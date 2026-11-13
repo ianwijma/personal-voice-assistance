@@ -1,6 +1,6 @@
 import { describe, expect, it } from "@effect/vitest"
 import type { Message } from "@pva/core"
-import { catchUpBlock, composeMessage, primeBlock, sessionEnv, sessionOptions, SESSION_CWD } from "../src/index.ts"
+import { ALLOWED_ENV, catchUpBlock, composeMessage, primeBlock, sessionEnv, sessionOptions, SESSION_CWD, STRIPPED_ENV } from "../src/index.ts"
 
 const ctx = { selfId: "claude-subscription", selfName: "Claude subscription" }
 const say = (agentId: string | undefined, content: string, extra: object = {}) =>
@@ -45,6 +45,66 @@ describe("session options (safety)", () => {
     expect(env).toEqual({ PATH: "/usr/bin", ENABLE_CLAUDEAI_MCP_SERVERS: "false", CLAUDE_AGENT_SDK_CLIENT_APP: "personal-voice-assistant/0.0.0" })
     expect(options.env?.ANTHROPIC_API_KEY).toBeUndefined()
     expect(options.env?.ANTHROPIC_BASE_URL).toBeUndefined()
+  })
+
+  it("passes only allowlisted variables: other providers' keys and the vault password never reach Claude Code", () => {
+    const env = sessionEnv({
+      PATH: "/usr/bin",
+      HOME: "/home/x",
+      USER: "x",
+      LOGNAME: "x",
+      SHELL: "/bin/bash",
+      LANG: "en_GB.UTF-8",
+      LC_ALL: "en_GB.UTF-8",
+      LC_TIME: "nl_NL.UTF-8",
+      TERM: "xterm",
+      TMPDIR: "/tmp",
+      TZ: "Europe/Amsterdam",
+      XDG_CONFIG_HOME: "/home/x/.config",
+      XDG_RUNTIME_DIR: "/run/user/1000",
+      CLAUDE_CONFIG_DIR: "/home/x/.claude",
+      HTTPS_PROXY: "http://proxy:3128",
+      no_proxy: "localhost",
+      NODE_EXTRA_CA_CERTS: "/etc/ca.pem",
+      SSL_CERT_FILE: "/etc/ssl/cert.pem",
+      // Must not pass:
+      PVA_VAULT_PASSWORD: "hunter2hunter2",
+      DEEPGRAM_API_KEY: "dg",
+      CARTESIA_API_KEY: "ca",
+      HOME_ASSISTANT_TOKEN: "ha",
+      OPENROUTER_API_KEY: "or",
+      TYPESAFE_API_KEY: "ts",
+      ANTHROPIC_API_KEY: "sk",
+      AWS_SECRET_ACCESS_KEY: "aws",
+      GITHUB_TOKEN: "gh",
+      NODE_OPTIONS: "--require /tmp/evil.js",
+      ENABLE_CLAUDEAI_MCP_SERVERS: "true",
+      SOMETHING_ELSE: "x",
+      UNSET: undefined
+    })
+    expect(env).toEqual({
+      PATH: "/usr/bin",
+      HOME: "/home/x",
+      USER: "x",
+      LOGNAME: "x",
+      SHELL: "/bin/bash",
+      LANG: "en_GB.UTF-8",
+      LC_ALL: "en_GB.UTF-8",
+      LC_TIME: "nl_NL.UTF-8",
+      TERM: "xterm",
+      TMPDIR: "/tmp",
+      TZ: "Europe/Amsterdam",
+      XDG_CONFIG_HOME: "/home/x/.config",
+      XDG_RUNTIME_DIR: "/run/user/1000",
+      CLAUDE_CONFIG_DIR: "/home/x/.claude",
+      HTTPS_PROXY: "http://proxy:3128",
+      no_proxy: "localhost",
+      NODE_EXTRA_CA_CERTS: "/etc/ca.pem",
+      SSL_CERT_FILE: "/etc/ssl/cert.pem",
+      ENABLE_CLAUDEAI_MCP_SERVERS: "false",
+      CLAUDE_AGENT_SDK_CLIENT_APP: "personal-voice-assistant/0.0.0"
+    })
+    for (const key of STRIPPED_ENV) expect(ALLOWED_ENV as ReadonlyArray<string>).not.toContain(key)
   })
 
   it("registers no MCP server without tools", () => {

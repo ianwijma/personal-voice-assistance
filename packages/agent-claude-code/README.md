@@ -9,6 +9,10 @@ Code with a subscription login (research: `docs/research/agent-backends.md` §2)
 Claude credentials: the owner logs in by running `claude`. Importing the package loads nothing (the SDK is imported
 lazily) and spawns nothing until the module starts with the opt-in on.
 
+In the app it is the `claude-subscription` entry of the module catalog and the `claude-subscription` choice of
+`LLM_PROVIDER` (Options → Assistant → Language model): the assistant then answers through this agent, read per
+turn, so switching the module on or off applies from the next turn (`apps/assistant/src/subscription.ts`).
+
 ## How it works
 
 - **Start**: spawns one Claude Code process in streaming-input mode and waits for its `initialize` answer (login, plan,
@@ -37,7 +41,8 @@ lazily) and spawns nothing until the module starts with the opt-in on.
 | No permission prompt can block a turn | `permissionMode: "dontAsk"` (deny anything not pre-approved), `permissionPrompts: "none"` (nothing ever waits for approval), `allowedTools` = our MCP tools only |
 | No project or user settings, CLAUDE.md, hooks, skills, plugins, memory | `settingSources: []`, `skills: []`, `plugins: []`, `settings: { autoMemoryEnabled: false, disableAllHooks: true }`, `strictMcpConfig: true`, `ENABLE_CLAUDEAI_MCP_SERVERS=false`, `cwd` an empty folder in the temp dir |
 | No sessions on disk | `persistSession: false` (live test: no folder under `~/.claude/projects` for the session's cwd) |
-| Subscription, not an API key | `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, `CLAUDE_CODE_USE_*` removed from the process environment; `apiKeySource` checked at start |
+| Subscription, not an API key | `apiKeySource` checked at start; `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, `CLAUDE_CODE_USE_*` are never passed (not in the allowlist below) |
+| No other secrets reach Claude Code | the process environment is built from an **allowlist** (`ALLOWED_ENV` in `src/options.ts`), not copied: `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `LANG`, `LC_*`, `TERM`, `TMPDIR`, `TZ`, `XDG_*`, `CLAUDE_CONFIG_DIR`, `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` (both cases), `NODE_EXTRA_CA_CERTS`, `SSL_CERT_FILE`, plus `ENABLE_CLAUDEAI_MCP_SERVERS=false` and `CLAUDE_AGENT_SDK_CLIENT_APP`. Other providers' keys, `PVA_VAULT_PASSWORD`, `NODE_OPTIONS` and anything else in `.env` stay out |
 
 ## Measured (live test, 2026-11-13, Haiku 5.5, Max plan, this machine)
 

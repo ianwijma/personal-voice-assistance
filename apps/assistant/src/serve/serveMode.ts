@@ -19,14 +19,18 @@ import { fileURLToPath } from "node:url"
 import { defaultSystemPrompt } from "../config.ts"
 import { userCwd } from "../env.ts"
 import { moduleCatalog, withModuleInstructions } from "../modules.ts"
+import { makeSubscriptionAgents, SUBSCRIPTION_AGENT_ID, SUBSCRIPTION_PROVIDER } from "../subscription.ts"
+import { makeAccessPolicy } from "./access.ts"
 import { defaultPreflight, defaultProviderBuilder, type Engine, EngineBuildProblems, makeEngine, type ProviderBuilder } from "./Engine.ts"
 import { type HttpError, type HttpServer, startHttp, webDirExists } from "./http.ts"
 import { makeHeardAudio } from "./HeardAudio.ts"
+import { type Keys, makeKeys } from "./Keys.ts"
 import { makePublisher } from "./Publisher.ts"
 import { makeSections } from "./sections.ts"
 import { makeSessionHub, type SessionHub } from "./SessionHub.ts"
-import { DataDirConfig, loadSettingsStore, type SettingsStoreError } from "./SettingsStore.ts"
+import { DataDirConfig, KEYS_LOCKED_MESSAGE, loadSettingsStore, SettingsStoreError } from "./SettingsStore.ts"
 import { makeStateTracker } from "./StateTracker.ts"
+import { type KdfParams, openVault, type Vault, VaultPathConfig } from "./Vault.ts"
 
 /**
  * `serve` mode (docs/UI-AND-MODULES.md §4): one process, one port. The browser
@@ -47,6 +51,15 @@ export interface ServeOptions {
   readonly tls?: { readonly certFile: string; readonly keyFile: string } | undefined
   readonly webDir: string
   readonly dataDir: string
+  /** The key vault file (`PVA_VAULT_PATH`; tests use a temporary directory). */
+  readonly vaultPath: string
+  /** For tests: cheaper scrypt parameters for a new vault, and the clock of the unlock rate limit. */
+  readonly vaultKdf?: KdfParams
+  readonly vaultNow?: () => number
+  /** Admin access ends after this long without an admin action. Default 15 minutes. */
+  readonly adminIdleMs?: number
+  /** Unlock the vault at start with this (`PVA_VAULT_PASSWORD`). Default: `env.PVA_VAULT_PASSWORD`. Never grants admin access. */
+  readonly vaultPassword?: string
   readonly catalog?: ReadonlyArray<ModuleDefinition<any>>
   /** Engine providers (tests inject fakes). Default: the providers chosen by the settings. */
   readonly build?: ProviderBuilder
@@ -67,6 +80,8 @@ export interface ServeHandle {
   readonly engine: Engine
   readonly host: ModuleHost
   readonly web: WebAudio
+  readonly keys: Keys
+  readonly vault: Vault
   /** Completes when the first engine build and module start have settled. */
   readonly ready: Effect.Effect<void>
 }
@@ -74,10 +89,46 @@ export interface ServeHandle {
 export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, HttpError | SettingsStoreError, Scope.Scope> =>
   Effect.gen(function*() {
     const env = options.env ?? process.env
-    const store = yield* loadSettingsStore(options.dataDir)
+    const catalog = options.catalog ?? moduleCatalog
+    const vault = yield* Effect.tryPromise({
+      try: () =>
+        openVault({
+          path: options.vaultPath,
+          ...(options.vaultKdf !== undefined ? { kdf: options.vaultKdf } : {}),
+          ...(options.vaultNow !== undefined ? { now: options.vaultNow } : {})
+        }),
+      catch: (cause) => new SettingsStoreError({ message: `Could not open the key vault at ${options.vaultPath}`, cause })
+    })
+    const store = yield* loadSettingsStore(options.dataDir, { vault })
     for (const problem of store.problems) yield* Effect.logError(problem)
+    if (store.legacySecretCount() > 0) {
+      yield* vault.state() === "none"
+        ? Effect.logWarning(
+          `API keys are stored unencrypted in ${options.dataDir}/secrets.json. Set a password in Options → Keys & access to move them ` +
+            `into an encrypted key vault outside the project (${vault.path}).`
+        )
+        : Effect.logWarning(`${options.dataDir}/secrets.json still holds keys; they move into the key vault at the next unlock.`)
+    }
     const sections = makeSections(store, env)
-    const host = yield* makeModuleHost({ catalog: options.catalog ?? moduleCatalog, persistence: store.modulePersistence, env })
+    const host = yield* makeModuleHost({ catalog, persistence: store.modulePersistence, env })
+    const keys = makeKeys({ vault, store, host })
+    const access = makeAccessPolicy({ catalog, sections: sections.list, vaultState: keys.state })
+
+    // Keys set in the environment win over the vault and are not protected by it: say so (names only).
+    const secretFields = [
+      ...sections.list().flatMap((x) => x.form.fields),
+      ...host.modules().flatMap((m) => m.settings.fields)
+    ].flatMap((f) => (f.type === "secret" && f.env !== undefined ? [f.env] : []))
+    const inEnv = secretFields.filter((name) => (env[name] ?? "") !== "")
+    if (inEnv.length > 0) {
+      yield* Effect.logWarning(
+        `${inEnv.join(", ")} ${inEnv.length === 1 ? "is" : "are"} set in the environment (.env): used as is and not protected by the key vault. ` +
+          "Enter keys in Options instead and remove them from .env."
+      )
+    }
+    const vaultPassword = options.vaultPassword ?? env.PVA_VAULT_PASSWORD
+    if (vaultPassword !== undefined && vaultPassword !== "") yield* keys.autoUnlock(vaultPassword)
+    else if (vault.state() === "locked") yield* Effect.logWarning("The key vault is locked: unlock it in Options → Keys & access so the engines and modules can use their keys.")
     const turnTrace = options.turnTrace ?? makeTurnTrace()
     const runFork = yield* FiberSet.makeRuntime<never, void, never>()
     const run = (effect: Effect.Effect<void>) => {
@@ -207,18 +258,36 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
 
     // The turn setup is rebuilt only when its inputs change (a string compare per turn).
     let cached: { key: string; setup: TurnSetup } | undefined
+    const voiceBlock = () => {
+      const voices = engine?.voices()
+      return voices === undefined ? "" : voicePrompt(voices.names, voices.defaultVoice)
+    }
+    /** Base prompt + running modules' instructions + voice block. */
+    const systemFor = (base: string, instructions: ReadonlyArray<string>, voices: string) => {
+      const system = withModuleInstructions(base, instructions)
+      return voices.length === 0 ? system : `${system}\n\n${voices}`
+    }
     const setup = Effect.sync((): TurnSetup => {
       const snapshot = host.snapshot()
       const base = String(sections.value("SYSTEM_PROMPT") ?? defaultSystemPrompt)
-      const voices = engine?.voices()
-      const voiceBlock = voices === undefined ? "" : voicePrompt(voices.names, voices.defaultVoice)
-      const key = `${snapshot.version}\u0000${base}\u0000${voiceBlock}`
+      const voices = voiceBlock()
+      const key = `${snapshot.version}\u0000${base}\u0000${voices}`
       if (cached?.key !== key) {
-        const system = withModuleInstructions(base, snapshot.instructions)
-        cached = { key, setup: { system: voiceBlock.length === 0 ? system : `${system}\n\n${voiceBlock}`, registry: snapshot.registry } }
+        cached = { key, setup: { system: systemFor(base, snapshot.instructions, voices), registry: snapshot.registry } }
       }
       return cached.setup
     })
+
+    // LLM_PROVIDER=claude-subscription: an agent conversation whose agent is the running claude-subscription module.
+    const subscriptionModule = () => host.modules().find((m) => m.id === SUBSCRIPTION_AGENT_ID)
+    const subscriptionDetail = () => {
+      const m = subscriptionModule()
+      const model = String(m?.settings.values.model ?? "claude-haiku-5-5")
+      if (m?.state === "running") return model
+      return `${model} · module ${m === undefined || !m.enabled ? "off" : m.state}: the offline stand-in answers`
+    }
+    const secretNames = () =>
+      sections.list().flatMap((x) => x.form.fields).flatMap((f) => (f.type === "secret" && f.env !== undefined ? [f.env] : []))
 
     engine = yield* makeEngine({
       build: options.build ?? defaultProviderBuilder,
@@ -235,7 +304,29 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       onEvent,
       gate: gateStream,
       defaultVoice: () => String(sections.value("DEFAULT_VOICE")),
-      onStatus: (status) => broadcast({ type: "engine", engine: status })
+      onStatus: (status) => broadcast({ type: "engine", engine: status }),
+      agentSetup: (providers) => {
+        if (providers.llmProvider !== SUBSCRIPTION_PROVIDER) return undefined
+        const toAgents = makeSubscriptionAgents({
+          fallbackLlm: providers.llm,
+          agents: () => host.snapshot().agents,
+          module: subscriptionModule,
+          promptFor: (agent, turn) =>
+            agent.systemPrompt === undefined ? turn.system : systemFor(agent.systemPrompt, host.snapshot().instructions, voiceBlock())
+        })
+        return Effect.map(setup, toAgents)
+      },
+      describeEngines: (engines) =>
+        engines.map((e) => (e.stage === "llm" && e.provider === SUBSCRIPTION_PROVIDER ? { ...e, detail: subscriptionDetail(), location: "hosted" } : e)),
+      // While the vault is locked, a key that "is not set" is really locked away.
+      explainProblems: (problems) => {
+        if (keys.state() !== "locked") return problems
+        const names = secretNames()
+        return problems.map((p) => {
+          const missing = /^([A-Z][A-Z0-9_]*) is not set$/.exec(p.message)?.[1]
+          return missing !== undefined && names.some((n) => missing.endsWith(n)) ? { ...p, message: KEYS_LOCKED_MESSAGE } : p
+        })
+      }
     })
     const theEngine = engine
 
@@ -249,6 +340,9 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       gate,
       run,
       server: { name: "personal-voice-assistance", version: "0.0.0" },
+      keys,
+      access,
+      ...(options.adminIdleMs !== undefined ? { adminIdleMs: options.adminIdleMs } : {}),
       onSectionSaved: (sectionId, needsReload) => {
         if (needsReload) theEngine.setReloadPending(true)
         if (sectionId === "voices") {
@@ -260,8 +354,19 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       ...(options.helloTimeoutMs !== undefined ? { helloTimeoutMs: options.helloTimeoutMs } : {})
     })
     const theHub = hub
-    host.subscribe((module) => theHub.broadcast({ type: "module.changed", module }))
-    sections.subscribe((section) => theHub.broadcast({ type: "section.changed", section }))
+    host.subscribe((module) => {
+      theHub.broadcast({ type: "module.changed", module: access.module(module) })
+      if (module.id === SUBSCRIPTION_AGENT_ID && theEngine.status().engines.some((e) => e.provider === SUBSCRIPTION_PROVIDER)) theEngine.refreshStatus()
+    })
+    sections.subscribe((section) => theHub.broadcast({ type: "section.changed", section: access.section(section) }))
+    keys.subscribe((state) => {
+      theHub.vaultChanged()
+      sections.announceAll()
+      // Engines that failed (a key was locked away) are rebuilt once the keys are there.
+      if (state === "unlocked" && theEngine.status().state === "failed") {
+        run(Effect.flatMap(theEngine.reload, (r) => (r.ok ? Effect.logInfo("Engines reloaded after the keys were unlocked.") : Effect.void)))
+      }
+    })
 
     const http = yield* startHttp({
       host: options.host,
@@ -278,7 +383,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     const engineStarted = yield* Effect.forkScoped(theEngine.start)
     const ready = Effect.asVoid(Effect.all([Fiber.await(modulesStarted), Fiber.await(engineStarted)]))
 
-    return { http, hub: theHub, engine: theEngine, host, web, ready }
+    return { http, hub: theHub, engine: theEngine, host, web, keys, vault, ready }
   })
 
 const isLoopback = (host: string) => host === "localhost" || host === "::1" || host.startsWith("127.")
@@ -297,7 +402,8 @@ export const ServeConfig = Config.all({
     Config.withDefault(join(repoRoot, "apps", "web", "out")),
     Config.map((p) => (isAbsolute(p) ? p : resolve(userCwd, p)))
   ),
-  dataDir: DataDirConfig
+  dataDir: DataDirConfig,
+  vaultPath: VaultPathConfig
 })
 
 /** `pnpm start serve`: runs until Ctrl+C, then closes the sockets, the engines and the modules. */
@@ -309,14 +415,19 @@ export const serveMode = Effect.scoped(Effect.gen(function*() {
   if ((cert === undefined) !== (key === undefined)) {
     yield* Effect.logWarning("Set both SERVE_TLS_CERT and SERVE_TLS_KEY for HTTPS; serving plain HTTP.")
   }
-  const handle = yield* startServe({ ...config, tls })
-  yield* Effect.logInfo(`Assistant UI at ${handle.http.url}  (settings in ${config.dataDir})`)
+  // Read the vault password once and take it out of the environment, so the engine processes forked later
+  // (and anything else that inherits process.env) never see it.
+  const vaultPassword = process.env.PVA_VAULT_PASSWORD
+  delete process.env.PVA_VAULT_PASSWORD
+  const handle = yield* startServe({ ...config, tls, ...(vaultPassword !== undefined && vaultPassword !== "" ? { vaultPassword } : {}) })
+  yield* Effect.logInfo(`Assistant UI at ${handle.http.url}  (settings in ${config.dataDir}, keys in ${config.vaultPath})`)
   if (!webDirExists(config.webDir)) {
     yield* Effect.logWarning(`The web UI is not built (${config.webDir} is missing): run pnpm --filter @pva/web build`)
   }
   if (!isLoopback(config.host)) {
     yield* Effect.logWarning(
-      `Listening on ${config.host}: anyone who can reach this port can use the assistant and change its settings (there is no login).`
+      `Listening on ${config.host}: anyone who can reach this port can use the assistant and change its open settings (there is no login; ` +
+        "keys, providers and agents need the vault password once one is set)."
     )
   }
   if (tls === undefined && !isLoopback(config.host)) {

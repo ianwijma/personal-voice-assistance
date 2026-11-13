@@ -16,6 +16,11 @@
  *   drop-mid-reply  like voice, but every socket is dropped 0.8 s into the reply's playback.
  *   takeover        like voice without a turn; 1.5 s after a claim, "another tab" takes the audio.
  *   outdated        every hello is answered with close 4400 (page out of date).
+ *   vault           like modules; protected items (Home Assistant, Language model) can be changed by any page until a
+ *                   password is set (vault.setup), then only by pages that typed it. Lock / unlock / change password work.
+ *   keys-locked     a vault exists (password "correct horse battery") and is locked, so the engines failed;
+ *                   unlocking reloads them.
+ * In every scenario the vault starts as "none" (everyone may change everything) unless the scenario says otherwise.
  *
  * Control endpoints (for tests): GET /mock/log (client messages and microphone stats), POST /mock/reset,
  * POST /mock/turn (run the scripted voice turn now), POST /mock/send {"messages": [ServerMessage…]} (broadcast),
@@ -45,7 +50,10 @@ import { type WebSocket, WebSocketServer } from "ws"
 
 const PORT = Number(process.env.MOCK_PORT ?? 8787)
 const HOST = process.env.MOCK_HOST ?? "127.0.0.1"
-const SCENARIOS = ["voice", "typed", "modules", "engine-failed", "drop-mid-reply", "takeover", "outdated"] as const
+const SCENARIOS = ["voice", "typed", "modules", "engine-failed", "drop-mid-reply", "takeover", "outdated", "vault", "keys-locked"] as const
+const VAULT_PASSWORD = "correct horse battery"
+const VAULT_LOCATION = "/home/owner/.config/pva/vault.enc"
+const KEYS_LOCKED = "Keys are locked — unlock them in Options"
 type Scenario = typeof SCENARIOS[number]
 const REPLY_RATE = 22_050
 
@@ -120,7 +128,8 @@ const initialModules = (): Array<ModuleInfo> => [
       secrets: { token: { set: true, source: "store" } },
       errors: []
     },
-    revision: 1
+    revision: 1,
+    protected: true
   },
   {
     id: "notes",
@@ -201,11 +210,19 @@ const initialSections = (): Array<SettingsSection> => [
       secrets: { ANTHROPIC_API_KEY: { set: true, source: "env" } },
       errors: []
     },
-    revision: 1
+    revision: 1,
+    protected: true
   }
 ]
 
 const readyEngine = (): EngineStatus => clone(exampleSnapshot.engine)
+const keysLockedEngine = (): EngineStatus => ({
+  ...readyEngine(),
+  state: "failed",
+  engines: [],
+  problems: [{ stage: "language model (LLM_PROVIDER)", message: KEYS_LOCKED }]
+})
+const initialEngine = (): EngineStatus => (scenario === "engine-failed" ? failedEngine() : scenario === "keys-locked" ? keysLockedEngine() : readyEngine())
 const failedEngine = (): EngineStatus => ({
   ...readyEngine(),
   state: "failed",
@@ -225,6 +242,8 @@ interface Conn {
   micFrames: number
   micGaps: number
   lastSeq: number | undefined
+  /** Typed the vault password on this connection. */
+  admin: boolean
 }
 
 interface Reply {
@@ -253,7 +272,8 @@ let assistantState: "idle" | "listening" | "hearing" | "thinking" | "speaking" =
 let micLive = true
 let modules = initialModules()
 let sections = initialSections()
-let engine: EngineStatus = scenario === "engine-failed" ? failedEngine() : readyEngine()
+let engine: EngineStatus = initialEngine()
+let vault: { state: "none" | "locked" | "unlocked"; password?: string } = scenario === "keys-locked" ? { state: "locked", password: VAULT_PASSWORD } : { state: "none" }
 let history: Array<HistoryItem> = clone([...exampleSnapshot.history])
 let traces: Array<TraceInfo> = []
 let turnSeq = 20
@@ -273,7 +293,9 @@ const resetState = () => {
   micLive = true
   modules = initialModules()
   sections = initialSections()
-  engine = scenario === "engine-failed" ? failedEngine() : readyEngine()
+  engine = initialEngine()
+  vault = scenario === "keys-locked" ? { state: "locked", password: VAULT_PASSWORD } : { state: "none" }
+  for (const c of conns) c.admin = false
   history = clone([...exampleSnapshot.history])
   traces = []
   turnSeq = 20
@@ -297,6 +319,42 @@ const setState = (state: typeof assistantState, turnId?: number) => {
   if (state === assistantState && turnId === undefined) return
   assistantState = state
   broadcast(turnId === undefined ? { type: "state", state } : { type: "state", state, turnId })
+}
+
+// ---- Key vault and admin access (per connection)
+
+const isAdmin = (c: Conn) => vault.state === "none" || (c.admin && vault.state === "unlocked")
+const vaultInfo = (c: Conn) => ({ state: vault.state, admin: isAdmin(c), location: VAULT_LOCATION })
+const sendVault = (c: Conn) => sendTo(c, { type: "vault", vault: vaultInfo(c) })
+const vaultChanged = () => {
+  if (vault.state !== "unlocked") for (const c of conns) c.admin = false
+  for (const c of conns) if (c.welcomed) sendVault(c)
+}
+/** A protected change from a page without admin access is refused with `locked`. */
+const refuseLocked = (c: Conn, requestId: string, isProtected: boolean | undefined): boolean => {
+  if (isProtected !== true || isAdmin(c)) return false
+  result(c, requestId, false, {
+    code: "locked",
+    message: vault.state === "locked"
+      ? "The keys are locked: unlock them with the password in Options → Keys & access to change this."
+      : "Protected: type the password in Options → Keys & access to change this."
+  })
+  return true
+}
+const grantAdmin = (c: Conn) => {
+  c.admin = true
+  sendVault(c)
+}
+const afterUnlock = () => {
+  vaultChanged()
+  if (engine.state === "failed" && engine.problems.some((p) => p.message === KEYS_LOCKED)) {
+    engine = { ...engine, state: "reloading" }
+    broadcast({ type: "engine", engine })
+    after(600, () => {
+      engine = { ...readyEngine(), reloadPending: false }
+      broadcast({ type: "engine", engine })
+    })
+  }
 }
 
 const restingState = () => (owner !== undefined && micLive ? "listening" : "idle")
@@ -649,12 +707,14 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
     case "module.enable": {
       const mod = modules.find((x) => x.id === m.moduleId)
       if (mod === undefined) return result(c, m.requestId, false, { code: "unknown_module", message: `No module ${m.moduleId}.` })
+      if (refuseLocked(c, m.requestId, mod.protected)) return
       startModule(c, m.requestId, m.moduleId)
       return
     }
     case "module.disable": {
       const mod = modules.find((x) => x.id === m.moduleId)
       if (mod === undefined) return result(c, m.requestId, false, { code: "unknown_module", message: `No module ${m.moduleId}.` })
+      if (refuseLocked(c, m.requestId, mod.protected)) return
       setModule(m.moduleId, (x) => {
         const { error: _e, status: _s, ...rest } = x
         return { ...rest, enabled: false, state: "stopping", tools: [] }
@@ -666,6 +726,7 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
     case "module.configure": {
       const mod = modules.find((x) => x.id === m.moduleId)
       if (mod === undefined) return result(c, m.requestId, false, { code: "unknown_module", message: `No module ${m.moduleId}.` })
+      if (refuseLocked(c, m.requestId, mod.protected)) return
       const errors = validate(mod.settings, m.patch)
       if (errors.length > 0) return result(c, m.requestId, false, { code: "invalid_settings", message: "Some settings are not valid.", moduleId: m.moduleId, fieldErrors: errors })
       const tokenGood = typeof m.patch.secrets.token === "string" ? m.patch.secrets.token.includes("good") : (mod as ModuleInfo & { tokenGood?: boolean }).tokenGood
@@ -678,6 +739,7 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
       const i = sections.findIndex((s) => s.id === m.sectionId)
       if (i === -1) return result(c, m.requestId, false, { code: "unknown_section", message: `No section ${m.sectionId}.` })
       const section = sections[i]!
+      if (refuseLocked(c, m.requestId, section.protected)) return
       const errors = validate(section.form, m.patch)
       if (errors.length > 0) return result(c, m.requestId, false, { code: "invalid_settings", message: "Some settings are not valid.", fieldErrors: errors })
       const next: SettingsSection = { ...section, form: applyPatch(section.form, m.patch), revision: section.revision + 1 }
@@ -703,6 +765,44 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
       })
       return
     }
+    case "vault.setup": {
+      if (vault.state !== "none") return result(c, m.requestId, false, { code: "busy", message: `A vault already exists at ${VAULT_LOCATION}` })
+      if (m.password.length < 8) return result(c, m.requestId, false, { code: "bad_password", message: "The password must be at least 8 characters" })
+      vault = { state: "unlocked", password: m.password }
+      c.admin = true
+      result(c, m.requestId, true)
+      vaultChanged()
+      return
+    }
+    case "vault.unlock": {
+      if (vault.state === "none") return result(c, m.requestId, false, { code: "locked", message: "There is no vault yet" })
+      if (m.password !== vault.password) return result(c, m.requestId, false, { code: "bad_password", message: "Wrong password (or the vault file was changed)" })
+      const wasLocked = vault.state === "locked"
+      vault = { ...vault, state: "unlocked" }
+      result(c, m.requestId, true)
+      grantAdmin(c)
+      if (wasLocked) afterUnlock()
+      return
+    }
+    case "vault.lock": {
+      if (vault.state === "none") return result(c, m.requestId, false, { code: "locked", message: "There is no key vault yet: set a password first" })
+      if (!isAdmin(c)) return result(c, m.requestId, false, { code: "locked", message: "Protected: type the password in Options → Keys & access to change this." })
+      vault = { ...vault, state: "locked" }
+      result(c, m.requestId, true)
+      vaultChanged()
+      return
+    }
+    case "vault.changePassword": {
+      if (vault.state === "none") return result(c, m.requestId, false, { code: "locked", message: "There is no vault yet" })
+      if (m.oldPassword !== vault.password) return result(c, m.requestId, false, { code: "bad_password", message: "Wrong password (or the vault file was changed)" })
+      if (m.newPassword.length < 8) return result(c, m.requestId, false, { code: "bad_password", message: "The password must be at least 8 characters" })
+      const wasLocked = vault.state === "locked"
+      vault = { state: "unlocked", password: m.newPassword }
+      result(c, m.requestId, true)
+      grantAdmin(c)
+      if (wasLocked) afterUnlock()
+      return
+    }
     case "ping":
       sendTo(c, { type: "pong", id: m.id })
       return
@@ -721,7 +821,7 @@ const dropAll = () => {
 const wss = new WebSocketServer({ noServer: true, perMessageDeflate: false })
 
 wss.on("connection", (ws: WebSocket) => {
-  const c: Conn = { ws, id: `conn-${++connSeq}`, welcomed: false, micFrames: 0, micGaps: 0, lastSeq: undefined }
+  const c: Conn = { ws, id: `conn-${++connSeq}`, welcomed: false, micFrames: 0, micGaps: 0, lastSeq: undefined, admin: false }
   conns.add(c)
   log(c.id, "connected")
   ws.on("message", (data: Buffer, isBinary: boolean) => {
@@ -767,7 +867,8 @@ wss.on("connection", (ws: WebSocket) => {
           modules,
           sections,
           history: history.slice(-200),
-          traces: traces.slice(-20)
+          traces: traces.slice(-20),
+          vault: vaultInfo(c)
         }
       })
       if (resumed) {

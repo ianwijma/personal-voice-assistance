@@ -170,6 +170,7 @@ export const startAssistant = async (options: {
       SERVE_HOST: "127.0.0.1",
       SERVE_PORT: String(options.port),
       PVA_DATA_DIR: options.dataDir,
+      PVA_VAULT_PATH: join(options.dataDir, "vault", "vault.enc"), // never the owner's real key vault
       PVA_WEB_DIR: webOut,
       ...options.env
     }

@@ -12,6 +12,7 @@ import {
 } from "./common.ts"
 import { MAX_TEXT_INPUT_CHARS } from "./constants.ts"
 import { SettingsPatch } from "./settings.ts"
+import { Password } from "./vault.ts"
 
 /**
  * Text frames from the browser to the assistant. Binary frames from the
@@ -157,6 +158,40 @@ export const EngineReload = Schema.Struct({
   requestId: RequestId
 })
 
+/**
+ * Create the vault with a password (at least `MIN_PASSWORD_CHARS`), moving the keys out of the project into it.
+ * Only while there is no vault. Grants this page admin access.
+ */
+export const VaultSetup = Schema.Struct({
+  type: Schema.Literal("vault.setup"),
+  requestId: RequestId,
+  password: Password
+})
+
+/**
+ * Unlock the vault (when locked) and get admin access for this page (also when another page or
+ * `PVA_VAULT_PASSWORD` already unlocked it). A wrong password is answered `bad_password`.
+ */
+export const VaultUnlock = Schema.Struct({
+  type: Schema.Literal("vault.unlock"),
+  requestId: RequestId,
+  password: Password
+})
+
+/** Admin only: lock the vault now (the keys leave memory; every page loses admin access). */
+export const VaultLock = Schema.Struct({
+  type: Schema.Literal("vault.lock"),
+  requestId: RequestId
+})
+
+/** Re-encrypt the vault under a new password (with a new salt). Needs the current password. */
+export const VaultChangePassword = Schema.Struct({
+  type: Schema.Literal("vault.changePassword"),
+  requestId: RequestId,
+  oldPassword: Password,
+  newPassword: Password
+})
+
 /** Liveness check; the server answers `pong` with the same id. Sent every 5 s. */
 export const Ping = Schema.Struct({
   type: Schema.Literal("ping"),
@@ -180,6 +215,10 @@ export const ClientMessage = Schema.Union([
   ModuleConfigure,
   SettingsUpdate,
   EngineReload,
+  VaultSetup,
+  VaultUnlock,
+  VaultLock,
+  VaultChangePassword,
   Ping
 ]).pipe(Schema.toTaggedUnion("type"))
 export type ClientMessage = typeof ClientMessage.Type

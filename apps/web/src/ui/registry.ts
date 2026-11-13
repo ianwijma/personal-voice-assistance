@@ -2,6 +2,7 @@ import type { ComponentType } from "react"
 import { AboutTab } from "@/components/AboutTab.tsx"
 import { AssistantTab } from "@/components/AssistantTab.tsx"
 import { DeviceTab } from "@/components/DeviceTab.tsx"
+import { KeysTab } from "@/components/KeysPanel.tsx"
 import { ModulesTab } from "@/components/ModulesTab.tsx"
 import {
   AudioErrorCard,
@@ -13,6 +14,7 @@ import {
   StartPrompt
 } from "@/components/overlays.tsx"
 import type { ClientState } from "@/lib/state.ts"
+import { KEYS_TAB } from "@/lib/vault.ts"
 
 /**
  * The extension points of the UI (docs/UI-AND-MODULES.md §3.12). A new panel or
@@ -31,6 +33,7 @@ export interface OptionTab {
 export const optionTabs: ReadonlyArray<OptionTab> = [
   { id: "modules", title: "Modules", component: ModulesTab },
   { id: "assistant", title: "Assistant", component: AssistantTab },
+  { id: KEYS_TAB, title: "Keys & access", component: KeysTab },
   { id: "device", title: "This device", component: DeviceTab },
   { id: "about", title: "About", component: AboutTab }
 ]

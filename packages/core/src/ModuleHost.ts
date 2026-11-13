@@ -80,6 +80,13 @@ export interface ModuleHost {
   readonly enable: (id: string) => Effect.Effect<HostResult>
   readonly disable: (id: string) => Effect.Effect<HostResult>
   readonly configure: (id: string, patch: SettingsPatch) => Effect.Effect<HostResult>
+  /**
+   * Replace every module's saved secrets without saving them (the app's key vault was unlocked or locked; a module
+   * missing from `secrets` has none). Modules whose secrets changed are announced; enabled modules in `error` are
+   * started again (a start that failed for lack of a key). Running modules keep running with what they started with.
+   * Completes when those starts have settled.
+   */
+  readonly setSecrets: (secrets: Readonly<Record<string, Readonly<Record<string, string>>>>) => Effect.Effect<void>
   /** Called with a module's new info whenever it changes (state, settings, status). Returns an unsubscribe function. */
   readonly subscribe: (listener: (info: ModuleInfo) => void) => () => void
   /**
@@ -485,8 +492,24 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
       )
     })
 
+  const setSecrets = (all: Readonly<Record<string, Readonly<Record<string, string>>>>) =>
+    Effect.suspend(() => {
+      for (const entry of entries) {
+        const next = all[entry.def.id] ?? {}
+        if (JSON.stringify(next) === JSON.stringify(entry.secrets)) continue
+        entry.secrets = next
+        notify(entry)
+      }
+      return Effect.forEach(
+        entries.filter((e) => e.enabled && e.state === "error" && !e.busy),
+        (entry) => exclusive(entry.def.id, (e) => (e.enabled && e.state === "error" ? start(e) : Effect.succeed({ ok: true } as HostResult))),
+        { concurrency: "unbounded", discard: true }
+      )
+    })
+
   return {
     fieldAction,
+    setSecrets,
     snapshot: () => snapshot,
     modules: () => entries.map(info),
     startEnabled,

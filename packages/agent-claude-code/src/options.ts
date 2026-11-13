@@ -17,9 +17,10 @@ export const BUILT_IN_TOOLS = [
 ] as const
 
 /**
- * Variables removed from the harness's environment: with an API key or another
+ * Variables that must never reach the harness: with an API key or another
  * provider configured, Claude Code would bill that instead of the owner's
- * subscription (and `apiKeySource` would no longer be "none").
+ * subscription (and `apiKeySource` would no longer be "none"). None of them is
+ * in `ALLOWED_ENV`; the list is kept so the test can pin that.
  */
 export const STRIPPED_ENV = [
   "ANTHROPIC_API_KEY",
@@ -51,9 +52,29 @@ export interface SessionOptionsInput {
   readonly stderr: (line: string) => void
 }
 
+/**
+ * The only variables passed on to Claude Code: what a CLI needs to find its
+ * home, its login and the network, nothing else. Other providers' keys,
+ * `PVA_VAULT_PASSWORD` and anything else in `.env` never reach it.
+ * `LC_*` and `XDG_*` are matched by prefix.
+ */
+export const ALLOWED_ENV = [
+  "PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "TERM", "TMPDIR", "TZ",
+  "CLAUDE_CONFIG_DIR",
+  "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy",
+  "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE"
+] as const
+export const ALLOWED_ENV_PREFIXES = ["LC_", "XDG_"] as const
+
+const allowed = new Set<string>(ALLOWED_ENV)
+
+/** The harness's environment: the allowlisted variables of `env`, plus the two settings below. */
 export const sessionEnv = (env: Readonly<Record<string, string | undefined>>): Record<string, string | undefined> => {
-  const out: Record<string, string | undefined> = { ...env }
-  for (const key of STRIPPED_ENV) delete out[key]
+  const out: Record<string, string | undefined> = {}
+  for (const [key, value] of Object.entries(env)) {
+    if (value === undefined) continue
+    if (allowed.has(key) || ALLOWED_ENV_PREFIXES.some((prefix) => key.startsWith(prefix))) out[key] = value
+  }
   // Do not load the owner's claude.ai account connectors (Gmail, Drive, ...): research saw them appear otherwise.
   out.ENABLE_CLAUDEAI_MCP_SERVERS = "false"
   out.CLAUDE_AGENT_SDK_CLIENT_APP = "personal-voice-assistant/0.0.0"

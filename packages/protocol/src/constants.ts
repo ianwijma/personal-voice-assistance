@@ -8,8 +8,11 @@
  * to the binary framing. Optional fields that a peer may ignore do not need a
  * bump. Production serves the web UI from the assistant itself, so in practice
  * a mismatch means a stale tab or a dev server against an older assistant.
+ *
+ * 2: the key vault and admin access (`vault.*` messages, `vault`, `snapshot.vault`, `protected` on modules and
+ * sections; error codes `locked` and `bad_password`, which are new members of a closed set).
  */
-export const PROTOCOL_VERSION = 1
+export const PROTOCOL_VERSION = 2
 
 /** Path of the WebSocket endpoint, on the same origin as the UI in production. */
 export const WS_PATH = "/ws"

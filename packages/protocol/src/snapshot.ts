@@ -11,6 +11,7 @@ import {
   TurnSource
 } from "./common.ts"
 import { SettingsForm } from "./settings.ts"
+import { VaultInfo } from "./vault.ts"
 
 /** A one-line status a running module publishes, e.g. "Connected · 143 entities". */
 export const StatusLine = Schema.Struct({
@@ -44,7 +45,12 @@ export const ModuleInfo = Schema.Struct({
   tools: Schema.Array(ToolInfo),
   settings: SettingsForm,
   /** Increases on every change to this module; a client keeps the highest it has seen. */
-  revision: NonNegativeInt
+  revision: NonNegativeInt,
+  /**
+   * Only a page with admin access may switch it on or off or change its settings (it has a secret, or it is an
+   * agent). Absent = false.
+   */
+  protected: Schema.optionalKey(Schema.Boolean)
 })
 export type ModuleInfo = typeof ModuleInfo.Type
 
@@ -54,7 +60,9 @@ export const SettingsSection = Schema.Struct({
   title: Schema.String,
   description: Schema.optionalKey(Schema.String),
   form: SettingsForm,
-  revision: NonNegativeInt
+  revision: NonNegativeInt,
+  /** Only a page with admin access may change it (it has a secret, or it chooses providers). Absent = false. */
+  protected: Schema.optionalKey(Schema.Boolean)
 })
 export type SettingsSection = typeof SettingsSection.Type
 
@@ -147,6 +155,8 @@ export const Snapshot = Schema.Struct({
   /** The most recent history (at most 200 items), oldest first. */
   history: Schema.Array(HistoryItem),
   /** The most recent traces (at most 20), oldest first. */
-  traces: Schema.Array(TraceInfo)
+  traces: Schema.Array(TraceInfo),
+  /** The key vault as this page sees it. Absent: treat as `{ state: "none", admin: true }`. */
+  vault: Schema.optionalKey(VaultInfo)
 })
 export type Snapshot = typeof Snapshot.Type

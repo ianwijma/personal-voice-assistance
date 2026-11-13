@@ -236,7 +236,13 @@ const definitions = (sttProvider: string): ReadonlyArray<SectionDefinition> => {
           default: "fake",
           options: [
             { value: "fake", label: "Offline stand-in", description: "Echoes what you say; answers time questions." },
-            { value: "anthropic", label: "Anthropic" }
+            { value: "anthropic", label: "Anthropic", description: "The Anthropic API with your API key (below)." },
+            {
+              value: "claude-subscription",
+              label: "Claude subscription (Claude Code login)",
+              description: "Uses the claude program logged in on this machine; replies count against your subscription's limits. " +
+                "Needs the Claude subscription module switched on under Modules (with its opt-in); until then the offline stand-in answers."
+            }
           ],
           apply: reload
         }),
@@ -255,11 +261,18 @@ const definitions = (sttProvider: string): ReadonlyArray<SectionDefinition> => {
           options: [{ value: "sherpa", label: "On this machine (sherpa-onnx)" }, { value: "deepgram", label: "Deepgram (hosted)" }],
           apply: reload
         }),
+        DEEPGRAM_API_KEY: Setting.secret({ label: "Deepgram API key", description: "Only for Deepgram speech to text.", env: "DEEPGRAM_API_KEY", apply: reload }),
         TTS_PROVIDER: Setting.choice({
           label: "Text to speech (standard voice)",
           env: "TTS_PROVIDER",
           default: "sherpa",
           options: [{ value: "sherpa", label: "On this machine (Piper/Kokoro)" }, { value: "cartesia", label: "Cartesia (hosted)" }],
+          apply: reload
+        }),
+        CARTESIA_API_KEY: Setting.secret({
+          label: "Cartesia API key",
+          description: "Only for Cartesia voices (the standard voice on Cartesia, or the expressive voice).",
+          env: "CARTESIA_API_KEY",
           apply: reload
         })
       }
@@ -277,6 +290,8 @@ export interface Sections {
   readonly configProvider: () => ConfigProvider.ConfigProvider
   /** Called with a section after it changed. */
   readonly subscribe: (listener: (section: SettingsSection) => void) => () => void
+  /** Announce every section again with a new revision (the secrets behind them changed: the key vault was unlocked or locked). */
+  readonly announceAll: () => void
 }
 
 /** Saved values from earlier versions: renamed recogniser presets. */
@@ -374,6 +389,13 @@ export const makeSections = (store: SettingsStore, env: Readonly<Record<string, 
     subscribe: (listener) => {
       listeners.add(listener)
       return () => listeners.delete(listener)
+    },
+    announceAll: () => {
+      for (const d of current()) {
+        revisions.set(d.id, (revisions.get(d.id) ?? 0) + 1)
+        const section = describe(d)
+        for (const listener of listeners) listener(section)
+      }
     }
   }
 }

@@ -2,6 +2,7 @@
 import { useState } from "react"
 import { shallowEqual } from "@/lib/store.ts"
 import { useClient, useClientState } from "./context.tsx"
+import { LockedBadge } from "./KeysPanel.tsx"
 import { SettingsForm } from "./SettingsForm.tsx"
 import { Spinner } from "./ui/Icon.tsx"
 import { Button, cx } from "./ui/controls.tsx"
@@ -12,6 +13,7 @@ export function AssistantTab() {
   const client = useClient()
   const engine = useClientState((s) => s.engine)
   const sections = useClientState((s) => s.sections, shallowEqual)
+  const admin = useClientState((s) => s.vault.admin)
   const [reloading, setReloading] = useState(false)
   const reload = async () => {
     setReloading(true)
@@ -75,15 +77,27 @@ export function AssistantTab() {
           </ul>
         </section>
       )}
-      {sections.map((section) => (
-        <section key={section.id} data-testid={`section-${section.id}`}>
-          <h3 className="label mb-1 text-ink-faint">{section.title}</h3>
-          {section.description !== undefined && <p className="mb-3 text-[13px] text-ink-muted">{section.description}</p>}
-          <div className="mt-3">
-            <SettingsForm form={section.form} revision={section.revision} idPrefix={`s-${section.id}`} onSave={(patch) => client.updateSection(section.id, patch)} />
-          </div>
-        </section>
-      ))}
+      {sections.map((section) => {
+        const editable = section.protected !== true || admin
+        return (
+          <section key={section.id} data-testid={`section-${section.id}`} data-locked={editable ? undefined : "true"}>
+            <div className="mb-1 flex flex-wrap items-center gap-x-3 gap-y-1">
+              <h3 className="label text-ink-faint">{section.title}</h3>
+              {!editable && <LockedBadge name={section.title} />}
+            </div>
+            {section.description !== undefined && <p className="mb-3 text-[13px] text-ink-muted">{section.description}</p>}
+            <div className="mt-3">
+              <SettingsForm
+                form={section.form}
+                revision={section.revision}
+                idPrefix={`s-${section.id}`}
+                readOnly={!editable}
+                onSave={(patch) => client.updateSection(section.id, patch)}
+              />
+            </div>
+          </section>
+        )
+      })}
     </div>
   )
 }

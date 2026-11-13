@@ -1,22 +1,22 @@
 "use client"
 import { useState } from "react"
 import type { SettingField } from "@pva/protocol"
+import { shallowEqual } from "@/lib/store.ts"
+import { secretStatus } from "@/lib/vault.ts"
+import { useClientState } from "../context.tsx"
 import { Button } from "../ui/controls.tsx"
 import { type FieldProps, inputClass } from "./types.ts"
 
 /** Never pre-filled: shows whether the secret is set, and lets you replace or remove it. */
 export function SecretField({ field, id, describedBy, secret, secretDraft, onSecretChange, disabled, invalid }: FieldProps<Extract<SettingField, { type: "secret" }>>) {
   const [editing, setEditing] = useState(false)
+  const vault = useClientState((s) => s.vault, shallowEqual)
   const state = secret ?? { set: false, source: "none" as const }
   const status = secretDraft === null
     ? "Will be removed when you save"
     : typeof secretDraft === "string" && secretDraft !== ""
     ? "New value entered"
-    : state.source === "env"
-    ? `Set by ${field.env ?? "an environment variable"} in the environment`
-    : state.source === "store"
-    ? "Set (saved here)"
-    : "Not set"
+    : secretStatus(state, vault, field.env)
   if (editing) {
     return (
       <div className="flex gap-2">
@@ -56,7 +56,7 @@ export function SecretField({ field, id, describedBy, secret, secretDraft, onSec
         <span aria-hidden="true" className={`size-1.5 rounded-full ${state.set && secretDraft !== null ? "bg-ok" : "bg-ink-faint"}`} />
         {status}
       </span>
-      {state.source !== "env" && (
+      {state.source !== "env" && !disabled && (
         <>
           <Button size="sm" disabled={disabled} onClick={() => setEditing(true)}>{state.set ? "Replace" : "Set"}</Button>
           {state.set && secretDraft !== null && (
@@ -68,3 +68,4 @@ export function SecretField({ field, id, describedBy, secret, secretDraft, onSec
     </div>
   )
 }
+

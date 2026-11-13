@@ -33,6 +33,18 @@ Recorded by the server implementation (2026-11-13). **No message shape changed a
 
 Checked and found consistent, no change: the headless player sends `playback.started`, `progress` every ~250 ms and `finished`; on takeover the new owner's reducer copes with `turn.end` before its own `session`; after a reconnect the page sends `audio.config` and `mic.state` before frames; on Stop the page sends `interrupt` then `playback.stopped` (about 20 ms later in headless Chromium, whose device renders 10.7 ms blocks) and the turn ends within ~25 ms, far inside the server's 300 ms wait, with no stall error; when the server's `reply.stop` reaches the worklet during its fade, the single `playback.stopped` covers both (the server takes the first count either way); in `manual` mode the page holds frames back without advancing the sequence number (no `mic_gap`) while the server feeds its noise floor, and speech over the reply is ignored while the next question after it is heard. Not changed (noted): conversation history items carry no latency or "typed" marker, so the chat loses both for turns from before a reload.
 
+**Key vault, admin access and the Claude subscription (2026-11-14)**: **protocol 2** (new error codes `locked` and
+`bad_password` are new members of a closed set; everything else is additive). What changed:
+
+| What | Side | Why |
+|---|---|---|
+| Secrets live in an encrypted **key vault** outside the project (`PVA_VAULT_PATH`, default `~/.config/pva/vault.enc`) once the owner sets a password; `data/secrets.json` is imported and deleted. The vault starts **locked** after every start (unless `PVA_VAULT_PASSWORD` unlocks it). §1.6 below. | Server (`Vault.ts`, `Keys.ts`, `SettingsStore.ts`) | Keys must not be readable by tools that work on the checkout; §1.6 used to say encrypting at rest was not useful because the key would sit next to it — now the key is the owner's password, which does not. |
+| **Admin access per connection**: typing the password on a page lets that connection change **protected** items (sections or modules with a secret field, `language-model`, `speech`, every agent module); other connections get `locked`. Ends on disconnect, `vault.lock`, or 15 min without an admin action. While no vault exists every connection is admin. | Server (`access.ts`, `SessionHub.ts`) | Not everyone who can open the page should change keys or providers. |
+| Messages `vault.setup`, `vault.unlock`, `vault.lock`, `vault.changePassword` (requests), `vault { vault: VaultInfo }` (to each tab with its own `admin`), `snapshot.vault`, `ModuleInfo.protected`, `SettingsSection.protected`. | Protocol (`vault.ts`, `client.ts`, `server.ts`, `snapshot.ts`) | §2.3. |
+| While locked, engines that need a key fail with "Keys are locked — unlock them in Options" instead of "X is not set"; modules that need one show the same error. An unlock reloads failed engines and restarts failed modules (`ModuleHost.setSecrets`). | Server (`serveMode.ts`, core `ModuleHost.ts`) | The owner fixes it with one password, not a restart. |
+| `LLM_PROVIDER=claude-subscription`: an agent conversation (`makeAgentConversation`) whose agent is the running `claude-subscription` module, read per turn; when it is not running the offline stand-in answers after a spoken notice. `DEEPGRAM_API_KEY` and `CARTESIA_API_KEY` are fields of the `speech` section. | Server (`subscription.ts`, `Engine.ts`, `sections.ts`) | Run on the owner's Claude plan, chosen from the UI. |
+| Options gains a **Keys & access** tab (set password / unlock / get edit access / lock / change password); protected cards and sections show a lock with "Unlock to change" and are read-only on pages without admin access; the engine banner has an inline unlock when the engines failed for locked keys. The vault logic is in `lib/vault.ts` and `ClientState.vault`, not in the drawer. | Front end | §3.7. |
+
 **Who reads what**
 
 | Reader | Sections |
@@ -283,7 +295,7 @@ Directory: `PVA_DATA_DIR`, default `<repo>/data/` (git-ignored; add it to `.giti
 }
 ```
 
-`data/secrets.json` (mode `0600`, same shape, secrets only):
+Secrets: in the **key vault** once the owner has set a password (below); before that, `data/secrets.json` (mode `0600`, same shape, secrets only):
 
 ```json
 { "version": 1, "modules": { "home-assistant": { "token": "eyJ..." } }, "sections": { "language-model": { "ANTHROPIC_API_KEY": "sk-ant-..." } } }
@@ -292,7 +304,15 @@ Directory: `PVA_DATA_DIR`, default `<repo>/data/` (git-ignored; add it to `.giti
 - Only values the owner set are stored; everything else comes from defaults, so a changed default in code takes effect for unset fields. `null` in a patch removes the key.
 - A module missing from the file uses `enabledByDefault` and defaults. Entries for modules no longer in the catalog are kept untouched (a module removed for a while keeps its settings).
 - Writes are atomic (write `*.tmp`, then rename) and serialised. Both files are read once at startup; the server is their only writer.
-- **Secrets**: the browser can set or remove a secret but never read it back; the form shows only `{ set, source }`. They live in their own file so `settings.json` can be shared or committed elsewhere without leaking them. This is no weaker than `.env`, which already holds the language-model key in plain text on the same machine. Encrypting at rest is not useful here (the key to decrypt would sit next to it).
+- **Secrets**: the browser can set or remove a secret but never read it back; the form shows only `{ set, source }`. They are kept apart from `settings.json`, so that file can be shared or committed elsewhere without leaking them.
+- **Key vault** (`apps/assistant/src/serve/Vault.ts`, `Keys.ts`; 2026-11-14). The original reasoning here ("encrypting at rest is not useful, the key would sit next to it") assumed a key on disk; the vault's key is the owner's password, so the keys are out of reach of anything that only reads the checkout or its environment (coding agents included).
+  - File `PVA_VAULT_PATH`, default `$XDG_CONFIG_HOME/pva/vault.enc` (else `~/.config/pva/vault.enc`), outside the project; mode 0600, a directory it creates 0700; atomic writes.
+  - scrypt (N = 2¹⁷, r = 8, p = 1, random 16-byte salt, parameters stored in the file; 289 ms to unlock on the development machine) → AES-256-GCM, fresh 12-byte IV per write, the header (format, version, KDF parameters, salt) as additional data. Plaintext: `{ modules, sections }` as in `secrets.json`. The derived key stays in memory only while unlocked and is overwritten on lock. A wrong password and a modified file both fail authentication; neither resets the vault.
+  - States `none` (no vault: `secrets.json` as before, every page is admin), `locked` (every start, unless `PVA_VAULT_PASSWORD` unlocks it), `unlocked`. While locked, `SettingsStore.secrets()` is empty and a save that changes a secret fails ("Keys are locked — unlock them in Options"); other settings still save.
+  - Setup (`vault.setup`, ≥ 8 characters) imports `secrets.json` and deletes it; an unlock does the same if the file came back (the vault's values win). Change password re-encrypts with a new salt. Lock forgets key and secrets (running engines keep what they started with). Forgotten password: delete the file; the keys are lost.
+  - Unlock attempts (also wrong old passwords): after 5 failures in a row refused for 30 s, then the wait doubles (at most an hour). Server-wide, not per connection.
+  - Environment still wins (`source: env`); the UI labels such keys "set in .env (not protected)" and the server logs their names at start.
+  - **Admin access** is per connection (`SessionHub`): granted by a successful `vault.setup`, `vault.unlock` or `vault.changePassword` on that connection; ends on disconnect, `vault.lock` (from any admin page: it locks the vault for everyone) or 15 minutes without an admin action. **Protected** (`access.ts`): a section or module with a secret field, the `language-model` and `speech` sections, every agent module. Changes to protected items from other connections are answered `locked`. `PVA_VAULT_PASSWORD` never grants admin access.
 - **Environment wins** over both files, everywhere. Consequence for `.env.example`: it currently sets many defaults uncommented (`STT_SHERPA_FINAL_SILENCE_MS=600`, `VOICES=standard`, …); copied as is, they would lock those fields in the UI. The server work must comment out every line whose value equals the default, keeping the explanations.
 
 ### 1.7 Voices, engines and turn detection: assistant settings sections
@@ -397,10 +417,14 @@ Text frames are JSON objects with a `type`. Decoding (`decodeClientMessage`, `de
 | `playback.stopped { turnId, playedSamples }` | owner | Final progress after a stop; `play`'s interruption completes |
 | `interrupt { turnId? }` | any | Interrupts the running committed turn (ignored if `turnId` names another turn) |
 | `text.send { requestId, text, speak }` | any | `result` (accepted or not), then a turn. Spoken only if the sender is the owner and `speak` |
-| `module.enable` / `module.disable { requestId, moduleId }` | any | §1.4; `result` to the sender, `module.changed` to all |
-| `module.configure { requestId, moduleId, patch }` | any | §1.4 |
-| `settings.update { requestId, sectionId, patch }` | any | Validate, save; `live` fields apply from the next turn; `result`, `section.changed`, `engine` (for `reloadPending`) |
+| `module.enable` / `module.disable { requestId, moduleId }` | any (admin for a `protected` module) | §1.4; `result` to the sender, `module.changed` to all |
+| `module.configure { requestId, moduleId, patch }` | any (admin for a `protected` module) | §1.4 |
+| `settings.update { requestId, sectionId, patch }` | any (admin for a `protected` section) | Validate, save; `live` fields apply from the next turn; `result`, `section.changed`, `engine` (for `reloadPending`) |
 | `engine.reload { requestId }` | any | §1.7; `engine` messages while reloading; `result` when done |
+| `vault.setup { requestId, password }` | any (only while there is no vault) | Create the key vault (§1.6), import `secrets.json`; this connection becomes admin; `vault` to every tab |
+| `vault.unlock { requestId, password }` | any | Unlock (or, when unlocked, check the password); this connection becomes admin; `bad_password` when wrong or rate limited |
+| `vault.lock { requestId }` | admin | Lock: keys leave memory, every connection loses admin access |
+| `vault.changePassword { requestId, oldPassword, newPassword }` | any (proves the password) | Re-encrypt with a new salt; this connection becomes admin |
 | `ping { id }` | any | `pong { id }` |
 
 Messages the role does not allow (playback reports from an observer, `mic.state` from an observer) are ignored with one `error` `not_owner`. Requests (`requestId`) are answered with exactly one `result` to the sender; the resulting change is broadcast to every tab (`module.changed`, `section.changed`, `engine`), the sender included, so every tab, including the one that made the change, updates from the broadcast. Each `ModuleInfo` and `SettingsSection` carries a `revision`; a client keeps the highest it has seen.
@@ -423,6 +447,7 @@ Messages the role does not allow (playback reports from an observer, `mic.state`
 | `reply.end { turnId }` (*owner*) | All reply audio has been sent |
 | `reply.stop { turnId }` (*owner*) | Stop playing now and answer `playback.stopped` |
 | `module.changed`, `section.changed`, `engine` | A module, section or the engines changed |
+| `vault { vault }` (*each tab, with its own `admin`*) | The vault's state or this tab's admin access changed (also in `welcome.snapshot.vault`) |
 | `result` (*sender*) | Answer to a request |
 | `error` | A problem not tied to a request (`turn_failed`, `mic_gap`, `playback_timeout`, …) |
 | `pong` (*sender*) | Answer to `ping` |
@@ -532,7 +557,7 @@ The server ignores playback reports for a turn that is not the one currently pla
 
 ### 2.8 Versioning
 
-`PROTOCOL_VERSION` (an integer, now 1) is checked once, at `hello`. Bump it for anything an older peer could misread: removed or renamed messages or fields, changed meaning, a new required field, a new member of a closed literal set (states, outcomes, error codes, field types), or a framing change. New optional fields and new message types do not need a bump (unknown types are ignored, unknown fields stripped). In production the UI is served by the assistant itself, so a mismatch means a stale tab or `next dev` against an older server; the UI then asks for a reload.
+`PROTOCOL_VERSION` (an integer, now 2: the key vault added the error codes `locked` and `bad_password`) is checked once, at `hello`. Bump it for anything an older peer could misread: removed or renamed messages or fields, changed meaning, a new required field, a new member of a closed literal set (states, outcomes, error codes, field types), or a framing change. New optional fields and new message types do not need a bump (unknown types are ignored, unknown fields stripped). In production the UI is served by the assistant itself, so a mismatch means a stale tab or `next dev` against an older server; the UI then asks for a reload.
 
 ---
 
@@ -725,12 +750,13 @@ Single-key shortcuts are ignored while focus is in a text field. `Esc` first clo
 
 ### 3.7 Options
 
-A drawer with four tabs. Everything in the first two is rendered from server data.
+A drawer with five tabs (Modules, Assistant, Keys & access, This device, About; Keys & access is item 5 below). Everything in the first two is rendered from server data.
 
 1. **Modules**: one card per `ModuleInfo`, in catalog order. Collapsed: switch (intent; sends `module.enable` / `module.disable`, shows a spinner until the `result`), name, one-line description, and either the status line (tone dot + text) or a state badge (`STARTING`, `ERROR`). Expanded: the error (danger box, with **Retry** = enable), the generated settings form, and the module's tools (name, description, a `READ-ONLY` chip for speculative tools).
 2. **Assistant**: the engines in use (read-only list from `EngineStatus.engines` and voices: provider, model, local/hosted), then one form per `SettingsSection`. Fields with `apply: "reload"` carry the note "Applies after reloading the engines (about 2 s; interrupts a reply)". While `reloadPending`, a bar at the top says "Saved changes need an engine reload" with **Reload now** (`engine.reload`). Engine problems (`EngineStatus.problems`) are listed here too.
 3. **This device** (stored in `localStorage`, not on the server): microphone (`enumerateDevices` after permission; "Default"), speaker (only if `AudioContext.setSinkId` exists), **Interrupting** as a three-way segmented control: *Headphones: instant* / *Speakers: say a few words* (default) / *Tap Stop to interrupt* (sends `audio.config`), the echo test (§5), and under "Advanced": output path (*Direct* / *Through a media element*), prebuffer (20–200 ms, default 60), captions, latency readout.
 4. **About**: protocol and server version, connection id, keyboard shortcuts.
+5. **Keys & access** (between Assistant and This device; 2026-11-14): by vault state (`lib/vault.ts` `keysView`): *setup* ("Protect your keys": new password twice), *unlock* (password + Unlock, with the error or a retry countdown), *elevate* (unlocked but not admin here: password + "Get edit access"), *admin* (Lock now, Change password). Shows the vault file's path and the forgotten-password rule. Protected module cards and sections on a page without admin access show a lock with "Unlock to change" (opens this tab), disabled inputs and no Save. When the engines failed and the vault is locked, the engine banner carries an inline password field. The state (`ClientState.vault`, `canChange`, `engineNeedsKeys`) and the checks live outside the drawer, so a redesigned settings screen reuses them.
 
 **Generated forms** (`SettingsForm` → one renderer per field type):
 

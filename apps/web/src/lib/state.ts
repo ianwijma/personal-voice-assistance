@@ -10,7 +10,8 @@ import type {
   ServerMessageType,
   SettingsSection,
   TraceInfo,
-  TurnSource
+  TurnSource,
+  VaultInfo
 } from "@pva/protocol"
 
 /**
@@ -96,6 +97,8 @@ export interface ClientState {
   readonly engine: EngineStatus
   readonly modules: { readonly order: ReadonlyArray<string>; readonly byId: Readonly<Record<string, ModuleInfo>> }
   readonly sections: ReadonlyArray<SettingsSection>
+  /** The key vault as this page sees it (`admin`: this page may change protected settings). */
+  readonly vault: VaultInfo
   readonly turns: ReadonlyArray<TurnView>
   readonly liveTranscript: string
   readonly traces: ReadonlyArray<TraceInfo>
@@ -115,6 +118,8 @@ export const MAX_TRACES = 50
 export const MAX_TOASTS = 3
 
 export const emptyEngine: EngineStatus = { state: "starting", problems: [], reloadPending: false, engines: [], voices: [] }
+/** A server that sends no vault (or has none yet): every page may change everything. */
+export const noVault: VaultInfo = { state: "none", admin: true }
 
 export const initialState: ClientState = {
   connection: { status: "connecting", attempt: 0, everConnected: false },
@@ -123,6 +128,7 @@ export const initialState: ClientState = {
   engine: emptyEngine,
   modules: { order: [], byId: {} },
   sections: [],
+  vault: noVault,
   turns: [],
   liveTranscript: "",
   traces: [],
@@ -251,6 +257,7 @@ const server: ServerHandlers = {
     engine: m.snapshot.engine,
     modules: { order: m.snapshot.modules.map((x) => x.id), byId: Object.fromEntries(m.snapshot.modules.map((x) => [x.id, x])) },
     sections: m.snapshot.sections,
+    vault: m.snapshot.vault ?? noVault,
     turns: historyToTurns(m.snapshot.history),
     traces: m.snapshot.traces.slice(-MAX_TRACES),
     toasts: s.toasts,
@@ -321,6 +328,7 @@ const server: ServerHandlers = {
   "module.changed": (s, m) => upsertModule(s, m.module),
   "section.changed": (s, m) => upsertSection(s, m.section),
   engine: (s, m) => ({ ...s, engine: m.engine }),
+  vault: (s, m) => ({ ...s, vault: m.vault }),
   result: (s, m) => {
     if (!(m.requestId in s.pending)) return s
     const { [m.requestId]: _done, ...pending } = s.pending
@@ -391,6 +399,13 @@ export const reducer = (s: ClientState, a: Action): ClientState => {
 }
 
 // ---- Derived values (selectors) ----
+
+/** May this page change `item` (a module or settings section)? Protected items need admin access. */
+export const canChange = (s: ClientState, item: { readonly protected?: boolean } | undefined): boolean =>
+  item?.protected !== true || s.vault.admin
+
+/** The engines failed and the key vault is locked: unlocking is the fix (the server reloads them). */
+export const engineNeedsKeys = (s: ClientState): boolean => s.engine.state === "failed" && s.vault.state === "locked"
 
 export const isOwner = (s: ClientState) => s.session.role === "owner"
 

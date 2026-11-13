@@ -34,7 +34,7 @@ Requirements: Node ≥ 22.18, pnpm 10, `tar` with bzip2, about 800 MB of disk fo
 ```sh
 pnpm install
 pnpm download-models          # default STT (Parakeet v2 + Silero VAD) and TTS (Piper en_US-lessac-medium), into models/
-cp .env.example .env          # set ANTHROPIC_API_KEY and LLM_PROVIDER=anthropic for real answers
+cp .env.example .env          # optional: settings you want fixed (keys go in the web UI, not here)
 
 echo "what's the time?" | pnpm start text      # text mode; works offline with the stand-in model
 pnpm start say "Hello, I run on this machine."   # plays on the speaker (or add --out hello.wav)
@@ -54,9 +54,11 @@ Settings come from environment variables and, in `serve` mode, from the web UI's
 
 A provider's settings (including its API key) are read only when that provider is selected. A missing key for a provider you don't use is never an error.
 
+**API keys go in the web UI, not in `.env`.** Options → Assistant (Language model, Speech engines) and the module cards take the keys; they are kept in an encrypted **key vault** outside the project, unlocked with your password after each start (see [Keys & access](#keys--access)). A key in `.env` still works and wins, but the UI marks it *set in .env (not protected)*: anything that can read the project folder, coding agents included, can read it. The CLI modes read keys from the environment, and also from the vault when `PVA_VAULT_PASSWORD` is set.
+
 | Stage | Selected by | Choices (default first) | Needs |
 |---|---|---|---|
-| Language model | `LLM_PROVIDER` | `fake` (offline stand-in), `anthropic` | `ANTHROPIC_API_KEY` |
+| Language model | `LLM_PROVIDER` | `fake` (offline stand-in), `anthropic`, `claude-subscription` | `anthropic`: `ANTHROPIC_API_KEY`; `claude-subscription`: the `claude` CLI logged in with a subscription and the *Claude subscription* module switched on (no key) |
 | Speech to text | `STT_PROVIDER` | `sherpa` (local), `deepgram` (hosted) | `sherpa`: model files (`pnpm download-models`); `deepgram`: `DEEPGRAM_API_KEY` |
 | Text to speech | `TTS_PROVIDER` | `sherpa` (local), `cartesia` (hosted) | `sherpa`: model files; `cartesia`: `CARTESIA_API_KEY` |
 | Voices | `VOICES`, `DEFAULT_VOICE` | `standard`; optional `natural`, `expressive` | each enabled voice's provider settings (see [Voices](#voices)) |
@@ -64,7 +66,9 @@ A provider's settings (including its API key) are read only when that provider i
 
 Within a local provider, the model is a setting: `STT_SHERPA_MODEL` (`parakeet-v2`, `parakeet-ultra`, `whisper-turbo`, `hybrid-nemotron-parakeet`, `nemotron-560`, `nemotron-320`, …; see [Speech recognition models](#speech-recognition-models)) and `TTS_SHERPA_PRESET` (`en_US-lessac-medium`, `nl_NL-pim-medium`, `kokoro-af_heart`). The adapter READMEs ([stt-sherpa](packages/stt-sherpa/README.md), [tts-sherpa](packages/tts-sherpa/README.md)) list every setting, the models and their measurements. To compare engines, run `say` and `bench --live` on the same WAV files with each.
 
-`fake` is an offline LLM stand-in: it answers time questions through the clock tool and echoes everything else. It is the default so that text mode works without any key. **For real use set `LLM_PROVIDER=anthropic`.**
+`fake` is an offline LLM stand-in: it answers time questions through the clock tool and echoes everything else. It is the default so that text mode works without any key. **For real use choose Anthropic (with an API key) or the Claude subscription** under Options → Assistant → Language model.
+
+**Claude subscription** (`claude-subscription`): the language model is Claude Code with the login of the `claude` program on this machine, so replies count against your Claude plan's limits instead of an API bill ([`@pva/agent-claude-code`](packages/agent-claude-code/README.md)). Anthropic's terms for using a subscription from other software are unclear, so the *Claude subscription* module is off by default and has its own opt-in switch. Choose it under Language model, then under Modules switch on *Claude subscription* (and, in its settings, *Use my Claude subscription*); it takes effect from the next turn, no reload. While the module is off, starting or failed, the offline stand-in answers and first says so ("Claude subscription is off — switch it on under Modules."). Claude Code gets only a short allowlist of environment variables (`PATH`, `HOME`, locale, proxy and CA settings, `CLAUDE_CONFIG_DIR`, …), never other providers' keys or the vault password.
 
 If a required setting or a model file is missing, the app lists every problem, with the stage it belongs to and how to fix it, and exits:
 
@@ -138,11 +142,23 @@ pnpm dev       # development: the assistant on :8787 and the UI with hot reload 
 
 One process on one port serves the UI and a WebSocket at `/ws`. The browser becomes the assistant's microphone and speaker: press **Start** on the page. Any number of tabs (at most 8) can be open; one owns the audio and the others see the conversation and play nothing ("Use this tab" moves the audio). Without a built UI the page says how to build it; the assistant runs anyway.
 
-The Options panel switches modules on and off and edits their settings while the assistant runs (a change applies from the next turn; a tool call in progress finishes), and edits the assistant settings (system prompt, voices, turn detection, language model, speech engines). Saved values go to `data/settings.json`, secrets such as API keys to `data/secrets.json` (mode 0600; the browser can set or remove a secret but never read it). `PVA_DATA_DIR` moves that directory. Environment variables and `.env` win over saved values and lock the field in the UI. Settings marked *reload* take effect after **Reload engines**, which rebuilds the speech and language engines in about 2 s and keeps the conversation.
+The Options panel switches modules on and off and edits their settings while the assistant runs (a change applies from the next turn; a tool call in progress finishes), and edits the assistant settings (system prompt, voices, turn detection, language model, speech engines). Saved values go to `data/settings.json`; secrets such as API keys go to the key vault (below; before you set a password, to `data/secrets.json` at mode 0600 as before). The browser can set or remove a secret but never read it. `PVA_DATA_DIR` moves the data directory. Environment variables and `.env` win over saved values and lock the field in the UI. Settings marked *reload* take effect after **Reload engines**, which rebuilds the speech and language engines in about 2 s and keeps the conversation.
 
-Settings: `SERVE_HOST` (default `127.0.0.1`), `SERVE_PORT` (8787), `SERVE_ALLOWED_ORIGINS` (other page origins allowed to open the socket; default the Next dev server on port 3000), `SERVE_TLS_CERT` + `SERVE_TLS_KEY` (PEM files; with both, the server speaks HTTPS/WSS on the same port), `PVA_WEB_DIR` (default `apps/web/out`), `PVA_DATA_DIR` (default `data/`). Ctrl+C closes the sockets, the engine processes and the modules.
+Settings: `SERVE_HOST` (default `127.0.0.1`), `SERVE_PORT` (8787), `SERVE_ALLOWED_ORIGINS` (other page origins allowed to open the socket; default the Next dev server on port 3000), `SERVE_TLS_CERT` + `SERVE_TLS_KEY` (PEM files; with both, the server speaks HTTPS/WSS on the same port), `PVA_WEB_DIR` (default `apps/web/out`), `PVA_DATA_DIR` (default `data/`), `PVA_VAULT_PATH`, `PVA_VAULT_PASSWORD` (below). Ctrl+C closes the sockets, the engine processes and the modules.
 
-**Reaching it from another device.** Browsers allow the microphone only on `https://` pages or on `localhost`, and this machine has no sound card, so the microphone and speaker are always another device. The assistant binds to `127.0.0.1` and has **no login**: anyone who can reach the port can use it and change its settings. Routes, simplest first:
+#### Keys & access
+
+Options → **Keys & access**:
+
+1. **Set a password** (at least 8 characters, typed twice). The keys in `data/secrets.json` move into an encrypted file outside the project, `~/.config/pva/vault.enc` (`$XDG_CONFIG_HOME/pva/vault.enc`, or `PVA_VAULT_PATH`; mode 0600 in a 0700 directory), and `data/secrets.json` is deleted; the page says how many keys moved. From then on every key entered in the UI is stored only there.
+2. **After every restart the keys are locked.** Engines and modules that need a key do not start ("Keys are locked — unlock them in Options"); local speech and the Claude subscription keep working. Type the password (the banner on the stage has a password field too): the failed engines reload and failed modules restart by themselves. To run unattended, put the password in `.env` as `PVA_VAULT_PASSWORD`, the one secret meant for `.env`: the vault then unlocks at start (a wrong one is logged and leaves it locked). It is never logged, taken out of the environment at start and never passed to Claude Code.
+3. **Who may change what.** Typing the password on a page also gives *that page* (that connection) edit access to protected settings: anything with a key, the language model and speech engine choices, and agent modules. Other pages see them read-only with a lock and an "Unlock to change" link; the server refuses their changes. Edit access ends when the page closes, on **Lock now**, or after 15 minutes without a change. `PVA_VAULT_PASSWORD` never gives edit access. Everything else (voices, listening, chat) stays open to every page.
+4. **Lock now** removes the keys from memory and ends every page's edit access (running engines keep the keys they started with until they are reloaded). **Change password** re-encrypts the vault with a new salt.
+5. **Forgot the password?** Delete the vault file; the keys in it are lost and you enter them again. There is no other way in.
+
+The vault is `node:crypto` only: scrypt (N = 2¹⁷, r = 8, p = 1, a random 16-byte salt, parameters in the file; unlocking took 289 ms on the development machine) and AES-256-GCM with a fresh 12-byte IV per write, the header authenticated. A wrong password and a modified file both fail to open, and the file is never reset. After 5 wrong passwords in a row, unlocking is refused for 30 s, then the wait doubles.
+
+**Reaching it from another device.** Browsers allow the microphone only on `https://` pages or on `localhost`, and this machine has no sound card, so the microphone and speaker are always another device. The assistant binds to `127.0.0.1` and has **no login**: anyone who can reach the port can use it and change its open settings (once a vault password is set, keys, providers and agents need that password; see [Keys & access](#keys--access)). Routes, simplest first:
 
 1. **SSH tunnel** (a laptop on your network; the recommended route):
    1. On the assistant machine: `pnpm serve` (leave it running; it stays on `127.0.0.1`).
@@ -488,6 +504,7 @@ Taken from the files in the model archives and the adapter READMEs; nobody has r
 | PipeWire backend | unit tests with stand-in processes; in voice mode `pw-record` started and delivered audio to a stand-in STT server on the development machine, which has no sound card (so that audio was not a real microphone signal) |
 | Weather module | unit tests with an injected `fetch`; never called against the real Open-Meteo API from the tests |
 | **Serve mode** (WebSocket protocol, ownership, modules and settings from the UI, engine reload, echo gate) | unit tests (module host, echo gate, web audio backend, conversation events) and scripted-client tests against the real server with injected providers; a live test with the local models; run by hand on the development machine with a scripted client streaming `bench-audio` WAVs into `LLM_PROVIDER=fake pnpm start serve`: real recognition, Piper reply audio over the socket, an engine reload with the local models (1.8 s, conversation kept, no engine process left behind), and Ctrl+C leaving no processes |
+| **Key vault, admin access, Claude subscription as the language model** (2026-11-14) | vault unit tests (round trip, wrong password, tampering, change password, file modes, legacy import, rate limit with an injected clock, unlock time with the real parameters); scripted-client tests against the real server (protected changes refused per connection, unlock reloads failed engines, restart starts locked, `PVA_VAULT_PASSWORD`); the agent conversation with the scripted Agent SDK fake (module off → stand-in with notice, on → Claude, no reload); Playwright against the mock (set password → lock → unlock → change → lock → refused; second page; banner unlock). Text mode with `LLM_PROVIDER=claude-subscription` and the module off, by hand. **Not** run against a real subscription in this work (the adapter's own live test passed earlier on the owner's Max plan), and never with the real UI against the real server |
 | **Web UI against the real assistant** (`pnpm e2e:real`, 10 tests; 2026-11-13) | the built page in headless Chromium (no sound card), fake microphone fed from WAVs, real `serve` with the local models and the fake LLM: visual states of a spoken turn in order, transcript and reply in the chat, latency readout; the player worklet really runs (`playback.started`, progress every 250 ms, `finished`); barge-in in `instant` and `confirm` mode with history holding only the clauses that played; `manual` mode ignoring speech over the reply; typed message with a spoken reply; Stop (no stall error, history cut); two pages and a takeover in the middle of a reply; server killed (SIGKILL and SIGINT) in the middle of a reply, then restarted: the page reconnects and gets the audio back without a new Start; a module setting the server rejects, a reconfiguration and disabling/enabling seen in a second page and used on the next turn. Also by hand: the `pnpm dev` page against the real server, and Ctrl+C in `pnpm serve` and `pnpm dev` leaving no processes. Latency through the browser: [Through the browser](#through-the-browser) |
 
 **Not verified:**
@@ -520,6 +537,7 @@ packages/audio-pipewire   microphone/speaker via pw-record / pw-cat
 packages/audio-file       WAV in / WAV out (tests, benchmarks)
 packages/audio-web        the browser as microphone and speaker (serve mode), over an abstract link
 packages/protocol         the browser ↔ assistant protocol: message schemas, binary frames, examples
+packages/agent-claude-code the claude-subscription agent (Claude Code with the owner's login), off by default with an opt-in
 models/                   downloaded models (git-ignored; pnpm download-models)
 packages/modules-builtin  clock, weather
 apps/assistant            providers.ts, voices.ts, modules.ts, modes: text, voice, serve, bench, say, transcribe

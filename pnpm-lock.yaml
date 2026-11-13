@@ -71,6 +71,9 @@ importers:
       '@effect/platform-node':
         specifier: 'catalog:'
         version: 4.1.4(effect@4.1.4)(redis@6.3.1(@opentelemetry/api@1.10.0))
+      '@pva/agent-claude-code':
+        specifier: workspace:*
+        version: link:../../packages/agent-claude-code
       '@pva/audio-file':
         specifier: workspace:*
         version: link:../../packages/audio-file

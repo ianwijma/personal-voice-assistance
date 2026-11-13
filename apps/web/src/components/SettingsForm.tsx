@@ -2,6 +2,9 @@
 import { type ComponentType, useEffect, useRef, useState } from "react"
 import type { FieldError, SettingField, SettingsForm as Form, SettingsPatch, SettingValue } from "@pva/protocol"
 import type { ResultMessage } from "@/lib/connection.ts"
+import { shallowEqual } from "@/lib/store.ts"
+import { secretStatus } from "@/lib/vault.ts"
+import { useClientState } from "./context.tsx"
 import { computePatch, type Draft, errorsByKey, type FormSync, initialDraft, isEmptyPatch, reconcile, splitAdvanced } from "@/lib/forms.ts"
 import { fieldRenderers } from "@/ui/fieldRenderers.ts"
 import type { FieldProps } from "./fields/types.ts"
@@ -32,13 +35,16 @@ export function SettingsForm({
   revision,
   idPrefix,
   onSave,
-  saveLabel = "Save"
+  saveLabel = "Save",
+  readOnly = false
 }: {
   readonly form: Form
   readonly revision: number
   readonly idPrefix: string
   readonly onSave: (patch: SettingsPatch) => Promise<ResultMessage>
   readonly saveLabel?: string
+  /** Shown but not editable (a protected form on a page without admin access): inputs disabled, no Save. */
+  readonly readOnly?: boolean
 }) {
   const [sync, setSync] = useState<FormSync>(() => ({ draft: initialDraft(form), baseRevision: revision, stale: false }))
   const [serverErrors, setServerErrors] = useState<ReadonlyArray<FieldError>>([])
@@ -46,6 +52,7 @@ export function SettingsForm({
   const [localErrors, setLocalErrors] = useState<Readonly<Record<string, string>>>({})
   const [saving, setSaving] = useState(false)
   const [saved, setSaved] = useState(false)
+  const vault = useClientState((s) => s.vault, shallowEqual)
   const previous = useRef({ form, revision })
 
   useEffect(() => {
@@ -108,7 +115,9 @@ export function SettingsForm({
             <Icon name="lock" size={15} className="mt-0.5 shrink-0 text-ink-faint" />
             <div className="min-w-0 text-[14px]">
               {field.type !== "secret" && <div className="break-words font-mono text-[13px] text-ink">{displayValue(field, form.values[field.key])}</div>}
-              <div className="text-[13px] text-ink-muted">{field.locked.reason}</div>
+              <div className="text-[13px] text-ink-muted">
+                {field.type === "secret" ? secretStatus(form.secrets[field.key] ?? { set: true, source: "env" }, vault, field.env) : field.locked.reason}
+              </div>
             </div>
           </div>
         ) : (
@@ -125,7 +134,7 @@ export function SettingsForm({
                 const { [field.key]: _old, ...rest } = d.secrets
                 return { ...d, secrets: value === undefined || value === "" ? rest : { ...rest, [field.key]: value } }
               })}
-            disabled={saving}
+            disabled={saving || readOnly}
             invalid={fieldErrors.length > 0}
             onLocalError={(message) =>
               setLocalErrors((e) => {
@@ -148,6 +157,7 @@ export function SettingsForm({
     <form
       className="flex flex-col gap-5"
       data-testid={`form-${idPrefix}`}
+      data-readonly={readOnly ? "true" : undefined}
       onSubmit={(e) => {
         e.preventDefault()
         void save()
@@ -175,7 +185,7 @@ export function SettingsForm({
           <div className="mt-4 flex flex-col gap-5">{advanced.map(renderField)}</div>
         </details>
       )}
-      {form.fields.some((f) => f.locked === undefined) && (
+      {!readOnly && form.fields.some((f) => f.locked === undefined) && (
         <div className="flex items-center gap-2">
           <Button type="submit" variant={dirty ? "primary" : "default"} size="sm" disabled={!dirty || saving || hasLocalErrors}>
             {saving && <Spinner size={13} />}

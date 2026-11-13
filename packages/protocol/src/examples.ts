@@ -87,7 +87,8 @@ export const exampleHomeAssistantModule: ModuleInfo = {
     secrets: { token: { set: true, source: "store" } },
     errors: []
   },
-  revision: 7
+  revision: 7,
+  protected: true
 }
 
 export const exampleVoiceSection: SettingsSection = {
@@ -179,7 +180,8 @@ export const exampleSnapshot: Snapshot = {
     { role: "user", text: "Tell me a long story" },
     { role: "assistant", text: "Once upon a time,", interrupted: true, tools: [] }
   ],
-  traces: [exampleTrace]
+  traces: [exampleTrace],
+  vault: { state: "unlocked", admin: true, location: "/home/owner/.config/pva/vault.enc" }
 }
 
 const audio = { contextSampleRate: 48_000, baseLatencyMs: 10, outputLatencyMs: 21.3, echoCancellation: true, outputPath: "direct" } as const
@@ -211,6 +213,10 @@ export const clientExamples: { readonly [T in ClientMessageType]: Extract<Client
     patch: { values: { DEFAULT_VOICE: "natural", VOICES: ["standard", "natural"] }, secrets: {} }
   },
   "engine.reload": { type: "engine.reload", requestId: "r6" },
+  "vault.setup": { type: "vault.setup", requestId: "r7", password: "correct horse battery" },
+  "vault.unlock": { type: "vault.unlock", requestId: "r8", password: "correct horse battery" },
+  "vault.lock": { type: "vault.lock", requestId: "r9" },
+  "vault.changePassword": { type: "vault.changePassword", requestId: "r10", oldPassword: "correct horse battery", newPassword: "staple gun lamp post" },
   "ping": { type: "ping", id: 41 }
 }
 
@@ -244,6 +250,7 @@ export const serverExamples: { readonly [T in ServerMessageType]: Extract<Server
   "module.changed": { type: "module.changed", module: exampleHomeAssistantModule },
   "section.changed": { type: "section.changed", section: exampleVoiceSection },
   "engine": { type: "engine", engine: { ...exampleSnapshot.engine, state: "reloading" } },
+  "vault": { type: "vault", vault: { state: "locked", admin: false, location: "/home/owner/.config/pva/vault.enc", retryAfterMs: 30_000 } },
   "result": {
     type: "result",
     requestId: "r4",

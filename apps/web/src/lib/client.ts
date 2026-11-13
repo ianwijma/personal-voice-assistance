@@ -40,6 +40,11 @@ export interface AssistantClient {
   readonly configureModule: (moduleId: string, patch: SettingsPatch) => Promise<ResultMessage>
   readonly updateSection: (sectionId: string, patch: SettingsPatch) => Promise<ResultMessage>
   readonly reloadEngines: () => Promise<ResultMessage>
+  /** Key vault (see `lib/vault.ts`): passwords go to the server only and are never kept here. */
+  readonly setupVault: (password: string) => Promise<ResultMessage>
+  readonly unlockVault: (password: string) => Promise<ResultMessage>
+  readonly lockVault: () => Promise<ResultMessage>
+  readonly changeVaultPassword: (oldPassword: string, newPassword: string) => Promise<ResultMessage>
   readonly setPrefs: (patch: Partial<Prefs>) => void
   readonly echoTest: () => Promise<{ cancelled: boolean; residualDb: number }>
   readonly connection: Connection
@@ -316,6 +321,10 @@ export const createAssistantClient = (): AssistantClient => {
     configureModule: (moduleId, patch) => connection.request({ type: "module.configure", moduleId, patch }),
     updateSection: (sectionId, patch) => connection.request({ type: "settings.update", sectionId, patch }),
     reloadEngines: () => connection.request({ type: "engine.reload" }),
+    setupVault: (password) => connection.request({ type: "vault.setup", password }),
+    unlockVault: (password) => connection.request({ type: "vault.unlock", password }),
+    lockVault: () => connection.request({ type: "vault.lock" }),
+    changeVaultPassword: (oldPassword, newPassword) => connection.request({ type: "vault.changePassword", oldPassword, newPassword }),
     setPrefs,
     diagnostics,
     echoTest: async () => {

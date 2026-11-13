@@ -1,7 +1,9 @@
 "use client"
 import { useState } from "react"
 import type { ModuleInfo } from "@pva/protocol"
+import { canChange } from "@/lib/state.ts"
 import { useClient, useClientState } from "./context.tsx"
+import { LockedBadge } from "./KeysPanel.tsx"
 import { SettingsForm } from "./SettingsForm.tsx"
 import { StatusLine } from "./StatusLine.tsx"
 import { Icon, Spinner } from "./ui/Icon.tsx"
@@ -17,6 +19,8 @@ export function ModuleCard({ module: m }: { readonly module: ModuleInfo }) {
   const client = useClient()
   const [expanded, setExpanded] = useState(m.state === "error")
   const busy = useClientState((s) => Object.values(s.pending).some((p) => p.target === m.id && (p.kind === "module.enable" || p.kind === "module.disable")))
+  // Protected (a key, or an agent) and this page has no admin access: shown read-only; the server refuses changes anyway.
+  const editable = useClientState((s) => canChange(s, m))
   const toggle = async (enabled: boolean) => {
     const result = await client.enableModule(m.id, enabled)
     if (!result.ok) {
@@ -30,11 +34,12 @@ export function ModuleCard({ module: m }: { readonly module: ModuleInfo }) {
     <section
       data-testid={`module-${m.id}`}
       data-state={m.state}
+      data-locked={editable ? undefined : "true"}
       className={cx("rounded-lg border bg-surface transition-colors duration-[240ms]", m.state === "error" ? "border-danger/35" : "border-line")}
     >
       <div className="flex items-start gap-3 p-4">
         <div className="pt-0.5">
-          <Switch checked={m.enabled} onChange={(v) => void toggle(v)} label={`${m.name} enabled`} busy={moduleSwitchBusy(m.state, busy)} disabled={busy} />
+          <Switch checked={m.enabled} onChange={(v) => void toggle(v)} label={`${m.name} enabled`} busy={moduleSwitchBusy(m.state, busy)} disabled={busy || !editable} />
         </div>
         <button
           type="button"
@@ -59,16 +64,17 @@ export function ModuleCard({ module: m }: { readonly module: ModuleInfo }) {
           <Icon name="chevronDown" size={18} className={cx("mt-0.5 shrink-0 text-ink-faint transition-transform duration-[120ms] group-hover:text-ink", expanded && "rotate-180")} />
         </button>
       </div>
+      {!editable && <div className="-mt-2 px-4 pb-3 pl-[4.25rem]"><LockedBadge name={m.name} /></div>}
       {expanded && (
         <div id={bodyId} className="flex flex-col gap-5 border-t border-line/70 px-4 pb-5 pt-4">
           {m.state === "error" && m.error !== undefined && (
             <div role="alert" className="flex flex-col items-start gap-2 rounded-md border border-danger/40 bg-danger/5 px-3 py-2.5">
               <p className="text-[13px] text-ink">{m.error}</p>
-              {m.enabled && <Button size="sm" onClick={() => void toggle(true)} disabled={busy}>{busy && <Spinner size={12} />}Retry</Button>}
+              {m.enabled && editable && <Button size="sm" onClick={() => void toggle(true)} disabled={busy}>{busy && <Spinner size={12} />}Retry</Button>}
             </div>
           )}
           {m.settings.fields.length > 0 && (
-            <SettingsForm form={m.settings} revision={m.revision} idPrefix={`m-${m.id}`} onSave={(patch) => client.configureModule(m.id, patch)} />
+            <SettingsForm form={m.settings} revision={m.revision} idPrefix={`m-${m.id}`} readOnly={!editable} onSave={(patch) => client.configureModule(m.id, patch)} />
           )}
           {m.tools.length > 0 && (
             <div>

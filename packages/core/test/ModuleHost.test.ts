@@ -298,4 +298,39 @@ describe("ModuleHost", () => {
       }))
       assert.strictEqual(m.probe.closes, 2)
     }))
+  it.effect("setSecrets: secrets change without a save; an enabled module that failed for a missing key starts once it has one", () =>
+    Effect.gen(function*() {
+      let starts = 0
+      const keyed = defineModule({
+        id: "keyed",
+        name: "Keyed",
+        description: "Needs a key",
+        settings: { token: Setting.secret({ label: "Token", required: true }) },
+        start: ({ settings }) => Effect.sync(() => {
+          starts++
+          return { instructions: `Key ${settings.token?.length ?? 0}` }
+        })
+      })
+      const { persistence, saves } = fakePersistence({ keyed: { enabled: true } })
+      const h = yield* makeModuleHost({ catalog: [keyed], persistence, env: {} })
+      const seen: Array<ModuleInfo> = []
+      h.subscribe((info) => seen.push(info))
+      yield* h.startEnabled
+      assert.strictEqual(h.modules()[0]!.state, "error")
+      assert.strictEqual(starts, 0)
+
+      yield* h.setSecrets({ keyed: { token: "abc" } })
+      assert.strictEqual(h.modules()[0]!.state, "running")
+      assert.deepStrictEqual(h.modules()[0]!.settings.secrets.token, { set: true, source: "store" })
+      assert.strictEqual(starts, 1)
+      assert.deepStrictEqual(h.snapshot().instructions, ["Key 3"])
+      assert.strictEqual(saves.length, 0)
+
+      // Taken away again (the vault was locked): the form says so, the running instance keeps running.
+      yield* h.setSecrets({})
+      assert.deepStrictEqual(h.modules()[0]!.settings.secrets.token, { set: false, source: "none" })
+      assert.strictEqual(h.modules()[0]!.state, "running")
+      assert.strictEqual(saves.length, 0)
+      assert.ok(seen.length >= 3)
+    }).pipe(Effect.scoped))
 })

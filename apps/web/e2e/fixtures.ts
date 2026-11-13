@@ -49,7 +49,7 @@ export const writeFakeMic = () => {
   writeFileSync(fakeMicPath, Buffer.concat([header, data]))
 }
 
-export type Scenario = "voice" | "typed" | "modules" | "engine-failed" | "drop-mid-reply" | "takeover" | "outdated"
+export type Scenario = "voice" | "typed" | "modules" | "engine-failed" | "drop-mid-reply" | "takeover" | "outdated" | "vault" | "keys-locked"
 
 export interface MockLog {
   readonly scenario: string

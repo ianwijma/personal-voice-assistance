@@ -11,6 +11,7 @@ import {
   TurnSource
 } from "./common.ts"
 import { EngineStatus, ModuleInfo, SettingsSection, Snapshot, TraceInfo } from "./snapshot.ts"
+import { VaultInfo } from "./vault.ts"
 
 /**
  * Text frames from the assistant to the browser. Binary frames from the
@@ -147,6 +148,12 @@ export const Engine = Schema.Struct({
   engine: EngineStatus
 })
 
+/** The vault's state or this page's admin access changed. Sent to each tab with its own `admin`. */
+export const Vault = Schema.Struct({
+  type: Schema.Literal("vault"),
+  vault: VaultInfo
+})
+
 /** Outcome of a request (`requestId` of the request). Sent only to the requesting tab. */
 export const Result = Schema.Struct({
   type: Schema.Literal("result"),
@@ -184,6 +191,7 @@ export const ServerMessage = Schema.Union([
   ModuleChanged,
   SectionChanged,
   Engine,
+  Vault,
   Result,
   ErrorMessage,
   Pong

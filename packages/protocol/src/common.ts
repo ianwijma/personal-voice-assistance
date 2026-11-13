@@ -80,6 +80,13 @@ export const ErrorCode = Schema.Literals([
   "playback_timeout",
   /** A turn failed (provider error); the conversation continues. */
   "turn_failed",
+  /**
+   * Protected: the setting or module can only be changed by a page with admin access (type the vault password
+   * in Options → Keys & access), or the keys it needs are locked.
+   */
+  "locked",
+  /** A vault password was wrong, too short, or refused for now (too many attempts; see `vault.retryAfterMs`). */
+  "bad_password",
   "internal"
 ])
 export type ErrorCode = typeof ErrorCode.Type

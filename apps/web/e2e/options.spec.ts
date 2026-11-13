@@ -86,7 +86,7 @@ test("assistant settings: a reload field marks a reload pending; Reload now appl
   expect(types).toContain("engine.reload")
   // The voices section uses the same generated form (choice + multichoice).
   await expect(page.getByTestId("section-voices").getByRole("radio", { name: "natural" })).toBeVisible()
-  await expect(page.getByTestId("section-language-model")).toContainText("Set by ANTHROPIC_API_KEY in the environment")
+  await expect(page.getByTestId("section-language-model")).toContainText("Set by ANTHROPIC_API_KEY in .env (not protected)")
 })
 
 test("a change from another tab updates a clean form and is flagged on a dirty one", async ({ page }) => {

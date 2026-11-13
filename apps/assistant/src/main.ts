@@ -1,7 +1,7 @@
 import "./env.ts" // first: loads .env before anything reads the environment
 import { NodeRuntime } from "@effect/platform-node"
-import { Conversation, ToolRegistry, TurnTrace } from "@pva/core"
-import { Cause, Config, Effect, Layer, Logger, Stream } from "effect"
+import { Conversation, Llm, ToolRegistry, TurnTrace } from "@pva/core"
+import { Cause, Config, ConfigProvider, Effect, Layer, Logger, Stream } from "effect"
 import { resolve } from "node:path"
 import * as readline from "node:readline"
 import { collectWavs, parseLiveArgs, runLive } from "./bench/live.ts"
@@ -15,6 +15,8 @@ import { FakeLlm } from "./FakeLlm.ts"
 import { LlmLayer, SttLayer, TtsLayer } from "./providers.ts"
 import { sayCommand } from "./say.ts"
 import { serveMode } from "./serve/serveMode.ts"
+import { defaultVaultPath, openVault } from "./serve/Vault.ts"
+import { makeSubscriptionAgents, SUBSCRIPTION_AGENT_ID, SUBSCRIPTION_PROVIDER } from "./subscription.ts"
 import { buildProviders, describeConfigError, StartupError } from "./startup.ts"
 import { runTextTurns } from "./text.ts"
 import { compareModelsCommand } from "./compareModels.ts"
@@ -42,11 +44,25 @@ const StderrLogger = Logger.layer([
 
 // Text mode uses the same system prompt as voice mode (including the voice
 // instructions), so the model behaves the same; markers are stripped from the output.
+// LLM_PROVIDER=claude-subscription: the claude-subscription agent module (switched on and opted in from the web UI,
+// or with CLAUDE_SUBSCRIPTION_OPT_IN) answers; the offline stand-in answers, with a notice, when it is not running.
 const ConversationLayer = Layer.unwrap(Effect.gen(function*() {
   const settings = yield* AppConfig
   const voices = yield* loadVoiceSettings
   const modules = yield* startCliModules()
   const systemPrompt = withVoicePrompt(withModuleInstructions(settings.systemPrompt, modules.instructions), voices)
+  const llmProvider = yield* Config.String("LLM_PROVIDER").pipe(Config.withDefault("fake"))
+  if (llmProvider === SUBSCRIPTION_PROVIDER) {
+    const fallbackLlm = yield* Llm
+    const toAgents = makeSubscriptionAgents({
+      fallbackLlm,
+      agents: () => modules.agents,
+      module: () => modules.infos.find((m) => m.id === SUBSCRIPTION_AGENT_ID),
+      promptFor: (agent, turn) =>
+        agent.systemPrompt === undefined ? turn.system : withVoicePrompt(withModuleInstructions(agent.systemPrompt, modules.instructions), voices)
+    })
+    return Conversation.layerWithAgents({ ...settings, setup: Effect.succeed(toAgents({ system: systemPrompt, registry: modules.registry })) })
+  }
   return Conversation.layer({ ...settings, systemPrompt }).pipe(Layer.provide(Layer.succeed(ToolRegistry, modules.registry)))
 })).pipe(
   Layer.provide(Layer.mergeAll(LlmLayer, TurnTrace.layer()))
@@ -169,8 +185,33 @@ const program: Effect.Effect<void, unknown> = mode === "text"
       "say [--voice NAME] [--out FILE] <text> | transcribe <wav file> | compare-models [--models a,b] [--agc on|off|both] [--ref TEXT] <wavs>]"
   })
 
+/**
+ * CLI modes read provider settings from the environment. With PVA_VAULT_PASSWORD set they also find the API keys
+ * entered in the web UI (the key vault's section keys), as a fallback behind the environment.
+ */
+const withVaultKeys = <A, E>(effect: Effect.Effect<A, E>): Effect.Effect<A, E> =>
+  Effect.gen(function*() {
+    const password = process.env.PVA_VAULT_PASSWORD ?? ""
+    if (password === "") return yield* effect
+    const vault = yield* Effect.promise(() => openVault({ path: defaultVaultPath(process.env) }))
+    if (vault.state() !== "locked") return yield* effect
+    const unlocked = yield* Effect.promise(() => vault.unlock(password))
+    if (!unlocked.ok) {
+      yield* Effect.logWarning(`PVA_VAULT_PASSWORD did not unlock the key vault: ${unlocked.message}`)
+      return yield* effect
+    }
+    const keys: Record<string, string> = {}
+    for (const section of Object.values(vault.secrets()?.sections ?? {})) Object.assign(keys, section)
+    vault.lock()
+    const env: Record<string, string> = {}
+    for (const [key, value] of Object.entries(process.env)) if (value !== undefined && value !== "") env[key] = value
+    return yield* effect.pipe(
+      Effect.provideService(ConfigProvider.ConfigProvider, ConfigProvider.orElse(ConfigProvider.fromEnvRecord(env), ConfigProvider.fromEnvRecord(keys)))
+    )
+  })
+
 NodeRuntime.runMain(
-  program.pipe(
+  (mode === "serve" ? program : withVaultKeys(program)).pipe(
     Effect.catch((e) => {
       const message = e instanceof StartupError
         ? e.message
