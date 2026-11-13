@@ -1,0 +1,50 @@
+{
+  "name": "@pva/web",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "worklets": "node scripts/build-worklets.mjs",
+    "predev": "node scripts/build-worklets.mjs",
+    "dev": "next dev",
+    "dev:mock": "node scripts/build-worklets.mjs && node scripts/dev-mock.mjs",
+    "mock": "tsx mock/server.ts",
+    "prebuild": "node scripts/build-worklets.mjs",
+    "build": "next build",
+    "check": "node scripts/build-worklets.mjs && tsc -p tsconfig.json && tsc -p worklets/tsconfig.json && tsc -p mock/tsconfig.json",
+    "test": "node scripts/build-worklets.mjs && vitest run",
+    "e2e": "node scripts/build-worklets.mjs && next build && playwright test --project static --project dev",
+    "e2e:install": "playwright install --only-shell chromium",
+    "screenshots": "node scripts/build-worklets.mjs && next build && playwright test --project screenshots",
+    "e2e:real": "export PVA_WEB_EXPORT_DIR=\"${PVA_WEB_EXPORT_DIR:-out-e2e}\" && node scripts/build-worklets.mjs && next build && playwright test -c playwright.real.config.ts --project real",
+    "bench:browser": "node scripts/build-worklets.mjs && next build && playwright test -c playwright.real.config.ts --project real-latency",
+    "screenshots:real": "node scripts/build-worklets.mjs && next build && playwright test -c playwright.real.config.ts --project real-screenshots"
+  },
+  "dependencies": {
+    "@fontsource/ibm-plex-mono": "5.3.0",
+    "@fontsource/ibm-plex-sans": "5.3.0",
+    "@pva/protocol": "workspace:*",
+    "effect": "catalog:",
+    "next": "16.4.6",
+    "react": "19.3.1",
+    "react-dom": "19.3.1"
+  },
+  "devDependencies": {
+    "@playwright/test": "catalog:",
+    "@pva/audio-web": "workspace:*",
+    "@pva/core": "workspace:*",
+    "@tailwindcss/turbopack": "4.3.5",
+    "@testing-library/jest-dom": "6.9.1",
+    "@testing-library/react": "16.3.3",
+    "@types/node": "catalog:",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@types/ws": "catalog:",
+    "jsdom": "31.0.0",
+    "tailwindcss": "4.3.5",
+    "tsx": "catalog:",
+    "typescript": "catalog:",
+    "vitest": "catalog:",
+    "ws": "catalog:"
+  }
+}

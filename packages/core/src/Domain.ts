@@ -1,0 +1,88 @@
+/**
+ * Events produced by `Stt`, including turn detection.
+ *
+ * Utterance boundaries (contract, relied on by Stop; docs/ARCHITECTURE.md): every
+ * utterance begins with `SpeechStarted` and ends with exactly one `EndOfTurn`;
+ * `Interim`, `EagerEndOfTurn` and `TurnResumed` in between belong to it. An
+ * utterance for which `SpeechStarted` was sent ALWAYS ends with an `EndOfTurn`,
+ * also when no words were recognised: its `text` is then the empty string. A
+ * recogniser that commits without having sent `SpeechStarted` sends it right
+ * before the `EndOfTurn`. An `EndOfTurn` with empty or blank text starts nothing in
+ * `Conversation`: it closes the utterance (and a Stop attached to it) and discards a
+ * speculative turn. `EagerEndOfTurn` is never empty; one that is (a recogniser
+ * breaking the contract) discards a speculative turn and starts nothing, but does NOT
+ * end the utterance: it stays open and a Stop stays in force until the `EndOfTurn`
+ * (review round 5: an eager event must never lift a cancellation).
+ *
+ * Every `EagerEndOfTurn`, `TurnResumed` and `EndOfTurn` therefore arrives inside an open utterance
+ * (after a `SpeechStarted`, before that utterance's `EndOfTurn`). One that arrives with no utterance
+ * open breaks the contract and `Conversation` ignores it — it starts, promotes, discards and
+ * interrupts nothing (logged at most once per 10 s) — because a duplicated final would otherwise
+ * run its action twice (review round 6). A recogniser that reconnects in the middle of an utterance
+ * must therefore send `SpeechStarted` again before the rest of it if it has already closed the first
+ * part with an `EndOfTurn`. Typed text, `Say` and Stop are not recogniser events and are never ignored.
+ */
+export type SttEvent =
+  | { readonly _tag: "SpeechStarted" }
+  | { readonly _tag: "Interim"; readonly text: string }
+  | { readonly _tag: "EagerEndOfTurn"; readonly text: string }
+  | { readonly _tag: "TurnResumed" }
+  | { readonly _tag: "EndOfTurn"; readonly text: string }
+
+export interface ToolCall {
+  readonly id: string
+  readonly name: string
+  readonly input: unknown
+}
+
+export interface ToolResult {
+  readonly id: string
+  readonly name: string
+  /** Text returned to the model (JSON for structured results). */
+  readonly content: string
+  readonly isError: boolean
+}
+
+/**
+ * Conversation history. Tool results get their own role; adapters map them to
+ * whatever the provider expects (for Anthropic: a user message with
+ * `tool_result` blocks).
+ */
+export type Message =
+  | { readonly role: "user"; readonly content: string }
+  | {
+    readonly role: "assistant"
+    readonly content: string
+    readonly toolCalls?: ReadonlyArray<ToolCall>
+    /** The user barged in; `content` is only what was actually played. */
+    readonly interrupted?: boolean
+    /** The agent that said it (absent in single-model conversations and history from before agents). */
+    readonly agentId?: string
+  }
+  | { readonly role: "tool"; readonly results: ReadonlyArray<ToolResult> }
+
+export interface ToolSpec {
+  readonly name: string
+  readonly description: string
+  /** JSON Schema (draft 2020-12) of the tool input. */
+  readonly inputSchema: Readonly<Record<string, unknown>>
+}
+
+export interface LlmRequest {
+  /** Stable instructions. Identical across turns so adapters can cache it. */
+  readonly system: string
+  /**
+   * Per-turn facts from context providers (current time, ...). Changes between
+   * turns, so adapters must place it after any cached prefix.
+   */
+  readonly context?: string
+  readonly messages: ReadonlyArray<Message>
+  readonly tools: ReadonlyArray<ToolSpec>
+}
+
+export type StopReason = "end" | "tool_use" | "max_tokens" | "other"
+
+export type LlmEvent =
+  | { readonly _tag: "TextDelta"; readonly text: string }
+  | { readonly _tag: "ToolCall"; readonly id: string; readonly name: string; readonly input: unknown }
+  | { readonly _tag: "Done"; readonly stopReason: StopReason }

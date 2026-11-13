@@ -1,0 +1,142 @@
+/**
+ * Starts serve mode in-process with injected providers (a controllable `Stt`,
+ * a scripted `Llm`, a tone `Tts`), a temporary data directory and a free port.
+ */
+import { defineModule, Llm, type LlmEvent, makeTool, type ModuleDefinition, Setting, Stt, type SttEvent, Tts, type TtsAudio } from "@pva/core"
+import { sttContractKeeper } from "@pva/core/testing"
+import { Effect, Exit, Queue, References, Schema, Scope, Stream } from "effect"
+import { mkdtempSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+import type { EngineProviders, ProviderBuilder } from "../../src/serve/Engine.ts"
+import { type ServeHandle, type ServeOptions, startServe } from "../../src/serve/serveMode.ts"
+
+/** An `Stt` that drains its audio (recording what it got) and emits events pushed by the test. */
+export const controlledStt = () => {
+  const queue = Effect.runSync(Queue.unbounded<SttEvent>())
+  const chunks: Array<Uint8Array> = []
+  const stt = Stt.of({
+    transcribe: (audio) =>
+      Stream.merge(
+        audio.pipe(Stream.tap((c) => Effect.sync(() => chunks.push(c))), Stream.drain, Stream.orDie),
+        Stream.fromQueue(queue)
+      )
+  })
+  // A real recogniser sends `SpeechStarted` before any transcript of an utterance; the conversation ignores
+  // transcripts without one. The keeper inserts it where a test's script leaves it out.
+  const keep = sttContractKeeper()
+  return {
+    stt,
+    chunks,
+    emit: (...events: Array<SttEvent>) => (keep(events) as Array<SttEvent>).forEach((e) => Queue.offerUnsafe(queue, e))
+  }
+}
+
+/** An `Llm` that answers with `reply(userText)` word by word (a few ms apart); tool calls are not used. */
+export const scriptedLlm = (reply: (userText: string, requestIndex: number) => string, options: { readonly firstTokenMs?: number } = {}) => {
+  const requests: Array<{ system: string; messages: ReadonlyArray<unknown> }> = []
+  const llm = Llm.of({
+    stream: (request) =>
+      Stream.suspend(() => {
+        requests.push({ system: request.system, messages: request.messages })
+        const last = request.messages.at(-1)
+        const text = reply(last?.role === "user" ? last.content : "", requests.length - 1)
+        const events: Array<LlmEvent> = [
+          ...text.split(/(?<= )/).map((w): LlmEvent => ({ _tag: "TextDelta", text: w })),
+          { _tag: "Done", stopReason: "end" }
+        ]
+        let first = true
+        return Stream.fromIterable(events).pipe(
+          Stream.tap((e) => {
+            const wait = first && (options.firstTokenMs ?? 0) > 0 ? options.firstTokenMs! : e._tag === "TextDelta" ? 2 : 0
+            first = false
+            return wait > 0 ? Effect.sleep(wait) : Effect.void
+          })
+        )
+      })
+  })
+  return { llm, requests }
+}
+
+/** A tone `Tts`: `millisPerClause` of audio per clause in 40 ms chunks, produced faster than real time. */
+export const toneTts = (options: { readonly sampleRate?: number; readonly millisPerClause?: number } = {}) => {
+  const sampleRate = options.sampleRate ?? 22_050
+  const perChunk = Math.round(sampleRate * 0.04)
+  const chunks = Math.max(1, Math.round((options.millisPerClause ?? 400) / 40))
+  return Tts.of({
+    sampleRate,
+    synthesize: (clauses) =>
+      clauses.pipe(
+        Stream.zipWithIndex,
+        Stream.flatMap(([, clause]) =>
+          Stream.fromIterable(Array.from({ length: chunks }, (): TtsAudio => ({ audio: new Uint8Array(new Int16Array(perChunk).fill(800).buffer), clause }))).pipe(
+            Stream.tap(() => Effect.sleep(2))
+          )
+        )
+      )
+  })
+}
+
+export const fakeBuild = (providers: Partial<EngineProviders> & Pick<EngineProviders, "stt" | "llm">): ProviderBuilder =>
+  Effect.succeed({
+    voices: [{ name: "standard", description: "Everyday answers.", tts: toneTts() }],
+    defaultVoice: "standard",
+    maxToolRounds: 5,
+    engines: [{ stage: "llm", provider: "fake", detail: "scripted", location: "local" }],
+    voiceInfo: [{ name: "standard", description: "Everyday answers.", enabled: true, isDefault: true, engine: "tone", location: "local" }],
+    ...providers
+  })
+
+/** A module with one setting and one tool, for the broadcast tests. */
+export const greeterModule: ModuleDefinition<any> = defineModule({
+  id: "greeter",
+  name: "Greeter",
+  description: "Greets.",
+  settings: {
+    greeting: Setting.text({ label: "Greeting", default: "hello", check: (v) => (v === "bad" ? "Not this one" : undefined) }),
+    token: Setting.secret({ label: "Token" })
+  },
+  start: ({ settings, setStatus }) =>
+    Effect.sync(() => {
+      setStatus({ text: `Says ${settings.greeting}`, tone: "ok" })
+      return {
+        instructions: `Greet with ${settings.greeting}.`,
+        tools: [makeTool({ name: "greet", description: "greet", parameters: Schema.Struct({}), speculative: true, execute: () => Effect.succeed(settings.greeting) })]
+      }
+    })
+})
+
+export interface TestServer {
+  readonly handle: ServeHandle
+  readonly url: string
+  readonly dataDir: string
+  readonly close: () => Promise<void>
+}
+
+export const startTestServer = async (
+  options: Partial<ServeOptions> & Pick<ServeOptions, "build">
+): Promise<TestServer> => {
+  const scope = Effect.runSync(Scope.make())
+  const dataDir = options.dataDir ?? mkdtempSync(join(tmpdir(), "pva-serve-"))
+  const program = startServe({
+    host: "127.0.0.1",
+    port: 0,
+    allowedOrigins: ["http://localhost:3000"],
+    webDir: join(dataDir, "no-web"),
+    catalog: [greeterModule],
+    env: {},
+    ...options,
+    dataDir
+  }).pipe(Scope.provide(scope), Effect.provideService(References.MinimumLogLevel, "Error"))
+  const handle = await Effect.runPromise(program)
+  await Effect.runPromise(handle.ready)
+  return {
+    handle,
+    url: handle.http.url,
+    dataDir,
+    close: () => Effect.runPromise(Scope.close(scope, Exit.void))
+  }
+}
+
+/** 16 kHz PCM filled with one byte value, so the test can tell microphone audio from the noise floor. */
+export const markedPcm = (ms: number, value = 0x11) => new Uint8Array(Math.round((ms / 1000) * 16_000) * 2).fill(value)

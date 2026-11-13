@@ -1,0 +1,11 @@
+/.next/
+/out/
+/out-e2e/
+/public/worklets/
+/test-results/
+/playwright-report/
+/e2e/.fixtures/
+next-env.d.ts
+*.tsbuildinfo
+*.pem
+/e2e-real/.fixtures/

@@ -1,0 +1,10 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    // Browser-safe: no Node types and no DOM. The package must only use ECMAScript
+    // built-ins (Uint8Array, DataView, JSON), so both the server and the web app can import it.
+    "types": [],
+    "lib": ["ES2023"]
+  },
+  "include": ["src"]
+}
