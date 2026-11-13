@@ -1,0 +1,91 @@
+import { assert, describe, it } from "@effect/vitest"
+import { Stt, SttError, Tts, TtsError } from "@pva/core"
+import { makeToneTts } from "@pva/core/testing"
+import * as SherpaTts from "@pva/tts-sherpa"
+import { Config, ConfigProvider, Effect, Layer } from "effect"
+import { mkdtempSync, readFileSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+import { parseWav } from "@pva/audio-file"
+import { parseLiveArgs } from "../src/bench/live.ts"
+import { makeBenchWavs } from "../src/bench/makeWavs.ts"
+import { buildProviders, describeStartFailure } from "../src/startup.ts"
+import { voiceCatalog, voiceConfigProvider } from "../src/voices.ts"
+
+const voice = (name: string) => voiceCatalog.find((v) => v.name === name)!
+const presetFor = (env: Record<string, string>, name: string) =>
+  Effect.runSync(
+    SherpaTts.config().pipe(
+      Effect.map((o) => o.preset),
+      Effect.provideService(ConfigProvider.ConfigProvider, voiceConfigProvider(ConfigProvider.fromEnvRecord(env), voice(name)))
+    )
+  )
+
+describe("per-voice settings for the local TTS", () => {
+  it("standard uses TTS_SHERPA_PRESET (default Piper lessac); VOICE_STANDARD_ overrides it", () => {
+    assert.strictEqual(presetFor({}, "standard"), "en_US-lessac-medium")
+    assert.strictEqual(presetFor({ TTS_SHERPA_PRESET: "nl_NL-pim-medium" }, "standard"), "nl_NL-pim-medium")
+    assert.strictEqual(
+      presetFor({ TTS_SHERPA_PRESET: "nl_NL-pim-medium", VOICE_STANDARD_TTS_SHERPA_PRESET: "kokoro-af_heart" }, "standard"),
+      "kokoro-af_heart"
+    )
+  })
+
+  it("natural is Kokoro unless VOICE_NATURAL_TTS_SHERPA_PRESET says otherwise; the unprefixed preset does not leak in", () => {
+    assert.strictEqual(presetFor({}, "natural"), "kokoro-af_heart")
+    assert.strictEqual(presetFor({ TTS_SHERPA_PRESET: "nl_NL-pim-medium" }, "natural"), "kokoro-af_heart")
+    assert.strictEqual(presetFor({ VOICE_NATURAL_TTS_SHERPA_PRESET: "en_US-lessac-medium" }, "natural"), "en_US-lessac-medium")
+  })
+
+  it("other settings still fall back to the unprefixed value", () => {
+    const threads = Effect.runSync(
+      SherpaTts.config().pipe(
+        Effect.map((o) => o.threads),
+        Effect.provideService(
+          ConfigProvider.ConfigProvider,
+          voiceConfigProvider(ConfigProvider.fromEnvRecord({ TTS_SHERPA_THREADS: "3" }), voice("natural"))
+        )
+      )
+    )
+    assert.strictEqual(threads, 3)
+  })
+})
+
+describe("startup", () => {
+  it.effect("a provider that fails to start (missing model) is reported with its stage, next to missing settings", () =>
+    Effect.gen(function*() {
+      const error = yield* buildProviders([
+        { stage: "voice \"standard\" (TTS_PROVIDER)", layer: Layer.effect(Tts, new TtsError({ message: "Model file missing. Run: download" })) },
+        { stage: "speech-to-text (STT_PROVIDER)", layer: Layer.effect(Stt, new SttError({ message: "Speech model file not found" })) },
+        { stage: "language model (LLM_PROVIDER)", layer: Layer.effect(Tts, Effect.flatMap(Config.String("SOME_KEY"), () => Effect.die("unreachable"))) }
+      ]).pipe(Effect.scoped, Effect.provideService(ConfigProvider.ConfigProvider, ConfigProvider.fromEnvRecord({})), Effect.flip)
+      assert.strictEqual(
+        error.message,
+        [
+          "Cannot start (settings go in the environment or in .env; see .env.example):",
+          "  voice \"standard\" (TTS_PROVIDER): Model file missing. Run: download",
+          "  speech-to-text (STT_PROVIDER): Speech model file not found",
+          "  language model (LLM_PROVIDER): SOME_KEY is not set"
+        ].join("\n")
+      )
+      assert.strictEqual(describeStartFailure(new TtsError({ message: "x" })), "x")
+    }))
+})
+
+describe("bench", () => {
+  it("parses --rounds", () => {
+    assert.deepStrictEqual(parseLiveArgs(["a", "--rounds", "3", "b"]), { rounds: 3, paths: ["a", "b"] })
+    assert.deepStrictEqual(parseLiveArgs(["a"]), { rounds: 1, paths: ["a"] })
+    assert.match(parseLiveArgs(["--rounds", "0"]) as string, /positive whole number/)
+  })
+
+  it.live("--make-wavs resamples the engine's audio to 16 kHz", () =>
+    Effect.gen(function*() {
+      const dir = mkdtempSync(join(tmpdir(), "pva-wavs-"))
+      const [path] = yield* makeBenchWavs(dir, ["One clause."])
+      const wav = parseWav(readFileSync(path!))
+      assert.strictEqual(wav.sampleRate, 16_000)
+      // The tone TTS makes 100 ms per clause at 22050 Hz: 1600 samples at 16 kHz (the resampler drops the last one).
+      assert.approximately(wav.data.length / 2, 1600, 2)
+    }).pipe(Effect.provide(makeToneTts({ sampleRate: 22_050, millisPerClause: 100 }).layer)))
+})

@@ -1,0 +1,31 @@
+{
+  "name": "@pva/assistant",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "tsx src/main.ts",
+    "check": "tsc -p tsconfig.json",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@effect/platform-node": "catalog:",
+    "@pva/audio-file": "workspace:*",
+    "@pva/audio-pipewire": "workspace:*",
+    "@pva/core": "workspace:*",
+    "@pva/llm-anthropic": "workspace:*",
+    "@pva/modules-builtin": "workspace:*",
+    "@pva/stt-deepgram": "workspace:*",
+    "@pva/stt-sherpa": "workspace:*",
+    "@pva/tts-cartesia": "workspace:*",
+    "@pva/tts-sherpa": "workspace:*",
+    "effect": "catalog:"
+  },
+  "devDependencies": {
+    "@effect/vitest": "catalog:",
+    "@types/node": "catalog:",
+    "tsx": "catalog:",
+    "typescript": "catalog:",
+    "vitest": "catalog:"
+  }
+}

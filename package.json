@@ -1,0 +1,22 @@
+{
+  "name": "personal-voice-assistance",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.34.9",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "start": "pnpm --silent --filter @pva/assistant start",
+    "download-models": "pnpm --silent --filter @pva/stt-sherpa download-models && pnpm --silent --filter @pva/tts-sherpa download",
+    "check": "tsc -p tsconfig.json",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@effect/vitest": "catalog:",
+    "@types/node": "catalog:",
+    "effect": "catalog:",
+    "typescript": "catalog:",
+    "vitest": "catalog:"
+  }
+}

@@ -1,0 +1,18 @@
+packages:
+  - packages/*
+  - apps/*
+
+catalog:
+  effect: 4.1.4
+  "@effect/platform-node": 4.1.4
+  "@effect/vitest": 4.1.4
+  vitest: 5.1.0
+  typescript: 7.0.2
+  "@types/node": 22.20.5
+  "@anthropic-ai/sdk": 1.8.0
+  ws: 8.23.0
+  "@types/ws": 8.18.2
+  tsx: 4.23.15
+
+onlyBuiltDependencies:
+  - esbuild

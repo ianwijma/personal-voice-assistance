@@ -1,0 +1,28 @@
+{
+  "name": "@pva/stt-sherpa",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "check": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "download-models": "tsx scripts/download-models.ts",
+    "measure": "tsx scripts/measure.ts"
+  },
+  "dependencies": {
+    "@pva/core": "workspace:*",
+    "effect": "catalog:",
+    "@effect/platform-node": "catalog:",
+    "sherpa-onnx-node": "2.0.1"
+  },
+  "devDependencies": {
+    "@effect/vitest": "catalog:",
+    "@types/node": "catalog:",
+    "typescript": "catalog:",
+    "vitest": "catalog:",
+    "tsx": "catalog:"
+  }
+}
