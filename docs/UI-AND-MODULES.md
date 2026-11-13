@@ -45,6 +45,29 @@ Checked and found consistent, no change: the headless player sends `playback.sta
 | `LLM_PROVIDER=claude-subscription`: an agent conversation (`makeAgentConversation`) whose agent is the running `claude-subscription` module, read per turn; when it is not running the offline stand-in answers after a spoken notice. `DEEPGRAM_API_KEY` and `CARTESIA_API_KEY` are fields of the `speech` section. | Server (`subscription.ts`, `Engine.ts`, `sections.ts`) | Run on the owner's Claude plan, chosen from the UI. |
 | Options gains a **Keys & access** tab (set password / unlock / get edit access / lock / change password); protected cards and sections show a lock with "Unlock to change" and are read-only on pages without admin access; the engine banner has an inline unlock when the engines failed for locked keys. The vault logic is in `lib/vault.ts` and `ClientState.vault`, not in the drawer. | Front end | §3.7. |
 
+**Settings screen (2026-11-14, phase 2a of docs/SETTINGS-UI.md)**: **protocol 3**. All new fields are optional, but a
+save may now be answered with warnings first (a v2 page could not confirm them) and the section ids changed. What changed:
+
+| What | Side | Why |
+|---|---|---|
+| The 420 px Options drawer is replaced by a full-screen **settings screen** (§3.7): a category list and the page from 1024 px, a drill-down with a back button below; deep links `#settings/<category>/<page>`; a global reload bar; one sticky Save/Cancel footer per page; "Leave without saving?". Entry points unchanged (gear button, `O`). | Front end (`components/settings/*`, `lib/settingsTree.ts`) | Two-level settings for everything that was in `.env`. |
+| Sections and modules carry their **placement** (`SettingsSection.group/page/order/visibleWhen`, `ModuleInfo.kind/group`); the server splits the old five sections into the pages of docs/SETTINGS-UI.md §2.1 (`sectionDefinitions.ts`). | Protocol, server | Modules and agents from the catalog appear without UI changes. |
+| Assistant settings are **stored flat by key**: `settings.json` version 2 (`assistant: { KEY: value }`), the vault and `secrets.json` the same (`assistant`); a version-1 file is migrated at load, collision-safe, with `settings.json.v1-backup`. §1.6. | Server (`SettingsStore.ts`, `flatten.ts`, `Vault.ts`) | A field can move between pages without losing its value. |
+| Field `visibleWhen` (judged on the draft in the UI, on the saved values on the server; hidden fields are neither validated nor saved), field `source` (`default` / `saved` / `env-file` / `env-process`, with Reset), option `tags` / `implication` / `module`, form `warnings`, `ErrorInfo.warnings` + `settings.update.confirmWarnings` ("Save anyway"), section cross-field checks, `EngineStatus.reloadPendingFor`, `VaultInfo.lockReason`. | Protocol, core (`Settings.ts`), server | §1.7. |
+| Protected sections are marked in their definition: `language-model`, `stt-engine`, `voice-engines`, plus any with a secret. | Server (`access.ts`) | Same rule, new ids. |
+
+**Settings from outside and model downloads (2026-11-14, phase 2b: P4 and P7 of docs/SETTINGS-UI.md)**: **protocol 4**
+(new messages, new closed literal sets). What changed:
+
+| What | Side | Why |
+|---|---|---|
+| The environment is an **env view** (`apps/assistant/src/envView.ts`): every variable with its origin, a `.env` file with path and line, or the process. A locked field's `locked` carries `file` and `line` ("Set by X in /…/.env, line 3"); `snapshot.env` / `env { env }` list the known variables by kind (`setting`, `bootstrap`, `development`, `unknown`), never their values. | Protocol (`env.ts`), core (`Settings.ts` `envLocation`), server | The owner sees what still sits in `.env` and where. |
+| `settings.moveFromEnv { requestId, keys }` (admin): each value is checked like a typed one, saved by key (a key into the vault, refused while it is locked; a module field through `ModuleHost.configure` with `includeHidden`), released from the env view and `process.env`, and its line commented out of `.env` (backup `.env.bak-<time>` 0600, atomic rewrite keeping the mode). Answered with a `result` naming any key it could not move; `env` and `section.changed` / `module.changed` follow. | Protocol, server (`serve/envSettings.ts`) | `.env` shrinks to the bootstrap variables. |
+| **Jobs** (`serve/jobs.ts`, protocol `jobs.ts`): `job.start { tool, action: "download", target }`, `job.cancel { jobId }`, `model.delete { tool, target }` (all admin); `job { job }` to every tab (throttled to 4/s per job) and `snapshot.jobs`; `models { models }` and `snapshot.models` (per tool: folder, free space, presets with size, unpacked size, installed, in use). `ToolId` is a closed set (`stt-models`, `tts-models`); targets must be preset names of the server's tables. | Protocol, server (`serve/models.ts`) | Local speech models are downloaded from the UI. |
+| `ChoiceOption.download { tool, target, sizeMb }` on recogniser presets and local voices: an option tagged `not-downloaded` shows Download inline, and Save waits for it. | Protocol, server, front end (`FieldRow.tsx`) | No `.env`-style "run this command" refusal. |
+| New pages: Speech recognition › Models, Voices › Models, Diagnostics › Settings from outside (with Move and Move all); "Move to settings" on a field set by `.env`; an Overview checklist item while settings are still in `.env`. | Front end (`settings/pages/ModelsPages.tsx`, `OverridesPage.tsx`, `DownloadControl.tsx`) | §3.7. |
+| A module may be switched on before the owner chooses once a secret is set (`ModuleDefinition.enabledWhenSet`), judged by the host with the resolved settings, so a key in the vault counts like one in `.env` (TypeSafe Jev); `setSecrets` re-checks it. | Core (`ModuleHost.ts`), `decide-typesafe` | No raw `process.env` read in a module definition. |
+
 **Who reads what**
 
 | Reader | Sections |
@@ -283,22 +306,26 @@ Directory: `PVA_DATA_DIR`, default `<repo>/data/` (git-ignored; add it to `.giti
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "modules": {
     "weather": { "enabled": true, "settings": { "defaultPlace": "Amsterdam, Netherlands" } },
     "home-assistant": { "enabled": false, "settings": { "baseUrl": "http://192.168.1.20:8123" } }
   },
-  "sections": {
-    "voices": { "DEFAULT_VOICE": "natural" },
-    "listening": { "STT_SHERPA_FINAL_SILENCE_MS": 500 }
-  }
+  "assistant": { "DEFAULT_VOICE": "natural", "STT_SHERPA_FINAL_SILENCE_MS": 500 }
 }
 ```
 
-Secrets: in the **key vault** once the owner has set a password (below); before that, `data/secrets.json` (mode `0600`, same shape, secrets only):
+Assistant settings are stored **flat by key** (version 2, 2026-11-14): the keys are globally unique environment
+variable names, and the sections only place them on the settings screen, so a field can move to another page without
+a migration. A version-1 file (`sections: { listening: { … } }`) is migrated at load: flattened by `flatten.ts`
+(a key saved in two sections keeps the value of the section that owned it in version 1, else the later one; the
+collision is logged with key and section names only), the original kept as `settings.json.v1-backup`, the file
+written back as version 2 (CLI modes, read-only, migrate in memory only).
+
+Secrets: in the **key vault** once the owner has set a password (below); before that, `data/secrets.json` (mode `0600`, same shape, secrets only; a version-1 file is read flat and rewritten as version 2 at its next save):
 
 ```json
-{ "version": 1, "modules": { "home-assistant": { "token": "eyJ..." } }, "sections": { "language-model": { "ANTHROPIC_API_KEY": "sk-ant-..." } } }
+{ "version": 2, "modules": { "home-assistant": { "token": "eyJ..." } }, "assistant": { "ANTHROPIC_API_KEY": "sk-ant-..." } }
 ```
 
 - Only values the owner set are stored; everything else comes from defaults, so a changed default in code takes effect for unset fields. `null` in a patch removes the key.
@@ -307,12 +334,12 @@ Secrets: in the **key vault** once the owner has set a password (below); before 
 - **Secrets**: the browser can set or remove a secret but never read it back; the form shows only `{ set, source }`. They are kept apart from `settings.json`, so that file can be shared or committed elsewhere without leaking them.
 - **Key vault** (`apps/assistant/src/serve/Vault.ts`, `Keys.ts`; 2026-11-14). The original reasoning here ("encrypting at rest is not useful, the key would sit next to it") assumed a key on disk; the vault's key is the owner's password, so the keys are out of reach of anything that only reads the checkout or its environment (coding agents included).
   - File `PVA_VAULT_PATH`, default `$XDG_CONFIG_HOME/pva/vault.enc` (else `~/.config/pva/vault.enc`), outside the project; mode 0600, a directory it creates 0700; atomic writes.
-  - scrypt (N = 2¹⁷, r = 8, p = 1, random 16-byte salt, parameters stored in the file; 289 ms to unlock on the development machine) → AES-256-GCM, fresh 12-byte IV per write, the header (format, version, KDF parameters, salt) as additional data. Plaintext: `{ modules, sections }` as in `secrets.json`. The derived key stays in memory only while unlocked and is overwritten on lock. A wrong password and a modified file both fail authentication; neither resets the vault.
-  - States `none` (no vault: `secrets.json` as before, every page is admin), `locked` (every start, unless `PVA_VAULT_PASSWORD` unlocks it), `unlocked`. While locked, `SettingsStore.secrets()` is empty and a save that changes a secret fails ("Keys are locked — unlock them in Options"); other settings still save.
+  - scrypt (N = 2¹⁷, r = 8, p = 1, random 16-byte salt, parameters stored in the file; 289 ms to unlock on the development machine) → AES-256-GCM, fresh 12-byte IV per write, the header (format, version, KDF parameters, salt) as additional data. Plaintext: `{ modules, assistant }` as in `secrets.json` (a vault written before version 2 has `sections`; it is read flat and written flat at its next change). The derived key stays in memory only while unlocked and is overwritten on lock. A wrong password and a modified file both fail authentication; neither resets the vault.
+  - States `none` (no vault: `secrets.json` as before, every page is admin), `locked` (every start, unless `PVA_VAULT_PASSWORD` unlocks it), `unlocked`. While locked, `SettingsStore.secrets()` is empty and a save that changes a secret fails ("Keys are locked — unlock them in Settings → Keys & access"); other settings still save.
   - Setup (`vault.setup`, ≥ 8 characters) imports `secrets.json` and deletes it; an unlock does the same if the file came back (the vault's values win). Change password re-encrypts with a new salt. Lock forgets key and secrets (running engines keep what they started with). Forgotten password: delete the file; the keys are lost.
   - Unlock attempts (also wrong old passwords): after 5 failures in a row refused for 30 s, then the wait doubles (at most an hour). Server-wide, not per connection.
   - Environment still wins (`source: env`); the UI labels such keys "set in .env (not protected)" and the server logs their names at start.
-  - **Admin access** is per connection (`SessionHub`): granted by a successful `vault.setup`, `vault.unlock` or `vault.changePassword` on that connection; ends on disconnect, `vault.lock` (from any admin page: it locks the vault for everyone) or 15 minutes without an admin action. **Protected** (`access.ts`): a section or module with a secret field, the `language-model` and `speech` sections, every agent module. Changes to protected items from other connections are answered `locked`. `PVA_VAULT_PASSWORD` never grants admin access.
+  - **Admin access** is per connection (`SessionHub`): granted by a successful `vault.setup`, `vault.unlock` or `vault.changePassword` on that connection; ends on disconnect, `vault.lock` (from any admin page: it locks the vault for everyone) or 15 minutes without an admin action. **Protected** (`access.ts`): a section or module with a secret field, the sections that choose providers (`language-model`, `stt-engine`, `voice-engines`; `protected` in `sectionDefinitions.ts`), every agent module. Changes to protected items from other connections are answered `locked`. `PVA_VAULT_PASSWORD` never grants admin access.
 - **Environment wins** over both files, everywhere. Consequence for `.env.example`: it currently sets many defaults uncommented (`STT_SHERPA_FINAL_SILENCE_MS=600`, `VOICES=standard`, …); copied as is, they would lock those fields in the UI. The server work must comment out every line whose value equals the default, keeping the explanations.
 
 ### 1.7 Voices, engines and turn detection: assistant settings sections
@@ -321,23 +348,28 @@ Secrets: in the **key vault** once the owner has set a password (below); before 
 
 The saved section values are fed to the providers through an Effect `ConfigProvider` placed *under* the environment (`ConfigProvider.orElse(env, fromRecord(savedSectionValues ∪ savedSectionSecrets))`). Provider adapters read their settings exactly as today; the `VOICE_<NAME>_` prefix wrapper in `voices.ts` wraps this combined provider. No adapter changes.
 
-The server builds the sections for the providers in use (e.g. `listening` shows sherpa thresholds when `STT_PROVIDER=sherpa`, Deepgram's when `deepgram`), so the UI never shows settings that do nothing.
+Every section is always sent in full (2026-11-14; before, the server rebuilt `listening` per provider). Fields that
+only matter for one choice carry `visibleWhen` (`STT_SHERPA_MODEL` only with `STT_PROVIDER = sherpa`), judged by the UI
+against the draft, so choosing a provider shows its fields before saving; the server judges it against the values the
+save produces and neither validates nor saves a hidden field. A whole page can be conditional too (Deepgram): it stays
+reachable as "Set up Deepgram", so a key can be entered before switching. Each section also names its place on the
+settings screen (`group`, `page`, `order`) and may have cross-field **checks** (an `error` refuses the save; a
+`warning` is answered with `ErrorInfo.warnings` until the page sends `confirmWarnings`, and stays on the form as
+`form.warnings` while the saved values have it). Definitions: `apps/assistant/src/serve/sectionDefinitions.ts`.
 
-| Section | Field (env name) | Type | Apply | Notes |
+| Section (page) | Field (env name) | Type | Apply | Notes |
 |---|---|---|---|---|
-| `conversation` | `SYSTEM_PROMPT` | text, multiline | live | Next turn; re-caches once |
-| | `MAX_TOOL_ROUNDS` | number | reload | A `Conversation` option |
-| `voices` | `DEFAULT_VOICE` | choice (enabled voices) | **live** | Needs the router's fixed output rate (§4.3) |
-| | `VOICES` | multichoice (catalog) | reload | Starts or stops engine processes |
-| `listening` (sherpa) | `STT_SHERPA_MODEL` | choice | reload | |
-| | `STT_SHERPA_EAGER_SILENCE_MS`, `STT_SHERPA_FINAL_SILENCE_MS` | number, ms | reload | `Stt` has no reconfigure call today |
-| | `STT_SHERPA_VAD_THRESHOLD`, `STT_SHERPA_MIN_SPEECH_MS` | number, advanced | reload | |
-| `listening` (deepgram) | `DEEPGRAM_EOT_THRESHOLD`, `DEEPGRAM_EAGER_EOT_THRESHOLD` | number | reload | |
-| `language-model` | `LLM_PROVIDER` | choice | reload | |
-| | `ANTHROPIC_MODEL` | text | reload | |
-| | `ANTHROPIC_API_KEY` | secret | reload | So a fresh install can be set up from the UI |
-| `speech` | `STT_PROVIDER`, `TTS_PROVIDER` | choice | reload | |
-| not in the UI (v1) | `VOICE_<NAME>_*`, thread counts, URLs, timeouts | | | Environment only |
+| `language-model` (Language model › Provider) | `LLM_PROVIDER` | choice (tags; `claude-subscription` names its module and opt-in) | reload | Check: Claude API without key → warning |
+| | `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL`; advanced `_MAX_TOKENS`, `_EFFORT`, `_THINKING`, `_TIMEOUT_MS` | secret, text, … | reload | `visibleWhen` LLM_PROVIDER = anthropic |
+| `llm-behaviour` (Language model › Behaviour) | `SYSTEM_PROMPT`; advanced `MAX_TOOL_ROUNDS` | text, number | live; reload | |
+| `stt-engine` (Speech recognition › Engine) | `STT_PROVIDER`, `STT_SHERPA_MODEL` (tag `not-downloaded`), `STT_SHERPA_LANGUAGE` | choice | reload | Check: Deepgram without key → warning; a missing model is still refused with the download command (until P7) |
+| `stt-timing` (› Turn timing; page in use with sherpa) | `STT_SHERPA_EAGER_SILENCE_MS`, `STT_SHERPA_FINAL_SILENCE_MS`; advanced `_MIN_SPEECH_MS` | number, ms | reload | Check: final must be longer than eager → error |
+| `stt-mic` (› Microphone processing; with sherpa) | `STT_SHERPA_AGC`, `STT_SHERPA_VAD_THRESHOLD`; advanced `_AGC_MAX_GAIN_DB` | | reload | |
+| `stt-deepgram` (› Deepgram; with deepgram) | `DEEPGRAM_API_KEY`, `DEEPGRAM_EOT_THRESHOLD`, `DEEPGRAM_EAGER_EOT_THRESHOLD`; advanced `_EOT_TIMEOUT_MS` | | reload | Check: eager ≥ final → error |
+| `voices` (Voices › Voices) | `DEFAULT_VOICE` (**live**), `VOICES` | choice, multichoice | live; reload | Check: a Cartesia voice without key → warning |
+| `voice-engines` (Voices › Voice engines) | `TTS_PROVIDER`, `CARTESIA_API_KEY` | choice, secret | reload | Check: Cartesia without key → warning |
+| `recordings` (Diagnostics › Recordings) | `RECORD_HEARD_AUDIO`; advanced `_MAX_FILES` | | live | |
+| not in the UI yet | `VOICE_<NAME>_*`, thread counts, URLs, model folders | | | Environment only (pieces P4/H) |
 | **per device, in the browser** | interrupt mode, microphone, speaker, output path, prebuffer, captions, latency readout | | live | `localStorage`; not server settings, because they depend on the device (headphones on the laptop, speakers on the phone) |
 
 **Reload** (`engine.reload`): interrupt the running turn (committed as interrupted, as with barge-in), stop the voice loop, close the engine scope (engine processes, STT worker, sockets), rebuild providers with the saved settings, start a new `Conversation` with the previous history (`initialHistory`, §4.3) and a new voice loop. The HTTP server, the sockets, the module host and the audio owner are untouched. About 2 s with local models. The old engines are closed **before** the new ones are built (two STT models would not fit comfortably in memory). If the build fails, the engine state is `failed` with the same per-stage problem lines as the CLI startup error; the UI shows them and settings stay editable, so the owner can fix the key and reload again. After saving a `reload` field, `EngineStatus.reloadPending` is true until a reload succeeds.
@@ -419,12 +451,16 @@ Text frames are JSON objects with a `type`. Decoding (`decodeClientMessage`, `de
 | `text.send { requestId, text, speak }` | any | `result` (accepted or not), then a turn. Spoken only if the sender is the owner and `speak` |
 | `module.enable` / `module.disable { requestId, moduleId }` | any (admin for a `protected` module) | §1.4; `result` to the sender, `module.changed` to all |
 | `module.configure { requestId, moduleId, patch }` | any (admin for a `protected` module) | §1.4 |
-| `settings.update { requestId, sectionId, patch }` | any (admin for a `protected` section) | Validate, save; `live` fields apply from the next turn; `result`, `section.changed`, `engine` (for `reloadPending`) |
+| `settings.update { requestId, sectionId, patch, confirmWarnings? }` | any (admin for a `protected` section) | Validate (hidden fields skipped), run the cross-field checks (new errors refuse; new warnings refuse with `ErrorInfo.warnings` unless `confirmWarnings`), save by key; `live` fields apply from the next turn; `result`, `section.changed` for every section whose form changed, `engine` (for `reloadPending` / `reloadPendingFor`) |
 | `engine.reload { requestId }` | any | §1.7; `engine` messages while reloading; `result` when done |
 | `vault.setup { requestId, password }` | any (only while there is no vault) | Create the key vault (§1.6), import `secrets.json`; this connection becomes admin; `vault` to every tab |
 | `vault.unlock { requestId, password }` | any | Unlock (or, when unlocked, check the password); this connection becomes admin; `bad_password` when wrong or rate limited |
 | `vault.lock { requestId }` | admin | Lock: keys leave memory, every connection loses admin access |
 | `vault.changePassword { requestId, oldPassword, newPassword }` | any (proves the password) | Re-encrypt with a new salt; this connection becomes admin |
+| `settings.moveFromEnv { requestId, keys }` | admin | Move `.env` values into the saved settings (keys into the vault; refused while it is locked) and comment the lines out of the file (backup kept); `result` names keys that could not move; `env`, `section.changed`, `module.changed` |
+| `job.start { requestId, tool, action, target }` | admin | Start a job (now: download a model preset by name); `result` at once, then `job` messages; `busy` when it runs already or two jobs run |
+| `job.cancel { requestId, jobId }` | admin | Cancel a running job (partial files removed); the job ends `cancelled` |
+| `model.delete { requestId, tool, target }` | admin | Delete a downloaded model; refused (`busy`) while the running engines use it or a job downloads it; `models` |
 | `ping { id }` | any | `pong { id }` |
 
 Messages the role does not allow (playback reports from an observer, `mic.state` from an observer) are ignored with one `error` `not_owner`. Requests (`requestId`) are answered with exactly one `result` to the sender; the resulting change is broadcast to every tab (`module.changed`, `section.changed`, `engine`), the sender included, so every tab, including the one that made the change, updates from the broadcast. Each `ModuleInfo` and `SettingsSection` carries a `revision`; a client keeps the highest it has seen.
@@ -448,6 +484,9 @@ Messages the role does not allow (playback reports from an observer, `mic.state`
 | `reply.stop { turnId }` (*owner*) | Stop playing now and answer `playback.stopped` |
 | `module.changed`, `section.changed`, `engine` | A module, section or the engines changed |
 | `vault { vault }` (*each tab, with its own `admin`*) | The vault's state or this tab's admin access changed (also in `welcome.snapshot.vault`) |
+| `env { env }` | The variables set outside the UI changed (a move) |
+| `job { job }` | A job started, progressed (at most 4 per second) or ended |
+| `models { models }` | Which models are downloaded or in use changed |
 | `result` (*sender*) | Answer to a request |
 | `error` | A problem not tied to a request (`turn_failed`, `mic_gap`, `playback_timeout`, …) |
 | `pong` (*sender*) | Answer to `ping` |
@@ -557,7 +596,7 @@ The server ignores playback reports for a turn that is not the one currently pla
 
 ### 2.8 Versioning
 
-`PROTOCOL_VERSION` (an integer, now 2: the key vault added the error codes `locked` and `bad_password`) is checked once, at `hello`. Bump it for anything an older peer could misread: removed or renamed messages or fields, changed meaning, a new required field, a new member of a closed literal set (states, outcomes, error codes, field types), or a framing change. New optional fields and new message types do not need a bump (unknown types are ignored, unknown fields stripped). In production the UI is served by the assistant itself, so a mismatch means a stale tab or `next dev` against an older server; the UI then asks for a reload.
+`PROTOCOL_VERSION` (an integer, now 4: 2 = the key vault added the error codes `locked` and `bad_password`; 3 = the settings screen's placement and field semantics, with saves that may be answered with warnings to confirm; 4 = settings from outside and jobs, with the closed sets `ToolId`, `JobState`, `JobPhase`) is checked once, at `hello`. Bump it for anything an older peer could misread: removed or renamed messages or fields, changed meaning, a new required field, a new member of a closed literal set (states, outcomes, error codes, field types), or a framing change. New optional fields and new message types do not need a bump (unknown types are ignored, unknown fields stripped). In production the UI is served by the assistant itself, so a mismatch means a stale tab or `next dev` against an older server; the UI then asks for a reload.
 
 ---
 
@@ -586,7 +625,7 @@ Desktop (≥ 1024 px)
 │                    mic   stop   chat                    │ [Type a message] ↵ │ │ dock, centred, 24 px from bottom
 └────────────────────────────────────────────────────────────────────────────────┘
 
-Phone (< 640 px)                         Options: right drawer 420 px (≥ 640), full-screen sheet (< 640)
+Phone (< 640 px)                         Settings: full screen; list + page (≥ 1024), drill-down (< 1024)
 ┌──────────────────────────┐             Chat: popover (≥ 1024), right sheet 400 px (640–1023),
 │ ● listening   ↯ 642  ⚙   │             bottom sheet 85dvh with a drag handle (< 640)
 │                          │
@@ -728,7 +767,7 @@ Dock (centred at the bottom; visible once the tab owns the audio, chat button al
 | Stop (■) | Enabled while `thinking` or `speaking`: flush the local player, send `interrupt`. Otherwise shown disabled | `Esc` |
 | Chat (💬) | Open / close the chat; a dot when there are unread replies | `C` |
 | End (top bar, text button) | Release the audio (`audio.release`), stop the microphone, close the `AudioContext`; back to "not started" | — |
-| Options (⚙, top bar) | Open the options drawer | `O` |
+| Settings (⚙, top bar) | Open the settings screen (where it was last) | `O` |
 | — | Focus the chat input (opens the chat) | `/` |
 | — | Show keyboard shortcuts | `?` |
 
@@ -748,7 +787,21 @@ Single-key shortcuts are ignored while focus is in a text field. `Esc` first clo
 - **Composer**: auto-growing textarea (1–6 lines), Enter sends, Shift+Enter is a new line, placeholder "Type a message". A speaker toggle "Speak replies" (owner only; remembered per device; default on). Disabled with an explanation while disconnected or while the engine is not ready.
 - **Unread**: replies that arrive while the chat is closed set the dot on the chat button.
 
-### 3.7 Options
+### 3.7 Options → the settings screen
+
+**Since 2026-11-14 the drawer below is replaced by the settings screen of docs/SETTINGS-UI.md §3** (full screen; a
+category list and the page from 1024 px, a drill-down with a back button below; deep links `#settings/<category>/<page>`;
+Overview, Language model, Speech recognition, Voices, Modules, Keys & access, This device, Diagnostics, About). The
+tabs' contents moved: Modules → one page per module (switch, status, error/Retry, form, tools) under Modules, agents
+under Language model; Assistant → Overview (engines, voices, problems, a setup checklist) and the section pages; Keys &
+access → its own pages (Edit access & vault, Keys), and every protected page offers the password inline; This device →
+three pages (Microphone & speaker, Audio processing, Display); About unchanged. Forms on a page share one sticky footer
+(Save, "Save and reload", Cancel, warnings with "Save anyway"). Phase 2b added Speech recognition › Models and Voices
+› Models (download with progress, cancel, delete; a model in use cannot be deleted), an inline Download next to a
+chosen model that is not downloaded (Save waits for it), Diagnostics › Settings from outside (every variable from
+`.env` or the environment with file and line, Move / Move all), and Move to settings on a field set by `.env`. What
+follows is the drawer as it was, for its details that still hold (field renderers, stale forms, the Keys & access
+views).
 
 A drawer with five tabs (Modules, Assistant, Keys & access, This device, About; Keys & access is item 5 below). Everything in the first two is rendered from server data.
 
@@ -766,9 +819,11 @@ A drawer with five tabs (Modules, Assistant, Keys & access, This device, About; 
 | `secret` | "Set (saved here)" / "Set by `ENV` in the environment" / "Not set"; **Replace** opens a password input; **Remove** sends `null`. Never pre-filled |
 | `number` | Number input with `min`/`max`/`step` (step 1 if `integer`) and the `unit` after it |
 | `boolean` | Switch |
-| `choice` | Segmented control for ≤ 4 options, select otherwise; the selected option's description below |
+| `choice` | Radio rows with tag chips for ≤ 4 options that carry `tags`; segmented control for ≤ 4 plain options; select otherwise. The selected option's description, tags and `implication` line below |
 | `multichoice` | Checkbox list with descriptions |
-| any, `locked` | Value shown read-only with a lock icon and the reason |
+| any, `locked` | Value shown read-only with a pin and the reason (".env" or "the environment", from `source`) |
+| any, `visibleWhen` | Shown only while the condition holds on the page's draft; hidden fields are not sent |
+| any, `source: saved` | "Changed · Reset" next to the label; Reset sends `null` on save |
 | any, `advanced` | Inside an "Advanced" disclosure |
 
 Errors from `form.errors` and from a failed `result` (`fieldErrors`) show under their fields (`key: null` at the top of the form). **Save** is enabled when the form is dirty and sends a patch with only the changed fields; **Cancel** reverts. When a `module.changed` / `section.changed` with a higher revision arrives while the form is dirty, local edits are kept and a line says "Changed in another tab · Load latest"; if not dirty, the form updates silently.
@@ -818,10 +873,11 @@ apps/web/
     prefs.ts                per-device preferences (localStorage)
   src/components/           App, TopBar, LatencyReadout, Stage, Visualiser, StateLabel, Captions, StartPrompt,
                             ObserverBanner, EngineBanner, ControlDock, ChatPanel, MessageList, AssistantMessage,
-                            ToolChip, Composer, OptionsDrawer, ModulesTab, ModuleCard, AssistantTab, DeviceTab,
-                            AboutTab, SettingsForm, fields/{Text,Secret,Number,Boolean,Choice,MultiChoice}Field,
-                            StatusLine, Toasts, ShortcutsDialog
-  src/ui/registry.ts        option tabs, stage overlays, field renderers (see §3.12)
+                            ToolChip, Composer, KeysPanel, fields/{Text,Secret,Number,Boolean,Choice,MultiChoice}Field,
+                            StatusLine, Toasts, ShortcutsDialog;
+                            settings/{SettingsShell,SettingsNav,ServerPage,FieldRow,PageFooter,ReloadBar,ModuleHeader,
+                            usePageForms} and settings/pages/* (the settings screen, 2026-11-14)
+  src/ui/registry.ts        settings pages, stage overlays, field renderers (see §3.12)
   mock/server.ts            scripted mock assistant (§6)
   e2e/                      Playwright tests
 ```
@@ -870,7 +926,7 @@ The reducer is pure and covers every `ServerMessage` type (TypeScript exhaustive
 
 - **Server data drives the UI**: modules, settings, voices, engines, sections and status lines are rendered generically. A new module, setting, section or voice on the server appears with no front-end change.
 - **Field renderers** are a `Record<SettingFieldType, Component>`; the type makes a missing renderer a compile error when the protocol gains a field type.
-- **Option tabs and stage overlays** are arrays in `src/ui/registry.ts` (`{ id, title, component, when?: (state) => boolean }`). A new panel = one component file + one line there.
+- **Settings pages and stage overlays** are arrays in `src/ui/registry.ts` (`settingsPages`: `{ group, id, title, order, component }`; `stageOverlays`: `{ id, component, when }`). A new client page = one component file + one line there. Pages built from server data (sections, modules) need no line at all: they place themselves (`group`, `page`, `order`).
 - **Module-contributed elements** are data with a generic renderer (`StatusLine`). The deferred cards (§1.9) would add one renderer per data kind to a `displayRenderers` record.
 
 ---
@@ -887,8 +943,9 @@ apps/assistant/src/serve/
   Publisher.ts      ConversationEvent → ServerMessage; speculative buffering; voice per clause; history and trace mapping
   StateTracker.ts   the assistant state (§2.4)
   Engine.ts         reloadable scope: providers (voices → router), Conversation, voice loop; engine status
-  SettingsStore.ts  data/settings.json + data/secrets.json; ConfigProvider overlay for sections
-  sections.ts       the assistant settings sections for the providers in use
+  SettingsStore.ts  data/settings.json + data/secrets.json (version 2: assistant settings flat by key; v1 migration)
+  sectionDefinitions.ts  the assistant settings: placement on the settings screen, visibleWhen, cross-field checks
+  sections.ts       resolve / patch / check the sections over the flat values; ConfigProvider overlay for the providers
 packages/audio-web/   WebAudioInput / WebAudioOutput over an abstract link (no ws dependency; unit-testable)
 packages/core/        additive changes (§4.3) + ModuleHost.ts + EchoGate.ts
 ```
@@ -970,7 +1027,7 @@ Serve mode always runs `Conversation` with `bargeIn: true`; the interrupt modes 
    | `manual` | Drop all STT events, and the web input feeds the noise floor instead of the microphone (nothing can be heard while the assistant speaks); only Stop interrupts |
 
    Outside the window every mode passes everything through. The thresholds are named constants with tests (echo of a played clause is dropped; a different sentence interrupts; one-word "stop" does not interrupt in `confirm`, which is the known cost).
-3. **Per-device choice and a test.** Options → This device → Interrupting (§3.7). The **echo test** plays a 3 s synthetic speech-like signal (a chirp train with a speech envelope, generated in the browser) through the normal player and compares the microphone RMS during playback with 1 s of silence before it. Residual within 6 dB of the silence level: "Echo is cancelled: you can use *Headphones: instant* even on speakers." Otherwise: "Echo is not cancelled: keep *Speakers*, or try *Through a media element* and test again." The result is stored per device and shown next to the control.
+3. **Per-device choice and a test.** Settings → This device → Microphone & speaker → Interrupting (§3.7). The **echo test** plays a 3 s synthetic speech-like signal (a chirp train with a speech envelope, generated in the browser) through the normal player and compares the microphone RMS during playback with 1 s of silence before it. Residual within 6 dB of the silence level: "Echo is cancelled: you can use *Headphones: instant* even on speakers." Otherwise: "Echo is not cancelled: keep *Speakers*, or try *Through a media element* and test again." The result is stored per device and shown next to the control.
 
 Barge-in in `confirm` mode costs time: the interruption happens when the recogniser has two words, typically 400–700 ms after you start speaking, instead of at `SpeechStarted`. Once decided, sound stops within the stop latency of §2.6. With headphones, `instant` gives today's behaviour.
 

@@ -16,7 +16,10 @@ export type ThinkingMode = "disabled" | "adaptive"
 
 export interface AnthropicLlmOptions {
   readonly apiKey: Redacted.Redacted<string>
-  /** Defaults to the SDK default (`ANTHROPIC_BASE_URL` or api.anthropic.com). */
+  /**
+   * The API endpoint. Default `DEFAULT_BASE_URL`. Always passed to the SDK, so the SDK never falls back to reading
+   * `ANTHROPIC_BASE_URL` from `process.env` itself: the value comes from the settings (`config`), like the rest.
+   */
   readonly baseURL?: string
   readonly model: string
   readonly maxTokens: number
@@ -28,7 +31,11 @@ export interface AnthropicLlmOptions {
   readonly warmUp: boolean
 }
 
+/** The public API. */
+export const DEFAULT_BASE_URL = "https://api.anthropic.com"
+
 export const defaults = {
+  baseURL: DEFAULT_BASE_URL,
   model: "claude-haiku-5-5",
   maxTokens: 1024,
   effort: "low",
@@ -262,7 +269,7 @@ export const make = Effect.fnUntraced(function*(options: AnthropicLlmOptions) {
   // One client for the process: undici keeps the connection alive between turns.
   const client = new Anthropic({
     apiKey: Redacted.value(options.apiKey),
-    ...(options.baseURL !== undefined ? { baseURL: options.baseURL } : {}),
+    baseURL: options.baseURL ?? DEFAULT_BASE_URL,
     timeout: options.timeoutMs,
     maxRetries: 0
   })
@@ -319,6 +326,7 @@ export const layer = (options: AnthropicLlmOptions): Layer.Layer<Llm> => Layer.e
 /** Options from the environment; everything but the API key has a default. */
 export const config = Config.all({
   apiKey: Config.Redacted("ANTHROPIC_API_KEY"),
+  baseURL: Config.String("ANTHROPIC_BASE_URL").pipe(Config.withDefault(DEFAULT_BASE_URL)),
   model: Config.String("ANTHROPIC_MODEL").pipe(Config.withDefault(defaults.model)),
   maxTokens: Config.Int("ANTHROPIC_MAX_TOKENS").pipe(Config.withDefault(defaults.maxTokens)),
   effort: Config.Literals(["low", "medium", "high"], "ANTHROPIC_EFFORT").pipe(

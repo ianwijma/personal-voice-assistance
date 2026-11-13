@@ -62,7 +62,7 @@ const vaultState = async (client: ScriptedClient, pred: (v: VaultInfo) => boolea
   return (await client.waitFor("vault", (m) => pred(m.vault), { from: 0 })).vault
 }
 
-const protectedUpdate = { type: "settings.update", sectionId: "language-model", patch: { values: { ANTHROPIC_MODEL: "claude-sonnet-5-5" }, secrets: {} } } as const
+const protectedUpdate = { type: "settings.update", sectionId: "language-model", patch: { values: { LLM_PROVIDER: "fake" }, secrets: {} } } as const
 const openUpdate = { type: "settings.update", sectionId: "voices", patch: { values: { DEFAULT_VOICE: "standard" }, secrets: {} } } as const
 const configureGreeter = { type: "module.configure", moduleId: "greeter", patch: { values: { greeting: "hoi" }, secrets: {} } } as const
 
@@ -86,7 +86,17 @@ describe("serve: key vault and admin access", () => {
     const { client, welcome } = await helloed(server)
     expect(welcome.snapshot.vault).toEqual({ state: "none", admin: true, location: join(server.dataDir, "vault", "vault.enc") })
     const flags = Object.fromEntries(welcome.snapshot.sections.map((s) => [s.id, s.protected === true]))
-    expect(flags).toEqual({ conversation: false, voices: false, listening: false, "language-model": true, speech: true })
+    expect(flags).toEqual({
+      "language-model": true,
+      "llm-behaviour": false,
+      "stt-engine": true,
+      "stt-timing": false,
+      "stt-mic": false,
+      "stt-deepgram": true,
+      voices: false,
+      "voice-engines": true,
+      recordings: false
+    })
     expect(welcome.snapshot.modules[0]).toMatchObject({ id: "greeter", protected: true })
     expect((await request(client, protectedUpdate)).ok).toBe(true)
     expect((await request(client, configureGreeter)).ok).toBe(true)
@@ -152,7 +162,12 @@ describe("serve: key vault and admin access", () => {
     expect(first.handle.engine.status()).toMatchObject({ state: "failed", problems: [{ message: "ANTHROPIC_API_KEY is not set" }] })
     const { client: a } = await helloed(first)
     expect((await request(a, { type: "vault.setup", password: PASSWORD })).ok).toBe(true)
-    const keyUpdate = { type: "settings.update", sectionId: "language-model", patch: { values: {}, secrets: { ANTHROPIC_API_KEY: "sk-ant-test" } } } as const
+    // The key field is shown (and saved) only with the Claude API chosen, so the patch chooses it too.
+    const keyUpdate = {
+      type: "settings.update",
+      sectionId: "language-model",
+      patch: { values: { LLM_PROVIDER: "anthropic" }, secrets: { ANTHROPIC_API_KEY: "sk-ant-test" } }
+    } as const
     expect((await request(a, keyUpdate)).ok).toBe(true)
     expect((await request(a, { type: "module.configure", moduleId: "greeter", patch: { values: {}, secrets: { token: "tok" } } })).ok).toBe(true)
     expect(existsSync(join(dataDir, "secrets.json"))).toBe(false)

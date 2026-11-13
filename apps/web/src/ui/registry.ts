@@ -1,9 +1,4 @@
 import type { ComponentType } from "react"
-import { AboutTab } from "@/components/AboutTab.tsx"
-import { AssistantTab } from "@/components/AssistantTab.tsx"
-import { DeviceTab } from "@/components/DeviceTab.tsx"
-import { KeysTab } from "@/components/KeysPanel.tsx"
-import { ModulesTab } from "@/components/ModulesTab.tsx"
 import {
   AudioErrorCard,
   ConnectingHint,
@@ -13,29 +8,43 @@ import {
   StartHint,
   StartPrompt
 } from "@/components/overlays.tsx"
+import { AboutPage } from "@/components/settings/pages/AboutPage.tsx"
+import { AccessPage, KeysListPage } from "@/components/settings/pages/AccessPages.tsx"
+import { AudioProcessingPage, DisplayPage, MicrophonePage } from "@/components/settings/pages/DevicePages.tsx"
+import { LatencyPage, ProblemsPage } from "@/components/settings/pages/DiagnosticsPages.tsx"
+import { SpeechModelsPage, VoiceModelsPage } from "@/components/settings/pages/ModelsPages.tsx"
+import { OverridesPage } from "@/components/settings/pages/OverridesPage.tsx"
+import { OverviewPage } from "@/components/settings/pages/OverviewPage.tsx"
+import type { ClientPageRef } from "@/lib/settingsTree.ts"
 import type { ClientState } from "@/lib/state.ts"
-import { KEYS_TAB } from "@/lib/vault.ts"
 
 /**
- * The extension points of the UI (docs/UI-AND-MODULES.md §3.12). A new panel or
- * stage element is one component file plus one line here.
+ * The extension points of the UI (docs/UI-AND-MODULES.md §3.12). A new settings
+ * page or stage element is one component file plus one line here.
  */
 
-export interface OptionTab {
-  readonly id: string
-  readonly title: string
+/**
+ * A page of the settings screen that the client itself provides (docs/SETTINGS-UI.md §2.2). `group` is a category
+ * slug of `settingsGroups` (`lib/settingsTree.ts`); pages sort by `order` with the server's pages of that category
+ * (sections 10–100, modules from 500). Everything else on the screen comes from the server's data.
+ */
+export interface SettingsPageEntry extends ClientPageRef {
   readonly component: ComponentType
-  /** Show the tab only when this holds (default: always). */
-  readonly when?: (s: ClientState) => boolean
 }
 
-/** Tabs of the options drawer, in order. */
-export const optionTabs: ReadonlyArray<OptionTab> = [
-  { id: "modules", title: "Modules", component: ModulesTab },
-  { id: "assistant", title: "Assistant", component: AssistantTab },
-  { id: KEYS_TAB, title: "Keys & access", component: KeysTab },
-  { id: "device", title: "This device", component: DeviceTab },
-  { id: "about", title: "About", component: AboutTab }
+export const settingsPages: ReadonlyArray<SettingsPageEntry> = [
+  { group: "overview", id: "overview", title: "Overview", description: "What is set up, and what still needs doing.", order: 0, component: OverviewPage },
+  { group: "keys", id: "access", title: "Edit access & vault", description: "Who may change keys, providers and agents.", order: 10, component: AccessPage },
+  { group: "keys", id: "keys", title: "Keys", description: "Every key, whether it is set, and what uses it.", order: 20, component: KeysListPage },
+  { group: "device", id: "microphone", title: "Microphone & speaker", description: "Saved in this browser only.", order: 10, component: MicrophonePage },
+  { group: "device", id: "audio-processing", title: "Audio processing", description: "Saved in this browser only.", order: 20, component: AudioProcessingPage },
+  { group: "device", id: "display", title: "Display", description: "Saved in this browser only.", order: 30, component: DisplayPage },
+  { group: "diagnostics", id: "latency", title: "Latency", description: "How fast the last replies started.", order: 20, component: LatencyPage },
+  { group: "diagnostics", id: "problems", title: "Problems", description: "Engines and modules that could not start.", order: 30, component: ProblemsPage },
+  { group: "diagnostics", id: "overrides", title: "Settings from outside", description: "What .env and the environment set, and moving it into the settings.", order: 40, component: OverridesPage },
+  { group: "speech", id: "models", title: "Models", description: "The speech recognition models on this machine: download and delete.", order: 90, component: SpeechModelsPage },
+  { group: "voices", id: "models", title: "Models", description: "The voice models on this machine: download and delete.", order: 90, component: VoiceModelsPage },
+  { group: "about", id: "about", title: "About", description: "Version, connection and keyboard shortcuts.", order: 0, component: AboutPage }
 ]
 
 export interface StageOverlay {

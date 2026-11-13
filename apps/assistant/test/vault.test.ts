@@ -11,7 +11,7 @@ const kdf = { N: 2 ** 12, r: 8, p: 1 }
 const temp = () => mkdtempSync(join(tmpdir(), "pva-vault-"))
 const secrets: VaultSecrets = {
   modules: { "home-assistant": { token: "ha-token" } },
-  sections: { "language-model": { ANTHROPIC_API_KEY: "sk-ant-test" } }
+  assistant: { ANTHROPIC_API_KEY: "sk-ant-test" }
 }
 const open = (path: string, now?: () => number) => openVault({ path, kdf, ...(now !== undefined ? { now } : {}) })
 
@@ -61,12 +61,12 @@ describe("vault: file and crypto", () => {
     const vault = await open(path)
     await vault.setup("correct horse", secrets)
     const iv1 = JSON.parse(readFileSync(path, "utf8")).cipher.iv
-    await vault.save({ ...secrets, sections: {} })
+    await vault.save({ ...secrets, assistant: {} })
     const iv2 = JSON.parse(readFileSync(path, "utf8")).cipher.iv
     expect(iv2).not.toBe(iv1)
     const reopened = await open(path)
     await reopened.unlock("correct horse")
-    expect(reopened.secrets()).toEqual({ ...secrets, sections: {} })
+    expect(reopened.secrets()).toEqual({ ...secrets, assistant: {} })
   })
 
   it("tampering: a changed byte, a changed parameter or salt fails to open; garbage is reported as damaged; the file is never reset", async () => {
@@ -206,18 +206,18 @@ describe("vault: the settings store on top of it", () => {
     expect(store.secrets().modules.greeter).toEqual({ token: "from-json" })
     expect(store.legacySecretCount()).toBe(2)
 
-    expect(await vault.setup("correct horse", { modules: {}, sections: {} })).toEqual({ ok: true })
+    expect(await vault.setup("correct horse", { modules: {}, assistant: {} })).toEqual({ ok: true })
     expect(await Effect.runPromise(store.importLegacySecrets())).toBe(2)
     expect(existsSync(join(dir, "secrets.json"))).toBe(false)
     expect(store.legacySecretCount()).toBe(0)
-    expect(vault.secrets()).toEqual({ modules: legacy.modules, sections: legacy.sections })
-    expect(store.secrets().sections["language-model"]).toEqual({ ANTHROPIC_API_KEY: "sk-json" })
+    expect(vault.secrets()).toEqual({ modules: legacy.modules, assistant: { ANTHROPIC_API_KEY: "sk-json" } })
+    expect(store.secrets().assistant).toEqual({ ANTHROPIC_API_KEY: "sk-json" })
 
-    // New secrets go to the vault only.
-    await Effect.runPromise(store.saveSection("speech", { STT_PROVIDER: "deepgram" }, { DEEPGRAM_API_KEY: "dg" }))
+    // New secrets go to the vault only (flat by key, like every assistant setting).
+    await Effect.runPromise(store.saveAssistant(["STT_PROVIDER", "DEEPGRAM_API_KEY"], { STT_PROVIDER: "deepgram" }, { DEEPGRAM_API_KEY: "dg" }))
     expect(existsSync(join(dir, "secrets.json"))).toBe(false)
-    expect(vault.secrets()?.sections.speech).toEqual({ DEEPGRAM_API_KEY: "dg" })
-    expect(JSON.parse(readFileSync(join(dir, "settings.json"), "utf8")).sections.speech).toEqual({ STT_PROVIDER: "deepgram" })
+    expect(vault.secrets()?.assistant).toEqual({ ANTHROPIC_API_KEY: "sk-json", DEEPGRAM_API_KEY: "dg" })
+    expect(JSON.parse(readFileSync(join(dir, "settings.json"), "utf8"))).toMatchObject({ version: 2, assistant: { STT_PROVIDER: "deepgram" } })
     expect(readFileSync(join(dir, "settings.json"), "utf8")).not.toContain("dg\"")
   })
 
@@ -227,12 +227,14 @@ describe("vault: the settings store on top of it", () => {
     await (await open(path)).setup("correct horse", secrets)
     const vault = await open(path)
     const store = await Effect.runPromise(loadSettingsStore(dir, { vault }))
-    expect(store.secrets()).toEqual({ version: 1, modules: {}, sections: {} })
-    const refused = await Effect.runPromise(Effect.flip(store.saveSection("language-model", { LLM_PROVIDER: "anthropic" }, { ANTHROPIC_API_KEY: "new" })))
+    expect(store.secrets()).toEqual({ version: 2, modules: {}, assistant: {} })
+    const refused = await Effect.runPromise(
+      Effect.flip(store.saveAssistant(["LLM_PROVIDER", "ANTHROPIC_API_KEY"], { LLM_PROVIDER: "anthropic" }, { ANTHROPIC_API_KEY: "new" }))
+    )
     expect(refused.message).toBe(KEYS_LOCKED_MESSAGE)
     expect(existsSync(join(dir, "settings.json"))).toBe(false)
-    await Effect.runPromise(store.saveSection("voices", { DEFAULT_VOICE: "natural" }, {}))
-    expect(store.settings().sections.voices).toEqual({ DEFAULT_VOICE: "natural" })
+    await Effect.runPromise(store.saveAssistant(["DEFAULT_VOICE", "VOICES"], { DEFAULT_VOICE: "natural" }, {}))
+    expect(store.settings().assistant).toEqual({ DEFAULT_VOICE: "natural" })
     // Saving a module with the (empty) secrets it sees while locked does not wipe the vault.
     await Effect.runPromise(store.saveModule("home-assistant", { enabled: true, settings: {}, secrets: {} }))
     await vault.unlock("correct horse")
@@ -242,13 +244,13 @@ describe("vault: the settings store on top of it", () => {
   it("a secrets.json that comes back after setup is merged at the next import (the vault's values win)", async () => {
     const dir = temp()
     const path = join(dir, "vault.enc")
-    await (await open(path)).setup("correct horse", { modules: { greeter: { token: "in-vault" } }, sections: {} })
+    await (await open(path)).setup("correct horse", { modules: { greeter: { token: "in-vault" } }, assistant: {} })
     writeFileSync(join(dir, "secrets.json"), JSON.stringify(legacy), { mode: 0o600 })
     const vault = await open(path)
     const store = await Effect.runPromise(loadSettingsStore(dir, { vault }))
     await vault.unlock("correct horse")
     expect(await Effect.runPromise(store.importLegacySecrets())).toBe(2)
-    expect(vault.secrets()).toEqual({ modules: { greeter: { token: "in-vault" } }, sections: legacy.sections })
+    expect(vault.secrets()).toEqual({ modules: { greeter: { token: "in-vault" } }, assistant: { ANTHROPIC_API_KEY: "sk-json" } })
     expect(existsSync(join(dir, "secrets.json"))).toBe(false)
   })
 })

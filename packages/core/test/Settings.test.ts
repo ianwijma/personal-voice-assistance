@@ -2,7 +2,15 @@ import { assert, describe, it } from "@effect/vitest"
 import { Effect, Exit, Schema, Scope } from "effect"
 import { defineModule, fromAssistantModule, ModuleStartError } from "../src/ModuleDefinition.ts"
 import { makeTool } from "../src/Module.ts"
-import { applySettingsPatch, resolveSettings, Setting, type SettingsOf, type SettingsSources } from "../src/Settings.ts"
+import {
+  applySettingsPatch,
+  isVisible,
+  resolveSettings,
+  runSettingsChecks,
+  Setting,
+  type SettingsOf,
+  type SettingsSources
+} from "../src/Settings.ts"
 
 const spec = {
   place: Setting.text({ label: "Home location", default: "", env: "WEATHER_DEFAULT_PLACE" }),
@@ -105,6 +113,99 @@ describe("applySettingsPatch", () => {
       secrets: {}
     })
     assert.deepStrictEqual(result, { ok: true, stored: { place: "x" }, secrets: {} })
+  })
+})
+
+describe("visibleWhen", () => {
+  const provider = {
+    PROVIDER: Setting.choice({ label: "Provider", options: [{ value: "local", label: "Local" }, { value: "hosted", label: "Hosted" }], default: "local" }),
+    KEY: Setting.secret({ label: "Key", required: true, visibleWhen: { key: "PROVIDER", in: ["hosted"] } }),
+    MODEL: Setting.number({ label: "Model size", default: 2, min: 1, max: 4, visibleWhen: { key: "PROVIDER", in: ["local"] } })
+  }
+
+  it("is part of the field description", () => {
+    const { form } = resolveSettings(provider, sources())
+    assert.deepStrictEqual(form.fields.find((f) => f.key === "KEY")?.visibleWhen, { key: "PROVIDER", in: ["hosted"] })
+    assert.strictEqual(form.fields.find((f) => f.key === "PROVIDER")?.visibleWhen, undefined)
+  })
+
+  it("a hidden field is not validated: its saved problems and a missing required secret are not reported", () => {
+    const local = resolveSettings(provider, sources({ stored: { PROVIDER: "local" } }))
+    assert.deepStrictEqual(local.form.errors, [], "the key is hidden while the provider is local")
+    assert.notStrictEqual(local.value, undefined)
+    const hosted = resolveSettings(provider, sources({ stored: { PROVIDER: "hosted", MODEL: 99 } }))
+    assert.deepStrictEqual(hosted.form.errors.map((e) => e.key), ["KEY"], "the bad model size is hidden; the key is not")
+    assert.strictEqual(hosted.form.values.MODEL, 2, "an invalid hidden value shows as its default")
+  })
+
+  it("can depend on a field of another section (context)", () => {
+    const page = { DETAIL: Setting.text({ label: "Detail", default: "", check: (v) => (v === "bad" ? "Bad" : undefined), visibleWhen: { key: "OTHER", in: [true] } }) }
+    assert.strictEqual(resolveSettings(page, sources({ stored: { DETAIL: "bad" }, context: () => false })).form.errors.length, 0)
+    assert.strictEqual(resolveSettings(page, sources({ stored: { DETAIL: "bad" }, context: () => true })).form.errors.length, 1)
+    assert.strictEqual(isVisible(page.DETAIL, {}, undefined), false, "an unknown key never matches")
+  })
+
+  it("a patch judges visibility on the values after the patch, and ignores hidden fields", () => {
+    // Choosing hosted in the same patch shows the key, so the key is validated and saved.
+    const shown = applySettingsPatch(provider, sources(), { values: { PROVIDER: "hosted" }, secrets: { KEY: "k" } })
+    assert.deepStrictEqual(shown, { ok: true, stored: { PROVIDER: "hosted" }, secrets: { KEY: "k" } })
+    // A value for a hidden field is neither validated nor saved; the saved value stays.
+    const hidden = applySettingsPatch(provider, sources({ stored: { PROVIDER: "hosted", MODEL: 3 } }), { values: { MODEL: 99 }, secrets: {} })
+    assert.deepStrictEqual(hidden, { ok: true, stored: { PROVIDER: "hosted", MODEL: 3 }, secrets: {} })
+  })
+})
+
+describe("field source", () => {
+  it("says where each value comes from: default, saved, .env or the process environment", () => {
+    const { form } = resolveSettings(spec, sources({
+      stored: { place: "Paris" },
+      secrets: { token: "t" },
+      env: { WEATHER_UNITS: "fahrenheit" },
+      envOrigin: (name) => (name === "WEATHER_UNITS" ? "env-file" : "env-process")
+    }))
+    const source = Object.fromEntries(form.fields.map((f) => [f.key, f.source]))
+    assert.deepStrictEqual(source, { place: "saved", units: "env-file", timeoutMs: "default", verbose: "default", domains: "default", token: "saved" })
+    assert.deepStrictEqual(form.fields.find((f) => f.key === "units")?.locked, { reason: "Set by WEATHER_UNITS in .env" })
+    const processEnv = resolveSettings(spec, sources({ env: { HA_TOKEN: "x" } })).form.fields.find((f) => f.key === "token")
+    assert.strictEqual(processEnv?.source, "env-process")
+  })
+
+  it("a lock from a .env file names the file and the line (for Move to settings)", () => {
+    const { form } = resolveSettings(spec, sources({
+      env: { WEATHER_UNITS: "fahrenheit", HA_TOKEN: "x" },
+      envOrigin: () => "env-file",
+      envLocation: (name) => (name === "WEATHER_UNITS" ? { file: "/home/me/.env", line: 4 } : undefined)
+    }))
+    assert.deepStrictEqual(form.fields.find((f) => f.key === "units")?.locked, {
+      reason: "Set by WEATHER_UNITS in /home/me/.env, line 4",
+      file: "/home/me/.env",
+      line: 4
+    })
+    assert.deepStrictEqual(form.fields.find((f) => f.key === "token")?.locked, { reason: "Set by HA_TOKEN in .env" })
+  })
+
+  it("applySettingsPatch with includeHidden saves a field whose visibleWhen does not hold", () => {
+    const hidden = { mode: Setting.choice({ label: "Mode", default: "a", options: [{ value: "a", label: "A" }, { value: "b", label: "B" }] }), extra: Setting.text({ label: "Extra", default: "", visibleWhen: { key: "mode", in: ["b"] } }) }
+    const base = { stored: {}, secrets: {}, env: {} }
+    const skipped = applySettingsPatch(hidden, base, { values: { extra: "x" }, secrets: {} })
+    assert.deepStrictEqual(skipped, { ok: true, stored: {}, secrets: {} })
+    const saved = applySettingsPatch(hidden, base, { values: { extra: "x" }, secrets: {} }, { includeHidden: true })
+    assert.deepStrictEqual(saved, { ok: true, stored: { extra: "x" }, secrets: {} })
+  })
+})
+
+describe("runSettingsChecks", () => {
+  const values: Record<string, unknown> = { EAGER: 300, FINAL: 200, PROVIDER: "hosted" }
+  const view = { value: (key: string) => values[key], secretSet: (key: string) => key === "SET" }
+  it("splits errors from warnings; warnings never become errors", () => {
+    const result = runSettingsChecks([
+      (v) => (Number(v.value("FINAL")) <= Number(v.value("EAGER")) ? [{ level: "error", key: "FINAL", message: "Must be longer" }] : []),
+      (v) => (v.value("PROVIDER") === "hosted" && !v.secretSet("KEY") ? [{ level: "warning", key: "PROVIDER", message: "No key" }] : []),
+      () => {
+        throw new Error("a broken check is skipped")
+      }
+    ], view)
+    assert.deepStrictEqual(result, { errors: [{ key: "FINAL", message: "Must be longer" }], warnings: [{ key: "PROVIDER", message: "No key" }] })
   })
 })
 

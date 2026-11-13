@@ -56,6 +56,8 @@ export const makeKeys = (options: {
   const { vault, store, host } = options
   const listeners = new Set<(state: VaultState) => void>()
   let imported: number | undefined
+  // Why the vault is locked, for the page's wording: since the start, or a page pressed "Lock now".
+  let lockReason: "start" | "manual" = "start"
 
   const changed = () => {
     const state = vault.state()
@@ -102,12 +104,13 @@ export const makeKeys = (options: {
         admin: state === "none" || admin,
         location: vault.path,
         ...(imported !== undefined ? { importedLegacySecrets: imported } : {}),
-        ...(retry > 0 ? { retryAfterMs: retry } : {})
+        ...(retry > 0 ? { retryAfterMs: retry } : {}),
+        ...(state === "locked" ? { lockReason } : {})
       }
     },
     setup: (password) =>
       run(
-        () => vault.setup(password, { modules: {}, sections: {} }),
+        () => vault.setup(password, { modules: {}, assistant: {} }),
         Effect.andThen(Effect.logInfo(`Key vault created at ${vault.path}; the password is needed after every restart.`), opened)
       ),
     unlock: (password) =>
@@ -121,6 +124,7 @@ export const makeKeys = (options: {
     lock: Effect.gen(function*() {
       if (vault.state() === "none") return failure("locked", "There is no key vault yet: set a password first")
       vault.lock()
+      lockReason = "manual"
       yield* Effect.logInfo("Key vault locked.")
       changed()
       yield* host.setSecrets({})
@@ -137,7 +141,7 @@ export const makeKeys = (options: {
     autoUnlock: (password) =>
       Effect.gen(function*() {
         if (vault.state() === "none") {
-          yield* Effect.logWarning("PVA_VAULT_PASSWORD is set but there is no key vault yet: set a password in Options → Keys & access.")
+          yield* Effect.logWarning("PVA_VAULT_PASSWORD is set but there is no key vault yet: set a password in Settings → Keys & access.")
           return
         }
         if (vault.state() === "unlocked") return
@@ -145,7 +149,7 @@ export const makeKeys = (options: {
         if (result.ok) yield* Effect.logInfo(`Key vault unlocked at start with PVA_VAULT_PASSWORD (${vault.path}).`)
         else {
           yield* Effect.logError(
-            `PVA_VAULT_PASSWORD did not unlock the key vault: ${result.error.message}. The keys stay locked; unlock them in Options → Keys & access.`
+            `PVA_VAULT_PASSWORD did not unlock the key vault: ${result.error.message}. The keys stay locked; unlock them in Settings → Keys & access.`
           )
         }
       }),

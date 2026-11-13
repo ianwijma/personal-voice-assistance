@@ -1,9 +1,9 @@
 import { assert, describe, it } from "@effect/vitest"
 import { Llm, LlmError, type LlmEvent, type LlmRequest } from "@pva/core"
-import { Effect, Exit, Fiber, Redacted, Stream } from "effect"
+import { ConfigProvider, Effect, Exit, Fiber, Redacted, Stream } from "effect"
 import * as Http from "node:http"
 import type { AddressInfo } from "node:net"
-import { type AnthropicLlmOptions, defaults, layer, toStopReason } from "../src/index.ts"
+import { type AnthropicLlmOptions, config, DEFAULT_BASE_URL, defaults, layer, layerConfig, toStopReason } from "../src/index.ts"
 
 // ---------------------------------------------------------------------------
 // A local server that records requests and replays SSE fixtures.
@@ -397,4 +397,42 @@ describe.skipIf(!process.env.ANTHROPIC_API_KEY)("AnthropicLlm (live)", () => {
         warmUp: false
       })
     )), 30_000)
+})
+
+describe("AnthropicLlm config: ANTHROPIC_BASE_URL is an explicit setting", () => {
+  const read = (env: Record<string, string>) =>
+    Effect.gen(function*() {
+      return yield* config
+    }).pipe(Effect.provideService(ConfigProvider.ConfigProvider, ConfigProvider.fromEnvRecord(env)))
+
+  it.effect("defaults to the public API when unset (the SDK never reads process.env for it)", () =>
+    Effect.gen(function*() {
+      const options = yield* read({ ANTHROPIC_API_KEY: "k" })
+      assert.strictEqual(options.baseURL, DEFAULT_BASE_URL)
+    }))
+
+  it.live("a value from the settings' ConfigProvider (not process.env) reaches the SDK", () =>
+    Effect.gen(function*() {
+      const api = yield* fakeApi(replay([messageStart, textStart(0), textDelta(0, "Hi."), blockStop(0), ...messageEnd("end_turn")]))
+      const before = process.env.ANTHROPIC_BASE_URL
+      // A stray export pointing elsewhere must not win over the settings.
+      process.env.ANTHROPIC_BASE_URL = "http://127.0.0.1:1"
+      try {
+        const events = yield* Effect.gen(function*() {
+          const llm = yield* Llm
+          return yield* Stream.runCollect(llm.stream(request))
+        }).pipe(
+          Effect.provide(layerConfig),
+          Effect.provideService(
+            ConfigProvider.ConfigProvider,
+            ConfigProvider.fromEnvRecord({ ANTHROPIC_API_KEY: "k", ANTHROPIC_BASE_URL: api.url, ANTHROPIC_WARM_UP: "false" })
+          )
+        )
+        assert.deepStrictEqual(events.at(-1), { _tag: "Done", stopReason: "end" })
+        assert.strictEqual(api.bodies.length, 1)
+      } finally {
+        if (before === undefined) delete process.env.ANTHROPIC_BASE_URL
+        else process.env.ANTHROPIC_BASE_URL = before
+      }
+    }))
 })

@@ -42,6 +42,11 @@ export const VaultInfo = Schema.Struct({
   /** Keys from the old `data/secrets.json` were moved into the vault and that file was deleted (set once, after setup or unlock). */
   importedLegacySecrets: Schema.optionalKey(NonNegativeInt),
   /** Unlock attempts are refused for this long (too many wrong passwords). */
-  retryAfterMs: Schema.optionalKey(NonNegativeInt)
+  retryAfterMs: Schema.optionalKey(NonNegativeInt),
+  /**
+   * Why it is locked (only while `locked`): `start` = locked since the assistant started (no `PVA_VAULT_PASSWORD`,
+   * or it did not fit); `manual` = a page pressed "Lock now". Absent = not known.
+   */
+  lockReason: Schema.optionalKey(Schema.Literals(["start", "manual"]))
 })
 export type VaultInfo = typeof VaultInfo.Type

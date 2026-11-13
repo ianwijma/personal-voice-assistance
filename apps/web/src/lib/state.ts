@@ -1,9 +1,12 @@
 import type {
   AssistantState,
   EngineStatus,
+  EnvInfo,
   ErrorInfo,
   HistoryItem,
   InterruptMode,
+  JobInfo,
+  ModelSet,
   ModuleInfo,
   Role,
   ServerMessage,
@@ -13,6 +16,7 @@ import type {
   TurnSource,
   VaultInfo
 } from "@pva/protocol"
+import type { SettingsPath } from "./settingsTree.ts"
 
 /**
  * Client state: one immutable value, changed only by `reducer`. Reply audio
@@ -99,6 +103,11 @@ export interface ClientState {
   readonly sections: ReadonlyArray<SettingsSection>
   /** The key vault as this page sees it (`admin`: this page may change protected settings). */
   readonly vault: VaultInfo
+  /** Settings set outside the UI (environment, `.env`); undefined: the server does not say (older server). */
+  readonly env: EnvInfo | undefined
+  /** Downloadable models per tool, and the running / recent jobs (downloads). */
+  readonly models: ReadonlyArray<ModelSet>
+  readonly jobs: ReadonlyArray<JobInfo>
   readonly turns: ReadonlyArray<TurnView>
   readonly liveTranscript: string
   readonly traces: ReadonlyArray<TraceInfo>
@@ -106,8 +115,13 @@ export interface ClientState {
   readonly toasts: ReadonlyArray<Toast>
   readonly ui: {
     readonly chatOpen: boolean
-    readonly optionsOpen: boolean
-    readonly optionsTab: string
+    /** The settings screen (docs/SETTINGS-UI.md §3.1); its path is mirrored in the URL hash (`#settings/…`). */
+    readonly settingsOpen: boolean
+    readonly settingsPath: SettingsPath
+    /** The settings page on screen has unsaved edits. */
+    readonly settingsDirty: boolean
+    /** A navigation held for "Leave without saving?" (`lib/settingsTree.ts` `navigateSettings`). */
+    readonly settingsLeave?: SettingsPath | "close" | undefined
     readonly unread: number
     readonly shortcutsOpen: boolean
   }
@@ -117,7 +131,7 @@ export const MAX_TURNS = 300
 export const MAX_TRACES = 50
 export const MAX_TOASTS = 3
 
-export const emptyEngine: EngineStatus = { state: "starting", problems: [], reloadPending: false, engines: [], voices: [] }
+export const emptyEngine: EngineStatus = { state: "starting", problems: [], reloadPending: false, reloadPendingFor: [], engines: [], voices: [] }
 /** A server that sends no vault (or has none yet): every page may change everything. */
 export const noVault: VaultInfo = { state: "none", admin: true }
 
@@ -129,12 +143,15 @@ export const initialState: ClientState = {
   modules: { order: [], byId: {} },
   sections: [],
   vault: noVault,
+  env: undefined,
+  models: [],
+  jobs: [],
   turns: [],
   liveTranscript: "",
   traces: [],
   pending: {},
   toasts: [],
-  ui: { chatOpen: false, optionsOpen: false, optionsTab: "modules", unread: 0, shortcutsOpen: false }
+  ui: { chatOpen: false, settingsOpen: false, settingsPath: [], settingsDirty: false, unread: 0, shortcutsOpen: false }
 }
 
 /** Things that happen in the page rather than on the server. */
@@ -258,6 +275,9 @@ const server: ServerHandlers = {
     modules: { order: m.snapshot.modules.map((x) => x.id), byId: Object.fromEntries(m.snapshot.modules.map((x) => [x.id, x])) },
     sections: m.snapshot.sections,
     vault: m.snapshot.vault ?? noVault,
+    env: m.snapshot.env,
+    models: m.snapshot.models ?? [],
+    jobs: m.snapshot.jobs ?? [],
     turns: historyToTurns(m.snapshot.history),
     traces: m.snapshot.traces.slice(-MAX_TRACES),
     toasts: s.toasts,
@@ -329,6 +349,15 @@ const server: ServerHandlers = {
   "section.changed": (s, m) => upsertSection(s, m.section),
   engine: (s, m) => ({ ...s, engine: m.engine }),
   vault: (s, m) => ({ ...s, vault: m.vault }),
+  env: (s, m) => ({ ...s, env: m.env }),
+  models: (s, m) => ({ ...s, models: m.models }),
+  job: (s, m) => {
+    const i = s.jobs.findIndex((j) => j.id === m.job.id)
+    if (i === -1) return { ...s, jobs: [...s.jobs, m.job].slice(-20) }
+    const jobs = s.jobs.slice()
+    jobs[i] = m.job
+    return { ...s, jobs }
+  },
   result: (s, m) => {
     if (!(m.requestId in s.pending)) return s
     const { [m.requestId]: _done, ...pending } = s.pending
@@ -477,3 +506,11 @@ export const turnById = (s: ClientState, turnId: number | undefined): TurnView |
   const idx = findTurn(s.turns, turnId)
   return idx === -1 ? undefined : s.turns[idx]
 }
+
+/** The running download of a model, if any. */
+export const runningJob = (s: ClientState, tool: string, target: string): JobInfo | undefined =>
+  s.jobs.find((j) => j.tool === tool && j.target === target && j.state === "running")
+
+/** The newest job of a model (running or finished). */
+export const lastJob = (s: ClientState, tool: string, target: string): JobInfo | undefined =>
+  [...s.jobs].reverse().find((j) => j.tool === tool && j.target === target)

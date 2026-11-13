@@ -20,14 +20,14 @@ describe("reducer", () => {
   })
 
   it("welcome replaces the state from the snapshot and keeps the UI", () => {
-    const before = run([{ type: "local/ui", patch: { chatOpen: true, optionsTab: "device" } }])
+    const before = run([{ type: "local/ui", patch: { chatOpen: true, settingsPath: ["device", "display"] } }])
     const s = reducer(before, welcome)
     expect(s.connection).toMatchObject({ status: "open", attempt: 0, everConnected: true, connectionId: "conn-3", server: { name: "pva" } })
     expect(s.session).toMatchObject({ role: "owner", ownerPresent: true, serverState: "listening" })
     expect(modulesInOrder(s).map((m) => m.id)).toEqual(["weather", "home-assistant"])
-    expect(s.sections.map((x) => x.id)).toEqual(["voices"])
+    expect(s.sections.map((x) => x.id)).toEqual(["voices", "stt-engine"])
     expect(s.ui.chatOpen).toBe(true)
-    expect(s.ui.optionsTab).toBe("device")
+    expect(s.ui.settingsPath).toEqual(["device", "display"])
     // History: 4 items → 2 turns; the second reply was interrupted (its text is what was heard).
     expect(s.turns).toHaveLength(2)
     expect(s.turns[0]).toMatchObject({ userText: "What's the weather like?", text: "Light rain in Amsterdam, 7 degrees.", outcome: "completed" })
@@ -126,7 +126,7 @@ describe("reducer", () => {
     expect(added.modules.order).toEqual(["weather", "home-assistant", "notes"])
     const section = serverExamples["section.changed"].section
     expect(reducer(s0, { type: "section.changed", section: { ...section, revision: 0 } })).toBe(s0)
-    expect(reducer(s0, { type: "section.changed", section: { ...section, revision: 2, title: "V" } }).sections[0]!.title).toBe("V")
+    expect(reducer(s0, { type: "section.changed", section: { ...section, revision: 3, title: "V" } }).sections.find((x) => x.id === section.id)!.title).toBe("V")
   })
 
   it("tracks requests until their result", () => {

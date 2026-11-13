@@ -13,7 +13,7 @@ export function EngineBanner() {
     shallowEqual
   )
   if (!e.open || e.state === "ready") return null
-  const openOptions = () => client.store.dispatch({ type: "local/ui", patch: { optionsOpen: true, optionsTab: "assistant" } })
+  const openOptions = () => client.settings(["overview", "overview"])
   return (
     <div
       role="status"
@@ -39,7 +39,7 @@ export function EngineBanner() {
             <span className="text-ink-muted">{e.problems.map((p) => `${p.stage}: ${p.message}`).join(" · ") || "the engines failed to start."}</span>
           </p>
           <button type="button" onClick={openOptions} className="shrink-0 text-[13px] text-voice underline-offset-4 hover:underline">
-            Open options
+            Open settings
           </button>
         </>
       ) : (

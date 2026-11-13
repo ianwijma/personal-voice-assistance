@@ -4,10 +4,10 @@ import type { InterruptMode, OutputPath } from "@pva/protocol"
 import { formatDiagnostics } from "@/lib/audio/diagnostics.ts"
 import { VoiceAudio } from "@/lib/audio/VoiceAudio.ts"
 import { MAX_PREBUFFER_MS } from "@/lib/prefs.ts"
-import { useClient, useClientState, useDiagnostics, usePrefs } from "./context.tsx"
-import { inputClass } from "./fields/types.ts"
-import { Spinner } from "./ui/Icon.tsx"
-import { Button, Segmented, Switch } from "./ui/controls.tsx"
+import { useClient, useClientState, useDiagnostics, usePrefs } from "../../context.tsx"
+import { inputClass } from "../../fields/types.ts"
+import { Spinner } from "../../ui/Icon.tsx"
+import { Button, Segmented, Switch } from "../../ui/controls.tsx"
 
 const INTERRUPT: ReadonlyArray<{ readonly value: InterruptMode; readonly title: string; readonly label: string; readonly help: string }> = [
   { value: "instant", title: "Headphones", label: "Headphones: instant", help: "Any speech interrupts the reply at once. Use with headphones, or if the echo test passes." },
@@ -59,7 +59,8 @@ function Row({ label, htmlFor, children, help }: { readonly label: string; reado
   )
 }
 
-export function DeviceTab() {
+/** This device › Microphone & speaker: device choice, Interrupting and the echo test. */
+export function MicrophonePage() {
   const client = useClient()
   const prefs = usePrefs((p) => p)
   const running = useClientState((s) => s.audio.phase === "running" || s.audio.phase === "suspended")
@@ -85,8 +86,6 @@ export function DeviceTab() {
 
   return (
     <div className="flex flex-col gap-7">
-      <p className="text-[13px] text-ink-muted">Saved in this browser only: each device keeps its own choices.</p>
-
       <Row label="Microphone" htmlFor="pref-mic" help={!running && mics.every((d) => d.label === "") ? "Names appear after you allow the microphone." : undefined}>
         <select id="pref-mic" value={prefs.micDeviceId} onChange={(e) => client.setPrefs({ micDeviceId: e.target.value })} className={inputClass}>
           <option value="">Default</option>
@@ -125,28 +124,45 @@ export function DeviceTab() {
           <p className="text-[13px] text-ink" data-testid="echo-result">
             {prefs.echoTest.cancelled
               ? <>Echo is cancelled ({prefs.echoTest.residualDb} dB): you can use <em>Headphones: instant</em> even on speakers.</>
-              : <>Echo is not cancelled ({prefs.echoTest.residualDb > 0 ? "+" : ""}{prefs.echoTest.residualDb} dB): keep <em>Speakers</em>, or try <em>Through a media element</em> below and test again.</>}
+              : <>Echo is not cancelled ({prefs.echoTest.residualDb > 0 ? "+" : ""}{prefs.echoTest.residualDb} dB): keep <em>Speakers</em>, or try <em>Through a media element</em> (Display › Advanced) and test again.</>}
             <span className="text-ink-faint"> · tested with {prefs.echoTest.outputPath === "direct" ? "direct output" : "a media element"}</span>
           </p>
         )}
       </div>
+    </div>
+  )
+}
 
+/** This device › Audio processing: the browser's voice processing, and the audio diagnostics. */
+export function AudioProcessingPage() {
+  const client = useClient()
+  const prefs = usePrefs((p) => p)
+  const running = useClientState((s) => s.audio.phase === "running" || s.audio.phase === "suspended")
+  return (
+    <div className="flex flex-col gap-7">
       <div className="flex flex-col gap-4" data-testid="mic-processing">
-        <div>
-          <div className="text-[14px] font-medium text-ink">Microphone processing</div>
-          <p className="text-[13px] text-ink-muted">
-            The browser's voice processing. Changing a switch re-opens the microphone{running ? "" : " (when audio is on)"}.
-          </p>
-        </div>
+        <p className="text-[13px] text-ink-muted">
+          The browser's voice processing. Changing a switch re-opens the microphone{running ? "" : " (when audio is on)"}.
+        </p>
         {PROCESSING.map((p) => (
           <ToggleRow key={p.key} label={p.label} help={p.help} checked={prefs[p.key]} onChange={(v) => client.setPrefs({ [p.key]: v })} />
         ))}
       </div>
-
       <AudioDiagnostics />
+    </div>
+  )
+}
 
+/** This device › Display: captions and the latency readout; Advanced: output path and prebuffer. */
+export function DisplayPage() {
+  const client = useClient()
+  const prefs = usePrefs((p) => p)
+  return (
+    <div className="flex flex-col gap-7">
+      <ToggleRow label="Captions" help="Show what you say and what the assistant is saying under the line." checked={prefs.captions} onChange={(v) => client.setPrefs({ captions: v })} />
+      <ToggleRow label="Latency readout" help="The ↯ number in the top bar." checked={prefs.latencyReadout} onChange={(v) => client.setPrefs({ latencyReadout: v })} />
       <details className="group rounded-md border border-line/70 px-3 py-2 [&[open]]:pb-4">
-        <summary className="label cursor-pointer list-none text-ink-muted marker:hidden hover:text-ink">Advanced</summary>
+        <summary className="label flex min-h-8 cursor-pointer list-none items-center text-ink-muted marker:hidden hover:text-ink">Advanced</summary>
         <div className="mt-4 flex flex-col gap-6">
           <Row label="Output path" help="A media element is an older workaround that can make some browsers cancel the assistant's echo.">
             <Segmented<OutputPath>
@@ -160,7 +176,7 @@ export function DeviceTab() {
           <Row
             label={`Prebuffer · ${prefs.prebufferMs} ms`}
             htmlFor="pref-prebuffer"
-            help="Audio buffered before a reply starts. Lower is faster; raise it (200–300 ms on a phone over Wi-Fi) if replies stutter, pop or the underrun count below grows."
+            help="Audio buffered before a reply starts. Lower is faster; raise it (200–300 ms on a phone over Wi-Fi) if replies stutter, pop or the underrun count (Audio processing) grows."
           >
             <input
               id="pref-prebuffer"
@@ -173,8 +189,6 @@ export function DeviceTab() {
               className="w-full accent-[var(--color-you)]"
             />
           </Row>
-          <ToggleRow label="Captions" help="Show what you say and what the assistant is saying under the line." checked={prefs.captions} onChange={(v) => client.setPrefs({ captions: v })} />
-          <ToggleRow label="Latency readout" help="The ↯ number in the top bar." checked={prefs.latencyReadout} onChange={(v) => client.setPrefs({ latencyReadout: v })} />
         </div>
       </details>
     </div>

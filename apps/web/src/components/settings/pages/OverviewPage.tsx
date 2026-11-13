@@ -1,19 +1,25 @@
 "use client"
 import { useState } from "react"
+import { setupChecklist } from "@/lib/setupChecklist.ts"
 import { shallowEqual } from "@/lib/store.ts"
-import { useClient, useClientState } from "./context.tsx"
-import { LockedBadge } from "./KeysPanel.tsx"
-import { SettingsForm } from "./SettingsForm.tsx"
-import { Spinner } from "./ui/Icon.tsx"
-import { Button, cx } from "./ui/controls.tsx"
+import { useClient, useClientState } from "../../context.tsx"
+import { Icon, Spinner } from "../../ui/Icon.tsx"
+import { Button, cx } from "../../ui/controls.tsx"
 
 const STAGE: Record<string, string> = { llm: "Language model", stt: "Speech recognition", tts: "Speech synthesis" }
 
-export function AssistantTab() {
+export function Where({ location }: { readonly location: "local" | "hosted" }) {
+  return <span className={cx("label shrink-0 text-[9px]", location === "local" ? "text-ink-faint" : "text-warn")}>{location}</span>
+}
+
+/**
+ * Overview (docs/SETTINGS-UI.md §3.7): what works and what still needs doing (each item links to the page that
+ * fixes it), engine problems with Try again, and the running engines and voices.
+ */
+export function OverviewPage() {
   const client = useClient()
+  const items = useClientState(setupChecklist, shallowEqual)
   const engine = useClientState((s) => s.engine)
-  const sections = useClientState((s) => s.sections, shallowEqual)
-  const admin = useClientState((s) => s.vault.admin)
   const [reloading, setReloading] = useState(false)
   const reload = async () => {
     setReloading(true)
@@ -21,31 +27,47 @@ export function AssistantTab() {
     setReloading(false)
     if (!result.ok) client.store.dispatch({ type: "local/toast", message: result.error?.message ?? "The reload failed.", tone: "error" })
   }
+  const open = items.filter((i) => !i.ok).length
   return (
-    <div className="flex flex-col gap-7">
-      {engine.reloadPending && (
-        <div className="flex items-center gap-3 rounded-md border border-voice/40 bg-voice-soft px-3 py-2.5" data-testid="reload-pending">
-          <p className="flex-1 text-[13px] text-ink">Saved changes need an engine reload.</p>
-          <Button size="sm" variant="primary" onClick={() => void reload()} disabled={reloading || engine.state === "reloading"}>
-            {(reloading || engine.state === "reloading") && <Spinner size={12} />}
-            Reload now
-          </Button>
-        </div>
-      )}
+    <div className="flex flex-col gap-8">
       {engine.problems.length > 0 && (
-        <div role="alert" className="rounded-md border border-danger/40 bg-danger/5 px-3 py-2.5 text-[13px]">
+        <div role="alert" className="rounded-md border border-danger/40 bg-danger/5 px-3 py-2.5 text-[13px]" data-testid="engine-problems">
           <p className="mb-1 font-medium text-ink">The engines could not start</p>
           <ul className="flex flex-col gap-1 text-ink-muted">
             {engine.problems.map((p, i) => <li key={i}><span className="font-mono text-ink">{p.stage}</span>: {p.message}</li>)}
           </ul>
-          {!engine.reloadPending && <Button size="sm" className="mt-2" onClick={() => void reload()} disabled={reloading}>Try again</Button>}
+          {!engine.reloadPending && (
+            <Button size="sm" className="mt-2" onClick={() => void reload()} disabled={reloading}>
+              {reloading && <Spinner size={12} />}
+              Try again
+            </Button>
+          )}
         </div>
       )}
-      <section>
-        <h3 className="label mb-3 text-ink-faint">Engines</h3>
+      <section data-testid="checklist">
+        <div className="mb-3 flex items-baseline justify-between">
+          <h4 className="label text-ink-faint">Getting started</h4>
+          <span className="font-mono text-[12px] text-ink-faint">{items.length - open} of {items.length}</span>
+        </div>
         <ul className="flex flex-col divide-y divide-line/60 rounded-md border border-line">
-          {engine.engines.map((e) => (
-            <li key={e.stage} className="flex items-center gap-3 px-3 py-2.5">
+          {items.map((item) => (
+            <li key={item.id} className="flex min-h-12 items-center gap-3 px-3 py-2" data-ok={item.ok ? "true" : "false"}>
+              <span aria-hidden="true" className={cx("inline-flex size-5 shrink-0 items-center justify-center rounded-full border", item.ok ? "border-ok text-ok" : "border-ink-faint")}>
+                {item.ok && <Icon name="check" size={12} />}
+              </span>
+              <span className={cx("min-w-0 flex-1 text-[14px]", item.ok ? "text-ink" : "text-ink-muted")}>{item.text}</span>
+              {item.action !== undefined && (
+                <Button size="sm" onClick={() => client.settings(item.action!.path)}>{item.action.label}</Button>
+              )}
+            </li>
+          ))}
+        </ul>
+      </section>
+      <section>
+        <h4 className="label mb-3 text-ink-faint">Engines</h4>
+        <ul className="flex flex-col divide-y divide-line/60 rounded-md border border-line">
+          {engine.engines.map((e, i) => (
+            <li key={`${e.stage}-${i}`} className="flex items-center gap-3 px-3 py-2.5">
               <span className="min-w-0 flex-1">
                 <span className="block text-[13px] text-ink-muted">{STAGE[e.stage] ?? e.stage}</span>
                 <span className="block truncate font-mono text-[13px] text-ink">{e.provider} · {e.detail}</span>
@@ -58,7 +80,7 @@ export function AssistantTab() {
       </section>
       {engine.voices.length > 0 && (
         <section>
-          <h3 className="label mb-3 text-ink-faint">Voices</h3>
+          <h4 className="label mb-3 text-ink-faint">Voices</h4>
           <ul className="flex flex-col divide-y divide-line/60 rounded-md border border-line">
             {engine.voices.map((v) => (
               <li key={v.name} className={cx("flex items-start gap-3 px-3 py-2.5", !v.enabled && "opacity-55")}>
@@ -77,31 +99,6 @@ export function AssistantTab() {
           </ul>
         </section>
       )}
-      {sections.map((section) => {
-        const editable = section.protected !== true || admin
-        return (
-          <section key={section.id} data-testid={`section-${section.id}`} data-locked={editable ? undefined : "true"}>
-            <div className="mb-1 flex flex-wrap items-center gap-x-3 gap-y-1">
-              <h3 className="label text-ink-faint">{section.title}</h3>
-              {!editable && <LockedBadge name={section.title} />}
-            </div>
-            {section.description !== undefined && <p className="mb-3 text-[13px] text-ink-muted">{section.description}</p>}
-            <div className="mt-3">
-              <SettingsForm
-                form={section.form}
-                revision={section.revision}
-                idPrefix={`s-${section.id}`}
-                readOnly={!editable}
-                onSave={(patch) => client.updateSection(section.id, patch)}
-              />
-            </div>
-          </section>
-        )
-      })}
     </div>
   )
-}
-
-function Where({ location }: { readonly location: "local" | "hosted" }) {
-  return <span className={cx("label shrink-0 text-[9px]", location === "local" ? "text-ink-faint" : "text-warn")}>{location}</span>
 }

@@ -1,7 +1,21 @@
 import { describe, expect, it } from "vitest"
 import type { SettingsForm } from "@pva/protocol"
 import { exampleHomeAssistantModule, exampleWeatherModule } from "@pva/protocol/examples"
-import { computePatch, errorsByKey, initialDraft, isDirty, parseNumber, reconcile, splitAdvanced } from "@/lib/forms.ts"
+import {
+  computePatch,
+  draftLookup,
+  errorsByKey,
+  fieldVisible,
+  initialDraft,
+  isDirty,
+  onlyReloadFields,
+  parseNumber,
+  reconcile,
+  resetDraftValue,
+  setDraftValue,
+  someReloadFields,
+  splitAdvanced
+} from "@/lib/forms.ts"
 
 const weather = exampleWeatherModule.settings
 const ha = exampleHomeAssistantModule.settings
@@ -60,5 +74,50 @@ describe("generated forms", () => {
     expect(parseNumber("", f)).toHaveProperty("error")
     expect(parseNumber("1.5", f)).toEqual({ error: "Enter a whole number." })
     expect(parseNumber("100", f)).toEqual({ error: "At least 500 ms." })
+  })
+})
+
+describe("draft-driven visibility, reset and patches (settings screen)", () => {
+  const form: SettingsForm = {
+    fields: [
+      { type: "choice", key: "STT_PROVIDER", label: "Engine", apply: "reload", default: "sherpa", source: "saved", options: [{ value: "sherpa", label: "Local" }, { value: "deepgram", label: "Deepgram" }] },
+      { type: "number", key: "MODEL_SIZE", label: "Size", apply: "reload", default: 2, integer: true, source: "saved", visibleWhen: { key: "STT_PROVIDER", in: ["sherpa"] } },
+      { type: "secret", key: "DEEPGRAM_API_KEY", label: "Key", apply: "reload", visibleWhen: { key: "STT_PROVIDER", in: ["deepgram"] } }
+    ],
+    values: { STT_PROVIDER: "sherpa", MODEL_SIZE: 3 },
+    secrets: { DEEPGRAM_API_KEY: { set: false, source: "none" } },
+    errors: []
+  }
+  const field = (key: string) => form.fields.find((f) => f.key === key)!
+
+  it("evaluates visibleWhen against the draft (choosing Deepgram shows its key before saving)", () => {
+    const d = setDraftValue(initialDraft(form), "STT_PROVIDER", "deepgram")
+    const lookup = draftLookup(d, () => undefined)
+    expect(fieldVisible(field("DEEPGRAM_API_KEY"), lookup)).toBe(true)
+    expect(fieldVisible(field("MODEL_SIZE"), lookup)).toBe(false)
+    expect(fieldVisible(field("MODEL_SIZE"), draftLookup(initialDraft(form), () => undefined))).toBe(true)
+    // Keys of other sections come from the fallback.
+    expect(fieldVisible(field("MODEL_SIZE"), (k) => (k === "STT_PROVIDER" ? "sherpa" : undefined))).toBe(true)
+  })
+
+  it("does not send hidden fields", () => {
+    let d = setDraftValue(initialDraft(form), "MODEL_SIZE", 4)
+    d = setDraftValue(d, "STT_PROVIDER", "deepgram")
+    const lookup = draftLookup(d, () => undefined)
+    expect(computePatch(form, d, (f) => fieldVisible(f, lookup))).toEqual({ values: { STT_PROVIDER: "deepgram" }, secrets: {} })
+  })
+
+  it("Reset to default sends null (nothing stays saved); an edit after it cancels the reset", () => {
+    const reset = resetDraftValue(initialDraft(form), field("MODEL_SIZE"))
+    expect(reset.values.MODEL_SIZE).toBe(2)
+    expect(computePatch(form, reset)).toEqual({ values: { MODEL_SIZE: null }, secrets: {} })
+    const edited = setDraftValue(reset, "MODEL_SIZE", 5)
+    expect(computePatch(form, edited)).toEqual({ values: { MODEL_SIZE: 5 }, secrets: {} })
+  })
+
+  it("knows when every change needs an engine reload", () => {
+    expect(onlyReloadFields(form, { values: { STT_PROVIDER: "deepgram" }, secrets: {} })).toBe(true)
+    expect(onlyReloadFields(weather, { values: { units: "fahrenheit" }, secrets: {} })).toBe(false)
+    expect(someReloadFields(form, { values: {}, secrets: {} })).toBe(false)
   })
 })

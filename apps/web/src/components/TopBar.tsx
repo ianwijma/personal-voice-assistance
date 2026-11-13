@@ -74,9 +74,9 @@ export function TopBar() {
       <div className="ml-auto flex items-center gap-1 sm:gap-2">
         <LatencyReadout />
         <IconButton
-          label="Options (O)"
+          label="Settings (O)"
           aria-haspopup="dialog"
-          onClick={() => client.store.dispatch({ type: "local/ui", patch: { optionsOpen: true } })}
+          onClick={() => client.settings(client.store.get().ui.settingsPath)}
         >
           <Icon name="gear" />
         </IconButton>

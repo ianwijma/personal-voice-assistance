@@ -1,5 +1,5 @@
 import { Schema } from "effect"
-import { ChoiceOption, NumberField, BooleanField, ChoiceField, MultiChoiceField, SecretField, SecretState, TextField } from "./settings.ts"
+import { ChoiceOption, SettingsGroup, NumberField, BooleanField, ChoiceField, MultiChoiceField, SecretField, SecretState, TextField } from "./settings.ts"
 import { FieldError, FieldKey, ModuleId, NonNegativeFinite, RequestId, SectionId, TurnId } from "./common.ts"
 
 /**
@@ -10,7 +10,8 @@ import { FieldError, FieldKey, ModuleId, NonNegativeFinite, RequestId, SectionId
  * `SettingField` or `PROTOCOL_VERSION`. Other work is being built against
  * protocol v1 right now, so nothing here changes what v1 peers send or accept.
  * The integration step (build plan piece G) merges these into the unions in one
- * change and sets `PROTOCOL_VERSION = 3` (2 is the key vault, already merged):
+ * change and bumps `PROTOCOL_VERSION` (2 is the key vault, 3 the settings screen's placement and field semantics, both
+ * merged; `ModuleInfo.kind` and `SettingsSection.group` are merged already):
  * - the five new settings field types and the wider `SettingValue` (closed sets → bump);
  * - the new messages (`module.action`, `settings.action`, `routing.set`, `routing`, `intent.decision`, `turn.agent`);
  * - the optional fields below, spread into the existing structs (`...TurnStartAgentFields` into `TurnStart`, ...);
@@ -263,10 +264,6 @@ export const SettingsPatchV2 = Schema.Struct({
 })
 export type SettingsPatchV2 = typeof SettingsPatchV2.Type
 
-/** Which options tab a settings section belongs to. Absent = "general". */
-export const SettingsGroup = Schema.Literals(["agents", "speech", "voices", "general"])
-export type SettingsGroup = typeof SettingsGroup.Type
-
 // ---------------------------------------------------------------------------
 // New messages
 
@@ -372,7 +369,7 @@ export const ModuleInfoAgentFields = {
   actions: Schema.optionalKey(Schema.Array(ActionInfo))
 }
 
-/** `SettingsSection`: the options tab it belongs to. */
+/** `SettingsSection`: the settings category it belongs to (merged: `SettingsSection.group`, protocol 3). */
 export const SettingsSectionGroupFields = { group: Schema.optionalKey(SettingsGroup) }
 
 /** `Snapshot`: routing state on connect. */

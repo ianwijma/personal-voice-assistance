@@ -16,7 +16,7 @@ import { controlledStt, fakeBuild, scriptedLlm, startTestServer, type TestServer
 
 vi.setConfig({ testTimeout: 20_000 })
 
-const OFF = "Claude subscription is off — switch it on under Modules."
+const OFF = "Claude subscription is off — switch it on in Settings, Language model."
 
 describe("claude-subscription agent set (pure)", () => {
   let running = false
@@ -52,7 +52,7 @@ describe("claude-subscription agent set (pure)", () => {
     expect(subscriptionNotice(undefined)).toBe(OFF)
     expect(subscriptionNotice(info(false, "disabled"))).toBe(OFF)
     expect(subscriptionNotice(info(true, "starting"))).toMatch(/still starting/)
-    expect(subscriptionNotice(info(true, "error"))).toMatch(/could not start — see Modules/)
+    expect(subscriptionNotice(info(true, "error"))).toMatch(/could not start — see Settings, Language model/)
   })
 })
 

@@ -82,7 +82,7 @@ export const ErrorCode = Schema.Literals([
   "turn_failed",
   /**
    * Protected: the setting or module can only be changed by a page with admin access (type the vault password
-   * in Options → Keys & access), or the keys it needs are locked.
+   * in Settings → Keys & access), or the keys it needs are locked.
    */
   "locked",
   /** A vault password was wrong, too short, or refused for now (too many attempts; see `vault.retryAfterMs`). */
@@ -104,6 +104,11 @@ export const ErrorInfo = Schema.Struct({
   message: Schema.String,
   turnId: Schema.optionalKey(TurnId),
   moduleId: Schema.optionalKey(ModuleId),
-  fieldErrors: Schema.optionalKey(Schema.Array(FieldError))
+  fieldErrors: Schema.optionalKey(Schema.Array(FieldError)),
+  /**
+   * `invalid_settings` without field errors: the save would work, but these look like mistakes. Nothing was saved;
+   * send it again with `confirmWarnings` to save anyway.
+   */
+  warnings: Schema.optionalKey(Schema.Array(FieldError))
 })
 export type ErrorInfo = typeof ErrorInfo.Type

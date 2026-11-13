@@ -31,9 +31,9 @@ export const OFFLINE_AGENT_ID = "offline"
 
 /** What the stand-in says first, from the module's state. */
 export const subscriptionNotice = (module: ModuleInfo | undefined): string => {
-  if (module === undefined || !module.enabled) return "Claude subscription is off — switch it on under Modules."
+  if (module === undefined || !module.enabled) return "Claude subscription is off — switch it on in Settings, Language model."
   if (module.state === "starting") return "Claude subscription is still starting — try again in a moment."
-  if (module.state === "error") return "Claude subscription could not start — see Modules."
+  if (module.state === "error") return "Claude subscription could not start — see Settings, Language model."
   return "Claude subscription did not answer."
 }
 

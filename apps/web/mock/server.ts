@@ -12,15 +12,22 @@
  *   typed           no automatic voice turn; typed messages get replies (spoken for the owner if asked).
  *   modules         like typed; the module catalog covers every field type, an invalid value
  *                   (weather "Home location" = "Atlantis") and a module that fails to start (home-assistant).
+ * Settings in every scenario are placed like the real server's (group/page/order, visibleWhen, option tags), with
+ * its cross-field checks (final silence > early guess: error; a hosted provider without its key: warning, "Save
+ * anyway" with confirmWarnings), reloadPendingFor, and the Claude subscription agent (starts once opted in).
  *   engine-failed   the engines failed (problems listed); typed messages are refused.
  *   drop-mid-reply  like voice, but every socket is dropped 0.8 s into the reply's playback.
  *   takeover        like voice without a turn; 1.5 s after a claim, "another tab" takes the audio.
  *   outdated        every hello is answered with close 4400 (page out of date).
- *   vault           like modules; protected items (Home Assistant, Language model) can be changed by any page until a
+ *   vault           like modules; protected items (Home Assistant, Language model, Speech engine, Claude subscription) can be changed by any page until a
  *                   password is set (vault.setup), then only by pages that typed it. Lock / unlock / change password work.
  *   keys-locked     a vault exists (password "correct horse battery") and is locked, so the engines failed;
  *                   unlocking reloads them.
  * In every scenario the vault starts as "none" (everyone may change everything) unless the scenario says otherwise.
+ *
+ * Every scenario also has settings from a fake .env (Diagnostics › Settings from outside: Move works, keys are refused
+ * while the vault is locked) and model downloads (Speech recognition › Models, Voices › Models: a download takes
+ * MOCK_DOWNLOAD_TICKS × 250 ms, then 1.5 s to "unpack"; Cancel and Delete work; the models in use cannot be deleted).
  *
  * Control endpoints (for tests): GET /mock/log (client messages and microphone stats), POST /mock/reset,
  * POST /mock/turn (run the scripted voice turn now), POST /mock/send {"messages": [ServerMessage…]} (broadcast),
@@ -35,7 +42,10 @@ import {
   encodeReplyFrame,
   encodeServerMessage,
   type EngineStatus,
+  type EnvInfo,
   type HistoryItem,
+  type JobInfo,
+  type ModelSet,
   type ModuleInfo,
   PROTOCOL_VERSION,
   type ServerMessage,
@@ -43,17 +53,23 @@ import {
   type SettingsPatch,
   type SettingsSection,
   type SettingValue,
+  type ToolId,
   type TraceInfo
 } from "@pva/protocol"
 import { exampleSnapshot, exampleVoiceSection, exampleWeatherModule } from "@pva/protocol/examples"
 import { type WebSocket, WebSocketServer } from "ws"
+import type { Condition, FieldError } from "@pva/protocol"
 
 const PORT = Number(process.env.MOCK_PORT ?? 8787)
 const HOST = process.env.MOCK_HOST ?? "127.0.0.1"
 const SCENARIOS = ["voice", "typed", "modules", "engine-failed", "drop-mid-reply", "takeover", "outdated", "vault", "keys-locked"] as const
 const VAULT_PASSWORD = "correct horse battery"
 const VAULT_LOCATION = "/home/owner/.config/pva/vault.enc"
-const KEYS_LOCKED = "Keys are locked — unlock them in Options"
+const KEYS_LOCKED = "Keys are locked — unlock them in Settings → Keys & access"
+const ENV_FILE = "/home/owner/personal-voice-assistance/.env"
+const MODELS_DIR = "/home/owner/personal-voice-assistance/models"
+/** Simulated download speed: ticks of 250 ms (MOCK_DOWNLOAD_TICKS, default 16 for the download and 6 to unpack). */
+const DOWNLOAD_TICKS = Number(process.env.MOCK_DOWNLOAD_TICKS ?? 16)
 type Scenario = typeof SCENARIOS[number]
 const REPLY_RATE = 22_050
 
@@ -95,9 +111,11 @@ const initialModules = (): Array<ModuleInfo> => [
       secrets: {},
       errors: []
     },
-    revision: 1
+    revision: 1,
+    kind: "capability",
+    group: "modules"
   },
-  clone(exampleWeatherModule),
+  { ...clone(exampleWeatherModule), kind: "capability", group: "modules" },
   {
     id: "home-assistant",
     name: "Home Assistant",
@@ -129,7 +147,9 @@ const initialModules = (): Array<ModuleInfo> => [
       errors: []
     },
     revision: 1,
-    protected: true
+    protected: true,
+    kind: "capability",
+    group: "modules"
   },
   {
     id: "notes",
@@ -161,18 +181,107 @@ const initialModules = (): Array<ModuleInfo> => [
       secrets: {},
       errors: []
     },
-    revision: 1
+    revision: 1,
+    kind: "capability",
+    group: "modules"
+  },
+  {
+    id: "claude-subscription",
+    name: "Claude subscription",
+    description: "Claude through your Claude subscription (Claude Code). Off unless you opt in: the terms for this use are unclear.",
+    enabled: false,
+    state: "disabled",
+    tools: [],
+    settings: {
+      fields: [
+        {
+          type: "boolean",
+          key: "optIn",
+          label: "Use my Claude subscription",
+          description: "Anthropic does not clearly allow other software to drive Claude Code with a subscription login; usage counts against your plan's limits. Off by default.",
+          apply: "live",
+          default: false,
+          source: "default"
+        },
+        { type: "text", key: "model", label: "Model", description: "claude-haiku-5-5 (fastest), claude-sonnet-5-5 or claude-opus-5-5.", apply: "live", default: "claude-haiku-5-5", maxLength: 100, source: "default" },
+        { type: "boolean", key: "speculate", label: "Start before I finish speaking", apply: "live", default: false, advanced: true, source: "default" }
+      ],
+      values: { optIn: false, model: "claude-haiku-5-5", speculate: false },
+      secrets: {},
+      errors: []
+    },
+    revision: 1,
+    protected: true,
+    kind: "agent",
+    group: "agents"
   }
 ]
 
+const sherpa = { key: "STT_PROVIDER", in: ["sherpa"] }
+const deepgram = { key: "STT_PROVIDER", in: ["deepgram"] }
+const anthropic = { key: "LLM_PROVIDER", in: ["anthropic"] }
+
+/** The assistant settings, placed on the settings screen like the real server's (`sectionDefinitions.ts`). */
 const initialSections = (): Array<SettingsSection> => [
   {
-    id: "conversation",
-    title: "Conversation",
+    id: "language-model",
+    title: "Provider",
+    group: "agents",
+    page: { id: "provider", title: "Provider", description: "Who answers you. Changing it reloads the engines (a few seconds)." },
+    order: 10,
+    protected: true,
     form: {
       fields: [
-        { type: "text", key: "SYSTEM_PROMPT", label: "System prompt", description: "How the assistant behaves. Applies from the next turn.", apply: "live", default: "You are a concise, friendly voice assistant.", multiline: true, maxLength: 4000 },
-        { type: "number", key: "MAX_TOOL_ROUNDS", label: "Tool rounds per turn", apply: "reload", default: 4, integer: true, min: 1, max: 10, step: 1 }
+        {
+          type: "choice",
+          key: "LLM_PROVIDER",
+          label: "Language model",
+          apply: "reload",
+          default: "fake",
+          source: "saved",
+          options: [
+            { value: "fake", label: "Offline stand-in", description: "Echoes what you say and answers time questions.", tags: ["local"], implication: "No language model: the replies are canned." },
+            { value: "anthropic", label: "Claude API", description: "The Anthropic API with your own API key, billed per use.", tags: ["hosted", "needs-key"], implication: "What you say is sent to Anthropic." },
+            {
+              value: "claude-subscription",
+              label: "Claude subscription",
+              description: "Claude Code with your own Claude login on this machine; replies count against your plan's limits.",
+              tags: ["hosted", "experimental"],
+              implication: "What you say is sent to Anthropic through Claude Code.",
+              module: { id: "claude-subscription", optIn: "optIn" }
+            }
+          ]
+        },
+        { type: "secret", key: "ANTHROPIC_API_KEY", label: "Anthropic API key", apply: "reload", env: "ANTHROPIC_API_KEY", source: "env-file", locked: { reason: `Set by ANTHROPIC_API_KEY in ${ENV_FILE}, line 3`, file: ENV_FILE, line: 3 }, visibleWhen: anthropic },
+        { type: "text", key: "ANTHROPIC_MODEL", label: "Model", apply: "reload", default: "claude-haiku-5-5", source: "env-process", locked: { reason: "Set by ANTHROPIC_MODEL in the environment" }, visibleWhen: anthropic },
+        {
+          type: "choice",
+          key: "ANTHROPIC_EFFORT",
+          label: "Effort",
+          apply: "reload",
+          default: "low",
+          advanced: true,
+          source: "default",
+          visibleWhen: anthropic,
+          options: [{ value: "low", label: "Low" }, { value: "medium", label: "Medium", tags: ["slow-start"] }, { value: "high", label: "High", tags: ["slow-start"] }]
+        }
+      ],
+      values: { LLM_PROVIDER: "anthropic", ANTHROPIC_MODEL: "claude-haiku-5-5", ANTHROPIC_EFFORT: "low" },
+      secrets: { ANTHROPIC_API_KEY: { set: true, source: "env" } },
+      errors: []
+    },
+    revision: 1
+  },
+  {
+    id: "llm-behaviour",
+    title: "Behaviour",
+    group: "agents",
+    page: { id: "behaviour", title: "Behaviour", description: "How the language model talks." },
+    order: 20,
+    form: {
+      fields: [
+        { type: "text", key: "SYSTEM_PROMPT", label: "System prompt", description: "How the assistant behaves. Applies from the next turn.", apply: "live", default: "You are a concise, friendly voice assistant.", multiline: true, maxLength: 4000, source: "default" },
+        { type: "number", key: "MAX_TOOL_ROUNDS", label: "Tool rounds per turn", apply: "reload", default: 4, integer: true, min: 1, max: 10, step: 1, advanced: true, source: "default" }
       ],
       values: { SYSTEM_PROMPT: "You are a concise, friendly voice assistant.", MAX_TOOL_ROUNDS: 4 },
       secrets: {},
@@ -180,16 +289,73 @@ const initialSections = (): Array<SettingsSection> => [
     },
     revision: 1
   },
-  clone(exampleVoiceSection),
   {
-    id: "listening",
-    title: "Listening",
-    description: "Turn detection for the local recogniser (sherpa).",
+    id: "stt-engine",
+    title: "Engine",
+    group: "speech",
+    page: { id: "engine", title: "Engine", description: "How your speech is turned into text." },
+    order: 10,
+    protected: true,
     form: {
       fields: [
-        { type: "number", key: "STT_SHERPA_EAGER_SILENCE_MS", label: "Early guess after", apply: "reload", default: 250, integer: true, min: 100, max: 2000, step: 10, unit: "ms" },
-        { type: "number", key: "STT_SHERPA_FINAL_SILENCE_MS", label: "End of turn after", apply: "reload", default: 600, integer: true, min: 200, max: 3000, step: 10, unit: "ms" },
-        { type: "number", key: "STT_SHERPA_VAD_THRESHOLD", label: "Voice threshold", apply: "reload", default: 0.5, integer: false, min: 0.05, max: 0.95, step: 0.05, advanced: true }
+        {
+          type: "choice",
+          key: "STT_PROVIDER",
+          label: "Speech to text",
+          apply: "reload",
+          default: "sherpa",
+          source: "default",
+          options: [
+            { value: "sherpa", label: "On this machine", tags: ["local"], implication: "Your voice never leaves this machine." },
+            { value: "deepgram", label: "Deepgram", description: "Deepgram Flux over the internet. Its key is on the Deepgram page.", tags: ["hosted", "needs-key"], implication: "What you say is sent to Deepgram." }
+          ]
+        },
+        {
+          type: "choice",
+          key: "STT_SHERPA_MODEL",
+          label: "Speech recognition model",
+          description: "Accurate models read the whole sentence once you pause; streaming models show words while you talk.",
+          apply: "reload",
+          default: "parakeet-v2",
+          source: "default",
+          visibleWhen: sherpa,
+          options: [
+            { value: "parakeet-v2", label: "Parakeet v2 — English, most accurate", tags: ["local"], description: "Reads the whole sentence once you pause; no live words.", download: { tool: "stt-models", target: "parakeet-v2", sizeMb: 484 } },
+            { value: "nemotron-320", label: "Nemotron 320 ms — live words", tags: ["local"], download: { tool: "stt-models", target: "nemotron-320", sizeMb: 477 } },
+            { value: "whisper-turbo", label: "Whisper turbo — 99 languages", tags: ["local", "not-downloaded"], description: "Robust in noise, slower. Not downloaded yet (565 MB).", download: { tool: "stt-models", target: "whisper-turbo", sizeMb: 565 } },
+            { value: "parakeet-ultra", label: "Parakeet Ultra — multilingual", tags: ["local", "not-downloaded"], download: { tool: "stt-models", target: "parakeet-ultra", sizeMb: 489 } },
+            { value: "zipformer-en", label: "Zipformer — small, fast", tags: ["local"], download: { tool: "stt-models", target: "zipformer-en", sizeMb: 312 } }
+          ]
+        },
+        {
+          type: "choice",
+          key: "STT_SHERPA_LANGUAGE",
+          label: "Language",
+          apply: "reload",
+          default: "auto",
+          source: "default",
+          visibleWhen: { all: [sherpa, { key: "STT_SHERPA_MODEL", in: ["whisper-turbo", "nemotron-320"] }] },
+          options: [{ value: "auto", label: "Automatic" }, { value: "en", label: "English" }, { value: "nl", label: "Dutch" }]
+        }
+      ],
+      values: { STT_PROVIDER: "sherpa", STT_SHERPA_MODEL: "parakeet-v2", STT_SHERPA_LANGUAGE: "auto" },
+      secrets: {},
+      errors: []
+    },
+    revision: 1
+  },
+  {
+    id: "stt-timing",
+    title: "Turn timing",
+    group: "speech",
+    page: { id: "turn-timing", title: "Turn timing", description: "When your turn ends and a reply may start." },
+    order: 20,
+    visibleWhen: sherpa,
+    form: {
+      fields: [
+        { type: "number", key: "STT_SHERPA_EAGER_SILENCE_MS", label: "Early guess after", apply: "reload", default: 250, integer: true, min: 50, max: 2000, step: 10, unit: "ms", source: "default" },
+        { type: "number", key: "STT_SHERPA_FINAL_SILENCE_MS", label: "End of turn after", apply: "reload", default: 600, integer: true, min: 100, max: 3000, step: 10, unit: "ms", source: "default" },
+        { type: "number", key: "STT_SHERPA_VAD_THRESHOLD", label: "Voice threshold", apply: "reload", default: 0.5, integer: false, min: 0.05, max: 0.95, step: 0.05, advanced: true, source: "default" }
       ],
       values: { STT_SHERPA_EAGER_SILENCE_MS: 250, STT_SHERPA_FINAL_SILENCE_MS: 600, STT_SHERPA_VAD_THRESHOLD: 0.5 },
       secrets: {},
@@ -198,24 +364,141 @@ const initialSections = (): Array<SettingsSection> => [
     revision: 1
   },
   {
-    id: "language-model",
-    title: "Language model",
+    id: "stt-deepgram",
+    title: "Deepgram",
+    group: "speech",
+    page: { id: "deepgram", title: "Deepgram", description: "Hosted speech recognition (Deepgram Flux)." },
+    order: 40,
+    visibleWhen: deepgram,
+    protected: true,
     form: {
       fields: [
-        { type: "choice", key: "LLM_PROVIDER", label: "Provider", apply: "reload", default: "anthropic", options: [{ value: "anthropic", label: "Anthropic" }, { value: "fake", label: "Fake (testing)" }] },
-        { type: "text", key: "ANTHROPIC_MODEL", label: "Model", apply: "reload", default: "claude-haiku-5-5", locked: { reason: "Set by ANTHROPIC_MODEL in the environment" } },
-        { type: "secret", key: "ANTHROPIC_API_KEY", label: "API key", apply: "reload", env: "ANTHROPIC_API_KEY" }
+        { type: "secret", key: "DEEPGRAM_API_KEY", label: "Deepgram API key", apply: "reload", env: "DEEPGRAM_API_KEY", source: "default" },
+        { type: "number", key: "DEEPGRAM_EOT_THRESHOLD", label: "End-of-turn confidence", apply: "reload", default: 0.7, integer: false, min: 0.5, max: 1, step: 0.05, source: "default" }
       ],
-      values: { LLM_PROVIDER: "anthropic", ANTHROPIC_MODEL: "claude-haiku-5-5" },
-      secrets: { ANTHROPIC_API_KEY: { set: true, source: "env" } },
+      values: { DEEPGRAM_EOT_THRESHOLD: 0.7 },
+      secrets: { DEEPGRAM_API_KEY: { set: false, source: "none" } },
       errors: []
     },
-    revision: 1,
-    protected: true
+    revision: 1
+  },
+  { ...clone(exampleVoiceSection), group: "voices", page: { id: "overview", title: "Voices", description: "Which voices the assistant may use." }, order: 10 },
+  {
+    id: "voice-engines",
+    title: "Voice engines",
+    group: "voices",
+    page: { id: "engines", title: "Voice engines", description: "The engine of the standard voice, and the hosted voice service." },
+    order: 20,
+    protected: true,
+    form: {
+      fields: [
+        {
+          type: "choice",
+          key: "TTS_PROVIDER",
+          label: "Standard voice engine",
+          apply: "reload",
+          default: "sherpa",
+          source: "default",
+          options: [
+            { value: "sherpa", label: "On this machine (Piper/Kokoro)", tags: ["local"] },
+            { value: "cartesia", label: "Cartesia", tags: ["hosted", "needs-key"], implication: "Replies are sent to Cartesia to be spoken." }
+          ]
+        },
+        { type: "secret", key: "CARTESIA_API_KEY", label: "Cartesia API key", apply: "reload", env: "CARTESIA_API_KEY", source: "default" }
+      ],
+      values: { TTS_PROVIDER: "sherpa" },
+      secrets: { CARTESIA_API_KEY: { set: false, source: "none" } },
+      errors: []
+    },
+    revision: 1
+  },
+  {
+    id: "recordings",
+    title: "Recordings",
+    group: "diagnostics",
+    page: { id: "recordings", title: "Recordings", description: "Save what the assistant hears, to find out why it mishears." },
+    order: 10,
+    form: {
+      fields: [
+        { type: "boolean", key: "RECORD_HEARD_AUDIO", label: "Save what the assistant hears", apply: "live", default: false, source: "default" },
+        { type: "number", key: "RECORD_HEARD_AUDIO_MAX_FILES", label: "Recordings kept", apply: "live", default: 50, integer: true, min: 1, max: 500, advanced: true, source: "default", visibleWhen: { key: "RECORD_HEARD_AUDIO", in: [true] } }
+      ],
+      values: { RECORD_HEARD_AUDIO: false, RECORD_HEARD_AUDIO_MAX_FILES: 50 },
+      secrets: {},
+      errors: []
+    },
+    revision: 1
   }
 ]
 
-const readyEngine = (): EngineStatus => clone(exampleSnapshot.engine)
+/** Every section's value of `key` (keys are global), and whether a secret is set. */
+const valueOf = (key: string, list: ReadonlyArray<SettingsSection> = sections): unknown => {
+  for (const x of list) if (Object.hasOwn(x.form.values, key)) return x.form.values[key]
+  return undefined
+}
+const secretSet = (key: string, list: ReadonlyArray<SettingsSection> = sections) => list.some((x) => x.form.secrets[key]?.set === true)
+const holds = (c: Condition | undefined, lookup: (key: string) => unknown) =>
+  c === undefined || ("all" in c ? c.all.every((x) => x.in.includes(lookup(x.key) as never)) : "any" in c ? c.any.some((x) => x.in.includes(lookup(x.key) as never)) : c.in.includes(lookup(c.key) as never))
+
+/** The cross-field checks of the real server, per section (an error refuses a save; a warning asks first). */
+const checks = (list: ReadonlyArray<SettingsSection>): { errors: Array<FieldError & { section: string }>; warnings: Array<FieldError & { section: string }> } => {
+  const v = (key: string) => valueOf(key, list)
+  const errors: Array<FieldError & { section: string }> = []
+  const warnings: Array<FieldError & { section: string }> = []
+  if (Number(v("STT_SHERPA_FINAL_SILENCE_MS")) <= Number(v("STT_SHERPA_EAGER_SILENCE_MS"))) {
+    errors.push({ section: "stt-timing", key: "STT_SHERPA_FINAL_SILENCE_MS", message: `Must be longer than the early guess (${String(v("STT_SHERPA_EAGER_SILENCE_MS"))} ms).` })
+  }
+  if (v("STT_PROVIDER") === "deepgram" && !secretSet("DEEPGRAM_API_KEY", list)) {
+    warnings.push({ section: "stt-engine", key: "STT_PROVIDER", message: "Deepgram is chosen but there is no Deepgram key: speech recognition fails until you add it on the Deepgram page." })
+  }
+  if (v("LLM_PROVIDER") === "anthropic" && !secretSet("ANTHROPIC_API_KEY", list)) {
+    warnings.push({ section: "language-model", key: "ANTHROPIC_API_KEY", message: "The Claude API is chosen but there is no API key: replies fail until you add it here." })
+  }
+  if (v("TTS_PROVIDER") === "cartesia" && !secretSet("CARTESIA_API_KEY", list)) {
+    warnings.push({ section: "voice-engines", key: "TTS_PROVIDER", message: "Cartesia is chosen but there is no Cartesia key: the standard voice fails until you add it below." })
+  }
+  const voices = v("VOICES")
+  if (Array.isArray(voices) && voices.includes("expressive") && !secretSet("CARTESIA_API_KEY", list)) {
+    warnings.push({ section: "voices", key: "VOICES", message: "expressive speaks through Cartesia, but there is no Cartesia key: add it on the Voice engines page." })
+  }
+  return { errors, warnings }
+}
+
+/** The sections with their forms' warnings for the saved values. */
+const withWarnings = (list: Array<SettingsSection>): Array<SettingsSection> => {
+  const { warnings } = checks(list)
+  return list.map((x) => {
+    const mine = warnings.filter((w) => w.section === x.id).map(({ key, message }) => ({ key, message }))
+    const { warnings: _old, ...form } = x.form
+    return { ...x, form: mine.length > 0 ? { ...form, warnings: mine } : form }
+  })
+}
+
+/** The engines as the saved settings would build them (the language model follows LLM_PROVIDER). */
+const readyEngine = (): EngineStatus => {
+  const base = clone(exampleSnapshot.engine)
+  const provider = String(valueOf("LLM_PROVIDER") ?? "anthropic")
+  const sub = modules.find((m) => m.id === "claude-subscription")
+  const model = String(sub?.settings.values.model ?? "claude-haiku-5-5")
+  const detail = provider === "anthropic"
+    ? String(valueOf("ANTHROPIC_MODEL") ?? "claude-haiku-5-5")
+    : provider === "claude-subscription"
+    ? sub?.state === "running" ? model : `${model} · module ${sub?.enabled === true ? sub.state : "off"}: the offline stand-in answers`
+    : "offline stand-in"
+  return {
+    ...base,
+    reloadPendingFor: [],
+    engines: base.engines.map((e) => (e.stage === "llm" ? { ...e, provider, detail, location: provider === "fake" ? "local" : "hosted" } : e))
+  }
+}
+/** The Claude subscription module changed: the running engines say so when it is the language model. */
+const refreshEngine = () => {
+  if (engine.state !== "ready" || !engine.engines.some((e) => e.stage === "llm" && e.provider === "claude-subscription")) return
+  const llm = readyEngine().engines.find((e) => e.stage === "llm")!
+  engine = { ...engine, engines: engine.engines.map((e) => (e.stage === "llm" ? llm : e)) }
+  broadcast({ type: "engine", engine })
+}
+
 const keysLockedEngine = (): EngineStatus => ({
   ...readyEngine(),
   state: "failed",
@@ -271,9 +554,16 @@ let claimedSince = false
 let assistantState: "idle" | "listening" | "hearing" | "thinking" | "speaking" = "idle"
 let micLive = true
 let modules = initialModules()
-let sections = initialSections()
+let sections = withWarnings(initialSections())
 let engine: EngineStatus = initialEngine()
-let vault: { state: "none" | "locked" | "unlocked"; password?: string } = scenario === "keys-locked" ? { state: "locked", password: VAULT_PASSWORD } : { state: "none" }
+let vault: { state: "none" | "locked" | "unlocked"; password?: string; lockReason?: "start" | "manual" } = scenario === "keys-locked"
+  ? { state: "locked", password: VAULT_PASSWORD, lockReason: "start" }
+  : { state: "none" }
+let env: EnvInfo = initialEnv()
+let models: Array<ModelSet> = initialModels()
+let jobs: Array<JobInfo> = []
+let jobSeq = 0
+const jobTimers = new Map<string, ReturnType<typeof setInterval>>()
 let history: Array<HistoryItem> = clone([...exampleSnapshot.history])
 let traces: Array<TraceInfo> = []
 let turnSeq = 20
@@ -292,10 +582,15 @@ const resetState = () => {
   assistantState = "idle"
   micLive = true
   modules = initialModules()
-  sections = initialSections()
+  sections = withWarnings(initialSections())
   engine = initialEngine()
-  vault = scenario === "keys-locked" ? { state: "locked", password: VAULT_PASSWORD } : { state: "none" }
+  vault = scenario === "keys-locked" ? { state: "locked", password: VAULT_PASSWORD, lockReason: "start" } : { state: "none" }
   for (const c of conns) c.admin = false
+  env = initialEnv()
+  models = initialModels()
+  for (const t of jobTimers.values()) clearInterval(t)
+  jobTimers.clear()
+  jobs = []
   history = clone([...exampleSnapshot.history])
   traces = []
   turnSeq = 20
@@ -321,10 +616,174 @@ const setState = (state: typeof assistantState, turnId?: number) => {
   broadcast(turnId === undefined ? { type: "state", state } : { type: "state", state, turnId })
 }
 
+// ---- Settings from outside (.env) and model downloads
+
+function initialEnv(): EnvInfo {
+  return {
+    files: [ENV_FILE],
+    entries: [
+      { key: "ANTHROPIC_API_KEY", origin: "file", file: ENV_FILE, line: 3, kind: "setting", secret: true, page: { path: ["language-model", "provider"], title: "Language model › Provider" }, movable: true },
+      { key: "ANTHROPIC_MODEL", origin: "process", kind: "setting", secret: false, page: { path: ["language-model", "provider"], title: "Language model › Provider" }, movable: false },
+      { key: "PVA_VAULT_PASSWORD", origin: "file", file: ENV_FILE, line: 1, kind: "bootstrap", secret: true, movable: false },
+      { key: "SERVE_PORT", origin: "file", file: ENV_FILE, line: 2, kind: "bootstrap", secret: false, movable: false },
+      { key: "STT_SHERPA_MODLE", origin: "file", file: ENV_FILE, line: 6, kind: "unknown", secret: false, movable: false },
+      { key: "TTS_SHERPA_SPEED", origin: "file", file: ENV_FILE, line: 5, kind: "setting", secret: false, page: { path: ["voices", "engines"], title: "Voices › Voice engines" }, movable: true }
+    ]
+  }
+}
+
+function initialModels(): Array<ModelSet> {
+  return [
+    {
+      tool: "stt-models",
+      title: "Speech recognition models",
+      directory: MODELS_DIR,
+      freeMb: 41_200,
+      items: [
+        { id: "parakeet-v2", label: "Parakeet v2 — English, most accurate", description: "Best English accuracy.", sizeMb: 484, diskMb: 663, installed: true, inUse: true },
+        { id: "parakeet-ultra", label: "Parakeet Ultra — multilingual", description: "English, Dutch and 23 more languages.", sizeMb: 489, diskMb: 673, installed: false, inUse: false },
+        { id: "whisper-turbo", label: "Whisper turbo — 99 languages", description: "Robust in noise, slower.", sizeMb: 565, diskMb: 1039, installed: false, inUse: false },
+        { id: "nemotron-320", label: "Nemotron 320 ms — live words", description: "Live words, multilingual.", sizeMb: 477, diskMb: 686, installed: true, inUse: false },
+        { id: "zipformer-en", label: "Zipformer — small, fast", description: "Small and light, least accurate.", sizeMb: 312, diskMb: 331, installed: true, inUse: false }
+      ]
+    },
+    {
+      tool: "tts-models",
+      title: "Voice models",
+      directory: MODELS_DIR,
+      freeMb: 41_200,
+      items: [
+        { id: "en_US-lessac-medium", label: "Piper en_US-lessac-medium", description: "Fast · 22050 Hz", sizeMb: 68, diskMb: 83, installed: true, inUse: true },
+        { id: "nl_NL-pim-medium", label: "Piper nl_NL-pim-medium", description: "Fast · 22050 Hz", sizeMb: 68, diskMb: 83, installed: false, inUse: false },
+        { id: "kokoro-af_heart", label: "Kokoro kokoro-af_heart", description: "Higher quality, slower first audio · 24000 Hz", sizeMb: 350, diskMb: 403, installed: true, inUse: false }
+      ]
+    }
+  ]
+}
+
+const setInstalled = (tool: ToolId, target: string, installed: boolean) => {
+  models = models.map((m) => (m.tool !== tool ? m : { ...m, items: m.items.map((i) => (i.id === target ? { ...i, installed } : i)) }))
+  broadcast({ type: "models", models })
+  // The recogniser choice drops or gains its `not-downloaded` tag.
+  if (tool !== "stt-models") return
+  sections = sections.map((x) => {
+    if (!x.form.fields.some((f) => f.key === "STT_SHERPA_MODEL")) return x
+    const fields = x.form.fields.map((f) =>
+      f.key !== "STT_SHERPA_MODEL" || f.type !== "choice"
+        ? f
+        : {
+          ...f,
+          options: f.options.map((o) =>
+            o.value !== target ? o : { ...o, tags: installed ? (o.tags ?? []).filter((t) => t !== "not-downloaded") : [...(o.tags ?? []), "not-downloaded" as const] }
+          )
+        }
+    )
+    const next = { ...x, form: { ...x.form, fields }, revision: x.revision + 1 }
+    broadcast({ type: "section.changed", section: next })
+    return next
+  })
+}
+
+const updateJob = (job: JobInfo) => {
+  jobs = [...jobs.filter((j) => j.id !== job.id), job].slice(-20)
+  broadcast({ type: "job", job })
+}
+
+const startDownload = (c: Conn, requestId: string, tool: ToolId, target: string) => {
+  const item = models.find((m) => m.tool === tool)?.items.find((i) => i.id === target)
+  if (item === undefined) return result(c, requestId, false, { code: "invalid_settings", message: `There is no model "${target}"` })
+  if (item.installed) return result(c, requestId, false, { code: "busy", message: `${item.label} is already downloaded` })
+  if (jobs.some((j) => j.state === "running" && j.tool === tool && j.target === target)) {
+    return result(c, requestId, false, { code: "busy", message: `${item.label} is already being downloaded` })
+  }
+  const total = item.sizeMb * 1e6
+  let job: JobInfo = {
+    id: `job-${++jobSeq}`,
+    tool,
+    action: "download",
+    target,
+    label: item.label,
+    state: "running",
+    phase: "check",
+    log: [`Needs about ${((item.sizeMb + item.diskMb) / 1000).toFixed(1)} GB; 41.2 GB free`],
+    startedAt: Date.now()
+  }
+  updateJob(job)
+  result(c, requestId, true)
+  let tick = 0
+  const unpackTicks = 6
+  const timer = setInterval(() => {
+    tick++
+    if (tick <= DOWNLOAD_TICKS) {
+      job = { ...job, phase: "download", progress: { done: Math.round((total * tick) / DOWNLOAD_TICKS), total, unit: "bytes" }, log: tick === 1 ? [...job.log, `Downloading ${target}`] : job.log }
+    } else if (tick <= DOWNLOAD_TICKS + unpackTicks) {
+      job = { ...job, phase: "unpack", progress: { done: Math.round((total * (tick - DOWNLOAD_TICKS)) / unpackTicks), total, unit: "bytes" } }
+    } else {
+      clearInterval(timer)
+      jobTimers.delete(job.id)
+      job = { ...job, state: "succeeded", endedAt: Date.now(), log: [...job.log, `${target}: ready`] }
+      updateJob(job)
+      setInstalled(tool, target, true)
+      return
+    }
+    updateJob(job)
+  }, 250)
+  jobTimers.set(job.id, timer)
+}
+
+const cancelJob = (c: Conn, requestId: string, jobId: string) => {
+  const job = jobs.find((j) => j.id === jobId && j.state === "running")
+  const timer = jobTimers.get(jobId)
+  if (job === undefined || timer === undefined) return result(c, requestId, false, { code: "invalid_settings", message: "That job is not running" })
+  clearInterval(timer)
+  jobTimers.delete(jobId)
+  updateJob({ ...job, state: "cancelled", endedAt: Date.now() })
+  result(c, requestId, true)
+}
+
+const deleteModel = (c: Conn, requestId: string, tool: ToolId, target: string) => {
+  const item = models.find((m) => m.tool === tool)?.items.find((i) => i.id === target)
+  if (item === undefined) return result(c, requestId, false, { code: "invalid_settings", message: `There is no model "${target}"` })
+  if (item.inUse) return result(c, requestId, false, { code: "busy", message: `${item.label} is in use by the running engines; choose another model and reload first` })
+  if (!item.installed) return result(c, requestId, false, { code: "invalid_settings", message: `${item.label} is not downloaded` })
+  setInstalled(tool, target, false)
+  result(c, requestId, true)
+}
+
+const moveFromEnv = (c: Conn, requestId: string, keys: ReadonlyArray<string>) => {
+  const entries = keys.map((k) => env.entries.find((e) => e.key === k))
+  const bad = keys.filter((_, i) => entries[i]?.movable !== true)
+  if (bad.length > 0) return result(c, requestId, false, { code: "invalid_settings", message: `${bad.join(", ")} cannot be moved` })
+  if (vault.state === "locked" && entries.some((e) => e?.secret === true)) {
+    return result(c, requestId, false, { code: "locked", message: "Unlock the key vault first (Settings → Keys & access)" })
+  }
+  env = { ...env, entries: env.entries.filter((e) => !keys.includes(e.key)) }
+  // The fields those variables locked are saved settings now.
+  sections = sections.map((x) => {
+    if (!x.form.fields.some((f) => keys.includes(f.key) && f.locked !== undefined)) return x
+    const fields = x.form.fields.map((f) => {
+      if (!keys.includes(f.key)) return f
+      const { locked: _locked, ...rest } = f
+      return { ...rest, source: "saved" as const }
+    })
+    const secrets = Object.fromEntries(Object.entries(x.form.secrets).map(([k, v]) => [k, keys.includes(k) ? { set: true, source: "store" as const } : v]))
+    const next = { ...x, form: { ...x.form, fields, secrets }, revision: x.revision + 1 }
+    broadcast({ type: "section.changed", section: next })
+    return next
+  })
+  result(c, requestId, true)
+  broadcast({ type: "env", env })
+}
+
 // ---- Key vault and admin access (per connection)
 
 const isAdmin = (c: Conn) => vault.state === "none" || (c.admin && vault.state === "unlocked")
-const vaultInfo = (c: Conn) => ({ state: vault.state, admin: isAdmin(c), location: VAULT_LOCATION })
+const vaultInfo = (c: Conn) => ({
+  state: vault.state,
+  admin: isAdmin(c),
+  location: VAULT_LOCATION,
+  ...(vault.state === "locked" && vault.lockReason !== undefined ? { lockReason: vault.lockReason } : {})
+})
 const sendVault = (c: Conn) => sendTo(c, { type: "vault", vault: vaultInfo(c) })
 const vaultChanged = () => {
   if (vault.state !== "unlocked") for (const c of conns) c.admin = false
@@ -336,8 +795,8 @@ const refuseLocked = (c: Conn, requestId: string, isProtected: boolean | undefin
   result(c, requestId, false, {
     code: "locked",
     message: vault.state === "locked"
-      ? "The keys are locked: unlock them with the password in Options → Keys & access to change this."
-      : "Protected: type the password in Options → Keys & access to change this."
+      ? "The keys are locked: unlock them with the password in Settings → Keys & access to change this."
+      : "Protected: type the password in Settings → Keys & access to change this."
   })
   return true
 }
@@ -546,13 +1005,20 @@ const result = (c: Conn, requestId: string, ok: boolean, error?: Extract<ServerM
 const applyPatch = (form: SettingsForm, patch: SettingsPatch): SettingsForm => {
   const values: Record<string, SettingValue> = { ...form.values }
   const secrets = { ...form.secrets }
+  const sources: Record<string, "default" | "saved"> = {}
   for (const [k, v] of Object.entries(patch.values)) {
     const field = form.fields.find((f) => f.key === k)
     if (field === undefined || field.type === "secret") continue
     values[k] = v === null ? (field.default as SettingValue) : v
+    sources[k] = v === null ? "default" : "saved"
   }
-  for (const [k, v] of Object.entries(patch.secrets)) secrets[k] = v === null ? { set: false, source: "none" } : { set: true, source: "store" }
-  return { ...form, values, secrets, errors: [] }
+  for (const [k, v] of Object.entries(patch.secrets)) {
+    secrets[k] = v === null ? { set: false, source: "none" } : { set: true, source: "store" }
+    sources[k] = v === null ? "default" : "saved"
+  }
+  // Fields set by the environment keep their source; the others say where their value now comes from.
+  const fields = form.fields.map((f) => (sources[f.key] !== undefined && f.locked === undefined ? { ...f, source: sources[f.key]! } : f))
+  return { ...form, fields, values, secrets, errors: [] }
 }
 
 const validate = (form: SettingsForm, patch: SettingsPatch) => {
@@ -587,6 +1053,12 @@ const startModule = (c: Conn, requestId: string, id: string) => {
   after(600, () => {
     const m = modules.find((x) => x.id === id)!
     const goodToken = (m as ModuleInfo & { tokenGood?: boolean }).tokenGood === true
+    if (id === "claude-subscription" && m.settings.values.optIn !== true) {
+      const message = "Switch on \"Use my Claude subscription\" first: you accept that this use of your subscription is not clearly allowed."
+      setModule(id, (x) => ({ ...x, state: "error", error: message, tools: [] }))
+      result(c, requestId, false, { code: "module_start_failed", message, moduleId: id })
+      return
+    }
     if (id === "home-assistant" && !goodToken) {
       const message = "Home Assistant rejected the token (HTTP 401). Create a new long-lived token and paste it here."
       setModule(id, (x) => ({ ...x, state: "error", error: message, tools: [] }))
@@ -598,9 +1070,16 @@ const startModule = (c: Conn, requestId: string, id: string) => {
       : id === "notes"
       ? [{ name: "add_note", description: "Save a short note.", speculative: false }, { name: "read_notes", description: "Read recent notes.", speculative: true }]
       : m.tools.length > 0 ? m.tools : initialModules().find((x) => x.id === id)?.tools ?? []
-    const status = id === "home-assistant" ? { text: "Connected to Home · 42 devices", tone: "ok" as const } : id === "notes" ? { text: "12 notes in Inbox", tone: "neutral" as const } : m.status
+    const status = id === "home-assistant"
+      ? { text: "Connected to Home · 42 devices", tone: "ok" as const }
+      : id === "notes"
+      ? { text: "12 notes in Inbox", tone: "neutral" as const }
+      : id === "claude-subscription"
+      ? { text: `Ready · ${String(m.settings.values.model)} · max plan`, tone: "ok" as const }
+      : m.status
     setModule(id, (x) => ({ ...x, state: "running", tools, ...(status !== undefined ? { status } : {}) }))
     result(c, requestId, true)
+    if (id === "claude-subscription") refreshEngine()
   })
 }
 
@@ -691,7 +1170,7 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
       return
     }
     case "text.send": {
-      if (engine.state !== "ready") return result(c, m.requestId, false, { code: "engine_failed", message: "The assistant's engines are not running; see Options → Assistant." })
+      if (engine.state !== "ready") return result(c, m.requestId, false, { code: "engine_failed", message: "The assistant's engines are not running; see Settings → Overview." })
       result(c, m.requestId, true)
       const spoken = c === owner && m.speak
       const lower = m.text.toLowerCase()
@@ -720,7 +1199,10 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
         return { ...rest, enabled: false, state: "stopping", tools: [] }
       })
       result(c, m.requestId, true)
-      after(400, () => setModule(m.moduleId, (x) => ({ ...x, state: "disabled" })))
+      after(400, () => {
+        setModule(m.moduleId, (x) => ({ ...x, state: "disabled" }))
+        if (m.moduleId === "claude-subscription") refreshEngine()
+      })
       return
     }
     case "module.configure": {
@@ -740,15 +1222,34 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
       if (i === -1) return result(c, m.requestId, false, { code: "unknown_section", message: `No section ${m.sectionId}.` })
       const section = sections[i]!
       if (refuseLocked(c, m.requestId, section.protected)) return
-      const errors = validate(section.form, m.patch)
+      // Fields hidden after the patch (visibleWhen) are neither validated nor saved, as on the real server.
+      const after = (key: string) => (Object.hasOwn(m.patch.values, key) && m.patch.values[key] !== null ? m.patch.values[key] : valueOf(key))
+      const shown = (key: string) => holds(section.form.fields.find((f) => f.key === key)?.visibleWhen, after)
+      const patch: SettingsPatch = {
+        values: Object.fromEntries(Object.entries(m.patch.values).filter(([k]) => shown(k))),
+        secrets: Object.fromEntries(Object.entries(m.patch.secrets).filter(([k]) => shown(k)))
+      }
+      const errors = validate(section.form, patch)
       if (errors.length > 0) return result(c, m.requestId, false, { code: "invalid_settings", message: "Some settings are not valid.", fieldErrors: errors })
-      const next: SettingsSection = { ...section, form: applyPatch(section.form, m.patch), revision: section.revision + 1 }
-      sections[i] = next
+      const candidate = sections.map((x, j) => (j === i ? { ...x, form: applyPatch(x.form, patch) } : x))
+      const fresh = <E extends FieldError>(a: ReadonlyArray<E>, b: ReadonlyArray<E>) => b.filter((e) => !a.some((x) => x.key === e.key && x.message === e.message))
+      const before = checks(sections)
+      const later = checks(candidate)
+      const newErrors = fresh(before.errors, later.errors).map(({ key, message }) => ({ key, message }))
+      if (newErrors.length > 0) return result(c, m.requestId, false, { code: "invalid_settings", message: newErrors[0]!.message, fieldErrors: newErrors })
+      const newWarnings = fresh(before.warnings, later.warnings).map(({ key, message }) => ({ key, message }))
+      if (newWarnings.length > 0 && m.confirmWarnings !== true) {
+        return result(c, m.requestId, false, { code: "invalid_settings", message: "Check the warnings below, then save anyway or change the settings", warnings: newWarnings })
+      }
+      const committed = withWarnings(candidate)
+      const changed = new Set(committed.filter((x, j) => j === i || JSON.stringify(x.form) !== JSON.stringify(sections[j]!.form)).map((x) => x.id))
+      sections = committed.map((x) => (changed.has(x.id) ? { ...x, revision: x.revision + 1 } : x))
+      for (const x of sections) if (changed.has(x.id)) broadcast({ type: "section.changed", section: x })
       result(c, m.requestId, true)
-      broadcast({ type: "section.changed", section: next })
-      const needsReload = Object.keys({ ...m.patch.values, ...m.patch.secrets }).some((k) => section.form.fields.find((f) => f.key === k)?.apply === "reload")
-      if (needsReload && !engine.reloadPending) {
-        engine = { ...engine, reloadPending: true }
+      const needsReload = Object.keys({ ...patch.values, ...patch.secrets }).some((k) => section.form.fields.find((f) => f.key === k)?.apply === "reload")
+      const path = `${section.group ?? "general"}/${section.page?.id ?? section.id}`
+      if (needsReload && (!engine.reloadPending || !(engine.reloadPendingFor ?? []).includes(path))) {
+        engine = { ...engine, reloadPending: true, reloadPendingFor: [...(engine.reloadPendingFor ?? []).filter((p) => p !== path), path] }
         broadcast({ type: "engine", engine })
       }
       return
@@ -786,8 +1287,8 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
     }
     case "vault.lock": {
       if (vault.state === "none") return result(c, m.requestId, false, { code: "locked", message: "There is no key vault yet: set a password first" })
-      if (!isAdmin(c)) return result(c, m.requestId, false, { code: "locked", message: "Protected: type the password in Options → Keys & access to change this." })
-      vault = { ...vault, state: "locked" }
+      if (!isAdmin(c)) return result(c, m.requestId, false, { code: "locked", message: "Protected: type the password in Settings → Keys & access to change this." })
+      vault = { ...vault, state: "locked", lockReason: "manual" }
       result(c, m.requestId, true)
       vaultChanged()
       return
@@ -803,6 +1304,18 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
       if (wasLocked) afterUnlock()
       return
     }
+    case "settings.moveFromEnv":
+      if (refuseLocked(c, m.requestId, true)) return
+      return moveFromEnv(c, m.requestId, m.keys)
+    case "job.start":
+      if (refuseLocked(c, m.requestId, true)) return
+      return startDownload(c, m.requestId, m.tool, m.target)
+    case "job.cancel":
+      if (refuseLocked(c, m.requestId, true)) return
+      return cancelJob(c, m.requestId, m.jobId)
+    case "model.delete":
+      if (refuseLocked(c, m.requestId, true)) return
+      return deleteModel(c, m.requestId, m.tool, m.target)
     case "ping":
       sendTo(c, { type: "pong", id: m.id })
       return
@@ -868,7 +1381,10 @@ wss.on("connection", (ws: WebSocket) => {
           sections,
           history: history.slice(-200),
           traces: traces.slice(-20),
-          vault: vaultInfo(c)
+          vault: vaultInfo(c),
+          env,
+          models,
+          jobs
         }
       })
       if (resumed) {

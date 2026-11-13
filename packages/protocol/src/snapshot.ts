@@ -10,7 +10,10 @@ import {
   TurnOutcome,
   TurnSource
 } from "./common.ts"
-import { SettingsForm } from "./settings.ts"
+import { ModuleKind } from "./agents.ts"
+import { Condition, SettingsForm, SettingsGroup, SettingsPage } from "./settings.ts"
+import { EnvInfo } from "./env.ts"
+import { JobInfo, ModelSet } from "./jobs.ts"
 import { VaultInfo } from "./vault.ts"
 
 /** A one-line status a running module publishes, e.g. "Connected · 143 entities". */
@@ -50,7 +53,14 @@ export const ModuleInfo = Schema.Struct({
    * Only a page with admin access may switch it on or off or change its settings (it has a secret, or it is an
    * agent). Absent = false.
    */
-  protected: Schema.optionalKey(Schema.Boolean)
+  protected: Schema.optionalKey(Schema.Boolean),
+  /** What the module contributes. Absent = "capability". */
+  kind: Schema.optionalKey(ModuleKind),
+  /**
+   * The settings category that shows the module's page (`#settings/<group>/<id>`): `modules` for capabilities,
+   * `agents` (Language model) for agents and decision providers. Absent = by `kind`.
+   */
+  group: Schema.optionalKey(SettingsGroup)
 })
 export type ModuleInfo = typeof ModuleInfo.Type
 
@@ -62,7 +72,18 @@ export const SettingsSection = Schema.Struct({
   form: SettingsForm,
   revision: NonNegativeInt,
   /** Only a page with admin access may change it (it has a secret, or it chooses providers). Absent = false. */
-  protected: Schema.optionalKey(Schema.Boolean)
+  protected: Schema.optionalKey(Schema.Boolean),
+  /** The settings category (docs/SETTINGS-UI.md §2.2). Absent = "general". */
+  group: Schema.optionalKey(SettingsGroup),
+  /** The page it is shown on; sections sharing a page are stacked on it. Absent = a page of its own (`id`, `title`). */
+  page: Schema.optionalKey(SettingsPage),
+  /** Position among the pages of its group (lower first), then server order. */
+  order: Schema.optionalKey(Schema.Finite),
+  /**
+   * The page is in use only while this holds (the Deepgram page: `STT_PROVIDER = deepgram`). A page not in use is
+   * still reachable ("Set up Deepgram", under "Not in use"), so a key can be entered before switching.
+   */
+  visibleWhen: Schema.optionalKey(Condition)
 })
 export type SettingsSection = typeof SettingsSection.Type
 
@@ -96,6 +117,8 @@ export const EngineStatus = Schema.Struct({
   problems: Schema.Array(Schema.Struct({ stage: Schema.String, message: Schema.String })),
   /** Saved settings differ from what the running engines use; a reload would apply them. */
   reloadPending: Schema.Boolean,
+  /** The settings pages (`<group>/<page>`) whose saved changes wait for that reload. Absent = not known. */
+  reloadPendingFor: Schema.optionalKey(Schema.Array(Schema.String)),
   engines: Schema.Array(EngineInfo),
   voices: Schema.Array(VoiceInfo)
 })
@@ -157,6 +180,12 @@ export const Snapshot = Schema.Struct({
   /** The most recent traces (at most 20), oldest first. */
   traces: Schema.Array(TraceInfo),
   /** The key vault as this page sees it. Absent: treat as `{ state: "none", admin: true }`. */
-  vault: Schema.optionalKey(VaultInfo)
+  vault: Schema.optionalKey(VaultInfo),
+  /** Settings set outside the UI (environment, `.env`). Absent: an older server. */
+  env: Schema.optionalKey(EnvInfo),
+  /** Downloadable models, per tool. */
+  models: Schema.optionalKey(Schema.Array(ModelSet)),
+  /** Running jobs and the last finished ones, oldest first. */
+  jobs: Schema.optionalKey(Schema.Array(JobInfo))
 })
 export type Snapshot = typeof Snapshot.Type

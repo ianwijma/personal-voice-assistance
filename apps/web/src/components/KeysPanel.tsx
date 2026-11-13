@@ -1,7 +1,7 @@
 "use client"
 import { type FormEvent, useEffect, useState } from "react"
 import { shallowEqual } from "@/lib/store.ts"
-import { KEYS_TAB, keysView, newPasswordProblem, passwordProblem, retrySecondsLeft } from "@/lib/vault.ts"
+import { keysView, lockedExplanation, newPasswordProblem, passwordProblem, retrySecondsLeft } from "@/lib/vault.ts"
 import { useClient, useClientState } from "./context.tsx"
 import { inputClass } from "./fields/types.ts"
 import { Icon, Spinner } from "./ui/Icon.tsx"
@@ -10,7 +10,8 @@ import { Button, cx } from "./ui/controls.tsx"
 /**
  * "Keys & access": the key vault's controls for this page. Self-contained
  * (reads `ClientState.vault`, calls the client's vault actions), so any screen
- * can place it; today it is the options drawer's Keys & access tab.
+ * can place it: the settings screen's Keys & access › Edit access page. The
+ * page headers' inline unlock and the engine banner use `UnlockForm`.
  */
 export function KeysPanel() {
   const vault = useClientState((s) => s.vault, shallowEqual)
@@ -27,10 +28,7 @@ export function KeysPanel() {
       {view === "unlock" && (
         <section className="flex flex-col gap-3">
           <Heading icon="lock" title="Keys are locked" />
-          <p className="text-[13px] text-ink-muted">
-            The assistant was restarted. Type the password so the engines and modules can use their keys again; this page can then also
-            change protected settings.
-          </p>
+          <p className="text-[13px] text-ink-muted" data-testid="locked-explanation">{lockedExplanation(vault)}</p>
           <UnlockForm label="Unlock" />
         </section>
       )}
@@ -52,11 +50,6 @@ export function KeysPanel() {
       )}
     </div>
   )
-}
-
-/** The options tab (one line in `ui/registry.ts`). */
-export function KeysTab() {
-  return <KeysPanel />
 }
 
 function Heading({ icon, title }: { readonly icon: "lock"; readonly title: string }) {
@@ -114,14 +107,17 @@ function useRetryCountdown(): number {
   return retrySecondsLeft(retryAfterMs, receivedAt, now)
 }
 
-/** Password + button: unlocks the vault (or gives this page edit access when it is already unlocked). Also used by the engine banner. */
-export function UnlockForm({ label = "Unlock", compact = false }: { readonly label?: string; readonly compact?: boolean }) {
+/**
+ * Password + button: unlocks the vault (or gives this page edit access when it is already unlocked). Also used by
+ * the engine banner and, inline, by protected settings pages (`idSuffix` keeps their ids apart).
+ */
+export function UnlockForm({ label = "Unlock", compact = false, idSuffix }: { readonly label?: string; readonly compact?: boolean; readonly idSuffix?: string }) {
   const client = useClient()
   const [password, setPassword] = useState("")
   const [error, setError] = useState<string | undefined>()
   const [busy, setBusy] = useState(false)
   const wait = useRetryCountdown()
-  const id = compact ? "unlock-password-banner" : "unlock-password"
+  const id = idSuffix !== undefined ? `unlock-password-${idSuffix}` : compact ? "unlock-password-banner" : "unlock-password"
   const submit = async (e: FormEvent) => {
     e.preventDefault()
     const problem = passwordProblem(password)
@@ -134,7 +130,7 @@ export function UnlockForm({ label = "Unlock", compact = false }: { readonly lab
     else setError(result.error?.message ?? "The vault did not unlock.")
   }
   return (
-    <form onSubmit={(e) => void submit(e)} className={cx("flex flex-col gap-2", compact && "sm:flex-row sm:items-end")} data-testid={compact ? "unlock-form-banner" : "unlock-form"}>
+    <form onSubmit={(e) => void submit(e)} className={cx("flex flex-col gap-2", compact && "sm:flex-row sm:items-end")} data-testid={idSuffix !== undefined ? `unlock-form-${idSuffix}` : compact ? "unlock-form-banner" : "unlock-form"}>
       <div className={cx(compact && "min-w-0 flex-1")}>
         {compact ? (
           <input
@@ -263,30 +259,5 @@ function AdminControls() {
         </form>
       )}
     </section>
-  )
-}
-
-/** "Locked" chip and an "Unlock to change" link to the Keys & access place, for a protected item this page may not change. */
-export function LockedBadge({ name }: { readonly name: string }) {
-  const client = useClient()
-  const open = () => client.store.dispatch({ type: "local/ui", patch: { optionsOpen: true, optionsTab: KEYS_TAB } })
-  return (
-    <span className="inline-flex items-center gap-2" data-testid="locked-badge">
-      <span className="label inline-flex items-center gap-1 text-[10px] text-ink-faint" title="Protected: needs the vault password">
-        <Icon name="lock" size={11} />
-        Locked
-      </span>
-      <button
-        type="button"
-        onClick={(e) => {
-          e.stopPropagation()
-          open()
-        }}
-        aria-label={`Unlock to change ${name}`}
-        className="text-[12px] text-voice underline-offset-4 hover:underline"
-      >
-        Unlock to change
-      </button>
-    </span>
   )
 }

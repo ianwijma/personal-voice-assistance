@@ -95,6 +95,8 @@ export const defineAgent = <const S extends SettingsSpec = {}>(definition: {
   readonly settings?: S
   /** Default false: the owner switches an agent on (it may need a key, a login or an opt-in). */
   readonly enabledByDefault?: boolean
+  /** Enabled before the owner has chosen once this secret setting is set (see `ModuleDefinition.enabledWhenSet`). */
+  readonly enabledWhenSet?: keyof S & string
   readonly start: (context: ModuleContext<SettingsOf<S>>) => Effect.Effect<AgentImplementation, ModuleStartError, Scope.Scope>
 }): KindedModuleDefinition<S> => {
   const module = defineModule({
@@ -103,6 +105,7 @@ export const defineAgent = <const S extends SettingsSpec = {}>(definition: {
     description: definition.description,
     ...(definition.settings !== undefined ? { settings: definition.settings } : {}),
     enabledByDefault: definition.enabledByDefault ?? false,
+    ...(definition.enabledWhenSet !== undefined ? { enabledWhenSet: definition.enabledWhenSet } : {}),
     start: (context) =>
       Effect.map(definition.start(context), (impl): ExtendedModuleInstance => {
         const { firstEventTimeoutMs: _t, speculate: _s, systemPrompt: _p, turn: _turn, ...contributions } = impl
@@ -119,6 +122,8 @@ export const defineDecider = <const S extends SettingsSpec = {}>(definition: {
   readonly description: string
   readonly settings?: S
   readonly enabledByDefault?: boolean
+  /** Enabled before the owner has chosen once this secret setting is set (see `ModuleDefinition.enabledWhenSet`). */
+  readonly enabledWhenSet?: keyof S & string
   readonly start: (
     context: ModuleContext<SettingsOf<S>>
   ) => Effect.Effect<Pick<DecisionProvider, "decide" | "location"> & Omit<ModuleContributions, "agents" | "deciders">, ModuleStartError, Scope.Scope>
@@ -129,6 +134,7 @@ export const defineDecider = <const S extends SettingsSpec = {}>(definition: {
     description: definition.description,
     ...(definition.settings !== undefined ? { settings: definition.settings } : {}),
     enabledByDefault: definition.enabledByDefault ?? false,
+    ...(definition.enabledWhenSet !== undefined ? { enabledWhenSet: definition.enabledWhenSet } : {}),
     start: (context) =>
       Effect.map(definition.start(context), ({ decide, location, ...contributions }): ExtendedModuleInstance => ({
         ...contributions,

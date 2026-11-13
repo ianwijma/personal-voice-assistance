@@ -1,4 +1,4 @@
-import type { FieldError, SettingField, SettingsForm, SettingsPatch, SettingValue } from "@pva/protocol"
+import { evaluateCondition, type FieldError, type SettingField, type SettingsForm, type SettingsPatch, type SettingValue } from "@pva/protocol"
 
 /**
  * Pure helpers behind the generated settings forms: the local draft, the
@@ -11,30 +11,73 @@ export interface Draft {
   readonly values: Readonly<Record<string, SettingValue>>
   /** Only the secrets the user touched: a new value, or `null` to remove. */
   readonly secrets: Readonly<Record<string, string | null>>
+  /** Saved values the user reset to their default ("Reset to default"): sent as `null`, so nothing stays saved. */
+  readonly reset?: ReadonlyArray<string>
 }
 
 export const initialDraft = (form: SettingsForm): Draft => ({ values: { ...form.values }, secrets: {} })
+
+/** The draft with `key` set to `value` (an edit undoes a pending reset of that field). */
+export const setDraftValue = (draft: Draft, key: string, value: SettingValue): Draft => ({
+  ...draft,
+  values: { ...draft.values, [key]: value },
+  ...(draft.reset?.includes(key) ? { reset: draft.reset.filter((k) => k !== key) } : {})
+})
+
+/** "Reset to default": the draft shows the default, and the save removes the saved value. */
+export const resetDraftValue = (draft: Draft, field: SettingField): Draft => {
+  if (field.type === "secret") return draft
+  return { ...draft, values: { ...draft.values, [field.key]: field.default }, reset: [...(draft.reset ?? []).filter((k) => k !== field.key), field.key] }
+}
+
+/**
+ * Is the field shown? `lookup` gives other fields' current values (the page's drafts, then every section's saved
+ * values): the condition is evaluated against the draft, so choosing a provider shows its fields before saving.
+ */
+export const fieldVisible = (field: SettingField, lookup: (key: string) => unknown): boolean =>
+  field.visibleWhen === undefined || evaluateCondition(field.visibleWhen, lookup)
+
+/** A lookup over this form's draft first, then `fallback` (other forms, saved values). */
+export const draftLookup = (draft: Draft, fallback: (key: string) => unknown) => (key: string): unknown =>
+  Object.hasOwn(draft.values, key) ? draft.values[key] : fallback(key)
 
 export const valueEqual = (a: SettingValue | undefined, b: SettingValue | undefined): boolean => {
   if (Array.isArray(a) && Array.isArray(b)) return a.length === b.length && a.every((x, i) => x === b[i])
   return a === b
 }
 
-/** The patch for the changed fields only (locked fields are never sent). */
-export const computePatch = (form: SettingsForm, draft: Draft): SettingsPatch => {
+/**
+ * The patch for the changed fields only. Locked fields are never sent, nor hidden ones (`shown` false: their saved
+ * value stays). A reset field whose value is saved is sent as `null`.
+ */
+export const computePatch = (form: SettingsForm, draft: Draft, shown: (field: SettingField) => boolean = () => true): SettingsPatch => {
   const values: Record<string, SettingValue | null> = {}
   const secrets: Record<string, string | null> = {}
   for (const field of form.fields) {
-    if (field.locked !== undefined) continue
+    if (field.locked !== undefined || !shown(field)) continue
     if (field.type === "secret") {
       if (field.key in draft.secrets) secrets[field.key] = draft.secrets[field.key]!
       continue
     }
     const next = draft.values[field.key]
+    if (draft.reset?.includes(field.key) === true && field.source === "saved" && valueEqual(next, field.default)) {
+      values[field.key] = null
+      continue
+    }
     if (next !== undefined && !valueEqual(next, form.values[field.key])) values[field.key] = next
   }
   return { values, secrets }
 }
+
+/** Every changed field of the patch applies after an engine reload (offer "Save and reload"). */
+export const onlyReloadFields = (form: SettingsForm, patch: SettingsPatch): boolean => {
+  const keys = [...Object.keys(patch.values), ...Object.keys(patch.secrets)]
+  return keys.length > 0 && keys.every((k) => form.fields.find((f) => f.key === k)?.apply === "reload")
+}
+
+/** Some changed field of the patch applies after an engine reload. */
+export const someReloadFields = (form: SettingsForm, patch: SettingsPatch): boolean =>
+  [...Object.keys(patch.values), ...Object.keys(patch.secrets)].some((k) => form.fields.find((f) => f.key === k)?.apply === "reload")
 
 export const isEmptyPatch = (p: SettingsPatch) => Object.keys(p.values).length === 0 && Object.keys(p.secrets).length === 0
 

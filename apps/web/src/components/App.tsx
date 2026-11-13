@@ -5,7 +5,7 @@ import { ChatPanel } from "./ChatPanel.tsx"
 import { ClientContext, useClientState } from "./context.tsx"
 import { ControlDock } from "./ControlDock.tsx"
 import { LiveAnnouncer } from "./LiveAnnouncer.tsx"
-import { OptionsDrawer } from "./OptionsDrawer.tsx"
+import { SettingsShell } from "./settings/SettingsShell.tsx"
 import { ShortcutsDialog } from "./ShortcutsDialog.tsx"
 import { Stage } from "./Stage.tsx"
 import { Toasts } from "./Toasts.tsx"
@@ -38,7 +38,7 @@ function Shell() {
         <Toasts />
       </main>
       <ChatPanel />
-      <OptionsDrawer />
+      <SettingsShell />
       <ShortcutsDialog />
       <LiveAnnouncer />
     </div>

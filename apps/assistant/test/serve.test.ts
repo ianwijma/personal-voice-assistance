@@ -52,7 +52,18 @@ describe("serve: handshake", () => {
     expect(welcome.snapshot.state).toBe("idle")
     expect(welcome.snapshot.engine.state).toBe("ready")
     expect(welcome.snapshot.modules.map((m) => [m.id, m.state])).toEqual([["greeter", "running"]])
-    expect(welcome.snapshot.sections.map((s) => s.id)).toEqual(["conversation", "voices", "listening", "language-model", "speech"])
+    expect(welcome.snapshot.sections.map((s) => [s.id, `${s.group}/${s.page?.id}`])).toEqual([
+      ["language-model", "agents/provider"],
+      ["llm-behaviour", "agents/behaviour"],
+      ["stt-engine", "speech/engine"],
+      ["stt-timing", "speech/turn-timing"],
+      ["stt-mic", "speech/microphone"],
+      ["stt-deepgram", "speech/deepgram"],
+      ["voices", "voices/overview"],
+      ["voice-engines", "voices/engines"],
+      ["recordings", "diagnostics/recordings"]
+    ])
+    expect(welcome.snapshot.modules[0]).toMatchObject({ id: "greeter", group: "modules" })
     expect(welcome.snapshot.history).toEqual([])
   })
 
@@ -318,22 +329,25 @@ describe("serve: modules and settings", () => {
     a.send({ type: "text.send", requestId: "t1", text: "before reload", speak: false })
     await a.waitFor("turn.end", () => true, { timeoutMs: 10_000 })
 
-    a.send({ type: "settings.update", requestId: "s1", sectionId: "listening", patch: { values: { STT_SHERPA_FINAL_SILENCE_MS: 500 }, secrets: {} } })
+    a.send({ type: "settings.update", requestId: "s1", sectionId: "stt-timing", patch: { values: { STT_SHERPA_FINAL_SILENCE_MS: 500 }, secrets: {} } })
     expect((await a.waitFor("result", (m) => m.requestId === "s1")).ok).toBe(true)
     const section = await b.waitFor("section.changed")
     expect(section.section.form.values.STT_SHERPA_FINAL_SILENCE_MS).toBe(500)
-    expect((await b.waitFor("engine", (m) => m.engine.reloadPending)).engine.state).toBe("ready")
+    const pending = (await b.waitFor("engine", (m) => m.engine.reloadPending)).engine
+    expect(pending.state).toBe("ready")
+    expect(pending.reloadPendingFor).toEqual(["speech/turn-timing"])
 
-    a.send({ type: "settings.update", requestId: "s2", sectionId: "listening", patch: { values: { STT_SHERPA_FINAL_SILENCE_MS: 5 }, secrets: {} } })
+    a.send({ type: "settings.update", requestId: "s2", sectionId: "stt-timing", patch: { values: { STT_SHERPA_FINAL_SILENCE_MS: 5 }, secrets: {} } })
     expect((await a.waitFor("result", (m) => m.requestId === "s2")).error?.code).toBe("invalid_settings")
 
     const from = b.messages.length
     a.send({ type: "engine.reload", requestId: "r1" })
     expect((await a.waitFor("result", (m) => m.requestId === "r1", { timeoutMs: 10_000 })).ok).toBe(true)
     await b.waitFor("engine", (m) => m.engine.state === "ready", { from })
-    const engines = b.messages.slice(from).filter((m) => m.type === "engine").map((m) => (m as { engine: { state: string; reloadPending: boolean } }).engine)
+    const engines = b.messages.slice(from).filter((m) => m.type === "engine").map((m) => (m as { engine: { state: string; reloadPending: boolean; reloadPendingFor?: ReadonlyArray<string> } }).engine)
     expect(engines.map((e) => e.state)).toEqual(["reloading", "ready"])
     expect(engines.at(-1)!.reloadPending).toBe(false)
+    expect(engines.at(-1)!.reloadPendingFor).toEqual([])
 
     const late = await connect()
     expect((await late.hello()).snapshot.history).toEqual([
@@ -341,30 +355,34 @@ describe("serve: modules and settings", () => {
       { role: "assistant", text: "Reply to before reload.", interrupted: false, tools: [] }
     ])
     const saved = JSON.parse(readFileSync(join(server!.dataDir, "settings.json"), "utf8"))
-    expect(saved.sections.listening).toEqual({ STT_SHERPA_FINAL_SILENCE_MS: 500 })
+    expect(saved).toEqual({ version: 2, modules: expect.anything(), assistant: { STT_SHERPA_FINAL_SILENCE_MS: 500 } })
   })
 })
 
 describe("serve: choosing the speech recognition model", () => {
-  it("lists the presets with descriptions; a preset whose files are missing is refused with the download command", async () => {
+  it("lists the presets with descriptions and how to download them; saving a preset whose files are missing is refused", async () => {
     const emptyModels = mkdtempSync(join(tmpdir(), "pva-no-models-"))
     await basic(undefined, { env: { STT_SHERPA_MODEL_DIR: emptyModels } })
     const a = await connect()
-    const listening = (await a.hello()).snapshot.sections.find((s) => s.id === "listening")!
-    const model = listening.form.fields.find((f) => f.key === "STT_SHERPA_MODEL")!
+    const sections = (await a.hello()).snapshot.sections
+    const fields = sections.flatMap((s) => s.form.fields)
+    const model = fields.find((f) => f.key === "STT_SHERPA_MODEL")!
     expect(model.type).toBe("choice")
-    const options = (model as { options: ReadonlyArray<{ value: string; description?: string }> }).options
+    expect(model.visibleWhen).toEqual({ key: "STT_PROVIDER", in: ["sherpa"] })
+    const options = (model as { options: ReadonlyArray<{ value: string; description?: string; tags?: ReadonlyArray<string> }> }).options
     expect(options.map((o) => o.value)).toContain("parakeet-v2")
     expect(options.find((o) => o.value === "whisper-turbo")!.description).toMatch(/99 languages/)
+    expect(options.find((o) => o.value === "whisper-turbo")!.tags).toEqual(["local", "not-downloaded"])
+    expect((options.find((o) => o.value === "whisper-turbo") as { download?: unknown }).download).toEqual({ tool: "stt-models", target: "whisper-turbo", sizeMb: 565 })
     for (const key of ["STT_SHERPA_LANGUAGE", "STT_SHERPA_VAD_THRESHOLD", "STT_SHERPA_AGC", "STT_SHERPA_EAGER_SILENCE_MS", "STT_SHERPA_FINAL_SILENCE_MS", "RECORD_HEARD_AUDIO"]) {
-      const field = listening.form.fields.find((f) => f.key === key)
+      const field = fields.find((f) => f.key === key)
       expect(field?.description, key).toBeTruthy()
     }
-    a.send({ type: "settings.update", requestId: "m1", sectionId: "listening", patch: { values: { STT_SHERPA_MODEL: "whisper-turbo" }, secrets: {} } })
+    a.send({ type: "settings.update", requestId: "m1", sectionId: "stt-engine", patch: { values: { STT_SHERPA_MODEL: "whisper-turbo" }, secrets: {} } })
     const result = await a.waitFor("result", (m) => m.requestId === "m1")
     expect(result.ok).toBe(false)
     expect(result.error?.fieldErrors?.[0]?.key).toBe("STT_SHERPA_MODEL")
-    expect(result.error?.message).toContain("pnpm --filter @pva/stt-sherpa download-models whisper-turbo --model-dir")
+    expect(result.error?.message).toContain("is not downloaded yet: download it first (565 MB)")
   })
 
   it("a reload whose recogniser files are missing is refused before the running engines stop", async () => {

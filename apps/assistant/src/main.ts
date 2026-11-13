@@ -1,7 +1,7 @@
 import "./env.ts" // first: loads .env before anything reads the environment
 import { NodeRuntime } from "@effect/platform-node"
 import { Conversation, Llm, ToolRegistry, TurnTrace } from "@pva/core"
-import { Cause, Config, ConfigProvider, Effect, Layer, Logger, Stream } from "effect"
+import { Cause, Config, Effect, Layer, Logger, Stream } from "effect"
 import { resolve } from "node:path"
 import * as readline from "node:readline"
 import { collectWavs, parseLiveArgs, runLive } from "./bench/live.ts"
@@ -15,7 +15,9 @@ import { FakeLlm } from "./FakeLlm.ts"
 import { LlmLayer, SttLayer, TtsLayer } from "./providers.ts"
 import { sayCommand } from "./say.ts"
 import { serveMode } from "./serve/serveMode.ts"
-import { defaultVaultPath, openVault } from "./serve/Vault.ts"
+import { DataDirConfig } from "./serve/SettingsStore.ts"
+import { VaultPathConfig } from "./serve/Vault.ts"
+import { askVaultPassword, type CliSettings, CliSettingsRef, explainMissingKey, withCliSettings } from "./cliSettings.ts"
 import { makeSubscriptionAgents, SUBSCRIPTION_AGENT_ID, SUBSCRIPTION_PROVIDER } from "./subscription.ts"
 import { buildProviders, describeConfigError, StartupError } from "./startup.ts"
 import { runTextTurns } from "./text.ts"
@@ -186,38 +188,33 @@ const program: Effect.Effect<void, unknown> = mode === "text"
   })
 
 /**
- * CLI modes read provider settings from the environment. With PVA_VAULT_PASSWORD set they also find the API keys
- * entered in the web UI (the key vault's section keys), as a fallback behind the environment.
+ * CLI modes read the saved settings and the key vault's keys behind the environment, like serve mode
+ * (`cliSettings.ts`). The vault password comes from PVA_VAULT_PASSWORD, or is asked for on a terminal.
  */
-const withVaultKeys = <A, E>(effect: Effect.Effect<A, E>): Effect.Effect<A, E> =>
+let cliSettings: CliSettings | undefined
+const withSavedSettings = <A, E>(effect: Effect.Effect<A, E>): Effect.Effect<A, E> =>
   Effect.gen(function*() {
-    const password = process.env.PVA_VAULT_PASSWORD ?? ""
-    if (password === "") return yield* effect
-    const vault = yield* Effect.promise(() => openVault({ path: defaultVaultPath(process.env) }))
-    if (vault.state() !== "locked") return yield* effect
-    const unlocked = yield* Effect.promise(() => vault.unlock(password))
-    if (!unlocked.ok) {
-      yield* Effect.logWarning(`PVA_VAULT_PASSWORD did not unlock the key vault: ${unlocked.message}`)
-      return yield* effect
-    }
-    const keys: Record<string, string> = {}
-    for (const section of Object.values(vault.secrets()?.sections ?? {})) Object.assign(keys, section)
-    vault.lock()
-    const env: Record<string, string> = {}
-    for (const [key, value] of Object.entries(process.env)) if (value !== undefined && value !== "") env[key] = value
-    return yield* effect.pipe(
-      Effect.provideService(ConfigProvider.ConfigProvider, ConfigProvider.orElse(ConfigProvider.fromEnvRecord(env), ConfigProvider.fromEnvRecord(keys)))
+    const dataDir = yield* DataDirConfig.pipe(Effect.orDie)
+    const vaultPath = yield* VaultPathConfig.pipe(Effect.orDie)
+    const interactive = process.stdin.isTTY === true && process.stderr.isTTY === true
+    return yield* withCliSettings(
+      Effect.flatMap(Effect.service(CliSettingsRef), (settings) => {
+        cliSettings = settings
+        return effect
+      }),
+      { env: process.env, dataDir, vaultPath, ...(interactive ? { prompt: askVaultPassword } : {}) }
     )
   })
 
 NodeRuntime.runMain(
-  (mode === "serve" ? program : withVaultKeys(program)).pipe(
+  (mode === "serve" ? program : withSavedSettings(program)).pipe(
     Effect.catch((e) => {
-      const message = e instanceof StartupError
+      const described = e instanceof StartupError
         ? e.message
         : e instanceof Config.ConfigError
         ? describeConfigError(e)
         : undefined
+      const message = described === undefined ? undefined : explainMissingKey(described, cliSettings)
       if (message === undefined) return Effect.fail(e)
       return Effect.sync(() => {
         process.stderr.write(`${message}\n`)

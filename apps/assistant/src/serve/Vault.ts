@@ -4,6 +4,7 @@ import { chmod, mkdir, readFile, rename, stat, writeFile } from "node:fs/promise
 import { homedir } from "node:os"
 import { dirname, join, resolve } from "node:path"
 import { userCwd } from "../env.ts"
+import { flattenSections } from "./flatten.ts"
 
 /**
  * The key vault (docs/UI-AND-MODULES.md §1.6): API keys and tokens in one
@@ -29,10 +30,14 @@ import { userCwd } from "../env.ts"
  * Forgotten password: delete the vault file; the keys in it are lost.
  */
 
-/** The plaintext: the same shape as the old `data/secrets.json`, without its version. */
+/**
+ * The plaintext: module secrets per module, assistant secrets flat by key (the same shape as `data/secrets.json`
+ * version 2, without its version). A vault written before the settings screen keeps assistant secrets per section
+ * (`sections`); it is read as flat and written flat at the next change.
+ */
 export interface VaultSecrets {
   readonly modules: Readonly<Record<string, Readonly<Record<string, string>>>>
-  readonly sections: Readonly<Record<string, Readonly<Record<string, string>>>>
+  readonly assistant: Readonly<Record<string, string>>
 }
 
 export type VaultState = "none" | "locked" | "unlocked"
@@ -157,7 +162,7 @@ const encrypt = (key: Buffer, kdf: VaultFile["kdf"], secrets: VaultSecrets): Vau
   const iv = randomBytes(12)
   const cipher = createCipheriv("aes-256-gcm", key, iv)
   cipher.setAAD(additionalData(kdf))
-  const plaintext = Buffer.from(JSON.stringify({ modules: secrets.modules, sections: secrets.sections }), "utf8")
+  const plaintext = Buffer.from(JSON.stringify({ modules: secrets.modules, assistant: secrets.assistant }), "utf8")
   const data = Buffer.concat([cipher.update(plaintext), cipher.final()])
   plaintext.fill(0)
   return {
@@ -169,10 +174,15 @@ const encrypt = (key: Buffer, kdf: VaultFile["kdf"], secrets: VaultSecrets): Vau
   }
 }
 
-const validSecrets = (u: unknown): u is VaultSecrets => {
-  const group = (g: unknown) =>
-    isRecord(g) && Object.values(g).every((r) => isRecord(r) && Object.values(r).every((v) => typeof v === "string"))
-  return isRecord(u) && group(u.modules) && group(u.sections)
+const strings = (r: unknown): r is Record<string, string> => isRecord(r) && Object.values(r).every((v) => typeof v === "string")
+const group = (g: unknown): g is Record<string, Record<string, string>> => isRecord(g) && Object.values(g).every(strings)
+
+/** The plaintext as `VaultSecrets` (the per-section shape of older vaults flattened), or undefined when it is not one. Exported for tests. */
+export const readVaultSecrets = (u: unknown): VaultSecrets | undefined => {
+  if (!isRecord(u) || !group(u.modules)) return undefined
+  if (strings(u.assistant)) return { modules: u.modules, assistant: u.assistant }
+  if (group(u.sections)) return { modules: u.modules, assistant: flattenSections(u.sections, "key vault").flat }
+  return undefined
 }
 
 /** `undefined`: authentication failed (wrong key or a modified file). */
@@ -188,7 +198,7 @@ const decrypt = (key: Buffer, file: VaultFile): VaultSecrets | undefined => {
   }
   try {
     const parsed: unknown = JSON.parse(plaintext.toString("utf8"))
-    return validSecrets(parsed) ? { modules: parsed.modules, sections: parsed.sections } : undefined
+    return readVaultSecrets(parsed)
   } catch {
     return undefined
   } finally {

@@ -11,6 +11,8 @@ import {
   TurnId
 } from "./common.ts"
 import { MAX_TEXT_INPUT_CHARS } from "./constants.ts"
+import { MAX_MOVE_KEYS } from "./env.ts"
+import { JobAction, ToolId } from "./jobs.ts"
 import { SettingsPatch } from "./settings.ts"
 import { Password } from "./vault.ts"
 
@@ -144,12 +146,17 @@ export const ModuleConfigure = Schema.Struct({
   patch: SettingsPatch
 })
 
-/** Change assistant settings in one section (a patch). */
+/**
+ * Change assistant settings in one section (a patch). Saved values are stored by key, not by section, so the
+ * section only says which form (and which checks) the patch belongs to.
+ */
 export const SettingsUpdate = Schema.Struct({
   type: Schema.Literal("settings.update"),
   requestId: RequestId,
   sectionId: SectionId,
-  patch: SettingsPatch
+  patch: SettingsPatch,
+  /** Save even when the section's checks warn (the owner saw `ErrorInfo.warnings` and chose "Save anyway"). */
+  confirmWarnings: Schema.optionalKey(Schema.Boolean)
 })
 
 /** Rebuild the speech and language engines with the saved settings (keeps the conversation). */
@@ -192,6 +199,45 @@ export const VaultChangePassword = Schema.Struct({
   newPassword: Password
 })
 
+/**
+ * Admin only: move settings from a `.env` file into the saved settings (keys into the key vault, refused while it
+ * is locked). Each line is commented out of the file (a backup is kept next to it); the value is never echoed.
+ * `keys` are environment variable names with `movable` in `EnvInfo`. All or nothing per key; the answer names the
+ * keys that could not be moved.
+ */
+export const SettingsMoveFromEnv = Schema.Struct({
+  type: Schema.Literal("settings.moveFromEnv"),
+  requestId: RequestId,
+  keys: Schema.Array(Schema.String.check(Schema.isPattern(/^[A-Za-z_][A-Za-z0-9_]{0,127}$/))).check(
+    Schema.isMinLength(1),
+    Schema.isMaxLength(MAX_MOVE_KEYS)
+  )
+})
+
+/** Admin only: start a job (download a model preset). `target` must be a name from the tool's table. */
+export const JobStart = Schema.Struct({
+  type: Schema.Literal("job.start"),
+  requestId: RequestId,
+  tool: ToolId,
+  action: JobAction,
+  target: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(100))
+})
+
+/** Admin only: cancel a running job (a download's partial files are removed). */
+export const JobCancel = Schema.Struct({
+  type: Schema.Literal("job.cancel"),
+  requestId: RequestId,
+  jobId: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(64))
+})
+
+/** Admin only: delete a downloaded model. Refused while the running engines use it. */
+export const ModelDelete = Schema.Struct({
+  type: Schema.Literal("model.delete"),
+  requestId: RequestId,
+  tool: ToolId,
+  target: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(100))
+})
+
 /** Liveness check; the server answers `pong` with the same id. Sent every 5 s. */
 export const Ping = Schema.Struct({
   type: Schema.Literal("ping"),
@@ -219,6 +265,10 @@ export const ClientMessage = Schema.Union([
   VaultUnlock,
   VaultLock,
   VaultChangePassword,
+  SettingsMoveFromEnv,
+  JobStart,
+  JobCancel,
+  ModelDelete,
   Ping
 ]).pipe(Schema.toTaggedUnion("type"))
 export type ClientMessage = typeof ClientMessage.Type

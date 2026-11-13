@@ -17,12 +17,16 @@ import { Config, Effect, Fiber, FiberSet, Option, type Scope, Stream } from "eff
 import { isAbsolute, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 import { defaultSystemPrompt } from "../config.ts"
-import { userCwd } from "../env.ts"
+import { envView as processEnvView, userCwd } from "../env.ts"
+import { type EnvView, makeEnvView } from "../envView.ts"
 import { moduleCatalog, withModuleInstructions } from "../modules.ts"
 import { makeSubscriptionAgents, SUBSCRIPTION_AGENT_ID, SUBSCRIPTION_PROVIDER } from "../subscription.ts"
 import { makeAccessPolicy } from "./access.ts"
 import { defaultPreflight, defaultProviderBuilder, type Engine, EngineBuildProblems, makeEngine, type ProviderBuilder } from "./Engine.ts"
+import { type EnvMover, makeEnvMover } from "./envSettings.ts"
 import { type HttpError, type HttpServer, startHttp, webDirExists } from "./http.ts"
+import { type Jobs, makeJobs } from "./jobs.ts"
+import { makeModels, type Models, type PresetDownloader, presetsInUse } from "./models.ts"
 import { makeHeardAudio } from "./HeardAudio.ts"
 import { type Keys, makeKeys } from "./Keys.ts"
 import { makePublisher } from "./Publisher.ts"
@@ -31,6 +35,8 @@ import { makeSessionHub, type SessionHub } from "./SessionHub.ts"
 import { DataDirConfig, KEYS_LOCKED_MESSAGE, loadSettingsStore, SettingsStoreError } from "./SettingsStore.ts"
 import { makeStateTracker } from "./StateTracker.ts"
 import { type KdfParams, openVault, type Vault, VaultPathConfig } from "./Vault.ts"
+import * as SherpaStt from "@pva/stt-sherpa"
+import type { ToolId } from "@pva/protocol"
 
 /**
  * `serve` mode (docs/UI-AND-MODULES.md §4): one process, one port. The browser
@@ -65,8 +71,17 @@ export interface ServeOptions {
   readonly build?: ProviderBuilder
   /** Checks before a reload stops the running engines. Default: `defaultPreflight` with the default builder, none otherwise. */
   readonly preflight?: Effect.Effect<void, EngineBuildProblems>
-  /** Default `process.env`. */
+  /**
+   * The environment with where each variable came from (`envView.ts`). Default: the process environment and the
+   * `.env` files `env.ts` loaded; with `env`, that record (every variable from the process).
+   */
+  readonly envView?: EnvView
+  /** Tests: a plain environment (every variable counts as exported by the process unless `envOrigin` says otherwise). */
   readonly env?: Readonly<Record<string, string | undefined>>
+  readonly envOrigin?: (name: string) => "env-file" | "env-process"
+  /** Tests: model downloads without the network, and the free disk space. */
+  readonly modelDownloaders?: Readonly<Record<ToolId, PresetDownloader>>
+  readonly freeBytes?: (dir: string) => Promise<number>
   readonly turnTrace?: TurnTrace["Service"]
   /** Playback stall limit (tests shorten it). Default 2000 ms. */
   readonly stallMs?: number
@@ -82,13 +97,18 @@ export interface ServeHandle {
   readonly web: WebAudio
   readonly keys: Keys
   readonly vault: Vault
+  readonly envView: EnvView
+  readonly envMover: EnvMover
+  readonly jobs: Jobs
+  readonly models: Models
   /** Completes when the first engine build and module start have settled. */
   readonly ready: Effect.Effect<void>
 }
 
 export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, HttpError | SettingsStoreError, Scope.Scope> =>
   Effect.gen(function*() {
-    const env = options.env ?? process.env
+    const envView = options.envView ?? (options.env === undefined ? processEnvView : makeEnvView({ processEnv: options.env }))
+    const env = envView.record
     const catalog = options.catalog ?? moduleCatalog
     const vault = yield* Effect.tryPromise({
       try: () =>
@@ -104,13 +124,16 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     if (store.legacySecretCount() > 0) {
       yield* vault.state() === "none"
         ? Effect.logWarning(
-          `API keys are stored unencrypted in ${options.dataDir}/secrets.json. Set a password in Options → Keys & access to move them ` +
+          `API keys are stored unencrypted in ${options.dataDir}/secrets.json. Set a password in Settings → Keys & access to move them ` +
             `into an encrypted key vault outside the project (${vault.path}).`
         )
         : Effect.logWarning(`${options.dataDir}/secrets.json still holds keys; they move into the key vault at the next unlock.`)
     }
-    const sections = makeSections(store, env)
-    const host = yield* makeModuleHost({ catalog, persistence: store.modulePersistence, env })
+    // Where environment values came from (.env with its line, or the process), for the fields' source and lock.
+    const envOrigin = options.envOrigin ?? envView.sourceOf
+    const envLocation = envView.locationOf
+    const sections = makeSections(store, env, { envOrigin, envLocation })
+    const host = yield* makeModuleHost({ catalog, persistence: store.modulePersistence, env, envOrigin, envLocation })
     const keys = makeKeys({ vault, store, host })
     const access = makeAccessPolicy({ catalog, sections: sections.list, vaultState: keys.state })
 
@@ -123,12 +146,12 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     if (inEnv.length > 0) {
       yield* Effect.logWarning(
         `${inEnv.join(", ")} ${inEnv.length === 1 ? "is" : "are"} set in the environment (.env): used as is and not protected by the key vault. ` +
-          "Enter keys in Options instead and remove them from .env."
+          "Use Move to settings in Settings → Diagnostics → Settings from outside to put them in the vault."
       )
     }
     const vaultPassword = options.vaultPassword ?? env.PVA_VAULT_PASSWORD
     if (vaultPassword !== undefined && vaultPassword !== "") yield* keys.autoUnlock(vaultPassword)
-    else if (vault.state() === "locked") yield* Effect.logWarning("The key vault is locked: unlock it in Options → Keys & access so the engines and modules can use their keys.")
+    else if (vault.state() === "locked") yield* Effect.logWarning("The key vault is locked: unlock it in Settings → Keys & access so the engines and modules can use their keys.")
     const turnTrace = options.turnTrace ?? makeTurnTrace()
     const runFork = yield* FiberSet.makeRuntime<never, void, never>()
     const run = (effect: Effect.Effect<void>) => {
@@ -139,6 +162,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     // Late-bound: the hub needs the engine and the engine's callbacks need the hub.
     let hub: SessionHub | undefined
     let engine: Engine | undefined
+    let modelsRef: Models | undefined
     const broadcast = (message: ServerMessage) => hub?.broadcast(message)
 
     const gate = makeEchoGate("instant")
@@ -304,7 +328,11 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       onEvent,
       gate: gateStream,
       defaultVoice: () => String(sections.value("DEFAULT_VOICE")),
-      onStatus: (status) => broadcast({ type: "engine", engine: status }),
+      onStatus: (status) => {
+        broadcast({ type: "engine", engine: status })
+        // Which models are in use follows the running engines.
+        if (hub !== undefined) broadcast({ type: "models", models: modelsRef?.list() ?? [] })
+      },
       agentSetup: (providers) => {
         if (providers.llmProvider !== SUBSCRIPTION_PROVIDER) return undefined
         const toAgents = makeSubscriptionAgents({
@@ -330,7 +358,33 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     })
     const theEngine = engine
 
+    // Model downloads (jobs) and settings from outside the UI.
+    const jobs = makeJobs({ onChange: (job) => broadcast({ type: "job", job }) })
+    yield* Effect.addFinalizer(() => Effect.sync(() => jobs.cancelAll()))
+    const models: Models = makeModels({
+      jobs,
+      dirs: sections.modelDirs,
+      inUse: () => presetsInUse(theEngine.status().engines),
+      onChange: () => {
+        sections.announceAll()
+        broadcast({ type: "models", models: models.list() })
+      },
+      ...(options.modelDownloaders !== undefined ? { downloaders: options.modelDownloaders } : {}),
+      ...(options.freeBytes !== undefined ? { freeBytes: options.freeBytes } : {})
+    })
+    // Partial downloads of an earlier run (it was stopped mid-download) are removed before anything starts.
+    for (const dir of new Set([sections.modelDirs().stt, sections.modelDirs().tts])) {
+      const removed = yield* Effect.promise(() => SherpaStt.cleanPartials(dir))
+      if (removed.length > 0) yield* Effect.logInfo(`Removed ${removed.length} partial download(s) in ${dir}`)
+    }
+    yield* Effect.promise(() => models.refresh())
+    modelsRef = models
+    const envMover = makeEnvMover({ view: envView, catalog, sections, host, store, vaultState: keys.state, onMoved: () => {} })
+
     hub = makeSessionHub({
+      env: envMover,
+      models,
+      jobs,
       web,
       engine: theEngine,
       host,
@@ -343,12 +397,12 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       keys,
       access,
       ...(options.adminIdleMs !== undefined ? { adminIdleMs: options.adminIdleMs } : {}),
-      onSectionSaved: (sectionId, needsReload) => {
-        if (needsReload) theEngine.setReloadPending(true)
+      onSectionSaved: (sectionId, needsReload, path) => {
+        if (needsReload) theEngine.setReloadPending(true, path)
         if (sectionId === "voices") {
           const wanted = String(sections.value("DEFAULT_VOICE"))
           const running = theEngine.voices()
-          if (running !== undefined && !running.names.some((v) => v.name === wanted)) theEngine.setReloadPending(true)
+          if (running !== undefined && !running.names.some((v) => v.name === wanted)) theEngine.setReloadPending(true, path)
         }
       },
       ...(options.helloTimeoutMs !== undefined ? { helloTimeoutMs: options.helloTimeoutMs } : {})
@@ -383,7 +437,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     const engineStarted = yield* Effect.forkScoped(theEngine.start)
     const ready = Effect.asVoid(Effect.all([Fiber.await(modulesStarted), Fiber.await(engineStarted)]))
 
-    return { http, hub: theHub, engine: theEngine, host, web, keys, vault, ready }
+    return { http, hub: theHub, engine: theEngine, host, web, keys, vault, envView, envMover, jobs, models, ready }
   })
 
 const isLoopback = (host: string) => host === "localhost" || host === "::1" || host.startsWith("127.")
@@ -419,6 +473,7 @@ export const serveMode = Effect.scoped(Effect.gen(function*() {
   // (and anything else that inherits process.env) never see it.
   const vaultPassword = process.env.PVA_VAULT_PASSWORD
   delete process.env.PVA_VAULT_PASSWORD
+  processEnvView.redact("PVA_VAULT_PASSWORD")
   const handle = yield* startServe({ ...config, tls, ...(vaultPassword !== undefined && vaultPassword !== "" ? { vaultPassword } : {}) })
   yield* Effect.logInfo(`Assistant UI at ${handle.http.url}  (settings in ${config.dataDir}, keys in ${config.vaultPath})`)
   if (!webDirExists(config.webDir)) {
@@ -437,7 +492,10 @@ export const serveMode = Effect.scoped(Effect.gen(function*() {
   const status = handle.engine.status()
   if (status.state === "ready") yield* Effect.logInfo("Engines ready. Open the page and press Start.")
   if (status.engines.some((e) => e.stage === "llm" && e.provider === "fake")) {
-    yield* Effect.logWarning("LLM_PROVIDER=fake: replies are canned echoes. Choose Anthropic under Options → Language model for real answers.")
+    yield* Effect.logWarning(
+      "LLM_PROVIDER=fake: replies are canned echoes. For real answers open Settings → Language model → Provider and choose " +
+        "Anthropic (with an API key) or Claude subscription (your own Claude login, behind an opt-in)."
+    )
   }
   yield* Effect.never
 }).pipe(Effect.onInterrupt(() => Effect.logInfo("Stopping: closing connections, engines and modules."))))

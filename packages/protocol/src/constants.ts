@@ -11,8 +11,19 @@
  *
  * 2: the key vault and admin access (`vault.*` messages, `vault`, `snapshot.vault`, `protected` on modules and
  * sections; error codes `locked` and `bad_password`, which are new members of a closed set).
+ *
+ * 3: the settings screen (docs/SETTINGS-UI.md): placement of sections and modules (`group`, `page`, `order`,
+ * `visibleWhen`; `ModuleInfo.kind`), field `visibleWhen` and `source`, choice option `tags` / `implication` / `module`,
+ * form `warnings` with `ErrorInfo.warnings` and `settings.update.confirmWarnings` ("Save anyway"), `reloadPendingFor`,
+ * `vault.lockReason`. All optional fields, but a save may now be answered with warnings first, which a v2 page
+ * cannot confirm, and the section ids changed (settings are stored by key).
+ *
+ * 4: settings from outside and model downloads (docs/SETTINGS-UI.md P4, P7): `settings.moveFromEnv`, `env` and
+ * `snapshot.env`; jobs (`job.start`, `job.cancel`, `model.delete`, `job`, `models`, `snapshot.jobs`,
+ * `snapshot.models`, closed sets `ToolId` / `JobState` / `JobPhase`); `locked.file` / `locked.line`;
+ * `ChoiceOption.download`.
  */
-export const PROTOCOL_VERSION = 2
+export const PROTOCOL_VERSION = 4
 
 /** Path of the WebSocket endpoint, on the same origin as the UI in production. */
 export const WS_PATH = "/ws"

@@ -19,6 +19,22 @@ const RELEASES = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-mo
 export interface Archive {
   readonly dir: string
   readonly url: string
+  /** Download size, MB (10^6 bytes; the release's Content-Length, 2026-11-14). */
+  readonly sizeMb: number
+  /** Unpacked size, MB. */
+  readonly diskMb: number
+}
+
+/** Download and unpacked sizes of the release archives, MB (measured 2026-11-14; unpacked: `du` of a full unpack). */
+const archiveSizes: Readonly<Record<string, { readonly sizeMb: number; readonly diskMb: number }>> = {
+  "sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8": { sizeMb: 483, diskMb: 662 },
+  "sherpa-onnx-nemo-parakeet-tdt-0.6b-ultra-int8": { sizeMb: 488, diskMb: 672 },
+  "sherpa-onnx-whisper-turbo": { sizeMb: 564, diskMb: 1038 },
+  "sherpa-onnx-nemotron-3.5-asr-streaming-0.6b-560ms-int8-2026-06-11": { sizeMb: 476, diskMb: 685 },
+  "sherpa-onnx-nemotron-3.5-asr-streaming-0.6b-320ms-int8-2026-06-11": { sizeMb: 476, diskMb: 685 },
+  // Unpacked size not measured on a full unpack: assumed close to the download.
+  "sherpa-onnx-streaming-zipformer-en-2023-06-26": { sizeMb: 311, diskMb: 330 },
+  "sherpa-onnx-nemo-streaming-fast-conformer-transducer-en-480ms-int8": { sizeMb: 106, diskMb: 139 }
 }
 
 export interface StreamingModel {
@@ -105,7 +121,7 @@ export interface HybridPreset extends PresetCommon {
 
 export type Preset = StreamingPreset | OfflinePreset | HybridPreset
 
-const archive = (dir: string): Archive => ({ dir, url: `${RELEASES}/${dir}.tar.bz2` })
+const archive = (dir: string): Archive => ({ dir, url: `${RELEASES}/${dir}.tar.bz2`, ...(archiveSizes[dir] ?? { sizeMb: 500, diskMb: 700 }) })
 
 const transducer = (dir: string) => ({
   archive: archive(dir),
@@ -268,11 +284,19 @@ export const takesLanguage = (preset: Preset): boolean =>
 
 export const VAD_FILE = "silero_vad.onnx"
 export const VAD_URL = `${RELEASES}/silero_vad.onnx`
+/** The Silero VAD model, MB. */
+export const VAD_SIZE_MB = 0.65
 
 /** `<repository root>/models`. */
 export const defaultModelDir: string = fileURLToPath(new URL("../../../models", import.meta.url))
 
 export const DOWNLOAD_COMMAND = "pnpm --filter @pva/stt-sherpa download-models"
+
+/** Download size of a preset (its archives, plus the VAD model), MB. */
+export const sizeMb = (preset: Preset): number => Math.round(archives(preset).reduce((n, a) => n + a.sizeMb, VAD_SIZE_MB))
+
+/** Space a preset takes once unpacked, MB. */
+export const diskMb = (preset: Preset): number => Math.round(archives(preset).reduce((n, a) => n + a.diskMb, VAD_SIZE_MB))
 
 /** The archives a preset needs. */
 export const archives = (preset: Preset): ReadonlyArray<Archive> =>
@@ -338,6 +362,6 @@ export const installedPresets = (modelDir: string = defaultModelDir): ReadonlyAr
 export const missingModelMessage = (name: PresetName, modelDir: string, customDir: boolean): string | undefined => {
   const missing = missingFile(modelFiles(presets[name], modelDir))
   if (missing === undefined) return undefined
-  return `Speech model file not found: ${missing}. Download it with \`${DOWNLOAD_COMMAND} ${name}` +
+  return `Speech model file not found: ${missing}. Download it in Settings → Speech recognition → Models, or with \`${DOWNLOAD_COMMAND} ${name}` +
     (customDir ? ` --model-dir ${modelDir}` : "") + "`"
 }

@@ -18,6 +18,9 @@ import {
 import { Effect } from "effect"
 import type { AccessPolicy } from "./access.ts"
 import type { Engine } from "./Engine.ts"
+import type { EnvMover } from "./envSettings.ts"
+import type { Jobs } from "./jobs.ts"
+import type { Models } from "./models.ts"
 import type { Keys } from "./Keys.ts"
 import { historyItems, type Publisher } from "./Publisher.ts"
 import type { Sections } from "./sections.ts"
@@ -75,11 +78,16 @@ export interface HubOptions {
   readonly gate: EchoGate
   /** Run an effect in the server's scope (requests that do work). */
   readonly run: (effect: Effect.Effect<void>) => void
-  /** After a settings section was saved. */
-  readonly onSectionSaved: (sectionId: string, needsReload: boolean) => void
+  /** After a settings section was saved (`path`: its settings page, `<group>/<page>`). */
+  readonly onSectionSaved: (sectionId: string, needsReload: boolean, path: string) => void
   readonly server: { readonly name: string; readonly version: string }
   readonly keys: Keys
   readonly access: AccessPolicy
+  /** Settings from outside the UI and "Move to settings". Absent: no `env` in the snapshot, moves refused. */
+  readonly env?: EnvMover
+  /** Model downloads (jobs). Absent: none offered. */
+  readonly models?: Models
+  readonly jobs?: Jobs
   /** Admin access ends after this long without an admin action. Default 15 minutes. */
   readonly adminIdleMs?: number
   readonly helloTimeoutMs?: number
@@ -231,8 +239,8 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
 
   const lockedMessage = () =>
     keys.state() === "locked"
-      ? "The keys are locked: unlock them with the password in Options → Keys & access to change this."
-      : "Protected: type the password in Options → Keys & access to change this."
+      ? "The keys are locked: unlock them with the password in Settings → Keys & access to change this."
+      : "Protected: type the password in Settings → Keys & access to change this."
 
   /** A request that changes a protected item: allowed for admin connections (and extends their access). */
   const allowed = (client: Client, requestId: RequestId, isProtected: boolean): boolean => {
@@ -268,7 +276,10 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
     sections: options.sections.list().map(access.section),
     history: historyItems(Effect.runSync(options.engine.history)),
     traces: options.publisher.traces(),
-    vault: keys.info(isAdmin(client))
+    vault: keys.info(isAdmin(client)),
+    ...(options.env !== undefined ? { env: options.env.info() } : {}),
+    ...(options.models !== undefined ? { models: options.models.list() } : {}),
+    ...(options.jobs !== undefined ? { jobs: options.jobs.list() } : {})
   })
 
   const hello = (client: Client, message: ClientMessage) => {
@@ -354,7 +365,7 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
       }
       case "text.send": {
         if (options.engine.status().state !== "ready") {
-          return result(client, message.requestId, failure("engine_failed", "The speech and language engines are not running; check Options → Engines"))
+          return result(client, message.requestId, failure("engine_failed", "The speech and language engines are not running; see Settings → Overview"))
         }
         result(client, message.requestId, { ok: true })
         options.engine.send({ _tag: "TextInput", text: message.text, speak: message.speak && client === owner })
@@ -371,10 +382,13 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
         return options.run(Effect.map(options.host.configure(message.moduleId, message.patch), (r) => result(client, message.requestId, r)))
       case "settings.update":
         if (!allowed(client, message.requestId, access.sectionProtected(message.sectionId))) return
-        return options.run(Effect.map(options.sections.update(message.sectionId, message.patch), ({ reload, result: r }) => {
-          result(client, message.requestId, r)
-          if (r.ok) options.onSectionSaved(message.sectionId, reload)
-        }))
+        return options.run(Effect.map(
+          options.sections.update(message.sectionId, message.patch, { confirmWarnings: message.confirmWarnings === true }),
+          ({ reload, path, result: r }) => {
+            result(client, message.requestId, r)
+            if (r.ok) options.onSectionSaved(message.sectionId, reload, path)
+          }
+        ))
       case "engine.reload":
         return options.run(Effect.map(options.engine.reload, (r) => result(client, message.requestId, r)))
       case "vault.setup":
@@ -386,6 +400,33 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
       case "vault.lock":
         if (keys.state() !== "none" && !isAdmin(client)) return result(client, message.requestId, failure("locked", lockedMessage()))
         return vaultRequest(client, message.requestId, keys.lock, false)
+      case "settings.moveFromEnv": {
+        // Admin only, always: it rewrites a file on the server.
+        if (!allowed(client, message.requestId, true)) return
+        const mover = options.env
+        if (mover === undefined) return result(client, message.requestId, failure("internal", "Moving settings is not available here"))
+        return options.run(Effect.map(mover.move(message.keys), (r) => {
+          result(client, message.requestId, r.ok ? { ok: true } : { ok: false, error: r.error })
+          broadcast({ type: "env", env: mover.info() })
+        }))
+      }
+      case "job.start": {
+        if (!allowed(client, message.requestId, true)) return
+        if (options.models === undefined) return result(client, message.requestId, failure("internal", "Downloads are not available here"))
+        const started = options.models.download(message.tool, message.target)
+        return result(client, message.requestId, started.ok ? { ok: true } : { ok: false, error: started.error })
+      }
+      case "job.cancel": {
+        if (!allowed(client, message.requestId, true)) return
+        const cancelled = options.jobs?.cancel(message.jobId) === true
+        return result(client, message.requestId, cancelled ? { ok: true } : failure("invalid_settings", "That job is not running"))
+      }
+      case "model.delete": {
+        if (!allowed(client, message.requestId, true)) return
+        const models = options.models
+        if (models === undefined) return result(client, message.requestId, failure("internal", "Models cannot be deleted here"))
+        return options.run(Effect.map(Effect.promise(() => models.remove(message.tool, message.target)), (r) => result(client, message.requestId, r)))
+      }
       case "ping":
         return send(client, { type: "pong", id: message.id })
     }

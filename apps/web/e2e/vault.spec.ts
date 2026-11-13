@@ -9,8 +9,15 @@ const PASSWORD = "correct horse battery"
 
 const openKeys = async (page: Page) => {
   await page.keyboard.press("o")
-  await expect(page.getByTestId("options")).toBeVisible()
-  await page.getByRole("tab", { name: "Keys & access" }).click()
+  await expect(page.getByTestId("settings")).toBeVisible()
+  await page.getByTestId("nav-keys").click()
+  await expect(page.getByTestId("page-keys-access")).toBeVisible()
+}
+
+/** Go to a settings page through the category list (desktop: list + page). */
+const go = async (page: Page, group: string, id?: string) => {
+  await page.getByTestId(`nav-${group}`).click()
+  if (id !== undefined) await page.getByTestId(`nav-${group}-${id}`).click()
 }
 
 /** A page-less client that asks the mock to change a protected section, as a page without admin access would. */
@@ -50,10 +57,11 @@ test("set a password → lock → unlock → change a protected setting → lock
   await expect(panel).toHaveAttribute("data-view", "setup")
   await expect(panel).toContainText("Protect your keys")
 
-  // Before a password exists every page may change everything (no lock badges).
-  await page.getByRole("tab", { name: "Assistant" }).click()
-  await expect(page.getByTestId("section-language-model")).not.toHaveAttribute("data-locked", "true")
-  await page.getByRole("tab", { name: "Keys & access" }).click()
+  // Before a password exists every page may change everything (no padlocks).
+  await go(page, "language-model", "provider")
+  await expect(page.getByTestId("page-language-model-provider")).not.toHaveAttribute("data-locked", "true")
+  await expect(page.getByTestId("settings-nav").locator("[data-mark=lock]")).toHaveCount(0)
+  await go(page, "keys", "access")
 
   // Set the password (a mismatch is caught on the page first).
   await panel.getByLabel("New password").fill(PASSWORD)
@@ -65,32 +73,39 @@ test("set a password → lock → unlock → change a protected setting → lock
   await expect(panel).toHaveAttribute("data-view", "admin")
   await expect(panel).toContainText("Keys are unlocked")
 
-  // Lock: this page loses edit access, protected items turn read-only.
+  // Lock: this page loses edit access, protected pages turn read-only, the list shows padlocks and keys.
   await panel.getByRole("button", { name: "Lock now" }).click()
   await expect(panel).toHaveAttribute("data-view", "unlock")
-  await page.getByRole("tab", { name: "Modules" }).click()
-  const ha = page.getByTestId("module-home-assistant")
-  await expect(ha).toHaveAttribute("data-locked", "true")
-  await expect(ha.getByRole("switch")).toBeDisabled()
-  await expect(page.getByTestId("module-weather")).not.toHaveAttribute("data-locked", "true")
+  await expect(panel.getByTestId("locked-explanation")).toContainText("locked from a page (Lock now)")
+  await expect(panel.getByTestId("locked-explanation")).not.toContainText("restarted")
+  await expect(page.getByTestId("nav-language-model").locator("[data-mark=lock]")).toBeVisible()
+  await go(page, "modules", "home-assistant")
+  const haPage = page.getByTestId("page-modules-home-assistant")
+  await expect(haPage).toHaveAttribute("data-locked", "true")
+  await expect(page.getByTestId("module-home-assistant").getByRole("switch")).toBeDisabled()
+  await expect(page.getByTestId("nav-modules-home-assistant").locator("[data-mark=key]")).toBeVisible()
+  await expect(page.getByTestId("page-footer")).toHaveCount(0)
+  await go(page, "modules", "weather")
+  await expect(page.getByTestId("page-modules-weather")).not.toHaveAttribute("data-locked", "true")
 
-  // "Unlock to change" leads to Keys & access; a wrong password is refused, the right one unlocks.
-  await ha.getByRole("button", { name: "Unlock to change Home Assistant" }).click()
-  await expect(panel).toHaveAttribute("data-view", "unlock")
-  await panel.getByLabel("Password").fill("wrong horse battery")
-  await panel.getByRole("button", { name: "Unlock" }).click()
-  await expect(panel.getByRole("alert")).toContainText("Wrong password")
-  await panel.getByLabel("Password").fill(PASSWORD)
-  await panel.getByRole("button", { name: "Unlock" }).click()
-  await expect(panel).toHaveAttribute("data-view", "admin")
+  // The password can be typed on the protected page itself: a wrong one is refused, the right one unlocks.
+  await go(page, "modules", "home-assistant")
+  const inline = page.getByTestId("unlock-form-page")
+  await inline.getByLabel("Vault password").fill("wrong horse battery")
+  await inline.getByRole("button", { name: "Unlock" }).click()
+  await expect(inline.getByRole("alert")).toContainText("Wrong password")
+  await inline.getByLabel("Vault password").fill(PASSWORD)
+  await inline.getByRole("button", { name: "Unlock" }).click()
+  await expect(haPage).not.toHaveAttribute("data-locked", "true")
+  await expect(page.getByTestId("module-home-assistant").getByRole("switch")).toBeEnabled()
 
   // Change a protected setting.
-  await page.getByRole("tab", { name: "Assistant" }).click()
-  const section = page.getByTestId("section-language-model")
-  await expect(section).not.toHaveAttribute("data-locked", "true")
-  await section.getByRole("radio", { name: "Fake (testing)" }).click()
-  await section.getByRole("button", { name: "Save" }).click()
-  await expect(section.getByText("Saved")).toBeVisible()
+  await go(page, "language-model", "provider")
+  const provider = page.getByTestId("page-language-model-provider")
+  await expect(provider).not.toHaveAttribute("data-locked", "true")
+  await provider.getByRole("radio", { name: /Offline stand-in/ }).click()
+  await page.getByTestId("page-footer").getByRole("button", { name: "Save", exact: true }).click()
+  await expect(page.getByTestId("page-footer").getByText("Saved")).toBeVisible()
   const results = (await mock.log()).messages.filter((m) => m.type === "settings.update")
   expect(results.at(-1)).toMatchObject({ sectionId: "language-model", patch: { values: { LLM_PROVIDER: "fake" } } })
 
@@ -98,19 +113,28 @@ test("set a password → lock → unlock → change a protected setting → lock
   const other = await protectedUpdateFromAnotherClient()
   expect(other).toMatchObject({ type: "result", ok: false, error: { code: "locked" } })
 
-  // Lock again: the section is read-only (no Save), with the lock badge.
-  await page.getByRole("tab", { name: "Keys & access" }).click()
+  // Lock again: the page is read-only (no Save), with the inline password form.
+  await go(page, "keys", "access")
   await panel.getByRole("button", { name: "Lock now" }).click()
   await expect(panel).toHaveAttribute("data-view", "unlock")
-  await page.getByRole("tab", { name: "Assistant" }).click()
-  await expect(section).toHaveAttribute("data-locked", "true")
-  await expect(section.getByTestId("locked-badge")).toBeVisible()
-  await expect(section.getByRole("button", { name: "Save" })).toHaveCount(0)
-  await expect(section.getByRole("radio", { name: "Anthropic" })).toBeDisabled()
-  // Open sections stay editable for everyone.
-  await expect(page.getByTestId("section-listening").getByLabel("End of turn after")).toBeEnabled()
+  await go(page, "language-model", "provider")
+  await expect(provider).toHaveAttribute("data-locked", "true")
+  await expect(provider.getByTestId("edit-access")).toBeVisible()
+  await expect(page.getByTestId("page-footer")).toHaveCount(0)
+  await expect(provider.getByRole("radio", { name: /Claude API/ })).toBeDisabled()
+  // Open pages stay editable for everyone.
+  await go(page, "speech", "turn-timing")
+  await expect(page.getByTestId("form-s-stt-timing").getByLabel("End of turn after")).toBeEnabled()
   const refused = await protectedUpdateFromAnotherClient()
   expect(refused).toMatchObject({ ok: false, error: { code: "locked" } })
+
+  // The keys list: every key, its state, and what uses it.
+  await go(page, "keys", "keys")
+  const keys = page.getByTestId("keys-list")
+  await expect(keys.locator("[data-key=DEEPGRAM_API_KEY]")).toContainText("Speech recognition › Deepgram")
+  await expect(keys.locator("[data-key=ANTHROPIC_API_KEY]")).toContainText("Set by ANTHROPIC_API_KEY in .env (not protected)")
+  await keys.locator("[data-key=HOME_ASSISTANT_TOKEN]").getByRole("button", { name: "Modules › Home Assistant" }).click()
+  await expect(haPage).toBeVisible()
 })
 
 test("a second page is not an admin until it types the password", async ({ page, baseURL, context }) => {
@@ -126,14 +150,15 @@ test("a second page is not an admin until it types the password", async ({ page,
   await openKeys(second)
   const panel2 = second.getByTestId("keys-panel")
   await expect(panel2).toHaveAttribute("data-view", "elevate")
-  await second.getByRole("tab", { name: "Modules" }).click()
-  await expect(second.getByTestId("module-home-assistant")).toHaveAttribute("data-locked", "true")
-  await second.getByRole("tab", { name: "Keys & access" }).click()
+  await go(second, "modules", "home-assistant")
+  await expect(second.getByTestId("page-modules-home-assistant")).toHaveAttribute("data-locked", "true")
+  await expect(second.getByTestId("edit-access")).toContainText("only a page where the password was typed")
+  await go(second, "keys", "access")
   await panel2.getByLabel("Password").fill(PASSWORD)
   await panel2.getByRole("button", { name: "Get edit access" }).click()
   await expect(panel2).toHaveAttribute("data-view", "admin")
-  await second.getByRole("tab", { name: "Modules" }).click()
-  await expect(second.getByTestId("module-home-assistant")).not.toHaveAttribute("data-locked", "true")
+  await go(second, "modules", "home-assistant")
+  await expect(second.getByTestId("page-modules-home-assistant")).not.toHaveAttribute("data-locked", "true")
   await second.close()
 })
 
@@ -149,4 +174,11 @@ test("engines that failed because the keys are locked: the banner unlocks them i
   await form.getByLabel("Vault password").fill(PASSWORD)
   await form.getByRole("button", { name: "Unlock" }).click()
   await expect(banner).toBeHidden({ timeout: 5000 })
+})
+
+test("the locked view says why: after a restart (not 'Lock now')", async ({ page, baseURL }) => {
+  await mock.scenario("keys-locked")
+  await page.goto(appUrl(baseURL, "#settings/keys/access"))
+  await expect(page.getByTestId("locked-explanation")).toContainText("The assistant was restarted")
+  await expect(page.getByTestId("nav-overview").locator("[data-mark=error]")).toBeVisible()
 })

@@ -79,7 +79,8 @@ export interface ModuleHost {
   readonly startEnabled: Effect.Effect<void>
   readonly enable: (id: string) => Effect.Effect<HostResult>
   readonly disable: (id: string) => Effect.Effect<HostResult>
-  readonly configure: (id: string, patch: SettingsPatch) => Effect.Effect<HostResult>
+  /** `includeHidden`: also save fields hidden by `visibleWhen` (moving values out of `.env`). */
+  readonly configure: (id: string, patch: SettingsPatch, options?: { readonly includeHidden?: boolean }) => Effect.Effect<HostResult>
   /**
    * Replace every module's saved secrets without saving them (the app's key vault was unlocked or locked; a module
    * missing from `secrets` has none). Modules whose secrets changed are announced; enabled modules in `error` are
@@ -101,6 +102,10 @@ export interface ModuleHostOptions {
   readonly persistence: ModulePersistence
   /** The environment (including `.env`); fields with `env` read it and are locked when set. */
   readonly env: Readonly<Record<string, string | undefined>>
+  /** Where an environment variable came from (`.env` or the process), for the fields' `source`. */
+  readonly envOrigin?: (name: string) => "env-file" | "env-process"
+  /** The `.env` file and line that set a variable, shown on the locked field. */
+  readonly envLocation?: (name: string) => { readonly file: string; readonly line: number } | undefined
   /** Time `start` may take. Default 10 s. */
   readonly startTimeoutMs?: number
   /** Time a replaced or disabled instance keeps running for tool calls in flight. Default 10 s. */
@@ -126,6 +131,8 @@ interface Entry {
   status: StatusLine | undefined
   stored: Readonly<Record<string, unknown>>
   secrets: Readonly<Record<string, string>>
+  /** The owner has chosen on or off (saved); before that, `enabledByDefault` / `enabledWhenSet` decide. */
+  chosen: boolean
   running: Running | undefined
   busy: boolean
   revision: number
@@ -162,6 +169,7 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
     return {
       def,
       enabled: record?.enabled ?? def.enabledByDefault,
+      chosen: record?.enabled !== undefined,
       state: "disabled",
       error: undefined,
       status: undefined,
@@ -174,9 +182,21 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
     }
   })
   const byId = new Map(entries.map((e) => [e.def.id, e]))
+  const envOrigin = {
+    ...(options.envOrigin !== undefined ? { envOrigin: options.envOrigin } : {}),
+    ...(options.envLocation !== undefined ? { envLocation: options.envLocation } : {})
+  }
 
   const resolve = (entry: Entry, stored = entry.stored, secrets = entry.secrets) =>
-    resolveSettings(entry.def.settings, { stored, secrets, env: options.env })
+    resolveSettings(entry.def.settings, { stored, secrets, env: options.env, ...envOrigin })
+
+  /** Before the owner has chosen: on by default, or on once the `enabledWhenSet` key is set (environment or saved). */
+  const defaultIntent = (entry: Entry): boolean => {
+    const key = entry.def.enabledWhenSet
+    if (entry.def.enabledByDefault || key === undefined) return entry.def.enabledByDefault
+    return resolve(entry).form.secrets[key]?.set === true
+  }
+  for (const entry of entries) if (!entry.chosen) entry.enabled = defaultIntent(entry)
 
   const info = (entry: Entry): ModuleInfo => ({
     id: entry.def.id,
@@ -188,7 +208,8 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
     ...(entry.status !== undefined && entry.running !== undefined ? { status: entry.status } : {}),
     tools: (entry.running?.tools ?? []).map((t) => ({ name: t.name, description: t.description, speculative: t.speculative === true })),
     settings: resolve(entry).form,
-    revision: entry.revision
+    revision: entry.revision,
+    ...(entry.def.kind !== undefined ? { kind: entry.def.kind } : {})
   })
 
   const notify = (entry: Entry) => {
@@ -401,6 +422,7 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
     exclusive(id, (entry) =>
       Effect.gen(function*() {
         entry.enabled = true
+        entry.chosen = true
         if (entry.running !== undefined) {
           yield* save(entry)
           notify(entry)
@@ -415,6 +437,7 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
     exclusive(id, (entry) =>
       Effect.gen(function*() {
         entry.enabled = false
+        entry.chosen = true
         entry.error = undefined
         const running = entry.running
         if (running !== undefined) {
@@ -431,10 +454,15 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
         return { ok: true } as HostResult
       }))
 
-  const configure = (id: string, patch: SettingsPatch) =>
+  const configure = (id: string, patch: SettingsPatch, configureOptions: { readonly includeHidden?: boolean } = {}) =>
     exclusive(id, (entry) =>
       Effect.gen(function*() {
-        const patched = applySettingsPatch(entry.def.settings, { stored: entry.stored, secrets: entry.secrets, env: options.env }, patch)
+        const patched = applySettingsPatch(
+          entry.def.settings,
+          { stored: entry.stored, secrets: entry.secrets, env: options.env, ...envOrigin },
+          patch,
+          configureOptions
+        )
         if (!patched.ok) {
           return failure("invalid_settings", "Some settings are not valid", { moduleId: id, fieldErrors: patched.errors })
         }
@@ -465,10 +493,13 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
         return { ok: true } as HostResult
       }))
 
-  const startEnabled = Effect.forEach(
-    entries.filter((e) => e.enabled),
-    (entry) => exclusive(entry.def.id, start),
-    { concurrency: "unbounded", discard: true }
+  // Evaluated when run: a module switched on by `setSecrets` before this runs is included (and started once).
+  const startEnabled = Effect.suspend(() =>
+    Effect.forEach(
+      entries.filter((e) => e.enabled && e.running === undefined && e.state !== "starting"),
+      (entry) => exclusive(entry.def.id, (e) => (e.enabled && e.running === undefined ? start(e) : Effect.succeed({ ok: true } as HostResult))),
+      { concurrency: "unbounded", discard: true }
+    )
   )
 
   // Shutdown: close every instance at once (no grace).
@@ -494,15 +525,24 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
 
   const setSecrets = (all: Readonly<Record<string, Readonly<Record<string, string>>>>) =>
     Effect.suspend(() => {
+      const switchedOn = new Set<Entry>()
       for (const entry of entries) {
         const next = all[entry.def.id] ?? {}
         if (JSON.stringify(next) === JSON.stringify(entry.secrets)) continue
         entry.secrets = next
+        // A key that now counts (the vault was unlocked) switches on a module the owner has not chosen for.
+        if (!entry.chosen && !entry.busy && entry.running === undefined && entry.state === "disabled") {
+          const wanted = defaultIntent(entry)
+          if (wanted && !entry.enabled) switchedOn.add(entry)
+          entry.enabled = wanted
+        }
         notify(entry)
       }
       return Effect.forEach(
-        entries.filter((e) => e.enabled && e.state === "error" && !e.busy),
-        (entry) => exclusive(entry.def.id, (e) => (e.enabled && e.state === "error" ? start(e) : Effect.succeed({ ok: true } as HostResult))),
+        entries.filter((e) => e.enabled && !e.busy && (e.state === "error" || switchedOn.has(e))),
+        (entry) =>
+          exclusive(entry.def.id, (e) =>
+            e.enabled && e.running === undefined && (e.state === "error" || e.state === "disabled") ? start(e) : Effect.succeed({ ok: true } as HostResult)),
         { concurrency: "unbounded", discard: true }
       )
     })

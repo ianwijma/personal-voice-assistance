@@ -189,7 +189,8 @@ export interface Engine {
   /** Typed text or Stop. False when the engines are not running. */
   readonly send: (input: ConversationInput) => boolean
   readonly history: Effect.Effect<ReadonlyArray<Message>>
-  readonly setReloadPending: (pending: boolean) => void
+  /** Saved settings wait for a reload (`path`: the settings page they are on, for `reloadPendingFor`). */
+  readonly setReloadPending: (pending: boolean, path?: string) => void
   /** The enabled voices and the default voice in effect, while the engines run. */
   readonly voices: () => { readonly names: ReadonlyArray<Voice>; readonly defaultVoice: string } | undefined
   /** Announce the status again (`describeEngines` has something new to say). */
@@ -200,7 +201,7 @@ export const makeEngine = (options: EngineOptions): Effect.Effect<Engine, never,
   Effect.gen(function*() {
     const scope = yield* Effect.scope
     const control = yield* Queue.unbounded<ConversationInput>()
-    let status: EngineStatus = { state: "starting", problems: [], reloadPending: false, engines: [], voices: [] }
+    let status: EngineStatus = { state: "starting", problems: [], reloadPending: false, reloadPendingFor: [], engines: [], voices: [] }
     let fiber: Fiber.Fiber<void> | undefined
     let conversationHistory: Effect.Effect<ReadonlyArray<Message>> | undefined
     let history: ReadonlyArray<Message> = []
@@ -256,7 +257,7 @@ export const makeEngine = (options: EngineOptions): Effect.Effect<Engine, never,
         conversationHistory = conversation.history
         yield* Queue.clear(control)
         ready = true
-        setStatus({ state: "ready", problems: [], reloadPending: false, engines: providers.engines, voices: providers.voiceInfo })
+        setStatus({ state: "ready", problems: [], reloadPending: false, reloadPendingFor: [], engines: providers.engines, voices: providers.voiceInfo })
         yield* Deferred.succeed(latch, { ok: true })
 
         const events = Stream.merge(
@@ -324,8 +325,12 @@ export const makeEngine = (options: EngineOptions): Effect.Effect<Engine, never,
       reload: launch("reloading"),
       send: (input) => ready && Queue.offerUnsafe(control, input),
       history: Effect.suspend(() => conversationHistory ?? Effect.succeed(history)),
-      setReloadPending: (pending) => {
-        if (status.reloadPending !== pending) setStatus({ ...status, reloadPending: pending })
+      setReloadPending: (pending, path) => {
+        const before = status.reloadPendingFor ?? []
+        const pages = !pending ? [] : path === undefined || before.includes(path) ? before : [...before, path]
+        if (status.reloadPending !== pending || pages.length !== before.length) {
+          setStatus({ ...status, reloadPending: pending, reloadPendingFor: pages })
+        }
       },
       voices: () => running === undefined ? undefined : { names: running.voices, defaultVoice: currentRouter().defaultVoice }
     } satisfies Engine

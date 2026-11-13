@@ -3,6 +3,7 @@ import { makeModuleHost, type ModuleDefinition, type ModulePersistence, type Mod
 import { clockModule, weatherModule } from "@pva/modules-builtin"
 import type { ModuleInfo } from "@pva/protocol"
 import { Config, Effect, type Scope } from "effect"
+import { CliSettingsRef } from "./cliSettings.ts"
 import { DataDirConfig, loadSettingsStore } from "./serve/SettingsStore.ts"
 import { openVault, VaultPathConfig } from "./serve/Vault.ts"
 
@@ -27,13 +28,17 @@ export const withModuleInstructions = (systemPrompt: string, instructions: Reado
  * For the CLI modes: start the enabled modules once, with the saved settings
  * (never written), and return their snapshot (and the modules' info). A module
  * that cannot start is reported as a warning and left out, as in serve mode.
- * Module keys in the key vault are used when `PVA_VAULT_PASSWORD` unlocks it.
+ * Module keys in the key vault are used when it was unlocked (`cliSettings.ts`: `PVA_VAULT_PASSWORD` or the
+ * terminal prompt).
  */
 export const startCliModules = (
   options: { readonly catalog?: ReadonlyArray<ModuleDefinition<any>>; readonly persistence?: ModulePersistence } = {}
 ): Effect.Effect<ModuleSnapshot & { readonly infos: ReadonlyArray<ModuleInfo> }, never, Scope.Scope> =>
   Effect.gen(function*() {
-    const persistence = options.persistence ?? (yield* Effect.gen(function*() {
+    const loaded = yield* CliSettingsRef
+    const persistence = options.persistence ?? (loaded !== undefined
+      ? readOnlyPersistence(loaded.store?.modulePersistence.initial)
+      : undefined) ?? (yield* Effect.gen(function*() {
       const directory = yield* DataDirConfig
       const vaultPath = yield* VaultPathConfig
       const vault = yield* Effect.promise(() => openVault({ path: vaultPath }))

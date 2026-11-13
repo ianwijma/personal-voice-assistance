@@ -1,10 +1,11 @@
-import type { InterruptMode, OutputPath, SettingsPatch } from "@pva/protocol"
+import type { InterruptMode, OutputPath, SettingsPatch, ToolId } from "@pva/protocol"
 import { createDiagnosticsStore, type DiagnosticsStore, type MicProcessing } from "./audio/diagnostics.ts"
 import { levels, markInterrupted } from "./audio/levels.ts"
 import { describeMicError, type PlayerEvent, VoiceAudio } from "./audio/VoiceAudio.ts"
 import { type Connection, makeConnection, type RequestInput, type ResultMessage, resolveWsUrl } from "./connection.ts"
 import { runEchoTest } from "./echoTest.ts"
 import { createPrefsStore, type Prefs, type PrefsStore } from "./prefs.ts"
+import { navigateSettings, type SettingsPath } from "./settingsTree.ts"
 import type { ClientState } from "./state.ts"
 import { type ClientStore, createClientStore } from "./store.ts"
 
@@ -38,13 +39,25 @@ export interface AssistantClient {
   readonly request: (message: RequestInput) => Promise<ResultMessage>
   readonly enableModule: (moduleId: string, enabled: boolean) => Promise<ResultMessage>
   readonly configureModule: (moduleId: string, patch: SettingsPatch) => Promise<ResultMessage>
-  readonly updateSection: (sectionId: string, patch: SettingsPatch) => Promise<ResultMessage>
+  /** `confirmWarnings`: the owner saw the warnings and chose "Save anyway". */
+  readonly updateSection: (sectionId: string, patch: SettingsPatch, confirmWarnings?: boolean) => Promise<ResultMessage>
+  /**
+   * Open the settings at `to` (a path such as `["speech", "engine"]`), or close them. With unsaved edits on the page
+   * this asks "Leave without saving?" first, unless `discard`.
+   */
+  readonly settings: (to: SettingsPath | "close", options?: { readonly discard?: boolean }) => void
   readonly reloadEngines: () => Promise<ResultMessage>
   /** Key vault (see `lib/vault.ts`): passwords go to the server only and are never kept here. */
   readonly setupVault: (password: string) => Promise<ResultMessage>
   readonly unlockVault: (password: string) => Promise<ResultMessage>
   readonly lockVault: () => Promise<ResultMessage>
   readonly changeVaultPassword: (oldPassword: string, newPassword: string) => Promise<ResultMessage>
+  /** Admin: move these `.env` variables into the saved settings (keys into the vault) and comment them out of the file. */
+  readonly moveFromEnv: (keys: ReadonlyArray<string>) => Promise<ResultMessage>
+  /** Admin: download a model preset (a job; progress arrives as `job` messages). */
+  readonly downloadModel: (tool: ToolId, target: string) => Promise<ResultMessage>
+  readonly cancelJob: (jobId: string) => Promise<ResultMessage>
+  readonly deleteModel: (tool: ToolId, target: string) => Promise<ResultMessage>
   readonly setPrefs: (patch: Partial<Prefs>) => void
   readonly echoTest: () => Promise<{ cancelled: boolean; residualDb: number }>
   readonly connection: Connection
@@ -319,12 +332,18 @@ export const createAssistantClient = (): AssistantClient => {
     request: connection.request,
     enableModule: (moduleId, enabled) => connection.request({ type: enabled ? "module.enable" : "module.disable", moduleId }),
     configureModule: (moduleId, patch) => connection.request({ type: "module.configure", moduleId, patch }),
-    updateSection: (sectionId, patch) => connection.request({ type: "settings.update", sectionId, patch }),
+    updateSection: (sectionId, patch, confirmWarnings) =>
+      connection.request({ type: "settings.update", sectionId, patch, ...(confirmWarnings === true ? { confirmWarnings: true } : {}) }),
+    settings: (to, options = {}) => dispatch({ type: "local/ui", patch: navigateSettings(store.get().ui, to, options.discard === true) }),
     reloadEngines: () => connection.request({ type: "engine.reload" }),
     setupVault: (password) => connection.request({ type: "vault.setup", password }),
     unlockVault: (password) => connection.request({ type: "vault.unlock", password }),
     lockVault: () => connection.request({ type: "vault.lock" }),
     changeVaultPassword: (oldPassword, newPassword) => connection.request({ type: "vault.changePassword", oldPassword, newPassword }),
+    moveFromEnv: (keys) => connection.request({ type: "settings.moveFromEnv", keys: [...keys] }),
+    downloadModel: (tool, target) => connection.request({ type: "job.start", tool, action: "download", target }),
+    cancelJob: (jobId) => connection.request({ type: "job.cancel", jobId }),
+    deleteModel: (tool, target) => connection.request({ type: "model.delete", tool, target }),
     setPrefs,
     diagnostics,
     echoTest: async () => {
