@@ -54,8 +54,11 @@ const { values } = parseArgs({
     conditions: { type: "string", default: "clean,tel,lp7k,quiet,noise15,reverb,combo" },
     lang: { type: "string" },
     json: { type: "string" },
+    interim: { type: "string" },
     // The adapter as it was before whole-turn decoding (a copy of the old src/ in src/baseline.tmp, model nemotron-3.5).
-    baseline: { type: "boolean", default: false }
+    baseline: { type: "boolean", default: false },
+    // Score the events saved in a --json file of a --set run again (no audio, no model).
+    rescore: { type: "string" }
   }
 })
 const model = resolvePresetName(values.model)
@@ -92,7 +95,8 @@ interface Scored {
 
 /**
  * Assigns each turn to an utterance by the time the turn started (its `SpeechStarted`, or for a turn without
- * one its first event): the last utterance whose speech started (minus 300 ms) before it. So a slow
+ * one its first event): the last clip that started (in the timeline) before it. Clips are separated by 1.5 s of
+ * noise, and the VAD can fire before the clip's first loud frame, so the clip's start is the boundary. So a slow
  * `EndOfTurn` that arrives after the next clip has begun still counts for its own clip.
  */
 const score = (
@@ -104,7 +108,7 @@ const score = (
 ): Array<Scored> => {
   const owner = (at: number) => {
     let u = -1
-    for (let i = 0; i < utterances.length; i++) if (at >= t0 + (utterances[i]!.speechStartMs - 300) / speed) u = i
+    for (let i = 0; i < utterances.length; i++) if (at >= t0 + utterances[i]!.startMs / speed) u = i
     return u
   }
   const per = utterances.map(() => ({ texts: [] as Array<string>, eager: undefined as number | undefined, final: undefined as number | undefined, started: undefined as number | undefined, same: undefined as boolean | undefined, resumed: 0 }))
@@ -281,6 +285,32 @@ const program = Effect.gen(function*() {
   }
 })
 
+if (values.rescore) {
+  const saved = JSON.parse(readFileSync(values.rescore, "utf8")) as { results: Array<{ condition: string; events?: Array<{ at: number } & SttEvent> }> }
+  const setDir = join(defaultModelDir, "test-wavs", "stt-quality")
+  const items = JSON.parse(readFileSync(join(setDir, "items.json"), "utf8")) as Record<string, { text: string; lang: string }>
+  const langs = values.lang ? values.lang.split(",") : ["en"]
+  const clips = new Map<string, Clip>()
+  for (const [name, item] of Object.entries(items)) if (langs.includes(item.lang)) clips.set(`${name}.wav`, { name, ...item })
+  const all: Array<Scored> = []
+  const out: Array<unknown> = []
+  for (const r of saved.results) {
+    if (r.events === undefined) continue
+    const parts: Array<string | number> = [1000]
+    for (const name of clips.keys()) parts.push(name, 1500)
+    const { utterances } = timeline(parts, { dir: join(setDir, "cond", r.condition), spanDir: join(setDir, "cond", "clean") })
+    const rows = score(r.events.map(({ at, ...event }) => ({ at, event: event as SttEvent })), utterances, clips, 0, true)
+    all.push(...rows)
+    out.push({ condition: r.condition, ...summary(`${r.condition}/en`, rows) })
+  }
+  out.push({ condition: "all", ...summary("all/en", all) })
+  if (values.json) {
+    const { writeFileSync } = await import("node:fs")
+    writeFileSync(values.json, JSON.stringify(out, null, 1))
+  }
+  process.exit(0)
+}
+
 const options = {
   model,
   eagerSilenceMs: Number(values.eager),
@@ -288,6 +318,7 @@ const options = {
   maxBacklogMs: 10_000,
   agc: values.agc !== "off",
   ...(values.vad ? { vadThreshold: Number(values.vad) } : {}),
+  ...(values.interim ? { interimMs: Number(values.interim) } : {}),
   ...(values.language ? { language: values.language } : {}),
   ...(values.padding ? { tailPaddingMs: Number(values.padding) } : {})
 }

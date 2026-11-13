@@ -70,6 +70,10 @@ export interface HubOptions {
   readonly maxConnections?: number
   readonly observerBufferLimit?: number
   readonly ownerBufferLimit?: number
+  /** Requests that do work (settings, modules, reload) running at once, per connection. Default 4. */
+  readonly maxPendingPerConnection?: number
+  /** The same, over all connections. Default 16. */
+  readonly maxPendingTotal?: number
 }
 
 interface Client {
@@ -81,6 +85,8 @@ interface Client {
   lastSeq: number | undefined
   lastGapErrorAt: number
   warned: Set<string>
+  /** Requests of this connection still running. */
+  pending: number
   /** This connection as the audio link (one object per connection, so a repeated claim is not a change of owner). */
   link: AudioClientLink | undefined
 }
@@ -98,6 +104,9 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
   let ownerMode: InterruptMode = "confirm"
   let lastOwnerClientId: string | undefined
   let micLive = false
+  const maxPendingPerConnection = options.maxPendingPerConnection ?? 4
+  const maxPendingTotal = options.maxPendingTotal ?? 16
+  let pendingTotal = 0
 
   const drop = (client: Client, code: number, reason: string) => {
     if (client.closed) return
@@ -188,6 +197,32 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
 
   const failure = (code: ErrorInfo["code"], message: string): HostResult => ({ ok: false, error: { code, message } })
 
+  /**
+   * Runs a request that does work, within the limits: a tab sending requests faster than they complete gets
+   * `busy` answers instead of an ever-growing pile of operations (and disk writes) behind it.
+   */
+  const limited = (client: Client, requestId: RequestId, work: Effect.Effect<HostResult, never>, after?: (r: HostResult) => void) => {
+    if (client.pending >= maxPendingPerConnection || pendingTotal >= maxPendingTotal) {
+      return result(client, requestId, failure("busy", "Too many changes at once; try again in a moment"))
+    }
+    client.pending++
+    pendingTotal++
+    options.run(work.pipe(
+      // A request that dies is still answered (exactly one result per request, §2.3).
+      Effect.catchCause((cause) =>
+        Effect.as(Effect.logError("serve: request failed", cause), failure("internal", "The assistant could not complete that request"))
+      ),
+      Effect.map((r) => {
+        result(client, requestId, r)
+        after?.(r)
+      }),
+      Effect.ensuring(Effect.sync(() => {
+        client.pending--
+        pendingTotal--
+      }))
+    ))
+  }
+
   const snapshot = (client: Client): Snapshot => ({
     state: options.tracker.current().state,
     role: client === owner ? "owner" : "observer",
@@ -271,9 +306,10 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
       case "playback.progress":
       case "playback.finished":
       case "playback.stopped":
-        // A tab that just lost the audio still answers the reply.stop it was sent: ignored without an error.
-        if (client !== owner) return
-        return options.web.report(message)
+        // Without an error from a tab that is not the owner: a tab that just lost the audio answers the reply.stop
+        // it was sent, and that count is used (WebAudio takes reports on a reply only from the link it played to).
+        if (client.link === undefined) return
+        return options.web.report(message, client.link)
       case "interrupt": {
         const running = options.publisher.committedTurn()
         if (message.turnId !== undefined && message.turnId !== running) return
@@ -281,26 +317,43 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
         return
       }
       case "text.send": {
-        if (options.engine.status().state !== "ready") {
-          return result(client, message.requestId, failure("engine_failed", "The speech and language engines are not running; check Options → Engines"))
-        }
-        result(client, message.requestId, { ok: true })
-        options.engine.send({ _tag: "TextInput", text: message.text, speak: message.speak && client === owner })
-        return
+        // Answered after the engine took it or refused it: `ok` only for input that will be handled.
+        const outcome = options.engine.status().state !== "ready"
+          ? "not_running"
+          : options.engine.send({ _tag: "TextInput", text: message.text, speak: message.speak && client === owner })
+        return result(
+          client,
+          message.requestId,
+          outcome === "accepted"
+            ? { ok: true }
+            : outcome === "busy"
+            ? failure("busy", "The assistant is still taking the previous messages; try again in a moment")
+            : failure("engine_failed", "The speech and language engines are not running; check Options → Engines")
+        )
       }
       case "module.enable":
-        return options.run(Effect.map(options.host.enable(message.moduleId), (r) => result(client, message.requestId, r)))
+        return limited(client, message.requestId, options.host.enable(message.moduleId))
       case "module.disable":
-        return options.run(Effect.map(options.host.disable(message.moduleId), (r) => result(client, message.requestId, r)))
+        return limited(client, message.requestId, options.host.disable(message.moduleId))
       case "module.configure":
-        return options.run(Effect.map(options.host.configure(message.moduleId, message.patch), (r) => result(client, message.requestId, r)))
-      case "settings.update":
-        return options.run(Effect.map(options.sections.update(message.sectionId, message.patch), ({ reload, result: r }) => {
-          result(client, message.requestId, r)
-          if (r.ok) options.onSectionSaved(message.sectionId, reload)
-        }))
+        return limited(client, message.requestId, options.host.configure(message.moduleId, message.patch))
+      case "settings.update": {
+        let reload = false
+        const { sectionId } = message
+        return limited(
+          client,
+          message.requestId,
+          Effect.map(options.sections.update(sectionId, message.patch), (u) => {
+            reload = u.reload
+            return u.result
+          }),
+          (r) => {
+            if (r.ok) options.onSectionSaved(sectionId, reload)
+          }
+        )
+      }
       case "engine.reload":
-        return options.run(Effect.map(options.engine.reload, (r) => result(client, message.requestId, r)))
+        return limited(client, message.requestId, options.engine.reload)
       case "ping":
         return send(client, { type: "pong", id: message.id })
     }
@@ -321,6 +374,7 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
         lastSeq: undefined,
         lastGapErrorAt: -Infinity,
         warned: new Set(),
+        pending: 0,
         link: undefined
       }
       client.helloTimer = setTimeout(() => {

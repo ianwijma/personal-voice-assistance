@@ -31,6 +31,12 @@ export interface PlayerOptions {
   readonly progressMs?: number
   /** Reported in playback.started. */
   readonly outputLatencyMs?: number
+  /**
+   * Answer `reply.stop` as a page whose worklet is slow to confirm: first `playback.stopped` with this provisional
+   * count (`exact: false`, from the true count and the reply's rate), then the true count (`exact: true`) after
+   * `exactAfterMs`. Default: one answer with the true count and no `exact` field (an older page).
+   */
+  readonly provisionalStop?: { readonly count: (played: number, sampleRate: number) => number; readonly exactAfterMs: number }
 }
 
 export interface ScriptedClientOptions {
@@ -63,7 +69,7 @@ export class ScriptedClient {
   private seq = 0
   /** Where the next `waitFor` starts looking: just after the message the previous one returned. */
   private cursor = 0
-  private readonly player: Required<PlayerOptions>
+  private readonly player: Required<Omit<PlayerOptions, "provisionalStop">> & { readonly provisionalStop: PlayerOptions["provisionalStop"] | undefined }
 
   readonly ws: WebSocket
 
@@ -74,7 +80,8 @@ export class ScriptedClient {
       enabled: options.player?.enabled ?? true,
       speed: options.player?.speed ?? 1,
       progressMs: options.player?.progressMs ?? 250,
-      outputLatencyMs: options.player?.outputLatencyMs ?? 12
+      outputLatencyMs: options.player?.outputLatencyMs ?? 12,
+      provisionalStop: options.player?.provisionalStop
     }
     this.closed = new Promise((resolve) => ws.on("close", (code, reason) => {
       this.stopReply()
@@ -228,7 +235,13 @@ export class ScriptedClient {
       }
       case "reply.stop": {
         const reply = this.reply
-        if (reply !== undefined && reply.turnId === message.turnId && !reply.done) {
+        const provisional = this.player.provisionalStop
+        if (reply !== undefined && reply.turnId === message.turnId && !reply.done && provisional !== undefined) {
+          this.advance(reply)
+          this.finishReply(reply, "stopped", true)
+          this.send({ type: "playback.stopped", turnId: reply.turnId, playedSamples: provisional.count(reply.played, reply.sampleRate), exact: false })
+          setTimeout(() => this.send({ type: "playback.stopped", turnId: reply.turnId, playedSamples: reply.played, exact: true }), provisional.exactAfterMs)
+        } else if (reply !== undefined && reply.turnId === message.turnId && !reply.done) {
           this.advance(reply)
           this.finishReply(reply, "stopped", false)
         } else if (reply !== undefined && reply.turnId === message.turnId) {

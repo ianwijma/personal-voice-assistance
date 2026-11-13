@@ -1,7 +1,7 @@
 import { assert, describe, it } from "@effect/vitest"
 import { Tts, type TtsAudio, TtsError } from "@pva/core"
 import { Cause, Effect, Exit, Fiber, Queue, Redacted, Stream } from "effect"
-import type { IncomingMessage } from "node:http"
+import { createServer, type IncomingMessage } from "node:http"
 import { type WebSocket, WebSocketServer } from "ws"
 import { CARTESIA_VERSION, type CartesiaOptions, DEFAULT_MODEL, DEFAULT_VOICE, layer } from "../src/index.ts"
 
@@ -389,5 +389,148 @@ describe("Cartesia Tts", () => {
       const error = Exit.isFailure(exit) ? Cause.squash(exit.cause) : undefined
       assert.instanceOf(error, TtsError)
       assert.match((error as TtsError).message, /not connected after 200 ms/)
+    }))
+
+  it.live("text frames that are valid JSON but not an object, or have odd fields, are dropped; the turn completes", () =>
+    Effect.gen(function*() {
+      const uncaught: Array<unknown> = []
+      const onUncaught = (e: unknown) => uncaught.push(e)
+      process.on("uncaughtException", onUncaught)
+      yield* Effect.addFinalizer(() => Effect.sync(() => process.off("uncaughtException", onUncaught)))
+      const server = yield* mockServer
+      yield* Effect.gen(function*() {
+        const tts = yield* Tts
+        const conn = yield* server.conns.take()
+        const turn = yield* startTurn(tts, Stream.make("Hi."))
+        const id = (yield* server.messages.take()).context_id as string
+        yield* server.messages.take()
+        yield* server.messages.take()
+        for (const frame of ["null", "[1]", "7", "\"x\"", JSON.stringify({ context_id: 5 }), JSON.stringify({ type: "chunk", context_id: id, data: 5 })]) {
+          yield* Effect.sync(() => conn.ws.send(frame))
+        }
+        yield* send(conn, chunk(id, [1, 2]))
+        yield* send(conn, done(id))
+        yield* Fiber.join(turn.fiber)
+        assert.deepStrictEqual(turn.got, [{ audio: [1, 2], clause: 0 }])
+        assert.deepStrictEqual(uncaught, [])
+      }).pipe(Effect.provide(layer(options(server.port))))
+    }))
+
+  it.live("error text that echoes the API key is redacted", () =>
+    Effect.gen(function*() {
+      const key = "ct-0123456789abcdefSECRET"
+      const server = yield* mockServer
+      yield* Effect.gen(function*() {
+        const tts = yield* Tts
+        const conn = yield* server.conns.take()
+        const turn = yield* startTurn(tts, Stream.make("Hi."))
+        const id = (yield* server.messages.take()).context_id as string
+        yield* send(conn, { type: "error", status_code: 401, title: "Unauthorized", message: `bad key ${key}`, done: true, context_id: id })
+        const exit = yield* Fiber.await(turn.fiber)
+        const error = Exit.isFailure(exit) ? Cause.squash(exit.cause) : undefined
+        assert.instanceOf(error, TtsError)
+        assert.include((error as TtsError).message, "Unauthorized")
+        assert.notInclude((error as TtsError).message, key)
+      }).pipe(Effect.provide(layer(options(server.port, { apiKey: Redacted.make(key) }))))
+    }))
+
+  it.live("a context that never sends audio or done fails the turn and is cancelled", () =>
+    Effect.gen(function*() {
+      const server = yield* mockServer
+      yield* Effect.gen(function*() {
+        const tts = yield* Tts
+        yield* server.conns.take()
+        const turn = yield* startTurn(tts, Stream.make("Hello."))
+        const id = (yield* server.messages.take()).context_id as string
+        yield* server.messages.take() // flush
+        yield* server.messages.take() // end of input
+        const exit = yield* Fiber.await(turn.fiber)
+        const error = Exit.isFailure(exit) ? Cause.squash(exit.cause) : undefined
+        assert.instanceOf(error, TtsError)
+        assert.match((error as TtsError).message, /no audio/)
+        assert.deepStrictEqual(yield* server.messages.take(), { context_id: id, cancel: true })
+      }).pipe(Effect.provide(layer(options(server.port, { drainTimeoutMs: 200 }))))
+    }))
+
+  it.live("a context that stops before its last flush is acknowledged fails the turn (truncated speech)", () =>
+    Effect.gen(function*() {
+      const server = yield* mockServer
+      yield* Effect.gen(function*() {
+        const tts = yield* Tts
+        const conn = yield* server.conns.take()
+        const turn = yield* startTurn(tts, Stream.make("One.", "Two."))
+        const id = (yield* server.messages.take()).context_id as string
+        for (let i = 0; i < 4; i++) yield* server.messages.take() // flush, clause 2, flush, end of input
+        yield* send(conn, chunk(id, [1]))
+        yield* send(conn, flushDone(id, 1))
+        const exit = yield* Fiber.await(turn.fiber)
+        const error = Exit.isFailure(exit) ? Cause.squash(exit.cause) : undefined
+        assert.instanceOf(error, TtsError)
+        assert.match((error as TtsError).message, /1 of 2/)
+        assert.deepStrictEqual(turn.got, [{ audio: [1], clause: 0 }])
+        assert.deepStrictEqual(yield* server.messages.take(), { context_id: id, cancel: true })
+      }).pipe(Effect.provide(layer(options(server.port, { drainTimeoutMs: 200 }))))
+    }))
+
+  it.live("a context whose speech was all generated but whose done never came still ends the turn normally", () =>
+    Effect.gen(function*() {
+      const server = yield* mockServer
+      yield* Effect.gen(function*() {
+        const tts = yield* Tts
+        const conn = yield* server.conns.take()
+        const turn = yield* startTurn(tts, Stream.make("One."))
+        const id = (yield* server.messages.take()).context_id as string
+        yield* server.messages.take()
+        yield* server.messages.take()
+        yield* send(conn, chunk(id, [1]))
+        yield* send(conn, flushDone(id, 1))
+        yield* Fiber.join(turn.fiber)
+        assert.deepStrictEqual(turn.got, [{ audio: [1], clause: 0 }])
+      }).pipe(Effect.provide(layer(options(server.port, { drainTimeoutMs: 200 }))))
+    }))
+
+  it.live("a server that accepts the connection but never completes the upgrade is abandoned and replaced", () =>
+    Effect.gen(function*() {
+      const wss = new WebSocketServer({ noServer: true })
+      const conns = new Inbox<Conn>()
+      const messages = new Inbox<Msg>()
+      wss.on("connection", (ws, req) => {
+        conns.push({ ws, url: new URL(req.url ?? "/", "ws://localhost"), headers: req.headers })
+        ws.on("message", (data) => messages.push(JSON.parse(data.toString())))
+      })
+      let upgrades = 0
+      const hung: Array<import("node:net").Socket> = []
+      const http = yield* Effect.acquireRelease(
+        Effect.callback<import("node:http").Server>((resume) => {
+          const server = createServer()
+          server.on("upgrade", (req, socket, head) => {
+            if (upgrades++ === 0) hung.push(socket as import("node:net").Socket)
+            else wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req))
+          })
+          server.listen(0, "127.0.0.1", () => resume(Effect.succeed(server)))
+        }),
+        (server) =>
+          Effect.sync(() => {
+            for (const s of hung) s.destroy()
+            for (const c of wss.clients) c.terminate()
+            server.closeAllConnections()
+            server.close()
+          })
+      )
+      const port = (http.address() as import("node:net").AddressInfo).port
+      yield* Effect.gen(function*() {
+        const tts = yield* Tts
+        // The first turn starts while the first handshake hangs; it gets the replacement socket.
+        const turn = yield* startTurn(tts, Stream.make("Hi."))
+        const conn = yield* conns.take()
+        const id = (yield* messages.take()).context_id as string
+        yield* messages.take()
+        yield* messages.take()
+        yield* send(conn, chunk(id, [4]))
+        yield* send(conn, done(id))
+        yield* Fiber.join(turn.fiber)
+        assert.deepStrictEqual(turn.got, [{ audio: [4], clause: 0 }])
+        assert.strictEqual(upgrades, 2)
+      }).pipe(Effect.provide(layer(options(port, { handshakeTimeoutMs: 200, connectTimeoutMs: 1500 }))))
     }))
 })

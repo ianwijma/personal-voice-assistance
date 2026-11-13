@@ -32,7 +32,8 @@ export interface FakeQuery extends QueryHandle {
   readonly interrupts: number
   readonly closed: boolean
   readonly registered: Array<{ tools: ReadonlyArray<SessionTool>; viaSetMcpServers: boolean }>
-  crash(message?: string): void
+  /** The iterator throws `error` (an `Error` made from a string), as the SDK does when the process dies. */
+  crash(error?: string | Error): void
 }
 
 export interface FakeSdkOptions {
@@ -40,6 +41,8 @@ export interface FakeSdkOptions {
   readonly account?: { subscriptionType?: string; apiKeySource?: string }
   /** Delay before initializationResult resolves (ms); `Infinity` never resolves. */
   readonly initDelayMs?: number
+  /** initializationResult rejects with this instead (the process could not start). */
+  readonly initError?: unknown
   /** Interrupts are never acknowledged (a stuck session). */
   readonly hangOnInterrupt?: boolean
   /** Tools listed in the init message besides our MCP tools (to test the safety check). */
@@ -125,7 +128,9 @@ export const makeFakeSdk = (options: FakeSdkOptions = {}) => {
           for (const w of waiters.splice(0)) w.resolve({ done: true, value: undefined })
         },
         initializationResult: () =>
-          (options.initDelayMs === Infinity ? new Promise(() => {}) : sleep(options.initDelayMs ?? 1)).then(() => ({
+          (options.initDelayMs === Infinity ? new Promise(() => {}) : sleep(options.initDelayMs ?? 1)).then(() => {
+            if ("initError" in options) throw options.initError
+          }).then(() => ({
             account: { subscriptionType: "max", apiKeySource: "none", ...options.account },
             models: [{ value: "claude-haiku-5-5", displayName: "Haiku 5.5", description: "" }] as never
           })),
@@ -137,8 +142,8 @@ export const makeFakeSdk = (options: FakeSdkOptions = {}) => {
           }
           return {}
         },
-        crash: (message = "Claude Code process exited with code 1") => {
-          failure = new Error(message)
+        crash: (error = "Claude Code process exited with code 1") => {
+          failure = typeof error === "string" ? new Error(error) : error
           for (const w of waiters.splice(0)) w.reject(failure)
         }
       }

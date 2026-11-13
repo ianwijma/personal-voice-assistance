@@ -3,6 +3,7 @@
  * a scripted `Llm`, a tone `Tts`), a temporary data directory and a free port.
  */
 import { defineModule, Llm, type LlmEvent, makeTool, type ModuleDefinition, Setting, Stt, type SttEvent, Tts, type TtsAudio } from "@pva/core"
+import { sttContractKeeper } from "@pva/core/testing"
 import { Effect, Exit, Queue, References, Schema, Scope, Stream } from "effect"
 import { mkdtempSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -21,7 +22,14 @@ export const controlledStt = () => {
         Stream.fromQueue(queue)
       )
   })
-  return { stt, chunks, emit: (...events: Array<SttEvent>) => events.forEach((e) => Queue.offerUnsafe(queue, e)) }
+  // A real recogniser sends `SpeechStarted` before any transcript of an utterance; the conversation ignores
+  // transcripts without one. The keeper inserts it where a test's script leaves it out.
+  const keep = sttContractKeeper()
+  return {
+    stt,
+    chunks,
+    emit: (...events: Array<SttEvent>) => (keep(events) as Array<SttEvent>).forEach((e) => Queue.offerUnsafe(queue, e))
+  }
 }
 
 /** An `Llm` that answers with `reply(userText)` word by word (a few ms apart); tool calls are not used. */

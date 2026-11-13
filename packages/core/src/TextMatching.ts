@@ -15,20 +15,31 @@ export interface Word {
   readonly start: number
   /** Offset just past the last character in the original text. */
   readonly end: number
+  /**
+   * The word ends in a possessive suffix with its apostrophe: "bedroom's", "Bedroom’s", "kids'"
+   * (review round 6). `norm` drops the apostrophe ("bedrooms"), so this is the only trace of it.
+   */
+  readonly possessive?: true
 }
 
 const wordPattern = /[\p{L}\p{N}][\p{L}\p{N}'’]*/gu
 
-/** Normalise one word: lower case, no diacritics, no apostrophes. */
+/**
+ * Normalise one word: lower case, no diacritics, no apostrophes. Canonical decomposition (NFD),
+ * not compatibility decomposition (review round 5): "²", "４", "ﬁ" stay what they are, so a
+ * superscript or full-width character never turns into the digit or letters it resembles.
+ */
 export const normalizeWord = (word: string): string =>
-  word.normalize("NFKD").replace(/\p{M}/gu, "").toLowerCase().replace(/['’]/g, "")
+  word.normalize("NFD").replace(/\p{M}/gu, "").toLowerCase().replace(/['’]/g, "")
 
 /** Split text into words (letters and digits; punctuation and spaces separate words). */
 export const words = (text: string): Array<Word> => {
   const result: Array<Word> = []
   for (const match of text.matchAll(wordPattern)) {
     const norm = normalizeWord(match[0])
-    if (norm.length > 0) result.push({ norm, start: match.index, end: match.index + match[0].length })
+    if (norm.length === 0) continue
+    const possessive = /\p{L}['’][sS]$/u.test(match[0]) || /[sS]['’]$/u.test(match[0])
+    result.push(possessive ? { norm, start: match.index, end: match.index + match[0].length, possessive: true } : { norm, start: match.index, end: match.index + match[0].length })
   }
   return result
 }

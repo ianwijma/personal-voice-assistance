@@ -48,8 +48,45 @@ const play = <A>(steps: ReadonlyArray<A | Sleep>): Stream.Stream<A> =>
     Stream.filter((a): a is A => a !== undefined)
   )
 
-/** A stream of `steps`, pausing (in clock time) at each `sleep`. */
-export const scripted = <A>(steps: ReadonlyArray<A | Sleep>): Stream.Stream<A> => play(steps)
+/**
+ * A stream of `steps`, pausing (in clock time) at each `sleep`. A script of recogniser events
+ * is made to follow the `SttEvent` contract, like a real recogniser: a `SpeechStarted` is sent
+ * right before an `EagerEndOfTurn`, `TurnResumed` or `EndOfTurn` that would otherwise arrive with
+ * no utterance open (none since the last `EndOfTurn`). `scriptedRaw` sends the steps as written.
+ */
+export const scripted = <A>(steps: ReadonlyArray<A | Sleep>): Stream.Stream<A> => play(withSpeechStarted(steps))
+
+/** `scripted` without the `SttEvent` contract applied: the steps exactly as written (protocol-violation tests). */
+export const scriptedRaw = <A>(steps: ReadonlyArray<A | Sleep>): Stream.Stream<A> => play(steps)
+
+const tagOf = (u: unknown): string | undefined =>
+  typeof u === "object" && u !== null && typeof (u as { _tag?: unknown })._tag === "string" ? (u as { _tag: string })._tag : undefined
+
+/**
+ * A stateful `withSpeechStarted` for fakes that emit events in several calls (a controllable
+ * recogniser): each call returns its events with a `SpeechStarted` inserted where a recogniser that
+ * keeps the `SttEvent` contract would have sent it, remembering whether an utterance is open.
+ */
+export const sttContractKeeper = () => {
+  let open = false
+  return <A>(steps: ReadonlyArray<A | Sleep>): Array<A | Sleep> => {
+    const out: Array<A | Sleep> = []
+    for (const step of steps) {
+      const tag = tagOf(step)
+      if (tag === "SpeechStarted") open = true
+      else if ((tag === "EagerEndOfTurn" || tag === "TurnResumed" || tag === "EndOfTurn") && !open) {
+        out.push(speechStarted as A)
+        open = true
+      }
+      if (tag === "EndOfTurn") open = false
+      out.push(step)
+    }
+    return out
+  }
+}
+
+/** Insert `SpeechStarted` where a recogniser that keeps the contract would have sent it. */
+export const withSpeechStarted = <A>(steps: ReadonlyArray<A | Sleep>): Array<A | Sleep> => sttContractKeeper()(steps)
 
 const isSleep = (u: unknown): u is Sleep =>
   typeof u === "object" && u !== null && (u as { _tag?: unknown })._tag === "Sleep"
@@ -63,10 +100,10 @@ export const interim = (text: string): SttEvent => ({ _tag: "Interim", text })
 export const eagerEndOfTurn = (text: string): SttEvent => ({ _tag: "EagerEndOfTurn", text })
 export const endOfTurn = (text: string): SttEvent => ({ _tag: "EndOfTurn", text })
 
-/** `Stt` that ignores its audio and emits `script` (with `sleep` steps between events). */
+/** `Stt` that ignores its audio and emits `script` (with `sleep` steps between events), following the `SttEvent` contract (`withSpeechStarted`). */
 export const makeScriptedStt = (script: ReadonlyArray<SttEvent | Sleep>) => {
   const probe = newProbe()
-  const layer = Layer.succeed(Stt, Stt.of({ transcribe: () => play(script).pipe(track(probe)) }))
+  const layer = Layer.succeed(Stt, Stt.of({ transcribe: () => play(withSpeechStarted(script)).pipe(track(probe)) }))
   return { layer, probe }
 }
 

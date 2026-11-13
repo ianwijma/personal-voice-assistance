@@ -41,6 +41,8 @@ export const makeEngineTts = (
           const joiner = makeJoiner(sampleRate, join)
           const jobs = new Set<Job>()
           let next = 0
+          /** The last clause that produced audio: the pause before the next clause's speech is counted as part of it. */
+          let lastAudible: number | undefined
           let ended = false
           let settled = false
 
@@ -68,7 +70,10 @@ export const makeEngineTts = (
                 onAudio: (samples) => {
                   jobs.delete(job)
                   if (settled) return
-                  for (const audio of joiner(samples, text)) Queue.offerUnsafe(queue, { audio, clause })
+                  const joined = joiner(samples, text)
+                  for (const audio of joined.pause) Queue.offerUnsafe(queue, { audio, clause: lastAudible ?? clause })
+                  for (const audio of joined.speech) Queue.offerUnsafe(queue, { audio, clause })
+                  if (joined.speech.length > 0) lastAudible = clause
                   finishIfDone()
                 },
                 onError: (message) => {

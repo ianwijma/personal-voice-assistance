@@ -79,7 +79,7 @@ export const runLive = (options: LiveOptions): Effect.Effect<Array<BenchRow>, Au
         Effect.sync(() => {
           if (event._tag === "EagerEndOfTurn") heard.eagerAt = tt.now()
           else if (event._tag === "TurnResumed") heard.resumed++
-          else if (event._tag === "EndOfTurn") heard.text = event.text
+          else if (event._tag === "EndOfTurn" && event.text !== "") heard.text = event.text // empty: an utterance with no words
         })
 
       const turn = (pcm: Uint8Array, index: number): Stream.Stream<Uint8Array> => {

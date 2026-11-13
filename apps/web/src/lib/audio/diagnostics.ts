@@ -1,4 +1,5 @@
 import { createStore, type Store } from "../store.ts"
+import type { PlaybackRoute } from "./playback.ts"
 
 /**
  * What the owner can read off "This device" to report audio problems: the
@@ -56,6 +57,8 @@ export interface PlaybackTotals {
 
 export interface Diagnostics {
   readonly mic: MicReport | undefined
+  /** How the player's live count reaches the page, and why (shared memory or messages). */
+  readonly route?: PlaybackRoute | undefined
   readonly playback: PlaybackTotals
 }
 
@@ -73,12 +76,15 @@ const emptyPlayback = (): PlaybackTotals => ({
 type DiagnosticsAction =
   | { readonly type: "mic"; readonly report: MicReport | undefined }
   | { readonly type: "reply"; readonly stats: ReplyStats }
+  | { readonly type: "route"; readonly route: PlaybackRoute }
   | { readonly type: "reset" }
 
 export const reduceDiagnostics = (s: Diagnostics, a: DiagnosticsAction): Diagnostics => {
   switch (a.type) {
     case "mic":
       return { ...s, mic: a.report }
+    case "route":
+      return { ...s, route: a.route }
     case "reply": {
       const p = s.playback
       const min = a.stats.minQueueMs >= 0 ? Math.min(p.minQueueMs ?? Infinity, a.stats.minQueueMs) : p.minQueueMs
@@ -108,6 +114,10 @@ export const createDiagnosticsStore = (): DiagnosticsStore =>
 
 const flag = (v: boolean | undefined) => (v === undefined ? "not reported" : v ? "on" : "off")
 
+/** The diagnostics line for the playback-count route. */
+export const describeRoute = (r: PlaybackRoute | undefined): string =>
+  r === undefined ? "not started" : `${r.route === "shared" ? "shared memory" : "messages"}: ${r.reason}`
+
 /** Plain text for "Copy report". */
 export const formatDiagnostics = (d: Diagnostics, extra: { readonly userAgent: string; readonly outputPath: string; readonly prebufferMs: number }): string => {
   const lines = [`Browser: ${extra.userAgent}`]
@@ -123,6 +133,7 @@ export const formatDiagnostics = (d: Diagnostics, extra: { readonly userAgent: s
     )
   }
   const p = d.playback
+  lines.push(`Playback count: ${describeRoute(d.route)}`)
   lines.push(
     `Playback (${extra.outputPath} output, prebuffer ${extra.prebufferMs} ms) since ${new Date(p.since).toLocaleTimeString()}: ${p.replies} replies, ` +
       `${p.underruns} underruns in ${p.repliesWithUnderruns} replies, ${p.gapMs} ms of gaps, ${p.clicks} clicks smoothed, ` +

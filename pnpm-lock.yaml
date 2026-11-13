@@ -157,6 +157,12 @@ importers:
       '@playwright/test':
         specifier: 'catalog:'
         version: 1.65.0
+      '@pva/audio-web':
+        specifier: workspace:*
+        version: link:../../packages/audio-web
+      '@pva/core':
+        specifier: workspace:*
+        version: link:../../packages/core
       '@tailwindcss/turbopack':
         specifier: 4.3.5
         version: 4.3.5

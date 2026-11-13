@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url"
 import { assert, describe, it } from "@effect/vitest"
 import { Effect, Fiber, Stream } from "effect"
 import {
+  captureBufferFrames,
   captureCommand,
   captureStream,
   defaultOptions,
@@ -68,6 +69,21 @@ describe("capture", () => {
       assert.deepStrictEqual(frames.map((f) => f.length), [640, 640, 640, 640, 640])
       assert.deepStrictEqual(concat(frames), Buffer.from(pattern(640 * 5)))
       assert.isFalse(isAlive(pidFile), "capture process still running after the stream ended")
+    }))
+
+  it.live("a consumer that falls behind gets at most the newest 3 s, not everything the process wrote", () =>
+    Effect.gen(function*() {
+      const pidFile = join(tmp(), "pid")
+      let received = 0
+      const fiber = yield* captureStream(node("capture.mjs", pidFile, 640 * 2000, "hang")).pipe(
+        Stream.runForEach(() => Effect.andThen(Effect.sync(() => void received++), received === 0 ? Effect.sleep(700) : Effect.void)),
+        Effect.forkChild
+      )
+      // Long enough for the stand-in process to start when the whole suite is loading the machine.
+      yield* Effect.sleep(2_500)
+      yield* Fiber.interrupt(fiber)
+      assert.isAtMost(received, 1 + captureBufferFrames + 20, `received ${received} of 2000 frames`)
+      assert.isAbove(received, 1)
     }))
 
   it.live("an unexpected exit fails the stream with AudioError carrying stderr, after the audio", () =>
@@ -137,6 +153,29 @@ describe("playback", () => {
       // Bounded by the kernel buffer of Node's stdio socketpair (~200 KiB on
       // Linux) + Node's 16 KiB highWaterMark; an unbounded writer would be at MBs.
       assert.isBelow(pulled, 512 * 1024, `pulled ${pulled} bytes into a stalled player`)
+    }))
+
+  it.live("a player that stops reading fails the playback after the stall limit, and is killed", () =>
+    Effect.gen(function*() {
+      const dir = tmp()
+      const pidFile = join(dir, "pid")
+      const endless = Stream.forever(Stream.succeed(new Uint8Array(4096)))
+      const start = yield* now
+      const exit = yield* Effect.exit(playThrough(node("player.mjs", pidFile, join(dir, "out"), 0, "stall"), endless, 300))
+      assert.strictEqual(exit._tag, "Failure")
+      assert.include(String(exit), "stopped reading its input")
+      assert.isBelow((yield* now) - start, 2_000)
+      assert.isFalse(isAlive(pidFile))
+    }))
+
+  it.live("a player that never exits after the end of its input fails after the stall limit, and is killed", () =>
+    Effect.gen(function*() {
+      const dir = tmp()
+      const pidFile = join(dir, "pid")
+      const exit = yield* Effect.exit(playThrough(node("player.mjs", pidFile, join(dir, "out"), 60_000, "play"), Stream.make(pattern(1000)), 300))
+      assert.strictEqual(exit._tag, "Failure")
+      assert.include(String(exit), "did not exit after the end of its input")
+      assert.isFalse(isAlive(pidFile))
     }))
 
   it.live("a player that exits early fails with AudioError carrying stderr", () =>

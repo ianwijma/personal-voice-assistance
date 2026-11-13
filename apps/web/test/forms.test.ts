@@ -18,7 +18,7 @@ describe("generated forms", () => {
     const d = initialDraft(ha)
     const same = { ...d, values: { ...d.values, domains: ["light", "sensor", "climate"] } }
     expect(isDirty(ha, same)).toBe(false)
-    const replaced = { values: { ...d.values, domains: ["light"] }, secrets: { token: "new" } }
+    const replaced = { ...d, values: { ...d.values, domains: ["light"] }, secrets: { token: "new" } }
     expect(computePatch(ha, replaced)).toEqual({ values: { domains: ["light"] }, secrets: { token: "new" } })
     expect(computePatch(ha, { ...d, secrets: { token: null } })).toEqual({ values: {}, secrets: { token: null } })
   })
@@ -37,10 +37,33 @@ describe("generated forms", () => {
     const edits = { ...initialDraft(weather), values: { ...weather.values, units: "fahrenheit" } }
     const dirty = reconcile({ draft: edits, baseRevision: 3, stale: false }, weather, next, 4)
     expect(dirty.stale).toBe(true)
-    expect(dirty.draft).toBe(edits)
+    // The edit is kept, the other tab's change shows in the field the user did not touch...
+    expect(dirty.draft.values).toMatchObject({ units: "fahrenheit", defaultPlace: "Utrecht" })
+    // ...and saving sends only the edit: never a reset of the other tab's change.
+    expect(computePatch(next, dirty.draft)).toEqual({ values: { units: "fahrenheit" }, secrets: {} })
 
     const old = { draft: edits, baseRevision: 5, stale: false }
     expect(reconcile(old, weather, next, 4)).toBe(old)
+  })
+
+  it("a stale form saved without reconciling still sends only what the user edited (review finding 7)", () => {
+    // a=old-a, b=old-b; the user edits only a; another tab changes b; the form shown is the newest.
+    const edits = { ...initialDraft(weather), values: { ...initialDraft(weather).values, units: "fahrenheit" } }
+    const remote: SettingsForm = { ...weather, values: { ...weather.values, defaultPlace: "remote place" } }
+    expect(computePatch(remote, edits)).toEqual({ values: { units: "fahrenheit" }, secrets: {} })
+    // An edit reverted by hand is no edit.
+    const reverted = { ...edits, values: { ...edits.values, units: weather.values.units! } }
+    expect(isDirty(remote, reverted)).toBe(false)
+  })
+
+  it("several revisions in a row keep merging, and a field both sides changed keeps the user's edit", () => {
+    const edits = { ...initialDraft(weather), values: { ...weather.values, units: "fahrenheit" } }
+    const r4: SettingsForm = { ...weather, values: { ...weather.values, defaultPlace: "Utrecht" } }
+    const r5: SettingsForm = { ...weather, values: { ...weather.values, defaultPlace: "Delft", units: "celsius", timeoutMs: 4000 } }
+    let sync = reconcile({ draft: edits, baseRevision: 3, stale: false }, weather, r4, 4)
+    sync = reconcile(sync, r4, r5, 5)
+    expect(sync.draft.values).toMatchObject({ units: "fahrenheit", defaultPlace: "Delft", timeoutMs: 4000 })
+    expect(computePatch(r5, sync.draft)).toEqual({ values: { units: "fahrenheit" }, secrets: {} })
   })
 
   it("groups errors by field, null for the form", () => {

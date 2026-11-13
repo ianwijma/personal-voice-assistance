@@ -83,6 +83,641 @@ Interfaces other pieces use:
   trailing "today/now/vandaag/…".
 - `packages/agent-intent` has a dev dependency on `@pva/modules-builtin` (end-to-end test); the lockfile gained that one link.
 
+### Review fixes (core, intent path, built-in modules) — 2026-11-14
+
+Behaviour changed after an independent review; each line replaces what the entries above or the sections below say.
+
+- **Stop cancels a speculative turn too** (was: "a pending speculative turn is left alone"). `Interrupt` discards a pending
+  turn (outcome `discarded`), and the eager or final transcript of that same utterance then starts nothing; new speech
+  (`SpeechStarted`), typed text, `Say` or a different transcript clears that. `docs/ARCHITECTURE.md` updated to match.
+- **A manual agent choice wins over a waiting speculative turn.** `SetActiveAgent` made after a turn was planned keeps
+  that turn's promotion from applying its routing outcome (`decision.next`) or its `ExpectReply` arming.
+- **The pending question is dropped at promotion, not at once** (supersedes "on a fallback or decider error the pending
+  question is dropped at once"). The `Handoff` still goes out immediately, so the fallback agent does not wait; the
+  clearing waits for `promoted` on its own fiber (bounded by `pendingMs`) and clears only the question that turn saw, so
+  a discarded speculative turn leaves it in place. With `onNoMatch: "say"` it is cleared at commit like any spoken turn.
+- **A pending question or confirmation is used only with the same action registration.** If the turn's actions no
+  longer contain the very `RegisteredAction` that asked (module disabled or reconfigured), or a dynamic value chosen
+  before the question is no longer offered, the pending intent is dropped and the utterance is decided as a new request
+  (`pendingStillValid`, exported from `Decision.ts`). A "yes" never carries over to a new instance.
+- **Numbers: which one is meant is decided before its range is checked.** All numbers found are offered as candidates;
+  one out of range is marked `invalid` and, if chosen (or if it is the only number), the value is asked for again with
+  "I can't use <what was said>. <question>" — never replaced by another number of the sentence, and never by an
+  optional parameter's default. An out-of-range answer to a pending question asks again (the action stays pending).
+  `ParamPlan` `missing` gains `invalid?: string`.
+- **Signs are part of numbers.** "-5", "−5", "minus five", "negative 5", "min vijf", "negatief tien" parse as negative
+  (and signed decimals); a duration with a sign is negative, which no duration parameter accepts; `parseDuration`
+  returns `undefined` for a negative value.
+- **`Param.text` gains `notAfter`**: words that, right before a marker, mean it is not one. `weather.today` uses
+  `notAfter: ["wat"]`, so "wat voor weer is het in Utrecht" takes "Utrecht" (it took "weer is het in").
+- **Keyword decider: negation and confirmations.** A command with a negation (not, don't, never, no, can't, won't,
+  niet, nooit, geen, nee, …) gets `fits` 0.1 and is handed to the conversational agent rather than acted on; a negated
+  answer to a pending question ("not the kitchen") does not choose the option it names. A pending confirmation is
+  confirmed only by a reply made entirely of yes words ("yes please", "ja, doe maar", "go ahead", "that's right"):
+  "please", "do" or "right" inside a new command no longer confirm. A reply made of no words, or with a negation,
+  cancels; a reply that is a command of its own is decided as a new request.
+- **Module host: tool-name clashes are checked at publication**, synchronously against the modules running then, and
+  the candidate snapshot is built before anything changes; on a clash the new instance's scope is closed and the start
+  fails with `module_start_failed` (two modules starting at once with the same tool name no longer fail
+  `startEnabled`). An interrupted start closes the half-started scope and restores the module's previous state; a
+  `start` that throws before returning its effect is a start failure.
+- **Module code that throws synchronously is contained**: a tool's `execute` (error result), an action's `run`
+  (failed action), `announce` (no announcement; the action still runs), a `confirm` text function (the label is asked),
+  a decider's `decide` (decision error → `Handoff`), a field action and the generated agent/decider tests (reported).
+  Interruption is never turned into an error.
+
+### Review fixes, second round (core, intent path) — 2026-11-14
+
+A second review checked the first round's fixes. Each line replaces what the entries above or the sections below say.
+
+- **Stop cancels an utterance, not a transcript** (replaces "the eager or final transcript of that same utterance then
+  starts nothing"). After Stop discards a speculative turn, everything the recogniser sends for that utterance — revised
+  eager transcripts, `TurnResumed`, the final `EndOfTurn` with whatever words — starts nothing. The utterance ends with its
+  `EndOfTurn` (swallowed); `SpeechStarted`, typed text and `Say` begin something new. This relies on the boundary contract
+  now stated with `SttEvent` in `docs/ARCHITECTURE.md` (both recogniser families keep it); a recogniser that breaks it
+  cannot leave the conversation deaf: the cancellation lapses after `CANCELLED_UTTERANCE_MS` (20 s).
+- **Promotion compares values** (`normalizeTranscript`): a sign or dash before a digit, a separator between digits and
+  "%" count; other punctuation and case do not. "5" → "-5", "15" → "1.5", "35" → "3-5" discard the speculative turn and
+  decide again from the final words (history records them).
+- **Numbers are read whole** (`ValueParsing.ts`; extends §3.5): hundreds, thousands, millions in English ("one hundred
+  and forty", "nineteen hundred", "a hundred") and Dutch, glued or spaced ("honderdveertig", "tweehonderd", "twee
+  honderd", "tweeduizend driehonderd", "vijf en twintig"); "anderhalf", "tweeënhalf", "<n> and a half", "<n> point five",
+  "<n> komma vijf". A compound number is one candidate, never several smaller ones ("one hundred forty percent" is 140,
+  asked for again, never 40). "1,000" / "1.000" (three digits after the separator) is a thousands separator in one
+  language and a decimal point in the other: one candidate with value NaN, which no parameter accepts, so it is asked
+  for. A minus sign separated from its number by spaces is a sign ("- 5"), except between two numbers ("3 - 5"). An en
+  dash is not read as a minus.
+- **Choice questions always offer "none of these"** (option id `none`, 254 values at most), and a required parameter with
+  a **single value is no longer filled without asking**: it gets the "does it say which …?" question; when the utterance
+  names none, the single value is used; when it names one, the choice must pick it (`ParamPlan` choice gains
+  `only?`). A value named but not offered is never replaced by the only value, a default or the best of a bad set: it is
+  asked about ("turn on the bedroom lights" with only a kitchen light; "what time is it in Utrecht"). Keyword decider:
+  `stated` is also 0.9 when the utterance has a content word nothing explains (not in the action's label, description
+  or examples, not an offered value, a number, a question word or a negation). Known cost: a stray word ("turn on the
+  lights quickly" with a single light) makes it ask.
+- **A broken option list leaves out only its actions**: each list is read once per plan; an action whose list throws is
+  not offered (`DecisionPlan.unavailable`, also in `warnings`, logged by the intent agent); if nothing is left and no
+  question is pending, the intent agent hands off without a request (`Decision` outcome `fallback`, reason "no actions
+  available"). A pending question whose list fails is dropped and the utterance decided as a new request.
+- **A reply to a pending question that is a command of its own is planned afresh** (all its parameters), never taken
+  as the answer. Core rule, whatever the provider: the reply is a new request when it gives a value already decided
+  another value (the pending action's own parameter questions in the same request), or when the provider confidently
+  picks a different action (fits ≥ `fitsAccept`, action ≥ `action`, not compound). Keyword decider: `answers` is 0.2 when
+  words other than value words (option names, numbers, units) and the question's own words pick an action ("turn off the
+  kitchen lights please" after "Which room or light?"); "the kitchen", "the kitchen lights", "40 percent", "veertig
+  procent" still answer. Number words no longer count toward choosing an action (in the utterance or in examples).
+- **Core safeguard, independent of the decision provider** (`interpretDecision`, word lists in
+  `packages/core/src/IntentWords.ts`, English and Dutch, moved there from the keyword decider, which now uses them):
+  a pending confirmation is accepted only on a bounded affirmative ("yes please", "ja, doe maar", "go ahead"); a reply
+  the provider calls a yes that is not one is decided as a new request; a provider's no still cancels. A request that
+  contains a negation ("don't", "not", "never", "niet", "nooit", "geen", …) for an action with side effects (not
+  `speculative`) is not acted on, asked about or confirmed, also as the answer to a pending question: `Fallback` with the
+  new reason `negated`, so the conversational agent answers. Read-only actions are not vetoed. No action needs a
+  confirmation it did not declare. Extend the lists with `extendIntentWords` and `makeIntentAgent({ words })`;
+  `interpretDecision` takes them as a fourth argument.
+- **Nothing is placed after a `Handoff`**: `Conversation` stops reading an agent's stream there, so the intent agent sets
+  up the dropping of a pending question before it emits `Handoff` in every branch (the "no decision provider" branch kept
+  it after, so the stale question survived). Stated on `AgentEvent` `Handoff`.
+- **A manual agent choice also wins over `ExpectReply` after promotion** (and in typed turns): an intent question
+  planned before a `SetActiveAgent` no longer arms the intent agent once promoted.
+- **Module host: a successful start is always published or closed.** The module's start is the only interruptible part;
+  from its return until the instance is published (or its scope closed on a clash, and, for a reconfiguration, the old
+  instance retired) nothing can interrupt, so an interruption right after a successful start no longer leaves an
+  instance running unpublished (tested by interrupting after every scheduler step).
+
+### Review fixes, third round (core, intent path, keyword decider) — 2026-11-14
+
+A third review found seven more cases of the assistant acting on something other than what was said. Patching
+examples had not converged, so this round changes the default. Each line replaces what the entries above or the sections
+below say.
+
+**The rule: act only on what is fully accounted for.** The intent path may run an action with side effects only when
+every word of what was said is explained — by the trigger (already removed), the action, its parameter values, and a
+closed set of filler words. Anything unexplained, unparsed or contradictory means: ask a short question, or hand the
+sentence to the conversational agent. Recognisers of "safe to act" input are closed lists and grammars (allow-lists);
+nothing is inferred from the absence of a known bad word. The closed lists are `IntentWords` in
+`packages/core/src/IntentWords.ts` (`yes`, `yesFiller`, `filler`, `negation`, `prohibition`, `no`, `noFiller`; English
+and Dutch; extend with `extendIntentWords` / `makeIntentAgent({ words })`); the number grammar is written out at the top
+of `packages/core/src/ValueParsing.ts`; the accounting is `packages/core/src/Accounting.ts` and `unexplainedForRequest`
+in `Decision.ts`.
+
+- **Accounting of a request (core, any provider).** For an action that is not `speculative`, `interpretDecision` checks
+  that every word is explained: the action's vocabulary (`actionVocabulary`: its label, the sentences of its description
+  that do not start with "Not", its examples, its parameters' labels, units and text markers; number words and, in
+  examples, names of its values are left out; negations never count), the values it is given (the option chosen, where it
+  is named; the number span used; the text taken with its marker word; and for a question about to be asked, whatever
+  names a value of the parameter asked about), and `filler`. Words inside a value — a number span, the name of an option —
+  are explained only by being that value. Otherwise `Fallback` with the new reason **`unexplained`**. A value is one that
+  was said: an option chosen for a choice parameter that the utterance does not name is a guess and is asked for (a
+  single-valued parameter whose value is not named still takes it, as before). Read-only actions are not checked by core
+  (as with the negation veto); the keyword decider checks them.
+- **Numbers and durations: a span is one value or one invalid candidate** (replaces "Numbers are read whole" of round 2
+  where it differs). A connected numeric expression — digits, number words, signs, separators, fractions,
+  point/komma, "and a half", units, in any mix — is one span; either the whole span reads as exactly one value, or it is
+  one candidate with value NaN (asked for again). The scanner never resumes inside a span and never offers part of one.
+  "one hundred 40 percent", "one point twenty five percent", "1.234,5 percent", "forty 5", "five five", "3 and 5", "3-5",
+  "3 - 5", "five minus three" are each one invalid span (round 2 read "five five", "3 and 5" and "3-5" as two numbers).
+  A span with a duration unit is a duration, not a number (and the other way round). `ValueCandidate` gains optional
+  `start`/`end` offsets; `numericSpans` is exported. `parseDuration` takes exactly one duration.
+- **Replies to a pending question** (replaces round 2's "a reply … that is a command of its own is planned afresh" and its
+  core rule). Core reads the reply from its text and the pending question alone (`ReplyReading`, in
+  `DecisionPlan.pending.reading`): it is an answer only if it is nothing but the value (exactly one number span read by
+  the parser, or the names of exactly one option, or text after a marker), optionally the question's own words (the
+  parameter's label and unit, the spoken question, the action's vocabulary, the names of values already decided) and
+  fillers. Any other word — an unknown place, another option, a different verb, another number — makes it `other`: it is
+  then planned as a fresh request with no memory of the pending one (and is acted on only if that fresh request passes
+  the accounting rule). The provider's "answers the question" (and, for a choice, its choice of option) can only confirm
+  core's reading, never replace it. "the attic 40" after "What brightness?" for the kitchen is handed on; "the kitchen
+  40", "set it to 40", "op veertig graag" still answer. The `answers` role carries core's `reading`, and the keyword
+  decider confirms exactly what core accepts.
+- **Confirmations: a closed phrase grammar** (replaces "a pending confirmation is accepted only on a bounded
+  affirmative" and the word bag). `isConfirmation(text)`: `filler* affirmative (filler | affirmative)*` with phrases from
+  `yes` ("yes", "sure", "ok", "ja", "prima", "go ahead", "do it", "doe maar", "ga je gang", …) and `yesFiller` ("please",
+  "thank you", "alsjeblieft", …), nothing else, no negation, no question mark. Interrogative forms ("is that right", "is
+  that okay", "do you", "shall I", "zal ik", "klopt dat") are not in the grammar, so they never confirm, with or without a
+  question mark; a bare "right", "go" or "do" does not confirm either. A provider's no still cancels. `isAffirmative`
+  applies the same grammar to words already split.
+- **Negation and prohibition** (extends round 2's veto). `negation` now lists contractions with and without apostrophes
+  (dont, doesnt, wouldnt, shouldnt, mustnt, cant, couldnt, wont, …), a contraction split by the recogniser ("don t"),
+  "without", "except", "unless", and Dutch nergens, niemand, zonder, behalve; the new `prohibition` list (stop, quit,
+  cease, cancel, abort, avoid, refrain, forget, skip, prevent; Dutch stoppen, hou/houd (op met), ophouden, annuleer,
+  vermijd, vergeet, staak, voorkom, genoeg) vetoes a side effect the same way (`Fallback` `negated`), except a word that
+  is in the action's own vocabulary ("stop the timer" for a "Stop the timer" action). Because of the accounting rule, a
+  negation in no list ("nimmer", "ne'er") also fails, as an unexplained word.
+- **Offline keyword decider: the same rule for a fresh request.** `fits` is 0.2 (below `fitsAccept`, so never acted on)
+  when the best action leaves any word unexplained; core computes the unexplained words per action and passes them in the
+  `fits` role (`unexplained`); Jev never sees roles. Expect more sentences handed to the conversational agent; that is
+  the intended trade.
+- **Promotion of an intent turn compares the words strictly** (replaces round 2's "Promotion compares values" for intent
+  turns). A turn routed to an intent agent is promoted only if the final transcript equals the eager one after
+  lowercasing, collapsing whitespace, and removing sentence-final punctuation and commas between words
+  (`strictTranscript`); anything else ("five" → "-five", any change in a number, a word added or dropped) discards the
+  speculative turn and plans the final transcript afresh. Conversational agents keep `normalizeTranscript`.
+- **Stop cancels the open utterance, with or without a turn** (replaces round 2's "Stop cancels an utterance, not a
+  transcript" where it differs). `Conversation` tracks the utterance being spoken apart from any reply fiber:
+  `SpeechStarted` or an eager transcript opens it, `TurnResumed` keeps it open, its `EndOfTurn` closes it. Stop cancels
+  it whether or not a turn exists — before the first eager transcript, or between speculative replies after
+  `TurnResumed`. A `SpeechStarted` inside the cancelled utterance does not lift the cancellation; one after its
+  `EndOfTurn` does, as do typed text and `Say`; the 20 s lapse stays.
+- **Option lists are read once per plan, failures included.** The cache is keyed by the parameter's own identity (the
+  pending answer is planned with an "as required" flag instead of a copy of the parameter), a list that throws is
+  remembered as failed, the pending answer and reading are built once inside the protected block, the dynamic values a
+  pending intent chose are checked there against the same snapshot (the intent agent no longer calls `pendingStillValid`
+  before planning), and a pending intent whose action the plan left out as unavailable is dropped, never run.
+- **History bound** (core): see "History bound" in `docs/ARCHITECTURE.md` (32 turns, evicted 8 at a time, 48 000
+  characters, 8 000 per item; `ConversationOptions.history`). `AgentTurnInput.historyStart` (new, optional) is the number
+  of messages evicted before `history[0]`; a harness agent's catch-up must keep its position in those absolute numbers.
+
+Interfaces changed: `IntentWords` gains required `prohibition` and `filler` (code that builds the object literally must
+add them; `extendIntentWords` is unaffected); `IntentOutcome` `Fallback` reason gains `unexplained`; `DecisionPlan`
+gains `accounting` and `pending.reading`; `QuestionRole` `fits` gains `unexplained?`, `answers` gains `reading?`;
+`buildDecisionPlan` takes `words?`; `ValueCandidate` gains `start?`/`end?`; new exports `isConfirmation`, `isProhibited`,
+`strictTranscript`, `HistoryLimits`, `DEFAULT_HISTORY_LIMITS`, `numericSpans`, `unexplainedForRequest`, `ReplyReading`
+and the `Accounting.ts` helpers.
+
+Commands that used to work and are now refused or asked about (all handed to the conversational agent unless noted):
+a stray word in a command ("turn on the kitchen lights quickly", "… for my mother"; fillers such as "please" or "now"
+are fine); a
+second number ("dim 3 lights in the kitchen to 40 percent", also "… 140 percent", which used to ask); a room the module
+does not know ("turn on the bedroom lights" with only a kitchen: handed on, used to ask); two numbers next to each other
+("rooms 3 and 5", "3-5": asked for again); a provider's room the sentence does not name ("turn on the bedroom lights"
+when the provider says kitchen: asked); "right" alone, "go" or "do" as a confirmation; a reply that adds anything to the
+value ("40 percent quickly", "the kitchen at 40 percent"); and a speculative intent turn whose final transcript differs in
+anything but case, spacing, final punctuation and commas (decided again, about 250 ms later).
+
+Cost, measured (`AccountedFor.test.ts`, `keywords.test.ts`, this machine): planning plus interpretation with core's
+accounting ≈ 50 µs per sentence (5 actions); the keyword decision ≈ 130 µs (7 actions; memoised criteria, stems and
+phonetic keys); no extra decision request.
+
+### Review fixes, fourth round (core, intent path) — 2026-11-14
+
+A fourth review scripted a decision provider to give the most harmful confident answers and found six ways through
+round 3's rule, plus one small gap. They had one cause: the accounting checked that every *word* was covered by
+*something*, not that each piece of the sentence is used for exactly one purpose, in a form that means what the action
+needs. This round closes that. The rule of round 3 stands; these are its four parts now. Each line replaces what the
+entries above or the sections below say.
+
+- **Every character is accounted for, through one normalisation** (`packages/core/src/Utterance.ts`). The value
+  parser, core's accounting, the confirmation grammar and the promotion of a speculative intent turn all read
+  `canonicalUtterance(text)`: the original (NFC, case kept) with only the closed set of ignorable punctuation removed —
+  `.` `!` `…` `;` `:` before a space or the end; `,` before a space or the end unless a neighbouring word is part of a
+  number (`isNumericWord`, `NumberWords.ts`); quotation marks; a dash between two letters ("twenty-one") — and
+  whitespace collapsed. Every other mark stays and must be accounted for: consumed by the number span it belongs to (a
+  sign of any dash kind before a number; a decimal mark glued before a digit group, ".5", read as 0.5; "%" and "°" after
+  it; a separator between digit groups), the final "?" of an asking request construction ("can you …?"), punctuation
+  that is part of an option's own name, or a comma outside numbers (`IGNORABLE_OUTSIDE_NUMBERS`). Anything else — "?"
+  after an imperative, "+40", "4:30", "#2", "&", a dash glued to a word — makes the request unaccounted. Signs: "-",
+  "−", "﹣", "－" are a minus; any other dash before a number (U+2010–U+2015, U+FE58) makes the number unreadable (NaN,
+  asked again). A trailing "." after a number followed by a space ("5. percent") is sentence punctuation, so 5; glued
+  ("5.percent") it is in no span and the request is handed on. Promotion of an intent turn (`strictTranscript`, now
+  `canonicalUtterance`) compares canonical texts exactly: "yes" and "yes?", "5" and "–5", "5" and ".5", a change of
+  case, or a comma next to a number are different transcripts (the final one is decided afresh); "Yes." and "Yes" are
+  the same. `isConfirmation` reads the canonical text and refuses any mark but a comma.
+- **Each span has exactly one role** (`assignRoles`, `Accounting.ts`). Per offered action, the names of its options
+  (all matches, `allOptionMentions`) and every number span are assigned roles longest first: a span inside a strictly
+  longer one is consumed by it ("room two" names a room, so its "two" is no number; "two hundred percent" is a number,
+  so a room called "Two" inside it is not named); the same option found twice over the same words is one candidate;
+  any other overlap (two options, or a name and a number, over the same words; spans that cross) leaves every span
+  involved ambiguous: no parameter may use it, and it is covered only when a parameter it could fill is being asked
+  about, so the result is a question. Number and duration candidates are only those whose span keeps the number role
+  (`DecisionPlan` plans each action's numbers against its own roles). In the interpretation, a parameter filled from
+  words another parameter's value uses (one number for two parameters, text taken over an option's name), or two
+  numbers that two parameters could each take either way ("set the colour to 40 at 60"), make those parameters
+  missing: ask. One action per sentence: a request that another offered, non-read-only action of a different kind
+  (other label stems) explains fully, with no more questions and at least as many of its own words, is handed on
+  (`Fallback` `uncertain`: "turn the kitchen lights" — on or off?; "set the kitchen to 20" — brightness or heating?;
+  "switch everything off" stays the confirmed `all_off`, whose own words explain more than `lights_off`'s value does).
+  A fresh request must contain at least one of the action's own words (a room alone is no command).
+- **A value carries its unit, and the unit must fit** (`unitFits`, `paramUnit`, `ValueParsing.ts`). The parser
+  reads the unit said with a number (`ValueCandidate.unit`, `NumericSpan.unit`: "percent" for percent/procent/pct/%,
+  "degree" for degree(s)/graad/graden/°); core reads it from its own spans too, whatever a parser reports. A number is
+  a value of a parameter only with no unit said, or the parameter's declared unit by closed aliases (percent: "percent",
+  "%", "procent", "pct", "percentage", "per cent"; degree: "degree(s)", "°", "graad", "graden", "celsius", "°c",
+  "degrees celsius", "graden celsius"; any other declared unit as written). "40 degrees" is not a brightness in percent,
+  and a number with a unit is not a value of a parameter that declares none; such a number is an unexplained span
+  (handed on), also as the answer to "What brightness?". Durations are unchanged (a number unit in a duration span is
+  NaN; a number span is no duration).
+- **Fillers are positional, and a sentence must be a request** (`requestFrame` and `account`, `Accounting.ts`; lists in
+  `IntentWords`). `filler` now holds only words neutral anywhere: articles, "my"/"our"/"mijn"/"onze", "please",
+  "kindly", "just", "now", hesitations, "even"/"eens"/"nu"/"graag"/"alsjeblieft", and the prepositions that place a
+  value (to, in, at, for, of, into, op, naar, voor, van, bij, te); a preposition, article or possessive must be followed
+  by what it places ("… lights for my" was cut off). Positional, closed lists: `opening` (hey, hi, hello, ok, okay,
+  well, so, oh, hoi, hallo, nou, zo, goed; only first), `askFrame` ("can/could/will/would you", "kun je", "kunt u",
+  "kan je", "wil je", "wilt u", "zou je", "zoudt u", …; only at the start; accounts for one final "?"), `wantFrame`
+  ("I want", "I want you to", "I'd like (you to)", "I would like (you to)", "let's", "ik wil (graag)", "ik zou (graag)
+  willen", …; only at the start), `manner` (only first or last) and `closing` (only last), and `replyFiller` ("it",
+  "make", "maak"; replies only). The body between them is the action's words and its values. Words that build
+  sentences (conjunctions, pronouns, auxiliaries, modals, question words: `STRUCTURAL_WORDS`) are never part of a
+  side-effect action's vocabulary, even when its description uses them ("… or every light"). The action's verbs (the
+  first word of its label or an example, used nowhere later in them, naming no value: "turn", "switch", "dim", "set",
+  "doe", "zet") must come before any other content word ("the kitchen lights turn on" is a statement). `stemWord` no
+  longer strips -ing and -ed ("turning on …", "… turned on" are not the imperative). So statements ("I like the kitchen
+  lights on"), questions about the world ("will the kitchen lights turn on", "did you turn on …"), reported speech ("he
+  said turn on …") and conditionals ("if it gets dark …") are handed on; "can you turn on the kitchen lights?" acts.
+  Read-only actions keep a lenient reading for a provider's `fits` role only (`mode: "question"`, round 3's word list
+  `QUESTION_FILLER`): core never acts on it, and they do not compete with side effects.
+
+Findings: (1) eager "yes", final "yes?" — promotion compares canonical texts, so the turn is decided afresh and "yes?"
+is no confirmation (`ConversationRound4.test.ts`, end to end through `makeIntentAgent`); (2) ".5 percent", "–5
+percent" — consumed by the span, 0.5 and NaN, asked again "I can't use … What brightness?"; (3) "dim room two" asks for
+the brightness, and "room two" as the answer to "What brightness?" is no number; (4) "40 degrees" is no brightness;
+(5) "I like the kitchen lights on" and "will the kitchen lights turn on" are handed on; (6) an `EndOfTurn` (or
+`EagerEndOfTurn`) with empty or blank text closes the open utterance and any Stop attached to it, discards a
+speculative turn and starts nothing — no agent request, no history entry, no canned reply — for every agent kind
+(contract: an utterance for which `SpeechStarted` was sent always ends with an `EndOfTurn`, text "" when no words were
+recognised; the recognisers are changed by others; `SttEvent` comment and `docs/ARCHITECTURE.md` updated). No sounder
+defence than the 20 s lapse exists against a recogniser that never closes an utterance: `Conversation` sees events and
+their times, not audio, so it cannot tell a `SpeechStarted` that begins a new utterance from one a recogniser repeats
+inside the stopped one, nor long speech without events from silence; a rule that lifted the cancellation on a second
+`SpeechStarted` or after a gap would let the rest of a stopped utterance act; (7) a pending question or confirmation is
+kept only if its action is among the actions this plan offers (at most 255, lists readable), not merely enabled.
+
+Usability, each by a closed list: a trailing politeness phrase (`closing`: "please", "thanks", "thank you (very
+much)", "thanks a lot", "many thanks", "cheers", "for me", "alsjeblieft", "alstublieft", "graag", "dank je (wel)",
+"dankjewel", "dank u (wel)", "dankuwel", "bedankt", "voor mij", "voor me") after a complete request; a leading or
+trailing manner word (`manner`: "quickly", "now", "right now", "immediately", "right away", "snel", "nu", "even",
+"meteen", "nu meteen", "direct"). Not: text after "please", a manner word inside the request ("turn on quickly the …",
+"doe snel het licht aan"), politeness first.
+
+Tests: `packages/core/test/AccountedRound4.test.ts` checks every row against every confident answer a provider could
+give (each action, each option combination, "answers" yes and no): the seven findings, a table per rule (rule 1: every
+dash and minus at each edge of a number, decimal marks at each edge, "?", "!" and "." on commands and confirmations,
+eager and final; rule 2: option names with number words, fillers, a yes-word, a unit, crossing and equal spans, one
+number for two parameters; rule 3: every number unit against brightness, heating, colour and timer parameters, in
+requests and replies; rule 4: statements, questions about the world, reported speech and conditionals made only of
+individually allowed words, and the request constructions), the usability lists, and a property: 400 sentences made
+from five valid commands (English and Dutch) by 1–3 random insertions, deletions, substitutions and glued marks drawn
+from all the closed lists, number words, units, option names, yes-words, negations and punctuation; for every
+sentence and every confident answer, an outcome with a side effect occurs only if the sentence is a valid command —
+after removing ignorable punctuation, free fillers, and the closed request construction at its edges, exactly one
+room name, the action's particle and at most a verb (first) and a light word, or for brightness a verb, the room and
+40 with an optional unit, as written out in the test — and then only with that command's action and values. Result:
+62 of the 400 were valid, 54 were acted on, 0 violations (the first runs found that function words of descriptions
+and dangling prepositions let truncated commands act; both are fixed above).
+
+Interfaces changed: `IntentWords` gains required `opening`, `askFrame`, `wantFrame`, `manner`, `closing`,
+`replyFiller` and `filler` shrinks to free words (`extendIntentWords` merges them all); `ValueCandidate` gains
+`unit?`; `NumericSpan` gains `unit?`; `ParamPlan` `missing` gains `start?`/`end?`; `DecisionPlan` gains `text` (the
+canonical text, which offsets refer to) and `explained`; `ActionAccounting` gains `text`, `marks`, `verbs`, `values`,
+`ambiguous`, `reserved` (its `numbers` carry character offsets and units); `unexplainedForRequest` takes `asked?`;
+`parseValues` reads the canonical text (candidate text and offsets refer to it: "twenty-one" is "twenty one"); new
+exports from `Utterance.ts` (`canonicalUtterance`, `readUtterance`, `sameUtterance`, `DASH`, `MINUS`,
+`IGNORABLE_OUTSIDE_NUMBERS`, `Mark`, `Utterance`), `Accounting.ts` (`allOptionMentions`, `assignRoles`, `NUMBER_ROLE`,
+`actionWords`, `requestFrame`, `account`, `STRUCTURAL_WORDS`, `QUESTION_FILLER`, `mentionChars` and their types) and
+`ValueParsing.ts` (`unitFits`, `paramUnit`, `NumberUnit`); `stemWord` keeps -ing and -ed.
+
+Commands that used to work and are now refused or asked about (handed to the conversational agent unless noted): a
+"?" after a command without an asking frame ("turn on the kitchen lights?", "I want … on?"); pronouns, modals and
+discourse words outside the request construction ("turn it on", "make the kitchen 40 percent" — "make" is a reply
+word now —, "also turn on …", "… too", "then …"); a fresh request with no action word ("the kitchen", "the bedroom 40"
+after "What brightness?" for the kitchen); a request two actions explain alike ("turn the kitchen lights", "kitchen
+lights", "lights"; "switch everything off" when the provider picks `lights_off`; "set the kitchen to 20" when a
+heating action exists); a command ending in a preposition, article or possessive; -ing and -ed forms; a verb after
+another content word ("in de keuken doe het licht aan"); a number with a unit for a parameter of another unit or of
+none; "5.percent", "5,percent", "40,5" for an integer parameter (asked); one number for two parameters, or two
+unit-less numbers for two parameters (asked); and a speculative intent turn whose final transcript differs in case,
+in a mark the canonical text keeps, or in a comma next to a number (decided again, about 250 ms later).
+
+Cost, measured on this machine (no extra decision request): plan plus interpretation ≈ 114 µs per sentence with 8
+actions (`AccountedRound4.test.ts`) and ≈ 70 µs with 5 actions (`AccountedFor.test.ts`; round 3: ≈ 50 µs); the
+keyword decision ≈ 142 µs (7 actions).
+
+### Review fixes, fifth round (core, intent path, tools) — 2026-11-14
+
+A fifth review found three more ways through the rule, plus gaps in round 4's property test (its oracle reused the
+production word lists and frame stripping, so it accepted what the code accepted). Each line replaces what the entries
+above or the sections below say.
+
+- **Every promotion compares canonical texts** (replaces round 3's "Conversational agents keep `normalizeTranscript`").
+  Whatever agent kind planned a speculative turn, it is promoted only if the final transcript is canonically the same
+  as the eager one (`sameUtterance`); `normalizeTranscript` is removed. Before, a turn planned for a model agent used
+  the looser comparison and could still reach an intent agent by `Handoff` or failure fallback: "hey jev switch
+  everything off", then eager "yes" to `main`, `main` hands off, jev reads "yes" as the confirmation, final "yes?" —
+  promoted, and everything was switched off (`ConversationRound5.test.ts`). Cost, measured over every eager/final pair
+  that the core, agent-intent, modules-builtin and assistant test suites send (49 pairs): 38 promotions before, 27 now;
+  the 11 lost were all model turns, and differed only in a sentence-final "?" added (7, four of them with a capital
+  first letter as well) or a capital first letter alone (4, the final "." or "!" being ignorable either way; one also
+  dropped an apostrophe, "what's"/"whats"). So the looser rule differed from the strict one not only on
+  end-of-sentence punctuation but also on capitalisation. Recorded runs: the 105 live bench turns in `bench-out/`
+  (stt-sherpa, 5 configurations) were all promoted, and stay so: sherpa's eager transcript is the very text its
+  `EndOfTurn` carries when the user does not resume. stt-deepgram's eager and final transcripts may differ in case or
+  punctuation; that is unmeasured (no recordings). A lost promotion costs one fresh decision on the final words
+  (≈ 250 ms later), not a wrong action.
+- **Characters belong to the span that won their words** (`Accounting.ts`, `Decision.ts`). Only a number span that
+  kept the number role and is in use consumes its sign, decimal mark and unit; a number absorbed into an option's name
+  gives them back, so "turn on room -two", "room –two", "room two%", "room two°", "the forty° degrees lamp" are not
+  accounted for (they acted on "Room two" / "Forty degrees lamp"). The accounting now asserts a **partition**
+  (`partitioned`, inside `account`): every character of the canonical text is owned by exactly one winning value span
+  (its words and the marks it consumes), a word outside values (already given its role), or the closed ignorable set
+  (a single space, a comma before a space outside every winning span, the final "?" of an asking frame). Two winning
+  spans claiming one word or mark, or a character nobody owns, reports `NOT_PARTITIONED` and the sentence is not
+  accounted for (tested directly in `AccountedRound5.test.ts`).
+- **An unfinished request is never acted on.** `requestFrame` no longer strips a dependent filler (article,
+  possessive, preposition: `DEPENDENT`) at either edge, so it stays in the body, where it must be followed by what it
+  places: "turn on the kitchen lights for my", "… at", "… to", "… for", "… for my please", "… to now" are handed on. A
+  dependent right before the verb places nothing either ("at set the kitchen …", "the dim the kitchen …").
+- **A number after a time or condition word is no value** (`TIME_BEFORE_NUMBER`, `TIME_BEFORE_DURATION`): after "at",
+  "by", "until", "till", "after", "before", "around", "since", "from", "past", "in", "within", "om", "tot", "na",
+  "voor", "vanaf", "rond", "omstreeks", "sinds", "tegen", "uiterlijk", "over", "binnen" a number is no candidate for a
+  number parameter; for a duration parameter the same words count except "in", "within", "over", "binnen", "voor". One
+  exception: "at" with the parameter's own unit said is a value ("at 50 percent"; "by 10 percent" is a change, not a
+  level). So "dim the kitchen at 7", "… at seven", "at 7" as the answer to "What brightness?" are not acted on.
+- **An empty `EagerEndOfTurn` does not end the utterance** (corrects round 4's description, which said it did; the code
+  already behaved so). It discards a speculative turn and starts nothing, but the utterance stays open and a Stop
+  stays in force until its `EndOfTurn` (or the 20 s lapse): an eager event, outside the contract, must never lift a
+  cancellation. Stated with `SttEvent` and in `docs/ARCHITECTURE.md`.
+- **Holes the new property found, fixed:** a cut-off word named an option by stem ("turn on the kitch"; a said word
+  shorter than the name's word no longer matches by stem); phonetic keys dropped every non-ASCII character ("room
+  t٠wo" sounded like "room two"; phonetic keys only for plain letters); `normalizeWord` used compatibility
+  decomposition, so "4²" read as 42 and "４０" as 40 (now NFD); a comma inside a name or glued to a word was ignorable
+  ("dim the room, two to 40", ",dim …"); an article was skipped inside a name where the name has none ("forty the
+  degrees lamp"); "seventy- five" / "seventy‑ five" read as 75 (a hyphen counts only glued on both sides); an action
+  was chosen by its rival's range ("set the kitchen to 35" set the brightness because 35 is no temperature: an
+  out-of-range number is no missing value in the one-action check); "-0" and "minus zero" were 0 (a signed zero is in
+  no range); ",0" and ".0" were 0 (a leading decimal mark needs a non-zero digit); a quote inside a word split it
+  ("a`t 82" became "a t 82", escaping the time rule; a quote between two letters or digits is a mark);
+  `isConfirmation` accepted a glued comma (",nu correct yeah", "yes,ok"; it now refuses every mark the canonical text
+  keeps); a broken longer name fell back to a shorter name inside it ("the lamp in in the hall" acted on "Hall", "the
+  desk to lamp" on "Desk"; `shadowingOptions` makes such a mention ambiguous, so it is asked); "t" ('t) right before a
+  number word ("for t eight seconds", cut from "thirty eight") is unexplained.
+- **Confirmation is enforced for action tools** (supersedes "not enforced: §7" above). See §3.2: for an action declared
+  `confirm: true`, the first call of its generated tool only records the request and tells the model to ask; the action
+  runs on a later turn's call with the same values when that turn's words are a confirmation (`isConfirmation`) and the
+  pending confirmation is still valid by the intent path's rules. One pending question or confirmation per conversation
+  (`PendingIntents`, created by `Conversation`, `AgentTurnInput.pendingIntents`), shared by the intent agent and the
+  tools; a committed turn whose words are not a confirmation ends a pending confirmation of an earlier turn, whichever
+  agent answers it.
+
+**The property** (`PropertyRound5.test.ts`, replacing round 4's): valid commands are built from templates in literal
+data — opener, verb phrase, one target written as an option's name, a value with its unit, closer — with their meaning
+recorded as they are built, for a house whose names contain number words, digits, fillers, a yes-word, a unit and
+prefixes/suffixes of other names; nothing is imported from the production word lists. A sentence must act iff it is an
+instance (looked up in the full set of instances, never parsed) and then with its recorded meaning, against every
+confident provider answer, fresh, as the answer to "What brightness?" and to "Switch everything off?". Edits: insertion,
+deletion, substitution, transposition and duplication of words; insertion of 76 literal symbols (every dash and minus,
+decimal marks, `% ° ? ! & / @ # + =`, brackets, quotes, zero-width and non-breaking spaces, full-width, Arabic-Indic and
+Devanagari digits) at every position of six probe sentences; character deletion, duplication and truncation; truncation
+after every word and character; a second number, a unit swap, a sign flip; negations, prohibitions, times and
+conditions. The design's tolerances (an article or value preposition before a value, a stutter, "lights"↔"light", the
+verb left out, the unit word anywhere, a recogniser's doubled letter) are decided from the roles the tokens were built
+with (`benignMeanings`); such a result may act with the base meaning but need not. Promotion: an eager instance and a
+final one edit away are promoted (`sameUtterance`) only if they are the same instance. All quoted inputs of rounds
+1–5 run as fixed regressions in all three contexts. 3 000 random edited sentences plus the exhaustive parts, seed
+20261114 (printed on failure; `PROPERTY_SEED`, `PROPERTY_CASES` override), ≈ 18 s on this machine; 216 of the 3 000 edited sentences are instances, 281 act, 0 violations; 0 also for seeds 1–7
+and 12. Confirmation questions asked on non-instances ("switch off", "lights" → "Switch everything off?") are counted, not
+failed: asking runs nothing, and only a reply in the closed grammar confirms.
+
+Interfaces changed: `AgentTurnInput.pendingIntents?` (new, optional); new `PendingIntents.ts` (`PendingIntents`,
+`PendingEntry`, `makePendingIntents`, `confirmingTools`, `ConfirmingContext`, `PENDING_MS`); new exports
+`confirmQuestion`, `actionValues`, `shadowingOptions`, `NOT_PARTITIONED`, `TIME_BEFORE_NUMBER`, `TIME_BEFORE_DURATION`;
+`normalizeTranscript` removed; `normalizeWord` uses NFD; the generated tool description of a `confirm` action says the
+first call does not run it.
+
+Commands that used to work and are now refused or asked about (handed on unless noted): a speculative turn of any agent
+whose final transcript differs in case or a final "?" (decided again from the final words); a number after a time or
+condition word, without the parameter's unit after "at" ("dim the kitchen at 7", "set the kitchen colour to 40 at 60",
+"room two at 40" as a reply); a unit-less number outside one rival's range ("set the kitchen to 35" with a heating
+action); a request ending in an article, possessive or preposition, also before politeness or a manner word; an article
+or preposition first or right before the verb; a name said cut off, with a glued comma or mark, with an article where it
+has none, or broken by an inserted word when a shorter name lies inside it (asked); "-0", ".0", ",0" (asked); superscript
+or full-width digits; "seventy- five" (asked); "'t" before a number; a confirmation with a glued comma; and an action
+with `confirm: true` called by a conversational agent: it now takes a confirmation from the owner and a second call.
+
+Cost, measured (this machine): plan plus interpretation ≈ 110 µs per sentence with 8 actions (`AccountedRound4.test.ts`)
+and ≈ 65 µs with 5 actions (`AccountedFor.test.ts`); the keyword decision ≈ 126 µs (7 actions) — the same as round 4
+within noise; no extra decision request. A confirming tool call adds a map lookup and one `isConfirmation`.
+
+### Review fixes, sixth round (core, intent path, tools) — 2026-11-14
+
+A sixth review (a different model) found the fifth round's tool confirmation unsound and three other problems. Each line
+replaces what the entries above or the sections below say.
+
+- **Confirmation is an interaction core conducts** (finding 1, 2; replaces round 5's "Confirmation is enforced for
+  action tools"). The model is no longer in charge of asking or of calling again: see §3.2. Proposal → core's question →
+  armed when presented → the next committed turn is offered to it before routing → one consumption operation
+  (`consumeConfirmation`) immediately before execution. Round 5's second-call mechanism (`confirmingTools`,
+  `PendingIntents.committed`) and its tests are removed. The reviewer's probes now fail to run anything: a proposal
+  followed by a `Handoff` in the same turn ends the agent's stream at the proposal (no fallback runs, and the intent
+  agent never acts on a `confirm: true` action anyway — it proposes); an eager "yes" at 14 s and its final at 16 s after
+  arming is consumed at promotion with the clock read then, the window has closed, and the turn is answered as a fresh
+  request; a "yes" can only answer the action's own question, because core asks it and nothing follows it.
+- **One pending slot, newest wins.** The conversation's `PendingIntents` holds either the intent agent's parameter
+  question or an armed confirmation. A confirmation armed after a question replaces it; a question stored after a
+  confirmation replaces it (and any committed turn that does not answer a confirmation drops it). A new proposal while one
+  is pending drops the older one when its turn commits, and its question is the one the owner hears. The intent agent
+  ignores a confirmation in the slot.
+- **Every route that can run an action's `run`:**
+
+  | Call site | `confirm: true` action |
+  |---|---|
+  | Intent agent, act path (`IntentAgent.ts`) | never run: a `Confirm` outcome, or an `Act` of such an action, emits `ConfirmAction` (a proposal) |
+  | Generated tool (`actionTool` execute, `Actions.ts`) | always refused (error result), whoever holds the registry |
+  | `Conversation`'s tool wrapper (`proposingTools`, every model and harness agent's `AgentTurnInput.tools`, the single-model `Conversation.layer` too, via `ToolRegistry.actionFor`) | turned into a proposal, never run |
+  | Core's confirmation answer (`runConfirmed`, `Conversation.ts`) | runs only after `consumeConfirmation` succeeds, at execution time |
+  | `ModuleHost.fieldAction("test")` (`testAgent`, `testDecider`) | runs no module action (an agent with no tools; a decision over its own no-op fixtures) |
+  | `apps/assistant`, other packages | no direct call of `run` or of a registry's `run` outside `Conversation` (searched) |
+
+- **Possessives and meaning-bearing suffixes** (finding 3). `words()` marks a word said with a possessive suffix and its
+  apostrophe (`Word.possessive`: "bedroom's", "kids'"; the norm still drops the apostrophe). An option's name word is
+  named by the same word, the same sound, or a plural (-s, -es after a sibilant, -ies) — no longer by any stem: -en,
+  -er, -ing, -ed, -je and cut-off forms name nothing ("wooden" is not "Wood", "listen" not "List", "lampje"/"lampen" not
+  "Lamp"). A possessive, or a bare plural, as the last word of a mention is a DEPENDENT form (`WordSpan.possessive`): like
+  an article it must be followed at once by a content word of the action that it possesses ("turn on the bedroom's
+  lights" acts); at the end, or before a filler, preposition, closer or manner word ("turn on the bedroom's", "… the
+  bedroom's please", "dim the bedroom's to 40 percent", "turn on the living room's") the request is not accounted for. A
+  name with an apostrophe of its own ("Kids' room", "Mary's") still matches with or without it. A bare trailing
+  "bedrooms" is treated as possibly "bedroom's" with the apostrophe dropped (recognisers drop it): handed on. It is also
+  a plausible plural, but a plural of a single named room or lamp is rare in a command, so the cost is small and an
+  unfinished sentence never acts.
+- **A transcript with no utterance open is ignored** (finding 4). `EagerEndOfTurn`, `TurnResumed` or `EndOfTurn` with
+  no `SpeechStarted` since the last `EndOfTurn` starts, promotes, discards and interrupts nothing (logged at most once per
+  10 s). Stated with `SttEvent` and in `docs/ARCHITECTURE.md`. Typed text, `Say` and Stop are unaffected. stt-sherpa keeps
+  the contract (it sends `SpeechStarted` before an eager or final transcript of a turn it had not opened). stt-deepgram
+  does not in three places after a reconnect (see "Not held" below). The scripted fakes of `@pva/core/testing`
+  (`scripted`, `makeScriptedStt`) insert the `SpeechStarted` a contract-keeping recogniser sends (`withSpeechStarted`;
+  `scriptedRaw` sends events as written; `sttContractKeeper()` for fakes that emit in several calls).
+- **The property** (finding 5). `benignMeanings` no longer allows a broken longer name to fall back to a shorter name
+  inside it, nor a time or condition word right before the number ("dim the lamp in the to hall to 40 percent", "dim
+  the kitchen in 40 percent"); the round 6 sentences are fixed regressions. New end-to-end property cases
+  (`ConversationRound6.test.ts`) run the real `Conversation` with recogniser events: eager and final transcripts one
+  mutation apart, direct, across a hand-off and a failure fallback, with and without an armed confirmation; an action
+  runs only when the final transcript alone (run in a fresh conversation) runs it.
+- **`PlaybackObserver.final`** (agreed with the audio fixer). When called, the clauses heard are recomputed from that
+  count and may shrink, before history is committed; later `progress` is ignored; the confirmation question's arming
+  uses it. A `ClausePlaying` already emitted for a clause found not heard is not recalled: the UI keeps showing that
+  clause as played while history (and what agents see) leaves it out. **For the lead:** a protocol event
+  ("clauses heard: n", or `ClausePlaying` with a lower index) would let the UI correct it; none was added.
+
+Interfaces changed: new `AgentEvent` `ConfirmAction`; `PendingEntry` gains `armedAt?`, `agentId?`; `PendingIntents`
+loses `committed`, gains `dropConfirmation`; `makePendingIntents()` takes no words; removed `confirmingTools`,
+`ConfirmingContext`; new `proposingTools`, `ProposalContext`, `PROPOSED_RESULT`, `consumeConfirmation`,
+`confirmationAnswer`, `isConfirmationEntry`, `needsConfirmation`, `CONFIRM_WINDOW_MS`, `checkedActionValues`,
+`CONFIRM_CANCELLED_TEXT`, `PROTOCOL_LOG_MS`; `Tool.action?`, `ToolRegistry.actionFor?`; `Word.possessive?`,
+`WordSpan.possessive?`; conversation options `confirmWindowMs?` and `intentWords?` (give the conversation the same lists
+as `makeIntentAgent({ words })` when a household extends them: confirmations are core's now); `@pva/core/testing` gains
+`scriptedRaw`, `withSpeechStarted`, `sttContractKeeper`, and `scripted`/`makeScriptedStt` insert `SpeechStarted`.
+
+Commands that used to work and are now refused or asked about: a confirmation through a second tool call (calling the
+tool makes core ask; the answer goes to core); a "yes" to a confirmation that reaches an agent (only core answers it); a
+"yes" over the first clause of a two-clause question, after Stop, or after the window (now counted from the end of the
+question, not from the proposal); the intent agent's `words` no longer decide confirmations (pass `intentWords` to the
+conversation); a possessive or bare plural of a name at the end of a request or before a filler ("turn on the bedrooms");
+a Dutch -en plural or other inflection of a name ("doe de lampen aan" for a lamp named "Lamp"); a final or eager
+transcript without `SpeechStarted` (a recogniser outside the contract).
+
+**Not held / needed outside these packages.** (1) `packages/stt-deepgram/src/FluxConnection.ts`: after a reconnect in
+the middle of an utterance, the continuation can arrive as `EagerEndOfTurn` (its branch never checks `speechStarted`),
+as `EndOfTurn` with text but `started` false (`if (final || started)`), or from `endOpenTurn` with `open && text` and no
+`SpeechStarted`; each is now ignored. Change needed there: emit `SpeechStarted` (and set `speechStarted`) before an
+`EagerEndOfTurn` or `EndOfTurn` whenever `speechStarted` is false. (2) `apps/assistant/test/support/serveHarness.ts`
+`controlledStt().emit` sends finals without `SpeechStarted`; 11 tests of `serve.test.ts` now time out. Change needed:
+`const keep = sttContractKeeper()` and `emit: (...events) => keep(events).forEach(...)`. (3) `apps/assistant` should pass
+the same `intentWords` to the conversation as to `makeIntentAgent` if it extends the lists.
+
+### Review fixes, seventh round (core, intent path, stt-deepgram) — 2026-11-14
+
+A seventh review (a different model) found four high and four medium problems. Each line replaces what the entries
+above or the sections below say; §3.2 now describes the confirmation mechanism as a whole.
+
+- **An answer is eligible only if it began after the question had been played to its end** (finding 1; replaces round
+  6's "armed … when the owner interrupted it after its final clause had started"). What an utterance may answer is fixed
+  at its `SpeechStarted` (typed: at submission) and never improved by later playback reports or a `final` count. Arming
+  needs the question's turn to complete with everything played. An earlier utterance interrupts and drops the question
+  (barge-in) or cannot answer it (no barge-in); a yes from it is answered with `ConfirmTexts.tooEarly`, a no with
+  "OK, I won't." When the proposing turn said anything before the question, the question is preceded by "To confirm:".
+  Outcome by start of the answering utterance (two-clause question, played [0, 200) ms, armed at 200; tests in
+  `ConfirmationRound7.test.ts`, each with barge-in on and off): before any audio — not run; during earlier speech of the
+  turn — not run; during the lead-in — not run; during the first clause — not run; during the last clause — not run;
+  exactly at the end (the speech event is handled before playback ends) — not run; after the end — run; after the window
+  — not run ("too late"); typed during the question or at its end — not run, after it — run; a final count lower than
+  the progress known when the utterance began — not armed; a higher one — not eligible; equal to the whole question —
+  armed.
+- **The question states every value that will be executed** (finding 2): `confirmationQuestion` (§3.2 step 2). A
+  function that leaves a value out, names another option, throws or returns nothing refuses the proposal (nothing asked,
+  the agent told why, `ConfirmTexts.refused` spoken); there is no fallback to a question without the values. A boolean
+  parameter with a module's own text is refused (free text cannot be checked for it). Checked: the only built-in
+  `confirm: true` action is demo-home `all_off` (no parameters, `confirm: true`: asks "Switch everything off?",
+  unchanged); `packages/module-home-assistant/src` declares no `confirm` action, so nothing there is refused.
+- **Validation, consumption and the start of the action are one step at promotion** (finding 3). `resolveAnswer` runs
+  uninterruptibly when the answering turn is committed (started committed, or in the `EndOfTurn` handler before the
+  promotion is released): checks against the present moment, removes the entry, forks the action detached. Only then is
+  anything said: the announcement, then the result or "Done." only after success, a failure as a failure. Interrupted
+  speech or an abandoned text stream does not cancel or lose the action; its real outcome reaches history (§3.2 step 8).
+  The reviewer's probes: a module removed and the clock advanced while the first chunk is paused — the action had
+  already run once, at consumption; a consumer that takes one chunk — the action runs and history records its outcome.
+- **stt-deepgram: duplicates by turn index** (finding 4). Per connection, the highest Flux `turn_index` that ended is
+  kept; any `StartOfTurn`, `Update`, `EagerEndOfTurn`, `TurnResumed` or `EndOfTurn` for that index or a lower one is a
+  duplicate and dropped (logged at most once per 10 s, `DUPLICATE_LOG_MS`). A `SpeechStarted` is synthesised only for a
+  turn not opened and not ended. A new connection starts afresh (indexes are assumed, not documented, to restart). A
+  message without an index: a final or eager transcript right after a final, with no start or interim between, is
+  dropped. Never by transcript text.
+- **The single-model API consumes its own confirmations** (finding 5): `layer` / `layerWithSetup` offer the turn's
+  registry's action tools (`ToolRegistry.actionFor`) as the turn's actions; a registry replaced between question and
+  answer holds new registrations, so the answer is "no longer available".
+- **Every answered confirmation is spoken and recorded** (finding 6): "Done." when the action supplies no words;
+  outcome notes in history for ran/failed/cancelled/too early/window closed/no longer available/refused (§3.2 step 8,
+  `docs/ARCHITECTURE.md`). A yes that comes too late or for a vanished action is no longer passed to the agent as a
+  fresh request: core says why.
+- **Action words: no -en stemming** (finding 7). `stemWord` strips only plural/third-person -s, -es after a sibilant
+  and -ies ("listen" no longer matches "List", "lichten" no longer "licht", "zetten" never matched "zet"). Dutch forms
+  an action needs belong in its label, description or examples. Every example of the built-in modules decides exactly
+  as before (checked over every confident answer).
+- **The final count decides history whatever the outcome** (finding 8): a completed turn whose final count is below
+  what was handed over is recorded like an interrupted one, and never arms a question.
+
+Interfaces changed: `confirmationQuestion`, `spokenValue`, `describeProposal` (Decision.ts; `confirmQuestion` now
+returns "" for a refused proposal); `ProposalContext.propose` returns `boolean | string` (the refusal reason);
+conversation option `confirmTexts?: Partial<ConfirmTexts>`, exports `ConfirmTexts`, `DEFAULT_CONFIRM_TEXTS`,
+`DUTCH_CONFIRM_TEXTS` (`CONFIRM_CANCELLED_TEXT` kept); stt-deepgram exports `DUPLICATE_LOG_MS` from `FluxConnection.ts`.
+
+Commands that used to work and are now refused or asked about: a "yes" spoken over the last clause of a confirmation
+question (or at the same moment it ends) — now "the question hadn't finished … please say your request again"; a typed
+"yes" sent while the question is still playing; any `confirm` function that does not name the values it confirms, or
+throws (before: asked with the label) — now refused; a confirmed action with a boolean parameter and its own question
+text — refused; action vocabulary reached only through -en stemming ("listen music" for "List music", "zet de lichten
+aan" when the examples only say "licht"); a Flux transcript repeated for an ended turn.
+
+### After the final review (core) — 2026-11-14
+
+The final review (no further review is available) reproduced two ways for the wrong answer to authorise a confirmed
+action, plus three smaller faults (listed under "Known limitations" at the start of §3.2). Instead of repairing the
+mechanism again, the system now fails closed and the part that is unsound by construction is gone. Each line replaces
+what the entries above or §3.2 say.
+
+- **Confirmation-required actions are off unless enabled.** New conversation option `confirmActions: "off" | "on"`,
+  default `"off"`, read once when the conversation is made (it cannot change during a conversation's life). While off, a
+  proposal of a `confirm: true` action is refused where it would become THE proposal of the turn, before anything can be
+  pending: no question, nothing run. A model or harness gets `CONFIRMATIONS_OFF_RESULT` as its tool result ("… requires
+  confirmation by the owner, and confirmations are switched off in this assistant's settings, so it cannot be run …");
+  the intent agent's `ConfirmAction` takes the existing refusal path. The owner hears `ConfirmTexts.switchedOff` ("I
+  can't do that: it needs a confirmation step, and confirmations are switched off." / "Dat kan ik niet doen: daarvoor is
+  een bevestiging nodig, en bevestigen staat uit."); history gets the usual refused-proposal note with reason
+  `CONFIRMATIONS_OFF_REASON`. A later "yes" is an ordinary message. Actions without `confirm: true`, parameter
+  questions, speculation, promotion, routing and history are unchanged. With `"on"` everything is as described in §3.2.
+  The application passes no value, so confirmations are off; to switch them on it passes `confirmActions: "on"` to the
+  conversation (`makeConversationWithSetup` in `apps/assistant/src/serve/Engine.ts`; `Conversation.layer` in
+  `apps/assistant/src/main.ts` and `voice.ts`).
+
+  | Call site | `confirm: true` action while `"off"` |
+  |---|---|
+  | Intent agent, act path (`IntentAgent.ts`) | unchanged: emits `ConfirmAction`, never runs it; `Conversation`'s `propose` refuses it |
+  | Generated tool (`actionTool` execute, `Actions.ts`) | unchanged: always refused, whoever holds the registry |
+  | `Conversation`'s tool wrapper (`proposingTools`) | `propose` refuses; the call is answered with `CONFIRMATIONS_OFF_RESULT` |
+  | `Conversation`'s `propose` (both routes above end here) | first check: refused before `log.proposal` is set, so no question and no arming |
+  | `armProposal` | no proposal to arm; guarded again (no pending entry while off) |
+  | `resolveAnswer`, the only caller of `startConfirmed` (formerly `runConfirmed`) | second check, at execution, before `consumeConfirmation`: dropped, nothing run |
+  | `ModuleHost.fieldAction("test")` | unchanged: runs no module action |
+
+- **The confirmation question is always core's.** `confirmationQuestion` no longer calls a module's `confirm` function
+  and no longer verifies free text: the question is the label, then each parameter's label and spoken value (a number
+  with its unit: "Set the level: level 40 percent?"), or the label with "?" when there are no values. A `confirm`
+  function still type-checks and is simply not called; the module host logs one warning per such action when the module
+  starts. The round 7 refusals of a module's text (vague, wrong, throwing, empty, boolean) are gone with it.
+
+Interfaces changed: conversation option `confirmActions?`; `ConfirmTexts.switchedOff`; new `CONFIRMATIONS_OFF_REASON`,
+`CONFIRMATIONS_OFF_RESULT` (`PendingIntents.ts`). Commands that used to work and are now refused: every `confirm: true`
+action (demo-home `all_off` among them) while `confirmActions` is not `"on"`.
+
 **Who reads what**
 
 | Reader | Sections |
@@ -683,6 +1318,17 @@ which …?" yes/no question so an unstated value is never guessed. `question` wo
 
 ### 3.2 Actions and tools
 
+> **Known limitations — confirmation is switched off by default.** Actions declared `confirm: true` are refused unless
+> the conversation's `confirmActions` is `"on"` (see "After the final review"). Before switching it on, know that the
+> final review left these open:
+>
+> - An answer begun before the question can become eligible when the echo gate holds back the start of speech in
+>   "confirm" interrupt mode (the conversation records the time of release, not the time speech began).
+> - A quick one-word answer can be lost in the echo gate's tail in "confirm" and "manual" modes.
+> - A module's announcement can assert completion before the action has succeeded.
+> - A harness agent's catch-up can miss an outcome that was corrected after it last read history.
+> - An option renamed between question and answer is recorded under its new name.
+
 **Every action is offered to conversational agents as a tool** unless `offerAsTool: false` (piece C,
 `actionTool(registered)`): name `actionToolName(moduleId, id)` (`demo-home_lights_on`), description = label + description,
 input schema: `choice` → enum of values; `dynamic` → string ("one of the names the owner uses for a room or light"),
@@ -691,6 +1337,61 @@ unresolved name returning an error result that lists the valid names (so a chang
 schema); `number` → number; `duration` → string parsed by the value parser; `boolean` → boolean; `text` → string. The
 tool's `speculative` = the action's. The tool runs `run` and returns `say` (or "ok"). So "turn on the living room lights"
 works through Jev and through any conversational agent, with one implementation.
+
+**Confirmation is conducted by core** (review rounds 6 and 7; this paragraph is the whole mechanism as it now is). An
+action declared `confirm: true` never runs because an agent asked for it.
+
+1. *Proposal.* When any agent reaches the point of running it with complete, valid values — the intent agent after
+   interpretation (it emits the `AgentEvent` `ConfirmAction`), a conversational or harness agent by calling the generated
+   tool (core's wrapper `proposingTools`, `PendingIntents.ts`) — `Conversation` records THE proposal of the turn
+   (registration, values, proposing agent) and stops reading the agent's stream as soon as no tool call waits for its
+   result (text after that is neither spoken nor recorded; further tool calls are refused). A tool call is answered with
+   `PROPOSED_RESULT` ("the assistant is now asking the owner; do not ask or say anything further; you will see the
+   outcome").
+2. *The question states the values* (`confirmationQuestion`, `Decision.ts`), always in core's words (after the final
+   review; a module's `confirm` function is never called): with no values, the label with "?"; with values, the label
+   followed by each parameter's label and spoken value, a number with its unit ("Reset the room: room Bedroom?"). A
+   value that cannot be said REFUSES the proposal: nothing is asked, the tool result tells the agent why, and the owner
+   hears `ConfirmTexts.refused` ("Sorry, I can't ask you to confirm that, so I didn't do it."). While `confirmActions`
+   is not `"on"`, every proposal is refused before this step (`ConfirmTexts.switchedOff`).
+3. *Asking.* Core speaks the question itself as the turn's last words, recorded as the proposing agent's message. When
+   the turn already said anything before it, the question is preceded by `ConfirmTexts.leadIn` ("To confirm:" /
+   "Ter bevestiging:"), so what the owner hears last is unmistakably the action's question.
+4. *Arming.* The question is armed only once it has been played TO ITS END: its turn completed, its final clause was the
+   turn's last and started playing, and the output's authoritative final count (if it gives one) covers everything
+   handed over; in text mode, when its text was delivered and the turn completed. There is no barge-in shortcut. The
+   response window (`confirmWindowMs`, default 15 000 ms) starts at arming. A question interrupted by speech or typed
+   text is remembered unarmed; one that Stop stopped, whose playback failed, or of a discarded turn is forgotten.
+5. *Who may answer.* Eligibility is a property of the answering utterance, fixed when it begins and never improved: a
+   spoken utterance may answer only if, at its `SpeechStarted`, the question was already armed (played to its end
+   according to what was known then — a later final count does not count); typed text only if submitted after arming.
+   An utterance that began earlier (before any audio, during earlier speech of the turn, during the lead-in or any clause
+   of the question, or at the same moment as its end) is not an answer: with barge-in it interrupts the question, which is
+   then never armed; without barge-in the question arms but the utterance still cannot answer it.
+6. *The answer.* The next committed user turn — spoken or typed, from any tab — is offered to the last question asked
+   before routing (`asked`, kept until a later committed turn settles it). A yes or a no by closed grammar
+   (`confirmationAnswer`: `isConfirmation` / `isRefusal`) is core's, with no agent; anything else drops the confirmation
+   and is routed as a fresh request. The answer is settled when its turn is committed (started committed, or promoted from
+   a speculative turn) in ONE uninterruptible step with nothing awaited (`resolveAnswer`): a no cancels; a yes from an
+   ineligible utterance is dropped as too early; otherwise `consumeConfirmation` checks, against the clock read now, that
+   the entry is current, armed, from an earlier turn, its window open, and its registration and dynamic values still
+   offered (the setup read now; the single-model API offers its registry's action tools), removes it, and the action is
+   started DETACHED, with the 5 s limit, so nothing that happens to the turn's speech can cancel it half-way.
+7. *What is said.* After the start: the action's announcement (if it declares one), then — only once the action has
+   ended — its `say`, or `ConfirmTexts.done` ("Done.") when it supplied no words at all, or "Sorry, <reason>" when it
+   failed. A dropped answer says why: `cancelled` ("OK, I won't."), `tooEarly` ("I didn't do it: the question hadn't
+   finished when you answered. Please say your request again."), `lapsed` ("… that answer came too late …"),
+   `unavailable` ("… that can't be done any more."). All are recorded as the proposing agent's words. The fixed texts are
+   `confirmTexts` (default `DEFAULT_CONFIRM_TEXTS`; `DUTCH_CONFIRM_TEXTS` exists).
+8. *What is recorded.* The answering turn ends with an explicit outcome note (an assistant message, never spoken,
+   attributed to the proposer): ran and succeeded, ran and failed with the reason, the owner said no, or not run and why
+   (answered too early, window closed, no longer available); a refused proposal gets one too. If the turn is interrupted
+   or its consumer goes away while the action runs, the action still completes and the note, committed as "outcome not
+   known yet", is replaced in place by the real outcome. So the proposing call's tool result is never the last word: a
+   model reads the note in its history, a harness in its catch-up (non-empty assistant messages are passed on).
+
+The generated tool itself refuses to run a `confirm: true` action, so no registry can run one either; its description
+says calling the tool makes the assistant ask the owner, and that the model must not ask itself.
 
 Tools are **not** turned into actions automatically (a JSON-schema input cannot be mapped onto choice questions). A module
 that wants both declares the action and lets the tool be generated, or keeps a hand-written tool and sets
@@ -1142,7 +1843,8 @@ see the decision in the chat once G lands.
 - Creating agents from the UI (several instances of one kind at run time). Each instance is one catalog line.
 - Several actions in one sentence ("lights on and blinds down"): detected and passed to the conversational agent.
 - Timers, reminders and anything a module would have to say on its own later (modules still cannot speak by themselves).
-- Confirmation before side-effecting *tools* of conversational agents (actions have `confirm`).
+- Confirmation before side-effecting *tools* of conversational agents (actions have `confirm`, enforced for their
+  generated tools since review round 5; hand-written module tools still have none).
 - Running the conversational agent in parallel with Jev "just in case" (wastes tokens on every command).
 - Committing an intent turn before the final silence when the decision is confident (the obvious next latency step for
   commands; needs data from real use).

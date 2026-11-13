@@ -107,6 +107,109 @@ test("Stop: the page stops at once, sends interrupt then playback.stopped, answe
   expect(history.at(-1)!.text.length).toBeGreaterThan(0)
 })
 
+/**
+ * Records every AudioWorkletNode the page creates (a node can only be created once its module loaded), the
+ * shared counter handed to it (cross-origin isolated pages only), and the message types its port delivers.
+ */
+const workletProbe = () => {
+  type Probe = { nodes: Array<string>; counters: Array<SharedArrayBuffer>; portMessages: Record<string, number> }
+  const probe: Probe = { nodes: [], counters: [], portMessages: {} }
+  ;(window as unknown as { __pvaWorklets: Probe }).__pvaWorklets = probe
+  const Native = window.AudioWorkletNode
+  window.AudioWorkletNode = class extends Native {
+    constructor(context: BaseAudioContext, name: string, options?: AudioWorkletNodeOptions) {
+      super(context, name, options)
+      probe.nodes.push(name)
+      const counter = (options?.processorOptions as { counter?: unknown } | undefined)?.counter
+      if (typeof SharedArrayBuffer === "function" && counter instanceof SharedArrayBuffer) probe.counters.push(counter)
+      this.port.addEventListener("message", (e: MessageEvent) => {
+        const type = `${name}:${(e.data as { type?: string } | undefined)?.type ?? "?"}`
+        probe.portMessages[type] = (probe.portMessages[type] ?? 0) + 1
+      })
+    }
+  } as typeof AudioWorkletNode
+}
+
+test("cross-origin isolation as configured; the worklets load; Stop mid-reply gives a final count the server takes as exact", async ({ page }) => {
+  const isolated = process.env.SERVE_CROSS_ORIGIN_ISOLATION !== "false"
+  const responses: Array<{ path: string; status: number; coep: string | undefined; corp: string | undefined }> = []
+  page.on("response", (r) => {
+    const url = new URL(r.url())
+    if (url.origin === assistant.url) responses.push({ path: url.pathname, status: r.status(), coep: r.headers()["cross-origin-embedder-policy"], corp: r.headers()["cross-origin-resource-policy"] })
+  })
+  await page.addInitScript({ content: `var __name = (f) => f; (${workletProbe.toString()})()` })
+  const document = await page.goto(assistant.url)
+  expect(document!.headers()["cross-origin-opener-policy"]).toBe(isolated ? "same-origin" : undefined)
+  expect(document!.headers()["cross-origin-embedder-policy"]).toBe(isolated ? "require-corp" : undefined)
+  expect(await page.evaluate(() => window.crossOriginIsolated)).toBe(isolated)
+  await page.getByTestId("start").click()
+  await expectVisualState(page, "listening")
+
+  // Both worklet modules loaded (their nodes exist) and were served with the same headers as the page.
+  const probe = () => page.evaluate(() => {
+    const p = (window as unknown as { __pvaWorklets: { nodes: Array<string>; counters: Array<SharedArrayBuffer>; portMessages: Record<string, number> } }).__pvaWorklets
+    return { nodes: p.nodes, counters: p.counters.map((c) => Array.from(new Int32Array(c))), portMessages: p.portMessages }
+  })
+  expect([...(await probe()).nodes].sort()).toEqual(["pva-capture", "pva-player"])
+  // Worklet module fetches do not show up as page responses: fetch the same files to check their headers.
+  for (const path of ["/worklets/capture.js", "/worklets/player.js"]) {
+    const r = await page.request.get(`${assistant.url}${path}`)
+    expect(r.status(), path).toBe(200)
+    expect(r.headers()["cross-origin-embedder-policy"], path).toBe(isolated ? "require-corp" : undefined)
+    expect(r.headers()["cross-origin-resource-policy"], path).toBe(isolated ? "same-origin" : undefined)
+  }
+  const scripts = responses.filter((r) => r.path.endsWith(".js"))
+  expect(scripts.length).toBeGreaterThan(0)
+  for (const r of scripts) expect(r.corp, r.path).toBe(isolated ? "same-origin" : undefined)
+  expect(responses.filter((r) => r.status >= 400)).toEqual([])
+
+  const from = (await messages(page)).length
+  await type(page, LONG)
+  const started = await waitForMessage(page, (m) => m.msg.type === "playback.started", { from })
+  await page.waitForTimeout(500)
+  const before = await probe()
+  await page.waitForTimeout(200)
+  const during = await probe()
+  if (isolated) {
+    // The shared counter is in use: one, for the player; the worklet rewrites it every quantum (sequence, reply
+    // id, instance token, count, open).
+    expect(during.counters.length).toBe(1)
+    // Layout since the seventh review: sequence, reply id, instance token, count, open.
+    const [seq0, , , played0] = before.counters[0]!
+    const [seq1, id, token, played1, open] = during.counters[0]!
+    expect(token).not.toBe(0)
+    expect(seq1).not.toBe(seq0)
+    expect(id).toBe(started.msg.turnId)
+    expect(played1).toBeGreaterThan(played0!)
+    expect(open).toBe(1)
+    // The worklet sends count messages only until the page has confirmed the shared counter (the fallback
+    // of the fifth review): by now it has, so no more arrive while the reply keeps playing.
+    const counts = (p: typeof during) => Object.entries(p.portMessages).filter(([k]) => k.endsWith(":count")).reduce((n, [, c]) => n + c, 0)
+    expect(counts(during)).toBe(counts(before))
+  } else {
+    expect(during.counters).toEqual([])
+    expect(Object.entries(during.portMessages).filter(([k]) => k.endsWith(":count")).map(([, n]) => n)[0]).toBeGreaterThan(10)
+  }
+  console.log(`[isolation ${isolated ? "on" : "off"}] counters ${JSON.stringify(during.counters)}; port messages ${JSON.stringify(during.portMessages)}`)
+
+  await page.getByTestId("stop").click()
+  const end = await waitForMessage(page, (m) => m.msg.type === "turn.end", { from })
+  expect(end.msg.outcome).toBe("interrupted")
+  const log = (await messages(page)).slice(from)
+  const interrupt = log.find((m) => m.msg.type === "interrupt")!
+  const stopped = log.filter((m) => m.dir === "out" && m.msg.type === "playback.stopped" && m.msg.turnId === end.msg.turnId)
+  console.log(`[isolation ${isolated ? "on" : "off"}] playback.stopped sent: ${JSON.stringify(stopped.map((m) => ({ at: Math.round(m.at - interrupt.at), ...m.msg })))}; turn.end ${Math.round(end.at - interrupt.at)} ms after interrupt`)
+  // The final count is exact and the server took it as such: an exact first report ends its wait at once (a
+  // provisional one would have kept the turn open to the 300 ms deadline).
+  expect(stopped[0]!.msg.exact).toBe(true)
+  expect(new Set(stopped.map((m) => m.msg.playedSamples)).size).toBe(1)
+  expect(end.at - interrupt.at).toBeLessThan(300)
+  const history = await serverHistory(assistant.url)
+  expect(history.at(-1)).toMatchObject({ role: "assistant", interrupted: true })
+  expect(history.at(-1)!.text.length).toBeGreaterThan(0)
+  expect(history.at(-1)!.text.length).toBeLessThan(LONG.length)
+})
+
 test("two pages: the second observes, takes the audio mid-reply, and the first becomes an observer with its audio closed", async ({ browser }, testInfo) => {
   const ctx = await browser.newContext({ permissions: ["microphone"], viewport: { width: 1280, height: 800 } })
   const a = await ctx.newPage()

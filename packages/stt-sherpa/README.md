@@ -98,6 +98,24 @@ TurnDetector (pure) ◀── frames / partials / ───────   stream
    └── SttEvents ──▶ Stream
 ```
 
+`src/worker.mjs` only loads the models; the logic on the worker side is `src/recognizerCore.mjs` (with
+`decodeQueue.mjs` and `turnAudio.mjs`), which the test stand-ins (`test/fake-*.mjs`) run with fake models
+(`test/fakeModels.mjs`), so boundary cuts, segment checkpoints and the decode-queue bound are tested as they
+run in production. Bounds: whole-turn decodes waiting are at most two longest pieces of audio (a decode that
+never returns drops the turn, logged); a streaming segment is checkpointed at a 200 ms pause after 5 s (8 s
+regardless) and keeps 30 s of frames, so a boundary cut decodes again at most one piece. A checkpoint forced in the
+middle of speech (the 8 s one) starts the next stream 2 s before the cut and joins the two texts where their words
+match (`reconcile`), because a fresh stream with no left context split or dropped the word at the cut
+(`scripts/checkpoint-quality.ts`, results below under Measured).
+`scripts/replay-cost.ts` measures what a cut costs the worker with the installed streaming models: all of it,
+the piece decoded again up to the boundary and the frames after it fed again to start the next segment
+(`stats.replayedFrames` + `stats.refedFrames`). 2026-11-14, worst case (no pause, the next sentence 1 s along):
+nemotron-560 0.90 s, nemotron-320 1.31 s, zipformer 0.32 s, fast-conformer 0.35 s (7.4 s replayed + 0.9 s fed
+again); with the next sentence 3 s along (more than the main thread's 1 s backlog limit lets the worker get
+ahead) 1.13 / 1.77 / 0.36 / 0.43 s. Before the checkpoints a cut decoded the whole kept segment: 4.6 / 5.2 /
+1.1 / 1.4 s. The frames fed again are the next sentence's, which must be decoded anyway; they are bounded by how
+far the worker is past the boundary when the finalise arrives.
+
 - **Worker.** Decode calls block (~55 ms per chunk for Nemotron, 0.1–3 s for a whole turn), so the
   recogniser, the VAD and the gain control run in a `worker_threads` worker. It is plain JavaScript because
   worker threads inherit neither tsx's nor vitest's TypeScript loader. A worker error or exit fails the
@@ -106,6 +124,13 @@ TurnDetector (pure) ◀── frames / partials / ───────   stream
   `maxBacklogMs` it drops audio instead of queueing it and logs a warning. Whole-turn decodes run on the
   thread pool (`decodeAsync`), so the worker keeps reporting VAD decisions while a decode runs and the
   backlog stays near zero even during a 3 s Whisper decode.
+- **Every utterance is closed.** Each utterance that got `SpeechStarted` ends with one `EndOfTurn`; when no
+  words were recognised (noise the VAD took for speech, a turn dropped because decoding fell behind, input that
+  ended first) its `text` is empty, so a consumer knows the utterance is over and starts nothing. An utterance
+  that never got `SpeechStarted` (shorter than `minSpeechMs`) produces no event at all, and `EagerEndOfTurn` is
+  never empty. (Until 2026-11-14 an utterance without words ended with no event.) When a turn is dropped while
+  its `Finalize` waits behind a stalled decode, that `Finalize` is answered at once with no text, and the
+  stalled decode's text, when it comes, is not added to the dropped turn.
 - **Turn detection** is `TurnDetector`, a pure state machine over per-frame VAD decisions and transcript
   updates, unit-tested with scripted input. Thresholds come from an `EndOfTurnPolicy`
   (`{ eagerSilenceMs(text), finalSilenceMs(text) }`); a semantic end-of-turn detector can replace
@@ -133,6 +158,10 @@ Non-streaming models are far more accurate on real-world audio, and for these si
 - **Speech while a decode runs** is held: the answer arrives with the user speaking, the detector keeps it
   and the next pause decodes again. A `Finalize` decided before the speech (by frame number) is still
   answered; the worker only cancels one whose frame it has already seen speech after.
+- **A slow decode** (Whisper, or a long turn) that is still running when the final threshold passes ends the
+  turn there: if the user starts the next sentence before the answer arrives, that sentence is a new turn,
+  and the finished turn is decoded through the frame where it ended (`Finalize` with `through`), so the new
+  speech neither joins it nor is lost. (Before this fix, one Whisper run merged a whole timeline into one turn.)
 - **Interim text**: Parakeet re-decodes the turn so far every 1 s of speech (`interimMs`), for the first
   10 s of a turn, only while the VAD says speech and no other decode is queued. That keeps the "say a few
   words" barge-in mode working (it needs words, and with no interims it waited for a pause) and shows live
@@ -183,7 +212,99 @@ cancellation handle echo; see Measured for how much more often a quiet echo is d
 
 ## Measured
 
-MEASURED-PLACEHOLDER
+**Streaming checkpoints and accuracy** (`scripts/checkpoint-quality.ts`, 2026-11-14): the English clips of the
+quality set longer than 7 s plus two read passages with no pause (24 s, 41 s), 428 words, 159 s, through the
+worker logic and the turn detector as in production. Word error rate:
+
+| Model | Whole segment (no checkpoints) | 8 s hard cut (third review) | 8 s cut with 2 s overlap (now) |
+|---|---|---|---|
+| nemotron-560 | 11.68 % | 11.92 % | 11.68 % |
+| nemotron-320 | 12.85 % | 14.49 % | 12.85 % |
+| zipformer-en | 16.82 % | 17.52 % | 16.59 % |
+| fast-conformer-en | 8.88 % | 9.58 % | 9.11 % |
+
+Checkpoints at pauses changed no word on any clip. The plain 8 s cut split or dropped the word it fell in
+("squalid quar | of", "soul in he", "mortals and to | finally": *be* dropped). With the overlap, all 11 joins of
+each model were reconciled on matching words; the cost is 2 s decoded twice per forced cut (12 s of 159 s here,
+only in speech with no 200 ms pause for 8 s). Cutting at short VAD gaps instead (tried) still split words: Silero
+rarely reports a gap inside fluent speech.
+
+
+On this machine (AMD Ryzen 9 7945HX, 16 threads, CPU only, 30 GB), 2026-11-13/14, through this adapter
+(`scripts/measure.ts`, audio fed in 20 ms chunks at real time), with the defaults (eager 250 ms, final
+600 ms, VAD 0.5, gain control on). "Previous" is the adapter as it was before this change with its default
+(`nemotron-3.5`, VAD 0.5, no gain control, one stream with `reset()`).
+
+**Degraded set** (34 English clips × 7 conditions, 526 words each, from stt-quality.md §2.2; WER normalised
+as in the study; one timeline per condition, clips 1.5 s apart, each clip at its own level):
+
+| WER % | clean | tel | lp7k | quiet | noise15 | reverb | combo | **all** |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|
+| **`parakeet-v2`** (new default) | 12.2 | 14.3 | 11.6 | 12.5 | 13.9 | 18.9 | 18.9 | **14.6** |
+| `nemotron-320` through the new adapter (gain control, fresh streams) | 20.5 | | | 19.1 | | | 42.7 | (27.4 on these 3) |
+| previous default, earlier scoring¹ | 27.2 | 34.4 | 28.0 | 30.7 | 35.3 | 45.9 | 55.8 | **36.8** |
+| `parakeet-v2`, earlier scoring¹, VAD 0.35 | 11.2 | 15.8 | 12.9 | 19.9 | 14.7 | 17.0 | 40.0 | **18.8** |
+
+¹ The first runs assigned a turn to the clip during which its `EndOfTurn` arrived; a slow `EndOfTurn` after
+the next clip had started was credited to that clip (and the first clip counted as missed), which inflates
+both rows' errors, most in `quiet` and `combo`. The scorer now assigns a turn by when it started; the new
+default's row was re-scored from the saved events. The previous default was not re-run (the study already
+establishes the gap: 33.7 % vs 13.3 % mean, models alone). Compare the two "earlier scoring" rows with each
+other: 18.8 vs 36.8 %.
+
+Latency on the same set (ms after the clip's last loud frame, medians over all conditions): `parakeet-v2`
+speculative 562, final 770 (clean: 440 / 671); previous default (earlier scoring) 494 / 750 (clean:
+407 / 670). The speculative text equalled the final text in 155 of 234 turns: a long or resumed turn is
+decoded again, and a decode still running at the final threshold gives `EndOfTurn` without an eager event.
+68 of 238 clips were split into two turns, by pauses longer than 600 ms in the (conversational) clips.
+
+**VAD threshold, with the gain control on** (`parakeet-v2`, same set, same scoring), 0.5 vs 0.35: WER all
+14.6 / 15.0 % (clean 12.2 / 11.2, tel 14.3 / 15.8, quiet 12.5 / 11.0, noise15 13.9 / 14.7, reverb 18.9 / 17.2,
+combo 18.9 / 22.4), clips split into two turns 68 / 46; final transcript after the speech, median 770 / 949 ms
+(quiet 791 / 1381, noise15 1111 / 1350, combo 1180 / 1690: 0.35 holds on to noisy tails). Same accuracy,
+0.2 s faster: 0.5 stays the default, and the gain control does the work for quiet input (quiet 12.5 % here
+against 30.7 % for the previous default, earlier scoring).
+
+**Clean clips** (`0.wav`, 18 words; `1.wav`, 48 words with two ~320 ms pauses; 3 rounds):
+
+| | `parakeet-v2` | previous default |
+|---|---|---|
+| word errors | 0/198 | 25/357 (with the Dutch clips; 7.0 %) |
+| `0.wav`: speculative / final after the last loud frame | 506–524 / 679–681 ms | 391–443 / 680 ms |
+| `1.wav` (16 s): final | 1585–1968 ms² (one turn, no split) | 1000–1316 ms (split by its pauses) |
+| speculative text == final text | every turn that had one | 15/15 |
+| main event-loop delay (10 ms timer) | p50 0.1, p99 1.5, max 4.5 ms (max 20–32 ms during the 30-minute set runs, both adapters) | p50 0.1, p99 1.5, max 2.8 ms |
+
+² The 16 s sentence is decoded at the end (0.6 s with 8 threads) after a ~0.7 s VAD hold on its noisy tail:
+whole-turn decoding costs about the study's predicted +0.36 s on very long turns, nothing on short ones.
+
+**Memory** (process RSS, `measure --soak-minutes 5`, the clean clips looped; real time for whole-turn
+presets, 3× for streaming):
+
+| preset | after load | after 1 min | after 5 min |
+|---|--:|--:|--:|
+| `parakeet-v2` | 1.28 GB | 1.66 GB | 1.66 GB (flat) |
+| `hybrid-nemotron-parakeet` | 1.97 GB | 2.37 GB | 2.38 GB (flat) |
+| `nemotron-560` (fresh stream per segment) | 1.20 GB | 1.18 GB | 1.18 GB (flat) |
+| previous default | 1.19 GB | 1.16 GB | 1.16 GB |
+| `parakeet-ultra` / `whisper-turbo` | 1.31 / 1.87 GB | 1.50 GB / 2.67 GB (after a 30 s turn) | not soaked |
+
+The recogniser's memory grows with the longest input it has decoded (a 3× soak that merged clips into
+60 s turns reached 2.96 GB), hence the 30 s cap on a turn's piece.
+
+**Other presets, clean clips, 1 round**: `parakeet-ultra` 6/119 word errors with the Dutch clips;
+`nemotron-560` 18/357 (5.0 %, 3 rounds, EN + NL); `hybrid-nemotron-parakeet` 0/198, same latency as
+`parakeet-v2`; `whisper-turbo` (language auto): the English and Dutch clips came out right by eye (not
+scored: its first scored run hit the slow-decode bug fixed below), final 1.1–3.3 s after the speech.
+
+**False triggers** (`false-triggers`, 60 s of each noise through the real adapter, VAD 0.5 / 0.35 / 0.3, gain
+control off / on): the server's −75 dBFS floor, white noise at −55 and −45 dBFS, pink noise at −50, −40 and
+−30 dBFS, 50 Hz hum at −35 dBFS and clicks at −20 dBFS gave **no** `SpeechStarted` and no turn in any of the
+96 runs. Speech-like noise (six overlapping voices at −45 dBFS RMS) gave 2–6 `SpeechStarted` per minute
+without the gain control and 1 with it (the noise cap holds the gain down), and 1–2 false turns per minute
+without it, 0 with it. The assistant's own voice played back at −40 or −50 dBFS peak (an echo) is detected
+as speech with or without the gain control (12–13 starts per minute either way): echo is the echo gate's
+and the browser's job, and the gain control does not make it worse here.
 
 ## Is it the audio or the model?
 

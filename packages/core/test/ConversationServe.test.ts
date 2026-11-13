@@ -201,7 +201,7 @@ describe("Conversation events", () => {
   it.effect("a speculative turn is announced as speculative and promoted", () => {
     const t = setup({ llm: [[sleep(50), textDelta("Noon.")]] })
     return Effect.gen(function*() {
-      const fiber = yield* startVoice([eagerEndOfTurn("what time"), sleep(200), endOfTurn("What time?")])
+      const fiber = yield* startVoice([eagerEndOfTurn("what time"), sleep(200), endOfTurn("what time.")])
       yield* advance(1_000)
       yield* Fiber.join(fiber)
       assert.deepStrictEqual(t.events[0], { _tag: "TurnStarted", turnId: 1, source: "voice", text: "what time", speculative: true, spoken: true })
@@ -268,7 +268,7 @@ describe("Conversation input: typed text and Stop", () => {
     }).pipe(Effect.provide(t.layer))
   })
 
-  it.effect("Interrupt stops the committed turn even with barge-in disabled; a pending speculative turn is left alone", () => {
+  it.effect("Interrupt stops the committed turn even with barge-in disabled, and a pending speculative turn too (review finding 9)", () => {
     const t = setup({ llm: [[textDelta("One. "), textDelta("Two. "), textDelta("Three.")], [sleep(100), textDelta("Spec.")]], bargeIn: false })
     return Effect.gen(function*() {
       const fiber = yield* startVoice([endOfTurn("first"), sleep(150), stop, sleep(500), eagerEndOfTurn("next"), sleep(10), stop, sleep(200), endOfTurn("next")])
@@ -276,11 +276,9 @@ describe("Conversation input: typed text and Stop", () => {
       yield* Fiber.join(fiber)
       assert.deepStrictEqual(yield* history, [
         { role: "user", content: "first" },
-        { role: "assistant", content: "One. Two.", interrupted: true },
-        { role: "user", content: "next" },
-        { role: "assistant", content: "Spec." }
+        { role: "assistant", content: "One. Two.", interrupted: true }
       ])
-      assert.deepStrictEqual((yield* traces).map((tr) => tr.outcome), ["interrupted", "completed"])
+      assert.deepStrictEqual((yield* traces).map((tr) => tr.outcome), ["interrupted", "discarded"])
     }).pipe(Effect.provide(t.layer))
   })
 })

@@ -1,4 +1,5 @@
 import type { Effect, Schema } from "effect"
+import type { RegisteredAction } from "./Actions.ts"
 import type { ToolError } from "./Errors.ts"
 
 /** Something the model can call. */
@@ -10,6 +11,8 @@ export interface Tool<I = any, R = never> {
   /** Safe to run before the turn is confirmed (read-only lookups). Default `false`. */
   readonly speculative?: boolean
   readonly execute: (input: I) => Effect.Effect<unknown, ToolError, R>
+  /** The action this tool was generated for (`actionTool`), so core can apply the action's confirmation rule. */
+  readonly action?: RegisteredAction
 }
 
 /** Facts sent with each turn as `LlmRequest.context` (not part of the cached system prompt). Must be fast: cached or local. */

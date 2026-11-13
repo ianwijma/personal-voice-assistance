@@ -4,8 +4,11 @@
 import { assert, describe, it } from "@effect/vitest"
 import { Effect, Fiber, Layer, Schema, Stream } from "effect"
 import { TestClock } from "effect/testing"
-import type { AgentEvent } from "../src/Agent.ts"
+import { defineAction, Param, registerActions } from "../src/Actions.ts"
+import type { Agent, AgentEvent } from "../src/Agent.ts"
 import { Conversation } from "../src/Conversation.ts"
+import { choiceAnswer, type DecisionAnswer, type DecisionProvider, type DecisionRequest, makeScriptedDecider } from "../src/Decision.ts"
+import { makeIntentAgent } from "../src/IntentAgent.ts"
 import type { AgentTurnSetup, ConversationEvent, ConversationInput } from "../src/ConversationEvents.ts"
 import { makeTool } from "../src/Module.ts"
 import { makeModelAgent } from "../src/ModelAgent.ts"
@@ -459,6 +462,279 @@ describe("a turn records its events in order", () => {
     return Effect.gen(function*() {
       yield* run([endOfTurn("lights on")])
       assert.deepStrictEqual(ofTag(t.events, "IntentDecided"), [{ _tag: "IntentDecided", turnId: 1, agentId: "jev", decision }])
+    }).pipe(Effect.provide(t.layer))
+  })
+})
+
+describe("review findings: Stop and manual routing against speculative turns", () => {
+  it.effect("finding 9: Stop cancels a speculative turn, and its final EndOfTurn does not bring the reply back", () => {
+    const main = makeScriptedAgent({ id: "main" }, [say("Hello."), say("Again."), say("Third.")])
+    const t = harness({ setup: makeAgentSetup({ agents: [main.agent], routing: routing() }) })
+    return Effect.gen(function*() {
+      yield* run([
+        eagerEndOfTurn("hi"),
+        sleep(10),
+        { _tag: "Interrupt" },
+        sleep(10),
+        endOfTurn("hi"),
+        sleep(1_000),
+        // A new utterance is heard normally, even with the same words.
+        speechStarted,
+        eagerEndOfTurn("hi"),
+        sleep(10),
+        endOfTurn("hi"),
+        sleep(1_000),
+        endOfTurn("something else")
+      ])
+      assert.deepStrictEqual(played(t.out), ["<Again.>", "<Third.>"])
+      assert.deepStrictEqual(yield* history, [
+        { role: "user", content: "hi" },
+        { role: "assistant", content: "Again.", agentId: "main" },
+        { role: "user", content: "something else" },
+        { role: "assistant", content: "Third.", agentId: "main" }
+      ])
+      assert.deepStrictEqual((yield* traces).map((tr) => tr.outcome), ["discarded", "completed", "completed"])
+    }).pipe(Effect.provide(t.layer))
+  })
+
+  it.effect("finding 10: an agent chosen by hand while a speculative turn waits is not overwritten by its promotion", () => {
+    const main = makeScriptedAgent({ id: "main" }, [say("Main.")])
+    const claude = makeScriptedAgent({ id: "claude-subscription" }, [say("Quark."), say("More.")])
+    const t = harness({ setup: makeAgentSetup({ agents: [main.agent, claude.agent], routing: routing() }) })
+    return Effect.gen(function*() {
+      yield* run([
+        eagerEndOfTurn("hey claude what is a quark"),
+        sleep(20),
+        { _tag: "SetActiveAgent", agentId: "main" },
+        sleep(20),
+        endOfTurn("hey claude what is a quark"),
+        sleep(1_000),
+        endOfTurn("tell me more")
+      ])
+      assert.deepStrictEqual(main.probe.inputs.map((i) => [i.text, i.routedBy]), [["tell me more", "sticky"]])
+      assert.strictEqual((yield* routerState).sticky?.agentId, "main")
+    }).pipe(Effect.provide(t.layer))
+  })
+})
+
+describe("review round 2: Stop cancels an utterance, not a transcript (finding B)", () => {
+  // Rule: Stop during a speculative turn cancels the utterance it belongs to. Everything the
+  // recogniser sends for that utterance until its EndOfTurn (revised eager transcripts,
+  // TurnResumed, a final transcript with different words) starts nothing; SpeechStarted,
+  // typed text or Say begins something new. A recogniser that never ends the utterance
+  // cannot keep the conversation deaf: the cancellation expires.
+  const echo = () => makeScriptedAgent({ id: "main" }, (input) => [agentText(`(answer to ${input.text})`)])
+
+  it.effect("a final transcript that differs from the stopped eager one starts nothing", () => {
+    const main = echo()
+    const t = harness({ setup: makeAgentSetup({ agents: [main.agent], routing: routing() }) })
+    return Effect.gen(function*() {
+      yield* run([
+        speechStarted,
+        eagerEndOfTurn("turn on kitchen lights"),
+        sleep(10),
+        { _tag: "Interrupt" },
+        sleep(10),
+        endOfTurn("turn on the kitchen lights"),
+        sleep(1_000)
+      ])
+      assert.deepStrictEqual(played(t.out), [])
+      assert.deepStrictEqual(yield* history, [])
+      assert.deepStrictEqual((yield* traces).map((tr) => tr.outcome), ["discarded"])
+    }).pipe(Effect.provide(t.layer))
+  })
+
+  it.effect("revisions after Stop (TurnResumed, a new eager transcript, the final one) all belong to the stopped utterance", () => {
+    const main = echo()
+    const t = harness({ setup: makeAgentSetup({ agents: [main.agent], routing: routing() }) })
+    return Effect.gen(function*() {
+      yield* run([
+        speechStarted,
+        eagerEndOfTurn("turn on"),
+        sleep(10),
+        { _tag: "Interrupt" },
+        turnResumed,
+        eagerEndOfTurn("turn on the kitchen"),
+        sleep(10),
+        eagerEndOfTurn("turn on the kitchen lights"),
+        sleep(10),
+        endOfTurn("turn on the kitchen lights please"),
+        sleep(1_000),
+        // The next utterance is heard, with the same words or others.
+        speechStarted,
+        eagerEndOfTurn("turn on the kitchen lights please"),
+        sleep(10),
+        endOfTurn("turn on the kitchen lights please"),
+        sleep(1_000)
+      ])
+      assert.deepStrictEqual(played(t.out), ["<(answer to turn on the kitchen lights please)>"])
+      assert.deepStrictEqual(main.probe.inputs.map((i) => i.text), ["turn on", "turn on the kitchen lights please"], "nothing between Stop and the next utterance started")
+    }).pipe(Effect.provide(t.layer))
+  })
+
+  it.effect("the utterance ends with its EndOfTurn, even from a recogniser that then sends no SpeechStarted", () => {
+    const main = echo()
+    const t = harness({ setup: makeAgentSetup({ agents: [main.agent], routing: routing() }) })
+    return Effect.gen(function*() {
+      yield* run([
+        eagerEndOfTurn("hi"),
+        sleep(10),
+        { _tag: "Interrupt" },
+        endOfTurn("hi there"),
+        sleep(1_000),
+        eagerEndOfTurn("hi"),
+        sleep(10),
+        endOfTurn("hi")
+      ])
+      assert.deepStrictEqual(played(t.out), ["<(answer to hi)>"])
+    }).pipe(Effect.provide(t.layer))
+  })
+
+  it.effect("a recogniser that never ends the utterance cannot leave the conversation deaf: the cancellation expires", () => {
+    const main = echo()
+    const t = harness({ setup: makeAgentSetup({ agents: [main.agent], routing: routing() }) })
+    return Effect.gen(function*() {
+      yield* run([
+        eagerEndOfTurn("hi"),
+        sleep(10),
+        { _tag: "Interrupt" },
+        sleep(1_000),
+        eagerEndOfTurn("hi"), // still within the bound: the same utterance
+        sleep(30_000),
+        eagerEndOfTurn("hi"),
+        sleep(10),
+        endOfTurn("hi")
+      ], 40_000)
+      assert.deepStrictEqual(played(t.out), ["<(answer to hi)>"])
+      assert.strictEqual(main.probe.inputs.length, 2, "the eager turn of the still-cancelled utterance never started; the late one did")
+    }).pipe(Effect.provide(t.layer))
+  })
+})
+
+describe("review round 2: promotion compares the values said (finding C)", () => {
+  // Rule (round 5, replacing round 2's looser comparison): a speculative turn is promoted
+  // only when the final transcript is canonically the same (`canonicalUtterance`).
+  const echo = () => makeScriptedAgent({ id: "main" }, (input) => [agentText(`(answer to ${input.text})`)])
+  const pairs: ReadonlyArray<readonly [string, string, boolean]> = [
+    ["dim the kitchen to 5 percent", "dim the kitchen to -5 percent", false],
+    ["dim the kitchen to 5 percent", "dim the kitchen to − 5 percent", false],
+    ["dim the kitchen to 5 percent", "dim the kitchen to - 5 percent", false],
+    ["set it to 15 degrees", "set it to 1.5 degrees", false],
+    ["zet hem op 15 graden", "zet hem op 1,5 graden", false],
+    ["rooms 35", "rooms 3-5", false],
+    ["dim to 40", "dim to 40%", false],
+    ["set it to 1000", "set it to 1,000", false],
+    // Round 5: every promotion compares canonical texts, so case, "?" and apostrophes count too.
+    ["Turn on the lights", "turn on the lights.", false],
+    ["dim the kitchen to 40 percent", "Dim the kitchen to 40 percent.", false],
+    ["dim to 40", "Dim to 40!", false],
+    ["what's the time", "whats the time?", false],
+    // Only the ignorable punctuation of `Utterance.ts`: promoted.
+    ["turn on the lights", "turn on the lights.", true],
+    ["Dim the kitchen to 40 percent", "Dim the kitchen to 40 percent!", true],
+    ["please, dim to 40", "please dim to 40.", true]
+  ]
+  it.effect("each pair: promoted, or discarded and decided again from the final words", () =>
+    Effect.gen(function*() {
+      for (const [eager, final, same] of pairs) {
+        const main = echo()
+        const t = harness({ setup: makeAgentSetup({ agents: [main.agent], routing: routing() }) })
+        yield* Effect.gen(function*() {
+          yield* run([eagerEndOfTurn(eager), sleep(50), endOfTurn(final), sleep(1_000)])
+          const outcomes = (yield* traces).map((tr) => tr.outcome)
+          const h = yield* history
+          if (same) {
+            assert.deepStrictEqual(outcomes, ["completed"], `${eager} / ${final}: promoted`)
+          } else {
+            assert.deepStrictEqual(outcomes, ["discarded", "completed"], `${eager} / ${final}: discarded`)
+            assert.deepStrictEqual(h[0], { role: "user", content: final }, "history records the final words")
+            assert.deepStrictEqual(played(t.out), [`<(answer to ${final})>`])
+          }
+        }).pipe(Effect.provide(t.layer))
+      }
+    }))
+})
+
+/** The real intent agent behind a Conversation: a two-room house and a scripted decider that asks for the room. */
+const intentHouse = () => {
+  const runs: Array<unknown> = []
+  const rooms = [{ value: "area:kitchen", label: "Kitchen" }, { value: "area:hall", label: "Hall" }]
+  const actions = registerActions("home", [
+    defineAction({
+      id: "lights_on",
+      label: "Turn lights on",
+      description: "Switch on the lights in a room.",
+      params: { target: Param.dynamic({ label: "Room or light", options: () => rooms }) },
+      announce: () => "Lights on.",
+      run: (p) => Effect.sync(() => void runs.push(p))
+    })
+  ])
+  const noul = (value: number): DecisionAnswer => ({ type: "noul", value })
+  const decider = makeScriptedDecider((request: DecisionRequest) => {
+    const base = { action: choiceAnswer({ "home.lights_on": 1 }), fits: noul(0.95), compound: noul(0.02) }
+    if (request.questions["pending/answers"] !== undefined) {
+      return { answers: { ...base, fits: noul(0.1), "pending/answers": noul(0.95), "pending/answer": choiceAnswer({ "area:kitchen": 0.95, "area:hall": 0.05 }) } }
+    }
+    return { answers: { ...base, "home.lights_on/target": choiceAnswer({ "area:kitchen": 0.5, "area:hall": 0.5 }) } }
+  }, { id: "keywords" })
+  const intent = makeIntentAgent({ deciders: ["keywords"] })
+  const jev: Agent = { id: "jev", name: "Jev", kind: "intent", speculate: true, firstEventTimeoutMs: 5_000, turn: intent.turn }
+  return { runs, actions, decider, intent, jev }
+}
+
+describe("review round 2: the intent agent behind Conversation (findings F, G)", () => {
+  it.effect("F: a hand-off because no decision provider runs drops the pending question, read through Conversation", () => {
+    const house = intentHouse()
+    const main = makeScriptedAgent({ id: "main" }, (input) => [agentText(`(answer to ${input.text})`)])
+    let deciders: ReadonlyMap<string, DecisionProvider> = new Map([["keywords", house.decider]])
+    const t = harness({
+      setup: () => makeAgentSetup({ agents: [main.agent, house.jev], routing: routing(), extra: { actions: house.actions, deciders } })
+    })
+    return Effect.gen(function*() {
+      const c = yield* Conversation
+      const fiber = yield* Effect.forkChild(c.voice(scripted([
+        endOfTurn("hey jev lights on"),
+        sleep(1_000)
+      ])))
+      yield* advance(2_000)
+      yield* Fiber.join(fiber)
+      assert.strictEqual(house.intent.pending()?.awaiting.kind, "param", "the question is pending")
+      deciders = new Map()
+      const second = yield* Effect.forkChild(c.voice(scripted([endOfTurn("hey jev what is a quark"), sleep(1_000)])))
+      yield* advance(2_000)
+      yield* Fiber.join(second)
+      assert.deepStrictEqual(main.probe.inputs.map((i) => i.text), ["What is a quark"], "the fallback agent answered")
+      assert.strictEqual(house.intent.pending(), undefined, "the stale question was dropped")
+      // A provider again, within the pending time: "the kitchen" does not resume the old action.
+      deciders = new Map([["keywords", house.decider]])
+      const third = yield* Effect.forkChild(c.voice(scripted([endOfTurn("hey jev the kitchen"), sleep(1_000)])))
+      yield* advance(2_000)
+      yield* Fiber.join(third)
+      assert.deepStrictEqual(house.runs, [])
+    }).pipe(Effect.provide(t.layer))
+  })
+
+  it.effect("G: an agent chosen by hand while a speculative intent question waits is not overridden by its ExpectReply", () => {
+    const house = intentHouse()
+    const main = makeScriptedAgent({ id: "main" }, (input) => [agentText(`(answer to ${input.text})`)])
+    const t = harness({
+      setup: makeAgentSetup({ agents: [main.agent, house.jev], routing: routing(), extra: { actions: house.actions, deciders: new Map([["keywords", house.decider]]) } })
+    })
+    return Effect.gen(function*() {
+      yield* run([
+        eagerEndOfTurn("hey jev lights on"),
+        sleep(20),
+        { _tag: "SetActiveAgent", agentId: "main" },
+        sleep(20),
+        endOfTurn("hey jev lights on"),
+        sleep(1_000),
+        endOfTurn("the kitchen"),
+        sleep(1_000)
+      ])
+      assert.deepStrictEqual(played(t.out)[0], "<Which room or light?>", "the question was asked")
+      assert.deepStrictEqual(main.probe.inputs.map((i) => [i.text, i.routedBy]), [["the kitchen", "sticky"]], "the owner's choice stands")
+      assert.isUndefined((yield* routerState).armed)
+      assert.deepStrictEqual(house.runs, [])
     }).pipe(Effect.provide(t.layer))
   })
 })

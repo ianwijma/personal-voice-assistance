@@ -12,7 +12,7 @@ import { defaultRoutingConfig, makeTriggerRouter } from "../src/Routing.ts"
 import { Llm } from "../src/Services.ts"
 import { makeToolRegistry, ToolRegistry } from "../src/ToolRegistry.ts"
 import { type Trace, TurnTrace } from "../src/TurnTrace.ts"
-import { endOfTurn, makeAgentSetup, makeMarkerTts, makeRecordingAudioOutput, makeScriptedAgent, makeScriptedLlm, textDelta } from "../src/testing.ts"
+import { endOfTurn, speechStarted, makeAgentSetup, makeMarkerTts, makeRecordingAudioOutput, makeScriptedAgent, makeScriptedLlm, textDelta } from "../src/testing.ts"
 
 const TURNS = 150
 const reply = (_: LlmRequest) => [textDelta("Hi! "), textDelta("What can I do for you today?")]
@@ -32,7 +32,7 @@ const measure = (layer: (onEvent: (e: ConversationEvent) => void) => Layer.Layer
     const deltas: Array<number> = []
     const events = Stream.range(1, TURNS).pipe(
       Stream.flatMap((i) =>
-        Stream.make(endOfTurn(`Hello number ${i}.`)).pipe(Stream.concat(Stream.fromEffectDrain(Effect.gen(function*() {
+        Stream.make(speechStarted, endOfTurn(`Hello number ${i}.`)).pipe(Stream.concat(Stream.fromEffectDrain(Effect.gen(function*() {
           const trace = yield* Queue.take(ended)
           deltas.push(trace.marks.playbackStart! - trace.marks.endOfTurn!)
         })))), { concurrency: 1 })

@@ -8,7 +8,7 @@ A personal voice assistant that runs on your Linux machine. You talk, it answers
 
 Two goals decide the design:
 
-1. **Low latency.** The number that matters is the time from the end of your sentence to the first sound of the reply. Target: under 800 ms. Measured on the development machine with local speech and a simulated 300 ms model: **median 729 ms, worst 1100 ms** (see [Measured latency](#measured-latency)).
+1. **Low latency.** The number that matters is the time from the end of your sentence to the first sound of the reply. Target: under 800 ms. Measured on the development machine with local speech (Parakeet v2) and a simulated 300 ms model: **median 771 ms, worst 1095 ms** (see [Measured latency](#measured-latency)).
 2. **Easy to extend and to swap.** A new capability is one file plus one line. A new provider is one package plus one line. Different replies can use different voices (engines).
 
 Node 22, TypeScript, Effect 4, pnpm workspace. The design and the service contracts are in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
@@ -140,7 +140,9 @@ One process on one port serves the UI and a WebSocket at `/ws`. The browser beco
 
 The Options panel switches modules on and off and edits their settings while the assistant runs (a change applies from the next turn; a tool call in progress finishes), and edits the assistant settings (system prompt, voices, turn detection, language model, speech engines). Saved values go to `data/settings.json`, secrets such as API keys to `data/secrets.json` (mode 0600; the browser can set or remove a secret but never read it). `PVA_DATA_DIR` moves that directory. Environment variables and `.env` win over saved values and lock the field in the UI. Settings marked *reload* take effect after **Reload engines**, which rebuilds the speech and language engines in about 2 s and keeps the conversation.
 
-Settings: `SERVE_HOST` (default `127.0.0.1`), `SERVE_PORT` (8787), `SERVE_ALLOWED_ORIGINS` (other page origins allowed to open the socket; default the Next dev server on port 3000), `SERVE_TLS_CERT` + `SERVE_TLS_KEY` (PEM files; with both, the server speaks HTTPS/WSS on the same port), `PVA_WEB_DIR` (default `apps/web/out`), `PVA_DATA_DIR` (default `data/`). Ctrl+C closes the sockets, the engine processes and the modules.
+Settings: `SERVE_HOST` (default `127.0.0.1`), `SERVE_PORT` (8787), `SERVE_ALLOWED_ORIGINS` (other page origins allowed to open the socket; default the Next dev server on port 3000), `SERVE_ALLOWED_HOSTS` (host names the server answers to, comma-separated; IP addresses, `localhost` and the hosts in `SERVE_ALLOWED_ORIGINS` always work, any other name is refused with HTTP 403 so a web page on a rebound DNS name cannot use the assistant), `SERVE_TLS_CERT` + `SERVE_TLS_KEY` (PEM files; with both, the server speaks HTTPS/WSS on the same port), `SERVE_CROSS_ORIGIN_ISOLATION` (default `true`: the page and its files are sent with `Cross-Origin-Opener-Policy: same-origin`, `Cross-Origin-Embedder-Policy: require-corp` and `Cross-Origin-Resource-Policy: same-origin`, which makes the page cross-origin isolated, so it reads how much of a reply played straight from the player instead of by message), `PVA_WEB_DIR` (default `apps/web/out`), `PVA_DATA_DIR` (default `data/`). Ctrl+C closes the sockets, the engine processes and the modules.
+
+**If the page does not load (or Start fails) on a particular browser**, restart the assistant with `SERVE_CROSS_ORIGIN_ISOLATION=false` (in `.env` or the service's environment) and reload the page. If that fixes it, cross-origin isolation is the cause: the page works without it, with a slightly less exact count of what was heard when it is closed in the middle of a reply. Tested in Chromium only; not yet on iPhone Safari.
 
 **Reaching it from another device.** Browsers allow the microphone only on `https://` pages or on `localhost`, and this machine has no sound card, so the microphone and speaker are always another device. The assistant binds to `127.0.0.1` and has **no login**: anyone who can reach the port can use it and change its settings. Routes, simplest first:
 
@@ -152,7 +154,7 @@ Settings: `SERVE_HOST` (default `127.0.0.1`), `SERVE_PORT` (8787), `SERVE_ALLOWE
 
    For `pnpm dev`, forward both ports and open `http://localhost:3000`: `ssh -N -L 3000:localhost:3000 -L 8787:localhost:8787 user@assistant-host`.
 2. **HTTPS on the assistant** (a phone, which cannot open an SSH tunnel easily): set `SERVE_TLS_CERT` and `SERVE_TLS_KEY` to a certificate the device trusts (your own CA installed on the device, or a real hostname with a DNS-01 certificate), and `SERVE_HOST=0.0.0.0`, then open `https://<that hostname>:8787` on the phone. The server warns when it listens beyond loopback. Not tried on a real phone yet.
-3. **A reverse proxy** in front of the default loopback binding (Caddy, `tailscale serve`), which terminates TLS. Add the proxy's public origin to `SERVE_ALLOWED_ORIGINS` if it differs from the `Host` the server sees.
+3. **A reverse proxy** in front of the default loopback binding (Caddy, `tailscale serve`), which terminates TLS. Add the proxy's public origin to `SERVE_ALLOWED_ORIGINS` if it differs from the `Host` the server sees, and its host name to `SERVE_ALLOWED_HOSTS` if the proxy passes that name on as `Host`.
 
 **Echo and interrupting.** Each device chooses how speech interrupts the assistant (Options → This device): *Headphones: instant* (any speech stops the reply), *Speakers: confirm* (the default: the assistant stops once the recogniser has two words that are not its own echo; one-word "stop" does not interrupt, use the Stop button), or *manual* (only Stop; the microphone is muted while the assistant speaks). The server-side echo gate implements these; the browser's echo cancellation is also requested.
 
@@ -165,7 +167,7 @@ pnpm --filter @pva/assistant exec tsx test/support/drive.ts --url http://127.0.0
 
 Observed on the development machine (2026-11-13, local STT nemotron-3.5, Piper, fake LLM, scripted client on the same machine): the speculative reply was promoted and the client reported `playback.started` 2–4 ms after `EndOfTurn` in four turns; from the end of the speech audio to `turn.start` and `playback.started` 635 and 657 ms in the two turns where that was timed (the 600 ms final silence dominates, as in the CLI). The trace's `playbackStart` includes the WebSocket hop and the browser's report; `audible` adds the browser's `outputLatency`. For the real browser see [Through the browser](#through-the-browser).
 
-**Testing it with the real page.** `pnpm e2e:real` builds the UI and runs the page in headless Chromium against the real assistant (local speech models, `LLM_PROVIDER=fake`), with Chromium's fake microphone playing 48 kHz WAVs made from `bench-audio/`: a spoken turn, barge-in in `instant` and `confirm` mode, `manual` mode, a typed message, Stop, two pages with a takeover in the middle of a reply, the server killed and restarted in the middle of a reply, and modules changed from the options drawer (10 tests, about 1.5 minutes; each test file starts its own assistant on its own port, 8791–8798). It skips when the models, `bench-audio/` or Chromium are missing (`pnpm start bench --make-wavs bench-audio`, `pnpm --filter @pva/web e2e:install`). `pnpm bench:browser` measures latency through the browser (below); `pnpm --filter @pva/web screenshots:real` rewrites `apps/web/screenshots/real-*.png`. The assistant's output and each page's message log are kept under `apps/web/test-results/real/`.
+**Testing it with the real page.** `pnpm e2e:real` builds the UI and runs the page in headless Chromium against the real assistant (local speech models, `LLM_PROVIDER=fake`), with Chromium's fake microphone playing 48 kHz WAVs made from `bench-audio/`: a spoken turn, barge-in in `instant` and `confirm` mode, `manual` mode, a typed message, Stop, two pages with a takeover in the middle of a reply, the server killed and restarted in the middle of a reply, and modules changed from the options drawer (11 tests, about 1.5 minutes; each test file starts its own assistant on its own port, 8791–8798, with its data under `apps/web/test-results/real/`). It builds the UI into `apps/web/out-e2e/`, never over `apps/web/out/`, so an assistant already serving `out/` is not disturbed. One test checks that the page is cross-origin isolated as configured, that the worklets load and use the shared counter, and that Stop gives an exact final count; run it once more with `SERVE_CROSS_ORIGIN_ISOLATION=false pnpm e2e:real` to check the page without isolation. It skips when the models, `bench-audio/` or Chromium are missing (`pnpm start bench --make-wavs bench-audio`, `pnpm --filter @pva/web e2e:install`). `pnpm bench:browser` measures latency through the browser (below); `pnpm --filter @pva/web screenshots:real` rewrites `apps/web/screenshots/real-*.png`. The assistant's output and each page's message log are kept under `apps/web/test-results/real/`.
 
 ### On a phone (iPhone Safari or Brave)
 
@@ -336,7 +338,22 @@ BENCH_LLM_FIRST_TOKEN_MS=300 STT_SHERPA_MODEL=<model> STT_SHERPA_EAGER_SILENCE_M
   pnpm start bench --live --rounds 3 <dir with the 7 files>
 ```
 
-End of user audio → reply playback start, median / worst (ms), with the median of each step:
+**With the new default STT** (2026-11-14, same machine; the five `bench-audio` questions, 3 rounds = 15 turns,
+`BENCH_LLM_FIRST_TOKEN_MS=300 pnpm start bench --live --rounds 3 bench-audio`), and the previous default
+model through the same adapter in the same session (`STT_SHERPA_MODEL=nemotron-320 STT_SHERPA_AGC=false`):
+
+| STT model | eager | eot | 1st token | 1st clause | tts audio | **PLAY median / worst** |
+|---|---|---|---|---|---|---|
+| `parakeet-v2` (new default) | 397 | 660 | 730 | 746 | 771 | **771 / 1095** |
+| `nemotron-320` (previous default model) | 393 | 681 | 716 | 731 | 756 | **757 / 1081** |
+
++14 ms at the median for these 2–3 s questions (the study predicted +0.01–0.08 s for 3–5 s turns), every
+turn speculative and promoted, every transcript right; Nemotron heard "like an Amsterdam" in all three
+rounds and returns no final punctuation. Long sentences cost more (a 16 s sentence: about +0.4 s, see the
+stt-sherpa README). The table below is the earlier measurement (21 turns including two LibriSpeech clips,
+so not directly comparable).
+
+End of user audio → reply playback start, median / worst (ms), with the median of each step (2026-11-13, before the change):
 
 | STT model | eager / final silence | eager | eot | 1st token | 1st clause | tts audio | **PLAY median / worst** |
 |---|---|---|---|---|---|---|---|
@@ -453,7 +470,7 @@ Measured on the development machine during `bench --live` (resident memory):
 
 | Process | Default | Alternatives |
 |---|---|---|
-| main process (Node, app, STT worker with the model) | 1.2 GB with `nemotron-3.5` | 430 MB with `zipformer-en` |
+| main process (Node, app, STT worker with the model) | 1.3 GB after loading `parakeet-v2`, 1.66 GB after the first minute, then flat | 2.4 GB `hybrid-nemotron-parakeet`; 1.2 GB `nemotron-560` / `nemotron-320`; 1.9–2.7 GB `whisper-turbo`; 430 MB `zipformer-en` |
 | Piper engine process (`standard` voice) | 280–590 MB (grows with long replies) | |
 | Kokoro engine process (`natural` voice, only when enabled) | about 700 MB (adapter README) | |
 
@@ -467,7 +484,10 @@ Taken from the files in the model archives and the adapter READMEs; nobody has r
 | Piper `nl_NL-pim-medium` | TTS (Dutch) | dataset CC0, but fine-tuned from lessac-medium, so the Lessac terms may carry over |
 | Kokoro v1.0 `af_heart` | TTS (`natural` voice) | Apache-2.0 |
 | `espeak-ng-data` (shipped with every TTS preset) | phonemisation | GPL-3.0 data files |
-| Nemotron 3.5 ASR streaming 0.6B (default STT) | STT | NVIDIA model ([Hugging Face card](https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b)); the archive carries no licence file: **check the card before relying on it** |
+| Parakeet-TDT 0.6B v2 (default STT) | STT | CC-BY-4.0 (NVIDIA); attribution required |
+| Parakeet Ultra (optional) | STT | CC-BY-4.0 (Moondream, derived from NVIDIA Parakeet v3; not an NVIDIA release) |
+| Whisper large-v3-turbo (optional) | STT | MIT (OpenAI) |
+| Nemotron 3.5 ASR streaming 0.6B, 320 / 560 ms (optional) | STT | NVIDIA model ([Hugging Face card](https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b)); the archive carries no licence file: **check the card before relying on it** |
 | Zipformer streaming en 2023-06-26 | STT | Apache-2.0 (archive README) |
 | NeMo FastConformer streaming en | STT | NVIDIA NeMo model; the archive carries no licence file: not checked |
 | Silero VAD | voice activity | MIT (Silero project); not stated in the downloaded file |
@@ -488,6 +508,7 @@ Taken from the files in the model archives and the adapter READMEs; nobody has r
 | PipeWire backend | unit tests with stand-in processes; in voice mode `pw-record` started and delivered audio to a stand-in STT server on the development machine, which has no sound card (so that audio was not a real microphone signal) |
 | Weather module | unit tests with an injected `fetch`; never called against the real Open-Meteo API from the tests |
 | **Serve mode** (WebSocket protocol, ownership, modules and settings from the UI, engine reload, echo gate) | unit tests (module host, echo gate, web audio backend, conversation events) and scripted-client tests against the real server with injected providers; a live test with the local models; run by hand on the development machine with a scripted client streaming `bench-audio` WAVs into `LLM_PROVIDER=fake pnpm start serve`: real recognition, Piper reply audio over the socket, an engine reload with the local models (1.8 s, conversation kept, no engine process left behind), and Ctrl+C leaving no processes |
+| **Speech recognition presets, gain control, diagnostics** (2026-11-14) | real-model tests for Parakeet v2 (whole turn, quiet input, steady noise), the hybrid, Whisper (Dutch), Nemotron 560; measurements on the degraded set and false-trigger runs (stt-sherpa README); `pnpm e2e:real` with Parakeet v2 as the default (10/10, including "say a few words" barge-in through Parakeet's interim words and the This-device diagnostics); by hand with the scripted client on a second server: switching the model from the settings (`settings.update` + `engine.reload`, 1.9 s) to Nemotron 560 and back, the next turn recognised by the new model each time, "Save what the assistant hears" writing WAV + JSON and the log line, then `compare-models` on those files (8 presets, 2 files, 1 min 39 s). Not on a real phone. |
 | **Web UI against the real assistant** (`pnpm e2e:real`, 10 tests; 2026-11-13) | the built page in headless Chromium (no sound card), fake microphone fed from WAVs, real `serve` with the local models and the fake LLM: visual states of a spoken turn in order, transcript and reply in the chat, latency readout; the player worklet really runs (`playback.started`, progress every 250 ms, `finished`); barge-in in `instant` and `confirm` mode with history holding only the clauses that played; `manual` mode ignoring speech over the reply; typed message with a spoken reply; Stop (no stall error, history cut); two pages and a takeover in the middle of a reply; server killed (SIGKILL and SIGINT) in the middle of a reply, then restarted: the page reconnects and gets the audio back without a new Start; a module setting the server rejects, a reconfiguration and disabling/enabling seen in a second page and used on the next turn. Also by hand: the `pnpm dev` page against the real server, and Ctrl+C in `pnpm serve` and `pnpm dev` leaving no processes. Latency through the browser: [Through the browser](#through-the-browser) |
 
 **Not verified:**
@@ -512,7 +533,7 @@ PVA_PIPEWIRE_LIVE=1 pnpm --filter @pva/audio-pipewire test
 ```
 packages/core             service interfaces, Conversation, tool registry, clause chunker, TurnTrace, voice router, test fakes
 packages/llm-anthropic    Llm via @anthropic-ai/sdk
-packages/stt-sherpa       Stt on this machine: sherpa-onnx + Silero VAD in a worker thread, turn detection (default)
+packages/stt-sherpa       Stt on this machine: sherpa-onnx (whole-turn Parakeet/Whisper, streaming Nemotron, hybrid) + Silero VAD + gain control in a worker thread, turn detection (default)
 packages/tts-sherpa       Tts on this machine: Piper / Kokoro via sherpa-onnx, one child process per engine (default)
 packages/stt-deepgram     Stt via Deepgram Flux (hosted, optional)
 packages/tts-cartesia     Tts via Cartesia Sonic (hosted, optional)

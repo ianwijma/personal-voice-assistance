@@ -100,11 +100,11 @@ const request: LlmRequest = {
   tools: []
 }
 
-const collect = (url: string, req: LlmRequest = request) =>
+const collect = (url: string, req: LlmRequest = request, extra: Partial<AnthropicLlmOptions> = {}) =>
   Effect.gen(function*() {
     const llm = yield* Llm
     return yield* Stream.runCollect(llm.stream(req))
-  }).pipe(Effect.provide(layer(options(url))))
+  }).pipe(Effect.provide(layer({ ...options(url), ...extra })))
 
 // ---------------------------------------------------------------------------
 
@@ -308,10 +308,43 @@ describe("AnthropicLlm", () => {
       assert.isTrue(error?._tag === "Fail" && error.error instanceof LlmError)
       const message = error?._tag === "Fail" ? error.error.message : ""
       assert.include(message, "401")
-      assert.include(message, "authentication_error")
-      assert.include(message, "invalid x-api-key")
+      assert.include(message, "rejected the API key")
+      // Fixed text for a rejected key: the upstream message is not repeated (a gateway may echo the key in it).
+      assert.notInclude(message, "invalid x-api-key")
       assert.include(message, "req_123")
       assert.strictEqual(api.bodies.length, 1) // not retried
+    }))
+
+  it.live("upstream text that echoes the API key is redacted from errors (HTTP and mid-stream)", () =>
+    Effect.gen(function*() {
+      const key = "sk-ant-api03-0123456789abcdefSECRET"
+      const denied = yield* fakeApi((_req, res) => {
+        res.writeHead(401, { "content-type": "application/json" })
+        res.end(JSON.stringify({ type: "error", error: { type: "authentication_error", message: `Invalid API key: ${key}` } }))
+      })
+      const e1 = yield* Effect.flip(collect(denied.url, request, { apiKey: Redacted.make(key) }))
+      assert.notInclude(e1.message, key)
+      assert.notInclude(String(e1.cause), key)
+
+      const bad = yield* fakeApi((_req, res) => {
+        res.writeHead(400, { "content-type": "application/json" })
+        res.end(JSON.stringify({ type: "error", error: { type: "invalid_request_error", message: `bad key ${key}` } }))
+      })
+      const e2 = yield* Effect.flip(collect(bad.url, request, { apiKey: Redacted.make(key) }))
+      assert.include(e2.message, "invalid_request_error")
+      assert.notInclude(e2.message, key)
+      assert.notInclude(String(e2.cause), key)
+
+      const midStream = yield* fakeApi((_req, res) => {
+        startSse(res)
+        res.end(
+          sse([messageStart, textStart(0), textDelta(0, "Hi")]) +
+            `event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "api_error", message: `key ${key} failed` } })}\n\n`
+        )
+      })
+      const e3 = yield* Effect.flip(collect(midStream.url, request, { apiKey: Redacted.make(key) }))
+      assert.include(e3.message, "api_error")
+      assert.notInclude(e3.message, key)
     }))
 
   it.live("retries once on overload when nothing was emitted yet", () =>

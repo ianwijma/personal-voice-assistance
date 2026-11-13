@@ -69,6 +69,8 @@ export const makeReframer = (frameBytes: number) => {
  * Microphone stream from a capture process writing raw PCM to stdout. The
  * process is spawned when the stream is consumed and killed when the consumer
  * stops. Capture never ends on its own, so any exit fails the stream.
+ * A consumer that falls behind loses the oldest audio beyond 3 s (`captureBufferFrames`), as the web input does:
+ * a stalled consumer must not make the capture process's output pile up here.
  */
 export const captureStream = (command: Command, frameBytes = captureFrameBytes): Stream.Stream<Uint8Array, AudioError> =>
   Stream.callback<Uint8Array, AudioError>((queue) =>
@@ -85,8 +87,19 @@ export const captureStream = (command: Command, frameBytes = captureFrameBytes):
         else proc.child.stdout.once("close", () => resume(Effect.void))
       })
       Queue.failCauseUnsafe(queue, Cause.fail(new AudioError({ message: describeExit(command, exit, proc.stderr()) })))
-    })
+    }), { bufferSize: captureBufferFrames, strategy: "sliding" }
   )
+
+/** Capture frames held for a consumer that falls behind: 3 s of 20 ms frames. */
+export const captureBufferFrames = 150
+
+/**
+ * A player that stops reading (a hung PipeWire, a stopped process) would hold the reply, and the turn, for ever.
+ * A write that waits longer than this, or an exit that does not follow the end of input within it, fails the
+ * playback (the player is killed). Longer than the most a player legitimately takes: draining what is buffered
+ * ahead of it (the ~200 KiB pipe, about 4.5 s at 22.05 kHz).
+ */
+export const PLAYER_STALL_MS = 10_000
 
 /**
  * Play `audio` through a player process reading raw PCM from stdin; returns
@@ -109,7 +122,7 @@ export const captureStream = (command: Command, frameBytes = captureFrameBytes):
  * measured ~176 KiB in the stall test) plus Node's 16 KiB highWaterMark. That
  * read-ahead only protects against underruns; all of it is dropped on kill.
  */
-export const playThrough = <E>(command: Command, audio: Stream.Stream<Uint8Array, E>): Effect.Effect<void, E | AudioError> =>
+export const playThrough = <E>(command: Command, audio: Stream.Stream<Uint8Array, E>, stallMs = PLAYER_STALL_MS): Effect.Effect<void, E | AudioError> =>
   Effect.scoped(
     Effect.gen(function*() {
       const proc = yield* spawnScoped(command)
@@ -134,12 +147,16 @@ export const playThrough = <E>(command: Command, audio: Stream.Stream<Uint8Array
           })
         })
 
-      const feed = Stream.runForEach(audio, write).pipe(
+      const stalled = (what: string) => () =>
+        Effect.fail(new AudioError({ message: `${command.command} ${what} for ${stallMs} ms; playback stopped` }))
+      const feed = Stream.runForEach(audio, (chunk) =>
+        Effect.timeoutOrElse(write(chunk), { duration: stallMs, orElse: stalled("stopped reading its input") })).pipe(
         Effect.andThen(Effect.sync(() => {
           ended = true
           stdin.end()
         })),
-        Effect.andThen(Effect.never)
+        Effect.andThen(Effect.sleep(stallMs)),
+        Effect.andThen(stalled("did not exit after the end of its input")())
       )
 
       const exit = yield* Effect.raceFirst(feed, Deferred.await(proc.exited))

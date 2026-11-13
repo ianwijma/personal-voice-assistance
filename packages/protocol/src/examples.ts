@@ -193,7 +193,7 @@ export const clientExamples: { readonly [T in ClientMessageType]: Extract<Client
   "playback.started": { type: "playback.started", turnId: 12, outputLatencyMs: 21.3, startDelayMs: 0 },
   "playback.progress": { type: "playback.progress", turnId: 12, playedSamples: 11_025, underruns: 0 },
   "playback.finished": { type: "playback.finished", turnId: 12, playedSamples: 52_920 },
-  "playback.stopped": { type: "playback.stopped", turnId: 12, playedSamples: 17_640 },
+  "playback.stopped": { type: "playback.stopped", turnId: 12, playedSamples: 17_640, exact: true },
   "interrupt": { type: "interrupt", turnId: 12 },
   "text.send": { type: "text.send", requestId: "r1", text: "What time is it in Tokyo?", speak: true },
   "module.enable": { type: "module.enable", requestId: "r2", moduleId: "weather" },

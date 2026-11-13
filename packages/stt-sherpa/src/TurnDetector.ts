@@ -14,7 +14,11 @@
  *   finalises the new segment and sends `EagerEndOfTurn` again.
  * - After `finalSilenceMs`: `EndOfTurn` with the same text as the last
  *   `EagerEndOfTurn` (segments are already final, nothing is re-decoded).
- * - A turn whose segments contain no words ends silently.
+ * - Every utterance that got `SpeechStarted` ends with `EndOfTurn`: with an
+ *   empty `text` when no words were recognised (noise, a turn dropped because
+ *   the recogniser was overloaded, or input that ended first). An utterance
+ *   that never got `SpeechStarted` (a click) ends with no event. `EagerEndOfTurn`
+ *   is never empty.
  * - When a turn ends (committed, or dropped because it had no words), the
  *   detector says so (`Commit`), so a recogniser that keeps the turn's audio
  *   can drop it.
@@ -52,8 +56,11 @@ export type TurnInput =
 
 export type TurnOutput =
   | SttEvent
-  /** Finalise the open segment, unless the VAD saw speech after frame `frame`. */
-  | { readonly _tag: "Finalize"; readonly frame: number }
+  /**
+   * Finalise the open segment, unless the VAD saw speech after frame `frame`. With `through`: finalise the turn
+   * as it was at frame `frame` (whole-turn recognisers decode its audio up to that frame), whatever came after.
+   */
+  | { readonly _tag: "Finalize"; readonly frame: number; readonly through?: true }
   /** The turn ended at frame `frame` (committed or dropped). */
   | { readonly _tag: "Commit"; readonly frame: number }
 
@@ -101,6 +108,13 @@ export class TurnDetector {
   private finalFrame = -1
   /** Speech of at least `minSpeechMs` came after that point: the next turn has started. */
   private nextTurnStarted = false
+  /**
+   * The user went on (speech of at least `minSpeechMs`) while a `Finalize` was pending, before the final
+   * threshold: that answer does not cover the whole turn.
+   */
+  private resumedWhilePending = false
+  /** VAD speech after the final threshold while its answer was awaited (the next turn's audio). */
+  private heardAfterFinal = false
   private ended = false
   /** Text of the `EagerEndOfTurn` that has not been resumed. */
   private eagerText: string | undefined = undefined
@@ -129,6 +143,9 @@ export class TurnDetector {
       case "SegmentCancelled":
         this.pending = false
         this.heard = true
+        // Speech after the request, but the turn already ended at the final threshold (input that arrives in
+        // bursts, or a worker far behind): decode the turn as it was at that point, then go on with the rest.
+        if (this.finalDue) this.finalizeThrough(out)
         break
       case "End":
         this.ended = true
@@ -157,11 +174,15 @@ export class TurnDetector {
       this.speechMs += FRAME_MS
       this.silenceMs = 0
       this.heard = true
+      if (this.finalDue && this.pending) this.heardAfterFinal = true
       if (this.speechMs >= this.options.minSpeechMs) {
         // The turn is over (final threshold passed), only its answer is awaited: this speech is the next turn.
         if (this.finalDue && this.pending) this.nextTurnStarted = true
-        else if (!this.open) this.openTurn(out)
-        else this.resume(out)
+        else {
+          if (this.pending) this.resumedWhilePending = true
+          if (!this.open) this.openTurn(out)
+          else this.resume(out)
+        }
       }
       return
     }
@@ -210,7 +231,15 @@ export class TurnDetector {
         return
       }
     } else if (text) this.segments.push(text)
-    if (this.heard && this.finalDue && !this.ended) {
+    if (this.finalDue && this.resumedWhilePending) {
+      // The turn ended at the final threshold, but the user had gone on while this answer was being decoded,
+      // before that point: the answer misses those words (streaming: they are in a segment still open). Decode the turn through the final threshold again
+      // before committing it (committing now would drop that audio). Speech after the threshold, if any,
+      // stays the next turn's (`heard` / `nextTurnStarted` are kept).
+      this.finalizeThrough(out)
+      return
+    }
+    if (this.heard && this.finalDue) {
       // The turn ended at the final threshold while its answer was being decoded (a slow model); the speech
       // since then belongs to the next turn, not to this one.
       const started = this.nextTurnStarted
@@ -219,6 +248,8 @@ export class TurnDetector {
       this.heard = true
       this.silenceMs = silenceMs
       if (started) this.openTurn(out)
+      // The input is over: nothing else will finalise the next turn.
+      if (this.ended) this.finalize(out)
       return
     }
     if (this.heard) {
@@ -234,6 +265,14 @@ export class TurnDetector {
     this.resume(out)
     this.eagerText = joined
     out.push({ _tag: "EagerEndOfTurn", text: joined })
+  }
+
+  /** Finalise the turn that ended at the final threshold, through that frame, whatever came after it. */
+  private finalizeThrough(out: Array<TurnOutput>): void {
+    this.resumedWhilePending = false
+    this.heard = this.heardAfterFinal
+    this.pending = true
+    out.push({ _tag: "Finalize", frame: this.finalFrame, through: true })
   }
 
   private finalize(out: Array<TurnOutput>): void {
@@ -255,13 +294,16 @@ export class TurnDetector {
 
   private commit(out: Array<TurnOutput>, frame: number = this.frame): void {
     const text = this.text()
-    if (text) {
+    if (text || this.open) {
       if (!this.open) out.push(SPEECH_STARTED)
+      // Empty when no words were recognised: the utterance that `SpeechStarted` opened is over all the same.
       out.push({ _tag: "EndOfTurn", text })
     }
     out.push({ _tag: "Commit", frame })
     this.finalFrame = -1
     this.nextTurnStarted = false
+    this.resumedWhilePending = false
+    this.heardAfterFinal = false
     this.open = false
     this.segments = []
     this.partial = ""

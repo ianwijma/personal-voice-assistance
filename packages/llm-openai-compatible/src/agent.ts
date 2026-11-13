@@ -8,9 +8,10 @@
  * for a home server sends one tiny request in the background so the model is
  * loaded before the first turn (a cold local model load takes seconds).
  */
-import { type AgentImplementation, defineAgent, makeModelAgent, ModuleStartError, Setting, type SettingsSpec } from "@pva/core"
+import { type AgentImplementation, defineAgent, makeModelAgent, type ModuleContext, ModuleStartError, Setting, type SettingsSpec } from "@pva/core"
 import { Effect, Redacted, Stream } from "effect"
-import { type ModelListError, listModels } from "./models.ts"
+import { ADDRESS_RULES, type ModelListError, listModels } from "./models.ts"
+import { addressSecrets, checkAddress, clip, fromUpstream, sanitize, type Secrets, secretList } from "./redact.ts"
 import { make } from "./OpenAiCompatibleLlm.ts"
 import { type ModelInfo, type ProfileId, profiles, type ReasoningEffort, resolveBaseUrl } from "./profiles.ts"
 
@@ -47,14 +48,14 @@ const serverOptions = [
   { value: "generic", label: "Other OpenAI-compatible server" }
 ] as const
 
-const checkUrl = (value: string): string | undefined => {
+/** The address check of the settings form: never repeats the value (it may hold a password). */
+export const checkUrl = (value: string): string | undefined => {
   if (value.trim() === "") return undefined
-  try {
-    const url = new URL(value.trim())
-    return url.protocol === "http:" || url.protocol === "https:" ? undefined : "Must start with http:// or https://"
-  } catch {
-    return "Must be an address such as http://192.168.1.20:11434/v1"
-  }
+  const address = checkAddress(value, ADDRESS_RULES)
+  if (address.ok) return undefined
+  return address.problem === "is not a valid address"
+    ? "Must be an address such as http://192.168.1.20:11434/v1"
+    : `${address.problem[0]!.toUpperCase()}${address.problem.slice(1)}`
 }
 
 const checkTemperature = (value: string): string | undefined => {
@@ -184,6 +185,8 @@ const homeSettings = (p: string, defaultModel: string) => {
   }
 }
 
+type SetStatus = ModuleContext<unknown>["setStatus"]
+
 /** What `start` reads, whichever variant declared it. */
 interface RawSettings {
   readonly server?: ProfileId
@@ -199,11 +202,11 @@ interface RawSettings {
   readonly warmUp?: boolean
 }
 
-const startError = (error: ModelListError, hint: string) =>
-  new ModuleStartError({
+const startError = (secrets: Secrets, error: ModelListError, hint: string) =>
+  new ModuleStartError(sanitize(secrets, {
     message: error.reason === "unauthorized" ? `${error.message}. Check the API key.` : `${error.message}. ${hint}`,
     cause: error
-  })
+  }))
 
 /** An agent over one OpenAI-compatible endpoint. Another endpoint is one more call of this in the catalog. */
 export const openAiCompatibleAgent = (options: OpenAiCompatibleAgentOptions) => {
@@ -219,10 +222,28 @@ export const openAiCompatibleAgent = (options: OpenAiCompatibleAgentOptions) => 
     kind: "model",
     enabledByDefault: options.enabledByDefault ?? false,
     settings,
-    start: ({ setStatus, settings: s }) =>
-      Effect.gen(function*() {
-        const raw = s as unknown as RawSettings
+    start: ({ setStatus: setUnsafeStatus, settings: s }) => {
+      // Every secret-typed setting and every credential part of the configured address (also of one too
+      // malformed to use) is masked in errors and status lines; known before anything can fail.
+      const raw = s as unknown as RawSettings
+      const secrets: Secrets = secretList(raw.apiKey, addressSecrets(raw.baseUrl))
+      return startAgent(raw, setUnsafeStatus, secrets).pipe(
+        // The last resort: anything unexpected leaves as a sanitised start error.
+        Effect.catchDefect((defect) =>
+          Effect.fail(new ModuleStartError(sanitize(secrets, { message: `The agent could not start: ${fromUpstream(defect, secrets)}`, cause: defect })))
+        ),
+        Effect.mapError((e) => new ModuleStartError(sanitize(secrets, { message: e.message, cause: e.cause })))
+      )
+    }
+  })
+
+  function startAgent(raw: RawSettings, setUnsafeStatus: SetStatus, secrets: Secrets) {
+    return Effect.gen(function*() {
         const profile = profiles[fixed ?? raw.server ?? "generic"]
+        if (raw.baseUrl.trim() !== "") {
+          const address = checkAddress(raw.baseUrl, ADDRESS_RULES)
+          if (!address.ok) return yield* new ModuleStartError({ message: `The server address ${address.problem}.` })
+        }
         const baseUrl = resolveBaseUrl(profile, raw.baseUrl)
         if (baseUrl === undefined) {
           return yield* new ModuleStartError({
@@ -236,12 +257,15 @@ export const openAiCompatibleAgent = (options: OpenAiCompatibleAgentOptions) => 
           return yield* new ModuleStartError({ message: `Add your ${profile.label} API key.` })
         }
         const apiKey = key === "" ? undefined : Redacted.make(key)
+        // Status lines carry upstream text too (model names, error messages): redacted, then shortened.
+        const setStatus: SetStatus = (status) =>
+          setUnsafeStatus(status === undefined ? undefined : { ...status, text: clip(status.text, secrets, 120) })
         const fetchOption = options.fetch !== undefined ? { fetch: options.fetch } : {}
 
         setStatus({ text: `Connecting to ${profile.label}…`, tone: "neutral" })
         const models: ReadonlyArray<ModelInfo> = yield* listModels({ profile, baseUrl, apiKey, timeoutMs: 2_000, ...fetchOption }).pipe(
           Effect.mapError((e) =>
-            startError(e, fixed !== undefined ? "Check the connection." : "Is the server running, and reachable from this machine?")
+            startError(secrets, e, fixed !== undefined ? "Check the connection." : "Is the server running, and reachable from this machine?")
           )
         )
         const model = raw.model.trim() !== "" ? raw.model.trim() : models[0]?.id
@@ -280,7 +304,7 @@ export const openAiCompatibleAgent = (options: OpenAiCompatibleAgentOptions) => 
           yield* warm.stream({ system: "", messages: [{ role: "user", content: "Hi" }], tools: [] }).pipe(
             Stream.runDrain,
             Effect.tap(() => Effect.sync(() => setStatus(ready))),
-            Effect.catch((e) => Effect.sync(() => setStatus({ text: `Loading the model failed: ${e.message}`.slice(0, 120), tone: "warning" }))),
+            Effect.catch((e) => Effect.sync(() => setStatus({ text: `Loading the model failed: ${e.message}`, tone: "warning" }))),
             Effect.forkScoped
           )
         } else {
@@ -295,7 +319,7 @@ export const openAiCompatibleAgent = (options: OpenAiCompatibleAgentOptions) => 
         }
         return impl
       })
-  })
+  }
 }
 
 export const openRouterAgent = openAiCompatibleAgent({

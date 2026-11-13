@@ -156,10 +156,29 @@ describe("JevClient against a fake /v1/systemone", () => {
       const first = yield* Effect.flip(jev.decide(plan.request))
       assert.strictEqual(first.reason, "unavailable")
       assert.isTrue(isKeyRejected(first))
-      assert.include(first.message, "TypeSafe rejected the API key (401): Invalid API key")
+      // Fixed text: the upstream body is not repeated (a gateway may echo the key in it).
+      assert.strictEqual(first.message, "TypeSafe rejected the API key (401)")
       const second = yield* Effect.flip(jev.decide(plan.request))
       assert.isTrue(isKeyRejected(second))
       assert.strictEqual(api.requests.length, 1)
+    }))
+
+  it.live("upstream text that echoes the key is never put into an error", () =>
+    Effect.gen(function*() {
+      const key = "ts-live-0123456789abcdefSECRET"
+      const keyed = (url: string) => makeJevClient({ apiKey: Redacted.make(key), baseUrl: url, timeoutMs: 1_000 })
+      const denied = yield* fakeJev(reply(401, { detail: `Invalid API key: ${key}` }))
+      const e1 = yield* Effect.flip(keyed(denied.url).decide(plan.request))
+      assert.notInclude(e1.message, key)
+      assert.notInclude(String(e1.cause), key)
+      const refused = yield* fakeJev(reply(400, { detail: `Unknown model for key ${key}` }))
+      const e2 = yield* Effect.flip(keyed(refused.url).decide(plan.request))
+      assert.include(e2.message, "Unknown model")
+      assert.notInclude(e2.message, key)
+      const odd = yield* fakeJev(reply(200, { answers: { fits: { type: "noul", noul: key } } }))
+      const e3 = yield* Effect.flip(keyed(odd.url).decide(plan.request))
+      assert.strictEqual(e3.reason, "invalid")
+      assert.notInclude(e3.message, key)
     }))
 
   it.live("429 and 529 are 'unavailable' (service failed), not retried, not key-rejected", () =>

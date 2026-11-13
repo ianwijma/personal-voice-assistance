@@ -1,6 +1,7 @@
 import { makeWebAudio, type WebAudio } from "@pva/audio-web"
 import {
   type ConversationEvent,
+  type HostResult,
   ECHO_TAIL_MS,
   makeEchoGate,
   makeModuleHost,
@@ -19,6 +20,7 @@ import { fileURLToPath } from "node:url"
 import { defaultSystemPrompt } from "../config.ts"
 import { userCwd } from "../env.ts"
 import { moduleCatalog, withModuleInstructions } from "../modules.ts"
+import { acquireDataDirLock, type DataDirLockError } from "./DataDirLock.ts"
 import { defaultPreflight, defaultProviderBuilder, type Engine, EngineBuildProblems, makeEngine, type ProviderBuilder } from "./Engine.ts"
 import { type HttpError, type HttpServer, startHttp, webDirExists } from "./http.ts"
 import { makeHeardAudio } from "./HeardAudio.ts"
@@ -40,11 +42,19 @@ import { makeStateTracker } from "./StateTracker.ts"
 
 const repoRoot = fileURLToPath(new URL("../../../../", import.meta.url))
 
+/** How long a start after unblocking waits for a module (or the engines) busy with another operation. */
+const IDLE_WAIT_MS = 30_000
+const IDLE_POLL_MS = 25
+
 export interface ServeOptions {
   readonly host: string
   readonly port: number
   readonly allowedOrigins: ReadonlyArray<string>
+  /** Host names the server answers to besides IP literals and `localhost` (`SERVE_ALLOWED_HOSTS`). */
+  readonly allowedHosts?: ReadonlyArray<string>
   readonly tls?: { readonly certFile: string; readonly keyFile: string } | undefined
+  /** Cross-origin isolation headers on the page and its files (`SERVE_CROSS_ORIGIN_ISOLATION`). Default on. */
+  readonly crossOriginIsolation?: boolean
   readonly webDir: string
   readonly dataDir: string
   readonly catalog?: ReadonlyArray<ModuleDefinition<any>>
@@ -71,11 +81,23 @@ export interface ServeHandle {
   readonly ready: Effect.Effect<void>
 }
 
-export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, HttpError | SettingsStoreError, Scope.Scope> =>
+export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, HttpError | SettingsStoreError | DataDirLockError, Scope.Scope> =>
   Effect.gen(function*() {
     const env = options.env ?? process.env
-    const store = yield* loadSettingsStore(options.dataDir)
+    // Before anything in the data directory is read or recovered, and held until the server stops: the one writer.
+    const lock = yield* acquireDataDirLock(options.dataDir)
+    const store = yield* loadSettingsStore(options.dataDir, { lock })
     for (const problem of store.problems) yield* Effect.logError(problem)
+    /**
+     * Settings and keys that may come from two saves (a damaged journal): nothing that uses them starts. Every page
+     * sees why in the engine status (`failed`, problem stage "settings"), the bar at the top of the page; the
+     * settings stay editable, and the first successful save starts the engines and the enabled modules.
+     */
+    const settingsProblem = () => {
+      const why = store.blocked()
+      return why === undefined ? undefined : { stage: "settings", message: why }
+    }
+    if (store.blocked() !== undefined) yield* Effect.logError(store.blocked()!)
     const sections = makeSections(store, env)
     const host = yield* makeModuleHost({ catalog: options.catalog ?? moduleCatalog, persistence: store.modulePersistence, env })
     const turnTrace = options.turnTrace ?? makeTurnTrace()
@@ -107,6 +129,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     let unsuppress: ReturnType<typeof setTimeout> | undefined
     const web: WebAudio = yield* makeWebAudio({
       ...(options.stallMs !== undefined ? { stallMs: options.stallMs } : {}),
+      log: (line) => runFork(Effect.logWarning(line)),
       onPlayback: (event) => {
         if (event._tag === "started") {
           tracker.playbackStarted(event.turnId)
@@ -182,8 +205,12 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
         lastLost = hub?.micFramesLost() ?? 0
         return delta
       },
-      log: (line) => runFork(Effect.logInfo(line))
+      log: (line) => runFork(Effect.logInfo(line)),
+      writable: () => lock.held(),
+      begin: lock.begin
     })
+    // Before the lock is released (finalizers run in reverse): no recording write or rotation after it.
+    yield* Effect.addFinalizer(() => Effect.promise(() => heard.close()))
     const input = { stream: web.input.stream.pipe(Stream.tap((chunk) => Effect.sync(() => heard.audio(chunk)))) }
 
     let lastTranscript = ""
@@ -235,7 +262,8 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       onEvent,
       gate: gateStream,
       defaultVoice: () => String(sections.value("DEFAULT_VOICE")),
-      onStatus: (status) => broadcast({ type: "engine", engine: status })
+      onStatus: (status) => broadcast({ type: "engine", engine: status }),
+      blocked: settingsProblem
     })
     const theEngine = engine
 
@@ -268,14 +296,66 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       port: options.port,
       webDir: options.webDir,
       allowedOrigins: options.allowedOrigins,
+      allowedHosts: options.allowedHosts ?? [],
       tls: options.tls,
+      crossOriginIsolation: options.crossOriginIsolation ?? true,
       hub: theHub,
       ...(options.pingIntervalMs !== undefined ? { pingIntervalMs: options.pingIntervalMs } : {})
     })
 
-    // Modules and engines start in parallel; neither waits for the other.
-    const modulesStarted = yield* Effect.forkScoped(host.startEnabled)
+    /**
+     * Runs `operation` (a module or engine operation) until it is not refused as `busy`: another operation on the
+     * same module (or an engine rebuild) is still running, and this one comes after it. Polled every
+     * `IDLE_POLL_MS` while `wanted()` still holds, at most `IDLE_WAIT_MS`; any other failure is logged.
+     */
+    const whenIdle = (what: string, wanted: () => boolean, operation: Effect.Effect<HostResult>): Effect.Effect<void> =>
+      Effect.gen(function*() {
+        const deadline = Date.now() + IDLE_WAIT_MS
+        while (wanted()) {
+          const result = yield* operation
+          if (result.ok) return
+          if (result.error.code !== "busy") return yield* Effect.logWarning(`Could not start ${what}: ${result.error.message}`)
+          if (Date.now() >= deadline) {
+            return yield* Effect.logWarning(`Could not start ${what}: it was still busy after ${IDLE_WAIT_MS / 1000} s (${result.error.message})`)
+          }
+          yield* Effect.sleep(IDLE_POLL_MS)
+        }
+      })
+    /** Brings the running modules in line with the enabled set: starts every enabled module that is not running. */
+    const reconcileModules = Effect.suspend(() =>
+      Effect.forEach(
+        host.modules().filter((m) => m.enabled && m.state === "disabled").map((m) => m.id),
+        (id) => {
+          // Still enabled and still not started (the owner may have disabled or started it meanwhile).
+          const waiting = () => host.modules().some((m) => m.id === id && m.enabled && m.state === "disabled")
+          return whenIdle(`module ${id}`, waiting, host.enable(id))
+        },
+        { concurrency: "unbounded", discard: true }
+      )
+    )
+
+    // Modules and engines start in parallel; neither waits for the other. While the settings may come from two
+    // saves, the engine start only reports why (see `settingsProblem`) and no module starts, until a save.
+    const blockedAtStart = store.blocked() !== undefined
+    // `startEnabled` skips a module another operation holds (a request from a page that connected first); the
+    // reconcile after it starts that one once the operation has finished.
+    const modulesStarted = yield* Effect.forkScoped(blockedAtStart ? Effect.void : Effect.andThen(host.startEnabled, reconcileModules))
     const engineStarted = yield* Effect.forkScoped(theEngine.start)
+    if (blockedAtStart) {
+      // Called from inside the save, which may be a module operation that still holds that module's guard: the
+      // module is started once that operation has finished (`whenIdle`), not refused as `busy` and forgotten.
+      store.onUnblocked(() =>
+        run(Effect.gen(function*() {
+          yield* Effect.logInfo("The settings were saved: starting the engines and the enabled modules.")
+          yield* Effect.all([
+            // `startIfStopped`: after waiting out a `busy` (a reload the owner sent meanwhile), the engines
+            // that reload brought up must not be rebuilt.
+            whenIdle("the engines", () => true, theEngine.startIfStopped),
+            reconcileModules
+          ], { concurrency: 2, discard: true })
+        }))
+      )
+    }
     const ready = Effect.asVoid(Effect.all([Fiber.await(modulesStarted), Fiber.await(engineStarted)]))
 
     return { http, hub: theHub, engine: theEngine, host, web, ready }
@@ -291,6 +371,12 @@ export const ServeConfig = Config.all({
     Config.withDefault("http://localhost:3000,http://127.0.0.1:3000"),
     Config.map((s) => s.split(",").map((o) => o.trim()).filter((o) => o.length > 0))
   ),
+  allowedHosts: Config.String("SERVE_ALLOWED_HOSTS").pipe(
+    Config.withDefault(""),
+    Config.map((s) => s.split(",").map((h) => h.trim()).filter((h) => h.length > 0))
+  ),
+  // Off only to rule it out when the page fails to load on some browser (see the README).
+  crossOriginIsolation: Config.Boolean("SERVE_CROSS_ORIGIN_ISOLATION").pipe(Config.withDefault(true)),
   tlsCert: Config.option(Config.String("SERVE_TLS_CERT")),
   tlsKey: Config.option(Config.String("SERVE_TLS_KEY")),
   webDir: Config.String("PVA_WEB_DIR").pipe(

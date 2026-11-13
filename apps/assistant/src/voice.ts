@@ -84,7 +84,7 @@ export const voiceMode = Effect.scoped(Effect.gen(function*() {
       micError = e
     })))
     const events = stt.transcribe(mic).pipe(
-      Stream.tap((event) => event._tag === "EndOfTurn" ? Effect.sync(() => console.log(`you: ${event.text}`)) : Effect.void)
+      Stream.tap((event) => event._tag === "EndOfTurn" && event.text !== "" ? Effect.sync(() => console.log(`you: ${event.text}`)) : Effect.void)
     )
     yield* Effect.logInfo(`Listening (audio: ${backend}, LLM: ${llmProvider}, voices: ${voices.enabled.map((v) => v.name).join(", ")}). Press Ctrl+C to quit.`)
     yield* conversation.voice(events).pipe(

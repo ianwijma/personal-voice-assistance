@@ -1,7 +1,7 @@
 import { applySettingsPatch, type HostResult, resolveSettings, Setting, type SettingsSpec } from "@pva/core"
 import type { SettingsPatch, SettingsSection, SettingValue } from "@pva/protocol"
 import * as SherpaStt from "@pva/stt-sherpa"
-import { ConfigProvider, Effect } from "effect"
+import { ConfigProvider, Effect, Semaphore } from "effect"
 import { defaultSystemPrompt } from "../config.ts"
 import { voiceCatalog } from "../voices.ts"
 import type { SettingsStore } from "./SettingsStore.ts"
@@ -320,19 +320,34 @@ export const makeSections = (store: SettingsStore, env: Readonly<Record<string, 
     revision: revisions.get(d.id) ?? 0
   })
 
+  /**
+   * Effective values by key, built on first use and dropped after every save. `value` is read for every
+   * microphone frame (RECORD_HEARD_AUDIO); building the sections checks the recogniser model files on disk,
+   * which belongs in forms (`list`), not in a per-frame lookup.
+   */
+  let effective: Map<string, SettingValue | undefined> | undefined
+  const effectiveValues = () => {
+    if (effective === undefined) {
+      const values = new Map<string, SettingValue | undefined>()
+      for (const d of current()) {
+        const resolved = resolveSettings(d.spec, sources(d.id)).form.values
+        for (const key of Object.keys(d.spec)) if (!values.has(key)) values.set(key, resolved[key])
+      }
+      effective = values
+    }
+    return effective
+  }
+
+  const updateLock = Semaphore.makeUnsafe(1)
   const nonEmptyEnv: Record<string, string> = {}
   for (const [key, value] of Object.entries(env)) if (value !== undefined && value !== "") nonEmptyEnv[key] = value
 
   return {
     list: () => current().map(describe),
-    value: (key) => {
-      for (const d of current()) {
-        if (Object.hasOwn(d.spec, key)) return resolveSettings(d.spec, sources(d.id)).form.values[key]
-      }
-      return undefined
-    },
+    value: (key) => effectiveValues().get(key),
+    // Read, validate and save as one step: two saves of a section at once must not each start from the old values.
     update: (id, patch) =>
-      Effect.gen(function*() {
+      updateLock.withPermit(Effect.gen(function*() {
         const d = current().find((s) => s.id === id)
         if (d === undefined) return { result: { ok: false, error: { code: "unknown_section", message: `There is no settings section "${id}"` } }, reload: false } as const
         const missingModel = id === "listening" ? checkModel(patch, env) : []
@@ -348,6 +363,7 @@ export const makeSections = (store: SettingsStore, env: Readonly<Record<string, 
           yield* Effect.logError(saved.failure.message, saved.failure.cause)
           return { result: { ok: false, error: { code: "internal", message: `${saved.failure.message}; nothing was changed` } }, reload: false } as const
         }
+        effective = undefined
         const changed = [...Object.keys(patch.values), ...Object.keys(patch.secrets)]
         const needsReload = changed.some((key) => {
           const field = d.spec[key]?.describe(key)
@@ -362,7 +378,7 @@ export const makeSections = (store: SettingsStore, env: Readonly<Record<string, 
           for (const listener of listeners) listener(section)
         }
         return { result: { ok: true }, reload: needsReload } as const
-      }),
+      })),
     configProvider: () => {
       const saved: Record<string, string> = {}
       const settings = store.settings().sections

@@ -2,22 +2,24 @@
  * The `jev-typesafe` decision-provider module (docs/AGENTS-AND-INTENTS.md §1.6, §3.7):
  * one file and one catalog line.
  */
-import { type DecisionError, defineDecider, type ModuleContext, ModuleStartError, Setting } from "@pva/core"
+import { type DecisionError, type DecisionRequest, defineDecider, type ModuleContext, ModuleStartError, Setting } from "@pva/core"
 import { Effect, Redacted } from "effect"
-import { defaults, isKeyRejected, makeJevClient, pingRequest } from "./JevClient.ts"
+import { ADDRESS_RULES, defaults, isKeyRejected, makeJevClient, pingRequest } from "./JevClient.ts"
+import { addressSecrets, checkAddress, clip, fromUpstream, sanitize, type Secrets, secretList } from "./redact.ts"
 
-const checkUrl = (value: string): string | undefined => {
-  try {
-    const url = new URL(value)
-    return url.protocol === "https:" || url.protocol === "http:" ? undefined : "Must start with https:// or http://"
-  } catch {
-    return "Must be an address such as https://api.typesafe.ai"
-  }
+/** The address check of the settings form: never repeats the value (it may hold a password). */
+export const checkUrl = (value: string): string | undefined => {
+  const address = checkAddress(value, ADDRESS_RULES)
+  if (address.ok) return undefined
+  return address.problem === "is not a valid address"
+    ? "Must be an address such as https://api.typesafe.ai"
+    : `${address.problem[0]!.toUpperCase()}${address.problem.slice(1)}`
 }
 
 type StatusLine = NonNullable<Parameters<ModuleContext<unknown>["setStatus"]>[0]>
 
-const status = (text: string, tone: StatusLine["tone"]): StatusLine => ({ text: text.length > 120 ? `${text.slice(0, 119)}…` : text, tone })
+/** Status lines carry upstream text (the model name, error messages): masked like errors, before shortening. */
+const statusWith = (secrets: Secrets) => (raw: string, tone: StatusLine["tone"]): StatusLine => ({ text: clip(raw, secrets, 119), tone })
 
 /** The start check may open a fresh TLS connection, so it gets more time than a decision. */
 const START_CHECK_MS = 3_000
@@ -73,11 +75,18 @@ export const makeJevDecider = (options: JevDeciderOptions = {}) => {
         description: "A slower answer is dropped and the conversational agent answers instead."
       })
     },
-    start: ({ setStatus, settings }) =>
-      Effect.gen(function*() {
+    start: ({ setStatus, settings }) => {
+      // Every secret-typed setting and every credential part of the address, known before anything can fail.
+      let secrets: Secrets = []
+      return Effect.gen(function*() {
+        secrets = secretList(settings.apiKey, addressSecrets(settings.baseUrl))
         if (settings.apiKey === undefined || settings.apiKey.trim() === "") {
           return yield* new ModuleStartError({ message: "Add your TypeSafe API key (console.typesafe.ai/keys)." })
         }
+        const address = checkAddress(settings.baseUrl, ADDRESS_RULES)
+        if (!address.ok) return yield* new ModuleStartError({ message: `The TypeSafe address ${address.problem}.` })
+        const status = statusWith(secrets)
+        const startError = (fields: ConstructorParameters<typeof ModuleStartError>[0]) => new ModuleStartError(sanitize(secrets, fields))
         const common = {
           apiKey: Redacted.make(settings.apiKey.trim()),
           baseUrl: settings.baseUrl,
@@ -91,10 +100,10 @@ export const makeJevDecider = (options: JevDeciderOptions = {}) => {
         if (checked._tag === "Failure") {
           const error = checked.failure
           if (isKeyRejected(error)) {
-            return yield* new ModuleStartError({ message: "TypeSafe rejected the API key: check it at console.typesafe.ai/keys.", cause: error })
+            return yield* startError({ message: "TypeSafe rejected the API key: check it at console.typesafe.ai/keys.", cause: error })
           }
           if (error.reason === "rejected") {
-            return yield* new ModuleStartError({ message: `${error.message}. Is the model name "${common.model}" right?`, cause: error })
+            return yield* startError({ message: `${error.message}. Is the model name "${common.model}" right?`, cause: error })
           }
           // A passing outage must not leave the module in an error state: decisions are tried per turn.
           setStatus(status(`Start check failed (${error.message}); will try again on the next decision`, "warning"))
@@ -113,13 +122,20 @@ export const makeJevDecider = (options: JevDeciderOptions = {}) => {
           )
         return {
           location: "hosted" as const,
-          decide: (request) =>
+          decide: (request: DecisionRequest) =>
             client.decide(request).pipe(
               Effect.tap(() => Effect.sync(() => setStatus(status(`Last decision ${client.lastMs() ?? "?"} ms`, "ok")))),
               Effect.tapError(report)
             )
         }
-      })
+      }).pipe(
+        // The last resort: anything unexpected leaves as a sanitised start error.
+        Effect.catchDefect((defect) =>
+          Effect.fail(new ModuleStartError(sanitize(secrets, { message: `TypeSafe could not start: ${fromUpstream(defect, secrets)}`, cause: defect })))
+        ),
+        Effect.mapError((e) => new ModuleStartError(sanitize(secrets, { message: e.message, cause: e.cause })))
+      )
+    }
   })
 }
 

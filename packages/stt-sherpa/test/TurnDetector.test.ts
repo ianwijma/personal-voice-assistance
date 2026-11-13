@@ -128,9 +128,19 @@ describe("TurnDetector", () => {
     ])
   })
 
-  it("noise with no words: SpeechStarted (barge-in) but no turn events", () => {
+  it("noise with no words: SpeechStarted (barge-in), then an empty EndOfTurn closes the utterance; never an empty eager", () => {
     const out = run([speech(300), silence(260), segment(""), silence(600)])
-    assert.deepStrictEqual(tags(out), ["SpeechStarted", "Finalize"])
+    assert.deepStrictEqual(tags(out), ["SpeechStarted", "Finalize", "EndOfTurn()"])
+  })
+
+  it("every SpeechStarted is closed by one EndOfTurn: no words, end of input, and an empty answer after the final threshold", () => {
+    // Input that ends during the utterance, before any words.
+    assert.deepStrictEqual(tags(run([speech(300), { _tag: "End" }, segment("")])), ["SpeechStarted", "Finalize", "EndOfTurn()"])
+    // The answer (empty: a dropped turn) comes after the final threshold.
+    assert.deepStrictEqual(tags(run([speech(300), silence(700), segment("")])), ["SpeechStarted", "Finalize", "EndOfTurn()"])
+    // Two utterances of noise: two pairs.
+    const two = tags(run([speech(300), silence(260), segment(""), silence(600), speech(300), silence(260), segment(""), silence(600)]))
+    assert.deepStrictEqual(two, ["SpeechStarted", "Finalize", "EndOfTurn()", "SpeechStarted", "Finalize", "EndOfTurn()"])
   })
 
   it("a click shorter than minSpeechMs does not send SpeechStarted", () => {
@@ -255,9 +265,14 @@ describe("TurnDetector, cumulative (whole-turn recognisers)", () => {
     assert.deepStrictEqual(tags(out), ["Finalize", "Commit"])
   })
 
-  it("an empty answer after a real onset: SpeechStarted (barge-in) but no turn, then Commit at the final threshold", () => {
+  it("an empty answer after a real onset: SpeechStarted (barge-in), an empty EndOfTurn and Commit at the final threshold", () => {
     const out = run([speech(300), silence(260), segment(""), silence(400)], cumulative(), true)
-    assert.deepStrictEqual(tags(out), ["SpeechStarted", "Finalize", "Commit"])
+    assert.deepStrictEqual(tags(out), ["SpeechStarted", "Finalize", "EndOfTurn()", "Commit"])
+  })
+
+  it("an eager text, then the user goes on and the turn is dropped (empty answer): an empty EndOfTurn ends it, no empty eager", () => {
+    const out = run([speech(400), silence(260), segment("Turn on"), speech(300), silence(260), segment(""), silence(400)], cumulative())
+    assert.deepStrictEqual(tags(out), ["SpeechStarted", "Finalize", "EagerEndOfTurn(Turn on)", "TurnResumed", "Finalize", "EndOfTurn()"])
   })
 
   it("a slow decode (final threshold passes first): EndOfTurn when the answer arrives", () => {
@@ -310,5 +325,76 @@ describe("TurnDetector, cumulative (whole-turn recognisers)", () => {
     // The first Commit names the frame where the turn ended, so the worker keeps the second sentence's audio.
     const commit = out.find(([, o]) => o._tag === "Commit")!
     assert.deepStrictEqual(commit[1], { _tag: "Commit", frame: (500 + 600) / 20 })
+  })
+
+  it("speech resumed before the final boundary while the decode runs: the whole turn is decoded again before it is committed", () => {
+    // Review finding 4: 400 ms speech, 260 ms pause (decode starts), 200 ms more speech, 600 ms pause; the first
+    // answer only covers "Turn on". Committing it would drop the resumed words' audio in the worker.
+    const out = run([
+      speech(400),
+      silence(260), // Finalize at frame 33
+      speech(200), // resumed before the answer
+      silence(600), // final threshold at frame 73, still waiting
+      segment("Turn on") // the stale answer
+    ], cumulative(), true)
+    assert.deepStrictEqual(out.map(([, o]) => o), [
+      { _tag: "SpeechStarted" },
+      { _tag: "Finalize", frame: 33 },
+      { _tag: "Finalize", frame: 73, through: true }
+    ])
+    const d = cumulative()
+    run([speech(400), silence(260), speech(200), silence(600), segment("Turn on")], d)
+    assert.deepStrictEqual(tags(run([segment("Turn on the light.")], d, true)), ["EndOfTurn(Turn on the light.)", "Commit"])
+  })
+
+  it("resumed before the final boundary and the next sentence after it: decoded through the boundary, two turns", () => {
+    const d = cumulative()
+    const out = run([
+      speech(400),
+      silence(260), // Finalize at frame 33
+      speech(200),
+      silence(600), // final boundary at frame 73
+      speech(300), // the next sentence
+      segment("Turn on"), // stale
+      segment("Turn on the light."), // the turn through frame 73
+      silence(260),
+      segment("Thanks."),
+      silence(400)
+    ], d, true)
+    assert.deepStrictEqual(tags(out), [
+      "SpeechStarted",
+      "Finalize",
+      "Finalize",
+      "EndOfTurn(Turn on the light.)",
+      "Commit",
+      "SpeechStarted",
+      "Finalize",
+      "EagerEndOfTurn(Thanks.)",
+      "EndOfTurn(Thanks.)",
+      "Commit"
+    ])
+    const outputs = out.map(([, o]) => o)
+    assert.deepStrictEqual(outputs[2], { _tag: "Finalize", frame: 73, through: true })
+    assert.deepStrictEqual(outputs[4], { _tag: "Commit", frame: 73 })
+  })
+
+  it("a click (shorter than minSpeechMs) before the final boundary does not cost a second decode", () => {
+    const out = run([speech(400), silence(260), speech(40), silence(600), segment("Turn on the light.")], cumulative(), true)
+    assert.deepStrictEqual(tags(out), ["SpeechStarted", "Finalize", "EndOfTurn(Turn on the light.)", "Commit"])
+  })
+
+  it("input that arrives in one burst: the decode is cancelled after the turn ended; both turns still come out", () => {
+    const d = cumulative()
+    // 300 ms speech, 700 ms pause (the turn ends at frame 45), 300 ms of the next sentence, then the end of the input,
+    // all before the worker answers the first Finalize, which it then cancels (speech came after its frame).
+    const first = run([speech(300), silence(700), speech(300), { _tag: "End" }, { _tag: "SegmentCancelled" }], d, true)
+    assert.deepStrictEqual(first.map(([, o]) => o), [
+      { _tag: "SpeechStarted" },
+      { _tag: "Finalize", frame: 28 },
+      { _tag: "Finalize", frame: 45, through: true }
+    ])
+    assert.deepStrictEqual(tags(run([segment("First.")], d, true)), ["EndOfTurn(First.)", "Commit", "SpeechStarted", "Finalize"])
+    assert.deepStrictEqual(tags(run([segment("Second.")], d, true)), ["EndOfTurn(Second.)", "Commit"])
+    assert.isTrue(d.settled)
   })
 })

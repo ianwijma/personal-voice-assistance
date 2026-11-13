@@ -115,7 +115,7 @@ describe("Conversation", () => {
   it.effect("EagerEndOfTurn starts a speculative turn that buffers audio; EndOfTurn with the same text promotes it", () => {
     const t = setup({ llm: [[sleep(100), textDelta("It is noon.")]], ttsDelay: 50 })
     return Effect.gen(function*() {
-      const fiber = yield* startVoice([eagerEndOfTurn("what time is it"), sleep(300), endOfTurn("What time is it?")])
+      const fiber = yield* startVoice([eagerEndOfTurn("what time is it"), sleep(300), endOfTurn("what time is it.")])
       yield* advance(250)
       // LLM and TTS already ran, but nothing played and nothing committed.
       assert.deepStrictEqual(t.tts.probe.clauses, ["It is noon."])

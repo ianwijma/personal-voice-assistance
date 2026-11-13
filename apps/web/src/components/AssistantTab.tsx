@@ -15,7 +15,7 @@ export function AssistantTab() {
   const [reloading, setReloading] = useState(false)
   const reload = async () => {
     setReloading(true)
-    const result = await client.reloadEngines()
+    const result = await client.reloadEngines() // continuation(none): shows this request's own outcome; no audio or preference state
     setReloading(false)
     if (!result.ok) client.store.dispatch({ type: "local/toast", message: result.error?.message ?? "The reload failed.", tone: "error" })
   }

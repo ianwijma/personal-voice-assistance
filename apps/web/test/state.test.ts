@@ -182,3 +182,20 @@ describe("reducer", () => {
     expect(s.ui.unread).toBe(0)
   })
 })
+
+describe("history: a message stopped before any reply", () => {
+  it("shows as stopped when another user message follows; the newest unanswered one is left open", async () => {
+    const { historyToTurns } = await import("@/lib/state.ts")
+    const turns = historyToTurns([
+      { role: "user", text: "first" },
+      { role: "user", text: "second" },
+      { role: "assistant", text: "Reply.", interrupted: false, tools: [] },
+      { role: "user", text: "third" }
+    ])
+    expect(turns.map((t) => [t.userText, t.outcome])).toEqual([
+      ["first", "interrupted"],
+      ["second", "completed"],
+      ["third", undefined]
+    ])
+  })
+})

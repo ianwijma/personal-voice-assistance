@@ -1,4 +1,5 @@
 import { Context, Effect, Layer, Schema } from "effect"
+import type { RegisteredAction } from "./Actions.ts"
 import type { ToolCall, ToolResult, ToolSpec } from "./Domain.ts"
 import type { AssistantModule, ContextProvider, Tool } from "./Module.ts"
 
@@ -11,6 +12,8 @@ export class ToolRegistry extends Context.Service<ToolRegistry, {
   readonly specs: ReadonlyArray<ToolSpec>
   isSpeculative(name: string): boolean
   run(call: ToolCall): Effect.Effect<ToolResult>
+  /** The action a generated action tool stands for (`Tool.action`); absent for other tools and in hand-made registries. */
+  readonly actionFor?: (name: string) => RegisteredAction | undefined
   /** Output of every context provider, formatted for `LlmRequest.context` ("" if none; empty outputs are left out). */
   readonly context: Effect.Effect<string>
 }>()("@pva/core/ToolRegistry") {
@@ -58,7 +61,9 @@ export const makeToolRegistry = (modules: ReadonlyArray<AssistantModule>): ToolR
       Effect.matchEffect({
         onFailure: (error) => Effect.succeed(errorResult(call, `Invalid input: ${error.message}`)),
         onSuccess: (input) =>
-          entry.tool.execute(input).pipe(
+          // Suspended: a tool that throws while building its effect is a defect caught below, not a failed turn.
+          // Interruption is neither an error nor a defect, so it passes through.
+          Effect.suspend(() => entry.tool.execute(input)).pipe(
             Effect.map((value): ToolResult => ({ id: call.id, name: call.name, content: encodeResult(value), isError: false })),
             Effect.catch((error) => Effect.succeed(errorResult(call, error.message))),
             Effect.catchDefect((defect) => Effect.succeed(errorResult(call, `Tool crashed: ${String(defect)}`)))
@@ -76,6 +81,7 @@ export const makeToolRegistry = (modules: ReadonlyArray<AssistantModule>): ToolR
   return ToolRegistry.of({
     specs,
     isSpeculative: (name) => tools.get(name)?.tool.speculative === true,
+    actionFor: (name) => tools.get(name)?.tool.action,
     run,
     context
   })

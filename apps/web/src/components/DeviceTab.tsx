@@ -1,7 +1,7 @@
 "use client"
 import { useEffect, useState } from "react"
 import type { InterruptMode, OutputPath } from "@pva/protocol"
-import { formatDiagnostics } from "@/lib/audio/diagnostics.ts"
+import { describeRoute, formatDiagnostics } from "@/lib/audio/diagnostics.ts"
 import { VoiceAudio } from "@/lib/audio/VoiceAudio.ts"
 import { MAX_PREBUFFER_MS } from "@/lib/prefs.ts"
 import { useClient, useClientState, useDiagnostics, usePrefs } from "./context.tsx"
@@ -41,10 +41,23 @@ const useDevices = (kind: MediaDeviceKind, refreshKey: unknown) => {
   useEffect(() => {
     const md = navigator.mediaDevices
     if (md === undefined) return
-    const load = () => void md.enumerateDevices().then((all) => setDevices(all.filter((d) => d.kind === kind && d.deviceId !== "" && d.deviceId !== "default")), () => undefined)
+    // Overlapping enumerations (a device change during the first one) can settle out of order: only the
+    // latest of this effect, while it is mounted, sets the list.
+    let latest = 0
+    let disposed = false
+    const load = () => {
+      const mine = ++latest
+      // continuation(identity): only the latest enumeration of this effect, while it is mounted.
+      void md.enumerateDevices().then((all) => {
+        if (!disposed && mine === latest) setDevices(all.filter((d) => d.kind === kind && d.deviceId !== "" && d.deviceId !== "default"))
+      }, () => undefined)
+    }
     load()
-    md.addEventListener("devicechange", load)
-    return () => md.removeEventListener("devicechange", load)
+    md.addEventListener("devicechange", load) // continuation(identity): see `load`; removed on cleanup
+    return () => {
+      disposed = true
+      md.removeEventListener("devicechange", load)
+    }
   }, [kind, refreshKey])
   return devices
 }
@@ -70,12 +83,12 @@ export function DeviceTab() {
   const [testError, setTestError] = useState<string | undefined>()
   const mode = INTERRUPT.find((m) => m.value === prefs.interruptMode) ?? INTERRUPT[1]!
 
+  // The test, its cancellation and saving the result are the client's (`client.echoTest`); this only shows progress.
   const runTest = async () => {
     setTesting(true)
     setTestError(undefined)
     try {
-      const r = await client.echoTest()
-      client.setPrefs({ echoTest: { ...r, at: Date.now(), outputPath: prefs.outputPath } })
+      await client.echoTest() // continuation(none): afterwards only this component's own display state changes
     } catch (e) {
       setTestError(e instanceof Error ? e.message : "The test failed.")
     } finally {
@@ -206,9 +219,10 @@ function AudioDiagnostics() {
   const p = diagnostics.playback
   const copy = () => {
     const text = formatDiagnostics(diagnostics, { userAgent: navigator.userAgent, outputPath, prebufferMs })
+    // continuation(none): only this component's own "Copied" label changes.
     void navigator.clipboard?.writeText(text).then(() => {
       setCopied(true)
-      setTimeout(() => setCopied(false), 2000)
+      setTimeout(() => setCopied(false), 2000) // continuation(none): only the label
     }, () => window.prompt("Copy this report", text))
   }
   const cell = "py-0.5 pr-3 text-ink-muted"
@@ -226,6 +240,7 @@ function AudioDiagnostics() {
               <tr><td className={cell}>Automatic gain</td><td className="text-ink">{flag(mic.autoGainControl)} (asked {mic.requested.autoGainControl ? "on" : "off"})</td></tr>
             </>
           )}
+          <tr><td className={cell}>Playback count</td><td className="text-ink" data-testid="playback-route">{describeRoute(diagnostics.route)}</td></tr>
           <tr><td className={cell}>Replies played</td><td className="text-ink" data-testid="playback-replies">{p.replies}</td></tr>
           <tr><td className={cell}>Underruns</td><td className="text-ink" data-testid="playback-underruns">{p.underruns} in {p.repliesWithUnderruns} replies, {p.gapMs} ms of gaps</td></tr>
           <tr><td className={cell}>Clicks smoothed</td><td className="text-ink">{p.clicks}</td></tr>

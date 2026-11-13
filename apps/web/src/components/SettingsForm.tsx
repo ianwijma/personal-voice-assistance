@@ -71,7 +71,7 @@ export function SettingsForm({
     setSaving(true)
     setFormMessage(undefined)
     setServerErrors([])
-    const result = await onSave(patch)
+    const result = await onSave(patch) // continuation(state): the saved form is read from `previous.current` when the answer comes
     setSaving(false)
     if (result.ok) {
       // The broadcast (module.changed / section.changed) brings the saved values.

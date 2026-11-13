@@ -206,7 +206,8 @@ describe("OpenAiCompatibleLlm errors, retries, timeouts and interruption", () =>
       const api = yield* fakeServer(json(401, { error: { message: "No auth credentials found", code: 401 } }))
       const exit = yield* Effect.exit(collect(api.url, request, { profile: "openrouter" }))
       const error = failure(exit)
-      assert.include(error?.message, "OpenRouter rejected the API key (401): No auth credentials found")
+      // Fixed text: the upstream body is not repeated (a gateway may echo the key in it).
+      assert.strictEqual(error?.message, "OpenRouter rejected the API key (401)")
       assert.strictEqual(api.requests.length, 1)
     }))
 
@@ -418,4 +419,62 @@ describe("OpenAiCompatibleLlm request", () => {
       assert.deepStrictEqual(extras(p, { reasoningEffort: "none", sortByLatency: true }), {})
     }
   })
+})
+
+describe("OpenAiCompatibleLlm review regressions", () => {
+  it.live("tool headers that all precede their interleaved argument fragments get their real arguments", () =>
+    Effect.gen(function*() {
+      const api = yield* fakeServer(replay([
+        toolDelta([{ index: 0, id: "call_a", type: "function", function: { name: "lights_on", arguments: "" } }]),
+        toolDelta([{ index: 1, id: "call_b", type: "function", function: { name: "lights_off", arguments: "" } }]),
+        toolDelta([{ index: 0, function: { arguments: "{\"target\":" } }]),
+        toolDelta([{ index: 1, function: { arguments: "{\"target\":" } }]),
+        toolDelta([{ index: 0, function: { arguments: " \"kitchen\"}" } }]),
+        toolDelta([{ index: 1, function: { arguments: " \"hall\"}" } }]),
+        toolDelta([{ index: 2, id: "call_c", type: "function", function: { name: "current_time", arguments: "" } }]),
+        finish("tool_calls")
+      ]))
+      const events = yield* collect(api.url)
+      assert.deepStrictEqual([...events], [
+        { _tag: "ToolCall", id: "call_a", name: "lights_on", input: { target: "kitchen" } },
+        { _tag: "ToolCall", id: "call_b", name: "lights_off", input: { target: "hall" } },
+        { _tag: "ToolCall", id: "call_c", name: "current_time", input: {} },
+        { _tag: "Done", stopReason: "tool_use" }
+      ])
+    }))
+
+  const KEY = "sk-or-v1-0123456789abcdefSECRET"
+
+  it.live("a 401 that echoes the submitted key never puts the key in the error", () =>
+    Effect.gen(function*() {
+      const api = yield* fakeServer(json(401, { error: { message: `Invalid API key: ${KEY}` } }))
+      const error = yield* Effect.flip(collect(api.url, request, { profile: "openrouter", apiKey: Redacted.make(KEY) }))
+      assert.include(error.message, "OpenRouter rejected the API key (401)")
+      assert.notInclude(error.message, KEY)
+      assert.notInclude(String(error.cause), KEY)
+    }))
+
+  it.live("other HTTP errors, stream errors and protocol errors that echo the key are redacted", () =>
+    Effect.gen(function*() {
+      const opts = { apiKey: Redacted.make(KEY) }
+      const http = yield* fakeServer(json(400, { error: { message: `bad request for key ${KEY}` } }))
+      const e1 = yield* Effect.flip(collect(http.url, request, opts))
+      assert.include(e1.message, "answered 400")
+      assert.notInclude(e1.message, KEY)
+
+      const inStream = yield* fakeServer(replay([text("Hi"), { error: { code: 400, message: `key ${KEY} is over quota` } }]))
+      const e2 = yield* Effect.flip(collect(inStream.url, request, opts))
+      assert.include(e2.message, "over quota")
+      assert.notInclude(e2.message, KEY)
+
+      const notJson = yield* fakeServer((_req, res) => {
+        startSse(res)
+        res.end(`data: oops ${KEY}\n\n`)
+      })
+      const e3 = yield* Effect.flip(collect(notJson.url, request, opts))
+      assert.include(e3.message, "not JSON")
+      assert.notInclude(e3.message, KEY)
+      // A key cut in half by the 120-character limit must not leak its first half either.
+      assert.notInclude(e3.message, KEY.slice(0, 12))
+    }))
 })

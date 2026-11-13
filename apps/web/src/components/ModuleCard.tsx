@@ -18,7 +18,7 @@ export function ModuleCard({ module: m }: { readonly module: ModuleInfo }) {
   const [expanded, setExpanded] = useState(m.state === "error")
   const busy = useClientState((s) => Object.values(s.pending).some((p) => p.target === m.id && (p.kind === "module.enable" || p.kind === "module.disable")))
   const toggle = async (enabled: boolean) => {
-    const result = await client.enableModule(m.id, enabled)
+    const result = await client.enableModule(m.id, enabled) // continuation(none): shows this request's own outcome for this card
     if (!result.ok) {
       client.store.dispatch({ type: "local/toast", message: `${m.name}: ${result.error?.message ?? "the change failed."}`, tone: "error" })
       if (result.error?.code === "module_start_failed" || result.error?.code === "invalid_settings") setExpanded(true)

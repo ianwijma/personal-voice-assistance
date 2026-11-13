@@ -181,7 +181,8 @@ export const makeWeatherParts = (options: WeatherOptions = {}) => {
     description: "Say the current weather and today's forecast, at home or in a named city.",
     examples: ["what's the weather like", "what is the weather in Paris", "hoe is het weer", "wat voor weer is het in Utrecht"],
     params: {
-      place: Param.text({ label: "Place", after: ["in", "for", "at", "voor", "te"], maxWords: 4, optional: true })
+      // "wat voor weer is het in Utrecht": "voor" after "wat" is "what kind of", not "for <place>".
+      place: Param.text({ label: "Place", after: ["in", "for", "at", "voor", "te"], notAfter: ["wat"], maxWords: 4, optional: true })
     },
     speculative: true,
     offerAsTool: false,

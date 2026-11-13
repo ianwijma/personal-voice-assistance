@@ -11,7 +11,9 @@ import {
 import { Cause, Effect, Queue, Stream } from "effect"
 import { catchUpBlock, composeMessage, primeBlock } from "./catchUp.ts"
 import { type ClaudeSdk, loadClaudeSdk, mcpToolName, type SDKMessage, type SessionTool, type ToolHandler } from "./sdk.ts"
-import { ClaudeSession, type LoginInfo, SessionError, type SessionConfig, toolKey } from "./session.ts"
+import { proxyCredentialsProblem } from "./options.ts"
+import { clip, fromUpstream, redact } from "./redact.ts"
+import { ClaudeSession, type LoginInfo, proxySecrets, safeErrorText, SessionError, type SessionConfig, toolKey } from "./session.ts"
 
 export const AGENT_ID = "claude-subscription"
 export const AGENT_NAME = "Claude subscription"
@@ -33,8 +35,15 @@ export interface ClaudeAgentOptions {
   readonly systemPrompt?: string | undefined
   readonly sessionIdleMinutes: number
   readonly claudePath?: string | undefined
-  /** Environment for the Claude Code process (API keys are stripped). Default: `process.env`. */
+  /** Environment the Claude Code process's allow-listed variables are taken from (`ALLOWED_ENV`). Default: `process.env`. */
   readonly env?: Readonly<Record<string, string | undefined>>
+  /**
+   * The "Proxy for Claude Code" secret: passed to the process as-is (`HTTPS_PROXY`, `HTTP_PROXY`). Inherited proxy
+   * URLs with credentials are never passed (sixth review, finding 3; `sessionEnv`).
+   */
+  readonly proxy?: string | undefined
+  /** Claude Code's debug logging (debug files under its configuration directory). Default: off. */
+  readonly debug?: boolean
   readonly sdk?: ClaudeSdk | undefined
   readonly now?: () => number
   /** Limits; defaults from the design (§1.8). */
@@ -80,6 +89,8 @@ export const makeClaudeAgent = async (options: ClaudeAgentOptions): Promise<Clau
   const turnTimeoutMs = options.turnTimeoutMs ?? DEFAULTS.turnTimeoutMs
   const interruptAckMs = options.interruptAckMs ?? DEFAULTS.interruptAckMs
   const idleMs = options.sessionIdleMinutes * 60_000
+  /** Every error text this agent produces is redacted with these (the proxy secret: `proxySecrets`). */
+  const secrets = proxySecrets(options.proxy)
 
   let closed = false
   let current: ClaudeSession | undefined
@@ -90,8 +101,8 @@ export const makeClaudeAgent = async (options: ClaudeAgentOptions): Promise<Clau
   let syncedThrough = 0
   let login: LoginInfo | undefined
 
-  const spawn = (config: Omit<SessionConfig, "model" | "claudePath" | "env">): Promise<ClaudeSession> => {
-    const session = new ClaudeSession(sdk, { ...config, model: options.model, claudePath: options.claudePath, env }, now)
+  const spawn = (config: Omit<SessionConfig, "model" | "claudePath" | "env" | "proxy" | "debug">): Promise<ClaudeSession> => {
+    const session = new ClaudeSession(sdk, { ...config, model: options.model, claudePath: options.claudePath, env, proxy: options.proxy, debug: options.debug === true }, now)
     const ready = session.start(startTimeoutMs).then((info) => {
       login = info
       return session
@@ -169,8 +180,12 @@ export const makeClaudeAgent = async (options: ClaudeAgentOptions): Promise<Clau
           if (controller.signal.aborted) return
           const fresh = !session.used
           const ctx = { selfId: AGENT_ID, selfName: AGENT_NAME }
-          const earlier = fresh ? primeBlock(input.history, ctx) : catchUpBlock(input.history, syncedThrough, ctx)
-          syncedThrough = input.history.length
+          // `syncedThrough` is an absolute position in the conversation; the history given
+          // here starts at `historyStart` once old turns have been evicted. A negative
+          // offset (our own last turn was evicted) clamps to 0 inside `catchUpBlock`.
+          const start = input.historyStart ?? 0
+          const earlier = fresh ? primeBlock(input.history, ctx) : catchUpBlock(input.history, syncedThrough - start, ctx)
+          syncedThrough = start + input.history.length
           const text = composeMessage({ instructions: acquired.instructions, earlier, context: input.context, text: input.text })
 
           let textSinceTool = false
@@ -193,14 +208,17 @@ export const makeClaudeAgent = async (options: ClaudeAgentOptions): Promise<Clau
             const started = performance.now()
             try {
               if (!input.tools.isSpeculative(name)) await Effect.runPromise(input.promoted, { signal: controller.signal })
-              const result = await Effect.runPromise(input.tools.run(call), { signal: controller.signal })
+              const ran = await Effect.runPromise(input.tools.run(call), { signal: controller.signal })
+              // A failed tool returns its error as a result (it does not throw): a diagnostic, redacted like the
+              // catch path's (after the final review). A successful result is content and passes untouched.
+              const result = ran.isError ? { ...ran, content: redact(ran.content, secrets) } : ran
               const ms = Math.round(performance.now() - started)
               input.trace.tools.push({ name, ms })
               emit({ _tag: "ToolFinished", result, ms })
               return { content: result.content, isError: result.isError }
             } catch (e) {
               const ms = Math.round(performance.now() - started)
-              const result = { id: call.id, name, content: `Tool did not finish: ${e instanceof Error ? e.message : String(e)}`, isError: true }
+              const result = { id: call.id, name, content: `Tool did not finish: ${fromUpstream(e, secrets)}`, isError: true }
               emit({ _tag: "ToolFinished", result, ms })
               return { content: result.content, isError: true }
             }
@@ -247,7 +265,7 @@ export const makeClaudeAgent = async (options: ClaudeAgentOptions): Promise<Clau
                       ? `${AGENT_NAME}: the plan's usage limit is reached`
                       : isAuthError(m.error)
                       ? `${AGENT_NAME}: Claude Code is not logged in (${m.error}); run claude and log in`
-                      : `${AGENT_NAME}: ${m.error}`
+                      : `${AGENT_NAME}: ${redact(String(m.error), secrets)}`
                     finish(new SessionError(reason, m.error === "invalid_request" || m.error === "unknown" ? "failed" : "unavailable"))
                   }
                   return
@@ -255,7 +273,8 @@ export const makeClaudeAgent = async (options: ClaudeAgentOptions): Promise<Clau
                 case "result": {
                   if (m.subtype === "success" && !m.is_error) return finish()
                   if (m.subtype === "error_max_turns") return finish()
-                  const detail = m.subtype === "success" ? m.result.slice(0, 200) : m.subtype
+                  // Redacted whole, then shortened (`clip`): a cut first could leave part of a secret unrecognisable.
+                  const detail = m.subtype === "success" ? clip(m.result, secrets, 200) : redact(String(m.subtype), secrets)
                   return finish(new SessionError(`${AGENT_NAME} failed: ${detail}`, emittedText ? "failed" : "unavailable"))
                 }
                 default:
@@ -281,12 +300,15 @@ export const makeClaudeAgent = async (options: ClaudeAgentOptions): Promise<Clau
           (e: unknown) => {
             if (settled) return
             settled = true
-            const error = e instanceof SessionError ? e : new SessionError(e instanceof Error ? e.message : String(e), "failed")
+            // The SDK's exit errors end with the process's stderr: never shown raw (`safeErrorText`), and the
+            // proxy secret is redacted from the message and the cause alike (the cause is a fresh, redacted error).
+            const kind = e instanceof SessionError ? e.kind : "failed"
+            const message = safeErrorText(e, secrets)
             // A stuck turn: interrupt it (killing the session if that is not acknowledged either).
-            if (error.kind === "timeout") session?.interrupt(interruptAckMs)
+            if (kind === "timeout") session?.interrupt(interruptAckMs)
             Queue.failCauseUnsafe(
               queue,
-              Cause.fail(new AgentError({ message: error.message, reason: error.kind, cause: e }))
+              Cause.fail(new AgentError({ message, reason: kind, cause: new SessionError(message, kind) }))
             )
           }
         )
@@ -300,7 +322,7 @@ export const makeClaudeAgent = async (options: ClaudeAgentOptions): Promise<Clau
     closed = true
     first.kill("not a subscription login")
     throw new SessionError(
-      `Claude Code is not using a subscription login (it uses ${first.login.apiKeySource}): run claude and log in with your Claude account.`,
+      redact(`Claude Code is not using a subscription login (it uses ${first.login.apiKeySource}): run claude and log in with your Claude account.`, secrets),
       "unavailable"
     )
   }
@@ -387,6 +409,21 @@ const settings = {
     description: "Empty: the copy bundled with the SDK. Or the path to an installed claude.",
     maxLength: 500,
     advanced: true
+  }),
+  proxy: Setting.secret({
+    label: "Proxy for Claude Code",
+    description: "Only if Claude Code must reach the internet through a proxy that needs a user name and password: the " +
+      "proxy's address with them, for example http://user:password@proxy:8080. Passed to Claude Code as its proxy and kept " +
+      "as a secret. A proxy without credentials in the assistant's own environment (HTTPS_PROXY) is passed on by itself; " +
+      "one with credentials is not.",
+    env: "CLAUDE_SUBSCRIPTION_PROXY"
+  }),
+  debugLogs: Setting.boolean({
+    label: "Claude Code debug logs",
+    description: "Lets Claude Code write its debug log files (under its configuration folder, usually ~/.claude). They can " +
+      "contain what was said. Only for diagnosing a problem; off by default.",
+    default: false,
+    advanced: true
   })
 }
 
@@ -403,9 +440,15 @@ export const claudeSubscriptionAgentModule = (deps: { readonly sdk?: ClaudeSdk; 
     description: "Claude through your Claude subscription (Claude Code). Off unless you opt in: the terms for this use are unclear.",
     enabledByDefault: false,
     settings,
-    start: ({ settings: s, setStatus }) =>
+    start: ({ settings: s, setStatus: setStatusRaw }) =>
       Effect.gen(function*() {
+        // Every status line, error message and cause this module produces is redacted with the proxy secret.
+        const secrets = proxySecrets(s.proxy)
+        const setStatus: typeof setStatusRaw = (status) =>
+          setStatusRaw(status === undefined ? status : { ...status, text: redact(status.text, secrets).slice(0, 120) })
         if (!s.optIn) return yield* new ModuleStartError({ message: `Switch on "Use my Claude subscription" first: ${OPT_IN_TEXT}.` })
+        const proxyProblem = proxyCredentialsProblem(deps.env ?? process.env, s.proxy)
+        if (proxyProblem !== undefined) return yield* new ModuleStartError({ message: proxyProblem })
         setStatus({ text: "Starting Claude Code…", tone: "neutral" })
         const agent = yield* Effect.acquireRelease(
           Effect.tryPromise({
@@ -417,21 +460,25 @@ export const claudeSubscriptionAgentModule = (deps: { readonly sdk?: ClaudeSdk; 
                 systemPrompt: s.systemPrompt,
                 sessionIdleMinutes: s.sessionIdleMinutes,
                 claudePath: s.claudePath,
+                proxy: s.proxy,
+                debug: s.debugLogs,
                 ...(deps.sdk !== undefined ? { sdk: deps.sdk } : {}),
                 ...(deps.env !== undefined ? { env: deps.env } : {})
               }),
-            catch: (e) =>
-              new ModuleStartError({
-                message: e instanceof SessionError && e.message.startsWith("Claude Code is not using")
-                  ? e.message
-                  : `Claude Code could not start: ${e instanceof Error ? e.message : String(e)}. Is it installed and logged in (run claude)?`,
-                cause: e
+            catch: (e) => {
+              const text = safeErrorText(e, secrets)
+              return new ModuleStartError({
+                message: e instanceof SessionError && text.startsWith("Claude Code is not using")
+                  ? text
+                  : `Claude Code could not start: ${text}. Is it installed and logged in (run claude)?`,
+                cause: e instanceof SessionError ? new SessionError(text, e.kind) : new Error(text)
               })
+            }
           }),
           (a) => Effect.sync(() => a.shutdown())
         )
         const plan = agent.login()?.subscriptionType
-        setStatus({ text: `Ready · ${s.model.trim()}${plan !== undefined ? ` · ${plan} plan` : ""}`.slice(0, 120), tone: "ok" })
+        setStatus({ text: `Ready · ${s.model.trim()}${plan !== undefined ? ` · ${plan} plan` : ""}`, tone: "ok" })
         const { login: _l, shutdown: _s, session: _x, ...implementation } = agent
         return implementation
       })

@@ -1,8 +1,9 @@
 // Serve mode driven by the scripted client, with injected providers (docs/UI-AND-MODULES.md §6.1).
 import { endOfTurn, eagerEndOfTurn, interim, speechStarted } from "@pva/core/testing"
 import { CloseCode, PROTOCOL_VERSION } from "@pva/protocol"
+import { defineModule, type ModuleDefinition } from "@pva/core"
 import { Effect } from "effect"
-import { readFileSync, statSync } from "node:fs"
+import { readFileSync, statSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 import { afterEach, describe, expect, it, vi } from "vitest"
 
@@ -11,7 +12,7 @@ import { mkdtempSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { defaultPreflight, EngineBuildProblems } from "../src/serve/Engine.ts"
 import { ScriptedClient, sleep } from "./support/scriptedClient.ts"
-import { controlledStt, fakeBuild, markedPcm, scriptedLlm, startTestServer, type TestServer, toneTts } from "./support/serveHarness.ts"
+import { controlledStt, fakeBuild, greeterModule, markedPcm, scriptedLlm, startTestServer, type TestServer, toneTts } from "./support/serveHarness.ts"
 
 let server: TestServer | undefined
 const clients: Array<ScriptedClient> = []
@@ -190,6 +191,31 @@ describe("serve: interruptions", () => {
     owner.pressStop()
     const end = await owner.waitFor("turn.end")
     expect(end.outcome).toBe("interrupted")
+  })
+
+  it("a typed message taken just before Stop: kept in history unanswered; the next request carries it before the new one", async () => {
+    const stt = controlledStt()
+    const llm = scriptedLlm((t) => `Reply to ${t}.`, { firstTokenMs: 400 })
+    server = await startTestServer({ build: fakeBuild({ stt: stt.stt, llm: llm.llm }) })
+    const owner = await connect()
+    await owner.hello()
+    owner.send({ type: "text.send", requestId: "t1", text: "first", speak: false })
+    const start = await owner.waitFor("turn.start", () => true, { timeoutMs: 10_000 })
+    owner.send({ type: "interrupt", turnId: start.turnId })
+    expect((await owner.waitFor("turn.end", (m) => m.turnId === start.turnId)).outcome).toBe("interrupted")
+    const from = owner.messages.length
+    owner.send({ type: "text.send", requestId: "t2", text: "second", speak: false })
+    expect((await owner.waitFor("turn.end", () => true, { from, timeoutMs: 10_000 })).outcome).toBe("completed")
+    // The owner did send it, so it stays (as for any turn stopped before its reply); it has no answer.
+    const later = await connect()
+    const welcome = await later.hello()
+    expect(welcome.snapshot.history.map((h) => [h.role, h.text])).toEqual([
+      ["user", "first"],
+      ["user", "second"],
+      ["assistant", "Reply to second."]
+    ])
+    // The model sees both, in order (the adapters merge consecutive user messages for APIs that need alternation).
+    expect(llm.requests.at(-1)!.messages.map((m: any) => [m.role, m.content])).toEqual([["user", "first"], ["user", "second"]])
   })
 
   it("claiming again while already the owner does not stop the reply", async () => {
@@ -407,6 +433,27 @@ describe("serve: ownership", () => {
     expect(b.types()).not.toContain("reply.start")
   })
 
+  it("takeover between a clause start and the next progress report: the old owner's final count still reaches history", async () => {
+    const { stt } = await basic(() => "One long clause. Another long clause. And a third one.")
+    // A reports playback.started and then nothing until asked (its next periodic report is far away).
+    const a = await connect({ player: { progressMs: 60_000 } })
+    await a.hello()
+    await a.claim("instant")
+    const b = await connect()
+    await b.hello()
+    stt.emit(endOfTurn("talk"))
+    await a.waitFor("assistant.playing", (m) => m.clause === 0, { timeoutMs: 10_000 })
+    await sleep(600) // the second 400 ms clause is now playing in A; the server has not been told
+    await b.claim("confirm")
+    await a.waitFor("reply.stop")
+    const end = await b.waitFor("turn.end", () => true, { from: 0 })
+    expect(["interrupted", "failed"]).toContain(end.outcome)
+    const late = await connect()
+    const welcome = await late.hello()
+    const said = welcome.snapshot.history.find((h) => h.role === "assistant")
+    expect(said?.text).toBe("One long clause. Another long clause.")
+  })
+
   it("reconnect with resumeOwner gets the audio back if nobody claimed it since; otherwise it is an observer", async () => {
     await basic()
     const a = await connect()
@@ -452,6 +499,48 @@ describe("serve: ownership", () => {
   })
 })
 
+describe("serve: provisional final counts (playback.stopped exact: false)", () => {
+  it("barge-in: a provisional count past the next clause, then the exact one: history holds what the exact count says", async () => {
+    const { stt } = await basic(() => "First clause here. Second clause here. Third clause here.")
+    // The page's first answer overstates (500 ms more than played: into the second clause); the exact one follows.
+    const owner = await connect({ player: { provisionalStop: { count: (played, rate) => played + Math.round(rate / 2), exactAfterMs: 80 } } })
+    await owner.hello()
+    await owner.claim("instant")
+    stt.emit(endOfTurn("tell me"))
+    await owner.waitFor("assistant.playing", (m) => m.clause === 0, { timeoutMs: 10_000 })
+    await sleep(150)
+    stt.emit(speechStarted)
+    await owner.waitFor("reply.stop")
+    const end = await owner.waitFor("turn.end")
+    expect(end.outcome).toBe("interrupted")
+    const late = await connect()
+    const welcome = await late.hello()
+    expect(welcome.snapshot.history).toEqual([
+      { role: "user", text: "tell me" },
+      { role: "assistant", text: "First clause here.", interrupted: true, tools: [] }
+    ])
+  })
+
+  it("takeover: a provisional count short of the second clause, then the exact one: the old owner's exact count reaches history", async () => {
+    const { stt } = await basic(() => "One long clause. Another long clause. And a third one.")
+    const a = await connect({ player: { progressMs: 60_000, provisionalStop: { count: (_played, rate) => Math.round(rate / 10), exactAfterMs: 80 } } })
+    await a.hello()
+    await a.claim("instant")
+    const b = await connect()
+    await b.hello()
+    stt.emit(endOfTurn("talk"))
+    await a.waitFor("assistant.playing", (m) => m.clause === 0, { timeoutMs: 10_000 })
+    await sleep(600) // the second 400 ms clause is playing in A
+    await b.claim("confirm")
+    await a.waitFor("reply.stop")
+    const end = await b.waitFor("turn.end", () => true, { from: 0 })
+    expect(["interrupted", "failed"]).toContain(end.outcome)
+    const late = await connect()
+    const welcome = await late.hello()
+    expect(welcome.snapshot.history.find((h) => h.role === "assistant")?.text).toBe("One long clause. Another long clause.")
+  })
+})
+
 describe("serve: playback stall", () => {
   it("a browser that stops reporting: reply.stop, playback_timeout error, the turn fails", async () => {
     const stt = controlledStt()
@@ -466,5 +555,188 @@ describe("serve: playback stall", () => {
     const error = await owner.waitFor("error", (m) => m.error.code === "playback_timeout")
     expect(error.error.turnId).toBeGreaterThan(0)
     expect((await owner.waitFor("turn.end")).outcome).toBe("failed")
+  })
+})
+
+describe("serve: settings that may come from two saves (a damaged journal after a half-applied save)", () => {
+  it("every page sees why in the engine bar; engines and modules stay stopped until a save, which starts them", async () => {
+    const { acquireDataDirLockSync, releaseDataDirLock } = await import("../src/serve/DataDirLock.ts")
+    const { loadSettingsStore } = await import("../src/serve/SettingsStore.ts")
+    const dataDir = mkdtempSync(join(tmpdir(), "pva-serve-"))
+    const { lock } = acquireDataDirLockSync(dataDir)
+    const before = await Effect.runPromise(loadSettingsStore(dataDir, { lock }))
+    await Effect.runPromise(before.saveModule("greeter", { enabled: true, settings: { greeting: "hello" }, secrets: { token: "t1" } }))
+    // A save that replaces secrets.json and stops before settings.json (its rollback fails too) ...
+    const crashing = await Effect.runPromise(loadSettingsStore(dataDir, { lock, beforeStep: (step) => {
+      if (step === "settings" || step === "rollback") throw new Error("crash")
+    } }))
+    await Effect.runPromise(Effect.result(crashing.saveModule("greeter", { enabled: true, settings: { greeting: "hoi" }, secrets: { token: "t2" } })))
+    releaseDataDirLock(lock)
+    // ... and whose journal is then unreadable.
+    writeFileSync(join(dataDir, "transaction.json"), "{damaged")
+    const llm = scriptedLlm((t) => `Reply to ${t}.`)
+    server = await startTestServer({ build: fakeBuild({ stt: controlledStt().stt, llm: llm.llm }), dataDir })
+    const page = await connect()
+    const welcome = await page.hello()
+    expect(welcome.snapshot.engine.state).toBe("failed")
+    expect(welcome.snapshot.engine.problems).toHaveLength(1)
+    expect(welcome.snapshot.engine.problems[0]!.stage).toBe("settings")
+    expect(welcome.snapshot.engine.problems[0]!.message).toContain("may come from two different saves")
+    expect(welcome.snapshot.modules.find((m) => m.id === "greeter")).toMatchObject({ enabled: true, state: "disabled" })
+    // Try again (engine.reload) is answered with the same reason and builds nothing.
+    page.send({ type: "engine.reload", requestId: "r1" })
+    const refused = await page.waitFor("result", (m) => m.requestId === "r1")
+    expect(refused.ok).toBe(false)
+    expect(refused.error?.message).toContain("two different saves")
+    // The owner checks the settings and saves: the engines and the enabled module start.
+    page.send({ type: "settings.update", requestId: "s1", sectionId: "listening", patch: { values: { STT_SHERPA_FINAL_SILENCE_MS: 600 }, secrets: {} } })
+    expect((await page.waitFor("result", (m) => m.requestId === "s1")).ok).toBe(true)
+    await page.waitFor("engine", (m) => m.engine.state === "ready", { from: 0, timeoutMs: 10_000 })
+    await page.waitFor("module.changed", (m) => m.module.id === "greeter" && m.module.state === "running", { from: 0, timeoutMs: 10_000 })
+    const late = await connect()
+    expect((await late.hello()).snapshot.engine).toMatchObject({ state: "ready", problems: [] })
+  })
+})
+
+describe("serve: unblocking through every kind of save (fifth review)", () => {
+  /** A second module, so enabling or disabling one shows that the other enabled modules start too. */
+  const waver: ModuleDefinition<any> = defineModule({
+    id: "waver",
+    name: "Waver",
+    description: "Waves.",
+    settings: {},
+    start: () => Effect.succeed({ instructions: "Wave." })
+  })
+
+  /** A data directory whose settings and keys may come from two saves, with greeter and waver enabled. */
+  const blockedDir = async () => {
+    const { acquireDataDirLockSync, releaseDataDirLock } = await import("../src/serve/DataDirLock.ts")
+    const { loadSettingsStore } = await import("../src/serve/SettingsStore.ts")
+    const dataDir = mkdtempSync(join(tmpdir(), "pva-serve-"))
+    const { lock } = acquireDataDirLockSync(dataDir)
+    const before = await Effect.runPromise(loadSettingsStore(dataDir, { lock }))
+    await Effect.runPromise(before.saveModule("waver", { enabled: true, settings: {}, secrets: {} }))
+    await Effect.runPromise(before.saveModule("greeter", { enabled: true, settings: { greeting: "hello" }, secrets: { token: "t1" } }))
+    const crashing = await Effect.runPromise(loadSettingsStore(dataDir, { lock, beforeStep: (step) => {
+      if (step === "settings" || step === "rollback") throw new Error("crash")
+    } }))
+    await Effect.runPromise(Effect.result(crashing.saveModule("greeter", { enabled: true, settings: { greeting: "hoi" }, secrets: { token: "t2" } })))
+    releaseDataDirLock(lock)
+    writeFileSync(join(dataDir, "transaction.json"), "{damaged")
+    return dataDir
+  }
+
+  const saves: ReadonlyArray<readonly [string, Record<string, unknown>, Record<string, { enabled: boolean; state: string }>]> = [
+    ["an assistant section", { type: "settings.update", sectionId: "listening", patch: { values: { STT_SHERPA_FINAL_SILENCE_MS: 600 }, secrets: {} } }, {
+      greeter: { enabled: true, state: "running" },
+      waver: { enabled: true, state: "running" }
+    }],
+    ["a section secret", { type: "settings.update", sectionId: "language-model", patch: { values: {}, secrets: { ANTHROPIC_API_KEY: "sk-test" } } }, {
+      greeter: { enabled: true, state: "running" },
+      waver: { enabled: true, state: "running" }
+    }],
+    ["a module's settings", { type: "module.configure", moduleId: "greeter", patch: { values: { greeting: "hallo" }, secrets: {} } }, {
+      greeter: { enabled: true, state: "running" },
+      waver: { enabled: true, state: "running" }
+    }],
+    ["a module secret", { type: "module.configure", moduleId: "greeter", patch: { values: {}, secrets: { token: "t3" } } }, {
+      greeter: { enabled: true, state: "running" },
+      waver: { enabled: true, state: "running" }
+    }],
+    ["a module enable", { type: "module.enable", moduleId: "greeter" }, {
+      greeter: { enabled: true, state: "running" },
+      waver: { enabled: true, state: "running" }
+    }],
+    ["a module disable", { type: "module.disable", moduleId: "greeter" }, {
+      greeter: { enabled: false, state: "disabled" },
+      waver: { enabled: true, state: "running" }
+    }]
+  ]
+
+  for (const [what, request, expected] of saves) {
+    it(`saving ${what} starts the engines and every enabled module`, async () => {
+      const dataDir = await blockedDir()
+      const llm = scriptedLlm((t) => `Reply to ${t}.`)
+      server = await startTestServer({ build: fakeBuild({ stt: controlledStt().stt, llm: llm.llm }), dataDir, catalog: [greeterModule, waver] })
+      const page = await connect()
+      const welcome = await page.hello()
+      expect(welcome.snapshot.engine.state).toBe("failed")
+      page.send({ ...request, requestId: "s1" } as never)
+      expect((await page.waitFor("result", (m) => m.requestId === "s1")).ok).toBe(true)
+      await page.waitFor("engine", (m) => m.engine.state === "ready", { from: 0, timeoutMs: 10_000 })
+      const settled = async () => {
+        for (let i = 0; i < 100; i++) {
+          const modules = server!.handle.host.modules()
+          if (Object.entries(expected).every(([id, want]) => {
+            const m = modules.find((x) => x.id === id)
+            return m?.enabled === want.enabled && m.state === want.state
+          })) return modules
+          await sleep(20)
+        }
+        return server!.handle.host.modules()
+      }
+      const modules = await settled()
+      for (const [id, want] of Object.entries(expected)) expect(modules.find((m) => m.id === id), id).toMatchObject(want)
+    })
+  }
+
+  /** A build that counts its calls; each waits for `release()` (so a build can be held in progress). */
+  const heldBuild = () => {
+    const llm = scriptedLlm((t) => `Reply to ${t}.`)
+    const inner = fakeBuild({ stt: controlledStt().stt, llm: llm.llm })
+    let builds = 0
+    let open: () => void = () => {}
+    let gate = new Promise<void>((resolve) => (open = resolve))
+    const build = Effect.suspend(() => {
+      builds++
+      return Effect.andThen(Effect.promise(() => gate), inner)
+    })
+    return {
+      build,
+      builds: () => builds,
+      release: () => {
+        open()
+        gate = Promise.resolve()
+      }
+    }
+  }
+
+  it("sixth review: an unblock and the owner's reload overlapping build the engines once (reload while the unblock's build runs)", async () => {
+    const dataDir = await blockedDir()
+    const held = heldBuild()
+    server = await startTestServer({ build: held.build, dataDir, catalog: [greeterModule, waver] })
+    const page = await connect()
+    await page.hello()
+    page.send({ type: "module.configure", moduleId: "greeter", patch: { values: { greeting: "hallo" }, secrets: {} }, requestId: "s1" } as never)
+    expect((await page.waitFor("result", (m) => m.requestId === "s1")).ok).toBe(true)
+    page.send({ type: "engine.reload", requestId: "r1" })
+    const reload = await page.waitFor("result", (m) => m.requestId === "r1", { from: 0 })
+    expect(reload.ok ? "ok" : reload.error?.code).toBe("busy")
+    expect(held.builds()).toBe(1)
+    held.release()
+    await page.waitFor("engine", (m) => m.engine.state === "ready", { from: 0, timeoutMs: 10_000 })
+    await sleep(300) // several retry intervals (25 ms)
+    expect(held.builds()).toBe(1)
+    expect(server.handle.engine.status().state).toBe("ready")
+  })
+
+  it("sixth review: a reload sent together with the unblocking save never leads to a second build", async () => {
+    for (let round = 0; round < 5; round++) {
+      const dataDir = await blockedDir()
+      const held = heldBuild()
+      server = await startTestServer({ build: held.build, dataDir, catalog: [greeterModule, waver] })
+      const page = await connect()
+      await page.hello()
+      page.send({ type: "settings.update", sectionId: "listening", patch: { values: { STT_SHERPA_FINAL_SILENCE_MS: 600 }, secrets: {} }, requestId: "s1" } as never)
+      page.send({ type: "engine.reload", requestId: "r1" })
+      await page.waitFor("result", (m) => m.requestId === "s1", { from: 0 })
+      await page.waitFor("result", (m) => m.requestId === "r1", { from: 0 })
+      held.release()
+      await page.waitFor("engine", (m) => m.engine.state === "ready", { from: 0, timeoutMs: 10_000 })
+      await sleep(200)
+      expect(held.builds(), `round ${round}`).toBe(1)
+      await server.close()
+      server = undefined
+    }
   })
 })

@@ -288,7 +288,7 @@ describe("claude-subscription module", () => {
       const fake = makeFakeSdk()
       const module = claudeSubscriptionAgentModule({ sdk: fake.sdk })
       expect(module).toMatchObject({ id: "claude-subscription", kind: "agent", agentKind: "harness", enabledByDefault: false })
-      const settings = { optIn: false, model: "claude-haiku-5-5", systemPrompt: "", speculate: false, tools: true, sessionIdleMinutes: 60, claudePath: "" }
+      const settings = { optIn: false, model: "claude-haiku-5-5", systemPrompt: "", speculate: false, tools: true, sessionIdleMinutes: 60, claudePath: "", debugLogs: false, proxy: undefined }
       const exit = yield* Effect.exit(Effect.scoped(module.start({ settings, setStatus: () => {} })))
       assert.isTrue(Exit.isFailure(exit))
       expect(String(exit)).toContain(OPT_IN_TEXT)
@@ -300,7 +300,7 @@ describe("claude-subscription module", () => {
     Effect.gen(function*() {
       const fake = makeFakeSdk()
       const module = claudeSubscriptionAgentModule({ sdk: fake.sdk, env: {} })
-      const settings = { optIn: true, model: "claude-haiku-5-5", systemPrompt: "", speculate: false, tools: true, sessionIdleMinutes: 60, claudePath: "" }
+      const settings = { optIn: true, model: "claude-haiku-5-5", systemPrompt: "", speculate: false, tools: true, sessionIdleMinutes: 60, claudePath: "", debugLogs: false, proxy: undefined }
       const statuses: Array<string> = []
       const scope = yield* Scope.make()
       const instance = yield* module.start({ settings, setStatus: (s) => s !== undefined && statuses.push(s.text) }).pipe(Scope.provide(scope))
@@ -311,4 +311,132 @@ describe("claude-subscription module", () => {
       yield* Scope.close(scope, Exit.void)
       expect(fake.queries[0]!.closed).toBe(true)
     }))
+})
+
+describe("the Claude Code process gets an allow-listed environment, no debug logs, and no raw stderr (fifth review, hardening)", () => {
+  const planted = {
+    PATH: "/usr/bin",
+    HOME: "/home/owner",
+    LANG: "en_GB.UTF-8",
+    LC_ALL: "en_GB.UTF-8",
+    XDG_CONFIG_HOME: "/home/owner/.config",
+    CLAUDE_CONFIG_DIR: "/home/owner/.claude",
+    HTTPS_PROXY: "http://proxy:3128",
+    // Secrets of the assistant that must never reach the subprocess:
+    PLANTED_SECRET: "s3cret-planted",
+    OPENAI_API_KEY: "sk-openai",
+    PVA_VAULT_PASSWORD: "vault-pass",
+    HOME_ASSISTANT_TOKEN: "ha-token",
+    ANTHROPIC_API_KEY: "sk-ant",
+    DEBUG_CLAUDE_AGENT_SDK: "1",
+    CLAUDE_DEBUG: "1",
+    DEBUG: "*"
+  }
+
+  it.live("a planted secret variable (and every other one off the list) does not reach the options passed to the SDK", () =>
+    Effect.gen(function*() {
+      const fake = makeFakeSdk()
+      const agent = yield* Effect.promise(() => makeClaudeAgent({ ...agentOptions, env: planted, sdk: fake.sdk }))
+      const options = fake.queries[0]!.options
+      expect(options.env).toEqual({
+        PATH: "/usr/bin",
+        HOME: "/home/owner",
+        LANG: "en_GB.UTF-8",
+        LC_ALL: "en_GB.UTF-8",
+        XDG_CONFIG_HOME: "/home/owner/.config",
+        CLAUDE_CONFIG_DIR: "/home/owner/.claude",
+        HTTPS_PROXY: "http://proxy:3128",
+        ENABLE_CLAUDEAI_MCP_SERVERS: "false",
+        CLAUDE_AGENT_SDK_CLIENT_APP: "personal-voice-assistant/0.0.0"
+      })
+      expect(JSON.stringify(options)).not.toContain("s3cret-planted")
+      expect(options.debug).toBe(false)
+      expect(options.debugFile).toBeUndefined()
+      agent.shutdown()
+    }))
+
+  it.live("debug logging only when the setting switches it on", () =>
+    Effect.gen(function*() {
+      const fake = makeFakeSdk()
+      const module = claudeSubscriptionAgentModule({ sdk: fake.sdk, env: planted })
+      const settings = { optIn: true, model: "claude-haiku-5-5", systemPrompt: "", speculate: false, tools: true, sessionIdleMinutes: 60, claudePath: "", debugLogs: true, proxy: undefined }
+      const scope = yield* Scope.make()
+      yield* module.start({ settings, setStatus: () => {} }).pipe(Scope.provide(scope))
+      expect(fake.queries[0]!.options.debug).toBe(true)
+      expect(fake.queries[0]!.options.env?.DEBUG_CLAUDE_AGENT_SDK).toBeUndefined()
+      expect((module.settings.debugLogs.describe("debugLogs") as { default?: unknown }).default).toBe(false)
+      yield* Scope.close(scope, Exit.void)
+    }))
+
+  it.live("an exit error's stderr text is not passed on: the turn's error is one bounded line without it", () =>
+    Effect.gen(function*() {
+      const leaked = `${"x".repeat(500)} OPENAI_API_KEY=sk-leaked`
+      const fake = makeFakeSdk({ respond: (ctx) => ctx.query.crash(`Claude Code process exited with code 1. stderr: ${leaked}\nmore lines`) })
+      const agent = yield* Effect.promise(() => makeClaudeAgent({ ...agentOptions, sdk: fake.sdk }))
+      const error = yield* Effect.flip(collect(agent.turn(makeInput())))
+      const message = (error as Error).message
+      expect(message).toMatch(/process exited with code 1/)
+      expect(message).not.toContain("stderr")
+      expect(message).not.toContain("sk-leaked")
+      expect(message.length).toBeLessThanOrEqual(240)
+      expect(String((error as { cause?: unknown }).cause)).not.toContain("sk-leaked")
+      agent.shutdown()
+    }))
+
+  it("safeErrorText: drops the stderr tail, keeps one line, bounds the length", async () => {
+    const { safeErrorText } = await import("../src/session.ts")
+    expect(safeErrorText(new Error("Claude Code process exited with code 1. stderr: secret"))).toBe("Claude Code process exited with code 1")
+    expect(safeErrorText("a\n  b")).toBe("a b")
+    expect(safeErrorText("y".repeat(1000)).length).toBe(200)
+  })
+})
+
+describe("proxy credentials and the locale and XDG lists (sixth review, finding 3)", () => {
+  const base = { optIn: true, model: "claude-haiku-5-5", systemPrompt: "", speculate: false, tools: true, sessionIdleMinutes: 60, claudePath: "", debugLogs: false, proxy: undefined }
+
+  it.live("an inherited proxy URL with credentials is not passed on; the start fails saying how to supply it, and spawns nothing", () =>
+    Effect.gen(function*() {
+      const fake = makeFakeSdk()
+      const env = { PATH: "/usr/bin", HTTPS_PROXY: "http://owner:password@proxy:8080", http_proxy: "http://proxy:3128" }
+      const module = claudeSubscriptionAgentModule({ sdk: fake.sdk, env })
+      const exit = yield* Effect.exit(Effect.scoped(module.start({ settings: { ...base, proxy: undefined }, setStatus: () => {} })))
+      assert.isTrue(Exit.isFailure(exit))
+      const text = String(exit)
+      expect(text).toContain("HTTPS_PROXY")
+      expect(text).toMatch(/credentials/)
+      expect(text).toContain("Proxy for Claude Code")
+      expect(text).not.toContain("password")
+      expect(fake.queries).toHaveLength(0)
+      // And the agent itself never passes it, whoever calls it.
+      const agent = yield* Effect.promise(() => makeClaudeAgent({ ...agentOptions, env, sdk: fake.sdk }))
+      expect(fake.queries[0]!.options.env).toMatchObject({ http_proxy: "http://proxy:3128" })
+      expect(fake.queries[0]!.options.env?.HTTPS_PROXY).toBeUndefined()
+      expect(JSON.stringify(fake.queries[0]!.options)).not.toContain("password")
+      agent.shutdown()
+    }))
+
+  it.live("the \"Proxy for Claude Code\" setting is a secret, passed to the subprocess as-is, replacing inherited proxy variables", () =>
+    Effect.gen(function*() {
+      const fake = makeFakeSdk()
+      const env = { PATH: "/usr/bin", HTTPS_PROXY: "http://owner:password@proxy:8080", ALL_PROXY: "socks5://proxy:1080", NO_PROXY: "localhost" }
+      const module = claudeSubscriptionAgentModule({ sdk: fake.sdk, env })
+      expect(module.settings.proxy.describe("proxy")).toMatchObject({ type: "secret", label: "Proxy for Claude Code" })
+      const scope = yield* Scope.make()
+      yield* module.start({ settings: { ...base, proxy: "http://me:s3cret@proxy:8080" }, setStatus: () => {} }).pipe(Scope.provide(scope))
+      expect(fake.queries[0]!.options.env).toMatchObject({ HTTPS_PROXY: "http://me:s3cret@proxy:8080", HTTP_PROXY: "http://me:s3cret@proxy:8080", NO_PROXY: "localhost" })
+      expect(fake.queries[0]!.options.env?.ALL_PROXY).toBeUndefined()
+      expect(JSON.stringify(fake.queries[0]!.options)).not.toContain("owner:password")
+      yield* Scope.close(scope, Exit.void)
+    }))
+
+  it("sessionEnv: only the standard LC_ and XDG_ names; credential-free proxies pass, credential-bearing ones do not", async () => {
+    const { sessionEnv } = await import("../src/options.ts")
+    const env = sessionEnv({
+      LC_ALL: "C", LC_TIME: "en_GB.UTF-8", LC_SECRET_TOKEN: "x", LC_ANYTHING: "y",
+      XDG_CONFIG_HOME: "/c", XDG_RUNTIME_DIR: "/run/user/1000", XDG_API_KEY: "k", XDG_WHATEVER: "w",
+      HTTP_PROXY: "http://proxy:3128", https_proxy: "http://u@proxy:3128", ALL_PROXY: "http://:pw@proxy:1"
+    })
+    expect(env).toMatchObject({ LC_ALL: "C", LC_TIME: "en_GB.UTF-8", XDG_CONFIG_HOME: "/c", XDG_RUNTIME_DIR: "/run/user/1000", HTTP_PROXY: "http://proxy:3128" })
+    for (const k of ["LC_SECRET_TOKEN", "LC_ANYTHING", "XDG_API_KEY", "XDG_WHATEVER", "https_proxy", "ALL_PROXY"]) expect(env[k]).toBeUndefined()
+  })
 })

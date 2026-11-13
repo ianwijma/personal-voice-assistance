@@ -80,6 +80,16 @@ export class TurnAudio {
     return this.samples.slice(0, this.count * this.frameSamples)
   }
 
+  /**
+   * A copy of the turn's audio up to and including frame `atFrame`.
+   * @param {number} atFrame
+   */
+  audioThrough(atFrame) {
+    let n = this.count
+    while (n > 0 && this.index[n - 1] > atFrame) n--
+    return this.samples.slice(0, n * this.frameSamples)
+  }
+
   /** Whether a frame after `atFrame` was speech. */
   speechAfter(atFrame) {
     for (let i = this.count - 1; i >= 0 && this.index[i] > atFrame; i--) if (this.speech[i] === 1) return true

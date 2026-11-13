@@ -14,7 +14,9 @@ import { startCliModules, withModuleInstructions } from "./modules.ts"
 import { FakeLlm } from "./FakeLlm.ts"
 import { LlmLayer, SttLayer, TtsLayer } from "./providers.ts"
 import { sayCommand } from "./say.ts"
+import { DataDirLockError } from "./serve/DataDirLock.ts"
 import { serveMode } from "./serve/serveMode.ts"
+import { SettingsStoreError } from "./serve/SettingsStore.ts"
 import { buildProviders, describeConfigError, StartupError } from "./startup.ts"
 import { runTextTurns } from "./text.ts"
 import { compareModelsCommand } from "./compareModels.ts"
@@ -176,6 +178,8 @@ NodeRuntime.runMain(
         ? e.message
         : e instanceof Config.ConfigError
         ? describeConfigError(e)
+        : e instanceof DataDirLockError || e instanceof SettingsStoreError
+        ? e.message // says what to do (another server on the data directory, an unfinished save that cannot be finished)
         : undefined
       if (message === undefined) return Effect.fail(e)
       return Effect.sync(() => {

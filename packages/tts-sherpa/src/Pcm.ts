@@ -8,6 +8,10 @@
  * clause but the first: the total silence at a join is `sentencePauseMs` after
  * `. ! ?` and `clausePauseMs` after anything else (`, ; :`). Trimming the first
  * clause's leading silence also makes the first audible sound come sooner.
+ *
+ * The inserted pause is returned apart from the clause's speech: it belongs to
+ * the clause before it (its length follows from how that clause ends), so a
+ * listener interrupted during the pause has not heard any of the next clause.
  */
 
 export interface JoinOptions {
@@ -60,9 +64,18 @@ export const chunkPcm = (pcm: Int16Array, size: number): Array<Uint8Array> => {
 
 const endsSentence = (text: string) => /[.!?…]["')\]]*\s*$/.test(text)
 
+/** What the joiner gives for one clause: the pause that ends the previous clause, then this clause's speech. */
+export interface JoinedClause {
+  /** Silence to play before `speech`; it belongs to the previous clause. Empty for the first clause. */
+  readonly pause: Array<Uint8Array>
+  readonly speech: Array<Uint8Array>
+}
+
+const none: JoinedClause = { pause: [], speech: [] }
+
 /**
  * Stateful per-turn joiner: feed it each clause's samples in order, get back
- * the s16le chunks to emit for that clause (pause first, then speech).
+ * the s16le chunks to emit for that clause: the pause, then the speech.
  */
 export const makeJoiner = (sampleRate: number, options: JoinOptions = defaultJoinOptions) => {
   const pad = ms(sampleRate, options.padMs)
@@ -70,12 +83,12 @@ export const makeJoiner = (sampleRate: number, options: JoinOptions = defaultJoi
   const chunk = Math.max(1, ms(sampleRate, options.chunkMs))
   let previous: { readonly text: string; readonly trailing: number } | undefined
 
-  return (samples: Float32Array, text: string): Array<Uint8Array> => {
-    if (!options.trim) return chunkPcm(floatToS16(samples), chunk)
+  return (samples: Float32Array, text: string): JoinedClause => {
+    if (!options.trim) return { pause: [], speech: chunkPcm(floatToS16(samples), chunk) }
     const t = options.threshold
     let first = 0
     while (first < samples.length && Math.abs(samples[first]!) < t) first++
-    if (first === samples.length) return [] // nothing audible
+    if (first === samples.length) return none // nothing audible
     let last = samples.length - 1
     while (last > first && Math.abs(samples[last]!) < t) last--
     const start = Math.max(0, first - pad)
@@ -90,17 +103,16 @@ export const makeJoiner = (sampleRate: number, options: JoinOptions = defaultJoi
     }
     previous = { text, trailing }
 
-    const out = new Int16Array(gap + end - start) // the gap is the zeros at the front
-    floatToS16(samples.subarray(start, end), out, gap)
+    const out = floatToS16(samples.subarray(start, end))
     // Fade the outer edges of the pads (only where we actually cut).
     const fadeIn = start > 0 ? Math.min(fade, leading) : 0
-    for (let i = 0; i < fadeIn; i++) out[gap + i] = Math.round(out[gap + i]! * (i / fadeIn))
+    for (let i = 0; i < fadeIn; i++) out[i] = Math.round(out[i]! * (i / fadeIn))
     const fadeOut = end < samples.length ? Math.min(fade, trailing) : 0
     for (let i = 0; i < fadeOut; i++) {
       const j = out.length - 1 - i
       out[j] = Math.round(out[j]! * (i / fadeOut))
     }
-    return chunkPcm(out, chunk)
+    return { pause: gap > 0 ? chunkPcm(new Int16Array(gap), chunk) : [], speech: chunkPcm(out, chunk) }
   }
 }
 

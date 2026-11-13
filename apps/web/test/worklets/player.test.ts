@@ -66,7 +66,7 @@ describe("player worklet", () => {
     send({ type: "end", id: 12 })
     render(ms(600))
     expect(msgs("started")).toHaveLength(1)
-    expect(msgs("finished")).toEqual([{ type: "finished", id: 12, playedSamples: 882 * 2 + 2205 * 3 }])
+    expect(msgs("finished")).toEqual([{ type: "finished", id: 12, token: 0, playedSamples: 882 * 2 + 2205 * 3 }])
     expect(msgs("underrun")).toHaveLength(0)
     expect(proc.state).toBe("idle")
   })
@@ -108,7 +108,7 @@ describe("player worklet", () => {
     const stopped = msgs("stopped")[0]
     // Everything rendered so far (500 ms of quanta + the 192-sample fade), at the source rate.
     const expected = Math.round((ms(500) * QUANTUM + 192) * 24_000 / RATE)
-    expect(stopped).toEqual({ type: "stopped", id: 9, playedSamples: expected, report: true })
+    expect(stopped).toEqual({ type: "stopped", id: 9, token: 0, playedSamples: expected, report: true })
     // The fade ramps down within 192 samples, then silence.
     expect(Math.abs(fade[0]!)).toBeGreaterThan(0)
     expect(rms(fade.subarray(192))).toBe(0)
@@ -128,11 +128,11 @@ describe("player worklet", () => {
     send({ type: "frame", buffer: frame(4, tone(4800, 48_000)) })
     send({ type: "end", id: 4 })
     render(ms(200))
-    expect(msgs("finished")).toEqual([{ type: "finished", id: 4, playedSamples: 4800 }])
+    expect(msgs("finished")).toEqual([{ type: "finished", id: 4, token: 0, playedSamples: 4800 }])
     send({ type: "stop", id: 4, report: true })
-    expect(msgs("stopped")).toEqual([{ type: "stopped", id: 4, playedSamples: 4800, report: true }])
+    expect(msgs("stopped")).toEqual([{ type: "stopped", id: 4, token: 0, playedSamples: 4800, report: true }])
     send({ type: "stop", id: 99, report: true })
-    expect(msgs("stopped")[1]).toEqual({ type: "stopped", id: 99, playedSamples: 0, report: true })
+    expect(msgs("stopped")[1]).toEqual({ type: "stopped", id: 99, token: 0, playedSamples: 0, report: true })
     send({ type: "stop", report: true }) // the Stop button with nothing playing: nothing to report
     expect(msgs("stopped")).toHaveLength(2)
   })
@@ -142,7 +142,7 @@ describe("player worklet", () => {
     send({ type: "frame", buffer: frame(5, tone(441, 22_050)) })
     render(2)
     send({ type: "stop", id: 5, report: false })
-    expect(msgs("stopped")).toEqual([{ type: "stopped", id: 5, playedSamples: 0, report: false }])
+    expect(msgs("stopped")).toEqual([{ type: "stopped", id: 5, token: 0, playedSamples: 0, report: false }])
     expect(msgs("started")).toHaveLength(0)
     expect(proc.state).toBe("idle")
   })
@@ -161,7 +161,7 @@ describe("player worklet", () => {
     send({ type: "start", id: 6, rate: 48_000 })
     send({ type: "frame", buffer: frame(6, tone(4800, 48_000)) }) // 100 ms
     render(ms(150))
-    expect(msgs("underrun")).toEqual([{ type: "underrun", id: 6, underruns: 1 }])
+    expect(msgs("underrun")).toEqual([{ type: "underrun", id: 6, token: 0, underruns: 1 }])
     expect(proc.state).toBe("buffering")
     send({ type: "frame", buffer: frame(6, tone(1440, 48_000)) }) // 30 ms: below the 40 ms refill
     expect(rms(render(4))).toBe(0)
@@ -173,7 +173,7 @@ describe("player worklet", () => {
     expect(last.underruns).toBeGreaterThanOrEqual(2)
     send({ type: "end", id: 6 })
     render(2)
-    expect(msgs("finished")).toEqual([{ type: "finished", id: 6, playedSamples: 4800 + 1440 + 960 }])
+    expect(msgs("finished")).toEqual([{ type: "finished", id: 6, token: 0, playedSamples: 4800 + 1440 + 960 }])
   })
 
   it("finishes a reply shorter than the prebuffer once it ends, and a reply with no audio without started", () => {
@@ -182,13 +182,13 @@ describe("player worklet", () => {
     send({ type: "end", id: 10 })
     render(ms(40))
     expect(msgs("started")).toHaveLength(1)
-    expect(msgs("finished")).toEqual([{ type: "finished", id: 10, playedSamples: 480 }])
+    expect(msgs("finished")).toEqual([{ type: "finished", id: 10, token: 0, playedSamples: 480 }])
 
     send({ type: "start", id: 11, rate: 48_000 })
     send({ type: "end", id: 11 })
     render(2)
     expect(msgs("started")).toHaveLength(1)
-    expect(msgs("finished")[1]).toEqual({ type: "finished", id: 11, playedSamples: 0 })
+    expect(msgs("finished")[1]).toEqual({ type: "finished", id: 11, token: 0, playedSamples: 0 })
   })
 
   it("a new reply replaces an active one (the old one is reported stopped)", () => {

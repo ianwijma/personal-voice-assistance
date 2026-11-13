@@ -72,4 +72,12 @@ describe("TurnAudio", () => {
     assert.deepStrictEqual(pieces, [[1, 2, 3, 4, 5, 6]])
     assert.deepStrictEqual(frames(turn.audio()), [7, 8, 9])
   })
+
+  it("audioThrough: the turn's audio up to a frame, leaving out what came after it", () => {
+    const turn = new TurnAudio({ frameSamples: F, maxFrames: 100, prerollFrames: 3 })
+    feed(turn, [_, _, S, S, _, _, S, S, _])
+    assert.deepStrictEqual(frames(turn.audioThrough(6)), [1, 2, 3, 4, 5, 6])
+    assert.deepStrictEqual(frames(turn.audioThrough(100)), frames(turn.audio()))
+    assert.deepStrictEqual(frames(turn.audioThrough(0)), [])
+  })
 })

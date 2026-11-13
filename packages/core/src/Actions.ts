@@ -95,6 +95,11 @@ export interface BooleanParam extends ParamCommon<false> {
 export interface TextParam<O extends boolean = boolean> extends ParamCommon<O> {
   readonly kind: "text"
   readonly after: ReadonlyArray<string>
+  /**
+   * Words that, right before a marker, mean it is not one: `["wat"]` keeps the
+   * Dutch idiom "wat voor weer" ("what kind of weather") from reading as "for <place>".
+   */
+  readonly notAfter?: ReadonlyArray<string>
   /** Longest value kept, in words. Default 8. */
   readonly maxWords?: number
 }
@@ -161,7 +166,11 @@ export interface ActionDefinition<P extends ActionParams = ActionParams> {
   readonly params: P
   /** Read-only and safe to run before the turn is committed. Default false: `run` waits for the end of the turn. */
   readonly speculative?: boolean
-  /** Ask for a spoken yes first. `true` asks `<label>?`; a function words the question. Default false. */
+  /**
+   * Ask for a spoken yes first (core conducts it, and only when the conversation's `confirmActions`
+   * is "on"). Core always words the question itself from the label and the values; a function is
+   * accepted for compatibility but never called (the module host logs a warning). Default false.
+   */
   readonly confirm?: boolean | ((params: ParamValues<P>) => string)
   /** Also offered to conversational agents as a tool. Default true. */
   readonly offerAsTool?: boolean
@@ -300,6 +309,43 @@ const toParamValue = (name: string, param: ActionParam, value: unknown): unknown
 }
 
 /**
+ * The values an action's tool input stands for (a dynamic name resolved against the current
+ * options, a duration parsed): what `run` receives. Throws `ToolError` for a value it cannot use.
+ */
+export const actionValues = (registered: RegisteredAction, input: Readonly<Record<string, unknown>>): Record<string, any> => {
+  const values: Record<string, any> = {}
+  for (const [name, param] of Object.entries(registered.definition.params as ActionParams)) values[name] = toParamValue(name, param, input[name])
+  return values
+}
+
+/**
+ * `actionValues` for input that has NOT been through the tool's schema (core's confirmation
+ * proposal reads the raw tool input, review round 6): every required parameter present, a
+ * choice one of its values, a number a finite number, a boolean a boolean, text and names
+ * strings. Throws `ToolError` otherwise, so only complete, valid values are ever proposed.
+ */
+export const checkedActionValues = (registered: RegisteredAction, input: Readonly<Record<string, unknown>>): Record<string, any> => {
+  for (const [name, param] of Object.entries(registered.definition.params as ActionParams)) {
+    const value = input[name]
+    if (value === undefined || value === null) {
+      if (param.optional === true || param.kind === "boolean") continue
+      throw new ToolError({ message: `${name} is required` })
+    }
+    const ok = param.kind === "choice"
+      ? typeof value === "string" && param.options.some((o) => o.value === value)
+      : param.kind === "number"
+      ? typeof value === "number" && Number.isFinite(value)
+      : param.kind === "boolean"
+      ? typeof value === "boolean"
+      : typeof value === "string"
+    if (!ok) throw new ToolError({ message: `${name} has an invalid value` })
+  }
+  const clean: Record<string, unknown> = {}
+  for (const [k, v] of Object.entries(input)) if (v !== null) clean[k] = v
+  return actionValues(registered, clean)
+}
+
+/**
  * The tool a conversational agent uses for an action: name `actionToolName`,
  * input from the parameters (a `dynamic` value is a name resolved against the
  * current options when the tool runs, so a changing room list never changes the
@@ -314,17 +360,23 @@ export const actionTool = (registered: RegisteredAction): Tool => {
     const schema = paramSchema(param)
     fields[name] = param.optional === true ? Schema.optional(schema) as unknown as Schema.Codec<unknown, unknown> : schema
   }
-  const confirm = def.confirm !== undefined && def.confirm !== false ? " Ask the owner to confirm before calling this." : ""
-  return makeTool({
+  // Enforced by core (`proposingTools` and `Conversation`, review round 6): calling it makes the assistant ask.
+  const needsYes = def.confirm !== undefined && def.confirm !== false
+  const confirm = needsYes
+    ? " Needs the owner's confirmation: calling this does not run it; the assistant then asks the owner to confirm and runs it only if they do. Do not ask the owner yourself, and say nothing further after calling it."
+    : ""
+  const tool = makeTool({
     name: actionToolName(registered.moduleId, def.id),
     description: `${sentenceOf(def.label)} ${def.description}${confirm}`,
     parameters: Schema.Struct(fields) as unknown as Schema.Codec<Readonly<Record<string, unknown>>, unknown>,
     speculative: def.speculative === true,
     execute: (input: Readonly<Record<string, unknown>>) =>
       Effect.suspend(() => {
-        const values: Record<string, any> = {}
+        // Never through a registry: only core's confirmation (`consumeConfirmation`) runs such an action.
+        if (needsYes) return Effect.fail(new ToolError({ message: "Not run: this action needs the owner's confirmation, which only the assistant can ask for." }))
+        let values: Record<string, any>
         try {
-          for (const [name, param] of Object.entries(params)) values[name] = toParamValue(name, param, input[name])
+          values = actionValues(registered, input)
         } catch (error) {
           return Effect.fail(error instanceof ToolError ? error : new ToolError({ message: String(error) }))
         }
@@ -338,6 +390,7 @@ export const actionTool = (registered: RegisteredAction): Tool => {
         )
       })
   })
+  return { ...tool, action: registered }
 }
 
 const sentenceOf = (s: string) => (/[.!?]$/.test(s) ? s : `${s}.`)

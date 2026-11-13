@@ -1,4 +1,27 @@
-/** Events produced by `Stt`, including turn detection. */
+/**
+ * Events produced by `Stt`, including turn detection.
+ *
+ * Utterance boundaries (contract, relied on by Stop; docs/ARCHITECTURE.md): every
+ * utterance begins with `SpeechStarted` and ends with exactly one `EndOfTurn`;
+ * `Interim`, `EagerEndOfTurn` and `TurnResumed` in between belong to it. An
+ * utterance for which `SpeechStarted` was sent ALWAYS ends with an `EndOfTurn`,
+ * also when no words were recognised: its `text` is then the empty string. A
+ * recogniser that commits without having sent `SpeechStarted` sends it right
+ * before the `EndOfTurn`. An `EndOfTurn` with empty or blank text starts nothing in
+ * `Conversation`: it closes the utterance (and a Stop attached to it) and discards a
+ * speculative turn. `EagerEndOfTurn` is never empty; one that is (a recogniser
+ * breaking the contract) discards a speculative turn and starts nothing, but does NOT
+ * end the utterance: it stays open and a Stop stays in force until the `EndOfTurn`
+ * (review round 5: an eager event must never lift a cancellation).
+ *
+ * Every `EagerEndOfTurn`, `TurnResumed` and `EndOfTurn` therefore arrives inside an open utterance
+ * (after a `SpeechStarted`, before that utterance's `EndOfTurn`). One that arrives with no utterance
+ * open breaks the contract and `Conversation` ignores it — it starts, promotes, discards and
+ * interrupts nothing (logged at most once per 10 s) — because a duplicated final would otherwise
+ * run its action twice (review round 6). A recogniser that reconnects in the middle of an utterance
+ * must therefore send `SpeechStarted` again before the rest of it if it has already closed the first
+ * part with an `EndOfTurn`. Typed text, `Say` and Stop are not recogniser events and are never ignored.
+ */
 export type SttEvent =
   | { readonly _tag: "SpeechStarted" }
   | { readonly _tag: "Interim"; readonly text: string }
