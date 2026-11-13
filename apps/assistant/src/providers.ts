@@ -6,7 +6,7 @@ import * as DeepgramStt from "@pva/stt-deepgram"
 import * as SherpaStt from "@pva/stt-sherpa"
 import * as CartesiaTts from "@pva/tts-cartesia"
 import * as SherpaTts from "@pva/tts-sherpa"
-import { Config, Effect, Layer } from "effect"
+import { Config, Effect, Layer, Option } from "effect"
 import { resolve } from "node:path"
 import { userCwd } from "./env.ts"
 import { FakeLlm } from "./FakeLlm.ts"
@@ -18,7 +18,14 @@ import { FakeLlm } from "./FakeLlm.ts"
  * (API keys, ...) of providers that are not selected are never read.
  */
 const llmProviders = {
-  fake: FakeLlm.layer,
+  // Untimed, unless BENCH_LLM_FIRST_TOKEN_MS is set: then it stands in for a hosted model of that speed
+  // (as in `bench --live`), so serve mode can be measured the same way.
+  fake: Layer.unwrap(Effect.gen(function*() {
+    const firstTokenMs = yield* Config.Int("BENCH_LLM_FIRST_TOKEN_MS").pipe(Config.option)
+    if (Option.isNone(firstTokenMs)) return FakeLlm.layer
+    const tokensPerSecond = yield* Config.Finite("BENCH_LLM_TOKENS_PER_S").pipe(Config.withDefault(60))
+    return FakeLlm.layerTimed({ firstTokenMs: firstTokenMs.value, tokensPerSecond })
+  })),
   anthropic: AnthropicLlm.layerConfig
 }
 

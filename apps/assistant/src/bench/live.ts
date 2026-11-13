@@ -5,12 +5,12 @@
  * the next turn never overlaps the reply). Replies are written as WAV files.
  */
 import { layerOutput, loadInputPcm, pacedFrames } from "@pva/audio-file"
-import { type AudioError, Conversation, type Llm, Stt, type SttEvent, ToolRegistry, type Trace, type Tts, TurnTrace } from "@pva/core"
-import { Effect, Layer, Option, Queue, Stream } from "effect"
+import { type AudioError, Conversation, type Llm, type ModuleSnapshot, Stt, type SttEvent, ToolRegistry, type Trace, type Tts, TurnTrace } from "@pva/core"
+import { Effect, Layer, Option, Queue, type Scope, Stream } from "effect"
 import { readdirSync, statSync } from "node:fs"
 import { basename, join } from "node:path"
 import type { ConversationOptions } from "@pva/core"
-import { modules } from "../modules.ts"
+import { startCliModules } from "../modules.ts"
 import { observedTurnTraceLayer, StartupError } from "../startup.ts"
 import type { BenchRow } from "./report.ts"
 
@@ -50,17 +50,20 @@ export interface LiveOptions {
   readonly noiseFloor?: boolean
   /** Silence before the first file, while the STT connection opens. Default 1500 ms. */
   readonly leadInMs?: number
+  /** Running modules. Default: started from the saved settings. */
+  readonly modules?: ModuleSnapshot
 }
 
-export const runLive = (options: LiveOptions): Effect.Effect<Array<BenchRow>, AudioError | StartupError, Stt | Llm | Tts> =>
+export const runLive = (options: LiveOptions): Effect.Effect<Array<BenchRow>, AudioError | StartupError, Stt | Llm | Tts | Scope.Scope> =>
   Effect.gen(function*() {
     const pcms = yield* Effect.forEach(options.files, loadInputPcm)
     if (pcms.length === 0) return yield* new StartupError({ message: "bench --live: no .wav files given" })
     const finished = yield* Queue.unbounded<Trace>()
     const onFinish = (trace: Trace) => trace.outcome === "discarded" ? Effect.void : Queue.offer(finished, trace)
     const traceLayer = observedTurnTraceLayer(onFinish)
+    const modules = options.modules ?? (yield* startCliModules())
     const layer = Conversation.layer(options.conversation).pipe(
-      Layer.provideMerge(Layer.mergeAll(ToolRegistry.layer(modules), traceLayer, layerOutput({ directory: options.outputDir })))
+      Layer.provideMerge(Layer.mergeAll(Layer.succeed(ToolRegistry, modules.registry), traceLayer, layerOutput({ directory: options.outputDir })))
     )
     return yield* Effect.gen(function*() {
       const conversation = yield* Conversation

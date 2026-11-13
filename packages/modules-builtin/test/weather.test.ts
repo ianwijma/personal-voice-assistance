@@ -1,7 +1,7 @@
 import { assert, describe, it } from "@effect/vitest"
-import { makeToolRegistry, type ToolResult } from "@pva/core"
+import { makeToolRegistry, resolveSettings, type ToolResult } from "@pva/core"
 import { Effect } from "effect"
-import { weatherModule, type WeatherOptions } from "../src/weather.ts"
+import { makeWeather, weatherModule, type WeatherOptions } from "../src/weather.ts"
 
 const geocoding = {
   results: [
@@ -40,7 +40,7 @@ const json = (body: unknown, status = 200) => () => new Response(JSON.stringify(
 const ok = { "geocoding-api.open-meteo.com": json(geocoding), "api.open-meteo.com": json(forecast) }
 
 const run = (options: WeatherOptions, input: unknown): Effect.Effect<ToolResult> =>
-  makeToolRegistry([weatherModule(options)]).run({ id: "1", name: "weather", input })
+  makeToolRegistry([makeWeather(options)]).run({ id: "1", name: "weather", input })
 
 describe("weather module", () => {
   it.effect("geocodes the place, prefers the named country, returns a compact summary", () =>
@@ -63,7 +63,7 @@ describe("weather module", () => {
   it.effect("uses the home location and units, and caches geocoding", () =>
     Effect.gen(function*() {
       const { fetch, urls } = fakeFetch(ok)
-      const registry = makeToolRegistry([weatherModule({ fetch, defaultPlace: "Paris", units: "fahrenheit" })])
+      const registry = makeToolRegistry([makeWeather({ fetch, defaultPlace: "Paris", units: "fahrenheit" })])
       const first = yield* registry.run({ id: "1", name: "weather", input: {} })
       assert.match(JSON.parse(first.content).place, /^Paris, Texas/)
       assert.match(JSON.parse(first.content).now, /°F .* mph$/)
@@ -107,9 +107,35 @@ describe("weather module", () => {
     }))
 
   it("exposes an optional place parameter", () => {
-    const [spec] = makeToolRegistry([weatherModule()]).specs
+    const [spec] = makeToolRegistry([makeWeather()]).specs
     assert.strictEqual(spec!.name, "weather")
     assert.isUndefined(spec!.inputSchema.required)
     assert.property(spec!.inputSchema.properties as object, "place")
+  })
+})
+
+describe("weather module definition", () => {
+  it.effect("environment values lock fields; start publishes the home location and uses the injected fetch", () =>
+    Effect.gen(function*() {
+      const { fetch, urls } = fakeFetch(ok)
+      const module = weatherModule({ fetch })
+      const resolved = resolveSettings(module.settings, {
+        stored: { defaultPlace: "Paris, France" },
+        secrets: {},
+        env: { WEATHER_UNITS: "fahrenheit" }
+      })
+      assert.deepStrictEqual(resolved.value, { defaultPlace: "Paris, France", units: "fahrenheit", timeoutMs: 3000 })
+      assert.deepStrictEqual(resolved.form.fields.find((f) => f.key === "units")?.locked, { reason: "Set by WEATHER_UNITS in the environment" })
+      const statuses: Array<unknown> = []
+      const instance = yield* Effect.scoped(module.start({ settings: resolved.value!, setStatus: (s) => statuses.push(s) }))
+      assert.deepStrictEqual(statuses, [{ text: "Home: Paris, France", tone: "neutral" }])
+      const result = yield* makeToolRegistry([{ name: "weather", ...instance }]).run({ id: "1", name: "weather", input: {} })
+      assert.match(JSON.parse(result.content).now, /°F/)
+      assert.strictEqual(urls.length, 2)
+    }))
+
+  it("an invalid environment value is reported on the field", () => {
+    const resolved = resolveSettings(weatherModule().settings, { stored: {}, secrets: {}, env: { WEATHER_UNITS: "kelvin" } })
+    assert.deepStrictEqual(resolved.form.errors, [{ key: "units", message: "WEATHER_UNITS=kelvin is not valid: Must be one of: celsius, fahrenheit" }])
   })
 })

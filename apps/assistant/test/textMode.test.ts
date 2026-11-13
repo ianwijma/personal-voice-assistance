@@ -1,10 +1,13 @@
 import { assert, it } from "@effect/vitest"
-import { Conversation, ToolRegistry, TurnTrace } from "@pva/core"
+import { Conversation, makeToolRegistry, readOnlyPersistence, ToolRegistry, TurnTrace } from "@pva/core"
 import { makeScriptedLlm, textDelta } from "@pva/core/testing"
 import { Effect, Layer, Stream } from "effect"
 import { FakeLlm } from "../src/FakeLlm.ts"
-import { modules } from "../src/modules.ts"
+import { startCliModules } from "../src/modules.ts"
 import { runTextTurns } from "../src/text.ts"
+
+// The module catalog through the host, with nothing saved (the test never reads data/).
+const Modules = Layer.effect(ToolRegistry, Effect.map(startCliModules({ persistence: readOnlyPersistence() }), (s) => s.registry))
 
 it.live("text turn: fake LLM → clock tool → spoken-style answer", () =>
   Effect.gen(function*() {
@@ -16,7 +19,7 @@ it.live("text turn: fake LLM → clock tool → spoken-style answer", () =>
     assert.strictEqual((yield* conversation.history).length, 6)
   }).pipe(Effect.provide(
     Conversation.layer({ systemPrompt: "test" }).pipe(
-      Layer.provide(Layer.mergeAll(FakeLlm.layer, ToolRegistry.layer(modules), TurnTrace.layer()))
+      Layer.provide(Layer.mergeAll(FakeLlm.layer, Modules, TurnTrace.layer()))
     )
   )))
 
@@ -36,7 +39,7 @@ it.live("text mode never prints voice markers, even split across deltas; history
     })
   }).pipe(Effect.provide(
     Conversation.layer({ systemPrompt: "test" }).pipe(
-      Layer.provide(Layer.mergeAll(llm.layer, ToolRegistry.layer(modules), TurnTrace.layer()))
+      Layer.provide(Layer.mergeAll(llm.layer, Layer.succeed(ToolRegistry, makeToolRegistry([])), TurnTrace.layer()))
     )
   ))
 })

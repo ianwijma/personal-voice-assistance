@@ -32,6 +32,12 @@ export interface VoiceRouterOptions {
   readonly voices: ReadonlyArray<Voice>
   /** Name of the voice used when a reply has no marker (and for unknown names). Its rate is the router's rate. */
   readonly defaultVoice: string
+  /**
+   * Output rate. Default: the default voice's rate. Set it to keep the rate
+   * fixed when the router is rebuilt with another default voice (the web output
+   * cannot change rate mid-session).
+   */
+  readonly sampleRate?: number
   /** Called when a segment's synthesis has finished (for `say`-style measurements). */
   readonly onSegment?: (stats: VoiceSegmentStats) => void
   /** Clock for `onSegment`. Default `performance.now`. */
@@ -83,7 +89,7 @@ export const makeVoiceRouter = (options: VoiceRouterOptions): Tts["Service"] & {
   const byName = new Map(options.voices.map((v) => [v.name.toLowerCase(), v]))
   const fallback = byName.get(options.defaultVoice.toLowerCase())
   if (fallback === undefined) throw new Error(`default voice "${options.defaultVoice}" is not among the voices`)
-  const sampleRate = fallback.tts.sampleRate
+  const sampleRate = options.sampleRate ?? fallback.tts.sampleRate
   const now = options.now ?? (() => performance.now())
   const onSegment = options.onSegment
 

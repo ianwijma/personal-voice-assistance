@@ -1,4 +1,4 @@
-import { type AssistantModule, makeTool, ToolError } from "@pva/core"
+import { type AssistantModule, defineAction, defineModule, makeTool, Param, Setting, ToolError } from "@pva/core"
 import { DateTime, Effect, Option, Schema } from "effect"
 
 export interface ClockOptions {
@@ -14,9 +14,10 @@ export interface ClockOptions {
  * prompt) and a read-only tool (time in another zone).
  * Time comes from Effect's `Clock`, so tests can use `TestClock`.
  */
-export const clockModule = (options: ClockOptions = {}): AssistantModule => {
+export const makeClock = (options: ClockOptions = {}): AssistantModule => {
   const locale = options.locale ?? "en-GB"
-  const localZone = DateTime.zoneMakeNamedUnsafe(options.timeZone ?? Intl.DateTimeFormat().resolvedOptions().timeZone)
+  const zone = options.timeZone === undefined || options.timeZone === "" ? Intl.DateTimeFormat().resolvedOptions().timeZone : options.timeZone
+  const localZone = DateTime.zoneMakeNamedUnsafe(zone)
 
   const describe = (now: DateTime.Zoned) => ({
     timeZone: DateTime.zoneToString(now.zone),
@@ -53,3 +54,79 @@ export const clockModule = (options: ClockOptions = {}): AssistantModule => {
 
   return { name: "clock", tools: [currentTime], context: [context] }
 }
+
+/** A place the `time_now` action knows by name. */
+export interface ClockPlace {
+  readonly name: string
+  /** IANA zone. */
+  readonly zone: string
+  readonly aliases?: ReadonlyArray<string>
+}
+
+/** The places `time_now` offers (a `places` setting replaces this constant with the settings widening, piece G/H). */
+export const defaultPlaces: ReadonlyArray<ClockPlace> = [
+  { name: "Amsterdam", zone: "Europe/Amsterdam" },
+  { name: "London", zone: "Europe/London", aliases: ["Londen"] },
+  { name: "New York", zone: "America/New_York" },
+  { name: "Tokyo", zone: "Asia/Tokyo" }
+]
+
+/**
+ * The `time_now` action (docs/AGENTS-AND-INTENTS.md §3.9): read-only, so the
+ * intent agent may run it during a speculative turn. "It's 14:32." or, for a
+ * named place, "In Tokyo it's 22:32."
+ */
+export const clockActions = (options: ClockOptions & { readonly places?: ReadonlyArray<ClockPlace> } = {}) => {
+  const locale = options.locale ?? "en-GB"
+  const local = options.timeZone === undefined || options.timeZone === "" ? Intl.DateTimeFormat().resolvedOptions().timeZone : options.timeZone
+  const places = options.places ?? defaultPlaces
+  const timeIn = (zone: string) =>
+    Effect.map(DateTime.now, (now) => DateTime.format(DateTime.setZone(now, DateTime.zoneMakeNamedUnsafe(zone)), { locale, timeStyle: "short" }))
+  const timeNow = defineAction({
+    id: "time_now",
+    label: "Tell the time",
+    description: "Say what time it is now, here or in one of the named places.",
+    examples: ["what time is it", "what's the time in Tokyo", "hoe laat is het", "hoe laat is het in New York"],
+    params: {
+      zone: Param.choice({
+        label: "Place",
+        optional: true,
+        options: places.map((p) => ({ value: p.zone, label: p.name, ...(p.aliases !== undefined ? { aliases: p.aliases } : {}) }))
+      })
+    },
+    speculative: true,
+    run: ({ zone }) =>
+      Effect.map(timeIn(zone ?? local), (time) => {
+        const place = zone === undefined ? undefined : places.find((p) => p.zone === zone)
+        return { say: place === undefined ? `It's ${time}.` : `In ${place.name} it's ${time}.` }
+      })
+  })
+  return [timeNow]
+}
+
+/** The clock as a module: time zone and date format are settings. */
+export const clockModule = defineModule({
+  id: "clock",
+  name: "Clock",
+  description: "Tells the model the local date and time, and the time anywhere else.",
+  settings: {
+    timeZone: Setting.text({
+      label: "Time zone",
+      description: "IANA name, e.g. Europe/Amsterdam. Empty: this machine's zone.",
+      placeholder: Intl.DateTimeFormat().resolvedOptions().timeZone,
+      env: "CLOCK_TIME_ZONE",
+      maxLength: 64,
+      check: (zone) => (zone === "" || Option.isSome(DateTime.zoneMakeNamed(zone)) ? undefined : "Unknown time zone")
+    }),
+    locale: Setting.choice({
+      label: "Date format",
+      options: [
+        { value: "en-GB", label: "13 November 2026" },
+        { value: "en-US", label: "November 13, 2026" },
+        { value: "nl-NL", label: "13 november 2026" }
+      ],
+      default: "en-GB"
+    })
+  },
+  start: ({ settings }) => Effect.sync(() => ({ ...makeClock(settings), actions: clockActions(settings) }))
+})

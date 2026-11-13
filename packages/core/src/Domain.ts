@@ -33,6 +33,8 @@ export type Message =
     readonly toolCalls?: ReadonlyArray<ToolCall>
     /** The user barged in; `content` is only what was actually played. */
     readonly interrupted?: boolean
+    /** The agent that said it (absent in single-model conversations and history from before agents). */
+    readonly agentId?: string
   }
   | { readonly role: "tool"; readonly results: ReadonlyArray<ToolResult> }
 

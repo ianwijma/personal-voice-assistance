@@ -20,7 +20,7 @@ import {
   toolCall,
   turnResumed
 } from "@pva/core/testing"
-import { clockModule } from "@pva/modules-builtin"
+import { makeClock } from "@pva/modules-builtin"
 import { Effect, Layer, Queue, Stream } from "effect"
 import type { BenchRow } from "./report.ts"
 import { observedTurnTraceLayer } from "../startup.ts"
@@ -113,7 +113,7 @@ export const runOffline = (scenario: OfflineScenario, rounds: number) =>
     const layer = Conversation.layer({ systemPrompt: "Benchmark.", bargeIn: true }).pipe(
       Layer.provideMerge(Layer.mergeAll(
         makeScriptedLlm(respond(scenario.delays)).layer,
-        ToolRegistry.layer([clockModule()]),
+        ToolRegistry.layer([makeClock()]),
         observedTurnTraceLayer(onFinish),
         // Through the voice router, as in the app, so its overhead is part of the measurement.
         Layer.succeed(Tts, makeVoiceRouter({

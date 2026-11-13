@@ -106,10 +106,21 @@ export const normalizeLevel = (pcm: Uint8Array): Uint8Array => {
   return new Uint8Array(samples.buffer)
 }
 
-/** Concatenate WAV files (by name in `wavDir`, level-normalised) and silences (ms) into one recording. */
-export const timeline = (parts: ReadonlyArray<string | number>): { pcm: Uint8Array; utterances: Array<Utterance> } => {
+/**
+ * Concatenate WAV files and silences (ms) into one recording. Files are names in `wavDir`, level-normalised,
+ * unless `options.dir` is given: then they are paths relative to it, at their own level, and the speech span
+ * of each is taken from `options.spanDir` (the clean version of the same clip) when given.
+ */
+export const timeline = (
+  parts: ReadonlyArray<string | number>,
+  options: { readonly dir?: string; readonly spanDir?: string } = {}
+): { pcm: Uint8Array; utterances: Array<Utterance> } => {
   const pieces = parts.map((part) =>
-    typeof part === "number" ? silence(part) : normalizeLevel(readWav(join(wavDir, part)))
+    typeof part === "number"
+      ? silence(part)
+      : options.dir === undefined
+      ? normalizeLevel(readWav(join(wavDir, part)))
+      : readWav(join(options.dir, part))
   )
   const pcm = new Uint8Array(pieces.reduce((n, piece) => n + piece.length, 0))
   const utterances: Array<Utterance> = []
@@ -117,7 +128,7 @@ export const timeline = (parts: ReadonlyArray<string | number>): { pcm: Uint8Arr
   parts.forEach((part, i) => {
     const piece = pieces[i]!
     if (typeof part === "string") {
-      const span = speechSpanMs(piece)
+      const span = speechSpanMs(options.spanDir === undefined ? piece : readWav(join(options.spanDir, part)))
       utterances.push({ name: part, speechStartMs: offset / BYTES_PER_MS + span.start, speechEndMs: offset / BYTES_PER_MS + span.end })
     }
     pcm.set(piece, offset)
@@ -160,6 +171,35 @@ export const wordErrors = (reference: string, hypothesis: string): { errors: num
     for (let j = 1; j <= h.length; j++) {
       row.push(Math.min(prev[j]! + 1, row[j - 1]! + 1, prev[j - 1]! + (r[i - 1] === h[j - 1] ? 0 : 1)))
     }
+    prev = row
+  }
+  return { errors: prev[h.length]!, words: r.length }
+}
+
+// The study's normalisation (docs/research/stt-quality.md §2.2), so its numbers and these compare: fillers dropped,
+// UK → US spellings, number words 0–10 as digits, hyphens split.
+const FILLERS = new Set(["um", "uh", "mm", "hmm", "mhm", "er", "erm", "ah", "eh", "uhm", "umm", "mmm", "hm"])
+const US: Record<string, string> = {
+  dishonoured: "dishonored", honour: "honor", colour: "color", favourite: "favorite", neighbour: "neighbor", centre: "center",
+  realise: "realize", organisation: "organization", programme: "program", labour: "labor", behaviour: "behavior", grey: "gray", mum: "mom"
+}
+const NUMBERS: Record<string, string> = { zero: "0", one: "1", two: "2", three: "3", four: "4", five: "5", six: "6", seven: "7", eight: "8", nine: "9", ten: "10" }
+export const studyWords = (text: string, lang: string): Array<string> => {
+  let words = text.toLowerCase().replace(/[‘’`]/g, "'").replace(/[-–—_]/g, " ").replace(/[^\p{L}\p{N}'\s]/gu, " ")
+    .split(/\s+/).map((w) => w.replace(/^'+|'+$/g, "")).filter(Boolean)
+  if (lang === "en") {
+    words = words.filter((w) => !FILLERS.has(w)).map((w) => US[w] ?? w).map((w) => NUMBERS[w] ?? w)
+    words = words.join(" ").replace(/for ever/g, "forever").replace(/\bo k\b/g, "okay").replace(/\bok\b/g, "okay").split(" ").filter(Boolean)
+  }
+  return words
+}
+export const studyWordErrors = (reference: string, hypothesis: string, lang: string): { errors: number; words: number } => {
+  const r = studyWords(reference, lang)
+  const h = studyWords(hypothesis, lang)
+  let prev = Array.from({ length: h.length + 1 }, (_, j) => j)
+  for (let i = 1; i <= r.length; i++) {
+    const row = [i]
+    for (let j = 1; j <= h.length; j++) row.push(Math.min(prev[j]! + 1, row[j - 1]! + 1, prev[j - 1]! + (r[i - 1] === h[j - 1] ? 0 : 1)))
     prev = row
   }
   return { errors: prev[h.length]!, words: r.length }

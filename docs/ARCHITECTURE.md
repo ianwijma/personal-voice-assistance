@@ -21,7 +21,7 @@ AudioInput ──pcm 16k──▶ Stt ──SttEvent──▶ Conversation ─�
    clause chunker ──▶ Tts (voice router) ──pcm at the default voice's rate──▶ AudioOutput
 ```
 
-Default providers: `Stt` = sherpa-onnx streaming transducer + Silero VAD (local), `Tts` = Piper via sherpa-onnx
+Default providers: `Stt` = sherpa-onnx Parakeet-TDT v2, decoded once per turn, + Silero VAD (local), `Tts` = Piper via sherpa-onnx
 (local, 22050 Hz), `Llm` = Anthropic (hosted; `fake` offline stand-in when no key is configured).
 
 All audio is raw PCM, signed 16-bit little-endian, mono, carried as `Uint8Array` chunks of about 20 ms. Input is 16 kHz. Output rate is declared by the `Tts` service (Piper 22050 Hz, Kokoro and Cartesia 24 kHz); an engine cannot be asked for another rate, so a consumer that needs one resamples (`makeResampler`).
@@ -33,9 +33,18 @@ These are the contract. Adapters implement them; nothing outside an adapter may 
 ```ts
 // Audio
 AudioInput:  { readonly stream: Stream<Uint8Array, AudioError> }
-AudioOutput: { play(audio: Stream<Uint8Array, E>, sampleRate: number): Effect<void, E | AudioError> }
+AudioOutput: {
+  readonly reportsPlayback?: boolean
+  play(audio: Stream<Uint8Array, E>, sampleRate: number, observer?: PlaybackObserver): Effect<void, E | AudioError>
+}
 // `play` returns when the audio has finished playing. Interrupting the fiber
 // must silence the speaker immediately (drop everything buffered).
+// An output that is not paced by pulling (the browser buffers what it receives)
+// sets `reportsPlayback` and reports through the observer:
+PlaybackObserver = { started(): void; progress(playedSamples: number): void }
+// `started`: the first sample reached the device; `progress`: samples handed to
+// the device so far (non-decreasing; the final value before `play` returns or
+// its interruption completes).
 
 // Speech to text, including turn detection
 Stt: { transcribe(audio: Stream<Uint8Array, AudioError>): Stream<SttEvent, SttError> }
@@ -84,7 +93,18 @@ Interrupting the consumer of any of these streams must cancel the underlying wor
 
 One long-lived fiber consumes `SttEvent`s and owns at most one *turn fiber*.
 
-API: `Conversation.voice(events)` runs the loop over an event stream (`runVoice` wires `AudioInput → Stt → voice` with `Tts`/`AudioOutput`); `Conversation.textTurn(text)` runs one turn as a stream of text deltas without any audio service, through the same LLM/tool-loop code; `Conversation.history` reads the history.
+API: `Conversation.voice(events)` runs the loop over an input stream (`runVoice` wires `AudioInput → Stt → voice` with `Tts`/`AudioOutput`); `Conversation.textTurn(text)` runs one turn as a stream of text deltas without any audio service, through the same LLM/tool-loop code; `Conversation.history` reads the history.
+
+```ts
+ConversationInput = SttEvent | { _tag: "TextInput"; text: string; speak: boolean } | { _tag: "Interrupt" }
+Conversation.layer({ systemPrompt, maxToolRounds?, bargeIn?, chunker?, onEvent?, initialHistory? })  // needs ToolRegistry
+Conversation.layerWithSetup({ setup: Effect<TurnSetup>, ... })   // TurnSetup = { system, registry }, read once per turn
+```
+
+- `TextInput` (a typed message) behaves like `EndOfTurn` but always interrupts what runs, whatever the barge-in setting; with `speak: false` nothing is synthesised and the whole reply is committed. `Interrupt` (the Stop button) interrupts the committed turn; a pending speculative turn is left alone.
+- `setup` is evaluated once at the start of each turn (voice and text, including a speculative turn that is later promoted): a turn never sees a half-applied module or prompt change. `initialHistory` lets an engine reload keep the conversation.
+- `onEvent` receives `ConversationEvent`s synchronously on the turn's fiber (no Effect per event): `TurnStarted` (with `speculative`, `spoken`, `source`), `TurnPromoted`, `TextDelta` (raw, rounds separated by `"\n"`), `ClauseQueued`, `ClausePlaying`, `ToolStarted`, `ToolFinished`, `TurnEnded` (after history is committed, with the trace). Speculative turns emit events too; the subscriber decides what to show. A throwing subscriber is ignored.
+- `CurrentTurnTrace` is provided around `AudioOutput.play` as well as around `Tts.synthesize` (the web output uses the turn id as the reply id and records the browser's numbers in the trace).
 
 | Event | Action |
 |---|---|
@@ -96,7 +116,8 @@ API: `Conversation.voice(events)` runs the loop over an event stream (`runVoice`
 
 Details:
 - "Same text" compares transcripts case-insensitively, ignoring punctuation and extra whitespace.
-- A clause's audio "started playing" when its first chunk was handed to `AudioOutput` (`playbackStart` marks the first chunk of the turn). With barge-in disabled, `SpeechStarted` does nothing.
+- A clause's audio "started playing" when its first chunk was handed to `AudioOutput` (`playbackStart` marks the first chunk of the turn). With an output that `reportsPlayback`, `Conversation` instead records each clause's start offset in samples as chunks are pulled and counts a clause as played once the reported progress passes it; `playbackStart` is marked on `started()`. With barge-in disabled, `SpeechStarted` does nothing.
+- A turn whose playback fails (the browser disconnected) is committed like an interrupted one: only the clauses reported as played.
 - If the event stream ends, a still-pending speculative turn is discarded and a committed one is allowed to finish.
 - A turn that fails (provider error) is logged and committed like an interrupted one; the loop keeps running.
 
@@ -113,7 +134,7 @@ Different replies can use different TTS engines: an everyday answer is spoken by
 - **Selection is a marker, not a tool call.** The model starts its reply with `[voice:NAME]` (no marker = default voice). A marker at the start of a later clause switches part-way; the choice lasts until the next marker or the end of the reply. A tool call would cost an extra model round trip on every such reply; a marker costs nothing. An unknown name falls back to the default voice with a warning. Markers are removed before text reaches any engine (one elsewhere in a clause is stripped and ignored).
 - **Chunker.** `chunkClauses` never cuts inside a marker (`[voice: expressive]` contains `: `), and a leading marker does not count towards the comma minimum. The check only runs on text that starts with `[`, so an unmarked reply is chunked exactly as before.
 - **Ordering.** Each run of consecutive clauses with the same voice is a *segment*: one continuous `synthesize` call on that engine, fed clause by clause as clauses arrive (prosody is kept within a segment). A segment's engine starts as soon as its first clause arrives, even while an earlier segment's audio is still being delivered; its audio is buffered and emitted only after every earlier segment has ended. So audio never overtakes, and `TtsAudio.clause` is the index in the router's input and never decreases (a marker-only clause gets an index but no audio). Two segments of the same voice never synthesise at once, so engines need not support concurrent calls. Interrupting the consumer interrupts every running engine.
-- **Sample rates.** A reply plays at one rate: the router declares the default voice's `sampleRate` and resamples other voices on typed arrays (`makeResampler`: linear interpolation with state carried across chunks, plus a two-tap low-pass when downsampling). Cheap and fine for speech.
+- **Sample rates.** A reply plays at one rate: the router declares the default voice's `sampleRate` (or a fixed `sampleRate` option, so serve mode can change the default voice live without changing the output rate) and resamples other voices on typed arrays (`makeResampler`: linear interpolation with state carried across chunks, plus a two-tap low-pass when downsampling). Cheap and fine for speech.
 - **Prompt.** `voicePrompt(voices, defaultVoice)` (also `router.prompt`) is a deterministic block listing the voices, when to use each, and the marker syntax. The app appends it to the stable system prompt, never to the per-turn `context`, so prompt caching keeps working. With one voice it is empty and markers are just stripped.
 - **History keeps markers.** The assistant message is stored as the model wrote it, markers included (interrupted turns keep the markers of the clauses that played). Seeing its own earlier `[voice:...]` usage in context helps the model keep using the syntax correctly and consistently, and the history stays exactly what the model generated. Markers are removed only for display: text mode pipes replies through `stripVoiceMarkersStream`, and voice mode prints `stripVoiceMarkers(content)`.
 - **Tracing.** `Conversation` provides the turn's `Trace` as `CurrentTurnTrace` around `Tts.synthesize`; the router appends each voice it uses to `trace.voices`, shown as `voices: ...` in the latency line. The `Tts` interface is unchanged.
@@ -123,7 +144,7 @@ In the app, voices are declared in `apps/assistant/src/voices.ts` (name, descrip
 
 ### Local adapters: worker thread and child processes
 
-**`stt-sherpa`.** The recogniser and the VAD run in a `worker_threads` worker (plain `.mjs`, because workers inherit no TypeScript loader), since each decode blocks for tens of milliseconds. The main thread copies audio into one transferred buffer per batch and runs the pure `TurnDetector` state machine on the per-frame VAD decisions; it drops audio rather than queue it when the worker falls behind by more than 1 s. Turn detection is silence-based (`EagerEndOfTurn` after 250 ms, `EndOfTurn` after 600 ms by default), and the eager transcript is a real finalised decode, so the speculative turn is promoted whenever the user does not resume.
+**`stt-sherpa`.** The recogniser, the Silero VAD and a gain control run in a `worker_threads` worker (plain `.mjs`, because workers inherit no TypeScript loader), since each decode blocks for tens of milliseconds to seconds. The main thread copies audio into one transferred buffer per batch and runs the pure `TurnDetector` state machine on the per-frame VAD decisions; it drops audio rather than queue it when the worker falls behind by more than 1 s. Turn detection is silence-based (`EagerEndOfTurn` after 250 ms, `EndOfTurn` after 600 ms by default), and the eager transcript is a real final decode, so the speculative turn is promoted whenever the user does not resume. Two recogniser families behind the same `Stt` contract: **whole-turn** models (Parakeet, Whisper; the default) keep the turn's audio and decode all of it, from the turn's start, at each eager point, off the worker's event loop (`decodeAsync`), so VAD decisions keep flowing during the decode; their answer replaces the turn's text (the detector's cumulative mode), so a resumed sentence is decoded again as one piece instead of being joined from segments. **Streaming** models (Nemotron) show words while the user speaks and finalise a segment per pause, with a fresh stream per segment. A **hybrid** preset runs both: streaming for the live words, Parakeet for the text. The detector tells the worker when a turn ends (`Commit`) so the turn's audio is dropped; the worker collects garbage once per turn to keep the recogniser streams' native memory flat.
 
 **`tts-sherpa`.** Each engine (one per enabled local voice) runs in its own forked child process, because Piper needs `sherpa-onnx-node` 1.x and Kokoro 2.x, and because killing a child mid-synthesis is safe while terminating a worker was not. Clauses are queued in the parent and sent one at a time; audio comes back over IPC as `Float32Array`, is trimmed to controlled pauses and chunked on typed arrays. A crash or a stuck clause fails the turn and restarts the process; the child exits when the parent's IPC channel closes, and ignores the terminal's Ctrl+C so the parent shuts it down in order.
 
@@ -131,7 +152,7 @@ Building either layer fails with `SttError` / `TtsError` (e.g. a missing model f
 
 ### Latency tracing
 
-Every turn records monotonic timestamps (`performance.now()`): `endOfTurn`, `llmRequestSent`, `llmFirstToken`, `firstClause`, `ttsFirstAudio`, `playbackStart`, plus per-tool durations and the voices used. The `TurnTrace` service logs one line per turn with the deltas and exposes the last N traces. Each mark is shown relative to `endOfTurn` (negative for work a promoted speculative turn did early) and relative to the previous mark; the line also carries the outcome (`completed`, `interrupted`, `discarded`, `failed`). Marking is a plain synchronous call so it can sit on hot paths. In text mode only the LLM marks apply. Any change that claims to improve latency is judged by these numbers. `bench` in the app prints them as per-turn tables with median and worst case: offline (scripted turns through the real `Conversation` with the `@pva/core/testing` fakes and simulated provider delays; the TTS stand-in sits behind a one-voice router, as in the app) or live (WAV files through the real providers).
+Every turn records monotonic timestamps (`performance.now()`): `endOfTurn`, `llmRequestSent`, `llmFirstToken`, `firstClause`, `ttsFirstAudio`, `playbackStart`, plus per-tool durations and the voices used. An output in a browser adds `client: { outputLatencyMs, startDelayMs }`, and the latency line then shows `audible=` (playback start plus the device's output latency). The `TurnTrace` service logs one line per turn with the deltas and exposes the last N traces. Each mark is shown relative to `endOfTurn` (negative for work a promoted speculative turn did early) and relative to the previous mark; the line also carries the outcome (`completed`, `interrupted`, `discarded`, `failed`). Marking is a plain synchronous call so it can sit on hot paths. In text mode only the LLM marks apply. Any change that claims to improve latency is judged by these numbers. `bench` in the app prints them as per-turn tables with median and worst case: offline (scripted turns through the real `Conversation` with the `@pva/core/testing` fakes and simulated provider delays; the TTS stand-in sits behind a one-voice router, as in the app) or live (WAV files through the real providers).
 
 Latency techniques that are required, not optional:
 - Everything is loaded at startup: local models are loaded and warmed up when their layers are built; hosted STT/TTS WebSockets are opened at startup and kept warm (reconnect with backoff). The LLM HTTP client uses keep-alive.
@@ -141,7 +162,21 @@ Latency techniques that are required, not optional:
 
 ## Extending the assistant
 
-A capability is an `AssistantModule`:
+A capability is a **module**, declared with `defineModule` (`packages/core/src/ModuleDefinition.ts`) and listed in `moduleCatalog` (`apps/assistant/src/modules.ts`):
+
+```ts
+defineModule({
+  id: "weather", name: "Weather", description: "…",
+  settings: { defaultPlace: Setting.text({ label: "Home location", env: "WEATHER_DEFAULT_PLACE" }), … },
+  enabledByDefault?: boolean,
+  start: ({ settings, setStatus }) => Effect<ModuleInstance, ModuleStartError, Scope>
+})
+ModuleInstance = { tools?: ReadonlyArray<Tool>; context?: ReadonlyArray<ContextProvider>; instructions?: string }
+```
+
+Settings use a closed set of field types (`Setting.text`, `secret`, `number`, `boolean`, `choice`, `multichoice`; `packages/core/src/Settings.ts`); precedence is environment > saved value > default, and an environment value locks the field in the UI. The **module host** (`packages/core/src/ModuleHost.ts`, no Node dependency; persistence injected) starts enabled modules, enables, disables and reconfigures them while the assistant runs (one operation per module at a time; a replaced or disabled instance keeps running for a 10 s grace period so tool calls in flight finish; `start` has 10 s; a context provider has 50 ms per turn or contributes nothing), and publishes an immutable snapshot (tool registry, instructions in catalog order, tool → module map) that each turn reads once through `ConversationSetupOptions.setup`. The system prompt of a turn is base prompt + running modules' instructions + voice block; changing the tool list or the instructions changes the cached prefix once. The CLI modes start the catalog through the same host with the saved settings and no live changes. Full lifecycle: docs/UI-AND-MODULES.md §1.4.
+
+The pieces a module returns are the original capability shapes (an `AssistantModule` is still accepted by `makeToolRegistry`, and `fromAssistantModule` wraps one as a definition):
 
 ```ts
 interface AssistantModule {
@@ -163,34 +198,53 @@ The JSON Schema is `Schema.toJsonSchemaDocument(parameters)`, which describes th
 
 Context-provider output is sent each turn as `LlmRequest.context`, separate from the stable `system` prompt, so a ticking clock does not invalidate the cached prefix (system prompt + tools). The LLM adapter places it after the cached prefix. Keep it short and fast to compute.
 
-Adding a feature = one new file exporting a module + one line in `apps/assistant/src/modules.ts`. Adding a provider = one new package implementing a core interface + one line in `apps/assistant/src/providers.ts`. Adding a voice = one entry in `apps/assistant/src/voices.ts` (its provider must be in `ttsProviders`) + its name in `VOICES`.
+Adding a feature = one new file exporting `defineModule({...})` + one line in `moduleCatalog` in `apps/assistant/src/modules.ts`. Adding a provider = one new package implementing a core interface + one line in `apps/assistant/src/providers.ts`. Adding a voice = one entry in `apps/assistant/src/voices.ts` (its provider must be in `ttsProviders`) + its name in `VOICES`.
+
+## Serve mode (web UI)
+
+`pnpm start serve` (`apps/assistant/src/serve/`) runs one HTTP(S) server on one port: the static UI from `apps/web/out` and a WebSocket at `/ws` speaking the protocol in `packages/protocol` (JSON text frames validated with Effect Schema; binary frames of PCM with an 8-byte header). Design and protocol: [docs/UI-AND-MODULES.md](UI-AND-MODULES.md).
+
+```
+browser (owner tab) ─mic frames─▶ SessionHub ─▶ WebAudioInput ─▶ Stt ─▶ EchoGate ─▶ Conversation ─▶ … ─▶ Tts ─▶ WebAudioOutput ─reply frames─▶ owner tab
+                    ◀─────────── Publisher (ConversationEvent → messages, to every tab) ◀── onEvent ──┘          playback reports ─▶ PlaybackObserver
+```
+
+- **`packages/audio-web`** is the browser as `AudioInput`/`AudioOutput`, over an abstract link (no WebSocket dependency). The input is a continuous real-time 16 kHz stream: the owner's microphone frames while there is an owner with a live microphone, otherwise a −75 dBFS noise floor, so every STT adapter behaves as with a real microphone. The output sends reply audio as fast as TTS produces it (never paced) and waits for the browser's `playback.*` reports (`reportsPlayback: true`); it stops a reply on interruption (`reply.stop`, ≤ 300 ms wait for the final count), fails on owner loss, and fails with `playback_timeout` when the browser stops reporting for 2 s. Its input queue holds 3 s and counts what it drops (`inputStats()`).
+- **SessionHub**: handshake, roles (one audio owner, observers), requests, broadcast, send limits. **Publisher**: maps conversation events to messages synchronously, holding a speculative turn's messages until it is promoted. **StateTracker**: the assistant state. **Engine**: a reloadable scope (providers, voice router façade with a fixed output rate, `Conversation`, voice loop); a build failure is reported per stage instead of exiting; a reload first runs cheap checks (`defaultPreflight`: the chosen recogniser's model files exist), and if they fail the running engines are kept. **HeardAudio**: when "Save what the assistant hears" is on, each turn's audio as the recogniser received it goes to `data/recordings/` with level statistics, the transcript and transport counters (`pnpm start compare-models` replays them through every installed model). **SettingsStore**: `data/settings.json` and `data/secrets.json` (0600), atomic writes. **sections**: the assistant settings (voices, engines, turn detection) as settings forms keyed by their environment variable names, fed to the providers through a `ConfigProvider` placed under the environment.
+- **`EchoGate`** (`packages/core`, pure): during the audible window it passes everything (`instant`), drops recognition events that are the assistant's own words (`confirm`), or drops everything (`manual`). Serve mode always runs `Conversation` with barge-in on; the gate implements the interrupt modes.
 
 ## Repository layout
 
 ```
 packages/
   core/             interfaces, domain types, Conversation, tool loop, clause chunker, TurnTrace, voice router
-                    (markers, resampler), in-memory fakes
+                    (markers, resampler), settings, module definition and host, echo gate, in-memory fakes
   llm-anthropic/    Llm via @anthropic-ai/sdk (default model claude-haiku-5-5)
-  stt-sherpa/       Stt on this machine: sherpa-onnx streaming transducer + Silero VAD in a worker thread, silence-based
-                    turn detection (default; presets nemotron-3.5, zipformer-en, fast-conformer-en)
+  stt-sherpa/       Stt on this machine: sherpa-onnx + Silero VAD + gain control in a worker thread, silence-based turn
+                    detection; whole-turn presets (parakeet-v2 default, parakeet-ultra, whisper-turbo), streaming presets
+                    (nemotron-560, nemotron-320, zipformer-en, fast-conformer-en) and a hybrid (live words + Parakeet)
   tts-sherpa/       Tts on this machine: Piper / Kokoro via sherpa-onnx, one child process per engine (default)
   stt-deepgram/     Stt via Deepgram Flux (wss /v2/listen, eager end-of-turn) — hosted, optional
   tts-cartesia/     Tts via Cartesia Sonic WebSocket (contexts/continuations, raw pcm_s16le) — hosted, optional
   audio-pipewire/   AudioInput/AudioOutput by spawning pw-record / pw-cat
   audio-file/       AudioInput from a WAV/PCM file (paced in real time), AudioOutput to a WAV file — for tests and benchmarks on machines with no sound card
-  modules-builtin/  first modules: clock (context + tool), weather (Open-Meteo HTTP lookup, speculative-safe)
+  audio-web/        AudioInput/AudioOutput for a browser (serve mode), over an abstract link to the owner's connection
+  protocol/         browser ↔ assistant protocol: message schemas, binary framing, examples (browser-safe)
+  modules-builtin/  first modules (defineModule): clock (context + tool), weather (Open-Meteo HTTP lookup, speculative-safe)
 models/             downloaded model files (git-ignored; `pnpm download-models`)
 apps/
   assistant/        config (env, `.env`), providers.ts (one map per stage, chosen by `LLM_PROVIDER` / `STT_PROVIDER` /
                     `TTS_PROVIDER` / `AUDIO_BACKEND`; only the selected layers are built), voices.ts (`VOICES`,
-                    `DEFAULT_VOICE`), modules.ts, main.ts; modes: `voice`, `text` (stdin/stdout, no audio), `bench`
+                    `DEFAULT_VOICE`), modules.ts (the module catalog), main.ts, serve/ (web UI server); modes: `serve`,
+                    `voice`, `text` (stdin/stdout, no audio), `bench`
                     (offline with simulated delays, `--live` over WAV files with the real providers, `--make-wavs`),
-                    `say` (text → router → speaker or WAV, with engine timings), `transcribe` (WAV → STT events with timings)
+                    `say` (text → router → speaker or WAV, with engine timings), `transcribe` (WAV → STT events with timings),
+                    `compare-models` (WAVs → every installed local STT preset: transcript and timings)
 ```
 
 ## Testing
 
-- `core` is tested entirely with the in-memory fakes from `@pva/core/testing` (scripted `Stt` events, scripted `Llm` events, a `Tts` that reads clauses eagerly, records when each arrived, and turns each into a marker chunk tagged with its clause index, a tone `Tts` at a chosen sample rate, a recording `AudioOutput`, a scripted `AudioInput`) and `TestClock`. Gotcha: `TestClock.adjust` waits only one scheduler hop before advancing, so let freshly forked fibers run first (see `advance` in `Conversation.test.ts`). The Conversation table above — speculation, promotion, discard, barge-in, tool loop — each has a test.
+- `core` is tested entirely with the in-memory fakes from `@pva/core/testing` (scripted `Stt` events, scripted `Llm` events, a `Tts` that reads clauses eagerly, records when each arrived, and turns each into a marker chunk tagged with its clause index, a tone `Tts` at a chosen sample rate, a recording `AudioOutput`, a reporting `AudioOutput` that behaves like the browser, a scripted `AudioInput`) and `TestClock`.
+- Serve mode is tested with a scripted client (`apps/assistant/test/support/scriptedClient.ts`: a Node `ws` client that speaks the protocol and simulates the browser's player) against the real server with injected providers, plus one live test with the local models. Gotcha: `TestClock.adjust` waits only one scheduler hop before advancing, so let freshly forked fibers run first (see `advance` in `Conversation.test.ts`). The Conversation table above — speculation, promotion, discard, barge-in, tool loop — each has a test.
 - Adapters have unit tests for their protocol mapping against recorded/mock messages (a local mock WebSocket server), and an opt-in live test that runs only when the provider's API key is set.
 - `pnpm check` (typecheck all), `pnpm test` (all unit tests) must pass before any change is considered done.

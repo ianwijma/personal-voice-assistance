@@ -3,11 +3,15 @@
  * plain mutable object recording what happened, for assertions.
  * Delays use `Effect.sleep`, so they are driven by `TestClock` in tests.
  */
-import { Clock, Effect, Exit, Layer, Stream } from "effect"
+import { type Cause, Clock, Effect, Exit, Fiber, Layer, Queue, Stream } from "effect"
+import { type Agent, type AgentEvent, AgentError, type AgentTurnInput } from "./Agent.ts"
+import type { AgentSet, AgentTurnSetup, PlaybackObserver } from "./ConversationEvents.ts"
 import type { LlmEvent, LlmRequest, StopReason, SttEvent } from "./Domain.ts"
-import { LlmError } from "./Errors.ts"
+import { AudioError, LlmError } from "./Errors.ts"
 import { AudioInput, AudioOutput, Llm, Stt, Tts, type TtsAudio } from "./Services.ts"
 import { makeTurnTrace, TurnTrace } from "./TurnTrace.ts"
+import { defaultRoutingConfig, makeTriggerRouter, type RoutingConfig } from "./Routing.ts"
+import { makeToolRegistry, type ToolRegistry } from "./ToolRegistry.ts"
 
 export interface Sleep {
   readonly _tag: "Sleep"
@@ -101,6 +105,91 @@ export const makeScriptedLlm = (
     })
   )
   return { layer, probe }
+}
+
+// ---------------------------------------------------------------------------
+// Agents
+
+export const agentText = (text: string): AgentEvent => ({ _tag: "TextDelta", text })
+export const handoff = (reason = "no match"): AgentEvent => ({ _tag: "Handoff", reason })
+export const expectReply: AgentEvent = { _tag: "ExpectReply" }
+/** A script step that fails the agent's stream. */
+export const agentFails = (reason: AgentError["reason"] = "failed", message = "scripted failure"): AgentError =>
+  new AgentError({ message, reason })
+
+export type AgentScript = ReadonlyArray<AgentEvent | Sleep | AgentError>
+
+/**
+ * An `Agent` answering turn `n` with `responses[n]` (or `responses(input, n)`).
+ * An `AgentError` step fails the stream there. Running out of responses fails
+ * with `AgentError("failed")`. `probe.inputs` records every `AgentTurnInput`.
+ */
+export const makeScriptedAgent = (
+  options: {
+    readonly id: string
+    readonly name?: string
+    readonly kind?: Agent["kind"]
+    readonly speculate?: boolean
+    readonly firstEventTimeoutMs?: number
+    readonly systemPrompt?: string
+  },
+  responses: ReadonlyArray<AgentScript> | ((input: AgentTurnInput, index: number) => AgentScript)
+) => {
+  const probe = { ...newProbe(), inputs: [] as Array<AgentTurnInput>, calledAt: [] as Array<number> }
+  const kind = options.kind ?? "model"
+  const agent: Agent = {
+    id: options.id,
+    name: options.name ?? options.id,
+    kind,
+    speculate: options.speculate ?? kind !== "harness",
+    firstEventTimeoutMs: options.firstEventTimeoutMs ?? 5_000,
+    ...(options.systemPrompt !== undefined ? { systemPrompt: options.systemPrompt } : {}),
+    turn: (input) =>
+      Stream.unwrap(Effect.gen(function*() {
+        const index = probe.inputs.length
+        probe.inputs.push(input)
+        probe.calledAt.push(yield* Clock.currentTimeMillis)
+        const script = typeof responses === "function" ? responses(input, index) : responses[index]
+        if (script === undefined) return Stream.fail(new AgentError({ message: `ScriptedAgent ${options.id}: no response for turn ${index}`, reason: "failed" }))
+        return Stream.fromIterable(script).pipe(
+          Stream.mapEffect((step): Effect.Effect<AgentEvent | undefined, AgentError> =>
+            isSleep(step) ? Effect.as(Effect.sleep(step.millis), undefined)
+            : step instanceof AgentError ? Effect.fail(step)
+            : Effect.succeed(step)
+          ),
+          Stream.filter((e): e is AgentEvent => e !== undefined)
+        )
+      })).pipe(track(probe))
+  }
+  return { agent, probe }
+}
+
+/**
+ * A per-turn setup for `Conversation.layerWithAgents` with a trigger router over
+ * `routing` (default rules unless given) and the given running agents.
+ */
+export const makeAgentSetup = (options: {
+  readonly agents: ReadonlyArray<Agent>
+  readonly routing?: Partial<RoutingConfig>
+  readonly system?: string
+  readonly registry?: ToolRegistry["Service"]
+  readonly names?: ReadonlyMap<string, string>
+  readonly extra?: Partial<AgentSet>
+}): AgentTurnSetup => {
+  const routing: RoutingConfig = { ...defaultRoutingConfig, ...options.routing }
+  return {
+    system: options.system ?? "sys",
+    registry: options.registry ?? makeToolRegistry([]),
+    agents: {
+      router: makeTriggerRouter(routing),
+      agents: new Map(options.agents.map((a) => [a.id, a])),
+      defaultAgent: routing.defaultAgent,
+      fallbackAgent: routing.fallbackAgent,
+      armedMs: routing.armedMs,
+      ...(options.names !== undefined ? { names: options.names } : {}),
+      ...options.extra
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -207,6 +296,67 @@ export const makeRecordingAudioOutput = (options: { readonly chunkMillis?: numbe
               })
             )
           )
+        }).pipe(Effect.onExit((exit) => Effect.sync(() => record(probe, exit))))
+    })
+  )
+  return { layer, probe }
+}
+
+/**
+ * `AudioOutput` with `reportsPlayback: true`, like the browser: it pulls the
+ * whole stream as fast as it is produced (as if sending it), then "plays" it
+ * chunk by chunk, handing each chunk to the device (reporting `progress`) and
+ * taking `chunkMillis` per chunk. `started` is reported `startDelayMillis`
+ * after the first chunk arrived. `failAfterChunks` fails `play` (like a lost
+ * browser) after that many chunks were handed over.
+ */
+export const makeReportingAudioOutput = (
+  options: { readonly chunkMillis?: number; readonly startDelayMillis?: number; readonly failAfterChunks?: number } = {}
+) => {
+  const chunkMillis = options.chunkMillis ?? 100
+  const probe = {
+    ...newProbe(),
+    /** Chunks pulled from the stream (sent), in order. */
+    pulled: [] as Array<string>,
+    /** Chunks handed to the "device", with the clock time. */
+    chunks: [] as Array<{ readonly text: string; readonly at: number }>,
+    reports: [] as Array<{ readonly kind: "started" | "progress"; readonly samples: number; readonly at: number }>
+  }
+  const layer = Layer.succeed(
+    AudioOutput,
+    AudioOutput.of({
+      reportsPlayback: true,
+      play: <E>(audio: Stream.Stream<Uint8Array, E>, _sampleRate: number, observer?: PlaybackObserver) =>
+        Effect.gen(function*() {
+          probe.started++
+          const queue = yield* Queue.unbounded<Uint8Array, E | Cause.Done>()
+          const reader = yield* audio.pipe(
+            Stream.tap((chunk) => Effect.sync(() => probe.pulled.push(markerText(chunk)))),
+            Stream.runIntoQueue(queue),
+            Effect.forkChild
+          )
+          let played = 0
+          let handed = 0
+          yield* Stream.fromQueue(queue).pipe(Stream.runForEach((chunk) =>
+            Effect.gen(function*() {
+              if (handed === 0) {
+                if ((options.startDelayMillis ?? 0) > 0) yield* Effect.sleep(options.startDelayMillis!)
+                observer?.started()
+                probe.reports.push({ kind: "started", samples: 0, at: yield* Clock.currentTimeMillis })
+              }
+              if (options.failAfterChunks !== undefined && handed >= options.failAfterChunks) {
+                return yield* new AudioError({ message: "audio client disconnected" })
+              }
+              handed++
+              played += chunk.length >> 1
+              const at = yield* Clock.currentTimeMillis
+              probe.chunks.push({ text: markerText(chunk), at })
+              observer?.progress(played)
+              probe.reports.push({ kind: "progress", samples: played, at })
+              yield* Effect.sleep(chunkMillis)
+            })
+          ))
+          yield* Fiber.join(reader)
         }).pipe(Effect.onExit((exit) => Effect.sync(() => record(probe, exit))))
     })
   )

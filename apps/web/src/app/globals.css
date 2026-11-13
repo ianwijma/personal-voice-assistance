@@ -1,0 +1,115 @@
+@import "tailwindcss";
+@import "@fontsource/ibm-plex-sans/400.css";
+@import "@fontsource/ibm-plex-sans/500.css";
+@import "@fontsource/ibm-plex-sans/600.css";
+@import "@fontsource/ibm-plex-mono/400.css";
+@import "@fontsource/ibm-plex-mono/500.css";
+
+/* Design tokens: docs/UI-AND-MODULES.md §3.2. Amber is the assistant's voice, mint is yours. */
+@theme {
+  --color-bg: oklch(0.165 0.006 110);
+  --color-surface: oklch(0.205 0.007 110);
+  --color-surface-2: oklch(0.245 0.008 110);
+  --color-line: oklch(0.32 0.008 110);
+  --color-ink: oklch(0.93 0.015 95);
+  --color-ink-muted: oklch(0.70 0.014 95);
+  --color-ink-faint: oklch(0.52 0.010 95);
+  --color-voice: oklch(0.80 0.140 75);
+  --color-voice-soft: oklch(0.80 0.140 75 / 0.16);
+  --color-you: oklch(0.83 0.090 180);
+  --color-you-soft: oklch(0.83 0.090 180 / 0.16);
+  --color-ok: oklch(0.78 0.110 150);
+  --color-warn: oklch(0.80 0.120 55);
+  --color-danger: oklch(0.70 0.170 28);
+
+  --font-sans: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", monospace;
+
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 16px;
+  --shadow-panel: 0 16px 48px -16px oklch(0 0 0 / 0.65);
+  --ease-out: cubic-bezier(0.2, 0.8, 0.2, 1);
+
+  --text-label: 11px;
+  --text-label--line-height: 16px;
+  --text-caption: 20px;
+  --text-caption--line-height: 1.45;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --color-bg: oklch(0.970 0.008 95);
+    --color-surface: oklch(0.995 0.004 95);
+    --color-surface-2: oklch(0.940 0.008 95);
+    --color-line: oklch(0.870 0.010 95);
+    --color-ink: oklch(0.220 0.010 110);
+    --color-ink-muted: oklch(0.450 0.012 110);
+    --color-ink-faint: oklch(0.620 0.010 110);
+    --color-voice: oklch(0.620 0.150 60);
+    --color-voice-soft: oklch(0.620 0.150 60 / 0.14);
+    --color-you: oklch(0.550 0.090 195);
+    --color-you-soft: oklch(0.550 0.090 195 / 0.14);
+    --color-danger: oklch(0.550 0.190 28);
+    --shadow-panel: 0 16px 48px -20px oklch(0.3 0.02 95 / 0.35);
+  }
+}
+
+@layer base {
+html {
+  color-scheme: dark;
+  -webkit-text-size-adjust: 100%;
+}
+@media (prefers-color-scheme: light) {
+  html { color-scheme: light; }
+}
+
+body {
+  background: var(--color-bg);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  font-size: 15px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  overflow: hidden;
+}
+
+::selection { background: var(--color-you-soft); }
+
+/* One focus ring everywhere: 2 px mint, 2 px offset. */
+:focus-visible {
+  outline: 2px solid var(--color-you);
+  outline-offset: 2px;
+}
+}
+
+/* Small mono labels, like the legend on a piece of lab equipment. */
+@utility label {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 16px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  font-weight: 500;
+}
+
+@utility scrollbar-quiet {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-line) transparent;
+}
+
+@keyframes pva-spin { to { transform: rotate(360deg); } }
+@keyframes pva-fade-in { from { opacity: 0; } to { opacity: 1; } }
+@keyframes pva-rise { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+@keyframes pva-slide-in { from { transform: translateX(24px); opacity: 0; } to { transform: none; opacity: 1; } }
+@keyframes pva-sheet-up { from { transform: translateY(24px); opacity: 0; } to { transform: none; opacity: 1; } }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 1ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 1ms !important;
+  }
+  .spin-keep { animation-duration: 1.2s !important; animation-iteration-count: infinite !important; }
+}

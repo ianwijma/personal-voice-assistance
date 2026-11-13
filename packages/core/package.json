@@ -12,6 +12,7 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "@pva/protocol": "workspace:*",
     "effect": "catalog:"
   },
   "devDependencies": {

@@ -10,12 +10,14 @@ import { runOffline, type SimulatedDelays, zeroDelays } from "./bench/offline.ts
 import { formatReport } from "./bench/report.ts"
 import { AppConfig } from "./config.ts"
 import { userCwd } from "./env.ts"
-import { modules } from "./modules.ts"
+import { startCliModules, withModuleInstructions } from "./modules.ts"
 import { FakeLlm } from "./FakeLlm.ts"
 import { LlmLayer, SttLayer, TtsLayer } from "./providers.ts"
 import { sayCommand } from "./say.ts"
+import { serveMode } from "./serve/serveMode.ts"
 import { buildProviders, describeConfigError, StartupError } from "./startup.ts"
 import { runTextTurns } from "./text.ts"
+import { compareModelsCommand } from "./compareModels.ts"
 import { transcribeCommand } from "./transcribe.ts"
 import { voiceMode } from "./voice.ts"
 import { loadVoiceSettings, voiceStages, withVoicePrompt, withVoiceRouter } from "./voices.ts"
@@ -43,9 +45,11 @@ const StderrLogger = Logger.layer([
 const ConversationLayer = Layer.unwrap(Effect.gen(function*() {
   const settings = yield* AppConfig
   const voices = yield* loadVoiceSettings
-  return Conversation.layer({ ...settings, systemPrompt: withVoicePrompt(settings.systemPrompt, voices) })
+  const modules = yield* startCliModules()
+  const systemPrompt = withVoicePrompt(withModuleInstructions(settings.systemPrompt, modules.instructions), voices)
+  return Conversation.layer({ ...settings, systemPrompt }).pipe(Layer.provide(Layer.succeed(ToolRegistry, modules.registry)))
 })).pipe(
-  Layer.provide(Layer.mergeAll(LlmLayer, ToolRegistry.layer(modules), TurnTrace.layer()))
+  Layer.provide(Layer.mergeAll(LlmLayer, TurnTrace.layer()))
 )
 
 /** stdin/stdout REPL over the Conversation's text path. */
@@ -125,8 +129,9 @@ const bench = (args: ReadonlyArray<string>) =>
         { stage: "speech-to-text (STT_PROVIDER)", layer: SttLayer }
       ])
       const settings = yield* AppConfig
-      const conversation = { ...settings, systemPrompt: withVoicePrompt(settings.systemPrompt, voices) }
-      const rows = yield* runLive({ files, outputDir, conversation }).pipe(
+      const modules = yield* startCliModules()
+      const conversation = { ...settings, systemPrompt: withVoicePrompt(withModuleInstructions(settings.systemPrompt, modules.instructions), voices) }
+      const rows = yield* runLive({ files, outputDir, conversation, modules }).pipe(
         Effect.provide(withVoiceRouter(providers, voices))
       )
       console.log(formatReport(`live: ${files.length} turns, ${llmLabel}, replies in ${outputDir}`, rows, {
@@ -155,9 +160,13 @@ const program: Effect.Effect<void, unknown> = mode === "text"
   ? sayCommand(args)
   : mode === "transcribe"
   ? transcribeCommand(args)
+  : mode === "compare-models"
+  ? Effect.asVoid(compareModelsCommand(args))
+  : mode === "serve"
+  ? serveMode
   : new StartupError({
-    message: `Unknown mode "${mode}". Usage: assistant [text | voice | bench [--live [--rounds N] <wavs> | --make-wavs [dir]] | ` +
-      "say [--voice NAME] [--out FILE] <text> | transcribe <wav file>]"
+    message: `Unknown mode "${mode}". Usage: assistant [text | voice | serve | bench [--live [--rounds N] <wavs> | --make-wavs [dir]] | ` +
+      "say [--voice NAME] [--out FILE] <text> | transcribe <wav file> | compare-models [--models a,b] [--agc on|off|both] [--ref TEXT] <wavs>]"
   })
 
 NodeRuntime.runMain(

@@ -1,0 +1,209 @@
+// @vitest-environment node
+import { afterEach, describe, expect, it } from "vitest"
+import { type AddressInfo } from "node:net"
+import { type ClientMessage, CloseCode, decodeClientMessage, decodeMicFrame, encodeReplyFrame, encodeServerMessage, PROTOCOL_VERSION, type ServerMessage } from "@pva/protocol"
+import { serverExamples } from "@pva/protocol/examples"
+import { WebSocketServer, type WebSocket as ServerSocket } from "ws"
+import { type AudioPort, backoffMs, makeConnection } from "@/lib/connection.ts"
+import { createClientStore } from "@/lib/store.ts"
+
+const timing = { openTimeoutMs: 1000, welcomeTimeoutMs: 500, pingEveryMs: 60, pongTimeoutMs: 150, requestTimeoutMs: 300, backoffBaseMs: 20, backoffMaxMs: 80 }
+
+interface Peer {
+  readonly ws: ServerSocket
+  readonly text: Array<ClientMessage>
+  readonly binary: Array<Buffer>
+}
+
+const servers: Array<WebSocketServer> = []
+const stops: Array<() => void> = []
+afterEach(async () => {
+  for (const s of stops.splice(0)) s()
+  for (const s of servers.splice(0)) {
+    for (const c of s.clients) c.terminate()
+    await new Promise((r) => s.close(r))
+  }
+})
+
+/** A tiny scripted server: records what the client sends; `onHello` decides the answer. */
+const startServer = (onHello: (peer: Peer, hello: Extract<ClientMessage, { type: "hello" }>) => void = (p) => p.ws.send(encodeServerMessage(serverExamples.welcome))) =>
+  new Promise<{ url: string; peers: Array<Peer>; wss: WebSocketServer }>((resolve) => {
+    const wss = new WebSocketServer({ port: 0, host: "127.0.0.1" })
+    servers.push(wss)
+    const peers: Array<Peer> = []
+    wss.on("connection", (ws) => {
+      const peer: Peer = { ws, text: [], binary: [] }
+      peers.push(peer)
+      ws.on("message", (data: Buffer, isBinary: boolean) => {
+        if (isBinary) return void peer.binary.push(data)
+        const d = decodeClientMessage(data.toString())
+        if (d._tag !== "Ok") throw new Error(`bad client message: ${data.toString()}`)
+        peer.text.push(d.message)
+        if (d.message.type === "hello") onHello(peer, d.message)
+        if (d.message.type === "ping") ws.send(encodeServerMessage({ type: "pong", id: d.message.id }))
+      })
+    })
+    wss.on("listening", () => resolve({ url: `ws://127.0.0.1:${(wss.address() as AddressInfo).port}`, peers, wss }))
+  })
+
+const fakeAudio = (running = true) => {
+  const calls: Array<string> = []
+  const frames: Array<ArrayBuffer> = []
+  const audio: AudioPort = {
+    replyStart: (id, rate) => calls.push(`start ${id} ${rate}`),
+    replyFrame: (b) => frames.push(b),
+    replyEnd: (id) => calls.push(`end ${id}`),
+    replyStop: (id) => calls.push(`stop ${id}`),
+    socketLost: () => calls.push("lost"),
+    running: () => running
+  }
+  return { audio, calls, frames }
+}
+
+const until = async (cond: () => boolean, ms = 2000) => {
+  const end = Date.now() + ms
+  while (!cond()) {
+    if (Date.now() > end) throw new Error("timed out waiting")
+    await new Promise((r) => setTimeout(r, 5))
+  }
+}
+
+const connect = (url: string, audio: AudioPort, hooks = {}) => {
+  const store = createClientStore()
+  const conn = makeConnection({ url, clientId: "c-test-0001", store, audio, timing, hooks })
+  stops.push(conn.start())
+  return { store, conn }
+}
+
+describe("connection", () => {
+  it("says hello, dispatches the welcome and answers liveness pings", async () => {
+    const { url, peers } = await startServer()
+    const { store, conn } = connect(url, fakeAudio().audio)
+    await until(() => store.get().connection.status === "open")
+    expect(peers[0]!.text[0]).toEqual({ type: "hello", protocol: PROTOCOL_VERSION, clientId: "c-test-0001", resumeOwner: false })
+    expect(store.get().connection.connectionId).toBe("conn-3")
+    expect(conn.isOpen()).toBe(true)
+    await until(() => peers[0]!.text.filter((m) => m.type === "ping").length >= 3)
+    expect(store.get().connection.status).toBe("open") // pongs keep it alive
+  })
+
+  it("resolves requests with their result, and times out unanswered ones", async () => {
+    const { url, peers } = await startServer()
+    const { store, conn } = connect(url, fakeAudio().audio)
+    await until(() => conn.isOpen())
+    const p = conn.request({ type: "module.enable", moduleId: "weather" })
+    await until(() => peers[0]!.text.some((m) => m.type === "module.enable"))
+    const sent = peers[0]!.text.find((m) => m.type === "module.enable") as Extract<ClientMessage, { type: "module.enable" }>
+    expect(Object.values(store.get().pending)).toEqual([{ kind: "module.enable", target: "weather" }])
+    peers[0]!.ws.send(encodeServerMessage({ type: "result", requestId: sent.requestId, ok: true }))
+    expect(await p).toEqual({ type: "result", requestId: sent.requestId, ok: true })
+    expect(store.get().pending).toEqual({})
+    const late = await conn.request({ type: "engine.reload" })
+    expect(late.ok).toBe(false)
+    expect(late.error?.message).toMatch(/did not answer/)
+  })
+
+  it("routes reply audio to the player only for the owner, transferring the whole frame", async () => {
+    const { url, peers } = await startServer()
+    const fa = fakeAudio()
+    const { conn } = connect(url, fa.audio)
+    await until(() => conn.isOpen())
+    const ws = peers[0]!.ws
+    ws.send(encodeServerMessage({ type: "reply.start", turnId: 12, sampleRate: 22_050 }))
+    ws.send(encodeReplyFrame(12, new Uint8Array(882)))
+    ws.send(encodeServerMessage({ type: "reply.end", turnId: 12 }))
+    ws.send(encodeServerMessage({ type: "reply.stop", turnId: 12 }))
+    await until(() => fa.calls.length >= 3)
+    expect(fa.calls).toEqual(["start 12 22050", "end 12", "stop 12"])
+    expect(fa.frames).toHaveLength(1)
+    expect(fa.frames[0]!.byteLength).toBe(8 + 882)
+  })
+
+  it("sends microphone frames with consecutive sequence numbers only while owner and live", async () => {
+    const { url, peers } = await startServer()
+    const { store, conn } = connect(url, fakeAudio().audio)
+    await until(() => conn.isOpen())
+    const frame = () => new ArrayBuffer(8 + 640)
+    conn.resetMicSequence()
+    for (let i = 0; i < 3; i++) conn.sendMic(frame())
+    store.dispatch({ type: "local/mic", live: false })
+    conn.sendMic(frame()) // muted: dropped
+    store.dispatch({ type: "local/mic", live: true })
+    conn.resetMicSequence()
+    conn.sendMic(frame())
+    store.dispatch({ type: "session", role: "observer", ownerPresent: true, reason: "taken_over" })
+    conn.sendMic(frame()) // observer: dropped
+    await until(() => peers[0]!.binary.length >= 4)
+    await new Promise((r) => setTimeout(r, 30))
+    const seqs = peers[0]!.binary.map((b) => {
+      const f = decodeMicFrame(b)
+      if (!f.ok) throw new Error(f.error)
+      return f.frame.seq
+    })
+    expect(seqs).toEqual([0, 1, 2, 0])
+  })
+
+  it("reconnects with backoff after the socket drops, and asks to resume ownership", async () => {
+    const welcomes: Array<boolean> = []
+    const { url, peers } = await startServer((p, hello) => {
+      welcomes.push(hello.resumeOwner)
+      const snapshot = { ...serverExamples.welcome.snapshot, role: hello.resumeOwner ? "owner" as const : "observer" as const }
+      p.ws.send(encodeServerMessage({ ...serverExamples.welcome, snapshot }))
+    })
+    const fa = fakeAudio(true)
+    const resumed: Array<boolean> = []
+    const { store } = connect(url, fa.audio, { afterWelcome: (r: boolean) => resumed.push(r) })
+    await until(() => store.get().connection.status === "open")
+    store.dispatch({ type: "session", role: "owner", ownerPresent: true, reason: "claimed" })
+    peers[0]!.ws.terminate()
+    await until(() => store.get().connection.status === "reconnecting")
+    expect(fa.calls).toContain("lost") // the player is flushed at once
+    await until(() => peers.length === 2 && store.get().connection.status === "open")
+    expect(welcomes).toEqual([false, true])
+    expect(resumed).toEqual([false, true])
+    expect(store.get().session.role).toBe("owner")
+  })
+
+  it("treats a missing pong as a dead socket", async () => {
+    const { url, peers } = await startServer()
+    const { store, conn } = connect(url, fakeAudio().audio)
+    await until(() => conn.isOpen())
+    peers[0]!.ws.removeAllListeners("message") // stop answering pings (the socket stays open)
+    await until(() => store.get().connection.status === "reconnecting", 3000)
+    await until(() => peers.length >= 2)
+  })
+
+  it("stops retrying after close 4400 and marks the page outdated", async () => {
+    let hellos = 0
+    const { url } = await startServer((p) => {
+      hellos++
+      p.ws.send(encodeServerMessage({ type: "error", error: { code: "bad_message", message: "This page is out of date; reload it." } }))
+      p.ws.close(CloseCode.protocolMismatch)
+    })
+    const { store } = connect(url, fakeAudio().audio)
+    await until(() => store.get().connection.status === "outdated")
+    await new Promise((r) => setTimeout(r, 200))
+    expect(hellos).toBe(1)
+  })
+
+  it("shows connecting (not reconnecting) until the first welcome", async () => {
+    const { store } = connect("ws://127.0.0.1:1", fakeAudio().audio)
+    await until(() => store.get().connection.attempt >= 2)
+    expect(store.get().connection.status).toBe("connecting")
+  })
+
+  it("ignores unknown message types and counts invalid ones", async () => {
+    const { url, peers } = await startServer()
+    const { store, conn } = connect(url, fakeAudio().audio)
+    await until(() => conn.isOpen())
+    peers[0]!.ws.send(JSON.stringify({ type: "from.the.future", x: 1 }))
+    peers[0]!.ws.send(JSON.stringify({ type: "state", state: "dancing" }))
+    peers[0]!.ws.send(encodeServerMessage({ type: "state", state: "thinking", turnId: 3 } satisfies ServerMessage))
+    await until(() => store.get().session.serverState === "thinking")
+    expect(conn.stats()).toMatchObject({ unknownMessages: 1, invalidMessages: 1 })
+  })
+
+  it("backoff doubles from 250 ms to a 5 s cap", () => {
+    expect([1, 2, 3, 4, 5, 6, 7, 10].map((n) => backoffMs(n))).toEqual([250, 500, 1000, 2000, 4000, 5000, 5000, 5000])
+  })
+})

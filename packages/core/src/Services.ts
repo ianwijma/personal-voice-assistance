@@ -1,6 +1,7 @@
 import { Context } from "effect"
 import type { Effect, Stream } from "effect"
 import type { LlmEvent, LlmRequest, SttEvent } from "./Domain.ts"
+import type { PlaybackObserver } from "./ConversationEvents.ts"
 import type { AudioError, LlmError, SttError, TtsError } from "./Errors.ts"
 
 /**
@@ -13,9 +14,17 @@ export class AudioInput extends Context.Service<AudioInput, {
 /**
  * Speaker. `play` returns when the audio has finished playing. Interrupting the
  * fiber must silence the speaker immediately (drop everything buffered).
+ *
+ * An output whose playback is not paced by pulling chunks (a browser that
+ * buffers what it receives) sets `reportsPlayback: true` and reports through the
+ * `observer` it is then given: `started` when the first sample reached the
+ * device, `progress(samples)` as playback advances, with the final value
+ * reported before `play` returns or its interruption completes. `Conversation`
+ * then counts a clause as played from those reports instead of from pulls.
  */
 export class AudioOutput extends Context.Service<AudioOutput, {
-  play<E>(audio: Stream.Stream<Uint8Array, E>, sampleRate: number): Effect.Effect<void, E | AudioError>
+  readonly reportsPlayback?: boolean
+  play<E>(audio: Stream.Stream<Uint8Array, E>, sampleRate: number, observer?: PlaybackObserver): Effect.Effect<void, E | AudioError>
 }>()("@pva/core/AudioOutput") {}
 
 /** Speech to text, including turn detection. */

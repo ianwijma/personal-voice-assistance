@@ -1,6 +1,6 @@
 import { Config } from "effect"
 
-const defaultSystemPrompt = [
+export const defaultSystemPrompt = [
   "You are a personal voice assistant. Your replies are spoken aloud.",
   "Answer in one or two short sentences of plain spoken language: no lists, markdown, URLs or emoji.",
   "Use tools when they help; never guess facts a tool can look up."

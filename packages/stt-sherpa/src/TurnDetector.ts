@@ -15,6 +15,20 @@
  * - After `finalSilenceMs`: `EndOfTurn` with the same text as the last
  *   `EagerEndOfTurn` (segments are already final, nothing is re-decoded).
  * - A turn whose segments contain no words ends silently.
+ * - When a turn ends (committed, or dropped because it had no words), the
+ *   detector says so (`Commit`), so a recogniser that keeps the turn's audio
+ *   can drop it.
+ *
+ * Cumulative mode (whole-turn recognisers, `cumulative: true`): each answer to
+ * `Finalize` is the text of the whole turn so far, decoded again from its
+ * start, so it replaces the turn's text instead of being appended. Partials
+ * are the live text of the whole turn (from a streaming model running beside
+ * it, or from re-decoding the turn so far while the user speaks): they only
+ * become `Interim`s and never decide that the user resumed (a streaming
+ * model's partial lags the audio and catches up after the pause); resumption
+ * is the VAD's call. A turn whose speech never reached
+ * `minSpeechMs` (a click, a cough) gets no text in this mode, whatever the
+ * model made of it.
  *
  * The thresholds come from an `EndOfTurnPolicy` that sees the transcript, so a
  * smarter detector (one that judges whether the sentence is complete) can
@@ -40,6 +54,8 @@ export type TurnOutput =
   | SttEvent
   /** Finalise the open segment, unless the VAD saw speech after frame `frame`. */
   | { readonly _tag: "Finalize"; readonly frame: number }
+  /** The turn ended at frame `frame` (committed or dropped). */
+  | { readonly _tag: "Commit"; readonly frame: number }
 
 export interface EndOfTurnPolicy {
   /** Silence after which the open segment is finalised and `EagerEndOfTurn` sent. */
@@ -57,6 +73,8 @@ export interface TurnDetectorOptions {
   readonly policy: EndOfTurnPolicy
   /** Continuous speech needed for `SpeechStarted` / `TurnResumed` (filters clicks and short noises). */
   readonly minSpeechMs: number
+  /** Answers to `Finalize` are the whole turn's text (see above). Default false. */
+  readonly cumulative?: boolean
 }
 
 const SPEECH_STARTED: SttEvent = { _tag: "SpeechStarted" }
@@ -79,6 +97,10 @@ export class TurnDetector {
   private pending = false
   /** Commit as soon as the pending segment is final. */
   private finalDue = false
+  /** The frame at which the final threshold passed while a `Finalize` was pending. */
+  private finalFrame = -1
+  /** Speech of at least `minSpeechMs` came after that point: the next turn has started. */
+  private nextTurnStarted = false
   private ended = false
   /** Text of the `EagerEndOfTurn` that has not been resumed. */
   private eagerText: string | undefined = undefined
@@ -110,6 +132,7 @@ export class TurnDetector {
         break
       case "End":
         this.ended = true
+        if (this.pending && !this.finalDue) this.finalFrame = this.frame
         this.finalDue = true
         if (this.heard && !this.pending) this.finalize(out)
         else if (!this.pending) this.commit(out)
@@ -119,6 +142,7 @@ export class TurnDetector {
   }
 
   private text(): string {
+    if (this.options.cumulative) return this.segments.join(" ")
     return this.partial ? [...this.segments, this.partial].join(" ") : this.segments.join(" ")
   }
 
@@ -134,7 +158,9 @@ export class TurnDetector {
       this.silenceMs = 0
       this.heard = true
       if (this.speechMs >= this.options.minSpeechMs) {
-        if (!this.open) this.openTurn(out)
+        // The turn is over (final threshold passed), only its answer is awaited: this speech is the next turn.
+        if (this.finalDue && this.pending) this.nextTurnStarted = true
+        else if (!this.open) this.openTurn(out)
         else this.resume(out)
       }
       return
@@ -148,12 +174,22 @@ export class TurnDetector {
       this.finalize(out)
     }
     if (final) {
-      if (this.pending) this.finalDue = true
+      if (this.pending) {
+        if (!this.finalDue) this.finalFrame = this.frame
+        this.finalDue = true
+      }
       else this.commit(out)
     }
   }
 
   private onPartial(text: string, out: Array<TurnOutput>): void {
+    if (this.options.cumulative) {
+      if (!text || text === this.lastInterim) return
+      if (!this.open) this.openTurn(out)
+      this.lastInterim = text
+      out.push({ _tag: "Interim", text })
+      return
+    }
     this.partial = text
     const interim = this.text()
     if (!text || interim === this.lastInterim) return
@@ -166,7 +202,25 @@ export class TurnDetector {
   private onSegment(text: string, out: Array<TurnOutput>): void {
     this.pending = false
     this.partial = ""
-    if (text) this.segments.push(text)
+    if (this.options.cumulative) {
+      // Replaces the turn's text. Noise that never opened the turn has no text.
+      this.segments = text && this.open ? [text] : []
+      if (!this.heard && !this.finalDue && !this.active()) {
+        out.push({ _tag: "Commit", frame: this.frame })
+        return
+      }
+    } else if (text) this.segments.push(text)
+    if (this.heard && this.finalDue && !this.ended) {
+      // The turn ended at the final threshold while its answer was being decoded (a slow model); the speech
+      // since then belongs to the next turn, not to this one.
+      const started = this.nextTurnStarted
+      const silenceMs = this.silenceMs
+      this.commit(out, this.finalFrame)
+      this.heard = true
+      this.silenceMs = silenceMs
+      if (started) this.openTurn(out)
+      return
+    }
     if (this.heard) {
       // Speech after the decision point went into a new segment; the next pause finalises it.
       if (this.finalDue) this.finalize(out)
@@ -199,12 +253,15 @@ export class TurnDetector {
     out.push(TURN_RESUMED)
   }
 
-  private commit(out: Array<TurnOutput>): void {
+  private commit(out: Array<TurnOutput>, frame: number = this.frame): void {
     const text = this.text()
     if (text) {
       if (!this.open) out.push(SPEECH_STARTED)
       out.push({ _tag: "EndOfTurn", text })
     }
+    out.push({ _tag: "Commit", frame })
+    this.finalFrame = -1
+    this.nextTurnStarted = false
     this.open = false
     this.segments = []
     this.partial = ""

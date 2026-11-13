@@ -11,7 +11,7 @@ import {
 } from "@pva/core"
 import { Config, Effect, Layer, Stream } from "effect"
 import { AppConfig } from "./config.ts"
-import { modules } from "./modules.ts"
+import { startCliModules, withModuleInstructions } from "./modules.ts"
 import { AudioLayer, LlmLayer, SttLayer } from "./providers.ts"
 import { buildProviders, observedTurnTraceLayer, StartupError } from "./startup.ts"
 import { loadVoiceSettings, voiceStages, withVoicePrompt, withVoiceRouter } from "./voices.ts"
@@ -67,8 +67,10 @@ export const voiceMode = Effect.scoped(Effect.gen(function*() {
     })
 
   const services = Layer.succeedContext(providers)
-  const ConversationLive = Conversation.layer({ ...settings, systemPrompt: withVoicePrompt(settings.systemPrompt, voices) }).pipe(
-    Layer.provide(Layer.mergeAll(services, ToolRegistry.layer(modules), observedTurnTraceLayer(onFinish)))
+  const modules = yield* startCliModules()
+  const systemPrompt = withVoicePrompt(withModuleInstructions(settings.systemPrompt, modules.instructions), voices)
+  const ConversationLive = Conversation.layer({ ...settings, systemPrompt }).pipe(
+    Layer.provide(Layer.mergeAll(services, Layer.succeed(ToolRegistry, modules.registry), observedTurnTraceLayer(onFinish)))
   )
 
   yield* Effect.gen(function*() {

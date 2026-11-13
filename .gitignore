@@ -14,3 +14,6 @@ bench-audio/
 
 # local speech models (fetched by the download script)
 models/
+
+# settings saved from the web UI (serve mode; secrets.json holds API keys)
+data/

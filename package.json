@@ -8,9 +8,14 @@
   },
   "scripts": {
     "start": "pnpm --silent --filter @pva/assistant start",
+    "serve": "pnpm --silent --filter @pva/web build && pnpm --silent --filter @pva/assistant start serve",
     "download-models": "pnpm --silent --filter @pva/stt-sherpa download-models && pnpm --silent --filter @pva/tts-sherpa download",
-    "check": "tsc -p tsconfig.json",
-    "test": "vitest run"
+    "check": "tsc -p tsconfig.json && tsc -p packages/protocol/tsconfig.json && pnpm --silent --filter @pva/web check",
+    "test": "vitest run",
+    "dev": "pnpm --parallel --filter @pva/web --filter @pva/assistant dev",
+    "e2e": "pnpm --filter @pva/web e2e",
+    "e2e:real": "pnpm --filter @pva/web e2e:real",
+    "bench:browser": "pnpm --filter @pva/web bench:browser"
   },
   "devDependencies": {
     "@effect/vitest": "catalog:",

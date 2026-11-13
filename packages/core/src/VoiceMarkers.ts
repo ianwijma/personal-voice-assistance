@@ -43,20 +43,47 @@ export const stripVoiceMarkersStream = <E, R>(self: Stream.Stream<string, E, R>)
   Stream.mapAccum(
     self,
     () => ({ pending: "", trimNext: false }),
-    (state, delta): readonly [{ pending: string; trimNext: boolean }, ReadonlyArray<string>] => {
-      let text = state.pending + delta
-      if (state.trimNext) text = text.trimStart()
-      const stripped = stripVoiceMarkers(text)
-      // A marker at the very end: the space after it may arrive in the next delta.
-      const trimNext = endsWithMarker(text)
-      const open = stripped.lastIndexOf("[")
-      if (open >= 0 && isUnfinishedMarker(stripped.slice(open))) {
-        const out = stripped.slice(0, open)
-        return [{ pending: stripped.slice(open), trimNext: false }, out.length > 0 ? [out] : []]
-      }
-      return [{ pending: "", trimNext: trimNext || (state.trimNext && stripped.length === 0) }, stripped.length > 0 ? [stripped] : []]
+    (state, delta): readonly [MarkerStripState, ReadonlyArray<string>] => {
+      const [next, out] = stripStep(state, delta)
+      return [next, out.length > 0 ? [out] : []]
     },
     { onHalt: (state) => (state.pending.length > 0 ? [state.pending] : []) }
   )
+
+interface MarkerStripState {
+  readonly pending: string
+  readonly trimNext: boolean
+}
+
+const stripStep = (state: MarkerStripState, delta: string): readonly [MarkerStripState, string] => {
+  let text = state.pending + delta
+  if (state.trimNext) text = text.trimStart()
+  const stripped = stripVoiceMarkers(text)
+  // A marker at the very end: the space after it may arrive in the next delta.
+  const trimNext = endsWithMarker(text)
+  const open = stripped.lastIndexOf("[")
+  if (open >= 0 && isUnfinishedMarker(stripped.slice(open))) {
+    return [{ pending: stripped.slice(open), trimNext: false }, stripped.slice(0, open)]
+  }
+  return [{ pending: "", trimNext: trimNext || (state.trimNext && stripped.length === 0) }, stripped]
+}
+
+/** The same as `stripVoiceMarkersStream`, for code that receives deltas one by one. */
+export const makeMarkerStripper = () => {
+  let state: MarkerStripState = { pending: "", trimNext: false }
+  return {
+    push: (delta: string): string => {
+      const [next, out] = stripStep(state, delta)
+      state = next
+      return out
+    },
+    /** Text held back at the end (an unfinished `[...`). */
+    flush: (): string => {
+      const out = state.pending
+      state = { pending: "", trimNext: false }
+      return out
+    }
+  }
+}
 
 const endsWithMarker = (text: string) => /\[voice:\s*[a-z0-9_-]*\s*\]$/i.test(text)

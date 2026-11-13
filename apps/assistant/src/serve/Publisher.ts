@@ -1,0 +1,240 @@
+import { type ConversationEvent, makeMarkerStripper, type Message, parseVoiceMarker, stripVoiceMarkers, type Trace } from "@pva/core"
+import type { HistoryItem, ServerMessage, TraceInfo } from "@pva/protocol"
+
+/**
+ * Turns `ConversationEvent`s into protocol messages (docs/UI-AND-MODULES.md
+ * §4.4). Synchronous: `Conversation.onEvent` calls it on the turn's fiber, it
+ * maps the event and calls `broadcast` (which serialises once and writes to
+ * each socket). A speculative turn's messages are held back until it is
+ * promoted and dropped if it is discarded, so it never appears in any UI.
+ */
+
+const TOOL_INPUT_LIMIT = 2_048
+export const MAX_TRACES = 20
+export const MAX_HISTORY_ITEMS = 200
+
+interface TurnView {
+  readonly spoken: boolean
+  pending: boolean
+  readonly buffer: Array<ServerMessage>
+  voice: string
+  readonly strip: ReturnType<typeof makeMarkerStripper>
+}
+
+export interface PublisherOptions {
+  readonly broadcast: (message: ServerMessage) => void
+  /** The module that contributes a tool (from the module host's current snapshot). */
+  readonly moduleOfTool: (name: string) => string | null
+  /** The default voice and the enabled voices (the voice per clause is tracked as the router does). */
+  readonly voices: () => { readonly defaultVoice: string; readonly names: ReadonlySet<string> }
+  /** Right after `turn.start` of a committed (or just promoted) turn went out, before the rest of its messages. */
+  readonly onCommitted?: (turnId: number) => void
+}
+
+export interface Publisher {
+  readonly onEvent: (event: ConversationEvent) => void
+  /** The most recent traces, oldest first (for `welcome`). */
+  readonly traces: () => ReadonlyArray<TraceInfo>
+  /** The committed turn that is running (between `turn.start` and `turn.end`). */
+  readonly committedTurn: () => number | undefined
+}
+
+const truncateInput = (input: unknown): unknown => {
+  let json: string | undefined
+  try {
+    json = JSON.stringify(input)
+  } catch {
+    return String(input)
+  }
+  if (json === undefined) return null
+  return json.length <= TOOL_INPUT_LIMIT ? JSON.parse(json) : `${json.slice(0, TOOL_INPUT_LIMIT)}…`
+}
+
+/** Marks relative to end of turn, as in the CLI's latency line. */
+export const traceInfo = (trace: Trace): TraceInfo => {
+  const origin = trace.marks.endOfTurn ?? trace.startedAt
+  const marks: Record<string, number> = {}
+  for (const key of ["llmRequestSent", "llmFirstToken", "firstClause", "ttsFirstAudio", "playbackStart"] as const) {
+    const t = trace.marks[key]
+    if (t !== undefined) marks[key] = Math.round((t - origin) * 10) / 10
+  }
+  return {
+    turnId: trace.id,
+    mode: trace.mode,
+    speculative: trace.speculative,
+    outcome: trace.outcome ?? "failed",
+    marks,
+    ...(trace.endedAt !== undefined ? { totalMs: Math.round((trace.endedAt - origin) * 10) / 10 } : {}),
+    tools: trace.tools.map((t) => ({ name: t.name, ms: Math.max(0, Math.round(t.ms)) })),
+    voices: [...trace.voices],
+    ...(trace.client !== undefined ? { client: { ...trace.client } } : {})
+  }
+}
+
+export const makePublisher = (options: PublisherOptions): Publisher => {
+  const turns = new Map<number, TurnView>()
+  const traces: Array<TraceInfo> = []
+  let committed: number | undefined
+
+  const send = (turnId: number, message: ServerMessage) => {
+    const view = turns.get(turnId)
+    if (view?.pending === true) view.buffer.push(message)
+    else options.broadcast(message)
+  }
+
+  const handle = (event: ConversationEvent) => {
+    switch (event._tag) {
+      case "TurnStarted": {
+        const view: TurnView = {
+          spoken: event.spoken,
+          pending: event.speculative,
+          buffer: [],
+          voice: options.voices().defaultVoice,
+          strip: makeMarkerStripper()
+        }
+        turns.set(event.turnId, view)
+        const start: ServerMessage = { type: "turn.start", turnId: event.turnId, source: event.source, userText: event.text, spoken: event.spoken }
+        if (event.speculative) view.buffer.push(start)
+        else {
+          committed = event.turnId
+          options.broadcast(start)
+          options.onCommitted?.(event.turnId)
+        }
+        return
+      }
+      case "TurnPromoted": {
+        const view = turns.get(event.turnId)
+        if (view === undefined) return
+        view.pending = false
+        committed = event.turnId
+        const [start, ...rest] = view.buffer.splice(0)
+        if (start !== undefined) options.broadcast(start)
+        options.onCommitted?.(event.turnId)
+        for (const message of rest) options.broadcast(message)
+        return
+      }
+      case "TextDelta": {
+        const view = turns.get(event.turnId)
+        if (view === undefined || view.spoken) return
+        const text = view.strip.push(event.text)
+        if (text.length > 0) send(event.turnId, { type: "assistant.text", turnId: event.turnId, clause: null, text })
+        return
+      }
+      case "ClauseQueued": {
+        const view = turns.get(event.turnId)
+        if (view === undefined) return
+        const voices = options.voices()
+        const parsed = parseVoiceMarker(event.text)
+        if (parsed.voice !== undefined) view.voice = voices.names.has(parsed.voice) ? parsed.voice : voices.defaultVoice
+        const text = stripVoiceMarkers(parsed.text).trim()
+        if (text.length === 0) return
+        send(event.turnId, { type: "assistant.text", turnId: event.turnId, clause: event.index, text, voice: view.voice })
+        return
+      }
+      case "ClausePlaying":
+        return send(event.turnId, { type: "assistant.playing", turnId: event.turnId, clause: event.index })
+      case "ToolStarted":
+        return send(event.turnId, {
+          type: "tool.start",
+          turnId: event.turnId,
+          callId: event.call.id,
+          tool: event.call.name,
+          moduleId: options.moduleOfTool(event.call.name),
+          input: truncateInput(event.call.input) as never
+        })
+      case "ToolFinished":
+        return send(event.turnId, {
+          type: "tool.end",
+          turnId: event.turnId,
+          callId: event.result.id,
+          ok: !event.result.isError,
+          ms: Math.max(0, event.ms),
+          ...(event.result.isError ? { error: event.result.content.slice(0, 500) } : {})
+        })
+      case "TurnEnded": {
+        const view = turns.get(event.turnId)
+        turns.delete(event.turnId)
+        if (committed === event.turnId) committed = undefined
+        if (event.outcome === "discarded" || view?.pending === true) return
+        if (view !== undefined && !view.spoken) {
+          const rest = view.strip.flush()
+          if (rest.length > 0) options.broadcast({ type: "assistant.text", turnId: event.turnId, clause: null, text: rest })
+        }
+        const info = traceInfo(event.trace)
+        traces.push(info)
+        if (traces.length > MAX_TRACES) traces.shift()
+        options.broadcast({ type: "turn.end", turnId: event.turnId, outcome: event.outcome, trace: info })
+        if (event.outcome === "failed") {
+          options.broadcast({
+            type: "error",
+            error: { code: "turn_failed", message: "That reply failed (see the assistant's log); the conversation continues.", turnId: event.turnId }
+          })
+        }
+        return
+      }
+    }
+  }
+
+  return {
+    onEvent: (event) => {
+      try {
+        handle(event)
+      } catch (error) {
+        console.error("serve: could not publish a conversation event", error)
+      }
+    },
+    traces: () => traces.slice(),
+    committedTurn: () => committed
+  }
+}
+
+/**
+ * History as the user saw it: one user item per user message and at most one
+ * assistant item per turn (its text without markers, interrupted if any part
+ * was, and its tool calls with success). The last `MAX_HISTORY_ITEMS` items.
+ */
+export const historyItems = (messages: ReadonlyArray<Message>): Array<HistoryItem> => {
+  const items: Array<HistoryItem> = []
+  let texts: Array<string> = []
+  let interrupted = false
+  let tools: Array<{ name: string; ok: boolean }> = []
+  let calls = new Map<string, { name: string; ok: boolean }>()
+  let open = false
+  const close = () => {
+    if (open && (texts.length > 0 || tools.length > 0)) items.push({ role: "assistant", text: texts.join(" "), interrupted, tools })
+    texts = []
+    interrupted = false
+    tools = []
+    calls = new Map()
+    open = false
+  }
+  for (const message of messages) {
+    switch (message.role) {
+      case "user":
+        close()
+        items.push({ role: "user", text: message.content })
+        open = true
+        break
+      case "assistant": {
+        open = true
+        const text = stripVoiceMarkers(message.content).trim()
+        if (text.length > 0) texts.push(text)
+        if (message.interrupted === true) interrupted = true
+        for (const call of message.toolCalls ?? []) {
+          const tool = { name: call.name, ok: true }
+          tools.push(tool)
+          calls.set(call.id, tool)
+        }
+        break
+      }
+      case "tool":
+        for (const result of message.results) {
+          const tool = calls.get(result.id)
+          if (tool !== undefined) tool.ok = !result.isError
+        }
+        break
+    }
+  }
+  close()
+  return items.slice(-MAX_HISTORY_ITEMS)
+}

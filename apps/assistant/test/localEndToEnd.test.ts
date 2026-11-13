@@ -17,9 +17,10 @@ import { FakeLlm } from "../src/FakeLlm.ts"
 const required = [
   join(SherpaTts.defaultModelDir, "vits-piper-en_US-lessac-medium", "en_US-lessac-medium.onnx"),
   join(SherpaStt.defaultModelDir, "silero_vad.onnx"),
-  join(SherpaStt.defaultModelDir, SherpaStt.presets["zipformer-en"].dir, SherpaStt.presets["zipformer-en"].encoder)
+  join(SherpaStt.defaultModelDir, "silero_vad.onnx")
 ]
-const missing = required.find((f) => !existsSync(f))
+const missing = required.find((f) => !existsSync(f)) ??
+  (SherpaStt.installedPresets().includes("zipformer-en") ? undefined : "the zipformer-en model")
 if (missing !== undefined) console.warn(`Skipping the local end-to-end test: ${missing} is missing`)
 
 it.live.skipIf(missing !== undefined)(

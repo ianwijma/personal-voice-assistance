@@ -98,7 +98,7 @@ export const withVoicePrompt = (systemPrompt: string, settings: VoiceSettings): 
 const envName = (name: string) => `VOICE_${name.toUpperCase().replace(/[^A-Z0-9]/g, "_")}`
 
 /** `VOICE_<NAME>_PROVIDER`, else the declared provider, else `TTS_PROVIDER` (default `sherpa`). */
-const providerOf = (voice: VoiceDeclaration): Config.Config<TtsProviderName> =>
+export const providerOf = (voice: VoiceDeclaration): Config.Config<TtsProviderName> =>
   Config.option(Config.Literals(ttsProviderNames, `${envName(voice.name)}_PROVIDER`)).pipe(
     Config.map(Option.getOrUndefined),
     Config.flatMap((chosen) =>
@@ -148,6 +148,10 @@ export const voiceRouter = (
     voices: settings.enabled.map((v) => ({ name: v.name, description: v.description, tts: Context.get(context, voiceKey(v.name)) })),
     ...(onSegment !== undefined ? { onSegment } : {})
   })
+
+/** The voices built by `voiceStages` (found in `context`), for a router built elsewhere. */
+export const builtVoices = (context: Context.Context<any>, settings: VoiceSettings) =>
+  settings.enabled.map((v) => ({ name: v.name, description: v.description, tts: Context.get(context, voiceKey(v.name)) }))
 
 /** `context` with `Tts` set to the voice router. */
 export const withVoiceRouter = (context: Context.Context<any>, settings: VoiceSettings): Context.Context<any> =>

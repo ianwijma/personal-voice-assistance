@@ -1,12 +1,19 @@
+import type { AgentKind, RouteReason } from "@pva/protocol"
 import { Context, Effect, Layer } from "effect"
 
 export const traceMarks = [
   "endOfTurn",
   "llmRequestSent",
   "llmFirstToken",
+  /** Intent agents: decision request sent / answer received. */
+  "decisionSent",
+  "decisionReceived",
   "firstClause",
   "ttsFirstAudio",
-  "playbackStart"
+  "playbackStart",
+  /** Intent agents: the action's `run` started / ended. */
+  "actionStarted",
+  "actionFinished"
 ] as const
 export type TraceMark = typeof traceMarks[number]
 
@@ -23,8 +30,24 @@ export interface Trace {
   readonly tools: Array<{ readonly name: string; readonly ms: number }>
   /** Voices that spoke in this turn, in order of first use (filled by the voice router). */
   readonly voices: Array<string>
+  /** The agent that answered (agent conversations; replaced when a fallback agent takes over). */
+  agent?: TraceAgent
   outcome?: TurnOutcome
   endedAt?: number
+  /**
+   * Reported by an output that plays elsewhere (the browser): its output latency
+   * (the sound is audible this much after `playbackStart`) and how long it
+   * buffered before starting.
+   */
+  client?: { readonly outputLatencyMs: number; readonly startDelayMs: number }
+}
+
+export interface TraceAgent {
+  readonly id: string
+  readonly kind: AgentKind
+  readonly routedBy: RouteReason
+  /** The agent the turn was meant for (unavailable, failed or passed on). */
+  readonly fallbackFrom?: string
 }
 
 /**
@@ -58,12 +81,19 @@ const ms = (n: number) => `${Math.round(n)}ms`
 export const formatTrace = (trace: Trace): string => {
   const origin = trace.marks.endOfTurn ?? trace.startedAt
   const parts = [`turn #${trace.id} ${trace.mode}${trace.speculative ? " (speculative)" : ""} ${trace.outcome ?? "running"}`]
+  if (trace.agent !== undefined) {
+    parts.push(`agent=${trace.agent.id}(${trace.agent.routedBy}${trace.agent.fallbackFrom !== undefined ? `, instead of ${trace.agent.fallbackFrom}` : ""})`)
+  }
   let prev: number | undefined
   for (const mark of traceMarks) {
     const t = trace.marks[mark]
     if (t === undefined || mark === "endOfTurn") continue
     parts.push(`${mark}=${ms(t - origin)}${prev !== undefined ? ` (+${ms(t - prev)})` : ""}`)
     prev = t
+  }
+  const start = trace.marks.playbackStart
+  if (trace.client !== undefined && start !== undefined) {
+    parts.push(`audible=${ms(start + trace.client.outputLatencyMs - origin)} (+${ms(trace.client.outputLatencyMs)} output latency)`)
   }
   if (trace.tools.length > 0) parts.push(`tools: ${trace.tools.map((t) => `${t.name} ${ms(t.ms)}`).join(", ")}`)
   if (trace.voices.length > 0) parts.push(`voices: ${trace.voices.join(", ")}`)

@@ -1,4 +1,4 @@
-import { type AssistantModule, makeTool, ToolError } from "@pva/core"
+import { ActionError, type AssistantModule, defineAction, defineModule, makeTool, Param, Setting, ToolError } from "@pva/core"
 import { Effect, Schema } from "effect"
 
 export interface WeatherOptions {
@@ -67,7 +67,16 @@ const placeName = (p: Place) =>
  * speculative turn. Geocoding results are cached for the life of the process,
  * so a repeated place costs one HTTP request instead of two.
  */
-export const weatherModule = (options: WeatherOptions = {}): AssistantModule => {
+export const makeWeather = (options: WeatherOptions = {}): AssistantModule => {
+  const { tool } = makeWeatherParts(options)
+  return { name: "weather", tools: [tool] }
+}
+
+/** Words that may trail a spoken place but are not part of it ("in Paris today"). */
+const TRAILING = /\s+(today|now|right now|tomorrow|please|vandaag|nu|morgen|alsjeblieft)$/i
+
+/** The `weather` tool and the `today` action of one instance, sharing the geocode cache. */
+export const makeWeatherParts = (options: WeatherOptions = {}) => {
   const fetchFn = options.fetch ?? globalThis.fetch
   const timeoutMs = options.timeoutMs ?? 3000
   const fahrenheit = options.units === "fahrenheit"
@@ -134,7 +143,7 @@ export const weatherModule = (options: WeatherOptions = {}): AssistantModule => 
     speculative: true,
     execute: ({ place }) =>
       Effect.gen(function*() {
-        const query = place?.trim() || options.defaultPlace
+        const query = place?.trim() || options.defaultPlace?.trim()
         if (query === undefined || query.length === 0) {
           return yield* new ToolError({ message: "No place given and no home location configured; ask the user where" })
         }
@@ -161,5 +170,89 @@ export const weatherModule = (options: WeatherOptions = {}): AssistantModule => 
       )
   })
 
-  return { name: "weather", tools: [weather] }
+  /**
+   * The `today` action (docs/AGENTS-AND-INTENTS.md §3.9): read-only, so it may
+   * run during a speculative turn; not offered as a tool (the `weather` tool
+   * exists). "Amsterdam: light rain, 12 degrees; 9 to 14 today."
+   */
+  const today = defineAction({
+    id: "today",
+    label: "Tell the weather",
+    description: "Say the current weather and today's forecast, at home or in a named city.",
+    examples: ["what's the weather like", "what is the weather in Paris", "hoe is het weer", "wat voor weer is het in Utrecht"],
+    params: {
+      place: Param.text({ label: "Place", after: ["in", "for", "at", "voor", "te"], maxWords: 4, optional: true })
+    },
+    speculative: true,
+    offerAsTool: false,
+    run: ({ place }) =>
+      Effect.gen(function*() {
+        const named = place?.replace(/[.!?,]+$/, "").replace(TRAILING, "").trim()
+        const query = named || options.defaultPlace?.trim()
+        if (query === undefined || query.length === 0) {
+          return yield* new ActionError({ message: "I don't know where home is: set a home location in the weather options." })
+        }
+        const location = yield* geocode(query)
+        const { current: now, daily } = yield* forecast(location)
+        const min = daily.temperature_2m_min[0]
+        const max = daily.temperature_2m_max[0]
+        const unit = fahrenheit ? "degrees Fahrenheit" : "degrees"
+        return {
+          say: `${location.name}: ${describeCode(now.weather_code)}, ${round(now.temperature_2m)} ${unit}` +
+            (min === undefined || max === undefined ? "." : `; ${round(min)} to ${round(max)} today.`)
+        }
+      }).pipe(
+        Effect.timeoutOrElse({
+          duration: timeoutMs,
+          orElse: () => Effect.fail(new ActionError({ message: "The weather service did not answer in time." }))
+        }),
+        Effect.mapError((e) => e instanceof ActionError ? e : new ActionError({ message: "The weather service did not answer.", cause: e }))
+      )
+  })
+
+  return { tool: weather, today }
 }
+
+/**
+ * The weather lookup as a module. The geocode cache lives in the instance, so
+ * changed settings start with a fresh cache. `fetch` is injected in tests.
+ */
+export const weatherModule = (deps: { readonly fetch?: typeof globalThis.fetch } = {}) =>
+  defineModule({
+    id: "weather",
+    name: "Weather",
+    description: "Current weather and today's forecast from Open-Meteo (no account needed).",
+    settings: {
+      defaultPlace: Setting.text({
+        label: "Home location",
+        description: "Used when you don't name a place.",
+        placeholder: "Amsterdam, Netherlands",
+        env: "WEATHER_DEFAULT_PLACE",
+        maxLength: 200
+      }),
+      units: Setting.choice({
+        label: "Units",
+        env: "WEATHER_UNITS",
+        default: "celsius",
+        options: [{ value: "celsius", label: "Celsius, km/h" }, { value: "fahrenheit", label: "Fahrenheit, mph" }]
+      }),
+      timeoutMs: Setting.number({
+        label: "Timeout",
+        description: "Longest a lookup may take; a spoken reply cannot wait much longer.",
+        default: 3000,
+        integer: true,
+        min: 500,
+        max: 10_000,
+        step: 100,
+        unit: "ms",
+        advanced: true
+      })
+    },
+    start: ({ setStatus, settings }) =>
+      Effect.sync(() => {
+        const home = settings.defaultPlace.trim()
+        setStatus(home === "" ? undefined : { text: `Home: ${home}`.slice(0, 120), tone: "neutral" })
+        const { today, tool } = makeWeatherParts({ ...settings, ...(deps.fetch !== undefined ? { fetch: deps.fetch } : {}) })
+        return { tools: [tool], actions: [today] }
+      })
+  })

@@ -1,11 +1,11 @@
 import { assert, describe, it } from "@effect/vitest"
-import { makeToolRegistry } from "@pva/core"
+import { makeToolRegistry, resolveSettings } from "@pva/core"
 import { Effect } from "effect"
 import { TestClock } from "effect/testing"
-import { clockModule } from "../src/clock.ts"
+import { clockModule, makeClock } from "../src/clock.ts"
 
 describe("clock module", () => {
-  const registry = makeToolRegistry([clockModule({ timeZone: "Europe/Amsterdam", locale: "en-GB" })])
+  const registry = makeToolRegistry([makeClock({ timeZone: "Europe/Amsterdam", locale: "en-GB" })])
   const at = Date.UTC(2026, 10, 13, 10, 45, 30) // 11:45:30 in Amsterdam
 
   it.effect("provides local date, time and zone as context", () =>
@@ -44,4 +44,18 @@ describe("clock module", () => {
     assert.deepStrictEqual(spec!.inputSchema.required, ["timeZone"])
     assert.strictEqual((spec!.inputSchema.properties as any).timeZone.description, "IANA time zone name")
   })
+})
+
+describe("clock module definition", () => {
+  it.effect("starts with typed settings and validates the time zone", () =>
+    Effect.gen(function*() {
+      const bad = resolveSettings(clockModule.settings, { stored: { timeZone: "Mars/Olympus" }, secrets: {}, env: {} })
+      assert.deepStrictEqual(bad.form.errors, [{ key: "timeZone", message: "The saved value is not valid (Unknown time zone); save a new one" }])
+      const ok = resolveSettings(clockModule.settings, { stored: { locale: "en-US" }, secrets: {}, env: { CLOCK_TIME_ZONE: "Asia/Tokyo" } })
+      assert.deepStrictEqual(ok.value, { timeZone: "Asia/Tokyo", locale: "en-US" })
+      yield* TestClock.setTime(Date.UTC(2026, 10, 13, 10, 45, 30))
+      const instance = yield* Effect.scoped(clockModule.start({ settings: ok.value!, setStatus: () => {} }))
+      const registry = makeToolRegistry([{ name: "clock", ...instance }])
+      assert.strictEqual(yield* registry.context, "## Clock\nIt is Friday, November 13, 2026, 7:45 PM local time (Asia/Tokyo).")
+    }))
 })

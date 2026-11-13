@@ -1,4 +1,5 @@
-export { layer, layerConfig, make, type SherpaSttOptions } from "./SherpaStt.ts"
+export { type Agc, type AgcOptions, makeAgc } from "./agc.mjs"
+export { check, checkConfig, layer, layerConfig, make, optionsConfig, type SherpaSttOptions } from "./SherpaStt.ts"
 export {
   type EndOfTurnPolicy,
   fixedSilence,
@@ -7,4 +8,19 @@ export {
   type TurnInput,
   type TurnOutput
 } from "./TurnDetector.ts"
-export { defaultModelDir, type Preset, type PresetName, presetNames, presets } from "./presets.ts"
+export {
+  DEFAULT_PRESET,
+  DEFAULT_VAD_THRESHOLD,
+  defaultModelDir,
+  DOWNLOAD_COMMAND,
+  installedPresets,
+  isPresetName,
+  legacyPresetNames,
+  missingModelMessage,
+  type Preset,
+  type PresetName,
+  presetNames,
+  presets,
+  resolvePresetName,
+  takesLanguage
+} from "./presets.ts"

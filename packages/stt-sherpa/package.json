@@ -10,7 +10,8 @@
     "check": "tsc -p tsconfig.json",
     "test": "vitest run",
     "download-models": "tsx scripts/download-models.ts",
-    "measure": "tsx scripts/measure.ts"
+    "measure": "tsx scripts/measure.ts",
+    "false-triggers": "tsx scripts/false-triggers.ts"
   },
   "dependencies": {
     "@pva/core": "workspace:*",

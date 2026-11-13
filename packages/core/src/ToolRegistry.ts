@@ -11,7 +11,7 @@ export class ToolRegistry extends Context.Service<ToolRegistry, {
   readonly specs: ReadonlyArray<ToolSpec>
   isSpeculative(name: string): boolean
   run(call: ToolCall): Effect.Effect<ToolResult>
-  /** Output of every context provider, formatted for `LlmRequest.context` ("" if none). */
+  /** Output of every context provider, formatted for `LlmRequest.context` ("" if none; empty outputs are left out). */
   readonly context: Effect.Effect<string>
 }>()("@pva/core/ToolRegistry") {
   static readonly layer = (modules: ReadonlyArray<AssistantModule>) =>
@@ -69,8 +69,9 @@ export const makeToolRegistry = (modules: ReadonlyArray<AssistantModule>): ToolR
 
   const context = providers.length === 0
     ? Effect.succeed("")
-    : Effect.forEach(providers, (p) => Effect.map(p.get, (text) => `## ${p.name}\n${text}`), { concurrency: "unbounded" })
-      .pipe(Effect.map((sections) => sections.join("\n\n")))
+    : Effect.forEach(providers, (p) => Effect.map(p.get, (text) => text.length === 0 ? "" : `## ${p.name}\n${text}`), {
+      concurrency: "unbounded"
+    }).pipe(Effect.map((sections) => sections.filter((s) => s.length > 0).join("\n\n")))
 
   return ToolRegistry.of({
     specs,

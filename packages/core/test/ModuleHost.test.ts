@@ -1,0 +1,301 @@
+import { assert, describe, it } from "@effect/vitest"
+import type { ModuleInfo } from "@pva/protocol"
+import { Effect, Fiber, Schema } from "effect"
+import { TestClock } from "effect/testing"
+import { makeTool } from "../src/Module.ts"
+import { defineModule, ModuleStartError } from "../src/ModuleDefinition.ts"
+import { makeModuleHost, type ModulePersistence, type ModuleRecord } from "../src/ModuleHost.ts"
+import { Setting } from "../src/Settings.ts"
+
+const advance = (millis: number) => Effect.andThen(Effect.repeat(Effect.yieldNow, { times: 50 }), TestClock.adjust(millis))
+
+/** Persistence that records every save. */
+const fakePersistence = (
+  modules: Record<string, ModuleRecord> = {},
+  secrets: Record<string, Record<string, string>> = {}
+) => {
+  const saves: Array<{ id: string; enabled: boolean; settings: unknown; secrets: unknown }> = []
+  const persistence: ModulePersistence = {
+    initial: { modules, secrets },
+    save: (id, record) => Effect.sync(() => saves.push({ id, ...record }))
+  }
+  return { persistence, saves }
+}
+
+interface Probe {
+  starts: number
+  closes: number
+  toolCalls: Array<string>
+}
+
+/** A module with a `greeting` setting, a tool named `tool` (configurable), a context provider, and a probe. */
+const testModule = (options: {
+  readonly id?: string
+  readonly tool?: string
+  readonly startMillis?: number
+  readonly fail?: string
+  readonly toolMillis?: number
+  readonly contextMillis?: number
+  readonly enabledByDefault?: boolean
+  readonly probe?: Probe
+}) => {
+  const probe: Probe = options.probe ?? { starts: 0, closes: 0, toolCalls: [] }
+  const definition = defineModule({
+    id: options.id ?? "test",
+    name: options.id === undefined ? "Test" : options.id.toUpperCase(),
+    description: "A test module",
+    ...(options.enabledByDefault !== undefined ? { enabledByDefault: options.enabledByDefault } : {}),
+    settings: {
+      greeting: Setting.text({ label: "Greeting", default: "hello", check: (v) => (v === "bad" ? "Not this one" : undefined) }),
+      token: Setting.secret({ label: "Token", env: "TEST_TOKEN" })
+    },
+    start: ({ settings, setStatus }) =>
+      Effect.gen(function*() {
+        probe.starts++
+        if ((options.startMillis ?? 0) > 0) yield* Effect.sleep(options.startMillis!)
+        if (options.fail !== undefined || settings.greeting === "fail") {
+          return yield* new ModuleStartError({ message: options.fail ?? "Refused" })
+        }
+        yield* Effect.addFinalizer(() => Effect.sync(() => probe.closes++))
+        setStatus({ text: `Greeting ${settings.greeting}`, tone: "ok" })
+        return {
+          instructions: `Say ${settings.greeting}.`,
+          tools: [makeTool({
+            name: options.tool ?? "tool",
+            description: "tool",
+            parameters: Schema.Struct({}),
+            speculative: true,
+            execute: () =>
+              Effect.gen(function*() {
+                if ((options.toolMillis ?? 0) > 0) yield* Effect.sleep(options.toolMillis!)
+                probe.toolCalls.push(settings.greeting)
+                return settings.greeting
+              })
+          })],
+          context: [{
+            name: "Ctx",
+            get: (options.contextMillis ?? 0) > 0
+              ? Effect.as(Effect.sleep(options.contextMillis!), "slow")
+              : Effect.succeed(`ctx ${settings.greeting}`)
+          }]
+        }
+      })
+  })
+  return { definition, probe }
+}
+
+const host = (catalog: ReadonlyArray<ReturnType<typeof testModule>["definition"]>, persistence: ModulePersistence, env: Record<string, string> = {}) =>
+  makeModuleHost({ catalog, persistence, env })
+
+const stateOf = (modules: ReadonlyArray<ModuleInfo>, id = "test") => modules.find((m) => m.id === id)!
+
+describe("ModuleHost", () => {
+  it.effect("startup: modules with intent on start (default: enabledByDefault); the snapshot has their tools and instructions", () =>
+    Effect.gen(function*() {
+      const a = testModule({ id: "a", tool: "ta" })
+      const b = testModule({ id: "b", tool: "tb", enabledByDefault: false })
+      const c = testModule({ id: "c", tool: "tc", enabledByDefault: false })
+      const { persistence } = fakePersistence({ c: { enabled: true } })
+      const h = yield* host([a.definition, b.definition, c.definition], persistence)
+      assert.deepStrictEqual(h.modules().map((m) => m.state), ["disabled", "disabled", "disabled"])
+      yield* h.startEnabled
+      assert.deepStrictEqual(h.modules().map((m) => [m.id, m.enabled, m.state]), [["a", true, "running"], ["b", false, "disabled"], ["c", true, "running"]])
+      const snap = h.snapshot()
+      assert.deepStrictEqual(snap.registry.specs.map((s) => s.name), ["ta", "tc"])
+      assert.deepStrictEqual(snap.instructions, ["Say hello.", "Say hello."])
+      assert.deepStrictEqual([...snap.toolModules], [["ta", "a"], ["tc", "c"]])
+      assert.strictEqual(yield* snap.registry.context, "## Ctx\nctx hello\n\n## Ctx\nctx hello")
+      assert.deepStrictEqual(stateOf(h.modules(), "a").status, { text: "Greeting hello", tone: "ok" })
+    }).pipe(Effect.scoped))
+
+  it.effect("enable: starting → running, intent saved, every change notified with a higher revision", () =>
+    Effect.gen(function*() {
+      const m = testModule({ startMillis: 100, enabledByDefault: false })
+      const { persistence, saves } = fakePersistence()
+      const h = yield* host([m.definition], persistence)
+      const seen: Array<ModuleInfo> = []
+      h.subscribe((info) => seen.push(info))
+      const fiber = yield* Effect.forkChild(h.enable("test"))
+      yield* advance(10)
+      assert.strictEqual(stateOf(h.modules()).state, "starting")
+      const busy = yield* h.disable("test")
+      assert.deepStrictEqual(busy.ok ? undefined : busy.error.code, "busy")
+      yield* advance(100)
+      assert.deepStrictEqual(yield* Fiber.join(fiber), { ok: true })
+      assert.deepStrictEqual(seen.map((i) => i.state), ["starting", "running"])
+      assert.isTrue(seen[1]!.revision > seen[0]!.revision)
+      assert.deepStrictEqual(saves, [{ id: "test", enabled: true, settings: {}, secrets: {} }])
+      assert.deepStrictEqual(seen[1]!.tools, [{ name: "tool", description: "tool", speculative: true }])
+    }).pipe(Effect.scoped))
+
+  it.effect("enable with invalid saved settings: error with form errors, intent saved, invalid_settings", () =>
+    Effect.gen(function*() {
+      const m = testModule({ enabledByDefault: false })
+      const { persistence, saves } = fakePersistence({ test: { enabled: false, settings: { greeting: "bad" } } })
+      const h = yield* host([m.definition], persistence)
+      const result = yield* h.enable("test")
+      assert.isFalse(result.ok)
+      if (!result.ok) {
+        assert.strictEqual(result.error.code, "invalid_settings")
+        assert.deepStrictEqual(result.error.fieldErrors, [{ key: "greeting", message: "The saved value is not valid (Not this one); save a new one" }])
+      }
+      const info = stateOf(h.modules())
+      assert.deepStrictEqual([info.enabled, info.state], [true, "error"])
+      assert.match(info.error!, /not valid/)
+      assert.strictEqual(saves.at(-1)!.enabled, true)
+      assert.strictEqual(m.probe.starts, 0)
+    }).pipe(Effect.scoped))
+
+  it.effect("a failing start: error with its message, module_start_failed; enabling again retries", () =>
+    Effect.gen(function*() {
+      const m = testModule({ fail: "The token was rejected (HTTP 401)", enabledByDefault: false })
+      const { persistence } = fakePersistence()
+      const h = yield* host([m.definition], persistence)
+      const result = yield* h.enable("test")
+      assert.deepStrictEqual(result, { ok: false, error: { code: "module_start_failed", message: "The token was rejected (HTTP 401)", moduleId: "test" } })
+      assert.deepStrictEqual([stateOf(h.modules()).state, stateOf(h.modules()).error], ["error", "The token was rejected (HTTP 401)"])
+      yield* h.enable("test")
+      assert.strictEqual(m.probe.starts, 2)
+    }).pipe(Effect.scoped))
+
+  it.effect("a start that takes longer than 10 s fails", () =>
+    Effect.gen(function*() {
+      const m = testModule({ startMillis: 60_000, enabledByDefault: false })
+      const { persistence } = fakePersistence()
+      const h = yield* host([m.definition], persistence)
+      const fiber = yield* Effect.forkChild(h.enable("test"))
+      yield* advance(10_000)
+      const result = yield* Fiber.join(fiber)
+      assert.strictEqual(result.ok ? "" : result.error.message, "Did not start within 10 s")
+      assert.strictEqual(stateOf(h.modules()).state, "error")
+    }).pipe(Effect.scoped))
+
+  it.effect("a tool name used by another running module: error, module_start_failed, scope closed", () =>
+    Effect.gen(function*() {
+      const a = testModule({ id: "a", tool: "same" })
+      const b = testModule({ id: "b", tool: "same", enabledByDefault: false })
+      const { persistence } = fakePersistence()
+      const h = yield* host([a.definition, b.definition], persistence)
+      yield* h.startEnabled
+      const result = yield* h.enable("b")
+      assert.strictEqual(result.ok ? "" : result.error.message, "Tool name \"same\" is already used by module A")
+      assert.strictEqual(stateOf(h.modules(), "b").state, "error")
+      assert.strictEqual(b.probe.closes, 1)
+      assert.deepStrictEqual(h.snapshot().registry.specs.map((s) => s.name), ["same"])
+    }).pipe(Effect.scoped))
+
+  it.effect("disable: leaves the snapshot at once; a tool call in flight finishes; the scope closes after the grace period", () =>
+    Effect.gen(function*() {
+      const m = testModule({ toolMillis: 3_000 })
+      const { persistence, saves } = fakePersistence()
+      const h = yield* host([m.definition], persistence)
+      yield* h.startEnabled
+      const turnSnapshot = h.snapshot() // a turn in flight holds this
+      const call = yield* Effect.forkChild(turnSnapshot.registry.run({ id: "1", name: "tool", input: {} }))
+      yield* advance(10)
+      assert.deepStrictEqual(yield* h.disable("test"), { ok: true })
+      assert.deepStrictEqual(h.snapshot().registry.specs, [])
+      assert.strictEqual(stateOf(h.modules()).state, "stopping")
+      assert.deepStrictEqual(saves.at(-1)!.enabled, false)
+      yield* advance(3_000)
+      const result = yield* Fiber.join(call)
+      assert.deepStrictEqual([result.isError, result.content], [false, "hello"])
+      assert.strictEqual(m.probe.closes, 0, "still in its grace period")
+      yield* advance(7_000)
+      assert.strictEqual(m.probe.closes, 1)
+      assert.strictEqual(stateOf(h.modules()).state, "disabled")
+    }).pipe(Effect.scoped))
+
+  it.effect("reconfigure while running: the new instance replaces the old one, a running tool call finishes on the old one", () =>
+    Effect.gen(function*() {
+      const m = testModule({ toolMillis: 1_000 })
+      const { persistence, saves } = fakePersistence()
+      const h = yield* host([m.definition], persistence)
+      yield* h.startEnabled
+      const call = yield* Effect.forkChild(h.snapshot().registry.run({ id: "1", name: "tool", input: {} }))
+      yield* advance(10)
+      const result = yield* h.configure("test", { values: { greeting: "hi" }, secrets: {} })
+      assert.deepStrictEqual(result, { ok: true })
+      assert.deepStrictEqual(h.snapshot().instructions, ["Say hi."])
+      yield* advance(1_000)
+      assert.strictEqual((yield* Fiber.join(call)).content, "hello", "the old instance served the call")
+      assert.deepStrictEqual(saves.at(-1)!.settings, { greeting: "hi" })
+      yield* Effect.yieldNow
+      assert.deepStrictEqual(stateOf(h.modules()).status, { text: "Greeting hi", tone: "ok" })
+      assert.deepStrictEqual(stateOf(h.modules()).settings.values.greeting, "hi")
+      assert.strictEqual(m.probe.closes, 0)
+      yield* advance(10_000)
+      assert.strictEqual(m.probe.closes, 1, "the old instance closed after the grace period")
+    }).pipe(Effect.scoped))
+
+  it.effect("reconfigure that fails to start keeps the old instance and does not save", () =>
+    Effect.gen(function*() {
+      const m = testModule({})
+      const { persistence, saves } = fakePersistence()
+      const h = yield* host([m.definition], persistence)
+      yield* h.startEnabled
+      const result = yield* h.configure("test", { values: { greeting: "fail" }, secrets: {} })
+      assert.strictEqual(result.ok ? "" : result.error.code, "module_start_failed")
+      assert.strictEqual(stateOf(h.modules()).state, "running")
+      assert.deepStrictEqual(h.snapshot().instructions, ["Say hello."])
+      assert.deepStrictEqual(stateOf(h.modules()).settings.values.greeting, "hello")
+      assert.deepStrictEqual(saves, [])
+    }).pipe(Effect.scoped))
+
+  it.effect("an invalid patch changes nothing; a locked field is refused", () =>
+    Effect.gen(function*() {
+      const m = testModule({})
+      const { persistence, saves } = fakePersistence()
+      const h = yield* host([m.definition], persistence, { TEST_TOKEN: "from-env" })
+      yield* h.startEnabled
+      const bad = yield* h.configure("test", { values: { greeting: "bad" }, secrets: { token: "x" } })
+      assert.deepStrictEqual(bad.ok ? [] : bad.error.fieldErrors, [
+        { key: "greeting", message: "Not this one" },
+        { key: "token", message: "Set by TEST_TOKEN in the environment; change it there" }
+      ])
+      assert.deepStrictEqual(saves, [])
+      assert.deepStrictEqual(stateOf(h.modules()).settings.secrets, { token: { set: true, source: "env" } })
+    }).pipe(Effect.scoped))
+
+  it.effect("reconfigure while disabled saves without starting; while in error it saves and starts", () =>
+    Effect.gen(function*() {
+      const m = testModule({ enabledByDefault: false })
+      const { persistence, saves } = fakePersistence({ test: { enabled: true, settings: { greeting: "fail" } } })
+      const h = yield* host([m.definition], persistence)
+      yield* h.startEnabled
+      assert.strictEqual(stateOf(h.modules()).state, "error")
+      const fixed = yield* h.configure("test", { values: { greeting: "ok now" }, secrets: { token: "secret" } })
+      assert.deepStrictEqual(fixed, { ok: true })
+      assert.strictEqual(stateOf(h.modules()).state, "running")
+      assert.deepStrictEqual(saves.at(-1), { id: "test", enabled: true, settings: { greeting: "ok now" }, secrets: { token: "secret" } })
+      yield* h.disable("test")
+      yield* h.configure("test", { values: { greeting: "later" }, secrets: {} })
+      assert.strictEqual(m.probe.starts, 2)
+      assert.deepStrictEqual(saves.at(-1)!.settings, { greeting: "later" })
+    }).pipe(Effect.scoped))
+
+  it.effect("a context provider slower than 50 ms contributes nothing to that turn", () =>
+    Effect.gen(function*() {
+      const m = testModule({ contextMillis: 200 })
+      const { persistence } = fakePersistence()
+      const h = yield* host([m.definition], persistence)
+      yield* h.startEnabled
+      const fiber = yield* Effect.forkChild(h.snapshot().registry.context)
+      yield* advance(50)
+      assert.strictEqual(yield* Fiber.join(fiber), "")
+    }).pipe(Effect.scoped))
+
+  it.effect("unknown module; shutdown closes every instance without grace", () =>
+    Effect.gen(function*() {
+      const m = testModule({})
+      const { persistence } = fakePersistence()
+      yield* Effect.scoped(Effect.gen(function*() {
+        const h = yield* host([m.definition], persistence)
+        yield* h.startEnabled
+        const unknown = yield* h.enable("nope")
+        assert.strictEqual(unknown.ok ? "" : unknown.error.code, "unknown_module")
+        yield* h.configure("test", { values: { greeting: "two" }, secrets: {} }) // one instance in its grace period
+      }))
+      assert.strictEqual(m.probe.closes, 2)
+    }))
+})

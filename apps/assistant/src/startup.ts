@@ -31,19 +31,29 @@ export const describeStartFailure = (error: Config.ConfigError | ProviderStartEr
 export const buildProviders = Effect.fnUntraced(function*(
   stages: ReadonlyArray<{ readonly stage: string; readonly layer: Layer.Layer<any, Config.ConfigError | ProviderStartError> }>
 ): Effect.fn.Return<Context.Context<any>, StartupError, Scope.Scope> {
-  let context = Context.empty() as Context.Context<any>
-  const problems: Array<string> = []
-  for (const { layer, stage } of stages) {
-    const built = yield* Effect.result(Layer.build(layer))
-    if (Result.isSuccess(built)) context = Context.merge(context, built.success)
-    else problems.push(`  ${stage}: ${describeStartFailure(built.failure)}`)
-  }
+  const { context, problems } = yield* buildStages(stages)
   if (problems.length > 0) {
     return yield* new StartupError({
-      message: `Cannot start (settings go in the environment or in .env; see .env.example):\n${problems.join("\n")}`
+      message: `Cannot start (settings go in the environment or in .env; see .env.example):\n${
+        problems.map((p) => `  ${p.stage}: ${p.message}`).join("\n")
+      }`
     })
   }
   return context
+})
+
+/** Like `buildProviders`, but returns the problems per stage instead of failing (serve mode shows them in the UI). */
+export const buildStages = Effect.fnUntraced(function*(
+  stages: ReadonlyArray<{ readonly stage: string; readonly layer: Layer.Layer<any, Config.ConfigError | ProviderStartError> }>
+): Effect.fn.Return<{ readonly context: Context.Context<any>; readonly problems: ReadonlyArray<{ readonly stage: string; readonly message: string }> }, never, Scope.Scope> {
+  let context = Context.empty() as Context.Context<any>
+  const problems: Array<{ readonly stage: string; readonly message: string }> = []
+  for (const { layer, stage } of stages) {
+    const built = yield* Effect.result(Layer.build(layer))
+    if (Result.isSuccess(built)) context = Context.merge(context, built.success)
+    else problems.push({ stage, message: describeStartFailure(built.failure) })
+  }
+  return { context, problems }
 })
 
 /**
