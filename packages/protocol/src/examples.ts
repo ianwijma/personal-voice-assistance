@@ -8,7 +8,25 @@ import { PROTOCOL_VERSION } from "./constants.ts"
 import type { ServerMessage, ServerMessageType } from "./server.ts"
 import type { EnvInfo } from "./env.ts"
 import type { JobInfo, ModelSet } from "./jobs.ts"
-import type { ModuleInfo, SettingsSection, Snapshot, TraceInfo } from "./snapshot.ts"
+import {
+  DEFAULT_DEVICE_PROFILE,
+  DEVICE_EDITABLE_FIELDS,
+  type DeviceInfo,
+  type DeviceProfile,
+  effectiveProfile,
+  type FrontendKindInfo,
+  PROFILE_FIELDS,
+  WEB_VOICE_KIND
+} from "./frontends.ts"
+import {
+  type AdminSnapshot,
+  engineSummary,
+  type EngineStatus,
+  type ModuleInfo,
+  type SettingsSection,
+  type Snapshot,
+  type TraceInfo
+} from "./snapshot.ts"
 
 export const exampleWeatherModule: ModuleInfo = {
   id: "weather",
@@ -255,61 +273,108 @@ export const exampleJob: JobInfo = {
   startedAt: 1_763_100_000_000
 }
 
+export const exampleEngineStatus: EngineStatus = {
+  state: "ready",
+  problems: [],
+  reloadPending: false,
+  reloadPendingFor: [],
+  engines: [
+    { stage: "llm", provider: "anthropic", detail: "claude-haiku-5-5", location: "hosted" },
+    { stage: "stt", provider: "sherpa", detail: "nemotron-3.5", location: "local" },
+    { stage: "tts", provider: "sherpa", detail: "Piper en_US-lessac-medium", location: "local" }
+  ],
+  voices: [
+    {
+      name: "standard",
+      description: "Everyday answers: quick and clear.",
+      enabled: true,
+      isDefault: true,
+      engine: "Piper en_US-lessac-medium",
+      location: "local"
+    },
+    {
+      name: "natural",
+      description: "Longer replies where warmth matters.",
+      enabled: true,
+      isDefault: false,
+      engine: "Kokoro af_heart",
+      location: "local"
+    }
+  ]
+}
+
+export const exampleProfile: DeviceProfile = {
+  ...DEFAULT_DEVICE_PROFILE,
+  activation: "wake-phrase",
+  voice: "natural",
+  interruptMode: "instant"
+}
+
+export const exampleFrontend: FrontendKindInfo = {
+  id: WEB_VOICE_KIND,
+  title: "Voice assistant in a browser",
+  description: "The voice front end on a phone, tablet or computer.",
+  fields: PROFILE_FIELDS,
+  defaults: { activation: "wake-phrase", wakePhrases: ["hey jeff", "hey jev", "hey geoff", "hey go"] },
+  profile: effectiveProfile({ activation: "wake-phrase", wakePhrases: ["hey jeff", "hey jev", "hey geoff", "hey go"] })
+}
+
+export const exampleDevice: DeviceInfo = {
+  id: "d-5c1e0b7a42",
+  kind: WEB_VOICE_KIND,
+  name: "iPhone · Safari",
+  firstSeen: 1_763_000_000_000,
+  lastSeen: 1_763_100_000_000,
+  overrides: { voice: "natural", interruptMode: "instant" },
+  profile: effectiveProfile(exampleFrontend.defaults, { voice: "natural", interruptMode: "instant" }),
+  connections: 1,
+  audioOwner: true
+}
+
+/** The voice part, as a voice connection that owns the audio gets it. */
 export const exampleSnapshot: Snapshot = {
   state: "listening",
   role: "owner",
   ownerPresent: true,
-  engine: {
-    state: "ready",
-    problems: [],
-    reloadPending: false,
-    reloadPendingFor: [],
-    engines: [
-      { stage: "llm", provider: "anthropic", detail: "claude-haiku-5-5", location: "hosted" },
-      { stage: "stt", provider: "sherpa", detail: "nemotron-3.5", location: "local" },
-      { stage: "tts", provider: "sherpa", detail: "Piper en_US-lessac-medium", location: "local" }
-    ],
-    voices: [
-      {
-        name: "standard",
-        description: "Everyday answers: quick and clear.",
-        enabled: true,
-        isDefault: true,
-        engine: "Piper en_US-lessac-medium",
-        location: "local"
-      },
-      {
-        name: "natural",
-        description: "Longer replies where warmth matters.",
-        enabled: true,
-        isDefault: false,
-        engine: "Kokoro af_heart",
-        location: "local"
-      }
-    ]
-  },
-  modules: [exampleWeatherModule, exampleHomeAssistantModule],
-  sections: [exampleVoiceSection, exampleSpeechEngineSection],
+  engine: engineSummary(exampleEngineStatus),
   history: [
     { role: "user", text: "What's the weather like?" },
     { role: "assistant", text: "Light rain in Amsterdam, 7 degrees.", interrupted: false, tools: [{ name: "weather", ok: true }] },
     { role: "user", text: "Tell me a long story" },
     { role: "assistant", text: "Once upon a time,", interrupted: true, tools: [] }
   ],
+  device: { deviceId: exampleDevice.id, profile: exampleDevice.profile, editable: DEVICE_EDITABLE_FIELDS },
+  admin: { enabled: true, loggedIn: false }
+}
+
+/** The admin part, as `admin.snapshot` carries it. */
+export const exampleAdminSnapshot: AdminSnapshot = {
+  engine: exampleEngineStatus,
+  modules: [exampleWeatherModule, exampleHomeAssistantModule],
+  sections: [exampleVoiceSection, exampleSpeechEngineSection],
   traces: [exampleTrace],
   vault: { state: "unlocked", admin: true, location: "/home/owner/.config/pva/vault.enc" },
   env: exampleEnv,
   models: exampleModels,
-  jobs: [exampleJob]
+  jobs: [exampleJob],
+  frontends: [exampleFrontend],
+  devices: [exampleDevice]
 }
 
 const audio = { contextSampleRate: 48_000, baseLatencyMs: 10, outputLatencyMs: 21.3, echoCancellation: true, outputPath: "direct" } as const
 
 export const clientExamples: { readonly [T in ClientMessageType]: Extract<ClientMessage, { readonly type: T }> } = {
-  "hello": { type: "hello", protocol: PROTOCOL_VERSION, clientId: "c-7f3a9b21", resumeOwner: false },
-  "audio.claim": { type: "audio.claim", interruptMode: "confirm", audio },
+  "hello": {
+    type: "hello",
+    protocol: PROTOCOL_VERSION,
+    clientId: "c-7f3a9b21",
+    resumeOwner: false,
+    frontend: "voice",
+    device: { id: "d-5c1e0b7a42", kind: WEB_VOICE_KIND, name: "iPhone · Safari" }
+  },
+  "audio.claim": { type: "audio.claim", audio },
   "audio.release": { type: "audio.release" },
-  "audio.config": { type: "audio.config", interruptMode: "instant", audio },
+  "audio.config": { type: "audio.config", audio: { ...audio, outputPath: "element" } },
   "mic.state": { type: "mic.state", live: false },
   "playback.started": { type: "playback.started", turnId: 12, outputLatencyMs: 21.3, startDelayMs: 0 },
   "playback.progress": { type: "playback.progress", turnId: 12, playedSamples: 11_025, underruns: 0 },
@@ -341,7 +406,37 @@ export const clientExamples: { readonly [T in ClientMessageType]: Extract<Client
   "job.start": { type: "job.start", requestId: "r12", tool: "stt-models", action: "download", target: "whisper-turbo" },
   "job.cancel": { type: "job.cancel", requestId: "r13", jobId: "job-3" },
   "model.delete": { type: "model.delete", requestId: "r14", tool: "tts-models", target: "nl_NL-pim-medium" },
+  "admin.login": { type: "admin.login", requestId: "r15", password: "correct horse battery" },
+  "admin.logout": { type: "admin.logout", requestId: "r16" },
+  "device.update": { type: "device.update", requestId: "r17", patch: { activation: "wake-phrase", followUpSeconds: 12, voice: null } },
+  "frontend.update": {
+    type: "frontend.update",
+    requestId: "r18",
+    kind: WEB_VOICE_KIND,
+    patch: { wakePhrases: ["hey jeff", "hey jev", "hey geoff", "hey go"], wakeMatch: "close", prebufferMs: null }
+  },
+  "device.admin.update": { type: "device.admin.update", requestId: "r19", id: "d-5c1e0b7a42", name: "Kitchen phone", patch: { interruptMode: "instant" } },
+  "device.forget": { type: "device.forget", requestId: "r20", id: "d-5c1e0b7a42" },
+  "wake.test": { type: "wake.test", requestId: "r21", on: true },
   "ping": { type: "ping", id: 41 }
+}
+
+/** The `result` of a successful `admin.login`. */
+export const exampleLoginResult: Extract<ServerMessage, { readonly type: "result" }> = {
+  type: "result",
+  requestId: "r15",
+  ok: true,
+  admin: { token: "q2Vx8m0rJ3cW5yT1bN7dK9fH4gL6pZ2aS8eU0iO3wQk", expiresAt: 1_763_143_200_000 }
+}
+
+/** An admin front end's `hello` with a session token from an earlier login. */
+export const exampleAdminHello: Extract<ClientMessage, { readonly type: "hello" }> = {
+  type: "hello",
+  protocol: PROTOCOL_VERSION,
+  clientId: "c-a0d1e2f3",
+  resumeOwner: false,
+  frontend: "admin",
+  adminToken: "q2Vx8m0rJ3cW5yT1bN7dK9fH4gL6pZ2aS8eU0iO3wQk"
 }
 
 export const serverExamples: { readonly [T in ServerMessageType]: Extract<ServerMessage, { readonly type: T }> } = {
@@ -373,7 +468,7 @@ export const serverExamples: { readonly [T in ServerMessageType]: Extract<Server
   "reply.stop": { type: "reply.stop", turnId: 12 },
   "module.changed": { type: "module.changed", module: exampleHomeAssistantModule },
   "section.changed": { type: "section.changed", section: exampleSpeechEngineSection },
-  "engine": { type: "engine", engine: { ...exampleSnapshot.engine, state: "ready", reloadPending: true, reloadPendingFor: ["speech/engine"] } },
+  "engine": { type: "engine", engine: { ...exampleEngineStatus, state: "ready", reloadPending: true, reloadPendingFor: ["speech/engine"] } },
   "vault": {
     type: "vault",
     vault: { state: "locked", admin: false, location: "/home/owner/.config/pva/vault.enc", retryAfterMs: 30_000, lockReason: "manual" }
@@ -393,5 +488,13 @@ export const serverExamples: { readonly [T in ServerMessageType]: Extract<Server
     }
   },
   "error": { type: "error", error: { code: "turn_failed", message: "The language model did not answer in time.", turnId: 12 } },
+  "engine.summary": { type: "engine.summary", engine: engineSummary(exampleEngineStatus) },
+  "admin.state": { type: "admin.state", admin: { enabled: true, loggedIn: true, expiresAt: 1_763_143_200_000 } },
+  "admin.snapshot": { type: "admin.snapshot", snapshot: exampleAdminSnapshot },
+  "device.profile": { type: "device.profile", deviceId: "d-5c1e0b7a42", profile: exampleProfile, editable: DEVICE_EDITABLE_FIELDS },
+  "frontends": { type: "frontends", frontends: [exampleFrontend] },
+  "devices": { type: "devices", devices: [exampleDevice] },
+  "wake": { type: "wake", phrase: "hey jeff", armed: true },
+  "wake.heard": { type: "wake.heard", text: "Hey go, what time is it?", at: 1_763_100_001_000 },
   "pong": { type: "pong", id: 41 }
 }

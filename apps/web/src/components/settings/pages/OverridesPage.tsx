@@ -59,7 +59,7 @@ export function OverridesPage() {
               Move all to settings
             </Button>
           ) : (
-            <span className="ml-auto text-[12px] text-ink-muted"><Icon name="lock" size={13} className="inline" /> Needs edit access (Keys & access).</span>
+            <span className="ml-auto text-[12px] text-ink-muted"><Icon name="lock" size={13} className="inline" /> Needs the admin login.</span>
           )}
         </div>
       )}

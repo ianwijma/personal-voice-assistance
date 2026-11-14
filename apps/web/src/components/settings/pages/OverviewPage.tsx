@@ -83,10 +83,10 @@ export function OverviewPage() {
           <h4 className="label mb-3 text-ink-faint">Voices</h4>
           <ul className="flex flex-col divide-y divide-line/60 rounded-md border border-line">
             {engine.voices.map((v) => (
-              <li key={v.name} className={cx("flex items-start gap-3 px-3 py-2.5", !v.enabled && "opacity-55")}>
+              <li key={v.name} className="flex items-start gap-3 px-3 py-2.5">
                 <span className="min-w-0 flex-1">
                   <span className="flex items-center gap-2">
-                    <span className="text-[14px] text-ink">{v.name}</span>
+                    <span className={cx("text-[14px]", v.enabled ? "text-ink" : "text-ink-muted")}>{v.name}</span>
                     {v.isDefault && <span className="label text-[9px] text-voice">Default</span>}
                     {!v.enabled && <span className="label text-[9px] text-ink-faint">Off</span>}
                   </span>

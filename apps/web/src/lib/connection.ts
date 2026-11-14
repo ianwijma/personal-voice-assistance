@@ -2,6 +2,8 @@ import {
   type ClientMessage,
   CloseCode,
   decodeReplyFrame,
+  type DeviceHello,
+  type FrontendRole,
   decodeServerMessage,
   encodeClientMessage,
   FrameKind,
@@ -44,9 +46,20 @@ export interface ConnectionHooks {
   readonly afterWelcome?: (resumed: boolean) => void
 }
 
+/** What `hello` says about the page (protocol 5): read on every connect, so a new admin token is sent after a login. */
+export interface HelloIdentity {
+  readonly frontend: FrontendRole
+  /** Voice front end: this browser as a device. */
+  readonly device?: DeviceHello
+  /** Admin front end: the session token from `sessionStorage`, if any. */
+  readonly adminToken?: string
+}
+
 export interface ConnectionOptions {
   readonly url: string
   readonly clientId: string
+  /** Default: a voice page without a device. */
+  readonly identity?: () => HelloIdentity
   readonly store: ClientStore
   readonly audio: AudioPort
   readonly hooks?: ConnectionHooks
@@ -308,11 +321,16 @@ export const makeConnection = (options: ConnectionOptions): Connection => {
         console.error("[pva] failed to handle a message", error)
       }
     }
+    const identity = options.identity?.() ?? { frontend: "voice" as const }
     sendRaw(socket, {
       type: "hello",
       protocol: PROTOCOL_VERSION,
       clientId: options.clientId,
-      resumeOwner: wasOwner && audio.running()
+      // An admin page never owns the audio.
+      resumeOwner: identity.frontend === "voice" && wasOwner && audio.running(),
+      frontend: identity.frontend,
+      ...(identity.device !== undefined ? { device: identity.device } : {}),
+      ...(identity.adminToken !== undefined ? { adminToken: identity.adminToken } : {})
     })
     yield* Deferred.await(welcomedSignal).pipe(
       Effect.timeoutOrElse({

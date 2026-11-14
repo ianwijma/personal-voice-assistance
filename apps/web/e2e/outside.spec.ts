@@ -1,5 +1,5 @@
 import type { Page } from "@playwright/test"
-import { appUrl, expect, mock, test } from "./fixtures.ts"
+import { expect, gotoAdmin, mock, test } from "./fixtures.ts"
 
 // Settings from outside (docs/SETTINGS-UI.md §4.4, P4) and model downloads (§5.4, P7), against the mock: the
 // Overrides page with Move and Move all, Move on a locked field, a download with progress and cancel on the Models
@@ -8,7 +8,7 @@ import { appUrl, expect, mock, test } from "./fixtures.ts"
 const log = async (type: string) => (await mock.log()).messages.filter((m) => m.type === type)
 
 const overrides = async (page: Page, baseURL: string | undefined) => {
-  await page.goto(appUrl(baseURL, "#settings/diagnostics/overrides"))
+  await gotoAdmin(page, baseURL, "#settings/diagnostics/overrides")
   const list = page.getByTestId("overrides")
   await expect(list).toBeVisible()
   return list
@@ -43,7 +43,7 @@ for (const size of [{ name: "desktop (1280 × 800)", viewport: { width: 1280, he
       await expect(list.locator("[data-group=movable]")).toHaveCount(0)
       await expect(page.getByTestId("move-all")).toHaveCount(0)
       // The field it locked is a saved setting now (no pin, no Move).
-      await page.goto(appUrl(baseURL, "#settings/language-model/provider"))
+      await gotoAdmin(page, baseURL, "#settings/language-model/provider")
       const key = page.getByTestId("form-s-language-model").locator("[data-field=ANTHROPIC_API_KEY]")
       await expect(key).toHaveAttribute("data-source", "saved")
       await expect(key.getByTestId("move-to-settings")).toHaveCount(0)
@@ -55,7 +55,7 @@ for (const size of [{ name: "desktop (1280 × 800)", viewport: { width: 1280, he
     })
 
     test("a field set by .env shows the file and line, and moves into the settings from there", async ({ page, baseURL }) => {
-      await page.goto(appUrl(baseURL, "#settings/language-model/provider"))
+      await gotoAdmin(page, baseURL, "#settings/language-model/provider")
       const key = page.getByTestId("form-s-language-model").locator("[data-field=ANTHROPIC_API_KEY]")
       await expect(key).toHaveAttribute("data-source", "env-file")
       await key.getByTestId("move-to-settings").click()
@@ -64,7 +64,7 @@ for (const size of [{ name: "desktop (1280 × 800)", viewport: { width: 1280, he
     })
 
     test("a download on the Models page shows progress and can be cancelled", async ({ page, baseURL }) => {
-      await page.goto(appUrl(baseURL, "#settings/speech/models"))
+      await gotoAdmin(page, baseURL, "#settings/speech/models")
       const models = page.getByTestId("models-stt-models")
       await expect(models).toContainText("3 of 5 downloaded")
       const whisper = models.locator("[data-model=whisper-turbo]")
@@ -89,12 +89,12 @@ for (const size of [{ name: "desktop (1280 × 800)", viewport: { width: 1280, he
       await expect(zip).toHaveAttribute("data-state", "missing")
       await expect(models).toContainText("2 of 5 downloaded")
       // Voices › Models is its own page (same id, other category).
-      await page.goto(appUrl(baseURL, "#settings/voices/models"))
+      await gotoAdmin(page, baseURL, "#settings/voices/models")
       await expect(page.getByTestId("models-tts-models").locator("[data-model=nl_NL-pim-medium]")).toHaveAttribute("data-state", "missing")
     })
 
     test("choosing a recogniser that is not downloaded offers Download and holds Save until it is there", async ({ page, baseURL }) => {
-      await page.goto(appUrl(baseURL, "#settings/speech/engine"))
+      await gotoAdmin(page, baseURL, "#settings/speech/engine")
       const form = page.getByTestId("form-s-stt-engine")
       await form.locator("[data-field=STT_SHERPA_MODEL] select").selectOption("parakeet-ultra")
       const inline = form.getByTestId("inline-download")
@@ -113,18 +113,17 @@ for (const size of [{ name: "desktop (1280 × 800)", viewport: { width: 1280, he
   })
 }
 
-test.describe("without edit access", () => {
+test.describe("with the keys locked", () => {
   test.beforeEach(async () => {
     await mock.scenario("keys-locked")
   })
 
-  test("Move, Download and Delete are not offered (the server refuses them as well: apps/assistant tests)", async ({ page, baseURL }) => {
+  test("a key cannot move until the vault is unlocked; downloads need no keys", async ({ page, baseURL }) => {
     const list = await overrides(page, baseURL)
-    await expect(list).toContainText("Needs edit access")
-    await expect(list.getByRole("button", { name: /Move/ })).toHaveCount(0)
-    await page.goto(appUrl(baseURL, "#settings/speech/models"))
+    await expect(list).toContainText("keys can move once it is unlocked")
+    await expect(list).not.toContainText("Needs the admin login") // a logged-in admin may change everything
+    await gotoAdmin(page, baseURL, "#settings/speech/models")
     const whisper = page.getByTestId("models-stt-models").locator("[data-model=whisper-turbo]")
-    await expect(whisper).toContainText("A page with edit access can download it")
-    await expect(whisper.getByRole("button")).toHaveCount(0)
+    await expect(whisper.getByRole("button", { name: /Download/ })).toBeVisible()
   })
 })

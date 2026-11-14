@@ -18,4 +18,4 @@ export interface FieldProps<F extends SettingField = SettingField> {
 }
 
 export const inputClass =
-  "h-10 w-full rounded-md border border-line bg-surface-2/60 px-3 text-[14px] text-ink outline-none transition-colors duration-[120ms] placeholder:text-ink-faint hover:border-ink-faint/60 focus-visible:border-ink-faint disabled:cursor-not-allowed disabled:opacity-60 aria-[invalid=true]:border-danger/70"
+  "h-10 w-full rounded-md border border-line bg-surface-2/60 px-3 text-base text-ink transition-colors sm:text-[14px] duration-[120ms] placeholder:text-ink-faint hover:border-ink-faint/60 focus-visible:border-you disabled:cursor-not-allowed disabled:opacity-60 aria-[invalid=true]:border-danger/70"

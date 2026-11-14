@@ -6,20 +6,32 @@
  * and records every message. Plain Node + `ws` + `@pva/protocol`.
  */
 import {
+  type AdminSnapshot,
   type ClientMessage,
   decodeReplyFrame,
   decodeServerMessage,
+  type DeviceHello,
   encodeClientMessage,
   encodeMicFrame,
-  type InterruptMode,
+  type FrontendRole,
   MIC_FRAME_SAMPLES,
   PROTOCOL_VERSION,
   type ServerMessage,
   type ServerMessageOf,
   type ServerMessageType,
+  WEB_VOICE_KIND,
   WS_PATH
 } from "@pva/protocol"
 import { randomUUID } from "node:crypto"
+
+/** What an admin page has after logging in: the voice `welcome` and the `admin.snapshot`, and its session token. */
+export interface AdminWelcome {
+  readonly welcome: ServerMessageOf<"welcome">
+  readonly snapshot: AdminSnapshot
+  readonly token: string
+}
+
+let requestCounter = 0
 import WebSocket from "ws"
 
 export interface PlayerOptions {
@@ -43,6 +55,8 @@ export interface ScriptedClientOptions {
   readonly url: string
   readonly origin?: string
   readonly clientId?: string
+  /** The device this voice page says it is (default: one per client, `dev-<random>`, kind `web-voice`). */
+  readonly deviceId?: string
   readonly player?: PlayerOptions
 }
 
@@ -63,6 +77,7 @@ export class ScriptedClient {
   /** Reply audio received, per turn: samples. */
   readonly replySamples = new Map<number, number>()
   readonly clientId: string
+  readonly device: DeviceHello
   readonly closed: Promise<{ code: number; reason: string }>
   private readonly waiters: Array<{ match: (m: ServerMessage) => boolean; resolve: (m: ServerMessage) => void; from: number }> = []
   private reply: Reply | undefined
@@ -76,6 +91,7 @@ export class ScriptedClient {
   private constructor(ws: WebSocket, options: ScriptedClientOptions) {
     this.ws = ws
     this.clientId = options.clientId ?? `client-${randomUUID()}`
+    this.device = { id: options.deviceId ?? `dev-${randomUUID()}`, kind: WEB_VOICE_KIND, name: "Test browser" }
     this.player = {
       enabled: options.player?.enabled ?? true,
       speed: options.player?.speed ?? 1,
@@ -116,15 +132,55 @@ export class ScriptedClient {
     this.ws.send(data)
   }
 
-  async hello(options: { readonly resumeOwner?: boolean; readonly protocol?: number } = {}): Promise<ServerMessageOf<"welcome">> {
-    this.send({ type: "hello", protocol: options.protocol ?? PROTOCOL_VERSION, clientId: this.clientId, resumeOwner: options.resumeOwner ?? false })
+  /**
+   * Say hello. Default: a voice page with this client's `device` (`device: false` sends none). `frontend: "admin"`
+   * sends no device, and `adminToken` when given.
+   */
+  async hello(options: {
+    readonly resumeOwner?: boolean
+    readonly protocol?: number
+    readonly frontend?: FrontendRole
+    readonly device?: DeviceHello | false
+    readonly adminToken?: string
+  } = {}): Promise<ServerMessageOf<"welcome">> {
+    const frontend = options.frontend ?? "voice"
+    const device = frontend === "voice" && options.device !== false ? options.device ?? this.device : undefined
+    this.send({
+      type: "hello",
+      protocol: options.protocol ?? PROTOCOL_VERSION,
+      clientId: this.clientId,
+      resumeOwner: options.resumeOwner ?? false,
+      frontend,
+      ...(device !== undefined ? { device } : {}),
+      ...(options.adminToken !== undefined ? { adminToken: options.adminToken } : {})
+    })
     return this.waitFor("welcome")
   }
 
-  async claim(interruptMode: InterruptMode = "instant"): Promise<ServerMessageOf<"session">> {
+  /** `admin.login` on this (admin) connection: the result, and after success the `admin.snapshot`. */
+  async login(password: string): Promise<{ readonly result: ServerMessageOf<"result">; readonly snapshot?: AdminSnapshot }> {
+    const requestId = `login-${++requestCounter}`
+    const from = this.messages.length
+    this.send({ type: "admin.login", requestId, password })
+    const result = await this.waitFor("result", (m) => m.requestId === requestId, { from })
+    if (!result.ok) return { result }
+    const snapshot = (await this.waitFor("admin.snapshot", () => true, { from })).snapshot
+    return { result, snapshot }
+  }
+
+  /** Hello as an admin page and log in (the usual start of a test that changes settings). */
+  async admin(password: string): Promise<AdminWelcome> {
+    const welcome = await this.hello({ frontend: "admin" })
+    const { result, snapshot } = await this.login(password)
+    if (!result.ok || snapshot === undefined || result.admin === undefined) throw new Error(`admin login failed: ${JSON.stringify(result)}`)
+    return { welcome, snapshot, token: result.admin.token }
+  }
+
+  /** Become the audio owner. The interrupt mode comes from the device profile (protocol 5). */
+  async claim(): Promise<ServerMessageOf<"session">> {
     this.seq = 0
     const from = this.messages.length
-    this.send({ type: "audio.claim", interruptMode, audio: { contextSampleRate: 48_000, outputPath: "direct", outputLatencyMs: this.player.outputLatencyMs } })
+    this.send({ type: "audio.claim", audio: { contextSampleRate: 48_000, outputPath: "direct", outputLatencyMs: this.player.outputLatencyMs } })
     return this.waitFor("session", (m) => m.role === "owner", { from })
   }
 

@@ -11,6 +11,7 @@ import { createAssistantClient } from "../src/lib/client.ts"
 import { PlayerProcessor } from "../worklets/player.js"
 import { flush, installFakeAudio, tokenFor } from "./fakeAudio.ts"
 import { alternating, contentCounts, QUANTUM, replyFrame } from "./worklets/oracle.ts"
+import { profileMessage } from "./profile.ts"
 
 const LOCAL_REPLY_ID = 0xffff_fff0
 let fake: ReturnType<typeof installFakeAudio>
@@ -91,7 +92,7 @@ describe("finding 1: an echo test of an older session never touches the session 
     const { client } = await owningClient()
     const outcome = client.echoTest().then(() => "resolved", (e: Error) => e.message)
     await vi.advanceTimersByTimeAsync(1200) // playing
-    client.setPrefs({ outputPath: "element" })
+    client.store.dispatch(profileMessage({ outputPath: "element" })) // the profile changed in admin
     await vi.advanceTimersByTimeAsync(100)
     expect(await outcome).toMatch(/interrupted/)
     expect(client.prefs.get().echoTest).toBeUndefined()
@@ -101,22 +102,31 @@ describe("finding 1: an echo test of an older session never touches the session 
   })
 })
 
-describe("finding 2: a completed microphone-processing change sends the interrupt mode in force now", () => {
+describe("finding 2 (protocol 5): a profile change reaches the running microphone; the interrupt mode is the server's", () => {
   beforeEach(() => {
     fake = installFakeAudio()
     wakeLock()
   })
 
-  it("confirm; processing changed; instant chosen while the microphone reopens; granted: audio.config says instant", async () => {
+  it("processing changed in the profile: the microphone re-opens with it, then audio.config (without a mode) is sent", async () => {
     const { client, sent } = await owningClient()
-    expect(client.prefs.get().interruptMode).toBe("confirm")
-    client.setPrefs({ echoCancellation: false })
-    client.setPrefs({ interruptMode: "instant" })
-    fake.pending.at(-1)!.resolve()
+    client.store.dispatch(profileMessage({ echoCancellation: false }))
+    client.store.dispatch(profileMessage({ echoCancellation: false, interruptMode: "instant" }))
+    const reopened = fake.pending.at(-1)!
+    expect((reopened.constraints.audio as MediaTrackConstraints).echoCancellation).toBe(false)
+    reopened.resolve()
     await flush()
     const configs = sent.filter((m) => m.type === "audio.config")
-    expect(configs.at(-1)?.interruptMode).toBe("instant")
-    expect(configs.every((m) => m.interruptMode === "instant")).toBe(true)
+    expect(configs.length).toBeGreaterThan(0)
+    expect(configs.every((m) => !("interruptMode" in m))).toBe(true)
+  })
+
+  it("an unchanged profile (another field) does not re-open the microphone", async () => {
+    const { client } = await owningClient()
+    const before = fake.pending.length
+    client.store.dispatch(profileMessage({ captions: false }))
+    await flush()
+    expect(fake.pending.length).toBe(before)
   })
 })
 

@@ -22,8 +22,22 @@
  * `snapshot.env`; jobs (`job.start`, `job.cancel`, `model.delete`, `job`, `models`, `snapshot.jobs`,
  * `snapshot.models`, closed sets `ToolId` / `JobState` / `JobPhase`); `locked.file` / `locked.line`;
  * `ChoiceOption.download`.
+ *
+ * 5: front ends, admin and activation (docs/FRONTENDS-AND-ACTIVATION.md §4): `hello.frontend` (required),
+ * `hello.device`, `hello.adminToken`; the welcome snapshot is role-shaped (the voice part for everyone: state, role,
+ * history, `EngineSummary`, `device`, `admin`) and the admin part is its own message `admin.snapshot`, sent only to
+ * admin connections (after login, so logging in needs no reconnect); `engine` (full status) goes to admin
+ * connections and `engine.summary` to everyone; `admin.login` (its `result` carries `admin: AdminSession`),
+ * `admin.logout`, `admin.state`, error codes `admin_required` and `unknown_device`; every settings, module, vault,
+ * job, model and `.env` request is admin only; device profiles (`frontends.ts`): `device.profile`, `device.update`,
+ * `frontend.update`, `device.admin.update`, `device.forget`, `frontends`, `devices`; activation: `AssistantState`
+ * `asleep`, `wake`, the phrase tester `wake.test` / `wake.heard`; `audio.claim` / `audio.config` lose
+ * `interruptMode` (it is a profile field now). `EngineSummary.state` (the engines' state without the problems) was
+ * added during integration, within version 5 (server and web ship together). `wake.heard.accepted` (whether the
+ * utterance was taken, so the tester can tell "answered without a phrase" from "ignored") was added in UI review
+ * round 2, also within version 5 and optional: a page that gets a message without it says only "No phrase matched".
  */
-export const PROTOCOL_VERSION = 4
+export const PROTOCOL_VERSION = 5
 
 /** Path of the WebSocket endpoint, on the same origin as the UI in production. */
 export const WS_PATH = "/ws"

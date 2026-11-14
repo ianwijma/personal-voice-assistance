@@ -23,7 +23,22 @@
  *                   password is set (vault.setup), then only by pages that typed it. Lock / unlock / change password work.
  *   keys-locked     a vault exists (password "correct horse battery") and is locked, so the engines failed;
  *                   unlocking reloads them.
- * In every scenario the vault starts as "none" (everyone may change everything) unless the scenario says otherwise.
+ *   wake            like voice, but the web-voice default is the wake phrase: after a claim the assistant is asleep;
+ *                   "hey go …" is ignored (a tester line), then "hey jeff" alone wakes it (`wake`, armed) and the voice
+ *                   turn follows; after the reply the follow-up window, then asleep again. Devices are seeded.
+ *   devices         like typed, with two remembered devices (one with overrides) besides the ones that connect.
+ *   long-phrase     like typed, with a six-word wake phrase ("hello my personal voice assistant please") as the
+ *                   web-voice default (asleep after a claim) and a third device that has it among three phrases.
+ *   admin-disabled  no admin password: `admin.state.enabled` is false and every login is refused.
+ *   admin-backoff   every wrong admin password refuses logins for 30 s.
+ * In every scenario the vault starts as "none" (no vault yet) unless the scenario says otherwise.
+ *
+ * Protocol 5 (docs/FRONTENDS-AND-ACTIVATION.md): pages say `frontend: "voice" | "admin"` in hello. The admin
+ * password is ADMIN_PASSWORD below ("admin password"); a login returns a token that a later hello may carry. The
+ * admin part (settings, modules, engine status, vault, env, models, jobs, traces, front ends, devices) goes to
+ * admin connections only, and every change needs one (`admin_required` otherwise). Voice pages get the voice part,
+ * `engine.summary`, their device profile (`device.profile`, live), and `wake`. Admin pages that switched the
+ * tester on get `wake.heard`.
  *
  * Every scenario also has settings from a fake .env (Diagnostics › Settings from outside: Move works, keys are refused
  * while the vault is locked) and model downloads (Speech recognition › Models, Voices › Models: a download takes
@@ -31,16 +46,36 @@
  *
  * Control endpoints (for tests): GET /mock/log (client messages and microphone stats), POST /mock/reset,
  * POST /mock/turn (run the scripted voice turn now), POST /mock/send {"messages": [ServerMessage…]} (broadcast),
- * POST /mock/drop (terminate every socket), POST /mock/offline {"ms": 3000} (drop and refuse connections for a while).
+ * POST /mock/drop (terminate every socket), POST /mock/offline {"ms": 3000} (drop and refuse connections for a while),
+ * POST /mock/admin/end {"reason": "idle" | "expired"} (end every admin session), POST /mock/wake {"phrase", "armed"}
+ * (the owner said the wake phrase), POST /mock/heard {"text", "matched"?, "accepted"?} (a tester line; `accepted: null` leaves the field out), POST /mock/state
+ * {"state"} (set the assistant state, e.g. "asleep"), POST /mock/defaults {"patch"} (change the web-voice defaults).
  */
+import { randomBytes } from "node:crypto"
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http"
 import {
+  type AdminState,
   type ClientMessage,
   CloseCode,
+  DEFAULT_DEVICE_PROFILE,
+  DEVICE_EDITABLE_FIELDS,
+  type DeviceInfo,
+  type DeviceProfile,
+  type DeviceProfileInfo,
+  type FrontendKindInfo,
+  applyProfilePatch,
+  effectiveProfile,
+  PROFILE_FIELDS,
+  type ProfileOverrides,
+  type ProfilePatch,
+  WAKE_ARMED_MS,
+  WAKE_TEST_MAX_MS,
+  WEB_VOICE_KIND,
   decodeClientMessage,
   decodeMicFrame,
   encodeReplyFrame,
   encodeServerMessage,
+  engineSummary,
   type EngineStatus,
   type EnvInfo,
   type HistoryItem,
@@ -56,16 +91,33 @@ import {
   type ToolId,
   type TraceInfo
 } from "@pva/protocol"
-import { exampleSnapshot, exampleVoiceSection, exampleWeatherModule } from "@pva/protocol/examples"
+import { exampleEngineStatus, exampleSnapshot, exampleVoiceSection, exampleWeatherModule } from "@pva/protocol/examples"
 import { type WebSocket, WebSocketServer } from "ws"
 import type { Condition, FieldError } from "@pva/protocol"
 
 const PORT = Number(process.env.MOCK_PORT ?? 8787)
 const HOST = process.env.MOCK_HOST ?? "127.0.0.1"
-const SCENARIOS = ["voice", "typed", "modules", "engine-failed", "drop-mid-reply", "takeover", "outdated", "vault", "keys-locked"] as const
+const SCENARIOS = [
+  "voice",
+  "typed",
+  "modules",
+  "engine-failed",
+  "drop-mid-reply",
+  "takeover",
+  "outdated",
+  "vault",
+  "keys-locked",
+  "wake",
+  "devices",
+  "long-phrase",
+  "admin-disabled",
+  "admin-backoff"
+] as const
+/** The admin password of the mock (`PVA_ADMIN_PASSWORD` on the real server). */
+const ADMIN_PASSWORD = "admin password"
 const VAULT_PASSWORD = "correct horse battery"
 const VAULT_LOCATION = "/home/owner/.config/pva/vault.enc"
-const KEYS_LOCKED = "Keys are locked — unlock them in Settings → Keys & access"
+const KEYS_LOCKED = "Keys are locked — unlock them in admin → Keys & vault"
 const ENV_FILE = "/home/owner/personal-voice-assistance/.env"
 const MODELS_DIR = "/home/owner/personal-voice-assistance/models"
 /** Simulated download speed: ticks of 250 ms (MOCK_DOWNLOAD_TICKS, default 16 for the download and 6 to unpack). */
@@ -227,7 +279,7 @@ const initialSections = (): Array<SettingsSection> => [
     id: "language-model",
     title: "Provider",
     group: "agents",
-    page: { id: "provider", title: "Provider", description: "Who answers you. Changing it reloads the engines (a few seconds)." },
+    page: { id: "provider", title: "Provider", description: "Who answers you." },
     order: 10,
     protected: true,
     form: {
@@ -476,7 +528,7 @@ const withWarnings = (list: Array<SettingsSection>): Array<SettingsSection> => {
 
 /** The engines as the saved settings would build them (the language model follows LLM_PROVIDER). */
 const readyEngine = (): EngineStatus => {
-  const base = clone(exampleSnapshot.engine)
+  const base = clone(exampleEngineStatus)
   const provider = String(valueOf("LLM_PROVIDER") ?? "anthropic")
   const sub = modules.find((m) => m.id === "claude-subscription")
   const model = String(sub?.settings.values.model ?? "claude-haiku-5-5")
@@ -525,8 +577,14 @@ interface Conn {
   micFrames: number
   micGaps: number
   lastSeq: number | undefined
-  /** Typed the vault password on this connection. */
-  admin: boolean
+  /** Protocol 5: what the page said it is in hello. */
+  frontend: "voice" | "admin"
+  /** The admin session this connection is logged in with. */
+  session?: string | undefined
+  /** The device this voice connection belongs to. */
+  deviceId?: string
+  /** The phrase tester is on until then (epoch ms). */
+  testerUntil?: number | undefined
 }
 
 interface Reply {
@@ -555,7 +613,7 @@ let connSeq = 0
 let owner: Conn | undefined
 let lastOwnerClientId: string | undefined
 let claimedSince = false
-let assistantState: "idle" | "listening" | "hearing" | "thinking" | "speaking" = "idle"
+let assistantState: "idle" | "asleep" | "listening" | "hearing" | "thinking" | "speaking" = "idle"
 let micLive = true
 let modules = initialModules()
 let sections = withWarnings(initialSections())
@@ -575,6 +633,145 @@ let reply: Reply | undefined
 let scriptTimers: Array<ReturnType<typeof setTimeout>> = []
 const clientLog: Array<Record<string, unknown>> = []
 
+// ---- Admin sessions, front ends and devices (protocol 5)
+
+const sessions = new Map<string, { expiresAt: number }>()
+let loginFailures = 0
+let loginRefusedUntil = 0
+/** POST /mock/logout-fails {"on"}: the next admin.logout requests are refused (a failed log out). */
+let logoutFails = false
+const adminEnabled = () => scenario !== "admin-disabled"
+
+interface DeviceRecord {
+  id: string
+  kind: string
+  name: string
+  firstSeen: number
+  lastSeen: number
+  overrides: ProfileOverrides
+}
+const HOUR = 3_600_000
+const seededDevices = (): Map<string, DeviceRecord> => {
+  if (scenario !== "devices" && scenario !== "wake" && scenario !== "long-phrase") return new Map()
+  const now = Date.now()
+  return new Map([
+    ...(scenario === "long-phrase"
+      ? [["d-living-room-0003", { id: "d-living-room-0003", kind: WEB_VOICE_KIND, name: "Living room tablet", firstSeen: now - 20 * 24 * HOUR, lastSeen: now - 5 * 60_000, overrides: { activation: "wake-phrase", wakePhrases: [LONG_PHRASE, "hey computer", "ok house"] } }] as [string, DeviceRecord]]
+      : []),
+    ["d-kitchen-ipad-0001", { id: "d-kitchen-ipad-0001", kind: WEB_VOICE_KIND, name: "Kitchen iPad", firstSeen: now - 40 * 24 * HOUR, lastSeen: now - 2 * HOUR, overrides: { activation: "wake-phrase", followUpSeconds: 15, voice: "natural" } }],
+    ["d-pixel-phone-0002", { id: "d-pixel-phone-0002", kind: WEB_VOICE_KIND, name: "Android phone · Chrome", firstSeen: now - 9 * 24 * HOUR, lastSeen: now - 3 * 24 * HOUR, overrides: {} }]
+  ])
+}
+/** Six words: wake phrases may be this long (the UI must not cut or jump on them). */
+const LONG_PHRASE = "hello my personal voice assistant please"
+const initialKindDefaults = (): ProfileOverrides =>
+  scenario === "wake" ? { activation: "wake-phrase" } : scenario === "long-phrase" ? { activation: "wake-phrase", wakePhrases: [LONG_PHRASE] } : {}
+let devices = seededDevices()
+let kindDefaults: ProfileOverrides = initialKindDefaults()
+/** Wake-phrase windows: the armed window after the phrase alone, the follow-up window after a reply. */
+let awakeUntil = 0
+let awakeTimer: ReturnType<typeof setTimeout> | undefined
+
+const KIND_INFO = {
+  id: WEB_VOICE_KIND,
+  title: "Voice assistant in a browser",
+  description: "The voice front end opened in a browser: a phone, a tablet or a computer.",
+  fields: [...PROFILE_FIELDS]
+}
+const frontendInfos = (): Array<FrontendKindInfo> => [{ ...KIND_INFO, defaults: kindDefaults, profile: effectiveProfile(kindDefaults) }]
+const deviceProfile = (id: string | undefined): DeviceProfile => effectiveProfile(kindDefaults, id === undefined ? {} : devices.get(id)?.overrides ?? {})
+const deviceInfos = (): Array<DeviceInfo> => {
+  const now = Date.now()
+  return [...devices.values()]
+    .map((d) => {
+      const connections = [...conns].filter((c) => c.welcomed && c.deviceId === d.id).length
+      return { ...d, lastSeen: connections > 0 ? now : d.lastSeen, profile: deviceProfile(d.id), connections, audioOwner: owner?.deviceId === d.id }
+    })
+    .sort((a, b) => b.lastSeen - a.lastSeen)
+}
+const profileInfo = (c: Conn): DeviceProfileInfo =>
+  c.deviceId === undefined
+    ? { profile: effectiveProfile(kindDefaults), editable: [] }
+    : { deviceId: c.deviceId, profile: deviceProfile(c.deviceId), editable: [...DEVICE_EDITABLE_FIELDS] }
+const isAdminConn = (c: Conn) => c.session !== undefined && sessions.has(c.session)
+const adminState = (c: Conn, extra: Partial<AdminState> = {}): AdminState => {
+  const wait = loginRefusedUntil - Date.now()
+  return {
+    enabled: adminEnabled(),
+    loggedIn: isAdminConn(c),
+    ...(wait > 0 ? { retryAfterMs: wait } : {}),
+    ...(isAdminConn(c) ? { expiresAt: sessions.get(c.session!)!.expiresAt } : {}),
+    ...extra
+  }
+}
+const sendAdminSnapshot = (c: Conn) =>
+  sendTo(c, {
+    type: "admin.snapshot",
+    snapshot: { engine, modules, sections, traces: traces.slice(-20), vault: vaultInfo(c), env, models, jobs, frontends: frontendInfos(), devices: deviceInfos() }
+  })
+const pushProfiles = () => {
+  for (const c of conns) if (c.welcomed && c.frontend === "voice") sendTo(c, { type: "device.profile", ...profileInfo(c) })
+}
+const devicesChanged = () => broadcast({ type: "devices", devices: deviceInfos() })
+const frontendsChanged = () => broadcast({ type: "frontends", frontends: frontendInfos() })
+const ownerProfile = (): DeviceProfile => (owner === undefined ? DEFAULT_DEVICE_PROFILE : deviceProfile(owner.deviceId))
+const wakeMode = () => owner !== undefined && ownerProfile().activation === "wake-phrase"
+/** Keep the owner awake (no phrase needed) for `ms`; then asleep again unless something is going on. */
+const stayAwake = (ms: number) => {
+  awakeUntil = Date.now() + ms
+  if (awakeTimer !== undefined) clearTimeout(awakeTimer)
+  awakeTimer = setTimeout(() => {
+    awakeTimer = undefined
+    if (reply === undefined && (assistantState === "listening" || assistantState === "asleep")) setState(restingState())
+  }, ms + 20)
+}
+/**
+ * A tester line to admin connections that switched the tester on. `accepted` defaults to what the server's wake gate
+ * would say: matched a phrase, always listening, or inside an armed / follow-up window; `null` leaves it out (an older
+ * server).
+ */
+const sendHeard = (text: string, matched?: string, accepted?: boolean | null) => {
+  const now = Date.now()
+  const taken = accepted === undefined ? matched !== undefined || !wakeMode() || awakeUntil > now : accepted
+  for (const c of conns) {
+    if (!c.welcomed || !isAdminConn(c) || c.testerUntil === undefined || c.testerUntil < now) continue
+    sendTo(c, {
+      type: "wake.heard",
+      text,
+      ...(matched === undefined ? {} : { matched }),
+      ...(taken === null ? {} : { accepted: taken }),
+      at: now
+    })
+  }
+}
+/** The owner said the wake phrase. */
+const wakeUp = (phrase: string, armed: boolean) => {
+  broadcast({ type: "wake", phrase, armed })
+  if (!armed) return // the request came in the same sentence: a turn follows
+  stayAwake(WAKE_ARMED_MS)
+  if (reply === undefined) setState("listening")
+}
+const endSessions = (reason: "logout" | "expired" | "idle", token?: string) => {
+  for (const [t] of sessions) if (token === undefined || t === token) sessions.delete(t)
+  for (const c of conns) {
+    if (!c.welcomed || c.session === undefined || sessions.has(c.session)) continue
+    c.session = undefined
+    c.testerUntil = undefined
+    sendTo(c, { type: "admin.state", admin: adminState(c, { endReason: reason }) })
+  }
+}
+/** Admin-only request from a page that is not logged in: refused (true = refused). */
+const requireAdmin = (c: Conn, requestId: string): boolean => {
+  if (isAdminConn(c)) return false
+  result(c, requestId, false, { code: "admin_required", message: adminEnabled() ? "Log in to admin to change this." : "Admin is switched off: set PVA_ADMIN_PASSWORD in .env and restart." })
+  return true
+}
+/** The server checks every value: a voice that is not enabled falls back to "". */
+const cleanPatch = (patch: ProfilePatch): ProfilePatch => {
+  if (typeof patch.voice !== "string" || patch.voice === "") return patch
+  return engine.voices.some((v) => v.enabled && v.name === patch.voice) ? patch : { ...patch, voice: "" }
+}
+
 const resetState = () => {
   for (const t of scriptTimers) clearTimeout(t)
   scriptTimers = []
@@ -589,7 +786,16 @@ const resetState = () => {
   sections = withWarnings(initialSections())
   engine = initialEngine()
   vault = scenario === "keys-locked" ? { state: "locked", password: VAULT_PASSWORD, lockReason: "start" } : { state: "none" }
-  for (const c of conns) c.admin = false
+  // A reset is a restart: admin sessions end (a page that sends its old token gets endReason "token").
+  sessions.clear()
+  loginFailures = 0
+  loginRefusedUntil = 0
+  logoutFails = false
+  devices = seededDevices()
+  kindDefaults = initialKindDefaults()
+  awakeUntil = 0
+  if (awakeTimer !== undefined) clearTimeout(awakeTimer)
+  awakeTimer = undefined
   env = initialEnv()
   models = initialModels()
   for (const t of jobTimers.values()) clearInterval(t)
@@ -610,8 +816,21 @@ const after = (ms: number, f: () => void) => {
 const sendTo = (c: Conn, m: ServerMessage) => {
   if (c.ws.readyState === c.ws.OPEN) c.ws.send(encodeServerMessage(m))
 }
+/** Messages that carry admin data: only admin connections get them (protocol 5). */
+const ADMIN_ONLY: ReadonlySet<ServerMessage["type"]> = new Set(["engine", "module.changed", "section.changed", "vault", "env", "job", "models", "frontends", "devices", "wake.heard", "admin.snapshot"])
+let lastSummary = ""
 const broadcast = (m: ServerMessage) => {
-  for (const c of conns) if (c.welcomed) sendTo(c, m)
+  const adminOnly = ADMIN_ONLY.has(m.type)
+  for (const c of conns) if (c.welcomed && (!adminOnly || isAdminConn(c))) sendTo(c, m)
+  if (m.type === "engine") {
+    // Everyone gets the summary when it changes.
+    const summary = engineSummary(m.engine)
+    const key = JSON.stringify(summary)
+    if (key !== lastSummary) {
+      lastSummary = key
+      broadcast({ type: "engine.summary", engine: summary })
+    }
+  }
 }
 
 const setState = (state: typeof assistantState, turnId?: number) => {
@@ -781,33 +1000,28 @@ const moveFromEnv = (c: Conn, requestId: string, keys: ReadonlyArray<string>) =>
 
 // ---- Key vault and admin access (per connection)
 
-const isAdmin = (c: Conn) => vault.state === "none" || (c.admin && vault.state === "unlocked")
 const vaultInfo = (c: Conn) => ({
   state: vault.state,
-  admin: isAdmin(c),
+  // Since protocol 5: this connection is admin (the login), whatever the vault's state.
+  admin: isAdminConn(c),
   location: VAULT_LOCATION,
   ...(vault.state === "locked" && vault.lockReason !== undefined ? { lockReason: vault.lockReason } : {})
 })
 const sendVault = (c: Conn) => sendTo(c, { type: "vault", vault: vaultInfo(c) })
 const vaultChanged = () => {
-  if (vault.state !== "unlocked") for (const c of conns) c.admin = false
-  for (const c of conns) if (c.welcomed) sendVault(c)
+  for (const c of conns) if (c.welcomed && isAdminConn(c)) sendVault(c)
 }
-/** A protected change from a page without admin access is refused with `locked`. */
+/**
+ * Every change needs admin (`admin_required`); a protected item (keys, providers, agents) also needs the keys
+ * unlocked (`locked`).
+ */
 const refuseLocked = (c: Conn, requestId: string, isProtected: boolean | undefined): boolean => {
-  if (isProtected !== true || isAdmin(c)) return false
-  result(c, requestId, false, {
-    code: "locked",
-    message: vault.state === "locked"
-      ? "The keys are locked: unlock them with the password in Settings → Keys & access to change this."
-      : "Protected: type the password in Settings → Keys & access to change this."
-  })
+  if (requireAdmin(c, requestId)) return true
+  if (isProtected !== true || vault.state !== "locked") return false
+  result(c, requestId, false, { code: "locked", message: "The keys are locked: unlock them in Keys & vault to change this." })
   return true
 }
-const grantAdmin = (c: Conn) => {
-  c.admin = true
-  sendVault(c)
-}
+const grantAdmin = (c: Conn) => sendVault(c)
 const afterUnlock = () => {
   vaultChanged()
   if (engine.state === "failed" && engine.problems.some((p) => p.message === KEYS_LOCKED)) {
@@ -820,7 +1034,8 @@ const afterUnlock = () => {
   }
 }
 
-const restingState = () => (owner !== undefined && micLive ? "listening" : "idle")
+const restingState = () =>
+  owner === undefined || !micLive ? "idle" : wakeMode() && Date.now() >= awakeUntil ? "asleep" : "listening"
 
 const sessionUpdate = (reason: "claimed" | "released" | "taken_over" | "owner_disconnected" | "resumed", ownerPresentOverride?: boolean) => {
   for (const c of conns) {
@@ -896,6 +1111,11 @@ const endTurn = (r: Reply, outcome: "completed" | "interrupted" | "failed") => {
   const heard = r.spoken ? r.clauses.filter((_, i) => i <= r.playedClause || outcome === "completed").map((c) => c.text).join(" ") : r.clauses.map((c) => c.text).join("")
   history.push({ role: "assistant", text: heard, interrupted: outcome !== "completed", tools: r.tools.map((t) => ({ name: t.name, ok: true })) })
   broadcast({ type: "turn.end", turnId: r.turnId, outcome, trace })
+  if (wakeMode()) {
+    const followUp = ownerProfile().followUpSeconds * 1000
+    if (followUp > 0) stayAwake(followUp)
+    else awakeUntil = 0
+  }
   setState(restingState())
 }
 
@@ -992,7 +1212,7 @@ const runReply = (opts: {
   // Clauses go to TTS one after another, faster than real time.
   opts.clauses.forEach((text, i) => {
     r.timers.push(setTimeout(() => {
-      broadcast({ type: "assistant.text", turnId, clause: i, text, voice: "standard" })
+      broadcast({ type: "assistant.text", turnId, clause: i, text, voice: ownerProfile().voice || "standard" })
       if (c !== undefined) sendReplyAudio(c, turnId, pcms[i]!)
       if (i === opts.clauses.length - 1 && c !== undefined) sendTo(c, { type: "reply.end", turnId })
     }, t + 30 + i * 380))
@@ -1006,14 +1226,26 @@ const runVoiceTurn = () => {
   setState("hearing")
   const words = ["what's", "what's the", "what's the weather", "what's the weather in", "what's the weather in Paris"]
   words.forEach((w, i) => after(250 + i * 260, () => broadcast({ type: "transcript", text: w })))
-  after(250 + words.length * 260 + 350, () =>
+  after(250 + words.length * 260 + 350, () => {
+    sendHeard("What's the weather in Paris?", undefined, true)
     runReply({
       source: "voice",
       userText: "What's the weather in Paris?",
       clauses: VOICE_CLAUSES,
       spoken: true,
       tool: { name: "weather", moduleId: "weather", input: { place: "Paris, France" }, ms: 241 }
-    }))
+    })
+  })
+}
+
+/** The wake scenario after a claim: asleep; a line it ignores; the phrase alone; then the voice turn. */
+const runWakeScript = () => {
+  after(2500, () => sendHeard("Hey go, what's the weather?"))
+  after(4000, () => {
+    sendHeard("Hey Jeff", "hey jeff")
+    wakeUp("hey jeff", true)
+  })
+  after(5500, runVoiceTurn)
 }
 
 // ---------------------------------------------------------------------------
@@ -1111,6 +1343,7 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
     case "hello":
       return
     case "audio.claim": {
+      if (c.frontend === "admin") return sendTo(c, { type: "error", error: { code: "bad_message", message: "The admin page cannot use the audio." } })
       const previous = owner
       if (previous !== undefined && previous !== c) {
         if (reply !== undefined && reply.owner === previous) sendTo(previous, { type: "reply.stop", turnId: reply.turnId })
@@ -1125,8 +1358,11 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
         if (!x.welcomed) continue
         sendTo(x, { type: "session", role: x === c ? "owner" : "observer", ownerPresent: true, reason: x === previous ? "taken_over" : "claimed" })
       }
-      setState("listening")
+      awakeUntil = 0
+      setState(restingState())
+      devicesChanged()
       if (scenario === "voice" || scenario === "drop-mid-reply") after(900, runVoiceTurn)
+      if (scenario === "wake") runWakeScript()
       if (scenario === "takeover") {
         after(1500, () => {
           if (owner !== c) return
@@ -1145,6 +1381,7 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
       if (reply !== undefined) interruptReply(reply)
       sessionUpdate("released")
       setState("idle")
+      devicesChanged()
       return
     case "audio.config":
       return
@@ -1280,6 +1517,7 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
       return
     }
     case "engine.reload": {
+      if (requireAdmin(c, m.requestId)) return
       if (engine.state === "reloading") return result(c, m.requestId, false, { code: "busy", message: "A reload is already running." })
       if (reply !== undefined) interruptReply(reply)
       engine = { ...engine, state: "reloading" }
@@ -1292,15 +1530,16 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
       return
     }
     case "vault.setup": {
+      if (requireAdmin(c, m.requestId)) return
       if (vault.state !== "none") return result(c, m.requestId, false, { code: "busy", message: `A vault already exists at ${VAULT_LOCATION}` })
       if (m.password.length < 8) return result(c, m.requestId, false, { code: "bad_password", message: "The password must be at least 8 characters" })
       vault = { state: "unlocked", password: m.password }
-      c.admin = true
       result(c, m.requestId, true)
       vaultChanged()
       return
     }
     case "vault.unlock": {
+      if (requireAdmin(c, m.requestId)) return
       if (vault.state === "none") return result(c, m.requestId, false, { code: "locked", message: "There is no vault yet" })
       if (m.password !== vault.password) return result(c, m.requestId, false, { code: "bad_password", message: "Wrong password (or the vault file was changed)" })
       const wasLocked = vault.state === "locked"
@@ -1311,14 +1550,15 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
       return
     }
     case "vault.lock": {
+      if (requireAdmin(c, m.requestId)) return
       if (vault.state === "none") return result(c, m.requestId, false, { code: "locked", message: "There is no key vault yet: set a password first" })
-      if (!isAdmin(c)) return result(c, m.requestId, false, { code: "locked", message: "Protected: type the password in Settings → Keys & access to change this." })
       vault = { ...vault, state: "locked", lockReason: "manual" }
       result(c, m.requestId, true)
       vaultChanged()
       return
     }
     case "vault.changePassword": {
+      if (requireAdmin(c, m.requestId)) return
       if (vault.state === "none") return result(c, m.requestId, false, { code: "locked", message: "There is no vault yet" })
       if (m.oldPassword !== vault.password) return result(c, m.requestId, false, { code: "bad_password", message: "Wrong password (or the vault file was changed)" })
       if (m.newPassword.length < 8) return result(c, m.requestId, false, { code: "bad_password", message: "The password must be at least 8 characters" })
@@ -1330,17 +1570,113 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
       return
     }
     case "settings.moveFromEnv":
-      if (refuseLocked(c, m.requestId, true)) return
+      if (requireAdmin(c, m.requestId)) return
       return moveFromEnv(c, m.requestId, m.keys)
     case "job.start":
-      if (refuseLocked(c, m.requestId, true)) return
+      if (requireAdmin(c, m.requestId)) return
       return startDownload(c, m.requestId, m.tool, m.target)
     case "job.cancel":
-      if (refuseLocked(c, m.requestId, true)) return
+      if (requireAdmin(c, m.requestId)) return
       return cancelJob(c, m.requestId, m.jobId)
     case "model.delete":
-      if (refuseLocked(c, m.requestId, true)) return
+      if (requireAdmin(c, m.requestId)) return
       return deleteModel(c, m.requestId, m.tool, m.target)
+    case "admin.login": {
+      if (!adminEnabled()) return result(c, m.requestId, false, { code: "admin_required", message: "Admin is switched off: set PVA_ADMIN_PASSWORD in .env and restart." })
+      const wait = loginRefusedUntil - Date.now()
+      if (wait > 0) {
+        result(c, m.requestId, false, { code: "bad_password", message: `Too many wrong passwords: try again in ${Math.ceil(wait / 1000)} s.` })
+        return sendTo(c, { type: "admin.state", admin: adminState(c) })
+      }
+      if (m.password !== ADMIN_PASSWORD) {
+        loginFailures++
+        // The same back-off as vault unlocks: free tries, then a growing wait (admin-backoff: 30 s at once).
+        const refuse = scenario === "admin-backoff" ? 30_000 : loginFailures >= 3 ? Math.min(60_000, 5_000 * 2 ** (loginFailures - 3)) : 0
+        if (refuse > 0) loginRefusedUntil = Date.now() + refuse
+        result(c, m.requestId, false, { code: "bad_password", message: "Wrong password." })
+        return sendTo(c, { type: "admin.state", admin: adminState(c) })
+      }
+      loginFailures = 0
+      const token = randomBytes(32).toString("base64url")
+      const expiresAt = Date.now() + 12 * HOUR
+      sessions.set(token, { expiresAt })
+      c.session = token
+      sendTo(c, { type: "result", requestId: m.requestId, ok: true, admin: { token, expiresAt } })
+      sendTo(c, { type: "admin.state", admin: adminState(c) })
+      sendAdminSnapshot(c)
+      return
+    }
+    case "admin.logout": {
+      if (logoutFails) return result(c, m.requestId, false, { code: "internal", message: "The assistant could not log you out." })
+      result(c, m.requestId, true)
+      if (c.session !== undefined) endSessions("logout", c.session)
+      return
+    }
+    case "device.update": {
+      if (c.frontend !== "voice" || c.deviceId === undefined) return result(c, m.requestId, false, { code: "bad_message", message: "This page has no device." })
+      const fields = Object.keys(m.patch)
+      if (fields.some((f) => !(DEVICE_EDITABLE_FIELDS as ReadonlyArray<string>).includes(f))) {
+        return result(c, m.requestId, false, { code: "admin_required", message: "Only admin can change that." })
+      }
+      const record = devices.get(c.deviceId)
+      if (record === undefined) return result(c, m.requestId, false, { code: "unknown_device", message: "This device is not known." })
+      // As the server: a voice that is not enabled (a stale list) is refused.
+      if (typeof m.patch.voice === "string" && m.patch.voice !== "" && !engine.voices.some((v) => v.enabled && v.name === m.patch.voice)) {
+        return result(c, m.requestId, false, { code: "invalid_settings", message: `"${m.patch.voice}" is not an enabled voice.` })
+      }
+      record.overrides = applyProfilePatch(record.overrides, cleanPatch(m.patch))
+      pushProfiles()
+      result(c, m.requestId, true)
+      devicesChanged()
+      if (c === owner && reply === undefined) setState(restingState())
+      return
+    }
+    case "frontend.update": {
+      if (requireAdmin(c, m.requestId)) return
+      if (m.kind !== WEB_VOICE_KIND) return result(c, m.requestId, false, { code: "unknown_device", message: `No front-end kind ${m.kind}.` })
+      kindDefaults = applyProfilePatch(kindDefaults, cleanPatch(m.patch))
+      pushProfiles()
+      result(c, m.requestId, true)
+      frontendsChanged()
+      devicesChanged()
+      if (reply === undefined) setState(restingState())
+      return
+    }
+    case "device.admin.update": {
+      if (requireAdmin(c, m.requestId)) return
+      const record = devices.get(m.id)
+      if (record === undefined) return result(c, m.requestId, false, { code: "unknown_device", message: "This device is not known (any more)." })
+      if (m.name !== undefined) record.name = m.name.trim()
+      if (m.patch !== undefined) record.overrides = applyProfilePatch(record.overrides, cleanPatch(m.patch))
+      pushProfiles()
+      result(c, m.requestId, true)
+      devicesChanged()
+      if (reply === undefined) setState(restingState())
+      return
+    }
+    case "device.forget": {
+      if (requireAdmin(c, m.requestId)) return
+      const record = devices.get(m.id)
+      if (record === undefined) return result(c, m.requestId, false, { code: "unknown_device", message: "This device is not known (any more)." })
+      devices.delete(m.id)
+      // A device that is connected now is recorded again as new.
+      const now = Date.now()
+      if ([...conns].some((x) => x.welcomed && x.deviceId === m.id)) devices.set(m.id, { ...record, firstSeen: now, lastSeen: now, overrides: {} })
+      pushProfiles()
+      result(c, m.requestId, true)
+      devicesChanged()
+      return
+    }
+    case "wake.test": {
+      if (requireAdmin(c, m.requestId)) return
+      if (m.on) {
+        c.testerUntil = Date.now() + WAKE_TEST_MAX_MS
+      } else {
+        c.testerUntil = undefined
+      }
+      result(c, m.requestId, true)
+      return
+    }
     case "ping":
       sendTo(c, { type: "pong", id: m.id })
       return
@@ -1359,7 +1695,7 @@ const dropAll = () => {
 const wss = new WebSocketServer({ noServer: true, perMessageDeflate: false })
 
 wss.on("connection", (ws: WebSocket) => {
-  const c: Conn = { ws, id: `conn-${++connSeq}`, welcomed: false, micFrames: 0, micGaps: 0, lastSeq: undefined, admin: false }
+  const c: Conn = { ws, id: `conn-${++connSeq}`, welcomed: false, micFrames: 0, micGaps: 0, lastSeq: undefined, frontend: "voice" }
   conns.add(c)
   log(c.id, "connected")
   ws.on("message", (data: Buffer, isBinary: boolean) => {
@@ -1386,8 +1722,19 @@ wss.on("connection", (ws: WebSocket) => {
         return ws.close(CloseCode.protocolMismatch)
       }
       c.clientId = m.clientId
+      c.frontend = m.frontend
+      const tokenSent = m.frontend === "admin" ? m.adminToken : undefined
+      if (tokenSent !== undefined && sessions.has(tokenSent)) c.session = tokenSent
+      if (m.frontend === "voice" && m.device !== undefined) {
+        const now = Date.now()
+        const known = devices.get(m.device.id)
+        devices.set(m.device.id, known === undefined
+          ? { id: m.device.id, kind: m.device.kind, name: m.device.name, firstSeen: now, lastSeen: now, overrides: {} }
+          : { ...known, lastSeen: now })
+        c.deviceId = m.device.id
+      }
       c.welcomed = true
-      const resumed = m.resumeOwner && owner === undefined && lastOwnerClientId === m.clientId
+      const resumed = m.frontend === "voice" && m.resumeOwner && owner === undefined && lastOwnerClientId === m.clientId
       if (resumed) {
         owner = c
         c.lastSeq = undefined
@@ -1398,23 +1745,20 @@ wss.on("connection", (ws: WebSocket) => {
         server: { name: "pva-mock", version: "0.0.0" },
         connectionId: c.id,
         snapshot: {
-          state: resumed ? "listening" : assistantState,
+          state: resumed ? restingState() : assistantState,
           role: c === owner ? "owner" : "observer",
           ownerPresent: owner !== undefined || lastOwnerClientId === "c-another-tab",
-          engine,
-          modules,
-          sections,
+          engine: engineSummary(engine),
           history: history.slice(-200),
-          traces: traces.slice(-20),
-          vault: vaultInfo(c),
-          env,
-          models,
-          jobs
+          ...(m.frontend === "voice" ? { device: profileInfo(c) } : {}),
+          admin: adminState(c, tokenSent !== undefined && c.session === undefined ? { endReason: "token" } : {})
         }
       })
+      if (isAdminConn(c)) sendAdminSnapshot(c)
+      if (c.deviceId !== undefined) devicesChanged()
       if (resumed) {
         sessionUpdate("resumed")
-        setState("listening")
+        setState(restingState())
       }
       return
     }
@@ -1423,6 +1767,10 @@ wss.on("connection", (ws: WebSocket) => {
   ws.on("close", () => {
     conns.delete(c)
     log(c.id, "closed")
+    if (c.deviceId !== undefined) {
+      const record = devices.get(c.deviceId)
+      if (record !== undefined) record.lastSeen = Date.now()
+    }
     if (owner === c) {
       owner = undefined
       if (reply !== undefined && reply.owner === c) {
@@ -1432,6 +1780,7 @@ wss.on("connection", (ws: WebSocket) => {
       sessionUpdate("owner_disconnected")
       setState("idle")
     }
+    if (c.deviceId !== undefined) devicesChanged()
   })
 })
 
@@ -1488,6 +1837,39 @@ const http = createServer((req, res) => {
         // Drop every socket and refuse new ones for `ms` (default 3 s): the UI shows reconnecting.
         offlineUntil = Date.now() + (typeof payload.ms === "number" ? payload.ms : 3000)
         dropAll()
+        return json(res, 200, { ok: true })
+      }
+      case "/mock/admin/end": {
+        const reason = payload.reason === "expired" ? "expired" : payload.reason === "logout" ? "logout" : "idle"
+        endSessions(reason)
+        return json(res, 200, { ok: true })
+      }
+      case "/mock/wake": {
+        wakeUp(typeof payload.phrase === "string" ? payload.phrase : "hey jeff", payload.armed !== false)
+        return json(res, 200, { ok: true })
+      }
+      case "/mock/heard": {
+        sendHeard(
+          String(payload.text ?? ""),
+          typeof payload.matched === "string" ? payload.matched : undefined,
+          typeof payload.accepted === "boolean" ? payload.accepted : payload.accepted === null ? null : undefined
+        )
+        return json(res, 200, { ok: true })
+      }
+      case "/mock/defaults": {
+        // The web-voice defaults, as admin › Front ends would set them (tests).
+        kindDefaults = applyProfilePatch(kindDefaults, (payload.patch ?? {}) as ProfilePatch)
+        pushProfiles()
+        frontendsChanged()
+        return json(res, 200, { ok: true })
+      }
+      case "/mock/logout-fails":
+        logoutFails = payload.on !== false
+        return json(res, 200, { ok: true })
+      case "/mock/state": {
+        const state = payload.state
+        if (state !== "idle" && state !== "asleep" && state !== "listening" && state !== "hearing" && state !== "thinking" && state !== "speaking") return json(res, 400, { error: "state?" })
+        setState(state)
         return json(res, 200, { ok: true })
       }
       case "/mock/send": {

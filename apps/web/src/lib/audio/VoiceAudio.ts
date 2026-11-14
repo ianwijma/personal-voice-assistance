@@ -74,13 +74,13 @@ export const describeMicError = (e: unknown): string => {
   const name = (e as { name?: string } | null)?.name
   switch (name) {
     case "NotAllowedError":
-      return "Microphone permission was denied. Allow it in the browser's site settings and press Start again."
+      return "Microphone permission was denied. Allow it in the browser's site settings, then press Try again."
     case "NotFoundError":
       return "No microphone found."
     case "NotReadableError":
       return "The microphone is in use by another app or blocked by the system."
     case "OverconstrainedError":
-      return "The selected microphone is not available. Choose another one under Options → This device."
+      return "The selected microphone is not available. Choose another one in Settings › Microphone."
     case "SecurityError":
       return "The browser blocked the microphone on this page. It needs HTTPS or localhost."
     default:

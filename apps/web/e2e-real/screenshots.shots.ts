@@ -1,10 +1,11 @@
 // Screenshots of the REAL system (real assistant, local speech, fake model), saved as
-// screenshots/real-*.png next to the mock ones. Run with `pnpm --filter @pva/web screenshots:real`.
+// screenshots/real-voice-*.png and real-admin-*.png next to the mock ones. Run with `pnpm --filter @pva/web screenshots:real`.
 import { join } from "node:path"
 import type { Browser, Page } from "@playwright/test"
 import {
   type Assistant,
   chromiumArgsFor,
+  E2E_ADMIN_PASSWORD,
   expectVisualState,
   here,
   instrument,
@@ -40,7 +41,7 @@ const run = async (browser: Browser, size: "desktop" | "phone") => {
   )
   const page: Page = await ctx.newPage()
   await instrument(page)
-  const shot = (name: string) => page.screenshot({ path: join(shots, `real-${size}-${name}.png`) })
+  const shot = (front: "voice" | "admin", name: string) => page.screenshot({ path: join(shots, `real-${front}-${size}-${name}.png`) })
   try {
     await page.goto(assistant.url)
     await page.getByTestId("start").click()
@@ -49,7 +50,7 @@ const run = async (browser: Browser, size: "desktop" | "phone") => {
     // A spoken turn in progress: "What time is it in Tokyo right now?", answered through the clock tool.
     await waitForMessage(page, (m) => m.msg.type === "playback.started" && m.msg.turnId === 1, { timeout: 30_000 })
     await page.waitForTimeout(900)
-    await shot("01-speaking")
+    await shot("voice", "01-speaking")
 
     // The chat after a real exchange: two spoken turns and a typed one.
     await waitForMessage(page, (m) => m.msg.type === "turn.end" && m.msg.turnId === 2, { timeout: 30_000 })
@@ -58,11 +59,17 @@ const run = async (browser: Browser, size: "desktop" | "phone") => {
     await page.locator("#chat-input").press("Enter")
     await waitForMessage(page, (m) => m.msg.type === "turn.end" && m.msg.turnId === 3, { timeout: 30_000 })
     await page.waitForTimeout(400)
-    await shot("02-chat")
+    await shot("voice", "02-chat")
+    await page.getByTestId("chat-panel").getByRole("button", { name: /close/i }).click()
+    await page.getByTestId("settings-toggle").click()
+    await page.getByTestId("voice-sheet").waitFor()
+    await page.waitForTimeout(400)
+    await shot("voice", "03-settings-sheet")
 
-    // Settings (the file names still say "options"): a real module page, the Overview, and the voices page.
-    if (size === "phone") await page.getByTestId("chat-panel").getByRole("button", { name: /close/i }).click() // the chat covers the page
-    await page.getByRole("button", { name: "Settings (O)" }).click()
+    // Admin, logged in with the test password: a real module page, the Overview, the voices page, the front end.
+    await page.goto(`${assistant.url}/admin/`)
+    await page.locator("#admin-password").fill(E2E_ADMIN_PASSWORD)
+    await page.getByRole("button", { name: "Log in" }).click()
     await page.getByTestId("settings").waitFor()
     const open = async (group: string, id: string) => {
       // On a phone, back up to the category list first (drill-down).
@@ -73,13 +80,19 @@ const run = async (browser: Browser, size: "desktop" | "phone") => {
     }
     await open("modules", "clock")
     await page.waitForTimeout(300)
-    await shot("03-options-modules")
+    await shot("admin", "01-module")
     await open("overview", "overview")
     await page.waitForTimeout(300)
-    await shot("04-options-assistant")
+    await shot("admin", "02-overview")
     await open("voices", "overview")
     await page.waitForTimeout(200)
-    await shot("05-options-voices")
+    await shot("admin", "03-voices")
+    // Front ends has one page per kind (no page list): on a phone, back up first, as `open` does.
+    while (size === "phone" && await page.getByTestId("settings-back").isVisible()) await page.getByTestId("settings-back").click()
+    await page.getByTestId("nav-frontends").click()
+    await page.getByTestId("page-frontends-frontend").waitFor()
+    await page.waitForTimeout(200)
+    await shot("admin", "04-front-end")
   } finally {
     await ctx.close()
   }

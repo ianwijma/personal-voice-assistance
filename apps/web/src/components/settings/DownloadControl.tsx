@@ -97,7 +97,7 @@ export function DownloadControl({ tool, target, sizeMb, label }: { readonly tool
             <Icon name="arrowDown" size={14} /> Download · {formatMb(sizeMb)}
           </Button>
         ) : (
-          <span className="text-[13px] text-ink-muted">Not downloaded ({formatMb(sizeMb)}). A page with edit access can download it.</span>
+          <span className="text-[13px] text-ink-muted">Not downloaded ({formatMb(sizeMb)}). Log in to admin to download it.</span>
         )}
         {last?.state === "failed" && <span className="text-[13px] text-danger" role="alert">Last try failed: {last.error}</span>}
         {last?.state === "cancelled" && <span className="text-[13px] text-ink-muted">Cancelled.</span>}

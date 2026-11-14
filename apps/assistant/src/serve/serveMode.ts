@@ -6,14 +6,18 @@ import {
   makeEchoGate,
   makeModuleHost,
   makeTurnTrace,
+  makeWakeGate,
   type ModuleDefinition,
   type ModuleHost,
   type SttEvent,
   type TurnSetup,
   type TurnTrace,
-  voicePrompt
+  voicePrompt,
+  WAKE_ALWAYS,
+  type WakeConfig,
+  wakeConfigFromProfile
 } from "@pva/core"
-import type { ServerMessage } from "@pva/protocol"
+import { type DeviceProfile, engineSummary, type ServerMessage, WAKE_ARMED_MS } from "@pva/protocol"
 import { Config, Effect, Fiber, FiberSet, Option, type Scope, Stream } from "effect"
 import { isAbsolute, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
@@ -23,10 +27,12 @@ import { type EnvView, makeEnvView } from "../envView.ts"
 import { moduleCatalog, withModuleInstructions } from "../modules.ts"
 import { makeSubscriptionAgents, SUBSCRIPTION_AGENT_ID, SUBSCRIPTION_PROVIDER } from "../subscription.ts"
 import { makeAccessPolicy } from "./access.ts"
+import { adminPasswordProblem, makeAdminSessions } from "./AdminSessions.ts"
 import { acquireDataDirLock, type DataDirLockError } from "./DataDirLock.ts"
 import { defaultPreflight, defaultProviderBuilder, type Engine, EngineBuildProblems, makeEngine, type ProviderBuilder } from "./Engine.ts"
 import { type EnvMover, makeEnvMover } from "./envSettings.ts"
 import { type HttpError, type HttpServer, startHttp, webDirExists } from "./http.ts"
+import { makeFrontends } from "./frontends.ts"
 import { type Jobs, makeJobs } from "./jobs.ts"
 import { makeModels, type Models, type PresetDownloader, presetsInUse } from "./models.ts"
 import { makeHeardAudio } from "./HeardAudio.ts"
@@ -72,8 +78,16 @@ export interface ServeOptions {
   /** For tests: cheaper scrypt parameters for a new vault, and the clock of the unlock rate limit. */
   readonly vaultKdf?: KdfParams
   readonly vaultNow?: () => number
-  /** Admin access ends after this long without an admin action. Default 15 minutes. */
+  /**
+   * The admin password (`PVA_ADMIN_PASSWORD`, read once by `serveMode`). Default: `env.PVA_ADMIN_PASSWORD`. Unset or
+   * shorter than 8 characters: admin is disabled (nothing can be configured from a browser).
+   */
+  readonly adminPassword?: string
+  /** Tests: admin sessions end after this long without an admin action (default 30 min) / at the latest (12 h). */
   readonly adminIdleMs?: number
+  readonly adminMaxMs?: number
+  /** Tests: the admin sessions' clock (epoch ms; the login back-off). Default `Date.now`. */
+  readonly adminNow?: () => number
   /** Unlock the vault at start with this (`PVA_VAULT_PASSWORD`). Default: `env.PVA_VAULT_PASSWORD`. Never grants admin access. */
   readonly vaultPassword?: string
   readonly catalog?: ReadonlyArray<ModuleDefinition<any>>
@@ -183,12 +197,22 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
 
     // Late-bound: the hub needs the engine and the engine's callbacks need the hub.
     let hub: SessionHub | undefined
+    let theHub: SessionHub | undefined
+    let lastSummary: string | undefined
+    /** The enabled voices of the engine status (kept while a rebuild fails); empty before the first build. */
+    const enabledVoices = (): ReadonlySet<string> =>
+      new Set((engine?.status().voices ?? []).filter((v) => v.enabled).map((v) => v.name))
     let engine: Engine | undefined
     let modelsRef: Models | undefined
     const broadcast = (message: ServerMessage) => hub?.broadcast(message)
 
     const gate = makeEchoGate("instant")
-    const tracker = makeStateTracker({ onChange: (s) => broadcast({ type: "state", ...s }) })
+    // After the echo gate, before Conversation; configured from the audio owner's profile (no owner: `always`).
+    const wake = makeWakeGate(WAKE_ALWAYS)
+    const tracker = makeStateTracker({
+      onChange: (s) => broadcast({ type: "state", ...s }),
+      asleep: () => wake.config().activation === "wake-phrase" && !wake.awake(now())
+    })
     yield* Effect.addFinalizer(() => Effect.sync(() => tracker.dispose()))
     const publisher = makePublisher({
       broadcast,
@@ -209,11 +233,14 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
         if (event._tag === "started") {
           tracker.playbackStarted(event.turnId)
           gate.playbackStarted(now())
+          wake.replyStarted(now())
           if (unsuppress !== undefined) clearTimeout(unsuppress)
           if (hub?.ownerMode() === "manual") web.setSuppressed(true)
         } else {
           tracker.playbackEnded(event.turnId, event.reason)
           gate.playbackEnded(now())
+          wake.replyEnded(now())
+          tracker.wakeChanged(wake.config().followUpMs)
           unsuppress = setTimeout(() => web.setSuppressed(false), ECHO_TAIL_MS)
           unsuppress.unref?.()
         }
@@ -294,17 +321,43 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       lastTranscript = text
       broadcast({ type: "transcript", text })
     }
+    /**
+     * Stt → echo gate → wake gate → Conversation. Only what passed both gates is shown (transcript), moves the state
+     * or reaches the conversation: an utterance the wake gate ignores reaches no page, no history, no agent and no
+     * recording (`heard.discard`); its text goes only to admin pages with the phrase tester on (`wake.heard`).
+     */
     const gateStream = (events: Stream.Stream<SttEvent, unknown>) =>
       events.pipe(Stream.flatMap((event) => {
-        heard.event(event)
-        const result = gate.filter(event, now())
-        for (const passed of result.events) {
-          tracker.stt(passed)
-          if (passed._tag === "Interim") transcript(passed.text)
-          else if (passed._tag === "EndOfTurn") transcript("")
+        const t = now()
+        if (event._tag !== "EndOfTurn") heard.event(event)
+        const echo = gate.filter(event, t)
+        const out: Array<SttEvent> = []
+        let wakeDropped = false
+        for (const e of echo.events) {
+          const w = wake.filter(e, t)
+          if (w.heard !== undefined) theHub?.wakeHeard(w.heard.text, w.heard.phrase, w.heard.accepted)
+          if (w.woke !== undefined) {
+            broadcast({ type: "wake", phrase: w.woke.phrase, armed: w.woke.armed })
+            tracker.wakeChanged(w.woke.armed ? wake.config().armedMs ?? WAKE_ARMED_MS : wake.config().followUpMs)
+          }
+          if (w.dropped !== undefined || (e._tag === "EndOfTurn" && w.events.length === 0)) wakeDropped = true
+          for (const passed of w.events) {
+            out.push(passed)
+            tracker.stt(passed)
+            if (passed._tag === "Interim") transcript(passed.text)
+            else if (passed._tag === "EndOfTurn") {
+              transcript("")
+              // An accepted utterance opens the follow-up window: the state may go back to asleep by itself.
+              if (wake.config().activation === "wake-phrase") tracker.wakeChanged(wake.config().followUpMs)
+            }
+          }
         }
-        if (result.dropped) transcript("")
-        return Stream.fromIterable(result.events)
+        if (event._tag === "EndOfTurn") {
+          if (wakeDropped) heard.discard()
+          else heard.event(event)
+        }
+        if (echo.dropped) transcript("")
+        return Stream.fromIterable(out)
       }))
 
     // The turn setup is rebuilt only when its inputs change (a string compare per turn).
@@ -354,9 +407,21 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       setup,
       onEvent,
       gate: gateStream,
-      defaultVoice: () => String(sections.value("DEFAULT_VOICE")),
+      // The audio owner's voice (its profile), else DEFAULT_VOICE; the engine swaps routers only for a running voice.
+      defaultVoice: () => {
+        const own = theHub?.ownerProfile()?.voice ?? ""
+        return own !== "" && enabledVoices().has(own) ? own : String(sections.value("DEFAULT_VOICE"))
+      },
       onStatus: (status) => {
+        // `engine` goes to admin connections only (SessionHub.ADMIN_ONLY); the summary to everyone, when it changed.
         broadcast({ type: "engine", engine: status })
+        const summary = JSON.stringify(engineSummary(status))
+        if (summary !== lastSummary) {
+          lastSummary = summary
+          broadcast({ type: "engine.summary", engine: engineSummary(status) })
+          // The enabled voices may have changed: a profile's voice may fall back to "" (or come back).
+          theHub?.refreshProfiles()
+        }
         // Which models are in use follows the running engines.
         if (hub !== undefined) broadcast({ type: "models", models: modelsRef?.list() ?? [] })
       },
@@ -409,7 +474,33 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     modelsRef = models
     const envMover = makeEnvMover({ view: envView, catalog, sections, host, store, vaultState: keys.state, onMoved: () => {} })
 
+    const adminPassword = options.adminPassword ?? env.PVA_ADMIN_PASSWORD
+    const adminProblem = adminPasswordProblem(adminPassword)
+    if (adminProblem !== undefined) yield* Effect.logWarning(adminProblem)
+    const admin = makeAdminSessions({
+      password: adminPassword,
+      ...(options.adminIdleMs !== undefined ? { idleMs: options.adminIdleMs } : {}),
+      ...(options.adminMaxMs !== undefined ? { maxMs: options.adminMaxMs } : {}),
+      ...(options.adminNow !== undefined ? { now: options.adminNow } : {})
+    })
+    yield* Effect.addFinalizer(() => Effect.sync(() => admin.dispose()))
+    const frontends = makeFrontends({ store, enabledVoices })
+
+    /** The owner's profile → the wake gate (only when its part changed: `configure` drops a held utterance). */
+    let wakeKey = JSON.stringify(WAKE_ALWAYS)
+    const onOwnerProfile = (profile: DeviceProfile | undefined) => {
+      const next: WakeConfig = profile === undefined ? WAKE_ALWAYS : wakeConfigFromProfile(profile)
+      const key = JSON.stringify(next)
+      if (key === wakeKey) return
+      wakeKey = key
+      wake.configure(next)
+      tracker.wakeChanged(Math.max(next.followUpMs, next.armedMs ?? WAKE_ARMED_MS))
+    }
+
     hub = makeSessionHub({
+      admin,
+      frontends,
+      onOwnerProfile,
       env: envMover,
       models,
       jobs,
@@ -424,7 +515,6 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       server: { name: "personal-voice-assistance", version: "0.0.0" },
       keys,
       access,
-      ...(options.adminIdleMs !== undefined ? { adminIdleMs: options.adminIdleMs } : {}),
       onSectionSaved: (sectionId, needsReload, path) => {
         if (needsReload) theEngine.setReloadPending(true, path)
         if (sectionId === "voices") {
@@ -435,14 +525,15 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       },
       ...(options.helloTimeoutMs !== undefined ? { helloTimeoutMs: options.helloTimeoutMs } : {})
     })
-    const theHub = hub
+    theHub = hub
+    const hubNow = hub
     host.subscribe((module) => {
-      theHub.broadcast({ type: "module.changed", module: access.module(module) })
+      hubNow.broadcast({ type: "module.changed", module: access.module(module) })
       if (module.id === SUBSCRIPTION_AGENT_ID && theEngine.status().engines.some((e) => e.provider === SUBSCRIPTION_PROVIDER)) theEngine.refreshStatus()
     })
-    sections.subscribe((section) => theHub.broadcast({ type: "section.changed", section: access.section(section) }))
+    sections.subscribe((section) => hubNow.broadcast({ type: "section.changed", section: access.section(section) }))
     keys.subscribe((state) => {
-      theHub.vaultChanged()
+      hubNow.vaultChanged()
       sections.announceAll()
       // Engines that failed (a key was locked away) are rebuilt once the keys are there.
       if (state === "unlocked" && theEngine.status().state === "failed") {
@@ -458,7 +549,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       allowedHosts: options.allowedHosts ?? [],
       tls: options.tls,
       crossOriginIsolation: options.crossOriginIsolation ?? true,
-      hub: theHub,
+      hub: hubNow,
       ...(options.pingIntervalMs !== undefined ? { pingIntervalMs: options.pingIntervalMs } : {})
     })
 
@@ -526,7 +617,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     }
     const ready = Effect.asVoid(Effect.all([Fiber.await(modulesStarted), Fiber.await(engineStarted)]))
 
-    return { http, hub: theHub, engine: theEngine, host, web, keys, vault, envView, envMover, jobs, models, ready }
+    return { http, hub: hubNow, engine: theEngine, host, web, keys, vault, envView, envMover, jobs, models, ready }
   })
 
 const isLoopback = (host: string) => host === "localhost" || host === "::1" || host.startsWith("127.")
@@ -569,15 +660,25 @@ export const serveMode = Effect.scoped(Effect.gen(function*() {
   const vaultPassword = process.env.PVA_VAULT_PASSWORD
   delete process.env.PVA_VAULT_PASSWORD
   processEnvView.redact("PVA_VAULT_PASSWORD")
-  const handle = yield* startServe({ ...config, tls, ...(vaultPassword !== undefined && vaultPassword !== "" ? { vaultPassword } : {}) })
+  // The admin password likewise: read once, then gone from the environment and the env view.
+  const adminPassword = process.env.PVA_ADMIN_PASSWORD
+  delete process.env.PVA_ADMIN_PASSWORD
+  processEnvView.redact("PVA_ADMIN_PASSWORD")
+  const handle = yield* startServe({
+    ...config,
+    tls,
+    ...(vaultPassword !== undefined && vaultPassword !== "" ? { vaultPassword } : {}),
+    // Always passed (also when unset), so the env view's copy is never consulted.
+    adminPassword: adminPassword ?? ""
+  })
   yield* Effect.logInfo(`Assistant UI at ${handle.http.url}  (settings in ${config.dataDir}, keys in ${config.vaultPath})`)
   if (!webDirExists(config.webDir)) {
     yield* Effect.logWarning(`The web UI is not built (${config.webDir} is missing): run pnpm --filter @pva/web build`)
   }
   if (!isLoopback(config.host)) {
     yield* Effect.logWarning(
-      `Listening on ${config.host}: anyone who can reach this port can use the assistant and change its open settings (there is no login; ` +
-        "keys, providers and agents need the vault password once one is set)."
+      `Listening on ${config.host}: anyone who can reach this port can talk to the assistant; changing anything needs the ` +
+        "admin password (PVA_ADMIN_PASSWORD) on /admin/."
     )
   }
   if (tls === undefined && !isLoopback(config.host)) {

@@ -1,12 +1,11 @@
 import type { Page } from "@playwright/test"
-import { appUrl, expect, mock, test } from "./fixtures.ts"
+import { appUrl, expect, loginAdmin, mock, test } from "./fixtures.ts"
 
-// Generated forms, modules and this device's settings, on the settings screen (was the options drawer).
+// Generated forms and modules on the admin settings screen; the voice front end's echo test and settings sheet.
 
-/** Open a settings page by its deep link (the page loads with the settings already open). */
+/** Open an admin settings page by its deep link (logging in on the way). */
 const openPage = async (page: Page, baseURL: string | undefined, path: string) => {
-  await page.goto(appUrl(baseURL, `#settings/${path}`))
-  await expect(page.getByTestId("settings")).toBeVisible()
+  await loginAdmin(page, baseURL, `#settings/${path}`)
   await expect(page.getByTestId(`page-${path.replace("/", "-")}`)).toBeVisible()
 }
 const footer = (page: Page) => page.getByTestId("page-footer")
@@ -130,45 +129,33 @@ test("a change from another tab updates a clean form and is flagged on a dirty o
   await expect(form.getByLabel("Home location")).toHaveValue("Leiden")
 })
 
-test("this device: interrupt mode is sent to the server while owning the audio, and remembered", async ({ page, baseURL }) => {
+test("the voice sheet: Esc closes it and returns focus; S opens it again", async ({ page, baseURL }) => {
   await page.goto(appUrl(baseURL))
-  await page.getByTestId("start").click()
-  await expect(page.getByTestId("stage")).toHaveAttribute("data-visual-state", "listening")
-  await page.keyboard.press("o")
-  await page.getByTestId("nav-device").click()
-  await page.getByRole("radio", { name: /Headphones/ }).click()
-  await expect.poll(async () => (await mock.log()).messages.filter((m) => m.type === "audio.config").map((m) => m.interruptMode)).toEqual(["instant"])
-  await page.reload()
-  await expect(page.getByTestId("page-device-microphone")).toBeVisible() // the hash kept the page
-  await expect(page.getByRole("radio", { name: /Headphones/ })).toHaveAttribute("aria-checked", "true")
-})
-
-test("Esc closes the settings and returns focus; O reopens them where they were", async ({ page, baseURL }) => {
-  await page.goto(appUrl(baseURL))
-  await page.getByRole("button", { name: "Settings (O)" }).click()
-  await expect(page.getByTestId("settings")).toBeVisible()
-  await page.getByTestId("nav-voices").click()
+  const toggle = page.getByTestId("settings-toggle")
+  await toggle.click()
+  const sheet = page.getByTestId("voice-sheet")
+  await expect(sheet).toBeVisible()
+  await expect(sheet.getByRole("heading", { name: "Settings" })).toBeVisible()
   await page.keyboard.press("Escape")
-  await expect(page.getByTestId("settings")).toBeHidden()
-  await expect(page.getByRole("button", { name: "Settings (O)" })).toBeFocused()
-  expect(new URL(page.url()).hash).toBe("")
-  await page.keyboard.press("o")
-  await expect(page.getByTestId("page-voices-overview")).toBeVisible()
+  await expect(sheet).toBeHidden()
+  await expect(toggle).toBeFocused()
+  await page.keyboard.press("s")
+  await expect(sheet).toBeVisible()
 })
 
-test("the echo test plays through the player, reports nothing to the server, and stores a result", async ({ page, baseURL }) => {
+test("the echo test (voice sheet › More) plays through the player, reports nothing to the server, and stores a result", async ({ page, baseURL }) => {
   await page.goto(appUrl(baseURL))
   await page.getByTestId("start").click()
   await expect(page.getByTestId("stage")).toHaveAttribute("data-visual-state", "listening")
-  await page.keyboard.press("o")
-  await page.getByTestId("nav-device").click()
+  await page.getByTestId("settings-toggle").click()
+  await page.getByTestId("sheet-more").getByText("More").click()
   const before = (await mock.log()).mic.find((x) => x.owner)!.frames
   await page.getByRole("button", { name: "Test echo" }).click()
   await expect(page.getByRole("button", { name: /Listening for echo/ })).toBeVisible()
   await page.waitForTimeout(1500)
   const during = (await mock.log()).mic.find((x) => x.owner)!.frames
   expect(during - before).toBeLessThan(5) // the microphone is held back during the test
-  await expect(page.getByTestId("echo-result")).toContainText(/Echo is (not )?cancelled/, { timeout: 10_000 })
+  await expect(page.getByTestId("echo-result")).toContainText(/Echo is (not )?removed/, { timeout: 10_000 })
   const log = await mock.log()
   expect(log.messages.filter((m) => m.type.startsWith("playback."))).toEqual([])
 })

@@ -45,7 +45,7 @@ export function ModuleHeader({ module: m, editable, compact = false }: { readonl
         </div>
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-2">
-            <span className={cx("font-medium text-ink", compact ? "text-[14px]" : "text-[15px]")}>{m.enabled ? "On" : "Off"}</span>
+            <span className={cx("font-medium text-ink", compact ? "text-[14px]" : "text-[15px]")}>{compact ? `${m.name} module: ${m.enabled ? "on" : "off"}` : m.enabled ? "On" : "Off"}</span>
             {badge !== undefined && (
               <span className={cx("label inline-flex items-center gap-1 text-[10px]", m.state === "error" ? "text-danger" : "text-ink-faint")}>
                 {m.state !== "error" && <Spinner size={10} />}

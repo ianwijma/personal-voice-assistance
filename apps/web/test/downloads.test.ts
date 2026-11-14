@@ -27,7 +27,7 @@ describe("model downloads in the client", () => {
   })
 
   it("jobs arrive in the snapshot and as `job` messages; running and last are found by tool and target", () => {
-    let s = reducer(initialState, serverExamples.welcome)
+    let s = reducer(reducer(initialState, serverExamples.welcome), serverExamples["admin.snapshot"])
     expect(runningJob(s, "stt-models", "whisper-turbo")?.id).toBe(exampleJob.id)
     s = reducer(s, serverExamples.job)
     expect(runningJob(s, "stt-models", "whisper-turbo")).toBeUndefined()

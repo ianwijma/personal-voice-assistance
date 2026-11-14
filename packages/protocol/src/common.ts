@@ -29,8 +29,14 @@ export const NonNegativeFinite = Schema.Finite.check(Schema.isGreaterThanOrEqual
  * What the assistant is doing, as decided by the server (see the state table in
  * docs/UI-AND-MODULES.md). `muted`, `disconnected`, `error` and "not started"
  * are client-side states layered on top.
+ *
+ * `asleep` (protocol 5): there is an audio owner, its profile's activation is `wake-phrase`, and no window is
+ * open (no armed window after the phrase alone, no follow-up window after a reply, no reply in progress that
+ * counts as awake). The assistant still hears everything but reacts only to a wake phrase. The voice front end
+ * shows *Say "<first wake phrase>"*. It takes the place of `listening`; `hearing` is not shown for speech the wake
+ * gate holds back (ordinary talk in the room), only once an utterance is accepted.
  */
-export const AssistantState = Schema.Literals(["idle", "listening", "hearing", "thinking", "speaking"])
+export const AssistantState = Schema.Literals(["idle", "listening", "hearing", "thinking", "speaking", "asleep"])
 export type AssistantState = typeof AssistantState.Type
 
 export const TurnOutcome = Schema.Literals(["completed", "interrupted", "discarded", "failed"])
@@ -45,7 +51,8 @@ export const Role = Schema.Literals(["owner", "observer"])
 export type Role = typeof Role.Type
 
 /**
- * How the user can interrupt the assistant while it speaks, chosen per device:
+ * How the user can interrupt the assistant while it speaks, per device (a `DeviceProfile` field since protocol 5;
+ * it used to be sent in `audio.claim` / `audio.config`):
  * - `instant`: any speech interrupts (headphones, or proven echo cancellation).
  * - `confirm`: speech interrupts once the recogniser has heard at least two words
  *   that are not the assistant's own (open speakers; the default).
@@ -81,12 +88,22 @@ export const ErrorCode = Schema.Literals([
   /** A turn failed (provider error); the conversation continues. */
   "turn_failed",
   /**
-   * Protected: the setting or module can only be changed by a page with admin access (type the vault password
-   * in Settings → Keys & access), or the keys it needs are locked.
+   * The keys it needs are locked (the vault is locked, or a `.env` key cannot be moved while it is). Since
+   * protocol 5 a request from a connection that is not admin is answered `admin_required` instead.
    */
   "locked",
-  /** A vault password was wrong, too short, or refused for now (too many attempts; see `vault.retryAfterMs`). */
+  /**
+   * A password was wrong, too short, or refused for now (too many attempts): the vault password (see
+   * `vault.retryAfterMs`) or, since protocol 5, the admin password of `admin.login` (see `admin.state.retryAfterMs`).
+   */
   "bad_password",
+  /**
+   * Protocol 5: the request needs an admin connection (`admin.login`) and this one is not, or its session ended.
+   * Every settings, module, vault, job, model, `.env`, front-end and device-admin request, and `wake.test`.
+   */
+  "admin_required",
+  /** Protocol 5: no such device (`device.admin.update`, `device.forget`) or front-end kind (`frontend.update`). */
+  "unknown_device",
   "internal"
 ])
 export type ErrorCode = typeof ErrorCode.Type

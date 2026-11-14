@@ -8,10 +8,8 @@ import { Icon, Spinner } from "./ui/Icon.tsx"
 import { Button, cx } from "./ui/controls.tsx"
 
 /**
- * "Keys & access": the key vault's controls for this page. Self-contained
- * (reads `ClientState.vault`, calls the client's vault actions), so any screen
- * can place it: the settings screen's Keys & access › Edit access page. The
- * page headers' inline unlock and the engine banner use `UnlockForm`.
+ * The key vault's controls (admin: Keys & vault › Vault). Self-contained (reads `ClientState.vault`, calls the
+ * client's vault actions). Protected pages' inline unlock uses `UnlockForm`.
  */
 export function KeysPanel() {
   const vault = useClientState((s) => s.vault, shallowEqual)
@@ -32,16 +30,7 @@ export function KeysPanel() {
           <UnlockForm label="Unlock" />
         </section>
       )}
-      {view === "elevate" && (
-        <section className="flex flex-col gap-3">
-          <Heading icon="lock" title="Keys are unlocked" />
-          <p className="text-[13px] text-ink-muted">
-            The assistant can use its keys. To change providers, keys or agents from this page, type the password.
-          </p>
-          <UnlockForm label="Get edit access" />
-        </section>
-      )}
-      {view === "admin" && <AdminControls />}
+      {view === "unlocked" && <UnlockedControls />}
       {vault.location !== undefined && (
         <p className="text-[12px] text-ink-faint">
           Vault file: <span className="break-all font-mono">{vault.location}</span>. Forgot the password? Delete that file; the keys in it are lost and
@@ -52,7 +41,7 @@ export function KeysPanel() {
   )
 }
 
-function Heading({ icon, title }: { readonly icon: "lock"; readonly title: string }) {
+function Heading({ icon, title }: { readonly icon: "lock" | "unlock"; readonly title: string }) {
   return (
     <h3 className="flex items-center gap-2 text-[15px] font-medium text-ink">
       <Icon name={icon} size={16} className="text-ink-muted" />
@@ -107,10 +96,7 @@ function useRetryCountdown(): number {
   return retrySecondsLeft(retryAfterMs, receivedAt, now)
 }
 
-/**
- * Password + button: unlocks the vault (or gives this page edit access when it is already unlocked). Also used by
- * the engine banner and, inline, by protected settings pages (`idSuffix` keeps their ids apart).
- */
+/** Password + button: unlocks the vault. Also used inline by protected settings pages (`idSuffix` keeps their ids apart). */
 export function UnlockForm({ label = "Unlock", compact = false, idSuffix }: { readonly label?: string; readonly compact?: boolean; readonly idSuffix?: string }) {
   const client = useClient()
   const [password, setPassword] = useState("")
@@ -182,9 +168,9 @@ function SetupForm() {
     <section className="flex flex-col gap-3" data-testid="vault-setup">
       <Heading icon="lock" title="Protect your keys" />
       <p className="text-[13px] text-ink-muted">
-        API keys are now stored unencrypted in the project folder, and anyone who opens this page can change providers and keys. Set a password:
-        the keys move out of the project into an encrypted file, and only a page where the password was typed can change keys, providers and
-        agents. You type the password again after every restart of the assistant.
+        API keys are now stored unencrypted in the project folder. Set a password: the keys move out of the project into an encrypted file.
+        After every restart of the assistant you unlock it here again (or set <code className="font-mono text-[12px] text-ink">PVA_VAULT_PASSWORD</code> in .env
+        for unattended starts). This is not the admin password.
       </p>
       <form onSubmit={(e) => void submit(e)} className="flex flex-col gap-3">
         <PasswordInput id="vault-new" label="New password" value={password} onChange={setPassword} autoComplete="new-password" disabled={busy} />
@@ -201,7 +187,7 @@ function SetupForm() {
   )
 }
 
-function AdminControls() {
+function UnlockedControls() {
   const client = useClient()
   const [changing, setChanging] = useState(false)
   const [current, setCurrent] = useState("")
@@ -233,9 +219,9 @@ function AdminControls() {
   }
   return (
     <section className="flex flex-col gap-3" data-testid="vault-admin">
-      <Heading icon="lock" title="Keys are unlocked" />
+      <Heading icon="unlock" title="Keys are unlocked" />
       <p className="text-[13px] text-ink-muted">
-        This page can change keys, providers and agents. Access ends when you close the page, lock, or after 15 minutes without a change.
+        The assistant can use its keys, and you can change them on the pages that use them.
       </p>
       <div className="flex flex-wrap items-center gap-2">
         <Button size="sm" onClick={() => void lock()} disabled={busy}>Lock now</Button>

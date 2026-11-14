@@ -1,15 +1,26 @@
 // SessionHub request limits: requests that do work (settings, modules, reload) are bounded per connection and overall.
-import { encodeClientMessage, PROTOCOL_VERSION, type ServerMessage } from "@pva/protocol"
+import { DEFAULT_DEVICE_PROFILE, encodeClientMessage, PROTOCOL_VERSION, type ServerMessage } from "@pva/protocol"
 import { Deferred, Effect } from "effect"
 import { describe, expect, it } from "vitest"
 import { makeAccessPolicy } from "../src/serve/access.ts"
+import { makeAdminSessions } from "../src/serve/AdminSessions.ts"
 import { type HubConnection, makeSessionHub } from "../src/serve/SessionHub.ts"
 
-/** No key vault (everything open): the access checks pass, as before the vault existed. */
-const noVault = {
+const ADMIN_PASSWORD = "hub admin password"
+
+/** No key vault; an admin password (each tab of these tests logs in, since every change is admin only). */
+const noVault = () => ({
   keys: { state: () => "none", info: () => ({ state: "none", admin: true, location: "" }), subscribe: () => () => {} } as never,
-  access: makeAccessPolicy({ catalog: [], sections: () => [], vaultState: () => "none" })
-}
+  access: makeAccessPolicy({ catalog: [], sections: () => [], vaultState: () => "none" }),
+  admin: makeAdminSessions({ password: ADMIN_PASSWORD }),
+  frontends: {
+    profile: () => DEFAULT_DEVICE_PROFILE,
+    kinds: () => [],
+    devices: () => [],
+    seen: () => Effect.void,
+    left: () => {}
+  } as never
+})
 
 const setup = () => {
   const gate = Effect.runSync(Deferred.make<void>())
@@ -36,7 +47,7 @@ const setup = () => {
     run: (effect) => void Effect.runFork(effect),
     onSectionSaved: () => {},
     server: { name: "test", version: "0" },
-    ...noVault
+    ...noVault()
   })
   const connect = (id: string) => {
     const received: Array<ServerMessage> = []
@@ -48,8 +59,10 @@ const setup = () => {
       bufferedAmount: () => 0
     }
     const handlers = hub.accept(connection)!
-    handlers.onText(encodeClientMessage({ type: "hello", protocol: PROTOCOL_VERSION, clientId: `client-${id}-0000`, resumeOwner: false }))
-    const results = () => received.filter((m): m is Extract<ServerMessage, { type: "result" }> => m.type === "result")
+    handlers.onText(encodeClientMessage({ type: "hello", protocol: PROTOCOL_VERSION, clientId: `client-${id}-0000`, resumeOwner: false, frontend: "admin" }))
+    handlers.onText(encodeClientMessage({ type: "admin.login", requestId: `login-${id}`, password: ADMIN_PASSWORD }))
+    // Only the results of the requests under test.
+    const results = () => received.filter((m): m is Extract<ServerMessage, { type: "result" }> => m.type === "result" && !m.requestId.startsWith("login-"))
     return { handlers, results }
   }
   return { hub, connect, release: () => Effect.runSync(Deferred.succeed(gate, undefined)), started: () => started, finished: () => finished }
@@ -116,11 +129,11 @@ describe("SessionHub: typed input", () => {
       run: (effect) => void Effect.runFork(effect),
       onSectionSaved: () => {},
       server: { name: "test", version: "0" },
-      ...noVault
+      ...noVault()
     })
     const received: Array<ServerMessage> = []
     const handlers = hub.accept({ id: "a", sendText: (t) => received.push(JSON.parse(t)), sendBinary: () => {}, close: () => {}, bufferedAmount: () => 0 })!
-    handlers.onText(encodeClientMessage({ type: "hello", protocol: PROTOCOL_VERSION, clientId: "client-a-0000", resumeOwner: false }))
+    handlers.onText(encodeClientMessage({ type: "hello", protocol: PROTOCOL_VERSION, clientId: "client-a-0000", resumeOwner: false, frontend: "voice" }))
     const say = (n: number) => handlers.onText(encodeClientMessage({ type: "text.send", requestId: `t${n}`, text: `hi ${n}`, speak: false }))
     const results = () => received.filter((m): m is Extract<ServerMessage, { type: "result" }> => m.type === "result")
     return { say, results, sent }

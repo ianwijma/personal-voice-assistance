@@ -38,6 +38,8 @@ export const STATE_PARAMS: { readonly [S in VisualState]: StateParams } = {
   muted: { color: "ink-faint", alpha: 1, aMin: 0, omega: [0, 0, 0], weights: [1, 0.5, 0.3], gap: true },
   hearing: { color: "you", alpha: 1, aMin: 3, omega: [2.4, 3.1, 4.2], weights: [1, 0.7, 0.5], glow: { blur: 8, alpha: 0.35 } },
   listening: { color: "you", alpha: 0.85, aMin: 2, omega: [0.6, 0.9, 1.3], weights: [1, 0.6, 0.35], breathe: true },
+  // Wake-phrase mode, waiting for the phrase: your colour, faint and slow, breathing.
+  asleep: { color: "you", alpha: 0.42, aMin: 1.5, omega: [0.25, 0.35, 0.45], weights: [1, 0.5, 0.3], breathe: true },
   idle: { color: "ink-faint", alpha: 1, aMin: 1, omega: [0.3, 0.4, 0.5], weights: [1, 0.5, 0.3] }
 }
 

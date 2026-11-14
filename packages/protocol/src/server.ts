@@ -10,7 +10,9 @@ import {
   TurnId,
   TurnSource
 } from "./common.ts"
-import { EngineStatus, ModuleInfo, SettingsSection, Snapshot, TraceInfo } from "./snapshot.ts"
+import { AdminSession, AdminState } from "./admin.ts"
+import { DeviceInfo, DeviceProfileInfo, FrontendKindInfo, WakePhrase } from "./frontends.ts"
+import { AdminSnapshot, EngineStatus, EngineSummary, ModuleInfo, SettingsSection, Snapshot, TraceInfo } from "./snapshot.ts"
 import { EnvInfo } from "./env.ts"
 import { JobInfo, ModelSet } from "./jobs.ts"
 import { VaultInfo } from "./vault.ts"
@@ -19,9 +21,17 @@ import { VaultInfo } from "./vault.ts"
  * Text frames from the assistant to the browser. Binary frames from the
  * assistant are reply audio (see `frames.ts`) and go to the audio owner only;
  * every other message goes to every connected tab unless noted.
+ *
+ * Protocol 5: messages marked "Admin connections only" carry admin data (settings, modules, engine details,
+ * vault, `.env`, models, jobs, front ends, devices) and go only to connections that are admin (`admin.ts`).
+ * Turn events go to every connection; `turn.end.trace` is included for every connection (it is the turn's own
+ * latency), while the trace list lives in `admin.snapshot`.
  */
 
-/** Answer to `hello`. Sent only to the new connection. */
+/**
+ * Answer to `hello`. Sent only to the new connection, with the voice part of the state. On an admin connection
+ * whose `hello.adminToken` was valid, `admin.snapshot` follows immediately.
+ */
 export const Welcome = Schema.Struct({
   type: Schema.Literal("welcome"),
   protocol: Schema.Int,
@@ -135,40 +145,43 @@ export const ReplyStop = Schema.Struct({
   turnId: TurnId
 })
 
+/** Admin connections only. */
 export const ModuleChanged = Schema.Struct({
   type: Schema.Literal("module.changed"),
   module: ModuleInfo
 })
 
+/** Admin connections only. */
 export const SectionChanged = Schema.Struct({
   type: Schema.Literal("section.changed"),
   section: SettingsSection
 })
 
+/** Admin connections only: the full engine status changed. Everyone also gets `engine.summary` when it changes. */
 export const Engine = Schema.Struct({
   type: Schema.Literal("engine"),
   engine: EngineStatus
 })
 
-/** The vault's state or this page's admin access changed. Sent to each tab with its own `admin`. */
+/** Admin connections only: the vault's state changed. (`vault.admin` mirrors `AdminState.loggedIn` since protocol 5.) */
 export const Vault = Schema.Struct({
   type: Schema.Literal("vault"),
   vault: VaultInfo
 })
 
-/** The settings set outside the UI changed (a move, or an engine reload). */
+/** Admin connections only: the settings set outside the UI changed (a move, or an engine reload). */
 export const Env = Schema.Struct({
   type: Schema.Literal("env"),
   env: EnvInfo
 })
 
-/** A job started, progressed (at most 4 per second), or ended. Sent to every tab. */
+/** Admin connections only: a job started, progressed (at most 4 per second), or ended. */
 export const Job = Schema.Struct({
   type: Schema.Literal("job"),
   job: JobInfo
 })
 
-/** The downloadable models changed (a download finished, a model was deleted, the engines changed). */
+/** Admin connections only: the downloadable models changed (a download finished, a model was deleted, the engines changed). */
 export const Models = Schema.Struct({
   type: Schema.Literal("models"),
   models: Schema.Array(ModelSet)
@@ -180,7 +193,91 @@ export const Result = Schema.Struct({
   requestId: RequestId,
   ok: Schema.Boolean,
   /** Present when `ok` is false. */
-  error: Schema.optionalKey(ErrorInfo)
+  error: Schema.optionalKey(ErrorInfo),
+  /** Protocol 5: present only on the successful result of `admin.login`. */
+  admin: Schema.optionalKey(AdminSession)
+})
+
+/**
+ * Protocol 5: everyone. The engine's readiness or the enabled voices changed (sent with every change that alters
+ * the summary; admin connections also get `engine`).
+ */
+export const EngineSummaryMessage = Schema.Struct({
+  type: Schema.Literal("engine.summary"),
+  engine: EngineSummary
+})
+
+/**
+ * Protocol 5: this connection's admin access changed (login, logout, session end, a wrong password with back-off).
+ * Sent to the connection concerned only.
+ */
+export const AdminStateMessage = Schema.Struct({
+  type: Schema.Literal("admin.state"),
+  admin: AdminState
+})
+
+/**
+ * Protocol 5, admin connections only: the admin part of the state. Sent right after `welcome` (valid
+ * `hello.adminToken`) or right after a successful `admin.login`. Replaces everything admin the page held.
+ */
+export const AdminSnapshotMessage = Schema.Struct({
+  type: Schema.Literal("admin.snapshot"),
+  snapshot: AdminSnapshot
+})
+
+/**
+ * Protocol 5: this connection's effective device profile changed (its own `device.update`, an admin change to its
+ * kind or to the device, the device was forgotten, or a voice became disabled so `voice` fell back to `""`). Sent
+ * to every connection of the device. Replaces `snapshot.device`.
+ */
+export const DeviceProfileMessage = Schema.Struct({
+  type: Schema.Literal("device.profile"),
+  ...DeviceProfileInfo.fields
+})
+
+/** Protocol 5, admin connections only: the front-end kinds or their defaults changed. The whole list. */
+export const Frontends = Schema.Struct({
+  type: Schema.Literal("frontends"),
+  frontends: Schema.Array(FrontendKindInfo)
+})
+
+/**
+ * Protocol 5, admin connections only: the devices changed (seen, renamed, overrides, forgotten, connected,
+ * disconnected, audio owner). The whole list, most recently seen first; at most one per second while only
+ * `lastSeen` / `connections` change.
+ */
+export const Devices = Schema.Struct({
+  type: Schema.Literal("devices"),
+  devices: Schema.Array(DeviceInfo)
+})
+
+/**
+ * Protocol 5, everyone: the audio owner said a wake phrase. `phrase` is the configured phrase that matched.
+ * `armed: true`: it was the phrase alone; the next utterance within `WAKE_ARMED_MS` needs no phrase (the voice
+ * front end shows "Listening…" and plays its cue). `armed: false`: the phrase and the request came in one
+ * utterance (a turn follows; the cue is skipped).
+ */
+export const Wake = Schema.Struct({
+  type: Schema.Literal("wake"),
+  phrase: WakePhrase,
+  armed: Schema.Boolean
+})
+
+/**
+ * Protocol 5, admin connections that switched `wake.test` on: one final transcript of the audio owner, as the
+ * recogniser heard it (before the phrase was removed). `matched`: the wake phrase it matched (absent = it matched
+ * none). `accepted`: the assistant took the utterance (it answers it, or the phrase alone made it listen); `true`
+ * without `matched` means it was accepted without a phrase (always listening, or inside an armed or follow-up
+ * window), `false` that it was ignored. Absent from an older server: the page then only knows "no phrase matched".
+ * Never stored.
+ */
+export const WakeHeard = Schema.Struct({
+  type: Schema.Literal("wake.heard"),
+  text: Schema.String,
+  matched: Schema.optionalKey(WakePhrase),
+  accepted: Schema.optionalKey(Schema.Boolean),
+  /** Epoch milliseconds. */
+  at: NonNegativeFinite
 })
 
 /** A problem not tied to a request (a failed turn, lost microphone audio, a module that crashed). */
@@ -217,6 +314,14 @@ export const ServerMessage = Schema.Union([
   Models,
   Result,
   ErrorMessage,
+  EngineSummaryMessage,
+  AdminStateMessage,
+  AdminSnapshotMessage,
+  DeviceProfileMessage,
+  Frontends,
+  Devices,
+  Wake,
+  WakeHeard,
   Pong
 ]).pipe(Schema.toTaggedUnion("type"))
 export type ServerMessage = typeof ServerMessage.Type

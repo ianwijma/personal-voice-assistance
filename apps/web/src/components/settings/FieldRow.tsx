@@ -9,6 +9,7 @@ import { useClient } from "../context.tsx"
 import { Icon } from "../ui/Icon.tsx"
 import { Button } from "../ui/controls.tsx"
 import { DownloadControl } from "./DownloadControl.tsx"
+import { FieldMarkers } from "./FormFooter.tsx"
 
 export const RELOAD_NOTE = "Applies after reloading the engines (about 2 s; interrupts a reply)."
 
@@ -52,8 +53,8 @@ export interface FieldRowProps {
 }
 
 /**
- * One generated field (docs/SETTINGS-UI.md §3.2, §3.5): label, reload chip, a "Changed · Reset" marker for a saved
- * value, the field's renderer (or, when the environment sets it, the value read-only with a pin and where it comes
+ * One generated field (docs/SETTINGS-UI.md §3.2, §3.5): label, a small reload marker (the footer says what it
+ * means when such a field is changed), "Unsaved" for an edit and "Custom · Reset" for a saved non-default value, the field's renderer (or, when the environment sets it, the value read-only with a pin and where it comes
  * from), then errors, warnings and the description.
  */
 export function FieldRow({ field, form, draft, idPrefix, errors, warnings, readOnly, saving, vault, setDraft, onLocalError }: FieldRowProps) {
@@ -61,8 +62,14 @@ export function FieldRow({ field, form, draft, idPrefix, errors, warnings, readO
   const describedBy = `${id}-desc`
   const Renderer = fieldRenderers[field.type] as ComponentType<FieldProps>
   const resetPending = draft.reset?.includes(field.key) === true
-  const canReset = !readOnly && field.locked === undefined && field.type !== "secret" && field.source === "saved" &&
-    !resetPending && !valueEqual(form.values[field.key], field.default)
+  // Saved, and not what it would be by default: "Custom" (stays until a reset is saved).
+  const custom = field.locked === undefined && field.type !== "secret" && field.source === "saved" && !resetPending &&
+    !valueEqual(form.values[field.key], field.default)
+  const canReset = !readOnly && custom
+  /** The default, in words (secrets have none). */
+  const defaultText = field.type === "secret" ? "" : displayValue(field, field.default)
+  // Edited here and not saved yet (secrets show their own state).
+  const unsaved = field.type !== "secret" && field.locked === undefined && (resetPending || (draft.values[field.key] !== undefined && !valueEqual(draft.values[field.key], draft.base[field.key])))
   const secret = form.secrets[field.key]
   // A newly chosen model that is not downloaded: offer Download, and hold Save until it is there (§3.3).
   const toDownload = field.locked === undefined ? optionsToDownload(field, draft.values[field.key]) : []
@@ -76,21 +83,19 @@ export function FieldRow({ field, form, draft, idPrefix, errors, warnings, readO
     <div className="flex flex-col gap-1.5" data-field={field.key} data-field-type={field.type} data-source={field.source}>
       <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
         <label htmlFor={id} className="text-[14px] font-medium text-ink">{field.label}</label>
-        {field.apply === "reload" && <span className="label text-[10px] text-ink-faint" title={RELOAD_NOTE}>Reload</span>}
-        {canReset && (
-          <span className="ml-auto inline-flex items-baseline gap-2">
-            <span className="label text-[10px] text-ink-faint" title="Saved from this screen; the default is different">Changed</span>
-            <button
-              type="button"
-              className="text-[12px] text-voice underline-offset-4 hover:underline"
-              onClick={() => setDraft((d) => resetDraftValue(d, field))}
-              aria-label={`Reset ${field.label} to its default`}
-            >
-              Reset
-            </button>
+        {field.apply === "reload" && (
+          <span className="inline-flex self-center text-ink-faint" title={RELOAD_NOTE} data-testid="reload-marker">
+            <Icon name="reload" size={12} />
+            <span className="sr-only">(applies after an engine reload)</span>
           </span>
         )}
-        {resetPending && <span className="label ml-auto text-[10px] text-voice">Default when saved</span>}
+        <FieldMarkers
+          unsaved={unsaved}
+          {...(resetPending ? { unsavedTitle: `Goes back to the default (${defaultText}) when saved` } : {})}
+          saved={custom ? "Custom" : undefined}
+          savedTitle={`Saved from this screen; the default is ${defaultText}`}
+          reset={canReset ? { label: `Reset ${field.label} to the default (${defaultText})`, onReset: () => setDraft((d) => resetDraftValue(d, field)) } : undefined}
+        />
       </div>
       {field.locked !== undefined ? (
         <div id={id} className="flex items-start gap-2 rounded-md border border-line/70 bg-surface-2/40 px-3 py-2" data-testid="locked-value">
@@ -133,7 +138,6 @@ export function FieldRow({ field, form, draft, idPrefix, errors, warnings, readO
         {errors.map((m, i) => <p key={`e${i}`} role="alert" className="text-[13px] text-danger">{m}</p>)}
         {warnings.map((m, i) => <p key={`w${i}`} className="text-[13px] text-warn" data-testid="field-warning">{m}</p>)}
         {field.description !== undefined && <p className="text-[13px] text-ink-muted">{field.description}</p>}
-        {field.apply === "reload" && field.locked === undefined && !readOnly && <p className="text-[12px] text-ink-faint">{RELOAD_NOTE}</p>}
       </div>
     </div>
   )
@@ -150,7 +154,7 @@ function MoveToSettings({ variable, readOnly, secret, vaultLocked }: {
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | undefined>()
   if (variable === undefined) return null
-  if (readOnly) return <p className="mt-1 text-[12px] text-ink-faint">A page with edit access can move it into the settings.</p>
+  if (readOnly) return <p className="mt-1 text-[12px] text-ink-faint">Unlock the keys to move it into the settings.</p>
   return (
     <div className="mt-2 flex flex-col gap-1">
       <div className="flex flex-wrap items-center gap-2">

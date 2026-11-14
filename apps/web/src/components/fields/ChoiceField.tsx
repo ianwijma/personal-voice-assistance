@@ -40,7 +40,7 @@ export function ChoiceField({ field, id, describedBy, value, onChange, disabled,
                 className={cx(
                   "flex min-h-11 w-full items-start gap-3 rounded-md border px-3 py-2.5 text-left transition-colors duration-[120ms]",
                   "disabled:cursor-not-allowed disabled:opacity-60",
-                  checked ? "border-ink-faint/70 bg-surface-2/70" : "border-line hover:border-ink-faint/50"
+                  checked ? "border-ink-muted bg-surface-2/70 shadow-[inset_0_0_0_1px_var(--color-ink-muted)]" : "border-line hover:border-ink-faint/50"
                 )}
               >
                 <span

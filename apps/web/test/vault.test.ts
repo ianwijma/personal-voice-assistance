@@ -1,55 +1,46 @@
 import { describe, expect, it } from "vitest"
 import type { ServerMessage } from "@pva/protocol"
-import { exampleSnapshot, serverExamples } from "@pva/protocol/examples"
-import { canChange, engineNeedsKeys, initialState, noVault, reducer } from "@/lib/state.ts"
+import { exampleAdminSnapshot, exampleEngineStatus, serverExamples } from "@pva/protocol/examples"
+import { engineNeedsKeys, initialState, noVault, reducer } from "@/lib/state.ts"
 import { keysView, newPasswordProblem, passwordProblem, retrySecondsLeft, secretStatus } from "@/lib/vault.ts"
 
-const welcomeWith = (vault: typeof exampleSnapshot.vault): ServerMessage => ({
-  ...serverExamples.welcome,
-  snapshot: vault === undefined ? (({ vault: _v, ...rest }) => rest)(exampleSnapshot) : { ...exampleSnapshot, vault }
-})
+// Protocol 5 sends the vault in `admin.snapshot` (admin connections only), not in `welcome`.
+const welcomeWith = (vault: typeof exampleAdminSnapshot.vault | undefined): Array<ServerMessage> => [
+  serverExamples.welcome,
+  ...(vault === undefined ? [] : [{ type: "admin.snapshot" as const, snapshot: { ...exampleAdminSnapshot, vault } }])
+]
+const reduceAll = (s: typeof initialState, ms: ReadonlyArray<ServerMessage>) => ms.reduce(reducer, s)
 
 describe("vault state", () => {
-  it("welcome takes the snapshot's vault; a server without one means 'none, everyone may change'", () => {
-    expect(reducer(initialState, welcomeWith({ state: "locked", admin: false })).vault).toEqual({ state: "locked", admin: false })
-    expect(reducer(initialState, welcomeWith(undefined)).vault).toEqual(noVault)
+  it("the admin snapshot carries the vault; without one (a voice page) it is unknown and nothing is admin", () => {
+    expect(reduceAll(initialState, welcomeWith({ state: "locked", admin: false })).vault).toEqual({ state: "locked", admin: false })
+    expect(reduceAll(initialState, welcomeWith(undefined)).vault).toEqual(noVault)
   })
 
   it("`vault` messages replace it (admin is this page's own)", () => {
-    let s = reducer(initialState, welcomeWith({ state: "unlocked", admin: false }))
+    let s = reduceAll(initialState, welcomeWith({ state: "unlocked", admin: false }))
     s = reducer(s, { type: "vault", vault: { state: "unlocked", admin: true } })
     expect(s.vault.admin).toBe(true)
     s = reducer(s, serverExamples.vault)
     expect(s.vault).toEqual(serverExamples.vault.vault)
   })
 
-  it("protected items need admin access; unprotected ones never do", () => {
-    const locked = reducer(initialState, welcomeWith({ state: "unlocked", admin: false }))
-    const admin = reducer(locked, { type: "vault", vault: { state: "unlocked", admin: true } })
-    expect(canChange(locked, { protected: true })).toBe(false)
-    expect(canChange(locked, {})).toBe(true)
-    expect(canChange(locked, undefined)).toBe(true)
-    expect(canChange(admin, { protected: true })).toBe(true)
-    const none = reducer(initialState, welcomeWith({ state: "none", admin: true }))
-    expect(canChange(none, { protected: true })).toBe(true)
-  })
-
   it("engineNeedsKeys: failed engines while the vault is locked", () => {
-    const failed = { ...exampleSnapshot.engine, state: "failed" as const, problems: [{ stage: "llm", message: "Keys are locked — unlock them in Options" }] }
-    let s = reducer(initialState, welcomeWith({ state: "locked", admin: false }))
+    const failed = { ...exampleEngineStatus, state: "failed" as const, problems: [{ stage: "llm", message: "Keys are locked — unlock them in Options" }] }
+    let s = reduceAll(initialState, welcomeWith({ state: "locked", admin: false }))
     s = reducer(s, { type: "engine", engine: failed })
     expect(engineNeedsKeys(s)).toBe(true)
     expect(engineNeedsKeys(reducer(s, { type: "vault", vault: { state: "unlocked", admin: true } }))).toBe(false)
-    expect(engineNeedsKeys(reducer(s, { type: "engine", engine: exampleSnapshot.engine }))).toBe(false)
+    expect(engineNeedsKeys(reducer(s, { type: "engine", engine: exampleEngineStatus }))).toBe(false)
   })
 })
 
-describe("Keys & access logic", () => {
-  it("chooses the controls from the vault state and this page's access", () => {
+describe("Keys & vault logic", () => {
+  it("chooses the controls from the vault state only (who may change things is the admin login since protocol 5)", () => {
     expect(keysView({ state: "none", admin: true })).toBe("setup")
-    expect(keysView({ state: "locked", admin: false })).toBe("unlock")
-    expect(keysView({ state: "unlocked", admin: false })).toBe("elevate")
-    expect(keysView({ state: "unlocked", admin: true })).toBe("admin")
+    expect(keysView({ state: "locked", admin: true })).toBe("unlock")
+    expect(keysView({ state: "unlocked", admin: true })).toBe("unlocked")
+    expect(keysView({ state: "unlocked", admin: false })).toBe("unlocked")
   })
 
   it("checks a new password before sending it", () => {

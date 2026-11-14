@@ -1,5 +1,6 @@
-// A plain static file server for the exported site (`out/`), like the one the
-// assistant's server will be: GET/HEAD, `/` → index.html, `/x` → x.html.
+// A plain static file server for the exported site (`out/`), like the assistant's server: GET/HEAD, a directory
+// URL (`/`, `/admin/`) → its index.html, a directory without the trailing slash (`/admin`) → 308 to `/admin/`
+// (the export uses `trailingSlash: true`), `/x` → x.html.
 // Usage: node scripts/serve-static.mjs [dir] [port]
 import { createReadStream, existsSync, statSync } from "node:fs"
 import { createServer } from "node:http"
@@ -24,7 +25,14 @@ createServer((req, res) => {
     res.writeHead(403).end()
     return
   }
-  if (existsSync(file) && statSync(file).isDirectory()) file = join(file, "index.html")
+  if (existsSync(file) && statSync(file).isDirectory()) {
+    if (!path.endsWith("/")) {
+      const url = new URL(req.url ?? "/", "http://x")
+      res.writeHead(308, { location: `${url.pathname}/${url.search}` }).end()
+      return
+    }
+    file = join(file, "index.html")
+  }
   else if (!existsSync(file) && existsSync(`${file}.html`)) file = `${file}.html`
   if (!existsSync(file)) {
     res.writeHead(404, { "content-type": "text/plain" }).end("not found")

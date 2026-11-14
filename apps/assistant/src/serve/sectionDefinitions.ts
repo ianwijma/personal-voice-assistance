@@ -128,7 +128,7 @@ export const sectionDefinitions = (dirs: ModelDirs = defaultModelDirs): Readonly
       id: "language-model",
       title: "Provider",
       group: "agents",
-      page: { id: "provider", title: "Provider", description: "Who answers you. Changing it reloads the engines (a few seconds)." },
+      page: { id: "provider", title: "Provider", description: "Who answers you." },
       order: 10,
       protected: true,
       spec: {

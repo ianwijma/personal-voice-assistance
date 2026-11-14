@@ -35,7 +35,14 @@ const FILES = [
   // Fifth review: outside the lifecycle, but they await and then act.
   "src/lib/echoTest.ts",
   // The settings screen (docs/SETTINGS-UI.md) replaced DeviceTab, AssistantTab, ModuleCard and SettingsForm.
-  "src/components/settings/pages/DevicePages.tsx",
+  "src/components/voice/VoiceSheet.tsx",
+  "src/components/voice/useMediaDevices.ts",
+  // Protocol 5: the admin front end's pages that await a request.
+  "src/components/admin/LoginScreen.tsx",
+  "src/components/admin/AdminHeader.tsx",
+  "src/components/settings/ProfileForm.tsx",
+  "src/components/settings/PhraseTester.tsx",
+  "src/components/settings/pages/DevicesPages.tsx",
   "src/components/settings/ReloadBar.tsx",
   "src/components/settings/ServerPage.tsx",
   "src/components/settings/ModuleHeader.tsx",

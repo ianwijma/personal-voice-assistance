@@ -80,11 +80,28 @@ describe("connection", () => {
     const { url, peers } = await startServer()
     const { store, conn } = connect(url, fakeAudio().audio)
     await until(() => store.get().connection.status === "open")
-    expect(peers[0]!.text[0]).toEqual({ type: "hello", protocol: PROTOCOL_VERSION, clientId: "c-test-0001", resumeOwner: false })
+    expect(peers[0]!.text[0]).toEqual({ type: "hello", protocol: PROTOCOL_VERSION, clientId: "c-test-0001", resumeOwner: false, frontend: "voice" })
     expect(store.get().connection.connectionId).toBe("conn-3")
     expect(conn.isOpen()).toBe(true)
     await until(() => peers[0]!.text.filter((m) => m.type === "ping").length >= 3)
     expect(store.get().connection.status).toBe("open") // pongs keep it alive
+  })
+
+  it("protocol 5: hello says what the page is: a voice page with its device; an admin page with its token, read on every connect", async () => {
+    const { url, peers } = await startServer()
+    const audio = fakeAudio(false).audio
+    const voice = makeConnection({ url, clientId: "c-test-0002", store: createClientStore(), audio, timing, identity: () => ({ frontend: "voice", device: { id: "d-test-device-1", kind: "web-voice", name: "Mac · Chrome" } }) })
+    stops.push(voice.start())
+    let token: string | undefined
+    const admin = makeConnection({ url, clientId: "c-test-0003", store: createClientStore(), audio, timing, identity: () => (token === undefined ? { frontend: "admin" } : { frontend: "admin", adminToken: token }) })
+    stops.push(admin.start())
+    await until(() => peers.filter((p) => p.text.length > 0).length === 2)
+    const hellos = peers.map((p) => p.text[0]!)
+    expect(hellos).toContainEqual({ type: "hello", protocol: PROTOCOL_VERSION, clientId: "c-test-0002", resumeOwner: false, frontend: "voice", device: { id: "d-test-device-1", kind: "web-voice", name: "Mac · Chrome" } })
+    expect(hellos).toContainEqual({ type: "hello", protocol: PROTOCOL_VERSION, clientId: "c-test-0003", resumeOwner: false, frontend: "admin" })
+    token = "A".repeat(43)
+    for (const p of peers.filter((x) => x.text[0]?.type === "hello" && (x.text[0] as { clientId: string }).clientId === "c-test-0003")) p.ws.terminate()
+    await until(() => peers.some((p) => (p.text[0] as { adminToken?: string } | undefined)?.adminToken === token), 3000)
   })
 
   it("resolves requests with their result, and times out unanswered ones", async () => {

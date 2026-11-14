@@ -1,20 +1,26 @@
-import type {
-  AssistantState,
-  EngineStatus,
+import {
+  type AdminState,
+  type AssistantState,
+  DEFAULT_DEVICE_PROFILE,
+  type DeviceInfo,
+  type DeviceProfile,
+  type DeviceProfileInfo,
+  type EngineStatus,
+  type EngineSummary,
+  type FrontendKindInfo,
   EnvInfo,
-  ErrorInfo,
-  HistoryItem,
-  InterruptMode,
-  JobInfo,
-  ModelSet,
-  ModuleInfo,
-  Role,
-  ServerMessage,
-  ServerMessageType,
-  SettingsSection,
-  TraceInfo,
-  TurnSource,
-  VaultInfo
+  type ErrorInfo,
+  type HistoryItem,
+  type JobInfo,
+  type ModelSet,
+  type ModuleInfo,
+  type Role,
+  type ServerMessage,
+  type ServerMessageType,
+  type SettingsSection,
+  type TraceInfo,
+  type TurnSource,
+  type VaultInfo
 } from "@pva/protocol"
 import type { SettingsPath } from "./settingsTree.ts"
 
@@ -68,6 +74,27 @@ export interface Toast {
   readonly tone: "error" | "info"
 }
 
+/** One line of the admin phrase tester (`wake.heard`). */
+export interface HeardLine {
+  readonly text: string
+  /** The wake phrase it matched; absent = none. */
+  readonly matched?: string
+  /** The assistant took it (answered it, or the phrase alone made it listen); absent from an older server. */
+  readonly accepted?: boolean
+  readonly at: number
+}
+
+/**
+ * What the phrase tester says about a line: matched a phrase, accepted without one (always listening, or the device
+ * was already listening), ignored, or — from a server that does not say whether it was accepted — only that no
+ * phrase matched.
+ */
+export type HeardOutcome = "matched" | "accepted" | "ignored" | "no-match"
+export const heardOutcome = (l: HeardLine): HeardOutcome =>
+  l.matched !== undefined ? "matched" : l.accepted === true ? "accepted" : l.accepted === false ? "ignored" : "no-match"
+
+export const MAX_HEARD = 40
+
 export interface PendingRequest {
   readonly kind: string
   readonly target?: string
@@ -96,8 +123,30 @@ export interface ClientState {
     readonly error?: string
     /** The local player is playing this reply (from the player's started/finished/stopped). */
     readonly playing?: { readonly turnId: number }
-    readonly interruptMode: InterruptMode
   }
+  /** What every connection knows about the engines (protocol 5 `engine.summary`): ready or not, the enabled voices. */
+  readonly summary: EngineSummary
+  /**
+   * This connection's device profile as the server sent it (`snapshot.device`, `device.profile`); undefined on admin
+   * connections and before `welcome`. `profileOverlay`: this page's own changes sent with `device.update` and not yet
+   * confirmed (optimistic; any `device.profile` replaces them). Read the effective profile with `profileOf`.
+   */
+  readonly device: DeviceProfileInfo | undefined
+  readonly profileOverlay: Partial<DeviceProfile>
+  /** Admin access as this connection sees it (`snapshot.admin`, `admin.state`). */
+  readonly admin: AdminState
+  /** Counts `admin.state` messages, so a page can restart a countdown when the same `retryAfterMs` comes again. */
+  readonly adminSeq: number
+  /** The admin part of the state (`admin.snapshot`) has arrived for the current login. */
+  readonly adminReady: boolean
+  /** Admin: the front-end kinds with their defaults, and the remembered devices (most recently seen first). */
+  readonly frontends: ReadonlyArray<FrontendKindInfo>
+  readonly devices: ReadonlyArray<DeviceInfo>
+  /** The audio owner said the wake phrase alone (`wake` with `armed`): "Listening…" until the next state change. */
+  readonly woke: { readonly phrase: string } | undefined
+  /** Admin phrase tester: what the recogniser heard while it was on, oldest first. */
+  readonly heard: ReadonlyArray<HeardLine>
+  /** Admin only: the full engine status (`admin.snapshot.engine`, `engine`). */
   readonly engine: EngineStatus
   readonly modules: { readonly order: ReadonlyArray<string>; readonly byId: Readonly<Record<string, ModuleInfo>> }
   readonly sections: ReadonlyArray<SettingsSection>
@@ -115,7 +164,12 @@ export interface ClientState {
   readonly toasts: ReadonlyArray<Toast>
   readonly ui: {
     readonly chatOpen: boolean
-    /** The settings screen (docs/SETTINGS-UI.md §3.1); its path is mirrored in the URL hash (`#settings/…`). */
+    /** Voice front end: the settings sheet. */
+    readonly sheetOpen: boolean
+    /**
+     * Admin: the settings screen (docs/SETTINGS-UI.md §3.1) is the admin page itself, so it is always open there;
+     * its path is mirrored in the URL hash (`#settings/…`).
+     */
     readonly settingsOpen: boolean
     readonly settingsPath: SettingsPath
     /** The settings page on screen has unsaved edits. */
@@ -132,13 +186,25 @@ export const MAX_TRACES = 50
 export const MAX_TOASTS = 3
 
 export const emptyEngine: EngineStatus = { state: "starting", problems: [], reloadPending: false, reloadPendingFor: [], engines: [], voices: [] }
-/** A server that sends no vault (or has none yet): every page may change everything. */
-export const noVault: VaultInfo = { state: "none", admin: true }
+/** Before the admin snapshot: no vault known, and this page is not admin. */
+export const noVault: VaultInfo = { state: "none", admin: false }
+export const noAdmin: AdminState = { enabled: true, loggedIn: false }
+export const emptySummary: EngineSummary = { ready: false, state: "starting", voices: [] }
 
 export const initialState: ClientState = {
   connection: { status: "connecting", attempt: 0, everConnected: false },
   session: { role: "observer", ownerPresent: false, serverState: "idle" },
-  audio: { phase: "off", micLive: true, interruptMode: "confirm" },
+  audio: { phase: "off", micLive: true },
+  summary: emptySummary,
+  device: undefined,
+  profileOverlay: {},
+  admin: noAdmin,
+  adminSeq: 0,
+  adminReady: false,
+  frontends: [],
+  devices: [],
+  woke: undefined,
+  heard: [],
   engine: emptyEngine,
   modules: { order: [], byId: {} },
   sections: [],
@@ -151,15 +217,33 @@ export const initialState: ClientState = {
   traces: [],
   pending: {},
   toasts: [],
-  ui: { chatOpen: false, settingsOpen: false, settingsPath: [], settingsDirty: false, unread: 0, shortcutsOpen: false }
+  ui: { chatOpen: false, sheetOpen: false, settingsOpen: false, settingsPath: [], settingsDirty: false, unread: 0, shortcutsOpen: false }
 }
+
+/** The admin part of the state, emptied at logout and when a session ends. */
+const adminPart = {
+  engine: emptyEngine,
+  modules: initialState.modules,
+  sections: initialState.sections,
+  vault: noVault,
+  env: undefined,
+  models: initialState.models,
+  jobs: initialState.jobs,
+  traces: initialState.traces,
+  frontends: initialState.frontends,
+  devices: initialState.devices,
+  heard: initialState.heard,
+  adminReady: false
+} satisfies Partial<ClientState>
 
 /** Things that happen in the page rather than on the server. */
 export type LocalAction =
   | { readonly type: "local/connection"; readonly status: ConnectionStatus; readonly attempt: number }
   | { readonly type: "local/audio"; readonly phase: AudioPhase; readonly error?: string }
   | { readonly type: "local/mic"; readonly live: boolean }
-  | { readonly type: "local/interrupt-mode"; readonly mode: InterruptMode }
+  | { readonly type: "local/profile-overlay"; readonly patch: Partial<DeviceProfile> }
+  | { readonly type: "local/profile-overlay-clear" }
+  | { readonly type: "local/heard-clear" }
   | { readonly type: "local/playing"; readonly turnId: number | undefined }
   | { readonly type: "local/request"; readonly requestId: string; readonly kind: string; readonly target?: string }
   | { readonly type: "local/request-done"; readonly requestId: string }
@@ -276,22 +360,57 @@ const server: ServerHandlers = {
     session: { role: m.snapshot.role, ownerPresent: m.snapshot.ownerPresent, serverState: m.snapshot.state },
     // The audio graph belongs to the page and survives reconnects; the player was flushed on loss.
     audio: withoutPlaying(s.audio),
+    summary: m.snapshot.engine,
+    device: m.snapshot.device,
+    admin: m.snapshot.admin,
+    adminSeq: s.adminSeq + 1,
+    // A reconnect with a valid admin token keeps the admin data on screen until the new `admin.snapshot` replaces it.
+    ...(m.snapshot.admin.loggedIn ? pickAdmin(s) : {}),
+    turns: historyToTurns(m.snapshot.history),
+    toasts: s.toasts,
+    ui: s.ui
+  }),
+  "admin.snapshot": (s, m) => ({
+    ...s,
     engine: m.snapshot.engine,
     modules: { order: m.snapshot.modules.map((x) => x.id), byId: Object.fromEntries(m.snapshot.modules.map((x) => [x.id, x])) },
     sections: m.snapshot.sections,
-    vault: m.snapshot.vault ?? noVault,
+    vault: m.snapshot.vault,
     env: m.snapshot.env,
-    models: m.snapshot.models ?? [],
-    jobs: m.snapshot.jobs ?? [],
-    turns: historyToTurns(m.snapshot.history),
+    models: m.snapshot.models,
+    jobs: m.snapshot.jobs,
     traces: m.snapshot.traces.slice(-MAX_TRACES),
-    toasts: s.toasts,
-    ui: s.ui
+    frontends: m.snapshot.frontends,
+    devices: m.snapshot.devices,
+    adminReady: true
+  }),
+  "engine.summary": (s, m) => ({ ...s, summary: m.engine }),
+  "admin.state": (s, m) => {
+    const next = { ...s, admin: m.admin, adminSeq: s.adminSeq + 1 }
+    return m.admin.loggedIn ? next : { ...next, ...adminPart }
+  },
+  "device.profile": (s, m) => ({
+    ...s,
+    device: m.deviceId === undefined ? { profile: m.profile, editable: m.editable } : { deviceId: m.deviceId, profile: m.profile, editable: m.editable },
+    profileOverlay: {}
+  }),
+  frontends: (s, m) => ({ ...s, frontends: m.frontends }),
+  devices: (s, m) => ({ ...s, devices: m.devices }),
+  // The phrase and the request in one sentence (`armed: false`): a turn follows, nothing to show.
+  wake: (s, m) => (m.armed ? { ...s, woke: { phrase: m.phrase } } : s),
+  "wake.heard": (s, m) => ({
+    ...s,
+    heard: [
+      ...s.heard,
+      { text: m.text, ...(m.matched === undefined ? {} : { matched: m.matched }), ...(m.accepted === undefined ? {} : { accepted: m.accepted }), at: m.at }
+    ].slice(-MAX_HEARD)
   }),
   session: (s, m) => ({ ...s, session: { ...s.session, role: m.role, ownerPresent: m.ownerPresent } }),
   state: (s, m) => {
     const { stateTurnId: _previous, ...rest } = s.session
-    return { ...s, session: m.turnId === undefined ? { ...rest, serverState: m.state } : { ...rest, serverState: m.state, stateTurnId: m.turnId } }
+    const session = m.turnId === undefined ? { ...rest, serverState: m.state } : { ...rest, serverState: m.state, stateTurnId: m.turnId }
+    // "Listening…" after the wake phrase lasts until the assistant hears something, or falls asleep again.
+    return { ...s, session, woke: m.state === "listening" ? s.woke : undefined }
   },
   transcript: (s, m) => (s.liveTranscript === m.text ? s : { ...s, liveTranscript: m.text }),
   "turn.start": (s, m) => {
@@ -301,7 +420,7 @@ const server: ServerHandlers = {
       (t) => ({ ...t, source: m.source, userText: m.userText, spoken: m.spoken }),
       () => newTurn(`t${m.turnId}`, { turnId: m.turnId, source: m.source, userText: m.userText, spoken: m.spoken })
     )
-    return { ...next, liveTranscript: "" }
+    return { ...next, liveTranscript: "", woke: undefined }
   },
   "assistant.text": (s, m) =>
     withTurn(
@@ -380,7 +499,10 @@ const server: ServerHandlers = {
 const local = (s: ClientState, a: LocalAction): ClientState => {
   switch (a.type) {
     case "local/connection":
-      return { ...s, connection: { ...s.connection, status: a.status, attempt: a.attempt } }
+      // Outdated: the page shows its own notice with Reload, so the server's "out of date" error toast goes.
+      return a.status === "outdated"
+        ? { ...s, toasts: [], connection: { ...s.connection, status: a.status, attempt: a.attempt } }
+        : { ...s, connection: { ...s.connection, status: a.status, attempt: a.attempt } }
     case "local/socket-lost":
       // Requests in flight will never be answered on this socket; the player was flushed.
       return { ...s, pending: {}, audio: withoutPlaying(s.audio), liveTranscript: "" }
@@ -391,8 +513,12 @@ const local = (s: ClientState, a: LocalAction): ClientState => {
     }
     case "local/mic":
       return { ...s, audio: { ...s.audio, micLive: a.live } }
-    case "local/interrupt-mode":
-      return { ...s, audio: { ...s.audio, interruptMode: a.mode } }
+    case "local/profile-overlay":
+      return { ...s, profileOverlay: { ...s.profileOverlay, ...a.patch } }
+    case "local/profile-overlay-clear":
+      return Object.keys(s.profileOverlay).length === 0 ? s : { ...s, profileOverlay: {} }
+    case "local/heard-clear":
+      return s.heard.length === 0 ? s : { ...s, heard: [] }
     case "local/playing":
       if (a.turnId === undefined) return s.audio.playing === undefined ? s : { ...s, audio: withoutPlaying(s.audio) }
       return { ...s, audio: { ...s.audio, playing: { turnId: a.turnId } } }
@@ -413,8 +539,28 @@ const local = (s: ClientState, a: LocalAction): ClientState => {
     case "local/ui": {
       const ui = { ...s.ui, ...a.patch }
       if (a.patch.chatOpen === true) ui.unread = 0
+      // One modal panel at a time: opening the settings sheet closes Help, and the other way round.
+      if (a.patch.sheetOpen === true && a.patch.shortcutsOpen === undefined) ui.shortcutsOpen = false
+      if (a.patch.shortcutsOpen === true && a.patch.sheetOpen === undefined) ui.sheetOpen = false
       return { ...s, ui }
     }
+  }
+}
+
+function pickAdmin(s: ClientState): Partial<ClientState> {
+  return {
+    engine: s.engine,
+    modules: s.modules,
+    sections: s.sections,
+    vault: s.vault,
+    env: s.env,
+    models: s.models,
+    jobs: s.jobs,
+    traces: s.traces,
+    frontends: s.frontends,
+    devices: s.devices,
+    heard: s.heard,
+    adminReady: s.adminReady
   }
 }
 
@@ -434,9 +580,11 @@ export const reducer = (s: ClientState, a: Action): ClientState => {
 
 // ---- Derived values (selectors) ----
 
-/** May this page change `item` (a module or settings section)? Protected items need admin access. */
-export const canChange = (s: ClientState, item: { readonly protected?: boolean } | undefined): boolean =>
-  item?.protected !== true || s.vault.admin
+/** This connection's effective device profile: the server's, with this page's unconfirmed changes on top. */
+export const profileOf = (s: ClientState): DeviceProfile => {
+  const base = s.device?.profile ?? DEFAULT_DEVICE_PROFILE
+  return Object.keys(s.profileOverlay).length === 0 ? base : { ...base, ...s.profileOverlay }
+}
 
 /** The engines failed and the key vault is locked: unlocking is the fix (the server reloads them). */
 export const engineNeedsKeys = (s: ClientState): boolean => s.engine.state === "failed" && s.vault.state === "locked"
@@ -459,6 +607,7 @@ export type VisualState =
   | "muted"
   | "hearing"
   | "listening"
+  | "asleep"
   | "idle"
 
 /** The visualiser's state (docs/UI-AND-MODULES.md §3.3): first matching row wins. */
@@ -474,6 +623,8 @@ export const visualState = (s: ClientState): VisualState => {
   if (owner && !s.audio.micLive) return "muted"
   if (s.session.serverState === "hearing") return "hearing"
   if (s.session.serverState === "listening") return "listening"
+  // Wake-phrase mode: listening without reacting. The phrase alone ("Hey Jeff") shows as listening at once.
+  if (s.session.serverState === "asleep") return s.woke !== undefined ? "listening" : "asleep"
   return "idle"
 }
 
@@ -496,15 +647,25 @@ export const lastLatency = (s: ClientState) => {
 
 /** The voice name to show next to SPEAKING: only when more than one voice is enabled. */
 export const speakingVoice = (s: ClientState): string | undefined => {
-  if (s.engine.voices.filter((v) => v.enabled).length < 2) return undefined
+  if (s.summary.voices.length < 2) return undefined
   const turnId = s.audio.playing?.turnId ?? s.session.stateTurnId
   if (turnId === undefined) return undefined
   const idx = findTurn(s.turns, turnId)
   if (idx === -1) return undefined
   const t = s.turns[idx]!
   const clause = t.clauses[Math.max(0, t.playedClause)]
-  return clause?.voice ?? s.engine.voices.find((v) => v.isDefault)?.name
+  return clause?.voice ?? defaultVoiceOf(s)
 }
+
+/** The voice a reply uses when no clause names one: the profile's voice, else the assistant's default. */
+export const defaultVoiceOf = (s: ClientState): string | undefined => {
+  const chosen = profileOf(s).voice
+  if (chosen !== "" && s.summary.voices.some((v) => v.name === chosen)) return chosen
+  return s.summary.voices.find((v) => v.isDefault)?.name
+}
+
+/** "Hey Jeff" for "hey jeff": a phrase as shown on the stage. */
+export const displayPhrase = (phrase: string): string => phrase.replace(/(^|\s)(\p{L})/gu, (_m, space: string, letter: string) => space + letter.toUpperCase())
 
 export const turnById = (s: ClientState, turnId: number | undefined): TurnView | undefined => {
   if (turnId === undefined) return undefined

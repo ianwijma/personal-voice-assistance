@@ -1,6 +1,7 @@
 import "./env.ts" // first: loads .env before anything reads the environment
 import { NodeRuntime } from "@effect/platform-node"
-import { Conversation, Llm, ToolRegistry, TurnTrace } from "@pva/core"
+import { Conversation, Llm, ToolRegistry, TurnTrace, type WakeConfig, wakeConfigFromProfile } from "@pva/core"
+import { DEFAULT_DEVICE_PROFILE } from "@pva/protocol"
 import { Cause, Config, Effect, Layer, Logger, Stream } from "effect"
 import { resolve } from "node:path"
 import * as readline from "node:readline"
@@ -93,6 +94,9 @@ const RealisticDelays: Config.Config<SimulatedDelays> = Config.all({
   eagerLeadMs: Config.Int("BENCH_EAGER_LEAD_MS").pipe(Config.withDefault(200))
 })
 
+/** Wake-phrase mode with the default phrases, for the offline benchmark. */
+const benchWake: WakeConfig = { ...wakeConfigFromProfile(DEFAULT_DEVICE_PROFILE), activation: "wake-phrase" }
+
 const offlineBench = Effect.gen(function*() {
   const rounds = yield* Config.Int("BENCH_ROUNDS").pipe(Config.withDefault(3))
   const realistic = yield* RealisticDelays
@@ -105,7 +109,10 @@ const offlineBench = Effect.gen(function*() {
       delays: realistic,
       eager: false
     },
-    { name: `realistic, eager end-of-turn ON (EagerEndOfTurn ${d.eagerLeadMs} ms before EndOfTurn)`, delays: realistic, eager: true }
+    { name: `realistic, eager end-of-turn ON (EagerEndOfTurn ${d.eagerLeadMs} ms before EndOfTurn)`, delays: realistic, eager: true },
+    // The wake gate in wake-phrase mode: every utterance is "Hey Jeff, …" (the gate removes the phrase).
+    { name: "realistic, eager OFF, wake phrase (\"Hey Jeff, …\")", delays: realistic, eager: false, wake: benchWake, wakePrefix: "Hey Jeff, " },
+    { name: "realistic, eager ON, wake phrase (\"Hey Jeff, …\")", delays: realistic, eager: true, wake: benchWake, wakePrefix: "Hey Jeff, " }
   ]
   for (const scenario of scenarios) {
     const rows = yield* runOffline(scenario, rounds)

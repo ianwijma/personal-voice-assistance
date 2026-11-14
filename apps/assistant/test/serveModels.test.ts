@@ -9,7 +9,7 @@ import { afterEach, describe, expect, it, vi } from "vitest"
 import { makeJobs } from "../src/serve/jobs.ts"
 import type { PresetDownloader } from "../src/serve/models.ts"
 import { ScriptedClient, sleep } from "./support/scriptedClient.ts"
-import { controlledStt, fakeBuild, scriptedLlm, startTestServer, type TestServer } from "./support/serveHarness.ts"
+import { controlledStt, fakeBuild, scriptedLlm, startTestServer, type TestServer, TEST_ADMIN_PASSWORD } from "./support/serveHarness.ts"
 
 vi.setConfig({ testTimeout: 20_000 })
 
@@ -75,7 +75,8 @@ const start = async (installed: Set<string>, steps?: number) => {
 const connect = async (server: TestServer) => {
   const c = await ScriptedClient.connect({ url: server.url })
   clients.push(c)
-  await c.hello()
+  // Downloads and deletes are admin only (protocol 5).
+  await c.admin(TEST_ADMIN_PASSWORD)
   return c
 }
 
@@ -93,7 +94,7 @@ describe("serve: model downloads", () => {
     const server = await start(new Set(["stt-models:parakeet-v2", "tts-models:en_US-lessac-medium"]))
     const a = await ScriptedClient.connect({ url: server.url })
     clients.push(a)
-    const { snapshot } = await a.hello()
+    const { snapshot } = await a.admin(TEST_ADMIN_PASSWORD)
     const stt = snapshot.models?.find((m) => m.tool === "stt-models")
     expect(stt?.freeMb).toBe(50_000)
     expect(stt?.items.find((i) => i.id === "parakeet-v2")).toMatchObject({ installed: true, inUse: true, sizeMb: 484 })
@@ -157,10 +158,13 @@ describe("serve: model downloads", () => {
     const server = await start(new Set(["tts-models:nl_NL-pim-medium"]))
     const admin = await connect(server)
     expect((await request(admin, { type: "vault.setup", password: PASSWORD })).ok).toBe(true)
-    const b = await connect(server)
-    expect(await request(b, { type: "job.start", tool: "stt-models", action: "download", target: "whisper-turbo" })).toMatchObject({ ok: false, error: { code: "locked" } })
-    expect(await request(b, { type: "job.cancel", jobId: "job-1" })).toMatchObject({ ok: false, error: { code: "locked" } })
-    expect(await request(b, { type: "model.delete", tool: "tts-models", target: "nl_NL-pim-medium" })).toMatchObject({ ok: false, error: { code: "locked" } })
+    // A voice page (no admin login).
+    const b = await ScriptedClient.connect({ url: server.url })
+    clients.push(b)
+    await b.hello()
+    expect(await request(b, { type: "job.start", tool: "stt-models", action: "download", target: "whisper-turbo" })).toMatchObject({ ok: false, error: { code: "admin_required" } })
+    expect(await request(b, { type: "job.cancel", jobId: "job-1" })).toMatchObject({ ok: false, error: { code: "admin_required" } })
+    expect(await request(b, { type: "model.delete", tool: "tts-models", target: "nl_NL-pim-medium" })).toMatchObject({ ok: false, error: { code: "admin_required" } })
     expect(server.handle.jobs.list()).toEqual([])
     expect(await request(admin, { type: "model.delete", tool: "tts-models", target: "nl_NL-pim-medium" })).toMatchObject({ ok: true })
   })

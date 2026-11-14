@@ -47,7 +47,7 @@ for (const signal of ["SIGKILL", "SIGINT"] as const) {
     await assistant.stop(signal)
     const deadAt = (await messages(page)).length
     await expectVisualState(page, "disconnected", 5000)
-    await expect(page.getByTestId("connection-status")).toContainText(/reconnecting/i)
+    await expect(page.getByTestId("state-label")).toContainText(/reconnecting/i)
     // The player was flushed (not playing audio the server will never count), and nothing went out on the dead socket.
     const playing = await page.evaluate(() => (window as unknown as { __pva: { store: { get: () => { audio: { playing?: unknown; phase: string } } } } }).__pva.store.get().audio)
     expect(playing.playing).toBeUndefined()

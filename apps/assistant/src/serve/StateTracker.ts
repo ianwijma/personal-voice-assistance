@@ -5,7 +5,11 @@ import type { AssistantState } from "@pva/protocol"
  * The assistant state (docs/UI-AND-MODULES.md §2.4), computed on the server
  * from ownership, the microphone, recognition events, turns and playback.
  * Calls `onChange` only when the state (or its turn) changes. First match wins:
- * speaking > thinking > hearing > listening > idle.
+ * speaking > thinking > hearing > asleep > listening > idle.
+ *
+ * `asleep` (protocol 5): the owner's microphone is live, its device is in wake-phrase mode and the wake gate is not
+ * awake (`options.asleep`). The gate's windows close by time, so `wakeChanged(ms)` re-checks the state after `ms`
+ * (the longest window that may have just opened), and the state returns to `asleep` with nobody speaking.
  */
 
 /** An utterance counts as open this long after the last recognition event. */
@@ -26,13 +30,20 @@ export interface StateTracker {
    * `turnEnded` instead of flickering through `thinking`. After `failed` it drops to `thinking` at once.
    */
   readonly playbackEnded: (turnId: number, reason?: "finished" | "stopped" | "failed") => void
+  /** The wake gate's state may have changed now, and may change again by itself within `recheckInMs`. */
+  readonly wakeChanged: (recheckInMs?: number) => void
   readonly dispose: () => void
 }
 
 export const makeStateTracker = (options: {
   readonly onChange: (state: { readonly state: AssistantState; readonly turnId?: number }) => void
   readonly now?: () => number
+  /** The owner's device is in wake-phrase mode and the wake gate is asleep. Default: never. */
+  readonly asleep?: () => boolean
 }): StateTracker => {
+  const asleep = options.asleep ?? (() => false)
+  /** One per window that may close by itself (rare: a reply end, a phrase); each re-checks once. */
+  const wakeTimers = new Set<ReturnType<typeof setTimeout>>()
   const now = options.now ?? (() => performance.now())
   let owner = false
   let micLive = false
@@ -48,6 +59,7 @@ export const makeStateTracker = (options: {
     if (committed !== undefined) return { state: "thinking", turnId: committed }
     const live = owner && micLive
     if (live && (pending !== undefined || (utteranceAt !== undefined && now() - utteranceAt < HEARING_WINDOW_MS))) return { state: "hearing" }
+    if (live && asleep()) return { state: "asleep" }
     if (live) return { state: "listening" }
     return { state: "idle" }
   }
@@ -110,8 +122,20 @@ export const makeStateTracker = (options: {
       if (playing === turnId && !((reason === "finished" || reason === "stopped") && committed === turnId)) playing = undefined
       update()
     },
+    wakeChanged: (recheckInMs) => {
+      update()
+      if (recheckInMs === undefined) return
+      const t = setTimeout(() => {
+        wakeTimers.delete(t)
+        update()
+      }, recheckInMs + 5)
+      t.unref?.()
+      wakeTimers.add(t)
+    },
     dispose: () => {
       if (timer !== undefined) clearTimeout(timer)
+      for (const t of wakeTimers) clearTimeout(t)
+      wakeTimers.clear()
     }
   }
 }

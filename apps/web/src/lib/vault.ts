@@ -2,8 +2,8 @@ import { type FieldSource, MAX_PASSWORD_CHARS, MIN_PASSWORD_CHARS, type ModuleIn
 import type { NavGroup, SettingsPath } from "./settingsTree.ts"
 
 /**
- * The "Keys & access" logic, independent of where a UI shows it (the settings
- * screen's Keys & access pages, the engine banner, the page headers' inline
+ * The keys and vault logic, independent of where a UI shows it (the settings
+ * screen's Keys & vault pages, the engine banner, the page headers' inline
  * unlock): which controls a page offers for the vault's state,
  * password checks before sending, and the retry countdown. Pure functions;
  * the actions are `AssistantClient.setupVault` / `unlockVault` / `lockVault` /
@@ -16,13 +16,15 @@ export const KEYS_PATH: SettingsPath = ["keys", "access"]
 /**
  * - `setup`: no vault yet: offer to set a password.
  * - `unlock`: the vault is locked: a password field with Unlock.
- * - `elevate`: unlocked, but this page may not change protected settings: a password field for edit access.
- * - `admin`: this page may change everything: Lock and Change password.
+ * - `unlocked`: Lock and Change password.
+ *
+ * Since protocol 5 these controls are on the admin page only, behind the admin login; the vault password no longer
+ * grants anything but the keys.
  */
-export type KeysView = "setup" | "unlock" | "elevate" | "admin"
+export type KeysView = "setup" | "unlock" | "unlocked"
 
 export const keysView = (vault: VaultInfo): KeysView =>
-  vault.state === "none" ? "setup" : vault.state === "locked" ? "unlock" : vault.admin ? "admin" : "elevate"
+  vault.state === "none" ? "setup" : vault.state === "locked" ? "unlock" : "unlocked"
 
 /** A new password and its confirmation: what is wrong with them, if anything (checked again by the server). */
 export const newPasswordProblem = (password: string, confirm: string): string | undefined => {
@@ -42,7 +44,7 @@ export const retrySecondsLeft = (retryAfterMs: number | undefined, receivedAt: n
 
 /** The locked view's explanation: why the keys are locked, worded for the case. */
 export const lockedExplanation = (vault: VaultInfo): string => {
-  const then = "Type the password so the engines and modules can use their keys again; this page can then also change protected settings."
+  const then = "Type the password so the engines and modules can use their keys again."
   if (vault.lockReason === "manual") return `The keys were locked from a page (Lock now). ${then}`
   if (vault.lockReason === "start") return `The assistant was restarted, and the keys stay locked until the password is typed. ${then}`
   return `The keys are locked. ${then}`

@@ -5,7 +5,8 @@
 import { defineModule, Llm, type LlmEvent, makeTool, type ModuleDefinition, Setting, Stt, type SttEvent, Tts, type TtsAudio } from "@pva/core"
 import { sttContractKeeper } from "@pva/core/testing"
 import { Effect, Exit, Queue, References, Schema, Scope, Stream } from "effect"
-import { mkdtempSync } from "node:fs"
+import type { ProfileOverrides } from "@pva/protocol"
+import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import type { EngineProviders, ProviderBuilder } from "../../src/serve/Engine.ts"
@@ -113,11 +114,25 @@ export interface TestServer {
   readonly close: () => Promise<void>
 }
 
+/** The admin password every test server has (unless a test passes `adminPassword`). */
+export const TEST_ADMIN_PASSWORD = "test admin password"
+
+/**
+ * Starts a test server. Without a `settings.json` in its data directory one is written first with the `web-voice`
+ * kind defaults `kindDefaults` (default `{ interruptMode: "instant" }`: barge-in tests interrupt by voice, as the
+ * scripted client's `claim("instant")` did before protocol 5).
+ */
 export const startTestServer = async (
-  options: Partial<ServeOptions> & Pick<ServeOptions, "build">
+  options: Partial<ServeOptions> & Pick<ServeOptions, "build"> & { readonly kindDefaults?: ProfileOverrides }
 ): Promise<TestServer> => {
   const scope = Effect.runSync(Scope.make())
   const dataDir = options.dataDir ?? mkdtempSync(join(tmpdir(), "pva-serve-"))
+  if (!existsSync(join(dataDir, "settings.json"))) {
+    mkdirSync(dataDir, { recursive: true })
+    const frontends = { "web-voice": options.kindDefaults ?? { interruptMode: "instant" } }
+    writeFileSync(join(dataDir, "settings.json"), `${JSON.stringify({ version: 3, modules: {}, assistant: {}, frontends, devices: {} }, null, 2)}\n`)
+  }
+  const { kindDefaults: _, ...serveOptions } = options
   const program = startServe({
     host: "127.0.0.1",
     port: 0,
@@ -128,7 +143,8 @@ export const startTestServer = async (
     // Never the owner's real vault; a cheap scrypt so tests stay fast (a vault opens with its own stored parameters).
     vaultPath: join(dataDir, "vault", "vault.enc"),
     vaultKdf: { N: 2 ** 12, r: 8, p: 1 },
-    ...options,
+    adminPassword: TEST_ADMIN_PASSWORD,
+    ...serveOptions,
     dataDir
   }).pipe(Scope.provide(scope), Effect.provideService(References.MinimumLogLevel, "Error"))
   const handle = await Effect.runPromise(program)

@@ -10,6 +10,7 @@ import { Icon, Spinner } from "../ui/Icon.tsx"
 import { Button, cx } from "../ui/controls.tsx"
 import { FieldRow } from "./FieldRow.tsx"
 import { ModuleHeader, ModuleTools, moduleStateText } from "./ModuleHeader.tsx"
+import { MarkerLegend } from "./FormFooter.tsx"
 import { PageFooter } from "./PageFooter.tsx"
 import { type PageFormDef, type PageForms, type PageFormView, usePageForms } from "./usePageForms.ts"
 
@@ -23,12 +24,14 @@ const linkedOptions = (sections: ReadonlyArray<SettingsSection>) =>
 
 /**
  * A page built from server data (docs/SETTINGS-UI.md §3.2): the sections placed on it, or a module (switch, status,
- * form, tools). Protected pages are read-only without admin access and offer the password right here. One sticky
- * footer saves every form on the page.
+ * form, tools). Every change needs admin, and this screen is only shown to a logged-in admin; a protected page (it
+ * has keys, chooses providers or is an agent) is read-only only while the key vault is locked, and offers Unlock
+ * right here. One sticky footer saves every form on the page.
  */
 export function ServerPage({ page }: { readonly page: NavPage }) {
   const client = useClient()
-  const admin = useClientState((s) => s.vault.admin)
+  const keysLocked = useClientState((s) => s.vault.state === "locked")
+  const admin = !keysLocked
   const vault = useClientState((s) => s.vault, shallowEqual)
   const allSections = useClientState((s) => s.sections)
   const modules = useClientState((s) => s.modules.byId)
@@ -63,11 +66,19 @@ export function ServerPage({ page }: { readonly page: NavPage }) {
   }, [client, forms.dirty])
   useEffect(() => () => client.store.dispatch({ type: "local/ui", patch: { settingsDirty: false } }), [client])
 
+  // A choice served by a module (Claude subscription) chosen but not saved yet: the card's one button commits it
+  // (save, opt in, switch on, reload), so the footer's Save buttons wait and point at it.
+  const commitVia = links.find((l) => {
+    const view = forms.views.find((v) => v.def.key === `s:${l.section.id}`)
+    return view !== undefined && view.lookup(l.field.key) === l.option.value && values.get(l.field.key) !== l.option.value
+  })?.option.label
+
   const notInUse = !page.inUse
   return (
     <div className="flex flex-1 flex-col" data-testid={`page-${page.group}-${page.id}`} data-locked={editable ? undefined : "true"}>
       <div className="flex flex-1 flex-col gap-7 pb-8">
-        {!editable && <EditAccess />}
+        {forms.views.some((v) => v.def.form.fields.some((f) => f.locked === undefined)) && <div className="-mb-3"><MarkerLegend device={false} /></div>}
+        {!editable && <KeysLocked />}
         {notInUse && sections.length > 0 && <NotInUse />}
         {module !== undefined && <ModuleHeader module={module} editable={editable} />}
         {forms.views.filter((v) => v.def.only === undefined).map((view) => (
@@ -94,7 +105,7 @@ export function ServerPage({ page }: { readonly page: NavPage }) {
         ))}
         {module !== undefined && <ModuleTools module={module} />}
       </div>
-      {editable && (forms.views.some((v) => !v.def.readOnly && v.def.form.fields.some((f) => f.locked === undefined)) || forms.dirty) && <PageFooter forms={forms} />}
+      {editable && (forms.views.some((v) => !v.def.readOnly && v.def.form.fields.some((f) => f.locked === undefined)) || forms.dirty) && <PageFooter forms={forms} commitVia={commitVia} />}
     </div>
   )
 }
@@ -171,20 +182,15 @@ function FormBlock({ view, forms, heading, vault, renderAfter }: {
   )
 }
 
-/** A protected page without admin access: say so, and take the password right here. */
-function EditAccess() {
-  const state = useClientState((s) => s.vault.state)
+/** A protected page while the key vault is locked: say so, and take the vault password right here. */
+function KeysLocked() {
   return (
-    <div className="flex flex-col gap-3 rounded-md border border-line bg-surface-2/40 px-4 py-3" data-testid="edit-access">
+    <div className="flex flex-col gap-3 rounded-md border border-line bg-surface-2/40 px-4 py-3" data-testid="keys-locked">
       <p className="flex items-start gap-2 text-[13px] text-ink">
-        <Icon name="lock" size={15} className="mt-0.5 shrink-0 text-ink-muted" />
-        <span>
-          {state === "locked"
-            ? "Protected, and the keys are locked. Type the password to unlock them and edit this page."
-            : "Protected: only a page where the password was typed may change this. Type it to edit."}
-        </span>
+        <Icon name="key" size={15} className="mt-0.5 shrink-0 text-ink-muted" />
+        <span>The keys are locked, so this page cannot be changed. Type the vault password to unlock them.</span>
       </p>
-      <UnlockForm label={state === "locked" ? "Unlock" : "Get edit access"} compact idSuffix="page" />
+      <UnlockForm label="Unlock" compact idSuffix="page" />
     </div>
   )
 }
@@ -197,9 +203,20 @@ function NotInUse() {
   )
 }
 
-const done = (ok: boolean, busy = false) => (
-  <span aria-hidden="true" className={cx("inline-flex size-4 shrink-0 items-center justify-center rounded-full border", ok ? "border-ok text-ok" : "border-ink-faint")}>
-    {busy ? <Spinner size={10} /> : ok ? <Icon name="check" size={11} /> : null}
+/**
+ * A step's marker: a check when done, a spinner while it happens, its number when it is the next thing to do, and a
+ * dash while it waits for an earlier step. Square, so it does not look like the radio buttons of the choice above.
+ */
+const StepMarker = ({ n, state }: { readonly n: number; readonly state: "done" | "busy" | "next" | "waiting" }) => (
+  <span
+    aria-hidden="true"
+    data-step={state}
+    className={cx(
+      "inline-flex size-5 shrink-0 items-center justify-center rounded-[5px] border font-mono text-[11px]",
+      state === "done" ? "border-ok/60 bg-ok/10 text-ok" : state === "next" ? "border-voice/70 text-voice" : "border-line text-ink-muted"
+    )}
+  >
+    {state === "done" ? <Icon name="check" size={12} /> : state === "busy" ? <Spinner size={10} /> : state === "next" ? n : "–"}
   </span>
 )
 
@@ -264,43 +281,77 @@ function OptionModuleCard({ module: m, option, fieldKey, view, forms, editable, 
     setFailure(message)
   }
 
+  const steps = [
+    { text: `Chosen as the ${fieldKey === "LLM_PROVIDER" ? "language model" : "setting"}${chosen ? "" : " (not saved yet)"}`, ok: chosen, busy: false },
+    { text: "Opted in", ok: optedIn, busy: false },
+    { text: "Switched on and ready", ok: running, busy: m.state === "starting" },
+    { text: "Answering (engines reloaded)", ok: inUse, busy: reloading }
+  ]
+  const firstOpen = steps.findIndex((st) => !st.ok)
+  const optIn = optInField !== undefined && view !== undefined && (
+    <FieldRow
+      field={optInField}
+      form={m.settings}
+      draft={view.state.sync.draft}
+      idPrefix={`m-${m.id}`}
+      errors={view.state.serverErrors.filter((e: FieldError) => e.key === optInField.key).map((e) => e.message)}
+      warnings={[]}
+      readOnly={view.def.readOnly}
+      saving={forms.saving || step !== undefined}
+      vault={vault}
+      setDraft={(f) => forms.setDraft(view.def.key, f)}
+      onLocalError={() => undefined}
+    />
+  )
+  // The separate controls: needed to switch it off again once it is in use, or to do the steps one by one. While
+  // the one button above can do everything, they are folded away.
+  const separate = complete || !editable ? (
+    <div className="flex flex-col gap-4 border-t border-line/60 pt-4">
+      {optIn}
+      <ModuleHeader module={m} editable={editable} compact />
+    </div>
+  ) : (
+    <details className="group border-t border-line/60 pt-3" data-testid="option-module-steps">
+      <summary className="flex min-h-10 cursor-pointer list-none items-center gap-1.5 text-[13px] text-ink-muted marker:hidden hover:text-ink">
+        <Icon name="chevron" size={14} className="shrink-0 transition-transform duration-[120ms] group-open:rotate-90" />
+        Do the steps one by one
+      </summary>
+      <div className="mt-3 flex flex-col gap-4">
+        {optIn}
+        <ModuleHeader module={m} editable={editable} compact />
+      </div>
+    </details>
+  )
   return (
     <div className="flex flex-col gap-4 rounded-lg border border-line bg-surface px-4 py-4" data-testid="option-module" data-complete={complete ? "true" : undefined}>
       <div className="flex flex-wrap items-baseline justify-between gap-2">
         <h4 className="text-[14px] font-medium text-ink">{m.name}</h4>
         <span className="text-[12px] text-ink-muted" data-testid="option-module-state">{moduleStateText(m)}</span>
       </div>
-      <ol className="flex flex-col gap-2 text-[13px]">
-        <li className="flex items-center gap-2">{done(chosen)}<span className={chosen ? "text-ink" : "text-ink-muted"}>Chosen as the {fieldKey === "LLM_PROVIDER" ? "language model" : "setting"}{chosen ? "" : " (not saved yet)"}</span></li>
-        <li className="flex items-center gap-2">{done(optedIn)}<span className={optedIn ? "text-ink" : "text-ink-muted"}>Opted in</span></li>
-        <li className="flex items-center gap-2">{done(running, m.state === "starting")}<span className={running ? "text-ink" : "text-ink-muted"}>Switched on and ready</span></li>
-        <li className="flex items-center gap-2">{done(inUse, reloading)}<span className={inUse ? "text-ink" : "text-ink-muted"}>Answering (engines reloaded)</span></li>
+      <ol className="flex flex-col gap-2 text-[13px]" aria-label="Steps">
+        {steps.map((st, i) => {
+          const state = st.ok ? "done" : st.busy ? "busy" : i === firstOpen ? "next" : "waiting"
+          return (
+            <li key={st.text} className="flex items-center gap-2.5" data-done={st.ok ? "true" : "false"}>
+              <StepMarker n={i + 1} state={state} />
+              <span className={st.ok ? "text-ink" : "text-ink-muted"}>
+                {st.text}
+                <span className="sr-only">{st.ok ? ": done" : state === "busy" ? ": in progress" : ": not yet"}</span>
+              </span>
+            </li>
+          )
+        })}
       </ol>
-      {optInField !== undefined && view !== undefined && (
-        <FieldRow
-          field={optInField}
-          form={m.settings}
-          draft={view.state.sync.draft}
-          idPrefix={`m-${m.id}`}
-          errors={view.state.serverErrors.filter((e: FieldError) => e.key === optInField.key).map((e) => e.message)}
-          warnings={[]}
-          readOnly={view.def.readOnly}
-          saving={forms.saving || step !== undefined}
-          vault={vault}
-          setDraft={(f) => forms.setDraft(view.def.key, f)}
-          onLocalError={() => undefined}
-        />
-      )}
-      <ModuleHeader module={m} editable={editable} compact />
       {editable && !complete && (
         <div className="flex flex-wrap items-center gap-3">
-          <Button variant="primary" size="sm" onClick={() => void useIt()} disabled={step !== undefined || forms.saving}>
+          <Button variant="primary" className="max-sm:h-11" onClick={() => void useIt()} disabled={step !== undefined || forms.saving} data-testid="use-option">
             {step !== undefined && <Spinner size={12} />}
             {step ?? `Use ${option.label}`}
           </Button>
-          <span className="text-[12px] text-ink-faint">Saves the choice and the opt-in, switches it on and reloads the engines.</span>
+          <span className="text-[12px] text-ink-muted">Does every step: saves the choice and the opt-in, switches it on, reloads the engines.</span>
         </div>
       )}
+      {separate}
       {failure !== undefined && <p role="alert" className="text-[13px] text-danger">{failure}</p>}
     </div>
   )

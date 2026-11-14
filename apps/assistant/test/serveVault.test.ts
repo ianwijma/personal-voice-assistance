@@ -9,7 +9,7 @@ import { afterEach, describe, expect, it, vi } from "vitest"
 import { EngineBuildProblems, type ProviderBuilder } from "../src/serve/Engine.ts"
 import { KEYS_LOCKED_MESSAGE } from "../src/serve/SettingsStore.ts"
 import { ScriptedClient, sleep } from "./support/scriptedClient.ts"
-import { controlledStt, fakeBuild, scriptedLlm, startTestServer, type TestServer } from "./support/serveHarness.ts"
+import { controlledStt, fakeBuild, scriptedLlm, startTestServer, TEST_ADMIN_PASSWORD, type TestServer } from "./support/serveHarness.ts"
 
 vi.setConfig({ testTimeout: 20_000 })
 
@@ -36,9 +36,17 @@ const connect = async (server: TestServer) => {
   return client
 }
 
+/** A voice page. */
 const helloed = async (server: TestServer) => {
   const client = await connect(server)
   const welcome = await client.hello()
+  return { client, welcome }
+}
+
+/** An admin page, logged in (`welcome.snapshot` is the admin snapshot). */
+const adminPage = async (server: TestServer) => {
+  const client = await connect(server)
+  const welcome = await client.admin(TEST_ADMIN_PASSWORD)
   return { client, welcome }
 }
 
@@ -56,8 +64,8 @@ const request = async (client: ScriptedClient, message: RequestInput) => {
 
 /** The newest `vault` message (or the welcome's) matching `pred`, waiting for it if needed. */
 const vaultState = async (client: ScriptedClient, pred: (v: VaultInfo) => boolean): Promise<VaultInfo> => {
-  const seen = [...client.messages].reverse().find((m) => m.type === "vault" || m.type === "welcome")
-  const current = seen?.type === "vault" ? seen.vault : seen?.type === "welcome" ? seen.snapshot.vault : undefined
+  const seen = [...client.messages].reverse().find((m) => m.type === "vault" || m.type === "admin.snapshot")
+  const current = seen?.type === "vault" ? seen.vault : seen?.type === "admin.snapshot" ? seen.snapshot.vault : undefined
   if (current !== undefined && pred(current)) return current
   return (await client.waitFor("vault", (m) => pred(m.vault), { from: 0 })).vault
 }
@@ -81,9 +89,13 @@ const keyedBuild = (): ProviderBuilder => {
 }
 
 describe("serve: key vault and admin access", () => {
-  it("before a vault exists every page may change everything; protected items are flagged", async () => {
+  it("no voice page may change anything, also before a vault exists; an admin page may; protected items are flagged", async () => {
     const server = await start()
-    const { client, welcome } = await helloed(server)
+    const { client: voice } = await helloed(server)
+    for (const update of [protectedUpdate, openUpdate, configureGreeter, { type: "vault.setup", password: PASSWORD } as const]) {
+      expect(await request(voice, update)).toMatchObject({ ok: false, error: { code: "admin_required" } })
+    }
+    const { client, welcome } = await adminPage(server)
     expect(welcome.snapshot.vault).toEqual({ state: "none", admin: true, location: join(server.dataDir, "vault", "vault.enc") })
     const flags = Object.fromEntries(welcome.snapshot.sections.map((s) => [s.id, s.protected === true]))
     expect(flags).toEqual({
@@ -99,68 +111,44 @@ describe("serve: key vault and admin access", () => {
     })
     expect(welcome.snapshot.modules[0]).toMatchObject({ id: "greeter", protected: true })
     expect((await request(client, protectedUpdate)).ok).toBe(true)
+    expect((await request(client, openUpdate)).ok).toBe(true)
     expect((await request(client, configureGreeter)).ok).toBe(true)
   })
 
-  it("after setup: the page that set it is admin, others are refused (`locked`) until they type the password; admin is per connection", async () => {
+  it("the vault needs an admin page and its own password; typing the vault password grants nothing; a lock keeps admin", async () => {
     const server = await start()
-    const { client: a } = await helloed(server)
-    const { client: b } = await helloed(server)
+    const { client: a } = await adminPage(server)
+    const { client: voice } = await helloed(server)
 
     expect(await request(a, { type: "vault.setup", password: "short" })).toMatchObject({ ok: false, error: { code: "bad_password" } })
     expect(await request(a, { type: "vault.setup", password: PASSWORD })).toEqual({ type: "result", requestId: expect.any(String), ok: true })
     expect(await vaultState(a, (v) => v.state === "unlocked")).toMatchObject({ state: "unlocked", admin: true })
-    expect(await vaultState(b, (v) => v.state === "unlocked")).toMatchObject({ state: "unlocked", admin: false })
     expect(existsSync(join(server.dataDir, "vault", "vault.enc"))).toBe(true)
+    // The voice page gets no vault messages at all, and the right vault password changes nothing for it.
+    expect(voice.types()).not.toContain("vault")
+    expect(await request(voice, { type: "vault.unlock", password: PASSWORD })).toMatchObject({ ok: false, error: { code: "admin_required" } })
+    expect(await request(voice, openUpdate)).toMatchObject({ ok: false, error: { code: "admin_required" } })
 
-    // B: protected items refused, open ones fine.
-    const refused = await request(b, protectedUpdate)
-    expect(refused).toMatchObject({ ok: false, error: { code: "locked" } })
-    expect(refused.error?.message).toMatch(/Keys & access/)
-    expect(await request(b, configureGreeter)).toMatchObject({ ok: false, error: { code: "locked" } })
-    expect(await request(b, { type: "module.disable", moduleId: "greeter" })).toMatchObject({ ok: false, error: { code: "locked" } })
-    expect(await request(b, { type: "vault.lock" })).toMatchObject({ ok: false, error: { code: "locked" } })
-    expect((await request(b, openUpdate)).ok).toBe(true)
-    // A: allowed.
+    // A second admin page (its own login) works alongside.
+    const { client: b, welcome } = await adminPage(server)
+    expect(welcome.snapshot.vault).toMatchObject({ state: "unlocked", admin: true })
+    expect((await request(b, configureGreeter)).ok).toBe(true)
+
+    // A locks: the keys leave memory; both admin pages stay admin (their sessions are not the vault's).
+    expect((await request(a, { type: "vault.lock" })).ok).toBe(true)
+    for (const client of [a, b]) expect(await vaultState(client, (v) => v.state === "locked")).toMatchObject({ admin: true })
     expect((await request(a, protectedUpdate)).ok).toBe(true)
-
-    // B types a wrong password, then the right one: now B is admin too; a third page still is not.
     expect(await request(b, { type: "vault.unlock", password: "wrong horse" })).toMatchObject({ ok: false, error: { code: "bad_password" } })
     expect((await request(b, { type: "vault.unlock", password: PASSWORD })).ok).toBe(true)
-    expect(await vaultState(b, (v) => v.admin)).toMatchObject({ state: "unlocked", admin: true })
-    expect((await request(b, configureGreeter)).ok).toBe(true)
-    const { client: c, welcome } = await helloed(server)
-    expect(welcome.snapshot.vault).toMatchObject({ state: "unlocked", admin: false })
-    expect(await request(c, protectedUpdate)).toMatchObject({ ok: false, error: { code: "locked" } })
-
-    // A locks: the keys leave memory and every page loses admin access.
-    expect((await request(a, { type: "vault.lock" })).ok).toBe(true)
-    for (const client of [a, b, c]) expect(await vaultState(client, (v) => v.state === "locked")).toMatchObject({ admin: false })
-    expect(await request(a, protectedUpdate)).toMatchObject({ ok: false, error: { code: "locked" } })
-    expect(JSON.stringify(a.messages)).not.toContain(PASSWORD)
-  })
-
-  it("admin access ends after the idle limit and when the page disconnects", async () => {
-    const server = await start({ adminIdleMs: 300 })
-    const { client: a } = await helloed(server)
-    expect((await request(a, { type: "vault.setup", password: PASSWORD })).ok).toBe(true)
-    expect((await request(a, protectedUpdate)).ok).toBe(true)
-    await sleep(450)
-    expect(await vaultState(a, (v) => !v.admin)).toMatchObject({ state: "unlocked", admin: false })
-    expect(await request(a, protectedUpdate)).toMatchObject({ ok: false, error: { code: "locked" } })
-
-    expect((await request(a, { type: "vault.unlock", password: PASSWORD })).ok).toBe(true)
-    a.close()
-    const { client: again, welcome } = await helloed(server)
-    expect(welcome.snapshot.vault?.admin).toBe(false)
-    expect(await request(again, protectedUpdate)).toMatchObject({ ok: false, error: { code: "locked" } })
+    expect(voice.types()).not.toContain("vault")
+    for (const c of [a, b, voice]) expect(JSON.stringify(c.messages)).not.toContain(PASSWORD)
   })
 
   it("a restart starts locked: engines that need a key fail cleanly; unlocking reloads them; modules get their secrets back", async () => {
     const dataDir = mkdtempSync(join(tmpdir(), "pva-serve-"))
     const first = await start({ dataDir, build: keyedBuild() })
     expect(first.handle.engine.status()).toMatchObject({ state: "failed", problems: [{ message: "ANTHROPIC_API_KEY is not set" }] })
-    const { client: a } = await helloed(first)
+    const { client: a } = await adminPage(first)
     expect((await request(a, { type: "vault.setup", password: PASSWORD })).ok).toBe(true)
     // The key field is shown (and saved) only with the Claude API chosen, so the patch chooses it too.
     const keyUpdate = {
@@ -176,8 +164,8 @@ describe("serve: key vault and admin access", () => {
     servers = servers.filter((s) => s !== first)
 
     const second = await start({ dataDir, build: keyedBuild() })
-    const { client: b, welcome } = await helloed(second)
-    expect(welcome.snapshot.vault).toMatchObject({ state: "locked", admin: false })
+    const { client: b, welcome } = await adminPage(second)
+    expect(welcome.snapshot.vault).toMatchObject({ state: "locked", admin: true })
     expect(welcome.snapshot.engine).toMatchObject({
       state: "failed",
       problems: [{ stage: "language model (LLM_PROVIDER)", message: KEYS_LOCKED_MESSAGE }]
@@ -198,32 +186,34 @@ describe("serve: key vault and admin access", () => {
   it("PVA_VAULT_PASSWORD unlocks at start without giving any page admin access; a wrong one leaves it locked", async () => {
     const dataDir = mkdtempSync(join(tmpdir(), "pva-serve-"))
     const first = await start({ dataDir })
-    const { client: a } = await helloed(first)
+    const { client: a } = await adminPage(first)
     expect((await request(a, { type: "vault.setup", password: PASSWORD })).ok).toBe(true)
     a.close()
     await first.close()
     servers = servers.filter((s) => s !== first)
 
     const auto = await start({ dataDir, env: { PVA_VAULT_PASSWORD: PASSWORD } })
-    const { client: b, welcome } = await helloed(auto)
-    expect(welcome.snapshot.vault).toMatchObject({ state: "unlocked", admin: false })
-    expect(await request(b, protectedUpdate)).toMatchObject({ ok: false, error: { code: "locked" } })
-    expect((await request(b, { type: "vault.unlock", password: PASSWORD })).ok).toBe(true)
-    expect((await request(b, protectedUpdate)).ok).toBe(true)
+    const { client: b } = await helloed(auto)
+    expect(await request(b, protectedUpdate)).toMatchObject({ ok: false, error: { code: "admin_required" } })
+    expect(auto.handle.vault.state()).toBe("unlocked")
+    const { client: c, welcome } = await adminPage(auto)
+    expect(welcome.snapshot.vault).toMatchObject({ state: "unlocked", admin: true })
+    expect((await request(c, protectedUpdate)).ok).toBe(true)
     b.close()
+    c.close()
     await auto.close()
     servers = servers.filter((s) => s !== auto)
 
     const wrong = await start({ dataDir, env: { PVA_VAULT_PASSWORD: "not the password" } })
-    const { welcome: w } = await helloed(wrong)
-    expect(w.snapshot.vault).toMatchObject({ state: "locked", admin: false })
+    const { welcome: w } = await adminPage(wrong)
+    expect(w.snapshot.vault).toMatchObject({ state: "locked", admin: true })
   })
 
   it("setup moves data/secrets.json into the vault, deletes it and reports it", async () => {
     const dataDir = mkdtempSync(join(tmpdir(), "pva-serve-"))
     writeFileSync(join(dataDir, "secrets.json"), JSON.stringify({ version: 1, modules: { greeter: { token: "legacy" } }, sections: {} }), { mode: 0o600 })
     const server = await start({ dataDir })
-    const { client, welcome } = await helloed(server)
+    const { client, welcome } = await adminPage(server)
     expect(welcome.snapshot.modules[0]!.settings.secrets.token).toEqual({ set: true, source: "store" })
     expect((await request(client, { type: "vault.setup", password: PASSWORD })).ok).toBe(true)
     const info = await vaultState(client, (v) => v.importedLegacySecrets !== undefined)
@@ -235,7 +225,7 @@ describe("serve: key vault and admin access", () => {
 
   it("a password that fails validation is never echoed back in the error", async () => {
     const server = await start()
-    const { client } = await helloed(server)
+    const { client } = await adminPage(server)
     const secret = `hunter2-${"x".repeat(300)}`
     const from = client.messages.length
     client.sendRaw(JSON.stringify({ type: "vault.unlock", requestId: "x1", password: secret }))
@@ -248,7 +238,7 @@ describe("serve: key vault and admin access", () => {
   it("too many wrong passwords: refused for a while, with the wait on the page", async () => {
     let now = 5_000_000
     const server = await start({ vaultNow: () => now })
-    const { client } = await helloed(server)
+    const { client } = await adminPage(server)
     expect((await request(client, { type: "vault.setup", password: PASSWORD })).ok).toBe(true)
     expect((await request(client, { type: "vault.lock" })).ok).toBe(true)
     for (let i = 0; i < 5; i++) await request(client, { type: "vault.unlock", password: "wrong horse" })

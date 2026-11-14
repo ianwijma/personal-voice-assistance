@@ -10,6 +10,7 @@ import {
   expectVisualState,
   here,
   instrument,
+  loginAdmin,
   messages,
   micStats,
   micWav,
@@ -280,17 +281,18 @@ test("two pages: the second observes, takes the audio mid-reply, and the first b
   }
 })
 
-test("modules from the options drawer: a rejected value, reconfigure and disable, seen in a second page and used on the next turn", async ({ browser }, testInfo) => {
+test("modules in admin: a rejected value, reconfigure and disable, seen in a second admin page and used on the voice page's next turn", async ({ browser }, testInfo) => {
   const ctx = await browser.newContext({ permissions: ["microphone"], viewport: { width: 1280, height: 800 } })
-  const a = await ctx.newPage()
-  const b = await ctx.newPage()
+  const a = await ctx.newPage() // the voice page
+  const b = await ctx.newPage() // admin
+  const c = await ctx.newPage() // a second admin page (its own login: the token is per tab)
   await instrument(a, " A")
   await instrument(b, " B")
+  await instrument(c, " C")
+  const footer = (p: Page) => p.getByTestId("page-footer")
   try {
     await a.goto(assistant.url)
-    await b.goto(assistant.url)
     await a.getByTestId("chat-toggle").click()
-    await b.getByTestId("chat-toggle").click()
 
     // Before: the time question goes through the clock's current_time tool, date in en-GB.
     let from = (await messages(a)).length
@@ -302,36 +304,30 @@ test("modules from the options drawer: a rejected value, reconfigure and disable
     expect(gb).toMatch(/\d{1,2} [A-Z][a-z]+ \d{4}/) // "13 November 2026"
     expect(end.msg.outcome).toBe("completed")
 
-    await a.keyboard.press("Escape")
-    await a.getByRole("button", { name: "Options (O)" }).click()
-    await expect(a.getByTestId("options")).toBeVisible()
-    const card = a.getByTestId("module-clock")
+    await loginAdmin(b, assistant.url, "#settings/modules/clock")
+    const card = b.getByTestId("module-clock")
     await expect(card).toHaveAttribute("data-state", "running")
-    await card.getByRole("button", { name: /Clock/ }).click()
-    const form = card.getByTestId("form-m-clock")
+    const form = b.getByTestId("form-m-clock")
 
     // A value the server rejects: shown under its field, nothing saved.
     await form.getByLabel("Time zone").fill("Mars/Olympus_Mons")
-    await form.getByRole("button", { name: "Save" }).click()
+    await footer(b).getByRole("button", { name: "Save", exact: true }).click()
     await expect(form.locator("[data-field=timeZone]")).toContainText("Unknown time zone")
     await expect(form.getByLabel("Time zone")).toHaveAttribute("aria-invalid", "true")
 
     // A valid change: zone and date format.
     await form.getByLabel("Time zone").fill("Asia/Tokyo")
     await form.getByRole("radio", { name: "November 13, 2026" }).click()
-    await form.getByRole("button", { name: "Save" }).click()
-    await expect(form.getByText("Saved")).toBeVisible()
+    await footer(b).getByRole("button", { name: "Save", exact: true }).click()
+    await expect(footer(b).getByText("Saved")).toBeVisible()
 
-    // The second page shows the change.
-    await b.keyboard.press("Escape")
-    await b.getByRole("button", { name: "Options (O)" }).click()
-    const cardB = b.getByTestId("module-clock")
-    await cardB.getByRole("button", { name: /Clock/ }).click()
-    await expect(cardB.getByTestId("form-m-clock").getByLabel("Time zone")).toHaveValue("Asia/Tokyo")
-    await expect(cardB.getByTestId("form-m-clock").getByRole("radio", { name: "November 13, 2026" })).toHaveAttribute("aria-checked", "true")
+    // The second admin page shows the change.
+    await loginAdmin(c, assistant.url, "#settings/modules/clock")
+    const formC = c.getByTestId("form-m-clock")
+    await expect(formC.getByRole("textbox", { name: "Time zone" })).toHaveValue("Asia/Tokyo")
+    await expect(formC.getByRole("radio", { name: "November 13, 2026" })).toHaveAttribute("aria-checked", "true")
 
-    // The next turn uses it: the date in en-US.
-    await a.keyboard.press("Escape")
+    // The voice page's next turn uses it: the date in en-US.
     from = (await messages(a)).length
     await type(a, "What time is it?")
     end = await waitForMessage(a, (m) => m.msg.type === "turn.end", { from })
@@ -339,16 +335,14 @@ test("modules from the options drawer: a rejected value, reconfigure and disable
     const us = log.filter((m) => m.msg.type === "assistant.text").map((m) => m.msg.text).join("")
     expect(us).toMatch(/[A-Z][a-z]+ \d{1,2}, \d{4}/) // "November 13, 2026"
 
-    // Disable the clock (from page B): page A sees it, and the time question is no longer a tool call.
+    // Disable the clock (from page B): page C sees it, and the time question is no longer a tool call.
     // The server keeps the old instance 10 s ("stopping", out of the snapshot already); the card shows it as off.
-    await cardB.getByRole("switch").first().click()
-    await expect(cardB).toHaveAttribute("data-state", /stopping|disabled/)
-    await expect(cardB.getByRole("switch").first()).toHaveAttribute("aria-checked", "false")
-    await expect(cardB.getByRole("switch").first()).not.toHaveAttribute("aria-busy", "true")
-    await expect(cardB).not.toContainText(/stopping/i)
-    await a.getByRole("button", { name: "Options (O)" }).click()
-    await expect(a.getByTestId("module-clock")).toHaveAttribute("data-state", /stopping|disabled/)
-    await a.keyboard.press("Escape")
+    await card.getByRole("switch").first().click()
+    await expect(card).toHaveAttribute("data-state", /stopping|disabled/)
+    await expect(card.getByRole("switch").first()).toHaveAttribute("aria-checked", "false")
+    await expect(card.getByRole("switch").first()).not.toHaveAttribute("aria-busy", "true")
+    await expect(card).not.toContainText(/stopping/i)
+    await expect(c.getByTestId("module-clock")).toHaveAttribute("data-state", /stopping|disabled/)
     from = (await messages(a)).length
     await type(a, "What time is it?")
     end = await waitForMessage(a, (m) => m.msg.type === "turn.end", { from })
@@ -356,10 +350,12 @@ test("modules from the options drawer: a rejected value, reconfigure and disable
     expect(log.some((m) => m.msg.type === "tool.start")).toBe(false)
     expect(log.filter((m) => m.msg.type === "assistant.text").map((m) => m.msg.text).join("")).toMatch(/You said: What time is it\?/)
     await expect(a.getByTestId("turn").last().getByTestId("tool-chip")).toHaveCount(0)
+    // The voice page never received module data.
+    expect((await messages(a)).some((m) => m.msg.type === "module.changed" || m.msg.type === "admin.snapshot")).toBe(false)
 
     // Enable it again: back to the tool.
-    await cardB.getByRole("switch").first().click()
-    await expect(cardB).toHaveAttribute("data-state", "running")
+    await card.getByRole("switch").first().click()
+    await expect(card).toHaveAttribute("data-state", "running")
     from = (await messages(a)).length
     await type(a, "What time is it?")
     await waitForMessage(a, (m) => m.msg.type === "turn.end", { from })
@@ -368,6 +364,7 @@ test("modules from the options drawer: a rejected value, reconfigure and disable
   } finally {
     await saveLog(a, testInfo.outputPath("socket-log-a.json"))
     await saveLog(b, testInfo.outputPath("socket-log-b.json"))
+    await saveLog(c, testInfo.outputPath("socket-log-c.json"))
     await ctx.close()
   }
 })

@@ -12,7 +12,7 @@ import { makeFakeSdk } from "../../../packages/agent-claude-code/test/fakeSdk.ts
 import { FakeLlm } from "../src/FakeLlm.ts"
 import { makeSubscriptionAgents, OFFLINE_AGENT_ID, SUBSCRIPTION_AGENT_ID, subscriptionNotice } from "../src/subscription.ts"
 import { ScriptedClient } from "./support/scriptedClient.ts"
-import { controlledStt, fakeBuild, scriptedLlm, startTestServer, type TestServer } from "./support/serveHarness.ts"
+import { controlledStt, fakeBuild, scriptedLlm, startTestServer, type TestServer, TEST_ADMIN_PASSWORD } from "./support/serveHarness.ts"
 
 vi.setConfig({ testTimeout: 20_000 })
 
@@ -95,7 +95,7 @@ describe("serve: LLM_PROVIDER=claude-subscription", () => {
     })
     const client = await ScriptedClient.connect({ url: server.url })
     clients.push(client)
-    const welcome = await client.hello()
+    const welcome = await client.admin(TEST_ADMIN_PASSWORD)
     expect(welcome.snapshot.engine.engines[0]).toEqual({
       stage: "llm",
       provider: "claude-subscription",

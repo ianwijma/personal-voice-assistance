@@ -1,6 +1,8 @@
 import {
   type Condition,
+  type DeviceInfo,
   evaluateCondition,
+  type FrontendKindInfo,
   type ModuleInfo,
   type SettingsGroup,
   type SettingsSection,
@@ -27,14 +29,15 @@ export interface GroupMeta {
 /** The categories, in order. `other` collects sections of an unknown group (a newer server) and is shown only when non-empty. */
 export const settingsGroups: ReadonlyArray<GroupMeta> = [
   { slug: "overview", title: "Overview", description: "What is set up, and what still needs doing." },
+  { slug: "frontends", title: "Front ends", description: "The defaults for each kind of voice front end." },
+  { slug: "devices", title: "Devices", description: "Every phone, tablet or computer that used the voice assistant." },
   { slug: "language-model", title: "Language model", description: "Who answers you.", server: "agents" },
   { slug: "speech", title: "Speech recognition", description: "How the assistant hears you.", server: "speech" },
   { slug: "voices", title: "Voices", description: "How the assistant sounds.", server: "voices" },
   { slug: "modules", title: "Modules", description: "What the assistant can do. Changes apply from the next turn.", server: "modules" },
-  { slug: "keys", title: "Keys & access", description: "Who may change things, and where the keys are.", server: "access" },
-  { slug: "device", title: "This device", description: "Saved in this browser only: each device keeps its own choices." },
+  { slug: "keys", title: "Keys & vault", description: "Where the keys are kept, and the vault that protects them.", server: "access" },
   { slug: "diagnostics", title: "Diagnostics", description: "Why it misbehaves.", server: "diagnostics" },
-  { slug: "about", title: "About", description: "Version, connection and keyboard shortcuts." },
+  { slug: "about", title: "About", description: "Version and connection." },
   { slug: "other", title: "Other", description: "Settings this page does not know where to put.", server: "general" }
 ]
 
@@ -48,6 +51,11 @@ export interface ClientPageRef {
   readonly title: string
   readonly description?: string
   readonly order: number
+  /**
+   * A page shown once per item of server data (`frontend`: one per front-end kind, `device`: one per device): not a
+   * page of its own; the tree places one page per item and the page reads its item from the path.
+   */
+  readonly perItem?: boolean
 }
 
 export type PageSource =
@@ -64,6 +72,8 @@ export interface NavPage {
   readonly source: PageSource
   /** False for a page whose `visibleWhen` does not hold (listed under "Not in use", e.g. "Set up Deepgram"). */
   readonly inUse: boolean
+  /** Shown in the navigation. False for a device's page: reached from the device list, not listed itself. */
+  readonly listed: boolean
   /** Only admin pages may change it. */
   readonly protected: boolean
   /** It has secret fields (a key icon while the vault is locked). */
@@ -83,6 +93,9 @@ export interface TreeInput {
   readonly sections: ReadonlyArray<SettingsSection>
   readonly modules: ReadonlyArray<ModuleInfo>
   readonly clientPages: ReadonlyArray<ClientPageRef>
+  /** Admin: one Front ends page per kind, one (unlisted) Devices page per device. */
+  readonly frontends?: ReadonlyArray<FrontendKindInfo>
+  readonly devices?: ReadonlyArray<DeviceInfo>
 }
 
 /** Every non-secret value of every section, by key (keys are global): what page and field conditions are judged on. */
@@ -127,6 +140,7 @@ export const buildSettingsTree = (input: TreeInput): ReadonlyArray<NavGroup> => 
       order: first.order ?? 1000 + index++,
       source: { kind: "sections", sections },
       inUse: sections.every((s) => holds(s.visibleWhen, values)),
+      listed: true,
       protected: sections.some((s) => s.protected === true),
       hasSecrets: sections.some((s) => s.form.fields.some((f) => f.type === "secret")),
       hasErrors: sections.some((s) => s.form.errors.length > 0)
@@ -143,13 +157,52 @@ export const buildSettingsTree = (input: TreeInput): ReadonlyArray<NavGroup> => 
       order: 500 + i,
       source: { kind: "module", moduleId: m.id },
       inUse: true,
+      listed: true,
       protected: m.protected === true,
       hasSecrets: m.settings.fields.some((f) => f.type === "secret"),
       hasErrors: m.state === "error" || m.settings.errors.length > 0
     })
   })
 
+  const perItem = (page: string) => input.clientPages.find((c) => c.perItem === true && c.id === page)
+  const frontendPage = perItem("frontend")
+  if (frontendPage !== undefined) {
+    ;(input.frontends ?? []).forEach((k, i) => {
+      add({
+        group: frontendPage.group,
+        id: k.id,
+        title: k.title,
+        description: k.description,
+        order: frontendPage.order + i,
+        source: { kind: "client", id: frontendPage.id },
+        inUse: true,
+        listed: true,
+        protected: false,
+        hasSecrets: false,
+        hasErrors: false
+      })
+    })
+  }
+  const devicePage = perItem("device")
+  if (devicePage !== undefined) {
+    ;(input.devices ?? []).forEach((d, i) => {
+      add({
+        group: devicePage.group,
+        id: d.id,
+        title: d.name,
+        order: devicePage.order + i,
+        source: { kind: "client", id: devicePage.id },
+        inUse: true,
+        listed: false,
+        protected: false,
+        hasSecrets: false,
+        hasErrors: false
+      })
+    })
+  }
+
   for (const c of input.clientPages) {
+    if (c.perItem === true) continue
     add({
       group: c.group,
       id: c.id,
@@ -158,6 +211,7 @@ export const buildSettingsTree = (input: TreeInput): ReadonlyArray<NavGroup> => 
       order: c.order,
       source: { kind: "client", id: c.id },
       inUse: true,
+      listed: true,
       protected: false,
       hasSecrets: false,
       hasErrors: false
@@ -194,6 +248,9 @@ export interface Resolved {
   readonly page: NavPage | undefined
 }
 
+/** The pages a category lists in the navigation. */
+export const listedPages = (group: NavGroup): ReadonlyArray<NavPage> => group.pages.filter((p) => p.listed)
+
 /**
  * What a path shows. On a wide screen (list + page) there is always a page: the category's first page, or the
  * first category. On a narrow one (drill-down) `[]` is the category list, `[category]` its page list (or its only
@@ -204,11 +261,12 @@ export const resolveSettingsPath = (tree: ReadonlyArray<NavGroup>, path: Setting
   if (group === undefined) {
     if (!wide) return { group: undefined, page: undefined }
     const first = tree[0]
-    return { group: first, page: first?.pages[0] }
+    return { group: first, page: first === undefined ? undefined : listedPages(first)[0] }
   }
   const page = group.pages.find((p) => p.id === path[1])
   if (page !== undefined) return { group, page }
-  if (wide || group.pages.length === 1) return { group, page: group.pages[0] }
+  const listed = listedPages(group)
+  if (wide || listed.length === 1) return { group, page: listed[0] }
   return { group, page: undefined }
 }
 
@@ -217,10 +275,12 @@ export const resolveSettingsPath = (tree: ReadonlyArray<NavGroup>, path: Setting
  * always in view, so up from anywhere is closing.
  */
 export const parentPath = (tree: ReadonlyArray<NavGroup>, path: SettingsPath, wide: boolean): SettingsPath | undefined => {
-  if (wide) return undefined
-  const { group, page } = resolveSettingsPath(tree, path, false)
+  const { group, page } = resolveSettingsPath(tree, path, wide)
   if (group === undefined) return undefined
-  return page !== undefined && group.pages.length > 1 ? [group.slug] : []
+  // An unlisted page (a device) goes back to the list it was opened from, on any screen.
+  if (page !== undefined && !page.listed) return [group.slug]
+  if (wide) return undefined
+  return page !== undefined && listedPages(group).length > 1 ? [group.slug] : []
 }
 
 /** "Speech recognition › Engine" for the `reloadPendingFor` paths (server groups) that the tree knows. */

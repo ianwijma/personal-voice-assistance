@@ -5,7 +5,9 @@
 @import "@fontsource/ibm-plex-mono/400.css";
 @import "@fontsource/ibm-plex-mono/500.css";
 
-/* Design tokens: docs/UI-AND-MODULES.md §3.2. Amber is the assistant's voice, mint is yours. */
+/* Design tokens: docs/UI-AND-MODULES.md §3.2. Amber is the assistant's voice, mint is yours.
+   Every colour that carries text is at least 4.5:1 on bg, surface and surface-2 in both themes
+   (test/contrast.test.ts computes it from this file). */
 @theme {
   --color-bg: oklch(0.165 0.006 110);
   --color-surface: oklch(0.205 0.007 110);
@@ -13,7 +15,7 @@
   --color-line: oklch(0.32 0.008 110);
   --color-ink: oklch(0.93 0.015 95);
   --color-ink-muted: oklch(0.70 0.014 95);
-  --color-ink-faint: oklch(0.52 0.010 95);
+  --color-ink-faint: oklch(0.64 0.010 95);
   --color-voice: oklch(0.80 0.140 75);
   --color-voice-soft: oklch(0.80 0.140 75 / 0.16);
   --color-you: oklch(0.83 0.090 180);
@@ -45,12 +47,14 @@
     --color-line: oklch(0.870 0.010 95);
     --color-ink: oklch(0.220 0.010 110);
     --color-ink-muted: oklch(0.450 0.012 110);
-    --color-ink-faint: oklch(0.620 0.010 110);
-    --color-voice: oklch(0.620 0.150 60);
+    --color-ink-faint: oklch(0.510 0.010 110);
+    --color-voice: oklch(0.520 0.150 60);
     --color-voice-soft: oklch(0.620 0.150 60 / 0.14);
-    --color-you: oklch(0.550 0.090 195);
-    --color-you-soft: oklch(0.550 0.090 195 / 0.14);
-    --color-danger: oklch(0.550 0.190 28);
+    --color-you: oklch(0.470 0.090 195);
+    --color-you-soft: oklch(0.550 0.090 195 / 0.10);
+    --color-ok: oklch(0.500 0.110 150);
+    --color-warn: oklch(0.520 0.120 50);
+    --color-danger: oklch(0.530 0.190 28);
     --shadow-panel: 0 16px 48px -20px oklch(0.3 0.02 95 / 0.35);
   }
 }
@@ -97,6 +101,23 @@ body {
 @utility scrollbar-quiet {
   scrollbar-width: thin;
   scrollbar-color: var(--color-line) transparent;
+}
+
+/* Short screens (small phones, phones in landscape): the voice stage tightens its spacing (`short:`). */
+@custom-variant short (@media (max-height: 600px));
+
+/* The voice stage scales with the height it has, so the line, its label and what is under them stay clear of the
+   dock on small and landscape phones (320 × 568, 667 × 375); on taller screens the old fixed sizes are kept. */
+@layer components {
+  .stage-pad { padding-top: max(12px, min(36dvh - 100px, 50dvh - 200px)); }
+  .stage-vis { height: clamp(48px, 100dvh - 320px, 160px); }
+  @media (min-width: 640px) {
+    .stage-pad { padding-top: max(12px, min(38dvh - 141px, 60dvh - 280px)); }
+    .stage-vis { height: clamp(48px, 100dvh - 320px, 240px); }
+  }
+  @media (max-height: 600px) {
+    .stage-pad { padding-top: max(8px, min(36dvh - 100px, 50dvh - 200px)); }
+  }
 }
 
 @keyframes pva-spin { to { transform: rotate(360deg); } }

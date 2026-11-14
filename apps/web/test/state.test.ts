@@ -5,12 +5,14 @@ import { type Action, type ClientState, initialState, isOwner, lastLatency, MAX_
 
 const run = (actions: ReadonlyArray<Action>, from: ClientState = initialState) => actions.reduce(reducer, from)
 const welcome = serverExamples.welcome
-const observerWelcome: ServerMessage = { ...welcome, snapshot: { ...exampleSnapshot, role: "observer", ownerPresent: false, state: "idle", history: [], traces: [] } }
+// Protocol 5 splits the snapshot: the voice part in `welcome`, the admin part in `admin.snapshot`.
+const adminSnapshot = serverExamples["admin.snapshot"]
+const observerWelcome: ServerMessage = { ...welcome, snapshot: { ...exampleSnapshot, role: "observer", ownerPresent: false, state: "idle", history: [] } }
 const audioRunning: Action = { type: "local/audio", phase: "running" }
 
 describe("reducer", () => {
   it("handles every server message type (examples from @pva/protocol)", () => {
-    let s = run([welcome])
+    let s = run([welcome, adminSnapshot])
     for (const type of Object.keys(serverExamples) as Array<ServerMessageType>) {
       expect(() => {
         s = reducer(s, serverExamples[type])
@@ -21,7 +23,7 @@ describe("reducer", () => {
 
   it("welcome replaces the state from the snapshot and keeps the UI", () => {
     const before = run([{ type: "local/ui", patch: { chatOpen: true, settingsPath: ["device", "display"] } }])
-    const s = reducer(before, welcome)
+    const s = run([welcome, adminSnapshot], before)
     expect(s.connection).toMatchObject({ status: "open", attempt: 0, everConnected: true, connectionId: "conn-3", server: { name: "pva" } })
     expect(s.session).toMatchObject({ role: "owner", ownerPresent: true, serverState: "listening" })
     expect(modulesInOrder(s).map((m) => m.id)).toEqual(["weather", "home-assistant"])
@@ -117,7 +119,7 @@ describe("reducer", () => {
   })
 
   it("keeps the highest module and section revision", () => {
-    const s0 = run([welcome])
+    const s0 = run([welcome, adminSnapshot])
     const newer = reducer(s0, { type: "module.changed", module: { ...exampleWeatherModule, revision: 9, enabled: false } })
     expect(newer.modules.byId.weather!.enabled).toBe(false)
     const stale = reducer(newer, { type: "module.changed", module: { ...exampleWeatherModule, revision: 4 } })
@@ -130,14 +132,14 @@ describe("reducer", () => {
   })
 
   it("tracks requests until their result", () => {
-    let s = run([welcome, { type: "local/request", requestId: "r9", kind: "module.enable", target: "weather" }])
+    let s = run([welcome, adminSnapshot, { type: "local/request", requestId: "r9", kind: "module.enable", target: "weather" }])
     expect(s.pending.r9).toEqual({ kind: "module.enable", target: "weather" })
     s = reducer(s, { type: "result", requestId: "r9", ok: true })
     expect(s.pending).toEqual({})
   })
 
   it("errors become toasts (at most 3) and attach to their turn", () => {
-    let s = run([welcome, { type: "turn.start", turnId: 12, source: "voice", userText: "x", spoken: true }])
+    let s = run([welcome, adminSnapshot, { type: "turn.start", turnId: 12, source: "voice", userText: "x", spoken: true }])
     s = reducer(s, serverExamples.error)
     expect(s.turns.at(-1)!.error).toBe("The language model did not answer in time.")
     for (let i = 0; i < 5; i++) s = reducer(s, { type: "local/toast", message: `m${i}`, tone: "info" })
@@ -146,7 +148,7 @@ describe("reducer", () => {
   })
 
   it("reconnect: losing the socket clears requests and playback; a new welcome replaces the snapshot", () => {
-    let s = run([welcome, audioRunning, { type: "local/playing", turnId: 12 }, { type: "local/request", requestId: "r1", kind: "text.send" }, { type: "local/ui", patch: { chatOpen: true } }])
+    let s = run([welcome, adminSnapshot, audioRunning, { type: "local/playing", turnId: 12 }, { type: "local/request", requestId: "r1", kind: "text.send" }, { type: "local/ui", patch: { chatOpen: true } }])
     s = reducer(s, { type: "local/socket-lost" })
     s = reducer(s, { type: "local/connection", status: "reconnecting", attempt: 2 })
     expect(s.pending).toEqual({})
@@ -161,7 +163,7 @@ describe("reducer", () => {
   })
 
   it("visual states: owner muted, error, outdated", () => {
-    const owner = run([welcome, audioRunning, { type: "local/mic", live: false }])
+    const owner = run([welcome, adminSnapshot, audioRunning, { type: "local/mic", live: false }])
     expect(visualState(owner)).toBe("muted")
     expect(visualState(reducer(owner, { type: "state", state: "thinking" }))).toBe("thinking")
     expect(visualState(reducer(owner, { type: "local/audio", phase: "error", error: "denied" }))).toBe("error")
@@ -169,14 +171,15 @@ describe("reducer", () => {
   })
 
   it("names the voice only when more than one is enabled", () => {
-    const s = run([welcome, audioRunning, { type: "turn.start", turnId: 12, source: "voice", userText: "", spoken: true }, { type: "assistant.text", turnId: 12, clause: 0, text: "a", voice: "natural" }, { type: "local/playing", turnId: 12 }, { type: "assistant.playing", turnId: 12, clause: 0 }])
+    const s = run([welcome, adminSnapshot, audioRunning, { type: "turn.start", turnId: 12, source: "voice", userText: "", spoken: true }, { type: "assistant.text", turnId: 12, clause: 0, text: "a", voice: "natural" }, { type: "local/playing", turnId: 12 }, { type: "assistant.playing", turnId: 12, clause: 0 }])
     expect(speakingVoice(s)).toBe("natural")
-    const single = { ...s, engine: { ...s.engine, voices: s.engine.voices.slice(0, 1) } }
+    expect(s.summary.voices.length).toBeGreaterThan(1)
+    const single = { ...s, summary: { ...s.summary, voices: s.summary.voices.slice(0, 1) } }
     expect(speakingVoice(single)).toBeUndefined()
   })
 
   it("opening the chat clears unread replies", () => {
-    let s = run([welcome, { type: "turn.end", turnId: 12, outcome: "completed", trace: exampleTrace }])
+    let s = run([welcome, adminSnapshot, { type: "turn.end", turnId: 12, outcome: "completed", trace: exampleTrace }])
     expect(s.ui.unread).toBe(1)
     s = reducer(s, { type: "local/ui", patch: { chatOpen: true } })
     expect(s.ui.unread).toBe(0)

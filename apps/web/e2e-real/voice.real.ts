@@ -6,6 +6,7 @@ import {
   expect,
   expectVisualState,
   here,
+  loginAdmin,
   messages,
   micWav,
   missingPrerequisite,
@@ -32,7 +33,19 @@ test.afterAll(async () => {
   await assistant?.stop()
 })
 
-test("a spoken turn: listening → hearing → thinking → speaking → listening, transcript and reply in the chat, latency shown", async ({ page }) => {
+test("a spoken turn: listening → hearing → thinking → speaking → listening, transcript and reply in the chat, latency in admin", async ({ page }) => {
+  // What the page asked the microphone for, and what the browser then reports (echo cancellation).
+  await page.addInitScript(() => {
+    const w = window as unknown as { __gum: Array<{ asked: unknown; got: unknown }> }
+    w.__gum = []
+    const original = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices)
+    navigator.mediaDevices.getUserMedia = async (c) => {
+      const stream = await original(c)
+      const asked = typeof c?.audio === "object" ? (c.audio as MediaTrackConstraints).echoCancellation : undefined
+      w.__gum.push({ asked: typeof asked === "object" && asked !== null && "exact" in asked ? asked.exact : asked, got: stream.getAudioTracks()[0]?.getSettings().echoCancellation })
+      return stream
+    }
+  })
   await page.goto(assistant.url)
   await expectVisualState(page, "not-started")
   await page.getByTestId("start").click()
@@ -71,17 +84,35 @@ test("a spoken turn: listening → hearing → thinking → speaking → listeni
   await expect(turn).toHaveAttribute("data-outcome", "completed")
   await expect(turn).toContainText(/hello/i)
   await expect(turn.getByTestId("assistant-message")).toContainText(/You said/i)
-  await expect(page.getByTestId("latency-readout")).toHaveText(/\d+ ms/)
   expect((await turnEnds(page)).length).toBe(1)
 
-  // This device: the microphone as the browser reports it, and the reply that just played, counted.
+  // This device's audio report (the help dialog, `?`): the reply that just played, counted.
   await page.keyboard.press("Escape")
-  await page.keyboard.press("o")
-  await page.getByRole("tab", { name: "This device" }).click()
-  const diagnostics = page.getByTestId("audio-diagnostics")
-  await expect(diagnostics.getByTestId("playback-replies")).toHaveText("1")
-  await expect(diagnostics.getByTestId("mic-rate")).toContainText("audio context")
-  // Turning echo cancellation off re-opens the microphone with it off, as the browser then reports.
-  await page.getByTestId("mic-processing").getByRole("switch", { name: "Echo cancellation" }).click()
-  await expect(diagnostics).toContainText(/Echo cancellation\s*off \(asked off\)/)
+  await page.keyboard.press("?")
+  const help = page.getByTestId("help-dialog")
+  await expect(help.getByTestId("audio-report")).toContainText("1 reply played")
+  await page.keyboard.press("Escape")
+
+  // The latency of that turn: in admin › Diagnostics › Latency (the voice page no longer shows it).
+  const admin = await page.context().newPage()
+  await loginAdmin(admin, assistant.url, "#settings/diagnostics/latency")
+  const latency = admin.getByTestId("page-diagnostics-latency")
+  await expect(latency).toContainText(/median \d+ ms/)
+  await expect(latency.locator("tbody tr")).toHaveCount(1)
+  await expect(latency.locator("tbody tr").first()).toContainText("completed")
+
+  // Echo cancellation is part of the device profile: switched off in admin (Front ends), the open voice page
+  // re-opens its microphone with it off, as the browser then reports.
+  await admin.getByTestId("nav-frontends").click()
+  const kind = admin.getByTestId("profile-frontend-web-voice")
+  await kind.getByRole("switch", { name: "Echo cancellation" }).click()
+  await admin.getByTestId("page-footer").getByRole("button", { name: "Save", exact: true }).click()
+  await expect(admin.getByTestId("footer-note")).toContainText("Saved")
+  await expect.poll(() => page.evaluate(() => (window as unknown as { __gum: Array<{ asked: unknown; got: unknown }> }).__gum.at(-1)), { timeout: 10_000 })
+    .toEqual({ asked: false, got: false })
+  const gum = await page.evaluate(() => (window as unknown as { __gum: Array<{ asked: unknown; got: unknown }> }).__gum)
+  expect(gum.length).toBe(2) // Start, then the re-open
+  expect(gum[0]).toEqual({ asked: true, got: true })
+  await expectVisualState(page, "listening")
+  await admin.close()
 })

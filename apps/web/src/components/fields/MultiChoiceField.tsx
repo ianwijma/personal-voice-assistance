@@ -23,7 +23,7 @@ export function MultiChoiceField({ field, id, describedBy, value, onChange, disa
               aria-hidden="true"
               className={cx(
                 "mt-0.5 inline-flex size-[18px] shrink-0 items-center justify-center rounded-[4px] border transition-colors duration-[120ms] peer-focus-visible:outline-2 peer-focus-visible:outline-offset-2 peer-focus-visible:outline-you",
-                checked ? "border-you/70 bg-you-soft text-you" : "border-line bg-surface-2"
+                checked ? "border-you bg-you-soft text-you" : "border-ink-faint bg-surface-2"
               )}
             >
               {checked && <Icon name="check" size={13} />}

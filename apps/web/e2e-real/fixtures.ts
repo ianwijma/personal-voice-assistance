@@ -1,11 +1,13 @@
 // Fixtures for the end-to-end tests against the REAL assistant (`pnpm start serve`
 // with the local speech models and the fake language model), in headless
 // Chromium with a fake microphone fed from WAV files. docs/UI-AND-MODULES.md §6.3.
-import { type ChildProcess, spawn } from "node:child_process"
+import { type ChildProcess, spawn, spawnSync } from "node:child_process"
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { dirname, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 import { chromium, expect, type Page, test as base } from "@playwright/test"
+import { makeResampler } from "@pva/core"
+import { PROTOCOL_VERSION } from "@pva/protocol"
 
 export const here = dirname(fileURLToPath(import.meta.url))
 export const repoRoot = resolve(here, "../../..")
@@ -44,13 +46,44 @@ export const missingPrerequisite = (): string | undefined => {
 // ---------------------------------------------------------------------------
 // 48 kHz input files for Chromium's fake microphone (it loops the file).
 
+/** A mono s16 WAV as 16 kHz samples (other rates are resampled the way `bench --make-wavs` does). */
 const readWav16k = (file: string): Int16Array => {
   const b = readFileSync(file)
+  const rate = b.readUInt32LE(b.indexOf("fmt ") + 12)
   const at = b.indexOf("data")
   const n = b.readUInt32LE(at + 4)
-  const out = new Int16Array(n / 2)
-  for (let i = 0; i < out.length; i++) out[i] = b.readInt16LE(at + 8 + i * 2)
-  return out
+  const raw = new Uint8Array(b.buffer, b.byteOffset + at + 8, Math.min(n, b.length - at - 8))
+  const pcm = rate === 16_000 ? raw.slice() : makeResampler(rate, 16_000)(raw.slice())
+  return new Int16Array(pcm.buffer, pcm.byteOffset, pcm.length >> 1)
+}
+
+/**
+ * Speech synthesised by the assistant itself (`pnpm start say`), cached in `.fixtures/`: the wake-phrase tests need
+ * sentences the bench files do not have ("Hey Jeff, what time is it?"). `voice`: a voice of the catalog
+ * (`standard` = Piper lessac, `natural` = Kokoro af_heart); `speed`: `TTS_SHERPA_SPEED`.
+ */
+export const spoken = (text: string, options: { readonly voice?: string; readonly speed?: number } = {}): Segment => {
+  const voice = options.voice ?? "standard"
+  const slug = `${voice}${options.speed === undefined ? "" : `-x${options.speed}`}-${text.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 40)}`
+  const path = join(fixturesDir, "say", `${slug}.wav`)
+  if (!existsSync(path)) {
+    mkdirSync(dirname(path), { recursive: true })
+    const scratch = join(fixturesDir, "say-data")
+    const tsx = join(assistantDir, "node_modules/tsx/dist/cli.mjs")
+    const r = spawnSync(process.execPath, [tsx, "src/main.ts", "say", "--voice", voice, "--out", path, text], {
+      cwd: assistantDir,
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        LLM_PROVIDER: "fake",
+        PVA_DATA_DIR: scratch,
+        PVA_VAULT_PATH: join(scratch, "vault.enc"),
+        ...(options.speed === undefined ? {} : { TTS_SHERPA_SPEED: String(options.speed) })
+      }
+    })
+    if (r.status !== 0 || !existsSync(path)) throw new Error(`say failed (${r.status}):\n${r.stdout}\n${r.stderr}`)
+  }
+  return { speech: path }
 }
 
 /** 16 → 48 kHz: zero-stuffing and a windowed-sinc low-pass at 7.6 kHz (the speech is 16 kHz anyway). */
@@ -97,7 +130,7 @@ export const micWav = (name: string, segments: ReadonlyArray<Segment>): string =
   const parts: Array<Float64Array> = []
   let seed = 1
   for (const s of segments) {
-    if ("speech" in s) parts.push(upsample3(readWav16k(join(benchAudio, s.speech))))
+    if ("speech" in s) parts.push(upsample3(readWav16k(s.speech.startsWith("/") ? s.speech : join(benchAudio, s.speech))))
     else {
       const n = Math.round((s.silenceMs * 48_000) / 1000)
       const noise = new Float64Array(n)
@@ -151,6 +184,9 @@ export interface Assistant {
   readonly process: ChildProcess
 }
 
+/** The admin password every assistant these tests start has. */
+export const E2E_ADMIN_PASSWORD = "e2e admin password"
+
 export const startAssistant = async (options: {
   readonly port: number
   readonly dataDir: string
@@ -173,6 +209,8 @@ export const startAssistant = async (options: {
       PVA_DATA_DIR: options.dataDir,
       PVA_VAULT_PATH: join(options.dataDir, "vault", "vault.enc"), // never the owner's real key vault
       PVA_WEB_DIR: webOut,
+      // Protocol 5: settings change through an admin connection (`setFrontendDefaults`).
+      PVA_ADMIN_PASSWORD: E2E_ADMIN_PASSWORD,
       ...options.env
     }
   })
@@ -365,9 +403,36 @@ export const test = base.extend({
 })
 export { expect }
 
-/** Per-device preferences (localStorage) to apply before the page loads. */
+/** Per-browser preferences (localStorage: microphone and speaker) to apply before the page loads. */
 export const setPrefs = (page: Page, prefs: Record<string, unknown>) =>
   page.addInitScript({ content: `localStorage.setItem("pva.prefs.v1", ${JSON.stringify(JSON.stringify(prefs))})` })
+
+/**
+ * Protocol 5: set the `web-voice` defaults (e.g. `{ interruptMode: "manual" }`), as admin › Front ends would: log in
+ * on an admin connection with `E2E_ADMIN_PASSWORD`, send `frontend.update`, wait for its result.
+ */
+export const setFrontendDefaults = async (url: string, patch: Record<string, unknown>): Promise<void> => {
+  const ws = new WebSocket(`${url.replace(/^http/, "ws")}/ws`)
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("admin: no answer")), 10_000)
+    ws.onopen = () => ws.send(JSON.stringify({ type: "hello", protocol: PROTOCOL_VERSION, clientId: `admin-${Date.now()}`, resumeOwner: false, frontend: "admin" }))
+    ws.onmessage = (e) => {
+      const m = JSON.parse(String(e.data)) as { type: string; requestId?: string; ok?: boolean; error?: { message: string } }
+      if (m.type === "welcome") ws.send(JSON.stringify({ type: "admin.login", requestId: "login", password: E2E_ADMIN_PASSWORD }))
+      if (m.type === "result" && m.requestId === "login") {
+        if (m.ok !== true) return reject(new Error(`admin login failed: ${m.error?.message}`))
+        ws.send(JSON.stringify({ type: "frontend.update", requestId: "defaults", kind: "web-voice", patch }))
+      }
+      if (m.type === "result" && m.requestId === "defaults") {
+        clearTimeout(timer)
+        ws.close()
+        if (m.ok === true) resolve()
+        else reject(new Error(`frontend.update failed: ${m.error?.message}`))
+      }
+    }
+    ws.onerror = () => reject(new Error("socket error"))
+  })
+}
 
 export type History = ReadonlyArray<{ role: "user" | "assistant"; text: string; interrupted?: boolean; tools?: ReadonlyArray<{ name: string; ok: boolean }> }>
 
@@ -376,7 +441,7 @@ export const serverHistory = async (url: string): Promise<History> => {
   const ws = new WebSocket(`${url.replace(/^http/, "ws")}/ws`)
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error("no welcome")), 5000)
-    ws.onopen = () => ws.send(JSON.stringify({ type: "hello", protocol: 1, clientId: `probe-${Date.now()}`, resumeOwner: false }))
+    ws.onopen = () => ws.send(JSON.stringify({ type: "hello", protocol: PROTOCOL_VERSION, clientId: `probe-${Date.now()}`, resumeOwner: false, frontend: "voice" }))
     ws.onmessage = (e) => {
       const m = JSON.parse(String(e.data)) as { type: string; snapshot?: { history: History } }
       if (m.type === "welcome") {
@@ -388,3 +453,17 @@ export const serverHistory = async (url: string): Promise<History> => {
     ws.onerror = () => reject(new Error("socket error"))
   })
 }
+
+/** Opens admin (`/admin/` + `hash`) and logs in with `E2E_ADMIN_PASSWORD` unless this tab already is; resolves when the settings screen is on. */
+export const loginAdmin = async (page: Page, url: string, hash = "") => {
+  await page.goto(`${url}/admin/${hash}`)
+  await page.locator("[data-testid=settings], [data-testid=login-form]").first().waitFor()
+  if (await page.getByTestId("login-form").isVisible()) {
+    await page.locator("#admin-password").fill(E2E_ADMIN_PASSWORD)
+    await page.getByRole("button", { name: "Log in" }).click()
+  }
+  await expect(page.getByTestId("settings")).toBeVisible()
+}
+
+/** Every alert on screen (error toasts, inline errors), as text. */
+export const alerts = async (page: Page) => (await page.getByRole("alert").allTextContents()).map((t) => t.trim()).filter((t) => t !== "")

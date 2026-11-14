@@ -128,6 +128,8 @@ export const usePageForms = (defs: ReadonlyArray<PageFormDef>, saved: (key: stri
         const { [field]: _old, ...rest } = s.localErrors
         return { ...s, localErrors: message === undefined ? rest : { ...rest, [field]: message } }
       }),
+    /** "Go back" from the warnings of a save: keep the edits, drop the warnings. */
+    dismissWarnings: () => setStates((current) => Object.fromEntries(Object.entries(current).map(([k, s]) => [k, s.confirm.length === 0 ? s : { ...s, confirm: [] }]))),
     /** Discard the edits (Cancel, or "Load latest" for one form). */
     cancel: (key?: string) =>
       setStates((current) => {

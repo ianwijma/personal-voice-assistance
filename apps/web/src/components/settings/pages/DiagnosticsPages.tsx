@@ -1,8 +1,9 @@
 "use client"
+import { type ReactNode, useEffect, useRef, useState } from "react"
 import { firstSoundMs, modulesInOrder } from "@/lib/state.ts"
 import { shallowEqual } from "@/lib/store.ts"
 import { useClient, useClientState } from "../../context.tsx"
-import { latencyTone, median, TraceRow } from "../../LatencyReadout.tsx"
+import { latencyTone, median, TRACE_COLUMNS, TraceRow } from "../latency.tsx"
 import { cx } from "../../ui/controls.tsx"
 
 /** Diagnostics › Latency: the last turns' traces with median and worst (the data of the ↯ readout). */
@@ -20,22 +21,22 @@ export function LatencyPage() {
       {traces.length === 0 ? (
         <p className="text-[14px] text-ink-muted">No turns yet. Each turn's latency trace appears here.</p>
       ) : (
-        <div className="-mx-2 overflow-x-auto scrollbar-quiet">
+        <ScrollX label="Latency of the last turns">
           <table className="w-full border-collapse font-mono text-[12px] tabular-nums">
             <thead>
               <tr className="text-left text-ink-faint">
-                {["turn", "spec", "1st token", "tts audio", "playback", "audible", "tools", "voice", "outcome"].map((h) => (
-                  <th key={h} className="label whitespace-nowrap px-2 py-2 text-[10px] font-medium">{h}</th>
+                {TRACE_COLUMNS.map((h) => (
+                  <th key={h} className="label whitespace-nowrap px-2 py-2 text-[10px] font-medium first:pl-0 last:pr-0">{h}</th>
                 ))}
               </tr>
             </thead>
             <tbody>{[...traces].reverse().map((t) => <TraceRow key={t.turnId} t={t} />)}</tbody>
           </table>
-        </div>
+        </ScrollX>
       )}
       <p className="text-[12px] text-ink-faint">
-        Milliseconds from the moment the assistant decided you had finished, from `TurnTrace`. Not included: microphone capture and the
-        silence the recogniser waits for.
+        Milliseconds from the moment the assistant decided you had finished, from each turn's latency trace. "Early" under a turn: the
+        reply was started before you had quite finished. The voice is under the outcome. Not included: microphone capture and the silence the recogniser waits for.
       </p>
     </div>
   )
@@ -64,5 +65,45 @@ export function ProblemsPage() {
         </li>
       ))}
     </ul>
+  )
+}
+
+/**
+ * A table that may be wider than the page (narrow screens): it scrolls sideways, can be scrolled with the keyboard
+ * (focusable, labelled), and fades at the edge that has more.
+ */
+function ScrollX({ label, children }: { readonly label: string; readonly children: ReactNode }) {
+  const ref = useRef<HTMLDivElement>(null)
+  const [more, setMore] = useState<{ readonly left: boolean; readonly right: boolean }>({ left: false, right: false })
+  useEffect(() => {
+    const el = ref.current
+    if (el === null) return
+    const update = () => setMore({ left: el.scrollLeft > 1, right: el.scrollLeft + el.clientWidth < el.scrollWidth - 1 })
+    update()
+    const ro = new ResizeObserver(update)
+    ro.observe(el)
+    el.addEventListener("scroll", update, { passive: true })
+    return () => {
+      ro.disconnect()
+      el.removeEventListener("scroll", update)
+    }
+  }, [])
+  const scrolls = more.left || more.right
+  const mask = more.left && more.right
+    ? "linear-gradient(to right, transparent, black 24px, black calc(100% - 24px), transparent)"
+    : more.right ? "linear-gradient(to right, black calc(100% - 32px), transparent)" : more.left ? "linear-gradient(to right, transparent, black 24px)" : undefined
+  return (
+    <div
+      ref={ref}
+      role="region"
+      aria-label={scrolls ? `${label} (scrolls sideways)` : label}
+      tabIndex={scrolls ? 0 : undefined}
+      data-testid="latency-table"
+      data-scrolls={scrolls ? "true" : "false"}
+      style={mask === undefined ? undefined : { maskImage: mask, WebkitMaskImage: mask }}
+      className="overflow-x-auto rounded-sm scrollbar-quiet"
+    >
+      {children}
+    </div>
   )
 }
