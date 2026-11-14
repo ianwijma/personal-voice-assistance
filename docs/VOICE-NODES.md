@@ -778,3 +778,66 @@ Each has a recommended default; work proceeds on it until he says otherwise.
 
 Nothing built yet. Each work package adds its entry here: what was built, where, differences from this design and
 why, the commands run and their results, and the measurements of §9 it produced.
+
+### WP-3 Node client skeleton (2026-11-14, branch `t3/add-headless-voice-node-client`)
+
+**Built**: `apps/node` (`@pva/node`), protocol 5. `main.ts` (CLI `run`, `devices`, `test-tone`), `config.ts`,
+`connection.ts`, `session.ts`, `playback.ts`, `audio.ts`, `tones.ts`, `node.ts` (`runNode`: one capture and one reply
+player per process, a fresh `Session` per connection), `README.md`. The node uses the core audio contract
+(`AudioInput` / `AudioOutput`) plus a small `NodeAudioInfo` service (backend names, player latency, cue output);
+PipeWire through `@pva/audio-pipewire` (`captureCommand` / `playbackCommand` / `captureStream` / `playThrough`), files
+through `@pva/audio-file`; input and output are chosen separately.
+
+**Seams left** (each a named place, marked `TODO(...)` or "WP-n seam" in the code):
+- WP-1: `alsaLayers` in `audio.ts` (fails with a clear message until `@pva/audio-alsa` exists) and `listDevices`
+  (only "System default" until the `arecord -L` / `aplay -L` / `pw-dump` parsers land); `AudioDeviceInfo` declared
+  locally.
+- WP-4: `bundle` script runs `scripts/bundle.mjs` (not there yet; esbuild not added as a dependency); `onOutdated` in
+  `runNode` for the 4400 → update check.
+- WP-6: `VOICE_NODE_KIND` (node.ts) and `UNAUTHORIZED_CLOSE_CODE = 4403` (connection.ts) declared locally;
+  `isSessionsFull` (session.ts) sniffs the raw text because protocol 5's `ErrorCode` lacks `sessions_full`.
+- WP-10: `helloFor` (add `hello.node`), `NodeSettings` (volume and cues from the profile instead of `--volume` /
+  `--no-cues`), `inputDevice` / `outputDevice` in `NodeAudioOptions` (profile `audioInput` / `audioOutput`),
+  `writeConfig` (for `pair --code`), `identifySound` / `testTone` (for `node.command`), `tlsPin` read but unused.
+
+**Differs from the design, and why**:
+- `ws` instead of Node 22's global `WebSocket` (§7.4): same `bufferedAmount` behaviour, and it takes an agent /
+  `checkServerIdentity`, which the `tlsPin` of WP-10 needs. Pure JavaScript, bundles fine.
+- Progress estimate (§4.4): the formula `min(written, (now − startedAt − latency) × rate)` counts the idle time of an
+  underrun as played. `PlaybackClock` restarts the estimate at the write that follows an underrun (counted in
+  `underruns`), still clamped to `written` and non-decreasing.
+- Shared owner on protocol 5: the node does not claim back when a browser takes the audio (`taken_over`); it claims
+  again only once `ownerPresent` is false, so the two do not fight. With voice sessions this case goes away.
+- A lost connection stops the playing reply without a report (the server has already failed the turn on owner loss).
+- The capture starts when the node first owns the audio and then runs for the life of the process; with
+  `--input-wav`, audio replayed while the server is unreachable is lost (seen in the restart run below).
+- With `--output-wav`, cues go to their own `cue-NNN.wav` series so `reply-NNN.wav` stays one file per reply.
+- The root `tsconfig.json` needed no change: it already includes `apps/*/src` and `apps/*/test`.
+
+**Tests** (`apps/node/test`, 25): a scripted server on a real `ws` socket speaking the `@pva/protocol` codecs —
+hello / claim / `mic.state`; no frames before ownership, then sequence 0…n; owner taken and given back (claim again,
+sequence from 0); reply reports started → progress (monotonic, ≤ written) → finished with every sample; volume;
+`reply.stop` answered with `playback.stopped { exact: true }` in under 300 ms and the player interrupted; reply stopped
+on connection loss, next reply after reconnect; wake and lapse cues; the latency line; backoff 40 → 80 → 160 → 200 →
+200 ms (base and cap shortened) and reset after a welcome; `sessions_full` → claim again; 4403 → the 10-minute retry.
+Plus units for the clock, gain, backoff (0.5 s → 30 s, equal jitter), close codes, config (0600), URL, tones and
+`--input-wav`. `pnpm check` and `pnpm test` pass (2779 tests).
+
+**Manual run on main (first data points, not claims)**: a real server on port 8799 with its own data directory
+(`LLM_PROVIDER=fake`, local Parakeet v2 STT, Piper), this machine (no sound card: PipeWire with only the null sink).
+1. `pnpm --filter @pva/node start --server http://127.0.0.1:8799 --input-wav bench-audio --input-gap-ms 9000
+   --output-wav <dir>`: all five bench WAVs answered, five `reply-NNN.wav` written. Node latency lines:
+
+   ```
+   turn #1 voice (speculative) completed llmRequestSent=-171ms llmFirstToken=-171ms (+1ms) firstClause=-154ms (+17ms) ttsFirstAudio=-31ms (+123ms) playbackStart=15ms (+46ms) audible=15ms (+0ms output latency, start delay 3ms) voices: standard total=1915ms
+   turn #2 voice (speculative) completed llmRequestSent=-137ms llmFirstToken=-131ms (+6ms) firstClause=-71ms (+60ms) ttsFirstAudio=-1ms (+70ms) playbackStart=2ms (+3ms) audible=2ms (+0ms output latency, start delay 0ms) tools: current_time 5ms voices: standard total=5828ms
+   turn #3 voice (speculative) completed llmRequestSent=-101ms llmFirstToken=-101ms (+0ms) firstClause=-86ms (+15ms) ttsFirstAudio=-32ms (+54ms) playbackStart=5ms (+37ms) audible=5ms (+0ms output latency, start delay 0ms) voices: standard total=2973ms
+   turn #4 voice completed llmRequestSent=11ms llmFirstToken=11ms (+0ms) firstClause=26ms (+15ms) ttsFirstAudio=109ms (+83ms) playbackStart=110ms (+2ms) audible=110ms (+0ms output latency, start delay 1ms) voices: standard total=2745ms
+   turn #5 voice (speculative) completed llmRequestSent=-192ms llmFirstToken=-192ms (+0ms) firstClause=-178ms (+15ms) ttsFirstAudio=-136ms (+42ms) playbackStart=2ms (+137ms) audible=2ms (+0ms output latency, start delay 0ms) voices: standard total=1956ms
+   ```
+2. The same with real `pw-cat` playback into the null sink (bench WAVs 01 and 03): `playbackStart=12ms … audible=32ms
+   (+20ms output latency)` and `playbackStart=9ms … audible=29ms`.
+3. Server stopped and restarted under a running node: `1001` → refused at 0.5, 0.6, 1.8, 3.9 s → reconnected, and
+   the next WAV was answered (`turn #1 … completed`).
+
+**Not verified**: a real microphone and speaker (no sound card here), ALSA, a Raspberry Pi, CPU (M1).
