@@ -2,8 +2,8 @@ import { evaluateCondition, type FieldError, type SettingField, type SettingsFor
 
 /**
  * Pure helpers behind the generated settings forms: the local draft, the
- * patch to send (only changed fields), and keeping edits when another tab
- * changes the same form.
+ * patch to send (only the fields the user edited), and keeping edits when
+ * another tab changes the same form.
  */
 
 export interface Draft {
@@ -13,9 +13,20 @@ export interface Draft {
   readonly secrets: Readonly<Record<string, string | null>>
   /** Saved values the user reset to their default ("Reset to default"): sent as `null`, so nothing stays saved. */
   readonly reset?: ReadonlyArray<string>
+  /**
+   * The server's values the draft is relative to. A field is edited when its value differs from
+   * its base, and only edited fields are sent: comparing with the newest form instead would turn
+   * a change made in another tab into a reset of that change.
+   */
+  readonly base: Readonly<Record<string, SettingValue>>
 }
 
-export const initialDraft = (form: SettingsForm): Draft => ({ values: { ...form.values }, secrets: {} })
+export const initialDraft = (form: SettingsForm): Draft => ({ values: { ...form.values }, secrets: {}, base: { ...form.values } })
+
+const edited = (draft: Draft, key: string): boolean => {
+  const value = draft.values[key]
+  return value !== undefined && !valueEqual(value, draft.base[key])
+}
 
 /** The draft with `key` set to `value` (an edit undoes a pending reset of that field). */
 export const setDraftValue = (draft: Draft, key: string, value: SettingValue): Draft => ({
@@ -47,8 +58,8 @@ export const valueEqual = (a: SettingValue | undefined, b: SettingValue | undefi
 }
 
 /**
- * The patch for the changed fields only. Locked fields are never sent, nor hidden ones (`shown` false: their saved
- * value stays). A reset field whose value is saved is sent as `null`.
+ * The patch for the fields the user edited (changed from the draft's base). Locked fields are never sent, nor
+ * hidden ones (`shown` false: their saved value stays). A reset field whose value is saved is sent as `null`.
  */
 export const computePatch = (form: SettingsForm, draft: Draft, shown: (field: SettingField) => boolean = () => true): SettingsPatch => {
   const values: Record<string, SettingValue | null> = {}
@@ -64,7 +75,7 @@ export const computePatch = (form: SettingsForm, draft: Draft, shown: (field: Se
       values[field.key] = null
       continue
     }
-    if (next !== undefined && !valueEqual(next, form.values[field.key])) values[field.key] = next
+    if (edited(draft, field.key)) values[field.key] = draft.values[field.key]!
   }
   return { values, secrets }
 }
@@ -104,12 +115,28 @@ export interface FormSync {
 
 /**
  * A new form arrived (`module.changed` / `section.changed`). Without edits the
- * draft follows silently; with edits they are kept and the form is marked stale.
+ * draft follows silently. With edits, the edited fields keep the user's values,
+ * every other field takes the new server value, the new values become the base
+ * (so a save sends only the edits), and the form is marked stale ("Changed in
+ * another tab"). A field changed on both sides keeps the user's edit.
  */
 export const reconcile = (sync: FormSync, previous: SettingsForm, next: SettingsForm, revision: number): FormSync => {
   if (revision <= sync.baseRevision) return sync
   if (!isDirty(previous, sync.draft)) return { draft: initialDraft(next), baseRevision: revision, stale: false }
-  return { ...sync, stale: true }
+  const values: Record<string, SettingValue> = { ...next.values }
+  for (const key of Object.keys(sync.draft.values)) {
+    if (edited(sync.draft, key)) values[key] = sync.draft.values[key]!
+  }
+  return {
+    draft: {
+      values,
+      secrets: sync.draft.secrets,
+      base: { ...next.values },
+      ...(sync.draft.reset !== undefined ? { reset: sync.draft.reset } : {})
+    },
+    baseRevision: revision,
+    stale: true
+  }
 }
 
 /** Fields split into the normal ones and those behind "Advanced". */

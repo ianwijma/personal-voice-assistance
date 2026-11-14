@@ -178,16 +178,54 @@ export interface EngineOptions {
   readonly explainProblems?: (
     problems: ReadonlyArray<{ readonly stage: string; readonly message: string }>
   ) => ReadonlyArray<{ readonly stage: string; readonly message: string }>
+  /** Typed inputs accepted but not yet taken by the conversation, at most. Default 4. */
+  readonly maxPendingInputs?: number
+  /**
+   * For a build that failed for a reason that clears by itself: what to wait for before building again on its own
+   * (`undefined`: no retry, the owner reloads). Default `retryWhenPreviousModelGone`.
+   */
+  readonly retryAfter?: (problems: ReadonlyArray<{ readonly stage: string; readonly message: string }>) => Effect.Effect<void> | undefined
+  /**
+   * A reason the engines must not be built now (the settings may come from two saves: `SettingsStore.blocked`).
+   * While it is set, start and reload answer `engine_failed` and the status is `failed` with it as the problem.
+   */
+  readonly blocked?: () => { readonly stage: string; readonly message: string } | undefined
 }
+
+/**
+ * A reload whose old local recogniser did not shut down in time (a native decode still running) cannot load a new
+ * one beside it. The old engine is already closed by then, and was not working (its recogniser was stuck), so
+ * instead of leaving the assistant without engines until a restart, the build is retried once that recogniser
+ * has gone.
+ */
+export const retryWhenPreviousModelGone: NonNullable<EngineOptions["retryAfter"]> = (problems) =>
+  problems.some((p) => SherpaStt.isOrphanedMessage(p.message)) ? Effect.promise(() => SherpaStt.whenNoOrphans()) : undefined
+
+const RETRY_NOTE = {
+  stage: "engines",
+  message: "The engines will start by themselves once the previous speech model has shut down. If they do not, restart the assistant."
+}
+
+export type SendOutcome = "accepted" | "busy" | "not_running"
 
 export interface Engine {
   readonly status: () => EngineStatus
   /** Build the engines (first start). Completes when they are ready or have failed. */
   readonly start: Effect.Effect<HostResult>
+  /**
+   * Like `start`, but does nothing (and answers ok) when the engines are already running. The check is made
+   * inside the rebuild guard, so a caller that retries after `busy` can never rebuild engines that the
+   * operation it waited for has just brought up (seventh review).
+   */
+  readonly startIfStopped: Effect.Effect<HostResult>
   /** Interrupt the running turn, close the engines, rebuild them with the saved settings, keep the history. */
   readonly reload: Effect.Effect<HostResult>
-  /** Typed text or Stop. False when the engines are not running. */
-  readonly send: (input: ConversationInput) => boolean
+  /**
+   * Typed text or Stop. `not_running` when the engines are not running; `busy` when `maxPendingInputs` typed
+   * inputs are already waiting for the conversation. Stop (`Interrupt`) is always accepted: it drops the typed
+   * inputs still waiting, and repeated presses before the conversation takes the first one count as one.
+   */
+  readonly send: (input: ConversationInput) => SendOutcome
   readonly history: Effect.Effect<ReadonlyArray<Message>>
   /** Saved settings wait for a reload (`path`: the settings page they are on, for `reloadPendingFor`). */
   readonly setReloadPending: (pending: boolean, path?: string) => void
@@ -197,10 +235,26 @@ export interface Engine {
   readonly refreshStatus: () => void
 }
 
+/** A control input with the Stop generation it was accepted in (`undefined`: a speech event). */
+interface Control {
+  readonly input: ConversationInput
+  readonly generation: number | undefined
+}
+
 export const makeEngine = (options: EngineOptions): Effect.Effect<Engine, never, Scope.Scope> =>
   Effect.gen(function*() {
     const scope = yield* Effect.scope
-    const control = yield* Queue.unbounded<ConversationInput>()
+    /**
+     * Inputs for the conversation besides speech. Not bounded by the queue itself (the merge with the speech
+     * events below reads ahead of the conversation) but by admission: at most `maxPendingInputs` typed inputs
+     * and one Stop are accepted and not yet taken by the conversation, counted until it takes them. Stop
+     * raises `stopGeneration`, so typed inputs accepted before it are dropped instead of starting stale turns.
+     */
+    const control = yield* Queue.unbounded<Control>()
+    const maxPendingInputs = options.maxPendingInputs ?? 4
+    let pendingInputs = 0
+    let stopPending = false
+    let stopGeneration = 0
     let status: EngineStatus = { state: "starting", problems: [], reloadPending: false, reloadPendingFor: [], engines: [], voices: [] }
     let fiber: Fiber.Fiber<void> | undefined
     let conversationHistory: Effect.Effect<ReadonlyArray<Message>> | undefined
@@ -227,17 +281,26 @@ export const makeEngine = (options: EngineOptions): Effect.Effect<Engine, never,
       return r
     }
 
-    const run = (latch: Deferred.Deferred<HostResult>) =>
+    const run = (latch: Deferred.Deferred<HostResult>): Effect.Effect<void> =>
       Effect.scoped(Effect.gen(function*() {
         const built = yield* options.build.pipe(
           Effect.provideService(ConfigProvider.ConfigProvider, options.configProvider()),
           Effect.result
         )
         if (built._tag === "Failure") {
-          const problems = options.explainProblems?.(built.failure.problems) ?? built.failure.problems
+          const explained = options.explainProblems?.(built.failure.problems) ?? built.failure.problems
+          const retry = (options.retryAfter ?? retryWhenPreviousModelGone)(built.failure.problems)
+          const problems = retry === undefined ? explained : [...explained, RETRY_NOTE]
           setStatus({ ...status, state: "failed", problems, engines: [], voices: status.voices })
           const message = `The engines could not start: ${problems.map((p) => `${p.stage}: ${p.message}`).join("; ")}`
           yield* Effect.logError(message)
+          if (retry !== undefined) {
+            // Outside this build's scope (which ends now); a reload by the owner meanwhile makes this one `busy`.
+            yield* retry.pipe(
+              Effect.andThen(Effect.suspend(() => (status.state === "failed" ? launch("starting") : Effect.void))),
+              Effect.forkIn(scope)
+            )
+          }
           yield* Deferred.succeed(latch, { ok: false, error: { code: "engine_failed", message } })
           return
         }
@@ -256,13 +319,28 @@ export const makeEngine = (options: EngineOptions): Effect.Effect<Engine, never,
         ).pipe(Effect.provideService(TurnTrace, options.turnTrace))
         conversationHistory = conversation.history
         yield* Queue.clear(control)
+        pendingInputs = 0
+        stopPending = false
         ready = true
         setStatus({ state: "ready", problems: [], reloadPending: false, reloadPendingFor: [], engines: providers.engines, voices: providers.voiceInfo })
         yield* Deferred.succeed(latch, { ok: true })
 
         const events = Stream.merge(
-          options.gate(providers.stt.transcribe(options.input.stream)),
+          options.gate(providers.stt.transcribe(options.input.stream)).pipe(Stream.map((input): Control => ({ input, generation: undefined }))),
           Stream.fromQueue(control)
+        ).pipe(
+          // One at a time, so each input is counted out (and checked against Stop) just before the conversation takes it.
+          Stream.rechunk(1),
+          Stream.filter((c) => {
+            if (c.generation === undefined) return true
+            if (c.input._tag === "Interrupt") {
+              stopPending = false
+              return true
+            }
+            pendingInputs--
+            return c.generation === stopGeneration
+          }),
+          Stream.map((c) => c.input)
         )
         const exit = yield* conversation.voice(events).pipe(
           Effect.provideService(Tts, tts),
@@ -285,9 +363,16 @@ export const makeEngine = (options: EngineOptions): Effect.Effect<Engine, never,
         )
       )
 
-    const launch = (state: "starting" | "reloading") =>
+    const busyResult: HostResult = { ok: false, error: { code: "busy", message: "The engines are already being rebuilt" } }
+
+    /** The rebuild itself; runs only while holding the guard. */
+    const rebuild = (state: "starting" | "reloading") =>
       Effect.gen(function*() {
-        if (busy) return { ok: false, error: { code: "busy", message: "The engines are already being rebuilt" } } as HostResult
+        const blocked = options.blocked?.()
+        if (blocked !== undefined && !ready) {
+          setStatus({ ...status, state: "failed", problems: [blocked], engines: [] })
+          return { ok: false, error: { code: "engine_failed", message: `${blocked.stage}: ${blocked.message}` } } as HostResult
+        }
         if (state === "reloading" && options.preflight !== undefined && ready) {
           const checked = yield* options.preflight.pipe(
             Effect.provideService(ConfigProvider.ConfigProvider, options.configProvider()),
@@ -301,7 +386,6 @@ export const makeEngine = (options: EngineOptions): Effect.Effect<Engine, never,
             return { ok: false, error: { code: "engine_failed", message } } as HostResult
           }
         }
-        busy = true
         setStatus({ ...status, state })
         if (fiber !== undefined) {
           yield* Fiber.interrupt(fiber)
@@ -312,18 +396,63 @@ export const makeEngine = (options: EngineOptions): Effect.Effect<Engine, never,
           conversationHistory = undefined
         }
         const latch = yield* Deferred.make<HostResult>()
-        fiber = yield* run(latch).pipe(Effect.forkIn(scope))
+        const built = yield* run(latch).pipe(Effect.forkIn(scope))
+        fiber = built
+        // However the build ends (failure, defect, interruption, even before it started), the request is answered.
+        yield* Fiber.await(built).pipe(
+          Effect.andThen((exit) => {
+            const message = Exit.isFailure(exit) && !Cause.hasInterruptsOnly(exit.cause)
+              ? `The engines stopped while starting: ${String(Cause.squash(exit.cause))}`
+              : "The engine build was stopped before it finished"
+            return Deferred.succeed(latch, { ok: false, error: { code: "engine_failed", message } }).pipe(
+              Effect.map((unanswered) => {
+                if (unanswered) setStatus({ ...status, state: "failed", problems: [{ stage: "engines", message }], engines: [] })
+              })
+            )
+          }),
+          Effect.forkIn(scope)
+        )
         return yield* Deferred.await(latch)
-      }).pipe(Effect.ensuring(Effect.sync(() => {
-        busy = false
-      })))
+      })
+
+    /**
+     * One rebuild at a time. The guard is taken synchronously (before the preflight, which may wait) and only
+     * the call that took it releases it, so a refused call can never let a third one interrupt the running build.
+     */
+    const launch = (state: "starting" | "reloading", needed: () => boolean = () => true): Effect.Effect<HostResult> =>
+      Effect.uninterruptibleMask((restore) =>
+        Effect.suspend(() => {
+          if (busy) return Effect.succeed(busyResult)
+          // Decided in the same synchronous step as taking the guard: nothing can run in between.
+          if (!needed()) return Effect.succeed<HostResult>({ ok: true })
+          busy = true
+          return restore(rebuild(state)).pipe(Effect.ensuring(Effect.sync(() => {
+            busy = false
+          })))
+        })
+      )
 
     return {
       status: () => view(status),
       refreshStatus: () => options.onStatus(view(status)),
       start: launch("starting"),
+      startIfStopped: launch("starting", () => !ready),
       reload: launch("reloading"),
-      send: (input) => ready && Queue.offerUnsafe(control, input),
+      send: (input) => {
+        if (!ready) return "not_running"
+        if (input._tag === "Interrupt") {
+          stopGeneration++
+          if (!stopPending) {
+            stopPending = true
+            Queue.offerUnsafe(control, { input, generation: stopGeneration })
+          }
+          return "accepted"
+        }
+        if (pendingInputs >= maxPendingInputs) return "busy"
+        pendingInputs++
+        Queue.offerUnsafe(control, { input, generation: stopGeneration })
+        return "accepted"
+      },
       history: Effect.suspend(() => conversationHistory ?? Effect.succeed(history)),
       setReloadPending: (pending, path) => {
         const before = status.reloadPendingFor ?? []

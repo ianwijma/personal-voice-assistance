@@ -37,9 +37,9 @@ export function Composer() {
     if (value === "" || blocked !== undefined || sending) return
     setSending(true)
     setError(undefined)
-    const result = await client.sendText(value.slice(0, MAX_TEXT_INPUT_CHARS))
+    const result = await client.sendText(value.slice(0, MAX_TEXT_INPUT_CHARS)) // continuation(state): the box is cleared only if it still holds what was sent
     setSending(false)
-    if (result.ok) setText("")
+    if (result.ok) setText((now) => (now.trim() === value ? "" : now))
     else setError(result.error?.message ?? "The message was not accepted.")
   }
 

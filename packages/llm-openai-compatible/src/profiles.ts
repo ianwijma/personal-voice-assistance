@@ -162,6 +162,8 @@ export const resolveBaseUrl = (profile: Profile, configured: string | undefined)
     return undefined
   }
   if (url.protocol !== "http:" && url.protocol !== "https:") return undefined
+  // Credentials and parameters do not belong in the address (the key has its own setting): refused, not dropped.
+  if (url.username !== "" || url.password !== "" || url.search !== "" || url.hash !== "") return undefined
   const path = url.pathname.replace(/\/+$/, "")
   if (path === "" && profile.id !== "generic" && profile.defaultBaseUrl?.endsWith("/v1") === true) {
     return `${url.origin}/v1`

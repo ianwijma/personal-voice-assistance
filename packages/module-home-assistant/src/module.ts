@@ -11,7 +11,7 @@ import {
   ToolError
 } from "@pva/core"
 import { Duration, Effect, Schedule, Schema } from "effect"
-import { type HomeAssistantClient, type HomeAssistantError, makeHomeAssistantClient, normalizeBaseUrl } from "./client.ts"
+import { checkAddressSetting, type HomeAssistantClient, type HomeAssistantError, makeHomeAssistantClient, normalizeBaseUrl } from "./client.ts"
 import {
   buildHouse,
   checkAliases,
@@ -23,6 +23,7 @@ import {
   labelOf,
   serviceTarget
 } from "./home.ts"
+import { addressSecrets, clip, fromUpstream, sanitize, type Secrets, secretList } from "./redact.ts"
 
 export interface HomeAssistantDeps {
   /** Injected in tests. Default: the global `fetch`. */
@@ -42,7 +43,7 @@ const settings = {
     placeholder: "http://homeassistant.local:8123",
     env: "HOME_ASSISTANT_URL",
     maxLength: 300,
-    check: (v) => (v.trim() === "" || normalizeBaseUrl(v) !== undefined ? undefined : "Must be an http:// or https:// address")
+    check: (v) => checkAddressSetting(v)
   }),
   token: Setting.secret({
     label: "Long-lived access token",
@@ -79,24 +80,31 @@ const settings = {
   })
 }
 
-const startError = (e: HomeAssistantError, baseUrl: string): ModuleStartError => {
+/** The only way a `ModuleStartError` is made once a token is known: message and cause sanitised (see `redact.ts`). */
+const moduleStartError = (secrets: Secrets, fields: ConstructorParameters<typeof ModuleStartError>[0]): ModuleStartError =>
+  new ModuleStartError(sanitize(secrets, fields))
+
+const startError = (secrets: Secrets, e: HomeAssistantError, baseUrl: string): ModuleStartError =>
+  moduleStartError(secrets, startErrorFields(e, baseUrl))
+
+const startErrorFields = (e: HomeAssistantError, baseUrl: string): ConstructorParameters<typeof ModuleStartError>[0] => {
   switch (e.kind) {
     case "unreachable":
-      return new ModuleStartError({ message: `Could not reach Home Assistant at ${baseUrl} (${e.detail}). Check the address.`, cause: e })
+      return { message: `Could not reach Home Assistant at ${baseUrl} (${e.detail}). Check the address.`, cause: e }
     case "unauthorized":
-      return new ModuleStartError({
+      return {
         message: "Home Assistant rejected the token. Create a long-lived access token in your Home Assistant profile (Security) and enter it here.",
         cause: e
-      })
+      }
     case "forbidden":
-      return new ModuleStartError({
+      return {
         message: "Home Assistant accepted the token but refused to list rooms: the token's user must be an administrator.",
         cause: e
-      })
+      }
     case "invalid":
-      return new ModuleStartError({ message: `Home Assistant at ${baseUrl} sent an answer this module cannot read (${e.detail}).`, cause: e })
+      return { message: `Home Assistant at ${baseUrl} sent an answer this module cannot read (${e.detail}).`, cause: e }
     case "http":
-      return new ModuleStartError({ message: `Home Assistant at ${baseUrl} answered with an error (${e.detail}).`, cause: e })
+      return { message: `Home Assistant at ${baseUrl} answered with an error (${e.detail}).`, cause: e }
   }
 }
 
@@ -117,10 +125,15 @@ export const homeAssistantModule = (deps: HomeAssistantDeps = {}) =>
     description: "Turn lights on and off by room through your Home Assistant server.",
     enabledByDefault: false,
     settings,
-    start: ({ setStatus, settings }) =>
-      Effect.gen(function*() {
+    start: ({ setStatus: setUnsafeStatus, settings }) => {
+      // The token and every credential part of the address, known before anything can fail.
+      let secrets: Secrets = []
+      return Effect.gen(function*() {
+        secrets = secretList(settings.token, addressSecrets(settings.baseUrl))
         const now = deps.now ?? Date.now
         const refreshMs = deps.refreshMs ?? DEFAULT_REFRESH_MS
+        const problem = checkAddressSetting(settings.baseUrl)
+        if (problem !== undefined) return yield* new ModuleStartError({ message: `The Home Assistant address: ${problem}.` })
         const baseUrl = normalizeBaseUrl(settings.baseUrl)
         if (baseUrl === undefined) {
           return yield* new ModuleStartError({ message: "Enter the address of your Home Assistant server (for example http://homeassistant.local:8123)." })
@@ -128,6 +141,9 @@ export const homeAssistantModule = (deps: HomeAssistantDeps = {}) =>
         if (settings.token === undefined) {
           return yield* new ModuleStartError({ message: "Enter a long-lived access token from your Home Assistant profile." })
         }
+        // Status lines carry upstream text (location name, version, error messages): redacted, then shortened.
+        const setStatus: typeof setUnsafeStatus = (status) =>
+          setUnsafeStatus(status === undefined ? undefined : { ...status, text: clip(status.text, secrets, 120) })
         const client: HomeAssistantClient = makeHomeAssistantClient({
           baseUrl,
           token: settings.token,
@@ -139,24 +155,24 @@ export const homeAssistantModule = (deps: HomeAssistantDeps = {}) =>
           Effect.flatMap((text) => {
             const inventory = decodeInventory(text)
             return inventory === undefined
-              ? Effect.fail({ kind: "invalid" as const, detail: `template answer is not the expected JSON: ${text.slice(0, 120)}` })
+              ? Effect.fail({ kind: "invalid" as const, detail: `template answer is not the expected JSON: ${clip(text, secrets, 120)}` })
               : Effect.succeed(buildHouse(inventory, settings.aliases, now()))
           })
         )
 
-        const config = yield* client.config.pipe(Effect.mapError((e) => startError(e, baseUrl)))
+        const config = yield* client.config.pipe(Effect.mapError((e) => startError(secrets, e, baseUrl)))
         let house: House = yield* loadHouse.pipe(
           Effect.mapError((e) =>
             "_tag" in e
-              ? startError(e, baseUrl)
-              : new ModuleStartError({ message: `Home Assistant at ${baseUrl} sent a room list this module cannot read (${e.detail}).` })
+              ? startError(secrets, e, baseUrl)
+              : moduleStartError(secrets, { message: `Home Assistant at ${baseUrl} sent a room list this module cannot read (${e.detail}).` })
           )
         )
 
         const statusFor = (h: House) => ({
           text: `${h.areas.length} ${h.areas.length === 1 ? "area" : "areas"} · ${h.lights.length} ${h.lights.length === 1 ? "light" : "lights"}${
             config.version !== undefined ? ` · HA ${config.version}` : ""
-          }`.slice(0, 120),
+          }`,
           tone: "ok" as const
         })
         setStatus(statusFor(house))
@@ -171,7 +187,7 @@ export const homeAssistantModule = (deps: HomeAssistantDeps = {}) =>
           Effect.catch((e) =>
             Effect.sync(() =>
               setStatus({
-                text: `Couldn't refresh from Home Assistant (${"_tag" in e ? e.message : "unreadable answer"}); list from ${clock(house.fetchedAt)}`.slice(0, 120),
+                text: `Couldn't refresh from Home Assistant (${"_tag" in e ? e.message : "unreadable answer"}); list from ${clock(house.fetchedAt)}`,
                 tone: "warning"
               })
             )
@@ -186,7 +202,7 @@ export const homeAssistantModule = (deps: HomeAssistantDeps = {}) =>
           Effect.runFork(refresh.pipe(Effect.ensuring(Effect.sync(() => (refreshing = false)))))
         }
 
-        const toActionError = (e: HomeAssistantError) => new ActionError({ message: e.message, cause: e })
+        const toActionError = (e: HomeAssistantError) => new ActionError(sanitize(secrets, { message: e.message, cause: e }))
 
         const switchLights = (value: string, on: boolean, brightnessPct?: number) =>
           Effect.gen(function*() {
@@ -204,7 +220,7 @@ export const homeAssistantModule = (deps: HomeAssistantDeps = {}) =>
         /** Current light states: a live read (status questions want now, not a minute ago). */
         const liveHouse = loadHouse.pipe(
           Effect.tap((h) => Effect.sync(() => (house = h))),
-          Effect.mapError((e) => new ActionError({ message: "_tag" in e ? e.message : "Home Assistant sent an unexpected answer." }))
+          Effect.mapError((e) => new ActionError(sanitize(secrets, { message: "_tag" in e ? e.message : "Home Assistant sent an unexpected answer." })))
         )
 
         const target = Param.dynamic({
@@ -262,7 +278,7 @@ export const homeAssistantModule = (deps: HomeAssistantDeps = {}) =>
             "Use it before answering questions about the home; use the light actions to change anything.",
           parameters: Schema.Struct({}),
           speculative: true,
-          execute: () => liveHouse.pipe(Effect.map(houseState), Effect.mapError((e) => new ToolError({ message: e.message })))
+          execute: () => liveHouse.pipe(Effect.map(houseState), Effect.mapError((e) => new ToolError(sanitize(secrets, { message: e.message }))))
         })
 
         const instance: ExtendedModuleInstance = {
@@ -270,12 +286,20 @@ export const homeAssistantModule = (deps: HomeAssistantDeps = {}) =>
           actions,
           instructions: "The owner's lights are controlled through Home Assistant: use home_state to see them and the light actions to switch them.",
           info: () => ({
-            server: `${config.locationName ?? "Home Assistant"}${config.version !== undefined ? ` ${config.version}` : ""} at ${baseUrl}`,
+            // A display boundary (the settings card), like the status line: upstream text, redacted here.
+            server: fromUpstream(`${config.locationName ?? "Home Assistant"}${config.version !== undefined ? ` ${config.version}` : ""} at ${baseUrl}`, secrets),
             lists: `${house.areas.length} areas, ${house.lights.length} lights, fetched ${clock(house.fetchedAt)}`
           })
         }
         return instance
-      })
+      }).pipe(
+        // The last resort: anything unexpected leaves as a sanitised start error.
+        Effect.catchDefect((defect) =>
+          Effect.fail(moduleStartError(secrets, { message: `Home Assistant could not start: ${fromUpstream(defect, secrets)}`, cause: defect }))
+        ),
+        Effect.mapError((e) => moduleStartError(secrets, { message: e.message, cause: e.cause }))
+      )
+    }
   })
 
 /** The module as registered in the app's catalog (real `fetch`, 60 s refresh). */

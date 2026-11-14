@@ -104,6 +104,17 @@ describe("decoding", () => {
     expect(decoded).toEqual(clientExamples.ping)
   })
 
+  it("playback.stopped: exact is optional and boolean (absent = exact, from older pages)", () => {
+    const { exact: _exact, ...withoutExact } = clientExamples["playback.stopped"]
+    const absent = ok(decodeClientMessage(JSON.stringify(withoutExact)))
+    expect(absent).toEqual(withoutExact)
+    expect("exact" in (absent as object)).toBe(false)
+    expect(ok(decodeClientMessage(JSON.stringify({ ...withoutExact, exact: false })))).toEqual({ ...withoutExact, exact: false })
+    expect(ok(decodeClientMessage(JSON.stringify({ ...withoutExact, exact: true })))).toEqual({ ...withoutExact, exact: true })
+    expect(decodeClientMessage(JSON.stringify({ ...withoutExact, exact: "no" }))).toMatchObject({ _tag: "Invalid", messageType: "playback.stopped" })
+    expect(decodeClientMessage(JSON.stringify({ ...withoutExact, exact: null }))._tag).toBe("Invalid")
+  })
+
   it("accepts a protocol mismatch at the schema level, so the server can answer it", () => {
     const hello = ok(decodeClientMessage(JSON.stringify({ ...clientExamples.hello, protocol: PROTOCOL_VERSION + 1 })))
     expect(hello).toMatchObject({ type: "hello", protocol: PROTOCOL_VERSION + 1 })

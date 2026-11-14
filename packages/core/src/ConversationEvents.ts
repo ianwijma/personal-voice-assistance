@@ -83,8 +83,10 @@ export type ConversationEvent =
  * - `TextInput` behaves like `EndOfTurn` but is deliberate, so it interrupts a
  *   running committed turn even when barge-in is disabled. With `speak: false`
  *   the reply is not synthesised and the whole reply is committed to history.
- * - `Interrupt` (the user pressed Stop) interrupts the running committed turn,
- *   whatever the barge-in setting; a pending speculative turn is left alone.
+ * - `Interrupt` (the user pressed Stop) interrupts the running turn, whatever
+ *   the barge-in setting. A pending speculative turn is discarded, and the
+ *   eager or final transcript of that same utterance then starts nothing (until
+ *   new speech, typed text or a different transcript).
  * - `SetActiveAgent` and `Say`: agent conversations (single-model conversations
  *   ignore `SetActiveAgent`; `Say` works in both).
  */
@@ -121,6 +123,15 @@ export interface PlaybackObserver {
    * or, when interrupted, before its interruption completes.
    */
   readonly progress: (playedSamples: number) => void
+  /**
+   * The authoritative number of samples handed to the device when playback ended
+   * (finished, stopped or failed). Called at most once, after the last `progress`
+   * and before `play` returns or its interruption completes. Unlike `progress` it
+   * may be lower than the last progress value: a page's exact count after a stop
+   * can be below an earlier estimate. When it is called, the conversation uses it,
+   * and not the last progress value, to decide which clauses were heard.
+   */
+  readonly final?: (playedSamples: number) => void
 }
 
 /**

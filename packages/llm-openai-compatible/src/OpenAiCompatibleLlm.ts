@@ -12,8 +12,8 @@
  * - text deltas are emitted as they arrive; reasoning deltas (`reasoning`,
  *   `reasoning_content`) are never emitted, so they are never spoken;
  * - tool calls are assembled from fragments by `index` and each is emitted as
- *   soon as it is complete (a later call started and its arguments parse, or
- *   the choice finished);
+ *   soon as it is complete (a later call started and its arguments are a
+ *   complete, non-empty JSON object, or the choice finished);
  * - `Done` is emitted at the first `finish_reason` and the stream ends there:
  *   the trailing usage chunk and `[DONE]` are not waited for;
  * - interrupting the consumer aborts the HTTP request (barge-in, discarded
@@ -26,6 +26,7 @@
 import { Llm, LlmError, type LlmEvent, type LlmRequest, type Message, type StopReason } from "@pva/core"
 import { Cause, Effect, Layer, Queue, Redacted, Stream } from "effect"
 import { type ModelInfo, type Profile, type ProfileId, profiles, type ReasoningEffort } from "./profiles.ts"
+import { addressSecrets, checkAddress, clip, fromUpstream, sanitize, type Secrets, secretList } from "./redact.ts"
 import { type SseEvent, SseParser } from "./sse.ts"
 
 export interface OpenAiCompatibleLlmOptions {
@@ -197,11 +198,15 @@ const isRetryable = (e: unknown): boolean => {
 
 const isRecord = (u: unknown): u is Record<string, unknown> => typeof u === "object" && u !== null && !Array.isArray(u)
 
-/** The human part of an error body: `{error:{message}}`, `{error:"…"}`, `{detail}`, `{message}` or the text. */
-export const errorText = (body: string): string => {
-  let text = body.trim()
+/**
+ * The human part of an error body: `{error:{message}}`, `{error:"…"}`, `{detail}`, `{message}` or the text.
+ * The body is redacted as a whole first (`fromUpstream`); only then trimmed, parsed and shortened.
+ */
+export const errorText = (body: string, secrets: ReadonlyArray<string | undefined> = []): string => {
+  const safe = fromUpstream(body, secrets)
+  let text = safe.trim()
   try {
-    const json: unknown = JSON.parse(body)
+    const json: unknown = JSON.parse(safe)
     if (isRecord(json)) {
       const error = json.error
       if (isRecord(error) && typeof error.message === "string") text = error.message
@@ -212,14 +217,14 @@ export const errorText = (body: string): string => {
   } catch {
     // not JSON: keep the text
   }
-  return text.length > 300 ? `${text.slice(0, 300)}…` : text
+  return clip(text.trim(), secrets, 300)
 }
 
-const describeHttp = (label: string, status: number, body: string): string => {
-  const detail = errorText(body)
-  const what = status === 401 || status === 403
-    ? `${label} rejected the API key (${status})`
-    : status === 404
+const describeHttp = (label: string, status: number, body: string, secrets: ReadonlyArray<string | undefined>): string => {
+  // A rejected key gets a fixed message: the body of a 401 is where a gateway echoes the key back.
+  if (status === 401 || status === 403) return `${label} rejected the API key (${status})`
+  const detail = errorText(body, secrets)
+  const what = status === 404
     ? `${label} answered 404 (wrong address or unknown model)`
     : status === 429
     ? `${label} is rate limiting (429)`
@@ -227,10 +232,18 @@ const describeHttp = (label: string, status: number, body: string): string => {
   return detail.length > 0 ? `${what}: ${detail}` : what
 }
 
-const toLlmError = (label: string) => (e: unknown): LlmError => {
-  if (e instanceof LlmError) return e
-  if (e instanceof ConnectionError) return new LlmError({ message: `Could not reach ${label}: ${e.message}`, cause: e })
-  return new LlmError({ message: e instanceof Error ? e.message : String(e), cause: e })
+/**
+ * The only way an `LlmError` is made here: message and cause are sanitised
+ * (credentials masked in every form; the cause is a plain copy, never the
+ * original error with its request or response).
+ */
+export const llmError = (secrets: Secrets, message: string, cause?: unknown): LlmError =>
+  new LlmError(sanitize(secrets, { message, cause }))
+
+const toLlmError = (label: string, secrets: Secrets) => (e: unknown): LlmError => {
+  if (e instanceof LlmError) return llmError(secrets, e.message, e.cause)
+  if (e instanceof ConnectionError) return llmError(secrets, `Could not reach ${label}: ${e.message}`, e)
+  return llmError(secrets, fromUpstream(e, secrets), e) // through `messageOf`: a SyntaxError's message (an input excerpt, already cut) is never kept
 }
 
 // ---------------------------------------------------------------------------
@@ -258,10 +271,12 @@ export class ChunkHandler {
 
   private readonly label: string
   private readonly emit: (event: LlmEvent) => void
+  private readonly secrets: ReadonlyArray<string | undefined>
 
-  constructor(label: string, emit: (event: LlmEvent) => void) {
+  constructor(label: string, emit: (event: LlmEvent) => void, secrets: ReadonlyArray<string | undefined> = []) {
     this.label = label
     this.emit = emit
+    this.secrets = secrets
   }
 
   /** One SSE event. */
@@ -273,7 +288,7 @@ export class ChunkHandler {
     try {
       chunk = JSON.parse(data)
     } catch {
-      throw new ProtocolError(`${this.label} sent a stream line that is not JSON: ${data.slice(0, 120)}`)
+      throw new ProtocolError(`${this.label} sent a stream line that is not JSON: ${clip(event.data, this.secrets, 120)}`)
     }
     if (event.event === "error") throw this.streamError(isRecord(chunk) ? chunk.error ?? chunk : chunk)
     return this.chunk(chunk)
@@ -350,18 +365,27 @@ export class ChunkHandler {
 
   /**
    * Emit the not-yet-emitted calls with an index below `before`, in index
-   * order. `onlyComplete`: stop at the first whose arguments do not parse yet
-   * (it may still be receiving fragments).
+   * order. `onlyComplete` (an early flush while the response is still
+   * streaming): stop at the first call whose arguments are not yet a complete
+   * JSON object. Empty arguments count as not yet complete, since a server may
+   * send every call's header before any call's arguments; a call that really
+   * has no arguments is emitted, as `{}`, when the choice finishes.
    */
   private flushTools(before: number, onlyComplete: boolean): void {
     const pending = [...this.slots].filter(([i, s]) => i < before && !s.emitted).sort(([a], [b]) => a - b)
     for (const [index, slot] of pending) {
       let input: unknown
       try {
-        input = slot.args.trim() === "" ? {} : JSON.parse(slot.args)
+        if (slot.args.trim() === "") {
+          if (onlyComplete) return
+          input = {}
+        } else {
+          input = JSON.parse(slot.args)
+          if (onlyComplete && !isRecord(input)) return
+        }
       } catch {
         if (onlyComplete) return
-        throw new ProtocolError(`Invalid JSON arguments for tool ${slot.name || "(unnamed)"}: ${slot.args.slice(0, 200)}`)
+        throw new ProtocolError(`Invalid JSON arguments for tool ${clip(slot.name || "(unnamed)", this.secrets, 64)}: ${clip(slot.args, this.secrets, 200)}`)
       }
       if (slot.name === "") {
         if (onlyComplete) return
@@ -376,33 +400,47 @@ export class ChunkHandler {
   private streamError(error: unknown): StreamError {
     if (isRecord(error)) {
       const code = typeof error.code === "number" || typeof error.code === "string" ? error.code : undefined
-      const message = typeof error.message === "string" ? error.message : JSON.stringify(error).slice(0, 300)
-      return new StreamError(code, `${this.label} error${code !== undefined ? ` ${code}` : ""} in the stream: ${message}`)
+      const message = clip(typeof error.message === "string" ? error.message : JSON.stringify(error), this.secrets, 300)
+      const shown = code === undefined ? "" : ` ${clip(String(code), this.secrets, 40)}`
+      return new StreamError(code, `${this.label} error${shown} in the stream: ${message}`)
     }
-    return new StreamError(undefined, `${this.label} error in the stream: ${String(error)}`)
+    return new StreamError(undefined, `${this.label} error in the stream: ${clip(String(error), this.secrets, 300)}`)
   }
 }
 
 // ---------------------------------------------------------------------------
 // One model call
 
-const readText = async (response: Response, limit = 4_096): Promise<string> => {
+/** The whole body, unshortened: it is redacted as a whole (`errorText` → `fromUpstream`) before any cut. */
+const readText = async (response: Response): Promise<string> => {
   try {
-    const text = await response.text()
-    return text.slice(0, limit)
+    return await response.text()
   } catch {
     return ""
   }
 }
 
+/** Everything the options hold that must never be shown: the key and every credential part of the address. */
+const secretsOf = (options: { readonly apiKey?: Redacted.Redacted<string> | undefined; readonly baseUrl: string }): ReadonlyArray<string> =>
+  secretList(options.apiKey !== undefined ? Redacted.value(options.apiKey) : undefined, addressSecrets(options.baseUrl))
+
+/** The rules for a configured base address: http(s), no user-info, no query (see `redact.ts`, `checkAddress`). */
+const ADDRESS_RULES = { protocols: ["http:", "https:"], query: false } as const
+
+/** What a call needs from the options, read once; reading or checking them never throws past here. */
+type Prepared =
+  | { readonly ok: true; readonly label: string; readonly base: string; readonly secrets: Secrets }
+  | { readonly ok: false; readonly error: LlmError }
+
 /** One model call. Resolves without throwing if `signal` aborts. */
 async function attempt(
   options: OpenAiCompatibleLlmOptions,
-  label: string,
+  prepared: { readonly label: string; readonly base: string; readonly secrets: Secrets },
   body: string,
   signal: AbortSignal,
   emit: (event: LlmEvent) => void
 ): Promise<void> {
+  const { label, base, secrets } = prepared
   const fetchFn = options.fetch ?? globalThis.fetch
   const watchdog = new AbortController()
   let stalled = false
@@ -418,14 +456,13 @@ async function attempt(
     if (stalled) return new StallError(`No ${waitingFor} from ${label} within ${options.timeoutMs} ms`)
     if (signal.aborted) return undefined
     if (e instanceof Error && !(e instanceof TypeError) && e.name !== "AbortError") return e
-    const cause = e instanceof Error && e.cause instanceof Error ? e.cause.message : e instanceof Error ? e.message : String(e)
-    return new ConnectionError(cause)
+    return new ConnectionError(fromUpstream(e instanceof Error && e.cause instanceof Error ? e.cause : e, secrets))
   }
   arm()
   try {
     let response: Response
     try {
-      response = await fetchFn(`${options.baseUrl}/chat/completions`, {
+      response = await fetchFn(`${base}/chat/completions`, {
         method: "POST",
         headers: {
           authorization: `Bearer ${options.apiKey !== undefined ? Redacted.value(options.apiKey) : "none"}`,
@@ -440,9 +477,9 @@ async function attempt(
       if (error === undefined) return
       throw error
     }
-    if (!response.ok) throw new HttpError(response.status, describeHttp(label, response.status, await readText(response)))
+    if (!response.ok) throw new HttpError(response.status, describeHttp(label, response.status, await readText(response), secrets))
     arm()
-    const handler = new ChunkHandler(label, emit)
+    const handler = new ChunkHandler(label, emit, secrets)
     const type = response.headers.get("content-type") ?? ""
     if (type.includes("application/json")) {
       // A server that ignored `stream: true` and answered in one piece.
@@ -487,12 +524,29 @@ async function attempt(
   }
 }
 
-export const make = Effect.fnUntraced(function*(options: OpenAiCompatibleLlmOptions) {
-  const profile = profileOf(options.profile)
-  const label = profile.label
+const prepare = (options: OpenAiCompatibleLlmOptions): Prepared => {
+  let secrets: Secrets = []
+  try {
+    // In steps: whatever was read before a getter throws is already masked.
+    secrets = secretList(options.apiKey !== undefined ? Redacted.value(options.apiKey) : undefined)
+    secrets = secretsOf(options)
+    const label = profileOf(options.profile).label
+    const address = checkAddress(options.baseUrl, ADDRESS_RULES)
+    if (!address.ok) return { ok: false, error: llmError(secrets, `The ${label} address ${address.problem}`) }
+    // The credential-free form is the only one any message, or the request, uses.
+    return { ok: true, label, base: address.display, secrets }
+  } catch (e) {
+    return { ok: false, error: llmError(secrets, `The language model settings could not be read: ${fromUpstream(e, secrets)}`, e) }
+  }
+}
 
-  const stream = (request: LlmRequest): Stream.Stream<LlmEvent, LlmError> =>
-    Stream.callback<LlmEvent, LlmError>((queue) =>
+const makeService = Effect.fnUntraced(function*(options: OpenAiCompatibleLlmOptions) {
+  const prepared = prepare(options)
+
+  const run = (request: LlmRequest): Stream.Stream<LlmEvent, LlmError> => {
+    if (!prepared.ok) return Stream.fail(prepared.error)
+    const { label, secrets } = prepared
+    return Stream.callback<LlmEvent, LlmError>((queue) =>
       Effect.gen(function*() {
         // Closing the stream's scope (completion, error or interruption of the
         // consumer) aborts the HTTP request: barge-in depends on this.
@@ -500,7 +554,11 @@ export const make = Effect.fnUntraced(function*(options: OpenAiCompatibleLlmOpti
           Effect.sync(() => new AbortController()),
           (c) => Effect.sync(() => c.abort())
         )
-        const body = JSON.stringify(toBody(request, options))
+        // Serialising can throw (a value with a throwing `toJSON`): a typed failure, not a defect.
+        const body = yield* Effect.try({
+          try: () => JSON.stringify(toBody(request, options)),
+          catch: (e) => llmError(secrets, `Could not build the request for ${label}: ${fromUpstream(e, secrets)}`, e)
+        })
         let emitted = false
         const emit = (event: LlmEvent) => {
           emitted = true
@@ -508,21 +566,50 @@ export const make = Effect.fnUntraced(function*(options: OpenAiCompatibleLlmOpti
         }
         const run = async () => {
           try {
-            await attempt(options, label, body, controller.signal, emit)
+            await attempt(options, prepared, body, controller.signal, emit)
           } catch (e) {
             if (emitted || controller.signal.aborted || !isRetryable(e)) throw e
-            await attempt(options, label, body, controller.signal, emit)
+            await attempt(options, prepared, body, controller.signal, emit)
           }
         }
         run().then(
           () => Queue.endUnsafe(queue),
-          (e) => Queue.failCauseUnsafe(queue, Cause.fail(toLlmError(label)(e)))
+          (e) => Queue.failCauseUnsafe(queue, Cause.fail(toLlmError(label, secrets)(e)))
         )
       })
+    )
+  }
+
+  // The last resort: whatever escapes the paths above (a defect) leaves as a sanitised `LlmError`.
+  const secrets = prepared.ok ? prepared.secrets : []
+  const stream = (request: LlmRequest): Stream.Stream<LlmEvent, LlmError> =>
+    Stream.suspend(() => run(request)).pipe(
+      Stream.catchDefect((defect) => Stream.fail(llmError(secrets, `The language model call failed unexpectedly: ${fromUpstream(defect, secrets)}`, defect))),
+      Stream.mapError((e) => llmError(secrets, e.message, e.cause))
     )
 
   return Llm.of({ stream })
 })
+
+/**
+ * The service. The last resort for building it: a defect while it is built becomes a service whose every
+ * call fails with a sanitised `LlmError`, never a raw defect.
+ */
+export const make = (options: OpenAiCompatibleLlmOptions) =>
+  makeService(options).pipe(
+    Effect.catchDefect((defect) =>
+      Effect.sync(() => {
+        let secrets: Secrets = []
+        try {
+          secrets = secretList(options.apiKey !== undefined ? Redacted.value(options.apiKey) : undefined)
+        } catch {
+          // what was read is kept
+        }
+        const error = llmError(secrets, `The language model could not be set up: ${fromUpstream(defect, secrets)}`, defect)
+        return Llm.of({ stream: () => Stream.fail(error) })
+      })
+    )
+  )
 
 export const layer = (options: OpenAiCompatibleLlmOptions): Layer.Layer<Llm> => Layer.effect(Llm, make(options))
 

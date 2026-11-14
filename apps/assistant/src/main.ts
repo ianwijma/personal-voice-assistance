@@ -14,8 +14,9 @@ import { startCliModules, withModuleInstructions } from "./modules.ts"
 import { FakeLlm } from "./FakeLlm.ts"
 import { LlmLayer, SttLayer, TtsLayer } from "./providers.ts"
 import { sayCommand } from "./say.ts"
+import { DataDirLockError } from "./serve/DataDirLock.ts"
 import { serveMode } from "./serve/serveMode.ts"
-import { DataDirConfig } from "./serve/SettingsStore.ts"
+import { DataDirConfig, SettingsStoreError } from "./serve/SettingsStore.ts"
 import { VaultPathConfig } from "./serve/Vault.ts"
 import { askVaultPassword, type CliSettings, CliSettingsRef, explainMissingKey, withCliSettings } from "./cliSettings.ts"
 import { makeSubscriptionAgents, SUBSCRIPTION_AGENT_ID, SUBSCRIPTION_PROVIDER } from "./subscription.ts"
@@ -213,6 +214,8 @@ NodeRuntime.runMain(
         ? e.message
         : e instanceof Config.ConfigError
         ? describeConfigError(e)
+        : e instanceof DataDirLockError || e instanceof SettingsStoreError
+        ? e.message // says what to do (another server on the data directory, an unfinished save that cannot be finished)
         : undefined
       const message = described === undefined ? undefined : explainMissingKey(described, cliSettings)
       if (message === undefined) return Effect.fail(e)

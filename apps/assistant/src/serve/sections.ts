@@ -2,7 +2,7 @@ import { applySettingsPatch, type HostResult, resolveSettings, runSettingsChecks
 import type { FieldError, SettingsPatch, SettingsSection, SettingValue } from "@pva/protocol"
 import * as SherpaStt from "@pva/stt-sherpa"
 import * as SherpaTts from "@pva/tts-sherpa"
-import { ConfigProvider, Effect } from "effect"
+import { ConfigProvider, Effect, Semaphore } from "effect"
 import { type ModelDirs, type SectionDefinition, sectionDefinitions, sectionPath } from "./sectionDefinitions.ts"
 import type { SettingsStore } from "./SettingsStore.ts"
 
@@ -180,12 +180,14 @@ export const makeSections = (
     for (const section of sections) for (const listener of listeners) listener(section)
   }
   const failed = (path: string, error: HostResult & { readonly ok: false }): SectionUpdate => ({ result: error, reload: false, path })
+  // Read, validate and save as one step: two saves at once must not each start from the old values.
+  const updateLock = Semaphore.makeUnsafe(1)
 
   return {
     list: () => current().sections,
     value: (key) => effective().get(key) as SettingValue | undefined,
     update: (id, patch, updateOptions = {}) =>
-      Effect.gen(function*() {
+      updateLock.withPermit(Effect.gen(function*() {
         const definitions = sectionDefinitions(modelDirs())
         const d = definitions.find((s) => s.id === id)
         if (d === undefined) {
@@ -245,7 +247,7 @@ export const makeSections = (
         for (const s of changed) revisions.set(s.id, (revisions.get(s.id) ?? 0) + 1)
         announce(current().sections.filter((s) => changed.some((c) => c.id === s.id)))
         return { result: { ok: true }, reload: needsReload, path } as const
-      }),
+      })),
     configProvider: () => {
       const values: Record<string, string> = {}
       const { stored, secrets } = saved()

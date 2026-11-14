@@ -1,5 +1,5 @@
 import { assert, describe, it } from "@effect/vitest"
-import { chunkPcm, defaultJoinOptions, floatToS16, makeJoiner, silentRuns } from "../src/Pcm.ts"
+import { chunkPcm, defaultJoinOptions, floatToS16, type JoinedClause, makeJoiner, silentRuns } from "../src/Pcm.ts"
 
 const RATE = 16_000
 const samplesFor = (ms: number) => Math.round((RATE * ms) / 1000)
@@ -12,6 +12,9 @@ const clause = (leadMs: number, toneMs: number, trailMs: number) => {
   for (let i = 0; i < tone; i++) out[lead + i] = 0.5 * Math.cos((2 * Math.PI * 200 * i) / RATE)
   return out
 }
+
+/** A joined clause as played: the pause, then the speech. */
+const all = (joined: JoinedClause) => [...joined.pause, ...joined.speech]
 
 const concat = (chunks: ReadonlyArray<Uint8Array>) => {
   const bytes = new Uint8Array(chunks.reduce((n, c) => n + c.length, 0))
@@ -41,9 +44,9 @@ describe("makeJoiner", () => {
   it("trims the first clause to the pad and puts the configured pause at each join", () => {
     const join = makeJoiner(RATE)
     const pcm = concat([
-      ...join(clause(70, 400, 180), "Sure,"),
-      ...join(clause(40, 300, 120), "that works."),
-      ...join(clause(10, 300, 90), "Anything else?")
+      ...all(join(clause(70, 400, 180), "Sure,")),
+      ...all(join(clause(40, 300, 120), "that works.")),
+      ...all(join(clause(10, 300, 90), "Anything else?"))
     ])
     const runs = silentRuns(pcm, RATE, defaultJoinOptions.threshold, 30)
     // pad before the first clause (20 ms, below the 30 ms floor so not a run), then the two joins.
@@ -60,7 +63,7 @@ describe("makeJoiner", () => {
   it("keeps a clause's own silence when it is shorter than the pad", () => {
     const join = makeJoiner(RATE)
     join(clause(0, 100, 5), "a,")
-    const second = concat(join(clause(5, 100, 0), "b"))
+    const second = concat(all(join(clause(5, 100, 0), "b")))
     // pause 150 ms = 5 ms kept trailing + 5 ms kept leading + 140 ms inserted
     assert.strictEqual(second.length, samplesFor(140 + 5 + 100))
   })
@@ -69,22 +72,34 @@ describe("makeJoiner", () => {
     const join = makeJoiner(RATE)
     const audio = clause(70, 400, 180)
     audio.fill(0.008, 0, samplesFor(70)) // quiet noise in the leading silence, below the threshold
-    const pcm = concat(join(audio, "x"))
+    const pcm = concat(all(join(audio, "x")))
     assert.strictEqual(pcm[0], 0)
     assert.strictEqual(pcm[pcm.length - 1], 0)
   })
 
   it("drops all-silent clauses and passes audio through untouched when trimming is off", () => {
-    assert.deepStrictEqual(makeJoiner(RATE)(new Float32Array(1000), "..."), [])
+    assert.deepStrictEqual(all(makeJoiner(RATE)(new Float32Array(1000), "...")), [])
     const raw = clause(70, 100, 100)
-    const pcm = concat(makeJoiner(RATE, { ...defaultJoinOptions, trim: false })(raw, "x"))
+    const pcm = concat(all(makeJoiner(RATE, { ...defaultJoinOptions, trim: false })(raw, "x")))
     assert.strictEqual(pcm.length, raw.length)
   })
 
   it("emits chunks of the configured size", () => {
-    const chunks = makeJoiner(RATE, { ...defaultJoinOptions, chunkMs: 20 })(clause(0, 1000, 0), "x")
+    const chunks = makeJoiner(RATE, { ...defaultJoinOptions, chunkMs: 20 })(clause(0, 1000, 0), "x").speech
     const size = samplesFor(20) * 2
     for (const c of chunks.slice(0, -1)) assert.strictEqual(c.length, size)
     assert.isAtMost(chunks.at(-1)!.length, size)
+  })
+
+  it("returns the inserted pause apart from the speech; the speech starts at the pad", () => {
+    const join = makeJoiner(RATE)
+    assert.deepStrictEqual(join(clause(70, 400, 180), "Done.").pause, [], "nothing before the first clause")
+    const second = join(clause(40, 300, 120), "Next one")
+    // 300 ms after a full stop = 20 ms kept trailing pad + 20 ms leading pad + 260 ms inserted.
+    assert.strictEqual(concat(second.pause).length, samplesFor(260))
+    assert.isTrue(concat(second.pause).every((x) => x === 0))
+    const speech = concat(second.speech)
+    const firstLoud = speech.findIndex((x) => Math.abs(x) >= defaultJoinOptions.threshold * 32767)
+    assert.closeTo(firstLoud, samplesFor(defaultJoinOptions.padMs), 2)
   })
 })

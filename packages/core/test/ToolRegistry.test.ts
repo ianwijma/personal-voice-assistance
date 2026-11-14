@@ -1,5 +1,5 @@
 import { assert, describe, it } from "@effect/vitest"
-import { Effect, Schema } from "effect"
+import { Cause, Effect, Exit, Fiber, Schema } from "effect"
 import { ToolError } from "../src/Errors.ts"
 import { type AssistantModule, makeTool } from "../src/Module.ts"
 import { makeToolRegistry } from "../src/ToolRegistry.ts"
@@ -83,4 +83,32 @@ describe("ToolRegistry", () => {
   it("rejects duplicate tool names", () => {
     assert.throws(() => makeToolRegistry([math, { name: "again", tools: [add] }]), /Duplicate tool/)
   })
+})
+
+describe("ToolRegistry: review finding 11", () => {
+  const throwsSync = makeTool({
+    name: "throws",
+    description: "Throws while building its effect",
+    parameters: Schema.Struct({}),
+    execute: () => {
+      throw new Error("built badly")
+    }
+  })
+  const blocks = makeTool({ name: "blocks", description: "Never finishes", parameters: Schema.Struct({}), execute: () => Effect.never })
+  const registry = makeToolRegistry([{ name: "bad", tools: [throwsSync, blocks] }])
+
+  it.effect("a tool that throws before returning its effect becomes an error result", () =>
+    Effect.gen(function*() {
+      const result = yield* registry.run({ id: "1", name: "throws", input: {} })
+      assert.isTrue(result.isError)
+      assert.match(result.content, /built badly/)
+    }))
+
+  it.effect("interruption stays interruption (not an error result)", () =>
+    Effect.gen(function*() {
+      const fiber = yield* Effect.forkChild(registry.run({ id: "2", name: "blocks", input: {} }))
+      yield* Effect.yieldNow
+      const exit = yield* Fiber.interrupt(fiber).pipe(Effect.andThen(Fiber.await(fiber)))
+      assert.isTrue(Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause))
+    }))
 })

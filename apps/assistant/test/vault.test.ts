@@ -1,11 +1,12 @@
 // The key vault (src/serve/Vault.ts) and the settings store on top of it. Temporary directories only.
 import { Effect } from "effect"
-import { existsSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs"
+import { cpSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { describe, expect, it } from "vitest"
-import { KEYS_LOCKED_MESSAGE, loadSettingsStore } from "../src/serve/SettingsStore.ts"
+import { KEYS_LOCKED_MESSAGE, loadSettingsStore, type SaveStep } from "../src/serve/SettingsStore.ts"
 import { DEFAULT_KDF, defaultVaultPath, openVault, type VaultSecrets } from "../src/serve/Vault.ts"
+import { openStore } from "./support/store.ts"
 
 const kdf = { N: 2 ** 12, r: 8, p: 1 }
 const temp = () => mkdtempSync(join(tmpdir(), "pva-vault-"))
@@ -202,7 +203,7 @@ describe("vault: the settings store on top of it", () => {
     const dir = temp()
     writeFileSync(join(dir, "secrets.json"), JSON.stringify(legacy), { mode: 0o600 })
     const vault = await open(join(dir, "keys", "vault.enc"))
-    const store = await Effect.runPromise(loadSettingsStore(dir, { vault }))
+    const store = await Effect.runPromise(openStore(dir, { vault }))
     expect(store.secrets().modules.greeter).toEqual({ token: "from-json" })
     expect(store.legacySecretCount()).toBe(2)
 
@@ -226,7 +227,7 @@ describe("vault: the settings store on top of it", () => {
     const path = join(dir, "vault.enc")
     await (await open(path)).setup("correct horse", secrets)
     const vault = await open(path)
-    const store = await Effect.runPromise(loadSettingsStore(dir, { vault }))
+    const store = await Effect.runPromise(openStore(dir, { vault }))
     expect(store.secrets()).toEqual({ version: 2, modules: {}, assistant: {} })
     const refused = await Effect.runPromise(
       Effect.flip(store.saveAssistant(["LLM_PROVIDER", "ANTHROPIC_API_KEY"], { LLM_PROVIDER: "anthropic" }, { ANTHROPIC_API_KEY: "new" }))
@@ -247,10 +248,147 @@ describe("vault: the settings store on top of it", () => {
     await (await open(path)).setup("correct horse", { modules: { greeter: { token: "in-vault" } }, assistant: {} })
     writeFileSync(join(dir, "secrets.json"), JSON.stringify(legacy), { mode: 0o600 })
     const vault = await open(path)
-    const store = await Effect.runPromise(loadSettingsStore(dir, { vault }))
+    const store = await Effect.runPromise(openStore(dir, { vault }))
     await vault.unlock("correct horse")
     expect(await Effect.runPromise(store.importLegacySecrets())).toBe(2)
     expect(vault.secrets()).toEqual({ modules: { greeter: { token: "in-vault" } }, assistant: { ANTHROPIC_API_KEY: "sk-json" } })
     expect(existsSync(join(dir, "secrets.json"))).toBe(false)
+  })
+})
+
+describe("vault: a save is one transaction over settings.json and the vault file (journal and revisions)", () => {
+  const PASSWORD = "correct horse"
+  const setupDir = async () => {
+    const dir = temp()
+    const path = join(dir, "keys", "vault.enc")
+    await (await open(path)).setup(PASSWORD, { modules: {}, assistant: {} })
+    return { dir, path }
+  }
+  const unlockedStore = async (dir: string, path: string, options: { beforeStep?: (step: SaveStep) => void } = {}) => {
+    const vault = await open(path)
+    // As serve mode does: the store loads (and recovers an unfinished save) first, then the keys are unlocked.
+    const store = await Effect.runPromise(openStore(dir, { vault, ...options }))
+    await vault.unlock(PASSWORD)
+    return { vault, store }
+  }
+  const committed = { values: { LLM_PROVIDER: "anthropic" }, secrets: { ANTHROPIC_API_KEY: "k-old" } }
+  const next = { values: { LLM_PROVIDER: "fake" }, secrets: {} }
+  const keys = ["LLM_PROVIDER", "ANTHROPIC_API_KEY"]
+  /** What a restart on `dir` loads (the vault at `dir/keys/vault.enc`, unlocked once the store has loaded). */
+  const restartSees = async (dir: string) => {
+    const { store } = await unlockedStore(dir, join(dir, "keys", "vault.enc"))
+    return { values: { LLM_PROVIDER: store.settings().assistant.LLM_PROVIDER }, secrets: { ...store.secrets().assistant }, blocked: store.blocked() }
+  }
+  const revision = (text: string) => (JSON.parse(text) as { revision?: number }).revision
+
+  it("both files carry the save's revision; the journal holds only the vault's encrypted text", async () => {
+    const { dir, path } = await setupDir()
+    let journal = ""
+    const { store } = await unlockedStore(dir, path, {
+      beforeStep: (step) => {
+        if (step === "secrets") journal = readFileSync(join(dir, "transaction.json"), "utf8")
+      }
+    })
+    await Effect.runPromise(store.saveAssistant(keys, committed.values, committed.secrets))
+    const r = revision(readFileSync(join(dir, "settings.json"), "utf8"))
+    expect(r).toBeTypeOf("number")
+    expect(revision(readFileSync(path, "utf8"))).toBe(r)
+    expect(JSON.parse(journal)).toMatchObject({ version: 2, secrets: "vault" })
+    expect(journal).not.toContain("k-old")
+    expect(statSync(join(dir, "keys", "vault.enc")).mode & 0o777).toBe(0o600)
+    expect(existsSync(join(dir, "transaction.json"))).toBe(false)
+  })
+
+  it("a crash between any two steps: a restart loads either the committed state or the new one, never a mix", async () => {
+    const { dir, path } = await setupDir()
+    const first = await unlockedStore(dir, path)
+    await Effect.runPromise(first.store.saveAssistant(keys, committed.values, committed.secrets))
+    const crashes: Array<{ step: SaveStep; dir: string }> = []
+    const { store } = await unlockedStore(dir, path, {
+      beforeStep: (step) => {
+        const to = temp()
+        cpSync(dir, to, { recursive: true })
+        rmSync(join(to, "writer.lock"), { force: true })
+        crashes.push({ step, dir: to })
+      }
+    })
+    await Effect.runPromise(store.saveAssistant(keys, next.values, next.secrets))
+    expect(crashes.map((c) => c.step)).toEqual(["journal", "secrets", "settings", "journal-remove"])
+    for (const crash of crashes) {
+      const seen = await restartSees(crash.dir)
+      const want = crash.step === "journal-remove" ? next : committed
+      expect({ values: seen.values, secrets: seen.secrets }, `crash before ${crash.step}`).toEqual(want)
+      expect(seen.blocked).toBeUndefined()
+    }
+  })
+
+  for (const steps of [["settings"], ["settings", "rollback"]] as const) {
+    it(`failure at ${steps.join(" + ")}: the save fails, memory and a restart keep the committed state`, async () => {
+      const { dir, path } = await setupDir()
+      const first = await unlockedStore(dir, path)
+      await Effect.runPromise(first.store.saveAssistant(keys, committed.values, committed.secrets))
+      const { store, vault } = await unlockedStore(dir, path, {
+        beforeStep: (step) => {
+          if ((steps as ReadonlyArray<string>).includes(step)) throw new Error(`injected failure at ${step}`)
+        }
+      })
+      const result = await Effect.runPromise(Effect.result(store.saveAssistant(keys, next.values, next.secrets)))
+      expect(result._tag).toBe("Failure")
+      expect(vault.secrets()?.assistant).toEqual(committed.secrets)
+      const seen = await restartSees(dir)
+      expect({ values: seen.values, secrets: seen.secrets }).toEqual(committed)
+    })
+  }
+
+  it("while locked, a settings-only save writes settings.json alone, with the vault's revision (still one save)", async () => {
+    const { dir, path } = await setupDir()
+    const first = await unlockedStore(dir, path)
+    await Effect.runPromise(first.store.saveAssistant(keys, committed.values, committed.secrets))
+    const vaultBefore = readFileSync(path, "utf8")
+    const vault = await open(path)
+    const store = await Effect.runPromise(openStore(dir, { vault }))
+    await Effect.runPromise(store.saveAssistant(["DEFAULT_VOICE", "VOICES"], { DEFAULT_VOICE: "natural" }, {}))
+    expect(readFileSync(path, "utf8")).toBe(vaultBefore)
+    expect(revision(readFileSync(join(dir, "settings.json"), "utf8"))).toBe(revision(vaultBefore))
+    const seen = await restartSees(dir)
+    expect(seen.blocked).toBeUndefined()
+    expect(seen.secrets).toEqual(committed.secrets)
+  })
+
+  it("settings.json and the vault from two different saves block the start until a save", async () => {
+    const { dir, path } = await setupDir()
+    const first = await unlockedStore(dir, path)
+    await Effect.runPromise(first.store.saveAssistant(keys, committed.values, committed.secrets))
+    const oldSettings = readFileSync(join(dir, "settings.json"), "utf8")
+    await Effect.runPromise(first.store.saveAssistant(keys, next.values, next.secrets))
+    writeFileSync(join(dir, "settings.json"), oldSettings) // what a damaged journal could leave
+    const { store } = await unlockedStore(dir, path)
+    expect(store.blocked()).toContain("the key vault")
+    await Effect.runPromise(store.saveAssistant(keys, next.values, next.secrets))
+    expect(store.blocked()).toBeUndefined()
+    expect((await restartSees(dir)).blocked).toBeUndefined()
+  })
+
+  it("a read-only load (the CLI) beside a half-done save reads the committed state from the journal", async () => {
+    const { dir, path } = await setupDir()
+    const first = await unlockedStore(dir, path)
+    await Effect.runPromise(first.store.saveAssistant(keys, committed.values, committed.secrets))
+    let midSave: string | undefined
+    const { store } = await unlockedStore(dir, path, {
+      beforeStep: (step) => {
+        if (step === "settings" && midSave === undefined) {
+          midSave = temp()
+          cpSync(dir, midSave, { recursive: true })
+        }
+      }
+    })
+    await Effect.runPromise(store.saveAssistant(keys, next.values, next.secrets))
+    const vault = await open(join(midSave!, "keys", "vault.enc"))
+    await vault.unlock(PASSWORD)
+    // The vault file there already holds the new keys; the reader takes the journal's committed text instead.
+    expect(vault.secrets()?.assistant).toEqual({})
+    const reader = await Effect.runPromise(loadSettingsStore(midSave!, { readOnly: true, vault }))
+    expect(reader.secrets().assistant).toEqual(committed.secrets)
+    expect(reader.settings().assistant.LLM_PROVIDER).toBe("anthropic")
   })
 })

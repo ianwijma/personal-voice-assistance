@@ -51,7 +51,7 @@ describe("SherpaTts with a stand-in engine", () => {
       }
     }).pipe(Effect.scoped))
 
-  it.live("emits chunks of chunkMs (40 ms default), only the last of a clause shorter", () =>
+  it.live("emits chunks of chunkMs (40 ms default), only the last of a clause's speech (and of the pause after it) shorter", () =>
     Effect.gen(function*() {
       const { tts } = yield* fake()
       const chunks = yield* collect(tts.synthesize(Stream.make("a fairly long clause of text,", "and another one.")))
@@ -59,9 +59,38 @@ describe("SherpaTts with a stand-in engine", () => {
       for (const clause of [0, 1]) {
         const mine = chunks.filter((c) => c.clause === clause)
         assert.isAbove(mine.length, 3)
-        for (const c of mine.slice(0, -1)) assert.strictEqual(c.audio.length, size)
-        assert.isAtMost(mine.at(-1)!.audio.length, size)
+        for (const c of mine) assert.isAtMost(c.audio.length, size)
+        // Clause 0: its speech, then the pause after it, each ending in at most one shorter chunk. Clause 1: speech only.
+        const short = mine.filter((c) => c.audio.length < size).length
+        assert.isAtMost(short, clause === 0 ? 2 : 1)
       }
+    }).pipe(Effect.scoped))
+
+  it.live("the pause between clauses belongs to the clause before it: a clause's chunks start with its speech", () =>
+    Effect.gen(function*() {
+      const { tts } = yield* fake()
+      const texts = ["Turn on the lights.", "  ", "Which room?"]
+      const chunks = yield* collect(tts.synthesize(Stream.fromIterable(texts)))
+      const pcmOf = (clause: number) => {
+        const mine = chunks.filter((c) => c.clause === clause)
+        const out = new Int16Array(mine.reduce((n, c) => n + c.audio.length / 2, 0))
+        let at = 0
+        for (const c of mine) {
+          out.set(new Int16Array(c.audio.buffer.slice(c.audio.byteOffset, c.audio.byteOffset + c.audio.length)), at)
+          at += c.audio.length / 2
+        }
+        return out
+      }
+      const limit = defaultJoinOptions.threshold * 32767
+      const leadingMs = (pcm: Int16Array) => (pcm.findIndex((x) => Math.abs(x) >= limit) * 1000) / RATE
+      const trailingMs = (pcm: Int16Array) => ((pcm.length - 1 - pcm.findLastIndex((x) => Math.abs(x) >= limit)) * 1000) / RATE
+      // Clause 2 (index 1 is blank) starts with at most the 20 ms pad of silence, not the 300 ms sentence pause.
+      assert.isAtMost(leadingMs(pcmOf(2)), defaultJoinOptions.padMs + 1)
+      // That pause is at the end of clause 0 (its pad plus the inserted gap: the full sentence pause minus the next pad).
+      assert.closeTo(trailingMs(pcmOf(0)), defaultJoinOptions.sentencePauseMs - defaultJoinOptions.padMs, 2)
+      // Indexes never go back.
+      const indexes = chunks.map((c) => c.clause)
+      for (let i = 1; i < indexes.length; i++) assert.isAtLeast(indexes[i]!, indexes[i - 1]!)
     }).pipe(Effect.scoped))
 
   it.live("synthesises each clause as it arrives, not at the end of the input", () =>

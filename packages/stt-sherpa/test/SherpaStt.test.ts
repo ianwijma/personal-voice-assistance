@@ -5,13 +5,13 @@
 import { assert, describe, it } from "@effect/vitest"
 import type { SttEvent } from "@pva/core"
 import { Stt } from "@pva/core"
-import { Effect, Exit, Layer, Stream } from "effect"
+import { Effect, Exit, Fiber, Layer, Stream } from "effect"
 import { existsSync } from "node:fs"
 import { join } from "node:path"
 import { Worker } from "node:worker_threads"
 import { defaultModelDir, missingFile, modelFiles, type PresetName, presets } from "../src/presets.ts"
-import { layer } from "../src/SherpaStt.ts"
-import { normalize, pacedAudio, references, silence, timeline, wavDir, wordErrors } from "./fixtures.ts"
+import { layer, make } from "../src/SherpaStt.ts"
+import { normalize, pacedAudio, readWav, references, silence, timeline, wavDir, wordErrors } from "./fixtures.ts"
 
 /** `it.live`, skipped with the reason in its title when a model file or the test audio is missing. */
 const withModel = (preset: PresetName) => {
@@ -36,13 +36,15 @@ const turns = (events: ReadonlyArray<SttEvent>) => {
   let resumed = 0
   for (const event of events) {
     if (event._tag === "SpeechStarted") {
-      // A turn whose segments had no words ends without an event.
+      // Every SpeechStarted is closed by an EndOfTurn (empty when no words were recognised) before the next.
+      assert.isFalse(open, "SpeechStarted inside an utterance")
       assert.isUndefined(eager, "SpeechStarted after EagerEndOfTurn")
       open = true
       continue
     }
     assert.isTrue(open, `${event._tag} outside a turn`)
     if (event._tag === "EagerEndOfTurn") {
+      assert.notStrictEqual(event.text, "", "an empty EagerEndOfTurn")
       assert.isUndefined(eager, "two EagerEndOfTurn without TurnResumed")
       eager = event.text
     } else if (event._tag === "TurnResumed") {
@@ -60,7 +62,8 @@ const turns = (events: ReadonlyArray<SttEvent>) => {
 }
 
 const checkTranscripts = (events: ReadonlyArray<SttEvent>, wavs: ReadonlyArray<string>, maxWer: number, eagerRequired = true) => {
-  const committed = turns(events)
+  // Utterances with no words (noise that opened one) end with an empty EndOfTurn: not turns of the clips.
+  const committed = turns(events).filter((t) => t.text !== "")
   const refs = references()
   assert.strictEqual(committed.length, wavs.length, JSON.stringify(committed))
   committed.forEach((turn, i) => {
@@ -197,6 +200,16 @@ describe("SherpaStt", () => {
       assert.isTrue(events.some((e) => e._tag === "Interim"))
     }).pipe(Effect.provide(layer({ model: "nemotron-560" }))), 90_000)
 
+  withModel("zipformer-en")("streaming, two sentences arriving in one burst: cut at the final boundary, two turns", () =>
+    Effect.gen(function*() {
+      const wavs = ["0.wav", "1.wav"]
+      const { pcm } = timeline([800, wavs[0]!, 1500, wavs[1]!, 1500])
+      // All at once (a network stall delivering everything): the worker has fed the second sentence to the
+      // open segment before the detector, far behind, decides that the first turn ended.
+      const events = yield* transcribe(Stream.make(pcm))
+      checkTranscripts(events, wavs, 0.15, false)
+    }).pipe(Effect.provide(layer({ model: "zipformer-en", maxBacklogMs: 60_000 }))), 60_000)
+
   withModel("zipformer-en")("a worker crash fails the stream instead of hanging", () =>
     Effect.gen(function*() {
       const { pcm } = timeline([800, "0.wav", 1500])
@@ -212,4 +225,21 @@ describe("SherpaStt", () => {
       assert.isTrue(Exit.isFailure(exit))
       assert.include(String(Exit.isFailure(exit) && exit.cause.toString()), "Speech worker exited")
     }).pipe(Effect.provide(layer({ model: "zipformer-en" }))), 30_000)
+
+  withModel("parakeet-v2")("closing the recogniser while native decodes run does not abort the process", () =>
+    Effect.gen(function*() {
+      // Terminating the worker thread during `decodeAsync` used to abort the whole process (SIGABRT).
+      const pcm = readWav(join(wavDir, "0.wav"))
+      const chunks: Array<Uint8Array> = []
+      for (let r = 0; r < 6; r++) for (let o = 0; o + 640 <= pcm.length; o += 640) chunks.push(pcm.subarray(o, o + 640))
+      for (const afterMs of [150, 400, 800, 1500]) {
+        yield* Effect.gen(function*() {
+          const stt = yield* make({ model: "parakeet-v2" })
+          const fiber = yield* Effect.forkChild(Stream.runDrain(stt.transcribe(Stream.fromIterable(chunks))))
+          yield* Effect.sleep(afterMs)
+          yield* Fiber.interrupt(fiber)
+        }).pipe(Effect.scoped) // closes the recogniser mid-decode
+      }
+      assert.isTrue(true, "the process is still running")
+    }), 120_000)
 })

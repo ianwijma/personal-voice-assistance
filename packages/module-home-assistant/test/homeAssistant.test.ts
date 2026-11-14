@@ -2,7 +2,7 @@ import { assert, describe, expect, it } from "@effect/vitest"
 import { type ActionDefinition, type ExtendedModuleInstance, makeToolRegistry, paramOptions, resolveSettings } from "@pva/core"
 type StatusLine = { readonly text: string; readonly tone: string }
 import { Effect, Exit, Scope } from "effect"
-import { buildHouse, checkAliases, describeLights, homeAssistantModule, normalizeBaseUrl, parseAliases, serviceTarget } from "../src/index.ts"
+import { buildHouse, checkAliases, describeLights, homeAssistantModule, makeHomeAssistantClient, normalizeBaseUrl, parseAliases, serviceTarget } from "../src/index.ts"
 import { defaultAreas, defaultLights, startFakeHomeAssistant } from "./fakeHomeAssistant.ts"
 
 const inventory = () => ({
@@ -246,5 +246,54 @@ describe("home-assistant module", () => {
       yield* Effect.sleep("250 millis")
       expect(ha.requests.length).toBe(before) // closing the scope stopped the refresh
       yield* Effect.promise(() => ha.close())
+    }))
+})
+
+describe("client errors (review regressions)", () => {
+  it.live("an error body that echoes the token never reaches the error detail", () =>
+    Effect.gen(function*() {
+      const token = "eyJhbGciOiJIUzI1NiJ9.secretpayload.signature"
+      const fakeFetch = (status: number) => (async () =>
+        new Response(`proxy says: bad token ${token} (Authorization: Bearer ${token})`, { status })) as typeof fetch
+      for (const [status, call] of [[500, "config"], [403, "template"], [502, "service"]] as const) {
+        const client = makeHomeAssistantClient({ baseUrl: "http://ha.local:8123", token, timeoutMs: 1000, fetch: fakeFetch(status) })
+        const effect = call === "config"
+          ? client.config
+          : call === "template"
+          ? client.renderTemplate("x")
+          : client.callService("light", "turn_on", {})
+        const error = yield* Effect.flip(effect)
+        expect(error.detail).toContain(String(status))
+        expect(error.detail).not.toContain(token)
+        expect(error.message).not.toContain(token)
+      }
+    }))
+})
+
+describe("successful answers are content, not diagnostics (fourth review, finding 4)", () => {
+  it.live("room and light names beginning with Basic, Token or Bearer reach the house model unchanged, with a credential configured", () =>
+    Effect.gen(function*() {
+      const token = "eyJhbGciOiJIUzI1NiJ9.unrelatedpayload.signature"
+      const body = JSON.stringify({
+        areas: [
+          { id: "basic_bedroom", name: "Basic Bedroom", lights: ["light.token_lamp"] },
+          { id: "bearer_hall", name: "Bearer Hallway", lights: [] }
+        ],
+        lights: [
+          { id: "light.token_lamp", name: "Token Lamp Stand", state: "on", brightness: 255 },
+          { id: "light.sk_lamp", name: "sk-livingroom-floorlamp", state: "off", brightness: null }
+        ]
+      })
+      const client = makeHomeAssistantClient({
+        baseUrl: "http://ha.local:8123",
+        token,
+        timeoutMs: 1000,
+        fetch: (async () => new Response(body, { status: 200 })) as typeof fetch
+      })
+      const text = yield* client.renderTemplate("x")
+      expect(text).toBe(body)
+      const house = buildHouse(JSON.parse(text), "", 0)
+      expect(house.targets.map((t) => t.label)).toEqual(["Basic Bedroom", "Bearer Hallway", "Token Lamp Stand", "sk-livingroom-floorlamp", expect.any(String)])
+      expect(describeLights(house)).toBe("Token Lamp Stand is on.")
     }))
 })

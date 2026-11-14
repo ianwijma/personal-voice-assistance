@@ -1,6 +1,6 @@
 import { assert, describe, it } from "@effect/vitest"
 import type { ModuleInfo } from "@pva/protocol"
-import { Effect, Fiber, Schema } from "effect"
+import { Effect, Fiber, Scheduler, Schema } from "effect"
 import { TestClock } from "effect/testing"
 import { makeTool } from "../src/Module.ts"
 import { defineModule, ModuleStartError } from "../src/ModuleDefinition.ts"
@@ -333,4 +333,145 @@ describe("ModuleHost", () => {
       assert.strictEqual(saves.length, 0)
       assert.ok(seen.length >= 3)
     }).pipe(Effect.scoped))
+})
+
+describe("ModuleHost: review findings", () => {
+  it.effect("finding 4: two modules starting at once with the same tool name: one runs, the other fails to start, the host carries on", () =>
+    Effect.gen(function*() {
+      const a = testModule({ id: "a", tool: "same", startMillis: 1 })
+      const b = testModule({ id: "b", tool: "same", startMillis: 1 })
+      const { persistence } = fakePersistence()
+      const h = yield* host([a.definition, b.definition], persistence)
+      const fiber = yield* Effect.forkChild(Effect.exit(h.startEnabled))
+      yield* advance(10)
+      const exit = yield* Fiber.join(fiber)
+      assert.strictEqual(exit._tag, "Success", "startEnabled does not fail")
+      const states = h.modules().map((m) => [m.id, m.state])
+      assert.deepStrictEqual(states, [["a", "running"], ["b", "error"]])
+      assert.match(stateOf(h.modules(), "b").error ?? "", /Tool name "same" is already used by module A/)
+      assert.deepStrictEqual(h.snapshot().registry.specs.map((s) => s.name), ["same"])
+      assert.deepStrictEqual([...h.snapshot().toolModules], [["same", "a"]])
+      assert.strictEqual(b.probe.closes, 1, "the rejected instance was closed")
+    }).pipe(Effect.scoped))
+
+  it.effect("finding 4: enabling a module while another with the same tool is being reconfigured", () =>
+    Effect.gen(function*() {
+      const a = testModule({ id: "a", tool: "same", startMillis: 1 })
+      const b = testModule({ id: "b", tool: "same", startMillis: 1, enabledByDefault: false })
+      const { persistence } = fakePersistence()
+      const h = yield* host([a.definition, b.definition], persistence)
+      const first = yield* Effect.forkChild(h.startEnabled)
+      yield* advance(5)
+      yield* Fiber.join(first)
+      const enabling = yield* Effect.forkChild(h.enable("b"))
+      yield* advance(5)
+      const result = yield* Fiber.join(enabling)
+      assert.deepStrictEqual(result.ok ? "ok" : result.error.code, "module_start_failed")
+      assert.deepStrictEqual(h.snapshot().registry.specs.map((s) => s.name), ["same"])
+    }).pipe(Effect.scoped))
+
+  const slowStarter = (log: Array<string>, options: { readonly throwSync?: boolean } = {}) =>
+    defineModule({
+      id: "slow",
+      name: "Slow",
+      description: "Registers a resource, then takes its time",
+      settings: {},
+      start: options.throwSync === true
+        ? () => {
+          throw new Error("constructed badly")
+        }
+        : () =>
+          Effect.gen(function*() {
+            yield* Effect.addFinalizer(() => Effect.sync(() => log.push("closed")))
+            yield* Effect.sleep(1_000)
+            return {}
+          })
+    })
+
+  it.effect("finding 5: interrupting startEnabled closes the half-started module's scope and restores its state", () =>
+    Effect.gen(function*() {
+      const log: Array<string> = []
+      const { persistence } = fakePersistence()
+      yield* Effect.gen(function*() {
+        const h = yield* makeModuleHost({ catalog: [slowStarter(log)], persistence, env: {} })
+        const fiber = yield* Effect.forkChild(h.startEnabled)
+        yield* advance(10)
+        assert.strictEqual(stateOf(h.modules(), "slow").state, "starting")
+        yield* Fiber.interrupt(fiber)
+        assert.deepStrictEqual(log, ["closed"], "the resource was released on interruption")
+        assert.strictEqual(stateOf(h.modules(), "slow").state, "disabled")
+        const again = yield* Effect.forkChild(h.enable("slow"))
+        yield* advance(10)
+        yield* Fiber.interrupt(again)
+        assert.deepStrictEqual(log, ["closed", "closed"])
+      }).pipe(Effect.scoped)
+      assert.deepStrictEqual(log, ["closed", "closed"], "nothing left for shutdown, nothing closed twice")
+    }))
+
+  it.effect("finding 5: a start that throws before returning its effect is a start failure, not a host crash", () =>
+    Effect.gen(function*() {
+      const { persistence } = fakePersistence()
+      const h = yield* makeModuleHost({ catalog: [slowStarter([], { throwSync: true })], persistence, env: {} })
+      yield* h.startEnabled
+      assert.strictEqual(stateOf(h.modules(), "slow").state, "error")
+      assert.match(stateOf(h.modules(), "slow").error ?? "", /crashed while starting/)
+    }).pipe(Effect.scoped))
+
+  it.effect("finding 11, same mistake: a field action that throws is reported, not a crash", () =>
+    Effect.gen(function*() {
+      const m = defineModule({
+        id: "fa",
+        name: "FA",
+        description: "x",
+        settings: {},
+        start: () => Effect.succeed({ fieldActions: { check: () => { throw new Error("thrown") } } })
+      })
+      const h = yield* makeModuleHost({ catalog: [m], persistence: fakePersistence().persistence, env: {} })
+      yield* h.startEnabled
+      const result = yield* h.fieldAction("fa", "check")
+      assert.isTrue(result.ok && !result.result.ok)
+    }).pipe(Effect.scoped))
+})
+
+describe("ModuleHost: review round 2, a successful start is always published or closed", () => {
+  // Every operation yields to the scheduler after each step (MaxOpsBeforeYield = 1), and the
+  // caller interrupts it after k of those yields, for every k: the interruption lands at every
+  // point between the module's start returning and its publication.
+  const instant = (probe: { starts: number; closes: number }, id = "m") =>
+    defineModule({
+      id,
+      name: id.toUpperCase(),
+      description: "Starts at once",
+      settings: { greeting: Setting.text({ label: "Greeting", default: "hello" }) },
+      start: () =>
+        Effect.gen(function*() {
+          yield* Effect.acquireRelease(Effect.sync(() => probe.starts++), () => Effect.sync(() => probe.closes++))
+          return { tools: [makeTool({ name: `${id}_tool`, description: "t", parameters: Schema.Struct({}), execute: () => Effect.succeed("ok") })] }
+        })
+    })
+
+  it.effect("enable and configure, interrupted at every step: no instance is left running unpublished", () =>
+    Effect.gen(function*() {
+      for (const op of ["enable", "configure"] as const) {
+        for (let k = 0; k < 120; k++) {
+          const probe = { starts: 0, closes: 0 }
+          const { persistence } = fakePersistence({ m: { enabled: op === "configure" } })
+          yield* Effect.gen(function*() {
+            const h = yield* makeModuleHost({ catalog: [instant(probe)], persistence, env: {} })
+            if (op === "configure") yield* h.startEnabled
+            const run = op === "enable" ? h.enable("m") : h.configure("m", { values: { greeting: "hi" }, secrets: {} })
+            const fiber = yield* Effect.forkChild(run.pipe(Effect.provideService(Scheduler.MaxOpsBeforeYield, 1)))
+            for (let i = 0; i < k; i++) yield* Effect.yieldNow
+            yield* Fiber.interrupt(fiber)
+            yield* advance(10_000) // past the grace period of a retired instance
+            const info = stateOf(h.modules(), "m")
+            const published = h.snapshot().registry.specs.some((s) => s.name === "m_tool")
+            // Exactly the published instance (if any) is still open.
+            assert.strictEqual(probe.starts - probe.closes, published ? 1 : 0, `${op}, interrupted after ${k} yields: open instances`)
+            assert.strictEqual(info.state === "running", published, `${op}, interrupted after ${k} yields: state ${info.state}`)
+          }).pipe(Effect.scoped)
+          assert.strictEqual(probe.starts, probe.closes, `${op}, k=${k}: everything closed at shutdown`)
+        }
+      }
+    }))
 })

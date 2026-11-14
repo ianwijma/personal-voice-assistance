@@ -35,7 +35,8 @@ it.live.skipIf(missing !== undefined)(
       const row = rows[0]!
       assert.strictEqual(row.trace?.outcome, "completed")
       assert.isTrue(row.trace?.speculative, "the eager end of turn should have been promoted")
-      assert.match(row.note ?? "", /heard "H[AEU]LLO CAN YOU HEAR ME"/) // zipformer sometimes hears "HULLO"
+      // The small zipformer model hears the first word as HELLO, HULLO, HALLO or HOLLO from run to run.
+      assert.match(row.note ?? "", /heard "H[A-Z]{1,2}LLO,? CAN YOU HEAR ME\??"/i, `heard: ${row.note}`)
       const play = row.extra?.PLAY
       assert.isTrue(play !== undefined && play > 0 && play < 2_000, `end of audio -> playback ${play} ms`)
       const reply = parseWav(readFileSync(join(outputDir, "reply-001.wav")))

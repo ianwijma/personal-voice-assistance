@@ -5,6 +5,11 @@ import type { PlayerEvent } from "./audio/VoiceAudio.ts"
  * through the normal player and compare the microphone level during playback
  * with 1 s of silence before it. Within 6 dB of the silence: the browser
  * cancels the assistant's voice.
+ *
+ * A result exists only for a test whose chirp played to its end and whose measurement window completed
+ * (sixth review, finding 2): a chirp that was stopped (a real reply replaced it, a stop) or did not finish
+ * within the window is an interrupted test, and nothing is measured. A real reply always wins over the
+ * test; the client cancels the test when one starts (`client.ts`, `echoTest`).
  */
 
 /** A chirp train with a syllable envelope: 4 bursts per second sweeping 250–1100 Hz, with two harmonics. */
@@ -32,6 +37,16 @@ export interface EchoTestDeps {
   readonly micRms: () => number
   readonly onPlayer: (listener: (e: PlayerEvent) => void) => void
   readonly sleep?: (ms: number) => Promise<void>
+  /** True once the test must stop (the session changed): it then rejects with `EchoTestCancelled`. */
+  readonly cancelled?: () => boolean
+}
+
+/** The echo test was cancelled while it ran (End, another session, another output path); nothing was measured. */
+export class EchoTestCancelled extends Error {
+  constructor() {
+    super("The echo test was interrupted. Run it again.")
+    this.name = "EchoTestCancelled"
+  }
 }
 
 export const ECHO_THRESHOLD_DB = 6
@@ -39,23 +54,32 @@ export const ECHO_THRESHOLD_DB = 6
 const meanSquare = (xs: ReadonlyArray<number>) => xs.reduce((s, x) => s + x * x, 0) / Math.max(1, xs.length)
 
 export const runEchoTest = async (deps: EchoTestDeps): Promise<{ cancelled: boolean; residualDb: number }> => {
+  // continuation(none): a timer that only settles; every step after it checks `cancelled` first.
   const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)))
+  const cancelled = deps.cancelled ?? (() => false)
+  const check = () => {
+    if (cancelled()) throw new EchoTestCancelled()
+  }
   const sample = async (ms: number, until?: () => boolean) => {
     const values: Array<number> = []
     const end = performance.now() + ms
     while (performance.now() < end && !(until?.() ?? false)) {
+      check()
       values.push(deps.micRms())
-      await sleep(20)
+      await sleep(20) // continuation(state): `check()` (the caller's `cancelled`) before the next sample
     }
+    check()
     return values
   }
-  const silence = await sample(1000)
-  let done = false
+  const silence = await sample(1000) // continuation(state): `sample` ends with `check()`
+  let ended: "finished" | "stopped" | undefined
   deps.onPlayer((e) => {
-    if (e.type === "finished" || e.type === "stopped") done = true
+    if (e.type === "finished" || e.type === "stopped") ended ??= e.type
   })
   deps.play(echoSignal(), 24_000)
-  const during = await sample(4000, () => done)
+  const during = await sample(4000, () => ended !== undefined) // continuation(state): `sample` ends with `check()`
+  // Only a chirp that played to its end measured anything: a stopped one, or one that never finished, did not.
+  if (ended !== "finished") throw new EchoTestCancelled()
   const floor = Math.max(meanSquare(silence), 1e-10)
   const residualDb = 10 * Math.log10(Math.max(meanSquare(during), 1e-10) / floor)
   return { cancelled: residualDb < ECHO_THRESHOLD_DB, residualDb: Math.round(residualDb * 10) / 10 }

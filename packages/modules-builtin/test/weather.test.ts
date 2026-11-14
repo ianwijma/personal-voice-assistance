@@ -1,7 +1,7 @@
 import { assert, describe, it } from "@effect/vitest"
-import { makeToolRegistry, resolveSettings, type ToolResult } from "@pva/core"
+import { buildDecisionPlan, makeToolRegistry, registerActions, resolveSettings, type ToolResult } from "@pva/core"
 import { Effect } from "effect"
-import { makeWeather, weatherModule, type WeatherOptions } from "../src/weather.ts"
+import { makeWeather, makeWeatherParts, weatherModule, type WeatherOptions } from "../src/weather.ts"
 
 const geocoding = {
   results: [
@@ -137,5 +137,31 @@ describe("weather module definition", () => {
   it("an invalid environment value is reported on the field", () => {
     const resolved = resolveSettings(weatherModule().settings, { stored: {}, secrets: {}, env: { WEATHER_UNITS: "kelvin" } })
     assert.deepStrictEqual(resolved.form.errors, [{ key: "units", message: "WEATHER_UNITS=kelvin is not valid: Must be one of: celsius, fahrenheit" }])
+  })
+})
+
+describe("the today action's own examples extract the right place (review finding 12)", () => {
+  const today = registerActions("weather", [makeWeatherParts({ fetch: (() => Promise.reject(new Error("offline"))) as typeof fetch }).today])
+  const placeOf = (utterance: string) => {
+    const plan = buildDecisionPlan({ utterance, actions: today })
+    const place = plan.params.get("weather.today")?.get("place")
+    return place?.kind === "fixed" ? place.value : undefined
+  }
+  const cases: ReadonlyArray<readonly [string, string | undefined]> = [
+    ["what's the weather like", undefined],
+    ["what is the weather in Paris", "Paris"],
+    ["hoe is het weer", undefined],
+    ["wat voor weer is het in Utrecht", "Utrecht"],
+    ["wat voor weer is het", undefined],
+    ["het weer voor Amsterdam", "Amsterdam"],
+    ["weather for Berlin", "Berlin"]
+  ]
+  for (const [utterance, expected] of cases) {
+    it(utterance, () => {
+      assert.strictEqual(placeOf(utterance), expected)
+    })
+  }
+  it("covers every example the action declares", () => {
+    for (const example of today[0]!.definition.examples ?? []) assert.isTrue(cases.some(([u]) => u === example), example)
   })
 })

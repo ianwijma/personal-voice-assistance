@@ -85,6 +85,8 @@ export interface Utterance {
   readonly name: string
   /** Position of the utterance's first and last loud frames in the timeline. */
   readonly speechStartMs: number
+  /** Where the clip itself starts in the timeline. */
+  readonly startMs: number
   readonly speechEndMs: number
 }
 
@@ -129,7 +131,7 @@ export const timeline = (
     const piece = pieces[i]!
     if (typeof part === "string") {
       const span = speechSpanMs(options.spanDir === undefined ? piece : readWav(join(options.spanDir, part)))
-      utterances.push({ name: part, speechStartMs: offset / BYTES_PER_MS + span.start, speechEndMs: offset / BYTES_PER_MS + span.end })
+      utterances.push({ name: part, startMs: offset / BYTES_PER_MS, speechStartMs: offset / BYTES_PER_MS + span.start, speechEndMs: offset / BYTES_PER_MS + span.end })
     }
     pcm.set(piece, offset)
     offset += piece.length

@@ -11,6 +11,7 @@ export declare class TurnAudio {
   readonly firstFrame: number
   push(frame: Float32Array, index: number, speech: boolean, preroll: () => ReadonlyArray<PrerollFrame>): Float32Array | undefined
   audio(): Float32Array
+  audioThrough(atFrame: number): Float32Array
   speechAfter(atFrame: number): boolean
   commit(atFrame: number): void
   clear(): void

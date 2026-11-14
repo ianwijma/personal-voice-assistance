@@ -193,6 +193,11 @@ export const historyToTurns = (history: ReadonlyArray<HistoryItem>): ReadonlyArr
   const turns: Array<TurnView> = []
   history.forEach((item, i) => {
     if (item.role === "user") {
+      // A user message followed by another one was stopped before any reply.
+      const prev = turns.at(-1)
+      if (prev !== undefined && prev.text === "" && prev.outcome === undefined) {
+        turns[turns.length - 1] = { ...prev, outcome: "interrupted" }
+      }
       turns.push(newTurn(`h${i}`, { source: "voice", userText: item.text, fromHistory: true }))
       return
     }

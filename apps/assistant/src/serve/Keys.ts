@@ -110,7 +110,7 @@ export const makeKeys = (options: {
     },
     setup: (password) =>
       run(
-        () => vault.setup(password, { modules: {}, assistant: {} }),
+        () => vault.setup(password, { modules: {}, assistant: {} }, store.revision()),
         Effect.andThen(Effect.logInfo(`Key vault created at ${vault.path}; the password is needed after every restart.`), opened)
       ),
     unlock: (password) =>

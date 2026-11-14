@@ -1,9 +1,17 @@
-import { existsSync, mkdtempSync, readdirSync, readFileSync } from "node:fs"
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { describe, expect, it } from "vitest"
 import { levelStats } from "../src/levels.ts"
-import { makeHeardAudio } from "../src/serve/HeardAudio.ts"
+import { type HeardAudioIo, makeHeardAudio } from "../src/serve/HeardAudio.ts"
+
+/** Synchronous file operations, so a test sees the files as soon as a recording finishes. */
+const syncIo: HeardAudioIo = {
+  mkdir: (dir) => void mkdirSync(dir, { recursive: true }),
+  writeFile: (path, data) => writeFileSync(path, data),
+  readdir: (dir) => readdirSync(dir),
+  rm: (path) => rmSync(path, { force: true })
+}
 
 /** 20 ms of a tone at `peakDbfs` (or quiet noise when undefined). */
 const chunk = (peakDbfs: number | undefined, n0 = 0) => {
@@ -28,7 +36,9 @@ const setup = (maxFiles = 50) => {
     model: () => "sherpa parakeet-v2",
     transport: () => ({ micFrames: 100, droppedFrames: 0, noiseFrames: 0, unroutedMicFrames: 0, maxMicGapMs: 40 }),
     log: (line) => lines.push(line),
-    now: () => now
+    now: () => now,
+    defer: (task) => task(),
+    io: syncIo
   })
   const audio = (ms: number, peak: number | undefined) => {
     for (let t = 0; t < ms; t += 20) {
@@ -91,6 +101,144 @@ describe("heard audio recorder", () => {
     t.audio(200, -10)
     t.heard.event({ _tag: "EndOfTurn", text: "off" })
     expect(t.files()).toHaveLength(4)
+  })
+})
+
+describe("heard audio recorder, off the event path", () => {
+  it("by default the files are written after the EndOfTurn event has been passed on, not while it is handled", async () => {
+    const dir = join(mkdtempSync(join(tmpdir(), "pva-heard-")), "recordings")
+    const heard = makeHeardAudio({ dir, enabled: () => true, maxFiles: () => 5, model: () => "m", log: () => {} })
+    heard.event({ _tag: "SpeechStarted" })
+    for (let t = 0; t < 400; t += 20) heard.audio(chunk(-20, t * 16))
+    heard.event({ _tag: "EndOfTurn", text: "hi" })
+    expect(existsSync(dir)).toBe(false)
+    // Asynchronous writes by default: wait for them.
+    for (let i = 0; i < 100 && (!existsSync(dir) || readdirSync(dir).length < 2); i++) await new Promise((resolve) => setTimeout(resolve, 10))
+    expect(readdirSync(dir)).toHaveLength(2)
+  })
+})
+
+describe("heard audio recorder, a disk that blocks", () => {
+  it("writes one recording at a time: while a write never finishes, later recordings are skipped, not held", async () => {
+    const dir = join(mkdtempSync(join(tmpdir(), "pva-heard-")), "recordings")
+    const lines: Array<string> = []
+    const writes: Array<number> = []
+    const stuck: HeardAudioIo = {
+      mkdir: () => undefined,
+      writeFile: (_path, data) => {
+        writes.push(data.length)
+        return new Promise(() => {}) // never finishes
+      },
+      readdir: () => [],
+      rm: () => undefined
+    }
+    const heard = makeHeardAudio({ dir, enabled: () => true, maxFiles: () => 5, model: () => "m", log: (l) => lines.push(l), defer: (task) => task(), io: stuck })
+    for (let turn = 0; turn < 20; turn++) {
+      heard.event({ _tag: "SpeechStarted" })
+      for (let t = 0; t < 2_000; t += 20) heard.audio(chunk(-20, t * 16))
+      heard.event({ _tag: "EndOfTurn", text: `turn ${turn}` })
+    }
+    await new Promise((resolve) => setImmediate(resolve))
+    expect(writes).toHaveLength(1)
+    expect(heard.skipped()).toBe(19)
+    expect(lines.some((l) => l.includes("still being written"))).toBe(true)
+  })
+
+  it("after a failed write the next recording is written again", async () => {
+    const dir = join(mkdtempSync(join(tmpdir(), "pva-heard-")), "recordings")
+    let fail = true
+    const io: HeardAudioIo = { ...syncIo, writeFile: (path, data) => (fail ? Promise.reject(new Error("EIO")) : syncIo.writeFile(path, data)) }
+    const lines: Array<string> = []
+    const heard = makeHeardAudio({ dir, enabled: () => true, maxFiles: () => 5, model: () => "m", log: (l) => lines.push(l), defer: (task) => task(), io })
+    const turn = () => {
+      heard.event({ _tag: "SpeechStarted" })
+      for (let t = 0; t < 400; t += 20) heard.audio(chunk(-20, t * 16))
+      heard.event({ _tag: "EndOfTurn", text: "hi" })
+    }
+    turn()
+    await new Promise((resolve) => setImmediate(resolve))
+    expect(lines.some((l) => l.includes("EIO"))).toBe(true)
+    fail = false
+    turn()
+    expect(heard.saved()).toHaveLength(1)
+  })
+})
+
+describe("heard audio recorder, shutdown and the directory lock", () => {
+  /** File operations whose writes wait until released, recording every call. */
+  const gatedIo = () => {
+    const calls: Array<string> = []
+    const gates: Array<() => void> = []
+    const io: HeardAudioIo = {
+      mkdir: (dir) => void calls.push(`mkdir ${dir}`),
+      writeFile: (path) => {
+        calls.push(`write ${path.slice(-5)}`)
+        return new Promise<void>((resolve) => gates.push(resolve))
+      },
+      readdir: () => {
+        calls.push("readdir")
+        return Array.from({ length: 10 }, (_, i) => `2026-01-0${i}.wav`)
+      },
+      rm: (path) => void calls.push(`rm ${path}`)
+    }
+    return { io, calls, release: () => gates.shift()?.() }
+  }
+  const record = (heard: ReturnType<typeof makeHeardAudio>) => {
+    heard.event({ _tag: "SpeechStarted" })
+    for (let t = 0; t < 400; t += 20) heard.audio(chunk(-20, t * 16))
+    heard.event({ _tag: "EndOfTurn", text: "hi" })
+  }
+
+  it("a write blocked when the server stops: close waits (bounded), and once the lock is gone nothing more is written or rotated", async () => {
+    const dir = join(mkdtempSync(join(tmpdir(), "pva-heard-")), "recordings")
+    const { io, calls, release } = gatedIo()
+    let held = true
+    const lines: Array<string> = []
+    const heard = makeHeardAudio({ dir, enabled: () => true, maxFiles: () => 2, model: () => "m", log: (l) => lines.push(l), defer: (task) => task(), io, writable: () => held, closeTimeoutMs: 50 })
+    record(heard)
+    expect(calls.at(-1)).toMatch(/^write .*\.wav$/)
+    const started = Date.now()
+    await heard.close()
+    expect(Date.now() - started).toBeGreaterThanOrEqual(45)
+    expect(lines.some((l) => l.includes("still being written"))).toBe(true)
+    held = false // the lock is released; another server takes the directory
+    release() // ... and the old write finally returns
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    expect(calls.filter((c) => c.startsWith("rm") || c === "readdir" || c.endsWith(".json"))).toEqual([])
+    expect(heard.saved()).toHaveLength(0)
+    // And nothing new is recorded after close.
+    record(heard)
+    expect(calls.filter((c) => c.startsWith("write"))).toHaveLength(1)
+  })
+
+  it("the lock lost while a save waits (no close): the remaining steps never run (the reviewer's case)", async () => {
+    const dir = join(mkdtempSync(join(tmpdir(), "pva-heard-")), "recordings")
+    const { io, calls, release } = gatedIo()
+    let held = true
+    const heard = makeHeardAudio({ dir, enabled: () => true, maxFiles: () => 2, model: () => "m", log: () => {}, defer: (task) => task(), io, writable: () => held })
+    record(heard)
+    held = false
+    release()
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    expect(calls.filter((c) => c.startsWith("rm") || c.endsWith(".json"))).toEqual([])
+  })
+
+  it("close settles once the operation in progress does, and a deferred save that has not begun never begins", async () => {
+    const dir = join(mkdtempSync(join(tmpdir(), "pva-heard-")), "recordings")
+    const { io, calls, release } = gatedIo()
+    const heard = makeHeardAudio({ dir, enabled: () => true, maxFiles: () => 2, model: () => "m", log: () => {}, defer: (task) => task(), io })
+    record(heard)
+    const closing = heard.close()
+    setTimeout(release, 20)
+    await closing
+    expect(calls.filter((c) => c.startsWith("write"))).toHaveLength(1)
+    const queued: Array<() => void> = []
+    const later = makeHeardAudio({ dir, enabled: () => true, maxFiles: () => 2, model: () => "m", log: () => {}, defer: (task) => void queued.push(task), io })
+    const before = calls.length
+    record(later)
+    await later.close() // the save was deferred, not begun
+    for (const task of queued) task()
+    expect(calls.length).toBe(before)
   })
 })
 

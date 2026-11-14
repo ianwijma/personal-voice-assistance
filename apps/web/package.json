@@ -16,7 +16,7 @@
     "e2e": "node scripts/build-worklets.mjs && next build && playwright test --project static --project dev",
     "e2e:install": "playwright install --only-shell chromium",
     "screenshots": "node scripts/build-worklets.mjs && next build && playwright test --project screenshots",
-    "e2e:real": "node scripts/build-worklets.mjs && next build && playwright test -c playwright.real.config.ts --project real",
+    "e2e:real": "export PVA_WEB_EXPORT_DIR=\"${PVA_WEB_EXPORT_DIR:-out-e2e}\" && node scripts/build-worklets.mjs && next build && playwright test -c playwright.real.config.ts --project real",
     "bench:browser": "node scripts/build-worklets.mjs && next build && playwright test -c playwright.real.config.ts --project real-latency",
     "screenshots:real": "node scripts/build-worklets.mjs && next build && playwright test -c playwright.real.config.ts --project real-screenshots"
   },
@@ -31,6 +31,8 @@
   },
   "devDependencies": {
     "@playwright/test": "catalog:",
+    "@pva/audio-web": "workspace:*",
+    "@pva/core": "workspace:*",
     "@tailwindcss/turbopack": "4.3.5",
     "@testing-library/jest-dom": "6.9.1",
     "@testing-library/react": "16.3.3",

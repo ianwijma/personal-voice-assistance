@@ -14,6 +14,7 @@ import { makeSections } from "../src/serve/sections.ts"
 import { loadSettingsStore } from "../src/serve/SettingsStore.ts"
 import { openVault } from "../src/serve/Vault.ts"
 import { ScriptedClient } from "./support/scriptedClient.ts"
+import { openStore } from "./support/store.ts"
 import { controlledStt, fakeBuild, greeterModule, scriptedLlm, startTestServer, type TestServer } from "./support/serveHarness.ts"
 
 vi.setConfig({ testTimeout: 20_000 })
@@ -117,7 +118,7 @@ const moverSetup = async (envText: string, vaultState: "none" | "locked" | "unlo
   const envPath = join(dir, ".env")
   writeFileSync(envPath, envText)
   const view = makeEnvView({ processEnv: { STT_SHERPA_VAD_THRESHOLD: "0.6" }, files: [{ path: envPath, text: envText }] })
-  const store = await Effect.runPromise(loadSettingsStore(join(dir, "data")))
+  const store = await Effect.runPromise(openStore(join(dir, "data")))
   const sections = makeSections(store, view.record, { envOrigin: view.sourceOf, envLocation: view.locationOf })
   const lines: Array<string> = []
   const logger = Logger.layer([Logger.make(({ message }) => lines.push(Array.isArray(message) ? message.join(" ") : String(message)))])

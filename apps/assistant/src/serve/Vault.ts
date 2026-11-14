@@ -77,7 +77,7 @@ export interface Vault {
   /** Milliseconds until an unlock attempt is accepted again (0 = now). */
   readonly retryAfterMs: () => number
   /** Create the vault (only when there is none) with these secrets; leaves it unlocked. */
-  readonly setup: (password: string, initial: VaultSecrets) => Promise<VaultResult>
+  readonly setup: (password: string, initial: VaultSecrets, revision?: number) => Promise<VaultResult>
   readonly unlock: (password: string) => Promise<VaultResult>
   /** Forget the key and the secrets. */
   readonly lock: () => void
@@ -85,6 +85,23 @@ export interface Vault {
   readonly changePassword: (oldPassword: string, newPassword: string) => Promise<VaultResult>
   /** Replace the secrets (only while unlocked). */
   readonly save: (next: VaultSecrets) => Promise<VaultResult>
+  /**
+   * Run `f` alone (no unlock, password change or other write in between): the settings store's save, which
+   * journals the file's text before replacing it (`SettingsStore.ts`, "Revisions" and the journal).
+   */
+  readonly exclusive: <A>(f: (writer: VaultWriter) => Promise<A>) => Promise<A>
+  /** The secrets in a vault file's text, under the current key; `undefined` while locked or when it does not open with it. */
+  readonly decode: (text: string) => VaultSecrets | undefined
+}
+
+/** A write of the vault file in steps, inside `Vault.exclusive`. */
+export interface VaultWriter {
+  /** The file text for `next` under the current key, carrying `revision`; `undefined` while locked. */
+  readonly encode: (next: VaultSecrets, revision: number | undefined) => string | undefined
+  /** Replace the file with `text` (atomic, 0600). Memory is not changed. */
+  readonly writeText: (text: string) => Promise<void>
+  /** After the save succeeded: `next` becomes the secrets in memory. */
+  readonly adopt: (next: VaultSecrets, revision: number | undefined) => void
 }
 
 export interface VaultOptions {
@@ -117,6 +134,11 @@ const FORMAT = "pva-vault"
 interface VaultFile {
   readonly format: typeof FORMAT
   readonly version: 1
+  /**
+   * The settings save that wrote this file (`SettingsStore.ts`, "Revisions"), so it can be matched with
+   * `settings.json` without the password. Authenticated (part of the additional data) when present.
+   */
+  readonly revision?: number
   readonly kdf: { readonly name: "scrypt"; readonly N: number; readonly r: number; readonly p: number; readonly salt: string }
   readonly cipher: { readonly name: "aes-256-gcm"; readonly iv: string; readonly tag: string }
   readonly data: string
@@ -141,12 +163,17 @@ const parseFile = (text: string): VaultFile | undefined => {
     typeof kdf.r === "number" && Number.isInteger(kdf.r) && kdf.r >= 1 && 128 * kdf.N * kdf.r <= 2 ** 28 &&
     typeof kdf.p === "number" && Number.isInteger(kdf.p) && kdf.p >= 1 && kdf.p <= 4 && isBase64(kdf.salt, 16)
   const okCipher = cipher.name === "aes-256-gcm" && isBase64(cipher.iv, 12) && isBase64(cipher.tag, 16)
-  if (!okKdf || !okCipher || !isBase64(u.data)) return undefined
+  const okRevision = u.revision === undefined || (typeof u.revision === "number" && Number.isSafeInteger(u.revision) && u.revision >= 0)
+  if (!okKdf || !okCipher || !okRevision || !isBase64(u.data)) return undefined
   return u as unknown as VaultFile
 }
 
+/** Whether `text` is a vault file (it may still not open). For the settings journal. */
+export const isVaultText = (text: string): boolean => parseFile(text) !== undefined
+
 /** The authenticated header: any change to the parameters or the salt makes decryption fail. */
-const additionalData = (kdf: VaultFile["kdf"]) => Buffer.from(`${FORMAT}:1:scrypt:${kdf.N}:${kdf.r}:${kdf.p}:${kdf.salt}:aes-256-gcm`, "utf8")
+const additionalData = (kdf: VaultFile["kdf"], revision: number | undefined) =>
+  Buffer.from(`${FORMAT}:1:scrypt:${kdf.N}:${kdf.r}:${kdf.p}:${kdf.salt}:aes-256-gcm${revision === undefined ? "" : `:revision=${revision}`}`, "utf8")
 
 const deriveKey = (password: string, salt: Buffer, params: KdfParams): Promise<Buffer> =>
   new Promise((resolvePromise, reject) => {
@@ -158,16 +185,17 @@ const deriveKey = (password: string, salt: Buffer, params: KdfParams): Promise<B
     })
   })
 
-const encrypt = (key: Buffer, kdf: VaultFile["kdf"], secrets: VaultSecrets): VaultFile => {
+const encrypt = (key: Buffer, kdf: VaultFile["kdf"], secrets: VaultSecrets, revision: number | undefined): VaultFile => {
   const iv = randomBytes(12)
   const cipher = createCipheriv("aes-256-gcm", key, iv)
-  cipher.setAAD(additionalData(kdf))
+  cipher.setAAD(additionalData(kdf, revision))
   const plaintext = Buffer.from(JSON.stringify({ modules: secrets.modules, assistant: secrets.assistant }), "utf8")
   const data = Buffer.concat([cipher.update(plaintext), cipher.final()])
   plaintext.fill(0)
   return {
     format: FORMAT,
     version: 1,
+    ...(revision !== undefined ? { revision } : {}),
     kdf,
     cipher: { name: "aes-256-gcm", iv: iv.toString("base64"), tag: cipher.getAuthTag().toString("base64") },
     data: data.toString("base64")
@@ -188,7 +216,7 @@ export const readVaultSecrets = (u: unknown): VaultSecrets | undefined => {
 /** `undefined`: authentication failed (wrong key or a modified file). */
 const decrypt = (key: Buffer, file: VaultFile): VaultSecrets | undefined => {
   const decipher = createDecipheriv("aes-256-gcm", key, Buffer.from(file.cipher.iv, "base64"))
-  decipher.setAAD(additionalData(file.kdf))
+  decipher.setAAD(additionalData(file.kdf, file.revision))
   decipher.setAuthTag(Buffer.from(file.cipher.tag, "base64"))
   let plaintext: Buffer
   try {
@@ -229,6 +257,8 @@ export const openVault = async (options: VaultOptions): Promise<Vault> => {
   let key: Buffer | undefined
   let kdf: VaultFile["kdf"] | undefined
   let secrets: VaultSecrets | undefined
+  /** The revision of the file as last opened or written (kept by a password change and by `save`). */
+  let revision: number | undefined
   let failures = 0
   let blockedUntil = 0
 
@@ -240,13 +270,15 @@ export const openVault = async (options: VaultOptions): Promise<Vault> => {
     return next
   }
 
-  const write = async (file: VaultFile) => {
+  const fileText = (file: VaultFile) => `${JSON.stringify(file, null, 2)}\n`
+  const write = (file: VaultFile) => writeText(fileText(file))
+  const writeText = async (text: string) => {
     const dir = dirname(path)
     const dirExisted = await exists(dir)
     await mkdir(dir, { recursive: true, mode: 0o700 })
     if (!dirExisted) await chmod(dir, 0o700)
     const tmp = `${path}.tmp`
-    await writeFile(tmp, `${JSON.stringify(file, null, 2)}\n`, { mode: 0o600 })
+    await writeFile(tmp, text, { mode: 0o600 })
     await chmod(tmp, 0o600)
     await rename(tmp, path)
     present = true
@@ -289,7 +321,7 @@ export const openVault = async (options: VaultOptions): Promise<Vault> => {
 
   /** Read the file and check the password; does not change the state. */
   const open = async (password: string): Promise<
-    { ok: true; key: Buffer; kdf: VaultFile["kdf"]; secrets: VaultSecrets } | ({ ok: false } & VaultFailure)
+    { ok: true; key: Buffer; kdf: VaultFile["kdf"]; secrets: VaultSecrets; revision: number | undefined } | ({ ok: false } & VaultFailure)
   > => {
     if (!(await exists(path))) {
       present = false
@@ -329,7 +361,7 @@ export const openVault = async (options: VaultOptions): Promise<Vault> => {
     }
     failures = 0
     blockedUntil = 0
-    return { ok: true, key: derived, kdf: file.kdf, secrets: opened }
+    return { ok: true, key: derived, kdf: file.kdf, secrets: opened, revision: file.revision }
   }
 
   return {
@@ -337,7 +369,7 @@ export const openVault = async (options: VaultOptions): Promise<Vault> => {
     state: () => (secrets !== undefined ? "unlocked" : present ? "locked" : "none"),
     secrets: () => secrets,
     retryAfterMs,
-    setup: (password, initial) =>
+    setup: (password, initial, initialRevision) =>
       serial(async (): Promise<VaultResult> => {
         if (present || (await exists(path))) {
           present = true
@@ -347,7 +379,7 @@ export const openVault = async (options: VaultOptions): Promise<Vault> => {
         if (short !== undefined) return short
         const fresh = await freshKdf(password)
         try {
-          await write(encrypt(fresh.key, fresh.kdf, initial))
+          await write(encrypt(fresh.key, fresh.kdf, initial, initialRevision))
         } catch (error) {
           fresh.key.fill(0)
           return { ok: false, reason: "io", message: `Could not write the vault at ${path}: ${describeError(error)}` }
@@ -356,6 +388,7 @@ export const openVault = async (options: VaultOptions): Promise<Vault> => {
         key = fresh.key
         kdf = fresh.kdf
         secrets = initial
+        revision = initialRevision
         return { ok: true }
       }),
     unlock: (password) =>
@@ -366,6 +399,7 @@ export const openVault = async (options: VaultOptions): Promise<Vault> => {
         key = opened.key
         kdf = opened.kdf
         secrets = opened.secrets
+        revision = opened.revision
         return { ok: true }
       }),
     lock: forget,
@@ -378,7 +412,7 @@ export const openVault = async (options: VaultOptions): Promise<Vault> => {
         opened.key.fill(0)
         const fresh = await freshKdf(newPassword)
         try {
-          await write(encrypt(fresh.key, fresh.kdf, opened.secrets))
+          await write(encrypt(fresh.key, fresh.kdf, opened.secrets, opened.revision))
         } catch (error) {
           fresh.key.fill(0)
           return { ok: false, reason: "io", message: `Could not write the vault at ${path}: ${describeError(error)}` }
@@ -387,19 +421,40 @@ export const openVault = async (options: VaultOptions): Promise<Vault> => {
         key = fresh.key
         kdf = fresh.kdf
         secrets = opened.secrets
+        revision = opened.revision
         return { ok: true }
       }),
     save: (next) =>
       serial(async (): Promise<VaultResult> => {
         if (key === undefined || kdf === undefined) return { ok: false, reason: "locked", message: "The keys are locked" }
         try {
-          await write(encrypt(key, kdf, next))
+          await write(encrypt(key, kdf, next, revision))
         } catch (error) {
           return { ok: false, reason: "io", message: `Could not write the vault at ${path}: ${describeError(error)}` }
         }
         secrets = next
         return { ok: true }
-      })
+      }),
+    exclusive: (f) =>
+      serial(() =>
+        f({
+          encode: (next, nextRevision) => {
+            if (key === undefined || kdf === undefined) return undefined
+            return fileText(encrypt(key, kdf, next, nextRevision))
+          },
+          writeText,
+          adopt: (next, nextRevision) => {
+            revision = nextRevision
+            if (key !== undefined) secrets = next
+          }
+        })
+      ),
+    decode: (text) => {
+      if (key === undefined || kdf === undefined) return undefined
+      const file = parseFile(text)
+      if (file === undefined || file.kdf.salt !== kdf.salt) return undefined
+      return decrypt(key, file)
+    }
   }
 }
 

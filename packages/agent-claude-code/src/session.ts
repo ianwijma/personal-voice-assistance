@@ -1,5 +1,6 @@
 import { mkdirSync } from "node:fs"
 import { PROVISIONAL_SYSTEM_PROMPT, SESSION_CWD, sessionOptions } from "./options.ts"
+import { addressSecrets, fromUpstream, type Secrets, secretList } from "./redact.ts"
 import { type ClaudeSdk, MCP_SERVER_NAME, type QueryHandle, type SDKMessage, type SDKUserMessage, type SessionTool, type ToolHandler } from "./sdk.ts"
 
 /**
@@ -21,6 +22,10 @@ export interface SessionConfig {
   readonly model: string
   readonly claudePath: string | undefined
   readonly env: Readonly<Record<string, string | undefined>>
+  /** The agent's "Proxy for Claude Code" secret (see `sessionEnv`). */
+  readonly proxy?: string | undefined
+  /** Claude Code's debug logging (off unless the owner's setting enables it). */
+  readonly debug?: boolean
   /** Undefined: provisional (see above). */
   readonly system: string | undefined
   readonly tools: ReadonlyArray<SessionTool>
@@ -61,7 +66,29 @@ const withTimeout = <A>(promise: Promise<A>, ms: number, message: string): Promi
     )
   })
 
-const errorText = (e: unknown) => (e instanceof Error ? e.message : String(e))
+/** The longest error text taken from Claude Code or the SDK (it reaches the owner's status line and logs). */
+export const ERROR_TEXT_MAX = 200
+
+/**
+ * The redaction list for this adapter (seventh review): the "Proxy for Claude Code" secret as given and trimmed,
+ * and its user-info, user name and password on their own, as written and percent-decoded (`addressSecrets`).
+ * Every error text, status line and cause the adapter produces is redacted with it (`src/redact.ts`, a copy
+ * identical to the other adapters').
+ */
+export const proxySecrets = (proxy: string | undefined): Array<string> => secretList(proxy, addressSecrets(proxy))
+
+/**
+ * An error's text, safe to show: redacted whole first (`fromUpstream`: the configured proxy in every form),
+ * then the SDK's exit-error tail (". stderr: …", which can hold anything Claude Code printed) is dropped (the
+ * bounded `stderr` lines stay for diagnostics), and the rest is one line of at most `ERROR_TEXT_MAX`
+ * characters: redact, then shorten, never the other way round.
+ */
+export const safeErrorText = (e: unknown, secrets: Secrets = []): string => {
+  const raw = fromUpstream(e, secrets) // an error's message, a string, or anything else as JSON: redacted whole
+  const cut = raw.search(/[.\s]*\bstderr\s*:/i)
+  const text = (cut >= 0 ? raw.slice(0, cut) : raw).replace(/\s+/g, " ").trim()
+  return text.length > ERROR_TEXT_MAX ? `${text.slice(0, ERROR_TEXT_MAX - 1)}…` : text
+}
 
 let nextSessionId = 1
 
@@ -83,6 +110,8 @@ export class ClaudeSession {
   readonly stderr: Array<string> = []
   /** Validated the session's `init` message (tool list) once. */
   initChecked = false
+  /** What its error texts are redacted with (`proxySecrets`). */
+  readonly secrets: ReadonlyArray<string>
 
   private readonly query: QueryHandle
   private readonly queue: Array<SDKUserMessage> = []
@@ -100,6 +129,7 @@ export class ClaudeSession {
   constructor(sdk: ClaudeSdk, config: SessionConfig, now: () => number) {
     this.sdk = sdk
     this.config = config
+    this.secrets = proxySecrets(config.proxy)
     this.now = now
     this.system = config.system
     this.toolKey = toolKey(config.tools)
@@ -131,6 +161,8 @@ export class ClaudeSession {
         mcpServer: provisional ? undefined : this.mcp,
         claudePath: config.claudePath,
         env: config.env,
+        proxy: config.proxy,
+        debug: config.debug === true,
         stderr: (data) => {
           for (const line of data.split("\n")) if (line.trim() !== "") this.stderr.push(line.slice(0, 300))
           if (this.stderr.length > 20) this.stderr.splice(0, this.stderr.length - 20)
@@ -155,7 +187,7 @@ export class ClaudeSession {
       }
       return this.login
     } catch (e) {
-      const reason = this.dead ?? errorText(e)
+      const reason = this.dead ?? safeErrorText(e, this.secrets)
       this.kill(reason)
       throw e instanceof SessionError ? e : new SessionError(`Claude Code could not start: ${reason}`, "unavailable")
     }
@@ -220,7 +252,7 @@ export class ClaudeSession {
         died: () => done()
       }
     })
-    this.query.interrupt().catch((e) => this.kill(`interrupt failed: ${errorText(e)}`))
+    this.query.interrupt().catch((e) => this.kill(`interrupt failed: ${safeErrorText(e, this.secrets)}`))
   }
 
   /** End the session for good. Idempotent. */
@@ -251,7 +283,7 @@ export class ClaudeSession {
         this.listener?.message(r.value)
       }
     } catch (e) {
-      this.kill(this.dead ?? `Claude Code stopped: ${errorText(e)}`)
+      this.kill(this.dead ?? `Claude Code stopped: ${safeErrorText(e, this.secrets)}`)
     }
   }
 

@@ -161,9 +161,10 @@ export const usePageForms = (defs: ReadonlyArray<PageFormDef>, saved: (key: stri
       let allOk = true
       for (const view of toSave) {
         update(view.def.key, ({ message: _m, ...s }) => ({ ...s, serverErrors: [], confirm: [] }))
+        // continuation(state): the saved form is read from `latest.current` / `previous.current` when the answer comes.
         const result = view.def.kind === "section"
-          ? await fns.section(view.def.id, view.patch, options.confirm === true)
-          : await fns.module(view.def.id, view.patch)
+          ? await fns.section(view.def.id, view.patch, options.confirm === true) // continuation(state): see above
+          : await fns.module(view.def.id, view.patch) // continuation(state): see above
         if (result.ok) {
           // The broadcast (section.changed / module.changed) arrived first and carries the saved values.
           const def = latest.current.find((d) => d.key === view.def.key) ?? view.def
@@ -183,7 +184,7 @@ export const usePageForms = (defs: ReadonlyArray<PageFormDef>, saved: (key: stri
       setSaving(false)
       if (allOk) {
         setSavedFlash(true)
-        if (options.reload === true) await fns.reload()
+        if (options.reload === true) await fns.reload() // continuation(none): nothing runs after the reload's answer
       }
       return allOk
     }

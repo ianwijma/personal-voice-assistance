@@ -262,32 +262,63 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
     actions: [],
     deciders: new Map()
   }
-  const rebuild = () => {
-    const running = entries.filter((e) => e.running !== undefined)
+  /** The snapshot of the running instances, with `candidate` in place of its entry's instance. Throws on a tool name clash. */
+  const buildSnapshot = (candidate?: { readonly entry: Entry; readonly running: Running }): ModuleSnapshot => {
+    const running = entries.flatMap((e) => {
+      const r = candidate?.entry === e ? candidate.running : e.running
+      return r === undefined ? [] : [{ e, r }]
+    })
     const toolModules = new Map<string, string>()
-    for (const e of running) for (const name of toolNames(e.running)) toolModules.set(name, e.def.id)
+    for (const { e, r } of running) for (const name of toolNames(r)) toolModules.set(name, e.def.id)
     const agents = new Map<string, Agent>()
     const deciders = new Map<string, DecisionProvider>()
-    for (const e of running) {
-      for (const agent of e.running!.instance.agents ?? []) if (!agents.has(agent.id)) agents.set(agent.id, agent)
-      for (const decider of e.running!.instance.deciders ?? []) if (!deciders.has(decider.id)) deciders.set(decider.id, decider)
+    for (const { r } of running) {
+      for (const agent of r.instance.agents ?? []) if (!agents.has(agent.id)) agents.set(agent.id, agent)
+      for (const decider of r.instance.deciders ?? []) if (!deciders.has(decider.id)) deciders.set(decider.id, decider)
     }
-    snapshot = {
+    return {
       version: snapshot.version + 1,
-      registry: makeToolRegistry(running.map((e) => ({
+      registry: makeToolRegistry(running.map(({ e, r }) => ({
         name: e.def.id,
-        tools: e.running!.tools,
-        context: (e.running!.instance.context ?? []).map((p) => wrapProvider(e.def.id, p))
+        tools: r.tools,
+        context: (r.instance.context ?? []).map((p) => wrapProvider(e.def.id, p))
       }))),
-      instructions: running.flatMap((e) => {
-        const text = e.running!.instance.instructions?.trim() ?? ""
+      instructions: running.flatMap(({ r }) => {
+        const text = r.instance.instructions?.trim() ?? ""
         return text.length > 0 ? [text] : []
       }),
       toolModules,
       agents,
-      actions: running.flatMap((e) => e.running!.actions),
+      actions: running.flatMap(({ r }) => r.actions),
       deciders
     }
+  }
+  const rebuild = () => {
+    snapshot = buildSnapshot()
+  }
+
+  /**
+   * Make a started instance the entry's running one, checked against the
+   * instances running NOW (another module may have started while this one did).
+   * Synchronous: nothing else can publish in between. On a clash nothing changes
+   * and the message is returned; the caller closes the candidate's scope.
+   */
+  const publish = (entry: Entry, running: Running): string | undefined => {
+    const names = toolNames(running)
+    for (const other of entries) {
+      if (other === entry || other.running === undefined) continue
+      const clash = names.find((n) => toolNames(other.running).includes(n))
+      if (clash !== undefined) return `Tool name "${clash}" is already used by module ${other.def.name}`
+    }
+    let next: ModuleSnapshot
+    try {
+      next = buildSnapshot({ entry, running })
+    } catch (error) {
+      return `The module's tools could not be offered: ${error instanceof Error ? error.message : String(error)}`
+    }
+    entry.running = running
+    snapshot = next
+    return undefined
   }
 
   const save = (entry: Entry) =>
@@ -297,10 +328,13 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
       secrets: entry.secrets
     }).pipe(Effect.catchCause((cause) => Effect.logError(`Could not save the settings of module ${entry.def.id}`, cause)))
 
-  /** Close a replaced or disabled instance after the grace period (tool calls in flight finish). */
-  const retire = (entry: Entry, running: Running) =>
-    Effect.gen(function*() {
-      retired.add(running.scope)
+  /**
+   * Close a replaced or disabled instance after the grace period (tool calls in flight finish).
+   * The scope is registered for shutdown at once, so an interruption before the timer is forked cannot leak it.
+   */
+  const retire = (entry: Entry, running: Running) => {
+    retired.add(running.scope)
+    return Effect.gen(function*() {
       yield* Effect.sleep(graceMs).pipe(
         Effect.andThen(Scope.close(running.scope, Exit.void)),
         Effect.ensuring(Effect.sync(() => {
@@ -313,6 +347,7 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
         Effect.forkIn(hostScope)
       )
     })
+  }
 
   const describeStartFailure = (cause: Cause.Cause<unknown>): string => {
     const error = Cause.findErrorOption(cause)
@@ -320,10 +355,32 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
     return `The module crashed while starting: ${Cause.pretty(cause).split("\n")[0]}`
   }
 
-  /** Start an instance with `settings`; on success it is not yet in the snapshot. */
-  const startInstance = (entry: Entry, settings: unknown, others: ReadonlyArray<Entry>) =>
+  /**
+   * Start an instance with `settings` and hand the result to `adopt`, which
+   * must publish the instance or close its scope. Only the module's own start
+   * is interruptible: from the moment it returns until `adopt` has finished the
+   * fiber cannot be interrupted, so a started instance is always either
+   * published or closed (an interruption right after a successful start used to
+   * leave it running unpublished). On every other exit, interruption and a
+   * `start` that throws included, the scope is closed here: the cleanup is
+   * installed before the module's code runs.
+   */
+  const startInstance = <A>(
+    entry: Entry,
+    settings: unknown,
+    adopt: (result: Effect.Success<ReturnType<typeof startIn>>) => Effect.Effect<A>
+  ) =>
+    Effect.uninterruptibleMask((restore) =>
+      Effect.flatMap(Scope.make(), (scope) =>
+        restore(startIn(entry, settings, scope)).pipe(
+          Effect.onExit((exit) => (Exit.isSuccess(exit) && exit.value.ok ? Effect.void : Scope.close(scope, Exit.void))),
+          Effect.flatMap(adopt)
+        )
+      )
+    )
+
+  const startIn = (entry: Entry, settings: unknown, scope: Scope.Closeable) =>
     Effect.gen(function*() {
-      const scope = yield* Scope.make()
       const generation = ++entry.generation
       let startStatus: StatusLine | undefined
       let started = false
@@ -335,7 +392,7 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
           scheduleStatus(entry)
         }
       }
-      const exit = yield* entry.def.start({ settings: settings as never, setStatus }).pipe(
+      const exit = yield* Effect.suspend(() => entry.def.start({ settings: settings as never, setStatus })).pipe(
         Scope.provide(scope),
         Effect.timeoutOrElse({
           duration: startTimeoutMs,
@@ -343,8 +400,8 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
         }),
         Effect.exit
       )
-      const fail = (message: string) =>
-        Effect.as(Scope.close(scope, Exit.void), { ok: false as const, message })
+      // The scope is closed by `startInstance` for every result that is not ok.
+      const fail = (message: string) => Effect.succeed({ ok: false as const, message })
       if (Exit.isFailure(exit)) return yield* fail(describeStartFailure(exit.cause))
       const instance = exit.value
       let contributed: ReturnType<typeof contributionsOf>
@@ -359,15 +416,18 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
       const names = toolNames(contributed)
       const duplicate = names.find((n, i) => names.indexOf(n) !== i)
       if (duplicate !== undefined) return yield* fail(`The module declares the tool "${duplicate}" twice`)
-      for (const other of others) {
-        const clash = names.find((n) => toolNames(other.running).includes(n))
-        if (clash !== undefined) return yield* fail(`Tool name "${clash}" is already used by module ${other.def.name}`)
+      // Core always words a confirmation question itself (after the final review): a module's own text is ignored.
+      for (const a of contributed.actions) {
+        if (typeof a.definition.confirm === "function") {
+          yield* Effect.logWarning(
+            `Module ${entry.def.id}, action "${a.definition.id}": its own confirmation text is ignored; the assistant asks its own question from the action's label and values`
+          )
+        }
       }
+      // Clashes with other modules are checked by `publish`, against the modules running then.
       started = true
       return { ok: true as const, running: { scope, instance, generation, ...contributed }, status: startStatus }
     })
-
-  const othersOf = (entry: Entry) => entries.filter((e) => e !== entry && e.running !== undefined)
 
   /** Resolve settings and start (enable, retry, startup). Intent is already on. */
   const start = (entry: Entry): Effect.Effect<HostResult> =>
@@ -379,29 +439,49 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
         notify(entry)
         return failure("invalid_settings", entry.error, { moduleId: entry.def.id, fieldErrors: resolved.form.errors })
       }
+      const before = { state: entry.state, error: entry.error }
       entry.state = "starting"
       entry.error = undefined
       notify(entry)
-      const result = yield* startInstance(entry, resolved.value, othersOf(entry))
-      if (!result.ok) {
+      const startFailed = (message: string): HostResult => {
         entry.state = "error"
-        entry.error = result.message
+        entry.error = message
         notify(entry)
-        return failure("module_start_failed", result.message, { moduleId: entry.def.id })
+        return failure("module_start_failed", message, { moduleId: entry.def.id })
       }
-      if (!entry.enabled) {
-        // Disabled while starting (only possible at shutdown races): do not keep it.
-        yield* Scope.close(result.running.scope, Exit.void)
-        entry.state = "disabled"
+      let adopted = false
+      // Runs uninterruptibly once the start has returned: publish, or close.
+      const adopt = (result: Effect.Success<ReturnType<typeof startIn>>): Effect.Effect<HostResult> => {
+        adopted = true
+        if (!result.ok) return Effect.succeed(startFailed(result.message))
+        if (!entry.enabled) {
+          // Disabled while starting (only possible at shutdown races): do not keep it.
+          return Effect.as(Scope.close(result.running.scope, Exit.void), { ok: true } as HostResult).pipe(Effect.tap(() =>
+            Effect.sync(() => {
+              entry.state = "disabled"
+              notify(entry)
+            })
+          ))
+        }
+        const clash = publish(entry, result.running)
+        if (clash !== undefined) return Effect.as(Scope.close(result.running.scope, Exit.void), startFailed(clash))
+        entry.status = result.status
+        entry.state = "running"
         notify(entry)
-        return { ok: true }
+        return Effect.succeed({ ok: true })
       }
-      entry.running = result.running
-      entry.status = result.status
-      entry.state = "running"
-      rebuild()
-      notify(entry)
-      return { ok: true }
+      return yield* startInstance(entry, resolved.value, adopt).pipe(
+        // Cancelled during the module's start (shutdown, the caller gave up): the scope is already closed; back to how
+        // it was. An interruption that arrives once the result was adopted changes nothing: that outcome stands.
+        Effect.onInterrupt(() =>
+          Effect.sync(() => {
+            if (adopted) return
+            entry.state = before.state
+            entry.error = before.error
+            notify(entry)
+          })
+        )
+      )
     })
 
   /** Run `op` unless another operation on the same module is in progress. */
@@ -472,15 +552,18 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
           if (resolved.value === undefined) {
             return failure("invalid_settings", "Some settings are not valid", { moduleId: id, fieldErrors: resolved.form.errors })
           }
-          // The old instance keeps serving while the new one starts.
-          const result = yield* startInstance(entry, resolved.value, othersOf(entry))
-          if (!result.ok) return failure("module_start_failed", result.message, { moduleId: id })
-          entry.stored = patched.stored
-          entry.secrets = patched.secrets
-          entry.running = result.running
-          entry.status = result.status
-          rebuild()
-          yield* retire(entry, old)
+          // The old instance keeps serving while the new one starts. Publication, the
+          // new settings and the old instance's retirement happen together, uninterruptibly.
+          const adopted = yield* startInstance(entry, resolved.value, (result): Effect.Effect<HostResult | undefined> => {
+            if (!result.ok) return Effect.succeed(failure("module_start_failed", result.message, { moduleId: id }))
+            const clash = publish(entry, result.running)
+            if (clash !== undefined) return Effect.as(Scope.close(result.running.scope, Exit.void), failure("module_start_failed", clash, { moduleId: id }))
+            entry.stored = patched.stored
+            entry.secrets = patched.secrets
+            entry.status = result.status
+            return Effect.as(retire(entry, old), undefined)
+          })
+          if (adopted !== undefined) return adopted
           yield* save(entry)
           notify(entry)
           return { ok: true } as HostResult
@@ -517,7 +600,8 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
       const own = instance.fieldActions?.[key]
       const handler = own ?? (key === "test" ? generatedTest(instance) : undefined)
       if (handler === undefined) return Effect.succeed({ ok: false, code: "unknown_action", message: `${entry.def.name} has no action "${key}"` } as const)
-      return handler().pipe(
+      // Suspended: a handler that throws is reported like one that fails.
+      return Effect.suspend(handler).pipe(
         Effect.catchCause((cause) => Effect.succeed<FieldActionResult>({ ok: false, text: `Failed: ${Cause.pretty(cause).split("\n")[0]}`.slice(0, 500), tone: "error" })),
         Effect.map((result) => ({ ok: true, result }) as const)
       )
@@ -586,7 +670,7 @@ export const testAgent = (agent: Agent): Effect.Effect<FieldActionResult> =>
     let first: number | undefined
     let text = ""
     const trace = { id: 0, mode: "text" as const, speculative: false, startedAt: start, marks: {}, tools: [], voices: [] }
-    const exit = yield* agent.turn({
+    const exit = yield* Stream.suspend(() => agent.turn({
       turnId: 0,
       text: "Say hello in five words.",
       utterance: "Say hello in five words.",
@@ -604,7 +688,7 @@ export const testAgent = (agent: Agent): Effect.Effect<FieldActionResult> =>
       mark: () => {},
       trace,
       maxToolRounds: 0
-    }).pipe(
+    })).pipe(
       Stream.runForEach((event) =>
         Effect.flatMap(Clock.currentTimeMillis, (now) =>
           Effect.sync(() => {
@@ -644,7 +728,7 @@ export const testDecider = (decider: DecisionProvider): Effect.Effect<FieldActio
   Effect.gen(function*() {
     const plan = buildDecisionPlan({ utterance: "Turn on the kitchen lights", actions: testActions })
     const start = yield* Clock.currentTimeMillis
-    const exit = yield* decider.decide(plan.request).pipe(
+    const exit = yield* Effect.suspend(() => decider.decide(plan.request)).pipe(
       Effect.timeoutOrElse({ duration: TEST_TIMEOUT_MS, orElse: () => Effect.fail(new Error("no answer")) }),
       Effect.exit
     )

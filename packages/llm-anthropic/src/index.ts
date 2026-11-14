@@ -5,6 +5,7 @@
 import Anthropic from "@anthropic-ai/sdk"
 import { Llm, LlmError, type LlmEvent, type LlmRequest, type Message, type StopReason } from "@pva/core"
 import { Cause, Config, Effect, Layer, Queue, Redacted, Stream } from "effect"
+import { addressSecrets, checkAddress, clip, fromUpstream, logText, safeId, sanitize, type Secrets, secretList } from "./redact.ts"
 
 export type Effort = "low" | "medium" | "high"
 /**
@@ -29,6 +30,8 @@ export interface AnthropicLlmOptions {
   readonly timeoutMs: number
   /** Open the HTTPS connection at startup (cheap authenticated GET). */
   readonly warmUp: boolean
+  /** For tests; defaults to the SDK's (the global `fetch`). */
+  readonly fetch?: typeof globalThis.fetch
 }
 
 /** The public API. */
@@ -175,20 +178,41 @@ const isRetryable = (e: unknown): boolean => {
   return false
 }
 
-const toLlmError = (e: unknown): LlmError => {
-  if (e instanceof LlmError) return e
+/**
+ * The only way an `LlmError` is made here: message and cause are sanitised
+ * (credentials masked in every form; the cause is a plain copy, never the SDK
+ * error, which carries the raw body and headers).
+ */
+export const llmError = (secrets: Secrets, message: string, cause?: unknown): LlmError =>
+  new LlmError(sanitize(secrets, { message, cause }))
+
+/**
+ * Upstream text can echo the submitted key (a gateway at `baseURL` answering
+ * `Invalid API key: <key>`), so a rejected key gets a fixed message, the
+ * request id is shown only when it is a plain id, and everything else is
+ * sanitised by `llmError`.
+ */
+const toLlmError = (secrets: Secrets) => (e: unknown): LlmError => {
+  if (e instanceof LlmError) return llmError(secrets, e.message, e.cause)
   if (e instanceof Anthropic.APIError) {
-    const parts = [
-      "Anthropic API error",
-      e.status !== undefined ? String(e.status) : undefined,
-      e.type ?? e.name,
-      ": ",
-      e.apiMessage ?? e.message,
-      e.requestID ? ` (request-id ${e.requestID})` : undefined
-    ]
-    return new LlmError({ message: parts.filter(Boolean).join(" ").replace(" : ", ": "), cause: e })
+    const id = safeId(e.requestID, secrets)
+    const requestId = id !== undefined ? ` (request-id ${id})` : ""
+    const message = e.status === 401 || e.status === 403
+      ? `Anthropic rejected the API key (${e.status})${requestId}`
+      : [
+        "Anthropic API error",
+        e.status !== undefined ? String(e.status) : undefined,
+        e.type ?? e.name,
+        ": ",
+        e.apiMessage ?? e.message,
+        requestId || undefined
+      ].filter(Boolean).join(" ").replace(" : ", ": ")
+    return llmError(secrets, message, new Error(message))
   }
-  return new LlmError({ message: e instanceof Error ? e.message : String(e), cause: e })
+  // The SDK rethrows `JSON.parse`'s error for a stream event that is not JSON: its message quotes the
+  // event's first characters, already cut, so it is never used (see `redact.ts`, `SYNTAX_ERROR_TEXT`).
+  if (e instanceof SyntaxError) return llmError(secrets, "Anthropic sent a stream event that is not JSON")
+  return llmError(secrets, fromUpstream(e, secrets), e)
 }
 
 // ---------------------------------------------------------------------------
@@ -200,7 +224,8 @@ async function attempt(
   params: Anthropic.MessageCreateParamsStreaming,
   signal: AbortSignal,
   timeoutMs: number,
-  emit: (event: LlmEvent) => void
+  emit: (event: LlmEvent) => void,
+  secrets: Secrets
 ): Promise<void> {
   const watchdog = new AbortController()
   let stalled = false
@@ -245,7 +270,7 @@ async function attempt(
           try {
             input = tool.json === "" ? {} : JSON.parse(tool.json)
           } catch {
-            throw new InvalidToolInput(`Invalid JSON input for tool ${tool.name}: ${tool.json}`)
+            throw new InvalidToolInput(`Invalid JSON input for tool ${clip(tool.name, secrets, 64)}: ${clip(tool.json, secrets, 200)}`)
           }
           emit({ _tag: "ToolCall", id: tool.id, name: tool.name, input })
           break
@@ -265,31 +290,94 @@ async function attempt(
   }
 }
 
-export const make = Effect.fnUntraced(function*(options: AnthropicLlmOptions) {
-  // One client for the process: undici keeps the connection alive between turns.
-  const client = new Anthropic({
-    apiKey: Redacted.value(options.apiKey),
-    baseURL: options.baseURL ?? DEFAULT_BASE_URL,
-    timeout: options.timeoutMs,
-    maxRetries: 0
-  })
+/** The rules for a base address: http(s), no user-info, no query (see `redact.ts`, `checkAddress`). */
+const ADDRESS_RULES = { protocols: ["http:", "https:"], query: false } as const
 
-  if (options.warmUp) {
+/**
+ * What the client needs, read and checked once; never throws. The address
+ * (`baseURL`, default `DEFAULT_BASE_URL`; always passed, so the SDK never reads
+ * `ANTHROPIC_BASE_URL` from `process.env` itself) must carry no credentials:
+ * the key goes in its own setting, and the SDK would put a password into the
+ * URL of every error. A stray `ANTHROPIC_BASE_URL` in `process.env` is not used,
+ * but is masked like a secret all the same.
+ */
+const prepare = (options: AnthropicLlmOptions): { readonly secrets: Secrets; readonly base?: string; readonly error?: LlmError } => {
+  let secrets: Secrets = []
+  try {
+    // In steps: whatever was read before a getter throws is already masked.
+    secrets = secretList(Redacted.value(options.apiKey))
+    secrets = secretList(secrets, addressSecrets(process.env.ANTHROPIC_BASE_URL))
+    const configured = options.baseURL === undefined || options.baseURL.trim() === "" ? DEFAULT_BASE_URL : options.baseURL
+    secrets = secretList(secrets, addressSecrets(configured))
+    const address = checkAddress(configured, ADDRESS_RULES)
+    if (!address.ok) return { secrets, error: llmError(secrets, `The Anthropic address ${address.problem}`) }
+    return { secrets, base: address.display }
+  } catch (e) {
+    return { secrets, error: llmError(secrets, `The Anthropic settings could not be read: ${fromUpstream(e, secrets)}`, e) }
+  }
+}
+
+const makeService = Effect.fnUntraced(function*(options: AnthropicLlmOptions) {
+  const prepared = prepare(options)
+  const secrets = prepared.secrets
+  // The SDK's own log lines (warnings, and whatever `ANTHROPIC_LOG` turns on: at debug, request and
+  // response details as objects) can quote responses: they go into the Effect log instead of the
+  // console, through `logText`, which redacts every string inside them whole before anything is
+  // inspected or shortened (fourth review: `inspect` cut strings at 10 000 characters first).
+  const runLog = Effect.runForkWith(yield* Effect.context<never>())
+  const sdkLog = (level: "error" | "warn" | "info" | "debug") => (message: string, ...rest: Array<unknown>) => {
+    const text = logText([message, ...rest], secrets)
+    runLog(
+      level === "error"
+        ? Effect.logError(`Anthropic SDK: ${text}`)
+        : level === "warn"
+        ? Effect.logWarning(`Anthropic SDK: ${text}`)
+        : level === "info"
+        ? Effect.logInfo(`Anthropic SDK: ${text}`)
+        : Effect.logDebug(`Anthropic SDK: ${text}`)
+    )
+  }
+  // One client for the process: undici keeps the connection alive between turns. Built inside the
+  // boundary: a constructor that throws is a failed setup, reported like any other error.
+  let setupError = prepared.error
+  let client: Anthropic | undefined
+  if (setupError === undefined) {
+    try {
+      client = new Anthropic({
+        logger: { error: sdkLog("error"), warn: sdkLog("warn"), info: sdkLog("info"), debug: sdkLog("debug") },
+        apiKey: Redacted.value(options.apiKey),
+        // The checked, credential-free form (always given: the SDK would otherwise read ANTHROPIC_BASE_URL itself).
+        ...(prepared.base !== undefined ? { baseURL: prepared.base } : {}),
+        timeout: options.timeoutMs,
+        maxRetries: 0,
+        ...(options.fetch !== undefined ? { fetch: options.fetch } : {})
+      })
+    } catch (e) {
+      setupError = llmError(secrets, `The Anthropic client could not be set up: ${fromUpstream(e, secrets)}`, e)
+    }
+  }
+  if (setupError !== undefined) yield* Effect.logWarning(setupError.message)
+
+  if (client !== undefined && options.warmUp) {
+    const warm = client
     // Opens TCP+TLS to the API (and validates the key) so the first turn does
     // not pay for the handshake. Whether the pooled connection survives until
     // the first turn depends on the server's keep-alive hint (unverified).
     yield* Effect.tryPromise({
-      try: (signal) => client.models.retrieve(options.model, null, { signal }),
-      catch: toLlmError
+      try: (signal) => warm.models.retrieve(options.model, null, { signal }),
+      catch: toLlmError(secrets)
     }).pipe(
+      Effect.catchDefect((d) => Effect.fail(llmError(secrets, `Anthropic warm-up failed unexpectedly: ${fromUpstream(d, secrets)}`, d))),
       Effect.tapError((e) => Effect.logWarning(`Anthropic warm-up failed: ${e.message}`)),
       Effect.ignore,
       Effect.forkScoped
     )
   }
 
-  const stream = (request: LlmRequest): Stream.Stream<LlmEvent, LlmError> =>
-    Stream.callback<LlmEvent, LlmError>((queue) =>
+  const run = (request: LlmRequest): Stream.Stream<LlmEvent, LlmError> => {
+    if (client === undefined) return Stream.fail(setupError ?? llmError(secrets, "The Anthropic client is not set up"))
+    const ready = client
+    return Stream.callback<LlmEvent, LlmError>((queue) =>
       Effect.gen(function*() {
         // Closing the stream's scope (completion, error or interruption of the
         // consumer) aborts the HTTP request: barge-in depends on this.
@@ -297,7 +385,10 @@ export const make = Effect.fnUntraced(function*(options: AnthropicLlmOptions) {
           Effect.sync(() => new AbortController()),
           (c) => Effect.sync(() => c.abort())
         )
-        const params = toParams(request, options)
+        const params = yield* Effect.try({
+          try: () => toParams(request, options),
+          catch: (e) => llmError(secrets, `Could not build the Anthropic request: ${fromUpstream(e, secrets)}`, e)
+        })
         let emitted = false
         const emit = (event: LlmEvent) => {
           emitted = true
@@ -305,21 +396,49 @@ export const make = Effect.fnUntraced(function*(options: AnthropicLlmOptions) {
         }
         const run = async () => {
           try {
-            await attempt(client, params, controller.signal, options.timeoutMs, emit)
+            await attempt(ready, params, controller.signal, options.timeoutMs, emit, secrets)
           } catch (e) {
             if (emitted || controller.signal.aborted || !isRetryable(e)) throw e
-            await attempt(client, params, controller.signal, options.timeoutMs, emit)
+            await attempt(ready, params, controller.signal, options.timeoutMs, emit, secrets)
           }
         }
         run().then(
           () => Queue.endUnsafe(queue),
-          (e) => Queue.failCauseUnsafe(queue, Cause.fail(toLlmError(e)))
+          (e) => Queue.failCauseUnsafe(queue, Cause.fail(toLlmError(secrets)(e)))
         )
       })
+    )
+  }
+
+  // The last resort: whatever escapes the paths above (a defect) leaves as a sanitised `LlmError`.
+  const stream = (request: LlmRequest): Stream.Stream<LlmEvent, LlmError> =>
+    Stream.suspend(() => run(request)).pipe(
+      Stream.catchDefect((defect) => Stream.fail(llmError(secrets, `The Anthropic call failed unexpectedly: ${fromUpstream(defect, secrets)}`, defect))),
+      Stream.mapError((e) => llmError(secrets, e.message, e.cause))
     )
 
   return Llm.of({ stream })
 })
+
+/**
+ * The service. The last resort for building it: a defect while it is built becomes a service whose every
+ * call fails with a sanitised `LlmError`, never a raw defect.
+ */
+export const make = (options: AnthropicLlmOptions) =>
+  makeService(options).pipe(
+    Effect.catchDefect((defect) =>
+      Effect.sync(() => {
+        let secrets: Secrets = []
+        try {
+          secrets = secretList(options.apiKey !== undefined ? Redacted.value(options.apiKey) : undefined)
+        } catch {
+          // what was read is kept
+        }
+        const error = llmError(secrets, `The Anthropic client could not be set up: ${fromUpstream(defect, secrets)}`, defect)
+        return Llm.of({ stream: () => Stream.fail(error) })
+      })
+    )
+  )
 
 export const layer = (options: AnthropicLlmOptions): Layer.Layer<Llm> => Layer.effect(Llm, make(options))
 

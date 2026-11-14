@@ -121,6 +121,37 @@ describe("hey Jev, end to end with the keyword decider and the demo home", () =>
       assert.deepStrictEqual(t.main.probe.inputs.map((i) => [i.text, i.routedBy]), [["What is a quark?", "trigger"], ["Thanks!", "default"]])
     })))
 
+  it.effect("review round 2, finding A: a new command while a question is pending is not taken as its answer", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const t = yield* assemble({ live: false })
+      yield* Effect.gen(function*() {
+        const fiber = yield* Effect.forkChild(voice([
+          endOfTurn("Hey Jev, turn on the lights."),
+          sleep(2_000),
+          endOfTurn("Turn off the kitchen lights please."),
+          sleep(2_000),
+          endOfTurn("Hey Jev, dim the kitchen to one hundred forty percent."),
+          sleep(2_000),
+          endOfTurn("Dim the living room to 40 percent.")
+        ]))
+        yield* advance(10_000)
+        yield* Fiber.join(fiber)
+      }).pipe(Effect.provide(t.layer))
+      const decisions = t.events.flatMap((e) => (e._tag === "IntentDecided" ? [`${e.decision.outcome}${e.decision.action ? ` ${e.decision.action.id}` : ""}`] : []))
+      assert.deepStrictEqual(decisions, [
+        "ask demo-home.lights_on",
+        "act demo-home.lights_off",
+        "ask demo-home.set_brightness",
+        "act demo-home.set_brightness"
+      ])
+      const state = Effect.map(t.host.snapshot().registry.run({ id: "s", name: "demo_home_state", input: {} }), (r) =>
+        JSON.parse(r.content) as { rooms: Array<{ name: string; lights: Array<{ on: boolean; brightness: number }> }> })
+      const rooms = (yield* state).rooms
+      assert.deepStrictEqual(yield* t.lights, ["Living room"], "the kitchen was not switched on")
+      assert.strictEqual(rooms.find((r) => r.name === "Living room")!.lights[0]!.brightness, 40)
+      assert.notStrictEqual(rooms.find((r) => r.name === "Kitchen")!.lights[0]!.brightness, 40)
+    })))
+
   it.live("one spoken command on the real clock: transcript and trace", () =>
     Effect.scoped(Effect.gen(function*() {
       const t = yield* assemble({ live: true })

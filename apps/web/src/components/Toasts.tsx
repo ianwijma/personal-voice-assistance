@@ -17,6 +17,7 @@ export function Toasts() {
 function ToastItem({ toast }: { readonly toast: Toast }) {
   const client = useClient()
   useEffect(() => {
+    // continuation(identity): dismisses only this toast, by its id; cleared when the toast goes.
     const timer = setTimeout(() => client.store.dispatch({ type: "local/toast-dismiss", id: toast.id }), 6000)
     return () => clearTimeout(timer)
   }, [client, toast.id])

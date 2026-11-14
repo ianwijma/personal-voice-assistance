@@ -5,6 +5,7 @@ import type { DecisionProvider } from "./Decision.ts"
 import type { Message, ToolCall, ToolResult } from "./Domain.ts"
 import type { ToolRegistry } from "./ToolRegistry.ts"
 import type { Trace, TraceMark } from "./TurnTrace.ts"
+import type { PendingIntents } from "./PendingIntents.ts"
 
 /**
  * Agents: the interchangeable responders behind one interface
@@ -45,6 +46,14 @@ export interface AgentTurnInput {
    * (interrupted replies hold only what was heard). The same for every agent.
    */
   readonly history: ReadonlyArray<Message>
+  /**
+   * How many messages were evicted from the front of the shared history before
+   * this turn (`ConversationOptions.history`): `history[i]` is message number
+   * `historyStart + i` of the conversation. An agent that remembers a position in
+   * the history across turns (a harness's catch-up) keeps it in these absolute
+   * numbers. Absent (0) when nothing was ever evicted.
+   */
+  readonly historyStart?: number
   /** Stable system prompt for this agent: its own prompt (or the global one) + module instructions + voice block. Cacheable. */
   readonly system: string
   /** Per-turn facts from context providers (time, ...); `undefined` when empty. Never cached. */
@@ -75,6 +84,13 @@ export interface AgentTurnInput {
   readonly now?: (() => number) | undefined
   /** Upper bound on tool rounds (model agents; harness agents pass it on where the harness supports it). */
   readonly maxToolRounds: number
+  /**
+   * The conversation's one pending question or confirmation, shared by every agent: the intent
+   * agent keeps its parameter question here; core keeps an armed confirmation of a `confirm: true`
+   * action here (review round 6), which no agent answers. Absent (agents' own tests): an agent
+   * keeps its own.
+   */
+  readonly pendingIntents?: PendingIntents
 }
 
 /**
@@ -99,9 +115,18 @@ export type AgentEvent =
   /**
    * The agent passes this turn on before producing any text (an intent agent
    * found no matching action). `Conversation` re-runs the same turn on the
-   * fallback agent; emitting it after text is a defect.
+   * fallback agent; emitting it after text is a defect. `Conversation` stops
+   * reading the stream at a `Handoff`: an effect placed after it never runs.
    */
   | { readonly _tag: "Handoff"; readonly reason: string }
+  /**
+   * The agent proposes running an action declared `confirm: true` with complete, valid values
+   * (the intent agent; conversational agents propose by calling the action's generated tool).
+   * `Conversation` does not run it: it ends the agent's stream for the turn there (nothing after it
+   * is read), speaks the action's own confirmation question itself, and conducts the confirmation
+   * (docs/AGENTS-AND-INTENTS.md, "Review fixes, sixth round"). Text already spoken stays.
+   */
+  | { readonly _tag: "ConfirmAction"; readonly action: RegisteredAction; readonly params: Readonly<Record<string, unknown>> }
 
 /** Shown in the chat for an intent turn (`intent.decision` in the protocol). */
 export interface IntentDecisionInfo {

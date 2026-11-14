@@ -1,6 +1,7 @@
 import { assert, describe, expect, it } from "@effect/vitest"
 import { Effect, Exit } from "effect"
 import { defineAction, Param, type ParamOption, registerActions } from "../src/Actions.ts"
+import { parseValues } from "../src/ValueParsing.ts"
 import {
   buildDecisionPlan,
   choiceAnswer,
@@ -129,6 +130,7 @@ describe("buildDecisionPlan", () => {
         "area:living_room": "Living room (also called: lounge, woonkamer)",
         "area:kitchen": "Kitchen (also called: keuken)",
         "light:desk_lamp": "Desk lamp",
+      none: "None of these: the utterance names something else, or nothing",
         all: "All lights (also called: everywhere, the whole house)"
       },
       role: { kind: "param", action: "demo-home.lights_on", param: "target" }
@@ -143,14 +145,14 @@ describe("buildDecisionPlan", () => {
     expect(q["demo-home.set_brightness/level"]).toBeUndefined() // no number in the sentence: missing
     expect(q["weather.today/place"]).toBeUndefined() // text is never asked
     const dim = buildDecisionPlan({ utterance: "Dim the kitchen to 40 percent", actions, parse: digits })
-    expect(dim.params.get("demo-home.set_brightness")?.get("level")).toEqual({ kind: "fixed", value: 40, label: "40" })
+    expect(dim.params.get("demo-home.set_brightness")?.get("level")).toMatchObject({ kind: "fixed", value: 40, label: "40" })
     const two = buildDecisionPlan({ utterance: "Set light 2 to 40", actions, parse: digits })
     expect(two.request.questions["demo-home.set_brightness/level"]).toMatchObject({
       type: "choice",
       options: { c0: "2", c1: "40", none: "None of these" }
     })
     expect(buildDecisionPlan({ utterance: "Set it to 140", actions, parse: digits }).params.get("demo-home.set_brightness")?.get("level"))
-      .toEqual({ kind: "missing" }) // out of range
+      .toMatchObject({ kind: "missing", invalid: "140" }) // out of range: asked for again
   })
 
   it("has no questions when no module offers an action", () => {
@@ -286,4 +288,282 @@ describe("makeScriptedDecider", () => {
       const exit = yield* Effect.exit(failing.decide(plan.request))
       assert.isTrue(Exit.isFailure(exit))
     }))
+})
+
+describe("a number out of range is never replaced by another number (review finding 6)", () => {
+  const brightnessIs = (choice: string, utterance: string, pending?: Parameters<typeof buildDecisionPlan>[0]["pending"]) => {
+    const plan = buildDecisionPlan({ utterance, actions, parse: parseValues, pending })
+    const options = Object.keys((plan.request.questions["demo-home.set_brightness/level"] as { options?: Record<string, unknown> } | undefined)?.options ?? {})
+    const answers: Record<string, DecisionAnswer> = {
+      [Q.action]: choiceAnswer({ "demo-home.set_brightness": 0.95, "demo-home.lights_on": 0.05 }),
+      [Q.fits]: noul(0.95),
+      [Q.compound]: noul(0.02),
+      "demo-home.set_brightness/target": choiceAnswer({ "area:kitchen": 0.95, "area:living_room": 0.05 }),
+      ...(options.length > 0 ? { "demo-home.set_brightness/level": choiceAnswer(Object.fromEntries(options.map((o) => [o, o === choice ? 0.9 : 0.1 / (options.length - 1)]))) } : {})
+    }
+    return { plan, outcome: interpretDecision(plan, { answers }) }
+  }
+
+  it("dim the kitchen to 140 percent: the decider picks 140, which is asked for again", () => {
+    const { outcome } = brightnessIs("", "dim the kitchen to 140 percent")
+    expect(outcome._tag).toBe("Ask")
+    if (outcome._tag !== "Ask") return
+    expect(outcome.pending.awaiting).toMatchObject({ kind: "param", param: "level" })
+    expect(outcome.question).toBe("I can't use 140 percent. What brightness?")
+    expect(outcome.pending.params).not.toHaveProperty("level")
+  })
+  it("dim 3 lights in kitchen to 140 percent: two numbers, one parameter — the other number is unexplained (round 3)", () => {
+    const { plan, outcome } = brightnessIs("c0", "dim 3 lights in kitchen to 140 percent")
+    expect(plan.request.questions["demo-home.set_brightness/level"]).toMatchObject({ type: "choice", options: { c0: "140 percent", c1: "3" } })
+    expect(outcome).toMatchObject({ _tag: "Fallback", reason: "unexplained" })
+  })
+
+  it("the only number said is out of range: asked for, not taken", () => {
+    const { outcome } = brightnessIs("", "dim the kitchen to -5 percent")
+    expect(outcome._tag).toBe("Ask")
+    if (outcome._tag === "Ask") expect(outcome.question).toBe("I can't use -5 percent. What brightness?")
+  })
+
+  it("an answer out of range keeps the action pending and asks again", () => {
+    const { outcome } = brightnessIs("", "dim the kitchen")
+    if (outcome._tag !== "Ask") return assert.fail("expected a question")
+    const twice = interpretDecision(
+      buildDecisionPlan({ utterance: "140 percent", actions, parse: parseValues, pending: outcome.pending }),
+      { answers: { [Q.pendingAnswers]: noul(0.9), [Q.fits]: noul(0.1) } }
+    )
+    expect(twice).toMatchObject({ _tag: "Ask", question: "I can't use 140 percent. What brightness?" })
+    const valid = interpretDecision(
+      buildDecisionPlan({ utterance: "40 percent", actions, parse: parseValues, pending: outcome.pending }),
+      { answers: { [Q.pendingAnswers]: noul(0.9), [Q.fits]: noul(0.1) } }
+    )
+    expect(valid).toMatchObject({ _tag: "Act", params: { target: "area:kitchen", level: 40 } })
+  })
+
+  it("a valid number among several is not acted on: the other number is unexplained (round 3)", () => {
+    const { outcome } = brightnessIs("c0", "dim 3 lights in kitchen to 40 percent")
+    expect(outcome).toMatchObject({ _tag: "Fallback", reason: "unexplained" })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Review round 2. The answers below are scripted: they stand for any provider,
+// a hosted one included, that answers too confidently.
+
+describe("a value named but not offered is never replaced (review round 2, finding E)", () => {
+  // Rule: "only available" is not "requested". A single value is used only when the utterance
+  // names none; a named value that matches no option is asked about, never replaced by the
+  // only option, a default, or the best of a bad set.
+  const kitchenOnly = [{ value: "area:kitchen", label: "Kitchen" }]
+  const single = registerActions("home", [defineAction({
+    id: "lights_on",
+    label: "Turn lights on",
+    description: "Switch on the lights in a room.",
+    params: { target: Param.dynamic({ label: "Room or light", options: () => kitchenOnly }) },
+    run: () => Effect.void
+  })])
+  const base = { [Q.action]: choiceAnswer({ "home.lights_on": 0.97 }), [Q.fits]: noul(0.95), [Q.compound]: noul(0.02) }
+
+  it("a single value is offered as a choice with none of these, and a 'does it say which' question", () => {
+    const p = buildDecisionPlan({ utterance: "turn on the bedroom lights", actions: single })
+    const question = p.request.questions["home.lights_on/target"]
+    expect(question?.type === "choice" ? Object.keys(question.options) : []).toEqual(["area:kitchen", "none"])
+    expect(p.request.questions["home.lights_on/target?"]).toMatchObject({ type: "noul", role: { kind: "stated" } })
+  })
+  it("named and not offered: handed on (an unexplained word, round 3), never switched in the kitchen", () => {
+    const p = buildDecisionPlan({ utterance: "turn on the bedroom lights", actions: single })
+    for (const answer of [choiceAnswer({ "area:kitchen": 0.1, none: 0.9 }), choiceAnswer({ "area:kitchen": 0.5, none: 0.5 }), choiceAnswer({ "area:kitchen": 0.99 })]) {
+      const outcome = interpretDecision(p, respond({ ...base, "home.lights_on/target?": noul(0.9), "home.lights_on/target": answer }))
+      expect(outcome).toMatchObject({ _tag: "Fallback", reason: "unexplained" })
+    }
+  })
+  it("nothing named: the only value is used", () => {
+    const p = buildDecisionPlan({ utterance: "turn on the lights", actions: single })
+    expect(interpretDecision(p, respond({ ...base, "home.lights_on/target?": noul(0.1) }))).toMatchObject({ _tag: "Act", params: { target: "area:kitchen" } })
+  })
+  it("the only value named: used", () => {
+    const p = buildDecisionPlan({ utterance: "turn on the kitchen lights", actions: single })
+    expect(interpretDecision(p, respond({ ...base, "home.lights_on/target?": noul(0.9), "home.lights_on/target": choiceAnswer({ "area:kitchen": 0.9, none: 0.1 }) })))
+      .toMatchObject({ _tag: "Act", params: { target: "area:kitchen" } })
+  })
+  it("several values: 'none of these' is asked about; an optional value named but unknown is asked about, not defaulted", () => {
+    const p = buildDecisionPlan({ utterance: "turn on the lights in the bedroom", actions, parse: digits })
+    const lightsOnBase = { [Q.action]: choiceAnswer({ "demo-home.lights_on": 0.96 }), [Q.fits]: noul(0.95), [Q.compound]: noul(0.02) }
+    expect(interpretDecision(p, respond({ ...lightsOnBase, "demo-home.lights_on/target": choiceAnswer({ "area:kitchen": 0.05, none: 0.95 }) })))
+      .toMatchObject({ _tag: "Fallback", reason: "unexplained" })
+    const tz = buildDecisionPlan({ utterance: "what time is it in Utrecht", actions, parse: digits })
+    expect(interpretDecision(tz, respond({
+      [Q.action]: choiceAnswer({ "clock.time_now": 0.96 }),
+      [Q.fits]: noul(0.95),
+      [Q.compound]: noul(0.02),
+      "clock.time_now/zone?": noul(0.9),
+      "clock.time_now/zone": choiceAnswer({ "Europe/Amsterdam": 0.1, "Asia/Tokyo": 0.1, none: 0.8 })
+    }))).toMatchObject({ _tag: "Ask", question: "Which place?" })
+  })
+  it("a reply to the question that names something not offered is not taken", () => {
+    const p = buildDecisionPlan({ utterance: "turn on the lights", actions: single })
+    const asked = interpretDecision(p, respond({ ...base, "home.lights_on/target?": noul(0.9), "home.lights_on/target": choiceAnswer({ "area:kitchen": 0.1, none: 0.9 }) }))
+    if (asked._tag !== "Ask") return assert.fail("expected Ask")
+    const reply = buildDecisionPlan({ utterance: "the bedroom", actions: single, pending: asked.pending })
+    expect(interpretDecision(reply, respond({ [Q.pendingAnswers]: noul(0.95), [Q.pendingAnswer]: choiceAnswer({ "area:kitchen": 0.2, none: 0.8 }) })))
+      .toMatchObject({ _tag: "Fallback" })
+  })
+})
+
+describe("one broken option list does not stop the others (review round 2, finding H)", () => {
+  // Rule: a module's option list that fails leaves out only the actions that need it (reported);
+  // every list is read once per plan; with nothing left, the result is a normal hand-off.
+  let calls = 0
+  const broken = Param.dynamic({ label: "Speaker", options: (): ReadonlyArray<ParamOption> => {
+    throw new Error("speaker list down")
+  } })
+  const counted = Param.dynamic({ label: "Room or light", options: () => {
+    calls++
+    return targets
+  } })
+  const mixed = [
+    ...registerActions("music", [defineAction({ id: "play", label: "Play music", description: "Play music on a speaker.", params: { speaker: broken }, run: () => Effect.void })]),
+    ...registerActions("home", [
+      defineAction({ id: "lights_on", label: "Turn lights on", description: "Switch on the lights.", params: { target: counted }, run: () => Effect.void }),
+      defineAction({ id: "lights_off", label: "Turn lights off", description: "Switch off the lights.", params: { target: counted }, run: () => Effect.void })
+    ])
+  ]
+  it("the other actions are offered and decided; the failure is reported", () => {
+    calls = 0
+    const p = buildDecisionPlan({ utterance: "turn on the kitchen lights", actions: mixed })
+    expect(p.actions.map((a) => a.id)).toEqual(["home.lights_on", "home.lights_off"])
+    expect(p.unavailable.map((u) => u.actionId)).toEqual(["music.play"])
+    expect(p.warnings.some((w) => /speaker list down/.test(w))).toBe(true)
+    expect(calls).toBe(1)
+    const outcome = interpretDecision(p, respond({
+      [Q.action]: choiceAnswer({ "home.lights_on": 0.95 }),
+      [Q.fits]: noul(0.95),
+      [Q.compound]: noul(0.02),
+      "home.lights_on/target": choiceAnswer({ "area:kitchen": 0.95 })
+    }))
+    expect(outcome).toMatchObject({ _tag: "Act", params: { target: "area:kitchen" } })
+  })
+  it("nothing usable left: no action is offered, and the outcome is a plain hand-off", () => {
+    const p = buildDecisionPlan({ utterance: "play some music", actions: mixed.slice(0, 1) })
+    expect(p.actions).toEqual([])
+    expect(interpretDecision(p, respond({}))).toMatchObject({ _tag: "Fallback", reason: "no_match" })
+  })
+})
+
+describe("core's safeguard, whatever the provider says (review round 2)", () => {
+  const confirmPending = () => {
+    const p = buildDecisionPlan({ utterance: "Switch everything off", actions })
+    const outcome = interpretDecision(p, respond({ [Q.action]: choiceAnswer({ "demo-home.all_off": 0.9 }), [Q.fits]: noul(0.9), [Q.compound]: noul(0) }))
+    if (outcome._tag !== "Confirm") throw new Error("expected Confirm")
+    return outcome.pending
+  }
+  const sureYes = { [Q.pendingAnswers]: noul(0.95), [Q.pendingYes]: noul(0.99) }
+
+  it("a confirmation is accepted only on a bounded affirmative, English and Dutch", () => {
+    const pending = confirmPending()
+    for (const yes of ["yes", "Yes please.", "go ahead", "that's right", "ja", "ja, doe maar", "prima"]) {
+      expect(interpretDecision(buildDecisionPlan({ utterance: yes, actions, pending }), respond(sureYes)), yes).toMatchObject({ _tag: "Act" })
+    }
+    for (const notYes of ["turn on the kitchen lights please", "yes, but not the bedroom", "doe het licht aan in de keuken graag", "right, what's the weather", "sure, no"]) {
+      const outcome = interpretDecision(buildDecisionPlan({ utterance: notYes, actions, pending }), respond(sureYes))
+      expect(outcome._tag === "Act" && outcome.action.id === "demo-home.all_off", notYes).toBe(false)
+    }
+  })
+  it("a negated request for an action with side effects is handed on, English and Dutch; a read-only action is not vetoed", () => {
+    const lightsOnAnswers = {
+      [Q.action]: choiceAnswer({ "demo-home.lights_on": 0.97 }),
+      [Q.fits]: noul(0.97),
+      [Q.compound]: noul(0.01),
+      "demo-home.lights_on/target": choiceAnswer({ "area:kitchen": 0.95 })
+    }
+    for (const utterance of ["don't turn on the kitchen lights", "do not turn on the kitchen lights", "never turn on the kitchen lights", "doe het licht niet aan in de keuken", "nooit het licht aan in de keuken"]) {
+      expect(interpretDecision(buildDecisionPlan({ utterance, actions }), respond(lightsOnAnswers)), utterance).toEqual({ _tag: "Fallback", reason: "negated" })
+    }
+    // Asking or confirming is also an action of the path: not from a negated sentence.
+    expect(interpretDecision(buildDecisionPlan({ utterance: "don't switch everything off", actions }), respond({ [Q.action]: choiceAnswer({ "demo-home.all_off": 0.9 }), [Q.fits]: noul(0.9), [Q.compound]: noul(0) })))
+      .toEqual({ _tag: "Fallback", reason: "negated" })
+    expect(interpretDecision(buildDecisionPlan({ utterance: "isn't it time yet", actions }), respond({ [Q.action]: choiceAnswer({ "clock.time_now": 0.9 }), [Q.fits]: noul(0.9), [Q.compound]: noul(0), "clock.time_now/zone?": noul(0.1) })))
+      .toMatchObject({ _tag: "Act" })
+    expect(interpretDecision(buildDecisionPlan({ utterance: "turn on the kitchen lights", actions }), respond(lightsOnAnswers))).toMatchObject({ _tag: "Act" })
+  })
+  it("a negated answer to a pending question is handed on", () => {
+    const vague = buildDecisionPlan({ utterance: "Turn on the lights", actions })
+    const asked = interpretDecision(vague, respond({ [Q.action]: choiceAnswer({ "demo-home.lights_on": 0.97 }), [Q.fits]: noul(0.97), [Q.compound]: noul(0), "demo-home.lights_on/target": choiceAnswer({ "area:kitchen": 0.5, all: 0.5 }) }))
+    if (asked._tag !== "Ask") return assert.fail("expected Ask")
+    for (const utterance of ["not the kitchen", "niet de keuken"]) {
+      const reply = buildDecisionPlan({ utterance, actions, pending: asked.pending })
+      expect(interpretDecision(reply, respond({ [Q.pendingAnswers]: noul(0.95), [Q.pendingAnswer]: choiceAnswer({ "area:kitchen": 0.95 }) })), utterance)
+        .toEqual({ _tag: "Fallback", reason: "negated" })
+    }
+  })
+})
+
+describe("a reply that is a command of its own is planned afresh (review round 2, finding A, core's part)", () => {
+  // Rule: while a question is pending, an utterance that confidently asks for another action,
+  // or for the same action with another value for something already decided, is a new request
+  // with all its parameters; terse answers still answer.
+  const askRoom = () => {
+    const vague = buildDecisionPlan({ utterance: "turn on the lights", actions, parse: digits })
+    const asked = interpretDecision(vague, respond({ [Q.action]: choiceAnswer({ "demo-home.lights_on": 0.97 }), [Q.fits]: noul(0.97), [Q.compound]: noul(0), "demo-home.lights_on/target": choiceAnswer({ "area:kitchen": 0.5, all: 0.5 }) }))
+    if (asked._tag !== "Ask") throw new Error("expected Ask")
+    return asked.pending
+  }
+  const askLevel = () => {
+    const p = buildDecisionPlan({ utterance: "dim the kitchen to 140 percent", actions, parse: digits })
+    const asked = interpretDecision(p, respond({ [Q.action]: choiceAnswer({ "demo-home.set_brightness": 0.97 }), [Q.fits]: noul(0.97), [Q.compound]: noul(0), "demo-home.set_brightness/target": choiceAnswer({ "area:kitchen": 0.95 }) }))
+    if (asked._tag !== "Ask") throw new Error("expected Ask")
+    return asked.pending
+  }
+  it("'turn off the kitchen lights please' after 'Which room or light?' switches off, even if the provider calls it an answer", () => {
+    const reply = buildDecisionPlan({ utterance: "turn off the kitchen lights please", actions, pending: askRoom(), parse: digits })
+    const outcome = interpretDecision(reply, respond({
+      [Q.pendingAnswers]: noul(0.9),
+      [Q.pendingAnswer]: choiceAnswer({ "area:kitchen": 0.95 }),
+      [Q.action]: choiceAnswer({ "demo-home.lights_off": 0.95 }),
+      [Q.fits]: noul(0.95),
+      [Q.compound]: noul(0.02),
+      "demo-home.lights_off/target": choiceAnswer({ "area:kitchen": 0.95 })
+    }))
+    expect(outcome).toMatchObject({ _tag: "Act", params: { target: "area:kitchen" } })
+    if (outcome._tag === "Act") expect(outcome.action.id).toBe("demo-home.lights_off")
+  })
+  it("'dim bedroom 40' after 'What brightness?' (for the kitchen) dims the bedroom", () => {
+    const reply = buildDecisionPlan({ utterance: "dim the living room 40", actions, pending: askLevel(), parse: digits })
+    const outcome = interpretDecision(reply, respond({
+      [Q.pendingAnswers]: noul(0.9),
+      [Q.action]: choiceAnswer({ "demo-home.set_brightness": 0.95 }),
+      [Q.fits]: noul(0.95),
+      [Q.compound]: noul(0.02),
+      "demo-home.set_brightness/target": choiceAnswer({ "area:living_room": 0.95 })
+    }))
+    expect(outcome).toMatchObject({ _tag: "Act", params: { target: "area:living_room", level: 40 } })
+  })
+  it("terse answers still answer", () => {
+    const room = buildDecisionPlan({ utterance: "the kitchen", actions, pending: askRoom(), parse: digits })
+    expect(interpretDecision(room, respond({ [Q.pendingAnswers]: noul(0.95), [Q.pendingAnswer]: choiceAnswer({ "area:kitchen": 0.95 }), [Q.fits]: noul(0.2) })))
+      .toMatchObject({ _tag: "Act", params: { target: "area:kitchen" } })
+    const level = buildDecisionPlan({ utterance: "40 percent", actions, pending: askLevel(), parse: digits })
+    expect(interpretDecision(level, respond({ [Q.pendingAnswers]: noul(0.95), [Q.action]: choiceAnswer({ "demo-home.set_brightness": 0.9 }), [Q.fits]: noul(0.9), [Q.compound]: noul(0) })))
+      .toMatchObject({ _tag: "Act", params: { target: "area:kitchen", level: 40 } })
+    // The same action again, nothing contradicted: still the answer.
+    const same = buildDecisionPlan({ utterance: "turn on the kitchen lights", actions, pending: askRoom(), parse: digits })
+    expect(interpretDecision(same, respond({ [Q.pendingAnswers]: noul(0.95), [Q.pendingAnswer]: choiceAnswer({ "area:kitchen": 0.95 }), [Q.action]: choiceAnswer({ "demo-home.lights_on": 0.95 }), [Q.fits]: noul(0.95), [Q.compound]: noul(0) })))
+      .toMatchObject({ _tag: "Act", params: { target: "area:kitchen" } })
+  })
+})
+
+describe("a reply that changes a value already decided is not the answer (review round 2, finding A, core's part)", () => {
+  it("'the living room, 40' after 'What brightness?' for the kitchen: not the kitchen, even when the provider is unsure it is a command", () => {
+    const p = buildDecisionPlan({ utterance: "dim the kitchen to 140 percent", actions, parse: digits })
+    const asked = interpretDecision(p, respond({ [Q.action]: choiceAnswer({ "demo-home.set_brightness": 0.97 }), [Q.fits]: noul(0.97), [Q.compound]: noul(0), "demo-home.set_brightness/target": choiceAnswer({ "area:kitchen": 0.95 }) }))
+    if (asked._tag !== "Ask") return assert.fail("expected Ask")
+    const reply = buildDecisionPlan({ utterance: "living room 40", actions, pending: asked.pending, parse: digits })
+    const outcome = interpretDecision(reply, respond({
+      [Q.pendingAnswers]: noul(0.95),
+      [Q.action]: choiceAnswer({ "demo-home.set_brightness": 0.6 }),
+      [Q.fits]: noul(0.4),
+      [Q.compound]: noul(0),
+      "demo-home.set_brightness/target": choiceAnswer({ "area:living_room": 0.9 })
+    }))
+    expect(outcome._tag === "Act" && outcome.params["target"] === "area:kitchen").toBe(false)
+  })
 })

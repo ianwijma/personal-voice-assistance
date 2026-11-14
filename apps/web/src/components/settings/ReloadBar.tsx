@@ -27,7 +27,7 @@ export function ReloadBar({ tree }: { readonly tree: ReadonlyArray<NavGroup> }) 
   const reload = async () => {
     setBusy(true)
     setFailure(undefined)
-    const result = await client.reloadEngines()
+    const result = await client.reloadEngines() // continuation(none): shows this request's own outcome; no audio or preference state
     setBusy(false)
     if (!result.ok) setFailure(result.error?.message ?? "The reload failed; the running engines were kept.")
   }

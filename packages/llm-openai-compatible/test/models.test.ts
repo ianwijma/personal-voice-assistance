@@ -51,7 +51,7 @@ describe("listModels", () => {
       const denied = yield* fakeServer(json(401, { error: { message: "Invalid API key" } }))
       const e1 = yield* Effect.flip(listModels({ profile: "llamacpp", baseUrl: denied.url }))
       assert.strictEqual(e1.reason, "unauthorized")
-      assert.include(e1.message, "rejected the API key (401): Invalid API key")
+      assert.match(e1.message, /rejected the API key \(401\)$/)
 
       const html = yield* fakeServer((_req, res) => {
         res.writeHead(200, { "content-type": "text/html" })
@@ -84,4 +84,22 @@ describe("resolveBaseUrl", () => {
     assert.isUndefined(resolveBaseUrl(profiles.ollama, "not a url"))
     assert.isUndefined(resolveBaseUrl(profiles.ollama, "ftp://x/v1"))
   })
+})
+
+describe("listModels review regressions", () => {
+  it.live("a rejected key that the server echoes back never reaches the error", () =>
+    Effect.gen(function*() {
+      const key = "sk-live-0123456789abcdefSECRET"
+      const denied = yield* fakeServer(json(401, { error: { message: `Invalid API key: ${key}` } }))
+      const e1 = yield* Effect.flip(listModels({ profile: "generic", baseUrl: denied.url, apiKey: Redacted.make(key) }))
+      assert.strictEqual(e1.reason, "unauthorized")
+      assert.include(e1.message, "rejected the API key (401)")
+      assert.notInclude(e1.message, key)
+      assert.notInclude(String(e1.cause), key)
+
+      const broken = yield* fakeServer(json(500, { error: { message: `upstream failed for ${key}` } }))
+      const e2 = yield* Effect.flip(listModels({ profile: "generic", baseUrl: broken.url, apiKey: Redacted.make(key) }))
+      assert.include(e2.message, "answered 500")
+      assert.notInclude(e2.message, key)
+    }))
 })

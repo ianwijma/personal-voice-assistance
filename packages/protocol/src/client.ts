@@ -104,7 +104,14 @@ export const PlaybackFinished = Schema.Struct({
 export const PlaybackStopped = Schema.Struct({
   type: Schema.Literal("playback.stopped"),
   turnId: TurnId,
-  playedSamples: NonNegativeInt
+  playedSamples: NonNegativeInt,
+  /**
+   * `false`: `playedSamples` is the page's best estimate, sent before the player
+   * confirmed its own count; an exact report for the same turn may follow, and
+   * the server waits for it (within its stop deadline) before taking this one.
+   * Absent (older pages) or `true`: the count is exact.
+   */
+  exact: Schema.optionalKey(Schema.Boolean)
 })
 
 /**

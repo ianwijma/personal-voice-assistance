@@ -145,7 +145,8 @@ export const compareModelsCommand = (args: ReadonlyArray<string>) =>
               Stream.runForEach((event) => Effect.sync(() => events.push({ at: performance.now(), event })))
             )
             const end = t0 + input.endMs / speed
-            const finals = events.filter((e) => e.event._tag === "EndOfTurn")
+            // An utterance with no words ends with an empty EndOfTurn: not a turn of the file.
+            const finals = events.filter((e) => e.event._tag === "EndOfTurn" && e.event.text !== "")
             const lastFinal = finals.at(-1)
             const lastEager = events.filter((e) => e.event._tag === "EagerEndOfTurn").at(-1)
             const text = finals.map((e) => ("text" in e.event ? e.event.text : "")).join(" ")

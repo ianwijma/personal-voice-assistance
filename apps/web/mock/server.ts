@@ -544,6 +544,10 @@ interface Reply {
   stallTimer?: ReturnType<typeof setInterval>
   ended: boolean
   dropScheduled?: boolean
+  /** Sent reply.stop and waiting (≤ 300 ms) for playback.stopped. */
+  awaitingStop?: boolean
+  /** The first `playback.stopped { exact: false }`: used only if no exact count comes within the stop's 300 ms. */
+  provisional?: number
 }
 
 const conns = new Set<Conn>()
@@ -895,13 +899,30 @@ const endTurn = (r: Reply, outcome: "completed" | "interrupted" | "failed") => {
   setState(restingState())
 }
 
+/** Clauses up to `samples` started playing: tell every tab. */
+const playedTo = (r: Reply, samples: number) => {
+  let k = r.playedClause
+  while (k + 1 < r.clauses.length && r.clauses[k + 1]!.startSample < samples) k++
+  if (k > r.playedClause) {
+    r.playedClause = k
+    broadcast({ type: "assistant.playing", turnId: r.turnId, clause: k })
+  }
+}
+
+/** The stop's wait ran out: a provisional count is better than nothing. */
+const endStopped = (r: Reply) => {
+  if (r.ended) return
+  if (r.provisional !== undefined) playedTo(r, r.provisional)
+  endTurn(r, "interrupted")
+}
+
 /** Interrupt the running reply: reply.stop to the owner, wait ≤ 300 ms for playback.stopped. */
 const interruptReply = (r: Reply) => {
   if (r.ended) return
   if (r.spoken && r.owner !== undefined && r.started !== undefined) {
     sendTo(r.owner, { type: "reply.stop", turnId: r.turnId })
-    r.timers.push(setTimeout(() => endTurn(r, "interrupted"), 300))
-    ;(r as { awaitingStop?: boolean }).awaitingStop = true
+    r.timers.push(setTimeout(() => endStopped(r), 300))
+    r.awaitingStop = true
   } else {
     if (r.spoken && r.owner !== undefined) sendTo(r.owner, { type: "reply.stop", turnId: r.turnId })
     endTurn(r, "interrupted")
@@ -1153,12 +1174,16 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
       const r = reply
       if (r === undefined || r.turnId !== m.turnId) return
       r.lastReport = Date.now()
-      let k = r.playedClause
-      while (k + 1 < r.clauses.length && r.clauses[k + 1]!.startSample < m.playedSamples) k++
-      if (k > r.playedClause) {
-        r.playedClause = k
-        broadcast({ type: "assistant.playing", turnId: r.turnId, clause: k })
+      if (m.type === "playback.stopped" && m.exact === false) {
+        // As the real server: a provisional count is kept, not used, while an exact one may still come within the
+        // stop's 300 ms (interruptReply's timer; or one started here when the page stopped on its own), and used if
+        // none does. A second provisional count is ignored.
+        if (r.provisional !== undefined) return
+        r.provisional = m.playedSamples
+        if (r.awaitingStop !== true) r.timers.push(setTimeout(() => endStopped(r), 300))
+        return
       }
+      playedTo(r, m.playedSamples)
       if (m.type === "playback.finished") endTurn(r, "completed")
       if (m.type === "playback.stopped") endTurn(r, "interrupted")
       return

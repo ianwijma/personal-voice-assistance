@@ -243,17 +243,17 @@ function OptionModuleCard({ module: m, option, fieldKey, view, forms, editable, 
       const edits = optInKey !== undefined && view !== undefined && !optedIn
         ? { [view.def.key]: (d: Draft) => setDraftValue(d, optInKey, true) }
         : {}
-      const ok = await forms.save({ edits })
+      const ok = await forms.save({ edits }) // continuation(state): each step re-reads the store; `finish` checks `mounted`
       if (!ok) return finish("Not saved: see the messages on this page.")
     }
     if (!running) {
       setStep(`Starting ${m.name}…`)
-      const on = await client.enableModule(m.id, true)
+      const on = await client.enableModule(m.id, true) // continuation(state): see above
       if (!on.ok) return finish(on.error?.message ?? `${m.name} did not start.`)
     }
     if (client.store.get().engine.engines.find((e) => e.stage === "llm")?.provider !== option.value) {
       setStep("Reloading engines…")
-      const reloaded = await client.reloadEngines()
+      const reloaded = await client.reloadEngines() // continuation(state): see above
       if (!reloaded.ok) return finish(reloaded.error?.message ?? "The engines were not reloaded.")
     }
     finish(undefined)

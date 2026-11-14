@@ -77,7 +77,13 @@ type WorkerMessage =
     gainDb?: number
   }
   | { type: "cancelled"; session: number }
+  | { type: "flushed"; session: number }
+  | { type: "closed" }
   | { type: "error"; session: number; message: string }
+  /** Whole-turn: decoding is so far behind (a native decode that does not return) that a turn was dropped. */
+  | { type: "overload"; session: number; message: string }
+  /** A turn boundary could not be honoured exactly. */
+  | { type: "warning"; session: number; message: string }
 
 interface Session {
   readonly id: number
@@ -87,10 +93,80 @@ interface Session {
 
 const workerUrl = new URL("./worker.mjs", import.meta.url)
 
+/** Longest wait for the worker's native decodes to finish when closing (a whole-turn decode takes up to ~3 s). */
+const CLOSE_WAIT_MS = 15_000
+
+/**
+ * Workers that did not answer `close` in time and were left running (each holds a loaded model, up to about a
+ * gigabyte). While there is one, no new recogniser is loaded beside it (see `makeWithWorker`), so at most one
+ * is ever left behind; it is counted out when it finally answers or exits.
+ */
+let orphanedWorkers = 0
+
+/** Workers left running after a close that timed out (diagnostics, tests). */
+export const orphans = (): number => orphanedWorkers
+
+let orphanWaiters: Array<() => void> = []
+const orphanGone = () => {
+  if (orphanedWorkers > 0) return
+  for (const resolve of orphanWaiters) resolve()
+  orphanWaiters = []
+}
+
+/** Resolves once no worker is left behind (at once if none is). */
+export const whenNoOrphans = (): Promise<void> =>
+  orphanedWorkers === 0 ? Promise.resolve() : new Promise((resolve) => orphanWaiters.push(resolve))
+
+const orphanedMessage =
+  "The previous local speech model has not shut down: a native decode has not finished, and it still holds its memory. " +
+  "No second model is loaded beside it; try again once it finishes, or restart the assistant."
+
+/** Whether an error message is the one for a model that cannot load because the previous one is still running. */
+export const isOrphanedMessage = (message: string): boolean => message.includes(orphanedMessage)
+
+/**
+ * Stops the worker without cutting a native decode short: terminating the thread while `decodeAsync` runs
+ * aborts the whole process. The worker is asked to close and answers once its decodes have settled; only then
+ * is it terminated. If that takes longer than `closeWaitMs` the worker is left to finish on its own (it no
+ * longer keeps the process alive, and is terminated when it answers) and counted in `orphanedWorkers`.
+ * Succeeds with `true` when it was left behind. A worker that has already exited (it crashed) has nothing to wait for.
+ */
+const stopWorker = (worker: Worker, closeWaitMs: number, exited: () => boolean) =>
+  Effect.callback<boolean>((resume) => {
+    if (exited()) return resume(Effect.succeed(false))
+    let done = false
+    let orphaned = false
+    const finish = (left: boolean) => {
+      if (done) return
+      done = true
+      clearTimeout(timer)
+      resume(Effect.succeed(left))
+    }
+    worker.on("message", (message: WorkerMessage) => {
+      if (message.type === "closed") worker.terminate().then(() => finish(false), () => finish(false))
+    })
+    worker.once("exit", () => {
+      if (orphaned) {
+        orphaned = false
+        orphanedWorkers--
+        orphanGone()
+      }
+      finish(false)
+    })
+    const timer = setTimeout(() => {
+      worker.unref()
+      orphaned = true
+      orphanedWorkers++
+      finish(true)
+    }, closeWaitMs)
+    timer.unref()
+    worker.postMessage({ type: "close" })
+  })
+
 /** Starts the worker and waits until the model is loaded and warmed up. */
-const startWorker = (workerData: unknown) =>
+const startWorker = (url: URL, workerData: unknown) =>
   Effect.callback<{ worker: Worker; loadMs: number }, SttError>((resume) => {
-    const worker = new Worker(workerUrl, { workerData })
+    const worker = new Worker(url, { workerData })
     const onMessage = (message: WorkerMessage) => {
       if (message.type !== "ready") return
       cleanup()
@@ -169,6 +245,8 @@ const workerConfig = (preset: Preset, modelDir: string, options: SherpaSttOption
 export const check = (options: SherpaSttOptions = {}): Effect.Effect<void, SttError> =>
   Effect.suspend(() => {
     const name = options.model ?? DEFAULT_PRESET
+    // Checked before a reload stops the running engines: a new model would be refused anyway (see `makeWithWorker`).
+    if (orphanedWorkers > 0) return Effect.fail(new SttError({ message: orphanedMessage }))
     if (!presets[name]) {
       return Effect.fail(new SttError({ message: `Unknown speech model "${name}"; choose one of ${presetNames.join(", ")}` }))
     }
@@ -176,7 +254,16 @@ export const check = (options: SherpaSttOptions = {}): Effect.Effect<void, SttEr
     return message === undefined ? Effect.void : Effect.fail(new SttError({ message }))
   })
 
-export const make = (options: SherpaSttOptions = {}): Effect.Effect<Stt["Service"], SttError, Scope.Scope> =>
+export const make = (options: SherpaSttOptions = {}): Effect.Effect<Stt["Service"], SttError, Scope.Scope> => makeWithWorker(options)
+
+/**
+ * `make` with another worker script (tests: a stand-in that speaks the worker protocol without a model) and
+ * extra worker data merged over the configuration.
+ */
+export const makeWithWorker = (
+  options: SherpaSttOptions,
+  script: { readonly url?: URL; readonly data?: Readonly<Record<string, unknown>>; readonly closeWaitMs?: number } = {}
+): Effect.Effect<Stt["Service"], SttError, Scope.Scope> =>
   Effect.gen(function*() {
     const name = options.model ?? DEFAULT_PRESET
     yield* check(options)
@@ -188,12 +275,23 @@ export const make = (options: SherpaSttOptions = {}): Effect.Effect<Stt["Service
     const maxBacklogFrames = Math.ceil((options.maxBacklogMs ?? 1000) / FRAME_MS)
 
     let closing = false
+    let exited = false
     const { loadMs, worker } = yield* Effect.acquireRelease(
-      startWorker(workerConfig(preset, modelDir, options)),
+      startWorker(script.url ?? workerUrl, { ...workerConfig(preset, modelDir, options), ...script.data }),
       ({ worker }) =>
-        Effect.promise(() => {
+        Effect.suspend(() => {
           closing = true
-          return worker.terminate()
+          return stopWorker(worker, script.closeWaitMs ?? CLOSE_WAIT_MS, () => exited).pipe(
+            Effect.flatMap((left) =>
+              left
+                ? Effect.logWarning(
+                  `The local speech model ${name} did not shut down within ${Math.round((script.closeWaitMs ?? CLOSE_WAIT_MS) / 1000)} s ` +
+                    "(a native decode is still running); it was left to finish and keeps its memory until then. " +
+                    "No new local model is loaded while it runs."
+                )
+                : Effect.void
+            )
+          )
         })
     )
     yield* Effect.logInfo(`Local speech model ${name} loaded in ${Math.round(loadMs)} ms`)
@@ -211,7 +309,10 @@ export const make = (options: SherpaSttOptions = {}): Effect.Effect<Stt["Service
       if (session && "session" in message && message.session === session.id) session.onMessage(message)
     })
     worker.on("error", (cause) => crash(new SttError({ message: `Speech worker crashed: ${cause.message}`, cause })))
-    worker.on("exit", (code) => crash(new SttError({ message: `Speech worker exited with code ${code}` })))
+    worker.on("exit", (code) => {
+      exited = true
+      crash(new SttError({ message: `Speech worker exited with code ${code}` }))
+    })
 
     const transcribe = (audio: Stream.Stream<Uint8Array, AudioError>) =>
       Stream.callback<SttEvent, SttError>((queue) =>
@@ -229,7 +330,9 @@ export const make = (options: SherpaSttOptions = {}): Effect.Effect<Stt["Service
 
           const step = (input: TurnInput) => {
             for (const output of detector.step(input)) {
-              if (output._tag === "Finalize") worker.postMessage({ type: "finalize", session: id, frame: output.frame })
+              if (output._tag === "Finalize") {
+                worker.postMessage({ type: "finalize", session: id, frame: output.frame, ...(output.through ? { through: true } : {}) })
+              }
               else if (output._tag === "Commit") worker.postMessage({ type: "commit", session: id, frame: output.frame })
               else Queue.offerUnsafe(queue, output)
             }
@@ -261,8 +364,21 @@ export const make = (options: SherpaSttOptions = {}): Effect.Effect<Stt["Service
                   return step({ _tag: "Segment", text: message.text })
                 case "cancelled":
                   return step({ _tag: "SegmentCancelled" })
+                case "flushed":
+                  // Every frame of the input has been reported: the audio has really ended for the detector.
+                  if (!audioEnded) {
+                    audioEnded = true
+                    step({ _tag: "End" })
+                  }
+                  return
                 case "error":
                   return Queue.failCauseUnsafe(queue, Cause.fail(new SttError({ message: message.message })))
+                case "overload":
+                  runLog(Effect.logWarning(`Local speech model ${name}: ${message.message}`))
+                  return
+                case "warning":
+                  runLog(Effect.logWarning(`Local speech model ${name}: ${message.message}`))
+                  return
               }
             }
           }
@@ -304,8 +420,9 @@ export const make = (options: SherpaSttOptions = {}): Effect.Effect<Stt["Service
           yield* Stream.runForEachArray(audio, (chunks) => Effect.sync(() => send(chunks))).pipe(
             Effect.mapError((cause) => new SttError({ message: `Audio input failed: ${cause.message}`, cause }))
           )
-          audioEnded = true
-          step({ _tag: "End" })
+          // The worker may still be processing the last buffers (and the detector may be waiting for none of
+          // them yet): end only after it has reported every frame. Messages to the worker are handled in order.
+          worker.postMessage({ type: "flush", session: id })
         })
       )
 

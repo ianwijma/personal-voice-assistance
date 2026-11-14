@@ -10,7 +10,8 @@ import { chromium, expect, type Page, test as base } from "@playwright/test"
 export const here = dirname(fileURLToPath(import.meta.url))
 export const repoRoot = resolve(here, "../../..")
 const assistantDir = join(repoRoot, "apps/assistant")
-export const webOut = join(repoRoot, "apps/web/out")
+/** The UI the tests serve: `pnpm e2e:real` builds it to `out-e2e/` (`PVA_WEB_EXPORT_DIR`), never over `out/`. */
+export const webOut = join(repoRoot, "apps/web", process.env.PVA_WEB_EXPORT_DIR ?? "out")
 const fixturesDir = join(here, ".fixtures")
 const benchAudio = join(repoRoot, "bench-audio")
 
@@ -26,7 +27,7 @@ const requiredModels = [
 export const missingPrerequisite = (): string | undefined => {
   for (const m of requiredModels) if (!existsSync(join(repoRoot, m))) return `${m} is missing (pnpm download-models)`
   if (!existsSync(join(benchAudio, "01-hello-can-you-hear-me.wav"))) return "bench-audio/ is missing (pnpm start bench --make-wavs)"
-  if (!existsSync(join(webOut, "index.html"))) return "apps/web/out is missing (pnpm --filter @pva/web build)"
+  if (!existsSync(join(webOut, "index.html"))) return `${webOut} is missing (pnpm e2e:real builds it)`
   // Headless runs use Chrome Headless Shell, which sits next to the full Chromium build of the same revision.
   const notInstalled = "Playwright's Chromium is not installed (pnpm --filter @pva/web e2e:install)"
   try {
