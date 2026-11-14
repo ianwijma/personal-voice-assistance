@@ -5,6 +5,7 @@ import {
   decodeServerMessage,
   encodeClientMessage,
   encodeServerMessage,
+  evaluateCondition,
   MAX_TEXT_FRAME_BYTES,
   PROTOCOL_VERSION,
   ServerMessage
@@ -127,5 +128,51 @@ describe("encoding", () => {
   })
   it("produces plain JSON with the type first-class", () => {
     expect(JSON.parse(encodeServerMessage(serverExamples.state))).toEqual({ type: "state", state: "speaking", turnId: 12 })
+  })
+})
+
+describe("settings screen fields (protocol 3)", () => {
+  it("a result can carry warnings to confirm", () => {
+    const message = {
+      type: "result",
+      requestId: "r9",
+      ok: false,
+      error: {
+        code: "invalid_settings",
+        message: "Check the warnings, then save anyway",
+        warnings: [{ key: "STT_PROVIDER", message: "No Deepgram key" }]
+      }
+    } as const
+    expect(ok(decodeServerMessage(encodeServerMessage(message)))).toEqual(message)
+  })
+  it("rejects an unknown option tag, settings group or condition shape", () => {
+    const section = serverExamples["section.changed"].section
+    const withTag = (tags: ReadonlyArray<string>) => ({
+      ...serverExamples["section.changed"],
+      section: {
+        ...section,
+        form: { ...section.form, fields: [{ ...section.form.fields[0]!, options: [{ value: "x", label: "X", tags }] }] }
+      }
+    })
+    expect(decodeServerMessage(JSON.stringify(withTag(["hosted"])))._tag).toBe("Ok")
+    expect(decodeServerMessage(JSON.stringify(withTag(["shiny"])))._tag).toBe("Invalid")
+    expect(decodeServerMessage(JSON.stringify({ ...serverExamples["section.changed"], section: { ...section, group: "elsewhere" } }))._tag).toBe("Invalid")
+    expect(decodeServerMessage(JSON.stringify({ ...serverExamples["section.changed"], section: { ...section, visibleWhen: { key: "STT_PROVIDER" } } }))._tag)
+      .toBe("Invalid")
+  })
+})
+
+describe("evaluateCondition", () => {
+  const values: Record<string, unknown> = { STT_PROVIDER: "deepgram", AGC: true, N: 3 }
+  const lookup = (key: string) => values[key]
+  it("compares by equality, with all / any", () => {
+    expect(evaluateCondition({ key: "STT_PROVIDER", in: ["deepgram"] }, lookup)).toBe(true)
+    expect(evaluateCondition({ key: "STT_PROVIDER", in: ["sherpa"] }, lookup)).toBe(false)
+    expect(evaluateCondition({ all: [{ key: "AGC", in: [true] }, { key: "N", in: [3] }] }, lookup)).toBe(true)
+    expect(evaluateCondition({ all: [{ key: "AGC", in: [true] }, { key: "N", in: [4] }] }, lookup)).toBe(false)
+    expect(evaluateCondition({ any: [{ key: "AGC", in: [false] }, { key: "N", in: [3] }] }, lookup)).toBe(true)
+  })
+  it("an unknown key never matches", () => {
+    expect(evaluateCondition({ key: "MISSING", in: ["x"] }, lookup)).toBe(false)
   })
 })

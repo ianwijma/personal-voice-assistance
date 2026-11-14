@@ -125,6 +125,9 @@ export const startTestServer = async (
     webDir: join(dataDir, "no-web"),
     catalog: [greeterModule],
     env: {},
+    // Never the owner's real vault; a cheap scrypt so tests stay fast (a vault opens with its own stored parameters).
+    vaultPath: join(dataDir, "vault", "vault.enc"),
+    vaultKdf: { N: 2 ** 12, r: 8, p: 1 },
     ...options,
     dataDir
   }).pipe(Scope.provide(scope), Effect.provideService(References.MinimumLogLevel, "Error"))

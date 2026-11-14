@@ -69,6 +69,12 @@ export interface ModuleDefinition<S extends SettingsSpec = SettingsSpec> {
   readonly settings: S
   /** Enabled on first run (before the owner has chosen). Default true. */
   readonly enabledByDefault: boolean
+  /**
+   * Also enabled before the owner has chosen once this secret field (a key of `settings`) is set, from the
+   * environment or saved (the key vault): a key entered in the UI counts like one in `.env`. The host re-checks it
+   * when the saved secrets change (the vault was unlocked).
+   */
+  readonly enabledWhenSet?: string
   /** Which tab shows the module: `capability` (default), `agent` or `decider`. */
   readonly kind?: ModuleKind
   /** For `kind: "agent"`: the agent's kind. */
@@ -91,6 +97,7 @@ export const defineModule = <const S extends SettingsSpec = {}>(definition: {
   readonly description: string
   readonly settings?: S
   readonly enabledByDefault?: boolean
+  readonly enabledWhenSet?: keyof S & string
   readonly kind?: ModuleKind
   readonly start: (context: ModuleContext<SettingsOf<S>>) => Effect.Effect<ModuleInstance, ModuleStartError, Scope.Scope>
 }): ModuleDefinition<S> => {
@@ -103,6 +110,7 @@ export const defineModule = <const S extends SettingsSpec = {}>(definition: {
     description: definition.description,
     settings: definition.settings ?? ({} as S),
     enabledByDefault: definition.enabledByDefault ?? true,
+    ...(definition.enabledWhenSet !== undefined ? { enabledWhenSet: definition.enabledWhenSet } : {}),
     ...(definition.kind !== undefined ? { kind: definition.kind } : {}),
     start: definition.start
   }

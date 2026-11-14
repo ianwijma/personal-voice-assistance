@@ -1,10 +1,12 @@
 import {
+  type AgentTurnSetup,
   type AudioInput,
   AudioOutput,
   type ConversationEvent,
   type ConversationInput,
   type HostResult,
   Llm,
+  makeAgentConversation,
   makeConversationWithSetup,
   makeVoiceRouter,
   type Message,
@@ -39,7 +41,10 @@ export class EngineBuildProblems extends Schema.TaggedError<EngineBuildProblems>
 
 /** What one engine build provides. */
 export interface EngineProviders {
+  /** The language model (for `claude-subscription`: the offline stand-in that answers while the agent is not running). */
   readonly llm: Llm["Service"]
+  /** `LLM_PROVIDER` as built. Default (absent): a single-model conversation over `llm`. */
+  readonly llmProvider?: string
   readonly stt: Stt["Service"]
   /** The enabled voices. */
   readonly voices: ReadonlyArray<Voice>
@@ -84,8 +89,13 @@ export const defaultProviderBuilder: ProviderBuilder = Effect.gen(function*() {
     {
       stage: "llm",
       provider: llmProvider,
-      detail: llmProvider === "anthropic" ? yield* configValue(Config.String("ANTHROPIC_MODEL"), "claude-haiku-5-5") : "offline stand-in",
-      location: llmProvider === "anthropic" ? "hosted" : "local"
+      // claude-subscription: serve mode fills in the agent module's model (`EngineOptions.describeEngines`).
+      detail: llmProvider === "anthropic"
+        ? yield* configValue(Config.String("ANTHROPIC_MODEL"), "claude-haiku-5-5")
+        : llmProvider === "claude-subscription"
+        ? "Claude Code login"
+        : "offline stand-in",
+      location: llmProvider === "fake" ? "local" : "hosted"
     },
     {
       stage: "stt",
@@ -118,6 +128,7 @@ export const defaultProviderBuilder: ProviderBuilder = Effect.gen(function*() {
   }
   return {
     llm: Context.get(context as Context.Context<Llm>, Llm),
+    llmProvider,
     stt: Context.get(context as Context.Context<Stt>, Stt),
     voices: builtVoices(context, voices),
     defaultVoice: voices.defaultVoice,
@@ -156,6 +167,17 @@ export interface EngineOptions {
   /** The default voice chosen in the settings now (live). */
   readonly defaultVoice: () => string
   readonly onStatus: (status: EngineStatus) => void
+  /**
+   * An agent conversation for these providers (`LLM_PROVIDER=claude-subscription`), read at the start of each turn;
+   * `undefined`: the single-model conversation over `providers.llm` with `setup`.
+   */
+  readonly agentSetup?: (providers: EngineProviders) => Effect.Effect<AgentTurnSetup> | undefined
+  /** Adjust the engine list shown (live details such as an agent module's model). Applied on every status. */
+  readonly describeEngines?: (engines: ReadonlyArray<EngineInfo>) => ReadonlyArray<EngineInfo>
+  /** Reword build problems for the owner (a missing key while the key vault is locked). */
+  readonly explainProblems?: (
+    problems: ReadonlyArray<{ readonly stage: string; readonly message: string }>
+  ) => ReadonlyArray<{ readonly stage: string; readonly message: string }>
   /** Typed inputs accepted but not yet taken by the conversation, at most. Default 4. */
   readonly maxPendingInputs?: number
   /**
@@ -205,9 +227,12 @@ export interface Engine {
    */
   readonly send: (input: ConversationInput) => SendOutcome
   readonly history: Effect.Effect<ReadonlyArray<Message>>
-  readonly setReloadPending: (pending: boolean) => void
+  /** Saved settings wait for a reload (`path`: the settings page they are on, for `reloadPendingFor`). */
+  readonly setReloadPending: (pending: boolean, path?: string) => void
   /** The enabled voices and the default voice in effect, while the engines run. */
   readonly voices: () => { readonly names: ReadonlyArray<Voice>; readonly defaultVoice: string } | undefined
+  /** Announce the status again (`describeEngines` has something new to say). */
+  readonly refreshStatus: () => void
 }
 
 /** A control input with the Stop generation it was accepted in (`undefined`: a speech event). */
@@ -230,7 +255,7 @@ export const makeEngine = (options: EngineOptions): Effect.Effect<Engine, never,
     let pendingInputs = 0
     let stopPending = false
     let stopGeneration = 0
-    let status: EngineStatus = { state: "starting", problems: [], reloadPending: false, engines: [], voices: [] }
+    let status: EngineStatus = { state: "starting", problems: [], reloadPending: false, reloadPendingFor: [], engines: [], voices: [] }
     let fiber: Fiber.Fiber<void> | undefined
     let conversationHistory: Effect.Effect<ReadonlyArray<Message>> | undefined
     let history: ReadonlyArray<Message> = []
@@ -238,9 +263,11 @@ export const makeEngine = (options: EngineOptions): Effect.Effect<Engine, never,
     let busy = false
     let running: { readonly voices: ReadonlyArray<Voice>; router: Tts["Service"]; defaultVoice: string; readonly sampleRate: number } | undefined
 
+    const view = (s: EngineStatus): EngineStatus =>
+      options.describeEngines === undefined || s.engines.length === 0 ? s : { ...s, engines: options.describeEngines(s.engines) }
     const setStatus = (next: EngineStatus) => {
       status = next
-      options.onStatus(next)
+      options.onStatus(view(next))
     }
 
     /** The router for the default voice in effect: rebuilt (cheaply, engines untouched) when the setting changes. */
@@ -261,8 +288,9 @@ export const makeEngine = (options: EngineOptions): Effect.Effect<Engine, never,
           Effect.result
         )
         if (built._tag === "Failure") {
+          const explained = options.explainProblems?.(built.failure.problems) ?? built.failure.problems
           const retry = (options.retryAfter ?? retryWhenPreviousModelGone)(built.failure.problems)
-          const problems = retry === undefined ? built.failure.problems : [...built.failure.problems, RETRY_NOTE]
+          const problems = retry === undefined ? explained : [...explained, RETRY_NOTE]
           setStatus({ ...status, state: "failed", problems, engines: [], voices: status.voices })
           const message = `The engines could not start: ${problems.map((p) => `${p.stage}: ${p.message}`).join("; ")}`
           yield* Effect.logError(message)
@@ -283,19 +311,18 @@ export const makeEngine = (options: EngineOptions): Effect.Effect<Engine, never,
           sampleRate: router.sampleRate,
           synthesize: (clauses) => Stream.suspend(() => currentRouter().router.synthesize(clauses))
         })
-        const conversation = yield* makeConversationWithSetup({
-          setup: options.setup,
-          onEvent: options.onEvent,
-          initialHistory: history,
-          maxToolRounds: providers.maxToolRounds,
-          bargeIn: true
-        }).pipe(Effect.provideService(Llm, providers.llm), Effect.provideService(TurnTrace, options.turnTrace))
+        const common = { onEvent: options.onEvent, initialHistory: history, maxToolRounds: providers.maxToolRounds, bargeIn: true }
+        const agentSetup = options.agentSetup?.(providers)
+        const conversation = yield* (agentSetup !== undefined
+          ? makeAgentConversation({ ...common, setup: agentSetup })
+          : makeConversationWithSetup({ ...common, setup: options.setup }).pipe(Effect.provideService(Llm, providers.llm))
+        ).pipe(Effect.provideService(TurnTrace, options.turnTrace))
         conversationHistory = conversation.history
         yield* Queue.clear(control)
         pendingInputs = 0
         stopPending = false
         ready = true
-        setStatus({ state: "ready", problems: [], reloadPending: false, engines: providers.engines, voices: providers.voiceInfo })
+        setStatus({ state: "ready", problems: [], reloadPending: false, reloadPendingFor: [], engines: providers.engines, voices: providers.voiceInfo })
         yield* Deferred.succeed(latch, { ok: true })
 
         const events = Stream.merge(
@@ -406,7 +433,8 @@ export const makeEngine = (options: EngineOptions): Effect.Effect<Engine, never,
       )
 
     return {
-      status: () => status,
+      status: () => view(status),
+      refreshStatus: () => options.onStatus(view(status)),
       start: launch("starting"),
       startIfStopped: launch("starting", () => !ready),
       reload: launch("reloading"),
@@ -426,8 +454,12 @@ export const makeEngine = (options: EngineOptions): Effect.Effect<Engine, never,
         return "accepted"
       },
       history: Effect.suspend(() => conversationHistory ?? Effect.succeed(history)),
-      setReloadPending: (pending) => {
-        if (status.reloadPending !== pending) setStatus({ ...status, reloadPending: pending })
+      setReloadPending: (pending, path) => {
+        const before = status.reloadPendingFor ?? []
+        const pages = !pending ? [] : path === undefined || before.includes(path) ? before : [...before, path]
+        if (status.reloadPending !== pending || pages.length !== before.length) {
+          setStatus({ ...status, reloadPending: pending, reloadPendingFor: pages })
+        }
       },
       voices: () => running === undefined ? undefined : { names: running.voices, defaultVoice: currentRouter().defaultVoice }
     } satisfies Engine

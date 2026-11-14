@@ -12,6 +12,7 @@ import { afterEach, describe, expect, it, vi } from "vitest"
 import { acquireDataDirLock, type DataDirLock } from "../src/serve/DataDirLock.ts"
 import { makeHeardAudio } from "../src/serve/HeardAudio.ts"
 import { loadSettingsStore, type LoadOptions, type SaveStep, type StartupStep } from "../src/serve/SettingsStore.ts"
+import { saveSection, sectionOf } from "./support/store.ts"
 
 vi.setConfig({ testTimeout: 20_000 })
 
@@ -100,13 +101,13 @@ const interruptWhilePaused = async (
 describe("release gate: startup (recovery and clean-up)", () => {
   /** A journal from a save that replaced secrets.json and stopped before settings.json: recovery restores `prior`. */
   const halfSaved = (dir: string) => {
-    const file = (revision: number, greeting: string) => `${JSON.stringify({ version: 1, revision, modules: { m: { enabled: true, settings: { greeting } } }, sections: {} }, null, 2)}\n`
-    const keys = (revision: number, token: string) => `${JSON.stringify({ version: 1, revision, modules: { m: { token } }, sections: {} }, null, 2)}\n`
+    const file = (revision: number, greeting: string) => `${JSON.stringify({ version: 2, revision, modules: { m: { enabled: true, settings: { greeting } } }, assistant: {} }, null, 2)}\n`
+    const keys = (revision: number, token: string) => `${JSON.stringify({ version: 2, revision, modules: { m: { token } }, assistant: {} }, null, 2)}\n`
     const prior = { settings: file(1, "hello"), secrets: keys(1, "old") }
     const next = { settings: file(2, "hoi"), secrets: keys(2, "new") }
-    writeFileSync(join(dir, "settings.json"), `${JSON.stringify({ version: 1, revision: 1, modules: { m: { enabled: true, settings: { greeting: "other" } } }, sections: {} }, null, 2)}\n`)
+    writeFileSync(join(dir, "settings.json"), `${JSON.stringify({ version: 2, revision: 1, modules: { m: { enabled: true, settings: { greeting: "other" } } }, assistant: {} }, null, 2)}\n`)
     writeFileSync(join(dir, "secrets.json"), next.secrets, { mode: 0o600 })
-    writeFileSync(join(dir, "transaction.json"), `${JSON.stringify({ version: 1, prior, next })}\n`, { mode: 0o600 })
+    writeFileSync(join(dir, "transaction.json"), `${JSON.stringify({ version: 2, secrets: "file", prior, next })}\n`, { mode: 0o600 })
     return prior
   }
 
@@ -122,7 +123,9 @@ describe("release gate: startup (recovery and clean-up)", () => {
     }],
     ["recover-settings", halfSaved, (dir) => expect(existsSync(join(dir, "transaction.json"))).toBe(true)],
     ["recover-journal-remove", halfSaved, (dir) => expect(existsSync(join(dir, "transaction.json"))).toBe(false)],
-    ["set-aside-file", (dir) => writeFileSync(join(dir, "settings.json"), "{corrupt"), () => {}]
+    ["set-aside-file", (dir) => writeFileSync(join(dir, "settings.json"), "{corrupt"), () => {}],
+    // A version-1 settings.json (per section) is rewritten flat by key at start: also under the lock.
+    ["migrate-settings", (dir) => writeFileSync(join(dir, "settings.json"), `${JSON.stringify({ version: 1, modules: {}, sections: { conversation: { SYSTEM_PROMPT: "x" } } })}\n`), () => {}]
   ]
 
   for (const [step, prepare, after] of cases) {
@@ -184,11 +187,11 @@ describe("release gate: saves", () => {
         store = yield* loadSettingsStore(dir, { lock, beforeStep: (s) => (s === "secrets" ? paused.pause() : undefined) })
         void Effect.runPromise(Effect.result(store.saveModule("m", { enabled: true, settings: {}, secrets: { token: "t" } })))
         // A second save waits for the first one's permit, which is released only after the lock's release began.
-        late = Effect.runPromise(Effect.exit(store.saveSection("conversation", { SYSTEM_PROMPT: "x" }, {})))
+        late = Effect.runPromise(Effect.exit(saveSection(store, "llm-behaviour", { SYSTEM_PROMPT: "x" }, {})))
       }))
     const exit = (await late) as Exit.Exit<void, unknown>
     expect(Exit.isFailure(exit)).toBe(true)
-    expect(JSON.parse(readFileSync(join(dir, "settings.json"), "utf8")).sections.conversation).toBeUndefined()
+    expect(sectionOf(JSON.parse(readFileSync(join(dir, "settings.json"), "utf8")), "llm-behaviour")).toBeUndefined()
   })
 })
 

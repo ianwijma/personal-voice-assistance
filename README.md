@@ -33,8 +33,8 @@ Requirements: Node ≥ 22.18, pnpm 10, `tar` with bzip2, about 800 MB of disk fo
 
 ```sh
 pnpm install
-pnpm download-models          # default STT (Parakeet v2 + Silero VAD) and TTS (Piper en_US-lessac-medium), into models/
-cp .env.example .env          # set ANTHROPIC_API_KEY and LLM_PROVIDER=anthropic for real answers
+pnpm download-models          # default STT (Parakeet v2 + Silero VAD) and TTS (Piper en_US-lessac-medium), into models/ (or later from Settings)
+# everything else is set in the web UI (pnpm serve → Settings); .env only for the few startup variables
 
 echo "what's the time?" | pnpm start text      # text mode; works offline with the stand-in model
 pnpm start say "Hello, I run on this machine."   # plays on the speaker (or add --out hello.wav)
@@ -50,35 +50,67 @@ Optional models: `pnpm --filter @pva/tts-sherpa download kokoro-af_heart` (the `
 
 ## Configuration
 
-Settings come from environment variables and, in `serve` mode, from the web UI's Options (saved in `data/`; see [Web UI](#web-ui-serve-mode)). The app also loads a `.env` file, from the directory you run it in and from the repository root, using Node's built-in `process.loadEnvFile`. Variables already set in your shell take precedence. `.env` is git-ignored. **[`.env.example`](.env.example) lists every variable with its default and a one-line explanation**, commented out: a variable that is set wins over the web UI and locks that field there, so set only what you want fixed.
+**Configure everything under Settings in the web UI** (`pnpm serve`, then the gear or `O`). Values are saved in
+`data/settings.json`, keys in an encrypted key vault outside the project (see [Keys & access](#keys--access)). Every
+page says what a choice implies (hosted, needs a key, not downloaded, slower start) and what it needs, and a speech
+model that is not on this machine yet is downloaded from the same page. The command-line modes (`text`, `voice`,
+`say`, `bench`, `transcribe`) read the same saved settings and keys.
 
-A provider's settings (including its API key) are read only when that provider is selected. A missing key for a provider you don't use is never an error.
+| What | Where in Settings |
+|---|---|
+| Language model: offline stand-in, Claude API (key), Claude subscription | Language model › Provider |
+| Speech recognition: on this machine (model, language, turn timing, microphone processing) or Deepgram | Speech recognition › Engine, Turn timing, Microphone processing, Deepgram |
+| Speech and voice models: download, cancel, delete | Speech recognition › Models, Voices › Models |
+| Voices, the default voice, their engines and the Cartesia key | Voices |
+| Modules (clock, weather, …) | Modules |
+| Keys, the vault password, who may change what | Keys & access |
+| What `.env` or the environment still sets, and **Move to settings** | Diagnostics › Settings from outside |
 
-| Stage | Selected by | Choices (default first) | Needs |
-|---|---|---|---|
-| Language model | `LLM_PROVIDER` | `fake` (offline stand-in), `anthropic` | `ANTHROPIC_API_KEY` |
-| Speech to text | `STT_PROVIDER` | `sherpa` (local), `deepgram` (hosted) | `sherpa`: model files (`pnpm download-models`); `deepgram`: `DEEPGRAM_API_KEY` |
-| Text to speech | `TTS_PROVIDER` | `sherpa` (local), `cartesia` (hosted) | `sherpa`: model files; `cartesia`: `CARTESIA_API_KEY` |
-| Voices | `VOICES`, `DEFAULT_VOICE` | `standard`; optional `natural`, `expressive` | each enabled voice's provider settings (see [Voices](#voices)) |
-| Audio | `AUDIO_BACKEND` | `pipewire`, `file` | `file` needs `AUDIO_INPUT_FILE` |
+**`.env` holds almost nothing.** Only these are read before the settings exist ([`.env.example`](.env.example)), all
+optional:
 
-Within a local provider, the model is a setting: `STT_SHERPA_MODEL` (`parakeet-v2`, `parakeet-ultra`, `whisper-turbo`, `hybrid-nemotron-parakeet`, `nemotron-560`, `nemotron-320`, …; see [Speech recognition models](#speech-recognition-models)) and `TTS_SHERPA_PRESET` (`en_US-lessac-medium`, `nl_NL-pim-medium`, `kokoro-af_heart`). The adapter READMEs ([stt-sherpa](packages/stt-sherpa/README.md), [tts-sherpa](packages/tts-sherpa/README.md)) list every setting, the models and their measurements. To compare engines, run `say` and `bench --live` on the same WAV files with each.
+| Variable | Default | What |
+|---|---|---|
+| `PVA_VAULT_PASSWORD` | unset | unlocks the key vault at start (otherwise unlock it in the UI after each restart) |
+| `PVA_DATA_DIR` | `<repo>/data` | where the settings are |
+| `SERVE_HOST`, `SERVE_PORT` | `127.0.0.1`, `8787` | where the UI listens (anything but loopback exposes it to your network) |
+| `SERVE_TLS_CERT`, `SERVE_TLS_KEY` | unset | both set: HTTPS (the microphone needs it off localhost) |
 
-`fake` is an offline LLM stand-in: it answers time questions through the clock tool and echoes everything else. It is the default so that text mode works without any key. **For real use set `LLM_PROVIDER=anthropic`.**
+Anything else in `.env` or exported by the shell still works and wins over the saved settings (environment > saved >
+default), and the field shows where it comes from ("Set by STT_SHERPA_AGC in /…/.env, line 3"). For a variable from
+`.env`, **Move to settings** (on the field, or Diagnostics › Settings from outside, also *Move all*) saves the value
+(a key into the vault; refused while the vault is locked) and comments its line out of the file, keeping a backup
+next to it (`.env.bak-<time>`, mode 0600) and the file's mode; the value is never logged or sent to a page. That page
+also lists variables nothing reads (often a typo).
 
-If a required setting or a model file is missing, the app lists every problem, with the stage it belongs to and how to fix it, and exits:
+The command-line modes unlock the vault with `PVA_VAULT_PASSWORD`, or ask for the password when run in a terminal
+(Enter skips it; providers that need a key then fail and say the vault is locked).
+
+**For development** (read from the environment only, not shown in the UI): `AUDIO_BACKEND` (`pipewire` | `file`),
+`AUDIO_INPUT_FILE`, `AUDIO_INPUT_TRAILING_SILENCE_MS`, `AUDIO_OUTPUT_DIR`, `PIPEWIRE_*` (CLI audio), `BARGE_IN`,
+`BENCH_*` (benchmarks; `BENCH_LLM_FIRST_TOKEN_MS` / `BENCH_LLM_TOKENS_PER_S` also give the offline stand-in a
+simulated speed in serve mode), `SERVE_ALLOWED_ORIGINS`, `PVA_WEB_DIR`, `PVA_VAULT_PATH`, `DEEPGRAM_URL`,
+`CARTESIA_URL`, and the web mock's `MOCK_*` / `E2E_MOCK_PORT`. The adapter READMEs list every provider setting by
+its variable name ([stt-sherpa](packages/stt-sherpa/README.md), [tts-sherpa](packages/tts-sherpa/README.md)), which is
+also the key it is saved under.
+
+`fake` is an offline LLM stand-in: it answers time questions through the clock tool and echoes everything else. It is the default so that text mode works without any key. **For real use choose Anthropic (with an API key) or the Claude subscription** under Settings → Language model → Provider (for the Claude subscription, **Use Claude subscription** there saves the choice, opts in, switches the agent on and reloads the engines).
+
+**Claude subscription** (`claude-subscription`): the language model is Claude Code with the login of the `claude` program on this machine, so replies count against your Claude plan's limits instead of an API bill ([`@pva/agent-claude-code`](packages/agent-claude-code/README.md)). Anthropic's terms for using a subscription from other software are unclear, so the *Claude subscription* module is off by default and has its own opt-in switch. Choose it under Language model, then under Modules switch on *Claude subscription* (and, in its settings, *Use my Claude subscription*); it takes effect from the next turn, no reload. While the module is off, starting or failed, the offline stand-in answers and first says so ("Claude subscription is off — switch it on under Modules."). Claude Code gets only a short allowlist of environment variables (`PATH`, `HOME`, locale, proxy and CA settings, `CLAUDE_CONFIG_DIR`, …), never other providers' keys or the vault password.
+
+If a required setting or a model file is missing, a command-line mode lists every problem, with the stage it belongs to and how to fix it, and exits (serve mode shows the same problems in Settings › Overview and keeps running):
 
 ```
 Cannot start (settings go in the environment or in .env; see .env.example):
-  voice "standard" (TTS_PROVIDER): Model file for TTS preset "en_US-lessac-medium" is missing: /…/models/vits-piper-en_US-lessac-medium/en_US-lessac-medium.onnx. Run: pnpm --filter @pva/tts-sherpa download en_US-lessac-medium
+  voice "standard" (TTS_PROVIDER): Model file for TTS preset "en_US-lessac-medium" is missing: /…/models/vits-piper-en_US-lessac-medium/en_US-lessac-medium.onnx. Download it in Settings → Voices → Models, or run: pnpm --filter @pva/tts-sherpa download en_US-lessac-medium
   speech-to-text (STT_PROVIDER): DEEPGRAM_API_KEY is not set
 ```
 
 ### Speech recognition models
 
-The local recogniser is chosen with `STT_SHERPA_MODEL` or under Options → Assistant → **Listening** (the
-choice reloads the engines; a model that is not downloaded is refused with the download command, and the
-running one keeps running). The same section sets the language, the two end-of-turn pauses, the speech
+The local recogniser is chosen under Settings → Speech recognition → **Engine** (`STT_SHERPA_MODEL`; the choice
+reloads the engines, and if the reload fails the running one keeps running). A model that is not downloaded yet
+shows **Download** with its size right there, and Save waits until it is there. The same section sets the language, the two end-of-turn pauses, the speech
 detection threshold and the gain control, each with an explanation of what it trades.
 
 | Preset | For | Trade-off |
@@ -91,8 +123,18 @@ detection threshold and the gain control, each with an explanation of what it tr
 | `nemotron-320` | The previous default (`nemotron-3.5`) | The least accurate of the large models |
 | `zipformer-en`, `fast-conformer-en` | Small machines, English | Not recommended: the worst on real-world audio |
 
-Download the others with `pnpm --filter @pva/stt-sherpa download-models <preset>` (`--list` shows which are
-installed). Details, licences and measurements: [stt-sherpa README](packages/stt-sherpa/README.md).
+**Downloads from the UI**: Speech recognition › Models and Voices › Models list every preset with its size and state
+(installed, downloading x %, not downloaded) and offer Download, Cancel and Delete (a model the running engines use
+cannot be deleted). Only a page with edit access can start one; every page sees the progress. A download checks the
+free disk space first (download plus unpacked size), fetches into a `.part` file (60 s without data fails it),
+checks the size, unpacks at low priority (`nice -n 10 tar -xjf`) into a temporary folder, checks the expected files,
+and only then moves the model into place; cancelling or a failure removes the partial files (and a restart removes
+what an interrupted one left). It runs on the server, so closing the page does not stop it. Measured effect on
+replies: [While a model downloads](#while-a-model-downloads).
+
+From a terminal the same code runs: `pnpm --filter @pva/stt-sherpa download-models <preset>` (`--list` shows which
+are installed and their sizes) and `pnpm --filter @pva/tts-sherpa download <preset>`. Details, licences and
+measurements: [stt-sherpa README](packages/stt-sherpa/README.md).
 
 ## Running
 
@@ -138,25 +180,37 @@ pnpm dev       # development: the assistant on :8787 and the UI with hot reload 
 
 One process on one port serves the UI and a WebSocket at `/ws`. The browser becomes the assistant's microphone and speaker: press **Start** on the page. Any number of tabs (at most 8) can be open; one owns the audio and the others see the conversation and play nothing ("Use this tab" moves the audio). Without a built UI the page says how to build it; the assistant runs anyway.
 
-The Options panel switches modules on and off and edits their settings while the assistant runs (a change applies from the next turn; a tool call in progress finishes), and edits the assistant settings (system prompt, voices, turn detection, language model, speech engines). Saved values go to `data/settings.json`, secrets such as API keys to `data/secrets.json` (mode 0600; the browser can set or remove a secret but never read it). `PVA_DATA_DIR` moves that directory. Environment variables and `.env` win over saved values and lock the field in the UI. Settings marked *reload* take effect after **Reload engines**, which rebuilds the speech and language engines in about 2 s and keeps the conversation.
+The settings screen switches modules on and off and edits their settings while the assistant runs (a change applies from the next turn; a tool call in progress finishes), and edits the assistant settings (system prompt, voices, turn detection, language model, speech engines). Saved values go to `data/settings.json`; secrets such as API keys go to the key vault (below; before you set a password, to `data/secrets.json` at mode 0600 as before). The browser can set or remove a secret but never read it. `PVA_DATA_DIR` moves the data directory. Environment variables and `.env` win over saved values and lock the field in the UI (with **Move to settings** for a `.env` line; see [Configuration](#configuration)). Settings marked *reload* take effect after **Reload engines**, which rebuilds the speech and language engines in about 2 s and keeps the conversation.
 
-Settings: `SERVE_HOST` (default `127.0.0.1`), `SERVE_PORT` (8787), `SERVE_ALLOWED_ORIGINS` (other page origins allowed to open the socket; default the Next dev server on port 3000), `SERVE_ALLOWED_HOSTS` (host names the server answers to, comma-separated; IP addresses, `localhost` and the hosts in `SERVE_ALLOWED_ORIGINS` always work, any other name is refused with HTTP 403 so a web page on a rebound DNS name cannot use the assistant), `SERVE_TLS_CERT` + `SERVE_TLS_KEY` (PEM files; with both, the server speaks HTTPS/WSS on the same port), `SERVE_CROSS_ORIGIN_ISOLATION` (default `true`: the page and its files are sent with `Cross-Origin-Opener-Policy: same-origin`, `Cross-Origin-Embedder-Policy: require-corp` and `Cross-Origin-Resource-Policy: same-origin`, which makes the page cross-origin isolated, so it reads how much of a reply played straight from the player instead of by message), `PVA_WEB_DIR` (default `apps/web/out`), `PVA_DATA_DIR` (default `data/`). Ctrl+C closes the sockets, the engine processes and the modules.
+Settings: `SERVE_HOST` (default `127.0.0.1`), `SERVE_PORT` (8787), `SERVE_ALLOWED_ORIGINS` (other page origins allowed to open the socket; default the Next dev server on port 3000), `SERVE_ALLOWED_HOSTS` (host names the server answers to besides IP addresses, `localhost` and the origins' hosts; any other name gets HTTP 403, against DNS rebinding), `SERVE_TLS_CERT` + `SERVE_TLS_KEY` (PEM files; with both, the server speaks HTTPS/WSS on the same port), `SERVE_CROSS_ORIGIN_ISOLATION` (default `true`: COOP/COEP/CORP headers make the page cross-origin isolated, so it reads how much of a reply played straight from the player), `PVA_WEB_DIR` (default `apps/web/out`), `PVA_DATA_DIR` (default `data/`), `PVA_VAULT_PATH`, `PVA_VAULT_PASSWORD` (below). Ctrl+C closes the sockets, the engine processes and the modules.
 
 **If the page does not load (or Start fails) on a particular browser**, restart the assistant with `SERVE_CROSS_ORIGIN_ISOLATION=false` (in `.env` or the service's environment) and reload the page. If that fixes it, cross-origin isolation is the cause: the page works without it, with a slightly less exact count of what was heard when it is closed in the middle of a reply. Tested in Chromium only; not yet on iPhone Safari.
 
-**Reaching it from another device.** Browsers allow the microphone only on `https://` pages or on `localhost`, and this machine has no sound card, so the microphone and speaker are always another device. The assistant binds to `127.0.0.1` and has **no login**: anyone who can reach the port can use it and change its settings. Routes, simplest first:
+#### Keys & access
+
+Settings → **Keys & access** (every protected page also takes the password inline):
+
+1. **Set a password** (at least 8 characters, typed twice). The keys in `data/secrets.json` move into an encrypted file outside the project, `~/.config/pva/vault.enc` (`$XDG_CONFIG_HOME/pva/vault.enc`, or `PVA_VAULT_PATH`; mode 0600 in a 0700 directory), and `data/secrets.json` is deleted; the page says how many keys moved. From then on every key entered in the UI is stored only there.
+2. **After every restart the keys are locked.** Engines and modules that need a key do not start ("Keys are locked — unlock them in Settings → Keys & access"); local speech and the Claude subscription keep working. Type the password (the banner on the stage has a password field too): the failed engines reload and failed modules restart by themselves. To run unattended, put the password in `.env` as `PVA_VAULT_PASSWORD`, the one secret meant for `.env`: the vault then unlocks at start (a wrong one is logged and leaves it locked). It is never logged, taken out of the environment at start and never passed to Claude Code.
+3. **Who may change what.** Typing the password on a page also gives *that page* (that connection) edit access to protected settings: anything with a key, the language model and speech engine choices, and agent modules. Other pages see them read-only with a lock and an "Unlock to change" link; the server refuses their changes. Edit access ends when the page closes, on **Lock now**, or after 15 minutes without a change. `PVA_VAULT_PASSWORD` never gives edit access. Everything else (voices, listening, chat) stays open to every page.
+4. **Lock now** removes the keys from memory and ends every page's edit access (running engines keep the keys they started with until they are reloaded). **Change password** re-encrypts the vault with a new salt.
+5. **Forgot the password?** Delete the vault file; the keys in it are lost and you enter them again. There is no other way in.
+
+The vault is `node:crypto` only: scrypt (N = 2¹⁷, r = 8, p = 1, a random 16-byte salt, parameters in the file; unlocking took 289 ms on the development machine) and AES-256-GCM with a fresh 12-byte IV per write, the header authenticated. A wrong password and a modified file both fail to open, and the file is never reset. After 5 wrong passwords in a row, unlocking is refused for 30 s, then the wait doubles.
+
+**Reaching it from another device.** Browsers allow the microphone only on `https://` pages or on `localhost`, and this machine has no sound card, so the microphone and speaker are always another device. The assistant binds to `127.0.0.1` and has **no login**: anyone who can reach the port can use it and change its open settings (once a vault password is set, keys, providers and agents need that password; see [Keys & access](#keys--access)). Routes, simplest first:
 
 1. **SSH tunnel** (a laptop on your network; the recommended route):
    1. On the assistant machine: `pnpm serve` (leave it running; it stays on `127.0.0.1`).
    2. On the laptop: `ssh -N -L 8787:localhost:8787 user@assistant-host` (leave it running; `-N` means no shell).
    3. On the laptop, open **`http://localhost:8787`** in Chrome or Edge (only Chromium is tested), press **Start talking** and allow the microphone. `localhost` counts as secure, so no certificate is needed.
-   4. On open speakers keep the default *Speakers: say a few words*; with headphones choose *Headphones: instant* (Options → This device), where **Test echo** also tells you whether your browser cancels the assistant's voice.
+   4. On open speakers keep the default *Speakers: say a few words*; with headphones choose *Headphones: instant* (Settings → This device → Microphone & speaker), where **Test echo** also tells you whether your browser cancels the assistant's voice.
 
    For `pnpm dev`, forward both ports and open `http://localhost:3000`: `ssh -N -L 3000:localhost:3000 -L 8787:localhost:8787 user@assistant-host`.
 2. **HTTPS on the assistant** (a phone, which cannot open an SSH tunnel easily): set `SERVE_TLS_CERT` and `SERVE_TLS_KEY` to a certificate the device trusts (your own CA installed on the device, or a real hostname with a DNS-01 certificate), and `SERVE_HOST=0.0.0.0`, then open `https://<that hostname>:8787` on the phone. The server warns when it listens beyond loopback. Not tried on a real phone yet.
 3. **A reverse proxy** in front of the default loopback binding (Caddy, `tailscale serve`), which terminates TLS. Add the proxy's public origin to `SERVE_ALLOWED_ORIGINS` if it differs from the `Host` the server sees, and its host name to `SERVE_ALLOWED_HOSTS` if the proxy passes that name on as `Host`.
 
-**Echo and interrupting.** Each device chooses how speech interrupts the assistant (Options → This device): *Headphones: instant* (any speech stops the reply), *Speakers: confirm* (the default: the assistant stops once the recogniser has two words that are not its own echo; one-word "stop" does not interrupt, use the Stop button), or *manual* (only Stop; the microphone is muted while the assistant speaks). The server-side echo gate implements these; the browser's echo cancellation is also requested.
+**Echo and interrupting.** Each device chooses how speech interrupts the assistant (Settings → This device → Microphone & speaker): *Headphones: instant* (any speech stops the reply), *Speakers: confirm* (the default: the assistant stops once the recogniser has two words that are not its own echo; one-word "stop" does not interrupt, use the Stop button), or *manual* (only Stop; the microphone is muted while the assistant speaks). The server-side echo gate implements these; the browser's echo cancellation is also requested.
 
 **Testing it without a browser.** A scripted client speaks a WAV into a running server and prints the message timeline and each turn's latency trace:
 
@@ -171,7 +225,7 @@ Observed on the development machine (2026-11-13, local STT nemotron-3.5, Piper, 
 
 ### On a phone (iPhone Safari or Brave)
 
-The page works on iOS (Safari, and Brave, which uses the same WebKit engine) over HTTPS. Options → **This
+The page works on iOS (Safari, and Brave, which uses the same WebKit engine) over HTTPS. Settings → **This
 device** has settings that matter more on a phone than elsewhere, stored per device:
 
 - **Microphone processing**: echo cancellation, noise suppression and automatic gain, each switchable
@@ -191,7 +245,7 @@ and [Popping in playback](#popping-in-playback).
 
 To find out why a sentence was misheard:
 
-1. Options → Assistant → Listening → **Save what the assistant hears** (on). From then on every turn's audio,
+1. Settings → Diagnostics → Recordings → **Save what the assistant hears** (on). From then on every turn's audio,
    exactly as the server received it (before its gain control), is saved in `data/recordings/` as a WAV file
    with a `.json` beside it (the transcript, the model, levels, band and transport counters); the newest 50
    are kept (*Recordings kept*, advanced). The server log gets one line per turn, for example:
@@ -237,7 +291,7 @@ at 48, 44.1 and 24 kHz):
   clause boundaries (bit-identical to resampling the whole reply at once), and fades on Stop were already
   ramped.
 
-Remaining hypotheses, most likely first, and what to try (Options → This device):
+Remaining hypotheses, most likely first, and what to try (Settings → This device):
 
 1. **iOS voice processing crackle** ([WebKit bug 326286](https://bugs.webkit.org/show_bug.cgi?id=326286):
    output crackles while a microphone with echo cancellation is open, iOS 26.2–27; open, no fix). Turn
@@ -371,6 +425,25 @@ How to read it:
 - **With a 300 ms model, the final silence is not the bottleneck below ~600 ms:** the speculative reply needs `eager` + 300 ms, about 650–700 ms after the audio ends. Cutting the final silence to 400 ms saved only 8 ms at the median, while making it likelier that a pause mid-sentence ends your turn. An earlier eager end of turn (200 ms) saved about 30 ms. The defaults stay at 250 / 600 ms: 30 ms is small next to the risks, which these clean test clips cannot show. Every pause longer than the eager threshold starts a speculative model request (paid, with a hosted model) and makes the STT finalise a segment, losing context at the join (see the stt-sherpa README). Try `STT_SHERPA_EAGER_SILENCE_MS=200` if your speech has few pauses.
 - **The local engines are fast:** first clause → first Piper audio 20–30 ms; the STT's finalise adds about 100 ms (Nemotron) or 30 ms (zipformer) to the eager end of turn.
 - **CPU:** during a turn the whole app used about 2 cores at the median and 5.2 at peak (main process with the STT about 2–3.6 cores while you speak, Piper up to 3.8 cores in bursts), out of 16. No contention on this machine; on a 4-core machine try `STT_SHERPA_THREADS=2` and `TTS_SHERPA_THREADS=2` (not measured).
+
+### While a model downloads
+
+Run on the development machine (16 cores) on 2026-11-14: `bench --live --rounds 6` over two test clips
+(`models/test-wavs/0.wav`, short; `1.wav`, a long sentence), local Parakeet v2 + Piper, the offline stand-in with
+`BENCH_LLM_FIRST_TOKEN_MS=250`, 12 turns each. "During unpack": the real downloader (`downloadArchives`) looping on a
+564 MB Whisper archive served from a local HTTP server (download 0.7 s, then `nice -n 10 tar -xjf` for 32 s per round,
+so the unpack ran through every turn). Milliseconds from the end of the clip's audio:
+
+| Turns | eager (median) | tts audio − 1st clause (typical) | PLAY median, short clip | PLAY median, long clip | PLAY median / worst, all 12 |
+|---|---|---|---|---|---|
+| Idle | 27 | 23–31 | 321 | 1269 | **790 / 1442** |
+| During unpack | 61 | 23–55 | 353 | 1250 | **812 / 1414** |
+
+Reading: an unpack adds about 30 ms to a short turn (the recogniser's eager decision and the first audio are a little
+later) and nothing measurable to a long one (within run-to-run noise); the worst case did not get worse. Not worth
+pausing unpacking during a turn, so it is not done. The download phase itself was not measured on its own (locally it
+lasts under a second; from GitHub it lasts longer but is network-bound, not CPU-bound). Not run: a download on a
+machine with few cores, where the niced bzip2 process competes for the same core as the decoder.
 
 ### Through the browser
 
@@ -508,6 +581,7 @@ Taken from the files in the model archives and the adapter READMEs; nobody has r
 | PipeWire backend | unit tests with stand-in processes; in voice mode `pw-record` started and delivered audio to a stand-in STT server on the development machine, which has no sound card (so that audio was not a real microphone signal) |
 | Weather module | unit tests with an injected `fetch`; never called against the real Open-Meteo API from the tests |
 | **Serve mode** (WebSocket protocol, ownership, modules and settings from the UI, engine reload, echo gate) | unit tests (module host, echo gate, web audio backend, conversation events) and scripted-client tests against the real server with injected providers; a live test with the local models; run by hand on the development machine with a scripted client streaming `bench-audio` WAVs into `LLM_PROVIDER=fake pnpm start serve`: real recognition, Piper reply audio over the socket, an engine reload with the local models (1.8 s, conversation kept, no engine process left behind), and Ctrl+C leaving no processes |
+| **Key vault, admin access, Claude subscription as the language model** (2026-11-14) | vault unit tests (round trip, wrong password, tampering, change password, file modes, legacy import, rate limit with an injected clock, unlock time with the real parameters); scripted-client tests against the real server (protected changes refused per connection, unlock reloads failed engines, restart starts locked, `PVA_VAULT_PASSWORD`); the agent conversation with the scripted Agent SDK fake (module off → stand-in with notice, on → Claude, no reload); Playwright against the mock (set password → lock → unlock → change → lock → refused; second page; banner unlock). Text mode with `LLM_PROVIDER=claude-subscription` and the module off, by hand. **Not** run against a real subscription in this work (the adapter's own live test passed earlier on the owner's Max plan), and never with the real UI against the real server |
 | **Speech recognition presets, gain control, diagnostics** (2026-11-14) | real-model tests for Parakeet v2 (whole turn, quiet input, steady noise), the hybrid, Whisper (Dutch), Nemotron 560; measurements on the degraded set and false-trigger runs (stt-sherpa README); `pnpm e2e:real` with Parakeet v2 as the default (10/10, including "say a few words" barge-in through Parakeet's interim words and the This-device diagnostics); by hand with the scripted client on a second server: switching the model from the settings (`settings.update` + `engine.reload`, 1.9 s) to Nemotron 560 and back, the next turn recognised by the new model each time, "Save what the assistant hears" writing WAV + JSON and the log line, then `compare-models` on those files (8 presets, 2 files, 1 min 39 s). Not on a real phone. |
 | **Web UI against the real assistant** (`pnpm e2e:real`, 10 tests; 2026-11-13) | the built page in headless Chromium (no sound card), fake microphone fed from WAVs, real `serve` with the local models and the fake LLM: visual states of a spoken turn in order, transcript and reply in the chat, latency readout; the player worklet really runs (`playback.started`, progress every 250 ms, `finished`); barge-in in `instant` and `confirm` mode with history holding only the clauses that played; `manual` mode ignoring speech over the reply; typed message with a spoken reply; Stop (no stall error, history cut); two pages and a takeover in the middle of a reply; server killed (SIGKILL and SIGINT) in the middle of a reply, then restarted: the page reconnects and gets the audio back without a new Start; a module setting the server rejects, a reconfiguration and disabling/enabling seen in a second page and used on the next turn. Also by hand: the `pnpm dev` page against the real server, and Ctrl+C in `pnpm serve` and `pnpm dev` leaving no processes. Latency through the browser: [Through the browser](#through-the-browser) |
 
@@ -541,6 +615,7 @@ packages/audio-pipewire   microphone/speaker via pw-record / pw-cat
 packages/audio-file       WAV in / WAV out (tests, benchmarks)
 packages/audio-web        the browser as microphone and speaker (serve mode), over an abstract link
 packages/protocol         the browser ↔ assistant protocol: message schemas, binary frames, examples
+packages/agent-claude-code the claude-subscription agent (Claude Code with the owner's login), off by default with an opt-in
 models/                   downloaded models (git-ignored; pnpm download-models)
 packages/modules-builtin  clock, weather
 apps/assistant            providers.ts, voices.ts, modules.ts, modes: text, voice, serve, bench, say, transcribe

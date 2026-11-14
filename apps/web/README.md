@@ -4,7 +4,9 @@ The page is the owner's microphone, speaker and control surface. Open it, press 
 
 ![Speaking](screenshots/desktop-05-speaking.png)
 
-All screenshots are in [`screenshots/`](screenshots/): every visual state, the chat, the options, phone sizes and the light theme (from the mock), and `real-*.png` taken from the real assistant.
+All screenshots are in [`screenshots/`](screenshots/): every visual state, the chat, the settings screen (desktop and phone), phone sizes and the light theme (from the mock), and `real-*.png` taken from the real assistant (the `real-*-options-*` ones still show the old options drawer).
+
+![Settings: Claude subscription on the phone](screenshots/phone-07-settings-claude-subscription.png)
 
 ## Running it
 
@@ -24,7 +26,7 @@ Socket address: `?ws=ws://host:port/ws` in the page URL overrides everything; th
 |---|---|---|
 | Type check | `pnpm --filter @pva/web check` | App, worklets (`// @ts-check` JS), mock |
 | Unit tests (vitest) | `pnpm --filter @pva/web test` | Reducer and store (driven by `@pva/protocol/examples`), forms, the connection layer against a real `ws` server, and the worklets in Node with a minimal `AudioWorkletProcessor` shim |
-| End-to-end (Playwright) | `pnpm --filter @pva/web e2e:install` once (Chrome Headless Shell, ~280 MB in `~/.cache/ms-playwright`), then `pnpm --filter @pva/web e2e` | Headless Chromium with a fake microphone, against the mock. Builds the export first; the full suite runs on `out/` served by a plain static file server (`scripts/serve-static.mjs`), a smoke test on `next dev` |
+| End-to-end (Playwright) | `pnpm --filter @pva/web e2e:install` once (Chrome Headless Shell, ~280 MB in `~/.cache/ms-playwright`), then `pnpm --filter @pva/web e2e` | Headless Chromium with a fake microphone, against the mock. Builds the export first; the full suite runs on `out/` served by a plain static file server (`scripts/serve-static.mjs`), a smoke test on `next dev`. The mock listens on 8787; when that port is taken (a running assistant), set `E2E_MOCK_PORT=8797` |
 | Screenshots | `pnpm --filter @pva/web screenshots` | Rewrites the mock screenshots in `screenshots/` |
 | End-to-end against the **real** assistant | `pnpm e2e:real` from the repository root (= `pnpm --filter @pva/web e2e:real`) | `e2e-real/`, config `playwright.real.config.ts`: the built page in headless Chromium, fake microphone fed from 48 kHz WAVs built from `bench-audio/`, each file starting its own `serve` (local speech models, `LLM_PROVIDER=fake`). 10 tests, ~1.5 min. Skips when the models, `bench-audio/` or Chromium are missing. Logs in `test-results/real/` |
 | Latency through the browser | `pnpm bench:browser` from the repository root | 10 spoken turns with the fake model at 300 ms to first token; prints a table and writes `test-results/real/latency.json` |
@@ -34,7 +36,7 @@ The root `pnpm check` and `pnpm test` include the web app.
 
 ## The mock assistant (`mock/server.ts`)
 
-Speaks the real protocol (`@pva/protocol`) on `ws://127.0.0.1:8787/ws`. Scenarios (`MOCK_SCENARIO=…` or `POST /mock/scenario {"name": …}`): `voice` (after a claim: hearing with interim transcripts → a turn with a tool and three clauses → reply audio as an amplitude-modulated tone at 22 050 Hz, honouring playback reports, `reply.stop` and stalls), `typed`, `modules` (every field type, an invalid value: weather "Home location" = `Atlantis`, a module that fails to start: Home Assistant, which starts once its token is replaced with one containing `good`), `engine-failed`, `drop-mid-reply`, `takeover`, `outdated`. Typed messages work in every scenario ("time" uses a tool, "story" gives a long reply, "fail" makes a tool fail). Test endpoints: `GET /mock/log`, `POST /mock/turn`, `/mock/send`, `/mock/drop`, `/mock/offline`, `/mock/reset`.
+Speaks the real protocol (`@pva/protocol`) on `ws://127.0.0.1:8787/ws` (`MOCK_PORT` to change). Its settings are placed like the real server's (categories, pages, `visibleWhen`, option tags), with the same cross-field checks (warnings with "Save anyway"), `reloadPendingFor`, and a Claude subscription agent that starts once opted in. Scenarios (`MOCK_SCENARIO=…` or `POST /mock/scenario {"name": …}`): `voice` (after a claim: hearing with interim transcripts → a turn with a tool and three clauses → reply audio as an amplitude-modulated tone at 22 050 Hz, honouring playback reports, `reply.stop` and stalls), `typed`, `modules` (every field type, an invalid value: weather "Home location" = `Atlantis`, a module that fails to start: Home Assistant, which starts once its token is replaced with one containing `good`), `engine-failed`, `drop-mid-reply`, `takeover`, `outdated`, `vault` (like `modules`; Home Assistant and Language model are protected: any page may change them until a password is set with Keys & access, then only pages that typed it; lock, unlock and change password work), `keys-locked` (a locked vault, password `correct horse battery`, made the engines fail; unlocking reloads them). The vault starts as `none` in every other scenario. Typed messages work in every scenario ("time" uses a tool, "story" gives a long reply, "fail" makes a tool fail). Test endpoints: `GET /mock/log`, `POST /mock/turn`, `/mock/send`, `/mock/drop`, `/mock/offline`, `/mock/reset`.
 
 ## Structure
 
@@ -50,10 +52,16 @@ src/lib/
   audio/levels.ts        the mutable level object the visualiser reads (never React state)
   audio/diagnostics.ts   "This device" diagnostics: the microphone as reported, playback counters from the player
   visualiser.ts          the canvas animation (§3.3)
-  forms.ts               patch / dirty / "changed in another tab" logic for generated forms
+  forms.ts               patch / dirty / "changed in another tab" / visibleWhen / Reset logic for generated forms
+  settingsTree.ts        the settings screen's navigation: categories, pages from server data, #settings/… paths, back, the leave guard
+  setupChecklist.ts      the Overview's "Getting started" list
+  vault.ts               Keys & access logic: views, password checks, lock wording, the keys list
   prefs.ts               per-device preferences (localStorage)
 src/components/          one file per component of §3.11
-src/ui/registry.ts       the extension points: option tabs, stage overlays, field renderers
+src/components/settings/ the settings screen: SettingsShell (layer, hash sync, drill-down), SettingsNav, ServerPage
+                         (sections / module pages), FieldRow, usePageForms (several forms, one footer), PageFooter,
+                         ReloadBar, ModuleHeader; pages/ (Overview, Keys & access, This device, Diagnostics, About)
+src/ui/registry.ts       the extension points: settings pages, stage overlays, field renderers
 ```
 
 Data flow: socket → `decodeServerMessage` → `dispatch` → reducer → components (selectors). Reply audio never touches the store: binary frames go from `onmessage` straight to the player worklet (the whole `ArrayBuffer` is transferred, the worklet reads the turn id from the header). Microphone frames go from the capture worklet to `ws.send` with only the 8-byte header written in between. The visualiser reads `levels` and the analyser on `requestAnimationFrame`; React renders it once.
@@ -62,7 +70,7 @@ Data flow: socket → `decodeServerMessage` → `dispatch` → reducer → compo
 
 Nothing about specific modules, voices or settings is in the UI: modules, settings sections, voices, engines and status lines are rendered from the server's snapshot, so a new module or setting on the server appears without a front-end change.
 
-- **A new options panel**: write `src/components/MyTab.tsx` (a component with no props; read state with `useClientState`, act with `useClient()`), then add one line to `optionTabs` in `src/ui/registry.ts`: `{ id: "my-tab", title: "Mine", component: MyTab }` (optional `when: (state) => boolean`).
+- **A new settings page** (one the client provides): write a component with no props (read state with `useClientState`, act with `useClient()`), then add one line to `settingsPages` in `src/ui/registry.ts`: `{ group: "diagnostics", id: "mine", title: "Mine", order: 40, component: MyPage }`. Pages built from server data (settings sections, modules, agents) need no line: the server places them (`group`, `page`, `order`), and `#settings/<category>/<page>` deep-links to any page.
 - **A new element on the stage** (under the visualiser): a component plus one line in `stageOverlays` with a `when` predicate over the client state.
 - **A new settings field type** (a protocol change, see `packages/protocol/src/settings.ts`): write `src/components/fields/MyField.tsx` taking `FieldProps<…>` and add it to `fieldRenderers` in `src/ui/fieldRenderers.ts`. That record is typed by `SettingFieldType`, so a field type without a renderer is a compile error. Labels, descriptions, locked values, "Advanced", reload notes, errors and Save/Cancel are generic (`SettingsForm.tsx`).
 - **A new server message**: add a case to the reducer in `src/lib/state.ts`; the handler table is typed by `ServerMessageType`, so a missing one is a compile error.
@@ -78,7 +86,7 @@ The design in `docs/research/browser-audio.md` was never run; it is now verified
   runs dry mid-quantum (an underrun), playback resumes, a reply starts, ends or is replaced by another — a
   decaying offset bridges the jump over ~3 ms. Each underrun in a reply doubles the refill target (40 → 320 ms).
   After each reply the worklet posts a `stats` message (underruns, gap ms, clicks smoothed, lowest queue level)
-  that only the page reads (Options → This device → Audio diagnostics). Tests: continuity across uneven frames
+  that only the page reads (Settings → This device → Audio processing → Audio diagnostics). Tests: continuity across uneven frames
   at 48 / 44.1 / 24 kHz for 22.05 and 24 kHz replies (bit-identical to one frame), no steep steps at an
   underrun or at a cut.
 - **Microphone processing** is per device (`echoCancellation`, `noiseSuppression`, `autoGainControl` prefs);
@@ -86,4 +94,4 @@ The design in `docs/research/browser-audio.md` was never run; it is now verified
 - **Graph**: the analyser sits in the output path (player → analyser → destination) so it is always pulled.
 - Verified in headless Chromium without a sound card: the player runs at real time and reports `started`, `progress` (every ~250 ms), `finished` and `stopped`; outputLatency was reported as 53–63 ms, `startDelayMs` 0 (the first clause arrives whole). Both output paths (direct and media element) play.
 
-Not verifiable here (needs real hardware): whether the browser's echo canceller removes the assistant's voice (use Options → This device → Test echo), real `outputLatency` per device, speaker selection (`setSinkId`), Bluetooth, iOS/Safari/Firefox, the screen wake lock.
+Not verifiable here (needs real hardware): whether the browser's echo canceller removes the assistant's voice (use Settings → This device → Microphone & speaker → Test echo), real `outputLatency` per device, speaker selection (`setSinkId`), Bluetooth, iOS/Safari/Firefox, the screen wake lock.

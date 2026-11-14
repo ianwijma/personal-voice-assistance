@@ -78,7 +78,7 @@ describe("credentials never leak (decide-typesafe)", () => {
         for (const [what, fetch] of all) {
           const statuses: Array<string> = []
           const { exit, logs } = yield* withLogs(
-            Effect.scoped(makeJevDecider({ env: {}, fetch }).start({
+            Effect.scoped(makeJevDecider({ fetch }).start({
               settings: { apiKey: key, model: "jev-1.14.0", baseUrl: "http://upstream.test", timeoutMs: 150 },
               setStatus: (s) => {
                 if (s !== undefined) statuses.push(s.text)

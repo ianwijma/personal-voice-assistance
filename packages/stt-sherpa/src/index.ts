@@ -23,6 +23,7 @@ export {
   DEFAULT_PRESET,
   DEFAULT_VAD_THRESHOLD,
   defaultModelDir,
+  diskMb,
   DOWNLOAD_COMMAND,
   installedPresets,
   isPresetName,
@@ -33,5 +34,7 @@ export {
   presetNames,
   presets,
   resolvePresetName,
+  sizeMb,
   takesLanguage
 } from "./presets.ts"
+export { cleanPartials, deletePreset, DownloadError, type DownloadProgress, downloadPreset, isInstalled, presetArchives } from "./download.ts"

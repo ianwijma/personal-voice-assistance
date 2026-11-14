@@ -28,7 +28,8 @@ const rejectingHub = (): SessionHub & { rejected: number } => {
     ownerMode: () => undefined,
     closeAll: () => {},
     size: () => 0,
-    micFramesLost: () => 0
+    micFramesLost: () => 0,
+    vaultChanged: () => {}
   }
   return hub
 }

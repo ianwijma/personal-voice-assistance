@@ -60,17 +60,24 @@ const run = async (browser: Browser, size: "desktop" | "phone") => {
     await page.waitForTimeout(400)
     await shot("02-chat")
 
-    // Options: the real modules (clock expanded) and the assistant's settings sections.
+    // Settings (the file names still say "options"): a real module page, the Overview, and the voices page.
     if (size === "phone") await page.getByTestId("chat-panel").getByRole("button", { name: /close/i }).click() // the chat covers the page
-    await page.getByRole("button", { name: "Options (O)" }).click()
-    await page.getByTestId("options").waitFor()
-    await page.getByTestId("module-clock").getByRole("button", { name: /Clock/ }).click()
+    await page.getByRole("button", { name: "Settings (O)" }).click()
+    await page.getByTestId("settings").waitFor()
+    const open = async (group: string, id: string) => {
+      // On a phone, back up to the category list first (drill-down).
+      while (size === "phone" && await page.getByTestId("settings-back").isVisible()) await page.getByTestId("settings-back").click()
+      await page.getByTestId(`nav-${group}`).click()
+      if (await page.getByTestId(`nav-${group}-${id}`).isVisible()) await page.getByTestId(`nav-${group}-${id}`).click()
+      await page.getByTestId(`page-${group}-${id}`).waitFor()
+    }
+    await open("modules", "clock")
     await page.waitForTimeout(300)
     await shot("03-options-modules")
-    await page.getByRole("tab", { name: "Assistant" }).click()
+    await open("overview", "overview")
     await page.waitForTimeout(300)
     await shot("04-options-assistant")
-    await page.getByTestId("options").getByTestId("section-voices").scrollIntoViewIfNeeded()
+    await open("voices", "overview")
     await page.waitForTimeout(200)
     await shot("05-options-voices")
   } finally {

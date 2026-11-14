@@ -10,7 +10,7 @@ import { defaultJoinOptions, type JoinOptions } from "./Pcm.ts"
 import {
   DEFAULT_PRESET,
   defaultModelDir,
-  downloadCommand,
+  downloadHint,
   engineConfig,
   type Preset,
   presetFiles,
@@ -19,7 +19,8 @@ import {
 import { makeEngineTts } from "./SherpaTts.ts"
 
 export { defaultJoinOptions, type JoinOptions } from "./Pcm.ts"
-export { DEFAULT_PRESET, defaultModelDir, type EngineKind, type Preset, presets } from "./Presets.ts"
+export { DEFAULT_PRESET, defaultModelDir, type EngineKind, type Preset, presetFiles, presetLabel, presets, sizeMb } from "./Presets.ts"
+export { cleanPartials, deletePreset, DownloadError, type DownloadProgress, downloadPreset, isInstalled, presetArchive } from "./download.ts"
 
 export interface SherpaTtsOptions {
   /** Name of an entry of `presets`. Default `en_US-lessac-medium`. */
@@ -51,7 +52,7 @@ export const makeWithEngine = (options: SherpaTtsOptions = {}) =>
     const missing = Object.values(presetFiles(preset, modelDir)).find((file) => !existsSync(file))
     if (missing !== undefined) {
       return yield* new TtsError({
-        message: `Model file for TTS preset "${preset.name}" is missing: ${missing}. Run: ${downloadCommand(preset.name)}`
+        message: `Model file for TTS preset "${preset.name}" is missing: ${missing}. ${downloadHint(preset.name)}`
       })
     }
     const { module, config } = engineConfig(preset, modelDir, options.threads ?? preset.threads)

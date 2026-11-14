@@ -4,8 +4,10 @@ import { fileURLToPath } from "node:url"
 import { expect, type Page, test as base } from "@playwright/test"
 
 export const here = dirname(fileURLToPath(import.meta.url))
-export const MOCK = "http://127.0.0.1:8787"
-export const WS = "ws://127.0.0.1:8787/ws"
+/** The mock's port: 8787, or `E2E_MOCK_PORT` when something else (a running assistant) already has 8787. */
+export const MOCK_PORT = Number(process.env.E2E_MOCK_PORT ?? 8787)
+export const MOCK = `http://127.0.0.1:${MOCK_PORT}`
+export const WS = `ws://127.0.0.1:${MOCK_PORT}/ws`
 export const fakeMicPath = join(here, ".fixtures", "speech.wav")
 
 /**
@@ -49,7 +51,7 @@ export const writeFakeMic = () => {
   writeFileSync(fakeMicPath, Buffer.concat([header, data]))
 }
 
-export type Scenario = "voice" | "typed" | "modules" | "engine-failed" | "drop-mid-reply" | "takeover" | "outdated"
+export type Scenario = "voice" | "typed" | "modules" | "engine-failed" | "drop-mid-reply" | "takeover" | "outdated" | "vault" | "keys-locked"
 
 export interface MockLog {
   readonly scenario: string

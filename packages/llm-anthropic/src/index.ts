@@ -17,7 +17,10 @@ export type ThinkingMode = "disabled" | "adaptive"
 
 export interface AnthropicLlmOptions {
   readonly apiKey: Redacted.Redacted<string>
-  /** Defaults to the SDK default (`ANTHROPIC_BASE_URL` or api.anthropic.com). */
+  /**
+   * The API endpoint. Default `DEFAULT_BASE_URL`. Always passed to the SDK, so the SDK never falls back to reading
+   * `ANTHROPIC_BASE_URL` from `process.env` itself: the value comes from the settings (`config`), like the rest.
+   */
   readonly baseURL?: string
   readonly model: string
   readonly maxTokens: number
@@ -31,7 +34,11 @@ export interface AnthropicLlmOptions {
   readonly fetch?: typeof globalThis.fetch
 }
 
+/** The public API. */
+export const DEFAULT_BASE_URL = "https://api.anthropic.com"
+
 export const defaults = {
+  baseURL: DEFAULT_BASE_URL,
   model: "claude-haiku-5-5",
   maxTokens: 1024,
   effort: "low",
@@ -287,24 +294,23 @@ async function attempt(
 const ADDRESS_RULES = { protocols: ["http:", "https:"], query: false } as const
 
 /**
- * What the client needs, read and checked once; never throws. The address the
- * SDK would use (`baseURL`, else `ANTHROPIC_BASE_URL`) must carry no
- * credentials: the key goes in its own setting, and the SDK would put a
- * password into the URL of every error.
+ * What the client needs, read and checked once; never throws. The address
+ * (`baseURL`, default `DEFAULT_BASE_URL`; always passed, so the SDK never reads
+ * `ANTHROPIC_BASE_URL` from `process.env` itself) must carry no credentials:
+ * the key goes in its own setting, and the SDK would put a password into the
+ * URL of every error. A stray `ANTHROPIC_BASE_URL` in `process.env` is not used,
+ * but is masked like a secret all the same.
  */
 const prepare = (options: AnthropicLlmOptions): { readonly secrets: Secrets; readonly base?: string; readonly error?: LlmError } => {
   let secrets: Secrets = []
   try {
     // In steps: whatever was read before a getter throws is already masked.
     secrets = secretList(Redacted.value(options.apiKey))
-    const configured = options.baseURL ?? process.env.ANTHROPIC_BASE_URL
+    secrets = secretList(secrets, addressSecrets(process.env.ANTHROPIC_BASE_URL))
+    const configured = options.baseURL === undefined || options.baseURL.trim() === "" ? DEFAULT_BASE_URL : options.baseURL
     secrets = secretList(secrets, addressSecrets(configured))
-    if (configured === undefined || configured.trim() === "") return { secrets }
     const address = checkAddress(configured, ADDRESS_RULES)
-    if (!address.ok) {
-      const which = options.baseURL !== undefined ? "The Anthropic address" : "ANTHROPIC_BASE_URL"
-      return { secrets, error: llmError(secrets, `${which} ${address.problem}`) }
-    }
+    if (!address.ok) return { secrets, error: llmError(secrets, `The Anthropic address ${address.problem}`) }
     return { secrets, base: address.display }
   } catch (e) {
     return { secrets, error: llmError(secrets, `The Anthropic settings could not be read: ${fromUpstream(e, secrets)}`, e) }
@@ -340,7 +346,7 @@ const makeService = Effect.fnUntraced(function*(options: AnthropicLlmOptions) {
       client = new Anthropic({
         logger: { error: sdkLog("error"), warn: sdkLog("warn"), info: sdkLog("info"), debug: sdkLog("debug") },
         apiKey: Redacted.value(options.apiKey),
-        // The checked, credential-free form (the SDK would otherwise read ANTHROPIC_BASE_URL itself).
+        // The checked, credential-free form (always given: the SDK would otherwise read ANTHROPIC_BASE_URL itself).
         ...(prepared.base !== undefined ? { baseURL: prepared.base } : {}),
         timeout: options.timeoutMs,
         maxRetries: 0,
@@ -439,6 +445,7 @@ export const layer = (options: AnthropicLlmOptions): Layer.Layer<Llm> => Layer.e
 /** Options from the environment; everything but the API key has a default. */
 export const config = Config.all({
   apiKey: Config.Redacted("ANTHROPIC_API_KEY"),
+  baseURL: Config.String("ANTHROPIC_BASE_URL").pipe(Config.withDefault(DEFAULT_BASE_URL)),
   model: Config.String("ANTHROPIC_MODEL").pipe(Config.withDefault(defaults.model)),
   maxTokens: Config.Int("ANTHROPIC_MAX_TOKENS").pipe(Config.withDefault(defaults.maxTokens)),
   effort: Config.Literals(["low", "medium", "high"], "ANTHROPIC_EFFORT").pipe(

@@ -1,7 +1,10 @@
-import type {
-  ApplyMode,
-  ChoiceOption,
-  FieldError,
+import {
+  type ApplyMode,
+  type ChoiceOption,
+  type Condition,
+  evaluateCondition,
+  type FieldError,
+  type FieldSource,
   SecretState,
   SettingField,
   SettingsForm,
@@ -23,6 +26,12 @@ import type {
  * and it is set to a non-empty value; the field is then locked in the UI) >
  * saved value > default. For secrets: environment variable > saved secret > not set.
  *
+ * A field with `visibleWhen` is shown only while its condition holds (keys may
+ * name fields of other sections, through `SettingsSources.context`). A hidden
+ * field is never validated: its saved value stays, problems with it are not
+ * reported, a patch that names it is ignored for it, and the module or
+ * provider gets its value if valid, else its default.
+ *
  * See docs/UI-AND-MODULES.md §1.
  */
 
@@ -37,6 +46,8 @@ interface SettingCommon {
   readonly apply?: ApplyMode
   /** Environment variable that, when set, provides the value and locks the field. */
   readonly env?: string
+  /** Shown (and validated) only while this holds. */
+  readonly visibleWhen?: Condition
 }
 
 /** One setting. `A` is the type the module receives. */
@@ -52,6 +63,8 @@ export interface Setting<A> {
   readonly decode: (raw: unknown) => Decoded<A>
   /** Parse the text of an environment variable. */
   readonly fromEnv: (text: string) => Decoded<A>
+  /** When the field is shown (and validated); absent = always. */
+  readonly visibleWhen?: Condition
 }
 
 export type SettingsSpec = { readonly [key: string]: Setting<any> }
@@ -65,8 +78,12 @@ const commonFields = (key: string, options: SettingCommon) => ({
   label: options.label,
   apply: options.apply ?? "live",
   ...(options.description !== undefined ? { description: options.description } : {}),
-  ...(options.advanced !== undefined ? { advanced: options.advanced } : {})
+  ...(options.advanced !== undefined ? { advanced: options.advanced } : {}),
+  ...(options.visibleWhen !== undefined ? { visibleWhen: options.visibleWhen } : {})
 })
+
+/** The `visibleWhen` of a constructor's options, for the `Setting` itself. */
+const visibility = (options: SettingCommon) => (options.visibleWhen !== undefined ? { visibleWhen: options.visibleWhen } : {})
 
 const text = (options: SettingCommon & {
   readonly default?: string
@@ -86,6 +103,7 @@ const text = (options: SettingCommon & {
   return {
     type: "text",
     secret: false,
+    ...visibility(options),
     env: options.env,
     defaultValue: options.default ?? "",
     describe: (key) => ({
@@ -115,6 +133,7 @@ const secret = (options: Omit<SettingCommon, "advanced"> & {
   return {
     type: "secret",
     secret: true,
+    ...visibility(options),
     required: options.required ?? false,
     env: options.env,
     defaultValue: undefined,
@@ -143,6 +162,7 @@ const number = (options: SettingCommon & {
   return {
     type: "number",
     secret: false,
+    ...visibility(options),
     env: options.env,
     defaultValue: options.default,
     describe: (key) => ({
@@ -165,6 +185,7 @@ const boolean = (options: SettingCommon & { readonly default: boolean }): Settin
   return {
     type: "boolean",
     secret: false,
+    ...visibility(options),
     env: options.env,
     defaultValue: options.default,
     describe: (key) => ({ type: "boolean", ...commonFields(key, options), default: options.default }),
@@ -192,6 +213,7 @@ const choice = <const V extends string>(options: SettingCommon & {
   return {
     type: "choice",
     secret: false,
+    ...visibility(options),
     env: options.env,
     defaultValue: options.default,
     describe: (key) => ({ type: "choice", ...commonFields(key, options), default: options.default, options: options.options }),
@@ -215,6 +237,7 @@ const multichoice = <const V extends string>(options: SettingCommon & {
   return {
     type: "multichoice",
     secret: false,
+    ...visibility(options),
     env: options.env,
     defaultValue: options.default,
     describe: (key) => ({ type: "multichoice", ...commonFields(key, options), default: options.default, options: options.options }),
@@ -226,7 +249,7 @@ const multichoice = <const V extends string>(options: SettingCommon & {
 /** Constructors for settings fields. */
 export const Setting = { text, secret, number, boolean, choice, multichoice }
 
-/** Where setting values come from. All three are plain records so they are easy to fake in tests. */
+/** Where setting values come from. Plain records and functions, so they are easy to fake in tests. */
 export interface SettingsSources {
   /** Saved values (the module's or section's entry in the settings file). */
   readonly stored: Readonly<Record<string, unknown>>
@@ -234,7 +257,22 @@ export interface SettingsSources {
   readonly secrets: Readonly<Record<string, string>>
   /** The process environment (including `.env`). */
   readonly env: Readonly<Record<string, string | undefined>>
+  /** Where an environment variable came from (`.env` file or the process). Default: `env-process`. */
+  readonly envOrigin?: (name: string) => "env-file" | "env-process"
+  /** The `.env` file and line of a variable from a file (shown on the locked field, docs/SETTINGS-UI.md §4.4). */
+  readonly envLocation?: (name: string) => { readonly file: string; readonly line: number } | undefined
+  /** Effective values of fields outside this spec (other sections), for `visibleWhen`. */
+  readonly context?: (key: string) => unknown
 }
+
+/** Is the field shown, given the effective values of its own form (`values`) and of the others (`context`)? */
+export const isVisible = (
+  setting: { readonly visibleWhen?: Condition | undefined },
+  values: Readonly<Record<string, unknown>>,
+  context: ((key: string) => unknown) | undefined
+): boolean =>
+  setting.visibleWhen === undefined ||
+  evaluateCondition(setting.visibleWhen, (key) => (Object.hasOwn(values, key) ? values[key] : context?.(key)))
 
 export interface ResolvedSettings<A> {
   /** The settings the module receives; `undefined` when any field has an error. */
@@ -254,49 +292,66 @@ export const resolveSettings = <S extends SettingsSpec>(spec: S, sources: Settin
   const fields: Array<SettingField> = []
   const values: Record<string, SettingValue> = {}
   const secrets: Record<string, SecretState> = {}
-  const errors: Array<FieldError> = []
+  const problems: Array<FieldError> = []
   const result: Record<string, unknown> = {}
+  const origin = (name: string): FieldSource => sources.envOrigin?.(name) ?? "env-process"
+  const lock = (name: string, source: FieldSource) => {
+    const at = source === "env-file" ? sources.envLocation?.(name) : undefined
+    return at === undefined ? { reason: lockReason(name, source) } : { reason: lockReason(name, source, at), file: at.file, line: at.line }
+  }
 
   for (const [key, setting] of Object.entries(spec)) {
     const fromEnv = envValue(setting, sources.env)
     const described = setting.describe(key)
-    fields.push(fromEnv === undefined ? described : { ...described, locked: { reason: `Set by ${setting.env} in the environment` } })
 
     if (setting.secret) {
       const stored = sources.secrets[key]
       const value = fromEnv ?? (stored !== undefined && stored.length > 0 ? stored : undefined)
       secrets[key] = { set: value !== undefined, source: fromEnv !== undefined ? "env" : value !== undefined ? "store" : "none" }
+      const source: FieldSource = fromEnv !== undefined ? origin(setting.env!) : value !== undefined ? "saved" : "default"
+      fields.push(fromEnv === undefined ? { ...described, source } : { ...described, source, locked: lock(setting.env!, source) })
       if (value === undefined && (setting as { readonly required?: boolean }).required === true) {
-        errors.push({ key, message: setting.env === undefined ? "Not set" : `Not set (enter it here or set ${setting.env})` })
+        problems.push({ key, message: setting.env === undefined ? "Not set" : `Not set (enter it here or set ${setting.env})` })
       }
       result[key] = value
       continue
     }
 
     let decoded: Decoded<unknown>
+    let source: FieldSource
     if (fromEnv !== undefined) {
+      source = origin(setting.env!)
       decoded = setting.fromEnv(fromEnv)
       if (!decoded.ok) decoded = fail(`${setting.env}=${fromEnv} is not valid: ${decoded.error}`)
     } else if (Object.hasOwn(sources.stored, key)) {
+      source = "saved"
       decoded = setting.decode(sources.stored[key])
       if (!decoded.ok) decoded = fail(`The saved value is not valid (${decoded.error}); save a new one`)
     } else {
+      source = "default"
       decoded = ok(setting.defaultValue)
     }
+    fields.push(fromEnv === undefined ? { ...described, source } : { ...described, source, locked: lock(setting.env!, source) })
     if (decoded.ok) {
       values[key] = decoded.value as SettingValue
       result[key] = decoded.value
     } else {
       values[key] = setting.defaultValue as SettingValue
-      errors.push({ key, message: decoded.error })
+      result[key] = setting.defaultValue
+      problems.push({ key, message: decoded.error })
     }
   }
 
+  // Hidden fields are not validated: their problems are not reported (their value is the default when invalid).
+  const errors = problems.filter((e) => e.key === null || isVisible(spec[e.key]!, values, sources.context))
   return {
     value: errors.length === 0 ? (result as SettingsOf<S>) : undefined,
     form: { fields, values, secrets, errors }
   }
 }
+
+const lockReason = (env: string, source: FieldSource, at?: { readonly file: string; readonly line: number }) =>
+  source !== "env-file" ? `Set by ${env} in the environment` : at === undefined ? `Set by ${env} in .env` : `Set by ${env} in ${at.file}, line ${at.line}`
 
 export type PatchResult =
   | {
@@ -313,7 +368,13 @@ export type PatchResult =
  * field set by the environment cannot be changed. All or nothing. Pure: the
  * caller persists the result and restarts the module with it.
  */
-export const applySettingsPatch = (spec: SettingsSpec, sources: SettingsSources, patch: SettingsPatch): PatchResult => {
+export const applySettingsPatch = (
+  spec: SettingsSpec,
+  sources: SettingsSources,
+  patch: SettingsPatch,
+  /** `includeHidden`: save fields whose `visibleWhen` does not hold too ("Move to settings" keeps every value). */
+  options: { readonly includeHidden?: boolean } = {}
+): PatchResult => {
   const stored: Record<string, SettingValue> = {}
   for (const [key, value] of Object.entries(sources.stored)) {
     if (Object.hasOwn(spec, key)) stored[key] = value as SettingValue
@@ -323,6 +384,26 @@ export const applySettingsPatch = (spec: SettingsSpec, sources: SettingsSources,
     if (Object.hasOwn(spec, key)) secrets[key] = value
   }
   const errors: Array<FieldError> = []
+
+  // Visibility is judged on the values after the patch (a patch that chooses Deepgram shows its fields).
+  const after: Record<string, unknown> = {}
+  for (const [key, setting] of Object.entries(spec)) {
+    if (setting.secret) continue
+    const fromEnv = envValue(setting, sources.env)
+    const raw = fromEnv !== undefined
+      ? setting.fromEnv(fromEnv)
+      : Object.hasOwn(patch.values, key) && patch.values[key] !== null
+      ? setting.decode(patch.values[key])
+      : Object.hasOwn(patch.values, key) || !Object.hasOwn(sources.stored, key)
+      ? ok(setting.defaultValue)
+      : setting.decode(sources.stored[key])
+    after[key] = raw.ok ? raw.value : setting.defaultValue
+  }
+  const hidden = (key: string) => {
+    if (options.includeHidden === true) return false
+    const setting = Object.hasOwn(spec, key) ? spec[key] : undefined
+    return setting !== undefined && !isVisible(setting, after, sources.context)
+  }
 
   const check = (key: string, wantSecret: boolean): Setting<unknown> | undefined => {
     const setting = Object.hasOwn(spec, key) ? spec[key] : undefined
@@ -342,6 +423,7 @@ export const applySettingsPatch = (spec: SettingsSpec, sources: SettingsSources,
   }
 
   for (const [key, raw] of Object.entries(patch.values)) {
+    if (hidden(key)) continue // not validated, not changed: its saved value stays
     const setting = check(key, false)
     if (setting === undefined) continue
     if (raw === null) {
@@ -353,6 +435,7 @@ export const applySettingsPatch = (spec: SettingsSpec, sources: SettingsSources,
     else errors.push({ key, message: decoded.error })
   }
   for (const [key, raw] of Object.entries(patch.secrets)) {
+    if (hidden(key)) continue
     const setting = check(key, true)
     if (setting === undefined) continue
     if (raw === null) {
@@ -365,4 +448,43 @@ export const applySettingsPatch = (spec: SettingsSpec, sources: SettingsSources,
   }
 
   return errors.length > 0 ? { ok: false, errors } : { ok: true, stored, secrets }
+}
+
+/**
+ * Cross-field checks of a settings section (docs/SETTINGS-UI.md §3.3): run on
+ * save against the values the save would produce (of every section: keys are
+ * global). An `error` refuses the save, under the named field; a `warning`
+ * refuses it only until the owner confirms ("Save anyway"), and is shown on
+ * the form while the saved values still have it.
+ */
+export interface SettingsCheckView {
+  /** The effective value of any non-secret field (environment > saved > default). */
+  readonly value: (key: string) => unknown
+  /** Whether a secret is set (environment or saved). */
+  readonly secretSet: (key: string) => boolean
+}
+
+export interface SettingsProblem extends FieldError {
+  readonly level: "error" | "warning"
+}
+
+export type SettingsCheck = (view: SettingsCheckView) => ReadonlyArray<SettingsProblem>
+
+/** Run checks; their results split into errors and warnings. A check that throws is skipped. */
+export const runSettingsChecks = (
+  checks: ReadonlyArray<SettingsCheck>,
+  view: SettingsCheckView
+): { readonly errors: ReadonlyArray<FieldError>; readonly warnings: ReadonlyArray<FieldError> } => {
+  const errors: Array<FieldError> = []
+  const warnings: Array<FieldError> = []
+  for (const check of checks) {
+    let problems: ReadonlyArray<SettingsProblem>
+    try {
+      problems = check(view)
+    } catch {
+      continue
+    }
+    for (const p of problems) (p.level === "error" ? errors : warnings).push({ key: p.key, message: p.message })
+  }
+  return { errors, warnings }
 }

@@ -26,7 +26,10 @@ const llmProviders = {
     const tokensPerSecond = yield* Config.Finite("BENCH_LLM_TOKENS_PER_S").pipe(Config.withDefault(60))
     return FakeLlm.layerTimed({ firstTokenMs: firstTokenMs.value, tokensPerSecond })
   })),
-  anthropic: AnthropicLlm.layerConfig
+  anthropic: AnthropicLlm.layerConfig,
+  // The language model is the claude-subscription agent module (Claude Code with the owner's login), chosen per
+  // turn from the running modules; this offline stand-in answers, with a notice, while that module is not running.
+  "claude-subscription": FakeLlm.layer
 }
 
 /** `sherpa` runs on this machine (models in `models/`); `deepgram` is hosted. */
@@ -81,7 +84,7 @@ export const choose = <M extends Record<string, unknown>>(name: string, provider
     Config.map((key) => providers[key]!)
   )
 
-/** `LLM_PROVIDER`: `fake` (default, offline) | `anthropic`. */
+/** `LLM_PROVIDER`: `fake` (default, offline) | `anthropic` | `claude-subscription` (see `subscription.ts`). */
 export const LlmLayer: Layer.Layer<Llm, Config.ConfigError> = Layer.unwrap(choose("LLM_PROVIDER", llmProviders, "fake"))
 
 /** `STT_PROVIDER`: `sherpa` (default, local) | `deepgram`. A local model is loaded when the layer is built. */

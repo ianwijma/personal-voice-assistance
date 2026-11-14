@@ -1,6 +1,6 @@
 import "./env.ts" // first: loads .env before anything reads the environment
 import { NodeRuntime } from "@effect/platform-node"
-import { Conversation, ToolRegistry, TurnTrace } from "@pva/core"
+import { Conversation, Llm, ToolRegistry, TurnTrace } from "@pva/core"
 import { Cause, Config, Effect, Layer, Logger, Stream } from "effect"
 import { resolve } from "node:path"
 import * as readline from "node:readline"
@@ -16,7 +16,10 @@ import { LlmLayer, SttLayer, TtsLayer } from "./providers.ts"
 import { sayCommand } from "./say.ts"
 import { DataDirLockError } from "./serve/DataDirLock.ts"
 import { serveMode } from "./serve/serveMode.ts"
-import { SettingsStoreError } from "./serve/SettingsStore.ts"
+import { DataDirConfig, SettingsStoreError } from "./serve/SettingsStore.ts"
+import { VaultPathConfig } from "./serve/Vault.ts"
+import { askVaultPassword, type CliSettings, CliSettingsRef, explainMissingKey, withCliSettings } from "./cliSettings.ts"
+import { makeSubscriptionAgents, SUBSCRIPTION_AGENT_ID, SUBSCRIPTION_PROVIDER } from "./subscription.ts"
 import { buildProviders, describeConfigError, StartupError } from "./startup.ts"
 import { runTextTurns } from "./text.ts"
 import { compareModelsCommand } from "./compareModels.ts"
@@ -44,11 +47,25 @@ const StderrLogger = Logger.layer([
 
 // Text mode uses the same system prompt as voice mode (including the voice
 // instructions), so the model behaves the same; markers are stripped from the output.
+// LLM_PROVIDER=claude-subscription: the claude-subscription agent module (switched on and opted in from the web UI,
+// or with CLAUDE_SUBSCRIPTION_OPT_IN) answers; the offline stand-in answers, with a notice, when it is not running.
 const ConversationLayer = Layer.unwrap(Effect.gen(function*() {
   const settings = yield* AppConfig
   const voices = yield* loadVoiceSettings
   const modules = yield* startCliModules()
   const systemPrompt = withVoicePrompt(withModuleInstructions(settings.systemPrompt, modules.instructions), voices)
+  const llmProvider = yield* Config.String("LLM_PROVIDER").pipe(Config.withDefault("fake"))
+  if (llmProvider === SUBSCRIPTION_PROVIDER) {
+    const fallbackLlm = yield* Llm
+    const toAgents = makeSubscriptionAgents({
+      fallbackLlm,
+      agents: () => modules.agents,
+      module: () => modules.infos.find((m) => m.id === SUBSCRIPTION_AGENT_ID),
+      promptFor: (agent, turn) =>
+        agent.systemPrompt === undefined ? turn.system : withVoicePrompt(withModuleInstructions(agent.systemPrompt, modules.instructions), voices)
+    })
+    return Conversation.layerWithAgents({ ...settings, setup: Effect.succeed(toAgents({ system: systemPrompt, registry: modules.registry })) })
+  }
   return Conversation.layer({ ...settings, systemPrompt }).pipe(Layer.provide(Layer.succeed(ToolRegistry, modules.registry)))
 })).pipe(
   Layer.provide(Layer.mergeAll(LlmLayer, TurnTrace.layer()))
@@ -171,16 +188,36 @@ const program: Effect.Effect<void, unknown> = mode === "text"
       "say [--voice NAME] [--out FILE] <text> | transcribe <wav file> | compare-models [--models a,b] [--agc on|off|both] [--ref TEXT] <wavs>]"
   })
 
+/**
+ * CLI modes read the saved settings and the key vault's keys behind the environment, like serve mode
+ * (`cliSettings.ts`). The vault password comes from PVA_VAULT_PASSWORD, or is asked for on a terminal.
+ */
+let cliSettings: CliSettings | undefined
+const withSavedSettings = <A, E>(effect: Effect.Effect<A, E>): Effect.Effect<A, E> =>
+  Effect.gen(function*() {
+    const dataDir = yield* DataDirConfig.pipe(Effect.orDie)
+    const vaultPath = yield* VaultPathConfig.pipe(Effect.orDie)
+    const interactive = process.stdin.isTTY === true && process.stderr.isTTY === true
+    return yield* withCliSettings(
+      Effect.flatMap(Effect.service(CliSettingsRef), (settings) => {
+        cliSettings = settings
+        return effect
+      }),
+      { env: process.env, dataDir, vaultPath, ...(interactive ? { prompt: askVaultPassword } : {}) }
+    )
+  })
+
 NodeRuntime.runMain(
-  program.pipe(
+  (mode === "serve" ? program : withSavedSettings(program)).pipe(
     Effect.catch((e) => {
-      const message = e instanceof StartupError
+      const described = e instanceof StartupError
         ? e.message
         : e instanceof Config.ConfigError
         ? describeConfigError(e)
         : e instanceof DataDirLockError || e instanceof SettingsStoreError
         ? e.message // says what to do (another server on the data directory, an unfinished save that cannot be finished)
         : undefined
+      const message = described === undefined ? undefined : explainMissingKey(described, cliSettings)
       if (message === undefined) return Effect.fail(e)
       return Effect.sync(() => {
         process.stderr.write(`${message}\n`)

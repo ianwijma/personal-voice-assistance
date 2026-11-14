@@ -1,10 +1,10 @@
 "use client"
 import { PROTOCOL_VERSION } from "@pva/protocol"
 import { shallowEqual } from "@/lib/store.ts"
-import { useClientState } from "./context.tsx"
-import { ShortcutList } from "./ShortcutsDialog.tsx"
+import { useClientState } from "../../context.tsx"
+import { ShortcutList } from "../../ShortcutsDialog.tsx"
 
-export function AboutTab() {
+export function AboutPage() {
   const c = useClientState((s) => s.connection, shallowEqual)
   const rows: ReadonlyArray<readonly [string, string]> = [
     ["Assistant", c.server === undefined ? "—" : `${c.server.name} ${c.server.version}`],
@@ -24,7 +24,7 @@ export function AboutTab() {
       </dl>
       <section>
         <h3 className="label text-ink-faint">Keyboard</h3>
-        <div className="-mx-5">
+        <div className="-mx-5 sm:-mx-8">
           <ShortcutList />
         </div>
       </section>

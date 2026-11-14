@@ -1724,8 +1724,11 @@ enabled in the running engines the result says "Enable this voice and reload the
 ### 4.5 Secrets
 
 Unchanged handling, applied to the new keys: OpenRouter, home server, TypeSafe, Home Assistant, Cartesia, Deepgram keys are
-`secret` fields (write-only from the browser, `secrets.json` at 0600, environment wins). Subscription agents hold no
-secrets at all: the CLIs keep their own logins.
+`secret` fields (write-only from the browser, environment wins). Since 2026-11-14 they are stored in the encrypted key
+vault outside the project once the owner sets a password (before that, `secrets.json` at 0600), and agent modules and any
+form with a secret are **protected**: only a page where the vault password was typed may change them
+(docs/UI-AND-MODULES.md §1.6). Subscription agents hold no secrets at all: the CLIs keep their own logins, and the Claude
+Code subprocess gets an allowlisted environment only.
 
 ---
 

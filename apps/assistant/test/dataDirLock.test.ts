@@ -16,7 +16,7 @@ import {
   setFlockProgramForTests
 } from "../src/serve/DataDirLock.ts"
 import { loadSettingsStore } from "../src/serve/SettingsStore.ts"
-import { openStore } from "./support/store.ts"
+import { openStore, saveSection, sectionOf } from "./support/store.ts"
 
 const fresh = () => mkdtempSync(join(tmpdir(), "pva-lock-"))
 const onDisk = (dir: string, file: string) => existsSync(join(dir, file)) ? JSON.parse(readFileSync(join(dir, file), "utf8")) : undefined
@@ -260,8 +260,8 @@ describe("DataDirLock: one writer", () => {
           assert.strictEqual(readFileSync(join(dir, "secrets.json"), "utf8"), before.secrets)
         }
       })
-      yield* a.saveSection("language-model", { LLM_PROVIDER: "anthropic" }, { ANTHROPIC_API_KEY: "k1" })
-      yield* a.saveSection("language-model", { LLM_PROVIDER: "fake" }, {})
+      yield* saveSection(a, "language-model", { LLM_PROVIDER: "anthropic" }, { ANTHROPIC_API_KEY: "k1" })
+      yield* saveSection(a, "language-model", { LLM_PROVIDER: "fake" }, {})
       assert.deepStrictEqual(seen, ["refused", "refused"])
       assert.isFalse(existsSync(join(dir, "transaction.json")))
     }))
@@ -270,20 +270,20 @@ describe("DataDirLock: one writer", () => {
     Effect.gen(function*() {
       const dir = fresh()
       const a = yield* openStore(dir)
-      yield* a.saveSection("language-model", { LLM_PROVIDER: "anthropic" }, { ANTHROPIC_API_KEY: "k1" })
+      yield* saveSection(a, "language-model", { LLM_PROVIDER: "anthropic" }, { ANTHROPIC_API_KEY: "k1" })
       const before = readdirSync(dir).sort()
       const reader = yield* loadSettingsStore(dir, { readOnly: true })
-      assert.deepStrictEqual(reader.secrets().sections["language-model"], { ANTHROPIC_API_KEY: "k1" })
+      assert.deepStrictEqual(sectionOf(reader.secrets(), "language-model"), { ANTHROPIC_API_KEY: "k1" })
       assert.deepStrictEqual(readdirSync(dir).sort(), before)
       // A journal left mid-save: the reader uses the state it resolves to, and leaves the journal for the writer.
       const journal = { version: 1, prior: { settings: readFileSync(join(dir, "settings.json"), "utf8"), secrets: readFileSync(join(dir, "secrets.json"), "utf8") }, next: { settings: "{\"version\":1,\"modules\":{},\"sections\":{}}\n", secrets: "{\"version\":1,\"modules\":{},\"sections\":{}}\n" } }
       writeFileSync(join(dir, "transaction.json"), JSON.stringify(journal), { mode: 0o600 })
       const midSave = yield* loadSettingsStore(dir, { readOnly: true })
-      assert.deepStrictEqual(midSave.secrets().sections["language-model"], { ANTHROPIC_API_KEY: "k1" })
+      assert.deepStrictEqual(sectionOf(midSave.secrets(), "language-model"), { ANTHROPIC_API_KEY: "k1" })
       assert.isTrue(existsSync(join(dir, "transaction.json")))
       // ... and its saves are ignored.
-      yield* midSave.saveSection("language-model", { LLM_PROVIDER: "fake" }, {})
-      assert.deepStrictEqual(onDisk(dir, "settings.json").sections["language-model"], { LLM_PROVIDER: "anthropic" })
+      yield* saveSection(midSave, "language-model", { LLM_PROVIDER: "fake" }, {})
+      assert.deepStrictEqual(sectionOf(onDisk(dir, "settings.json"), "language-model"), { LLM_PROVIDER: "anthropic" })
     }))
 })
 
@@ -291,14 +291,15 @@ describe("SettingsStore: journals that cannot be used", () => {
   const committed = (dir: string) =>
     Effect.gen(function*() {
       const s = yield* openStore(dir)
-      yield* s.saveSection("language-model", { LLM_PROVIDER: "anthropic" }, { ANTHROPIC_API_KEY: "k1" })
+      yield* saveSection(s, "language-model", { LLM_PROVIDER: "anthropic" }, { ANTHROPIC_API_KEY: "k1" })
     })
 
   it.effect("a journal from a newer version stops the start with what to do, and is left alone", () =>
     Effect.gen(function*() {
       const dir = fresh()
       yield* committed(dir)
-      writeFileSync(join(dir, "transaction.json"), JSON.stringify({ version: 2, whatever: true }), { mode: 0o600 })
+      // Version 2 is this version's own (it names where the secrets are); 3 is from a newer one.
+      writeFileSync(join(dir, "transaction.json"), JSON.stringify({ version: 3, whatever: true }), { mode: 0o600 })
       const result = yield* Effect.result(openStore(dir))
       assert.strictEqual(result._tag, "Failure")
       if (result._tag === "Failure") {
@@ -317,9 +318,9 @@ describe("SettingsStore: journals that cannot be used", () => {
           if (halfApplied) {
             // The finding's case: a save replaced secrets.json, crashed before settings.json, and its journal is damaged.
             const s = yield* openStore(dir, { beforeStep: (step) => { if (step === "settings" || step === "rollback") throw new Error("crash") } })
-            yield* Effect.result(s.saveSection("language-model", { LLM_PROVIDER: "fake" }, { ANTHROPIC_API_KEY: "k2" }))
-            assert.strictEqual(onDisk(dir, "secrets.json").sections["language-model"].ANTHROPIC_API_KEY, "k2", "new secrets, old settings")
-            assert.strictEqual(onDisk(dir, "settings.json").sections["language-model"].LLM_PROVIDER, "anthropic")
+            yield* Effect.result(saveSection(s, "language-model", { LLM_PROVIDER: "fake" }, { ANTHROPIC_API_KEY: "k2" }))
+            assert.strictEqual(sectionOf(onDisk(dir, "secrets.json"), "language-model").ANTHROPIC_API_KEY, "k2", "new secrets, old settings")
+            assert.strictEqual(sectionOf(onDisk(dir, "settings.json"), "language-model").LLM_PROVIDER, "anthropic")
           }
           const files = { settings: readFileSync(join(dir, "settings.json"), "utf8"), secrets: readFileSync(join(dir, "secrets.json"), "utf8") }
           writeFileSync(join(dir, "transaction.json"), journal, { mode: 0o644 })
@@ -344,13 +345,13 @@ describe("SettingsStore: journals that cannot be used", () => {
             let unblocked = 0
             again.onUnblocked(() => unblocked++)
             // Saving without a change is the owner's word that the settings are right.
-            yield* again.saveSection("language-model", again.settings().sections["language-model"] as any, again.secrets().sections["language-model"] ?? {})
+            yield* saveSection(again, "language-model", sectionOf(again.settings(), "language-model") as any, sectionOf(again.secrets(), "language-model") ?? {})
             assert.isUndefined(again.blocked())
             assert.strictEqual(unblocked, 1)
             assert.isUndefined((yield* openStore(dir)).blocked())
           } else {
             // The next successful save removes it: the state on disk is then one the owner saved since.
-            yield* store.saveSection("language-model", { LLM_PROVIDER: "fake" }, {})
+            yield* saveSection(store, "language-model", { LLM_PROVIDER: "fake" }, {})
           }
           assert.deepStrictEqual(readdirSync(dir).filter((n) => n.startsWith("transaction.json")), [])
         }
@@ -374,7 +375,7 @@ describe("SettingsStore: journals that cannot be used", () => {
       }
       assert.isTrue(existsSync(join(dir, "transaction.json")), "kept, so a later start can finish it")
       const later = yield* openStore(dir)
-      assert.deepStrictEqual(later.secrets().sections["language-model"], { ANTHROPIC_API_KEY: "k1" }, "the state before the save")
+      assert.deepStrictEqual(sectionOf(later.secrets(), "language-model"), { ANTHROPIC_API_KEY: "k1" }, "the state before the save")
       assert.isFalse(existsSync(join(dir, "transaction.json")))
     }))
 

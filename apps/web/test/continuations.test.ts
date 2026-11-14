@@ -34,11 +34,13 @@ const FILES = [
   "src/lib/audio/lifecycle.ts",
   // Fifth review: outside the lifecycle, but they await and then act.
   "src/lib/echoTest.ts",
-  "src/components/DeviceTab.tsx",
-  "src/components/AssistantTab.tsx",
+  // The settings screen (docs/SETTINGS-UI.md) replaced DeviceTab, AssistantTab, ModuleCard and SettingsForm.
+  "src/components/settings/pages/DevicePages.tsx",
+  "src/components/settings/ReloadBar.tsx",
+  "src/components/settings/ServerPage.tsx",
+  "src/components/settings/ModuleHeader.tsx",
+  "src/components/settings/usePageForms.ts",
   "src/components/Composer.tsx",
-  "src/components/ModuleCard.tsx",
-  "src/components/SettingsForm.tsx",
   "src/components/Toasts.tsx"
 ] as const
 

@@ -3,17 +3,19 @@ import {
   AudioInput,
   Conversation,
   formatTrace,
+  Llm,
   type Message,
   Stt,
   stripVoiceMarkers,
   ToolRegistry,
   type Trace
 } from "@pva/core"
-import { Config, Effect, Layer, Stream } from "effect"
+import { Config, Context, Effect, Layer, Stream } from "effect"
 import { AppConfig } from "./config.ts"
 import { startCliModules, withModuleInstructions } from "./modules.ts"
 import { AudioLayer, LlmLayer, SttLayer } from "./providers.ts"
 import { buildProviders, observedTurnTraceLayer, StartupError } from "./startup.ts"
+import { makeSubscriptionAgents, SUBSCRIPTION_AGENT_ID, SUBSCRIPTION_PROVIDER } from "./subscription.ts"
 import { loadVoiceSettings, voiceStages, withVoicePrompt, withVoiceRouter } from "./voices.ts"
 
 /** The assistant's words in `messages` (one turn's worth of history), without voice markers. */
@@ -69,9 +71,20 @@ export const voiceMode = Effect.scoped(Effect.gen(function*() {
   const services = Layer.succeedContext(providers)
   const modules = yield* startCliModules()
   const systemPrompt = withVoicePrompt(withModuleInstructions(settings.systemPrompt, modules.instructions), voices)
-  const ConversationLive = Conversation.layer({ ...settings, systemPrompt }).pipe(
-    Layer.provide(Layer.mergeAll(services, Layer.succeed(ToolRegistry, modules.registry), observedTurnTraceLayer(onFinish)))
-  )
+  const ConversationLive = (llmProvider === SUBSCRIPTION_PROVIDER
+    ? Conversation.layerWithAgents({
+      ...settings,
+      setup: Effect.succeed(makeSubscriptionAgents({
+        fallbackLlm: Context.get(built as Context.Context<Llm>, Llm),
+        agents: () => modules.agents,
+        module: () => modules.infos.find((m) => m.id === SUBSCRIPTION_AGENT_ID),
+        promptFor: (agent, turn) =>
+          agent.systemPrompt === undefined ? turn.system : withVoicePrompt(withModuleInstructions(agent.systemPrompt, modules.instructions), voices)
+      })({ system: systemPrompt, registry: modules.registry }))
+    })
+    : Conversation.layer({ ...settings, systemPrompt })).pipe(
+      Layer.provide(Layer.mergeAll(services, Layer.succeed(ToolRegistry, modules.registry), observedTurnTraceLayer(onFinish)))
+    )
 
   yield* Effect.gen(function*() {
     const conversation = yield* Conversation

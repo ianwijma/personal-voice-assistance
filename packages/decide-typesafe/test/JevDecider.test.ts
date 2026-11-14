@@ -5,8 +5,10 @@ import {
   defineAction,
   type ExtendedModuleInstance,
   interpretDecision,
+  makeModuleHost,
   ModuleStartError,
   Param,
+  readOnlyPersistence,
   registerActions
 } from "@pva/core"
 import { Effect, Exit, Fiber, Redacted } from "effect"
@@ -260,17 +262,17 @@ describe("jev-typesafe module", () => {
   const settings = (url: string) => ({ apiKey: "ts-test", model: "jev-1.14.0", baseUrl: url, timeoutMs: 1_000 })
 
   const start = (url: string, statuses: Array<string> = []): Effect.Effect<ExtendedModuleInstance, ModuleStartError> =>
-    Effect.scoped(makeJevDecider({ env: {} }).start({
+    Effect.scoped(makeJevDecider().start({
       settings: settings(url),
       setStatus: (s) => {
         if (s !== undefined) statuses.push(`${s.tone}: ${s.text}`)
       }
     }))
 
-  it("is enabled by default only when TYPESAFE_API_KEY is set, and declares its settings", () => {
-    assert.isFalse(makeJevDecider({ env: {} }).enabledByDefault)
-    assert.isTrue(makeJevDecider({ env: { TYPESAFE_API_KEY: "x" } }).enabledByDefault)
-    const def = makeJevDecider({ env: {} })
+  it("is enabled by default only once its key is set (decided by the host), and declares its settings", () => {
+    assert.isFalse(makeJevDecider().enabledByDefault)
+    assert.strictEqual(makeJevDecider().enabledWhenSet, "apiKey")
+    const def = makeJevDecider()
     assert.strictEqual(def.kind, "decider")
     assert.strictEqual(def.id, "jev-typesafe")
     assert.deepStrictEqual(Object.keys(def.settings), ["apiKey", "model", "baseUrl", "timeoutMs"])
@@ -322,4 +324,51 @@ describe("jev-typesafe module", () => {
       assert.strictEqual(error.reason, "unavailable")
       assert.match(statuses.at(-1)!, /^warning: Last decision failed: TypeSafe answered 503/)
     }))
+})
+
+describe("jev-typesafe: a key in the vault counts like one in the environment", () => {
+  // The start check goes to this fake fetch (no network).
+  const fetch: typeof globalThis.fetch = async () =>
+    new Response(JSON.stringify({ model: "jev-1.14.0", answers: { fits: { value: true } } }), { status: 200, headers: { "content-type": "application/json" } })
+  const catalog = [makeJevDecider({ fetch })]
+  const enabled = (host: { modules: () => ReadonlyArray<{ id: string; enabled: boolean }> }) => host.modules().find((m) => m.id === "jev-typesafe")!.enabled
+
+  it.effect("off without a key anywhere", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const host = yield* makeModuleHost({ catalog, persistence: readOnlyPersistence(), env: {} })
+      assert.isFalse(enabled(host))
+    })))
+
+  it.effect("on with TYPESAFE_API_KEY in the environment", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const host = yield* makeModuleHost({ catalog, persistence: readOnlyPersistence(), env: { TYPESAFE_API_KEY: "ts-env" } })
+      assert.isTrue(enabled(host))
+    })))
+
+  it.effect("on with the key saved in the vault (the saved secrets), and not when the owner switched it off", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const saved = yield* makeModuleHost({
+        catalog,
+        persistence: readOnlyPersistence({ modules: {}, secrets: { "jev-typesafe": { apiKey: "ts-vault" } } }),
+        env: {}
+      })
+      assert.isTrue(enabled(saved))
+      const chosenOff = yield* makeModuleHost({
+        catalog,
+        persistence: readOnlyPersistence({ modules: { "jev-typesafe": { enabled: false } }, secrets: { "jev-typesafe": { apiKey: "ts-vault" } } }),
+        env: {}
+      })
+      assert.isFalse(enabled(chosenOff))
+    })))
+
+  it.live("switched on and started when the vault is unlocked later (setSecrets)", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const host = yield* makeModuleHost({ catalog, persistence: readOnlyPersistence(), env: {} })
+      yield* host.startEnabled
+      assert.isFalse(enabled(host))
+      yield* host.setSecrets({ "jev-typesafe": { apiKey: "ts-vault" } })
+      const info = host.modules().find((m) => m.id === "jev-typesafe")!
+      assert.isTrue(info.enabled)
+      assert.strictEqual(info.state, "running")
+    })))
 })

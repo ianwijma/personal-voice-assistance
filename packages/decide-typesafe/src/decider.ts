@@ -25,20 +25,20 @@ const statusWith = (secrets: Secrets) => (raw: string, tone: StatusLine["tone"])
 const START_CHECK_MS = 3_000
 
 export interface JevDeciderOptions {
-  /** Where "enabled by default when the key is set" is read from. Default `process.env`. */
-  readonly env?: Readonly<Record<string, string | undefined>>
   /** For tests. */
   readonly fetch?: typeof globalThis.fetch
 }
 
 export const makeJevDecider = (options: JevDeciderOptions = {}) => {
-  const env = options.env ?? process.env
   return defineDecider({
     id: "jev-typesafe",
     name: "TypeSafe Jev",
     description:
       "TypeSafe's Jev model picks the action you meant, in about a quarter of a second. Only sentences routed to Jev are sent to TypeSafe, which documents no retention period.",
-    enabledByDefault: (env.TYPESAFE_API_KEY ?? "").trim() !== "",
+    // Switched on (until the owner chooses) once the key is set: in the environment or saved in the key vault. The
+    // module host decides with the resolved settings, so a key entered in the UI counts like one in `.env`.
+    enabledByDefault: false,
+    enabledWhenSet: "apiKey",
     settings: {
       apiKey: Setting.secret({
         label: "API key",
@@ -139,5 +139,5 @@ export const makeJevDecider = (options: JevDeciderOptions = {}) => {
   })
 }
 
-/** The catalog entry: enabled by default when `TYPESAFE_API_KEY` is set. */
+/** The catalog entry: enabled by default once its key is set (`TYPESAFE_API_KEY` or the vault). */
 export const jevTypesafeDecider = makeJevDecider()

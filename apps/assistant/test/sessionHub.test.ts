@@ -2,7 +2,14 @@
 import { encodeClientMessage, PROTOCOL_VERSION, type ServerMessage } from "@pva/protocol"
 import { Deferred, Effect } from "effect"
 import { describe, expect, it } from "vitest"
+import { makeAccessPolicy } from "../src/serve/access.ts"
 import { type HubConnection, makeSessionHub } from "../src/serve/SessionHub.ts"
+
+/** No key vault (everything open): the access checks pass, as before the vault existed. */
+const noVault = {
+  keys: { state: () => "none", info: () => ({ state: "none", admin: true, location: "" }), subscribe: () => () => {} } as never,
+  access: makeAccessPolicy({ catalog: [], sections: () => [], vaultState: () => "none" })
+}
 
 const setup = () => {
   const gate = Effect.runSync(Deferred.make<void>())
@@ -16,7 +23,7 @@ const setup = () => {
   const hub = makeSessionHub({
     web: { setOwner: () => {}, setMicLive: () => {}, micFrame: () => {}, report: () => {} } as never,
     engine: {
-      status: () => ({ state: "ready", problems: [], reloadPending: false, engines: [], voices: [] }),
+      status: () => ({ state: "ready", problems: [], reloadPending: false, reloadPendingFor: [], engines: [], voices: [] }),
       history: Effect.succeed([]),
       reload: work({ ok: true }),
       send: () => true
@@ -28,7 +35,8 @@ const setup = () => {
     gate: { setMode: () => {} } as never,
     run: (effect) => void Effect.runFork(effect),
     onSectionSaved: () => {},
-    server: { name: "test", version: "0" }
+    server: { name: "test", version: "0" },
+    ...noVault
   })
   const connect = (id: string) => {
     const received: Array<ServerMessage> = []
@@ -93,7 +101,7 @@ describe("SessionHub: typed input", () => {
     const hub = makeSessionHub({
       web: { setOwner: () => {}, setMicLive: () => {}, micFrame: () => {}, report: () => {} } as never,
       engine: {
-        status: () => ({ state, problems: [], reloadPending: false, engines: [], voices: [] }),
+        status: () => ({ state, problems: [], reloadPending: false, reloadPendingFor: [], engines: [], voices: [] }),
         history: Effect.succeed([]),
         send: (input: unknown) => {
           sent.push(input)
@@ -107,7 +115,8 @@ describe("SessionHub: typed input", () => {
       gate: { setMode: () => {} } as never,
       run: (effect) => void Effect.runFork(effect),
       onSectionSaved: () => {},
-      server: { name: "test", version: "0" }
+      server: { name: "test", version: "0" },
+      ...noVault
     })
     const received: Array<ServerMessage> = []
     const handlers = hub.accept({ id: "a", sendText: (t) => received.push(JSON.parse(t)), sendBinary: () => {}, close: () => {}, bufferedAmount: () => 0 })!

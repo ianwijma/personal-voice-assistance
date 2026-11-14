@@ -1,5 +1,5 @@
 import { defineConfig, devices } from "@playwright/test"
-import { fakeMicPath } from "./e2e/fixtures.ts"
+import { fakeMicPath, MOCK_PORT } from "./e2e/fixtures.ts"
 
 /**
  * End-to-end tests in headless Chromium against the mock assistant, with a fake
@@ -47,7 +47,7 @@ export default defineConfig({
     }
   ],
   webServer: [
-    { command: "MOCK_QUIET=1 pnpm exec tsx mock/server.ts", url: "http://127.0.0.1:8787/mock/log", reuseExistingServer: true },
+    { command: `MOCK_QUIET=1 MOCK_PORT=${MOCK_PORT} pnpm exec tsx mock/server.ts`, url: `http://127.0.0.1:${MOCK_PORT}/mock/log`, reuseExistingServer: true },
     { command: "node scripts/serve-static.mjs out 3200", url: "http://127.0.0.1:3200", reuseExistingServer: true },
     { command: "pnpm exec next dev -p 3100", url: "http://localhost:3100", reuseExistingServer: true, timeout: 120_000 }
   ]

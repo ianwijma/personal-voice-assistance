@@ -15,9 +15,15 @@ export const useShortcuts = () => {
       const ui = (patch: Partial<typeof s.ui>) => client.store.dispatch({ type: "local/ui", patch })
       if (e.key === "Escape") {
         // Panels handle Esc themselves when focus is inside them; modal ones close even if it is not.
-        if (s.ui.shortcutsOpen || s.ui.optionsOpen) {
+        if (s.ui.shortcutsOpen) {
           e.preventDefault()
-          ui(s.ui.shortcutsOpen ? { shortcutsOpen: false } : { optionsOpen: false })
+          ui({ shortcutsOpen: false })
+          return
+        }
+        if (s.ui.settingsOpen) {
+          // The settings screen handles Esc itself when focus is inside it (up a level); otherwise close.
+          e.preventDefault()
+          client.settings("close")
           return
         }
         // Otherwise: stop the reply.
@@ -44,7 +50,7 @@ export const useShortcuts = () => {
         case "o":
         case "O":
           e.preventDefault()
-          ui({ optionsOpen: !s.ui.optionsOpen })
+          client.settings(s.ui.settingsOpen ? "close" : s.ui.settingsPath)
           return
         case "/":
           e.preventDefault()

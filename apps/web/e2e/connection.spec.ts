@@ -58,7 +58,7 @@ test("page out of date (close 4400): asks for a reload and stops retrying", asyn
   await expect(page.getByTestId("connection-status")).toHaveText(/out of date/i)
 })
 
-test("engines failed: a banner explains, typed messages are blocked, Open options goes to the Assistant tab", async ({ page, baseURL }) => {
+test("engines failed: a banner explains, typed messages are blocked, Open settings goes to the Overview", async ({ page, baseURL }) => {
   await mock.scenario("engine-failed")
   await page.goto(appUrl(baseURL))
   await expect(page.getByTestId("engine-banner")).toContainText("DEEPGRAM_API_KEY is not set")
@@ -66,9 +66,11 @@ test("engines failed: a banner explains, typed messages are blocked, Open option
   await expect(page.locator("#chat-input")).toBeDisabled()
   await expect(page.getByTestId("chat-panel")).toContainText("engines are not running")
   await page.keyboard.press("Escape")
-  await page.getByRole("button", { name: "Open options" }).click()
-  await expect(page.getByRole("tab", { name: "Assistant" })).toHaveAttribute("aria-selected", "true")
-  await expect(page.getByTestId("options")).toContainText("The engines could not start")
+  await page.getByRole("button", { name: "Open settings" }).click()
+  await expect(page.getByTestId("page-overview-overview")).toBeVisible()
+  await expect(page.getByTestId("engine-problems")).toContainText("The engines could not start")
+  await expect(page.getByTestId("nav-overview").locator("[data-mark=error]")).toBeVisible()
+  expect(new URL(page.url()).hash).toBe("#settings/overview/overview")
 })
 
 test("taken over by another tab: the microphone closes and Use this tab takes it back", async ({ page, baseURL }) => {

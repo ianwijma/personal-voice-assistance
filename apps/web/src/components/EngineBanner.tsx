@@ -1,21 +1,37 @@
 "use client"
+import { engineNeedsKeys } from "@/lib/state.ts"
 import { shallowEqual } from "@/lib/store.ts"
 import { useClient, useClientState } from "./context.tsx"
+import { UnlockForm } from "./KeysPanel.tsx"
 import { Spinner } from "./ui/Icon.tsx"
 
 /** A bar at the top of the stage when the engines failed or are (re)loading. */
 export function EngineBanner() {
   const client = useClient()
-  const e = useClientState((s) => ({ state: s.engine.state, problems: s.engine.problems, open: s.connection.status === "open" }), shallowEqual)
+  const e = useClientState(
+    (s) => ({ state: s.engine.state, problems: s.engine.problems, open: s.connection.status === "open", needsKeys: engineNeedsKeys(s) }),
+    shallowEqual
+  )
   if (!e.open || e.state === "ready") return null
-  const openOptions = () => client.store.dispatch({ type: "local/ui", patch: { optionsOpen: true, optionsTab: "assistant" } })
+  const openOptions = () => client.settings(["overview", "overview"])
   return (
     <div
       role="status"
       data-testid="engine-banner"
       className="absolute inset-x-3 top-2 mx-auto flex max-w-[720px] items-start gap-3 rounded-md border border-line bg-surface px-4 py-2.5 text-[14px] sm:inset-x-6"
     >
-      {e.state === "failed" ? (
+      {e.needsKeys ? (
+        <>
+          <span className="mt-[7px] size-1.5 shrink-0 rounded-full bg-danger" aria-hidden="true" />
+          <div className="flex min-w-0 flex-1 flex-col gap-2" data-testid="engine-banner-keys">
+            <p className="text-ink">
+              Keys are locked, so the assistant can't start:{" "}
+              <span className="text-ink-muted">type the password to unlock them (the engines reload by themselves).</span>
+            </p>
+            <UnlockForm compact />
+          </div>
+        </>
+      ) : e.state === "failed" ? (
         <>
           <span className="mt-[7px] size-1.5 shrink-0 rounded-full bg-danger" aria-hidden="true" />
           <p className="min-w-0 flex-1 text-ink">
@@ -23,7 +39,7 @@ export function EngineBanner() {
             <span className="text-ink-muted">{e.problems.map((p) => `${p.stage}: ${p.message}`).join(" · ") || "the engines failed to start."}</span>
           </p>
           <button type="button" onClick={openOptions} className="shrink-0 text-[13px] text-voice underline-offset-4 hover:underline">
-            Open options
+            Open settings
           </button>
         </>
       ) : (

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest"
-import { moduleBadge, moduleSwitchBusy } from "@/components/ModuleCard.tsx"
+import { moduleBadge, moduleSwitchBusy } from "@/components/settings/ModuleHeader.tsx"
 
 describe("module card", () => {
   it("shows a disabled module in its 10 s grace (stopping) as off: no badge, no busy switch", () => {
