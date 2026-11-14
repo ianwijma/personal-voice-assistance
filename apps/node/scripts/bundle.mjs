@@ -10,7 +10,9 @@
  * The server (WP-7) serves these four files as they are under /node/. The bundle depends only on the source tree
  * (no timestamps), so the same commit always gives the same SHA-256 and nodes do not update for nothing.
  *
- *   node scripts/bundle.mjs [--out <dir>]
+ *   node scripts/bundle.mjs [--out <dir>] [--label <word>]
+ *
+ * `--label` appends `.<word>` to the version (a test build that must differ from the release of the same commit).
  */
 import { execFileSync } from "node:child_process"
 import { createHash } from "node:crypto"
@@ -21,7 +23,8 @@ import { parseArgs } from "node:util"
 import { build } from "esbuild"
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..")
-const { values } = parseArgs({ options: { out: { type: "string" } } })
+const { values } = parseArgs({ options: { out: { type: "string" }, label: { type: "string" } } })
+if (values.label !== undefined && !/^[0-9A-Za-z-]{1,16}$/.test(values.label)) throw new Error("--label: 1 to 16 letters, digits or dashes")
 const out = resolve(values.out ?? join(root, "dist"))
 
 const sha256 = (bytes) => createHash("sha256").update(bytes).digest("hex")
@@ -42,7 +45,7 @@ const git = (...args) => {
 const pkg = JSON.parse(readFileSync(join(root, "package.json"), "utf8"))
 const commit = git("rev-parse", "--short=10", "HEAD") ?? "unknown"
 const dirty = git("status", "--porcelain", "--", ".", "../../packages", "../../pnpm-lock.yaml")
-const version = `${pkg.version}+${commit}${dirty ? ".dirty" : ""}`
+const version = `${pkg.version}+${commit}${dirty ? ".dirty" : ""}${values.label !== undefined ? `.${values.label}` : ""}`
 if (version.length > 64) throw new Error(`version ${version} is longer than 64 characters`)
 
 const runtime = JSON.parse(readFileSync(join(root, "scripts", "runtime.json"), "utf8"))

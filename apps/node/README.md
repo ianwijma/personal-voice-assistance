@@ -114,6 +114,7 @@ src/releases.ts    release directories, state, start counting and rollback (plai
 src/boot.ts        the boot guard (bundled alone into pva-node-boot.mjs)
 src/pair.ts        pair --code: POST /node/pair, writes node.json (WP-10 takes it over)
 scripts/bundle.mjs the distribution build;  scripts/pin-runtime.mjs  the runtime pins
+scripts/serve-dist.mjs  dist/ under /node/ plus a proxy to an assistant (stand-in for WP-7's routes)
 install/           install.sh and the two unit templates (filled into dist/install.sh by the build)
 ```
 

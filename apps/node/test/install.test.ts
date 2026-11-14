@@ -8,7 +8,7 @@
  * install.sh in place of the real nodejs.org pins, so no download happens.
  */
 import { execFileSync, spawn, spawnSync } from "node:child_process"
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, rmSync, statSync, writeFileSync } from "node:fs"
+import { chmodSync, existsSync, symlinkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, rmSync, statSync, writeFileSync } from "node:fs"
 import * as http from "node:http"
 import type { AddressInfo } from "node:net"
 import { tmpdir } from "node:os"
@@ -259,6 +259,22 @@ describe.skipIf(!tools)("install.sh (staged with --root)", { timeout: 60_000 }, 
     expect(actions).toContain("loginctl enable-linger ian")
     expect(actions).toContain("systemctl --user -M ian@ restart pva-node.service")
     expect(actions).not.toContain("useradd")
+  })
+
+  it("a re-run keeps the release previous points at and removes other old releases", async () => {
+    expect((await install(["--server", base, "--no-pair", "--runtime", runtimeTarball])).status).toBe(0)
+    const releases = at("opt/pva-node/releases")
+    const kept = "a".repeat(64)
+    const orphan = "b".repeat(64)
+    for (const sha of [kept, orphan]) {
+      mkdirSync(join(releases, sha))
+      writeFileSync(join(releases, sha, "pva-node.mjs"), "// old\n")
+    }
+    symlinkSync(kept, join(releases, "previous"))
+    expect((await install(["--runtime", runtimeTarball])).status).toBe(0)
+    expect(readlinkSync(join(releases, "previous"))).toBe(kept)
+    expect(existsSync(join(releases, kept, "pva-node.mjs"))).toBe(true)
+    expect(existsSync(join(releases, orphan))).toBe(false)
   })
 
   it("--upgrade-runtime and --uninstall", async () => {

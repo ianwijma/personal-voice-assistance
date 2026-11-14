@@ -177,6 +177,8 @@ install_runtime() {
 		mkdir -p "$staging"
 		tar -xzf "$tarball" -C "$staging" --no-same-owner
 		[ -x "$staging/$runtime_name/bin/node" ] || die "the tarball does not contain $runtime_name/bin/node"
+		# C headers and man pages are not needed to run (65 MB of a Pi's SD card).
+		rm -rf "$staging/$runtime_name/include" "$staging/$runtime_name/share"
 		rm -rf "$runtime_path"
 		mv "$staging/$runtime_name" "$runtime_path"
 		rmdir "$staging"
@@ -269,13 +271,15 @@ install_release() {
 	mv -T "$RELEASES/.current.tmp.$$" "$RELEASES/current"
 	# The installer's choice is trusted: forget probation, rollbacks and refused releases of earlier runs.
 	rm -f "$RELEASES/state.json"
-	# Old release directories (64 hex digits, never the current / previous links) go.
+	# Release directories other than current and previous (64 hex digits; never the links themselves) go.
+	keep_previous=$(readlink "$RELEASES/previous" 2>/dev/null || true)
 	for dir in "$RELEASES"/*; do
 		name=${dir##*/}
 		[ ! -L "$dir" ] && [ -d "$dir" ] || continue
 		printf '%s' "$name" | grep -Eq '^[0-9a-f]{64}$' || continue
-		if [ "$name" != "$BUNDLE_SHA" ] && [ "$name" != "$old" ]; then rm -rf "$dir"; fi
+		if [ "$name" != "$BUNDLE_SHA" ] && [ "$name" != "$keep_previous" ]; then rm -rf "$dir"; fi
 	done
+	if [ -n "$keep_previous" ] && [ ! -d "$RELEASES/$keep_previous" ]; then rm -f "$RELEASES/previous"; fi
 	"$NODE" "$RELEASES/current/pva-node.mjs" version >"$TMP/version.json" 2>"$TMP/version.err" ||
 		die "the node program does not start: $(cat "$TMP/version.err")"
 	grep -q "\"bundleSha256\":\"$BUNDLE_SHA\"" "$TMP/version.json" || die "the installed release does not report its own hash: $(cat "$TMP/version.json")"
