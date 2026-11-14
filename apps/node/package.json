@@ -1,0 +1,30 @@
+{
+  "name": "@pva/node",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Voice node: a headless thin client that is the microphone and speaker of a box (docs/VOICE-NODES.md)",
+  "scripts": {
+    "start": "tsx src/main.ts",
+    "check": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "bundle": "node scripts/bundle.mjs"
+  },
+  "dependencies": {
+    "@effect/platform-node": "catalog:",
+    "@pva/audio-file": "workspace:*",
+    "@pva/audio-pipewire": "workspace:*",
+    "@pva/core": "workspace:*",
+    "@pva/protocol": "workspace:*",
+    "effect": "catalog:",
+    "ws": "catalog:"
+  },
+  "devDependencies": {
+    "@effect/vitest": "catalog:",
+    "@types/node": "catalog:",
+    "@types/ws": "catalog:",
+    "tsx": "catalog:",
+    "typescript": "catalog:",
+    "vitest": "catalog:"
+  }
+}
