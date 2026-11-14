@@ -1,0 +1,365 @@
+{
+ "HEY JEFF": [
+  "▁HE",
+  "Y",
+  "▁JE",
+  "FF"
+ ],
+ "HEY JEV": [
+  "▁HE",
+  "Y",
+  "▁JE",
+  "V"
+ ],
+ "HEY GEOFF": [
+  "▁HE",
+  "Y",
+  "▁G",
+  "E",
+  "O",
+  "FF"
+ ],
+ "OK JEFF": [
+  "▁O",
+  "K",
+  "▁JE",
+  "FF"
+ ],
+ "HI JEFF": [
+  "▁HI",
+  "▁JE",
+  "FF"
+ ],
+ "JEFF": [
+  "▁JE",
+  "FF"
+ ],
+ "JEV": [
+  "▁JE",
+  "V"
+ ],
+ "GEOFF": [
+  "▁G",
+  "E",
+  "O",
+  "FF"
+ ],
+ "HEY JEFFREY": [
+  "▁HE",
+  "Y",
+  "▁JE",
+  "FF",
+  "RE",
+  "Y"
+ ],
+ "HELLO JEFF": [
+  "▁HE",
+  "LL",
+  "O",
+  "▁JE",
+  "FF"
+ ],
+ "HEY ASSISTANT": [
+  "▁HE",
+  "Y",
+  "▁AS",
+  "S",
+  "IST",
+  "ANT"
+ ],
+ "HEY COMPUTER": [
+  "▁HE",
+  "Y",
+  "▁COMP",
+  "U",
+  "TER"
+ ],
+ "OKAY COMPUTER": [
+  "▁OKAY",
+  "▁COMP",
+  "U",
+  "TER"
+ ],
+ "HELLO WORLD": [
+  "▁HE",
+  "LL",
+  "O",
+  "▁WORLD"
+ ],
+ "HI GOOGLE": [
+  "▁HI",
+  "▁GO",
+  "O",
+  "G",
+  "LE"
+ ],
+ "HEY SIRI": [
+  "▁HE",
+  "Y",
+  "▁S",
+  "I",
+  "RI"
+ ],
+ "ALEXA": [
+  "▁A",
+  "LE",
+  "X",
+  "A"
+ ],
+ "LOVE AND PEACE": [
+  "▁LOVE",
+  "▁AND",
+  "▁P",
+  "E",
+  "A",
+  "CE"
+ ],
+ "PLAY MUSIC": [
+  "▁PLAY",
+  "▁MU",
+  "S",
+  "IC"
+ ],
+ "GO HOME": [
+  "▁GO",
+  "▁HOME"
+ ],
+ "HAPPY NEW YEAR": [
+  "▁HA",
+  "PP",
+  "Y",
+  "▁NEW",
+  "▁YEAR"
+ ],
+ "MERRY CHRISTMAS": [
+  "▁ME",
+  "R",
+  "RY",
+  "▁",
+  "CH",
+  "R",
+  "IST",
+  "MA",
+  "S"
+ ],
+ "LIGHT UP": [
+  "▁",
+  "L",
+  "IGHT",
+  "▁UP"
+ ],
+ "LOVELY CHILD": [
+  "▁LOVE",
+  "LY",
+  "▁CHI",
+  "L",
+  "D"
+ ],
+ "FOREVER": [
+  "▁FOR",
+  "E",
+  "VER"
+ ],
+ "WAKE UP": [
+  "▁WA",
+  "KE",
+  "▁UP"
+ ],
+ "STOP": [
+  "▁ST",
+  "O",
+  "P"
+ ],
+ "NEVER MIND": [
+  "▁NEVER",
+  "▁MIN",
+  "D"
+ ],
+ "TURN ON THE LIGHTS": [
+  "▁TURN",
+  "▁ON",
+  "▁THE",
+  "▁",
+  "L",
+  "IGHT",
+  "S"
+ ],
+ "WHAT TIME IS IT": [
+  "▁WHAT",
+  "▁TIME",
+  "▁IS",
+  "▁IT"
+ ],
+ "GOOD MORNING": [
+  "▁GOOD",
+  "▁MO",
+  "R",
+  "N",
+  "ING"
+ ],
+ "GOOD NIGHT": [
+  "▁GOOD",
+  "▁",
+  "N",
+  "IGHT"
+ ],
+ "THANK YOU": [
+  "▁THANK",
+  "▁YOU"
+ ],
+ "CANCEL": [
+  "▁CAN",
+  "CE",
+  "L"
+ ],
+ "PAUSE THE MUSIC": [
+  "▁PA",
+  "U",
+  "SE",
+  "▁THE",
+  "▁MU",
+  "S",
+  "IC"
+ ],
+ "HEY JARVIS": [
+  "▁HE",
+  "Y",
+  "▁JA",
+  "R",
+  "VI",
+  "S"
+ ],
+ "HEY MYCROFT": [
+  "▁HE",
+  "Y",
+  "▁MY",
+  "C",
+  "RO",
+  "F",
+  "T"
+ ],
+ "HEY RHASSPY": [
+  "▁HE",
+  "Y",
+  "▁",
+  "R",
+  "HA",
+  "S",
+  "S",
+  "P",
+  "Y"
+ ],
+ "AMSTERDAM": [
+  "▁A",
+  "M",
+  "S",
+  "TER",
+  "D",
+  "A",
+  "M"
+ ],
+ "ROTTERDAM": [
+  "▁RO",
+  "T",
+  "TER",
+  "D",
+  "A",
+  "M"
+ ],
+ "SCHEVENINGEN": [
+  "▁S",
+  "CH",
+  "E",
+  "VE",
+  "N",
+  "ING",
+  "EN"
+ ],
+ "XYLOPHONE": [
+  "▁",
+  "X",
+  "Y",
+  "LO",
+  "PH",
+  "ONE"
+ ],
+ "QUIZZICAL": [
+  "▁QU",
+  "I",
+  "Z",
+  "Z",
+  "ICAL"
+ ],
+ "JUXTAPOSE": [
+  "▁JU",
+  "X",
+  "TA",
+  "PO",
+  "SE"
+ ],
+ "SPHINX OF BLACK QUARTZ": [
+  "▁S",
+  "PH",
+  "IN",
+  "X",
+  "▁OF",
+  "▁BLACK",
+  "▁QU",
+  "AR",
+  "T",
+  "Z"
+ ],
+ "ZYZZYVA": [
+  "▁",
+  "Z",
+  "Y",
+  "Z",
+  "Z",
+  "Y",
+  "V",
+  "A"
+ ],
+ "IT'S ME": [
+  "▁IT",
+  "'",
+  "S",
+  "▁ME"
+ ],
+ "DON'T STOP": [
+  "▁DON",
+  "'",
+  "T",
+  "▁ST",
+  "O",
+  "P"
+ ],
+ "O'CLOCK": [
+  "▁O",
+  "'",
+  "C",
+  "LO",
+  "CK"
+ ],
+ "HEY 2 JEFF": [
+  "▁HE",
+  "Y",
+  "▁",
+  "2",
+  "▁JE",
+  "FF"
+ ],
+ "ROBOT 42": [
+  "▁RO",
+  "B",
+  "O",
+  "T",
+  "▁",
+  "42"
+ ],
+ "HEY  JEFF": [
+  "▁HE",
+  "Y",
+  "▁JE",
+  "FF"
+ ]
+}
