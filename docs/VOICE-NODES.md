@@ -864,3 +864,148 @@ Accuracy fails §6, on 336 synthetic wakes (Kokoro, 28 voices):
 
 The decision can be reopened only by M4 on a Pi 4 with ≥ 50 of the owner's own wakes and ≥ 3 h of TV audio
 (`packages/kws-sherpa/scripts/pi-m4.sh`), which nobody has run yet.
+
+### WP-4 Packaging, installer, updates (2026-11-14, branch `t3/voice-node-wp4`)
+
+Built on the merge of WP-1, WP-2 and WP-3. **Integration first** (own commit): the merged tree needed no lockfile or
+link fixes; `pnpm check` passed and the one test failure seen (`audio-pipewire` "a consumer that falls behind…", a
+load-sensitive timing test unchanged since PR #1) passes alone; it failed in 2 of 7 full `pnpm test` runs on this
+machine during this work, and is left alone here (not this package's file). WP-1 is plugged into WP-3's
+seams in `apps/node/src/audio.ts`: `alsaLayers` runs `@pva/audio-alsa`'s `arecord` / `aplay` (an empty profile device is
+ALSA's `default`), `listDevices` returns `pw-dump` sources / sinks or the `default` + `plughw:` PCMs, and the node's
+`--audio` gained **`auto`** (its new default): PipeWire when this process's PipeWire socket (`$PIPEWIRE_RUNTIME_DIR` or
+`$XDG_RUNTIME_DIR` + `pipewire-0`) exists and `pw-record` / `pw-cat` are installed, else ALSA — so the system unit (no
+session) always gets ALSA. `test/audio.test.ts` runs stand-in `arecord` / `aplay` / `pw-dump` from `PATH` and checks the
+exact command lines.
+
+**Built** (all in `apps/node`):
+- `scripts/bundle.mjs` (`pnpm --filter @pva/node bundle`): esbuild (catalog `esbuild 0.28.2`, ESM, node22) →
+  `dist/pva-node.mjs` (1.6 MiB, 1301 inputs), `dist/pva-node-boot.mjs` (5 KiB), `dist/install.sh` (the source with the
+  runtime pins and both unit templates filled in), `dist/manifest.json`. The bundle contains only what the source
+  determines (`version` = `<package version>+<10-char git sha>[.dirty][.<--label>]`, no timestamp), so the same commit
+  gives the same hash (tested) and nodes do not update for nothing. The build runs the bundle (`version`) to read its
+  protocol and check its hash. `scripts/runtime.json` pins **Node 22.23.5** (`.tar.gz`, nodejs.org SHA256SUMS);
+  `scripts/pin-runtime.mjs <22.x.y>` rewrites it (reproduced the committed file exactly). `scripts/serve-dist.mjs`:
+  a stand-in for WP-7's routes (serves `dist/` under `/node/`, proxies everything else including `/ws`).
+- **Manifest, format 1** (`Manifest` in `src/update.ts` is the contract): `{ format: 1, protocol, version, builtAt?,
+  bundle: { path, sha256, bytes }, boot: { path, sha256, bytes }, installer?: { path, sha256, bytes }, runtime: { version,
+  "linux-arm64": { url, sha256 }, "linux-x64": { url, sha256 } } }`; `path`s are relative to the manifest URL.
+- `install/install.sh` (POSIX sh; `shellcheck -s sh` 0.11.0 clean on the source and the built copy; `-o all` adds only
+  style notes): arch check (arm64, x64; `armv6l`/`armv7l` refused), root and systemd checks, runtime download and
+  SHA-256 check against the built-in pin (or `--runtime <tarball>`, still checked), `include/` and `share/` dropped
+  (−65 MB), system user `pva-node` in `audio`, the files and modes of §7.1, the boot guard and release checked against
+  the manifest (length and hash), pairing with `--code` (or a prompt on `/dev/tty`), `--no-pair [--device-id] [--name]`
+  for servers without pairing, `--tls-pin`, `--audio auto|alsa|pipewire`, `--user` (PipeWire user unit with lingering),
+  `--upgrade-runtime`, `--uninstall`, and `--root <dir>` (stage into a directory, system changes only recorded in
+  `actions.log`: how the tests run it). Re-running keeps what is right and remembers server / audio / user in
+  `/etc/pva-node/install.env` (never sourced). Any hash or length mismatch stops it before anything changes; downloads
+  are never run by a shell (the JSON manifest is parsed by the installed Node and every value is validated).
+- `install/pva-node.service` (system) and `install/pva-node-user.service` (user).
+- `src/update.ts` (manifest check before every connection attempt and right after a 4400; download capped at
+  `bundle.bytes` and 32 MiB; switch; exit 0), `src/releases.ts` (release dirs, `state.json`, start counting, rollback,
+  pruning; plain `node:fs`), `src/boot.ts` (the boot guard), `src/pair.ts` + CLI `pair`, `configure`, `version`; hooks
+  in `runNode` (`updates`: check, `welcomed`, probation; returns `Updated` / `FailedStart`).
+
+**Final ownership** (§7.1): `/opt/pva-node`, `runtime/`, `pva-node-boot.mjs`, `/etc/pva-node/`, `install.env`: root
+(0755 / 0644); `releases/` (with `current`, `previous`, `state.json`): the node's user; `/etc/pva-node/node.json`: the
+node's user, 0600; `/var/lib/pva-node`: the node's user, 0700. The node's user is `pva-node` (system unit) or the
+`--user` (user unit).
+
+**Differs from the design, and why**:
+- **Boot guard.** The unit runs `node /opt/pva-node/pva-node-boot.mjs run --config … --audio <alsa|pipewire>`, not the
+  bundle directly (§7.3's `ExecStart`). With the design's line a new bundle that crashes while loading (a syntax error,
+  a bad import) can never count its own failed starts, and systemd would restart it for ever: exactly the brick of §11.
+  The guard (root-owned, installed by install.sh, not self-updated, no imports beyond `node:`) counts each start of a
+  pending release *before* loading it, rolls back after three, then loads `releases/current/pva-node.mjs` in-process
+  with the same arguments. The node logs when the server's boot guard differs ("run install.sh again").
+- **What counts as a failed start**: every process start of a pending release (counted by the guard), and a running
+  pending release exits 1 when the server refused it (close 4400, 1002, 1003, 1007, 1008, or no `welcome` within the
+  timeout). An unreachable or restarting server, 1001 / 1006 and 4403 do not count (else a server outage or a removed
+  node would roll back a good release and mark it bad). A rolled-back release is put in `state.bad` and never switched
+  to again; installing with install.sh clears that.
+- **`tlsPin` is the SHA-256 of the certificate's public key (DER SubjectPublicKeyInfo)**, written `sha256:<hex>`: it
+  survives renewal with the same key and is what curl's `--pinnedpubkey sha256//<base64>` checks, which install.sh
+  uses (`-k` only skips the CA check; the pin is enforced — verified against a self-signed server: match passes,
+  mismatch fails with curl error 90). Node's `getPeerCertificate().pubkey` is *not* SPKI for EC keys (it is the bare
+  point), so the node hashes the key taken from the certificate (`peerKeySha256`). The node checks the pin when the
+  response arrives (public files only); `pair` sends the code only after the pin matched.
+- `state.json` lives in `releases/`, next to the links it describes; no update lock (one node process per box, and the
+  installer stops the service before it touches releases).
+- `pair` / `configure` / `version` and `src/pair.ts` are WP-10's per §7.4 but the installer needs them now; WP-10
+  takes them over (the pairing request is §5.1's, see the WP-7 list below).
+- `StartLimitIntervalSec=0` (systemd would otherwise give up after 5 quick restarts) and a few more hardening options
+  (`ProtectKernel*`, `ProtectControlGroups`, `RestrictSUIDSGID`, `LockPersonality`); they do not affect ALSA.
+- The runtime is the `.tar.gz` (gzip is always present; `xz-utils` is not on every minimal image). The manifest repeats
+  the runtime pins; install.sh refuses a manifest whose runtime version differs from its own ("download install.sh
+  again"), since both are built together.
+- The root `pnpm serve` script does not run the bundle yet: that changes how the owner's running service starts, and
+  serving is WP-7's; WP-7 adds `pnpm --filter @pva/node bundle` there (or builds on demand).
+- After a rollback the orphaned release directories stay until the next confirmed release prunes them (a few MiB).
+
+**WP-7 must serve / implement** (tested here against `scripts/serve-dist.mjs` and test fixtures):
+1. `GET /node/manifest.json`, `/node/pva-node.mjs`, `/node/pva-node-boot.mjs`, `/node/install.sh`: the four files of
+   `apps/node/dist` byte for byte (the node and installer check length and SHA-256 against the manifest), with the
+   usual host check; `Cache-Control: no-store` at least for the manifest; anything else under `/node/` and a missing
+   `dist/` → 404. Serve only those names (manifest paths are plain file names; the installer rejects anything else).
+2. `POST /node/pair`, request `{ code, hostname, platform: { os, arch, hostname, model? }, version }` with `code`
+   already normalised (8 Crockford characters, upper case, no dash, `O`→`0`, `I`/`L`→`1`); answers `200 { deviceId,
+   credential, name? }`, `403 { error: "bad_code" | "expired" }`, `503 { error: "admin_disabled" }` (the node prints a
+   sentence for each; 404 says "update the assistant").
+3. Admin's install command must pass `--server <url>` (a script read from a pipe cannot know where it came from):
+   `curl -fsSL <url>/node/install.sh | sudo sh -s -- --server <url> --code K7QM-2XHP`; with a self-signed certificate
+   also `--tls-pin sha256:<hex>`, and the `curl` of the command itself needs `-k --pinnedpubkey sha256//<base64 of the
+   same digest>`.
+4. The pin admin shows: SHA-256 of the server certificate's DER SPKI (`new X509Certificate(pem).publicKey.export({ type:
+   "spki", format: "der" })`), as `sha256:<64 hex>`.
+5. `DeviceInfo.node.upToDate` = `hello.node.bundleSha256 === manifest.bundle.sha256`; `version` / `bundleSha256` come from
+   `pva-node version` / `detectInstall` (WP-10 puts them in `hello.node`).
+6. Build the bundle for `pnpm serve` (see above).
+
+**Tests**: `test/update.test.ts` (28): bad hash refused with nothing written, atomic switch (relative symlink renamed
+over, no temporaries left), the last confirmed release stays the rollback target across two unconfirmed updates, start
+counting and rollback after three, confirmation and pruning, give-up without a previous, stale pending, damaged state;
+the updater against a local HTTP fixture (up to date, switch, hash mismatch, over-long body, bad release skipped,
+unreachable server, bad manifest, runtime hint once, confirmation) and an HTTPS fixture with a self-signed EC
+certificate (pin match, mismatch, no pin); `runNode`: a check before the hello (a new release exits without
+connecting), confirmation at welcome, **4400 triggers a check**, failed start on probation, no failed start while the
+server is away; the boot guard as a real process (arguments passed through; a bundle that cannot load fails three
+starts and is rolled back on the fourth). `test/install.test.ts` (14): builds the real `dist/`, checks the manifest
+against the files and reproducibility, then staged installs against a fixture server with a stand-in runtime tarball:
+fresh install (files, modes, unit, recorded actions), the staged release running through the guard, idempotent re-run
+(only the manifest fetched), pairing (code normalised, wrong code), bundle hash mismatch (fail closed, release
+unchanged), runtime hash mismatch, stale installer, armv7 / bad URL / PipeWire without user refused, user unit,
+`--upgrade-runtime`, `--uninstall`, a re-run keeping `previous`. `pnpm check` passes; `pnpm test` passes (2882 tests, 29 skipped), apart from that flaky `audio-pipewire` test.
+
+**Real runs on this machine (x86-64, no sound card; the owner's service on 8787 untouched)**:
+1. Assistant on port 8799 with its own data directory (`LLM_PROVIDER=fake`, local Parakeet v2 STT, Piper),
+   `serve-dist.mjs` on 8798. `curl -fsSL http://127.0.0.1:8798/node/install.sh | sh -s -- --root <dir> --server
+   http://127.0.0.1:8798 --no-pair …` downloaded the real Node 22.23.5 x64 tarball (hash matched the pin) and staged
+   in 1.4 s; 140 MB under `/opt/pva-node` after dropping headers (205 MB before). The arm64 tarball was downloaded and
+   its hash matched its pin too (not run: no arm64 here, no emulation).
+2. The staged release run through the boot guard (a shell loop standing in for `Restart=always`, `--input-wav
+   bench-audio --output-wav`): all five bench WAVs answered, `reply-001…005.wav` written. Latency lines (fake LLM;
+   first data point, not a claim): `turn #1 … ttsFirstAudio=-190ms playbackStart=4ms`, `turn #2 … playbackStart=3ms`,
+   `#3 3ms`, `#4 2ms`, `#5 2ms` (all speculative).
+3. **Self-update**: build B (`--label b`) put in place, connection dropped → on reconnect `the server has …b
+   (a8fe465ec191); downloading it` → `switched … restarting` (29 ms later) → exit 0 → `pva-node-boot: new release
+   a8fe465ec191, start 1` → `release a8fe465ec191 confirmed` 16 ms after start → the next WAV answered on B.
+4. **Rollback**: a release C that throws at load served with a correct manifest → switched, then `failed to load` on
+   starts 1–3 (exit 1), on start 4 `did not reach the server's welcome in 3 starts; rolled back to a8fe465ec191`; B
+   then logged `the server's bundle faf9c5c2ec58 … was rolled back on this node before; staying on a8fe465ec191` and
+   answered five more WAVs (turns 8–12); `state.json` held `bad: [C]` and the `lastError`.
+5. **systemd** (a throwaway privileged Debian 13 container with systemd as PID 1, files served inside it by busybox
+   httpd because the host firewall drops container→host traffic, so no assistant there): `curl | sh` as root installed
+   in 4.9 s including the runtime download; `pva-node` (uid 996, groups `pva-node audio`) created, modes and owners as
+   above, unit enabled and active as `User=pva-node`; with `ProtectSystem=strict` the node **self-updated** (wrote
+   `releases/`, exit 0, systemd restart counter 1, the guard counted start 1, release pending since no server
+   welcomed it); survived a container restart (active after boot); a re-run without arguments downloaded nothing and
+   kept `node.json`; `--uninstall` removed the unit, the three directories and the user. Container and image removed.
+
+**Not verified**: a Raspberry Pi or any arm64 box (the arm64 runtime hash only); a Debian 13 *VM* (a container stood
+in) and reboot of a real machine; the service against a real server through systemd (the container could not reach
+the assistant; the real-server runs went through the shell supervisor instead); ALSA with a real sound card (the
+container has none: the node idles without owning audio); the PipeWire `--user` variant against a real user session
+(only staged); `--tls-pin` through install.sh end to end (curl's pin check and the node's were each verified
+separately); real pairing (WP-7 does not exist; tested against a fixture). WP-4's acceptance asks for real installs on
+a Raspberry Pi OS Lite arm64 box and a Debian 13 x86-64 VM with install time, disk, reboot and server restart under
+Status: those remain open for WP-11 or a follow-up with the hardware.

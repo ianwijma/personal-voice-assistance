@@ -1,0 +1,31 @@
+# The voice node as a system service (docs/VOICE-NODES.md §7.3). Written by install.sh; ALSA audio.
+# @AUDIO@ is replaced by install.sh. Self-update writes only /opt/pva-node/releases (owned by pva-node).
+[Unit]
+Description=Personal voice assistant node
+After=network-online.target sound.target
+Wants=network-online.target
+# Restart for ever: a node waits out a server that is away, and the boot guard handles a bad release.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=pva-node
+Group=pva-node
+SupplementaryGroups=audio
+ExecStart=/opt/pva-node/runtime/current/bin/node /opt/pva-node/pva-node-boot.mjs run --config /etc/pva-node/node.json --audio @AUDIO@
+Restart=always
+RestartSec=2
+# hardening that does not break ALSA
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/pva-node /opt/pva-node/releases
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

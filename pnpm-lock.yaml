@@ -30,6 +30,9 @@ catalogs:
     effect:
       specifier: 4.1.4
       version: 4.1.4
+    esbuild:
+      specifier: 0.28.2
+      version: 0.28.2
     tsx:
       specifier: 4.23.15
       version: 4.23.15
@@ -138,6 +141,9 @@ importers:
       '@effect/platform-node':
         specifier: 'catalog:'
         version: 4.1.4(effect@4.1.4)(redis@6.3.1(@opentelemetry/api@1.10.0))
+      '@pva/audio-alsa':
+        specifier: workspace:*
+        version: link:../../packages/audio-alsa
       '@pva/audio-file':
         specifier: workspace:*
         version: link:../../packages/audio-file
@@ -166,6 +172,9 @@ importers:
       '@types/ws':
         specifier: 'catalog:'
         version: 8.18.2
+      esbuild:
+        specifier: 'catalog:'
+        version: 0.28.2
       tsx:
         specifier: 'catalog:'
         version: 4.23.15
