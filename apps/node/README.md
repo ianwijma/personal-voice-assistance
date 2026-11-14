@@ -52,12 +52,14 @@ are the same numbers the server logs.
 
 | Backend | Status |
 |---|---|
-| `pipewire` (default) | `pw-record` / `pw-cat` through `@pva/audio-pipewire` |
-| `alsa` | WP-1 (`@pva/audio-alsa`); `alsaLayers` in `src/audio.ts` is the seam |
+| `pipewire` | `pw-record` / `pw-cat` through `@pva/audio-pipewire`; devices from `pw-dump` (`node.name` ids) |
+| `alsa` | `arecord` / `aplay` through `@pva/audio-alsa`; devices from `arecord -L` / `aplay -L` (`default`, `plughw:CARD=…`) |
 | file | `--input-wav` / `--output-wav` through `@pva/audio-file` |
 
-Input and output are chosen separately. Device lists (`devices`) show only the system default until WP-1's parsers
-land (`listDevices` in `src/audio.ts`).
+`--audio auto` (the default) picks PipeWire when this process can reach a PipeWire daemon (its socket in
+`$XDG_RUNTIME_DIR`) and `pw-record` / `pw-cat` are installed, else ALSA; a system service has no user session and
+always gets ALSA. The installer writes the explicit choice into the unit. Input and output are chosen separately.
+`--input-device` / `--output-device` take the ids `devices` prints; empty means the backend's default.
 
 ## Layout
 
@@ -67,7 +69,7 @@ src/config.ts      node.json read / write (0600), schema-validated; the WebSocke
 src/connection.ts  ws client: hello, welcome, ping, reconnect policy (pure), close codes
 src/session.ts     the device side of the protocol for one connection
 src/playback.ts    reply player with playback reports, volume, cues; PlaybackClock
-src/audio.ts       backend choice (pipewire | alsa | file), device listing
+src/audio.ts       backend choice (auto | pipewire | alsa | file), device listing
 src/tones.ts       cue and test-tone generation
 src/node.ts        runNode: capture + player for the process, a session per connection
 ```

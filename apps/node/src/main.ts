@@ -11,7 +11,7 @@ import { parseArgs } from "node:util"
 import { NodeRuntime } from "@effect/platform-node"
 import { AudioOutput } from "@pva/core"
 import { Effect, Schema, Stream } from "effect"
-import { audioLayer, type DeviceBackend, listDevices, NodeAudioInfo } from "./audio.ts"
+import { audioLayer, type BackendChoice, chooseBackend, listDevices, NodeAudioInfo } from "./audio.ts"
 import { DEFAULT_CONFIG_PATH, defaultDeviceId, type NodeConfig, NodeConfig as NodeConfigSchema, readConfig } from "./config.ts"
 import { DEFAULT_VOLUME, defaultLog, runNode } from "./node.ts"
 import { applyGain, volumeGain } from "./playback.ts"
@@ -24,7 +24,7 @@ run (default)
   --server <url>         instead of --config: the assistant, e.g. http://assistant.lan:8787
   --device-id <id>       with --server: this node's device id (default node-<hostname>)
   --name <name>          with --server: suggested device name (default: the hostname)
-  --audio <backend>      pipewire (default) or alsa
+  --audio <backend>      auto (default: PipeWire when a PipeWire daemon is reachable, else ALSA), pipewire or alsa
   --input-wav <path>     a WAV/PCM file or a directory of them instead of the microphone
   --input-gap-ms <ms>    silence after each input file (default 12000)
   --output-wav <dir>     write replies as reply-NNN.wav instead of playing them
@@ -80,11 +80,12 @@ if (values.help === true) {
 }
 
 const command = positionals[0] ?? "run"
-const backend: DeviceBackend = values.audio === undefined || values.audio === "pipewire"
-  ? "pipewire"
-  : values.audio === "alsa"
-  ? "alsa"
-  : fail(`unknown --audio ${values.audio} (pipewire or alsa)`)
+const backendChoice: BackendChoice = values.audio === undefined
+  ? "auto"
+  : values.audio === "auto" || values.audio === "pipewire" || values.audio === "alsa"
+  ? values.audio
+  : fail(`unknown --audio ${values.audio} (auto, pipewire or alsa)`)
+const backend = chooseBackend(backendChoice)
 const volume = int("volume", values.volume, 0, 100, DEFAULT_VOLUME)
 
 const audioOptions = {
@@ -112,6 +113,7 @@ const run = Effect.gen(function*() {
 
 const devices = Effect.gen(function*() {
   const list = yield* listDevices(backend)
+  process.stdout.write(`Backend: ${backend}${backendChoice === "auto" ? " (auto)" : ""}\n`)
   const show = (title: string, items: typeof list.inputs) =>
     `${title}:\n${items.map((d) => `  ${d.isDefault ? "*" : " "} ${d.id === "" ? "(default)" : d.id}  ${d.name}`).join("\n")}`
   process.stdout.write(`${show("Inputs", list.inputs)}\n${show("Outputs", list.outputs)}\n${list.note !== undefined ? `\n${list.note}\n` : ""}`)

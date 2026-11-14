@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "@effect/platform-node": "catalog:",
+    "@pva/audio-alsa": "workspace:*",
     "@pva/audio-file": "workspace:*",
     "@pva/audio-pipewire": "workspace:*",
     "@pva/core": "workspace:*",

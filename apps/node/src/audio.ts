@@ -6,18 +6,29 @@
  * Input and output are chosen separately, so a box without a sound card can run with `--input-wav` and
  * `--output-wav` (`@pva/audio-file`, paced in real time), and a box with only a speaker can replay WAVs into it.
  *
+ * Backends: PipeWire (`pw-record` / `pw-cat`, `@pva/audio-pipewire`) and ALSA (`arecord` / `aplay`,
+ * `@pva/audio-alsa`). `auto` (the default) picks PipeWire where a PipeWire daemon is reachable for this process and
+ * ALSA otherwise (headless boxes, and the system service, which has no user session) — `chooseBackend`. Device
+ * lists come from `pw-dump` and `arecord -L` / `aplay -L` (`listDevices`).
+ *
  * Seams:
- * - **WP-1** (`@pva/audio-alsa`): `alsaLayers` below is the one place the ALSA backend plugs in, and
- *   `listDevices` is where both backends' device lists (`arecord -L` / `aplay -L`, `pw-dump`) plug in.
  * - **WP-10**: the profile's `audioInput` / `audioOutput` arrive as `inputDevice` / `outputDevice`; reopening on a
  *   profile change rebuilds these layers.
  */
-import { readdirSync, statSync } from "node:fs"
-import { join } from "node:path"
+import { accessSync, constants, existsSync, readdirSync, statSync } from "node:fs"
+import { delimiter, join } from "node:path"
+import {
+  captureCommand as alsaCaptureCommand,
+  defaultOptions as alsaDefaults,
+  listAlsaDevices,
+  playbackCommand as alsaPlaybackCommand
+} from "@pva/audio-alsa"
 import { loadInputPcm, makeFileOutput, pacedFrames } from "@pva/audio-file"
 import {
+  type AudioDeviceInfo,
   captureCommand,
   defaultOptions as pipeWireDefaults,
+  listPipeWireDevices,
   makeAudioInput as pipeWireInput,
   makeAudioOutput as pipeWireOutput,
   playbackCommand
@@ -26,13 +37,59 @@ import { AudioError, AudioInput, AudioOutput } from "@pva/core"
 import { Context, Effect, Layer, Stream } from "effect"
 
 export type DeviceBackend = "pipewire" | "alsa"
+export type BackendChoice = DeviceBackend | "auto"
 export type AudioBackendName = DeviceBackend | "file"
 
-/** Protocol 7's `AudioDeviceInfo` (WP-6 moves it to `@pva/protocol`). */
-export interface AudioDeviceInfo {
-  readonly id: string
-  readonly name: string
-  readonly isDefault: boolean
+/** Protocol 7's `AudioDeviceInfo` (WP-6 moves it to `@pva/protocol`); the one `@pva/audio-pipewire` defines. */
+export type { AudioDeviceInfo }
+
+/** What `chooseBackend` looks at; injectable for tests. */
+export interface BackendProbe {
+  readonly env: NodeJS.ProcessEnv
+  /** The file exists (a socket counts). */
+  readonly exists: (path: string) => boolean
+  /** An executable of this name is on `PATH`. */
+  readonly onPath: (program: string) => boolean
+}
+
+const isExecutable = (path: string) => {
+  try {
+    accessSync(path, constants.X_OK)
+    return statSync(path).isFile()
+  } catch {
+    return false
+  }
+}
+
+export const systemProbe: BackendProbe = {
+  env: process.env,
+  exists: existsSync,
+  onPath: (program) => (process.env["PATH"] ?? "").split(delimiter).some((dir) => dir !== "" && isExecutable(join(dir, program)))
+}
+
+/**
+ * The PipeWire socket this process would connect to: `$PIPEWIRE_RUNTIME_DIR` (else `$XDG_RUNTIME_DIR`) +
+ * `$PIPEWIRE_REMOTE` (else `pipewire-0`), as libpipewire resolves it. `undefined` without a runtime directory.
+ */
+export const pipeWireSocket = (env: NodeJS.ProcessEnv): string | undefined => {
+  const remote = env["PIPEWIRE_REMOTE"] ?? "pipewire-0"
+  if (remote.startsWith("/")) return remote
+  const dir = env["PIPEWIRE_RUNTIME_DIR"] || env["XDG_RUNTIME_DIR"]
+  return dir === undefined || dir === "" ? undefined : join(dir, remote)
+}
+
+/**
+ * The backend rule of docs/VOICE-NODES.md §7.2: PipeWire where it runs, ALSA where it does not. `auto` means
+ * PipeWire when `pw-record` and `pw-cat` are installed and this process can reach a PipeWire daemon (its socket in
+ * the user's runtime directory exists: a desktop session, or the user unit of a lingering user), else ALSA. The
+ * system unit (`User=pva-node`, no session, no `XDG_RUNTIME_DIR`) therefore always gets ALSA; the installer also
+ * writes the explicit choice into the unit (`--audio alsa|pipewire`), so `auto` is the fallback for manual runs.
+ */
+export const chooseBackend = (choice: BackendChoice, probe: BackendProbe = systemProbe): DeviceBackend => {
+  if (choice !== "auto") return choice
+  const socket = pipeWireSocket(probe.env)
+  const pipeWire = socket !== undefined && probe.exists(socket) && probe.onPath("pw-record") && probe.onPath("pw-cat")
+  return pipeWire ? "pipewire" : "alsa"
 }
 
 export interface AudioDevices {
@@ -115,15 +172,26 @@ const pipeWireLayers = (options: NodeAudioOptions): DeviceLayers => {
   }
 }
 
-/**
- * WP-1 seam: the ALSA backend. When `@pva/audio-alsa` lands, this returns its input and output (same contract as
- * audio-pipewire: `arecord` / `aplay`, devices by card name) and `outputLatencyMs` = its buffer time.
- */
-const alsaLayers = (_options: NodeAudioOptions): Effect.Effect<DeviceLayers, AudioError> =>
-  Effect.fail(new AudioError({ message: "the ALSA backend (@pva/audio-alsa, WP-1) is not part of this build yet; use --audio pipewire" }))
+/** The ALSA options for these node options: `""` / unset devices are ALSA's `default` PCM. */
+export const alsaOptionsFor = (options: NodeAudioOptions) => ({
+  captureDevice: blank(options.inputDevice) ?? alsaDefaults.captureDevice,
+  playbackDevice: blank(options.outputDevice) ?? alsaDefaults.playbackDevice,
+  captureLatencyMs: options.captureLatencyMs ?? alsaDefaults.captureLatencyMs,
+  playbackLatencyMs: options.playbackLatencyMs ?? alsaDefaults.playbackLatencyMs
+})
+
+/** ALSA through `@pva/audio-alsa`'s commands, run by the same process plumbing as PipeWire (`makeAudioInput` …). */
+const alsaLayers = (options: NodeAudioOptions): DeviceLayers => {
+  const alsa = alsaOptionsFor(options)
+  return {
+    input: pipeWireInput(alsaCaptureCommand(alsa)),
+    output: pipeWireOutput((rate) => alsaPlaybackCommand(alsa, rate)),
+    outputLatencyMs: alsa.playbackLatencyMs
+  }
+}
 
 const deviceLayers = (options: NodeAudioOptions): Effect.Effect<DeviceLayers, AudioError> =>
-  options.backend === "alsa" ? alsaLayers(options) : Effect.succeed(pipeWireLayers(options))
+  Effect.succeed(options.backend === "alsa" ? alsaLayers(options) : pipeWireLayers(options))
 
 /** `AudioInput`, `AudioOutput` and `NodeAudioInfo` for these options. Device backends are only built when used. */
 export const audioLayer = (options: NodeAudioOptions): Layer.Layer<AudioInput | AudioOutput | NodeAudioInfo, AudioError> =>
@@ -153,12 +221,10 @@ export const audioLayer = (options: NodeAudioOptions): Layer.Layer<AudioInput | 
   }))
 
 /**
- * WP-1 seam: the devices of a backend for `pva-node devices` (and WP-10's `node.status`). Until the parsers of WP-1
- * land, only "System default" is known.
+ * The devices of a backend for `pva-node devices` (and WP-10's `node.status`): PipeWire's sources and sinks from
+ * `pw-dump` (ids are `node.name`s), ALSA's `default` and `plughw:CARD=…` PCMs from `arecord -L` / `aplay -L`. Each id
+ * is what `--input-device` / `--output-device` (and the profile's `audioInput` / `audioOutput`) take; `""` always
+ * means the backend's default. Fails with `AudioError` when the listing program is missing or fails.
  */
 export const listDevices = (backend: DeviceBackend): Effect.Effect<AudioDevices, AudioError> =>
-  Effect.succeed({
-    inputs: [{ id: "", name: "System default", isDefault: true }],
-    outputs: [{ id: "", name: "System default", isDefault: true }],
-    note: `listing ${backend} devices arrives with WP-1 (arecord -L / aplay -L, pw-dump); only the default is shown`
-  })
+  backend === "alsa" ? listAlsaDevices : listPipeWireDevices
