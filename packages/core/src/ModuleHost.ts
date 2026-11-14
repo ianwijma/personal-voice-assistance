@@ -673,6 +673,7 @@ export const testAgent = (agent: Agent): Effect.Effect<FieldActionResult> =>
     const exit = yield* Stream.suspend(() => agent.turn({
       turnId: 0,
       text: "Say hello in five words.",
+      conversationId: "agent-test",
       utterance: "Say hello in five words.",
       source: "text",
       spoken: false,

@@ -15,7 +15,10 @@ export const median = (xs: ReadonlyArray<number>): number | undefined => {
   return s.length % 2 === 1 ? s[m] : (s[m - 1]! + s[m]!) / 2
 }
 
-/** The latency table's columns (seven, so they fit the page column at 1280 px; early start and voice go under). */
+/**
+ * The latency table's columns (seven, so they fit the page column at 1280 px; the device (admin: `session`) and early
+ * start go under the turn, the voice under the outcome).
+ */
 export const TRACE_COLUMNS = ["turn", "1st token", "tts audio", "playback", "audible", "outcome", "tools"] as const
 
 export function TraceRow({ t }: { readonly t: TraceInfo }) {
@@ -24,6 +27,9 @@ export function TraceRow({ t }: { readonly t: TraceInfo }) {
     <tr className="border-t border-line/60 align-top text-ink-muted">
       <td className="py-1.5 pl-0 pr-2 text-ink">
         {t.turnId}
+        {t.session !== undefined && (
+          <span className="block max-w-[10rem] truncate text-[10px] text-ink-faint" title={t.session} data-testid="trace-device">{t.session}</span>
+        )}
         {t.speculative && <span className="block text-[10px] text-ink-faint" title="Started before you had quite finished">early</span>}
       </td>
       <td className="px-2 py-1.5">{fmt(t.marks.llmFirstToken)}</td>

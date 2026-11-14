@@ -30,13 +30,13 @@ export function LatencyPage() {
                 ))}
               </tr>
             </thead>
-            <tbody>{[...traces].reverse().map((t) => <TraceRow key={t.turnId} t={t} />)}</tbody>
+            <tbody>{[...traces].reverse().map((t, i) => <TraceRow key={`${traces.length - i}-${t.session ?? ""}-${t.turnId}`} t={t} />)}</tbody>
           </table>
         </ScrollX>
       )}
       <p className="text-[12px] text-ink-faint">
-        Milliseconds from the moment the assistant decided you had finished, from each turn's latency trace. "Early" under a turn: the
-        reply was started before you had quite finished. The voice is under the outcome. Not included: microphone capture and the silence the recogniser waits for.
+        Milliseconds from the moment the assistant decided you had finished, from each turn's latency trace. Under a turn: the device it
+        was on, and "early" when the reply was started before you had quite finished. The voice is under the outcome. Not included: microphone capture and the silence the recogniser waits for.
       </p>
     </div>
   )

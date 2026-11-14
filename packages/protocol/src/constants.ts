@@ -36,8 +36,16 @@
  * added during integration, within version 5 (server and web ship together). `wake.heard.accepted` (whether the
  * utterance was taken, so the tester can tell "answered without a phrase" from "ignored") was added in UI review
  * round 2, also within version 5 and optional: a page that gets a message without it says only "No phrase matched".
+ *
+ * 6: voice sessions (docs/VOICE-SESSIONS.md §4): one session and one conversation per device, several devices at
+ * once. Server `conversation` (a new conversation started: `new`, `idle`, or `resumed`), `snapshot.conversation`
+ * (required); client `conversation.new` (any voice connection; answered with `result`); error code `sessions_full`
+ * (`audio.claim`, `text.send`); admin `sessions` and `admin.snapshot.sessions` (required); `wake.test.deviceId`;
+ * profile field `conversationIdleMinutes` (a new member of the closed set `ProfileField`, required in a profile).
+ * `snapshot.history`, `snapshot.ownerPresent`, `session` and `state` are about the device's own session. Admin `trace`
+ * (every finished turn of every session, with `TraceInfo.session`; added in integration, before 6 was released).
  */
-export const PROTOCOL_VERSION = 5
+export const PROTOCOL_VERSION = 6
 
 /** Path of the WebSocket endpoint, on the same origin as the UI in production. */
 export const WS_PATH = "/ws"

@@ -3,6 +3,7 @@ import { useRef } from "react"
 import { Composer } from "./Composer.tsx"
 import { useClient, useClientState } from "./context.tsx"
 import { MessageList } from "./MessageList.tsx"
+import { NewConversationButton } from "./NewConversation.tsx"
 import { PanelHeader, useDialog } from "./ui/Panel.tsx"
 import { useKeyboardInset } from "./useKeyboardInset.ts"
 import { useMediaQuery, WIDE_QUERY } from "./useMediaQuery.ts"
@@ -44,7 +45,9 @@ export function ChatPanel() {
         ].join(" ")}
       >
         <div className="mx-auto mt-2 h-1 w-10 shrink-0 rounded-full bg-line sm:hidden" aria-hidden="true" />
-        <PanelHeader title="Conversation" titleId="chat-title" onClose={close} />
+        <PanelHeader title="Conversation" titleId="chat-title" onClose={close}>
+          <NewConversationButton />
+        </PanelHeader>
         <MessageList />
         <Composer />
       </aside>

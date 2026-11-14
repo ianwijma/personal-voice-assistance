@@ -1,5 +1,14 @@
 import { Setting, type SettingsCheck, type SettingsProblem, type SettingsSpec } from "@pva/core"
-import type { Condition, OptionTag, SettingsGroup, SettingsPage } from "@pva/protocol"
+import {
+  type Condition,
+  CONVERSATION_IDLE_MINUTES_LIMITS,
+  DEFAULT_CONVERSATION_IDLE_MINUTES,
+  DEFAULT_MAX_VOICE_SESSIONS,
+  DEFAULT_SESSION_DISCARD_MINUTES,
+  type OptionTag,
+  type SettingsGroup,
+  type SettingsPage
+} from "@pva/protocol"
 import * as SherpaStt from "@pva/stt-sherpa"
 import * as SherpaTts from "@pva/tts-sherpa"
 import { SUBSCRIPTION_AGENT_ID, SUBSCRIPTION_PROVIDER } from "../subscription.ts"
@@ -269,6 +278,38 @@ export const sectionDefinitions = (dirs: ModelDirs = defaultModelDirs): Readonly
           max: 10,
           advanced: true,
           apply: reload
+        }),
+        // Voice sessions (docs/VOICE-SESSIONS.md): live, no reload.
+        CONVERSATION_IDLE_MINUTES: Setting.number({
+          label: "New conversation after a quiet spell (minutes)",
+          description: "After this many minutes without a turn, the next thing said starts a new conversation (0 = never). " +
+            "The default for every device; a device's own setting can differ.",
+          env: "CONVERSATION_IDLE_MINUTES",
+          default: DEFAULT_CONVERSATION_IDLE_MINUTES,
+          integer: true,
+          min: CONVERSATION_IDLE_MINUTES_LIMITS.min,
+          max: CONVERSATION_IDLE_MINUTES_LIMITS.max
+        }),
+        MAX_VOICE_SESSIONS: Setting.number({
+          label: "Devices talking at once",
+          description: "How many devices can each have a conversation with the assistant at the same time. One more is refused " +
+            "until one of them has been closed for a while.",
+          env: "MAX_VOICE_SESSIONS",
+          default: DEFAULT_MAX_VOICE_SESSIONS,
+          integer: true,
+          min: 1,
+          max: 8,
+          advanced: true
+        }),
+        SESSION_DISCARD_MINUTES: Setting.number({
+          label: "Forget a closed device's conversation after (minutes)",
+          description: "A device with no page open for this long loses its conversation; one that comes back sooner carries on.",
+          env: "SESSION_DISCARD_MINUTES",
+          default: DEFAULT_SESSION_DISCARD_MINUTES,
+          integer: true,
+          min: 1,
+          max: 1_440,
+          advanced: true
         })
       }
     },

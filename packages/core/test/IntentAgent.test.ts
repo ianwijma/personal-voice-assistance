@@ -58,6 +58,7 @@ const wants = (action: string, extra: Record<string, DecisionAnswer> = {}, fits 
 
 const makeInput = (overrides: Partial<AgentTurnInput> & { readonly actions: AgentTurnInput["actions"] }): AgentTurnInput => ({
   turnId: 1,
+  conversationId: "c1",
   // Most scripted answers below pick the kitchen; core acts only on what was said (review round 3).
   text: "Turn on the kitchen lights.",
   utterance: "Hey Jev, turn on the kitchen lights.",

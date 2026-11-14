@@ -8,6 +8,7 @@ import { type Connection, makeConnection, type RequestInput, type ResultMessage,
 import { EchoTestCancelled, runEchoTest } from "./echoTest.ts"
 import { deviceHello } from "./device.ts"
 import { createPrefsStore, type Prefs, type PrefsStore } from "./prefs.ts"
+import { sessionsFullText } from "./sessions.ts"
 import { navigateSettings, type SettingsPath } from "./settingsTree.ts"
 import { type ClientState, profileOf } from "./state.ts"
 import { type ClientStore, createClientStore } from "./store.ts"
@@ -77,8 +78,13 @@ export interface AssistantClient {
   readonly updateFrontend: (kind: FrontendKindId, patch: ProfilePatch) => Promise<ResultMessage>
   readonly updateDeviceAdmin: (id: string, change: { readonly name?: string; readonly patch?: ProfilePatch }) => Promise<ResultMessage>
   readonly forgetDevice: (id: string) => Promise<ResultMessage>
-  /** Admin: the phrase tester (`wake.heard` lines arrive while it is on). */
-  readonly wakeTest: (on: boolean) => Promise<ResultMessage>
+  /**
+   * Admin: the phrase tester (`wake.heard` lines arrive while it is on), for one device's session (`deviceId`) or,
+   * without one, the most recently active session.
+   */
+  readonly wakeTest: (on: boolean, deviceId?: string) => Promise<ResultMessage>
+  /** Voice: start a new conversation on this device (`conversation.new`); the chat empties on the server's answer. */
+  readonly newConversation: () => Promise<ResultMessage>
   /**
    * Run the echo test and save its result in the preferences (with the output path it ran on). Rejects
    * (saving nothing) when audio is off, a test already runs, or the test is cancelled: End, a takeover, a
@@ -306,6 +312,14 @@ export const createAssistantClient = (options: { readonly frontend?: FrontendRol
           void releaseAudio("takeover") // taken over by another tab: close our microphone
         }
         if (m.type === "turn.end" && m.outcome === "interrupted") markInterrupted()
+        if (m.type === "error" && m.error.code === "sessions_full") {
+          // The claim was refused (too many devices talking): close the microphone and say why where Start was.
+          const message = sessionsFullText(m.error.message)
+          if (audio.running || store.get().audio.phase !== "off") {
+            releaseWakeLock()
+            void releaseAudio("end", message) // continuation(generation): `releaseAudio` starts a new generation itself
+          } else dispatch({ type: "local/audio", phase: "error", error: message })
+        }
       }
     }
   })
@@ -615,7 +629,8 @@ export const createAssistantClient = (options: { readonly frontend?: FrontendRol
         ...(change.patch !== undefined ? { patch: change.patch } : {})
       }),
     forgetDevice: (id) => connection.request({ type: "device.forget", id }),
-    wakeTest: (on) => connection.request({ type: "wake.test", on }),
+    wakeTest: (on, deviceId) => connection.request(deviceId === undefined ? { type: "wake.test", on } : { type: "wake.test", on, deviceId }),
+    newConversation: () => connection.request({ type: "conversation.new" }),
     diagnostics,
     echoTest: async () => {
       if (!audio.running) throw new Error("Start audio first.")

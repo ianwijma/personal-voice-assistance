@@ -32,7 +32,7 @@ import {
   turnResumed
 } from "@pva/core/testing"
 import { makeClock } from "@pva/modules-builtin"
-import { Effect, Layer, Queue, Stream } from "effect"
+import { Deferred, Effect, Layer, Queue, Stream } from "effect"
 import type { BenchRow } from "./report.ts"
 import { observedTurnTraceLayer } from "../startup.ts"
 
@@ -122,12 +122,29 @@ const sttEvents = (turn: ScriptedTurn, scenario: OfflineScenario): Array<SttEven
   return [speechStarted, ...falseStart, eagerEndOfTurn(turn.user), ...(lead > 0 ? [sleep(lead)] : []), endOfTurn(turn.user)]
 }
 
-/**
- * Run the script `rounds` times in one conversation (after one unreported
- * warm-up round, so JIT compilation is not measured) and return the committed
- * turns. Each turn waits for the previous reply to finish playing.
- */
-export const runOffline = (scenario: OfflineScenario, rounds: number) =>
+/** All sessions reach turn `k` before any of them speaks it: simultaneous turn ends. */
+const makeBarrier = (parties: number) => {
+  const turns = new Map<number, { arrived: number; open: Deferred.Deferred<void> }>()
+  return (k: number) =>
+    Effect.suspend(() => {
+      let entry = turns.get(k)
+      if (entry === undefined) {
+        entry = { arrived: 0, open: Deferred.makeUnsafe<void>() }
+        turns.set(k, entry)
+      }
+      entry.arrived++
+      return entry.arrived >= parties ? Deferred.succeed(entry.open, undefined) : Deferred.await(entry.open)
+    })
+}
+
+/** One session: the script `rounds` times (after a warm-up round) through its own `Conversation`. */
+const runSession = (
+  scenario: OfflineScenario,
+  rounds: number,
+  tts: Tts["Service"],
+  barrier: ((k: number) => Effect.Effect<void>) | undefined,
+  label: string
+) =>
   Effect.gen(function*() {
     const finished = yield* Queue.unbounded<Trace>()
     const onFinish = (trace: Trace) => trace.outcome === "discarded" ? Effect.void : Queue.offer(finished, trace)
@@ -136,11 +153,7 @@ export const runOffline = (scenario: OfflineScenario, rounds: number) =>
         makeScriptedLlm(respond(scenario.delays)).layer,
         ToolRegistry.layer([makeClock()]),
         observedTurnTraceLayer(onFinish),
-        // Through the voice router, as in the app, so its overhead is part of the measurement.
-        Layer.succeed(Tts, makeVoiceRouter({
-          defaultVoice: "bench",
-          voices: [{ name: "bench", description: "", tts: makeMarkerTts({ delayMillis: scenario.delays.ttsFirstAudioMs }).service }]
-        })),
+        Layer.succeed(Tts, tts),
         makeRecordingAudioOutput({ chunkMillis: scenario.delays.playbackMsPerClause }).layer
       ))
     )
@@ -150,12 +163,13 @@ export const runOffline = (scenario: OfflineScenario, rounds: number) =>
     const gated = (events: Stream.Stream<SttEvent>) =>
       events.pipe(Stream.flatMap((event) => Stream.fromIterable(wake.filter(event, performance.now()).events)))
     const rows: Array<BenchRow> = []
-    const events = Stream.fromIterable(turns).pipe(
-      Stream.flatMap(({ round, turn }) =>
-        gated(scripted(sttEvents(turn, scenario))).pipe(
+    const events = Stream.fromIterable(turns.map((t, k) => ({ ...t, k }))).pipe(
+      Stream.flatMap(({ round, turn, k }) =>
+        Stream.fromEffectDrain(barrier === undefined ? Effect.void : barrier(k)).pipe(
+          Stream.concat(gated(scripted(sttEvents(turn, scenario)))),
           Stream.concat(Stream.fromEffectDrain(Effect.gen(function*() {
             const trace = yield* Queue.take(finished)
-            if (round > 0) rows.push({ label: `${round}.${script.indexOf(turn) + 1} ${turn.user.slice(0, 24)}`, trace })
+            if (round > 0) rows.push({ label: `${label}${round}.${script.indexOf(turn) + 1} ${turn.user.slice(0, 24)}`, trace })
           })))
         ), { concurrency: 1 })
     )
@@ -164,4 +178,34 @@ export const runOffline = (scenario: OfflineScenario, rounds: number) =>
       yield* conversation.voice(events)
     }).pipe(Effect.provide(layer))
     return rows
+  })
+
+/** Through the voice router, as in the app, so its overhead is part of the measurement. */
+const benchTts = (scenario: OfflineScenario) =>
+  makeVoiceRouter({
+    defaultVoice: "bench",
+    voices: [{ name: "bench", description: "", tts: makeMarkerTts({ delayMillis: scenario.delays.ttsFirstAudioMs }).service }]
+  })
+
+/**
+ * Run the script `rounds` times in one conversation (after one unreported
+ * warm-up round, so JIT compilation is not measured) and return the committed
+ * turns. Each turn waits for the previous reply to finish playing.
+ */
+export const runOffline = (scenario: OfflineScenario, rounds: number) => runSession(scenario, rounds, benchTts(scenario), undefined, "")
+
+/**
+ * `bench --sessions N`: N sessions at once, as serve mode runs several devices: each its own `Conversation`, the
+ * voice (TTS stand-in behind one router) shared, and every turn's end simultaneous in all sessions (each session
+ * waits for the others before speaking its next turn). Rows per session.
+ */
+export const runOfflineSessions = (scenario: OfflineScenario, rounds: number, sessions: number) =>
+  Effect.gen(function*() {
+    const tts = benchTts(scenario)
+    const barrier = makeBarrier(sessions)
+    return yield* Effect.forEach(
+      Array.from({ length: sessions }, (_, i) => i),
+      (i) => runSession(scenario, rounds, tts, barrier, `s${i + 1} `),
+      { concurrency: "unbounded" }
+    )
   })

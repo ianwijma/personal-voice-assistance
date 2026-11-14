@@ -73,7 +73,7 @@ export const bargeIn = (mode: "instant" | "confirm", gapMs: number, port: number
       const clauses = log.filter((m) => m.msg.type === "assistant.text" && m.msg.turnId === 1).map((m) => m.msg as unknown as { clause: number; text: string })
       const playedUpTo = Math.max(...log.filter((m) => m.msg.type === "assistant.playing" && m.msg.turnId === 1).map((m) => m.msg.clause as number))
       const heard = clauses.filter((c) => c.clause <= playedUpTo).map((c) => c.text).join(" ")
-      const history = await serverHistory(assistant.url)
+      const history = await serverHistory(assistant.url, page)
       const reply1 = history[1]!
       expect(history[0]).toMatchObject({ role: "user" })
       expect(reply1).toMatchObject({ role: "assistant", interrupted: true })

@@ -1,24 +1,21 @@
-import { makeWebAudio, type WebAudio } from "@pva/audio-web"
 import {
-  type ConversationEvent,
   type HostResult,
-  ECHO_TAIL_MS,
-  makeEchoGate,
   makeModuleHost,
   makeTurnTrace,
-  makeWakeGate,
   type ModuleDefinition,
   type ModuleHost,
-  type SttEvent,
   type TurnSetup,
   type TurnTrace,
-  voicePrompt,
-  WAKE_ALWAYS,
-  type WakeConfig,
-  wakeConfigFromProfile
+  voicePrompt
 } from "@pva/core"
-import { type DeviceProfile, engineSummary, type ServerMessage, WAKE_ARMED_MS } from "@pva/protocol"
-import { Config, Effect, Fiber, FiberSet, Option, type Scope, Stream } from "effect"
+import {
+  DEFAULT_CONVERSATION_IDLE_MINUTES,
+  DEFAULT_MAX_VOICE_SESSIONS,
+  DEFAULT_SESSION_DISCARD_MINUTES,
+  engineSummary,
+  type ServerMessage
+} from "@pva/protocol"
+import { Cause, Config, Effect, Exit, Fiber, FiberSet, Option, type Scope } from "effect"
 import { isAbsolute, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 import { defaultSystemPrompt } from "../config.ts"
@@ -29,19 +26,26 @@ import { makeSubscriptionAgents, SUBSCRIPTION_AGENT_ID, SUBSCRIPTION_PROVIDER } 
 import { makeAccessPolicy } from "./access.ts"
 import { adminPasswordProblem, makeAdminSessions } from "./AdminSessions.ts"
 import { acquireDataDirLock, type DataDirLockError } from "./DataDirLock.ts"
-import { defaultPreflight, defaultProviderBuilder, type Engine, EngineBuildProblems, makeEngine, type ProviderBuilder } from "./Engine.ts"
+import {
+  defaultPreflight,
+  defaultProviderBuilder,
+  type Engine,
+  EngineBuildProblems,
+  type EngineProviders,
+  makeEngine,
+  type ProviderBuilder
+} from "./Engine.ts"
 import { type EnvMover, makeEnvMover } from "./envSettings.ts"
 import { type HttpError, type HttpServer, startHttp, webDirExists } from "./http.ts"
 import { makeFrontends } from "./frontends.ts"
 import { type Jobs, makeJobs } from "./jobs.ts"
 import { makeModels, type Models, type PresetDownloader, presetsInUse } from "./models.ts"
-import { makeHeardAudio } from "./HeardAudio.ts"
 import { type Keys, makeKeys } from "./Keys.ts"
-import { makePublisher } from "./Publisher.ts"
 import { makeSections } from "./sections.ts"
 import { makeSessionHub, type SessionHub } from "./SessionHub.ts"
 import { DataDirConfig, KEYS_LOCKED_MESSAGE, loadSettingsStore, SettingsStoreError } from "./SettingsStore.ts"
-import { makeStateTracker } from "./StateTracker.ts"
+import { makeVoiceSession, type VoicesNow } from "./VoiceSession.ts"
+import { makeVoiceSessions, type VoiceSessions } from "./VoiceSessions.ts"
 import { type KdfParams, openVault, type Vault, VaultPathConfig } from "./Vault.ts"
 import * as SherpaStt from "@pva/stt-sherpa"
 import type { ToolId } from "@pva/protocol"
@@ -52,8 +56,9 @@ import type { ToolId } from "@pva/protocol"
  * settings and the engines live here.
  *
  * Startup order: HTTP first (so the UI loads and shows "starting"), then the
- * module host and the engine build in parallel. The voice loop runs over the
- * web audio input; when nobody owns the audio, that input is a noise floor.
+ * module host and the engine build in parallel. Every voice device gets its own voice session (its own audio
+ * pipeline and conversation, docs/VOICE-SESSIONS.md) at its first claim or typed message, on the shared engines;
+ * a session's input is a noise floor while none of its device's tabs owns the audio.
  */
 
 const repoRoot = fileURLToPath(new URL("../../../../", import.meta.url))
@@ -109,6 +114,8 @@ export interface ServeOptions {
   readonly turnTrace?: TurnTrace["Service"]
   /** Playback stall limit (tests shorten it). Default 2000 ms. */
   readonly stallMs?: number
+  /** Tests: what one minute of `conversationIdleMinutes` and `SESSION_DISCARD_MINUTES` is (ms). Default 60 000. */
+  readonly minuteMs?: number
   readonly helloTimeoutMs?: number
   readonly pingIntervalMs?: number
 }
@@ -117,8 +124,9 @@ export interface ServeHandle {
   readonly http: HttpServer
   readonly hub: SessionHub
   readonly engine: Engine
+  /** The voice sessions (one per device). */
+  readonly sessions: VoiceSessions
   readonly host: ModuleHost
-  readonly web: WebAudio
   readonly keys: Keys
   readonly vault: Vault
   readonly envView: EnvView
@@ -193,11 +201,23 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     const run = (effect: Effect.Effect<void>) => {
       runFork(effect.pipe(Effect.catchCause((cause) => Effect.logError("serve: request failed", cause))))
     }
-    const now = () => performance.now()
+    // Voice sessions are built synchronously (in a hub handler) with the server's services (logging, scheduler).
+    const services = yield* Effect.context<never>()
+    /**
+     * Not `Effect.runSync`: its scheduler only runs while it runs, so the fibers a session forks (the noise floor of
+     * its audio input) would never run again. A fork starts at once and these effects never wait, so it has
+     * finished when `runFork` returns.
+     */
+    const runSync = <A>(effect: Effect.Effect<A>): A => {
+      const exit = Effect.runForkWith(services)(effect).pollUnsafe()
+      if (exit === undefined) throw new Error("serve: a voice session could not be created synchronously")
+      if (Exit.isFailure(exit)) throw Cause.squash(exit.cause)
+      return exit.value
+    }
+    const minuteMs = options.minuteMs ?? 60_000
 
-    // Late-bound: the hub needs the engine and the engine's callbacks need the hub.
+    // Late-bound: the hub needs the engine and the sessions, and their callbacks need the hub.
     let hub: SessionHub | undefined
-    let theHub: SessionHub | undefined
     let lastSummary: string | undefined
     /** The enabled voices of the engine status (kept while a rebuild fails); empty before the first build. */
     const enabledVoices = (): ReadonlySet<string> =>
@@ -206,183 +226,14 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     let modelsRef: Models | undefined
     const broadcast = (message: ServerMessage) => hub?.broadcast(message)
 
-    const gate = makeEchoGate("instant")
-    // After the echo gate, before Conversation; configured from the audio owner's profile (no owner: `always`).
-    const wake = makeWakeGate(WAKE_ALWAYS)
-    const tracker = makeStateTracker({
-      onChange: (s) => broadcast({ type: "state", ...s }),
-      asleep: () => wake.config().activation === "wake-phrase" && !wake.awake(now())
-    })
-    yield* Effect.addFinalizer(() => Effect.sync(() => tracker.dispose()))
-    const publisher = makePublisher({
-      broadcast,
-      onCommitted: (turnId) => tracker.turnPromoted(turnId),
-      moduleOfTool: (name) => host.snapshot().toolModules.get(name) ?? null,
-      voices: () => {
-        const v = engine?.voices()
-        return { defaultVoice: v?.defaultVoice ?? String(sections.value("DEFAULT_VOICE")), names: new Set(v?.names.map((x) => x.name) ?? []) }
-      }
-    })
-
-    // Manual interrupt mode: the microphone is replaced by silence while the assistant is audible (plus the reverb tail).
-    let unsuppress: ReturnType<typeof setTimeout> | undefined
-    const web: WebAudio = yield* makeWebAudio({
-      ...(options.stallMs !== undefined ? { stallMs: options.stallMs } : {}),
-      log: (line) => runFork(Effect.logWarning(line)),
-      onPlayback: (event) => {
-        if (event._tag === "started") {
-          tracker.playbackStarted(event.turnId)
-          gate.playbackStarted(now())
-          wake.replyStarted(now())
-          if (unsuppress !== undefined) clearTimeout(unsuppress)
-          if (hub?.ownerMode() === "manual") web.setSuppressed(true)
-        } else {
-          tracker.playbackEnded(event.turnId, event.reason)
-          gate.playbackEnded(now())
-          wake.replyEnded(now())
-          tracker.wakeChanged(wake.config().followUpMs)
-          unsuppress = setTimeout(() => web.setSuppressed(false), ECHO_TAIL_MS)
-          unsuppress.unref?.()
-        }
-      },
-      onStall: (turnId) =>
-        broadcast({
-          type: "error",
-          error: { code: "playback_timeout", message: "The browser stopped reporting playback, so the reply was stopped", turnId }
-        })
-    })
-
-    // Clause texts per turn, so the echo gate knows the words that just played.
-    const clauses = new Map<number, { texts: Array<string>; given: number }>()
-    const onEvent = (event: ConversationEvent) => {
-      publisher.onEvent(event)
-      switch (event._tag) {
-        case "TurnStarted":
-          // Committed turns reach the tracker through the publisher's onCommitted, right after turn.start.
-          if (event.speculative) tracker.turnStarted(event.turnId, true)
-          return
-        case "TurnEnded":
-          clauses.delete(event.turnId)
-          return tracker.turnEnded(event.turnId)
-        case "ClauseQueued": {
-          const entry = clauses.get(event.turnId) ?? { texts: [], given: 0 }
-          entry.texts[event.index] = event.text
-          clauses.set(event.turnId, entry)
-          return
-        }
-        case "ClausePlaying": {
-          const entry = clauses.get(event.turnId)
-          if (entry === undefined) return
-          for (; entry.given <= event.index; entry.given++) gate.clausePlayed(entry.texts[entry.given] ?? "", now())
-          return
-        }
-        default:
-          return
-      }
-    }
-
-    // "What does the assistant hear" (RECORD_HEARD_AUDIO): taps the recogniser's input and events.
-    let lastInput = web.inputStats()
-    let lastLost = 0
-    const heard = makeHeardAudio({
-      dir: join(options.dataDir, "recordings"),
-      enabled: () => sections.value("RECORD_HEARD_AUDIO") === true,
-      maxFiles: () => Number(sections.value("RECORD_HEARD_AUDIO_MAX_FILES") ?? 50),
-      model: () => {
-        const stt = engine?.status().engines.find((e) => e.stage === "stt")
-        return stt === undefined ? "unknown" : `${stt.provider} ${stt.detail}`
-      },
-      // Counters since the previous recording.
-      transport: () => {
-        const current = web.inputStats()
-        const delta = {
-          micFrames: current.micFrames - lastInput.micFrames,
-          droppedFrames: current.droppedFrames - lastInput.droppedFrames,
-          noiseFrames: current.noiseFrames - lastInput.noiseFrames,
-          unroutedMicFrames: current.unroutedMicFrames - lastInput.unroutedMicFrames,
-          lostOnTheWay: (hub?.micFramesLost() ?? 0) - lastLost,
-          maxMicGapMs: current.maxMicGapMs
-        }
-        lastInput = current
-        lastLost = hub?.micFramesLost() ?? 0
-        return delta
-      },
-      log: (line) => runFork(Effect.logInfo(line)),
-      writable: () => lock.held(),
-      begin: lock.begin
-    })
-    // Before the lock is released (finalizers run in reverse): no recording write or rotation after it.
-    yield* Effect.addFinalizer(() => Effect.promise(() => heard.close()))
-    const input = { stream: web.input.stream.pipe(Stream.tap((chunk) => Effect.sync(() => heard.audio(chunk)))) }
-
-    let lastTranscript = ""
-    const transcript = (text: string) => {
-      if (text === lastTranscript) return
-      lastTranscript = text
-      broadcast({ type: "transcript", text })
-    }
-    /**
-     * Stt → echo gate → wake gate → Conversation. Only what passed both gates is shown (transcript), moves the state
-     * or reaches the conversation: an utterance the wake gate ignores reaches no page, no history, no agent and no
-     * recording (`heard.discard`); its text goes only to admin pages with the phrase tester on (`wake.heard`).
-     */
-    const gateStream = (events: Stream.Stream<SttEvent, unknown>) =>
-      events.pipe(Stream.flatMap((event) => {
-        const t = now()
-        if (event._tag !== "EndOfTurn") heard.event(event)
-        const echo = gate.filter(event, t)
-        const out: Array<SttEvent> = []
-        let wakeDropped = false
-        for (const e of echo.events) {
-          const w = wake.filter(e, t)
-          if (w.heard !== undefined) theHub?.wakeHeard(w.heard.text, w.heard.phrase, w.heard.accepted)
-          if (w.woke !== undefined) {
-            broadcast({ type: "wake", phrase: w.woke.phrase, armed: w.woke.armed })
-            tracker.wakeChanged(w.woke.armed ? wake.config().armedMs ?? WAKE_ARMED_MS : wake.config().followUpMs)
-          }
-          if (w.dropped !== undefined || (e._tag === "EndOfTurn" && w.events.length === 0)) wakeDropped = true
-          for (const passed of w.events) {
-            out.push(passed)
-            tracker.stt(passed)
-            if (passed._tag === "Interim") transcript(passed.text)
-            else if (passed._tag === "EndOfTurn") {
-              transcript("")
-              // An accepted utterance opens the follow-up window: the state may go back to asleep by itself.
-              if (wake.config().activation === "wake-phrase") tracker.wakeChanged(wake.config().followUpMs)
-            }
-          }
-        }
-        if (event._tag === "EndOfTurn") {
-          if (wakeDropped) heard.discard()
-          else heard.event(event)
-        }
-        if (echo.dropped) transcript("")
-        return Stream.fromIterable(out)
-      }))
-
-    // The turn setup is rebuilt only when its inputs change (a string compare per turn).
-    let cached: { key: string; setup: TurnSetup } | undefined
-    const voiceBlock = () => {
-      const voices = engine?.voices()
-      return voices === undefined ? "" : voicePrompt(voices.names, voices.defaultVoice)
-    }
     /** Base prompt + running modules' instructions + voice block. */
     const systemFor = (base: string, instructions: ReadonlyArray<string>, voices: string) => {
       const system = withModuleInstructions(base, instructions)
       return voices.length === 0 ? system : `${system}\n\n${voices}`
     }
-    const setup = Effect.sync((): TurnSetup => {
-      const snapshot = host.snapshot()
-      const base = String(sections.value("SYSTEM_PROMPT") ?? defaultSystemPrompt)
-      const voices = voiceBlock()
-      const key = `${snapshot.version}\u0000${base}\u0000${voices}`
-      if (cached?.key !== key) {
-        cached = { key, setup: { system: systemFor(base, snapshot.instructions, voices), registry: snapshot.registry } }
-      }
-      return cached.setup
-    })
 
     // LLM_PROVIDER=claude-subscription: an agent conversation whose agent is the running claude-subscription module.
+    // Every session's conversation uses that one agent; it keeps one Claude Code session per conversation id.
     const subscriptionModule = () => host.modules().find((m) => m.id === SUBSCRIPTION_AGENT_ID)
     const subscriptionDetail = () => {
       const m = subscriptionModule()
@@ -393,39 +244,27 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     const secretNames = () =>
       sections.list().flatMap((x) => x.form.fields).flatMap((f) => (f.type === "secret" && f.env !== undefined ? [f.env] : []))
 
-    engine = yield* makeEngine({
-      build: options.build ?? defaultProviderBuilder,
-      ...(options.preflight !== undefined
-        ? { preflight: options.preflight }
-        : options.build === undefined
-        ? { preflight: defaultPreflight }
-        : {}),
-      configProvider: sections.configProvider,
-      input,
-      output: web.output,
-      turnTrace,
-      setup,
-      onEvent,
-      gate: gateStream,
-      // The audio owner's voice (its profile), else DEFAULT_VOICE; the engine swaps routers only for a running voice.
-      defaultVoice: () => {
-        const own = theHub?.ownerProfile()?.voice ?? ""
-        return own !== "" && enabledVoices().has(own) ? own : String(sections.value("DEFAULT_VOICE"))
-      },
-      onStatus: (status) => {
-        // `engine` goes to admin connections only (SessionHub.ADMIN_ONLY); the summary to everyone, when it changed.
-        broadcast({ type: "engine", engine: status })
-        const summary = JSON.stringify(engineSummary(status))
-        if (summary !== lastSummary) {
-          lastSummary = summary
-          broadcast({ type: "engine.summary", engine: engineSummary(status) })
-          // The enabled voices may have changed: a profile's voice may fall back to "" (or come back).
-          theHub?.refreshProfiles()
+    /**
+     * One session's turn setup (and agent setup): its voice block names that session's default voice. Rebuilt only
+     * when its inputs change (a string compare per turn).
+     */
+    const conversationSetup = (voices: () => VoicesNow | undefined) => {
+      let cached: { key: string; setup: TurnSetup } | undefined
+      const voiceBlock = () => {
+        const v = voices()
+        return v === undefined ? "" : voicePrompt(v.names, v.defaultVoice)
+      }
+      const setup = Effect.sync((): TurnSetup => {
+        const snapshot = host.snapshot()
+        const base = String(sections.value("SYSTEM_PROMPT") ?? defaultSystemPrompt)
+        const block = voiceBlock()
+        const key = `${snapshot.version}\u0000${base}\u0000${block}`
+        if (cached?.key !== key) {
+          cached = { key, setup: { system: systemFor(base, snapshot.instructions, block), registry: snapshot.registry } }
         }
-        // Which models are in use follows the running engines.
-        if (hub !== undefined) broadcast({ type: "models", models: modelsRef?.list() ?? [] })
-      },
-      agentSetup: (providers) => {
+        return cached.setup
+      })
+      const agentSetup = (providers: EngineProviders) => {
         if (providers.llmProvider !== SUBSCRIPTION_PROVIDER) return undefined
         const toAgents = makeSubscriptionAgents({
           fallbackLlm: providers.llm,
@@ -435,6 +274,31 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
             agent.systemPrompt === undefined ? turn.system : systemFor(agent.systemPrompt, host.snapshot().instructions, voiceBlock())
         })
         return Effect.map(setup, toAgents)
+      }
+      return { setup, agentSetup }
+    }
+
+    engine = yield* makeEngine({
+      build: options.build ?? defaultProviderBuilder,
+      ...(options.preflight !== undefined
+        ? { preflight: options.preflight }
+        : options.build === undefined
+        ? { preflight: defaultPreflight }
+        : {}),
+      configProvider: sections.configProvider,
+      defaultVoice: () => String(sections.value("DEFAULT_VOICE")),
+      onStatus: (status) => {
+        // `engine` goes to admin connections only (SessionHub.ADMIN_ONLY); the summary to everyone, when it changed.
+        broadcast({ type: "engine", engine: status })
+        const summary = JSON.stringify(engineSummary(status))
+        if (summary !== lastSummary) {
+          lastSummary = summary
+          broadcast({ type: "engine.summary", engine: engineSummary(status) })
+          // The enabled voices may have changed: a profile's voice may fall back to "" (or come back).
+          hub?.refreshProfiles()
+        }
+        // Which models are in use follows the running engines.
+        if (hub !== undefined) broadcast({ type: "models", models: modelsRef?.list() ?? [] })
       },
       describeEngines: (engines) =>
         engines.map((e) => (e.stage === "llm" && e.provider === SUBSCRIPTION_PROVIDER ? { ...e, detail: subscriptionDetail(), location: "hosted" } : e)),
@@ -484,33 +348,76 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       ...(options.adminNow !== undefined ? { now: options.adminNow } : {})
     })
     yield* Effect.addFinalizer(() => Effect.sync(() => admin.dispose()))
-    const frontends = makeFrontends({ store, enabledVoices })
+    const frontends = makeFrontends({
+      store,
+      enabledVoices,
+      conversationIdleMinutes: () => Number(sections.value("CONVERSATION_IDLE_MINUTES") ?? DEFAULT_CONVERSATION_IDLE_MINUTES)
+    })
 
-    /** The owner's profile → the wake gate (only when its part changed: `configure` drops a held utterance). */
-    let wakeKey = JSON.stringify(WAKE_ALWAYS)
-    const onOwnerProfile = (profile: DeviceProfile | undefined) => {
-      const next: WakeConfig = profile === undefined ? WAKE_ALWAYS : wakeConfigFromProfile(profile)
-      const key = JSON.stringify(next)
-      if (key === wakeKey) return
-      wakeKey = key
-      wake.configure(next)
-      tracker.wakeChanged(Math.max(next.followUpMs, next.armedMs ?? WAKE_ARMED_MS))
+    // One voice session per device (docs/VOICE-SESSIONS.md §2), on the shared engines.
+    const recordings = join(options.dataDir, "recordings")
+    const sttModel = () => {
+      const stt = theEngine.status().engines.find((e) => e.stage === "stt")
+      return stt === undefined ? "unknown" : `${stt.provider} ${stt.detail}`
     }
+    const sessions: VoiceSessions = makeVoiceSessions({
+      make: (key, device, initial) =>
+        makeVoiceSession({
+          key,
+          ...(device !== undefined ? { deviceId: device.id } : {}),
+          name: () => (device === undefined ? "Voice page without a device" : frontends.nameOf(device.id) ?? device.name),
+          engine: theEngine,
+          profile: () => hub?.profileOf(key) ?? frontends.profile(device?.id),
+          assistantDefaultVoice: () => String(sections.value("DEFAULT_VOICE")),
+          enabledVoices,
+          conversationSetup,
+          moduleOfTool: (name) => host.snapshot().toolModules.get(name) ?? null,
+          turnTrace,
+          send: (message) => hub?.toSession(key, message),
+          wakeHeard: (text, phrase, accepted) => hub?.wakeHeard(key, text, phrase, accepted),
+          onChange: (minor) => hub?.sessionsChanged(minor),
+          onTrace: (trace) => {
+            sessions.addTrace(trace)
+            // Admin's Diagnostics › Latency grows live (admin connections get no `turn.*`; ADMIN_ONLY).
+            hub?.broadcast({ type: "trace", key, ...(device !== undefined ? { deviceId: device.id } : {}), trace })
+          },
+          minuteMs,
+          ...(initial !== undefined ? { initialConversation: initial } : {}),
+          ...(options.stallMs !== undefined ? { stallMs: options.stallMs } : {}),
+          heard: {
+            dir: recordings,
+            enabled: () => sections.value("RECORD_HEARD_AUDIO") === true,
+            maxFiles: () => Number(sections.value("RECORD_HEARD_AUDIO_MAX_FILES") ?? 50),
+            model: sttModel,
+            writable: () => lock.held(),
+            begin: lock.begin,
+            lostOnTheWay: () => hub?.micFramesLost(key) ?? 0,
+            log: (line) => runFork(Effect.logInfo(line))
+          },
+          log: (line) => runFork(Effect.logWarning(line))
+        }),
+      max: () => Number(sections.value("MAX_VOICE_SESSIONS") ?? DEFAULT_MAX_VOICE_SESSIONS),
+      discardMs: () => Number(sections.value("SESSION_DISCARD_MINUTES") ?? DEFAULT_SESSION_DISCARD_MINUTES) * minuteMs,
+      runSync,
+      run,
+      onChange: (minor) => hub?.sessionsChanged(minor),
+      onDiscard: (key) => hub?.sessionDiscarded(key),
+      announce: (key, info) => hub?.toSession(key, { type: "conversation", id: info.id, reason: "new", startedAt: info.startedAt })
+    })
+    // Before the lock is released and the engines close (finalizers run in reverse): every session's loop stops, and
+    // no recording write or rotation happens after it.
+    yield* Effect.addFinalizer(() => sessions.closeAll)
 
     hub = makeSessionHub({
       admin,
       frontends,
-      onOwnerProfile,
       env: envMover,
       models,
       jobs,
-      web,
       engine: theEngine,
       host,
       sections,
-      publisher,
-      tracker,
-      gate,
+      sessions,
       run,
       server: { name: "personal-voice-assistance", version: "0.0.0" },
       keys,
@@ -522,10 +429,11 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
           const running = theEngine.voices()
           if (running !== undefined && !running.names.some((v) => v.name === wanted)) theEngine.setReloadPending(true, path)
         }
+        // CONVERSATION_IDLE_MINUTES is the built-in default of every profile's conversationIdleMinutes.
+        if (sectionId === "llm-behaviour") hubNow.refreshProfiles()
       },
       ...(options.helloTimeoutMs !== undefined ? { helloTimeoutMs: options.helloTimeoutMs } : {})
     })
-    theHub = hub
     const hubNow = hub
     host.subscribe((module) => {
       hubNow.broadcast({ type: "module.changed", module: access.module(module) })
@@ -617,7 +525,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     }
     const ready = Effect.asVoid(Effect.all([Fiber.await(modulesStarted), Fiber.await(engineStarted)]))
 
-    return { http, hub: hubNow, engine: theEngine, host, web, keys, vault, envView, envMover, jobs, models, ready }
+    return { http, hub: hubNow, engine: theEngine, sessions, host, keys, vault, envView, envMover, jobs, models, ready }
   })
 
 const isLoopback = (host: string) => host === "localhost" || host === "::1" || host.startsWith("127.")
@@ -664,9 +572,14 @@ export const serveMode = Effect.scoped(Effect.gen(function*() {
   const adminPassword = process.env.PVA_ADMIN_PASSWORD
   delete process.env.PVA_ADMIN_PASSWORD
   processEnvView.redact("PVA_ADMIN_PASSWORD")
+  // Tests only (the real-browser e2e): what one minute of conversationIdleMinutes / SESSION_DISCARD_MINUTES is, in ms.
+  const testMinuteMs = Number(process.env.PVA_TEST_MINUTE_MS ?? "")
+  const minuteMs = Number.isInteger(testMinuteMs) && testMinuteMs >= 100 ? testMinuteMs : undefined
+  if (minuteMs !== undefined) yield* Effect.logWarning(`PVA_TEST_MINUTE_MS: a minute of the idle and discard settings is ${minuteMs} ms (tests only).`)
   const handle = yield* startServe({
     ...config,
     tls,
+    ...(minuteMs !== undefined ? { minuteMs } : {}),
     ...(vaultPassword !== undefined && vaultPassword !== "" ? { vaultPassword } : {}),
     // Always passed (also when unset), so the env view's copy is never consulted.
     adminPassword: adminPassword ?? ""

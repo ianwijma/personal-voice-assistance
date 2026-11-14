@@ -9,6 +9,7 @@ import { cx } from "./ui/controls.tsx"
 /** The conversation as a transcript, oldest first; sticks to the bottom unless you scrolled up. */
 export function MessageList() {
   const turns = useClientState((s) => s.turns)
+  const divider = useClientState((s) => s.divider)
   const live = useClientState((s) => s.liveTranscript)
   const defaultVoice = useClientState(defaultVoiceOf)
   const scroller = useRef<HTMLDivElement>(null)
@@ -38,6 +39,16 @@ export function MessageList() {
   return (
     <div className="relative min-h-0 flex-1">
       <div ref={scroller} onScroll={onScroll} data-testid="messages" className="h-full overflow-y-auto px-5 py-4 scrollbar-quiet">
+        {/* Polite: a new conversation started by another tab of this device, or after a quiet while, is announced. */}
+        <div aria-live="polite">
+          {divider !== undefined && (
+            <p data-testid="conversation-divider" data-reason={divider} className="mb-5 flex items-center gap-3 text-center text-[12px] text-ink-faint">
+              <span aria-hidden="true" className="h-px min-w-6 flex-1 bg-line" />
+              <span>{divider === "idle" ? "New conversation — it had been quiet for a while" : "New conversation"}</span>
+              <span aria-hidden="true" className="h-px min-w-6 flex-1 bg-line" />
+            </p>
+          )}
+        </div>
         {turns.length === 0 && live === "" && (
           <p className="mt-8 text-center text-[14px] text-ink-faint">Nothing said yet. Talk, or type below.</p>
         )}

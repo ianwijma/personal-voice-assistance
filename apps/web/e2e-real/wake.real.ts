@@ -96,8 +96,11 @@ test.describe("asleep: unrelated talk is ignored; the phrase with a request is a
       // Nothing of the unrelated sentence reached the voice page: no transcript, no caption, no "hearing".
       const transcripts = ofType(before, "transcript").map((m) => String(m.text))
       expect(transcripts.join(" ")).not.toMatch(/tomato/i)
-      const states = await visualHistory(voice)
-      expect(states.slice(0, states.indexOf("listening") === -1 ? states.length : states.indexOf("listening"))).not.toContain("hearing")
+      // No "hearing" before the phrase woke it (at the wake the state goes straight to hearing: the same utterance).
+      const inbound = before.filter((m) => m.dir === "in")
+      const wokeAt = inbound.findIndex((m) => m.msg.type === "wake")
+      expect(wokeAt).toBeGreaterThan(-1)
+      expect(ofType(inbound.slice(0, wokeAt), "state").map((m) => m.state)).not.toContain("hearing")
       await waitForMessage(voice, (m) => m.msg.type === "turn.end", { timeout: 30_000 })
       expect((await turnEnds(voice))[0]!.outcome).toBe("completed")
 

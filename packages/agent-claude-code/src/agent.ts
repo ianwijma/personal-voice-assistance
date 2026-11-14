@@ -50,22 +50,46 @@ export interface ClaudeAgentOptions {
   readonly startTimeoutMs?: number
   readonly turnTimeoutMs?: number
   readonly interruptAckMs?: number
+  /**
+   * Most Claude Code sessions open at once, one per conversation (docs/VOICE-SESSIONS.md §3). When one more is
+   * needed, the least recently used one is closed (it primes from the history again if that conversation comes
+   * back). Default 4 (`MAX_VOICE_SESSIONS`'s default).
+   */
+  readonly maxSessions?: number
 }
 
 export const DEFAULTS = {
   startTimeoutMs: 9_000, // the host fails a start after 10 s
   turnTimeoutMs: 30_000,
   interruptAckMs: 1_000,
-  bindTimeoutMs: 3_000
+  bindTimeoutMs: 3_000,
+  maxSessions: 4
 }
 
 /** Minimal session states for logs and the status line. */
 export interface ClaudeAgentHandle extends AgentImplementation {
   readonly login: () => LoginInfo | undefined
-  /** Ends the session (module scope close). */
+  /** Ends every session (module scope close). */
   readonly shutdown: () => void
-  /** For tests and diagnostics. */
-  readonly session: () => ClaudeSession | undefined
+  /**
+   * For tests and diagnostics: the session of `conversationId`, or without one the most recently used
+   * conversation's session (else the warm spare).
+   */
+  readonly session: (conversationId?: string) => ClaudeSession | undefined
+  /** Conversations with an open session, least recently used first (tests, diagnostics). */
+  readonly conversations: () => ReadonlyArray<string>
+  /** Close the Claude Code session of a conversation that has ended (New conversation, a discarded voice session). */
+  readonly endConversation: (conversationId: string) => Effect.Effect<void>
+}
+
+/** One conversation's Claude Code session and its catch-up position. */
+interface Slot {
+  readonly conversationId: string
+  session: ClaudeSession | undefined
+  /** The session being started for this conversation. */
+  starting: Promise<ClaudeSession> | undefined
+  /** Shared-history index at the start of this conversation's last turn here (catch-up, §1.4). */
+  syncedThrough: number
 }
 
 const sessionToolsOf = (input: AgentTurnInput): ReadonlyArray<SessionTool> =>
@@ -77,9 +101,14 @@ const isAuthError = (e: string | undefined) =>
 
 /**
  * The Claude subscription agent's behaviour, independent of the module
- * plumbing. `start` spawns a warm (provisional) session and checks the login;
- * each `turn` reuses it, restarting it when the prompt or the tools changed,
- * after a crash, a stuck interrupt or `sessionIdleMinutes` without a turn.
+ * plumbing. `start` spawns a warm (provisional) session and checks the login
+ * (once, for every conversation). Each conversation (`AgentTurnInput.conversationId`)
+ * gets its own session, opened at its first turn (the warm spare when there is one),
+ * with its own catch-up position; turns of different conversations run in parallel.
+ * A conversation's session is restarted when the prompt or the tools changed, after a
+ * crash or a stuck interrupt; it is closed after `sessionIdleMinutes` without a turn,
+ * by `endConversation`, and (least recently used first) when `maxSessions` are open
+ * and another conversation needs one.
  */
 export const makeClaudeAgent = async (options: ClaudeAgentOptions): Promise<ClaudeAgentHandle> => {
   const sdk = options.sdk ?? (await loadClaudeSdk())
@@ -92,44 +121,101 @@ export const makeClaudeAgent = async (options: ClaudeAgentOptions): Promise<Clau
   /** Every error text this agent produces is redacted with these (the proxy secret: `proxySecrets`). */
   const secrets = proxySecrets(options.proxy)
 
+  const maxSessions = Math.max(1, options.maxSessions ?? DEFAULTS.maxSessions)
+
   let closed = false
-  let current: ClaudeSession | undefined
-  let starting: Promise<ClaudeSession> | undefined
+  /** Conversations with a session (open or starting), least recently used first (re-inserted at every turn). */
+  const slots = new Map<string, Slot>()
+  /**
+   * A warm session not yet given to a conversation: the one spawned at start (provisional), or a replacement
+   * started in the background after one closed. The next conversation that needs a session takes it.
+   */
+  let spare: { session: ClaudeSession; ready: Promise<ClaudeSession> } | undefined
   /** The last real prompt and tool set, so a replacement session is spawned with them (warm, not provisional). */
   let known: { system: string; tools: ReadonlyArray<SessionTool> } | undefined
-  /** Shared-history index at the start of this agent's last turn (catch-up, §1.4). */
-  let syncedThrough = 0
   let login: LoginInfo | undefined
 
-  const spawn = (config: Omit<SessionConfig, "model" | "claudePath" | "env" | "proxy" | "debug">): Promise<ClaudeSession> => {
+  const spawn = (config: Omit<SessionConfig, "model" | "claudePath" | "env" | "proxy" | "debug">) => {
     const session = new ClaudeSession(sdk, { ...config, model: options.model, claudePath: options.claudePath, env, proxy: options.proxy, debug: options.debug === true }, now)
     const ready = session.start(startTimeoutMs).then((info) => {
       login = info
       return session
     })
-    current = session
-    starting = ready
-    ready.then(
-      () => {
-        if (starting === ready) starting = undefined
-      },
-      () => {
-        if (starting === ready) starting = undefined
-      }
-    )
-    return ready
+    return { session, ready }
   }
 
-  /** Start a replacement in the background, so the next turn finds a warm session. */
+  /** Sessions that hold (or are starting) a Claude Code process for a conversation. */
+  const boundCount = () => {
+    let n = 0
+    for (const slot of slots.values()) if (slot.starting !== undefined || (slot.session !== undefined && slot.session.dead === undefined)) n++
+    return n
+  }
+
+  /** Start a replacement in the background, so the next turn finds a warm session (if there is room for one). */
   const respawnSoon = () => {
-    if (closed) return
-    spawn(known !== undefined ? { system: known.system, tools: known.tools } : { system: undefined, tools: [] }).catch(() => {})
+    if (closed || spare !== undefined || boundCount() >= maxSessions) return
+    const s = spawn(known !== undefined ? { system: known.system, tools: known.tools } : { system: undefined, tools: [] })
+    spare = s
+    s.ready.catch(() => {
+      if (spare === s) spare = undefined
+    })
   }
 
-  /** A ready session for this turn's prompt and tools, and the instructions to prepend when binding a provisional one. */
-  const acquire = async (system: string, tools: ReadonlyArray<SessionTool>): Promise<{ session: ClaudeSession; instructions?: string }> => {
+  const closeSlot = (slot: Slot, reason: string) => {
+    if (slots.get(slot.conversationId) === slot) slots.delete(slot.conversationId)
+    slot.session?.kill(reason)
+    slot.starting?.then((s) => s.kill(reason), () => {})
+    slot.session = undefined
+  }
+
+  /** Make room for one more conversation's session: close the least recently used one (an idle one first). */
+  const makeRoom = (forSlot: Slot) => {
+    while (boundCount() >= maxSessions) {
+      const others = [...slots.values()].filter((s) => s !== forSlot && (s.starting !== undefined || (s.session !== undefined && s.session.dead === undefined)))
+      const victim = others.find((s) => s.starting === undefined && s.session?.inTurn === false && s.session.draining === undefined) ?? others[0]
+      if (victim === undefined) return
+      closeSlot(victim, "closed for another conversation")
+    }
+  }
+
+  /** A session for `slot`: the warm spare if it fits, else a new one (closing the least recently used if needed). */
+  const take = async (slot: Slot, system: string, tools: ReadonlyArray<SessionTool>): Promise<ClaudeSession> => {
+    const key = toolKey(tools)
+    const s = spare
+    spare = undefined
+    if (s !== undefined) {
+      const ready = await s.ready.catch(() => undefined)
+      if (ready !== undefined && ready.dead === undefined && !ready.used &&
+        (ready.provisional || (ready.system === system && ready.toolKey === key))) {
+        slot.session = ready
+        return ready
+      }
+      s.session.kill("replaced")
+    }
+    makeRoom(slot)
+    const started = spawn({ system, tools })
+    slot.session = started.session
+    slot.starting = started.ready
+    try {
+      return await started.ready
+    } finally {
+      if (slot.starting === started.ready) slot.starting = undefined
+    }
+  }
+
+  const slotFor = (conversationId: string): Slot => {
+    let slot = slots.get(conversationId)
+    if (slot === undefined) slot = { conversationId, session: undefined, starting: undefined, syncedThrough: 0 }
+    // Most recently used last.
+    slots.delete(conversationId)
+    slots.set(conversationId, slot)
+    return slot
+  }
+
+  /** A ready session for this turn's conversation, prompt and tools, and the instructions to prepend when binding a provisional one. */
+  const acquire = async (slot: Slot, system: string, tools: ReadonlyArray<SessionTool>): Promise<{ session: ClaudeSession; instructions?: string }> => {
     if (closed) throw new SessionError(`${AGENT_NAME} is stopped`, "unavailable")
-    let session = starting !== undefined ? await starting.catch(() => undefined) : current
+    let session = slot.starting !== undefined ? await slot.starting.catch(() => undefined) : slot.session
     if (session?.draining !== undefined) await session.draining
     const key = toolKey(tools)
     const stale = session === undefined || session.dead !== undefined ||
@@ -138,8 +224,11 @@ export const makeClaudeAgent = async (options: ClaudeAgentOptions): Promise<Clau
       (session.provisional && session.used)
     if (stale) {
       session?.kill("replaced")
-      session = await spawn({ system, tools })
+      slot.session = undefined
+      if (slots.get(slot.conversationId) !== slot) slots.set(slot.conversationId, slot) // closed meanwhile: open again
+      session = await take(slot, system, tools)
     }
+    if (closed) throw new SessionError(`${AGENT_NAME} is stopped`, "unavailable")
     known = { system, tools }
     if (session!.provisional) {
       await session!.bind(system, tools, DEFAULTS.bindTimeoutMs)
@@ -175,7 +264,8 @@ export const makeClaudeAgent = async (options: ClaudeAgentOptions): Promise<Clau
 
         const run = async (): Promise<void> => {
           const tools = options.tools ? sessionToolsOf(input) : []
-          const acquired = await acquire(input.system, tools)
+          const slot = slotFor(input.conversationId)
+          const acquired = await acquire(slot, input.system, tools)
           session = acquired.session
           if (controller.signal.aborted) return
           const fresh = !session.used
@@ -184,8 +274,8 @@ export const makeClaudeAgent = async (options: ClaudeAgentOptions): Promise<Clau
           // here starts at `historyStart` once old turns have been evicted. A negative
           // offset (our own last turn was evicted) clamps to 0 inside `catchUpBlock`.
           const start = input.historyStart ?? 0
-          const earlier = fresh ? primeBlock(input.history, ctx) : catchUpBlock(input.history, syncedThrough - start, ctx)
-          syncedThrough = start + input.history.length
+          const earlier = fresh ? primeBlock(input.history, ctx) : catchUpBlock(input.history, slot.syncedThrough - start, ctx)
+          slot.syncedThrough = start + input.history.length
           const text = composeMessage({ instructions: acquired.instructions, earlier, context: input.context, text: input.text })
 
           let textSinceTool = false
@@ -317,7 +407,9 @@ export const makeClaudeAgent = async (options: ClaudeAgentOptions): Promise<Clau
 
   // Warm up: spawn the session now, so the process start is off the first turn's path.
   // No warm-up *turn*: it would spend quota and put a message in the session.
-  const first = await spawn({ system: undefined, tools: [] })
+  const warm = spawn({ system: undefined, tools: [] })
+  const first = await warm.ready
+  spare = warm
   if (first.login?.apiKeySource !== undefined && first.login.apiKeySource !== "none" && first.login.apiKeySource !== "oauth") {
     closed = true
     first.kill("not a subscription login")
@@ -329,12 +421,17 @@ export const makeClaudeAgent = async (options: ClaudeAgentOptions): Promise<Clau
 
   // Idle restart: bounds the memory of a day-long session (untested) and keeps a warm one ready.
   const idleTimer = setInterval(() => {
-    const s = current
-    if (closed || s === undefined || !s.used || s.dead !== undefined || s.draining !== undefined) return
-    if (now() - s.lastUsedAt > idleMs) {
-      s.kill("idle")
-      respawnSoon()
+    if (closed) return
+    let closedOne = false
+    for (const slot of [...slots.values()]) {
+      const s = slot.session
+      if (slot.starting !== undefined || s === undefined || !s.used || s.dead !== undefined || s.draining !== undefined || s.inTurn) continue
+      if (now() - s.lastUsedAt > idleMs) {
+        closeSlot(slot, "idle")
+        closedOne = true
+      }
     }
+    if (closedOne) respawnSoon()
   }, Math.min(60_000, Math.max(1_000, idleMs / 4)))
   idleTimer.unref?.()
 
@@ -343,7 +440,19 @@ export const makeClaudeAgent = async (options: ClaudeAgentOptions): Promise<Clau
     speculate: options.speculate,
     systemPrompt: options.systemPrompt,
     login: () => login,
-    session: () => current,
+    session: (conversationId) => {
+      if (conversationId !== undefined) return slots.get(conversationId)?.session
+      return [...slots.values()].at(-1)?.session ?? spare?.session
+    },
+    conversations: () => [...slots.keys()],
+    endConversation: (conversationId) =>
+      Effect.sync(() => {
+        const slot = slots.get(conversationId)
+        if (slot === undefined) return
+        closeSlot(slot, "the conversation ended")
+        // Keep a warm session for the next conversation.
+        respawnSoon()
+      }),
     settingOptions: () => ({ model: login?.models.length ? login.models : MODELS }),
     info: () => ({
       login: login === undefined ? "" : `Logged in with a ${login.subscriptionType ?? "Claude"} plan`
@@ -351,7 +460,9 @@ export const makeClaudeAgent = async (options: ClaudeAgentOptions): Promise<Clau
     shutdown: () => {
       closed = true
       clearInterval(idleTimer)
-      current?.kill("stopped")
+      for (const slot of [...slots.values()]) closeSlot(slot, "stopped")
+      spare?.session.kill("stopped")
+      spare = undefined
     }
   }
 }
@@ -432,7 +543,14 @@ const settings = {
  * subscription, by driving Claude Code with the Agent SDK. Off by default and
  * behind an explicit opt-in (§1.8).
  */
-export const claudeSubscriptionAgentModule = (deps: { readonly sdk?: ClaudeSdk; readonly env?: Readonly<Record<string, string | undefined>> } = {}) =>
+export const claudeSubscriptionAgentModule = (
+  deps: {
+    readonly sdk?: ClaudeSdk
+    readonly env?: Readonly<Record<string, string | undefined>>
+    /** Most Claude Code sessions at once (one per conversation; the assistant's `MAX_VOICE_SESSIONS`). Default 4. */
+    readonly maxSessions?: number
+  } = {}
+) =>
   defineAgent({
     id: AGENT_ID,
     name: AGENT_NAME,
@@ -463,6 +581,7 @@ export const claudeSubscriptionAgentModule = (deps: { readonly sdk?: ClaudeSdk; 
                 proxy: s.proxy,
                 debug: s.debugLogs,
                 ...(deps.sdk !== undefined ? { sdk: deps.sdk } : {}),
+                ...(deps.maxSessions !== undefined ? { maxSessions: deps.maxSessions } : {}),
                 ...(deps.env !== undefined ? { env: deps.env } : {})
               }),
             catch: (e) => {
@@ -479,7 +598,7 @@ export const claudeSubscriptionAgentModule = (deps: { readonly sdk?: ClaudeSdk; 
         )
         const plan = agent.login()?.subscriptionType
         setStatus({ text: `Ready · ${s.model.trim()}${plan !== undefined ? ` · ${plan} plan` : ""}`, tone: "ok" })
-        const { login: _l, shutdown: _s, session: _x, ...implementation } = agent
+        const { conversations: _c, login: _l, shutdown: _s, session: _x, ...implementation } = agent
         return implementation
       })
   })

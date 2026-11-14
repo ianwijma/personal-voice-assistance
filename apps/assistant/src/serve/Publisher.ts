@@ -29,6 +29,8 @@ export interface PublisherOptions {
   readonly voices: () => { readonly defaultVoice: string; readonly names: ReadonlySet<string> }
   /** Right after `turn.start` of a committed (or just promoted) turn went out, before the rest of its messages. */
   readonly onCommitted?: (turnId: number) => void
+  /** A committed turn ended: its trace (serve mode keeps the recent ones of every session for admin). */
+  readonly onTrace?: (trace: TraceInfo) => void
 }
 
 export interface Publisher {
@@ -67,7 +69,8 @@ export const traceInfo = (trace: Trace): TraceInfo => {
     ...(trace.endedAt !== undefined ? { totalMs: Math.round((trace.endedAt - origin) * 10) / 10 } : {}),
     tools: trace.tools.map((t) => ({ name: t.name, ms: Math.max(0, Math.round(t.ms)) })),
     voices: [...trace.voices],
-    ...(trace.client !== undefined ? { client: { ...trace.client } } : {})
+    ...(trace.client !== undefined ? { client: { ...trace.client } } : {}),
+    ...(trace.session !== undefined ? { session: trace.session.slice(0, 64) } : {})
   }
 }
 
@@ -163,7 +166,10 @@ export const makePublisher = (options: PublisherOptions): Publisher => {
         const info = traceInfo(event.trace)
         traces.push(info)
         if (traces.length > MAX_TRACES) traces.shift()
-        options.broadcast({ type: "turn.end", turnId: event.turnId, outcome: event.outcome, trace: info })
+        // Admin's traces carry the session (the device's name, which admin sets); the device's own tabs do not need it.
+        options.onTrace?.(info)
+        const { session: _session, ...forDevice } = info
+        options.broadcast({ type: "turn.end", turnId: event.turnId, outcome: event.outcome, trace: forDevice })
         if (event.outcome === "failed") {
           options.broadcast({
             type: "error",

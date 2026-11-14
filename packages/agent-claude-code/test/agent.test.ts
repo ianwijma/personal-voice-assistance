@@ -24,6 +24,7 @@ const makeInput = (overrides: Partial<AgentTurnInput> & { marks?: Array<TraceMar
   return {
     turnId: 1,
     text: "What's a good name for a goldfish?",
+    conversationId: "c1",
     utterance: "Hey Claude, what's a good name for a goldfish?",
     source: "voice",
     spoken: true,
@@ -439,4 +440,105 @@ describe("proxy credentials and the locale and XDG lists (sixth review, finding 
     expect(env).toMatchObject({ LC_ALL: "C", LC_TIME: "en_GB.UTF-8", XDG_CONFIG_HOME: "/c", XDG_RUNTIME_DIR: "/run/user/1000", HTTP_PROXY: "http://proxy:3128" })
     for (const k of ["LC_SECRET_TOKEN", "LC_ANYTHING", "XDG_API_KEY", "XDG_WHATEVER", "https_proxy", "ALL_PROXY"]) expect(env[k]).toBeUndefined()
   })
+})
+
+describe("claude-subscription agent: one session per conversation (docs/VOICE-SESSIONS.md §3)", () => {
+  const conv = (conversationId: string, text: string, history: Array<Message> = []) => makeInput({ conversationId, text, history })
+
+  it.live("two conversations run in parallel, each in its own session; the first takes the warm one; one login check", () =>
+    Effect.gen(function*() {
+      const fake = makeFakeSdk({
+        respond: async (ctx) => {
+          await ctx.sleep(150)
+          ctx.delta(`Answer to ${ctx.text.split("\n").at(-1)}`)
+          ctx.result()
+        }
+      })
+      const agent = yield* Effect.promise(() => makeClaudeAgent({ ...agentOptions, sdk: fake.sdk }))
+      const t0 = Date.now()
+      const [a, b] = yield* Effect.all([collect(agent.turn(conv("kitchen", "Hi from the kitchen"))), collect(agent.turn(conv("desk", "Hi from the desk")))], {
+        concurrency: "unbounded"
+      })
+      const elapsed = Date.now() - t0
+      expect(texts(a)).toEqual(["Answer to Hi from the kitchen"])
+      expect(texts(b)).toEqual(["Answer to Hi from the desk"])
+      assert.isBelow(elapsed, 280, "the two turns overlapped (each takes 150 ms)")
+      expect(fake.queries).toHaveLength(2)
+      // The warm (provisional) session was bound for the first conversation; the second was spawned with the real prompt.
+      expect(fake.queries[0]!.received[0]).toContain("<instructions>")
+      expect(fake.queries[1]!.options.systemPrompt).toBe("You are Jev's colleague. Speak briefly.")
+      expect(fake.queries[1]!.received[0]).toBe("Hi from the desk")
+      expect(agent.session("kitchen")).not.toBe(agent.session("desk"))
+      expect(agent.conversations()).toEqual(["kitchen", "desk"])
+      agent.shutdown()
+      expect(fake.queries.every((q) => q.closed)).toBe(true)
+    }))
+
+  it.live("catch-up is kept per conversation", () =>
+    Effect.gen(function*() {
+      const fake = makeFakeSdk()
+      const agent = yield* Effect.promise(() => makeClaudeAgent({ ...agentOptions, sdk: fake.sdk }))
+      yield* collect(agent.turn(conv("a", "Hi")))
+      yield* collect(agent.turn(conv("b", "Hello")))
+      // Conversation a: Jev answered something since; b: nothing new.
+      const ha: Array<Message> = [
+        { role: "user", content: "Hi" },
+        { role: "assistant", content: "Hello there.", agentId: "claude-subscription" } as Message,
+        { role: "user", content: "turn on the lights" },
+        { role: "assistant", content: "Living room lights on.", agentId: "jev" } as Message
+      ]
+      const hb: Array<Message> = [{ role: "user", content: "Hello" }, { role: "assistant", content: "Hello there.", agentId: "claude-subscription" } as Message]
+      yield* collect(agent.turn(conv("b", "And now?", hb)))
+      yield* collect(agent.turn(conv("a", "Did that work?", ha)))
+      const qa = fake.queries.find((q) => q.received[0]?.endsWith("Hi"))!
+      const qb = fake.queries.find((q) => q.received[0]?.endsWith("Hello"))!
+      expect(qb.received[1]).toBe("And now?")
+      expect(qa.received[1]).toBe("<earlier>\nUser: turn on the lights\nJev: Living room lights on.\n</earlier>\n\nDid that work?")
+      agent.shutdown()
+    }))
+
+  it.live("at most maxSessions open: the least recently used one is closed, and primes from the history when it comes back", () =>
+    Effect.gen(function*() {
+      const fake = makeFakeSdk()
+      const agent = yield* Effect.promise(() => makeClaudeAgent({ ...agentOptions, sdk: fake.sdk, maxSessions: 2 }))
+      yield* collect(agent.turn(conv("a", "One")))
+      yield* collect(agent.turn(conv("b", "Two")))
+      yield* collect(agent.turn(conv("a", "One again", [{ role: "user", content: "One" }, { role: "assistant", content: "Hello there.", agentId: "claude-subscription" } as Message])))
+      // b is now the least recently used: a third conversation closes it.
+      const bSession = agent.session("b")!
+      yield* collect(agent.turn(conv("c", "Three")))
+      expect(bSession.dead).toBeDefined()
+      expect(agent.conversations()).toEqual(["a", "c"])
+      expect(fake.queries.filter((q) => !q.closed)).toHaveLength(2)
+      // b comes back: a fresh session (closing a, now the least recently used), told what was said before.
+      const hb: Array<Message> = [{ role: "user", content: "Two" }, { role: "assistant", content: "Hello there.", agentId: "claude-subscription" } as Message]
+      yield* collect(agent.turn(conv("b", "Two again", hb)))
+      expect(agent.conversations()).toEqual(["c", "b"])
+      expect(fake.queries.at(-1)!.received[0]).toBe("<earlier>\nUser: Two\nYou: Hello there.\n</earlier>\n\nTwo again")
+      expect(fake.queries.filter((q) => !q.closed)).toHaveLength(2)
+      agent.shutdown()
+    }))
+
+  it.live("endConversation closes that conversation's session and keeps a warm one for the next conversation", () =>
+    Effect.gen(function*() {
+      const fake = makeFakeSdk()
+      const agent = yield* Effect.promise(() => makeClaudeAgent({ ...agentOptions, sdk: fake.sdk }))
+      yield* collect(agent.turn(conv("old", "Hi")))
+      yield* collect(agent.turn(conv("other", "Hello")))
+      const old = agent.session("old")!
+      yield* agent.endConversation("old")
+      expect(old.dead).toBeDefined()
+      expect(agent.conversations()).toEqual(["other"])
+      expect(agent.session("other")!.dead).toBeUndefined()
+      const spawned = fake.queries.length
+      // The new conversation takes the warm replacement: no process start on its first turn.
+      yield* Effect.sleep("20 millis")
+      yield* collect(agent.turn(conv("new", "Fresh start")))
+      expect(fake.queries).toHaveLength(spawned)
+      expect(fake.queries.at(-1)!.received[0]).toBe("Fresh start")
+      // Unknown or already closed: nothing happens.
+      yield* agent.endConversation("old")
+      yield* agent.endConversation("never")
+      agent.shutdown()
+    }))
 })

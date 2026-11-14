@@ -436,12 +436,23 @@ export const setFrontendDefaults = async (url: string, patch: Record<string, unk
 
 export type History = ReadonlyArray<{ role: "user" | "assistant"; text: string; interrupted?: boolean; tools?: ReadonlyArray<{ name: string; ok: boolean }> }>
 
-/** The server's conversation history, as a newly connecting tab receives it (`welcome.snapshot.history`). */
-export const serverHistory = async (url: string): Promise<History> => {
+/**
+ * The server's conversation history of `page`'s device, as a newly connecting tab of that device receives it
+ * (`welcome.snapshot.history`). Protocol 6: a conversation per device, so the probe says it is that device.
+ */
+export const serverHistory = async (url: string, page: Page): Promise<History> => {
+  const deviceId = await page.evaluate(() => localStorage.getItem("pva.deviceId") ?? "")
   const ws = new WebSocket(`${url.replace(/^http/, "ws")}/ws`)
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error("no welcome")), 5000)
-    ws.onopen = () => ws.send(JSON.stringify({ type: "hello", protocol: PROTOCOL_VERSION, clientId: `probe-${Date.now()}`, resumeOwner: false, frontend: "voice" }))
+    ws.onopen = () => ws.send(JSON.stringify({
+        type: "hello",
+        protocol: PROTOCOL_VERSION,
+        clientId: `probe-${Date.now()}`,
+        resumeOwner: false,
+        frontend: "voice",
+        ...(deviceId === "" ? {} : { device: { id: deviceId, kind: "web-voice", name: "probe" } })
+      }))
     ws.onmessage = (e) => {
       const m = JSON.parse(String(e.data)) as { type: string; snapshot?: { history: History } }
       if (m.type === "welcome") {

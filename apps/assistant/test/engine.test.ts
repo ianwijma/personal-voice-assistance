@@ -1,9 +1,11 @@
-// Engine builds and reloads (Engine.ts): the rebuild guard and the build's completion.
+// Engine builds and reloads (Engine.ts): the rebuild guard and the build's completion; a session's loop on the
+// engines (SessionConversation.ts): typed-input admission, loops restarted by a reload, a failed loop.
 import { assert, describe, it } from "@effect/vitest"
-import { AudioOutput, type ConversationEvent, makeTurnTrace } from "@pva/core"
+import { AudioOutput, type ConversationEvent, makeToolRegistry, makeTurnTrace } from "@pva/core"
 import type { HostResult } from "@pva/core"
 import { ConfigProvider, Deferred, Effect, Fiber, Stream } from "effect"
-import { EngineBuildProblems, type EngineProviders, makeEngine, type ProviderBuilder, retryWhenPreviousModelGone } from "../src/serve/Engine.ts"
+import { type Engine, EngineBuildProblems, type EngineProviders, makeEngine, type ProviderBuilder, retryWhenPreviousModelGone } from "../src/serve/Engine.ts"
+import { makeSessionConversation } from "../src/serve/SessionConversation.ts"
 import { controlledStt, fakeBuild, scriptedLlm } from "./support/serveHarness.ts"
 
 const base = fakeBuild({ stt: controlledStt().stt, llm: scriptedLlm(() => "Ok.").llm })
@@ -18,24 +20,30 @@ const scriptedBuild = (steps: ReadonlyArray<Effect.Effect<void> | undefined>) =>
   return { build, builds: () => n }
 }
 
-const engineWith = (
-  build: ProviderBuilder,
-  preflight?: Effect.Effect<void, never>,
-  output?: AudioOutput["Service"],
-  onEvent: (event: ConversationEvent) => void = () => {}
-) =>
+const engineWith = (build: ProviderBuilder, preflight?: Effect.Effect<void, never>) =>
   makeEngine({
     build,
     ...(preflight === undefined ? {} : { preflight }),
     configProvider: () => ConfigProvider.fromEnvRecord({}),
-    input: { stream: Stream.never },
-    output: output ?? AudioOutput.of({ play: (audio) => Stream.runDrain(audio) }),
-    turnTrace: makeTurnTrace(),
-    setup: Effect.succeed({ system: "", registry: { tools: [], find: () => undefined } as never }),
-    onEvent,
-    gate: (events) => events,
     defaultVoice: () => "standard",
     onStatus: () => {}
+  })
+
+/** A voice session's conversation on `engine` (no speech: typed input only), started. */
+const sessionOn = (engine: Engine, output?: AudioOutput["Service"], onEvent: (event: ConversationEvent) => void = () => {}) =>
+  Effect.gen(function*() {
+    const conversation = yield* makeSessionConversation({
+      engine,
+      input: { stream: Stream.never },
+      output: output ?? AudioOutput.of({ play: (audio) => Stream.runDrain(audio) }),
+      turnTrace: makeTurnTrace(),
+      setup: Effect.succeed({ system: "", registry: makeToolRegistry([]) }),
+      onEvent,
+      gate: (events) => events,
+      defaultVoice: () => "standard"
+    })
+    conversation.start()
+    return conversation
   })
 
 const busy = (r: HostResult) => !r.ok && r.error.code === "busy"
@@ -87,7 +95,7 @@ describe("Engine: reload guard", () => {
     }).pipe(Effect.scoped))
 })
 
-/** Accepted by `Engine.send` (an older engine answered `true` for everything). */
+/** Accepted by `SessionConversation.send` (an older engine answered `true` for everything). */
 const accepted = (r: unknown) => r === true || r === "accepted"
 
 describe("Engine: startIfStopped (seventh review)", () => {
@@ -118,7 +126,7 @@ describe("Engine: startIfStopped (seventh review)", () => {
     }))
 })
 
-describe("Engine: typed input admission", () => {
+describe("voice session conversation: typed input admission", () => {
   /**
    * A reply that plays until interrupted, whose interruption then waits for `release` (as the real output waits
    * for the browser's final playback report): while it waits, the conversation takes no input.
@@ -141,10 +149,11 @@ describe("Engine: typed input admission", () => {
             return yield* Effect.never
           }).pipe(Effect.onInterrupt(() => Deferred.await(release)))
       })
-      const engine = yield* engineWith(fakeBuild({ stt: controlledStt().stt, llm: llm.llm }), undefined, output, onEvent)
+      const built = yield* engineWith(fakeBuild({ stt: controlledStt().stt, llm: llm.llm }))
       // Never leave the scope's close waiting on the held-up interruption when an assertion fails.
       yield* Effect.addFinalizer(() => Deferred.succeed(release, undefined))
-      assert.isTrue((yield* engine.start).ok)
+      assert.isTrue((yield* built.start).ok)
+      const engine = yield* sessionOn(built, output, onEvent)
       assert.isTrue(accepted(engine.send({ _tag: "TextInput", text: "first", speak: true })))
       for (let i = 0; i < 200 && plays === 0; i++) yield* Effect.sleep(5)
       assert.strictEqual(plays, 1, "the first reply is playing")
@@ -197,12 +206,6 @@ describe("Engine: a build refused because the previous recogniser is still shutt
       const engine = yield* makeEngine({
         build,
         configProvider: () => ConfigProvider.fromEnvRecord({}),
-        input: { stream: Stream.never },
-        output: AudioOutput.of({ play: (audio) => Stream.runDrain(audio) }),
-        turnTrace: makeTurnTrace(),
-        setup: Effect.succeed({ system: "", registry: { tools: [], find: () => undefined } as never }),
-        onEvent: () => {},
-        gate: (events) => events,
         defaultVoice: () => "standard",
         onStatus: (s) => statuses.push(s.state),
         retryAfter: (problems) => problems.some((p) => p.message.startsWith(orphaned)) ? Deferred.await(gone) : undefined
@@ -222,4 +225,44 @@ describe("Engine: a build refused because the previous recogniser is still shutt
     assert.isDefined(retryWhenPreviousModelGone([{ stage: "stt", message: "x The previous local speech model has not shut down: a native decode has not finished, and it still holds its memory. No second model is loaded beside it; try again once it finishes, or restart the assistant." }]))
     assert.isUndefined(retryWhenPreviousModelGone([{ stage: "stt", message: "model files missing" }]))
   })
+})
+
+describe("Engine: session loops", () => {
+  it.live("a reload stops every attached loop and starts it again; each keeps its own history", () =>
+    Effect.gen(function*() {
+      const engine = yield* engineWith(base)
+      assert.isTrue((yield* engine.start).ok)
+      const turns: Array<string> = []
+      const onEvent = (e: ConversationEvent) => {
+        if (e._tag === "TurnEnded" && e.outcome === "completed") turns.push(String(e.turnId))
+      }
+      const a = yield* sessionOn(engine, undefined, onEvent)
+      const b = yield* sessionOn(engine, undefined, onEvent)
+      assert.isTrue(accepted(a.send({ _tag: "TextInput", text: "to a", speak: false })))
+      assert.isTrue(accepted(b.send({ _tag: "TextInput", text: "to b", speak: false })))
+      for (let i = 0; i < 200 && turns.length < 2; i++) yield* Effect.sleep(5)
+      const idA = a.conversation().id
+      assert.isTrue((yield* engine.reload.pipe(Effect.timeout(2_000))).ok)
+      for (let i = 0; i < 200 && !(a.running() && b.running()); i++) yield* Effect.sleep(5)
+      assert.deepStrictEqual((yield* a.history).filter((m) => m.role === "user").map((m) => m.content), ["to a"])
+      assert.deepStrictEqual((yield* b.history).filter((m) => m.role === "user").map((m) => m.content), ["to b"])
+      assert.strictEqual(a.conversation().id, idA)
+      assert.notStrictEqual(a.conversation().id, b.conversation().id)
+      yield* a.end
+      assert.isFalse(a.running())
+      assert.strictEqual(a.send({ _tag: "TextInput", text: "gone", speak: false }), "not_running")
+    }).pipe(Effect.scoped))
+
+  it.live("a loop that fails stops the engines (reported as a speech-to-text problem)", () =>
+    Effect.gen(function*() {
+      const engine = yield* engineWith(base)
+      assert.isTrue((yield* engine.start).ok)
+      yield* sessionOn(engine)
+      const detach = engine.attach({ run: () => Effect.fail(new Error("recogniser crashed")) })
+      for (let i = 0; i < 200 && engine.status().state === "ready"; i++) yield* Effect.sleep(5)
+      assert.strictEqual(engine.status().state, "failed")
+      assert.deepStrictEqual(engine.status().problems, [{ stage: "speech-to-text", message: "recogniser crashed" }])
+      assert.isFalse(engine.ready())
+      yield* detach
+    }).pipe(Effect.scoped))
 })

@@ -21,6 +21,8 @@ export interface RecognizerCore {
     readonly pendingDecodes: number
     readonly retainedStreamingFrames: number
     readonly pieces: number
+    /** Sessions open now. */
+    readonly sessions: number
     readonly stats: RecognizerCoreStats
   }
 }
@@ -37,8 +39,12 @@ export declare const makeRecognizerCore: (deps: {
   config: unknown
   online?: unknown
   offline?: unknown
-  vad: unknown
+  /** The VAD of the first session (loaded and warm at startup); reused by later sessions when it is free. */
+  vad?: unknown
+  /** Creates a VAD for a session when every existing one is in use (several sessions at once). */
+  makeVad?: () => unknown
   agc?: unknown
+  makeAgc?: () => unknown
   post: (message: any) => void
   collect?: () => void
   segmentLimits?: Partial<{ checkpointMs: number; pauseMs: number; hardCheckpointMs: number; overlapMs: number; keepMs: number; joinHoldMs: number }>

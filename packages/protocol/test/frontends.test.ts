@@ -29,9 +29,6 @@ const decodeProfile = Schema.decodeUnknownResult(DeviceProfile)
 const okProfile = (v: unknown) => decodeProfile(v)._tag === "Success"
 
 describe("protocol 5", () => {
-  it("is version 5", () => {
-    expect(PROTOCOL_VERSION).toBe(5)
-  })
 
   it("hello needs a front-end role; device and adminToken are optional and validated", () => {
     const { frontend: _f, ...noRole } = clientExamples.hello

@@ -103,8 +103,12 @@ describe("serve: LLM_PROVIDER=claude-subscription", () => {
       location: "hosted"
     })
     expect(welcome.snapshot.modules.find((m) => m.id === SUBSCRIPTION_AGENT_ID)).toMatchObject({ enabled: false, protected: true })
+    // Typed on voice pages of two devices (admin connections have no voice session since protocol 6).
+    const voice = await ScriptedClient.connect({ url: server.url, deviceId: "device-a" })
+    clients.push(voice)
+    await voice.hello()
 
-    const off = await reply(client, "what time is it", "t1")
+    const off = await reply(voice, "what time is it", "t1")
     expect(off).toBe(`${OFF}\nYou said: what time is it.`)
     expect(fake.queries).toHaveLength(0)
 
@@ -118,7 +122,7 @@ describe("serve: LLM_PROVIDER=claude-subscription", () => {
     const engine = await client.waitFor("engine", (m) => m.engine.engines[0]?.detail === "claude-haiku-5-5", { from: 0 })
     expect(engine.engine.engines[0]).toMatchObject({ provider: "claude-subscription", location: "hosted" })
 
-    const on = await reply(client, "tell me a joke", "t2")
+    const on = await reply(voice, "tell me a joke", "t2")
     expect(on).toBe("Claude heard: tell me a joke")
     expect(fake.queries).toHaveLength(1)
     expect(fake.queries[0]!.received.at(-1)).toContain("tell me a joke")
@@ -126,11 +130,21 @@ describe("serve: LLM_PROVIDER=claude-subscription", () => {
     expect(Object.keys(fake.queries[0]!.options.env ?? {}).sort()).toEqual(["CLAUDE_AGENT_SDK_CLIENT_APP", "ENABLE_CLAUDEAI_MCP_SERVERS", "PATH"])
     expect(llm.requests).toHaveLength(1) // the stand-in was used once, for the first turn only
 
+    // A second device at the same time: its own conversation, its own Claude Code session, the same login.
+    const other = await ScriptedClient.connect({ url: server.url, deviceId: "device-b" })
+    clients.push(other)
+    await other.hello()
+    const [onA, onB] = await Promise.all([reply(voice, "and another", "t2a"), reply(other, "hello from b", "t2b")])
+    expect(onA).toBe("Claude heard: and another")
+    expect(onB).toBe("Claude heard: hello from b")
+    expect(fake.queries).toHaveLength(2)
+    expect(fake.queries[1]!.received.join("\n")).not.toContain("tell me a joke")
+
     // Off again: the next turn falls back, without a reload.
     from = client.messages.length
     client.send({ type: "module.disable", requestId: "d1", moduleId: SUBSCRIPTION_AGENT_ID })
     expect((await client.waitFor("result", (m) => m.requestId === "d1", { from })).ok).toBe(true)
-    expect(await reply(client, "still there", "t3")).toBe(`${OFF}\nYou said: still there.`)
+    expect(await reply(voice, "still there", "t3")).toBe(`${OFF}\nYou said: still there.`)
   })
 })
 

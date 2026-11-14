@@ -1,8 +1,8 @@
 # @pva/agent-claude-code
 
 The `claude-subscription` harness agent (build plan piece J, `docs/AGENTS-AND-INTENTS.md` §1.8): Claude through the
-owner's Claude subscription, by driving Claude Code with `@anthropic-ai/claude-agent-sdk` 0.3.323 as one long-lived
-session.
+owner's Claude subscription, by driving Claude Code with `@anthropic-ai/claude-agent-sdk` 0.3.323, one long-lived
+session per conversation (docs/VOICE-SESSIONS.md §3).
 
 **Off by default, behind an explicit opt-in.** Anthropic's terms do not clearly allow other software to drive Claude
 Code with a subscription login (research: `docs/research/agent-backends.md` §2). The assistant never reads or stores
@@ -17,6 +17,12 @@ turn, so switching the module on or off applies from the next turn (`apps/assist
 
 - **Start**: spawns one Claude Code process in streaming-input mode and waits for its `initialize` answer (login, plan,
   model list); a login through an API key (`apiKeySource` other than `none`/`oauth`) is refused. No warm-up message.
+- **Sessions per conversation**: each conversation (`AgentTurnInput.conversationId`) has its own Claude Code session
+  and its own catch-up position, opened lazily at its first turn; turns of different conversations run in parallel
+  under the one login (checked once, at start). At most `maxSessions` (default 4, the assistant's `MAX_VOICE_SESSIONS`)
+  are open: one more closes the least recently used (an idle one first), which primes from the history again if its
+  conversation comes back. `endConversation(id)` (New conversation, the idle reset, a discarded voice session) closes
+  that conversation's session and starts a warm replacement in the background for the next conversation.
 - **Warm first turn**: the system prompt and tools are not known at module start, so the first session is
   *provisional*: a fixed short system prompt; the first message carries the real prompt in `<instructions>` and the
   tools are registered with `setMcpServers` just before it. Every later session (restart) is spawned with the real

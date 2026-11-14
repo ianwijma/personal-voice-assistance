@@ -10,7 +10,7 @@ coverage/
 # assistant output (benchmarks, file audio backend)
 audio-out/
 bench-out/
-bench-audio/
+bench-audio
 
 # local speech models (fetched by the download script)
 models/

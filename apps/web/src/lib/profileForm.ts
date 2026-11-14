@@ -29,6 +29,7 @@ export const PROFILE_GROUPS: ReadonlyArray<ProfileGroup> = [
   { id: "activation", title: "Activation", fields: ["activation", "wakePhrases", "wakeMatch", "followUpSeconds"] },
   { id: "voice", title: "Voice", fields: ["voice"] },
   { id: "interrupting", title: "Interrupting", fields: ["interruptMode"] },
+  { id: "conversation", title: "Conversation", fields: ["conversationIdleMinutes"] },
   { id: "processing", title: "Audio processing", fields: ["echoCancellation", "noiseSuppression", "autoGainControl"] },
   { id: "display", title: "Display", fields: ["captions", "speakReplies"] },
   { id: "advanced", title: "Advanced", fields: ["outputPath", "prebufferMs"], advanced: true }
@@ -41,6 +42,7 @@ export const FIELD_LABEL: { readonly [F in ProfileField]: string } = {
   followUpSeconds: "Keep listening after a reply",
   voice: "Voice",
   interruptMode: "Interrupting",
+  conversationIdleMinutes: "Start a new conversation after",
   captions: "Captions",
   speakReplies: "Speak replies to typed messages",
   echoCancellation: "Echo cancellation",
@@ -79,6 +81,8 @@ export const displayProfileValue = <F extends ProfileField>(field: F, value: Dev
       return value === "direct" ? "Direct" : "Media element"
     case "prebufferMs":
       return `${String(value)} ms`
+    case "conversationIdleMinutes":
+      return value === 0 ? "Never" : `${String(value)} min`
     default:
       return onOff(value as boolean)
   }

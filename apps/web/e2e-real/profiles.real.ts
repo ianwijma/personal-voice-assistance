@@ -59,12 +59,12 @@ test("the voice page's device in Devices; a kind default and a device override r
     const id = await deviceId(voice)
     expect(id).toMatch(/^[A-Za-z0-9_-]{8,64}$/)
 
-    // Devices: this browser, connected, the audio owner, always listening.
+    // Devices: this browser, connected, talking now (it owns its session's audio), always listening.
     await loginAdmin(admin, assistant.url, "#settings/devices")
     const row = admin.getByTestId("device-list").locator(`[data-device="${id}"]`)
     await expect(row).toContainText("Chrome")
     await expect(row).toContainText("Connected now")
-    await expect(row.getByTestId("audio-owner")).toHaveText("Audio owner now")
+    await expect(row.getByTestId("talking-now")).toHaveText("Talking now")
     await expect(row).toContainText("Always listening")
     await expect(admin.getByTestId("assistant-line")).toContainText(/listening/i)
     // One browser, two tabs: each has its own client id; the admin tab never took the audio from the voice tab.

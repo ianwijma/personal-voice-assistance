@@ -4,6 +4,7 @@ import {
   type Activation,
   type DeviceProfile,
   FOLLOW_UP_SECONDS_MAX,
+  CONVERSATION_IDLE_MINUTES_LIMITS,
   FOLLOW_UP_SECONDS_MIN,
   type InterruptMode,
   type OutputPath,
@@ -43,6 +44,7 @@ const help = (device: boolean): Partial<Record<ProfileField, string>> => {
   return {
     wakeMatch: "Close accepts small differences in longer words (“hey jeffs”, “hey geff”). Add a phrase for anything else.",
     followUpSeconds: "After a reply, the next question needs no phrase within this time. 0 = say the phrase every time.",
+    conversationIdleMinutes: `After this long without a turn, the next thing said on ${here} starts a fresh conversation: the assistant forgets the earlier one. 0 = never.`,
     voice: `The voice replies use on ${here}. A voice that is switched off falls back to the assistant's default.`,
     echoCancellation: "Removes the assistant's own voice from the microphone. On iPhone it also changes your voice's level and can make playback crackle.",
     noiseSuppression: "Filters steady background noise. It can blur quiet words.",
@@ -234,6 +236,19 @@ export function ProfileForm({ id, fields, base, saved, showInherited, onSave, af
           onInvalid={(bad) => markInvalid("followUpSeconds", bad)}
         />
       ), { labelFor: `${id}-followUpSeconds` }),
+    conversationIdleMinutes: () =>
+      row("conversationIdleMinutes", (
+        <NumberInput
+          id={`${id}-conversationIdleMinutes`}
+          value={value("conversationIdleMinutes")}
+          min={CONVERSATION_IDLE_MINUTES_LIMITS.min}
+          max={CONVERSATION_IDLE_MINUTES_LIMITS.max}
+          unit="minutes quiet"
+          disabled={saving}
+          onChange={(n) => set("conversationIdleMinutes", n)}
+          onInvalid={(bad) => markInvalid("conversationIdleMinutes", bad)}
+        />
+      ), { labelFor: `${id}-conversationIdleMinutes` }),
     voice: () => row("voice", <VoiceSelect id={`${id}-voice`} value={value("voice")} disabled={saving} onChange={(v) => set("voice", v)} />, { labelFor: `${id}-voice` }),
     interruptMode: () => {
       const mode = INTERRUPT_CHOICES.find((c) => c.value === value("interruptMode")) ?? INTERRUPT_CHOICES[1]

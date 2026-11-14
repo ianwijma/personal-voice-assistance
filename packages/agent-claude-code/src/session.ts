@@ -172,6 +172,11 @@ export class ClaudeSession {
     void this.pump()
   }
 
+  /** A turn is in progress (sent and not yet ended or interrupted). */
+  get inTurn(): boolean {
+    return this.busy
+  }
+
   get provisional(): boolean {
     return this.system === undefined
   }

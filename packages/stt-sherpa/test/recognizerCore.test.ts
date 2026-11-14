@@ -124,6 +124,92 @@ describe("recognizerCore, whole-turn: a native decode that never returns", () =>
   })
 })
 
+describe("recognizerCore, several sessions on one model", () => {
+  const twoSessions = (options: { decodeMs?: number; maxQueuedDecodeMs?: number } = {}) => {
+    const posted: Array<any> = []
+    const model = fakeOffline({ decodeMs: options.decodeMs ?? 10 })
+    let vads = 0
+    const core = makeRecognizerCore({
+      config: offlineConfig,
+      offline: model,
+      vad: fakeVad(),
+      makeVad: () => {
+        vads++
+        return fakeVad()
+      },
+      post: (m: any) => posted.push(m),
+      ...(options.maxQueuedDecodeMs !== undefined ? { maxQueuedDecodeMs: options.maxQueuedDecodeMs } : {})
+    })
+    core.onMessage({ type: "open", session: 1 })
+    core.onMessage({ type: "open", session: 2 })
+    const audio = (session: number, ms: number, amplitude = 8000) => {
+      for (let t = 0; t < ms; t += 1000) core.onMessage({ type: "audio", session, buffer: pcm(Math.min(1000, ms - t), amplitude) })
+    }
+    return { core, posted, model, audio, vads: () => vads }
+  }
+
+  it("each session has its own VAD and turn audio; decodes of both are answered to their own session", async () => {
+    const { audio, core, posted, vads } = twoSessions()
+    assert.strictEqual(vads(), 1, "the startup VAD serves the first session; one more for the second")
+    assert.strictEqual(core.inspect().sessions, 2)
+    audio(1, 500, 0)
+    audio(2, 500, 0)
+    audio(1, 600, 9000) // "w9"
+    audio(2, 600, 5000) // "w5"
+    audio(1, 600, 0)
+    audio(2, 600, 0)
+    core.onMessage({ type: "finalize", session: 1, frame: 1_000_000, through: true })
+    core.onMessage({ type: "finalize", session: 2, frame: 1_000_000, through: true })
+    await new Promise((r) => setTimeout(r, 60))
+    const segments = posted.filter((m) => m.type === "segment").map((m) => [m.session, m.text])
+    assert.deepStrictEqual(segments, [[1, "w9"], [2, "w5"]])
+    // Each session's VAD decisions are its own.
+    const speech = (session: number) => posted.filter((m) => m.type === "frames" && m.session === session).flatMap((m) => m.speech)
+    assert.strictEqual(speech(1).filter((x: number) => x === 1).length, 30)
+    assert.strictEqual(speech(2).filter((x: number) => x === 1).length, 30)
+  })
+
+  it("ending one session drops only its queued decodes; the other's are still decoded", async () => {
+    const { audio, core, model, posted } = twoSessions({ decodeMs: 30 })
+    audio(1, 3 * 35_000) // three long pieces of session 1: the first runs, two wait
+    audio(2, 600, 5000)
+    audio(2, 600, 0)
+    core.onMessage({ type: "finalize", session: 2, frame: 1_000_000, through: true }) // queued behind them
+    core.onMessage({ type: "end", session: 1 })
+    assert.strictEqual(core.inspect().sessions, 1)
+    await new Promise((r) => setTimeout(r, 150))
+    assert.strictEqual(model.calls.started, 2, "session 1's running piece, then session 2's finalise; nothing else")
+    assert.deepStrictEqual(posted.filter((m) => m.type === "segment").map((m) => [m.session, m.text]), [[2, "w5"]])
+    // A message for the ended session is ignored.
+    core.onMessage({ type: "flush", session: 1 })
+    assert.isFalse(posted.some((m) => m.type === "flushed" && m.session === 1))
+  })
+
+  it("the bound on queued audio is per session: one session's backlog never drops another's turn", async () => {
+    const { audio, core, model, posted } = twoSessions({ maxQueuedDecodeMs: 40_000 })
+    model.hang.on = true
+    audio(1, 3 * 35_000) // session 1 overflows its own bound
+    assert.strictEqual(posted.filter((m) => m.type === "overload" && m.session === 1).length, 1)
+    audio(2, 600, 5000)
+    audio(2, 600, 0)
+    core.onMessage({ type: "finalize", session: 2, frame: 1_000_000, through: true })
+    assert.isFalse(posted.some((m) => m.type === "overload" && m.session === 2))
+    model.hang.on = false
+    model.hang.release?.()
+    await new Promise((r) => setTimeout(r, 60))
+    assert.deepStrictEqual(posted.filter((m) => m.type === "segment" && m.session === 2).map((m) => m.text), ["w5"])
+  })
+
+  it("a VAD is reused after its session ends", () => {
+    const { core, vads } = twoSessions()
+    core.onMessage({ type: "end", session: 2 })
+    core.onMessage({ type: "open", session: 3 })
+    assert.strictEqual(vads(), 1)
+    core.onMessage({ type: "open", session: 4 })
+    assert.strictEqual(vads(), 2)
+  })
+})
+
 const streamingConfig = { kind: "streaming", prerollMs: 400, agc: false, streaming: { tailPaddingMs: 0 } }
 
 const streamingCore = (limits?: Record<string, number>) => {

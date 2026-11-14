@@ -1,6 +1,6 @@
 import { appUrl, expect, loginAdmin, mock, test } from "./fixtures.ts"
 
-// Admin › Devices: the list (name, kind, last seen, the audio owner, activation), a device's page with rename, the
+// Admin › Devices: the list (name, kind, last seen, talking now with its state, activation), a device's page with rename, the
 // profile form with "Default (…)" or an override with Reset (sent as null), and forget with confirmation.
 
 const updates = async () => (await mock.log()).messages.filter((m) => m.type === "device.admin.update")
@@ -11,7 +11,7 @@ test("no devices yet: the list says how one appears", async ({ page, baseURL }) 
   await expect(page.getByTestId("no-devices")).toContainText("No devices yet.")
 })
 
-test("the list shows every device, the audio owner and how it activates; a voice page appears when it connects", async ({ page, baseURL, context }) => {
+test("the list shows every device, which one is talking now and how it activates; a voice page appears when it connects", async ({ page, baseURL, context }) => {
   await mock.scenario("devices")
   await loginAdmin(page, baseURL, "#settings/devices")
   const list = page.getByTestId("device-list")
@@ -30,7 +30,8 @@ test("the list shows every device, the audio owner and how it activates; a voice
   await expect(list.locator("[data-device]")).toHaveCount(3)
   const mine = list.locator("[data-device]").first()
   await expect(mine).toContainText("Connected now")
-  await expect(mine.getByTestId("audio-owner")).toHaveText("Audio owner now")
+  await expect(mine.getByTestId("talking-now")).toHaveText("Talking now")
+  await expect(mine.getByTestId("session-state")).toHaveText("listening")
   await voice.close()
 })
 

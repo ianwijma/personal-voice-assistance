@@ -1,21 +1,16 @@
 "use client"
 import { type RefObject, useState } from "react"
+import { stateWord, talkingSessions } from "@/lib/sessions.ts"
 import { shallowEqual } from "@/lib/store.ts"
 import { useClient, useClientState } from "../context.tsx"
 import { Icon, Spinner } from "../ui/Icon.tsx"
 import { cx, ToneDot } from "../ui/controls.tsx"
 import { useHref } from "../useHref.ts"
 
-const STATE_WORD: Record<string, string> = {
-  idle: "idle",
-  asleep: "waiting for the wake phrase",
-  listening: "listening",
-  hearing: "hearing someone",
-  thinking: "thinking",
-  speaking: "speaking"
-}
-
-/** What the assistant is doing, as one short line: connection, engines, then the conversation. */
+/**
+ * What the assistant is doing, as one short line: connection, engines, then the devices talking to it (protocol 6:
+ * from the voice sessions; one device says its state, several say how many).
+ */
 const useAssistantLine = () =>
   useClientState(
     (s) => {
@@ -24,10 +19,14 @@ const useAssistantLine = () =>
       }
       if (s.engine.state === "failed") return { text: "engines failed", tone: "error" as const }
       if (s.engine.state !== "ready") return { text: s.engine.state === "reloading" ? "reloading engines…" : "starting engines…", tone: "warning" as const }
-      if (!s.session.ownerPresent) return { text: "ready · no device is listening", tone: "neutral" as const }
-      const owner = s.devices.find((d) => d.audioOwner)
-      const word = STATE_WORD[s.session.serverState] ?? s.session.serverState
-      return { text: owner === undefined ? word : `${word} on ${owner.name}`, tone: "ok" as const }
+      const talking = talkingSessions(s.sessions)
+      if (talking.length === 0) return { text: "ready · no device is listening", tone: "neutral" as const }
+      if (talking.length > 1) {
+        const busy = talking.filter((x) => x.state === "thinking" || x.state === "speaking").length
+        return { text: `talking on ${talking.length} devices${busy > 0 ? ` · ${busy} answering` : ""}`, tone: "ok" as const }
+      }
+      const one = talking[0]!
+      return { text: `${stateWord(one.state)} on ${one.name}`, tone: "ok" as const }
     },
     shallowEqual
   )

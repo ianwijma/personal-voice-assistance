@@ -24,7 +24,7 @@ const chunk = (peakDbfs: number | undefined, n0 = 0) => {
   return new Uint8Array(s.buffer)
 }
 
-const setup = (maxFiles = 50) => {
+const setup = (maxFiles = 50, device?: { readonly key: string; readonly name: string }) => {
   const dir = join(mkdtempSync(join(tmpdir(), "pva-heard-")), "recordings")
   let now = 1_000_000
   const lines: Array<string> = []
@@ -38,7 +38,8 @@ const setup = (maxFiles = 50) => {
     log: (line) => lines.push(line),
     now: () => now,
     defer: (task) => task(),
-    io: syncIo
+    io: syncIo,
+    ...(device !== undefined ? { device: () => device } : {})
   })
   const audio = (ms: number, peak: number | undefined) => {
     for (let t = 0; t < ms; t += 20) {
@@ -85,6 +86,18 @@ describe("heard audio recorder", () => {
     const meta = JSON.parse(readFileSync(join(t.dir, t.files().filter((f) => f.endsWith(".json"))[1]!), "utf8"))
     expect(meta.ended).toBe("30 s limit")
     expect(meta.stats.seconds).toBeCloseTo(30, 0)
+  })
+
+  it("a voice session's recorder names the device in the file name, the .json and the log line", () => {
+    const t = setup(50, { key: "dev-1", name: "Kitchen tablet" })
+    t.heard.event({ _tag: "SpeechStarted" })
+    t.audio(200, -10)
+    t.heard.event({ _tag: "EndOfTurn", text: "hello" })
+    const files = t.files()
+    expect(files.every((f) => /-kitchen-tablet-001\.(wav|json)$/.test(f))).toBe(true)
+    const meta = JSON.parse(readFileSync(join(t.dir, files.find((f) => f.endsWith(".json"))!), "utf8"))
+    expect(meta.device).toEqual({ key: "dev-1", name: "Kitchen tablet" })
+    expect(t.lines[0]).toMatch(/^Heard on Kitchen tablet \(sherpa parakeet-v2\): "hello"/)
   })
 
   it("keeps only the newest recordings, and records nothing while switched off", () => {

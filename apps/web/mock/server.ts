@@ -50,6 +50,20 @@
  * POST /mock/admin/end {"reason": "idle" | "expired"} (end every admin session), POST /mock/wake {"phrase", "armed"}
  * (the owner said the wake phrase), POST /mock/heard {"text", "matched"?, "accepted"?} (a tester line; `accepted: null` leaves the field out), POST /mock/state
  * {"state"} (set the assistant state, e.g. "asleep"), POST /mock/defaults {"patch"} (change the web-voice defaults).
+ *
+ * Protocol 6 (docs/VOICE-SESSIONS.md): one voice session per device (`hello.device.id`; a voice page without one has
+ * its own), each with its own audio owner, state, conversation (starting with the example history) and reply.
+ * Turn traffic, `state`, `session`, `wake` and `conversation` go to that device's tabs only; admin connections get
+ * `sessions` (and `admin.snapshot.sessions`) and no turn traffic. A claim on one device never touches another; within
+ * a device the last claim wins. `conversation.new` restarts the device's conversation; a turn after more than the
+ * device's `conversationIdleMinutes` without one starts with `conversation { reason: "idle" }`. More started sessions
+ * than MAX_VOICE_SESSIONS (Language model › Conversations, default 4) are refused with `sessions_full` unless a
+ * session whose device left can make room (the least recently active one is dropped); a session
+ * without a connection for SESSION_DISCARD_MINUTES is dropped. `wake.test.deviceId` picks whose lines the tester gets.
+ * The endpoints that act on a session (/mock/turn, /mock/wake, /mock/state, /mock/heard) take an optional
+ * "deviceId" (default: the most recently active session that has an owner); POST /mock/idle {"deviceId"?, "now"?}
+ * makes the device's conversation old enough for the idle reset at its next turn (`now`: at once);
+ * POST /mock/max-sessions {"n"} sets MAX_VOICE_SESSIONS.
  */
 import { randomBytes } from "node:crypto"
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http"
@@ -57,7 +71,11 @@ import {
   type AdminState,
   type ClientMessage,
   CloseCode,
-  DEFAULT_DEVICE_PROFILE,
+  type AssistantState,
+  type ConversationInfo,
+  DEFAULT_CONVERSATION_IDLE_MINUTES,
+  DEFAULT_MAX_VOICE_SESSIONS,
+  DEFAULT_SESSION_DISCARD_MINUTES,
   DEVICE_EDITABLE_FIELDS,
   type DeviceInfo,
   type DeviceProfile,
@@ -84,6 +102,7 @@ import {
   type ModuleInfo,
   PROTOCOL_VERSION,
   type ServerMessage,
+  type SessionInfo,
   type SettingsForm,
   type SettingsPatch,
   type SettingsSection,
@@ -465,6 +484,25 @@ const initialSections = (): Array<SettingsSection> => [
     revision: 1
   },
   {
+    // Protocol 6 (docs/VOICE-SESSIONS.md): voice sessions and conversations.
+    id: "conversations",
+    title: "Conversations",
+    group: "agents",
+    page: { id: "conversations", title: "Conversations", description: "How long a conversation lasts, and how many devices may talk at once." },
+    order: 30,
+    form: {
+      fields: [
+        { type: "number", key: "CONVERSATION_IDLE_MINUTES", label: "Start a new conversation after", description: "Minutes without a turn after which the next thing said starts a fresh conversation. 0 = never. A device's profile can say otherwise.", apply: "live", default: DEFAULT_CONVERSATION_IDLE_MINUTES, integer: true, min: 0, max: 240, step: 1, unit: "min", source: "default" },
+        { type: "number", key: "MAX_VOICE_SESSIONS", label: "Devices talking at once", description: "One more device is refused until one of them is done.", apply: "live", default: DEFAULT_MAX_VOICE_SESSIONS, integer: true, min: 1, max: 16, step: 1, source: "default" },
+        { type: "number", key: "SESSION_DISCARD_MINUTES", label: "Forget a device's conversation after", description: "Minutes without any open page on that device.", apply: "live", default: DEFAULT_SESSION_DISCARD_MINUTES, integer: true, min: 1, max: 1440, step: 1, unit: "min", advanced: true, source: "default" }
+      ],
+      values: { CONVERSATION_IDLE_MINUTES: DEFAULT_CONVERSATION_IDLE_MINUTES, MAX_VOICE_SESSIONS: DEFAULT_MAX_VOICE_SESSIONS, SESSION_DISCARD_MINUTES: DEFAULT_SESSION_DISCARD_MINUTES },
+      secrets: {},
+      errors: []
+    },
+    revision: 1
+  },
+  {
     id: "recordings",
     title: "Recordings",
     group: "diagnostics",
@@ -585,6 +623,8 @@ interface Conn {
   deviceId?: string
   /** The phrase tester is on until then (epoch ms). */
   testerUntil?: number | undefined
+  /** Protocol 6: the device the tester follows; undefined = the most recently active session. */
+  testerDevice?: string | undefined
 }
 
 interface Reply {
@@ -595,6 +635,9 @@ interface Reply {
   readonly tools: Array<{ name: string; ms: number }>
   readonly source: "voice" | "text"
   readonly owner: Conn | undefined
+  /** The voice session (device) the turn belongs to, and its conversation then. */
+  readonly session: VSession
+  readonly conversationId: string
   playedClause: number
   started?: { at: number; outputLatencyMs: number; startDelayMs: number }
   lastReport: number
@@ -608,13 +651,37 @@ interface Reply {
   provisional?: number
 }
 
+/**
+ * Protocol 6 (docs/VOICE-SESSIONS.md): one voice session per device (the device id, or the client id of a voice page
+ * without one): its own audio owner, state, conversation and reply. A record exists from the device's first
+ * connection (its conversation is what the page shows), but it is *started* (counts against MAX_VOICE_SESSIONS, is
+ * listed to admin) only at its first claim or typed message. Each starts with the example history.
+ */
+interface VSession {
+  readonly key: string
+  readonly deviceId: string | undefined
+  started: boolean
+  owner: Conn | undefined
+  lastOwnerClientId: string | undefined
+  state: AssistantState
+  micLive: boolean
+  history: Array<HistoryItem>
+  conversation: ConversationInfo
+  reply: Reply | undefined
+  /** Committed turns in this conversation, and when the last one ended (epoch ms). */
+  turns: number
+  lastTurnAt: number | null
+  lastActive: number
+  /** Wake-phrase windows: the armed window after the phrase alone, the follow-up window after a reply. */
+  awakeUntil: number
+  awakeTimer: ReturnType<typeof setTimeout> | undefined
+  discardTimer: ReturnType<typeof setTimeout> | undefined
+}
+
 const conns = new Set<Conn>()
 let connSeq = 0
-let owner: Conn | undefined
-let lastOwnerClientId: string | undefined
-let claimedSince = false
-let assistantState: "idle" | "asleep" | "listening" | "hearing" | "thinking" | "speaking" = "idle"
-let micLive = true
+const voiceSessions = new Map<string, VSession>()
+let conversationSeq = 0
 let modules = initialModules()
 let sections = withWarnings(initialSections())
 let engine: EngineStatus = initialEngine()
@@ -626,10 +693,8 @@ let models: Array<ModelSet> = initialModels()
 let jobs: Array<JobInfo> = []
 let jobSeq = 0
 const jobTimers = new Map<string, ReturnType<typeof setInterval>>()
-let history: Array<HistoryItem> = clone([...exampleSnapshot.history])
 let traces: Array<TraceInfo> = []
 let turnSeq = 20
-let reply: Reply | undefined
 let scriptTimers: Array<ReturnType<typeof setTimeout>> = []
 const clientLog: Array<Record<string, unknown>> = []
 
@@ -668,9 +733,6 @@ const initialKindDefaults = (): ProfileOverrides =>
   scenario === "wake" ? { activation: "wake-phrase" } : scenario === "long-phrase" ? { activation: "wake-phrase", wakePhrases: [LONG_PHRASE] } : {}
 let devices = seededDevices()
 let kindDefaults: ProfileOverrides = initialKindDefaults()
-/** Wake-phrase windows: the armed window after the phrase alone, the follow-up window after a reply. */
-let awakeUntil = 0
-let awakeTimer: ReturnType<typeof setTimeout> | undefined
 
 const KIND_INFO = {
   id: WEB_VOICE_KIND,
@@ -685,7 +747,7 @@ const deviceInfos = (): Array<DeviceInfo> => {
   return [...devices.values()]
     .map((d) => {
       const connections = [...conns].filter((c) => c.welcomed && c.deviceId === d.id).length
-      return { ...d, lastSeen: connections > 0 ? now : d.lastSeen, profile: deviceProfile(d.id), connections, audioOwner: owner?.deviceId === d.id }
+      return { ...d, lastSeen: connections > 0 ? now : d.lastSeen, profile: deviceProfile(d.id), connections, audioOwner: voiceSessions.get(d.id)?.owner !== undefined }
     })
     .sort((a, b) => b.lastSeen - a.lastSeen)
 }
@@ -707,34 +769,153 @@ const adminState = (c: Conn, extra: Partial<AdminState> = {}): AdminState => {
 const sendAdminSnapshot = (c: Conn) =>
   sendTo(c, {
     type: "admin.snapshot",
-    snapshot: { engine, modules, sections, traces: traces.slice(-20), vault: vaultInfo(c), env, models, jobs, frontends: frontendInfos(), devices: deviceInfos() }
+    snapshot: { engine, modules, sections, traces: traces.slice(-20), vault: vaultInfo(c), env, models, jobs, frontends: frontendInfos(), devices: deviceInfos(), sessions: sessionInfos() }
   })
 const pushProfiles = () => {
   for (const c of conns) if (c.welcomed && c.frontend === "voice") sendTo(c, { type: "device.profile", ...profileInfo(c) })
 }
 const devicesChanged = () => broadcast({ type: "devices", devices: deviceInfos() })
 const frontendsChanged = () => broadcast({ type: "frontends", frontends: frontendInfos() })
-const ownerProfile = (): DeviceProfile => (owner === undefined ? DEFAULT_DEVICE_PROFILE : deviceProfile(owner.deviceId))
-const wakeMode = () => owner !== undefined && ownerProfile().activation === "wake-phrase"
-/** Keep the owner awake (no phrase needed) for `ms`; then asleep again unless something is going on. */
-const stayAwake = (ms: number) => {
-  awakeUntil = Date.now() + ms
-  if (awakeTimer !== undefined) clearTimeout(awakeTimer)
-  awakeTimer = setTimeout(() => {
-    awakeTimer = undefined
-    if (reply === undefined && (assistantState === "listening" || assistantState === "asleep")) setState(restingState())
+// ---- Voice sessions (protocol 6)
+
+/** A voice connection's session key: its device, or its own client id; admin connections have none. */
+const keyOf = (c: Conn): string | undefined => (c.frontend !== "voice" ? undefined : c.deviceId ?? c.clientId)
+const newConversationInfo = (): ConversationInfo => ({ id: `conv-${++conversationSeq}-${Date.now().toString(36)}`, startedAt: Date.now() })
+/** The session record of a voice connection, made on first use (not started yet). */
+const sessionFor = (c: Conn): VSession | undefined => {
+  const key = keyOf(c)
+  if (key === undefined) return undefined
+  let v = voiceSessions.get(key)
+  if (v === undefined) {
+    const now = Date.now()
+    v = {
+      key,
+      deviceId: c.deviceId,
+      started: false,
+      owner: undefined,
+      lastOwnerClientId: undefined,
+      state: "idle",
+      micLive: true,
+      history: clone([...exampleSnapshot.history]),
+      conversation: { id: `conv-${++conversationSeq}-${now.toString(36)}`, startedAt: now - 6 * 60_000 },
+      reply: undefined,
+      turns: exampleSnapshot.history.filter((h) => h.role === "user").length,
+      lastTurnAt: now - 5 * 60_000,
+      lastActive: now,
+      awakeUntil: 0,
+      awakeTimer: undefined,
+      discardTimer: undefined
+    }
+    voiceSessions.set(key, v)
+  }
+  return v
+}
+const sessionName = (v: VSession) => (v.deviceId === undefined ? "A browser tab without a device id" : devices.get(v.deviceId)?.name ?? "A device")
+const connsOf = (v: VSession) => [...conns].filter((c) => c.welcomed && keyOf(c) === v.key)
+/** A message about a session's turns: only to that device's connections. */
+const toSession = (v: VSession, m: ServerMessage) => {
+  for (const c of connsOf(v)) sendTo(c, m)
+}
+const startedSessions = () => [...voiceSessions.values()].filter((v) => v.started).sort((a, b) => b.lastActive - a.lastActive)
+const ownerPresentIn = (v: VSession) => v.owner !== undefined || v.lastOwnerClientId === "c-another-tab"
+const sessionInfos = (): Array<SessionInfo> =>
+  startedSessions().map((v) => ({
+    key: v.key,
+    ...(v.deviceId === undefined ? {} : { deviceId: v.deviceId }),
+    name: sessionName(v),
+    state: v.state,
+    ownerPresent: ownerPresentIn(v),
+    conversationId: v.conversation.id,
+    turns: v.turns,
+    lastTurnAt: v.lastTurnAt
+  }))
+let lastSessions = ""
+/** Admin connections get the list when it changed. */
+const sessionsChanged = () => {
+  const list = sessionInfos()
+  const key = JSON.stringify(list)
+  if (key === lastSessions) return
+  lastSessions = key
+  broadcast({ type: "sessions", sessions: list })
+}
+const numberSetting = (key: string, fallback: number) => {
+  const v = valueOf(key)
+  return typeof v === "number" ? v : fallback
+}
+/** Start a session at its first claim or typed message; `false`: refused, MAX_VOICE_SESSIONS are talking already. */
+const startSession = (v: VSession): boolean => {
+  v.lastActive = Date.now()
+  if (v.started) return true
+  const max = numberSetting("MAX_VOICE_SESSIONS", DEFAULT_MAX_VOICE_SESSIONS)
+  // At the limit, the least recently active session whose device left makes room (as the server does).
+  while (startedSessions().length >= max) {
+    const gone = startedSessions().filter((x) => connsOf(x).length === 0).at(-1)
+    if (gone === undefined) return false
+    dropSession(gone)
+  }
+  v.started = true
+  return true
+}
+const sessionsFull = () => ({ code: "sessions_full" as const, message: `The assistant is already talking on ${startedSessions().length} devices.` })
+/** The session a test endpoint means: `deviceId`, else the most recently active one that talks, else any started. */
+const targetSession = (deviceId?: unknown): VSession | undefined => {
+  if (typeof deviceId === "string") return voiceSessions.get(deviceId)
+  const started = startedSessions()
+  return started.find((v) => v.owner !== undefined) ?? started[0]
+}
+/** A new conversation on the session: the running turn stops, the history goes, every tab of the device is told. */
+const newConversation = (v: VSession, reason: "new" | "idle") => {
+  if (v.reply !== undefined) interruptReply(v.reply)
+  v.history = []
+  v.conversation = newConversationInfo()
+  v.turns = 0
+  v.lastTurnAt = null
+  toSession(v, { type: "conversation", id: v.conversation.id, reason, startedAt: v.conversation.startedAt })
+  sessionsChanged()
+}
+/** The session and its conversation go (discarded, or its place taken at the limit). */
+const dropSession = (v: VSession) => {
+  if (v.discardTimer !== undefined) clearTimeout(v.discardTimer)
+  v.discardTimer = undefined
+  if (v.reply !== undefined) clearReply(v.reply)
+  if (v.awakeTimer !== undefined) clearTimeout(v.awakeTimer)
+  voiceSessions.delete(v.key)
+  sessionsChanged()
+}
+/** No connection left on the device: drop its session after SESSION_DISCARD_MINUTES. */
+const scheduleDiscard = (v: VSession) => {
+  if (v.discardTimer !== undefined) clearTimeout(v.discardTimer)
+  v.discardTimer = setTimeout(() => {
+    v.discardTimer = undefined
+    if (connsOf(v).length > 0) return
+    dropSession(v)
+  }, numberSetting("SESSION_DISCARD_MINUTES", DEFAULT_SESSION_DISCARD_MINUTES) * 60_000)
+}
+
+const sessionProfile = (v: VSession): DeviceProfile => (v.deviceId === undefined ? effectiveProfile(kindDefaults) : deviceProfile(v.deviceId))
+const wakeMode = (v: VSession) => v.owner !== undefined && sessionProfile(v).activation === "wake-phrase"
+/** Keep the session awake (no phrase needed) for `ms`; then asleep again unless something is going on. */
+const stayAwake = (v: VSession, ms: number) => {
+  v.awakeUntil = Date.now() + ms
+  if (v.awakeTimer !== undefined) clearTimeout(v.awakeTimer)
+  v.awakeTimer = setTimeout(() => {
+    v.awakeTimer = undefined
+    if (v.reply === undefined && (v.state === "listening" || v.state === "asleep")) setState(v, restingState(v))
   }, ms + 20)
 }
 /**
- * A tester line to admin connections that switched the tester on. `accepted` defaults to what the server's wake gate
- * would say: matched a phrase, always listening, or inside an armed / follow-up window; `null` leaves it out (an older
- * server).
+ * A tester line from session `v` to admin connections that switched the tester on and follow that session (a device
+ * id, or the most recently active session); without a session, to every tester. `accepted` defaults to what the
+ * server's wake gate would say: matched a phrase, always listening, or inside an armed / follow-up window; `null`
+ * leaves it out (an older server).
  */
-const sendHeard = (text: string, matched?: string, accepted?: boolean | null) => {
+const sendHeard = (v: VSession | undefined, text: string, matched?: string, accepted?: boolean | null) => {
   const now = Date.now()
-  const taken = accepted === undefined ? matched !== undefined || !wakeMode() || awakeUntil > now : accepted
+  const taken = accepted === undefined ? matched !== undefined || v === undefined || !wakeMode(v) || v.awakeUntil > now : accepted
+  const auto = targetSession()
   for (const c of conns) {
     if (!c.welcomed || !isAdminConn(c) || c.testerUntil === undefined || c.testerUntil < now) continue
+    if (v !== undefined && (c.testerDevice === undefined ? auto !== v : c.testerDevice !== v.deviceId)) continue
     sendTo(c, {
       type: "wake.heard",
       text,
@@ -744,12 +925,12 @@ const sendHeard = (text: string, matched?: string, accepted?: boolean | null) =>
     })
   }
 }
-/** The owner said the wake phrase. */
-const wakeUp = (phrase: string, armed: boolean) => {
-  broadcast({ type: "wake", phrase, armed })
+/** The session's owner said the wake phrase. */
+const wakeUp = (v: VSession, phrase: string, armed: boolean) => {
+  toSession(v, { type: "wake", phrase, armed })
   if (!armed) return // the request came in the same sentence: a turn follows
-  stayAwake(WAKE_ARMED_MS)
-  if (reply === undefined) setState("listening")
+  stayAwake(v, WAKE_ARMED_MS)
+  if (v.reply === undefined) setState(v, "listening")
 }
 const endSessions = (reason: "logout" | "expired" | "idle", token?: string) => {
   for (const [t] of sessions) if (token === undefined || t === token) sessions.delete(t)
@@ -757,6 +938,7 @@ const endSessions = (reason: "logout" | "expired" | "idle", token?: string) => {
     if (!c.welcomed || c.session === undefined || sessions.has(c.session)) continue
     c.session = undefined
     c.testerUntil = undefined
+    c.testerDevice = undefined
     sendTo(c, { type: "admin.state", admin: adminState(c, { endReason: reason }) })
   }
 }
@@ -775,13 +957,13 @@ const cleanPatch = (patch: ProfilePatch): ProfilePatch => {
 const resetState = () => {
   for (const t of scriptTimers) clearTimeout(t)
   scriptTimers = []
-  if (reply !== undefined) clearReply(reply)
-  reply = undefined
-  owner = undefined
-  lastOwnerClientId = undefined
-  claimedSince = false
-  assistantState = "idle"
-  micLive = true
+  for (const v of voiceSessions.values()) {
+    if (v.reply !== undefined) clearReply(v.reply)
+    if (v.awakeTimer !== undefined) clearTimeout(v.awakeTimer)
+    if (v.discardTimer !== undefined) clearTimeout(v.discardTimer)
+  }
+  voiceSessions.clear()
+  lastSessions = ""
   modules = initialModules()
   sections = withWarnings(initialSections())
   engine = initialEngine()
@@ -793,15 +975,11 @@ const resetState = () => {
   logoutFails = false
   devices = seededDevices()
   kindDefaults = initialKindDefaults()
-  awakeUntil = 0
-  if (awakeTimer !== undefined) clearTimeout(awakeTimer)
-  awakeTimer = undefined
   env = initialEnv()
   models = initialModels()
   for (const t of jobTimers.values()) clearInterval(t)
   jobTimers.clear()
   jobs = []
-  history = clone([...exampleSnapshot.history])
   traces = []
   turnSeq = 20
   clientLog.length = 0
@@ -817,7 +995,7 @@ const sendTo = (c: Conn, m: ServerMessage) => {
   if (c.ws.readyState === c.ws.OPEN) c.ws.send(encodeServerMessage(m))
 }
 /** Messages that carry admin data: only admin connections get them (protocol 5). */
-const ADMIN_ONLY: ReadonlySet<ServerMessage["type"]> = new Set(["engine", "module.changed", "section.changed", "vault", "env", "job", "models", "frontends", "devices", "wake.heard", "admin.snapshot"])
+const ADMIN_ONLY: ReadonlySet<ServerMessage["type"]> = new Set(["engine", "module.changed", "section.changed", "vault", "env", "job", "models", "frontends", "devices", "sessions", "trace", "wake.heard", "admin.snapshot"])
 let lastSummary = ""
 const broadcast = (m: ServerMessage) => {
   const adminOnly = ADMIN_ONLY.has(m.type)
@@ -833,10 +1011,11 @@ const broadcast = (m: ServerMessage) => {
   }
 }
 
-const setState = (state: typeof assistantState, turnId?: number) => {
-  if (state === assistantState && turnId === undefined) return
-  assistantState = state
-  broadcast(turnId === undefined ? { type: "state", state } : { type: "state", state, turnId })
+const setState = (v: VSession, state: AssistantState, turnId?: number) => {
+  if (state === v.state && turnId === undefined) return
+  v.state = state
+  toSession(v, turnId === undefined ? { type: "state", state } : { type: "state", state, turnId })
+  sessionsChanged()
 }
 
 // ---- Settings from outside (.env) and model downloads
@@ -1034,14 +1213,17 @@ const afterUnlock = () => {
   }
 }
 
-const restingState = () =>
-  owner === undefined || !micLive ? "idle" : wakeMode() && Date.now() >= awakeUntil ? "asleep" : "listening"
+const restingState = (v: VSession): AssistantState =>
+  v.owner === undefined || !v.micLive ? "idle" : wakeMode(v) && Date.now() >= v.awakeUntil ? "asleep" : "listening"
 
-const sessionUpdate = (reason: "claimed" | "released" | "taken_over" | "owner_disconnected" | "resumed", ownerPresentOverride?: boolean) => {
-  for (const c of conns) {
-    if (!c.welcomed) continue
-    sendTo(c, { type: "session", role: c === owner ? "owner" : "observer", ownerPresent: ownerPresentOverride ?? owner !== undefined, reason })
-  }
+const sessionUpdate = (v: VSession, reason: "claimed" | "released" | "taken_over" | "owner_disconnected" | "resumed") => {
+  for (const c of connsOf(v)) sendTo(c, { type: "session", role: c === v.owner ? "owner" : "observer", ownerPresent: ownerPresentIn(v), reason })
+  devicesChanged()
+  sessionsChanged()
+}
+/** After a change of profiles: every session that is not in a turn settles in its resting state. */
+const settleAll = () => {
+  for (const v of voiceSessions.values()) if (v.reply === undefined) setState(v, restingState(v))
 }
 
 // ---------------------------------------------------------------------------
@@ -1104,19 +1286,29 @@ const makeTrace = (r: Reply, outcome: TraceInfo["outcome"]): TraceInfo => {
 
 const endTurn = (r: Reply, outcome: "completed" | "interrupted" | "failed") => {
   if (r.ended) return
+  const v = r.session
   clearReply(r)
-  if (reply === r) reply = undefined
+  if (v.reply === r) v.reply = undefined
   const trace = makeTrace(r, outcome)
-  traces = [...traces, trace].slice(-20)
-  const heard = r.spoken ? r.clauses.filter((_, i) => i <= r.playedClause || outcome === "completed").map((c) => c.text).join(" ") : r.clauses.map((c) => c.text).join("")
-  history.push({ role: "assistant", text: heard, interrupted: outcome !== "completed", tools: r.tools.map((t) => ({ name: t.name, ok: true })) })
-  broadcast({ type: "turn.end", turnId: r.turnId, outcome, trace })
-  if (wakeMode()) {
-    const followUp = ownerProfile().followUpSeconds * 1000
-    if (followUp > 0) stayAwake(followUp)
-    else awakeUntil = 0
+  // Admin's traces carry the session (the device's name) and arrive live as `trace`; the device's tabs get turn.end.
+  const forAdmin: TraceInfo = { ...trace, session: sessionName(v).slice(0, 64) }
+  traces = [...traces, forAdmin].slice(-20)
+  broadcast({ type: "trace", key: v.key, ...(v.deviceId === undefined ? {} : { deviceId: v.deviceId }), trace: forAdmin })
+  // A turn of a conversation that was replaced (New conversation) is never committed to the new one.
+  if (v.conversation.id === r.conversationId) {
+    const heard = r.spoken ? r.clauses.filter((_, i) => i <= r.playedClause || outcome === "completed").map((c) => c.text).join(" ") : r.clauses.map((c) => c.text).join("")
+    v.history.push({ role: "assistant", text: heard, interrupted: outcome !== "completed", tools: r.tools.map((t) => ({ name: t.name, ok: true })) })
+    v.turns++
+    v.lastTurnAt = Date.now()
   }
-  setState(restingState())
+  toSession(v, { type: "turn.end", turnId: r.turnId, outcome, trace })
+  if (wakeMode(v)) {
+    const followUp = sessionProfile(v).followUpSeconds * 1000
+    if (followUp > 0) stayAwake(v, followUp)
+    else v.awakeUntil = 0
+  }
+  setState(v, restingState(v))
+  sessionsChanged()
 }
 
 /** Clauses up to `samples` started playing: tell every tab. */
@@ -1125,7 +1317,7 @@ const playedTo = (r: Reply, samples: number) => {
   while (k + 1 < r.clauses.length && r.clauses[k + 1]!.startSample < samples) k++
   if (k > r.playedClause) {
     r.playedClause = k
-    broadcast({ type: "assistant.playing", turnId: r.turnId, clause: k })
+    toSession(r.session, { type: "assistant.playing", turnId: r.turnId, clause: k })
   }
 }
 
@@ -1149,20 +1341,24 @@ const interruptReply = (r: Reply) => {
   }
 }
 
-const runReply = (opts: {
+const runReply = (v: VSession, opts: {
   source: "voice" | "text"
   userText: string
   clauses: ReadonlyArray<string>
   spoken: boolean
   tool?: { name: string; moduleId: string; input: unknown; ms: number; ok?: boolean; error?: string }
 }) => {
-  if (reply !== undefined) interruptReply(reply)
+  if (v.reply !== undefined) interruptReply(v.reply)
+  // The idle reset, decided at the start of the turn: quiet for longer than the device's conversationIdleMinutes.
+  const idleMinutes = sessionProfile(v).conversationIdleMinutes
+  if (idleMinutes > 0 && v.lastTurnAt !== null && Date.now() - v.lastTurnAt > idleMinutes * 60_000) newConversation(v, "idle")
   const turnId = ++turnSeq
   const endOfTurn = Date.now()
-  history.push({ role: "user", text: opts.userText })
-  broadcast({ type: "transcript", text: "" })
-  broadcast({ type: "turn.start", turnId, source: opts.source, userText: opts.userText, spoken: opts.spoken })
-  setState("thinking", turnId)
+  v.lastActive = endOfTurn
+  v.history.push({ role: "user", text: opts.userText })
+  toSession(v, { type: "transcript", text: "" })
+  toSession(v, { type: "turn.start", turnId, source: opts.source, userText: opts.userText, spoken: opts.spoken })
+  setState(v, "thinking", turnId)
   let startSample = 0
   const pcms = opts.clauses.map((text, i) => synthesize(text, i * 1.7 + turnId))
   const clauses = opts.clauses.map((text, i) => {
@@ -1170,30 +1366,30 @@ const runReply = (opts: {
     startSample += pcms[i]!.length
     return c
   })
-  const r: Reply = { turnId, clauses, endOfTurn, spoken: opts.spoken, tools: [], source: opts.source, owner, playedClause: -1, lastReport: Date.now(), timers: [], ended: false }
-  reply = r
+  const r: Reply = { turnId, clauses, endOfTurn, spoken: opts.spoken, tools: [], source: opts.source, owner: v.owner, session: v, conversationId: v.conversation.id, playedClause: -1, lastReport: Date.now(), timers: [], ended: false }
+  v.reply = r
   let t = 120
   if (opts.tool !== undefined) {
     const tool = opts.tool
-    r.timers.push(setTimeout(() => broadcast({ type: "tool.start", turnId, callId: `toolu_${turnId}`, tool: tool.name, moduleId: tool.moduleId, input: tool.input as never }), t))
+    r.timers.push(setTimeout(() => toSession(v, { type: "tool.start", turnId, callId: `toolu_${turnId}`, tool: tool.name, moduleId: tool.moduleId, input: tool.input as never }), t))
     t += tool.ms
     r.timers.push(setTimeout(() => {
       r.tools.push({ name: tool.name, ms: tool.ms })
-      broadcast({ type: "tool.end", turnId, callId: `toolu_${turnId}`, ok: tool.ok ?? true, ms: tool.ms, ...(tool.error !== undefined ? { error: tool.error } : {}) })
+      toSession(v, { type: "tool.end", turnId, callId: `toolu_${turnId}`, ok: tool.ok ?? true, ms: tool.ms, ...(tool.error !== undefined ? { error: tool.error } : {}) })
     }, t))
     t += 40
   }
   if (!opts.spoken) {
     // Unspoken: stream raw text deltas, then end.
     const words = opts.clauses.join(" ").split(/(?<= )/)
-    words.forEach((w, i) => r.timers.push(setTimeout(() => broadcast({ type: "assistant.text", turnId, clause: null, text: w }), t + 280 + i * 45)))
+    words.forEach((w, i) => r.timers.push(setTimeout(() => toSession(v, { type: "assistant.text", turnId, clause: null, text: w }), t + 280 + i * 45)))
     r.timers.push(setTimeout(() => endTurn(r, "completed"), t + 300 + words.length * 45))
     return
   }
-  const c = owner
+  const c = v.owner
   r.timers.push(setTimeout(() => {
     if (c === undefined || c.ws.readyState !== c.ws.OPEN) {
-      broadcast({ type: "error", error: { code: "turn_failed", message: "No audio client: the reply could not be played.", turnId } })
+      toSession(v, { type: "error", error: { code: "turn_failed", message: "No audio client: the reply could not be played.", turnId } })
       endTurn(r, "failed")
       return
     }
@@ -1204,7 +1400,7 @@ const runReply = (opts: {
       if (r.ended) return
       if (Date.now() - r.lastReport > 2000) {
         sendTo(c, { type: "reply.stop", turnId })
-        broadcast({ type: "error", error: { code: "playback_timeout", message: "The browser stopped reporting playback; the reply was stopped.", turnId } })
+        toSession(v, { type: "error", error: { code: "playback_timeout", message: "The browser stopped reporting playback; the reply was stopped.", turnId } })
         endTurn(r, "failed")
       }
     }, 250)
@@ -1212,7 +1408,7 @@ const runReply = (opts: {
   // Clauses go to TTS one after another, faster than real time.
   opts.clauses.forEach((text, i) => {
     r.timers.push(setTimeout(() => {
-      broadcast({ type: "assistant.text", turnId, clause: i, text, voice: ownerProfile().voice || "standard" })
+      toSession(v, { type: "assistant.text", turnId, clause: i, text, voice: sessionProfile(v).voice || "standard" })
       if (c !== undefined) sendReplyAudio(c, turnId, pcms[i]!)
       if (i === opts.clauses.length - 1 && c !== undefined) sendTo(c, { type: "reply.end", turnId })
     }, t + 30 + i * 380))
@@ -1221,14 +1417,14 @@ const runReply = (opts: {
 
 const VOICE_CLAUSES = ["It's sunny in Paris,", "eighteen degrees with a light wind from the west,", "and it stays dry until the evening."]
 
-const runVoiceTurn = () => {
-  if (owner === undefined) return
-  setState("hearing")
+const runVoiceTurn = (v: VSession | undefined) => {
+  if (v === undefined || v.owner === undefined) return
+  setState(v, "hearing")
   const words = ["what's", "what's the", "what's the weather", "what's the weather in", "what's the weather in Paris"]
-  words.forEach((w, i) => after(250 + i * 260, () => broadcast({ type: "transcript", text: w })))
+  words.forEach((w, i) => after(250 + i * 260, () => toSession(v, { type: "transcript", text: w })))
   after(250 + words.length * 260 + 350, () => {
-    sendHeard("What's the weather in Paris?", undefined, true)
-    runReply({
+    sendHeard(v, "What's the weather in Paris?", undefined, true)
+    runReply(v, {
       source: "voice",
       userText: "What's the weather in Paris?",
       clauses: VOICE_CLAUSES,
@@ -1239,13 +1435,13 @@ const runVoiceTurn = () => {
 }
 
 /** The wake scenario after a claim: asleep; a line it ignores; the phrase alone; then the voice turn. */
-const runWakeScript = () => {
-  after(2500, () => sendHeard("Hey go, what's the weather?"))
+const runWakeScript = (v: VSession) => {
+  after(2500, () => sendHeard(v, "Hey go, what's the weather?"))
   after(4000, () => {
-    sendHeard("Hey Jeff", "hey jeff")
-    wakeUp("hey jeff", true)
+    sendHeard(v, "Hey Jeff", "hey jeff")
+    wakeUp(v, "hey jeff", true)
   })
-  after(5500, runVoiceTurn)
+  after(5500, () => runVoiceTurn(v))
 }
 
 // ---------------------------------------------------------------------------
@@ -1343,62 +1539,66 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
     case "hello":
       return
     case "audio.claim": {
-      if (c.frontend === "admin") return sendTo(c, { type: "error", error: { code: "bad_message", message: "The admin page cannot use the audio." } })
-      const previous = owner
-      if (previous !== undefined && previous !== c) {
-        if (reply !== undefined && reply.owner === previous) sendTo(previous, { type: "reply.stop", turnId: reply.turnId })
-        if (reply !== undefined) interruptReply(reply)
+      const v = sessionFor(c)
+      if (v === undefined) return sendTo(c, { type: "error", error: { code: "bad_message", message: "The admin page cannot use the audio." } })
+      // Protocol 6: a claim that would start one more session than MAX_VOICE_SESSIONS is refused.
+      if (!startSession(v)) return sendTo(c, { type: "error", error: sessionsFull() })
+      // Within the device, the last claim wins (another device is never touched).
+      const previous = v.owner
+      if (previous !== undefined && previous !== c && v.reply !== undefined) {
+        if (v.reply.owner === previous) sendTo(previous, { type: "reply.stop", turnId: v.reply.turnId })
+        interruptReply(v.reply)
       }
-      owner = c
-      lastOwnerClientId = c.clientId
-      claimedSince = true
-      micLive = true
+      v.owner = c
+      v.lastOwnerClientId = c.clientId
+      v.micLive = true
       c.lastSeq = undefined
-      for (const x of conns) {
-        if (!x.welcomed) continue
-        sendTo(x, { type: "session", role: x === c ? "owner" : "observer", ownerPresent: true, reason: x === previous ? "taken_over" : "claimed" })
-      }
-      awakeUntil = 0
-      setState(restingState())
+      for (const x of connsOf(v)) sendTo(x, { type: "session", role: x === c ? "owner" : "observer", ownerPresent: true, reason: x === previous ? "taken_over" : "claimed" })
+      v.awakeUntil = 0
+      setState(v, restingState(v))
       devicesChanged()
-      if (scenario === "voice" || scenario === "drop-mid-reply") after(900, runVoiceTurn)
-      if (scenario === "wake") runWakeScript()
+      sessionsChanged()
+      if (scenario === "voice" || scenario === "drop-mid-reply") after(900, () => runVoiceTurn(v))
+      if (scenario === "wake") runWakeScript(v)
       if (scenario === "takeover") {
         after(1500, () => {
-          if (owner !== c) return
-          owner = undefined
-          lastOwnerClientId = "c-another-tab"
+          if (v.owner !== c) return
+          v.owner = undefined
+          v.lastOwnerClientId = "c-another-tab"
           sendTo(c, { type: "session", role: "observer", ownerPresent: true, reason: "taken_over" })
-          for (const x of conns) if (x !== c && x.welcomed) sendTo(x, { type: "session", role: "observer", ownerPresent: true, reason: "claimed" })
-          setState("listening")
+          for (const x of connsOf(v)) if (x !== c) sendTo(x, { type: "session", role: "observer", ownerPresent: true, reason: "claimed" })
+          setState(v, "listening")
         })
       }
       return
     }
-    case "audio.release":
-      if (owner !== c) return
-      owner = undefined
-      if (reply !== undefined) interruptReply(reply)
-      sessionUpdate("released")
-      setState("idle")
-      devicesChanged()
+    case "audio.release": {
+      const v = sessionFor(c)
+      if (v === undefined || v.owner !== c) return
+      v.owner = undefined
+      if (v.reply !== undefined) interruptReply(v.reply)
+      sessionUpdate(v, "released")
+      setState(v, "idle")
       return
+    }
     case "audio.config":
       return
-    case "mic.state":
-      if (owner !== c) return sendTo(c, { type: "error", error: { code: "not_owner", message: "Only the audio owner can do that." } })
-      micLive = m.live
+    case "mic.state": {
+      const v = sessionFor(c)
+      if (v === undefined || v.owner !== c) return sendTo(c, { type: "error", error: { code: "not_owner", message: "Only the audio owner can do that." } })
+      v.micLive = m.live
       c.lastSeq = undefined
-      if (reply === undefined) setState(restingState())
+      if (v.reply === undefined) setState(v, restingState(v))
       return
+    }
     case "playback.started": {
-      const r = reply
+      const r = sessionFor(c)?.reply
       if (r === undefined || r.turnId !== m.turnId || r.started !== undefined) return
       r.started = { at: Date.now(), outputLatencyMs: m.outputLatencyMs, startDelayMs: m.startDelayMs }
       r.lastReport = Date.now()
       r.playedClause = 0
-      setState("speaking", r.turnId)
-      broadcast({ type: "assistant.playing", turnId: r.turnId, clause: 0 })
+      setState(r.session, "speaking", r.turnId)
+      toSession(r.session, { type: "assistant.playing", turnId: r.turnId, clause: 0 })
       if (scenario === "drop-mid-reply" && r.dropScheduled !== true) {
         r.dropScheduled = true
         r.timers.push(setTimeout(() => dropAll(), 800))
@@ -1408,7 +1608,7 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
     case "playback.progress":
     case "playback.finished":
     case "playback.stopped": {
-      const r = reply
+      const r = sessionFor(c)?.reply
       if (r === undefined || r.turnId !== m.turnId) return
       r.lastReport = Date.now()
       if (m.type === "playback.stopped" && m.exact === false) {
@@ -1426,15 +1626,18 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
       return
     }
     case "interrupt": {
-      const r = reply
+      const r = sessionFor(c)?.reply
       if (r === undefined || (m.turnId !== undefined && m.turnId !== r.turnId)) return
       interruptReply(r)
       return
     }
     case "text.send": {
       if (engine.state !== "ready") return result(c, m.requestId, false, { code: "engine_failed", message: "The assistant's engines are not running; see Settings → Overview." })
+      const v = sessionFor(c)
+      if (v === undefined) return result(c, m.requestId, false, { code: "bad_message", message: "The admin page has no conversation." })
+      if (!startSession(v)) return result(c, m.requestId, false, sessionsFull())
       result(c, m.requestId, true)
-      const spoken = c === owner && m.speak
+      const spoken = c === v.owner && m.speak
       const lower = m.text.toLowerCase()
       const clauses = lower.includes("time")
         ? ["It's twenty past four in the afternoon in Tokyo."]
@@ -1442,7 +1645,8 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
         ? ["Once upon a time, in a city of canals,", "a small boat carried letters from door to door,", "and every evening the boatman sang the names of the streets,", "so that the houses would remember them."]
         : ["You said: " + m.text.slice(0, 80) + ".", "This is the mock assistant, so that is all I can say."]
       const tool = lower.includes("time") ? { name: "current_time", moduleId: "clock", input: { zone: "Asia/Tokyo" }, ms: 3 } : lower.includes("fail") ? { name: "weather", moduleId: "weather", input: { place: "Atlantis" }, ms: 3000, ok: false, error: "Weather service did not answer within 3000 ms" } : undefined
-      runReply({ source: "text", userText: m.text, clauses, spoken, ...(tool !== undefined ? { tool } : {}) })
+      runReply(v, { source: "text", userText: m.text, clauses, spoken, ...(tool !== undefined ? { tool } : {}) })
+      sessionsChanged()
       return
     }
     case "module.enable": {
@@ -1519,7 +1723,7 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
     case "engine.reload": {
       if (requireAdmin(c, m.requestId)) return
       if (engine.state === "reloading") return result(c, m.requestId, false, { code: "busy", message: "A reload is already running." })
-      if (reply !== undefined) interruptReply(reply)
+      for (const v of voiceSessions.values()) if (v.reply !== undefined) interruptReply(v.reply)
       engine = { ...engine, state: "reloading" }
       broadcast({ type: "engine", engine })
       after(1200, () => {
@@ -1628,7 +1832,7 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
       pushProfiles()
       result(c, m.requestId, true)
       devicesChanged()
-      if (c === owner && reply === undefined) setState(restingState())
+      settleAll()
       return
     }
     case "frontend.update": {
@@ -1639,7 +1843,7 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
       result(c, m.requestId, true)
       frontendsChanged()
       devicesChanged()
-      if (reply === undefined) setState(restingState())
+      settleAll()
       return
     }
     case "device.admin.update": {
@@ -1651,7 +1855,8 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
       pushProfiles()
       result(c, m.requestId, true)
       devicesChanged()
-      if (reply === undefined) setState(restingState())
+      sessionsChanged()
+      settleAll()
       return
     }
     case "device.forget": {
@@ -1669,12 +1874,23 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
     }
     case "wake.test": {
       if (requireAdmin(c, m.requestId)) return
+      if (m.deviceId !== undefined && !devices.has(m.deviceId)) return result(c, m.requestId, false, { code: "unknown_device", message: "This device is not known (any more)." })
       if (m.on) {
         c.testerUntil = Date.now() + WAKE_TEST_MAX_MS
+        c.testerDevice = m.deviceId
       } else {
         c.testerUntil = undefined
+        c.testerDevice = undefined
       }
       result(c, m.requestId, true)
+      return
+    }
+    case "conversation.new": {
+      // Protocol 6: this device's conversation only; the running turn stops, the history goes, its tabs are told.
+      const v = sessionFor(c)
+      if (v === undefined) return result(c, m.requestId, false, { code: "bad_message", message: "The admin page has no conversation." })
+      result(c, m.requestId, true)
+      newConversation(v, "new")
       return
     }
     case "ping":
@@ -1702,7 +1918,7 @@ wss.on("connection", (ws: WebSocket) => {
     if (isBinary) {
       if (!c.welcomed) return ws.close(CloseCode.badMessage)
       const frame = decodeMicFrame(data)
-      if (!frame.ok || c !== owner) return
+      if (!frame.ok || c !== sessionFor(c)?.owner) return
       c.micFrames++
       if (frame.frame.pcm.byteLength !== 640) clientLog.push({ at: Date.now(), conn: c.id, type: "mic.bad-size", bytes: frame.frame.pcm.byteLength })
       if (c.lastSeq !== undefined && frame.frame.seq !== ((c.lastSeq + 1) >>> 0)) c.micGaps++
@@ -1734,9 +1950,14 @@ wss.on("connection", (ws: WebSocket) => {
         c.deviceId = m.device.id
       }
       c.welcomed = true
-      const resumed = m.frontend === "voice" && m.resumeOwner && owner === undefined && lastOwnerClientId === m.clientId
+      const v = sessionFor(c)
+      if (v?.discardTimer !== undefined) {
+        clearTimeout(v.discardTimer)
+        v.discardTimer = undefined
+      }
+      const resumed = v !== undefined && m.resumeOwner && v.owner === undefined && v.lastOwnerClientId === m.clientId
       if (resumed) {
-        owner = c
+        v.owner = c
         c.lastSeq = undefined
       }
       sendTo(c, {
@@ -1745,20 +1966,22 @@ wss.on("connection", (ws: WebSocket) => {
         server: { name: "pva-mock", version: "0.0.0" },
         connectionId: c.id,
         snapshot: {
-          state: resumed ? restingState() : assistantState,
-          role: c === owner ? "owner" : "observer",
-          ownerPresent: owner !== undefined || lastOwnerClientId === "c-another-tab",
+          // Protocol 6: about the device's own session; an admin connection has none.
+          state: v === undefined ? "idle" : resumed ? restingState(v) : v.state,
+          role: v !== undefined && c === v.owner ? "owner" : "observer",
+          ownerPresent: v !== undefined && ownerPresentIn(v),
           engine: engineSummary(engine),
-          history: history.slice(-200),
+          history: v === undefined ? [] : v.history.slice(-200),
           ...(m.frontend === "voice" ? { device: profileInfo(c) } : {}),
-          admin: adminState(c, tokenSent !== undefined && c.session === undefined ? { endReason: "token" } : {})
+          admin: adminState(c, tokenSent !== undefined && c.session === undefined ? { endReason: "token" } : {}),
+          conversation: v === undefined ? { id: "no-session", startedAt: Date.now() } : v.conversation
         }
       })
       if (isAdminConn(c)) sendAdminSnapshot(c)
       if (c.deviceId !== undefined) devicesChanged()
       if (resumed) {
-        sessionUpdate("resumed")
-        setState(restingState())
+        sessionUpdate(v, "resumed")
+        setState(v, restingState(v))
       }
       return
     }
@@ -1771,15 +1994,17 @@ wss.on("connection", (ws: WebSocket) => {
       const record = devices.get(c.deviceId)
       if (record !== undefined) record.lastSeen = Date.now()
     }
-    if (owner === c) {
-      owner = undefined
-      if (reply !== undefined && reply.owner === c) {
-        broadcast({ type: "error", error: { code: "turn_failed", message: "The audio client disconnected during the reply.", turnId: reply.turnId } })
-        endTurn(reply, "failed")
+    const v = keyOf(c) === undefined ? undefined : voiceSessions.get(keyOf(c)!)
+    if (v !== undefined && v.owner === c) {
+      v.owner = undefined
+      if (v.reply !== undefined && v.reply.owner === c) {
+        toSession(v, { type: "error", error: { code: "turn_failed", message: "The audio client disconnected during the reply.", turnId: v.reply.turnId } })
+        endTurn(v.reply, "failed")
       }
-      sessionUpdate("owner_disconnected")
-      setState("idle")
+      sessionUpdate(v, "owner_disconnected")
+      setState(v, "idle")
     }
+    if (v !== undefined && connsOf(v).length === 0) scheduleDiscard(v)
     if (c.deviceId !== undefined) devicesChanged()
   })
 })
@@ -1807,8 +2032,9 @@ const http = createServer((req, res) => {
       return json(res, 200, {
         scenario,
         messages: clientLog,
-        mic: [...conns].map((c) => ({ conn: c.id, frames: c.micFrames, gaps: c.micGaps, owner: c === owner })),
-        state: assistantState,
+        mic: [...conns].map((c) => ({ conn: c.id, frames: c.micFrames, gaps: c.micGaps, owner: c === sessionFor(c)?.owner })),
+        state: targetSession()?.state ?? "idle",
+        sessions: sessionInfos(),
         connections: conns.size
       })
     }
@@ -1828,8 +2054,25 @@ const http = createServer((req, res) => {
         dropAll()
         return json(res, 200, { ok: true })
       case "/mock/turn":
-        runVoiceTurn()
+        runVoiceTurn(targetSession(payload.deviceId))
         return json(res, 200, { ok: true })
+      case "/mock/idle": {
+        // Protocol 6: the device's conversation has been quiet for longer than its conversationIdleMinutes: the next
+        // turn starts a new one (reason "idle"); `now: true` starts it at once.
+        const v = targetSession(payload.deviceId)
+        if (v === undefined) return json(res, 400, { error: "no session" })
+        if (payload.now === true) newConversation(v, "idle")
+        else v.lastTurnAt = Date.now() - (Math.max(1, sessionProfile(v).conversationIdleMinutes) + 1) * 60_000
+        return json(res, 200, { ok: true })
+      }
+      case "/mock/max-sessions": {
+        // MAX_VOICE_SESSIONS, as admin › Language model › Conversations would set it.
+        const n = typeof payload.n === "number" ? payload.n : DEFAULT_MAX_VOICE_SESSIONS
+        sections = sections.map((x) => (x.id === "conversations" ? { ...x, form: { ...x.form, values: { ...x.form.values, MAX_VOICE_SESSIONS: n } }, revision: x.revision + 1 } : x))
+        const section = sections.find((x) => x.id === "conversations")
+        if (section !== undefined) broadcast({ type: "section.changed", section })
+        return json(res, 200, { ok: true })
+      }
       case "/mock/drop":
         dropAll()
         return json(res, 200, { ok: true })
@@ -1845,11 +2088,13 @@ const http = createServer((req, res) => {
         return json(res, 200, { ok: true })
       }
       case "/mock/wake": {
-        wakeUp(typeof payload.phrase === "string" ? payload.phrase : "hey jeff", payload.armed !== false)
+        const v = targetSession(payload.deviceId)
+        if (v !== undefined) wakeUp(v, typeof payload.phrase === "string" ? payload.phrase : "hey jeff", payload.armed !== false)
         return json(res, 200, { ok: true })
       }
       case "/mock/heard": {
         sendHeard(
+          typeof payload.deviceId === "string" ? voiceSessions.get(payload.deviceId) : undefined,
           String(payload.text ?? ""),
           typeof payload.matched === "string" ? payload.matched : undefined,
           typeof payload.accepted === "boolean" ? payload.accepted : payload.accepted === null ? null : undefined
@@ -1861,6 +2106,7 @@ const http = createServer((req, res) => {
         kindDefaults = applyProfilePatch(kindDefaults, (payload.patch ?? {}) as ProfilePatch)
         pushProfiles()
         frontendsChanged()
+        settleAll()
         return json(res, 200, { ok: true })
       }
       case "/mock/logout-fails":
@@ -1869,7 +2115,8 @@ const http = createServer((req, res) => {
       case "/mock/state": {
         const state = payload.state
         if (state !== "idle" && state !== "asleep" && state !== "listening" && state !== "hearing" && state !== "thinking" && state !== "speaking") return json(res, 400, { error: "state?" })
-        setState(state)
+        const v = targetSession(payload.deviceId)
+        for (const x of v !== undefined ? [v] : [...voiceSessions.values()]) setState(x, state)
         return json(res, 200, { ok: true })
       }
       case "/mock/send": {

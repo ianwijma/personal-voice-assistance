@@ -20,6 +20,7 @@ const core = makeRecognizerCore({
   config: { ...workerData, agc: false },
   online: fakeOnline(),
   vad: fakeVad(),
+  makeVad: fakeVad,
   post,
   ...(workerData.segmentLimits ? { segmentLimits: workerData.segmentLimits } : {})
 })

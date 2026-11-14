@@ -1,4 +1,4 @@
-import { Cause, Context, Deferred, Effect, Exit, Fiber, Layer, Queue, Stream } from "effect"
+import { Cause, Clock, Context, Deferred, Effect, Exit, Fiber, Layer, Queue, Stream } from "effect"
 import type { Agent, AgentEvent, AgentTurnInput } from "./Agent.ts"
 import { AgentError } from "./Agent.ts"
 import { type ClauseChunkerOptions, chunkClauses } from "./ClauseChunker.ts"
@@ -6,6 +6,7 @@ import type {
   AgentSet,
   AgentTurnSetup,
   ConversationEvent,
+  ConversationStartReason,
   ConversationInput,
   PlaybackObserver,
   TurnSetup
@@ -46,6 +47,23 @@ interface CommonOptions {
   readonly onEvent?: (event: ConversationEvent) => void
   /** History to start from (an engine reload keeps the conversation). */
   readonly initialHistory?: ReadonlyArray<Message>
+  /**
+   * The id of the conversation `initialHistory` belongs to (an engine reload keeps it, so an agent that keys
+   * state by `AgentTurnInput.conversationId` keeps its session). Default: a new random id.
+   */
+  readonly initialConversationId?: string
+  /**
+   * When the last turn of `initialHistory` was committed (epoch ms, `Conversation.lastTurnAt`), so an engine reload
+   * does not restart the idle clock. Default: none (the idle clock starts at the next committed turn).
+   */
+  readonly initialLastTurnAt?: number
+  /**
+   * Idle reset (docs/VOICE-SESSIONS.md §1): when no turn has been committed for this long (ms), the next turn first
+   * starts a new conversation (`newConversation("idle")`). Decided at the start of the turn, so a speculative turn
+   * and its promotion see the same history. A function is read at every turn start (it can change at runtime, e.g.
+   * a device profile); `undefined`, 0 or a negative value means never. Default never.
+   */
+  readonly idleResetMs?: number | (() => number | undefined)
   /** How much history is kept (and so sent to a model every turn). Defaults: `DEFAULT_HISTORY_LIMITS`. */
   readonly history?: HistoryLimits
   /**
@@ -188,6 +206,18 @@ export class Conversation extends Context.Service<Conversation, {
   readonly history: Effect.Effect<ReadonlyArray<Message>>
   /** The routing state (sticky and armed agents); always empty in a single-model conversation. */
   readonly routerState: Effect.Effect<RouterState>
+  /**
+   * Start a new conversation (docs/VOICE-SESSIONS.md §1): stops the running voice turn as Stop does (the rest of
+   * the utterance being spoken starts nothing), drops the history, the pending question or confirmation and the
+   * routing state, and gives the conversation a new id, emitted as `ConversationStarted`. Works whether or not a
+   * voice loop runs. A `textTurn` still running is not stopped, but nothing of it is recorded in the new
+   * conversation. Succeeds with the new id.
+   */
+  newConversation(reason?: ConversationStartReason): Effect.Effect<string>
+  /** The current conversation's id (`AgentTurnInput.conversationId`). */
+  readonly conversationId: Effect.Effect<string>
+  /** When the current conversation's last turn was committed (epoch ms; `Clock`), or `undefined` if none yet. */
+  readonly lastTurnAt: Effect.Effect<number | undefined>
 }>()("@pva/core/Conversation") {
   static readonly layer = (options: ConversationOptions) =>
     Layer.effect(Conversation, makeConversation(options))
@@ -339,6 +369,8 @@ interface Answer {
 interface TurnLog {
   /** The user message as recorded: what the agent received (trigger phrase removed). */
   readonly user: string
+  /** The conversation the turn started in: a turn of an earlier conversation is never recorded in a newer one. */
+  readonly conversation: number
   readonly rounds: Array<Round>
   /** Spoken turns only: clauses sent to TTS, in order, with the round they belong to (-1: a notice, never recorded). */
   readonly clauses: Array<{ readonly text: string; readonly round: number }>
@@ -414,8 +446,22 @@ interface ReplyContext {
   readonly history: ReadonlyArray<Message>
   /** Messages evicted before `history[0]` when the snapshot was taken. */
   readonly historyStart: number
+  /** The conversation the turn belongs to (decided at its start). */
+  readonly conversationId: string
   readonly expectReply: (agentId: string) => void
 }
+
+/** A `newConversation` request to the running voice loop. */
+interface VoiceControl {
+  readonly reason: ConversationStartReason
+  readonly done: Deferred.Deferred<string>
+}
+
+/** What the voice loop handles: the input events, and `newConversation` requests. */
+type LoopInput = ConversationInput | { readonly _tag: "NewConversation" } & VoiceControl
+
+/** A new conversation id (random; `ConversationOptions.initialConversationId` carries one across a reload). */
+const newConversationId = (): string => globalThis.crypto.randomUUID()
 
 const noDeciders: ReadonlyMap<string, DecisionProvider> = new Map()
 const HANDOFF = Symbol("handoff")
@@ -478,6 +524,13 @@ const makeConversationCore = Effect.fnUntraced(function*(options: AgentConversat
   const history: Array<Message> = []
   /** Messages evicted from the front so far (`AgentTurnInput.historyStart`). */
   let evicted = 0
+  /** The current conversation (`newConversation`): its id, and a counter that tells turns of older ones apart. */
+  let conversationId = options.initialConversationId ?? newConversationId()
+  let conversationEpoch = 0
+  /** When the last turn was committed (epoch ms), for the idle reset. */
+  let lastTurnAt: number | undefined = options.initialLastTurnAt
+  /** The running voice loop's way to stop its turn and start a new conversation (`newConversation`). */
+  let voiceControl: Queue.Queue<VoiceControl> | undefined
   let routerState: RouterState = options.initialRouterState ?? initialRouterState
   /** The conversation's one pending question or confirmation, shared by every agent (review rounds 5 and 6). */
   const pendingIntents = makePendingIntents()
@@ -499,6 +552,50 @@ const makeConversationCore = Effect.fnUntraced(function*(options: AgentConversat
         // A subscriber must never break a turn.
       }
     }
+
+  // -------------------------------------------------------------------------
+  // Conversations (docs/VOICE-SESSIONS.md §1)
+
+  /** Drops the conversation's state and starts a new one. No turn may be running (the caller stops it first). */
+  const resetConversation = (reason: ConversationStartReason) =>
+    Effect.suspend(() => {
+      const ended = conversationId
+      history.length = 0
+      evicted = 0
+      conversationEpoch++
+      conversationId = newConversationId()
+      lastTurnAt = undefined
+      pendingIntents.set(undefined)
+      asked = undefined
+      setRouterState(initialRouterState)
+      emit({ _tag: "ConversationStarted", conversationId, reason })
+      const id = conversationId
+      return Effect.as(endAgentConversations(ended), id)
+    })
+
+  /** Tell the agents of the current setup that a conversation ended (a harness closes its session). Never fails. */
+  const endAgentConversations = (ended: string): Effect.Effect<void> =>
+    options.setup.pipe(
+      Effect.flatMap((setup) => {
+        const ends = [...setup.agents.agents.values()].flatMap((a) => (a.endConversation !== undefined ? [a.endConversation] : []))
+        return Effect.forEach(ends, (end) => Effect.catchCause(Effect.suspend(() => end(ended)), () => Effect.void), { discard: true })
+      }),
+      Effect.catchCause(() => Effect.void)
+    )
+
+  const idleResetMs = (): number | undefined => {
+    const value = typeof options.idleResetMs === "function" ? options.idleResetMs() : options.idleResetMs
+    return value !== undefined && Number.isFinite(value) && value > 0 ? value : undefined
+  }
+
+  /** At a turn's start: a new conversation first when none was committed for `idleResetMs`. True if it reset. */
+  const resetIfIdle: Effect.Effect<boolean> = Effect.suspend(() => {
+    const ms = idleResetMs()
+    const last = lastTurnAt
+    if (ms === undefined || last === undefined) return Effect.succeed(false)
+    return Effect.flatMap(Clock.currentTimeMillis, (now) =>
+      now - last < ms ? Effect.succeed(false) : Effect.as(resetConversation("idle"), true))
+  })
 
   // -------------------------------------------------------------------------
   // Routing
@@ -940,6 +1037,7 @@ const makeConversationCore = Effect.fnUntraced(function*(options: AgentConversat
           routedBy: decision.reason,
           history: ctx.history,
           ...(ctx.historyStart > 0 ? { historyStart: ctx.historyStart } : {}),
+          conversationId: ctx.conversationId,
           system: set.promptFor === undefined ? setup.system : set.promptFor(agent),
           context: context.length === 0 ? undefined : context,
           // A call of a `confirm: true` action PROPOSES it: core asks and conducts the confirmation (round 6),
@@ -1198,10 +1296,15 @@ const makeConversationCore = Effect.fnUntraced(function*(options: AgentConversat
     discarded: boolean,
     stopped = false
   ) =>
-    Effect.suspend(() => {
+    Effect.flatMap(Clock.currentTimeMillis, (now) => {
       const outcome = outcomeOf(exit, discarded)
-      if (outcome !== "discarded" && !log.canned) commit(log, spoken, outcome === "completed" && log.shortened !== true)
-      armProposal(log, trace, spoken, outcome, stopped)
+      // A turn of a conversation that has since been replaced (`newConversation`) is not recorded in the new one.
+      const current = log.conversation === conversationEpoch
+      if (current && outcome !== "discarded" && !log.canned) {
+        commit(log, spoken, outcome === "completed" && log.shortened !== true)
+        lastTurnAt = now
+      }
+      if (current) armProposal(log, trace, spoken, outcome, stopped)
       const logFailure = Exit.isFailure(exit) && outcome === "failed"
         ? Effect.logError("Turn failed", exit.cause)
         : Effect.void
@@ -1213,6 +1316,7 @@ const makeConversationCore = Effect.fnUntraced(function*(options: AgentConversat
 
   const newLog = (plan: TurnPlan, text: string): TurnLog => ({
     user: plan.decision?.text ?? text,
+    conversation: conversationEpoch,
     rounds: [],
     clauses: [],
     played: 0,
@@ -1226,6 +1330,7 @@ const makeConversationCore = Effect.fnUntraced(function*(options: AgentConversat
 
   const textTurn = (text: string, turnOptions?: { readonly agentId?: string | undefined }): Stream.Stream<string, LlmError> =>
     Stream.unwrap(Effect.gen(function*() {
+      yield* resetIfIdle
       const trace = tt.begin("text")
       tt.mark(trace, "endOfTurn")
       // Typed: it can answer a confirmation only if it was submitted after the question was armed.
@@ -1245,6 +1350,7 @@ const makeConversationCore = Effect.fnUntraced(function*(options: AgentConversat
         promoted: Effect.void,
         history: history.slice(),
         historyStart: evicted,
+        conversationId,
         expectReply: (agentId) => {
           if (!overruled(plan)) armFor(plan.setup?.agents, agentId)
         }
@@ -1264,7 +1370,7 @@ const makeConversationCore = Effect.fnUntraced(function*(options: AgentConversat
 
       const live = () => (current !== undefined && !current.done ? current : undefined)
 
-      const contextOf = (turn: ActiveTurn, log: TurnLog, history: ReadonlyArray<Message>, historyStart: number): ReplyContext => ({
+      const contextOf = (turn: ActiveTurn, log: TurnLog, history: ReadonlyArray<Message>, historyStart: number, conversationId: string): ReplyContext => ({
         plan: turn.plan,
         log,
         trace: turn.trace,
@@ -1275,6 +1381,7 @@ const makeConversationCore = Effect.fnUntraced(function*(options: AgentConversat
         promoted: Deferred.await(turn.promoted),
         history,
         historyStart,
+        conversationId,
         expectReply: (agentId) => {
           // The owner chose an agent by hand after this turn was planned: that choice stands,
           // whether the request comes before promotion (stored) or after it (applied now).
@@ -1390,7 +1497,12 @@ const makeConversationCore = Effect.fnUntraced(function*(options: AgentConversat
         how: { readonly explicitAgent?: string | undefined; readonly say?: string; readonly answerable?: PendingEntry | undefined } = {}
       ) =>
         Effect.gen(function*() {
-          const plan: TurnPlan = how.say !== undefined ? { canned: how.say } : planTurn(yield* options.setup, text, source, how.explicitAgent, how.answerable)
+          // Idle reset, decided here at the turn's start (a speculative turn and its promotion see the same
+          // history); a canned `Say` is not a turn of the conversation. What an utterance could answer belonged
+          // to the old conversation.
+          const reset = how.say === undefined && (yield* resetIfIdle)
+          const answerable = reset ? undefined : how.answerable
+          const plan: TurnPlan = how.say !== undefined ? { canned: how.say } : planTurn(yield* options.setup, text, source, how.explicitAgent, answerable)
           const trace = tt.begin(source, speculative)
           const promoted = yield* Deferred.make<void>()
           if (!speculative) {
@@ -1403,7 +1515,7 @@ const makeConversationCore = Effect.fnUntraced(function*(options: AgentConversat
           emit(turnStarted(trace, source, text, speculative, spoken, plan))
           if (plan.agent !== undefined) setTraceAgent(trace, plan.agent, plan.decision!, plan.decision!.unavailable)
           if (!speculative) yield* commitPlan(plan, trace)
-          const ctx = contextOf(turn, log, history.slice(), evicted)
+          const ctx = contextOf(turn, log, history.slice(), evicted, conversationId)
           // Forked uninterruptible so the exit handler is installed even if the
           // turn is interrupted before it starts running; the body is interruptible.
           turn.fiber = yield* Effect.interruptible(spoken ? turnBody(turn, ctx) : unspokenBody(ctx)).pipe(
@@ -1461,7 +1573,7 @@ const makeConversationCore = Effect.fnUntraced(function*(options: AgentConversat
         return Effect.logWarning(`Speech recognition sent ${event._tag} with no utterance open (no SpeechStarted since the last EndOfTurn); ignored`)
       }
 
-      const handle = (event: ConversationInput): Effect.Effect<void> =>
+      const handle = (event: LoopInput): Effect.Effect<void> =>
         Effect.gen(function*() {
           const turn = live()
           switch (event._tag) {
@@ -1552,21 +1664,44 @@ const makeConversationCore = Effect.fnUntraced(function*(options: AgentConversat
               }
               return
             }
-            case "Interrupt": {
-              // Stop cancels whatever runs, a speculative turn included, and the open
-              // utterance whether or not a turn exists for it: the rest of that utterance
-              // (eager transcripts, its final EndOfTurn) must not then start a reply.
-              if (utteranceOpen || turn?.pending === true) cancelled = { until: tt.now() + CANCELLED_UTTERANCE_MS }
-              if (turn !== undefined) {
-                turn.stopped = true
-                yield* interrupt(turn)
-              }
-              return
+            case "Interrupt":
+              return yield* stop(turn)
+            case "NewConversation": {
+              // As Stop, then the new conversation (the stopped turn is committed to the old one first).
+              yield* stop(turn)
+              return yield* Deferred.succeed(event.done, yield* resetConversation(event.reason))
             }
           }
         })
 
-      yield* Stream.runForEach(events, handle)
+      /**
+       * Stop cancels whatever runs, a speculative turn included, and the open utterance whether or
+       * not a turn exists for it: the rest of that utterance (eager transcripts, its final EndOfTurn)
+       * must not then start a reply.
+       */
+      const stop = (turn: ActiveTurn | undefined) =>
+        Effect.gen(function*() {
+          if (utteranceOpen || turn?.pending === true) cancelled = { until: tt.now() + CANCELLED_UTTERANCE_MS }
+          if (turn !== undefined) {
+            turn.stopped = true
+            yield* interrupt(turn)
+          }
+        })
+
+      // `newConversation` reaches the loop through this queue, so it is handled in order with the events.
+      const control = yield* Queue.unbounded<VoiceControl>()
+      voiceControl = control
+      yield* Effect.addFinalizer(() =>
+        Effect.gen(function*() {
+          if (voiceControl === control) voiceControl = undefined
+          // Requests that arrived as the loop ended: answered without a loop.
+          for (const request of yield* Queue.clear(control)) yield* Deferred.succeed(request.done, yield* resetConversation(request.reason))
+        }).pipe(Effect.orDie)
+      )
+      const controlEvents = Stream.fromQueue(control).pipe(
+        Stream.map((request): LoopInput => ({ _tag: "NewConversation", reason: request.reason, done: request.done }))
+      )
+      yield* Stream.runForEach(Stream.merge(events as Stream.Stream<LoopInput, E>, controlEvents, { haltStrategy: "left" }), handle)
 
       const last = live()
       if (last?.fiber !== undefined) {
@@ -1575,10 +1710,24 @@ const makeConversationCore = Effect.fnUntraced(function*(options: AgentConversat
       }
     }))
 
+  const newConversation = (reason: ConversationStartReason = "new"): Effect.Effect<string> =>
+    Effect.suspend(() => {
+      const control = voiceControl
+      if (control === undefined) return resetConversation(reason)
+      return Effect.gen(function*() {
+        const done = yield* Deferred.make<string>()
+        yield* Queue.offer(control, { reason, done })
+        return yield* Deferred.await(done)
+      })
+    })
+
   return Conversation.of({
     voice,
     textTurn,
     history: Effect.sync(() => history.slice()),
-    routerState: Effect.sync(() => routerState)
+    routerState: Effect.sync(() => routerState),
+    newConversation,
+    conversationId: Effect.sync(() => conversationId),
+    lastTurnAt: Effect.sync(() => lastTurnAt)
   })
 })

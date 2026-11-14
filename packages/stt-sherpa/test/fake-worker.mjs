@@ -2,7 +2,9 @@
 // the bounded decode queue) with the fake models of fakeModels.mjs. Every message is handled in order on a chain
 // (`workerData.frameDelayMs` per frame), like a busy real worker. A decode takes `workerData.decodeMs` and answers
 // `workerData.text`. `close` waits `workerData.closeDelayMs` first (a native decode settling).
-// `workerData.exitOnAudio`: the thread dies (a native crash) on the first audio.
+// `workerData.exitOnAudio`: the thread dies (a native crash) on the first audio; `workerData.exitOnAudioOf`: on the
+// first audio of that session id. `workerData.wordsOfAudio`: decodes answer the words of the audio (fakeModels.mjs)
+// instead of `text`, so concurrent sessions can tell their turns apart.
 // `workerData.stallMs`: decodes hang (a stalled native decode) for that long after the first audio, then return;
 // `workerData.maxQueuedDecodeMs` sets the core's bound on queued decode audio.
 import { parentPort, workerData } from "node:worker_threads"
@@ -15,8 +17,9 @@ const config = { ...workerData, agc: false, offline: { ...workerData.offline, in
 const hang = { on: workerData.stallMs !== undefined }
 const core = makeRecognizerCore({
   config,
-  offline: fakeOffline({ text: workerData.text ?? "hello", decodeMs: workerData.decodeMs ?? 0, hang }),
+  offline: fakeOffline({ ...(workerData.wordsOfAudio ? {} : { text: workerData.text ?? "hello" }), decodeMs: workerData.decodeMs ?? 0, hang }),
   vad: fakeVad(),
+  makeVad: fakeVad,
   post: (m) => parentPort.postMessage(m),
   ...(workerData.maxQueuedDecodeMs !== undefined ? { maxQueuedDecodeMs: workerData.maxQueuedDecodeMs } : {})
 })
@@ -24,6 +27,7 @@ let stallStarted = false
 let chain = Promise.resolve()
 parentPort.on("message", (m) => {
   if (m.type === "audio" && workerData.exitOnAudio) process.exit(3)
+  if (m.type === "audio" && workerData.exitOnAudioOf === m.session) process.exit(3)
   if (m.type === "audio" && hang.on && !stallStarted) {
     stallStarted = true
     setTimeout(() => {
