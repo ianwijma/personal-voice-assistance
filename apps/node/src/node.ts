@@ -7,7 +7,8 @@
  * - `helloFor` (WP-10): adds `hello.node` (credential, version, bundle hash, platform).
  * - `NodeSettings` (WP-10): volume and cues come from the pushed profile instead of CLI flags; audio devices too
  *   (rebuild the audio layer on change).
- * - `onOutdated` (WP-4): a 4400 triggers the manifest check and self-update.
+ * - `updates` (WP-4, `update.ts`): the manifest check before every connection attempt and after a 4400, the
+ *   confirmation of a new release at its first `welcome`, and a failed start while it is on probation.
  * - 4403 (WP-6 / WP-10) is already mapped to the slow retry (`Timing.unauthorizedRetryMs`).
  */
 import { randomUUID } from "node:crypto"
@@ -54,6 +55,32 @@ export const helloFor = (config: NodeConfig, clientId: string): HelloMessage => 
   device: { id: config.deviceId, kind: VOICE_NODE_KIND, name: config.name ?? defaultDeviceName() }
 })
 
+/** Self-update hooks (`update.ts`'s `Updater`). */
+export interface NodeUpdates {
+  /** Fetch the manifest; `Switched` means a new release is in place and the process should exit. */
+  readonly check: Effect.Effect<{ readonly _tag: string }>
+  /** The server welcomed this node. */
+  readonly welcomed: Effect.Effect<void>
+  /** The running release has not been confirmed by a welcome yet. */
+  readonly onProbation: () => boolean
+}
+
+/** Why `runNode` returned: the service manager restarts the process with `exitCode`. */
+export type NodeExit =
+  | { readonly _tag: "Updated"; readonly exitCode: 0 }
+  /** A release on probation reached the server but not `welcome`: counted as a failed start (`releases.ts`). */
+  | { readonly _tag: "FailedStart"; readonly exitCode: 1; readonly reason: string }
+
+/**
+ * Close codes that mean the server was reached and refused what this node said (as opposed to an unreachable or
+ * restarting server, or a removed node): protocol mismatch, protocol error, unsupported or invalid data, policy.
+ */
+const REFUSED_CODES = new Set([4400, 1002, 1003, 1007, 1008])
+
+/** Whether a connection that never got `welcome` counts against a release on probation. */
+export const countsAsFailedStart = (lost: ConnectionLost): boolean =>
+  !lost.welcomed && (REFUSED_CODES.has(lost.code) || (lost.code === 0 && lost.reason === "no welcome"))
+
 export interface NodeRunOptions {
   readonly config: NodeConfig
   readonly settings?: NodeSettings
@@ -61,8 +88,10 @@ export interface NodeRunOptions {
   readonly clientId?: string
   readonly log?: (line: string) => void
   readonly onTrace?: (line: string) => void
-  /** WP-4 seam: the server speaks another protocol version (4400). Default: log; the backoff retries. */
+  /** The server speaks another protocol version (4400). Default: log; the backoff retries. */
   readonly onOutdated?: Effect.Effect<void>
+  /** Self-update (absent: never updates, e.g. a development run). */
+  readonly updates?: NodeUpdates
   /** Called after every lost connection with the delay chosen (tests). */
   readonly onReconnect?: (lost: ConnectionLost, delayMs: number) => void
   readonly random?: () => number
@@ -73,7 +102,7 @@ export const defaultLog = (line: string) => {
   process.stderr.write(`${new Date().toISOString()} ${line}\n`)
 }
 
-/** Run the node until interrupted. */
+/** Run the node until interrupted, or until it must restart (a new release, a failed start on probation). */
 export const runNode = (options: NodeRunOptions) =>
   Effect.gen(function*() {
     const input = yield* AudioInput
@@ -113,11 +142,18 @@ export const runNode = (options: NodeRunOptions) =>
     yield* Effect.forkScoped(Effect.andThen(Deferred.await(wanted), capture))
 
     log(`pva-node: ${url} as device ${options.config.deviceId}; input ${info.input}, output ${info.output}`)
+    const updates = options.updates
+    const updated: Effect.Effect<boolean> = updates === undefined
+      ? Effect.succeed(false)
+      : Effect.map(updates.check, (result) => result._tag === "Switched")
     let attempt = 0
     while (true) {
+      // §7.3: the manifest check comes before every hello, so a node never stays on another protocol for longer
+      // than one connection attempt.
+      if (yield* updated) return { _tag: "Updated", exitCode: 0 } as const
       const lost = yield* Effect.scoped(connectOnce(url, helloFor(options.config, clientId), (socket) => {
         link = socket
-        session = makeSession({
+        const handlers = makeSession({
           link: socket,
           player,
           cues: () => settings.cues,
@@ -126,7 +162,15 @@ export const runNode = (options: NodeRunOptions) =>
           ...(options.onTrace !== undefined ? { onTrace: options.onTrace } : {}),
           onOwner: () => Deferred.doneUnsafe(wanted, Effect.void)
         })
-        return session
+        session = handlers
+        if (updates === undefined) return handlers
+        return {
+          ...handlers,
+          onMessage: (message) => {
+            if (message.type === "welcome") fork(updates.welcomed)
+            handlers.onMessage(message)
+          }
+        }
       }, timing)).pipe(Effect.flip)
       session?.close()
       session = undefined
@@ -143,6 +187,12 @@ export const runNode = (options: NodeRunOptions) =>
         if (action === "outdated") {
           log(`the server speaks another protocol version than this node (${PROTOCOL_VERSION}); the node must be updated`)
           if (options.onOutdated !== undefined) yield* options.onOutdated
+          if (yield* updated) return { _tag: "Updated", exitCode: 0 } as const
+        }
+        if (updates?.onProbation() === true && countsAsFailedStart(lost)) {
+          const reason = `${lost.code === 0 ? lost.reason : `${lost.code} ${lost.reason}`}`
+          log(`the new release did not get a welcome (${reason}); exiting, which counts as a failed start`)
+          return { _tag: "FailedStart", exitCode: 1, reason } as const
         }
         delayMs = reconnectDelay(attempt, timing, options.random)
       }

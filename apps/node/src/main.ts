@@ -4,20 +4,26 @@
  *   pva-node [run]      connect to the assistant and be its microphone and speaker (default)
  *   pva-node devices    list the audio devices of the backend
  *   pva-node test-tone  play a 1 kHz test tone (or a cue) on this box, without a server
+ *   pva-node pair       redeem a pairing code and write node.json (install.sh runs it; WP-4, WP-10 owns it after)
+ *   pva-node configure  write node.json without pairing (servers before WP-7: no credential)
+ *   pva-node version    print the version, protocol and bundle hash as JSON
  *
- * Later packages add `pair --code` and `status` (WP-10); `update.ts` is WP-4's.
+ * `run` updates itself from the server when it runs from an installed release (`update.ts`).
  */
 import { parseArgs } from "node:util"
 import { NodeRuntime } from "@effect/platform-node"
 import { AudioOutput } from "@pva/core"
+import { PROTOCOL_VERSION } from "@pva/protocol"
 import { Effect, Schema, Stream } from "effect"
 import { audioLayer, type BackendChoice, chooseBackend, listDevices, NodeAudioInfo } from "./audio.ts"
-import { DEFAULT_CONFIG_PATH, defaultDeviceId, type NodeConfig, NodeConfig as NodeConfigSchema, readConfig } from "./config.ts"
+import { DEFAULT_CONFIG_PATH, defaultDeviceId, type NodeConfig, NodeConfig as NodeConfigSchema, readConfig, writeConfig } from "./config.ts"
 import { DEFAULT_VOLUME, defaultLog, runNode } from "./node.ts"
+import { pair } from "./pair.ts"
+import { BUILD, detectInstall, NODE_VERSION, parseTlsPin, updaterFor } from "./update.ts"
 import { applyGain, volumeGain } from "./playback.ts"
 import { asBytes, identifySound, lapseCue, testTone, TONE_RATE, wakeCue } from "./tones.ts"
 
-const usage = `Usage: pva-node [run|devices|test-tone] [options]
+const usage = `Usage: pva-node [run|devices|test-tone|pair|configure|version] [options]
 
 run (default)
   --config <file>        node config (default ${DEFAULT_CONFIG_PATH})
@@ -40,6 +46,14 @@ test-tone
   --audio <backend>  --output-wav <dir>  --volume <0..100>
   --ms <ms>              tone length (default 1000, at most 5000)
   --sound <name>         tone (default), wake, lapse or identify
+
+pair                     redeem a pairing code from admin and write the config
+  --server <url>  --code <code>  --config <file>  [--tls-pin sha256:<hex>]  [--name <name>]
+
+configure                write the config without pairing (a server without /node/pair)
+  --server <url>  --config <file>  [--device-id <id>]  [--name <name>]  [--tls-pin sha256:<hex>]
+
+version                  {"version","protocol","bundleSha256"} as JSON
 `
 
 const { positionals, values } = parseArgs({
@@ -59,6 +73,8 @@ const { positionals, values } = parseArgs({
     "no-cues": { type: "boolean" },
     ms: { type: "string" },
     sound: { type: "string" },
+    code: { type: "string" },
+    "tls-pin": { type: "string" },
     help: { type: "boolean", short: "h" }
   }
 })
@@ -108,8 +124,63 @@ const loadConfig = (): Effect.Effect<NodeConfig, unknown> => {
 
 const run = Effect.gen(function*() {
   const config = yield* loadConfig()
-  return yield* Effect.scoped(runNode({ config, settings: { volume, cues: values["no-cues"] !== true } }))
+  const self = updaterFor(config.server, config.tlsPin, defaultLog)
+  defaultLog(`pva-node ${NODE_VERSION} (protocol ${PROTOCOL_VERSION})${"reason" in self ? `; self-update off: ${self.reason}` : ""}`)
+  const exit = yield* Effect.scoped(runNode({
+    config,
+    settings: { volume, cues: values["no-cues"] !== true },
+    ...("updater" in self ? { updates: self.updater } : {})
+  }))
+  // Exit explicitly: the service manager starts the new (or the previous) release.
+  return yield* Effect.sync(() => process.exit(exit.exitCode))
 }).pipe(Effect.provide(audioLayer(audioOptions)))
+
+const need = (name: string, value: string | undefined): string => value ?? fail(`${command} needs --${name}`)
+
+const checkPin = (pin: string | undefined) => {
+  try {
+    parseTlsPin(pin)
+  } catch (e) {
+    fail((e as Error).message)
+  }
+  return pin
+}
+
+const pairCommand = Effect.gen(function*() {
+  const configPath = values.config ?? DEFAULT_CONFIG_PATH
+  const config = yield* pair({
+    server: need("server", values.server),
+    code: need("code", values.code),
+    configPath,
+    tlsPin: checkPin(values["tls-pin"]),
+    name: values.name
+  })
+  process.stdout.write(`paired as ${config.deviceId}${config.name !== undefined ? ` (${config.name})` : ""}; wrote ${configPath}\n`)
+})
+
+const configureCommand = Effect.gen(function*() {
+  const configPath = values.config ?? DEFAULT_CONFIG_PATH
+  const pin = checkPin(values["tls-pin"])
+  const config = yield* Schema.decodeUnknownEffect(NodeConfigSchema)({
+    server: need("server", values.server),
+    deviceId: values["device-id"] ?? defaultDeviceId(),
+    ...(values.name !== undefined ? { name: values.name } : {}),
+    ...(pin !== undefined ? { tlsPin: pin } : {})
+  })
+  yield* writeConfig(configPath, config)
+  process.stdout.write(`wrote ${configPath} for ${config.deviceId}\n`)
+})
+
+const versionCommand = Effect.sync(() => {
+  const install = detectInstall()
+  process.stdout.write(`${JSON.stringify({
+    version: NODE_VERSION,
+    protocol: PROTOCOL_VERSION,
+    bundled: BUILD !== undefined,
+    ...(install._tag !== "Dev" ? { bundleSha256: install.sha256 } : {}),
+    installed: install._tag === "Installed"
+  })}\n`)
+})
 
 const devices = Effect.gen(function*() {
   const list = yield* listDevices(backend)
@@ -143,6 +214,12 @@ const program = command === "run"
   ? devices
   : command === "test-tone"
   ? tone
+  : command === "pair"
+  ? pairCommand
+  : command === "configure"
+  ? configureCommand
+  : command === "version"
+  ? versionCommand
   : fail(`unknown command ${command}`)
 
 NodeRuntime.runMain(
