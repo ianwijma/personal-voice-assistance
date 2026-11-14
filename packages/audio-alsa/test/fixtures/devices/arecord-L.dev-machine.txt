@@ -1,0 +1,20 @@
+null
+    Discard all samples (playback) or generate zero samples (capture)
+pipewire
+    PipeWire Sound Server
+default
+    Default ALSA Output (currently PipeWire Media Server)
+front:CARD=Intel
+    Front output / input
+surround21:CARD=Intel
+    2.1 Surround output to Front and Subwoofer speakers
+surround40:CARD=Intel
+    4.0 Surround output to Front and Rear speakers
+surround41:CARD=Intel
+    4.1 Surround output to Front, Rear and Subwoofer speakers
+surround50:CARD=Intel
+    5.0 Surround output to Front, Center and Rear speakers
+surround51:CARD=Intel
+    5.1 Surround output to Front, Center, Rear and Subwoofer speakers
+surround71:CARD=Intel
+    7.1 Surround output to Front, Center, Side, Rear and Woofer speakers

@@ -1,0 +1,17 @@
+null
+    Discard all samples (playback) or generate zero samples (capture)
+default:CARD=Intel
+    HDA Intel, ICH6 Analog
+    Default Audio Device
+sysdefault:CARD=Intel
+    HDA Intel, ICH6 Analog
+    Default Audio Device
+front:CARD=Intel,DEV=0
+    HDA Intel, ICH6 Analog
+    Front output / input
+hw:CARD=Intel,DEV=0
+    HDA Intel, ICH6 Analog
+    Direct hardware device without any conversions
+plughw:CARD=Intel,DEV=0
+    HDA Intel, ICH6 Analog
+    Hardware device with all software conversions
