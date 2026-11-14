@@ -778,3 +778,26 @@ Each has a recommended default; work proceeds on it until he says otherwise.
 
 Nothing built yet. Each work package adds its entry here: what was built, where, differences from this design and
 why, the commands run and their results, and the measurements of §9 it produced.
+
+**WP-5 (keyword-spotter spike), 2026-11-14: no-go for `on-keyword` for now; `continuous` stays.**
+Details, commands and every number are in `packages/kws-sherpa/FINDINGS.md`. **All numbers are x86 (Ryzen 9
+7945HX), not a Pi.**
+
+The §11 risks are cleared:
+- `sherpa-onnx-node` 2.0.1 exports `KeywordSpotter`.
+- `sherpa-onnx-linux-arm64@2.0.1` ships aarch64 binaries that need glibc ≥ 2.17. This was checked by inspecting
+  the files, not by running them.
+- Keywords must be model tokens. A TypeScript encoder (the English model's `bpe.model` is a SentencePiece *unigram*
+  model) matches the reference `sentencepiece` on 52 / 52 phrases.
+- Changing phrases means rebuilding the spotter, which takes about 340 ms.
+
+Cost is small: RTF 0.011, 1.1 % of one core, about 77 MB RSS.
+
+Accuracy fails §6, on 336 synthetic wakes (Kokoro, 28 voices):
+- The best setting (gigaspeech model, boost 2, threshold 0.05) misses **21 %** of them, and **14 %** of clean "hey
+  jeff" spoken alone.
+- The fire comes **352 ms** (p50) / 552 ms (p95) after the phrase ends.
+- There were 0 false fires in 0.66 h of real speech, and 2.1 % of near-miss sentences fired, mostly "Hey Jess".
+
+The decision can be reopened only by M4 on a Pi 4 with ≥ 50 of the owner's own wakes and ≥ 3 h of TV audio
+(`packages/kws-sherpa/scripts/pi-m4.sh`), which nobody has run yet.

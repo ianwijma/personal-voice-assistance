@@ -1,0 +1,30 @@
+{
+  "name": "@pva/kws-sherpa",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "WP-5 spike: sherpa-onnx keyword spotter for the voice node (docs/VOICE-NODES.md \u00a76, M4).",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "check": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "download-models": "tsx scripts/download-models.ts",
+    "synth": "tsx scripts/synth-samples.ts",
+    "measure": "tsx scripts/measure-m4.ts"
+  },
+  "dependencies": {
+    "effect": "catalog:",
+    "sherpa-onnx-node": "2.0.1"
+  },
+  "devDependencies": {
+    "@effect/vitest": "catalog:",
+    "@pva/core": "workspace:*",
+    "@pva/tts-sherpa": "workspace:*",
+    "@types/node": "catalog:",
+    "tsx": "catalog:",
+    "typescript": "catalog:",
+    "vitest": "catalog:"
+  }
+}
