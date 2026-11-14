@@ -16,7 +16,7 @@ import type { Vault, VaultFailure } from "./Vault.ts"
 
 export interface Keys {
   readonly state: () => VaultState
-  /** The vault as one page sees it. */
+  /** The vault as one page sees it (`admin`: that page is an admin connection; protocol 5: `VaultInfo.admin`). */
   readonly info: (admin: boolean) => VaultInfo
   readonly setup: (password: string) => Effect.Effect<HostResult>
   /** Unlock (or, when already unlocked, check the password). */
@@ -101,7 +101,7 @@ export const makeKeys = (options: {
       const retry = vault.retryAfterMs()
       return {
         state,
-        admin: state === "none" || admin,
+        admin,
         location: vault.path,
         ...(imported !== undefined ? { importedLegacySecrets: imported } : {}),
         ...(retry > 0 ? { retryAfterMs: retry } : {}),

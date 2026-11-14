@@ -162,7 +162,7 @@ describe("the Overview checklist", () => {
     const { reducer, initialState } = await import("@/lib/state.ts")
     const { openChecklistItems, setupChecklist } = await import("@/lib/setupChecklist.ts")
     const { serverExamples } = await import("@pva/protocol/examples")
-    const withEnv = reducer(initialState, serverExamples.welcome)
+    const withEnv = reducer(reducer(initialState, serverExamples.welcome), serverExamples["admin.snapshot"])
     // The example has a key still in .env: one open item, until it moves.
     expect(setupChecklist(withEnv).find((i) => i.id === "env")).toMatchObject({ ok: false, text: "1 setting is still in .env (they cannot be changed here)", action: { path: ["diagnostics", "overrides"] } })
     const s = reducer(withEnv, { type: "env", env: { files: [], entries: [] } })

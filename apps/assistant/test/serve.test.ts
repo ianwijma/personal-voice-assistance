@@ -12,7 +12,7 @@ import { mkdtempSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { defaultPreflight, EngineBuildProblems } from "../src/serve/Engine.ts"
 import { ScriptedClient, sleep } from "./support/scriptedClient.ts"
-import { controlledStt, fakeBuild, greeterModule, markedPcm, scriptedLlm, startTestServer, type TestServer, toneTts } from "./support/serveHarness.ts"
+import { controlledStt, fakeBuild, greeterModule, markedPcm, scriptedLlm, startTestServer, TEST_ADMIN_PASSWORD, type TestServer, toneTts } from "./support/serveHarness.ts"
 
 let server: TestServer | undefined
 const clients: Array<ScriptedClient> = []
@@ -43,7 +43,7 @@ const inOrder = (all: ReadonlyArray<string>, sub: ReadonlyArray<string>) => {
 }
 
 describe("serve: handshake", () => {
-  it("hello → welcome with a full snapshot; the tab starts as an observer", async () => {
+  it("hello → welcome with the voice snapshot; the tab starts as an observer; admin data only after login", async () => {
     await basic()
     const client = await connect()
     const welcome = await client.hello()
@@ -51,9 +51,14 @@ describe("serve: handshake", () => {
     expect(welcome.snapshot.role).toBe("observer")
     expect(welcome.snapshot.ownerPresent).toBe(false)
     expect(welcome.snapshot.state).toBe("idle")
-    expect(welcome.snapshot.engine.state).toBe("ready")
-    expect(welcome.snapshot.modules.map((m) => [m.id, m.state])).toEqual([["greeter", "running"]])
-    expect(welcome.snapshot.sections.map((s) => [s.id, `${s.group}/${s.page?.id}`])).toEqual([
+    expect(welcome.snapshot.engine).toEqual({ ready: true, state: "ready", voices: [{ name: "standard", description: "Everyday answers.", isDefault: true }] })
+    expect(welcome.snapshot.history).toEqual([])
+    expect(Object.keys(welcome.snapshot).sort()).toEqual(["admin", "device", "engine", "history", "ownerPresent", "role", "state"])
+    const admin = await connect()
+    const { snapshot } = await admin.admin(TEST_ADMIN_PASSWORD)
+    expect(snapshot.engine.state).toBe("ready")
+    expect(snapshot.modules.map((m) => [m.id, m.state])).toEqual([["greeter", "running"]])
+    expect(snapshot.sections.map((s) => [s.id, `${s.group}/${s.page?.id}`])).toEqual([
       ["language-model", "agents/provider"],
       ["llm-behaviour", "agents/behaviour"],
       ["stt-engine", "speech/engine"],
@@ -64,14 +69,13 @@ describe("serve: handshake", () => {
       ["voice-engines", "voices/engines"],
       ["recordings", "diagnostics/recordings"]
     ])
-    expect(welcome.snapshot.modules[0]).toMatchObject({ id: "greeter", group: "modules" })
-    expect(welcome.snapshot.history).toEqual([])
+    expect(snapshot.modules[0]).toMatchObject({ id: "greeter", group: "modules" })
   })
 
   it("a different protocol version gets an error and close 4400; no hello closes 4401; binary first closes 4402", async () => {
     await basic(undefined, { helloTimeoutMs: 200 })
     const old = await connect()
-    old.send({ type: "hello", protocol: PROTOCOL_VERSION + 1, clientId: "client-old-123", resumeOwner: false })
+    old.send({ type: "hello", protocol: PROTOCOL_VERSION + 1, clientId: "client-old-123", resumeOwner: false, frontend: "voice" })
     const error = await old.waitFor("error")
     expect(error.error).toEqual({ code: "bad_message", message: "This page is out of date; reload it" })
     expect((await old.closed).code).toBe(CloseCode.protocolMismatch)
@@ -101,7 +105,7 @@ describe("serve: a voice turn", () => {
     const owner = await connect()
     await owner.hello()
     const from = owner.messages.length
-    const session = await owner.claim("instant")
+    const session = await owner.claim()
     expect(session).toEqual({ type: "session", role: "owner", ownerPresent: true, reason: "claimed" })
     await owner.waitFor("state", (m) => m.state === "listening")
     await owner.streamPcm(markedPcm(200), { realTime: false })
@@ -140,7 +144,7 @@ describe("serve: a voice turn", () => {
     const { stt } = await basic()
     const owner = await connect()
     await owner.hello()
-    await owner.claim("instant")
+    await owner.claim()
     const observer = await connect()
     const welcome = await observer.hello()
     expect(welcome.snapshot.ownerPresent).toBe(true)
@@ -157,7 +161,7 @@ describe("serve: interruptions", () => {
     const { stt } = await basic(() => "First clause here. Second clause here. Third clause here.")
     const owner = await connect()
     await owner.hello()
-    await owner.claim("instant")
+    await owner.claim()
     stt.emit(endOfTurn("tell me"))
     await owner.waitFor("assistant.playing", (m) => m.clause === 0, { timeoutMs: 10_000 })
     await sleep(150) // well inside the first 400 ms clause
@@ -173,14 +177,15 @@ describe("serve: interruptions", () => {
       { role: "user", text: "tell me" },
       { role: "assistant", text: "First clause here.", interrupted: true, tools: [] }
     ])
-    expect(welcome.snapshot.traces.map((t) => t.outcome)).toEqual(["interrupted"])
+    const admin = await connect()
+    expect((await admin.admin(TEST_ADMIN_PASSWORD)).snapshot.traces.map((t) => t.outcome)).toEqual(["interrupted"])
   })
 
   it("Stop from an observer interrupts the owner's reply through reply.stop", async () => {
     const { stt } = await basic(() => "One long clause. Another long clause. And a third one.")
     const owner = await connect()
     await owner.hello()
-    await owner.claim("instant")
+    await owner.claim()
     const observer = await connect()
     await observer.hello()
     stt.emit(endOfTurn("talk"))
@@ -195,7 +200,7 @@ describe("serve: interruptions", () => {
     const { stt } = await basic(() => "One long clause. Another long clause. And a third one.")
     const owner = await connect()
     await owner.hello()
-    await owner.claim("instant")
+    await owner.claim()
     stt.emit(endOfTurn("talk"))
     await owner.waitFor("assistant.playing", () => true, { timeoutMs: 10_000 })
     await sleep(100)
@@ -233,10 +238,10 @@ describe("serve: interruptions", () => {
     const { stt } = await basic(() => "Short reply here.")
     const owner = await connect()
     await owner.hello()
-    await owner.claim("instant")
+    await owner.claim()
     stt.emit(endOfTurn("hi"))
     await owner.waitFor("assistant.playing", () => true, { timeoutMs: 10_000 })
-    await owner.claim("confirm")
+    await owner.claim()
     expect((await owner.waitFor("turn.end", () => true, { from: 0, timeoutMs: 10_000 })).outcome).toBe("completed")
     expect(owner.types()).not.toContain("reply.stop")
   })
@@ -245,7 +250,7 @@ describe("serve: interruptions", () => {
     const { stt } = await basic(() => "Short.")
     const owner = await connect()
     await owner.hello()
-    await owner.claim("instant")
+    await owner.claim()
     stt.emit(endOfTurn("hi"))
     const start = await owner.waitFor("turn.start", () => true, { timeoutMs: 10_000 })
     owner.send({ type: "interrupt", turnId: start.turnId + 100 })
@@ -275,7 +280,7 @@ describe("serve: typed messages", () => {
     await basic((t) => `Spoken reply to ${t}.`)
     const owner = await connect()
     await owner.hello()
-    await owner.claim("instant")
+    await owner.claim()
     owner.send({ type: "text.send", requestId: "r2", text: "say it", speak: true })
     const start = await owner.waitFor("turn.start", () => true, { timeoutMs: 10_000 })
     expect(start.spoken).toBe(true)
@@ -288,7 +293,12 @@ describe("serve: typed messages", () => {
     })
     const tab = await connect()
     const welcome = await tab.hello()
-    expect(welcome.snapshot.engine).toMatchObject({ state: "failed", problems: [{ stage: "language model (LLM_PROVIDER)", message: "ANTHROPIC_API_KEY is not set" }] })
+    expect(welcome.snapshot.engine).toEqual({ ready: false, state: "failed", voices: [] })
+    const admin = await connect()
+    expect((await admin.admin(TEST_ADMIN_PASSWORD)).snapshot.engine).toMatchObject({
+      state: "failed",
+      problems: [{ stage: "language model (LLM_PROVIDER)", message: "ANTHROPIC_API_KEY is not set" }]
+    })
     tab.send({ type: "text.send", requestId: "r3", text: "anyone?", speak: false })
     const refused = await tab.waitFor("result")
     expect(refused.ok).toBe(false)
@@ -301,8 +311,8 @@ describe("serve: modules and settings", () => {
     await basic()
     const a = await connect()
     const b = await connect()
-    await a.hello()
-    const welcomeB = await b.hello()
+    await a.admin(TEST_ADMIN_PASSWORD)
+    const welcomeB = await b.admin(TEST_ADMIN_PASSWORD)
     const revision = welcomeB.snapshot.modules[0]!.revision
 
     a.send({ type: "module.configure", requestId: "c1", moduleId: "greeter", patch: { values: { greeting: "hoi" }, secrets: { token: "s3cret" } } })
@@ -333,7 +343,7 @@ describe("serve: modules and settings", () => {
   it("a module change applies from the next turn's system prompt", async () => {
     const { stt, llm } = await basic(() => "Ok.")
     const owner = await connect()
-    await owner.hello()
+    await owner.admin(TEST_ADMIN_PASSWORD)
     owner.send({ type: "text.send", requestId: "t1", text: "one", speak: false })
     await owner.waitFor("turn.end", () => true, { timeoutMs: 10_000 })
     owner.send({ type: "module.configure", requestId: "c1", moduleId: "greeter", patch: { values: { greeting: "hoi" }, secrets: {} } })
@@ -350,8 +360,8 @@ describe("serve: modules and settings", () => {
     await basic((t) => `Reply to ${t}.`)
     const a = await connect()
     const b = await connect()
-    await a.hello()
-    await b.hello()
+    await a.admin(TEST_ADMIN_PASSWORD)
+    await b.admin(TEST_ADMIN_PASSWORD)
     a.send({ type: "text.send", requestId: "t1", text: "before reload", speak: false })
     await a.waitFor("turn.end", () => true, { timeoutMs: 10_000 })
 
@@ -381,7 +391,14 @@ describe("serve: modules and settings", () => {
       { role: "assistant", text: "Reply to before reload.", interrupted: false, tools: [] }
     ])
     const saved = JSON.parse(readFileSync(join(server!.dataDir, "settings.json"), "utf8"))
-    expect(saved).toEqual({ version: 2, revision: expect.any(Number), modules: expect.anything(), assistant: { STT_SHERPA_FINAL_SILENCE_MS: 500 } })
+    expect(saved).toEqual({
+      version: 3,
+      revision: expect.any(Number),
+      modules: expect.anything(),
+      assistant: { STT_SHERPA_FINAL_SILENCE_MS: 500 },
+      frontends: { "web-voice": { interruptMode: "instant" } },
+      devices: expect.anything()
+    })
   })
 })
 
@@ -390,7 +407,7 @@ describe("serve: choosing the speech recognition model", () => {
     const emptyModels = mkdtempSync(join(tmpdir(), "pva-no-models-"))
     await basic(undefined, { env: { STT_SHERPA_MODEL_DIR: emptyModels } })
     const a = await connect()
-    const sections = (await a.hello()).snapshot.sections
+    const sections = (await a.admin(TEST_ADMIN_PASSWORD)).snapshot.sections
     const fields = sections.flatMap((s) => s.form.fields)
     const model = fields.find((f) => f.key === "STT_SHERPA_MODEL")!
     expect(model.type).toBe("choice")
@@ -415,7 +432,7 @@ describe("serve: choosing the speech recognition model", () => {
     const emptyModels = mkdtempSync(join(tmpdir(), "pva-no-models-"))
     const { stt } = await basic((t) => `Reply to ${t}.`, { env: { STT_SHERPA_MODEL_DIR: emptyModels }, preflight: defaultPreflight })
     const a = await connect()
-    await a.hello()
+    await a.admin(TEST_ADMIN_PASSWORD)
     const from = a.messages.length
     a.send({ type: "engine.reload", requestId: "r1" })
     const result = await a.waitFor("result", (m) => m.requestId === "r1", { timeoutMs: 10_000 })
@@ -436,12 +453,12 @@ describe("serve: ownership", () => {
     const { stt } = await basic(() => "One long clause. Another long clause. And a third one.")
     const a = await connect()
     await a.hello()
-    await a.claim("instant")
+    await a.claim()
     const b = await connect()
     await b.hello()
     stt.emit(endOfTurn("talk"))
     await a.waitFor("assistant.playing", () => true, { timeoutMs: 10_000 })
-    await b.claim("confirm")
+    await b.claim()
     // The previous owner first gets reply.stop, then its new role.
     await a.waitFor("reply.stop")
     expect(await a.waitFor("session", (m) => m.reason === "taken_over")).toEqual({ type: "session", role: "observer", ownerPresent: true, reason: "taken_over" })
@@ -456,13 +473,13 @@ describe("serve: ownership", () => {
     // A reports playback.started and then nothing until asked (its next periodic report is far away).
     const a = await connect({ player: { progressMs: 60_000 } })
     await a.hello()
-    await a.claim("instant")
+    await a.claim()
     const b = await connect()
     await b.hello()
     stt.emit(endOfTurn("talk"))
     await a.waitFor("assistant.playing", (m) => m.clause === 0, { timeoutMs: 10_000 })
     await sleep(600) // the second 400 ms clause is now playing in A; the server has not been told
-    await b.claim("confirm")
+    await b.claim()
     await a.waitFor("reply.stop")
     const end = await b.waitFor("turn.end", () => true, { from: 0 })
     expect(["interrupted", "failed"]).toContain(end.outcome)
@@ -476,7 +493,7 @@ describe("serve: ownership", () => {
     await basic()
     const a = await connect()
     await a.hello()
-    await a.claim("instant")
+    await a.claim()
     const watcher = await connect()
     await watcher.hello()
     a.drop()
@@ -486,7 +503,7 @@ describe("serve: ownership", () => {
     expect(welcome.snapshot.role).toBe("owner")
     expect(await again.waitFor("session")).toEqual({ type: "session", role: "owner", ownerPresent: true, reason: "resumed" })
 
-    await watcher.claim("instant")
+    await watcher.claim()
     again.drop()
     const third = await connect({ clientId: a.clientId })
     expect((await third.hello({ resumeOwner: true })).snapshot.role).toBe("observer")
@@ -523,7 +540,7 @@ describe("serve: provisional final counts (playback.stopped exact: false)", () =
     // The page's first answer overstates (500 ms more than played: into the second clause); the exact one follows.
     const owner = await connect({ player: { provisionalStop: { count: (played, rate) => played + Math.round(rate / 2), exactAfterMs: 80 } } })
     await owner.hello()
-    await owner.claim("instant")
+    await owner.claim()
     stt.emit(endOfTurn("tell me"))
     await owner.waitFor("assistant.playing", (m) => m.clause === 0, { timeoutMs: 10_000 })
     await sleep(150)
@@ -543,13 +560,13 @@ describe("serve: provisional final counts (playback.stopped exact: false)", () =
     const { stt } = await basic(() => "One long clause. Another long clause. And a third one.")
     const a = await connect({ player: { progressMs: 60_000, provisionalStop: { count: (_played, rate) => Math.round(rate / 10), exactAfterMs: 80 } } })
     await a.hello()
-    await a.claim("instant")
+    await a.claim()
     const b = await connect()
     await b.hello()
     stt.emit(endOfTurn("talk"))
     await a.waitFor("assistant.playing", (m) => m.clause === 0, { timeoutMs: 10_000 })
     await sleep(600) // the second 400 ms clause is playing in A
-    await b.claim("confirm")
+    await b.claim()
     await a.waitFor("reply.stop")
     const end = await b.waitFor("turn.end", () => true, { from: 0 })
     expect(["interrupted", "failed"]).toContain(end.outcome)
@@ -566,7 +583,7 @@ describe("serve: playback stall", () => {
     server = await startTestServer({ build: fakeBuild({ stt: stt.stt, llm: llm.llm, voices: [{ name: "standard", description: "d", tts: toneTts({ millisPerClause: 120 }) }] }), stallMs: 400 })
     const owner = await connect({ player: { enabled: false } })
     await owner.hello()
-    await owner.claim("instant")
+    await owner.claim()
     stt.emit(endOfTurn("hello"))
     await owner.waitFor("reply.end", () => true, { timeoutMs: 10_000 })
     await owner.waitFor("reply.stop", () => true, { timeoutMs: 3_000 })
@@ -595,7 +612,7 @@ describe("serve: settings that may come from two saves (a damaged journal after 
     const llm = scriptedLlm((t) => `Reply to ${t}.`)
     server = await startTestServer({ build: fakeBuild({ stt: controlledStt().stt, llm: llm.llm }), dataDir })
     const page = await connect()
-    const welcome = await page.hello()
+    const welcome = await page.admin(TEST_ADMIN_PASSWORD)
     expect(welcome.snapshot.engine.state).toBe("failed")
     expect(welcome.snapshot.engine.problems).toHaveLength(1)
     expect(welcome.snapshot.engine.problems[0]!.stage).toBe("settings")
@@ -612,7 +629,9 @@ describe("serve: settings that may come from two saves (a damaged journal after 
     await page.waitFor("engine", (m) => m.engine.state === "ready", { from: 0, timeoutMs: 10_000 })
     await page.waitFor("module.changed", (m) => m.module.id === "greeter" && m.module.state === "running", { from: 0, timeoutMs: 10_000 })
     const late = await connect()
-    expect((await late.hello()).snapshot.engine).toMatchObject({ state: "ready", problems: [] })
+    expect((await late.hello()).snapshot.engine.ready).toBe(true)
+    const admin = await connect()
+    expect((await admin.admin(TEST_ADMIN_PASSWORD)).snapshot.engine).toMatchObject({ state: "ready", problems: [] })
   })
 })
 
@@ -677,7 +696,7 @@ describe("serve: unblocking through every kind of save (fifth review)", () => {
       const llm = scriptedLlm((t) => `Reply to ${t}.`)
       server = await startTestServer({ build: fakeBuild({ stt: controlledStt().stt, llm: llm.llm }), dataDir, catalog: [greeterModule, waver] })
       const page = await connect()
-      const welcome = await page.hello()
+      const welcome = await page.admin(TEST_ADMIN_PASSWORD)
       expect(welcome.snapshot.engine.state).toBe("failed")
       page.send({ ...request, requestId: "s1" } as never)
       expect((await page.waitFor("result", (m) => m.requestId === "s1")).ok).toBe(true)
@@ -724,7 +743,7 @@ describe("serve: unblocking through every kind of save (fifth review)", () => {
     const held = heldBuild()
     server = await startTestServer({ build: held.build, dataDir, catalog: [greeterModule, waver] })
     const page = await connect()
-    await page.hello()
+    await page.admin(TEST_ADMIN_PASSWORD)
     page.send({ type: "module.configure", moduleId: "greeter", patch: { values: { greeting: "hallo" }, secrets: {} }, requestId: "s1" } as never)
     expect((await page.waitFor("result", (m) => m.requestId === "s1")).ok).toBe(true)
     page.send({ type: "engine.reload", requestId: "r1" })
@@ -744,7 +763,7 @@ describe("serve: unblocking through every kind of save (fifth review)", () => {
       const held = heldBuild()
       server = await startTestServer({ build: held.build, dataDir, catalog: [greeterModule, waver] })
       const page = await connect()
-      await page.hello()
+      await page.admin(TEST_ADMIN_PASSWORD)
       page.send({ type: "settings.update", sectionId: "stt-timing", patch: { values: { STT_SHERPA_FINAL_SILENCE_MS: 600 }, secrets: {} }, requestId: "s1" } as never)
       page.send({ type: "engine.reload", requestId: "r1" })
       await page.waitFor("result", (m) => m.requestId === "s1", { from: 0 })

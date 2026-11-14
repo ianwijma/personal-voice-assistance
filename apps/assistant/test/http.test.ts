@@ -29,7 +29,10 @@ const rejectingHub = (): SessionHub & { rejected: number } => {
     closeAll: () => {},
     size: () => 0,
     micFramesLost: () => 0,
-    vaultChanged: () => {}
+    vaultChanged: () => {},
+    ownerProfile: () => undefined,
+    refreshProfiles: () => {},
+    wakeHeard: () => {}
   }
   return hub
 }
@@ -460,4 +463,67 @@ describe("http: cross-origin isolation headers (SERVE_CROSS_ORIGIN_ISOLATION)", 
     expect(read({ SERVE_CROSS_ORIGIN_ISOLATION: "false" })).toBe(false)
     expect(read({ SERVE_CROSS_ORIGIN_ISOLATION: "true" })).toBe(true)
   })
+})
+
+describe("http: the admin front end at /admin/", () => {
+  /** A UI export with the voice page and the admin page in one of Next's two layouts. */
+  const site = (layout: "admin.html" | "admin/index.html") => {
+    const dir = mkdtempSync(join(tmpdir(), "pva-http-admin-"))
+    writeFileSync(join(dir, "index.html"), "<!doctype html><title>voice</title>")
+    if (layout === "admin.html") writeFileSync(join(dir, "admin.html"), "<!doctype html><title>admin</title>")
+    else {
+      mkdirSync(join(dir, "admin"))
+      writeFileSync(join(dir, "admin/index.html"), "<!doctype html><title>admin</title>")
+    }
+    writeFileSync(join(dir, "404.html"), "<!doctype html><title>404</title>")
+    return dir
+  }
+  const serve = async (webDir: string) => {
+    const scope = Effect.runSync(Scope.make())
+    scopes.push(scope)
+    const server = await Effect.runPromise(
+      startHttp({ host: "127.0.0.1", port: 0, webDir, allowedOrigins: [], hub: rejectingHub() }).pipe(Scope.provide(scope))
+    )
+    return async (path: string) => {
+      const res = await fetch(`${server.url}${path}`, { redirect: "manual" })
+      return {
+        status: res.status,
+        location: res.headers.get("location"),
+        body: await res.text(),
+        type: res.headers.get("content-type"),
+        coop: res.headers.get("cross-origin-opener-policy"),
+        coep: res.headers.get("cross-origin-embedder-policy"),
+        corp: res.headers.get("cross-origin-resource-policy"),
+        nosniff: res.headers.get("x-content-type-options")
+      }
+    }
+  }
+
+  it("trailingSlash export (admin/index.html): /admin redirects to /admin/ (308, query kept), with the page's headers", async () => {
+    const get = await serve(site("admin/index.html"))
+    const voice = await get("/")
+    for (const [path, to] of [["/admin", "/admin/"], ["/admin?x=1", "/admin/?x=1"]] as const) {
+      const r = await get(path)
+      expect(r.status, path).toBe(308)
+      expect(r.location, path).toBe(to)
+      expect([r.coop, r.coep, r.corp, r.nosniff], path).toEqual([voice.coop, voice.coep, voice.corp, voice.nosniff])
+    }
+    expect((await get("/")).status).toBe(200)
+    expect((await get("/nope")).status).toBe(404)
+  })
+
+  for (const layout of ["admin.html", "admin/index.html"] as const) {
+    it(`serves the admin page at /admin/ and its file path (export layout ${layout}), with the page's headers`, async () => {
+      const get = await serve(site(layout))
+      const voice = await get("/")
+      for (const path of [...(layout === "admin.html" ? ["/admin", "/admin?x=1"] : []), "/admin/", `/${layout}`, "/admin/?x=1"]) {
+        const r = await get(path)
+        expect(r.status, path).toBe(200)
+        expect(r.body, path).toContain("<title>admin</title>")
+        expect({ ...r, body: undefined }, path).toEqual({ ...voice, body: undefined })
+      }
+      expect((await get("/admin/nope")).status).toBe(404)
+      expect((await get("/adminx")).status).toBe(404)
+    })
+  }
 })

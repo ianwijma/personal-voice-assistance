@@ -1,11 +1,15 @@
 "use client"
 import { useEffect } from "react"
 import { useClient } from "./context.tsx"
+import { WIDE_QUERY } from "./useMediaQuery.ts"
 
 const typingTarget = (el: EventTarget | null) =>
   el instanceof HTMLElement && (el.isContentEditable || el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.tagName === "SELECT")
 
-/** Single-key shortcuts (docs/UI-AND-MODULES.md §3.5); ignored while typing. Panels handle their own Esc first. */
+/**
+ * Single-key shortcuts (docs/UI-AND-MODULES.md §3.5); ignored while typing, and off when the viewer switched them off
+ * in the help dialog (`prefs.shortcuts`). Panels handle their own Esc first.
+ */
 export const useShortcuts = () => {
   const client = useClient()
   useEffect(() => {
@@ -20,10 +24,10 @@ export const useShortcuts = () => {
           ui({ shortcutsOpen: false })
           return
         }
-        if (s.ui.settingsOpen) {
-          // The settings screen handles Esc itself when focus is inside it (up a level); otherwise close.
+        if (s.ui.sheetOpen) {
+          // The settings sheet handles Esc itself when focus is inside it; otherwise close it.
           e.preventDefault()
-          client.settings("close")
+          ui({ sheetOpen: false })
           return
         }
         // Otherwise: stop the reply.
@@ -34,6 +38,11 @@ export const useShortcuts = () => {
         return
       }
       if (typingTarget(e.target)) return
+      // A modal panel is open (the settings sheet, Help, or the chat as a sheet below 1024 px): only its own keys
+      // (Esc, above) work, so nothing opens underneath it and focus never moves behind it.
+      if (s.ui.sheetOpen || s.ui.shortcutsOpen || (s.ui.chatOpen && !window.matchMedia(WIDE_QUERY).matches)) return
+      // Single-character shortcuts can be switched off in the help dialog (WCAG 2.1.4); Esc always works.
+      if (!client.prefs.get().shortcuts) return
       switch (e.key) {
         case "m":
         case "M":
@@ -47,10 +56,10 @@ export const useShortcuts = () => {
           e.preventDefault()
           ui({ chatOpen: !s.ui.chatOpen })
           return
-        case "o":
-        case "O":
+        case "s":
+        case "S":
           e.preventDefault()
-          client.settings(s.ui.settingsOpen ? "close" : s.ui.settingsPath)
+          ui({ sheetOpen: !s.ui.sheetOpen })
           return
         case "/":
           e.preventDefault()

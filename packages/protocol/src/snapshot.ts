@@ -15,6 +15,8 @@ import { Condition, SettingsForm, SettingsGroup, SettingsPage } from "./settings
 import { EnvInfo } from "./env.ts"
 import { JobInfo, ModelSet } from "./jobs.ts"
 import { VaultInfo } from "./vault.ts"
+import { AdminState } from "./admin.ts"
+import { DeviceInfo, DeviceProfileInfo, FrontendKindInfo } from "./frontends.ts"
 
 /** A one-line status a running module publishes, e.g. "Connected · 143 entities". */
 export const StatusLine = Schema.Struct({
@@ -50,8 +52,9 @@ export const ModuleInfo = Schema.Struct({
   /** Increases on every change to this module; a client keeps the highest it has seen. */
   revision: NonNegativeInt,
   /**
-   * Only a page with admin access may switch it on or off or change its settings (it has a secret, or it is an
-   * agent). Absent = false.
+   * It has a secret, or it is an agent. Before protocol 5 only admin pages could change such a module; since
+   * protocol 5 every module change is admin only, so this is informational (and module info reaches admin
+   * connections only). Absent = false.
    */
   protected: Schema.optionalKey(Schema.Boolean),
   /** What the module contributes. Absent = "capability". */
@@ -71,7 +74,10 @@ export const SettingsSection = Schema.Struct({
   description: Schema.optionalKey(Schema.String),
   form: SettingsForm,
   revision: NonNegativeInt,
-  /** Only a page with admin access may change it (it has a secret, or it chooses providers). Absent = false. */
+  /**
+   * It has a secret, or it chooses providers. Informational since protocol 5 (every settings change is admin only,
+   * and sections reach admin connections only). Absent = false.
+   */
   protected: Schema.optionalKey(Schema.Boolean),
   /** The settings category (docs/SETTINGS-UI.md §2.2). Absent = "general". */
   group: Schema.optionalKey(SettingsGroup),
@@ -111,9 +117,13 @@ export const EngineInfo = Schema.Struct({
 })
 export type EngineInfo = typeof EngineInfo.Type
 
+/** Where the engines are: `failed` = a provider could not start (see `EngineStatus.problems`). */
+export const EngineState = Schema.Literals(["starting", "ready", "reloading", "failed"])
+export type EngineState = typeof EngineState.Type
+
 export const EngineStatus = Schema.Struct({
   /** `failed`: a provider could not start; see `problems`. The UI and settings still work. */
-  state: Schema.Literals(["starting", "ready", "reloading", "failed"]),
+  state: EngineState,
   problems: Schema.Array(Schema.Struct({ stage: Schema.String, message: Schema.String })),
   /** Saved settings differ from what the running engines use; a reload would apply them. */
   reloadPending: Schema.Boolean,
@@ -166,26 +176,83 @@ export const TraceInfo = Schema.Struct({
 })
 export type TraceInfo = typeof TraceInfo.Type
 
-/** Everything a freshly connected tab needs to render. */
+/** A voice the voice front end can offer ("Assistant default" is `""` in the profile, not listed here). */
+export const VoiceChoice = Schema.Struct({
+  name: Schema.String,
+  description: Schema.String,
+  /** The assistant's default voice (`DEFAULT_VOICE`), used when the profile's `voice` is `""`. */
+  isDefault: Schema.Boolean
+})
+export type VoiceChoice = typeof VoiceChoice.Type
+
+/**
+ * The engine as a voice connection sees it (protocol 5): whether a conversation can run, and the enabled voices.
+ * Admin connections get the full `EngineStatus` as well (`admin.snapshot.engine`, `engine`).
+ */
+export const EngineSummary = Schema.Struct({
+  /** `EngineStatus.state === "ready"`: speech and language engines are running. */
+  ready: Schema.Boolean,
+  /** `EngineStatus.state`, without the problems: lets a voice page say "starting" rather than "failed". */
+  state: EngineState,
+  /** The enabled voices of the running engines (empty while not ready). */
+  voices: Schema.Array(VoiceChoice)
+})
+export type EngineSummary = typeof EngineSummary.Type
+
+/** The summary of a full status (what the server sends to voice connections). */
+export const engineSummary = (status: EngineStatus): EngineSummary => ({
+  ready: status.state === "ready",
+  state: status.state,
+  voices: status.state === "ready"
+    ? status.voices.filter((v) => v.enabled).map((v) => ({ name: v.name, description: v.description, isDefault: v.isDefault }))
+    : []
+})
+
+/**
+ * Everything a freshly connected tab needs to run a conversation (protocol 5: the voice part, sent to every
+ * connection in `welcome`). It holds no settings, modules, env, models, jobs, vault or traces: those are in
+ * `AdminSnapshot`, sent as `admin.snapshot` to admin connections only.
+ */
 export const Snapshot = Schema.Struct({
   state: AssistantState,
   role: Role,
   ownerPresent: Schema.Boolean,
+  engine: EngineSummary,
+  /** The most recent history (at most 200 items), oldest first. */
+  history: Schema.Array(HistoryItem),
+  /**
+   * This connection's effective device profile. Present on voice connections (from `hello.device`, or the
+   * `web-voice` kind defaults with nothing editable when `hello` had no device); absent on admin connections.
+   */
+  device: Schema.optionalKey(DeviceProfileInfo),
+  /** Admin access as this connection sees it (also on voice connections: the voice front end links to admin). */
+  admin: AdminState
+})
+export type Snapshot = typeof Snapshot.Type
+
+/**
+ * The admin part of the state (protocol 5), sent as `admin.snapshot` right after `welcome` when the `hello` token
+ * was valid, or right after a successful `admin.login`. Later changes arrive as their own messages (`engine`,
+ * `module.changed`, `section.changed`, `turn.end` traces, `vault`, `env`, `models`, `job`, `frontends`,
+ * `devices`), also to admin connections only.
+ */
+export const AdminSnapshot = Schema.Struct({
   engine: EngineStatus,
   /** In catalog order. */
   modules: Schema.Array(ModuleInfo),
   sections: Schema.Array(SettingsSection),
-  /** The most recent history (at most 200 items), oldest first. */
-  history: Schema.Array(HistoryItem),
   /** The most recent traces (at most 20), oldest first. */
   traces: Schema.Array(TraceInfo),
-  /** The key vault as this page sees it. Absent: treat as `{ state: "none", admin: true }`. */
-  vault: Schema.optionalKey(VaultInfo),
-  /** Settings set outside the UI (environment, `.env`). Absent: an older server. */
+  vault: VaultInfo,
+  /** Settings set outside the UI (environment, `.env`). Absent: the server runs without the env view (tests). */
   env: Schema.optionalKey(EnvInfo),
-  /** Downloadable models, per tool. */
-  models: Schema.optionalKey(Schema.Array(ModelSet)),
+  /** Downloadable models, per tool (empty when the server offers none). */
+  models: Schema.Array(ModelSet),
   /** Running jobs and the last finished ones, oldest first. */
-  jobs: Schema.optionalKey(Schema.Array(JobInfo))
+  jobs: Schema.Array(JobInfo),
+  /** Every front-end kind with its defaults, in registry order. */
+  frontends: Schema.Array(FrontendKindInfo),
+  /** Every remembered device, most recently seen first. */
+  devices: Schema.Array(DeviceInfo)
 })
-export type Snapshot = typeof Snapshot.Type
+export type AdminSnapshot = typeof AdminSnapshot.Type

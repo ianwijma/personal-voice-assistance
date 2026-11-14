@@ -9,28 +9,15 @@ import { KeysPanel } from "../../KeysPanel.tsx"
 import { Icon } from "../../ui/Icon.tsx"
 import { cx } from "../../ui/controls.tsx"
 
-/** Keys & access › Edit access & vault: the vault's controls (`KeysPanel`) and what admin access means. */
-export function AccessPage() {
-  const admin = useClientState((s) => s.vault.admin)
-  const state = useClientState((s) => s.vault.state)
-  return (
-    <div className="flex flex-col gap-6">
-      <p className="flex items-start gap-2 rounded-md border border-line bg-surface-2/40 px-3 py-2.5 text-[13px] text-ink-muted" data-testid="access-state">
-        <Icon name="lock" size={15} className="mt-0.5 shrink-0" />
-        <span>
-          {state === "none"
-            ? "Every page may change every setting until you set a password."
-            : admin
-            ? "This page has edit access: it may change keys, providers and agents."
-            : "This page can change open settings only. Pages marked with a padlock need the password, typed on this page."}
-        </span>
-      </p>
-      <KeysPanel />
-    </div>
-  )
+/**
+ * Keys & vault › Vault: the vault's controls (`KeysPanel`). Who may change settings is the admin login now
+ * (docs/FRONTENDS-AND-ACTIVATION.md §1); the vault only keeps the keys, with its own password.
+ */
+export function VaultPage() {
+  return <KeysPanel />
 }
 
-/** Keys & access › Keys: every key with its state and the pages that use it (no values: the server never sends them). */
+/** Keys & vault › Keys: every key with its state and the pages that use it (no values: the server never sends them). */
 export function KeysListPage() {
   const client = useClient()
   const sections = useClientState((s) => s.sections)

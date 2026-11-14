@@ -33,17 +33,19 @@ describe("store", () => {
 })
 
 describe("per-device preferences", () => {
-  it("fall back to defaults for missing, invalid or out-of-range entries", () => {
+  it("fall back to defaults for missing or invalid entries", () => {
     expect(parsePrefs(null)).toEqual(defaultPrefs)
     expect(parsePrefs("not json")).toEqual(defaultPrefs)
-    const p = parsePrefs(JSON.stringify({ interruptMode: "instant", prebufferMs: 5000, captions: "yes", outputPath: "element" }))
-    expect(p).toMatchObject({ interruptMode: "instant", prebufferMs: 500, captions: true, outputPath: "element" })
-    // The microphone processing switches: on unless stored as off; anything else falls back to on.
-    expect(parsePrefs(JSON.stringify({ echoCancellation: false, noiseSuppression: "no" }))).toMatchObject({
-      echoCancellation: false,
-      noiseSuppression: true,
-      autoGainControl: true
-    })
-    expect(parsePrefs(JSON.stringify({ interruptMode: "loud" })).interruptMode).toBe("confirm")
+    expect(parsePrefs(JSON.stringify({ micDeviceId: "usb", sinkId: 3, startHintShown: true }))).toEqual({ micDeviceId: "usb", sinkId: "", startHintShown: true, shortcuts: true })
+  })
+
+  it("drop the fields that moved to the device profile (protocol 5): the server's values apply", () => {
+    const p = parsePrefs(JSON.stringify({ micDeviceId: "usb", interruptMode: "instant", prebufferMs: 300, captions: false, outputPath: "element", echoCancellation: false, latencyReadout: false }))
+    expect(p).toEqual({ micDeviceId: "usb", sinkId: "", startHintShown: false, shortcuts: true })
+  })
+
+  it("keep the single-key shortcuts switch (default on)", () => {
+    expect(parsePrefs(JSON.stringify({ shortcuts: false })).shortcuts).toBe(false)
+    expect(parsePrefs(JSON.stringify({ shortcuts: "no" })).shortcuts).toBe(true)
   })
 })

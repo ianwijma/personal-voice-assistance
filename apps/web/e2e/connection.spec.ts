@@ -1,4 +1,4 @@
-import { appUrl, expect, expectVisualState, mock, test, visualHistory } from "./fixtures.ts"
+import { appUrl, expect, expectVisualState, loginAdmin, mock, test, visualHistory } from "./fixtures.ts"
 
 test("reconnecting: dashed line and banner, then ownership resumes without a new Start", async ({ page, baseURL }) => {
   await mock.scenario("typed")
@@ -26,8 +26,9 @@ test("while the assistant is unreachable: reconnecting with a count, dock and co
   await expect(page.getByTestId("turn")).toHaveCount(2)
   await mock.offline(3000)
   await expectVisualState(page, "disconnected", 3000)
-  await expect(page.getByTestId("connection-status")).toHaveText(/reconnecting \([2-9]\)/i, { timeout: 3000 })
-  await expect(page.getByTestId("state-label")).toHaveText(/reconnecting · \d/i)
+  // Said once, under the line; the top bar keeps only its pulsing dot.
+  await expect(page.getByTestId("state-label")).toHaveText(/reconnecting · attempt [2-9]/i, { timeout: 3000 })
+  await expect(page.getByTestId("connection-status")).toHaveText("")
   await expect(page.locator("#chat-input")).toBeDisabled()
   await expect(page.getByTestId("mic-toggle")).toBeDisabled()
   await expect(page.getByTestId("turn")).toHaveCount(2)
@@ -55,18 +56,25 @@ test("page out of date (close 4400): asks for a reload and stops retrying", asyn
   await expect(page.getByText("This page is older than the assistant.")).toBeVisible()
   await expect(page.getByRole("button", { name: "Reload" })).toBeVisible()
   await expectVisualState(page, "error")
-  await expect(page.getByTestId("connection-status")).toHaveText(/out of date/i)
+  // Said once on the stage (label and notice); the top bar keeps only its red dot, and the server's error is no toast.
+  await expect(page.getByTestId("state-label")).toHaveText("Page out of date")
+  await expect(page.getByTestId("connection-status")).toHaveText("")
+  await expect(page.getByRole("alert").filter({ hasText: "out of date; reload" })).toHaveCount(0)
 })
 
-test("engines failed: a banner explains, typed messages are blocked, Open settings goes to the Overview", async ({ page, baseURL }) => {
+test("engines failed: the voice page says it is not ready, typed messages are blocked, admin shows why", async ({ page, baseURL }) => {
   await mock.scenario("engine-failed")
   await page.goto(appUrl(baseURL))
-  await expect(page.getByTestId("engine-banner")).toContainText("DEEPGRAM_API_KEY is not set")
+  await expect(page.getByTestId("engine-banner")).toContainText("could not start")
+  await expect(page.getByTestId("engine-banner")).toHaveAttribute("data-state", "failed")
+  await expect(page.getByTestId("engine-banner")).not.toContainText("DEEPGRAM") // engine details are admin data
   await page.keyboard.press("c")
   await expect(page.locator("#chat-input")).toBeDisabled()
-  await expect(page.getByTestId("chat-panel")).toContainText("engines are not running")
+  await expect(page.getByTestId("chat-panel")).toContainText("not ready")
   await page.keyboard.press("Escape")
-  await page.getByRole("button", { name: "Open settings" }).click()
+  await page.getByRole("link", { name: "See why in admin" }).click()
+  await expect(page.getByTestId("login-form")).toBeVisible()
+  await loginAdmin(page, baseURL, "#settings/overview/overview")
   await expect(page.getByTestId("page-overview-overview")).toBeVisible()
   await expect(page.getByTestId("engine-problems")).toContainText("The engines could not start")
   await expect(page.getByTestId("nav-overview").locator("[data-mark=error]")).toBeVisible()

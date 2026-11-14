@@ -1,5 +1,6 @@
-import { App } from "@/components/App.tsx"
+import { VoiceApp } from "@/components/voice/VoiceApp.tsx"
 
+/** The voice front end. */
 export default function Page() {
-  return <App />
+  return <VoiceApp />
 }

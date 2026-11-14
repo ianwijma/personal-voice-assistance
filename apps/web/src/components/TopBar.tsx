@@ -1,63 +1,48 @@
 "use client"
 import { shallowEqual } from "@/lib/store.ts"
 import { useClient, useClientState } from "./context.tsx"
-import { LatencyReadout } from "./LatencyReadout.tsx"
 import { Icon } from "./ui/Icon.tsx"
 import { cx, IconButton, ToneDot } from "./ui/controls.tsx"
 
-const STATE_WORD: Record<string, string> = {
-  idle: "idle",
-  listening: "listening",
-  hearing: "hearing you",
-  thinking: "thinking",
-  speaking: "speaking"
-}
-
+/**
+ * The voice front end's top bar: a status dot and no words (the stage says everything: the engine banner for "not ready", the label
+ * under the line has connecting / reconnecting, the stage's notices have outdated, audio errors and audio on another
+ * device), End, and the settings sheet.
+ */
 export function TopBar() {
   const client = useClient()
   const v = useClientState(
     (s) => ({
       status: s.connection.status,
-      attempt: s.connection.attempt,
-      everConnected: s.connection.everConnected,
-      owner: s.session.role === "owner" && s.audio.phase !== "off",
-      ownerPresent: s.session.ownerPresent,
-      serverState: s.session.serverState,
-      micLive: s.audio.micLive,
-      engine: s.engine.state
+      owner: s.session.role === "owner" && s.audio.phase !== "off" && s.audio.phase !== "error",
+      audioError: s.audio.phase === "error",
+      ready: s.summary.ready,
+      sheetOpen: s.ui.sheetOpen
     }),
     shallowEqual
   )
-  let text: string
+  let text: string | undefined
   let tone: "ok" | "warning" | "error" | "neutral"
   if (v.status === "outdated") {
-    text = "page out of date"
     tone = "error"
   } else if (v.status !== "open") {
-    text = v.everConnected ? `reconnecting (${v.attempt})…` : "connecting…"
+    // The label under the line says "Connecting" / "Reconnecting · attempt N": one place only.
     tone = "warning"
-  } else if (v.engine === "failed") {
-    text = "engines failed"
+  } else if (v.audioError) {
     tone = "error"
-  } else if (v.engine === "reloading" || v.engine === "starting") {
-    text = v.engine === "reloading" ? "reloading engines…" : "starting engines…"
+  } else if (!v.ready) {
+    // The banner on the stage says why: no visible words here, only for assistive technology.
+    text = "not ready"
     tone = "warning"
-  } else if (!v.owner && v.ownerPresent) {
-    text = `${STATE_WORD[v.serverState] ?? v.serverState} · on another device`
-    tone = "neutral"
-  } else if (!v.owner) {
-    text = "ready"
-    tone = "neutral"
   } else {
-    text = !v.micLive && v.serverState !== "thinking" && v.serverState !== "speaking" ? "mic off" : STATE_WORD[v.serverState] ?? v.serverState
-    tone = "ok"
+    tone = v.owner ? "ok" : "neutral"
   }
   return (
-    <header className="relative z-20 flex h-14 shrink-0 items-center gap-3 px-3 sm:gap-5 sm:px-6">
-      <div className="flex min-w-0 items-center gap-2.5 pl-1">
+    <header className="relative z-20 flex h-14 shrink-0 items-center gap-3 pl-[max(12px,env(safe-area-inset-left))] pr-[max(8px,env(safe-area-inset-right))] sm:gap-5 sm:px-6">
+      <div className="flex min-w-0 items-center gap-2.5 pl-1" data-testid="connection-status-line">
         <ToneDot tone={tone} className={cx("size-2", tone === "warning" && "animate-pulse")} />
         <span className="label hidden text-ink sm:inline">PVA</span>
-        <span data-testid="connection-status" className="label truncate text-ink-muted">
+        <span data-testid="connection-status" className="sr-only">
           {text}
         </span>
       </div>
@@ -65,18 +50,22 @@ export function TopBar() {
         <button
           type="button"
           onClick={client.endAudio}
-          className="label hidden h-8 rounded-md px-2.5 text-ink-muted transition-colors duration-[120ms] hover:bg-surface-2 hover:text-ink sm:inline-flex sm:items-center"
+          data-testid="end-session"
+          className="label ml-auto inline-flex h-11 items-center gap-2 rounded-md border border-line px-3 text-ink-muted transition-colors duration-[120ms] hover:bg-surface-2 hover:text-ink sm:ml-0 sm:h-8 sm:border-transparent sm:px-2.5"
           title="Release the microphone and speaker"
         >
-          End
+          <span aria-hidden="true" className="size-2 rounded-[2px] bg-current" />
+          End session
         </button>
       )}
-      <div className="ml-auto flex items-center gap-1 sm:gap-2">
-        <LatencyReadout />
+      <div className={cx("flex items-center", v.owner ? "max-sm:ml-0 sm:ml-auto" : "ml-auto")}>
         <IconButton
-          label="Settings (O)"
+          label="Settings (S)"
           aria-haspopup="dialog"
-          onClick={() => client.settings(client.store.get().ui.settingsPath)}
+          aria-expanded={v.sheetOpen}
+          data-testid="settings-toggle"
+          className="size-11"
+          onClick={() => client.store.dispatch({ type: "local/ui", patch: { sheetOpen: !v.sheetOpen } })}
         >
           <Icon name="gear" />
         </IconButton>

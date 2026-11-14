@@ -1,8 +1,8 @@
 "use client"
 import { useRef } from "react"
-import { turnById, visualState } from "@/lib/state.ts"
+import { profileOf, turnById, visualState } from "@/lib/state.ts"
 import { shallowEqual } from "@/lib/store.ts"
-import { useClientState, usePrefs } from "./context.tsx"
+import { useClientState } from "./context.tsx"
 import { cx } from "./ui/controls.tsx"
 
 interface Caption {
@@ -15,7 +15,7 @@ const tail = (text: string, max = 150) => (text.length <= max ? text : `…${tex
 
 /** Captions: what you are saying while hearing, the playing clause (and the next one) while speaking. Fade 2 s after. */
 export function Captions() {
-  const enabled = usePrefs((p) => p.captions)
+  const enabled = useClientState((s) => profileOf(s).captions)
   const reserve = useClientState((s) => s.connection.status === "open" && ((s.session.role === "owner" && s.audio.phase !== "off") || s.session.ownerPresent))
   const caption = useClientState((s): Caption | null => {
     const v = visualState(s)
@@ -36,7 +36,8 @@ export function Captions() {
     <div
       data-testid="captions"
       className={cx(
-        "mt-3 min-h-[3.2em] w-full max-w-[640px] px-6 text-center text-[16px] leading-[1.45] sm:text-caption",
+        // Two lines are reserved, so nothing under them moves when they appear; smaller on a short screen.
+        "mt-3 min-h-[3.2em] w-full max-w-[640px] px-6 text-center text-[16px] leading-[1.45] sm:text-caption short:mt-2 short:min-h-[2.9em] short:text-[16px]",
         "transition-opacity ease-out",
         caption !== null ? "opacity-100 duration-[240ms]" : "opacity-0 delay-[2000ms] duration-500"
       )}

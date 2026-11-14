@@ -10,7 +10,7 @@ import { flattenSections } from "../src/serve/flatten.ts"
 import { readSettingsFile } from "../src/serve/SettingsStore.ts"
 import { readVaultSecrets } from "../src/serve/Vault.ts"
 import { ScriptedClient } from "./support/scriptedClient.ts"
-import { controlledStt, fakeBuild, scriptedLlm, startTestServer, type TestServer } from "./support/serveHarness.ts"
+import { controlledStt, fakeBuild, scriptedLlm, startTestServer, type TestServer, TEST_ADMIN_PASSWORD } from "./support/serveHarness.ts"
 
 vi.setConfig({ testTimeout: 20_000 })
 
@@ -32,7 +32,8 @@ const start = async (extra: Partial<Parameters<typeof startTestServer>[0]> = {})
 const helloed = async (server: TestServer) => {
   const client = await ScriptedClient.connect({ url: server.url })
   clients.push(client)
-  const welcome = await client.hello()
+  // Every change is admin only since protocol 5: these pages log in (`welcome.snapshot` is the admin snapshot).
+  const welcome = await client.admin(TEST_ADMIN_PASSWORD)
   return { client, welcome }
 }
 
@@ -71,9 +72,11 @@ describe("flat storage", () => {
     expect(welcome.snapshot.modules[0]!.settings.values.greeting).toBe("hoi")
     const written = JSON.parse(readFileSync(join(dataDir, "settings.json"), "utf8"))
     expect(written).toEqual({
-      version: 2,
+      version: 3,
       modules: v1.modules,
-      assistant: { STT_SHERPA_FINAL_SILENCE_MS: 700, STT_SHERPA_MODEL: "nemotron-3.5", DEFAULT_VOICE: "natural", LLM_PROVIDER: "anthropic" }
+      assistant: { STT_SHERPA_FINAL_SILENCE_MS: 700, STT_SHERPA_MODEL: "nemotron-3.5", DEFAULT_VOICE: "natural", LLM_PROVIDER: "anthropic" },
+      frontends: {},
+      devices: {}
     })
     expect(JSON.parse(readFileSync(join(dataDir, "settings.json.v1-backup"), "utf8"))).toEqual(v1)
   })
@@ -97,8 +100,13 @@ describe("flat storage", () => {
     // The owner wins even when it comes first.
     expect(flattenSections({ speech: { STT_PROVIDER: "sherpa" }, listening: { STT_PROVIDER: "deepgram" } }, "x").flat).toEqual({ STT_PROVIDER: "sherpa" })
     // A version-2 file is read as it is; anything else is not a settings file.
-    expect(readSettingsFile({ version: 2, modules: {}, assistant: { A: 1 } })).toEqual({ file: { version: 2, modules: {}, assistant: { A: 1 } }, migrated: false, problems: [] })
-    expect(readSettingsFile({ version: 3 })).toBeUndefined()
+    expect(readSettingsFile({ version: 2, modules: {}, assistant: { A: 1 } })).toEqual({
+      file: { version: 3, modules: {}, assistant: { A: 1 }, frontends: {}, devices: {} },
+      migrated: false,
+      problems: []
+    })
+    expect(readSettingsFile({ version: 4 })).toBeUndefined()
+    expect(readSettingsFile({ version: 3, frontends: [] })).toBeUndefined()
   })
 
   it("an older vault's per-section secrets are read flat", () => {
@@ -157,7 +165,7 @@ describe("field semantics", () => {
     expect(asked).toMatchObject({ ok: false, error: { code: "invalid_settings", warnings: [{ key: "STT_PROVIDER" }] } })
     expect(asked.error?.fieldErrors).toBeUndefined()
     expect(asked.error?.warnings?.[0]?.message).toContain("no Deepgram key")
-    expect(existsSync(join(server.dataDir, "settings.json")), "nothing was saved").toBe(false)
+    expect(JSON.parse(readFileSync(join(server.dataDir, "settings.json"), "utf8")).assistant, "nothing was saved").toEqual({})
 
     const from = client.messages.length
     expect((await request(client, { ...deepgram, confirmWarnings: true })).ok).toBe(true)

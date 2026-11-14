@@ -2,7 +2,6 @@
 import { PROTOCOL_VERSION } from "@pva/protocol"
 import { shallowEqual } from "@/lib/store.ts"
 import { useClientState } from "../../context.tsx"
-import { ShortcutList } from "../../ShortcutsDialog.tsx"
 
 export function AboutPage() {
   const c = useClientState((s) => s.connection, shallowEqual)
@@ -22,12 +21,6 @@ export function AboutPage() {
           </div>
         ))}
       </dl>
-      <section>
-        <h3 className="label text-ink-faint">Keyboard</h3>
-        <div className="-mx-5 sm:-mx-8">
-          <ShortcutList />
-        </div>
-      </section>
     </div>
   )
 }

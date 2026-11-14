@@ -1,8 +1,7 @@
 "use client"
 import { memo, useLayoutEffect, useRef, useState } from "react"
-import { firstSoundMs, type TurnView } from "@/lib/state.ts"
+import { defaultVoiceOf, type TurnView } from "@/lib/state.ts"
 import { useClientState } from "./context.tsx"
-import { latencyTone, TraceRow } from "./LatencyReadout.tsx"
 import { ToolChip } from "./ToolChip.tsx"
 import { Icon } from "./ui/Icon.tsx"
 import { cx } from "./ui/controls.tsx"
@@ -11,7 +10,7 @@ import { cx } from "./ui/controls.tsx"
 export function MessageList() {
   const turns = useClientState((s) => s.turns)
   const live = useClientState((s) => s.liveTranscript)
-  const defaultVoice = useClientState((s) => s.engine.voices.find((v) => v.isDefault)?.name)
+  const defaultVoice = useClientState(defaultVoiceOf)
   const scroller = useRef<HTMLDivElement>(null)
   const stuck = useRef(true)
   const [showJump, setShowJump] = useState(false)
@@ -83,8 +82,6 @@ const TurnBlock = memo(function TurnBlock({ turn, defaultVoice }: { readonly tur
 })
 
 function AssistantMessage({ turn, defaultVoice }: { readonly turn: TurnView; readonly defaultVoice: string | undefined }) {
-  const [showTrace, setShowTrace] = useState(false)
-  const latency = turn.trace === undefined ? undefined : firstSoundMs(turn.trace)
   const voice = turn.clauses.find((c) => c.voice !== undefined && c.voice !== defaultVoice)?.voice
   const interrupted = turn.outcome === "interrupted"
   const allPlayed = turn.outcome === "completed" || turn.fromHistory === true
@@ -92,17 +89,6 @@ function AssistantMessage({ turn, defaultVoice }: { readonly turn: TurnView; rea
     <div className="border-l-2 border-voice pl-3" data-testid="assistant-message">
       <div className="flex items-center gap-2">
         <span className="label text-voice">Assistant{voice !== undefined && <span className="text-ink-muted"> · {voice}</span>}</span>
-        {latency !== undefined && (
-          <button
-            type="button"
-            onClick={() => setShowTrace(!showTrace)}
-            aria-expanded={showTrace}
-            className={cx("ml-auto font-mono text-[12px] tabular-nums hover:underline", latencyTone(latency.ms))}
-            title={latency.label === "audible" ? "End of your turn → first sound" : "End of your turn → first token"}
-          >
-            {Math.round(latency.ms)} ms
-          </button>
-        )}
       </div>
       {turn.tools.length > 0 && (
         <div className="mt-1.5 flex flex-col items-start gap-1">
@@ -117,7 +103,7 @@ function AssistantMessage({ turn, defaultVoice }: { readonly turn: TurnView; rea
               <span
                 key={i}
                 data-played={played || undefined}
-                className={cx("transition-colors duration-[240ms] ease-out", played ? "text-ink" : interrupted ? "text-ink-muted/60" : "text-ink-muted")}
+                className={cx("transition-colors duration-[240ms] ease-out", played ? "text-ink" : interrupted ? "text-ink-faint" : "text-ink-muted")}
               >
                 {i > 0 ? " " : ""}{c.text}
               </span>
@@ -132,13 +118,6 @@ function AssistantMessage({ turn, defaultVoice }: { readonly turn: TurnView; rea
       {interrupted && <span data-testid="interrupted-tag" className="label mt-1.5 inline-block text-[10px] text-ink-faint">Interrupted</span>}
       {turn.outcome === "failed" && turn.error === undefined && <p className="mt-1.5 text-[13px] text-danger">The reply failed.</p>}
       {turn.error !== undefined && <p className="mt-1.5 text-[13px] text-danger">{turn.error}</p>}
-      {showTrace && turn.trace !== undefined && (
-        <div className="mt-2 overflow-x-auto rounded-sm bg-surface-2/60 scrollbar-quiet">
-          <table className="w-full font-mono text-[11px] tabular-nums">
-            <tbody><TraceRow t={turn.trace} /></tbody>
-          </table>
-        </div>
-      )}
     </div>
   )
 }

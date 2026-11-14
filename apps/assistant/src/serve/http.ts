@@ -88,7 +88,13 @@ const isolationHeaders = {
   "Cross-Origin-Resource-Policy": "same-origin"
 } as const
 
-/** The file for a URL path, or undefined. Never leaves `root`. */
+/**
+ * The file for a URL path, or undefined. Never leaves `root`.
+ *
+ * Next's static export writes a nested route (`/admin/`) as `admin/index.html` with `trailingSlash: true` (what
+ * `apps/web` uses), and as `admin.html` without it. Both are served at `/admin/`, and at their file paths; `/admin`
+ * is redirected to `/admin/` for the directory layout (`trailingSlashRedirect`) and served directly for the other.
+ */
 export const resolveStatic = (root: string, urlPath: string): string | undefined => {
   let path: string
   try {
@@ -98,7 +104,9 @@ export const resolveStatic = (root: string, urlPath: string): string | undefined
   }
   if (path.includes("\0")) return undefined
   const base = resolve(root)
-  const candidates = path.endsWith("/") ? [`${path}index.html`] : [path, `${path}.html`, `${path}/index.html`]
+  const candidates = path.endsWith("/")
+    ? [`${path}index.html`, ...(path.length > 1 ? [`${path.slice(0, -1)}.html`] : [])]
+    : [path, `${path}.html`, `${path}/index.html`]
   for (const candidate of candidates) {
     const full = resolve(base, `.${candidate}`)
     if (full !== base && !full.startsWith(base + sep)) return undefined
@@ -109,6 +117,33 @@ export const resolveStatic = (root: string, urlPath: string): string | undefined
     }
   }
   return undefined
+}
+
+/**
+ * `/admin` (no slash, no file of that name or `admin.html`, but a directory with an `index.html`) → `/admin/`, as
+ * Next's `trailingSlash` does; the query is kept. `undefined`: no redirect.
+ */
+export const trailingSlashRedirect = (root: string, url: string): string | undefined => {
+  const [rawPath = "/", ...rest] = url.split("?")
+  if (rawPath.endsWith("/")) return undefined
+  let path: string
+  try {
+    path = decodeURIComponent(rawPath)
+  } catch {
+    return undefined
+  }
+  const base = resolve(root)
+  const direct = resolve(base, `.${path}`)
+  if (direct !== base && !direct.startsWith(base + sep)) return undefined
+  const isFile = (p: string) => {
+    try {
+      return statSync(p).isFile()
+    } catch {
+      return false
+    }
+  }
+  if (isFile(direct) || isFile(`${direct}.html`) || !isFile(join(direct, "index.html"))) return undefined
+  return `${rawPath}/${rest.length > 0 ? `?${rest.join("?")}` : ""}`
 }
 
 /** Every static response's headers go through here (`isolate`: the cross-origin isolation headers). */
@@ -123,6 +158,11 @@ const serveStatic = (webDir: string, isolate: boolean, req: http.IncomingMessage
     return
   }
   const urlPath = req.url ?? "/"
+  const redirect = trailingSlashRedirect(webDir, urlPath)
+  if (redirect !== undefined) {
+    res.writeHead(308, headers({ Location: redirect, "Cache-Control": "no-cache", "X-Content-Type-Options": "nosniff" })).end()
+    return
+  }
   let file = resolveStatic(webDir, urlPath)
   let status = 200
   if (file === undefined) {

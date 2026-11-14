@@ -52,9 +52,9 @@ export interface KdfParams {
 export const DEFAULT_KDF: KdfParams = { N: 2 ** 17, r: 8, p: 1 }
 
 export const MIN_PASSWORD_LENGTH = 8
-const MAX_FAILURES_BEFORE_WAIT = 5
-const FIRST_WAIT_MS = 30_000
-const MAX_WAIT_MS = 3_600_000
+export const MAX_FAILURES_BEFORE_WAIT = 5
+export const FIRST_WAIT_MS = 30_000
+export const MAX_WAIT_MS = 3_600_000
 const KEY_BYTES = 32
 
 export type VaultFailure =

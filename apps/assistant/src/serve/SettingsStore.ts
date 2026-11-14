@@ -1,5 +1,5 @@
 import type { ModulePersistence } from "@pva/core"
-import type { SettingValue } from "@pva/protocol"
+import { DeviceId, DeviceName, FrontendKindId, NonNegativeFinite, ProfileOverrides, type SettingValue } from "@pva/protocol"
 import { Config, Effect, Schema, Semaphore } from "effect"
 import { chmod, mkdir, readdir, readFile, rename, rm, unlink, writeFile } from "node:fs/promises"
 import { dirname, join, resolve } from "node:path"
@@ -15,6 +15,13 @@ import { isVaultText, type Vault, type VaultSecrets, type VaultWriter } from "./
  * Files are read once at startup; the server is their only writer. Writes are
  * atomic (temporary file, then rename) and serialised; memory changes only
  * after a successful write.
+ *
+ * Front ends (version 3; docs/FRONTENDS-AND-ACTIVATION.md §2): `frontends` holds each front-end kind's default
+ * profile overrides, `devices` every remembered device (`DeviceRecord`). A version-2 file is read as version 3
+ * with both maps empty and written as version 3 at its next save (nothing is lost, so there is no backup).
+ * Entries that do not decode are dropped at load with a problem. Saves of front-end data (`saveFrontends`) follow
+ * the same atomic-write and revision rules, but are refused while the settings are `blocked()`: a device
+ * registering must not count as the owner's word that settings from two saves belong together.
  *
  * Assistant settings are stored flat by key (version 2; docs/SETTINGS-UI.md
  * §4.3): the settings sections are only how the screen groups them, so a field
@@ -66,8 +73,28 @@ import { isVaultText, type Vault, type VaultSecrets, type VaultWriter } from "./
  * next successful save clears it (the owner has then looked at and saved the settings).
  */
 
-export interface SettingsFile {
-  readonly version: 2
+/** One remembered device (`devices[id]`). */
+export const DeviceRecord = Schema.Struct({
+  kind: FrontendKindId,
+  name: DeviceName,
+  firstSeen: NonNegativeFinite,
+  lastSeen: NonNegativeFinite,
+  overrides: ProfileOverrides
+})
+export type DeviceRecord = typeof DeviceRecord.Type
+
+/** The front-end part of `settings.json`. */
+export interface FrontendData {
+  /** Kind id → its default profile overrides. */
+  readonly frontends: Readonly<Record<string, ProfileOverrides>>
+  /** Device id → its record. */
+  readonly devices: Readonly<Record<string, DeviceRecord>>
+}
+
+export const SETTINGS_VERSION = 3
+
+export interface SettingsFile extends FrontendData {
+  readonly version: 3
   /** The save that wrote this file; both files of one save carry the same one (see "Revisions" above). */
   readonly revision?: number
   readonly modules: Readonly<Record<string, { readonly enabled?: boolean; readonly settings?: Readonly<Record<string, unknown>> }>>
@@ -96,7 +123,7 @@ export const DataDirConfig = Config.String("PVA_DATA_DIR").pipe(
   Config.map((p) => resolve(userCwd, p))
 )
 
-const emptySettings = (): SettingsFile => ({ version: 2, modules: {}, assistant: {} })
+const emptySettings = (): SettingsFile => ({ version: 3, modules: {}, assistant: {}, frontends: {}, devices: {} })
 const emptySecrets = (): SecretsFile => ({ version: 2, modules: {}, assistant: {} })
 
 const isRecord = (u: unknown): u is Record<string, unknown> => typeof u === "object" && u !== null && !Array.isArray(u)
@@ -112,20 +139,51 @@ interface Read<A> {
   readonly problems: ReadonlyArray<string>
 }
 
-/** Read `settings.json` of version 1 or 2 (exported for tests). The revision is kept. */
+const decodeOverrides = Schema.decodeUnknownOption(ProfileOverrides)
+const decodeDevice = Schema.decodeUnknownOption(DeviceRecord)
+const isKindId = Schema.is(FrontendKindId)
+const isDeviceId = Schema.is(DeviceId)
+
+/** The front-end maps of a version-3 file; entries that do not decode are dropped, each with a problem. */
+const readFrontendData = (u: Record<string, unknown>, problems: Array<string>): FrontendData => {
+  const frontends: Record<string, ProfileOverrides> = {}
+  const devices: Record<string, DeviceRecord> = {}
+  for (const [kind, value] of Object.entries(isRecord(u.frontends) ? u.frontends : {})) {
+    const decoded = decodeOverrides(value)
+    if (isKindId(kind) && decoded._tag === "Some") frontends[kind] = decoded.value
+    else problems.push(`settings.json: the defaults of front-end kind "${kind.slice(0, 40)}" were not valid and were dropped`)
+  }
+  for (const [id, value] of Object.entries(isRecord(u.devices) ? u.devices : {})) {
+    const decoded = decodeDevice(value)
+    if (isDeviceId(id) && decoded._tag === "Some") devices[id] = decoded.value
+    else problems.push(`settings.json: the record of device "${id.slice(0, 64)}" was not valid and was dropped`)
+  }
+  return { frontends, devices }
+}
+
+/**
+ * Read `settings.json` of version 1, 2 or 3 (exported for tests). The revision is kept. `migrated` only for
+ * version 1 (rewritten at load with a backup); a version-2 file becomes version 3 in memory (empty front-end maps)
+ * and on disk at its next save.
+ */
 export const readSettingsFile = (u: unknown): Read<SettingsFile> | undefined => {
   if (!isRecord(u) || !optionalRecords(u.modules)) return undefined
   const modules = (u.modules ?? {}) as SettingsFile["modules"]
-  if (u.version === 2 && (u.assistant === undefined || isRecord(u.assistant))) {
+  if ((u.version === 2 || u.version === 3) && (u.assistant === undefined || isRecord(u.assistant))) {
+    if (u.version === 3 && ((u.frontends !== undefined && !isRecord(u.frontends)) || (u.devices !== undefined && !isRecord(u.devices)))) {
+      return undefined
+    }
+    const problems: Array<string> = []
+    const frontendData = u.version === 3 ? readFrontendData(u, problems) : { frontends: {}, devices: {} }
     return {
-      file: { version: 2, ...revisionField(u), modules, assistant: (u.assistant ?? {}) as Record<string, unknown> },
+      file: { version: 3, ...revisionField(u), modules, assistant: (u.assistant ?? {}) as Record<string, unknown>, ...frontendData },
       migrated: false,
-      problems: []
+      problems
     }
   }
   if (u.version === 1 && optionalRecords(u.sections)) {
     const { flat, problems } = flattenSections((u.sections ?? {}) as Record<string, Record<string, unknown>>, "settings.json")
-    return { file: { version: 2, ...revisionField(u), modules, assistant: flat }, migrated: true, problems }
+    return { file: { version: 3, ...revisionField(u), modules, assistant: flat, frontends: {}, devices: {} }, migrated: true, problems }
   }
   return undefined
 }
@@ -189,6 +247,11 @@ export interface SettingsStore {
     values: Readonly<Record<string, SettingValue>>,
     secrets: Readonly<Record<string, string>>
   ) => Effect.Effect<void, SettingsStoreError>
+  /**
+   * Save front-end data (kind defaults, device records): `change` maps the committed data to the new data. Refused
+   * while `blocked()` (see the header). Never touches the secrets.
+   */
+  readonly saveFrontends: (what: string, change: (committed: FrontendData) => FrontendData) => Effect.Effect<void, SettingsStoreError>
   /** The module host's view of the store. */
   readonly modulePersistence: ModulePersistence
 }
@@ -936,6 +999,16 @@ export const loadSettingsStore = (directory: string, options: LoadOptions = {}):
           ).pipe(Effect.map(() => count))
         })
 
+      const saveFrontends: SettingsStore["saveFrontends"] = (what, change) =>
+        Effect.suspend(() =>
+          blockedProblem !== undefined
+            ? Effect.fail(new SettingsStoreError({ message: `${what} was not saved: ${blockedProblem}` }))
+            : persist(what, (committed) => {
+              const next = change({ frontends: committed.settings.frontends, devices: committed.settings.devices })
+              return { settings: { ...committed.settings, frontends: next.frontends, devices: next.devices }, secrets: committed.secrets }
+            })
+        )
+
       const store: SettingsStore = {
         directory,
         settings: () => settings,
@@ -951,6 +1024,7 @@ export const loadSettingsStore = (directory: string, options: LoadOptions = {}):
         },
         saveModule,
         saveAssistant,
+        saveFrontends,
         modulePersistence: {
           initial: { modules: settings.modules, secrets: current().modules },
           save: saveModule

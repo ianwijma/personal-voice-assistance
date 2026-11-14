@@ -1,53 +1,39 @@
 "use client"
-import { engineNeedsKeys } from "@/lib/state.ts"
 import { shallowEqual } from "@/lib/store.ts"
-import { useClient, useClientState } from "./context.tsx"
-import { UnlockForm } from "./KeysPanel.tsx"
+import { useClientState } from "./context.tsx"
 import { Spinner } from "./ui/Icon.tsx"
+import { useHref } from "./useHref.ts"
 
-/** A bar at the top of the stage when the engines failed or are (re)loading. */
+/** What the bar says per engine state (`engine.summary.state`); the details and the fix are in admin. */
+const TEXT = {
+  starting: ["The assistant is starting.", "This takes a few seconds."],
+  reloading: ["The assistant is reloading its engines.", "This takes a few seconds."],
+  failed: ["The assistant could not start.", "Something needs fixing in admin."],
+  ready: ["", ""]
+} as const
+
+/**
+ * A bar at the top of the stage while the assistant cannot hold a conversation. A voice page knows the engines'
+ * state (protocol 5 `engine.summary`) but not the problems: why it failed, and the fix, are in admin.
+ */
 export function EngineBanner() {
-  const client = useClient()
-  const e = useClientState(
-    (s) => ({ state: s.engine.state, problems: s.engine.problems, open: s.connection.status === "open", needsKeys: engineNeedsKeys(s) }),
-    shallowEqual
-  )
-  if (!e.open || e.state === "ready") return null
-  const openOptions = () => client.settings(["overview", "overview"])
+  const e = useClientState((s) => ({ ready: s.summary.ready, state: s.summary.state, open: s.connection.status === "open" }), shallowEqual)
+  const admin = useHref("/admin/")
+  if (!e.open || e.ready) return null
   return (
     <div
       role="status"
       data-testid="engine-banner"
-      className="absolute inset-x-3 top-2 mx-auto flex max-w-[720px] items-start gap-3 rounded-md border border-line bg-surface px-4 py-2.5 text-[14px] sm:inset-x-6"
+      data-state={e.state}
+      className="absolute inset-x-3 top-2 mx-auto flex max-w-[720px] items-center gap-3 rounded-md border border-line bg-surface px-4 py-2.5 text-[14px] sm:inset-x-6"
     >
-      {e.needsKeys ? (
-        <>
-          <span className="mt-[7px] size-1.5 shrink-0 rounded-full bg-danger" aria-hidden="true" />
-          <div className="flex min-w-0 flex-1 flex-col gap-2" data-testid="engine-banner-keys">
-            <p className="text-ink">
-              Keys are locked, so the assistant can't start:{" "}
-              <span className="text-ink-muted">type the password to unlock them (the engines reload by themselves).</span>
-            </p>
-            <UnlockForm compact />
-          </div>
-        </>
-      ) : e.state === "failed" ? (
-        <>
-          <span className="mt-[7px] size-1.5 shrink-0 rounded-full bg-danger" aria-hidden="true" />
-          <p className="min-w-0 flex-1 text-ink">
-            The assistant can't listen right now:{" "}
-            <span className="text-ink-muted">{e.problems.map((p) => `${p.stage}: ${p.message}`).join(" · ") || "the engines failed to start."}</span>
-          </p>
-          <button type="button" onClick={openOptions} className="shrink-0 text-[13px] text-voice underline-offset-4 hover:underline">
-            Open settings
-          </button>
-        </>
-      ) : (
-        <>
-          <Spinner className="mt-[3px] text-ink-muted" />
-          <p className="text-ink-muted">{e.state === "reloading" ? "Reloading engines…" : "Starting engines…"}</p>
-        </>
-      )}
+      {e.state === "failed" ? <span aria-hidden="true" className="size-1.5 shrink-0 rounded-full bg-danger" /> : <Spinner className="shrink-0 text-ink-muted" />}
+      <p className="min-w-0 flex-1 text-ink">
+        {TEXT[e.state][0]} <span className="text-ink-muted">{TEXT[e.state][1]}</span>
+      </p>
+      <a href={admin} className="inline-flex min-h-11 shrink-0 items-center text-[13px] text-voice underline-offset-4 hover:underline">
+        See why in admin
+      </a>
     </div>
   )
 }

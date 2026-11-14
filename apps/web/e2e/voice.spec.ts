@@ -36,8 +36,8 @@ test("start, then a whole spoken exchange: listening → hearing → thinking �
   expect(mic.gaps).toBe(0)
   expect(log.messages.some((m) => m.type === "mic.bad-size")).toBe(false)
 
-  // The latency readout shows the turn's first sound.
-  await expect(page.getByTestId("latency-readout")).toHaveText(/\d+ ms/)
+  // The voice front end has no latency readout (that is admin › Diagnostics).
+  await expect(page.getByTestId("latency-readout")).toHaveCount(0)
 })
 
 test("Stop silences the reply at once and the chat shows the interrupted reply", async ({ page, baseURL }) => {
@@ -111,15 +111,23 @@ test("a denied microphone shows the reason and Try again", async ({ page, baseUR
     navigator.mediaDevices.getUserMedia = () => Promise.reject(new DOMException("denied", "NotAllowedError"))
   })
   await page.goto(appUrl(baseURL))
+  await expect(page.getByTestId("start")).toBeVisible()
+  const labelY = async () => Math.round((await page.getByTestId("state-label").boundingBox())!.y)
+  const before = await labelY()
   await page.getByTestId("start").click()
   await expectVisualState(page, "error")
   await expect(page.getByTestId("audio-error")).toContainText("Microphone permission was denied")
+  await expect(page.getByTestId("audio-error")).toContainText("then press Try again")
   await expect(page.getByRole("button", { name: "Try again" })).toBeVisible()
+  // No layout shift between states: the line and its label stay where they were.
+  expect(await labelY()).toBe(before)
+  await expect(page.getByTestId("state-label")).toHaveText("Audio error")
+  await expect(page.getByTestId("connection-status")).toHaveText("")
   expect((await mock.log()).messages.some((m) => m.type === "audio.claim")).toBe(false)
 })
 
 test("the media-element output path also plays the reply and reports it", async ({ page, baseURL }) => {
-  await page.addInitScript(() => localStorage.setItem("pva.prefs.v1", JSON.stringify({ outputPath: "element" })))
+  await mock.defaults({ outputPath: "element" }) // a device-profile field since protocol 5
   await page.goto(appUrl(baseURL))
   await page.getByTestId("start").click()
   await expectVisualState(page, "speaking", 10_000)

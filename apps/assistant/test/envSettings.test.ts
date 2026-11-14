@@ -15,7 +15,7 @@ import { loadSettingsStore } from "../src/serve/SettingsStore.ts"
 import { openVault } from "../src/serve/Vault.ts"
 import { ScriptedClient } from "./support/scriptedClient.ts"
 import { openStore } from "./support/store.ts"
-import { controlledStt, fakeBuild, greeterModule, scriptedLlm, startTestServer, type TestServer } from "./support/serveHarness.ts"
+import { controlledStt, fakeBuild, greeterModule, scriptedLlm, startTestServer, type TestServer, TEST_ADMIN_PASSWORD } from "./support/serveHarness.ts"
 
 vi.setConfig({ testTimeout: 20_000 })
 
@@ -128,6 +128,22 @@ const moverSetup = async (envText: string, vaultState: "none" | "locked" | "unlo
 }
 
 describe("Move to settings (the mover)", () => {
+  it("PVA_ADMIN_PASSWORD is a bootstrap variable: listed with its line once redacted, never movable, its value gone", async () => {
+    const admin = "admin password in env"
+    const t = await moverSetup(`PVA_ADMIN_PASSWORD=${admin}\n`, "none")
+    t.view.redact("PVA_ADMIN_PASSWORD")
+    expect(t.view.record.PVA_ADMIN_PASSWORD).toBeUndefined()
+    await t.run(Effect.gen(function*() {
+      const host = yield* makeModuleHost({ catalog: [greeterModule], persistence: t.store.modulePersistence, env: t.view.record })
+      const mover = makeEnvMover({ view: t.view, catalog: [greeterModule], sections: t.sections, host, store: t.store, vaultState: () => "none", onMoved: () => {} })
+      const info = mover.info()
+      expect(info.entries.find((e) => e.key === "PVA_ADMIN_PASSWORD")).toMatchObject({ kind: "bootstrap", movable: false, line: 1 })
+      expect(JSON.stringify(info)).not.toContain(admin)
+      expect(yield* mover.move(["PVA_ADMIN_PASSWORD"])).toMatchObject({ ok: false })
+    }))
+    expect(readFileSync(t.envPath, "utf8")).toContain(`PVA_ADMIN_PASSWORD=${admin}`)
+  })
+
   it("refuses keys while the vault is locked, changing nothing; non-secrets still move", async () => {
     const env = `ANTHROPIC_API_KEY=${SECRET}\nSTT_SHERPA_AGC=false\n`
     const t = await moverSetup(env, "locked")
@@ -243,7 +259,7 @@ describe("serve: settings from outside", () => {
   it("fields show the .env file and line; the snapshot lists the variables; an admin moves them, others are refused", async () => {
     const { server, envPath } = await startWithEnv(`# keys\nANTHROPIC_API_KEY=${SECRET}\nSTT_SHERPA_AGC=false\n`)
     const a = await connect(server)
-    const welcome = await a.hello()
+    const welcome = await a.admin(TEST_ADMIN_PASSWORD)
     const agc = welcome.snapshot.sections.flatMap((s) => s.form.fields).find((f) => f.key === "STT_SHERPA_AGC")!
     expect(agc.source).toBe("env-file")
     expect(agc.locked).toEqual({ reason: `Set by STT_SHERPA_AGC in ${envPath}, line 3`, file: envPath, line: 3 })
@@ -252,11 +268,11 @@ describe("serve: settings from outside", () => {
       ["STT_SHERPA_AGC", 3, true]
     ])
 
-    // A vault exists: page `b` is not admin and is refused.
+    // A vault exists; page `b` (a voice page, not admin) is refused.
     expect((await request(a, { type: "vault.setup", password: PASSWORD })).ok).toBe(true)
     const b = await connect(server)
     await b.hello()
-    expect(await request(b, { type: "settings.moveFromEnv", keys: ["STT_SHERPA_AGC"] })).toMatchObject({ ok: false, error: { code: "locked" } })
+    expect(await request(b, { type: "settings.moveFromEnv", keys: ["STT_SHERPA_AGC"] })).toMatchObject({ ok: false, error: { code: "admin_required" } })
     expect(readFileSync(envPath, "utf8")).toContain("STT_SHERPA_AGC=false")
 
     // The admin page moves both: the key into the vault, the switch into settings.json.
@@ -285,9 +301,9 @@ describe("serve: settings from outside", () => {
   it("a secret is refused while the vault is locked (after a restart)", async () => {
     const { server, envPath } = await startWithEnv(`ANTHROPIC_API_KEY=${SECRET}\n`)
     const a = await connect(server)
-    await a.hello()
+    await a.admin(TEST_ADMIN_PASSWORD)
     expect((await request(a, { type: "vault.setup", password: PASSWORD })).ok).toBe(true)
-    // Locking also ends admin access, so the request is refused for both reasons; the file stays.
+    // Locking keeps the admin session (protocol 5); the key cannot go into a locked vault, so the file stays.
     expect((await request(a, { type: "vault.lock" })).ok).toBe(true)
     expect(await request(a, { type: "settings.moveFromEnv", keys: ["ANTHROPIC_API_KEY"] })).toMatchObject({ ok: false, error: { code: "locked" } })
     expect(readFileSync(envPath, "utf8")).toContain(SECRET)

@@ -51,7 +51,24 @@ export const writeFakeMic = () => {
   writeFileSync(fakeMicPath, Buffer.concat([header, data]))
 }
 
-export type Scenario = "voice" | "typed" | "modules" | "engine-failed" | "drop-mid-reply" | "takeover" | "outdated" | "vault" | "keys-locked"
+export type Scenario =
+  | "voice"
+  | "typed"
+  | "modules"
+  | "engine-failed"
+  | "drop-mid-reply"
+  | "takeover"
+  | "outdated"
+  | "vault"
+  | "keys-locked"
+  | "wake"
+  | "devices"
+  | "long-phrase"
+  | "admin-disabled"
+  | "admin-backoff"
+
+/** The mock's admin password (`ADMIN_PASSWORD` in mock/server.ts). */
+export const ADMIN_PASSWORD = "admin password"
 
 export interface MockLog {
   readonly scenario: string
@@ -78,14 +95,65 @@ export const mock = {
   },
   send: async (messages: ReadonlyArray<unknown>) => {
     await fetch(`${MOCK}/mock/send`, { method: "POST", body: JSON.stringify({ messages }) })
+  },
+  /** End every admin session (`idle` or `expired`). */
+  endAdmin: async (reason: "idle" | "expired") => {
+    await fetch(`${MOCK}/mock/admin/end`, { method: "POST", body: JSON.stringify({ reason }) })
+  },
+  /** The owner said the wake phrase (`armed`: the phrase alone). */
+  wake: async (phrase = "hey jeff", armed = true) => {
+    await fetch(`${MOCK}/mock/wake`, { method: "POST", body: JSON.stringify({ phrase, armed }) })
+  },
+  /**
+   * A line for the phrase tester. `accepted`: whether the gate took it (default: what the mock's gate would say;
+   * `null`: left out, as from an older server).
+   */
+  heard: async (text: string, matched?: string, accepted?: boolean | null) => {
+    await fetch(`${MOCK}/mock/heard`, {
+      method: "POST",
+      body: JSON.stringify({ text, ...(matched === undefined ? {} : { matched }), ...(accepted === undefined ? {} : { accepted }) })
+    })
+  },
+  /** Change the web-voice defaults (as admin › Front ends would). */
+  defaults: async (patch: Record<string, unknown>) => {
+    await fetch(`${MOCK}/mock/defaults`, { method: "POST", body: JSON.stringify({ patch }) })
+  },
+  /** Make `admin.logout` fail (or work again). */
+  logoutFails: async (on = true) => {
+    await fetch(`${MOCK}/mock/logout-fails`, { method: "POST", body: JSON.stringify({ on }) })
+  },
+  state: async (state: string) => {
+    await fetch(`${MOCK}/mock/state`, { method: "POST", body: JSON.stringify({ state }) })
   }
 }
 
-/** The page URL: the static export needs the mock's address (`?ws=`); next dev derives it. */
-export const appUrl = (baseURL: string | undefined, extra = "") => {
-  const url = new URL(baseURL ?? "http://127.0.0.1:3200")
+/** The voice page's URL: the static export needs the mock's address (`?ws=`); next dev derives it. `extra`: a hash. */
+export const appUrl = (baseURL: string | undefined, extra = "", path = "/") => {
+  const url = new URL(path, baseURL ?? "http://127.0.0.1:3200")
   url.searchParams.set("ws", WS)
   return `${url.toString()}${extra}`
+}
+
+/** The admin page's URL (`/admin/`), with an optional hash (`#settings/speech/engine`). */
+export const adminUrl = (baseURL: string | undefined, hash = "") => appUrl(baseURL, hash, "/admin/")
+
+/** Open admin at `hash`, logging in only if this tab is not logged in yet (the token is per tab). */
+export const gotoAdmin = async (page: Page, baseURL: string | undefined, hash = "") => {
+  await page.goto(adminUrl(baseURL, hash))
+  await page.locator("[data-testid=settings], [data-testid=login-form]").first().waitFor()
+  if (await page.getByTestId("login-form").isVisible()) {
+    await page.locator("#admin-password").fill(ADMIN_PASSWORD)
+    await page.getByRole("button", { name: "Log in" }).click()
+  }
+  await expect(page.getByTestId("settings")).toBeVisible()
+}
+
+/** Open admin (at `hash`) and log in with the mock's password; resolves when the settings screen is on. */
+export const loginAdmin = async (page: Page, baseURL: string | undefined, hash = "") => {
+  await page.goto(adminUrl(baseURL, hash))
+  await page.locator("#admin-password").fill(ADMIN_PASSWORD)
+  await page.getByRole("button", { name: "Log in" }).click()
+  await expect(page.getByTestId("settings")).toBeVisible()
 }
 
 export const visualState = (page: Page) => page.getByTestId("stage").getAttribute("data-visual-state")

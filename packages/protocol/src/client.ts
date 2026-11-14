@@ -1,7 +1,7 @@
 import { Schema } from "effect"
+import { AdminToken } from "./admin.ts"
 import {
   ClientId,
-  InterruptMode,
   ModuleId,
   NonNegativeFinite,
   NonNegativeInt,
@@ -12,6 +12,7 @@ import {
 } from "./common.ts"
 import { MAX_TEXT_INPUT_CHARS } from "./constants.ts"
 import { MAX_MOVE_KEYS } from "./env.ts"
+import { DeviceHello, DeviceId, DeviceName, FrontendKindId, FrontendRole, ProfilePatch } from "./frontends.ts"
 import { JobAction, ToolId } from "./jobs.ts"
 import { SettingsPatch } from "./settings.ts"
 import { Password } from "./vault.ts"
@@ -19,6 +20,10 @@ import { Password } from "./vault.ts"
 /**
  * Text frames from the browser to the assistant. Binary frames from the
  * browser are microphone audio (see `frames.ts`).
+ *
+ * Protocol 5: requests marked "Admin only" are answered `admin_required` on a connection that is not admin
+ * (`admin.login`, `admin.ts`). That covers every settings, module, engine-reload, vault, `.env`, job, model,
+ * front-end and device-admin request, and the phrase tester.
  */
 
 /** First message on every connection. Nothing else is accepted before it. */
@@ -31,7 +36,21 @@ export const Hello = Schema.Struct({
    * graph is still running. The server makes it the owner again only if no other
    * tab has claimed the audio since.
    */
-  resumeOwner: Schema.Boolean
+  resumeOwner: Schema.Boolean,
+  /** Protocol 5: which front end this is. `admin` connections never own the audio and send no `device`. */
+  frontend: FrontendRole,
+  /**
+   * Protocol 5, voice front ends: this device (stable `deviceId` from `localStorage`, its kind, a suggested name).
+   * The server records it (first seen / last seen) and answers with its effective profile (`snapshot.device`).
+   * Without it a voice connection gets the `web-voice` kind defaults and may change none of them.
+   */
+  device: Schema.optionalKey(DeviceHello),
+  /**
+   * Protocol 5, admin front ends: the session token from an earlier `admin.login` (kept in `sessionStorage`), so a
+   * reload or reconnect stays logged in. Valid: `admin.snapshot` follows `welcome`. Not valid: `snapshot.admin` says
+   * `loggedIn: false` (no error).
+   */
+  adminToken: Schema.optionalKey(AdminToken)
 })
 
 /** Facts about the browser's audio setup, for logs and the latency trace. */
@@ -44,20 +63,22 @@ export const AudioClientInfo = Schema.Struct({
   outputPath: OutputPath
 })
 
-/** Become the microphone and speaker (sent after the Start gesture succeeded). The last claim wins. */
+/**
+ * Become the microphone and speaker (sent after the Start gesture succeeded). The last claim wins.
+ * Protocol 5: the interrupt mode comes from the device profile, not from here. From an admin connection it is
+ * refused with error `not_owner` (the admin front end never claims the audio).
+ */
 export const AudioClaim = Schema.Struct({
   type: Schema.Literal("audio.claim"),
-  interruptMode: InterruptMode,
   audio: AudioClientInfo
 })
 
 /** Stop being the microphone and speaker (the user ended the session). */
 export const AudioRelease = Schema.Struct({ type: Schema.Literal("audio.release") })
 
-/** Change per-device audio options while owning the audio. */
+/** The browser's audio setup changed while owning the audio (e.g. the output path). Protocol 5: no interrupt mode. */
 export const AudioConfig = Schema.Struct({
   type: Schema.Literal("audio.config"),
-  interruptMode: InterruptMode,
   audio: AudioClientInfo
 })
 
@@ -133,19 +154,21 @@ export const TextSend = Schema.Struct({
   speak: Schema.Boolean
 })
 
+/** Admin only. */
 export const ModuleEnable = Schema.Struct({
   type: Schema.Literal("module.enable"),
   requestId: RequestId,
   moduleId: ModuleId
 })
 
+/** Admin only. */
 export const ModuleDisable = Schema.Struct({
   type: Schema.Literal("module.disable"),
   requestId: RequestId,
   moduleId: ModuleId
 })
 
-/** Change a module's settings (a patch: only changed fields). Restarts the module if it is running. */
+/** Admin only: change a module's settings (a patch: only changed fields). Restarts the module if it is running. */
 export const ModuleConfigure = Schema.Struct({
   type: Schema.Literal("module.configure"),
   requestId: RequestId,
@@ -154,7 +177,7 @@ export const ModuleConfigure = Schema.Struct({
 })
 
 /**
- * Change assistant settings in one section (a patch). Saved values are stored by key, not by section, so the
+ * Admin only: change assistant settings in one section (a patch). Saved values are stored by key, not by section, so the
  * section only says which form (and which checks) the patch belongs to.
  */
 export const SettingsUpdate = Schema.Struct({
@@ -166,15 +189,15 @@ export const SettingsUpdate = Schema.Struct({
   confirmWarnings: Schema.optionalKey(Schema.Boolean)
 })
 
-/** Rebuild the speech and language engines with the saved settings (keeps the conversation). */
+/** Admin only: rebuild the speech and language engines with the saved settings (keeps the conversation). */
 export const EngineReload = Schema.Struct({
   type: Schema.Literal("engine.reload"),
   requestId: RequestId
 })
 
 /**
- * Create the vault with a password (at least `MIN_PASSWORD_CHARS`), moving the keys out of the project into it.
- * Only while there is no vault. Grants this page admin access.
+ * Admin only: create the vault with a password (at least `MIN_PASSWORD_CHARS`), moving the keys out of the project
+ * into it. Only while there is no vault. (Before protocol 5 this also granted admin access; it no longer does.)
  */
 export const VaultSetup = Schema.Struct({
   type: Schema.Literal("vault.setup"),
@@ -183,8 +206,8 @@ export const VaultSetup = Schema.Struct({
 })
 
 /**
- * Unlock the vault (when locked) and get admin access for this page (also when another page or
- * `PVA_VAULT_PASSWORD` already unlocked it). A wrong password is answered `bad_password`.
+ * Admin only: unlock the vault (when locked). A wrong password is answered `bad_password`. (Before protocol 5 this
+ * also granted admin access to the page; it no longer does, and an unlocked vault answers `ok`.)
  */
 export const VaultUnlock = Schema.Struct({
   type: Schema.Literal("vault.unlock"),
@@ -192,13 +215,13 @@ export const VaultUnlock = Schema.Struct({
   password: Password
 })
 
-/** Admin only: lock the vault now (the keys leave memory; every page loses admin access). */
+/** Admin only: lock the vault now (the keys leave memory). Admin sessions are not affected (protocol 5). */
 export const VaultLock = Schema.Struct({
   type: Schema.Literal("vault.lock"),
   requestId: RequestId
 })
 
-/** Re-encrypt the vault under a new password (with a new salt). Needs the current password. */
+/** Admin only: re-encrypt the vault under a new password (with a new salt). Needs the current password. */
 export const VaultChangePassword = Schema.Struct({
   type: Schema.Literal("vault.changePassword"),
   requestId: RequestId,
@@ -245,6 +268,86 @@ export const ModelDelete = Schema.Struct({
   target: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(100))
 })
 
+/**
+ * Log in to admin with `PVA_ADMIN_PASSWORD`. Success: `result` with `ok: true` and `admin: AdminSession` (keep the
+ * token in `sessionStorage`, send it in the next `hello`), then `admin.state` and `admin.snapshot` on this
+ * connection. Wrong password: `bad_password`, and `admin.state` with `retryAfterMs` while attempts are refused
+ * (the same back-off as vault unlocks). Admin disabled (no password set): `admin_required` with a message saying
+ * so. Already logged in: `ok` with a fresh session.
+ */
+export const AdminLogin = Schema.Struct({
+  type: Schema.Literal("admin.login"),
+  requestId: RequestId,
+  password: Password
+})
+
+/**
+ * End this connection's admin session (the token stops working everywhere it was used). Answered `ok` also when
+ * not logged in. Every connection of the session gets `admin.state` with `loggedIn: false, endReason: "logout"`.
+ */
+export const AdminLogout = Schema.Struct({
+  type: Schema.Literal("admin.logout"),
+  requestId: RequestId
+})
+
+/**
+ * Change this connection's own device profile: only `DEVICE_EDITABLE_FIELDS` (`voice`, `activation`,
+ * `followUpSeconds`); a patch naming any other field is refused whole with `admin_required`. `null` removes the
+ * device's override (back to the kind default). A voice connection without `hello.device` is refused (`bad_message`).
+ * Every connection of the device then gets `device.profile`; admin connections get `devices`.
+ */
+export const DeviceUpdate = Schema.Struct({
+  type: Schema.Literal("device.update"),
+  requestId: RequestId,
+  patch: ProfilePatch
+})
+
+/**
+ * Admin only: change a front-end kind's defaults (Front ends › kind). Fields not in the kind's `fields` are refused
+ * (`invalid_settings`, with `fieldErrors`). Unknown kind: `unknown_device`. Every affected device connection gets
+ * `device.profile`; admin connections get `frontends` and `devices`.
+ */
+export const FrontendUpdate = Schema.Struct({
+  type: Schema.Literal("frontend.update"),
+  requestId: RequestId,
+  kind: FrontendKindId,
+  patch: ProfilePatch
+})
+
+/**
+ * Admin only: rename a device and/or change its overrides (any profile field that applies to its kind). Unknown
+ * device: `unknown_device`. The device's connections get `device.profile`; admin connections get `devices`.
+ */
+export const DeviceAdminUpdate = Schema.Struct({
+  type: Schema.Literal("device.admin.update"),
+  requestId: RequestId,
+  id: DeviceId,
+  name: Schema.optionalKey(DeviceName),
+  patch: Schema.optionalKey(ProfilePatch)
+})
+
+/**
+ * Admin only: forget a device (its record and overrides). A device that is connected now is recorded again as new
+ * (kind defaults) and its connections get `device.profile`. Unknown device: `unknown_device`.
+ */
+export const DeviceForget = Schema.Struct({
+  type: Schema.Literal("device.forget"),
+  requestId: RequestId,
+  id: DeviceId
+})
+
+/**
+ * Admin only: switch the wake-phrase tester on or off for this connection. While on, the connection gets
+ * `wake.heard` for every final transcript of the current audio owner (also in `always` mode, and including what
+ * the wake gate dropped). It switches itself off `WAKE_TEST_MAX_MS` (5 min) after the last `on: true`, and when the
+ * connection stops being admin; the page counts the 5 minutes itself (sending `on: true` again restarts them).
+ */
+export const WakeTest = Schema.Struct({
+  type: Schema.Literal("wake.test"),
+  requestId: RequestId,
+  on: Schema.Boolean
+})
+
 /** Liveness check; the server answers `pong` with the same id. Sent every 5 s. */
 export const Ping = Schema.Struct({
   type: Schema.Literal("ping"),
@@ -276,6 +379,13 @@ export const ClientMessage = Schema.Union([
   JobStart,
   JobCancel,
   ModelDelete,
+  AdminLogin,
+  AdminLogout,
+  DeviceUpdate,
+  FrontendUpdate,
+  DeviceAdminUpdate,
+  DeviceForget,
+  WakeTest,
   Ping
 ]).pipe(Schema.toTaggedUnion("type"))
 export type ClientMessage = typeof ClientMessage.Type

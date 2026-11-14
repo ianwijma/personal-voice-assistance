@@ -1,71 +1,38 @@
 "use client"
-import { useEffect, useState } from "react"
-import { Spinner } from "../ui/Icon.tsx"
-import { Button, cx } from "../ui/controls.tsx"
+import { Button } from "../ui/controls.tsx"
+import { FormFooter } from "./FormFooter.tsx"
 import type { PageForms } from "./usePageForms.ts"
 
 /**
- * Lift the footer above the on-screen keyboard (iOS Safari keeps `position: sticky` elements behind it): the
- * distance between the layout viewport's bottom and the visual viewport's bottom.
- */
-const useKeyboardInset = () => {
-  const [inset, setInset] = useState(0)
-  useEffect(() => {
-    const vv = window.visualViewport
-    if (vv === null || vv === undefined) return
-    const update = () => setInset(Math.max(0, Math.round(window.innerHeight - vv.height - vv.offsetTop)))
-    update()
-    vv.addEventListener("resize", update)
-    vv.addEventListener("scroll", update)
-    return () => {
-      vv.removeEventListener("resize", update)
-      vv.removeEventListener("scroll", update)
-    }
-  }, [])
-  return inset
-}
-
-/**
  * The page's sticky footer (docs/SETTINGS-UI.md §3.1, §3.4): Save / Cancel for every form on the page, "Save and
- * reload" when every change needs an engine reload, and the warnings of a save with "Save anyway".
+ * reload" when every change needs an engine reload, and the warnings of a save with "Save anyway" / "Go back".
+ * It is the only place a page says that its changes need an engine reload. While a chosen option's card (Claude
+ * subscription) is the way to commit, Save waits and the note points at the card: one obvious way to commit.
  */
-export function PageFooter({ forms }: { readonly forms: PageForms }) {
-  const inset = useKeyboardInset()
-  const disabled = !forms.dirty || forms.saving || forms.hasLocalErrors
+export function PageFooter({ forms, commitVia }: {
+  readonly forms: PageForms
+  /** A chosen option whose card's button is the way to commit it ("Claude subscription"): Save waits for it. */
+  readonly commitVia?: string | undefined
+}) {
+  const disabled = !forms.dirty || forms.saving || forms.hasLocalErrors || commitVia !== undefined
   return (
-    <div
-      className="sticky bottom-0 z-10 -mx-5 mt-auto border-t border-line bg-surface/95 px-5 pt-3 backdrop-blur-sm sm:-mx-8 sm:px-8"
-      style={{ bottom: inset, paddingBottom: "max(12px, env(safe-area-inset-bottom))" }}
-      data-testid="page-footer"
-    >
-      {forms.confirming.length > 0 && (
-        <div className="mb-3 flex flex-col gap-2 rounded-md border border-warn/40 bg-warn/5 px-3 py-2.5" role="alert" data-testid="save-warnings">
-          {forms.confirming.map((w, i) => <p key={i} className="text-[13px] text-ink">{w.message}</p>)}
-          <div className="flex flex-wrap gap-2">
-            <Button size="sm" variant="primary" onClick={() => void forms.save({ confirm: true })} disabled={forms.saving}>
-              {forms.saving && <Spinner size={12} />}
-              Save anyway
-            </Button>
-          </div>
-        </div>
-      )}
-      <div className="flex flex-wrap items-center gap-2">
-        <Button type="button" variant={forms.dirty ? "primary" : "default"} size="sm" disabled={disabled} onClick={() => void forms.save()}>
-          {forms.saving && <Spinner size={13} />}
-          Save
-        </Button>
-        {forms.allReload && (
-          <Button type="button" size="sm" disabled={disabled} onClick={() => void forms.save({ reload: true })}>Save and reload</Button>
-        )}
-        <Button size="sm" variant="quiet" disabled={!forms.dirty || forms.saving} onClick={() => forms.cancel()}>Cancel</Button>
-        <span
-          className={cx("text-[12px]", forms.saved ? "text-ok" : "text-ink-faint")}
-          aria-live="polite"
-          data-testid="footer-note"
-        >
-          {forms.saved ? "Saved" : forms.someReload ? "Applies after an engine reload (about 2 s)." : forms.dirty ? "Unsaved changes" : ""}
-        </span>
-      </div>
-    </div>
+    <FormFooter
+      dirty={forms.dirty}
+      saving={forms.saving}
+      saveDisabled={disabled}
+      // The card's button is the one way to commit: no disabled Save next to a note that points away from it.
+      hideSave={commitVia !== undefined}
+      onSave={() => void forms.save()}
+      onCancel={() => forms.cancel()}
+      cancelDisabled={!forms.dirty || forms.saving}
+      extra={forms.allReload ? <Button className="max-sm:h-11" disabled={disabled} onClick={() => void forms.save({ reload: true })}>Save and reload</Button> : undefined}
+      note={commitVia !== undefined && !forms.saving
+        ? `To save this choice, use “Use ${commitVia}” above: it saves, switches it on and reloads.`
+        : forms.saved ? "Saved" : forms.someReload ? "Applies after an engine reload (about 2 s; interrupts a reply)." : forms.dirty ? "Unsaved changes" : ""}
+      noteTone={forms.saved ? "ok" : "muted"}
+      warnings={forms.confirming.map((w) => w.message)}
+      onSaveAnyway={() => void forms.save({ confirm: true })}
+      onBack={forms.dismissWarnings}
+    />
   )
 }

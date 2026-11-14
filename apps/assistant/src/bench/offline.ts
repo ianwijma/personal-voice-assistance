@@ -3,7 +3,18 @@
  * in-process stand-ins (from `@pva/core/testing`) for STT, LLM, TTS and the
  * speaker, each with a configurable simulated delay. No keys, no network.
  */
-import { Conversation, type LlmRequest, makeVoiceRouter, type SttEvent, ToolRegistry, type Trace, Tts } from "@pva/core"
+import {
+  Conversation,
+  type LlmRequest,
+  makeVoiceRouter,
+  makeWakeGate,
+  type SttEvent,
+  ToolRegistry,
+  type Trace,
+  Tts,
+  WAKE_ALWAYS,
+  type WakeConfig
+} from "@pva/core"
 import {
   done,
   eagerEndOfTurn,
@@ -51,6 +62,12 @@ export interface OfflineScenario {
   readonly delays: SimulatedDelays
   /** Emit `EagerEndOfTurn` (speculative turns) or only `EndOfTurn`. */
   readonly eager: boolean
+  /**
+   * The wake gate in front of `Conversation`, as in serve mode (default: `always`, the gate passing everything).
+   * In `wake-phrase` mode every utterance starts with `wakePrefix` ("Hey Jeff, …"), which the gate removes.
+   */
+  readonly wake?: WakeConfig
+  readonly wakePrefix?: string
 }
 
 interface ScriptedTurn {
@@ -93,6 +110,10 @@ const respond = (delays: SimulatedDelays) => (request: LlmRequest): LlmScript =>
 
 /** What the STT stand-in emits for one turn. */
 const sttEvents = (turn: ScriptedTurn, scenario: OfflineScenario): Array<SttEvent | Sleep> => {
+  const prefix = scenario.wake?.activation === "wake-phrase" ? scenario.wakePrefix ?? "" : ""
+  if (prefix !== "") {
+    turn = { ...turn, user: `${prefix}${turn.user}`, ...(turn.falseStart !== undefined ? { falseStart: `${prefix}${turn.falseStart}` } : {}) }
+  }
   const lead = scenario.delays.eagerLeadMs
   if (!scenario.eager) return [speechStarted, endOfTurn(turn.user)]
   const falseStart = turn.falseStart === undefined
@@ -124,10 +145,14 @@ export const runOffline = (scenario: OfflineScenario, rounds: number) =>
       ))
     )
     const turns = Array.from({ length: rounds + 1 }, (_, round) => script.map((turn) => ({ round, turn }))).flat()
+    // Serve mode's wake gate, on the events as they arrive (time passed in, as there).
+    const wake = makeWakeGate(scenario.wake ?? WAKE_ALWAYS)
+    const gated = (events: Stream.Stream<SttEvent>) =>
+      events.pipe(Stream.flatMap((event) => Stream.fromIterable(wake.filter(event, performance.now()).events)))
     const rows: Array<BenchRow> = []
     const events = Stream.fromIterable(turns).pipe(
       Stream.flatMap(({ round, turn }) =>
-        scripted(sttEvents(turn, scenario)).pipe(
+        gated(scripted(sttEvents(turn, scenario))).pipe(
           Stream.concat(Stream.fromEffectDrain(Effect.gen(function*() {
             const trace = yield* Queue.take(finished)
             if (round > 0) rows.push({ label: `${round}.${script.indexOf(turn) + 1} ${turn.user.slice(0, 24)}`, trace })

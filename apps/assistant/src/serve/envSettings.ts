@@ -20,6 +20,7 @@ import type { SettingsStore } from "./SettingsStore.ts"
 /** Read before the settings exist, or deciding who may reach the page: they stay in `.env`. */
 export const BOOTSTRAP_KEYS: ReadonlySet<string> = new Set([
   "PVA_VAULT_PASSWORD",
+  "PVA_ADMIN_PASSWORD",
   "PVA_DATA_DIR",
   "PVA_VAULT_PATH",
   "SERVE_HOST",

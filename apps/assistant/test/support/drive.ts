@@ -5,6 +5,9 @@
  *
  *   pnpm --filter @pva/assistant exec tsx test/support/drive.ts [--url http://127.0.0.1:8787] [--mode instant] [--reload] file.wav...
  *
+ * Protocol 5: settings and profiles are admin only. `--mode`, `--reload`, `--model` and `--record` need the admin
+ * password (`--admin-password`, or `PVA_ADMIN_PASSWORD` in the environment); they use a second, admin connection.
+ * `--mode` sets the interrupt mode as an override of this script's own device (not the kind defaults).
  * `--reload` first saves a listening setting and reloads the engines (prints how long that took).
  * `--model <preset>` first chooses that speech recognition model in the settings and reloads the engines.
  * `--record` first switches on "Save what the assistant hears".
@@ -17,7 +20,8 @@ import { ScriptedClient } from "./scriptedClient.ts"
 
 const args = process.argv.slice(2)
 let url = "http://127.0.0.1:8787"
-let mode: "instant" | "confirm" | "manual" = "instant"
+let mode: "instant" | "confirm" | "manual" | undefined
+let adminPassword = process.env.PVA_ADMIN_PASSWORD
 let reload = false
 let model: string | undefined
 let record = false
@@ -28,6 +32,7 @@ for (let i = 0; i < args.length; i++) {
   else if (args[i] === "--reload") reload = true
   else if (args[i] === "--model") model = args[++i]!
   else if (args[i] === "--record") record = true
+  else if (args[i] === "--admin-password") adminPassword = args[++i]!
   else files.push(resolve(process.env.INIT_CWD ?? process.cwd(), args[i]!))
 }
 if (files.length === 0) {
@@ -64,31 +69,53 @@ const describe = (m: ServerMessage): string => {
 
 const client = await ScriptedClient.connect({ url })
 const welcome = await client.hello()
-console.log(`${at()}  welcome: engine ${welcome.snapshot.engine.state}, modules ${welcome.snapshot.modules.map((m) => `${m.id}:${m.state}`).join(", ")}`)
+console.log(`${at()}  welcome: engine ${welcome.snapshot.engine.ready ? "ready" : "not ready"}, device ${client.device.id}`)
+const needsAdmin = mode !== undefined || reload || model !== undefined || record
+if (needsAdmin && (adminPassword === undefined || adminPassword === "")) {
+  console.error("--mode, --reload, --model and --record need --admin-password (or PVA_ADMIN_PASSWORD)")
+  process.exit(2)
+}
+const admin = needsAdmin ? await ScriptedClient.connect({ url }) : client
+if (needsAdmin) {
+  const logged = await admin.admin(adminPassword!)
+  console.log(`${at()}  admin: modules ${logged.snapshot.modules.map((m) => `${m.id}:${m.state}`).join(", ")}`)
+}
 let printed = client.messages.length
 const flush = () => {
   for (; printed < client.messages.length; printed++) console.log(`${at()}  ${describe(client.messages[printed]!)}`)
 }
 const ticker = setInterval(flush, 20)
 
-if (welcome.snapshot.engine.state !== "ready") await client.waitFor("engine", (m) => m.engine.state !== "starting", { timeoutMs: 60_000, from: 0 })
+if (!welcome.snapshot.engine.ready) await client.waitFor("engine.summary", (m) => m.engine.ready, { timeoutMs: 60_000, from: 0 })
+if (mode !== undefined) {
+  // The device record is saved right after hello; retry while it is not there yet.
+  for (let attempt = 0; attempt < 20; attempt++) {
+    admin.send({ type: "device.admin.update", requestId: `mode${attempt}`, id: client.device.id, patch: { interruptMode: mode } })
+    const r = await admin.waitFor("result", (m) => m.requestId === `mode${attempt}`, { from: 0 })
+    if (r.ok || r.error?.code !== "unknown_device") {
+      console.log(`${at()}  >>> mode ${mode}: ${JSON.stringify(r)}`)
+      break
+    }
+    await new Promise((done) => setTimeout(done, 100))
+  }
+}
 if (record) {
-  client.send({ type: "settings.update", requestId: "rec", sectionId: "listening", patch: { values: { RECORD_HEARD_AUDIO: true }, secrets: {} } })
-  console.log(`${at()}  >>> record: ${JSON.stringify(await client.waitFor("result", (m) => m.requestId === "rec", { from: 0 }))}`)
+  admin.send({ type: "settings.update", requestId: "rec", sectionId: "listening", patch: { values: { RECORD_HEARD_AUDIO: true }, secrets: {} } })
+  console.log(`${at()}  >>> record: ${JSON.stringify(await admin.waitFor("result", (m) => m.requestId === "rec", { from: 0 }))}`)
 }
 if (reload || model !== undefined) {
   const values = model !== undefined ? { STT_SHERPA_MODEL: model } : { STT_SHERPA_FINAL_SILENCE_MS: 550 }
-  client.send({ type: "settings.update", requestId: "s1", sectionId: "listening", patch: { values, secrets: {} } })
-  const saved = await client.waitFor("result", (m) => m.requestId === "s1", { from: 0 })
+  admin.send({ type: "settings.update", requestId: "s1", sectionId: "listening", patch: { values, secrets: {} } })
+  const saved = await admin.waitFor("result", (m) => m.requestId === "s1", { from: 0 })
   console.log(`${at()}  >>> settings.update: ${JSON.stringify(saved)}`)
   const started = performance.now()
-  client.send({ type: "engine.reload", requestId: "r1" })
-  const reloaded = await client.waitFor("result", (m) => m.requestId === "r1", { from: 0, timeoutMs: 60_000 })
+  admin.send({ type: "engine.reload", requestId: "r1" })
+  const reloaded = await admin.waitFor("result", (m) => m.requestId === "r1", { from: 0, timeoutMs: 60_000 })
   console.log(`${at()}  >>> engine.reload: ${JSON.stringify(reloaded)} after ${(performance.now() - started).toFixed(0)} ms`)
-  const engine = [...client.messages].reverse().find((m) => m.type === "engine")
+  const engine = [...admin.messages].reverse().find((m) => m.type === "engine")
   if (engine?.type === "engine") console.log(`${at()}  >>> engines: ${engine.engine.engines.map((e) => `${e.stage}=${e.provider} ${e.detail}`).join(", ")}`)
 }
-await client.claim(mode)
+await client.claim()
 await client.silence(1_000)
 for (const file of files) {
   const wav = parseWav(readFileSync(file))
@@ -113,5 +140,6 @@ for (const file of files) {
 }
 flush()
 clearInterval(ticker)
+if (admin !== client) admin.close()
 client.close()
 await client.closed

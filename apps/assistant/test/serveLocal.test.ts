@@ -50,7 +50,7 @@ it.skipIf(missing !== undefined)(
 
     const client = await ScriptedClient.connect({ url: server.url })
     await client.hello()
-    await client.claim("instant")
+    await client.claim()
     await client.silence(500)
     await client.streamPcm(speech.data)
     let done = false

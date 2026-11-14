@@ -112,8 +112,13 @@ export interface HeardRecording {
 export interface HeardAudio {
   /** Every chunk of audio the recogniser receives (16 kHz s16le). */
   readonly audio: (chunk: Uint8Array) => void
-  /** Every event the recogniser emits (before the echo gate). */
+  /**
+   * Every event the recogniser emits (before the echo gate). Serve mode passes an `EndOfTurn` only after the wake
+   * gate kept the utterance, and calls `discard` instead when the gate dropped it.
+   */
   readonly event: (event: SttEvent) => void
+  /** Forget the recording in progress without saving it (an utterance the wake gate ignored is never stored). */
+  readonly discard: () => void
   /** The recordings saved so far by this instance (newest last). */
   readonly saved: () => ReadonlyArray<HeardRecording>
   /** Recordings skipped because the previous one was still being written. */
@@ -326,6 +331,9 @@ export const makeHeardAudio = (options: HeardAudioOptions): HeardAudio => {
       if (event._tag === "Interim") recording.interim = event.text
       else if (event._tag === "EagerEndOfTurn") recording.eager.push(event.text)
       else if (event._tag === "EndOfTurn") finish(event.text, "end of turn")
+    },
+    discard: () => {
+      recording = undefined
     },
     saved: () => saved,
     skipped: () => skipped,

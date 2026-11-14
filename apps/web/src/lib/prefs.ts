@@ -1,75 +1,46 @@
-import type { InterruptMode, OutputPath } from "@pva/protocol"
+import type { OutputPath } from "@pva/protocol"
 import { createStore, type Store } from "./store.ts"
 
 /**
- * Per-device preferences, kept in `localStorage` (not on the server: they
- * depend on the device, e.g. headphones on the laptop, speakers on the phone).
+ * What this browser keeps for itself in `localStorage`: the microphone and speaker (hardware ids mean nothing on
+ * another machine), a one-time hint, whether single-key shortcuts are on, and the last echo test. Everything else that used to be per browser
+ * (interrupting, audio processing, captions, speaking replies, output path, prebuffer) is the device profile since
+ * protocol 5: it comes from the server (`device.profile`) and is edited in admin
+ * (docs/FRONTENDS-AND-ACTIVATION.md §2). Old stored values of those fields are ignored and dropped on the next write.
  */
 export interface Prefs {
-  readonly interruptMode: InterruptMode
   /** `""` = the system default. */
   readonly micDeviceId: string
   readonly sinkId: string
-  readonly outputPath: OutputPath
-  readonly prebufferMs: number
-  readonly captions: boolean
-  readonly latencyReadout: boolean
-  readonly speakReplies: boolean
   readonly startHintShown: boolean
-  /** The browser's voice processing on the microphone (re-opened when changed). */
-  readonly echoCancellation: boolean
-  readonly noiseSuppression: boolean
-  readonly autoGainControl: boolean
+  /** The single-key shortcuts (M, C, S, /, ?); switched off in the help dialog (WCAG 2.1.4). Default on. */
+  readonly shortcuts: boolean
   readonly echoTest?: { readonly cancelled: boolean; readonly residualDb: number; readonly at: number; readonly outputPath: OutputPath }
 }
 
 export const defaultPrefs: Prefs = {
-  interruptMode: "confirm",
   micDeviceId: "",
   sinkId: "",
-  outputPath: "direct",
-  prebufferMs: 60,
-  captions: true,
-  latencyReadout: true,
-  speakReplies: true,
   startHintShown: false,
-  echoCancellation: true,
-  noiseSuppression: true,
-  autoGainControl: true
+  shortcuts: true
 }
 
 const KEY = "pva.prefs.v1"
-
-const clamp = (n: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, n))
-
-/** Up to half a second: enough to ride out Wi-Fi power-save stalls on a phone. */
-export const MAX_PREBUFFER_MS = 500
 
 /** Parse stored preferences leniently: unknown or invalid entries fall back to the defaults. */
 export const parsePrefs = (raw: string | null): Prefs => {
   if (raw === null) return defaultPrefs
   try {
     const v = JSON.parse(raw) as Partial<Record<keyof Prefs, unknown>>
-    const pick = <K extends keyof Prefs>(k: K, ok: (x: unknown) => boolean): Prefs[K] =>
-      ok(v[k]) ? (v[k] as Prefs[K]) : defaultPrefs[k]
-    const bool = (x: unknown) => typeof x === "boolean"
-    const str = (x: unknown) => typeof x === "string"
+    const str = (x: unknown): x is string => typeof x === "string"
     const echo = v.echoTest as Prefs["echoTest"] | undefined
     const prefs: Prefs = {
-      interruptMode: pick("interruptMode", (x) => x === "instant" || x === "confirm" || x === "manual"),
-      micDeviceId: pick("micDeviceId", str),
-      sinkId: pick("sinkId", str),
-      outputPath: pick("outputPath", (x) => x === "direct" || x === "element"),
-      prebufferMs: typeof v.prebufferMs === "number" ? clamp(Math.round(v.prebufferMs), 20, MAX_PREBUFFER_MS) : defaultPrefs.prebufferMs,
-      captions: pick("captions", bool),
-      latencyReadout: pick("latencyReadout", bool),
-      speakReplies: pick("speakReplies", bool),
-      startHintShown: pick("startHintShown", bool),
-      echoCancellation: pick("echoCancellation", bool),
-      noiseSuppression: pick("noiseSuppression", bool),
-      autoGainControl: pick("autoGainControl", bool)
+      micDeviceId: str(v.micDeviceId) ? v.micDeviceId : defaultPrefs.micDeviceId,
+      sinkId: str(v.sinkId) ? v.sinkId : defaultPrefs.sinkId,
+      startHintShown: typeof v.startHintShown === "boolean" ? v.startHintShown : defaultPrefs.startHintShown,
+      shortcuts: typeof v.shortcuts === "boolean" ? v.shortcuts : defaultPrefs.shortcuts
     }
-    return echo !== undefined && typeof echo === "object" && typeof echo.cancelled === "boolean" ? { ...prefs, echoTest: echo } : prefs
+    return echo !== undefined && echo !== null && typeof echo === "object" && typeof echo.cancelled === "boolean" ? { ...prefs, echoTest: echo } : prefs
   } catch {
     return defaultPrefs
   }

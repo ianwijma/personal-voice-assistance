@@ -5,7 +5,6 @@ import { Icon } from "../ui/Icon.tsx"
 import { cx } from "../ui/controls.tsx"
 
 export interface NavBadges {
-  readonly admin: boolean
   readonly vaultLocked: boolean
   /** Open items in the Overview checklist. */
   readonly openItems: number
@@ -14,32 +13,69 @@ export interface NavBadges {
   readonly dirtyPage: string | undefined
 }
 
-/** The marks after a page or category name (docs/SETTINGS-UI.md §3.1): unsaved edits, errors, padlock, key. */
-function Marks({ dirty, error, padlock, keyIcon, dot }: { readonly dirty?: boolean; readonly error?: boolean; readonly padlock?: boolean; readonly keyIcon?: boolean; readonly dot?: boolean }) {
+type MarkKind = "dirty" | "todo" | "error" | "lock"
+
+/** What each mark means: its title, hidden text and legend entry. */
+const MARK_TEXT: Record<MarkKind, string> = {
+  dirty: "Unsaved changes",
+  todo: "Something to set up",
+  error: "A problem",
+  lock: "Locked: unlock the keys to change"
+}
+
+/**
+ * One mark, told apart by shape, not only by colour: a filled dot (unsaved), a hollow ring (to set up), "!" (a
+ * problem) and a padlock (the keys are locked). Each has a title and hidden text.
+ */
+function Mark({ kind }: { readonly kind: MarkKind }) {
+  const shape =
+    kind === "dirty" ? <span aria-hidden="true" className="block size-2 rounded-full bg-voice" />
+    : kind === "todo" ? <span aria-hidden="true" className="block size-2.5 rounded-full border-2 border-warn" />
+    : kind === "error" ? <span aria-hidden="true" className="label block text-[11px] leading-none text-danger">!</span>
+    : <Icon name="lock" size={14} className="block text-ink-faint" />
   return (
-    <span className="ml-auto flex shrink-0 items-center gap-1.5 pl-2">
-      {dirty === true && <span className="size-1.5 rounded-full bg-voice" title="Unsaved changes" data-mark="dirty" />}
-      {dot === true && <span className="size-1.5 rounded-full bg-warn" title="Something to set up" data-mark="todo" />}
-      {error === true && <span className="label text-[11px] text-danger" title="A problem" data-mark="error">!</span>}
-      {keyIcon === true && <Icon name="key" size={14} className="text-ink-faint" aria-label="Keys locked" data-mark="key" />}
-      {padlock === true && <Icon name="lock" size={14} className="text-ink-faint" aria-label="Protected" data-mark="lock" />}
+    <span className="inline-flex size-3.5 items-center justify-center" title={MARK_TEXT[kind]} data-mark={kind}>
+      {shape}
+      <span className="sr-only">({MARK_TEXT[kind].toLowerCase()})</span>
     </span>
   )
+}
+
+/** The marks after a page or category name (docs/SETTINGS-UI.md §3.1): unsaved edits, to set up, errors, key, padlock. */
+function Marks({ dirty, error, padlock, dot }: { readonly dirty?: boolean; readonly error?: boolean; readonly padlock?: boolean; readonly dot?: boolean }) {
+  return (
+    <span className="ml-auto flex shrink-0 items-center gap-1.5 pl-2">
+      {dirty === true && <Mark kind="dirty" />}
+      {dot === true && <Mark kind="todo" />}
+      {error === true && <Mark kind="error" />}
+      {padlock === true && <Mark kind="lock" />}
+    </span>
+  )
+}
+
+/** Every kind of mark shown anywhere in the list now, in the order they appear after a name. */
+const shownMarks = (tree: ReadonlyArray<NavGroup>, b: NavBadges): ReadonlyArray<MarkKind> => {
+  const all = tree.map((g) => groupMarks(g, b))
+  const kinds: Array<MarkKind> = []
+  if (all.some((m) => m.dirty)) kinds.push("dirty")
+  if (all.some((m) => m.dot)) kinds.push("todo")
+  if (all.some((m) => m.error)) kinds.push("error")
+  if (all.some((m) => m.padlock)) kinds.push("lock")
+  return kinds
 }
 
 const groupMarks = (g: NavGroup, b: NavBadges) => ({
   dirty: b.dirtyPage !== undefined && g.pages.some((p) => `${g.slug}/${p.id}` === b.dirtyPage),
   error: g.pages.some((p) => p.hasErrors) || ((g.slug === "overview" || g.slug === "diagnostics") && b.engineProblems),
-  padlock: !b.admin && g.pages.some((p) => p.protected),
-  keyIcon: b.vaultLocked && g.pages.some((p) => p.hasSecrets),
+  // A logged-in admin may change everything; protected pages (and pages with keys) wait for the keys to be unlocked.
+  padlock: b.vaultLocked && g.pages.some((p) => p.protected || p.hasSecrets),
   dot: g.slug === "overview" && b.openItems > 0
 })
 
 const pageMarks = (p: NavPage, b: NavBadges) => ({
   dirty: b.dirtyPage === `${p.group}/${p.id}`,
   error: p.hasErrors,
-  padlock: !b.admin && p.protected,
-  keyIcon: b.vaultLocked && p.hasSecrets
+  padlock: b.vaultLocked && (p.protected || p.hasSecrets)
 })
 
 function Row({ children, current, onClick, level, testId, muted = false }: {
@@ -59,11 +95,36 @@ function Row({ children, current, onClick, level, testId, muted = false }: {
       className={cx(
         "flex w-full items-center rounded-md text-left transition-colors duration-[120ms]",
         level === 0 ? "min-h-10 px-3 text-[14px]" : "min-h-9 pl-6 pr-3 text-[13px]",
-        current ? "bg-surface-2 text-ink" : muted ? "text-ink-faint hover:bg-surface-2/60 hover:text-ink" : "text-ink-muted hover:bg-surface-2/60 hover:text-ink"
+        // The current row: filled, with an amber edge; hover only lifts the text and a faint tint, so it never
+        // looks like a second current row.
+        current
+          ? "bg-surface-2 text-ink shadow-[inset_2px_0_0_var(--color-voice)]"
+          : muted
+          ? "text-ink-faint hover:bg-surface-2/30 hover:text-ink"
+          : "text-ink-muted hover:bg-surface-2/30 hover:text-ink"
       )}
     >
       {children}
     </button>
+  )
+}
+
+/**
+ * What the marks mean: every mark shown in the list has an entry (visible text, since a `title` does not work on
+ * touch). Hidden from screen readers: each mark already says what it means.
+ */
+function MarksLegend({ tree, badges, className }: { readonly tree: ReadonlyArray<NavGroup>; readonly badges: NavBadges; readonly className?: string }) {
+  const kinds = shownMarks(tree, badges)
+  if (kinds.length === 0) return null
+  return (
+    <p className={cx("flex flex-wrap gap-x-4 gap-y-1.5 text-[12px] text-ink-muted", className)} aria-hidden="true" data-testid="marks-legend">
+      {kinds.map((k) => (
+        <span key={k} className="inline-flex items-center gap-1.5" data-legend={k}>
+          <Mark kind={k} />
+          {MARK_TEXT[k]}
+        </span>
+      ))}
+    </p>
   )
 }
 
@@ -79,17 +140,19 @@ export function SettingsNavList({ tree, group, page, badges, go }: {
   readonly go: (path: SettingsPath) => void
 }) {
   return (
-    <nav aria-label="Settings categories" className="flex flex-col gap-0.5" data-testid="settings-nav">
+    <>
+    <nav aria-label="Settings categories" className="flex min-h-0 flex-1 flex-col gap-0.5 overflow-y-auto px-3 py-4 scrollbar-quiet" data-testid="settings-nav">
       {tree.map((g) => {
         const open = g.slug === group?.slug
-        const { inUse, notInUse } = splitPages(g.pages)
+        const listed = g.pages.filter((p) => p.listed)
+        const { inUse, notInUse } = splitPages(listed)
         return (
           <div key={g.slug} className="flex flex-col gap-0.5">
-            <Row current={open && g.pages.length <= 1} level={0} onClick={() => go([g.slug])} testId={`nav-${g.slug}`}>
+            <Row current={open && listed.length <= 1} level={0} onClick={() => go([g.slug])} testId={`nav-${g.slug}`}>
               <span className="truncate">{g.title}</span>
               <Marks {...groupMarks(g, badges)} />
             </Row>
-            {open && g.pages.length > 1 && (
+            {open && listed.length > 1 && (
               <div className="mb-1 flex flex-col gap-0.5">
                 {inUse.map((p) => (
                   <Row key={p.id} current={p.id === page?.id} level={1} onClick={() => go([g.slug, p.id])} testId={`nav-${g.slug}-${p.id}`}>
@@ -110,6 +173,9 @@ export function SettingsNavList({ tree, group, page, badges, go }: {
         )
       })}
     </nav>
+    {/* Outside the scrolling list, so the last line of the legend is never cut off. */}
+    <MarksLegend tree={tree} badges={badges} className="shrink-0 border-t border-line/60 px-6 py-3" />
+    </>
   )
 }
 
@@ -141,13 +207,14 @@ export function SettingsCategoryList({ tree, badges, go }: { readonly tree: Read
           </DrillRow>
         ))}
       </ul>
+      <MarksLegend tree={tree} badges={badges} className="border-t border-line/60 px-5 py-4" />
     </nav>
   )
 }
 
 /** The phone's second level: a category's pages. */
 export function SettingsPageList({ group, badges, go }: { readonly group: NavGroup; readonly badges: NavBadges; readonly go: (path: SettingsPath) => void }) {
-  const { inUse, notInUse } = splitPages(group.pages)
+  const { inUse, notInUse } = splitPages(group.pages.filter((p) => p.listed))
   return (
     <nav aria-label={`${group.title} pages`} data-testid="settings-pages">
       <p className="px-5 pb-3 pt-1 text-[13px] text-ink-muted">{group.description}</p>

@@ -1,13 +1,15 @@
-import type { ClientMessage, InterruptMode, OutputPath, SettingsPatch, ToolId } from "@pva/protocol"
+import type { ClientMessage, DeviceProfile, FrontendKindId, FrontendRole, ProfilePatch, SettingsPatch, ToolId } from "@pva/protocol"
 import { createDiagnosticsStore, type DiagnosticsStore, type MicProcessing } from "./audio/diagnostics.ts"
+import { CUE_RATE, wakeCue } from "./audio/cue.ts"
 import { levels, markInterrupted } from "./audio/levels.ts"
 import { type Guard, guardOf } from "./audio/lifecycle.ts"
 import { describeMicError, MicFallbackError, type PlayerEvent, VoiceAudio } from "./audio/VoiceAudio.ts"
 import { type Connection, makeConnection, type RequestInput, type ResultMessage, resolveWsUrl } from "./connection.ts"
 import { EchoTestCancelled, runEchoTest } from "./echoTest.ts"
+import { deviceHello } from "./device.ts"
 import { createPrefsStore, type Prefs, type PrefsStore } from "./prefs.ts"
 import { navigateSettings, type SettingsPath } from "./settingsTree.ts"
-import type { ClientState } from "./state.ts"
+import { type ClientState, profileOf } from "./state.ts"
 import { type ClientStore, createClientStore } from "./store.ts"
 
 /**
@@ -15,13 +17,15 @@ import { type ClientStore, createClientStore } from "./store.ts"
  * and the connection, wired together. Components call these actions; nothing
  * here depends on React.
  */
-const processingOf = (p: Prefs): MicProcessing => ({
+const processingOf = (p: Pick<DeviceProfile, keyof MicProcessing>): MicProcessing => ({
   echoCancellation: p.echoCancellation,
   noiseSuppression: p.noiseSuppression,
   autoGainControl: p.autoGainControl
 })
 
 export interface AssistantClient {
+  /** Which front end this client serves: `voice` (`/`) or `admin` (`/admin/`, never claims audio). */
+  readonly frontend: FrontendRole
   readonly store: ClientStore
   readonly prefs: PrefsStore
   /** Microphone settings as reported and playback counters, for "This device". */
@@ -59,7 +63,22 @@ export interface AssistantClient {
   readonly downloadModel: (tool: ToolId, target: string) => Promise<ResultMessage>
   readonly cancelJob: (jobId: string) => Promise<ResultMessage>
   readonly deleteModel: (tool: ToolId, target: string) => Promise<ResultMessage>
+  /** This browser's own choices (microphone, speaker). */
   readonly setPrefs: (patch: Partial<Prefs>) => void
+  /**
+   * Voice: change this device's own profile (`voice`, `activation`, `followUpSeconds`). Shown at once and reconciled
+   * with the server's `device.profile`; reverted with a toast when refused.
+   */
+  readonly updateDevice: (patch: ProfilePatch, opts?: { readonly toast?: boolean }) => Promise<ResultMessage>
+  /** Admin: log in (the token is kept in `sessionStorage` for reloads and reconnects) and out. */
+  readonly adminLogin: (password: string) => Promise<ResultMessage>
+  readonly adminLogout: () => Promise<ResultMessage>
+  /** Admin: a front-end kind's defaults; a device's name and overrides; forget a device. `null` in a patch = inherit. */
+  readonly updateFrontend: (kind: FrontendKindId, patch: ProfilePatch) => Promise<ResultMessage>
+  readonly updateDeviceAdmin: (id: string, change: { readonly name?: string; readonly patch?: ProfilePatch }) => Promise<ResultMessage>
+  readonly forgetDevice: (id: string) => Promise<ResultMessage>
+  /** Admin: the phrase tester (`wake.heard` lines arrive while it is on). */
+  readonly wakeTest: (on: boolean) => Promise<ResultMessage>
   /**
    * Run the echo test and save its result in the preferences (with the output path it ran on). Rejects
    * (saving nothing) when audio is off, a test already runs, or the test is cancelled: End, a takeover, a
@@ -70,6 +89,24 @@ export interface AssistantClient {
 }
 
 const clientIdKey = "pva.clientId"
+/** The admin session token: per tab, gone when the tab closes (docs/FRONTENDS-AND-ACTIVATION.md §1). */
+export const ADMIN_TOKEN_KEY = "pva.adminToken"
+
+const readToken = (): string | undefined => {
+  try {
+    return globalThis.sessionStorage?.getItem(ADMIN_TOKEN_KEY) ?? undefined
+  } catch {
+    return undefined
+  }
+}
+const writeToken = (token: string | undefined) => {
+  try {
+    if (token === undefined) globalThis.sessionStorage?.removeItem(ADMIN_TOKEN_KEY)
+    else globalThis.sessionStorage?.setItem(ADMIN_TOKEN_KEY, token)
+  } catch {
+    // Storage disabled: the login lasts for this connection only.
+  }
+}
 
 const makeClientId = (): string => {
   try {
@@ -85,6 +122,8 @@ const makeClientId = (): string => {
 
 /** Local echo-test replies use ids the server never uses for turns, and are never reported. */
 const LOCAL_REPLY_ID = 0xffff_fff0
+/** The wake cue: another local id. */
+const CUE_REPLY_ID = LOCAL_REPLY_ID + 1
 
 /**
  * THE place a player event becomes a playback report to the server (or none).
@@ -115,7 +154,8 @@ export const playbackReport = (e: PlayerEvent, outputLatencyMs: number): ClientM
   }
 }
 
-export const createAssistantClient = (): AssistantClient => {
+export const createAssistantClient = (options: { readonly frontend?: FrontendRole } = {}): AssistantClient => {
+  const frontend: FrontendRole = options.frontend ?? "voice"
   const store = createClientStore()
   const prefs = createPrefsStore()
   const diagnostics = createDiagnosticsStore()
@@ -171,7 +211,7 @@ export const createAssistantClient = (): AssistantClient => {
     if (echoRun !== undefined) return connection.setMicGate(false)
     // Manual interrupt mode: nothing from the microphone while the assistant is audible.
     const s = store.get()
-    connection.setMicGate(!(s.audio.interruptMode === "manual" && s.audio.playing !== undefined))
+    connection.setMicGate(!(profileOf(s).interruptMode === "manual" && s.audio.playing !== undefined))
   }
 
   /**
@@ -226,6 +266,13 @@ export const createAssistantClient = (): AssistantClient => {
   const connection: Connection = makeConnection({
     url: typeof location === "undefined" ? "ws://localhost:8787/ws" : resolveWsUrl(location),
     clientId: typeof sessionStorage === "undefined" ? "c-server-render" : makeClientId(),
+    identity: () => {
+      if (frontend === "admin") {
+        const token = readToken()
+        return token === undefined ? { frontend } : { frontend, adminToken: token }
+      }
+      return typeof window === "undefined" ? { frontend } : { frontend, device: deviceHello() }
+    },
     store,
     audio: {
       replyStart: (turnId, rate) => {
@@ -244,7 +291,7 @@ export const createAssistantClient = (): AssistantClient => {
         if (resumed) {
           // The server assumes a live microphone on resume: tell it the truth.
           const s = store.get()
-          connection.send({ type: "audio.config", interruptMode: s.audio.interruptMode, audio: audio.info() })
+          connection.send({ type: "audio.config", audio: audio.info() })
           connection.send({ type: "mic.state", live: s.audio.micLive })
         } else if (audio.running && store.get().session.role !== "owner") {
           // Someone else claimed the audio while we were away.
@@ -252,6 +299,9 @@ export const createAssistantClient = (): AssistantClient => {
         }
       },
       afterMessage: (m, previousRole) => {
+        if (m.type === "admin.state" && !m.admin.loggedIn) writeToken(undefined)
+        if (m.type === "welcome" && frontend === "admin" && !m.snapshot.admin.loggedIn) writeToken(undefined)
+        if (m.type === "wake" && m.armed) playCue()
         if (m.type === "session" && previousRole === "owner" && m.role === "observer" && audio.running) {
           void releaseAudio("takeover") // taken over by another tab: close our microphone
         }
@@ -282,6 +332,7 @@ export const createAssistantClient = (): AssistantClient => {
   const info = () => audio.info()
 
   const startAudio = () => {
+    if (frontend === "admin") return // the admin page never claims the audio
     const phase = store.get().audio.phase
     if (phase === "starting") return
     if (!VoiceAudio.supported()) {
@@ -293,19 +344,20 @@ export const createAssistantClient = (): AssistantClient => {
       // show the phase it is really in.
       dispatch({ type: "local/audio", phase: audio.contextState === "running" ? "running" : "suspended" })
       connection.resetMicSequence()
-      connection.send({ type: "audio.claim", interruptMode: store.get().audio.interruptMode, audio: audio.info() })
+      connection.send({ type: "audio.claim", audio: audio.info() })
       return
     }
     const p = prefs.get()
+    const profile = profileOf(store.get())
     const g = nextGeneration()
     dispatch({ type: "local/audio", phase: "starting" })
     // Synchronous up to the first await inside: the context is created and resumed in the gesture.
     const started = audio.start({
       micDeviceId: p.micDeviceId,
       sinkId: p.sinkId,
-      outputPath: p.outputPath,
-      prebufferMs: p.prebufferMs,
-      processing: processingOf(p)
+      outputPath: profile.outputPath,
+      prebufferMs: profile.prebufferMs,
+      processing: processingOf(profile)
     })
     // continuation(generation): both outcomes act only if no End, takeover or newer Start came first.
     void started.then(
@@ -315,7 +367,7 @@ export const createAssistantClient = (): AssistantClient => {
         dispatch({ type: "local/mic", live: true })
         dispatch({ type: "local/audio", phase: audio.contextState === "running" ? "running" : "suspended" })
         connection.resetMicSequence()
-        connection.send({ type: "audio.claim", interruptMode: store.get().audio.interruptMode, audio: audioInfo })
+        connection.send({ type: "audio.claim", audio: audioInfo })
         requestWakeLock()
       },
       (error: unknown) => {
@@ -348,8 +400,9 @@ export const createAssistantClient = (): AssistantClient => {
     (e: unknown) => {
       if (!g.current()) return
       if (e instanceof MicFallbackError) {
-        // Audio goes on, on the previous (or default) microphone: make the settings say so.
-        prefs.dispatch({ micDeviceId: e.fallback.deviceId, ...e.fallback.processing })
+        // Audio goes on, on the previous (or default) microphone: make the settings say so. (The processing it fell
+        // back to is the profile's to decide; it is applied again on the next profile change.)
+        prefs.dispatch({ micDeviceId: e.fallback.deviceId })
         diagnostics.dispatch({ type: "mic", report: audio.micReport() })
       }
       dispatch({ type: "local/toast", message: e instanceof MicFallbackError ? e.message : describeMicError(e), tone: "error" })
@@ -375,22 +428,30 @@ export const createAssistantClient = (): AssistantClient => {
   }
 
   const sendText = (text: string) =>
-    connection.request({ type: "text.send", text, speak: owner() && audio.running && prefs.get().speakReplies })
+    connection.request({ type: "text.send", text, speak: owner() && audio.running && profileOf(store.get()).speakReplies })
 
   const setPrefs = (patch: Partial<Prefs>) => {
     const before = prefs.get()
     prefs.dispatch(patch)
     const after = prefs.get()
-    if (patch.interruptMode !== undefined) {
-      dispatch({ type: "local/interrupt-mode", mode: patch.interruptMode })
-      updateMicGate()
-    }
-    if (patch.prebufferMs !== undefined) audio.setPrebuffer(after.prebufferMs)
-    if (patch.outputPath !== undefined && patch.outputPath !== before.outputPath) audio.setOutputPath(after.outputPath as OutputPath)
     if (patch.sinkId !== undefined && patch.sinkId !== before.sinkId) void audio.setSink(after.sinkId).catch(() => undefined) // continuation(none): ignores the outcome
     const g = guard()
     if (patch.micDeviceId !== undefined && patch.micDeviceId !== before.micDeviceId) {
       void audio.setMicDevice(after.micDeviceId).then(...micChanged(g, () => diagnostics.dispatch({ type: "mic", report: audio.micReport() }))) // continuation(generation): `micChanged`
+    }
+  }
+
+  /**
+   * The browser's part of the device profile, applied live when it changes (an admin edit reaches a running device at
+   * once): the microphone re-opens when its processing changes, the output path and prebuffer switch, the interrupt
+   * mode moves the microphone gate (the server applies its own copy to the echo gate).
+   */
+  const applyProfile = (before: DeviceProfile, after: DeviceProfile) => {
+    if (after.interruptMode !== before.interruptMode) updateMicGate()
+    if (after.prebufferMs !== before.prebufferMs) audio.setPrebuffer(after.prebufferMs)
+    if (after.outputPath !== before.outputPath) {
+      audio.setOutputPath(after.outputPath)
+      if (owner() && audio.running) connection.send({ type: "audio.config", audio: info() })
     }
     const processing = processingOf(after)
     const processingBefore = processingOf(before)
@@ -399,17 +460,52 @@ export const createAssistantClient = (): AssistantClient => {
       processing.noiseSuppression !== processingBefore.noiseSuppression ||
       processing.autoGainControl !== processingBefore.autoGainControl
     ) {
-      // continuation(generation+state): `micChanged`; the interrupt mode is read when the configuration is sent
-      // (fifth review, finding 2: a mode chosen while the microphone reopened must not be overwritten by the
-      // one captured here).
+      const g = guard()
+      // continuation(generation+state): `micChanged`; the configuration is read when it is sent.
       void audio.setMicProcessing(processing).then(...micChanged(g, () => {
         diagnostics.dispatch({ type: "mic", report: audio.micReport() })
-        if (owner() && audio.running) connection.send({ type: "audio.config", interruptMode: prefs.get().interruptMode as InterruptMode, audio: info() })
+        if (owner() && audio.running) connection.send({ type: "audio.config", audio: info() })
       }))
     }
-    if ((patch.interruptMode !== undefined || patch.outputPath !== undefined) && owner() && audio.running) {
-      connection.send({ type: "audio.config", interruptMode: after.interruptMode as InterruptMode, audio: info() })
+  }
+  let appliedProfile: DeviceProfile = profileOf(store.get())
+  // continuation(state): runs synchronously on every store change and compares with the profile applied last.
+  store.subscribe(() => {
+    const next = store.get().device?.profile
+    if (next === undefined || next === appliedProfile) return
+    const before = appliedProfile
+    appliedProfile = next
+    applyProfile(before, next)
+  })
+
+  /**
+   * "Listening…" after the wake phrase alone: two short soft tones (under 200 ms, generated), through the player so it
+   * uses the chosen speaker. Not while a reply or the echo test plays, nor with speaking replies off or the mic muted.
+   */
+  const playCue = () => {
+    const s = store.get()
+    if (frontend !== "voice" || !owner() || !audio.running || audio.contextState !== "running") return
+    if (!s.audio.micLive || !profileOf(s).speakReplies || s.audio.playing !== undefined || echoRun !== undefined) return
+    const open = audio.openReply()
+    if (open !== undefined && open < LOCAL_REPLY_ID) return
+    audio.playLocal(CUE_REPLY_ID, CUE_RATE, wakeCue())
+  }
+
+  /**
+   * This device's own profile change (`device.update`), shown at once. A refusal puts the shown value back and, unless
+   * `toast: false` (the settings sheet shows it next to the control instead), raises a toast.
+   */
+  const updateDevice = async (patch: ProfilePatch, opts: { readonly toast?: boolean } = {}): Promise<ResultMessage> => {
+    const shown: Partial<DeviceProfile> = {}
+    for (const [k, v] of Object.entries(patch)) if (v !== null) (shown as Record<string, unknown>)[k] = v
+    dispatch({ type: "local/profile-overlay", patch: shown })
+    const result = await connection.request({ type: "device.update", patch }) // continuation(state): the overlay is the store's; cleared on refusal
+    if (!result.ok) {
+      dispatch({ type: "local/profile-overlay-clear" })
+      if (opts.toast !== false) dispatch({ type: "local/toast", message: result.error?.message ?? "The change was not saved.", tone: "error" })
     }
+    // Accepted: the overlay stays until the server's `device.profile` replaces it (the server may correct a value).
+    return result
   }
 
   // ---- Screen wake lock while this tab owns the audio ----
@@ -436,7 +532,6 @@ export const createAssistantClient = (): AssistantClient => {
 
   const connect = () => {
     prefs.load()
-    dispatch({ type: "local/interrupt-mode", mode: prefs.get().interruptMode })
     const stop = connection.start()
     // continuation(none): acts on the present state when the page becomes visible.
     const onVisible = () => {
@@ -460,7 +555,19 @@ export const createAssistantClient = (): AssistantClient => {
     }
   }
 
+  const adminLogin = async (password: string) => {
+    const result = await connection.request({ type: "admin.login", password }) // continuation(none): stores the token of its own answer
+    if (result.ok && result.admin !== undefined) writeToken(result.admin.token)
+    return result
+  }
+  const adminLogout = async () => {
+    const result = await connection.request({ type: "admin.logout" }) // continuation(none): forgets the token whatever happened
+    writeToken(undefined)
+    return result
+  }
+
   return {
+    frontend,
     store,
     prefs,
     connection,
@@ -496,6 +603,19 @@ export const createAssistantClient = (): AssistantClient => {
     cancelJob: (jobId) => connection.request({ type: "job.cancel", jobId }),
     deleteModel: (tool, target) => connection.request({ type: "model.delete", tool, target }),
     setPrefs,
+    updateDevice,
+    adminLogin,
+    adminLogout,
+    updateFrontend: (kind, patch) => connection.request({ type: "frontend.update", kind, patch }),
+    updateDeviceAdmin: (id, change) =>
+      connection.request({
+        type: "device.admin.update",
+        id,
+        ...(change.name !== undefined ? { name: change.name } : {}),
+        ...(change.patch !== undefined ? { patch: change.patch } : {})
+      }),
+    forgetDevice: (id) => connection.request({ type: "device.forget", id }),
+    wakeTest: (on) => connection.request({ type: "wake.test", on }),
     diagnostics,
     echoTest: async () => {
       if (!audio.running) throw new Error("Start audio first.")
@@ -506,9 +626,9 @@ export const createAssistantClient = (): AssistantClient => {
       }
       const g = guard()
       const mine = { preempted: false }
-      const outputPath = prefs.get().outputPath
+      const outputPath = profileOf(store.get()).outputPath
       /** Cancelled: a new generation (End, takeover, failure, Start), or another output path than the one tested. */
-      const stale = () => !g.current() || echoRun !== mine || !audio.running || prefs.get().outputPath !== outputPath
+      const stale = () => !g.current() || echoRun !== mine || !audio.running || profileOf(store.get()).outputPath !== outputPath
       echoRun = mine
       updateMicGate()
       let listener: ((e: PlayerEvent) => void) | undefined

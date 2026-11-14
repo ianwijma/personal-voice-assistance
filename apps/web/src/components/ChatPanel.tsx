@@ -4,17 +4,24 @@ import { Composer } from "./Composer.tsx"
 import { useClient, useClientState } from "./context.tsx"
 import { MessageList } from "./MessageList.tsx"
 import { PanelHeader, useDialog } from "./ui/Panel.tsx"
+import { useKeyboardInset } from "./useKeyboardInset.ts"
+import { useMediaQuery, WIDE_QUERY } from "./useMediaQuery.ts"
 
 /**
- * The conversation: a popover in the bottom right on desktop, a right sheet on
- * tablets, a bottom sheet on phones.
+ * The conversation: a popover in the bottom right on desktop (not modal: Tab goes on to the page, so mute and stop
+ * stay in reach), a right sheet on tablets and a bottom sheet on phones (modal: focus is kept inside, the page behind
+ * is inert).
  */
 export function ChatPanel() {
   const client = useClient()
   const open = useClientState((s) => s.ui.chatOpen)
   const ref = useRef<HTMLElement>(null)
   const close = () => client.store.dispatch({ type: "local/ui", patch: { chatOpen: false } })
-  useDialog(ref, open, close, "#chat-input")
+  const modal = !useMediaQuery(WIDE_QUERY)
+  useDialog(ref, open, close, "#chat-input", { trap: modal })
+  // Phone: the bottom sheet rides above the on-screen keyboard and shrinks to fit what is left.
+  const inset = useKeyboardInset()
+  const lift = inset > 0 && typeof window !== "undefined" && window.innerWidth < 640
   if (!open) return null
   return (
     <>
@@ -22,8 +29,10 @@ export function ChatPanel() {
       <aside
         ref={ref}
         role="dialog"
+        aria-modal={modal || undefined}
         aria-labelledby="chat-title"
         data-testid="chat-panel"
+        style={lift ? { bottom: inset, height: `min(85dvh, calc(100dvh - ${inset + 16}px))` } : undefined}
         className={[
           "fixed z-40 flex flex-col overflow-hidden border-line bg-surface shadow-panel",
           // phone: bottom sheet
