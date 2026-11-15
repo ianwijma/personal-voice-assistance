@@ -4,7 +4,7 @@ How to design and build the thing on the voice stage that shows the assistant is
 
 This is a living document. Update it whenever a character is added, the contract gains something, or a rule turns out wrong. The investigation that produced the first set of characters is in `docs/research/visualiser-investigation/` (findings, prior art and a runnable lab with 19 prototypes); this document holds what should outlast it.
 
-**Status (2026-11-16).** The contract described here exists as a prototype in the lab (`docs/research/visualiser-investigation/lab/src/contract.ts`), where a character is called a *design*. The app itself still draws the three sine lines of `apps/web/src/lib/visualiser.ts`. Sections 3 to 5 are the rules the app's implementation must follow; where the lab already does something, it says so, and where it does not yet, it says "not built".
+**Status (2026-11-16).** The groundwork is in the app: the contract (`apps/web/src/characters/contract.ts`), the host that runs one character on the voice stage (`host.ts`), the feature extractor, kit, options and the shared helpers brought over from the lab, the registry, the baseline character (the sine lines, `library/sine-lines.ts`) and the compatibility tests of §6. Only the baseline is in the library so far; the 18 prototypes of the investigation (`docs/research/visualiser-investigation/`, where a character is called a *design*) are to be ported one file each (§7). The lab stays as a frozen research snapshot with its own copies. Extensions (§4.2, §5) are designed but none exists yet, and there is no settings page (§4.4). Port authors start at `apps/web/src/characters/README.md`.
 
 ## 1. What a character is
 
@@ -98,21 +98,22 @@ A figure can do what an abstract form cannot: show attention. It also fails in w
 
 ## 3. The manifest
 
-What a character declares about itself. In the lab this is the `Design` object.
+What a character declares about itself: the `Character` object in `apps/web/src/characters/contract.ts` (in the lab, the `Design` object). The host checks it on every load (`manifest.ts`) and refuses a character whose manifest is incomplete; the compatibility tests check it too (§6.7).
 
-| Field | Meaning | Lab |
+| Field | Meaning | Where it is used |
 |---|---|---|
-| `id` | Stable kebab-case identifier. Never reused for a different character. Stored in device profiles. | yes |
-| `name`, `summary`, `inspiredBy` | For the picker. | yes |
-| `family` | `abstract` or `figure` (the lab calls figures `character`). | yes |
-| `version` | Semantic version of the character itself (§4.5). | not built |
-| `contract` | The contract major version it was written against, e.g. `1`. | not built |
-| `renderer` | What it draws with: `2d`, `webgl2`. A host skips renderers it does not offer. | yes |
-| `modes` | One line per mode it draws: the five core modes always, plus any extra modes it opts into (§4.3). | core modes only |
-| `mappings` | Signal → effect pairs. | yes |
-| `options` | The settings it offers (§4.4). | yes |
-| `uses` | Optional inputs it can take advantage of (§4.2), each with what it does without them. | as free text (`serverNeeds`) |
-| `create(canvas)` | Returns an instance with `resize`, `frame`, `dispose`. | yes |
+| `id` | Stable kebab-case identifier, equal to the file name. Never reused for a different character. Stored in the choice. | Registry, choice, host |
+| `name`, `summary`, `inspiredBy` | For a future picker. | Manifest check only, until there is a picker |
+| `family` | `baseline`, `abstract` or `figure` (the lab calls figures `character`). | Manifest check |
+| `version` | Semantic version of the character itself (§4.5). | Manifest check; stored with the choice |
+| `contract` | The contract major version it was written against: `1`. | Host refuses a version it does not serve |
+| `renderer` | What it draws with: `2d`, `webgl2`. | Host gives a `webgl2` character a canvas of its own; refuses a renderer it does not serve |
+| `modes` | One line per core mode. | Manifest check |
+| `extraModes` | The extra modes it draws itself (§4.3), one line each. | Host's mode resolution |
+| `mappings` | Signal → effect pairs. | Manifest check (the promises; shown in a future picker) |
+| `options` | The settings it offers (§4.4). | Host validates stored values on every load |
+| `uses` | Optional inputs it can take advantage of (§4.2), each with what it gains and what it does without them. | Manifest check; the host will use it to decide what to produce once extensions exist |
+| `create(canvas)` | Returns an instance with `resize`, `frame`, `dispose`. | Host |
 
 ## 4. Compatibility
 
@@ -183,11 +184,11 @@ Modes say *what the assistant is doing*. They are not the place for *how it feel
 | **Character draws only core modes** | works | works: is handed the fallback |
 | **Character draws extra modes** | works: those modes never occur | works: is handed them |
 
-The lab has only the five core modes.
+The app's extra modes are `asleep`, `muted`, `not-started`, `disconnected` and `error`, all falling back to `idle` (`EXTRA_MODES` in the contract). The application's visual state (`visualState` in `apps/web/src/lib/state.ts`) is exactly a `Mode`; `Visualiser.tsx` fails to compile if the two drift apart. The resolution is `resolveMode` in `runner.ts`. The baseline declares all five extra modes; the lab prototypes declare none.
 
 ### 4.4 Options
 
-A character's settings are data: the character declares them, the host renders the controls, validates and stores the values. Built in the lab (`lab/src/options.ts`, `optionStore.ts`).
+A character's settings are data: the character declares them, the host renders the controls, validates and stores the values. Validation is `apps/web/src/characters/options.ts` (from the lab); the host runs it on every load. There are no controls yet (see the end of this section).
 
 Stored form, as it will go into a device profile:
 
@@ -212,22 +213,22 @@ Rules for the **character author**:
 - No option may switch off the thing that distinguishes a mode (for example the marks that make hearing differ from listening).
 - Values glide when changed and snap under reduced motion.
 
-**Reserved ids**, with fixed meaning across all characters, so settings carry over when the person switches character:
+**Reserved ids**, with fixed meaning across all characters, so settings carry over when the person switches character. A character need not offer them; when it does, it uses the kind below and a default that is the designed look (1 for a number, on for a toggle). `RESERVED_OPTIONS` in `options.ts`; the compatibility tests enforce it.
 
-| id | Meaning |
-|---|---|
-| `size` | Overall size, 1 = designed size. |
-| `speed` | Speed of ambient motion, 1 = designed speed. |
-| `glow` | Amount of glow or halo. |
-| `expressiveness` | Figures: size of nods, tilts, bounces, flinches. |
-| `liveliness` | Figures: how often it blinks and shifts gaze. |
-| `mouthRange` | Figures with a mouth: how far it opens. |
-| `nods` | Figures: nods along at phrase ends. |
-| `followsPointer` | Figures with eyes: gaze follows the pointer. |
+| id | Kind | Meaning |
+|---|---|---|
+| `size` | number | Overall size, 1 = designed size. |
+| `speed` | number | Speed of ambient motion, 1 = designed speed. |
+| `glow` | number, or toggle | Amount of glow or halo, 1 = designed; a toggle where the character has a single glow to switch (the baseline does). |
+| `expressiveness` | number | Figures: size of nods, tilts, bounces, flinches. |
+| `liveliness` | number | Figures: how often it blinks and shifts gaze. |
+| `mouthRange` | number | Figures with a mouth: how far it opens. |
+| `nods` | toggle | Figures: nods along at phrase ends. |
+| `followsPointer` | toggle | Figures with eyes: gaze follows the pointer. |
 
-**Where a person chooses and tunes a character is not decided.** The admin UI is being reorganised around assistants and devices (`docs/ASSISTANTS.md`, in progress on its own branch), and a character most likely belongs to an assistant, with a device able to override it. Until that lands there is no settings page for characters: the choice is a per-browser preference, and the stored form above is what any later settings page will read and write. Nothing in a character depends on where its settings are kept.
+**Where a person chooses and tunes a character is not decided.** The admin UI is being reorganised around assistants and devices (`docs/ASSISTANTS.md`, in progress on its own branch), and a character most likely belongs to an assistant, with a device able to override it. Until that lands there is no settings page for characters: the choice is a per-browser preference (`Prefs.character` in `apps/web/src/lib/prefs.ts`, a `CharacterChoice`, absent = the baseline), and the stored form above is what any later settings page will read and write. Nothing in a character depends on where its settings are kept. To try a character, open the voice page with `?character=<id>` and any number of `&opt.<id>=<value>` (the lab's syntax): this sets the preference for this browser and the parameters then leave the address bar. Values from the address bar are stored as given (strings) and validated on load like any other.
 
-Three settings belong to the host, not to any character, and apply to all: the person's colour, the assistant's colour, and sensitivity (a multiplier on loudness signals). A character must not duplicate them.
+Three settings belong to the host, not to any character, and apply to all: the person's colour, the assistant's colour, and sensitivity (a multiplier on loudness signals). A character must not duplicate them. They are stored next to the character's own options under the keys `$you`, `$voice` and `$sensitivity` (as in the lab). When the host falls back to the baseline it keeps these three and none of the failed character's own options.
 
 ### 4.5 Versions
 
@@ -237,8 +238,10 @@ Three settings belong to the host, not to any character, and apply to all: the p
 
 ### 4.6 Isolation and failure
 
-- A character that throws, or that exceeds its frame budget persistently, is stopped and replaced by the baseline character (the sine lines). The conversation is never affected: audio does not depend on the stage. The lab already isolates failures per instance.
-- A character is loaded on demand as its own chunk (4 to 9 KB gzipped each in the investigation), so adding characters does not grow the page for people who do not use them.
+- A character that fails to load, has an incomplete manifest, is written for a contract version or renderer the host does not serve, throws in `create`, `resize` or `frame`, or exceeds its frame budget persistently, is disposed and replaced by the baseline character (the sine lines) for the rest of the page's life, with one console warning. An unknown id in the choice also shows the baseline; the stored choice is never changed by the host. The conversation is never affected: audio does not depend on the stage.
+- **Persistently** (`host.ts`): the mean `frame()` cost over a window of 120 measured frames, each frame counted at most 16 ms (so one long pause cannot do it), is above 4 ms (twice the 2 ms budget of §2.4) in 3 consecutive windows, about 6 s at 60 Hz. The first 30 frames after a character starts, after a resize and after the tab comes back from the background are not measured, and a return from the background starts the count again. The baseline is never stopped for its cost.
+- A character is loaded on demand as its own chunk (4 to 9 KB gzipped each in the investigation; the registry's loaders are plain `import()`s, `scripts/build-characters.mjs`), so adding characters does not grow the page for people who do not use them. Whatever is on stage stays until the next character is ready (the baseline at page load); the swap happens inside one task, so there is no blank frame.
+- The host reads the current state through `window.__pvaStage.debug()` (character on stage, fallback and why, mean frame and feature cost), for tests and the console.
 - A character has no access to audio, the socket, storage or application state. It cannot slow the audio path, which is what the latency budget in `docs/ARCHITECTURE.md` protects.
 - The baseline character is part of the host and has no extensions and no options that can fail. There is always something to fall back to.
 
@@ -286,27 +289,37 @@ A voice node with a small screen, an LED matrix or a light ring is a new **rende
 
 ## 6. Tests that keep the promise
 
-Compatibility is kept by tests, not by intention. For every character in the application (not built; the lab has the option validation tests and per-design visual checks):
+Compatibility is kept by tests, not by intention. `apps/web/test/characters/compat.test.ts` runs the suite of `test/characters/support/compat.ts` against every character the registry finds, so a new character gets it by existing. The voices are the lab's formant synthesiser (`support/synth.ts`) played through the real feature extractor the way the host feeds it; the drawing goes to a recording fake canvas (`support/fakeCanvas.ts`: jsdom has none), which folds every call into a hash, so two runs can be compared exactly. Each run uses a freshly evaluated module, so per-page state (a figure's instance counter) starts the same. The numbered checks:
 
-1. **Core only**: run a scripted conversation with no `ext` and only the five core modes. It must not throw and must draw something different in each of the five modes.
-2. **Everything**: the same with every known extension present.
-3. **The unknown**: an extension name that does not exist, a known extension with a version one higher than known, and an application mode the character did not declare (the host must hand it the fallback). Output must equal the core-only run.
-4. **Appearing and disappearing**: extensions that come and go mid-reply. No throw.
-5. **Options**: every option at minimum and maximum, all together; stored values from every earlier version of the character, plus garbage, go through the host's validation and produce a working character.
-6. **Defaults are stable**: a recording of the drawing calls at default settings, compared against the previous release of the same character version line. This is how the investigation proved that adding options changed nothing by default.
-7. **Budget**: mean frame time at the heaviest settings under 2 ms.
+1. **Core only**: a scripted conversation with no `ext` and only the five core modes; each core mode pinned for 2 s. No throw, and the last frame differs between every pair of the five modes.
+2. **Extra modes**: every mode of `EXTRA_MODES` pinned: it draws, and one the character did not declare draws exactly what its fallback draws.
+3. **The unknown**: an extension name that does not exist and known-looking names with a version far too high, present throughout and then coming and going: no throw, and output equal to the core-only run. (There are no known extensions yet, so "every known extension present" is not tested; add it with the first extension.)
+4. **Options**: every option at minimum and at maximum together (host-level settings included) at the smallest cell, the largest stage and a 2× stage; every choice value; garbage stored values: validation gives a complete set and the character runs.
+5. **Reduced motion**: each core mode pinned with silent input: two frames a second apart are identical.
+6. **Defaults are stable**: a digest of the drawing calls every 0.5 s of the conversation at default settings, in both themes, plus how far solid drawing reaches past the canvas edge at the three sizes, is stored per character in `test/characters/__snapshots__/<id>.digest` (written on the first run; a change must be deliberate: check the look, then update with `-u`).
+7. **Manifest**: the checks of `manifest.ts` (id equals the file name, version is semver, contract is served, extra modes exist, `uses` entries complete, options valid, reserved ids with their kind and default).
+8. **Cost**: the mean `frame()` time over the conversation on the recording canvas stays under 20 ms. This only catches pathological cost; the real budget (2 ms, §2.4) is measured in the page (`window.__pvaStage.debug().frameMs`). No allocation per frame is not asserted.
 
-A contract change is accepted only when the full set of existing characters passes 1, 5, 6 and 7 without being edited.
+Also: `test/characters/isolation.test.ts` checks that files under `library/` and `shared/` import only the contract, the kit and the shared modules and name no page or network globals; `host.test.ts` covers loading, swapping, mode resolution, option validation on load and every fallback; `baseline.test.ts` checks the baseline's look in every visual state.
+
+Run against the 18 lab prototypes (wrapped with a version and contract) before they were ported, every check passes except (5) for aurora-ribbons (listening), cloud-orb (idle; the WebGL fake records its uniforms, so it may be a time uniform the shader ignores) and pitch-ink (listening; by design its pen keeps writing under reduced motion). Drawing past the canvas edge, recorded in (6), is 0 to 2 px for most, and up to 11 px (pitch-ink, light-ring at the small cell), 40 px (liquid-blob, light-ring on the large stage), 209 px (flame's sparks) and 304 px (particle-sphere's particles) at default settings: these are recorded, not judged, because particles and sparks may leave the frame on purpose, and a bounding box of path points cannot tell a visible overflow from one that fades out.
+
+A contract change is accepted only when the full set of existing characters passes 1, 4, 6 and 8 without being edited.
 
 ## 7. Adding a character: the short version
 
 1. Read §2 and look at the prototypes in the lab for the family closest to your idea.
-2. Write one file exporting the manifest and `create`. Use only the core frame first.
+2. Add one file, `apps/web/src/characters/library/<id>.ts`, default-exporting the `Character` (manifest and `create`). It may import `../contract.ts`, `../kit.ts` and `../shared/*.ts`, nothing else. Use only the core frame first. That file is the whole registration: `scripts/build-characters.mjs` lists the library before dev, build, check and test.
 3. Make the five modes read from stills in both themes. Then make voices tellable. Then add options.
 4. Add optional extension support last, each with its fallback.
-5. Run the checklist (§2.5) and the tests (§6). Register it with one line.
-6. Add it to the list below.
+5. Run the tests: `pnpm --filter @pva/web exec vitest run test/characters/compat.test.ts -t '"<id>"'`. The first run writes `test/characters/__snapshots__/<id>.digest`; commit it with the character. Then `pnpm check` and `pnpm test`.
+6. Look at it in the app (`pnpm --filter @pva/web dev:mock`, then `?character=<id>`; the README in `apps/web/src/characters/` has the recipe for every visual state and for screenshots), and run the checklist (§2.5).
+7. Add it to the list below.
 
 ## 8. Characters
 
-None in the application yet beyond the baseline sine lines. The 18 prototypes and the recommendation of which to build first are in `docs/research/visualiser-investigation/README.md`.
+| id | Family | Since | Notes |
+|---|---|---|---|
+| `sine-lines` | baseline | 1.0.0 | The default and the fallback; bundled with the host; draws every extra mode. |
+
+The 18 prototypes and the recommendation of which to build first are in `docs/research/visualiser-investigation/README.md`.

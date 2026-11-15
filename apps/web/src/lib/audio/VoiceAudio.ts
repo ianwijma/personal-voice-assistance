@@ -14,6 +14,9 @@ import { type InheritedReply, PlaybackLink, type PlaybackRoute, type PlayerPort,
  * changes listed in apps/web/README.md.
  */
 
+/** The capture worklet's output rate (the microphone frames sent to the server and kept in `levels.mic`). */
+const CAPTURE_RATE = 16_000
+
 export type PlayerEvent =
   | { readonly type: "started"; readonly id: number; readonly startDelayMs: number }
   | { readonly type: "progress"; readonly id: number; readonly playedSamples: number; readonly underruns: number }
@@ -319,7 +322,7 @@ export class VoiceAudio {
         numberOfInputs: 1,
         numberOfOutputs: 1,
         outputChannelCount: [1],
-        processorOptions: { targetRate: 16_000 }
+        processorOptions: { targetRate: CAPTURE_RATE }
       })
       const silent = ctx.createGain()
       silent.gain.value = 0
@@ -335,7 +338,7 @@ export class VoiceAudio {
       this.capture.port.onmessage = (e: MessageEvent<ArrayBuffer>) => {
         if (!current()) return
         const buffer = e.data
-        pushMicFrame(new Int16Array(buffer, 8))
+        pushMicFrame(new Int16Array(buffer, 8), performance.now(), CAPTURE_RATE)
         this.events.onMicFrame(buffer)
       }
       this.connectMic()
@@ -344,7 +347,9 @@ export class VoiceAudio {
       // publishes its live count into shared memory where the page may have it (cross-origin isolated),
       // otherwise by message (see `playback.ts`, `createPlayer`).
       this.analyser = ctx.createAnalyser()
-      this.analyser.fftSize = 1024
+      // 2048 samples is 43 ms at 48 kHz: the stage's feature extractor needs about 40 ms for pitch. The size only
+      // changes what the tap reports when read (on the main thread); the audio passes through unchanged.
+      this.analyser.fftSize = 2048
       this.analyser.smoothingTimeConstant = 0.5
       this.createPlayer(ctx, SharedCounter.available(), ROUTE_REASONS.notIsolated)
       this.routeOutput()
