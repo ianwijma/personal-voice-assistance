@@ -6,7 +6,9 @@
 import {
   Conversation,
   type LlmRequest,
+  makeRouteGate,
   makeWakeGate,
+  type RouteConfig,
   type SttEvent,
   ToolRegistry,
   type Trace,
@@ -67,6 +69,11 @@ export interface OfflineScenario {
    * In `wake-phrase` mode every utterance starts with `wakePrefix` ("Hey Jeff, …"), which the gate removes.
    */
   readonly wake?: WakeConfig
+  /**
+   * The route gate (docs/ASSISTANTS.md §3.4) instead of the wake gate. Every utterance starts with `wakePrefix`
+   * (when set), which the gate removes; whichever assistant it picks, the one `Conversation` answers.
+   */
+  readonly route?: RouteConfig
   readonly wakePrefix?: string
 }
 
@@ -110,7 +117,7 @@ const respond = (delays: SimulatedDelays) => (request: LlmRequest): LlmScript =>
 
 /** What the STT stand-in emits for one turn. */
 const sttEvents = (turn: ScriptedTurn, scenario: OfflineScenario): Array<SttEvent | Sleep> => {
-  const prefix = scenario.wake?.activation === "wake-phrase" ? scenario.wakePrefix ?? "" : ""
+  const prefix = scenario.wake?.activation === "wake-phrase" || scenario.route !== undefined ? scenario.wakePrefix ?? "" : ""
   if (prefix !== "") {
     turn = { ...turn, user: `${prefix}${turn.user}`, ...(turn.falseStart !== undefined ? { falseStart: `${prefix}${turn.falseStart}` } : {}) }
   }
@@ -159,7 +166,8 @@ const runSession = (
     )
     const turns = Array.from({ length: rounds + 1 }, (_, round) => script.map((turn) => ({ round, turn }))).flat()
     // Serve mode's wake gate, on the events as they arrive (time passed in, as there).
-    const wake = makeWakeGate(scenario.wake ?? WAKE_ALWAYS)
+    const route = scenario.route === undefined ? undefined : makeRouteGate(scenario.route)
+    const wake = route ?? makeWakeGate(scenario.wake ?? WAKE_ALWAYS)
     const gated = (events: Stream.Stream<SttEvent>) =>
       events.pipe(Stream.flatMap((event) => Stream.fromIterable(wake.filter(event, performance.now()).events)))
     const rows: Array<BenchRow> = []

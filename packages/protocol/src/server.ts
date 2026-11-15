@@ -1,6 +1,7 @@
 import { Schema } from "effect"
 import {
   AssistantState,
+  ErrorCode,
   ErrorInfo,
   ModuleId,
   NonNegativeFinite,
@@ -11,8 +12,10 @@ import {
   TurnSource
 } from "./common.ts"
 import { AdminSession, AdminState } from "./admin.ts"
+import { AssistantErrorCode, AssistantId } from "./assistants.ts"
+import { AssistantInfo, DeviceRecordInfo, DeviceSetup, DeviceTypeInfo } from "./devices.ts"
 import { DeviceId, DeviceInfo, DeviceProfileInfo, FrontendKindInfo, WakePhrase } from "./frontends.ts"
-import { AdminSnapshot, EngineStatus, EngineSummary, ModuleInfo, SettingsSection, Snapshot, TraceInfo } from "./snapshot.ts"
+import { AdminSnapshot, EngineStatus, EngineSummary, HistoryItem, ModuleInfo, SettingsSection, Snapshot, TraceInfo } from "./snapshot.ts"
 import { EnvInfo } from "./env.ts"
 import { JobInfo, ModelSet } from "./jobs.ts"
 import { VaultInfo } from "./vault.ts"
@@ -74,7 +77,9 @@ export const TurnStart = Schema.Struct({
   source: TurnSource,
   userText: Schema.String,
   /** The reply will be spoken (voice turns, and typed turns from the audio owner with `speak`). */
-  spoken: Schema.Boolean
+  spoken: Schema.Boolean,
+  /** Protocol 7: the assistant answering. */
+  assistantId: Schema.optionalKey(AssistantId)
 })
 
 /**
@@ -88,7 +93,9 @@ export const AssistantText = Schema.Struct({
   clause: Schema.NullOr(NonNegativeInt),
   text: Schema.String,
   /** The voice speaking this clause (spoken turns only). */
-  voice: Schema.optionalKey(Schema.String)
+  voice: Schema.optionalKey(Schema.String),
+  /** Protocol 7: the assistant answering. */
+  assistantId: Schema.optionalKey(AssistantId)
 })
 
 /** Clauses up to and including `clause` have started playing in the owner's browser. */
@@ -131,7 +138,9 @@ export const TurnEnd = Schema.Struct({
 export const ReplyStart = Schema.Struct({
   type: Schema.Literal("reply.start"),
   turnId: TurnId,
-  sampleRate: Schema.Int.check(Schema.isBetween({ minimum: 8000, maximum: 96_000 }))
+  sampleRate: Schema.Int.check(Schema.isBetween({ minimum: 8000, maximum: 96_000 })),
+  /** Protocol 7: the assistant whose voice this is. */
+  assistantId: Schema.optionalKey(AssistantId)
 })
 
 /** Audio owner only: every frame of the reply has been sent. */
@@ -261,7 +270,9 @@ export const Devices = Schema.Struct({
 export const Wake = Schema.Struct({
   type: Schema.Literal("wake"),
   phrase: WakePhrase,
-  armed: Schema.Boolean
+  armed: Schema.Boolean,
+  /** Protocol 7: the assistant the phrase belongs to. */
+  assistantId: Schema.optionalKey(AssistantId)
 })
 
 /**
@@ -293,7 +304,9 @@ export const Conversation = Schema.Struct({
   id: ConversationId,
   reason: ConversationReason,
   /** Epoch milliseconds when it started. */
-  startedAt: NonNegativeFinite
+  startedAt: NonNegativeFinite,
+  /** Protocol 7: whose conversation (one per assistant per device). */
+  assistantId: Schema.optionalKey(AssistantId)
 })
 
 /**
@@ -370,3 +383,65 @@ export const ServerMessage = Schema.Union([
 export type ServerMessage = typeof ServerMessage.Type
 export type ServerMessageType = ServerMessage["type"]
 export type ServerMessageOf<T extends ServerMessageType> = Extract<ServerMessage, { readonly type: T }>
+
+// -- Protocol 7 (docs/ASSISTANTS.md §5.3, §5.4): schemas only. Kept out of `ServerMessage` until the version bump, so
+// nothing that switches over `ServerMessage` changes. `AssistantsServerMessage` is the union to merge then; two of its
+// tags (`result`, `devices`) replace the protocol 5/6 messages of the same name and cannot sit in one union with them.
+
+/** The voice connection's device setup (replaces `device.profile`; also `snapshot.setup`). */
+export const DeviceSetupMessage = Schema.Struct({
+  type: Schema.Literal("device.setup"),
+  ...DeviceSetup.fields
+})
+
+/** Answer to `conversation.read`, also the other assistants' history on demand. */
+export const ConversationHistory = Schema.Struct({
+  type: Schema.Literal("conversation.history"),
+  requestId: RequestId,
+  assistantId: AssistantId,
+  id: ConversationId,
+  history: Schema.Array(HistoryItem)
+})
+
+/** Admin connections only: the whole list of assistants, order kept. */
+export const AssistantsMessage = Schema.Struct({
+  type: Schema.Literal("assistants"),
+  assistants: Schema.Array(AssistantInfo)
+})
+
+/** Admin connections only: the device types and their defaults (replaces `frontends`). */
+export const DeviceTypesMessage = Schema.Struct({
+  type: Schema.Literal("device.types"),
+  types: Schema.Array(DeviceTypeInfo)
+})
+
+/** Admin connections only: the devices (protocol 7 shape; replaces the protocol 5 `devices`). */
+export const DevicesV7Message = Schema.Struct({
+  type: Schema.Literal("devices"),
+  devices: Schema.Array(DeviceRecordInfo)
+})
+
+/** `result` with the protocol 7 error codes and `assistantId` (a successful `assistant.create`). */
+export const AssistantResultMessage = Schema.Struct({
+  type: Schema.Literal("result"),
+  requestId: RequestId,
+  ok: Schema.Boolean,
+  error: Schema.optionalKey(Schema.Struct({
+    ...ErrorInfo.fields,
+    code: Schema.Union([ErrorCode, AssistantErrorCode])
+  })),
+  admin: Schema.optionalKey(AdminSession),
+  assistantId: Schema.optionalKey(AssistantId)
+})
+
+/** The protocol 7 server messages that are new or changed. */
+export const AssistantsServerMessage = Schema.Union([
+  DeviceSetupMessage,
+  ConversationHistory,
+  AssistantsMessage,
+  DeviceTypesMessage,
+  DevicesV7Message,
+  AssistantResultMessage
+]).pipe(Schema.toTaggedUnion("type"))
+export type AssistantsServerMessage = typeof AssistantsServerMessage.Type
+export type AssistantsServerMessageType = AssistantsServerMessage["type"]
