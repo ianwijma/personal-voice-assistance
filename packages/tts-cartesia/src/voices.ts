@@ -14,7 +14,7 @@ export interface CartesiaVoicesOptions {
   readonly baseUrl?: string
   /** For previews. Default `DEFAULT_MODEL`. */
   readonly model?: string
-  /** `language` for previews (`CARTESIA_LANGUAGE`); empty = unset. */
+  /** The `CARTESIA_LANGUAGE` override; empty = unset (a preview then uses the voice's own language, else `en`). */
   readonly language?: string
   /** Preview rate (8000, 16000, 22050, 24000, 44100 or 48000). Default 24000. */
   readonly sampleRate?: number
@@ -120,7 +120,37 @@ export const describeVoice = (raw: unknown): VoiceDescription | undefined => {
   }
 }
 
-export const makeVoices = (options: CartesiaVoicesOptions): TtsVoices["Service"] => {
+/**
+ * A language as Cartesia's speech API takes it: the bare code (`en`, `nl`). Voice metadata may carry a locale
+ * (`en-US`, `en_GB`); its language part is used. Undefined when it is not a language code.
+ */
+export const languageCode = (raw: unknown): string | undefined => {
+  if (typeof raw !== "string") return undefined
+  const m = /^([A-Za-z]{2,3})(?:[-_][A-Za-z0-9]+)*$/.exec(raw.trim())
+  return m === null ? undefined : m[1]!.toLowerCase()
+}
+
+export const DEFAULT_LANGUAGE = "en"
+
+/**
+ * The language speech is requested in: the `CARTESIA_LANGUAGE` override when set (used as written), else the
+ * voice's own language as a bare code, else `en`.
+ */
+export const effectiveLanguage = (override: string | undefined, voiceLanguage: string | undefined): string => {
+  const set = override?.trim() ?? ""
+  return set !== "" ? set : languageCode(voiceLanguage) ?? DEFAULT_LANGUAGE
+}
+
+export const makeVoices = (options: CartesiaVoicesOptions): TtsVoices["Service"] => makeClient(options).voices
+
+/**
+ * One voice's language (a bare code) from `GET /voices/{id}`; undefined when Cartesia does not know the voice,
+ * cannot be reached or sends no usable language. Never fails: the caller falls back to `en`.
+ */
+export const lookupVoiceLanguage = (options: CartesiaVoicesOptions, voiceId: string): Effect.Effect<string | undefined> =>
+  makeClient(options).languageOf(voiceId)
+
+const makeClient = (options: CartesiaVoicesOptions) => {
   let secrets: Secrets = []
   try {
     secrets = secretList(Redacted.value(options.apiKey), addressSecrets(options.baseUrl))
@@ -168,6 +198,14 @@ export const makeVoices = (options: CartesiaVoicesOptions): TtsVoices["Service"]
         catch: (e) => failure(secrets, "unavailable", `Cartesia sent an answer that is not valid JSON (${errorName(e)})`)
       }))
 
+  const languageOf = (voiceId: string): Effect.Effect<string | undefined> =>
+    VOICE_ID_PATTERN.test(voiceId)
+      ? json("read the voice", `/voices/${encodeURIComponent(voiceId)}`).pipe(
+        Effect.map((body) => languageCode(describeVoice(body)?.language)),
+        Effect.catch(() => Effect.succeed(undefined))
+      )
+      : Effect.succeed(undefined)
+
   const list: Effect.Effect<VoiceList, VoiceCatalogError> = Effect.gen(function*() {
     const voices: Array<VoiceDescription> = []
     const seen = new Set<string>()
@@ -198,13 +236,14 @@ export const makeVoices = (options: CartesiaVoicesOptions): TtsVoices["Service"]
       if (!(SAMPLE_RATES as ReadonlyArray<number>).includes(sampleRate)) {
         return yield* failure(secrets, "invalid", `The Cartesia sample rate must be one of ${SAMPLE_RATES.join(", ")}`)
       }
-      const language = options.language?.trim() ?? ""
+      const override = options.language?.trim() ?? ""
+      const language = override !== "" ? override : effectiveLanguage(undefined, yield* languageOf(voiceId))
       const body = JSON.stringify({
         model_id: options.model ?? DEFAULT_MODEL,
         transcript: input,
         voice: { id: voiceId },
         output_format: { container: "raw", encoding: "pcm_s16le", sample_rate: sampleRate },
-        ...(language !== "" ? { language } : {})
+        language
       })
       const response = yield* call("read the preview", "/tts/bytes", { method: "POST", body }, "audio/*")
       const bytes = yield* Effect.tryPromise({
@@ -214,16 +253,16 @@ export const makeVoices = (options: CartesiaVoicesOptions): TtsVoices["Service"]
       return { sampleRate, pcm: bytes.length % 2 === 0 ? bytes : bytes.subarray(0, bytes.length - 1) }
     })
 
-  return TtsVoices.of({ list, preview })
+  return { voices: TtsVoices.of({ list, preview }), languageOf }
 }
 
-/** `CARTESIA_API_KEY` (required), `CARTESIA_URL`, `CARTESIA_MODEL`, `CARTESIA_LANGUAGE` (default `en`). */
+/** `CARTESIA_API_KEY` (required), `CARTESIA_URL`, `CARTESIA_MODEL`, `CARTESIA_LANGUAGE` (override; unset by default). */
 export const voicesConfig: Effect.Effect<TtsVoices["Service"], Config.ConfigError> = Effect.gen(function*() {
   const options = yield* Config.all({
     apiKey: Config.Redacted("CARTESIA_API_KEY"),
     baseUrl: Config.String("CARTESIA_URL").pipe(Config.withDefault(DEFAULT_BASE_URL)),
     model: Config.String("CARTESIA_MODEL").pipe(Config.withDefault(DEFAULT_MODEL)),
-    language: Config.String("CARTESIA_LANGUAGE").pipe(Config.withDefault("en"))
+    language: Config.String("CARTESIA_LANGUAGE").pipe(Config.withDefault(""))
   })
   return makeVoices(options)
 })

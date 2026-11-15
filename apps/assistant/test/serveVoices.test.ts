@@ -179,7 +179,7 @@ describe("voice API: providers and voices", () => {
     const { status, data } = await api("GET", "voice-providers")
     expect(status).toBe(200)
     const byId = Object.fromEntries(data.providers.map((p: any) => [p.id, p]))
-    expect(byId.sherpa).toMatchObject({ label: "On this machine", location: "local", status: "ready", voiceCount: 3, inUse: true, settingsPath: "voices/providers" })
+    expect(byId.sherpa).toMatchObject({ label: "On this machine", location: "local", status: "ready", voiceCount: Object.keys(SherpaTts.presets).length, inUse: true, settingsPath: "voices/providers" })
     expect(byId.cartesia).toMatchObject({ status: "needs_key", reason: "missing", keyField: "CARTESIA_API_KEY", inUse: false })
     expect(byId.elevenlabs).toMatchObject({ status: "ready", voiceCount: 2, keyField: "ELEVENLABS_API_KEY" })
     expect(JSON.stringify(data)).not.toContain(EL_KEY)
@@ -314,6 +314,31 @@ describe("voice API: downloads", () => {
     expect((await api("POST", "voices/download", { voice: lessac })).data.error.code).toBe("already_installed")
     expect((await api("POST", "voices/download", { voice: sarah })).status).toBe(400)
     expect((await api("GET", "jobs/job-999")).status).toBe(404)
+  })
+
+  it("the Kokoro voices download as one job: every one of them shows it, any of them cancels it, all are installed after", async () => {
+    const { api } = await start()
+    const emma = { provider: "sherpa", voiceId: "kokoro-bf_emma" }
+    const started = await api("POST", "voices/download", { voice: emma })
+    expect(started.status).toBe(202)
+    expect(started.data.job).toMatchObject({ tool: "tts-models", target: "kokoro-af_heart", label: expect.stringContaining("Kokoro v1.0"), state: "running" })
+    const id = started.data.job.id
+    const kokoroEntries = async () =>
+      (await api("GET", "voices?provider=sherpa")).data.providers[0].voices.filter((v: any) => v.voice.voiceId.startsWith("kokoro-"))
+    const during = await kokoroEntries()
+    expect(during.length).toBeGreaterThan(1)
+    for (const v of during) expect(v.local).toMatchObject({ state: "downloading", job: { id } })
+    // Another Kokoro voice while it runs: the same archive, so it is already being downloaded.
+    expect((await api("POST", "voices/download", { voice: kokoro })).data.error).toMatchObject({ code: "busy", message: expect.stringContaining("already being downloaded") })
+    expect((await api("POST", "voices/download/cancel", { voice: { provider: "sherpa", voiceId: "kokoro-am_michael" } })).status).toBe(200)
+    for (let i = 0; i < 50 && (await api("GET", `jobs/${id}`)).data.job.state === "running"; i++) await new Promise((r) => setTimeout(r, 20))
+    expect((await api("GET", `jobs/${id}`)).data.job.state).toBe("cancelled")
+
+    const again = await api("POST", "voices/download", { voice: emma })
+    expect(again.status).toBe(202)
+    for (let i = 0; i < 100 && (await api("GET", `jobs/${again.data.job.id}`)).data.job.state === "running"; i++) await new Promise((r) => setTimeout(r, 20))
+    for (const v of await kokoroEntries()) expect(v.local.state).toBe("installed")
+    expect((await api("POST", "voices/download", { voice: { provider: "sherpa", voiceId: "kokoro-bm_george" } })).data.error.code).toBe("already_installed")
   })
 
   it("a finished download makes the voice installed and previewable", async () => {

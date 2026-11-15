@@ -229,6 +229,24 @@ describe("voice catalog (API client)", () => {
     expect(calls.filter((c) => c.method === "POST").map((c) => c.body)).toEqual([{ voice: ref }, { voice: ref }])
   })
 
+  it("re-reads the local list when a voice-model download starts (the Kokoro voices all download with it) and when it ends", async () => {
+    const { calls, fetchFn } = scripted({ ...base(), "GET voices?provider=sherpa": () => ok({ providers: [lists[0]], selected: "sherpa:en_US-lessac-medium" }) })
+    const store = createStore<typeof initialState, typeof initialState>(initialState, (_s, next) => next)
+    const catalog = createVoiceCatalog({ store } as never, makeVoiceApi(() => "http://x/api/", () => "tok-1234567890abcdef", fetchFn))
+    catalog.ensure()
+    await vi.waitFor(() => expect(catalog.store.get().load).toBe("ready"))
+    const localReads = () => calls.filter((c) => c.path === "voices?provider=sherpa").length
+    const job: JobInfo = { id: "job-9", tool: "tts-models", action: "download", target: "kokoro-af_heart", label: "Kokoro v1.0 (28 voices)", state: "running", log: [], startedAt: 1 }
+    store.dispatch({ ...store.get(), jobs: [job] })
+    await vi.waitFor(() => expect(localReads()).toBe(1))
+    // Progress of the same job is not a new start.
+    store.dispatch({ ...store.get(), jobs: [{ ...job, progress: { done: 1, total: 2, unit: "bytes" } }] })
+    await new Promise((r) => setTimeout(r, 250))
+    expect(localReads()).toBe(1)
+    store.dispatch({ ...store.get(), jobs: [{ ...job, state: "succeeded" }] })
+    await vi.waitFor(() => expect(localReads()).toBe(2))
+  })
+
   it("an error answer becomes an ApiError with the server's code and message", async () => {
     const { fetchFn } = scripted({ "GET voices": () => fail(401, "admin_required", "Log in to admin first (the session may have ended)") })
     const api = makeVoiceApi(() => "http://x/api/", () => "tok-1234567890abcdef", fetchFn)

@@ -236,7 +236,7 @@ not in the UI unless stated); *drop* = remove.
 | `TTS_SHERPA_PAD_MS`, `_CHUNK_MS`, `_THREADS` | Tuning | 20, 40, preset's | `index.ts:85,90,91` | no | **UI** per voice, advanced |
 | `TTS_SHERPA_MODEL_DIR` | Model folder | `<repo>/models` | `index.ts:84`; **also** `tts-sherpa/scripts/download-models.ts:11` via `process.env` | no | as `STT_SHERPA_MODEL_DIR` (one "Models folder" setting for both) |
 | `CARTESIA_API_KEY` | Key | — | `tts-cartesia/src/index.ts:385` | no | **UI**, vault → Voices › Hosted voice service |
-| `CARTESIA_MODEL`, `_VOICE`, `_LANGUAGE` | Model, voice id, language | `sonic-3.6`, `db6b0ed5-…` ("Skylar"), `en` | `index.ts:386–388`, `Engine.ts:104` | no | **UI** per voice |
+| `CARTESIA_MODEL`, `_VOICE`, `_LANGUAGE` | Model, voice id, language | `sonic-3.6`, `db6b0ed5-…` ("Skylar"), unset (`_LANGUAGE` overrides; unset = the voice's own language, else `en`) | `index.ts:386–388`, `Engine.ts:104` | no | **UI** per voice |
 | `CARTESIA_MAX_BUFFER_DELAY_MS` | Server-side buffering | 0 | `index.ts:390` | no | **UI** per voice, advanced |
 | `CARTESIA_SAMPLE_RATE` | Output Hz | 24000 | `index.ts:389` | no | **drop from the UI** (the router resamples, nothing to gain); env stays for tests |
 | `CARTESIA_URL` | Endpoint | `wss://api.cartesia.ai` | `index.ts:391` | no | **dev** |

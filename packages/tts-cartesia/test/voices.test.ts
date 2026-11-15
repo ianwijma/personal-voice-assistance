@@ -170,7 +170,8 @@ describe("Cartesia voices", () => {
       const voices = makeVoices({ apiKey: Redacted.make(KEY), baseUrl: s.base })
       assert.strictEqual(failureOf(yield* Effect.exit(voices.preview(OTHER, "Hi."))).reason, "unknown_voice")
       assert.strictEqual(failureOf(yield* Effect.exit(voices.preview("../v1/user", "Hi."))).reason, "unknown_voice")
-      assert.strictEqual(s.seen.length, 1)
+      // the unknown voice cost two requests (its language, then the preview); the malformed id none
+      assert.strictEqual(s.seen.length, 2)
     }))
 
   it.effect("interrupting a preview aborts the request", () =>

@@ -157,12 +157,14 @@ export const makeApi = (options: ApiOptions) => {
         if (body.voice.provider !== "sherpa") return yield* badRequest("Only voices on this machine are downloaded", [{ key: "voice", message: "Not a voice on this machine" }])
         const preset = Object.hasOwn(SherpaTts.presets, body.voice.voiceId) ? SherpaTts.presets[body.voice.voiceId] : undefined
         if (preset === undefined) return yield* new ApiFailure({ status: 404, code: "unknown_voice", message: `There is no voice "${body.voice.voiceId}" on this machine` })
+        // The voices of a shared archive (Kokoro) download as one job, under the archive's owner preset.
+        const target = SherpaTts.archiveOwner(preset.name) ?? preset.name
         if (path === "voices/download/cancel") {
-          const job = options.jobs.running("tts-models", preset.name)
+          const job = options.jobs.running("tts-models", target)
           if (job === undefined || !options.jobs.cancel(job.id)) return yield* fail(404, "not_found", `${preset.voice.name} is not being downloaded`)
           return json(200, { cancelled: true, job: options.jobs.list().find((j) => j.id === job.id) ?? job })
         }
-        const started = options.models.download("tts-models", preset.name)
+        const started = options.models.download("tts-models", target)
         if (started.ok && started.job !== undefined) return json(202, { job: started.job })
         if (started.ok) return yield* fail(500, "internal", "The download did not start")
         const message = started.error.message

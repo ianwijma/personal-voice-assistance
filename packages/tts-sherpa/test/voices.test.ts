@@ -34,6 +34,25 @@ describe("voices on this machine", () => {
       assert.deepStrictEqual(lessac.local, { installed: true, sizeMb: 68, diskMb: 83 })
       assert.strictEqual(lessac.language, "en-US")
       assert.strictEqual(voices.find((v) => v.id === "kokoro-af_heart")!.local!.installed, false)
+      // A voice whose gender is not documented and not clear from its pitch has none.
+      assert.isFalse("gender" in voices.find((v) => v.id === "nl_BE-nathalie-medium")!)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it("the Kokoro voices are installed together; listing starts no engine", () => {
+    const dir = withModelDir(["kokoro-af_heart"])
+    let started = 0
+    try {
+      const voices = listVoices(dir)
+      const kokoro = voices.filter((v) => v.id.startsWith("kokoro-"))
+      assert.isAbove(kokoro.length, 1)
+      for (const v of kokoro) assert.deepStrictEqual(v.local, { installed: true, sizeMb: 350, diskMb: 403 })
+      assert.isFalse(voices.find((v) => v.id === "en_US-lessac-medium")!.local!.installed)
+      const service = makeVoices({ modelDir: dir, engineFor: () => Effect.sync(() => (started++, makeToneTts({ sampleRate: 24_000 }).service)) })
+      assert.strictEqual(Effect.runSync(service.list).voices.length, Object.keys(presets).length)
+      assert.strictEqual(started, 0)
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }

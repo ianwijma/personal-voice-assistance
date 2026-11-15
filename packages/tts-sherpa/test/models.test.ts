@@ -11,7 +11,15 @@ const texts: Record<string, ReadonlyArray<string>> = {
   default: ["Sure, I can do that.", "The meeting has been moved to three thirty tomorrow afternoon."]
 }
 
+// One run per distinct engine set-up (archive and lexicon), not per speaker: the 28 Kokoro voices share one model, and
+// loading it 28 times would only repeat the US and GB runs with another speaker id.
+const setups = new Map<string, (typeof presets)[string]>()
 for (const preset of Object.values(presets)) {
+  const key = `${preset.dir}|${preset.files.lexicon ?? ""}`
+  if (!setups.has(key)) setups.set(key, preset)
+}
+
+for (const preset of setups.values()) {
   const present = Object.values(presetFiles(preset, defaultModelDir)).every((f) => existsSync(f))
   const skip = `model not downloaded, run: pnpm --filter @pva/tts-sherpa download ${preset.name}`
   if (!present) console.warn(`Skipping real-model test for ${preset.name}: ${skip}`)

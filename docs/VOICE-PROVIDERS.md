@@ -56,13 +56,79 @@ the removed voice block did.
 
 | Provider | Where | Needs | Voices it lists | Preview through |
 |---|---|---|---|---|
-| `sherpa` | this machine | nothing (models are downloaded) | the presets of `@pva/tts-sherpa` (`en_US-lessac-medium`, `nl_NL-pim-medium`, `kokoro-af_heart`), installed or not | a local engine (§4.3) |
-| `cartesia` | hosted | `CARTESIA_API_KEY` | `GET https://api.cartesia.ai/voices` (header `Cartesia-Version: 2026-08-14`, `Authorization: Bearer <key>`; pages of 100 by `starting_after`) | `POST /tts/bytes`, raw `pcm_s16le` 24 kHz, model `CARTESIA_MODEL` |
+| `sherpa` | this machine | nothing (models are downloaded) | the presets of `@pva/tts-sherpa` (54 voices, §3.1), installed or not | a local engine (§4.3) |
+| `cartesia` | hosted | `CARTESIA_API_KEY` | `GET https://api.cartesia.ai/voices` (header `Cartesia-Version: 2026-08-14`, `Authorization: Bearer <key>`; pages of 100 by `starting_after`) | `POST /tts/bytes`, raw `pcm_s16le` 24 kHz, model `CARTESIA_MODEL`, `language` as below |
 | `elevenlabs` | hosted | `ELEVENLABS_API_KEY` | `GET https://api.elevenlabs.io/v2/voices` (header `xi-api-key`; pages of 100 by `next_page_token`): the account's voice library, premade voices included | `POST /v1/text-to-speech/{voice_id}?output_format=pcm_24000`, model `ELEVENLABS_MODEL` |
+
+**Cartesia language.** Speech and previews are requested in the chosen voice's own language, not a fixed one. Precedence:
+`CARTESIA_LANGUAGE` if set (used as written; an explicit override), else the voice's language from Cartesia
+(`GET /voices/{id}`, converted to the bare code Cartesia's speech API takes: `en_US` / `en-GB` → `en`), else `en` (voice
+unknown, Cartesia unreachable, no usable language: never an error). Live speech looks it up once when the engine is built
+(bounded to 3 s), never during a turn; a preview looks it up when it is made. No latency effect has been measured.
 
 The REST base address follows the provider's WebSocket address setting (`CARTESIA_URL`, `ELEVENLABS_URL`: `wss://` →
 `https://`, `ws://` → `http://`), so a gateway or a test server serves both. Provider-specific HTTP lives only in the
 adapter package (`packages/tts-cartesia`, `packages/tts-elevenlabs`).
+
+### 3.1 Voices on this machine
+
+Added 2026-11-16. The local provider lists **54 voices**: 26 Piper voices, each its own download, and 28 Kokoro voices
+that share one download. The voice keys of earlier versions (`sherpa:en_US-lessac-medium`, `sherpa:nl_NL-pim-medium`,
+`sherpa:kokoro-af_heart`) are unchanged, so a saved `ASSISTANT_VOICE` or favourite still works. The table is
+`packages/tts-sherpa/src/Presets.ts`.
+
+**Kokoro** (`kokoro-multi-lang-v1_0`, 350 MB download, 403 MB on disk): the 28 American and British English speakers
+of the archive, as `kokoro-<speaker>` (`kokoro-af_bella`, `kokoro-bm_george`, …). Their speaker ids come from the
+`speaker2id` metadata of this archive's `model.onnx`, read from the copy downloaded on this machine on 2026-11-13
+(the release asset was last updated 2026-10-26, before that, and is 349886476 bytes). The upstream README of the archive says ids 0–52 are
+stable. Gender comes from the speaker name (`af`/`bf` female, `am`/`bm` male, as in upstream Kokoro's VOICES.md), and
+the description shows upstream's quality grade (Heart A, Bella A-, Nicole and Emma B-, down to Adam F+). British
+speakers use the archive's British lexicon (`lexicon-gb-en.txt`), American ones the American lexicon.
+
+Left out: the archive's Spanish, French, Hindi, Italian, Japanese, Brazilian Portuguese and Chinese speakers (ids
+28–53). Kokoro runs on sherpa-onnx 2.x, which no longer uses espeak-ng (`dataDir` and `lang` are ignored) and only
+speaks words that are in the lexicons it is given. Tried on this machine: for Spanish, French, Italian, Portuguese,
+Hindi and Japanese text the engine logs "OOV word skipped" for nearly every word, and the result is wrong or silence.
+Chinese works with `lexicon-zh.txt` but is not offered (nobody here asked for it; it would need its own engine set-up
+and the rule FSTs). Adding it would be a table change.
+
+**Piper** (each 68 MB download, 83 MB on disk, unless noted; 22050 Hz, or 16000 Hz for a "low" voice):
+
+| Language | Voices (key) |
+|---|---|
+| English (US) | Lessac `en_US-lessac-medium` (f), Amy `en_US-amy-medium` (f), Kristin `en_US-kristin-medium` (f), Ryan `en_US-ryan-medium` (m), John `en_US-john-medium` (m), Joe `en_US-joe-medium` (m) |
+| English (GB) | Alba `en_GB-alba-medium` (f), Cori `en_GB-cori-medium` (f), Jenny `en_GB-jenny_dioco-medium` (f), Alan `en_GB-alan-medium` (m), Northern English `en_GB-northern_english_male-medium` (m) |
+| Dutch | Pim `nl_NL-pim-medium` (m), Ronnie `nl_NL-ronnie-medium` (m), Alex `nl_NL-alex-medium` (m), Nathalie `nl_BE-nathalie-medium` (Flemish), Rdh `nl_BE-rdh-medium` (Flemish, m) |
+| German | Thorsten `de_DE-thorsten-medium` (m), Kerstin `de_DE-kerstin-low` (16 kHz) |
+| French | Siwis `fr_FR-siwis-medium` (f), Gilles `fr_FR-gilles-low` (m, 16 kHz) |
+| Spanish | Davefx `es_ES-davefx-medium` (m), Daniela `es_AR-daniela-high` (116 MB, 134 MB on disk) |
+| Italian | Paola `it_IT-paola-medium` (f) |
+| Portuguese | Cadu `pt_BR-cadu-medium` (m), Faber `pt_BR-faber-medium`, Tugão `pt_PT-tugao-medium` |
+
+How they were chosen: single-speaker voices of the sherpa-onnx `tts-models` release (multi-speaker models such as
+`vctk` and `libritts` are left out: only speaker 0 would be reachable). Medium quality where there is one, a few per
+language, more for English and Dutch, and both voices where a language had a female and a male one. Each was
+downloaded from its release URL and run through the Piper engine of this project (sherpa-onnx-node 1.13.8) with a
+sentence in its own language: all load, speak at the sample rate in the table, and give a plausible duration. Sizes
+are the release's `Content-Length` and the unpacked folder. Piper voices phonemise with the `espeak-ng-data` in their
+own archive, with the language from the model's config, so non-English Piper voices are spoken in their own language.
+
+Gender is given only where it is known: from the model card or dataset (Kristin, John, Cori, Alba, Siwis, Ryan's
+RyanSpeech, Thorsten), or else from the measured median pitch of the sample when it is clear (below 140 Hz male,
+above 185 Hz female). Nathalie, Kerstin, Daniela, Faber and Tugão are between those values and nothing documents their
+gender, so their entries have none (`gender` is optional). Nobody has listened to them: the machine has no sound card.
+Left out after trying them: `fr_FR-tom-medium` (44.1 kHz, very quiet output), `es_MX-ald-medium`,
+`it_IT-riccardo-x_low` and `pt_BR-jeff-medium` (no documented gender and an ambiguous pitch, with a better voice of the
+language already listed).
+
+Licences vary per voice (each preset's `license`, shown on the Models page): several datasets are CC0 or public
+domain, `ryan` and `lessac` allow non-commercial use only, others are CC BY or CC BY-SA.
+
+**Cost of a longer list.** The list is metadata: listing reads no model and starts no engine. Only the voice the
+assistant speaks with is loaded (one engine, as before), and a preview starts at most one extra engine (§4.3).
+Measured with the 54 presets against the real model folder: listing takes 0.4 ms (median of 200; worst 2.6 ms), and
+importing the package plus listing started no child process. This was not a turn, so there is no TurnTrace number:
+the list is not on a turn's path.
 
 **Status of a provider** (`ProviderInfo.status`):
 
@@ -89,14 +155,16 @@ One entry per voice, from whichever provider:
 - `previewable`: false for a local voice that is not installed, and for every voice of a provider that is not `ready`.
 - `selected` (it is the assistant's voice) and `favourite`.
 
-Several local presets share one archive (none today; Kokoro voices would). A download is per preset name, and the
-entries of a shared archive all become installed when it is.
+Several local presets share one archive: the 28 Kokoro voices (§3.1). They are installed together (they need the same
+files), they download as one job (§4.4), and while it runs every one of their entries is `downloading` with that same
+`job`, so every Kokoro row of the picker shows the progress. Deleting the archive (Models page) removes all of them; it
+is refused while any of them is the assistant's voice. Their `sizeMb` is the archive's (350), the same on every entry.
 
 ### 4.2 Lists, search and staleness
 
 `GET /api/voices` returns every provider's list in one answer. The UI searches **client-side** over it:
 
-- The lists are small: three local presets, an ElevenLabs library of a few dozen to a few hundred voices, Cartesia's
+- The lists are small: 54 local voices, an ElevenLabs library of a few dozen to a few hundred voices, Cartesia's
   library of some hundreds. The server keeps at most **1000** voices per provider (`truncated: true` beyond that). A
   substring match over a few thousand short records takes well under a frame in a browser, so typing needs no round
   trip, and the search works across providers whose APIs search differently (Cartesia `q`, ElevenLabs `search`) or
@@ -117,7 +185,7 @@ its key (a new key is a new cache entry; the key itself is never stored there). 
   status is `error`. Without a previous list the provider's `voices` is empty.
 - A voice added at the provider meanwhile appears after a refresh or after 6 hours. A voice deleted there stays listed
   until then; previewing or selecting it then fails with `unknown_voice` (404).
-- The local list is computed on every request (it is a disk check of three presets).
+- The local list is computed on every request (a disk check of the 54 presets: 0.4 ms measured, §3.1).
 
 The cache is dropped when the server restarts. Opening the picker for the first time after a start therefore waits for
 the hosted calls; nothing is prefetched at start (no network call is made for a provider nobody looks at).
@@ -149,14 +217,20 @@ Local previews and live sessions share the CPU: there is a real tension. The saf
 4. Previewing any other local voice starts a **separate engine process** for it (the only way to hear a voice that
    is not loaded). It is kept for 60 s for further previews of the same voice, then closed; previewing another voice
    replaces it, so at most one extra engine exists. Cancelling kills that process at once. A Kokoro preview engine
-   takes about 400 MB of memory while it lives and a few seconds to start (its model loads first).
+   takes about 400 MB of memory while it lives and a few seconds to start (its model loads first). The engine is per voice: a Kokoro
+   voice other than the assistant's one gets its own preview engine even when the assistant speaks Kokoro (another
+   speaker of the same model), and moving the preview to another Kokoro voice loads the model again (measured on this
+   machine by a script, not a turn: about 1.2 s to start a Kokoro engine, against about 0.6 s for Piper).
 
 A local voice that is not installed cannot be previewed (`409 not_installed`); download it first.
 
 ### 4.4 Downloads
 
 `POST /api/voices/download` starts a download job for a local voice (`tool: "tts-models"`, `target` = the preset
-name). It is the same mechanism as the Models page: disk check, `.part` file, unpack, cancel removes partial files, one
+name; for a voice of a shared archive, the archive's **owner**, the first of its presets in the table: every Kokoro
+voice downloads as `target: "kokoro-af_heart"`, label "Kokoro v1.0 (28 voices)"). Downloading or cancelling through any
+Kokoro voice acts on that one job; starting a second Kokoro voice while it runs is `409 busy` ("… is already being
+downloaded"). It is the same mechanism as the Models page: disk check, `.part` file, unpack, cancel removes partial files, one
 job per target, at most two jobs at once. Progress is observed either way:
 
 - the WebSocket the admin page already holds receives `job` messages (throttled to 4 per second), or
@@ -469,7 +543,9 @@ Errors: 400, 401, 404 `unknown_provider` / `unknown_voice`, 409 `needs_key`, `no
 - **Voices › Voice providers** (section `voice-providers`, page `voices/providers`, protected; was `voice-engines`,
   `voices/engines`): `CARTESIA_API_KEY`, `ELEVENLABS_API_KEY` (secrets, `apply: reload`). `TTS_PROVIDER` is no longer
   a field: the provider follows from the voice.
-- **Voices › Models** is unchanged (it lists the same presets; downloads started from either page are the same job).
+- **Voices › Models** lists one item per archive: each Piper voice, and one "Kokoro v1.0 (28 voices)" item (target
+  `kokoro-af_heart`) for all Kokoro voices; it is in use while any Kokoro voice is the assistant's. Downloads started
+  from either page are the same job.
 
 ### 6.2 Migration (existing installs)
 
@@ -595,7 +671,8 @@ Built 2026-11-16 from §5 (`apps/web`). What changed there:
   the favourites and the one preview. It calls the API on the socket's server (`ws://host:port/ws` →
   `http://host:port/api/`) with the admin token from `sessionStorage`, follows download progress through the `job`
   messages the admin socket already gets, re-reads the local list when a voice-model job ends or the models change,
-  and everything when the vault or a Voices section changes. `409 superseded` is ignored; `409 busy` says "The
+  and everything when the vault or a Voices section changes. It also re-reads the local list when a voice-model job
+  starts, so all the voices of a shared archive (Kokoro) show the progress at once, not only the row that was pressed. `409 superseded` is ignored; `409 busy` says "The
   assistant is talking; try again in a moment". The pure parts (search, favourites order, the words under a voice) are
   in `src/lib/voicePicker.ts`.
 - **Where it is used**: Voices › Voices, in place of the `ASSISTANT_VOICE` text field (a field renderer by key,
@@ -626,6 +703,7 @@ Built 2026-11-16 from §5 (`apps/web`). What changed there:
 | Selection and migration (`voiceSelection.ts`, CLI modes, engine build) | Done 2026-11-16. |
 | HTTP API, catalog, favourites, settings pages | Done 2026-11-16. |
 | Web UI (picker, Voice providers page, favourites, preview player) | Done 2026-11-16 (§8): `pnpm check`, `pnpm test` and the web Playwright suite against the mock pass; screenshots `apps/web/screenshots/admin-*-voice-picker-*.png`. Not tried against the real server in a browser, nor on real phones. |
+| More local voices (§3.1: 26 Piper, 28 Kokoro sharing one archive) | Done 2026-11-16: table, shared-archive download and install state, Models page item, web re-read on job start, tests in `packages/tts-sherpa/test/presets.test.ts`, `apps/assistant/test/serveVoices.test.ts`, `serveModels.test.ts`, `apps/web/test/voicePicker.test.ts`. The mock still lists four local voices (the e2e tests pin them). |
 
 Measurements (2026-11-16, `pnpm start bench`, offline: scripted turns through the real `Conversation` with simulated
 provider delays, `BENCH_ROUNDS=5`, 20 turns per scenario, one run before this change at 1b4b4b3 and one after). End of

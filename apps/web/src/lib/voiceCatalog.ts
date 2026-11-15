@@ -230,11 +230,21 @@ export const createVoiceCatalog = (host: CatalogHost, api: VoiceApi = makeVoiceA
         else for (const id of localProviders()) void reloadProvider(id)
       }, 150)
     }
+    // A voice-model job that starts is re-read too: the voices of a shared archive (the Kokoro voices) all download
+    // with it, and their entries then carry it (`local.job`), so every one of their rows shows the progress.
+    const started = new Set(host.store.get().jobs.map((j) => j.id))
     host.store.subscribe(() => {
       const s = host.store.get()
       for (const j of s.jobs) {
-        if (j.state === "running" || ended.has(j.id)) continue
+        if (j.state === "running") {
+          if (started.has(j.id)) continue
+          started.add(j.id)
+          if (j.tool === "tts-models") soon(false)
+          continue
+        }
+        if (ended.has(j.id)) continue
         ended.add(j.id)
+        started.add(j.id)
         if (j.tool === "tts-models") soon(false)
       }
       if (s.models !== models) {

@@ -51,6 +51,7 @@ import { makeVoiceSession } from "./VoiceSession.ts"
 import { makeVoiceSessions, type VoiceSessions } from "./VoiceSessions.ts"
 import { type KdfParams, openVault, type Vault, VaultPathConfig } from "./Vault.ts"
 import * as SherpaStt from "@pva/stt-sherpa"
+import * as SherpaTts from "@pva/tts-sherpa"
 import type { ToolId } from "@pva/protocol"
 
 /**
@@ -465,7 +466,8 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       busy: () => sessions.list().some((s) => inTurn.has(s.state)),
       selected: assistantVoice.ref,
       isFavourite: favourites.has,
-      download: (preset) => jobs.running("tts-models", preset),
+      // Every voice of a shared archive (Kokoro) reports the one job that downloads it.
+      download: (preset) => jobs.running("tts-models", SherpaTts.archiveOwner(preset) ?? preset),
       ...(options.hostedVoices !== undefined ? { hostedVoices: options.hostedVoices } : {}),
       ...(options.localPreviewEngine !== undefined ? { localEngine: options.localPreviewEngine } : {})
     })

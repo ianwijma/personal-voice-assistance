@@ -20,7 +20,7 @@ import { makeEngineTts } from "./SherpaTts.ts"
 import { makeVoicesWith, type SherpaVoicesOptions, temporaryEngine } from "./voices.ts"
 
 export { defaultJoinOptions, type JoinOptions } from "./Pcm.ts"
-export { DEFAULT_PRESET, defaultModelDir, type EngineKind, type Preset, presetFiles, presetLabel, presets, sizeMb } from "./Presets.ts"
+export { archiveOwner, archiveVoices, DEFAULT_PRESET, defaultModelDir, type EngineKind, type Preset, presetFiles, presetLabel, presets, sizeMb } from "./Presets.ts"
 export { listVoices, type SherpaVoicesOptions } from "./voices.ts"
 export { cleanPartials, deletePreset, DownloadError, type DownloadProgress, downloadPreset, isInstalled, presetArchive } from "./download.ts"
 

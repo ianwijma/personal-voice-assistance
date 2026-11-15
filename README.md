@@ -503,7 +503,7 @@ ASSISTANT_VOICE=sherpa:kokoro-af_heart          # after: pnpm --filter @pva/tts-
 ASSISTANT_VOICE=elevenlabs:EXAVITQu4vr4xnSDxMaL # with ELEVENLABS_API_KEY=...
 ```
 
-A provider's other settings (`CARTESIA_MODEL`, `ELEVENLABS_SPEED`, `TTS_SHERPA_SPEED`, …) apply to whichever of its voices is chosen.
+A provider's other settings (`CARTESIA_MODEL`, `ELEVENLABS_SPEED`, `TTS_SHERPA_SPEED`, …) apply to whichever of its voices is chosen. Cartesia speaks in the chosen voice's own language (as Cartesia lists it, else `en`); `CARTESIA_LANGUAGE`, when set, overrides it.
 
 **Upgrading from named voices.** Installs from before voice providers used `TTS_PROVIDER`, `DEFAULT_VOICE`, `VOICES` and `VOICE_<NAME>_*`. While `ASSISTANT_VOICE` is not set, those settings still choose the voice the old default voice was (for example `DEFAULT_VOICE=natural` speaks with `sherpa:kokoro-af_heart`, `TTS_PROVIDER=elevenlabs` with `ELEVENLABS_VOICE`); `VOICES` is ignored. The rules are in [docs/VOICE-PROVIDERS.md §6.2](docs/VOICE-PROVIDERS.md). Choosing a voice in the UI (or setting `ASSISTANT_VOICE`) replaces them.
 

@@ -23,14 +23,17 @@ export interface SherpaVoicesOptions {
 const dirOf = (options: SherpaVoicesOptions) =>
   typeof options.modelDir === "function" ? options.modelDir() : options.modelDir ?? defaultModelDir
 
-/** The presets as voice descriptions, with their install state in `modelDir`. */
+/**
+ * The presets as voice descriptions, with their install state in `modelDir`. Metadata and a few `existsSync` calls
+ * per preset: nothing is loaded. The voices of a shared archive (Kokoro) are installed together.
+ */
 export const listVoices = (modelDir: string = defaultModelDir): ReadonlyArray<VoiceDescription> =>
   Object.values(presets).map((p) => ({
     id: p.name,
     name: p.voice.name,
     description: p.voice.description,
     language: p.voice.language,
-    gender: p.voice.gender,
+    ...(p.voice.gender !== undefined ? { gender: p.voice.gender } : {}),
     tags: p.voice.tags,
     local: { installed: isInstalled(p.name, modelDir), sizeMb: p.sizeMb, diskMb: p.diskMb }
   }))

@@ -7,7 +7,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterEach, describe, expect, it, vi } from "vitest"
 import { makeJobs } from "../src/serve/jobs.ts"
-import type { PresetDownloader } from "../src/serve/models.ts"
+import { type PresetDownloader, presetItems, presetsInUse } from "../src/serve/models.ts"
 import { ScriptedClient, sleep } from "./support/scriptedClient.ts"
 import { controlledStt, fakeBuild, scriptedLlm, startTestServer, type TestServer, TEST_ADMIN_PASSWORD } from "./support/serveHarness.ts"
 
@@ -177,6 +177,26 @@ describe("serve: model downloads", () => {
       error: { code: "busy", message: expect.stringContaining("in use by the running engines") }
     })
     expect(await request(a, { type: "model.delete", tool: "tts-models", target: "en_US-lessac-medium" })).toMatchObject({ ok: false, error: { code: "busy" } })
+  })
+})
+
+describe("voice models of a shared archive (the Kokoro voices)", () => {
+  it("are one item of the Models page, under the archive's owner; a voice using it keeps it in use", () => {
+    const items = presetItems("tts-models")
+    const kokoro = items.filter((i) => i.id.startsWith("kokoro-"))
+    expect(kokoro).toHaveLength(1)
+    expect(kokoro[0]).toMatchObject({ id: "kokoro-af_heart", label: expect.stringMatching(/^Kokoro v1\.0 \(\d+ voices\)$/), sizeMb: 350 })
+    expect(kokoro[0]!.description).toContain("voices in one download")
+    // Every Piper voice is an item of its own.
+    expect(items.find((i) => i.id === "nl_NL-ronnie-medium")).toMatchObject({ label: "Piper nl_NL-ronnie-medium", sizeMb: 68 })
+    const used = presetsInUse([{ stage: "tts", provider: "sherpa", detail: "voice: kokoro-bf_emma" }])
+    expect([...used.tts].sort()).toEqual(["kokoro-af_heart", "kokoro-bf_emma"])
+  })
+
+  it("a Kokoro voice other than the owner is not a Models page target", async () => {
+    const server = await start(new Set())
+    const a = await connect(server)
+    expect(await request(a, { type: "job.start", tool: "tts-models", action: "download", target: "kokoro-bf_emma" })).toMatchObject({ ok: false, error: { code: "invalid_settings" } })
   })
 })
 
