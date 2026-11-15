@@ -83,8 +83,7 @@ describe("protocol 5", () => {
       ready: true,
       state: "ready",
       voices: [
-        { name: "standard", description: "Everyday answers: quick and clear.", isDefault: true },
-        { name: "natural", description: "Longer replies where warmth matters.", isDefault: false }
+        { name: "sherpa:en_US-lessac-medium", description: "Lessac", isDefault: true }
       ]
     })
     expect(engineSummary({ ...exampleEngineStatus, state: "failed" })).toEqual({ ready: false, state: "failed", voices: [] })

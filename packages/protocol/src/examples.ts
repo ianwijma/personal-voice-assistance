@@ -178,37 +178,25 @@ export const exampleSpeechEngineSection: SettingsSection = {
   revision: 2
 }
 
+/** Voices › Voices (docs/VOICE-PROVIDERS.md §6.1): the assistant's one voice, a voice key. */
 export const exampleVoiceSection: SettingsSection = {
   id: "voices",
   title: "Voices",
+  description: "The voice the assistant speaks every reply with.",
   form: {
     fields: [
       {
-        type: "choice",
-        key: "DEFAULT_VOICE",
-        label: "Default voice",
-        description: "Speaks every reply unless the model picks another voice.",
-        apply: "live",
-        default: "standard",
-        options: [
-          { value: "standard", label: "standard", description: "Everyday answers: quick and clear." },
-          { value: "natural", label: "natural", description: "Longer replies where warmth matters." }
-        ]
-      },
-      {
-        type: "multichoice",
-        key: "VOICES",
-        label: "Enabled voices",
+        type: "text",
+        key: "ASSISTANT_VOICE",
+        label: "Assistant voice",
+        description: "A voice of one of the voice providers (provider:voice). Applies after reloading the engines. Empty: the voice of the earlier voice settings, else the voice on this machine.",
         apply: "reload",
-        default: ["standard"],
-        options: [
-          { value: "standard", label: "standard" },
-          { value: "natural", label: "natural" },
-          { value: "expressive", label: "expressive" }
-        ]
+        default: "",
+        placeholder: "sherpa:en_US-lessac-medium",
+        maxLength: 200
       }
     ],
-    values: { DEFAULT_VOICE: "standard", VOICES: ["standard", "natural"] },
+    values: { ASSISTANT_VOICE: "sherpa:en_US-lessac-medium" },
     secrets: {},
     errors: []
   },
@@ -225,7 +213,7 @@ export const exampleTrace: TraceInfo = {
   marks: { llmRequestSent: -232, llmFirstToken: -231, firstClause: -216, ttsFirstAudio: -184, playbackStart: 31 },
   totalMs: 1925,
   tools: [{ name: "weather", ms: 241 }],
-  voices: ["standard"],
+  voices: ["sherpa:en_US-lessac-medium"],
   client: { outputLatencyMs: 21.3, startDelayMs: 0 }
 }
 
@@ -284,21 +272,14 @@ export const exampleEngineStatus: EngineStatus = {
     { stage: "stt", provider: "sherpa", detail: "nemotron-3.5", location: "local" },
     { stage: "tts", provider: "sherpa", detail: "Piper en_US-lessac-medium", location: "local" }
   ],
+  // One voice: `name` is its key, `description` its name (docs/VOICE-PROVIDERS.md §8).
   voices: [
     {
-      name: "standard",
-      description: "Everyday answers: quick and clear.",
+      name: "sherpa:en_US-lessac-medium",
+      description: "Lessac",
       enabled: true,
       isDefault: true,
       engine: "Piper en_US-lessac-medium",
-      location: "local"
-    },
-    {
-      name: "natural",
-      description: "Longer replies where warmth matters.",
-      enabled: true,
-      isDefault: false,
-      engine: "Kokoro af_heart",
       location: "local"
     }
   ]
@@ -472,7 +453,7 @@ export const serverExamples: { readonly [T in ServerMessageType]: Extract<Server
   "state": { type: "state", state: "speaking", turnId: 12 },
   "transcript": { type: "transcript", text: "what's the weather in" },
   "turn.start": { type: "turn.start", turnId: 12, source: "voice", userText: "What's the weather in Paris?", spoken: true },
-  "assistant.text": { type: "assistant.text", turnId: 12, clause: 0, text: "It's sunny in Paris,", voice: "standard" },
+  "assistant.text": { type: "assistant.text", turnId: 12, clause: 0, text: "It's sunny in Paris,", voice: "sherpa:en_US-lessac-medium" },
   "assistant.playing": { type: "assistant.playing", turnId: 12, clause: 0 },
   "tool.start": {
     type: "tool.start",

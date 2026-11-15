@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest"
 import type { ServerMessage, ServerMessageType } from "@pva/protocol"
 import { exampleSnapshot, exampleTrace, exampleWeatherModule, serverExamples } from "@pva/protocol/examples"
-import { type Action, type ClientState, initialState, isOwner, lastLatency, MAX_TOASTS, modulesInOrder, reducer, speakingVoice, visualState } from "@/lib/state.ts"
+import { type Action, type ClientState, initialState, isOwner, lastLatency, MAX_TOASTS, modulesInOrder, reducer, visualState } from "@/lib/state.ts"
 
 const run = (actions: ReadonlyArray<Action>, from: ClientState = initialState) => actions.reduce(reducer, from)
 const welcome = serverExamples.welcome
@@ -168,14 +168,6 @@ describe("reducer", () => {
     expect(visualState(reducer(owner, { type: "state", state: "thinking" }))).toBe("thinking")
     expect(visualState(reducer(owner, { type: "local/audio", phase: "error", error: "denied" }))).toBe("error")
     expect(visualState(reducer(owner, { type: "local/connection", status: "outdated", attempt: 0 }))).toBe("error")
-  })
-
-  it("names the voice only when more than one is enabled", () => {
-    const s = run([welcome, adminSnapshot, audioRunning, { type: "turn.start", turnId: 12, source: "voice", userText: "", spoken: true }, { type: "assistant.text", turnId: 12, clause: 0, text: "a", voice: "natural" }, { type: "local/playing", turnId: 12 }, { type: "assistant.playing", turnId: 12, clause: 0 }])
-    expect(speakingVoice(s)).toBe("natural")
-    expect(s.summary.voices.length).toBeGreaterThan(1)
-    const single = { ...s, summary: { ...s.summary, voices: s.summary.voices.slice(0, 1) } }
-    expect(speakingVoice(single)).toBeUndefined()
   })
 
   it("opening the chat clears unread replies", () => {

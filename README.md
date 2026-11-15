@@ -46,7 +46,7 @@ pnpm serve                                     # the web UI: the browser is the 
 
 `pnpm check` typechecks every package and `pnpm test` runs all unit tests (no network, no keys; the tests that load real models skip when the models are absent). There is no build step: packages export their TypeScript sources and the app runs with `tsx`.
 
-Optional models: `pnpm --filter @pva/tts-sherpa download kokoro-af_heart` (the `natural` voice), `pnpm --filter @pva/tts-sherpa download nl_NL-pim-medium` (Dutch), `pnpm --filter @pva/stt-sherpa download-models parakeet-ultra whisper-turbo nemotron-560 hybrid-nemotron-parakeet` (other speech recognisers, see [Speech recognition models](#speech-recognition-models)).
+Optional models: `pnpm --filter @pva/tts-sherpa download kokoro-af_heart` (the Kokoro voice), `pnpm --filter @pva/tts-sherpa download nl_NL-pim-medium` (Dutch), `pnpm --filter @pva/stt-sherpa download-models parakeet-ultra whisper-turbo nemotron-560 hybrid-nemotron-parakeet` (other speech recognisers, see [Speech recognition models](#speech-recognition-models)).
 
 ## Configuration
 
@@ -103,7 +103,7 @@ If a required setting or a model file is missing, a command-line mode lists ever
 
 ```
 Cannot start (settings go in the environment or in .env; see .env.example):
-  voice "standard" (TTS_PROVIDER): Model file for TTS preset "en_US-lessac-medium" is missing: /…/models/vits-piper-en_US-lessac-medium/en_US-lessac-medium.onnx. Download it in Settings → Voices → Models, or run: pnpm --filter @pva/tts-sherpa download en_US-lessac-medium
+  voice (ASSISTANT_VOICE): Model file for TTS preset "en_US-lessac-medium" is missing: /…/models/vits-piper-en_US-lessac-medium/en_US-lessac-medium.onnx. Download it in Settings → Voices → Models, or run: pnpm --filter @pva/tts-sherpa download en_US-lessac-medium
   speech-to-text (STT_PROVIDER): DEEPGRAM_API_KEY is not set
 ```
 
@@ -314,14 +314,13 @@ Report back: **Copy report** in *Audio diagnostics* after a few replies, with ec
 Two quick-test commands try an engine without a conversation. Both stop with the startup message above if a key or a model is missing.
 
 ```sh
-pnpm start say "Hello, this is the standard voice."              # plays on AUDIO_BACKEND
-pnpm start say --voice natural "Once upon a time."               # pick a voice (enabled, and the default, for this run)
+pnpm start say "Hello, this is the assistant's voice."           # plays on AUDIO_BACKEND
+pnpm start say --voice sherpa:kokoro-af_heart "Once upon a time." # another voice, for this run (provider:voice)
 pnpm start say --out hello.wav "Write it to a file instead."
-VOICES=standard,natural pnpm start say "Piper here. [voice:natural] Kokoro here."   # markers work as in a reply
 pnpm start transcribe models/test-wavs/0.wav                     # 16 kHz WAV
 ```
 
-`say` sends the text through the same clause chunker and voice router as a conversation, then prints, for each voice used, the time from its first clause to its first audio, the total synthesis time, the length of the audio, and the real-time factor (synthesis time ÷ audio length; below 1 is faster than real time):
+`say` sends the text through the same clause chunker as a conversation, then prints the time from its first clause to its first audio, the total synthesis time, the length of the audio, and the real-time factor (synthesis time ÷ audio length; below 1 is faster than real time). Measured before voice providers (2026-11-14, Piper and Kokoro):
 
 ```
 standard: first audio 74 ms, synthesis 75 ms, audio 1.63 s, real-time factor 0.05 (1 clauses)
@@ -369,7 +368,7 @@ This runs a scripted four-turn conversation through the real `Conversation` orch
 2. **Realistic delays, eager end-of-turn off:** LLM first token 250 ms, then 60 tokens/s; TTS first audio 150 ms.
 3. **The same with eager end-of-turn on:** `EagerEndOfTurn` arrives 200 ms before `EndOfTurn`. This shows what speculative turns save.
 
-The delays can be changed with the `BENCH_*` variables in `.env.example`. Results on the development machine (median / worst): overhead **0.8 / 1.6 ms** (the voice router accounts for about 0.2 ms of the median); realistic without speculation **508 / 735 ms**; with speculation **307 / 535 ms**. The worst case is the tool turn, which needs two model calls.
+The delays can be changed with the `BENCH_*` variables in `.env.example`. Results on the development machine (median / worst): overhead **0.8 / 1.6 ms** (measured with the voice router, which has since been removed); realistic without speculation **508 / 735 ms**; with speculation **307 / 535 ms**. The worst case is the tool turn, which needs two model calls.
 
 **Live (the real pipeline):**
 
@@ -483,59 +482,32 @@ Each pipeline stage is a service interface in `packages/core` (`Llm`, `Stt`, `Tt
 
 1. Create a package (e.g. `packages/tts-elevenlabs`) that implements the interface and exports a layer reading its settings from the environment. Provider SDKs may only be imported inside their own package.
 2. Add it as a dependency of `apps/assistant` and add one line to the matching map in [`apps/assistant/src/providers.ts`](apps/assistant/src/providers.ts), for example `elevenlabs: ElevenLabsTts.layerConfig`. A layer may fail at build time with the stage's error (`TtsError`, `SttError`, e.g. a missing model); its message is shown at startup, so make it say how to fix the problem.
-3. Select it with `TTS_PROVIDER=elevenlabs` (or make it a voice: see [Voices](#voices)), add its variables to `.env.example`, and compare it with the old provider using `say` and `bench --live` on the same WAV files. For a new STT provider, `transcribe` shows its event timing on a WAV file.
+3. For a voice provider, also add its entry to `ttsProviderInfo` and its voice list (`makeVoices`) to `hostedTtsVoices` (see [Voices](#voices)); then choose one of its voices. Add its variables to `.env.example`, and compare it with the old provider using `say` and `bench --live` on the same WAV files. For a new STT provider, `transcribe` shows its event timing on a WAV file.
 
 ## Voices
 
-The assistant can speak different replies with different TTS engines. Everyday answers use the default voice, and the model can hand a reply such as "sing me a Christmas song" to a more expressive one. The model chooses by starting its reply with a marker like `[voice:expressive]`. It costs no extra model call, and it is never spoken, printed or shown. With only one voice enabled, nothing about voices is added to the prompt. [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#voices-per-reply-tts-selection-voicerouter-in-core) explains how it works.
+The assistant speaks every reply with **one voice**: `ASSISTANT_VOICE`, a voice of one of the **voice providers**, written `provider:voice`. The providers are `sherpa` (on this machine: Piper and Kokoro), `cartesia` and `elevenlabs` (hosted, each needs its key). The model does not choose voices. Design: [docs/VOICE-PROVIDERS.md](docs/VOICE-PROVIDERS.md).
 
-Voices are declared in [`apps/assistant/src/voices.ts`](apps/assistant/src/voices.ts). Three are declared now:
+| Voice | Provider | First audio (this machine, measured 2026-11-14) |
+|---|---|---|
+| `sherpa:en_US-lessac-medium` (default) | Piper, local | 30–90 ms per clause |
+| `sherpa:nl_NL-pim-medium` | Piper, local, Dutch | not measured |
+| `sherpa:kokoro-af_heart` | Kokoro, local (warmer, slower to start, about 700 MB of memory) | 200–950 ms per clause |
+| `cartesia:<voice id>` | Cartesia, hosted (`CARTESIA_API_KEY`) | not measured |
+| `elevenlabs:<voice id>` | ElevenLabs, hosted (`ELEVENLABS_API_KEY`) | not measured |
 
-| Voice | Engine | Enabled | First audio (this machine) |
-|---|---|---|---|
-| `standard` | whatever `TTS_PROVIDER` selects: local Piper `en_US-lessac-medium` by default | always (it is the default) | 30–90 ms per clause |
-| `natural` | local Kokoro `kokoro-af_heart` (warmer, slower to start) | only if listed in `VOICES` | 200–950 ms per clause |
-| `expressive` | hosted Cartesia (needs a key) | only if listed in `VOICES` | not measured |
-
-**Enable the Kokoro voice** (a second engine process, about 700 MB of memory):
-
-```sh
-pnpm --filter @pva/tts-sherpa download kokoro-af_heart
-VOICES=standard,natural          # the model may now pick [voice:natural] for stories and longer explanations
-# DEFAULT_VOICE=natural          # or make Kokoro speak every reply
-```
-
-**Enable the expressive voice:**
+In the web UI, Settings → Voices lists every provider's voices (search, preview, favourites, download of local voices); Settings → Voices → Voice providers takes the keys. From `.env`:
 
 ```sh
-VOICES=standard,expressive
-CARTESIA_API_KEY=...
-VOICE_EXPRESSIVE_CARTESIA_VOICE=<voice id>   # optional: a more expressive Cartesia voice
+ASSISTANT_VOICE=sherpa:kokoro-af_heart          # after: pnpm --filter @pva/tts-sherpa download kokoro-af_heart
+ASSISTANT_VOICE=elevenlabs:EXAVITQu4vr4xnSDxMaL # with ELEVENLABS_API_KEY=...
 ```
 
-**Use ElevenLabs** (hosted, needs a key; [settings](packages/tts-elevenlabs/README.md)): choose *ElevenLabs* as the
-standard voice engine on the Voice engines page and enter the key there, or move one voice to it:
+A provider's other settings (`CARTESIA_MODEL`, `ELEVENLABS_SPEED`, `TTS_SHERPA_SPEED`, …) apply to whichever of its voices is chosen.
 
-```sh
-ELEVENLABS_API_KEY=...
-TTS_PROVIDER=elevenlabs                              # the standard voice on ElevenLabs, or:
-VOICE_EXPRESSIVE_PROVIDER=elevenlabs                 # only the expressive voice
-VOICE_EXPRESSIVE_ELEVENLABS_VOICE=<voice id>         # optional: a voice from your ElevenLabs library
-```
+**Upgrading from named voices.** Installs from before voice providers used `TTS_PROVIDER`, `DEFAULT_VOICE`, `VOICES` and `VOICE_<NAME>_*`. While `ASSISTANT_VOICE` is not set, those settings still choose the voice the old default voice was (for example `DEFAULT_VOICE=natural` speaks with `sherpa:kokoro-af_heart`, `TTS_PROVIDER=elevenlabs` with `ELEVENLABS_VOICE`); `VOICES` is ignored. The rules are in [docs/VOICE-PROVIDERS.md §6.2](docs/VOICE-PROVIDERS.md). Choosing a voice in the UI (or setting `ASSISTANT_VOICE`) replaces them.
 
-Any provider setting can be set for one voice with the prefix `VOICE_<NAME>_`. The setting without the prefix is the fallback; a voice can also declare its own defaults (`natural` declares `TTS_SHERPA_PRESET=kokoro-af_heart`, which beats the unprefixed `TTS_SHERPA_PRESET`). For example `VOICE_STANDARD_TTS_SHERPA_PRESET=nl_NL-pim-medium` makes the standard voice Dutch. `VOICE_<NAME>_PROVIDER` swaps the engine of one voice, and `DEFAULT_VOICE` changes which voice speaks replies without a marker. Only enabled voices are initialised, so a voice you have not enabled never needs a key or a model.
-
-Try voices with `say`: `pnpm start say --voice natural --out kokoro.wav "Once upon a time."` (the chosen voice is the default for that run), or with markers, `VOICES=standard,natural pnpm start say "Piper here. [voice:natural] And Kokoro here."`.
-
-**Add a voice:** add one entry to `voiceCatalog`, for example
-
-```ts
-{ name: "narrator", description: "Long stories and bedtime tales.", provider: "cartesia" },
-```
-
-Then add `narrator` to `VOICES`. The description is what the model reads when it decides, so write it as advice. A local voice with another preset needs no new engine: `{ name: "dutch", description: "Replies in Dutch.", provider: "sherpa", settings: { TTS_SHERPA_PRESET: "nl_NL-pim-medium" } }`. To give a voice a new engine, first add the engine to `ttsProviders` (see the next section).
-
-Engines can have different sample rates. The router resamples every voice to the default voice's rate.
+Try a voice with `say`: `pnpm start say --voice sherpa:kokoro-af_heart --out kokoro.wav "Once upon a time."`.
 
 ## Echo cancellation (barge-in over open speakers)
 
@@ -556,7 +528,7 @@ Measured on the development machine during `bench --live` (resident memory):
 |---|---|---|
 | main process (Node, app, STT worker with the model) | 1.3 GB after loading `parakeet-v2`, 1.66 GB after the first minute, then flat | 2.4 GB `hybrid-nemotron-parakeet`; 1.2 GB `nemotron-560` / `nemotron-320`; 1.9–2.7 GB `whisper-turbo`; 430 MB `zipformer-en` |
 | Piper engine process (`standard` voice) | 280–590 MB (grows with long replies) | |
-| Kokoro engine process (`natural` voice, only when enabled) | about 700 MB (adapter README) | |
+| Kokoro engine process (only when a Kokoro voice is chosen, or previewed) | about 700 MB (adapter README) | |
 
 ## Model licences
 
@@ -566,7 +538,7 @@ Taken from the files in the model archives and the adapter READMEs; nobody has r
 |---|---|---|
 | Piper `en_US-lessac-medium` (default voice) | TTS | trained on the Blizzard 2013 Lessac dataset: **non-commercial (research) use only**. Fine for a personal assistant; choose another voice for anything commercial. |
 | Piper `nl_NL-pim-medium` | TTS (Dutch) | dataset CC0, but fine-tuned from lessac-medium, so the Lessac terms may carry over |
-| Kokoro v1.0 `af_heart` | TTS (`natural` voice) | Apache-2.0 |
+| Kokoro v1.0 `af_heart` | TTS (Kokoro voice) | Apache-2.0 |
 | `espeak-ng-data` (shipped with every TTS preset) | phonemisation | GPL-3.0 data files |
 | Parakeet-TDT 0.6B v2 (default STT) | STT | CC-BY-4.0 (NVIDIA); attribution required |
 | Parakeet Ultra (optional) | STT | CC-BY-4.0 (Moondream, derived from NVIDIA Parakeet v3; not an NVIDIA release) |
@@ -580,7 +552,7 @@ Taken from the files in the model archives and the adapter READMEs; nobody has r
 
 | Part | How it was tested |
 |---|---|
-| Conversation, tool loop, chunker, tracing, voice router | unit tests with scripted fakes |
+| Conversation, tool loop, chunker, tracing | unit tests with scripted fakes |
 | Local STT and TTS adapters | unit tests, plus real-model tests and measurements (see their READMEs) |
 | **Local end to end** (`bench --live` with sherpa STT, Piper TTS, the file audio backend and `LLM_PROVIDER=fake`) | run on the development machine, 2026-11-13: 20-turn runs per configuration, transcripts checked, every speculative turn promoted, reply WAVs checked (22050 Hz, plausible length, about −4 dBFS peak). Numbers in [Measured latency](#measured-latency) |
 | Barge-in with files (voice mode, file backend) | a second question started while a long reply was playing: the reply stopped and history kept only the played part. The file backend cannot hear the assistant, so this tests the logic, **not echo handling** |
@@ -616,7 +588,7 @@ PVA_PIPEWIRE_LIVE=1 pnpm --filter @pva/audio-pipewire test
 ## Repository layout
 
 ```
-packages/core             service interfaces, Conversation, tool registry, clause chunker, TurnTrace, voice router, test fakes
+packages/core             service interfaces, Conversation, tool registry, clause chunker, TurnTrace, voice references, test fakes
 packages/llm-anthropic    Llm via @anthropic-ai/sdk
 packages/stt-sherpa       Stt on this machine: sherpa-onnx (whole-turn Parakeet/Whisper, streaming Nemotron, hybrid) + Silero VAD + gain control in a worker thread, turn detection (default)
 packages/tts-sherpa       Tts on this machine: Piper / Kokoro via sherpa-onnx, one child process per engine (default)
@@ -630,6 +602,6 @@ packages/protocol         the browser ↔ assistant protocol: message schemas, b
 packages/agent-claude-code the claude-subscription agent (Claude Code with the owner's login), off by default with an opt-in
 models/                   downloaded models (git-ignored; pnpm download-models)
 packages/modules-builtin  clock, weather
-apps/assistant            providers.ts, voices.ts, modules.ts, modes: text, voice, serve, bench, say, transcribe
+apps/assistant            providers.ts, voiceSelection.ts, modules.ts, modes: text, voice, serve, bench, say, transcribe
 apps/web                  the web UI (Next.js static export), served by serve mode
 ```

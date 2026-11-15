@@ -1,6 +1,5 @@
 import type { InterruptMode } from "@pva/protocol"
 import type { SttEvent } from "./Domain.ts"
-import { stripVoiceMarkers } from "./VoiceMarkers.ts"
 
 /**
  * The echo gate (docs/UI-AND-MODULES.md §5): sits between the speech
@@ -47,7 +46,7 @@ export interface EchoGate {
   playbackStarted(now: number): void
   /** Playback finished or stopped; the window closes `ECHO_TAIL_MS` later. */
   playbackEnded(now: number): void
-  /** A clause started playing (raw text; voice markers are removed). */
+  /** A clause started playing (its text as sent to the voice). */
   clausePlayed(text: string, now: number): void
   /** Whether the audible window is open at `now`. */
   audible(now: number): boolean
@@ -102,7 +101,7 @@ export const makeEchoGate = (initial: InterruptMode = "confirm"): EchoGate => {
       endedAt = now
     },
     clausePlayed: (text, now) => {
-      played.push({ words: words(stripVoiceMarkers(text)), at: now })
+      played.push({ words: words(text), at: now })
     },
     audible,
     filter: (event, now) => {

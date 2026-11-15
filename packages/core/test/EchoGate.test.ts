@@ -5,7 +5,7 @@ import { endOfTurn, interim, speechStarted, turnResumed } from "../src/testing.t
 const playing = (mode: "instant" | "confirm" | "manual") => {
   const gate = makeEchoGate(mode)
   gate.playbackStarted(0)
-  gate.clausePlayed("[voice:standard] It's sunny in Paris, eighteen degrees.", 0)
+  gate.clausePlayed("It's sunny in Paris, eighteen degrees.", 0)
   gate.clausePlayed("Light wind from the west.", 500)
   return gate
 }

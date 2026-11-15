@@ -71,7 +71,7 @@ const vaultState = async (client: ScriptedClient, pred: (v: VaultInfo) => boolea
 }
 
 const protectedUpdate = { type: "settings.update", sectionId: "language-model", patch: { values: { LLM_PROVIDER: "fake" }, secrets: {} } } as const
-const openUpdate = { type: "settings.update", sectionId: "voices", patch: { values: { DEFAULT_VOICE: "standard" }, secrets: {} } } as const
+const openUpdate = { type: "settings.update", sectionId: "voices", patch: { values: { ASSISTANT_VOICE: null }, secrets: {} } } as const
 const configureGreeter = { type: "module.configure", moduleId: "greeter", patch: { values: { greeting: "hoi" }, secrets: {} } } as const
 
 /** A provider build that needs ANTHROPIC_API_KEY from the settings (as the real Anthropic adapter does). */
@@ -106,7 +106,7 @@ describe("serve: key vault and admin access", () => {
       "stt-mic": false,
       "stt-deepgram": true,
       voices: false,
-      "voice-engines": true,
+      "voice-providers": true,
       recordings: false
     })
     expect(welcome.snapshot.modules[0]).toMatchObject({ id: "greeter", protected: true })

@@ -702,25 +702,6 @@ export const lastLatency = (s: ClientState) => {
   return undefined
 }
 
-/** The voice name to show next to SPEAKING: only when more than one voice is enabled. */
-export const speakingVoice = (s: ClientState): string | undefined => {
-  if (s.summary.voices.length < 2) return undefined
-  const turnId = s.audio.playing?.turnId ?? s.session.stateTurnId
-  if (turnId === undefined) return undefined
-  const idx = findTurn(s.turns, turnId)
-  if (idx === -1) return undefined
-  const t = s.turns[idx]!
-  const clause = t.clauses[Math.max(0, t.playedClause)]
-  return clause?.voice ?? defaultVoiceOf(s)
-}
-
-/** The voice a reply uses when no clause names one: the profile's voice, else the assistant's default. */
-export const defaultVoiceOf = (s: ClientState): string | undefined => {
-  const chosen = profileOf(s).voice
-  if (chosen !== "" && s.summary.voices.some((v) => v.name === chosen)) return chosen
-  return s.summary.voices.find((v) => v.isDefault)?.name
-}
-
 /** "Hey Jeff" for "hey jeff": a phrase as shown on the stage. */
 export const displayPhrase = (phrase: string): string => phrase.replace(/(^|\s)(\p{L})/gu, (_m, space: string, letter: string) => space + letter.toUpperCase())
 

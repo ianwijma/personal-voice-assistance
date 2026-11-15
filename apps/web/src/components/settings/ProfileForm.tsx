@@ -27,12 +27,12 @@ import {
   normalisePhrase,
   overridesEqual,
   phraseProblem,
+  liveProfileFields,
   PROFILE_GROUPS,
   setOverride
 } from "@/lib/profileForm.ts"
 import { displayPhrase } from "@/lib/state.ts"
-import { shallowEqual } from "@/lib/store.ts"
-import { useClient, useClientState } from "../context.tsx"
+import { useClient } from "../context.tsx"
 import { inputClass } from "../fields/types.ts"
 import { Icon, Spinner } from "../ui/Icon.tsx"
 import { Button, cx, Segmented, Switch } from "../ui/controls.tsx"
@@ -45,7 +45,6 @@ const help = (device: boolean): Partial<Record<ProfileField, string>> => {
     wakeMatch: "Close accepts small differences in longer words (“hey jeffs”, “hey geff”). Add a phrase for anything else.",
     followUpSeconds: "After a reply, the next question needs no phrase within this time. 0 = say the phrase every time.",
     conversationIdleMinutes: `After this long without a turn, the next thing said on ${here} starts a fresh conversation: the assistant forgets the earlier one. 0 = never.`,
-    voice: `The voice replies use on ${here}. A voice that is switched off falls back to the assistant's default.`,
     echoCancellation: "Removes the assistant's own voice from the microphone. On iPhone it also changes your voice's level and can make playback crackle.",
     noiseSuppression: "Filters steady background noise. It can blur quiet words.",
     autoGainControl: "Lets the browser adjust the microphone level.",
@@ -81,11 +80,12 @@ export interface ProfileFormProps {
 }
 
 /**
- * The device-profile form (docs/FRONTENDS-AND-ACTIVATION.md §5): groups Activation, Voice, Interrupting, Audio
- * processing, Display, Advanced. A draft of overrides: a change sets one, Reset removes it (saved as `null`, the field
+ * The device-profile form (docs/FRONTENDS-AND-ACTIVATION.md §5): groups Activation, Interrupting, Conversation,
+ * Audio processing, Display, Advanced. A draft of overrides: a change sets one, Reset removes it (saved as `null`, the field
  * inherits again). One sticky footer saves the page; a change made elsewhere meanwhile shows "Load latest".
  */
-export function ProfileForm({ id, fields, base, saved, showInherited, onSave, afterPhrases, extraDirty = false }: ProfileFormProps) {
+export function ProfileForm({ id, fields: kindFields, base, saved, showInherited, onSave, afterPhrases, extraDirty = false }: ProfileFormProps) {
+  const fields = liveProfileFields(kindFields)
   const [draft, setDraft] = useState<ProfileOverrides>(saved)
   const [from, setFrom] = useState<ProfileOverrides>(saved)
   const [saving, setSaving] = useState(false)
@@ -249,7 +249,8 @@ export function ProfileForm({ id, fields, base, saved, showInherited, onSave, af
           onInvalid={(bad) => markInvalid("conversationIdleMinutes", bad)}
         />
       ), { labelFor: `${id}-conversationIdleMinutes` }),
-    voice: () => row("voice", <VoiceSelect id={`${id}-voice`} value={value("voice")} disabled={saving} onChange={(v) => set("voice", v)} />, { labelFor: `${id}-voice` }),
+    // Retired (docs/VOICE-PROVIDERS.md §1): never shown, see `RETIRED_PROFILE_FIELDS`.
+    voice: () => null,
     interruptMode: () => {
       const mode = INTERRUPT_CHOICES.find((c) => c.value === value("interruptMode")) ?? INTERRUPT_CHOICES[1]
       return row("interruptMode", (
@@ -482,22 +483,6 @@ function NumberInput({ id, value, min, max, unit, disabled, onChange, onInvalid 
       </div>
       {problem !== undefined && <p id={`${id}-problem`} role="alert" className="text-[13px] text-danger">{problem}</p>}
     </div>
-  )
-}
-
-/** Voice ids are lower case ("natural"); shown capitalised, as on the voice page. */
-const cap = (name: string) => (name === "" ? name : name[0]!.toUpperCase() + name.slice(1))
-
-function VoiceSelect({ id, value, disabled, onChange }: { readonly id: string; readonly value: string; readonly disabled: boolean; readonly onChange: (v: string) => void }) {
-  const voices = useClientState((s) => s.engine.voices.filter((v) => v.enabled), shallowEqual)
-  const fallback = voices.find((v) => v.isDefault)
-  const known = value === "" || voices.some((v) => v.name === value)
-  return (
-    <select id={id} value={value} disabled={disabled} onChange={(e) => onChange(e.target.value)} className={cx(inputClass, "max-sm:h-11")}>
-      <option value="">Assistant default{fallback !== undefined ? ` (now ${cap(fallback.name)})` : ""}</option>
-      {voices.map((v) => <option key={v.name} value={v.name}>{cap(v.name)}: {v.description}</option>)}
-      {!known && <option value={value}>{value} (switched off)</option>}
-    </select>
   )
 }
 

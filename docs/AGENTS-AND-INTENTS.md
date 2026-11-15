@@ -1,5 +1,10 @@
 # Agents, trigger routing and typed intents
 
+> **Changed 2026-11-16 (docs/VOICE-PROVIDERS.md):** the assistant speaks every reply with one voice
+> (`ASSISTANT_VOICE`); the voice router, `[voice:NAME]` markers, `VOICES` and `DEFAULT_VOICE` are gone, and a device
+> profile's `voice` no longer changes the voice (it falls back to `""`, the assistant's voice). Where this document
+> describes per-device voices or the router, that is the design as it was.
+
 Design for the next stage: several interchangeable agents (Claude and Codex subscriptions through their harnesses,
 OpenAI-compatible servers on the home network and OpenRouter, the existing Anthropic API), a spoken trigger phrase that
 picks the agent ("hey Jev, …"), a typed-intent path that runs programmatic actions without a conversational model, and a

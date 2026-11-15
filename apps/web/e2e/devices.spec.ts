@@ -19,7 +19,8 @@ test("the list shows every device, which one is talking now and how it activates
   const kitchen = list.locator("[data-device=d-kitchen-ipad-0001]")
   await expect(kitchen).toContainText("Kitchen iPad")
   await expect(kitchen).toContainText("Wake phrase · “hey jeff” +2")
-  await expect(kitchen).toContainText("3 own settings")
+  // Its stored voice (retired, docs/VOICE-PROVIDERS.md §1) is not counted.
+  await expect(kitchen).toContainText("2 own settings")
   await expect(kitchen).toContainText("Seen 2 h ago")
   await expect(kitchen).toContainText("Voice assistant in a browser")
   await expect(list.locator("[data-device=d-pixel-phone-0002]")).toContainText("Always listening")

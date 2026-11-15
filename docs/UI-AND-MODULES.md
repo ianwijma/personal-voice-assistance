@@ -1,5 +1,10 @@
 # Web UI, modules and the browser protocol
 
+> **Changed 2026-11-16 (docs/VOICE-PROVIDERS.md):** the assistant speaks every reply with one voice
+> (`ASSISTANT_VOICE`); the voice router, `[voice:NAME]` markers, `VOICES` and `DEFAULT_VOICE` are gone, and a device
+> profile's `voice` no longer changes the voice (it falls back to `""`, the assistant's voice). Where this document
+> describes per-device voices or the router, that is the design as it was.
+
 Design for the next stage: a browser UI that is also the microphone and speaker, a module system that can be changed while the assistant runs, and the protocol between them. Written 2026-11-13. `docs/ARCHITECTURE.md` remains the contract for everything that already exists; this document adds to it.
 
 ## Changes since the design
@@ -112,7 +117,7 @@ save may now be answered with warnings first (a v2 page could not confirm them) 
 | Sections and modules carry their **placement** (`SettingsSection.group/page/order/visibleWhen`, `ModuleInfo.kind/group`); the server splits the old five sections into the pages of docs/SETTINGS-UI.md §2.1 (`sectionDefinitions.ts`). | Protocol, server | Modules and agents from the catalog appear without UI changes. |
 | Assistant settings are **stored flat by key**: `settings.json` version 2 (`assistant: { KEY: value }`), the vault and `secrets.json` the same (`assistant`); a version-1 file is migrated at load, collision-safe, with `settings.json.v1-backup`. §1.6. | Server (`SettingsStore.ts`, `flatten.ts`, `Vault.ts`) | A field can move between pages without losing its value. |
 | Field `visibleWhen` (judged on the draft in the UI, on the saved values on the server; hidden fields are neither validated nor saved), field `source` (`default` / `saved` / `env-file` / `env-process`, with Reset), option `tags` / `implication` / `module`, form `warnings`, `ErrorInfo.warnings` + `settings.update.confirmWarnings` ("Save anyway"), section cross-field checks, `EngineStatus.reloadPendingFor`, `VaultInfo.lockReason`. | Protocol, core (`Settings.ts`), server | §1.7. |
-| Protected sections are marked in their definition: `language-model`, `stt-engine`, `voice-engines`, plus any with a secret. | Server (`access.ts`) | Same rule, new ids. |
+| Protected sections are marked in their definition: `language-model`, `stt-engine`, `voice-providers` (was `voice-engines`), plus any with a secret. | Server (`access.ts`) | Same rule, new ids. |
 
 **Settings from outside and model downloads (2026-11-14, phase 2b: P4 and P7 of docs/SETTINGS-UI.md)**: **protocol 4**
 (new messages, new closed literal sets). What changed:
@@ -397,7 +402,7 @@ Secrets: in the **key vault** once the owner has set a password (below); before 
   - Setup (`vault.setup`, ≥ 8 characters) imports `secrets.json` and deletes it; an unlock does the same if the file came back (the vault's values win). Change password re-encrypts with a new salt. Lock forgets key and secrets (running engines keep what they started with). Forgotten password: delete the file; the keys are lost.
   - Unlock attempts (also wrong old passwords): after 5 failures in a row refused for 30 s, then the wait doubles (at most an hour). Server-wide, not per connection.
   - Environment still wins (`source: env`); the UI labels such keys "set in .env (not protected)" and the server logs their names at start.
-  - **Admin access** is per connection (`SessionHub`): granted by a successful `vault.setup`, `vault.unlock` or `vault.changePassword` on that connection; ends on disconnect, `vault.lock` (from any admin page: it locks the vault for everyone) or 15 minutes without an admin action. **Protected** (`access.ts`): a section or module with a secret field, the sections that choose providers (`language-model`, `stt-engine`, `voice-engines`; `protected` in `sectionDefinitions.ts`), every agent module. Changes to protected items from other connections are answered `locked`. `PVA_VAULT_PASSWORD` never grants admin access.
+  - **Admin access** is per connection (`SessionHub`): granted by a successful `vault.setup`, `vault.unlock` or `vault.changePassword` on that connection; ends on disconnect, `vault.lock` (from any admin page: it locks the vault for everyone) or 15 minutes without an admin action. **Protected** (`access.ts`): a section or module with a secret field, the sections that choose providers (`language-model`, `stt-engine`, `voice-providers`; `protected` in `sectionDefinitions.ts`), every agent module. Changes to protected items from other connections are answered `locked`. `PVA_VAULT_PASSWORD` never grants admin access.
 - **Environment wins** over both files, everywhere. Consequence for `.env.example`: it currently sets many defaults uncommented (`STT_SHERPA_FINAL_SILENCE_MS=600`, `VOICES=standard`, …); copied as is, they would lock those fields in the UI. The server work must comment out every line whose value equals the default, keeping the explanations.
 
 ### 1.7 Voices, engines and turn detection: assistant settings sections
@@ -425,7 +430,7 @@ settings screen (`group`, `page`, `order`) and may have cross-field **checks** (
 | `stt-mic` (› Microphone processing; with sherpa) | `STT_SHERPA_AGC`, `STT_SHERPA_VAD_THRESHOLD`; advanced `_AGC_MAX_GAIN_DB` | | reload | |
 | `stt-deepgram` (› Deepgram; with deepgram) | `DEEPGRAM_API_KEY`, `DEEPGRAM_EOT_THRESHOLD`, `DEEPGRAM_EAGER_EOT_THRESHOLD`; advanced `_EOT_TIMEOUT_MS` | | reload | Check: eager ≥ final → error |
 | `voices` (Voices › Voices) | `DEFAULT_VOICE` (**live**), `VOICES` | choice, multichoice | live; reload | Check: a Cartesia voice without key → warning |
-| `voice-engines` (Voices › Voice engines) | `TTS_PROVIDER`, `CARTESIA_API_KEY` | choice, secret | reload | Check: Cartesia without key → warning |
+| `voice-providers` (Voices › Voice providers; was `voice-engines`, Voice engines) | `CARTESIA_API_KEY`, `ELEVENLABS_API_KEY` | secret | reload | Since 2026-11-16 (docs/VOICE-PROVIDERS.md): `TTS_PROVIDER` is gone; the voice's provider follows from `ASSISTANT_VOICE` |
 | `recordings` (Diagnostics › Recordings) | `RECORD_HEARD_AUDIO`; advanced `_MAX_FILES` | | live | |
 | not in the UI yet | `VOICE_<NAME>_*`, thread counts, URLs, model folders | | | Environment only (pieces P4/H) |
 | **per device, in the browser** | interrupt mode, microphone, speaker, output path, prebuffer, captions, latency readout | | live | `localStorage`; not server settings, because they depend on the device (headphones on the laptop, speakers on the phone) |

@@ -20,7 +20,10 @@ test("groups, the phrase list with validation, and Save sends only what changed;
   await loginAdmin(page, baseURL, "#settings/frontends")
   const form = page.getByTestId("profile-frontend-web-voice")
   await expect(page.getByTestId("page-frontends-frontend")).toBeVisible()
-  for (const group of ["Activation", "Voice", "Interrupting", "Audio processing", "Display"]) await expect(form.getByRole("heading", { name: group })).toBeVisible()
+  for (const group of ["Activation", "Interrupting", "Audio processing", "Display"]) await expect(form.getByRole("heading", { name: group })).toBeVisible()
+  // A device has no voice of its own any more (docs/VOICE-PROVIDERS.md §1).
+  await expect(form.getByRole("heading", { name: "Voice", exact: true })).toHaveCount(0)
+  await expect(form.locator("[data-field=voice]")).toHaveCount(0)
   await expect(form.locator("[data-group=advanced] summary")).toHaveText(/Advanced/)
 
   await form.getByRole("radio", { name: "Wake phrase" }).click()
@@ -48,8 +51,8 @@ test("groups, the phrase list with validation, and Save sends only what changed;
   await expect(phrasesField.getByTestId("custom-marker")).toHaveText("Custom")
   await expect(phrasesField.getByTestId("reset")).toHaveAccessibleName(/^Reset Wake phrases to the built-in default/)
   // A field named like its group keeps its label for assistive technology only.
-  await expect(form.locator("[data-field=voice] label")).toHaveClass(/sr-only/)
-  await expect(form.locator("#frontend-web-voice-voice")).toHaveAccessibleName("Voice")
+  await expect(form.locator("#frontend-web-voice-activation-label")).toHaveClass(/sr-only/)
+  await expect(form.locator("#frontend-web-voice-activation-label")).toHaveText("Activation")
   expect(await updates()).toEqual([{ activation: "wake-phrase", wakePhrases: ["hey jeff", "hey geoff", "hey geoffrey"] }])
 
   // The running voice page got the new profile: it is asleep now, waiting for the first phrase.

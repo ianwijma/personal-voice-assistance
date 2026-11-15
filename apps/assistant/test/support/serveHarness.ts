@@ -119,11 +119,11 @@ export const toneTts = (options: { readonly sampleRate?: number; readonly millis
 
 export const fakeBuild = (providers: Partial<EngineProviders> & Pick<EngineProviders, "stt" | "llm">): ProviderBuilder =>
   Effect.succeed({
-    voices: [{ name: "standard", description: "Everyday answers.", tts: toneTts() }],
-    defaultVoice: "standard",
+    tts: toneTts(),
+    voice: { provider: "sherpa", voiceId: "en_US-lessac-medium" },
     maxToolRounds: 5,
     engines: [{ stage: "llm", provider: "fake", detail: "scripted", location: "local" }],
-    voiceInfo: [{ name: "standard", description: "Everyday answers.", enabled: true, isDefault: true, engine: "tone", location: "local" }],
+    voiceInfo: [{ name: "sherpa:en_US-lessac-medium", description: "Lessac", enabled: true, isDefault: true, engine: "tone", location: "local" }],
     ...providers
   })
 

@@ -145,18 +145,14 @@ export function OverviewPage() {
       </section>
       {engine.voices.length > 0 && (
         <section>
-          <h4 className="label mb-3 text-ink-faint">Voices</h4>
+          {/* One voice (docs/VOICE-PROVIDERS.md §8): `name` is its key, `description` its name. */}
+          <h4 className="label mb-3 text-ink-faint">Voice</h4>
           <ul className="flex flex-col divide-y divide-line/60 rounded-md border border-line">
             {engine.voices.map((v) => (
-              <li key={v.name} className="flex items-start gap-3 px-3 py-2.5">
+              <li key={v.name} className="flex items-start gap-3 px-3 py-2.5" data-testid="running-voice" data-voice={v.name}>
                 <span className="min-w-0 flex-1">
-                  <span className="flex items-center gap-2">
-                    <span className={cx("text-[14px]", v.enabled ? "text-ink" : "text-ink-muted")}>{v.name}</span>
-                    {v.isDefault && <span className="label text-[9px] text-voice">Default</span>}
-                    {!v.enabled && <span className="label text-[9px] text-ink-faint">Off</span>}
-                  </span>
-                  <span className="block text-[13px] text-ink-muted">{v.description}</span>
-                  <span className="block font-mono text-[12px] text-ink-faint">{v.engine}</span>
+                  <span className="block text-[14px] text-ink">{v.description || v.name}</span>
+                  <span className="block truncate font-mono text-[12px] text-ink-faint">{v.engine}</span>
                 </span>
                 <Where location={v.location} />
               </li>

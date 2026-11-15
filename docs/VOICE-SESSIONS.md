@@ -1,5 +1,10 @@
 # Voice sessions: one conversation per device, several devices at once
 
+> **Changed 2026-11-16 (docs/VOICE-PROVIDERS.md):** the assistant speaks every reply with one voice
+> (`ASSISTANT_VOICE`); the voice router, `[voice:NAME]` markers, `VOICES` and `DEFAULT_VOICE` are gone, and a device
+> profile's `voice` no longer changes the voice (it falls back to `""`, the assistant's voice). Where this document
+> describes per-device voices or the router, that is the design as it was.
+
 Design written 2026-11-14 (lead session), at the owner's request. It changes three things:
 
 1. **Several devices at once.** Every voice device (a browser today; satellites around the house later) gets its own

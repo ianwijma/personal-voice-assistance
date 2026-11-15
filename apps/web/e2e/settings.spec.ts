@@ -32,9 +32,10 @@ test.describe("desktop (1280 × 800)", () => {
     await page.goBack()
     await expect(page.getByTestId("page-overview-overview")).toBeVisible()
 
-    await page.goto(adminUrl(baseURL, "#settings/voices/engines")) // the session token survives the navigation
-    await expect(page.getByTestId("page-voices-engines")).toBeVisible()
-    await expect(page.getByTestId("nav-voices-engines")).toHaveAttribute("aria-current", "page")
+    await page.goto(adminUrl(baseURL, "#settings/voices/providers")) // the session token survives the navigation
+    await expect(page.getByTestId("page-voices-providers")).toBeVisible()
+    await expect(page.getByTestId("nav-voices-providers")).toHaveAttribute("aria-current", "page")
+    await expect(page.getByTestId("page-title")).toHaveText("Voice providers")
   })
 
   test("Leave without saving? Stay keeps the edit; Discard leaves", async ({ page, baseURL }) => {

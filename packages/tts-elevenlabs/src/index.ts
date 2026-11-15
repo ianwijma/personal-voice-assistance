@@ -8,6 +8,8 @@ import { Cause, Config, Effect, Layer, Queue, Redacted, Stream } from "effect"
 import WebSocket from "ws"
 import { addressSecrets, checkAddress, clip, errorName, fromUpstream, sanitize, type Secrets, secretList } from "./redact.ts"
 
+export { describeVoice, type ElevenLabsVoicesOptions, makeVoices, voicesConfig } from "./voices.ts"
+
 export const DEFAULT_BASE_URL = "wss://api.elevenlabs.io"
 /** The docs' low-latency model for the multi-context WebSocket (~100 ms median, 32 languages). Measure others with TurnTrace. */
 export const DEFAULT_MODEL = "eleven_flash_v2_5"

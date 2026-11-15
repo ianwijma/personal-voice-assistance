@@ -194,7 +194,7 @@ const adminOnly: ReadonlyArray<RequestInput> = [
   { type: "module.enable", moduleId: "greeter" },
   { type: "module.disable", moduleId: "greeter" },
   { type: "module.configure", moduleId: "greeter", patch: { values: { greeting: "hoi" }, secrets: {} } },
-  { type: "settings.update", sectionId: "voices", patch: { values: { DEFAULT_VOICE: "standard" }, secrets: {} } },
+  { type: "settings.update", sectionId: "voices", patch: { values: { ASSISTANT_VOICE: "sherpa:en_US-lessac-medium" }, secrets: {} } },
   { type: "engine.reload" },
   { type: "vault.setup", password: "correct horse battery" },
   { type: "vault.unlock", password: "correct horse battery" },
@@ -286,10 +286,10 @@ describe("front-end kinds and devices", () => {
     const listed = await admin.client.waitFor("devices", (m) => m.devices.some((d) => d.id === "phone-0001" && d.connections === 2), { from: 0 })
     expect(listed.devices.find((d) => d.id === "phone-0001")).toMatchObject({ kind: WEB_VOICE_KIND, name: "Test browser", overrides: {}, audioOwner: false })
 
-    expect((await request(tab1.client, { type: "device.update", patch: { activation: "wake-phrase", followUpSeconds: 3, voice: "standard" } })).ok).toBe(true)
+    expect((await request(tab1.client, { type: "device.update", patch: { activation: "wake-phrase", followUpSeconds: 3, voice: "sherpa:en_US-lessac-medium" } })).ok).toBe(true)
     for (const tab of [tab1, tab2]) {
       const p = await profileOf(tab.client, (m) => m.profile.activation === "wake-phrase")
-      expect(p.profile).toMatchObject({ followUpSeconds: 3, voice: "standard" })
+      expect(p.profile).toMatchObject({ followUpSeconds: 3, voice: "sherpa:en_US-lessac-medium" })
     }
     await admin.client.waitFor("devices", (m) => m.devices.some((d) => d.overrides.activation === "wake-phrase"), { from: 0 })
     // Not editable by the device itself; an unknown voice; a page without a device.
@@ -308,7 +308,7 @@ describe("front-end kinds and devices", () => {
 
     const saved = JSON.parse(readFileSync(join(server.dataDir, "settings.json"), "utf8"))
     expect(saved.version).toBe(3)
-    expect(saved.devices["phone-0001"]).toMatchObject({ kind: WEB_VOICE_KIND, name: "Test browser", overrides: { activation: "wake-phrase", voice: "standard" } })
+    expect(saved.devices["phone-0001"]).toMatchObject({ kind: WEB_VOICE_KIND, name: "Test browser", overrides: { activation: "wake-phrase", voice: "sherpa:en_US-lessac-medium" } })
   })
 
   it("admin: kind defaults and device overrides reach running devices live; rename, reset, forget; unknown ids", async () => {
@@ -376,38 +376,20 @@ describe("front-end kinds and devices", () => {
     expect(server.handle.sessions.get("speaker-01")?.gate.mode()).toBe("instant")
   })
 
-  it("per-device voice: the owner's profile voice speaks its replies; empty = the assistant's default", async () => {
+  it("per-device voices are retired: every reply is spoken with the assistant's voice (docs/VOICE-PROVIDERS.md §1)", async () => {
     const stt = controlledStt()
     const llm = scriptedLlm((t) => `You said: ${t}.`)
-    const server = await startTestServer({
-      build: fakeBuild({
-        stt: stt.stt,
-        llm: llm.llm,
-        voices: [
-          { name: "standard", description: "Everyday answers.", tts: toneTts() },
-          { name: "bright", description: "Cheerful.", tts: toneTts() }
-        ],
-        voiceInfo: [
-          { name: "standard", description: "Everyday answers.", enabled: true, isDefault: true, engine: "tone", location: "local" },
-          { name: "bright", description: "Cheerful.", enabled: true, isDefault: false, engine: "tone", location: "local" }
-        ]
-      })
-    })
+    const server = await startTestServer({ build: fakeBuild({ stt: stt.stt, llm: llm.llm }) })
     servers.push(server)
     const owner = await voicePage(server)
-    expect(owner.welcome.snapshot.engine.voices.map((v) => v.name)).toEqual(["standard", "bright"])
+    expect(owner.welcome.snapshot.engine.voices.map((v) => v.name)).toEqual(["sherpa:en_US-lessac-medium"])
     await owner.client.claim()
-    expect((await request(owner.client, { type: "device.update", patch: { voice: "bright" } })).ok).toBe(true)
-    await profileOf(owner.client, (m) => m.profile.voice === "bright")
+    // An old voice name is not a voice any more.
+    expect((await request(owner.client, { type: "device.update", patch: { voice: "natural" } })).ok).toBe(false)
     stt.emit(endOfTurn("hi"))
     const spoken = await owner.client.waitFor("assistant.text", () => true, { timeoutMs: 10_000 })
-    expect(spoken.voice).toBe("bright")
+    expect(spoken.voice).toBe("sherpa:en_US-lessac-medium")
     await owner.client.waitFor("turn.end", () => true, { timeoutMs: 10_000 })
-    expect((await request(owner.client, { type: "device.update", patch: { voice: null } })).ok).toBe(true)
-    await profileOf(owner.client, (m) => m.profile.voice === "")
-    const from = owner.client.messages.length
-    stt.emit(endOfTurn("again"))
-    expect((await owner.client.waitFor("assistant.text", () => true, { from, timeoutMs: 10_000 })).voice).toBe("standard")
   })
 })
 

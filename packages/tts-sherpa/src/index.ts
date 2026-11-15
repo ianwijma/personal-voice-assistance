@@ -17,9 +17,11 @@ import {
   presets
 } from "./Presets.ts"
 import { makeEngineTts } from "./SherpaTts.ts"
+import { makeVoicesWith, type SherpaVoicesOptions, temporaryEngine } from "./voices.ts"
 
 export { defaultJoinOptions, type JoinOptions } from "./Pcm.ts"
 export { DEFAULT_PRESET, defaultModelDir, type EngineKind, type Preset, presetFiles, presetLabel, presets, sizeMb } from "./Presets.ts"
+export { listVoices, type SherpaVoicesOptions } from "./voices.ts"
 export { cleanPartials, deletePreset, DownloadError, type DownloadProgress, downloadPreset, isInstalled, presetArchive } from "./download.ts"
 
 export interface SherpaTtsOptions {
@@ -97,3 +99,9 @@ export const config = (prefix = "TTS_SHERPA_"): Config.Config<SherpaTtsOptions> 
 /** `Tts` configured from `<prefix>PRESET`, `<prefix>THREADS`, ... (see `config`). */
 export const layerConfig = (prefix = "TTS_SHERPA_"): Layer.Layer<Tts, TtsError | Config.ConfigError> =>
   Layer.effect(Tts, Effect.flatMap(config(prefix), make))
+
+/**
+ * The voices on this machine (`TtsVoices`, docs/VOICE-PROVIDERS.md §7.2): the presets with their install state, and
+ * previews through `options.engineFor` (default: a temporary engine per preview).
+ */
+export const makeVoices = (options: SherpaVoicesOptions = {}) => makeVoicesWith(options, temporaryEngine(make))

@@ -8,6 +8,8 @@ import { Cause, Config, Effect, Layer, Queue, Redacted, Stream } from "effect"
 import WebSocket from "ws"
 import { addressSecrets, checkAddress, clip, errorName, fromUpstream, sanitize, type Secrets, secretList } from "./redact.ts"
 
+export { type CartesiaVoicesOptions, describeVoice, makeVoices, voicesConfig } from "./voices.ts"
+
 export const CARTESIA_VERSION = "2026-08-14"
 export const DEFAULT_BASE_URL = "wss://api.cartesia.ai"
 /** Docs: "We recommend using Sonic 3.6". Configurable because 3.5 may be faster; measure with TurnTrace. */

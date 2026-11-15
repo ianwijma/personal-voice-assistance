@@ -7,6 +7,7 @@ import { describeMicError, MicFallbackError, type PlayerEvent, VoiceAudio } from
 import { type Connection, makeConnection, type RequestInput, type ResultMessage, resolveWsUrl } from "./connection.ts"
 import { EchoTestCancelled, runEchoTest } from "./echoTest.ts"
 import { deviceHello } from "./device.ts"
+import { ADMIN_TOKEN_KEY } from "./adminToken.ts"
 import { createPrefsStore, type Prefs, type PrefsStore } from "./prefs.ts"
 import { sessionsFullText } from "./sessions.ts"
 import { navigateSettings, type SettingsPath } from "./settingsTree.ts"
@@ -95,8 +96,7 @@ export interface AssistantClient {
 }
 
 const clientIdKey = "pva.clientId"
-/** The admin session token: per tab, gone when the tab closes (docs/FRONTENDS-AND-ACTIVATION.md §1). */
-export const ADMIN_TOKEN_KEY = "pva.adminToken"
+export { ADMIN_TOKEN_KEY }
 
 const readToken = (): string | undefined => {
   try {

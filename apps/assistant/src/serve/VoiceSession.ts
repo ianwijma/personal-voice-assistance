@@ -9,7 +9,7 @@ import {
   type SttEvent,
   type TurnSetup,
   TurnTrace,
-  type Voice,
+  voiceKey,
   type WakeConfig,
   wakeConfigFromProfile
 } from "@pva/core"
@@ -25,16 +25,10 @@ import { makeStateTracker, type StateTracker } from "./StateTracker.ts"
  * One device's voice session (docs/VOICE-SESSIONS.md §2): what serve mode used to wire once for the whole server,
  * wired per device. Its own `WebAudio` (microphone in, replies out, to the owner tab of this device), echo gate,
  * wake gate, state tracker, publisher, "save what it hears" tap, typed-input admission and `Conversation` (with its
- * own history), on the shared engines. Configured from its device profile (echo-gate mode, wake config, default
- * voice, idle reset), read live. Who owns the audio (which tab of the device) is the hub's business: it calls
+ * own history), on the shared engines. Configured from its device profile (echo-gate mode, wake config, idle reset),
+ * read live. Who owns the audio (which tab of the device) is the hub's business: it calls
  * `web.setOwner` / `setMicLive` and `ownerChanged`.
  */
-
-/** The enabled voices and a default voice. */
-export interface VoicesNow {
-  readonly names: ReadonlyArray<Voice>
-  readonly defaultVoice: string
-}
 
 export interface VoiceSessionOptions {
   /** The session's key: the device id, or the client id of a voice connection without a device. */
@@ -45,11 +39,8 @@ export interface VoiceSessionOptions {
   readonly engine: Engine
   /** The device's effective profile now. */
   readonly profile: () => DeviceProfile
-  /** The assistant's default voice (`DEFAULT_VOICE`) and the enabled voices, for a profile with `voice: ""`. */
-  readonly assistantDefaultVoice: () => string
-  readonly enabledVoices: () => ReadonlySet<string>
-  /** Per session: the turn setup, and the agent setup (claude-subscription), given this session's voices. */
-  readonly conversationSetup: (voices: () => VoicesNow | undefined) => {
+  /** Per session: the turn setup, and the agent setup (claude-subscription). */
+  readonly conversationSetup: () => {
     readonly setup: Effect.Effect<TurnSetup>
     readonly agentSetup?: (providers: EngineProviders) => Effect.Effect<AgentTurnSetup> | undefined
   }
@@ -154,13 +145,12 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
     })
     yield* Effect.addFinalizer(() => Effect.sync(() => tracker.dispose()))
 
-    /** This session's default voice: its profile's (when enabled), else the assistant's. */
-    const defaultVoice = () => {
-      const own = options.profile().voice
-      return own !== "" && options.enabledVoices().has(own) ? own : options.assistantDefaultVoice()
-    }
     let conversation: SessionConversation | undefined
-    const voicesNow = (): VoicesNow | undefined => conversation?.voices()
+    /** The voice key this session speaks with ("" while its loop does not run). */
+    const voiceNow = (): string => {
+      const voice = conversation?.voice() ?? options.engine.voice()
+      return voice === undefined ? "" : voiceKey(voice)
+    }
 
     const send = (message: ServerMessage) => {
       if (message.type === "turn.end") {
@@ -174,10 +164,7 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
       broadcast: send,
       onCommitted: (turnId) => tracker.turnPromoted(turnId),
       moduleOfTool: options.moduleOfTool,
-      voices: () => {
-        const v = voicesNow()
-        return { defaultVoice: v?.defaultVoice ?? defaultVoice(), names: new Set(v?.names.map((x) => x.name) ?? []) }
-      },
+      voice: voiceNow,
       ...(options.onTrace !== undefined ? { onTrace: options.onTrace } : {})
     })
 
@@ -324,7 +311,7 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
       }))
 
     const minuteMs = options.minuteMs ?? 60_000
-    const { setup, agentSetup } = options.conversationSetup(voicesNow)
+    const { setup, agentSetup } = options.conversationSetup()
     conversation = yield* makeSessionConversation({
       engine: options.engine,
       input,
@@ -339,7 +326,6 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
         options.onChange(false)
       },
       gate: gateStream,
-      defaultVoice,
       // The device's conversationIdleMinutes, live (0 = never).
       idleResetMs: () => {
         const minutes = options.profile().conversationIdleMinutes

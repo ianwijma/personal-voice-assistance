@@ -39,4 +39,4 @@ export const settingsPages: ReadonlyArray<SettingsPageEntry> = [
 export const clientPage = (group: string, id: string): ComponentType | undefined =>
   settingsPages.find((p) => p.group === group && p.id === id)?.component
 
-export { fieldRenderers } from "./fieldRenderers.ts"
+export { fieldRenderers, fieldRenderersByKey } from "./fieldRenderers.ts"

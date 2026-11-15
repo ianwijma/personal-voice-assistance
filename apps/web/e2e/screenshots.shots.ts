@@ -8,7 +8,7 @@
  */
 import { join } from "node:path"
 import type { Browser, BrowserContextOptions, Page } from "@playwright/test"
-import { ADMIN_PASSWORD, adminUrl, appUrl, expect, expectVisualState, gotoAdmin, here, loginAdmin, mock, test } from "./fixtures.ts"
+import { ADMIN_PASSWORD, adminUrl, appUrl, expect, expectVisualState, gotoAdmin, here, loginAdmin, MOCK, mock, test } from "./fixtures.ts"
 
 const dir = process.env.SCREENSHOT_DIR ?? join(here, "..", "screenshots")
 const shot = (page: Page, name: string) => page.screenshot({ path: join(dir, `${name}.png`) })
@@ -19,12 +19,14 @@ const captionHas = (page: Page, text: string) =>
 const DESKTOP: BrowserContextOptions = { viewport: { width: 1280, height: 800 } }
 const PHONE: BrowserContextOptions = { viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true, deviceScaleFactor: 2 }
 
-/** A voice the assistant no longer has, added to this page's list (a stale list): choosing it is refused. */
-const staleVoice = (page: Page) =>
+/** The next activation change from this page is rewritten to a field a device may not change itself: refused. */
+const refusedChange = (page: Page) =>
   page.evaluate(() => {
-    const c = (window as unknown as { __pva: { store: { get: () => { summary: { voices: ReadonlyArray<unknown> } }; dispatch: (a: unknown) => void } } }).__pva
-    const s = c.store.get().summary
-    c.store.dispatch({ type: "engine.summary", engine: { ...s, voices: [...s.voices, { name: "expressive", description: "Lively, through Cartesia.", isDefault: false }] } })
+    const send = WebSocket.prototype.send
+    WebSocket.prototype.send = function(this: WebSocket, data) {
+      if (typeof data === "string" && data.includes("\"device.update\"")) data = data.replace(/"activation":"[a-z-]+"/, "\"captions\":false")
+      return send.call(this, data)
+    }
   })
 
 const start = async (page: Page, baseURL: string | undefined) => {
@@ -124,18 +126,12 @@ test.describe("voice, desktop, dark", () => {
     await expect(page.getByTestId("wake-phrases")).toBeVisible()
     await settle(page, 400)
     await shot(page, "voice-desktop-11-settings-sheet-wake-phrase")
-    // A refused change (a stale voice list): the message stays next to the control, in the sheet.
+    // A refused change: the message stays next to the control, in the sheet.
+    await refusedChange(page)
     await page.getByTestId("voice-sheet").getByRole("radio", { name: "Always listening" }).click()
-    await staleVoice(page)
-    await page.getByTestId("voice-sheet").locator("[data-voice=expressive]").click()
     await expect(page.getByTestId("sheet-error")).toBeVisible()
     await settle(page, 400)
     await shot(page, "voice-desktop-18-settings-sheet-error")
-    await page.getByTestId("sheet-error").getByRole("button", { name: "Dismiss this message" }).click()
-    await page.getByTestId("voice-sheet").locator("[data-voice]").nth(1).click()
-    await expect(page.getByTestId("voice-note")).toHaveText("Used from the next reply.")
-    await settle(page, 300)
-    await shot(page, "voice-desktop-19-settings-sheet-voice-chosen")
   })
 
   test("new conversation: the button, the divider, after a quiet while, too many devices", async ({ page, browser, baseURL }) => {
@@ -782,5 +778,103 @@ test.describe("admin, long wake phrase, 320 px", () => {
     await page.getByTestId("phrase-list").evaluate((el) => el.scrollIntoView({ block: "center" }))
     await settle(page)
     await shot(page, "admin-phone-320-05-long-phrase-editor")
+  })
+})
+
+/**
+ * The voice picker (docs/VOICE-PROVIDERS.md §4) on Voices › Voices: the closed button, then the popup with
+ * Favourites, one provider, a download in progress, a preview playing, a search across providers, and a provider
+ * that needs a key. `names`: the file name of each, in that order.
+ */
+const pickerShots = async (page: Page, baseURL: string | undefined, names: {
+  readonly closed: string
+  readonly favourites: string
+  readonly provider: string
+  readonly download: string
+  readonly preview?: string
+  readonly search: string
+  readonly needsKey: string
+}, phone = false) => {
+  await mock.scenario("typed")
+  await loginAdmin(page, baseURL, "#settings/voices/overview")
+  const picker = page.getByTestId("voice-picker")
+  const popup = page.getByTestId("voice-popup")
+  const press = (l: ReturnType<Page["locator"]>) => (phone ? l.tap() : l.click())
+  const tab = (id: string) => page.getByTestId("voice-rail").locator(`[data-tab="${id}"]`)
+  await expect(picker).toContainText("Lessac")
+  await settle(page)
+  await shot(page, names.closed)
+  await press(picker)
+  await expect(popup.getByTestId("voice-row").first()).toBeVisible()
+  await settle(page, 400)
+  await shot(page, names.favourites)
+  await press(tab("sherpa"))
+  await settle(page)
+  await shot(page, names.provider)
+  const alba = popup.locator("[data-voice='sherpa:en_GB-alba-medium']")
+  await press(alba.locator("[data-action=download]"))
+  await expect.poll(async () => Number(await alba.getByRole("progressbar").getAttribute("aria-valuenow") ?? 0)).toBeGreaterThanOrEqual(30)
+  await shot(page, names.download)
+  await press(alba.locator("[data-action=cancel]"))
+  if (names.preview !== undefined) {
+    const heart = popup.locator("[data-voice='sherpa:kokoro-af_heart']")
+    await press(heart.locator("[data-action=preview]"))
+    await expect(heart).toHaveAttribute("data-preview", "playing")
+    await settle(page, 300)
+    await shot(page, names.preview)
+    await press(heart.locator("[data-action=stop]"))
+  }
+  await popup.getByTestId("voice-search").fill("gb")
+  await expect(popup.getByTestId("voice-list")).toHaveAttribute("data-mode", "search")
+  await settle(page)
+  await shot(page, names.search)
+  await press(tab("cartesia"))
+  await expect(popup.getByTestId("provider-needs-key")).toBeVisible()
+  await settle(page)
+  await shot(page, names.needsKey)
+}
+
+test.describe("voice picker, desktop, dark", () => {
+  test.use({ colorScheme: "dark", ...DESKTOP })
+  test("closed, favourites, a provider, a download, a preview, search, needs a key", async ({ page, baseURL }) => {
+    await fetch(`${MOCK}/mock/voices/hold`, { method: "POST", body: JSON.stringify({ ms: 0 }) })
+    await pickerShots(page, baseURL, {
+      closed: "admin-desktop-21-voice-picker-closed",
+      favourites: "admin-desktop-22-voice-picker-favourites",
+      provider: "admin-desktop-23-voice-picker-provider",
+      download: "admin-desktop-24-voice-picker-download",
+      preview: "admin-desktop-25-voice-picker-preview",
+      search: "admin-desktop-26-voice-picker-search",
+      needsKey: "admin-desktop-27-voice-picker-needs-key"
+    })
+  })
+})
+
+test.describe("voice picker, desktop, light", () => {
+  test.use({ colorScheme: "light", ...DESKTOP })
+  test("closed, favourites, a provider, a download, search, needs a key", async ({ page, baseURL }) => {
+    await pickerShots(page, baseURL, {
+      closed: "admin-desktop-light-08-voice-picker-closed",
+      favourites: "admin-desktop-light-09-voice-picker-favourites",
+      provider: "admin-desktop-light-10-voice-picker-provider",
+      download: "admin-desktop-light-11-voice-picker-download",
+      preview: "admin-desktop-light-12-voice-picker-preview",
+      search: "admin-desktop-light-13-voice-picker-search",
+      needsKey: "admin-desktop-light-14-voice-picker-needs-key"
+    })
+  })
+})
+
+test.describe("voice picker, phone, dark", () => {
+  test.use({ colorScheme: "dark", ...PHONE })
+  test("the bottom sheet: closed, favourites, a provider, a download, search, needs a key", async ({ page, baseURL }) => {
+    await pickerShots(page, baseURL, {
+      closed: "admin-phone-10-voice-picker-closed",
+      favourites: "admin-phone-11-voice-picker-favourites",
+      provider: "admin-phone-12-voice-picker-provider",
+      download: "admin-phone-13-voice-picker-download",
+      search: "admin-phone-14-voice-picker-search",
+      needsKey: "admin-phone-15-voice-picker-needs-key"
+    }, true)
   })
 })

@@ -215,10 +215,11 @@ test.describe("admin wording and states", () => {
   test("when a field's label is its group's heading, the markers sit on the heading's row", async ({ page, baseURL }) => {
     await mock.scenario("devices")
     await loginAdmin(page, baseURL, "#settings/devices/d-kitchen-ipad-0001")
-    const voice = page.locator("[data-field=voice]")
-    const heading = voice.locator("h4")
-    await expect(heading).toHaveText("Voice")
-    const markers = voice.getByTestId("field-markers")
+    // Activation's first field is "Activation" (the Voice group, the other such case, was retired).
+    const field = page.locator("[data-field=activation]")
+    const heading = field.locator("h4")
+    await expect(heading).toHaveText("Activation")
+    const markers = field.getByTestId("field-markers")
     await expect(markers).toBeVisible()
     const h = (await heading.boundingBox())!
     const m = (await markers.boundingBox())!

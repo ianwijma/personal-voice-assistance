@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest"
-import { DEFAULT_DEVICE_PROFILE, type ServerMessage } from "@pva/protocol"
+import { DEFAULT_DEVICE_PROFILE, PROFILE_FIELDS, type ServerMessage } from "@pva/protocol"
 import { exampleAdminSnapshot, exampleDevice, exampleFrontend, serverExamples } from "@pva/protocol/examples"
 import { CUE_MS, CUE_RATE, wakeCue } from "@/lib/audio/cue.ts"
 import { deviceId, deviceNameFromUserAgent } from "@/lib/device.ts"
@@ -10,8 +10,10 @@ import {
   draftPatch,
   effectiveValue,
   lastSeenText,
+  liveProfileFields,
   phraseFromHeard,
   phraseProblem,
+  PROFILE_GROUPS,
   setOverride
 } from "@/lib/profileForm.ts"
 import { buildSettingsTree, parentPath, resolveSettingsPath } from "@/lib/settingsTree.ts"
@@ -143,6 +145,12 @@ describe("the profile form", () => {
     expect(displayProfileValue("interruptMode", "confirm")).toBe("A few words")
     expect(activationSummary(DEFAULT_DEVICE_PROFILE)).toBe("Always listening")
     expect(activationSummary({ ...DEFAULT_DEVICE_PROFILE, activation: "wake-phrase" })).toBe("Wake phrase · “hey jeff” +2")
+  })
+
+  it("leaves out the retired voice field (docs/VOICE-PROVIDERS.md §1)", () => {
+    expect(liveProfileFields(PROFILE_FIELDS)).not.toContain("voice")
+    expect(liveProfileFields(PROFILE_FIELDS).length).toBe(PROFILE_FIELDS.length - 1)
+    expect(PROFILE_GROUPS.flatMap((g) => g.fields)).not.toContain("voice")
   })
 
   it("checks a new phrase against the protocol's bounds and the list", () => {

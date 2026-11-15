@@ -18,13 +18,11 @@ const seconds = (n: number) => (n === 0 ? "Off: say the phrase every time" : `${
 
 const touchInput = `${inputClass} max-sm:h-11`
 
-/** Voice names are lower case ids ("natural"); shown capitalised next to "Assistant default". */
-const voiceTitle = (name: string) => (name === "" ? name : name[0]!.toUpperCase() + name.slice(1))
-
 /**
- * The voice front end's settings (docs/FRONTENDS-AND-ACTIVATION.md §5): Voice, Activation, Microphone, Speaker, one
- * "More" group (the echo test, which only this device can run, and a way into Help), and a link to admin. Voice, activation and
+ * The voice front end's settings (docs/FRONTENDS-AND-ACTIVATION.md §5): Activation, Microphone, Speaker, one "More"
+ * group (the echo test, which only this device can run, and a way into Help), and a link to admin. Activation and
  * follow-up belong to the device profile on the server (`device.update`); microphone and speaker stay in this browser.
+ * The voice is the assistant's, chosen in admin under Voices (docs/VOICE-PROVIDERS.md §1): a device has none of its own.
  * A bottom sheet on a phone, a side sheet from 640 px.
  */
 export function VoiceSheet() {
@@ -71,7 +69,7 @@ function Section({ title, id, children }: { readonly title: string; readonly id:
 }
 
 /** The sheet's own profile fields: a refused change is shown next to its control until fixed or dismissed. */
-type SheetField = "voice" | "activation" | "followUpSeconds"
+type SheetField = "activation" | "followUpSeconds"
 
 function FieldError({ id, message, onDismiss }: { readonly id: string; readonly message: string; readonly onDismiss: () => void }) {
   return (
@@ -92,31 +90,22 @@ function FieldError({ id, message, onDismiss }: { readonly id: string; readonly 
 function SheetBody() {
   const client = useClient()
   const [errors, setErrors] = useState<Partial<Record<SheetField, string>>>({})
-  const [voiceNote, setVoiceNote] = useState(false)
   /** Sends one change; a refusal stays next to the control (the sheet covers the page's toasts). */
   const change = async (field: SheetField, patch: Parameters<typeof client.updateDevice>[0]) => {
-    if (field === "voice") setVoiceNote(false)
     const result = await client.updateDevice(patch, { toast: false }) // continuation(none): only this sheet's own messages
-    // The server's text names the raw id ("expressive" is not an enabled voice): said in plain words with the display name.
-    const refusal = field === "voice" && result.error?.code === "invalid_settings" && typeof patch.voice === "string" && patch.voice !== ""
-      ? `${voiceTitle(patch.voice)} is switched off in admin.`
-      : result.error?.message ?? "the assistant refused it."
+    const refusal = result.error?.message ?? "the assistant refused it."
     setErrors(({ [field]: _old, ...rest }) => (result.ok ? rest : { ...rest, [field]: refusal }))
-    if (field === "voice" && result.ok) setVoiceNote(true)
   }
   const dismiss = (field: SheetField) => setErrors(({ [field]: _old, ...rest }) => rest)
   const v = useClientState(
     (s) => {
       const profile = profileOf(s)
       return {
-        voice: profile.voice,
         activation: profile.activation,
         phrases: profile.wakePhrases,
         followUp: profile.followUpSeconds,
         editable: s.device?.editable ?? [],
         hasDevice: s.device?.deviceId !== undefined,
-        voices: s.summary.voices,
-        ready: s.summary.ready,
         running: s.audio.phase === "running" || s.audio.phase === "suspended"
       }
     },
@@ -128,7 +117,6 @@ function SheetBody() {
   const canChooseSpeaker = typeof window !== "undefined" && VoiceAudio.canChooseSpeaker()
   const admin = useHref("/admin/")
   const can = (f: ProfileField) => v.editable.includes(f)
-  const defaultVoice = v.voices.find((x) => x.isDefault)
   const followUps = FOLLOW_UP.includes(v.followUp) ? FOLLOW_UP : [...FOLLOW_UP, v.followUp].sort((a, b) => a - b)
 
   return (
@@ -138,40 +126,6 @@ function SheetBody() {
           This browser has no device id (storage is off), so it uses the default settings.
         </p>
       )}
-
-      <Section title="Voice" id="sheet-voice">
-        <div role="radiogroup" aria-labelledby="sheet-voice" className="flex flex-col divide-y divide-line/60 rounded-md border border-line" data-testid="voice-choices">
-          <VoiceChoice
-            name=""
-            title="Assistant default"
-            description={defaultVoice === undefined ? "The voice the assistant is set to." : `Now ${voiceTitle(defaultVoice.name)}; follows the assistant's setting.`}
-            checked={v.voice === "" || !v.voices.some((x) => x.name === v.voice)}
-            disabled={!can("voice")}
-            onSelect={() => void change("voice", { voice: "" })}
-          />
-          {v.voices.map((x) => (
-            <VoiceChoice
-              key={x.name}
-              name={x.name}
-              title={voiceTitle(x.name)}
-              description={x.description}
-              checked={v.voice === x.name}
-              disabled={!can("voice")}
-              onSelect={() => void change("voice", { voice: x.name })}
-            />
-          ))}
-        </div>
-        {errors.voice !== undefined && <FieldError id="sheet-voice-error" message={errors.voice} onDismiss={() => dismiss("voice")} />}
-        {/* Always in the page (a live region must exist before it speaks); takes no room while empty. */}
-        <p className={voiceNote && errors.voice === undefined ? "flex items-center gap-1.5 text-[12px] text-ok" : "sr-only"} aria-live="polite" data-testid="voice-note">
-          {voiceNote && errors.voice === undefined && <><Icon name="check" size={14} />Used from the next reply.</>}
-        </p>
-        {v.voices.length === 0 && (
-          <p className="text-[13px] text-ink-muted" data-testid="no-voices">
-            {v.ready ? "No voices are switched on. Admin can switch them on under Voices." : "The voices appear when the assistant is ready."}
-          </p>
-        )}
-      </Section>
 
       <Section title="Activation" id="sheet-activation">
         <Segmented<Activation>
@@ -287,35 +241,6 @@ function SheetBody() {
         <Icon name="arrowRight" size={16} className="shrink-0 text-ink-faint" />
       </a>
     </div>
-  )
-}
-
-function VoiceChoice({ name, title, description, checked, disabled, onSelect }: {
-  readonly name: string
-  readonly title: string
-  readonly description: string
-  readonly checked: boolean
-  readonly disabled: boolean
-  readonly onSelect: () => void
-}) {
-  const id = `voice-${name === "" ? "default" : name.replace(/[^A-Za-z0-9_-]/g, "-")}`
-  return (
-    <label htmlFor={id} className={cx("flex min-h-12 cursor-pointer items-start gap-3 px-3 py-2.5 transition-colors duration-[120ms] hover:bg-surface-2/60", checked && "bg-surface-2/60", disabled && "cursor-not-allowed opacity-60")} data-voice={name} data-checked={checked || undefined}>
-      <input
-        id={id}
-        type="radio"
-        name="sheet-voice"
-        checked={checked}
-        disabled={disabled}
-        onChange={onSelect}
-        // Drawn here rather than by the browser, so both states meet 3:1: an ink-faint ring, a thick mint ring when chosen.
-        className="mt-1 size-[18px] shrink-0 cursor-pointer appearance-none rounded-full border-[1.5px] border-ink-faint bg-surface transition-[border-color,border-width] duration-[120ms] checked:border-[5px] checked:border-you disabled:cursor-not-allowed"
-      />
-      <span className="min-w-0 flex-1">
-        <span className="block text-[14px] text-ink">{title}</span>
-        <span className="block text-[13px] text-ink-muted">{description}</span>
-      </span>
-    </label>
   )
 }
 

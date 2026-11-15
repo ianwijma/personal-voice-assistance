@@ -8,13 +8,14 @@ import {
   Llm,
   makeAgentConversation,
   makeConversationWithSetup,
-  makeVoiceRouter,
   type Message,
   type SttEvent,
   Tts,
   type TurnSetup,
   TurnTrace,
-  type Voice
+  type VoiceRef,
+  voiceKey,
+  withTraceVoice
 } from "@pva/core"
 import type { ConversationInfo } from "@pva/protocol"
 import { Effect, Queue, Stream } from "effect"
@@ -23,8 +24,8 @@ import type { BuiltEngines, Engine, EngineProviders } from "./Engine.ts"
 /**
  * One voice session's conversation on the shared engines (docs/VOICE-SESSIONS.md §2): the `Conversation` and its
  * voice loop, rebuilt on every engine build with this session's history, conversation id and idle clock carried
- * over; the typed-input admission (`maxPendingInputs`, Stop generations); and this session's voice router (its own
- * default voice, so two devices can use different default voices at the same time).
+ * over; and the typed-input admission (`maxPendingInputs`, Stop generations). Every reply is spoken with the build's
+ * voice, the assistant's (docs/VOICE-PROVIDERS.md).
  */
 
 export type SendOutcome = "accepted" | "busy" | "not_running"
@@ -47,8 +48,6 @@ export interface SessionConversationOptions {
   readonly onConversation?: (conversation: ConversationInfo, reason: "new" | "idle") => void
   /** The recognition stream on its way to the conversation (echo gate, wake gate, transcript, state). */
   readonly gate: (events: Stream.Stream<SttEvent, unknown>) => Stream.Stream<SttEvent, unknown>
-  /** This session's default voice now (its device profile's, else the assistant's; live). */
-  readonly defaultVoice: () => string
   /** The idle reset (`Conversation.idleResetMs`), read at every turn start. */
   readonly idleResetMs?: () => number | undefined
   /** Typed inputs accepted but not yet taken by the conversation, at most. Default 4. */
@@ -76,8 +75,8 @@ export interface SessionConversation {
    * id new (`onConversation` is called). Works without running engines.
    */
   readonly newConversation: Effect.Effect<ConversationInfo>
-  /** The enabled voices and this session's default voice in effect, while the loop runs. */
-  readonly voices: () => { readonly names: ReadonlyArray<Voice>; readonly defaultVoice: string } | undefined
+  /** The voice this session speaks with, while the loop runs. */
+  readonly voice: () => VoiceRef | undefined
   /** Start running on the engines (now and after every rebuild) until `end`. */
   readonly start: () => void
   /**
@@ -114,7 +113,7 @@ export const makeSessionConversation = (options: SessionConversationOptions): Ef
     let live: Conversation["Service"] | undefined
     let ready = false
     let detach: Effect.Effect<void> | undefined
-    let router: { voices: ReadonlyArray<Voice>; tts: Tts["Service"]; defaultVoice: string; readonly sampleRate: number } | undefined
+    let voice: VoiceRef | undefined
 
     const onEvent = (event: ConversationEvent) => {
       if (event._tag === "ConversationStarted") {
@@ -124,32 +123,11 @@ export const makeSessionConversation = (options: SessionConversationOptions): Ef
       options.onEvent(event)
     }
 
-    /** The router for this session's default voice: rebuilt (cheaply, engines untouched) when it changes. */
-    const currentRouter = () => {
-      const r = router!
-      const wanted = options.defaultVoice()
-      if (wanted !== r.defaultVoice && r.voices.some((v) => v.name === wanted)) {
-        r.tts = makeVoiceRouter({ voices: r.voices, defaultVoice: wanted, sampleRate: r.sampleRate })
-        r.defaultVoice = wanted
-      }
-      return r
-    }
-
     const run = (built: BuiltEngines): Effect.Effect<void, unknown> =>
       Effect.gen(function*() {
         const providers = built.providers
-        const wanted = options.defaultVoice()
-        const defaultVoice = providers.voices.some((v) => v.name === wanted) ? wanted : providers.defaultVoice
-        router = {
-          voices: providers.voices,
-          tts: makeVoiceRouter({ voices: providers.voices, defaultVoice, sampleRate: built.sampleRate }),
-          defaultVoice,
-          sampleRate: built.sampleRate
-        }
-        const tts = Tts.of({
-          sampleRate: built.sampleRate,
-          synthesize: (clauses) => Stream.suspend(() => currentRouter().tts.synthesize(clauses))
-        })
+        voice = providers.voice
+        const tts = withTraceVoice(providers.tts, voiceKey(providers.voice))
         const common = {
           onEvent,
           initialHistory: history,
@@ -193,7 +171,7 @@ export const makeSessionConversation = (options: SessionConversationOptions): Ef
         // Inputs accepted for this run and not taken are dropped (as the engines stopping drops a turn).
         Effect.ensuring(Effect.suspend(() => {
           ready = false
-          router = undefined
+          voice = undefined
           const c = live
           live = undefined
           return Effect.gen(function*() {
@@ -255,7 +233,7 @@ export const makeSessionConversation = (options: SessionConversationOptions): Ef
           return conversationInfo
         })
       }),
-      voices: () => (router === undefined ? undefined : { names: router.voices, defaultVoice: currentRouter().defaultVoice }),
+      voice: () => voice,
       start: () => {
         detach ??= options.engine.attach(loop)
       },

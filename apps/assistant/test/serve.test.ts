@@ -58,7 +58,7 @@ describe("serve: handshake", () => {
     expect(welcome.snapshot.role).toBe("observer")
     expect(welcome.snapshot.ownerPresent).toBe(false)
     expect(welcome.snapshot.state).toBe("idle")
-    expect(welcome.snapshot.engine).toEqual({ ready: true, state: "ready", voices: [{ name: "standard", description: "Everyday answers.", isDefault: true }] })
+    expect(welcome.snapshot.engine).toEqual({ ready: true, state: "ready", voices: [{ name: "sherpa:en_US-lessac-medium", description: "Lessac", isDefault: true }] })
     expect(welcome.snapshot.history).toEqual([])
     expect(Object.keys(welcome.snapshot).sort()).toEqual(["admin", "conversation", "device", "engine", "history", "ownerPresent", "role", "state"])
     const admin = await connect()
@@ -73,7 +73,7 @@ describe("serve: handshake", () => {
       ["stt-mic", "speech/microphone"],
       ["stt-deepgram", "speech/deepgram"],
       ["voices", "voices/overview"],
-      ["voice-engines", "voices/engines"],
+      ["voice-providers", "voices/providers"],
       ["recordings", "diagnostics/recordings"]
     ])
     expect(snapshot.modules[0]).toMatchObject({ id: "greeter", group: "modules" })
@@ -140,7 +140,7 @@ describe("serve: a voice turn", () => {
     expect(start).toMatchObject({ source: "voice", userText: "What's the weather in Paris?", spoken: true })
     const clauses = owner.messages.filter((m) => m.type === "assistant.text")
     expect(clauses.map((m) => (m as { text: string }).text)).toEqual(["It's sunny in Paris,", "eighteen degrees.", "Light wind."])
-    expect(clauses.every((m) => (m as { voice?: string }).voice === "standard")).toBe(true)
+    expect(clauses.every((m) => (m as { voice?: string }).voice === "sherpa:en_US-lessac-medium")).toBe(true)
     expect(end.trace.speculative).toBe(true)
     expect(end.trace.marks.playbackStart).toBeDefined()
     expect(end.trace.client).toEqual({ outputLatencyMs: 12, startDelayMs: 0 })
@@ -624,7 +624,7 @@ describe("serve: playback stall", () => {
   it("a browser that stops reporting: reply.stop, playback_timeout error, the turn fails", async () => {
     const stt = controlledStt()
     const llm = scriptedLlm(() => "Short reply.")
-    server = await startTestServer({ build: fakeBuild({ stt: stt.stt, llm: llm.llm, voices: [{ name: "standard", description: "d", tts: toneTts({ millisPerClause: 120 }) }] }), stallMs: 400 })
+    server = await startTestServer({ build: fakeBuild({ stt: stt.stt, llm: llm.llm, tts: toneTts({ millisPerClause: 120 }) }), stallMs: 400 })
     const owner = await connect({ player: { enabled: false } })
     await owner.hello()
     await owner.claim()

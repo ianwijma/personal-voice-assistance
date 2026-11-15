@@ -27,13 +27,22 @@ export interface ProfileGroup {
 
 export const PROFILE_GROUPS: ReadonlyArray<ProfileGroup> = [
   { id: "activation", title: "Activation", fields: ["activation", "wakePhrases", "wakeMatch", "followUpSeconds"] },
-  { id: "voice", title: "Voice", fields: ["voice"] },
   { id: "interrupting", title: "Interrupting", fields: ["interruptMode"] },
   { id: "conversation", title: "Conversation", fields: ["conversationIdleMinutes"] },
   { id: "processing", title: "Audio processing", fields: ["echoCancellation", "noiseSuppression", "autoGainControl"] },
   { id: "display", title: "Display", fields: ["captions", "speakReplies"] },
   { id: "advanced", title: "Advanced", fields: ["outputPath", "prebufferMs"], advanced: true }
 ]
+
+/**
+ * Profile fields the protocol still carries but that no longer do anything, so the forms leave them out: `voice`
+ * (docs/VOICE-PROVIDERS.md §1: the assistant speaks with one voice, chosen under Voices; a device's own voice choice
+ * was retired). A value a device still has stored is kept as it is and never shown.
+ */
+export const RETIRED_PROFILE_FIELDS: ReadonlySet<ProfileField> = new Set<ProfileField>(["voice"])
+
+/** The fields a profile form shows: the kind's, without the retired ones. */
+export const liveProfileFields = (fields: ReadonlyArray<ProfileField>): ReadonlyArray<ProfileField> => fields.filter((f) => !RETIRED_PROFILE_FIELDS.has(f))
 
 export const FIELD_LABEL: { readonly [F in ProfileField]: string } = {
   activation: "Activation",

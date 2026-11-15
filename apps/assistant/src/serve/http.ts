@@ -1,4 +1,4 @@
-import { CloseCode, FRAME_HEADER_BYTES, MAX_FRAME_PAYLOAD_BYTES, MAX_TEXT_FRAME_BYTES, WS_PATH } from "@pva/protocol"
+import { API_PREFIX, CloseCode, FRAME_HEADER_BYTES, MAX_FRAME_PAYLOAD_BYTES, MAX_TEXT_FRAME_BYTES, WS_PATH } from "@pva/protocol"
 import { Effect, Schema, type Scope } from "effect"
 import { createReadStream, existsSync, readFileSync, statSync } from "node:fs"
 import * as http from "node:http"
@@ -11,7 +11,8 @@ import type { SessionHub } from "./SessionHub.ts"
 
 /**
  * One HTTP(S) server on one port (docs/UI-AND-MODULES.md §4.6): the static UI
- * from `PVA_WEB_DIR` and the WebSocket at `/ws`, with an origin check.
+ * from `PVA_WEB_DIR`, the WebSocket at `/ws`, with an origin check, and the admin API under `/api/`
+ * (docs/VOICE-PROVIDERS.md §5).
  */
 
 export class HttpError extends Schema.TaggedError<HttpError>()("HttpError", { message: Schema.String }) {}
@@ -41,6 +42,8 @@ export interface HttpOptions {
    * so the page is `crossOriginIsolated` and its player can share its count with the page (`SharedArrayBuffer`).
    */
   readonly crossOriginIsolation?: boolean
+  /** Requests under `/api/` (docs/VOICE-PROVIDERS.md §5), after the host check. Absent: they get the static 404. */
+  readonly api?: (req: http.IncomingMessage, res: http.ServerResponse) => void
 }
 
 export interface HttpServer {
@@ -298,6 +301,10 @@ export const startHttp = (options: HttpOptions): Effect.Effect<HttpServer, HttpE
       server.on("request", (req, res) => {
         if (!hostAllowed(req.headers.host, hosts)) {
           res.writeHead(403, { "Content-Type": "text/plain; charset=utf-8" }).end(refuse(req.headers.host))
+          return
+        }
+        if (options.api !== undefined && (req.url ?? "").startsWith(API_PREFIX)) {
+          options.api(req, res)
           return
         }
         serveStatic(options.webDir, options.crossOriginIsolation ?? true, req, res)

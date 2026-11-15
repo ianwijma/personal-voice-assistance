@@ -26,12 +26,21 @@ export interface Preset {
   readonly sizeMb: number
   /** Unpacked size, MB. */
   readonly diskMb: number
+  /** How the voice picker shows it (docs/VOICE-PROVIDERS.md §4.1). */
+  readonly voice: {
+    readonly name: string
+    readonly description: string
+    /** BCP 47. */
+    readonly language: string
+    readonly gender: "female" | "male" | "neutral"
+    readonly tags: ReadonlyArray<string>
+  }
 }
 
 const RELEASES = "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models"
 
 /** A Piper voice from the sherpa-onnx releases, e.g. `piper("en_US-lessac-medium", "...")`. */
-const piper = (voice: string, license: string, sizeMb = 68, diskMb = 83): Preset => ({
+const piper = (voice: string, license: string, about: Preset["voice"], sizeMb = 68, diskMb = 83): Preset => ({
   name: voice,
   engine: "piper",
   dir: `vits-piper-${voice}`,
@@ -42,15 +51,21 @@ const piper = (voice: string, license: string, sizeMb = 68, diskMb = 83): Preset
   sampleRate: 22_050,
   license,
   sizeMb,
-  diskMb
+  diskMb,
+  voice: about
 })
 
 export const presets: Readonly<Record<string, Preset>> = Object.fromEntries(([
   piper(
     "en_US-lessac-medium",
-    "Trained on the Blizzard 2013 Lessac dataset, whose licence allows non-commercial (research) use only"
+    "Trained on the Blizzard 2013 Lessac dataset, whose licence allows non-commercial (research) use only",
+    { name: "Lessac", description: "Piper: fast, clear American English.", language: "en-US", gender: "female", tags: ["fast"] }
   ),
-  piper("nl_NL-pim-medium", "Dataset CC0 (fine-tuned from lessac-medium, so the lessac terms may carry over)"),
+  piper(
+    "nl_NL-pim-medium",
+    "Dataset CC0 (fine-tuned from lessac-medium, so the lessac terms may carry over)",
+    { name: "Pim", description: "Piper: fast Dutch.", language: "nl-NL", gender: "male", tags: ["fast"] }
+  ),
   {
     name: "kokoro-af_heart",
     engine: "kokoro",
@@ -68,7 +83,14 @@ export const presets: Readonly<Record<string, Preset>> = Object.fromEntries(([
     sampleRate: 24_000,
     license: "Apache-2.0",
     sizeMb: 350,
-    diskMb: 403
+    diskMb: 403,
+    voice: {
+      name: "Heart",
+      description: "Kokoro: warm and natural; its first audio comes later.",
+      language: "en-US",
+      gender: "female",
+      tags: ["natural", "slow-start"]
+    }
   }
 ] satisfies Array<Preset>).map((p) => [p.name, p]))
 

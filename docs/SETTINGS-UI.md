@@ -16,6 +16,12 @@ Legend: **[verify]** = not run or not confirmed here; **[run]** = executed on th
 
 ---
 
+> **Changed 2026-11-16 (docs/VOICE-PROVIDERS.md):** the named voices are gone. The Voices page holds one field,
+> `ASSISTANT_VOICE` (a voice key, `provider:voice`; the admin UI shows a voice picker over the HTTP API of that
+> design); "Voice engines" is now **Voice providers** (section `voice-providers`, page `voices/providers`) with the
+> hosted keys. `DEFAULT_VOICE`, `VOICES` and `TTS_PROVIDER` have no field any more; they are read only to migrate an
+> old install's voice. Where this document names them below, that is the design as it was.
+
 ## Status: what is built (phase 2a, 2026-11-14)
 
 The parallel work landed as: the vault and admin access in `apps/assistant/src/serve/{Vault,Keys,access}.ts`,
@@ -42,7 +48,7 @@ login), P8 (search), P9.
   switch, and **Use …** (save the choice and the opt-in, switch it on, reload the engines). The server's checks are
   unchanged (admin, opt-in). The module keeps its own page under Language model for its other settings.
 - **Voices**: no per-voice pages (`voice-<name>`, piece H). `TTS_PROVIDER` and `CARTESIA_API_KEY` share a protected
-  "Voice engines" page (the design's "Hosted voice service"), so the Voices page itself stays open to every page.
+  "Voice providers" page (the design's "Hosted voice service"; called "Voice engines" until 2026-11-16, docs/VOICE-PROVIDERS.md), so the Voices page itself stays open to every page.
 - **`FieldSource`** is `default | saved | env-file | env-process`. No `vault` value: `SecretState` already says it.
   `env-file` vs `env-process` comes from `env.ts` noting which keys `.env` added (no line numbers: P4).
 - **Not downloaded**: options carry the `not-downloaded` tag, but there is no `unavailable` + Download action yet
@@ -234,7 +240,7 @@ not in the UI unless stated); *drop* = remove.
 | `CARTESIA_MAX_BUFFER_DELAY_MS` | Server-side buffering | 0 | `index.ts:390` | no | **UI** per voice, advanced |
 | `CARTESIA_SAMPLE_RATE` | Output Hz | 24000 | `index.ts:389` | no | **drop from the UI** (the router resamples, nothing to gain); env stays for tests |
 | `CARTESIA_URL` | Endpoint | `wss://api.cartesia.ai` | `index.ts:391` | no | **dev** |
-| `ELEVENLABS_API_KEY` | Key | — | `tts-elevenlabs/src/index.ts` (`config`) | no | **UI**, vault → Voices › Voice engines (added 2026-11-16) |
+| `ELEVENLABS_API_KEY` | Key | — | `tts-elevenlabs/src/index.ts` (`config`) | no | **UI**, vault → Voices › Voice providers (added 2026-11-16) |
 | `ELEVENLABS_VOICE`, `_MODEL`, `_LANGUAGE`, `_SPEED`, `_STABILITY`, `_AUTO_MODE` | Voice id, model, language, voice settings | `EXAVITQu4vr4xnSDxMaL`, `eleven_flash_v2_5`, unset, unset, unset, true | `tts-elevenlabs/src/index.ts` (`config`) | no | engine keys (move from `.env`, saved by key); per voice with `VOICE_<NAME>_` |
 | `ELEVENLABS_SAMPLE_RATE`, `ELEVENLABS_URL` | Output Hz, endpoint | 24000, `wss://api.elevenlabs.io` | `tts-elevenlabs/src/index.ts` (`config`) | no | **dev** |
 

@@ -135,7 +135,7 @@ export const EngineStatus = Schema.Struct({
 })
 export type EngineStatus = typeof EngineStatus.Type
 
-/** Conversation history, as shown to the user (voice markers removed, tool results omitted). */
+/** Conversation history, as shown to the user (tool results omitted). */
 export const HistoryItem = Schema.Union([
   Schema.Struct({ role: Schema.Literal("user"), text: Schema.String }),
   Schema.Struct({
