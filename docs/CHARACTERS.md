@@ -34,7 +34,7 @@ A person glancing at the stage needs one answer: *whose turn is it?* Everything 
 | thinking | It heard me and is working; I should wait. | Its own rhythm, no audio; visibly not a stall. Mixes both colours or uses a third look. |
 | speaking | It is talking. | The assistant's colour; motion travels outward; follows the reply audio. |
 
-The app has further states (asleep, muted, reconnecting, error: `docs/UI-AND-MODULES.md` §3.3). A character need not design them: the host maps each onto one of the five modes plus a `detail` (§4.3) and overlays its own label and icon.
+These five are the **core modes**. Every character supports all five, always. The set of modes can grow (§4.3): the app already has further states (asleep, muted, reconnecting, error: `docs/UI-AND-MODULES.md` §3.3) and more are expected. A character need not design any of them: each mode beyond the core names the core mode it falls back to, and a character that has not opted into it is simply shown that core mode.
 
 Rules that came out of the investigation:
 
@@ -108,7 +108,7 @@ What a character declares about itself. In the lab this is the `Design` object.
 | `version` | Semantic version of the character itself (§4.5). | not built |
 | `contract` | The contract major version it was written against, e.g. `1`. | not built |
 | `renderer` | What it draws with: `2d`, `webgl2`. A host skips renderers it does not offer. | yes |
-| `modes` | One line per mode: what it looks like. | yes |
+| `modes` | One line per mode it draws: the five core modes always, plus any extra modes it opts into (§4.3). | core modes only |
 | `mappings` | Signal → effect pairs. | yes |
 | `options` | The settings it offers (§4.4). | yes |
 | `uses` | Optional inputs it can take advantage of (§4.2), each with what it does without them. | as free text (`serverNeeds`) |
@@ -128,7 +128,7 @@ Within a contract major version:
 
 - A field of the frame is never removed, never renamed, and never changes meaning, unit or range. `level` is 0 to 1 perceived loudness for ever.
 - New information is added only as an **extension** (§4.2), never as a new required field.
-- Enumerations a character switches on (`mode`) never gain members (§4.3).
+- The five core modes never change meaning and are never removed. New modes may be added, but a character is only ever handed a mode it has declared it supports (§4.3).
 - A host may give a character *more* than it asked for; a character must ignore what it does not know.
 
 A change that cannot follow these rules is a new contract major version. The host then keeps an adapter that feeds the old frame shape to characters written for the old version. Adapters are the host's cost, never the character author's. Expect this to be rare; nothing foreseen in §5 needs it.
@@ -163,16 +163,27 @@ What this gives:
 
 The host uses `uses` to decide what is worth producing: if the selected character does not use phoneme timings, the server is never asked for them. Extensions cost nothing when nobody wants them.
 
-### 4.3 Modes do not multiply
+### 4.3 Modes: five for certain, more by opt-in
 
-Characters switch on five modes. Adding a sixth would break every existing character, so:
+The five core modes are the floor: every character supports them and every host can drive a character with them alone. The set is open above that floor. New modes will come (the app's own asleep and muted states are the first; others, such as waiting for a confirmation or running a long tool, are likely), and adding one must not break a character written before it existed.
 
-- `mode` is always one of the five, for ever.
-- Finer state travels in `frame.detail`, an optional free string the host documents, for example `mode: "idle", detail: "asleep"`; `mode: "idle", detail: "muted"`; `mode: "thinking", detail: "tool:weather"`; `mode: "listening", detail: "awaiting-confirmation"`.
-- Every new application state is defined together with the core mode it falls back to. An old character shows that mode; a new one may refine it.
-- A character ignores a `detail` it does not know.
+How that works:
 
-`detail` is not built in the lab; the lab has only the five modes.
+- **Every mode beyond the core names its fallback**, which is a core mode or another mode that eventually reaches one: `asleep → idle`, `muted → idle`, `confirming → listening`. The fallback is part of the mode's definition and is recorded in the contract next to it.
+- **A character declares the extra modes it draws** in its manifest, beside the five it must have.
+- **The host hands a character only modes it declared.** For each frame the host takes the application's actual mode and walks the fallback chain until it reaches one the character supports. An old character therefore never sees a value it does not know; it sees the core mode, exactly as before the new mode existed.
+- The frame carries both: `mode`, the resolved mode for this character, and `coreMode`, the core mode at the end of the chain. A character that only wants the broad state reads `coreMode` and never needs updating.
+- **A mode is added for a state the person must be able to tell apart**, not for decoration. Section 2.1's warning applies: few states, each very different. A new mode needs a reason a person would care, a fallback, and at least one character that draws it.
+- A mode's meaning never changes once defined, and a mode is never removed; a mode nobody uses any more simply stops being sent.
+
+Modes say *what the assistant is doing*. They are not the place for *how it feels about it*: expression (warm, apologetic, emphatic) is a separate layer that sits on top of whatever mode is current, and arrives as an extension (§5.3). Keeping the two apart is what lets either grow without multiplying the other.
+
+| | Host knows only core modes | Host knows more modes |
+|---|---|---|
+| **Character draws only core modes** | works | works: is handed the fallback |
+| **Character draws extra modes** | works: those modes never occur | works: is handed them |
+
+The lab has only the five core modes.
 
 ### 4.4 Options
 
@@ -214,6 +225,8 @@ Rules for the **character author**:
 | `nods` | Figures: nods along at phrase ends. |
 | `followsPointer` | Figures with eyes: gaze follows the pointer. |
 
+**Where a person chooses and tunes a character is not decided.** The admin UI is being reorganised around assistants and devices (`docs/ASSISTANTS.md`, in progress on its own branch), and a character most likely belongs to an assistant, with a device able to override it. Until that lands there is no settings page for characters: the choice is a per-browser preference, and the stored form above is what any later settings page will read and write. Nothing in a character depends on where its settings are kept.
+
 Three settings belong to the host, not to any character, and apply to all: the person's colour, the assistant's colour, and sensitivity (a multiplier on loudness signals). A character must not duplicate them.
 
 ### 4.5 Versions
@@ -235,7 +248,7 @@ None of this is built. It is recorded so that when it is built, it goes in throu
 
 ### 5.1 The principle
 
-New capability reaches characters **only as extensions and `detail`**. Nobody adds a parameter to `frame()`, a new mode, or a second entry point. If a new feature seems to need one of those, the feature's design is wrong or it is time for a contract major version, and that is a decision to make explicitly.
+New capability reaches characters **only as extensions and opt-in modes**. Nobody adds a parameter to `frame()`, a mode without a fallback, or a second entry point. If a new feature seems to need one of those, the feature's design is wrong or it is time for a contract major version, and that is a decision to make explicitly.
 
 ### 5.2 Foreseen extensions
 
@@ -275,9 +288,9 @@ A voice node with a small screen, an LED matrix or a light ring is a new **rende
 
 Compatibility is kept by tests, not by intention. For every character in the application (not built; the lab has the option validation tests and per-design visual checks):
 
-1. **Core only**: run a scripted conversation with no `ext` and no `detail`. It must not throw and must draw something different in each of the five modes.
+1. **Core only**: run a scripted conversation with no `ext` and only the five core modes. It must not throw and must draw something different in each of the five modes.
 2. **Everything**: the same with every known extension present.
-3. **The unknown**: an extension name and a `detail` that do not exist, and a known extension with a version one higher than known. Output must equal the core-only run.
+3. **The unknown**: an extension name that does not exist, a known extension with a version one higher than known, and an application mode the character did not declare (the host must hand it the fallback). Output must equal the core-only run.
 4. **Appearing and disappearing**: extensions that come and go mid-reply. No throw.
 5. **Options**: every option at minimum and maximum, all together; stored values from every earlier version of the character, plus garbage, go through the host's validation and produce a working character.
 6. **Defaults are stable**: a recording of the drawing calls at default settings, compared against the previous release of the same character version line. This is how the investigation proved that adding options changed nothing by default.

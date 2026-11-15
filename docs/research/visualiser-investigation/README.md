@@ -120,4 +120,4 @@ Known rough extremes: edge glow at maximum depth, light ring at maximum spectrum
 
 Build first: **flame**, **light ring**, **pitch ink** and **twin lights** from the abstract set; **blob buddy** and **lips** from the figures. They were each designer's own strongest picks and held up when every design was compared across the five modes.
 
-Before any of them goes into the application: the contract needs the additions in `docs/CHARACTERS.md` (versions, extensions, `detail`), the extractor needs to run on the real microphone frames and player output, and the unverified items above need a pass on real hardware.
+Before any of them goes into the application: the contract needs the additions in `docs/CHARACTERS.md` (versions, extensions, opt-in modes), the extractor needs to run on the real microphone frames and player output, and the unverified items above need a pass on real hardware.
