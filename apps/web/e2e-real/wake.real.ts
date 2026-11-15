@@ -141,11 +141,11 @@ test.describe("asleep: unrelated talk is ignored; the phrase with a request is a
 test.describe("the phrase alone, then the request; the follow-up window; asleep again", () => {
   const wav = wavOf("wake-phrase-alone", [
         silence(2000),
-        spoken("Hey Jeff.", { voice: "natural" }),
+        spoken("Hey Jeff.", { voice: "sherpa:kokoro-af_heart" }),
         silence(1500),
-        spoken("What time is it?", { voice: "natural" }),
+        spoken("What time is it?", { voice: "sherpa:kokoro-af_heart" }),
         silence(7000),
-        spoken(UNRELATED, { voice: "natural" }),
+        spoken(UNRELATED, { voice: "sherpa:kokoro-af_heart" }),
         silence(25_000)
       ])
   const assistant = withAssistant("alone")

@@ -23,20 +23,12 @@ it.live("text turn: fake LLM → clock tool → spoken-style answer", () =>
     )
   )))
 
-it.live("text mode never prints voice markers, even split across deltas; history keeps them", () => {
-  const llm = makeScriptedLlm([
-    [textDelta("[voi"), textDelta("ce:expressive] Jingle bells, "), textDelta("jingle all the way! [voice:standard]"), textDelta(" Anything else?")],
-    [textDelta("Plain [answer].")]
-  ])
+it.live("text mode prints the reply as the model wrote it, a newline after each turn", () => {
+  const llm = makeScriptedLlm([[textDelta("Jingle bells, "), textDelta("jingle all the way!")], [textDelta("Plain [answer].")]])
   return Effect.gen(function*() {
     const written: Array<string> = []
     yield* runTextTurns(Stream.make("sing", "and now?"), (text) => written.push(text))
-    assert.strictEqual(written.join(""), "Jingle bells, jingle all the way! Anything else?\nPlain [answer].\n")
-    const history = yield* Effect.flatMap(Effect.service(Conversation), (c) => c.history)
-    assert.deepStrictEqual(history[1], {
-      role: "assistant",
-      content: "[voice:expressive] Jingle bells, jingle all the way! [voice:standard] Anything else?"
-    })
+    assert.strictEqual(written.join(""), "Jingle bells, jingle all the way!\nPlain [answer].\n")
   }).pipe(Effect.provide(
     Conversation.layer({ systemPrompt: "test" }).pipe(
       Layer.provide(Layer.mergeAll(llm.layer, Layer.succeed(ToolRegistry, makeToolRegistry([])), TurnTrace.layer()))

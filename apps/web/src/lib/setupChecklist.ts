@@ -42,7 +42,7 @@ export const setupChecklist = (s: ClientState): ReadonlyArray<ChecklistItem> => 
   items.push(
     voiceProblem !== undefined || voice === undefined
       ? { id: "voice", ok: false, text: `Voice: ${voiceProblem?.message ?? "not running"}`, action: { label: "Fix", path: ["voices", "overview"] } }
-      : { id: "voice", ok: true, text: `Voice: ${voice.name} (${voice.engine})` }
+      : { id: "voice", ok: true, text: `Voice: ${voice.description || voice.name} (${voice.engine})` }
   )
   items.push(
     s.vault.state === "none"

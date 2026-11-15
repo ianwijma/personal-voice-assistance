@@ -64,6 +64,13 @@
  * "deviceId" (default: the most recently active session that has an owner); POST /mock/idle {"deviceId"?, "now"?}
  * makes the device's conversation old enough for the idle reset at its next turn (`now`: at once);
  * POST /mock/max-sessions {"n"} sets MAX_VOICE_SESSIONS.
+ *
+ * The voice picker's HTTP API (docs/VOICE-PROVIDERS.md §5) is under /api/ on the same port (admin token from a login,
+ * CORS for the page's origin): the providers of mock/voices.ts (On this machine; Cartesia without a key, `vault_locked`
+ * while the vault is locked; ElevenLabs with one), favourites, previews (WAV tones, one at a time: `superseded`; `busy`
+ * for a voice on this machine while a device is in a turn), downloads (the Models page's jobs) and the assistant's voice
+ * (ASSISTANT_VOICE, with the server's checks). POST /mock/voices/fail {"provider", "on"?} makes a provider's key
+ * refused; POST /mock/voices/hold {"ms"} delays previews.
  */
 import { randomBytes } from "node:crypto"
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http"
@@ -108,10 +115,17 @@ import {
   type SettingsSection,
   type SettingValue,
   type ToolId,
-  type TraceInfo
+  type TraceInfo,
+  type Favourite,
+  MAX_FAVOURITES,
+  MAX_PREVIEW_CHARS,
+  type ProviderInfo,
+  type ProviderVoices,
+  type VoiceEntry
 } from "@pva/protocol"
 import { exampleEngineStatus, exampleSnapshot, exampleVoiceSection, exampleWeatherModule } from "@pva/protocol/examples"
 import { type WebSocket, WebSocketServer } from "ws"
+import { encodeWav, MOCK_PROVIDERS } from "./voices.ts"
 import type { Condition, FieldError } from "@pva/protocol"
 
 const PORT = Number(process.env.MOCK_PORT ?? 8787)
@@ -453,34 +467,22 @@ const initialSections = (): Array<SettingsSection> => [
     },
     revision: 1
   },
-  { ...clone(exampleVoiceSection), group: "voices", page: { id: "overview", title: "Voices", description: "Which voices the assistant may use." }, order: 10 },
+  { ...clone(exampleVoiceSection), group: "voices", page: { id: "overview", title: "Voices", description: "Which voice the assistant speaks with." }, order: 10 },
   {
-    id: "voice-engines",
-    title: "Voice engines",
+    // docs/VOICE-PROVIDERS.md §6.1 (was "voice-engines"; TTS_PROVIDER is gone: the provider follows from the voice).
+    id: "voice-providers",
+    title: "Voice providers",
     group: "voices",
-    page: { id: "engines", title: "Voice engines", description: "The engine of the standard voice, and the hosted voice services." },
+    page: { id: "providers", title: "Voice providers", description: "Where the voices come from: this machine, and the hosted voice services." },
     order: 20,
     protected: true,
     form: {
       fields: [
-        {
-          type: "choice",
-          key: "TTS_PROVIDER",
-          label: "Standard voice engine",
-          apply: "reload",
-          default: "sherpa",
-          source: "default",
-          options: [
-            { value: "sherpa", label: "On this machine (Piper/Kokoro)", tags: ["local"] },
-            { value: "cartesia", label: "Cartesia", tags: ["hosted", "needs-key"], implication: "Replies are sent to Cartesia to be spoken." },
-            { value: "elevenlabs", label: "ElevenLabs", tags: ["hosted", "needs-key"], implication: "Replies are sent to ElevenLabs to be spoken." }
-          ]
-        },
-        { type: "secret", key: "CARTESIA_API_KEY", label: "Cartesia API key", apply: "reload", env: "CARTESIA_API_KEY", source: "default" },
-        { type: "secret", key: "ELEVENLABS_API_KEY", label: "ElevenLabs API key", apply: "reload", env: "ELEVENLABS_API_KEY", source: "default" }
+        { type: "secret", key: "CARTESIA_API_KEY", label: "Cartesia API key", description: "For Cartesia voices: listing them, previews, and speaking with one.", apply: "reload", env: "CARTESIA_API_KEY", source: "default" },
+        { type: "secret", key: "ELEVENLABS_API_KEY", label: "ElevenLabs API key", description: "For ElevenLabs voices: listing them, previews, and speaking with one.", apply: "reload", env: "ELEVENLABS_API_KEY", source: "saved" }
       ],
-      values: { TTS_PROVIDER: "sherpa" },
-      secrets: { CARTESIA_API_KEY: { set: false, source: "none" }, ELEVENLABS_API_KEY: { set: false, source: "none" } },
+      values: {},
+      secrets: { CARTESIA_API_KEY: { set: false, source: "none" }, ELEVENLABS_API_KEY: { set: true, source: "store" } },
       errors: []
     },
     revision: 1
@@ -546,14 +548,16 @@ const checks = (list: ReadonlyArray<SettingsSection>): { errors: Array<FieldErro
   if (v("LLM_PROVIDER") === "anthropic" && !secretSet("ANTHROPIC_API_KEY", list)) {
     warnings.push({ section: "language-model", key: "ANTHROPIC_API_KEY", message: "The Claude API is chosen but there is no API key: replies fail until you add it here." })
   }
-  for (const [provider, label, key] of [["cartesia", "Cartesia", "CARTESIA_API_KEY"], ["elevenlabs", "ElevenLabs", "ELEVENLABS_API_KEY"]] as const) {
-    if (v("TTS_PROVIDER") === provider && !secretSet(key, list)) {
-      warnings.push({ section: "voice-engines", key: "TTS_PROVIDER", message: `${label} is chosen but there is no ${label} key: the standard voice fails until you add it below.` })
-    }
+  // ASSISTANT_VOICE (docs/VOICE-PROVIDERS.md §6.1): a hosted voice without its key warns; a voice on this machine
+  // that is not downloaded refuses the save.
+  const voice = parseVoiceKey(String(v("ASSISTANT_VOICE") ?? ""))
+  const provider = voice === undefined ? undefined : MOCK_PROVIDERS.find((p) => p.id === voice.provider)
+  if (voice !== undefined && provider?.keyField !== undefined && !secretSet(provider.keyField, list)) {
+    warnings.push({ section: "voices", key: "ASSISTANT_VOICE", message: `This voice speaks through ${provider.label}, but there is no ${provider.label} key: add it on the Voice providers page.` })
   }
-  const voices = v("VOICES")
-  if (Array.isArray(voices) && voices.includes("expressive") && !secretSet("CARTESIA_API_KEY", list)) {
-    warnings.push({ section: "voices", key: "VOICES", message: "expressive speaks through Cartesia, but there is no Cartesia key: add it on the Voice engines page." })
+  if (voice !== undefined && provider?.location === "local" && !presetInstalled(voice.voiceId)) {
+    const name = provider.voices.find((x) => x.voiceId === voice.voiceId)?.name ?? voice.voiceId
+    errors.push({ section: "voices", key: "ASSISTANT_VOICE", message: `${name} is not downloaded: download it first, or choose a voice that is.` })
   }
   return { errors, warnings }
 }
@@ -579,11 +583,40 @@ const readyEngine = (): EngineStatus => {
     : provider === "claude-subscription"
     ? sub?.state === "running" ? model : `${model} · module ${sub?.enabled === true ? sub.state : "off"}: the offline stand-in answers`
     : "offline stand-in"
+  // The voice stage follows ASSISTANT_VOICE: one voice, `name` its key, `description` its name.
+  const key = assistantVoiceKey()
+  const ref = parseVoiceKey(key) ?? { provider: "sherpa", voiceId: "en_US-lessac-medium" }
+  const p = MOCK_PROVIDERS.find((x) => x.id === ref.provider) ?? MOCK_PROVIDERS[0]!
+  const location = p.location
   return {
     ...base,
     reloadPendingFor: [],
-    engines: base.engines.map((e) => (e.stage === "llm" ? { ...e, provider, detail, location: provider === "fake" ? "local" : "hosted" } : e))
+    engines: base.engines.map((e) =>
+      e.stage === "llm" ? { ...e, provider, detail, location: provider === "fake" ? "local" : "hosted" }
+      : e.stage === "tts" ? { ...e, provider: ref.provider, detail: ref.voiceId, location }
+      : e
+    ),
+    voices: [{ name: key, description: p.voices.find((x) => x.voiceId === ref.voiceId)?.name ?? ref.voiceId, enabled: true, isDefault: true, engine: p.engine(ref.voiceId), location }]
   }
+}
+/** The assistant's voice as saved (ASSISTANT_VOICE), else the voice on this machine. */
+const assistantVoiceKey = (): string => {
+  const saved = String(valueOf("ASSISTANT_VOICE") ?? "").trim()
+  return parseVoiceKey(saved) !== undefined ? saved : "sherpa:en_US-lessac-medium"
+}
+/** The voice the running engines speak with. */
+const runningVoiceKey = (): string => engine.voices[0]?.name ?? assistantVoiceKey()
+/** A voice key → its parts (split at the first colon). */
+function parseVoiceKey(key: string): { provider: string; voiceId: string } | undefined {
+  const i = key.indexOf(":")
+  if (i <= 0) return undefined
+  const provider = key.slice(0, i)
+  const voiceId = key.slice(i + 1)
+  return /^[a-z][a-z0-9-]{0,31}$/.test(provider) && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(voiceId) ? { provider, voiceId } : undefined
+}
+/** Whether a voice model on this machine is downloaded (Voices › Models). */
+function presetInstalled(id: string): boolean {
+  return models.find((m) => m.tool === "tts-models")?.items.find((i) => i.id === id)?.installed === true
 }
 /** The Claude subscription module changed: the running engines say so when it is the language model. */
 const refreshEngine = () => {
@@ -687,13 +720,14 @@ let connSeq = 0
 const voiceSessions = new Map<string, VSession>()
 let conversationSeq = 0
 let modules = initialModules()
+// Before the sections: their checks look at which voice models are downloaded.
+let models: Array<ModelSet> = initialModels()
 let sections = withWarnings(initialSections())
 let engine: EngineStatus = initialEngine()
 let vault: { state: "none" | "locked" | "unlocked"; password?: string; lockReason?: "start" | "manual" } = scenario === "keys-locked"
   ? { state: "locked", password: VAULT_PASSWORD, lockReason: "start" }
   : { state: "none" }
 let env: EnvInfo = initialEnv()
-let models: Array<ModelSet> = initialModels()
 let jobs: Array<JobInfo> = []
 let jobSeq = 0
 const jobTimers = new Map<string, ReturnType<typeof setInterval>>()
@@ -952,11 +986,9 @@ const requireAdmin = (c: Conn, requestId: string): boolean => {
   result(c, requestId, false, { code: "admin_required", message: adminEnabled() ? "Log in to admin to change this." : "Admin is switched off: set PVA_ADMIN_PASSWORD in .env and restart." })
   return true
 }
-/** The server checks every value: a voice that is not enabled falls back to "". */
-const cleanPatch = (patch: ProfilePatch): ProfilePatch => {
-  if (typeof patch.voice !== "string" || patch.voice === "") return patch
-  return engine.voices.some((v) => v.enabled && v.name === patch.voice) ? patch : { ...patch, voice: "" }
-}
+/** As the server: a device's own voice is retired (docs/VOICE-PROVIDERS.md §1); any other value than "" becomes "". */
+const cleanPatch = (patch: ProfilePatch): ProfilePatch =>
+  typeof patch.voice !== "string" || patch.voice === "" ? patch : { ...patch, voice: "" }
 
 const resetState = () => {
   for (const t of scriptTimers) clearTimeout(t)
@@ -969,6 +1001,7 @@ const resetState = () => {
   voiceSessions.clear()
   lastSessions = ""
   modules = initialModules()
+  models = initialModels()
   sections = withWarnings(initialSections())
   engine = initialEngine()
   vault = scenario === "keys-locked" ? { state: "locked", password: VAULT_PASSWORD, lockReason: "start" } : { state: "none" }
@@ -980,7 +1013,9 @@ const resetState = () => {
   devices = seededDevices()
   kindDefaults = initialKindDefaults()
   env = initialEnv()
-  models = initialModels()
+  favourites = initialFavourites()
+  providerFailures.clear()
+  previewHold = 0
   for (const t of jobTimers.values()) clearInterval(t)
   jobTimers.clear()
   jobs = []
@@ -1033,7 +1068,7 @@ function initialEnv(): EnvInfo {
       { key: "PVA_VAULT_PASSWORD", origin: "file", file: ENV_FILE, line: 1, kind: "bootstrap", secret: true, movable: false },
       { key: "SERVE_PORT", origin: "file", file: ENV_FILE, line: 2, kind: "bootstrap", secret: false, movable: false },
       { key: "STT_SHERPA_MODLE", origin: "file", file: ENV_FILE, line: 6, kind: "unknown", secret: false, movable: false },
-      { key: "TTS_SHERPA_SPEED", origin: "file", file: ENV_FILE, line: 5, kind: "setting", secret: false, page: { path: ["voices", "engines"], title: "Voices › Voice engines" }, movable: true }
+      { key: "TTS_SHERPA_SPEED", origin: "file", file: ENV_FILE, line: 5, kind: "setting", secret: false, page: { path: ["voices", "providers"], title: "Voices › Voice providers" }, movable: true }
     ]
   }
 }
@@ -1060,6 +1095,7 @@ function initialModels(): Array<ModelSet> {
       freeMb: 41_200,
       items: [
         { id: "en_US-lessac-medium", label: "Piper en_US-lessac-medium", description: "Fast · 22050 Hz", sizeMb: 68, diskMb: 83, installed: true, inUse: true },
+        { id: "en_GB-alba-medium", label: "Piper en_GB-alba-medium", description: "Fast · 22050 Hz", sizeMb: 68, diskMb: 83, installed: false, inUse: false },
         { id: "nl_NL-pim-medium", label: "Piper nl_NL-pim-medium", description: "Fast · 22050 Hz", sizeMb: 68, diskMb: 83, installed: false, inUse: false },
         { id: "kokoro-af_heart", label: "Kokoro kokoro-af_heart", description: "Higher quality, slower first audio · 24000 Hz", sizeMb: 350, diskMb: 403, installed: true, inUse: false }
       ]
@@ -1096,11 +1132,18 @@ const updateJob = (job: JobInfo) => {
 }
 
 const startDownload = (c: Conn, requestId: string, tool: ToolId, target: string) => {
+  const started = startJob(tool, target)
+  if (!started.ok) return result(c, requestId, false, { code: started.code === "unknown" ? "invalid_settings" : "busy", message: started.message })
+  result(c, requestId, true)
+}
+
+/** A model download job (the Models pages and the voice picker's downloads are the same job). */
+const startJob = (tool: ToolId, target: string): { ok: true; job: JobInfo } | { ok: false; code: "unknown" | "installed" | "running"; message: string } => {
   const item = models.find((m) => m.tool === tool)?.items.find((i) => i.id === target)
-  if (item === undefined) return result(c, requestId, false, { code: "invalid_settings", message: `There is no model "${target}"` })
-  if (item.installed) return result(c, requestId, false, { code: "busy", message: `${item.label} is already downloaded` })
+  if (item === undefined) return { ok: false, code: "unknown", message: `There is no model "${target}"` }
+  if (item.installed) return { ok: false, code: "installed", message: `${item.label} is already downloaded` }
   if (jobs.some((j) => j.state === "running" && j.tool === tool && j.target === target)) {
-    return result(c, requestId, false, { code: "busy", message: `${item.label} is already being downloaded` })
+    return { ok: false, code: "running", message: `${item.label} is already being downloaded` }
   }
   const total = item.sizeMb * 1e6
   let job: JobInfo = {
@@ -1115,7 +1158,7 @@ const startDownload = (c: Conn, requestId: string, tool: ToolId, target: string)
     startedAt: Date.now()
   }
   updateJob(job)
-  result(c, requestId, true)
+  const first = job
   let tick = 0
   const unpackTicks = 6
   const timer = setInterval(() => {
@@ -1135,16 +1178,23 @@ const startDownload = (c: Conn, requestId: string, tool: ToolId, target: string)
     updateJob(job)
   }, 250)
   jobTimers.set(job.id, timer)
+  return { ok: true, job: first }
 }
 
 const cancelJob = (c: Conn, requestId: string, jobId: string) => {
+  const cancelled = stopJob(jobId)
+  if (cancelled === undefined) return result(c, requestId, false, { code: "invalid_settings", message: "That job is not running" })
+  result(c, requestId, true)
+}
+const stopJob = (jobId: string): JobInfo | undefined => {
   const job = jobs.find((j) => j.id === jobId && j.state === "running")
   const timer = jobTimers.get(jobId)
-  if (job === undefined || timer === undefined) return result(c, requestId, false, { code: "invalid_settings", message: "That job is not running" })
+  if (job === undefined || timer === undefined) return undefined
   clearInterval(timer)
   jobTimers.delete(jobId)
-  updateJob({ ...job, state: "cancelled", endedAt: Date.now() })
-  result(c, requestId, true)
+  const cancelled: JobInfo = { ...job, state: "cancelled", endedAt: Date.now() }
+  updateJob(cancelled)
+  return cancelled
 }
 
 const deleteModel = (c: Conn, requestId: string, tool: ToolId, target: string) => {
@@ -1282,7 +1332,7 @@ const makeTrace = (r: Reply, outcome: TraceInfo["outcome"]): TraceInfo => {
     marks,
     totalMs: Date.now() - r.endOfTurn,
     tools: r.tools,
-    voices: r.spoken ? ["standard"] : [],
+    voices: r.spoken ? [runningVoiceKey()] : [],
     ...(r.started !== undefined ? { client: { outputLatencyMs: r.started.outputLatencyMs, startDelayMs: r.started.startDelayMs } } : {})
   }
   return trace
@@ -1412,7 +1462,7 @@ const runReply = (v: VSession, opts: {
   // Clauses go to TTS one after another, faster than real time.
   opts.clauses.forEach((text, i) => {
     r.timers.push(setTimeout(() => {
-      toSession(v, { type: "assistant.text", turnId, clause: i, text, voice: sessionProfile(v).voice || "standard" })
+      toSession(v, { type: "assistant.text", turnId, clause: i, text, voice: runningVoiceKey() })
       if (c !== undefined) sendReplyAudio(c, turnId, pcms[i]!)
       if (i === opts.clauses.length - 1 && c !== undefined) sendTo(c, { type: "reply.end", turnId })
     }, t + 30 + i * 380))
@@ -1828,10 +1878,6 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
       }
       const record = devices.get(c.deviceId)
       if (record === undefined) return result(c, m.requestId, false, { code: "unknown_device", message: "This device is not known." })
-      // As the server: a voice that is not enabled (a stale list) is refused.
-      if (typeof m.patch.voice === "string" && m.patch.voice !== "" && !engine.voices.some((v) => v.enabled && v.name === m.patch.voice)) {
-        return result(c, m.requestId, false, { code: "invalid_settings", message: `"${m.patch.voice}" is not an enabled voice.` })
-      }
       record.overrides = applyProfilePatch(record.overrides, cleanPatch(m.patch))
       pushProfiles()
       result(c, m.requestId, true)
@@ -2013,6 +2059,310 @@ wss.on("connection", (ws: WebSocket) => {
   })
 })
 
+
+// ---------------------------------------------------------------------------
+// The voice picker's HTTP API (docs/VOICE-PROVIDERS.md §5), under /api/
+// ---------------------------------------------------------------------------
+
+/** Favourites, as `data/voice-favourites.json` would hold them: one Cartesia voice (no key yet) among them. */
+function initialFavourites(): Array<Favourite> {
+  const at = Date.UTC(2026, 10, 10)
+  const fav = (provider: string, voiceId: string, name: string, i: number): Favourite => ({ voice: { provider, voiceId }, key: `${provider}:${voiceId}`, name, addedAt: at + i * 60_000 })
+  return [
+    fav("elevenlabs", "mk2Ls1fsHW4xr9Ic3Bb2", "Charlotte", 0),
+    fav("sherpa", "kokoro-af_heart", "Heart", 1),
+    fav("cartesia", "db6b0ed5-d5d3-463d-ae85-518a07d3c2b4", "Skylar", 2),
+    fav("elevenlabs", "mk3Mt2gtIX5ys0Jd4Cc3", "Daniel", 3),
+    fav("sherpa", "en_US-lessac-medium", "Lessac", 4)
+  ]
+}
+let favourites: Array<Favourite> = initialFavourites()
+/** POST /mock/voices/fail {"provider", "on"}: a hosted provider whose key is refused (status `error`). */
+const providerFailures = new Set<string>()
+/** POST /mock/voices/hold {"ms"}: previews answer after this long (default 300 ms). */
+let previewHold = 0
+let pendingPreview: { readonly res: ServerResponse; readonly timer: ReturnType<typeof setTimeout> } | undefined
+
+class ApiFail {
+  readonly status: number
+  readonly code: string
+  readonly message: string
+  readonly retryAfterMs: number | undefined
+  constructor(status: number, code: string, message: string, retryAfterMs?: number) {
+    this.status = status
+    this.code = code
+    this.message = message
+    this.retryAfterMs = retryAfterMs
+  }
+}
+
+const providerStatus = (p: (typeof MOCK_PROVIDERS)[number]): ProviderInfo => {
+  const base = {
+    id: p.id,
+    label: p.label,
+    location: p.location,
+    settingsPath: "voices/providers",
+    ...(p.keyField !== undefined ? { keyField: p.keyField } : {}),
+    ...(p.implication !== undefined ? { implication: p.implication } : {}),
+    inUse: parseVoiceKey(assistantVoiceKey())?.provider === p.id
+  }
+  if (p.keyField === undefined) return { ...base, status: "ready", voiceCount: p.voices.length }
+  if (vault.state === "locked") return { ...base, status: "needs_key", reason: "vault_locked", message: `The keys are locked: unlock them to use ${p.label} voices.` }
+  if (!secretSet(p.keyField)) return { ...base, status: "needs_key", reason: "missing", message: `Add a ${p.label} API key to use its voices.` }
+  if (providerFailures.has(p.id)) return { ...base, status: "error", message: `${p.label} refused the API key (401): check it on the Voice providers page.`, voiceCount: p.voices.length }
+  return { ...base, status: "ready", voiceCount: p.voices.length }
+}
+
+const providerVoices = (p: (typeof MOCK_PROVIDERS)[number]): ProviderVoices => {
+  const info = providerStatus(p)
+  const selected = assistantVoiceKey()
+  const listed = info.status === "needs_key" ? [] : p.voices
+  const voices: Array<VoiceEntry> = listed.map((v) => {
+    const key = `${p.id}:${v.voiceId}`
+    const item = p.location === "local" ? models.find((m) => m.tool === "tts-models")?.items.find((i) => i.id === v.voiceId) : undefined
+    const job = item === undefined ? undefined : jobs.find((j) => j.tool === "tts-models" && j.target === v.voiceId && j.state === "running")
+    const local = item === undefined ? undefined : { state: job !== undefined ? "downloading" as const : item.installed ? "installed" as const : "not_installed" as const, sizeMb: item.sizeMb, diskMb: item.diskMb, ...(job !== undefined ? { job } : {}) }
+    return {
+      voice: { provider: p.id, voiceId: v.voiceId },
+      key,
+      name: v.name,
+      ...(v.description !== undefined ? { description: v.description } : {}),
+      ...(v.language !== undefined ? { language: v.language } : {}),
+      ...(v.gender !== undefined ? { gender: v.gender } : {}),
+      tags: [...v.tags],
+      ...(local !== undefined ? { local } : {}),
+      previewable: info.status === "ready" && (local === undefined || local.state === "installed"),
+      selected: key === selected,
+      favourite: favourites.some((f) => f.key === key)
+    }
+  })
+  return {
+    provider: info,
+    voices,
+    ...(p.location === "hosted" && info.status !== "needs_key" ? { fetchedAt: Date.now() - 20 * 60_000 } : {}),
+    stale: false,
+    truncated: false,
+    ...(info.status === "error" ? { error: { code: "provider_error", message: info.message ?? "The provider refused." } } : {})
+  }
+}
+
+const findVoice = (ref: unknown): { provider: (typeof MOCK_PROVIDERS)[number]; voice: (typeof MOCK_PROVIDERS)[number]["voices"][number] } => {
+  const r = ref as { provider?: unknown; voiceId?: unknown } | undefined
+  if (typeof r?.provider !== "string" || typeof r.voiceId !== "string") throw new ApiFail(400, "invalid_request", "The request is not valid: voice")
+  const provider = MOCK_PROVIDERS.find((p) => p.id === r.provider)
+  if (provider === undefined) throw new ApiFail(404, "unknown_provider", `There is no voice provider "${r.provider}"`)
+  const voice = provider.voices.find((v) => v.voiceId === r.voiceId)
+  if (voice === undefined) throw new ApiFail(404, "unknown_voice", `${provider.label} has no voice "${r.voiceId}"`)
+  return { provider, voice }
+}
+
+const needKey = (p: (typeof MOCK_PROVIDERS)[number]) => {
+  const info = providerStatus(p)
+  if (info.status === "needs_key") throw new ApiFail(409, "needs_key", info.message ?? `There is no ${p.label} key: add it on the Voice providers page.`)
+  return info
+}
+
+const defaultVoiceInfo = () => {
+  const saved = String(valueOf("ASSISTANT_VOICE") ?? "").trim()
+  const key = assistantVoiceKey()
+  const ref = parseVoiceKey(key)!
+  const name = MOCK_PROVIDERS.find((p) => p.id === ref.provider)?.voices.find((v) => v.voiceId === ref.voiceId)?.name
+  return {
+    voice: ref,
+    key,
+    ...(name !== undefined ? { name } : {}),
+    source: saved !== "" ? "saved" as const : "default" as const,
+    locked: false,
+    ...(engine.state === "ready" ? { running: runningVoiceKey() } : {}),
+    reloadPending: (engine.reloadPendingFor ?? []).includes("voices/overview"),
+    notes: [] as Array<string>
+  }
+}
+
+/** Save ASSISTANT_VOICE as settings.update would (a new revision, section.changed, the reload pending). */
+const saveAssistantVoice = (key: string) => {
+  sections = withWarnings(sections.map((x) => (x.id === "voices" ? { ...x, form: { ...x.form, values: { ...x.form.values, ASSISTANT_VOICE: key } }, revision: x.revision + 1 } : x)))
+  const section = sections.find((x) => x.id === "voices")
+  if (section !== undefined) broadcast({ type: "section.changed", section })
+  if (!(engine.reloadPendingFor ?? []).includes("voices/overview")) {
+    engine = { ...engine, reloadPending: true, reloadPendingFor: [...(engine.reloadPendingFor ?? []), "voices/overview"] }
+    broadcast({ type: "engine", engine })
+  }
+}
+
+const apiRoute = async (req: IncomingMessage, res: ServerResponse, path: string, query: URLSearchParams): Promise<{ status: number; body: unknown } | undefined> => {
+  const method = req.method ?? "GET"
+  const only = (...allowed: Array<string>) => {
+    if (!allowed.includes(method)) throw new ApiFail(405, "method_not_allowed", `Use ${allowed.join(", ")}`)
+  }
+  const body = async (): Promise<Record<string, unknown>> => {
+    const text = await readBody(req)
+    if (text === "") return {}
+    try {
+      return JSON.parse(text) as Record<string, unknown>
+    } catch {
+      throw new ApiFail(400, "invalid_request", "The request body is not valid JSON")
+    }
+  }
+  if (path === "voice-providers") {
+    only("GET")
+    return { status: 200, body: { providers: MOCK_PROVIDERS.map(providerStatus) } }
+  }
+  if (path === "voices") {
+    only("GET")
+    const id = query.get("provider")
+    if (id !== null && !MOCK_PROVIDERS.some((p) => p.id === id)) throw new ApiFail(404, "unknown_provider", `There is no voice provider "${id}"`)
+    // Hosted lists take a moment (a refresh longer: the providers are asked again).
+    await new Promise((r) => setTimeout(r, query.get("refresh") === "1" ? 500 : 120))
+    const providers = MOCK_PROVIDERS.filter((p) => id === null || p.id === id).map(providerVoices)
+    return { status: 200, body: { providers, selected: assistantVoiceKey() } }
+  }
+  if (path === "voices/preview") {
+    only("POST")
+    const b = await body()
+    const { provider, voice } = findVoice(b.voice)
+    const text = typeof b.text === "string" ? b.text.trim() : ""
+    if (text.length === 0 || text.length > MAX_PREVIEW_CHARS) throw new ApiFail(400, "invalid_request", "The preview text must be 1–300 characters", undefined)
+    const info = needKey(provider)
+    if (info.status === "error") throw new ApiFail(502, "provider_error", info.message ?? "The provider refused.")
+    if (provider.location === "local") {
+      if (!presetInstalled(voice.voiceId)) throw new ApiFail(409, "not_installed", `${voice.name} is not downloaded: download it first`)
+      if ([...voiceSessions.values()].some((v) => v.state === "hearing" || v.state === "thinking" || v.state === "speaking")) {
+        throw new ApiFail(409, "busy", "The assistant is talking; try again in a moment", 1000)
+      }
+    }
+    clientLog.push({ type: "api.preview", conn: "http", at: Date.now(), voice: `${provider.id}:${voice.voiceId}`, text })
+    // One preview at a time: a new one supersedes the one still waiting.
+    if (pendingPreview !== undefined) {
+      clearTimeout(pendingPreview.timer)
+      apiAnswer(req, pendingPreview.res, 409, { error: { code: "superseded", message: "A newer preview replaced this one" } })
+      pendingPreview = undefined
+    }
+    const pcm = synthesize(text, voice.name.length)
+    const wav = encodeWav(pcm, REPLY_RATE)
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(() => {
+        if (pendingPreview?.res === res) pendingPreview = undefined
+        resolve()
+      }, previewHold > 0 ? previewHold : 300)
+      pendingPreview = { res, timer }
+      res.on("close", () => {
+        if (pendingPreview?.res === res) {
+          clearTimeout(timer)
+          pendingPreview = undefined
+        }
+        resolve()
+      })
+    })
+    if (res.writableEnded || res.destroyed) return undefined
+    res.writeHead(200, { ...corsHeaders(req), "content-type": "audio/wav", "content-length": String(wav.length), "x-voice-sample-rate": String(REPLY_RATE), "x-preview-cache": "miss", "cache-control": "no-store" })
+    res.end(wav)
+    return undefined
+  }
+  if (path === "voices/download" || path === "voices/download/cancel") {
+    only("POST")
+    const { provider, voice } = findVoice((await body()).voice)
+    if (provider.location !== "local") throw new ApiFail(400, "invalid_request", "Only voices on this machine are downloaded")
+    if (path === "voices/download/cancel") {
+      const job = jobs.find((j) => j.tool === "tts-models" && j.target === voice.voiceId && j.state === "running")
+      const cancelled = job === undefined ? undefined : stopJob(job.id)
+      if (cancelled === undefined) throw new ApiFail(404, "not_found", `${voice.name} is not being downloaded`)
+      return { status: 200, body: { cancelled: true, job: cancelled } }
+    }
+    const started = startJob("tts-models", voice.voiceId)
+    if (!started.ok) {
+      throw started.code === "installed" ? new ApiFail(409, "already_installed", started.message)
+        : started.code === "running" ? new ApiFail(409, "busy", started.message)
+        : new ApiFail(404, "unknown_voice", started.message)
+    }
+    return { status: 202, body: { job: started.job } }
+  }
+  const jobMatch = /^jobs\/([^/]+)$/.exec(path)
+  if (jobMatch !== null) {
+    only("GET")
+    const job = jobs.find((j) => j.id === decodeURIComponent(jobMatch[1]!))
+    if (job === undefined) throw new ApiFail(404, "not_found", "There is no such job")
+    return { status: 200, body: { job } }
+  }
+  if (path === "voices/favourites") {
+    only("GET")
+    return { status: 200, body: { favourites } }
+  }
+  const favMatch = /^voices\/favourites\/([^/]+)$/.exec(path)
+  if (favMatch !== null) {
+    only("PUT", "DELETE")
+    let key: string
+    try {
+      key = decodeURIComponent(favMatch[1]!)
+    } catch {
+      throw new ApiFail(400, "invalid_request", "The voice in the address is not valid")
+    }
+    const ref = parseVoiceKey(key)
+    if (ref === undefined) throw new ApiFail(400, "invalid_request", `"${key.slice(0, 80)}" is not a voice (provider:voice)`)
+    if (!MOCK_PROVIDERS.some((p) => p.id === ref.provider)) throw new ApiFail(404, "unknown_provider", `There is no voice provider "${ref.provider}"`)
+    if (method === "DELETE") {
+      if (!favourites.some((f) => f.key === key)) throw new ApiFail(404, "not_found", "That voice is not a favourite")
+      favourites = favourites.filter((f) => f.key !== key)
+      return { status: 200, body: { favourites } }
+    }
+    const b = await body()
+    const listed = MOCK_PROVIDERS.find((p) => p.id === ref.provider)?.voices.find((v) => v.voiceId === ref.voiceId)?.name
+    const name = typeof b.name === "string" && b.name.length > 0 ? b.name.slice(0, 100) : listed ?? ref.voiceId
+    const existing = favourites.find((f) => f.key === key)
+    if (existing === undefined && favourites.length >= MAX_FAVOURITES) throw new ApiFail(409, "limit_reached", `At most ${MAX_FAVOURITES} favourites`)
+    const favourite: Favourite = existing !== undefined ? { ...existing, name } : { voice: ref, key, name, addedAt: Date.now() }
+    favourites = existing !== undefined ? favourites.map((f) => (f.key === key ? favourite : f)) : [...favourites, favourite]
+    return { status: 200, body: { favourite, favourites } }
+  }
+  if (path === "voices/default") {
+    only("GET", "PUT")
+    if (method === "GET") return { status: 200, body: { default: defaultVoiceInfo() } }
+    const b = await body()
+    const { provider, voice } = findVoice(b.voice)
+    needKey(provider)
+    if (provider.location === "local" && !presetInstalled(voice.voiceId)) throw new ApiFail(409, "not_installed", `${voice.name} is not downloaded: download it first`)
+    saveAssistantVoice(`${provider.id}:${voice.voiceId}`)
+    if (b.reload === true) {
+      engine = { ...readyEngine(), reloadPending: false }
+      broadcast({ type: "engine", engine })
+      return { status: 200, body: { default: defaultVoiceInfo(), reload: { ok: true } } }
+    }
+    return { status: 200, body: { default: defaultVoiceInfo() } }
+  }
+  throw new ApiFail(404, "not_found", `There is nothing at /api/${path}`)
+}
+
+/** CORS for the page's origin (the static export and the mock are on different ports). */
+const corsHeaders = (req: IncomingMessage): Record<string, string> => {
+  const origin = req.headers.origin
+  return origin === undefined ? {} : { "access-control-allow-origin": origin, vary: "Origin", "access-control-expose-headers": "X-Voice-Sample-Rate, X-Preview-Cache" }
+}
+
+function apiAnswer(req: IncomingMessage, res: ServerResponse, status: number, body: unknown) {
+  if (res.writableEnded || res.destroyed) return
+  res.writeHead(status, { ...corsHeaders(req), "content-type": "application/json; charset=utf-8", "cache-control": "no-store", "x-content-type-options": "nosniff" })
+  res.end(JSON.stringify(body))
+}
+
+const handleApi = async (req: IncomingMessage, res: ServerResponse, url: URL) => {
+  if (req.method === "OPTIONS") {
+    res.writeHead(204, { ...corsHeaders(req), "access-control-allow-methods": "GET, POST, PUT, DELETE", "access-control-allow-headers": "authorization, content-type", "access-control-max-age": "600" })
+    return res.end()
+  }
+  try {
+    const token = /^Bearer\s+(\S+)$/.exec(req.headers.authorization ?? "")?.[1]
+    if (!adminEnabled()) throw new ApiFail(401, "admin_required", "Admin is disabled: set PVA_ADMIN_PASSWORD (at least 8 characters) in .env and restart.")
+    if (token === undefined || !sessions.has(token)) throw new ApiFail(401, "admin_required", "Log in to admin first (the session may have ended)")
+    const answer = await apiRoute(req, res, url.pathname.slice("/api/".length).replace(/\/+$/, ""), url.searchParams)
+    if (answer !== undefined) apiAnswer(req, res, answer.status, answer.body)
+  } catch (e) {
+    if (e instanceof ApiFail) {
+      return apiAnswer(req, res, e.status, { error: { code: e.code, message: e.message, ...(e.retryAfterMs !== undefined ? { retryAfterMs: e.retryAfterMs } : {}) } })
+    }
+    apiAnswer(req, res, 500, { error: { code: "internal", message: String(e) } })
+  }
+}
+
 const readBody = (req: IncomingMessage) =>
   new Promise<string>((resolve) => {
     let body = ""
@@ -2028,6 +2378,7 @@ const json = (res: ServerResponse, status: number, body: unknown) => {
 const http = createServer((req, res) => {
   void (async () => {
     const url = new URL(req.url ?? "/", "http://localhost")
+    if (url.pathname.startsWith("/api/")) return handleApi(req, res, url)
     if (req.method === "OPTIONS") {
       res.writeHead(204, { "access-control-allow-origin": "*", "access-control-allow-methods": "GET,POST", "access-control-allow-headers": "content-type" })
       return res.end()
@@ -2113,6 +2464,16 @@ const http = createServer((req, res) => {
         settleAll()
         return json(res, 200, { ok: true })
       }
+      case "/mock/voices/fail": {
+        // A hosted provider whose key is refused (`on: false` makes it work again).
+        const id = String(payload.provider ?? "")
+        if (payload.on === false) providerFailures.delete(id)
+        else providerFailures.add(id)
+        return json(res, 200, { ok: true })
+      }
+      case "/mock/voices/hold":
+        previewHold = typeof payload.ms === "number" ? payload.ms : 0
+        return json(res, 200, { ok: true })
       case "/mock/logout-fails":
         logoutFails = payload.on !== false
         return json(res, 200, { ok: true })

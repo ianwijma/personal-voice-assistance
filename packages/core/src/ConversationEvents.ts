@@ -54,7 +54,7 @@ export type ConversationEvent =
   | { readonly _tag: "TurnPromoted"; readonly turnId: number }
   /** Raw model text, voice markers included; rounds are separated by "\n". */
   | { readonly _tag: "TextDelta"; readonly turnId: number; readonly text: string }
-  /** A clause was handed to TTS (spoken turns). Raw: may start with a `[voice:NAME]` marker. */
+  /** A clause was handed to TTS (spoken turns). The text as handed over. */
   | { readonly _tag: "ClauseQueued"; readonly turnId: number; readonly index: number; readonly text: string }
   /** Every clause up to `index` has started playing (spoken turns; from playback reports when the output provides them). */
   | { readonly _tag: "ClausePlaying"; readonly turnId: number; readonly index: number }
@@ -112,9 +112,9 @@ export type ConversationInput =
   | { readonly _tag: "SetActiveAgent"; readonly agentId: string | null }
   /**
    * Speak `text` as a canned turn: no agent, nothing recorded ("Play a sample").
-   * Interrupts like `TextInput`. `voice` adds a `[voice:NAME]` marker when the text has none.
+   * Interrupts like `TextInput`.
    */
-  | { readonly _tag: "Say"; readonly text: string; readonly voice?: string | undefined }
+  | { readonly _tag: "Say"; readonly text: string }
 
 /**
  * Passed by `Conversation` to `AudioOutput.play` (third parameter) when

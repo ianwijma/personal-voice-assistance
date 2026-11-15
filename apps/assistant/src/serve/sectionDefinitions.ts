@@ -13,8 +13,9 @@ import * as SherpaStt from "@pva/stt-sherpa"
 import * as SherpaTts from "@pva/tts-sherpa"
 import { SUBSCRIPTION_AGENT_ID, SUBSCRIPTION_PROVIDER } from "../subscription.ts"
 import { defaultSystemPrompt } from "../config.ts"
-import { hostedTts, isHostedTts } from "../providers.ts"
-import { voiceCatalog } from "../voices.ts"
+import { parseVoiceKey, voiceKey } from "@pva/core"
+import { isTtsProvider, ttsProviderInfo } from "../providers.ts"
+import { ASSISTANT_VOICE, DEFAULT_ASSISTANT_VOICE } from "../voiceSelection.ts"
 
 /**
  * The assistant settings as the settings screen shows them (docs/SETTINGS-UI.md
@@ -109,30 +110,16 @@ const languagePresets = SherpaStt.presetNames.filter((name) => SherpaStt.takesLa
 const warn = (key: string, message: string): SettingsProblem => ({ level: "warning", key, message })
 const error = (key: string, message: string): SettingsProblem => ({ level: "error", key, message })
 
-/** The voice's engine: its declared provider, else the standard engine (`TTS_PROVIDER`). */
-const engineOfVoice = (name: string, ttsProvider: unknown) => voiceCatalog.find((v) => v.name === name)?.provider ?? String(ttsProvider ?? "sherpa")
+/** `ASSISTANT_VOICE`'s own check: a voice key of a known provider (empty = the earlier settings decide). */
+const checkVoiceKey = (value: string): string | undefined => {
+  const v = value.trim()
+  if (v === "") return undefined
+  const ref = parseVoiceKey(v)
+  if (ref === undefined) return "Must be a voice: provider:voice, e.g. sherpa:en_US-lessac-medium"
+  return isTtsProvider(ref.provider) ? undefined : `There is no voice provider "${ref.provider}"`
+}
 
 export const sectionDefinitions = (dirs: ModelDirs = defaultModelDirs): ReadonlyArray<SectionDefinition> => {
-  const voiceOptions = voiceCatalog.map((v) => {
-    const service = isHostedTts(v.provider ?? "sherpa") ? hostedTts[v.provider as keyof typeof hostedTts] : undefined
-    const hosted = service !== undefined
-    const kokoro = v.settings?.TTS_SHERPA_PRESET?.startsWith("kokoro") === true
-    const tags: Array<OptionTag> = hosted ? ["hosted", "needs-key"] : kokoro ? ["local", "slow-start"] : ["local"]
-    // A voice on this machine whose declared preset is not downloaded yet can be downloaded from the option.
-    const preset = hosted ? undefined : SherpaTts.presets[v.settings?.TTS_SHERPA_PRESET ?? SherpaTts.DEFAULT_PRESET]
-    const download = preset === undefined ? undefined : { tool: "tts-models" as const, target: preset.name, sizeMb: SherpaTts.sizeMb(preset) }
-    if (preset !== undefined && !SherpaTts.isInstalled(preset.name, dirs.tts)) tags.push("not-downloaded")
-    return {
-      value: v.name,
-      label: v.name,
-      description: v.description,
-      tags,
-      ...(download !== undefined ? { download } : {}),
-      ...(service !== undefined ? { implication: `Replies in this voice are sent to ${service.label} to be spoken.` } : {}),
-      ...(kokoro ? { implication: "Its first audio takes about 0.2–0.9 s longer than the standard voice." } : {})
-    }
-  })
-
   return [
     // ---- Language model
     {
@@ -491,88 +478,62 @@ export const sectionDefinitions = (dirs: ModelDirs = defaultModelDirs): Readonly
       ]
     },
 
-    // ---- Voices
+    // ---- Voices (docs/VOICE-PROVIDERS.md §6.1)
     {
       id: "voices",
       title: "Voices",
-      description: "The model picks a voice per reply; the default speaks everything else.",
+      description: "The voice the assistant speaks every reply with.",
       group: "voices",
-      page: { id: "overview", title: "Voices", description: "Which voices the assistant may use." },
+      page: { id: "overview", title: "Voices", description: "Which voice the assistant speaks with." },
       order: 10,
       spec: {
-        DEFAULT_VOICE: Setting.choice({
-          label: "Default voice",
-          description: "Applies from the next reply when the voice is enabled; otherwise after reloading the engines.",
-          env: "DEFAULT_VOICE",
-          default: voiceCatalog[0]!.name,
-          options: voiceOptions
-        }),
-        VOICES: Setting.multichoice({
-          label: "Enabled voices",
-          description: "Each local voice is its own engine process. The default voice is always enabled.",
-          env: "VOICES",
-          default: [voiceCatalog[0]!.name],
-          options: voiceOptions,
+        [ASSISTANT_VOICE]: Setting.text({
+          label: "Assistant voice",
+          description: "A voice of one of the voice providers (provider:voice). Applies after reloading the engines. " +
+            "Empty: the voice of the earlier voice settings, else the voice on this machine.",
+          env: ASSISTANT_VOICE,
+          placeholder: voiceKey(DEFAULT_ASSISTANT_VOICE),
+          maxLength: 200,
+          check: checkVoiceKey,
           apply: reload
         })
       },
       checks: [
         (v) => {
-          const enabled = new Set([...(Array.isArray(v.value("VOICES")) ? v.value("VOICES") as ReadonlyArray<string> : []), String(v.value("DEFAULT_VOICE"))])
-          return Object.entries(hostedTts).flatMap(([provider, service]) => {
-            if (v.secretSet(service.keyEnv)) return []
-            const hosted = [...enabled].filter((name) => engineOfVoice(name, v.value("TTS_PROVIDER")) === provider)
-            return hosted.length === 0 ? [] : [
-              warn(
-                "VOICES",
-                `${hosted.join(", ")} ${hosted.length === 1 ? "speaks" : "speak"} through ${service.label}, but there is no ${service.label} key: add it on the Voice engines page.`
-              )
-            ]
-          })
+          const ref = parseVoiceKey(String(v.value(ASSISTANT_VOICE) ?? "").trim())
+          if (ref === undefined || !isTtsProvider(ref.provider)) return []
+          const info = ttsProviderInfo[ref.provider]
+          if (info.keyEnv === undefined || v.secretSet(info.keyEnv)) return []
+          return [
+            warn(
+              ASSISTANT_VOICE,
+              `This voice speaks through ${info.label}, but there is no ${info.label} key: add it on the Voice providers page.`
+            )
+          ]
         }
       ]
     },
     {
-      id: "voice-engines",
-      title: "Voice engines",
+      id: "voice-providers",
+      title: "Voice providers",
       group: "voices",
-      page: { id: "engines", title: "Voice engines", description: "The engine of the standard voice, and the hosted voice services." },
+      page: { id: "providers", title: "Voice providers", description: "Where the voices come from: this machine, and the hosted voice services." },
       order: 20,
       protected: true,
       spec: {
-        TTS_PROVIDER: Setting.choice({
-          label: "Standard voice engine",
-          description: "Also used by voices that do not name an engine of their own.",
-          env: "TTS_PROVIDER",
-          default: "sherpa",
-          options: [
-            { value: "sherpa", label: "On this machine (Piper/Kokoro)", tags: ["local"] },
-            { value: "cartesia", label: "Cartesia", tags: ["hosted", "needs-key"], implication: "Replies are sent to Cartesia to be spoken." },
-            { value: "elevenlabs", label: "ElevenLabs", tags: ["hosted", "needs-key"], implication: "Replies are sent to ElevenLabs to be spoken." }
-          ],
-          apply: reload
-        }),
         CARTESIA_API_KEY: Setting.secret({
           label: "Cartesia API key",
-          description: "For Cartesia voices (the standard voice on Cartesia, or the expressive voice).",
+          description: "For Cartesia voices: listing them, previews, and speaking with one.",
           env: "CARTESIA_API_KEY",
           apply: reload
         }),
         ELEVENLABS_API_KEY: Setting.secret({
           label: "ElevenLabs API key",
-          description: "For ElevenLabs voices (the standard voice on ElevenLabs, or a voice set to it with VOICE_<NAME>_PROVIDER=elevenlabs).",
+          description: "For ElevenLabs voices: listing them, previews, and speaking with one.",
           env: "ELEVENLABS_API_KEY",
           apply: reload
         })
-      },
-      checks: [
-        (v) => {
-          const provider = String(v.value("TTS_PROVIDER"))
-          if (!isHostedTts(provider) || v.secretSet(hostedTts[provider].keyEnv)) return []
-          const { label } = hostedTts[provider]
-          return [warn("TTS_PROVIDER", `${label} is chosen but there is no ${label} key: the standard voice fails until you add it below.`)]
-        }
-      ]
+      }
     },
 
     // ---- Diagnostics

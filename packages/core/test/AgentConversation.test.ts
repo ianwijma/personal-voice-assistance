@@ -244,8 +244,8 @@ describe("trigger only, arming and canned turns", () => {
     const main = makeScriptedAgent({ id: "main" }, [[agentText("One. "), sleep(5_000), agentText("Two.")]])
     const t = harness({ setup: makeAgentSetup({ agents: [main.agent], routing: routing() }) })
     return Effect.gen(function*() {
-      yield* run([endOfTurn("count"), sleep(150), { _tag: "Say", text: "This is the natural voice.", voice: "natural" }], 10_000)
-      assert.deepStrictEqual(played(t.out), ["<One.>", "<[voice:natural] This is the natural voice.>"])
+      yield* run([endOfTurn("count"), sleep(150), { _tag: "Say", text: "This is the natural voice." }], 10_000)
+      assert.deepStrictEqual(played(t.out), ["<One.>", "<This is the natural voice.>"])
       assert.deepStrictEqual(yield* history, [{ role: "user", content: "count" }, { role: "assistant", content: "One.", interrupted: true, agentId: "main" }])
       assert.strictEqual(ofTag(t.events, "TurnStarted")[1]!.canned, true)
     }).pipe(Effect.provide(t.layer))

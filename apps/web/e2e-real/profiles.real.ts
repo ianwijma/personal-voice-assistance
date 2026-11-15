@@ -1,8 +1,7 @@
 // Front-end kinds, devices and profiles against the real assistant (docs/FRONTENDS-AND-ACTIVATION.md §2, §5): the
 // voice page's device in admin › Devices, a kind default and a device override reaching the open voice page live,
-// the voice sheet's own fields (voice, activation, follow-up) showing in admin, and a voice that is not enabled.
-// (A voice switched off while a device uses it falls back live: covered by the server tests; here `VOICES` comes from
-// the environment, so admin cannot switch it.)
+// and the voice sheet's own fields (activation, follow-up) showing in admin. A device has no voice of its own any more
+// (docs/VOICE-PROVIDERS.md §1): the sheet offers none and admin's device form shows none.
 import type { Page } from "@playwright/test"
 import { join } from "node:path"
 import {
@@ -32,8 +31,7 @@ test.use({ launchOptions: { args: chromiumArgsFor(wav) } })
 
 let assistant: Assistant
 test.beforeAll(async () => {
-  // Two local voices, so a device can pick one that is not the default.
-  assistant = await startAssistant({ port: 8790, dataDir: join(here, "../test-results/real/data-profiles"), env: { VOICES: "standard,natural" } })
+  assistant = await startAssistant({ port: 8790, dataDir: join(here, "../test-results/real/data-profiles") })
 })
 test.afterAll(async () => {
   await assistant?.stop()
@@ -118,7 +116,7 @@ test("the voice page's device in Devices; a kind default and a device override r
   }
 })
 
-test("the voice sheet changes voice, activation and follow-up; admin shows them as the device's own; the reply uses the voice", async ({ browser }, testInfo) => {
+test("the voice sheet changes activation and follow-up; admin shows them as the device's own; no voice of its own", async ({ browser }, testInfo) => {
   const ctx = await browser.newContext({ permissions: ["microphone"], viewport: { width: 1280, height: 800 } })
   const voice = await ctx.newPage()
   const admin = await ctx.newPage()
@@ -131,69 +129,37 @@ test("the voice sheet changes voice, activation and follow-up; admin shows them 
     const id = await deviceId(voice)
     await loginAdmin(admin, assistant.url, `#settings/devices/${id}`)
     const form = admin.getByTestId(`profile-device-${id}`)
-    await expect(form.locator("[data-field=voice]").getByTestId("inherited")).toBeVisible()
+    await expect(form.locator("[data-field=voice]")).toHaveCount(0)
 
     await voice.getByTestId("settings-toggle").click()
     const sheet = voice.getByTestId("voice-sheet")
-    const voices = sheet.getByTestId("voice-choices")
-    await expect(voices.getByRole("radio")).toHaveCount(3) // Assistant default, standard, natural
-    await voices.getByRole("radio", { name: /natural/ }).check()
+    await expect(sheet.getByTestId("voice-choices")).toHaveCount(0)
     await sheet.getByRole("radio", { name: "Wake phrase" }).click()
     await expect(sheet.getByTestId("wake-phrases")).toContainText("Hey Jeff")
     await sheet.getByLabel("Keep listening after a reply").selectOption("15")
     await expect.poll(async () => (await lastProfile(voice))?.followUpSeconds).toBe(15)
     const profile = (await lastProfile(voice))!
-    expect(profile).toMatchObject({ voice: "natural", activation: "wake-phrase", followUpSeconds: 15 })
+    expect(profile).toMatchObject({ voice: "", activation: "wake-phrase", followUpSeconds: 15 })
     await expectVisualState(voice, "asleep")
 
-    // Admin's device page shows the three as overrides, live; the list says how it activates.
-    for (const f of ["voice", "activation", "followUpSeconds"]) await expect(form.locator(`[data-field=${f}]`)).toHaveAttribute("data-overridden", "true")
+    // Admin's device page shows the two as overrides, live; the list says how it activates.
+    for (const f of ["activation", "followUpSeconds"]) await expect(form.locator(`[data-field=${f}]`)).toHaveAttribute("data-overridden", "true")
     await expect(form.locator("[data-field=followUpSeconds]").getByRole("spinbutton")).toHaveValue("15")
     await admin.getByTestId("page-up").click()
     await expect(admin.getByTestId("device-list").locator(`[data-device="${id}"]`)).toContainText("Wake phrase")
-    await expect(admin.getByTestId("device-list").locator(`[data-device="${id}"]`)).toContainText("3 own settings")
+    await expect(admin.getByTestId("device-list").locator(`[data-device="${id}"]`)).toContainText("2 own settings")
 
-    // A typed message is answered in the device's voice.
+    // A typed message is answered in the assistant's one voice (its key).
     await voice.keyboard.press("Escape")
     await voice.getByTestId("chat-toggle").click()
     const from = (await messages(voice)).length
     await voice.locator("#chat-input").fill("Hello there.")
     await voice.locator("#chat-input").press("Enter")
     const end = await waitForMessage(voice, (m) => m.msg.type === "turn.end", { from, timeout: 30_000 })
-    expect((end.msg as unknown as { trace: { voices: Array<string> } }).trace.voices).toEqual(["natural"])
+    expect((end.msg as unknown as { trace: { voices: Array<string> } }).trace.voices).toEqual(["sherpa:en_US-lessac-medium"])
   } finally {
     await saveLog(voice, testInfo.outputPath("socket-log-voice.json"))
     await saveLog(admin, testInfo.outputPath("socket-log-admin.json"))
     await ctx.close()
   }
-})
-
-test("a voice that is not enabled (a stale list): the server refuses it, the sheet goes back and says why", async ({ page }) => {
-  await page.goto(assistant.url)
-  await page.getByTestId("settings-toggle").click()
-  const voices = page.getByTestId("voice-sheet").getByTestId("voice-choices")
-  await expect(voices.getByRole("radio", { name: /Assistant default/ })).toBeChecked()
-  // The list on screen offers `natural`; rewrite what the page sends to a voice the server does not have switched on
-  // (as when admin switches a voice off while the sheet is open).
-  await page.evaluate(() => {
-    const send = WebSocket.prototype.send
-    WebSocket.prototype.send = function(this: WebSocket, data) {
-      if (typeof data === "string" && data.includes("\"device.update\"")) data = data.replace("\"natural\"", "\"expressive\"")
-      return send.call(this, data)
-    }
-  })
-  await voices.getByRole("radio", { name: /natural/ }).check()
-  const result = await waitForMessage(page, (m) => m.msg.type === "result" && m.msg.ok === false)
-  expect(result.msg).toMatchObject({ error: { code: "invalid_settings" } })
-  await expect(voices.getByRole("radio", { name: /Assistant default/ })).toBeChecked()
-  await expect(voices.getByRole("radio", { name: /natural/ })).not.toBeChecked()
-  // Said in the sheet, next to the voices (a toast would be under the sheet), and it stays.
-  const error = page.getByTestId("voice-sheet").getByTestId("sheet-error")
-  await expect(error).toContainText(/switched off in admin/)
-  const shown = await alerts(page)
-  expect(shown.length).toBe(1)
-  console.log(`[stale voice] the sheet said: ${shown[0]}`)
-  expect(shown[0]).toMatch(/switched off in admin/)
-  await page.waitForTimeout(6500)
-  await expect(error).toBeVisible()
 })

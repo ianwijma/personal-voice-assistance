@@ -10,7 +10,6 @@ import { makeTool } from "../src/Module.ts"
 import { AudioOutput } from "../src/Services.ts"
 import { makeToolRegistry } from "../src/ToolRegistry.ts"
 import { CurrentTurnTrace, type Trace, TurnTrace } from "../src/TurnTrace.ts"
-import { makeVoiceRouter } from "../src/VoiceRouter.ts"
 import {
   eagerEndOfTurn,
   endOfTurn,
@@ -314,16 +313,4 @@ describe("Conversation setup and history", () => {
       assert.deepStrictEqual((yield* history).length, 4)
     }).pipe(Effect.provide(t.layer))
   })
-})
-
-describe("VoiceRouter sampleRate", () => {
-  it.effect("a fixed output rate resamples the default voice too", () =>
-    Effect.gen(function*() {
-      const tone = makeToneTts({ sampleRate: 24_000, millisPerClause: 100, chunks: 1 })
-      const router = makeVoiceRouter({ voices: [{ name: "a", description: "a", tts: tone.service }], defaultVoice: "a", sampleRate: 48_000 })
-      assert.strictEqual(router.sampleRate, 48_000)
-      const chunks = yield* Stream.runCollect(router.synthesize(Stream.make("Hello.")))
-      const samples = chunks.reduce((n, c) => n + c.audio.length / 2, 0)
-      assert.isTrue(Math.abs(samples - 4_800) <= 2, `got ${samples} samples`)
-    }))
 })

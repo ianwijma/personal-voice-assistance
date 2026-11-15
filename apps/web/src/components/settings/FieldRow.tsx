@@ -1,10 +1,9 @@
 "use client"
-import { type ComponentType, useEffect, useState } from "react"
+import { useEffect, useState } from "react"
 import type { ChoiceOption, SettingField, SettingsForm, SettingValue, VaultInfo } from "@pva/protocol"
 import { type Draft, resetDraftValue, setDraftValue, valueEqual } from "@/lib/forms.ts"
 import { secretStatus } from "@/lib/vault.ts"
-import { fieldRenderers } from "@/ui/fieldRenderers.ts"
-import type { FieldProps } from "../fields/types.ts"
+import { rendererFor } from "@/ui/fieldRenderers.ts"
 import { useClient } from "../context.tsx"
 import { Icon } from "../ui/Icon.tsx"
 import { Button } from "../ui/controls.tsx"
@@ -60,7 +59,7 @@ export interface FieldRowProps {
 export function FieldRow({ field, form, draft, idPrefix, errors, warnings, readOnly, saving, vault, setDraft, onLocalError }: FieldRowProps) {
   const id = `${idPrefix}-${field.key}`
   const describedBy = `${id}-desc`
-  const Renderer = fieldRenderers[field.type] as ComponentType<FieldProps>
+  const Renderer = rendererFor(field)
   const resetPending = draft.reset?.includes(field.key) === true
   // Saved, and not what it would be by default: "Custom" (stays until a reset is saved).
   const custom = field.locked === undefined && field.type !== "secret" && field.source === "saved" && !resetPending &&

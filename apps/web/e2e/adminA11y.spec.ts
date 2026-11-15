@@ -62,7 +62,7 @@ test("latency: every column fits the page column at 1280 px", async ({ page, bas
         turnId: 900 + i,
         outcome,
         trace: {
-          turnId: 900 + i, mode: "voice", speculative: i % 2 === 0, outcome, voices: ["natural"],
+          turnId: 900 + i, mode: "voice", speculative: i % 2 === 0, outcome, voices: ["sherpa:kokoro-af_heart"],
           tools: i === 2 ? [{ name: "weather", ms: 241 }, { name: "calendar", ms: 88 }] : [],
           marks: { llmFirstToken: 180 + i, ttsFirstAudio: 260 + i, playbackStart: 300 + i }
         }

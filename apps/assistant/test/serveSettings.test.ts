@@ -67,7 +67,7 @@ describe("flat storage", () => {
     expect(section(welcome.snapshot.sections, "stt-timing").form.values.STT_SHERPA_FINAL_SILENCE_MS).toBe(700)
     // The renamed preset is still understood.
     expect(section(welcome.snapshot.sections, "stt-engine").form.values.STT_SHERPA_MODEL).toBe("nemotron-320")
-    expect(section(welcome.snapshot.sections, "voices").form.values.DEFAULT_VOICE).toBe("natural")
+    // DEFAULT_VOICE has no field any more; it stays in the file and the voice migration reads it (docs/VOICE-PROVIDERS.md §6.2).
     expect(section(welcome.snapshot.sections, "language-model").form.values.LLM_PROVIDER).toBe("anthropic")
     expect(welcome.snapshot.modules[0]!.settings.values.greeting).toBe("hoi")
     const written = JSON.parse(readFileSync(join(dataDir, "settings.json"), "utf8"))
@@ -119,9 +119,9 @@ describe("flat storage", () => {
   it("a save replaces only its section's keys, and a field keeps its value wherever it is shown", async () => {
     const server = await start()
     const { client } = await helloed(server)
-    expect((await request(client, { type: "settings.update", sectionId: "voices", patch: { values: { DEFAULT_VOICE: "natural" }, secrets: {} } })).ok).toBe(true)
+    expect((await request(client, { type: "settings.update", sectionId: "voices", patch: { values: { ASSISTANT_VOICE: "cartesia:db6b0ed5-d5d3-463d-ae85-518a07d3c2b4" }, secrets: {} }, confirmWarnings: true })).ok).toBe(true)
     expect((await request(client, { type: "settings.update", sectionId: "stt-mic", patch: { values: { STT_SHERPA_AGC: false }, secrets: {} } })).ok).toBe(true)
-    expect((await request(client, { type: "settings.update", sectionId: "voices", patch: { values: { DEFAULT_VOICE: null }, secrets: {} } })).ok).toBe(true)
+    expect((await request(client, { type: "settings.update", sectionId: "voices", patch: { values: { ASSISTANT_VOICE: null }, secrets: {} } })).ok).toBe(true)
     expect(JSON.parse(readFileSync(join(server.dataDir, "settings.json"), "utf8")).assistant).toEqual({ STT_SHERPA_AGC: false })
     expect(existsSync(join(server.dataDir, "settings.json.v1-backup"))).toBe(false)
   })
@@ -176,7 +176,7 @@ describe("field semantics", () => {
     expect(announced).toContain("stt-engine")
 
     // An unrelated save is not held up by the warning that is already there.
-    expect((await request(client, { type: "settings.update", sectionId: "voices", patch: { values: { DEFAULT_VOICE: "natural" }, secrets: {} } })).ok).toBe(true)
+    expect((await request(client, { type: "settings.update", sectionId: "llm-behaviour", patch: { values: { SYSTEM_PROMPT: "Be brief." }, secrets: {} } })).ok).toBe(true)
 
     const keyFrom = client.messages.length
     expect((await request(client, { type: "settings.update", sectionId: "stt-deepgram", patch: { values: {}, secrets: { DEEPGRAM_API_KEY: "dg-key" } } })).ok).toBe(true)
@@ -187,20 +187,15 @@ describe("field semantics", () => {
   it("a hosted voice without its key warns; the Claude API without its key warns", async () => {
     const server = await start()
     const { client } = await helloed(server)
-    const voices = await request(client, { type: "settings.update", sectionId: "voices", patch: { values: { VOICES: ["standard", "expressive"] }, secrets: {} } })
-    expect(voices.error?.warnings?.[0]).toMatchObject({ key: "VOICES" })
-    expect(voices.error?.warnings?.[0]?.message).toContain("expressive speaks through Cartesia")
-    const elevenlabs = await request(client, { type: "settings.update", sectionId: "voice-engines", patch: { values: { TTS_PROVIDER: "elevenlabs" }, secrets: {} } })
-    const warningFor = (key: string) => elevenlabs.error?.warnings?.find((w) => w.key === key)?.message
-    expect(warningFor("TTS_PROVIDER")).toContain("ElevenLabs is chosen but there is no ElevenLabs key")
-    // The standard voice follows TTS_PROVIDER, so the voices on the same page warn too.
-    expect(warningFor("VOICES")).toContain("standard speaks through ElevenLabs")
-    const elevenlabsWithKey = await request(client, {
-      type: "settings.update",
-      sectionId: "voice-engines",
-      patch: { values: { TTS_PROVIDER: "elevenlabs" }, secrets: { ELEVENLABS_API_KEY: "el-key" } }
-    })
-    expect(elevenlabsWithKey.ok).toBe(true)
+    const voices = await request(client, { type: "settings.update", sectionId: "voices", patch: { values: { ASSISTANT_VOICE: "cartesia:db6b0ed5-d5d3-463d-ae85-518a07d3c2b4" }, secrets: {} } })
+    expect(voices.error?.warnings?.[0]).toMatchObject({ key: "ASSISTANT_VOICE" })
+    expect(voices.error?.warnings?.[0]?.message).toContain("This voice speaks through Cartesia, but there is no Cartesia key")
+    const key = await request(client, { type: "settings.update", sectionId: "voice-providers", patch: { values: {}, secrets: { CARTESIA_API_KEY: "car-key" } } })
+    expect(key.ok).toBe(true)
+    expect((await request(client, { type: "settings.update", sectionId: "voices", patch: { values: { ASSISTANT_VOICE: "cartesia:db6b0ed5-d5d3-463d-ae85-518a07d3c2b4" }, secrets: {} } })).ok).toBe(true)
+    // A voice that is not a voice key is refused by the field itself.
+    const bad = await request(client, { type: "settings.update", sectionId: "voices", patch: { values: { ASSISTANT_VOICE: "expressive" }, secrets: {} } })
+    expect(bad.error?.fieldErrors?.[0]).toMatchObject({ key: "ASSISTANT_VOICE" })
     const llm = await request(client, { type: "settings.update", sectionId: "language-model", patch: { values: { LLM_PROVIDER: "anthropic" }, secrets: {} } })
     expect(llm.error?.warnings?.[0]).toMatchObject({ key: "ANTHROPIC_API_KEY" })
     const withKey = await request(client, {
@@ -213,7 +208,7 @@ describe("field semantics", () => {
 
   it("field source: default, saved, .env and the process environment (locked)", async () => {
     const server = await start({
-      env: { STT_SHERPA_AGC: "false", TTS_PROVIDER: "sherpa" },
+      env: { STT_SHERPA_AGC: "false", ASSISTANT_VOICE: "sherpa:en_US-lessac-medium" },
       envOrigin: (name) => (name === "STT_SHERPA_AGC" ? "env-file" : "env-process")
     })
     const { client } = await helloed(server)
@@ -223,18 +218,18 @@ describe("field semantics", () => {
     expect(field(mic, "STT_SHERPA_AGC")).toMatchObject({ source: "env-file", locked: { reason: "Set by STT_SHERPA_AGC in .env" } })
     expect(field(mic, "STT_SHERPA_VAD_THRESHOLD").source).toBe("saved")
     expect(field(mic, "STT_SHERPA_AGC_MAX_GAIN_DB").source).toBe("default")
-    expect(field(section(welcome.snapshot.sections, "voice-engines"), "TTS_PROVIDER")).toMatchObject({
+    expect(field(section(welcome.snapshot.sections, "voices"), "ASSISTANT_VOICE")).toMatchObject({
       source: "env-process",
-      locked: { reason: "Set by TTS_PROVIDER in the environment" }
+      locked: { reason: "Set by ASSISTANT_VOICE in the environment" }
     })
-    expect(field(section(welcome.snapshot.sections, "voice-engines"), "CARTESIA_API_KEY").source).toBe("default")
+    expect(field(section(welcome.snapshot.sections, "voice-providers"), "CARTESIA_API_KEY").source).toBe("default")
   })
 
   it("reloadPendingFor names every page with saved changes the engines do not use yet", async () => {
     const server = await start()
     const { client } = await helloed(server)
     await request(client, { type: "settings.update", sectionId: "stt-mic", patch: { values: { STT_SHERPA_AGC: false }, secrets: {} } })
-    await request(client, { type: "settings.update", sectionId: "voices", patch: { values: { VOICES: ["standard", "natural"] }, secrets: {} } })
+    await request(client, { type: "settings.update", sectionId: "voices", patch: { values: { ASSISTANT_VOICE: "cartesia:db6b0ed5-d5d3-463d-ae85-518a07d3c2b4" }, secrets: {} }, confirmWarnings: true })
     await request(client, { type: "settings.update", sectionId: "stt-mic", patch: { values: { STT_SHERPA_VAD_THRESHOLD: 0.3 }, secrets: {} } })
     // A live field does not need a reload.
     await request(client, { type: "settings.update", sectionId: "llm-behaviour", patch: { values: { SYSTEM_PROMPT: "Be brief." }, secrets: {} } })

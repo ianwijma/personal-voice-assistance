@@ -49,13 +49,17 @@ export const presetItems = (tool: ToolId): ReadonlyArray<Item> => {
       return { id: name, label: p.label, description: p.description, sizeMb: SherpaStt.sizeMb(p), diskMb: SherpaStt.diskMb(p) }
     })
   }
-  return Object.values(SherpaTts.presets).map((p) => ({
-    id: p.name,
-    label: SherpaTts.presetLabel(p),
-    description: `${p.engine === "kokoro" ? "Higher quality, slower first audio" : "Fast"} · ${p.sampleRate} Hz · licence: ${p.license}`,
-    sizeMb: p.sizeMb,
-    diskMb: p.diskMb
-  }))
+  // One item per archive: the Kokoro voices share one, listed (downloaded, deleted) under its owner preset.
+  return Object.values(SherpaTts.presets).filter((p) => SherpaTts.archiveOwner(p.name) === p.name).map((p) => {
+    const voices = SherpaTts.archiveVoices(p.name).length
+    return {
+      id: p.name,
+      label: SherpaTts.presetLabel(p),
+      description: `${p.engine === "kokoro" ? "Higher quality, slower first audio" : "Fast"}${voices > 1 ? ` · ${voices} voices in one download` : ""} · ${p.sampleRate} Hz · licence: ${p.license}`,
+      sizeMb: p.sizeMb,
+      diskMb: p.diskMb
+    }
+  })
 }
 
 const titles: Readonly<Record<ToolId, string>> = { "stt-models": "Speech recognition models", "tts-models": "Voice models" }
@@ -174,7 +178,13 @@ export const presetsInUse = (engines: ReadonlyArray<{ readonly stage: string; re
   for (const e of engines) {
     if (e.provider !== "sherpa") continue
     if (e.stage === "stt") stt.add(SherpaStt.resolvePresetName(e.detail) ?? e.detail)
-    if (e.stage === "tts") tts.add(e.detail.includes(": ") ? e.detail.slice(e.detail.indexOf(": ") + 2) : e.detail)
+    if (e.stage === "tts") {
+      const name = e.detail.includes(": ") ? e.detail.slice(e.detail.indexOf(": ") + 2) : e.detail
+      tts.add(name)
+      // A voice of a shared archive (Kokoro) keeps the whole archive in use: it is listed under its owner.
+      const owner = SherpaTts.archiveOwner(name)
+      if (owner !== undefined) tts.add(owner)
+    }
   }
   // A hybrid preset uses the archives of two others: those count as in use too.
   for (const name of [...stt]) {

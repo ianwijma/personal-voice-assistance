@@ -78,7 +78,7 @@ export const TurnStart = Schema.Struct({
 })
 
 /**
- * Assistant text, voice markers removed. Spoken turns send one message per
+ * Assistant text. Spoken turns send one message per
  * clause as it is handed to speech synthesis (`clause` = its 0-based index);
  * unspoken turns stream raw text deltas (`clause: null`).
  */

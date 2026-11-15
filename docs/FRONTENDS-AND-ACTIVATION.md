@@ -1,5 +1,10 @@
 # Front ends, admin and activation
 
+> **Changed 2026-11-16 (docs/VOICE-PROVIDERS.md):** the assistant speaks every reply with one voice
+> (`ASSISTANT_VOICE`); the voice router, `[voice:NAME]` markers, `VOICES` and `DEFAULT_VOICE` are gone, and a device
+> profile's `voice` no longer changes the voice (it falls back to `""`, the assistant's voice). Where this document
+> describes per-device voices or the router, that is the design as it was.
+
 Design written 2026-11-14 (lead session). It changes three things:
 
 1. The web UI splits into two front ends: a simple **voice** front end and a password-protected **admin** front end.

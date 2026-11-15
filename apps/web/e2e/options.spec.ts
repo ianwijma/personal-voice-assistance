@@ -99,8 +99,8 @@ test("assistant settings: a reload field marks a reload pending (named in the gl
   const types = (await mock.log()).messages.map((m) => m.type)
   expect(types).toContain("settings.update")
   expect(types).toContain("engine.reload")
-  // The voices section uses the same generated form (choice + multichoice).
-  await expect(page.getByTestId("form-s-voices").getByRole("radio", { name: "natural" })).toBeVisible()
+  // The voices section is the generated form too, with the voice picker for the assistant's voice.
+  await expect(page.getByTestId("form-s-voices").getByTestId("voice-picker")).toContainText("Lessac")
   await page.getByTestId("nav-language-model").click()
   await expect(page.getByTestId("page-language-model-provider")).toContainText("Set by ANTHROPIC_API_KEY in .env (not protected)")
 })

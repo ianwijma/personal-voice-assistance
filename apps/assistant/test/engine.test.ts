@@ -25,7 +25,6 @@ const engineWith = (build: ProviderBuilder, preflight?: Effect.Effect<void, neve
     build,
     ...(preflight === undefined ? {} : { preflight }),
     configProvider: () => ConfigProvider.fromEnvRecord({}),
-    defaultVoice: () => "standard",
     onStatus: () => {}
   })
 
@@ -39,8 +38,7 @@ const sessionOn = (engine: Engine, output?: AudioOutput["Service"], onEvent: (ev
       turnTrace: makeTurnTrace(),
       setup: Effect.succeed({ system: "", registry: makeToolRegistry([]) }),
       onEvent,
-      gate: (events) => events,
-      defaultVoice: () => "standard"
+      gate: (events) => events
     })
     conversation.start()
     return conversation
@@ -206,7 +204,6 @@ describe("Engine: a build refused because the previous recogniser is still shutt
       const engine = yield* makeEngine({
         build,
         configProvider: () => ConfigProvider.fromEnvRecord({}),
-        defaultVoice: () => "standard",
         onStatus: (s) => statuses.push(s.state),
         retryAfter: (problems) => problems.some((p) => p.message.startsWith(orphaned)) ? Deferred.await(gone) : undefined
       })

@@ -6,7 +6,6 @@ import {
   Llm,
   type Message,
   Stt,
-  stripVoiceMarkers,
   ToolRegistry,
   type Trace
 } from "@pva/core"
@@ -16,12 +15,13 @@ import { startCliModules, withModuleInstructions } from "./modules.ts"
 import { AudioLayer, LlmLayer, SttLayer } from "./providers.ts"
 import { buildProviders, observedTurnTraceLayer, StartupError } from "./startup.ts"
 import { makeSubscriptionAgents, SUBSCRIPTION_AGENT_ID, SUBSCRIPTION_PROVIDER } from "./subscription.ts"
-import { loadVoiceSettings, voiceStages, withVoicePrompt, withVoiceRouter } from "./voices.ts"
+import { assistantVoiceStage, withVoiceTrace } from "./voiceSelection.ts"
+import { voiceKey } from "@pva/core"
 
-/** The assistant's words in `messages` (one turn's worth of history), without voice markers. */
+/** The assistant's words in `messages` (one turn's worth of history). */
 export const assistantText = (messages: ReadonlyArray<Message>): string => {
   const said = messages.flatMap((m) => {
-    const text = m.role === "assistant" ? stripVoiceMarkers(m.content).trim() : ""
+    const text = m.role === "assistant" ? m.content.trim() : ""
     return text.length > 0 ? [text] : []
   })
   const interrupted = messages.some((m) => m.role === "assistant" && m.interrupted === true)
@@ -36,19 +36,19 @@ export const assistantText = (messages: ReadonlyArray<Message>): string => {
  */
 export const voiceMode = Effect.scoped(Effect.gen(function*() {
   const settings = yield* AppConfig
-  const voices = yield* loadVoiceSettings
+  const voice = yield* assistantVoiceStage
   const llmProvider = yield* Config.String("LLM_PROVIDER").pipe(Config.withDefault("fake"))
   const backend = yield* Config.String("AUDIO_BACKEND").pipe(Config.withDefault("pipewire"))
 
   // Ordered so the connections that take longest to open start first: the TTS
   // socket opens and the LLM warm-up request starts while the rest is built.
   const built = yield* buildProviders([
-    ...voiceStages(voices),
+    voice.stage,
     { stage: "language model (LLM_PROVIDER)", layer: LlmLayer },
     { stage: "speech-to-text (STT_PROVIDER)", layer: SttLayer },
     { stage: "audio (AUDIO_BACKEND)", layer: AudioLayer }
   ])
-  const providers = withVoiceRouter(built, voices)
+  const providers = withVoiceTrace(built, voice.ref)
   if (llmProvider === "fake") {
     yield* Effect.logWarning("LLM_PROVIDER=fake: replies are canned echoes. Set LLM_PROVIDER=anthropic for real answers.")
   }
@@ -70,7 +70,7 @@ export const voiceMode = Effect.scoped(Effect.gen(function*() {
 
   const services = Layer.succeedContext(providers)
   const modules = yield* startCliModules()
-  const systemPrompt = withVoicePrompt(withModuleInstructions(settings.systemPrompt, modules.instructions), voices)
+  const systemPrompt = withModuleInstructions(settings.systemPrompt, modules.instructions)
   const ConversationLive = (llmProvider === SUBSCRIPTION_PROVIDER
     ? Conversation.layerWithAgents({
       ...settings,
@@ -79,7 +79,7 @@ export const voiceMode = Effect.scoped(Effect.gen(function*() {
         agents: () => modules.agents,
         module: () => modules.infos.find((m) => m.id === SUBSCRIPTION_AGENT_ID),
         promptFor: (agent, turn) =>
-          agent.systemPrompt === undefined ? turn.system : withVoicePrompt(withModuleInstructions(agent.systemPrompt, modules.instructions), voices)
+          agent.systemPrompt === undefined ? turn.system : withModuleInstructions(agent.systemPrompt, modules.instructions)
       })({ system: systemPrompt, registry: modules.registry }))
     })
     : Conversation.layer({ ...settings, systemPrompt })).pipe(
@@ -99,7 +99,7 @@ export const voiceMode = Effect.scoped(Effect.gen(function*() {
     const events = stt.transcribe(mic).pipe(
       Stream.tap((event) => event._tag === "EndOfTurn" && event.text !== "" ? Effect.sync(() => console.log(`you: ${event.text}`)) : Effect.void)
     )
-    yield* Effect.logInfo(`Listening (audio: ${backend}, LLM: ${llmProvider}, voices: ${voices.enabled.map((v) => v.name).join(", ")}). Press Ctrl+C to quit.`)
+    yield* Effect.logInfo(`Listening (audio: ${backend}, LLM: ${llmProvider}, voice: ${voiceKey(voice.ref)}). Press Ctrl+C to quit.`)
     yield* conversation.voice(events).pipe(
       Effect.catch((error) =>
         new StartupError({

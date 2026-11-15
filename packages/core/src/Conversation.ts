@@ -1654,8 +1654,7 @@ const makeConversationCore = Effect.fnUntraced(function*(options: AgentConversat
             case "Say": {
               cancelled = undefined
               if (turn !== undefined) yield* interrupt(turn)
-              const text = event.voice !== undefined && !/^\s*\[voice:/i.test(event.text) ? `[voice:${event.voice}] ${event.text}` : event.text
-              return yield* start("", false, "text", true, { say: text })
+              return yield* start("", false, "text", true, { say: event.text })
             }
             case "SetActiveAgent": {
               if (!legacy) {

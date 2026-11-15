@@ -1,4 +1,4 @@
-import { applySettingsPatch, type HostResult, resolveSettings, runSettingsChecks, type SettingsSources } from "@pva/core"
+import { applySettingsPatch, type HostResult, parseVoiceKey, resolveSettings, runSettingsChecks, type SettingsSources } from "@pva/core"
 import type { FieldError, SettingsPatch, SettingsSection, SettingValue } from "@pva/protocol"
 import * as SherpaStt from "@pva/stt-sherpa"
 import * as SherpaTts from "@pva/tts-sherpa"
@@ -44,6 +44,21 @@ export interface Sections {
   readonly announceAll: () => void
   /** Where the recogniser's and the voices' models are (environment > saved > `<repo>/models`). */
   readonly modelDirs: () => ModelDirs
+}
+
+/**
+ * A voice on this machine whose model is missing cannot be saved as the assistant's voice (the reload would fail):
+ * download it first (docs/VOICE-PROVIDERS.md §6.1).
+ */
+const checkLocalVoice = (patch: SettingsPatch, dir: string): ReadonlyArray<FieldError> => {
+  const value = patch.values.ASSISTANT_VOICE
+  if (typeof value !== "string") return []
+  const ref = parseVoiceKey(value.trim())
+  if (ref === undefined || ref.provider !== "sherpa") return []
+  const preset = Object.hasOwn(SherpaTts.presets, ref.voiceId) ? SherpaTts.presets[ref.voiceId] : undefined
+  if (preset === undefined) return [{ key: "ASSISTANT_VOICE", message: `There is no voice "${ref.voiceId}" on this machine` }]
+  if (SherpaTts.isInstalled(preset.name, dir)) return []
+  return [{ key: "ASSISTANT_VOICE", message: `${preset.voice.name} is not downloaded yet: download it first (${preset.sizeMb} MB)` }]
 }
 
 /** Saved values from earlier versions: renamed recogniser presets. */
@@ -196,7 +211,7 @@ export const makeSections = (
         const path = sectionPath(d)
         const { stored, secrets } = saved()
         const before = view(definitions, stored, secrets)
-        const missingModel = checkModel(patch, modelDirs().stt)
+        const missingModel = [...checkModel(patch, modelDirs().stt), ...checkLocalVoice(patch, modelDirs().tts)]
         if (missingModel.length > 0) {
           return failed(path, { ok: false, error: { code: "invalid_settings", message: missingModel[0]!.message, fieldErrors: missingModel } })
         }

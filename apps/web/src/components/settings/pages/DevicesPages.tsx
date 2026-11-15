@@ -1,7 +1,7 @@
 "use client"
 import { type FormEvent, useEffect, useRef, useState } from "react"
-import { type DeviceInfo, MAX_DEVICE_NAME_CHARS, type SessionInfo } from "@pva/protocol"
-import { activationSummary, lastSeenText } from "@/lib/profileForm.ts"
+import { type DeviceInfo, MAX_DEVICE_NAME_CHARS, type ProfileField, type SessionInfo } from "@pva/protocol"
+import { activationSummary, lastSeenText, RETIRED_PROFILE_FIELDS } from "@/lib/profileForm.ts"
 import { agoText, stateWord, turnsText } from "@/lib/sessions.ts"
 import { shallowEqual } from "@/lib/store.ts"
 import { useClient, useClientState } from "../../context.tsx"
@@ -46,7 +46,7 @@ export function DevicesPage() {
   return (
     <ul className="flex flex-col divide-y divide-line/60 rounded-md border border-line" data-testid="device-list">
       {devices.map((d) => {
-        const overrides = Object.keys(d.overrides).length
+        const overrides = Object.keys(d.overrides).filter((k) => !RETIRED_PROFILE_FIELDS.has(k as ProfileField)).length
         const session = sessions.find((x) => x.deviceId === d.id)
         const talking = talkingOf(d, session)
         return (

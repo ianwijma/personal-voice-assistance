@@ -1,4 +1,4 @@
-import { type ConversationEvent, makeMarkerStripper, type Message, parseVoiceMarker, stripVoiceMarkers, type Trace } from "@pva/core"
+import type { ConversationEvent, Message, Trace } from "@pva/core"
 import type { HistoryItem, ServerMessage, TraceInfo } from "@pva/protocol"
 
 /**
@@ -17,16 +17,15 @@ interface TurnView {
   readonly spoken: boolean
   pending: boolean
   readonly buffer: Array<ServerMessage>
-  voice: string
-  readonly strip: ReturnType<typeof makeMarkerStripper>
+  readonly voice: string
 }
 
 export interface PublisherOptions {
   readonly broadcast: (message: ServerMessage) => void
   /** The module that contributes a tool (from the module host's current snapshot). */
   readonly moduleOfTool: (name: string) => string | null
-  /** The default voice and the enabled voices (the voice per clause is tracked as the router does). */
-  readonly voices: () => { readonly defaultVoice: string; readonly names: ReadonlySet<string> }
+  /** The key of the voice that speaks this session's replies (`assistant.text.voice`). */
+  readonly voice: () => string
   /** Right after `turn.start` of a committed (or just promoted) turn went out, before the rest of its messages. */
   readonly onCommitted?: (turnId: number) => void
   /** A committed turn ended: its trace (serve mode keeps the recent ones of every session for admin). */
@@ -92,8 +91,7 @@ export const makePublisher = (options: PublisherOptions): Publisher => {
           spoken: event.spoken,
           pending: event.speculative,
           buffer: [],
-          voice: options.voices().defaultVoice,
-          strip: makeMarkerStripper()
+          voice: options.voice()
         }
         turns.set(event.turnId, view)
         const start: ServerMessage = { type: "turn.start", turnId: event.turnId, source: event.source, userText: event.text, spoken: event.spoken }
@@ -119,17 +117,14 @@ export const makePublisher = (options: PublisherOptions): Publisher => {
       case "TextDelta": {
         const view = turns.get(event.turnId)
         if (view === undefined || view.spoken) return
-        const text = view.strip.push(event.text)
+        const text = event.text
         if (text.length > 0) send(event.turnId, { type: "assistant.text", turnId: event.turnId, clause: null, text })
         return
       }
       case "ClauseQueued": {
         const view = turns.get(event.turnId)
         if (view === undefined) return
-        const voices = options.voices()
-        const parsed = parseVoiceMarker(event.text)
-        if (parsed.voice !== undefined) view.voice = voices.names.has(parsed.voice) ? parsed.voice : voices.defaultVoice
-        const text = stripVoiceMarkers(parsed.text).trim()
+        const text = event.text.trim()
         if (text.length === 0) return
         send(event.turnId, { type: "assistant.text", turnId: event.turnId, clause: event.index, text, voice: view.voice })
         return
@@ -159,10 +154,6 @@ export const makePublisher = (options: PublisherOptions): Publisher => {
         turns.delete(event.turnId)
         if (committed === event.turnId) committed = undefined
         if (event.outcome === "discarded" || view?.pending === true) return
-        if (view !== undefined && !view.spoken) {
-          const rest = view.strip.flush()
-          if (rest.length > 0) options.broadcast({ type: "assistant.text", turnId: event.turnId, clause: null, text: rest })
-        }
         const info = traceInfo(event.trace)
         traces.push(info)
         if (traces.length > MAX_TRACES) traces.shift()
@@ -196,7 +187,7 @@ export const makePublisher = (options: PublisherOptions): Publisher => {
 
 /**
  * History as the user saw it: one user item per user message and at most one
- * assistant item per turn (its text without markers, interrupted if any part
+ * assistant item per turn (its text, interrupted if any part
  * was, and its tool calls with success). The last `MAX_HISTORY_ITEMS` items.
  */
 export const historyItems = (messages: ReadonlyArray<Message>): Array<HistoryItem> => {
@@ -223,7 +214,7 @@ export const historyItems = (messages: ReadonlyArray<Message>): Array<HistoryIte
         break
       case "assistant": {
         open = true
-        const text = stripVoiceMarkers(message.content).trim()
+        const text = message.content.trim()
         if (text.length > 0) texts.push(text)
         if (message.interrupted === true) interrupted = true
         for (const call of message.toolCalls ?? []) {

@@ -277,23 +277,24 @@ test("the chat popover on a wide screen is not modal: Tab leaves it for the page
   await expect(page.getByRole("heading", { level: 1, name: "Voice assistant" })).toBeAttached()
 })
 
-test("a refused sheet change is shown in the sheet, next to its control, until dismissed; a voice choice is confirmed", async ({ page, baseURL }) => {
+test("a refused sheet change is shown in the sheet, next to its control, until dismissed", async ({ page, baseURL }) => {
   await mock.scenario("typed")
   await page.goto(appUrl(baseURL))
   await expect(page.getByTestId("start")).toBeVisible()
   await page.getByTestId("settings-toggle").click()
   const sheet = page.getByTestId("voice-sheet")
-  await sheet.locator("[data-voice]").nth(1).click()
-  await expect(sheet.getByTestId("voice-note")).toHaveText("Used from the next reply.")
-  // A stale list: a voice the assistant no longer has.
+  // The server refuses it: what the page sends is rewritten to a field a device may not change itself.
   await page.evaluate(() => {
-    const c = (window as unknown as { __pva: { store: { get: () => { summary: { voices: ReadonlyArray<unknown> } }; dispatch: (a: unknown) => void } } }).__pva
-    const s = c.store.get().summary
-    c.store.dispatch({ type: "engine.summary", engine: { ...s, voices: [...s.voices, { name: "expressive", description: "Lively, through Cartesia.", isDefault: false }] } })
+    const send = WebSocket.prototype.send
+    WebSocket.prototype.send = function(this: WebSocket, data) {
+      if (typeof data === "string" && data.includes("\"device.update\"")) data = data.replace("\"activation\":\"wake-phrase\"", "\"captions\":false")
+      return send.call(this, data)
+    }
   })
-  await sheet.locator("[data-voice=expressive]").click()
+  await sheet.getByRole("radio", { name: "Wake phrase" }).click()
   const error = sheet.getByTestId("sheet-error")
-  await expect(error).toHaveText(/Not changed: Expressive is switched off in admin\./)
+  await expect(error).toHaveText(/Not changed: Only admin can change that\./)
+  await expect(sheet.getByRole("radio", { name: "Always listening" })).toHaveAttribute("aria-checked", "true")
   await expect(error).toHaveAttribute("role", "alert")
   await expect(page.getByTestId("toasts").locator("[role=alert]")).toHaveCount(0)
   await page.waitForTimeout(6500) // longer than a toast lives

@@ -12,14 +12,17 @@ import {
   defaultModelDir,
   downloadHint,
   engineConfig,
+  engineSetup,
   type Preset,
   presetFiles,
   presets
 } from "./Presets.ts"
 import { makeEngineTts } from "./SherpaTts.ts"
+import { makeVoicesWith, type SherpaVoicesOptions, temporaryEngine } from "./voices.ts"
 
 export { defaultJoinOptions, type JoinOptions } from "./Pcm.ts"
-export { DEFAULT_PRESET, defaultModelDir, type EngineKind, type Preset, presetFiles, presetLabel, presets, sizeMb } from "./Presets.ts"
+export { archiveOwner, archiveVoices, DEFAULT_PRESET, defaultModelDir, type EngineKind, engineSetup, type Preset, presetFiles, presetLabel, presets, sizeMb } from "./Presets.ts"
+export { listVoices, type SherpaVoicesOptions } from "./voices.ts"
 export { cleanPartials, deletePreset, DownloadError, type DownloadProgress, downloadPreset, isInstalled, presetArchive } from "./download.ts"
 
 export interface SherpaTtsOptions {
@@ -62,6 +65,41 @@ export const makeWithEngine = (options: SherpaTtsOptions = {}) =>
     )
   })
 
+/** One loaded engine, and the presets it can also speak (another speaker of the same model and set-up). */
+export interface SharedEngine {
+  /** The engine's own preset. */
+  readonly tts: Tts["Service"]
+  /** `tts` for the engine's preset; for another preset of the same set-up (`engineSetup`) a `Tts` with its speaker id; else `undefined`. */
+  readonly forPreset: (name: string) => Tts["Service"] | undefined
+}
+
+/** `SharedEngine` over an engine built for `preset` (`makeEngineTts`). */
+export const shareEngine = (
+  preset: Preset,
+  built: { readonly tts: Tts["Service"]; readonly forSpeaker: (speaker: number) => Tts["Service"] }
+): SharedEngine => {
+  const setup = engineSetup(preset)
+  return {
+    tts: built.tts,
+    forPreset: (name) => {
+      const other = Object.hasOwn(presets, name) ? presets[name] : undefined
+      if (other === undefined) return undefined
+      if (other.name === preset.name) return built.tts
+      return engineSetup(other) === setup ? built.forSpeaker(other.speaker) : undefined
+    }
+  }
+}
+
+/**
+ * Like `make`, for previews: the engine can also speak the other presets of its set-up (the Kokoro voices of one
+ * lexicon) without loading the model again. Live turns use `make` (one speaker per engine).
+ */
+export const makeShared = (options: SherpaTtsOptions = {}): Effect.Effect<SharedEngine, TtsError, Scope.Scope> =>
+  Effect.gen(function*() {
+    const preset = yield* resolvePreset(options.preset ?? DEFAULT_PRESET)
+    return shareEngine(preset, yield* makeWithEngine(options))
+  })
+
 /** `Tts` service; the model is loaded now and the engine stops when the scope closes. */
 export const make = (options: SherpaTtsOptions = {}): Effect.Effect<Tts["Service"], TtsError, Scope.Scope> =>
   Effect.map(makeWithEngine(options), ({ tts }) => tts)
@@ -97,3 +135,9 @@ export const config = (prefix = "TTS_SHERPA_"): Config.Config<SherpaTtsOptions> 
 /** `Tts` configured from `<prefix>PRESET`, `<prefix>THREADS`, ... (see `config`). */
 export const layerConfig = (prefix = "TTS_SHERPA_"): Layer.Layer<Tts, TtsError | Config.ConfigError> =>
   Layer.effect(Tts, Effect.flatMap(config(prefix), make))
+
+/**
+ * The voices on this machine (`TtsVoices`, docs/VOICE-PROVIDERS.md §7.2): the presets with their install state, and
+ * previews through `options.engineFor` (default: a temporary engine per preview).
+ */
+export const makeVoices = (options: SherpaVoicesOptions = {}) => makeVoicesWith(options, temporaryEngine(make))

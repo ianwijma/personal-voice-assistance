@@ -10,40 +10,29 @@ import { parseWav } from "@pva/audio-file"
 import { parseLiveArgs } from "../src/bench/live.ts"
 import { makeBenchWavs } from "../src/bench/makeWavs.ts"
 import { buildProviders, describeStartFailure } from "../src/startup.ts"
-import { voiceCatalog, voiceConfigProvider } from "../src/voices.ts"
+import { voiceConfigProvider } from "../src/voiceSelection.ts"
 
-const voice = (name: string) => voiceCatalog.find((v) => v.name === name)!
-const presetFor = (env: Record<string, string>, name: string) =>
+const presetFor = (env: Record<string, string>, voiceId: string) =>
   Effect.runSync(
     SherpaTts.config().pipe(
       Effect.map((o) => o.preset),
-      Effect.provideService(ConfigProvider.ConfigProvider, voiceConfigProvider(ConfigProvider.fromEnvRecord(env), voice(name)))
+      Effect.provideService(ConfigProvider.ConfigProvider, voiceConfigProvider(ConfigProvider.fromEnvRecord(env), { provider: "sherpa", voiceId }))
     )
   )
 
-describe("per-voice settings for the local TTS", () => {
-  it("standard uses TTS_SHERPA_PRESET (default Piper lessac); VOICE_STANDARD_ overrides it", () => {
-    assert.strictEqual(presetFor({}, "standard"), "en_US-lessac-medium")
-    assert.strictEqual(presetFor({ TTS_SHERPA_PRESET: "nl_NL-pim-medium" }, "standard"), "nl_NL-pim-medium")
-    assert.strictEqual(
-      presetFor({ TTS_SHERPA_PRESET: "nl_NL-pim-medium", VOICE_STANDARD_TTS_SHERPA_PRESET: "kokoro-af_heart" }, "standard"),
-      "kokoro-af_heart"
-    )
+describe("a voice's provider settings", () => {
+  it("the voice's id replaces the provider's own voice setting", () => {
+    assert.strictEqual(presetFor({}, "kokoro-af_heart"), "kokoro-af_heart")
+    assert.strictEqual(presetFor({ TTS_SHERPA_PRESET: "nl_NL-pim-medium" }, "en_US-lessac-medium"), "en_US-lessac-medium")
   })
 
-  it("natural is Kokoro unless VOICE_NATURAL_TTS_SHERPA_PRESET says otherwise; the unprefixed preset does not leak in", () => {
-    assert.strictEqual(presetFor({}, "natural"), "kokoro-af_heart")
-    assert.strictEqual(presetFor({ TTS_SHERPA_PRESET: "nl_NL-pim-medium" }, "natural"), "kokoro-af_heart")
-    assert.strictEqual(presetFor({ VOICE_NATURAL_TTS_SHERPA_PRESET: "en_US-lessac-medium" }, "natural"), "en_US-lessac-medium")
-  })
-
-  it("other settings still fall back to the unprefixed value", () => {
+  it("other settings still come from the provider's settings", () => {
     const threads = Effect.runSync(
       SherpaTts.config().pipe(
         Effect.map((o) => o.threads),
         Effect.provideService(
           ConfigProvider.ConfigProvider,
-          voiceConfigProvider(ConfigProvider.fromEnvRecord({ TTS_SHERPA_THREADS: "3" }), voice("natural"))
+          voiceConfigProvider(ConfigProvider.fromEnvRecord({ TTS_SHERPA_THREADS: "3" }), { provider: "sherpa", voiceId: "kokoro-af_heart" })
         )
       )
     )
@@ -55,7 +44,7 @@ describe("startup", () => {
   it.effect("a provider that fails to start (missing model) is reported with its stage, next to missing settings", () =>
     Effect.gen(function*() {
       const error = yield* buildProviders([
-        { stage: "voice \"standard\" (TTS_PROVIDER)", layer: Layer.effect(Tts, new TtsError({ message: "Model file missing. Run: download" })) },
+        { stage: "voice (ASSISTANT_VOICE)", layer: Layer.effect(Tts, new TtsError({ message: "Model file missing. Run: download" })) },
         { stage: "speech-to-text (STT_PROVIDER)", layer: Layer.effect(Stt, new SttError({ message: "Speech model file not found" })) },
         { stage: "language model (LLM_PROVIDER)", layer: Layer.effect(Tts, Effect.flatMap(Config.String("SOME_KEY"), () => Effect.die("unreachable"))) }
       ]).pipe(Effect.scoped, Effect.provideService(ConfigProvider.ConfigProvider, ConfigProvider.fromEnvRecord({})), Effect.flip)
@@ -63,7 +52,7 @@ describe("startup", () => {
         error.message,
         [
           "Cannot start (settings go in the environment or in .env; see .env.example):",
-          "  voice \"standard\" (TTS_PROVIDER): Model file missing. Run: download",
+          "  voice (ASSISTANT_VOICE): Model file missing. Run: download",
           "  speech-to-text (STT_PROVIDER): Speech model file not found",
           "  language model (LLM_PROVIDER): SOME_KEY is not set"
         ].join("\n")

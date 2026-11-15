@@ -16,7 +16,8 @@ export const presetArchive = (preset: Preset): ArchiveSpec => ({
   name: preset.dir,
   url: preset.url,
   kind: "tar.bz2",
-  expect: Object.values(preset.files).map((f) => `${preset.dir}/${f}`),
+  // Sorted and unique: the speakers of a shared archive expect the same files whichever lexicon they use.
+  expect: [...new Set(Object.values(preset.files))].sort().map((f) => `${preset.dir}/${f}`),
   sizeMb: preset.sizeMb,
   diskMb: preset.diskMb
 })
@@ -39,12 +40,13 @@ export const isInstalled = (name: string, modelDir: string = defaultModelDir): b
   return preset !== undefined && Object.values(presetFiles(preset, modelDir)).every((f) => existsSync(f))
 }
 
-/** Delete a preset's folder (none of the presets share one). */
+/**
+ * Delete a preset's folder. For an archive several presets share (the Kokoro voices) this deletes all of them: the
+ * caller checks that none of them is in use (`archiveVoices`).
+ */
 export const deletePreset = async (name: string, modelDir: string = defaultModelDir): Promise<{ readonly removed: ReadonlyArray<string> }> => {
   const preset = Object.hasOwn(presets, name) ? presets[name] : undefined
   if (preset === undefined) throw new Error(`Unknown preset "${name}"`)
-  const shared = Object.values(presets).some((p) => p.name !== name && p.dir === preset.dir && isInstalled(p.name, modelDir))
-  if (shared) return { removed: [] }
   await rm(join(modelDir, preset.dir), { recursive: true, force: true })
   return { removed: [preset.dir] }
 }

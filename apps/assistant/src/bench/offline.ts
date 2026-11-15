@@ -6,14 +6,14 @@
 import {
   Conversation,
   type LlmRequest,
-  makeVoiceRouter,
   makeWakeGate,
   type SttEvent,
   ToolRegistry,
   type Trace,
   Tts,
   WAKE_ALWAYS,
-  type WakeConfig
+  type WakeConfig,
+  withTraceVoice
 } from "@pva/core"
 import {
   done,
@@ -180,12 +180,9 @@ const runSession = (
     return rows
   })
 
-/** Through the voice router, as in the app, so its overhead is part of the measurement. */
+/** Tagged with its voice in the trace, as in the app. */
 const benchTts = (scenario: OfflineScenario) =>
-  makeVoiceRouter({
-    defaultVoice: "bench",
-    voices: [{ name: "bench", description: "", tts: makeMarkerTts({ delayMillis: scenario.delays.ttsFirstAudioMs }).service }]
-  })
+  withTraceVoice(makeMarkerTts({ delayMillis: scenario.delays.ttsFirstAudioMs }).service, "bench")
 
 /**
  * Run the script `rounds` times in one conversation (after one unreported
@@ -196,7 +193,7 @@ export const runOffline = (scenario: OfflineScenario, rounds: number) => runSess
 
 /**
  * `bench --sessions N`: N sessions at once, as serve mode runs several devices: each its own `Conversation`, the
- * voice (TTS stand-in behind one router) shared, and every turn's end simultaneous in all sessions (each session
+ * voice (TTS stand-in) shared, and every turn's end simultaneous in all sessions (each session
  * waits for the others before speaking its next turn). Rows per session.
  */
 export const runOfflineSessions = (scenario: OfflineScenario, rounds: number, sessions: number) =>

@@ -59,25 +59,29 @@ const ENGINE_KEYS: Readonly<Record<string, string>> = {
   STT_SHERPA_MODEL_DIR: "speech/engine",
   DEEPGRAM_MODEL: "speech/deepgram",
   DEEPGRAM_EOT_TIMEOUT_MS: "speech/deepgram",
-  TTS_SHERPA_PRESET: "voices/engines",
-  TTS_SHERPA_MODEL_DIR: "voices/engines",
-  TTS_SHERPA_THREADS: "voices/engines",
-  TTS_SHERPA_SPEED: "voices/engines",
-  TTS_SHERPA_TRIM_SILENCE: "voices/engines",
-  TTS_SHERPA_CLAUSE_PAUSE_MS: "voices/engines",
-  TTS_SHERPA_SENTENCE_PAUSE_MS: "voices/engines",
-  TTS_SHERPA_PAD_MS: "voices/engines",
-  TTS_SHERPA_CHUNK_MS: "voices/engines",
-  CARTESIA_MODEL: "voices/engines",
-  CARTESIA_VOICE: "voices/engines",
-  CARTESIA_LANGUAGE: "voices/engines",
-  CARTESIA_MAX_BUFFER_DELAY_MS: "voices/engines",
-  ELEVENLABS_MODEL: "voices/engines",
-  ELEVENLABS_VOICE: "voices/engines",
-  ELEVENLABS_LANGUAGE: "voices/engines",
-  ELEVENLABS_SPEED: "voices/engines",
-  ELEVENLABS_STABILITY: "voices/engines",
-  ELEVENLABS_AUTO_MODE: "voices/engines"
+  // Read only to migrate to ASSISTANT_VOICE (docs/VOICE-PROVIDERS.md §6.2); no field any more.
+  TTS_PROVIDER: "voices/providers",
+  DEFAULT_VOICE: "voices/overview",
+  VOICES: "voices/overview",
+  TTS_SHERPA_PRESET: "voices/providers",
+  TTS_SHERPA_MODEL_DIR: "voices/providers",
+  TTS_SHERPA_THREADS: "voices/providers",
+  TTS_SHERPA_SPEED: "voices/providers",
+  TTS_SHERPA_TRIM_SILENCE: "voices/providers",
+  TTS_SHERPA_CLAUSE_PAUSE_MS: "voices/providers",
+  TTS_SHERPA_SENTENCE_PAUSE_MS: "voices/providers",
+  TTS_SHERPA_PAD_MS: "voices/providers",
+  TTS_SHERPA_CHUNK_MS: "voices/providers",
+  CARTESIA_MODEL: "voices/providers",
+  CARTESIA_VOICE: "voices/providers",
+  CARTESIA_LANGUAGE: "voices/providers",
+  CARTESIA_MAX_BUFFER_DELAY_MS: "voices/providers",
+  ELEVENLABS_MODEL: "voices/providers",
+  ELEVENLABS_VOICE: "voices/providers",
+  ELEVENLABS_LANGUAGE: "voices/providers",
+  ELEVENLABS_SPEED: "voices/providers",
+  ELEVENLABS_STABILITY: "voices/providers",
+  ELEVENLABS_AUTO_MODE: "voices/providers"
 }
 /** `VOICE_<NAME>_<KEY>`: a per-voice override of an engine key (or `VOICE_<NAME>_PROVIDER`). */
 const VOICE_KEY = /^VOICE_[A-Z0-9]+_(.+)$/
@@ -154,7 +158,7 @@ export const makeEnvCatalog = (catalog: ReadonlyArray<ModuleDefinition<any>>): E
     const voice = VOICE_KEY.exec(key)?.[1]
     if (voice === undefined) return undefined
     if (voice === "PROVIDER" || ENGINE_KEYS[voice] !== undefined || targets.has(voice)) {
-      return { kind: "engine", secret: isSecretName(voice), ...page("voices/engines", titles) }
+      return { kind: "engine", secret: isSecretName(voice), ...page("voices/providers", titles) }
     }
     return undefined
   }

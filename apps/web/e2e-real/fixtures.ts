@@ -59,12 +59,13 @@ const readWav16k = (file: string): Int16Array => {
 
 /**
  * Speech synthesised by the assistant itself (`pnpm start say`), cached in `.fixtures/`: the wake-phrase tests need
- * sentences the bench files do not have ("Hey Jeff, what time is it?"). `voice`: a voice of the catalog
- * (`standard` = Piper lessac, `natural` = Kokoro af_heart); `speed`: `TTS_SHERPA_SPEED`.
+ * sentences the bench files do not have ("Hey Jeff, what time is it?"). `voice`: a voice key (`say --voice
+ * provider:voiceId`, docs/VOICE-PROVIDERS.md §2): `sherpa:en_US-lessac-medium` (Piper, the default) or
+ * `sherpa:kokoro-af_heart` (Kokoro); `speed`: `TTS_SHERPA_SPEED`.
  */
 export const spoken = (text: string, options: { readonly voice?: string; readonly speed?: number } = {}): Segment => {
-  const voice = options.voice ?? "standard"
-  const slug = `${voice}${options.speed === undefined ? "" : `-x${options.speed}`}-${text.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 40)}`
+  const voice = options.voice ?? "sherpa:en_US-lessac-medium"
+  const slug = `${voice.replace(/[^A-Za-z0-9_-]+/g, "_")}${options.speed === undefined ? "" : `-x${options.speed}`}-${text.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 40)}`
   const path = join(fixturesDir, "say", `${slug}.wav`)
   if (!existsSync(path)) {
     mkdirSync(dirname(path), { recursive: true })

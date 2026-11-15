@@ -13,7 +13,7 @@ import { AppConfig } from "./config.ts"
 import { userCwd } from "./env.ts"
 import { startCliModules, withModuleInstructions } from "./modules.ts"
 import { FakeLlm } from "./FakeLlm.ts"
-import { LlmLayer, SttLayer, TtsLayer } from "./providers.ts"
+import { LlmLayer, SttLayer } from "./providers.ts"
 import { sayCommand } from "./say.ts"
 import { DataDirLockError } from "./serve/DataDirLock.ts"
 import { serveMode } from "./serve/serveMode.ts"
@@ -26,7 +26,7 @@ import { runTextTurns } from "./text.ts"
 import { compareModelsCommand } from "./compareModels.ts"
 import { transcribeCommand } from "./transcribe.ts"
 import { voiceMode } from "./voice.ts"
-import { loadVoiceSettings, voiceStages, withVoicePrompt, withVoiceRouter } from "./voices.ts"
+import { assistantVoiceStage, withVoiceTrace } from "./voiceSelection.ts"
 
 /** Whether stdout's last write did not end a line (so a log line must start a new one). */
 let midLine = false
@@ -46,15 +46,13 @@ const StderrLogger = Logger.layer([
   })
 ])
 
-// Text mode uses the same system prompt as voice mode (including the voice
-// instructions), so the model behaves the same; markers are stripped from the output.
+// Text mode uses the same system prompt as voice mode, so the model behaves the same.
 // LLM_PROVIDER=claude-subscription: the claude-subscription agent module (switched on and opted in from the web UI,
 // or with CLAUDE_SUBSCRIPTION_OPT_IN) answers; the offline stand-in answers, with a notice, when it is not running.
 const ConversationLayer = Layer.unwrap(Effect.gen(function*() {
   const settings = yield* AppConfig
-  const voices = yield* loadVoiceSettings
   const modules = yield* startCliModules()
-  const systemPrompt = withVoicePrompt(withModuleInstructions(settings.systemPrompt, modules.instructions), voices)
+  const systemPrompt = withModuleInstructions(settings.systemPrompt, modules.instructions)
   const llmProvider = yield* Config.String("LLM_PROVIDER").pipe(Config.withDefault("fake"))
   if (llmProvider === SUBSCRIPTION_PROVIDER) {
     const fallbackLlm = yield* Llm
@@ -63,7 +61,7 @@ const ConversationLayer = Layer.unwrap(Effect.gen(function*() {
       agents: () => modules.agents,
       module: () => modules.infos.find((m) => m.id === SUBSCRIPTION_AGENT_ID),
       promptFor: (agent, turn) =>
-        agent.systemPrompt === undefined ? turn.system : withVoicePrompt(withModuleInstructions(agent.systemPrompt, modules.instructions), voices)
+        agent.systemPrompt === undefined ? turn.system : withModuleInstructions(agent.systemPrompt, modules.instructions)
     })
     return Conversation.layerWithAgents({ ...settings, setup: Effect.succeed(toAgents({ system: systemPrompt, registry: modules.registry })) })
   }
@@ -134,7 +132,8 @@ const bench = (args: ReadonlyArray<string>) =>
     const outputDir = resolve(userCwd, yield* Config.String("BENCH_OUTPUT_DIR").pipe(Config.withDefault("bench-out")))
     if (args[0] === "--make-wavs") {
       const directory = resolve(userCwd, args[1] ?? "bench-audio")
-      const providers = yield* buildProviders([{ stage: "text-to-speech (TTS_PROVIDER)", layer: TtsLayer }])
+      const voice = yield* assistantVoiceStage
+      const providers = yield* buildProviders([voice.stage])
       const files = yield* makeBenchWavs(directory).pipe(Effect.provide(providers))
       console.log(`Wrote ${files.length} files. Run: bench --live ${directory}`)
       return
@@ -146,7 +145,7 @@ const bench = (args: ReadonlyArray<string>) =>
       const once = yield* collectWavs(parsed.paths.map((p) => resolve(userCwd, p)))
       if (once.length === 0) return yield* new StartupError({ message: usage })
       const files = Array.from({ length: parsed.rounds }, () => once).flat()
-      const voices = yield* loadVoiceSettings
+      const voice = yield* assistantVoiceStage
       // The offline stand-in LLM gets the simulated delays of the offline benchmark,
       // so a fully local run can stand in for a hosted model.
       const llmProvider = yield* Config.String("LLM_PROVIDER").pipe(Config.withDefault("fake"))
@@ -158,16 +157,16 @@ const bench = (args: ReadonlyArray<string>) =>
         ? `fake LLM: 1st token ${delays.llmFirstTokenMs} ms, ${delays.llmTokensPerSecond} tok/s`
         : `LLM ${llmProvider}`
       const providers = yield* buildProviders([
-        ...voiceStages(voices),
+        voice.stage,
         { stage: "language model (LLM_PROVIDER)", layer: llm },
         { stage: "speech-to-text (STT_PROVIDER)", layer: SttLayer }
       ])
       const settings = yield* AppConfig
       const modules = yield* startCliModules()
-      const conversation = { ...settings, systemPrompt: withVoicePrompt(withModuleInstructions(settings.systemPrompt, modules.instructions), voices) }
+      const conversation = { ...settings, systemPrompt: withModuleInstructions(settings.systemPrompt, modules.instructions) }
       const { sessions, staggerMs } = parsed
       const perSession = yield* runLiveSessions({ files, outputDir, conversation, modules, sessions, staggerMs }).pipe(
-        Effect.provide(withVoiceRouter(providers, voices))
+        Effect.provide(withVoiceTrace(providers, voice.ref))
       )
       const together = sessions === 1 ? "" : `, ${sessions} sessions, user audio ends ${staggerMs === 0 ? "at the same moment" : `${staggerMs} ms apart`}`
       for (const [i, rows] of perSession.entries()) {
@@ -210,7 +209,7 @@ const program: Effect.Effect<void, unknown> = mode === "text"
   ? serveMode
   : new StartupError({
     message: `Unknown mode "${mode}". Usage: assistant [text | voice | serve | bench [--sessions N | --live [--rounds N] [--sessions N] [--stagger MS] <wavs> | --make-wavs [dir]] | ` +
-      "say [--voice NAME] [--out FILE] <text> | transcribe <wav file> | compare-models [--models a,b] [--agc on|off|both] [--ref TEXT] <wavs>]"
+      "say [--voice PROVIDER:VOICE] [--out FILE] <text> | transcribe <wav file> | compare-models [--models a,b] [--agc on|off|both] [--ref TEXT] <wavs>]"
   })
 
 /**

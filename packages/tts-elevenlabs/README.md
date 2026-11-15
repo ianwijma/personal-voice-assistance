@@ -14,11 +14,13 @@ spoken directly over `ws`. Hosted and optional. Wire reference: `docs/protocols/
 | `ELEVENLABS_SPEED` | (the voice's) | 0.7–1.2 |
 | `ELEVENLABS_STABILITY` | (the voice's) | 0–1 |
 | `ELEVENLABS_AUTO_MODE` | `true` | server skips its chunk schedule (the clause chunker sends whole clauses) |
-| `ELEVENLABS_SAMPLE_RATE` | 24000 | 8000, 16000, 22050, 24000, 32000, 44100 or 48000; development only (the voice router resamples) |
+| `ELEVENLABS_SAMPLE_RATE` | 24000 | 8000, 16000, 22050, 24000, 32000, 44100 or 48000; the reply plays at this rate |
 | `ELEVENLABS_URL` | `wss://api.elevenlabs.io` | ws(s), no user-info, no query; development / regional hosts |
 
-As a voice, every setting can be set for one voice with the `VOICE_<NAME>_` prefix, e.g.
-`VOICE_EXPRESSIVE_PROVIDER=elevenlabs` and `VOICE_EXPRESSIVE_ELEVENLABS_VOICE=<voice id>`.
+As a voice provider (docs/VOICE-PROVIDERS.md), choosing `ASSISTANT_VOICE=elevenlabs:<voice id>` sets `ELEVENLABS_VOICE`
+for the voice being built; the other settings apply to every ElevenLabs voice. `makeVoices` lists the account's voice
+library (`GET /v2/voices`) and previews a voice (`POST /v1/text-to-speech/{voice_id}`, raw PCM) over REST on the same
+host as `ELEVENLABS_URL`, never through the live socket.
 
 A setting the server would refuse (a rate it does not offer, speed or stability out of range, an empty voice, a refused
 address) makes every turn fail with a `TtsError` naming the variable; building the layer never fails.

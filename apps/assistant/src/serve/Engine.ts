@@ -1,13 +1,11 @@
-import { type HostResult, Llm, makeVoiceRouter, Stt, type Voice } from "@pva/core"
+import { type HostResult, Llm, Stt, Tts, type VoiceRef, voiceKey } from "@pva/core"
 import type { EngineInfo, EngineStatus, VoiceInfo } from "@pva/protocol"
 import * as SherpaStt from "@pva/stt-sherpa"
-import * as ElevenLabsTts from "@pva/tts-elevenlabs"
-import * as SherpaTts from "@pva/tts-sherpa"
 import { Cause, Config, ConfigProvider, Context, Deferred, Effect, Exit, Fiber, FiberSet, Schema, type Scope } from "effect"
 import { AppConfig } from "../config.ts"
-import { hostedTts, isHostedTts, LlmLayer, SttLayer } from "../providers.ts"
+import { LlmLayer, SttLayer, ttsProviderInfo } from "../providers.ts"
 import { buildStages } from "../startup.ts"
-import { builtVoices, loadVoiceSettings, providerOf, voiceCatalog, voiceConfigProvider, voiceStages } from "../voices.ts"
+import { assistantVoice, ttsLayerFor, voiceEngineName, voiceLabel, voiceStageName } from "../voiceSelection.ts"
 
 /**
  * The shared engines of serve mode (docs/UI-AND-MODULES.md §1.7, §4.5; docs/VOICE-SESSIONS.md §2): the providers
@@ -29,10 +27,10 @@ export interface EngineProviders {
   /** `LLM_PROVIDER` as built. Default (absent): a single-model conversation over `llm`. */
   readonly llmProvider?: string
   readonly stt: Stt["Service"]
-  /** The enabled voices. */
-  readonly voices: ReadonlyArray<Voice>
-  /** The default voice at build time; its rate is the output rate until the next build. */
-  readonly defaultVoice: string
+  /** The assistant's voice (docs/VOICE-PROVIDERS.md): every reply is spoken with it; its rate is the output rate. */
+  readonly tts: Tts["Service"]
+  /** Which voice `tts` is. */
+  readonly voice: VoiceRef
   readonly maxToolRounds: number
   readonly engines: ReadonlyArray<EngineInfo>
   readonly voiceInfo: ReadonlyArray<VoiceInfo>
@@ -46,28 +44,25 @@ const read = <A>(config: Config.Config<A>): Effect.Effect<A, Config.ConfigError>
 })
 const configValue = <A>(config: Config.Config<A>, fallback: A): Effect.Effect<A> => Effect.orElseSucceed(read(config), () => fallback)
 
-/** "Piper" or "Kokoro" for a sherpa voice preset (shown in the UI's voice list). */
-const sherpaEngineName = (preset: string) =>
-  SherpaTts.presets[preset]?.engine === "kokoro" ? "Kokoro" : SherpaTts.presets[preset]?.engine === "piper" ? "Piper" : "Local"
-
-/** The providers selected by the settings, as the CLI builds them (one stage per voice, LLM, STT). */
+/** The providers selected by the settings, as the CLI builds them (the assistant's voice, LLM, STT). */
 export const defaultProviderBuilder: ProviderBuilder = Effect.gen(function*() {
-  const voices = yield* loadVoiceSettings.pipe(
-    Effect.mapError((e) => new EngineBuildProblems({ problems: [{ stage: "voices (VOICES, DEFAULT_VOICE)", message: e.message }] }))
-  )
+  const resolved = yield* assistantVoice
+  if ("problem" in resolved) return yield* new EngineBuildProblems({ problems: [{ stage: voiceStageName, message: resolved.problem }] })
+  for (const note of resolved.notes) yield* Effect.logWarning(note)
   const settings = yield* read(AppConfig).pipe(
     Effect.mapError((e) => new EngineBuildProblems({ problems: [{ stage: "conversation", message: e.message }] }))
   )
+  const voice = resolved.ref
   const { context, problems } = yield* buildStages([
-    ...voiceStages(voices),
+    { stage: voiceStageName, layer: ttsLayerFor(voice) },
     { stage: "language model (LLM_PROVIDER)", layer: LlmLayer },
     { stage: "speech-to-text (STT_PROVIDER)", layer: SttLayer }
   ])
   if (problems.length > 0) return yield* new EngineBuildProblems({ problems })
 
-  const base = yield* ConfigProvider.ConfigProvider
   const llmProvider = yield* configValue(Config.String("LLM_PROVIDER"), "fake")
   const sttProvider = yield* configValue(Config.String("STT_PROVIDER"), "sherpa")
+  const location = (ttsProviderInfo as Record<string, { readonly location: "local" | "hosted" } | undefined>)[voice.provider]?.location ?? "hosted"
   const engines: Array<EngineInfo> = [
     {
       stage: "llm",
@@ -87,36 +82,24 @@ export const defaultProviderBuilder: ProviderBuilder = Effect.gen(function*() {
         ? yield* configValue(Config.String("DEEPGRAM_MODEL"), "flux-general-en")
         : yield* configValue(Config.String("STT_SHERPA_MODEL"), SherpaStt.DEFAULT_PRESET),
       location: sttProvider === "deepgram" ? "hosted" : "local"
-    }
+    },
+    // `detail` is the voice id: for `sherpa` the preset, which the Models page marks as in use.
+    { stage: "tts", provider: voice.provider, detail: voice.voiceId, location }
   ]
-  const voiceInfo: Array<VoiceInfo> = []
-  for (const voice of voiceCatalog) {
-    const provider = yield* configValue(providerOf(voice), "sherpa")
-    const detail = yield* (provider === "sherpa"
-      ? configValue(Config.String("TTS_SHERPA_PRESET"), SherpaTts.DEFAULT_PRESET)
-      : provider === "elevenlabs"
-      ? configValue(Config.String("ELEVENLABS_MODEL"), ElevenLabsTts.DEFAULT_MODEL)
-      : configValue(Config.String("CARTESIA_MODEL"), "sonic")).pipe(
-        Effect.provideService(ConfigProvider.ConfigProvider, voiceConfigProvider(base, voice))
-      )
-    const enabled = voices.enabled.some((v) => v.name === voice.name)
-    const location = provider === "sherpa" ? "local" : "hosted"
-    voiceInfo.push({
-      name: voice.name,
-      description: voice.description,
-      enabled,
-      isDefault: voice.name === voices.defaultVoice,
-      engine: `${provider === "sherpa" ? sherpaEngineName(detail) : (isHostedTts(provider) ? hostedTts[provider].label : provider)} ${detail}`,
-      location
-    })
-    if (enabled) engines.push({ stage: "tts", provider, detail: `${voice.name}: ${detail}`, location })
-  }
+  const voiceInfo: Array<VoiceInfo> = [{
+    name: voiceKey(voice),
+    description: voiceLabel(voice),
+    enabled: true,
+    isDefault: true,
+    engine: voiceEngineName(voice),
+    location
+  }]
   return {
     llm: Context.get(context as Context.Context<Llm>, Llm),
     llmProvider,
     stt: Context.get(context as Context.Context<Stt>, Stt),
-    voices: builtVoices(context, voices),
-    defaultVoice: voices.defaultVoice,
+    tts: Context.get(context as Context.Context<Tts>, Tts),
+    voice,
     maxToolRounds: settings.maxToolRounds,
     engines,
     voiceInfo
@@ -141,8 +124,6 @@ export interface EngineOptions {
   readonly preflight?: Effect.Effect<void, EngineBuildProblems>
   /** Environment over saved settings: what the providers read. Evaluated at every build. */
   readonly configProvider: () => ConfigProvider.ConfigProvider
-  /** The default voice chosen in the settings now (`DEFAULT_VOICE`, live). */
-  readonly defaultVoice: () => string
   readonly onStatus: (status: EngineStatus) => void
   /** Adjust the engine list shown (live details such as an agent module's model). Applied on every status. */
   readonly describeEngines?: (engines: ReadonlyArray<EngineInfo>) => ReadonlyArray<EngineInfo>
@@ -165,7 +146,7 @@ export interface EngineOptions {
 /** The engines of one build, as the voice sessions use them. */
 export interface BuiltEngines {
   readonly providers: EngineProviders
-  /** The output rate of every voice router of this build (the build-time default voice's rate). */
+  /** The output rate of this build (the assistant's voice's rate). */
   readonly sampleRate: number
 }
 
@@ -218,8 +199,8 @@ export interface Engine {
   readonly attach: (loop: SessionLoop) => Effect.Effect<void>
   /** Saved settings wait for a reload (`path`: the settings page they are on, for `reloadPendingFor`). */
   readonly setReloadPending: (pending: boolean, path?: string) => void
-  /** The enabled voices and the assistant's default voice in effect (`DEFAULT_VOICE` when it is running), while the engines run. */
-  readonly voices: () => { readonly names: ReadonlyArray<Voice>; readonly defaultVoice: string } | undefined
+  /** The voice the running engines speak with (undefined while they are not running). */
+  readonly voice: () => VoiceRef | undefined
   /** Announce the status again (`describeEngines` has something new to say). */
   readonly refreshStatus: () => void
 }
@@ -290,7 +271,6 @@ export const makeEngine = (options: EngineOptions): Effect.Effect<Engine, never,
           return
         }
         const providers = built.success
-        const router = makeVoiceRouter({ voices: providers.voices, defaultVoice: providers.defaultVoice })
         // Added after the providers' finalizers, so it runs before them: the loops end while their engines still work.
         yield* Effect.addFinalizer(() =>
           Effect.andThen(Effect.sync(() => {
@@ -300,7 +280,7 @@ export const makeEngine = (options: EngineOptions): Effect.Effect<Engine, never,
           }), stopLoops)
         )
         const failed = yield* Deferred.make<Cause.Cause<unknown>>()
-        current = { providers, sampleRate: router.sampleRate }
+        current = { providers, sampleRate: providers.tts.sampleRate }
         loopFailed = failed
         ready = true
         setStatus({ state: "ready", problems: [], reloadPending: false, reloadPendingFor: [], engines: providers.engines, voices: providers.voiceInfo })
@@ -413,12 +393,6 @@ export const makeEngine = (options: EngineOptions): Effect.Effect<Engine, never,
           setStatus({ ...status, reloadPending: pending, reloadPendingFor: pages })
         }
       },
-      voices: () => {
-        const built = ready ? current : undefined
-        if (built === undefined) return undefined
-        const wanted = options.defaultVoice()
-        const names = built.providers.voices
-        return { names, defaultVoice: names.some((v) => v.name === wanted) ? wanted : built.providers.defaultVoice }
-      }
+      voice: () => (ready ? current?.providers.voice : undefined)
     } satisfies Engine
   })

@@ -1,6 +1,6 @@
 import { appUrl, expect, expectVisualState, mock, test } from "./fixtures.ts"
 
-// The voice front end with protocol 5: the settings sheet (voice, activation, follow-up from the device profile),
+// The voice front end with protocol 5: the settings sheet (activation, follow-up from the device profile),
 // the device identity in hello, and the asleep / woke display.
 
 test("hello carries a stable device id and a name from the user agent; the profile comes from the server", async ({ page, baseURL }) => {
@@ -14,18 +14,14 @@ test("hello carries a stable device id and a name from the user agent; the profi
   expect(await page.evaluate(() => localStorage.getItem("pva.deviceId"))).toBe(id)
 })
 
-test("the sheet: choosing a voice and the wake phrase goes to the server; the phrases are read-only; follow-up", async ({ page, baseURL }) => {
+test("the sheet: the wake phrase goes to the server; the phrases are read-only; follow-up; no voice of its own", async ({ page, baseURL }) => {
   await mock.scenario("typed")
   await page.goto(appUrl(baseURL))
   await page.getByTestId("settings-toggle").click()
   const sheet = page.getByTestId("voice-sheet")
-  const voices = sheet.getByTestId("voice-choices")
-  await expect(voices.getByRole("radio")).toHaveCount(3) // Assistant default + two enabled voices
-  await expect(voices.getByRole("radio", { name: /Assistant default/ })).toBeChecked()
-  await expect(voices).toContainText("Longer replies where warmth matters.")
-  await voices.getByRole("radio", { name: /natural/i }).check()
-  await expect(voices.getByRole("radio", { name: /natural/i })).toBeChecked()
-  await expect.poll(async () => (await mock.log()).messages.filter((m) => m.type === "device.update").map((m) => m.patch)).toEqual([{ voice: "natural" }])
+  // The voice is the assistant's, chosen in admin (docs/VOICE-PROVIDERS.md §1): the sheet has no voice choice.
+  await expect(sheet.getByTestId("voice-choices")).toHaveCount(0)
+  await expect(sheet.getByRole("heading", { name: "Voice", exact: true })).toHaveCount(0)
 
   await expect(sheet).toContainText("reacts to everything it hears")
   await sheet.getByRole("radio", { name: "Wake phrase" }).click()
@@ -35,7 +31,6 @@ test("the sheet: choosing a voice and the wake phrase goes to the server; the ph
   await expect(phrases.getByRole("link", { name: "admin" })).toHaveAttribute("href", /\/admin\//)
   await sheet.getByLabel("Keep listening after a reply").selectOption("15")
   await expect.poll(async () => (await mock.log()).messages.filter((m) => m.type === "device.update").map((m) => m.patch)).toEqual([
-    { voice: "natural" },
     { activation: "wake-phrase" },
     { followUpSeconds: 15 }
   ])

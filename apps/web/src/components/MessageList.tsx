@@ -1,6 +1,6 @@
 "use client"
 import { memo, useLayoutEffect, useRef, useState } from "react"
-import { defaultVoiceOf, type TurnView } from "@/lib/state.ts"
+import type { TurnView } from "@/lib/state.ts"
 import { useClientState } from "./context.tsx"
 import { ToolChip } from "./ToolChip.tsx"
 import { Icon } from "./ui/Icon.tsx"
@@ -11,7 +11,6 @@ export function MessageList() {
   const turns = useClientState((s) => s.turns)
   const divider = useClientState((s) => s.divider)
   const live = useClientState((s) => s.liveTranscript)
-  const defaultVoice = useClientState(defaultVoiceOf)
   const scroller = useRef<HTMLDivElement>(null)
   const stuck = useRef(true)
   const [showJump, setShowJump] = useState(false)
@@ -53,7 +52,7 @@ export function MessageList() {
           <p className="mt-8 text-center text-[14px] text-ink-faint">Nothing said yet. Talk, or type below.</p>
         )}
         <ol className="flex flex-col gap-5">
-          {turns.map((t) => <TurnBlock key={t.key} turn={t} defaultVoice={defaultVoice} />)}
+          {turns.map((t) => <TurnBlock key={t.key} turn={t} />)}
           {live !== "" && (
             <li data-testid="live-transcript" className="border-l-2 border-you/50 pl-3 text-[15px] italic text-you">
               {live}
@@ -74,7 +73,7 @@ export function MessageList() {
   )
 }
 
-const TurnBlock = memo(function TurnBlock({ turn, defaultVoice }: { readonly turn: TurnView; readonly defaultVoice: string | undefined }) {
+const TurnBlock = memo(function TurnBlock({ turn }: { readonly turn: TurnView }) {
   const hasReply = turn.clauses.length > 0 || turn.text !== "" || turn.tools.length > 0 || turn.error !== undefined || turn.outcome !== undefined
   return (
     <li className="flex flex-col gap-3" data-testid="turn" data-turn-id={turn.turnId} data-outcome={turn.outcome}>
@@ -87,19 +86,18 @@ const TurnBlock = memo(function TurnBlock({ turn, defaultVoice }: { readonly tur
           <p className="mt-0.5 whitespace-pre-wrap text-[15px] text-ink">{turn.userText}</p>
         </div>
       )}
-      {hasReply && <AssistantMessage turn={turn} defaultVoice={defaultVoice} />}
+      {hasReply && <AssistantMessage turn={turn} />}
     </li>
   )
 })
 
-function AssistantMessage({ turn, defaultVoice }: { readonly turn: TurnView; readonly defaultVoice: string | undefined }) {
-  const voice = turn.clauses.find((c) => c.voice !== undefined && c.voice !== defaultVoice)?.voice
+function AssistantMessage({ turn }: { readonly turn: TurnView }) {
   const interrupted = turn.outcome === "interrupted"
   const allPlayed = turn.outcome === "completed" || turn.fromHistory === true
   return (
     <div className="border-l-2 border-voice pl-3" data-testid="assistant-message">
       <div className="flex items-center gap-2">
-        <span className="label text-voice">Assistant{voice !== undefined && <span className="text-ink-muted"> · {voice}</span>}</span>
+        <span className="label text-voice">Assistant</span>
       </div>
       {turn.tools.length > 0 && (
         <div className="mt-1.5 flex flex-col items-start gap-1">

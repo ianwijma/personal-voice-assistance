@@ -5,8 +5,7 @@ import {
   type ModuleDefinition,
   type ModuleHost,
   type TurnSetup,
-  type TurnTrace,
-  voicePrompt
+  type TurnTrace
 } from "@pva/core"
 import {
   DEFAULT_CONVERSATION_IDLE_MINUTES,
@@ -44,10 +43,15 @@ import { type Keys, makeKeys } from "./Keys.ts"
 import { makeSections } from "./sections.ts"
 import { makeSessionHub, type SessionHub } from "./SessionHub.ts"
 import { DataDirConfig, KEYS_LOCKED_MESSAGE, loadSettingsStore, SettingsStoreError } from "./SettingsStore.ts"
-import { makeVoiceSession, type VoicesNow } from "./VoiceSession.ts"
+import { makeApi } from "./api.ts"
+import { makeAssistantVoice } from "./AssistantVoice.ts"
+import { type Favourites, makeFavourites } from "./Favourites.ts"
+import { makeVoiceCatalog, type VoiceCatalog, type VoiceCatalogOptions } from "./VoiceCatalog.ts"
+import { makeVoiceSession } from "./VoiceSession.ts"
 import { makeVoiceSessions, type VoiceSessions } from "./VoiceSessions.ts"
 import { type KdfParams, openVault, type Vault, VaultPathConfig } from "./Vault.ts"
 import * as SherpaStt from "@pva/stt-sherpa"
+import * as SherpaTts from "@pva/tts-sherpa"
 import type { ToolId } from "@pva/protocol"
 
 /**
@@ -111,6 +115,9 @@ export interface ServeOptions {
   /** Tests: model downloads without the network, and the free disk space. */
   readonly modelDownloaders?: Readonly<Record<ToolId, PresetDownloader>>
   readonly freeBytes?: (dir: string) => Promise<number>
+  /** Tests: the hosted providers' voice lists and previews (local mock servers), and the engine of local previews. */
+  readonly hostedVoices?: VoiceCatalogOptions["hostedVoices"]
+  readonly localPreviewEngine?: VoiceCatalogOptions["localEngine"]
   readonly turnTrace?: TurnTrace["Service"]
   /** Playback stall limit (tests shorten it). Default 2000 ms. */
   readonly stallMs?: number
@@ -133,6 +140,7 @@ export interface ServeHandle {
   readonly envMover: EnvMover
   readonly jobs: Jobs
   readonly models: Models
+  readonly favourites: Favourites
   /** Completes when the first engine build and module start have settled. */
   readonly ready: Effect.Effect<void>
 }
@@ -219,18 +227,19 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     // Late-bound: the hub needs the engine and the sessions, and their callbacks need the hub.
     let hub: SessionHub | undefined
     let lastSummary: string | undefined
-    /** The enabled voices of the engine status (kept while a rebuild fails); empty before the first build. */
+    /**
+     * The voice of the engine status (kept while a rebuild fails; empty before the first build). A device profile's
+     * `voice` other than it falls back to "" (the assistant's voice): per-device voices are retired
+     * (docs/VOICE-PROVIDERS.md §1).
+     */
     const enabledVoices = (): ReadonlySet<string> =>
       new Set((engine?.status().voices ?? []).filter((v) => v.enabled).map((v) => v.name))
     let engine: Engine | undefined
     let modelsRef: Models | undefined
     const broadcast = (message: ServerMessage) => hub?.broadcast(message)
 
-    /** Base prompt + running modules' instructions + voice block. */
-    const systemFor = (base: string, instructions: ReadonlyArray<string>, voices: string) => {
-      const system = withModuleInstructions(base, instructions)
-      return voices.length === 0 ? system : `${system}\n\n${voices}`
-    }
+    /** Base prompt + running modules' instructions. */
+    const systemFor = (base: string, instructions: ReadonlyArray<string>) => withModuleInstructions(base, instructions)
 
     // LLM_PROVIDER=claude-subscription: an agent conversation whose agent is the running claude-subscription module.
     // Every session's conversation uses that one agent; it keeps one Claude Code session per conversation id.
@@ -244,23 +253,15 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     const secretNames = () =>
       sections.list().flatMap((x) => x.form.fields).flatMap((f) => (f.type === "secret" && f.env !== undefined ? [f.env] : []))
 
-    /**
-     * One session's turn setup (and agent setup): its voice block names that session's default voice. Rebuilt only
-     * when its inputs change (a string compare per turn).
-     */
-    const conversationSetup = (voices: () => VoicesNow | undefined) => {
+    /** One session's turn setup (and agent setup). Rebuilt only when its inputs change (a string compare per turn). */
+    const conversationSetup = () => {
       let cached: { key: string; setup: TurnSetup } | undefined
-      const voiceBlock = () => {
-        const v = voices()
-        return v === undefined ? "" : voicePrompt(v.names, v.defaultVoice)
-      }
       const setup = Effect.sync((): TurnSetup => {
         const snapshot = host.snapshot()
         const base = String(sections.value("SYSTEM_PROMPT") ?? defaultSystemPrompt)
-        const block = voiceBlock()
-        const key = `${snapshot.version}\u0000${base}\u0000${block}`
+        const key = `${snapshot.version}\u0000${base}`
         if (cached?.key !== key) {
-          cached = { key, setup: { system: systemFor(base, snapshot.instructions, block), registry: snapshot.registry } }
+          cached = { key, setup: { system: systemFor(base, snapshot.instructions), registry: snapshot.registry } }
         }
         return cached.setup
       })
@@ -271,7 +272,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
           agents: () => host.snapshot().agents,
           module: subscriptionModule,
           promptFor: (agent, turn) =>
-            agent.systemPrompt === undefined ? turn.system : systemFor(agent.systemPrompt, host.snapshot().instructions, voiceBlock())
+            agent.systemPrompt === undefined ? turn.system : systemFor(agent.systemPrompt, host.snapshot().instructions)
         })
         return Effect.map(setup, toAgents)
       }
@@ -286,7 +287,6 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
         ? { preflight: defaultPreflight }
         : {}),
       configProvider: sections.configProvider,
-      defaultVoice: () => String(sections.value("DEFAULT_VOICE")),
       onStatus: (status) => {
         // `engine` goes to admin connections only (SessionHub.ADMIN_ONLY); the summary to everyone, when it changed.
         broadcast({ type: "engine", engine: status })
@@ -368,8 +368,6 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
           name: () => (device === undefined ? "Voice page without a device" : frontends.nameOf(device.id) ?? device.name),
           engine: theEngine,
           profile: () => hub?.profileOf(key) ?? frontends.profile(device?.id),
-          assistantDefaultVoice: () => String(sections.value("DEFAULT_VOICE")),
-          enabledVoices,
           conversationSetup,
           moduleOfTool: (name) => host.snapshot().toolModules.get(name) ?? null,
           turnTrace,
@@ -424,11 +422,6 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       access,
       onSectionSaved: (sectionId, needsReload, path) => {
         if (needsReload) theEngine.setReloadPending(true, path)
-        if (sectionId === "voices") {
-          const wanted = String(sections.value("DEFAULT_VOICE"))
-          const running = theEngine.voices()
-          if (running !== undefined && !running.names.some((v) => v.name === wanted)) theEngine.setReloadPending(true, path)
-        }
         // CONVERSATION_IDLE_MINUTES is the built-in default of every profile's conversationIdleMinutes.
         if (sectionId === "llm-behaviour") hubNow.refreshProfiles()
       },
@@ -449,6 +442,48 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       }
     })
 
+    // The voice picker's API (docs/VOICE-PROVIDERS.md §5): providers, voices, previews, downloads, favourites.
+    const favourites = makeFavourites({ dataDir: options.dataDir, writable: () => lock.held(), log: (line) => runFork(Effect.logWarning(line)) })
+    let catalogRef: VoiceCatalog | undefined
+    const assistantVoice = makeAssistantVoice({
+      sections,
+      engine: theEngine,
+      catalog: () => catalogRef!,
+      onSaved: (update) => {
+        const running = theEngine.voice()
+        if (update.reload && running !== undefined) theEngine.setReloadPending(true, update.path)
+      }
+    })
+    const inTurn = new Set(["hearing", "thinking", "speaking"])
+    const voiceCatalog = yield* makeVoiceCatalog({
+      configProvider: sections.configProvider,
+      vaultLocked: () => keys.state() === "locked",
+      modelDir: () => sections.modelDirs().tts,
+      live: () => {
+        const built = theEngine.built()
+        return built === undefined ? undefined : { voice: built.providers.voice, tts: built.providers.tts }
+      },
+      busy: () => sessions.list().some((s) => inTurn.has(s.state)),
+      selected: assistantVoice.ref,
+      isFavourite: favourites.has,
+      // Every voice of a shared archive (Kokoro) reports the one job that downloads it.
+      download: (preset) => jobs.running("tts-models", SherpaTts.archiveOwner(preset) ?? preset),
+      ...(options.hostedVoices !== undefined ? { hostedVoices: options.hostedVoices } : {}),
+      ...(options.localPreviewEngine !== undefined ? { localEngine: options.localPreviewEngine } : {})
+    })
+    catalogRef = voiceCatalog
+    const api = makeApi({
+      admin,
+      catalog: voiceCatalog,
+      favourites,
+      jobs,
+      models,
+      assistantVoice,
+      services,
+      allowedOrigins: options.allowedOrigins,
+      scheme: options.tls === undefined ? "http" : "https"
+    })
+
     const http = yield* startHttp({
       host: options.host,
       port: options.port,
@@ -458,6 +493,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       tls: options.tls,
       crossOriginIsolation: options.crossOriginIsolation ?? true,
       hub: hubNow,
+      api,
       ...(options.pingIntervalMs !== undefined ? { pingIntervalMs: options.pingIntervalMs } : {})
     })
 
@@ -525,7 +561,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     }
     const ready = Effect.asVoid(Effect.all([Fiber.await(modulesStarted), Fiber.await(engineStarted)]))
 
-    return { http, hub: hubNow, engine: theEngine, sessions, host, keys, vault, envView, envMover, jobs, models, ready }
+    return { http, hub: hubNow, engine: theEngine, sessions, host, keys, vault, envView, envMover, jobs, models, favourites, ready }
   })
 
 const isLoopback = (host: string) => host === "localhost" || host === "::1" || host.startsWith("127.")
