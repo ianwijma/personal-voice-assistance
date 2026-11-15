@@ -1,10 +1,10 @@
 /**
  * Keeping configured credentials out of error text and logs.
  *
- * IDENTICAL COPIES of this file live in the six adapters that hold a credential
+ * IDENTICAL COPIES of this file live in the adapters that hold a credential
  * (`llm-openai-compatible`, `llm-anthropic`, `decide-typesafe`,
- * `module-home-assistant`, `stt-deepgram`, `tts-cartesia`, each as
- * `src/redact.ts`); sharing it would mean a new export of `@pva/core`. A test in
+ * `module-home-assistant`, `stt-deepgram`, `tts-cartesia`, `tts-elevenlabs`,
+ * `agent-claude-code`, each as `src/redact.ts`); sharing it would mean a new export of `@pva/core`. A test in
  * `llm-openai-compatible` (`redact.test.ts`) fails when the copies differ.
  *
  * The rule in every adapter: each error it returns or logs is built through

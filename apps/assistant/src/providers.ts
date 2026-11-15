@@ -5,6 +5,7 @@ import { AnthropicLlm } from "@pva/llm-anthropic"
 import * as DeepgramStt from "@pva/stt-deepgram"
 import * as SherpaStt from "@pva/stt-sherpa"
 import * as CartesiaTts from "@pva/tts-cartesia"
+import * as ElevenLabsTts from "@pva/tts-elevenlabs"
 import * as SherpaTts from "@pva/tts-sherpa"
 import { Config, Effect, Layer, Option } from "effect"
 import { resolve } from "node:path"
@@ -46,9 +47,18 @@ const sttProviders = {
  */
 export const ttsProviders = {
   sherpa: SherpaTts.layerConfig(),
-  cartesia: CartesiaTts.layerConfig
+  cartesia: CartesiaTts.layerConfig,
+  elevenlabs: ElevenLabsTts.layerConfig
 } satisfies Record<string, Layer.Layer<Tts, TtsError | Config.ConfigError>>
 export type TtsProviderName = keyof typeof ttsProviders
+
+/** The hosted voice services: their name for people, and the setting that holds their key. */
+export const hostedTts = {
+  cartesia: { label: "Cartesia", keyEnv: "CARTESIA_API_KEY" },
+  elevenlabs: { label: "ElevenLabs", keyEnv: "ELEVENLABS_API_KEY" }
+} as const satisfies Partial<Record<TtsProviderName, { readonly label: string; readonly keyEnv: string }>>
+export type HostedTtsName = keyof typeof hostedTts
+export const isHostedTts = (provider: string): provider is HostedTtsName => Object.hasOwn(hostedTts, provider)
 export const ttsProviderNames = Object.keys(ttsProviders) as Array<TtsProviderName>
 
 const audioBackends = {
@@ -93,7 +103,7 @@ export const SttLayer: Layer.Layer<Stt, SttError | Config.ConfigError> = Layer.u
 /** Default of `TTS_PROVIDER` (the engine of voices that do not name one). */
 export const defaultTtsProvider: TtsProviderName = "sherpa"
 
-/** `TTS_PROVIDER`: `sherpa` (default, local) | `cartesia`. The engine starts / the connection opens when the layer is built. */
+/** `TTS_PROVIDER`: `sherpa` (default, local) | `cartesia` | `elevenlabs`. The engine starts / the connection opens when the layer is built. */
 export const TtsLayer: Layer.Layer<Tts, TtsError | Config.ConfigError> = Layer.unwrap(
   choose("TTS_PROVIDER", ttsProviders, defaultTtsProvider)
 )

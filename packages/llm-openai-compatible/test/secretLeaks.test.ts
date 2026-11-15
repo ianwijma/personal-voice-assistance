@@ -245,7 +245,7 @@ describe("credentials never leak (llm-openai-compatible)", () => {
     const readTest = (pkg: string) => readFileSync(new URL(`../../${pkg}/test/leaks.ts`, import.meta.url), "utf8")
     const mine = read("llm-openai-compatible")
     const mineTest = readTest("llm-openai-compatible")
-    for (const pkg of ["llm-anthropic", "decide-typesafe", "module-home-assistant", "stt-deepgram", "tts-cartesia", "agent-claude-code"]) {
+    for (const pkg of ["llm-anthropic", "decide-typesafe", "module-home-assistant", "stt-deepgram", "tts-cartesia", "tts-elevenlabs", "agent-claude-code"]) {
       assert.strictEqual(read(pkg), mine, `${pkg}/src/redact.ts differs`)
       assert.strictEqual(readTest(pkg), mineTest, `${pkg}/test/leaks.ts differs`)
     }

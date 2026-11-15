@@ -190,6 +190,17 @@ describe("field semantics", () => {
     const voices = await request(client, { type: "settings.update", sectionId: "voices", patch: { values: { VOICES: ["standard", "expressive"] }, secrets: {} } })
     expect(voices.error?.warnings?.[0]).toMatchObject({ key: "VOICES" })
     expect(voices.error?.warnings?.[0]?.message).toContain("expressive speaks through Cartesia")
+    const elevenlabs = await request(client, { type: "settings.update", sectionId: "voice-engines", patch: { values: { TTS_PROVIDER: "elevenlabs" }, secrets: {} } })
+    const warningFor = (key: string) => elevenlabs.error?.warnings?.find((w) => w.key === key)?.message
+    expect(warningFor("TTS_PROVIDER")).toContain("ElevenLabs is chosen but there is no ElevenLabs key")
+    // The standard voice follows TTS_PROVIDER, so the voices on the same page warn too.
+    expect(warningFor("VOICES")).toContain("standard speaks through ElevenLabs")
+    const elevenlabsWithKey = await request(client, {
+      type: "settings.update",
+      sectionId: "voice-engines",
+      patch: { values: { TTS_PROVIDER: "elevenlabs" }, secrets: { ELEVENLABS_API_KEY: "el-key" } }
+    })
+    expect(elevenlabsWithKey.ok).toBe(true)
     const llm = await request(client, { type: "settings.update", sectionId: "language-model", patch: { values: { LLM_PROVIDER: "anthropic" }, secrets: {} } })
     expect(llm.error?.warnings?.[0]).toMatchObject({ key: "ANTHROPIC_API_KEY" })
     const withKey = await request(client, {
