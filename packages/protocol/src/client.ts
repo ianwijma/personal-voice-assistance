@@ -345,7 +345,24 @@ export const DeviceForget = Schema.Struct({
 export const WakeTest = Schema.Struct({
   type: Schema.Literal("wake.test"),
   requestId: RequestId,
-  on: Schema.Boolean
+  on: Schema.Boolean,
+  /**
+   * Protocol 6: whose transcripts (each device has its own session): this device's session. Absent: the most
+   * recently active session (as it changes). Unknown device: `unknown_device`.
+   */
+  deviceId: Schema.optionalKey(DeviceId)
+})
+
+/**
+ * Protocol 6, voice connections: start a new conversation on this connection's device (New conversation). Stops the
+ * running turn as Stop does, drops the device's history and gives the conversation a new id; every connection of the
+ * device gets `conversation { reason: "new" }`. Works without running engines. Answered with `result`. A voice
+ * connection without a device has a session of its own; one without a session yet gets the `conversation` message
+ * all the same (its next turn starts in the new conversation).
+ */
+export const ConversationNew = Schema.Struct({
+  type: Schema.Literal("conversation.new"),
+  requestId: RequestId
 })
 
 /** Liveness check; the server answers `pong` with the same id. Sent every 5 s. */
@@ -386,6 +403,7 @@ export const ClientMessage = Schema.Union([
   DeviceAdminUpdate,
   DeviceForget,
   WakeTest,
+  ConversationNew,
   Ping
 ]).pipe(Schema.toTaggedUnion("type"))
 export type ClientMessage = typeof ClientMessage.Type

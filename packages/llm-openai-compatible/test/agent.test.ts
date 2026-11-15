@@ -54,6 +54,7 @@ const timeTool = {
 
 const input = (marks: Array<string>, overrides: Partial<AgentTurnInput> = {}): AgentTurnInput => ({
   turnId: 1,
+  conversationId: "c1",
   text: "What time is it?",
   utterance: "Hey local, what time is it?",
   source: "text",

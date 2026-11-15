@@ -11,11 +11,12 @@ import {
   TurnSource
 } from "./common.ts"
 import { AdminSession, AdminState } from "./admin.ts"
-import { DeviceInfo, DeviceProfileInfo, FrontendKindInfo, WakePhrase } from "./frontends.ts"
+import { DeviceId, DeviceInfo, DeviceProfileInfo, FrontendKindInfo, WakePhrase } from "./frontends.ts"
 import { AdminSnapshot, EngineStatus, EngineSummary, ModuleInfo, SettingsSection, Snapshot, TraceInfo } from "./snapshot.ts"
 import { EnvInfo } from "./env.ts"
 import { JobInfo, ModelSet } from "./jobs.ts"
 import { VaultInfo } from "./vault.ts"
+import { ConversationId, ConversationReason, SessionInfo, SessionKey } from "./sessions.ts"
 
 /**
  * Text frames from the assistant to the browser. Binary frames from the
@@ -280,6 +281,45 @@ export const WakeHeard = Schema.Struct({
   at: NonNegativeFinite
 })
 
+/**
+ * Protocol 6, the device's connections: its conversation is a new one (`new`: `conversation.new`; `idle`: it had
+ * been quiet for `conversationIdleMinutes`, sent before the turn that started it; `resumed`: the page's
+ * conversation went on, e.g. after an engine reload, with a history the page should take from the snapshot). With
+ * `new` and `idle` the history is empty: the page clears its chat and shows a divider. Replaces
+ * `snapshot.conversation`.
+ */
+export const Conversation = Schema.Struct({
+  type: Schema.Literal("conversation"),
+  id: ConversationId,
+  reason: ConversationReason,
+  /** Epoch milliseconds when it started. */
+  startedAt: NonNegativeFinite
+})
+
+/**
+ * Protocol 6, admin connections only: the voice sessions changed (created, state, owner, a turn, a new
+ * conversation, discarded). The whole list, most recently active first; throttled like `devices` (at most one per
+ * second while only `state` changes).
+ */
+export const Sessions = Schema.Struct({
+  type: Schema.Literal("sessions"),
+  sessions: Schema.Array(SessionInfo)
+})
+
+/**
+ * Protocol 6, admin connections only: a voice session finished a turn (committed or not; discarded speculative
+ * turns are not sent). The trace carries `session` (the device's name); `key` / `deviceId` say which session, so
+ * admin › Diagnostics › Latency grows live (admin gets no `turn.*`). Also kept in `admin.snapshot.traces`.
+ */
+export const TraceMessage = Schema.Struct({
+  type: Schema.Literal("trace"),
+  /** The session's key (`SessionInfo.key`). */
+  key: SessionKey,
+  /** The device; absent for a session of a voice connection without a device. */
+  deviceId: Schema.optionalKey(DeviceId),
+  trace: TraceInfo
+})
+
 /** A problem not tied to a request (a failed turn, lost microphone audio, a module that crashed). */
 export const ErrorMessage = Schema.Struct({
   type: Schema.Literal("error"),
@@ -322,6 +362,9 @@ export const ServerMessage = Schema.Union([
   Devices,
   Wake,
   WakeHeard,
+  Conversation,
+  Sessions,
+  TraceMessage,
   Pong
 ]).pipe(Schema.toTaggedUnion("type"))
 export type ServerMessage = typeof ServerMessage.Type

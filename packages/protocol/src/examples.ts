@@ -27,6 +27,7 @@ import {
   type Snapshot,
   type TraceInfo
 } from "./snapshot.ts"
+import type { ConversationInfo, SessionInfo } from "./sessions.ts"
 
 export const exampleWeatherModule: ModuleInfo = {
   id: "weather",
@@ -325,10 +326,24 @@ export const exampleDevice: DeviceInfo = {
   name: "iPhone · Safari",
   firstSeen: 1_763_000_000_000,
   lastSeen: 1_763_100_000_000,
-  overrides: { voice: "natural", interruptMode: "instant" },
-  profile: effectiveProfile(exampleFrontend.defaults, { voice: "natural", interruptMode: "instant" }),
+  overrides: { voice: "natural", interruptMode: "instant", conversationIdleMinutes: 5 },
+  profile: effectiveProfile(exampleFrontend.defaults, { voice: "natural", interruptMode: "instant", conversationIdleMinutes: 5 }),
   connections: 1,
   audioOwner: true
+}
+
+export const exampleConversation: ConversationInfo = { id: "5b0f6a0e-3c1d-4c7e-9a52-1f0e8d2b7c44", startedAt: 1_763_099_400_000 }
+
+/** One voice session (protocol 6), as admin sees it. */
+export const exampleSession: SessionInfo = {
+  key: exampleDevice.id,
+  deviceId: exampleDevice.id,
+  name: exampleDevice.name,
+  state: "listening",
+  ownerPresent: true,
+  conversationId: exampleConversation.id,
+  turns: 2,
+  lastTurnAt: 1_763_100_000_000
 }
 
 /** The voice part, as a voice connection that owns the audio gets it. */
@@ -344,7 +359,8 @@ export const exampleSnapshot: Snapshot = {
     { role: "assistant", text: "Once upon a time,", interrupted: true, tools: [] }
   ],
   device: { deviceId: exampleDevice.id, profile: exampleDevice.profile, editable: DEVICE_EDITABLE_FIELDS },
-  admin: { enabled: true, loggedIn: false }
+  admin: { enabled: true, loggedIn: false },
+  conversation: exampleConversation
 }
 
 /** The admin part, as `admin.snapshot` carries it. */
@@ -358,7 +374,11 @@ export const exampleAdminSnapshot: AdminSnapshot = {
   models: exampleModels,
   jobs: [exampleJob],
   frontends: [exampleFrontend],
-  devices: [exampleDevice]
+  devices: [exampleDevice],
+  sessions: [
+    exampleSession,
+    { key: "c-a0d1e2f3", name: "Browser without a device id", state: "idle", ownerPresent: false, conversationId: "9d4c2a71-0b5e-4f3a-8e61-7c2d9b0a5f13", turns: 0, lastTurnAt: null }
+  ]
 }
 
 const audio = { contextSampleRate: 48_000, baseLatencyMs: 10, outputLatencyMs: 21.3, echoCancellation: true, outputPath: "direct" } as const
@@ -417,7 +437,8 @@ export const clientExamples: { readonly [T in ClientMessageType]: Extract<Client
   },
   "device.admin.update": { type: "device.admin.update", requestId: "r19", id: "d-5c1e0b7a42", name: "Kitchen phone", patch: { interruptMode: "instant" } },
   "device.forget": { type: "device.forget", requestId: "r20", id: "d-5c1e0b7a42" },
-  "wake.test": { type: "wake.test", requestId: "r21", on: true },
+  "wake.test": { type: "wake.test", requestId: "r21", on: true, deviceId: "d-5c1e0b7a42" },
+  "conversation.new": { type: "conversation.new", requestId: "r22" },
   "ping": { type: "ping", id: 41 }
 }
 
@@ -496,5 +517,8 @@ export const serverExamples: { readonly [T in ServerMessageType]: Extract<Server
   "devices": { type: "devices", devices: [exampleDevice] },
   "wake": { type: "wake", phrase: "hey jeff", armed: true },
   "wake.heard": { type: "wake.heard", text: "Hey go, what time is it?", at: 1_763_100_001_000 },
+  "conversation": { type: "conversation", id: "e1a7c3f9-2b4d-4e6a-8c0f-3d5b7a9e1c02", reason: "idle", startedAt: 1_763_100_600_000 },
+  "sessions": { type: "sessions", sessions: [exampleSession] },
+  "trace": { type: "trace", key: exampleDevice.id, deviceId: exampleDevice.id, trace: { ...exampleTrace, session: exampleDevice.name } },
   "pong": { type: "pong", id: 41 }
 }

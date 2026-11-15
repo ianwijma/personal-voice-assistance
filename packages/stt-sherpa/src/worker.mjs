@@ -18,8 +18,14 @@
 //   replaces the turn's text instead of being appended to it.
 // - hybrid: offline as above, plus an online stream per turn for live words only.
 //
+// Sessions: several voice sessions can be open at once (docs/VOICE-SESSIONS.md §3). The model is loaded once and
+// shared; each session has its own VAD (the one loaded below serves the first; more are created only when more
+// sessions are open at once), AGC, and turn state. Whole-turn decodes of every session go through one queue.
+//
 // Protocol (every message carries the session id; the main thread ignores stale ones):
-//   in : { type: "reset", session }                 new session: clear all state
+//   in : { type: "open", session }                  a new session with fresh state (others keep running)
+//        { type: "end", session }                   the session is over: its state and queued decodes are dropped
+//        { type: "reset", session }                 one session only: end every open session, open this one
 //        { type: "audio", session, buffer }          s16le mono 16 kHz, any length (transferred)
 //        { type: "finalize", session, frame, through? }
 //                                                    finalise unless speech came after `frame`; with `through`,
@@ -110,7 +116,7 @@ const offlineRecognizer = (offline) => {
 const online = config.streaming ? onlineRecognizer(config.streaming) : undefined
 const offline = config.offline ? offlineRecognizer(config.offline) : undefined
 
-const vad = new sherpa.Vad({
+const makeVad = () => new sherpa.Vad({
   sileroVad: {
     model: config.vad.file,
     threshold: config.vad.threshold,
@@ -123,8 +129,8 @@ const vad = new sherpa.Vad({
   numThreads: 1,
   debug: false
 }, 60)
-
-const agc = config.agc ? makeAgc(config.agc) : undefined
+// The first session's VAD, loaded with the model; later concurrent sessions get their own (`makeVad`).
+const vad = makeVad()
 
 // Warm up: the first decodes are much slower than the rest.
 if (online) {
@@ -141,7 +147,16 @@ if (offline) {
   }
 }
 
-const core = makeRecognizerCore({ config, online, offline, vad, agc, post, collect })
+const core = makeRecognizerCore({
+  config,
+  online,
+  offline,
+  vad,
+  makeVad,
+  ...(config.agc ? { makeAgc: () => makeAgc(config.agc) } : {}),
+  post,
+  collect
+})
 parentPort.on("message", (message) => core.onMessage(message))
 
 post({ type: "ready", loadMs: performance.now() - t0 })

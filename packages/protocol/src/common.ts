@@ -104,6 +104,11 @@ export const ErrorCode = Schema.Literals([
   "admin_required",
   /** Protocol 5: no such device (`device.admin.update`, `device.forget`) or front-end kind (`frontend.update`). */
   "unknown_device",
+  /**
+   * Protocol 6: an `audio.claim` or `text.send` would start one more voice session than `MAX_VOICE_SESSIONS` allows
+   * ("The assistant is already talking on N devices").
+   */
+  "sessions_full",
   "internal"
 ])
 export type ErrorCode = typeof ErrorCode.Type

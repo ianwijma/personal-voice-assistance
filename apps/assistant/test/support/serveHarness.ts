@@ -12,24 +12,63 @@ import { join } from "node:path"
 import type { EngineProviders, ProviderBuilder } from "../../src/serve/Engine.ts"
 import { type ServeHandle, type ServeOptions, startServe } from "../../src/serve/serveMode.ts"
 
-/** An `Stt` that drains its audio (recording what it got) and emits events pushed by the test. */
+/**
+ * An `Stt` that drains its audio (recording what it got) and emits events pushed by the test. Every `transcribe`
+ * call (one per voice session, again after each engine reload) is a stream of its own: `emit` goes to every open
+ * one (a test with one session; with none open yet, to the next that opens), `emitTo(i, …)` to the i-th open one in the order they were opened (sessions in
+ * the order they were created; a reload reopens them in that order).
+ */
 export const controlledStt = () => {
-  const queue = Effect.runSync(Queue.unbounded<SttEvent>())
   const chunks: Array<Uint8Array> = []
+  interface Open {
+    readonly queue: Queue.Queue<SttEvent>
+    readonly chunks: Array<Uint8Array>
+    readonly keep: ReturnType<typeof sttContractKeeper>
+  }
+  const open: Array<Open> = []
+  /** `emit` with no stream open (a session whose loop is still starting): for the next one that opens. */
+  const held: Array<SttEvent> = []
+  let opened = 0
   const stt = Stt.of({
     transcribe: (audio) =>
-      Stream.merge(
-        audio.pipe(Stream.tap((c) => Effect.sync(() => chunks.push(c))), Stream.drain, Stream.orDie),
-        Stream.fromQueue(queue)
-      )
+      Stream.suspend(() => {
+        // A real recogniser sends `SpeechStarted` before any transcript of an utterance; the conversation ignores
+        // transcripts without one. The keeper inserts it where a test's script leaves it out.
+        const entry: Open = { queue: Effect.runSync(Queue.unbounded<SttEvent>()), chunks: [], keep: sttContractKeeper() }
+        open.push(entry)
+        opened++
+        if (held.length > 0) push(entry, held.splice(0))
+        return Stream.merge(
+          audio.pipe(Stream.tap((c) => Effect.sync(() => {
+            chunks.push(c)
+            entry.chunks.push(c)
+          })), Stream.drain, Stream.orDie),
+          Stream.fromQueue(entry.queue)
+        ).pipe(Stream.ensuring(Effect.sync(() => {
+          const i = open.indexOf(entry)
+          if (i >= 0) open.splice(i, 1)
+        })))
+      })
   })
-  // A real recogniser sends `SpeechStarted` before any transcript of an utterance; the conversation ignores
-  // transcripts without one. The keeper inserts it where a test's script leaves it out.
-  const keep = sttContractKeeper()
+  const push = (entry: Open, events: ReadonlyArray<SttEvent>) => (entry.keep(events) as Array<SttEvent>).forEach((e) => Queue.offerUnsafe(entry.queue, e))
   return {
     stt,
+    /** Audio received by every stream. */
     chunks,
-    emit: (...events: Array<SttEvent>) => (keep(events) as Array<SttEvent>).forEach((e) => Queue.offerUnsafe(queue, e))
+    /** The audio received by the i-th open stream. */
+    chunksOf: (i: number): ReadonlyArray<Uint8Array> => open[i]?.chunks ?? [],
+    /** Streams open now, and opened since start. */
+    open: () => open.length,
+    opened: () => opened,
+    emit: (...events: Array<SttEvent>) => {
+      if (open.length === 0) held.push(...events)
+      for (const entry of open) push(entry, events)
+    },
+    emitTo: (i: number, ...events: Array<SttEvent>) => {
+      const entry = open[i]
+      if (entry === undefined) throw new Error(`no recognition stream ${i} (${open.length} open)`)
+      push(entry, events)
+    }
   }
 }
 

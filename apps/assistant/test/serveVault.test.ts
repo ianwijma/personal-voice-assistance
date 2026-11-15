@@ -172,7 +172,9 @@ describe("serve: key vault and admin access", () => {
     })
     const greeter = welcome.snapshot.modules.find((m) => m.id === "greeter")!
     expect(greeter.settings.secrets.token).toEqual({ set: false, source: "none" })
-    const refusedText = await request(b, { type: "text.send", text: "hello", speak: false })
+    // Typed on a voice page (admin connections have no voice session since protocol 6).
+    const { client: voice } = await helloed(second)
+    const refusedText = await request(voice, { type: "text.send", text: "hello", speak: false })
     expect(refusedText.error?.code).toBe("engine_failed")
 
     expect((await request(b, { type: "vault.unlock", password: PASSWORD })).ok).toBe(true)

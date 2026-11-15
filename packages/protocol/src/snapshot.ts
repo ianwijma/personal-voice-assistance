@@ -1,4 +1,5 @@
 import { Schema } from "effect"
+import { ConversationInfo, SessionInfo } from "./sessions.ts"
 import {
   AssistantState,
   ModuleId,
@@ -172,7 +173,9 @@ export const TraceInfo = Schema.Struct({
     outputLatencyMs: NonNegativeFinite,
     /** From the reply's first audio chunk arriving in the browser to playback starting (prebuffer). */
     startDelayMs: NonNegativeFinite
-  }))
+  })),
+  /** Protocol 6: the voice session the turn belongs to (its device's name), so admin can tell sessions apart. */
+  session: Schema.optionalKey(Schema.String.check(Schema.isMaxLength(64)))
 })
 export type TraceInfo = typeof TraceInfo.Type
 
@@ -226,7 +229,12 @@ export const Snapshot = Schema.Struct({
    */
   device: Schema.optionalKey(DeviceProfileInfo),
   /** Admin access as this connection sees it (also on voice connections: the voice front end links to admin). */
-  admin: AdminState
+  admin: AdminState,
+  /**
+   * Protocol 6: the conversation `history` belongs to (the device's session's; on an admin connection, or a device
+   * without a session yet, the one its next turn would start in).
+   */
+  conversation: ConversationInfo
 })
 export type Snapshot = typeof Snapshot.Type
 
@@ -253,6 +261,8 @@ export const AdminSnapshot = Schema.Struct({
   /** Every front-end kind with its defaults, in registry order. */
   frontends: Schema.Array(FrontendKindInfo),
   /** Every remembered device, most recently seen first. */
-  devices: Schema.Array(DeviceInfo)
+  devices: Schema.Array(DeviceInfo),
+  /** Protocol 6: the voice sessions, most recently active first (`sessions`). */
+  sessions: Schema.Array(SessionInfo)
 })
 export type AdminSnapshot = typeof AdminSnapshot.Type

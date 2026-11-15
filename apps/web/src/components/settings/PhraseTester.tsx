@@ -5,6 +5,7 @@ import { normalisePhrase, phraseFromHeard } from "@/lib/profileForm.ts"
 import { displayPhrase, type HeardLine, heardOutcome, profileOf } from "@/lib/state.ts"
 import { shallowEqual } from "@/lib/store.ts"
 import { useClient, useClientState } from "../context.tsx"
+import { inputClass } from "../fields/types.ts"
 import { Icon, Spinner } from "../ui/Icon.tsx"
 import { Button, cx } from "../ui/controls.tsx"
 
@@ -49,8 +50,9 @@ export const ownSettingsNote = (name: string, overridden: ReadonlyArray<string>)
 }
 
 /**
- * The phrase tester (docs/FRONTENDS-AND-ACTIVATION.md §5): while on, what the recogniser hears from the device that
- * has the audio, line by line, marked matched (with the phrase), accepted without a phrase (always
+ * The phrase tester (docs/FRONTENDS-AND-ACTIVATION.md §5): while on, what the recogniser hears from one device's voice
+ * session (protocol 6: picked in "Listen to" when several devices have one; by default the most recently active
+ * device that is talking), line by line, marked matched (with the phrase), accepted without a phrase (always
  * listening, or inside an armed or follow-up window) or ignored; `Add "…"` turns a mishearing into a
  * phrase of its own. Lines are judged by the server with that device's saved, effective settings, so the tester says
  * which device it tests, whether that device has its own wake settings, and that unsaved edits on this page are not
@@ -66,12 +68,23 @@ export function PhraseTester({ onAdd, phrases: draftPhrases = [], savedPhrases =
   const client = useClient()
   const heard = useClientState((s) => s.heard)
   const phrases = useClientState((s) => s.frontends[0]?.profile.wakePhrases ?? profileOf(s).wakePhrases, shallowEqual)
+  /** "Listen to": a device id, or "" for the most recently active session. */
+  const [chosen, setChosen] = useState("")
+  const choices = useClientState(
+    (s) => s.sessions.flatMap((x) => (x.deviceId === undefined ? [] : [`${x.deviceId}\u0000${x.name}`])),
+    shallowEqual
+  )
   const owner = useClientState(
     (s) => {
-      if (!s.session.ownerPresent) return undefined
-      const d = s.devices.find((x) => x.audioOwner)
+      const session = chosen !== ""
+        ? s.sessions.find((x) => x.deviceId === chosen)
+        : s.sessions.find((x) => x.ownerPresent)
+      // A server that lists no sessions: the device that has the audio.
+      const deviceId = session !== undefined ? session.deviceId : s.sessions.length === 0 ? s.devices.find((x) => x.audioOwner)?.id : undefined
+      if (session === undefined && deviceId === undefined) return undefined
+      const d = s.devices.find((x) => x.id === deviceId)
       return d === undefined
-        ? { id: undefined, name: "another device", own: "" }
+        ? { id: undefined, name: session?.name ?? "another device", own: "" }
         : { id: d.id, name: d.name, own: WAKE_FIELDS.filter((f) => Object.hasOwn(d.overrides, f)).join(",") }
     },
     shallowEqual
@@ -106,7 +119,7 @@ export function PhraseTester({ onAdd, phrases: draftPhrases = [], savedPhrases =
     client.store.dispatch({ type: "local/heard-clear" })
     setAdded({})
     setErrors({})
-    const result = await client.wakeTest(true) // continuation(none): only this component's own state
+    const result = await client.wakeTest(true, chosen === "" ? undefined : chosen) // continuation(none): only this component's own state
     setBusy(false)
     if (result.ok) {
       setUntil(Date.now() + WAKE_TEST_MAX_MS)
@@ -138,6 +151,17 @@ export function PhraseTester({ onAdd, phrases: draftPhrases = [], savedPhrases =
     if (onRef.current && client.store.get().admin.loggedIn) void client.wakeTest(false) // continuation(none): fire and forget on unmount
   }, [client])
 
+  /** A different device while listening: its lines only from now on. */
+  const choose = async (deviceId: string) => {
+    setChosen(deviceId)
+    if (!onRef.current) return
+    client.store.dispatch({ type: "local/heard-clear" })
+    setAdded({})
+    setErrors({})
+    const result = await client.wakeTest(true, deviceId === "" ? undefined : deviceId) // continuation(none): only a toast
+    if (!result.ok) client.store.dispatch({ type: "local/toast", message: result.error?.message ?? "The tester could not switch devices.", tone: "error" })
+  }
+
   const lines = [...heard].reverse()
   return (
     <div className="flex flex-col gap-3 rounded-md border border-line bg-surface-2/30 p-3" data-testid="phrase-tester" data-on={on ? "true" : "false"}>
@@ -164,6 +188,25 @@ export function PhraseTester({ onAdd, phrases: draftPhrases = [], savedPhrases =
           </Button>
         )}
       </div>
+      {(choices.length > 1 || chosen !== "") && (
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
+          <label htmlFor="tester-device" className="text-[13px] text-ink-muted">Listen to</label>
+          <select
+            id="tester-device"
+            data-testid="tester-device"
+            value={chosen}
+            onChange={(e) => void choose(e.target.value)}
+            className={cx(inputClass, "w-auto min-w-0 max-w-full flex-1 max-sm:h-11 sm:flex-none")}
+          >
+            <option value="">The device talking most recently</option>
+            {choices.map((c) => {
+              const [deviceId, name] = c.split("\u0000") as [string, string]
+              return <option key={deviceId} value={deviceId}>{name}</option>
+            })}
+            {chosen !== "" && !choices.some((c) => c.startsWith(`${chosen}\u0000`)) && <option value={chosen}>A device without a session now</option>}
+          </select>
+        </div>
+      )}
       {owner !== undefined && owner.own !== "" && owner.id !== undefined && (
         <p className="text-[13px] text-ink-muted" data-testid="tester-own-settings">
           {ownSettingsNote(owner.name, owner.own.split(","))}{" "}

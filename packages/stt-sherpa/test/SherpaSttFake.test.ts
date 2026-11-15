@@ -3,7 +3,7 @@
  */
 import { assert, describe, it } from "@effect/vitest"
 import type { SttEvent } from "@pva/core"
-import { Effect, Stream } from "effect"
+import { Effect, Fiber, Stream } from "effect"
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
@@ -195,4 +195,64 @@ describe("SherpaStt (stand-in worker): a worker that does not answer close", () 
       assert.strictEqual(orphans(), 0)
       yield* Effect.scoped(makeWithWorker(options, { url: fakeWorker }))
     }))
+})
+
+describe("SherpaStt (stand-in worker): several transcriptions at once on one worker", () => {
+  const options = { model: "parakeet-v2" as const, agc: false }
+  const tags = (events: ReadonlyArray<SttEvent>) => events.map((e) => ("text" in e ? `${e._tag}(${e.text})` : e._tag)).join(" ")
+
+  it.live("two concurrent transcriptions each get their own turns", () =>
+    Effect.gen(function*() {
+      const stt = yield* makeWithWorker({ ...options, modelDir: fakeModelDir() }, { url: fakeWorker, data: { wordsOfAudio: true, frameDelayMs: 1, decodeMs: 30 } })
+      const [a, b] = yield* Effect.all([
+        Stream.runCollect(stt.transcribe(audio([[8, 300], [false, 700], [6, 300], [false, 700]]))),
+        Stream.runCollect(stt.transcribe(audio([[false, 200], [5, 400], [false, 700]])))
+      ], { concurrency: "unbounded" })
+      assert.deepStrictEqual(turns([...a]), ["w8", "w6"], tags([...a]))
+      assert.deepStrictEqual(turns([...b]), ["w5"], tags([...b]))
+    }).pipe(Effect.scoped))
+
+  it.live("two concurrent streaming transcriptions each get their own turns", () =>
+    Effect.gen(function*() {
+      const stt = yield* makeWithWorker({ model: "nemotron-560", modelDir: fakeModelDir("nemotron-560"), agc: false }, {
+        url: fakeStreamingWorker,
+        data: { frameDelayMs: 1 }
+      })
+      const [a, b] = yield* Effect.all([
+        Stream.runCollect(stt.transcribe(audio([[8, 300], [false, 700], [6, 300], [false, 700]]))),
+        Stream.runCollect(stt.transcribe(audio([[5, 300], [false, 300], [3, 300], [false, 700]])))
+      ], { concurrency: "unbounded" })
+      assert.deepStrictEqual(turns([...a]), ["w8", "w6"], tags([...a]))
+      assert.deepStrictEqual(turns([...b]), ["w5 w3"], tags([...b]))
+    }).pipe(Effect.scoped))
+
+  it.live("closing one transcription leaves the other running, and a new one can start beside it", () =>
+    Effect.gen(function*() {
+      const stt = yield* makeWithWorker({ ...options, modelDir: fakeModelDir() }, { url: fakeWorker, data: { wordsOfAudio: true, frameDelayMs: 1, decodeMs: 30 } })
+      const [a, b] = yield* Effect.all([
+        Stream.runCollect(stt.transcribe(audio([[9, 300], [false, 700], [8, 300], [false, 700]]))),
+        // Closed after its first event, while the first one still has most of its audio to go.
+        Stream.runCollect(stt.transcribe(audio([[3, 2_000], [false, 700]])).pipe(Stream.take(1)))
+      ], { concurrency: "unbounded" })
+      assert.deepStrictEqual(turns([...a]), ["w9", "w8"], tags([...a]))
+      assert.deepStrictEqual([...b], [{ _tag: "SpeechStarted" }])
+      // The worker still serves a new transcription.
+      const c = yield* Stream.runCollect(stt.transcribe(audio([[2, 300], [false, 700]])))
+      assert.deepStrictEqual(turns([...c]), ["w2"])
+    }).pipe(Effect.scoped))
+
+  it.live("a worker crash fails every open transcription", () =>
+    Effect.gen(function*() {
+      // Session 2's first audio kills the thread while session 1 is still waiting for its frames.
+      const stt = yield* makeWithWorker({ ...options, modelDir: fakeModelDir() }, { url: fakeWorker, data: { exitOnAudioOf: 2, frameDelayMs: 2 } })
+      const first = yield* Effect.forkChild(Effect.exit(Stream.runDrain(stt.transcribe(audio([[true, 3_000], [false, 700]])))))
+      yield* Effect.sleep(20)
+      const second = yield* Effect.exit(Stream.runDrain(stt.transcribe(audio([[true, 300], [false, 700]]))))
+      const a = yield* Fiber.join(first)
+      assert.strictEqual(a._tag, "Failure")
+      assert.strictEqual(second._tag, "Failure")
+      // A later transcription fails at once with the same error.
+      const third = yield* Effect.exit(Stream.runDrain(stt.transcribe(audio([[true, 100]]))))
+      assert.strictEqual(third._tag, "Failure")
+    }).pipe(Effect.scoped))
 })

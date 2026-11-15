@@ -1,6 +1,7 @@
 import {
   type AdminState,
   type AssistantState,
+  type ConversationInfo,
   DEFAULT_DEVICE_PROFILE,
   type DeviceInfo,
   type DeviceProfile,
@@ -17,6 +18,7 @@ import {
   type Role,
   type ServerMessage,
   type ServerMessageType,
+  type SessionInfo,
   type SettingsSection,
   type TraceInfo,
   type TurnSource,
@@ -158,6 +160,24 @@ export interface ClientState {
   readonly models: ReadonlyArray<ModelSet>
   readonly jobs: ReadonlyArray<JobInfo>
   readonly turns: ReadonlyArray<TurnView>
+  /**
+   * Protocol 6: the device's conversation the chat shows (`snapshot.conversation`, `conversation`); undefined before
+   * the first `welcome`.
+   */
+  readonly conversation: ConversationInfo | undefined
+  /**
+   * The chat starts with a divider: a new conversation began while this page was open (`new`: New conversation;
+   * `idle`: it had been quiet for a while). Undefined: no divider (the page opened on this conversation).
+   */
+  readonly divider: "new" | "idle" | undefined
+  /**
+   * Turn ids of the conversation that was replaced: late messages about them (the stopped turn's `turn.end`) are
+   * dropped instead of showing up in the new conversation. A `turn.start` with the same id (ids restart at 1 per
+   * conversation) is a turn of the new one.
+   */
+  readonly staleTurns: ReadonlyArray<number>
+  /** Admin: the voice sessions, most recently active first (`admin.snapshot.sessions`, `sessions`). */
+  readonly sessions: ReadonlyArray<SessionInfo>
   readonly liveTranscript: string
   readonly traces: ReadonlyArray<TraceInfo>
   readonly pending: Readonly<Record<string, PendingRequest>>
@@ -213,6 +233,10 @@ export const initialState: ClientState = {
   models: [],
   jobs: [],
   turns: [],
+  conversation: undefined,
+  divider: undefined,
+  staleTurns: [],
+  sessions: [],
   liveTranscript: "",
   traces: [],
   pending: {},
@@ -232,6 +256,7 @@ const adminPart = {
   traces: initialState.traces,
   frontends: initialState.frontends,
   devices: initialState.devices,
+  sessions: initialState.sessions,
   heard: initialState.heard,
   adminReady: false
 } satisfies Partial<ClientState>
@@ -308,7 +333,10 @@ const withTurn = (
   create: () => TurnView = () => newTurn(`t${turnId}`, { turnId, source: "voice", spoken: true })
 ): ClientState => {
   const idx = findTurn(s.turns, turnId)
-  if (idx === -1) return { ...s, turns: capTurns([...s.turns, f(create())]) }
+  if (idx === -1) {
+    if (s.staleTurns.includes(turnId)) return s // a turn of the conversation that was replaced
+    return { ...s, turns: capTurns([...s.turns, f(create())]) }
+  }
   const turns = s.turns.slice()
   turns[idx] = f(turns[idx]!)
   return { ...s, turns }
@@ -367,6 +395,8 @@ const server: ServerHandlers = {
     // A reconnect with a valid admin token keeps the admin data on screen until the new `admin.snapshot` replaces it.
     ...(m.snapshot.admin.loggedIn ? pickAdmin(s) : {}),
     turns: historyToTurns(m.snapshot.history),
+    conversation: m.snapshot.conversation,
+    divider: dividerAfterWelcome(s, m.snapshot.conversation, m.snapshot.history.length),
     toasts: s.toasts,
     ui: s.ui
   }),
@@ -382,6 +412,7 @@ const server: ServerHandlers = {
     traces: m.snapshot.traces.slice(-MAX_TRACES),
     frontends: m.snapshot.frontends,
     devices: m.snapshot.devices,
+    sessions: m.snapshot.sessions,
     adminReady: true
   }),
   "engine.summary": (s, m) => ({ ...s, summary: m.engine }),
@@ -396,6 +427,17 @@ const server: ServerHandlers = {
   }),
   frontends: (s, m) => ({ ...s, frontends: m.frontends }),
   devices: (s, m) => ({ ...s, devices: m.devices }),
+  // Protocol 6. A new conversation (New conversation, or after being quiet for a while) starts with an empty chat and a
+  // divider; `resumed` only says which conversation goes on (the chat stays).
+  conversation: (s, m) => {
+    const conversation = { id: m.id, startedAt: m.startedAt }
+    if (m.reason === "resumed") return { ...s, conversation }
+    const stale = s.turns.flatMap((t) => (t.turnId === undefined ? [] : [t.turnId]))
+    return { ...s, conversation, divider: m.reason, turns: [], staleTurns: stale, liveTranscript: "", ui: { ...s.ui, unread: 0 } }
+  },
+  sessions: (s, m) => ({ ...s, sessions: m.sessions }),
+  // Admin: a session's finished turn (admin gets no turn.end); turn ids repeat across sessions, so it is appended.
+  trace: (s, m) => ({ ...s, traces: [...s.traces, m.trace].slice(-MAX_TRACES) }),
   // The phrase and the request in one sentence (`armed: false`): a turn follows, nothing to show.
   wake: (s, m) => (m.armed ? { ...s, woke: { phrase: m.phrase } } : s),
   "wake.heard": (s, m) => ({
@@ -414,8 +456,9 @@ const server: ServerHandlers = {
   },
   transcript: (s, m) => (s.liveTranscript === m.text ? s : { ...s, liveTranscript: m.text }),
   "turn.start": (s, m) => {
+    const fresh = s.staleTurns.includes(m.turnId) ? { ...s, staleTurns: s.staleTurns.filter((id) => id !== m.turnId) } : s
     const next = withTurn(
-      s,
+      fresh,
       m.turnId,
       (t) => ({ ...t, source: m.source, userText: m.userText, spoken: m.spoken }),
       () => newTurn(`t${m.turnId}`, { turnId: m.turnId, source: m.source, userText: m.userText, spoken: m.spoken })
@@ -460,6 +503,7 @@ const server: ServerHandlers = {
         }]
     })),
   "turn.end": (s, m) => {
+    if (findTurn(s.turns, m.turnId) === -1 && s.staleTurns.includes(m.turnId)) return s
     const next = withTurn(s, m.turnId, (t) => ({ ...t, outcome: m.outcome, trace: m.trace }))
     const traces = [...next.traces.filter((t) => t.turnId !== m.trace.turnId), m.trace].slice(-MAX_TRACES)
     const unread = next.ui.chatOpen ? next.ui.unread : next.ui.unread + 1
@@ -489,6 +533,8 @@ const server: ServerHandlers = {
   },
   error: (s, m) => {
     const e = m.error
+    // Refused Start: the client closes the microphone and shows it as the start error (`client.ts`), not as a toast.
+    if (e.code === "sessions_full") return s
     let next = s
     if (e.turnId !== undefined) next = withTurn(next, e.turnId, (t) => ({ ...t, error: describeError(e) }))
     return addToast(next, describeError(e), e.code === "mic_gap" ? "info" : "error")
@@ -559,9 +605,20 @@ function pickAdmin(s: ClientState): Partial<ClientState> {
     traces: s.traces,
     frontends: s.frontends,
     devices: s.devices,
+    sessions: s.sessions,
     heard: s.heard,
     adminReady: s.adminReady
   }
+}
+
+/**
+ * The divider after a (re)connect: kept while the conversation is the same one; a different conversation with nothing
+ * in it yet (it was replaced while this page was away) gets "New conversation"; the first connect shows none.
+ */
+function dividerAfterWelcome(s: ClientState, next: ConversationInfo, historyLength: number): ClientState["divider"] {
+  if (s.conversation === undefined) return undefined
+  if (s.conversation.id === next.id) return s.divider
+  return historyLength === 0 ? "new" : undefined
 }
 
 function withoutPlaying(audio: ClientState["audio"]): ClientState["audio"] {

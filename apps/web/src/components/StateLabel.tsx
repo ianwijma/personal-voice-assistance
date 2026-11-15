@@ -69,7 +69,7 @@ export function StateLabel() {
   )
 }
 
-/** This tab watches: another tab or device has the audio. */
+/** This tab watches: another tab of this device has the audio (protocol 6: other devices have sessions of their own). */
 const observing = (s: Parameters<typeof visualState>[0]) => s.session.ownerPresent && !(s.session.role === "owner" && s.audio.phase !== "off")
 
 /**

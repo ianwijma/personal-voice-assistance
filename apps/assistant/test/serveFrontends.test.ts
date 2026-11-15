@@ -353,16 +353,16 @@ describe("front-end kinds and devices", () => {
     expect(again.devices.find((d) => d.id === "tablet-001")?.overrides).toEqual({})
   })
 
-  it("the audio owner's profile decides the echo gate's interrupt mode, live", async () => {
+  it("the device profile decides its session's echo-gate interrupt mode, live", async () => {
     const { server, stt } = await start()
     const admin = await adminPage(server)
     const owner = await voicePage(server, { deviceId: "speaker-01" })
     await owner.client.claim()
-    expect(server.handle.hub.ownerMode()).toBe("instant")
+    expect(server.handle.sessions.get("speaker-01")?.gate.mode()).toBe("instant")
     await deviceKnown(admin.client, "speaker-01")
     expect((await request(admin.client, { type: "device.admin.update", id: "speaker-01", patch: { interruptMode: "manual" } })).ok).toBe(true)
     await profileOf(owner.client, (m) => m.profile.interruptMode === "manual")
-    expect(server.handle.hub.ownerMode()).toBe("manual")
+    expect(server.handle.sessions.get("speaker-01")?.gate.mode()).toBe("manual")
     // Manual: talking during the reply does not interrupt it.
     stt.emit(endOfTurn("tell me"))
     await owner.client.waitFor("assistant.playing", () => true, { timeoutMs: 10_000 })
@@ -373,7 +373,7 @@ describe("front-end kinds and devices", () => {
     // Back to the kind default (instant).
     expect((await request(admin.client, { type: "device.admin.update", id: "speaker-01", patch: { interruptMode: null } })).ok).toBe(true)
     await profileOf(owner.client, (m) => m.profile.interruptMode === "instant")
-    expect(server.handle.hub.ownerMode()).toBe("instant")
+    expect(server.handle.sessions.get("speaker-01")?.gate.mode()).toBe("instant")
   })
 
   it("per-device voice: the owner's profile voice speaks its replies; empty = the assistant's default", async () => {
@@ -426,7 +426,7 @@ describe("wake phrase in serve mode", () => {
 
   it("ignored talk produces no turn, no caption, no history, nothing for the model; only the tester sees it", async () => {
     const { server, stt, llm, owner, admin } = await wakeServer()
-    const observer = await voicePage(server)
+    const observer = await voicePage(server, { deviceId: owner.device.id })
     stt.emit(speechStarted, interim("what is the weather like"), endOfTurn("what is the weather like"))
     const heard = await admin.waitFor("wake.heard", () => true, { from: 0 })
     expect(heard).toMatchObject({ text: "what is the weather like", accepted: false })
@@ -438,7 +438,7 @@ describe("wake phrase in serve mode", () => {
       expect(JSON.stringify(c.messages)).not.toContain("weather")
     }
     expect(llm.requests).toEqual([])
-    const late = await voicePage(server)
+    const late = await voicePage(server, { deviceId: owner.device.id })
     expect(late.welcome.snapshot.history).toEqual([])
     expect(late.welcome.snapshot.state).toBe("asleep")
   })

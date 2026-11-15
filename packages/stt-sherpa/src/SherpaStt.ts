@@ -296,17 +296,19 @@ export const makeWithWorker = (
     )
     yield* Effect.logInfo(`Local speech model ${name} loaded in ${Math.round(loadMs)} ms`)
 
-    // One worker, one recogniser stream: one transcription at a time.
-    let session: Session | undefined
+    // One worker (one loaded model), any number of concurrent transcriptions: each is a session of its own in the
+    // worker (its own VAD and turn state) and here (its own TurnDetector). A crash fails every open one.
+    const open = new Map<number, Session>()
     let sessions = 0
     let crashed: SttError | undefined
     const crash = (error: SttError) => {
       if (closing || crashed) return
       crashed = error
-      session?.fail(error)
+      for (const session of [...open.values()]) session.fail(error)
     }
     worker.on("message", (message: WorkerMessage) => {
-      if (session && "session" in message && message.session === session.id) session.onMessage(message)
+      if (!("session" in message)) return
+      open.get(message.session)?.onMessage(message)
     })
     worker.on("error", (cause) => crash(new SttError({ message: `Speech worker crashed: ${cause.message}`, cause })))
     worker.on("exit", (code) => {
@@ -318,7 +320,6 @@ export const makeWithWorker = (
       Stream.callback<SttEvent, SttError>((queue) =>
         Effect.gen(function*() {
           if (crashed) return yield* crashed
-          if (session) return yield* new SttError({ message: "The local recogniser is already transcribing" })
           const runLog = Effect.runForkWith(yield* Effect.context<never>())
           const id = ++sessions
           const detector = new TurnDetector({ policy, minSpeechMs, cumulative })
@@ -342,7 +343,7 @@ export const makeWithWorker = (
             }
           }
 
-          session = {
+          open.set(id, {
             id,
             fail: (error) => Queue.failCauseUnsafe(queue, Cause.fail(error)),
             onMessage: (message) => {
@@ -381,14 +382,15 @@ export const makeWithWorker = (
                   return
               }
             }
-          }
+          })
+          // Closing this transcription ends only its session in the worker; the others keep running.
           yield* Effect.addFinalizer(() =>
             Effect.sync(() => {
-              session = undefined
-              if (!crashed && !closing) worker.postMessage({ type: "reset", session: 0 })
+              open.delete(id)
+              if (!crashed && !closing) worker.postMessage({ type: "end", session: id })
             })
           )
-          worker.postMessage({ type: "reset", session: id })
+          worker.postMessage({ type: "open", session: id })
 
           // Per batch of chunks: one memcpy into a fresh buffer that is transferred, not cloned.
           const send = (chunks: ReadonlyArray<Uint8Array>) => {

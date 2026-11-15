@@ -102,7 +102,7 @@ test("Stop: the page stops at once, sends interrupt then playback.stopped, answe
   expect(end.at - interrupt.at).toBeLessThan(300)
   expect(log.filter((m) => m.msg.type === "error").map((m) => JSON.stringify(m.msg))).toEqual([])
   expect(log.some((m) => m.msg.type === "playback.finished")).toBe(false)
-  const history = await serverHistory(assistant.url)
+  const history = await serverHistory(assistant.url, page)
   expect(history.at(-1)).toMatchObject({ role: "assistant", interrupted: true })
   expect(history.at(-1)!.text.length).toBeLessThan(LONG.length)
   expect(history.at(-1)!.text.length).toBeGreaterThan(0)
@@ -205,7 +205,7 @@ test("cross-origin isolation as configured; the worklets load; Stop mid-reply gi
   expect(stopped[0]!.msg.exact).toBe(true)
   expect(new Set(stopped.map((m) => m.msg.playedSamples)).size).toBe(1)
   expect(end.at - interrupt.at).toBeLessThan(300)
-  const history = await serverHistory(assistant.url)
+  const history = await serverHistory(assistant.url, page)
   expect(history.at(-1)).toMatchObject({ role: "assistant", interrupted: true })
   expect(history.at(-1)!.text.length).toBeGreaterThan(0)
   expect(history.at(-1)!.text.length).toBeLessThan(LONG.length)
@@ -263,7 +263,7 @@ test("two pages: the second observes, takes the audio mid-reply, and the first b
     await expect(a.locator("[data-testid=turn][data-outcome=running]")).toHaveCount(0)
     await expect(b.locator("[data-testid=turn][data-outcome=running]")).toHaveCount(0)
     // History holds only the part that A played.
-    const history = await serverHistory(assistant.url)
+    const history = await serverHistory(assistant.url, a)
     const reply = history.at(-1)!
     expect(reply.role).toBe("assistant")
     expect(reply.text.length).toBeLessThan(LONG.length)

@@ -16,14 +16,21 @@ import { controlledStt, fakeBuild, greeterModule, markedPcm, scriptedLlm, startT
 
 let server: TestServer | undefined
 const clients: Array<ScriptedClient> = []
+/**
+ * Protocol 6: every device has its own voice session. These tests are about the tabs of one device (one owner,
+ * observers, takeover within the device), so every tab of a test is the same device unless it says otherwise
+ * (`serveSessions.test.ts` has several devices).
+ */
+let deviceId = `dev-${Math.random().toString(36).slice(2)}`
 afterEach(async () => {
   for (const c of clients.splice(0)) c.close()
   await server?.close()
   server = undefined
+  deviceId = `dev-${Math.random().toString(36).slice(2)}`
 })
 
 const connect = async (options: Partial<Parameters<typeof ScriptedClient.connect>[0]> = {}) => {
-  const client = await ScriptedClient.connect({ url: server!.url, ...options })
+  const client = await ScriptedClient.connect({ url: server!.url, deviceId, ...options })
   clients.push(client)
   return client
 }
@@ -53,7 +60,7 @@ describe("serve: handshake", () => {
     expect(welcome.snapshot.state).toBe("idle")
     expect(welcome.snapshot.engine).toEqual({ ready: true, state: "ready", voices: [{ name: "standard", description: "Everyday answers.", isDefault: true }] })
     expect(welcome.snapshot.history).toEqual([])
-    expect(Object.keys(welcome.snapshot).sort()).toEqual(["admin", "device", "engine", "history", "ownerPresent", "role", "state"])
+    expect(Object.keys(welcome.snapshot).sort()).toEqual(["admin", "conversation", "device", "engine", "history", "ownerPresent", "role", "state"])
     const admin = await connect()
     const { snapshot } = await admin.admin(TEST_ADMIN_PASSWORD)
     expect(snapshot.engine.state).toBe("ready")
@@ -234,6 +241,35 @@ describe("serve: interruptions", () => {
     expect(llm.requests.at(-1)!.messages.map((m: any) => [m.role, m.content])).toEqual([["user", "first"], ["user", "second"]])
   })
 
+  it("conversation.new: stops the turn, empties the history, new id for every tab of the device", async () => {
+    const stt = controlledStt()
+    const llm = scriptedLlm((t) => `Reply to ${t}.`, { firstTokenMs: 400 })
+    server = await startTestServer({ build: fakeBuild({ stt: stt.stt, llm: llm.llm }) })
+    const owner = await connect()
+    const first = await owner.hello()
+    const other = await connect()
+    await other.hello()
+    owner.send({ type: "text.send", requestId: "t1", text: "first", speak: false })
+    expect((await owner.waitFor("turn.end", () => true, { timeoutMs: 10_000 })).outcome).toBe("completed")
+    owner.send({ type: "text.send", requestId: "t2", text: "second", speak: false })
+    const start = await owner.waitFor("turn.start", (m) => m.userText === "second", { timeoutMs: 10_000 })
+    owner.send({ type: "conversation.new", requestId: "n1" })
+    expect((await owner.waitFor("result", (m) => m.requestId === "n1")).ok).toBe(true)
+    expect((await owner.waitFor("turn.end", (m) => m.turnId === start.turnId, { from: owner.messages.indexOf(start) })).outcome).toBe("interrupted")
+    const told = await other.waitFor("conversation")
+    expect(told.reason).toBe("new")
+    expect(told.id).not.toBe(first.snapshot.conversation.id)
+    const later = await connect()
+    const welcome = await later.hello()
+    expect(welcome.snapshot.history).toEqual([])
+    expect(welcome.snapshot.conversation.id).toBe(told.id)
+    // The next turn starts from nothing.
+    const from = owner.messages.length
+    owner.send({ type: "text.send", requestId: "t3", text: "third", speak: false })
+    expect((await owner.waitFor("turn.end", () => true, { from, timeoutMs: 10_000 })).outcome).toBe("completed")
+    expect(llm.requests.at(-1)!.messages.map((m: any) => [m.role, m.content])).toEqual([["user", "third"]])
+  })
+
   it("claiming again while already the owner does not stop the reply", async () => {
     const { stt } = await basic(() => "Short reply here.")
     const owner = await connect()
@@ -342,12 +378,15 @@ describe("serve: modules and settings", () => {
 
   it("a module change applies from the next turn's system prompt", async () => {
     const { stt, llm } = await basic(() => "Ok.")
+    // Typed on a voice page (protocol 6: admin connections have no voice session), configured on the admin page.
     const owner = await connect()
-    await owner.admin(TEST_ADMIN_PASSWORD)
+    await owner.hello()
+    const admin = await connect()
+    await admin.admin(TEST_ADMIN_PASSWORD)
     owner.send({ type: "text.send", requestId: "t1", text: "one", speak: false })
     await owner.waitFor("turn.end", () => true, { timeoutMs: 10_000 })
-    owner.send({ type: "module.configure", requestId: "c1", moduleId: "greeter", patch: { values: { greeting: "hoi" }, secrets: {} } })
-    await owner.waitFor("result", (m) => m.requestId === "c1")
+    admin.send({ type: "module.configure", requestId: "c1", moduleId: "greeter", patch: { values: { greeting: "hoi" }, secrets: {} } })
+    await admin.waitFor("result", (m) => m.requestId === "c1")
     const from = owner.messages.length
     owner.send({ type: "text.send", requestId: "t2", text: "two", speak: false })
     await owner.waitFor("turn.end", () => true, { from, timeoutMs: 10_000 })
@@ -362,8 +401,11 @@ describe("serve: modules and settings", () => {
     const b = await connect()
     await a.admin(TEST_ADMIN_PASSWORD)
     await b.admin(TEST_ADMIN_PASSWORD)
-    a.send({ type: "text.send", requestId: "t1", text: "before reload", speak: false })
-    await a.waitFor("turn.end", () => true, { timeoutMs: 10_000 })
+    // Typed on a voice page: admin connections have no voice session (protocol 6).
+    const voice = await connect()
+    await voice.hello()
+    voice.send({ type: "text.send", requestId: "t1", text: "before reload", speak: false })
+    await voice.waitFor("turn.end", () => true, { timeoutMs: 10_000 })
 
     a.send({ type: "settings.update", requestId: "s1", sectionId: "stt-timing", patch: { values: { STT_SHERPA_FINAL_SILENCE_MS: 500 }, secrets: {} } })
     expect((await a.waitFor("result", (m) => m.requestId === "s1")).ok).toBe(true)
@@ -440,9 +482,11 @@ describe("serve: choosing the speech recognition model", () => {
     expect(result.error?.message).toContain("the running ones are kept")
     expect(result.error?.message).toContain("download-models parakeet-v2")
     expect(a.messages.slice(from).filter((m) => m.type === "engine")).toEqual([])
-    // Still listening: a spoken turn is answered by the engines that kept running.
-    a.send({ type: "text.send", requestId: "t1", text: "still there?", speak: false })
-    const end = await a.waitFor("turn.end", () => true, { timeoutMs: 10_000 })
+    // Still listening: a turn is answered by the engines that kept running (typed on a voice page).
+    const voice = await connect()
+    await voice.hello()
+    voice.send({ type: "text.send", requestId: "t1", text: "still there?", speak: false })
+    const end = await voice.waitFor("turn.end", () => true, { timeoutMs: 10_000 })
     expect(end.type).toBe("turn.end")
     void stt
   })

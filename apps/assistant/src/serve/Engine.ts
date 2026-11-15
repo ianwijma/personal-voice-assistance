@@ -1,38 +1,20 @@
-import {
-  type AgentTurnSetup,
-  type AudioInput,
-  AudioOutput,
-  type ConversationEvent,
-  type ConversationInput,
-  type HostResult,
-  Llm,
-  makeAgentConversation,
-  makeConversationWithSetup,
-  makeVoiceRouter,
-  type Message,
-  Stt,
-  type SttEvent,
-  Tts,
-  type TurnSetup,
-  TurnTrace,
-  type Voice
-} from "@pva/core"
+import { type HostResult, Llm, makeVoiceRouter, Stt, type Voice } from "@pva/core"
 import type { EngineInfo, EngineStatus, VoiceInfo } from "@pva/protocol"
 import * as SherpaStt from "@pva/stt-sherpa"
 import * as SherpaTts from "@pva/tts-sherpa"
-import { Cause, Config, ConfigProvider, Context, Deferred, Effect, Exit, Fiber, Queue, Schema, type Scope, Stream } from "effect"
+import { Cause, Config, ConfigProvider, Context, Deferred, Effect, Exit, Fiber, FiberSet, Schema, type Scope } from "effect"
 import { AppConfig } from "../config.ts"
 import { LlmLayer, SttLayer } from "../providers.ts"
 import { buildStages } from "../startup.ts"
 import { builtVoices, loadVoiceSettings, providerOf, voiceCatalog, voiceConfigProvider, voiceStages } from "../voices.ts"
 
 /**
- * The engines of serve mode (docs/UI-AND-MODULES.md §1.7, §4.5): providers
- * (voices → router), the `Conversation` and the voice loop, in one scope that
- * can be rebuilt in-process (`reload`) while the HTTP server, the sockets, the
- * module host and the audio owner stay. The conversation history is carried
- * over. A build failure becomes `state: "failed"` with per-stage problems
- * instead of exiting, so settings stay editable from the UI.
+ * The shared engines of serve mode (docs/UI-AND-MODULES.md §1.7, §4.5; docs/VOICE-SESSIONS.md §2): the providers
+ * (language model, speech-to-text, voices), in one scope that can be rebuilt in-process (`reload`) while the HTTP
+ * server, the sockets, the module host and the voice sessions stay. It owns no conversation: every voice session
+ * attaches its loop (`attach`), which runs on each build and is stopped (keeping that session's history) when the
+ * build ends. A build failure becomes `state: "failed"` with per-stage problems instead of exiting, so settings stay
+ * editable from the UI.
  */
 
 export class EngineBuildProblems extends Schema.TaggedError<EngineBuildProblems>()("EngineBuildProblems", {
@@ -156,30 +138,15 @@ export interface EngineOptions {
   readonly preflight?: Effect.Effect<void, EngineBuildProblems>
   /** Environment over saved settings: what the providers read. Evaluated at every build. */
   readonly configProvider: () => ConfigProvider.ConfigProvider
-  readonly input: AudioInput["Service"]
-  readonly output: AudioOutput["Service"]
-  readonly turnTrace: TurnTrace["Service"]
-  /** The turn setup (system prompt and tools), read at the start of each turn. */
-  readonly setup: Effect.Effect<TurnSetup>
-  readonly onEvent: (event: ConversationEvent) => void
-  /** The recognition stream on its way to the conversation (echo gate, transcript, state). */
-  readonly gate: (events: Stream.Stream<SttEvent, unknown>) => Stream.Stream<SttEvent, unknown>
-  /** The default voice chosen in the settings now (live). */
+  /** The default voice chosen in the settings now (`DEFAULT_VOICE`, live). */
   readonly defaultVoice: () => string
   readonly onStatus: (status: EngineStatus) => void
-  /**
-   * An agent conversation for these providers (`LLM_PROVIDER=claude-subscription`), read at the start of each turn;
-   * `undefined`: the single-model conversation over `providers.llm` with `setup`.
-   */
-  readonly agentSetup?: (providers: EngineProviders) => Effect.Effect<AgentTurnSetup> | undefined
   /** Adjust the engine list shown (live details such as an agent module's model). Applied on every status. */
   readonly describeEngines?: (engines: ReadonlyArray<EngineInfo>) => ReadonlyArray<EngineInfo>
   /** Reword build problems for the owner (a missing key while the key vault is locked). */
   readonly explainProblems?: (
     problems: ReadonlyArray<{ readonly stage: string; readonly message: string }>
   ) => ReadonlyArray<{ readonly stage: string; readonly message: string }>
-  /** Typed inputs accepted but not yet taken by the conversation, at most. Default 4. */
-  readonly maxPendingInputs?: number
   /**
    * For a build that failed for a reason that clears by itself: what to wait for before building again on its own
    * (`undefined`: no retry, the owner reloads). Default `retryWhenPreviousModelGone`.
@@ -190,6 +157,22 @@ export interface EngineOptions {
    * While it is set, start and reload answer `engine_failed` and the status is `failed` with it as the problem.
    */
   readonly blocked?: () => { readonly stage: string; readonly message: string } | undefined
+}
+
+/** The engines of one build, as the voice sessions use them. */
+export interface BuiltEngines {
+  readonly providers: EngineProviders
+  /** The output rate of every voice router of this build (the build-time default voice's rate). */
+  readonly sampleRate: number
+}
+
+/**
+ * A voice session's loop on the shared engines (docs/VOICE-SESSIONS.md §2): `run` is started on every build while the
+ * loop is attached and interrupted when the build ends (a reload, a failure, the server stopping). A failure that is
+ * not an interruption stops the engines (as a recogniser that died does), reported as a speech-to-text problem.
+ */
+export interface SessionLoop {
+  readonly run: (built: BuiltEngines) => Effect.Effect<void, unknown>
 }
 
 /**
@@ -206,8 +189,6 @@ const RETRY_NOTE = {
   message: "The engines will start by themselves once the previous speech model has shut down. If they do not, restart the assistant."
 }
 
-export type SendOutcome = "accepted" | "busy" | "not_running"
-
 export interface Engine {
   readonly status: () => EngineStatus
   /** Build the engines (first start). Completes when they are ready or have failed. */
@@ -218,50 +199,42 @@ export interface Engine {
    * operation it waited for has just brought up (seventh review).
    */
   readonly startIfStopped: Effect.Effect<HostResult>
-  /** Interrupt the running turn, close the engines, rebuild them with the saved settings, keep the history. */
-  readonly reload: Effect.Effect<HostResult>
   /**
-   * Typed text or Stop. `not_running` when the engines are not running; `busy` when `maxPendingInputs` typed
-   * inputs are already waiting for the conversation. Stop (`Interrupt`) is always accepted: it drops the typed
-   * inputs still waiting, and repeated presses before the conversation takes the first one count as one.
+   * Stop every session's loop (running turns end interrupted), close the engines, rebuild them with the saved
+   * settings, start every session's loop again (each keeps its own history and conversation id).
    */
-  readonly send: (input: ConversationInput) => SendOutcome
-  readonly history: Effect.Effect<ReadonlyArray<Message>>
+  readonly reload: Effect.Effect<HostResult>
+  /** Whether the engines are running (built, and no loop has failed). */
+  readonly ready: () => boolean
+  /** The engines of the running build. */
+  readonly built: () => BuiltEngines | undefined
+  /**
+   * Run `loop` on the engines now (when they are running) and on every later build, until the returned effect
+   * detaches it (and waits for its run to end).
+   */
+  readonly attach: (loop: SessionLoop) => Effect.Effect<void>
   /** Saved settings wait for a reload (`path`: the settings page they are on, for `reloadPendingFor`). */
   readonly setReloadPending: (pending: boolean, path?: string) => void
-  /** The enabled voices and the default voice in effect, while the engines run. */
+  /** The enabled voices and the assistant's default voice in effect (`DEFAULT_VOICE` when it is running), while the engines run. */
   readonly voices: () => { readonly names: ReadonlyArray<Voice>; readonly defaultVoice: string } | undefined
   /** Announce the status again (`describeEngines` has something new to say). */
   readonly refreshStatus: () => void
 }
 
-/** A control input with the Stop generation it was accepted in (`undefined`: a speech event). */
-interface Control {
-  readonly input: ConversationInput
-  readonly generation: number | undefined
-}
-
 export const makeEngine = (options: EngineOptions): Effect.Effect<Engine, never, Scope.Scope> =>
   Effect.gen(function*() {
     const scope = yield* Effect.scope
-    /**
-     * Inputs for the conversation besides speech. Not bounded by the queue itself (the merge with the speech
-     * events below reads ahead of the conversation) but by admission: at most `maxPendingInputs` typed inputs
-     * and one Stop are accepted and not yet taken by the conversation, counted until it takes them. Stop
-     * raises `stopGeneration`, so typed inputs accepted before it are dropped instead of starting stale turns.
-     */
-    const control = yield* Queue.unbounded<Control>()
-    const maxPendingInputs = options.maxPendingInputs ?? 4
-    let pendingInputs = 0
-    let stopPending = false
-    let stopGeneration = 0
+    const runFork = yield* FiberSet.makeRuntime<never, void, unknown>()
     let status: EngineStatus = { state: "starting", problems: [], reloadPending: false, reloadPendingFor: [], engines: [], voices: [] }
     let fiber: Fiber.Fiber<void> | undefined
-    let conversationHistory: Effect.Effect<ReadonlyArray<Message>> | undefined
-    let history: ReadonlyArray<Message> = []
     let ready = false
     let busy = false
-    let running: { readonly voices: ReadonlyArray<Voice>; router: Tts["Service"]; defaultVoice: string; readonly sampleRate: number } | undefined
+    let current: BuiltEngines | undefined
+    /** Attached session loops, and the run of each on the current build. */
+    const loops = new Set<SessionLoop>()
+    const runs = new Map<SessionLoop, Fiber.Fiber<void, unknown>>()
+    /** Completed by the first loop that fails (not by an interruption): the build then ends. */
+    let loopFailed: Deferred.Deferred<Cause.Cause<unknown>> | undefined
 
     const view = (s: EngineStatus): EngineStatus =>
       options.describeEngines === undefined || s.engines.length === 0 ? s : { ...s, engines: options.describeEngines(s.engines) }
@@ -270,16 +243,25 @@ export const makeEngine = (options: EngineOptions): Effect.Effect<Engine, never,
       options.onStatus(view(next))
     }
 
-    /** The router for the default voice in effect: rebuilt (cheaply, engines untouched) when the setting changes. */
-    const currentRouter = () => {
-      const r = running!
-      const wanted = options.defaultVoice()
-      if (wanted !== r.defaultVoice && r.voices.some((v) => v.name === wanted)) {
-        r.router = makeVoiceRouter({ voices: r.voices, defaultVoice: wanted, sampleRate: r.sampleRate })
-        r.defaultVoice = wanted
-      }
-      return r
+    const startLoop = (loop: SessionLoop) => {
+      const built = current
+      const failed = loopFailed
+      if (built === undefined || failed === undefined || runs.has(loop)) return
+      const run = runFork(Effect.suspend(() => loop.run(built)).pipe(
+        Effect.onError((cause) => (Cause.hasInterruptsOnly(cause) ? Effect.void : Deferred.succeed(failed, cause)))
+      ))
+      runs.set(loop, run)
+      run.addObserver(() => {
+        if (runs.get(loop) === run) runs.delete(loop)
+      })
     }
+
+    /** Interrupt every loop's run and wait for them to end (each keeps its history). Before the providers close. */
+    const stopLoops = Effect.suspend(() => {
+      const all = [...runs.values()]
+      runs.clear()
+      return Fiber.interruptAll(all)
+    })
 
     const run = (latch: Deferred.Deferred<HostResult>): Effect.Effect<void> =>
       Effect.scoped(Effect.gen(function*() {
@@ -306,59 +288,34 @@ export const makeEngine = (options: EngineOptions): Effect.Effect<Engine, never,
         }
         const providers = built.success
         const router = makeVoiceRouter({ voices: providers.voices, defaultVoice: providers.defaultVoice })
-        running = { voices: providers.voices, router, defaultVoice: providers.defaultVoice, sampleRate: router.sampleRate }
-        const tts = Tts.of({
-          sampleRate: router.sampleRate,
-          synthesize: (clauses) => Stream.suspend(() => currentRouter().router.synthesize(clauses))
-        })
-        const common = { onEvent: options.onEvent, initialHistory: history, maxToolRounds: providers.maxToolRounds, bargeIn: true }
-        const agentSetup = options.agentSetup?.(providers)
-        const conversation = yield* (agentSetup !== undefined
-          ? makeAgentConversation({ ...common, setup: agentSetup })
-          : makeConversationWithSetup({ ...common, setup: options.setup }).pipe(Effect.provideService(Llm, providers.llm))
-        ).pipe(Effect.provideService(TurnTrace, options.turnTrace))
-        conversationHistory = conversation.history
-        yield* Queue.clear(control)
-        pendingInputs = 0
-        stopPending = false
+        // Added after the providers' finalizers, so it runs before them: the loops end while their engines still work.
+        yield* Effect.addFinalizer(() =>
+          Effect.andThen(Effect.sync(() => {
+            ready = false
+            current = undefined
+            loopFailed = undefined
+          }), stopLoops)
+        )
+        const failed = yield* Deferred.make<Cause.Cause<unknown>>()
+        current = { providers, sampleRate: router.sampleRate }
+        loopFailed = failed
         ready = true
         setStatus({ state: "ready", problems: [], reloadPending: false, reloadPendingFor: [], engines: providers.engines, voices: providers.voiceInfo })
+        for (const loop of loops) startLoop(loop)
         yield* Deferred.succeed(latch, { ok: true })
 
-        const events = Stream.merge(
-          options.gate(providers.stt.transcribe(options.input.stream)).pipe(Stream.map((input): Control => ({ input, generation: undefined }))),
-          Stream.fromQueue(control)
-        ).pipe(
-          // One at a time, so each input is counted out (and checked against Stop) just before the conversation takes it.
-          Stream.rechunk(1),
-          Stream.filter((c) => {
-            if (c.generation === undefined) return true
-            if (c.input._tag === "Interrupt") {
-              stopPending = false
-              return true
-            }
-            pendingInputs--
-            return c.generation === stopGeneration
-          }),
-          Stream.map((c) => c.input)
-        )
-        const exit = yield* conversation.voice(events).pipe(
-          Effect.provideService(Tts, tts),
-          Effect.provideService(AudioOutput, options.output),
-          Effect.exit
-        )
+        // Until the build is interrupted (reload, stop) or a loop fails; the finalizer above then stops the others.
+        const cause = yield* Deferred.await(failed)
         ready = false
-        if (Exit.isFailure(exit) && !Cause.hasInterruptsOnly(exit.cause)) {
-          const message = Cause.squash(exit.cause)
-          const text = message instanceof Error ? message.message : String(message)
-          yield* Effect.logError("The voice loop stopped", exit.cause)
-          setStatus({ ...status, state: "failed", problems: [{ stage: "speech-to-text", message: text }] })
-        }
+        const squashed = Cause.squash(cause)
+        const text = squashed instanceof Error ? squashed.message : String(squashed)
+        yield* Effect.logError("The voice loop stopped", cause)
+        setStatus({ ...status, state: "failed", problems: [{ stage: "speech-to-text", message: text }] })
       })).pipe(
         Effect.onExit(() =>
           Effect.sync(() => {
             ready = false
-            running = undefined
+            current = undefined
           })
         )
       )
@@ -390,10 +347,6 @@ export const makeEngine = (options: EngineOptions): Effect.Effect<Engine, never,
         if (fiber !== undefined) {
           yield* Fiber.interrupt(fiber)
           fiber = undefined
-        }
-        if (conversationHistory !== undefined) {
-          history = yield* conversationHistory
-          conversationHistory = undefined
         }
         const latch = yield* Deferred.make<HostResult>()
         const built = yield* run(latch).pipe(Effect.forkIn(scope))
@@ -438,22 +391,18 @@ export const makeEngine = (options: EngineOptions): Effect.Effect<Engine, never,
       start: launch("starting"),
       startIfStopped: launch("starting", () => !ready),
       reload: launch("reloading"),
-      send: (input) => {
-        if (!ready) return "not_running"
-        if (input._tag === "Interrupt") {
-          stopGeneration++
-          if (!stopPending) {
-            stopPending = true
-            Queue.offerUnsafe(control, { input, generation: stopGeneration })
-          }
-          return "accepted"
-        }
-        if (pendingInputs >= maxPendingInputs) return "busy"
-        pendingInputs++
-        Queue.offerUnsafe(control, { input, generation: stopGeneration })
-        return "accepted"
+      ready: () => ready,
+      built: () => (ready ? current : undefined),
+      attach: (loop) => {
+        loops.add(loop)
+        if (ready) startLoop(loop)
+        return Effect.suspend(() => {
+          loops.delete(loop)
+          const run = runs.get(loop)
+          runs.delete(loop)
+          return run === undefined ? Effect.void : Fiber.interrupt(run)
+        })
       },
-      history: Effect.suspend(() => conversationHistory ?? Effect.succeed(history)),
       setReloadPending: (pending, path) => {
         const before = status.reloadPendingFor ?? []
         const pages = !pending ? [] : path === undefined || before.includes(path) ? before : [...before, path]
@@ -461,6 +410,12 @@ export const makeEngine = (options: EngineOptions): Effect.Effect<Engine, never,
           setStatus({ ...status, reloadPending: pending, reloadPendingFor: pages })
         }
       },
-      voices: () => running === undefined ? undefined : { names: running.voices, defaultVoice: currentRouter().defaultVoice }
+      voices: () => {
+        const built = ready ? current : undefined
+        if (built === undefined) return undefined
+        const wanted = options.defaultVoice()
+        const names = built.providers.voices
+        return { names, defaultVoice: names.some((v) => v.name === wanted) ? wanted : built.providers.defaultVoice }
+      }
     } satisfies Engine
   })

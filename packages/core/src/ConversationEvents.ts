@@ -20,7 +20,15 @@ import type { Trace, TurnOutcome } from "./TurnTrace.ts"
  * (serve mode buffers a pending turn's events and releases them on
  * `TurnPromoted`, or drops them when the turn ends `discarded`).
  */
+/** Why a new conversation started (`Conversation.newConversation`): asked for, or the idle reset. */
+export type ConversationStartReason = "new" | "idle"
+
 export type ConversationEvent =
+  /**
+   * A new conversation started (`newConversation`, or the idle reset at a turn's start): the history is empty and
+   * `conversationId` is new. Emitted on the fiber that started it, before the next turn's `TurnStarted`.
+   */
+  | { readonly _tag: "ConversationStarted"; readonly conversationId: string; readonly reason: ConversationStartReason }
   | {
     readonly _tag: "TurnStarted"
     /** The turn's `Trace.id`. */

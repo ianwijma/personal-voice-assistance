@@ -54,6 +54,12 @@ export interface AgentTurnInput {
    * numbers. Absent (0) when nothing was ever evicted.
    */
   readonly historyStart?: number
+  /**
+   * The conversation this turn belongs to (`Conversation.conversationId`). It changes when a new conversation
+   * starts (New conversation, the idle reset), and every voice session has its own. An agent that keeps state
+   * across turns (a harness session, a catch-up position) keys it by this id.
+   */
+  readonly conversationId: string
   /** Stable system prompt for this agent: its own prompt (or the global one) + module instructions + voice block. Cacheable. */
   readonly system: string
   /** Per-turn facts from context providers (time, ...); `undefined` when empty. Never cached. */
@@ -171,4 +177,10 @@ export interface Agent {
   readonly firstEventTimeoutMs: number
   /** Answer one turn. Interrupting the stream must stop the agent's work promptly and leave it ready for the next turn. */
   readonly turn: (input: AgentTurnInput) => Stream.Stream<AgentEvent, AgentError>
+  /**
+   * The conversation `conversationId` has ended (New conversation, the idle reset, a discarded voice session):
+   * an agent that keeps state per conversation (a harness session) drops it. Optional; must not fail or block.
+   * `Conversation` calls it on every agent of its current setup when it starts a new conversation.
+   */
+  readonly endConversation?: ((conversationId: string) => Effect.Effect<void>) | undefined
 }

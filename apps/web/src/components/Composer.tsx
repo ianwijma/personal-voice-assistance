@@ -1,6 +1,7 @@
 "use client"
 import { type KeyboardEvent, useLayoutEffect, useRef, useState } from "react"
 import { MAX_TEXT_INPUT_CHARS } from "@pva/protocol"
+import { sessionsFullText } from "@/lib/sessions.ts"
 import { shallowEqual } from "@/lib/store.ts"
 import { useClient, useClientState } from "./context.tsx"
 import { Icon } from "./ui/Icon.tsx"
@@ -38,6 +39,7 @@ export function Composer() {
     const result = await client.sendText(value.slice(0, MAX_TEXT_INPUT_CHARS)) // continuation(state): the box is cleared only if it still holds what was sent
     setSending(false)
     if (result.ok) setText((now) => (now.trim() === value ? "" : now))
+    else if (result.error?.code === "sessions_full") setError(sessionsFullText(result.error.message))
     else setError(result.error?.message ?? "The message was not accepted.")
   }
 

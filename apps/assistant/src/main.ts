@@ -5,9 +5,9 @@ import { DEFAULT_DEVICE_PROFILE } from "@pva/protocol"
 import { Cause, Config, Effect, Layer, Logger, Stream } from "effect"
 import { resolve } from "node:path"
 import * as readline from "node:readline"
-import { collectWavs, parseLiveArgs, runLive } from "./bench/live.ts"
+import { collectWavs, parseLiveArgs, runLiveSessions } from "./bench/live.ts"
 import { makeBenchWavs } from "./bench/makeWavs.ts"
-import { runOffline, type SimulatedDelays, zeroDelays } from "./bench/offline.ts"
+import { runOffline, runOfflineSessions, type SimulatedDelays, zeroDelays } from "./bench/offline.ts"
 import { formatReport } from "./bench/report.ts"
 import { AppConfig } from "./config.ts"
 import { userCwd } from "./env.ts"
@@ -97,7 +97,7 @@ const RealisticDelays: Config.Config<SimulatedDelays> = Config.all({
 /** Wake-phrase mode with the default phrases, for the offline benchmark. */
 const benchWake: WakeConfig = { ...wakeConfigFromProfile(DEFAULT_DEVICE_PROFILE), activation: "wake-phrase" }
 
-const offlineBench = Effect.gen(function*() {
+const offlineBench = (sessions: number) => Effect.gen(function*() {
   const rounds = yield* Config.Int("BENCH_ROUNDS").pipe(Config.withDefault(3))
   const realistic = yield* RealisticDelays
   const d = realistic
@@ -115,8 +115,16 @@ const offlineBench = Effect.gen(function*() {
     { name: "realistic, eager ON, wake phrase (\"Hey Jeff, …\")", delays: realistic, eager: true, wake: benchWake, wakePrefix: "Hey Jeff, " }
   ]
   for (const scenario of scenarios) {
-    const rows = yield* runOffline(scenario, rounds)
-    yield* Effect.sync(() => console.log(formatReport(scenario.name, rows)))
+    if (sessions <= 1) {
+      const rows = yield* runOffline(scenario, rounds)
+      yield* Effect.sync(() => console.log(formatReport(scenario.name, rows)))
+      continue
+    }
+    // Several voice sessions at once, turn ends simultaneous: one table per session.
+    const perSession = yield* runOfflineSessions(scenario, rounds, sessions)
+    for (const [i, rows] of perSession.entries()) {
+      yield* Effect.sync(() => console.log(formatReport(`${scenario.name} — session ${i + 1} of ${sessions}`, rows)))
+    }
   }
   console.log("Times in ms relative to EndOfTurn; negative = done early by a promoted speculative turn.")
 })
@@ -132,7 +140,7 @@ const bench = (args: ReadonlyArray<string>) =>
       return
     }
     if (args[0] === "--live") {
-      const usage = "Usage: bench --live [--rounds N] <wav files or directories> (16 kHz mono)"
+      const usage = "Usage: bench --live [--rounds N] [--sessions N] [--stagger MS] <wav files or directories> (16 kHz mono)"
       const parsed = parseLiveArgs(args.slice(1))
       if (typeof parsed === "string") return yield* new StartupError({ message: `${parsed}. ${usage}` })
       const once = yield* collectWavs(parsed.paths.map((p) => resolve(userCwd, p)))
@@ -157,21 +165,31 @@ const bench = (args: ReadonlyArray<string>) =>
       const settings = yield* AppConfig
       const modules = yield* startCliModules()
       const conversation = { ...settings, systemPrompt: withVoicePrompt(withModuleInstructions(settings.systemPrompt, modules.instructions), voices) }
-      const rows = yield* runLive({ files, outputDir, conversation, modules }).pipe(
+      const { sessions, staggerMs } = parsed
+      const perSession = yield* runLiveSessions({ files, outputDir, conversation, modules, sessions, staggerMs }).pipe(
         Effect.provide(withVoiceRouter(providers, voices))
       )
-      console.log(formatReport(`live: ${files.length} turns, ${llmLabel}, replies in ${outputDir}`, rows, {
-        traceColumns: false,
-        headline: { key: "PLAY", label: "end of user audio -> playback start" }
-      }))
+      const together = sessions === 1 ? "" : `, ${sessions} sessions, user audio ends ${staggerMs === 0 ? "at the same moment" : `${staggerMs} ms apart`}`
+      for (const [i, rows] of perSession.entries()) {
+        const which = sessions === 1 ? "" : ` — session ${i + 1} of ${sessions}`
+        console.log(formatReport(`live: ${files.length} turns, ${llmLabel}${together}, replies in ${outputDir}${which}`, rows, {
+          traceColumns: false,
+          headline: { key: "PLAY", label: "end of user audio -> playback start" }
+        }))
+      }
       console.log(
         "Times in ms from the end of each file's audio: eager = EagerEndOfTurn, eot = EndOfTurn, then the LLM's first\n" +
           "token, the first clause sent to TTS, its first audio, and PLAY = first audio handed to the speaker."
       )
       return
     }
+    if (args[0] === "--sessions") {
+      const n = Number(args[1])
+      if (!Number.isInteger(n) || n < 1 || n > 16) return yield* new StartupError({ message: "Usage: bench --sessions N (1..16)" })
+      return yield* offlineBench(n)
+    }
     if (args.length > 0) return yield* new StartupError({ message: `Unknown bench option "${args[0]}"` })
-    yield* offlineBench
+    yield* offlineBench(1)
   }).pipe(Effect.scoped)
 
 const [mode = "text", ...args] = process.argv.slice(2)
@@ -191,7 +209,7 @@ const program: Effect.Effect<void, unknown> = mode === "text"
   : mode === "serve"
   ? serveMode
   : new StartupError({
-    message: `Unknown mode "${mode}". Usage: assistant [text | voice | serve | bench [--live [--rounds N] <wavs> | --make-wavs [dir]] | ` +
+    message: `Unknown mode "${mode}". Usage: assistant [text | voice | serve | bench [--sessions N | --live [--rounds N] [--sessions N] [--stagger MS] <wavs> | --make-wavs [dir]] | ` +
       "say [--voice NAME] [--out FILE] <text> | transcribe <wav file> | compare-models [--models a,b] [--agc on|off|both] [--ref TEXT] <wavs>]"
   })
 

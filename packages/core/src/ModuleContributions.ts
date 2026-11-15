@@ -64,6 +64,8 @@ export interface AgentImplementation extends Omit<ModuleContributions, "agents" 
   readonly systemPrompt?: string | undefined
   /** Default: model 5000 ms, harness 8000 ms, intent 1500 ms. */
   readonly firstEventTimeoutMs?: number
+  /** `Agent.endConversation`: drop what is kept for a conversation that has ended. */
+  readonly endConversation?: Agent["endConversation"]
 }
 
 export const defaultFirstEventTimeoutMs: Readonly<Record<AgentKind, number>> = { model: 5_000, harness: 8_000, intent: 1_500 }
@@ -79,7 +81,8 @@ export const toAgent = (
   speculate: impl.speculate ?? meta.kind !== "harness",
   firstEventTimeoutMs: impl.firstEventTimeoutMs ?? defaultFirstEventTimeoutMs[meta.kind],
   ...(impl.systemPrompt !== undefined && impl.systemPrompt.trim() !== "" ? { systemPrompt: impl.systemPrompt } : {}),
-  turn: impl.turn
+  turn: impl.turn,
+  ...(impl.endConversation !== undefined ? { endConversation: impl.endConversation } : {})
 })
 
 /**

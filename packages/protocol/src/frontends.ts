@@ -119,6 +119,8 @@ export const PREBUFFER_MS_MAX = 500
 export const WAKE_ARMED_MS = 8_000
 /** The admin phrase tester (`wake.test`) switches itself off after this long. */
 export const WAKE_TEST_MAX_MS = 300_000
+/** `conversationIdleMinutes` bounds (docs/VOICE-SESSIONS.md §4); the built-in default is the setting's default. */
+export const CONVERSATION_IDLE_MINUTES_LIMITS = { min: 0, max: 240, default: 10 } as const
 /** Longest voice name in a profile. */
 export const MAX_VOICE_NAME_CHARS = 64
 
@@ -126,6 +128,13 @@ export const MAX_VOICE_NAME_CHARS = 64
 export const FollowUpSeconds = Schema.Int.check(Schema.isBetween({ minimum: FOLLOW_UP_SECONDS_MIN, maximum: FOLLOW_UP_SECONDS_MAX }))
 /** Reply audio buffered by the browser before playback starts, 20..500 ms. */
 export const PrebufferMs = Schema.Int.check(Schema.isBetween({ minimum: PREBUFFER_MS_MIN, maximum: PREBUFFER_MS_MAX }))
+/**
+ * Minutes without a committed turn after which the next turn starts a new conversation (protocol 6); 0 = never.
+ * Whole minutes, 0..240.
+ */
+export const ConversationIdleMinutes = Schema.Int.check(
+  Schema.isBetween({ minimum: CONVERSATION_IDLE_MINUTES_LIMITS.min, maximum: CONVERSATION_IDLE_MINUTES_LIMITS.max })
+)
 /** `""` = the assistant's default voice; else the name of an enabled voice (the server falls back to `""` otherwise). */
 export const ProfileVoice = Schema.String.check(Schema.isMaxLength(MAX_VOICE_NAME_CHARS))
 
@@ -143,6 +152,11 @@ export const DeviceProfile = Schema.Struct({
   voice: ProfileVoice,
   /** Server: the echo gate's mode while this device owns the audio (it used to come in `audio.claim`). */
   interruptMode: InterruptMode,
+  /**
+   * Server (protocol 6): the device's conversation starts afresh at the next turn after this many minutes without a
+   * committed turn; 0 = never. The kind default comes from the assistant setting `CONVERSATION_IDLE_MINUTES`.
+   */
+  conversationIdleMinutes: ConversationIdleMinutes,
   /** Browser: show captions of the reply on the stage. */
   captions: Schema.Boolean,
   /** Browser: speak replies to typed messages (`text.send.speak`). */
@@ -166,6 +180,7 @@ export const ProfileField = Schema.Literals([
   "followUpSeconds",
   "voice",
   "interruptMode",
+  "conversationIdleMinutes",
   "captions",
   "speakReplies",
   "echoCancellation",
@@ -190,6 +205,7 @@ export const DEFAULT_DEVICE_PROFILE: DeviceProfile = {
   followUpSeconds: 8,
   voice: "",
   interruptMode: "confirm",
+  conversationIdleMinutes: CONVERSATION_IDLE_MINUTES_LIMITS.default,
   captions: true,
   speakReplies: true,
   echoCancellation: true,
@@ -210,6 +226,7 @@ export const ProfileOverrides = Schema.Struct({
   followUpSeconds: Schema.optionalKey(FollowUpSeconds),
   voice: Schema.optionalKey(ProfileVoice),
   interruptMode: Schema.optionalKey(InterruptMode),
+  conversationIdleMinutes: Schema.optionalKey(ConversationIdleMinutes),
   captions: Schema.optionalKey(Schema.Boolean),
   speakReplies: Schema.optionalKey(Schema.Boolean),
   echoCancellation: Schema.optionalKey(Schema.Boolean),
@@ -231,6 +248,7 @@ export const ProfilePatch = Schema.Struct({
   followUpSeconds: Schema.optionalKey(Schema.NullOr(FollowUpSeconds)),
   voice: Schema.optionalKey(Schema.NullOr(ProfileVoice)),
   interruptMode: Schema.optionalKey(Schema.NullOr(InterruptMode)),
+  conversationIdleMinutes: Schema.optionalKey(Schema.NullOr(ConversationIdleMinutes)),
   captions: Schema.optionalKey(Schema.NullOr(Schema.Boolean)),
   speakReplies: Schema.optionalKey(Schema.NullOr(Schema.Boolean)),
   echoCancellation: Schema.optionalKey(Schema.NullOr(Schema.Boolean)),

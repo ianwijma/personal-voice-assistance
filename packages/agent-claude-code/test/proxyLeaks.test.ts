@@ -56,6 +56,7 @@ const input = (): AgentTurnInput => {
   const trace: Trace = { id: 1, mode: "voice", speculative: false, startedAt: 0, marks: {}, tools: [], voices: [] }
   return {
     turnId: 1,
+    conversationId: "c1",
     text: "Hello",
     utterance: "Hey Claude, hello",
     source: "voice",

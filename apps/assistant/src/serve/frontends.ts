@@ -83,6 +83,8 @@ export interface Frontends {
   /** A device's connection closed: `lastSeen` = now (memory; written with the next save). */
   readonly left: (id: string) => void
   readonly known: (id: string) => boolean
+  /** A remembered device's name. */
+  readonly nameOf: (id: string) => string | undefined
   readonly kindOfDevice: (id: string) => string | undefined
   /**
    * `device.update` from the device itself: only `DEVICE_EDITABLE_FIELDS`. A device whose first record is still
@@ -103,6 +105,11 @@ export interface FrontendsOptions {
   readonly enabledVoices: () => ReadonlySet<string>
   /** Default `Date.now`. */
   readonly now?: () => number
+  /**
+   * The built-in default of `conversationIdleMinutes` (the assistant setting `CONVERSATION_IDLE_MINUTES`, live), under
+   * the kind defaults and the device overrides. Default: `DEFAULT_DEVICE_PROFILE`'s.
+   */
+  readonly conversationIdleMinutes?: () => number
 }
 
 export const makeFrontends = (options: FrontendsOptions): Frontends => {
@@ -112,6 +119,13 @@ export const makeFrontends = (options: FrontendsOptions): Frontends => {
   const lastSeen = new Map<string, number>()
 
   const data = (): FrontendData => store.settings()
+  /** The built-in defaults, with the assistant's `CONVERSATION_IDLE_MINUTES`. */
+  const builtin = (): DeviceProfile => {
+    const minutes = options.conversationIdleMinutes?.()
+    return minutes === undefined || !Number.isInteger(minutes) || minutes < 0
+      ? DEFAULT_DEVICE_PROFILE
+      : { ...DEFAULT_DEVICE_PROFILE, conversationIdleMinutes: minutes }
+  }
   const kindDefaults = (kind: string): ProfileOverrides => data().frontends[kind] ?? {}
 
   const validVoice = (profile: DeviceProfile): DeviceProfile => {
@@ -123,7 +137,7 @@ export const makeFrontends = (options: FrontendsOptions): Frontends => {
   const profile = (deviceId: string | undefined, kind?: string): DeviceProfile => {
     const record = deviceId === undefined ? undefined : data().devices[deviceId]
     const k = record?.kind ?? kind ?? WEB_VOICE_KIND
-    return validVoice(effectiveProfile(kindDefaults(k), record?.overrides ?? {}, DEFAULT_DEVICE_PROFILE))
+    return validVoice(effectiveProfile(kindDefaults(k), record?.overrides ?? {}, builtin()))
   }
 
   /** Checks shared by every patch: fields of the kind, and a voice that is enabled. */
@@ -186,7 +200,7 @@ export const makeFrontends = (options: FrontendsOptions): Frontends => {
         description: k.description,
         fields: [...k.fields],
         defaults: kindDefaults(k.id),
-        profile: validVoice(effectiveProfile(kindDefaults(k.id), {}, DEFAULT_DEVICE_PROFILE))
+        profile: validVoice(effectiveProfile(kindDefaults(k.id), {}, builtin()))
       })),
     devices: (live) => {
       const t = now()
@@ -229,6 +243,7 @@ export const makeFrontends = (options: FrontendsOptions): Frontends => {
       if (data().devices[id] !== undefined) lastSeen.set(id, now())
     },
     known: (id) => data().devices[id] !== undefined,
+    nameOf: (id) => data().devices[id]?.name,
     kindOfDevice: (id) => data().devices[id]?.kind,
     updateOwn: (device, patch, connected) =>
       Effect.suspend(() => {

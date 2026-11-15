@@ -1,7 +1,8 @@
 "use client"
 import { type FormEvent, useEffect, useRef, useState } from "react"
-import { type DeviceInfo, MAX_DEVICE_NAME_CHARS } from "@pva/protocol"
+import { type DeviceInfo, MAX_DEVICE_NAME_CHARS, type SessionInfo } from "@pva/protocol"
 import { activationSummary, lastSeenText } from "@/lib/profileForm.ts"
+import { agoText, stateWord, turnsText } from "@/lib/sessions.ts"
 import { shallowEqual } from "@/lib/store.ts"
 import { useClient, useClientState } from "../../context.tsx"
 import { inputClass } from "../../fields/types.ts"
@@ -20,10 +21,17 @@ const useNow = () => {
   return now
 }
 
-/** Devices › All devices: name, kind, last seen, the audio owner, how it activates. */
+/**
+ * Whether a device is talking now (one of its tabs owns its session's audio), from its voice session; a server that
+ * lists no sessions falls back to the device's `audioOwner`.
+ */
+const talkingOf = (d: DeviceInfo, session: SessionInfo | undefined): boolean => (session === undefined ? d.audioOwner : session.ownerPresent)
+
+/** Devices › All devices: name, kind, last seen, talking now (with its state), how it activates. */
 export function DevicesPage() {
   const client = useClient()
   const devices = useClientState((s) => s.devices)
+  const sessions = useClientState((s) => s.sessions)
   const kinds = useClientState((s) => s.frontends)
   const now = useNow()
   if (devices.length === 0) {
@@ -39,6 +47,8 @@ export function DevicesPage() {
     <ul className="flex flex-col divide-y divide-line/60 rounded-md border border-line" data-testid="device-list">
       {devices.map((d) => {
         const overrides = Object.keys(d.overrides).length
+        const session = sessions.find((x) => x.deviceId === d.id)
+        const talking = talkingOf(d, session)
         return (
           <li key={d.id}>
             <button
@@ -53,7 +63,8 @@ export function DevicesPage() {
               <span className="min-w-0 flex-1">
                 <span className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
                   <span className="truncate text-[14px] text-ink">{d.name}</span>
-                  {d.audioOwner && <span className="label rounded-sm border border-you/50 px-1 text-[9px] leading-[14px] text-you" data-testid="audio-owner">Audio owner now</span>}
+                  {talking && <span className="label rounded-sm border border-you/50 px-1 text-[9px] leading-[14px] text-you" data-testid="talking-now">Talking now</span>}
+                  {talking && session !== undefined && <span className="text-[12px] text-ink-muted" data-testid="session-state">{stateWord(session.state)}</span>}
                 </span>
                 <span className="block text-[13px] text-ink-muted" title={activationSummary(d.profile)}>
                   {d.profile.activation === "always" ? "Always listening" : (
@@ -103,6 +114,7 @@ export function DevicePage() {
   const id = useClientState((s) => s.ui.settingsPath[1])
   const device = useClientState((s) => s.devices.find((d) => d.id === id), shallowEqual)
   const kind = useClientState((s) => s.frontends.find((k) => k.id === device?.kind), shallowEqual)
+  const session = useClientState((s) => s.sessions.find((x) => x.deviceId === id), shallowEqual)
   const now = useNow()
   // Without a profile form (unknown kind) the rename registers the unsaved edit itself.
   const noForm = device !== undefined && kind === undefined
@@ -129,8 +141,17 @@ export function DevicePage() {
           <dd className="text-ink" data-testid="device-status">
             {lastSeenText(device, now)}
             {device.connections > 1 ? ` · ${device.connections} tabs` : ""}
-            {device.audioOwner ? " · has the audio now" : ""}
+            {talkingOf(device, session) ? ` · talking now${session !== undefined ? `, ${stateWord(session.state)}` : ""}` : ""}
           </dd>
+          {session !== undefined && (
+            <>
+              <dt className="text-ink-muted">Conversation</dt>
+              <dd className="text-ink" data-testid="device-conversation">
+                {turnsText(session.turns)}
+                {session.lastTurnAt !== null ? ` · last ${agoText(session.lastTurnAt, now)}` : ""}
+              </dd>
+            </>
+          )}
           <dt className="text-ink-muted">First seen</dt>
           <dd className="text-ink">{new Date(device.firstSeen).toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" })}</dd>
         </dl>

@@ -76,6 +76,7 @@ export interface MockLog {
   readonly mic: ReadonlyArray<{ conn: string; frames: number; gaps: number; owner: boolean }>
   readonly state: string
   readonly connections: number
+  readonly sessions: ReadonlyArray<{ key: string; deviceId?: string; name: string; state: string; ownerPresent: boolean; turns: number }>
 }
 
 export const mock = {
@@ -108,10 +109,10 @@ export const mock = {
    * A line for the phrase tester. `accepted`: whether the gate took it (default: what the mock's gate would say;
    * `null`: left out, as from an older server).
    */
-  heard: async (text: string, matched?: string, accepted?: boolean | null) => {
+  heard: async (text: string, matched?: string, accepted?: boolean | null, deviceId?: string) => {
     await fetch(`${MOCK}/mock/heard`, {
       method: "POST",
-      body: JSON.stringify({ text, ...(matched === undefined ? {} : { matched }), ...(accepted === undefined ? {} : { accepted }) })
+      body: JSON.stringify({ text, ...(matched === undefined ? {} : { matched }), ...(accepted === undefined ? {} : { accepted }), ...(deviceId === undefined ? {} : { deviceId }) })
     })
   },
   /** Change the web-voice defaults (as admin › Front ends would). */
@@ -124,8 +125,19 @@ export const mock = {
   },
   state: async (state: string) => {
     await fetch(`${MOCK}/mock/state`, { method: "POST", body: JSON.stringify({ state }) })
+  },
+  /** Protocol 6: the device's conversation has been quiet too long; its next turn starts a new one (`now`: at once). */
+  idle: async (deviceId?: string, now = false) => {
+    await fetch(`${MOCK}/mock/idle`, { method: "POST", body: JSON.stringify({ ...(deviceId === undefined ? {} : { deviceId }), now }) })
+  },
+  /** Protocol 6: MAX_VOICE_SESSIONS. */
+  maxSessions: async (n: number) => {
+    await fetch(`${MOCK}/mock/max-sessions`, { method: "POST", body: JSON.stringify({ n }) })
   }
 }
+
+/** The device id this browser context's voice page uses (`pva.deviceId` in `localStorage`). */
+export const deviceIdOf = (page: Page): Promise<string> => page.evaluate(() => localStorage.getItem("pva.deviceId") ?? "")
 
 /** The voice page's URL: the static export needs the mock's address (`?ws=`); next dev derives it. `extra`: a hash. */
 export const appUrl = (baseURL: string | undefined, extra = "", path = "/") => {

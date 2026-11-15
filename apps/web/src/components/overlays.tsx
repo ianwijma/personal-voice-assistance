@@ -78,7 +78,7 @@ export function ObserverBanner() {
   const secure = useSecureContext()
   return (
     <div data-testid="observer-banner" className="flex flex-col items-center gap-3 animate-[pva-fade-in_320ms_var(--ease-out)] short:gap-2">
-      <p className="text-[14px] text-ink-muted short:text-[13px]">Audio is on another tab or device</p>
+      <p className="text-[14px] text-ink-muted short:text-[13px]">Audio is on another tab</p>
       {secure ? <StartButton>Use this tab</StartButton> : <InsecureNotice />}
     </div>
   )

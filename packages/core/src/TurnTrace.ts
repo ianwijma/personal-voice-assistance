@@ -40,6 +40,8 @@ export interface Trace {
    * buffered before starting.
    */
   client?: { readonly outputLatencyMs: number; readonly startDelayMs: number }
+  /** The voice session the turn belongs to (serve mode: the device's name), so the latency line tells sessions apart. */
+  readonly session?: string
 }
 
 export interface TraceAgent {
@@ -80,7 +82,9 @@ const ms = (n: number) => `${Math.round(n)}ms`
 /** `endOfTurn→X` deltas; for a promoted speculative turn some are negative (work done early). */
 export const formatTrace = (trace: Trace): string => {
   const origin = trace.marks.endOfTurn ?? trace.startedAt
-  const parts = [`turn #${trace.id} ${trace.mode}${trace.speculative ? " (speculative)" : ""} ${trace.outcome ?? "running"}`]
+  const parts = [
+    `${trace.session !== undefined ? `[${trace.session}] ` : ""}turn #${trace.id} ${trace.mode}${trace.speculative ? " (speculative)" : ""} ${trace.outcome ?? "running"}`
+  ]
   if (trace.agent !== undefined) {
     parts.push(`agent=${trace.agent.id}(${trace.agent.routedBy}${trace.agent.fallbackFrom !== undefined ? `, instead of ${trace.agent.fallbackFrom}` : ""})`)
   }

@@ -138,6 +138,38 @@ test.describe("voice, desktop, dark", () => {
     await shot(page, "voice-desktop-19-settings-sheet-voice-chosen")
   })
 
+  test("new conversation: the button, the divider, after a quiet while, too many devices", async ({ page, browser, baseURL }) => {
+    await mock.scenario("typed")
+    await start(page, baseURL)
+    await page.keyboard.press("c")
+    await page.locator("#chat-input").fill("What time is it in Tokyo?")
+    await page.keyboard.press("Enter")
+    await expect(page.getByTestId("turn").last()).toHaveAttribute("data-outcome", "completed", { timeout: 15_000 })
+    await page.getByTestId("new-conversation").hover()
+    await settle(page, 400)
+    await shot(page, "voice-desktop-20-chat-new-conversation-button")
+    await page.getByTestId("new-conversation").click()
+    await expect(page.getByTestId("conversation-divider")).toBeVisible()
+    await page.locator("#chat-input").fill("Hello again")
+    await page.keyboard.press("Enter")
+    await expect(page.getByTestId("turn").last()).toHaveAttribute("data-outcome", "completed", { timeout: 15_000 })
+    await page.mouse.move(0, 0)
+    await settle(page, 400)
+    await shot(page, "voice-desktop-21-new-conversation")
+    await mock.idle(undefined, true)
+    await expect(page.getByTestId("conversation-divider")).toHaveAttribute("data-reason", "idle")
+    await settle(page, 400)
+    await shot(page, "voice-desktop-22-new-conversation-idle")
+    await mock.maxSessions(1)
+    const other = await otherPage(browser, DESKTOP)
+    await other.page.goto(appUrl(baseURL))
+    await other.page.getByTestId("start").click()
+    await expect(other.page.getByTestId("audio-error")).toBeVisible()
+    await settle(other.page, 500)
+    await shot(other.page, "voice-desktop-23-sessions-full")
+    await other.ctx.close()
+  })
+
   test("connection and errors", async ({ page, browser, baseURL }) => {
     await mock.scenario("typed")
     await start(page, baseURL)
@@ -163,12 +195,13 @@ test.describe("voice, desktop, dark", () => {
     await page.getByTestId("start").click()
     await expectVisualState(page, "listening")
 
-    const observer = await otherPage(browser, DESKTOP)
+    // Another tab of the same device (protocol 6: another device would have its own session).
+    const observer = { page: await page.context().newPage() }
     await observer.page.goto(appUrl(baseURL))
     await expect(observer.page.getByTestId("observer-banner")).toBeVisible()
     await settle(observer.page, 500)
     await shot(observer.page, "voice-desktop-15-observer")
-    await observer.ctx.close()
+    await observer.page.close()
 
     await mock.scenario("engine-failed")
     await page.reload()
@@ -225,6 +258,27 @@ test.describe("voice, phone, dark", () => {
     await shot(page, "voice-phone-07-settings-sheet-more")
   })
 
+  test("phone: New conversation in the dock's More menu, the divider", async ({ page, baseURL }) => {
+    await mock.scenario("typed")
+    await start(page, baseURL)
+    await page.waitForTimeout(7500) // the start hint fades
+    await page.getByTestId("dock-more").tap()
+    await expect(page.getByTestId("dock-menu")).toBeVisible()
+    await settle(page, 400)
+    await shot(page, "voice-phone-10-dock-more")
+    await page.getByTestId("dock-new-conversation").tap()
+    await expect(page.getByTestId("toasts")).toContainText("Started a new conversation.")
+    await settle(page, 300)
+    await shot(page, "voice-phone-11-new-conversation-toast")
+    await page.getByTestId("chat-toggle").tap()
+    await page.locator("#chat-input").fill("Hello again")
+    await page.getByTestId("send").tap()
+    await expect(page.getByTestId("turn").last()).toHaveAttribute("data-outcome", "completed", { timeout: 15_000 })
+    await page.locator("#chat-input").blur()
+    await settle(page, 500)
+    await shot(page, "voice-phone-12-chat-new-conversation")
+  })
+
   test("phone: asleep and woke, microphone error", async ({ page, browser, baseURL }) => {
     await mock.scenario("typed")
     await mock.defaults({ activation: "wake-phrase" })
@@ -274,12 +328,13 @@ for (const [width, height] of [[320, 568], [360, 640], [375, 667], [667, 375]] a
       await settle(page, 400)
       await shot(page, name("03-muted"))
       await page.getByTestId("mic-toggle").tap()
-      const observer = await otherPage(browser, SMALL)
+      // Another tab of the same device (protocol 6: another device would have its own session).
+      const observer = { page: await page.context().newPage() }
       await observer.page.goto(appUrl(baseURL))
       await expect(observer.page.getByTestId("observer-banner")).toBeVisible()
       await settle(observer.page, 500)
       await shot(observer.page, name("05-observer"))
-      await observer.ctx.close()
+      await observer.page.close()
       await page.getByTestId("end-session").tap()
 
       await mock.scenario("voice")
@@ -352,8 +407,20 @@ test.describe("voice, light", () => {
 // ---------------------------------------------------------------------------------------------------------------
 
 /** Run a few typed turns from a voice page, so the latency page and the device list have something to show. */
+const IPHONE_UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1"
+
+/** A voice page with a few turns, and (protocol 6) a second device, an iPhone, talking at the same time. */
 const someTurns = async (browser: Browser, baseURL: string | undefined) => {
+  const phone = await otherPage(browser, { ...PHONE, userAgent: IPHONE_UA })
+  await phone.page.goto(appUrl(baseURL))
+  await phone.page.getByTestId("start").tap()
+  await expectVisualState(phone.page, "listening")
   const voice = await otherPage(browser, DESKTOP)
+  const close = voice.ctx.close.bind(voice.ctx)
+  voice.ctx.close = async () => {
+    await phone.ctx.close()
+    await close()
+  }
   await voice.page.goto(appUrl(baseURL))
   await voice.page.getByTestId("start").click()
   await expectVisualState(voice.page, "listening")
@@ -411,6 +478,9 @@ test.describe("admin, desktop, dark", () => {
     await expect(page.getByTestId("page-overview-overview")).toBeVisible()
     await settle(page, 500)
     await shot(page, "admin-desktop-06-overview")
+    await page.getByTestId("sessions").scrollIntoViewIfNeeded()
+    await settle(page)
+    await shot(page, "admin-desktop-06b-overview-sessions")
 
     await page.getByTestId("nav-frontends").click()
     await expect(page.getByTestId("page-frontends-frontend")).toBeVisible()

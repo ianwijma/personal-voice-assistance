@@ -73,9 +73,11 @@ describe("startup", () => {
 })
 
 describe("bench", () => {
-  it("parses --rounds", () => {
-    assert.deepStrictEqual(parseLiveArgs(["a", "--rounds", "3", "b"]), { rounds: 3, paths: ["a", "b"] })
-    assert.deepStrictEqual(parseLiveArgs(["a"]), { rounds: 1, paths: ["a"] })
+  it("parses --rounds, --sessions and --stagger", () => {
+    assert.deepStrictEqual(parseLiveArgs(["a", "--rounds", "3", "b"]), { rounds: 3, sessions: 1, staggerMs: 0, paths: ["a", "b"] })
+    assert.deepStrictEqual(parseLiveArgs(["a"]), { rounds: 1, sessions: 1, staggerMs: 0, paths: ["a"] })
+    assert.deepStrictEqual(parseLiveArgs(["--sessions", "3", "--stagger", "300", "a"]), { rounds: 1, sessions: 3, staggerMs: 300, paths: ["a"] })
+    assert.match(parseLiveArgs(["--sessions", "9"]) as string, /1 to 8/)
     assert.match(parseLiveArgs(["--rounds", "0"]) as string, /positive whole number/)
   })
 
