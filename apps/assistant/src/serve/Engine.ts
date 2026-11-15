@@ -1,10 +1,11 @@
 import { type HostResult, Llm, makeVoiceRouter, Stt, type Voice } from "@pva/core"
 import type { EngineInfo, EngineStatus, VoiceInfo } from "@pva/protocol"
 import * as SherpaStt from "@pva/stt-sherpa"
+import * as ElevenLabsTts from "@pva/tts-elevenlabs"
 import * as SherpaTts from "@pva/tts-sherpa"
 import { Cause, Config, ConfigProvider, Context, Deferred, Effect, Exit, Fiber, FiberSet, Schema, type Scope } from "effect"
 import { AppConfig } from "../config.ts"
-import { LlmLayer, SttLayer } from "../providers.ts"
+import { hostedTts, isHostedTts, LlmLayer, SttLayer } from "../providers.ts"
 import { buildStages } from "../startup.ts"
 import { builtVoices, loadVoiceSettings, providerOf, voiceCatalog, voiceConfigProvider, voiceStages } from "../voices.ts"
 
@@ -93,6 +94,8 @@ export const defaultProviderBuilder: ProviderBuilder = Effect.gen(function*() {
     const provider = yield* configValue(providerOf(voice), "sherpa")
     const detail = yield* (provider === "sherpa"
       ? configValue(Config.String("TTS_SHERPA_PRESET"), SherpaTts.DEFAULT_PRESET)
+      : provider === "elevenlabs"
+      ? configValue(Config.String("ELEVENLABS_MODEL"), ElevenLabsTts.DEFAULT_MODEL)
       : configValue(Config.String("CARTESIA_MODEL"), "sonic")).pipe(
         Effect.provideService(ConfigProvider.ConfigProvider, voiceConfigProvider(base, voice))
       )
@@ -103,7 +106,7 @@ export const defaultProviderBuilder: ProviderBuilder = Effect.gen(function*() {
       description: voice.description,
       enabled,
       isDefault: voice.name === voices.defaultVoice,
-      engine: `${provider === "sherpa" ? sherpaEngineName(detail) : "Cartesia"} ${detail}`,
+      engine: `${provider === "sherpa" ? sherpaEngineName(detail) : (isHostedTts(provider) ? hostedTts[provider].label : provider)} ${detail}`,
       location
     })
     if (enabled) engines.push({ stage: "tts", provider, detail: `${voice.name}: ${detail}`, location })

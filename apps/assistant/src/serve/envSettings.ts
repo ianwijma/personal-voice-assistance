@@ -41,6 +41,8 @@ const DEVELOPMENT_KEYS: ReadonlySet<string> = new Set([
   "DEEPGRAM_URL",
   "CARTESIA_URL",
   "CARTESIA_SAMPLE_RATE",
+  "ELEVENLABS_URL",
+  "ELEVENLABS_SAMPLE_RATE",
   "NEXT_PUBLIC_PVA_WS_URL",
   "SCREENSHOT_DIR",
   "RUNS",
@@ -69,7 +71,13 @@ const ENGINE_KEYS: Readonly<Record<string, string>> = {
   CARTESIA_MODEL: "voices/engines",
   CARTESIA_VOICE: "voices/engines",
   CARTESIA_LANGUAGE: "voices/engines",
-  CARTESIA_MAX_BUFFER_DELAY_MS: "voices/engines"
+  CARTESIA_MAX_BUFFER_DELAY_MS: "voices/engines",
+  ELEVENLABS_MODEL: "voices/engines",
+  ELEVENLABS_VOICE: "voices/engines",
+  ELEVENLABS_LANGUAGE: "voices/engines",
+  ELEVENLABS_SPEED: "voices/engines",
+  ELEVENLABS_STABILITY: "voices/engines",
+  ELEVENLABS_AUTO_MODE: "voices/engines"
 }
 /** `VOICE_<NAME>_<KEY>`: a per-voice override of an engine key (or `VOICE_<NAME>_PROVIDER`). */
 const VOICE_KEY = /^VOICE_[A-Z0-9]+_(.+)$/

@@ -27,7 +27,7 @@ replaces the single `Llm` with an agent conversation (`makeAgentConversation`) w
 module (Claude Code with the owner's login, `packages/agent-claude-code`), read per turn; the offline stand-in answers, after a
 spoken notice, while that module is not running (`apps/assistant/src/subscription.ts`).
 
-All audio is raw PCM, signed 16-bit little-endian, mono, carried as `Uint8Array` chunks of about 20 ms. Input is 16 kHz. Output rate is declared by the `Tts` service (Piper 22050 Hz, Kokoro and Cartesia 24 kHz); an engine cannot be asked for another rate, so a consumer that needs one resamples (`makeResampler`).
+All audio is raw PCM, signed 16-bit little-endian, mono, carried as `Uint8Array` chunks of about 20 ms. Input is 16 kHz. Output rate is declared by the `Tts` service (Piper 22050 Hz, Kokoro, Cartesia and ElevenLabs 24 kHz); an engine cannot be asked for another rate, so a consumer that needs one resamples (`makeResampler`).
 
 ### Service interfaces (`packages/core`)
 
@@ -143,7 +143,7 @@ History records what was heard and what happened (review round 7). A spoken turn
 
 History can contain consecutive messages that map to the same provider role (a `tool` message followed by the next `user` message, or a `user` message after a turn that produced no text); the LLM adapter merges them as its API requires.
 
-**How `Conversation` calls `Tts`:** once per turn, with the stream of every clause of the turn (all rounds, including text spoken before a tool call), running ahead of playback. Each clause is handed over the moment the chunker emits it; nothing waits for the end of the LLM stream. The adapter must send each clause on as soon as it arrives, as one continuous synthesis (for Cartesia: one context with continuations), so later clauses synthesise while earlier ones play, with no gap and natural intonation across clauses. It tags every audio chunk with the 0-based index of the input clause it belongs to, and these indexes never decrease; `Conversation` uses them to know which clauses' audio actually started playing (needed for interrupted history). The clause stream carries no errors: if the LLM fails mid-turn, the stream just ends, the audio already synthesised is played, and then the turn fails.
+**How `Conversation` calls `Tts`:** once per turn, with the stream of every clause of the turn (all rounds, including text spoken before a tool call), running ahead of playback. Each clause is handed over the moment the chunker emits it; nothing waits for the end of the LLM stream. The adapter must send each clause on as soon as it arrives, as one continuous synthesis (for Cartesia: one context with continuations; for ElevenLabs: one context, each clause flushed), so later clauses synthesise while earlier ones play, with no gap and natural intonation across clauses. It tags every audio chunk with the 0-based index of the input clause it belongs to, and these indexes never decrease; `Conversation` uses them to know which clauses' audio actually started playing (needed for interrupted history). The clause stream carries no errors: if the LLM fails mid-turn, the stream just ends, the audio already synthesised is played, and then the turn fails.
 
 Interrupting the consumer of any of these streams must cancel the underlying work (abort the HTTP request, cancel the TTS context, kill the player). Barge-in is implemented purely as fiber interruption, so this is a correctness requirement, not a nicety.
 
@@ -295,6 +295,7 @@ packages/
   tts-sherpa/       Tts on this machine: Piper / Kokoro via sherpa-onnx, one child process per engine (default)
   stt-deepgram/     Stt via Deepgram Flux (wss /v2/listen, eager end-of-turn) — hosted, optional
   tts-cartesia/     Tts via Cartesia Sonic WebSocket (contexts/continuations, raw pcm_s16le) — hosted, optional
+  tts-elevenlabs/   Tts via the ElevenLabs multi-context WebSocket (one context per turn, raw pcm_s16le) — hosted, optional
   audio-pipewire/   AudioInput/AudioOutput by spawning pw-record / pw-cat
   audio-file/       AudioInput from a WAV/PCM file (paced in real time), AudioOutput to a WAV file — for tests and benchmarks on machines with no sound card
   audio-web/        AudioInput/AudioOutput for a browser (serve mode), over an abstract link to the owner's connection

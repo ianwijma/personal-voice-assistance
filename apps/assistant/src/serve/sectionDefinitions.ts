@@ -13,6 +13,7 @@ import * as SherpaStt from "@pva/stt-sherpa"
 import * as SherpaTts from "@pva/tts-sherpa"
 import { SUBSCRIPTION_AGENT_ID, SUBSCRIPTION_PROVIDER } from "../subscription.ts"
 import { defaultSystemPrompt } from "../config.ts"
+import { hostedTts, isHostedTts } from "../providers.ts"
 import { voiceCatalog } from "../voices.ts"
 
 /**
@@ -113,7 +114,8 @@ const engineOfVoice = (name: string, ttsProvider: unknown) => voiceCatalog.find(
 
 export const sectionDefinitions = (dirs: ModelDirs = defaultModelDirs): ReadonlyArray<SectionDefinition> => {
   const voiceOptions = voiceCatalog.map((v) => {
-    const hosted = (v.provider ?? "sherpa") === "cartesia"
+    const service = isHostedTts(v.provider ?? "sherpa") ? hostedTts[v.provider as keyof typeof hostedTts] : undefined
+    const hosted = service !== undefined
     const kokoro = v.settings?.TTS_SHERPA_PRESET?.startsWith("kokoro") === true
     const tags: Array<OptionTag> = hosted ? ["hosted", "needs-key"] : kokoro ? ["local", "slow-start"] : ["local"]
     // A voice on this machine whose declared preset is not downloaded yet can be downloaded from the option.
@@ -126,7 +128,7 @@ export const sectionDefinitions = (dirs: ModelDirs = defaultModelDirs): Readonly
       description: v.description,
       tags,
       ...(download !== undefined ? { download } : {}),
-      ...(hosted ? { implication: "Replies in this voice are sent to Cartesia to be spoken." } : {}),
+      ...(service !== undefined ? { implication: `Replies in this voice are sent to ${service.label} to be spoken.` } : {}),
       ...(kokoro ? { implication: "Its first audio takes about 0.2–0.9 s longer than the standard voice." } : {})
     }
   })
@@ -516,12 +518,17 @@ export const sectionDefinitions = (dirs: ModelDirs = defaultModelDirs): Readonly
       },
       checks: [
         (v) => {
-          if (v.secretSet("CARTESIA_API_KEY")) return []
           const enabled = new Set([...(Array.isArray(v.value("VOICES")) ? v.value("VOICES") as ReadonlyArray<string> : []), String(v.value("DEFAULT_VOICE"))])
-          const hosted = [...enabled].filter((name) => engineOfVoice(name, v.value("TTS_PROVIDER")) === "cartesia")
-          return hosted.length === 0 ? [] : [
-            warn("VOICES", `${hosted.join(", ")} ${hosted.length === 1 ? "speaks" : "speak"} through Cartesia, but there is no Cartesia key: add it on the Voice engines page.`)
-          ]
+          return Object.entries(hostedTts).flatMap(([provider, service]) => {
+            if (v.secretSet(service.keyEnv)) return []
+            const hosted = [...enabled].filter((name) => engineOfVoice(name, v.value("TTS_PROVIDER")) === provider)
+            return hosted.length === 0 ? [] : [
+              warn(
+                "VOICES",
+                `${hosted.join(", ")} ${hosted.length === 1 ? "speaks" : "speak"} through ${service.label}, but there is no ${service.label} key: add it on the Voice engines page.`
+              )
+            ]
+          })
         }
       ]
     },
@@ -529,7 +536,7 @@ export const sectionDefinitions = (dirs: ModelDirs = defaultModelDirs): Readonly
       id: "voice-engines",
       title: "Voice engines",
       group: "voices",
-      page: { id: "engines", title: "Voice engines", description: "The engine of the standard voice, and the hosted voice service." },
+      page: { id: "engines", title: "Voice engines", description: "The engine of the standard voice, and the hosted voice services." },
       order: 20,
       protected: true,
       spec: {
@@ -540,7 +547,8 @@ export const sectionDefinitions = (dirs: ModelDirs = defaultModelDirs): Readonly
           default: "sherpa",
           options: [
             { value: "sherpa", label: "On this machine (Piper/Kokoro)", tags: ["local"] },
-            { value: "cartesia", label: "Cartesia", tags: ["hosted", "needs-key"], implication: "Replies are sent to Cartesia to be spoken." }
+            { value: "cartesia", label: "Cartesia", tags: ["hosted", "needs-key"], implication: "Replies are sent to Cartesia to be spoken." },
+            { value: "elevenlabs", label: "ElevenLabs", tags: ["hosted", "needs-key"], implication: "Replies are sent to ElevenLabs to be spoken." }
           ],
           apply: reload
         }),
@@ -549,13 +557,21 @@ export const sectionDefinitions = (dirs: ModelDirs = defaultModelDirs): Readonly
           description: "For Cartesia voices (the standard voice on Cartesia, or the expressive voice).",
           env: "CARTESIA_API_KEY",
           apply: reload
+        }),
+        ELEVENLABS_API_KEY: Setting.secret({
+          label: "ElevenLabs API key",
+          description: "For ElevenLabs voices (the standard voice on ElevenLabs, or a voice set to it with VOICE_<NAME>_PROVIDER=elevenlabs).",
+          env: "ELEVENLABS_API_KEY",
+          apply: reload
         })
       },
       checks: [
-        (v) =>
-          v.value("TTS_PROVIDER") === "cartesia" && !v.secretSet("CARTESIA_API_KEY")
-            ? [warn("TTS_PROVIDER", "Cartesia is chosen but there is no Cartesia key: the standard voice fails until you add it below.")]
-            : []
+        (v) => {
+          const provider = String(v.value("TTS_PROVIDER"))
+          if (!isHostedTts(provider) || v.secretSet(hostedTts[provider].keyEnv)) return []
+          const { label } = hostedTts[provider]
+          return [warn("TTS_PROVIDER", `${label} is chosen but there is no ${label} key: the standard voice fails until you add it below.`)]
+        }
       ]
     },
 

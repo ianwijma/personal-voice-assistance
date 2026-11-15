@@ -458,7 +458,7 @@ const initialSections = (): Array<SettingsSection> => [
     id: "voice-engines",
     title: "Voice engines",
     group: "voices",
-    page: { id: "engines", title: "Voice engines", description: "The engine of the standard voice, and the hosted voice service." },
+    page: { id: "engines", title: "Voice engines", description: "The engine of the standard voice, and the hosted voice services." },
     order: 20,
     protected: true,
     form: {
@@ -472,13 +472,15 @@ const initialSections = (): Array<SettingsSection> => [
           source: "default",
           options: [
             { value: "sherpa", label: "On this machine (Piper/Kokoro)", tags: ["local"] },
-            { value: "cartesia", label: "Cartesia", tags: ["hosted", "needs-key"], implication: "Replies are sent to Cartesia to be spoken." }
+            { value: "cartesia", label: "Cartesia", tags: ["hosted", "needs-key"], implication: "Replies are sent to Cartesia to be spoken." },
+            { value: "elevenlabs", label: "ElevenLabs", tags: ["hosted", "needs-key"], implication: "Replies are sent to ElevenLabs to be spoken." }
           ]
         },
-        { type: "secret", key: "CARTESIA_API_KEY", label: "Cartesia API key", apply: "reload", env: "CARTESIA_API_KEY", source: "default" }
+        { type: "secret", key: "CARTESIA_API_KEY", label: "Cartesia API key", apply: "reload", env: "CARTESIA_API_KEY", source: "default" },
+        { type: "secret", key: "ELEVENLABS_API_KEY", label: "ElevenLabs API key", apply: "reload", env: "ELEVENLABS_API_KEY", source: "default" }
       ],
       values: { TTS_PROVIDER: "sherpa" },
-      secrets: { CARTESIA_API_KEY: { set: false, source: "none" } },
+      secrets: { CARTESIA_API_KEY: { set: false, source: "none" }, ELEVENLABS_API_KEY: { set: false, source: "none" } },
       errors: []
     },
     revision: 1
@@ -544,8 +546,10 @@ const checks = (list: ReadonlyArray<SettingsSection>): { errors: Array<FieldErro
   if (v("LLM_PROVIDER") === "anthropic" && !secretSet("ANTHROPIC_API_KEY", list)) {
     warnings.push({ section: "language-model", key: "ANTHROPIC_API_KEY", message: "The Claude API is chosen but there is no API key: replies fail until you add it here." })
   }
-  if (v("TTS_PROVIDER") === "cartesia" && !secretSet("CARTESIA_API_KEY", list)) {
-    warnings.push({ section: "voice-engines", key: "TTS_PROVIDER", message: "Cartesia is chosen but there is no Cartesia key: the standard voice fails until you add it below." })
+  for (const [provider, label, key] of [["cartesia", "Cartesia", "CARTESIA_API_KEY"], ["elevenlabs", "ElevenLabs", "ELEVENLABS_API_KEY"]] as const) {
+    if (v("TTS_PROVIDER") === provider && !secretSet(key, list)) {
+      warnings.push({ section: "voice-engines", key: "TTS_PROVIDER", message: `${label} is chosen but there is no ${label} key: the standard voice fails until you add it below.` })
+    }
   }
   const voices = v("VOICES")
   if (Array.isArray(voices) && voices.includes("expressive") && !secretSet("CARTESIA_API_KEY", list)) {

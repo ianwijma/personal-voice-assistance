@@ -234,6 +234,9 @@ not in the UI unless stated); *drop* = remove.
 | `CARTESIA_MAX_BUFFER_DELAY_MS` | Server-side buffering | 0 | `index.ts:390` | no | **UI** per voice, advanced |
 | `CARTESIA_SAMPLE_RATE` | Output Hz | 24000 | `index.ts:389` | no | **drop from the UI** (the router resamples, nothing to gain); env stays for tests |
 | `CARTESIA_URL` | Endpoint | `wss://api.cartesia.ai` | `index.ts:391` | no | **dev** |
+| `ELEVENLABS_API_KEY` | Key | — | `tts-elevenlabs/src/index.ts` (`config`) | no | **UI**, vault → Voices › Voice engines (added 2026-11-16) |
+| `ELEVENLABS_VOICE`, `_MODEL`, `_LANGUAGE`, `_SPEED`, `_STABILITY`, `_AUTO_MODE` | Voice id, model, language, voice settings | `EXAVITQu4vr4xnSDxMaL`, `eleven_flash_v2_5`, unset, unset, unset, true | `tts-elevenlabs/src/index.ts` (`config`) | no | engine keys (move from `.env`, saved by key); per voice with `VOICE_<NAME>_` |
+| `ELEVENLABS_SAMPLE_RATE`, `ELEVENLABS_URL` | Output Hz, endpoint | 24000, `wss://api.elevenlabs.io` | `tts-elevenlabs/src/index.ts` (`config`) | no | **dev** |
 
 ### 1.5 Modules
 

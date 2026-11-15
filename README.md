@@ -4,7 +4,7 @@
 
 Created in [T3 Code](https://t3.codes).
 
-A personal voice assistant that runs on your Linux machine. You talk, it answers out loud, and it can call tools (the clock and the weather so far) to look things up. **Everything runs locally except the language model:** speech recognition, turn detection and speech synthesis use [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) models on the CPU, so the only key you need is the language model's. Hosted speech providers (Deepgram, Cartesia) remain available as options.
+A personal voice assistant that runs on your Linux machine. You talk, it answers out loud, and it can call tools (the clock and the weather so far) to look things up. **Everything runs locally except the language model:** speech recognition, turn detection and speech synthesis use [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) models on the CPU, so the only key you need is the language model's. Hosted speech providers (Deepgram, Cartesia, ElevenLabs) remain available as options.
 
 Two goals decide the design:
 
@@ -61,7 +61,7 @@ model that is not on this machine yet is downloaded from the same page. The comm
 | Language model: offline stand-in, Claude API (key), Claude subscription | Language model › Provider |
 | Speech recognition: on this machine (model, language, turn timing, microphone processing) or Deepgram | Speech recognition › Engine, Turn timing, Microphone processing, Deepgram |
 | Speech and voice models: download, cancel, delete | Speech recognition › Models, Voices › Models |
-| Voices, the default voice, their engines and the Cartesia key | Voices |
+| Voices, the default voice, their engines and the Cartesia and ElevenLabs keys | Voices |
 | Modules (clock, weather, …) | Modules |
 | Keys, the vault password, who may change what | Keys & access |
 | What `.env` or the environment still sets, and **Move to settings** | Diagnostics › Settings from outside |
@@ -91,8 +91,8 @@ The command-line modes unlock the vault with `PVA_VAULT_PASSWORD`, or ask for th
 `AUDIO_INPUT_FILE`, `AUDIO_INPUT_TRAILING_SILENCE_MS`, `AUDIO_OUTPUT_DIR`, `PIPEWIRE_*` (CLI audio), `BARGE_IN`,
 `BENCH_*` (benchmarks; `BENCH_LLM_FIRST_TOKEN_MS` / `BENCH_LLM_TOKENS_PER_S` also give the offline stand-in a
 simulated speed in serve mode), `SERVE_ALLOWED_ORIGINS`, `PVA_WEB_DIR`, `PVA_VAULT_PATH`, `DEEPGRAM_URL`,
-`CARTESIA_URL`, and the web mock's `MOCK_*` / `E2E_MOCK_PORT`. The adapter READMEs list every provider setting by
-its variable name ([stt-sherpa](packages/stt-sherpa/README.md), [tts-sherpa](packages/tts-sherpa/README.md)), which is
+`CARTESIA_URL`, `ELEVENLABS_URL`, and the web mock's `MOCK_*` / `E2E_MOCK_PORT`. The adapter READMEs list every provider setting by
+its variable name ([stt-sherpa](packages/stt-sherpa/README.md), [tts-sherpa](packages/tts-sherpa/README.md), [tts-elevenlabs](packages/tts-elevenlabs/README.md)), which is
 also the key it is saved under.
 
 `fake` is an offline LLM stand-in: it answers time questions through the clock tool and echoes everything else. It is the default so that text mode works without any key. **For real use choose Anthropic (with an API key) or the Claude subscription** under Settings → Language model → Provider (for the Claude subscription, **Use Claude subscription** there saves the choice, opts in, switches the agent on and reloads the engines).
@@ -513,6 +513,16 @@ CARTESIA_API_KEY=...
 VOICE_EXPRESSIVE_CARTESIA_VOICE=<voice id>   # optional: a more expressive Cartesia voice
 ```
 
+**Use ElevenLabs** (hosted, needs a key; [settings](packages/tts-elevenlabs/README.md)): choose *ElevenLabs* as the
+standard voice engine on the Voice engines page and enter the key there, or move one voice to it:
+
+```sh
+ELEVENLABS_API_KEY=...
+TTS_PROVIDER=elevenlabs                              # the standard voice on ElevenLabs, or:
+VOICE_EXPRESSIVE_PROVIDER=elevenlabs                 # only the expressive voice
+VOICE_EXPRESSIVE_ELEVENLABS_VOICE=<voice id>         # optional: a voice from your ElevenLabs library
+```
+
 Any provider setting can be set for one voice with the prefix `VOICE_<NAME>_`. The setting without the prefix is the fallback; a voice can also declare its own defaults (`natural` declares `TTS_SHERPA_PRESET=kokoro-af_heart`, which beats the unprefixed `TTS_SHERPA_PRESET`). For example `VOICE_STANDARD_TTS_SHERPA_PRESET=nl_NL-pim-medium` makes the standard voice Dutch. `VOICE_<NAME>_PROVIDER` swaps the engine of one voice, and `DEFAULT_VOICE` changes which voice speaks replies without a marker. Only enabled voices are initialised, so a voice you have not enabled never needs a key or a model.
 
 Try voices with `say`: `pnpm start say --voice natural --out kokoro.wav "Once upon a time."` (the chosen voice is the default for that run), or with markers, `VOICES=standard,natural pnpm start say "Piper here. [voice:natural] And Kokoro here."`.
@@ -574,11 +584,11 @@ Taken from the files in the model archives and the adapter READMEs; nobody has r
 | Local STT and TTS adapters | unit tests, plus real-model tests and measurements (see their READMEs) |
 | **Local end to end** (`bench --live` with sherpa STT, Piper TTS, the file audio backend and `LLM_PROVIDER=fake`) | run on the development machine, 2026-11-13: 20-turn runs per configuration, transcripts checked, every speculative turn promoted, reply WAVs checked (22050 Hz, plausible length, about −4 dBFS peak). Numbers in [Measured latency](#measured-latency) |
 | Barge-in with files (voice mode, file backend) | a second question started while a long reply was playing: the reply stopped and history kept only the played part. The file backend cannot hear the assistant, so this tests the logic, **not echo handling** |
-| `say` | run with Piper, with Kokoro, and with both in one reply (markers), to WAV files; against a local stand-in for Cartesia; never against real Cartesia |
+| `say` | run with Piper, with Kokoro, and with both in one reply (markers), to WAV files; against local stand-ins for Cartesia and ElevenLabs; never against the real services |
 | `transcribe` | run with the local STT on the test clips (English and Dutch); never against Deepgram |
 | Startup and shutdown with two local voices | model-missing messages checked; Ctrl+C (SIGINT to the whole process group) and a killed parent leave no engine processes |
 | Text mode with `LLM_PROVIDER=fake`, offline benchmark | run end to end on the development machine |
-| Anthropic, Deepgram, Cartesia adapters | unit tests against mock servers and recorded messages; opt-in live tests exist but have **not** been run (no keys) |
+| Anthropic, Deepgram, Cartesia, ElevenLabs adapters | unit tests against mock servers and recorded messages; opt-in live tests exist but have **not** been run (no keys) |
 | PipeWire backend | unit tests with stand-in processes; in voice mode `pw-record` started and delivered audio to a stand-in STT server on the development machine, which has no sound card (so that audio was not a real microphone signal) |
 | Weather module | unit tests with an injected `fetch`; never called against the real Open-Meteo API from the tests |
 | **Serve mode** (WebSocket protocol, ownership, modules and settings from the UI, engine reload, echo gate) | unit tests (module host, echo gate, web audio backend, conversation events) and scripted-client tests against the real server with injected providers; a live test with the local models; run by hand on the development machine with a scripted client streaming `bench-audio` WAVs into `LLM_PROVIDER=fake pnpm start serve`: real recognition, Piper reply audio over the socket, an engine reload with the local models (1.8 s, conversation kept, no engine process left behind), and Ctrl+C leaving no processes |
@@ -593,13 +603,13 @@ Taken from the files in the model archives and the adapter READMEs; nobody has r
 - No real language model: latency with Anthropic is extrapolated from the simulated 300 ms first token, not measured.
 - Echo cancellation and barge-in over open speakers: the headless browser never hears its own output, so `confirm` mode was tested only with a second sentence in the input file, not with real echo (PipeWire echo-cancel snippet untested too). Whether a real browser cancels the assistant's voice (Options → This device → Test echo, with both output paths) is unknown.
 - The web UI on a real device: a laptop through the SSH tunnel, a phone over HTTPS with a real certificate, real `outputLatency`, Bluetooth, speaker selection, Safari and Firefox. Nobody has listened to the browser's playback.
-- Deepgram and Cartesia have never been called for real.
+- Deepgram, Cartesia and ElevenLabs have never been called for real.
 - Thread counts were tuned on one 16-thread machine; a 4-core machine will behave differently.
 
 The opt-in live adapter tests run when the keys are present in the shell environment (the test runner does not read `.env`):
 
 ```sh
-ANTHROPIC_API_KEY=... CARTESIA_API_KEY=... DEEPGRAM_API_KEY=... DEEPGRAM_TEST_AUDIO=question.wav pnpm test
+ANTHROPIC_API_KEY=... CARTESIA_API_KEY=... ELEVENLABS_API_KEY=... DEEPGRAM_API_KEY=... DEEPGRAM_TEST_AUDIO=question.wav pnpm test
 PVA_PIPEWIRE_LIVE=1 pnpm --filter @pva/audio-pipewire test
 ```
 
@@ -612,6 +622,7 @@ packages/stt-sherpa       Stt on this machine: sherpa-onnx (whole-turn Parakeet/
 packages/tts-sherpa       Tts on this machine: Piper / Kokoro via sherpa-onnx, one child process per engine (default)
 packages/stt-deepgram     Stt via Deepgram Flux (hosted, optional)
 packages/tts-cartesia     Tts via Cartesia Sonic (hosted, optional)
+packages/tts-elevenlabs   Tts via the ElevenLabs multi-context WebSocket (hosted, optional)
 packages/audio-pipewire   microphone/speaker via pw-record / pw-cat
 packages/audio-file       WAV in / WAV out (tests, benchmarks)
 packages/audio-web        the browser as microphone and speaker (serve mode), over an abstract link

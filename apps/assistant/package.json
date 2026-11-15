@@ -22,6 +22,7 @@
     "@pva/stt-deepgram": "workspace:*",
     "@pva/stt-sherpa": "workspace:*",
     "@pva/tts-cartesia": "workspace:*",
+    "@pva/tts-elevenlabs": "workspace:*",
     "@pva/tts-sherpa": "workspace:*",
     "effect": "catalog:",
     "ws": "catalog:"
