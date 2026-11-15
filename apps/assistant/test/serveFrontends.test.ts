@@ -289,7 +289,8 @@ describe("front-end kinds and devices", () => {
     expect((await request(tab1.client, { type: "device.update", patch: { activation: "wake-phrase", followUpSeconds: 3, voice: "sherpa:en_US-lessac-medium" } })).ok).toBe(true)
     for (const tab of [tab1, tab2]) {
       const p = await profileOf(tab.client, (m) => m.profile.activation === "wake-phrase")
-      expect(p.profile).toMatchObject({ followUpSeconds: 3, voice: "sherpa:en_US-lessac-medium" })
+      // A device's own voice is retired since settings version 4 (the assistant's voice speaks): accepted, not kept.
+      expect(p.profile).toMatchObject({ followUpSeconds: 3, voice: "" })
     }
     await admin.client.waitFor("devices", (m) => m.devices.some((d) => d.overrides.activation === "wake-phrase"), { from: 0 })
     // Not editable by the device itself; an unknown voice; a page without a device.
@@ -307,8 +308,9 @@ describe("front-end kinds and devices", () => {
     expect((await profileOf(tab1.client, (m) => m.profile.followUpSeconds === 8)).profile.activation).toBe("wake-phrase")
 
     const saved = JSON.parse(readFileSync(join(server.dataDir, "settings.json"), "utf8"))
-    expect(saved.version).toBe(3)
-    expect(saved.devices["phone-0001"]).toMatchObject({ kind: WEB_VOICE_KIND, name: "Test browser", overrides: { activation: "wake-phrase", voice: "sherpa:en_US-lessac-medium" } })
+    expect(saved.version).toBe(4)
+    expect(saved.devices["phone-0001"]).toMatchObject({ kind: WEB_VOICE_KIND, name: "Test browser", own: { withoutPhrase: { mode: "nobody" } } })
+    expect(saved.devices["phone-0001"].own.assistants).toBeUndefined()
   })
 
   it("admin: kind defaults and device overrides reach running devices live; rename, reset, forget; unknown ids", async () => {

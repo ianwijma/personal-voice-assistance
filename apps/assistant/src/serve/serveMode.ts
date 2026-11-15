@@ -161,7 +161,8 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     })
     // Before anything in the data directory is read or recovered, and held until the server stops: the one writer.
     const lock = yield* acquireDataDirLock(options.dataDir)
-    const store = yield* loadSettingsStore(options.dataDir, { lock, vault })
+    // The environment and the catalog: what a version-3 file's migration reads, and what locks the migrated assistant.
+    const store = yield* loadSettingsStore(options.dataDir, { lock, vault, assistants: { env, catalog } })
     for (const problem of store.problems) yield* Effect.logError(problem)
     /**
      * Settings and keys that may come from two saves (a damaged journal): nothing that uses them starts. Every page

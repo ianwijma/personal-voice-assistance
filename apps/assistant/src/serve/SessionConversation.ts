@@ -32,7 +32,8 @@ export type SendOutcome = "accepted" | "busy" | "not_running"
 
 export interface SessionConversationOptions {
   readonly engine: Engine
-  readonly input: AudioInput["Service"]
+  /** The microphone this conversation transcribes itself (with `gate`). Not used when `speech` is given. */
+  readonly input?: AudioInput["Service"]
   readonly output: AudioOutput["Service"]
   /** This session's trace service (its own turn ids, `Trace.session` set). */
   readonly turnTrace: TurnTrace["Service"]
@@ -46,8 +47,15 @@ export interface SessionConversationOptions {
   readonly onEvent: (event: ConversationEvent) => void
   /** A new conversation started (`newConversation`, or the conversation's idle reset). */
   readonly onConversation?: (conversation: ConversationInfo, reason: "new" | "idle") => void
-  /** The recognition stream on its way to the conversation (echo gate, wake gate, transcript, state). */
-  readonly gate: (events: Stream.Stream<SttEvent, unknown>) => Stream.Stream<SttEvent, unknown>
+  /** The recognition stream on its way to the conversation (echo gate, wake gate, transcript, state). Not used with `speech`. */
+  readonly gate?: (events: Stream.Stream<SttEvent, unknown>) => Stream.Stream<SttEvent, unknown>
+  /**
+   * The session dispatcher's seam (docs/ASSISTANTS.md §3.3, `SessionDispatcher.ts`): when given, the voice loop reads
+   * its speech events (and the dispatcher's own interrupts) from this stream, made at each run start, instead of
+   * transcribing `input` through `gate` itself. Typed input still goes through `send`. Neither `speech` nor
+   * `input` with `gate`: the loop gets typed input only.
+   */
+  readonly speech?: (built: BuiltEngines) => Stream.Stream<ConversationInput, unknown>
   /** The idle reset (`Conversation.idleResetMs`), read at every turn start. */
   readonly idleResetMs?: () => number | undefined
   /** Typed inputs accepted but not yet taken by the conversation, at most. Default 4. */
@@ -145,8 +153,13 @@ export const makeSessionConversation = (options: SessionConversationOptions): Ef
         live = conversation
         ready = true
 
+        const speech: Stream.Stream<ConversationInput, unknown> = options.speech !== undefined
+          ? options.speech(built)
+          : options.input !== undefined && options.gate !== undefined
+          ? options.gate(providers.stt.transcribe(options.input.stream))
+          : Stream.never
         const events = Stream.merge(
-          options.gate(providers.stt.transcribe(options.input.stream)).pipe(Stream.map((input): Control => ({ input, generation: undefined }))),
+          speech.pipe(Stream.map((input): Control => ({ input, generation: undefined }))),
           Stream.fromQueue(control)
         ).pipe(
           // One at a time, so each input is counted out (and checked against Stop) just before the conversation takes it.

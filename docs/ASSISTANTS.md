@@ -804,6 +804,61 @@ WP-3 onwards). PR #4 is not needed until WP-17.
 The UI packages can expose fields whose server half lands later (Hearing before WP-11). Until then the server stores
 those fields, and the page says "used from the next start" where they are not yet live.
 
+### Baseline measurements (WP-0)
+
+Measured 2026-11-16 on the development machine: AMD Ryzen 9 7945HX with Radeon Graphics, 16 cores, 16 logical
+processors (`/proc/cpuinfo`), 31,789,676 kB = 30.3 GiB RAM (`/proc/meminfo`), Linux 7.0.0-43, Node 22.22.1, sherpa-onnx-node
+2.0.1 (recognisers, Kokoro) and 1.13.8 (Piper).
+
+**Method.** `apps/assistant/src/bench/baseline.ts` (`node --import tsx src/bench/baseline.ts --runs 5 --model-dir
+<models>`). Each run is a fresh process that calls the real adapter's `make` (`stt-sherpa` or `tts-sherpa`), which
+returns when the model is loaded and warmed up. *Added MB* = RSS of the process after minus before (`/proc/<pid>/statm`);
+a recogniser is a worker thread of the process, a voice engine is a child process, so its whole RSS is added (it
+includes the child's own Node runtime, about 40 MB). *Load ms* = wall-clock time of `make` (worker or child start,
+sherpa import, model load, warm-up decodes). Five runs each; the table shows the minimum and the median. The model
+files were already in the page cache (they had been read before), so a first start after boot is slower; no turn had
+been decoded, and a recogniser's memory grows with the longest turn it decodes. Models that are not installed are not
+measured and nothing was downloaded. `ramMb` (median) and `loadMs` (minimum) are recorded in
+`packages/stt-sherpa/src/presets.ts`.
+
+**Noise.** Other test suites ran on the machine during the measurements (load average 1.4–6 at the time). Memory was
+stable (the five runs of a model differ by at most 4 %, usually under 2 %); load time had one slow outlier per model
+(up to +300 ms), so use the minimum, not the mean.
+
+| Item | Added MB min | Added MB median | Load ms min | Load ms median |
+|---|---|---|---|---|
+| stt `parakeet-v2` | 1024 | 1050 | 1609 | 1657 |
+| stt `parakeet-ultra` | 1045 | 1067 | 1632 | 1643 |
+| stt `whisper-turbo` | 1613 | 1640 | 2621 | 2671 |
+| stt `hybrid-nemotron-parakeet` | 1668 | 1683 | 2443 | 2477 |
+| stt `nemotron-560` | 940 | 948 | 1178 | 1207 |
+| stt `nemotron-320` | 946 | 964 | 1240 | 1289 |
+| stt `zipformer-en` | 166 | 167 | 1308 | 1375 |
+| stt `fast-conformer-en` | 248 | 250 | 745 | 759 |
+| voice Piper `en_US-lessac-medium` | 163 | 163 | 473 | 481 |
+| voice Piper `nl_NL-pim-medium` | 169 | 169 | 722 | 730 |
+| voice Kokoro `kokoro-af_heart` (one engine serves all Kokoro speakers) | 563 | 563 | 1099 | 1124 |
+
+Not measured (not installed): none of the recogniser presets or the three voice engines above were missing. Other
+Piper voices and Kokoro speakers were not measured (a Piper voice differs by model size; every Kokoro speaker shares
+the one engine).
+
+**Two talking sessions on one recogniser worker.** `bench --live --rounds 2 --sessions N` with `parakeet-v2`, the
+Piper voice `en_US-lessac-medium`, the stand-in LLM (first token 250 ms, 60 tokens/s) and the five clips of
+`bench-audio` (10 turns per session); sessions play the clips rotated by one, and their user audio ends at the same
+moment. Three runs each, medians of the 10 turns per session, ms from the end of the user's audio:
+
+| Sessions | EagerEndOfTurn | EndOfTurn | playback start |
+|---|---|---|---|
+| 1 | 397 / 406 / 427 | 660 / 651 / 680 | 704 / 716 / 730 |
+| 2 (session 1) | 404 / 440 / 422 | 660 / 661 / 641 | 722 / 759 / 744 |
+| 2 (session 2) | 479 / 424 / 425 | 661 / 650 / 652 | 789 / 768 / 772 |
+
+With two sessions the end-of-turn time does not change, the eager time and the playback start grow by about 10–60 ms
+(the other session's decode queues ahead of yours) and the spread between runs is of the same size, so this is an
+indication, not a precise cost. Only one pair of simultaneous sessions was measured, with ~1 s clips; more sessions,
+longer turns and a second loaded model are WP-11's measurement.
+
 ## 9. Risks and open questions
 
 **Risks**

@@ -118,7 +118,7 @@ export const makeFrontends = (options: FrontendsOptions): Frontends => {
   /** `lastSeen` newer than the stored one (memory only until the next save). */
   const lastSeen = new Map<string, number>()
 
-  const data = (): FrontendData => store.settings()
+  const data = (): FrontendData => store.frontendData()
   /** The built-in defaults, with the assistant's `CONVERSATION_IDLE_MINUTES`. */
   const builtin = (): DeviceProfile => {
     const minutes = options.conversationIdleMinutes?.()

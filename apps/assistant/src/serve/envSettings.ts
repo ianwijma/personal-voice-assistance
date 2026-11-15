@@ -3,6 +3,7 @@ import type { HostResult } from "@pva/core"
 import type { EnvEntry, EnvInfo, EnvKind, SettingsGroup, SettingsPatch, SettingValue } from "@pva/protocol"
 import { Effect } from "effect"
 import { type CommentOutResult, commentOutKeys, type EnvOrigin, type EnvView } from "../envView.ts"
+import { assistantFieldOf, MIGRATED_ASSISTANT_ID } from "./migrateAssistants.ts"
 import type { Sections } from "./sections.ts"
 import { sectionDefinitions } from "./sectionDefinitions.ts"
 import type { SettingsStore } from "./SettingsStore.ts"
@@ -15,6 +16,11 @@ import type { SettingsStore } from "./SettingsStore.ts"
  * (benchmarks, tests, the command-line audio), `setting` (a field of a section
  * or module, or an engine setting without a field yet) and `unknown` (nothing
  * reads it). Only `setting` variables from a `.env` file can be moved.
+ *
+ * A key that became a field of the assistant (docs/ASSISTANTS.md §4.4: SYSTEM_PROMPT, ANTHROPIC_MODEL, STT_*, …) is
+ * an `assistant-field` target: its value applies to, and locks, that field of the migrated assistant only, and
+ * "Move to settings" writes it there (through its flat key, which today's engines still read and which the store
+ * mirrors into the assistant) before the line is commented out.
  */
 
 /** Read before the settings exist, or deciding who may reach the page: they stay in `.env`. */
@@ -112,6 +118,18 @@ const groupTitle: Readonly<Record<string, string>> = {
 export type EnvTarget =
   | { readonly kind: "section"; readonly key: string; readonly setting: Setting<unknown>; readonly path: ReadonlyArray<string>; readonly title: string }
   | {
+    readonly kind: "assistant-field"
+    /** The assistant whose field it sets and locks: the migrated one. */
+    readonly assistantId: string
+    /** The field (a dotted path of `Assistant`). */
+    readonly field: string
+    /** Its flat key (the section field the settings screen still shows). */
+    readonly key: string
+    readonly setting: Setting<unknown>
+    readonly path: ReadonlyArray<string>
+    readonly title: string
+  }
+  | {
     readonly kind: "module"
     readonly moduleId: string
     readonly key: string
@@ -142,7 +160,14 @@ export const makeEnvCatalog = (catalog: ReadonlyArray<ModuleDefinition<any>>): E
   for (const d of sectionDefinitions()) {
     const p = page(`${groupSlug[d.group]}/${d.page.id}`, titles)
     for (const [key, setting] of Object.entries(d.spec as SettingsSpec)) {
-      if (setting.env !== undefined) targets.set(setting.env, { kind: "section", key, setting, ...p })
+      if (setting.env === undefined) continue
+      const assistantField = assistantFieldOf(setting.env)
+      targets.set(
+        setting.env,
+        assistantField === undefined
+          ? { kind: "section", key, setting, ...p }
+          : { kind: "assistant-field", assistantId: MIGRATED_ASSISTANT_ID, field: assistantField, key, setting, ...p }
+      )
     }
   }
   for (const def of catalog) {
@@ -311,8 +336,10 @@ export const makeEnvMover = (options: {
         const r = yield* options.host.configure(p.target.moduleId, patch, { includeHidden: true })
         return r.ok ? { ok: true as const } : { ok: false as const, message: r.error.message }
       }
-      const storeKey = p.target.kind === "section" ? p.target.key : p.key
-      const value = p.target.kind === "section" ? decodedValue(p.target.setting, p.text) : p.text
+      // A section field or an assistant field by its flat key (the store mirrors the latter into the assistant), or
+      // an engine key as it is.
+      const storeKey = p.target.kind === "engine" ? p.key : p.target.key
+      const value = p.target.kind === "engine" ? p.text : decodedValue(p.target.setting, p.text)
       const r = yield* Effect.result(
         options.store.saveAssistant([storeKey], secret ? {} : { [storeKey]: value as SettingValue }, secret ? { [storeKey]: p.text } : {})
       )

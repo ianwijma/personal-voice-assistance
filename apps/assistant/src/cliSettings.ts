@@ -6,6 +6,8 @@
  * The vault is unlocked with `PVA_VAULT_PASSWORD`, else (stdin and stderr are a terminal) by asking for the password;
  * Enter skips it. Without the keys, a provider that needs one fails with "X is not set (the key vault is locked …)".
  */
+import type { ModuleDefinition } from "@pva/core"
+import type { Assistant } from "@pva/protocol"
 import { ConfigProvider, Context, Effect } from "effect"
 import * as readline from "node:readline"
 import { makeSections } from "./serve/sections.ts"
@@ -17,6 +19,12 @@ export interface CliSettings {
   readonly store: SettingsStore | undefined
   readonly vaultState: "none" | "locked" | "unlocked"
   readonly vaultPath: string
+  /**
+   * The assistant a CLI mode answers as (docs/ASSISTANTS.md §4.4): `assistantId` if it exists, else the first
+   * switched-on one, with the environment applied to the migrated one as in serve mode. A version-3 data directory
+   * is migrated in memory only. Absent: no settings, or no assistant.
+   */
+  readonly assistant?: Assistant | undefined
 }
 
 /** The CLI's saved settings, when `withCliSettings` loaded them (`startCliModules` reuses them). */
@@ -34,6 +42,16 @@ export interface LoadCliOptions {
   readonly prompt?: () => Promise<string>
   /** For tests. */
   readonly openVault?: (path: string) => Promise<Vault>
+  /** The module catalog, for migrating a version-3 data directory in memory (which modules were on). */
+  readonly catalog?: ReadonlyArray<ModuleDefinition<any>>
+  /** The assistant to answer as (default: the first switched-on one). */
+  readonly assistantId?: string
+}
+
+/** The assistant a CLI mode uses: `id` when it exists, else the first switched-on one (with the environment applied). */
+export const cliAssistant = (store: SettingsStore, id?: string): Assistant | undefined => {
+  const inEffect = store.assistantsInEffect().map((a) => a.assistant)
+  return (id !== undefined ? inEffect.find((a) => a.id === id) : undefined) ?? inEffect.find((a) => a.on)
 }
 
 export const loadCliSettings = (options: LoadCliOptions): Effect.Effect<{ readonly settings: CliSettings; readonly configProvider: ConfigProvider.ConfigProvider }> =>
@@ -63,12 +81,16 @@ export const loadCliSettings = (options: LoadCliOptions): Effect.Effect<{ readon
       }
     }
     const vaultState = vault?.state() ?? "none"
-    const store = yield* loadSettingsStore(options.dataDir, { readOnly: true, ...(vault !== undefined ? { vault } : {}) }).pipe(
+    const store = yield* loadSettingsStore(options.dataDir, {
+      readOnly: true,
+      ...(vault !== undefined ? { vault } : {}),
+      assistants: { env: options.env, ...(options.catalog !== undefined ? { catalog: options.catalog } : {}) }
+    }).pipe(
       Effect.tap((s) => Effect.forEach(s.problems, (p) => Effect.logWarning(p), { discard: true })),
       Effect.catchCause((cause) => Effect.as(Effect.logWarning("Could not read the saved settings; using the environment and defaults", cause), undefined))
     )
     return {
-      settings: { store, vaultState, vaultPath: options.vaultPath },
+      settings: { store, vaultState, vaultPath: options.vaultPath, assistant: store === undefined ? undefined : cliAssistant(store, options.assistantId) },
       configProvider: store === undefined ? fromEnv() : cliConfigProvider(store, options.env)
     }
   })

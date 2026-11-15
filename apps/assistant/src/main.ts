@@ -20,7 +20,7 @@ import { runOffline, runOfflineSessions, type SimulatedDelays, zeroDelays } from
 import { formatReport } from "./bench/report.ts"
 import { AppConfig } from "./config.ts"
 import { userCwd } from "./env.ts"
-import { startCliModules, withModuleInstructions } from "./modules.ts"
+import { moduleCatalog, startCliModules, withModuleInstructions } from "./modules.ts"
 import { FakeLlm } from "./FakeLlm.ts"
 import { LlmLayer, SttLayer } from "./providers.ts"
 import { sayCommand } from "./say.ts"
@@ -250,7 +250,7 @@ const withSavedSettings = <A, E>(effect: Effect.Effect<A, E>): Effect.Effect<A, 
         cliSettings = settings
         return effect
       }),
-      { env: process.env, dataDir, vaultPath, ...(interactive ? { prompt: askVaultPassword } : {}) }
+      { env: process.env, dataDir, vaultPath, catalog: moduleCatalog, ...(interactive ? { prompt: askVaultPassword } : {}) }
     )
   })
 
