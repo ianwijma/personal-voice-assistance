@@ -48,8 +48,11 @@ export interface VoiceSessions {
   readonly connections: (key: string, count: number) => void
   /** The device's conversation: its session's, else the one its first turn will start in. */
   readonly conversation: (key: string) => ConversationInfo
-  /** `conversation.new` on a device: its session's, else a new reserved id (announced). */
-  readonly newConversation: (key: string) => Effect.Effect<ConversationInfo>
+  /**
+   * `conversation.new` on a device: `assistant`'s conversation in its session (absent: the answering assistant's),
+   * else a new reserved id (announced).
+   */
+  readonly newConversation: (key: string, assistant?: string) => Effect.Effect<ConversationInfo>
   /** For admin: every session, most recently active first. */
   readonly list: () => ReadonlyArray<SessionInfo>
   readonly all: () => ReadonlyArray<VoiceSession>
@@ -144,10 +147,10 @@ export const makeVoiceSessions = (options: VoiceSessionsOptions): VoiceSessions 
       timers.set(key, timer)
     },
     conversation: (key) => sessions.get(key)?.session.conversation.conversation() ?? reserved.get(key) ?? reserve(key, fresh()),
-    newConversation: (key) =>
+    newConversation: (key, assistant) =>
       Effect.suspend(() => {
         const session = sessions.get(key)?.session
-        if (session !== undefined) return session.conversation.newConversation
+        if (session !== undefined) return session.conversation.newConversation(assistant)
         return Effect.sync(() => {
           const info = reserve(key, fresh())
           options.announce(key, info)

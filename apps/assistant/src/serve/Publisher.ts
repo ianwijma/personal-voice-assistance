@@ -18,6 +18,8 @@ interface TurnView {
   pending: boolean
   readonly buffer: Array<ServerMessage>
   readonly voice: string
+  /** The assistant answering (protocol 7 `assistantId` on its messages). */
+  readonly assistant: string | undefined
 }
 
 export interface PublisherOptions {
@@ -33,7 +35,8 @@ export interface PublisherOptions {
 }
 
 export interface Publisher {
-  readonly onEvent: (event: ConversationEvent) => void
+  /** `assistant`: the assistant whose conversation the event comes from (its id tags the turn's messages). */
+  readonly onEvent: (event: ConversationEvent, assistant?: string) => void
   /** The most recent traces, oldest first (for `welcome`). */
   readonly traces: () => ReadonlyArray<TraceInfo>
   /** The committed turn that is running (between `turn.start` and `turn.end`). */
@@ -55,7 +58,7 @@ const truncateInput = (input: unknown): unknown => {
 export const traceInfo = (trace: Trace): TraceInfo => {
   const origin = trace.marks.endOfTurn ?? trace.startedAt
   const marks: Record<string, number> = {}
-  for (const key of ["llmRequestSent", "llmFirstToken", "firstClause", "ttsFirstAudio", "playbackStart"] as const) {
+  for (const key of ["llmRequestSent", "llmFirstToken", "firstClause", "ttsFirstAudio", "playbackStart", "routeSent", "routeReceived"] as const) {
     const t = trace.marks[key]
     if (t !== undefined) marks[key] = Math.round((t - origin) * 10) / 10
   }
@@ -69,7 +72,12 @@ export const traceInfo = (trace: Trace): TraceInfo => {
     tools: trace.tools.map((t) => ({ name: t.name, ms: Math.max(0, Math.round(t.ms)) })),
     voices: [...trace.voices],
     ...(trace.client !== undefined ? { client: { ...trace.client } } : {}),
-    ...(trace.session !== undefined ? { session: trace.session.slice(0, 64) } : {})
+    ...(trace.session !== undefined ? { session: trace.session.slice(0, 64) } : {}),
+    // Protocol 7 (docs/ASSISTANTS.md §3.7, §5.4): who answered, on which device, and who chose the assistant.
+    ...(trace.assistant !== undefined ? { assistant: { id: trace.assistant.id, name: trace.assistant.name } } : {}),
+    ...(trace.deviceId !== undefined ? { deviceId: trace.deviceId } : {}),
+    ...(trace.device !== undefined ? { device: trace.device } : {}),
+    ...(trace.route !== undefined ? { route: { ...trace.route } } : {})
   }
 }
 
@@ -84,17 +92,28 @@ export const makePublisher = (options: PublisherOptions): Publisher => {
     else options.broadcast(message)
   }
 
-  const handle = (event: ConversationEvent) => {
+  /** Protocol 7: `assistantId` on a turn's messages. */
+  const tag = (view: TurnView | undefined) => (view?.assistant !== undefined ? { assistantId: view.assistant } : {})
+
+  const handle = (event: ConversationEvent, assistant: string | undefined) => {
     switch (event._tag) {
       case "TurnStarted": {
         const view: TurnView = {
           spoken: event.spoken,
           pending: event.speculative,
           buffer: [],
-          voice: options.voice()
+          voice: options.voice(),
+          assistant
         }
         turns.set(event.turnId, view)
-        const start: ServerMessage = { type: "turn.start", turnId: event.turnId, source: event.source, userText: event.text, spoken: event.spoken }
+        const start: ServerMessage = {
+          type: "turn.start",
+          turnId: event.turnId,
+          source: event.source,
+          userText: event.text,
+          spoken: event.spoken,
+          ...tag(view)
+        }
         if (event.speculative) view.buffer.push(start)
         else {
           committed = event.turnId
@@ -118,7 +137,7 @@ export const makePublisher = (options: PublisherOptions): Publisher => {
         const view = turns.get(event.turnId)
         if (view === undefined || view.spoken) return
         const text = event.text
-        if (text.length > 0) send(event.turnId, { type: "assistant.text", turnId: event.turnId, clause: null, text })
+        if (text.length > 0) send(event.turnId, { type: "assistant.text", turnId: event.turnId, clause: null, text, ...tag(view) })
         return
       }
       case "ClauseQueued": {
@@ -126,7 +145,7 @@ export const makePublisher = (options: PublisherOptions): Publisher => {
         if (view === undefined) return
         const text = event.text.trim()
         if (text.length === 0) return
-        send(event.turnId, { type: "assistant.text", turnId: event.turnId, clause: event.index, text, voice: view.voice })
+        send(event.turnId, { type: "assistant.text", turnId: event.turnId, clause: event.index, text, voice: view.voice, ...tag(view) })
         return
       }
       case "ClausePlaying":
@@ -157,9 +176,10 @@ export const makePublisher = (options: PublisherOptions): Publisher => {
         const info = traceInfo(event.trace)
         traces.push(info)
         if (traces.length > MAX_TRACES) traces.shift()
-        // Admin's traces carry the session (the device's name, which admin sets); the device's own tabs do not need it.
+        // Admin's traces carry the session and the device (its name, which admin sets); the device's own tabs do not
+        // need them.
         options.onTrace?.(info)
-        const { session: _session, ...forDevice } = info
+        const { session: _session, device: _device, deviceId: _deviceId, ...forDevice } = info
         options.broadcast({ type: "turn.end", turnId: event.turnId, outcome: event.outcome, trace: forDevice })
         if (event.outcome === "failed") {
           options.broadcast({
@@ -173,9 +193,9 @@ export const makePublisher = (options: PublisherOptions): Publisher => {
   }
 
   return {
-    onEvent: (event) => {
+    onEvent: (event, assistant) => {
       try {
-        handle(event)
+        handle(event, assistant)
       } catch (error) {
         console.error("serve: could not publish a conversation event", error)
       }

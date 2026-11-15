@@ -891,3 +891,40 @@ longer turns and a second loaded model are WP-11's measurement.
 ## Status
 
 Design only; nothing built (2026-11-16).
+
+### WP-4b thin slice: built 2026-11-16
+
+The store (v4) and the dispatcher are wired into `VoiceSession` / `serveMode`. A device's effective settings
+(`effectiveDeviceSettings`: own sections ← type defaults ← built-in; a session without a device uses the browser
+defaults) give the route gate its config (`routeConfigFrom`), re-applied by `syncProfile` whenever the hub refreshes
+profiles. Per session: one recogniser stream per build (its own `SessionLoop`), echo gate → route gate → dispatcher →
+one `SessionConversation` per assistant (made on first use, fed through an inbox, its `speech` seam), all playing
+through one `OutputLease` over the session's `WebAudio` output, one turn counter for all of them. Per assistant: prompt
++ the instructions of its modules + a registry of its tools (`ModuleSnapshot.parts`, new and additive; capability
+modules only, agent and decision modules always pass; the snapshot's own registry is reused when nothing is left out),
+follow-up (assignment, else assistant), quiet spell (`newConversationAfter`), `replyEarly` (dispatcher) and
+`toolRounds` (read at each build). The language model, recogniser and voice stay the one shared build.
+
+- Traces: `Trace` gains `assistant`, `deviceId`, `device`, `route`, `config` and marks `routeSent`/`routeReceived`;
+  `Publisher.traceInfo` maps the first four into `TraceInfo` (the device's own `turn.end` carries no `device`,
+  `deviceId` or `session`). `turn.start`, `assistant.text`, `reply.start` (audio-web, from the turn's trace),
+  `wake` and `conversation` carry `assistantId`.
+- Routes as traced: phrase, armed (with the phrase that armed it), follow-up, default, typed. Until WP-14 a `decide`
+  utterance (TypeSafe device) is answered by the fallback and traced as `default`; a turn whose utterance reached its
+  conversation only as the barge-in owner is traced as `follow-up`. `config` is not filled yet (the resources it
+  describes arrive with WP-9).
+- Home line: a seam in `serveMode` (`homeLine`, no line until WP-12a adds the `home` section).
+- Typed text follows §2.6 (`typedTextTarget`); a device with no reachable assistant answers `bad_message`.
+  `conversation.new` takes `assistantId`. Snapshot history and conversation are the answering assistant's (§5.3).
+- Not yet: a device without assignments still runs its recogniser (everything is dropped by the gate) instead of none
+  (WP-11); heard-audio recordings do not name the assistant; the dispatcher's books are not reset at a reload (an
+  utterance left open is closed with an empty final at the next build's start, and inboxes are emptied).
+- Tests: `serveAssistants.test.ts` (two assistants on one device: phrase, follow-up, armed, separate histories,
+  prompts and tools, traces; typed text and `conversation.new` per assistant); `bench.test.ts` session-path
+  scenario. Changed: `serveFrontends.test.ts` (`wake` carries `assistantId`; in `always` mode a leading phrase is
+  stripped), `sessionHub.test.ts` (fake session's `sendText`/`stop`).
+- Bench (offline, `pnpm start bench`, 3 runs before and after on this machine, load 0.1–4.8; median / worst ms):
+  orchestration overhead 0.9 / 1.5, 0.8 / 1.5, 0.9 / 1.6 → 0.9 / 1.7, 0.9 / 1.5, 0.9 / 1.6. New rows, session path
+  (route gate, dispatcher, inbox, lease): overhead 0.8 / 1.2, 0.8 / 1.1, 0.8 / 1.0; realistic eager on with three
+  assistants 308 / 534, 307 / 533, 307 / 534 (direct route-gate row 307 / 535, 305 / 535, 307 / 534).
+- Evidence: `docs/assistants-evidence/thin-slice-transcript.txt` (real server, local recogniser and voice, offline LLM).

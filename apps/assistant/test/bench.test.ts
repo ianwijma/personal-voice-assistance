@@ -48,6 +48,17 @@ describe("offline bench", () => {
         assert.deepStrictEqual(rows[1]!.trace!.tools.map((t) => t.name), ["current_time"])
       }
     }))
+
+  it.live("session path (route gate, dispatcher, inbox, output lease): every turn completes, eager turns are promoted", () =>
+    Effect.gen(function*() {
+      for (const eager of [false, true]) {
+        const delays = eager ? { ...zeroDelays, llmFirstTokenMs: 20, eagerLeadMs: 10 } : zeroDelays
+        const rows = yield* runOffline({ name: "session path", delays, eager, dispatch: true }, 1)
+        assert.strictEqual(rows.length, 4)
+        assert.isTrue(rows.every((r) => r.trace?.outcome === "completed" && r.trace.marks.playbackStart !== undefined))
+        if (eager) assert.isTrue(rows.every((r) => r.trace?.speculative === true))
+      }
+    }))
 })
 
 describe("offline bench, several sessions (bench --sessions N)", () => {

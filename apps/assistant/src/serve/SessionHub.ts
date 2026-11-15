@@ -533,7 +533,7 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
       role: isOwner(client) ? "owner" : "observer",
       ownerPresent: o?.owner !== undefined,
       engine: engineSummary(options.engine.status()),
-      history: session === undefined ? [] : historyItems(Effect.runSync(session.conversation.history)),
+      history: session === undefined ? [] : historyItems(Effect.runSync(session.conversation.history())),
       ...(client.role === "voice" ? { device: profileInfo(client) } : {}),
       admin: adminState(client, endReason),
       conversation: key === undefined ? adminConversation : sessions.conversation(key)
@@ -649,7 +649,7 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
         const previous = owners.get(session.key)?.owner
         if (previous !== undefined && previous !== client && session.publisher.committedTurn() !== undefined) {
           // The previous owner's turn in flight (another tab of this device) is interrupted (its reply stops there).
-          session.conversation.send({ _tag: "Interrupt" })
+          session.conversation.stop()
         }
         becomeOwner(client, session)
         announce(session.key, "claimed", previous !== client ? previous : undefined)
@@ -688,7 +688,7 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
         if (session === undefined) return
         const running = session.publisher.committedTurn()
         if (message.turnId !== undefined && message.turnId !== running) return
-        session.conversation.send({ _tag: "Interrupt" })
+        session.conversation.stop()
         return
       }
       case "text.send": {
@@ -702,23 +702,31 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
         const session = sessions.open(client.sessionKey, client.device)
         if (session === "full") return result(client, message.requestId, { ok: false, error: sessionsFull() })
         session.touch()
-        const outcome = session.conversation.send({ _tag: "TextInput", text: message.text, speak: message.speak && isOwner(client) })
-        return result(
-          client,
-          message.requestId,
-          outcome === "accepted"
-            ? { ok: true }
-            : outcome === "busy"
-            ? failure("busy", "The assistant is still taking the previous messages; try again in a moment")
-            : failure("engine_failed", "The speech and language engines are not running; see the admin page")
-        )
+        // Routed to an assistant of the device (docs/ASSISTANTS.md §2.6 "Typed text"): the one the page names, else
+        // the follow-up holder, else who answers without a phrase, … Its conversation is made on first use.
+        const requestId = message.requestId
+        return options.run(Effect.map(
+          session.conversation.sendText(message.text, message.speak && isOwner(client), message.assistantId),
+          (outcome) =>
+            result(
+              client,
+              requestId,
+              outcome === "accepted"
+                ? { ok: true }
+                : outcome === "busy"
+                ? failure("busy", "The assistant is still taking the previous messages; try again in a moment")
+                : outcome === "dropped"
+                ? failure("bad_message", "No assistant answers typed messages on this device")
+                : failure("engine_failed", "The speech and language engines are not running; see the admin page")
+            )
+        ))
       }
       case "conversation.new": {
         // This device's conversation only (any of its connections); a device without a session gets a new id too.
         if (client.role !== "voice" || client.sessionKey === undefined) {
           return result(client, message.requestId, failure("bad_message", "A new conversation is started from a voice page"))
         }
-        return limited(client, message.requestId, Effect.as(sessions.newConversation(client.sessionKey), { ok: true } as HostResult))
+        return limited(client, message.requestId, Effect.as(sessions.newConversation(client.sessionKey, message.assistantId), { ok: true } as HostResult))
       }
       case "admin.login":
         return login(client, message.requestId, message.password)

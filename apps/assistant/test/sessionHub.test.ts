@@ -32,7 +32,13 @@ const fakeSessions = (send: (input: unknown) => string = () => "accepted") => {
     web: { setOwner: () => {}, setMicLive: () => {}, micFrame: () => {}, report: () => {} },
     tracker: { current: () => ({ state: "idle" }) },
     publisher: { committedTurn: () => undefined },
-    conversation: { send, history: Effect.succeed([]), conversation: () => ({ id: "c1", startedAt: 0 }) },
+    // Typed text goes to the session's routed conversations (`sendText`, an Effect since WP-4b); Stop is `stop`.
+    conversation: {
+      sendText: (text: string, speak: boolean) => Effect.sync(() => send({ _tag: "TextInput", text, speak })),
+      stop: () => send({ _tag: "Interrupt" }),
+      history: () => Effect.succeed([]),
+      conversation: () => ({ id: "c1", startedAt: 0 })
+    },
     syncProfile: () => {},
     ownerChanged: () => {},
     touch: () => {}

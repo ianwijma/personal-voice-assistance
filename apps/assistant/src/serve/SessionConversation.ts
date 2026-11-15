@@ -58,6 +58,8 @@ export interface SessionConversationOptions {
   readonly speech?: (built: BuiltEngines) => Stream.Stream<ConversationInput, unknown>
   /** The idle reset (`Conversation.idleResetMs`), read at every turn start. */
   readonly idleResetMs?: () => number | undefined
+  /** Tool rounds per turn (the assistant's `toolRounds`), read at every run start. Default: the build's `maxToolRounds`. */
+  readonly maxToolRounds?: () => number
   /** Typed inputs accepted but not yet taken by the conversation, at most. Default 4. */
   readonly maxPendingInputs?: number
   /** The conversation to start with (a session's id reserved before it existed). Default: a new one. */
@@ -142,7 +144,7 @@ export const makeSessionConversation = (options: SessionConversationOptions): Ef
           initialConversationId: conversationInfo.id,
           ...(lastTurnAt !== undefined ? { initialLastTurnAt: lastTurnAt } : {}),
           ...(options.idleResetMs !== undefined ? { idleResetMs: options.idleResetMs } : {}),
-          maxToolRounds: providers.maxToolRounds,
+          maxToolRounds: options.maxToolRounds?.() ?? providers.maxToolRounds,
           bargeIn: true
         }
         const agentSetup = options.agentSetup?.(providers)

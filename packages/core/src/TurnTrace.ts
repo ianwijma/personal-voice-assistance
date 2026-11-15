@@ -1,4 +1,4 @@
-import type { AgentKind, RouteReason } from "@pva/protocol"
+import type { AgentKind, RouteReason, TraceRoute } from "@pva/protocol"
 import { Context, Effect, Layer } from "effect"
 
 export const traceMarks = [
@@ -13,7 +13,10 @@ export const traceMarks = [
   "playbackStart",
   /** Intent agents: the action's `run` started / ended. */
   "actionStarted",
-  "actionFinished"
+  "actionFinished",
+  /** Routing (docs/ASSISTANTS.md §3.6, §3.7): the TypeSafe routing request left / its answer arrived. */
+  "routeSent",
+  "routeReceived"
 ] as const
 export type TraceMark = typeof traceMarks[number]
 
@@ -42,6 +45,15 @@ export interface Trace {
   client?: { readonly outputLatencyMs: number; readonly startDelayMs: number }
   /** The voice session the turn belongs to (serve mode: the device's name), so the latency line tells sessions apart. */
   readonly session?: string
+  /** The assistant that answers this turn (docs/ASSISTANTS.md §3.7; serve mode, one conversation per assistant). */
+  readonly assistant?: { readonly id: string; readonly name: string }
+  /** The device the turn was on: its id and name (serve mode). */
+  readonly deviceId?: string
+  readonly device?: string
+  /** Who chose the assistant (phrase, armed, follow-up, default, typed, TypeSafe); set at the turn's start, updated at its end of turn. */
+  route?: TraceRoute
+  /** A snapshot of the latency-relevant configuration the turn used (protocol 7 `TraceConfig`), when known. */
+  config?: unknown
 }
 
 export interface TraceAgent {
@@ -85,6 +97,9 @@ export const formatTrace = (trace: Trace): string => {
   const parts = [
     `${trace.session !== undefined ? `[${trace.session}] ` : ""}turn #${trace.id} ${trace.mode}${trace.speculative ? " (speculative)" : ""} ${trace.outcome ?? "running"}`
   ]
+  if (trace.assistant !== undefined) {
+    parts.push(`assistant=${trace.assistant.id}${trace.route !== undefined ? `(${trace.route.by}${"phrase" in trace.route ? ` "${trace.route.phrase}"` : ""})` : ""}`)
+  }
   if (trace.agent !== undefined) {
     parts.push(`agent=${trace.agent.id}(${trace.agent.routedBy}${trace.agent.fallbackFrom !== undefined ? `, instead of ${trace.agent.fallbackFrom}` : ""})`)
   }

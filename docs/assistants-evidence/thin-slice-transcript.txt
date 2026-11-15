@@ -1,0 +1,49 @@
+WP-4b thin slice: two assistants on one browser, real server (docs/ASSISTANTS.md §8).
+Recorded 2026-11-16 on branch t3/assistants-thin-slice (uncommitted working tree).
+
+How: `pnpm start serve` with LLM_PROVIDER=fake (the offline stand-in), the local recogniser (stt-sherpa parakeet-v2)
+and the local voice (Piper en_US-lessac-medium), a temporary data directory whose settings.json (version 4) holds
+two assistants on the browser defaults. The sentences were synthesised with `pnpm start say --out` (Piper),
+resampled to 16 kHz and streamed in real time as the microphone of a scripted browser tab that owns the audio
+(it plays the replies and reports playback). An admin tab collected the live `trace` messages.
+
+Server http://127.0.0.1:18931, protocol 6. Device "Test browser" (evidence-desk), browser defaults: Alpha ("hey alpha"), Bravo ("hey bravo"), nobody answers without a phrase, follow-up 8 s.
+Engines: llm fake offline stand-in; stt sherpa parakeet-v2; tts sherpa en_US-lessac-medium
+Alpha has the clock and weather modules on (as migrated); Bravo has none. The offline LLM stand-in answers "what time" with the clock tool when it has it, else echoes.
+
+> said (spoken, Piper WAV into the microphone): "Hey Alpha, what time is it?"
+  wake: phrase "hey alpha" → alpha
+  turn #1 heard "what time is it?" → answered by alpha: "It is 09:59 on Monday, 16 November 2026 in Australia/Sydney."
+> said (spoken, Piper WAV into the microphone): "And what about tomorrow?"
+  turn #2 heard "And what about to morrow?" → answered by alpha: "You said: And what about to morrow?"
+> said (spoken, Piper WAV into the microphone): "Hey Bravo, tell me a joke."
+  wake: phrase "hey bravo" → bravo
+  turn #3 heard "tell me a joke." → answered by bravo: "You said: tell me a joke."
+> said (spoken, Piper WAV into the microphone): "Hey Alpha."
+  wake: phrase "hey alpha" → alpha
+  no turn (nothing reached a conversation)
+> said (spoken, Piper WAV into the microphone): "One more thing."
+  turn #4 heard "One more thing." → answered by alpha: "You said: One more thing."
+> typed (text.send, assistantId "bravo"): "Thanks, that is all."
+  turn #5 "Thanks, that is all." → answered by bravo: "You said: Thanks, that is all."
+
+Admin `trace` messages (Diagnostics › Latency's live feed), one per finished turn:
+  turn #1 voice completed: assistant alpha (Alpha), route phrase "hey alpha", device Test browser [evidence-desk] · llmRequestSent=-248 llmFirstToken=-244.9 firstClause=-183.3 ttsFirstAudio=-124.5 playbackStart=6.7
+  turn #2 voice completed: assistant alpha (Alpha), route follow-up, device Test browser [evidence-desk] · llmRequestSent=-257 llmFirstToken=-256.9 firstClause=-241.8 ttsFirstAudio=-213.4 playbackStart=2.6
+  turn #3 voice completed: assistant bravo (Bravo), route phrase "hey bravo", device Test browser [evidence-desk] · llmRequestSent=-235.8 llmFirstToken=-235.6 firstClause=-221 ttsFirstAudio=-193.3 playbackStart=2.7
+  turn #4 voice completed: assistant alpha (Alpha), route armed "hey alpha", device Test browser [evidence-desk] · llmRequestSent=-274 llmFirstToken=-273.9 firstClause=-258.2 ttsFirstAudio=-236.9 playbackStart=2
+  turn #5 text completed: assistant bravo (Bravo), route typed, device Test browser [evidence-desk] · llmRequestSent=0.7 llmFirstToken=0.8
+
+Raw trace JSON:
+  {"type":"trace","key":"evidence-desk","deviceId":"evidence-desk","trace":{"turnId":1,"mode":"voice","speculative":true,"outcome":"completed","marks":{"llmRequestSent":-248,"llmFirstToken":-244.9,"firstClause":-183.3,"ttsFirstAudio":-124.5,"playbackStart":6.7},"totalMs":5507.8,"tools":[{"name":"current_time","ms":1}],"voices":["sherpa:en_US-lessac-medium"],"client":{"outputLatencyMs":12,"startDelayMs":0},"session":"Test browser","assistant":{"id":"alpha","name":"Alpha"},"deviceId":"evidence-desk","device":"Test browser","route":{"by":"phrase","phrase":"hey alpha"}}}
+  {"type":"trace","key":"evidence-desk","deviceId":"evidence-desk","trace":{"turnId":2,"mode":"voice","speculative":true,"outcome":"completed","marks":{"llmRequestSent":-257,"llmFirstToken":-256.9,"firstClause":-241.8,"ttsFirstAudio":-213.4,"playbackStart":2.6},"totalMs":2002.4,"tools":[],"voices":["sherpa:en_US-lessac-medium"],"client":{"outputLatencyMs":12,"startDelayMs":0},"session":"Test browser","assistant":{"id":"alpha","name":"Alpha"},"deviceId":"evidence-desk","device":"Test browser","route":{"by":"follow-up"}}}
+  {"type":"trace","key":"evidence-desk","deviceId":"evidence-desk","trace":{"turnId":3,"mode":"voice","speculative":true,"outcome":"completed","marks":{"llmRequestSent":-235.8,"llmFirstToken":-235.6,"firstClause":-221,"ttsFirstAudio":-193.3,"playbackStart":2.7},"totalMs":1752.1,"tools":[],"voices":["sherpa:en_US-lessac-medium"],"client":{"outputLatencyMs":12,"startDelayMs":0},"session":"Test browser","assistant":{"id":"bravo","name":"Bravo"},"deviceId":"evidence-desk","device":"Test browser","route":{"by":"phrase","phrase":"hey bravo"}}}
+  {"type":"trace","key":"evidence-desk","deviceId":"evidence-desk","trace":{"turnId":4,"mode":"voice","speculative":true,"outcome":"completed","marks":{"llmRequestSent":-274,"llmFirstToken":-273.9,"firstClause":-258.2,"ttsFirstAudio":-236.9,"playbackStart":2},"totalMs":1504.5,"tools":[],"voices":["sherpa:en_US-lessac-medium"],"client":{"outputLatencyMs":12,"startDelayMs":0},"session":"Test browser","assistant":{"id":"alpha","name":"Alpha"},"deviceId":"evidence-desk","device":"Test browser","route":{"by":"armed","phrase":"hey alpha"}}}
+  {"type":"trace","key":"evidence-desk","deviceId":"evidence-desk","trace":{"turnId":5,"mode":"text","speculative":false,"outcome":"completed","marks":{"llmRequestSent":0.7,"llmFirstToken":0.8},"totalMs":78,"tools":[],"voices":[],"session":"Test browser","assistant":{"id":"bravo","name":"Bravo"},"deviceId":"evidence-desk","device":"Test browser","route":{"by":"typed"}}}
+
+Server latency lines (TurnTrace log):
+  [Test browser] turn #1 voice (speculative) completed assistant=alpha(phrase "hey alpha") llmRequestSent=-248ms llmFirstToken=-245ms (+3ms) firstClause=-183ms (+62ms) ttsFirstAudio=-124ms (+59ms) playbackStart=7ms (+131ms) audible=19ms (+12ms output latency) tools: current_time 1ms voices: sherpa:en_US-lessac-medium total=5508ms
+  [Test browser] turn #2 voice (speculative) completed assistant=alpha(follow-up) llmRequestSent=-257ms llmFirstToken=-257ms (+0ms) firstClause=-242ms (+15ms) ttsFirstAudio=-213ms (+28ms) playbackStart=3ms (+216ms) audible=15ms (+12ms output latency) voices: sherpa:en_US-lessac-medium total=2002ms
+  [Test browser] turn #3 voice (speculative) completed assistant=bravo(phrase "hey bravo") llmRequestSent=-236ms llmFirstToken=-236ms (+0ms) firstClause=-221ms (+15ms) ttsFirstAudio=-193ms (+28ms) playbackStart=3ms (+196ms) audible=15ms (+12ms output latency) voices: sherpa:en_US-lessac-medium total=1752ms
+  [Test browser] turn #4 voice (speculative) completed assistant=alpha(armed "hey alpha") llmRequestSent=-274ms llmFirstToken=-274ms (+0ms) firstClause=-258ms (+16ms) ttsFirstAudio=-237ms (+21ms) playbackStart=2ms (+239ms) audible=14ms (+12ms output latency) voices: sherpa:en_US-lessac-medium total=1505ms
+  [Test browser] turn #5 text completed assistant=bravo(typed) llmRequestSent=1ms llmFirstToken=1ms (+0ms) total=78ms

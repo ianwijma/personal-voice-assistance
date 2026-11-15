@@ -1,18 +1,27 @@
 import {
   type HostResult,
   makeModuleHost,
+  makeToolRegistry,
   makeTurnTrace,
   type ModuleDefinition,
   type ModuleHost,
+  type ModuleSnapshot,
   type TurnSetup,
   type TurnTrace
 } from "@pva/core"
 import {
+  applicableOwn,
+  type Assistant,
   DEFAULT_CONVERSATION_IDLE_MINUTES,
   DEFAULT_MAX_VOICE_SESSIONS,
   DEFAULT_SESSION_DISCARD_MINUTES,
+  type DeviceSettings,
+  deviceTypeOf,
+  effectiveDeviceSettings,
   engineSummary,
-  type ServerMessage
+  type ServerMessage,
+  WEB_VOICE_DEVICE_TYPE,
+  WEB_VOICE_KIND
 } from "@pva/protocol"
 import { Cause, Config, Effect, Exit, Fiber, FiberSet, Option, type Scope } from "effect"
 import { isAbsolute, join, resolve } from "node:path"
@@ -254,18 +263,77 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     const secretNames = () =>
       sections.list().flatMap((x) => x.form.fields).flatMap((f) => (f.type === "secret" && f.env !== undefined ? [f.env] : []))
 
-    /** One session's turn setup (and agent setup). Rebuilt only when its inputs change (a string compare per turn). */
-    const conversationSetup = () => {
-      let cached: { key: string; setup: TurnSetup } | undefined
-      const setup = Effect.sync((): TurnSetup => {
-        const snapshot = host.snapshot()
-        const base = String(sections.value("SYSTEM_PROMPT") ?? defaultSystemPrompt)
-        const key = `${snapshot.version}\u0000${base}`
-        if (cached?.key !== key) {
-          cached = { key, setup: { system: systemFor(base, snapshot.instructions), registry: snapshot.registry } }
-        }
-        return cached.setup
+    // ---- Assistants and devices (docs/ASSISTANTS.md §2.6), read from the settings store (version 4)
+
+    /** The assistants in effect (the environment applied to the migrated one), by id; recomputed after a save. */
+    let assistantsCache: { readonly file: unknown; readonly byId: ReadonlyMap<string, Assistant> } | undefined
+    const assistantsNow = (): ReadonlyMap<string, Assistant> => {
+      const file = store.settings()
+      if (assistantsCache?.file !== file) {
+        assistantsCache = { file, byId: new Map(store.assistantsInEffect().map(({ assistant }) => [assistant.id, assistant])) }
+      }
+      return assistantsCache.byId
+    }
+    /** A device's effective settings: its own sections ← its type's defaults ← the built-in (no device: the browser defaults). */
+    const deviceSettingsOf = (deviceId: string | undefined): DeviceSettings => {
+      const file = store.settings()
+      const record = deviceId === undefined ? undefined : file.devices[deviceId]
+      const kind = record?.kind ?? WEB_VOICE_KIND
+      const type = deviceTypeOf(kind) ?? WEB_VOICE_DEVICE_TYPE
+      return effectiveDeviceSettings(type.builtIn, file.deviceTypes[kind], record === undefined ? undefined : applicableOwn(type, record.own))
+    }
+    /** Modules an assistant chooses (capabilities); agent and decision modules are not per assistant and always pass. */
+    const isCapability = (moduleId: string) => {
+      const def = catalog.find((d) => d.id === moduleId)
+      return def === undefined || def.kind === undefined || def.kind === "capability"
+    }
+    /**
+     * The Home line of every assistant's stable prompt (location, time zone, language; docs/ASSISTANTS.md §2.4).
+     * The `home` section arrives with WP-12a; until then there is no line.
+     */
+    const homeLine = (): string | undefined => undefined
+    /**
+     * An assistant's share of the running modules: the modules it has on (capabilities; the others always pass), the
+     * tools it has not switched off, and their instructions. The whole snapshot when nothing is left out.
+     */
+    const modulesFor = (snapshot: ModuleSnapshot, assistant: Assistant) => {
+      const parts = snapshot.parts.flatMap((part) => {
+        if (!isCapability(part.moduleId)) return [part]
+        const choice = assistant.modules[part.moduleId]
+        if (choice === undefined || !choice.on) return []
+        if (choice.offTools.length === 0) return [part]
+        const off = new Set(choice.offTools)
+        return [{ ...part, module: { ...part.module, tools: (part.module.tools ?? []).filter((t) => !off.has(t.name)) } }]
       })
+      const same = parts.length === snapshot.parts.length && parts.every((p, i) => p === snapshot.parts[i])
+      if (same) return { registry: snapshot.registry, instructions: snapshot.instructions }
+      return {
+        registry: makeToolRegistry(parts.map((p) => p.module)),
+        instructions: parts.flatMap((p) => (p.instructions.length > 0 ? [p.instructions] : []))
+      }
+    }
+
+    /**
+     * One assistant's turn setup in one session (and its agent setup): its prompt, the Home line, the instructions
+     * of its modules and a registry of its tools. Rebuilt only when the module snapshot or the assistant changed (two
+     * reference compares per turn).
+     */
+    const conversationSetup = (assistantId: string) => {
+      let cached: { snapshot: ModuleSnapshot; assistant: Assistant | undefined; home: string | undefined; setup: TurnSetup; instructions: ReadonlyArray<string> } | undefined
+      const current = () => {
+        const snapshot = host.snapshot()
+        const assistant = assistantsNow().get(assistantId)
+        const home = homeLine()
+        if (cached?.snapshot !== snapshot || cached.assistant !== assistant || cached.home !== home) {
+          // An assistant that does not exist (any more) is never routed; should a turn still start, it gets no tools.
+          const mine = assistant === undefined ? { registry: makeToolRegistry([]), instructions: [] } : modulesFor(snapshot, assistant)
+          const base = assistant?.prompt ?? defaultSystemPrompt
+          const instructions = home === undefined ? mine.instructions : [home, ...mine.instructions]
+          cached = { snapshot, assistant, home, setup: { system: systemFor(base, instructions), registry: mine.registry }, instructions }
+        }
+        return cached
+      }
+      const setup = Effect.sync((): TurnSetup => current().setup)
       const agentSetup = (providers: EngineProviders) => {
         if (providers.llmProvider !== SUBSCRIPTION_PROVIDER) return undefined
         const toAgents = makeSubscriptionAgents({
@@ -273,7 +341,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
           agents: () => host.snapshot().agents,
           module: subscriptionModule,
           promptFor: (agent, turn) =>
-            agent.systemPrompt === undefined ? turn.system : systemFor(agent.systemPrompt, host.snapshot().instructions)
+            agent.systemPrompt === undefined ? turn.system : systemFor(agent.systemPrompt, current().instructions)
         })
         return Effect.map(setup, toAgents)
       }
@@ -368,7 +436,8 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
           ...(device !== undefined ? { deviceId: device.id } : {}),
           name: () => (device === undefined ? "Voice page without a device" : frontends.nameOf(device.id) ?? device.name),
           engine: theEngine,
-          profile: () => hub?.profileOf(key) ?? frontends.profile(device?.id),
+          deviceSettings: () => deviceSettingsOf(device?.id),
+          assistants: assistantsNow,
           conversationSetup,
           moduleOfTool: (name) => host.snapshot().toolModules.get(name) ?? null,
           turnTrace,
