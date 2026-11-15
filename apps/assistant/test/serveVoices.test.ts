@@ -82,11 +82,13 @@ const fakeDownloader = (dir: string, steps = 25): Readonly<Record<ToolId, Preset
   return { "stt-models": tts, "tts-models": tts }
 }
 
-const start = async (options: { readonly env?: Record<string, string>; readonly installed?: ReadonlyArray<string> } = {}) => {
+const start = async (
+  options: { readonly env?: Record<string, string>; readonly installed?: ReadonlyArray<string>; readonly shared?: boolean } = {}
+) => {
   const modelDir = mkdtempSync(join(tmpdir(), "pva-voices-"))
   for (const preset of options.installed ?? ["en_US-lessac-medium"]) install(modelDir, preset)
   const hosted = fakeHosted()
-  const engines = { started: [] as Array<string>, closed: 0 }
+  const engines = { started: [] as Array<string>, closed: 0, speakers: [] as Array<number> }
   const stt = controlledStt()
   const server = await startTestServer({
     build: fakeBuild({ stt: stt.stt, llm: scriptedLlm((t) => `You said: ${t}.`).llm }),
@@ -94,9 +96,13 @@ const start = async (options: { readonly env?: Record<string, string>; readonly 
     hostedVoices: { elevenlabs: Effect.succeed(hosted.service) },
     localPreviewEngine: (preset) =>
       Effect.acquireRelease(
-        Effect.sync((): Tts["Service"] => {
+        Effect.sync((): Tts["Service"] | SherpaTts.SharedEngine => {
           engines.started.push(preset)
-          return toneTts({ sampleRate: 22_050, millisPerClause: 80 })
+          const tts = toneTts({ sampleRate: 22_050, millisPerClause: 80 })
+          // `shared`: like the real preview engine, it also speaks the other presets of its set-up (records their speaker).
+          return options.shared === true
+            ? SherpaTts.shareEngine(SherpaTts.presets[preset]!, { tts, forSpeaker: (speaker) => (engines.speakers.push(speaker), tts) })
+            : tts
         }),
         () => Effect.sync(() => engines.closed++)
       ),
@@ -251,6 +257,27 @@ describe("voice API: previews", () => {
     expect((await api("POST", "voices/preview", { voice: pim, text: "Tot ziens." })).status).toBe(200)
     expect(engines.started).toEqual(["nl_NL-pim-medium"])
     expect(engines.closed).toBe(0)
+  })
+
+  it("one preview engine speaks every Kokoro voice of its lexicon: moving between them loads no model", async () => {
+    const { api, engines } = await start({ installed: ["en_US-lessac-medium", "kokoro-af_heart"], shared: true })
+    const say = async (voiceId: string) => (await api("POST", "voices/preview", { voice: { provider: "sherpa", voiceId }, text: `Hello from ${voiceId}.` })).status
+    expect(await say("kokoro-af_bella")).toBe(200)
+    expect(await say("kokoro-af_nicole")).toBe(200)
+    expect(await say("kokoro-am_michael")).toBe(200)
+    expect(await say("kokoro-af_bella")).toBe(200)
+    expect(engines.started).toEqual(["kokoro-af_bella"])
+    expect(engines.speakers).toEqual([6, 16])
+    // Another lexicon (British, Chinese) is another set-up: the engine is replaced, as for any other voice.
+    expect(await say("kokoro-bf_emma")).toBe(200)
+    expect(await say("kokoro-bm_george")).toBe(200)
+    expect(await say("kokoro-zf_xiaoxiao")).toBe(200)
+    expect(engines.started).toEqual(["kokoro-af_bella", "kokoro-bf_emma", "kokoro-zf_xiaoxiao"])
+    expect(engines.speakers).toEqual([6, 16, 26])
+    expect(engines.closed).toBe(2)
+    // The assistant's own voice still uses its running engine.
+    expect(await say("en_US-lessac-medium")).toBe(200)
+    expect(engines.started).toHaveLength(3)
   })
 
   it("refuses what cannot be previewed, with the documented codes", async () => {

@@ -35,6 +35,8 @@ export interface EngineOptions {
 
 export interface Job {
   readonly text: string
+  /** Another speaker of the loaded model for this clause (a preview of another Kokoro voice). Default: init's. */
+  readonly speaker?: number
   /** Called once with the clause's samples, unless the job was cancelled. */
   readonly onAudio: (samples: Float32Array) => void
   /** Called once if the clause could not be synthesised (engine failure, crash, timeout, shutdown). */
@@ -176,7 +178,7 @@ export class Engine {
       child.kill("SIGKILL") // handled by onExit like any crash
     }, timeoutMs)
     this.current = { job, id, cancelled: false, timer }
-    child.send({ type: "speak", id, text: job.text })
+    child.send({ type: "speak", id, text: job.text, ...(job.speaker !== undefined ? { sid: job.speaker } : {}) })
   }
 
   private onMessage(child: ChildProcess, msg: HostMessage): void {

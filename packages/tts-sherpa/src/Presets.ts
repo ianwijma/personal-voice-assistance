@@ -81,13 +81,15 @@ const piperVoice = (name: string, language: string, gender: "female" | "male" | 
 })
 
 /**
- * Kokoro v1.0 (multi-lang), one archive for every speaker. Only the English speakers are offered: sherpa-onnx 2.x (the
- * version Kokoro runs on) has no espeak fallback, so it only speaks words in its lexicons (US and GB English, and
- * Chinese, which is not offered); Spanish, French, Hindi, Italian, Japanese and Portuguese text is mostly skipped
- * ("OOV word skipped"). Speaker ids: the `speaker2id` metadata of this archive's `model.onnx`.
+ * Kokoro v1.0 (multi-lang), one archive for every speaker. The English and Chinese speakers are offered: sherpa-onnx
+ * 2.x (the version Kokoro runs on) has no espeak fallback, so it only speaks words in its lexicons (US and GB English,
+ * Chinese); Spanish, French, Hindi, Italian, Japanese and Portuguese text is mostly skipped ("OOV word skipped").
+ * Three engine set-ups: American (US lexicon), British (GB lexicon), Chinese (US + Chinese lexicons, and the Chinese
+ * rule FSTs that read digits, dates and phone numbers). Speaker ids: the `speaker2id` metadata of this archive's
+ * `model.onnx`.
  */
 const KOKORO_DIR = "kokoro-multi-lang-v1_0"
-const KOKORO_COUNT = 28
+const KOKORO_COUNT = 36
 const kokoro = (
   speaker: string,
   id: number,
@@ -96,6 +98,8 @@ const kokoro = (
   description?: string
 ): Preset => {
   const british = speaker.startsWith("b")
+  const chinese = speaker.startsWith("z")
+  const language = chinese ? "Mandarin Chinese (reads English words too)" : british ? "British English" : "American English"
   return {
     name: `kokoro-${speaker}`,
     engine: "kokoro",
@@ -106,13 +110,18 @@ const kokoro = (
       voices: "voices.bin",
       tokens: "tokens.txt",
       dataDir: "espeak-ng-data",
-      lexicon: british ? "lexicon-gb-en.txt" : "lexicon-us-en.txt",
-      // Both lexicons, for every speaker: the files (and so the install check) are the same for all of them.
+      // Chinese: the US lexicon comes first in `engineConfig` (English words in a Chinese reply).
+      lexicon: chinese ? "lexicon-zh.txt" : british ? "lexicon-gb-en.txt" : "lexicon-us-en.txt",
+      // Every lexicon and rule FST, for every speaker: the files (and so the install check) are the same for all.
       lexiconUs: "lexicon-us-en.txt",
-      lexiconGb: "lexicon-gb-en.txt"
+      lexiconGb: "lexicon-gb-en.txt",
+      lexiconZh: "lexicon-zh.txt",
+      dateFst: "date-zh.fst",
+      phoneFst: "phone-zh.fst",
+      numberFst: "number-zh.fst"
     },
     speaker: id,
-    lang: british ? "en-gb" : "en-us",
+    lang: chinese ? "zh" : british ? "en-gb" : "en-us",
     threads: 8,
     sampleRate: 24_000,
     license: "Apache-2.0",
@@ -121,8 +130,8 @@ const kokoro = (
     voice: {
       name,
       description: description ??
-        `Kokoro: ${british ? "British" : "American"} English (upstream grade ${grade}); one download with the other ${KOKORO_COUNT - 1} Kokoro voices.`,
-      language: british ? "en-GB" : "en-US",
+        `Kokoro: ${language} (upstream grade ${grade}); one download with the other ${KOKORO_COUNT - 1} Kokoro voices.`,
+      language: chinese ? "zh-CN" : british ? "en-GB" : "en-US",
       gender: speaker[1] === "f" ? "female" : "male",
       tags: ["natural", "slow-start"]
     }
@@ -200,7 +209,16 @@ const table: Array<Preset> = [
   kokoro("bm_fable", 25, "Fable", "C"),
   kokoro("bm_george", 26, "George", "C"),
   kokoro("bm_lewis", 27, "Lewis", "D+"),
-  kokoro("bm_daniel", 24, "Daniel", "D")
+  kokoro("bm_daniel", 24, "Daniel", "D"),
+  // Kokoro, Mandarin Chinese (ids 45–52).
+  kokoro("zf_xiaobei", 45, "Xiaobei", "D"),
+  kokoro("zf_xiaoni", 46, "Xiaoni", "D"),
+  kokoro("zf_xiaoxiao", 47, "Xiaoxiao", "D"),
+  kokoro("zf_xiaoyi", 48, "Xiaoyi", "D"),
+  kokoro("zm_yunjian", 49, "Yunjian", "D"),
+  kokoro("zm_yunxi", 50, "Yunxi", "D"),
+  kokoro("zm_yunxia", 51, "Yunxia", "D"),
+  kokoro("zm_yunyang", 52, "Yunyang", "D")
 ]
 
 export const presets: Readonly<Record<string, Preset>> = Object.fromEntries(table.map((p) => [p.name, p]))
@@ -253,12 +271,28 @@ export const presetFiles = (preset: Preset, modelDir: string): Record<string, st
  */
 export const engineConfig = (preset: Preset, modelDir: string, threads: number) => {
   const f = presetFiles(preset, modelDir)
+  const chinese = preset.engine === "kokoro" && preset.lang === "zh"
+  // Chinese: the English lexicon too, so English words in a Chinese reply are read (sherpa-onnx's documented set-up).
+  const lexicon = chinese ? `${f.lexiconUs},${f.lexicon}` : f.lexicon
   const model = preset.engine === "piper"
     ? { vits: { model: f.model, tokens: f.tokens, dataDir: f.dataDir } }
-    : { kokoro: { model: f.model, voices: f.voices, tokens: f.tokens, dataDir: f.dataDir, lexicon: f.lexicon, lang: preset.lang ?? "en-us" } }
+    : { kokoro: { model: f.model, voices: f.voices, tokens: f.tokens, dataDir: f.dataDir, lexicon, lang: preset.lang ?? "en-us" } }
   return {
     module: preset.engine === "piper" ? "sherpa-onnx-node-v1" : "sherpa-onnx-node",
     // maxNumSentences 1: one clause in, one generate call; silenceScale only affects pauses inside a clause.
-    config: { model: { ...model, numThreads: threads, provider: "cpu", debug: false }, maxNumSentences: 1, silenceScale: 0.2 }
+    // ruleFsts (Chinese): digits, dates and phone numbers are read as Chinese; without them digits are skipped.
+    config: {
+      model: { ...model, numThreads: threads, provider: "cpu", debug: false },
+      maxNumSentences: 1,
+      silenceScale: 0.2,
+      ...(chinese ? { ruleFsts: [f.dateFst, f.phoneFst, f.numberFst].join(",") } : {})
+    }
   }
 }
+
+/**
+ * The engine a preset needs, as a string: presets with the same set-up (the Kokoro speakers of one lexicon) can be
+ * spoken by one loaded engine, each with its own speaker id (previews, `makeShared`).
+ */
+export const engineSetup = (preset: Preset): string =>
+  JSON.stringify({ dir: preset.dir, ...engineConfig(preset, "", preset.threads) })

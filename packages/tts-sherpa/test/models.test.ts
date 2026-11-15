@@ -8,6 +8,7 @@ import { presetFiles } from "../src/Presets.ts"
 
 const texts: Record<string, ReadonlyArray<string>> = {
   "nl_NL-pim-medium": ["Ja, dat kan ik doen.", "De vergadering is verplaatst naar morgenmiddag half vier."],
+  "kokoro-zf_xiaobei": ["好的，我可以做到。", "会议改到明天下午三点半。"],
   default: ["Sure, I can do that.", "The meeting has been moved to three thirty tomorrow afternoon."]
 }
 
@@ -34,7 +35,9 @@ for (const preset of setups.values()) {
         const bytes = Buffer.concat(chunks.map((c) => c.audio))
         const pcm = new Int16Array(bytes.buffer, bytes.byteOffset, bytes.length / 2)
         const seconds = pcm.length / tts.sampleRate
-        const words = clauses.join(" ").split(/\s+/).length
+        // Chinese has no spaces: about two characters to a word for the rate check.
+        const joined = clauses.join(" ")
+        const words = /\p{Script=Han}/u.test(joined) ? joined.replace(/[\s\p{P}]/gu, "").length / 2 : joined.split(/\s+/).length
         // Conversational speech is roughly 2–4 words per second.
         assert.isAbove(seconds, words / 5)
         assert.isBelow(seconds, words / 1.5)

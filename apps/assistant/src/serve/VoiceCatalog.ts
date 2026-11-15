@@ -64,8 +64,11 @@ export interface VoiceCatalogOptions {
   readonly download: (preset: string) => JobInfo | undefined
   /** Tests: the hosted providers' voices (default: the adapters', configured from `configProvider`). */
   readonly hostedVoices?: Partial<Record<TtsProviderName, Effect.Effect<TtsVoices["Service"], Config.ConfigError>>>
-  /** Tests: the engine of a local preview (default: `SherpaTts.make`). */
-  readonly localEngine?: (preset: string, modelDir: string) => Effect.Effect<Tts["Service"], TtsError, Scope.Scope>
+  /**
+   * Tests: the engine of a local preview (default: `SherpaTts.makeShared`). A plain `Tts` speaks only its own preset; a
+   * `SharedEngine` also the other presets of its set-up (another Kokoro speaker of the same lexicon).
+   */
+  readonly localEngine?: (preset: string, modelDir: string) => Effect.Effect<Tts["Service"] | SherpaTts.SharedEngine, TtsError, Scope.Scope>
   readonly now?: () => number
 }
 
@@ -122,7 +125,11 @@ export const makeVoiceCatalog = (options: VoiceCatalogOptions): Effect.Effect<Vo
   Effect.gen(function*() {
     const now = options.now ?? Date.now
     const hostedVoices = { ...hostedTtsVoices, ...options.hostedVoices }
-    const localEngine = options.localEngine ?? ((preset: string, modelDir: string) => SherpaTts.make({ preset, modelDir }))
+    const localEngine = (preset: string, modelDir: string): Effect.Effect<SherpaTts.SharedEngine, TtsError, Scope.Scope> =>
+      options.localEngine === undefined
+        ? SherpaTts.makeShared({ preset, modelDir })
+        : Effect.map(options.localEngine(preset, modelDir), (built) =>
+          "forPreset" in built ? built : { tts: built, forPreset: (name: string) => (name === preset ? built : undefined) })
     const cache = new Map<string, CacheEntry>()
     const locks = new Map<string, Semaphore.Semaphore>(ttsProviderNames.map((p) => [p, Semaphore.makeUnsafe(1)]))
     const isProvider = (id: string): id is TtsProviderName => Object.hasOwn(ttsProviderInfo, id)
@@ -350,8 +357,12 @@ export const makeVoiceCatalog = (options: VoiceCatalogOptions): Effect.Effect<Vo
       }
     }
 
-    /** The one kept preview engine (a local voice that is not the assistant's). */
-    let kept: { readonly preset: string; readonly dir: string; readonly scope: Scope.Closeable; readonly tts: Tts["Service"]; timer?: ReturnType<typeof setTimeout> } | undefined
+    /**
+     * The one kept preview engine (a local voice that is not the assistant's). It also speaks the other presets of its
+     * set-up (the Kokoro voices of one lexicon) with their own speaker id, so moving the preview between them does not
+     * load the model again. It is its own process: the assistant's engine is never given another speaker.
+     */
+    let kept: { readonly dir: string; readonly scope: Scope.Closeable; readonly engine: SherpaTts.SharedEngine; timer?: ReturnType<typeof setTimeout> } | undefined
     const closeKept = Effect.suspend(() => {
       const k = kept
       kept = undefined
@@ -374,7 +385,8 @@ export const makeVoiceCatalog = (options: VoiceCatalogOptions): Effect.Effect<Vo
       Effect.gen(function*() {
         const live = options.live()
         if (live !== undefined && live.voice.provider === "sherpa" && live.voice.voiceId === preset) return live.tts
-        if (kept !== undefined && (kept.preset !== preset || kept.dir !== dir)) yield* closeKept
+        let tts = kept !== undefined && kept.dir === dir ? kept.engine.forPreset(preset) : undefined
+        if (kept !== undefined && tts === undefined) yield* closeKept
         if (kept === undefined) {
           const scope = yield* Scope.make()
           const built = yield* Effect.result(Scope.provide(localEngine(preset, dir), scope))
@@ -382,14 +394,15 @@ export const makeVoiceCatalog = (options: VoiceCatalogOptions): Effect.Effect<Vo
             yield* Scope.close(scope, Exit.void)
             return yield* new VoiceCatalogError({ reason: "unavailable", message: `The voice could not be started: ${built.failure.message}` })
           }
-          kept = { preset, dir, scope, tts: built.success }
+          kept = { dir, scope, engine: built.success }
+          tts = built.success.tts
         }
         if (kept.timer !== undefined) clearTimeout(kept.timer)
         const mine = kept
         // A preview that did not finish (cancelled, superseded, failed) stops the engine at once: the clause in
         // synthesis is not waited for. One that finished keeps it for the next preview, for a while.
         yield* Effect.addFinalizer((exit) => (Exit.isSuccess(exit) && kept === mine ? Effect.sync(armIdle) : kept === mine ? closeKept : Effect.void))
-        return mine.tts
+        return tts!
       })
     const localVoicesService = SherpaTts.makeVoices({ modelDir: options.modelDir, engineFor, maxSeconds: MAX_PREVIEW_SECONDS })
 

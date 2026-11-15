@@ -8,12 +8,19 @@ import { type JoinOptions, makeJoiner } from "./Pcm.ts"
 
 /**
  * Starts the engine (model load happens here, at layer build) and stops it when
- * the scope closes. Returns the service and the engine (for measurements).
+ * the scope closes. Returns the service, the engine (for measurements) and
+ * `forSpeaker`: a service over the same engine that speaks with another speaker
+ * of the loaded model (previews of the other Kokoro voices; never used for live
+ * turns, whose jobs carry no speaker and so use the one the engine was started with).
  */
 export const makeEngineTts = (
   engineOptions: EngineOptions,
   join: JoinOptions
-): Effect.Effect<{ readonly tts: Tts["Service"]; readonly engine: Engine }, TtsError, Scope.Scope> =>
+): Effect.Effect<
+  { readonly tts: Tts["Service"]; readonly engine: Engine; readonly forSpeaker: (speaker: number) => Tts["Service"] },
+  TtsError,
+  Scope.Scope
+> =>
   Effect.gen(function*() {
     const engine = yield* Effect.acquireRelease(
       Effect.tryPromise({
@@ -35,7 +42,7 @@ export const makeEngineTts = (
      * are dropped, the one in flight finishes in the child and its audio is
      * discarded, so nothing leaks into a later turn.
      */
-    const synthesize = (clauses: Stream.Stream<string>): Stream.Stream<TtsAudio, TtsError> =>
+    const synthesizeAs = (speaker: number | undefined) => (clauses: Stream.Stream<string>): Stream.Stream<TtsAudio, TtsError> =>
       Stream.callback<TtsAudio, TtsError>((queue) =>
         Effect.gen(function*() {
           const joiner = makeJoiner(sampleRate, join)
@@ -67,6 +74,7 @@ export const makeEngineTts = (
               if (settled || text.length === 0) return // the index is used up, there is just no audio
               const job: Job = {
                 text,
+                ...(speaker !== undefined ? { speaker } : {}),
                 onAudio: (samples) => {
                   jobs.delete(job)
                   if (settled) return
@@ -92,5 +100,9 @@ export const makeEngineTts = (
         })
       )
 
-    return { tts: Tts.of({ sampleRate, synthesize }), engine }
+    return {
+      tts: Tts.of({ sampleRate, synthesize: synthesizeAs(undefined) }),
+      engine,
+      forSpeaker: (speaker) => Tts.of({ sampleRate, synthesize: synthesizeAs(speaker) })
+    }
   })

@@ -5,7 +5,7 @@ import { mkdtempSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { fileURLToPath } from "node:url"
-import { make } from "../src/index.ts"
+import { make, presets, shareEngine } from "../src/index.ts"
 import { defaultJoinOptions, type JoinOptions } from "../src/Pcm.ts"
 import { makeEngineTts } from "../src/SherpaTts.ts"
 
@@ -182,6 +182,35 @@ describe("SherpaTts with a stand-in engine", () => {
     Effect.gen(function*() {
       const { tts } = yield* fake()
       assert.deepStrictEqual(yield* collect(tts.synthesize(Stream.empty)), [])
+    }).pipe(Effect.scoped))
+})
+
+describe("another speaker of the loaded model (previews)", () => {
+  it.live("forSpeaker speaks with that speaker in the same process; the engine's own service is unchanged", () =>
+    Effect.gen(function*() {
+      const built = yield* fake({ join: untrimmed })
+      const pid = built.engine.pid
+      const own = bytes(yield* collect(built.tts.synthesize(Stream.make("abcd"))))
+      const other = bytes(yield* collect(built.forSpeaker(2).synthesize(Stream.make("abcd"))))
+      const ownAgain = bytes(yield* collect(built.tts.synthesize(Stream.make("abcd"))))
+      // Speaker 2 makes the stand-in's tone three times as long (fake-host.mjs).
+      assert.strictEqual(other - own, 2 * 2 * Math.round(RATE * 0.01 * 4))
+      assert.strictEqual(ownAgain, own)
+      assert.strictEqual(built.engine.pid, pid)
+    }).pipe(Effect.scoped))
+
+  it.live("shareEngine: the same lexicon's Kokoro voices share an engine, other set-ups do not", () =>
+    Effect.gen(function*() {
+      const built = yield* fake()
+      const spoken: Array<number> = []
+      const shared = shareEngine(presets["kokoro-af_heart"]!, { tts: built.tts, forSpeaker: (s) => (spoken.push(s), built.forSpeaker(s)) })
+      assert.strictEqual(shared.forPreset("kokoro-af_heart"), built.tts)
+      assert.isDefined(shared.forPreset("kokoro-am_michael"))
+      assert.isUndefined(shared.forPreset("kokoro-bf_emma"))
+      assert.isUndefined(shared.forPreset("kokoro-zf_xiaoxiao"))
+      assert.isUndefined(shared.forPreset("en_US-lessac-medium"))
+      assert.isUndefined(shared.forPreset("nope"))
+      assert.deepStrictEqual(spoken, [16])
     }).pipe(Effect.scoped))
 })
 
