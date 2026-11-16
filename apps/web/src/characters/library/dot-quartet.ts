@@ -16,7 +16,7 @@ const WHITE: Rgb = [255, 255, 255]
 const V_SHAPE = [1, 0.62, 0.62, 1] as const
 const A_SHAPE = [0.58, 1, 1, 0.58] as const
 const SHAPES = ["rounded", "square", "outline"] as const
-/** Keep bars this far (CSS px) from the canvas edges. */
+/** Keep bars this far (CSS px) from the box's edges. */
 const MARGIN = 4
 
 const create = (canvas: HTMLCanvasElement): CharacterInstance => {
@@ -62,14 +62,15 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
 
   return {
     resize(width, height, ratio) {
-      W = width
-      H = height
       dpr = ratio
       g = setup2d(canvas, dpr)
-      d0 = Math.max(6, unit(W, H) * 0.056)
     },
 
     frame(f) {
+      const fo = f.focus
+      W = fo.width
+      H = fo.height
+      d0 = Math.max(6, unit(W, H) * 0.056)
       const dt = f.dt
       const p = f.palette
       const dark = p.dark
@@ -122,8 +123,11 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
       if (!reduced) orbit += dt * TAU * 0.85 * (0.4 + mix.thinking) * speed
       else orbit = Math.PI / 4
       const rho = d * 1.45
-      const press = f.pointer.down && f.pointer.inside
-      const lean = f.pointer.inside ? clamp((f.pointer.x - cx) / (W * 0.5), -1, 1) : 0
+      const px = f.pointer.x - fo.x
+      const py = f.pointer.y - fo.y
+      const over = px >= 0 && px < W && py >= 0 && py < H
+      const press = f.pointer.down && over
+      const lean = over ? clamp((px - cx) / (W * 0.5), -1, 1) : 0
 
       for (let i = 0; i < 4; i++) {
         const outer = i === 0 || i === 3
@@ -165,7 +169,7 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
       }
       placed = true
 
-      clear2d(g, dpr)
+      clear2d(g, dpr, fo) // (0, 0) is the box's top-left corner; the glow may spread over the whole stage
 
       // Colour: grey, mint for the person, amber for the reply; while thinking the orbiting dots
       // alternate mint and amber (the turn is being handed over).
@@ -210,7 +214,7 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
       for (let i = 0; i < 4; i++) {
         const core = mixInto(tmp, i % 2 === 0 ? dotA : dotB, WHITE, whiten)
         const w = ws[i]!.value
-        // Bars never leave the canvas, at any size or loudness.
+        // Bars never leave the box, at any size or loudness.
         const h = Math.min(Math.max(w, hs[i]!.value), H - 2 * MARGIN)
         const x = xs[i]!.value - w / 2
         const y = clamp(ys[i]!.value - h / 2, MARGIN, H - MARGIN - h)
@@ -232,11 +236,12 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
 
 const design: Character = {
   id: "dot-quartet",
-  version: "1.0.0",
+  version: "1.1.0",
   contract: 1,
   name: "Dot quartet",
   family: "abstract",
   renderer: "2d",
+  canvas: "stage",
   summary: "Four dots that rest as dots, stand up as bars when someone speaks (V-shaped and tight for you, Λ-shaped and spread for the assistant) and orbit while thinking.",
   inspiredBy:
     "ChatGPT's first voice mode (circle, cloud, four ovals) and Google's four dots (rest, bars, spin), with the colours taken from our palette, plus a direction rule (outer bars lead for input, inner bars lead for output) after Meta AI's ring.",
@@ -256,7 +261,7 @@ const design: Character = {
     { signal: "active.brightness", effect: "Whiter bar cores for bright vowels (dark theme)." },
     { signal: "mode", effect: "Spacing (1.45 dot apart hearing, 2.5 speaking), V vs Λ envelope, which pair leads, row vs orbit, colour grey / mint / alternating mint-and-amber / amber; 250 ms crossfade on springs." },
     { signal: "pointer", effect: "The row leans toward the pointer; pressing squashes the dots (shorter, wider)." },
-    { signal: "options", effect: "Size, gap, shape, glow, spectrum detail, pitch staircase, motion speed and comet tails change the drawing in every mode; they glide over about 0.2 s (snap under reduced motion). Bars are kept inside the canvas." },
+    { signal: "options", effect: "Size, gap, shape, glow, spectrum detail, pitch staircase, motion speed and comet tails change the drawing in every mode; they glide over about 0.2 s (snap under reduced motion). Bars are kept inside the stage box; the glow spreads over the whole page." },
     { signal: "reducedMotion", effect: "No bobbing or orbiting: thinking is a still diamond of four dots; heights in quarter steps with no lag." }
   ],
   options: [

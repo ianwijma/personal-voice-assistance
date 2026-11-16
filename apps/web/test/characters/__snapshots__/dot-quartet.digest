@@ -1,4 +1,4 @@
-# dot-quartet 1.0.0: frame digests of a scripted conversation at default settings (docs/CHARACTERS.md §6.6).
+# dot-quartet 1.1.0: frame digests of a scripted conversation at default settings (docs/CHARACTERS.md §6.6).
 # A change here must be deliberate: check the look, then update with `pnpm --filter @pva/web exec vitest run test/characters -u`.
 dark  0.5 idle         15 87b0e17f
 dark  1.0 listening    15 7f484313
@@ -47,3 +47,26 @@ light 11.0 idle         15 96a5950f
 overflow 160×140×1 0.0 px
 overflow 900×420×1 0.0 px
 overflow 720×240×2 0.0 px
+stage  0.5 idle         15 eb93a9ff
+stage  1.0 listening    15 03419593
+stage  1.5 listening    22 f6a9204c
+stage  2.0 hearing      19 447d9f97
+stage  2.5 hearing      23 71b8be8b
+stage  3.0 hearing      19 3a21fdb9
+stage  3.5 hearing      19 ae65a734
+stage  4.0 hearing      19 6bc8556f
+stage  4.5 hearing      19 c5c2e4fe
+stage  5.0 thinking     70 8a97a0d2
+stage  5.5 thinking     70 0701f7e3
+stage  6.0 thinking     70 de92dacb
+stage  6.5 speaking     74 26a27768
+stage  7.0 speaking     71 53176e3d
+stage  7.5 speaking     22 2fda08ef
+stage  8.0 speaking     19 ebed65f1
+stage  8.5 speaking     19 2ab36b11
+stage  9.0 speaking     23 ede74359
+stage  9.5 listening    22 f2008fe4
+stage 10.0 listening    22 fd9bfb99
+stage 10.5 idle         22 c2f6b75d
+stage 11.0 idle         22 0cf1c6bc
+stage 1280×800×1 focus 720×240 at 280,200: solid drawing x 547.7..732.3, y 235.2..399.2
