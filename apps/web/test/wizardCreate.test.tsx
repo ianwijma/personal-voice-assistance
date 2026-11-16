@@ -21,10 +21,10 @@ const setup = (createAssistant: (...args: ReadonlyArray<unknown>) => Promise<Out
     store.dispatch({ type: "local/ui", patch: navigateSettings(store.get().ui, to, options?.discard === true) })
   )
   const client = { store, settings, createAssistant: create } as unknown as AssistantClient
-  render(<ClientContext.Provider value={client}><NewAssistantWizard /></ClientContext.Provider>)
+  const { unmount } = render(<ClientContext.Provider value={client}><NewAssistantWizard /></ClientContext.Provider>)
   /** The step as the browser's back and forward buttons change it: not through the wizard. */
   const toStep = (n: number) => act(() => store.dispatch({ type: "local/ui", patch: { settingsPath: ["assistants", "new", String(n)] } }))
-  return { store, create, settings, toStep }
+  return { store, create, settings, toStep, unmount }
 }
 
 const nameField = () => screen.getByRole("textbox", { name: "Name" }) as HTMLInputElement
@@ -77,5 +77,38 @@ describe("New assistant wizard while it creates (PR #35 review 3, finding 1)", (
     expect(settings).toHaveBeenLastCalledWith(["assistants", "new", "1"])
     fireEvent.change(nameField(), { target: { value: "Zed" } })
     expect(nameField().value).toBe("Zed")
+  })
+})
+
+describe("New assistant wizard left while it creates (PR #35 review 4, finding 2)", () => {
+  /** Name Mia, go to Check and send Create with the answer held; then leave the wizard (it unmounts) before it comes. */
+  const leaveWhileCreating = async () => {
+    let answer: (o: Outcome) => void = () => undefined
+    const s = setup(() => new Promise<Outcome>((resolve) => { answer = resolve }))
+    fireEvent.change(nameField(), { target: { value: "Mia" } })
+    s.toStep(7)
+    await act(async () => {
+      fireEvent.click(createButton())
+    })
+    expect(s.create).toHaveBeenCalledTimes(1)
+    // The sidebar opens a device; the wizard is gone.
+    act(() => s.store.dispatch({ type: "local/ui", patch: { settingsPath: ["devices", "kitchen"] } }))
+    s.unmount()
+    return { ...s, answer: (o: Outcome) => act(async () => answer(o)) }
+  }
+
+  it("a late success does not navigate (it would discard the page shown now), but still says it was created", async () => {
+    const { settings, store, answer } = await leaveWhileCreating()
+    await answer({ kind: "ok", assistantId: "mia" })
+    expect(settings).not.toHaveBeenCalled()
+    expect(store.get().ui.settingsPath).toEqual(["devices", "kitchen"])
+    expect(store.get().toasts.some((t) => t.message === "Created Mia.")).toBe(true)
+  })
+
+  it("a late refusal does not go back to a wizard step", async () => {
+    const { settings, store, answer } = await leaveWhileCreating()
+    await answer({ kind: "invalid", message: "Not valid.", fieldErrors: [{ key: "name", message: "Taken." }] })
+    expect(settings).not.toHaveBeenCalled()
+    expect(store.get().ui.settingsPath).toEqual(["devices", "kitchen"])
   })
 })
