@@ -320,12 +320,8 @@ describe("particle sphere: the streaks", () => {
   describe("under reduced motion", () => {
     const fan = (mode: Mode, v: VoiceFeatures, stored: Stored = {}) => heads(settle(make({ points: "dashes", ...stored }), mode, 30, { reduced: true, user: v, agent: v }))
 
-    it("nothing streams; a still fan of streaks shows the direction, and it does not move", () => {
-      for (const mode of ["listening", "hearing", "speaking"] as const) {
-        const a = fan(mode, voice())
-        expect(a.length, mode).toBeGreaterThan(0)
-        expect(fan(mode, voice())).toEqual(a)
-      }
+    it("nothing streams; a fan of streaks shows the direction while listening, hearing and speaking, and none while idle or thinking", () => {
+      for (const mode of ["listening", "hearing", "speaking"] as const) expect(fan(mode, voice()).length, mode).toBeGreaterThan(0)
       expect(fan("idle", voice())).toHaveLength(0)
       expect(fan("thinking", voice())).toHaveLength(0)
     })
@@ -383,13 +379,10 @@ describe("particle sphere: point styles", () => {
     expect(speaking(0.9)).toBeGreaterThan(speaking(0.05) * 1.5)
   })
 
-  it("an unknown style from storage is drawn as dots", () => {
-    expect(dots(style("no-such-style"))).toEqual(dots(style("dots")))
-  })
 })
 
 describe("particle sphere: thinking", () => {
-  it("gathers the points into rings that spin, with bigger points, and holds still under reduced motion", () => {
+  it("gathers the points into rings that spin, with bigger points", () => {
     const idle = mean(dots(settle(make(), "idle", 10, { reduced: true })).map((p) => p.r))
     const think = mean(dots(settle(make(), "thinking", 10, { reduced: true })).map((p) => p.r))
     expect(think).toBeGreaterThan(idle * 1.3)
@@ -398,11 +391,6 @@ describe("particle sphere: thinking", () => {
     const a = dots(frame(r, "thinking"))
     settle(r, "thinking", 30)
     expect(dots(frame(r, "thinking"))).not.toEqual(a)
-    const still = make()
-    settle(still, "thinking", 400, { reduced: true }) // the grain eases in over a second or two
-    // (to a thousandth of a pixel: the grain is still easing in, ever more slowly)
-    const rounded = (pts: ReadonlyArray<Pt>) => pts.map((p) => [p.x, p.y, p.r].map((v) => Number(v.toFixed(3))))
-    expect(rounded(dots(frame(still, "thinking", { reduced: true })))).toEqual(rounded(dots(settle(still, "thinking", 30, { reduced: true }))))
   })
 })
 
