@@ -1,28 +1,33 @@
 # Assistants: several configured assistants, assigned to devices
 
-Design written 2026-11-16 at the owner's request. Today there is one assistant, and its configuration is spread over the
-global settings (language model, speech recognition, voice, modules), the front-end kind defaults and the device
-overrides (activation, wake phrases, follow-up, conversation reset). This design makes the **assistant** a thing the
-admin creates. Each assistant has its own prompt, language model, hearing, voice and modules. **Devices** say which
-assistants answer on them and which phrase wakes each one.
+**Status: built (2026-11-16), work packages WP-0 to WP-16, with the open items listed under "Open items" at the end.** Voice
+nodes (WP-17: PR #4 rebased onto protocol 7) are not part of this branch. Sections 1 to 9 are the design, brought in line with
+what was built; "What was built" says what differs from it and why, and "Measurements" holds every number measured on the way.
 
-The UI contract is the two owner-approved mock-ups, `docs/mockups/assistants/admin.html` and
-`docs/mockups/assistants/voice.html`. Where they and the owner's brief disagree, the brief wins; §7.3 lists every
-such difference. The design builds on three other pieces of work:
+Design written 2026-11-16 at the owner's request. Before this work there was one assistant, and its configuration was spread
+over the global settings (language model, speech recognition, voice, modules), the front-end kind defaults and the device
+overrides (activation, wake phrases, follow-up, conversation reset). The **assistant** is now a thing the admin creates. Each
+assistant has its own prompt, language model, hearing, voice and modules. **Devices** say which assistants answer on them and
+which phrase wakes each one.
+
+The UI was built from the two owner-approved mock-ups, `docs/mockups/assistants/admin.html` and
+`docs/mockups/assistants/voice.html`. They are the **design reference**: the built pages may differ from them. Where the
+mock-ups and the owner's brief disagreed, the brief won (§7.3); where the build differs from the mock-ups, §7.4 says how.
+The design builds on three other pieces of work:
 
 - **Voice sessions** (docs/VOICE-SESSIONS.md, merged as #5): a voice session per device.
-- **Voice providers** (`docs/VOICE-PROVIDERS.md` in worktree `t3-5b95ea17`, server half built, not merged). It
-  provides one voice reference `{ provider, voiceId }`, removes the voice router, retires the per-device voice and
-  expects a per-assistant voice selection (its §7.1).
-- **Voice nodes** (docs/VOICE-NODES.md on branch `t3/standalone-triggered-voice-service`, PR #4).
+- **Voice providers** (docs/VOICE-PROVIDERS.md, merged). It provides one voice reference `{ provider, voiceId }`, removes the
+  voice router, retires the per-device voice and expects a per-assistant voice selection (its §7.1); this work built that.
+- **Voice nodes** (docs/VOICE-NODES.md on branch `t3/standalone-triggered-voice-service`, PR #4, not merged and not
+  in this branch). Its one-shot mode is built on `WakeGate`, which therefore stays in core (§4.1).
 
 `docs/ARCHITECTURE.md` stays the contract. This design changes none of its service interfaces (`AudioInput`,
 `AudioOutput`, `Stt`, `Llm`, `Tts`), and the `Conversation` API is unchanged too. It replaces `WakeGate`'s
-configuration (§3.4), makes additive changes to `Trace` and adds trace marks (§3.7). ARCHITECTURE.md is updated by
-WP-16.
+configuration in the session with `RouteGate` (§3.4), makes additive changes to `Trace` and adds trace marks (§3.7), and adds
+two optional fields to `TurnSetup` (`llm`, `tts`: §3.2). ARCHITECTURE.md was updated by WP-16.
 
 Sections: 1 decisions · 2 data model · 3 run time · 4 existing concepts · 5 protocol · 6 migration · 7 UI map ·
-8 build plan · 9 risks and open questions · Status.
+8 build plan · 9 risks and open questions · What was built · Open items · Measurements.
 
 ## 1. Decisions
 
@@ -47,11 +52,11 @@ Sections: 1 decisions · 2 data model · 3 run time · 4 existing concepts · 5 
 | Several conversations on one audio path | A **session dispatcher** per voice session: one recogniser stream, then the echo gate, then a **route gate**, then the dispatcher, then N unchanged `Conversation`s (one per assistant, made on first use), all sharing one `AudioOutput` through a lease (§3.3). | Leaves the 1700-line `Conversation` and its tested contract untouched; the utterance contract already defines everything the dispatcher needs (an empty `EndOfTurn` ends an utterance and starts nothing, ARCHITECTURE.md:84-86). | One `Conversation` with a history per agent: rewrites core's history, idle and routing state. |
 | Moving an utterance to another assistant | The dispatcher sends `SpeechStarted` to the conversation that is speaking (for barge-in) at once. When the transcript shows the sentence is for another assistant, it closes the utterance there with an empty `EndOfTurn` and replays `SpeechStarted` plus the text to the target. | Barge-in keeps its speed (it acts on `SpeechStarted`, before any words), and routing waits for words. | Holding barge-in until routing is known: slower interruption. |
 | One speaker | A per-session output lease: when one conversation starts `play`, a play still running for another fails with `AudioError("superseded")`. That turn is then committed like an interrupted one (the existing playback-failure rule, ARCHITECTURE.md:180). | Two replies can never sound at once, even with typed text racing speech. | Trusting the dispatcher's ordering alone. |
-| Where the wake phrase is matched | `WakeGate` becomes `RouteGate` (pure, core). Its phrases carry their assistant, follow-up windows belong to an assistant, and every event it lets through is tagged with a tentative target. Phrases are matched and stripped in every mode. | One matcher (`matchWakePhrase`, WakeGate.ts:182) with one tester. In the new model "always" means "someone answers without a phrase", and a phrase can still pick another assistant. | A second matcher in the dispatcher. |
+| Where the wake phrase is matched | `WakeGate` becomes `RouteGate` (pure, core). Its phrases carry their assistant, follow-up windows belong to an assistant, and every event it lets through is tagged with a tentative target. Phrases are matched and stripped in every mode. | One matcher (`matchWakePhrase`, WakeGate.ts:182) with one tester. In the new model "always" means "someone answers without a phrase", and a phrase can still pick another assistant. Built: `RouteGate` imports the matcher from `WakeGate.ts`, which stays in core (§4.1). | A second matcher in the dispatcher. |
 | "Start replying early" off | The dispatcher drops `EagerEndOfTurn` and `TurnResumed` before that assistant's conversation; for a Claude subscription assistant it also sets the agent's `speculate`. | No core option needed; the utterance contract allows an utterance without eager events. | A new `Conversation` option. |
 | Shared resources | The single build of `EngineProviders` (Engine.ts:25-38) becomes a **resource pool** keyed by configuration: one language-model instance per distinct adapter configuration, one recogniser **worker** per distinct local model and language, one `Tts` per distinct voice reference. Assistants that use the same configuration share one. Resources are built for what is reachable, released 10 s after their last user. | The pool shares what can be shared, so a second assistant with the same settings costs nothing. | One full set of engines per assistant: wasteful, and two copies of one 0.5–1 GB model. |
 | Per-assistant turn timing on one shared model | `stt-sherpa` shares a worker per (model, language, model directory, threads) across `make` calls. Turn timing, VAD threshold and gain become per-stream options, carried in the worker's per-session messages (the worker already keeps a VAD and gain control per session, ARCHITECTURE.md:207). The `Stt` interface is unchanged. | Two devices whose hearers differ only in end pause share one model in memory. | Adding an options argument to `Stt.transcribe`, which would change the contract. |
-| What reloads | No global engine reload for assistant changes. A changed resource key builds the new resource first, then each conversation switches at its next turn start; the running turn finishes on the old one. A full reload remains only for model directories and thread counts. | Today any provider change stops every session's loop (Engine.ts:203-206); that becomes unacceptable when changing one assistant would interrupt all of them. | Keeping the global reload. |
+| What reloads | No global engine reload for assistant changes. A changed resource key builds the new resource first, then each conversation switches at its next turn start; the running turn finishes on the old one. A full reload remains for the owner's Reload button. **Built:** a changed model directory or thread count is part of the recogniser's key and needs no reload either. | Before this work any provider change stopped every session's loop (Engine.ts:203-206); that becomes unacceptable when changing one assistant would interrupt all of them. | Keeping the global reload. |
 | Changing a device's recogniser | It happens when the hearer's settings or the hearer itself change (an assignment change, or a pick on the voice page). The session's recogniser stream is replaced at the next moment no utterance is open (waiting at most 5 s), after the new resource is ready. | An utterance is never cut in half. | Restarting at once. |
 | Device overrides granularity | Per **section key** of the device settings (assistants, withoutPhrase, matching, voicePage, interruptMode, audio, captions), not per field. | Matches the mock-up's "Own value · Reset" per section, and keeps an ordered assistant list one unit. `withoutPhrase` is its own key, so a voice-page pick does not copy the whole list. | Per-field overrides (today's `ProfileOverrides`, protocol/frontends.ts:222). |
 | Module instances | A module runs while at least one switched-on assistant has it on. An assistant with its own module settings gets its own instance, shared with any assistant whose effective settings are equal. Only fields a module marks `overridable` can be per assistant; secrets and addresses never. | `ModuleHost` keeps one instance per module id today (ModuleHost.ts:50-64). Sharing by effective settings keeps the common case at one instance. | One instance per assistant always: duplicates caches and connections (Home Assistant's 60 s refresh). |
@@ -59,7 +64,7 @@ Sections: 1 decisions · 2 data model · 3 run time · 4 existing concepts · 5 
 | Where entities live | `data/settings.json` version 4 gains `assistants` and `deviceTypes`; `devices` changes shape. Shared settings stay env-keyed flat sections; module shared settings stay under `modules`. Assistants hold no secrets. | Secrets keep their one path into the vault (flat keys and module secrets, unchanged). | Per-assistant secrets. |
 | Environment values for per-assistant keys | A `.env` value of a key that became per-assistant (`SYSTEM_PROMPT`, `ANTHROPIC_MODEL`, `STT_SHERPA_MODEL`, …) applies to, and locks, that field on the **migrated** assistant only, and is offered under Settings from outside with "Move to settings". | An install started from `.env` behaves exactly as before, and "environment wins" stays true. | Ignoring the environment after migration (silent change), or applying it to every assistant (surprising). |
 | Admin transport | Assistants and devices use WebSocket requests (`requestId`, answered with `result`) and whole-list pushes, as front ends do today. Each entity is saved whole, with a per-entity `rev` for conflict detection. | Other open admin pages must update live; the mock-up saves a whole draft per page. | An HTTP CRUD API under `/api/` (no push), or field patches (lost updates between two tabs). |
-| TypeSafe timing | Asked at the utterance's first `EagerEndOfTurn` (else its `EndOfTurn`). The eager event is held until the answer or the give-up time; the decision is reused at `EndOfTurn` when the canonical text is the same (`sameUtterance`), and asked again otherwise. | With the default pauses (eager 250 ms, final 600 ms) up to about 350 ms of the call overlaps the silence the recogniser waits anyway. That is a hypothesis to measure (WP-14), not a claim. | Asking only at `EndOfTurn`: the whole round trip would be added. |
+| TypeSafe timing | Asked at the utterance's first `EagerEndOfTurn` (else its `EndOfTurn`). The eager event is held until the answer or the give-up time; the decision is reused at `EndOfTurn` when the canonical text is the same (`sameUtterance`), and asked again otherwise. | With the default pauses (eager 250 ms, final 600 ms) up to about 350 ms of the call overlaps the silence the recogniser waits anyway. That was a hypothesis to measure (WP-14). **Measured: it does not hold.** The decision's whole time is added to playback, with early replies as without, because the speculative turn that produces the reply starts only after the answer (Measurements › TypeSafe routing). | Asking only at `EndOfTurn`: the whole round trip would be added. |
 | TypeSafe client | The existing `makeJevClient` (packages/decide-typesafe/src/JevClient.ts:199), with a routing request (§3.6). No retries; the give-up time is its timeout. | One client, already tested and redacted. | The SDK (10 s default timeout and retries, docs/research/typesafe-jev.md:154). |
 | Protocol | Version **7** for this work, which lands before the voice-node protocol; voice nodes rebase to 8 (§5.1). | Voice nodes' admin pages (Device defaults, Devices) are exactly what this redesign replaces; building them twice is waste. | Voice nodes first at 7. |
 | Accounts | A fixed set of five accounts: `offline`, `anthropic`, `claude-subscription`, `openrouter`, `home-model`. One of each, set up in Shared settings. | Matches the mock-up (one card per account), and each adapter already reads one key or address. | User-created accounts (two Anthropic keys): no need stated. |
@@ -292,12 +297,11 @@ says nobody answers anywhere.
 
 ## 3. Run time
 
-### 3.1 Today
+### 3.1 Before this work
 
-Shared engines are built once per build: `EngineProviders = { llm, stt, tts, voice, maxToolRounds }` (voice-provider
-version of serve/Engine.ts:25-38). Each session has one `Conversation` over them (SessionConversation.ts:138-171).
-The system prompt and tools are read per turn from the global `SYSTEM_PROMPT` and the module host
-(serveMode.ts:251-279). Any provider change is a global reload (Engine.ts:203-206).
+Shared engines were built once per build: `EngineProviders = { llm, stt, tts, voice, maxToolRounds }` (serve/Engine.ts). Each
+session had one `Conversation` over them (SessionConversation.ts). The system prompt and tools were read per turn from the
+global `SYSTEM_PROMPT` and the module host (serveMode.ts). Any provider change was a global reload.
 
 ### 3.2 Resource pool (replaces the single build)
 
@@ -354,6 +358,18 @@ child process. Each hosted LLM instance is an HTTP client with its own keep-aliv
 - Shared settings › Speech recognition models: the models in use and their total memory.
 - Voice tab: the same for a local voice engine that is not yet running.
 
+**As built** (WP-9 to WP-11; details and the reasons under "What was built"):
+
+- The pool holds language models, voices and recognisers (`serve/Resources.ts`). The core changed only by two optional
+  fields of `TurnSetup`: `llm` and `tts` (ARCHITECTURE.md). A turn reads its assistant's instance once, at its start, and keeps
+  it for every round, so a changed model or voice applies at the next turn without rebuilding the conversation.
+- `LlmKey` leaves `effort` and `thinking` out for the OpenAI-compatible accounts (they do not apply there), and an offline
+  account ignores the model fields. `SttKey` names the language only for a preset that takes one, and includes the model
+  directory and thread count. A voice's key is its `voiceKey`; the voices of one local engine share that engine.
+- Recognisers are bound per hearing **place** (`device:<id>`, and `type:<kind>` for a device type's defaults), not per assistant:
+  the hearer rule is per device. A place with no assistant wants nothing, and its session runs no recogniser.
+- `Engine.ts` holds no provider any more: it is the full reload (the owner's Reload button) and the status.
+
 ### 3.3 One voice session, several conversations
 
 ```
@@ -393,7 +409,8 @@ WebAudioInput ─▶ Stt(hearer) ─▶ EchoGate ─▶ RouteGate ─▶ Dispatc
 - **Limits**: `MAX_VOICE_SESSIONS` still counts devices. `SESSION_DISCARD_MINUTES` forgets all of a device's
   conversations. The Claude subscription agent's `maxSessions` (agent-claude-code/src/agent.ts:66, default 4) becomes
   `MAX_VOICE_SESSIONS` × the number of switched-on Claude subscription assistants, still closing the least recently
-  used.
+  used. **Built:** an assistant's model or effort change applies in place on its running session (`setModel` and the effort
+  setting, as Claude Code's /model and /effort); only `thinking` replaces the session.
 
 ### 3.4 Route gate (replaces WakeGate's configuration)
 
@@ -425,6 +442,8 @@ RouteGate.replyStarted(assistant, now) / replyEnded(assistant, followUpMs, now)
 - `wakeConfigFromProfile` (WakeGate.ts:69) is replaced by `routeConfigFrom(deviceSettings, assistants)`. The gate is
   reconfigured only when that part changes, which drops a held utterance, as today (VoiceSession.ts:354-362).
 - The offline bench keeps its scenarios and gains two-assistant phrase scenarios.
+- **Built** in `packages/core/src/RouteGate.ts`; `routeConfigFrom` is in `@pva/protocol` (pure, so the admin can use it too). `WakeGate.ts` stays
+  beside it (§4.1).
 
 **What this implies for hearing.** The gate sees a transcript, so the recogniser runs before the assistant is known.
 That is why the hearer rule exists. A phrase must be recognisable by the hearer's model and language (for example
@@ -466,6 +485,8 @@ when `sameUtterance` holds, and asked again (with a fresh give-up time) when the
 held. Docs claim about 100–150 ms per call; an independent benchmark measured a median of 247 ms and p95 of 347 ms
 (docs/research/typesafe-jev.md:142-143). The default 400 ms give-up is therefore near the tail, which WP-14 measures.
 
+**As built and measured:** the call is asked at the first non-blank `EagerEndOfTurn` (else at `EndOfTurn`); the event and everything after it wait for the answer or the give-up time; at the final the decision is reused when `sameUtterance` holds, else asked again. The decision's whole time is added to playback, with early replies as without; the live time of the call is in Measurements › TypeSafe routing. A device set to TypeSafe whose routing section is off or has no key answers nobody without a phrase, and sends nothing.
+
 Nothing else is sent: only the sentence and the Handles lines. TypeSafe option order biases the choice
 (typesafe-jev.md:77), so the order is the device's list order; the risk is noted in §9.
 
@@ -477,6 +498,7 @@ Nothing else is sent: only the sentence and the Handles lines. TypeSafe option o
   start. The route comes from the dispatcher's record for the utterance that started the turn. The config snapshot
   is taken from the resource keys and assistant fields that conversation actually uses for that turn, not from the
   saved settings.
+- **Built:** every finished turn's trace carries `config`, taken once at the turn's start (the keys and fields that conversation uses for that turn), for voice and typed turns, and shown to admin connections only.
 - `Publisher.traceInfo` (Publisher.ts:56-75) maps them into `TraceInfo` (§5.4). Today it drops `Trace.agent`; that
   field is dropped from `TraceInfo` for good, replaced by `assistant` and `route`.
 
@@ -484,27 +506,31 @@ Nothing else is sent: only the sentence and the Handles lines. TypeSafe option o
 
 ### 4.1 Agents, router and intents (packages/core, agent-*, decide-typesafe, protocol/agents.ts)
 
-- **`makeTriggerRouter`, `RoutingConfig` and its rules** (Routing.ts:19-77, :209): unused by the app (only
-  core/testing.ts:221). Removed in WP-16. Device phrases replace trigger phrases, and the follow-up window replaces
-  "sticky". The default rules' "hey jeff"/"hey jev" were the same phrases as the device defaults
-  (frontends.ts:203).
+- **`makeTriggerRouter`, `RoutingConfig` and its rules**: unused by the app. Device phrases replace trigger phrases, and
+  the follow-up window replaces "sticky". **WP-16:** they are out of core's public surface (`Routing.ts` keeps `Router`,
+  `RouterState`, `RouteDecision` and the state helpers); the router and its configuration live on in
+  `packages/core/src/TriggerRouter.ts` as a fixture for the agent tests, exported from `@pva/core/testing` only.
+- **`WakeGate`** (WakeGate.ts): its matcher is `RouteGate`'s. The gate and its config (`WakeConfig`, `wakeConfigFromProfile`)
+  stay in core because the voice-node design builds its one-shot mode on them (docs/VOICE-NODES.md §3 on branch
+  `t3/standalone-triggered-voice-service`, PR #4) and the offline bench still measures it; so do the version 3 profile types
+  it uses (`DeviceProfile`, `Activation`). Remove it when that branch has been rebased onto the route gate.
 - **`Router`, `AgentSet`, `makeAgentConversation`, `Agent`** stay as core's mechanism for an agent-backed
   conversation. The app keeps using them only for Claude subscription assistants, with the fixed
   `subscriptionRouter` (subscription.ts:59-65): the agent if running, else the offline stand-in with a notice.
 - **`claude-subscription` agent module**: its shared settings (opt-in, program, proxy, debug logs) become the account.
   Its per-assistant settings (`model`, `systemPrompt` → the assistant's prompt, `speculate` → `replyEarly`, `tools` →
   `useModules`, `sessionIdleMinutes` → `freshSessionAfterMinutes`) move to the assistant. Claude Code sessions are
-  already keyed by conversation id (ARCHITECTURE.md:142); WP-13 lets a session be opened with that conversation's
-  assistant's model and options.
+  already keyed by conversation id (ARCHITECTURE.md:142); WP-13a puts the assistant's options on each turn and applies a
+  model or effort change in place on the running session.
 - **Jev intent agent** (`packages/agent-intent`) and **decision providers** (`decide-typesafe`): not wired by this
   design. `makeJevClient` is reused for routing. An intent-only assistant ("commands without a language model") would
   be a sixth account kind later (§9, question 3).
 - **`llm-openai-compatible`**: becomes the `openrouter` and `home-model` accounts. Its agent modules
   (agent.ts:325, :334) provide the shared address and key; per-assistant models are Llm instances in the pool (WP-13).
-- **`module-home-assistant`**: not in the app's catalog today (apps/assistant/src/modules.ts:125-130, and not a
-  dependency). WP-12c adds it. Address and token are shared; `domains` (lights only today) is `overridable`.
-- **`protocol/agents.ts`** additions that were never put in the unions (routing.set, turn.agent, TraceAgentFields, …)
-  are deleted in WP-16, except `ModuleKind` (used by snapshot.ts:62).
+- **`module-home-assistant`**: in the app's catalog since WP-12c (and a dependency). Address and token are shared; `domains`
+  (lights only today) is `overridable`.
+- **`protocol/agents.ts`** additions that were never put in the unions (routing.set, turn.agent, TraceAgentFields, …) were
+  deleted in WP-16; `ModuleKind` and the settings field types stay.
 
 ### 4.2 Front-end kinds, profiles, device fields
 
@@ -524,7 +550,9 @@ Nothing else is sent: only the sentence and the Handles lines. TypeSafe option o
 | `DEVICE_EDITABLE_FIELDS` (voice, activation, followUpSeconds) and `device.update` | removed; `device.pick` (§5.3) |
 
 `ProfileOverrides`, `ProfilePatch`, `effectiveProfile`, `DeviceProfile` and `DeviceProfileInfo` are replaced by
-`DeviceOwn`, `DeviceSettings`, `effectiveDeviceSettings` and `DeviceSetup` (§5.3).
+`DeviceOwn`, `DeviceSettings`, `effectiveDeviceSettings` and `DeviceSetup` (§5.3). **WP-16:** `ProfilePatch`, `DeviceProfileInfo`,
+`FrontendKindInfo`, `DEVICE_EDITABLE_FIELDS`, `FRONTEND_KINDS` and the messages in the last row are gone; `DeviceProfile`,
+`ProfileOverrides` and `effectiveProfile` stay, for the version 3 migration and `WakeGate`.
 
 ### 4.3 Global sections that become per assistant
 
@@ -546,14 +574,16 @@ are read once by the migration and then ignored (kept in the file, listed in `mi
 values apply to the migrated assistant (§1.2). `envSettings.ts` gets a target kind `assistant-field`, so "Move to
 settings" writes the value into that assistant and comments out the line.
 
-The CLI modes (`voice`, `text`, `say`, `bench --live`) use the first switched-on assistant, or `--assistant <id>`, with
-the same resolution (`cliSettings.ts`).
+The CLI modes (`voice`, `text`, `say`, `transcribe`, `bench --live`) still read the flat keys: `cliSettings.ts` resolves an
+assistant (`cliAssistant`: the first switched-on one, or `assistantId`, with the environment applied) but no mode uses it yet and
+there is no `--assistant` flag. For the same reason the flat keys, their section fields and the mirror of a saved flat key into
+the migrated assistant stay (§6, "What was built").
 
 ## 5. Protocol
 
 ### 5.1 Version
 
-`PROTOCOL_VERSION = 7` (`packages/protocol/src/constants.ts:48`, now 6; the voice-provider work keeps 6).
+`PROTOCOL_VERSION = 7` (`packages/protocol/src/constants.ts`; built; the voice-provider work kept 6).
 
 The voice-node design claims 7 for itself (docs/VOICE-NODES.md §2), but its code is at 5: it branches from #3
 (93ed0fd), before voice sessions. **Order**: voice providers merge first (no bump), then this design's WP-2 (7). Voice
@@ -617,7 +647,7 @@ DevicePick        = { type: "device.pick", requestId, withoutPhrase: AssistantId
   // (it keeps fallback and giveUpMs from the effective value). Device-wide: every tab and every user of that device.
 ```
 
-Removed: `device.update`, `device.profile`, `DeviceProfileInfo`.
+Removed (built, WP-16): `device.update`, `device.profile`, `frontend.update`, `device.admin.update`, the `frontends` push, `DeviceProfileInfo`, `FrontendKindInfo`, `snapshot.device`, `snapshot.conversation` (`snapshot.conversations` is required; an admin connection gets an empty one), `admin.snapshot.frontends`, and `profile` and `overrides` on a device entry.
 
 ### 5.4 Admin pushes and snapshot
 
@@ -699,6 +729,12 @@ modes migrate in memory only. Voice providers must already be merged: the voice 
 Nothing else changes for a running install: the same model, recogniser, voice, phrases, follow-up, interrupting and
 modules answer. With only one assistant, conversations behave exactly as one conversation per device did.
 
+**Built as designed.** Tested on version 3 fixtures (default install, `always` and wake-phrase kinds, device overrides, Claude
+subscription, environment-locked keys) and by starting a server on a version 3 directory. The transitional "legacy view" that
+let the old front-end code read and write version 4 (`frontendData`, `saveFrontends`) is gone (WP-16); the saved flat keys of
+per-assistant settings are still mirrored into the migrated assistant when `settings.update` saves one (the command-line
+modes read them), and the Claude subscription module's per-assistant fields are mirrored the same way.
+
 ## 7. UI map
 
 ### 7.1 Admin (`docs/mockups/assistants/admin.html`)
@@ -761,6 +797,25 @@ keeps `conversations` keyed by assistant.
    persists (the voice mock-up's sheet text and the brief agree).
 10. **Open decision (a)** (one recogniser per device) is the owner's fixed decision 4.
 
+### 7.4 Differences in the built UI
+
+The built pages follow the mock-ups; these are the differences that are not in §7.3 (the code and this list win):
+
+- **Admin tree.** Shared settings regroups the server's pages by key (`settingsTree.ts`): the keys that moved onto the assistant are
+  not shown; Home and Routing appear when the server sends their section. Capability modules have no on/off switch (they run
+  for the assistants that have them on; the shared Modules page shows "Used by" and each instance); agent and decision modules
+  keep theirs.
+- **Language model tab.** The model is a free-text field; the models of a provider are not listed. Account cards say "Key set" or
+  "Address set" from the shared sections. "Ask before acting" is shown disabled.
+- **Device pages.** TypeSafe is listed and disabled ("which is not set up") until the routing section is on and has a key (the
+  admin reads this from the section; `canAuto` goes only to voice pages). The phrase tester has no "Add as phrase" on ignored
+  lines: a heard phrase belongs to an assistant, picked on the device page. The Hearing tab and device page do not show the
+  memory sentence ("about N MB more memory, M s to load"); a save that would load models needing more than 75 % of the free
+  memory is refused with a warning instead, and the hearer's `problems` carry the memory line.
+- **Diagnostics › Latency** has ten columns, is 1000 px wide and scrolls sideways on a phone.
+- **Wizard.** The step is the third part of the path (`#settings/assistants/new/<1..7>`), so "Leave without saving?" covers it;
+  nothing is sent before "Create assistant".
+
 ## 8. Build plan
 
 Each work package ends with `pnpm check` and `pnpm test` passing, plus the checks listed. "Opus" means the package is
@@ -804,7 +859,166 @@ WP-3 onwards). PR #4 is not needed until WP-17.
 The UI packages can expose fields whose server half lands later (Hearing before WP-11). Until then the server stores
 those fields, and the page says "used from the next start" where they are not yet live.
 
-### Baseline measurements (WP-0)
+**Done:** WP-0 to WP-16, all on 2026-11-16, in this branch. **Not done:** WP-17 (voice nodes on protocol 7), which is PR #4's rebase.
+
+## 9. Risks and open questions
+
+The recommendations below were followed. Measured since: the cost of a second local speech model and a second voice (Measurements ›
+WP-0, WP-11, WP-10), the delay TypeSafe adds (Measurements › TypeSafe routing), two sessions on one worker (Measurements ›
+WP-0 and WP-11).
+
+**Risks**
+
+| Risk | Recommendation |
+|---|---|
+| Two local speech models can exhaust memory on the server (each possibly about 1 GB). | Show the measured cost before saving (§3.2). Leave every device on one hearer model unless the owner chooses otherwise; warn above 75 % of free memory at save. |
+| Shared-worker decode queues: a talkative device delays another's turn ends (VOICE-NODES.md §6). | WP-0 and WP-11 measure it; per-model workers already separate different models. |
+| TypeSafe adds a round trip of about 250 ms median to sentences without a phrase. | Ask at the eager point; default off; give-up 400 ms; per-turn Routing column; tune the thresholds from traces. |
+| TypeSafe's choice order bias. | Keep list order (the owner controls it); later, ask twice with reversed order only if traces show bias. |
+| A hearer switch from a voice-page pick loads a model while people talk. | The new worker is built before the switch; the sheet already says "from the next thing you say". |
+| Each assistant on a Claude subscription device conversation opens a Claude Code process. | `maxSessions` bound (§3.3); measure process memory in WP-13a. |
+| "Never" conversations still drop old turns at the fixed history limits (32 turns, 48 000 characters, ARCHITECTURE.md:142). | Say so in the help (the mock-up does); compaction is future work, not part of this. |
+| Tools stored as "off" names: a module update's new side-effecting tool is on for every assistant using that module. | Modules mark new tools `defaultOff` when they change behaviour; the Modules tab shows "new" on tools added since the last save. |
+
+**Open questions** (each with the recommended answer)
+
+1. Should switching an assistant off also free its hearing role (another assistant's model takes over)? **No**:
+   hearing follows the list as configured, so switching off never changes how a device hears.
+2. Should a phrase of a switched-off assistant fall through to the default assistant? **No**: drop it, so a command
+   meant for one assistant never reaches another.
+3. Where does the Jev intent agent go? **Later, as a sixth account kind "Commands only (Jev)"**. Routing by TypeSafe
+   here does not need it.
+4. Should the voice page's pick be per visit rather than device-wide? **Device-wide**, as the mock-up's sheet text
+   says; the admin toggle limits who can do it.
+5. Raise devices talking at once to 16 as the mock-up shows? **Not before WP-0's** multi-session numbers.
+6. Can typed text on a TypeSafe device be routed by TypeSafe? **No**: the voice page always names the conversation
+   shown.
+
+## What was built
+
+Each package ended with `pnpm check` and `pnpm test` passing. The numbers are under "Measurements"; what each package left
+open is under "Open items".
+
+**Store, migration, route gate, dispatcher (WP-1 to WP-5).** `settings.json` version 4 holds `assistants`, `deviceTypes` and
+`devices`, each entity saved whole with a `rev`; a version 3 file is migrated at load (original kept as `settings.json.v3-backup`,
+notes in `migration.notes`) and the command-line modes migrate in memory only. A device's effective settings
+(`effectiveDeviceSettings`: own sections over the type's defaults over the built-in ones; a session without a device uses the
+browser defaults) give the route gate its config (`routeConfigFrom`), re-applied by `syncProfile` whenever the hub refreshes. Per
+session: one recogniser stream per build, echo gate, route gate, the dispatcher, one `SessionConversation` per assistant (made on
+first use, fed through an inbox), all playing through one `OutputLease`, one turn counter. Per assistant: prompt + the Home line + the
+instructions of its modules, a registry of its tools (by module and tool switches), follow-up (assignment, else assistant), quiet
+spell, `replyEarly` (dispatcher) and `toolRounds`. Messages: `assistant.create/save/delete`, `device.save` (admin), `device.pick`,
+`conversation.read` (voice); `assistants`, `device.types` (admin only), `device.setup` and `conversation.history` (voice),
+`devices`. Differences from §5: `devices` and `result` are one tag each, extended compatibly (`DeviceListInfo` is the protocol 5
+entry plus `own`, `settings`, `hearer`, `rev`; `result.assistantId` is optional), so no temporary tag exists; `FieldError.key` accepts
+dotted paths; the lists are pushed after any assistant, device or device-type save; validation refusals are `invalid_settings`
+with `fieldErrors`, and a "cannot be reached" or "no Handles" warning asks for `saveAnyway`. Deleting an assistant ends its
+conversations on every live session.
+
+**Resource pool (WP-9, WP-10, WP-11).** `serve/Resources.ts` holds the language models, the voices and the recognisers; every
+resource has a key, a state, `usedBy` and a problem, shown in the engine status. Wanted = every switched-on assistant on at least
+one effective list (models, voices) and the hearer of every place (recognisers). `reconcile` runs at start (awaited by
+`ServeHandle.ready`, so everything wanted is built and warm before the first turn), after every successful save, and after a vault
+change. A changed configuration builds the new instance first, the assistant stays bound to the old one until it is ready, and
+its next turn start switches; a turn already running finishes on the old one; an instance nobody uses is closed 10 s later. A build
+failure is that resource's problem only. Built differently from §3.2: a recogniser is bound per place, not per assistant; the language
+enters its key only for a preset that takes one; the model directory and thread count are in the key, so they need no full reload;
+Deepgram's key adds the address; the voices of one local engine share one engine process (every Kokoro speaker; a Piper voice is an
+engine of its own), and an engine runs one clause at a time, so two assistants on Kokoro that speak at the same moment queue. A
+hearer switch (a save, a `device.pick`, a vault change) waits until no utterance is open, at most 5 s, then moves the device's stream
+to the new recogniser; an utterance still open then is closed and starts nothing. `stt-sherpa` shares workers process-wide by worker
+key with per-stream options (VAD threshold, gain, pre-roll in the worker's `open`; turn timing on the main thread), with the orphan
+rule per key. A device with no assistant runs no recogniser; a recogniser that cannot load makes that device deaf (told once with
+`engine_failed`), typed text still works, and every other device hears. A save that would load local models needing more than 75 %
+of the free memory is refused with a warning until `saveAnyway`.
+
+**Home, modules (WP-12a to WP-12c).** Section `home` (location, time zone, language, units, date format) feeds every assistant's
+prompt (one line, always present) and the linked defaults of Weather (`defaultPlace` is `HOME_LOCATION` itself, not "", so the
+module stays independent of the app) and Clock. `overridable` fields can be per assistant (never a secret, never an address);
+resolution per field is own value > environment > saved > linked default > the field's default (own wins over the environment too).
+A capability module runs while a switched-on assistant has it on, one instance per distinct set of effective settings; its own switch
+is not read (`module.enable`/`disable` answer `not_allowed`), agent and decision modules keep theirs; a failing instance is that
+instance's error only. `ModuleSnapshot.assistantParts` gives each assistant the parts of its own instances. Home Assistant is in the
+catalog and a dependency; an install that had it off keeps it off on the migrated assistant.
+
+**Accounts (WP-13a, WP-13b, configuration snapshot).** Claude subscription: the agent is still one module instance; serve mode
+wraps it per assistant (`withConversationOptions`), so each assistant on each device has its own Claude Code session with its model,
+effort, thinking, tools and fresh-session time; `maxSessions` = `MAX_VOICE_SESSIONS` × the switched-on assistants on the account.
+A model or effort change applies in place on the running session; only `thinking` (or a change Claude Code does not confirm in 3 s)
+replaces it. The warm spare fits one launch at a time, so with assistants on different thinking settings the first turn of the other
+kind starts a process. OpenRouter and the home model are `Llm` instances (`llm-openai-compatible/account.ts`) over the shared section
+`llm-openai-accounts`; `effort` and `thinking` do not apply to them and are not in their key; not set up fails the build with a
+sentence that says where to set it up, and the assistant's `problems` say so. Every finished turn's trace carries `config` (admin
+connections only; the device's own `turn.end` drops it).
+
+**TypeSafe routing (WP-14).** Section `routing` (`TYPESAFE_ROUTING` off by default, key in the vault, model `jev-1.14.0`, address).
+`canAuto` is "the section is on, has a key and a valid address". The request is `makeJevClient`'s with a per-call time limit; the
+decision is `fits ≥ 0.5` and `choice ≥ 0.5`; none fits, a time-out, an error or a rejected key go to the fallback (`null`: dropped).
+Not set up on a TypeSafe device: nobody answers without a phrase (not the fallback), and nothing is sent. Traces carry
+`route = { by: "typesafe", outcome, probability, fits, ms, fallback }` and the marks `routeSent`, `routeReceived`. Built differently
+from §3.6: a later eager event with changed text asks again; a decision held at the final shows a negative `routeSent` (the
+conversation's `endOfTurn` mark comes after it). No retries, no warm-up request.
+
+The snapshot's fields and where each comes from:
+
+| Field | From |
+|---|---|
+| `llm.account`, `model`, `effort`, `thinking`, `maxTokens` | the spec of the language-model instance the turn is bound to (`ResourcePool.keyFor` → the spec recorded for that key: during a change, still the old one), for an offline account its normalised spec; a Claude subscription assistant: its own `llm` fields (what the agent is given) |
+| `hearing.hearer`, `engine`, `model`, `language`, `eagerSilenceMs`, `finalSilenceMs`, `eotThreshold` | the recogniser binding the device's stream runs on (`SttBinding.spec` and the hearer): stt-sherpa with its end pauses (the language only for a model that takes one), Deepgram with `eotThreshold`; typed text while no stream runs: the device's binding now |
+| `voice` | the key of the voice the turn is bound to (`ttsKeyFor`) |
+| `modules`, `tools` | the capability modules the assistant has on that run, and the tools in its registry (0 for a subscription assistant with `useModules` off) |
+| `replyEarly`, `toolRounds` | the assistant's fields |
+
+**Admin and voice page (WP-6b, WP-7, WP-8, WP-15).** `apps/web` only, with its mock server. The wizard (seven steps), the Assistants
+pages, Devices (list, a device, a type's defaults, with "Own value · Reset" per section), the Overview grid, Shared settings, Latency
+(assistant, device and route columns, filters, a median per assistant, the configuration snapshot of a turn and what changed since),
+the voice page's assistant menu, the chat switcher and per-assistant conversations. How the pages differ from the mock-ups: §7.4.
+
+**Clean-up (WP-16).** Removed: the protocol 5/6 messages and fields listed in §5.3, `serve/frontends.ts` (`FRONTEND_KINDS`) and the
+settings store's legacy view (`frontendData`, `saveFrontends`, `applyLegacyChange`), the unused additions of `protocol/agents.ts`,
+the dead `accountNotAvailableYet` stub of the admin, the mock server's profile layer, `profiles.real.ts`. The device registry (a device
+seen, its last visit, forgotten) moved to `serve/devices.ts` on version 4 records. `makeTriggerRouter` moved to a test fixture
+(§4.1). Kept on purpose: `WakeGate` and the version 3 profile types (the voice-node branch and the offline bench use them, §4.1); the
+flat per-assistant keys, their section fields and the mirror of a saved flat key into the migrated assistant (the command-line modes
+read the keys and `settings.update` still accepts them); the module fields of the Claude subscription (used outside serve mode,
+mirrored into the migrated assistant); `EngineProviders.llm/.tts/.voice/.stt` (tests inject one build through them, 42 uses in 25
+test files; `ServeOptions.buildLlm/buildTts/buildStt` already inject through the pool for the tests that need it). Tests use one
+temporary root per run (`vitest.global-setup.ts`) so they no longer leave `pva-*` directories in `/tmp`.
+
+## Open items
+
+- **Voice nodes (WP-17).** PR #4 is rebased onto protocol 7 later (its `voice-node` device type takes protocol 8). Until then
+  `WakeGate`, `wakeConfigFromProfile` and the version 3 profile types stay.
+- **TypeSafe.** The decision's whole time is added to playback (Measurements). A way to hide it, not built, is a design change for the
+  owner: start the speculative turn at once for a tentative assistant (the fallback, or the last one chosen) while TypeSafe is asked,
+  and hand over only when it chooses another. No warm-up request keeps the connection open (Node closes an idle one after about 4 s), so
+  a first sentence after a pause also pays the connection set-up; the live run had 1 s gaps and did not measure that (`--gap-ms 6000`
+  does). The 0.5 thresholds, the option-order bias and recogniser output (the live run used typed sentences) are not tuned.
+- **Not built in the UI.** "Add as phrase" on the phrase tester's ignored lines; the memory sentence on the Hearing tab; the models of a
+  provider as a list on the Language model tab (the model is free text); a "not set up" warning on saving an assistant (the problem shows
+  on the assistant and in the status); OpenRouter's per-model reasoning effort is not sent.
+- **Command-line modes.** They read the flat keys; `cliAssistant` resolves an assistant that no mode uses, and there is no `--assistant`
+  flag. The CLI modes do not apply Home (no Home line, no linked defaults).
+- **Not measured.** `llmFirstToken` of a fresh Anthropic instance with and without warm-up, and two Anthropic instances against one (no
+  key on the measuring machine); `llmFirstToken` against a live home model; Deepgram; hosted voices (`ttsFirstAudio`); the memory of a
+  Claude Code process and of a second Home Assistant instance; more than two sessions or models; resident memory after long turns; the
+  time of a hearer switch in a live run. Commands for the first two are under Measurements.
+- **Not verified.** A real OpenRouter or home model server (only the local mock was called); a real Home Assistant (only the fake
+  server); the real-server web suite's latency project (the real project and the real-admin screenshots ran, WP-16).
+- **Known flaky tests** (unrelated to this work, load-sensitive): `engine.test.ts` reload guard, `audio-pipewire` "consumer that falls
+  behind", `serve.test.ts` "message sequence", `serveLocal.test.ts` (real recogniser: once in about eight runs a different
+  transcript), `tts-sherpa` "survives Ctrl+C", and, now that the local models are found, `SherpaStt.test.ts` "nemotron-320: English and
+  Dutch turns in real time" in a full parallel run (passes alone).
+
+## Measurements
+
+All measured on 2026-11-16 on the development machine unless a subsection says otherwise: AMD Ryzen 9 7945HX with Radeon Graphics, 16
+cores, 16 logical processors (`/proc/cpuinfo`), 31,789,676 kB = 30.3 GiB RAM (`/proc/meminfo`), Linux 7.0.0-43, Node 22.22.1,
+sherpa-onnx-node 2.0.1 and 1.13.8. Other work often ran on the machine at the same time (the load is given per measurement); where a
+subsection says so, use the comparison within a table, not the absolute figures. Each subsection keeps its method and caveats. The
+tables and figures below are copied from the work packages' records and not changed.
+
+### WP-0: memory and load time, and two sessions on one worker
 
 Measured 2026-11-16 on the development machine: AMD Ryzen 9 7945HX with Radeon Graphics, 16 cores, 16 logical
 processors (`/proc/cpuinfo`), 31,789,676 kB = 30.3 GiB RAM (`/proc/meminfo`), Linux 7.0.0-43, Node 22.22.1, sherpa-onnx-node
@@ -859,143 +1073,16 @@ With two sessions the end-of-turn time does not change, the eager time and the p
 indication, not a precise cost. Only one pair of simultaneous sessions was measured, with ~1 s clips; more sessions,
 longer turns and a second loaded model are WP-11's measurement.
 
-## 9. Risks and open questions
+### WP-4b: the thin slice, offline bench
 
-**Risks**
-
-| Risk | Recommendation |
-|---|---|
-| Two local speech models can exhaust memory on the server (each possibly about 1 GB). | Show the measured cost before saving (§3.2). Leave every device on one hearer model unless the owner chooses otherwise; warn above 75 % of free memory at save. |
-| Shared-worker decode queues: a talkative device delays another's turn ends (VOICE-NODES.md §6). | WP-0 and WP-11 measure it; per-model workers already separate different models. |
-| TypeSafe adds a round trip of about 250 ms median to sentences without a phrase. | Ask at the eager point; default off; give-up 400 ms; per-turn Routing column; tune the thresholds from traces. |
-| TypeSafe's choice order bias. | Keep list order (the owner controls it); later, ask twice with reversed order only if traces show bias. |
-| A hearer switch from a voice-page pick loads a model while people talk. | The new worker is built before the switch; the sheet already says "from the next thing you say". |
-| Each assistant on a Claude subscription device conversation opens a Claude Code process. | `maxSessions` bound (§3.3); measure process memory in WP-13a. |
-| "Never" conversations still drop old turns at the fixed history limits (32 turns, 48 000 characters, ARCHITECTURE.md:142). | Say so in the help (the mock-up does); compaction is future work, not part of this. |
-| Tools stored as "off" names: a module update's new side-effecting tool is on for every assistant using that module. | Modules mark new tools `defaultOff` when they change behaviour; the Modules tab shows "new" on tools added since the last save. |
-
-**Open questions** (each with the recommended answer)
-
-1. Should switching an assistant off also free its hearing role (another assistant's model takes over)? **No**:
-   hearing follows the list as configured, so switching off never changes how a device hears.
-2. Should a phrase of a switched-off assistant fall through to the default assistant? **No**: drop it, so a command
-   meant for one assistant never reaches another.
-3. Where does the Jev intent agent go? **Later, as a sixth account kind "Commands only (Jev)"**. Routing by TypeSafe
-   here does not need it.
-4. Should the voice page's pick be per visit rather than device-wide? **Device-wide**, as the mock-up's sheet text
-   says; the admin toggle limits who can do it.
-5. Raise devices talking at once to 16 as the mock-up shows? **Not before WP-0's** multi-session numbers.
-6. Can typed text on a TypeSafe device be routed by TypeSafe? **No**: the voice page always names the conversation
-   shown.
-
-## Status
-
-Design only; nothing built (2026-11-16).
-
-### WP-4b thin slice: built 2026-11-16
-
-The store (v4) and the dispatcher are wired into `VoiceSession` / `serveMode`. A device's effective settings
-(`effectiveDeviceSettings`: own sections ← type defaults ← built-in; a session without a device uses the browser
-defaults) give the route gate its config (`routeConfigFrom`), re-applied by `syncProfile` whenever the hub refreshes
-profiles. Per session: one recogniser stream per build (its own `SessionLoop`), echo gate → route gate → dispatcher →
-one `SessionConversation` per assistant (made on first use, fed through an inbox, its `speech` seam), all playing
-through one `OutputLease` over the session's `WebAudio` output, one turn counter for all of them. Per assistant: prompt
-+ the instructions of its modules + a registry of its tools (`ModuleSnapshot.parts`, new and additive; capability
-modules only, agent and decision modules always pass; the snapshot's own registry is reused when nothing is left out),
-follow-up (assignment, else assistant), quiet spell (`newConversationAfter`), `replyEarly` (dispatcher) and
-`toolRounds` (read at each build). The language model, recogniser and voice stay the one shared build.
-
-- Traces: `Trace` gains `assistant`, `deviceId`, `device`, `route`, `config` and marks `routeSent`/`routeReceived`;
-  `Publisher.traceInfo` maps the first four into `TraceInfo` (the device's own `turn.end` carries no `device`,
-  `deviceId` or `session`). `turn.start`, `assistant.text`, `reply.start` (audio-web, from the turn's trace),
-  `wake` and `conversation` carry `assistantId`.
-- Routes as traced: phrase, armed (with the phrase that armed it), follow-up, default, typed. Until WP-14 a `decide`
-  utterance (TypeSafe device) is answered by the fallback and traced as `default`; a turn whose utterance reached its
-  conversation only as the barge-in owner is traced as `follow-up`. `config` is not filled yet (the resources it
-  describes arrive with WP-9).
-- Home line: a seam in `serveMode` (`homeLine`, no line until WP-12a adds the `home` section).
-- Typed text follows §2.6 (`typedTextTarget`); a device with no reachable assistant answers `bad_message`.
-  `conversation.new` takes `assistantId`. Snapshot history and conversation are the answering assistant's (§5.3).
-- Not yet: a device without assignments still runs its recogniser (everything is dropped by the gate) instead of none
-  (WP-11); heard-audio recordings do not name the assistant; the dispatcher's books are not reset at a reload (an
-  utterance left open is closed with an empty final at the next build's start, and inboxes are emptied).
-- Tests: `serveAssistants.test.ts` (two assistants on one device: phrase, follow-up, armed, separate histories,
-  prompts and tools, traces; typed text and `conversation.new` per assistant); `bench.test.ts` session-path
-  scenario. Changed: `serveFrontends.test.ts` (`wake` carries `assistantId`; in `always` mode a leading phrase is
-  stripped), `sessionHub.test.ts` (fake session's `sendText`/`stop`).
 - Bench (offline, `pnpm start bench`, 3 runs before and after on this machine, load 0.1–4.8; median / worst ms):
   orchestration overhead 0.9 / 1.5, 0.8 / 1.5, 0.9 / 1.6 → 0.9 / 1.7, 0.9 / 1.5, 0.9 / 1.6. New rows, session path
   (route gate, dispatcher, inbox, lease): overhead 0.8 / 1.2, 0.8 / 1.1, 0.8 / 1.0; realistic eager on with three
   assistants 308 / 534, 307 / 533, 307 / 534 (direct route-gate row 307 / 535, 305 / 535, 307 / 534).
 - Evidence: `docs/assistants-evidence/thin-slice-transcript.txt` (real server, local recogniser and voice, offline LLM).
 
-### WP-5 server messages: built 2026-11-16
+### WP-9: language models in the pool
 
-`serve/assistants.ts` (new) holds the handlers and the data of the pushes; `serve/devices.ts` (new) the pure device-type and device views of the v4 file; `SessionHub` does access and fan-out. `frontends.ts` is **not** replaced yet: it still serves the protocol 5 messages that stay until the UI packages (WP-6 to WP-8) drop them. Protocol is 7.
-
-Messages (client → server): `assistant.create`, `assistant.save`, `assistant.delete`, `device.save` (admin only, `admin_required` otherwise); `device.pick`, `conversation.read` (voice connections only, `bad_message` from an admin connection or a page without a device). Server → client: `assistants`, `device.types` (admin connections only, never a voice connection), `device.setup` (the voice connection of that device only, sent when it changes), `conversation.history` (the requester only), `devices` (admin only, as before), `result` (with `assistantId` after `assistant.create`).
-
-Deviations from §5:
-
-- **Tag collisions.** `devices` and `result` are one tag each, extended compatibly: `devices` entries are `DeviceListInfo` (the protocol 5 `DeviceInfo` plus `own`, `settings`, `hearer`, `rev`), and `result.assistantId` is an optional field. No temporary tag exists. Clean-up (WP-16): drop `profile`/`overrides` from `DeviceListInfo`. The error codes are in the one `ErrorCode` list. `frontends`, `device.profile`, `device.update`, `frontend.update`, `device.admin.update` stay.
-- `FieldError.key` accepts dotted paths (`hearing.finalSilenceMs`).
-- `assistants`/`device.types` are pushed as whole lists after any successful assistant, device or protocol 5 front-end save (not after shared-settings saves).
-- Validation errors are `invalid_settings` with `fieldErrors`; a "cannot be reached" warning asks for `saveAnyway`; `duplicate_phrase`, `unknown_assistant`, `limit_reached` are the code when validation finds that case. `assistant.save` on an unknown id is `unknown_assistant` before validation; a missing device or type is `unknown_device`.
-- `usedOn[].hears` and `resources` in `assistants` are coarse: `resources` is the engine's state (`unused` when the assistant is off or on no device) until the resource pool (WP-9) lands.
-- `canAuto` is "a decision provider module is running" until WP-14 adds the `routing` section.
-- No module field is `overridable` yet (WP-12b), so any `own` value on a module choice is refused.
-- Saving through the new messages refreshes live sessions' route configuration through `refreshProfiles` (no reload); LLM, recogniser and voice stay the shared build until WP-9/10/11.
-- Deleting an assistant ends its conversations by `stop` plus `newConversation` on each live session that has one (the conversation of a deleted assistant is no longer reachable).
-
-### WP-9 resource pool, language models: built 2026-11-16
-
-`serve/Resources.ts` holds the language models; the recogniser and the voice are still the engine's one shared build
-(WP-10, WP-11), so `Engine.ts` is the full reload of those two plus the status, which gains `resources`.
-
-- **Keys.** `llmKeyOf` = account + model + effort + thinking + maxTokens + giveUpMs + warmUp + the address with its
-  user info and query removed. The instance's identity adds the full address and a stamp of the account's key (the
-  first 16 hex digits of its SHA-256; never shown, never the key), so a changed key or address builds new instances.
-  The offline accounts (`offline`, and `claude-subscription`'s stand-in) ignore the model fields: every assistant on
-  them shares one instance.
-- **Builders.** `providers.ts` `llmAccountLayers`: `offline` and the `claude-subscription` stand-in are the offline LLM;
-  `anthropic` is `AnthropicLlm.make` over a `ConfigProvider` with the assistant's fields on top of the shared settings
-  (so the key comes from the vault or the environment as before), with `awaitWarmUp` (new, additive option of
-  `llm-anthropic`): the instance is ready only once its warm-up request has ended, so "ready" means "warm". `openrouter`
-  and `home-model` have no layer yet: their resource is `failed` with "The … account is not available yet." (WP-13b
-  adds them in `llmAccountLayers`; built, see "WP-13b" below). The Claude subscription agent itself is still the module's (WP-13a).
-- **Wanted** = every switched-on assistant on at least one effective list (each device type's defaults and each
-  known device's own list). `reconcile` runs at start (awaited by `ServeHandle.ready`, so every wanted instance is
-  built and warm before the first turn), after every successful settings-store save (`save…`, `create…`, `delete…`,
-  `import…`, which also covers WP-5's handlers), and after a vault lock or unlock (an unlock retries failed
-  instances); a turn of an assistant that is not bound yet reconciles at once and waits for its instance.
-- **Switching.** Each turn reads its assistant's instance once, at its start (`TurnSetup.llm`, the one additive seam
-  in core, see ARCHITECTURE.md), and keeps it for every round of its tool loop. A changed configuration builds the
-  new instance while the assistant stays bound to the old one; once the new one is ready the assistant is rebound,
-  and its next turn start uses it. Nothing else is stopped: no engine reload, no other session or assistant touched.
-- **Release.** An instance nobody is bound to or wants is `unused` and is closed 10 s later (`RESOURCE_GRACE_MS`),
-  and not before the last stream running on it has ended; wanted again within the grace, it is kept. A failed or
-  never-ready instance is dropped at once.
-- **Failure.** A build failure is that resource's `state: "failed"` with its `problem` (a key that "is not set" while
-  the vault is locked is reworded as the locked-keys message). Its assistants' turns fail with that problem (logged;
-  the device gets `turn_failed`), every other assistant answers. A warm-up that fails (a wrong key) does not fail the
-  build, as before: the first turn then fails.
-- **Full reload.** The owner's reload (and the reloads for model directories and threads) also rebuilds every
-  instance in use, in the background: each assistant switches when its new instance is ready, and the reload does
-  not wait for it.
-- **Status.** `EngineStatus.resources` lists every instance (`kind: "llm"`, key, label, location, `usedBy`, state,
-  problem). While a changed instance is built both the old (still `usedBy` the assistant) and the new are listed. The
-  `engines` list keeps one `llm` row for pages before WP-6: the first switched-on assistant's account and model.
-- **Not yet.** The Provider page's flat keys (`LLM_PROVIDER`, `ANTHROPIC_MODEL`, …) are no longer read by serve mode
-  (§4.4): after migration only the assistant's `llm` (and the environment's locks) count, and changing a model in the
-  UI waits for the assistant pages (WP-5/WP-6); the page still marks them "reload". The CLI modes still use the flat
-  keys (§4.4's `--assistant` is not built). `TurnTrace`'s `config` snapshot is still not filled.
-- **Tests.** `test/resources.test.ts` (sharing, a change with a turn in flight, grace, failure and retry, rebuild, keys,
-  a key stamp change, the default builder), `test/serveResources.test.ts` (scripted client: two assistants answer from
-  their own instances and share one when equal; a model change on Alpha while turns of Bravo on another device and of
-  Alpha itself are in progress: both complete on their old instances, Alpha's next turns on either device use the new
-  one, no engine reload; a failed instance in the status, `turn_failed`, the other assistant answers),
-  `packages/core/test/TurnSetupLlm.test.ts` (a model published mid-turn applies from the next turn; absent = the
-  conversation's), `llm-anthropic` warm-up tests (`awaitWarmUp`).
 - **Bench.** `bench --live --llm-per-session` gives each session its own language-model instance (as two assistants
   with different settings), to compare with the shared one.
 - **Measurements** (this machine, 2026-11-16, load 0.8–2.2). Offline bench (`pnpm start bench`), three runs each of
@@ -1015,56 +1102,8 @@ Deviations from §5:
   `LLM_PROVIDER=anthropic pnpm start bench --live --rounds 2 --sessions 2 bench-audio` against the same with
   `--llm-per-session`.
 
-### WP-10 per-assistant voice: built 2026-11-16
+### WP-10: voices in the pool
 
-`serve/Resources.ts` now also holds the voices; `Engine.ts` is the full reload of the recogniser only (plus the status).
-
-- **Keys.** `TtsKey` = `voiceKey(assistant.voice)` (`provider:voiceId`); the instance's identity adds a stamp of the
-  hosted provider's key (first 16 hex digits of its SHA-256, never shown), so a new Cartesia or ElevenLabs key builds
-  a new instance. Two assistants with the same voice share one instance. The status lists every instance as
-  `kind: "tts"` (key, label "Voice Piper …", location, `usedBy`, state, problem).
-- **What shares an engine.** A voice on this machine runs on an engine (a child process holding the model).
-  `defaultTtsBuilder` keeps one engine per `SherpaTts.engineSetup(preset)` plus the engine options (model directory,
-  threads, speed, joining), counted by the voice instances on it and stopped with the last one: every Kokoro speaker
-  shares one engine (one more speaker costs no memory and no load), a Piper voice is an engine of its own. A hosted
-  voice (Cartesia, ElevenLabs) is that provider's layer over `configProvider()` with the voice id on top, as before.
-  A failed engine start is not kept: the next instance that wants one starts a new engine.
-- **How a turn picks its voice.** `TurnSetup.tts` (new, optional, additive; the exact analogue of `TurnSetup.llm`,
-  ARCHITECTURE.md): read from the turn's plan when its body starts, for every clause of every round, and its
-  `sampleRate` is the one the reply plays at (so 22.05 and 24 kHz voices need no resampling). A `Say` reads the setup
-  when it starts, so a canned reply uses the assistant's voice. The serve setup waits for a voice that is still being
-  built (its rate is read at play time) and tags the turn's trace (`Trace.voices`) from the pool's wrapper.
-- **A changed voice** builds the new instance first; the assistant stays bound to the old one until the new one is
-  ready, then its next turn start takes it. Turns speaking on the old voice, on any device, finish on it (the instance
-  is not closed while a stream runs on it); nothing is reloaded and no other assistant or device is touched. The old
-  voice is released after the 10 s grace period unless someone wants it again. A voice nobody is bound to or wants is
-  `unused` and released the same way; a failed or never-ready one at once.
-- **Failure.** A voice that cannot start (model files missing, key not set, locked vault) is a failed resource with its
-  problem; its assistants' turns fail at the first synthesis with that problem (the device gets `turn_failed`, the
-  text of the reply is not spoken), every other assistant speaks. A vault unlock and the owner's reload build failed
-  voices again (`retryFailed`, `rebuild`).
-- **Status and API (§5.5).** The engine list's `tts` rows and `voices` come from the voices in use (the Models page
-  marks their presets in use). `VoiceEntry.selected` is now `usedBy: AssistantId[]` (every assistant, switched on or
-  not), `ProviderInfo.inUse` means "an assistant uses a voice of it", `GET /api/voices/default` answers with the first
-  switched-on assistant's voice (`source: "assistant"`, `locked: false`, `running` when its instance is ready,
-  `reloadPending: false`), `PUT /api/voices/default` answers `410 gone` pointing to the assistant's Voice tab,
-  `VoicesResponse.selected` stays (the same first voice). The preview of a voice the pool runs reuses its instance.
-  `apps/web`: only `mock/server.ts` and `test/voicePicker.test.ts` changed (`selected` → `usedBy`) to compile.
-- **Deviations.** (1) Voices share a reconcile call with the language models (`ReconcileOptions.voices`; the pool's
-  generic `makeKind` serves both), not a separate method. (2) The `ASSISTANT_VOICE` setting and its Voices-page field
-  still exist in the store and sections but nothing in serve mode reads them any more (the migration copied them into
-  the assistant); the old Voice page of the web UI therefore no longer changes what is spoken until WP-6a. (3) A
-  Kokoro engine runs one clause at a time, so two assistants speaking at the same moment on it take turns clause by
-  clause (measured below); the doc's one-engine rule was kept. (4) `EngineProviders.tts`/`.voice` stay, optional, for
-  tests that inject one voice (the pool then hands out instances that speak with it).
-- **Tests.** `test/resourcesVoices.test.ts` (keys and sharing, a change with a stream in flight, grace and re-want,
-  failure and retry, key stamp and rebuild, engine sharing with a counted fake engine, a failing engine start),
-  `test/serveVoicesPerAssistant.test.ts` (scripted client: two assistants with different voices speak in turn on one
-  device with their own voice and rate, the trace's `voices`; equal voices share one; a change on Alpha while Bravo's
-  turn and Alpha's own turn are held mid-reply, both complete on their old voices and Alpha's next turns on either
-  device use the new one, no engine reload; a failing voice in the status, `turn_failed`, the other assistant speaks),
-  `packages/core/test/TurnSetupTts.test.ts` (per-turn voice and rate, a voice published between turns, a `Say`, absent =
-  the loop's), the voice API tests of `serveVoices.test.ts`.
 - **Measurements** (2026-11-16, same machine and software as WP-0). `src/bench/voices.ts` (new): the real
   `defaultTtsBuilder` and the real engines in the pool, one assistant per voice, each with its own `Conversation`
   (`TurnSetup.tts`), an instant stand-in language model, spoken text turns (the same 3-sentence reply for every voice)
@@ -1096,125 +1135,12 @@ Deviations from §5:
     Piper + Kokoro 888–893 (WP-0: 163 + 169 + 563 = 895); Kokoro heart + bella (one engine) **563–565**, i.e. a second
     Kokoro speaker costs nothing. Load time with the voices loaded in parallel: Piper 0.50 s, Kokoro 1.1–1.2 s, both
     1.1–1.4 s.
-- **Not verified.** The web admin pages (WP-6a) do not save a voice yet, so a voice change was exercised through the
-  settings store, not a browser. Hosted voices (Cartesia, ElevenLabs) were tested with fake builders only: no keys on
-  this machine, so `ttsFirstAudio` of a hosted voice is not measured. The preview that starts a second Kokoro engine for
-  a speaker the pool does not run (the pool's engine is not shared with previews) is unchanged. `ramMb` in the status is
-  not filled for voices.
 
-### WP-6b wizard and WP-7 devices, overview, shared settings: built 2026-11-16
+  Not measured: hosted voices (Cartesia, ElevenLabs): no keys on this machine, so `ttsFirstAudio` of a hosted voice is not measured.
+  `ramMb` in the status is not filled for voices.
 
-`apps/web` only (and its mock server). Paths: `#settings/assistants/new/<1..7>` (the wizard), `#settings/devices` (list),
-`#settings/devices/<deviceId>` and `#settings/devices/type-<kind>` (a device, a type's defaults), `#settings/overview`
-(grid), `#settings/shared/<home|modules|accounts|routing|speech|providers|limits>`.
+### WP-11: recognisers per device
 
-- **Wizard** (`NewAssistantWizard.tsx`): the mock-up's seven steps (Start, Language model, Hearing, Voice, Modules, Where,
-  Check); it reuses the assistant tabs' fields through a local `AssistantDraft` (`useWizardDraft`). Nothing is sent before
-  "Create assistant": `assistant.create` with `copyOf` and `placements`. A refusal goes back to the step that owns the
-  field. The step is the third path part, so the settings screen's "Leave without saving?" guard covers it.
-- **Devices**: `DevicesPages.tsx` (list, device page, defaults page), `devices/AssignSection.tsx`, `lib/devices.ts` (a
-  draft of edits over what is saved: per section "Own value · Reset"; the list and "Answers without a phrase" are one
-  section made of two keys). Saves are `device.save`; a `warnings` outcome opens a "Save anyway?" dialog. TypeSafe is
-  listed and disabled ("which is not set up") while no decision module runs: the admin reads the server's `canAuto` as
-  "a module of kind `decider` is running" (the same rule the server uses), since `canAuto` is only sent to voice pages.
-- **Overview**: "Who answers where" grid (a list on a phone); the checklist names the assistants and accounts.
-- **Shared settings**: the tree regroups the server's `agents`, `speech`, `voices` and `modules` pages by key
-  (`settingsTree.ts`: `ASSISTANT_OWNED_KEYS`, `SHARED_PAGES`). The keys that moved onto the assistant are not shown; what
-  remains (Anthropic key and address, Deepgram key, voice provider keys, the two limits, the modules, the model lists) is
-  on Language model accounts, Speech recognition models, Voice providers, Limits and Modules. Home and Routing appear when
-  the server sends a `home` or `routing` section (Routing also when a decision module exists).
-- **Removed**: Front ends, `ProfileForm`, the old device page and the Language model, Speech recognition and Voices
-  categories. The module switches stay on the Modules page (the server still reads them until WP-12b).
-- **Not built**: Add as phrase on the tester's ignored lines (a heard phrase belongs to an assistant: pick on the device
-  page), the memory warning on the hearing notice (needs WP-11 data), per-module "own values" markers on Modules.
-
-### WP-11 per-device recogniser: built 2026-11-16
-
-`serve/Resources.ts` now also holds the recognisers; `Engine.ts` holds no provider any more: it is the full reload
-(the owner's Reload button) and the status. Every device hears with its hearer's model and hearing settings.
-
-- **Keys.** `SttKey` = `sttKeyOf(sttSpecOf(hearing, shared))`: stt-sherpa `sherpa|<preset>|<language>|<model dir>|<threads>`,
-  the language only for a preset that takes one (Whisper, Nemotron; `-` for Parakeet, Zipformer, the hybrid), the
-  model directory and threads from the shared `STT_SHERPA_MODEL_DIR` / `STT_SHERPA_THREADS`; Deepgram
-  `deepgram|<DEEPGRAM_MODEL>|<address>`, the instance's identity adding a stamp of `DEEPGRAM_API_KEY` (as WP-9/10).
-  **Per stream** (not in the key, `SttStreamSpec`): `eagerSilenceMs`, `finalSilenceMs`, `minSpeechMs`,
-  `vadThreshold`, `agc`, `agcMaxGainDb` (stt-sherpa) and `eotThreshold`, `eagerEotThreshold`, `eotTimeoutMs`
-  (Deepgram). Two hearers that differ only there share one instance.
-- **Places, not assistants.** Recognisers are bound per hearing *place*: `device:<id>` for every known device, and
-  `type:<kind>` for each device type's defaults (also used by a session whose device is not recorded). Each place
-  wants its hearer's hearing (`hearerOf`: the `withoutPhrase` assistant, else the first assignment; switched on or
-  not, §2.6); a place with no assistant wants nothing, and its session runs **no recogniser** (the voice page's
-  `device.setup` lists no assistant). The status lists each recogniser once (`kind: "stt"`), `usedBy` = the hearers,
-  with `ramMb` from WP-0's table for a local model.
-- **stt-sherpa.** A process-wide registry of workers by `workerKey` (model, model directory, threads, the language when
-  the preset takes one, per-model tuning, and in tests the stand-in script): `make(options)` and the new
-  `acquire(options)` → `Recogniser { forStream(streamOptions) }` reuse the loaded worker of the key, counted, stopped
-  with the last user. The worker's `open` message carries the session's `{ vadThreshold, agc, prerollMs }`; the worker
-  keeps idle VADs per threshold and AGCs per option set, so a second session with the same options costs nothing,
-  and the startup VAD still serves the first session with the default threshold. Turn timing stays on the main
-  thread (one `TurnDetector` per stream). A worker that dies is dropped from the registry (the next caller loads a
-  new one) and tells its users (`onFailure`). **Orphan rule per key**: a worker that did not answer `close` within
-  15 s is left behind under its key; no new worker of that key loads beside it (`check`, `acquire` refuse; the pool's
-  builder waits for it to go, the resource staying `starting` and the device on its old recogniser), while other
-  models still load. `orphans(key?)`, `whenNoOrphans(key?)`, `workers()` are the diagnostics.
-- **Deepgram.** One instance per configuration (`SttKey` plus the key stamp); each stream is its own Flux connection,
-  as before, with that hearer's confidences (`DeepgramStt.make` per stream: cheap, nothing is opened until
-  `transcribe`). A missing key is the resource's problem (the locked-vault wording when the vault is locked).
-- **Hearer switching (§3.5).** A settings save, a `device.pick`, a vault change and the reload reconcile the pool. A
-  place whose spec changes keeps its old binding while a new key builds (the device goes on hearing with the old
-  model); once the new instance is ready the place is rebound (changed stream options rebind at once, no load), and
-  the pool's `onRebind` tells every session. The session's recogniser loop reads its `hearing()`: when the bound
-  instance or the stream options differ from the stream it runs, it waits until no utterance is open
-  (`SpeechStarted` … `EndOfTurn` of the recogniser's own events), at most `HEARER_SWITCH_WAIT_MS` = 5 s, then closes
-  the old `transcribe` and opens the new one on the same `WebAudioInput`; an utterance still open after 5 s is closed
-  with an empty `EndOfTurn` (it starts nothing). The released instance goes 10 s after its last user (the grace
-  period), unless it is wanted again within it.
-- **Failure.** A recogniser that fails to load (model files missing, no key) or whose worker dies is a `failed`
-  resource with its problem; its places' streams fail with it. That device hears nothing and its tabs get one
-  `error` (`engine_failed`, "Speech recognition stopped: …") per engine build; typed text is still answered; every
-  other device hears. The hearer's `AssistantInfo.problems` gains `Hearing (<label>): <problem>`. A vault unlock and
-  the owner's reload build failed recognisers again. A recogniser stream that fails no longer stops the engines.
-- **Memory (WP-0 data).** `ResourceInfo.ramMb` for each local recogniser. While more than one local model is loaded,
-  each hearer on one gets the line `Hears with <model> (about N MB of memory); K local speech models are loaded
-  together, about T MB.` in its `problems`. §9's warning at save: an `assistant.save` or `device.save` whose new
-  local models (keys not loaded now) need more than 75 % of the free memory (`os.freemem`) is refused
-  `invalid_settings` with a warning ("This loads another speech model: about N MB more memory and M s to load, more
-  than 75 % of the F MB free on this machine.") until `saveAnyway`. The Hearing tab's "about N MB more, M s to load"
-  sentence (§3.2) is the UI's (WP-6a/7), from `ramMb`/the presets.
-- **Engine.** `defaultProviderBuilder` builds nothing but the tool-rounds fallback; `EngineProviders.stt` is optional
-  (tests that inject one recogniser: the pool then hands every place a stream of it). The reload's preflight is now
-  serve mode's: the model files of every local recogniser in use exist (`ServeOptions.checkModelsBeforeReload`,
-  default with the real builders), else the running engines are kept. `defaultPreflight` is gone. The status's `stt`
-  rows come from the pool's recognisers in use (the Models page's "in use").
-- **Deviations.** (1) Bound per place, not per assistant (the hearer rule is per device). (2) The language is in the
-  key only for a preset that takes one (the doc's key always had it), so two hearers on Parakeet with different
-  languages share a worker. (3) Deepgram's key adds the address. (4) `STT_SHERPA_MODEL_DIR` and `STT_SHERPA_THREADS`
-  are part of the key, so a change to them builds the new recogniser and switches at silence without a full reload
-  (§3.2 kept a full reload for them; the Reload button still rebuilds everything). (5) The full reload's rebuild of a
-  working local recogniser reuses its loaded worker (the registry) instead of loading a second copy of the model; a
-  dead one is loaded again. (6) Every type defaults place and every known device is wanted (as §3.2 says), so the
-  browser defaults' hearer is loaded at start before any device connects, and a known device that is offline keeps
-  its own hearer's model loaded. (7) Speech shorter than `minSpeechMs` at the switch moment (no `SpeechStarted` yet)
-  can be cut. (8) Serve mode reads only the shared speech settings (`STT_SHERPA_MODEL_DIR`, `STT_SHERPA_THREADS`,
-  `DEEPGRAM_MODEL`, `DEEPGRAM_URL`, `DEEPGRAM_API_KEY`); the flat per-assistant keys are no longer read by any engine
-  (the store still mirrors a saved flat key into the migrated assistant, WP-3), and the old Speech pages still mark
-  their fields "reload". (9) The CLI modes (`voice`, `transcribe`, `bench --live`) still use the flat keys.
-- **Tests.** `packages/stt-sherpa/test/recognizerCore.test.ts` (per-session VAD threshold, AGC options and pre-roll,
-  reuse per option set), `SherpaSttFake.test.ts` (two hearers on one model with different end pauses share one worker
-  and each gets its own end of turn; two models, two workers, stopped with their last user; the key; a dead worker
-  is not reused; the orphan rule per key: refused for its key, another key loads beside it, gone → loads again),
-  `apps/assistant/test/resourcesRecognisers.test.ts` (sharing and own stream options, two models, a change built
-  first while the place keeps the old one and the old one released after the grace, stream options rebind with no
-  load, re-want within the grace, a failed load is that resource's problem and a retry builds it, a worker that dies
-  marks it failed and a retry builds a new one, keys; the default builder on the stand-in worker: one worker for two
-  places, each its own end of turn, a second model a second worker, both stopped), `serveRecognisers.test.ts`
-  (scripted client: devices with different hearers on their own model, hearers on one model sharing one instance with
-  their own end pause, the old instance released, no reload; a hearer switch loads first and waits for silence, the
-  open utterance reaching its conversation whole; an utterance that does not end is closed after the wait; a device
-  with no assistants runs no recogniser until one is assigned; a model that fails: the device is told, typed text
-  works, the other device hears, the failed resource and Bravo's problem, back on a working model; the save-time
-  memory warning and `saveAnyway`), `providers.test.ts` (the new bench flags), `serve.test.ts` (the reload preflight
-  through `checkModelsBeforeReload`).
 - **Bench.** `bench --live --stt-models A,B,…` gives session `i` the `i`-th local model (round robin) through
   `SherpaStt.make` (equal models share a worker, as in the pool); `--load-model X` loads one more model and keeps it
   idle. `src/bench/baseline.ts together A,B,… [--runs N]` loads the listed recognisers one after the other into one
@@ -1268,117 +1194,8 @@ Deviations from §5:
     long turns (a recogniser grows with the longest turn it decodes, WP-0); the hearer switch's own cost in a live
     serve run (a switch is a stream close and open on a loaded worker; its correctness is tested, its time is not
     traced); the web pages (the Hearing tab's memory sentence is WP-6a/7's).
-- **Not verified.** A hearer switch through the real admin UI (WP-6a/7 do not save hearing yet); exercised through the
-  settings store and the WebSocket messages in tests. `serveLocal.test.ts` (real zipformer-en, now run in this
-  worktree because the local models are present) failed once in about eight runs with "HOLLO CAN YOU HEAR ME"
-  (a recognition variance; one stream was opened per run, no switch happened).
 
-### WP-12a Home and linked defaults: built 2026-11-16
-
-- **Section `home`** (`sectionDefinitions.ts` `homeSection`, group `modules`, page `home`, order 5; the admin's Shared
-  settings › Home picks it up by id): `HOME_LOCATION` (text ≤ 200), `HOME_TIME_ZONE` (IANA, checked with `Intl`; empty
-  = this machine's), `HOME_LANGUAGE` (en-GB, en-US, nl-NL, de-DE; default en-GB), `HOME_UNITS` (metric | imperial;
-  default metric), `HOME_DATE_FORMAT` (en-GB | en-US | nl-NL; default en-GB, §7.3). Live (no reload). Environment
-  variables of the same names lock them, as every flat key.
-- **Home line** (`homeLineOf`, protocol `assistants.ts`, pure so the admin's "See the full prompt" can show it): in
-  every assistant's stable prompt, after its own prompt and before the module instructions, through the WP-4b seam
-  (`homeLine` in `serveMode`): `Home: <location>; time zone <zone>; language <language>.` The location is left out
-  when empty; the zone is the machine's when Home names none. Unchanged while Home is unchanged (cached prefix).
-- **Linked defaults** (`linkedModuleDefaults`, now with `location`; `ModuleHostOptions.defaults`): Weather
-  `defaultPlace` ← `HOME_LOCATION`, `units` ← `HOME_UNITS` (imperial → fahrenheit), Clock `timeZone` ←
-  `HOME_TIME_ZONE`, `locale` ← `HOME_DATE_FORMAT`. A linked default replaces the field's own default only (saved value
-  and environment win; an assistant's own value wins over all); a default the field refuses is ignored. The module's
-  form shows it as the field's `default` and value (`source: "default"`). A Home save refreshes the module host
-  (`onSectionSaved`, after the section's values are in effect), which restarts only the instances whose settings it
-  moved.
-- **Deviations.** (1) Weather's `defaultPlace` default is `HOME_LOCATION` itself (§2.6 said "" with the module
-  reading `HOME_LOCATION`): the module stays independent of the app, and the form shows the place used. (2) The Home
-  line is always there (with the machine's zone and the default language when Home is not set), so every prompt
-  gained one line once. (3) The CLI modes do not apply Home (no Home line, no linked defaults: `startCliModules` is
-  unchanged).
-
-### WP-12b module overrides: built 2026-11-16
-
-- **Flag.** `Setting.*({ overridable: true })` (not offered on `Setting.secret`; addresses are simply not marked).
-  The field description carries `overridable: true` (protocol `SettingField`, optional). Marked: Clock `timeZone`,
-  `locale`; Weather `defaultPlace`, `units`; Home Assistant `domains`. Not marked: Weather `timeoutMs`, Home Assistant
-  `baseUrl` (address), `aliases`, `timeoutMs`, every secret, every agent or decision module field.
-- **Resolution** (`resolveSettings` sources `own` and `defaults`): per field, the assistant's own value (overridable
-  fields only) > environment > saved > linked default > the field's default. `applicableOwnValues`, `overridableKeys`,
-  `checkOwnValues` (core `Settings.ts`).
-- **Instances** (`ModuleHost`, `ModuleHostOptions.demand`). Serve mode gives the host, for every capability module,
-  the switched-on assistants that have it on with their `own` values (`moduleDemand`); agent and decision modules have
-  no demand and keep their own switch, as do all modules in the CLI modes (no `demand`: one instance, exactly the old
-  behaviour, the old tests unchanged). An instance's key is the JSON of the effective non-secret values (own applied);
-  assistants with equal keys share one instance. A module with demand:
-  - runs while its list is not empty (its saved `enabled` is not read; `module.enable`/`module.disable` answer
-    `not_allowed`, "switched on and off per assistant");
-  - starts its instances at `startEnabled` and at every `refresh`: serve calls `refresh` after every settings-store
-    save (assistant, device, section, module saves all pass `notifyAfterSaves`), after a Home save and after the
-    store is unblocked. New keys start (concurrently, each on its own: one failing is that instance's `error`, the
-    others run); an instance whose key no longer appears keeps serving until the new ones have settled, then leaves the
-    snapshot and is closed after the 10 s grace period (tool calls in flight finish). A key that is wanted again while
-    it is still leaving is kept; one already retired starts anew. A refresh that finds the module busy (a configure)
-    runs when that operation ends;
-  - `configure` (the shared settings) restarts only the instances whose key changes (all of them when the patch sets a
-    secret), all or nothing: if one cannot start, nothing changes and nothing is saved. Saving the same values restarts
-    nothing (before, a configure always restarted the one instance). `setSecrets` (vault) keeps running instances and
-    retries the ones in `error`.
-- **Per assistant.** `ModuleSnapshot.assistantParts`: for each assistant with demand, the parts of the instances it
-  uses (catalog order, plus every module without demand). The part object is shared between assistants on one
-  instance and with `parts` (the shared-settings instance is the one in `registry`, `parts`, `instructions`, `agents`,
-  `actions`). Serve's `modulesFor` takes the assistant's parts (else `parts`), then filters by its module switches and
-  `offTools` as before, so each assistant's tool registry, context providers and module instructions come from its own
-  instance. `toolModules` covers every instance's tools.
-- **`assistant.save` / `assistant.create`**: `own` values are checked by the module's fields (`ModuleHost.checkOwn`,
-  passed to `makeAssistants` as `checkOwn`): a secret ("A secret is shared: it cannot be set per assistant"), a field
-  that is not overridable ("This setting is shared: …"), an unknown field, or a value the field refuses is
-  `invalid_settings` with `fieldErrors` keyed `modules.<moduleId>.own.<field>`. Checked whether or not the module runs.
-- **Admin data for the Modules tab** (`ModuleInfo`, `module.changed` and `admin.snapshot.modules`, admin connections
-  only): `settings.fields[].overridable: true` on the fields an assistant may own; `instances` (present for a module
-  with demand): `[{ assistants: AssistantId[], own: FieldKey[] /* the fields these assistants own */, state, error?,
-  status? }]`; `enabled` = at least one switched-on assistant has it on; `state` = `error` while one instance fails
-  (`error` names its assistants: "… (for bravo)"), `starting` while one starts, else `running`; `tools` = the union of
-  the running instances' tools; `settings.values` and each field's `default` include the linked defaults. The web
-  page can enable "own settings" for the fields with `overridable` and save them as `modules[id].own` through
-  `assistant.save`.
-- **Deviations.** (1) A module whose wanted settings are invalid (e.g. Home Assistant without a token) does not run,
-  but shows an instance in `error` with the settings message instead of being silently absent (§2.6 "required settings
-  are set"). (2) The module's own switch is refused for capabilities rather than kept as a second switch; the admin's
-  Modules page still shows it (apps/web not changed: the switch now gets `not_allowed`). (3) Own values win over the
-  environment too (rule 1 of §2.6 as written). (4) Agents, decision providers and actions come from the
-  shared-settings instance only (none of them is per assistant). (5) `ModuleSnapshot.assistantParts` and
-  `ModuleInfo.instances` are additive; ARCHITECTURE.md describes the contract.
-- **Tests.** `packages/core/test/ModuleHostInstances.test.ts` (equal settings share one instance and one part; an
-  own date format runs a second and each assistant's tool answers in its own; the run rule and `not_allowed`; secrets,
-  shared fields and bad values refused by `checkOwn` and ignored at run time; grace on stop with a call in flight;
-  a shared change restarts only the affected instances, same values none, a secret all, a failing start nothing;
-  one instance failing leaves the other running; linked defaults and their refresh; a replaced instance serves
-  until its replacement runs; a module without demand), `packages/core/test/Settings.test.ts` (precedence, flag,
-  helpers), `packages/modules-builtin/test/instances.test.ts` (Clock with an own `nl-NL` answers "vrijdag 13 november
-  2026" to that assistant and "Friday, 13 November 2026" to the other, tool and context; Weather looks up Home's place in
-  Home's units, an own unit wins, a saved place wins over Home), `packages/protocol/test/assistants.test.ts`
-  (`homeLineOf`, `linkedModuleDefaults` with a location), `apps/assistant/test/serveModules.test.ts` (scripted client:
-  the Home line in the system prompt the model receives for both assistants, Weather and Clock follow a Home save, two
-  clock instances with each assistant's context in its own date format; `assistant.save` accepts an own time zone and
-  refuses a secret, a shared field and a bad value, back to one shared instance). Changed: `serve.test.ts` (sections
-  list starts with `home`; a capability's `module.disable` is `not_allowed`), `serveVault.test.ts` (`home` is not
-  protected).
-
-### WP-12c Home Assistant in the app: built 2026-11-16
-
-- `@pva/module-home-assistant` is a dependency of `apps/assistant` and in `moduleCatalog` after Weather. It is a
-  capability: it runs for the assistants that switch it on, with the shared address and token (the token in the vault
-  as every module secret) and an assistant's own `domains` if any. It talks plain HTTP (`fetch`): no provider SDK.
-  Migration: an install whose saved `enabled` was not on (the module was off by default) gets it off on the migrated
-  assistant.
-- **Test** (`serveModules.test.ts`, against the package's fake Home Assistant server on 127.0.0.1): wanted by Alpha
-  but without a token it is one instance in `error`; `module.configure` with the server's address and token starts it
-  (`/api/config` called with the token, which never reaches an admin message); Alpha's request carries `home_state`,
-  `home-assistant_lights_on`, `…_lights_off`, `…_lights_status` (its `offTools` removed `…_set_brightness`) and the
-  module's instructions, Bravo's none; `home_state` answers from the server.
-
-### WP-12 measurements (2026-11-16, the WP-0 machine)
+### WP-12: modules
 
 - **Offline bench** (`pnpm start bench`, three runs before the change — the branch's base commit — and three after,
   end of turn → playback start, median / worst ms; machine load 7–16 before, 4.6–0.5 after). Orchestration overhead
@@ -1398,59 +1215,57 @@ Deviations from §5:
   **7.8 KB** (all three runs equal to 0.1 KB); RSS grew 5.6–9.1 MB (Clock) and 5.2–6.3 MB (Weather) for 200, i.e.
   under 50 KB each. A second Home Assistant instance was not measured (it holds its house model and a 60 s refresh
   timer and makes its own requests; its size depends on the house).
-- **Not verified.** The web pages (no "own settings" control yet; the Modules page's switch now answers
-  `not_allowed` for a capability); a real Home Assistant (only the fake server); the CLI modes with Home (not applied).
 
-### WP-14 TypeSafe routing: built 2026-11-16
+### WP-13a: Claude subscription per assistant
 
-A sentence the route gate leaves to `decide` (a device set to "TypeSafe decides", no phrase, no open armed or
-follow-up window) is routed by TypeSafe. **Off by default**: nothing is sent until the owner switches the routing
-section on and adds a key, and only from devices set to TypeSafe.
+- **Measurements** (this machine, 2026-11-16, the owner's Claude login, Ultra plan, Haiku 5.5 with low effort; the
+  opt-in live test, `CLAUDE_SUBSCRIPTION_LIVE=1 ROUNDS=4 pnpm --filter @pva/agent-claude-code exec vitest run
+  test/liveAssistants.test.ts`; 18 short messages). The figure is the turn's `llmFirstToken` mark (what `TurnTrace`
+  records), ms after the turn's input reached the agent.
+  - Retune: Haiku answered "Blue." (first token 1538 ms); then the same session with `claude-sonnet-5-5`: the reply
+    reported `claude-sonnet-5-5` (2668 ms), same session, no process start.
+  - First turn after a quiet spell, fresh-session time **on** (1 min: the idle check closed the session and started a
+    warm spare, which the turn took and primed from the history) vs **off** (0: the same session answered), 4 rounds
+    alternated: on 2157, 1154, 1362, 1845 → median **1603 ms**; off 890, 1683, 1344, 1379 → median **1361 ms**. The
+    quiet spell was simulated by moving the agent's clock (the real gap was about 30 s), so Claude's prompt cache was
+    still warm for "off"; after a real hour both would miss it, and the difference measured here (about 240 ms, with a
+    spread of ±400 ms between runs) is an upper bound of what "on" costs. The first turn of each conversation (a new
+    conversation on the spare, retuned) took 1076–2647 ms.
+  - **Not measured**: the memory of a Claude Code process (§9's risk); more than one assistant's sessions under load.
 
-- **Settings.** New shared section `routing` (`sectionDefinitions.ts`; group `agents`, page `routing`, protected, live):
-  `TYPESAFE_ROUTING` (switch, default off), `TYPESAFE_API_KEY` (secret, vault), `TYPESAFE_MODEL` (default
-  `jev-1.14.0`), `TYPESAFE_BASE_URL` (advanced, default `https://api.typesafe.ai`, the adapter's address check). A
-  warning when it is on without a key. The `jev-typesafe` decision module (not in the app's catalog) is unchanged.
-- **`canAuto`** (voice pages' `device.setup`, `device.pick "typesafe"`) is now "the routing section is on, has a key and
-  a valid address" (`routing.ts` `routingReady`). It is re-sent after a save of the section and after a vault change.
-  The admin's device page reads the same from the section's values (`DevicesPages.tsx` `useCanAuto`; the old
-  decision-module rule only for a server without the section, as the mock server still is).
-- **Not set up** (off or no key) on a TypeSafe device: nobody answers a sentence without a phrase (what the device page
-  and the mock-up say), no request. Before WP-14 the fallback answered it.
-- **Request** (`packages/decide-typesafe/src/routing.ts` `routingRequest`, sent with `makeJevClient`, whose `decide`
-  gains a per-call `timeoutMs`): exactly §3.6. `state = { utterance, available_actions: { id: Handles, or "Name:
-  purpose" (or the name) when Handles is empty } }` over the device's switched-on assistants in list order
-  (`typesafeCandidates`); questions `assistant` (Choice, the same options) and `fits` (Noul); with one candidate only
-  `fits`. On the wire the options are the Choice's `criteria` and the roles are dropped (as for the intent decider).
-- **Decision** (`readRouting`): chosen when `fits ≥ ROUTE_FITS_MIN` (0.5) and the chosen option's probability
-  `≥ ROUTE_CHOICE_MIN` (0.5); a missing answer is 0; a choice that is not a candidate is none fits.
-- **Timing** (`serve/routing.ts` `makeTypesafeDecide`, the dispatcher's `decide`): asked at the first non-blank
-  `EagerEndOfTurn`, else at `EndOfTurn`; the event (and everything after it, the recogniser's events queue meanwhile)
-  waits for the answer or the give-up time (`withoutPhrase.giveUpMs`, default 400), after which the call is
-  interrupted and its request aborted (a late answer is never read). At the final the decision is reused when
-  `sameUtterance` holds, else asked again with a fresh give-up time. A later eager event with changed text is asked
-  again too (§3.6 names only the first eager; the re-ask overlaps the pause, and the final can then reuse it). No
-  retries. A phrase, an armed or follow-up window, and typed text never ask (they are not `decide` targets).
-- **Fallback**: none fits, the give-up time, or an error (key rejected, network, refused, bad answer; logged once per
-  distinct message) → the fallback (`null`: dropped). No switched-on candidate → the fallback without a request.
-- **Traces**: `route = { by: "typesafe", outcome: "chosen" | "none-fits" | "timeout" | "error", probability?, fits,
-  ms, fallback }` and marks `routeSent`, `routeReceived` (absent after a timeout), relative to the conversation's end
-  of turn like the other marks. A decision held at the final therefore shows a negative `routeSent`: the
-  conversation's `endOfTurn` mark comes after it. `TraceRoute.fits` is now a number (it was an integer, a WP-2 slip).
-- **Warnings** (§2.2): `validateDeviceSettings(…, { assistants })` warns `no_handles` for each switched-on assistant
-  with empty Handles on a TypeSafe device (a new warning asks "Save anyway" on `device.save`); `assistant.save` of a
-  switched-on assistant whose Handles becomes empty while it is on a TypeSafe device asks the same.
-- **Tests.** `apps/assistant/test/typesafeRouting.test.ts` (scripted routing service under the test clock, real route
-  gate and dispatcher: chosen with the eager event held until the answer and the final reusing it; none fits by the
-  Noul and by a weak choice; timeout at the give-up time with the call interrupted and the late answer unused; error;
-  text changed between eager and final asked again; phrase and follow-up never ask and are not delayed; fallback
-  nobody drops; not set up sends nothing; one candidate; typed text). `serveTypesafe.test.ts` (real server, the real
-  adapter over HTTP to a local fake `/v1/systemone`: wire body and bearer key, chosen / none fits / phrase / typed text,
-  traces and marks, off by default then switched on live with `device.setup` following, a slow server traced as a
-  timeout, the Handles warnings). `packages/decide-typesafe/test/routing.test.ts` (request and reading; HTTP body,
-  per-call time limit aborting the request, 401 / 529 / malformed answer). `benchTypesafe.test.ts`. Changed:
-  `serveAssistantMessages.test.ts` (`canAuto` from the section), `serve.test.ts` and `serveVault.test.ts` (the new
-  section in the lists).
+### Per-turn configuration snapshot
+
+- **Measurements** (this machine, 2026-11-16, load 0.5–2.7; before = the branch's base 121ef70 in a detached worktree,
+  after = this change, alternated). Offline bench (`pnpm start bench`), three runs each, end of turn → playback start,
+  median / worst ms. The bench's session path now uses `assistantTurnTrace` with a configuration snapshot looked up
+  the way serve mode does (before: the plain trace service), so the "after" row includes the wrapper too.
+  Session path overhead 0.9 / 1.4, 0.7 / 1.2, 0.9 / 2.0 → 0.8 / 1.2, 0.9 / 1.2, 0.9 / 1.4; session path realistic
+  eager on 307 / 534, 306 / 534, 307 / 536 → 307 / 536, 307 / 535, 306 / 535; orchestration overhead (not on the
+  changed path) 0.9 / 1.7, 1.0 / 1.7, 0.9 / 1.7 → 1.0 / 1.7, 1.1 / 3.2, 1.0 / 1.6; every other realistic row within
+  3 ms. The real serve path was measured apart (a temporary scripted-client test, not committed): 1200 typed turns
+  alternating two Anthropic assistants with the greeter module on an instant stand-in model, `TurnTrace`
+  `llmRequestSent − startedAt` at full precision (trace begin with its snapshot, setup, prompt, registry), the first 200
+  dropped, three runs each: before median 151.2, 151.7, 156.0 µs (p90 208, 201, 214) → after 152.0, 152.0, 150.6 µs
+  (p90 206, 205, 200). No measurable cost.
+
+### WP-13b: OpenAI-compatible accounts
+
+- **Measurements** (this machine, 2026-11-16, load 1.3–2.0). Offline bench (`pnpm start bench`), two runs each of the
+  commit before (a detached worktree) and this package, alternated; end of turn → playback start, median / worst ms.
+  Orchestration overhead 0.9 / 1.5, 0.9 / 1.7 → 1.0 / 1.6, 0.9 / 1.8; session path overhead 0.7 / 1.2, 0.8 / 2.1 → 0.8 /
+  1.2, 0.8 / 1.2; eager off 508 / 736, 508 / 736 → 509 / 736, 508 / 737; eager on 307 / 536, 307 / 534 → 308 / 535,
+  307 / 534 (wake phrase and route-gate rows the same within 2 ms). The turn path is unchanged (nothing in `core` or the
+  session path was touched).
+- **Not measured: `llmFirstToken` against a live home model** (no server here; the mock server's timings say nothing
+  about a model). With the owner's server (the model name as the server lists it), each a fresh process whose first row
+  is a fresh instance:
+  `LLM_PROVIDER=home-model HOME_MODEL_BASE_URL=http://<host>:<port> HOME_MODEL_MODEL=<model> HOME_MODEL_WARM_UP=true pnpm start bench --live --rounds 3 bench-audio`
+  against `HOME_MODEL_WARM_UP=false` (compare the "1st token" column; the first row shows the cold model), and
+  `… --rounds 2 --sessions 2 bench-audio` with and without `--llm-per-session`. In the app: put an assistant on the
+  Home model account, then Diagnostics › Latency shows each turn's `llmFirstToken`.
+
+### TypeSafe routing (WP-14)
+
 - **Measurement, offline** (`pnpm start bench --typesafe`; `src/bench/typesafe.ts`). The offline bench's session path
   (route gate → dispatcher → `Conversation`, output lease), realistic stand-ins (LLM first token 250 ms + 60 tok/s, TTS
   first audio 150 ms), a TypeSafe device with three candidates whose simulated decision answers Jeff after 150, 250
@@ -1477,241 +1292,13 @@ section on and adds a key, and only from devices set to TypeSafe.
   200 ms lead). A way to hide it (not built, a design change for the owner): start the speculative turn at once for a
   tentative assistant (the fallback, or the last one chosen) while TypeSafe is asked, and hand over only when it
   chooses another.
-- **Live: not measured** (no TypeSafe key on this machine; no request was made to api.typesafe.ai). With the owner's
-  key: `TYPESAFE_API_KEY=… pnpm start bench --typesafe-live` (or a key in the vault: `PVA_VAULT_PASSWORD=… pnpm start
-  bench --typesafe-live`; options `--count N` (default 50), `--gap-ms MS` (default 1000), `--timeout-ms MS` (default
-  2000)). It sends 50 English and Dutch sentences, one after another, over the three bench assistants and prints each
-  `routeReceived − routeSent`, the outcome and choice, p50/p90/p95/p99/max with and without the first (connection
-  set-up) request, how many fit in the 400 ms give-up, and the choices. Checked against a local fake server only.
-- **Unverified.** Every request and response shape is from TypeSafe's documentation (docs/research/typesafe-jev.md
-  §2.2, §2.3), never sent to the real service: the body (`model`, `state` as an object, Choice `criteria`, Noul),
-  the bearer header, the answer (`answers.assistant.choice`/`probabilities`, `answers.fits.noul`), the error codes,
-  whether the thresholds suit our sentences (Dutch included) and the option-order bias. The 0.5 thresholds are
-  starting points, to be tuned from traces.
-- **Not built.** The web voice page and Diagnostics' Routing column (WP-8, WP-15) are other packages; the mock server
-  has no `routing` section. No warm-up request keeps the TypeSafe connection open (Node closes an idle one after about
-  4 s, `packages/decide-typesafe/test/live.test.ts`), so a first sentence after a pause also pays the connection set-up; the live
-  bench's `--gap-ms 6000` shows what that costs.
-
-### WP-15 and the web halves of WP-12 and WP-14: built 2026-11-16
-
-`apps/web` only (and its mock server). Mock-up: `docs/mockups/assistants/admin.html`; where §7.3 differs, §7.3 wins.
-
-- **Assistant › Modules, own settings** (`assistants/tabs.tsx`): for a module with `overridable` fields (a secret never
-  is), "Uses the shared settings: <values> · Open" and "Use own settings for this assistant". With own settings each
-  overridable field shows "Same as shared" or "Own value · Reset" (Reset removes the key from `modules[id].own`, so the
-  assistant follows the shared value again; "Use the shared settings" drops `own`), and the other fields are named as
-  staying shared. Saved with the assistant through `assistant.save`; a refusal (`modules.<id>.own.<field>`) is shown on
-  its field, whose input is `aria-invalid`, and clears when the field is edited. The wizard shows modules `compact`
-  (switch and shared values only).
-- **Shared settings › Modules** (`ServerPage.tsx` `ModuleBlock`, `ModuleHeader.tsx` `ModuleInstances`): a capability
-  module (one with `ModuleInfo.instances`) has no switch. "Used by: Jeff, Keuken · T3 has its own date format" (assistants
-  switched on with the module on; an own value equal to the shared one counts as shared), then each instance: state,
-  "Shared settings" or "Own <fields>", its assistants, status, and its error (the server's "(for bravo)" text). A module
-  nobody has on says "Not running". Agents and decision modules, and a server without `instances`, keep `ModuleHeader`
-  and its switch.
-- **Home** renders from its section (five fields; units and date format are here, §7.3 item 1). **Routing** renders
-  from the `routing` section (switch, key through the vault flow, model, address under Advanced) under a header of
-  `RoutingIntro`: "TypeSafe", Hosted and Needs key chips, the state ("On", "Key set, switched off", "Needs a key", "Not
-  set up"), the section's description and "Used by:" the devices set to TypeSafe. The device page's TypeSafe option
-  follows the section through `useCanAuto` (switch on and key set): verified against the mock.
-- **Diagnostics › Latency** (`latency.tsx`, `DiagnosticsPages.tsx`): ten columns (Turn, Assistant, Device, Routing, 1st
-  token, TTS audio, Playback, Audible, Outcome, Tools; the page is wide, 1000 px, and scrolls sideways on a phone). Routing
-  is TypeSafe's time with its outcome under it (chosen, none fits, timed out, error); other routes leave it empty.
-  Filters by assistant (segmented), device and route (selects); with "All assistants" a median per assistant of the audible
-  time, with one assistant its median and worst. Hovering or focusing an assistant's name shows a popover of what it was
-  set to at that turn (language model, hearing, voice, modules and tools, chosen by), and opening a row shows the same plus
-  "Open <assistant>". "Changed since this turn: …" lists what differs between the snapshot (`TraceInfo.config`) and the
-  assistant now: language model fields, voice, reply early, tool rounds, module and tool counts, and hearing through the
-  assistant that hears on that device now (a different hearer reads "hearing Keuken's → Jeff's"). A turn without `config`
-  says "Configuration: not recorded" and cannot show a change.
-- **Mock server**: sections `home` and `routing` (`/mock/typesafe` now switches the section, and a save of it updates
-  `canAuto`); overridable fields (Clock time zone and date format, Weather place and units, Home Assistant domains);
-  capability modules follow the assistants (`instances` by effective values, `module.enable`/`disable` refused
-  `not_allowed`, own values checked per field, `POST /mock/module-error` injects an instance failure); T3's Clock has an
-  own date format; scenario `latency` seeds thirteen turns of every route kind with snapshots (`mock/traces.ts`), and live
-  turns carry assistant, device, route and a snapshot of the assistant as it is.
-- **Tests**: `apps/web/e2e/adminFinish.spec.ts` (own value set, refused, reset; modules page; Home; Routing flipping the
-  device page's option; latency columns, filters, popover, changed since, a live turn) and `apps/web/test/latency.test.ts`.
-  Changed: the module tests of `options.spec.ts` and `vault.spec.ts` (no capability switch), `settings.spec.ts` (Home and
-  Routing in the navigation), `assistants.spec.ts` (Home Assistant now runs: 4 tools for Jeff). Screenshots 58 to 67,
-  light 18 and 19, phone 23 to 25; 16, 17, 37, 38 and 49 regenerated.
-- **Not done / not verified**: `e2e-real` (real server) was not updated or run; its module test still clicks a
-  capability's switch. The real server fills `config` in another change: the counts of modules and tools in "changed
-  since" are the web's own (`toolCount`) and may differ from the server's until both are checked together.
-
-### WP-13a Claude subscription per assistant: built 2026-11-16
-
-Several assistants can be on the `claude-subscription` account at once, each with its own model and options; the
-account (the agent module's opt-in, Claude Code program, proxy and debug logs, its login) is shared.
-
-- **Keyed per assistant.** Claude Code sessions stay keyed by conversation id (`AgentTurnInput.conversationId`), and a
-  conversation belongs to one (device, assistant) pair (§3.3), so every assistant on every device has its own session
-  and catch-up position. The agent is still the one module instance; serve mode wraps it per assistant
-  (`subscription.ts` `makeSubscriptionAgents({ assistant })`) with `withConversationOptions` (new export of
-  `@pva/agent-claude-code`), which puts the assistant's options on each turn's input (a symbol-keyed field only this
-  agent reads; no change in core): `model` (empty → `claude-haiku-5-5`), `effort`, `thinking`, `tools` ← `useModules`,
-  `sessionIdleMinutes` ← `freshSessionAfterMinutes` (0 = never), and the account's `maxSessions`. The wrapper also sets
-  `speculate` ← `replyEarly` and drops the module's own system prompt (the assistant's prompt is the turn's). A turn
-  without options (the module used outside serve mode) behaves as before, with the module's settings.
-- **When a change applies.** Read at every turn (`subscriptionAssistantOf`, one object per assistant revision). A
-  changed model or effort applies from that conversation's next turn **on its running session**: `setModel` and the
-  `effortLevel` flag setting (as Claude Code's /model and /effort), so it keeps what was said and starts no process;
-  verified against the real Claude Code (below: the next reply reported the new model). A changed `thinking`, or a
-  change Claude Code does not confirm within 3 s, replaces the session at that turn (the new one is primed from the
-  history). `tools` (the tool set) and the fresh-session time are read per turn as before. No other assistant's
-  session is touched. The warm spare (started with the module's model at start, later with the last turn's options) is
-  retuned the same way before its first message, so a first turn still takes it.
-- **Bound.** `maxSessions` = `MAX_VOICE_SESSIONS` × the switched-on assistants on the account (at least 1;
-  `subscriptionSessionLimit`), passed with every turn; the latest value counts. When a conversation needs a session and
-  the bound is reached, the least recently used session (an idle one first) is closed, as before; it primes from the
-  history when its conversation comes back. A shrinking bound closes nothing by itself: it is applied when the next
-  session is needed (also when the warm spare is taken).
-- **Shared settings.** A `module.configure` of the account (program, proxy, debug logs, opt-in) restarts the module: both
-  assistants' next turns open sessions of the new agent with the new settings, each with its own model. The old
-  instance's sessions get no more turns (the module host closes the old instance after its grace period).
-- **Migration left open, now mirrored.** A save of the agent module's per-assistant settings (`model`, `tools`,
-  `sessionIdleMinutes`, `speculate`, a non-empty `systemPrompt`) is mirrored into the migrated assistant when it is on
-  the account (`mirrorSubscriptionSettings`, called by `SettingsStore.saveModule`): only the settings that save changed,
-  so an assistant's own later edit is kept when a shared field is saved; `CLAUDE_SUBSCRIPTION_MODEL` in the environment
-  keeps locking the model. Other assistants are not touched.
-- **Engine row** for a subscription assistant shows the assistant's model (was the module's).
-- **Deviations.** (1) A model or effort change is applied in place (§4.1 said "a session opened with the assistant's
-  model"); only thinking needs a new session. (2) The warm spare fits one launch at a time: with assistants on
-  different thinking settings, the first turn of the other kind starts a process (about 1–2.5 s, measured below as the
-  first turn). (3) The module's own `speculate`, `systemPrompt`, `model`, `tools` and `sessionIdleMinutes` fields stay
-  in its form; in serve mode they only matter through the mirror into the migrated assistant.
-- **Tests.** `packages/agent-claude-code/test/perAssistant.test.ts` (fake SDK: two assistants' sessions with their own
-  model, effort, thinking and tools, the spare retuned; no options = the module's; a model and effort change on the
-  running session, the other untouched, no retune when unchanged; a thinking change and a refused retune open a new
-  primed session; the per-turn bound closes the least recently used; per-conversation fresh-session time, 0 = never;
-  `endConversation` kept). `apps/assistant/test/serveSubscriptionAssistants.test.ts` (real server, fake SDK: the bound
-  and the options as pure functions; two assistants answer from sessions with their own model and options and their
-  traces say so; Alpha's model change applies at its next turn on its own session, Bravo's untouched, no new process;
-  a changed program is used by both assistants' new sessions; with `MAX_VOICE_SESSIONS=1` and Bravo switched off, Alpha's
-  new conversation closes Bravo's session). `migrateAssistants.test.ts` (the mirror, the environment lock, another
-  account untouched). `packages/agent-claude-code/test/liveAssistants.test.ts` (opt-in, real Claude Code).
-- **Measurements** (this machine, 2026-11-16, the owner's Claude login, Ultra plan, Haiku 5.5 with low effort; the
-  opt-in live test, `CLAUDE_SUBSCRIPTION_LIVE=1 ROUNDS=4 pnpm --filter @pva/agent-claude-code exec vitest run
-  test/liveAssistants.test.ts`; 18 short messages). The figure is the turn's `llmFirstToken` mark (what `TurnTrace`
-  records), ms after the turn's input reached the agent.
-  - Retune: Haiku answered "Blue." (first token 1538 ms); then the same session with `claude-sonnet-5-5`: the reply
-    reported `claude-sonnet-5-5` (2668 ms), same session, no process start.
-  - First turn after a quiet spell, fresh-session time **on** (1 min: the idle check closed the session and started a
-    warm spare, which the turn took and primed from the history) vs **off** (0: the same session answered), 4 rounds
-    alternated: on 2157, 1154, 1362, 1845 → median **1603 ms**; off 890, 1683, 1344, 1379 → median **1361 ms**. The
-    quiet spell was simulated by moving the agent's clock (the real gap was about 30 s), so Claude's prompt cache was
-    still warm for "off"; after a real hour both would miss it, and the difference measured here (about 240 ms, with a
-    spread of ±400 ms between runs) is an upper bound of what "on" costs. The first turn of each conversation (a new
-    conversation on the spare, retuned) took 1076–2647 ms.
-  - **Not measured**: the memory of a Claude Code process (§9's risk); more than one assistant's sessions under load.
-- **Not verified**: the web Language model tab (another package) saving `freshSessionAfterMinutes` and the model of a
-  subscription assistant (exercised through the store and the module form in tests); the effort setting's effect on
-  the reply (Claude Code accepted `effortLevel` for Haiku; whether Haiku uses it was not checked).
-
-### Per-turn configuration snapshot (`TraceInfo.config`): built 2026-11-16
-
-Every finished turn's trace carries `config` (protocol 7 `TraceConfig`, §5.4), filled for voice and typed turns alike:
-
-| Field | From |
-|---|---|
-| `llm.account`, `model`, `effort`, `thinking`, `maxTokens` | the spec of the language-model instance the turn is bound to (`ResourcePool.keyFor` → the spec recorded for that key: during a change, still the old one), for an offline account its normalised spec; a Claude subscription assistant: its own `llm` fields (what the agent is given) |
-| `hearing.hearer`, `engine`, `model`, `language`, `eagerSilenceMs`, `finalSilenceMs`, `eotThreshold` | the recogniser binding the device's stream runs on (`SttBinding.spec` and the hearer): stt-sherpa with its end pauses (the language only for a model that takes one), Deepgram with `eotThreshold`; typed text while no stream runs: the device's binding now |
-| `voice` | the key of the voice the turn is bound to (`ttsKeyFor`) |
-| `modules`, `tools` | the capability modules the assistant has on that run, and the tools in its registry (0 for a subscription assistant with `useModules` off) |
-| `replyEarly`, `toolRounds` | the assistant's fields |
-
-- **Captured at the turn's start**: `assistantTurnTrace.begin` (the per-conversation trace service of `VoiceSession`)
-  reads it once and the trace keeps the object; it is never changed afterwards, so a later save leaves earlier traces
-  (live `trace` pushes and `admin.snapshot.traces`) as they were. A voice turn's setup is read before `begin`, a typed
-  turn's just after; both see the same bindings.
-- **Cost on the turn path**: the assistant's part is built when the setup cache (`conversationSetup.current()`) is
-  rebuilt, i.e. only when the module snapshot, the assistant or its bindings change; at `begin` it is four reference
-  compares and the join with the hearing part (one object per binding id and hearer), made again only when either
-  changes. No prompt, registry or settings work.
-- **Who sees it**: admin connections only (`trace`, `admin.snapshot`). The device's own `turn.end` trace drops it, as it
-  drops the device fields: a voice connection never learns a model (§5.3).
-- **Measurements** (this machine, 2026-11-16, load 0.5–2.7; before = the branch's base 121ef70 in a detached worktree,
-  after = this change, alternated). Offline bench (`pnpm start bench`), three runs each, end of turn → playback start,
-  median / worst ms. The bench's session path now uses `assistantTurnTrace` with a configuration snapshot looked up
-  the way serve mode does (before: the plain trace service), so the "after" row includes the wrapper too.
-  Session path overhead 0.9 / 1.4, 0.7 / 1.2, 0.9 / 2.0 → 0.8 / 1.2, 0.9 / 1.2, 0.9 / 1.4; session path realistic
-  eager on 307 / 534, 306 / 534, 307 / 536 → 307 / 536, 307 / 535, 306 / 535; orchestration overhead (not on the
-  changed path) 0.9 / 1.7, 1.0 / 1.7, 0.9 / 1.7 → 1.0 / 1.7, 1.1 / 3.2, 1.0 / 1.6; every other realistic row within
-  3 ms. The real serve path was measured apart (a temporary scripted-client test, not committed): 1200 typed turns
-  alternating two Anthropic assistants with the greeter module on an instant stand-in model, `TurnTrace`
-  `llmRequestSent − startedAt` at full precision (trace begin with its snapshot, setup, prompt, registry), the first 200
-  dropped, three runs each: before median 151.2, 151.7, 156.0 µs (p90 208, 201, 214) → after 152.0, 152.0, 150.6 µs
-  (p90 206, 205, 200). No measurable cost.
-- **Tests.** `apps/assistant/test/serveTraceConfig.test.ts` (scripted client: voice and typed turns of Alpha and Bravo
-  with their exact snapshots, decoded by the protocol schema; the device's `turn.end` has none; after a model, tool
-  rounds and voice change, the earlier traces are unchanged and the new turns carry the new values; a new admin page's
-  snapshot traces likewise). The subscription traces in `serveSubscriptionAssistants.test.ts`.
-- **Not built**: the Diagnostics page's snapshot popover and "changed since" (WP-15, apps/web). `config` is `undefined`
-  for a turn whose device has no recogniser bound (no hearing to report; such a device has no assistant).
-
-### WP-13b OpenAI-compatible accounts: built 2026-11-16
-
-`openrouter` and `home-model` are real `Llm` instances in the pool, built by `packages/llm-openai-compatible`'s new
-`account.ts` (`accountConfig`, `makeAccount`, `accountLayer`) over the same `ConfigProvider` mechanism as `anthropic`.
-
-- **Shared settings** (new section `llm-openai-accounts`, page `agents/openai-accounts`, shown on Shared settings ›
-  Language model accounts; protected, live, secrets in the vault): `OPENROUTER_API_KEY` (secret, required),
-  `OPENROUTER_SORT_BY_LATENCY` (default on, advanced), `OPENROUTER_BASE_URL` (advanced; empty = the fixed
-  `https://openrouter.ai/api/v1`), `HOME_MODEL_BASE_URL` (required; `http://host:port` is enough, `/v1` is added),
-  `HOME_MODEL_API_KEY` (secret, optional). The web tree places these keys on the accounts page (`settingsTree.ts`,
-  one line).
-- **Per-assistant fields that apply**: `model`, `maxTokens` (`*_MAX_TOKENS`), `giveUpMs` (`*_TIMEOUT_MS`: no response
-  headers, or no data for that long, fails the call; one retry only before anything was emitted), `warmUp`. `effort` and
-  `thinking` do **not** apply: OpenRouter takes a reasoning effort only for models whose list entry names it and the pool
-  does not fetch the list; the home model sends none. They are therefore not part of these accounts' key (equal
-  settings share one instance, and changing effort or thinking builds nothing). `useModules` and
-  `freshSessionAfterMinutes` are the subscription's.
-- **Key and identity.** `llmKeyOf` for these accounts = account + model + maxTokens + giveUpMs + warm/cold + the address
-  without user info and query; the identity adds the full address and the key stamp, as for Anthropic (a changed key or
-  address builds a new instance, the old one is released after the grace period). `LlmAccounts` gains `openrouter` and
-  `home-model` (`serveMode.ts` `llmAccounts`).
-- **Warm-up** (`warmUp` on, awaited like `AnthropicLlm`'s `awaitWarmUp`, so "ready" means "warm"): OpenRouter opens the
-  connection with `GET /models` (also checks the key, at most the give-up time); the home model gets one one-token
-  request, which makes the server load the model (up to 60 s, `WARM_UP_LOAD_MS`, ends early on success). A failing
-  warm-up does not fail the build.
-- **Not set up.** No key (OpenRouter) or no address (home model) fails the build with "OpenRouter is not set up: add
-  its API key in Shared settings › Language model accounts." / "Home model is not set up: add the server address in
-  Shared settings › Language model accounts." (`notSetUpMessage`); a refused address or an empty model fails with its
-  own sentence, never with a credential. The resource is `failed` with that `problem`; the assistant's turns fail
-  (`turn_failed`) and every other assistant answers. `AssistantInfo.problems` gains "Language model (label): problem"
-  for a failed instance the assistant uses (also for Anthropic), and `resources.llm` is `failed` (`llmProblems` in
-  `assistants.ts`). With the vault locked, OpenRouter's problem reads as the locked-keys message. The admin's account
-  cards (`accountState` in `apps/web/src/lib/assistants.ts`) now read "Key set" / "Address set" from the shared
-  sections instead of the hard-coded "Not available yet".
-- **Streaming and tools** work as for Anthropic: the adapter streams text deltas, assembles tool calls from fragments,
-  never emits reasoning, ends at the finish reason and aborts the HTTP request when the consumer is interrupted (barge-in).
-  No gap needed fixing in the existing adapter; the additions are the account layer and `checkAccountAddress`.
-- **CLI.** `LLM_PROVIDER=openrouter|home-model` also works in the CLI modes and `bench --live` (flat `OPENROUTER_*`,
-  `HOME_MODEL_*` keys, incl. `HOME_MODEL_MODEL`).
-- **Tests.** `llm-openai-compatible/test/account.test.ts` (settings, not-set-up sentences, `/v1`, streamed text and
-  tool calls through the account layer against the local mock, the give-up time, awaited and failing warm-up, the
-  OpenRouter key and latency preference), the adapter's existing mock-server tests (streaming, tool calls, errors, stalls,
-  abort), `apps/assistant/test/serveOpenAiAccounts.test.ts` (an assistant on `home-model` answers through its own
-  instance at the mock; not set up is the account's problem while an offline assistant answers; setting the address
-  builds it; a changed address builds a new instance; two models are two instances, equal settings share one, a
-  different longest reply is separate, effort and thinking build nothing; OpenRouter without and with a key),
-  `apps/web/test/assistants.test.ts` (account states).
-- **Measurements** (this machine, 2026-11-16, load 1.3–2.0). Offline bench (`pnpm start bench`), two runs each of the
-  commit before (a detached worktree) and this package, alternated; end of turn → playback start, median / worst ms.
-  Orchestration overhead 0.9 / 1.5, 0.9 / 1.7 → 1.0 / 1.6, 0.9 / 1.8; session path overhead 0.7 / 1.2, 0.8 / 2.1 → 0.8 /
-  1.2, 0.8 / 1.2; eager off 508 / 736, 508 / 736 → 509 / 736, 508 / 737; eager on 307 / 536, 307 / 534 → 308 / 535,
-  307 / 534 (wake phrase and route-gate rows the same within 2 ms). The turn path is unchanged (nothing in `core` or the
-  session path was touched).
-- **Not measured: `llmFirstToken` against a live home model** (no server here; the mock server's timings say nothing
-  about a model). With the owner's server (the model name as the server lists it), each a fresh process whose first row
-  is a fresh instance:
-  `LLM_PROVIDER=home-model HOME_MODEL_BASE_URL=http://<host>:<port> HOME_MODEL_MODEL=<model> HOME_MODEL_WARM_UP=true pnpm start bench --live --rounds 3 bench-audio`
-  against `HOME_MODEL_WARM_UP=false` (compare the "1st token" column; the first row shows the cold model), and
-  `… --rounds 2 --sessions 2 bench-audio` with and without `--llm-per-session`. In the app: put an assistant on the
-  Home model account, then Diagnostics › Latency shows each turn's `llmFirstToken`.
-- **Not done or verified.** No real OpenRouter or home server was called. OpenRouter's per-model reasoning effort is not
-  sent. The model field on the assistant page is free text (the pickers' model lists from `listModels` are not wired).
-  A "not set up" warning on saving an assistant (§2.2) is not added: the problem shows on the assistant and in the
-  status. `apps/web/mock/assistants.ts` still fakes "not available yet" for these accounts (a dev mock).
-
+- **Live** (2026-11-16, with the owner's key, `pnpm start bench --typesafe-live`: 50 typed sentences, one every 1 s, model `jev-1.14.0`,
+  three sample assistants: Jeff general, Keuken kitchen, T3 coding). `routeReceived − routeSent`: p50 201 ms, p90 241 ms, p95 256 ms,
+  p99 and max 269 ms. 50 of 50 inside the 400 ms give-up; 0 errors, 0 timeouts. 49 sentences were chosen (jeff 22, keuken 15, t3 12) and
+  1 was none-fits ("never mind", fits 0.33). The 11 Dutch sentences were all chosen as expected. The lowest "fits" among the chosen:
+  "thank you" 0.53, "spell necessary" 0.55, "good morning" 0.72. **Limits:** one run; typed sentences, not recogniser output; 1 s gaps, so
+  no cold-connection cost. The run sent the requests as built and got no errors, so the request and answer shapes work. How to repeat it:
+  `TYPESAFE_API_KEY=… pnpm start bench --typesafe-live` (or a key in the vault: `PVA_VAULT_PASSWORD=… pnpm start bench --typesafe-live`;
+  options `--count N` (default 50), `--gap-ms MS` (default 1000), `--timeout-ms MS` (default 2000)); it prints each `routeReceived −
+  routeSent`, the outcome and choice, p50/p90/p95/p99/max with and without the first (connection set-up) request, how many fit in the
+  400 ms give-up, and the choices.
