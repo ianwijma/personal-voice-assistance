@@ -5,16 +5,19 @@
  *
  * Per frame the runner resolves the application's mode for this character (§4.3), keeps `prevMode` and
  * `modeAge`, applies the host-level settings (recolouring, sensitivity) and passes the character's own options,
- * validated on every `setStored` (§4.4). It allocates nothing per frame.
+ * validated on every `setStored` (§4.4), and fills `focus`: the host's for a "stage" character, the whole canvas
+ * otherwise (§2.6). It allocates nothing per frame.
  */
 import {
   BAND_COUNT,
   CORE_MODES,
+  type CanvasArea,
   type Character,
   type CharacterInstance,
   type CoreMode,
   EXTRA_MODES,
   type ExtraMode,
+  type Focus,
   type Frame,
   type FrameExtensions,
   type Mode,
@@ -47,6 +50,9 @@ export const coreOf = (mode: Mode): CoreMode => resolveMode(mode, undefined) as 
 
 const NO_EXTENSIONS: FrameExtensions = Object.freeze({})
 
+/** The canvas area a character asks for (`Character.canvas`, default `"box"`). */
+export const areaOf = (character: Pick<Character, "canvas">): CanvasArea => (character.canvas === "stage" ? "stage" : "box")
+
 export interface StepInput {
   /** The application's mode (any `Mode`); the runner resolves it for this character. */
   readonly mode: Mode
@@ -59,6 +65,11 @@ export interface StepInput {
   readonly pointer: Pointer
   readonly sinceInterrupt: number
   readonly ext?: FrameExtensions
+  /**
+   * Where the box is on this canvas (CSS px), for a `"stage"` character on a stage canvas. Absent: the whole canvas.
+   * Ignored for a `"box"` character, whose focus is always the whole canvas.
+   */
+  readonly focus?: Readonly<Focus>
 }
 
 export class Runner {
@@ -75,6 +86,8 @@ export class Runner {
   private basePalette: Palette | null = null
   private paletteVersion = -1
   private started = false
+  private cssWidth = 1
+  private cssHeight = 1
 
   constructor(character: Character, canvas: HTMLCanvasElement, stored: OptionValues | undefined) {
     this.character = character
@@ -92,6 +105,7 @@ export class Runner {
       agent: silent,
       active: silent,
       pointer: { x: 0, y: 0, down: false, inside: false },
+      focus: { x: 0, y: 0, width: 1, height: 1 },
       reducedMotion: false,
       palette: undefined as unknown as Palette, // set on the first step
       options: this.resolved.values,
@@ -119,6 +133,8 @@ export class Runner {
   resize(width: number, height: number, dpr: number): void {
     this.canvas.width = Math.max(1, Math.round(width * dpr))
     this.canvas.height = Math.max(1, Math.round(height * dpr))
+    this.cssWidth = width
+    this.cssHeight = height
     this.instance?.resize(width, height, dpr)
   }
 
@@ -163,6 +179,19 @@ export class Runner {
     p.y = input.pointer.y
     p.down = input.pointer.down
     p.inside = input.pointer.inside
+    const q = f.focus
+    const given = input.focus
+    if (given !== undefined && this.character.canvas === "stage" && Number.isFinite(given.x + given.y + given.width + given.height)) {
+      q.x = given.x
+      q.y = given.y
+      q.width = Math.max(1, given.width)
+      q.height = Math.max(1, given.height)
+    } else {
+      q.x = 0
+      q.y = 0
+      q.width = this.cssWidth
+      q.height = this.cssHeight
+    }
     f.reducedMotion = input.reducedMotion
     f.options = o.values
     f.sinceInterrupt = input.sinceInterrupt
