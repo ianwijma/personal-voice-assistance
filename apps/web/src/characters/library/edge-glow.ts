@@ -1,8 +1,10 @@
 /**
- * Edge glow: light that lives on the border of the stage and leaves the centre free for captions,
- * after the Apple Intelligence screen-edge glow and Gemini Live.
+ * Edge glow: light that lives on the edge of the screen and leaves the middle free for captions,
+ * after the Apple Intelligence screen-edge glow and Gemini Live. It is a stage character that ignores
+ * `focus` for its shape: the whole canvas is its frame, so on the voice page the light runs along the
+ * window's edge, and in a box (another host, the tests) along the box's.
  *
- * The glow is a stack of nested rounded rectangles stroked with one conic gradient, so its
+ * The glow is one conic gradient through two smooth falloff masks (a tight and a deep layer), so its
  * brightness and colour can change all the way around the frame. While you speak, the light pools
  * where your pitch is: along the bottom edge for a deep voice, climbing the sides to the top for a
  * high one, wider and deeper the louder you are; each syllable sends a pulse from the border
@@ -14,7 +16,7 @@ import type { Character, CharacterInstance, Rgb, VoiceFeatures } from "../contra
 import { AttackRelease, TAU, approach, clamp, clamp01, clear2d, lerp, optChoice, optNumber, optToggle, setup2d, smoothstep } from "../kit.ts"
 import { ChoiceMix, type Col, css, Glide, hueShift, mixInto, ModeMix, ONSET } from "../shared/light.ts"
 
-const STOPS = 72 // colour stops around the frame
+const STOPS = 120 // colour stops around the frame (72 showed as faint radial lines on a page-sized frame)
 const PULSES = 5
 const WHITE: Rgb = [255, 255, 255]
 /** "Lit edges" choices, in the order of the per-stop maps below. */
@@ -24,14 +26,21 @@ const STYLES = ["soft", "crisp", "line"] as const
 const MASK_SETTLE = 0.15
 const MASK_FADE = 0.3
 /**
- * Pixels of the glow's work surface per CSS pixel, whatever the device pixel ratio. The glow is soft
- * (its tightest falloff spans about 6 % of the short side), so it is drawn at half resolution and
- * scaled up; the shape's edge (the rounded corners) is cut at full resolution by a clip, and the
- * border line, pulses and chevrons are drawn at full resolution. Rasterising the two layers at full
- * device resolution cost about 3 ms a frame on a 720 × 240 stage (13 ms at ratio 2); this is a
- * quarter of that or less, and constant across ratios.
+ * Pixels of the glow's work surface per CSS pixel, whatever the device pixel ratio: at most half, and
+ * fewer on a large canvas so the surface stays within GLOW_BUDGET pixels (the largest box, 720 × 240, gets 0.43;
+ * the whole 1920 × 1080 page gets 0.12). The glow and the pulses are soft (the tightest falloff spans
+ * about 6 % of the short side), so they are composited on that surface and scaled up once, and only the
+ * band along the border where there is light is drawn; the shape's edge (the rounded corners) is cut at
+ * full resolution by a clip, and the border line and chevrons are drawn at full resolution.
+ * Rasterising the layers at full device resolution cost about 3 ms a frame in the 720 × 240 box and
+ * 5.5 ms (1280 × 800) to 10.8 ms (1920 × 1080) on the whole page.
  */
 const GLOW_SCALE = 0.5
+const GLOW_BUDGET = 32_000
+/** Strokes that make one pulse's soft profile (a triangle across its width, so it shows no bands). */
+const PULSE_STEPS = 8
+/** The border line's lowest alpha at any stop (0.12 × 0.25). */
+const LINE_FLOOR = 0.03
 
 const create = (canvas: HTMLCanvasElement): CharacterInstance => {
   let g = setup2d(canvas)
@@ -43,9 +52,13 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
   let CR0 = 12 // corner radius at "Corner roundness" 1
   let D = 20 // glow depth (eased option applied)
   let CR = 12 // corner radius (eased option applied)
-  // Off-screen work surface for the glow layers.
+  // Off-screen work surfaces: one layer at a time is cut out on `work`, and the layers and pulses are
+  // composited on `acc`, which is scaled up onto the canvas once.
   let work = new OffscreenCanvas(1, 1)
   let wg = work.getContext("2d")!
+  let acc = new OffscreenCanvas(1, 1)
+  let ag = acc.getContext("2d")!
+  let prevDs = 1 // depth the previous masks were built for, while they fade out
   // The masks depend on depth and corner radius. They are rebuilt (once, when the option settles)
   // and crossfaded from the previous pair, so changing them never pops and never costs per frame.
   // Two pairs are kept (allocated on resize) and swap roles on a rebuild.
@@ -183,6 +196,7 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
       masks = new MaskPair(pw, ph)
       spare = new MaskPair(pw, ph)
     }
+    prevDs = maskDs
     masks.build(cr * gk, D0 * ds * gk * 0.38, 1.8, D0 * ds * gk * 1.15, 2.4)
     masks.cr = cr
     maskDs = ds
@@ -201,11 +215,13 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
       D = D0 * depthG
       CR = cornerRadius(cornerG)
       layout()
-      gk = Math.min(dpr, GLOW_SCALE)
+      gk = Math.min(dpr, GLOW_SCALE, Math.sqrt(GLOW_BUDGET / (W * H)))
       const pw = Math.max(1, Math.round(W * gk))
       const ph = Math.max(1, Math.round(H * gk))
       work = new OffscreenCanvas(pw, ph)
       wg = work.getContext("2d")!
+      acc = new OffscreenCanvas(pw, ph)
+      ag = acc.getContext("2d")!
       prev = null
       buildMasks(wantDs, wantCs)
       maskFade = 1
@@ -362,6 +378,38 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
       // the intensity, and a deep one that follows its square, so bright parts reach further in.
       const PW = work.width
       const PH = work.height
+      ag.setTransform(1, 0, 0, 1, 0, 0)
+      ag.globalCompositeOperation = "source-over"
+      ag.globalAlpha = 1
+      ag.clearRect(0, 0, PW, PH)
+      // The band along the border where there is light, in work pixels: the deep layer, the pulses, and
+      // (points within d of a rounded corner are within d + 0.3 × radius of a straight edge) the corners.
+      // Every pass on the work surfaces is clipped to it, as the middle of a page-sized surface is empty
+      // and would be most of the cost.
+      let pulseReach = 0
+      for (let q = 0; q < PULSES; q++) {
+        const pp = pulsePos[q]!
+        if (pp >= 0 && pp <= 1) pulseReach = Math.max(pulseReach, 2 + pp * D * 0.85 + Math.max(1, D * 0.42) / 2)
+      }
+      const deepest = 1.15 * D0 * Math.max(maskDs, prev !== null ? prevDs : 0)
+      const bandCss = Math.max(deepest, pulseReach) + 0.3 * Math.max(masks.cr, prev !== null ? prev.cr : 0)
+      const b = Math.ceil(bandCss * gk) + 2
+      const whole = 2 * b >= PW || 2 * b >= PH
+      wg.save()
+      ag.save()
+      if (!whole) {
+        // Integer rectangles, so the ring is a pixel-exact clip.
+        wg.beginPath()
+        wg.rect(0, 0, PW, PH)
+        wg.rect(b, b, PW - 2 * b, PH - 2 * b)
+        wg.clip("evenodd")
+        ag.beginPath()
+        ag.rect(0, 0, PW, PH)
+        ag.rect(b, b, PW - 2 * b, PH - 2 * b)
+        ag.clip("evenodd")
+      }
+      // As 1.0, the pulses and the border line take the glow's blend only when a glow layer was drawn.
+      let blend: GlobalCompositeOperation = "source-over"
       // Style: "Crisp" drops the deep layer, "Line" drops both and leaves the border line.
       for (let layer = 0; layer < 2; layer++) {
         const weight = layer === 0 ? 1 - lineOnly : reach * Math.max(0, 1 - crisp - lineOnly)
@@ -385,56 +433,83 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
           wg.fillRect(0, 0, PW, PH)
           wg.globalCompositeOperation = "destination-in"
           wg.drawImage(mask, 0, 0)
-          g.globalCompositeOperation = dark ? "lighter" : "source-over"
-          g.globalAlpha = Math.min(1, weight * (dark ? 0.95 : 0.85)) * share
-          // The masks run on past the rounded corners, so scaling them up cannot soften the corner
-          // edge; the clip cuts it at full resolution instead.
-          g.save()
-          g.beginPath()
-          g.roundRect(0, 0, W, H, pair.cr)
-          g.clip()
-          g.drawImage(work, 0, 0, W, H)
-          g.restore()
+          blend = dark ? "lighter" : "source-over"
+          ag.globalCompositeOperation = blend
+          ag.globalAlpha = Math.min(1, weight * (dark ? 0.95 : 0.85)) * share
+          ag.drawImage(work, 0, 0)
         }
       }
-      g.globalAlpha = 1
+      ag.globalAlpha = 1
 
       // Pulses: a soft line of light travelling through the glow, in for you, out for the assistant.
-      // When only some edges are lit, the pulses are stroked through a gradient that fades with them.
+      // Drawn on the work surface with the glow, as a stack of strokes narrowing to the middle so the
+      // profile across it is a smooth ramp rather than visible steps. When only some edges are lit,
+      // the pulses are stroked through a gradient that fades with them.
       const pulseCol = dark ? mixInto(tmp, side, WHITE, 0.25) : side
       const partial = ew[0]! < 0.999
       let pulseGrad: CanvasGradient | null = null
+      ag.setTransform(PW / W, 0, 0, PH / H, 0, 0)
+      ag.globalCompositeOperation = blend
       for (let q = 0; q < PULSES; q++) {
         const pp = pulsePos[q]!
         if (pp < 0 || pp > 1) continue
         const inset = 2 + pp * D * 0.85
         const a = pulseGain[q]! * Math.sin(Math.PI * Math.min(1, pp * 1.2 + 0.1)) * (1 - 0.5 * pp) * (1 - 0.6 * lineOnly)
+        // The three strokes of 1.0 (0.42, 0.29, 0.16 of the depth at one alpha each) as a ramp of the same peak.
+        const peak = clamp01(3 * a * (dark ? 0.065 : 0.055))
+        const step = peak / PULSE_STEPS
         if (partial && pulseGrad === null) {
-          pulseGrad = g.createConicGradient(0, cx, cy)
+          pulseGrad = ag.createConicGradient(0, cx, cy)
           for (let i = 0; i <= STOPS; i++) {
             const j = i % STOPS
             pulseGrad.addColorStop(i === STOPS ? 1 : stopAngle[j]! / TAU, css(pulseCol, eLit[j]!))
           }
         }
-        for (let k = 0; k < 3; k++) {
-          g.lineWidth = Math.max(1, D * (0.42 - k * 0.13))
+        const wMax = Math.max(1, D * 0.42)
+        for (let k = 0; k < PULSE_STEPS; k++) {
+          ag.lineWidth = Math.max(1, wMax * (1 - k / PULSE_STEPS))
           if (pulseGrad !== null) {
-            g.strokeStyle = pulseGrad
-            g.globalAlpha = clamp01(a * (dark ? 0.065 : 0.055))
-          } else g.strokeStyle = css(pulseCol, a * (dark ? 0.065 : 0.055))
-          g.beginPath()
-          g.roundRect(inset, inset, W - 2 * inset, H - 2 * inset, CR + inset * 0.3)
-          g.stroke()
+            ag.strokeStyle = pulseGrad
+            ag.globalAlpha = step
+          } else ag.strokeStyle = css(pulseCol, step)
+          ag.beginPath()
+          ag.roundRect(inset, inset, W - 2 * inset, H - 2 * inset, CR + inset * 0.3)
+          ag.stroke()
         }
       }
-      g.globalAlpha = 1
+      ag.globalAlpha = 1
+      wg.restore()
+      ag.restore()
 
-      // The crisp border line: defines the frame in every mode.
+      // The composited glow onto the canvas, scaled up, only along the band. The masks run on past the
+      // rounded corners, so scaling them up cannot soften the corner edge; the clip cuts it at full
+      // resolution instead.
+      const sx = W / PW
+      const sy = H / PH
+      g.save()
+      g.beginPath()
+      g.roundRect(0, 0, W, H, Math.max(masks.cr, prev !== null ? prev.cr : 0))
+      g.clip()
+      if (whole) g.drawImage(acc, 0, 0, W, H)
+      else {
+        g.drawImage(acc, 0, 0, PW, b, 0, 0, W, b * sy)
+        g.drawImage(acc, 0, PH - b, PW, b, 0, (PH - b) * sy, W, b * sy)
+        g.drawImage(acc, 0, b, b, PH - 2 * b, 0, b * sy, b * sx, (PH - 2 * b) * sy)
+        g.drawImage(acc, PW - b, b, b, PH - 2 * b, (PW - b) * sx, b * sy, b * sx, (PH - 2 * b) * sy)
+      }
+      g.restore()
+      g.globalCompositeOperation = blend
+
+      // The crisp border line: defines the frame in every mode. Every stop has at least LINE_FLOOR alpha,
+      // so that floor is stroked first in one solid colour and the gradient on top carries the rest
+      // (the same line; the solid part is what marks the frame as the shape).
       const gb = g.createConicGradient(0, cx, cy)
+      const rest = dark ? 1 : 1 - LINE_FLOOR // "lighter" adds; source-over: floor + a′ (1 − floor) = a
       for (let i = 0; i <= STOPS; i++) {
         const j = i % STOPS
         mixInto(tmp, side, p.voice, warm[j]!)
-        gb.addColorStop(i === STOPS ? 1 : stopAngle[j]! / TAU, css(tmp, Math.min(1, 0.12 * (0.25 + 0.75 * eLit[j]!) + 0.9 * inten[j]!)))
+        const la = Math.min(1, 0.12 * (0.25 + 0.75 * eLit[j]!) + 0.9 * inten[j]!)
+        gb.addColorStop(i === STOPS ? 1 : stopAngle[j]! / TAU, css(tmp, (la - LINE_FLOOR) / rest))
       }
       // A breathy voice (a whisper) shimmers as dotted light instead of a solid line.
       const dotted = live && voiced < 0.35
@@ -443,12 +518,16 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
       const lw = Math.max(1, Math.min(W, H) / 200) * (1 + 1.2 * loud * (mix.hearing + mix.speaking)) * lineK
       if (dotted) g.setLineDash([1.5 * Math.max(1, lineK), 4 * Math.max(1, lineK)])
       g.globalAlpha = (dark ? 0.9 : 0.85) * Math.min(1, lineK * 4)
-      g.strokeStyle = gb
       g.lineWidth = Math.max(0.5, lw)
       const li = 1 + Math.max(0, lw / 2 - 1) * clamp01(lineK - 1) // a thicker line moves inward so it stays inside the canvas
       g.beginPath()
       g.roundRect(li, li, W - 2 * li, H - 2 * li, Math.max(0, CR - li + 1))
-      if (lineK > 0.02) g.stroke()
+      if (lineK > 0.02) {
+        g.strokeStyle = css(side, LINE_FLOOR)
+        g.stroke()
+        g.strokeStyle = gb
+        g.stroke()
+      }
       g.setLineDash([])
       g.globalAlpha = 1
       g.globalCompositeOperation = "source-over"
@@ -519,6 +598,7 @@ class MaskPair {
     const hx = w / 2
     const hy = h / 2
     const band = Math.ceil(Math.max(depthA, depthB)) + 1
+    const soft = 0.3 * Math.max(depthA, depthB)
     const edge = Math.max(band, Math.ceil(cr))
     const qw = Math.ceil(w / 2)
     const qh = Math.ceil(h / 2)
@@ -532,7 +612,10 @@ class MaskPair {
         const qy = hy - y - 0.5 - (hy - cr)
         const ox = qx > 0 ? qx : 0
         const oy = qy > 0 ? qy : 0
-        const sd = Math.sqrt(ox * ox + oy * oy) + Math.min(Math.max(qx, qy), 0) - cr
+        // A smooth maximum where the plain one has a crease along the corner's diagonal, which showed
+        // as a dark line in the glow at full-screen size.
+        const qd = qx - qy
+        const sd = Math.sqrt(ox * ox + oy * oy) + Math.min((qx + qy + Math.sqrt(qd * qd + soft * soft)) / 2, 0) - cr
         const d = -sd // distance inside
         const va = d > depthA ? 0 : lutA[d < 0 ? 0 : Math.round(d * kA)]!
         const vb = d > depthB ? 0 : lutB[d < 0 ? 0 : Math.round(d * kB)]!
@@ -566,11 +649,12 @@ const falloffLut = (power: number): Uint8ClampedArray => {
 const character: Character = {
   id: "edge-glow",
   name: "Edge glow",
-  version: "1.0.0",
+  version: "1.1.0",
   contract: 1,
   family: "abstract",
   renderer: "2d",
-  summary: "Light on the border of the stage, leaving the centre for captions: it pools where your pitch is and pulses inward as you speak, glows amber all round and pulses outward as the assistant replies.",
+  canvas: "stage",
+  summary: "Light on the edge of the screen, leaving the middle for captions: it pools where your pitch is and pulses inward as you speak, glows amber all round and pulses outward as the assistant replies.",
   inspiredBy:
     "The Apple Intelligence screen-edge glow and Gemini Live's screen glow (light on the frame, content left visible), Gemini's sharp-front, soft-tail gradients for the thinking comets, and Meta AI's inward-for-listening, outward-for-responding rule.",
   modes: {
