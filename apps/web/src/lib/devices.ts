@@ -118,6 +118,35 @@ export const patchOf = (base: DeviceBase, edit: DeviceEdit): DeviceSettingsPatch
 export const isDirty = (base: DeviceBase, edit: DeviceEdit, savedName: string | undefined): boolean =>
   Object.keys(patchOf(base, edit)).length > 0 || (edit.name !== undefined && edit.name.trim() !== savedName)
 
+/** The page's edits and the revision they started from. */
+export interface DeviceDraft {
+  readonly edit: DeviceEdit
+  readonly rev: number
+}
+
+/**
+ * The draft when revision `rev` arrives. `acked`: the edits a save of this page sent and the server took (they are
+ * in `rev`): exactly those leave a clean draft, and edits made while that save was on its way stay, on `rev`.
+ * Otherwise a draft with nothing to save follows `rev`, and one with edits stays where it is ("Changed somewhere else").
+ */
+export const draftOnRevision = (draft: DeviceDraft, rev: number, base: DeviceBase, savedName: string | undefined, acked: DeviceEdit | undefined): DeviceDraft =>
+  draft.rev === rev
+    ? draft
+    : acked !== undefined
+    ? { edit: draft.edit === acked ? noEdit : draft.edit, rev }
+    : draft.edit === noEdit || !isDirty(base, draft.edit, savedName)
+    ? { edit: noEdit, rev }
+    : draft
+
+/** The phrase without punctuation, as the tester compares a matched phrase. */
+const bare = (p: string) => p.trim().toLowerCase().replace(/[^\p{L}\p{N} ]/gu, "")
+
+/** The assistant a matched phrase wakes, among the assignments of the device that was tested (its saved settings). */
+export const wakesAssistant = (assignments: ReadonlyArray<Assignment>, phrase: string): string | undefined => {
+  const key = phrase.trim().toLowerCase()
+  return assignments.find((a) => a.phrases.some((p) => p.trim().toLowerCase() === key || bare(p) === bare(key)))?.assistant
+}
+
 // ---- Reading the list
 
 /** Whether the assistant answers without a phrase here. */

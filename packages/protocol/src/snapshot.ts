@@ -313,6 +313,11 @@ export const Snapshot = Schema.Struct({
   role: Role,
   ownerPresent: Schema.Boolean,
   engine: EngineSummary,
+  /**
+   * Protocol 7: the assistant `history` belongs to (the answering one: the follow-up holder, else who answers without
+   * a phrase, …). Absent: no session yet, or the server does not say.
+   */
+  answering: Schema.optionalKey(AssistantId),
   /** The most recent history (at most 200 items), oldest first. */
   history: Schema.Array(HistoryItem),
   /**

@@ -465,7 +465,10 @@ const server: ServerHandlers = {
     // "Listening…" after the wake phrase lasts until the assistant hears something, or falls asleep again.
     // Asleep or idle: nobody has the turn any more.
     const sleeping = m.state === "asleep" || m.state === "idle"
-    return { ...s, session, woke: m.state === "listening" ? s.woke : undefined, holder: sleeping ? undefined : s.holder }
+    // The server says who has the turn (protocol 7 `holder`, also when a window closed while the device keeps listening);
+    // a turn in flight keeps the assistant its `turn.start` named.
+    const told = m.holder === undefined ? s.holder : m.holder ?? (m.state === "thinking" || m.state === "speaking" ? s.holder : undefined)
+    return { ...s, session, woke: m.state === "listening" && m.holder !== null ? s.woke : undefined, holder: sleeping ? undefined : told }
   },
   transcript: (s, m) => (s.liveTranscript === m.text ? s : { ...s, liveTranscript: m.text }),
   "turn.start": (s, m) => {

@@ -147,6 +147,35 @@ describe("assistants on one device (WP-4b)", () => {
     expect(own.every((t) => t.device === undefined && t.session === undefined)).toBe(true)
   })
 
+  it("who has the turn: state.holder names the follow-up holder and goes back to nobody when its window lapses while the device keeps listening; a welcome in the window says whose history it sends", async () => {
+    const { stt } = await start(await twoAssistantsDataDir((file) => {
+      file.assistants.byId.bravo.followUpSeconds = 1
+      file.deviceTypes["web-voice"].withoutPhrase = { mode: "assistant", assistant: "alpha" }
+    }))
+    const page = await connect()
+    await page.hello()
+    await page.claim()
+    await untilOpen(stt, 1)
+    const from = page.messages.length
+    stt.emit(speechStarted, endOfTurn("hey bravo tell me a joke"))
+    const begun = await page.waitFor("turn.start", () => true, { from, timeoutMs: 10_000 })
+    expect(begun.assistantId).toBe("bravo")
+    const end = await page.waitFor("turn.end", (m) => m.turnId === begun.turnId, { from, timeoutMs: 10_000 })
+    await page.waitFor("state", (m) => m.holder === "bravo", { from })
+
+    // Another tab of the device inside Bravo's follow-up window: the snapshot's history is Bravo's, and says so.
+    const tab = await ScriptedClient.connect({ url: server!.url, deviceId: page.device.id })
+    clients.push(tab)
+    const welcome = await tab.hello()
+    expect(welcome.snapshot.answering).toBe("bravo")
+    expect(welcome.snapshot.history.filter((h) => h.role === "user").map((h) => h.text)).toEqual(["tell me a joke"])
+
+    // The window lapses (1 s after the reply); Alpha answers without a phrase again and the state stays listening.
+    const lapsed = await page.waitFor("state", (m) => m.holder === null, { from: page.messages.indexOf(end), timeoutMs: 5_000 })
+    expect(lapsed.state).toBe("listening")
+    await tab.waitFor("state", (m) => m.holder === null, { timeoutMs: 5_000 })
+  })
+
   it("typed text goes to the assistant the page names, else the follow-up holder, else who answers without a phrase; conversation.new is per assistant", async () => {
     const { llm } = await start(await twoAssistantsDataDir((file) => {
       file.deviceTypes["web-voice"].withoutPhrase = { mode: "assistant", assistant: "bravo" }

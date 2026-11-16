@@ -119,6 +119,11 @@ export function NumberControl({ draft, path, min, max, step, unit, integer = tru
     // Follows the draft when it changes elsewhere (Cancel, Reset, Load latest), not while a typed value is pending.
     if (Number(text) !== value || text.trim() === "") setText(String(value))
   }, [value]) // eslint-disable-line react-hooks/exhaustive-deps
+  const local = draft.localErrors[path]
+  useEffect(() => {
+    // Cancel and Load latest clear the field's error without changing the value it never took: show that value again.
+    if (local === undefined && (Number(text.replace(",", ".")) !== value || text.trim() === "")) setText(String(value))
+  }, [local]) // eslint-disable-line react-hooks/exhaustive-deps
   const id = idOfPath(path)
   const invalid = draft.localErrors[path] !== undefined || errorsFor(draft.errors, path).length > 0
   const { setLocalError } = draft

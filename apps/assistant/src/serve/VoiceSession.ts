@@ -129,6 +129,8 @@ export interface VoiceSessionOptions {
   readonly maxPendingInputs?: number
   /** The conversation to start with (an id this device was given before its session existed): the answering assistant's. */
   readonly initialConversation?: { readonly id: string; readonly startedAt: number }
+  /** Ids the device's other assistants were given before the session existed (`conversation.read`), by assistant. */
+  readonly reservedConversations?: ReadonlyMap<string, { readonly id: string; readonly startedAt: number }>
   /** "Save what the assistant hears". */
   readonly heard: {
     readonly dir: string
@@ -282,14 +284,43 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
     const followUpOf = (assistant: string | undefined) => (assistant === undefined ? 0 : route.config().followUpMs?.[assistant] ?? 0)
     const longestFollowUp = () => Math.max(0, ...Object.values(route.config().followUpMs ?? {}))
     const armedMs = () => route.config().armedMs ?? WAKE_ARMED_MS
+    /** Who has the turn (an open armed or follow-up window, a reply playing), as `state.holder` last told the pages. */
+    const holderNow = (): string | null => route.window(now())?.assistant ?? null
+    let holderSent: string | null = null
     const tracker = makeStateTracker({
       onChange: (s) => {
-        options.send({ type: "state", ...s })
+        holderSent = holderNow()
+        options.send({ type: "state", ...s, holder: holderSent })
         options.onChange(true)
       },
       asleep: () => route.config().withoutPhrase === "nobody" && !route.awake(now())
     })
     yield* Effect.addFinalizer(() => Effect.sync(() => tracker.dispose()))
+    /** A window closes by time without the state changing (the device keeps listening): the same state, the new holder. */
+    const holderCheck = () => {
+      const holder = holderNow()
+      if (holder === holderSent) return
+      holderSent = holder
+      options.send({ type: "state", ...tracker.current(), holder })
+    }
+    const holderTimers = new Set<ReturnType<typeof setTimeout>>()
+    yield* Effect.addFinalizer(() =>
+      Effect.sync(() => {
+        for (const t of holderTimers) clearTimeout(t)
+      })
+    )
+    /** `tracker.wakeChanged`, and the same re-check for the holder. */
+    const wakeChanged = (recheckInMs?: number) => {
+      tracker.wakeChanged(recheckInMs)
+      holderCheck()
+      if (recheckInMs === undefined) return
+      const t = setTimeout(() => {
+        holderTimers.delete(t)
+        holderCheck()
+      }, recheckInMs + 10)
+      t.unref?.()
+      holderTimers.add(t)
+    }
 
     /** The voice key `assistant` speaks with in this session ("" when it has none: not in use, the engines not running). */
     const voiceNow = (assistant: string | undefined): string => {
@@ -340,7 +371,7 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
           tracker.playbackEnded(event.turnId, event.reason)
           gate.playbackEnded(now())
           if (assistant !== undefined) route.replyEnded(assistant, now())
-          tracker.wakeChanged(followUpOf(assistant))
+          wakeChanged(followUpOf(assistant))
           if (unsuppress !== undefined) clearTimeout(unsuppress)
           unsuppress = setTimeout(() => web.setSuppressed(false), ECHO_TAIL_MS)
           unsuppress.unref?.()
@@ -522,6 +553,7 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
       if (wp.mode === "typesafe" && wp.fallback !== null) return wp.fallback
       return settings.assistants[0]?.assistant
     }
+    for (const [assistant, info] of options.reservedConversations ?? []) reserved.set(assistant, info)
     // The device's reserved conversation (from before its session existed) is the answering assistant's.
     if (options.initialConversation !== undefined) reserved.set(answering() ?? "", options.initialConversation)
 
@@ -554,7 +586,7 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
           if (r.woke !== undefined) {
             if (r.woke.armed) armedPhrase.set(r.woke.assistant, r.woke.phrase)
             options.send({ type: "wake", phrase: r.woke.phrase, armed: r.woke.armed, assistantId: r.woke.assistant })
-            tracker.wakeChanged(r.woke.armed ? armedMs() : followUpOf(r.woke.assistant))
+            wakeChanged(r.woke.armed ? armedMs() : followUpOf(r.woke.assistant))
           }
           if (r.dropped !== undefined || (e._tag === "EndOfTurn" && r.events.length === 0)) dropped = true
           for (const passed of r.events) {
@@ -566,7 +598,7 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
               // An accepted utterance opens the follow-up window: the state may go back to asleep by itself.
               if (route.config().withoutPhrase === "nobody") {
                 const target = r.target
-                tracker.wakeChanged(followUpOf(target !== undefined && "assistant" in target ? target.assistant : undefined))
+                wakeChanged(followUpOf(target !== undefined && "assistant" in target ? target.assistant : undefined))
               }
             }
           }
@@ -692,7 +724,7 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
       routeKey = key
       // `configure` drops a held utterance: only when the routing part of the settings changed.
       route.configure(next)
-      tracker.wakeChanged(Math.max(longestFollowUp(), armedMs()))
+      wakeChanged(Math.max(longestFollowUp(), armedMs()))
     }
     syncProfile()
 
@@ -720,7 +752,11 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
         Effect.suspend(() => {
           const a = assistant ?? answering()
           const made = conversationOf(a)
-          if (made !== undefined) return made.newConversation
+          if (made !== undefined) {
+            // Its conversation stops the open utterance; the dispatcher must not hand the rest to another one.
+            dispatcher.cancelUtterance(a!)
+            return made.newConversation
+          }
           return Effect.sync(() => {
             const info = fresh()
             reserved.set(a ?? "", info)
