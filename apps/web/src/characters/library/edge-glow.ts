@@ -202,7 +202,8 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
     maskDs = ds
     maskCs = cs
   }
-  const cornerRadius = (cs: number): number => Math.min(CR0 * cs, Math.min(W, H) / 2 - 2)
+  // Never negative: a tiny canvas would make roundRect throw.
+  const cornerRadius = (cs: number): number => Math.max(0, Math.min(CR0 * cs, Math.min(W, H) / 2 - 2))
 
   return {
     resize(width, height, ratio) {
@@ -228,6 +229,11 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
     },
 
     frame(f) {
+      // A zero-size canvas has nothing to draw (and the work surface scale divides by W and H).
+      if (W < 1 || H < 1) {
+        clear2d(g, dpr)
+        return
+      }
       const dt = f.dt
       const p = f.palette
       const dark = p.dark
@@ -306,6 +312,11 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
       for (let i = 0; i < 24; i++) bands[i] = approach(bands[i]!, live ? v.bands[i]! : 0, dt, 0.07)
 
       // Pulses: inward from the border for you, outward to the border for the assistant.
+      if (reduced) {
+        // Pulses already in flight are cleared, not frozen or left moving (an idle position of 9 stays out of range).
+        pulsePos.fill(9)
+        pulseDir.fill(0)
+      }
       const hit = live && !reduced && v.onset > ONSET && prevOnset <= ONSET
       prevOnset = live ? v.onset : 0
       if (hit && pulsesOn) {
@@ -649,7 +660,7 @@ const falloffLut = (power: number): Uint8ClampedArray => {
 const character: Character = {
   id: "edge-glow",
   name: "Edge glow",
-  version: "1.1.0",
+  version: "1.1.1",
   contract: 1,
   family: "abstract",
   renderer: "2d",

@@ -149,3 +149,51 @@ describe("edge glow: direction marks under reduced motion", () => {
     expect(c.from[0], "speaking points out").toBeLessThan(c.corner[0])
   })
 })
+
+describe("edge glow: tiny canvases", () => {
+  it("never asks for a negative corner radius, even when a syllable starts on a 1 × 1 canvas, and draws nothing on a 0 × 0 one", async () => {
+    for (const size of [[1, 1], [0, 0], [3, 2]] as const) {
+      const r = new Runner(await fresh(), document.createElement("canvas"), {})
+      r.create()
+      r.resize(size[0], size[1], 1)
+      const voice = createVoiceFeatures()
+      voice.onset = 1
+      voice.speaking = true
+      recording.log = []
+      r.step({ mode: "hearing", dt: 0, user: voice, agent: createVoiceFeatures(), palette: PALETTES.dark, reducedMotion: false, pointer: { x: 0, y: 0, down: false, inside: false }, sinceInterrupt: Infinity })
+      const rects = recording.log.filter((c) => c.name === "roundRect")
+      recording.log = null
+      r.dispose()
+      for (const c of rects) expect(c.args[4] as number, `${size.join("×")}`).toBeGreaterThanOrEqual(0)
+      if (size[0] === 0) expect(rects.length).toBe(0)
+    }
+  })
+})
+
+describe("edge glow: reduced motion switched on mid-animation", () => {
+  it("clears the pulses already in flight instead of freezing or moving them", async () => {
+    for (const mode of ["hearing", "speaking"] as const) {
+      const r = new Runner(await fresh(), document.createElement("canvas"), {})
+      r.create()
+      r.resize(720, 240, 1)
+      const voice = createVoiceFeatures()
+      const step = (onset: number, reducedMotion: boolean): number => {
+        voice.onset = onset
+        voice.speaking = true
+        voice.level = 0.6
+        recording.log = []
+        r.step({ mode, dt: 1 / 60, user: voice, agent: voice, palette: PALETTES.dark, reducedMotion, pointer: { x: 0, y: 0, down: false, inside: false }, sinceInterrupt: Infinity })
+        const n = recording.log.filter((c) => c.name === "roundRect").length
+        recording.log = null
+        return n
+      }
+      for (let i = 0; i < 5; i++) step(0, false)
+      step(1, false) // a syllable starts a pulse
+      const moving = step(0, false)
+      expect(moving, `${mode}: a pulse is drawn`).toBeGreaterThan(2) // the clip and the border line are two
+      expect(step(0, true), `${mode}: reduced motion draws no pulse`).toBe(2)
+      expect(step(0, true), `${mode}: and none comes back`).toBe(2)
+      r.dispose()
+    }
+  })
+})
