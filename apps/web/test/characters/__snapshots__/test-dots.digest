@@ -1,0 +1,49 @@
+# test-dots 0.1.0: frame digests of a scripted conversation at default settings (docs/CHARACTERS.md §6.6).
+# A change here must be deliberate: check the look, then update with `pnpm --filter @pva/web exec vitest run test/characters -u`.
+dark  0.5 idle         18 e8b68d4d
+dark  1.0 listening    18 7d5235a6
+dark  1.5 listening    18 235950b1
+dark  2.0 hearing      18 7f3eb9fb
+dark  2.5 hearing      18 1bd6569c
+dark  3.0 hearing      18 a464c400
+dark  3.5 hearing      18 90b6ea4d
+dark  4.0 hearing      18 23cfa86f
+dark  4.5 hearing      18 d27335f1
+dark  5.0 thinking     18 4964455c
+dark  5.5 thinking     18 e5364beb
+dark  6.0 thinking     18 28180ec8
+dark  6.5 speaking     18 9ad6384e
+dark  7.0 speaking     18 24b74f35
+dark  7.5 speaking     18 2aa16ed2
+dark  8.0 speaking     18 49fd60b4
+dark  8.5 speaking     18 c33c61de
+dark  9.0 speaking     18 7b446425
+dark  9.5 listening    18 476b8429
+dark 10.0 listening    18 57a7ce79
+dark 10.5 idle         18 19cf93af
+dark 11.0 idle         18 c1766407
+light  0.5 idle         18 56d96dfd
+light  1.0 listening    18 78f78a2d
+light  1.5 listening    18 830cf352
+light  2.0 hearing      18 201e9fdc
+light  2.5 hearing      18 c53cd313
+light  3.0 hearing      18 e8a991df
+light  3.5 hearing      18 4d6beb12
+light  4.0 hearing      18 5c90eb78
+light  4.5 hearing      18 96167d96
+light  5.0 thinking     18 bc5df7ef
+light  5.5 thinking     18 6a6a00ec
+light  6.0 thinking     18 eaf2e6eb
+light  6.5 speaking     18 4be9aeb1
+light  7.0 speaking     18 ed41b952
+light  7.5 speaking     18 eb62cb15
+light  8.0 speaking     18 a24a6d0f
+light  8.5 speaking     18 e28ef9b5
+light  9.0 speaking     18 4cb798a2
+light  9.5 listening    18 56a6c1aa
+light 10.0 listening    18 90a08be6
+light 10.5 idle         18 213ef8ff
+light 11.0 idle         18 2fd73921
+overflow 160×140×1 0.0 px
+overflow 900×420×1 0.0 px
+overflow 720×240×2 0.0 px
