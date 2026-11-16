@@ -262,20 +262,26 @@ export const makeResourcePool = (options: ResourcePoolOptions): Effect.Effect<Re
         retiring: false,
         closed: false,
         service: Llm.of({
+          // Counted from the start, the wait for the build included: a turn waiting for its instance keeps it alive when
+          // the assistant is rebound or switched off meanwhile (it finishes with the instance it started with).
           stream: (request) =>
-            Stream.unwrap(Effect.map(Deferred.await(settled), () => {
-              const inner = entry.inner
-              if (inner === undefined) {
-                return Stream.fail(new LlmError({ message: entry.problem ?? "The language model could not start." }))
-              }
-              return Stream.suspend(() => {
-                entry.inFlight++
-                return inner.stream(request)
-              }).pipe(Stream.ensuring(Effect.sync(() => {
-                entry.inFlight--
-                closeWhenIdle(entry)
-              })))
-            }))
+            Stream.suspend(() => {
+              entry.inFlight++
+              return Stream.unwrap(Effect.map(Deferred.await(settled), () => {
+                const inner = entry.inner
+                if (inner === undefined) {
+                  return Stream.fail(new LlmError({ message: entry.problem ?? "The language model could not start." }))
+                }
+                // Released before this stream started (nothing kept it): its instance is shut down.
+                if (entry.closed) {
+                  return Stream.fail(new LlmError({ message: "The language model was released before the turn started." }))
+                }
+                return Stream.suspend(() => inner.stream(request))
+              }))
+            }).pipe(Stream.ensuring(Effect.sync(() => {
+              entry.inFlight--
+              closeWhenIdle(entry)
+            })))
         })
       }
       return entry
