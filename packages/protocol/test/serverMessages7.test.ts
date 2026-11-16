@@ -191,3 +191,22 @@ describe("version 7 handling", () => {
     expect(decodeServerMessage(welcome({ ...exampleSnapshot, conversations: [{ ...conversations[0], turns: -1 }] }))).toMatchObject({ _tag: "Invalid", messageType: "welcome" })
   })
 })
+
+// PR #35 review 6, finding 2: `wake.heard` says where it was heard, so the admin tester need not guess.
+describe("wake.heard source", () => {
+  it("carries the device and the matched phrase's assistant, and decodes without them from an older server", () => {
+    const message = { type: "wake.heard", text: "hey jeff", matched: "hey jeff", accepted: true, source: { deviceId: exampleDevice.id, assistantId: "jeff" }, at: 1 }
+    expect(decodeServerMessage(JSON.stringify(message))).toEqual({ _tag: "Ok", message })
+    const nobody = { type: "wake.heard", text: "the tomatoes", accepted: false, source: { deviceId: exampleDevice.id }, at: 2 }
+    expect(decodeServerMessage(JSON.stringify(nobody))).toEqual({ _tag: "Ok", message: nobody })
+    const old = { type: "wake.heard", text: "hey jeff", matched: "hey jeff", accepted: true, at: 3 }
+    expect(decodeServerMessage(JSON.stringify(old))).toEqual({ _tag: "Ok", message: old })
+    expect(serverExamples["wake.heard"]).toMatchObject({ source: { deviceId: exampleDevice.id, assistantId: "jeff" } })
+  })
+  it("refuses a source whose ids are not ids", () => {
+    for (const source of [{ deviceId: "x" }, { assistantId: "Not An Id" }, { assistantId: "typesafe" }]) {
+      const text = JSON.stringify({ type: "wake.heard", text: "t", source, at: 1 })
+      expect(decodeServerMessage(text), JSON.stringify(source)).toMatchObject({ _tag: "Invalid", messageType: "wake.heard" })
+    }
+  })
+})
