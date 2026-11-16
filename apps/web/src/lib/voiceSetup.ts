@@ -206,16 +206,17 @@ export const profileFromSetup = (device: DeviceProfile | undefined, setup: Devic
 type Snap = Pick<Snapshot, "history" | "conversation" | "setup" | "conversations">
 
 /**
- * The part of the state a `welcome` sets: the setup, the conversations (the answering assistant's is the one the
- * snapshot's history belongs to; the others are read when the chat shows them) and no holder.
+ * The part of the state a `welcome` sets: the setup, the conversations (the snapshot's history is the answering
+ * assistant's, `snapshot.answering` when the server says, which may be a follow-up holder; the others are read when the
+ * chat shows them) and the holder (that follow-up holder, else nobody).
  */
 export const atWelcome = (
   previous: ClientState,
-  snapshot: Snap,
+  snapshot: Snap & Pick<Snapshot, "answering">,
   toTurns: (history: ReadonlyArray<HistoryItem>) => ReadonlyArray<TurnView>
 ): Pick<ClientState, "setup" | "holder" | "conversations" | "turns"> => {
   const setup = snapshot.setup
-  const probe = { setup, holder: undefined, ui: previous.ui } as unknown as ClientState
+  const probe = { setup, holder: snapshot.answering, ui: previous.ui } as unknown as ClientState
   const answering = answeringId(probe) ?? ""
   const list = snapshot.conversations ?? [{ assistantId: answering, id: snapshot.conversation.id, startedAt: snapshot.conversation.startedAt, turns: snapshot.history.length }]
   const conversations: Record<string, ConversationView> = {}
@@ -232,7 +233,8 @@ export const atWelcome = (
     }
   }
   const turns = toTurns(snapshot.history).map((t) => ({ ...t, assistantId: answering }))
-  return { setup, holder: undefined, conversations, turns }
+  // The history's assistant has the turn when it is not the one that answers anyway (a follow-up window is open).
+  return { setup, holder: answering === answeringId({ ...probe, holder: undefined }) ? undefined : holderOf(probe), conversations, turns }
 }
 
 /** `device.setup`: the new setup; the holder is dropped when it left the device or the pick changed who answers. */
@@ -273,14 +275,14 @@ export const onHistory = (
   const key = m.assistantId
   // A turn that is running on this page is the page's own view of the history's last message (a user message the server
   // has noted but not answered yet): the turn stays, the message goes, so the exchange is not shown twice.
-  // A running turn whose exchange the history already holds, answered, is dropped instead.
+  // Every other running turn stays too: the server commits an exchange when its turn ends, and equal text does not
+  // say that an exchange of the history is this turn (the same question may have been asked before).
   const mine = (t: TurnView) => (t.assistantId ?? answeringId(s) ?? "") === key && t.turnId !== undefined && t.outcome === undefined
   const last = m.history.at(-1)
-  const lastUser = [...m.history].reverse().find((h) => h.role === "user")?.text
   const open = last !== undefined && last.role === "user" ? s.turns.find((t) => mine(t) && t.userText === last.text) : undefined
   const items = open === undefined ? m.history : m.history.slice(0, -1)
   const fromHistory = toTurns(items).map((t) => ({ ...t, key: `${key}:${t.key}`, assistantId: key }))
-  const running = s.turns.filter((t) => mine(t) && (t === open || t.userText !== lastUser))
+  const running = s.turns.filter(mine)
   const others = withoutAssistant(s, key)
   const before = s.conversations[key]
   const info: ConversationInfo = { id: m.id, startedAt: before?.startedAt ?? Date.now() }

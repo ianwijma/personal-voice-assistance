@@ -140,6 +140,11 @@ export interface SessionDispatcher<C extends DispatchTarget> {
    * over. `accepted` unless every conversation asked answered otherwise.
    */
   readonly stop: (assistant?: string) => SendOutcome
+  /**
+   * A new conversation with `assistant` (which stops that conversation's open utterance itself): the rest of the
+   * open utterance, if `assistant` has it, is not handed over, as after Stop.
+   */
+  readonly cancelUtterance: (assistant: string) => void
   readonly get: (assistant: string) => C | undefined
   /** The conversations made so far, by assistant. */
   readonly conversations: () => ReadonlyMap<string, C>
@@ -451,6 +456,9 @@ export const makeSessionDispatcher = <C extends DispatchTarget>(
       if (u !== undefined && (assistant === undefined || u.delivered === assistant)) u.stopped = true
       const outcomes = chosen.map((book) => book.target!.send(interrupt))
       return outcomes.length === 0 || outcomes.includes("accepted") ? "accepted" : outcomes[0]!
+    },
+    cancelUtterance: (assistant) => {
+      if (open !== undefined && open.delivered === assistant) open.stopped = true
     },
     get: (assistant) => made.get(assistant),
     conversations: () => made,
