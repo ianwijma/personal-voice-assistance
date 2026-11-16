@@ -476,6 +476,8 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
         runSync(Effect.asVoid(Effect.forkDetach(syncResources(), { startImmediately: true })))
         return resources.llmFor(assistantId)
       }
+      /** Completes once the assistant's voice is built (its sample rate is final): `TurnSetup.ttsReady`. */
+      const ttsReady = resources.ttsReady(assistantId)
       /** Likewise the assistant's voice: the pool's instance for its `voice`, read at the turn's start. */
       const ttsNow = () => {
         const bound = resources.ttsFor(assistantId)
@@ -500,18 +502,15 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
             home,
             llm,
             tts,
-            setup: { system: systemFor(base, instructions), registry: mine.registry, llm: llm ?? notInUse, tts: tts ?? noVoice },
+            setup: { system: systemFor(base, instructions), registry: mine.registry, llm: llm ?? notInUse, tts: tts ?? noVoice, ...(tts !== undefined ? { ttsReady } : {}) },
             instructions
           }
         }
         return cached
       }
-      // A voice still being built (the assistant came into use just now) is waited for: its sample rate is read when
-      // the turn starts to play. An already bound voice that is being replaced is answered by the old one meanwhile.
-      const setup = Effect.suspend((): Effect.Effect<TurnSetup> => {
-        const now = current()
-        return now.tts === undefined ? Effect.succeed(now.setup) : Effect.map(resources.ttsReady(assistantId), () => current().setup)
-      })
+      // The setup never waits (the conversation's input loop reads it, so Stop and barge-in would wait too): a spoken
+      // turn waits for a voice still being built (the assistant came into use just now) itself, before it plays.
+      const setup = Effect.sync((): TurnSetup => current().setup)
       // A Claude subscription assistant: the agent module answers; the pool's instance is the offline stand-in.
       let subscription: { readonly fallback: Llm["Service"]; readonly toAgents: (setup: TurnSetup) => AgentTurnSetup } | undefined
       const agentSetup = () => {
