@@ -120,8 +120,6 @@ const visorPath = (g: CanvasRenderingContext2D, cx: number, cy: number, a: numbe
 
 const create = (canvas: HTMLCanvasElement): CharacterInstance => {
   let g = setup2d(canvas)
-  let W = 1
-  let H = 1
   let dpr = 1
   const mix = new ModeMix()
   const seed = instanceSeed(5)
@@ -156,13 +154,14 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
 
   return {
     resize(width, height, ratio) {
-      W = width
-      H = height
       dpr = ratio
       g = setup2d(canvas, dpr)
     },
 
     frame(f: Frame) {
+      const fo = f.focus
+      const W = fo.width
+      const H = fo.height
       const dt = f.dt
       const P = f.palette
       const reduced = f.reducedMotion
@@ -189,7 +188,7 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
       const cy = H / 2
 
       // Gaze.
-      youDirection(f, cx, cy, s * 2.4, you, pers.followsPointer)
+      youDirection(f, fo.x + cx, fo.y + cy, s * 2.4, you, pers.followsPointer)
       const side = S.thinkSide
       let gx = you.x
       const reg01 = remap(S.regard, 0.15, 0.82, 0, 1)
@@ -283,7 +282,7 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
       // path is inset by half that stroke so the size stays true.
       const round = Math.max(2, 0.1 * s)
 
-      clear2d(g, dpr)
+      clear2d(g, dpr, fo) // the whole stage; (0, 0) is the box's corner, the glow is no longer cut
       g.translate(xc, yc)
       g.rotate(tiltS)
       const glow = P.dark && !reduced
@@ -388,7 +387,7 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
 const design: Character = {
   id: "robot-eyes",
   name: "Robot eyes",
-  version: "1.0.0",
+  version: "1.1.0",
   contract: 1,
   family: "figure",
   summary: "Two solid rounded eyes and nothing else: they doze, perk up, follow you, dart while thinking and squint happily as they talk; a rim light says whose voice it is.",
@@ -431,6 +430,7 @@ const design: Character = {
     { ext: "reply.expression", gain: "Chooses between a handful of distinct eye poses for speaking (question, apology, good news).", without: "One pleasant squint." }
   ],
   renderer: "2d",
+  canvas: "stage",
   options: [
     sizeOption(0.5, 1.25),
     {

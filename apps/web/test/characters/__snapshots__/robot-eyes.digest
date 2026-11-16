@@ -1,4 +1,4 @@
-# robot-eyes 1.0.0: frame digests of a scripted conversation at default settings (docs/CHARACTERS.md §6.6).
+# robot-eyes 1.1.0: frame digests of a scripted conversation at default settings (docs/CHARACTERS.md §6.6).
 # A change here must be deliberate: check the look, then update with `pnpm --filter @pva/web exec vitest run test/characters -u`.
 dark  0.5 idle        102 6293220e
 dark  1.0 listening   102 d9a6d5fb
@@ -47,3 +47,26 @@ light 11.0 idle        196 09794691
 overflow 160×140×1 0.0 px
 overflow 900×420×1 0.0 px
 overflow 720×240×2 0.0 px
+stage  0.5 idle        102 3287be8e
+stage  1.0 listening   102 7f4c747b
+stage  1.5 listening   196 da8e4525
+stage  2.0 hearing     196 c91645ea
+stage  2.5 hearing     196 4e30ee44
+stage  3.0 hearing     196 d23aece9
+stage  3.5 hearing     196 a664dd24
+stage  4.0 hearing     196 ed6b3f92
+stage  4.5 hearing     196 c176e367
+stage  5.0 thinking    196 f9cc33e4
+stage  5.5 thinking    196 b2beff88
+stage  6.0 thinking    196 a6efeb11
+stage  6.5 speaking    196 ef767a07
+stage  7.0 speaking    196 092f81e0
+stage  7.5 speaking    196 32f47acf
+stage  8.0 speaking    196 6258cda1
+stage  8.5 speaking    196 9db16d3d
+stage  9.0 speaking    196 b993bfc3
+stage  9.5 listening   196 50b6073c
+stage 10.0 listening   196 ff764076
+stage 10.5 idle        196 7f7e53b9
+stage 11.0 idle        196 7fc15953
+stage 1280×800×1 focus 720×240 at 280,200: solid drawing x 541.7..771.0, y 259.0..370.6
