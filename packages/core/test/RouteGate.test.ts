@@ -421,6 +421,27 @@ describe("RouteGate: armed by the phrase alone", () => {
     assert.deepStrictEqual(feed(gate, [speechStarted, endOfTurn("ten minutes")], 1_000), [speechStarted, endOfTurn("ten minutes")])
   })
 
+  it("an armed assistant removed from the device by configure does not answer the next sentence", () => {
+    const gate = makeRouteGate(two({ withoutPhrase: "assistant", defaultAssistant: "jeff" }))
+    feed(gate, [speechStarted, endOfTurn("hey tee three")], 0)
+    assert.deepStrictEqual(gate.window(10), { assistant: "t3", by: "armed" })
+    const withoutT3 = two({ withoutPhrase: "assistant", defaultAssistant: "jeff" })
+    gate.configure({
+      ...withoutT3,
+      phrases: withoutT3.phrases.filter((p) => p.assistant !== "t3"),
+      followUpMs: { jeff: 5_000, keuken: 5_000 }
+    })
+    assert.isUndefined(gate.window(20))
+    assert.deepStrictEqual(gate.filter(speechStarted, 100).target, { assistant: "jeff", by: "default" })
+  })
+
+  it("an armed window survives configure while its assistant is still on the device", () => {
+    const gate = makeRouteGate(two())
+    feed(gate, [speechStarted, endOfTurn("hey tee three")], 0)
+    gate.configure(two({ match: "exact" }))
+    assert.deepStrictEqual(gate.filter(speechStarted, 100).target, { assistant: "t3", by: "armed" })
+  })
+
   it("an armed window beats an open follow-up window of another assistant", () => {
     const gate = makeRouteGate(two())
     gate.replyEnded("jeff", 0)

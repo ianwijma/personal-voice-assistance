@@ -114,6 +114,11 @@ export interface SessionDispatcher<C extends DispatchTarget> {
    * over. `accepted` unless every conversation asked answered otherwise.
    */
   readonly stop: (assistant?: string) => SendOutcome
+  /**
+   * A new conversation with `assistant` (which stops that conversation's open utterance itself): the rest of the
+   * open utterance, if `assistant` has it, is not handed over, as after Stop.
+   */
+  readonly cancelUtterance: (assistant: string) => void
   readonly get: (assistant: string) => C | undefined
   /** The conversations made so far, by assistant. */
   readonly conversations: () => ReadonlyMap<string, C>
@@ -315,6 +320,7 @@ export const makeSessionDispatcher = <C extends DispatchTarget>(
       u.delivered = undefined
       if (to === null) return
       const book = yield* ensure(to)
+      if (u.stopped) return
       push(book, speechStarted)
       u.delivered = to
       if (route !== undefined) routes.set(to, route)
@@ -354,6 +360,7 @@ export const makeSessionDispatcher = <C extends DispatchTarget>(
         const to = o?.assistant ?? assistantOf(target)
         if (to === undefined) return
         const book = yield* ensure(to)
+        if (next.stopped) return
         push(book, speechStarted)
         next.delivered = to
         routes.set(to, assistantOf(target) === to ? (target as DispatchRoute) : { by: "barge-in", assistant: to })
@@ -368,7 +375,8 @@ export const makeSessionDispatcher = <C extends DispatchTarget>(
       }
       if (event._tag !== "TurnResumed" && !u.stopped) {
         const where = yield* resolve(event, target, u)
-        if (where !== KEEP) {
+        // Stop may come while the decision is awaited: a stopped utterance opens nowhere new.
+        if (where !== KEEP && !u.stopped) {
           if (where.to !== (u.delivered ?? null)) yield* handOver(u, where.to, where.route)
           else if (where.to !== null && where.route !== undefined) routes.set(where.to, where.route)
         }
@@ -404,6 +412,9 @@ export const makeSessionDispatcher = <C extends DispatchTarget>(
       if (u !== undefined && (assistant === undefined || u.delivered === assistant)) u.stopped = true
       const outcomes = chosen.map((book) => book.target!.send(interrupt))
       return outcomes.length === 0 || outcomes.includes("accepted") ? "accepted" : outcomes[0]!
+    },
+    cancelUtterance: (assistant) => {
+      if (open !== undefined && open.delivered === assistant) open.stopped = true
     },
     get: (assistant) => made.get(assistant),
     conversations: () => made,

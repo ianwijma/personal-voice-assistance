@@ -586,7 +586,11 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
         Effect.suspend(() => {
           const a = assistant ?? answering()
           const made = conversationOf(a)
-          if (made !== undefined) return made.newConversation
+          if (made !== undefined) {
+            // Its conversation stops the open utterance; the dispatcher must not hand the rest to another one.
+            dispatcher.cancelUtterance(a!)
+            return made.newConversation
+          }
           return Effect.sync(() => {
             const info = fresh()
             reserved.set(a ?? "", info)
