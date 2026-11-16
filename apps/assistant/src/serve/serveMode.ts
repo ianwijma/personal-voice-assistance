@@ -20,9 +20,7 @@ import {
   voiceKey
 } from "@pva/core"
 import {
-  applicableOwn,
   type Assistant,
-  DEFAULT_CONVERSATION_IDLE_MINUTES,
   DEFAULT_MAX_VOICE_SESSIONS,
   DEFAULT_SESSION_DISCARD_MINUTES,
   type DeviceSettings,
@@ -36,7 +34,6 @@ import {
   type VoiceInfo,
   type ServerMessage,
   type TraceConfig,
-  WEB_VOICE_DEVICE_TYPE,
   WEB_VOICE_KIND
 } from "@pva/protocol"
 import { Cause, Config, ConfigProvider, Effect, Exit, Fiber, FiberSet, Option, type Scope, Stream } from "effect"
@@ -108,7 +105,7 @@ import { makeApi } from "./api.ts"
 import { makeAssistantVoice } from "./AssistantVoice.ts"
 import { type Favourites, makeFavourites } from "./Favourites.ts"
 import { makeVoiceCatalog, type VoiceCatalog, type VoiceCatalogOptions } from "./VoiceCatalog.ts"
-import { type AssistantTraceConfig, type Hearing, makeVoiceSession, type VoiceSession } from "./VoiceSession.ts"
+import { type AssistantTraceConfig, type Hearing, makeVoiceSession } from "./VoiceSession.ts"
 import { makeVoiceSessions, type VoiceSessions } from "./VoiceSessions.ts"
 import { makeRoutingService, ROUTING_KEYS } from "./routing.ts"
 import { type KdfParams, openVault, type Vault, VaultPathConfig } from "./Vault.ts"
@@ -346,13 +343,6 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     // Late-bound: the hub needs the engine and the sessions, and their callbacks need the hub.
     let hub: SessionHub | undefined
     let lastSummary: string | undefined
-    /**
-     * The voice of the engine status (kept while a rebuild fails; empty before the first build). A device profile's
-     * `voice` other than it falls back to "" (the assistant's voice): per-device voices are retired
-     * (docs/VOICE-PROVIDERS.md §1).
-     */
-    const enabledVoices = (): ReadonlySet<string> =>
-      new Set((engine?.status().voices ?? []).filter((v) => v.enabled).map((v) => v.name))
     let engine: Engine | undefined
     let modelsRef: Models | undefined
     const broadcast = (message: ServerMessage) => hub?.broadcast(message)

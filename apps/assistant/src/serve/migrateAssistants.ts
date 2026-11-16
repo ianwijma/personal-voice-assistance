@@ -13,17 +13,13 @@ import {
   type DeviceRecord,
   type DeviceSettings,
   deviceTypeOf,
-  effectiveDeviceSettings,
   effectiveProfile,
-  FOLLOW_UP_SECONDS_MAX,
-  hearerOf,
   type LlmAccountId,
   type ModuleChoice,
   PROFILE_FIELDS,
   type ProfileField,
   type ProfileOverrides,
   type QuietSpell,
-  WAKE_PHRASES_MAX,
   WEB_VOICE_KIND
 } from "@pva/protocol"
 import * as SherpaStt from "@pva/stt-sherpa"
@@ -148,8 +144,6 @@ export const quietSpellOf = (minutes: unknown): QuietSpell => {
   const n = clampInt(minutes, 0, 1440, DEFAULT_CONVERSATION_IDLE_MINUTES)
   return n === 0 ? "never" : n
 }
-/** The quiet spell as today's `conversationIdleMinutes` (0..240; "never" = 0). */
-const idleMinutesOf = (spell: QuietSpell): number => (spell === "never" ? 0 : Math.min(CONVERSATION_IDLE_MINUTES_LIMITS.max, spell))
 
 const accountOf = (provider: unknown): LlmAccountId =>
   provider === "anthropic" ? "anthropic" : provider === "claude-subscription" ? "claude-subscription" : "offline"
@@ -170,7 +164,6 @@ export const setPath = <A>(value: A, path: string, next: unknown): A => {
   return { ...record, [head!]: rest.length === 0 ? next : setPath(record[head!] ?? {}, rest.join("."), next) } as A
 }
 
-const sameJson = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b)
 
 // -- The assistant settings' fields ----------------------------------------------------------------------------------
 

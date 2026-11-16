@@ -1,7 +1,6 @@
 import { Schema } from "effect"
 import {
   AssistantState,
-  ErrorCode,
   ErrorInfo,
   ModuleId,
   NonNegativeFinite,
