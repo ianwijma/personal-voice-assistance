@@ -5,6 +5,7 @@ import { blankAssistantBody, copyName, targetKey, targetName, toBody } from "@/l
 import { useClient, useClientState } from "../../../context.tsx"
 import { inputClass } from "../../../fields/types.ts"
 import { Dialog, DialogButtons } from "./parts.tsx"
+import { MAX_ASSIGNMENTS, WAKE_PHRASE_CHARS_MAX, WAKE_PHRASE_WORDS_MAX, wakeWords } from "@pva/protocol"
 
 /** The dialogs of the assistant pages: delete (names the devices), duplicate, new, and "Add to a device…". */
 
@@ -149,6 +150,22 @@ const listOf = (t: DeviceTarget, devices: ReadonlyArray<DeviceListInfo>, types: 
   return type === undefined ? undefined : { list: type.settings.assistants, rev: type.rev }
 }
 
+/**
+ * What the protocol would refuse in "Add to a device…" before it is sent (the request would throw): a phrase without
+ * words or too long, or a list that is full. `undefined`: it can be sent.
+ */
+export const addToDeviceProblem = (phrase: string, list: ReadonlyArray<Assignment>, place: string): string | undefined => {
+  const text = phrase.trim()
+  if (text !== "") {
+    const words = wakeWords(text).length
+    if (words === 0) return "A wake phrase needs at least one word. Leave it empty to add it without one."
+    if (words > WAKE_PHRASE_WORDS_MAX) return `Use at most ${WAKE_PHRASE_WORDS_MAX} words.`
+    if (text.length > WAKE_PHRASE_CHARS_MAX) return `Use at most ${WAKE_PHRASE_CHARS_MAX} characters.`
+  }
+  if (list.length >= MAX_ASSIGNMENTS) return `${place} has ${MAX_ASSIGNMENTS} assistants already, the most it can have. Take one off first.`
+  return undefined
+}
+
 /** "Add to a device…": appends the assistant to a device's (or a type's defaults) list with one phrase, through `device.save`. */
 export function AddToDeviceDialog({ info, onClose }: { readonly info: AssistantInfo; readonly onClose: () => void }) {
   const client = useClient()
@@ -168,6 +185,12 @@ export function AddToDeviceDialog({ info, onClose }: { readonly info: AssistantI
     if (target === undefined) return
     const current = listOf(target, devices, types)
     if (current === undefined) return
+    const problem = addToDeviceProblem(phrase, current.list, targetName(target, devices, types))
+    if (problem !== undefined) {
+      setAnyway(false)
+      setMessage(problem)
+      return
+    }
     setBusy(true)
     setMessage(undefined)
     const added: Assignment = { assistant: info.id, phrases: phrase.trim() === "" ? [] : [phrase.trim()] }
@@ -184,6 +207,10 @@ export function AddToDeviceDialog({ info, onClose }: { readonly info: AssistantI
           setAnyway(true)
           setMessage(o.message)
         } else setMessage(o.kind === "invalid" ? o.fieldErrors.map((e) => e.message).join(" ") : o.message)
+      }, () => {
+        // The request itself failed (it could not be sent): the dialog is usable again.
+        setBusy(false)
+        setMessage("Could not add it. Try again.")
       })
   }
   return (
