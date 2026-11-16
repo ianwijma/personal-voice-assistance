@@ -1,7 +1,7 @@
 // The resource pool's sharing, release and eviction rules and its error paths (docs/ASSISTANTS.md §3.2, WP-9),
 // beyond what resources.test.ts covers: shared instances outliving one user, going back to an old configuration,
 // failed and never-used instances released at once, defects in a builder, the pool's own shutdown, `onChange`.
-import { Llm, type LlmEvent, LlmError } from "@pva/core"
+import { type AgentEvent, type AgentTurnInput, Llm, type LlmEvent, LlmError, makeModelAgent, type ToolRegistry } from "@pva/core"
 import type { AssistantLlm } from "@pva/protocol"
 import { Deferred, Effect, Exit, Fiber, Scope, Stream } from "effect"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
@@ -275,6 +275,114 @@ describe("resource pool: a turn waiting for its instance to load", () => {
     const answering = ask(llm)
     await expect(answering).rejects.toBeInstanceOf(LlmError)
     await expect(answering).rejects.toMatchObject({ message: "The language model was released before the turn started." })
+  })
+})
+
+describe("resource pool: a turn's whole tool loop holds its instance", () => {
+  /**
+   * Instances like the real adapters' (shut down once their scope closes). On "a", the first model call of a turn says
+   * "a#n round 1", waits for `firstRoundEnds` and ends in a tool call; the next call says "a#n round 2" and ends.
+   */
+  const toolLoopPool = async () => {
+    const firstRoundEnds = Deferred.makeUnsafe<void>()
+    const released: Array<string> = []
+    const calls: Array<string> = []
+    let builds = 0
+    const build: LlmBuilder = (s) =>
+      Effect.gen(function*() {
+        const name = `${s.model}#${++builds}`
+        let shut = false
+        yield* Effect.addFinalizer(() =>
+          Effect.sync(() => {
+            shut = true
+            released.push(name)
+          })
+        )
+        return Llm.of({
+          stream: (request) =>
+            Stream.suspend((): Stream.Stream<LlmEvent, LlmError> => {
+              if (shut) return Stream.fail(new LlmError({ message: "instance is shut down" }))
+              calls.push(name)
+              const second = request.messages.some((m) => m.role === "tool")
+              if (second) return Stream.make<Array<LlmEvent>>({ _tag: "TextDelta", text: `${name} round 2` }, { _tag: "Done", stopReason: "end" })
+              return Stream.make<Array<LlmEvent>>({ _tag: "TextDelta", text: `${name} round 1` }).pipe(
+                Stream.concat(Stream.fromEffectDrain(Deferred.await(firstRoundEnds))),
+                Stream.concat(Stream.make<Array<LlmEvent>>({ _tag: "ToolCall", id: "t1", name: "look", input: {} }, { _tag: "Done", stopReason: "tool_use" }))
+              )
+            })
+        })
+      })
+    const pool = await makePool({ buildLlm: build, graceMs: 10_000 })
+    await run(pool.reconcile(wanted({ x: spec("a") })))
+    return { pool, firstRoundEnds, released, calls }
+  }
+  const tools: ToolRegistry["Service"] = {
+    specs: [{ name: "look", description: "Looks.", inputSchema: { type: "object" } }],
+    isSpeculative: () => true,
+    run: (call) => Effect.succeed({ id: call.id, name: call.name, content: "seen", isError: false }),
+    context: Effect.succeed("")
+  }
+  /** A turn of the model agent on `llm` (the agent `Conversation` builds over a turn's `TurnSetup.llm`). */
+  const turnOn = (llm: Llm["Service"]) =>
+    Effect.runFork(Stream.runCollect(makeModelAgent({ llm }).turn({
+      system: "",
+      context: undefined,
+      history: [],
+      text: "hi",
+      tools,
+      promoted: Effect.void,
+      mark: () => {},
+      trace: { tools: [] },
+      maxToolRounds: 3
+    } as unknown as AgentTurnInput)).pipe(
+      Effect.map((events: ReadonlyArray<AgentEvent>) => events.flatMap((e) => (e._tag === "TextDelta" ? [e.text] : [])).join(""))
+    ))
+  const aListed = (pool: ResourcePool) => pool.status().some((r) => r.key === llmKeyOf(spec("a")))
+
+  it("the binding goes mid-stream, the grace period passes, the stream ends in a tool call: the next round runs on the original instance", async () => {
+    const { pool, firstRoundEnds, released, calls } = await toolLoopPool()
+    const turn = turnOn(pool.llmFor("x")!)
+    await advance(10)
+    expect(calls).toEqual(["a#1"])
+    // The assistant changes model while a's first round is streaming: a loses its last binding.
+    await run(pool.reconcile(wanted({ x: spec("b") })))
+    expect(pool.keyFor("x")).toBe(llmKeyOf(spec("b")))
+    // The response goes on past the grace period: a is kept for the running turn.
+    await advance(15_000)
+    expect(released).toEqual([])
+    expect(aListed(pool)).toBe(true)
+    // It ends in a tool call; the tool runs and the next round starts on a, which is still there.
+    Deferred.doneUnsafe(firstRoundEnds, Exit.void)
+    expect(await run(Fiber.join(turn))).toBe("a#1 round 1\na#1 round 2")
+    expect(calls).toEqual(["a#1", "a#1"])
+  })
+
+  it("once that turn has ended, its instance is closed (the grace period having passed while it ran)", async () => {
+    const { pool, firstRoundEnds, released } = await toolLoopPool()
+    const turn = turnOn(pool.llmFor("x")!)
+    await advance(10)
+    await run(pool.reconcile(wanted({ x: spec("b") })))
+    await advance(15_000)
+    Deferred.doneUnsafe(firstRoundEnds, Exit.void)
+    await run(Fiber.join(turn))
+    await advance(10)
+    expect(released).toEqual(["a#1"])
+    expect(aListed(pool)).toBe(false)
+    // The new binding answers.
+    expect(await ask(pool.llmFor("x"))).toBe("b#2 round 1")
+  })
+
+  it("a turn interrupted while it runs lets go of its instance: closed once nobody uses it", async () => {
+    const { pool, released } = await toolLoopPool()
+    const turn = turnOn(pool.llmFor("x")!)
+    await advance(10)
+    await run(pool.reconcile(wanted({ x: spec("b") })))
+    await advance(15_000)
+    expect(released).toEqual([])
+    await run(Fiber.interrupt(turn))
+    await advance(10)
+    expect(released).toEqual(["a#1"])
+    expect(aListed(pool)).toBe(false)
   })
 })
 
