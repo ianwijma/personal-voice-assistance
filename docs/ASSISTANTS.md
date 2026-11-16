@@ -603,12 +603,15 @@ DeviceSetup = { type: "device.setup", deviceId?,
 TurnStart       += { assistantId }      // also assistant.text, reply.start: assistantId
 Conversation    += { assistantId }      // conversation { id, reason, startedAt, assistantId }
 Wake            += { assistantId }
-State           += { holder?: AssistantId | null }   // who has the turn (open armed / follow-up window, reply playing);
-                                        // sent again with the same state when a window closes while listening
+State           += { holder?: AssistantId | null }   // who has the turn: the turn in flight or the utterance being
+                                        // heard, else an open armed / follow-up window, else null (nobody); sent again
+                                        // with the same state when only it changes. The page shows it, never guesses.
+                                        // An accepted device.pick closes the windows (the picked one answers next).
 Snapshot.conversations = Array<{ assistantId, id, startedAt, turns: number }>   // replaces snapshot.conversation
 Snapshot.history       = the history of the answering assistant (the follow-up holder, else withoutPhrase's, else
                          the first); the others are fetched on demand:
 Snapshot.answering     = that assistant (the page files `history` under it)
+Snapshot.holder        = who has the turn now, as State.holder (may be an armed assistant whose history it is not)
 ConversationHistory = { type: "conversation.history", requestId, assistantId, id, history: HistoryItem[] }
 
 // voice → server
