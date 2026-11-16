@@ -56,7 +56,9 @@ const settings = {
     label: "Devices to control",
     description: "This version controls lights only.",
     default: ["light"],
-    options: [{ value: "light", label: "Lights" }]
+    options: [{ value: "light", label: "Lights" }],
+    // An assistant may control fewer kinds of devices than the others (docs/ASSISTANTS.md §4.1).
+    overridable: true
   }),
   aliases: Setting.text({
     label: "Other names",

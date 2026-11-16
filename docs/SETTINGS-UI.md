@@ -248,9 +248,10 @@ not in the UI unless stated); *drop* = remove.
 
 | Variable | What | Default | Read by | UI today | Verdict |
 |---|---|---|---|---|---|
-| `CLOCK_TIME_ZONE` | IANA zone | the machine's | `modules-builtin/src/clock.ts:117` | yes | **UI** → Modules › Clock |
-| `WEATHER_DEFAULT_PLACE`, `WEATHER_UNITS` | Place, units | —, `celsius` | `weather.ts:230,235` | yes | **UI** → Modules › Weather |
-| `HOME_ASSISTANT_URL`, `HOME_ASSISTANT_TOKEN` | HA address, token | — | `module-home-assistant/src/module.ts:43,51` | not in the catalog yet | **UI**, token in the vault → Modules › Home Assistant |
+| `CLOCK_TIME_ZONE` | IANA zone | Home's time zone (WP-12a), else the machine's | `modules-builtin/src/clock.ts` | yes | **UI** → Modules › Clock |
+| `WEATHER_DEFAULT_PLACE`, `WEATHER_UNITS` | Place, units | Home's location and units (WP-12a) | `weather.ts` | yes | **UI** → Modules › Weather |
+| `HOME_ASSISTANT_URL`, `HOME_ASSISTANT_TOKEN` | HA address, token | — | `module-home-assistant/src/module.ts:43,51` | in the catalog since WP-12c | **UI**, token in the vault → Modules › Home Assistant |
+| `HOME_LOCATION`, `HOME_TIME_ZONE`, `HOME_LANGUAGE`, `HOME_UNITS`, `HOME_DATE_FORMAT` | Home (docs/ASSISTANTS.md §2.4) | —, the machine's, `en-GB`, `metric`, `en-GB` | section `home` (`sectionDefinitions.ts`); the prompts' Home line and the modules' linked defaults | yes (WP-12a) | **UI** → Shared settings › Home |
 | `RECORD_HEARD_AUDIO`, `RECORD_HEARD_AUDIO_MAX_FILES` | Save what the recogniser heard | false, 50 | read only through `sections.value` (`serveMode.ts:163–164`); env only as a lock | yes | **UI** → Diagnostics › Recordings |
 
 ### 1.6 Serve mode, paths and bootstrap

@@ -256,6 +256,8 @@ export const resolveModuleSettings = (input: {
 
 /** The Home values that linked module defaults come from. */
 export interface HomeValues {
+  /** `HOME_LOCATION`; absent or `""` = not set. */
+  readonly location?: string
   readonly units: "metric" | "imperial"
   /** `""` = this machine's. */
   readonly timeZone: string
@@ -263,11 +265,12 @@ export interface HomeValues {
 }
 
 /**
- * Module defaults computed from Home (§2.6): Weather `defaultPlace` "" (the module uses `HOME_LOCATION`), Weather
- * `units` ← `HOME_UNITS`, Clock `timeZone` ← `HOME_TIME_ZONE`, Clock `locale` ← `HOME_DATE_FORMAT`.
+ * Module defaults computed from Home (§2.6): Weather `defaultPlace` ← `HOME_LOCATION`, Weather `units` ← `HOME_UNITS`,
+ * Clock `timeZone` ← `HOME_TIME_ZONE`, Clock `locale` ← `HOME_DATE_FORMAT`. A saved or environment value of the
+ * module, or an assistant's own value, wins over them.
  */
 export const linkedModuleDefaults = (home: HomeValues): Record<string, Record<string, SettingValue>> => ({
-  weather: { defaultPlace: "", units: home.units === "imperial" ? "fahrenheit" : "celsius" },
+  weather: { defaultPlace: home.location ?? "", units: home.units === "imperial" ? "fahrenheit" : "celsius" },
   clock: { timeZone: home.timeZone, locale: home.dateFormat }
 })
 
@@ -321,4 +324,31 @@ export const moduleInstances = (input: {
     }
   }
   return [...out.values()]
+}
+
+/** What the Home line of a prompt says (§2.4): the owner's `HOME_*` values. */
+export interface HomeLineValues {
+  /** `""` = not set. */
+  readonly location: string
+  /** IANA zone; `""` = this machine's (`machineTimeZone`). */
+  readonly timeZone: string
+  /** BCP 47, e.g. "en-GB". */
+  readonly language: string
+  /** This machine's zone, said when `timeZone` is empty. */
+  readonly machineTimeZone?: string
+}
+
+/**
+ * The Home line of every assistant's stable prompt (§2.4: location, time zone, language), e.g. "Home: Amsterdam,
+ * Netherlands; time zone Europe/Amsterdam; language en-GB." `""` when there is nothing to say. Stable while Home
+ * does not change (it is part of the cached prompt prefix).
+ */
+export const homeLineOf = (home: HomeLineValues): string => {
+  const zone = home.timeZone.trim() !== "" ? home.timeZone.trim() : home.machineTimeZone ?? ""
+  const parts = [
+    ...(home.location.trim() !== "" ? [home.location.trim()] : []),
+    ...(zone !== "" ? [`time zone ${zone}`] : []),
+    ...(home.language.trim() !== "" ? [`language ${home.language.trim()}`] : [])
+  ]
+  return parts.length === 0 ? "" : `Home: ${parts.join("; ")}.`
 }

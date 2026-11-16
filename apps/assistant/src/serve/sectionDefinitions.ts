@@ -119,8 +119,79 @@ const checkVoiceKey = (value: string): string | undefined => {
   return isTtsProvider(ref.provider) ? undefined : `There is no voice provider "${ref.provider}"`
 }
 
+/** An IANA time zone this machine knows (empty = this machine's own). */
+const checkTimeZone = (zone: string): string | undefined => {
+  if (zone.trim() === "") return undefined
+  try {
+    new Intl.DateTimeFormat("en", { timeZone: zone.trim() })
+    return undefined
+  } catch {
+    return "Unknown time zone (use an IANA name such as Europe/Amsterdam)"
+  }
+}
+
+/**
+ * The shared `home` section (docs/ASSISTANTS.md §2.4, §7.3): every assistant's prompt gets a Home line from it, and
+ * the modules' linked defaults come from it (Weather place and units, Clock time zone and date format).
+ */
+export const homeSection: SectionDefinition = {
+  id: "home",
+  title: "Home",
+  group: "modules",
+  page: { id: "home", title: "Home", description: "Where the house is. Modules and every assistant's prompt use these." },
+  order: 5,
+  spec: {
+    HOME_LOCATION: Setting.text({
+      label: "Location",
+      description: "Town and country, e.g. \"Amsterdam, Netherlands\". Every assistant is told; the weather uses it when you name no place.",
+      env: "HOME_LOCATION",
+      placeholder: "Amsterdam, Netherlands",
+      maxLength: 200
+    }),
+    HOME_TIME_ZONE: Setting.text({
+      label: "Time zone",
+      description: "IANA name, e.g. Europe/Amsterdam. Empty: this machine's zone.",
+      env: "HOME_TIME_ZONE",
+      placeholder: Intl.DateTimeFormat().resolvedOptions().timeZone,
+      maxLength: 64,
+      check: checkTimeZone
+    }),
+    HOME_LANGUAGE: Setting.choice({
+      label: "Language",
+      description: "The household's language, told to every assistant.",
+      env: "HOME_LANGUAGE",
+      default: "en-GB",
+      options: [
+        { value: "en-GB", label: "English (United Kingdom)" },
+        { value: "en-US", label: "English (United States)" },
+        { value: "nl-NL", label: "Dutch (Netherlands)" },
+        { value: "de-DE", label: "German (Germany)" }
+      ]
+    }),
+    HOME_UNITS: Setting.choice({
+      label: "Units",
+      description: "The default of modules that measure (the weather), unless they or an assistant say otherwise.",
+      env: "HOME_UNITS",
+      default: "metric",
+      options: [{ value: "metric", label: "Metric (°C, km/h)" }, { value: "imperial", label: "Imperial (°F, mph)" }]
+    }),
+    HOME_DATE_FORMAT: Setting.choice({
+      label: "Date format",
+      description: "The default of modules that say dates (the clock), unless they or an assistant say otherwise.",
+      env: "HOME_DATE_FORMAT",
+      default: "en-GB",
+      options: [
+        { value: "en-GB", label: "13 November 2026" },
+        { value: "en-US", label: "November 13, 2026" },
+        { value: "nl-NL", label: "13 november 2026" }
+      ]
+    })
+  }
+}
+
 export const sectionDefinitions = (dirs: ModelDirs = defaultModelDirs): ReadonlyArray<SectionDefinition> => {
   return [
+    homeSection,
     // ---- Language model
     {
       id: "language-model",

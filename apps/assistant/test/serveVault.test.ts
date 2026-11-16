@@ -99,6 +99,7 @@ describe("serve: key vault and admin access", () => {
     expect(welcome.snapshot.vault).toEqual({ state: "none", admin: true, location: join(server.dataDir, "vault", "vault.enc") })
     const flags = Object.fromEntries(welcome.snapshot.sections.map((s) => [s.id, s.protected === true]))
     expect(flags).toEqual({
+      home: false,
       "language-model": true,
       "llm-behaviour": false,
       "stt-engine": true,

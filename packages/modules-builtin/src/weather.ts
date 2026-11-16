@@ -226,16 +226,18 @@ export const weatherModule = (deps: { readonly fetch?: typeof globalThis.fetch }
     settings: {
       defaultPlace: Setting.text({
         label: "Home location",
-        description: "Used when you don't name a place.",
+        description: "Used when you don't name a place. Follows Home's location unless set here.",
         placeholder: "Amsterdam, Netherlands",
         env: "WEATHER_DEFAULT_PLACE",
-        maxLength: 200
+        maxLength: 200,
+        overridable: true
       }),
       units: Setting.choice({
         label: "Units",
         env: "WEATHER_UNITS",
         default: "celsius",
-        options: [{ value: "celsius", label: "Celsius, km/h" }, { value: "fahrenheit", label: "Fahrenheit, mph" }]
+        options: [{ value: "celsius", label: "Celsius, km/h" }, { value: "fahrenheit", label: "Fahrenheit, mph" }],
+        overridable: true
       }),
       timeoutMs: Setting.number({
         label: "Timeout",

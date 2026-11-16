@@ -29,6 +29,7 @@ import {
   followUpMsFor,
   hearerOf,
   hearingFor,
+  homeLineOf,
   linkedModuleDefaults,
   makeAssistantId,
   moduleInstances,
@@ -551,6 +552,14 @@ describe("module settings (section 2.6)", () => {
       defaults: linkedModuleDefaults({ units: "metric", timeZone: "Europe/Berlin", dateFormat: "en-US" }).clock!
     })
     expect(eff).toEqual({ timeZone: "Europe/Berlin", locale: "en-US" })
+    expect(linkedModuleDefaults({ location: "Utrecht", units: "metric", timeZone: "", dateFormat: "en-GB" }).weather).toEqual({ defaultPlace: "Utrecht", units: "celsius" })
+  })
+  it("the Home line: location, time zone (the machine's when Home names none), language", () => {
+    expect(homeLineOf({ location: "Amsterdam, Netherlands", timeZone: "Europe/Amsterdam", language: "nl-NL" })).toBe(
+      "Home: Amsterdam, Netherlands; time zone Europe/Amsterdam; language nl-NL."
+    )
+    expect(homeLineOf({ location: " ", timeZone: "", language: "en-GB", machineTimeZone: "Europe/London" })).toBe("Home: time zone Europe/London; language en-GB.")
+    expect(homeLineOf({ location: "", timeZone: "", language: "" })).toBe("")
   })
   it("tools: allowed when the module is on and the tool not switched off", () => {
     expect(toolAllowed(jeff, "weather", "weather")).toBe(true)
