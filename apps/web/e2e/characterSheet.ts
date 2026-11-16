@@ -2,8 +2,8 @@
  * The contact sheets of one character, for its pull request:
  *   CHARACTER=<id> pnpm --filter @pva/web shots:character
  * writes screenshots/characters/<id>-dark.png and <id>-light.png: IDLE, LISTENING, HEARING, THINKING, SPEAKING, each a
- * screenshot of the real voice page's stage canvas area (desktop size) against the mock, composed into one image in
- * the browser. Not a Playwright test: it starts its own mock and static server on free ports, so several checkouts
+ * screenshot of the whole voice page (desktop size, 1280 x 800) against the mock, so glow, the full-stage look
+ * (docs/CHARACTERS.md §2.6) and the text over it can be judged, composed into one image in the browser (laid out at half size, at twice the density, so no pixel is lost). Not a Playwright test: it starts its own mock and static server on free ports, so several checkouts
  * can run it at once. See src/characters/README.md.
  *
  * Environment: CHARACTER (required), SKIP_BUILD=1 (reuse an existing export), PVA_WEB_EXPORT_DIR (the export, default
@@ -124,7 +124,8 @@ const run = async () => {
       }
       await page.waitForFunction((n) => (window as any).__pvaStage.debug().frames > n, 30)
       if ((await page.evaluate(() => (window as any).__pvaStage.debug())).id !== id) throw new Error(`character "${id}" left the stage`)
-      const png = await page.locator(".stage-vis").screenshot()
+      // The whole viewport, not only the box: a stage character draws across the page.
+      const png = await page.screenshot()
       return `data:image/png;base64,${png.toString("base64")}`
     } finally {
       await ctx.close()
@@ -138,7 +139,8 @@ const run = async () => {
       console.log(`${theme} ${state.label}`)
       panels.push({ state, src: await capture(theme, state) })
     }
-    const ctx = await browser.newContext({ colorScheme: theme, viewport: { width: 800, height: 400 } })
+    // Laid out at half size, rendered at twice the density: every panel keeps all its 1280 x 800 pixels.
+    const ctx = await browser.newContext({ colorScheme: theme, viewport: { width: 800, height: 400 }, deviceScaleFactor: 2 })
     const page = await ctx.newPage()
     const dark = theme === "dark"
     const cells = panels
@@ -151,9 +153,9 @@ const run = async () => {
       h1{font:600 18px system-ui,sans-serif;margin:0 0 16px}h1 span{font-weight:400;opacity:.65}
       .row{display:flex;gap:16px}figure{margin:0}
       .l{font:700 16px system-ui,sans-serif;letter-spacing:.12em;margin-bottom:8px}
-      img{display:block;outline:1px solid ${dark ? "#2a2f36" : "#d5d9de"}}
+      img{display:block;width:${VIEWPORT.width / 2}px;height:${VIEWPORT.height / 2}px;outline:1px solid ${dark ? "#2a2f36" : "#d5d9de"}}
       figcaption{margin-top:6px;font-size:13px;opacity:.7}</style>
-      <h1>${id} <span>${theme} theme, desktop stage</span></h1><div class="row">${cells}</div>`)
+      <h1>${id} <span>${theme} theme, the voice page at 1280 × 800</span></h1><div class="row">${cells}</div>`)
     await page.waitForFunction(() => [...document.images].every((i) => i.complete && i.naturalWidth > 0))
     const sheet = await page.screenshot({ fullPage: true })
     writeFileSync(join(outDir, `${id}-${theme}.png`), sheet)
