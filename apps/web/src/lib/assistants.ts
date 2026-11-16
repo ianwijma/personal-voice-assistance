@@ -268,6 +268,9 @@ export const summaryParts = (a: Assistant, modules: ReadonlyArray<ModuleInfo>, n
   ]
 }
 
+/** The provider of each of `summaryParts`' lines (model, hearing, voice; none for the modules), for a mark before it. */
+export const summaryMarks = (a: Assistant): ReadonlyArray<string | undefined> => [a.llm.account, a.hearing.engine, a.voice.provider, undefined]
+
 /** The label of a hearing preset: the speech section's option label (before " — "), else the preset name. */
 export const hearingModelNames = (sections: ReadonlyArray<SettingsSection>): ModelNames => {
   const field = sections.flatMap((s) => s.form.fields).find((f) => f.key === "STT_SHERPA_MODEL")

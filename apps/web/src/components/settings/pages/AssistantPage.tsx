@@ -1,7 +1,7 @@
 "use client"
 import { type KeyboardEvent, useEffect, useState } from "react"
 import type { AssistantInfo } from "@pva/protocol"
-import { ASSISTANT_TABS, type AssistantTab, hearingModelNames, isAssistantTab, listJoin, summaryParts } from "@/lib/assistants.ts"
+import { ASSISTANT_TABS, type AssistantTab, hearingModelNames, isAssistantTab, listJoin, summaryMarks, summaryParts } from "@/lib/assistants.ts"
 import { useClient, useClientState } from "../../context.tsx"
 import { cx } from "../../ui/controls.tsx"
 import { FormFooter } from "../FormFooter.tsx"
@@ -74,7 +74,7 @@ function Editor({ info }: { readonly info: AssistantInfo }) {
 
   return (
     <div className="flex flex-1 flex-col gap-4" data-testid="assistant-page" data-assistant={info.id}>
-      <Strip parts={parts} />
+      <Strip parts={parts} marks={summaryMarks(draft.saved)} />
       <div className="-mx-5 overflow-x-auto border-b border-line px-5 scrollbar-quiet sm:mx-0 sm:px-0">
         <div role="tablist" aria-label={`${info.name} settings`} className="flex min-w-max gap-1">
           {ASSISTANT_TABS.map(([k, label]) => {

@@ -921,6 +921,133 @@ test.describe("voice picker, phone, dark", () => {
   })
 })
 
+/**
+ * The model pickers (docs/MODEL-PICKERS.md) on Jeff's Language model and Hearing tabs: the closed pill, the popup on
+ * Favourites, on a provider, on a provider that is not set up, a search, the typed model, a failed list; the
+ * recogniser with a download in progress.
+ */
+const modelForce = (provider: string, state: string) => fetch(`${MOCK}/mock/models/state`, { method: "POST", body: JSON.stringify({ provider, state }) })
+
+const modelShots = async (page: Page, baseURL: string | undefined, names: {
+  readonly closed?: string
+  readonly favourites?: string
+  readonly provider?: string
+  readonly notSetUp?: string
+  readonly search?: string
+  readonly custom?: string
+  readonly failed?: string
+  readonly hearingClosed?: string
+  readonly hearingDownload?: string
+}, phone = false) => {
+  await mock.scenario("devices")
+  const press = (l: ReturnType<Page["locator"]>) => (phone ? l.tap() : l.click())
+  const picker = page.getByTestId("model-picker")
+  const popup = page.getByTestId("model-popup")
+  const tab = (id: string) => page.getByTestId("model-rail").locator(`[data-tab="${id}"]`)
+  const opened = async () => {
+    await press(picker)
+    await expect(popup.getByTestId("model-row").first()).toBeVisible()
+    await settle(page, 400)
+  }
+  if (names.closed !== undefined || names.favourites !== undefined || names.provider !== undefined || names.notSetUp !== undefined || names.search !== undefined || names.custom !== undefined || names.failed !== undefined) {
+    await loginAdmin(page, baseURL, "#settings/assistants/jeff/model")
+    await expect(picker).toContainText("Claude Haiku 5.5")
+    await page.mouse.move(2, 2)
+    await settle(page)
+    if (names.closed !== undefined) await shot(page, names.closed)
+    await opened()
+    if (names.favourites !== undefined) await shot(page, names.favourites)
+    if (names.provider !== undefined) {
+      await press(tab("anthropic"))
+      await settle(page)
+      await shot(page, names.provider)
+    }
+    if (names.notSetUp !== undefined) {
+      await press(tab("openrouter"))
+      await expect(popup.getByTestId("provider-needs-key")).toBeVisible()
+      await settle(page)
+      await shot(page, names.notSetUp)
+    }
+    if (names.search !== undefined) {
+      await modelForce("openrouter", "ready")
+      await popup.getByTestId("model-refresh").click()
+      await expect(tab("openrouter")).not.toHaveAttribute("data-trouble", /./)
+      await popup.getByTestId("model-search").fill("haiku")
+      await expect(popup.getByTestId("model-list")).toHaveAttribute("data-mode", "search")
+      await settle(page)
+      await shot(page, names.search)
+    }
+    if (names.custom !== undefined) {
+      await press(tab("anthropic"))
+      await popup.getByTestId("model-typed-input").scrollIntoViewIfNeeded()
+      await popup.getByTestId("model-typed-input").fill("claude-sonnet-4-5")
+      await settle(page)
+      await shot(page, names.custom)
+    }
+    if (names.failed !== undefined) {
+      await modelForce("anthropic", "failed")
+      await popup.getByTestId("model-refresh").click()
+      await expect(popup.getByTestId("provider-error")).toBeVisible()
+      await settle(page)
+      await shot(page, names.failed)
+    }
+  }
+  if (names.hearingClosed !== undefined || names.hearingDownload !== undefined) {
+    await loginAdmin(page, baseURL, "#settings/assistants/jeff/hearing")
+    await expect(picker).toContainText("Parakeet v2")
+    await page.mouse.move(2, 2)
+    await settle(page)
+    if (names.hearingClosed !== undefined) await shot(page, names.hearingClosed)
+    if (names.hearingDownload !== undefined) {
+      await opened()
+      await press(tab("sherpa"))
+      const whisper = popup.locator("[data-model='sherpa:whisper-turbo']")
+      await press(whisper.locator("[data-action=download]"))
+      await expect.poll(async () => Number(await whisper.getByRole("progressbar").getAttribute("aria-valuenow") ?? 0)).toBeGreaterThanOrEqual(30)
+      await shot(page, names.hearingDownload)
+      await press(whisper.locator("[data-action=cancel]"))
+    }
+  }
+}
+
+test.describe("model pickers, desktop, dark", () => {
+  test.use({ colorScheme: "dark", ...DESKTOP })
+  test("the Language model tab closed, favourites, a provider, not set up, search, a typed model, a failed list", async ({ page, baseURL }) => {
+    await modelShots(page, baseURL, {
+      closed: "admin-desktop-68-model-picker-closed",
+      favourites: "admin-desktop-69-model-picker-favourites",
+      provider: "admin-desktop-70-model-picker-provider",
+      notSetUp: "admin-desktop-71-model-picker-not-set-up",
+      search: "admin-desktop-72-model-picker-search",
+      custom: "admin-desktop-73-model-picker-custom",
+      failed: "admin-desktop-74-model-picker-failed"
+    })
+  })
+  test("the Hearing tab closed, and its popup with a download in progress", async ({ page, baseURL }) => {
+    await modelShots(page, baseURL, { hearingClosed: "admin-desktop-75-hearing-picker-closed", hearingDownload: "admin-desktop-76-hearing-picker-download" })
+  })
+})
+
+test.describe("model pickers, desktop, light", () => {
+  test.use({ colorScheme: "light", ...DESKTOP })
+  test("the language model popup on a provider", async ({ page, baseURL }) => {
+    await modelShots(page, baseURL, { provider: "admin-desktop-light-20-model-picker-provider" })
+  })
+  test("the recogniser popup with a download", async ({ page, baseURL }) => {
+    await modelShots(page, baseURL, { hearingDownload: "admin-desktop-light-21-hearing-picker-download" })
+  })
+})
+
+test.describe("model pickers, phone, dark", () => {
+  test.use({ colorScheme: "dark", ...PHONE })
+  test("the language model bottom sheet: favourites, not set up", async ({ page, baseURL }) => {
+    await modelShots(page, baseURL, { favourites: "admin-phone-26-model-picker-favourites", notSetUp: "admin-phone-27-model-picker-not-set-up" }, true)
+  })
+  test("the recogniser bottom sheet with a download", async ({ page, baseURL }) => {
+    await modelShots(page, baseURL, { hearingDownload: "admin-phone-28-hearing-picker-download" }, true)
+  })
+})
+
 // ---------------------------------------------------------------------------------------------------------------
 // Admin › Assistants (docs/ASSISTANTS.md §7.1, mock-up docs/mockups/assistants/admin.html)
 // ---------------------------------------------------------------------------------------------------------------

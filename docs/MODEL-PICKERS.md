@@ -1,6 +1,6 @@
 # Model pickers: language models and speech recognition models
 
-Design written 2026-11-16 at the owner's request; the server half is built (status at the end), the web half is not.
+Design written 2026-11-16 at the owner's request; the server half and the web half are built (status at the end).
 
 The voice picker (docs/VOICE-PROVIDERS.md §8) becomes the way to choose the other two models of an assistant:
 
@@ -209,7 +209,7 @@ A provider list's failure is never an HTTP error: the call answers 200 and that 
 - `apps/assistant/src/serve/api.ts`: the routes (`/api/models/…`), mounted with the voice routes.
 - `serveMode.ts`: wiring (`ServeOptions.modelListTimeoutMs`, `modelCatalogNow` for tests).
 
-## 6. For the web half (design only; not built)
+## 6. For the web half (design; built, see the end)
 
 ### 6.1 What in `VoicePicker` is voice-specific
 
@@ -330,4 +330,41 @@ Open questions for the owner:
 | Adapters (`llm-anthropic` `listModels` / `modelSource` / `knownModels`; `llm-openai-compatible` `accountModelSource` and the OpenRouter fields; Claude Code's descriptions; `ModuleHost.settingOptions`) | Done 2026-11-16, tests against local servers: `packages/llm-anthropic/test/models.test.ts`, `packages/llm-openai-compatible/test/modelSource.test.ts`, `packages/core/test/ModuleHost.test.ts`. |
 | Server (catalog, favourites, routes) | Done 2026-11-16: `apps/assistant/test/modelCatalog.test.ts` (states, cache, refresh, new key, failure pause, time limit, a failing provider next to working ones, known models, unlisted models, presets), `apps/assistant/test/serveModelPickers.test.ts` (admin only, both catalogs over HTTP, refresh, time limit, favourites persist and per kind, the limit, downloads and cancel). |
 | Web mock (`apps/web/mock/modelPickers.ts`) | Done 2026-11-16: every state (Anthropic ready; subscription `needs_setup` until its module runs; OpenRouter `needs_key` until its key is set; the home model's list failed with the typed model and the models in use; Deepgram `needs_key`; Whisper turbo not installed, its download progresses as the Models page's job). `POST /mock/models/state {"provider", "state"}` forces `auto`, `ready`, `failed`, `slow`, `needs_key`, `needs_address`. |
-| Web UI (generic picker, Language model and Hearing tabs) | Not built. |
+| Web UI (generic picker, Language model and Hearing tabs) | Built 2026-11-16, see "Built (web half)" below. |
+
+## Built (web half, 2026-11-16)
+
+The web UI follows §6; this lists where it differs, and what is left out.
+
+- **Files.** `apps/web/src/components/pickers/CatalogPicker.tsx` (generic picker), `modelSources.ts` (the model
+  adapters) and `ModelPickers.tsx` (`LlmModelPicker`, `SttModelPicker`); `apps/web/src/lib/catalogPicker.ts` (pure
+  logic, tested in `test/catalogPicker.test.ts`) and `lib/modelCatalog.ts` (one catalog per kind and client: lists,
+  favourites, downloads). `VoicePicker` is `CatalogPicker` over a voice source (`components/voices/VoicePicker.tsx`):
+  the preview column, the speaker, `voiceMeta` and the voice catalog stay there. `voicePicker.ts` and `voiceCatalog.ts`
+  are unchanged apart from `jobOf` taking the job's tool (default `tts-models`).
+- **Props differ from §6.2** where the code needed it: `PickerSource` also has `noun` (`"voice"` | `"model"`: the test
+  ids `voice-picker`, `model-popup`, … and the row attribute `data-voice` / `data-model`, so the voice specs run
+  unchanged), `words` (the texts), `useDownload(key, row)` and `useRowPhase(key)` (hooks that give the download and
+  the voice's preview phase to a row), `retry` / `retryProvider` (a failed list's Retry exists for models only) and
+  `typed` (the choice a typed model makes). `rowAction` is `RowAction`, a component, and `side` is `Side` (gets
+  `phone`). `GenericRow` has `title` (tooltip) and a `GenericProvider` carries its `notice`, `problem` and `linkText`
+  (the voices say "Open Voice providers", the models the catalog's `settingsLabel`). `CatalogPicker` takes `fallbackName`
+  for a chosen key in no list (Deepgram without a key shows "Deepgram").
+- **The typed model** is always visible as the last row of a provider's list (a labelled text field and "Use"; Enter
+  chooses), not behind a click. Search offers "Use “text” on <provider>" only for one word (ids have no spaces), so a
+  query of several words that matches nothing still says "No models match".
+- **Popup width** is 660 px for models too (the voices' with its preview column), so a row's facts have room; on a
+  phone the facts of a row are cut with an ellipsis as the voices' are (the row's tooltip has them whole).
+- **Language model tab**: one field "Language model" replaces the account cards and the model field; its dirty mark and
+  errors cover `llm.account` and `llm.model` (`AField` `alsoPaths`). **Hearing tab**: one field "Speech recognition
+  model" replaces the engine cards and the model list; the Language setting still follows the chosen model through
+  the speech section's own condition. A draft whose account or model is in no list shows the model's id (or, for
+  Deepgram, "Deepgram").
+- **Marks elsewhere**: the summary strip (assistants list, an assistant's page, the wizard's copy cards) has the
+  provider's mark before the model, hearing and voice lines (`summaryMarks`).
+- **Not built**: marks in the latency popover and its open rows (their facts are plain text pairs shared with tests),
+  "Used on" (it lists devices, not models); a per-provider "Retry" for the voice picker (not asked for); the typed
+  model's text is not checked against the provider (the assistant save is the check, §7 question 5).
+- **Mock**: unchanged. Verified against it (`e2e/modelPicker.spec.ts`, `e2e/assistants.spec.ts`, `e2e/wizard.spec.ts`,
+  screenshots `admin-desktop-68…76`, `admin-desktop-light-20…21`, `admin-phone-26…28`); not against the real server
+  or real providers.

@@ -22,7 +22,7 @@ test("a blank assistant through the seven steps: Start, model, hearing, voice, m
   await page.getByLabel("Purpose").fill("Helps with the garden")
   await next(page)
   await expect(page.getByTestId("wizard-next")).toHaveText("Next: Hearing")
-  await expect(page.getByRole("radiogroup", { name: "Account" })).toBeVisible()
+  await expect(page.getByTestId("model-picker")).toContainText("Claude Haiku 5.5")
   await page.getByRole("radiogroup", { name: "Effort" }).getByRole("radio", { name: "Medium" }).click()
   await next(page)
   await expect(page.getByTestId("hearing-callout")).toContainText("A device hears with one recogniser")

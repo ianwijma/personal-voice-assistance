@@ -1,6 +1,6 @@
 "use client"
 import { useEffect } from "react"
-import { hearingModelNames, plural, summaryParts } from "@/lib/assistants.ts"
+import { hearingModelNames, plural, summaryMarks, summaryParts } from "@/lib/assistants.ts"
 import { formatSettingsHash } from "@/lib/settingsTree.ts"
 import { useClient, useClientState } from "../../context.tsx"
 import { useCatalogState, useVoiceCatalog } from "../../voices/useVoiceCatalog.ts"
@@ -66,7 +66,7 @@ export function AssistantsPage() {
                     <span className="ml-auto text-[12px] text-ink-faint" data-testid="used-count">{usedWords(a.usedOn)}</span>
                   </span>
                   {a.purpose !== "" && <span className="text-[13px] text-ink-muted">{a.purpose}</span>}
-                  <Strip parts={summaryParts(a, moduleList, names, voiceName(a.voice))} className="text-ink-faint" />
+                  <Strip parts={summaryParts(a, moduleList, names, voiceName(a.voice))} marks={summaryMarks(a)} className="text-ink-faint" />
                 </span>
                 <Icon name="chevron" size={16} className="mt-2 shrink-0 text-ink-faint" />
               </button>

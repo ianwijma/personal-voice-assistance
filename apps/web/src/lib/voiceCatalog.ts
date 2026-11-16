@@ -388,16 +388,17 @@ export const createVoiceCatalog = (host: CatalogHost, api: VoiceApi = makeVoiceA
   }
 }
 
-/** The download job of a voice: a running one for it, else the newest of the one the picker started and the list's. */
+/** The download job of a voice (or, with `tool`, another model): a running one for it, else the newest of the one the picker started and the list's. */
 export const jobOf = (
   jobs: ReadonlyArray<JobInfo>,
   d: DownloadState | undefined,
   listJob: JobInfo | undefined,
-  target: string | undefined
+  target: string | undefined,
+  tool = "tts-models"
 ): JobInfo | undefined => {
   const byId = (id: string | undefined) => (id === undefined ? undefined : jobs.find((j) => j.id === id))
   const own = byId(d?.job?.id) ?? d?.job
   const listed = byId(listJob?.id) ?? listJob
-  const running = target === undefined ? undefined : jobs.find((j) => j.tool === "tts-models" && j.target === target && j.state === "running")
+  const running = target === undefined ? undefined : jobs.find((j) => j.tool === tool && j.target === target && j.state === "running")
   return running ?? [own, listed].filter((j): j is JobInfo => j !== undefined).sort((a, b) => b.startedAt - a.startedAt)[0]
 }
