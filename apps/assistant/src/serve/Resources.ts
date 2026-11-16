@@ -578,7 +578,7 @@ interface Entry<Spec, Svc> {
   inner?: Svc
   readonly scope: Scope.Closeable
   readonly settled: Deferred.Deferred<void>
-  /** The wrapper every user gets: waits for the build, answers with the problem, counts streams in flight. */
+  /** The wrapper every user gets: waits for the build, answers with the problem, counts the turns and streams running on it. */
   service: Svc
   inFlight: number
   /** Released (scheduled, or done): no longer offered. */
@@ -890,6 +890,10 @@ export const makeResourcePool = (options: ResourcePoolOptions): Effect.Effect<Re
       keyOf: llmKeyOf,
       wrap: (entry, release) =>
         Llm.of({
+          // A turn (the model agent's whole tool loop) holds its instance from its start to its end: one whose
+          // assistant is rebound or switched off meanwhile keeps it, past the grace period too, for every model round
+          // and the tools between them.
+          holdDuring: (turn) => counted(entry, release, turn),
           // Counted from the start, the wait for the build included: a turn waiting for its instance keeps it alive when
           // the assistant is rebound or switched off meanwhile (it finishes with the instance it started with).
           stream: (request) =>
