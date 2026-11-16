@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest"
-import type { DeviceSetup, ServerMessage } from "@pva/protocol"
+import type { DeviceSetup, HistoryItem, ServerMessage } from "@pva/protocol"
 import { exampleDeviceSetup, serverExamples } from "@pva/protocol/examples"
 import { type Action, type ClientState, displayPhrase, initialState, profileOf, reducer } from "@/lib/state.ts"
 import {
@@ -229,19 +229,37 @@ describe("one conversation per assistant", () => {
     expect(turnsOf(s, "t3").map((t) => [t.userText, t.text, t.outcome])).toEqual([["Hello", "re: Hello", "completed"], ["Hello", "Hi again.", "completed"]])
   })
 
-  it("a history that ends with the message a running turn is answering does not show it twice", () => {
-    const open: ServerMessage = {
+  it("a history whose last exchange is a running turn (the server's lastTurnId) shows it once; equal text without that id is another turn", () => {
+    const read = (items: ReadonlyArray<HistoryItem>, lastTurnId?: number): ServerMessage => ({
       type: "conversation.history",
       requestId: "r2",
       assistantId: "t3",
       id: "conv-t3",
-      history: [{ role: "user", text: "Earlier" }, { role: "assistant", text: "ok", interrupted: false, tools: [] }, { role: "user", text: "Start a thread" }]
+      history: items,
+      ...(lastTurnId !== undefined ? { lastTurnId } : {})
+    })
+    const user = (text: string): HistoryItem => ({ role: "user", text })
+    const reply = (text: string): HistoryItem => ({ role: "assistant", text, interrupted: false, tools: [] })
+
+    // T3 was asked "Hello" (turn 6) and stopped before any reply: committed without one, so the history ends with that
+    // "Hello". "Hello" again (turn 9) is running and not committed. Both are shown, whatever the server says of turn 6.
+    const stopped = run([welcomeWith(setup()), turnStart(6, "t3", "Hello"), turnEnd(6), turnStart(9, "t3", "Hello")])
+    for (const lastTurnId of [undefined, 6]) {
+      const s = run([read([user("Earlier"), reply("ok"), user("Hello")], lastTurnId)], stopped)
+      expect(turnsOf(s, "t3").map((t) => [t.userText, t.turnId])).toEqual([["Earlier", undefined], ["Hello", undefined], ["Hello", 9]])
+      expect(turnsOf(s, "t3")[2]!.outcome).toBeUndefined()
     }
-    const s = run([welcomeWith(setup()), turnStart(7, "t3", "Start a thread"), open])
-    expect(turnsOf(s, "t3").map((t) => t.userText)).toEqual(["Earlier", "Start a thread"])
-    expect(turnsOf(s, "t3")[1]!.turnId).toBe(7)
-    // The turn's end finds it and completes it.
-    expect(turnsOf(run([turnEnd(7)], s), "t3")[1]!.outcome).toBe("completed")
+
+    // Turn 7's exchange was committed and its turn.end is still on the way (lastTurnId 7): shown once, as the live turn,
+    // which its end then completes.
+    const running = run([welcomeWith(setup()), turnStart(7, "t3", "Start a thread")])
+    let s = run([read([user("Earlier"), reply("ok"), user("Start a thread"), reply("Started")], 7)], running)
+    expect(turnsOf(s, "t3").map((t) => [t.userText, t.turnId])).toEqual([["Earlier", undefined], ["Start a thread", 7]])
+    s = run([turnEnd(7)], s)
+    expect(turnsOf(s, "t3")[1]!.outcome).toBe("completed")
+    // The same history naming another turn: turn 7 is not in it, so it stays next to the exchange it looks like.
+    s = run([read([user("Earlier"), reply("ok"), user("Start a thread"), reply("Started")], 5)], running)
+    expect(turnsOf(s, "t3").map((t) => [t.userText, t.turnId])).toEqual([["Earlier", undefined], ["Start a thread", undefined], ["Start a thread", 7]])
   })
 
   it("a welcome during T3's follow-up window files the snapshot's history under T3 (snapshot.answering), not under who answers without a phrase", () => {
