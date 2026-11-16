@@ -236,7 +236,7 @@ describe("the model catalog's calls", () => {
       changes.push(method)
       if (method === "PUT") {
         await new Promise<void>((resolve) => {
-          answerPut = () => resolve()
+          held.set("put", () => resolve())
         })
         const f = { model: ref, key, name: "Claude Haiku 5.5", addedAt: 1 }
         return reply({ favourite: f, favourites: [f] })
@@ -256,6 +256,55 @@ describe("the model catalog's calls", () => {
     expect(changes).toEqual(["PUT", "DELETE"])
     expect(c.store.get().favourites).toEqual([])
     expect(c.store.get().notice).toBeUndefined()
+  })
+
+  it("a refresh that waits on a slow provider does not undo a star made meanwhile", async () => {
+    const key = "anthropic:claude-haiku-5-5"
+    const f = { model: { provider: "anthropic", modelId: "claude-haiku-5-5" }, key, name: "Claude Haiku 5.5", addedAt: 1 }
+    let holdModels = false
+    let holdPut = false
+    const held = new Map<"models" | "put", () => void>() // the requests held open, by what they ask for
+    const fetchFn = async (url: string, init?: RequestInit) => {
+      const method = init?.method ?? "GET"
+      if (method === "PUT") {
+        if (holdPut) await new Promise<void>((resolve) => {
+          held.set("put", () => resolve())
+        })
+        return reply({ favourite: f, favourites: [f] })
+      }
+      if (url.includes("favourites")) return reply(favs) // the old list, at once
+      if (holdModels) await new Promise<void>((resolve) => {
+        held.set("models", () => resolve())
+      })
+      return reply(sample)
+    }
+    const host = { store: createStore(initialState, (s) => s) }
+    const c = createModelCatalog("llm", host, makeVoiceApi(() => "http://h/api/", () => "token", fetchFn as unknown as typeof fetch))
+    await c.reload()
+    // The star is made and saved while the refresh waits for the models.
+    holdModels = true
+    const refresh = c.reload(true)
+    await vi.waitFor(() => expect(held.has("models")).toBe(true))
+    await c.toggleFavourite(key, "Claude Haiku 5.5")
+    expect(c.store.get().favourites.map((x) => x.key)).toEqual([key])
+    held.get("models")!()
+    await refresh
+    expect(c.store.get().favourites.map((x) => x.key)).toEqual([key])
+    // A refresh asked for while a star is still on its way, and answered after it, leaves the star too.
+    holdPut = true
+    await c.toggleFavourite(key, "Claude Haiku 5.5") // unstar (DELETE answers the empty list)
+    expect(c.store.get().favourites).toEqual([])
+    const star = c.toggleFavourite(key, "Claude Haiku 5.5")
+    await vi.waitFor(() => expect(held.has("put")).toBe(true))
+    held.delete("models")
+    const again = c.reload(true)
+    await vi.waitFor(() => expect(held.has("models")).toBe(true))
+    held.get("put")!()
+    await star
+    expect(c.store.get().favourites.map((x) => x.key)).toEqual([key])
+    held.get("models")!()
+    await again
+    expect(c.store.get().favourites.map((x) => x.key)).toEqual([key])
   })
 
   it("a finished download gives way to the list asked for after it: a model deleted since shows its download again", async () => {

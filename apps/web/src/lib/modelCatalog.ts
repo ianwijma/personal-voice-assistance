@@ -89,6 +89,9 @@ export const createModelCatalog = (kind: PickerKind, host: CatalogHost, api: Voi
   const reload = async (refresh = false) => {
     const seq = ++loadSeq
     const finished = finishedDownloads()
+    // The favourites answer is shown only if no favourite change was pending when it was asked for or started since:
+    // otherwise it may predate that change, and the change's own answer (or the optimistic state) is newer.
+    const favAt = favPending === 0 ? favSeq : -1
     set((s) => ({ ...s, ...(s.load === "ready" ? { refreshing: true } : { load: "loading" as const }) }))
     try {
       const [models, favs] = await Promise.all([ // continuation(state): only the newest load writes (`seq`)
@@ -97,7 +100,7 @@ export const createModelCatalog = (kind: PickerKind, host: CatalogHost, api: Voi
       ])
       if (seq !== loadSeq) return
       const { loadError: _e, ...rest } = get()
-      set(() => ({ ...rest, load: "ready", refreshing: false, lists: models.providers, favourites: favs.favourites, downloads: settle(rest.downloads, finished) }))
+      set(() => ({ ...rest, load: "ready", refreshing: false, lists: models.providers, favourites: favAt === favSeq && favPending === 0 ? favs.favourites : rest.favourites, downloads: settle(rest.downloads, finished) }))
     } catch (e) {
       if (seq !== loadSeq) return
       const message = messageOf(e, `The ${noun} could not be loaded.`)
