@@ -234,6 +234,9 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
   }
   const isOwner = (client: Client) => client.sessionKey !== undefined && owners.get(client.sessionKey)?.owner === client
   const sessionOf = (client: Client): VoiceSession | undefined => (client.sessionKey === undefined ? undefined : sessions.get(client.sessionKey))
+  /** The ids of the assistants on the connection's device now (`VoiceSessions` keeps reservations for these only). */
+  const assignedOn = (client: Client): ReadonlyArray<string> =>
+    assistants.setupFor(client.device?.id, client.device?.kind).assistants.map((a) => a.id)
   /**
    * Who answers on the connection's device while it has no session (no follow-up window yet), as the session decides
    * (§5.3, `VoiceSession.answering`): the `withoutPhrase` assistant, else the TypeSafe fallback, else the first.
@@ -604,7 +607,7 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
       history: session === undefined ? [] : historyItems(Effect.runSync(session.conversation.history())),
       ...(client.role === "voice" ? { device: profileInfo(client) } : {}),
       admin: adminState(client, endReason),
-      conversation: key === undefined ? adminConversation : sessions.conversation(key, session === undefined ? answersWithoutSession(client) : undefined),
+      conversation: key === undefined ? adminConversation : sessions.conversation(key, session === undefined ? answersWithoutSession(client) : undefined, assignedOn(client)),
       ...(client.role === "voice" ? voicePart(client, session) : {})
     }
   }
@@ -804,7 +807,7 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
         }
         // Without a session the reservation of the assistant asked for (absent: the one that will answer) is replaced.
         const assistantId = message.assistantId ?? (sessionOf(client) === undefined ? answersWithoutSession(client) : undefined)
-        return limited(client, message.requestId, Effect.as(sessions.newConversation(client.sessionKey, assistantId), { ok: true } as HostResult))
+        return limited(client, message.requestId, Effect.as(sessions.newConversation(client.sessionKey, assistantId, assignedOn(client)), { ok: true } as HostResult))
       }
       case "admin.login":
         return login(client, message.requestId, message.password)
@@ -874,7 +877,7 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
         }
         const session = sessionOf(client)
         // Without a session: the id reserved for that assistant (the session takes it over).
-        const info = session === undefined ? sessions.conversation(client.sessionKey, assistantId) : session.conversation.conversation(assistantId)
+        const info = session === undefined ? sessions.conversation(client.sessionKey, assistantId, setup.assistants.map((a) => a.id)) : session.conversation.conversation(assistantId)
         return send(client, {
           type: "conversation.history",
           requestId: message.requestId,
