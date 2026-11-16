@@ -255,8 +255,11 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
 
       // Rim light: mint with the person's level while hearing (faint while listening), amber with
       // the assistant's while speaking, a slow amber pulse while thinking.
-      const youLv = S.userTalking ? Math.max(0.15, f.user.level) : 0.1
-      const rimT = mix.listening * 0.25 + hearW * (0.3 + 0.9 * clamp01(youLv * 1.6)) + speakW * (0.3 + 0.9 * clamp01(S.talk * 1.8)) + thinkW * (reduced ? 0.3 : 0.18 + 0.14 * Math.sin(f.t * 3))
+      // Reduced motion holds the rim at a fixed brightness per mode: it must not flash with the
+      // live level, however it moves.
+      const youLv = reduced ? 0.5 : S.userTalking ? Math.max(0.15, f.user.level) : 0.1
+      const talkLv = reduced ? 0.5 : S.talk
+      const rimT = mix.listening * 0.25 + hearW * (0.3 + 0.9 * clamp01(youLv * 1.6)) + speakW * (0.3 + 0.9 * clamp01(talkLv * 1.8)) + thinkW * (reduced ? 0.3 : 0.18 + 0.14 * Math.sin(f.t * 3))
       rim = reduced ? Math.round(rimT * 3) / 3 : approach(rim, rimT, dt, rimT > rim ? 0.04 : 0.2)
       const toVoice = speakW + thinkW
       mixInto(rimRgb, P.you, P.voice, toVoice / Math.max(1e-3, toVoice + hearW + mix.listening))
@@ -387,7 +390,7 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
 const design: Character = {
   id: "robot-eyes",
   name: "Robot eyes",
-  version: "1.1.0",
+  version: "1.1.1",
   contract: 1,
   family: "figure",
   summary: "Two solid rounded eyes and nothing else: they doze, perk up, follow you, dart while thinking and squint happily as they talk; a rim light says whose voice it is.",
@@ -418,16 +421,12 @@ const design: Character = {
     { signal: "pointer (inside)", effect: "Gaze follows it; the eye on that side grows (perspective)." },
     { signal: "mode", effect: "Pose blend over ~0.2 s: openness, lid height, squint, size, height, droop; rim colour mint → amber." },
     { signal: "time (seeded)", effect: "Blinks every ~2.4–4.8 s with doubles and on big saccades; saccade hold 0.28 s thinking, 1.2–1.4 s otherwise, 3.5 s idle; dozing peeks every 7–13 s." },
-    { signal: "reducedMotion", effect: "Held poses: no blinks, saccades, nods, bounces, breathing, peeks or rim pulse; the rim steps in thirds; whisper/shout/energy poses change in held steps." },
+    { signal: "reducedMotion", effect: "Held poses: no blinks, saccades, nods, bounces, breathing, peeks or rim pulse; the rim holds one brightness per mode, whatever the voice does; whisper/shout/energy poses change in held steps." },
     {
       signal: "options",
       effect:
         "Size (capped so the eyes stay in frame), eye shape (rounded, round, tall morph over ~0.2 s; visor cross-fades), eye colour, rim thickness (at 0 the eyes take the voice colour instead); expressiveness scales nods, hops, squash, tilt and lid poses; liveliness divides blink and saccade intervals; nods and pointer-following switch off."
     }
-  ],
-  uses: [
-    { ext: "speech.words", gain: "The bounce lands exactly on stressed syllables instead of detected onsets.", without: "Syllable onsets detected from the reply audio." },
-    { ext: "reply.expression", gain: "Chooses between a handful of distinct eye poses for speaking (question, apology, good news).", without: "One pleasant squint." }
   ],
   renderer: "2d",
   canvas: "stage",

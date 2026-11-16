@@ -236,8 +236,25 @@ describe("the rim light says whose voice it is", () => {
   })
 
   it("is brighter for a louder voice", () => {
-    const alpha = (level: number) => Math.max(...rims(pose("hearing", { user: talking(level) })).map((s) => rgbOf(s.style)[3]!), 0)
+    const alpha = (level: number) => Math.max(...rims(pose("hearing", { user: talking(level), reduced: false })).map((s) => rgbOf(s.style)[3]!), 0)
     expect(alpha(0.8)).toBeGreaterThan(alpha(0.1))
+  })
+
+  it("under reduced motion holds one brightness per mode: it does not flash with the live level", () => {
+    for (const mode of ["hearing", "speaking"] as const) {
+      const r = make()
+      const seen = new Set<number>()
+      for (let i = 0; i < 40; i++) {
+        const lv = talking(i % 2 === 0 ? 0.2 : 0.8)
+        const calls = tick(r, mode, { reduced: true, ...(mode === "hearing" ? { user: lv } : { agent: lv }) })
+        if (i >= 20) for (const s of rims(calls)) seen.add(rgbOf(s.style)[3]!)
+      }
+      expect(seen.size, mode).toBe(1)
+    }
+  })
+
+  it("does not advertise extensions it does not read", () => {
+    expect(robot.uses).toBeUndefined()
   })
 
   it("is faint while listening and absent while idle", () => {
