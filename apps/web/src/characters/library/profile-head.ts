@@ -617,7 +617,7 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
 const design: Character = {
   id: "profile-head",
   name: "Profile head",
-  version: "1.1.0",
+  version: "1.1.1",
   contract: 1,
   family: "figure",
   summary: "A head in side profile: your voice arrives at the ear as mint wavefronts and drops in as dots, the dots link up and turn amber while it thinks, and leave the mouth as amber waves when it speaks.",
@@ -648,18 +648,6 @@ const design: Character = {
       signal: "options",
       effect:
         "Size (capped so skull and face stay in frame), facing left or right (a 0.3 s fade through the mirror), contour or silhouette and line weight (glide ~0.2 s); expressiveness scales nods, chin and brow lifts, lean and flinch; liveliness divides the blink interval; mouth range scales the jaw; nods switch off."
-    }
-  ],
-  uses: [
-    {
-      ext: "speech.words",
-      gain: "The dots become the actual words you say and the reply says, one per word, instead of one per syllable.",
-      without: "One dot per syllable onset, as drawn now."
-    },
-    {
-      ext: "speech.phonemes",
-      gain: "The jaw and lips follow exact mouth shapes, aligned to the played audio.",
-      without: "The jaw follows the spectral mouth estimate."
     }
   ],
   renderer: "2d",

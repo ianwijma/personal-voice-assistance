@@ -297,4 +297,8 @@ describe("profile head: reduced motion shows what the mode is with still shapes"
     expect(a!.stroke!.alpha).toBeGreaterThan(b!.stroke!.alpha)
     expect(b!.stroke!.alpha).toBeGreaterThan(c!.stroke!.alpha)
   })
+
+  it("declares no extension use: it reads nothing from frame.ext", () => {
+    expect("uses" in profileHead).toBe(false)
+  })
 })
