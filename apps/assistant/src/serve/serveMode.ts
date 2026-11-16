@@ -476,8 +476,6 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
         runSync(Effect.asVoid(Effect.forkDetach(syncResources(), { startImmediately: true })))
         return resources.llmFor(assistantId)
       }
-      /** Completes once the assistant's voice is built (its sample rate is final): `TurnSetup.ttsReady`. */
-      const ttsReady = resources.ttsReady(assistantId)
       /** Likewise the assistant's voice: the pool's instance for its `voice`, read at the turn's start. */
       const ttsNow = () => {
         const bound = resources.ttsFor(assistantId)
@@ -496,6 +494,8 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
           const mine = assistant === undefined ? { registry: makeToolRegistry([]), instructions: [] } : modulesFor(snapshot, assistant)
           const base = assistant?.prompt ?? defaultSystemPrompt
           const instructions = home === undefined ? mine.instructions : [home, ...mine.instructions]
+          // `TurnSetup.ttsReady`: completes once this `tts` (the instance bound now, not a later one) is built.
+          const ttsReady = resources.ttsReady(assistantId)
           cached = {
             snapshot,
             assistant,
