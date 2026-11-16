@@ -8,6 +8,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest"
 import type { Character, Mode, OptionValues } from "@/characters/contract.ts"
 import { createVoiceFeatures } from "@/characters/features.ts"
 import { Runner } from "@/characters/runner.ts"
+import { Ink, SoftSpot } from "@/characters/shared/figure.ts"
 import { pinned, run, type RunResult } from "./support/conversation.ts"
 import { installFakeCanvas, markStage, recording } from "./support/fakeCanvas.ts"
 import { PALETTES } from "./support/palettes.ts"
@@ -142,4 +143,49 @@ describe("blob buddy: eyes follow the pointer", () => {
   it("ignores the pointer when the option is off", async () => {
     expect(await frames(false, true)).toEqual(await frames(false, false))
   })
+})
+
+describe("blob buddy: manifest", () => {
+  it("lists no extension it does not read (no `uses`)", async () => {
+    expect("uses" in (await fresh())).toBe(false)
+  })
+})
+
+describe("blob buddy: frame allocations", () => {
+  /** How many distinct pure black or white colour arrays the character handed to the drawing helpers over `frames` frames. */
+  const distinctExtremes = async (palette: "dark" | "light", bodyColor: string | null, frames: number): Promise<number> => {
+    const seen = new Set<object>()
+    const note = (c: ReadonlyArray<number>) => {
+      if (c.every((v) => v === 0) || c.every((v) => v === 255)) seen.add(c)
+    }
+    const css = vi.spyOn(Ink.prototype, "css").mockImplementation(function (this: Ink, c: ReadonlyArray<number>) {
+      note(c)
+      return ""
+    } as never)
+    const draw = vi.spyOn(SoftSpot.prototype, "draw").mockImplementation(((...a: Array<unknown>) => note(a[6] as ReadonlyArray<number>)) as never)
+    try {
+      const r = new Runner(await fresh(), document.createElement("canvas"), bodyColor === null ? {} : { bodyColor })
+      r.create()
+      r.resize(720, 240, 1)
+      const quiet = createVoiceFeatures()
+      for (let i = 0; i < frames; i++) {
+        r.step({ mode: "listening", dt: 1 / 60, user: quiet, agent: quiet, palette: PALETTES[palette], reducedMotion: false, pointer: { x: 0, y: 0, down: false, inside: false }, sinceInterrupt: Infinity })
+      }
+      r.dispose()
+    } finally {
+      css.mockRestore()
+      draw.mockRestore()
+    }
+    return seen.size
+  }
+
+  for (const palette of ["dark", "light"] as const) {
+    for (const bodyColor of [null, "#f4e7c5", "#16213b"]) {
+      it(`reuses its black and white colours from frame to frame (${palette} theme, ${bodyColor ?? "default"} body)`, async () => {
+        const few = await distinctExtremes(palette, bodyColor, 5)
+        const many = await distinctExtremes(palette, bodyColor, 60)
+        expect(many, "no new colour array per frame").toBe(few)
+      })
+    }
+  }
 })

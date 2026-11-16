@@ -36,6 +36,10 @@ import {
   SoftSpot
 } from "../shared/figure.ts"
 
+// Fixed colours, shared by every frame (the frame hot path allocates no arrays).
+const BLACK: [number, number, number] = [0, 0, 0]
+const WHITE: [number, number, number] = [255, 255, 255]
+
 const N = 48
 const COS = new Float32Array(N)
 const SIN = new Float32Array(N)
@@ -220,13 +224,13 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
       if (bodyC === GREY || typeof bodyC !== "string") {
         mixInto(bodyRgb, P.bg, P.ink, (P.dark ? 0.5 : 0.12) + (P.dark ? 0.12 : 0.05) * alert)
         mixInto(bodyRgb, bodyRgb, P.voice, 0.07)
-        if (P.dark) mixInto(featRgb, P.bg, [0, 0, 0], 0.55)
+        if (P.dark) mixInto(featRgb, P.bg, BLACK, 0.55)
         else mixInto(featRgb, P.ink, P.ink, 0)
       } else {
         // A chosen colour, a little muted while dozing; dark features on a light body, light on a dark one.
         mixInto(bodyRgb, P.bg, optColor(f, "bodyColor"), 0.8 + 0.2 * alert)
-        if (lightness(bodyRgb) > 0.45) mixInto(featRgb, bodyRgb, [0, 0, 0], 0.82)
-        else mixInto(featRgb, bodyRgb, [255, 255, 255], 0.85)
+        if (lightness(bodyRgb) > 0.45) mixInto(featRgb, bodyRgb, BLACK, 0.82)
+        else mixInto(featRgb, bodyRgb, WHITE, 0.85)
       }
       const youLv = S.userTalking ? Math.max(0.15, f.user.level) : 0.1
       const accT = mix.listening * 0.35 + hearW * (0.35 + 0.65 * clamp01(youLv * 1.6)) + speakW * (0.35 + 0.65 * clamp01(S.talk * 1.8)) + thinkW * (reduced ? 0.4 : 0.3 + 0.2 * Math.sin(f.t * 3))
@@ -236,7 +240,7 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
 
       clear2d(g, dpr, fo)
       // Ground shadow: shrinks as it hops.
-      g.fillStyle = ink.css(P.dark ? [0, 0, 0] : P.ink, (P.dark ? 0.35 : 0.1) * (1 - hop * 3))
+      g.fillStyle = ink.css(P.dark ? BLACK : P.ink, (P.dark ? 0.35 : 0.1) * (1 - hop * 3))
       g.beginPath()
       g.ellipse(cx + ln * 0.3 * s, ground + 0.02 * s, a * (1.05 - hop * 2), 0.07 * s, 0, 0, TAU)
       g.fill()
@@ -278,8 +282,8 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
       // belly glow in the accent colour. All three are soft radial spots clipped to the body.
       g.save()
       g.clip()
-      hiSpot.draw(g, -a * 0.25 + ln * s * 0.3, -b * 1.5, a * 0.75, b * 0.5, -0.3, P.dark ? P.ink : [255, 255, 255], P.dark ? 0.2 : 0.6)
-      shadeSpot.draw(g, 0, 0.1 * s, a * 1.5, b * 0.7, 0, [0, 0, 0], P.dark ? 0.35 : 0.12)
+      hiSpot.draw(g, -a * 0.25 + ln * s * 0.3, -b * 1.5, a * 0.75, b * 0.5, -0.3, P.dark ? P.ink : WHITE, P.dark ? 0.2 : 0.6)
+      shadeSpot.draw(g, 0, 0.1 * s, a * 1.5, b * 0.7, 0, BLACK, P.dark ? 0.35 : 0.12)
       glowSpot.draw(g, ln * s * 0.12, -b * 0.62, a * 0.62, b * 0.5, 0, accRgb, clamp01(accent) * (P.dark ? 0.75 : 0.7))
       g.restore()
 
@@ -368,7 +372,7 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
 const character: Character = {
   id: "blob-buddy",
   name: "Blob buddy",
-  version: "1.1.0",
+  version: "1.1.1",
   contract: 1,
   family: "figure",
   summary: "A soft gumdrop creature with one antenna curl, animated with squash and stretch: it leans in to listen, shrinks from a shout, sways to think and hops on its syllables.",
@@ -402,10 +406,6 @@ const character: Character = {
       effect:
         "Size (shrinks only), body shape (gumdrop, round, tall: morphs over ~0.25 s), body colour (features switch to light or dark for contrast); expressiveness scales hops, squash-nods, tilt, lean and shrink; liveliness divides blink and glance intervals; mouth range scales the opening; nods and pointer-following switch off."
     }
-  ],
-  uses: [
-    { ext: "speech.words", gain: "It hops on words rather than detected syllables, which is calmer and more readable.", without: "It hops on detected syllable onsets." },
-    { ext: "reply.expression", gain: "A sentiment cue picks a body pose: a bigger, bouncier hop for good news, a smaller one for an apology.", without: "One neutral speaking pose." }
   ],
   renderer: "2d",
   canvas: "stage",
