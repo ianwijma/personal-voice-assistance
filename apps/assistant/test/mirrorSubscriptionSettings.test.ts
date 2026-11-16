@@ -44,9 +44,21 @@ describe("mirrorSubscriptionSettings", () => {
     expect(out.replyEarly).toBe(onSubscription.replyEarly)
   })
 
-  it("mirrors the idle minutes as the module's form reads them: a value its form rejects (under 5) is not mirrored", () => {
-    expect(mirrorSubscriptionSettings(onSubscription, {}, { sessionIdleMinutes: 30 }, context).llm.freshSessionAfterMinutes).toBe(30)
-    expect(mirrorSubscriptionSettings(onSubscription, {}, { sessionIdleMinutes: 1 }, context)).toBe(onSubscription)
+  it("mirrors the idle minutes across the assistant's whole range, 0 (never) to 1440", () => {
+    for (const minutes of [0, 1, 5, 30, 1440]) {
+      expect(mirrorSubscriptionSettings(onSubscription, {}, { sessionIdleMinutes: minutes }, context).llm.freshSessionAfterMinutes).toBe(minutes)
+    }
+  })
+
+  it("mirrors the edge values back and forth: 0 after 60, and 60 after 0", () => {
+    const never = mirrorSubscriptionSettings(onSubscription, { sessionIdleMinutes: 60 }, { sessionIdleMinutes: 0 }, context)
+    expect(never.llm.freshSessionAfterMinutes).toBe(0)
+    expect(mirrorSubscriptionSettings(never, { sessionIdleMinutes: 0 }, { sessionIdleMinutes: 60 }, context).llm.freshSessionAfterMinutes).toBe(60)
+  })
+
+  it("does not mirror a value outside the module's form (over 1440 or fractional)", () => {
+    expect(mirrorSubscriptionSettings(onSubscription, {}, { sessionIdleMinutes: 1441 }, context)).toBe(onSubscription)
+    expect(mirrorSubscriptionSettings(onSubscription, {}, { sessionIdleMinutes: 2.5 }, context)).toBe(onSubscription)
   })
 
   it("without a module catalog, clamps the idle minutes to 0..1440", () => {
