@@ -278,7 +278,7 @@ New and changed messages (schema constant → `type`):
 | server | `Frontends` | `frontends` | `{ frontends: FrontendKindInfo[] }`, admin only |
 | server | `Devices` | `devices` | `{ devices: DeviceInfo[] }`, admin only |
 | server | `Wake` | `wake` | `{ phrase, armed }`, everyone |
-| server | `WakeHeard` | `wake.heard` | `{ text, matched?, at }`, admin connections with the tester on |
+| server | `WakeHeard` | `wake.heard` | `{ text, matched?, at }` (protocol 7 adds `source?: { deviceId?, assistantId? }`, where it was heard: docs/ASSISTANTS.md §5), admin connections with the tester on |
 | common | `AssistantState` | — | + `asleep` |
 | common | `ErrorCode` | — | + `admin_required`, + `unknown_device`; `locked` now means "the keys are locked" only |
 

@@ -453,7 +453,13 @@ describe("wake phrase in serve mode", () => {
     expect(await owner.waitFor("wake", () => true, { from: 0 })).toEqual({ type: "wake", phrase: "hey jeff", armed: false, assistantId: "assistant" })
     expect((await owner.waitFor("turn.start", () => true, { from: 0 })).userText).toBe("what time is it?")
     expect(owner.messages.filter((m) => m.type === "transcript").map((m) => (m as { text: string }).text)).toEqual(["what", ""])
-    expect(await admin.waitFor("wake.heard", () => true, { from: 0 })).toMatchObject({ text: "Hey Jeff, what time is it?", matched: "hey jeff", accepted: true })
+    // PR #35 review 6, finding 2: the line says which device it was heard on and whose phrase it matched there.
+    expect(await admin.waitFor("wake.heard", () => true, { from: 0 })).toMatchObject({
+      text: "Hey Jeff, what time is it?",
+      matched: "hey jeff",
+      accepted: true,
+      source: { deviceId: owner.device.id, assistantId: "assistant" }
+    })
     await owner.waitFor("turn.end", () => true, { from: 0, timeoutMs: 10_000 })
     expect(owner.messages.some((m) => m.type === "state" && m.state === "speaking")).toBe(true)
     // Follow-up (1 s): no phrase needed.
@@ -464,6 +470,7 @@ describe("wake phrase in serve mode", () => {
     const followUp = await admin.waitFor("wake.heard", (m) => m.text === "and tomorrow", { from: 0 })
     expect(followUp.accepted).toBe(true)
     expect(followUp.matched).toBeUndefined()
+    expect(followUp.source).toEqual({ deviceId: owner.device.id })
     await owner.waitFor("turn.end", () => true, { from, timeoutMs: 10_000 })
     // The window closes with nobody speaking: asleep again, and talk is ignored.
     await owner.waitFor("state", (m) => m.state === "asleep", { from, timeoutMs: 3_000 })

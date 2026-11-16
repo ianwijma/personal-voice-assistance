@@ -121,8 +121,14 @@ export interface TreeInput {
   readonly assistants?: ReadonlyArray<Pick<AssistantInfo, "id" | "name" | "purpose" | "on">>
 }
 
-/** The path of a device type's defaults page (`#settings/devices/type-web-voice`). */
-export const typePageId = (kind: string): string => `type-${kind}`
+/**
+ * The path of a device type's defaults page (`#settings/devices/type.web-voice`). The dot keeps it apart from device
+ * pages: a `DeviceId` is letters, digits, `-` and `_` only, so no device (not even one called `type-web-voice`) has it.
+ */
+export const typePageId = (kind: string): string => `type.${kind}`
+
+/** Whether a Devices path part is a device type's defaults page (`typePageId`), not a device. */
+export const isTypePageId = (id: string | undefined): boolean => id?.startsWith("type.") === true
 
 /** Every non-secret value of every section, by key (keys are global): what page and field conditions are judged on. */
 export const savedValues = (sections: ReadonlyArray<SettingsSection>): ReadonlyMap<string, SettingValue> => {
