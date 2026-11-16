@@ -310,16 +310,37 @@ export const fake2d = (canvas: CanvasLike, rec: Recording = recording): CanvasRe
   let subLines = 0
   let fillSegs = 0
   let strokeSegs = 0
+  // The straight-only sub-path in progress: its first point, the direction to the first point that differs from it,
+  // and whether a point has been seen off that line. Collinear points enclose no area, so a straight-only sub-path
+  // fills only once `offLine` is set. This is decided in the coordinates the path was given in, ignoring the
+  // transform: an affine transform keeps collinear points collinear (a degenerate one only makes more paths flat,
+  // which this does not try to notice).
+  let startX: number | undefined
+  let startY: number | undefined
+  let dirX = 0
+  let dirY = 0
+  let hasDir = false
+  let offLine = false
   const newPath = () => {
     hasPoint = false
     subLines = 0
     fillSegs = 0
     strokeSegs = 0
+    startX = undefined
+    startY = undefined
+    hasDir = false
+    offLine = false
   }
   /** A new sub-path at a point (`moveTo`, and after `rect`, `roundRect` and `closePath`). */
-  const subPath = () => {
+  const subPath = (x?: number, y?: number) => {
     hasPoint = true
     subLines = 0
+    startX = x
+    startY = y
+    dirX = 0
+    dirY = 0
+    hasDir = false
+    offLine = false
   }
   /** A curved segment (a curve, an arc): strokable, and able to enclose an area. */
   const curve = () => {
@@ -328,15 +349,46 @@ export const fake2d = (canvas: CanvasLike, rec: Recording = recording): CanvasRe
     fillSegs++
     strokeSegs++
   }
-  /** A straight segment from the current point; with none, the call only starts a sub-path (as a browser does). */
-  const lineSegment = () => {
-    if (!hasPoint) return subPath()
+  /** The sub-path now holds a part that encloses area, once. */
+  const markOffLine = () => {
+    if (offLine) return
+    offLine = true
+    fillSegs++
+  }
+  /**
+   * A straight segment from the current point to (x, y); with no current point, the call only starts a sub-path (as
+   * a browser does). Without a known end point (a flat ellipse) the segment counts as off the line from the second
+   * segment on, as the conservative answer.
+   */
+  const lineSegment = (x?: number, y?: number) => {
+    if (!hasPoint) return subPath(x, y)
     subLines++
     strokeSegs++
-    if (subLines >= 2) fillSegs++
+    if (offLine) return
+    if (x === undefined || y === undefined || startX === undefined || startY === undefined) {
+      if (subLines >= 2) markOffLine()
+      return
+    }
+    const dx = x - startX
+    const dy = y - startY
+    // Points closer than this to a line are on it. Relative to the size of the shape (offsets from its first point),
+    // not to where it lies: a thin triangle far from the origin still has area.
+    const tol = 1e-9 * Math.max(1, Math.abs(dx), Math.abs(dy), Math.abs(dirX), Math.abs(dirY))
+    if (!hasDir) {
+      // A point repeated at the start makes no direction.
+      if (Math.hypot(dx, dy) > tol) {
+        dirX = dx
+        dirY = dy
+        hasDir = true
+      }
+      return
+    }
+    // Distance of the point from the line through the start along the direction.
+    const dist = Math.abs(dirX * dy - dirY * dx) / Math.hypot(dirX, dirY)
+    if (dist > tol) markOffLine()
   }
-  const rectSegment = (w: number, h: number) => {
-    subPath()
+  const rectSegment = (x: number, y: number, w: number, h: number) => {
+    subPath(x, y)
     if (sized(w) && sized(h)) fillSegs++
     if (sized(w) || sized(h)) strokeSegs++
   }
@@ -499,14 +551,14 @@ export const fake2d = (canvas: CanvasLike, rec: Recording = recording): CanvasRe
     },
     moveTo: ((x: number, y: number) => {
       point(x, y)
-      if (finite([x, y])) subPath()
+      if (finite([x, y])) subPath(x, y)
     }) as never,
     closePath: () => {
-      if (hasPoint) subPath()
+      if (hasPoint) subPath(startX, startY)
     },
     lineTo: ((x: number, y: number) => {
       point(x, y)
-      if (finite([x, y])) lineSegment()
+      if (finite([x, y])) lineSegment(x, y)
     }) as never,
     quadraticCurveTo: ((cx: number, cy: number, x: number, y: number) => {
       point(x, y)
@@ -522,9 +574,9 @@ export const fake2d = (canvas: CanvasLike, rec: Recording = recording): CanvasRe
       point(x1, y1)
       point(x2, y2)
       // Without a current point it only starts a sub-path; a radius of 0 is a straight line to (x1, y1).
-      if (!hasPoint) subPath()
+      if (!hasPoint) subPath(x1, y1)
       else if (r > 0) curve()
-      else lineSegment()
+      else lineSegment(x1, y1)
     }) as never,
     arc: ((x: number, y: number, r: number, a0: number, a1: number, ccw = false) => {
       if (!finite([x, y, r, a0, a1])) return
@@ -532,7 +584,7 @@ export const fake2d = (canvas: CanvasLike, rec: Recording = recording): CanvasRe
       arcPoints(x, y, r, r, 0, a0, a1, ccw)
       // A radius of 0 is a point: only the line to it from the current point.
       if (r > 0) curve()
-      else lineSegment()
+      else lineSegment(x, y)
     }) as never,
     ellipse: ((x: number, y: number, rx: number, ry: number, rot: number, a0: number, a1: number, ccw = false) => {
       if (!finite([x, y, rx, ry, rot, a0, a1])) return
@@ -552,13 +604,13 @@ export const fake2d = (canvas: CanvasLike, rec: Recording = recording): CanvasRe
     },
     rect: ((x: number, y: number, w: number, h: number) => {
       box(x, y, w, h)
-      if (finite([x, y, w, h])) rectSegment(w, h)
+      if (finite([x, y, w, h])) rectSegment(x, y, w, h)
     }) as never,
     roundRect: ((x: number, y: number, w: number, h: number, radii?: unknown) => {
       if (!finite([x, y, w, h])) return
       if (!checkRadii(radii)) return
       box(x, y, w, h)
-      rectSegment(w, h)
+      rectSegment(x, y, w, h)
     }) as never,
     // Only solid paint counts towards the extent: a gradient or pattern is a glow or a halo, meant to fade out at
     // the canvas edge, and its geometry (often a big circle) says nothing about where it is visible.

@@ -172,6 +172,17 @@ const EMPTY: ReadonlyArray<readonly [string, Character]> = [
       g.fillText("", 5, 5)
       g.strokeText("", 5, 5)
     })
+  ],
+  [
+    "a fill of points on one line (it encloses no area), a different colour per mode",
+    drawing("collinear-fill", (g, c) => {
+      g.beginPath()
+      g.moveTo(1, 1)
+      g.lineTo(3, 3)
+      g.lineTo(5, 5)
+      g.fillStyle = c
+      g.fill()
+    })
   ]
 ]
 
@@ -289,6 +300,16 @@ describe("the test canvas counts only effective painting", () => {
     expect(paints((g) => { g.beginPath(); g.roundRect(0, 0, 8, 8, 2); g.fill() })).toBe(1)
     expect(paints((g) => { g.beginPath(); g.moveTo(Number.NaN, 1); g.lineTo(Number.NaN, 5); g.fill() })).toBe(0)
     expect(paints((g) => { g.beginPath(); g.moveTo(1, 1); g.lineTo(5, 5); g.beginPath(); g.fill() })).toBe(0) // a new path starts empty
+    // Straight points on one line enclose no area; a triangle, even a thin one, does.
+    expect(paints((g) => { g.beginPath(); g.moveTo(1, 1); g.lineTo(3, 3); g.lineTo(5, 5); g.fill() })).toBe(0) // three collinear points
+    expect(paints((g) => { g.beginPath(); g.moveTo(1e9, 1e9); g.lineTo(1e9 + 100, 1e9); g.lineTo(1e9 + 50, 1e9 + 1); g.fill() })).toBe(1) // a thin triangle far from the origin: the tolerance follows the shape's size, not its position
+    expect(paints((g) => { g.beginPath(); g.moveTo(1, 1); g.lineTo(1, 1); g.lineTo(5, 5); g.fill() })).toBe(0) // a repeated point
+    expect(paints((g) => { g.beginPath(); g.moveTo(1, 1); g.lineTo(5, 5); g.lineTo(5, 5); g.lineTo(3, 3); g.fill() })).toBe(0) // repeated and doubling back
+    expect(paints((g) => { g.beginPath(); g.moveTo(1, 1); g.lineTo(5, 1); g.lineTo(3, 4); g.fill() })).toBe(1) // a triangle
+    expect(paints((g) => { g.beginPath(); g.moveTo(0, 0); g.lineTo(100, 0); g.lineTo(50, 1); g.fill() })).toBe(1) // a thin triangle
+    expect(paints((g) => { g.beginPath(); g.moveTo(1000000, 1000000); g.lineTo(1000100, 1000000); g.lineTo(1000050, 1000001); g.fill() })).toBe(1) // far from the origin
+    expect(paints((g) => { g.beginPath(); g.moveTo(1, 1); g.lineTo(5, 5); g.stroke() })).toBe(1) // a single stroked line still paints
+    expect(paints((g) => { g.beginPath(); g.moveTo(1, 1); g.lineTo(3, 3); g.lineTo(5, 5); g.stroke() })).toBe(1) // so do collinear points stroked
   })
 
   it("a rectangle needs a size, text must not be empty, an image draw needs a size", () => {
