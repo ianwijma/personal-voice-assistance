@@ -1,6 +1,8 @@
 import type { ComponentType } from "react"
 import { AboutPage } from "@/components/settings/pages/AboutPage.tsx"
 import { KeysListPage, VaultPage } from "@/components/settings/pages/AccessPages.tsx"
+import { AssistantPage } from "@/components/settings/pages/AssistantPage.tsx"
+import { AssistantsPage } from "@/components/settings/pages/AssistantsPage.tsx"
 import { DevicePage, DevicesPage } from "@/components/settings/pages/DevicesPages.tsx"
 import { LatencyPage, ProblemsPage } from "@/components/settings/pages/DiagnosticsPages.tsx"
 import { FrontendPage } from "@/components/settings/pages/FrontendPage.tsx"
@@ -22,6 +24,8 @@ export interface SettingsPageEntry extends ClientPageRef {
 
 export const settingsPages: ReadonlyArray<SettingsPageEntry> = [
   { group: "overview", id: "overview", title: "Overview", description: "What is set up, and what still needs doing.", order: 0, component: OverviewPage },
+  { group: "assistants", id: "all", title: "All assistants", description: "Each assistant is who answers, and how: its prompt, language model, hearing, voice and modules.", order: 0, component: AssistantsPage },
+  { group: "assistants", id: "assistant", title: "Assistant", order: 100, perItem: true, component: AssistantPage },
   { group: "frontends", id: "frontend", title: "Front end", order: 0, perItem: true, component: FrontendPage },
   { group: "devices", id: "all", title: "All devices", description: "Each browser that opened the voice assistant. Open one to rename it or change its settings.", order: 0, component: DevicesPage },
   { group: "devices", id: "device", title: "Device", order: 100, perItem: true, component: DevicePage },

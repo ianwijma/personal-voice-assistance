@@ -1,9 +1,11 @@
 import {
   type AdminState,
+  type AssistantInfo,
+  type DeviceTypeInfo,
   type AssistantState,
   type ConversationInfo,
   DEFAULT_DEVICE_PROFILE,
-  type DeviceInfo,
+  type DeviceListInfo,
   type DeviceProfile,
   type DeviceProfileInfo,
   type EngineStatus,
@@ -143,7 +145,10 @@ export interface ClientState {
   readonly adminReady: boolean
   /** Admin: the front-end kinds with their defaults, and the remembered devices (most recently seen first). */
   readonly frontends: ReadonlyArray<FrontendKindInfo>
-  readonly devices: ReadonlyArray<DeviceInfo>
+  readonly devices: ReadonlyArray<DeviceListInfo>
+  /** Admin (protocol 7): the assistants with where they are used, and the device types with their defaults. */
+  readonly assistants: ReadonlyArray<AssistantInfo>
+  readonly deviceTypes: ReadonlyArray<DeviceTypeInfo>
   /** The audio owner said the wake phrase alone (`wake` with `armed`): "Listening…" until the next state change. */
   readonly woke: { readonly phrase: string } | undefined
   /** Admin phrase tester: what the recogniser heard while it was on, oldest first. */
@@ -223,6 +228,8 @@ export const initialState: ClientState = {
   adminReady: false,
   frontends: [],
   devices: [],
+  assistants: [],
+  deviceTypes: [],
   woke: undefined,
   heard: [],
   engine: emptyEngine,
@@ -256,6 +263,8 @@ const adminPart = {
   traces: initialState.traces,
   frontends: initialState.frontends,
   devices: initialState.devices,
+  assistants: initialState.assistants,
+  deviceTypes: initialState.deviceTypes,
   sessions: initialState.sessions,
   heard: initialState.heard,
   adminReady: false
@@ -412,6 +421,8 @@ const server: ServerHandlers = {
     traces: m.snapshot.traces.slice(-MAX_TRACES),
     frontends: m.snapshot.frontends,
     devices: m.snapshot.devices,
+    assistants: m.snapshot.assistants ?? [],
+    deviceTypes: m.snapshot.deviceTypes ?? [],
     sessions: m.snapshot.sessions,
     adminReady: true
   }),
@@ -540,11 +551,12 @@ const server: ServerHandlers = {
     return addToast(next, describeError(e), e.code === "mic_gap" ? "info" : "error")
   },
   pong: (s) => s,
-  // Protocol 7 messages the UI packages (WP-6 to WP-8) take over; the pages do not read them yet.
+  // Protocol 7 messages the UI packages (WP-7, WP-8) take over; the pages do not read them yet. (`assistants` and
+  // `device.types` are WP-6a's, below.)
   "device.setup": (s) => s,
   "conversation.history": (s) => s,
-  assistants: (s) => s,
-  "device.types": (s) => s
+  assistants: (s, m) => ({ ...s, assistants: m.assistants }),
+  "device.types": (s, m) => ({ ...s, deviceTypes: m.types })
 }
 
 const local = (s: ClientState, a: LocalAction): ClientState => {
@@ -610,6 +622,8 @@ function pickAdmin(s: ClientState): Partial<ClientState> {
     traces: s.traces,
     frontends: s.frontends,
     devices: s.devices,
+    assistants: s.assistants,
+    deviceTypes: s.deviceTypes,
     sessions: s.sessions,
     heard: s.heard,
     adminReady: s.adminReady

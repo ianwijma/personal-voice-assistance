@@ -25,7 +25,7 @@ test("a wrong password is refused and said so; the right one opens the settings;
   await expect(page.getByTestId("admin-header")).toContainText("Log out")
   // Categories in the designed order.
   const order = await page.getByTestId("settings-nav").locator(":scope > div > button").allTextContents()
-  expect(order.map((t) => t.replace(/\(.*\)/, "").trim())).toEqual(["Overview", "Front ends", "Devices", "Language model", "Speech recognition", "Voices", "Modules", "Keys & vault", "Diagnostics", "About"])
+  expect(order.map((t) => t.replace(/\(.*\)/, "").trim())).toEqual(["Overview", "Assistants", "Front ends", "Devices", "Language model", "Speech recognition", "Voices", "Modules", "Keys & vault", "Diagnostics", "About"])
   const logins = (await mock.log()).messages.filter((m) => m.type === "admin.login")
   expect(logins).toHaveLength(3 - 1) // the empty one never left the page
 })

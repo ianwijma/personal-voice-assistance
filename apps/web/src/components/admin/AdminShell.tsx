@@ -93,6 +93,7 @@ export function AdminShell() {
   const modules = useClientState(modulesInOrder, shallowEqual)
   const frontends = useClientState((s) => s.frontends)
   const devices = useClientState((s) => s.devices)
+  const assistants = useClientState((s) => s.assistants)
   const path = useClientState((s) => s.ui.settingsPath)
   const leave = useClientState((s) => s.ui.settingsLeave)
   const marks = useClientState(
@@ -105,8 +106,8 @@ export function AdminShell() {
     shallowEqual
   )
   const tree = useMemo(
-    () => buildSettingsTree({ sections, modules, clientPages: settingsPages, frontends, devices }),
-    [sections, modules, frontends, devices]
+    () => buildSettingsTree({ sections, modules, clientPages: settingsPages, frontends, devices, assistants }),
+    [sections, modules, frontends, devices, assistants]
   )
   const { group, page } = resolveSettingsPath(tree, path, wide)
   const badges: NavBadges = { ...marks, dirtyPage: marks.dirty && page !== undefined ? `${page.group}/${page.id}` : undefined }
@@ -223,7 +224,11 @@ function PageColumn({ group, page, up, titleRef, contentRef }: {
     >
       <div className="mx-auto flex min-h-full w-full max-w-[680px] flex-col px-5 pt-6 sm:px-8">
         <div className="mb-6 flex flex-col gap-1">
-          {up !== undefined && !page.listed && group !== undefined ? (
+          {page.backLabel !== undefined && group !== undefined ? (
+            <a href={formatSettingsHash([group.slug])} className="label mb-1 hidden min-h-8 items-center gap-1 self-start text-[10px] text-voice hover:underline lg:inline-flex" data-testid="page-back">
+              <Icon name="back" size={14} /> {page.backLabel}
+            </a>
+          ) : up !== undefined && !page.listed && group !== undefined ? (
             <button type="button" onClick={up} className="label mb-1 hidden min-h-8 items-center gap-1 self-start text-[10px] text-voice hover:underline lg:inline-flex" data-testid="page-up">
               <Icon name="back" size={14} /> {group.title}
             </button>
@@ -232,19 +237,24 @@ function PageColumn({ group, page, up, titleRef, contentRef }: {
               {group !== undefined && listedCount > 1 && <span className="label text-[10px] text-ink-faint">{group.title}</span>}
             </div>
           )}
-          <h2
-            ref={titleRef}
-            tabIndex={titleRef !== undefined ? -1 : undefined}
-            id="page-title"
-            data-testid="page-title"
-            className="self-start break-words rounded-sm text-[20px] font-medium leading-tight text-ink outline-offset-4"
-          >
-            {page.title}
-          </h2>
+          <div className="flex flex-wrap items-center gap-2.5">
+            <h2
+              ref={titleRef}
+              tabIndex={titleRef !== undefined ? -1 : undefined}
+              id="page-title"
+              data-testid="page-title"
+              className="self-start break-words rounded-sm text-[20px] font-medium leading-tight text-ink outline-offset-4"
+            >
+              {page.title}
+            </h2>
+            {page.chip !== undefined && (
+              <span className={`label rounded-sm border px-1 text-[10px] leading-[16px] ${page.chip.tone === "ok" ? "border-ok/50 text-ok" : "border-line text-ink-faint"}`} data-testid="page-chip">{page.chip.text}</span>
+            )}
+          </div>
           {page.description !== undefined && <p className="text-[14px] text-ink-muted">{page.description}</p>}
         </div>
         {page.source.kind === "client"
-          ? <div className="flex flex-1 flex-col pb-10" data-testid={`page-${page.group}-${page.source.id === "device" || page.source.id === "frontend" ? page.source.id : page.id}`}>{Client !== undefined && <Client />}</div>
+          ? <div className={`flex flex-1 flex-col ${page.backLabel !== undefined ? "" : "pb-10"}`} data-testid={`page-${page.group}-${page.source.id === "device" || page.source.id === "frontend" || page.source.id === "assistant" ? page.source.id : page.id}`}>{Client !== undefined && <Client />}</div>
           : <ServerPage key={`${page.group}/${page.id}`} page={page} />}
       </div>
     </div>

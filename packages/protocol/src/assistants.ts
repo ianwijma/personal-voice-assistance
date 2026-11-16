@@ -144,12 +144,15 @@ export const assistantsById = (assistants: ReadonlyArray<Assistant>): ReadonlyMa
 /** Name comparison key: trimmed, case-insensitive. */
 export const nameKey = (name: string): string => name.trim().toLowerCase()
 
+/** Ids the admin pages use as addresses (`#settings/assistants/all`, `/new`); never given to an assistant. */
+export const RESERVED_ASSISTANT_IDS: ReadonlyArray<string> = ["all", "new"]
+
 /**
  * An id from a name ("Keuken" → "keuken"; a taken id gets "-2", "-3"…). Diacritics are dropped, other characters
  * become dashes, the id starts with a letter ("a" is put in front otherwise) and has at most 32 characters.
  */
 export const makeAssistantId = (name: string, taken: Iterable<string> = []): string => {
-  const used = new Set(taken)
+  const used = new Set([...taken, ...RESERVED_ASSISTANT_IDS])
   let base = name.normalize("NFD").replace(/\p{M}/gu, "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "")
   if (base === "") base = "assistant"
   if (!/^[a-z]/.test(base)) base = `a${base}`

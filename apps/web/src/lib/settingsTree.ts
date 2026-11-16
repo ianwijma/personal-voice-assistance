@@ -1,4 +1,5 @@
 import {
+  type AssistantInfo,
   type Condition,
   type DeviceInfo,
   evaluateCondition,
@@ -29,6 +30,7 @@ export interface GroupMeta {
 /** The categories, in order. `other` collects sections of an unknown group (a newer server) and is shown only when non-empty. */
 export const settingsGroups: ReadonlyArray<GroupMeta> = [
   { slug: "overview", title: "Overview", description: "What is set up, and what still needs doing." },
+  { slug: "assistants", title: "Assistants", description: "Who answers, and how: prompt, language model, hearing, voice and modules." },
   { slug: "frontends", title: "Front ends", description: "The defaults for each kind of voice front end." },
   { slug: "devices", title: "Devices", description: "Every phone, tablet or computer that used the voice assistant." },
   { slug: "language-model", title: "Language model", description: "Who answers you.", server: "agents" },
@@ -72,6 +74,10 @@ export interface NavPage {
   readonly source: PageSource
   /** False for a page whose `visibleWhen` does not hold (listed under "Not in use", e.g. "Set up Deepgram"). */
   readonly inUse: boolean
+  /** A chip after the title ("On" / "Off" on an assistant's page). */
+  readonly chip?: { readonly text: string; readonly tone: "ok" | "off" }
+  /** The page has its own back link to its category list, with this name ("Assistants"). */
+  readonly backLabel?: string
   /** Shown in the navigation. False for a device's page: reached from the device list, not listed itself. */
   readonly listed: boolean
   /** Only admin pages may change it. */
@@ -96,6 +102,8 @@ export interface TreeInput {
   /** Admin: one Front ends page per kind, one (unlisted) Devices page per device. */
   readonly frontends?: ReadonlyArray<FrontendKindInfo>
   readonly devices?: ReadonlyArray<DeviceInfo>
+  /** Admin: one listed page per assistant (after "All assistants"). */
+  readonly assistants?: ReadonlyArray<Pick<AssistantInfo, "id" | "name" | "purpose" | "on">>
 }
 
 /** Every non-secret value of every section, by key (keys are global): what page and field conditions are judged on. */
@@ -183,6 +191,26 @@ export const buildSettingsTree = (input: TreeInput): ReadonlyArray<NavGroup> => 
       })
     })
   }
+  const assistantPage = perItem("assistant")
+  if (assistantPage !== undefined) {
+    ;(input.assistants ?? []).forEach((a, i) => {
+      add({
+        group: assistantPage.group,
+        id: a.id,
+        title: a.name,
+        ...(a.purpose !== "" ? { description: a.purpose } : {}),
+        chip: a.on ? { text: "On", tone: "ok" } : { text: "Off", tone: "off" },
+        backLabel: "Assistants",
+        order: assistantPage.order + i,
+        source: { kind: "client", id: assistantPage.id },
+        inUse: true,
+        listed: true,
+        protected: false,
+        hasSecrets: false,
+        hasErrors: false
+      })
+    })
+  }
   const devicePage = perItem("device")
   if (devicePage !== undefined) {
     ;(input.devices ?? []).forEach((d, i) => {
@@ -227,7 +255,7 @@ export const buildSettingsTree = (input: TreeInput): ReadonlyArray<NavGroup> => 
 
 // ---- Paths and deep links
 
-/** `[]` = the top (the category list on a phone), `[category]`, `[category, page]`. */
+/** `[]` = the top (the category list on a phone), `[category]`, `[category, page]`, `[category, page, tab]` (an assistant's tab). */
 export type SettingsPath = ReadonlyArray<string>
 
 const HASH = "#settings"
@@ -235,13 +263,16 @@ const HASH = "#settings"
 /** `#settings/speech/engine` → `["speech", "engine"]`; `#settings` → `[]`; anything else → undefined. */
 export const parseSettingsHash = (hash: string): SettingsPath | undefined => {
   if (hash !== HASH && !hash.startsWith(`${HASH}/`)) return undefined
-  return hash.slice(HASH.length).split("/").filter((p) => p.length > 0).map((p) => decodeURIComponent(p)).slice(0, 2)
+  return hash.slice(HASH.length).split("/").filter((p) => p.length > 0).map((p) => decodeURIComponent(p)).slice(0, 3)
 }
 
 export const formatSettingsHash = (path: SettingsPath): string =>
-  [HASH, ...path.slice(0, 2).map((p) => encodeURIComponent(p))].join("/")
+  [HASH, ...path.slice(0, 3).map((p) => encodeURIComponent(p))].join("/")
 
 export const samePath = (a: SettingsPath, b: SettingsPath) => a.length === b.length && a.every((x, i) => x === b[i])
+
+/** The same category and page: a tab of one page is not another page (its edits stay across tabs). */
+export const samePage = (a: SettingsPath, b: SettingsPath) => a[0] === b[0] && a[1] === b[1]
 
 export interface Resolved {
   readonly group: NavGroup | undefined
@@ -309,7 +340,7 @@ export interface SettingsUi {
  * edits (`discard`: the user confirmed). Closing keeps the last path, so the settings reopen where they were.
  */
 export const navigateSettings = (ui: SettingsUi, to: SettingsPath | "close", discard = false): Partial<SettingsUi> => {
-  const leaving = to === "close" ? ui.settingsOpen : !ui.settingsOpen || !samePath(to, ui.settingsPath)
+  const leaving = to === "close" ? ui.settingsOpen : !ui.settingsOpen || !samePage(to, ui.settingsPath)
   if (ui.settingsDirty && leaving && !discard) return { settingsLeave: to }
   if (to === "close") return { settingsOpen: false, settingsDirty: false, settingsLeave: undefined }
   return { settingsOpen: true, settingsPath: to, settingsLeave: undefined, ...(leaving ? { settingsDirty: false } : {}) }

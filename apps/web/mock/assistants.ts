@@ -1,0 +1,296 @@
+/**
+ * The mock's assistants, device types and device settings (protocol 7, docs/ASSISTANTS.md §5): held in memory, with the
+ * rev check, the validation of `@pva/protocol` and the sample data of the admin mock-up (Jeff, T3, Keuken). The server
+ * (`server.ts`) does the access check and the pushes; this module answers the messages.
+ */
+import {
+  type Assistant,
+  type AssistantBody,
+  type AssistantInfo,
+  assistantUsedOn,
+  BUILT_IN_WEB_VOICE_SETTINGS,
+  type DeviceOwn,
+  type DeviceSettings,
+  type DeviceSettingsPatch,
+  type DeviceTarget,
+  type DeviceTypeInfo,
+  type ErrorInfo,
+  type FieldError,
+  type Issue,
+  effectiveDeviceSettings,
+  hearerOf,
+  MAX_ASSISTANTS,
+  makeAssistantId,
+  type ModuleInfo,
+  type ModuleOffer,
+  removeAssistantFromSettings,
+  validateAssistant,
+  validateDeviceSettings,
+  WEB_VOICE_DEVICE_TYPE,
+  WEB_VOICE_KIND
+} from "@pva/protocol"
+
+export interface AssistantResult {
+  readonly ok: boolean
+  readonly error?: ErrorInfo
+  readonly assistantId?: string
+}
+
+const OK: AssistantResult = { ok: true }
+const fail = (code: ErrorInfo["code"], message: string, extra: { readonly fieldErrors?: ReadonlyArray<FieldError>; readonly warnings?: ReadonlyArray<FieldError> } = {}): AssistantResult => ({
+  ok: false,
+  error: { code, message, ...extra }
+})
+const fieldErrorsOf = (issues: ReadonlyArray<Issue>): ReadonlyArray<FieldError> => issues.map((i) => ({ key: i.path, message: i.message }))
+const SPECIFIC = ["duplicate_phrase", "unknown_assistant", "limit_reached"] as const
+const refusal = (issues: ReadonlyArray<Issue>): AssistantResult => {
+  const specific = issues.find((i) => (SPECIFIC as ReadonlyArray<string>).includes(i.code))
+  return fail((specific?.code ?? "invalid_settings") as ErrorInfo["code"], (specific ?? issues[0])?.message ?? "Some settings are not valid.", { fieldErrors: fieldErrorsOf(issues) })
+}
+
+const clone = <T>(x: T): T => structuredClone(x)
+
+const hearingOf = (model: string, language: "auto" | "en" | "nl", early: number, final: number, minSpeech: number, threshold: number) => ({
+  engine: "sherpa" as const,
+  model,
+  language,
+  eagerSilenceMs: early,
+  finalSilenceMs: final,
+  minSpeechMs: minSpeech,
+  agc: true,
+  agcMaxGainDb: 30,
+  vadThreshold: threshold,
+  deepgram: { eotThreshold: 0.7, eagerEotThreshold: 0.5, eotTimeoutMs: 5000 }
+})
+
+/** The admin mock-up's three assistants (docs/mockups/assistants/admin.html), on the modules the mock has. */
+export const seedAssistants = (): Array<Assistant> => [
+  {
+    id: "jeff",
+    rev: 0,
+    name: "Jeff",
+    purpose: "Everyday questions and the house.",
+    handles: "General questions, the weather and the time, and switching things in the house on and off.",
+    on: true,
+    prompt: "You are Jeff, the voice assistant of our house. Answer in one or two short sentences: your replies are spoken. When a question is about the house, use Home Assistant. If you are not sure what was meant, ask one short question.",
+    toolRounds: 5,
+    followUpSeconds: 8,
+    newConversationAfter: 10,
+    replyEarly: true,
+    confirmActions: "off",
+    llm: { account: "anthropic", model: "claude-haiku-5-5", effort: "low", thinking: "off", maxTokens: 1024, giveUpMs: 5000, warmUp: true, useModules: true, freshSessionAfterMinutes: 30 },
+    hearing: hearingOf("parakeet-v2", "en", 250, 600, 100, 0.5),
+    voice: { provider: "sherpa", voiceId: "en_US-lessac-medium" },
+    modules: { clock: { on: true, offTools: [] }, weather: { on: true, offTools: [] }, "home-assistant": { on: true, offTools: [] }, notes: { on: false, offTools: [] } }
+  },
+  {
+    id: "t3",
+    rev: 0,
+    name: "T3",
+    purpose: "Talks to my T3 Code instance: starts and checks coding work.",
+    handles: "Anything about coding work: starting, checking or messaging threads in T3 Code.",
+    on: true,
+    prompt: "You are T3. You talk to my T3 Code instance: start coding work, check on it and read back what it says. Keep spoken replies short. When a thread is still running, say so and offer to check again later.",
+    toolRounds: 8,
+    followUpSeconds: 30,
+    newConversationAfter: "never",
+    replyEarly: false,
+    confirmActions: "off",
+    llm: { account: "claude-subscription", model: "claude-sonnet-5-5", effort: "medium", thinking: "adaptive", maxTokens: 2048, giveUpMs: 8000, warmUp: true, useModules: true, freshSessionAfterMinutes: 30 },
+    hearing: hearingOf("parakeet-v2", "en", 250, 600, 100, 0.5),
+    voice: { provider: "sherpa", voiceId: "kokoro-af_heart" },
+    modules: { clock: { on: true, offTools: [] }, notes: { on: true, offTools: [] } }
+  },
+  {
+    id: "keuken",
+    rev: 0,
+    name: "Keuken",
+    purpose: "Dutch kitchen helper: timers, recipes, shopping list.",
+    handles: "Cooking and the kitchen, usually in Dutch: timers, recipes and the shopping list.",
+    on: true,
+    prompt: "Je bent Keuken, de hulp in onze keuken. Antwoord kort en in het Nederlands. Je zet timers, helpt met recepten stap voor stap en houdt de boodschappenlijst bij.",
+    toolRounds: 5,
+    followUpSeconds: 0,
+    newConversationAfter: 30,
+    replyEarly: true,
+    confirmActions: "off",
+    llm: { account: "home-model", model: "qwen3-14b", effort: "low", thinking: "off", maxTokens: 768, giveUpMs: 6000, warmUp: true, useModules: true, freshSessionAfterMinutes: 30 },
+    hearing: hearingOf("nemotron-320", "nl", 300, 800, 120, 0.45),
+    voice: { provider: "sherpa", voiceId: "nl_NL-pim-medium" },
+    modules: { clock: { on: true, offTools: [] }, notes: { on: true, offTools: [] } }
+  }
+]
+
+/** The sample devices' own settings: the kitchen iPad has its own list; the others follow the type's defaults. */
+const seedTypeSettings = (): DeviceSettings => ({
+  ...BUILT_IN_WEB_VOICE_SETTINGS,
+  assistants: [{ assistant: "jeff", phrases: [] }, { assistant: "t3", phrases: ["Hey T3", "Hey tee three"] }],
+  withoutPhrase: { mode: "assistant", assistant: "jeff" },
+  voicePage: { pick: true },
+  captions: { captions: true, speakTyped: false }
+})
+
+const seedDeviceOwn = (): Map<string, { own: DeviceOwn; rev: number }> =>
+  new Map([
+    ["d-kitchen-ipad-0001", { rev: 0, own: { assistants: [{ assistant: "jeff", phrases: ["Hey Jeff"] }, { assistant: "keuken", phrases: ["Hé keuken", "Hey keuken"], followUpSeconds: 15 }], captions: { captions: false, speakTyped: false } } }]
+  ])
+
+export interface Known {
+  readonly id: string
+  readonly name: string
+}
+
+export interface AssistantsMock {
+  readonly reset: () => void
+  readonly assistants: () => ReadonlyArray<Assistant>
+  readonly infos: (devices: ReadonlyArray<Known>) => Array<AssistantInfo>
+  readonly deviceTypes: () => Array<DeviceTypeInfo>
+  /** A device's protocol 7 fields. */
+  readonly deviceFields: (id: string) => { own: DeviceOwn; settings: DeviceSettings; hearer: string | null; rev: number }
+  readonly create: (message: { assistant: AssistantBody; copyOf?: string | undefined }) => AssistantResult
+  readonly save: (message: { assistant: Assistant }) => AssistantResult
+  readonly remove: (message: { id: string; rev: number }, devices: ReadonlyArray<Known>) => AssistantResult
+  readonly saveDevice: (message: { target: DeviceTarget; rev: number; settings: DeviceSettingsPatch; saveAnyway?: boolean | undefined }) => AssistantResult
+  /** Another admin changed an assistant: the fields of `patch` are set and the rev goes up. */
+  readonly touch: (id: string, patch: Partial<AssistantBody>) => boolean
+  /** A device was forgotten: its own settings go. */
+  readonly forgetDevice: (id: string) => void
+}
+
+export const createAssistantsMock = (modules: () => ReadonlyArray<ModuleInfo>): AssistantsMock => {
+  let assistants = seedAssistants()
+  let typeSettings = seedTypeSettings()
+  let typeRev = 0
+  let deviceOwn = seedDeviceOwn()
+
+  const offers = (): Record<string, ModuleOffer> =>
+    Object.fromEntries(modules().filter((m) => m.state === "running").map((m) => [m.id, { overridable: [], tools: m.tools.map((t) => t.name) } satisfies ModuleOffer]))
+
+  /** `validateAssistant` as the real server uses it: no module field is overridable yet, so any `own` value is refused. */
+  const issues = (body: AssistantBody & { readonly id?: string }): ReadonlyArray<Issue> => {
+    const running = offers()
+    const out = [...validateAssistant(body, { others: assistants, modules: running })]
+    const known = new Set(modules().map((m) => m.id))
+    for (const [moduleId, choice] of Object.entries(body.modules)) {
+      if (!known.has(moduleId) || running[moduleId] !== undefined) continue
+      for (const field of Object.keys(choice.own ?? {})) out.push({ code: "invalid", path: `modules.${moduleId}.own.${field}`, message: `${field} cannot be set per assistant.` })
+    }
+    return out
+  }
+
+  const effective = (own: DeviceOwn | undefined): DeviceSettings => effectiveDeviceSettings(BUILT_IN_WEB_VOICE_SETTINGS, typeSettings, own)
+
+  const mock: AssistantsMock = {
+    reset: () => {
+      assistants = seedAssistants()
+      typeSettings = seedTypeSettings()
+      typeRev = 0
+      deviceOwn = seedDeviceOwn()
+    },
+    assistants: () => assistants,
+    infos: (devices) => {
+      const entries = [
+        { target: { kind: "type", type: WEB_VOICE_KIND } as DeviceTarget, settings: typeSettings },
+        ...devices.map((d) => ({ target: { kind: "device", id: d.id } as DeviceTarget, settings: effective(deviceOwn.get(d.id)?.own) }))
+      ]
+      const nameOf = (t: DeviceTarget) => (t.kind === "type" ? WEB_VOICE_DEVICE_TYPE.title : devices.find((d) => d.id === t.id)?.name ?? t.id)
+      return assistants.map((a) => {
+        const usedOn = assistantUsedOn(a.id, entries)
+        const used = a.on && usedOn.length > 0
+        const problems = [
+          ...(usedOn.length === 0 ? ["Not used on any device."] : []),
+          ...usedOn.filter((u) => u.reach === "unreachable").map((u) => `Cannot be reached on ${nameOf(u.target)}: no wake phrase and not the one that answers without a phrase.`)
+        ]
+        const state = used ? "ready" : "unused"
+        // As the real server (WP-9): the accounts it has no builder for fail with this problem.
+        const unavailable = used && (a.llm.account === "openrouter" || a.llm.account === "home-model")
+        return {
+          ...clone(a),
+          usedOn: [...usedOn],
+          resources: { llm: unavailable ? "failed" : state, voice: state },
+          problems: unavailable ? [...problems, `The ${a.llm.account === "home-model" ? "Home model" : "OpenRouter"} account is not available yet.`] : problems
+        }
+      })
+    },
+    deviceTypes: () => [{ kind: WEB_VOICE_KIND, title: WEB_VOICE_DEVICE_TYPE.title, one: WEB_VOICE_DEVICE_TYPE.one, many: WEB_VOICE_DEVICE_TYPE.many, description: WEB_VOICE_DEVICE_TYPE.description, keys: [...WEB_VOICE_DEVICE_TYPE.keys], settings: clone(typeSettings), rev: typeRev }],
+    deviceFields: (id) => {
+      const record = deviceOwn.get(id)
+      const settings = effective(record?.own)
+      return { own: clone(record?.own ?? {}), settings: clone(settings), hearer: hearerOf(settings), rev: record?.rev ?? 0 }
+    },
+    create: ({ assistant, copyOf }) => {
+      if (assistants.length >= MAX_ASSISTANTS) return fail("limit_reached", `There can be at most ${MAX_ASSISTANTS} assistants.`)
+      if (copyOf !== undefined && !assistants.some((a) => a.id === copyOf)) return fail("unknown_assistant", `There is no assistant ${copyOf} to start from.`)
+      const found = issues(assistant)
+      if (found.length > 0) return refusal(found)
+      const id = makeAssistantId(assistant.name, assistants.map((a) => a.id))
+      assistants = [...assistants, { ...clone(assistant), id, rev: 0 }]
+      return { ok: true, assistantId: id }
+    },
+    save: ({ assistant }) => {
+      const current = assistants.find((a) => a.id === assistant.id)
+      if (current === undefined) return fail("unknown_assistant", `There is no assistant ${assistant.id}.`)
+      const found = issues(assistant)
+      if (found.length > 0) return refusal(found)
+      if (assistant.rev !== current.rev) return fail("stale", `${current.name} changed since this page read it; reload it.`)
+      assistants = assistants.map((a) => (a.id === assistant.id ? { ...clone(assistant), rev: current.rev + 1 } : a))
+      return OK
+    },
+    remove: ({ id, rev }, devices) => {
+      const current = assistants.find((a) => a.id === id)
+      if (current === undefined) return fail("unknown_assistant", `There is no assistant ${id}.`)
+      if (rev !== current.rev) return fail("stale", `${current.name} changed since this page read it; reload it.`)
+      assistants = assistants.filter((a) => a.id !== id)
+      typeSettings = removeAssistantFromSettings(typeSettings, id) as DeviceSettings
+      typeRev += 1
+      for (const d of devices) {
+        const record = deviceOwn.get(d.id)
+        if (record === undefined) continue
+        deviceOwn.set(d.id, { own: removeAssistantFromSettings(record.own, id, typeSettings.assistants), rev: record.rev + 1 })
+      }
+      return OK
+    },
+    saveDevice: ({ target, rev, settings, saveAnyway }) => {
+      const patch = Object.fromEntries(Object.entries(settings).filter(([, v]) => v !== undefined)) as Record<string, unknown>
+      const known = new Set(assistants.map((a) => a.id))
+      if (target.kind === "type") {
+        if (target.type !== WEB_VOICE_KIND) return fail("unknown_device", `No device type ${target.type}.`)
+        if (rev !== typeRev) return fail("stale", "The defaults changed since this page read them; reload them.")
+        if (Object.values(patch).some((v) => v === null)) return fail("bad_message", "A type's defaults have no value to go back to.")
+        const next = { ...typeSettings, ...patch } as DeviceSettings
+        const v = validateDeviceSettings(next, known)
+        if (v.errors.length > 0) return refusal(v.errors)
+        const before = new Set(validateDeviceSettings(typeSettings, known).warnings.map((w) => w.path))
+        const fresh = v.warnings.filter((w) => !before.has(w.path))
+        if (fresh.length > 0 && saveAnyway !== true) return fail("invalid_settings", `${fresh[0]!.message} Save anyway to keep it.`, { warnings: fieldErrorsOf(fresh) })
+        typeSettings = next
+        typeRev += 1
+        return OK
+      }
+      const record = deviceOwn.get(target.id) ?? { own: {}, rev: 0 }
+      if (rev !== record.rev) return fail("stale", "The device changed since this page read it; reload it.")
+      const own: Record<string, unknown> = { ...record.own }
+      for (const [k, v] of Object.entries(patch)) {
+        if (v === null) delete own[k]
+        else own[k] = v
+      }
+      const v = validateDeviceSettings(effective(own as DeviceOwn), known)
+      if (v.errors.length > 0) return refusal(v.errors)
+      const before = new Set(validateDeviceSettings(effective(record.own), known).warnings.map((w) => w.path))
+      const fresh = v.warnings.filter((w) => !before.has(w.path))
+      if (fresh.length > 0 && saveAnyway !== true) return fail("invalid_settings", `${fresh[0]!.message} Save anyway to keep it.`, { warnings: fieldErrorsOf(fresh) })
+      deviceOwn.set(target.id, { own: own as DeviceOwn, rev: record.rev + 1 })
+      return OK
+    },
+    touch: (id, patch) => {
+      const current = assistants.find((a) => a.id === id)
+      if (current === undefined) return false
+      assistants = assistants.map((a) => (a.id === id ? { ...a, ...clone(patch), rev: a.rev + 1 } : a))
+      return true
+    },
+    forgetDevice: (id) => {
+      deviceOwn.delete(id)
+    }
+  }
+  return mock
+}

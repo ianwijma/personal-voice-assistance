@@ -97,7 +97,9 @@ describe("paths", () => {
     expect(parseSettingsHash("#settings")).toEqual([])
     expect(parseSettingsHash("#settings/")).toEqual([])
     expect(parseSettingsHash("#settings/speech/engine")).toEqual(["speech", "engine"])
-    expect(parseSettingsHash("#settings/modules/weather/extra")).toEqual(["modules", "weather"])
+    // A third part is an assistant's tab; nothing after it counts.
+    expect(parseSettingsHash("#settings/assistants/jeff/model")).toEqual(["assistants", "jeff", "model"])
+    expect(parseSettingsHash("#settings/modules/weather/extra/more")).toEqual(["modules", "weather", "extra"])
     expect(parseSettingsHash("#settingsx")).toBeUndefined()
     expect(parseSettingsHash("")).toBeUndefined()
     expect(formatSettingsHash(["speech", "engine"])).toBe("#settings/speech/engine")

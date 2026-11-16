@@ -126,6 +126,7 @@ import {
 } from "@pva/protocol"
 import { exampleEngineStatus, exampleSnapshot, exampleVoiceSection, exampleWeatherModule } from "@pva/protocol/examples"
 import { type WebSocket, WebSocketServer } from "ws"
+import { createAssistantsMock } from "./assistants.ts"
 import { encodeWav, MOCK_PROVIDERS } from "./voices.ts"
 import type { Condition, FieldError } from "@pva/protocol"
 
@@ -180,7 +181,7 @@ const initialModules = (): Array<ModuleInfo> => [
     enabled: true,
     state: "running",
     status: { text: "Europe/Amsterdam · 13 November 2026", tone: "neutral" },
-    tools: [{ name: "current_time", description: "The current time in a time zone.", speculative: true }],
+    tools: [{ name: "current_time", description: "The current time in a time zone.", speculative: true }, { name: "time_in", description: "The time in another place.", speculative: true }],
     settings: {
       fields: [
         { type: "text", key: "timeZone", label: "Time zone", description: "IANA name, e.g. Europe/Amsterdam. Empty: this machine's zone.", apply: "live", default: "", placeholder: "Europe/Amsterdam", locked: { reason: "Set by CLOCK_TIME_ZONE in the environment" } },
@@ -721,6 +722,8 @@ let connSeq = 0
 const voiceSessions = new Map<string, VSession>()
 let conversationSeq = 0
 let modules = initialModules()
+/** Protocol 7: assistants, device types and the devices' own sections (mock/assistants.ts). */
+const assistantsMock = createAssistantsMock(() => modules)
 // Before the sections: their checks look at which voice models are downloaded.
 let models: Array<ModelSet> = initialModels()
 let sections = withWarnings(initialSections())
@@ -786,8 +789,7 @@ const deviceInfos = (): Array<DeviceListInfo> => {
   return [...devices.values()]
     .map((d) => {
       const connections = [...conns].filter((c) => c.welcomed && c.deviceId === d.id).length
-      // Protocol 7 fields: the mock has no assistants yet (the UI packages add them).
-      return { ...d, lastSeen: connections > 0 ? now : d.lastSeen, profile: deviceProfile(d.id), connections, audioOwner: voiceSessions.get(d.id)?.owner !== undefined, own: {}, settings: BUILT_IN_WEB_VOICE_SETTINGS, hearer: null, rev: 0 }
+      return { ...d, lastSeen: connections > 0 ? now : d.lastSeen, profile: deviceProfile(d.id), connections, audioOwner: voiceSessions.get(d.id)?.owner !== undefined, ...assistantsMock.deviceFields(d.id) }
     })
     .sort((a, b) => b.lastSeen - a.lastSeen)
 }
@@ -809,12 +811,19 @@ const adminState = (c: Conn, extra: Partial<AdminState> = {}): AdminState => {
 const sendAdminSnapshot = (c: Conn) =>
   sendTo(c, {
     type: "admin.snapshot",
-    snapshot: { engine, modules, sections, traces: traces.slice(-20), vault: vaultInfo(c), env, models, jobs, frontends: frontendInfos(), devices: deviceInfos(), sessions: sessionInfos() }
+    snapshot: { engine, modules, sections, traces: traces.slice(-20), vault: vaultInfo(c), env, models, jobs, frontends: frontendInfos(), devices: deviceInfos(), sessions: sessionInfos(), assistants: assistantInfos(), deviceTypes: assistantsMock.deviceTypes() }
   })
 const pushProfiles = () => {
   for (const c of conns) if (c.welcomed && c.frontend === "voice") sendTo(c, { type: "device.profile", ...profileInfo(c) })
 }
 const devicesChanged = () => broadcast({ type: "devices", devices: deviceInfos() })
+const assistantInfos = () => assistantsMock.infos([...devices.values()].map((d) => ({ id: d.id, name: d.name })))
+/** After an assistant or device save: the whole lists, as the real server pushes them (admin connections only). */
+const assistantsChanged = () => {
+  broadcast({ type: "assistants", assistants: assistantInfos() })
+  broadcast({ type: "device.types", types: assistantsMock.deviceTypes() })
+  devicesChanged()
+}
 const frontendsChanged = () => broadcast({ type: "frontends", frontends: frontendInfos() })
 // ---- Voice sessions (protocol 6)
 
@@ -1013,6 +1022,7 @@ const resetState = () => {
   loginRefusedUntil = 0
   logoutFails = false
   devices = seededDevices()
+  assistantsMock.reset()
   kindDefaults = initialKindDefaults()
   env = initialEnv()
   favourites = initialFavourites()
@@ -1036,7 +1046,7 @@ const sendTo = (c: Conn, m: ServerMessage) => {
   if (c.ws.readyState === c.ws.OPEN) c.ws.send(encodeServerMessage(m))
 }
 /** Messages that carry admin data: only admin connections get them (protocol 5). */
-const ADMIN_ONLY: ReadonlySet<ServerMessage["type"]> = new Set(["engine", "module.changed", "section.changed", "vault", "env", "job", "models", "frontends", "devices", "sessions", "trace", "wake.heard", "admin.snapshot"])
+const ADMIN_ONLY: ReadonlySet<ServerMessage["type"]> = new Set(["engine", "module.changed", "section.changed", "vault", "env", "job", "models", "frontends", "devices", "assistants", "device.types", "sessions", "trace", "wake.heard", "admin.snapshot"])
 let lastSummary = ""
 const broadcast = (m: ServerMessage) => {
   const adminOnly = ADMIN_ONLY.has(m.type)
@@ -1916,12 +1926,42 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
       const record = devices.get(m.id)
       if (record === undefined) return result(c, m.requestId, false, { code: "unknown_device", message: "This device is not known (any more)." })
       devices.delete(m.id)
+      assistantsMock.forgetDevice(m.id)
       // A device that is connected now is recorded again as new.
       const now = Date.now()
       if ([...conns].some((x) => x.welcomed && x.deviceId === m.id)) devices.set(m.id, { ...record, firstSeen: now, lastSeen: now, overrides: {} })
       pushProfiles()
       result(c, m.requestId, true)
       devicesChanged()
+      return
+    }
+    case "assistant.create": {
+      if (requireAdmin(c, m.requestId)) return
+      const r = assistantsMock.create(m)
+      sendTo(c, r.ok ? { type: "result", requestId: m.requestId, ok: true, ...(r.assistantId !== undefined ? { assistantId: r.assistantId } : {}) } : { type: "result", requestId: m.requestId, ok: false, ...(r.error !== undefined ? { error: r.error } : {}) })
+      if (r.ok) assistantsChanged()
+      return
+    }
+    case "assistant.save": {
+      if (requireAdmin(c, m.requestId)) return
+      const r = assistantsMock.save(m)
+      sendTo(c, r.ok ? { type: "result", requestId: m.requestId, ok: true } : { type: "result", requestId: m.requestId, ok: false, ...(r.error !== undefined ? { error: r.error } : {}) })
+      if (r.ok) assistantsChanged()
+      return
+    }
+    case "assistant.delete": {
+      if (requireAdmin(c, m.requestId)) return
+      const r = assistantsMock.remove(m, [...devices.values()].map((d) => ({ id: d.id, name: d.name })))
+      sendTo(c, r.ok ? { type: "result", requestId: m.requestId, ok: true } : { type: "result", requestId: m.requestId, ok: false, ...(r.error !== undefined ? { error: r.error } : {}) })
+      if (r.ok) assistantsChanged()
+      return
+    }
+    case "device.save": {
+      if (requireAdmin(c, m.requestId)) return
+      if (m.target.kind === "device" && !devices.has(m.target.id)) return result(c, m.requestId, false, { code: "unknown_device", message: "That device is not known." })
+      const r = assistantsMock.saveDevice(m)
+      sendTo(c, r.ok ? { type: "result", requestId: m.requestId, ok: true } : { type: "result", requestId: m.requestId, ok: false, ...(r.error !== undefined ? { error: r.error } : {}) })
+      if (r.ok) assistantsChanged()
       return
     }
     case "wake.test": {
@@ -2457,6 +2497,12 @@ const http = createServer((req, res) => {
           typeof payload.accepted === "boolean" ? payload.accepted : payload.accepted === null ? null : undefined
         )
         return json(res, 200, { ok: true })
+      }
+      case "/mock/assistant": {
+        // Another admin changed an assistant (tests): `patch` is set on it and its rev goes up; the lists are pushed.
+        const ok = assistantsMock.touch(String(payload.id ?? ""), (payload.patch ?? {}) as Parameters<typeof assistantsMock.touch>[1])
+        if (ok) assistantsChanged()
+        return json(res, ok ? 200 : 404, { ok })
       }
       case "/mock/defaults": {
         // The web-voice defaults, as admin › Front ends would set them (tests).
