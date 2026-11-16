@@ -168,7 +168,8 @@ Required shape:
   removes the override.
 - Activation: `AssistantState` gains `asleep` (owner present, wake mode, no window open). Server `wake`
   `{ phrase, armed }` to all connections when a phrase is heard. Admin tester: `wake.test { on }` and server
-  `wake.heard { text, matched?: phrase, at }` to connections that switched it on (5 min limit, then off).
+  `wake.heard { text, matched?: phrase, at }` to connections that switched it on (5 min limit, then off). Protocol 7
+  adds `source?: { deviceId?, assistantId? }` (where it was heard; docs/ASSISTANTS.md §5).
 - `audio.claim` / `audio.config` lose `interruptMode` (it comes from the profile).
 - A voice connection no longer needs `vault.*`, `settings.*`, `module.*`, `job.*`, `model.*`: all admin only.
 
@@ -271,7 +272,7 @@ New and changed messages (schema constant → `type`):
 | server | `Frontends` | `frontends` | `{ frontends: FrontendKindInfo[] }`, admin only |
 | server | `Devices` | `devices` | `{ devices: DeviceInfo[] }`, admin only |
 | server | `Wake` | `wake` | `{ phrase, armed }`, everyone |
-| server | `WakeHeard` | `wake.heard` | `{ text, matched?, at }`, admin connections with the tester on |
+| server | `WakeHeard` | `wake.heard` | `{ text, matched?, at }` (+ protocol 7 `source?`), admin connections with the tester on |
 | common | `AssistantState` | — | + `asleep` |
 | common | `ErrorCode` | — | + `admin_required`, + `unknown_device`; `locked` now means "the keys are locked" only |
 

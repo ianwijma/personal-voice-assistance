@@ -57,6 +57,12 @@ interface Placement {
 
 const NO_PLACEMENT: Placement = { on: false, phrase: "" }
 
+/**
+ * Start from › Blank, as the radio value: never an assistant id (`AssistantId` is lower case letters, digits and
+ * dashes), so an assistant called "Blank" (id `blank`) is a copy like any other. Every other value is an id.
+ */
+export const BLANK_START = "(blank)"
+
 export function NewAssistantWizard() {
   const client = useClient()
   const part = useClientState((s) => s.ui.settingsPath[2])
@@ -90,7 +96,7 @@ export function NewAssistantWizard() {
   }, [])
   const draft = useWizardDraft(blank, () => creating.current)
   const a = draft.current
-  const [from, setFrom] = useState("blank")
+  const [from, setFrom] = useState(BLANK_START)
   const [where, setWhere] = useState<Readonly<Record<string, Placement>>>({})
   const [busy, setBusy] = useState(false)
   const [whereMessage, setWhereMessage] = useState<string | undefined>()
@@ -98,7 +104,7 @@ export function NewAssistantWizard() {
   const [now] = useState(() => Date.now())
 
   // The settings screen asks "Leave without saving?" once anything has been typed or chosen.
-  const dirty = a.name !== "" || a.purpose !== "" || a.handles !== "" || from !== "blank" || Object.values(where).some((w) => w.on) || !deepEqual({ ...a, name: "", purpose: "", handles: "" }, { ...blank(), name: "", purpose: "", handles: "" })
+  const dirty = a.name !== "" || a.purpose !== "" || a.handles !== "" || from !== BLANK_START || Object.values(where).some((w) => w.on) || !deepEqual({ ...a, name: "", purpose: "", handles: "" }, { ...blank(), name: "", purpose: "", handles: "" })
   useEffect(() => {
     if (client.store.get().ui.settingsDirty !== dirty) client.store.dispatch({ type: "local/ui", patch: { settingsDirty: dirty } })
   }, [client, dirty])
@@ -116,7 +122,7 @@ export function NewAssistantWizard() {
   const chooseFrom = (id: string) => {
     if (creating.current) return
     setFrom(id)
-    const source = assistants.find((x) => x.id === id)
+    const source = id === BLANK_START ? undefined : assistants.find((x) => x.id === id)
     const fresh = blank()
     const body = source === undefined ? toBody(fresh) : toBody(source)
     draft.replace({ ...a, ...body, name: a.name, purpose: a.purpose, handles: a.handles, on: true, confirmActions: "off" })
@@ -138,7 +144,7 @@ export function NewAssistantWizard() {
     const body = { ...toBody(a), name: a.name.trim() }
     let outcome: Outcome
     try {
-      outcome = await client.createAssistant(body, { ...(from !== "blank" ? { copyOf: from } : {}), placements }) // continuation(identity): only this page's own state; it navigates only while this wizard is still mounted (`alive`)
+      outcome = await client.createAssistant(body, { ...(from !== BLANK_START ? { copyOf: from } : {}), placements }) // continuation(identity): only this page's own state; it navigates only while this wizard is still mounted (`alive`)
     } catch {
       outcome = { kind: "refused", code: "internal", message: "Could not create it. Try again." }
     }
@@ -188,7 +194,7 @@ export function NewAssistantWizard() {
               value={from}
               onChange={chooseFrom}
               cards={[
-                { value: "blank", title: "Blank", tags: [], description: "Good defaults: Anthropic API, Parakeet v2, the Lessac voice on this machine and the Clock module." },
+                { value: BLANK_START, title: "Blank", tags: [], description: "Good defaults: Anthropic API, Parakeet v2, the Lessac voice on this machine and the Clock module." },
                 ...assistants.map((x) => ({
                   value: x.id,
                   title: `Copy of ${x.name}`,
@@ -322,7 +328,7 @@ export function NewAssistantWizard() {
             <CheckRow n={1} label="Start" go={go}>
               {a.name.trim() !== "" ? <span className="text-ink">{a.name.trim()}</span> : <span className="text-warn">No name yet</span>}
               {a.purpose !== "" && <span className="text-ink-muted"> · {a.purpose}</span>}
-              <span className="block text-[12px] text-ink-faint">{from === "blank" ? "Started blank" : `Copy of ${assistants.find((x) => x.id === from)?.name ?? from}`}</span>
+              <span className="block text-[12px] text-ink-faint">{from === BLANK_START ? "Started blank" : `Copy of ${assistants.find((x) => x.id === from)?.name ?? from}`}</span>
             </CheckRow>
             <CheckRow n={2} label="Language model" go={go}>
               {accountInfo(a.llm.account).title} · <span className="font-mono text-[13px]">{a.llm.account === "offline" ? "no model" : a.llm.model} · effort {a.llm.effort}</span>

@@ -685,7 +685,8 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
           moduleOfTool: (name) => host.snapshot().toolModules.get(name) ?? null,
           turnTrace,
           send: (message) => hub?.toSession(key, message),
-          wakeHeard: (text, phrase, accepted) => hub?.wakeHeard(key, text, phrase, accepted),
+          wakeHeard: (text, phrase, accepted, assistant) =>
+            hub?.wakeHeard(key, text, phrase, accepted, { ...(device !== undefined ? { deviceId: device.id } : {}), ...(assistant !== undefined ? { assistantId: assistant } : {}) }),
           onChange: (minor) => hub?.sessionsChanged(minor),
           onTrace: (trace) => {
             sessions.addTrace(trace)
