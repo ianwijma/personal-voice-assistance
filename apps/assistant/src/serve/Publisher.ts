@@ -26,8 +26,8 @@ export interface PublisherOptions {
   readonly broadcast: (message: ServerMessage) => void
   /** The module that contributes a tool (from the module host's current snapshot). */
   readonly moduleOfTool: (name: string) => string | null
-  /** The key of the voice that speaks this session's replies (`assistant.text.voice`). */
-  readonly voice: () => string
+  /** The key of the voice that speaks `assistant`'s replies in this session (`assistant.text.voice`). */
+  readonly voice: (assistant: string | undefined) => string
   /** Right after `turn.start` of a committed (or just promoted) turn went out, before the rest of its messages. */
   readonly onCommitted?: (turnId: number) => void
   /** A committed turn ended: its trace (serve mode keeps the recent ones of every session for admin). */
@@ -102,7 +102,7 @@ export const makePublisher = (options: PublisherOptions): Publisher => {
           spoken: event.spoken,
           pending: event.speculative,
           buffer: [],
-          voice: options.voice(),
+          voice: options.voice(assistant),
           assistant
         }
         turns.set(event.turnId, view)

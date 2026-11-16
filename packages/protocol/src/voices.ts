@@ -23,6 +23,9 @@ export const MAX_API_BODY_BYTES = 4096
 export const ProviderIdString = Schema.String.check(Schema.isPattern(/^[a-z][a-z0-9-]{0,31}$/))
 export const VoiceIdString = Schema.String.check(Schema.isPattern(/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/))
 
+/** An assistant id (the pattern of `AssistantId`, repeated here: `assistants.ts` imports this file). */
+const AssistantIdString = Schema.String.check(Schema.isPattern(/^[a-z][a-z0-9-]{0,31}$/))
+
 /** One voice of one provider. */
 export const VoiceRefSchema = Schema.Struct({ provider: ProviderIdString, voiceId: VoiceIdString })
 export type VoiceRefJson = typeof VoiceRefSchema.Type
@@ -41,6 +44,7 @@ export const ProviderInfo = Schema.Struct({
   settingsPath: Schema.String,
   implication: Schema.optionalKey(Schema.String),
   voiceCount: Schema.optionalKey(NonNegativeFinite),
+  /** An assistant speaks with a voice of this provider. */
   inUse: Schema.Boolean
 })
 export type ProviderInfo = typeof ProviderInfo.Type
@@ -63,7 +67,8 @@ export const VoiceEntry = Schema.Struct({
     job: Schema.optionalKey(JobInfo)
   })),
   previewable: Schema.Boolean,
-  selected: Schema.Boolean,
+  /** Protocol 7: the assistants that speak with this voice (replaces `selected`). */
+  usedBy: Schema.Array(AssistantIdString),
   favourite: Schema.Boolean
 })
 export type VoiceEntry = typeof VoiceEntry.Type
@@ -141,7 +146,8 @@ export const DefaultVoice = Schema.Struct({
   voice: VoiceRefSchema,
   key: Schema.String,
   name: Schema.optionalKey(Schema.String),
-  source: Schema.Literals(["saved", "environment", "migrated", "default"]),
+  /** `assistant` (protocol 7): the first assistant's voice; `PUT /api/voices/default` is gone (the assistant's Voice tab saves it). */
+  source: Schema.Literals(["saved", "environment", "migrated", "default", "assistant"]),
   locked: Schema.Boolean,
   running: Schema.optionalKey(Schema.String),
   reloadPending: Schema.Boolean,

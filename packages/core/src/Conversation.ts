@@ -402,6 +402,8 @@ interface TurnPlan {
   readonly agent?: Agent
   /** Speak this instead of running an agent. */
   readonly canned?: string
+  /** The voice of a `Say` (a canned reply made without a setup): the setup's `tts`, read when it starts. */
+  readonly tts?: Tts["Service"] | undefined
   /** Spoken before the agent's answer ("Codex isn't available."). */
   readonly notice?: string
   /** Manual routing changes (`SetActiveAgent`) made before this plan; a later one wins over this turn's routing outcome. */
@@ -517,7 +519,7 @@ export const makeConversationWithSetup = Effect.fnUntraced(function*(options: Co
   return yield* makeConversationCore(
     {
       ...options,
-      setup: Effect.map(options.setup, (s): AgentTurnSetup => ({ system: s.system, registry: s.registry, agents: agentsFor(s.registry, s.llm ?? defaultLlm) }))
+      setup: Effect.map(options.setup, (s): AgentTurnSetup => ({ system: s.system, registry: s.registry, agents: agentsFor(s.registry, s.llm ?? defaultLlm), ...(s.tts !== undefined ? { tts: s.tts } : {}) }))
     },
     true
   )
@@ -1376,7 +1378,7 @@ const makeConversationCore = Effect.fnUntraced(function*(options: AgentConversat
   const voice = <E>(events: Stream.Stream<ConversationInput, E>): Effect.Effect<void, E, Tts | AudioOutput> =>
     Effect.scoped(Effect.gen(function*() {
       const scope = yield* Effect.scope
-      const tts = yield* Tts
+      const defaultTts = yield* Tts
       const output = yield* AudioOutput
       let current: ActiveTurn | undefined
 
@@ -1409,6 +1411,8 @@ const makeConversationCore = Effect.fnUntraced(function*(options: AgentConversat
       const turnBody = (turn: ActiveTurn, ctx: ReplyContext) =>
         Effect.gen(function*() {
           const log = ctx.log
+          // The turn's voice, fixed at its start (`TurnSetup.tts`), else the voice loop's.
+          const tts = ctx.plan.tts ?? ctx.plan.setup?.tts ?? defaultTts
           const queue = yield* Queue.unbounded<TtsAudio, AgentError | TtsError | Cause.Done>()
 
           // One TTS stream for the whole turn (all rounds), fed clause by clause as the
@@ -1514,7 +1518,9 @@ const makeConversationCore = Effect.fnUntraced(function*(options: AgentConversat
           // to the old conversation.
           const reset = how.say === undefined && (yield* resetIfIdle)
           const answerable = reset ? undefined : how.answerable
-          const plan: TurnPlan = how.say !== undefined ? { canned: how.say } : planTurn(yield* options.setup, text, source, how.explicitAgent, answerable)
+          const plan: TurnPlan = how.say !== undefined
+            ? { canned: how.say, tts: (yield* options.setup).tts }
+            : planTurn(yield* options.setup, text, source, how.explicitAgent, answerable)
           const trace = tt.begin(source, speculative)
           const promoted = yield* Deferred.make<void>()
           if (!speculative) {

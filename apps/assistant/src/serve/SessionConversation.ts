@@ -12,6 +12,7 @@ import {
   type Message,
   type SttEvent,
   Tts,
+  TtsError,
   type TurnSetup,
   TurnTrace,
   type VoiceRef,
@@ -25,8 +26,8 @@ import type { BuiltEngines, Engine } from "./Engine.ts"
 /**
  * One voice session's conversation on the shared engines (docs/VOICE-SESSIONS.md §2): the `Conversation` and its
  * voice loop, rebuilt on every engine build with this session's history, conversation id and idle clock carried
- * over; and the typed-input admission (`maxPendingInputs`, Stop generations). Every reply is spoken with the build's
- * voice, the assistant's (docs/VOICE-PROVIDERS.md).
+ * over; and the typed-input admission (`maxPendingInputs`, Stop generations). Every reply is spoken with the voice of
+ * the turn's setup (`TurnSetup.tts`: the assistant's own, from the resource pool, docs/ASSISTANTS.md §3.2).
  */
 
 export type SendOutcome = "accepted" | "busy" | "not_running"
@@ -101,6 +102,12 @@ export interface SessionConversation {
 /** The conversation's own `Llm` when neither the turn's setup nor the build names one: every turn fails. */
 const noLlm = Llm.of({ stream: () => Stream.fail(new LlmError({ message: "No language model is set up for this assistant." })) })
 
+/** The voice loop's own `Tts` when the turn's setup names none: nothing can be spoken. */
+const noTts = Tts.of({
+  sampleRate: 22_050,
+  synthesize: () => Stream.fail(new TtsError({ message: "No voice is set up for this assistant." }))
+})
+
 /** A control input with the Stop generation it was accepted in (`undefined`: a speech event). */
 interface Control {
   readonly input: ConversationInput
@@ -142,7 +149,9 @@ export const makeSessionConversation = (options: SessionConversationOptions): Ef
       Effect.gen(function*() {
         const providers = built.providers
         voice = providers.voice
-        const tts = withTraceVoice(providers.tts, voiceKey(providers.voice))
+        // Every turn names its own voice (`TurnSetup.tts`, the pool's instance for the assistant's voice); this one
+        // is for a conversation whose setup names none (tests that inject one voice).
+        const tts = providers.tts !== undefined && providers.voice !== undefined ? withTraceVoice(providers.tts, voiceKey(providers.voice)) : noTts
         const common = {
           onEvent,
           initialHistory: history,

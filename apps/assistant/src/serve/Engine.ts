@@ -1,19 +1,18 @@
-import { type HostResult, type Llm, Stt, Tts, type VoiceRef, voiceKey } from "@pva/core"
+import { type HostResult, type Llm, Stt, type Tts, type VoiceRef } from "@pva/core"
 import type { EngineInfo, EngineStatus, ResourceInfo, VoiceInfo } from "@pva/protocol"
 import * as SherpaStt from "@pva/stt-sherpa"
 import { Cause, Config, ConfigProvider, Context, Deferred, Effect, Exit, Fiber, FiberSet, Schema, type Scope } from "effect"
 import { AppConfig } from "../config.ts"
-import { SttLayer, ttsProviderInfo } from "../providers.ts"
+import { SttLayer } from "../providers.ts"
 import { buildStages } from "../startup.ts"
-import { assistantVoice, ttsLayerFor, voiceEngineName, voiceLabel, voiceStageName } from "../voiceSelection.ts"
 
 /**
- * The shared engines of serve mode (docs/UI-AND-MODULES.md §1.7, §4.5; docs/VOICE-SESSIONS.md §2): the providers
- * that are still one shared build (speech-to-text, the voice), in one scope that can be rebuilt in-process (`reload`,
+ * The shared engines of serve mode (docs/UI-AND-MODULES.md §1.7, §4.5; docs/VOICE-SESSIONS.md §2): the provider
+ * that is still one shared build (speech-to-text), in one scope that can be rebuilt in-process (`reload`,
  * the full reload of docs/ASSISTANTS.md §3.2) while the HTTP server, the sockets, the module host and the voice
  * sessions stay; and the engine status, which also lists the resource pool's resources (`EngineOptions.resources`).
- * The language models are the pool's (`Resources.ts`, WP-9): built per assistant configuration and switched at a
- * turn start, never by this build. It owns no conversation: every voice session
+ * The language models and the voices are the pool's (`Resources.ts`, WP-9 and WP-10): built per assistant
+ * configuration and switched at a turn start, never by this build. It owns no conversation: every voice session
  * attaches its loop (`attach`), which runs on each build and is stopped (keeping that session's history) when the
  * build ends. A build failure becomes `state: "failed"` with per-stage problems instead of exiting, so settings stay
  * editable from the UI.
@@ -31,10 +30,12 @@ export interface EngineProviders {
    */
   readonly llm?: Llm["Service"]
   readonly stt: Stt["Service"]
-  /** The assistant's voice (docs/VOICE-PROVIDERS.md): every reply is spoken with it; its rate is the output rate. */
-  readonly tts: Tts["Service"]
-  /** Which voice `tts` is. */
-  readonly voice: VoiceRef
+  /**
+   * Tests only: one voice for every assistant (serve mode's pool then hands out instances that speak with it, unless
+   * `ServeOptions.buildTts` is given), and which voice it is. The real builder leaves both out: voices are the pool's.
+   */
+  readonly tts?: Tts["Service"]
+  readonly voice?: VoiceRef
   readonly maxToolRounds: number
   readonly engines: ReadonlyArray<EngineInfo>
   readonly voiceInfo: ReadonlyArray<VoiceInfo>
@@ -48,24 +49,16 @@ const read = <A>(config: Config.Config<A>): Effect.Effect<A, Config.ConfigError>
 })
 const configValue = <A>(config: Config.Config<A>, fallback: A): Effect.Effect<A> => Effect.orElseSucceed(read(config), () => fallback)
 
-/** The shared providers selected by the settings (the assistant's voice, STT). The language models are the pool's. */
+/** The shared providers selected by the settings (STT). The language models and the voices are the pool's. */
 export const defaultProviderBuilder: ProviderBuilder = Effect.gen(function*() {
-  const resolved = yield* assistantVoice
-  if ("problem" in resolved) return yield* new EngineBuildProblems({ problems: [{ stage: voiceStageName, message: resolved.problem }] })
-  for (const note of resolved.notes) yield* Effect.logWarning(note)
   const settings = yield* read(AppConfig).pipe(
     Effect.mapError((e) => new EngineBuildProblems({ problems: [{ stage: "conversation", message: e.message }] }))
   )
-  const voice = resolved.ref
-  const { context, problems } = yield* buildStages([
-    { stage: voiceStageName, layer: ttsLayerFor(voice) },
-    { stage: "speech-to-text (STT_PROVIDER)", layer: SttLayer }
-  ])
+  const { context, problems } = yield* buildStages([{ stage: "speech-to-text (STT_PROVIDER)", layer: SttLayer }])
   if (problems.length > 0) return yield* new EngineBuildProblems({ problems })
 
   const sttProvider = yield* configValue(Config.String("STT_PROVIDER"), "sherpa")
-  const location = (ttsProviderInfo as Record<string, { readonly location: "local" | "hosted" } | undefined>)[voice.provider]?.location ?? "hosted"
-  // No `llm` row: serve mode adds the language model's from the pool (`EngineOptions.describeEngines`).
+  // No `llm` or `tts` row: serve mode adds those from the pool (`EngineOptions.describeEngines`).
   const engines: Array<EngineInfo> = [
     {
       stage: "stt",
@@ -74,25 +67,13 @@ export const defaultProviderBuilder: ProviderBuilder = Effect.gen(function*() {
         ? yield* configValue(Config.String("DEEPGRAM_MODEL"), "flux-general-en")
         : yield* configValue(Config.String("STT_SHERPA_MODEL"), SherpaStt.DEFAULT_PRESET),
       location: sttProvider === "deepgram" ? "hosted" : "local"
-    },
-    // `detail` is the voice id: for `sherpa` the preset, which the Models page marks as in use.
-    { stage: "tts", provider: voice.provider, detail: voice.voiceId, location }
+    }
   ]
-  const voiceInfo: Array<VoiceInfo> = [{
-    name: voiceKey(voice),
-    description: voiceLabel(voice),
-    enabled: true,
-    isDefault: true,
-    engine: voiceEngineName(voice),
-    location
-  }]
   return {
     stt: Context.get(context as Context.Context<Stt>, Stt),
-    tts: Context.get(context as Context.Context<Tts>, Tts),
-    voice,
     maxToolRounds: settings.maxToolRounds,
     engines,
-    voiceInfo
+    voiceInfo: []
   }
 })
 
@@ -125,6 +106,8 @@ export interface EngineOptions {
   readonly resources?: {
     readonly status: () => ReadonlyArray<ResourceInfo>
     readonly rebuild: Effect.Effect<void>
+    /** The voices in use (`EngineStatus.voices`); the build's own list is used while none is. */
+    readonly voices?: () => ReadonlyArray<VoiceInfo>
   }
   /** Reword build problems for the owner (a missing key while the key vault is locked). */
   readonly explainProblems?: (
@@ -145,8 +128,8 @@ export interface EngineOptions {
 /** The engines of one build, as the voice sessions use them. */
 export interface BuiltEngines {
   readonly providers: EngineProviders
-  /** The output rate of this build (the assistant's voice's rate). */
-  readonly sampleRate: number
+  /** The output rate of this build's voice (tests that inject one voice); the pool's voices declare their own. */
+  readonly sampleRate?: number
 }
 
 /**
@@ -198,7 +181,7 @@ export interface Engine {
   readonly attach: (loop: SessionLoop) => Effect.Effect<void>
   /** Saved settings wait for a reload (`path`: the settings page they are on, for `reloadPendingFor`). */
   readonly setReloadPending: (pending: boolean, path?: string) => void
-  /** The voice the running engines speak with (undefined while they are not running). */
+  /** The voice of the injected build (tests only; the real engines have none, voices are the pool's). */
   readonly voice: () => VoiceRef | undefined
   /** Announce the status again (`describeEngines` has something new to say). */
   readonly refreshStatus: () => void
@@ -221,7 +204,10 @@ export const makeEngine = (options: EngineOptions): Effect.Effect<Engine, never,
 
     const view = (s: EngineStatus): EngineStatus => {
       const described = options.describeEngines === undefined || s.engines.length === 0 ? s : { ...s, engines: options.describeEngines(s.engines) }
-      return options.resources === undefined ? described : { ...described, resources: options.resources.status() }
+      if (options.resources === undefined) return described
+      const pooled = options.resources.voices?.() ?? []
+      const voices = pooled.length > 0 ? pooled : s.voices
+      return { ...described, voices, resources: options.resources.status() }
     }
     const setStatus = (next: EngineStatus) => {
       status = next
@@ -281,7 +267,7 @@ export const makeEngine = (options: EngineOptions): Effect.Effect<Engine, never,
           }), stopLoops)
         )
         const failed = yield* Deferred.make<Cause.Cause<unknown>>()
-        current = { providers, sampleRate: providers.tts.sampleRate }
+        current = { providers, ...(providers.tts !== undefined ? { sampleRate: providers.tts.sampleRate } : {}) }
         loopFailed = failed
         ready = true
         setStatus({ state: "ready", problems: [], reloadPending: false, reloadPendingFor: [], engines: providers.engines, voices: providers.voiceInfo })

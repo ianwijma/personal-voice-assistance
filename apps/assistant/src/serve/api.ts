@@ -3,7 +3,6 @@ import { parseVoiceKey, type VoiceRef, voiceKey } from "@pva/core"
 import {
   API_PREFIX,
   type ApiErrorBody,
-  DefaultVoiceRequest,
   FavouriteRequest,
   MAX_API_BODY_BYTES,
   PreviewRequest,
@@ -211,9 +210,8 @@ export const makeApi = (options: ApiOptions) => {
       if (path === "voices/default") {
         yield* only("GET", "PUT")
         if (method === "GET") return json(200, { default: yield* options.assistantVoice.get })
-        const body = yield* decode(DefaultVoiceRequest, yield* readJson(req))
-        yield* knownProvider(body.voice)
-        return json(200, yield* options.assistantVoice.save(body.voice, body.reload === true))
+        // Each assistant has its own voice (docs/ASSISTANTS.md §5.5): it is saved with the assistant.
+        return yield* fail(410, "gone", "There is no single assistant voice any more: choose each assistant's voice in its Voice tab (Assistants › the assistant › Voice).")
       }
       return yield* fail(404, "not_found", `There is nothing at ${API_PREFIX}${path}`)
     })

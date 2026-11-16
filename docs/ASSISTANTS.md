@@ -1014,3 +1014,90 @@ Deviations from §5:
   `ANTHROPIC_WARM_UP=true` (five runs each, compare the first row's "1st token"), and
   `LLM_PROVIDER=anthropic pnpm start bench --live --rounds 2 --sessions 2 bench-audio` against the same with
   `--llm-per-session`.
+
+### WP-10 per-assistant voice: built 2026-11-16
+
+`serve/Resources.ts` now also holds the voices; `Engine.ts` is the full reload of the recogniser only (plus the status).
+
+- **Keys.** `TtsKey` = `voiceKey(assistant.voice)` (`provider:voiceId`); the instance's identity adds a stamp of the
+  hosted provider's key (first 16 hex digits of its SHA-256, never shown), so a new Cartesia or ElevenLabs key builds
+  a new instance. Two assistants with the same voice share one instance. The status lists every instance as
+  `kind: "tts"` (key, label "Voice Piper …", location, `usedBy`, state, problem).
+- **What shares an engine.** A voice on this machine runs on an engine (a child process holding the model).
+  `defaultTtsBuilder` keeps one engine per `SherpaTts.engineSetup(preset)` plus the engine options (model directory,
+  threads, speed, joining), counted by the voice instances on it and stopped with the last one: every Kokoro speaker
+  shares one engine (one more speaker costs no memory and no load), a Piper voice is an engine of its own. A hosted
+  voice (Cartesia, ElevenLabs) is that provider's layer over `configProvider()` with the voice id on top, as before.
+  A failed engine start is not kept: the next instance that wants one starts a new engine.
+- **How a turn picks its voice.** `TurnSetup.tts` (new, optional, additive; the exact analogue of `TurnSetup.llm`,
+  ARCHITECTURE.md): read from the turn's plan when its body starts, for every clause of every round, and its
+  `sampleRate` is the one the reply plays at (so 22.05 and 24 kHz voices need no resampling). A `Say` reads the setup
+  when it starts, so a canned reply uses the assistant's voice. The serve setup waits for a voice that is still being
+  built (its rate is read at play time) and tags the turn's trace (`Trace.voices`) from the pool's wrapper.
+- **A changed voice** builds the new instance first; the assistant stays bound to the old one until the new one is
+  ready, then its next turn start takes it. Turns speaking on the old voice, on any device, finish on it (the instance
+  is not closed while a stream runs on it); nothing is reloaded and no other assistant or device is touched. The old
+  voice is released after the 10 s grace period unless someone wants it again. A voice nobody is bound to or wants is
+  `unused` and released the same way; a failed or never-ready one at once.
+- **Failure.** A voice that cannot start (model files missing, key not set, locked vault) is a failed resource with its
+  problem; its assistants' turns fail at the first synthesis with that problem (the device gets `turn_failed`, the
+  text of the reply is not spoken), every other assistant speaks. A vault unlock and the owner's reload build failed
+  voices again (`retryFailed`, `rebuild`).
+- **Status and API (§5.5).** The engine list's `tts` rows and `voices` come from the voices in use (the Models page
+  marks their presets in use). `VoiceEntry.selected` is now `usedBy: AssistantId[]` (every assistant, switched on or
+  not), `ProviderInfo.inUse` means "an assistant uses a voice of it", `GET /api/voices/default` answers with the first
+  switched-on assistant's voice (`source: "assistant"`, `locked: false`, `running` when its instance is ready,
+  `reloadPending: false`), `PUT /api/voices/default` answers `410 gone` pointing to the assistant's Voice tab,
+  `VoicesResponse.selected` stays (the same first voice). The preview of a voice the pool runs reuses its instance.
+  `apps/web`: only `mock/server.ts` and `test/voicePicker.test.ts` changed (`selected` → `usedBy`) to compile.
+- **Deviations.** (1) Voices share a reconcile call with the language models (`ReconcileOptions.voices`; the pool's
+  generic `makeKind` serves both), not a separate method. (2) The `ASSISTANT_VOICE` setting and its Voices-page field
+  still exist in the store and sections but nothing in serve mode reads them any more (the migration copied them into
+  the assistant); the old Voice page of the web UI therefore no longer changes what is spoken until WP-6a. (3) A
+  Kokoro engine runs one clause at a time, so two assistants speaking at the same moment on it take turns clause by
+  clause (measured below); the doc's one-engine rule was kept. (4) `EngineProviders.tts`/`.voice` stay, optional, for
+  tests that inject one voice (the pool then hands out instances that speak with it).
+- **Tests.** `test/resourcesVoices.test.ts` (keys and sharing, a change with a stream in flight, grace and re-want,
+  failure and retry, key stamp and rebuild, engine sharing with a counted fake engine, a failing engine start),
+  `test/serveVoicesPerAssistant.test.ts` (scripted client: two assistants with different voices speak in turn on one
+  device with their own voice and rate, the trace's `voices`; equal voices share one; a change on Alpha while Bravo's
+  turn and Alpha's own turn are held mid-reply, both complete on their old voices and Alpha's next turns on either
+  device use the new one, no engine reload; a failing voice in the status, `turn_failed`, the other assistant speaks),
+  `packages/core/test/TurnSetupTts.test.ts` (per-turn voice and rate, a voice published between turns, a `Say`, absent =
+  the loop's), the voice API tests of `serveVoices.test.ts`.
+- **Measurements** (2026-11-16, same machine and software as WP-0). `src/bench/voices.ts` (new): the real
+  `defaultTtsBuilder` and the real engines in the pool, one assistant per voice, each with its own `Conversation`
+  (`TurnSetup.tts`), an instant stand-in language model, spoken text turns (the same 3-sentence reply for every voice)
+  and an output that takes everything at once; the figure is `ttsFirstAudio − firstClause` from `TurnTrace` (the
+  engine's time to first audio for the first clause, "Good morning."), median over 11 turns (the first turn of a voice
+  dropped). Command: `node --import tsx src/bench/voices.ts --voices piper,kokoro --mode sequential --turns 12
+  --model-dir <models>`; each run is a fresh process; `sequential` alternates the voices one turn at a time,
+  `concurrent` starts every assistant's turn at the same moment. **Machine load was not quiet**: other work ran on the
+  machine (load average 2 at the start, 9–14 for the second table; 16 logical processors), so use the comparison within
+  a table, not the absolute figures.
+  - First pass, one run per row group of 3, load rising 1.8 → 11 over the pass (so later rows ran under more load):
+    Piper alone 22.6 / 22.3 / 22.7 ms, Kokoro alone 185.6 / 182.4 / 187.1 ms, Piper+Kokoro 26.0 / 26.5 / 27.1 (Piper) and
+    195.8 / 197.3 / 203.3 (Kokoro), Piper+Kokoro concurrent 34.8 / 35.1 / 29.4 and 239.4 / 237.0 / 222.8, Piper+Dutch+Kokoro
+    25.5–28.0, 36.9–39.4 (Dutch) and 183.5–200.7.
+  - Second pass, alternating the configurations in each of 5 rounds to cancel drift (load 8.7–14), median of the 5 run
+    medians (each in brackets): Piper alone **22.9** ms [38.9, 23.4, 22.7, 22.9, 22.2]; Piper with Kokoro loaded
+    **28.1** [28.4, 28.1, 28.1, 27.0, 26.6] (+5 ms); Kokoro alone **190.2** [178.7, 204.0, 190.2, 199.7, 189.7]; Kokoro
+    with Piper loaded **197.3** [195.7, 209.8, 185.7, 203.5, 197.3] (+7 ms). With both loaded and turns alternating, a
+    voice is about 5 ms (Piper, +20 %) and 7–10 ms (Kokoro, +4 %) slower than alone; I did not isolate the cause (an
+    idle engine process between turns is the likely one) and the Kokoro difference is inside its run-to-run spread.
+  - Both speaking at once (`concurrent`, separate engines): Piper 29–35 ms, Kokoro 223–239 ms, i.e. +7–12 ms and
+    +35–50 ms over the sequential figures. Two Kokoro speakers on the one shared engine: sequential 182–199 ms (heart)
+    and 193–213 ms (bella), the same as one speaker; **concurrent: the first speaker 179–192 ms, the second 1159–1276 ms**,
+    because the engine synthesises one clause at a time and the second assistant's first clause waits behind the
+    first's whole reply (about 1.1 s). Two assistants on Kokoro that talk at the same moment therefore queue; two
+    Kokoro engines would avoid it for about 560 MB more.
+  - **Memory** (added MB = this process's RSS after the load minus before, plus the engine child processes' RSS, as
+    WP-0): Piper alone 162, Kokoro alone 563 (WP-0: 163 and 563); Piper + Kokoro 724–727 (sum of WP-0: 726); Piper + Dutch
+    Piper + Kokoro 888–893 (WP-0: 163 + 169 + 563 = 895); Kokoro heart + bella (one engine) **563–565**, i.e. a second
+    Kokoro speaker costs nothing. Load time with the voices loaded in parallel: Piper 0.50 s, Kokoro 1.1–1.2 s, both
+    1.1–1.4 s.
+- **Not verified.** The web admin pages (WP-6a) do not save a voice yet, so a voice change was exercised through the
+  settings store, not a browser. Hosted voices (Cartesia, ElevenLabs) were tested with fake builders only: no keys on
+  this machine, so `ttsFirstAudio` of a hosted voice is not measured. The preview that starts a second Kokoro engine for
+  a speaker the pool does not run (the pool's engine is not shared with previews) is unchanged. `ramMb` in the status is
+  not filled for voices.

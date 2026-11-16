@@ -4,7 +4,7 @@ import type { Agent, IntentDecisionInfo } from "./Agent.ts"
 import type { DecisionProvider } from "./Decision.ts"
 import type { SttEvent, ToolCall, ToolResult } from "./Domain.ts"
 import type { Router, RouterState } from "./Routing.ts"
-import type { Llm } from "./Services.ts"
+import type { Llm, Tts } from "./Services.ts"
 import type { ToolRegistry } from "./ToolRegistry.ts"
 import type { Trace, TurnOutcome } from "./TurnTrace.ts"
 
@@ -159,6 +159,13 @@ export interface TurnSetup {
    * agent conversations (their agents hold their own model).
    */
   readonly llm?: Llm["Service"] | undefined
+  /**
+   * The voice this turn speaks with, from its start to its end (`Conversation.voice`): every clause of every round,
+   * a canned reply and a notice included. Absent: the `Tts` the voice loop was given. Serve mode's resource pool sets
+   * it (the assistant's own voice), so a changed voice applies at the next turn start without touching a turn that is
+   * speaking (docs/ASSISTANTS.md §3.2). Its `sampleRate` must be final when the setup is read.
+   */
+  readonly tts?: Tts["Service"] | undefined
 }
 
 /**
