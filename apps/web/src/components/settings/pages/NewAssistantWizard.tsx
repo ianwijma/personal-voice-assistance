@@ -1,5 +1,5 @@
 "use client"
-import { useEffect, useState } from "react"
+import { useEffect, useRef, useState } from "react"
 import type { Assistant, AssistantInfo, DeviceTarget, FieldError } from "@pva/protocol"
 import {
   accountInfo,
@@ -7,6 +7,7 @@ import {
   deepEqual,
   hearingModelNames,
   listJoin,
+  type Outcome,
   plural,
   quoted,
   summaryMarks,
@@ -78,7 +79,9 @@ export function NewAssistantWizard() {
     ...blankAssistantBody(""),
     modules: Object.fromEntries(capability.map((m) => [m.id, { on: m.id === "clock", offTools: [] }]))
   })
-  const draft = useWizardDraft(blank)
+  /** Set while `assistant.create` is on its way: the wizard is inert and ignores edits and step changes (they would not be in the request). */
+  const creating = useRef(false)
+  const draft = useWizardDraft(blank, () => creating.current)
   const a = draft.current
   const [from, setFrom] = useState("blank")
   const [where, setWhere] = useState<Readonly<Record<string, Placement>>>({})
@@ -94,11 +97,17 @@ export function NewAssistantWizard() {
   }, [client, dirty])
   useEffect(() => () => client.store.dispatch({ type: "local/ui", patch: { settingsDirty: false } }), [client])
 
-  const go = (n: number) => client.settings(["assistants", "new", String(n)])
+  const go = (n: number) => {
+    if (!creating.current) client.settings(["assistants", "new", String(n)])
+  }
+  const editWhere = (f: (s: Readonly<Record<string, Placement>>) => Readonly<Record<string, Placement>>) => {
+    if (!creating.current) setWhere(f)
+  }
   const next = () => go(Math.min(LAST, step + 1))
 
   /** Start from: a copy takes the prompt, language model, hearing, voice and modules; the typed name, purpose and Handles stay. */
   const chooseFrom = (id: string) => {
+    if (creating.current) return
     setFrom(id)
     const source = assistants.find((x) => x.id === id)
     const fresh = blank()
@@ -107,18 +116,26 @@ export function NewAssistantWizard() {
   }
 
   const create = async () => {
+    if (creating.current) return
     setCreateError(undefined)
     setWhereMessage(undefined)
     if (a.name.trim() === "") {
       draft.setErrors([{ key: "name", message: "An assistant needs a name." }])
       return go(1)
     }
+    creating.current = true
     setBusy(true)
     const placements = Object.entries(where)
       .filter(([, w]) => w.on)
       .map(([key, w]) => ({ target: targetOfKey(key), ...(w.phrase.trim() !== "" ? { phrase: w.phrase.trim() } : {}) }))
     const body = { ...toBody(a), name: a.name.trim() }
-    const outcome = await client.createAssistant(body, { ...(from !== "blank" ? { copyOf: from } : {}), placements }) // continuation(none): only this page's own state, then it navigates
+    let outcome: Outcome
+    try {
+      outcome = await client.createAssistant(body, { ...(from !== "blank" ? { copyOf: from } : {}), placements }) // continuation(none): only this page's own state, then it navigates
+    } catch {
+      outcome = { kind: "refused", code: "internal", message: "Could not create it. Try again." }
+    }
+    creating.current = false
     setBusy(false)
     if (outcome.kind === "ok" && outcome.assistantId !== undefined) {
       client.store.dispatch({ type: "local/toast", message: `Created ${body.name}.`, tone: "info" })
@@ -138,7 +155,7 @@ export function NewAssistantWizard() {
   const dupes = assistants.some((x) => x.name.trim().toLowerCase() === a.name.trim().toLowerCase() && a.name.trim() !== "")
 
   return (
-    <div className="flex flex-1 flex-col gap-6" data-testid="wizard" data-step={step}>
+    <div className="flex flex-1 flex-col gap-6" data-testid="wizard" data-step={step} inert={busy} aria-busy={busy}>
       <p className="-mt-4 text-[14px] text-ink-muted" data-testid="wizard-step-name">{STEPS[step - 1]}</p>
       <Stepper step={step} go={go} />
       {step === 1 && (
@@ -237,7 +254,7 @@ export function NewAssistantWizard() {
                           role="checkbox"
                           aria-checked={w.on}
                           aria-label={`${r.name}${r.defaults ? " (defaults)" : ""}`}
-                          onClick={() => setWhere((s) => ({ ...s, [key]: { ...(s[key] ?? NO_PLACEMENT), on: !w.on } }))}
+                          onClick={() => editWhere((s) => ({ ...s, [key]: { ...(s[key] ?? NO_PLACEMENT), on: !w.on } }))}
                           className="flex min-h-11 items-start gap-3 text-left"
                           data-testid="where-check"
                         >
@@ -261,7 +278,7 @@ export function NewAssistantWizard() {
                               value={w.phrase}
                               autoComplete="off"
                               placeholder={`Wake phrase, for example hey ${(a.name.trim() || "mia").toLowerCase()}`}
-                              onChange={(e) => setWhere((s) => ({ ...s, [key]: { ...(s[key] ?? NO_PLACEMENT), phrase: e.target.value } }))}
+                              onChange={(e) => editWhere((s) => ({ ...s, [key]: { ...(s[key] ?? NO_PLACEMENT), phrase: e.target.value } }))}
                               className={cx(inputClass, "max-w-[360px]")}
                             />
                             {w.phrase.trim() === "" && <p className="text-[13px] text-warn">Without a phrase it cannot be reached here.</p>}
@@ -278,7 +295,7 @@ export function NewAssistantWizard() {
             <Button
               variant="quiet"
               onClick={() => {
-                setWhere({})
+                editWhere(() => ({}))
                 go(7)
               }}
               data-testid="decide-later"
