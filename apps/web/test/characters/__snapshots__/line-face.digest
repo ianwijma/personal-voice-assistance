@@ -1,4 +1,4 @@
-# line-face 1.0.0: frame digests of a scripted conversation at default settings (docs/CHARACTERS.md §6.6).
+# line-face 1.1.0: frame digests of a scripted conversation at default settings (docs/CHARACTERS.md §6.6).
 # A change here must be deliberate: check the look, then update with `pnpm --filter @pva/web exec vitest run test/characters -u`.
 dark  0.5 idle         31 dcfeda63
 dark  1.0 listening    36 f2e606ee
@@ -47,3 +47,26 @@ light 11.0 idle         34 22ff9fcf
 overflow 160×140×1 6.7 px
 overflow 900×420×1 0.0 px
 overflow 720×240×2 0.0 px
+stage  0.5 idle         31 cc37b7e3
+stage  1.0 listening    36 48e72b6e
+stage  1.5 listening    34 e4bc6448
+stage  2.0 hearing      34 9a37b51e
+stage  2.5 hearing      44 02c651b1
+stage  3.0 hearing      54 bf783dbb
+stage  3.5 hearing      54 0f31d0d7
+stage  4.0 hearing      49 23e97e5c
+stage  4.5 hearing      54 94169951
+stage  5.0 thinking     58 9c5ec72a
+stage  5.5 thinking     48 bfc5168f
+stage  6.0 thinking     38 b0135164
+stage  6.5 speaking     38 3db1a050
+stage  7.0 speaking     70 6a035cbd
+stage  7.5 speaking     57 d2adc7b0
+stage  8.0 speaking     63 863ccda8
+stage  8.5 speaking     57 c507dd7e
+stage  9.0 speaking     57 d6a6bdf0
+stage  9.5 listening    66 88c404c1
+stage 10.0 listening    34 870686b3
+stage 10.5 idle         34 3528d58f
+stage 11.0 idle         34 d18922be
+stage 1280×800×1 focus 720×240 at 280,200: solid drawing x 489.0..793.0, y 220.5..415.8

@@ -101,14 +101,16 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
   let qS = 0
 
   return {
-    resize(width, height, ratio) {
-      W = width
-      H = height
+    resize(_width, _height, ratio) {
       dpr = ratio
       g = setup2d(canvas, dpr)
     },
 
     frame(f: Frame) {
+      // The canvas is the whole page; the face lives in the focus (the box) and is drawn from its corner.
+      const fo = f.focus
+      W = fo.width
+      H = fo.height
       const dt = f.dt
       const P = f.palette
       const reduced = f.reducedMotion
@@ -131,7 +133,7 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
       const cy = H / 2
 
       // ---- Gaze target per mode.
-      youDirection(f, cx, cy, s * 2.2, you, pers.followsPointer)
+      youDirection(f, fo.x + cx, fo.y + cy, s * 2.2, you, pers.followsPointer)
       const side = S.thinkSide
       let gx = you.x
       let gy = you.y + (mix.hearing > 0.5 ? (S.regard - 0.45) * 0.7 : 0)
@@ -191,7 +193,7 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
       mixInto(strokeRgb, P.inkFaint, P.ink, alert)
       mixInto(mouthRgb, strokeRgb, P.voice, speakW)
 
-      clear2d(g, dpr)
+      clear2d(g, dpr, fo)
       // Tilt about the neck (below the chin), so the whole head swings, not just its features.
       const pivot = 1.5 * s * scale
       g.translate(cx, cy + drop * s + pivot)
@@ -368,7 +370,7 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
 const character: Character = {
   id: "line-face",
   name: "Line face",
-  version: "1.0.0",
+  version: "1.1.0",
   contract: 1,
   family: "figure",
   summary: "A face in a few confident strokes: dot eyes, short brows, one mouth line, and comic-strip sound marks that carry your voice in.",
@@ -421,6 +423,7 @@ const character: Character = {
     }
   ],
   renderer: "2d",
+  canvas: "stage",
   options: [
     sizeOption(0.5, 1.1),
     {
