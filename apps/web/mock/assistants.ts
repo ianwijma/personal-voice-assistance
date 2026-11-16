@@ -4,6 +4,7 @@
  * (`server.ts`) does the access check and the pushes; this module answers the messages.
  */
 import {
+  type Assignment,
   type Assistant,
   type AssistantBody,
   type AssistantInfo,
@@ -37,6 +38,17 @@ export interface AssistantResult {
 }
 
 const OK: AssistantResult = { ok: true }
+
+/**
+ * The server's `withPlacement` (apps/assistant/src/serve/assistants.ts): the assistant added to the list; one already
+ * in it (a device following its type, placed on the type first) gets the phrase instead of a second entry.
+ */
+export const withPlacement = (list: ReadonlyArray<Assignment>, id: string, phrase: string | undefined): ReadonlyArray<Assignment> => {
+  const existing = list.find((x) => x.assistant === id)
+  if (existing === undefined) return [...list, { assistant: id, phrases: phrase !== undefined ? [phrase] : [] }]
+  if (phrase === undefined || existing.phrases.includes(phrase)) return list
+  return list.map((x) => (x === existing ? { ...x, phrases: [...x.phrases, phrase] } : x))
+}
 const fail = (code: ErrorInfo["code"], message: string, extra: { readonly fieldErrors?: ReadonlyArray<FieldError>; readonly warnings?: ReadonlyArray<FieldError> } = {}): AssistantResult => ({
   ok: false,
   error: { code, message, ...extra }
@@ -234,10 +246,10 @@ export const createAssistantsMock = (modules: () => ReadonlyArray<ModuleInfo>): 
       let nextType = typeSettings
       const nextOwn = new Map(deviceOwn)
       for (const p of placements ?? []) {
-        const added = { assistant: id, phrases: p.phrase === undefined || p.phrase.trim() === "" ? [] : [p.phrase.trim()] }
+        const phrase = p.phrase === undefined || p.phrase.trim() === "" ? undefined : p.phrase.trim()
         if (p.target.kind === "type") {
           if (p.target.type !== WEB_VOICE_KIND) return fail("unknown_device", `No device type ${p.target.type}.`)
-          nextType = { ...nextType, assistants: [...nextType.assistants, added] }
+          nextType = { ...nextType, assistants: withPlacement(nextType.assistants, id, phrase) }
           const v = validateDeviceSettings(nextType, known)
           if (v.errors.length > 0) return refusal(v.errors)
           continue
@@ -246,7 +258,7 @@ export const createAssistantsMock = (modules: () => ReadonlyArray<ModuleInfo>): 
         if (!devices.some((d) => d.id === target.id)) return fail("unknown_device", "That device is not known.")
         const record = nextOwn.get(target.id) ?? { own: {}, rev: 0 }
         const list = effectiveDeviceSettings(BUILT_IN_WEB_VOICE_SETTINGS, nextType, record.own).assistants
-        const own = { ...record.own, assistants: [...list, added] } as DeviceOwn
+        const own = { ...record.own, assistants: withPlacement(list, id, phrase) } as DeviceOwn
         const v = validateDeviceSettings(effectiveDeviceSettings(BUILT_IN_WEB_VOICE_SETTINGS, nextType, own), known)
         if (v.errors.length > 0) return refusal(v.errors)
         nextOwn.set(target.id, { own, rev: record.rev + 1 })
