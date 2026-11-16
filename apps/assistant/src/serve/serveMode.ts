@@ -434,17 +434,22 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       deviceId !== undefined && store.settings().devices[deviceId] !== undefined ? `device:${deviceId}` : `type:${WEB_VOICE_KIND}`
     /**
      * Every hearing place (§3.2 "Wanted", stt: the hearer of every type defaults entry and of every known device) with
-     * its effective settings. `override` replaces one place's settings (a save being checked).
+     * its effective settings. `override` replaces one place's settings (a save being checked); a type's new defaults
+     * also apply to the devices of that type that inherit them.
      */
     const placesNow = (override?: { readonly place: string; readonly settings: DeviceSettings }): Map<string, DeviceSettings> => {
-      const file = store.settings()
+      const saved = store.settings()
+      const typeKind = override?.place.startsWith("type:") === true ? override.place.slice("type:".length) : undefined
+      const file = typeKind === undefined
+        ? saved
+        : { ...saved, deviceTypes: { ...saved.deviceTypes, [typeKind]: { ...override!.settings, rev: saved.deviceTypes[typeKind]?.rev ?? 0 } } }
       const places = new Map<string, DeviceSettings>()
       for (const kind of new Set([WEB_VOICE_KIND, ...Object.keys(file.deviceTypes)])) {
         const type = deviceTypeOf(kind)
         if (type === undefined) continue
         places.set(`type:${kind}`, effectiveDeviceSettings(type.builtIn, file.deviceTypes[kind], undefined))
       }
-      for (const id of Object.keys(file.devices)) places.set(`device:${id}`, deviceSettingsOf(id))
+      for (const id of Object.keys(file.devices)) places.set(`device:${id}`, deviceSettingsFrom(file, id))
       if (override !== undefined) places.set(override.place, override.settings)
       return places
     }
