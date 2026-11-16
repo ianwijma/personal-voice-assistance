@@ -8,7 +8,6 @@ import { beforeEach, describe, expect, it, vi } from "vitest"
 import type { Character, Mode, OptionValues } from "@/characters/contract.ts"
 import { createVoiceFeatures } from "@/characters/features.ts"
 import { Runner } from "@/characters/runner.ts"
-import { Ink, SoftSpot } from "@/characters/shared/figure.ts"
 import { pinned, run, type RunResult } from "./support/conversation.ts"
 import { installFakeCanvas, markStage, recording } from "./support/fakeCanvas.ts"
 import { PALETTES } from "./support/palettes.ts"
@@ -158,13 +157,17 @@ describe("blob buddy: frame allocations", () => {
     const note = (c: ReadonlyArray<number>) => {
       if (c.every((v) => v === 0) || c.every((v) => v === 255)) seen.add(c)
     }
-    const css = vi.spyOn(Ink.prototype, "css").mockImplementation(function (this: Ink, c: ReadonlyArray<number>) {
+    // `fresh()` resets the module registry, so the character builds its helpers from a newly evaluated
+    // `shared/figure.ts`: spy on that copy (imported after the reset), not on one imported at the top of this file.
+    const character = await fresh()
+    const figure = await import("@/characters/shared/figure.ts")
+    const css = vi.spyOn(figure.Ink.prototype, "css").mockImplementation(((c: ReadonlyArray<number>) => {
       note(c)
       return ""
-    } as never)
-    const draw = vi.spyOn(SoftSpot.prototype, "draw").mockImplementation(((...a: Array<unknown>) => note(a[6] as ReadonlyArray<number>)) as never)
+    }) as never)
+    const draw = vi.spyOn(figure.SoftSpot.prototype, "draw").mockImplementation(((...a: Array<unknown>) => note(a[6] as ReadonlyArray<number>)) as never)
     try {
-      const r = new Runner(await fresh(), document.createElement("canvas"), bodyColor === null ? {} : { bodyColor })
+      const r = new Runner(character, document.createElement("canvas"), bodyColor === null ? {} : { bodyColor })
       r.create()
       r.resize(720, 240, 1)
       const quiet = createVoiceFeatures()
@@ -172,6 +175,8 @@ describe("blob buddy: frame allocations", () => {
         r.step({ mode: "listening", dt: 1 / 60, user: quiet, agent: quiet, palette: PALETTES[palette], reducedMotion: false, pointer: { x: 0, y: 0, down: false, inside: false }, sinceInterrupt: Infinity })
       }
       r.dispose()
+      expect(css, "the spy sees the character's colour calls").toHaveBeenCalled()
+      expect(draw, "the spy sees the character's soft spots").toHaveBeenCalled()
     } finally {
       css.mockRestore()
       draw.mockRestore()
@@ -184,6 +189,7 @@ describe("blob buddy: frame allocations", () => {
       it(`reuses its black and white colours from frame to frame (${palette} theme, ${bodyColor ?? "default"} body)`, async () => {
         const few = await distinctExtremes(palette, bodyColor, 5)
         const many = await distinctExtremes(palette, bodyColor, 60)
+        expect(few, "black or white reached the drawing helpers").toBeGreaterThan(0)
         expect(many, "no new colour array per frame").toBe(few)
       })
     }
