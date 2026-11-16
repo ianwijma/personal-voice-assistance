@@ -221,8 +221,8 @@ describe("lips: the mouth shapes of the reply", () => {
   })
 
   it("a loud reply glows inside the mouth more than a soft one; a silent mouth does not glow", () => {
-    const glow = (level: number) => {
-      const calls = settle(make(), "speaking", 90, { agent: saying({ open: 0.6 }, level) })
+    const glow = (level: number, state: "speaking" | "idle" = "speaking") => {
+      const calls = settle(make(), state, 90, { agent: saying({ open: 0.6 }, level) })
       // The glow is an ellipse filled in the voice colour.
       const v = PALETTES.dark.voice
       const hit = paths(calls).find((p) => {
@@ -232,8 +232,10 @@ describe("lips: the mouth shapes of the reply", () => {
       })
       return hit === undefined ? 0 : rgba(hit.style)[3]
     }
-    expect(glow(0.9)).toBeGreaterThanOrEqual(glow(0.1))
-    expect(glow(0.9)).toBeGreaterThan(0)
+    expect(glow(0.9)).toBeGreaterThan(glow(0.1))
+    expect(glow(0.1)).toBeGreaterThan(0)
+    // Silent: when the assistant is not speaking there is no glow, whatever the level.
+    expect(glow(0.9, "idle")).toBe(0)
   })
 })
 
