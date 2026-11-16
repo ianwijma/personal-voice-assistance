@@ -688,4 +688,64 @@ describe("changes that must hold together", () => {
     expect(await read("alpha")).toBe(alpha)
     expect(await read("bravo")).toBe(bravo)
   })
+
+  /** Alpha answers without a phrase and the page may pick; `read` is `conversation.read` of one assistant's id. */
+  const alphaAnswersWithPick = async () => {
+    await start((file) => {
+      file.deviceTypes["web-voice"].withoutPhrase = { mode: "assistant", assistant: "alpha" }
+      file.deviceTypes["web-voice"].voicePage = { pick: true }
+    })
+    const { client: page, welcome } = await voice()
+    const read = async (assistantId: string) => {
+      const requestId = `read-${++seq}`
+      const from = page.messages.length
+      page.send({ type: "conversation.read", requestId, assistantId })
+      return (await page.waitFor("conversation.history", (m) => m.requestId === requestId, { from })).id
+    }
+    return { page, welcome, read }
+  }
+
+  it("before its session exists, each assistant keeps its own conversation id when the page picks who answers", async () => {
+    const { page, welcome, read } = await alphaAnswersWithPick()
+    const alpha = await read("alpha")
+    const bravo = await read("bravo")
+    expect(bravo).not.toBe(alpha)
+    // The device's own id (the welcome's) is the answering assistant's.
+    expect(welcome.snapshot.conversations.find((c) => c.assistantId === "alpha")?.id).toBe(alpha)
+    expect(await request(page, { type: "device.pick", withoutPhrase: "bravo" })).toMatchObject({ ok: true })
+    await page.waitFor("device.setup", (m) => m.withoutPhrase.mode === "assistant" && m.withoutPhrase.assistant === "bravo", { from: 0 })
+    expect(await read("bravo")).toBe(bravo)
+    expect(await read("alpha")).toBe(alpha)
+    // The session opens with Bravo answering; neither id moves to the other assistant.
+    await typed(page, "hello to alpha", "alpha")
+    await typed(page, "hello to bravo", "bravo")
+    expect(await read("alpha")).toBe(alpha)
+    expect(await read("bravo")).toBe(bravo)
+  })
+
+  it("before its session exists, conversation.new replaces only the named assistant's id and says whose it is", async () => {
+    const { page, read } = await alphaAnswersWithPick()
+    const alpha = await read("alpha")
+    const bravo = await read("bravo")
+    let from = page.messages.length
+    expect(await request(page, { type: "conversation.new", assistantId: "bravo" })).toMatchObject({ ok: true })
+    const bravoNew = await page.waitFor("conversation", (m) => m.reason === "new", { from })
+    expect(bravoNew).toMatchObject({ assistantId: "bravo" })
+    expect(bravoNew.id).not.toBe(bravo)
+    expect(await read("bravo")).toBe(bravoNew.id)
+    expect(await read("alpha")).toBe(alpha)
+    // Without an assistant: the one that will answer (Alpha).
+    from = page.messages.length
+    expect(await request(page, { type: "conversation.new" })).toMatchObject({ ok: true })
+    const alphaNew = await page.waitFor("conversation", (m) => m.reason === "new", { from })
+    expect(alphaNew).toMatchObject({ assistantId: "alpha" })
+    expect(alphaNew.id).not.toBe(alpha)
+    expect(await read("alpha")).toBe(alphaNew.id)
+    expect(await read("bravo")).toBe(bravoNew.id)
+    // The session starts both in those ids.
+    await typed(page, "hello to alpha", "alpha")
+    await typed(page, "hello to bravo", "bravo")
+    expect(await read("alpha")).toBe(alphaNew.id)
+    expect(await read("bravo")).toBe(bravoNew.id)
+  })
 })

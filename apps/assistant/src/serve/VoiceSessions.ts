@@ -13,8 +13,9 @@ import type { VoiceSession } from "./VoiceSession.ts"
  * - When its device has had no connection for `discardMs()` (`SESSION_DISCARD_MINUTES`), the session is discarded:
  *   its loop stops, its conversation is dropped (the agents are told, so a Claude subscription session closes) and
  *   its audio pipeline is closed. A device that comes back within that time finds its session as it left it.
- * - A device without a session still has a conversation id (the one its first turn will start in), so a page can
- *   show it and `conversation.new` works before anything was said.
+ * - A device without a session still has a conversation id for each assistant (the one that assistant's first turn
+ *   will start in), so a page can show it and `conversation.new` works before anything was said. The caller names the
+ *   assistant (the one that will answer, when it means the device's); the session takes every id over.
  */
 
 export interface VoiceSessionsOptions {
@@ -22,9 +23,8 @@ export interface VoiceSessionsOptions {
   readonly make: (
     key: string,
     device: { readonly id: string; readonly name: string } | undefined,
-    initial: ConversationInfo | undefined,
-    /** Ids reserved for other assistants of the device (`conversation(key, assistant)`), by assistant. */
-    others?: ReadonlyMap<string, ConversationInfo>
+    /** Ids reserved for the device's assistants before its session existed (`conversation(key, assistant)`), by assistant. */
+    reserved?: ReadonlyMap<string, ConversationInfo>
   ) => Effect.Effect<VoiceSession, never, Scope.Scope>
   /** `MAX_VOICE_SESSIONS`, live. */
   readonly max: () => number
@@ -38,8 +38,8 @@ export interface VoiceSessionsOptions {
   readonly onChange: (minor: boolean) => void
   /** A session was discarded (the hub forgets its ownership). */
   readonly onDiscard: (key: string) => void
-  /** A device without a session started a new conversation: tell its connections. */
-  readonly announce: (key: string, conversation: ConversationInfo) => void
+  /** A device without a session started a new conversation (`assistant`'s): tell its connections. */
+  readonly announce: (key: string, conversation: ConversationInfo, assistant: string | undefined) => void
 }
 
 export interface VoiceSessions {
@@ -49,14 +49,14 @@ export interface VoiceSessions {
   /** The device's connections now (0 starts the discard timer, more cancels it). */
   readonly connections: (key: string, count: number) => void
   /**
-   * The device's conversation: its session's, else the one its first turn will start in. `assistant`: that
-   * assistant's in the session, else an id reserved for it (the session gives it to that assistant). Without a
-   * session, leave `assistant` out for the one that will answer: the device's id is its.
+   * `assistant`'s conversation on the device: in its session (absent: the answering assistant's), else the id reserved
+   * for it (the session gives it to that assistant). Without a session the caller names the assistant (the one that
+   * will answer for the device's own); absent only when the device has none.
    */
   readonly conversation: (key: string, assistant?: string) => ConversationInfo
   /**
    * `conversation.new` on a device: `assistant`'s conversation in its session (absent: the answering assistant's),
-   * else a new reserved id (announced).
+   * else a new id reserved for `assistant` (announced; the other assistants keep theirs).
    */
   readonly newConversation: (key: string, assistant?: string) => Effect.Effect<ConversationInfo>
   /** For admin: every session, most recently active first. */
@@ -77,29 +77,27 @@ const MAX_RESERVED = 64
 
 export const makeVoiceSessions = (options: VoiceSessionsOptions): VoiceSessions => {
   const sessions = new Map<string, { readonly session: VoiceSession; readonly scope: Scope.Closeable }>()
-  const reserved = new Map<string, ConversationInfo>()
-  /** Per device, ids reserved for its other assistants (`conversation(key, assistant)`). */
-  const reservedOthers = new Map<string, Map<string, ConversationInfo>>()
+  /** Per device without a session, the ids reserved for its assistants (`""`: no assistant). */
+  const reserved = new Map<string, Map<string, ConversationInfo>>()
   const timers = new Map<string, ReturnType<typeof setTimeout>>()
   const traces: Array<TraceInfo> = []
   let closed = false
 
   const fresh = (): ConversationInfo => ({ id: globalThis.crypto.randomUUID(), startedAt: Date.now() })
-  const reserve = (key: string, info: ConversationInfo) => {
+  /** The device's reservations, most recently used last (the oldest devices are forgotten past `MAX_RESERVED`). */
+  const reservationsOf = (key: string): Map<string, ConversationInfo> => {
+    const byAssistant = reserved.get(key) ?? new Map<string, ConversationInfo>()
     reserved.delete(key)
-    reserved.set(key, info)
+    reserved.set(key, byAssistant)
     while (reserved.size > MAX_RESERVED) reserved.delete(reserved.keys().next().value!)
-    return info
+    return byAssistant
   }
-  const reservedOther = (key: string, assistant: string): ConversationInfo => {
-    const byAssistant = reservedOthers.get(key) ?? new Map<string, ConversationInfo>()
-    reservedOthers.delete(key)
-    reservedOthers.set(key, byAssistant)
-    while (reservedOthers.size > MAX_RESERVED) reservedOthers.delete(reservedOthers.keys().next().value!)
-    let info = byAssistant.get(assistant)
+  const reservedFor = (key: string, assistant: string | undefined): ConversationInfo => {
+    const byAssistant = reservationsOf(key)
+    let info = byAssistant.get(assistant ?? "")
     if (info === undefined) {
       info = fresh()
-      byAssistant.set(assistant, info)
+      byAssistant.set(assistant ?? "", info)
     }
     return info
   }
@@ -115,7 +113,6 @@ export const makeVoiceSessions = (options: VoiceSessionsOptions): VoiceSessions 
     if (entry === undefined) return
     sessions.delete(key)
     reserved.delete(key)
-    reservedOthers.delete(key)
     options.onDiscard(key)
     options.onChange(false)
     options.run(stop(entry))
@@ -149,11 +146,9 @@ export const makeVoiceSessions = (options: VoiceSessionsOptions): VoiceSessions 
         discard(gone.key)
       }
       const scope = options.runSync(Scope.make())
-      const initial = reserved.get(key)
+      const ids = reserved.get(key)
       reserved.delete(key)
-      const others = reservedOthers.get(key)
-      reservedOthers.delete(key)
-      const session = options.runSync(Scope.provide(options.make(key, device, initial, others), scope))
+      const session = options.runSync(Scope.provide(options.make(key, device, ids), scope))
       sessions.set(key, { session, scope })
       session.conversation.start()
       options.onChange(false)
@@ -172,15 +167,16 @@ export const makeVoiceSessions = (options: VoiceSessionsOptions): VoiceSessions 
     conversation: (key, assistant) => {
       const session = sessions.get(key)?.session
       if (session !== undefined) return session.conversation.conversation(assistant)
-      return assistant === undefined ? reserved.get(key) ?? reserve(key, fresh()) : reservedOther(key, assistant)
+      return reservedFor(key, assistant)
     },
     newConversation: (key, assistant) =>
       Effect.suspend(() => {
         const session = sessions.get(key)?.session
         if (session !== undefined) return session.conversation.newConversation(assistant)
         return Effect.sync(() => {
-          const info = reserve(key, fresh())
-          options.announce(key, info)
+          const info = fresh()
+          reservationsOf(key).set(assistant ?? "", info)
+          options.announce(key, info, assistant)
           return info
         })
       }),

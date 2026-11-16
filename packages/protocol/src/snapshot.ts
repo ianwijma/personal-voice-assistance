@@ -319,6 +319,12 @@ export const Snapshot = Schema.Struct({
    * a phrase, …). Absent: no session yet, or the server does not say.
    */
   answering: Schema.optionalKey(AssistantId),
+  /**
+   * Protocol 7: who has the turn on the device now, as `state.holder` says it (the turn in flight or the utterance
+   * being heard, else an open armed or follow-up window; `null`: nobody). Not whose `history` this is (`answering`):
+   * an armed assistant has the turn without the history being its. Absent: no session yet, or the server does not say.
+   */
+  holder: Schema.optionalKey(Schema.NullOr(AssistantId)),
   /** The most recent history (at most 200 items), oldest first. */
   history: Schema.Array(HistoryItem),
   /** Admin access as this connection sees it (also on voice connections: the voice front end links to admin). */

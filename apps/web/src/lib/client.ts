@@ -663,11 +663,8 @@ export const createAssistantClient = (options: { readonly frontend?: FrontendRol
       ),
     wakeTest: (on, deviceId) => connection.request(deviceId === undefined ? { type: "wake.test", on } : { type: "wake.test", on, deviceId }),
     newConversation: (assistantId) => connection.request(assistantId === undefined ? { type: "conversation.new" } : { type: "conversation.new", assistantId }),
-    pickAssistant: async (withoutPhrase) => {
-      const result = await connection.request({ type: "device.pick", withoutPhrase }) // continuation(none): only the store's own state changes
-      if (result.ok) dispatch({ type: "local/holder-clear" })
-      return result
-    },
+    // Who has the turn afterwards is the server's to say: an accepted pick closes its windows and the `state` that follows names the holder.
+    pickAssistant: (withoutPhrase) => connection.request({ type: "device.pick", withoutPhrase }),
     readConversation: (assistantId) => {
       connection.send({ type: "conversation.read", requestId: `read-${assistantId}-${Date.now().toString(36)}`, assistantId })
     },

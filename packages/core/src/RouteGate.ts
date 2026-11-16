@@ -115,6 +115,12 @@ export interface RouteGate {
   replyStarted(assistant: string, now: number): void
   /** `assistant`'s spoken reply finished or was stopped: opens its follow-up window. */
   replyEnded(assistant: string, now: number): void
+  /**
+   * Closes the armed and follow-up windows: a pick on the device (`device.pick`) decides who answers the next sentence
+   * without a phrase. A reply still playing keeps counting until it ends, and its end opens its follow-up window as
+   * usual; an open utterance keeps its target.
+   */
+  release(): void
   /** An utterance starting now would be accepted without a phrase. */
   awake(now: number): boolean
   /** The open window right now, if any (armed first, then follow-up). */
@@ -359,6 +365,10 @@ export const makeRouteGate = (initial: RouteConfig): RouteGate => {
     replyEnded: (assistant, now) => {
       if (replying === assistant) replying = undefined
       following = { assistant, from: now }
+    },
+    release: () => {
+      armed = undefined
+      following = undefined
     },
     awake: (now) => baseTarget(now, false).by !== "dropped",
     window,

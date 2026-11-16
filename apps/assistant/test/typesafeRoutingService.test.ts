@@ -6,7 +6,15 @@ import { DecisionError, type DecisionRequest, type DecisionResponse } from "@pva
 import type { RouteCandidate } from "@pva/decide-typesafe"
 import { Effect, Fiber } from "effect"
 import { TestClock } from "effect/testing"
-import { makeRoutingService, makeTypesafeDecide, ROUTING_KEYS, type RoutingService, type RoutingSettings, routingReady } from "../src/serve/routing.ts"
+import {
+  makeRoutingService,
+  makeTypesafeDecide,
+  ROUTING_KEYS,
+  type RoutingService,
+  type RoutingSettings,
+  routingReady,
+  typesafeNow
+} from "../src/serve/routing.ts"
 
 const advance = (millis: number) => Effect.andThen(Effect.repeat(Effect.yieldNow, { times: 50 }), TestClock.adjust(millis))
 
@@ -152,6 +160,27 @@ const decideWith = (
 const ask = { text: "tell me a joke", fallback: "alpha", final: true } as const
 
 describe("makeTypesafeDecide: the fallback", () => {
+  it.effect("routing not set up: nobody, marked so the dispatcher does not swap in the fallback", () =>
+    Effect.gen(function*() {
+      const run = makeTypesafeDecide({ routing: () => undefined, candidates: () => [alpha, bravo], giveUpMs: () => 300, now: () => 0 })
+      assert.deepStrictEqual(yield* run(ask), { assistant: null, fallback: true, notSetUp: true })
+    }))
+
+  it("typesafeNow: the candidates and fallback only while the device routes by TypeSafe", () => {
+    const on = new Map([["alpha", { on: true }], ["bravo", { on: true }]])
+    const assistants = [{ assistant: "alpha", phrases: [] }, { assistant: "bravo", phrases: [] }]
+    assert.deepStrictEqual(typesafeNow({ assistants, withoutPhrase: { mode: "typesafe", fallback: "alpha", giveUpMs: 400 } }, on), {
+      candidates: ["alpha", "bravo"],
+      fallback: "alpha"
+    })
+    assert.deepStrictEqual(typesafeNow({ assistants, withoutPhrase: { mode: "typesafe", fallback: null, giveUpMs: 400 } }, on), {
+      candidates: ["alpha", "bravo"],
+      fallback: null
+    })
+    assert.deepStrictEqual(typesafeNow({ assistants, withoutPhrase: { mode: "nobody" } }, on), { candidates: [], fallback: null })
+    assert.deepStrictEqual(typesafeNow({ assistants, withoutPhrase: { mode: "assistant", assistant: "alpha" } }, on), { candidates: [], fallback: null })
+  })
+
   it.effect("nobody switched on: the fallback answers at once, with no request and no decision", () =>
     Effect.gen(function*() {
       const { run, sent } = decideWith(() => Effect.succeed(noulOnly(1)), { candidates: [] })

@@ -176,6 +176,57 @@ describe("assistants on one device (WP-4b)", () => {
     await tab.waitFor("state", (m) => m.holder === null, { timeoutMs: 5_000 })
   })
 
+  it("who has the turn after the phrase alone: a joining tab is told apart from whose history it gets, the next sentence is heard as the armed assistant's, and an accepted pick hands the next sentence to the picked one", async () => {
+    const { stt } = await start(await twoAssistantsDataDir((file) => {
+      file.assistants.byId.bravo.followUpSeconds = 0
+      file.deviceTypes["web-voice"].withoutPhrase = { mode: "assistant", assistant: "alpha" }
+      file.deviceTypes["web-voice"].voicePage = { pick: true }
+    }))
+    const page = await connect()
+    await page.hello()
+    await page.claim()
+    await untilOpen(stt, 1)
+
+    // "hey bravo" alone arms Bravo (Alpha answers without a phrase): the state names Bravo.
+    let from = page.messages.length
+    stt.emit(speechStarted, endOfTurn("hey bravo"))
+    await page.waitFor("wake", (m) => m.armed, { from })
+    await page.waitFor("state", (m) => m.state === "listening" && m.holder === "bravo", { from, timeoutMs: 5_000 })
+
+    // Another tab of the device inside the armed window: the history is Alpha's, the turn is Bravo's.
+    const tab = await ScriptedClient.connect({ url: server!.url, deviceId: page.device.id })
+    clients.push(tab)
+    const welcome = await tab.hello()
+    expect(welcome.snapshot.answering).toBe("alpha")
+    expect(welcome.snapshot.holder).toBe("bravo")
+
+    // The next sentence starts: it uses up the armed window, and Bravo keeps the turn while it is heard.
+    from = page.messages.length
+    stt.emit(speechStarted)
+    const hearing = await page.waitFor("state", (m) => m.state === "hearing", { from })
+    expect(hearing.holder).toBe("bravo")
+    stt.emit(endOfTurn("tell me a joke"))
+    const begun = await page.waitFor("turn.start", () => true, { from, timeoutMs: 10_000 })
+    expect(begun.assistantId).toBe("bravo")
+    expect(page.messages.slice(from, page.messages.indexOf(begun)).filter((m) => m.type === "state").map((m) => (m as { holder?: string | null }).holder)).not.toContain(null)
+    await page.waitFor("turn.end", (m) => m.turnId === begun.turnId, { from, timeoutMs: 10_000 })
+    // Bravo has no follow-up: nobody has the turn after its reply.
+    await page.waitFor("state", (m) => m.state === "listening" && m.holder === null, { from, timeoutMs: 5_000 })
+
+    // Armed again, then the page picks Alpha (who answers without a phrase already): the window closes on the server too.
+    from = page.messages.length
+    stt.emit(speechStarted, endOfTurn("hey bravo"))
+    await page.waitFor("state", (m) => m.state === "listening" && m.holder === "bravo", { from, timeoutMs: 5_000 })
+    const tabFrom = tab.messages.length
+    page.send({ type: "device.pick", requestId: "pick-1", withoutPhrase: "alpha" })
+    expect(await page.waitFor("result", (m) => m.requestId === "pick-1", { from })).toMatchObject({ ok: true })
+    await page.waitFor("state", (m) => m.holder === null, { from })
+    await tab.waitFor("state", (m) => m.holder === null, { from: tabFrom })
+    from = page.messages.length
+    stt.emit(speechStarted, endOfTurn("what time is it"))
+    expect(await page.waitFor("turn.start", () => true, { from, timeoutMs: 10_000 })).toMatchObject({ assistantId: "alpha", userText: "what time is it" })
+  })
+
   it("typed text goes to the assistant the page names, else the follow-up holder, else who answers without a phrase; conversation.new is per assistant", async () => {
     const { llm } = await start(await twoAssistantsDataDir((file) => {
       file.deviceTypes["web-voice"].withoutPhrase = { mode: "assistant", assistant: "bravo" }

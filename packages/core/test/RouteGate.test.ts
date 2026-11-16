@@ -448,6 +448,24 @@ describe("RouteGate: armed by the phrase alone", () => {
     feed(gate, [speechStarted, endOfTurn("hey tee three")], 10)
     assert.deepStrictEqual(gate.filter(speechStarted, 100).target, { assistant: "t3", by: "armed" })
   })
+
+  it("release (an accepted pick) closes the armed and follow-up windows: the next sentence goes to who answers without a phrase", () => {
+    const gate = makeRouteGate(two({ withoutPhrase: "assistant", defaultAssistant: "jeff", followUpMs: { jeff: 5_000, t3: 5_000 } }))
+    feed(gate, [speechStarted, endOfTurn("hey tee three")], 0)
+    assert.deepStrictEqual(gate.window(10), { assistant: "t3", by: "armed" })
+    gate.release()
+    assert.isUndefined(gate.window(20))
+    assert.deepStrictEqual(gate.filter(speechStarted, 100).target, { assistant: "jeff", by: "default" })
+    gate.filter(endOfTurn(""), 101)
+    // A follow-up window, too; a reply that plays during the pick still opens its own when it ends.
+    gate.replyEnded("t3", 200)
+    gate.release()
+    assert.isUndefined(gate.window(210))
+    gate.replyStarted("t3", 300)
+    gate.release()
+    gate.replyEnded("t3", 400)
+    assert.deepStrictEqual(gate.window(410), { assistant: "t3", by: "follow-up" })
+  })
 })
 
 describe("RouteGate: a switched-off assistant", () => {

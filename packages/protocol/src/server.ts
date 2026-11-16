@@ -59,9 +59,11 @@ export const State = Schema.Struct({
   /** The committed turn this state belongs to (thinking, speaking). */
   turnId: Schema.optionalKey(TurnId),
   /**
-   * Protocol 7: the assistant that has the turn (an open armed or follow-up window, or its reply playing); `null`:
-   * nobody, speech goes to who answers without a phrase. Sent again with an unchanged `state` when only this changed
-   * (a window closed by itself while the device keeps listening). Absent: the server does not say.
+   * Protocol 7: the assistant that has the turn, the one rule the pages show: the assistant of the turn in flight or of
+   * the utterance being heard, else the one whose armed or follow-up window is open; `null`: nobody, speech goes to who
+   * answers without a phrase. Sent again with an unchanged `state` when only this changed (a phrase inside the
+   * utterance, a window that closed by itself while the device keeps listening, an accepted `device.pick`, which closes
+   * the windows). Absent: the server does not say.
    */
   holder: Schema.optionalKey(Schema.NullOr(AssistantId))
 })

@@ -1,5 +1,6 @@
 import { DecisionError, type DecisionRequest, type DecisionResponse } from "@pva/core"
 import { checkUrl, defaults as jevDefaults, makeJevClient, readRouting, type RouteCandidate, routingRequest } from "@pva/decide-typesafe"
+import { type Assistant, type DeviceSettings, typesafeCandidates, typesafeFallback } from "@pva/protocol"
 import { Effect, Redacted } from "effect"
 import type { DecideResult, DecideRoute, RouteDecision } from "./SessionDispatcher.ts"
 
@@ -73,6 +74,19 @@ export const makeRoutingService = (
   }
 }
 
+/**
+ * The session dispatcher's `decideNow` for a device (`SessionDispatcherOptions.decideNow`): who a pending or reused
+ * `decide` answer may still go to. A device that no longer routes by TypeSafe has no candidates and no fallback, so
+ * a late answer, chosen or not, goes to nobody.
+ */
+export const typesafeNow = (
+  settings: Pick<DeviceSettings, "assistants" | "withoutPhrase">,
+  assistants: ReadonlyMap<string, Pick<Assistant, "on">>
+): { readonly candidates: ReadonlyArray<string>; readonly fallback: string | null } => ({
+  candidates: settings.withoutPhrase.mode === "typesafe" ? typesafeCandidates(settings, assistants) : [],
+  fallback: typesafeFallback(settings, assistants)
+})
+
 export interface TypesafeDecideOptions {
   /** `undefined`, or not `ready`: routing is not set up, and nobody answers without a phrase (the device page says so). */
   readonly routing: () => RoutingService | undefined
@@ -100,7 +114,7 @@ export const makeTypesafeDecide = (options: TypesafeDecideOptions): DecideRoute 
   return (request) =>
     Effect.suspend((): Effect.Effect<DecideResult> => {
       const routing = options.routing()
-      if (routing === undefined || !routing.ready()) return Effect.succeed({ assistant: null, fallback: true })
+      if (routing === undefined || !routing.ready()) return Effect.succeed({ assistant: null, fallback: true, notSetUp: true })
       const candidates = options.candidates()
       if (candidates.length === 0) return Effect.succeed({ assistant: request.fallback, fallback: true })
       const giveUpMs = options.giveUpMs()
