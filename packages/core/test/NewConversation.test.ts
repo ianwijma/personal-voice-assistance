@@ -76,6 +76,24 @@ describe("Conversation: newConversation", () => {
     }).pipe(Effect.provide(t.layer))
   })
 
+  it.effect("lastTurnId names the turn whose exchange ends the history, and is reset with the conversation", () => {
+    const t = harness([[agentText("One.")], [agentText("Two.")], [agentText("Three.")]])
+    const lastTurnId = Effect.flatMap(conversation, (c) => c.lastTurnId)
+    const ended = () => t.events.flatMap((e) => (e._tag === "TurnEnded" ? [e.turnId] : []))
+    return Effect.gen(function*() {
+      assert.isUndefined(yield* lastTurnId)
+      yield* textTurn("first")
+      yield* textTurn("second")
+      assert.deepStrictEqual(userTexts(yield* history), ["first", "second"])
+      assert.strictEqual(yield* lastTurnId, ended().at(-1))
+      assert.notStrictEqual(ended().at(-1), ended().at(-2))
+      yield* newConversation()
+      assert.isUndefined(yield* lastTurnId)
+      yield* textTurn("third")
+      assert.strictEqual(yield* lastTurnId, ended().at(-1))
+    }).pipe(Effect.provide(t.layer))
+  })
+
   it.effect("while a voice turn runs: stops it as Stop does, and nothing of it lands in the new conversation", () => {
     const t = harness([[sleep(500), agentText("A slow answer.")], [agentText("Fresh.")]])
     return Effect.gen(function*() {

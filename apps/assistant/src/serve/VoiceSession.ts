@@ -184,6 +184,8 @@ export interface SessionConversations {
   readonly history: (assistant?: string) => Effect.Effect<ReadonlyArray<Message>>
   readonly conversation: (assistant?: string) => ConversationInfo
   readonly lastTurnAt: (assistant?: string) => number | undefined
+  /** The turn whose exchange ends `assistant`'s history (`conversation.history.lastTurnId`, §5.3), if the server knows it. */
+  readonly lastTurnId: (assistant?: string) => number | undefined
   /** Committed turns in `assistant`'s current conversation. */
   readonly turnsOf: (assistant?: string) => number
   readonly newConversation: (assistant?: string) => Effect.Effect<ConversationInfo>
@@ -330,8 +332,15 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
     const followUpOf = (assistant: string | undefined) => (assistant === undefined ? 0 : route.config().followUpMs?.[assistant] ?? 0)
     const longestFollowUp = () => Math.max(0, ...Object.values(route.config().followUpMs ?? {}))
     const armedMs = () => route.config().armedMs ?? WAKE_ARMED_MS
-    /** The assistant the utterance being heard goes to (its route target); `undefined` while TypeSafe decides, or nobody. */
+    /**
+     * The assistant the open utterance goes to (its route target), from its `SpeechStarted` to its `EndOfTurn` only, not
+     * for the hearing tail after it; `undefined` while TypeSafe decides, for nobody, or once Stop or a new conversation
+     * cancelled the utterance (`heardStopped`: the rest of it reaches no turn).
+     */
     let heardFor: string | undefined
+    let heardStopped = false
+    /** The assistant a closed utterance's words went to, until their turn is committed (or the next utterance starts). */
+    let handedTo: string | undefined
     /**
      * Who has the turn, the one rule the pages show (`state.holder`, `snapshot.holder`): the assistant of the turn in
      * flight or of the utterance being heard (an armed window is consumed when the utterance starts, its assistant keeps
@@ -340,7 +349,7 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
     const holderNow = (): string | null => {
       const s = tracker.current()
       if (s.state === "hearing" || s.state === "thinking" || s.state === "speaking") {
-        const busy = (s.turnId === undefined ? undefined : assistantOfTurn(s.turnId)) ?? heardFor
+        const busy = (s.turnId === undefined ? undefined : assistantOfTurn(s.turnId)) ?? heardFor ?? handedTo
         if (busy !== undefined) return busy
       }
       return route.window(now())?.assistant ?? null
@@ -416,7 +425,11 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
     }
     const publisher = makePublisher({
       broadcast: send,
-      onCommitted: (turnId) => tracker.turnPromoted(turnId),
+      onCommitted: (turnId) => {
+        // The handed-over words have their turn now: it names the holder (`state.turnId`).
+        handedTo = undefined
+        tracker.turnPromoted(turnId)
+      },
       moduleOfTool: options.moduleOfTool,
       voice: voiceNow,
       ...(options.onTrace !== undefined ? { onTrace: options.onTrace } : {})
@@ -699,7 +712,17 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
           results.push(r)
           // The utterance's assistant (a phrase in it may change it), before the state that names it is sent.
           const routed = r.target
-          if (routed !== undefined) heardFor = routed.by === "decide" || routed.by === "dropped" ? undefined : routed.assistant
+          const routedTo = routed === undefined || routed.by === "decide" || routed.by === "dropped" ? undefined : routed.assistant
+          if (e._tag === "SpeechStarted") handedTo = undefined
+          if (e._tag === "EndOfTurn") {
+            // The utterance is over: it holds the turn no longer (a phrase alone leaves its armed window). Its words,
+            // if any reach a turn, hold it until that turn is committed.
+            const words = !heardStopped && r.events.some((p) => p._tag === "EndOfTurn" && p.text.trim().length > 0)
+            handedTo = words ? routedTo : undefined
+            heardFor = undefined
+            heardStopped = false
+          } else if (heardStopped) heardFor = undefined
+          else if (routed !== undefined) heardFor = routedTo
           else if (e._tag === "SpeechStarted") heardFor = undefined
           if (r.heard !== undefined) options.wakeHeard(r.heard.text, r.heard.phrase, r.heard.accepted)
           if (r.woke !== undefined) {
@@ -752,10 +775,19 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
     /** The id of a recogniser whose stream failed: not tried again until the hearing changes. */
     let failedId: string | undefined
 
+    /** An utterance closed outside `onStt` (a recogniser switch, a new build): it holds the turn no longer. */
+    const utteranceDropped = () => {
+      heardFor = undefined
+      heardStopped = false
+      handedTo = undefined
+      holderCheck()
+    }
+
     /** Closes an utterance the previous stream left open (it starts nothing). */
     const closeOpenUtterance = Effect.suspend(() => {
       if (!utteranceOpen) return Effect.void
       utteranceOpen = false
+      utteranceDropped()
       heard.discard()
       return dispatcher.dispatch(route.filter({ _tag: "EndOfTurn", text: "" }, now()))
     })
@@ -824,6 +856,7 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
           if (recogniserRuns++ > 0) {
             // A new build: an utterance the previous recogniser stream left open is closed (it starts nothing).
             utteranceOpen = false
+            utteranceDropped()
             yield* dispatcher.dispatch(route.filter({ _tag: "EndOfTurn", text: "" }, now()))
           }
           failedId = undefined
@@ -862,6 +895,19 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
     }
     syncProfile()
 
+    /**
+     * Stop or a new conversation for `assistant` (`undefined`: every one) cancels the open utterance it has, and the
+     * words it was handed: they reach no turn, so they hold the turn no longer.
+     */
+    const utteranceCancelled = (assistant: string | undefined) => {
+      if (heardFor !== undefined && (assistant === undefined || heardFor === assistant)) {
+        heardFor = undefined
+        heardStopped = true
+      }
+      if (handedTo !== undefined && (assistant === undefined || handedTo === assistant)) handedTo = undefined
+      holderCheck()
+    }
+
     const conversations: SessionConversations = {
       sendText: (text, speak, named) =>
         Effect.suspend(() => {
@@ -873,7 +919,11 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
           if ("dropped" in target) return Effect.succeed<TextOutcome>("dropped")
           return dispatcher.send(target.assistant, { _tag: "TextInput", text, speak })
         }),
-      stop: (assistant) => dispatcher.stop(assistant),
+      stop: (assistant) => {
+        const outcome = dispatcher.stop(assistant)
+        utteranceCancelled(assistant)
+        return outcome
+      },
       running: () => detach !== undefined && options.engine.ready(),
       history: (assistant) => conversationOf(assistant ?? answering())?.history ?? Effect.succeed([]),
       conversation: (assistant) => {
@@ -881,6 +931,7 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
         return conversationOf(a)?.conversation() ?? reservedFor(a ?? "")
       },
       lastTurnAt: (assistant) => conversationOf(assistant ?? answering())?.lastTurnAt(),
+      lastTurnId: (assistant) => conversationOf(assistant ?? answering())?.lastTurnId(),
       turnsOf: (assistant) => turnsBy.get(assistant ?? answering() ?? "") ?? 0,
       newConversation: (assistant) =>
         Effect.suspend(() => {
@@ -889,6 +940,7 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
           if (made !== undefined) {
             // Its conversation stops the open utterance; the dispatcher must not hand the rest to another one.
             dispatcher.cancelUtterance(a!)
+            utteranceCancelled(a)
             return made.newConversation
           }
           return Effect.sync(() => {

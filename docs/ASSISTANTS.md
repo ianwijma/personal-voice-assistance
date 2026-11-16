@@ -641,12 +641,19 @@ State           += { holder?: AssistantId | null }   // who has the turn: the tu
                                         // heard, else an open armed / follow-up window, else null (nobody); sent again
                                         // with the same state when only it changes. The page shows it, never guesses.
                                         // An accepted device.pick closes the windows (the picked one answers next).
+                                        // "Being heard": from its SpeechStarted to its EndOfTurn, then (words only)
+                                        // until its turn is committed; not the 2 s hearing tail. Stop or a new
+                                        // conversation for its assistant cancels it: it holds the turn no longer.
 Snapshot.conversations = Array<{ assistantId, id, startedAt, turns: number }>   // replaces snapshot.conversation
 Snapshot.history       = the history of the answering assistant (the follow-up holder, else withoutPhrase's, else
                          the first); the others are fetched on demand:
 Snapshot.answering     = that assistant (the page files `history` under it)
 Snapshot.holder        = who has the turn now, as State.holder (may be an armed assistant whose history it is not)
-ConversationHistory = { type: "conversation.history", requestId, assistantId, id, history: HistoryItem[] }
+ConversationHistory = { type: "conversation.history", requestId, assistantId, id, history: HistoryItem[],
+                        lastTurnId?: TurnId }   // the turn whose exchange (its user message and what followed) ends
+                        // `history`, when a turn of this session was committed last. A turn the page still shows as
+                        // running with that id is that exchange; no other running turn is in `history` (an exchange
+                        // is committed when its turn ends). The page tells turns apart by id only, never by text.
 
 // voice → server
 TextSend         += { assistantId? }    // the voice page always sends the conversation shown
@@ -974,10 +981,10 @@ The snapshot's fields and where each comes from:
 
 | Field | From |
 |---|---|
-| `llm.account`, `model`, `effort`, `thinking`, `maxTokens` | the spec of the language-model instance the turn is bound to (`ResourcePool.keyFor` → the spec recorded for that key: during a change, still the old one), for an offline account its normalised spec; a Claude subscription assistant: its own `llm` fields (what the agent is given) |
+| `llm.account`, `model`, `effort`, `thinking`, `maxTokens` | the spec of the language-model instance the turn is bound to (`ResourcePool.keyFor` → the spec recorded for that key: during a change, still the old one), for an offline account its normalised spec; bound to the Claude subscription (the binding's account, as `agentSetup` reads it, not the saved one): the assistant's own `llm` fields, as the agent is given them (`subscriptionAssistantOf`), not its stand-in's spec |
 | `hearing.hearer`, `engine`, `model`, `language`, `eagerSilenceMs`, `finalSilenceMs`, `eotThreshold` | the recogniser binding the device's stream runs on (`SttBinding.spec` and the hearer): stt-sherpa with its end pauses (the language only for a model that takes one), Deepgram with `eotThreshold`; typed text while no stream runs: the device's binding now |
 | `voice` | the key of the voice the turn is bound to (`ttsKeyFor`) |
-| `modules`, `tools` | the capability modules the assistant has on that run, and the tools in its registry (0 for a subscription assistant with `useModules` off) |
+| `modules`, `tools` | the capability modules the assistant has on that run, and the tools in its registry (0 when bound to the Claude subscription with `useModules` off) |
 | `replyEarly`, `toolRounds` | the assistant's fields |
 
 **Admin and voice page (WP-6b, WP-7, WP-8, WP-15).** `apps/web` only, with its mock server. The wizard (seven steps), the Assistants
