@@ -93,6 +93,10 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
   let markNext = 0
   let lastOnset = 0
   let markLevel = 0
+  // Reduced motion: the quantised level is held at least MARK_HOLD seconds before it may step again.
+  const MARK_HOLD = 0.6
+  let markHeld = 99
+  let markStep = 0
   let dotsPhase = 0
   let tiltS = 0
   let scaleS = 1
@@ -228,6 +232,8 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
         for (let i = 0; i < MARKS_N; i++) markAge[i] = markAge[i]! + dt
       }
       lastOnset = u.onset
+      if (reduced) markAge.fill(99) // nothing in flight survives into a still pose
+      else markHeld = 99 // the first still pose after moving accepts its level at once
       if (marks > 0.02) {
         const youRgb = P.you
         const light = P.dark ? 1 : 1.35 // mint needs more weight on the light page
@@ -238,7 +244,15 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
           // A still pose: listening shows one quiet mark a side; hearing shows three, sized by
           // the person's held loudness.
           const lvT = hearW * (S.userTalking ? Math.max(0.12, u.level) : 0.1)
-          markLevel = reduced ? Math.round(lvT * 4) / 4 : lvT
+          if (reduced) {
+            markHeld += dt
+            const q = Math.round(lvT * 4) / 4
+            if (q !== markStep && markHeld >= MARK_HOLD) {
+              markStep = q
+              markHeld = 0
+            }
+            markLevel = markStep
+          } else markLevel = lvT
           const n = mix.listening > 0.5 ? 1 : 3
           for (let i = 0; i < n; i++) {
             const lv = mix.listening > 0.5 ? 0.05 : markLevel
@@ -370,7 +384,7 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
 const character: Character = {
   id: "line-face",
   name: "Line face",
-  version: "1.1.0",
+  version: "1.1.1",
   contract: 1,
   family: "figure",
   summary: "A face in a few confident strokes: dot eyes, short brows, one mouth line, and comic-strip sound marks that carry your voice in.",
@@ -396,8 +410,8 @@ const character: Character = {
     { signal: "user.pitchDelta (live)", effect: "Brows follow your intonation a little." },
     { signal: "user.level over 0.5 s (and voicing)", effect: "Whisper or soft: leans in (face up to +11 %), eyes and brows lift. Loud or shouting: pulls back (−7 %), squints, brows down and in." },
     { signal: "user.onset at level > 0.58", effect: "Flinch: face shrinks 6 % and eyes squeeze, less each time (habituates over 3 s)." },
-    { signal: "user.level (live)", effect: "Sound marks: size, thickness, opacity and inward speed." },
-    { signal: "user.syllableRate and |pitchDelta|", effect: "Energy: slow flat speech gets lower lids and calmer marks; fast excited speech wider eyes, higher brows, faster marks." },
+    { signal: "user.level (live)", effect: "Sound marks: length, thickness and opacity of the ear mark and of each mark launched; held in steps under reduced motion." },
+    { signal: "user.syllableRate and |pitchDelta|", effect: "Energy: slow flat speech gets lower lids and calmer marks; fast excited speech wider eyes and higher brows. (Faster speech also launches more marks, one per syllable onset.)" },
     { signal: "user.register", effect: "Where it looks: a high or child voice is looked at slightly lower, a deep voice slightly higher." },
     { signal: "user.silenceFor mid-turn", effect: "Waiting: brows soften upward and the smile grows a little." },
     { signal: "pointer (inside)", effect: "Eyes, head turn and tilt direction follow it." },
@@ -408,18 +422,6 @@ const character: Character = {
       signal: "options",
       effect:
         "Size (capped so head, marks and motion stay in frame), style (head line on/off, curved, bold or no brows) and line weight glide over ~0.2 s; expressiveness scales nods, bobs, tilt, lean, flinch and brows; liveliness divides blink and glance intervals; mouth range scales the opening; nods and pointer-following switch off."
-    }
-  ],
-  uses: [
-    {
-      ext: "speech.phonemes",
-      gain: "Exact mouth shapes from the speech engine's phoneme or viseme timings, notably closed lips on m, b and p.",
-      without: "The mouth follows the spectral estimate."
-    },
-    {
-      ext: "reply.expression",
-      gain: "A matching expression (for example a question or a warm reply) instead of a neutral pleasant one.",
-      without: "A neutral pleasant face; core-driven motion only."
     }
   ],
   renderer: "2d",

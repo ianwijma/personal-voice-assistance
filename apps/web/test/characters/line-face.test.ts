@@ -192,6 +192,37 @@ describe("line face: sound marks", () => {
   })
 })
 
+describe("line face: reduced motion", () => {
+  it("holds the sound-mark level for a while when live audio keeps changing", () => {
+    // Levels alternating across a quantisation edge (0.37 / 0.38) must not make the marks flash each frame.
+    const r = make()
+    const alt = (i: number): StepOptions => ({ reduced: true, user: voice({ level: i % 2 === 0 ? 0.37 : 0.38 }) })
+    step(r, "hearing", secs(1), alt)
+    const spans: Array<number> = []
+    for (let i = 0; i < secs(2); i++) spans.push(nums(markArcs(step(r, "hearing", 1, () => alt(i)))[0]!)[4]!)
+    const changes: Array<number> = []
+    for (let i = 1; i < spans.length; i++) if (spans[i] !== spans[i - 1]) changes.push(i)
+    for (let i = 1; i < changes.length; i++) expect(changes[i]! - changes[i - 1]!).toBeGreaterThanOrEqual(secs(0.5))
+    expect(changes.length).toBeLessThanOrEqual(4)
+  })
+
+  it("clears sound marks in flight when it is switched on, and they do not come back", () => {
+    const r = make()
+    step(r, "hearing", secs(0.5), { user: voice() })
+    step(r, "hearing", secs(0.3), (i) => ({ user: voice({ onset: i % 6 === 0 ? 1 : 0 }) }))
+    expect(markArcs(step(r, "hearing", 1, { user: voice() })).length).toBeGreaterThan(2)
+    expect(markArcs(step(r, "hearing", 1, { user: voice(), reduced: true }))).toHaveLength(6)
+    // Back to normal motion straight away: only the ear mark, none of the old marks resume.
+    expect(markArcs(step(r, "hearing", 1, { user: voice() }))).toHaveLength(2)
+  })
+})
+
+describe("line face: manifest", () => {
+  it("advertises no extension it does not read", () => {
+    expect(lineFace.uses).toBeUndefined()
+  })
+})
+
 describe("line face: thinking dots", () => {
   it("three amber dots above the head, on one side, stepping up and outward", () => {
     const P = PALETTES.light
