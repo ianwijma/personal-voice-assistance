@@ -51,8 +51,7 @@
  * `stale`, `duplicate_phrase`, `unknown_assistant`, `limit_reached`, `not_allowed`; `FieldError.key` may be a dotted
  * path; `devices` entries carry `own`, `settings`, `hearer` and `rev` next to the protocol 5 fields;
  * `assistantId` on turn, reply, wake and conversation messages, `snapshot.setup`/`conversations`,
- * `admin.snapshot.assistants`/`deviceTypes`, `SessionInfo.answering`/`conversations`; `wake.heard.source` (the device
- * it was heard on and the matched phrase's assistant there; optional, absent from an older server). The protocol 5 front-end
+ * `admin.snapshot.assistants`/`deviceTypes`, `SessionInfo.answering`/`conversations`. The protocol 5 front-end
  * messages stay until the UI packages replace them.
  */
 export const PROTOCOL_VERSION = 7
