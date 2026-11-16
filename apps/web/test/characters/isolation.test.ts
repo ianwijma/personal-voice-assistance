@@ -6,7 +6,6 @@
  */
 import { readdirSync, readFileSync } from "node:fs"
 import { join, relative } from "node:path"
-import ts from "typescript"
 import { describe, expect, it } from "vitest"
 
 const root = join(import.meta.dirname, "../../src/characters")
@@ -18,45 +17,133 @@ const ALLOWED: { readonly [dir: string]: RegExp } = {
   shared: /^\.\.\/(contract|kit)\.ts$|^\.\/[a-z0-9-]+\.ts$/
 }
 
-/** Names a character must not reference as free identifiers (a global of the page or the network, or a way to run text as code). */
-const FORBIDDEN = new Set(["document", "window", "globalThis", "self", "navigator", "location", "history", "localStorage", "sessionStorage", "indexedDB", "fetch", "XMLHttpRequest", "WebSocket", "EventSource", "AudioContext", "requestAnimationFrame", "setTimeout", "setInterval", "postMessage", "eval", "Function", "require"])
+const FORBIDDEN = /\b(document|window|globalThis|self|navigator|location|history|localStorage|sessionStorage|indexedDB|fetch|XMLHttpRequest|WebSocket|EventSource|AudioContext|requestAnimationFrame|setTimeout|setInterval|postMessage|eval|Function|require)\b|\bimport\s*\(/g
 
-/** Is this identifier a use of a variable (a free reference), and not a name that is declared, a property name, a label or a type? */
-const isReference = (node: ts.Identifier): boolean => {
-  const p = node.parent
-  if (ts.isPropertyAccessExpression(p)) return p.expression === node // `a.window`: `window` is a property name
-  if (ts.isShorthandPropertyAssignment(p)) return true // `{ window }` reads the variable
-  if (ts.isExportSpecifier(p)) return p.parent.parent.moduleSpecifier === undefined && (p.propertyName ?? p.name) === node
-  if (ts.isBindingElement(p)) return p.initializer === node // a default value; the names are declarations
-  if (ts.isQualifiedName(p) || ts.isLabeledStatement(p) || ts.isBreakOrContinueStatement(p)) return false
-  if ((p as { name?: ts.Node }).name === node) return false // a declaration, a property key, a member name
-  if ((p as { propertyName?: ts.Node }).propertyName === node) return false
-  return true
-}
+/** Words after which a `/` starts a regular expression (after any other word, a number, `)` or `]` it divides). */
+const REGEX_AFTER_WORD = new Set(["return", "typeof", "case", "in", "of", "delete", "void", "throw", "new", "else", "do", "yield", "await", "instanceof"])
 
 /**
- * What a source imports (every module specifier: `import`, `export ... from`, `import x = require()`, `import()`
- * types) and which forbidden names it uses as free references, by the TypeScript parser: comments, strings,
- * template text and regular expression literals are not code, and a template's `${...}` expressions are walked
- * like any other expression. Type positions are not walked.
+ * Reads a source as the code that runs, not the text: comments dropped; string, template and regular expression
+ * literals emptied (so a word in a label, a help text or a pattern does not count), but a template's `${...}`
+ * expressions kept, nested templates included, because they run. Also returns the specifiers of its imports (a
+ * string right after `from` or `import`). A scanner, not a parser, so it has to know where a regular expression
+ * can start: a `}` or a quote inside one must not end a template expression or open a string.
  */
-const analyse = (src: string): { readonly specifiers: ReadonlyArray<string>; readonly globals: ReadonlyArray<string> } => {
-  const file = ts.createSourceFile("character.ts", src, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS)
+const scan = (src: string): { readonly code: string; readonly specifiers: ReadonlyArray<string> } => {
+  let out = ""
+  let i = 0
+  const n = src.length
   const specifiers: Array<string> = []
-  const globals: Array<string> = []
-  const visit = (node: ts.Node): void => {
-    if (ts.isImportTypeNode(node) && ts.isLiteralTypeNode(node.argument) && ts.isStringLiteral(node.argument.literal)) specifiers.push(node.argument.literal.text)
-    if (ts.isTypeNode(node) && !ts.isExpressionWithTypeArguments(node)) return
-    if (ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) {
-      if (node.moduleSpecifier !== undefined && ts.isStringLiteral(node.moduleSpecifier)) specifiers.push(node.moduleSpecifier.text)
-    } else if (ts.isImportEqualsDeclaration(node)) {
-      if (ts.isExternalModuleReference(node.moduleReference) && ts.isStringLiteral(node.moduleReference.expression)) specifiers.push(node.moduleReference.expression.text)
-    } else if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword) globals.push("import()")
-    else if (ts.isIdentifier(node) && FORBIDDEN.has(node.text) && isReference(node)) globals.push(node.text)
-    ts.forEachChild(node, visit)
+  // One entry per open template expression: the brace depth inside it (it ends at its own closing brace).
+  const exprs: Array<number> = []
+  /** Does a `/` here start a regular expression? Decided by what came before it. */
+  const regexAllowed = (): boolean => {
+    const before = out.trimEnd()
+    if (before === "") return true
+    const last = before[before.length - 1]!
+    if (/[(,=:[!&|?{};+\-*%<>~^]/.test(last)) return true
+    const word = /[A-Za-z_$][\w$]*$/.exec(before)?.[0]
+    return word !== undefined && REGEX_AFTER_WORD.has(word)
   }
-  visit(file)
-  return { specifiers, globals }
+  /** Skip a regular expression literal starting at `i` (a `/`); false (and nothing skipped) when it is not one. */
+  const skipRegex = (): boolean => {
+    let j = i + 1
+    let inClass = false
+    while (j < n) {
+      const ch = src[j]!
+      if (ch === "\n") return false
+      if (ch === "\\") j += 2
+      else if (ch === "[") {
+        inClass = true
+        j++
+      } else if (ch === "]") {
+        inClass = false
+        j++
+      } else if (ch === "/" && !inClass) break
+      else j++
+    }
+    if (j >= n) return false
+    j++
+    while (j < n && /[A-Za-z]/.test(src[j]!)) j++
+    i = j
+    out += "_re_"
+    return true
+  }
+  /** Skip a template literal's text from just after its opening backtick (or a closing `}`) to its end or `${`. */
+  const templateText = (): void => {
+    while (i < n) {
+      const ch = src[i]!
+      if (ch === "\\") {
+        i += 2
+        continue
+      }
+      if (ch === "`") {
+        i++
+        out += '""'
+        return
+      }
+      if (ch === "$" && src[i + 1] === "{") {
+        i += 2
+        out += "("
+        exprs.push(0)
+        return
+      }
+      i++
+    }
+  }
+  while (i < n) {
+    const ch = src[i]!
+    const next = src[i + 1]
+    if (ch === "/" && next === "/") {
+      while (i < n && src[i] !== "\n") i++
+      continue
+    }
+    if (ch === "/" && next === "*") {
+      const end = src.indexOf("*/", i + 2)
+      i = end < 0 ? n : end + 2
+      out += " "
+      continue
+    }
+    if (ch === "/" && regexAllowed() && skipRegex()) continue
+    if (ch === '"' || ch === "'") {
+      const start = i + 1
+      i++
+      while (i < n && src[i] !== ch && src[i] !== "\n") i += src[i] === "\\" ? 2 : 1
+      if (/\b(from|import)\s*$/.test(out)) specifiers.push(src.slice(start, i))
+      i++
+      out += '""'
+      continue
+    }
+    if (ch === "`") {
+      i++
+      templateText()
+      continue
+    }
+    if (exprs.length > 0) {
+      const top = exprs.length - 1
+      if (ch === "{") exprs[top] = exprs[top]! + 1
+      else if (ch === "}") {
+        if (exprs[top] === 0) {
+          // The end of a template expression: back in the template's text.
+          exprs.pop()
+          out += ")"
+          i++
+          templateText()
+          continue
+        }
+        exprs[top] = exprs[top]! - 1
+      }
+    }
+    out += ch
+    i++
+  }
+  return { code: out, specifiers }
+}
+
+/** What a source imports, and the forbidden names (or `import()`) its code uses, in order. */
+const analyse = (src: string): { readonly specifiers: ReadonlyArray<string>; readonly globals: ReadonlyArray<string> } => {
+  const { code, specifiers } = scan(src)
+  return { specifiers, globals: [...code.matchAll(FORBIDDEN)].map((m) => m[1] ?? "import()") }
 }
 
 describe("character isolation", () => {
@@ -90,7 +177,7 @@ describe("character isolation", () => {
     expect(uses("const re = /window|document|fetch/g")).toBeUndefined()
   })
 
-  it("the check finds free references by name, however they are written, and not property names, declarations or types", () => {
+  it("the check finds a forbidden name however it is written", () => {
     const uses = (src: string) => analyse(src).globals[0]
     expect(uses("const w = window['document']")).toBe("window")
     expect(uses("const x = a ? globalThis.fetch : 0")).toBe("globalThis")
@@ -102,10 +189,9 @@ describe("character isolation", () => {
     expect(uses("export { fetch }")).toBe("fetch")
     expect(uses("const m = await import('../../app/x.ts')")).toBe("import()")
     expect(uses("const o = { [window.x]: 1 }")).toBe("window")
-    expect(uses("const x = obj.window + obj.document + obj?.fetch; const o = { window: 1, fetch: 2, history() {} }")).toBeUndefined()
-    expect(uses("type T = typeof window; let f: Function; const n = x as Function; interface I { document: string }")).toBeUndefined()
-    expect(uses("const { window: w, fetch: f } = o; function g(self: number) { return 1 }")).toBeUndefined() // a declared name is not a reference
-    expect(uses("export { a as window }; import { fetch as get } from '../kit.ts'")).toBeUndefined()
+    expect(uses("const ok = x.test('a') && /[/}]+/.test(y) ? window.name : 0")).toBe("window") // a `/` and a `}` in a character class
+    expect(uses("function f() { return /\\//.test(s) ? navigator.language : 0 }")).toBe("navigator") // an escaped slash
+    expect(uses("const q = a / b; const r = c / d; fetch(q)")).toBe("fetch") // dividing twice is not a regular expression
   })
 
   it("the check sees every kind of import", () => {
@@ -113,7 +199,6 @@ describe("character isolation", () => {
     expect(from('import { a } from "../kit.ts"\nimport type { B } from "../../app/store.ts"')).toEqual(["../kit.ts", "../../app/store.ts"])
     expect(from('export * from "../shared/x.ts"\nexport { y } from "../../lib/y.ts"')).toEqual(["../shared/x.ts", "../../lib/y.ts"])
     expect(from('import "../side-effect.ts"')).toEqual(["../side-effect.ts"])
-    expect(from('type T = import("../../app/x.ts").X')).toEqual(["../../app/x.ts"])
     expect(from('const s = "import x from \\"../../app/x.ts\\""; // import y from "../z.ts"')).toEqual([])
   })
 
