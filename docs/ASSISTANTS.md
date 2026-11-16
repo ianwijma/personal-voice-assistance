@@ -1400,3 +1400,95 @@ Deviations from §5:
   timer and makes its own requests; its size depends on the house).
 - **Not verified.** The web pages (no "own settings" control yet; the Modules page's switch now answers
   `not_allowed` for a capability); a real Home Assistant (only the fake server); the CLI modes with Home (not applied).
+
+### WP-14 TypeSafe routing: built 2026-11-16
+
+A sentence the route gate leaves to `decide` (a device set to "TypeSafe decides", no phrase, no open armed or
+follow-up window) is routed by TypeSafe. **Off by default**: nothing is sent until the owner switches the routing
+section on and adds a key, and only from devices set to TypeSafe.
+
+- **Settings.** New shared section `routing` (`sectionDefinitions.ts`; group `agents`, page `routing`, protected, live):
+  `TYPESAFE_ROUTING` (switch, default off), `TYPESAFE_API_KEY` (secret, vault), `TYPESAFE_MODEL` (default
+  `jev-1.14.0`), `TYPESAFE_BASE_URL` (advanced, default `https://api.typesafe.ai`, the adapter's address check). A
+  warning when it is on without a key. The `jev-typesafe` decision module (not in the app's catalog) is unchanged.
+- **`canAuto`** (voice pages' `device.setup`, `device.pick "typesafe"`) is now "the routing section is on, has a key and
+  a valid address" (`routing.ts` `routingReady`). It is re-sent after a save of the section and after a vault change.
+  The admin's device page reads the same from the section's values (`DevicesPages.tsx` `useCanAuto`; the old
+  decision-module rule only for a server without the section, as the mock server still is).
+- **Not set up** (off or no key) on a TypeSafe device: nobody answers a sentence without a phrase (what the device page
+  and the mock-up say), no request. Before WP-14 the fallback answered it.
+- **Request** (`packages/decide-typesafe/src/routing.ts` `routingRequest`, sent with `makeJevClient`, whose `decide`
+  gains a per-call `timeoutMs`): exactly §3.6. `state = { utterance, available_actions: { id: Handles, or "Name:
+  purpose" (or the name) when Handles is empty } }` over the device's switched-on assistants in list order
+  (`typesafeCandidates`); questions `assistant` (Choice, the same options) and `fits` (Noul); with one candidate only
+  `fits`. On the wire the options are the Choice's `criteria` and the roles are dropped (as for the intent decider).
+- **Decision** (`readRouting`): chosen when `fits ≥ ROUTE_FITS_MIN` (0.5) and the chosen option's probability
+  `≥ ROUTE_CHOICE_MIN` (0.5); a missing answer is 0; a choice that is not a candidate is none fits.
+- **Timing** (`serve/routing.ts` `makeTypesafeDecide`, the dispatcher's `decide`): asked at the first non-blank
+  `EagerEndOfTurn`, else at `EndOfTurn`; the event (and everything after it, the recogniser's events queue meanwhile)
+  waits for the answer or the give-up time (`withoutPhrase.giveUpMs`, default 400), after which the call is
+  interrupted and its request aborted (a late answer is never read). At the final the decision is reused when
+  `sameUtterance` holds, else asked again with a fresh give-up time. A later eager event with changed text is asked
+  again too (§3.6 names only the first eager; the re-ask overlaps the pause, and the final can then reuse it). No
+  retries. A phrase, an armed or follow-up window, and typed text never ask (they are not `decide` targets).
+- **Fallback**: none fits, the give-up time, or an error (key rejected, network, refused, bad answer; logged once per
+  distinct message) → the fallback (`null`: dropped). No switched-on candidate → the fallback without a request.
+- **Traces**: `route = { by: "typesafe", outcome: "chosen" | "none-fits" | "timeout" | "error", probability?, fits,
+  ms, fallback }` and marks `routeSent`, `routeReceived` (absent after a timeout), relative to the conversation's end
+  of turn like the other marks. A decision held at the final therefore shows a negative `routeSent`: the
+  conversation's `endOfTurn` mark comes after it. `TraceRoute.fits` is now a number (it was an integer, a WP-2 slip).
+- **Warnings** (§2.2): `validateDeviceSettings(…, { assistants })` warns `no_handles` for each switched-on assistant
+  with empty Handles on a TypeSafe device (a new warning asks "Save anyway" on `device.save`); `assistant.save` of a
+  switched-on assistant whose Handles becomes empty while it is on a TypeSafe device asks the same.
+- **Tests.** `apps/assistant/test/typesafeRouting.test.ts` (scripted routing service under the test clock, real route
+  gate and dispatcher: chosen with the eager event held until the answer and the final reusing it; none fits by the
+  Noul and by a weak choice; timeout at the give-up time with the call interrupted and the late answer unused; error;
+  text changed between eager and final asked again; phrase and follow-up never ask and are not delayed; fallback
+  nobody drops; not set up sends nothing; one candidate; typed text). `serveTypesafe.test.ts` (real server, the real
+  adapter over HTTP to a local fake `/v1/systemone`: wire body and bearer key, chosen / none fits / phrase / typed text,
+  traces and marks, off by default then switched on live with `device.setup` following, a slow server traced as a
+  timeout, the Handles warnings). `packages/decide-typesafe/test/routing.test.ts` (request and reading; HTTP body,
+  per-call time limit aborting the request, 401 / 529 / malformed answer). `benchTypesafe.test.ts`. Changed:
+  `serveAssistantMessages.test.ts` (`canAuto` from the section), `serve.test.ts` and `serveVault.test.ts` (the new
+  section in the lists).
+- **Measurement, offline** (`pnpm start bench --typesafe`; `src/bench/typesafe.ts`). The offline bench's session path
+  (route gate → dispatcher → `Conversation`, output lease), realistic stand-ins (LLM first token 250 ms + 60 tok/s, TTS
+  first audio 150 ms), a TypeSafe device with three candidates whose simulated decision answers Jeff after 150, 250
+  or 400 ms (give-up set to 2 s so the simulated answer is always used), against the same path with the device
+  answering without a phrase and no decider. The recogniser's events reach the dispatcher through a queue, as in serve
+  mode. Figure: **recogniser `EndOfTurn` → playback start** (`EOT->PLAY`; the trace's own end of turn is the
+  conversation's, after the decision), median of 12 turns per run (3 rounds of the 4 scripted turns, after a warm-up
+  round). No follow-up window opens in the bench, so every turn is decided. This machine (WP-0's), 3 runs, load
+  1.3–11; the eager lead is the bench's default 200 ms, plus one run with 350 ms (the real defaults, eager 250 /
+  final 600):
+
+  | Decision | eager OFF (3 runs) → median | eager ON, lead 200 (3 runs) → median | eager ON, lead 350 (1 run) |
+  |---|---|---|---|
+  | none (no decider) | 508 / 508 / 524 → **508** | 308 / 307 / 307 → **307** | 158 |
+  | 150 ms | 659 / 659 / 663 → **659** (+151) | 460 / 459 / 459 → **459** (+152) | 309 (+151) |
+  | 250 ms | 759 / 760 / 759 → **759** (+251) | 558 / 558 / 558 → **558** (+251) | 408 (+250) |
+  | 400 ms | 910 / 909 / 909 → **909** (+401) | 709 / 715 / 708 → **709** (+402) | 558 (+400) |
+
+  Worst turns (the tool turn) move by the same amounts (740 → 888 / 987 / 1138 eager off). **Reading: the decision's
+  whole time is added to playback, with eager on as with eager off.** §1.2's hypothesis (the call overlaps the pause
+  before the final) holds only for the final: it is not held longer when the decision is shorter than the eager lead.
+  But the speculative turn, which produces the reply, starts only after the answer, so it is late by the same amount.
+  Eager on with a 250 ms decision beats eager off without TypeSafe (508) only with the 350 ms lead (408; 558 with the
+  200 ms lead). A way to hide it (not built, a design change for the owner): start the speculative turn at once for a
+  tentative assistant (the fallback, or the last one chosen) while TypeSafe is asked, and hand over only when it
+  chooses another.
+- **Live: not measured** (no TypeSafe key on this machine; no request was made to api.typesafe.ai). With the owner's
+  key: `TYPESAFE_API_KEY=… pnpm start bench --typesafe-live` (or a key in the vault: `PVA_VAULT_PASSWORD=… pnpm start
+  bench --typesafe-live`; options `--count N` (default 50), `--gap-ms MS` (default 1000), `--timeout-ms MS` (default
+  2000)). It sends 50 English and Dutch sentences, one after another, over the three bench assistants and prints each
+  `routeReceived − routeSent`, the outcome and choice, p50/p90/p95/p99/max with and without the first (connection
+  set-up) request, how many fit in the 400 ms give-up, and the choices. Checked against a local fake server only.
+- **Unverified.** Every request and response shape is from TypeSafe's documentation (docs/research/typesafe-jev.md
+  §2.2, §2.3), never sent to the real service: the body (`model`, `state` as an object, Choice `criteria`, Noul),
+  the bearer header, the answer (`answers.assistant.choice`/`probabilities`, `answers.fits.noul`), the error codes,
+  whether the thresholds suit our sentences (Dutch included) and the option-order bias. The 0.5 thresholds are
+  starting points, to be tuned from traces.
+- **Not built.** The web voice page and Diagnostics' Routing column (WP-8, WP-15) are other packages; the mock server
+  has no `routing` section. No warm-up request keeps the TypeSafe connection open (Node closes an idle one after about
+  4 s, `packages/decide-typesafe/test/live.test.ts`), so a first sentence after a pause also pays the connection set-up; the live
+  bench's `--gap-ms 6000` shows what that costs.

@@ -42,6 +42,7 @@ import type { BenchRow } from "./report.ts"
 import { observedTurnTraceLayer } from "../startup.ts"
 import { makeOutputLease } from "../serve/OutputLease.ts"
 import { type DispatchHooks, makeSessionDispatcher } from "../serve/SessionDispatcher.ts"
+import { simulatedDecide } from "./typesafe.ts"
 
 export interface SimulatedDelays {
   /** Request sent → first text token. */
@@ -86,6 +87,17 @@ export interface OfflineScenario {
    * front of the one `Conversation`.
    */
   readonly dispatch?: boolean
+  /**
+   * WP-14: a TypeSafe device (no phrase, so every utterance is decided) on the session path, with a simulated decision
+   * of this many ms (`bench/typesafe.ts`). Implies `dispatch`. Rows then carry `EOT->PLAY`: the recogniser's
+   * `EndOfTurn` → playback start (the trace's own end of turn comes after a decision held at the final).
+   */
+  readonly decideMs?: number
+  /**
+   * The recogniser's events reach the dispatcher through a queue, as in serve mode (its timing does not wait for a
+   * decision the dispatcher holds), and rows carry `EOT->PLAY`. On with `decideMs`; set it on the baseline row too.
+   */
+  readonly queued?: boolean
 }
 
 interface ScriptedTurn {
@@ -169,7 +181,11 @@ const runSession = (
     const recording = makeRecordingAudioOutput({ chunkMillis: scenario.delays.playbackMsPerClause })
     // Serve's session path: the dispatcher's hooks see the conversation's events; it plays through a lease.
     let hooks: DispatchHooks | undefined
-    const output = scenario.dispatch === true
+    const dispatch = scenario.dispatch === true || scenario.decideMs !== undefined
+    const queued = scenario.queued === true || scenario.decideMs !== undefined
+    /** When the recogniser's `EndOfTurn` of the current turn was emitted (session path). */
+    let recogniserEot: number | undefined
+    const output = dispatch
       ? Layer.effect(AudioOutput, Effect.gen(function*() {
         return makeOutputLease(yield* AudioOutput).output("jeff")
       })).pipe(Layer.provide(recording.layer))
@@ -192,15 +208,19 @@ const runSession = (
             Stream.concat(feed(scripted(sttEvents(turn, scenario)))),
             Stream.concat(Stream.fromEffectDrain(Effect.gen(function*() {
               const trace = yield* Queue.take(finished)
-              if (round > 0) rows.push({ label: `${label}${round}.${script.indexOf(turn) + 1} ${turn.user.slice(0, 24)}`, trace })
+              const play = trace.marks.playbackStart
+              const extra = queued && recogniserEot !== undefined && play !== undefined ? { extra: { "EOT->PLAY": play - recogniserEot } } : {}
+              if (round > 0) rows.push({ label: `${label}${round}.${script.indexOf(turn) + 1} ${turn.user.slice(0, 24)}`, trace, ...extra })
             })))
           ), { concurrency: 1 })
       )
-    if (scenario.dispatch === true) {
+    if (dispatch) {
       // Recogniser events → route gate → dispatcher → the conversation's inbox (as `VoiceSession` wires it).
       const inbox = yield* Queue.unbounded<ConversationInput, Cause.Done>()
-      const route = makeRouteGate(scenario.route ?? routeConfigFromWake(WAKE_ALWAYS, "jeff"))
+      const typesafe: RouteConfig = { phrases: [], match: "close", withoutPhrase: "decide", fallback: "jeff", followUpMs: {}, off: new Set() }
+      const route = makeRouteGate(scenario.route ?? (scenario.decideMs !== undefined ? typesafe : routeConfigFromWake(WAKE_ALWAYS, "jeff")))
       const dispatcher = makeSessionDispatcher({
+        ...(scenario.decideMs !== undefined ? { decide: simulatedDecide(scenario.decideMs) } : {}),
         make: (_assistant, h) =>
           Effect.sync(() => {
             hooks = h
@@ -208,7 +228,18 @@ const runSession = (
           })
       })
       const feed = (events: Stream.Stream<SttEvent>) =>
-        events.pipe(Stream.mapEffect((event) => dispatcher.dispatch(route.filter(event, performance.now()))), Stream.drain)
+        queued
+          ? events.pipe(
+            // As the recogniser's queue does in serve mode: its timing does not wait for a decision the dispatcher holds.
+            Stream.map((event) => ({ event, at: performance.now() })),
+            Stream.buffer({ capacity: "unbounded" }),
+            Stream.mapEffect(({ event, at }) => {
+              if (event._tag === "EndOfTurn") recogniserEot = at
+              return dispatcher.dispatch(route.filter(event, at))
+            }),
+            Stream.drain
+          )
+          : events.pipe(Stream.mapEffect((event) => dispatcher.dispatch(route.filter(event, performance.now()))), Stream.drain)
       const driver = Stream.runDrain(perTurn(feed)).pipe(Effect.ensuring(Queue.end(inbox)))
       yield* Effect.gen(function*() {
         const conversation = yield* Conversation

@@ -194,8 +194,10 @@ export const TraceRoute = Schema.Union([
   Schema.Struct({
     by: Schema.Literal("typesafe"),
     outcome: Schema.Literals(["chosen", "none-fits", "timeout", "error"]),
+    /** The chosen (or best) option's probability, 0..1; absent with one candidate (the Noul alone decides). */
     probability: Schema.optionalKey(Schema.Finite),
-    fits: Schema.optionalKey(NonNegativeInt),
+    /** The companion Noul "does any fit", 0..1. */
+    fits: Schema.optionalKey(Schema.Finite),
     ms: NonNegativeFinite,
     fallback: Schema.Boolean
   })

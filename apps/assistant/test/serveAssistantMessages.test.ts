@@ -1,9 +1,8 @@
 // Protocol 7 messages on the server (docs/ASSISTANTS.md §5.2 to §5.4, WP-5): assistant and device saves, `device.pick`,
 // `conversation.read`, the pushes and who gets them. Scripted clients against the real server with injected providers.
-import { defineModule, type ModuleDefinition } from "@pva/core"
+import type { ModuleDefinition } from "@pva/core"
 import { endOfTurn, speechStarted } from "@pva/core/testing"
 import type { ClientMessage, ServerMessage, ServerMessageOf, ServerMessageType } from "@pva/protocol"
-import { Effect } from "effect"
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -23,14 +22,8 @@ afterEach(async () => {
 
 type Json = Record<string, any>
 
-/** A decision provider that is running: "TypeSafe is set up" (`canAuto`). */
-const deciderModule: ModuleDefinition<any> = defineModule({
-  id: "decider-x",
-  name: "Decider",
-  description: "A decision provider.",
-  kind: "decider",
-  start: () => Effect.succeed({})
-})
+/** "TypeSafe is set up" (`canAuto`, WP-14): the routing section switched on, with a key. */
+const routingEnv = { TYPESAFE_ROUTING: "true", TYPESAFE_API_KEY: "ts-test-key" }
 
 /** Two assistants (Alpha with the greeter, Bravo) on the browser defaults: "hey alpha" / "hey bravo", nobody without a phrase. */
 const twoAssistantsDataDir = async (edit: (file: Json) => void = () => {}): Promise<string> => {
@@ -55,10 +48,10 @@ const twoAssistantsDataDir = async (edit: (file: Json) => void = () => {}): Prom
   return dataDir
 }
 
-const start = async (edit?: (file: Json) => void, catalog: Array<ModuleDefinition<any>> = [greeterModule]) => {
+const start = async (edit?: (file: Json) => void, catalog: Array<ModuleDefinition<any>> = [greeterModule], env: Record<string, string> = {}) => {
   const stt = controlledStt()
   const llm = scriptedLlm((t) => `Reply to ${t}.`)
-  server = await startTestServer({ build: fakeBuild({ stt: stt.stt, llm: llm.llm }), dataDir: await twoAssistantsDataDir(edit), catalog })
+  server = await startTestServer({ build: fakeBuild({ stt: stt.stt, llm: llm.llm }), dataDir: await twoAssistantsDataDir(edit), catalog, env })
   return { stt, llm }
 }
 
@@ -560,11 +553,11 @@ describe("device.pick", () => {
     expect(await utterance(page, stt, "hey alpha hello")).toMatchObject({ assistantId: "alpha" })
   })
 
-  it("'typesafe' needs a running decision provider and keeps the effective fallback and give-up time", async () => {
+  it("'typesafe' needs the routing section set up and keeps the effective fallback and give-up time", async () => {
     await start((file) => {
       withPick(file)
       file.deviceTypes["web-voice"].withoutPhrase = { mode: "typesafe", fallback: "bravo", giveUpMs: 700 }
-    }, [greeterModule, deciderModule])
+    }, [greeterModule], routingEnv)
     const { client: page, welcome } = await voice()
     expect(welcome.snapshot.setup).toMatchObject({ canPick: true, canAuto: true, withoutPhrase: { mode: "typesafe", fallback: "bravo" } })
     const a = await admin()

@@ -32,7 +32,9 @@ import type { SendOutcome } from "./SessionConversation.ts"
  * - The target is re-evaluated at every text event (`Interim`, `EagerEndOfTurn`, `EndOfTurn`), as the route gate
  *   re-matches phrases per event. Blank texts never move an utterance. A `decide` target is resolved only at a
  *   non-blank eager or final transcript (interims keep where the utterance is), and the decision is reused at the
- *   final when the text is the same utterance (`sameUtterance`), as §3.6 describes.
+ *   final when the text is the same utterance (`sameUtterance`), as §3.6 describes. Events are handled one after
+ *   another, so the event being decided, and everything after it, waits for the answer (the recogniser's events
+ *   queue meanwhile); a later eager event whose text changed is asked again too.
  * - Stop interrupts every conversation that is active (a committed turn running or about to start, a speculative
  *   turn, or the open utterance), and the rest of the stopped utterance is never handed over.
  * - Typed text, and a non-empty final, interrupt a committed turn of ANOTHER conversation (inside one conversation
@@ -57,7 +59,7 @@ export interface DispatchHooks {
   readonly onEvent: (event: ConversationEvent) => void
 }
 
-/** Asking who a `decide` utterance is for. WP-14 plugs TypeSafe in here (§3.6). */
+/** Asking who a `decide` utterance is for: TypeSafe (§3.6, WP-14: `routing.ts` `makeTypesafeDecide`). */
 export interface DecideRequest {
   /** The eager or final transcript (phrase-free: a `decide` target means no phrase matched). Never blank. */
   readonly text: string
@@ -67,17 +69,34 @@ export interface DecideRequest {
   readonly final: boolean
 }
 
+/** What a routing call came to, for the trace (protocol 7 `TraceRoute` `by: "typesafe"`, marks `routeSent`/`routeReceived`). */
+export interface RouteDecision {
+  readonly outcome: "chosen" | "none-fits" | "timeout" | "error"
+  /** The chosen (or, for none fits, the best) option's probability; absent with one candidate. */
+  readonly probability?: number
+  /** The companion Noul: does any assistant fit (0..1). */
+  readonly fits?: number
+  /** From sending to the answer (or to the give-up time). */
+  readonly ms: number
+  /** Trace clock (`TurnTrace.now`): the request left. */
+  readonly sentAt: number
+  /** Trace clock: the answer (or the error) arrived; absent after a timeout. */
+  readonly receivedAt?: number
+}
+
 export interface DecideResult {
   /** `null`: nobody answers; the utterance is dropped. */
   readonly assistant: string | null
   /** The fallback answered (nobody was chosen, or the decider gave up or failed). */
   readonly fallback: boolean
+  /** A routing call was made (absent: answered without one, e.g. `decideByFallback`). */
+  readonly decision?: RouteDecision
 }
 
 /**
- * The seam for TypeSafe routing (WP-14). Until then the fallback answers every `decide` utterance (and nobody when
- * it is `null`). The dispatcher holds the event until the effect completes, so a real decider must bound itself
- * (the give-up time) and must not fail.
+ * The seam for TypeSafe routing (WP-14, `routing.ts` `makeTypesafeDecide`). Without it the fallback answers every
+ * `decide` utterance (and nobody when it is `null`). The dispatcher holds the event until the effect completes, so a
+ * real decider must bound itself (the give-up time) and must not fail.
  */
 export type DecideRoute = (request: DecideRequest) => Effect.Effect<DecideResult>
 
@@ -86,7 +105,7 @@ export const decideByFallback: DecideRoute = (request) => Effect.succeed({ assis
 /** How the last utterance or typed message reached an assistant (for traces, §3.7). */
 export type DispatchRoute =
   | Extract<RouteTarget, { readonly assistant: string; readonly by: "phrase" | "armed" | "follow-up" | "default" }>
-  | { readonly by: "decide"; readonly assistant: string; readonly fallback: boolean }
+  | { readonly by: "decide"; readonly assistant: string; readonly fallback: boolean; readonly decision?: RouteDecision }
   | { readonly by: "typed"; readonly assistant: string }
   /** It got the utterance's `SpeechStarted` as the barge-in owner, and no text has decided otherwise yet. */
   | { readonly by: "barge-in"; readonly assistant: string }
@@ -297,7 +316,15 @@ export const makeSessionDispatcher = <C extends DispatchTarget>(
           return Effect.map(answer, (result): Where =>
             result.assistant === null
               ? { to: null }
-              : { to: result.assistant, route: { by: "decide", assistant: result.assistant, fallback: result.fallback } })
+              : {
+                to: result.assistant,
+                route: {
+                  by: "decide",
+                  assistant: result.assistant,
+                  fallback: result.fallback,
+                  ...(result.decision !== undefined ? { decision: result.decision } : {})
+                }
+              })
         }
         default:
           return Effect.succeed({ to: target.assistant, route: target })

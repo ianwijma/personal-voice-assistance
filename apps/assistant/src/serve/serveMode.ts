@@ -101,6 +101,7 @@ import { type Favourites, makeFavourites } from "./Favourites.ts"
 import { makeVoiceCatalog, type VoiceCatalog, type VoiceCatalogOptions } from "./VoiceCatalog.ts"
 import { type Hearing, makeVoiceSession, type VoiceSession } from "./VoiceSession.ts"
 import { makeVoiceSessions, type VoiceSessions } from "./VoiceSessions.ts"
+import { makeRoutingService, ROUTING_KEYS } from "./routing.ts"
 import { type KdfParams, openVault, type Vault, VaultPathConfig } from "./Vault.ts"
 import * as SherpaStt from "@pva/stt-sherpa"
 import * as SherpaTts from "@pva/tts-sherpa"
@@ -177,6 +178,8 @@ export interface ServeOptions {
    * that build's `llm`.
    */
   readonly buildLlm?: LlmBuilder
+  /** TypeSafe routing's HTTP client (tests: a fake server's, or a stand-in). Default: the global `fetch`. */
+  readonly routingFetch?: typeof globalThis.fetch
   /**
    * Builds the resource pool's voice instances (tests inject fakes). Default: the providers' adapters
    * (`defaultTtsBuilder`); with an injected `build` and no `buildTts`, instances that speak with that build's `tts`.
@@ -902,6 +905,14 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       conversationIdleMinutes: () => Number(sections.value("CONVERSATION_IDLE_MINUTES") ?? DEFAULT_CONVERSATION_IDLE_MINUTES)
     })
 
+    // TypeSafe routing (docs/ASSISTANTS.md §3.6): the shared `routing` section, read at each decision (live).
+    const routing = makeRoutingService(() => ({
+      enabled: sections.value(ROUTING_KEYS.enabled) === true,
+      apiKey: settingNow(ROUTING_KEYS.apiKey),
+      model: settingNow(ROUTING_KEYS.model),
+      baseUrl: settingNow(ROUTING_KEYS.baseUrl)
+    }), options.routingFetch !== undefined ? { fetch: options.routingFetch } : {})
+
     // One voice session per device (docs/VOICE-SESSIONS.md §2), on the shared engines.
     const recordings = join(options.dataDir, "recordings")
     const sessions: VoiceSessions = makeVoiceSessions({
@@ -918,6 +929,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
           conversationSetup,
           voiceOf: resources.ttsKeyFor,
           moduleOfTool: (name) => host.snapshot().toolModules.get(name) ?? null,
+          routing: () => routing,
           turnTrace,
           send: (message) => hub?.toSession(key, message),
           wakeHeard: (text, phrase, accepted) => hub?.wakeHeard(key, text, phrase, accepted),
@@ -963,8 +975,8 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       engineState: () => theEngine.status().state,
       hearingProblems,
       speechMemoryWarning,
-      // TypeSafe is set up when a decision provider runs (the routing section arrives with WP-14).
-      canAuto: () => host.modules().some((m) => m.kind === "decider" && m.state === "running")
+      // TypeSafe is set up: the routing section is switched on, with a key and a valid address (WP-14).
+      canAuto: routing.ready
     })
     hub = makeSessionHub({
       admin,
@@ -987,6 +999,8 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
         if (sectionId === "llm-behaviour") hubNow.refreshProfiles()
         // Home moves the modules' linked defaults (read once the section's new values are in effect).
         if (sectionId === "home") run(syncModules())
+        // `canAuto` (the voice pages' `device.setup`) follows the routing section (WP-14).
+        if (sectionId === "routing") hubNow.refreshProfiles()
       },
       ...(options.helloTimeoutMs !== undefined ? { helloTimeoutMs: options.helloTimeoutMs } : {})
     })
@@ -999,6 +1013,8 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     keys.subscribe((state) => {
       hubNow.vaultChanged()
       sections.announceAll()
+      // The TypeSafe key may have come or gone with the vault: `canAuto` follows (WP-14).
+      hubNow.refreshProfiles()
       // Engines that failed (a key was locked away) are rebuilt once the keys are there.
       if (state === "unlocked" && theEngine.status().state === "failed") {
         run(Effect.flatMap(theEngine.reload, (r) => (r.ok ? Effect.logInfo("Engines reloaded after the keys were unlocked.") : Effect.void)))

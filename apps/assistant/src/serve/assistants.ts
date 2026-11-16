@@ -194,10 +194,11 @@ export const makeAssistants = (options: AssistantsOptions): Assistants => {
     saveAnyway: boolean
   ): AssistantResult | undefined => {
     const ids = knownIds()
-    const checked = validateDeviceSettings(next, ids)
+    const records = { assistants: new Map(inEffect().map((a) => [a.id, a])) }
+    const checked = validateDeviceSettings(next, ids, records)
     if (checked.errors.length > 0) return refusal(checked.errors)
     if (saveAnyway) return undefined
-    const old = new Set(validateDeviceSettings(before, ids).warnings.map((w) => w.path))
+    const old = new Set(validateDeviceSettings(before, ids, records).warnings.map((w) => w.path))
     const fresh = checked.warnings.filter((w) => !old.has(w.path))
     if (fresh.length === 0) return undefined
     return fail("invalid_settings", `${fresh[0]!.message} Save anyway to keep it.`, { warnings: fieldErrorsOf(fresh) })
@@ -349,12 +350,28 @@ export const makeAssistants = (options: AssistantsOptions): Assistants => {
       }).pipe(Effect.catch((e) => Effect.succeed(entityFailure(e))))
     })
 
+  /** §2.2: a switched-on assistant on a TypeSafe device whose Handles becomes empty asks "Save anyway" (once). */
+  const handlesRefusal = (a: Assistant, saveAnyway: boolean): AssistantResult | undefined => {
+    if (saveAnyway || !a.on || a.handles.trim() !== "") return undefined
+    const before = store.assistants().find((x) => x.id === a.id)
+    if (before !== undefined && before.on && before.handles.trim() === "") return undefined
+    const file = store.settings()
+    const lists = [
+      ...DEVICE_TYPES.map((t) => typeSettingsFrom(file, t.kind)),
+      ...Object.keys(file.devices).map((id) => deviceSettingsFrom(file, id))
+    ]
+    if (!lists.some((s) => s.withoutPhrase.mode === "typesafe" && s.assistants.some((x) => x.assistant === a.id))) return undefined
+    const message = `${a.name} has no Handles text, so TypeSafe can only go by its name and purpose.`
+    return fail("invalid_settings", `${message} Save anyway to keep it.`, { warnings: [{ key: "handles", message }] })
+  }
+
   const save: Assistants["save"] = (message) =>
     Effect.suspend(() => {
       if (!knownIds().has(message.assistant.id)) return Effect.succeed(fail("unknown_assistant", `There is no assistant ${message.assistant.id}.`))
       const issues = assistantIssues(message.assistant)
       if (issues.length > 0) return Effect.succeed(refusal(issues))
-      const memory = memoryRefusal({ assistant: message.assistant }, message.saveAnyway === true, "hearing.model")
+      const memory = memoryRefusal({ assistant: message.assistant }, message.saveAnyway === true, "hearing.model") ??
+        handlesRefusal(message.assistant, message.saveAnyway === true)
       if (memory !== undefined) return Effect.succeed(memory)
       return store.saveAssistantRecord(message.assistant).pipe(
         Effect.as(OK),

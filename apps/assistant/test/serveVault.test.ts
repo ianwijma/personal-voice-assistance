@@ -108,6 +108,7 @@ describe("serve: key vault and admin access", () => {
       "stt-deepgram": true,
       voices: false,
       "voice-providers": true,
+      routing: true,
       recordings: false
     })
     expect(welcome.snapshot.modules[0]).toMatchObject({ id: "greeter", protected: true })

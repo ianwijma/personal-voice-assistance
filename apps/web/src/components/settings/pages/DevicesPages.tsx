@@ -54,8 +54,16 @@ const ownSections = (d: Pick<DeviceListInfo, "own">): number => {
   return ["assistants|withoutPhrase", "matching", "voicePage", "interruptMode", "audio", "captions"].filter((s) => s.split("|").some((k) => own[k] !== undefined)).length
 }
 
-/** "TypeSafe decides" without a working TypeSafe: the page that sets it up exists only on a server that has Routing. */
-const useCanAuto = () => useClientState((s) => Object.values(s.modules.byId).some((m) => m.kind === "decider" && m.state === "running"))
+/**
+ * The server's `canAuto` (WP-14): the routing section is switched on and has a key. A server without that section:
+ * a running decision module (the older rule). The page that sets it up exists only on a server that has Routing.
+ */
+const useCanAuto = () =>
+  useClientState((s) => {
+    const routing = s.sections.find((x) => x.id === "routing")
+    if (routing !== undefined) return routing.form.values.TYPESAFE_ROUTING === true && routing.form.secrets.TYPESAFE_API_KEY?.set === true
+    return Object.values(s.modules.byId).some((m) => m.kind === "decider" && m.state === "running")
+  })
 const useHasRouting = () => useClientState((s) => s.sections.some((x) => x.id === "routing") || Object.values(s.modules.byId).some((m) => m.kind === "decider"))
 
 // ---- Devices › All devices

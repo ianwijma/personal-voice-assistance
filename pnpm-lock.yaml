@@ -86,6 +86,9 @@ importers:
       '@pva/core':
         specifier: workspace:*
         version: link:../../packages/core
+      '@pva/decide-typesafe':
+        specifier: workspace:*
+        version: link:../../packages/decide-typesafe
       '@pva/llm-anthropic':
         specifier: workspace:*
         version: link:../../packages/llm-anthropic
