@@ -32,9 +32,13 @@ const roundMessages = (rounds: ReadonlyArray<Round>): Array<Message> =>
 
 const NEWLINE: AgentEvent = { _tag: "TextDelta", text: "\n" }
 
+/** The whole turn (every round and the tools between them) inside the instance's hold, when it has one. */
+const held = (llm: Llm["Service"], turn: Stream.Stream<AgentEvent, AgentError>): Stream.Stream<AgentEvent, AgentError> =>
+  llm.holdDuring === undefined ? turn : llm.holdDuring(turn)
+
 export const makeModelAgent = (options: { readonly llm: Llm["Service"] }): Pick<Agent, "turn"> => ({
   turn: (input: AgentTurnInput): Stream.Stream<AgentEvent, AgentError> =>
-    Stream.suspend(() => {
+    held(options.llm, Stream.suspend(() => {
       const { llm } = options
       const tools = input.tools
       const request = input.context === undefined ? { system: input.system } : { system: input.system, context: input.context }
@@ -102,5 +106,5 @@ export const makeModelAgent = (options: { readonly llm: Llm["Service"] }): Pick<
         })
 
       return round(0)
-    })
+    }))
 })
