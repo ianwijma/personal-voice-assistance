@@ -271,6 +271,37 @@ describe("chladni sand: the sand", () => {
     expect(grains(settle(r, "idle", 60))).toEqual(rest)
   })
 
+  it("resettling after a figure-range change follows elapsed time: none at dt 0, the same total at 120 Hz as at 60 Hz", () => {
+    const step = (r: Runner, dt: number) => {
+      recording.log = []
+      r.step({ mode: "idle", dt, user: quiet, agent: quiet, palette: PALETTES.dark, reducedMotion: false, pointer: { x: 0, y: 0, down: false, inside: false }, sinceInterrupt: Infinity })
+      const calls = recording.log
+      recording.log = null
+      return grains(calls)
+    }
+    const changed = () => {
+      const r = make()
+      settle(r, "idle", 10)
+      r.setStored({ detail: "intricate" })
+      return r
+    }
+    const frozen = changed()
+    const before = step(frozen, 0)
+    expect(step(frozen, 0)).toEqual(before)
+    const travel = (a: ReadonlyArray<Grain>, b: ReadonlyArray<Grain>) => mean(a.map((g, j) => Math.hypot(g.u - b[j]!.u, g.v - b[j]!.v)))
+    const at60 = changed()
+    const start = step(at60, 0)
+    let g60 = start
+    for (let i = 0; i < 30; i++) g60 = step(at60, 1 / 60)
+    const at120 = changed()
+    let g120 = start
+    for (let i = 0; i < 60; i++) g120 = step(at120, 1 / 120)
+    const d60 = travel(start, g60)
+    expect(d60).toBeGreaterThan(0)
+    expect(travel(start, g120)).toBeGreaterThan(d60 * 0.7)
+    expect(travel(start, g120)).toBeLessThan(d60 * 1.3)
+  })
+
   it("a loud voice shakes the sand harder when the figure changes, 'Shake' sets how hard, and a whisper barely stirs it", () => {
     // How far the sand travels over the 40 frames after the voice moves from a deep register to a child's.
     const travel = (level: number, shake: number) => {

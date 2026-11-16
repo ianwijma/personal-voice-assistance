@@ -1,4 +1,4 @@
-# chladni-sand 1.1.0: frame digests of a scripted conversation at default settings (docs/CHARACTERS.md §6.6).
+# chladni-sand 1.1.1: frame digests of a scripted conversation at default settings (docs/CHARACTERS.md §6.6).
 # A change here must be deliberate: check the look, then update with `pnpm --filter @pva/web exec vitest run test/characters -u`.
 dark  0.5 idle       1131 d8552481
 dark  1.0 listening  1131 319df84b

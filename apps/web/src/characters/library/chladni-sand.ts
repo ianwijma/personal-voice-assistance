@@ -376,7 +376,7 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
             if (settle > 0) {
               // Resettling after a plate or range change: a gentle Newton step each frame slides the sand onto the new lines.
               const g2 = FX * FX + FY * FY + 0.05
-              const k = 0.6366 * 0.8 * 0.14
+              const k = 0.6366 * 0.8 * 0.14 * dt * 60 // per second, not per frame: the 60 Hz strength, scaled by the elapsed time (none at dt 0)
               uu -= ((F * FX) / g2) * k
               ww -= ((F * FY) / g2) * k
             }
@@ -471,7 +471,7 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
 
 const character: Character = {
   id: "chladni-sand",
-  version: "1.1.0",
+  version: "1.1.1",
   contract: 1,
   name: "Chladni sand",
   family: "abstract",
