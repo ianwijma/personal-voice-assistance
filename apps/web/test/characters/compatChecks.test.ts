@@ -172,6 +172,17 @@ const EMPTY: ReadonlyArray<readonly [string, Character]> = [
       g.fillText("", 5, 5)
       g.strokeText("", 5, 5)
     })
+  ],
+  [
+    "a fill of points on one line (it encloses no area), a different colour per mode",
+    drawing("collinear-fill", (g, c) => {
+      g.beginPath()
+      g.moveTo(1, 1)
+      g.lineTo(3, 3)
+      g.lineTo(5, 5)
+      g.fillStyle = c
+      g.fill()
+    })
   ]
 ]
 
@@ -196,17 +207,6 @@ const VISIBLE: ReadonlyArray<readonly [string, Character]> = [
       g.moveTo(1, 1)
       g.lineTo(5, 5)
       g.stroke()
-    })
-  ],
-  [
-    "a fill of points on one line, a different colour per mode",
-    drawing("collinear-fill", (g, c) => {
-      g.beginPath()
-      g.moveTo(1, 1)
-      g.lineTo(3, 3)
-      g.lineTo(5, 5)
-      g.fillStyle = c
-      g.fill()
     })
   ],
   [
@@ -302,6 +302,7 @@ describe("the test canvas counts only effective painting", () => {
     expect(paints((g) => { g.beginPath(); g.moveTo(1, 1); g.lineTo(5, 5); g.beginPath(); g.fill() })).toBe(0) // a new path starts empty
     // Straight points on one line enclose no area; a triangle, even a thin one, does.
     expect(paints((g) => { g.beginPath(); g.moveTo(1, 1); g.lineTo(3, 3); g.lineTo(5, 5); g.fill() })).toBe(0) // three collinear points
+    expect(paints((g) => { g.beginPath(); g.moveTo(1e9, 1e9); g.lineTo(1e9 + 100, 1e9); g.lineTo(1e9 + 50, 1e9 + 1); g.fill() })).toBe(1) // a thin triangle far from the origin: the tolerance follows the shape's size, not its position
     expect(paints((g) => { g.beginPath(); g.moveTo(1, 1); g.lineTo(1, 1); g.lineTo(5, 5); g.fill() })).toBe(0) // a repeated point
     expect(paints((g) => { g.beginPath(); g.moveTo(1, 1); g.lineTo(5, 5); g.lineTo(5, 5); g.lineTo(3, 3); g.fill() })).toBe(0) // repeated and doubling back
     expect(paints((g) => { g.beginPath(); g.moveTo(1, 1); g.lineTo(5, 1); g.lineTo(3, 4); g.fill() })).toBe(1) // a triangle

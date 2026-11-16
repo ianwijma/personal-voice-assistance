@@ -371,8 +371,9 @@ export const fake2d = (canvas: CanvasLike, rec: Recording = recording): CanvasRe
     }
     const dx = x - startX
     const dy = y - startY
-    // Points closer than this to a line (relative to the size of the coordinates) are on it.
-    const tol = 1e-9 * Math.max(1, Math.abs(startX), Math.abs(startY), Math.abs(x), Math.abs(y))
+    // Points closer than this to a line are on it. Relative to the size of the shape (offsets from its first point),
+    // not to where it lies: a thin triangle far from the origin still has area.
+    const tol = 1e-9 * Math.max(1, Math.abs(dx), Math.abs(dy), Math.abs(dirX), Math.abs(dirY))
     if (!hasDir) {
       // A point repeated at the start makes no direction.
       if (Math.hypot(dx, dy) > tol) {
