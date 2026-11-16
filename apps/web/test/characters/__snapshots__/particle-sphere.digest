@@ -1,0 +1,49 @@
+# particle-sphere 1.0.0: frame digests of a scripted conversation at default settings (docs/CHARACTERS.md §6.6).
+# A change here must be deliberate: check the look, then update with `pnpm --filter @pva/web exec vitest run test/characters -u`.
+dark  0.5 idle        262 b8d74403
+dark  1.0 listening   265 684ced50
+dark  1.5 listening   321 38a8be9a
+dark  2.0 hearing     437 709d1a91
+dark  2.5 hearing     622 6cd5086f
+dark  3.0 hearing    1000 4090fd6f
+dark  3.5 hearing    1265 80447e7e
+dark  4.0 hearing    1014 c19b16a5
+dark  4.5 hearing    1031 8f2bcae6
+dark  5.0 thinking    769 9b21d9cc
+dark  5.5 thinking    407 2cf9e161
+dark  6.0 thinking    350 557c1e5e
+dark  6.5 speaking    340 61bb477d
+dark  7.0 speaking    472 c016c52d
+dark  7.5 speaking    719 ce7f339b
+dark  8.0 speaking   1043 72e2a5bf
+dark  8.5 speaking   1143 ad54e538
+dark  9.0 speaking    720 c9f06ae8
+dark  9.5 listening   558 b25f02f1
+dark 10.0 listening   470 6ec765b6
+dark 10.5 idle        486 daeceeeb
+dark 11.0 idle        395 6f823c5d
+light  0.5 idle        262 56f04a1d
+light  1.0 listening   265 f63dfa61
+light  1.5 listening   321 a7c2880d
+light  2.0 hearing     437 4c300a6c
+light  2.5 hearing     622 26dece2d
+light  3.0 hearing    1000 8dd087f4
+light  3.5 hearing    1265 2baa24a8
+light  4.0 hearing    1014 4384add6
+light  4.5 hearing    1031 1f27843e
+light  5.0 thinking    769 5a58416d
+light  5.5 thinking    407 e2edbc7f
+light  6.0 thinking    350 3c882236
+light  6.5 speaking    340 92b10d2c
+light  7.0 speaking    472 7c8d0a77
+light  7.5 speaking    719 7c8ba7ff
+light  8.0 speaking   1043 1c4f9cd2
+light  8.5 speaking   1143 4f5eb446
+light  9.0 speaking    720 35704c53
+light  9.5 listening   558 6a8a20f3
+light 10.0 listening   470 478531ba
+light 10.5 idle        486 c680ece1
+light 11.0 idle        395 ee26dd4f
+overflow 160×140×1 93.8 px
+overflow 900×420×1 303.6 px
+overflow 720×240×2 173.8 px
