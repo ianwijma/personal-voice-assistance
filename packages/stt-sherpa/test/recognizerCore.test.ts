@@ -251,6 +251,94 @@ describe("recognizerCore, per-stream options (docs/ASSISTANTS.md §3.2)", () => 
   })
 })
 
+describe("recognizerCore, per-stream options: which option wins (docs/ASSISTANTS.md §3.2)", () => {
+  const setup = (config: Record<string, unknown>, withMakers = true, startupAgc = false) => {
+    const vadsMade: Array<number> = []
+    const agcsMade: Array<unknown> = []
+    const posted: Array<any> = []
+    const core = makeRecognizerCore({
+      config: { ...offlineConfig, ...config },
+      offline: fakeOffline({ text: "x" }),
+      vad: fakeVad(),
+      ...(startupAgc ? { agc: { process: () => {}, reset: () => {}, gainDb: () => 0 } } : {}),
+      ...(withMakers
+        ? {
+          makeVad: (threshold: number) => {
+            vadsMade.push(threshold)
+            return fakeVad()
+          },
+          makeAgc: (options: unknown) => {
+            agcsMade.push(options)
+            return { process: () => {}, reset: () => {}, gainDb: () => 0 }
+          }
+        }
+        : {}),
+      post: (m: any) => posted.push(m)
+    })
+    return { core, vadsMade, agcsMade, posted }
+  }
+
+  it("a session that says `agc: false` runs without gain control even when the worker's default has it", () => {
+    const { core, agcsMade } = setup({ vad: { threshold: 0.5 }, agc: { maxGainDb: 20 } }, true, true)
+    core.onMessage({ type: "open", session: 1, options: { agc: false } })
+    assert.deepStrictEqual(agcsMade, [], "no gain control was made or taken for it")
+    // The startup gain control still serves a session that says nothing about gain.
+    core.onMessage({ type: "open", session: 2, options: { vadThreshold: 0.5 } })
+    assert.deepStrictEqual(agcsMade, [], "the worker's own gain control, not a new one")
+  })
+
+  it("a session may ask for gain control the worker's default does not have", () => {
+    const { core, agcsMade } = setup({ vad: { threshold: 0.5 } })
+    core.onMessage({ type: "open", session: 1, options: { agc: { maxGainDb: 9 } } })
+    assert.deepStrictEqual(agcsMade, [{ maxGainDb: 9 }])
+    // No options at all: the worker's default (none), so no gain control.
+    core.onMessage({ type: "open", session: 2 })
+    assert.strictEqual(agcsMade.length, 1)
+  })
+
+  it("an option that is not a number falls back to the worker's default threshold: the startup VAD serves it", () => {
+    const { core, vadsMade, posted } = setup({ vad: { threshold: 0.5 } })
+    core.onMessage({ type: "open", session: 1, options: { vadThreshold: "0.9" } })
+    assert.deepStrictEqual(vadsMade, [])
+    // A second session at the same time needs a detector of its own, made with the default threshold.
+    core.onMessage({ type: "open", session: 2, options: { vadThreshold: null } })
+    assert.deepStrictEqual(vadsMade, [0.5])
+    assert.deepStrictEqual(posted.filter((m) => m.type === "error"), [])
+  })
+
+  it("`reset` takes the options too: it ends every other session and opens this one with its own detector", () => {
+    const { core, vadsMade } = setup({ vad: { threshold: 0.5 } })
+    core.onMessage({ type: "open", session: 1 })
+    core.onMessage({ type: "open", session: 2 })
+    assert.deepStrictEqual(vadsMade, [0.5], "the second session needed a detector of its own")
+    core.onMessage({ type: "reset", session: 3, options: { vadThreshold: 0.8 } })
+    assert.strictEqual(core.inspect().sessions, 1)
+    assert.deepStrictEqual(vadsMade, [0.5, 0.8], "the new session has the threshold it asked for, not a detector of the ended ones")
+    // Session 0 only ends everything.
+    core.onMessage({ type: "reset", session: 0 })
+    assert.strictEqual(core.inspect().sessions, 0)
+  })
+
+  it("opening an id again replaces that session and hands its detector back for the new options", () => {
+    const { core, vadsMade } = setup({ vad: { threshold: 0.5 } })
+    core.onMessage({ type: "open", session: 1, options: { vadThreshold: 0.7 } })
+    core.onMessage({ type: "open", session: 1, options: { vadThreshold: 0.7 } })
+    assert.strictEqual(core.inspect().sessions, 1)
+    assert.deepStrictEqual(vadsMade, [0.7], "the first one's detector was reused, not a second one made")
+  })
+
+  it("a session that needs a detector the worker cannot make is reported as an error, and the others go on", () => {
+    const { core, posted } = setup({ vad: { threshold: 0.5 } }, false)
+    core.onMessage({ type: "open", session: 1 })
+    core.onMessage({ type: "open", session: 2 }) // a second detector, with no `makeVad`
+    const errors = posted.filter((m) => m.type === "error")
+    assert.strictEqual(errors.length, 1)
+    assert.strictEqual(errors[0].session, 2)
+    assert.include(errors[0].message, "No voice-activity detector")
+    assert.strictEqual(core.inspect().sessions, 1)
+  })
+})
+
 const streamingConfig = { kind: "streaming", prerollMs: 400, agc: false, streaming: { tailPaddingMs: 0 } }
 
 const streamingCore = (limits?: Record<string, number>) => {

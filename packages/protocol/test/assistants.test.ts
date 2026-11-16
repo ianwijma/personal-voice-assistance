@@ -561,6 +561,20 @@ describe("module settings (section 2.6)", () => {
     expect(homeLineOf({ location: " ", timeZone: "", language: "en-GB", machineTimeZone: "Europe/London" })).toBe("Home: time zone Europe/London; language en-GB.")
     expect(homeLineOf({ location: "", timeZone: "", language: "" })).toBe("")
   })
+  it("the Home line: trims every part, the machine's zone only when Home names none, nothing to say is empty", () => {
+    expect(homeLineOf({ location: "  Utrecht ", timeZone: " Europe/Berlin ", language: " de-DE ", machineTimeZone: "Asia/Tokyo" })).toBe(
+      "Home: Utrecht; time zone Europe/Berlin; language de-DE."
+    )
+    expect(homeLineOf({ location: "Utrecht", timeZone: "  ", language: "" })).toBe("Home: Utrecht.")
+    expect(homeLineOf({ location: "", timeZone: "", language: "", machineTimeZone: "" })).toBe("")
+    expect(homeLineOf({ location: "", timeZone: "", language: "nl-NL" })).toBe("Home: language nl-NL.")
+  })
+  it("linked defaults: Home without a location leaves the weather place empty; imperial maps to Fahrenheit", () => {
+    expect(linkedModuleDefaults({ units: "imperial", timeZone: "", dateFormat: "nl-NL" })).toEqual({
+      weather: { defaultPlace: "", units: "fahrenheit" },
+      clock: { timeZone: "", locale: "nl-NL" }
+    })
+  })
   it("tools: allowed when the module is on and the tool not switched off", () => {
     expect(toolAllowed(jeff, "weather", "weather")).toBe(true)
     expect(toolAllowed(jeff, "clock", "set_timer")).toBe(false)
