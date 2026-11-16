@@ -301,8 +301,6 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
 
   return {
     resize(width, height, ratio) {
-      W = width
-      H = height
       dpr = ratio
       g = setup2d(canvas, dpr)
     },
@@ -313,7 +311,10 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
       const reduced = f.reducedMotion
       mix.step(f)
       modeTone(tone, mix, p)
-      clear2d(g, dpr)
+      const fo = f.focus
+      clear2d(g, dpr, fo) // the whole canvas; (0, 0) is the box's top-left corner
+      W = fo.width
+      H = fo.height
 
       // Options.
       const o = f.options
@@ -373,11 +374,11 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
 
       // Pointer.
       const pt = f.pointer
-      const pdx = pt.x - cx
-      const pdy = pt.y - cy
+      const pdx = pt.x - fo.x - cx
+      const pdy = pt.y - fo.y - cy
       const pDist = Math.hypot(pdx, pdy) / R0
       const pAng = Math.atan2(pdy, pdx)
-      const near = pt.inside ? clamp01(1.9 - pDist) : 0
+      const near = pt.inside && pDist < 2 ? clamp01(1.9 - pDist) : 0
 
       for (let i = 0; i < N; i++) {
         const th = (i / N) * TAU
@@ -470,6 +471,15 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
         }
         g.fillStyle = gg
         g.fillRect(cx - glowR, cy - glowR, glowR * 2, glowR * 2.3)
+        // A wider, fainter haze that fades out over the stage (alpha 0 at its rim, inside its square).
+        const hazeR = R0 * 3.4
+        const hy = cy + (p.dark ? 0 : R0 * 0.25)
+        const hg = g.createRadialGradient(cx, hy, glowR * 0.6, cx, hy, hazeR)
+        const hc = p.dark ? tone : c1
+        hg.addColorStop(0, css(hc, (p.dark ? 0.05 + lv * 0.06 : 0.035 + lv * 0.03) * glowK))
+        hg.addColorStop(1, css(hc, 0))
+        g.fillStyle = hg
+        g.fillRect(cx - hazeR, hy - hazeR, hazeR * 2, hazeR * 2)
       }
 
       // Liquid fill: one gradient shared by body, necks and droplets so they merge seamlessly.
@@ -594,7 +604,7 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
 const character: Character = {
   id: "liquid-blob",
   name: "Liquid blob",
-  version: "1.0.0",
+  version: "1.1.0",
   contract: 1,
   family: "abstract",
   summary: "A glossy body of liquid whose outline is pressed in by your voice and swells out with its own; droplets fly in while it listens and bud out while it speaks.",
@@ -621,6 +631,7 @@ const character: Character = {
     { signal: "reducedMotion", effect: "No wobble or flight: the shape is set directly per mode; one still droplet shows the direction (budded out while speaking, waiting outside while taking in)." }
   ],
   renderer: "2d",
+  canvas: "stage",
   options: [
     { id: "size", kind: "number", label: "Size", min: 0.5, max: 1.25, step: 0.05, default: 1, unit: "×", group: "Shape", help: "How big the body of liquid is; above 1 it grows only as far as the canvas allows." },
     { id: "relief", kind: "number", label: "Voice relief", min: 0, max: 2, step: 0.1, default: 1, unit: "×", group: "Reaction", help: "How deeply your voice dents the outline and how far the reply swells it." },
