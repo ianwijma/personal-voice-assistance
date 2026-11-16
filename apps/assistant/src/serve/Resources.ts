@@ -451,9 +451,18 @@ export const defaultSttBuilder = (
       Effect.catch((e) => (SherpaStt.isOrphanedMessage(e.message) ? Effect.andThen(waitForOrphan, SherpaStt.acquire(options, script)) : Effect.fail(e))),
       Effect.mapError((e) => new ResourceBuildError({ message: e.message }))
     )
+    // The worker outlives this instance when another one (a full reload's replacement) shares it: drop this
+    // instance's failure listeners when its scope closes, so the worker does not keep retired instances alive.
+    const unsubscribes = new Set<() => void>()
+    yield* Effect.addFinalizer(() =>
+      Effect.sync(() => {
+        for (const unsubscribe of unsubscribes) unsubscribe()
+        unsubscribes.clear()
+      })
+    )
     return {
       forStream: (stream) => shared.forStream(sherpaStreamOf(stream)),
-      onFailure: (listener) => void shared.onFailure((e) => listener(e.message))
+      onFailure: (listener) => void unsubscribes.add(shared.onFailure((e) => listener(e.message)))
     } satisfies Recogniser
   })
 
