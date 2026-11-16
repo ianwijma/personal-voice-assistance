@@ -1,0 +1,49 @@
+# lips 1.0.0: frame digests of a scripted conversation at default settings (docs/CHARACTERS.md §6.6).
+# A change here must be deliberate: check the look, then update with `pnpm --filter @pva/web exec vitest run test/characters -u`.
+dark  0.5 idle        244 30b57e97
+dark  1.0 listening   279 2ccb9902
+dark  1.5 listening   188 11fd4a2a
+dark  2.0 hearing     188 dd5832a7
+dark  2.5 hearing     279 d7fcc97b
+dark  3.0 hearing     279 848af307
+dark  3.5 hearing     279 692ce161
+dark  4.0 hearing     279 49322eb7
+dark  4.5 hearing     182 6e72e83a
+dark  5.0 thinking    285 a60d5e9e
+dark  5.5 thinking    185 3058c361
+dark  6.0 thinking    185 593a4430
+dark  6.5 speaking    185 150f15b8
+dark  7.0 speaking    270 48f4c9de
+dark  7.5 speaking    273 6b307615
+dark  8.0 speaking    273 6b2740ad
+dark  8.5 speaking    273 d0b08c6b
+dark  9.0 speaking    247 a0efbc6f
+dark  9.5 listening   273 11591aba
+dark 10.0 listening   188 7a75f8b6
+dark 10.5 idle        188 eae0a727
+dark 11.0 idle        279 3ef6e9e8
+light  0.5 idle        244 e0f353f7
+light  1.0 listening   279 c456197a
+light  1.5 listening   188 557e16fc
+light  2.0 hearing     188 786d161b
+light  2.5 hearing     279 bc8454e6
+light  3.0 hearing     279 c6bcf280
+light  3.5 hearing     279 9f9982e4
+light  4.0 hearing     279 715e6b18
+light  4.5 hearing     182 d6bb05c8
+light  5.0 thinking    285 6a5d9b12
+light  5.5 thinking    185 4f1b96be
+light  6.0 thinking    185 612c44f9
+light  6.5 speaking    185 d0fbd7a4
+light  7.0 speaking    270 c4518581
+light  7.5 speaking    273 ae30ac97
+light  8.0 speaking    273 3ca2491d
+light  8.5 speaking    273 e8c101cf
+light  9.0 speaking    247 9812f06c
+light  9.5 listening   273 9832585e
+light 10.0 listening   188 87b8d19b
+light 10.5 idle        188 af6fd260
+light 11.0 idle        279 a640e7db
+overflow 160×140×1 0.0 px
+overflow 900×420×1 0.0 px
+overflow 720×240×2 0.0 px
