@@ -57,7 +57,20 @@ test.describe("Assistant › Modules: own settings", () => {
     expect((await saves()).at(-1)!.assistant.modules.weather.own).toEqual({})
     // Units: a choice, own to Fahrenheit, then the whole module back to the shared settings.
     await weather.locator("[data-field='modules.weather.own.units']").getByRole("radio", { name: "Fahrenheit, mph" }).click()
-    await expect(weather.locator("[data-field='modules.weather.own.units']").getByTestId("own-marker")).toBeVisible()
+    const units = weather.locator("[data-field='modules.weather.own.units']")
+    await expect(units.getByTestId("own-marker")).toBeVisible()
+    // Back to Celsius, the shared value: still an own value (it would not follow a later shared change), so Reset stays.
+    await units.getByRole("radio", { name: "Celsius, km/h" }).click()
+    await expect(units.getByTestId("own-marker")).toBeVisible()
+    await expect(units.getByTestId("own-reset")).toBeVisible()
+    // Resetting one field keeps the others' own values.
+    await place.getByRole("textbox").fill("Rotterdam")
+    await units.getByTestId("own-reset").click()
+    await expect(units.getByTestId("same-as-shared")).toBeVisible()
+    await expect(place.getByTestId("own-marker")).toBeVisible()
+    await saveButton(page).click()
+    await expect(page.getByTestId("footer-note")).toContainText("Saved")
+    expect((await saves()).at(-1)!.assistant.modules.weather.own).toEqual({ defaultPlace: "Rotterdam" })
     await weather.getByTestId("use-shared").click()
     await expect(weather.getByTestId("use-own")).toBeVisible()
     await saveButton(page).click()
