@@ -107,14 +107,47 @@ describe("Spring", () => {
     }
   })
 
-  // BUG: with a half-life below about 8.5 ms (0 is clamped to 1 ms) omega * (1/240) passes the explicit Euler
-  // stability limit, so the value diverges (to -1e49 .. NaN) although the comment in `step` says "stable for any dt".
-  it.fails("a half-life of 5 ms or 0 follows its target instead of diverging", () => {
+  // Was a bug: below a half-life of about 8.5 ms (0 is clamped to 1 ms) omega * (1/240) passed the explicit Euler
+  // stability limit and the value diverged (to -1e49 .. NaN). Stiff springs now use the exact solution.
+  it("a half-life of 5 ms or 0 follows its target instead of diverging", () => {
     for (const halfLife of [0.005, 0]) {
       const s = new Spring(halfLife)
       for (let i = 0; i < 60; i++) s.step(1, 1 / 60)
       expect(s.value, `halfLife ${halfLife}`).toBeCloseTo(1, 4)
     }
+  })
+
+  it("every half-life settles for any dt, with or without bounce, and never overshoots when critically damped", () => {
+    for (const halfLife of [0, 0.0005, 0.001, 0.005, 0.0139, 0.015, 0.1]) {
+      for (const bounce of [0, 0.5, 0.9]) {
+        for (const dt of [1 / 240, 1 / 60, 0.1, 1, 100, Infinity]) {
+          const s = new Spring(halfLife, 0, bounce)
+          let max = 0
+          for (let i = 0; i < 4000 && Math.abs(s.value - 1) > 1e-9; i++) max = Math.max(max, s.step(1, dt))
+          const label = `halfLife ${halfLife}, bounce ${bounce}, dt ${dt}`
+          expect(Number.isFinite(s.value), label).toBe(true)
+          expect(s.value, label).toBeCloseTo(1, 4)
+          if (bounce === 0) expect(max, label).toBeLessThanOrEqual(1.0001)
+        }
+      }
+    }
+  })
+
+  it("a stiff spring matches the sub-stepped integration across the switch-over, and keeps its velocity", () => {
+    const stiff = new Spring(0.0139) // exact solution (ω·h > 0.5)
+    const soft = new Spring(0.0141) // sub-stepped Euler
+    for (let i = 0; i < 6; i++) {
+      stiff.step(1, 1 / 240)
+      soft.step(1, 1 / 240)
+    }
+    expect(stiff.value).toBeGreaterThan(0)
+    expect(Math.abs(stiff.value - soft.value)).toBeLessThan(0.02)
+    expect(stiff.velocity).toBeGreaterThan(0)
+    // Velocity is carried over a change of half-life: the spring keeps moving.
+    stiff.halfLife = 0.2
+    const before = stiff.value
+    stiff.step(1, 1 / 60)
+    expect(stiff.value).toBeGreaterThan(before)
   })
 
   it("does not move for dt 0, and set() jumps with no velocity left over", () => {
