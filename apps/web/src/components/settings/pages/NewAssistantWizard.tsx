@@ -80,6 +80,14 @@ export function NewAssistantWizard() {
   })
   /** Set while `assistant.create` is on its way: the wizard is inert and ignores edits and step changes (they would not be in the request). */
   const creating = useRef(false)
+  /** False once this wizard has unmounted (left through the sidebar, say): a late answer must not navigate then. */
+  const alive = useRef(true)
+  useEffect(() => {
+    alive.current = true
+    return () => {
+      alive.current = false
+    }
+  }, [])
   const draft = useWizardDraft(blank, () => creating.current)
   const a = draft.current
   const [from, setFrom] = useState("blank")
@@ -130,7 +138,7 @@ export function NewAssistantWizard() {
     const body = { ...toBody(a), name: a.name.trim() }
     let outcome: Outcome
     try {
-      outcome = await client.createAssistant(body, { ...(from !== "blank" ? { copyOf: from } : {}), placements }) // continuation(none): only this page's own state, then it navigates
+      outcome = await client.createAssistant(body, { ...(from !== "blank" ? { copyOf: from } : {}), placements }) // continuation(identity): only this page's own state; it navigates only while this wizard is still mounted (`alive`)
     } catch {
       outcome = { kind: "refused", code: "internal", message: "Could not create it. Try again." }
     }
@@ -138,8 +146,11 @@ export function NewAssistantWizard() {
     setBusy(false)
     if (outcome.kind === "ok" && outcome.assistantId !== undefined) {
       client.store.dispatch({ type: "local/toast", message: `Created ${body.name}.`, tone: "info" })
+      // Left meanwhile: the page shown now is someone else's; going to the new assistant would discard its edits.
+      if (!alive.current) return
       return client.settings(["assistants", outcome.assistantId], { discard: true })
     }
+    if (!alive.current) return
     if (outcome.kind === "invalid") {
       draft.setErrors(outcome.fieldErrors)
       const first = Math.min(...outcome.fieldErrors.map((e: FieldError) => stepOfPath(e.key)))
