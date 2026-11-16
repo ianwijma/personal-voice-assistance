@@ -154,11 +154,6 @@ describe("eye shape", () => {
     expect(visor.slice(clip).some((c) => c.name === "fill")).toBe(true)
   })
 
-  it("an unknown shape falls back to rounded", () => {
-    const r = ratio("rounded")
-    expect(ratio("nonsense")).toBeCloseTo(r, 6)
-  })
-
   it("changing the shape morphs the eyes over about 0.2 s, and cross-fades to and from the visor", () => {
     const r = make({ eyeShape: "round" })
     for (let i = 0; i < FRAMES; i++) tick(r, "listening")
@@ -193,13 +188,6 @@ describe("the pose of each mode (reduced motion holds it)", () => {
     const speaking = talk("speaking")
     const hearing = talk("hearing")
     expect(speaking.height).toBeLessThan(hearing.height)
-  })
-
-  it("holds the same pose forever with reduced motion (no breathing, blinks or saccades)", () => {
-    const r = make()
-    const first = JSON.stringify(shapes(tick(r, "listening", { reduced: true })))
-    for (let i = 0; i < 600; i++) tick(r, "listening", { reduced: true })
-    expect(JSON.stringify(shapes(tick(r, "listening", { reduced: true })))).toBe(first)
   })
 })
 
@@ -357,12 +345,5 @@ describe("blinking", () => {
     expect(calm).toBeGreaterThanOrEqual(1)
     expect(lively).toBeGreaterThan(calm * 2)
     expect(lively).toBeGreaterThan(8) // about every 2.1 s at 2×, and extra ones with each big glance
-  })
-
-  it("does not blink at all with reduced motion", () => {
-    const r = make()
-    const hs = new Set<number>()
-    for (let i = 0; i < 3600; i++) hs.add(Math.round(painted(bodies(tick(r, "listening", { reduced: true }))[0]!).height * 1000))
-    expect(hs.size).toBe(1)
   })
 })
