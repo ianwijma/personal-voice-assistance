@@ -96,6 +96,8 @@ export interface VoiceSessionOptions {
   readonly maxPendingInputs?: number
   /** The conversation to start with (an id this device was given before its session existed): the answering assistant's. */
   readonly initialConversation?: { readonly id: string; readonly startedAt: number }
+  /** Ids the device's other assistants were given before the session existed (`conversation.read`), by assistant. */
+  readonly reservedConversations?: ReadonlyMap<string, { readonly id: string; readonly startedAt: number }>
   /** "Save what the assistant hears". */
   readonly heard: {
     readonly dir: string
@@ -482,6 +484,7 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
       if (wp.mode === "typesafe" && wp.fallback !== null) return wp.fallback
       return settings.assistants[0]?.assistant
     }
+    for (const [assistant, info] of options.reservedConversations ?? []) reserved.set(assistant, info)
     // The device's reserved conversation (from before its session existed) is the answering assistant's.
     if (options.initialConversation !== undefined) reserved.set(answering() ?? "", options.initialConversation)
 
@@ -589,7 +592,11 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
         Effect.suspend(() => {
           const a = assistant ?? answering()
           const made = conversationOf(a)
-          if (made !== undefined) return made.newConversation
+          if (made !== undefined) {
+            // Its conversation stops the open utterance; the dispatcher must not hand the rest to another one.
+            dispatcher.cancelUtterance(a!)
+            return made.newConversation
+          }
           return Effect.sync(() => {
             const info = fresh()
             reserved.set(a ?? "", info)

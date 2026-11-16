@@ -20,7 +20,7 @@ import {
   withTraceVoice
 } from "@pva/core"
 import type { ConversationInfo } from "@pva/protocol"
-import { Effect, Queue, Stream } from "effect"
+import { type Cause, Effect, Fiber, Queue, Stream } from "effect"
 import type { BuiltEngines, Engine } from "./Engine.ts"
 
 /**
@@ -42,8 +42,9 @@ export interface SessionConversationOptions {
   /** The turn setup (system prompt and tools), read at the start of each turn. */
   readonly setup: Effect.Effect<TurnSetup>
   /**
-   * An agent conversation (a `claude-subscription` assistant), chosen at each run start, its setup read at the start
-   * of each turn; `undefined`: the single-model conversation with `setup`, whose `TurnSetup.llm` (the resource
+   * An agent conversation (a `claude-subscription` assistant), chosen again at every input that can start a turn
+   * (the conversation is swapped for one of the other kind, history kept, when this changes), its setup read at the
+   * start of each turn; `undefined`: the single-model conversation with `setup`, whose `TurnSetup.llm` (the resource
    * pool's instance) answers the turn (default: `providers.llm`, tests).
    */
   readonly agentSetup?: () => Effect.Effect<AgentTurnSetup> | undefined
@@ -108,6 +109,12 @@ const noTts = Tts.of({
   synthesize: () => Stream.fail(new TtsError({ message: "No voice is set up for this assistant." }))
 })
 
+/** The inputs of one conversation of a run, and its agents (`undefined`: the single model). */
+interface Segment {
+  readonly inbox: Queue.Queue<ConversationInput, Cause.Done>
+  readonly agentSetup: Effect.Effect<AgentTurnSetup> | undefined
+}
+
 /** A control input with the Stop generation it was accepted in (`undefined`: a speech event). */
 interface Control {
   readonly input: ConversationInput
@@ -152,22 +159,6 @@ export const makeSessionConversation = (options: SessionConversationOptions): Ef
         // Every turn names its own voice (`TurnSetup.tts`, the pool's instance for the assistant's voice); this one
         // is for a conversation whose setup names none (tests that inject one voice).
         const tts = providers.tts !== undefined && providers.voice !== undefined ? withTraceVoice(providers.tts, voiceKey(providers.voice)) : noTts
-        const common = {
-          onEvent,
-          initialHistory: history,
-          initialConversationId: conversationInfo.id,
-          ...(lastTurnAt !== undefined ? { initialLastTurnAt: lastTurnAt } : {}),
-          ...(options.idleResetMs !== undefined ? { idleResetMs: options.idleResetMs } : {}),
-          maxToolRounds: options.maxToolRounds?.() ?? providers.maxToolRounds,
-          bargeIn: true
-        }
-        const agentSetup = options.agentSetup?.()
-        const conversation = yield* (agentSetup !== undefined
-          ? makeAgentConversation({ ...common, setup: agentSetup })
-          : makeConversationWithSetup({ ...common, setup: options.setup }).pipe(Effect.provideService(Llm, providers.llm ?? noLlm))
-        ).pipe(Effect.provideService(TurnTrace, options.turnTrace))
-        live = conversation
-        ready = true
 
         const speech: Stream.Stream<ConversationInput, unknown> = options.speech !== undefined
           ? options.speech(built)
@@ -191,10 +182,72 @@ export const makeSessionConversation = (options: SessionConversationOptions): Ef
           }),
           Stream.map((c) => c.input)
         )
-        yield* conversation.voice(events).pipe(
-          Effect.provideService(Tts, tts),
-          Effect.provideService(AudioOutput, options.output)
-        )
+
+        // The kind of conversation (agents for a `claude-subscription` assistant, else the single model) is chosen
+        // again at every input that can start a turn outside an utterance (typed text, a canned line, the start of
+        // speech), so an account change takes effect at the next turn without a reload. On a change the conversation
+        // in use gets what that input would do to its turn (speech: barge-in; typed: Stop), ends once its last turn
+        // has played, and one of the other kind continues with its history, conversation id and idle clock.
+        const segments = yield* Queue.unbounded<Segment, Cause.Done>()
+        const open = (agentSetup: Effect.Effect<AgentTurnSetup> | undefined) =>
+          Effect.gen(function*() {
+            const inbox = yield* Queue.unbounded<ConversationInput, Cause.Done>()
+            yield* Queue.offer(segments, { inbox, agentSetup })
+            return inbox
+          })
+        let agentSetup = options.agentSetup?.()
+        let inbox = yield* open(agentSetup)
+        let utteranceOpen = false
+        const driver = yield* Stream.runForEach(events, (input) =>
+          Effect.gen(function*() {
+            const startsTurn = input._tag === "TextInput" || input._tag === "Say" || (input._tag === "SpeechStarted" && !utteranceOpen)
+            if (input._tag === "SpeechStarted") utteranceOpen = true
+            else if (input._tag === "EndOfTurn") utteranceOpen = false
+            if (startsTurn) {
+              const next = options.agentSetup?.()
+              if ((next === undefined) !== (agentSetup === undefined)) {
+                const handover: ConversationInput = input._tag === "SpeechStarted" ? input : { _tag: "Interrupt" }
+                yield* Queue.offer(inbox, handover)
+                yield* Queue.end(inbox)
+                agentSetup = next
+                inbox = yield* open(next)
+              }
+            }
+            yield* Queue.offer(inbox, input)
+          })).pipe(
+            Effect.ensuring(Effect.suspend(() => Effect.andThen(Queue.end(inbox), Queue.end(segments)))),
+            Effect.forkChild
+          )
+
+        yield* Stream.runForEach(Stream.fromQueue(segments), (segment) =>
+          Effect.gen(function*() {
+            const previous = live
+            if (previous !== undefined) {
+              history = yield* previous.history
+              lastTurnAt = yield* previous.lastTurnAt
+            }
+            const common = {
+              onEvent,
+              initialHistory: history,
+              initialConversationId: conversationInfo.id,
+              ...(lastTurnAt !== undefined ? { initialLastTurnAt: lastTurnAt } : {}),
+              ...(options.idleResetMs !== undefined ? { idleResetMs: options.idleResetMs } : {}),
+              maxToolRounds: options.maxToolRounds?.() ?? providers.maxToolRounds,
+              bargeIn: true
+            }
+            const conversation = yield* (segment.agentSetup !== undefined
+              ? makeAgentConversation({ ...common, setup: segment.agentSetup })
+              : makeConversationWithSetup({ ...common, setup: options.setup }).pipe(Effect.provideService(Llm, providers.llm ?? noLlm))
+            ).pipe(Effect.provideService(TurnTrace, options.turnTrace))
+            live = conversation
+            ready = true
+            yield* conversation.voice(Stream.fromQueue(segment.inbox)).pipe(
+              Effect.provideService(Tts, tts),
+              Effect.provideService(AudioOutput, options.output)
+            )
+          }))
+        // The inputs ended: a failure of the speech stream is the loop's failure.
+        yield* Fiber.join(driver)
       }).pipe(
         // However the loop ends (reload, failure, discard): keep what the next build starts from.
         // Inputs accepted for this run and not taken are dropped (as the engines stopping drops a turn).
