@@ -973,18 +973,26 @@ export const makeResourcePool = (options: ResourcePoolOptions): Effect.Effect<Re
         get sampleRate() {
           return entry.inner?.sampleRate ?? UNKNOWN_SAMPLE_RATE
         },
+        // Counted from the start, the wait for the build included: a turn waiting for its voice keeps it alive when the
+        // assistant is rebound or switched off meanwhile (it finishes with the voice it started with).
         synthesize: (clauses) =>
-          Stream.unwrap(Effect.gen(function*() {
-            // The turn's trace names the voice that spoke it, whatever happens next.
-            const trace = yield* CurrentTurnTrace
-            if (trace !== undefined && !trace.voices.includes(entry.key)) trace.voices.push(entry.key)
-            yield* Deferred.await(entry.settled)
-            const inner = entry.inner
-            if (inner === undefined) {
-              return Stream.fail(new TtsError({ message: entry.problem ?? "The voice could not start." }))
-            }
-            return counted(entry, release, Stream.suspend(() => inner.synthesize(clauses)))
-          }))
+          counted(
+            entry,
+            release,
+            Stream.unwrap(Effect.gen(function*() {
+              // The turn's trace names the voice that spoke it, whatever happens next.
+              const trace = yield* CurrentTurnTrace
+              if (trace !== undefined && !trace.voices.includes(entry.key)) trace.voices.push(entry.key)
+              yield* Deferred.await(entry.settled)
+              const inner = entry.inner
+              if (inner === undefined) {
+                return Stream.fail(new TtsError({ message: entry.problem ?? "The voice could not start." }))
+              }
+              // Released before this synthesis started (nothing kept it): its engine is shut down.
+              if (entry.closed) return Stream.fail(new TtsError({ message: "The voice was released before the turn spoke." }))
+              return Stream.suspend(() => inner.synthesize(clauses))
+            }))
+          )
       }),
       describe: (spec) => ({ kind: "tts", label: ttsLabelOf(spec), location: ttsLocationOf(spec) })
     }, hooks)

@@ -1,7 +1,7 @@
 "use client"
 import { useLayoutEffect, useRef, useState } from "react"
 import type { AssistantInfo, DeviceListInfo, ModuleInfo, TraceInfo } from "@pva/protocol"
-import { ACCOUNTS, plural, prettyVoice, toolCount } from "@/lib/assistants.ts"
+import { ACCOUNTS, CLAUDE_MODELS, plural, prettyVoice, toolCount } from "@/lib/assistants.ts"
 import { formatSettingsHash } from "@/lib/settingsTree.ts"
 import { firstSoundMs } from "@/lib/state.ts"
 import { parseKey } from "@/lib/voicePicker.ts"
@@ -120,10 +120,43 @@ export const factsOf = (t: TraceInfo, ctx: LatencyContext): ReadonlyArray<readon
   ]
 }
 
+type LlmKnob = "model" | "effort" | "thinking" | "maxTokens"
+const ALL_KNOBS: ReadonlyArray<LlmKnob> = ["model", "effort", "thinking", "maxTokens"]
+/**
+ * The language-model settings each account uses, as the server keeps them (`llmSpecOf`) and a turn's snapshot records
+ * them (`traceConfigOf`). A setting an account does not use is recorded as a stand-in (offline: no model, effort low,
+ * thinking off, 1024 tokens; OpenRouter and the home model: effort low, thinking off), whatever the assistant has saved,
+ * so "changed since" does not compare it. An account the app does not know uses all of them.
+ */
+export const LLM_KNOBS: Readonly<Record<string, ReadonlyArray<LlmKnob>>> = {
+  anthropic: ALL_KNOBS,
+  "claude-subscription": ALL_KNOBS,
+  openrouter: ["model", "maxTokens"],
+  "home-model": ["model", "maxTokens"],
+  offline: []
+}
+const knobsOf = (account: string): ReadonlyArray<LlmKnob> => LLM_KNOBS[account] ?? ALL_KNOBS
+/** The assistant's `llm` as a turn's snapshot would record it now: a Claude subscription assistant without a model answers with the first Claude model. */
+const llmNow = (llm: AssistantInfo["llm"]): AssistantInfo["llm"] =>
+  llm.account === "claude-subscription" && llm.model.trim() === "" ? { ...llm, model: CLAUDE_MODELS[0] } : llm
+
+/**
+ * The modules an assistant has on that run for it now, as the server counts them for a turn: capabilities (agents and
+ * decision providers are not per assistant) whose instance for this assistant (else the module) is running.
+ */
+const runningModules = (a: AssistantInfo, modules: ReadonlyArray<ModuleInfo>): AssistantInfo["modules"] =>
+  Object.fromEntries(Object.entries(a.modules).filter(([id, choice]) => {
+    if (!choice.on) return false
+    const m = modules.find((x) => x.id === id)
+    if (m === undefined || (m.kind !== undefined && m.kind !== "capability")) return false
+    return (m.instances?.find((i) => i.assistants.includes(a.id))?.state ?? m.state) === "running"
+  }))
+
 /**
  * What differs between the snapshot of a turn and the assistant as it is now ("voice Lessac → Heart"). Empty when
- * nothing differs, or there is no snapshot or the assistant is gone. Modules and tools are compared by count; hearing
- * through the assistant that hears on that device now.
+ * nothing differs, or there is no snapshot or the assistant is gone. Each value now is worked out as the server records
+ * it for a turn (the language-model settings the account uses, the modules that run), so an unchanged assistant shows
+ * nothing. Modules and tools are compared by count; hearing through the assistant that hears on that device now.
  */
 export const changedSince = (t: TraceInfo, ctx: LatencyContext): ReadonlyArray<string> => {
   const c = t.config
@@ -134,10 +167,16 @@ export const changedSince = (t: TraceInfo, ctx: LatencyContext): ReadonlyArray<s
     if (was !== undefined && was !== now) out.push(`${label} ${String(was)} → ${String(now)}`)
   }
   if (c.llm.account !== a.llm.account) out.push(`account ${accountTitle(c.llm.account)} → ${accountTitle(a.llm.account)}`)
-  diff("model", c.llm.model, a.llm.model)
-  diff("effort", c.llm.effort, a.llm.effort)
-  diff("thinking", c.llm.thinking, a.llm.thinking)
-  diff("longest reply", c.llm.maxTokens, a.llm.maxTokens)
+  // Only the settings both the turn's account and the current one use (a changed account is named above).
+  const nowKnobs = knobsOf(a.llm.account)
+  const llm = llmNow(a.llm)
+  const knob = (k: LlmKnob, label: string) => {
+    if (knobsOf(c.llm.account).includes(k) && nowKnobs.includes(k)) diff(label, c.llm[k], llm[k])
+  }
+  knob("model", "model")
+  knob("effort", "effort")
+  knob("thinking", "thinking")
+  knob("maxTokens", "longest reply")
   const hearer = hearerNow(t, ctx)
   if (hearer !== undefined) {
     if (hearer.id !== c.hearing.hearer) {
@@ -156,30 +195,16 @@ export const changedSince = (t: TraceInfo, ctx: LatencyContext): ReadonlyArray<s
   const was = voiceOf(c.voice, ctx)
   const nowKey = `${a.voice.provider}:${a.voice.voiceId}`
   if (c.voice !== nowKey) out.push(`voice ${was.name} → ${voiceOf(nowKey, ctx).name}`)
-  diff("modules", c.modules, Object.values(a.modules).filter((m) => m.on).length)
+  const running = runningModules(a, ctx.modules)
+  diff("modules", c.modules, Object.keys(running).length)
   // A Claude subscription assistant not let to use its modules has no tools, whatever its modules (as the server records it).
-  diff("tools", c.tools, a.llm.account === "claude-subscription" && !a.llm.useModules ? 0 : toolCount(a, ctx.modules))
+  diff("tools", c.tools, a.llm.account === "claude-subscription" && !a.llm.useModules ? 0 : toolCount({ modules: running }, ctx.modules))
   if (c.replyEarly !== a.replyEarly) out.push(`reply early ${c.replyEarly ? "on" : "off"} → ${a.replyEarly ? "on" : "off"}`)
   diff("tool rounds", c.toolRounds, a.toolRounds)
   return out
 }
 
 const changedText = (parts: ReadonlyArray<string>) => parts.join("; ")
-
-/**
- * The turns' own keys, oldest first: device, assistant and turn number (turn numbers count per device), and how many
- * earlier traces had those (a device's numbers can start over). Not the list position: a new trace must not change the
- * keys of the rows already shown (their open state and popover are kept by key).
- */
-export const traceKeys = (traces: ReadonlyArray<TraceInfo>): ReadonlyArray<string> => {
-  const seen = new Map<string, number>()
-  return traces.map((t) => {
-    const base = `${t.deviceId ?? t.session ?? ""}:${t.assistant?.id ?? ""}:${t.turnId}`
-    const n = seen.get(base) ?? 0
-    seen.set(base, n + 1)
-    return n === 0 ? base : `${base}:${n}`
-  })
-}
 
 // ---- Rows
 
