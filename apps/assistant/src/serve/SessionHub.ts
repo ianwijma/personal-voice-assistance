@@ -885,12 +885,15 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
         const session = sessionOf(client)
         // Without a session: the id reserved for that assistant (the session takes it over).
         const info = session === undefined ? sessions.conversation(client.sessionKey, assistantId) : session.conversation.conversation(assistantId)
+        // Read together with the history: the turn its last exchange is (the page may still show that turn as running).
+        const lastTurnId = session?.conversation.lastTurnId(assistantId)
         return send(client, {
           type: "conversation.history",
           requestId: message.requestId,
           assistantId,
           id: info.id,
-          history: session === undefined ? [] : historyItems(Effect.runSync(session.conversation.history(assistantId)))
+          history: session === undefined ? [] : historyItems(Effect.runSync(session.conversation.history(assistantId))),
+          ...(lastTurnId !== undefined ? { lastTurnId } : {})
         })
       }
       case "wake.test": {

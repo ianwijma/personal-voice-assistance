@@ -731,6 +731,8 @@ interface VSession {
   awakeUntil: number
   /** The assistant the utterance being heard goes to (`runVoiceTurn`), and the `holder` the last `state` said. */
   hearingFor: string | undefined
+  /** The timer that turns the utterance being heard into its turn (cleared when Stop or a new conversation cancels it). */
+  hearingEnd: ReturnType<typeof setTimeout> | undefined
   holderSent: string | null
   awakeTimer: ReturnType<typeof setTimeout> | undefined
   discardTimer: ReturnType<typeof setTimeout> | undefined
@@ -898,6 +900,7 @@ const sessionFor = (c: Conn): VSession | undefined => {
       lastActive: now,
       awakeUntil: 0,
       hearingFor: undefined,
+      hearingEnd: undefined,
       holderSent: null,
       awakeTimer: undefined,
       discardTimer: undefined
@@ -965,17 +968,32 @@ const targetSession = (deviceId?: unknown): VSession | undefined => {
   const started = startedSessions()
   return started.find((v) => v.owner !== undefined) ?? started[0]
 }
+/** Per conversation (`voice.convFor`): the turn whose exchange ends its history (`conversation.history.lastTurnId`). */
+const lastTurnOf = new WeakMap<object, number>()
 /** A new conversation on the session: the running turn stops, the history goes, every tab of the device is told. */
 const newConversation = (v: VSession, reason: "new" | "idle", assistantId: string | undefined = voice.answeringOf(v, v.deviceId)) => {
   // Only the turn of this assistant's conversation stops; the other assistants keep theirs.
   if (v.reply !== undefined && v.reply.assistantId === assistantId) interruptReply(v.reply)
+  if (reason === "new") cancelHearing(v, assistantId)
   const conv = voice.convFor(v, assistantId)
   conv.history = []
+  lastTurnOf.delete(conv)
   conv.conversation = newConversationInfo()
   conv.turns = 0
   conv.lastTurnAt = null
   toSession(v, { type: "conversation", id: conv.conversation.id, reason, startedAt: conv.conversation.startedAt, ...(assistantId !== undefined ? { assistantId } : {}) })
   sessionsChanged()
+}
+/**
+ * As the server: Stop, or a new conversation for the assistant (`undefined`: any) whose sentence is being heard,
+ * cancels that sentence. No turn follows, and its assistant holds the turn no longer.
+ */
+const cancelHearing = (v: VSession, assistantId: string | undefined) => {
+  if (v.hearingFor === undefined || (assistantId !== undefined && v.hearingFor !== assistantId)) return
+  if (v.hearingEnd !== undefined) clearTimeout(v.hearingEnd)
+  v.hearingEnd = undefined
+  v.hearingFor = undefined
+  setState(v, v.state === "hearing" && v.reply === undefined ? restingState(v) : v.state)
 }
 /** The session and its conversation go (discarded, or its place taken at the limit). */
 const dropSession = (v: VSession) => {
@@ -1510,6 +1528,7 @@ const runReply = (v: VSession, opts: {
   const endOfTurn = Date.now()
   v.lastActive = endOfTurn
   conv.history.push({ role: "user", text: opts.userText })
+  lastTurnOf.set(conv, turnId)
   voice.setHolder(v, assistantId)
   v.hearingFor = undefined
   toSession(v, { type: "transcript", text: "" })
@@ -1591,10 +1610,12 @@ const runVoiceTurn = (v: VSession | undefined, opts: { assistantId?: string | un
   v.hearingFor = assistantId
   setState(v, "hearing")
   if (opts.phrase !== undefined) wakeUp(v, opts.phrase, false, assistantId)
+  if (v.hearingEnd !== undefined) clearTimeout(v.hearingEnd)
   const spoken = (script.userText.charAt(0).toLowerCase() + script.userText.slice(1)).replace(/[?]/g, "").split(" ")
   const words = spoken.map((_, i) => spoken.slice(0, i + 1).join(" "))
   words.forEach((w, i) => after(250 + i * 260, () => toSession(v, { type: "transcript", text: w })))
-  after(250 + words.length * 260 + 350, () => {
+  v.hearingEnd = after(250 + words.length * 260 + 350, () => {
+    v.hearingEnd = undefined
     sendHeard(v, script.userText, opts.phrase, true)
     runReply(v, { source: "voice", userText: script.userText, clauses: script.clauses, spoken: true, tool: script.tool, assistantId })
   })
@@ -1793,9 +1814,12 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
       return
     }
     case "interrupt": {
-      const r = sessionFor(c)?.reply
-      if (r === undefined || (m.turnId !== undefined && m.turnId !== r.turnId)) return
-      interruptReply(r)
+      const v = sessionFor(c)
+      const r = v?.reply
+      if (m.turnId !== undefined && m.turnId !== r?.turnId) return
+      if (r !== undefined) interruptReply(r)
+      // As the server: Stop also cancels the sentence being heard.
+      if (v !== undefined) cancelHearing(v, undefined)
       return
     }
     case "text.send": {
@@ -2126,7 +2150,9 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
         return result(c, m.requestId, false, { code: "unknown_assistant", message: `${m.assistantId} is not one of the assistants on this device.` })
       }
       const conv = voice.convFor(v, m.assistantId)
-      sendTo(c, { type: "conversation.history", requestId: m.requestId, assistantId: m.assistantId, id: conv.conversation.id, history: clone(conv.history.slice(-200)) })
+      // As the server: the turn whose exchange ends the history (here its user message is noted when the turn starts).
+      const lastTurnId = lastTurnOf.get(conv)
+      sendTo(c, { type: "conversation.history", requestId: m.requestId, assistantId: m.assistantId, id: conv.conversation.id, history: clone(conv.history.slice(-200)), ...(lastTurnId !== undefined ? { lastTurnId } : {}) })
       return
     }
     case "ping":
