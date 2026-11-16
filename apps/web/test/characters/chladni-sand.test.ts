@@ -140,7 +140,7 @@ const mean = (xs: ReadonlyArray<number>) => xs.reduce((s, x) => s + x, 0) / xs.l
 const FIG: ReadonlyArray<readonly [n: number, m: number, s: number]> = [
   [1, 2, 1], [1, 3, -1], [2, 3, 1], [1, 4, 1], [3, 4, -1], [2, 5, 1], [1, 6, -1], [3, 5, 1], [2, 7, -1], [4, 5, 1], [3, 7, 1], [5, 6, -1]
 ]
-const ROUND: ReadonlyArray<readonly [a: number, b: number]> = [[1, 1], [2, 1], [0, 2], [3, 1], [1, 2], [2, 2], [4, 1], [3, 2], [0, 3], [4, 2], [2, 3], [3, 3]]
+const ROUND: ReadonlyArray<readonly [a: number, b: number]> = [[1, 1], [2, 1], [0, 2], [3, 1], [1, 2], [2, 2], [4, 1], [3, 2], [0, 3], [4, 2], [2, 3], [5, 3]]
 const square = (k: number, g: Grain): number => {
   const [n, m, s] = FIG[k]!
   const X = ((g.u + 1) * Math.PI) / 2
@@ -198,10 +198,10 @@ describe("chladni sand: the sand lies on the nodal lines of the figure the voice
     expect(Math.max(...sand(DEEP).map((g) => Math.hypot(g.u, g.v)))).toBeGreaterThan(1.1)
   })
 
-  // BUG (see the pull request): on a round plate, under reduced motion, the sand of figures 2 (pure rings) and 11 (3 diameters, 3 rings)
-  // is placed by 14 Newton steps that stall on the antinodes, where the gradient is nearly zero. A quarter to a half of the sand is
-  // left off the lines (measured: 73 % and 52 % within 0.1 of a nodal line; every other figure on both plates: 100 %).
-  it.fails("a round plate gathers all the sand on the lines of figure 2 and figure 11 under reduced motion", () => {
+  // Regression: on a round plate under reduced motion, the 14 Newton steps of a snap stalled for grains on an antinode, where the
+  // gradient is nearly zero. Round figure 2 (pure rings, antinodes at r = 0, 0.5 and 1) kept only 73 % of the sand within 0.1 of a
+  // nodal line; every other figure had all of it. A length-limited rescue pass now moves the grains that a snap left off the lines.
+  it("a round plate gathers all the sand on the lines of figure 2 and figure 11 under reduced motion", () => {
     for (const k of [2, 11]) expect(onLines(sand({ register: k / 11, pitch: k / 11 }, { plate: "round" }), (g) => round(k, g)), `round figure ${k}`).toBeGreaterThan(0.95)
   })
 
