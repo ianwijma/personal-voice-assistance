@@ -194,7 +194,9 @@ describe("voice catalog (API client)", () => {
     answers[0]!(fail(409, "superseded"))
     await first
     expect(catalog.store.get().preview?.key).toBe("elevenlabs:a1")
-    answers[1]!(new Response(new Blob([new Uint8Array(44)]), { status: 200, headers: { "content-type": "audio/wav" } }))
+    // A byte body, not a `Blob`: this file runs under jsdom, whose Blob has no `stream()`, and
+    // newer Node releases (22.23) call it when a Response is built from one.
+    answers[1]!(new Response(new Uint8Array(44), { status: 200, headers: { "content-type": "audio/wav" } }))
     await second
     expect(catalog.store.get().preview).toEqual({ key: "elevenlabs:a1", phase: "playing" })
     expect(played).toHaveLength(1)
