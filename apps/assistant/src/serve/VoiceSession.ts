@@ -775,7 +775,12 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
           }
           const next = hearingNow()
           // A recogniser still being bound (`waiting`) keeps the current one: the device goes on hearing.
-          if (next.kind === "waiting" || sameHearing(next, hearing)) continue
+          if (next.kind === "waiting") continue
+          if (sameHearing(next, hearing)) {
+            // The same recogniser, perhaps for another hearer (same hearing settings): the snapshot names the one now.
+            if (next.kind === "ready") streamHearing = next
+            continue
+          }
           // §3.5: the new recogniser is ready (the pool binds it only then); switch at the next silence, waiting at
           // most `switchWaitMs` for an open utterance to end.
           const deadline = now() + switchWaitMs

@@ -179,4 +179,55 @@ describe("the per-turn configuration snapshot (TraceInfo.config)", () => {
     const welcome = await later.admin(TEST_ADMIN_PASSWORD)
     expect(welcome.snapshot.traces.map((t) => t.config)).toEqual(all.map((t) => t.config))
   })
+
+  it("a new hearer on the same recogniser (identical hearing settings) is named by the next turns' snapshots", async () => {
+    const { dataDir, base } = await dataDirWithTwo()
+    // Alpha hears with the same settings as Bravo, and the device may pick who answers without a phrase.
+    const path = join(dataDir, "settings.json")
+    const file = JSON.parse(readFileSync(path, "utf8")) as Json
+    file.assistants.byId.alpha.hearing = base.hearing
+    file.deviceTypes["web-voice"].voicePage = { pick: true }
+    writeFileSync(path, `${JSON.stringify(file, null, 2)}\n`)
+    const stt = controlledStt()
+    server = await startTestServer({ build: fakeBuild({ stt: stt.stt, llm: scriptedLlm(() => "the build's").llm }), buildLlm: fakeModels, resourceGraceMs: 100, dataDir })
+    const admin = await connect()
+    await admin.admin(TEST_ADMIN_PASSWORD)
+    const page = await connect()
+    await page.hello()
+    await page.claim()
+    await until("the recogniser stream", () => stt.open() === 1)
+
+    const typed = async (assistantId: string, text: string, id: string) => {
+      const from = page.messages.length
+      page.send({ type: "text.send", requestId: id, text, speak: false, assistantId })
+      expect((await page.waitFor("result", (m) => m.requestId === id, { from })).ok).toBe(true)
+      const begun = await page.waitFor("turn.start", (m) => m.assistantId === assistantId, { from, timeoutMs: 10_000 })
+      return page.waitFor("turn.end", (m) => m.turnId === begun.turnId, { from, timeoutMs: 10_000 })
+    }
+    const hearingOf = (hearer: string) => ({ hearer, engine: "sherpa", model: base.hearing.model, eagerSilenceMs: base.hearing.eagerSilenceMs, finalSilenceMs: base.hearing.finalSilenceMs })
+
+    await typed("alpha", "hello", "t1")
+    await until("one trace", () => traces(admin).length === 1)
+    expect(traces(admin)[0]!.config?.hearing).toEqual(hearingOf("alpha"))
+
+    // Bravo now answers without a phrase, so Bravo is the hearer; the recogniser stream goes on as it was.
+    const from = page.messages.length
+    page.send({ type: "device.pick", requestId: "p1", withoutPhrase: "bravo" })
+    expect((await page.waitFor("result", (m) => m.requestId === "p1", { from })).ok).toBe(true)
+    await page.waitFor("device.setup", (m) => m.withoutPhrase.mode === "assistant", { from })
+    await sleep(100)
+    expect(stt.opened()).toBe(1)
+
+    await typed("bravo", "hi there", "t2")
+    const fromSpoken = page.messages.length
+    stt.emit(speechStarted, endOfTurn("tell me a joke"))
+    const begun = await page.waitFor("turn.start", () => true, { from: fromSpoken, timeoutMs: 10_000 })
+    expect(begun.assistantId).toBe("bravo")
+    await page.waitFor("turn.end", (m) => m.turnId === begun.turnId, { from: fromSpoken, timeoutMs: 10_000 })
+    await until("three traces", () => traces(admin).length === 3)
+    const all = traces(admin)
+    expect(stt.opened()).toBe(1)
+    // The earlier turn keeps the hearer it was heard with; the later ones name Bravo.
+    expect(all.map((t) => [t.mode, t.config?.hearing])).toEqual([["text", hearingOf("alpha")], ["text", hearingOf("bravo")], ["voice", hearingOf("bravo")]])
+  })
 })
