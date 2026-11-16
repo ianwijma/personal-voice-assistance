@@ -160,7 +160,8 @@ export const makePublisher = (options: PublisherOptions): Publisher => {
           callId: event.call.id,
           tool: event.call.name,
           moduleId: options.moduleOfTool(event.call.name),
-          input: truncateInput(event.call.input) as never
+          input: truncateInput(event.call.input) as never,
+          ...tag(turns.get(event.turnId))
         })
       case "ToolFinished":
         return send(event.turnId, {
@@ -169,7 +170,8 @@ export const makePublisher = (options: PublisherOptions): Publisher => {
           callId: event.result.id,
           ok: !event.result.isError,
           ms: Math.max(0, event.ms),
-          ...(event.result.isError ? { error: event.result.content.slice(0, 500) } : {})
+          ...(event.result.isError ? { error: event.result.content.slice(0, 500) } : {}),
+          ...tag(turns.get(event.turnId))
         })
       case "TurnEnded": {
         const view = turns.get(event.turnId)
