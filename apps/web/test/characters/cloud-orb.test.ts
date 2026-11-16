@@ -139,6 +139,28 @@ describe("cloud orb: where it is and how big", () => {
     expect(read("uR", "idle", 5, { reduced: true, pointer: { x: 5, y: 5, down: true, inside: true } })).toBeCloseTo(rest, 6) // pressed elsewhere on the stage
     expect(read("uR", "idle", 5, { reduced: true, pointer: { ...at, down: true, inside: false } })).toBeCloseTo(rest, 6)
   })
+
+  it("still shrinks 5 % under a press at the largest size and reaction, where the cap applies", () => {
+    const big: Stored = { size: 1.25, swell: 2 }
+    const at = { x: BOX.x + 10, y: BOX.y + 10 }
+    const d = { user: voice(LOUD), reduced: true }
+    const rest = read("uR", "hearing", 5, d, big)
+    expect(rest).toBeCloseTo(CAP, 6)
+    expect(read("uR", "hearing", 5, { ...d, pointer: { ...at, down: true, inside: true } }, big)).toBeCloseTo(0.95 * CAP, 6)
+  })
+
+  it("draws nothing, rather than a zero radius, for a degenerate focus box (the shader divides by the radius)", () => {
+    const centre = { x: 0, y: 0, down: false, inside: true }
+    for (const focus of [{ x: 0, y: 0, width: 0, height: 0 }, { x: 0, y: 0, width: 0, height: 200 }, { x: 0, y: 0, width: 200, height: 0 }]) {
+      const o = orb().run("idle", 3, { focus, pointer: centre })
+      expect(() => o.u("uR"), `${focus.width}x${focus.height}`).toThrow() // the uniform was never sent: no draw
+    }
+    // A normal box with the pointer at its exact centre sends a finite light position.
+    const mid = { x: BOX.x + BOX.width / 2, y: BOX.y + BOX.height / 2, down: false, inside: true }
+    const light = orb().run("idle", 3, { pointer: mid }).v("uLight")
+    expect(light.every(Number.isFinite)).toBe(true)
+    expect(orb().run("idle", 3).u("uR")).toBeGreaterThan(0)
+  })
 })
 
 describe("cloud orb: which way the clouds flow", () => {

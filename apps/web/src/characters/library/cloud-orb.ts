@@ -238,6 +238,7 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
   let grainK = 1
   let haloK = 1
   let swellK = 1
+  let pressK = 1 // the press shrink, eased
   let pitchK = 1
   let clock = -1 // ambient time at the "Motion speed"
 
@@ -313,8 +314,9 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
       // Size: the person's loudness swells the orb; the reply only breathes it slightly.
       const R0 = Math.min(H * 0.36, W * 0.3)
       const press = f.pointer.down && f.pointer.inside && f.pointer.x >= fo.x && f.pointer.x < fo.x + W && f.pointer.y >= fo.y && f.pointer.y < fo.y + H ? 0.95 : 1
+      pressK = ease(pressK, press, dt, 0.08)
       const breathe = reduced ? 1 : 1 + 0.025 * Math.sin(clock * 1.6) * mix.listening
-      const sT = mix.of(0.62, 0.86, 0.9 + 0.38 * swellK * clamp01(Lu * 1.5), 0.8, 0.86 + 0.3 * swellK * clamp01(La * 1.6)) * breathe * press
+      const sT = mix.of(0.62, 0.86, 0.9 + 0.38 * swellK * clamp01(Lu * 1.5), 0.8, 0.86 + 0.3 * swellK * clamp01(La * 1.6)) * breathe
       const s = reduced ? sT : size.step(sT, dt)
 
       // Flow: inward while taking in (gently, faster when you are louder), outward while speaking
@@ -344,10 +346,14 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
       drift += rise * dt * 0.6 * motion
       // Pointer: the light inside follows the pointer.
       // The orb (not its fading halo) always fits the focus box, whatever the size and swell.
-      const R = Math.min(R0 * s * sizeK, 0.48 * Math.min(W, H))
+      // The cap comes first and the press shrink after it, so pressing shows even at the largest settings.
+      const R = Math.min(R0 * s * sizeK, 0.48 * Math.min(W, H)) * pressK
+      // No drawable orb (first frame before the size envelope has risen, or a degenerate focus box): the
+      // shader and the pointer mapping divide by the radius, so clear and stop.
+      const drawable = R > 0
       const px = f.pointer.x - fo.x
       const py = f.pointer.y - fo.y
-      if (f.pointer.inside && px >= 0 && px < W && py >= 0 && py < H) {
+      if (drawable && f.pointer.inside && px >= 0 && px < W && py >= 0 && py < H) {
         lightX = ease(lightX, clamp((f.pointer.x - fo.x - W / 2) / R, -0.7, 0.7), dt, 0.2)
         lightY = ease(lightY, clamp(-(f.pointer.y - fo.y - H / 2) / R, -0.7, 0.7), dt, 0.2)
       } else lightX = ease(lightX, 0, dt, 0.4)
@@ -372,6 +378,7 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
 
       gl.clearColor(0, 0, 0, 0)
       gl.clear(gl.COLOR_BUFFER_BIT)
+      if (!drawable) return
       gl.useProgram(prog)
       gl.bindVertexArray(vao)
       gl.uniform2f(U.cen, (fo.x + W / 2) * dpr, (CH - fo.y - H / 2) * dpr)
@@ -407,7 +414,7 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
 const character: Character = {
   id: "cloud-orb",
   name: "Cloud orb",
-  version: "1.1.0",
+  version: "1.1.1",
   contract: 1,
   family: "abstract",
   renderer: "webgl2",
