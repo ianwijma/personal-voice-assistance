@@ -43,7 +43,8 @@ export interface AssistantClient {
   /** Stop the reply now (Stop button / Esc). */
   readonly stopReply: () => void
   readonly resumeAudio: () => void
-  readonly sendText: (text: string) => Promise<ResultMessage>
+  /** Typed text goes to `assistantId`'s conversation (the one the chat shows); without one, to the answering assistant. */
+  readonly sendText: (text: string, assistantId?: string) => Promise<ResultMessage>
   readonly request: (message: RequestInput) => Promise<ResultMessage>
   readonly enableModule: (moduleId: string, enabled: boolean) => Promise<ResultMessage>
   readonly configureModule: (moduleId: string, patch: SettingsPatch) => Promise<ResultMessage>
@@ -104,7 +105,14 @@ export interface AssistantClient {
    */
   readonly wakeTest: (on: boolean, deviceId?: string) => Promise<ResultMessage>
   /** Voice: start a new conversation on this device (`conversation.new`); the chat empties on the server's answer. */
-  readonly newConversation: () => Promise<ResultMessage>
+  readonly newConversation: (assistantId?: string) => Promise<ResultMessage>
+  /**
+   * Voice, protocol 7: pick who answers without a phrase on this device (`device.pick`): an assistant id, `"typesafe"`
+   * (whichever fits) or `""` (nobody). Device-wide. The new `device.setup` arrives as a push; a refusal is in the result.
+   */
+  readonly pickAssistant: (withoutPhrase: string) => Promise<ResultMessage>
+  /** Voice, protocol 7: ask for one assistant's conversation; the answer is a `conversation.history` (no `result`). */
+  readonly readConversation: (assistantId: string) => void
   /**
    * Run the echo test and save its result in the preferences (with the output path it ran on). Rejects
    * (saving nothing) when audio is off, a test already runs, or the test is cancelled: End, a takeover, a
@@ -468,8 +476,13 @@ export const createAssistantClient = (options: { readonly frontend?: FrontendRol
     connection.send(turnId === undefined ? { type: "interrupt" } : { type: "interrupt", turnId })
   }
 
-  const sendText = (text: string) =>
-    connection.request({ type: "text.send", text, speak: owner() && audio.running && profileOf(store.get()).speakReplies })
+  const sendText = (text: string, assistantId?: string) =>
+    connection.request({
+      type: "text.send",
+      text,
+      speak: owner() && audio.running && profileOf(store.get()).speakReplies,
+      ...(assistantId !== undefined ? { assistantId } : {})
+    })
 
   const setPrefs = (patch: Partial<Prefs>) => {
     const before = prefs.get()
@@ -512,8 +525,8 @@ export const createAssistantClient = (options: { readonly frontend?: FrontendRol
   let appliedProfile: DeviceProfile = profileOf(store.get())
   // continuation(state): runs synchronously on every store change and compares with the profile applied last.
   store.subscribe(() => {
-    const next = store.get().device?.profile
-    if (next === undefined || next === appliedProfile) return
+    const next = profileOf(store.get())
+    if (next === appliedProfile) return
     const before = appliedProfile
     appliedProfile = next
     applyProfile(before, next)
@@ -682,7 +695,15 @@ export const createAssistantClient = (options: { readonly frontend?: FrontendRol
         options.label ?? "The device"
       ),
     wakeTest: (on, deviceId) => connection.request(deviceId === undefined ? { type: "wake.test", on } : { type: "wake.test", on, deviceId }),
-    newConversation: () => connection.request({ type: "conversation.new" }),
+    newConversation: (assistantId) => connection.request(assistantId === undefined ? { type: "conversation.new" } : { type: "conversation.new", assistantId }),
+    pickAssistant: async (withoutPhrase) => {
+      const result = await connection.request({ type: "device.pick", withoutPhrase }) // continuation(none): only the store's own state changes
+      if (result.ok) dispatch({ type: "local/holder-clear" })
+      return result
+    },
+    readConversation: (assistantId) => {
+      connection.send({ type: "conversation.read", requestId: `read-${assistantId}-${Date.now().toString(36)}`, assistantId })
+    },
     diagnostics,
     echoTest: async () => {
       if (!audio.running) throw new Error("Start audio first.")

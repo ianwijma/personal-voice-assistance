@@ -1,28 +1,25 @@
 "use client"
 import { type ReactNode, useRef, useState } from "react"
-import { type Activation, FOLLOW_UP_SECONDS_MAX, type ProfileField } from "@pva/protocol"
 import { VoiceAudio } from "@/lib/audio/VoiceAudio.ts"
-import { displayPhrase, profileOf } from "@/lib/state.ts"
+import { displayPhrase, visualState } from "@/lib/state.ts"
 import { shallowEqual } from "@/lib/store.ts"
+import { defaultAssistantId, reachText } from "@/lib/voiceSetup.ts"
 import { useClient, useClientState, usePrefs } from "../context.tsx"
 import { inputClass } from "../fields/types.ts"
 import { Icon, Spinner } from "../ui/Icon.tsx"
 import { PanelHeader, useDialog } from "../ui/Panel.tsx"
-import { Button, cx, Segmented } from "../ui/controls.tsx"
+import { Button, cx } from "../ui/controls.tsx"
 import { useHref } from "../useHref.ts"
 import { useMediaDevices } from "./useMediaDevices.ts"
-
-/** Follow-up choices; a value set in admin that is not one of these is listed too. */
-const FOLLOW_UP = [0, 5, 8, 15, 30, FOLLOW_UP_SECONDS_MAX]
-const seconds = (n: number) => (n === 0 ? "Off: say the phrase every time" : `${n} seconds`)
 
 const touchInput = `${inputClass} max-sm:h-11`
 
 /**
- * The voice front end's settings (docs/FRONTENDS-AND-ACTIVATION.md §5): Activation, Microphone, Speaker, one "More"
- * group (the echo test, which only this device can run, and a way into Help), and a link to admin. Activation and
- * follow-up belong to the device profile on the server (`device.update`); microphone and speaker stay in this browser.
- * The voice is the assistant's, chosen in admin under Voices (docs/VOICE-PROVIDERS.md §1): a device has none of its own.
+ * The voice front end's settings (docs/ASSISTANTS.md §7.2): Assistant (who answers without a phrase, as a choice
+ * where the device lets people pick, else the list), Microphone, Speaker, one "More" group (the echo test, which only
+ * this device can run, and a way into Help), and a link to admin. The pick belongs to the device on the server
+ * (`device.pick`); microphone and speaker stay in this browser. The voice is the assistant's, chosen in admin: a device
+ * has none of its own, and phrases and follow-up are admin's too.
  * A bottom sheet on a phone, a side sheet from 640 px.
  */
 export function VoiceSheet() {
@@ -68,9 +65,6 @@ function Section({ title, id, children }: { readonly title: string; readonly id:
   )
 }
 
-/** The sheet's own profile fields: a refused change is shown next to its control until fixed or dismissed. */
-type SheetField = "activation" | "followUpSeconds"
-
 function FieldError({ id, message, onDismiss }: { readonly id: string; readonly message: string; readonly onDismiss: () => void }) {
   return (
     <div id={id} role="alert" data-testid="sheet-error" className="flex items-start gap-2 rounded-md border border-danger/40 bg-danger/10 py-1.5 pl-3 pr-1 text-[13px] text-danger">
@@ -87,28 +81,118 @@ function FieldError({ id, message, onDismiss }: { readonly id: string; readonly 
   )
 }
 
-function SheetBody() {
+interface Choice {
+  readonly value: string
+  readonly title: string
+  readonly detail?: string
+  readonly reach: string
+}
+
+/** Who answers without a phrase: a choice where the device lets people pick, else the plain list (docs/mockups/assistants/voice.html). */
+function AssistantGroup({ admin }: { readonly admin: string }) {
   const client = useClient()
-  const [errors, setErrors] = useState<Partial<Record<SheetField, string>>>({})
-  /** Sends one change; a refusal stays next to the control (the sheet covers the page's toasts). */
-  const change = async (field: SheetField, patch: Parameters<typeof client.updateDevice>[0]) => {
-    const result = await client.updateDevice(patch, { toast: false }) // continuation(none): only this sheet's own messages
-    const refusal = result.error?.message ?? "the assistant refused it."
-    setErrors(({ [field]: _old, ...rest }) => (result.ok ? rest : { ...rest, [field]: refusal }))
-  }
-  const dismiss = (field: SheetField) => setErrors(({ [field]: _old, ...rest }) => rest)
+  const [error, setError] = useState<string | undefined>()
+  const [saved, setSaved] = useState(false)
   const v = useClientState(
     (s) => {
-      const profile = profileOf(s)
+      const started = visualState(s) !== "not-started"
       return {
-        activation: profile.activation,
-        phrases: profile.wakePhrases,
-        followUp: profile.followUpSeconds,
-        editable: s.device?.editable ?? [],
-        hasDevice: s.device?.deviceId !== undefined,
-        running: s.audio.phase === "running" || s.audio.phase === "suspended"
+        canPick: s.setup?.canPick === true,
+        canAuto: s.setup?.canAuto === true,
+        several: (s.setup?.assistants.length ?? 0) > 1,
+        mode: s.setup?.withoutPhrase.mode,
+        assistant: defaultAssistantId(s.setup),
+        list: JSON.stringify(
+          (s.setup?.assistants ?? []).map((a): Choice => ({ value: a.id, title: a.name, detail: a.purpose, reach: reachText(s, a.id, started, displayPhrase) }))
+        )
       }
     },
+    shallowEqual
+  )
+  const list = JSON.parse(v.list) as ReadonlyArray<Choice>
+  const pick = async (value: string) => {
+    setSaved(false)
+    // continuation(none): only this group's own note or error.
+    const result = await client.pickAssistant(value)
+    if (result.ok) {
+      setError(undefined)
+      setSaved(true)
+    } else setError(result.error?.message ?? "the assistant refused it.")
+  }
+  if (!v.canPick) {
+    return (
+      <>
+        <div className="flex flex-col divide-y divide-line/60 rounded-md border border-line" data-testid="assistant-list">
+          {list.map((a) => <ChoiceText key={a.value} choice={a} />)}
+        </div>
+        <p className="text-[12px] text-ink-faint">
+          {v.several ? "Who answers, phrases and follow-up are" : "Phrases and follow-up are"} changed in <a href={admin} className="text-voice underline-offset-4 hover:underline">admin</a>.
+        </p>
+      </>
+    )
+  }
+  const rows: ReadonlyArray<Choice & { readonly checked: boolean }> = [
+    ...list.map((a) => ({ ...a, checked: v.mode === "assistant" && v.assistant === a.value })),
+    ...(v.canAuto ? [{ value: "typesafe", title: "Whichever fits", reach: "Each thing you say goes to the assistant it suits.", checked: v.mode === "typesafe" }] : []),
+    { value: "", title: "Nobody", reach: "Sleeps until it hears a phrase", checked: v.mode === "nobody" }
+  ]
+  return (
+    <>
+      <div role="radiogroup" aria-labelledby="sheet-assistant" data-testid="assistant-choices" className="flex flex-col divide-y divide-line/60 rounded-md border border-line">
+        {rows.map((r) => {
+          const id = `sheet-assistant-${r.value === "" ? "none" : r.value}`
+          return (
+            <label
+              key={r.value}
+              htmlFor={id}
+              className={cx("flex min-h-12 cursor-pointer items-start gap-3 px-3 py-2.5 transition-colors duration-[120ms] hover:bg-surface-2/60", r.checked && "bg-surface-2/60")}
+            >
+              <input
+                type="radio"
+                id={id}
+                name="sheet-assistant"
+                value={r.value}
+                checked={r.checked}
+                data-testid={`sheet-assistant-${r.value === "" ? "none" : r.value}`}
+                onChange={() => void pick(r.value)}
+                className="mt-1 size-[18px] shrink-0 cursor-pointer appearance-none rounded-full border-[1.5px] border-ink-faint bg-surface transition-[border-color,border-width] duration-[120ms] checked:border-[5px] checked:border-you"
+              />
+              <ChoiceText choice={r} bare />
+            </label>
+          )
+        })}
+      </div>
+      <p className={saved ? "flex items-center gap-1.5 text-[12px] text-ok" : "sr-only"} aria-live="polite" data-testid="assistant-saved">
+        {saved && <Icon name="check" size={14} />}
+        {saved ? "Used from the next thing you say." : ""}
+      </p>
+      {error !== undefined && <FieldError id="sheet-assistant-error" message={error} onDismiss={() => setError(undefined)} />}
+      <p className="text-[12px] text-ink-faint">This decides who answers without a phrase on this device, for everyone who uses it.</p>
+      <p className="text-[12px] text-ink-faint">
+        Phrases and follow-up are changed in <a href={admin} className="text-voice underline-offset-4 hover:underline">admin</a>.
+      </p>
+    </>
+  )
+}
+
+function ChoiceText({ choice, bare = false }: { readonly choice: Choice; readonly bare?: boolean }) {
+  const text = (
+    <span className="min-w-0">
+      <span className="block text-[14px] text-ink">{choice.title}</span>
+      {choice.detail !== undefined && choice.detail !== "" && <span className="block text-[13px] text-ink-muted">{choice.detail}</span>}
+      <span className="mt-0.5 block text-[12px] text-ink-faint">{choice.reach}</span>
+    </span>
+  )
+  return bare ? text : <div className="px-3 py-2.5">{text}</div>
+}
+
+function SheetBody() {
+  const client = useClient()
+  const v = useClientState(
+    (s) => ({
+      hasDevice: s.device?.deviceId !== undefined,
+      running: s.audio.phase === "running" || s.audio.phase === "suspended"
+    }),
     shallowEqual
   )
   const prefs = usePrefs((p) => p, shallowEqual)
@@ -116,8 +200,6 @@ function SheetBody() {
   const speakers = useMediaDevices("audiooutput", v.running)
   const canChooseSpeaker = typeof window !== "undefined" && VoiceAudio.canChooseSpeaker()
   const admin = useHref("/admin/")
-  const can = (f: ProfileField) => v.editable.includes(f)
-  const followUps = FOLLOW_UP.includes(v.followUp) ? FOLLOW_UP : [...FOLLOW_UP, v.followUp].sort((a, b) => a - b)
 
   return (
     <div className="flex flex-col gap-6">
@@ -127,50 +209,8 @@ function SheetBody() {
         </p>
       )}
 
-      <Section title="Activation" id="sheet-activation">
-        <Segmented<Activation>
-          name="activation"
-          label="Activation"
-          tall
-          testId="activation"
-          value={v.activation}
-          disabled={!can("activation")}
-          options={[{ value: "always", label: "Always listening" }, { value: "wake-phrase", label: "Wake phrase" }]}
-          onChange={(activation) => void change("activation", { activation })}
-        />
-        {errors.activation !== undefined && <FieldError id="sheet-activation-error" message={errors.activation} onDismiss={() => dismiss("activation")} />}
-        {v.activation === "always" ? (
-          <p className="text-[13px] text-ink-muted">The assistant reacts to everything it hears.</p>
-        ) : (
-          <>
-            <div className="flex flex-col gap-2" data-testid="wake-phrases">
-              <p className="text-[13px] text-ink-muted">It reacts after you say one of these:</p>
-              <ul className="flex flex-wrap gap-1.5">
-                {v.phrases.map((p) => (
-                  <li key={p} className="rounded-full border border-line bg-surface-2/60 px-3 py-1 text-[13px] text-ink">{displayPhrase(p)}</li>
-                ))}
-              </ul>
-              <p className="text-[12px] text-ink-faint">
-                The phrases are changed in <a href={admin} className="text-voice underline-offset-4 hover:underline">admin</a>.
-              </p>
-            </div>
-            <div className="flex flex-col gap-1.5">
-              <label htmlFor="sheet-follow-up" className="text-[14px] font-medium text-ink">Keep listening after a reply</label>
-              <select
-                id="sheet-follow-up"
-                value={v.followUp}
-                disabled={!can("followUpSeconds")}
-                onChange={(e) => void change("followUpSeconds", { followUpSeconds: Number(e.target.value) })}
-                className={touchInput}
-                aria-describedby={errors.followUpSeconds !== undefined ? "sheet-follow-up-help sheet-follow-up-error" : "sheet-follow-up-help"}
-              >
-                {followUps.map((n) => <option key={n} value={n}>{seconds(n)}</option>)}
-              </select>
-              <p id="sheet-follow-up-help" className="text-[12px] text-ink-faint">Within this time you can answer without the phrase.</p>
-              {errors.followUpSeconds !== undefined && <FieldError id="sheet-follow-up-error" message={errors.followUpSeconds} onDismiss={() => dismiss("followUpSeconds")} />}
-            </div>
-          </>
-        )}
+      <Section title="Assistant" id="sheet-assistant">
+        <AssistantGroup admin={admin} />
       </Section>
 
       <Section title="Microphone" id="sheet-mic">

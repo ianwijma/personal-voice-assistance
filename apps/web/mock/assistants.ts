@@ -127,7 +127,7 @@ const seedTypeSettings = (): DeviceSettings => ({
   assistants: [{ assistant: "jeff", phrases: [] }, { assistant: "t3", phrases: ["Hey T3", "Hey tee three"] }],
   withoutPhrase: { mode: "assistant", assistant: "jeff" },
   voicePage: { pick: true },
-  captions: { captions: true, speakTyped: false }
+  captions: { captions: true, speakTyped: true } // as the built-in (and the old `speakReplies`): the voice page speaks replies to typed text
 })
 
 const LONG_PHRASE = "hello my personal voice assistant please"

@@ -1,13 +1,17 @@
 "use client"
+import { displayPhrase, visualState } from "@/lib/state.ts"
 import { shallowEqual } from "@/lib/store.ts"
+import { defaultAssistantId, reachText, topBarName } from "@/lib/voiceSetup.ts"
 import { useClient, useClientState } from "./context.tsx"
 import { Icon } from "./ui/Icon.tsx"
 import { cx, IconButton, ToneDot } from "./ui/controls.tsx"
+import { PopMenu, type PopMenuItem } from "./voice/PopMenu.tsx"
 
 /**
- * The voice front end's top bar: a status dot and no words (the stage says everything: the engine banner for "not ready", the label
- * under the line has connecting / reconnecting, the stage's notices have outdated, audio errors and audio on another
- * device), End, and the settings sheet.
+ * The voice front end's top bar: a status dot, the answering assistant's name (a menu of the device's assistants where
+ * the device lets people pick, docs/ASSISTANTS.md §7.2), End, and the settings sheet. The stage says the rest (the engine
+ * banner for "not ready", the label under the line has connecting / reconnecting, the stage's notices have outdated,
+ * audio errors and audio on another device).
  */
 export function TopBar() {
   const client = useClient()
@@ -41,7 +45,7 @@ export function TopBar() {
     <header className="relative z-20 flex h-14 shrink-0 items-center gap-3 pl-[max(12px,env(safe-area-inset-left))] pr-[max(8px,env(safe-area-inset-right))] sm:gap-5 sm:px-6">
       <div className="flex min-w-0 items-center gap-2.5 pl-1" data-testid="connection-status-line">
         <ToneDot tone={tone} className={cx("size-2", tone === "warning" && "animate-pulse")} />
-        <span className="label hidden text-ink sm:inline">PVA</span>
+        <AssistantName />
         <span data-testid="connection-status" className="sr-only">
           {text}
         </span>
@@ -71,5 +75,48 @@ export function TopBar() {
         </IconButton>
       </div>
     </header>
+  )
+}
+
+/** The answering assistant: a plain name, or a menu to pick who answers without a phrase (`device.pick`). */
+function AssistantName() {
+  const client = useClient()
+  const v = useClientState(
+    (s) => ({
+      name: topBarName(s),
+      canPick: s.setup?.canPick === true,
+      canAuto: s.setup?.canAuto === true,
+      mode: s.setup?.withoutPhrase.mode,
+      assistant: defaultAssistantId(s.setup),
+      items: s.setup?.assistants.map((a) => ({ value: a.id, title: a.name, detail: reachText(s, a.id, visualState(s) !== "not-started", displayPhrase) })) ?? []
+    }),
+    (a, b) => shallowEqual({ ...a, items: JSON.stringify(a.items) }, { ...b, items: JSON.stringify(b.items) })
+  )
+  if (!v.canPick) return <span data-testid="assistant-name" className="label truncate text-ink">{v.name}</span>
+  const items: Array<PopMenuItem> = [
+    ...v.items.map((i) => ({ ...i, checked: v.mode === "assistant" && v.assistant === i.value, testId: `assistant-${i.value}` })),
+    ...(v.canAuto
+      ? [{ value: "typesafe", title: "Whichever fits", detail: "Each thing you say goes to the assistant it suits.", checked: v.mode === "typesafe", separator: true, testId: "assistant-typesafe" }]
+      : []),
+    { value: "", title: "Nobody", detail: "Sleeps until it hears a phrase", checked: v.mode === "nobody", separator: !v.canAuto, testId: "assistant-nobody" }
+  ]
+  return (
+    <PopMenu
+      testId="assistant-menu-button"
+      label={v.name}
+      title="Who answers on this device"
+      menuLabel="Assistants on this device"
+      note="This decides who answers without a phrase on this device."
+      items={items}
+      triggerClass="-ml-2 h-11 px-2 text-ink sm:h-8"
+      onPick={(value) => {
+        // continuation(none): the setup arrives as a push; only a refusal needs saying.
+        void client.pickAssistant(value).then((r) => {
+          if (!r.ok) client.store.dispatch({ type: "local/toast", message: r.error?.message ?? "The change was not saved.", tone: "error" })
+        })
+      }}
+    >
+      {null}
+    </PopMenu>
   )
 }

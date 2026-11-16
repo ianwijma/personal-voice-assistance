@@ -1,12 +1,14 @@
 "use client"
 import { useEffect, useState } from "react"
-import { displayPhrase, profileOf, visualState } from "@/lib/state.ts"
+import { displayPhrase, visualState } from "@/lib/state.ts"
+import { asleepText, nameOf, stripAssistantId } from "@/lib/voiceSetup.ts"
 import { useClientState } from "./context.tsx"
 import { cx } from "./ui/controls.tsx"
 import { useHoldsAudio } from "./voice/useSessionFocus.ts"
 
 /**
- * The label under the line. One line of fixed height, so nothing under it moves when the words change. Screen
+ * The label under the line, with the assistant that has the turn named after it when it is not the one that answers
+ * anyway ("Speaking · T3"). One line of fixed height, so nothing under it moves when the words change. Screen
  * readers hear only the changes that matter between replies (asleep, woke, mic off, connection and audio errors)
  * through a separate polite region; hearing / thinking / speaking are not announced (the reply announcer speaks the
  * reply itself).
@@ -16,6 +18,8 @@ export function StateLabel() {
     const v = visualState(s)
     // Another device has the audio: what it hears is not this tab listening.
     if (v === "listening" && observing(s)) return "Listening on another device"
+    const who = stripAssistantId(s)
+    const suffix = who === undefined ? "" : ` · ${nameOf(s, who)}`
     switch (v) {
       case "disconnected":
         return s.connection.everConnected ? `Reconnecting · attempt ${s.connection.attempt}` : "Connecting"
@@ -24,19 +28,17 @@ export function StateLabel() {
       case "not-started":
         return "Not started"
       case "speaking":
-        return "Speaking"
+        return `Speaking${suffix}`
       case "thinking":
-        return "Thinking"
+        return `Thinking${suffix}`
       case "muted":
         return "Mic off"
       case "hearing":
-        return "Hearing you"
+        return `Hearing you${suffix}`
       case "listening":
-        return s.woke !== undefined ? "Listening…" : "Listening"
-      case "asleep": {
-        const phrase = profileOf(s).wakePhrases[0]
-        return phrase === undefined ? "Waiting for the wake phrase" : `Say “${displayPhrase(phrase)}”`
-      }
+        return `${s.woke !== undefined || who !== undefined ? "Listening…" : "Listening"}${suffix}`
+      case "asleep":
+        return asleepText(s.setup, displayPhrase)
       case "idle":
         return "Idle"
     }
@@ -49,8 +51,7 @@ export function StateLabel() {
   // Room for the wake phrase on as many lines as it needs (up to six words), whatever the label says now, so nothing
   // under the line moves when the state changes. An invisible copy of the asleep label sets the box's height.
   const reserve = useClientState((s) => {
-    const phrase = profileOf(s).activation === "wake-phrase" ? profileOf(s).wakePhrases[0] : undefined
-    return phrase === undefined ? undefined : `Say “${displayPhrase(phrase)}”`
+    return s.setup?.withoutPhrase.mode === "nobody" ? asleepText(s.setup, displayPhrase) : undefined
   })
   const colour = cx(
     tone === "voice" && "text-voice",
@@ -95,8 +96,8 @@ export function StateAnnouncer() {
     const v = visualState(s)
     switch (v) {
       case "asleep": {
-        const phrase = profileOf(s).wakePhrases[0]
-        return phrase === undefined ? "Waiting for the wake phrase" : `Asleep. Say “${displayPhrase(phrase)}”`
+        const text = asleepText(s.setup, displayPhrase)
+        return text.startsWith("Say") ? `Asleep. ${text}` : text
       }
       case "listening":
         return s.woke !== undefined ? "Listening…" : ""
