@@ -1,8 +1,10 @@
-import { CurrentTurnTrace, Llm, LlmError, Tts, TtsError, type VoiceRef, voiceKey } from "@pva/core"
+import { CurrentTurnTrace, Llm, LlmError, type Stt, SttError, Tts, TtsError, type VoiceRef, voiceKey } from "@pva/core"
 import { DEFAULT_BASE_URL } from "@pva/llm-anthropic"
-import type { AssistantLlm, LlmAccountId, ResourceInfo } from "@pva/protocol"
+import type { AssistantHearing, AssistantLlm, LlmAccountId, ResourceInfo } from "@pva/protocol"
+import * as DeepgramStt from "@pva/stt-deepgram"
+import * as SherpaStt from "@pva/stt-sherpa"
 import * as SherpaTts from "@pva/tts-sherpa"
-import { Cause, type Config, ConfigProvider, Context, Deferred, Effect, Exit, FiberSet, Layer, Schema, Scope, Stream } from "effect"
+import { Cause, Config, ConfigProvider, Context, Deferred, Effect, Exit, FiberSet, Layer, Schema, Scope, Stream } from "effect"
 import { hasLlmAccountLayer, isTtsProvider, llmAccountLayers, ttsProviderInfo } from "../providers.ts"
 import { describeStartFailure } from "../startup.ts"
 import { ttsLayerFor, voiceConfigProvider, voiceEngineName } from "../voiceSelection.ts"
@@ -15,9 +17,10 @@ import { ttsLayerFor, voiceConfigProvider, voiceEngineName } from "../voiceSelec
  * stays for the turns still running on it. One build failing is a problem of that resource only.
  *
  * Scope: language models (WP-9; the accounts `offline`, `anthropic` and the offline stand-in of
- * `claude-subscription`; `openrouter` and `home-model` report a problem until WP-13b) and voices (WP-10: one `Tts`
- * per distinct voice, keyed by `voiceKey`; the voices of one local engine share it). The recogniser is still the
- * engine's one shared build (WP-11).
+ * `claude-subscription`; `openrouter` and `home-model` report a problem until WP-13b), voices (WP-10: one `Tts`
+ * per distinct voice, keyed by `voiceKey`; the voices of one local engine share it) and recognisers (WP-11: one per
+ * `SttKey`, bound per hearing *place* (a device, or a device type's defaults) rather than per assistant, with the
+ * place's hearer's stream options outside the key; `sttFor`).
  */
 
 /** What an instance of a language model is built from: the assistant's `llm` fields the account reads, and its address. */
@@ -271,6 +274,189 @@ export const defaultTtsBuilder = (
     })
 }
 
+// ---- Recognisers (docs/ASSISTANTS.md §3.2, §3.5, WP-11)
+
+/**
+ * The per-stream share of a hearing (docs/ASSISTANTS.md §1.2: turn timing, VAD and gain on this machine; Deepgram's
+ * end-of-turn confidences): not part of the key, so two hearers that differ only here share one instance.
+ */
+export interface SttStreamSpec {
+  readonly eagerSilenceMs: number
+  readonly finalSilenceMs: number
+  readonly minSpeechMs: number
+  readonly vadThreshold: number
+  readonly agc: boolean
+  readonly agcMaxGainDb: number
+  readonly eotThreshold: number
+  readonly eagerEotThreshold: number
+  readonly eotTimeoutMs: number
+}
+
+/** What a recogniser instance is built from (the `SttKey`), plus the stream options of the hearer that wants it. */
+export interface SttSpec {
+  readonly engine: AssistantHearing["engine"]
+  /** A stt-sherpa preset name; for Deepgram, the shared DEEPGRAM_MODEL. */
+  readonly model: string
+  /** stt-sherpa: the language, "" for a model that takes none (so it does not split the key). Deepgram: "". */
+  readonly language: string
+  /** stt-sherpa: the shared STT_SHERPA_MODEL_DIR and STT_SHERPA_THREADS (`undefined`: the defaults). */
+  readonly modelDir?: string
+  readonly threads?: number
+  /** Deepgram: the address (DEEPGRAM_URL) and a stamp of the key (a hash, never the key). Part of the identity. */
+  readonly address?: string
+  readonly credential?: string
+  readonly stream: SttStreamSpec
+}
+
+/** The shared settings a recogniser takes besides the hearer's own (§2.4 "Speech recognition models"). */
+export interface SttShared {
+  readonly modelDir?: string | undefined
+  readonly threads?: number | undefined
+  readonly deepgram?: { readonly model?: string | undefined; readonly address?: string | undefined; readonly credential?: string | undefined }
+}
+
+export const DEFAULT_DEEPGRAM_MODEL = "flux-general-en"
+
+/** A hearer's `hearing` as the pool keys it. */
+export const sttSpecOf = (hearing: AssistantHearing, shared: SttShared = {}): SttSpec => {
+  const stream: SttStreamSpec = {
+    eagerSilenceMs: hearing.eagerSilenceMs,
+    finalSilenceMs: hearing.finalSilenceMs,
+    minSpeechMs: hearing.minSpeechMs,
+    vadThreshold: hearing.vadThreshold,
+    agc: hearing.agc,
+    agcMaxGainDb: hearing.agcMaxGainDb,
+    eotThreshold: hearing.deepgram.eotThreshold,
+    eagerEotThreshold: hearing.deepgram.eagerEotThreshold,
+    eotTimeoutMs: hearing.deepgram.eotTimeoutMs
+  }
+  if (hearing.engine === "deepgram") {
+    const d = shared.deepgram ?? {}
+    return {
+      engine: "deepgram",
+      model: d.model === undefined || d.model === "" ? DEFAULT_DEEPGRAM_MODEL : d.model,
+      language: "",
+      address: d.address === undefined || d.address === "" ? DeepgramStt.DEFAULT_URL : d.address,
+      ...(d.credential !== undefined ? { credential: d.credential } : {}),
+      stream
+    }
+  }
+  const model = SherpaStt.resolvePresetName(hearing.model) ?? hearing.model
+  const preset = SherpaStt.isPresetName(model) ? SherpaStt.presets[model] : undefined
+  return {
+    engine: "sherpa",
+    model,
+    language: preset !== undefined && SherpaStt.takesLanguage(preset) ? hearing.language : "",
+    ...(shared.modelDir !== undefined && shared.modelDir !== "" ? { modelDir: shared.modelDir } : {}),
+    ...(shared.threads !== undefined ? { threads: shared.threads } : {}),
+    stream
+  }
+}
+
+/** `SttKey` (docs/ASSISTANTS.md §3.2): engine + (sherpa: model + language + modelDir + threads | deepgram: model + address). */
+export const sttKeyOf = (spec: SttSpec): string =>
+  spec.engine === "deepgram"
+    ? ["deepgram", spec.model, shownAddress(spec.address ?? DeepgramStt.DEFAULT_URL)].join("|")
+    : ["sherpa", spec.model, spec.language === "" ? "-" : spec.language, spec.modelDir ?? SherpaStt.defaultModelDir, spec.threads === undefined ? "default threads" : `${spec.threads} threads`].join("|")
+
+const sttIdentityOf = (spec: SttSpec): string => `${sttKeyOf(spec)}\u0000${spec.address ?? ""}\u0000${spec.credential ?? ""}`
+
+const sherpaPresetOf = (spec: SttSpec): SherpaStt.Preset | undefined =>
+  spec.engine === "sherpa" && SherpaStt.isPresetName(spec.model) ? SherpaStt.presets[spec.model] : undefined
+
+export const sttLabelOf = (spec: SttSpec): string => {
+  if (spec.engine === "deepgram") return `Speech recognition Deepgram ${spec.model}`
+  const preset = sherpaPresetOf(spec)
+  return `Speech model ${preset?.label ?? spec.model}${spec.language === "" ? "" : ` (${spec.language})`}`
+}
+
+/** The measured memory of a local speech model (WP-0, `presets.ts` `ramMb`); hosted: none. */
+export const sttRamMbOf = (spec: SttSpec): number | undefined => sherpaPresetOf(spec)?.ramMb
+
+/** The measured load time of a local speech model (WP-0, `presets.ts` `loadMs`). */
+export const sttLoadMsOf = (spec: SttSpec): number | undefined => sherpaPresetOf(spec)?.loadMs
+
+/** One recogniser instance: a loaded model (or a hosted configuration), heard by streams with their own options. */
+export interface Recogniser {
+  /** An `Stt` whose streams use these options (cheap: nothing is loaded). */
+  readonly forStream: (stream: SttStreamSpec) => Stt["Service"]
+  /** Called once if the instance dies (a worker crash). Optional: hosted recognisers have nothing to die. */
+  readonly onFailure?: (listener: (problem: string) => void) => void
+}
+
+/** Builds one recogniser instance in the scope it is given (closed when the pool releases it). */
+export type SttBuilder = (spec: SttSpec) => Effect.Effect<Recogniser, ResourceBuildError, Scope.Scope>
+
+/** stt-sherpa's options for the worker of `spec` and the stream options `stream`. */
+export const sherpaOptionsOf = (spec: SttSpec, stream: SttStreamSpec): SherpaStt.SherpaSttOptions => ({
+  model: spec.model as SherpaStt.PresetName,
+  ...(spec.modelDir !== undefined ? { modelDir: spec.modelDir } : {}),
+  ...(spec.threads !== undefined ? { threads: spec.threads } : {}),
+  ...(spec.language !== "" ? { language: spec.language } : {}),
+  ...sherpaStreamOf(stream)
+})
+
+const sherpaStreamOf = (stream: SttStreamSpec): SherpaStt.SherpaStreamOptions => ({
+  eagerSilenceMs: stream.eagerSilenceMs,
+  finalSilenceMs: stream.finalSilenceMs,
+  minSpeechMs: stream.minSpeechMs,
+  vadThreshold: stream.vadThreshold,
+  agc: stream.agc ? { maxGainDb: stream.agcMaxGainDb } : false
+})
+
+/**
+ * The recognisers of serve mode. On this machine (stt-sherpa): the shared worker of the key (`SherpaStt.acquire`:
+ * one loaded model per key, whoever asks), each stream with its hearer's timing, VAD and gain. A worker of the same
+ * key that was left behind (a native decode that did not finish) is waited for before a new one loads (the orphan
+ * rule, per key); a worker that dies marks the instance failed. Deepgram: one connection per stream, as before,
+ * with the shared key and address (`configProvider()`) and the stream's confidences.
+ */
+export const defaultSttBuilder = (
+  configProvider: () => ConfigProvider.ConfigProvider,
+  /** Tests: the worker script of stt-sherpa (a stand-in without a model). */
+  script?: SherpaStt.WorkerScript
+): SttBuilder => (spec) =>
+  Effect.gen(function*() {
+    if (spec.engine === "deepgram") {
+      const apiKey = yield* Effect.gen(function*() {
+        return yield* Config.Redacted("DEEPGRAM_API_KEY")
+      }).pipe(
+        Effect.provideService(ConfigProvider.ConfigProvider, configProvider()),
+        Effect.mapError((e) => new ResourceBuildError({ message: describeStartFailure(e) }))
+      )
+      return {
+        forStream: (stream) =>
+          DeepgramStt.make({
+            apiKey,
+            model: spec.model,
+            ...(spec.address !== undefined ? { url: spec.address } : {}),
+            eotThreshold: stream.eotThreshold,
+            eagerEotThreshold: stream.eagerEotThreshold,
+            eotTimeoutMs: stream.eotTimeoutMs
+          })
+      } satisfies Recogniser
+    }
+    if (!SherpaStt.isPresetName(spec.model)) return yield* new ResourceBuildError({ message: `There is no speech model "${spec.model}".` })
+    const options = sherpaOptionsOf(spec, spec.stream)
+    const key = SherpaStt.workerKey(options, script)
+    const waitForOrphan = Effect.suspend(() =>
+      SherpaStt.orphans(key) === 0 ? Effect.void : Effect.andThen(
+        Effect.logWarning(`The previous ${spec.model} speech model has not shut down yet; it is loaded again once it has.`),
+        Effect.promise(() => SherpaStt.whenNoOrphans(key))
+      )
+    )
+    yield* waitForOrphan
+    // A worker of this key still stopping may be left behind as the load starts: wait for it once more, then load.
+    const shared = yield* SherpaStt.acquire(options, script).pipe(
+      Effect.catch((e) => (SherpaStt.isOrphanedMessage(e.message) ? Effect.andThen(waitForOrphan, SherpaStt.acquire(options, script)) : Effect.fail(e))),
+      Effect.mapError((e) => new ResourceBuildError({ message: e.message }))
+    )
+    return {
+      forStream: (stream) => shared.forStream(sherpaStreamOf(stream)),
+      onFailure: (listener) => void shared.onFailure((e) => listener(e.message))
+    } satisfies Recogniser
+  })
+
 // ---- The pool
 
 /** How long an instance nobody uses any more is kept (turns still running on it finish). docs/ASSISTANTS.md §1.2. */
@@ -280,10 +466,17 @@ export interface ResourcePoolOptions {
   readonly buildLlm: LlmBuilder
   /** Builds voices. Default: none (a voice then fails with "Voices are not available"). */
   readonly buildTts?: TtsBuilder
+  /** Builds recognisers. Default: none (a recogniser then fails with "Speech recognition is not available"). */
+  readonly buildStt?: SttBuilder
   /** Default `RESOURCE_GRACE_MS`. */
   readonly graceMs?: number
   /** Something in `status()` changed (a build settled, an instance was released, who uses what). */
   readonly onChange?: () => void
+  /**
+   * The bindings may have changed (after every reconcile, build and failure): what `sttFor` answers for a place may be
+   * different, also when the status is not (changed stream options).
+   */
+  readonly onRebind?: () => void
   /** Reword a build problem for the owner (a key that is locked away). */
   readonly explainProblem?: (message: string) => string
   readonly log?: (line: string) => void
@@ -299,6 +492,24 @@ export interface ReconcileOptions {
   readonly rebuild?: boolean
   /** The voice of each assistant in use (`ttsSpecOf`). Default: none. */
   readonly voices?: ReadonlyMap<string, TtsSpec>
+  /**
+   * The recogniser of every hearing place (docs/ASSISTANTS.md §2.6 "The device's recogniser"): by place
+   * (`device:<id>`, or `type:<kind>` for a type's defaults and the sessions that follow them), the hearing spec of its
+   * hearer (`sttSpecOf`) and who that hearer is (the status's `usedBy`). Default: none.
+   */
+  readonly recognisers?: ReadonlyMap<string, { readonly spec: SttSpec; readonly hearer: string }>
+}
+
+/** What a hearing place is bound to (`ResourcePool.sttFor`). */
+export interface SttBinding {
+  /** Changes with every new instance and with the stream options: a session restarts its stream when it changes. */
+  readonly id: string
+  readonly key: string
+  /** The `Stt` of this place: the instance with the place's stream options. */
+  readonly stt: Stt["Service"]
+  readonly spec: SttSpec
+  readonly state: "starting" | "ready" | "failed"
+  readonly problem?: string
 }
 
 export interface ResourcePool {
@@ -333,10 +544,19 @@ export interface ResourcePool {
   readonly ttsReady: (assistant: string) => Effect.Effect<void>
   /** The key of the voice `assistant` uses now. */
   readonly ttsKeyFor: (assistant: string) => string | undefined
+  /**
+   * The recogniser a hearing place (`ReconcileOptions.recognisers`) hears with now: the ready instance for its spec,
+   * else the one it used before while the new one is built (a device keeps hearing during a model load), else the one
+   * being built (its streams wait for it). A failed instance fails every stream with its problem (an `SttError`).
+   * `undefined`: the place has no recogniser (no hearer, or not reconciled yet).
+   */
+  readonly sttFor: (place: string) => SttBinding | undefined
   readonly status: () => ReadonlyArray<ResourceInfo>
 }
 
 interface Entry<Spec, Svc> {
+  /** Unique per instance (a rebuild of the same identity is a new instance). */
+  readonly serial: number
   readonly spec: Spec
   readonly key: string
   readonly identity: string
@@ -362,11 +582,19 @@ interface KindConfig<Spec, Svc> {
   readonly keyOf: (spec: Spec) => string
   /** The service every user of `entry` gets. */
   readonly wrap: (entry: Entry<Spec, Svc>, release: () => void) => Svc
-  readonly describe: (spec: Spec) => { readonly kind: ResourceInfo["kind"]; readonly label: string; readonly location: "local" | "hosted" }
+  readonly describe: (spec: Spec) => { readonly kind: ResourceInfo["kind"]; readonly label: string; readonly location: "local" | "hosted"; readonly ramMb?: number }
+  /**
+   * Called once the instance is ready, with a way to mark it failed later (a recogniser whose worker died): it is
+   * then offered with its problem, as one that failed to build, until it is built again (`retryFailed`).
+   */
+  readonly afterBuild?: (entry: Entry<Spec, Svc>, fail: (problem: string) => void) => void
+  /** Who the status names as users (`usedBy`): the users themselves by default. */
+  readonly usedByOf?: (users: ReadonlyArray<string>) => ReadonlyArray<string>
 }
 
 interface PoolHooks {
   readonly graceMs: number
+  readonly rebound: () => void
   readonly runFork: (effect: Effect.Effect<void>) => unknown
   readonly closing: () => boolean
   readonly changed: () => void
@@ -383,10 +611,12 @@ const makeKind = <Spec, Svc>(config: KindConfig<Spec, Svc>, hooks: PoolHooks) =>
   const current = new Map<string, Entry<Spec, Svc>>()
   /** Every instance not closed yet (the newest and those still kept for a running turn). */
   const alive = new Set<Entry<Spec, Svc>>()
-  /** The instance each assistant in use is bound to. */
+  /** The instance each assistant in use is bound to, and the spec it wanted when it was bound. */
   const bound = new Map<string, Entry<Spec, Svc>>()
+  const boundSpec = new Map<string, Spec>()
   /** The assistants in use and the spec each one wants. */
   let wanted = new Map<string, Spec>()
+  let serials = 0
 
   const close = (entry: Entry<Spec, Svc>) => {
     if (entry.closed) return
@@ -407,6 +637,7 @@ const makeKind = <Spec, Svc>(config: KindConfig<Spec, Svc>, hooks: PoolHooks) =>
 
   const makeEntry = (spec: Spec): Entry<Spec, Svc> => {
     const entry: Entry<Spec, Svc> = {
+      serial: ++serials,
       spec,
       key: config.keyOf(spec),
       identity: config.identityOf(spec),
@@ -434,7 +665,15 @@ const makeKind = <Spec, Svc>(config: KindConfig<Spec, Svc>, hooks: PoolHooks) =>
 
   /** Bind every assistant to the best instance for it; schedule the release of what nobody uses. */
   const rebind = () => {
-    for (const assistant of [...bound.keys()]) if (!wanted.has(assistant)) bound.delete(assistant)
+    bindAll()
+    hooks.rebound()
+  }
+  const bindAll = () => {
+    for (const assistant of [...bound.keys()]) {
+      if (wanted.has(assistant)) continue
+      bound.delete(assistant)
+      boundSpec.delete(assistant)
+    }
     for (const [assistant, spec] of wanted) {
       const target = current.get(config.identityOf(spec))
       if (target === undefined) continue
@@ -442,6 +681,7 @@ const makeKind = <Spec, Svc>(config: KindConfig<Spec, Svc>, hooks: PoolHooks) =>
       // Building: keep what the assistant used before (its turns keep answering) until the new one has settled.
       if (target.state === "starting" && before !== undefined && before !== target && !before.closed) continue
       bound.set(assistant, target)
+      boundSpec.set(assistant, spec)
     }
     for (const entry of alive) {
       const used = usersOf(entry).length > 0
@@ -483,6 +723,15 @@ const makeKind = <Spec, Svc>(config: KindConfig<Spec, Svc>, hooks: PoolHooks) =>
               entry.inner = exit.value
               entry.state = "ready"
               hooks.log(`${config.name} ready: ${entry.key}`)
+              config.afterBuild?.(entry, (problem) => {
+                if (entry.closed || entry.state === "failed") return
+                entry.state = "failed"
+                entry.problem = problem
+                hooks.log(`${config.name} failed: ${entry.key}: ${problem}`)
+                if (hooks.closing()) return
+                rebind()
+                hooks.changed()
+              })
             } else {
               const failure = Cause.squash(exit.cause)
               entry.state = "failed"
@@ -528,6 +777,13 @@ const makeKind = <Spec, Svc>(config: KindConfig<Spec, Svc>, hooks: PoolHooks) =>
       return undefined
     },
     serviceFor: (assistant: string): Svc | undefined => bound.get(assistant)?.service,
+    /** What `assistant` is bound to: the instance (its serial changes with every new instance) and the spec it wanted. */
+    bindingFor: (assistant: string): { readonly service: Svc; readonly key: string; readonly serial: number; readonly spec: Spec; readonly state: Entry<Spec, Svc>["state"]; readonly problem?: string } | undefined => {
+      const entry = bound.get(assistant)
+      const spec = boundSpec.get(assistant)
+      if (entry === undefined || spec === undefined) return undefined
+      return { service: entry.service, key: entry.key, serial: entry.serial, spec, state: entry.state, ...(entry.problem !== undefined ? { problem: entry.problem } : {}) }
+    },
     keyFor: (assistant: string): string | undefined => bound.get(assistant)?.key,
     settledFor: (assistant: string): Effect.Effect<void> => Effect.suspend(() => {
       const entry = bound.get(assistant)
@@ -535,13 +791,14 @@ const makeKind = <Spec, Svc>(config: KindConfig<Spec, Svc>, hooks: PoolHooks) =>
     }),
     info: (): Array<ResourceInfo> =>
       [...alive].map((entry) => {
-        const usedBy = usersOf(entry)
+        const users = usersOf(entry)
+        const usedBy = config.usedByOf === undefined ? users : [...config.usedByOf(users)]
         const problem = entry.problem === undefined ? undefined : hooks.explainProblem(entry.problem)
         return {
           ...config.describe(entry.spec),
           key: entry.key,
           usedBy,
-          state: entry.state === "ready" && usedBy.length === 0 ? "unused" as const : entry.state,
+          state: entry.state === "ready" && users.length === 0 ? "unused" as const : entry.state,
           ...(problem !== undefined ? { problem } : {})
         }
       }),
@@ -556,6 +813,7 @@ const makeKind = <Spec, Svc>(config: KindConfig<Spec, Svc>, hooks: PoolHooks) =>
         alive.clear()
         current.clear()
         bound.clear()
+        boundSpec.clear()
         return Effect.forEach(all, (e) => Scope.close(e.scope, Exit.void), { discard: true })
       })
   }
@@ -597,6 +855,13 @@ export const makeResourcePool = (options: ResourcePoolOptions): Effect.Effect<Re
     }
     const hooks: PoolHooks = {
       graceMs: options.graceMs ?? RESOURCE_GRACE_MS,
+      rebound: () => {
+        try {
+          options.onRebind?.()
+        } catch {
+          // a throwing listener changes nothing here
+        }
+      },
       runFork,
       closing: () => closing,
       changed,
@@ -652,12 +917,39 @@ export const makeResourcePool = (options: ResourcePoolOptions): Effect.Effect<Re
       describe: (spec) => ({ kind: "tts", label: ttsLabelOf(spec), location: ttsLocationOf(spec) })
     }, hooks)
 
-    const statusNow = (): Array<ResourceInfo> => [...llms.info(), ...voices.info()]
+    /** Who hears with each place's recogniser (the status names hearers, not places). */
+    let hearers = new Map<string, string>()
+    const recognisers = makeKind<SttSpec, Recogniser>({
+      name: "Speech recogniser",
+      build: options.buildStt ?? (() => Effect.fail(new ResourceBuildError({ message: "Speech recognition is not available." }))),
+      identityOf: sttIdentityOf,
+      keyOf: sttKeyOf,
+      wrap: (entry, release): Recogniser => ({
+        forStream: (stream) => ({
+          transcribe: (audio) =>
+            Stream.unwrap(Effect.map(Deferred.await(entry.settled), () => {
+              const inner = entry.inner
+              if (inner === undefined || entry.state === "failed") {
+                return Stream.fail(new SttError({ message: entry.problem ?? "The speech recogniser could not start." }))
+              }
+              return counted(entry, release, Stream.suspend(() => inner.forStream(stream).transcribe(audio)))
+            }))
+        })
+      }),
+      describe: (spec) => {
+        const ramMb = sttRamMbOf(spec)
+        return { kind: "stt", label: sttLabelOf(spec), location: spec.engine === "deepgram" ? "hosted" : "local", ...(ramMb !== undefined ? { ramMb } : {}) }
+      },
+      afterBuild: (entry, fail) => entry.inner?.onFailure?.(fail),
+      usedByOf: (places) => [...new Set(places.flatMap((p) => (hearers.has(p) ? [hearers.get(p)!] : [])))]
+    }, hooks)
+
+    const statusNow = (): Array<ResourceInfo> => [...llms.info(), ...voices.info(), ...recognisers.info()]
 
     yield* Effect.addFinalizer(() =>
       Effect.suspend(() => {
         closing = true
-        return Effect.andThen(llms.closeAll(), voices.closeAll())
+        return Effect.andThen(Effect.andThen(llms.closeAll(), voices.closeAll()), recognisers.closeAll())
       })
     )
 
@@ -668,7 +960,13 @@ export const makeResourcePool = (options: ResourcePoolOptions): Effect.Effect<Re
       reconcile: (next, reconcileOptions = {}) =>
         Effect.suspend(() => {
           if (closing) return Effect.void
-          const started = [...llms.reconcile(next, reconcileOptions), ...voices.reconcile(reconcileOptions.voices ?? new Map(), reconcileOptions)]
+          const places = reconcileOptions.recognisers ?? new Map()
+          hearers = new Map([...places].map(([place, { hearer }]) => [place, hearer]))
+          const started = [
+            ...llms.reconcile(next, reconcileOptions),
+            ...voices.reconcile(reconcileOptions.voices ?? new Map(), reconcileOptions),
+            ...recognisers.reconcile(new Map([...places].map(([place, { spec }]) => [place, spec])), reconcileOptions)
+          ]
           changed()
           return awaitAll(started)
         }),
@@ -679,6 +977,18 @@ export const makeResourcePool = (options: ResourcePoolOptions): Effect.Effect<Re
       ttsFor: voices.serviceFor,
       ttsReady: voices.settledFor,
       ttsKeyFor: voices.keyFor,
+      sttFor: (place) => {
+        const b = recognisers.bindingFor(place)
+        if (b === undefined) return undefined
+        return {
+          id: `${b.serial}|${JSON.stringify(b.spec.stream)}`,
+          key: b.key,
+          stt: b.service.forStream(b.spec.stream),
+          spec: b.spec,
+          state: b.state,
+          ...(b.problem !== undefined ? { problem: b.problem } : {})
+        }
+      },
       status: statusNow
     } satisfies ResourcePool
   })

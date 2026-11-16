@@ -63,10 +63,20 @@ describe("startup", () => {
 
 describe("bench", () => {
   it("parses --rounds, --sessions, --stagger and --llm-per-session", () => {
-    assert.deepStrictEqual(parseLiveArgs(["a", "--rounds", "3", "b"]), { rounds: 3, sessions: 1, staggerMs: 0, llmPerSession: false, paths: ["a", "b"] })
-    assert.deepStrictEqual(parseLiveArgs(["a"]), { rounds: 1, sessions: 1, staggerMs: 0, llmPerSession: false, paths: ["a"] })
-    assert.deepStrictEqual(parseLiveArgs(["--sessions", "3", "--stagger", "300", "a"]), { rounds: 1, sessions: 3, staggerMs: 300, llmPerSession: false, paths: ["a"] })
-    assert.deepStrictEqual(parseLiveArgs(["--sessions", "2", "--llm-per-session", "a"]), { rounds: 1, sessions: 2, staggerMs: 0, llmPerSession: true, paths: ["a"] })
+    assert.deepStrictEqual(parseLiveArgs(["a", "--rounds", "3", "b"]), { rounds: 3, sessions: 1, staggerMs: 0, llmPerSession: false, sttModels: [], loadModel: undefined, paths: ["a", "b"] })
+    assert.deepStrictEqual(parseLiveArgs(["a"]), { rounds: 1, sessions: 1, staggerMs: 0, llmPerSession: false, sttModels: [], loadModel: undefined, paths: ["a"] })
+    assert.deepStrictEqual(parseLiveArgs(["--sessions", "3", "--stagger", "300", "a"]), { rounds: 1, sessions: 3, staggerMs: 300, llmPerSession: false, sttModels: [], loadModel: undefined, paths: ["a"] })
+    assert.deepStrictEqual(parseLiveArgs(["--sessions", "2", "--llm-per-session", "a"]), { rounds: 1, sessions: 2, staggerMs: 0, llmPerSession: true, sttModels: [], loadModel: undefined, paths: ["a"] })
+    assert.deepStrictEqual(parseLiveArgs(["--sessions", "2", "--stt-models", "parakeet-v2, nemotron-560", "--load-model", "zipformer-en", "a"]), {
+      rounds: 1,
+      sessions: 2,
+      staggerMs: 0,
+      llmPerSession: false,
+      sttModels: ["parakeet-v2", "nemotron-560"],
+      loadModel: "zipformer-en",
+      paths: ["a"]
+    })
+    assert.match(parseLiveArgs(["--stt-models", ""]) as string, /comma-separated/)
     assert.match(parseLiveArgs(["--sessions", "9"]) as string, /1 to 8/)
     assert.match(parseLiveArgs(["--rounds", "0"]) as string, /positive whole number/)
   })

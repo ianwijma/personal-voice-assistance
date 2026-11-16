@@ -26,17 +26,39 @@ export const collectWavs = (paths: ReadonlyArray<string>): Effect.Effect<Array<s
     catch: (e) => new StartupError({ message: `bench --live: ${e instanceof Error ? e.message : String(e)}` })
   })
 
-/** `[--rounds N] [--sessions N] [--stagger MS] [--llm-per-session] paths...` after `bench --live`. */
+/**
+ * `[--rounds N] [--sessions N] [--stagger MS] [--llm-per-session] [--stt-models A,B,...] [--load-model X] paths...`
+ * after `bench --live`. `--stt-models`: session `i` hears with the `i`-th local model of the list (round robin), each
+ * its own hearer as in serve mode's pool (equal models share one worker; WP-11). `--load-model`: one more local model
+ * is loaded and kept idle for the run (two models loaded, one talking).
+ */
 export const parseLiveArgs = (
   args: ReadonlyArray<string>
-): { rounds: number; sessions: number; staggerMs: number; llmPerSession: boolean; paths: Array<string> } | string => {
+): {
+  rounds: number
+  sessions: number
+  staggerMs: number
+  llmPerSession: boolean
+  sttModels: Array<string>
+  loadModel: string | undefined
+  paths: Array<string>
+} | string => {
   let rounds = 1
   let sessions = 1
   let staggerMs = 0
   let llmPerSession = false
+  let sttModels: Array<string> = []
+  let loadModel: string | undefined
   const paths: Array<string> = []
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--llm-per-session") llmPerSession = true
+    else if (args[i] === "--stt-models") {
+      sttModels = (args[++i] ?? "").split(",").map((m) => m.trim()).filter((m) => m.length > 0)
+      if (sttModels.length === 0) return "--stt-models needs a comma-separated list of speech models"
+    } else if (args[i] === "--load-model") {
+      loadModel = args[++i]
+      if (loadModel === undefined || loadModel === "") return "--load-model needs a speech model"
+    }
     else if (args[i] === "--rounds") {
       const n = Number(args[++i])
       if (!Number.isInteger(n) || n < 1) return "--rounds needs a positive whole number"
@@ -51,7 +73,7 @@ export const parseLiveArgs = (
       staggerMs = n
     } else paths.push(args[i]!)
   }
-  return { rounds, sessions, staggerMs, llmPerSession, paths }
+  return { rounds, sessions, staggerMs, llmPerSession, sttModels, loadModel, paths }
 }
 
 export interface LiveOptions {
@@ -82,6 +104,8 @@ export interface LiveSessionsOptions extends LiveOptions {
    * the environment is shared by every session.
    */
   readonly llmPerSession?: Layer.Layer<Llm, Config.ConfigError>
+  /** Session `i` hears with this recogniser (`--stt-models`). Absent: the one `Stt` of the environment. */
+  readonly sttPerSession?: (session: number) => Stt["Service"]
 }
 
 /** One 20 ms frame (`pacedFrames`). */
@@ -119,7 +143,8 @@ const runLiveSession = (
   barrier: (k: number) => Effect.Effect<void>,
   outputDir: string,
   modules: ModuleSnapshot,
-  label: string
+  label: string,
+  ownStt?: Stt["Service"]
 ): Effect.Effect<Array<BenchRow>, AudioError | StartupError, Stt | Llm | Tts> =>
   Effect.gen(function*() {
     const finished = yield* Queue.unbounded<Trace>()
@@ -130,7 +155,7 @@ const runLiveSession = (
     )
     return yield* Effect.gen(function*() {
       const conversation = yield* Conversation
-      const stt = yield* Stt
+      const stt = ownStt ?? (yield* Stt)
       const tt = yield* TurnTrace
       const rows: Array<BenchRow> = []
       const noiseFloor = options.noiseFloor ?? true
@@ -223,7 +248,8 @@ export const runLiveSessions = (
           barrier,
           n === 1 ? options.outputDir : join(options.outputDir, `s${i + 1}`),
           modules,
-          n === 1 ? "" : `s${i + 1} `
+          n === 1 ? "" : `s${i + 1} `,
+          options.sttPerSession?.(i)
         ).pipe((session) =>
           options.llmPerSession === undefined ? session : Effect.provide(session, options.llmPerSession).pipe(
             Effect.mapError((e) => (e instanceof Config.ConfigError ? new StartupError({ message: `language model: ${describeConfigError(e)}` }) : e))

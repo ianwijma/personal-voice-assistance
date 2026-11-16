@@ -5,12 +5,15 @@ import {
   Llm,
   type RouteConfig,
   routeConfigFromWake,
+  Stt,
+  SttError,
   ToolRegistry,
   TurnTrace,
   type WakeConfig,
   wakeConfigFromProfile
 } from "@pva/core"
 import { DEFAULT_DEVICE_PROFILE } from "@pva/protocol"
+import * as SherpaStt from "@pva/stt-sherpa"
 import { Cause, Config, Effect, Layer, Logger, Stream } from "effect"
 import { resolve } from "node:path"
 import * as readline from "node:readline"
@@ -165,7 +168,8 @@ const bench = (args: ReadonlyArray<string>) =>
       return
     }
     if (args[0] === "--live") {
-      const usage = "Usage: bench --live [--rounds N] [--sessions N] [--stagger MS] [--llm-per-session] <wav files or directories> (16 kHz mono)"
+      const usage = "Usage: bench --live [--rounds N] [--sessions N] [--stagger MS] [--llm-per-session] [--stt-models A,B] [--load-model X] " +
+        "<wav files or directories> (16 kHz mono)"
       const parsed = parseLiveArgs(args.slice(1))
       if (typeof parsed === "string") return yield* new StartupError({ message: `${parsed}. ${usage}` })
       const once = yield* collectWavs(parsed.paths.map((p) => resolve(userCwd, p)))
@@ -182,22 +186,42 @@ const bench = (args: ReadonlyArray<string>) =>
       const llmLabel = llmProvider === "fake"
         ? `fake LLM: 1st token ${delays.llmFirstTokenMs} ms, ${delays.llmTokensPerSecond} tok/s`
         : `LLM ${llmProvider}`
+      // `--stt-models`: each session its own local recogniser (the pool's sharing: equal models share a worker);
+      // the environment's recogniser is then not loaded.
+      const ownStt = parsed.sttModels.length > 0
       const providers = yield* buildProviders([
         voice.stage,
         { stage: "language model (LLM_PROVIDER)", layer: llm },
-        { stage: "speech-to-text (STT_PROVIDER)", layer: SttLayer }
+        ownStt
+          ? { stage: "speech-to-text (--stt-models)", layer: Layer.succeed(Stt, Stt.of({ transcribe: () => Stream.fail(new SttError({ message: "unused" })) })) }
+          : { stage: "speech-to-text (STT_PROVIDER)", layer: SttLayer }
       ])
+      const sttOptions = yield* SherpaStt.optionsConfig
+      const sessionStts: Array<Stt["Service"]> = []
+      for (const model of parsed.sttModels) {
+        const name = SherpaStt.resolvePresetName(model)
+        if (name === undefined) return yield* new StartupError({ message: `--stt-models: unknown speech model "${model}"` })
+        sessionStts.push(yield* SherpaStt.make({ ...sttOptions, model: name }).pipe(Effect.mapError((e) => new StartupError({ message: e.message }))))
+      }
+      if (parsed.loadModel !== undefined) {
+        const name = SherpaStt.resolvePresetName(parsed.loadModel)
+        if (name === undefined) return yield* new StartupError({ message: `--load-model: unknown speech model "${parsed.loadModel}"` })
+        yield* SherpaStt.acquire({ ...sttOptions, model: name }).pipe(Effect.mapError((e) => new StartupError({ message: e.message })))
+      }
       const settings = yield* AppConfig
       const modules = yield* startCliModules()
       const conversation = { ...settings, systemPrompt: withModuleInstructions(settings.systemPrompt, modules.instructions) }
       const { sessions, staggerMs, llmPerSession } = parsed
       // `--llm-per-session`: one language-model instance per session (serve mode's pool with two different settings).
       const ownLlm = llmPerSession ? { llmPerSession: llm } : {}
-      const perSession = yield* runLiveSessions({ files, outputDir, conversation, modules, sessions, staggerMs, ...ownLlm }).pipe(
+      const perStt = ownStt ? { sttPerSession: (i: number) => sessionStts[i % sessionStts.length]! } : {}
+      const perSession = yield* runLiveSessions({ files, outputDir, conversation, modules, sessions, staggerMs, ...ownLlm, ...perStt }).pipe(
         Effect.provide(withVoiceTrace(providers, voice.ref))
       )
       const together = (sessions === 1 ? "" : `, ${sessions} sessions, user audio ends ${staggerMs === 0 ? "at the same moment" : `${staggerMs} ms apart`}`) +
-        (llmPerSession ? ", one LLM instance per session" : "")
+        (llmPerSession ? ", one LLM instance per session" : "") +
+        (ownStt ? `, speech models per session ${parsed.sttModels.join(",")} (${SherpaStt.workers()} loaded)` : "") +
+        (parsed.loadModel !== undefined ? `, ${parsed.loadModel} loaded idle` : "")
       for (const [i, rows] of perSession.entries()) {
         const which = sessions === 1 ? "" : ` — session ${i + 1} of ${sessions}`
         console.log(formatReport(`live: ${files.length} turns, ${llmLabel}${together}, replies in ${outputDir}${which}`, rows, {

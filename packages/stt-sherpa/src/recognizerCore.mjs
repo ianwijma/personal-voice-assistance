@@ -177,7 +177,7 @@ export const makeRecognizerCore = (deps) => {
    * One voice session's state (its own VAD, AGC, turn audio, segments, pre-roll): everything but the models and the
    * decode queue, which all sessions share.
    */
-  const openSession = (session, vad, agc) => {
+  const openSession = (session, vad, agc, prerollMs) => {
     // ---- Session state ----
 
     /** Set once the session has ended: its results are dropped, its queued decodes never run. */
@@ -188,7 +188,7 @@ export const makeRecognizerCore = (deps) => {
     let fill = 0
     let carry = -1 // low byte of a sample split across two chunks
     // Recent frames (after the AGC), fed to the recogniser when speech starts (covers the VAD's onset lag).
-    const prerollFrames = Math.max(1, Math.round(config.prerollMs / FRAME_MS))
+    const prerollFrames = Math.max(1, Math.round(prerollMs / FRAME_MS))
     const ring = Array.from({ length: prerollFrames }, () => ({ frame: new Float32Array(FRAME), index: -1, speech: false }))
     let ringPos = 0
     let ringCount = 0
@@ -663,41 +663,65 @@ export const makeRecognizerCore = (deps) => {
 
   // ---- Sessions ----
   //
-  // Each voice session has its own VAD and AGC. VADs are reused: a session that ends gives its VAD back (reset), so
-  // the one loaded at startup serves the first session as before, and a new one is created only while more
-  // sessions are open at once than ever before.
+  // Each voice session has its own VAD and AGC, made with that session's options (`open`'s `options`: VAD
+  // threshold, gain control, pre-roll; docs/ASSISTANTS.md §3.2: per stream, so two hearers on one model with
+  // different microphone settings share the worker). VADs and AGCs are reused per set of options: a session that
+  // ends gives its VAD back (reset), so the one loaded at startup serves the first session with the default
+  // threshold as before, and a new one is created only while more sessions with those options are open at once
+  // than ever before.
 
   /** Open sessions by id. */
   const sessions = new Map()
-  const idleVads = deps.vad ? [deps.vad] : []
-  const idleAgcs = deps.agc ? [deps.agc] : []
-  const takeVad = () => {
-    const vad = idleVads.pop() ?? deps.makeVad?.()
+  const defaultThreshold = config.vad?.threshold
+  /** Idle VADs by threshold, idle AGCs by their options. */
+  const idleVads = new Map()
+  const idleAgcs = new Map()
+  const idle = (pool, key) => {
+    let list = pool.get(key)
+    if (!list) {
+      list = []
+      pool.set(key, list)
+    }
+    return list
+  }
+  if (deps.vad) idle(idleVads, String(defaultThreshold)).push(deps.vad)
+  if (deps.agc) idle(idleAgcs, JSON.stringify(config.agc ?? {})).push(deps.agc)
+  const takeVad = (threshold) => {
+    const vad = idle(idleVads, String(threshold)).pop() ?? deps.makeVad?.(threshold)
     if (!vad) throw new Error("No voice-activity detector for another session (makeVad not given)")
     return vad
   }
-  const takeAgc = () => idleAgcs.pop() ?? deps.makeAgc?.()
+  const takeAgc = (options) => idle(idleAgcs, JSON.stringify(options)).pop() ?? deps.makeAgc?.(options)
+
+  /** A session's options: what `open` says, else the worker's configuration (the protocol before per-stream options). */
+  const sessionOptions = (options) => {
+    const threshold = typeof options?.vadThreshold === "number" ? options.vadThreshold : defaultThreshold
+    const agc = options === undefined || !("agc" in options) ? config.agc : options.agc
+    const prerollMs = typeof options?.prerollMs === "number" ? options.prerollMs : config.prerollMs
+    return { threshold, agc: agc === false || agc === undefined || agc === null ? false : agc, prerollMs }
+  }
 
   const endSession = (id) => {
     const s = sessions.get(id)
     if (!s) return
     sessions.delete(id)
-    s.end()
-    s.vad.reset()
-    idleVads.push(s.vad)
-    if (s.agc) {
-      s.agc.reset()
-      idleAgcs.push(s.agc)
+    s.state.end()
+    s.state.vad.reset()
+    idle(idleVads, String(s.threshold)).push(s.state.vad)
+    if (s.state.agc) {
+      s.state.agc.reset()
+      idle(idleAgcs, JSON.stringify(s.agc)).push(s.state.agc)
     }
   }
 
-  const openSessionById = (id) => {
+  const openSessionById = (id, options) => {
     endSession(id)
-    const vad = takeVad()
+    const o = sessionOptions(options)
+    const vad = takeVad(o.threshold)
     vad.reset()
-    const agc = takeAgc()
+    const agc = o.agc === false ? undefined : takeAgc(o.agc)
     agc?.reset()
-    sessions.set(id, openSession(id, vad, agc))
+    sessions.set(id, { state: openSession(id, vad, agc, o.prerollMs), threshold: o.threshold, agc: o.agc })
   }
 
   const onMessage = (message) => {
@@ -710,15 +734,15 @@ export const makeRecognizerCore = (deps) => {
         return
       }
       if (closing) return
-      if (message.type === "open") return openSessionById(message.session)
+      if (message.type === "open") return openSessionById(message.session, message.options)
       if (message.type === "end") return endSession(message.session)
       if (message.type === "reset") {
         // One session at a time (the protocol before several sessions): every other session ends.
         for (const id of [...sessions.keys()]) endSession(id)
-        if (message.session > 0) openSessionById(message.session)
+        if (message.session > 0) openSessionById(message.session, message.options)
         return
       }
-      const s = sessions.get(message.session)
+      const s = sessions.get(message.session)?.state
       if (!s) return
       if (message.type === "audio") s.onAudio(message.buffer)
       else if (message.type === "finalize") s.onFinalize(message.frame, message.through === true)
@@ -736,7 +760,7 @@ export const makeRecognizerCore = (deps) => {
       let retainedStreamingFrames = 0
       let pieces = 0
       for (const s of sessions.values()) {
-        const i = s.inspect()
+        const i = s.state.inspect()
         retainedStreamingFrames += i.retainedStreamingFrames
         pieces += i.pieces
       }

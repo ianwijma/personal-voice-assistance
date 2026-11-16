@@ -1,21 +1,21 @@
-import { type HostResult, type Llm, Stt, type Tts, type VoiceRef } from "@pva/core"
+import { type HostResult, type Llm, type Stt, type Tts, type VoiceRef } from "@pva/core"
 import type { EngineInfo, EngineStatus, ResourceInfo, VoiceInfo } from "@pva/protocol"
 import * as SherpaStt from "@pva/stt-sherpa"
-import { Cause, Config, ConfigProvider, Context, Deferred, Effect, Exit, Fiber, FiberSet, Schema, type Scope } from "effect"
+import { Cause, type Config, ConfigProvider, Deferred, Effect, Exit, Fiber, FiberSet, Schema, type Scope } from "effect"
 import { AppConfig } from "../config.ts"
-import { SttLayer } from "../providers.ts"
-import { buildStages } from "../startup.ts"
 
 /**
- * The shared engines of serve mode (docs/UI-AND-MODULES.md §1.7, §4.5; docs/VOICE-SESSIONS.md §2): the provider
- * that is still one shared build (speech-to-text), in one scope that can be rebuilt in-process (`reload`,
- * the full reload of docs/ASSISTANTS.md §3.2) while the HTTP server, the sockets, the module host and the voice
- * sessions stay; and the engine status, which also lists the resource pool's resources (`EngineOptions.resources`).
- * The language models and the voices are the pool's (`Resources.ts`, WP-9 and WP-10): built per assistant
- * configuration and switched at a turn start, never by this build. It owns no conversation: every voice session
- * attaches its loop (`attach`), which runs on each build and is stopped (keeping that session's history) when the
- * build ends. A build failure becomes `state: "failed"` with per-stage problems instead of exiting, so settings stay
- * editable from the UI.
+ * The engine of serve mode (docs/UI-AND-MODULES.md §1.7, §4.5; docs/VOICE-SESSIONS.md §2; docs/ASSISTANTS.md §3.2):
+ * since WP-11 it holds no provider. The language models, the voices and the recognisers are the resource pool's
+ * (`Resources.ts`): built per configuration, and switched at a turn start (models, voices) or at the next silence
+ * (a device's recogniser), never by this build. What remains is the **full reload** of §3.2 (the owner's Reload
+ * button, and the reload that model directories and thread counts ask for): a scope that can be rebuilt in-process
+ * (`reload`) while the HTTP server, the sockets, the module host and the voice sessions stay, which stops every
+ * session's loop (keeping its history), rebuilds the pool's resources in use (`EngineOptions.resources.rebuild`) and
+ * starts the loops again; and the engine status, which lists the pool's resources (`EngineStatus.resources`). It owns
+ * no conversation: every voice session attaches its loop (`attach`), which runs on each build and is stopped when
+ * the build ends. A build failure becomes `state: "failed"` with per-stage problems instead of exiting, so settings
+ * stay editable from the UI.
  */
 
 export class EngineBuildProblems extends Schema.TaggedError<EngineBuildProblems>()("EngineBuildProblems", {
@@ -29,7 +29,11 @@ export interface EngineProviders {
    * it, unless `ServeOptions.buildLlm` is given). The real builder leaves it out: language models are the pool's.
    */
   readonly llm?: Llm["Service"]
-  readonly stt: Stt["Service"]
+  /**
+   * Tests only: one recogniser for every hearing place (serve mode's pool then hands out instances that hear with it,
+   * unless `ServeOptions.buildStt` is given). The real builder leaves it out: recognisers are the pool's (WP-11).
+   */
+  readonly stt?: Stt["Service"]
   /**
    * Tests only: one voice for every assistant (serve mode's pool then hands out instances that speak with it, unless
    * `ServeOptions.buildTts` is given), and which voice it is. The real builder leaves both out: voices are the pool's.
@@ -47,46 +51,17 @@ export type ProviderBuilder = Effect.Effect<EngineProviders, EngineBuildProblems
 const read = <A>(config: Config.Config<A>): Effect.Effect<A, Config.ConfigError> => Effect.gen(function*() {
   return yield* config
 })
-const configValue = <A>(config: Config.Config<A>, fallback: A): Effect.Effect<A> => Effect.orElseSucceed(read(config), () => fallback)
 
-/** The shared providers selected by the settings (STT). The language models and the voices are the pool's. */
+/**
+ * The build of the real engines: nothing but the tool rounds' fallback (each assistant's `toolRounds` wins). The
+ * language models, the voices and the recognisers are the pool's; serve mode adds their rows to the status
+ * (`EngineOptions.describeEngines`).
+ */
 export const defaultProviderBuilder: ProviderBuilder = Effect.gen(function*() {
   const settings = yield* read(AppConfig).pipe(
     Effect.mapError((e) => new EngineBuildProblems({ problems: [{ stage: "conversation", message: e.message }] }))
   )
-  const { context, problems } = yield* buildStages([{ stage: "speech-to-text (STT_PROVIDER)", layer: SttLayer }])
-  if (problems.length > 0) return yield* new EngineBuildProblems({ problems })
-
-  const sttProvider = yield* configValue(Config.String("STT_PROVIDER"), "sherpa")
-  // No `llm` or `tts` row: serve mode adds those from the pool (`EngineOptions.describeEngines`).
-  const engines: Array<EngineInfo> = [
-    {
-      stage: "stt",
-      provider: sttProvider,
-      detail: sttProvider === "deepgram"
-        ? yield* configValue(Config.String("DEEPGRAM_MODEL"), "flux-general-en")
-        : yield* configValue(Config.String("STT_SHERPA_MODEL"), SherpaStt.DEFAULT_PRESET),
-      location: sttProvider === "deepgram" ? "hosted" : "local"
-    }
-  ]
-  return {
-    stt: Context.get(context as Context.Context<Stt>, Stt),
-    maxToolRounds: settings.maxToolRounds,
-    engines,
-    voiceInfo: []
-  }
-})
-
-/**
- * Cheap checks that can fail a reload before the running engines are stopped: a recogniser whose model
- * files are missing (the error names the download command) leaves the previous one running.
- */
-export const defaultPreflight: Effect.Effect<void, EngineBuildProblems> = Effect.gen(function*() {
-  const sttProvider = yield* configValue(Config.String("STT_PROVIDER"), "sherpa")
-  if (sttProvider !== "sherpa") return
-  yield* SherpaStt.checkConfig.pipe(
-    Effect.mapError((e) => new EngineBuildProblems({ problems: [{ stage: "speech-to-text (STT_PROVIDER)", message: e.message }] }))
-  )
+  return { maxToolRounds: settings.maxToolRounds, engines: [], voiceInfo: [] }
 })
 
 export interface EngineOptions {
@@ -203,7 +178,8 @@ export const makeEngine = (options: EngineOptions): Effect.Effect<Engine, never,
     let loopFailed: Deferred.Deferred<Cause.Cause<unknown>> | undefined
 
     const view = (s: EngineStatus): EngineStatus => {
-      const described = options.describeEngines === undefined || s.engines.length === 0 ? s : { ...s, engines: options.describeEngines(s.engines) }
+      // The pool's rows (models, voices, recognisers) are added while the engines run, though the build has none.
+      const described = options.describeEngines === undefined || (s.engines.length === 0 && s.state !== "ready") ? s : { ...s, engines: options.describeEngines(s.engines) }
       if (options.resources === undefined) return described
       const pooled = options.resources.voices?.() ?? []
       const voices = pooled.length > 0 ? pooled : s.voices

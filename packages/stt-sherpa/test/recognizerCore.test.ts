@@ -210,6 +210,47 @@ describe("recognizerCore, several sessions on one model", () => {
   })
 })
 
+describe("recognizerCore, per-stream options (docs/ASSISTANTS.md §3.2)", () => {
+  it("each session's VAD threshold and gain options are its own; detectors and gain controls are reused per option set", () => {
+    const vadsMade: Array<number> = []
+    const agcsMade: Array<string> = []
+    const posted: Array<any> = []
+    const config = { ...offlineConfig, vad: { threshold: 0.5 }, agc: {} }
+    const core = makeRecognizerCore({
+      config,
+      offline: fakeOffline({ text: "x" }),
+      vad: fakeVad(),
+      makeVad: (threshold: number) => {
+        vadsMade.push(threshold)
+        return fakeVad()
+      },
+      makeAgc: (options: unknown) => {
+        agcsMade.push(JSON.stringify(options))
+        return { process: () => {}, reset: () => {}, gainDb: () => 0 }
+      },
+      post: (m: any) => posted.push(m)
+    })
+    // The startup VAD (threshold 0.5) serves the first session with the default.
+    core.onMessage({ type: "open", session: 1, options: { vadThreshold: 0.5, agc: false, prerollMs: 400 } })
+    core.onMessage({ type: "open", session: 2, options: { vadThreshold: 0.7, agc: { maxGainDb: 12 }, prerollMs: 200 } })
+    core.onMessage({ type: "open", session: 3, options: { vadThreshold: 0.7, agc: { maxGainDb: 30 }, prerollMs: 400 } })
+    assert.deepStrictEqual(vadsMade, [0.7, 0.7])
+    assert.deepStrictEqual(agcsMade, [JSON.stringify({ maxGainDb: 12 }), JSON.stringify({ maxGainDb: 30 })])
+    // Ended sessions give theirs back for the next session with the same options.
+    core.onMessage({ type: "end", session: 2 })
+    core.onMessage({ type: "open", session: 4, options: { vadThreshold: 0.7, agc: { maxGainDb: 12 }, prerollMs: 400 } })
+    assert.deepStrictEqual(vadsMade, [0.7, 0.7])
+    assert.strictEqual(agcsMade.length, 2)
+    // No options: the worker's configuration (the protocol before per-stream options).
+    core.onMessage({ type: "end", session: 1 })
+    core.onMessage({ type: "open", session: 5 })
+    assert.deepStrictEqual(vadsMade, [0.7, 0.7], "the startup VAD again")
+    assert.strictEqual(agcsMade.at(-1), JSON.stringify({}))
+    assert.strictEqual(core.inspect().sessions, 3)
+    assert.deepStrictEqual(posted.filter((m) => m.type === "error"), [])
+  })
+})
+
 const streamingConfig = { kind: "streaming", prerollMs: 400, agc: false, streaming: { tailPaddingMs: 0 } }
 
 const streamingCore = (limits?: Record<string, number>) => {
