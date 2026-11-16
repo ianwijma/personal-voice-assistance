@@ -577,7 +577,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       return stt === undefined ? "unknown" : `${stt.provider} ${stt.detail}`
     }
     const sessions: VoiceSessions = makeVoiceSessions({
-      make: (key, device, initial, others) =>
+      make: (key, device, reserved) =>
         makeVoiceSession({
           key,
           ...(device !== undefined ? { deviceId: device.id } : {}),
@@ -597,8 +597,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
             hub?.broadcast({ type: "trace", key, ...(device !== undefined ? { deviceId: device.id } : {}), trace })
           },
           minuteMs,
-          ...(initial !== undefined ? { initialConversation: initial } : {}),
-          ...(others !== undefined ? { reservedConversations: others } : {}),
+          ...(reserved !== undefined ? { reservedConversations: reserved } : {}),
           ...(options.stallMs !== undefined ? { stallMs: options.stallMs } : {}),
           heard: {
             dir: recordings,
@@ -618,7 +617,8 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       run,
       onChange: (minor) => hub?.sessionsChanged(minor),
       onDiscard: (key) => hub?.sessionDiscarded(key),
-      announce: (key, info) => hub?.toSession(key, { type: "conversation", id: info.id, reason: "new", startedAt: info.startedAt })
+      announce: (key, info, assistant) =>
+        hub?.toSession(key, { type: "conversation", id: info.id, reason: "new", startedAt: info.startedAt, ...(assistant !== undefined ? { assistantId: assistant } : {}) })
     })
     sessionsRef = sessions
     // Before the lock is released and the engines close (finalizers run in reverse): every session's loop stops, and
