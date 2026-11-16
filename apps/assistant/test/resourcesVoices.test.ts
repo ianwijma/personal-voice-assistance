@@ -133,6 +133,35 @@ describe("resource pool: voices", () => {
     expect(pool.status().some((r) => r.key === voiceKey(piper))).toBe(false)
   })
 
+  it("ttsReady waits for the voice bound when it is called, even once the assistant is rebound to a ready voice", async () => {
+    const fake = fakeVoices()
+    const building = Deferred.makeUnsafe<void>()
+    const build: TtsBuilder = (spec) =>
+      ttsKeyOf(spec) === voiceKey(kokoro) ? Effect.andThen(Deferred.await(building), fake.build(spec)) : fake.build(spec)
+    const pool = await makePool(build)
+    await reconcile(pool, { c: piper })
+    // a and b come into use on Kokoro, still being built: a turn of a captures that voice and its readiness.
+    const wanting = reconcile(pool, { a: kokoro, b: kokoro, c: piper })
+    await sleep(10)
+    const voice = pool.ttsFor("a")!
+    const ready = pool.ttsReady("a")
+    expect(voice.sampleRate).toBe(22_050)
+    // Before the turn waits, a switches to Piper (ready, so bound at once); b keeps Kokoro alive.
+    await reconcile(pool, { a: piper, b: kokoro, c: piper })
+    expect(pool.ttsKeyFor("a")).toBe(voiceKey(piper))
+    let done = false
+    const waiting = run(ready).then(() => {
+      done = true
+    })
+    await sleep(30)
+    // Still waiting for Kokoro: the turn must not read the placeholder rate of the voice it speaks with.
+    expect(done).toBe(false)
+    Deferred.doneUnsafe(building, Exit.void)
+    await waiting
+    await wanting
+    expect(voice.sampleRate).toBe(24_000)
+  })
+
   it("a voice nobody wants any more is released after the grace period, and kept when wanted again within it", async () => {
     const fake = fakeVoices()
     const pool = await makePool(fake.build, 80)
