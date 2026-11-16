@@ -39,6 +39,7 @@ interface StepOptions {
   readonly agent?: VoiceFeatures
   readonly reduced?: boolean
   readonly pointer?: Pointer
+  readonly focus?: { x: number; y: number; width: number; height: number }
 }
 
 /** Steps `frames` frames; returns the calls of the last one. `voices(i)` may vary the voice per frame. */
@@ -47,7 +48,7 @@ const step = (r: Runner, mode: Mode, frames: number, o: StepOptions | ((i: numbe
   for (let i = 0; i < frames; i++) {
     const s = typeof o === "function" ? o(i) : o
     recording.log = []
-    r.step({ mode, dt: DT, user: s.user ?? silent, agent: s.agent ?? silent, palette: PALETTES.dark, reducedMotion: s.reduced === true, pointer: s.pointer ?? NO_POINTER, sinceInterrupt: Infinity })
+    r.step({ mode, dt: DT, user: s.user ?? silent, agent: s.agent ?? silent, palette: PALETTES.dark, reducedMotion: s.reduced === true, pointer: s.pointer ?? NO_POINTER, sinceInterrupt: Infinity, ...(s.focus !== undefined ? { focus: s.focus } : {}) })
     last = recording.log
   }
   recording.log = null
@@ -109,6 +110,37 @@ describe("pitch ink: the pen's height", () => {
     }
     expect(rise(1)).toBeGreaterThan(0)
     expect(rise(2)).toBeGreaterThan(rise(1) * 1.8)
+  })
+
+  it("on the stage, a pitch far past the stave swings on but never closer than 12 px to the canvas edge, also with one shared stave", () => {
+    const BOXED = { x: 280, y: 100, width: 720, height: 240 }
+    const stage = (stored: OptionValues) => {
+      const r = new Runner(pitchInk, document.createElement("canvas"), stored)
+      r.create()
+      r.resize(1280, 800, 1)
+      return r
+    }
+    for (const staves of ["two", "shared"]) {
+      const r = stage({ staves, zoom: 3 })
+      const high = nib(step(r, "hearing", secs(3), { user: voice({ pitch: 1, register: 0.5 }), focus: BOXED })).y
+      expect(high + BOXED.y).toBeGreaterThanOrEqual(12 - 1e-6)
+      expect(high).toBeLessThan(H * 0.08) // and it does swing on past the top of the stave
+      const low = nib(step(stage({ staves, zoom: 3 }), "hearing", secs(3), { user: voice({ pitch: 0, register: 0.5 }), focus: BOXED })).y
+      expect(low + BOXED.y).toBeLessThanOrEqual(800 - 12 + 1e-6)
+    }
+  })
+
+  it("when the box moves nearer the canvas edge, the ink already written is brought inside it too", () => {
+    const r = new Runner(pitchInk, document.createElement("canvas"), { zoom: 3 })
+    r.create()
+    r.resize(1280, 800, 1)
+    step(r, "hearing", secs(3), { user: voice({ pitch: 1, register: 0.5 }), focus: { x: 280, y: 100, width: 720, height: 240 } })
+    const moved = { x: 280, y: 20, width: 720, height: 240 }
+    const calls = step(r, "hearing", 1, { user: voice({ pitch: 1, register: 0.5 }), focus: moved })
+    const ys = calls.filter((c) => c.name === "lineTo" || c.name === "moveTo").map((c) => c.args[1] as number)
+    // The ribbon's edges lie up to a nib's half-width (about 7 px here) beyond the bounded centre line.
+    expect(Math.min(...ys)).toBeGreaterThanOrEqual(12 - moved.y - 12)
+    expect(nib(calls).y + moved.y).toBeGreaterThanOrEqual(12 - 1e-6)
   })
 
   it("is slew-limited: a single octave slip of the tracker cannot make the line jump", () => {
@@ -197,6 +229,18 @@ describe("pitch ink: hover", () => {
     const r = make()
     const calls = step(r, "hearing", secs(3), { user: voice({ pitchHz: 187.4 }), pointer: hover(40) })
     expect(labels(calls)).toEqual(["187 Hz"])
+  })
+
+  it("reads the pitch at the column under the pointer, by where it was recorded on the paper", () => {
+    // Each frame's pitch is its own number (100 Hz + frame), so the label tells which moment's ink is under the pointer.
+    const frames = secs(6)
+    const r2 = make()
+    const out = step(r2, "hearing", frames, (i) => ({ user: voice({ pitchHz: 100 + i }), pointer: { x: W * 0.8 - 80, y: H / 2, down: false, inside: true } }))
+    const hz = Number(labels(out)[0]!.replace(" Hz", ""))
+    // At settled speed (86.4 px/s, 1.44 px a frame) 80 px of paper is about 55.6 frames back, not the 80 the 2 px/column guess gives.
+    const framesBack = frames - 1 - (hz - 100)
+    expect(framesBack).toBeGreaterThan(52)
+    expect(framesBack).toBeLessThan(60)
   })
 
   it("shows nothing off the paper's end, outside the canvas, or over a dotted line that carries no voice", () => {

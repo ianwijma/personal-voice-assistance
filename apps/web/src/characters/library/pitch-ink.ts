@@ -37,7 +37,8 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
 
   const cPos = new Float64Array(COLS) // paper position of the column (px)
   const cOwn = new Uint8Array(COLS)
-  const cY = new Float32Array(COLS) // fraction of the height
+  const cY = new Float32Array(COLS) // fraction of the height, within the stave
+  const cO = new Float32Array(COLS) // how far the pen swung on past the stave's end (fraction of the height, up positive), added after the stave is laid out
   const cW = new Float32Array(COLS) // half-width, px at a 420 px tall stage
   const cDry = new Float32Array(COLS) // whisper stipple strength
   const cSpat = new Float32Array(COLS) // sibilance spatter strength
@@ -55,6 +56,9 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
   let speed = 0
   let penX = 0
   let penY = 0.5
+  let penO = 0
+  let loY = 0 // the lowest and highest the pen and ink may show (px, box coordinates): inside the canvas
+  let hiY = 1
   let width = 0
   let pitchS = 0.4
   let laneSide = 0 // 0 top (you) .. 1 bottom (assistant), eased
@@ -87,10 +91,18 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
     const u = raw < 0 ? 0 : raw > 1 ? 1 : raw
     const top = lerp(TOP0, BOT0, side)
     const bot = lerp(TOP1, BOT1, side)
-    // On the stage a pitch beyond the stave's ends (a wide melody zoom) swings on past them, softly saturating.
+    return bot - u * (bot - top)
+  }
+  /** On the stage a pitch beyond the stave's ends (a wide melody zoom) swings on past them, softly saturating (fraction of the height, up positive). */
+  const overOf = (pitch: number): number => {
+    const raw = (pitch - 0.1) / 0.82
     const over = raw < 0 ? raw : raw > 1 ? raw - 1 : 0
-    const extra = over === 0 ? 0 : Math.sign(over) * (1 - Math.exp(-2.5 * Math.abs(over))) * reachF
-    return bot - u * (bot - top) - extra
+    return over === 0 ? 0 : Math.sign(over) * (1 - Math.exp(-2.5 * Math.abs(over))) * reachF
+  }
+  /** Where a stave height and its overshoot show (px): the overshoot is added after the stave is laid out, and the result stays inside the canvas. */
+  const showY = (y: number, side: number, o: number): number => {
+    const v = (mapY(y, side) - o) * H
+    return v < loY ? loY : v > hiY ? hiY : v
   }
   /**
    * Where a height written in the two-stave layout shows now: with "One shared stave" both
@@ -103,14 +115,15 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
     const span = lerp(TOP1 - TOP0, BOT1 - TOP0, shareK)
     return top + ((y - top2) * span) / (TOP1 - TOP0)
   }
-  const yOf = (j: number): number => mapY(cY[j]!, cSide[j]!) * H
+  const yOf = (j: number): number => showY(cY[j]!, cSide[j]!, cO[j]!)
   /** Displayed half-width (px) of a recorded width, for the chosen pen and thickness. */
   const inkW = (w: number, scale: number): number => Math.max(0, penA + (w - 0.6) * penB) * thickK * scale
 
-  const write = (own: number, y: number, w: number, dry: number, spat: number, hz: number) => {
+  const write = (own: number, y: number, o: number, w: number, dry: number, spat: number, hz: number) => {
     cPos[head] = paper
     cOwn[head] = own
     cY[head] = y
+    cO[head] = o
     cW[head] = w
     cDry[head] = dry
     cSpat[head] = spat
@@ -147,6 +160,9 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
       // Room beyond the box (above and below) the pen may swing into.
       const room = Math.min(fo.y, CH - fo.y - fo.height) - 12
       reachF = room > 0 ? Math.min(room, Math.max(0.25 * H, 48)) / H : 0
+      // Nothing is shown closer than 12 px to the canvas edge (the box itself is always allowed).
+      loY = Math.min(0, 12 - fo.y)
+      hiY = Math.max(H, CH - fo.y - 12)
 
       // Options.
       const opts = f.options
@@ -199,10 +215,16 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
       const pS = reduced ? Math.round(pitchS * 8) / 8 : pitchS
       const lvQ = reduced ? (on && v.speaking && voiced ? Math.min(3, 1 + Math.floor(v.level * 3)) : 0) : 0
       // "Melody zoom" stretches the pitch scale around the voice's own register.
-      let y = laneY(laneSide, reg + (pS - reg) * zoomK)
-      if (mode === "idle") y = lerp(y, 0.5, mix.idle)
+      const zp = reg + (pS - reg) * zoomK
+      let y = laneY(laneSide, zp)
+      let yo = overOf(zp)
+      if (mode === "idle") {
+        y = lerp(y, 0.5, mix.idle)
+        yo *= 1 - mix.idle
+      }
       if (mode === "thinking" && !reduced) y += Math.sin(f.t * 6.5) * 0.05 * mix.thinking
       penY = reduced ? y : approach(penY, y, dt, 0.035)
+      penO = reduced ? yo : approach(penO, yo, dt, 0.035)
       const wTarget = on && v.speaking ? (voiced ? 0.6 + 13 * Math.pow(v.level, 1.2) : 0) : 0
       width = reduced ? (lvQ === 0 ? 0 : 0.6 + 4 * lvQ) : approach(width, wTarget, dt, wTarget > width ? 0.03 : 0.08)
 
@@ -227,7 +249,7 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
             } else if (mode === "thinking") own = Math.floor(paper / (STEP * 3)) % 2 === 0 ? THINK : NONE
             else own = Math.floor(paper / (STEP * 4)) % 3 === 0 ? WAIT : NONE
             lastCol = paper
-            write(own, penY, own === YOU || own === AGENT ? (voiced ? width : 0) : 0, dry, spat, voiced ? v.pitchHz : 0)
+            write(own, penY, penO, own === YOU || own === AGENT ? (voiced ? width : 0) : 0, dry, spat, voiced ? v.pitchHz : 0)
           }
         }
       } else if (paper - lastCol >= STEP) {
@@ -241,7 +263,7 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
           if (v.sibilance > 0.45) spat = clamp01((v.sibilance - 0.45) * 2.2) * clamp01(v.level * 3)
         } else if (mode === "thinking") own = Math.floor(paper / (STEP * 3)) % 2 === 0 ? THINK : NONE
         else if (mode === "listening") own = Math.floor(paper / (STEP * 4)) % 3 === 0 ? WAIT : NONE
-        write(own, penY, own === YOU || own === AGENT ? (voiced ? width : 0) : 0, dry, spat, voiced ? v.pitchHz : 0)
+        write(own, penY, penO, own === YOU || own === AGENT ? (voiced ? width : 0) : 0, dry, spat, voiced ? v.pitchHz : 0)
       }
 
       // Reduced motion: the pen stays put at its place on the page.
@@ -414,7 +436,7 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
 
       // ---- The pen: a nib with a halo that closes in or opens out, and a faint guide of where it will write.
       const nx = penX
-      const ny = mapY(penY, laneSide) * H
+      const ny = showY(penY, laneSide, penO)
       liftInto(cA, tone, 0.25, p)
       g.strokeStyle = css(sinkInto(cB, tone, 0.5, p), 0.45)
       g.lineWidth = hair
@@ -461,9 +483,26 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
         g.moveTo(ptx, H * 0.04)
         g.lineTo(ptx, H * 0.96)
         g.stroke()
-        const back = Math.round((penX - ptx) / STEP)
-        if (back >= 0 && back < count) {
-          const j = (head - 1 - back + COLS * 2) % COLS
+        // The column whose recorded paper position is nearest the pointer (columns are not always STEP apart).
+        const want = now - (penX - ptx)
+        let lo = 0
+        let hi = count - 1
+        while (lo < hi) {
+          const mid = (lo + hi) >> 1
+          if (cPos[(head - count + mid + COLS) % COLS]! < want) lo = mid + 1
+          else hi = mid
+        }
+        let bestK = -1
+        let bestD = STEP * 1.5
+        for (let k = Math.max(0, lo - 1); k <= Math.min(count - 1, lo); k++) {
+          const d = Math.abs(cPos[(head - count + k + COLS) % COLS]! - want)
+          if (d < bestD) {
+            bestD = d
+            bestK = k
+          }
+        }
+        if (bestK >= 0) {
+          const j = (head - count + bestK + COLS) % COLS
           const hz = cHz[j]!
           if (hz > 0 && (cOwn[j] === YOU || cOwn[j] === AGENT)) {
             g.font = `${Math.round(11 * clamp(scale, 0.8, 1.2))}px ui-monospace, monospace`
@@ -481,7 +520,7 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
 const character: Character = {
   id: "pitch-ink",
   name: "Pitch ink",
-  version: "1.1.0",
+  version: "1.1.1",
   contract: 1,
   family: "abstract",
   summary: "A seismograph pen writes the melody of each voice on moving paper: you in the upper stave, the assistant in the lower; height is pitch, thickness is loudness.",
