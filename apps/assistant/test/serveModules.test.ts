@@ -150,7 +150,7 @@ describe("Home and module instances (WP-12a/12b)", () => {
       type: "settings.update",
       sectionId: "home",
       patch: {
-        values: { HOME_LOCATION: "Utrecht, Netherlands", HOME_TIME_ZONE: "Asia/Tokyo", HOME_LANGUAGE: "nl-NL", HOME_UNITS: "imperial", HOME_DATE_FORMAT: "en-US" },
+        values: { HOME_LOCATION: "Utrecht, Netherlands", HOME_TIME_ZONE: " Asia/Tokyo ", HOME_LANGUAGE: "nl-NL", HOME_UNITS: "imperial", HOME_DATE_FORMAT: "en-US" },
         secrets: {}
       }
     })

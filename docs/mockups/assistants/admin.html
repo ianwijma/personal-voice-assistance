@@ -1076,8 +1076,8 @@ function pOverview() {
     { d:'desk', talking:true, line:'T3 speaking · conversations: T3 6 turns, Jeff 2 turns · last just now' },
     { d:'iphone', talking:false, line:'Jeff listening · conversation: Jeff 2 turns · last 5 min ago' },
     { d:'living', talking:false, line:'Asleep, waiting for “Hey Jeff” · conversation: Jeff 1 turn · last 1 h ago' },
-  ];
-  const sessions = `<section><div class="section-head"><h4 class="label section-title">Voice sessions</h4><span class="count">1 talking · 3 of ${DATA.shared.limits.talking}</span></div>
+  ].filter(s => DEV(s.d)); // a forgotten device has no session
+  const sessions = `<section><div class="section-head"><h4 class="label section-title">Voice sessions</h4><span class="count">${sess.filter(s => s.talking).length} talking · ${sess.length} of ${DATA.shared.limits.talking}</span></div>
     <ul class="listbox">${sess.map(s => { const d = DEV(s.d); return `<li><a class="row" href="#devices/${d.id}"><span class="dot ${s.talking ? 'dot-ok' : 'dot-line'}"></span>
       <span class="rmain"><span class="rline"><span class="rname">${esc(d.name)}</span>${s.talking ? '<span class="label chip-you">Talking now</span>' : ''}</span><span class="t-13 muted">${esc(s.line)}</span></span>${ic('chev', 16, 'chev')}</a></li>`; }).join('')}</ul></section>`;
 

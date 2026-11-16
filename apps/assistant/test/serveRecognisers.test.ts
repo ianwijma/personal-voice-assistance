@@ -303,4 +303,27 @@ describe("serve: one recogniser per device, from its hearer (WP-11)", () => {
     admin.send({ type: "assistant.save", requestId: "s3", assistant: { ...bravo, hearing: { ...bravo.hearing, model: "parakeet-v2" } } })
     expect((await admin.waitFor("result", (m) => m.requestId === "s3")).ok).toBe(true)
   })
+
+  it("new type defaults are checked against the devices that inherit them: a device whose hearer changes warns too", async () => {
+    const fake = fakeRecognisers()
+    await start(fake, { freeMemoryBytes: () => 1e9 })
+    const store = server!.handle.store
+    // The browser defaults answer without a phrase with Alpha (model-a, loaded).
+    const stored = store.settings().deviceTypes["web-voice"]!
+    await Effect.runPromise(store.saveDeviceType("web-voice", stored.rev, { ...stored, withoutPhrase: { mode: "assistant", assistant: "alpha" } }))
+    // Device X lists Bravo first but inherits that answerer: it hears with Alpha. Bravo's parakeet-v2 is not loaded.
+    await device("device-x")
+    await saveOwn("device-x", { assistants: [{ assistant: "bravo", phrases: ["hey bravo"] }, { assistant: "alpha", phrases: ["hey alpha"] }] })
+    await saveHearing("bravo", { model: "parakeet-v2" })
+    expect(fake.builds).not.toContain("parakeet-v2")
+    const admin = await connect()
+    await admin.admin(TEST_ADMIN_PASSWORD)
+    // Nobody without a phrase: the defaults still hear with Alpha, but device X now hears with Bravo (parakeet-v2).
+    const rev = store.settings().deviceTypes["web-voice"]!.rev
+    admin.send({ type: "device.save", requestId: "t1", target: { kind: "type", type: "web-voice" }, rev, settings: { withoutPhrase: { mode: "nobody" } } })
+    const refused = await admin.waitFor("result", (m) => m.requestId === "t1")
+    expect(refused.ok).toBe(false)
+    expect(refused.error?.code).toBe("invalid_settings")
+    expect(refused.error?.message).toMatch(/about 1050 MB more memory/)
+  })
 })

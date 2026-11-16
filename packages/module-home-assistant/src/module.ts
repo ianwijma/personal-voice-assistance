@@ -208,6 +208,7 @@ export const homeAssistantModule = (deps: HomeAssistantDeps = {}) =>
 
         const switchLights = (value: string, on: boolean, brightnessPct?: number) =>
           Effect.gen(function*() {
+            if (!settings.domains.includes("light")) return yield* new ActionError({ message: "I'm not allowed to control lights." })
             const target = serviceTarget(house, value)
             if (target === undefined) {
               refreshSoon()
@@ -283,10 +284,14 @@ export const homeAssistantModule = (deps: HomeAssistantDeps = {}) =>
           execute: () => liveHouse.pipe(Effect.map(houseState), Effect.mapError((e) => new ToolError(sanitize(secrets, { message: e.message }))))
         })
 
+        // `domains` may be narrowed per assistant: without "light" this instance offers no light tool or action.
+        const lights = settings.domains.includes("light")
         const instance: ExtendedModuleInstance = {
-          tools: [homeState],
-          actions,
-          instructions: "The owner's lights are controlled through Home Assistant: use home_state to see them and the light actions to switch them.",
+          tools: lights ? [homeState] : [],
+          actions: lights ? actions : [],
+          ...(lights
+            ? { instructions: "The owner's lights are controlled through Home Assistant: use home_state to see them and the light actions to switch them." }
+            : {}),
           info: () => ({
             // A display boundary (the settings card), like the status line: upstream text, redacted here.
             server: fromUpstream(`${config.locationName ?? "Home Assistant"}${config.version !== undefined ? ` ${config.version}` : ""} at ${baseUrl}`, secrets),

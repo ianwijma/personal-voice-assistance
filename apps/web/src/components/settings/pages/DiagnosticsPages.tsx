@@ -6,13 +6,10 @@ import { firstSoundMs, modulesInOrder } from "@/lib/state.ts"
 import { shallowEqual } from "@/lib/store.ts"
 import { inputClass } from "../../fields/types.ts"
 import { useClient, useClientState } from "../../context.tsx"
-import { changedSince, factsOf, type LatencyContext, latencyTone, median, ROUTE_FILTERS, TRACE_COLUMNS, TraceRow, TracePopover, type TraceView, voiceLabel } from "../latency.tsx"
+import { changedSince, factsOf, type LatencyContext, latencyTone, median, ROUTE_FILTERS, TRACE_COLUMNS, TraceRow, TracePopover, traceKeys, type TraceView, voiceLabel } from "../latency.tsx"
 import { cx, Segmented } from "../../ui/controls.tsx"
 import { SELECT_CHEVRON } from "./assistants/parts.tsx"
 import { useVoiceNameOf } from "./AssistantsPage.tsx"
-
-/** The turn's own key: its device and number (turn numbers count per device). */
-const traceKey = (t: TraceInfo, index: number) => `${t.deviceId ?? t.session ?? ""}:${t.turnId}:${index}`
 
 const selectClass = `${inputClass} min-w-[11rem] max-w-full appearance-none bg-[length:16px] bg-[right_10px_center] bg-no-repeat pr-9`
 
@@ -56,7 +53,8 @@ export function LatencyPage() {
     hearingName: hearingModelNames(sections).hearing,
     voiceName
   }
-  const all: ReadonlyArray<TraceView> = [...traces].reverse().map((t, i) => ({ key: traceKey(t, i), t, voices: t.voices.map((v) => voiceLabel(v, ctx)), facts: factsOf(t, ctx), changed: changedSince(t, ctx) }))
+  const keys = traceKeys(traces)
+  const all: ReadonlyArray<TraceView> = traces.map((t, i) => ({ key: keys[i]!, t, voices: t.voices.map((v) => voiceLabel(v, ctx)), facts: factsOf(t, ctx), changed: changedSince(t, ctx) })).reverse()
 
   // The filters offer who is in the turns (an assistant or device since removed still shows in them).
   const assistantOptions = [...new Map(all.flatMap(({ t }) => (t.assistant === undefined ? [] : [[t.assistant.id, t.assistant.name] as const]))).entries()]

@@ -452,7 +452,20 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       )
       return Exit.isSuccess(exit) && exit.value !== "" ? exit.value : undefined
     }
-    /** The accounts' shared settings an instance depends on: a changed address or key makes new instances. */
+    /** A shared on/off setting as the providers read it, or `undefined` when unset or not a boolean. */
+    const booleanSettingNow = (name: string): boolean | undefined => {
+      if (settingNow(name) === undefined) return undefined
+      const exit = Effect.runSyncExit(
+        Effect.gen(function*() {
+          return yield* Config.Boolean(name)
+        }).pipe(Effect.provideService(ConfigProvider.ConfigProvider, sections.configProvider()))
+      )
+      return Exit.isSuccess(exit) ? exit.value : undefined
+    }
+    /**
+     * The accounts' shared settings an instance depends on: a changed address or key makes new instances, and so does
+     * OpenRouter's "Prefer the fastest provider" (its adapter reads it once, when built).
+     */
     const llmAccounts = (): LlmAccounts => {
       const stamp = (name: string) => {
         const key = settingNow(name)
@@ -460,7 +473,11 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       }
       return {
         anthropic: { address: settingNow("ANTHROPIC_BASE_URL"), credential: stamp("ANTHROPIC_API_KEY") },
-        openrouter: { address: settingNow("OPENROUTER_BASE_URL"), credential: stamp("OPENROUTER_API_KEY") },
+        openrouter: {
+          address: settingNow("OPENROUTER_BASE_URL"),
+          credential: stamp("OPENROUTER_API_KEY"),
+          sortByLatency: booleanSettingNow("OPENROUTER_SORT_BY_LATENCY")
+        },
         "home-model": { address: settingNow("HOME_MODEL_BASE_URL"), credential: stamp("HOME_MODEL_API_KEY") }
       }
     }
@@ -493,17 +510,22 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       deviceId !== undefined && store.settings().devices[deviceId] !== undefined ? `device:${deviceId}` : `type:${WEB_VOICE_KIND}`
     /**
      * Every hearing place (§3.2 "Wanted", stt: the hearer of every type defaults entry and of every known device) with
-     * its effective settings. `override` replaces one place's settings (a save being checked).
+     * its effective settings. `override` replaces one place's settings (a save being checked); a type's new defaults
+     * also apply to the devices of that type that inherit them.
      */
     const placesNow = (override?: { readonly place: string; readonly settings: DeviceSettings }): Map<string, DeviceSettings> => {
-      const file = store.settings()
+      const saved = store.settings()
+      const typeKind = override?.place.startsWith("type:") === true ? override.place.slice("type:".length) : undefined
+      const file = typeKind === undefined
+        ? saved
+        : { ...saved, deviceTypes: { ...saved.deviceTypes, [typeKind]: { ...override!.settings, rev: saved.deviceTypes[typeKind]?.rev ?? 0 } } }
       const places = new Map<string, DeviceSettings>()
       for (const kind of new Set([WEB_VOICE_KIND, ...Object.keys(file.deviceTypes)])) {
         const type = deviceTypeOf(kind)
         if (type === undefined) continue
         places.set(`type:${kind}`, effectiveDeviceSettings(type.builtIn, file.deviceTypes[kind], undefined))
       }
-      for (const id of Object.keys(file.devices)) places.set(`device:${id}`, deviceSettingsOf(id))
+      for (const id of Object.keys(file.devices)) places.set(`device:${id}`, deviceSettingsFrom(file, id))
       if (override !== undefined) places.set(override.place, override.settings)
       return places
     }
@@ -700,6 +722,8 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
         runSync(Effect.asVoid(Effect.forkDetach(syncResources(), { startImmediately: true })))
         return resources.llmFor(assistantId)
       }
+      /** Completes once the assistant's voice is built (its sample rate is final): `TurnSetup.ttsReady`. */
+      const ttsReady = resources.ttsReady(assistantId)
       /** Likewise the assistant's voice: the pool's instance for its `voice`, read at the turn's start. */
       const ttsNow = () => {
         const bound = resources.ttsFor(assistantId)
@@ -724,19 +748,24 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
             home,
             llm,
             tts,
-            setup: { system: systemFor(base, instructions), registry: mine.registry, llm: llm ?? notInUse, tts: tts ?? noVoice },
+            setup: {
+              system: systemFor(base, instructions),
+              registry: mine.registry,
+              llm: llm ?? notInUse,
+              tts: tts ?? noVoice,
+              ...(tts !== undefined ? { ttsReady } : {}),
+              // The limit the turn runs with and the one its snapshot (`config`) reports: both from this `assistant`.
+              ...(assistant !== undefined ? { maxToolRounds: assistant.toolRounds } : {})
+            },
             instructions,
             config: assistant === undefined ? undefined : traceConfigOf(assistant, mine.registry.specs.length, mine.modules)
           }
         }
         return cached
       }
-      // A voice still being built (the assistant came into use just now) is waited for: its sample rate is read when
-      // the turn starts to play. An already bound voice that is being replaced is answered by the old one meanwhile.
-      const setup = Effect.suspend((): Effect.Effect<TurnSetup> => {
-        const now = current()
-        return now.tts === undefined ? Effect.succeed(now.setup) : Effect.map(resources.ttsReady(assistantId), () => current().setup)
-      })
+      // The setup never waits (the conversation's input loop reads it, so Stop and barge-in would wait too): a spoken
+      // turn waits for a voice still being built (the assistant came into use just now) itself, before it plays.
+      const setup = Effect.sync((): TurnSetup => current().setup)
       /**
        * The turn's configuration snapshot, read when its trace begins: the values `current()` resolved for the setup,
        * made again only when the module snapshot, the assistant or its bindings changed (reference compares, no
@@ -1025,7 +1054,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     // One voice session per device (docs/VOICE-SESSIONS.md §2), on the shared engines.
     const recordings = join(options.dataDir, "recordings")
     const sessions: VoiceSessions = makeVoiceSessions({
-      make: (key, device, initial) =>
+      make: (key, device, initial, others) =>
         makeVoiceSession({
           key,
           ...(device !== undefined ? { deviceId: device.id } : {}),
@@ -1050,6 +1079,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
           },
           minuteMs,
           ...(initial !== undefined ? { initialConversation: initial } : {}),
+          ...(others !== undefined ? { reservedConversations: others } : {}),
           ...(options.stallMs !== undefined ? { stallMs: options.stallMs } : {}),
           heard: {
             dir: recordings,

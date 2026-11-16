@@ -117,6 +117,13 @@ export interface SessionDispatcherOptions<C extends DispatchTarget> {
   readonly replyEarly?: (assistant: string) => boolean
   /** Default `decideByFallback`. */
   readonly decide?: DecideRoute
+  /**
+   * Read each time a `decide` answer is applied (after the wait, and when an eager answer is reused at the final):
+   * the assistants it may go to now and the fallback now, since the device's settings can change while TypeSafe is
+   * asked. A chosen assistant no longer among `candidates`, or a fallback that is no longer the fallback, gives way to
+   * the fallback now (`null`: nobody). Default: every answer stands.
+   */
+  readonly decideNow?: () => { readonly candidates: ReadonlyArray<string>; readonly fallback: string | null }
 }
 
 export interface SessionDispatcher<C extends DispatchTarget> {
@@ -133,6 +140,11 @@ export interface SessionDispatcher<C extends DispatchTarget> {
    * over. `accepted` unless every conversation asked answered otherwise.
    */
   readonly stop: (assistant?: string) => SendOutcome
+  /**
+   * A new conversation with `assistant` (which stops that conversation's open utterance itself): the rest of the
+   * open utterance, if `assistant` has it, is not handed over, as after Stop.
+   */
+  readonly cancelUtterance: (assistant: string) => void
   readonly get: (assistant: string) => C | undefined
   /** The conversations made so far, by assistant. */
   readonly conversations: () => ReadonlyMap<string, C>
@@ -183,6 +195,13 @@ export const makeSessionDispatcher = <C extends DispatchTarget>(
 ): SessionDispatcher<C> => {
   const replyEarly = options.replyEarly ?? (() => true)
   const decide = options.decide ?? decideByFallback
+  /** A `decide` answer checked against the device as it is now (`decideNow`). */
+  const stillValid = (result: DecideResult): DecideResult => {
+    if (options.decideNow === undefined || result.assistant === null) return result
+    const now = options.decideNow()
+    const valid = result.fallback ? result.assistant === now.fallback : now.candidates.includes(result.assistant)
+    return valid ? result : { ...result, assistant: now.fallback, fallback: true }
+  }
   const books = new Map<string, Book<C>>()
   const made = new Map<string, C>()
   const making = new Map<string, Deferred.Deferred<Book<C>>>()
@@ -313,8 +332,9 @@ export const makeSessionDispatcher = <C extends DispatchTarget>(
             : decide({ text: event.text, fallback: target.fallback, final: event._tag === "EndOfTurn" }).pipe(
               Effect.tap((result) => Effect.sync(() => (u.decision = { text: event.text, result })))
             )
-          return Effect.map(answer, (result): Where =>
-            result.assistant === null
+          return Effect.map(answer, (raw): Where => {
+            const result = stillValid(raw)
+            return result.assistant === null
               ? { to: null }
               : {
                 to: result.assistant,
@@ -324,7 +344,8 @@ export const makeSessionDispatcher = <C extends DispatchTarget>(
                   fallback: result.fallback,
                   ...(result.decision !== undefined ? { decision: result.decision } : {})
                 }
-              })
+              }
+          })
         }
         default:
           return Effect.succeed({ to: target.assistant, route: target })
@@ -342,6 +363,8 @@ export const makeSessionDispatcher = <C extends DispatchTarget>(
       u.delivered = undefined
       if (to === null) return
       const book = yield* ensure(to)
+      // Stopped while its conversation was made: that conversation got no Interrupt, so it gets nothing.
+      if (u.stopped) return
       push(book, speechStarted)
       u.delivered = to
       if (route !== undefined) routes.set(to, route)
@@ -381,6 +404,7 @@ export const makeSessionDispatcher = <C extends DispatchTarget>(
         const to = o?.assistant ?? assistantOf(target)
         if (to === undefined) return
         const book = yield* ensure(to)
+        if (next.stopped) return
         push(book, speechStarted)
         next.delivered = to
         routes.set(to, assistantOf(target) === to ? (target as DispatchRoute) : { by: "barge-in", assistant: to })
@@ -395,7 +419,8 @@ export const makeSessionDispatcher = <C extends DispatchTarget>(
       }
       if (event._tag !== "TurnResumed" && !u.stopped) {
         const where = yield* resolve(event, target, u)
-        if (where !== KEEP) {
+        // Stop may have come while the decision was awaited: the stopped utterance stays where it is.
+        if (where !== KEEP && !u.stopped) {
           if (where.to !== (u.delivered ?? null)) yield* handOver(u, where.to, where.route)
           else if (where.to !== null && where.route !== undefined) routes.set(where.to, where.route)
         }
@@ -431,6 +456,9 @@ export const makeSessionDispatcher = <C extends DispatchTarget>(
       if (u !== undefined && (assistant === undefined || u.delivered === assistant)) u.stopped = true
       const outcomes = chosen.map((book) => book.target!.send(interrupt))
       return outcomes.length === 0 || outcomes.includes("accepted") ? "accepted" : outcomes[0]!
+    },
+    cancelUtterance: (assistant) => {
+      if (open !== undefined && open.delivered === assistant) open.stopped = true
     },
     get: (assistant) => made.get(assistant),
     conversations: () => made,

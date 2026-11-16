@@ -40,6 +40,11 @@ export interface LlmSpec {
    * of the instance's identity, not of the key shown in the status.
    */
   readonly credential?: string
+  /**
+   * OpenRouter: the shared "Prefer the fastest provider" setting (OPENROUTER_SORT_BY_LATENCY), when one is set. Part
+   * of the instance's identity (the adapter reads it once, when it is built), not of the key shown in the status.
+   */
+  readonly sortByLatency?: boolean
 }
 
 /** The shared account settings an `LlmSpec` takes besides the assistant's own fields. */
@@ -51,6 +56,8 @@ export interface LlmAccounts {
 export interface LlmAccountShared {
   readonly address?: string | undefined
   readonly credential?: string | undefined
+  /** OpenRouter only: OPENROUTER_SORT_BY_LATENCY, `undefined` when unset (the adapter's default applies). */
+  readonly sortByLatency?: boolean | undefined
 }
 
 /** The accounts built over `llm-openai-compatible`: they read model, longest reply, give-up time and warm-up only. */
@@ -66,6 +73,7 @@ export const llmSpecOf = (llm: AssistantLlm, accounts: LlmAccounts = {}): LlmSpe
     // Effort and thinking are not read by these accounts, so they are not part of the key (equal settings share).
     const address = accounts[llm.account]?.address
     const credential = accounts[llm.account]?.credential
+    const sortByLatency = llm.account === "openrouter" ? accounts.openrouter?.sortByLatency : undefined
     const shown = address === undefined || address === "" ? openAiDefaultAddress(llm.account) : address
     return {
       account: llm.account,
@@ -76,7 +84,8 @@ export const llmSpecOf = (llm: AssistantLlm, accounts: LlmAccounts = {}): LlmSpe
       giveUpMs: llm.giveUpMs,
       warmUp: llm.warmUp,
       ...(shown !== undefined ? { address: shown } : {}),
-      ...(credential !== undefined ? { credential } : {})
+      ...(credential !== undefined ? { credential } : {}),
+      ...(sortByLatency !== undefined ? { sortByLatency } : {})
     }
   }
   if (llm.account !== "anthropic") {
@@ -133,8 +142,9 @@ export const llmKeyOf = (spec: LlmSpec): string =>
     ? spec.account
     : `${spec.account}|${spec.model}`
 
-/** The instance's identity: its key plus what is not shown (the full address, the key stamp). */
-const identityOf = (spec: LlmSpec): string => `${llmKeyOf(spec)}\u0000${spec.address ?? ""}\u0000${spec.credential ?? ""}`
+/** The instance's identity: its key plus what is not shown (the full address, the key stamp, OpenRouter's sorting). */
+export const llmIdentityOf = (spec: LlmSpec): string =>
+  `${llmKeyOf(spec)}\u0000${spec.address ?? ""}\u0000${spec.credential ?? ""}\u0000${spec.sortByLatency ?? ""}`
 
 const accountLabels: Readonly<Record<LlmAccountId, string>> = {
   offline: "Offline stand-in",
@@ -170,7 +180,8 @@ export const llmConfigOf = (spec: LlmSpec): Record<string, string> =>
         [`${p}MAX_TOKENS`]: String(spec.maxTokens),
         [`${p}TIMEOUT_MS`]: String(spec.giveUpMs),
         [`${p}WARM_UP`]: spec.warmUp ? "true" : "false",
-        ...(spec.address !== undefined ? { [`${p}BASE_URL`]: spec.address } : {})
+        ...(spec.address !== undefined ? { [`${p}BASE_URL`]: spec.address } : {}),
+        ...(spec.sortByLatency !== undefined ? { OPENROUTER_SORT_BY_LATENCY: spec.sortByLatency ? "true" : "false" } : {})
       }
     })()
     : {}
@@ -919,7 +930,7 @@ export const makeResourcePool = (options: ResourcePoolOptions): Effect.Effect<Re
     const llms = makeKind<LlmSpec, Llm["Service"]>({
       name: "Language model",
       build: options.buildLlm,
-      identityOf,
+      identityOf: llmIdentityOf,
       keyOf: llmKeyOf,
       wrap: (entry, release) =>
         Llm.of({

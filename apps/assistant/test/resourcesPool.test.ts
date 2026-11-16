@@ -320,10 +320,10 @@ describe("resource pool: spec, key, label and config", () => {
     expect(key).not.toContain("secret")
   })
 
-  it("accounts other than Anthropic and the offline ones are keyed by account and model", () => {
+  it("accounts other than Anthropic and the offline ones are keyed by account and model first", () => {
     const openrouter = llmSpecOf({ ...anthropic("some/model"), account: "openrouter" })
-    expect(llmKeyOf(openrouter)).toBe("openrouter|some/model")
-    expect(llmKeyOf(llmSpecOf({ ...anthropic("a/b"), account: "home-model" }))).toBe("home-model|a/b")
+    expect(llmKeyOf(openrouter).startsWith("openrouter|some/model|")).toBe(true)
+    expect(llmKeyOf(llmSpecOf({ ...anthropic("a/b"), account: "home-model" })).startsWith("home-model|a/b|")).toBe(true)
   })
 
   it("the adapter's settings follow the spec: thinking is adaptive or disabled, the address only when there is one", () => {
