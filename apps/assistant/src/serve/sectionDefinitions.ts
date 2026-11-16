@@ -284,7 +284,8 @@ export const sectionDefinitions = (dirs: ModelDirs = defaultModelDirs): Readonly
           ],
           apply: reload
         }),
-        ANTHROPIC_API_KEY: Setting.secret({ label: "Anthropic API key", env: "ANTHROPIC_API_KEY", apply: reload, visibleWhen: anthropic }),
+        // The account (key and address) is shared by every assistant, so it is shown and saved whatever LLM_PROVIDER says.
+        ANTHROPIC_API_KEY: Setting.secret({ label: "Anthropic API key", env: "ANTHROPIC_API_KEY", apply: reload }),
         ANTHROPIC_MODEL: Setting.text({
           label: "Model",
           description: "claude-haiku-5-5 is the fastest; claude-sonnet-5-5 and claude-opus-5-5 are slower to start speaking.",
@@ -355,8 +356,7 @@ export const sectionDefinitions = (dirs: ModelDirs = defaultModelDirs): Readonly
           check: (v) => (/^https?:\/\/[^\s]+$/.test(v.trim()) ? undefined : "Must be an address such as https://api.anthropic.com"),
           description: "Only for a proxy or gateway in front of the Anthropic API.",
           advanced: true,
-          apply: reload,
-          visibleWhen: anthropic
+          apply: reload
         })
       },
       checks: [

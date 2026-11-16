@@ -326,19 +326,17 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
     let heardStopped = false
     /** The assistant a closed utterance's words went to, until their turn is committed (or the next utterance starts). */
     let handedTo: string | undefined
+    /** The committed turn in flight (from its commit to its `TurnEnded`), whatever the display shows. */
+    let inFlight: number | undefined
     /**
-     * Who has the turn, the one rule the pages show (`state.holder`, `snapshot.holder`): the assistant of the turn in
-     * flight or of the utterance being heard (an armed window is consumed when the utterance starts, its assistant keeps
-     * the turn), else the one whose armed or follow-up window is open, else nobody.
+     * Who has the turn, the one rule the pages show (`state.holder`, `snapshot.holder`), from the routing state only:
+     * the assistant of the turn in flight, else of the open utterance (an armed window is consumed when the utterance
+     * starts, its assistant keeps the turn to its `EndOfTurn`), else of the words a closed utterance handed over, else
+     * the one whose armed or follow-up window is open, else nobody. Never the display state (the tracker's hearing
+     * timer, the microphone): those change what the page shows, not who answers.
      */
-    const holderNow = (): string | null => {
-      const s = tracker.current()
-      if (s.state === "hearing" || s.state === "thinking" || s.state === "speaking") {
-        const busy = (s.turnId === undefined ? undefined : assistantOfTurn(s.turnId)) ?? heardFor ?? handedTo
-        if (busy !== undefined) return busy
-      }
-      return route.window(now())?.assistant ?? null
-    }
+    const holderNow = (): string | null =>
+      (inFlight === undefined ? undefined : assistantOfTurn(inFlight)) ?? heardFor ?? handedTo ?? route.window(now())?.assistant ?? null
     let holderSent: string | null = null
     const tracker = makeStateTracker({
       onChange: (s) => {
@@ -401,8 +399,9 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
     const publisher = makePublisher({
       broadcast: send,
       onCommitted: (turnId) => {
-        // The handed-over words have their turn now: it names the holder (`state.turnId`).
+        // The handed-over words have their turn now: the turn in flight names the holder.
         handedTo = undefined
+        inFlight = turnId
         tracker.turnPromoted(turnId)
       },
       moduleOfTool: options.moduleOfTool,
@@ -460,6 +459,7 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
           return
         case "TurnEnded":
           clauses.delete(event.turnId)
+          if (inFlight === event.turnId) inFlight = undefined
           return tracker.turnEnded(event.turnId)
         case "ClauseQueued": {
           const entry = clauses.get(event.turnId) ?? { texts: [], given: 0 }
@@ -692,7 +692,7 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
           if (r.heard !== undefined) options.wakeHeard(r.heard.text, r.heard.phrase, r.heard.accepted)
           if (r.woke !== undefined) {
             // The phrase's utterance is still heard: its new holder goes out before `wake`, which the page shows until the next state.
-            if (tracker.current().state === "hearing") holderCheck()
+            holderCheck()
             if (r.woke.armed) armedPhrase.set(r.woke.assistant, r.woke.phrase)
             options.send({ type: "wake", phrase: r.woke.phrase, armed: r.woke.armed, assistantId: r.woke.assistant })
             wakeChanged(r.woke.armed ? armedMs() : followUpOf(r.woke.assistant))
