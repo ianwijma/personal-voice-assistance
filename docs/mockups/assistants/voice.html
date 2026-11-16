@@ -868,7 +868,7 @@ document.addEventListener("click", (e) => {
     case "more-btn": S.more = !S.more; renderDock(); if (S.more) $("more-new").focus(); return;
     case "more-new": S.more = false; newConversation(); render("more-btn"); return;
     case "start": S.state = dev().always ? "listening" : "asleep"; S.turn = null; S.preset = ""; render("mic"); return;
-    case "end-btn": S.state = "notStarted"; S.turn = null; S.muted = false; S.preset = "notStarted"; render("start"); return;
+    case "end-btn": timers.forEach(clearTimeout); timers.length = 0; S.state = "notStarted"; S.turn = null; S.muted = false; S.preset = "notStarted"; render("start"); return;
     case "mic": S.muted = !S.muted; S.preset = ""; render("mic"); return;
     case "stop": if (S.state === "speaking" || S.state === "thinking") { timers.forEach(clearTimeout); timers.length = 0; stopReply(); } return;
     case "send": send(); return;

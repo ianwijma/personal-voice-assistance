@@ -40,4 +40,29 @@ describe("admin mock-up", () => {
     expect(document.querySelector('a.row[href="#devices/iphone"]')).not.toBeNull()
     expect(document.body.textContent).toContain("0 talking · 2 of 4")
   })
+
+  it("gives a device ticked in the wizard one assignment, even when its defaults are ticked too", async () => {
+    location.hash = "#assistants/new/1"
+    await vi.waitFor(() => expect(document.getElementById("c_name")).not.toBeNull())
+    const name = document.getElementById("c_name") as HTMLInputElement
+    name.value = "Mia"
+    name.dispatchEvent(new Event("input", { bubbles: true }))
+
+    location.hash = "#assistants/new/6"
+    await vi.waitFor(() => expect(document.getElementById("c_where_every-browser")).not.toBeNull())
+    ;(document.getElementById("c_where_every-browser") as HTMLButtonElement).click()
+    ;(document.getElementById("c_where_iphone") as HTMLButtonElement).click()
+
+    location.hash = "#assistants/new/7"
+    await vi.waitFor(() => expect(document.querySelector('[data-act="wcreate"]')).not.toBeNull())
+    ;(document.querySelector('[data-act="wcreate"]') as HTMLButtonElement).click()
+    await vi.waitFor(() => expect(location.hash).toBe("#assistants/mia/basics"))
+
+    for (const [device, label] of [["iphone", "iPhone · Safari"], ["every-browser", "Every browser"]]) {
+      location.hash = `#devices/${device}`
+      await vi.waitFor(() => expect(title()).toBe(label))
+      expect(document.querySelectorAll("#c_rmmia")).toHaveLength(1)
+    }
+    expect(errors).toEqual([])
+  })
 })
