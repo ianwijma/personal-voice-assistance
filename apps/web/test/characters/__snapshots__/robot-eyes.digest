@@ -1,0 +1,49 @@
+# robot-eyes 1.0.0: frame digests of a scripted conversation at default settings (docs/CHARACTERS.md §6.6).
+# A change here must be deliberate: check the look, then update with `pnpm --filter @pva/web exec vitest run test/characters -u`.
+dark  0.5 idle        102 6293220e
+dark  1.0 listening   102 d9a6d5fb
+dark  1.5 listening   196 a07b76a5
+dark  2.0 hearing     196 ec13e26a
+dark  2.5 hearing     196 8baf67c4
+dark  3.0 hearing     196 e8c3d469
+dark  3.5 hearing     196 f9ae58a4
+dark  4.0 hearing     196 dde27112
+dark  4.5 hearing     196 db286ae7
+dark  5.0 thinking    196 4a716d64
+dark  5.5 thinking    196 b7970e08
+dark  6.0 thinking    196 b223a991
+dark  6.5 speaking    196 67dd9187
+dark  7.0 speaking    196 45f8ab60
+dark  7.5 speaking    196 fd41c14f
+dark  8.0 speaking    196 56adcb21
+dark  8.5 speaking    196 417478bd
+dark  9.0 speaking    196 b5ef3b43
+dark  9.5 listening   196 ea635dbc
+dark 10.0 listening   196 a0ba0bf6
+dark 10.5 idle        196 5d95a339
+dark 11.0 idle        196 e3e780d3
+light  0.5 idle        102 c98b9902
+light  1.0 listening   102 4d8696cf
+light  1.5 listening   196 d6dd499f
+light  2.0 hearing     196 e176f6a4
+light  2.5 hearing     196 a9bda58c
+light  3.0 hearing     196 387b8aeb
+light  3.5 hearing     196 4123c3b8
+light  4.0 hearing     196 cc7bd30e
+light  4.5 hearing     196 b97cdb23
+light  5.0 thinking    196 a46685e0
+light  5.5 thinking    196 202f7fd4
+light  6.0 thinking    196 5b2f00ed
+light  6.5 speaking    196 7b1797b1
+light  7.0 speaking    196 c9e80e94
+light  7.5 speaking    196 efa79bcf
+light  8.0 speaking    196 8b618827
+light  8.5 speaking    196 9a76ab03
+light  9.0 speaking    196 da9438ab
+light  9.5 listening   196 c431cf4e
+light 10.0 listening   196 60278824
+light 10.5 idle        196 4c33e1e1
+light 11.0 idle        196 09794691
+overflow 160×140×1 0.0 px
+overflow 900×420×1 0.0 px
+overflow 720×240×2 0.0 px
