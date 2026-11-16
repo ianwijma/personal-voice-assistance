@@ -174,49 +174,55 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
    * A see-through fill (the outline finish) traces everything in the body's colour as one path
    * and fills it once, so overlaps do not darken.
    */
-  const pieces = (pass: 0 | 1 | 2, f: Frame, lv: number, tone: Col) => {
-    const p = f.palette
+  // State of the pass `pieces` is drawing, read by the helpers below (made once, not per frame).
+  let pass: 0 | 1 | 2 = 0
+  let union = false
+  let dark = false
+  const begin = () => {
+    if (!union) g.beginPath()
+  }
+  const paint = () => {
+    if (union) return
+    if (pass === 1) g.stroke()
+    else g.fill()
+  }
+  const sameTone = (i: number) => {
+    c3[0] = dR[i]!
+    c3[1] = dG[i]!
+    c3[2] = dB[i]!
+    return Math.abs(c3[0] - tone[0]) + Math.abs(c3[1] - tone[1]) + Math.abs(c3[2] - tone[2]) < 30
+  }
+  const drop = (i: number) => {
+    const rb = radiusAt(dAng[i]!) * R0
+    const x = cx + Math.cos(dAng[i]!) * dRho[i]! * R0
+    const y = cy + Math.sin(dAng[i]!) * dRho[i]! * R0
+    const rd = dRad[i]! * R0
+    begin()
+    neck(cx, cy, rb, x, y, rd)
+    paint()
+    begin()
+    g.moveTo(x + rd, y)
+    g.arc(x, y, rd, 0, TAU)
+    paint()
+    // Droplet highlight.
+    if (pass === 0 && !union && glossK > 0.01) {
+      g.fillStyle = css(WHITE, (dark ? 0.35 : 0.5) * glossK)
+      g.beginPath()
+      g.ellipse(x - rd * 0.35, y - rd * 0.4, rd * 0.32, rd * 0.2, -0.6, 0, TAU)
+      g.fill()
+    }
+  }
+  const bodyStyle = () => {
+    if (pass === 0) g.fillStyle = fill
+    else if (pass === 1) g.strokeStyle = css(tone)
+    else g.fillStyle = "#000"
+  }
+
+  const pieces = (which: 0 | 1 | 2, f: Frame, lv: number) => {
     const reduced = f.reducedMotion
-    const union = pass === 0 && fillA < 0.999
-    const begin = () => {
-      if (!union) g.beginPath()
-    }
-    const paint = () => {
-      if (union) return
-      if (pass === 1) g.stroke()
-      else g.fill()
-    }
-    const sameTone = (i: number) => {
-      c3[0] = dR[i]!
-      c3[1] = dG[i]!
-      c3[2] = dB[i]!
-      return Math.abs(c3[0] - tone[0]) + Math.abs(c3[1] - tone[1]) + Math.abs(c3[2] - tone[2]) < 30
-    }
-    const drop = (i: number) => {
-      const rb = radiusAt(dAng[i]!) * R0
-      const x = cx + Math.cos(dAng[i]!) * dRho[i]! * R0
-      const y = cy + Math.sin(dAng[i]!) * dRho[i]! * R0
-      const rd = dRad[i]! * R0
-      begin()
-      neck(cx, cy, rb, x, y, rd)
-      paint()
-      begin()
-      g.moveTo(x + rd, y)
-      g.arc(x, y, rd, 0, TAU)
-      paint()
-      // Droplet highlight.
-      if (pass === 0 && !union && glossK > 0.01) {
-        g.fillStyle = css(WHITE, (p.dark ? 0.35 : 0.5) * glossK)
-        g.beginPath()
-        g.ellipse(x - rd * 0.35, y - rd * 0.4, rd * 0.32, rd * 0.2, -0.6, 0, TAU)
-        g.fill()
-      }
-    }
-    const bodyStyle = () => {
-      if (pass === 0) g.fillStyle = fill
-      else if (pass === 1) g.strokeStyle = css(tone)
-      else g.fillStyle = "#000"
-    }
+    pass = which
+    dark = f.palette.dark
+    union = pass === 0 && fillA < 0.999
     if (pass === 0) g.globalAlpha = fillA
     bodyStyle()
     g.beginPath()
@@ -368,8 +374,8 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
       const pushOut = mix.speaking * reliefK // spectrum bulges (giving out)
       const spin = mix.thinking
       const breathe = reduced ? 0 : Math.sin(clock * 1.6) * 0.012 * (mix.listening + mix.idle * 0.6) * wobbleK
-      const sib = clamp01((v.sibilance - 0.3) * 1.5) * (on ? 1 : 0)
-      const pd = on ? clamp((v.pitchDelta / 10) * pitchK, -1.5, 1.5) : 0
+      const sib = reduced ? 0 : clamp01((v.sibilance - 0.3) * 1.5) * (on ? 1 : 0)
+      const pd = on && !reduced ? clamp((v.pitchDelta / 10) * pitchK, -1.5, 1.5) : 0
       stretch = approach(stretch, 1 + pd * 0.07 + spin * 0.0, dt, 0.25)
 
       // Pointer.
@@ -496,7 +502,8 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
       fill = lg
       lis = mix.listening
 
-      // Droplet physics.
+      // Droplet physics. Reduced motion clears whatever was in flight (one still droplet is drawn instead).
+      if (reduced) dKind.fill(0)
       for (let i = 0; i < MAX_DROPS; i++) {
         const kind = dKind[i]!
         if (kind === 0) continue
@@ -534,12 +541,12 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
         g.lineWidth = Math.max(2.5, S / 90)
         g.lineJoin = "round"
         g.globalAlpha = outlineK
-        pieces(1, f, lv, tone)
+        pieces(1, f, lv)
         g.globalCompositeOperation = "destination-out"
-        pieces(2, f, lv, tone)
+        pieces(2, f, lv)
         g.globalCompositeOperation = "source-over"
       }
-      pieces(0, f, lv, tone)
+      pieces(0, f, lv)
 
       // ---- Thinking: the person's colour marbles through the assistant's.
       const th = mix.thinking
@@ -604,7 +611,7 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
 const character: Character = {
   id: "liquid-blob",
   name: "Liquid blob",
-  version: "1.1.0",
+  version: "1.1.1",
   contract: 1,
   family: "abstract",
   summary: "A glossy body of liquid whose outline is pressed in by your voice and swells out with its own; droplets fly in while it listens and bud out while it speaks.",

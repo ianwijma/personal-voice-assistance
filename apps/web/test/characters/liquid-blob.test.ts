@@ -212,6 +212,19 @@ describe("liquid blob: the shape follows the voice's character", () => {
     expect(at(0.2)).not.toEqual(at(0.5))
     expect(at(0.5)).not.toEqual(at(0.9))
   })
+
+  it("reduced motion holds a still outline under steady sibilance and a moving pitch", () => {
+    for (const mode of ["speaking", "hearing"] as const) {
+      const who = mode === "speaking" ? "agent" : "user"
+      const r = make()
+      const v = voice({ sibilance: 1, pitchDelta: 6, level: 0.5 })
+      const o: StepOptions = who === "agent" ? { reduced: true, agent: v } : { reduced: true, user: v }
+      settle(r, mode, 120, o)
+      const a = outline(frame(r, mode, o))
+      const b = outline(settle(r, mode, 17, o))
+      expect(b, `${mode}: no shimmer`).toEqual(a)
+    }
+  })
 })
 
 describe("liquid blob: droplets", () => {
@@ -302,6 +315,18 @@ describe("liquid blob: droplets", () => {
     expect(taking.y).toBeLessThan(CY)
     expect(out.x).toBeLessThan(CX)
     expect(taking.x).toBeGreaterThan(CX)
+  })
+
+  it("reduced motion switched on mid-flight clears the droplets already in the air: only the one still droplet remains", () => {
+    for (const mode of ["speaking", "hearing"] as const) {
+      const who = mode === "speaking" ? "agent" : "user"
+      const r = make()
+      run(r, mode, 20, who, syllables([2], { level: 0.8 }))
+      expect(drops(frame(r, mode, who === "agent" ? { agent: voice({ level: 0.8 }) } : { user: voice({ level: 0.8 }) })).length, `${mode}: one is in flight`).toBeGreaterThanOrEqual(1)
+      const v = voice({ level: 0.8 })
+      const after = settle(r, mode, 3, who === "agent" ? { reduced: true, agent: v } : { reduced: true, user: v })
+      expect(drops(after), `${mode}: only the still droplet`).toHaveLength(1)
+    }
   })
 
   it("reduced motion listening keeps its three waiting droplets and adds the still one only when droplets are on", () => {
