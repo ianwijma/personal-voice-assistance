@@ -1,5 +1,5 @@
 "use client"
-import { useEffect, useRef } from "react"
+import { type RefObject, useEffect, useRef } from "react"
 import type { Mode } from "@/characters/contract.ts"
 import { type CharacterHost, type HostInput, startCharacterHost } from "@/characters/host.ts"
 import type { VisualState } from "@/lib/state.ts"
@@ -13,9 +13,11 @@ void VISUAL_STATES_ARE_MODES
 /**
  * The stage's canvas. React renders it once; the character host (`characters/host.ts`) draws on it outside
  * React, reading `input`, a mutable object updated in place when the visual state changes, and the browser's
- * character choice (`prefs.character`), followed live without a re-render.
+ * character choice (`prefs.character`), followed live without a re-render. `stage`: the page's full-stage layer,
+ * where the host puts the canvas of a character that asks for the whole stage (this canvas then stays, hidden, as
+ * the box that character centres on).
  */
-export function Visualiser({ state, owner }: { readonly state: VisualState; readonly owner: boolean }) {
+export function Visualiser({ state, owner, stage }: { readonly state: VisualState; readonly owner: boolean; readonly stage?: RefObject<HTMLElement | null> }) {
   const client = useClient()
   const canvas = useRef<HTMLCanvasElement>(null)
   const input = useRef<HostInput>({ state, owner })
@@ -25,7 +27,8 @@ export function Visualiser({ state, owner }: { readonly state: VisualState; read
     if (canvas.current === null) return
     const prefs = client.prefs
     let choice = prefs.get().character
-    const host = startCharacterHost(canvas.current, input.current, choice)
+    // Refs are attached before effects run, so the layer is there when the host starts.
+    const host = startCharacterHost(canvas.current, input.current, choice, { stage: stage?.current ?? null })
     const unsubscribe = prefs.subscribe(() => {
       const next = prefs.get().character
       if (next === choice) return
@@ -40,6 +43,6 @@ export function Visualiser({ state, owner }: { readonly state: VisualState; read
       host.stop()
       if (w.__pvaStage === host) delete w.__pvaStage
     }
-  }, [client])
+  }, [client, stage])
   return <canvas ref={canvas} aria-hidden="true" className="absolute inset-0 size-full" />
 }

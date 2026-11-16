@@ -13,6 +13,12 @@
  *
  * As a reference for character authors: keep everything the instance needs in the closure of `create`, allocate
  * in `resize` (not per frame), read only `frame`, smooth with `dt`.
+ *
+ * A stage character (`canvas: "stage"`, docs/CHARACTERS.md §2.6), the worked example of the recipe in
+ * `characters/README.md`: the lines span `frame.focus` (the box) and centre on it, so at rest they look exactly as
+ * they did in the box; at full voice they may swing past the box's top and bottom (`REACH_SHARE`, `REACH_MIN`), where the page
+ * leaves room, and their glow is no longer cut at the box's edge. With `focus` the whole canvas (a box, or a host
+ * without a stage) the drawing is call for call what version 1.0.0 drew.
  */
 import type { Character, CharacterInstance, Frame, Mode, Rgb } from "../contract.ts"
 import { approach, clamp01, clear2d, mix, optNumber, optToggle, rgba, setup2d } from "../kit.ts"
@@ -76,6 +82,14 @@ const SOLID: Array<number> = []
 /** After an interruption the line falls with this time constant for this long, so the amber collapses fast. */
 const INTERRUPT_TAU = 0.06
 const INTERRUPT_FOR = 0.6
+/**
+ * On the stage, how far past the box (above and below) the lines may swing at full level: a quarter of the box's
+ * height, at least 48 px, and never closer than `EDGE` to the canvas edge. Zero when the box is the whole canvas.
+ * It grows with the square of the level, so the quiet looks (listening, thinking's fixed 0.08) stay as in the box.
+ */
+const REACH_SHARE = 0.25
+const REACH_MIN = 48
+const EDGE = 12
 
 /** The level the lines move toward (0..1): the app's formulas, on the raw window RMS. */
 const targetLevel = (f: Frame): number => {
@@ -95,9 +109,9 @@ const targetLevel = (f: Frame): number => {
 
 const create = (canvas: HTMLCanvasElement): CharacterInstance => {
   let g = setup2d(canvas)
-  let W = 1
   let H = 1
   let dpr = 1
+  // One sample every STEP px across the focus; sized for the widest focus there can be (the canvas width).
   let ys: Array<Float32Array> = []
 
   // Animated state.
@@ -120,11 +134,10 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
 
   return {
     resize(width, height, ratio) {
-      W = width
       H = height
       dpr = ratio
       g = setup2d(canvas, dpr)
-      const n = Math.floor(W / STEP) + 1
+      const n = Math.floor(width / STEP) + 1
       ys = Array.from({ length: MAX_LINES }, () => new Float32Array(n))
     },
 
@@ -183,11 +196,16 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
         theta[i] = (theta[i]! + omega[i]! * dt) % (Math.PI * 2000)
       }
 
-      // Geometry.
-      clear2d(g, dpr)
-      const y0 = H / 2
-      const A = p.aMin + level * (0.38 * H - p.aMin)
-      const n = ys[0]!.length
+      // Geometry. The whole canvas is cleared and (0, 0) is put at the focus's corner, so from here on the drawing
+      // is in the box's coordinates, 0..W by 0..fo.height, exactly as when the canvas was the box.
+      const fo = f.focus
+      clear2d(g, dpr, fo)
+      const W = fo.width
+      const y0 = fo.height / 2
+      const room = Math.min(fo.y, H - fo.y - fo.height) - EDGE
+      const reach = room > 0 ? Math.min(room, Math.max(REACH_SHARE * fo.height, REACH_MIN)) : 0
+      const A = p.aMin + level * (0.38 * fo.height - p.aMin) + level * level * reach
+      const n = Math.min(ys[0]!.length, Math.floor(W / STEP) + 1)
       for (let i = 0; i < MAX_LINES; i++) {
         if (vis[i]! < 0.01) continue
         const yi = ys[i]!
@@ -270,7 +288,7 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
 const character: Character = {
   id: "sine-lines",
   name: "Sine lines",
-  version: "1.0.0",
+  version: "1.1.0",
   contract: 1,
   family: "baseline",
   summary: "Three superimposed sine lines whose colour, speed and height follow the conversation.",
@@ -290,7 +308,7 @@ const character: Character = {
     error: "Flat, in the danger colour."
   },
   mappings: [
-    { signal: "user.rms (hearing)", effect: "Amplitude: √(rms·9) of 38 % of the height; 40 ms rise, 180 ms fall." },
+    { signal: "user.rms (hearing)", effect: "Amplitude: √(rms·9) of 38 % of the box's height, plus on the full stage level² of a quarter of it (at least 48 px) beyond the box; 40 ms rise, 180 ms fall." },
     { signal: "user.rms (listening)", effect: "Amplitude: rms·4, so room noise barely moves it." },
     { signal: "agent.rms (speaking)", effect: "Amplitude: √(rms·5)." },
     { signal: "agent.low / mid / high (speaking)", effect: "Weight of the front, middle and back line (0.5+0.5·low, 0.3+0.7·mid, 0.2+0.8·high, as energy shares)." },
@@ -300,6 +318,7 @@ const character: Character = {
     { signal: "reducedMotion", effect: "Lines stop moving sideways; amplitude snaps to thirds; no breathing, sweep or glow; colour still shows the mode." }
   ],
   renderer: "2d",
+  canvas: "stage",
   options: [
     { id: "lines", kind: "number", label: "Lines", min: 1, max: 5, step: 1, default: 3, group: "Shape", help: "How many sine lines are drawn. Extra lines are thinner and lighter." },
     { id: "thickness", kind: "number", label: "Line thickness", min: 0.5, max: 3, step: 0.1, default: 1, unit: "×", group: "Shape", help: "Scales every line's stroke width." },
