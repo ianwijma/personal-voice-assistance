@@ -315,6 +315,23 @@ describe("dot quartet: bars stay in the box", () => {
     }
   })
 
+  it("bars drawn in a large box fit a tiny one on the very next frame", () => {
+    for (const mode of ["idle", "hearing", "speaking"] as const) {
+      const loud = voice({ level: 1, bands: new Float32Array(24).fill(1) })
+      const rig = make({}, [900, 420])
+      step(rig, mode, secs(1), { user: loud, agent: loud })
+      rig.r.resize(12, 9, 1)
+      for (const x of bars(step(rig, mode, 1, { user: loud, agent: loud }))) {
+        expect(x.w, mode).toBeGreaterThanOrEqual(0)
+        expect(x.h, mode).toBeGreaterThanOrEqual(0)
+        expect(x.x, mode).toBeGreaterThanOrEqual(-1e-6)
+        expect(x.y, mode).toBeGreaterThanOrEqual(-1e-6)
+        expect(x.x + x.w, mode).toBeLessThanOrEqual(12 + 1e-6)
+        expect(x.y + x.h, mode).toBeLessThanOrEqual(9 + 1e-6)
+      }
+    }
+  })
+
   it("tiny focus rectangles never give a negative size or a bar outside the box", () => {
     for (const size of [[200, 1], [20, 100], [12, 9], [1, 1]] as const) {
       for (const mode of ["idle", "hearing", "speaking"] as const) {

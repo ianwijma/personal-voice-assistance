@@ -167,11 +167,10 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
           th_ *= 0.82
           tw *= 1.15
         }
+        // A focus that changed size restarts every spring at its target: sizes kept from a larger box would not fit.
         if (!placed || resized) {
           xs[i]!.set(tx)
           ys[i]!.set(ty)
-        }
-        if (!placed) {
           hs[i]!.set(th_)
           ws[i]!.set(tw)
         }
@@ -228,8 +227,8 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
       g.lineWidth = Math.max(1.2, d * 0.09) * (1 + 0.5 * outline)
       for (let i = 0; i < 4; i++) {
         const core = mixInto(tmp, i % 2 === 0 ? dotA : dotB, WHITE, whiten)
-        const w = ws[i]!.value
         // Bars never leave the box, at any size or loudness.
+        const w = Math.min(ws[i]!.value, Math.max(0, W - 2 * m))
         const h = Math.min(Math.max(w, hs[i]!.value), H - 2 * m)
         const x = clamp(xs[i]!.value - w / 2, m, W - m - w)
         const y = clamp(ys[i]!.value - h / 2, m, H - m - h)
