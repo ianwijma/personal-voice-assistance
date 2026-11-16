@@ -12,14 +12,20 @@
  * and the state the paint is made with (styles, transform, dash; a drawn layer's content; WebGL's last value of
  * each setting and uniform). Calls after the last paint, which show nothing, do not reach it.
  *
- * Only effective painting counts: a `fill` or `stroke` needs a path with a segment that can produce pixels (and a
- * line width above 0 for a stroke), a rectangle needs a size, text must not be empty, an image draw needs a size,
- * and `globalAlpha` must be above 0. Not a rasteriser: it only keeps plainly empty output from counting.
+ * Only effective painting counts: a `fill` needs a path that can enclose an area (a sub-path of two or more
+ * straight segments, a curve, an arc, a rectangle with a size; a single line encloses none), a `stroke` a path with
+ * a segment, a rectangle needs a size, text must not be empty, an image draw needs a size, and `globalAlpha` must be
+ * above 0. Not a rasteriser: it only keeps plainly empty output from counting.
+ *
+ * Like a browser, the 2D fake ignores an invalid value for the properties it models: `lineWidth` and `miterLimit`
+ * not above 0, `shadowBlur` below 0, `globalAlpha` outside 0 to 1, or any of them not finite, keep the value they
+ * had (so a stroke after `lineWidth = 0` is drawn at the previous width).
  *
  * Like a browser, the 2D fake throws for a negative radius: `arc`, `arcTo`, `ellipse` and `createRadialGradient`
  * an `IndexSizeError`, `roundRect` a `RangeError`, and `createRadialGradient` a `TypeError` for a
  * non-finite argument; with a non-finite argument the path calls (including `roundRect`'s radii) do nothing, as in a
- * browser, and are counted (`nonFinite`, which includes `createRadialGradient`).
+ * browser, and are counted (`nonFinite`, which includes `createRadialGradient` and the numbers inside `roundRect`'s
+ * radii, once per call).
  */
 
 const FNV = 0x811c9dc5
@@ -201,23 +207,43 @@ const finite = (args: ReadonlyArray<unknown>): boolean => {
 const negativeRadius = (call: string, r: number): never => {
   throw new DOMException(`Failed to execute '${call}' on 'CanvasRenderingContext2D': The radius provided (${r}) is negative.`, "IndexSizeError")
 }
+/** `roundRect`'s radii as lists of numbers, one per radius: a point-like radius has two (`x` and `y`, 0 if absent). */
+const radiusValues = (radii: unknown): ReadonlyArray<ReadonlyArray<number>> => {
+  if (radii === undefined) return []
+  const list: ReadonlyArray<unknown> = Array.isArray(radii) ? radii : [radii]
+  return list.map((r) => (typeof r === "object" && r !== null ? [Number((r as { x?: unknown }).x ?? 0), Number((r as { y?: unknown }).y ?? 0)] : [Number(r)]))
+}
 /**
- * `roundRect`'s radii, as a browser checks them: 1 to 4 of them (a point-like one has two numbers, `x` and `y`).
- * A browser returns without drawing, and without throwing, when any value is non-finite, before it looks at the
- * sign of any; only when all are finite does a negative one throw a `RangeError`. True when they are all finite.
+ * `roundRect`'s radii, as a browser checks them: 1 to 4 of them, else a `RangeError`. Then each radius in turn: a
+ * non-finite value (either coordinate of a point-like one) makes the call return without drawing or throwing, a
+ * negative one throws a `RangeError`; so `[-1, NaN]` throws and `[NaN, -1]` does not. True when the call draws.
  */
 const checkRadii = (radii: unknown): boolean => {
   if (radii === undefined) return true
-  const list: ReadonlyArray<unknown> = Array.isArray(radii) ? radii : [radii]
+  const list = radiusValues(radii)
   if (list.length < 1 || list.length > 4) throw new RangeError(`Failed to execute 'roundRect' on 'CanvasRenderingContext2D': ${list.length} radii provided. Between one and four radii are necessary.`)
-  const values: Array<number> = []
-  for (const r of list) {
-    if (typeof r === "object" && r !== null) values.push(Number((r as { x?: unknown }).x ?? 0), Number((r as { y?: unknown }).y ?? 0))
-    else values.push(Number(r))
+  for (const values of list) {
+    if (!values.every((v) => Number.isFinite(v))) return false
+    for (const v of values) if (v < 0) throw new RangeError(`Failed to execute 'roundRect' on 'CanvasRenderingContext2D': Radius value ${v} is negative.`)
   }
-  if (!values.every((v) => Number.isFinite(v))) return false
-  for (const v of values) if (v < 0) throw new RangeError(`Failed to execute 'roundRect' on 'CanvasRenderingContext2D': Radius value ${v} is negative.`)
   return true
+}
+/** Does a geometry call have a non-finite number (for `roundRect`, also inside its radii)? */
+const hasNonFinite = (prop: string, args: ReadonlyArray<unknown>): boolean => {
+  if (!finite(args)) return true
+  if (prop !== "roundRect") return false
+  return radiusValues(args[4]).some((values) => values.some((v) => !Number.isFinite(v)))
+}
+
+/**
+ * The 2D properties whose setter ignores an invalid value, as in a browser (the property keeps its value): the
+ * test for a valid one, after the value is converted to a number.
+ */
+const VALID_NUMBER: { readonly [prop: string]: (v: number) => boolean } = {
+  lineWidth: (v) => Number.isFinite(v) && v > 0,
+  miterLimit: (v) => Number.isFinite(v) && v > 0,
+  shadowBlur: (v) => Number.isFinite(v) && v >= 0,
+  globalAlpha: (v) => Number.isFinite(v) && v >= 0 && v <= 1
 }
 
 /** A number as the platform converts an argument (`undefined` is NaN, `null` is 0). */
@@ -275,29 +301,42 @@ export const fake2d = (canvas: CanvasLike, rec: Recording = recording): CanvasRe
   let pMaxX = -Infinity
   let pMaxY = -Infinity
   const track = stages.has(canvas)
-  // What the current path can paint (since `beginPath`): whether it has a current point, and how many segments can
-  // put pixels on a fill (area) and on a stroke (a line). A rectangle of no width and height adds neither; one of
-  // no width or no height can still be stroked.
+  // What the current path can paint (since `beginPath`): whether it has a current point, the straight segments of
+  // the current sub-path, and how many parts can put pixels on a fill (an area) and on a stroke (a line). A single
+  // straight segment encloses no area: a sub-path needs two (three points) before a fill can show it. A curve or an
+  // arc can enclose an area by itself. A rectangle of no width and height adds neither; one of no width or no
+  // height can still be stroked.
   let hasPoint = false
+  let subLines = 0
   let fillSegs = 0
   let strokeSegs = 0
   const newPath = () => {
     hasPoint = false
+    subLines = 0
     fillSegs = 0
     strokeSegs = 0
   }
-  const segment = () => {
+  /** A new sub-path at a point (`moveTo`, and after `rect`, `roundRect` and `closePath`). */
+  const subPath = () => {
     hasPoint = true
+    subLines = 0
+  }
+  /** A curved segment (a curve, an arc): strokable, and able to enclose an area. */
+  const curve = () => {
+    hasPoint = true
+    subLines++
     fillSegs++
     strokeSegs++
   }
-  /** A segment from the current point; with none, the call only starts a sub-path (as a browser does). */
+  /** A straight segment from the current point; with none, the call only starts a sub-path (as a browser does). */
   const lineSegment = () => {
-    if (hasPoint) segment()
-    else hasPoint = true
+    if (!hasPoint) return subPath()
+    subLines++
+    strokeSegs++
+    if (subLines >= 2) fillSegs++
   }
   const rectSegment = (w: number, h: number) => {
-    hasPoint = true
+    subPath()
     if (sized(w) && sized(h)) fillSegs++
     if (sized(w) || sized(h)) strokeSegs++
   }
@@ -326,24 +365,22 @@ export const fake2d = (canvas: CanvasLike, rec: Recording = recording): CanvasRe
       const d = args[0] as { width?: unknown; height?: unknown } | null | undefined
       return sized(d?.width) && sized(d?.height)
     }
-    const alpha = props.get("globalAlpha")
-    if (typeof alpha === "number" && alpha <= 0) return false
-    const width = props.get("lineWidth")
-    const lines = !(typeof width === "number" && width <= 0)
+    // Only a valid `globalAlpha` is ever stored (see `VALID_NUMBER`), so this is 0 or above.
+    if (Number(props.get("globalAlpha") ?? 1) <= 0) return false
     const given = typeof args[0] === "object" && args[0] !== null // fill(path) / stroke(path): a Path2D we do not track
     switch (prop) {
       case "fill":
         return fillSegs > 0 || given
       case "stroke":
-        return lines && (strokeSegs > 0 || given)
+        return strokeSegs > 0 || given
       case "fillRect":
         return finite(args) && sized(args[2]) && sized(args[3])
       case "strokeRect":
-        return lines && finite(args) && (sized(args[2]) || sized(args[3]))
+        return finite(args) && (sized(args[2]) || sized(args[3]))
       case "fillText":
         return finite(args) && String(args[0] ?? "").length > 0
       case "strokeText":
-        return lines && finite(args) && String(args[0] ?? "").length > 0
+        return finite(args) && String(args[0] ?? "").length > 0
       case "drawImage": {
         if (!finite(args)) return false
         if (args.length >= 9) return sized(args[3]) && sized(args[4]) && sized(args[7]) && sized(args[8])
@@ -462,41 +499,52 @@ export const fake2d = (canvas: CanvasLike, rec: Recording = recording): CanvasRe
     },
     moveTo: ((x: number, y: number) => {
       point(x, y)
-      if (finite([x, y])) hasPoint = true
+      if (finite([x, y])) subPath()
     }) as never,
+    closePath: () => {
+      if (hasPoint) subPath()
+    },
     lineTo: ((x: number, y: number) => {
       point(x, y)
       if (finite([x, y])) lineSegment()
     }) as never,
     quadraticCurveTo: ((cx: number, cy: number, x: number, y: number) => {
       point(x, y)
-      if (finite([cx, cy, x, y])) segment()
+      if (finite([cx, cy, x, y])) curve()
     }) as never,
     bezierCurveTo: ((a: number, b: number, c: number, d: number, x: number, y: number) => {
       point(x, y)
-      if (finite([a, b, c, d, x, y])) segment()
+      if (finite([a, b, c, d, x, y])) curve()
     }) as never,
     arcTo: ((x1: number, y1: number, x2: number, y2: number, r: number) => {
       if (!finite([x1, y1, x2, y2, r])) return
       if (r < 0) negativeRadius("arcTo", r)
       point(x1, y1)
       point(x2, y2)
-      lineSegment()
+      // Without a current point it only starts a sub-path; a radius of 0 is a straight line to (x1, y1).
+      if (!hasPoint) subPath()
+      else if (r > 0) curve()
+      else lineSegment()
     }) as never,
     arc: ((x: number, y: number, r: number, a0: number, a1: number, ccw = false) => {
       if (!finite([x, y, r, a0, a1])) return
       if (r < 0) negativeRadius("arc", r)
       arcPoints(x, y, r, r, 0, a0, a1, ccw)
-      if (r > 0) segment()
-      else hasPoint = true
+      // A radius of 0 is a point: only the line to it from the current point.
+      if (r > 0) curve()
+      else lineSegment()
     }) as never,
     ellipse: ((x: number, y: number, rx: number, ry: number, rot: number, a0: number, a1: number, ccw = false) => {
       if (!finite([x, y, rx, ry, rot, a0, a1])) return
       if (rx < 0) negativeRadius("ellipse", rx)
       if (ry < 0) negativeRadius("ellipse", ry)
       arcPoints(x, y, rx, ry, rot, a0, a1, ccw)
-      if (rx > 0 && ry > 0) segment()
-      else hasPoint = true
+      if (rx > 0 && ry > 0) curve()
+      else {
+        // Flat: a line to it from the current point, and a line along it when one radius is above 0.
+        lineSegment()
+        if (rx > 0 || ry > 0) strokeSegs++
+      }
     }) as never,
     clip: () => {
       if (pMinX === Infinity) return
@@ -584,7 +632,7 @@ export const fake2d = (canvas: CanvasLike, rec: Recording = recording): CanvasRe
           rec.mix(id)
           for (const a of args) rec.value(a)
           rec.log?.push({ name: prop, args })
-          if (geometry && !finite(args)) rec.nonFinite++
+          if (geometry && hasNonFinite(prop, args)) rec.nonFinite++
           const out = own?.(...args)
           if (paints) {
             if (effective(prop, args)) paintNow(id, prop, args)
@@ -598,7 +646,9 @@ export const fake2d = (canvas: CanvasLike, rec: Recording = recording): CanvasRe
     },
     set(_t, prop, value) {
       if (typeof prop === "symbol") return true
-      props.set(prop, value)
+      // An invalid value is ignored, as in a browser; the assignment still reaches the call digest.
+      const valid = VALID_NUMBER[prop]
+      if (valid === undefined || valid(Number(value))) props.set(prop, value)
       // In the call digest as before, but not in what the next paint folds: a paint counts a property by its value.
       rec.quiet = true
       rec.mix(idOf(prop))
