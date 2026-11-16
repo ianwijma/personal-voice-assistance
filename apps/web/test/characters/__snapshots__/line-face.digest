@@ -1,0 +1,49 @@
+# line-face 1.0.0: frame digests of a scripted conversation at default settings (docs/CHARACTERS.md §6.6).
+# A change here must be deliberate: check the look, then update with `pnpm --filter @pva/web exec vitest run test/characters -u`.
+dark  0.5 idle         31 dcfeda63
+dark  1.0 listening    36 f2e606ee
+dark  1.5 listening    34 bb6ee2c8
+dark  2.0 hearing      34 f947bc9e
+dark  2.5 hearing      44 93348431
+dark  3.0 hearing      54 06b1403b
+dark  3.5 hearing      54 aabd6357
+dark  4.0 hearing      49 bf3210dc
+dark  4.5 hearing      54 168acad1
+dark  5.0 thinking     58 bd610daa
+dark  5.5 thinking     48 78bfdb0f
+dark  6.0 thinking     38 1d29b2e4
+dark  6.5 speaking     38 c81bdfd0
+dark  7.0 speaking     70 edb27c3d
+dark  7.5 speaking     57 db05e130
+dark  8.0 speaking     63 94208328
+dark  8.5 speaking     57 a5575ffe
+dark  9.0 speaking     57 12ecb070
+dark  9.5 listening    66 28905e41
+dark 10.0 listening    34 3946dc33
+dark 10.5 idle         34 db19d60f
+dark 11.0 idle         34 f329743e
+light  0.5 idle         31 9c240399
+light  1.0 listening    36 881bc980
+light  1.5 listening    34 1eafd5f6
+light  2.0 hearing      34 aba40f1f
+light  2.5 hearing      44 905e03f2
+light  3.0 hearing      54 a4698286
+light  3.5 hearing      54 26ae6fc4
+light  4.0 hearing      49 b3b92fb7
+light  4.5 hearing      54 8544dc89
+light  5.0 thinking     58 e1fd6d3d
+light  5.5 thinking     48 0315c556
+light  6.0 thinking     38 8504fed9
+light  6.5 speaking     38 359ed7a2
+light  7.0 speaking     70 581af53d
+light  7.5 speaking     57 ab471260
+light  8.0 speaking     63 5be7e7d7
+light  8.5 speaking     57 06068415
+light  9.0 speaking     57 6074f1cf
+light  9.5 listening    66 632fe8dd
+light 10.0 listening    34 0e9dc28f
+light 10.5 idle         34 85fc6676
+light 11.0 idle         34 22ff9fcf
+overflow 160×140×1 6.7 px
+overflow 900×420×1 0.0 px
+overflow 720×240×2 0.0 px
