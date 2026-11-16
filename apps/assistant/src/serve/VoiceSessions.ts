@@ -1,4 +1,4 @@
-import { type ConversationInfo, MAX_ASSIGNMENTS, type SessionInfo, type TraceInfo } from "@pva/protocol"
+import type { ConversationInfo, SessionInfo, TraceInfo } from "@pva/protocol"
 import { Effect, Exit, Scope } from "effect"
 import { MAX_TRACES } from "./Publisher.ts"
 import type { VoiceSession } from "./VoiceSession.ts"
@@ -15,7 +15,8 @@ import type { VoiceSession } from "./VoiceSession.ts"
  *   its audio pipeline is closed. A device that comes back within that time finds its session as it left it.
  * - A device without a session still has a conversation id for each assistant (the one that assistant's first turn
  *   will start in), so a page can show it and `conversation.new` works before anything was said. The caller names the
- *   assistant (the one that will answer, when it means the device's); the session takes every id over.
+ *   assistant (the one that will answer, when it means the device's) and passes the device's assignment list; the
+ *   session takes every id over.
  */
 
 export interface VoiceSessionsOptions {
@@ -51,14 +52,15 @@ export interface VoiceSessions {
   /**
    * `assistant`'s conversation on the device: in its session (absent: the answering assistant's), else the id reserved
    * for it (the session gives it to that assistant). Without a session the caller names the assistant (the one that
-   * will answer for the device's own); absent only when the device has none.
+   * will answer for the device's own); absent only when the device has none. `assigned`: the ids of the device's
+   * assistants now (its setup's list); used only without a session, to drop the reservations of the others.
    */
-  readonly conversation: (key: string, assistant?: string) => ConversationInfo
+  readonly conversation: (key: string, assistant: string | undefined, assigned: ReadonlyArray<string>) => ConversationInfo
   /**
    * `conversation.new` on a device: `assistant`'s conversation in its session (absent: the answering assistant's),
-   * else a new id reserved for `assistant` (announced; the other assistants keep theirs).
+   * else a new id reserved for `assistant` (announced; the other assistants keep theirs). `assigned`: as above.
    */
-  readonly newConversation: (key: string, assistant?: string) => Effect.Effect<ConversationInfo>
+  readonly newConversation: (key: string, assistant: string | undefined, assigned: ReadonlyArray<string>) => Effect.Effect<ConversationInfo>
   /** For admin: every session, most recently active first. */
   readonly list: () => ReadonlyArray<SessionInfo>
   readonly all: () => ReadonlyArray<VoiceSession>
@@ -74,12 +76,19 @@ export interface VoiceSessions {
 
 /** Device ids remembered with a conversation id before their session exists. */
 const MAX_RESERVED = 64
-/** Assistants remembered per device (its list, and `""`); the least recently used is forgotten past it (the list changed). */
-const MAX_RESERVED_PER_DEVICE = MAX_ASSIGNMENTS + 1
 
 export const makeVoiceSessions = (options: VoiceSessionsOptions): VoiceSessions => {
   const sessions = new Map<string, { readonly session: VoiceSession; readonly scope: Scope.Closeable }>()
-  /** Per device without a session, the ids reserved for its assistants (`""`: no assistant). */
+  /**
+   * Per device without a session, the ids reserved for its assistants (`""`: the device has no assistant).
+   *
+   * Invariant: a device holds a reservation only for an assistant assigned to it now (or `""` while it has none).
+   * Every read or new reservation first drops the device's other ones (`reserve`, with the assignment list the caller
+   * passes), so a device never holds more entries than it has assignments (at most `MAX_ASSIGNMENTS`). A reservation
+   * of an assistant that is still assigned goes only by `conversation.new` for it, or when the session opens and takes
+   * them over (or with the whole device, the oldest past `MAX_RESERVED`). An assistant taken off the device loses its
+   * reservation at the next read or reservation; put back, it gets a new id.
+   */
   const reserved = new Map<string, Map<string, ConversationInfo>>()
   const timers = new Map<string, ReturnType<typeof setTimeout>>()
   const traces: Array<TraceInfo> = []
@@ -94,16 +103,19 @@ export const makeVoiceSessions = (options: VoiceSessionsOptions): VoiceSessions 
     while (reserved.size > MAX_RESERVED) reserved.delete(reserved.keys().next().value!)
     return byAssistant
   }
-  /** Reserve `info` for `assistant` on the device (most recently used last; the oldest past `MAX_RESERVED_PER_DEVICE` is forgotten). */
-  const reserve = (key: string, assistant: string | undefined, info: ConversationInfo): ConversationInfo => {
+  /**
+   * `assistant`'s reservation on the device (`renew`: a new one in its place), after dropping those of assistants not
+   * in `assigned` (the invariant above). An assistant not in `assigned` gets an id that is not kept.
+   */
+  const reserve = (key: string, assistant: string | undefined, assigned: ReadonlyArray<string>, renew: boolean): ConversationInfo => {
+    const keep = new Set(assigned.length === 0 ? [""] : assigned)
     const byAssistant = reservationsOf(key)
-    byAssistant.delete(assistant ?? "")
-    byAssistant.set(assistant ?? "", info)
-    while (byAssistant.size > MAX_RESERVED_PER_DEVICE) byAssistant.delete(byAssistant.keys().next().value!)
+    for (const a of [...byAssistant.keys()]) if (!keep.has(a)) byAssistant.delete(a)
+    const slot = assistant ?? ""
+    const info = (renew ? undefined : byAssistant.get(slot)) ?? fresh()
+    if (keep.has(slot)) byAssistant.set(slot, info)
     return info
   }
-  const reservedFor = (key: string, assistant: string | undefined): ConversationInfo =>
-    reserve(key, assistant, reserved.get(key)?.get(assistant ?? "") ?? fresh())
 
   const stop = (entry: { readonly session: VoiceSession; readonly scope: Scope.Closeable }) =>
     Effect.andThen(
@@ -167,17 +179,17 @@ export const makeVoiceSessions = (options: VoiceSessionsOptions): VoiceSessions 
       timer.unref?.()
       timers.set(key, timer)
     },
-    conversation: (key, assistant) => {
+    conversation: (key, assistant, assigned) => {
       const session = sessions.get(key)?.session
       if (session !== undefined) return session.conversation.conversation(assistant)
-      return reservedFor(key, assistant)
+      return reserve(key, assistant, assigned, false)
     },
-    newConversation: (key, assistant) =>
+    newConversation: (key, assistant, assigned) =>
       Effect.suspend(() => {
         const session = sessions.get(key)?.session
         if (session !== undefined) return session.conversation.newConversation(assistant)
         return Effect.sync(() => {
-          const info = reserve(key, assistant, fresh())
+          const info = reserve(key, assistant, assigned, true)
           options.announce(key, info, assistant)
           return info
         })
