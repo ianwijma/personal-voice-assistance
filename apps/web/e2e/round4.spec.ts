@@ -93,7 +93,7 @@ for (const width of [320, 390]) {
       await page.getByRole("button", { name: "Log in" }).click()
       await expect(page.getByTestId("settings")).toBeVisible()
       // Settings pages: front-end defaults with the phrase editor, a device with the rename, a number, a choice, a text.
-      for (const hash of ["#settings/devices/type-web-voice", "#settings/devices/d-kitchen-ipad-0001", "#settings/shared/limits", "#settings/shared/accounts"]) {
+      for (const hash of ["#settings/devices/type.web-voice", "#settings/devices/d-kitchen-ipad-0001", "#settings/shared/limits", "#settings/shared/accounts"]) {
         await gotoAdmin(page, baseURL, hash)
         await expect(page.getByTestId("settings-page")).toBeVisible()
         await expectAtLeast16(page, hash, hash.endsWith("/accounts") ? 0 : 1)

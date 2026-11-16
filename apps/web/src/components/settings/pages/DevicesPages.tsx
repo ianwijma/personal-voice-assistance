@@ -23,7 +23,7 @@ import {
 } from "@/lib/devices.ts"
 import { INTERRUPT_CHOICES, lastSeenText } from "@/lib/profileForm.ts"
 import { agoText, stateWord, turnsText } from "@/lib/sessions.ts"
-import { formatSettingsHash, typePageId } from "@/lib/settingsTree.ts"
+import { formatSettingsHash, isTypePageId, typePageId } from "@/lib/settingsTree.ts"
 import { shallowEqual } from "@/lib/store.ts"
 import { useClient, useClientState } from "../../context.tsx"
 import { inputClass } from "../../fields/types.ts"
@@ -162,14 +162,14 @@ export function DevicesPage() {
 
 // ---- Device and defaults pages
 
-/** Devices › device, or the defaults of a type (`type-web-voice`): a device page, with Own value · Reset per section. */
+/** Devices › device, or the defaults of a type (`type.web-voice`): a device page, with Own value · Reset per section. */
 export function DevicePage() {
   const client = useClient()
   const id = useClientState((s) => s.ui.settingsPath[1])
   const types = useClientState((s) => s.deviceTypes)
   const device = useClientState((s) => s.devices.find((d) => d.id === id), shallowEqual)
-  const type = id?.startsWith("type-") === true ? types.find((t) => typePageId(t.kind) === id) : types.find((t) => t.kind === device?.kind)
-  if (type === undefined || (device === undefined && id?.startsWith("type-") !== true)) {
+  const type = isTypePageId(id) ? types.find((t) => typePageId(t.kind) === id) : types.find((t) => t.kind === device?.kind)
+  if (type === undefined || (device === undefined && !isTypePageId(id))) {
     return (
       <div className="flex flex-col items-start gap-3" data-testid="unknown-device">
         <p className="text-[14px] text-ink-muted">This device is not known (any more).</p>
@@ -177,7 +177,7 @@ export function DevicePage() {
       </div>
     )
   }
-  return <DeviceEditor key={id} type={type} device={id?.startsWith("type-") === true ? undefined : device} />
+  return <DeviceEditor key={id} type={type} device={isTypePageId(id) ? undefined : device} />
 }
 
 const SECTION_HELP = {
