@@ -4,6 +4,7 @@ Low-latency, modular personal voice assistant. Node 22, TypeScript, Effect 4, pn
 
 - Read `docs/ARCHITECTURE.md` before changing anything; the service interfaces in it are the contract.
 - Effect is **v4** (`effect@^4.1`). Its API differs from v3. Use `node_modules/effect/AGENTS.md` and `node_modules/effect/ai-docs/src/**` as the reference.
+- Read `docs/CHARACTERS.md` before adding or changing a character (the stage visual) or the contract it draws from; old characters must keep working.
 - Provider SDKs may only be imported inside their adapter package.
 - `pnpm check` and `pnpm test` must pass before a change is done.
 - Latency claims are backed by `TurnTrace` numbers, not by reasoning.
