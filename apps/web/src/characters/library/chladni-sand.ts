@@ -15,6 +15,12 @@ import { type Col, ModeMix, OptionGlide, col, css, hash01, liftInto, mixInto, mo
 const BASE_GRAINS = 2400
 const MAX_GRAINS = BASE_GRAINS * 2
 const MAX_FRONTS = 5
+/** Newton steps that put the sand onto the figure at once (the first frame, and every change under reduced motion). */
+const SNAP_STEPS = 14
+/** Extra length-limited steps for the grains a snap left off the lines under reduced motion; the length is in plate units, and a grain within RESCUE_TOL of f = 0 is left alone. */
+const RESCUE_STEPS = 24
+const RESCUE_STEP = 0.12
+const RESCUE_TOL = 0.02
 /** Figure ranges per "Figures" choice (indices into the tables below): simple, full, intricate. */
 const DETAILS = ["simple", "full", "intricate"]
 const DETAIL_LO = [0, 0, 4]
@@ -286,7 +292,8 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
       const newton = reduced || first
       // A silent plate (idle) does not move, so the sand needs no simulation at all.
       const resting = drive < 0.02 && !anyFront && !(onPlate && !pt.down) && settle <= 0
-      const iters = snap ? 14 : reduced || resting ? 0 : 1
+      // A snap is 14 Newton steps; under reduced motion a few more follow for the grains that have not reached a line (see below).
+      const iters = snap ? SNAP_STEPS + (reduced ? RESCUE_STEPS : 0) : reduced || resting ? 0 : 1
       const h = reduced ? 0.03 : dt
       if (snap) {
         // Re-strew the sand evenly first, so the projection covers the whole figure instead of bunching.
@@ -311,6 +318,8 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
           if (rB > 0.01) evalRound(figB, u, w, rB)
           if (th > 0.01) evalSpiral(u, w, th)
           const amp = Math.abs(F)
+          const rescue = it >= SNAP_STEPS
+          if (rescue && amp < RESCUE_TOL) continue // already on a line
           let hop = reduced ? 0 : drive * amp * 0.9
           // Fronts.
           for (let q = 0; anyFront && q < MAX_FRONTS; q++) {
@@ -337,7 +346,24 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
           }
           let uu: number
           let ww: number
-          if (newton) {
+          if (rescue) {
+            // The plain step above stalls on an antinode, where the gradient is nearly zero (a round plate's rings and lattices have
+            // flat tops), or is flung across the plate when the gradient is small but not zero. Grains still off a line after it get a
+            // true Newton step with a length limit, and a fixed kick off the flat spot where there is no direction to follow. No rand():
+            // the sand's random stream, and so every other frame, stays as it was.
+            const g2 = FX * FX + FY * FY
+            if (g2 > 0.09) {
+              const k = (F / g2) * 0.6366
+              const len = Math.abs(k) * Math.sqrt(g2)
+              const cap = len > RESCUE_STEP ? RESCUE_STEP / len : 1
+              uu = u - FX * k * cap
+              ww = w - FY * k * cap
+            } else {
+              const a = i * 2.399963 + it * 1.3 // the golden angle spreads the kicks of neighbouring grains
+              uu = u + Math.cos(a) * RESCUE_STEP
+              ww = w + Math.sin(a) * RESCUE_STEP
+            }
+          } else if (newton) {
             // Newton step onto the nodal line (f = 0): lands each grain on the figure in a few iterations.
             const g2 = FX * FX + FY * FY + 0.05
             uu = u - ((F * FX) / g2) * 0.6366 * 0.8
