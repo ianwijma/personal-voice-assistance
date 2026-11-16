@@ -96,9 +96,8 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
   }
 
   return {
-    resize(width, height, ratio) {
-      W = width
-      H = height
+    resize(_width, _height, ratio) {
+      // The canvas is the whole page; the layout comes from the focus, per frame.
       dpr = ratio
       g = setup2d(canvas, dpr)
     },
@@ -109,7 +108,10 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
       const reduced = f.reducedMotion
       mix.step(f)
       modeTone(tone, mix, p)
-      clear2d(g, dpr)
+      const fo = f.focus
+      clear2d(g, dpr, fo) // clears the whole canvas; (0, 0) is the box's top-left corner
+      W = fo.width
+      H = fo.height
 
       // Options.
       const o = f.options
@@ -199,12 +201,12 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
         }
         // Pointer: a press drops a big ring where the finger is; moving over the water trails small ones.
         const pt = f.pointer
-        const pxN = (pt.x - cx) / R
-        const pyN = (pt.y - cy) / R
+        const pxN = (pt.x - fo.x - cx) / R
+        const pyN = (pt.y - fo.y - cy) / R
         const inPool = pt.inside && pxN * pxN + pyN * pyN < 1
         if (pt.down && !pointerWas && inPool) spawn(f, pxN, pyN, 1, 0.9, lam * 1.2, 0.5 * speedK, 3, tone)
         if (inPool && !pt.down) {
-          const moved = Math.hypot(pt.x - lastPX, pt.y - lastPY)
+          const moved = Math.hypot(pt.x - fo.x - lastPX, pt.y - fo.y - lastPY)
           trailAcc += moved
           if (trailAcc > R * 0.12) {
             spawn(f, pxN, pyN, 1, 0.35, lam * 0.6, 0.35 * speedK, 1, tone)
@@ -212,8 +214,8 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
           }
         }
         pointerWas = pt.down
-        lastPX = pt.x
-        lastPY = pt.y
+        lastPX = pt.x - fo.x
+        lastPY = pt.y - fo.y
       }
       lastOnset = v.onset
 
@@ -250,12 +252,9 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
         g.stroke()
       }
 
-      g.save()
-      g.beginPath()
-      g.arc(cx, cy, R - px1 * 0.5, 0, TAU)
-      g.clip()
-
-      // ---- Rings.
+      // ---- Rings. Outward rings run on past the wall and fade over the stage; inward ones (which start at
+      // the wall, with crests trailing outside it) and the still reduced-motion set stay inside the water.
+      const poolClip = R - px1 * 0.5
       const crestRgb = c1
       const troughA = p.dark ? 0.55 : 0.75
       if (!reduced) {
@@ -270,8 +269,10 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
           if (d > 0) {
             lead = age * rSpd[i]! * R
             const reach = lead / R
-            strength = rA[i]! * Math.exp(-age * 0.45) * (1 - clamp01((reach - 0.75) / 0.6)) * clamp01(age * 8)
-            if (reach > 1.6 || (age > 0.3 && strength < 0.01)) {
+            // Inside the water the fade is the one it always had; beyond the wall it carries on from there to 0.
+            const fade = reach <= 1 ? 1 - clamp01((reach - 0.75) / 0.6) : 0.5833 * (1 - clamp01((reach - 1) / 1.6))
+            strength = rA[i]! * Math.exp(-age * 0.45) * fade * clamp01(age * 8)
+            if (reach > 2.7 || (age > 0.3 && strength < 0.01)) {
               rDir[i] = 0
               continue
             }
@@ -293,6 +294,12 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
           ringRgb[1] = rG[i]!
           ringRgb[2] = rB[i]!
           liftInto(crestRgb, ringRgb, 0.3, p)
+          if (d < 0) {
+            g.save()
+            g.beginPath()
+            g.arc(cx, cy, poolClip, 0, TAU)
+            g.clip()
+          }
           for (let j = 0; j < nC; j++) {
             // Crests trail behind the leading edge: outside it for inward rings, inside for outward.
             const rr = lead - d * j * lamPx
@@ -313,7 +320,7 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
             g.arc(ox, oy, rr, 0, TAU)
             g.stroke()
             const tr = rr - d * lamPx * 0.5
-            if (tr > 0.5 && troughK > 0.01) {
+            if (tr > 0.5 && troughK > 0.01 && (d < 0 || Math.hypot(ox - cx, oy - cy) + tr + w * 0.65 < poolClip)) {
               g.lineWidth = w * 1.3
               g.strokeStyle = p.dark ? css(p.bg, aj * troughA * troughK) : css(WHITE, aj * troughA * troughK)
               g.beginPath()
@@ -321,6 +328,7 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
               g.stroke()
             }
           }
+          if (d < 0) g.restore()
         }
 
         // Fizz: tiny rings that open and fade in 0.35 s.
@@ -340,6 +348,10 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
           g.stroke()
         }
       } else {
+        g.save()
+        g.beginPath()
+        g.arc(cx, cy, poolClip, 0, TAU)
+        g.clip()
         // Reduced motion: a still picture of the mode. Inward modes put the strongest crest
         // innermost; speaking puts it outermost; loudness (in thirds) sets how many crests show.
         const steps = Math.round(clamp01(lv * 1.6) * 3)
@@ -368,7 +380,13 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
           g.arc(cx, cy, Math.max(0.5, rr - lamPx * 0.5), 0, TAU)
           g.stroke()
         }
+        g.restore()
       }
+
+      g.save()
+      g.beginPath()
+      g.arc(cx, cy, poolClip, 0, TAU)
+      g.clip()
 
       // ---- Thinking: the water turns. Three spiral arms wind into a central dimple.
       const th = mix.thinking
@@ -468,7 +486,7 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
 const character: Character = {
   id: "ripple-pond",
   name: "Ripple pond",
-  version: "1.0.0",
+  version: "1.1.0",
   contract: 1,
   family: "abstract",
   summary: "A round basin of water seen from above: rings converge on the centre while it listens and run out from a falling drop while it speaks.",
@@ -495,6 +513,7 @@ const character: Character = {
     { signal: "reducedMotion", effect: "Nothing moves: a still ring set per mode (strongest crest inside while taking in, outside while speaking; crest count from loudness in thirds), a still spiral for thinking." }
   ],
   renderer: "2d",
+  canvas: "stage",
   options: [
     { id: "size", kind: "number", label: "Size", min: 0.5, max: 1, step: 0.05, default: 1, unit: "×", group: "Shape", help: "How big the basin is; at 1 it nearly fills the height." },
     { id: "arms", kind: "number", label: "Whirlpool arms", min: 2, max: 6, step: 1, default: 3, group: "Shape", help: "How many spiral arms the water turns into while it thinks." },
