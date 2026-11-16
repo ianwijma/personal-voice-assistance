@@ -110,7 +110,9 @@ SttEvent =
 // begins, not late.
 
 // Language model. One request = one model call. The tool loop lives in core.
-Llm: { stream(request: LlmRequest): Stream<LlmEvent, LlmError> }
+Llm: { stream(request: LlmRequest): Stream<LlmEvent, LlmError>; holdDuring?<A, E, R>(turn: Stream<A, E, R>): Stream<A, E, R> }
+// `holdDuring` (optional, 2026-11-17): keeps the instance alive while `turn` runs, every round of its tool loop and the
+// gaps between them included; `makeModelAgent` wraps each turn in it (serve mode's resource pool, docs/ASSISTANTS.md §3.2).
 LlmRequest = { system: string; context?: string; messages: ReadonlyArray<Message>; tools: ReadonlyArray<ToolSpec> }
 // `system` is the stable instructions (identical across turns, cacheable); `context` is the
 // per-turn context-provider output (omitted when empty), placed by the adapter after any cached prefix.
