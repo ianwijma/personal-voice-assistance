@@ -1,4 +1,4 @@
-# profile-head 1.0.0: frame digests of a scripted conversation at default settings (docs/CHARACTERS.md §6.6).
+# profile-head 1.1.0: frame digests of a scripted conversation at default settings (docs/CHARACTERS.md §6.6).
 # A change here must be deliberate: check the look, then update with `pnpm --filter @pva/web exec vitest run test/characters -u`.
 dark  0.5 idle        308 24387684
 dark  1.0 listening   583 dc064daf
@@ -47,3 +47,26 @@ light 11.0 idle        605 d848563e
 overflow 160×140×1 0.0 px
 overflow 900×420×1 0.0 px
 overflow 720×240×2 0.0 px
+stage  0.5 idle        308 3b7f1a04
+stage  1.0 listening   583 b99cdd0f
+stage  1.5 listening   324 aeefa6f9
+stage  2.0 hearing     324 46a4f878
+stage  2.5 hearing     605 bd1ff087
+stage  3.0 hearing     614 39f6116e
+stage  3.5 hearing     620 ae542dd7
+stage  4.0 hearing     620 459ebdc4
+stage  4.5 hearing     629 9403fa42
+stage  5.0 thinking    684 b596e8a8
+stage  5.5 thinking    738 1a178f38
+stage  6.0 thinking    467 0ba6d24a
+stage  6.5 speaking    443 a06a9767
+stage  7.0 speaking    448 fe48665f
+stage  7.5 speaking    372 d0c665bc
+stage  8.0 speaking    369 600f9960
+stage  8.5 speaking    363 084c789c
+stage  9.0 speaking    354 a1d0b289
+stage  9.5 listening   629 d8417f9c
+stage 10.0 listening   339 4dac2874
+stage 10.5 idle        336 91e4d145
+stage 11.0 idle        605 9b16f08d
+stage 1280×800×1 focus 720×240 at 280,200: solid drawing x 517.9..787.8, y 224.0..428.0

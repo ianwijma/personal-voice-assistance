@@ -108,8 +108,10 @@ const WAVES = 10
 
 const create = (canvas: HTMLCanvasElement): CharacterInstance => {
   let g = setup2d(canvas)
-  let W = 1
+  let W = 1 // the focus box's size, set each frame
   let H = 1
+  let CW = 1 // the canvas (the whole stage)
+  let CH = 1
   let dpr = 1
   const seed = instanceSeed(11)
   const mix = new ModeMix()
@@ -215,13 +217,16 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
 
   return {
     resize(width, height, ratio) {
-      W = width
-      H = height
+      CW = width
+      CH = height
       dpr = ratio
       g = setup2d(canvas, dpr)
     },
 
     frame(f: Frame) {
+      const fo = f.focus
+      W = fo.width
+      H = fo.height
       const dt = f.dt
       const P = f.palette
       const reduced = f.reducedMotion
@@ -354,8 +359,8 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
       // ---- Colours.
       const alert = mix.pick(ALERT)
       mixInto(lineRgb, P.inkFaint, P.ink, 0.35 + 0.65 * alert)
-      clear2d(g, dpr)
-      if (facing.shown === "left") g.setTransform(-dpr, 0, 0, dpr, W * dpr, 0) // mirrored: facing left
+      clear2d(g, dpr, fo) // (0, 0) is the box's top-left corner; the canvas reaches beyond it on every side
+      if (facing.shown === "left") g.setTransform(-dpr, 0, 0, dpr, dpr * (fo.x + W), dpr * fo.y) // mirrored about the box: facing left
       if (fade < 1) g.globalAlpha = fade
       g.lineCap = "round"
       g.lineJoin = "round"
@@ -395,7 +400,7 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
           for (let pass = 0; pass < 2; pass++) {
             g.save()
             g.beginPath()
-            if (pass === 0) g.rect(0, 0, W, H) // outside: canvas minus head (even-odd)
+            if (pass === 0) g.rect(facing.shown === "left" ? W - CW + fo.x : -fo.x, -fo.y, CW, CH) // outside: the whole canvas (in mirrored coordinates when facing left) minus head (even-odd)
             headPath(g)
             g.clip(pass === 0 ? "evenodd" : "nonzero")
             const k = pass === 0 ? 1 : 0.35
@@ -612,7 +617,7 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
 const design: Character = {
   id: "profile-head",
   name: "Profile head",
-  version: "1.0.0",
+  version: "1.1.0",
   contract: 1,
   family: "figure",
   summary: "A head in side profile: your voice arrives at the ear as mint wavefronts and drops in as dots, the dots link up and turn amber while it thinks, and leave the mouth as amber waves when it speaks.",
@@ -658,6 +663,7 @@ const design: Character = {
     }
   ],
   renderer: "2d",
+  canvas: "stage",
   options: [
     sizeOption(0.5, 1.2),
     {
