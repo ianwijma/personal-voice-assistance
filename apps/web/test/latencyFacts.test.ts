@@ -124,7 +124,7 @@ describe("latency page: what changed since a turn", () => {
   const now = (over: Partial<AssistantInfo>): AssistantInfo => ({ ...assistant, ...over })
 
   it("names a changed account, effort, thinking and reply length", () => {
-    const a = now({ llm: { ...assistant.llm, account: "claude-subscription", effort: "high", thinking: "adaptive", maxTokens: 2048 } })
+    const a = now({ llm: { ...assistant.llm, account: "claude-subscription", useModules: true, effort: "high", thinking: "adaptive", maxTokens: 2048 } })
     expect(changedSince(trace(), ctx({ assistants: [a] }))).toEqual([
       "account Anthropic API → Claude subscription",
       "effort low → high",
