@@ -23,12 +23,22 @@ const STYLES = ["soft", "crisp", "line"] as const
 /** Seconds an option that reshapes the masks must hold still before they are rebuilt, and the crossfade after. */
 const MASK_SETTLE = 0.15
 const MASK_FADE = 0.3
+/**
+ * Pixels of the glow's work surface per CSS pixel, whatever the device pixel ratio. The glow is soft
+ * (its tightest falloff spans about 6 % of the short side), so it is drawn at half resolution and
+ * scaled up; the shape's edge (the rounded corners) is cut at full resolution by a clip, and the
+ * border line, pulses and chevrons are drawn at full resolution. Rasterising the two layers at full
+ * device resolution cost about 3 ms a frame on a 720 × 240 stage (13 ms at ratio 2); this is a
+ * quarter of that or less, and constant across ratios.
+ */
+const GLOW_SCALE = 0.5
 
 const create = (canvas: HTMLCanvasElement): CharacterInstance => {
   let g = setup2d(canvas)
   let W = 1
   let H = 1
   let dpr = 1
+  let gk = 1 // work-surface pixels per CSS pixel
   let D0 = 20 // glow depth at "Glow depth" 1
   let CR0 = 12 // corner radius at "Corner roundness" 1
   let D = 20 // glow depth (eased option applied)
@@ -173,7 +183,8 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
       masks = new MaskPair(pw, ph)
       spare = new MaskPair(pw, ph)
     }
-    masks.build(cr * dpr, D0 * ds * dpr * 0.38, 1.8, D0 * ds * dpr * 1.15, 2.4)
+    masks.build(cr * gk, D0 * ds * gk * 0.38, 1.8, D0 * ds * gk * 1.15, 2.4)
+    masks.cr = cr
     maskDs = ds
     maskCs = cs
   }
@@ -190,8 +201,9 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
       D = D0 * depthG
       CR = cornerRadius(cornerG)
       layout()
-      const pw = Math.max(1, Math.round(W * dpr))
-      const ph = Math.max(1, Math.round(H * dpr))
+      gk = Math.min(dpr, GLOW_SCALE)
+      const pw = Math.max(1, Math.round(W * gk))
+      const ph = Math.max(1, Math.round(H * gk))
       work = new OffscreenCanvas(pw, ph)
       wg = work.getContext("2d")!
       prev = null
@@ -354,7 +366,7 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
       for (let layer = 0; layer < 2; layer++) {
         const weight = layer === 0 ? 1 - lineOnly : reach * Math.max(0, 1 - crisp - lineOnly)
         if (weight < 0.01) continue
-        const gr = wg.createConicGradient(0, cx * dpr, cy * dpr)
+        const gr = wg.createConicGradient(0, PW / 2, PH / 2)
         for (let i = 0; i <= STOPS; i++) {
           const j = i % STOPS
           const at = i === STOPS ? 1 : stopAngle[j]! / TAU
@@ -375,7 +387,14 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
           wg.drawImage(mask, 0, 0)
           g.globalCompositeOperation = dark ? "lighter" : "source-over"
           g.globalAlpha = Math.min(1, weight * (dark ? 0.95 : 0.85)) * share
+          // The masks run on past the rounded corners, so scaling them up cannot soften the corner
+          // edge; the clip cuts it at full resolution instead.
+          g.save()
+          g.beginPath()
+          g.roundRect(0, 0, W, H, pair.cr)
+          g.clip()
           g.drawImage(work, 0, 0, W, H)
+          g.restore()
         }
       }
       g.globalAlpha = 1
@@ -463,7 +482,8 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
 
 /**
  * Two alpha masks that are opaque at the border of a rounded rectangle and fade smoothly inward as
- * (1 − d/depth)^power, one per (depth, power) pair: `near` (tight) and `far` (deep). The canvases
+ * (1 − d/depth)^power, one per (depth, power) pair: `near` (tight) and `far` (deep). They stay opaque
+ * outside the rounded rectangle (in the corners), so the shape is cut by a clip at draw time. The canvases
  * and pixel buffers are allocated once per size; `build` is run on resize and when the depth or
  * corner options settle. The shape is symmetric, so one quadrant is computed and mirrored, and only
  * the band within the deeper depth of the border is visited.
@@ -475,6 +495,8 @@ class MaskPair {
   private readonly gFar: OffscreenCanvasRenderingContext2D
   private readonly iNear: ImageData
   private readonly iFar: ImageData
+  /** Corner radius (CSS px) of the shape the masks were built for, for the clip. */
+  cr = 0
   constructor(w: number, h: number) {
     this.near = new OffscreenCanvas(w, h)
     this.far = new OffscreenCanvas(w, h)
@@ -512,8 +534,8 @@ class MaskPair {
         const oy = qy > 0 ? qy : 0
         const sd = Math.sqrt(ox * ox + oy * oy) + Math.min(Math.max(qx, qy), 0) - cr
         const d = -sd // distance inside
-        const va = d < 0 || d > depthA ? 0 : lutA[Math.round(d * kA)]!
-        const vb = d < 0 || d > depthB ? 0 : lutB[Math.round(d * kB)]!
+        const va = d > depthA ? 0 : lutA[d < 0 ? 0 : Math.round(d * kA)]!
+        const vb = d > depthB ? 0 : lutB[d < 0 ? 0 : Math.round(d * kB)]!
         if (va === 0 && vb === 0) continue
         const x2 = w - 1 - x
         const i0 = (y * w + x) * 4 + 3
