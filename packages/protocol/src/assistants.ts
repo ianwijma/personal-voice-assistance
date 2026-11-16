@@ -270,8 +270,9 @@ export interface HomeValues {
  * module, or an assistant's own value, wins over them.
  */
 export const linkedModuleDefaults = (home: HomeValues): Record<string, Record<string, SettingValue>> => ({
-  weather: { defaultPlace: home.location ?? "", units: home.units === "imperial" ? "fahrenheit" : "celsius" },
-  clock: { timeZone: home.timeZone, locale: home.dateFormat }
+  // Trimmed as in `homeLineOf`, so the prompt and the modules read the same place and zone.
+  weather: { defaultPlace: (home.location ?? "").trim(), units: home.units === "imperial" ? "fahrenheit" : "celsius" },
+  clock: { timeZone: home.timeZone.trim(), locale: home.dateFormat }
 })
 
 /** The tools of `moduleId` this assistant may use: the module is on and the tool is not switched off. */

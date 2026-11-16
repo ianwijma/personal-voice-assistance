@@ -21,7 +21,7 @@ interface Probe {
 }
 
 /** A clock-like module: `format` is overridable, `place` is not, `token` is a secret; tool `say` answers with them. */
-const datesModule = (probe: Probe, options: { readonly toolMillis?: number } = {}) =>
+const datesModule = (probe: Probe, options: { readonly toolMillis?: number; readonly slowFormat?: string } = {}) =>
   defineModule({
     id: "dates",
     name: "Dates",
@@ -39,6 +39,7 @@ const datesModule = (probe: Probe, options: { readonly toolMillis?: number } = {
     start: ({ settings }) =>
       Effect.gen(function*() {
         probe.starts.push({ format: settings.format, place: settings.place })
+        if (settings.format === options.slowFormat) yield* Effect.sleep(1_000)
         if (settings.format === "fail") return yield* new ModuleStartError({ message: "This format cannot start" })
         const label = `${settings.format}@${settings.place}`
         yield* Effect.addFinalizer(() => Effect.sync(() => probe.closes.push(label)))
@@ -62,7 +63,14 @@ const datesModule = (probe: Probe, options: { readonly toolMillis?: number } = {
   })
 
 /** A host over `datesModule` whose demand is the mutable `demand` (no demand at all: a module without an entry). */
-const setup = (options: { readonly defaults?: Record<string, unknown>; readonly toolMillis?: number; readonly saved?: Record<string, unknown> } = {}) =>
+const setup = (
+  options: {
+    readonly defaults?: Record<string, unknown>
+    readonly toolMillis?: number
+    readonly slowFormat?: string
+    readonly saved?: Record<string, unknown>
+  } = {}
+) =>
   Effect.gen(function*() {
     const probe: Probe = { starts: [], closes: [], calls: [] }
     const state: { demand: Array<ModuleDemand>; defaults: Record<string, unknown> | undefined } = { demand: [], defaults: options.defaults }
@@ -262,6 +270,24 @@ describe("module instances (WP-12b)", () => {
       assert.include(["nl-NL@here", "en-US@here"], yield* ask("a"))
       yield* Fiber.join(fiber)
       assert.strictEqual(yield* ask("a"), "en-US@here")
+    }).pipe(Effect.scoped))
+
+  it.effect("an assistant leaving a shared instance keeps it until its own instance has started", () =>
+    Effect.gen(function*() {
+      const { ask, host, info, state } = yield* setup({ slowFormat: "nl-NL" })
+      state.demand = [{ assistantId: "a" }, { assistantId: "b" }]
+      yield* host.startEnabled
+      // B gets an own value whose instance takes a second to start; A keeps the shared one.
+      state.demand = [{ assistantId: "a" }, { assistantId: "b", own: { format: "nl-NL" } }]
+      const fiber = yield* Effect.forkChild(host.refresh)
+      yield* advance(10)
+      assert.deepStrictEqual(info().instances?.map((r) => [r.assistants, r.state]), [[["a"], "running"], [["b"], "starting"]])
+      assert.strictEqual(yield* ask("b"), "en-GB@here", "B is served by the shared instance while its own starts")
+      assert.strictEqual(yield* ask("a"), "en-GB@here")
+      yield* advance(1_000)
+      yield* Fiber.join(fiber)
+      assert.strictEqual(yield* ask("b"), "nl-NL@here")
+      assert.strictEqual(yield* ask("a"), "en-GB@here")
     }).pipe(Effect.scoped))
 
   it.effect("a module without demand keeps one instance following its switch, with linked defaults", () =>

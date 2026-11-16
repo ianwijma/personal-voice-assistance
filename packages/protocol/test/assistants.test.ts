@@ -545,6 +545,11 @@ describe("module settings (section 2.6)", () => {
       clock: { timeZone: "Europe/Amsterdam", locale: "nl-NL" }
     })
     expect(linkedModuleDefaults({ units: "metric", timeZone: "", dateFormat: "en-GB" }).weather?.units).toBe("celsius")
+    // Home accepts a zone with spaces around it (its check trims); the linked default is the bare zone.
+    expect(linkedModuleDefaults({ location: " Utrecht ", units: "metric", timeZone: " Asia/Tokyo ", dateFormat: "en-GB" })).toEqual({
+      weather: { defaultPlace: "Utrecht", units: "celsius" },
+      clock: { timeZone: "Asia/Tokyo", locale: "en-GB" }
+    })
     const eff = resolveModuleSettings({
       choice: undefined,
       overridable: ["timeZone", "locale"],
