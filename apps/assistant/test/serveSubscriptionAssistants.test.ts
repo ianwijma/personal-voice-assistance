@@ -47,7 +47,8 @@ const dataDir = async (): Promise<string> => {
     name: "Alpha",
     prompt: "You are Alpha.",
     replyEarly: false,
-    llm: { ...llm, model: "claude-sonnet-5-5", effort: "high", useModules: true, freshSessionAfterMinutes: 60 }
+    // A longest reply other than the stand-in's 1024: the subscription does not use it (the snapshot records 1024).
+    llm: { ...llm, model: "claude-sonnet-5-5", effort: "high", maxTokens: 2048, useModules: true, freshSessionAfterMinutes: 60 }
   }
   const bravo = {
     ...base,
@@ -158,9 +159,11 @@ describe("Claude subscription per assistant (WP-13a)", () => {
     expect(qb.options.systemPrompt ?? qb.received[0]).toContain("You are Bravo.")
     expect(qb.registered).toEqual([])
     await until("two traces", () => traces(admin).length === 2)
+    // No token limit is passed to Claude Code: the snapshot records the stand-in's 1024, not Alpha's saved 2048.
+    expect(assistantOf("alpha").llm.maxTokens).toBe(2048)
     expect(traces(admin).map((t) => [t.assistant?.id, t.config?.llm])).toEqual([
-      ["alpha", { account: "claude-subscription", model: "claude-sonnet-5-5", effort: "high", thinking: "off", maxTokens: assistantOf("alpha").llm.maxTokens }],
-      ["bravo", { account: "claude-subscription", model: "claude-opus-5-5", effort: "low", thinking: "off", maxTokens: assistantOf("bravo").llm.maxTokens }]
+      ["alpha", { account: "claude-subscription", model: "claude-sonnet-5-5", effort: "high", thinking: "off", maxTokens: 1024 }],
+      ["bravo", { account: "claude-subscription", model: "claude-opus-5-5", effort: "low", thinking: "off", maxTokens: 1024 }]
     ])
     expect(traces(admin)[1]!.config?.tools).toBe(0)
   })
@@ -231,7 +234,7 @@ describe("Claude subscription per assistant (WP-13a)", () => {
     const dir = await dataDir()
     const path = join(dir, "settings.json")
     const file = JSON.parse(readFileSync(path, "utf8")) as Json
-    file.assistants.byId.alpha.llm = { ...file.assistants.byId.alpha.llm, model: "claude-opus-5-5", effort: "high", thinking: "adaptive", useModules: false }
+    file.assistants.byId.alpha.llm = { ...file.assistants.byId.alpha.llm, model: "claude-opus-5-5", effort: "high", thinking: "adaptive", maxTokens: 2048, useModules: false }
     file.assistants.byId.alpha.modules = { greeter: { on: true, offTools: [] } }
     file.assistants.byId.bravo.on = false
     file.modules = { ...file.modules, greeter: { enabled: true, settings: { greeting: "hello" } } }
@@ -253,9 +256,9 @@ describe("Claude subscription per assistant (WP-13a)", () => {
     const page = await connect("device-desk")
     await page.hello()
     const llmStatus = () => server!.handle.resources.status().filter((r) => r.kind === "llm")
-    const maxTokens = assistantOf("alpha").llm.maxTokens
-    const onSubscription = { account: "claude-subscription", model: "claude-opus-5-5", effort: "high", thinking: "adaptive", maxTokens }
-    const onApi = { account: "anthropic", model: "claude-opus-5-5", effort: "high", thinking: "adaptive", maxTokens }
+    // The API uses the saved longest reply; the subscription none (the stand-in's 1024 is recorded).
+    const onSubscription = { account: "claude-subscription", model: "claude-opus-5-5", effort: "high", thinking: "adaptive", maxTokens: 1024 }
+    const onApi = { account: "anthropic", model: "claude-opus-5-5", effort: "high", thinking: "adaptive", maxTokens: 2048 }
 
     expect(await typed(page, "alpha", "one", "t1")).toBe("Claude heard: one")
     // To the Claude API, keeping the fields, with warm-up: while that instance is built the subscription binding answers.

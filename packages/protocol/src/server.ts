@@ -120,7 +120,9 @@ export const ToolStart = Schema.Struct({
   /** The module that contributed the tool (null for an unknown tool name). */
   moduleId: Schema.NullOr(ModuleId),
   /** The model's input, truncated by the server to about 2 KB of JSON. */
-  input: Schema.Json
+  input: Schema.Json,
+  /** Protocol 7: the assistant whose turn it is (as on `turn.start`), so a tab that joined mid-turn files it right. */
+  assistantId: Schema.optionalKey(AssistantId)
 })
 
 export const ToolEnd = Schema.Struct({
@@ -130,7 +132,9 @@ export const ToolEnd = Schema.Struct({
   ok: Schema.Boolean,
   ms: NonNegativeFinite,
   /** The error returned to the model, when `ok` is false. */
-  error: Schema.optionalKey(Schema.String)
+  error: Schema.optionalKey(Schema.String),
+  /** Protocol 7: the assistant whose turn it is (as on `turn.start`). */
+  assistantId: Schema.optionalKey(AssistantId)
 })
 
 /** A committed turn ended. `trace` is its latency trace. */

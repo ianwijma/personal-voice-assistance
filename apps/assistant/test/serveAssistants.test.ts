@@ -257,6 +257,45 @@ describe("assistants on one device (WP-4b)", () => {
     expect(await page.waitFor("turn.start", () => true, { from, timeoutMs: 10_000 })).toMatchObject({ assistantId: "alpha", userText: "what time is it" })
   })
 
+  it("the holder comes from the routing state, not the display: a sentence that outlasts the hearing timer stays the armed assistant's, and a muted microphone keeps a follow-up holder", async () => {
+    const { stt } = await start(await twoAssistantsDataDir((file) => {
+      file.deviceTypes["web-voice"].withoutPhrase = { mode: "assistant", assistant: "alpha" }
+    }))
+    const page = await connect()
+    await page.hello()
+    await page.claim()
+    await untilOpen(stt, 1)
+
+    // "hey bravo" alone arms Bravo; the next sentence starts and, with no interims (Whisper), lasts past the 2 s
+    // hearing timer: the display goes back to listening while the utterance is still open and still Bravo's.
+    let from = page.messages.length
+    stt.emit(speechStarted, endOfTurn("hey bravo"))
+    await page.waitFor("state", (m) => m.state === "listening" && m.holder === "bravo", { from, timeoutMs: 5_000 })
+    from = page.messages.length
+    stt.emit(speechStarted)
+    await page.waitFor("state", (m) => m.state === "hearing" && m.holder === "bravo", { from })
+    const tail = await page.waitFor("state", (m) => m.state === "listening", { from, timeoutMs: 5_000 })
+    expect(tail.holder).toBe("bravo")
+    // A tab joining now is told the same.
+    const tab = await ScriptedClient.connect({ url: server!.url, deviceId: page.device.id })
+    clients.push(tab)
+    expect((await tab.hello()).snapshot.holder).toBe("bravo")
+    stt.emit(endOfTurn("tell me a joke"))
+    const begun = await page.waitFor("turn.start", () => true, { from, timeoutMs: 10_000 })
+    expect(begun.assistantId).toBe("bravo")
+    const holders = page.messages.slice(from, page.messages.indexOf(begun)).filter((m) => m.type === "state").map((m) => (m as { holder?: string | null }).holder)
+    expect(holders).not.toContain(null)
+    expect(holders).not.toContain("alpha")
+    await page.waitFor("turn.end", (m) => m.turnId === begun.turnId, { from, timeoutMs: 10_000 })
+    await page.waitFor("state", (m) => m.state === "listening" && m.holder === "bravo", { from, timeoutMs: 5_000 })
+
+    // Bravo's follow-up window is open (8 s): muting the microphone makes the display idle, the turn stays Bravo's.
+    from = page.messages.length
+    page.send({ type: "mic.state", live: false })
+    const muted = await page.waitFor("state", (m) => m.state === "idle", { from, timeoutMs: 5_000 })
+    expect(muted.holder).toBe("bravo")
+  })
+
   it("a new conversation or Stop while a sentence is heard cancels that sentence: its assistant holds the turn no longer, and no turn follows", async () => {
     const { stt } = await start(await twoAssistantsDataDir((file) => {
       file.assistants.byId.bravo.followUpSeconds = 0

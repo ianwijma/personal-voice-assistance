@@ -29,7 +29,10 @@ turn, so switching the module on or off applies from the next turn (`apps/assist
   settings. A changed model or effort applies from the conversation's next turn on its running session (`setModel` and
   the `effortLevel` flag setting, as Claude Code's /model and /effort; checked live: the next reply reports the new
   model); a changed thinking setting, or a change Claude Code does not confirm within 3 s, replaces the session (the
-  new one is told what was said). The warm spare is retuned the same way before its first message. The module's opt-in,
+  new one is told what was said). The warm spare is retuned the same way before its first message. A conversation's
+  turns take, retune and bind its session one at a time, in order, up to sending their message, also when a turn is
+  cancelled meanwhile: the next turn compares its options with what Claude Code confirmed, never with a change still
+  pending (a session whose change was not confirmed is replaced). The module's opt-in,
   program, proxy and debug logs are the account's, shared by every assistant on it.
 - **Warm first turn**: the system prompt and tools are not known at module start, so the first session is
   *provisional*: a fixed short system prompt; the first message carries the real prompt in `<instructions>` and the

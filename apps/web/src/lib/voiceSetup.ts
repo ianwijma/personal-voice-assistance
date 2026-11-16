@@ -66,10 +66,19 @@ export const nameOf = (s: ClientState, id: string | undefined): string => assist
 /** The assistant that owns a message's `assistantId`; without one (a server that does not say) the answering one. */
 export const ownerKey = (s: ClientState, assistantId: string | undefined): string => assistantId ?? answeringId(s) ?? ""
 
+/**
+ * Where a turn that no message has named yet is filed (a server that does not say, or the moment before its first
+ * tagged message): who answers without a phrase, never who has the turn now, so a later change of holder moves no turn.
+ */
+const unownedKey = (s: ClientState): string => answeringId(s.holder === undefined ? s : { ...s, holder: undefined }) ?? ""
+/** The conversation a turn belongs to: its own assistant (set once, `state.ts` `ownedBy`), else `unownedKey`. */
+const turnKey = (t: TurnView, unowned: string): string => t.assistantId ?? unowned
+
 /** The assistant named next to the state ("Speaking · T3"): who has the turn, unless it is the one that answers anyway. */
 export const stripAssistantId = (s: ClientState): string | undefined => {
   if ((s.setup?.assistants.length ?? 0) < 2) return undefined // one assistant on the device: nothing to tell apart
-  const id = s.woke?.assistantId ?? holderOf(s)
+  // A server that names the holder is taken as it is; the wake's assistant only stands in for one that does not.
+  const id = s.holderTold ? holderOf(s) : s.woke?.assistantId ?? holderOf(s)
   return id !== undefined && id !== defaultAssistantId(s.setup) && idsOf(s.setup).includes(id) ? id : undefined
 }
 
@@ -155,8 +164,10 @@ export const newConversationToast = (s: ClientState): string => {
 // ---- Conversations
 
 /** The page's turns of one assistant's conversation, oldest first. */
-export const turnsOf = (s: ClientState, id: string | undefined): ReadonlyArray<TurnView> =>
-  s.turns.filter((t) => (t.assistantId ?? answeringId(s) ?? "") === (id ?? ""))
+export const turnsOf = (s: ClientState, id: string | undefined): ReadonlyArray<TurnView> => {
+  const unowned = unownedKey(s)
+  return s.turns.filter((t) => turnKey(t, unowned) === (id ?? ""))
+}
 
 /** Exchanges to show for one assistant in the switcher. */
 export const exchangesOf = (s: ClientState, id: string): number => {
@@ -211,7 +222,7 @@ export const atWelcome = (
   previous: ClientState,
   snapshot: Snap & Pick<Snapshot, "answering" | "holder">,
   toTurns: (history: ReadonlyArray<HistoryItem>) => ReadonlyArray<TurnView>
-): Pick<ClientState, "setup" | "holder" | "conversations" | "turns"> => {
+): Pick<ClientState, "setup" | "holder" | "holderTold" | "conversations" | "turns"> => {
   const setup = snapshot.setup
   const probe = { setup, holder: snapshot.answering, ui: previous.ui } as unknown as ClientState
   const answering = answeringId(probe) ?? ""
@@ -234,7 +245,7 @@ export const atWelcome = (
   const holder = snapshot.holder !== undefined
     ? snapshot.holder ?? undefined
     : answering === answeringId({ ...probe, holder: undefined }) ? undefined : holderOf(probe)
-  return { setup, holder, conversations, turns }
+  return { setup, holder, holderTold: snapshot.holder !== undefined, conversations, turns }
 }
 
 /**
@@ -247,7 +258,10 @@ export const onSetup = (s: ClientState, m: Extract<ServerMessage, { type: "devic
   return { ...s, setup, holder }
 }
 
-const withoutAssistant = (s: ClientState, key: string) => s.turns.filter((t) => (t.assistantId ?? answeringId(s) ?? "") !== key)
+const withoutAssistant = (s: ClientState, key: string) => {
+  const unowned = unownedKey(s)
+  return s.turns.filter((t) => turnKey(t, unowned) !== key)
+}
 
 /** `conversation`: a conversation of one assistant began (new / idle) or went on (resumed). */
 export const onConversation = (s: ClientState, m: Extract<ServerMessage, { type: "conversation" }>): ClientState => {
@@ -256,7 +270,8 @@ export const onConversation = (s: ClientState, m: Extract<ServerMessage, { type:
   if (m.reason === "resumed") {
     return { ...s, conversations: { ...s.conversations, [key]: { id: m.id, startedAt: m.startedAt, turns: before?.turns ?? 0, loaded: before?.loaded ?? false, ...(before?.divider !== undefined ? { divider: before.divider } : {}) } } }
   }
-  const stale = s.turns.flatMap((t) => (t.turnId === undefined || (t.assistantId ?? answeringId(s) ?? "") !== key ? [] : [t.turnId]))
+  const unowned = unownedKey(s)
+  const stale = s.turns.flatMap((t) => (t.turnId === undefined || turnKey(t, unowned) !== key ? [] : [t.turnId]))
   return {
     ...s,
     conversations: { ...s.conversations, [key]: { id: m.id, startedAt: m.startedAt, turns: 0, loaded: true, divider: m.reason } },
@@ -278,7 +293,8 @@ export const onHistory = (
   // committed without a reply). The server names the turn whose exchange ends the history (`lastTurnId`): a turn
   // running on this page with that id is the page's live view of that exchange, so the exchange goes and the turn
   // stays. Every other running turn is not in the history yet (an exchange is committed when its turn ends): it stays.
-  const mine = (t: TurnView) => (t.assistantId ?? answeringId(s) ?? "") === key && t.turnId !== undefined && t.outcome === undefined
+  const unowned = unownedKey(s)
+  const mine = (t: TurnView) => turnKey(t, unowned) === key && t.turnId !== undefined && t.outcome === undefined
   const live = m.lastTurnId === undefined ? undefined : s.turns.find((t) => mine(t) && t.turnId === m.lastTurnId)
   // That exchange starts at the history's last user message (each committed turn begins with its one user message).
   const from = live === undefined ? -1 : m.history.findLastIndex((h) => h.role === "user")
