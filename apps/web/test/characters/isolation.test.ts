@@ -271,8 +271,11 @@ const scan = (src: string): ReadonlyArray<Reading> => {
         const q = st.prev2
         if (ch === "(") {
           const control = p.kind === "word" && !p.property && CONTROL.has(p.value)
-          // `function (`, `function name (`, `function* name (`: a body follows that may be an expression.
-          const fn = p.kind === "word" && (p.value === "function" || (q.kind === "word" && q.value === "function") || (q.kind === "punct" && q.value === "*"))
+          // `function (`, `function name (`, `function* (`, `function* name (` (also after `async`): a body follows that
+          // may be an expression. A method's body (`*name() {}`, `async name() {}`) cannot be divided: it ends a member.
+          const isFunction = (t: Token) => t.kind === "word" && t.value === "function"
+          const isStar = (t: Token) => t.kind === "punct" && t.value === "*"
+          const fn = isFunction(p) || (isStar(p) && isFunction(q)) || (p.kind === "word" && (isFunction(q) || isStar(q)))
           st.stack.push({ open: "(", control, fn, brace: "unknown" })
         } else st.stack.push({ open: ch, control: false, fn: false, brace: ch === "{" ? braceAfter(p) : "unknown" })
         push({ kind: "punct", value: ch })
@@ -397,6 +400,32 @@ describe("character isolation", () => {
     // A function expression or a class expression can be divided; a declaration's body is followed by a statement.
     expect(analyse("const f = function () {} / window.x / 2").globals[0]).toBe("window")
     expect(analyse("const C = class {} / window.x / 2").globals[0]).toBe("window")
+    // A generator or async function expression too, with or without a name (review of #12: `*` before the parameters).
+    expect(analyse("const r = function* () {} / window.innerWidth / 2").globals[0]).toBe("window")
+    expect(analyse("const r = function*() {} / window.x / 2").globals[0]).toBe("window")
+    expect(analyse("const r = function /* c */ * /* d */ () {} / window.x / 2").globals[0]).toBe("window")
+    expect(analyse("const r = function* g() {} / window.x / 2").globals[0]).toBe("window")
+    expect(analyse("const r = async function () {} / window.x / 2").globals[0]).toBe("window")
+    expect(analyse("const r = async function* () {} / window.x / 2").globals[0]).toBe("window")
+    expect(analyse("const r = async function* g() {} / window.x / 2").globals[0]).toBe("window")
+    // A parenthesized arrow function with a block body divides (`() => {} / x` alone is a syntax error).
+    expect(analyse("const r = (() => {}) / window.x / 2").globals[0]).toBe("window")
+    expect(analyse("const r = (async () => {}) / window.x / 2").globals[0]).toBe("window")
+    // A generator function declaration followed by a real regular expression on a new statement: read both ways, and
+    // accepted when the names in it are local (it may be a division). A function expression followed by a new line
+    // really divides, so a global in what follows is reported.
+    expect(analyse("function* g() {}\n/local/.test(s)").globals[0]).toBeUndefined()
+    expect(analyse("async function* g() { yield 1 }\n/local|other/.test(s)").globals[0]).toBeUndefined()
+    expect(analyse("function* g() {}\n/window/.test(s)").globals[0]).toBe("window") // the division reading names it: fail closed
+    expect(analyse("const g = function* () {}\n/window/.test(s)").globals[0]).toBe("window")
+    // Methods end a member, not an operand: their bodies are read as code, and nothing divides after them.
+    expect(analyse("const o = { *g() { return window.x }, h: 1 }").globals[0]).toBe("window")
+    expect(analyse("const o = { async g() { return window.x } }").globals[0]).toBe("window")
+    expect(analyse("const o = { async *g() { yield window.x } }").globals[0]).toBe("window")
+    expect(analyse("class A { *g() { return window.x } }").globals[0]).toBe("window")
+    expect(analyse("class A { async g() { return window.x } }").globals[0]).toBe("window")
+    expect(analyse("class A { async *g() { yield window.x } }").globals[0]).toBe("window")
+    expect(analyse("class A { *g() {} async h() {} async *i() {} }\nconst n = 4 / 2").globals[0]).toBeUndefined()
     const both = analyse("function f() {}\n/window/.test(s)")
     expect(both.readings).toBe(2)
     expect(both.globals).toEqual(["window"]) // the division reading names it: reported
