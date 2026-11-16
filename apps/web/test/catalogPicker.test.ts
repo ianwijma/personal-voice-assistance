@@ -236,7 +236,7 @@ describe("the model catalog's calls", () => {
       changes.push(method)
       if (method === "PUT") {
         await new Promise<void>((resolve) => {
-          held.set("put", () => resolve())
+          answerPut = () => resolve()
         })
         const f = { model: ref, key, name: "Claude Haiku 5.5", addedAt: 1 }
         return reply({ favourite: f, favourites: [f] })
