@@ -67,6 +67,9 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
   const col: Col = [0, 0, 0]
   const arcCol: Col = [0, 0, 0]
   const tmp: Col = [0, 0, 0]
+  // Line-dash buffers, reused every frame (no per-frame allocation).
+  const dashWhisper: Array<number> = [0, 0]
+  const dashSolid: Array<number> = []
 
   /** Stroke an arc several times, wide-and-faint to narrow-and-bright: a cheap glow. */
   const glowArc = (cx: number, cy: number, r: number, a0: number, a1: number, width: number, c: Rgb, alpha: number, dark: boolean): void => {
@@ -155,8 +158,14 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
         ripGain[ripHead] = 0.4 + 0.6 * clamp01(L * 1.6)
         ripHead = (ripHead + 1) % RIPPLES
       }
-      for (let i = 0; i < BEADS; i++) beadAge[i] = beadAge[i]! + sdt
-      for (let i = 0; i < RIPPLES; i++) ripAge[i] = ripAge[i]! + sdt
+      if (reduced) {
+        // Reduced motion: whatever was in flight (sparks, ripples) is gone, not frozen or left moving.
+        beadAge.fill(99)
+        ripAge.fill(99)
+      } else {
+        for (let i = 0; i < BEADS; i++) beadAge[i] = beadAge[i]! + sdt
+        for (let i = 0; i < RIPPLES; i++) ripAge[i] = ripAge[i]! + sdt
+      }
 
       // Ring radius: small and still when ready, full while hearing or speaking.
       const loud = clamp01(L * 1.6)
@@ -169,6 +178,8 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
       const fit = Math.max(0, Math.min(room / (1.07 + bandK * thickK), (room - 40 * bandK * thickK) / 1.07))
       const Rs = Math.min(R * sizeK, fit)
       const rT = Rs * press * mix.of(0.5, 0.56, 1, 0.86, 1 + 0.07 * loud)
+      // A radius kept from a bigger focus must not outlast it: never above the largest the target can be.
+      if (radius.value > Rs * 1.07) radius.value = Rs * 1.07
       const r = radius.step(rT, dt)
       const cx = W / 2
       const cy = H / 2
@@ -219,13 +230,15 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
         const brightCol = dark ? mixInto(tmp, arcCol, WHITE, 0.1 + 0.35 * bright) : (arcCol)
         if (voiced < 0.35) {
           // Whisper: the arc breaks into a dotted line of small lights.
-          g.setLineDash([unitW * 1.5, unitW * 5])
+          dashWhisper[0] = unitW * 1.5
+          dashWhisper[1] = unitW * 5
+          g.setLineDash(dashWhisper)
         }
         for (let s = -1; s <= 1; s += 2) {
           const c = Math.PI / 2 - s * e
           glowArc(cx, cy, r, c - hl, c + hl, w, brightCol, a, dark)
         }
-        g.setLineDash([])
+        g.setLineDash(dashSolid)
         // Beads: each syllable landed at the pitch it had; they fade over 1.8 s.
         for (let i = 0; i < BEADS; i++) {
           const age = beadAge[i]!
@@ -362,7 +375,7 @@ const bandAt = (bands: Float32Array, ang: number): number => {
 const character: Character = {
   id: "light-ring",
   name: "Light ring",
-  version: "1.1.0",
+  version: "1.1.1",
   contract: 1,
   family: "abstract",
   renderer: "2d",

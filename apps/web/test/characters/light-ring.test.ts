@@ -470,6 +470,49 @@ describe("light ring: the styles", () => {
   })
 })
 
+describe("light ring: review fixes", () => {
+  it("a focus that shrinks takes the solid band inside it on the very next frame", () => {
+    const stage = [1280, 800] as const
+    const big: Focus = { x: 100, y: 100, width: 900, height: 420 }
+    const small: Focus = { x: 100, y: 100, width: 160, height: 140 }
+    const f = voice({ level: 1 })
+    f.bands.fill(1)
+    const r = make({}, stage)
+    settle(r, "speaking", 120, { agent: f, palette: PALETTES.light, focus: big })
+    const calls = frame(r, "speaking", { agent: f, palette: PALETTES.light, focus: small })
+    const band = polygons(calls).find((p) => p.pts.length >= 97)!
+    const reach = Math.max(...band.pts.slice(0, 97).map(([x, y]) => Math.hypot(x - small.width / 2, y - small.height / 2)))
+    expect(reach - small.height / 2).toBeLessThanOrEqual(0.01)
+  })
+
+  it("reduced motion switched on mid-flight clears the beads and ripples already travelling", () => {
+    const spark = run(make(), "hearing", 6, "user", syllables([2]))
+    expect(beads(spark[5]!)).toHaveLength(2)
+    const r = make()
+    run(r, "hearing", 6, "user", syllables([2]))
+    expect(beads(frame(r, "hearing", { user: voice(), reduced: true }))).toHaveLength(0)
+
+    const LIGHT = { palette: PALETTES.light }
+    const s = make()
+    run(s, "speaking", 6, "agent", syllables([2]), LIGHT)
+    const calls = frame(s, "speaking", { agent: voice(), reduced: true, ...LIGHT })
+    const rr = ring(calls).r
+    const outer = arcs(calls).filter((a) => a.op === "stroke" && wholeCircle(a) && a.r > rr * 1.04)
+    expect(outer).toHaveLength(1)
+    expect(outer[0]!.r / rr).toBeCloseTo(1.22, 2)
+  })
+
+  it("hearing reuses its line-dash buffers instead of allocating them every frame", () => {
+    const r = make()
+    const seen = new Set<unknown>()
+    for (let i = 0; i < 40; i++) {
+      const calls = frame(r, "hearing", { user: voice({ voicing: i < 20 ? 0.05 : 1 }) })
+      for (const c of calls) if (c.name === "setLineDash") seen.add(c.args[0])
+    }
+    expect(seen.size).toBeLessThanOrEqual(2)
+  })
+})
+
 describe("light ring: staying inside the box", () => {
   /** The loudest, fullest reply: every band at 1, level 1. How far the solid band reaches past the box's edge (negative: room left). */
   const overshoot = (stored: Record<string, number>, size: readonly [number, number]) => {

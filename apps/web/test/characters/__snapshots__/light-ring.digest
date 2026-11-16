@@ -1,4 +1,4 @@
-# light-ring 1.1.0: frame digests of a scripted conversation at default settings (docs/CHARACTERS.md §6.6).
+# light-ring 1.1.1: frame digests of a scripted conversation at default settings (docs/CHARACTERS.md §6.6).
 # A change here must be deliberate: check the look, then update with `pnpm --filter @pva/web exec vitest run test/characters -u`.
 dark  0.5 idle         12 b5f8be9a
 dark  1.0 listening    19 b20ee1e8
