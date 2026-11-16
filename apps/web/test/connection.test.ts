@@ -1,13 +1,31 @@
 // @vitest-environment node
-import { afterEach, describe, expect, it } from "vitest"
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest"
 import { type AddressInfo } from "node:net"
 import { type ClientMessage, CloseCode, decodeClientMessage, decodeMicFrame, encodeReplyFrame, encodeServerMessage, PROTOCOL_VERSION, type ServerMessage } from "@pva/protocol"
 import { serverExamples } from "@pva/protocol/examples"
-import { WebSocketServer, type WebSocket as ServerSocket } from "ws"
+import { WebSocket as WsClient, WebSocketServer, type WebSocket as ServerSocket } from "ws"
 import { type AudioPort, backoffMs, makeConnection } from "@/lib/connection.ts"
 import { createClientStore } from "@/lib/store.ts"
 
 const timing = { openTimeoutMs: 1000, welcomeTimeoutMs: 500, pingEveryMs: 60, pongTimeoutMs: 150, requestTimeoutMs: 300, backoffBaseMs: 20, backoffMaxMs: 80 }
+
+/**
+ * The page's `WebSocket`, played here by the `ws` package. This file runs in the node
+ * environment, whose built-in WebSocket is undici's, and that changes between Node
+ * releases: Node 22.23 (undici 6.29) fires `error` for a refused connection but never
+ * `close`, which a browser always does. Run on a fixed implementation, the tests mean
+ * the same on every Node.
+ */
+class TestWebSocket extends WsClient {
+  constructor(url: string) {
+    super(url)
+    // `ws` is an EventEmitter and throws on an `error` with no listener, which the page's
+    // `onerror = null` (a browser would stay quiet) would otherwise leave behind.
+    this.on("error", () => undefined)
+  }
+}
+beforeAll(() => void vi.stubGlobal("WebSocket", TestWebSocket))
+afterAll(() => void vi.unstubAllGlobals())
 
 interface Peer {
   readonly ws: ServerSocket
