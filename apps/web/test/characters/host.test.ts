@@ -118,7 +118,10 @@ describe("loading and swapping", () => {
     expect(appRegistry.ids).toContain(BASELINE_ID)
     expect(await appRegistry.load(BASELINE_ID)).toBe(appRegistry.baseline)
     expect(appRegistry.load("no-such-character")).toBeUndefined()
-    for (const id of appRegistry.ids) expect(appRegistry.load(id)).toBeInstanceOf(Promise)
+    // Awaited, so no load is still running when the test environment is torn down.
+    const loads = appRegistry.ids.map((id) => appRegistry.load(id))
+    for (const l of loads) expect(l).toBeInstanceOf(Promise)
+    for (const c of await Promise.all(loads)) expect(c).toBeDefined()
   })
 
   it("a choice that arrives while another is loading wins", async () => {
