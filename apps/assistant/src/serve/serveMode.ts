@@ -391,10 +391,18 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
             return llm === undefined ? Stream.fail(new LlmError({ message: "The engines are not running." })) : llm.stream(request)
           })
       }))
+    /** Late-bound: every conversation is told when an assistant's binding may have changed its kind. */
+    let sessionsRef: VoiceSessions | undefined
     const resources = yield* makeResourcePool({
       buildLlm: options.buildLlm ?? (options.build === undefined ? defaultLlmBuilder(sections.configProvider) : engineLlmBuilder),
       ...(options.resourceGraceMs !== undefined ? { graceMs: options.resourceGraceMs } : {}),
-      onChange: () => engine?.refreshStatus(),
+      onChange: () => {
+        engine?.refreshStatus()
+        // A published binding can switch an assistant between the subscription agents and one model (`agentSetup`).
+        for (const session of sessionsRef?.all() ?? []) {
+          for (const c of session.conversation.dispatcher.conversations().values()) c.conversation.bindingChanged()
+        }
+      },
       explainProblem,
       log: (line) => runFork(Effect.logInfo(line))
     })
@@ -443,7 +451,11 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       // A Claude subscription assistant: the agent module answers; the pool's instance is the offline stand-in.
       let subscription: { readonly fallback: Llm["Service"]; readonly toAgents: (setup: TurnSetup) => AgentTurnSetup } | undefined
       const agentSetup = () => {
-        if (assistantsNow().get(assistantId)?.llm.account !== SUBSCRIPTION_PROVIDER) return undefined
+        // The account of the binding in use (a key starts with its account), not the saved one: while a changed
+        // model is still being built the old binding answers, the old way. Not bound yet: the saved account.
+        const key = resources.keyFor(assistantId)
+        const account = key === undefined ? assistantsNow().get(assistantId)?.llm.account : key.split("|")[0]
+        if (account !== SUBSCRIPTION_PROVIDER) return undefined
         return Effect.map(setup, (turn) => {
           const fallback = turn.llm ?? notInUse
           if (subscription?.fallback !== fallback) {
@@ -608,6 +620,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       onDiscard: (key) => hub?.sessionDiscarded(key),
       announce: (key, info) => hub?.toSession(key, { type: "conversation", id: info.id, reason: "new", startedAt: info.startedAt })
     })
+    sessionsRef = sessions
     // Before the lock is released and the engines close (finalizers run in reverse): every session's loop stops, and
     // no recording write or rotation happens after it.
     yield* Effect.addFinalizer(() => sessions.closeAll)

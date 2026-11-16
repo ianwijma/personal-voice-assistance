@@ -369,7 +369,10 @@ WebAudioInput ─▶ Stt(hearer) ─▶ EchoGate ─▶ RouteGate ─▶ Dispatc
   across resource switches as today across builds (:109-112). Its LLM is the pool's instance for the assistant's
   `LlmKey`, and its `Tts` the instance for its voice. A Claude subscription assistant uses `makeAgentConversation`
   with the subscription agents (§4.1). A conversation is made the first time something is routed to that assistant
-  on that device, so an assistant nobody talks to costs nothing.
+  on that device, so an assistant nobody talks to costs nothing. The kind (agents or one model) follows the pool's
+  binding in use, not the saved account: when a published binding changes it, that one conversation's loop restarts
+  with the other kind as on an engine rebuild (the turn in flight is dropped; history, id and idle clock are kept),
+  and the agents the ended loop used are told that the conversation ended (`endConversation`).
 - **Dispatcher** (`serve/SessionDispatcher.ts`, new) owns the routing state of one session:
   - **Barge-in owner**: the conversation whose committed turn is running, else none. `SpeechStarted` goes to it at
     once (barge-in as today; the echo gate has already dropped the assistant's own voice), and the dispatcher opens
