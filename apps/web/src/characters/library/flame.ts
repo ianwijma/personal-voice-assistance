@@ -39,8 +39,9 @@ const soft = (x: number, knee: number, room: number): number => (x <= knee ? x :
 
 const create = (canvas: HTMLCanvasElement): CharacterInstance => {
   let g = setup2d(canvas)
-  let W = 1
+  let W = 1 // the box (focus) size, set each frame
   let H = 1
+  let CH = 1 // the whole canvas's height
   let dpr = 1
 
   // Teardrop template: x = sin t · sin(t/2)^1.3, y = cos t (y up, tip at t = 0).
@@ -138,8 +139,7 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
 
   return {
     resize(width, height, ratio) {
-      W = width
-      H = height
+      CH = height
       dpr = ratio
       g = setup2d(canvas, dpr)
     },
@@ -150,7 +150,10 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
       const reduced = f.reducedMotion
       mix.step(f)
       modeTone(tone, mix, p)
-      clear2d(g, dpr)
+      const fo = f.focus
+      clear2d(g, dpr, fo) // clears the whole canvas; (0, 0) is the box's top-left corner
+      W = fo.width
+      H = fo.height
 
       // Options.
       const o = f.options
@@ -214,14 +217,16 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
       const swayA = reduced ? 0 : soft((mix.blend(0.02, 0.012, 0.05, 0.05, 0.06) + lv * 0.08 + fl * 0.05) * stSway, 0.2, 0.1)
       const flick = soft((reduced ? 0.25 * (mix.hearing + mix.speaking) : mix.blend(0.15, 0.1, 0.6, 0.35, 0.75) + lv * 0.9) * stFlick, 1.7, 0.5)
       const tongues = Math.max(1.4, lerp(2.2, 5.5, voiceHi) + blendS(ST_TONGUES))
-      // Never past the top of the canvas, tongues included.
-      const hf = Math.min(heightS * S, (baseY - H * 0.02) / (1 + flick * 0.06))
+      // Never past the top of the canvas (not the box: the flame may rise above it), tongues included.
+      const hf = Math.min(heightS * S, (baseY + fo.y - CH * 0.02) / (1 + flick * 0.06))
 
       // Pointer: hovering draws the flame toward it; a press blows it away from the finger.
       const pt = f.pointer
       let leanT = 0
-      if (pt.inside) {
-        const dx = clamp((pt.x - cx) / (S * 0.6), -1, 1)
+      const px = pt.x - fo.x
+      const py = pt.y - fo.y
+      if (pt.inside && px >= 0 && px < W && py >= 0 && py < H) {
+        const dx = clamp((px - cx) / (S * 0.6), -1, 1)
         const side = dx >= 0 ? 1 : -1
         // Blowing is strongest close to the flame; hovering draws it gently toward the pointer.
         leanT = pt.down ? -side * 0.45 * clamp01(1.3 - Math.abs(dx)) : dx * 0.15
@@ -430,7 +435,7 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
 
 const design: Character = {
   id: "flame",
-  version: "1.0.0",
+  version: "1.1.0",
   contract: 1,
   name: "Flame",
   family: "abstract",
@@ -458,6 +463,7 @@ const design: Character = {
     { signal: "reducedMotion", effect: "No flicker, sway or flying motes: a still flame per mode with fixed air dashes pointing in (taking in) or fixed sparks above the tip (thinking, speaking)." }
   ],
   renderer: "2d",
+  canvas: "stage",
   options: [
     { id: "size", kind: "number", label: "Size", min: 0.5, max: 1, step: 0.05, default: 1, unit: "×", group: "Shape", help: "How big the flame and its wick are; at 1 a shout reaches the top of the canvas." },
     { id: "width", kind: "number", label: "Flame width", min: 0.6, max: 1.8, step: 0.05, default: 1, unit: "×", group: "Shape", help: "How broad the flame burns, from a slim candle to a wide fire." },

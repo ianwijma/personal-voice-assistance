@@ -1,4 +1,4 @@
-# flame 1.0.0: frame digests of a scripted conversation at default settings (docs/CHARACTERS.md §6.6).
+# flame 1.1.0: frame digests of a scripted conversation at default settings (docs/CHARACTERS.md §6.6).
 # A change here must be deliberate: check the look, then update with `pnpm --filter @pva/web exec vitest run test/characters -u`.
 dark  0.5 idle        189 3240fd95
 dark  1.0 listening   189 0c42b2b8
@@ -47,3 +47,26 @@ light 11.0 idle        197 9f3484f4
 overflow 160×140×1 51.5 px
 overflow 900×420×1 209.1 px
 overflow 720×240×2 119.5 px
+stage  0.5 idle        189 ecd9f115
+stage  1.0 listening   189 f9f8ec38
+stage  1.5 listening   197 a75f6ede
+stage  2.0 hearing     209 635a497d
+stage  2.5 hearing     233 f9bc014e
+stage  3.0 hearing     293 c0eb7322
+stage  3.5 hearing     357 002cf84c
+stage  4.0 hearing     359 035f79c7
+stage  4.5 hearing     374 488a5ef2
+stage  5.0 thinking    345 89aa7ed7
+stage  5.5 thinking    274 e399f8b9
+stage  6.0 thinking    204 78d54c0c
+stage  6.5 speaking    206 d1a787dc
+stage  7.0 speaking    215 2d009719
+stage  7.5 speaking    233 73fe6e71
+stage  8.0 speaking    360 7fceca79
+stage  8.5 speaking    290 1d1555a3
+stage  9.0 speaking    213 288d496e
+stage  9.5 listening   205 92b20799
+stage 10.0 listening   207 c18b95e0
+stage 10.5 idle        209 41ccb8b5
+stage 11.0 idle        197 2d95af12
+stage 1280×800×1 focus 720×240 at 280,200: solid drawing x 528.2..752.0, y 77.6..424.2
