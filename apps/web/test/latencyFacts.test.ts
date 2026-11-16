@@ -158,6 +158,30 @@ describe("latency page: what changed since a turn", () => {
     expect(changedSince(failed, ctx({ modules: [ownRuns] }))).toEqual(["modules 0 → 1", "tools 0 → 1"])
     // An agent or decision provider is not one of the assistant's modules.
     expect(changedSince(failed, ctx({ modules: [weather({ kind: "agent" })] }))).toEqual([])
+    // The module runs, but only for another assistant: nothing runs for this one (the module's state is not its own).
+    const othersOnly = weather({ state: "running", instances: [{ assistants: ["other"], own: [], state: "running" }] })
+    expect(changedSince(failed, ctx({ modules: [othersOnly] }))).toEqual([])
+  })
+
+  it("does not compare tools while another instance of the module runs (its tools are not this assistant's)", () => {
+    // Home Assistant for two assistants: Jeff on the shared settings, another with its own domains (no tools). The
+    // module's tools are the union of both running instances, so neither assistant's own count is known.
+    const ha = (instances: NonNullable<ModuleInfo["instances"]>): ModuleInfo => ({ ...exampleWeatherModule, id: "home-assistant", name: "Home Assistant", tools: [1, 2, 3, 4, 5].map((n) => ({ name: `ha_${n}`, description: "", speculative: false })), instances })
+    const two = ha([{ assistants: ["jeff"], own: [], state: "running" }, { assistants: ["other"], own: ["domains"], state: "running" }])
+    const other: AssistantInfo = { ...assistant, id: "other", name: "Other", modules: { "home-assistant": { on: true, offTools: [] } } }
+    const otherTurn = trace({ assistant: { id: "other", name: "Other" }, config: config({ tools: 0 }) })
+    // The reviewer's case: the other assistant's turn recorded no tools, and nothing changed for it.
+    expect(changedSince(otherTurn, ctx({ assistants: [assistant, other], modules: [two] }))).toEqual([])
+    // Nor for Jeff, whatever the union says.
+    const jeff: AssistantInfo = { ...assistant, modules: { "home-assistant": { on: true, offTools: [] } } }
+    expect(changedSince(trace({ config: config({ tools: 2 }) }), ctx({ assistants: [jeff, other], modules: [two] }))).toEqual([])
+    // Switching the module off is this assistant's own change: no module and no tool.
+    const jeffOff: AssistantInfo = { ...jeff, modules: { "home-assistant": { on: false, offTools: [] } } }
+    expect(changedSince(trace({ config: config({ tools: 2 }) }), ctx({ assistants: [jeffOff, other], modules: [two] }))).toEqual(["modules 1 → 0", "tools 2 → 0"])
+    // The other instance failing leaves one running: its tools are this assistant's again and are compared.
+    const one = ha([{ assistants: ["jeff"], own: [], state: "running" }, { assistants: ["other"], own: ["domains"], state: "error" }])
+    expect(changedSince(trace({ config: config({ tools: 2 }) }), ctx({ assistants: [jeff, other], modules: [one] }))).toEqual(["tools 2 → 5"])
+    expect(changedSince(trace({ config: config({ tools: 5 }) }), ctx({ assistants: [jeff, other], modules: [one] }))).toEqual([])
   })
 
   it("compares only the language-model settings the account uses, as the server records them", () => {

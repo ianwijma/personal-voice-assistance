@@ -143,15 +143,24 @@ const llmNow = (llm: AssistantInfo["llm"]): AssistantInfo["llm"] =>
 
 /**
  * The modules an assistant has on that run for it now, as the server counts them for a turn: capabilities (agents and
- * decision providers are not per assistant) whose instance for this assistant (else the module) is running.
+ * decision providers are not per assistant) whose instance for this assistant is running (the module's state when it
+ * lists no instances; with instances listed and none for this assistant, nothing runs for it).
  */
 const runningModules = (a: AssistantInfo, modules: ReadonlyArray<ModuleInfo>): AssistantInfo["modules"] =>
   Object.fromEntries(Object.entries(a.modules).filter(([id, choice]) => {
     if (!choice.on) return false
     const m = modules.find((x) => x.id === id)
     if (m === undefined || (m.kind !== undefined && m.kind !== "capability")) return false
-    return (m.instances?.find((i) => i.assistants.includes(a.id))?.state ?? m.state) === "running"
+    // With instances listed, only this assistant's own counts (another's running is not this one's).
+    return (m.instances === undefined ? m.state : m.instances.find((i) => i.assistants.includes(a.id))?.state) === "running"
   }))
+/**
+ * Whether the page knows the tools of the instances that run for the assistant: `ModuleInfo.tools` is the union of all
+ * of a module's running instances (`ModuleHost.info`), so with a second instance running (another assistant's own
+ * values) this assistant's tools are not known, and the tool count is not compared.
+ */
+const toolsKnown = (running: AssistantInfo["modules"], modules: ReadonlyArray<ModuleInfo>): boolean =>
+  Object.keys(running).every((id) => (modules.find((m) => m.id === id)?.instances?.filter((i) => i.state === "running").length ?? 0) <= 1)
 
 /**
  * What differs between the snapshot of a turn and the assistant as it is now ("voice Lessac → Heart"). Empty when
@@ -199,7 +208,8 @@ export const changedSince = (t: TraceInfo, ctx: LatencyContext): ReadonlyArray<s
   const running = runningModules(a, ctx.modules)
   diff("modules", c.modules, Object.keys(running).length)
   // A Claude subscription assistant not let to use its modules has no tools, whatever its modules (as the server records it).
-  diff("tools", c.tools, a.llm.account === "claude-subscription" && !a.llm.useModules ? 0 : toolCount({ modules: running }, ctx.modules))
+  if (a.llm.account === "claude-subscription" && !a.llm.useModules) diff("tools", c.tools, 0)
+  else if (toolsKnown(running, ctx.modules)) diff("tools", c.tools, toolCount({ modules: running }, ctx.modules))
   if (c.replyEarly !== a.replyEarly) out.push(`reply early ${c.replyEarly ? "on" : "off"} → ${a.replyEarly ? "on" : "off"}`)
   diff("tool rounds", c.toolRounds, a.toolRounds)
   return out
