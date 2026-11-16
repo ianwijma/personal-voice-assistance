@@ -23,6 +23,14 @@ turn, so switching the module on or off applies from the next turn (`apps/assist
   are open: one more closes the least recently used (an idle one first), which primes from the history again if its
   conversation comes back. `endConversation(id)` (New conversation, the idle reset, a discarded voice session) closes
   that conversation's session and starts a warm replacement in the background for the next conversation.
+- **Per assistant** (docs/ASSISTANTS.md WP-13a): `withConversationOptions(agent, options)` makes the agent answer a
+  conversation with one assistant's `model`, `effort`, `thinking`, `tools` and `sessionIdleMinutes` (0 = never), and
+  the account's `maxSessions` (read at every turn; the latest counts). A turn without options uses the module's own
+  settings. A changed model or effort applies from the conversation's next turn on its running session (`setModel` and
+  the `effortLevel` flag setting, as Claude Code's /model and /effort; checked live: the next reply reports the new
+  model); a changed thinking setting, or a change Claude Code does not confirm within 3 s, replaces the session (the
+  new one is told what was said). The warm spare is retuned the same way before its first message. The module's opt-in,
+  program, proxy and debug logs are the account's, shared by every assistant on it.
 - **Warm first turn**: the system prompt and tools are not known at module start, so the first session is
   *provisional*: a fixed short system prompt; the first message carries the real prompt in `<instructions>` and the
   tools are registered with `setMcpServers` just before it. Every later session (restart) is spawned with the real
@@ -66,5 +74,8 @@ turn, so switching the module on or off applies from the next turn (`apps/assist
 - `pnpm --filter @pva/agent-claude-code test`: the agent against a scripted fake of `query()` (`test/fakeSdk.ts`):
   deltas, tool calls through the MCP handler, promotion, interrupt and resume, stuck interrupt, crash, prompt/tool
   change, timeout, usage limit, unexpected tools, opt-in; options and catch-up as pure functions.
+- Live, opt-in, per assistant (a model change on a running session; first token after a quiet spell with the
+  fresh-session time on and off; 2 + 4 × ROUNDS short calls):
+  `CLAUDE_SUBSCRIPTION_LIVE=1 ROUNDS=4 pnpm --filter @pva/agent-claude-code exec vitest run test/liveAssistants.test.ts --silent=false`
 - Live, opt-in (7 short calls on the owner's subscription):
   `CLAUDE_SUBSCRIPTION_LIVE=1 pnpm --filter @pva/agent-claude-code exec vitest run test/live.test.ts --silent=false`

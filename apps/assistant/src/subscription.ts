@@ -1,4 +1,4 @@
-import { AGENT_ID, AGENT_NAME } from "@pva/agent-claude-code"
+import { AGENT_ID, AGENT_NAME, type ClaudeConversationOptions, withConversationOptions } from "@pva/agent-claude-code"
 import {
   type Agent,
   type AgentEvent,
@@ -9,7 +9,7 @@ import {
   type Router,
   type TurnSetup
 } from "@pva/core"
-import type { ModuleInfo } from "@pva/protocol"
+import type { Assistant, ModuleInfo } from "@pva/protocol"
 import { Stream } from "effect"
 
 /**
@@ -26,6 +26,8 @@ import { Stream } from "effect"
  */
 
 export const SUBSCRIPTION_PROVIDER = "claude-subscription"
+/** The model of a Claude subscription assistant whose model is empty (the agent module's default). */
+export const SUBSCRIPTION_DEFAULT_MODEL = "claude-haiku-5-5"
 export const SUBSCRIPTION_AGENT_ID = AGENT_ID
 export const OFFLINE_AGENT_ID = "offline"
 
@@ -64,6 +66,39 @@ export const subscriptionRouter: Router = {
   matchTrigger: () => undefined
 }
 
+/**
+ * One Claude subscription assistant as its conversations' agent sees it (docs/ASSISTANTS.md §4.1, WP-13a): its own
+ * model and options (`ClaudeConversationOptions`, with the account's session bound), and `replyEarly`, which is the
+ * agent's `speculate`. The account's shared settings (opt-in, program, proxy, debug logs) stay the module's.
+ */
+export interface SubscriptionAssistant {
+  readonly options: ClaudeConversationOptions
+  readonly replyEarly: boolean
+}
+
+/**
+ * The account's bound on open Claude Code sessions (docs/ASSISTANTS.md §3.3): `MAX_VOICE_SESSIONS` × the switched-on
+ * assistants on the Claude subscription (at least one).
+ */
+export const subscriptionSessionLimit = (maxVoiceSessions: number, assistants: Iterable<Pick<Assistant, "on" | "llm">>): number => {
+  let n = 0
+  for (const a of assistants) if (a.on && a.llm.account === SUBSCRIPTION_PROVIDER) n++
+  return Math.max(1, Math.floor(maxVoiceSessions)) * Math.max(1, n)
+}
+
+/** A Claude subscription assistant's options for its conversations: its `llm` fields, its `replyEarly`, the bound. */
+export const subscriptionAssistantOf = (assistant: Pick<Assistant, "llm" | "replyEarly">, maxSessions: number): SubscriptionAssistant => ({
+  options: {
+    model: assistant.llm.model.trim() === "" ? SUBSCRIPTION_DEFAULT_MODEL : assistant.llm.model.trim(),
+    effort: assistant.llm.effort,
+    thinking: assistant.llm.thinking,
+    tools: assistant.llm.useModules,
+    sessionIdleMinutes: assistant.llm.freshSessionAfterMinutes,
+    maxSessions
+  },
+  replyEarly: assistant.replyEarly
+})
+
 export interface SubscriptionAgentsOptions {
   /** The offline stand-in model (`LlmLayer` builds it for this provider). */
   readonly fallbackLlm: Llm["Service"]
@@ -73,6 +108,12 @@ export interface SubscriptionAgentsOptions {
   readonly module: () => ModuleInfo | undefined
   /** The stable system prompt for an agent with its own prompt (`Agent.systemPrompt`); default: the turn's. */
   readonly promptFor?: (agent: Agent, setup: TurnSetup) => string
+  /**
+   * The assistant these conversations belong to, read per turn (the same object while it does not change). When given,
+   * the agent answers with its model and options, its `replyEarly` as `speculate`, and its prompt (the turn's: the
+   * module's own system prompt is not used). Absent: the agent as the module runs it.
+   */
+  readonly assistant?: () => SubscriptionAssistant | undefined
 }
 
 /** Turn a turn's `TurnSetup` into the agent setup for this provider. Cheap: a map lookup per turn. */
@@ -80,8 +121,19 @@ export const makeSubscriptionAgents = (options: SubscriptionAgentsOptions): (set
   const offline = offlineAgentWithNotice(options.fallbackLlm, () => subscriptionNotice(options.module()))
   const names: ReadonlyMap<string, string> = new Map([[SUBSCRIPTION_AGENT_ID, AGENT_NAME], [OFFLINE_AGENT_ID, offline.name]])
   const alone: ReadonlyMap<string, Agent> = new Map([[OFFLINE_AGENT_ID, offline]])
+  /** The agent with the assistant's options: made again only when the agent or the assistant's options change. */
+  let wrapped: { readonly agent: Agent; readonly assistant: SubscriptionAssistant; readonly result: Agent } | undefined
+  const withAssistant = (agent: Agent | undefined): Agent | undefined => {
+    const assistant = options.assistant?.()
+    if (agent === undefined || assistant === undefined) return agent
+    if (wrapped?.agent !== agent || wrapped.assistant !== assistant) {
+      const { systemPrompt: _own, ...rest } = withConversationOptions(agent, assistant.options)
+      wrapped = { agent, assistant, result: { ...rest, speculate: assistant.replyEarly } }
+    }
+    return wrapped.result
+  }
   return (setup) => {
-    const claude = options.agents().get(SUBSCRIPTION_AGENT_ID)
+    const claude = withAssistant(options.agents().get(SUBSCRIPTION_AGENT_ID))
     const agents: ReadonlyMap<string, Agent> = claude === undefined ? alone : new Map([[SUBSCRIPTION_AGENT_ID, claude], [OFFLINE_AGENT_ID, offline]])
     const promptFor = options.promptFor
     return {

@@ -32,6 +32,8 @@ export interface FakeQuery extends QueryHandle {
   readonly interrupts: number
   readonly closed: boolean
   readonly registered: Array<{ tools: ReadonlyArray<SessionTool>; viaSetMcpServers: boolean }>
+  /** `setModel` and `applyFlagSettings` calls, in order. */
+  readonly retunes: Array<{ model: string | undefined } | { effortLevel: string | null | undefined }>
   /** The iterator throws `error` (an `Error` made from a string), as the SDK does when the process dies. */
   crash(error?: string | Error): void
 }
@@ -47,6 +49,8 @@ export interface FakeSdkOptions {
   readonly hangOnInterrupt?: boolean
   /** Tools listed in the init message besides our MCP tools (to test the safety check). */
   readonly extraInitTools?: ReadonlyArray<string>
+  /** `setModel` / `applyFlagSettings` reject (Claude Code refused the change). */
+  readonly refuseRetune?: boolean
 }
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
@@ -76,6 +80,7 @@ export const makeFakeSdk = (options: FakeSdkOptions = {}) => {
       let initSent = false
       let currentTools: ReadonlyArray<SessionTool> = []
       const registered: FakeQuery["registered"] = []
+      const retunes: FakeQuery["retunes"] = []
       const push = (m: unknown) => {
         const r = { done: false, value: m as SDKMessage } as IteratorResult<SDKMessage, void>
         const w = waiters.shift()
@@ -105,6 +110,15 @@ export const makeFakeSdk = (options: FakeSdkOptions = {}) => {
           return closed
         },
         registered,
+        retunes,
+        setModel: async (model) => {
+          if (options.refuseRetune === true) throw new Error("setModel refused")
+          retunes.push({ model })
+        },
+        applyFlagSettings: async (settings) => {
+          if (options.refuseRetune === true) throw new Error("applyFlagSettings refused")
+          retunes.push({ effortLevel: settings.effortLevel })
+        },
         next: () => {
           if (failure !== undefined) return Promise.reject(failure)
           const r = out.shift()

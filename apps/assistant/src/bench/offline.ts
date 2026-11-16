@@ -15,6 +15,7 @@ import {
   type SttEvent,
   ToolRegistry,
   type Trace,
+  TurnTrace,
   Tts,
   WAKE_ALWAYS,
   type WakeConfig,
@@ -37,11 +38,13 @@ import {
   turnResumed
 } from "@pva/core/testing"
 import { makeClock } from "@pva/modules-builtin"
+import type { TraceConfig } from "@pva/protocol"
 import { type Cause, Deferred, Effect, Layer, Queue, Stream } from "effect"
 import type { BenchRow } from "./report.ts"
-import { observedTurnTraceLayer } from "../startup.ts"
+import { observedTurnTrace, observedTurnTraceLayer } from "../startup.ts"
 import { makeOutputLease } from "../serve/OutputLease.ts"
 import { type DispatchHooks, makeSessionDispatcher } from "../serve/SessionDispatcher.ts"
+import { type AssistantTraceConfig, assistantTurnTrace } from "../serve/VoiceSession.ts"
 import { simulatedDecide } from "./typesafe.ts"
 
 export interface SimulatedDelays {
@@ -167,6 +170,41 @@ const makeBarrier = (parties: number) => {
     })
 }
 
+/**
+ * The session path's trace service as serve mode makes it per conversation (`assistantTurnTrace`): the assistant,
+ * its route and the configuration snapshot (docs/ASSISTANTS.md §3.7) filled at each turn's start. The snapshot is
+ * looked up as serve mode's is (reference compares of what the turn is bound to, then the join with the hearing),
+ * from values that do not change during the bench.
+ */
+const sessionTurnTrace = (onFinish: (trace: Trace) => Effect.Effect<void>): TurnTrace["Service"] => {
+  const bound = { snapshot: {}, assistant: {}, llm: {}, tts: {} }
+  const part: AssistantTraceConfig = {
+    llm: { account: "offline", model: "", effort: "low", thinking: "off", maxTokens: 1024 },
+    voice: "bench:bench",
+    modules: 1,
+    tools: 1,
+    replyEarly: true,
+    toolRounds: 5
+  }
+  const cached = { ...bound, config: part }
+  const hearing = { hearer: "jeff", engine: "sherpa", model: "bench", eagerSilenceMs: 200, finalSilenceMs: 600 }
+  let joined: { readonly part: AssistantTraceConfig; readonly hearing: typeof hearing; readonly value: TraceConfig } | undefined
+  const config = (): TraceConfig | undefined => {
+    const p = cached.snapshot === bound.snapshot && cached.assistant === bound.assistant && cached.llm === bound.llm && cached.tts === bound.tts
+      ? cached.config
+      : undefined
+    if (p === undefined) return undefined
+    if (joined?.part !== p || joined.hearing !== hearing) joined = { part: p, hearing, value: { ...p, hearing } }
+    return joined.value
+  }
+  return assistantTurnTrace(observedTurnTrace(onFinish), { next: 1 }, {
+    session: () => "bench",
+    assistant: () => ({ id: "jeff", name: "Jeff" }),
+    route: () => ({ by: "default" }),
+    config
+  })
+}
+
 /** One session: the script `rounds` times (after a warm-up round) through its own `Conversation`. */
 const runSession = (
   scenario: OfflineScenario,
@@ -194,7 +232,7 @@ const runSession = (
       Layer.provideMerge(Layer.mergeAll(
         makeScriptedLlm(respond(scenario.delays)).layer,
         ToolRegistry.layer([makeClock()]),
-        observedTurnTraceLayer(onFinish),
+        dispatch ? Layer.sync(TurnTrace, () => sessionTurnTrace(onFinish)) : observedTurnTraceLayer(onFinish),
         Layer.succeed(Tts, tts),
         output
       ))
