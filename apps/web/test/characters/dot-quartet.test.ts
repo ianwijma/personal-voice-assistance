@@ -31,8 +31,7 @@ type Rig = ReturnType<typeof make>
 const voice = (o: Partial<VoiceFeatures> = {}): VoiceFeatures => ({ ...createVoiceFeatures(), speaking: true, level: 0.6, rms: 0.06, voicing: 1, pitchHz: 200, pitch: 0.5, register: 0.5, ...o })
 const silent = createVoiceFeatures()
 /**
- * No pointer, placed well outside the canvas: the character decides "over the canvas" from the coordinates alone
- * (see "Bugs found" in the pull request: it ignores `inside`), and the host's initial (0, 0) is inside a box canvas.
+ * No pointer: not inside, and placed well outside the canvas as well.
  */
 const NO_POINTER: Pointer = { x: -1000, y: -1000, down: false, inside: false }
 
@@ -235,10 +234,9 @@ describe("dot quartet: the pointer", () => {
     expect(left).toBeLessThan(away)
   })
 
-  // BUG: the lean and the press test the coordinates against the focus, not `pointer.inside`, so a pointer that
-  // has left the canvas (inside = false, coordinates left at the last position, or the initial 0, 0 on a canvas
-  // whose focus starts at 0, 0) still pulls the row toward it.
-  it.fails("ignores a pointer that is not over the canvas (inside is false)", () => {
+  // The lean and the press need `pointer.inside`: a pointer that has left the canvas (inside = false, coordinates
+  // left at the last position, or the initial 0, 0 on a canvas whose focus starts at 0, 0) does not pull the row.
+  it("ignores a pointer that is not over the canvas (inside is false)", () => {
     const rig = make()
     const away = mean(bars(step(rig, "idle", secs(1))).map((b) => b.cx))
     const stale = mean(bars(step(rig, "idle", secs(1), { pointer: { x: 700, y: 120, down: false, inside: false } })).map((b) => b.cx))
