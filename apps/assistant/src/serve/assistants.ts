@@ -10,7 +10,7 @@ import {
   type DeviceListInfo,
   type DeviceOwn,
   type DeviceTypeInfo,
-  type DeviceSettings,
+  DeviceSettings,
   type DeviceSettingsKey,
   type DeviceSettingsPatch,
   type DeviceSetup,
@@ -29,9 +29,10 @@ import {
   TYPESAFE_GIVE_UP_MS,
   validateAssistant,
   validateDeviceSettings,
+  WAKE_PHRASES_MAX,
   type WithoutPhrase
 } from "@pva/protocol"
-import { Effect, Semaphore } from "effect"
+import { Effect, Schema, Semaphore } from "effect"
 import { deviceListInfos, deviceSettingsFrom, deviceTypeInfos, typeSettingsFrom } from "./devices.ts"
 import { EntitySaveError, type SettingsStore, SettingsStoreError } from "./SettingsStore.ts"
 import type { VoiceSessions } from "./VoiceSessions.ts"
@@ -109,6 +110,25 @@ const refusal = (issues: ReadonlyArray<Issue>): AssistantResult => {
 
 const entityFailure = (e: EntitySaveError | SettingsStoreError): AssistantResult =>
   e instanceof EntitySaveError ? fail(e.code, e.message) : fail("internal", e.message)
+
+const isStorableSettings = Schema.is(DeviceSettings)
+
+/**
+ * What the stored schema refuses and `validateDeviceSettings` does not check, for a settings value the server put
+ * together itself (placements add phrases up): more than `WAKE_PHRASES_MAX` phrases for one assignment, and, as a last
+ * guard, anything else `DeviceSettings` would refuse (the store would drop the entry on the next start, the pushes
+ * would not encode).
+ */
+const storableIssues = (settings: DeviceSettings): ReadonlyArray<Issue> => {
+  const issues: Array<Issue> = []
+  settings.assistants.forEach((a, i) => {
+    if (a.phrases.length > WAKE_PHRASES_MAX) {
+      issues.push({ code: "limit_reached", path: `assistants.${i}.phrases`, message: `At most ${WAKE_PHRASES_MAX} wake phrases for one assistant on a device.` })
+    }
+  })
+  if (issues.length === 0 && !isStorableSettings(settings)) issues.push({ code: "invalid", path: "assistants", message: "These settings could not be saved." })
+  return issues
+}
 
 const targetKey = (t: DeviceTarget) => (t.kind === "type" ? `type:${t.type}` : `device:${t.id}`)
 
@@ -309,6 +329,8 @@ export const makeAssistants = (options: AssistantsOptions): Assistants => {
       const next = withPlacement(settings, id, p.phrase)
       const checked = validateDeviceSettings(next, ids)
       if (checked.errors.length > 0) return refusal(checked.errors)
+      const unstorable = storableIssues(next)
+      if (unstorable.length > 0) return refusal(unstorable)
       current.set(key, next)
     }
     return undefined
