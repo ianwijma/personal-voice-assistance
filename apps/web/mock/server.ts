@@ -11,7 +11,11 @@
  *                   and reply.stop. Typed messages work in every scenario.
  *   typed           no automatic voice turn; typed messages get replies (spoken for the owner if asked).
  *   modules         like typed; the module catalog covers every field type, an invalid value
- *                   (weather "Home location" = "Atlantis") and a module that fails to start (home-assistant).
+ *                   (weather "Home location" = "Atlantis"). Capability modules run while an assistant has them on
+ *                   (`instances` per effective settings; `module.enable` is `not_allowed`); POST /mock/module-error
+ *                   {module, message?} makes a module's instances fail, and a saved token with "good" in it fixes them.
+ *   latency         like typed, with Diagnostics › Latency seeded: turns of every route kind with configuration
+ *                   snapshots (some differ from the assistants now), and a few devices.
  * Settings in every scenario are placed like the real server's (group/page/order, visibleWhen, option tags), with
  * its cross-field checks (final silence > early guess: error; a hosted provider without its key: warning, "Save
  * anyway" with confirmWarnings), reloadPendingFor, and the Claude subscription agent (starts once opted in).
@@ -139,6 +143,7 @@ import {
 import { exampleEngineStatus, exampleSnapshot, exampleVoiceSection, exampleWeatherModule } from "@pva/protocol/examples"
 import { type WebSocket, WebSocketServer } from "ws"
 import { createAssistantsMock } from "./assistants.ts"
+import { seedTraces } from "./traces.ts"
 import { createVoiceAssistants, scenarioSettings, scriptedTurn } from "./voiceAssistants.ts"
 import { encodeWav, MOCK_PROVIDERS } from "./voices.ts"
 import type { Condition, FieldError } from "@pva/protocol"
@@ -158,6 +163,7 @@ const SCENARIOS = [
   "wake",
   "devices",
   "long-phrase",
+  "latency",
   "admin-disabled",
   "admin-backoff"
 ] as const
@@ -186,6 +192,14 @@ const log = (...args: Array<unknown>) => {
 
 const clone = <T>(x: T): T => structuredClone(x)
 
+/** A capability module whose fields `keys` an assistant may own (`overridable`), as the server marks them. */
+const withOverridable = (m: ModuleInfo, keys: ReadonlyArray<string>): ModuleInfo => ({
+  ...m,
+  kind: "capability",
+  group: "modules",
+  settings: { ...m.settings, fields: m.settings.fields.map((f) => (keys.includes(f.key) ? { ...f, overridable: true } : f)) }
+})
+
 const initialModules = (): Array<ModuleInfo> => [
   {
     id: "clock",
@@ -197,13 +211,14 @@ const initialModules = (): Array<ModuleInfo> => [
     tools: [{ name: "current_time", description: "The current time in a time zone.", speculative: true }, { name: "time_in", description: "The time in another place.", speculative: true }],
     settings: {
       fields: [
-        { type: "text", key: "timeZone", label: "Time zone", description: "IANA name, e.g. Europe/Amsterdam. Empty: this machine's zone.", apply: "live", default: "", placeholder: "Europe/Amsterdam", locked: { reason: "Set by CLOCK_TIME_ZONE in the environment" } },
+        { type: "text", key: "timeZone", label: "Time zone", description: "IANA name, e.g. Europe/Amsterdam. Empty: this machine's zone.", apply: "live", default: "", placeholder: "Europe/Amsterdam", locked: { reason: "Set by CLOCK_TIME_ZONE in the environment" }, overridable: true },
         {
           type: "choice",
           key: "locale",
           label: "Date format",
           apply: "live",
           default: "en-GB",
+          overridable: true,
           options: [{ value: "en-GB", label: "13 November 2026" }, { value: "en-US", label: "November 13, 2026" }, { value: "nl-NL", label: "13 november 2026" }]
         }
       ],
@@ -215,7 +230,7 @@ const initialModules = (): Array<ModuleInfo> => [
     kind: "capability",
     group: "modules"
   },
-  { ...clone(exampleWeatherModule), kind: "capability", group: "modules" },
+  withOverridable(clone(exampleWeatherModule), ["defaultPlace", "units"]),
   {
     id: "home-assistant",
     name: "Home Assistant",
@@ -233,6 +248,7 @@ const initialModules = (): Array<ModuleInfo> => [
           label: "Devices it may read",
           apply: "live",
           default: ["light", "sensor", "climate"],
+          overridable: true,
           options: [
             { value: "light", label: "Lights" },
             { value: "sensor", label: "Sensors" },
@@ -523,6 +539,84 @@ const initialSections = (): Array<SettingsSection> => [
     revision: 1
   },
   {
+    // Protocol 7 (docs/ASSISTANTS.md §2.4, WP-12a): where the house is. Modules and every assistant's prompt use it.
+    id: "home",
+    title: "Home",
+    group: "modules",
+    page: { id: "home", title: "Home", description: "Where the house is. Modules and every assistant's prompt use these." },
+    order: 5,
+    form: {
+      fields: [
+        { type: "text", key: "HOME_LOCATION", label: "Location", description: "Town and country, e.g. \"Amsterdam, Netherlands\". Every assistant is told; the weather uses it when you name no place.", apply: "live", default: "", placeholder: "Amsterdam, Netherlands", maxLength: 200, source: "default" },
+        { type: "text", key: "HOME_TIME_ZONE", label: "Time zone", description: "IANA name, e.g. Europe/Amsterdam. Empty: this machine's zone.", apply: "live", default: "", placeholder: "Europe/Amsterdam", maxLength: 64, source: "default" },
+        {
+          type: "choice",
+          key: "HOME_LANGUAGE",
+          label: "Language",
+          description: "The household's language, told to every assistant.",
+          apply: "live",
+          default: "en-GB",
+          options: [{ value: "en-GB", label: "English (United Kingdom)" }, { value: "en-US", label: "English (United States)" }, { value: "nl-NL", label: "Dutch (Netherlands)" }, { value: "de-DE", label: "German (Germany)" }],
+          source: "default"
+        },
+        {
+          type: "choice",
+          key: "HOME_UNITS",
+          label: "Units",
+          description: "The default of modules that measure (the weather), unless they or an assistant say otherwise.",
+          apply: "live",
+          default: "metric",
+          options: [{ value: "metric", label: "Metric (°C, km/h)" }, { value: "imperial", label: "Imperial (°F, mph)" }],
+          source: "default"
+        },
+        {
+          type: "choice",
+          key: "HOME_DATE_FORMAT",
+          label: "Date format",
+          description: "The default of modules that say dates (the clock), unless they or an assistant say otherwise.",
+          apply: "live",
+          default: "en-GB",
+          options: [{ value: "en-GB", label: "13 November 2026" }, { value: "en-US", label: "November 13, 2026" }, { value: "nl-NL", label: "13 november 2026" }],
+          source: "default"
+        }
+      ],
+      values: { HOME_LOCATION: "", HOME_TIME_ZONE: "", HOME_LANGUAGE: "en-GB", HOME_UNITS: "metric", HOME_DATE_FORMAT: "en-GB" },
+      secrets: {},
+      errors: []
+    },
+    revision: 1
+  },
+  {
+    // Protocol 7 (WP-14): TypeSafe routes a sentence without a wake phrase. Off by default; hosted.
+    id: "routing",
+    title: "TypeSafe",
+    description: "TypeSafe's Jev model picks which assistant on a device a sentence without a wake phrase is for, from each assistant's Handles line.",
+    group: "agents",
+    page: { id: "routing", title: "Routing", description: "Who a sentence is for, when no wake phrase was said. Used only on devices that let TypeSafe decide." },
+    order: 40,
+    protected: true,
+    form: {
+      fields: [
+        {
+          type: "boolean",
+          key: "TYPESAFE_ROUTING",
+          label: "Let TypeSafe choose the assistant",
+          description: "Hosted and optional. What is sent: the sentence as text and the Handles line of each assistant on that device. A wake phrase always wins and skips TypeSafe; so does the next sentence within an assistant's follow-up time. It adds a delay before the reply starts, only for sentences without a phrase (see Diagnostics › Latency, Routing).",
+          apply: "live",
+          default: false,
+          source: "default"
+        },
+        { type: "secret", key: "TYPESAFE_API_KEY", label: "TypeSafe API key", description: "From console.typesafe.ai/keys. Kept in the vault. Without it, devices set to \"The one that fits\" answer nobody without a phrase.", apply: "live", env: "TYPESAFE_API_KEY" },
+        { type: "text", key: "TYPESAFE_MODEL", label: "Model", description: "A pinned version: the decision thresholds are tuned for one version, and jev-latest moves.", apply: "live", default: "jev-1.14.0", maxLength: 100, source: "default" },
+        { type: "text", key: "TYPESAFE_BASE_URL", label: "Server address", description: "Any server that speaks /v1/systemone.", apply: "live", default: "https://api.typesafe.ai", advanced: true, source: "default" }
+      ],
+      values: { TYPESAFE_ROUTING: false, TYPESAFE_MODEL: "jev-1.14.0", TYPESAFE_BASE_URL: "https://api.typesafe.ai" },
+      secrets: { TYPESAFE_API_KEY: { set: false, source: "none" } },
+      errors: []
+    },
+    revision: 1
+  },
+  {
     id: "recordings",
     title: "Recordings",
     group: "diagnostics",
@@ -563,6 +657,9 @@ const checks = (list: ReadonlyArray<SettingsSection>): { errors: Array<FieldErro
   }
   if (v("LLM_PROVIDER") === "anthropic" && !secretSet("ANTHROPIC_API_KEY", list)) {
     warnings.push({ section: "language-model", key: "ANTHROPIC_API_KEY", message: "The Claude API is chosen but there is no API key: replies fail until you add it here." })
+  }
+  if (v("TYPESAFE_ROUTING") === true && !secretSet("TYPESAFE_API_KEY", list)) {
+    warnings.push({ section: "routing", key: "TYPESAFE_API_KEY", message: "TypeSafe is switched on but there is no API key: devices set to \"The one that fits\" answer nobody without a phrase until you add it." })
   }
   // ASSISTANT_VOICE (docs/VOICE-PROVIDERS.md §6.1): a hosted voice without its key warns; a voice on this machine
   // that is not downloaded refuses the save.
@@ -739,7 +836,11 @@ const voiceSessions = new Map<string, VSession>()
 let conversationSeq = 0
 let modules = initialModules()
 /** Protocol 7: assistants, device types and the devices' own sections (mock/assistants.ts). */
-const assistantsMock = createAssistantsMock(() => modules)
+const assistantsMock = createAssistantsMock({
+  modules: () => modules,
+  toolNames: (id) => runningTools(id).map((t) => t.name),
+  checkOwn: (id, own) => checkOwn(id, own)
+})
 /** Protocol 7, the voice connection's side: the device's setup, a conversation per assistant, who has the turn (mock/voiceAssistants.ts). */
 const voice = createVoiceAssistants(assistantsMock, () => newConversationInfo(), (id) => ({
   overrides: { ...kindDefaults, ...(id === undefined ? {} : devices.get(id)?.overrides ?? {}) },
@@ -761,7 +862,7 @@ let env: EnvInfo = initialEnv()
 let jobs: Array<JobInfo> = []
 let jobSeq = 0
 const jobTimers = new Map<string, ReturnType<typeof setInterval>>()
-let traces: Array<TraceInfo> = []
+let traces: Array<TraceInfo> = scenario === "latency" ? seedTraces() : []
 let turnSeq = 20
 let scriptTimers: Array<ReturnType<typeof setTimeout>> = []
 const clientLog: Array<Record<string, unknown>> = []
@@ -785,7 +886,7 @@ interface DeviceRecord {
 }
 const HOUR = 3_600_000
 const seededDevices = (): Map<string, DeviceRecord> => {
-  if (scenario !== "devices" && scenario !== "wake" && scenario !== "long-phrase") return new Map()
+  if (scenario !== "devices" && scenario !== "wake" && scenario !== "long-phrase" && scenario !== "latency") return new Map()
   const now = Date.now()
   return new Map([
     ...(scenario === "long-phrase"
@@ -847,7 +948,14 @@ const pushProfiles = () => {
 const devicesChanged = () => broadcast({ type: "devices", devices: deviceInfos() })
 const assistantInfos = () => assistantsMock.infos([...devices.values()].map((d) => ({ id: d.id, name: d.name })))
 /** After an assistant or device save: the whole lists, as the real server pushes them (admin connections only). */
+/** The routing section changed: "Whichever fits" is offered when it is on and has a key (the server's `canAuto`). */
+const routingChanged = () => {
+  const x = sections.find((y) => y.id === "routing")
+  voice.setCanAuto(x?.form.values.TYPESAFE_ROUTING === true && x.form.secrets.TYPESAFE_API_KEY?.set === true)
+  pushSetups()
+}
 const assistantsChanged = () => {
+  syncCapabilities()
   broadcast({ type: "assistants", assistants: assistantInfos() })
   broadcast({ type: "device.types", types: assistantsMock.deviceTypes() })
   devicesChanged()
@@ -1067,6 +1175,7 @@ const resetState = () => {
   voiceSessions.clear()
   lastSessions = ""
   modules = initialModules()
+  forcedErrors.clear()
   models = initialModels()
   sections = withWarnings(initialSections())
   engine = initialEngine()
@@ -1078,6 +1187,7 @@ const resetState = () => {
   logoutFails = false
   devices = seededDevices()
   assistantsMock.reset(scenario === "long-phrase")
+  syncCapabilities()
   voice.reset()
   kindDefaults = initialKindDefaults()
   seedVoiceScenario()
@@ -1088,7 +1198,7 @@ const resetState = () => {
   for (const t of jobTimers.values()) clearInterval(t)
   jobTimers.clear()
   jobs = []
-  traces = []
+  traces = scenario === "latency" ? seedTraces() : []
   turnSeq = 20
   clientLog.length = 0
 }
@@ -1407,6 +1517,29 @@ const makeTrace = (r: Reply, outcome: TraceInfo["outcome"]): TraceInfo => {
   return trace
 }
 
+/** Protocol 7: who answered, on which device, chosen how, and what the assistant was set to (`TraceInfo.config`). */
+const adminTraceFields = (r: Reply, v: VSession): Partial<TraceInfo> => {
+  const a = assistantsMock.assistants().find((x) => x.id === (r.assistantId ?? voice.setupFor(v.deviceId).assistants[0]?.id))
+  if (a === undefined) return {}
+  const chosen = a.modules
+  const onModules = modules.filter((m) => m.kind === "capability" && chosen[m.id]?.on === true)
+  const config: NonNullable<TraceInfo["config"]> = {
+    llm: { account: a.llm.account, model: a.llm.model, effort: a.llm.effort, thinking: a.llm.thinking, maxTokens: a.llm.maxTokens },
+    hearing: { hearer: a.id, engine: a.hearing.engine, model: a.hearing.model, language: a.hearing.language, eagerSilenceMs: a.hearing.eagerSilenceMs, finalSilenceMs: a.hearing.finalSilenceMs },
+    voice: `${a.voice.provider}:${a.voice.voiceId}`,
+    modules: onModules.length,
+    tools: onModules.reduce((n, m) => n + m.tools.filter((t) => !(chosen[m.id]?.offTools ?? []).includes(t.name)).length, 0),
+    replyEarly: a.replyEarly,
+    toolRounds: a.toolRounds
+  }
+  return {
+    assistant: { id: a.id, name: a.name },
+    ...(v.deviceId === undefined ? {} : { deviceId: v.deviceId, device: sessionName(v).slice(0, 64) }),
+    route: r.source === "text" ? { by: "typed" } : { by: "default" },
+    config
+  }
+}
+
 const endTurn = (r: Reply, outcome: "completed" | "interrupted" | "failed") => {
   if (r.ended) return
   const v = r.session
@@ -1414,7 +1547,7 @@ const endTurn = (r: Reply, outcome: "completed" | "interrupted" | "failed") => {
   if (v.reply === r) v.reply = undefined
   const trace = makeTrace(r, outcome)
   // Admin's traces carry the session (the device's name) and arrive live as `trace`; the device's tabs get turn.end.
-  const forAdmin: TraceInfo = { ...trace, session: sessionName(v).slice(0, 64) }
+  const forAdmin: TraceInfo = { ...trace, session: sessionName(v).slice(0, 64), ...adminTraceFields(r, v) }
   traces = [...traces, forAdmin].slice(-20)
   broadcast({ type: "trace", key: v.key, ...(v.deviceId === undefined ? {} : { deviceId: v.deviceId }), trace: forAdmin })
   // A turn of a conversation that was replaced (New conversation) is never committed to the new one.
@@ -1632,6 +1765,86 @@ const setModule = (id: string, f: (m: ModuleInfo) => ModuleInfo) => {
   return next
 }
 
+// ---- Capability modules follow the assistants (docs/ASSISTANTS.md §2.6, WP-12b)
+
+const HA_TOOLS = [{ name: "home_state", description: "Current state of devices, by area or by name.", speculative: true }]
+const NOTES_TOOLS = [{ name: "add_note", description: "Save a short note.", speculative: false }, { name: "read_notes", description: "Read recent notes.", speculative: true }]
+/** What a running capability module offers, whether or not an assistant has it on right now. */
+const runningTools = (id: string): ModuleInfo["tools"] =>
+  id === "home-assistant" ? HA_TOOLS : id === "notes" ? NOTES_TOOLS : initialModules().find((x) => x.id === id)?.tools ?? []
+/** An instance's status: the clock says today's date in the instance's own date format. */
+const instanceStatus = (id: string, m: ModuleInfo, own: Readonly<Record<string, SettingValue>> | undefined) => {
+  const status = runningStatus(id, m)
+  if (id !== "clock" || status === undefined) return status
+  const locale = String(own?.locale ?? m.settings.values.locale ?? "en-GB")
+  const zone = String(own?.timeZone ?? m.settings.values.timeZone ?? "Europe/Amsterdam")
+  return { ...status, text: `${zone} · ${new Date(Date.UTC(2026, 10, 13)).toLocaleDateString(locale, { day: "numeric", month: "long", year: "numeric", timeZone: "UTC" })}` }
+}
+const runningStatus = (id: string, m: ModuleInfo) =>
+  id === "home-assistant" ? { text: "Connected to Home · 42 devices", tone: "ok" as const }
+  : id === "notes" ? { text: "12 notes in Inbox", tone: "neutral" as const }
+  : m.status
+/** A failure injected into a capability module's instances (tests: `/mock/module-error`); a saved token with "good" in it clears it. */
+const forcedErrors = new Map<string, string>()
+const ownableKeys = (m: ModuleInfo) => new Set(m.settings.fields.filter((f) => f.overridable === true && f.type !== "secret").map((f) => f.key))
+/** An instance's key: the effective non-secret values (an assistant's own applied), as the host keys them. */
+const instanceKey = (m: ModuleInfo, own: Readonly<Record<string, SettingValue>> | undefined) => {
+  const over = ownableKeys(m)
+  const values: Record<string, SettingValue> = { ...m.settings.values }
+  for (const [k, v] of Object.entries(own ?? {})) if (over.has(k)) values[k] = v
+  return JSON.stringify(Object.keys(values).sort().map((k) => [k, values[k]]))
+}
+/** The field errors the module's own checks give an assistant's own values (`ModuleHost.checkOwn`). */
+const checkOwn = (moduleId: string, own: Readonly<Record<string, unknown>>) => {
+  const m = modules.find((x) => x.id === moduleId)
+  if (m === undefined) return []
+  const values = Object.fromEntries(Object.entries(own)) as Record<string, SettingValue>
+  return validate(m.settings, { values, secrets: {} }).flatMap((e) => (e.key === null ? [] : [{ field: e.key, message: e.message }]))
+}
+/**
+ * A capability module runs while at least one switched-on assistant has it on; assistants whose effective values are
+ * equal share one instance, an assistant with its own values may run another. Module infos are updated (and pushed)
+ * only when they change. The shared instance is listed first.
+ */
+const syncCapabilities = () => {
+  const list = assistantsMock.assistants()
+  for (const m of [...modules]) {
+    if (m.kind !== "capability") continue
+    const wanting = list.filter((a) => a.on && a.modules[m.id]?.on === true)
+    const over = ownableKeys(m)
+    const sharedKey = instanceKey(m, undefined)
+    const groups = new Map<string, { assistants: Array<string>; own: Set<string>; values: Record<string, SettingValue> | undefined }>()
+    for (const a of wanting) {
+      const own = a.modules[m.id]!.own
+      const key = instanceKey(m, own)
+      const g = groups.get(key) ?? { assistants: [], own: new Set<string>(), values: key === sharedKey ? undefined : (own as Record<string, SettingValue> | undefined) }
+      g.assistants.push(a.id)
+      if (key !== sharedKey) for (const [k, v] of Object.entries(own ?? {})) if (over.has(k) && JSON.stringify(v) !== JSON.stringify(m.settings.values[k])) g.own.add(k)
+      groups.set(key, g)
+    }
+    const forced = forcedErrors.get(m.id)
+    const status = runningStatus(m.id, m)
+    const ordered = [...groups.entries()].sort(([a], [b]) => (a === sharedKey ? -1 : b === sharedKey ? 1 : 0)).map(([, g]) => g)
+    const instances = ordered.map((g) => ({
+      assistants: g.assistants,
+      own: [...g.own],
+      state: forced !== undefined ? ("error" as const) : ("running" as const),
+      ...(forced !== undefined ? { error: `${forced} (for ${g.assistants.join(", ")})` } : instanceStatus(m.id, m, g.values) !== undefined ? { status: instanceStatus(m.id, m, g.values)! } : {})
+    }))
+    const { error: _e, status: _s, ...rest } = m
+    const next: ModuleInfo = {
+      ...rest,
+      enabled: wanting.length > 0,
+      state: wanting.length === 0 ? "disabled" : forced !== undefined ? "error" : "running",
+      tools: wanting.length > 0 && forced === undefined ? [...runningTools(m.id)] : [],
+      ...(wanting.length > 0 && forced !== undefined ? { error: forced } : wanting.length > 0 && status !== undefined ? { status } : {}),
+      instances
+    }
+    const same = (a: ModuleInfo, b: ModuleInfo) => JSON.stringify({ ...a, revision: 0 }) === JSON.stringify({ ...b, revision: 0 })
+    if (!same(m, next)) setModule(m.id, () => next)
+  }
+}
+
 /** Start a module (600 ms). home-assistant fails unless its token was replaced with one containing "good". */
 const startModule = (c: Conn, requestId: string, id: string) => {
   setModule(id, (m) => {
@@ -1792,17 +2005,17 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
       sessionsChanged()
       return
     }
-    case "module.enable": {
-      const mod = modules.find((x) => x.id === m.moduleId)
-      if (mod === undefined) return result(c, m.requestId, false, { code: "unknown_module", message: `No module ${m.moduleId}.` })
-      if (refuseLocked(c, m.requestId, mod.protected)) return
-      startModule(c, m.requestId, m.moduleId)
-      return
-    }
+    case "module.enable":
     case "module.disable": {
       const mod = modules.find((x) => x.id === m.moduleId)
       if (mod === undefined) return result(c, m.requestId, false, { code: "unknown_module", message: `No module ${m.moduleId}.` })
       if (refuseLocked(c, m.requestId, mod.protected)) return
+      // A capability runs while an assistant has it on (WP-12b): the switch is the assistant's.
+      if (mod.kind === "capability") return result(c, m.requestId, false, { code: "not_allowed", message: `${mod.name} is switched on and off per assistant: change it on the assistant's Modules tab.` })
+      if (m.type === "module.enable") {
+        startModule(c, m.requestId, m.moduleId)
+        return
+      }
       setModule(m.moduleId, (x) => {
         const { error: _e, status: _s, ...rest } = x
         return { ...rest, enabled: false, state: "stopping", tools: [] }
@@ -1822,7 +2035,12 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
       if (errors.length > 0) return result(c, m.requestId, false, { code: "invalid_settings", message: "Some settings are not valid.", moduleId: m.moduleId, fieldErrors: errors })
       const tokenGood = typeof m.patch.secrets.token === "string" ? m.patch.secrets.token.includes("good") : (mod as ModuleInfo & { tokenGood?: boolean }).tokenGood
       setModule(m.moduleId, (x) => ({ ...x, settings: applyPatch(x.settings, m.patch), ...(tokenGood !== undefined ? { tokenGood } : {}) }) as ModuleInfo)
-      if (mod.state === "error" && mod.enabled) startModule(c, m.requestId, m.moduleId)
+      if (mod.kind === "capability") {
+        // The instances follow the new shared values; a token that works clears an injected failure.
+        if (tokenGood === true) forcedErrors.delete(m.moduleId)
+        syncCapabilities()
+        result(c, m.requestId, true)
+      } else if (mod.state === "error" && mod.enabled) startModule(c, m.requestId, m.moduleId)
       else result(c, m.requestId, true)
       return
     }
@@ -1854,6 +2072,7 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
       const changed = new Set(committed.filter((x, j) => j === i || JSON.stringify(x.form) !== JSON.stringify(sections[j]!.form)).map((x) => x.id))
       sections = committed.map((x) => (changed.has(x.id) ? { ...x, revision: x.revision + 1 } : x))
       for (const x of sections) if (changed.has(x.id)) broadcast({ type: "section.changed", section: x })
+      if (changed.has("routing")) routingChanged()
       result(c, m.requestId, true)
       const needsReload = Object.keys({ ...patch.values, ...patch.secrets }).some((k) => section.form.fields.find((f) => f.key === k)?.apply === "reload")
       const path = `${section.group ?? "general"}/${section.page?.id ?? section.id}`
@@ -2625,26 +2844,26 @@ const http = createServer((req, res) => {
         return json(res, 200, { ok: true })
       }
       case "/mock/typesafe": {
-        // TypeSafe set up or not (tests): a running decision module is what the server's `canAuto` looks at.
+        // TypeSafe set up or not (tests): the routing section switched on with a key, as `canAuto` reads it.
         const on = payload.on !== false
-        const next: ModuleInfo = {
-          id: "typesafe",
-          name: "TypeSafe",
-          description: "Routing: which assistant a sentence without a wake phrase is for.",
-          enabled: on,
-          state: on ? "running" : "disabled",
-          tools: [],
-          settings: { fields: [], values: {}, secrets: {}, errors: [] },
-          revision: (modules.find((m) => m.id === "typesafe")?.revision ?? 0) + 1,
-          protected: true,
-          kind: "decider",
-          group: "agents"
-        }
-        modules = [...modules.filter((m) => m.id !== "typesafe"), next]
-        broadcast({ type: "module.changed", module: next })
-        // The voice page's menu offers "Whichever fits" when it is set up.
-        voice.setCanAuto(on)
-        pushSetups()
+        sections = withWarnings(sections.map((x) => {
+          if (x.id !== "routing") return x
+          const form = on
+            ? { ...x.form, values: { ...x.form.values, TYPESAFE_ROUTING: true }, secrets: { ...x.form.secrets, TYPESAFE_API_KEY: { set: true, source: "store" as const } } }
+            : { ...x.form, values: { ...x.form.values, TYPESAFE_ROUTING: false }, secrets: { ...x.form.secrets, TYPESAFE_API_KEY: { set: false, source: "none" as const } } }
+          return { ...x, form, revision: x.revision + 1 }
+        }))
+        const routing = sections.find((x) => x.id === "routing")
+        if (routing !== undefined) broadcast({ type: "section.changed", section: routing })
+        routingChanged()
+        return json(res, 200, { ok: true })
+      }
+      case "/mock/module-error": {
+        // A capability module's instances fail (tests); `message` absent: they run again.
+        const id = String(payload.module ?? "")
+        if (typeof payload.message === "string") forcedErrors.set(id, payload.message)
+        else forcedErrors.delete(id)
+        syncCapabilities()
         return json(res, 200, { ok: true })
       }
       case "/mock/assistant": {
@@ -2703,6 +2922,7 @@ http.on("upgrade", (req, socket, head) => {
   wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req))
 })
 
+syncCapabilities()
 http.listen(PORT, HOST, () => console.log(`[mock] assistant mock on ws://${HOST}:${PORT}/ws · scenario ${scenario}`))
 
 const shutdown = () => {

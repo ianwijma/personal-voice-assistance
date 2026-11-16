@@ -510,11 +510,13 @@ test.describe("admin, desktop, dark", () => {
     await page.mouse.move(2, 2)
     await settle(page)
     await shot(page, "admin-desktop-57-shared-settings-navigation")
+    // Home Assistant's instance fails (a capability runs while an assistant has it on: there is no switch to press).
+    await fetch(`${MOCK}/mock/module-error`, { method: "POST", body: JSON.stringify({ module: "home-assistant", message: "Home Assistant rejected the token (HTTP 401). Create a new long-lived token and paste it here." }) })
     await page.getByTestId("nav-shared-modules").click()
     const ha = page.getByTestId("module-home-assistant")
-    await ha.getByRole("switch").click()
     await expect(ha).toHaveAttribute("data-state", "error")
-    await page.waitForTimeout(6200) // let the toast go
+    await ha.scrollIntoViewIfNeeded()
+    await settle(page)
     await shot(page, "admin-desktop-17-module-error")
   })
 
@@ -661,6 +663,127 @@ test.describe("admin, light", () => {
     await settle(phone.page)
     await shot(phone.page, "admin-phone-light-01-categories")
     await phone.ctx.close()
+  })
+})
+
+// ---------------------------------------------------------------------------------------------------------------
+// The assistants' admin pages that finish the work (docs/ASSISTANTS.md WP-12, WP-14, WP-15): own module settings, the
+// shared Modules page with its instances, Home, Routing, a device with TypeSafe, and Latency with every route kind.
+// ---------------------------------------------------------------------------------------------------------------
+
+const post = (path: string, body: unknown) => fetch(`${MOCK}${path}`, { method: "POST", body: JSON.stringify(body) })
+const KITCHEN_ID = "d-kitchen-ipad-0001"
+
+test.describe("admin, assistants finished, desktop, dark", () => {
+  test.use({ colorScheme: "dark", ...DESKTOP })
+
+  test("own module settings, shared Modules, Home, Routing, a device with TypeSafe, Latency", async ({ page, baseURL }) => {
+    await mock.scenario("latency")
+    await post("/mock/typesafe", { on: false })
+    // An assistant's own module settings: T3's Clock has its own date format; Jeff's Weather one just chosen and refused.
+    await loginAdmin(page, baseURL, "#settings/assistants/t3/modules")
+    await expect(page.getByTestId("assistant-page")).toBeVisible()
+    await page.locator("[data-module=clock]").scrollIntoViewIfNeeded()
+    await page.mouse.move(2, 2)
+    await settle(page, 400)
+    await shot(page, "admin-desktop-58-assistant-own-module-settings")
+    await gotoAdmin(page, baseURL, "#settings/assistants/jeff/modules")
+    const weather = page.locator("[data-module=weather]")
+    await weather.getByTestId("use-own").click()
+    await weather.locator("[data-field='modules.weather.own.defaultPlace']").getByRole("textbox").fill("Atlantis")
+    await page.getByTestId("page-footer").getByRole("button", { name: "Save", exact: true }).click()
+    await expect(weather.getByTestId("field-error")).toBeVisible()
+    await weather.scrollIntoViewIfNeeded()
+    await page.mouse.move(2, 2)
+    await settle(page, 400)
+    await shot(page, "admin-desktop-59-assistant-own-module-error")
+    await page.getByTestId("page-footer").getByRole("button", { name: "Cancel" }).click()
+    // Shared settings: Modules (who uses what, the instances), Home, Routing.
+    await gotoAdmin(page, baseURL, "#settings/shared/modules")
+    await expect(page.getByTestId("module-block-clock")).toBeVisible()
+    await page.mouse.move(2, 2)
+    await settle(page, 400)
+    await shot(page, "admin-desktop-60-shared-modules")
+    await gotoAdmin(page, baseURL, "#settings/shared/home")
+    await expect(page.getByTestId("form-s-home")).toBeVisible()
+    await page.getByTestId("form-s-home").locator("[data-field=HOME_LOCATION]").getByRole("textbox").fill("Utrecht, Netherlands")
+    await page.mouse.move(2, 2)
+    await settle(page, 350)
+    await shot(page, "admin-desktop-61-shared-home")
+    await page.getByTestId("page-footer").getByRole("button", { name: "Cancel" }).click()
+    await gotoAdmin(page, baseURL, "#settings/shared/routing")
+    await expect(page.getByTestId("routing-intro")).toBeVisible()
+    await page.mouse.move(2, 2)
+    await settle(page, 350)
+    await shot(page, "admin-desktop-62-shared-routing-off")
+    // TypeSafe set up: the device page offers it, chosen with its box.
+    await post("/mock/typesafe", { on: true })
+    await gotoAdmin(page, baseURL, `#settings/devices/${KITCHEN_ID}`)
+    await page.getByTestId("without-phrase").selectOption("typesafe")
+    await expect(page.getByTestId("typesafe-box")).toBeVisible()
+    await page.getByTestId("without-phrase").evaluate((el) => el.scrollIntoView({ block: "start" }))
+    await page.getByTestId("settings-page").evaluate((el) => el.scrollBy(0, -140))
+    await page.mouse.move(2, 2)
+    await settle(page, 350)
+    await shot(page, "admin-desktop-63-device-typesafe")
+    await page.getByTestId("page-footer").getByRole("button", { name: "Cancel" }).click()
+    // Latency: the ten columns, a filter, the popover.
+    await gotoAdmin(page, baseURL, "#settings/diagnostics/latency")
+    await expect(page.getByTestId("trace-row")).toHaveCount(13)
+    await page.mouse.move(2, 2)
+    await settle(page, 400)
+    await shot(page, "admin-desktop-64-latency-columns")
+    await page.getByTestId("filter-device").selectOption({ label: "Kitchen iPad" })
+    await settle(page, 300)
+    await shot(page, "admin-desktop-65-latency-filtered")
+    await page.getByTestId("filter-device").selectOption("all")
+    await page.locator("[data-testid=trace-row][data-turn='41']").getByTestId("trace-assistant").hover()
+    await expect(page.getByTestId("trace-popover")).toBeVisible()
+    await settle(page, 250)
+    await shot(page, "admin-desktop-66-latency-popover")
+    await page.mouse.move(2, 2)
+    await page.locator("[data-testid=trace-row][data-turn='44']").getByTestId("trace-toggle").click()
+    await page.locator("[data-testid=trace-row][data-turn='41']").getByTestId("trace-toggle").click()
+    await settle(page, 300)
+    await shot(page, "admin-desktop-67-latency-open-rows")
+  })
+})
+
+test.describe("admin, assistants finished, desktop, light", () => {
+  test.use({ colorScheme: "light", ...DESKTOP })
+
+  test("Latency with its popover, and the shared Modules", async ({ page, baseURL }) => {
+    await mock.scenario("latency")
+    await loginAdmin(page, baseURL, "#settings/diagnostics/latency")
+    await expect(page.getByTestId("trace-row")).toHaveCount(13)
+    await page.locator("[data-testid=trace-row][data-turn='42']").getByTestId("trace-assistant").hover()
+    await expect(page.getByTestId("trace-popover")).toBeVisible()
+    await settle(page, 300)
+    await shot(page, "admin-desktop-light-18-latency-popover")
+    await gotoAdmin(page, baseURL, "#settings/shared/modules")
+    await page.mouse.move(2, 2)
+    await settle(page, 350)
+    await shot(page, "admin-desktop-light-19-shared-modules")
+  })
+})
+
+test.describe("admin, assistants finished, phone, dark", () => {
+  test.use({ colorScheme: "dark", ...PHONE })
+
+  test("own module settings, Latency", async ({ page, baseURL }) => {
+    await mock.scenario("latency")
+    await loginAdmin(page, baseURL, "#settings/assistants/t3/modules")
+    await expect(page.getByTestId("assistant-page")).toBeVisible()
+    await page.locator("[data-module=clock]").scrollIntoViewIfNeeded()
+    await settle(page, 400)
+    await shot(page, "admin-phone-23-assistant-own-module-settings")
+    await gotoAdmin(page, baseURL, "#settings/diagnostics/latency")
+    await expect(page.getByTestId("trace-row")).toHaveCount(13)
+    await settle(page, 400)
+    await shot(page, "admin-phone-24-latency")
+    await page.locator("[data-testid=trace-row][data-turn='44']").getByTestId("trace-toggle").tap()
+    await settle(page, 300)
+    await shot(page, "admin-phone-25-latency-open-row")
   })
 })
 

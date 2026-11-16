@@ -197,7 +197,7 @@ export function NewAssistantWizard() {
       {step === 5 && (
         <>
           <p className="text-[14px] text-ink-muted">What it can do. Module settings are shared; here you only switch them on.</p>
-          <ModuleList draft={draft} />
+          <ModuleList draft={draft} compact />
           <p className="text-[13px] text-ink-muted">Which tools of a module it may use can be narrowed later on the assistant’s page.</p>
         </>
       )}

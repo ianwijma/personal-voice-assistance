@@ -229,7 +229,7 @@ export interface ModelNames {
 }
 
 /** "en_US-lessac-medium" → "Lessac", "kokoro-af_heart" → "Heart": a voice's own words, when the catalog has not named it. */
-const prettyVoice = (voiceId: string) => {
+export const prettyVoice = (voiceId: string) => {
   const kokoro = /^kokoro-[a-z]{2}_(.+)$/.exec(voiceId)
   const last = kokoro?.[1] ?? voiceId.replace(/^[a-z]{2}_[A-Z]{2}-/, "").split("-")[0] ?? voiceId
   return last.charAt(0).toUpperCase() + last.slice(1)

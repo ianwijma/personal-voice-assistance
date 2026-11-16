@@ -1492,3 +1492,50 @@ section on and adds a key, and only from devices set to TypeSafe.
   has no `routing` section. No warm-up request keeps the TypeSafe connection open (Node closes an idle one after about
   4 s, `packages/decide-typesafe/test/live.test.ts`), so a first sentence after a pause also pays the connection set-up; the live
   bench's `--gap-ms 6000` shows what that costs.
+
+### WP-15 and the web halves of WP-12 and WP-14: built 2026-11-16
+
+`apps/web` only (and its mock server). Mock-up: `docs/mockups/assistants/admin.html`; where §7.3 differs, §7.3 wins.
+
+- **Assistant › Modules, own settings** (`assistants/tabs.tsx`): for a module with `overridable` fields (a secret never
+  is), "Uses the shared settings: <values> · Open" and "Use own settings for this assistant". With own settings each
+  overridable field shows "Same as shared" or "Own value · Reset" (Reset removes the key from `modules[id].own`, so the
+  assistant follows the shared value again; "Use the shared settings" drops `own`), and the other fields are named as
+  staying shared. Saved with the assistant through `assistant.save`; a refusal (`modules.<id>.own.<field>`) is shown on
+  its field, whose input is `aria-invalid`, and clears when the field is edited. The wizard shows modules `compact`
+  (switch and shared values only).
+- **Shared settings › Modules** (`ServerPage.tsx` `ModuleBlock`, `ModuleHeader.tsx` `ModuleInstances`): a capability
+  module (one with `ModuleInfo.instances`) has no switch. "Used by: Jeff, Keuken · T3 has its own date format" (assistants
+  switched on with the module on; an own value equal to the shared one counts as shared), then each instance: state,
+  "Shared settings" or "Own <fields>", its assistants, status, and its error (the server's "(for bravo)" text). A module
+  nobody has on says "Not running". Agents and decision modules, and a server without `instances`, keep `ModuleHeader`
+  and its switch.
+- **Home** renders from its section (five fields; units and date format are here, §7.3 item 1). **Routing** renders
+  from the `routing` section (switch, key through the vault flow, model, address under Advanced) under a header of
+  `RoutingIntro`: "TypeSafe", Hosted and Needs key chips, the state ("On", "Key set, switched off", "Needs a key", "Not
+  set up"), the section's description and "Used by:" the devices set to TypeSafe. The device page's TypeSafe option
+  follows the section through `useCanAuto` (switch on and key set): verified against the mock.
+- **Diagnostics › Latency** (`latency.tsx`, `DiagnosticsPages.tsx`): ten columns (Turn, Assistant, Device, Routing, 1st
+  token, TTS audio, Playback, Audible, Outcome, Tools; the page is wide, 1000 px, and scrolls sideways on a phone). Routing
+  is TypeSafe's time with its outcome under it (chosen, none fits, timed out, error); other routes leave it empty.
+  Filters by assistant (segmented), device and route (selects); with "All assistants" a median per assistant of the audible
+  time, with one assistant its median and worst. Hovering or focusing an assistant's name shows a popover of what it was
+  set to at that turn (language model, hearing, voice, modules and tools, chosen by), and opening a row shows the same plus
+  "Open <assistant>". "Changed since this turn: …" lists what differs between the snapshot (`TraceInfo.config`) and the
+  assistant now: language model fields, voice, reply early, tool rounds, module and tool counts, and hearing through the
+  assistant that hears on that device now (a different hearer reads "hearing Keuken's → Jeff's"). A turn without `config`
+  says "Configuration: not recorded" and cannot show a change.
+- **Mock server**: sections `home` and `routing` (`/mock/typesafe` now switches the section, and a save of it updates
+  `canAuto`); overridable fields (Clock time zone and date format, Weather place and units, Home Assistant domains);
+  capability modules follow the assistants (`instances` by effective values, `module.enable`/`disable` refused
+  `not_allowed`, own values checked per field, `POST /mock/module-error` injects an instance failure); T3's Clock has an
+  own date format; scenario `latency` seeds thirteen turns of every route kind with snapshots (`mock/traces.ts`), and live
+  turns carry assistant, device, route and a snapshot of the assistant as it is.
+- **Tests**: `apps/web/e2e/adminFinish.spec.ts` (own value set, refused, reset; modules page; Home; Routing flipping the
+  device page's option; latency columns, filters, popover, changed since, a live turn) and `apps/web/test/latency.test.ts`.
+  Changed: the module tests of `options.spec.ts` and `vault.spec.ts` (no capability switch), `settings.spec.ts` (Home and
+  Routing in the navigation), `assistants.spec.ts` (Home Assistant now runs: 4 tools for Jeff). Screenshots 58 to 67,
+  light 18 and 19, phone 23 to 25; 16, 17, 37, 38 and 49 regenerated.
+- **Not done / not verified**: `e2e-real` (real server) was not updated or run; its module test still clicks a
+  capability's switch. The real server fills `config` in another change: the counts of modules and tools in "changed
+  since" are the web's own (`toolCount`) and may differ from the server's until both are checked together.

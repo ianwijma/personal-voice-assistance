@@ -20,16 +20,16 @@ test.describe("desktop (1280 × 800)", () => {
     await expect(page.getByTestId("page-overview-overview")).toBeVisible()
     await expect(page.getByTestId("settings-nav")).toBeVisible()
     await page.getByTestId("nav-shared").click()
-    await expect(page.getByTestId("page-shared-modules")).toBeVisible()
+    await expect(page.getByTestId("page-shared-home")).toBeVisible()
     expect(hash(page)).toBe("#settings/shared")
-    // The current category is expanded to its pages, in the mock-up's order (Home and Routing only when the server has them).
+    // The current category is expanded to its pages, in the mock-up's order (Home and Routing when the server has them).
     const pages = await page.getByTestId("settings-nav").locator("[data-testid^=nav-shared-]").allTextContents()
-    expect(pages.map((t) => t.trim())).toEqual(["Modules", "Language model accounts", "Speech recognition models", "Voice providers", "Limits"])
+    expect(pages.map((t) => t.trim())).toEqual(["Home", "Modules", "Language model accounts", "Routing", "Speech recognition models", "Voice providers", "Limits"])
     await page.getByTestId("nav-shared-limits").click()
     await expect(page.getByTestId("page-shared-limits")).toBeVisible()
     expect(hash(page)).toBe("#settings/shared/limits")
     await page.goBack()
-    await expect(page.getByTestId("page-shared-modules")).toBeVisible()
+    await expect(page.getByTestId("page-shared-home")).toBeVisible()
     await page.goBack()
     await expect(page.getByTestId("page-overview-overview")).toBeVisible()
 
