@@ -5,7 +5,7 @@
  * with the same input draw the same calls.
  */
 import { beforeAll, describe, expect, it } from "vitest"
-import { CORE_MODES, EXTRA_MODES, type Character, type ExtraMode, type FrameExtensions, type Mode, type OptionSpec, type OptionValues } from "@/characters/contract.ts"
+import { CORE_MODES, EXTRA_MODES, type Character, type ExtraMode, type Focus, type FrameExtensions, type Mode, type OptionSpec, type OptionValues } from "@/characters/contract.ts"
 import { manifestProblems } from "@/characters/manifest.ts"
 import { COMMON_OPTIONS, resolveAll } from "@/characters/options.ts"
 import { coreOf, resolveMode } from "@/characters/runner.ts"
@@ -16,6 +16,22 @@ import { PALETTES } from "./palettes.ts"
 export const MEAN_FRAME_BOUND_MS = 20
 /** Canvas sizes from docs/CHARACTERS.md §2.4: the smallest cell and the largest stage, plus a high-DPI stage. */
 const SIZES = [[160, 140, 1], [900, 420, 1], [720, 240, 2]] as const
+/**
+ * For `"stage"` characters (docs/CHARACTERS.md §2.6): the full-stage canvas of the voice page at desktop and phone
+ * size, with the focus where the page puts the box (smaller than the canvas and offset inside it).
+ */
+export const STAGES: ReadonlyArray<{ readonly label: string; readonly size: readonly [number, number, number]; readonly focus: Focus }> = [
+  { label: "desktop", size: [1280, 800, 1], focus: { x: 280, y: 200, width: 720, height: 240 } },
+  { label: "phone", size: [390, 844, 2], focus: { x: 16, y: 240, width: 358, height: 160 } }
+]
+/** A focus that moves and changes size every frame (the chat panel sliding, the layout scaling, the page scrolling). */
+const moving = (base: Focus) => (t: number): Focus => ({
+  x: base.x + 0.3 * base.width * Math.sin(t * 3),
+  y: base.y + 0.25 * base.height * Math.sin(t * 2.1),
+  width: base.width * (0.8 + 0.2 * Math.sin(t * 1.3)),
+  height: base.height * (0.8 + 0.2 * Math.cos(t * 1.7))
+})
+const fmt = (n: number) => n.toFixed(1)
 
 const EXTRAS = Object.keys(EXTRA_MODES) as Array<ExtraMode>
 
@@ -60,6 +76,7 @@ export const compatSuite = (id: string, load: () => Promise<unknown>) =>
     const runFresh = async (o: Omit<RunOptions, "palette"> & { readonly palette?: RunOptions["palette"] }): Promise<RunResult> =>
       run(await fresh(), { palette: PALETTES.dark, ...o })
     const is2d = () => c.renderer === "2d"
+    const isStage = () => c.canvas === "stage"
 
     beforeAll(async () => {
       c = await fresh()
@@ -137,7 +154,53 @@ export const compatSuite = (id: string, load: () => Promise<unknown>) =>
           const r = await runFresh({ script: CONVERSATION, seconds: CONVERSATION_SECONDS, size })
           lines.push(`overflow ${size.join("×")} ${r.overflow.toFixed(1)} px`)
         }
+      // A stage character also on the desktop stage (§2.6): its frames, and where its solid drawing reached. Not
+      // written for a box character, so their digests are exactly what they were before stage characters existed.
+      if (isStage()) {
+        const st = STAGES[0]!
+        const fo = st.focus
+        const r = await runFresh({ script: CONVERSATION, seconds: CONVERSATION_SECONDS, size: st.size, focus: fo })
+        for (const f of r.frames) lines.push(`stage ${f.t.toFixed(1).padStart(4)} ${f.mode.padEnd(9)} ${String(f.calls).padStart(5)} ${f.digest}`)
+        const e = r.extent
+        lines.push(`stage ${st.size.join("×")} focus ${fo.width}×${fo.height} at ${fo.x},${fo.y}: solid drawing ${e === null ? "none" : `x ${fmt(e.minX)}..${fmt(e.maxX)}, y ${fmt(e.minY)}..${fmt(e.maxY)}`}`)
+      }
       await expect(lines.join("\n") + "\n").toMatchFileSnapshot(`./__snapshots__/${id}.digest`)
+    })
+
+    it("(9) on the whole stage (stage characters): an offset focus, a moving focus, option extremes; centred on the focus", async () => {
+      if (!isStage()) return // a box character: nothing new to check, and nothing it is run with has changed
+      for (const st of STAGES) {
+        const conv = await runFresh({ script: CONVERSATION, seconds: CONVERSATION_SECONDS, size: st.size, focus: st.focus })
+        expect(conv.calls, st.label).toBeGreaterThan(0)
+        if (is2d()) {
+          // The solid drawing is centred inside the focus, or (a character that lights the screen's edge) surrounds it.
+          const e = conv.extent
+          expect(e, `${st.label}: draws something solid`).not.toBeNull()
+          const f = st.focus
+          const cx = (e!.minX + e!.maxX) / 2
+          const cy = (e!.minY + e!.maxY) / 2
+          const centred = cx >= f.x && cx <= f.x + f.width && cy >= f.y && cy <= f.y + f.height
+          const surrounds = e!.minX <= f.x && e!.maxX >= f.x + f.width && e!.minY <= f.y && e!.maxY >= f.y + f.height
+          expect(centred || surrounds, `${st.label}: drawing x ${fmt(e!.minX)}..${fmt(e!.maxX)}, y ${fmt(e!.minY)}..${fmt(e!.maxY)}; focus ${f.width}×${f.height} at ${f.x},${f.y}`).toBe(true)
+        }
+      }
+      const desk = STAGES[0]!
+      const lasts = new Map<string, string>()
+      for (const m of CORE_MODES) {
+        const r = await runFresh({ script: pinned(m), seconds: 2, size: desk.size, focus: desk.focus })
+        expect(r.lastCalls, `${m} draws on the stage`).toBeGreaterThan(0)
+        lasts.set(m, r.last)
+      }
+      for (const a of CORE_MODES) for (const b of CORE_MODES) if (a < b) expect(lasts.get(a), `${a} and ${b} look different on the stage`).not.toBe(lasts.get(b))
+      for (const st of STAGES) {
+        const r = await runFresh({ script: CONVERSATION, seconds: CONVERSATION_SECONDS, size: st.size, focus: moving(st.focus) })
+        expect(r.lastCalls, `${st.label}: draws with a moving focus`).toBeGreaterThan(0)
+      }
+      const specs = c.options ?? []
+      for (const high of [false, true]) {
+        const r = await runFresh({ script: CONVERSATION, seconds: 6, size: desk.size, focus: moving(desk.focus), stored: extremes(specs, high) })
+        expect(r.calls, `${high ? "max" : "min"} on the stage`).toBeGreaterThan(0)
+      }
     })
 
     it("(8) keeps a sane frame cost over the conversation", async () => {
