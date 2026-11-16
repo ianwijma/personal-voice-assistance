@@ -118,8 +118,8 @@ export interface VoiceSessionOptions {
   readonly turnTrace: TurnTrace["Service"]
   /** To every connection of this device. */
   readonly send: (message: ServerMessage) => void
-  /** One final transcript, for the phrase tester (`wake.heard`). */
-  readonly wakeHeard: (text: string, phrase: string | undefined, accepted: boolean) => void
+  /** One final transcript, for the phrase tester (`wake.heard`; `assistant`: whose phrase matched here, if anyone's). */
+  readonly wakeHeard: (text: string, phrase: string | undefined, accepted: boolean, assistant: string | undefined) => void
   /** Something admin's `sessions` shows changed (state, a turn, the conversation). */
   readonly onChange: (minor: boolean) => void
   /** A committed turn ended (the recent traces of every session, for admin). */
@@ -553,7 +553,7 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
         for (const e of echo.events) {
           const r = route.filter(e, t)
           results.push(r)
-          if (r.heard !== undefined) options.wakeHeard(r.heard.text, r.heard.phrase, r.heard.accepted)
+          if (r.heard !== undefined) options.wakeHeard(r.heard.text, r.heard.phrase, r.heard.accepted, r.heard.assistant)
           if (r.woke !== undefined) {
             if (r.woke.armed) armedPhrase.set(r.woke.assistant, r.woke.phrase)
             options.send({ type: "wake", phrase: r.woke.phrase, armed: r.woke.armed, assistantId: r.woke.assistant })

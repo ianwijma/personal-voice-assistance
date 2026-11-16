@@ -255,7 +255,7 @@ test("rename saves with the page; Forget asks first and removes the device", asy
 })
 
 test("the defaults page: no Own value marks; a change reaches the devices that follow it, not the ones with their own list", async ({ page, baseURL }) => {
-  await loginAdmin(page, baseURL, "#settings/devices/type-web-voice")
+  await loginAdmin(page, baseURL, "#settings/devices/type.web-voice")
   await expect(page.getByTestId("page-title")).toHaveText("Every browser")
   await expect(page.getByTestId("device-sub")).toHaveText("Applies to 2 browsers except where one has its own value. A change reaches running devices at once.")
   await expect(page.locator("[data-testid^=marks-] [data-testid=own-marker], [data-testid^=marks-] [data-testid=follows-marker]")).toHaveCount(0)
