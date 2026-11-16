@@ -176,6 +176,13 @@ export interface ClientState {
   readonly sessions: ReadonlyArray<SessionInfo>
   readonly liveTranscript: string
   readonly traces: ReadonlyArray<TraceInfo>
+  /**
+   * The own id of each of `traces`, in the same order: given when the trace arrives and kept while it stays, so neither
+   * a newer trace nor dropping the oldest changes another's (the latency table keeps open rows and its popover by it).
+   */
+  readonly traceIds: ReadonlyArray<number>
+  /** The next trace id; never reused, also not after a logout or a new snapshot. */
+  readonly traceSeq: number
   readonly pending: Readonly<Record<string, PendingRequest>>
   readonly toasts: ReadonlyArray<Toast>
   readonly ui: {
@@ -237,6 +244,8 @@ export const initialState: ClientState = {
   sessions: [],
   liveTranscript: "",
   traces: [],
+  traceIds: [],
+  traceSeq: 0,
   pending: {},
   toasts: [],
   ui: { chatOpen: false, chatView: undefined, sheetOpen: false, settingsOpen: false, settingsPath: [], settingsDirty: false, unread: 0, shortcutsOpen: false }
@@ -251,6 +260,7 @@ const adminPart = {
   env: undefined,
   models: initialState.models,
   jobs: initialState.jobs,
+  traceIds: initialState.traceIds,
   traces: initialState.traces,
   devices: initialState.devices,
   assistants: initialState.assistants,
@@ -392,6 +402,7 @@ const server: ServerHandlers = {
     ...(m.snapshot.admin.loggedIn ? pickAdmin(s) : {}),
     ...atWelcome(s, m.snapshot, historyToTurns),
     toasts: s.toasts,
+    traceSeq: s.traceSeq,
     ui: s.ui
   }),
   "admin.snapshot": (s, m) => ({
@@ -408,7 +419,9 @@ const server: ServerHandlers = {
     assistants: m.snapshot.assistants ?? [],
     deviceTypes: m.snapshot.deviceTypes ?? [],
     sessions: m.snapshot.sessions,
-    adminReady: true
+    adminReady: true,
+    // The snapshot's traces replace the list: each gets a new id.
+    ...newTraceIds(s, Math.min(m.snapshot.traces.length, MAX_TRACES))
   }),
   "engine.summary": (s, m) => ({ ...s, summary: m.engine }),
   "admin.state": (s, m) => {
@@ -421,7 +434,7 @@ const server: ServerHandlers = {
   conversation: onConversation,
   sessions: (s, m) => ({ ...s, sessions: m.sessions }),
   // Admin: a session's finished turn (admin gets no turn.end); turn ids repeat across sessions, so it is appended.
-  trace: (s, m) => ({ ...s, traces: [...s.traces, m.trace].slice(-MAX_TRACES) }),
+  trace: (s, m) => ({ ...s, ...withTraces(s, [m.trace]) }),
   // The phrase and the request in one sentence (`armed: false`): a turn follows, nothing to show.
   wake: (s, m) =>
     m.armed ? { ...s, woke: m.assistantId === undefined ? { phrase: m.phrase } : { phrase: m.phrase, assistantId: m.assistantId }, holder: m.assistantId ?? s.holder } : s,
@@ -496,9 +509,8 @@ const server: ServerHandlers = {
   "turn.end": (s, m) => {
     if (findTurn(s.turns, m.turnId) === -1 && s.staleTurns.includes(m.turnId)) return s
     const next = withTurn(s, m.turnId, (t) => ({ ...t, outcome: m.outcome, trace: m.trace }))
-    const traces = [...next.traces.filter((t) => t.turnId !== m.trace.turnId), m.trace].slice(-MAX_TRACES)
     const unread = next.ui.chatOpen ? next.ui.unread : next.ui.unread + 1
-    return { ...next, traces, ui: { ...next.ui, unread } }
+    return { ...next, ...withTraces(next, [m.trace], (t) => t.turnId === m.trace.turnId), ui: { ...next.ui, unread } }
   },
   // Reply audio control goes to the player, not the store.
   "reply.start": (s) => s,
@@ -587,6 +599,22 @@ const local = (s: ClientState, a: LocalAction): ClientState => {
   }
 }
 
+/**
+ * `traces` without those `drop` picks, with `add` appended (each with a new id), the last MAX_TRACES kept; the traces
+ * that stay keep their ids.
+ */
+function withTraces(s: ClientState, add: ReadonlyArray<TraceInfo>, drop: (t: TraceInfo) => boolean = () => false): Pick<ClientState, "traces" | "traceIds" | "traceSeq"> {
+  const kept = s.traces.flatMap((t, i) => (drop(t) ? [] : [{ t, id: s.traceIds[i] ?? -1 - i }]))
+  const fresh = newTraceIds(s, add.length)
+  const all = [...kept, ...add.map((t, i) => ({ t, id: fresh.traceIds[i]! }))].slice(-MAX_TRACES)
+  return { traces: all.map((x) => x.t), traceIds: all.map((x) => x.id), traceSeq: fresh.traceSeq }
+}
+
+/** `n` new trace ids, and the counter after them. */
+function newTraceIds(s: ClientState, n: number): Pick<ClientState, "traceIds" | "traceSeq"> {
+  return { traceIds: Array.from({ length: n }, (_, i) => s.traceSeq + i), traceSeq: s.traceSeq + n }
+}
+
 function pickAdmin(s: ClientState): Partial<ClientState> {
   return {
     engine: s.engine,
@@ -596,6 +624,7 @@ function pickAdmin(s: ClientState): Partial<ClientState> {
     env: s.env,
     models: s.models,
     jobs: s.jobs,
+    traceIds: s.traceIds,
     traces: s.traces,
     devices: s.devices,
     assistants: s.assistants,

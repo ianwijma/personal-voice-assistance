@@ -763,6 +763,10 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
         if (client.role !== "voice" || client.sessionKey === undefined) {
           return result(client, message.requestId, failure("bad_message", "A new conversation is started from a voice page"))
         }
+        // Only an assistant on this device (the server keeps its conversation, and before the session its reserved id).
+        if (message.assistantId !== undefined && !assistants.setupFor(client.device?.id, client.device?.kind).assistants.some((a) => a.id === message.assistantId)) {
+          return result(client, message.requestId, failure("unknown_assistant", `${message.assistantId} is not one of the assistants on this device`))
+        }
         // Without a session the reservation of the assistant asked for (absent: the one that will answer) is replaced.
         const assistantId = message.assistantId ?? (sessionOf(client) === undefined ? answersWithoutSession(client) : undefined)
         return limited(client, message.requestId, Effect.as(sessions.newConversation(client.sessionKey, assistantId), { ok: true } as HostResult))
