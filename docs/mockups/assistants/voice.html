@@ -929,10 +929,12 @@ function send() {
   const text = S.draft.trim();
   if (!text) return;
   const id = chatId(), c = convOf(S.device, id);
-  c.turns.push({ you: text, typed: true });
+  const turn = { you: text, typed: true };
+  c.turns.push(turn);
   S.draft = "";
   renderChat(); $("chat-input").focus();
-  setTimeout(() => { c.turns[c.turns.length - 1].reply = A[id].canned; renderMessages(); }, 700);
+  // Answer this turn, not the latest one; a new conversation in the meantime drops the reply.
+  setTimeout(() => { if (!c.turns.includes(turn)) return; turn.reply = A[id].canned; renderMessages(); }, 700);
 }
 function firstMenuItem() {
   const i = dev().list.findIndex((e) => isDefault(e.id)), n = dev().list.length;

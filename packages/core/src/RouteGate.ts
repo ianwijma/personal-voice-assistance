@@ -105,7 +105,10 @@ export interface RouteResult {
 }
 
 export interface RouteGate {
-  /** Live; discards a held utterance, keeps an open window only if it is still open under the new config. */
+  /**
+   * Live; discards a held utterance, keeps an open window only if it is still open under the new config. An armed
+   * window closes when its assistant is no longer on the device (no phrase and no follow-up length in the new config).
+   */
   configure(config: RouteConfig): void
   readonly config: () => RouteConfig
   /** `assistant` started a spoken reply: while it lasts, its follow-up counts as open when its length is above 0. */
@@ -174,6 +177,9 @@ export const makeRouteGate = (initial: RouteConfig): RouteGate => {
   const armedMs = () => config.armedMs ?? WAKE_ARMED_MS
   const followUpOf = (assistant: string) => config.followUpMs?.[assistant] ?? 0
   const isOff = (assistant: string) => config.off.has(assistant)
+  /** Still on the device: one of its phrases, or a follow-up length, is in the config. */
+  const assigned = (assistant: string) =>
+    config.phrases.some((p) => p.assistant === assistant) || Object.hasOwn(config.followUpMs ?? {}, assistant)
 
   const armedOpen = (now: number) => armed !== undefined && now - armed.at < armedMs()
   const followingOpen = (now: number) => {
@@ -342,6 +348,8 @@ export const makeRouteGate = (initial: RouteConfig): RouteGate => {
     configure: (next) => {
       config = next
       if (utterance?.kind === "held") utterance = { kind: "discarding" }
+      // An armed assistant that was removed from the device must not answer the next sentence.
+      if (armed !== undefined && !assigned(armed.assistant)) armed = undefined
     },
     config: () => config,
     replyStarted: (assistant) => {

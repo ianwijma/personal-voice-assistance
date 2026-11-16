@@ -23,6 +23,8 @@ export interface RecognizerCore {
     readonly pieces: number
     /** Sessions open now. */
     readonly sessions: number
+    /** Detectors kept for later sessions (at most a few, whatever thresholds were asked for). */
+    readonly idleVads: number
     readonly stats: RecognizerCoreStats
   }
 }
