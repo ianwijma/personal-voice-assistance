@@ -34,7 +34,8 @@ const entry = (provider: string, modelId: string, name: string, extra: Partial<M
   name,
   badges: [],
   tags: [modelId],
-  apply: provider === "sherpa" ? { hearing: { engine: "sherpa", model: modelId } } : { llm: { account: provider as "anthropic", model: modelId } },
+  // A recogniser engine's row sets the hearing; any other provider's, the language model (the schema checks both).
+  apply: provider === "sherpa" || provider === "deepgram" ? { hearing: { engine: provider, model: modelId } } : { llm: { account: provider as "anthropic", model: modelId } },
   listed: true,
   selectable: true,
   usedBy: [],
@@ -504,6 +505,8 @@ describe("the model catalog's calls", () => {
       await w.answer(1)
       expect(w.c.store.get().load).toBe("ready")
       expect(anthropicOf(w.c).provider.status).toBe("needs_key")
+      expect(w.shown.length).toBeGreaterThan(0)
+      expect(w.shown.at(-1)).toContain("anthropic:needs_key:")
       expect(w.shown.some((x) => x.includes("Old"))).toBe(false)
       expect(w.pending).toHaveLength(2)
     }
@@ -526,7 +529,10 @@ describe("the model catalog's calls", () => {
       expect(w.c.store.get().refreshing).toBe(false)
       await w.answer(2)
       expect(w.pending[2]!.url).toBe("http://h/api/models/llm")
-      expect(anthropicOf(w.c).provider.status).toBe("needs_key")
+      await vi.waitFor(() => expect(anthropicOf(w.c).provider.status).toBe("needs_key"))
+      expect(w.shown.length).toBeGreaterThan(0)
+      expect(w.shown.at(-1)).toContain("anthropic:needs_key:")
+      expect(w.shown.some((x) => x.includes("Old"))).toBe(false)
     }
   })
 
@@ -545,11 +551,14 @@ describe("the model catalog's calls", () => {
     expect(first.c.store.get().load).toBe("loading")
     await first.answer(1)
     expect(first.pending[1]!.url).toBe("http://h/api/models/stt")
-    expect(first.shown.every((x) => x.includes("M1") && x.includes("H1"))).toBe(true)
+    await vi.waitFor(() => expect(first.c.store.get().load).toBe("ready"))
+    expect(first.shown.length).toBeGreaterThan(0)
+    expect(first.shown.every((x) => x === "sherpa:ready:M1 deepgram:ready:H1")).toBe(true)
     // A full refresh: the hosted list is taken, the machine's older list is kept until the machine's new one answers.
     const w = watched("stt", list("M0", "H0"))
     w.c.ensure()
     await w.answer(0)
+    await vi.waitFor(() => expect(w.shown.at(-1)).toBe("sherpa:ready:M0 deepgram:ready:H0"))
     w.opts.body = list("M1", "H1")
     const refresh = w.c.reload(true)
     await vi.waitFor(() => expect(w.pending).toHaveLength(2))
@@ -560,7 +569,7 @@ describe("the model catalog's calls", () => {
     expect(w.shown.at(-1)).toBe("sherpa:ready:M0 deepgram:ready:H1")
     await w.answer(2)
     expect(w.pending[2]!.url).toBe("http://h/api/models/stt?provider=sherpa")
-    expect(w.shown.at(-1)).toBe("sherpa:ready:M2 deepgram:ready:H1")
+    await vi.waitFor(() => expect(w.shown.at(-1)).toBe("sherpa:ready:M2 deepgram:ready:H1"))
     expect(w.shown.some((x) => x.includes("M1"))).toBe(false)
   })
 
