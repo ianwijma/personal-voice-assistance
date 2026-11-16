@@ -1,4 +1,4 @@
-import { act, renderHook } from "@testing-library/react"
+import { act, fireEvent, render, renderHook, screen } from "@testing-library/react"
 import type { ReactNode } from "react"
 import { describe, expect, it, vi } from "vitest"
 import type { AssistantInfo } from "@pva/protocol"
@@ -6,6 +6,7 @@ import { exampleAssistantInfo } from "@pva/protocol/examples"
 import type { Outcome } from "@/lib/assistants.ts"
 import type { AssistantClient } from "@/lib/client.ts"
 import { ClientContext } from "@/components/context.tsx"
+import { NumberControl, TextControl } from "@/components/settings/pages/assistants/parts.tsx"
 import { useAssistantDraft } from "@/components/settings/pages/assistants/useAssistantDraft.ts"
 
 const info = (patch: Partial<AssistantInfo> = {}): AssistantInfo => ({ ...exampleAssistantInfo, ...patch })
@@ -224,6 +225,73 @@ describe("useAssistantDraft", () => {
     expect(result.current.saving).toBe(false)
   })
 
+  it("an edit made while the save is on its way is kept after it, on top of the saved revision, and saved next (PR #34 review, finding 1)", async () => {
+    let release: (o: Outcome) => void = () => {}
+    const { result, rerender, saveAssistant } = setup(() => new Promise<Outcome>((r) => (release = r)))
+    act(() => result.current.set("purpose", "Mine"))
+    let first: Promise<Outcome> | undefined
+    act(() => {
+      first = result.current.save()
+    })
+    act(() => result.current.set("handles", "Only lights."))
+    await act(async () => {
+      release({ kind: "ok" })
+      await first
+    })
+    expect(result.current.saving).toBe(false)
+    expect(result.current.current).toMatchObject({ purpose: "Mine", handles: "Only lights." })
+    expect(result.current.saved).toMatchObject({ purpose: "Mine", rev: 4 })
+    expect(result.current.dirty).toBe(true)
+    expect(result.current.justSaved).toBe(false)
+    expect(result.current.changed("handles")).toBe(true)
+    expect(result.current.changed("purpose")).toBe(false)
+    // The push of the first save is not "changed elsewhere".
+    rerender({ info: info({ purpose: "Mine", rev: 4 }) })
+    expect(result.current.behind).toBe(false)
+    expect(result.current.dirty).toBe(true)
+    let second: Promise<Outcome> | undefined
+    act(() => {
+      second = result.current.save()
+    })
+    await act(async () => {
+      release({ kind: "ok" })
+      await second
+    })
+    expect(saveAssistant.mock.calls[1]![0]).toMatchObject({ purpose: "Mine", handles: "Only lights.", rev: 4 })
+  })
+
+  it("an empty name is not sent: the name field says so, and nothing is left saving (PR #34 review, finding 2)", async () => {
+    const { result, saveAssistant } = setup()
+    act(() => result.current.set("name", ""))
+    let outcome: Outcome | undefined
+    await act(async () => {
+      outcome = await result.current.save()
+    })
+    expect(outcome).toMatchObject({ kind: "invalid" })
+    expect(saveAssistant).not.toHaveBeenCalled()
+    expect(result.current.saving).toBe(false)
+    expect(result.current.errors).toEqual([{ key: "name", message: "Enter a name." }])
+    expect(result.current.tabErrors("basics")).toBe(true)
+    act(() => result.current.set("name", "Mia"))
+    expect(result.current.errors).toEqual([])
+    await act(async () => void (await result.current.save()))
+    expect(saveAssistant).toHaveBeenCalledTimes(1)
+  })
+
+  it("a save whose request fails returns the editor to editing, keeps the edits and says it did not save (PR #34 review, finding 2)", async () => {
+    const { result } = setup(() => Promise.reject(new Error("encode failed")))
+    act(() => result.current.set("purpose", "Mine"))
+    let outcome: Outcome | undefined
+    await act(async () => {
+      outcome = await result.current.save()
+    })
+    expect(outcome).toMatchObject({ kind: "refused" })
+    expect(result.current.saving).toBe(false)
+    expect(result.current.dirty).toBe(true)
+    expect(result.current.current.purpose).toBe("Mine")
+    expect(result.current.message).toBe("Could not save. Try again.")
+  })
+
   describe("a push while editing", () => {
     it("a clean draft follows it", () => {
       const { result, rerender } = setup()
@@ -256,5 +324,46 @@ describe("useAssistantDraft", () => {
       expect(result.current.behind).toBe(false)
       expect(result.current.dirty).toBe(true)
     })
+  })
+})
+
+/** The number field of a page with a Cancel button, on the real draft. */
+function NumberPage({ value }: { readonly value: AssistantInfo }) {
+  const draft = useAssistantDraft(value)
+  return (
+    <div>
+      <TextControl draft={draft} path="purpose" max={80} label="Purpose" />
+      <NumberControl draft={draft} path="toolRounds" min={0} max={10} unit="rounds" label="Tool rounds" />
+      <button type="button" onClick={draft.cancel}>Cancel</button>
+      <span data-testid="dirty">{String(draft.dirty)}</span>
+    </div>
+  )
+}
+
+describe("NumberControl", () => {
+  it("Cancel puts back the saved number over text the draft never took (PR #34 review, finding 3)", () => {
+    const client = { saveAssistant: vi.fn() } as unknown as AssistantClient
+    render(<ClientContext.Provider value={client}><NumberPage value={info()} /></ClientContext.Provider>)
+    const rounds = screen.getByLabelText("Tool rounds") as HTMLInputElement
+    expect(rounds.value).toBe("3")
+    fireEvent.change(screen.getByLabelText("Purpose"), { target: { value: "Mine" } })
+    fireEvent.change(rounds, { target: { value: "99" } })
+    expect(rounds.value).toBe("99")
+    expect(rounds.getAttribute("aria-invalid")).toBe("true")
+    fireEvent.click(screen.getByText("Cancel"))
+    expect(rounds.value).toBe("3")
+    expect(rounds.getAttribute("aria-invalid")).toBeNull()
+    expect(screen.getByTestId("dirty").textContent).toBe("false")
+  })
+
+  it("a valid number typed after an invalid one is kept as typed", () => {
+    const client = { saveAssistant: vi.fn() } as unknown as AssistantClient
+    render(<ClientContext.Provider value={client}><NumberPage value={info()} /></ClientContext.Provider>)
+    const rounds = screen.getByLabelText("Tool rounds") as HTMLInputElement
+    fireEvent.change(rounds, { target: { value: "99" } })
+    fireEvent.change(rounds, { target: { value: "7" } })
+    expect(rounds.value).toBe("7")
+    expect(rounds.getAttribute("aria-invalid")).toBeNull()
+    expect(screen.getByTestId("dirty").textContent).toBe("true")
   })
 })

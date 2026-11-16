@@ -87,13 +87,13 @@ describe("language model accounts", () => {
     })
     it("the Anthropic API is ready when its key is set, else points at where to set it", () => {
       expect(accountState("anthropic", [section([], { ANTHROPIC_API_KEY: { set: true } })], [])).toEqual({ tone: "ok", text: "Key set" })
-      expect(accountState("anthropic", [section([], { ANTHROPIC_API_KEY: { set: false } })], [])).toMatchObject({ tone: "todo", setUp: ["language-model", "provider"] })
+      expect(accountState("anthropic", [section([], { ANTHROPIC_API_KEY: { set: false } })], [])).toMatchObject({ tone: "todo", setUp: ["shared", "accounts"] })
       expect(accountState("anthropic", [section([])], [])).toMatchObject({ tone: "todo" })
     })
     it("the subscription is ready only when its module is on and running", () => {
       expect(accountState("claude-subscription", [], [mod("claude-subscription", [])])).toEqual({ tone: "ok", text: "Logged in" })
       for (const m of [mod("claude-subscription", [], { enabled: false }), mod("claude-subscription", [], { state: "starting" })]) {
-        expect(accountState("claude-subscription", [], [m])).toMatchObject({ tone: "todo", setUp: ["language-model", "claude-subscription"] })
+        expect(accountState("claude-subscription", [], [m])).toMatchObject({ tone: "todo", setUp: ["shared", "accounts"] })
       }
       expect(accountState("claude-subscription", [], [])).toMatchObject({ tone: "todo" })
     })
