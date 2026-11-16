@@ -451,9 +451,18 @@ export const defaultSttBuilder = (
       Effect.catch((e) => (SherpaStt.isOrphanedMessage(e.message) ? Effect.andThen(waitForOrphan, SherpaStt.acquire(options, script)) : Effect.fail(e))),
       Effect.mapError((e) => new ResourceBuildError({ message: e.message }))
     )
+    // The worker outlives this instance when another one (a full reload's replacement) shares it: drop this
+    // instance's failure listeners when its scope closes, so the worker does not keep retired instances alive.
+    const unsubscribes = new Set<() => void>()
+    yield* Effect.addFinalizer(() =>
+      Effect.sync(() => {
+        for (const unsubscribe of unsubscribes) unsubscribe()
+        unsubscribes.clear()
+      })
+    )
     return {
       forStream: (stream) => shared.forStream(sherpaStreamOf(stream)),
-      onFailure: (listener) => void shared.onFailure((e) => listener(e.message))
+      onFailure: (listener) => void unsubscribes.add(shared.onFailure((e) => listener(e.message)))
     } satisfies Recogniser
   })
 
@@ -540,7 +549,11 @@ export interface ResourcePool {
    * failed one): wait for `ttsReady` before reading it. `undefined`: the assistant is not in use.
    */
   readonly ttsFor: (assistant: string) => Tts["Service"] | undefined
-  /** Completes once the voice `assistant` is bound to has been built (or has failed): its sample rate is known. */
+  /**
+   * Completes once the voice `assistant` is bound to at this call (the one `ttsFor` returns now) has been built (or
+   * has failed): its sample rate is known. The voice is resolved when this is called, not when the effect runs, so a
+   * rebinding in between neither skips that voice's build nor waits on another voice.
+   */
   readonly ttsReady: (assistant: string) => Effect.Effect<void>
   /** The key of the voice `assistant` uses now. */
   readonly ttsKeyFor: (assistant: string) => string | undefined
@@ -785,10 +798,11 @@ const makeKind = <Spec, Svc>(config: KindConfig<Spec, Svc>, hooks: PoolHooks) =>
       return { service: entry.service, key: entry.key, serial: entry.serial, spec, state: entry.state, ...(entry.problem !== undefined ? { problem: entry.problem } : {}) }
     },
     keyFor: (assistant: string): string | undefined => bound.get(assistant)?.key,
-    settledFor: (assistant: string): Effect.Effect<void> => Effect.suspend(() => {
+    /** Resolved now (not when run): it waits for the instance bound at the call, the one `serviceFor` returns now. */
+    settledFor: (assistant: string): Effect.Effect<void> => {
       const entry = bound.get(assistant)
       return entry === undefined ? Effect.void : Deferred.await(entry.settled)
-    }),
+    },
     info: (): Array<ResourceInfo> =>
       [...alive].map((entry) => {
         const users = usersOf(entry)

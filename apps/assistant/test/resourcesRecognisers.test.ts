@@ -311,4 +311,29 @@ describe("resource pool: the default recogniser builder on stt-sherpa (stand-in 
     await run(pool.reconcile(new Map(), { recognisers: new Map() }))
     await until("both workers stopped", () => SherpaStt.workers() === before)
   })
+
+  it("an instance closed while its worker lives on (a full reload's replacement shares it) stops listening for that worker's failure", async () => {
+    const dir = fakeModelDir("parakeet-v2")
+    const before = SherpaStt.workers()
+    // The worker dies on the audio of its first session.
+    const builder = defaultSttBuilder(() => ConfigProvider.fromEnvRecord({}), { url: fakeWorker, data: { exitOnAudioOf: 1 } })
+    const spec: SttSpec = { ...sttSpecOf(hearing("parakeet-v2", { agc: false })), modelDir: dir }
+    const oldScope = Effect.runSync(Scope.make())
+    const newScope = Effect.runSync(Scope.make())
+    const old = await run(Scope.provide(builder(spec), oldScope))
+    const replacement = await run(Scope.provide(builder(spec), newScope))
+    expect(SherpaStt.workers() - before).toBe(1)
+    const told: Array<string> = []
+    old.onFailure?.(() => told.push("old"))
+    replacement.onFailure?.(() => told.push("replacement"))
+    // The old instance is released after the grace period; the worker stays for the replacement.
+    await run(Scope.close(oldScope, Exit.void))
+    expect(SherpaStt.workers() - before).toBe(1)
+    const frame = new Uint8Array(new Int16Array(320).fill(8000).buffer)
+    await run(Effect.exit(Stream.runDrain(replacement.forStream(spec.stream).transcribe(Stream.make(frame)))))
+    await until("the replacement was told", () => told.length > 0)
+    expect(told).toEqual(["replacement"])
+    await run(Scope.close(newScope, Exit.void))
+    await until("the worker stopped", () => SherpaStt.workers() === before)
+  })
 })

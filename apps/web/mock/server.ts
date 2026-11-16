@@ -729,6 +729,9 @@ interface VSession {
   lastActive: number
   /** Wake-phrase windows: the armed window after the phrase alone, the follow-up window after a reply. */
   awakeUntil: number
+  /** The assistant the utterance being heard goes to (`runVoiceTurn`), and the `holder` the last `state` said. */
+  hearingFor: string | undefined
+  holderSent: string | null
   awakeTimer: ReturnType<typeof setTimeout> | undefined
   discardTimer: ReturnType<typeof setTimeout> | undefined
 }
@@ -894,6 +897,8 @@ const sessionFor = (c: Conn): VSession | undefined => {
       lastTurnAt: now - 5 * 60_000,
       lastActive: now,
       awakeUntil: 0,
+      hearingFor: undefined,
+      holderSent: null,
       awakeTimer: undefined,
       discardTimer: undefined
     }
@@ -1003,7 +1008,9 @@ const stayAwake = (v: VSession, ms: number) => {
   if (v.awakeTimer !== undefined) clearTimeout(v.awakeTimer)
   v.awakeTimer = setTimeout(() => {
     v.awakeTimer = undefined
-    if (v.reply === undefined && (v.state === "listening" || v.state === "asleep")) setState(v, restingState(v))
+    // The window closed: nobody keeps the turn (a reply in flight keeps it; its end opens a window of its own).
+    voice.setHolder(v, undefined)
+    if (v.reply === undefined) setState(v, v.state === "listening" || v.state === "asleep" ? restingState(v) : v.state)
   }, ms + 20)
 }
 /**
@@ -1119,10 +1126,24 @@ const broadcast = (m: ServerMessage) => {
   }
 }
 
+/**
+ * Who has the turn, as the server says it (`state.holder`, `snapshot.holder`): the reply's assistant, else the
+ * assistant of the utterance being heard, else the one whose armed or follow-up window is open, else nobody.
+ */
+const holderNow = (v: VSession): string | null => {
+  if (v.reply !== undefined) return v.reply.assistantId ?? null
+  if (v.state === "hearing" && v.hearingFor !== undefined) return v.hearingFor
+  return Date.now() < v.awakeUntil ? voice.holderOf(v) ?? null : null
+}
+
+/** The state, with who has the turn; sent again with the same state when only the holder changed (as the server does). */
 const setState = (v: VSession, state: AssistantState, turnId?: number) => {
-  if (state === v.state && turnId === undefined) return
+  const was = v.state
   v.state = state
-  toSession(v, turnId === undefined ? { type: "state", state } : { type: "state", state, turnId })
+  const holder = holderNow(v)
+  if (state === was && turnId === undefined && holder === v.holderSent) return
+  v.holderSent = holder
+  toSession(v, turnId === undefined ? { type: "state", state, holder } : { type: "state", state, turnId, holder })
   sessionsChanged()
 }
 
@@ -1426,10 +1447,14 @@ const endTurn = (r: Reply, outcome: "completed" | "interrupted" | "failed") => {
     conv.lastTurnAt = Date.now()
   }
   toSession(v, { type: "turn.end", turnId: r.turnId, outcome, trace })
-  if (wakeMode(v)) {
-    const followUp = voice.followUpMs(v.deviceId, r.assistantId)
-    if (followUp > 0) stayAwake(v, followUp)
-    else v.awakeUntil = 0
+  // The reply's assistant keeps the turn for its follow-up window, in every mode (as the server's route gate).
+  const followUp = voice.followUpMs(v.deviceId, r.assistantId)
+  if (followUp > 0) {
+    voice.setHolder(v, r.assistantId)
+    stayAwake(v, followUp)
+  } else {
+    v.awakeUntil = 0
+    voice.setHolder(v, undefined)
   }
   setState(v, restingState(v))
   sessionsChanged()
@@ -1486,6 +1511,7 @@ const runReply = (v: VSession, opts: {
   v.lastActive = endOfTurn
   conv.history.push({ role: "user", text: opts.userText })
   voice.setHolder(v, assistantId)
+  v.hearingFor = undefined
   toSession(v, { type: "transcript", text: "" })
   toSession(v, { type: "turn.start", turnId, source: opts.source, userText: opts.userText, spoken: opts.spoken, ...withId })
   setState(v, "thinking", turnId)
@@ -1562,6 +1588,7 @@ const runVoiceTurn = (v: VSession | undefined, opts: { assistantId?: string | un
   if (v === undefined || v.owner === undefined) return
   const assistantId = opts.assistantId ?? voice.answeringOf(v, v.deviceId)
   const script = scriptedTurn(assistantId, WEATHER_TURN)
+  v.hearingFor = assistantId
   setState(v, "hearing")
   if (opts.phrase !== undefined) wakeUp(v, opts.phrase, false, assistantId)
   const spoken = (script.userText.charAt(0).toLowerCase() + script.userText.slice(1)).replace(/[?]/g, "").split(" ")
@@ -1694,6 +1721,7 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
       c.lastSeq = undefined
       for (const x of connsOf(v)) sendTo(x, { type: "session", role: x === c ? "owner" : "observer", ownerPresent: true, reason: x === previous ? "taken_over" : "claimed" })
       v.awakeUntil = 0
+      voice.setHolder(v, undefined)
       setState(v, restingState(v))
       devicesChanged()
       sessionsChanged()
@@ -2077,10 +2105,17 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
       const r = voice.pick(c.deviceId, m.withoutPhrase)
       sendTo(c, r.ok ? { type: "result", requestId: m.requestId, ok: true } : { type: "result", requestId: m.requestId, ok: false, ...(r.error !== undefined ? { error: r.error } : {}) })
       if (!r.ok) return
-      // A pick is a fresh start for who answers: nobody keeps the turn.
+      // As the server: an accepted pick closes the device's armed and follow-up windows (a reply in flight keeps its
+      // turn), and the state that follows names who has the turn; the page does not guess.
       const v = sessionFor(c)
-      if (v !== undefined) voice.setHolder(v, undefined)
+      if (v !== undefined) {
+        voice.setHolder(v, undefined)
+        v.awakeUntil = 0
+        if (v.awakeTimer !== undefined) clearTimeout(v.awakeTimer)
+        v.awakeTimer = undefined
+      }
       assistantsChanged()
+      if (v !== undefined) setState(v, v.reply === undefined && (v.state === "listening" || v.state === "asleep") ? restingState(v) : v.state)
       return
     }
     case "conversation.read": {
@@ -2177,6 +2212,8 @@ wss.on("connection", (ws: WebSocket) => {
           role: v !== undefined && c === v.owner ? "owner" : "observer",
           ownerPresent: v !== undefined && ownerPresentIn(v),
           engine: engineSummary(engine),
+          // Who has the turn now (an armed assistant too), apart from whose history this is.
+          ...(v !== undefined && m.frontend === "voice" ? { holder: holderNow(v) } : {}),
           history: answering === undefined ? [] : answering.history.slice(-200),
           ...(m.frontend === "voice" ? { device: profileInfo(c) } : {}),
           admin: adminState(c, tokenSent !== undefined && c.session === undefined ? { endReason: "token" } : {}),

@@ -106,27 +106,15 @@ describe("the strip and the woke state", () => {
   })
 })
 
-describe("holder-clear", () => {
-  it("returns the same state when there is nothing to clear", () => {
-    const s = run([welcomeWith(two)])
-    expect(reducer(s, { type: "local/holder-clear" })).toBe(s)
-  })
-
-  it("clears a woke state that has no holder behind it", () => {
-    const s = { ...run([welcomeWith(two)]), woke: { phrase: "hey" } }
-    expect(reducer(s, { type: "local/holder-clear" }).woke).toBeUndefined()
-  })
-})
-
 describe("device.setup", () => {
   it("keeps the holder when the pick is the same and the holder is still on the device", () => {
     const held = run([welcomeWith(two), { type: "turn.start", turnId: 1, source: "voice", userText: "x", spoken: true, assistantId: "t3" }])
     expect(run([setupMessage({ ...two, canPick: !two.canPick })], held).holder).toBe("t3")
   })
 
-  it("the first setup has no earlier pick: it counts as a change and leaves no holder", () => {
+  it("the first setup keeps a holder that is on the device (who has the turn is the server's to say)", () => {
     const s = run([setupMessage(two)], { ...initialState, holder: "t3" })
-    expect(s.holder).toBeUndefined()
+    expect(s.holder).toBe("t3")
     expect(s.setup?.assistants).toHaveLength(2)
   })
 
