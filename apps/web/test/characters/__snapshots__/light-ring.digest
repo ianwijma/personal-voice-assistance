@@ -1,4 +1,4 @@
-# light-ring 1.0.0: frame digests of a scripted conversation at default settings (docs/CHARACTERS.md §6.6).
+# light-ring 1.1.0: frame digests of a scripted conversation at default settings (docs/CHARACTERS.md §6.6).
 # A change here must be deliberate: check the look, then update with `pnpm --filter @pva/web exec vitest run test/characters -u`.
 dark  0.5 idle         12 b5f8be9a
 dark  1.0 listening    19 b20ee1e8
@@ -47,3 +47,26 @@ light 11.0 idle         13 4b806680
 overflow 160×140×1 13.3 px
 overflow 900×420×1 40.0 px
 overflow 720×240×2 22.9 px
+stage  0.5 idle         12 aa89f61a
+stage  1.0 listening    19 a5a6e068
+stage  1.5 listening    16 a0e7888d
+stage  2.0 hearing      46 6bba5971
+stage  2.5 hearing      57 0636b600
+stage  3.0 hearing      73 3aeaec41
+stage  3.5 hearing      82 e655f019
+stage  4.0 hearing      79 d5169994
+stage  4.5 hearing      82 2d2daf71
+stage  5.0 thinking    125 09b02408
+stage  5.5 thinking    117 07ba208f
+stage  6.0 thinking     99 049be5eb
+stage  6.5 speaking    270 c1dd803c
+stage  7.0 speaking    273 145bb1d2
+stage  7.5 speaking    279 a79e42e2
+stage  8.0 speaking    228 5e2539ba
+stage  8.5 speaking    225 7281b7a4
+stage  9.0 speaking    222 9774c55a
+stage  9.5 listening   226 08185bdf
+stage 10.0 listening   223 07f3e1fe
+stage 10.5 idle        223 17f8aa68
+stage 11.0 idle         16 58949548
+stage 1280×800×1 focus 720×240 at 280,200: solid drawing x 497.1..782.9, y 177.1..462.9

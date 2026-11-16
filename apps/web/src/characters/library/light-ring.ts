@@ -25,7 +25,7 @@ const ARC_PLACE: { readonly [k: string]: number } = { bottom: 0.08, sides: 0.5, 
 
 const create = (canvas: HTMLCanvasElement): CharacterInstance => {
   let g = setup2d(canvas)
-  let W = 1
+  let W = 1 // the focus box, set per frame
   let H = 1
   let dpr = 1
   let R = 10 // radius at size 1
@@ -89,14 +89,18 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
 
   return {
     resize(width, height, ratio) {
-      W = width
-      H = height
       dpr = ratio
       g = setup2d(canvas, dpr)
-      R = Math.min(H * 0.34, W * 0.3)
     },
 
     frame(f) {
+      const fo = f.focus
+      W = fo.width
+      H = fo.height
+      R = Math.min(H * 0.34, W * 0.3)
+      const px = f.pointer.x - fo.x
+      const py = f.pointer.y - fo.y
+      const overBox = f.pointer.inside && px >= 0 && px < W && py >= 0 && py < H
       const dt = f.dt
       const p = f.palette
       const dark = p.dark
@@ -156,7 +160,7 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
 
       // Ring radius: small and still when ready, full while hearing or speaking.
       const loud = clamp01(L * 1.6)
-      const press = f.pointer.down && f.pointer.inside ? 0.94 : 1
+      const press = f.pointer.down && overBox ? 0.94 : 1
       // Size, capped so the ring and its thickest spectrum band stay inside the canvas.
       const fit = (0.5 * Math.min(W, H) - 2) / (1.07 + (0.105 + 0.219 * specK) * thickK)
       const Rs = Math.min(R * sizeK, fit)
@@ -175,7 +179,7 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
       mixInto(col, p.inkFaint, p.you, clamp01(mix.listening + mix.hearing + 0.4 * mix.thinking))
       mixInto(col, col, p.voice, clamp01(mix.speaking + 0.6 * mix.thinking))
 
-      clear2d(g, dpr)
+      clear2d(g, dpr, fo) // the whole canvas; (0, 0) is the box's top-left corner
       g.lineCap = "round"
       g.globalCompositeOperation = dark ? "lighter" : "source-over"
 
@@ -269,11 +273,7 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
           g.beginPath()
           for (let k = 0; k <= SEG; k++) {
             const ang = (k / SEG) * TAU
-            // Clipped to the canvas rectangle (only what would be cut off anyway is flattened).
-            const ca = Math.abs(Math.cos(ang))
-            const sa = Math.abs(Math.sin(ang))
-            const lim = Math.min(ca > 1e-3 ? (W / 2 - 1) / ca : 1e9, sa > 1e-3 ? (H / 2 - 1) / sa : 1e9)
-            const ro = Math.min(lim, r0 + prof[k]! * grow)
+            const ro = r0 + prof[k]! * grow
             if (k === 0) g.moveTo(cx + Math.cos(ang) * ro, cy + Math.sin(ang) * ro)
             else g.lineTo(cx + Math.cos(ang) * ro, cy + Math.sin(ang) * ro)
           }
@@ -310,7 +310,7 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
         g.lineWidth = Math.min(Math.max(1.5, unitW * 1.6), (0.33 * TAU * r) / SPOKES)
         g.lineCap = "butt"
         const r0 = r * 0.72
-        const r1 = edge + 1
+        const r1 = Math.max(edge + 1, r * 1.9) // past the ripples, so no glow is left unsegmented
         g.beginPath()
         for (let k = 0; k < SPOKES; k++) {
           const ang = (k / SPOKES) * TAU + Math.PI / SPOKES
@@ -326,8 +326,8 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
 
       // Pointer: a soft highlight on the ring at the pointer's angle.
       if (f.pointer.inside) {
-        const ang = Math.atan2(f.pointer.y - cy, f.pointer.x - cx)
-        const d = Math.hypot(f.pointer.x - cx, f.pointer.y - cy)
+        const ang = Math.atan2(py - cy, px - cx)
+        const d = Math.hypot(px - cx, py - cy)
         const near = clamp01(1 - Math.abs(d - r) / (R * 0.8))
         glow.paint(dark ? WHITE : col, 0.2, 2)
         glow.draw(g, cx + Math.cos(ang) * r, cy + Math.sin(ang) * r, unitW * 14, near * 0.35)
@@ -358,10 +358,11 @@ const bandAt = (bands: Float32Array, ang: number): number => {
 const character: Character = {
   id: "light-ring",
   name: "Light ring",
-  version: "1.0.0",
+  version: "1.1.0",
   contract: 1,
   family: "abstract",
   renderer: "2d",
+  canvas: "stage",
   summary: "A ring of light whose bright arc sits where your pitch is (deep at the bottom, high at the top), beads marking each syllable; the whole ring lights amber when the assistant speaks.",
   inspiredBy:
     "The Echo light ring (ready, directional arc, alternating chase, full ring) and the Alexa+ indicator's loudness-width pulse. The Echo's arc points at the speaker; with no microphone direction, ours points at your pitch. Outward ripples for the reply after Meta AI's ring.",
@@ -384,7 +385,7 @@ const character: Character = {
     { signal: "agent.onset (speaking)", effect: "Each syllable sends a ripple outward to 1.66× the radius over 1.1 s, stronger when louder." },
     { signal: "mode", effect: "Ring size (small when idle or ready, full while hearing or speaking), colour (grey / mint / amber), arc vs chase vs full band; 300 ms crossfade." },
     { signal: "pointer", effect: "Hover lights the ring at the pointer's angle; pressing shrinks the ring 6 %." },
-    { signal: "options", effect: "Size, ring thickness, arc position (follows pitch, or stays at the bottom, sides or top), arc length, spectrum detail, sparks and ripples, motion speed and style (glow / crisp / segments) change every mode; they glide over about 0.2 s (snap under reduced motion). The ring is capped so it and its spectrum band stay inside the canvas." },
+    { signal: "options", effect: "Size, ring thickness, arc position (follows pitch, or stays at the bottom, sides or top), arc length, spectrum detail, sparks and ripples, motion speed and style (glow / crisp / segments) change every mode; they glide over about 0.2 s (snap under reduced motion). The ring is capped so it and its spectrum band stay inside the box; its glow, sparks and ripples fade out over the whole page." },
     { signal: "reducedMotion", effect: "No chase, sparks, ripples or shimmer; thinking shows still alternating segments, speaking a second still outer ring; level in quarter steps, arc position in sixths of the ring." }
   ],
   options: [
