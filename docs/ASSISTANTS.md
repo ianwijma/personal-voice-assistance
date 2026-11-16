@@ -252,7 +252,8 @@ Keys that do not apply to the kind (`voicePage`, `captions`, browser audio field
    assistant therefore never reaches another assistant. TypeSafe never offers an off assistant; a fallback that is off
    means nobody.
 
-**Typed text** (`text.send`): the `assistantId` it names (the voice page always names the conversation shown), else
+**Typed text** (`text.send`): the `assistantId` it names if that assistant is assigned to this device (the voice page always names the
+conversation shown; a name not assigned here is ignored), else
 step 3, else the `withoutPhrase` assistant, else the TypeSafe fallback, else the first in the list. Typed text never
 calls TypeSafe.
 
