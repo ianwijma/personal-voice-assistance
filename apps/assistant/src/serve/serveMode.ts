@@ -463,7 +463,20 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       )
       return Exit.isSuccess(exit) && exit.value !== "" ? exit.value : undefined
     }
-    /** The accounts' shared settings an instance depends on: a changed address or key makes new instances. */
+    /** A shared on/off setting as the providers read it, or `undefined` when unset or not a boolean. */
+    const booleanSettingNow = (name: string): boolean | undefined => {
+      if (settingNow(name) === undefined) return undefined
+      const exit = Effect.runSyncExit(
+        Effect.gen(function*() {
+          return yield* Config.Boolean(name)
+        }).pipe(Effect.provideService(ConfigProvider.ConfigProvider, sections.configProvider()))
+      )
+      return Exit.isSuccess(exit) ? exit.value : undefined
+    }
+    /**
+     * The accounts' shared settings an instance depends on: a changed address or key makes new instances, and so does
+     * OpenRouter's "Prefer the fastest provider" (its adapter reads it once, when built).
+     */
     const llmAccounts = (): LlmAccounts => {
       const stamp = (name: string) => {
         const key = settingNow(name)
@@ -471,7 +484,11 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       }
       return {
         anthropic: { address: settingNow("ANTHROPIC_BASE_URL"), credential: stamp("ANTHROPIC_API_KEY") },
-        openrouter: { address: settingNow("OPENROUTER_BASE_URL"), credential: stamp("OPENROUTER_API_KEY") },
+        openrouter: {
+          address: settingNow("OPENROUTER_BASE_URL"),
+          credential: stamp("OPENROUTER_API_KEY"),
+          sortByLatency: booleanSettingNow("OPENROUTER_SORT_BY_LATENCY")
+        },
         "home-model": { address: settingNow("HOME_MODEL_BASE_URL"), credential: stamp("HOME_MODEL_API_KEY") }
       }
     }
