@@ -1,4 +1,4 @@
-# particle-sphere 1.0.0: frame digests of a scripted conversation at default settings (docs/CHARACTERS.md §6.6).
+# particle-sphere 1.1.0: frame digests of a scripted conversation at default settings (docs/CHARACTERS.md §6.6).
 # A change here must be deliberate: check the look, then update with `pnpm --filter @pva/web exec vitest run test/characters -u`.
 dark  0.5 idle        262 b8d74403
 dark  1.0 listening   265 684ced50
@@ -47,3 +47,26 @@ light 11.0 idle        395 ee26dd4f
 overflow 160×140×1 93.8 px
 overflow 900×420×1 303.6 px
 overflow 720×240×2 173.8 px
+stage  0.5 idle        262 2cb50683
+stage  1.0 listening   265 83b9f7d0
+stage  1.5 listening   321 45fc8b1a
+stage  2.0 hearing     437 ce250f11
+stage  2.5 hearing     622 f24de6ef
+stage  3.0 hearing    1000 65a907ef
+stage  3.5 hearing    1265 3404dbfe
+stage  4.0 hearing    1014 332a8425
+stage  4.5 hearing    1031 9a6bb566
+stage  5.0 thinking    769 789d3d4c
+stage  5.5 thinking    407 89a7a7e1
+stage  6.0 thinking    350 3f56d8de
+stage  6.5 speaking    340 f79178fd
+stage  7.0 speaking    472 13c68dad
+stage  7.5 speaking    719 68a8651b
+stage  8.0 speaking   1043 5012f73f
+stage  8.5 speaking   1143 4b6ccdb8
+stage  9.0 speaking    720 4070d268
+stage  9.5 listening   558 09ddb771
+stage 10.0 listening   470 7d81cc36
+stage 10.5 idle        486 cd58586b
+stage 11.0 idle        395 ebd2aedd
+stage 1280×800×1 focus 720×240 at 280,200: solid drawing x 348.0..940.0, y 26.2..611.2

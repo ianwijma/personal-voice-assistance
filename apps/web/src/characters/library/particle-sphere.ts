@@ -142,13 +142,11 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
 
   return {
     resize(width, height, ratio) {
-      W = width
-      H = height
       dpr = ratio
       g = setup2d(canvas, dpr)
-      const R = Math.min(W * 0.3, H * 0.36)
-      nBase = Math.round(clamp(R * R * 0.045, 300, 1100))
-      build(Math.min(MAX_POINTS, nBase * pointsK))
+      // The layout comes from the focus each frame; force the point count to be recomputed.
+      W = 0
+      H = 0
     },
 
     frame(f: Frame) {
@@ -157,7 +155,15 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
       const reduced = f.reducedMotion
       mix.step(f)
       modeTone(tone, mix, p)
-      clear2d(g, dpr)
+      const fo = f.focus
+      clear2d(g, dpr, fo) // (0, 0) is the box's top-left corner; glow and streaks may go beyond it
+      if (fo.width !== W || fo.height !== H) {
+        W = fo.width
+        H = fo.height
+        const R0 = Math.min(W * 0.3, H * 0.36)
+        nBase = Math.round(clamp(R0 * R0 * 0.045, 300, 1100))
+        build(Math.min(MAX_POINTS, nBase * pointsK))
+      }
 
       // Options.
       const o = f.options
@@ -223,8 +229,8 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
       // Ripples age.
       for (let q = 0; q < MAX_RIPPLES; q++) qAge[q] = qAge[q]! + (reduced ? 99 : dt)
       const pt = f.pointer
-      const pnx = (pt.x - cx) / R
-      const pny = (pt.y - cy) / R
+      const pnx = (pt.x - fo.x - cx) / R
+      const pny = (pt.y - fo.y - cy) / R
       const pIn = pt.inside && pnx * pnx + pny * pny < 1
       if (pt.down && !pressWas && pIn && !reduced) {
         const q = nextRipple
@@ -481,7 +487,7 @@ const character: Character = {
   id: "particle-sphere",
   name: "Particle sphere",
   family: "abstract",
-  version: "1.0.0",
+  version: "1.1.0",
   contract: 1,
   summary: "A turning sphere of points: the voice displaces its surface; particles stream into it while it listens and out of it while it speaks.",
   inspiredBy:
@@ -508,6 +514,7 @@ const character: Character = {
     { signal: "reducedMotion", effect: "No rotation, streaming or ripples: a still sphere per mode with a fixed fan of streaks (heads toward the sphere while taking in, away while speaking)." }
   ],
   renderer: "2d",
+  canvas: "stage",
   options: [
     { id: "size", kind: "number", label: "Size", min: 0.4, max: 1, step: 0.05, default: 1, unit: "×", group: "Shape", help: "How big the sphere is; at 1 it fills the height with room for the voice to swell it." },
     { id: "density", kind: "number", label: "Points", min: 0.3, max: 2, step: 0.05, default: 1, unit: "×", group: "Shape", help: "How many points make up the sphere: fewer reads as a loose cloud, more as a fine dusty surface." },
