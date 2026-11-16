@@ -149,8 +149,8 @@ test("Language model: account cards, model, effort, thinking, limits; the subscr
   const cards = page.getByRole("radiogroup", { name: "Account" })
   await expect(cards.getByRole("radio", { name: /Anthropic API/ })).toBeChecked()
   await expect(page.getByRole("heading", { name: "Claude subscription" })).toHaveCount(0)
-  // What the server cannot build yet says so.
-  await expect(cards.getByRole("radio", { name: /Home model/ })).toContainText("Not available yet")
+  // An account that is not set up links to where it is.
+  await expect(cards.getByRole("radio", { name: /Home model/ })).toContainText("Set up")
   await page.getByLabel("Model", { exact: true }).selectOption("claude-sonnet-5-5")
   await page.getByRole("radiogroup", { name: "Effort" }).getByRole("radio", { name: "High" }).click()
   await page.getByRole("radiogroup", { name: "Thinking" }).getByRole("radio", { name: "Adaptive" }).click()

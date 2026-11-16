@@ -16,6 +16,7 @@ import { defaultSystemPrompt } from "../config.ts"
 import { parseVoiceKey, voiceKey } from "@pva/core"
 import { isTtsProvider, ttsProviderInfo } from "../providers.ts"
 import { checkUrl, defaults as jevDefaults } from "@pva/decide-typesafe"
+import { checkAccountAddress } from "@pva/llm-openai-compatible"
 import { ASSISTANT_VOICE, DEFAULT_ASSISTANT_VOICE } from "../voiceSelection.ts"
 
 /**
@@ -241,9 +242,61 @@ const routingSection: SectionDefinition = {
   ]
 }
 
+/**
+ * The shared settings of the `openrouter` and `home-model` accounts (WP-13b, docs/ASSISTANTS.md §2.4 "Language model
+ * accounts"). The assistant's own fields (model, longest reply, give-up time, warm-up) are not here. Applied live: a
+ * changed key or address builds new instances in the resource pool (the key is part of an instance's identity).
+ */
+const openAiAccountsSection: SectionDefinition = {
+  id: "llm-openai-accounts",
+  title: "OpenRouter and home model",
+  description: "Language models over the OpenAI-compatible API: OpenRouter with your key, or a server on your own network.",
+  group: "agents",
+  page: { id: "openai-accounts", title: "OpenRouter and home model", description: "The OpenRouter key and the address of a model server on your network." },
+  order: 15,
+  protected: true,
+  spec: {
+    OPENROUTER_API_KEY: Setting.secret({
+      label: "OpenRouter API key",
+      description: "From openrouter.ai/keys. Kept in the vault. What you say is sent to OpenRouter and the model's provider.",
+      env: "OPENROUTER_API_KEY"
+    }),
+    OPENROUTER_SORT_BY_LATENCY: Setting.boolean({
+      label: "Prefer the fastest provider",
+      description: "Ask OpenRouter to route to the provider with the lowest latency for the model.",
+      env: "OPENROUTER_SORT_BY_LATENCY",
+      default: true,
+      advanced: true
+    }),
+    OPENROUTER_BASE_URL: Setting.text({
+      label: "OpenRouter address",
+      description: "Only for a proxy or gateway in front of OpenRouter. Empty: https://openrouter.ai/api/v1.",
+      env: "OPENROUTER_BASE_URL",
+      default: "",
+      placeholder: "https://openrouter.ai/api/v1",
+      advanced: true,
+      check: checkAccountAddress
+    }),
+    HOME_MODEL_BASE_URL: Setting.text({
+      label: "Home model server address",
+      description: "Ollama, llama.cpp, LM Studio, vLLM or any server with the OpenAI-compatible API. http://host:port is enough; /v1 is added. What you say stays on your network.",
+      env: "HOME_MODEL_BASE_URL",
+      default: "",
+      placeholder: "http://192.168.1.20:11434",
+      check: checkAccountAddress
+    }),
+    HOME_MODEL_API_KEY: Setting.secret({
+      label: "Home model API key",
+      description: "Only if the server was started with a key (llama.cpp --api-key, vLLM --api-key). Kept in the vault.",
+      env: "HOME_MODEL_API_KEY"
+    })
+  }
+}
+
 export const sectionDefinitions = (dirs: ModelDirs = defaultModelDirs): ReadonlyArray<SectionDefinition> => {
   return [
     homeSection,
+    openAiAccountsSection,
     // ---- Language model
     {
       id: "language-model",

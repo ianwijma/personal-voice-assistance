@@ -5,7 +5,7 @@
  * the next turn never overlaps the reply). Replies are written as WAV files.
  */
 import { frameBytes, layerOutput, loadInputPcm, pacedFrames } from "@pva/audio-file"
-import { type AudioError, Conversation, type Llm, type ModuleSnapshot, Stt, type SttEvent, ToolRegistry, type Trace, type Tts, TurnTrace } from "@pva/core"
+import { type AudioError, Conversation, type Llm, type LlmError, type ModuleSnapshot, Stt, type SttEvent, ToolRegistry, type Trace, type Tts, TurnTrace } from "@pva/core"
 import { Config, Deferred, Effect, Layer, Option, Queue, type Scope, Stream } from "effect"
 import { readdirSync, statSync } from "node:fs"
 import { basename, join } from "node:path"
@@ -103,7 +103,7 @@ export interface LiveSessionsOptions extends LiveOptions {
    * assistants with different settings two instances: two HTTP clients, two connections). Absent: the one `Llm` of
    * the environment is shared by every session.
    */
-  readonly llmPerSession?: Layer.Layer<Llm, Config.ConfigError>
+  readonly llmPerSession?: Layer.Layer<Llm, Config.ConfigError | LlmError>
   /** Session `i` hears with this recogniser (`--stt-models`). Absent: the one `Stt` of the environment. */
   readonly sttPerSession?: (session: number) => Stt["Service"]
 }
@@ -228,7 +228,7 @@ const runLiveSession = (
  */
 export const runLiveSessions = (
   options: LiveSessionsOptions
-): Effect.Effect<Array<Array<BenchRow>>, AudioError | StartupError, Stt | Llm | Tts | Scope.Scope> =>
+): Effect.Effect<Array<Array<BenchRow>>, AudioError | LlmError | StartupError, Stt | Llm | Tts | Scope.Scope> =>
   Effect.gen(function*() {
     const pcms = yield* Effect.forEach(options.files, loadInputPcm)
     if (pcms.length === 0) return yield* new StartupError({ message: "bench --live: no .wav files given" })
@@ -260,5 +260,5 @@ export const runLiveSessions = (
   })
 
 /** One session (`runLiveSessions` with `sessions: 1`). */
-export const runLive = (options: LiveOptions): Effect.Effect<Array<BenchRow>, AudioError | StartupError, Stt | Llm | Tts | Scope.Scope> =>
+export const runLive = (options: LiveOptions): Effect.Effect<Array<BenchRow>, AudioError | LlmError | StartupError, Stt | Llm | Tts | Scope.Scope> =>
   Effect.map(runLiveSessions({ ...options, sessions: 1 }), (all) => all[0]!)

@@ -465,12 +465,14 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     }
     /** The accounts' shared settings an instance depends on: a changed address or key makes new instances. */
     const llmAccounts = (): LlmAccounts => {
-      const key = settingNow("ANTHROPIC_API_KEY")
+      const stamp = (name: string) => {
+        const key = settingNow(name)
+        return key === undefined ? "" : createHash("sha256").update(key).digest("hex").slice(0, 16)
+      }
       return {
-        anthropic: {
-          address: settingNow("ANTHROPIC_BASE_URL"),
-          credential: key === undefined ? "" : createHash("sha256").update(key).digest("hex").slice(0, 16)
-        }
+        anthropic: { address: settingNow("ANTHROPIC_BASE_URL"), credential: stamp("ANTHROPIC_API_KEY") },
+        openrouter: { address: settingNow("OPENROUTER_BASE_URL"), credential: stamp("OPENROUTER_API_KEY") },
+        "home-model": { address: settingNow("HOME_MODEL_BASE_URL"), credential: stamp("HOME_MODEL_API_KEY") }
       }
     }
     /** The shared voice-provider settings an instance depends on: a new key makes new instances. */
@@ -908,6 +910,9 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
      * Per assistant, its hearing problems (`AssistantInfo.problems`): a recogniser that failed, and the memory of the
      * local speech models when more than one is loaded (WP-0's measured `ramMb`; docs/ASSISTANTS.md §3.2).
      */
+    const llmProblems = (assistantId: string): Array<string> =>
+      resources.status().filter((r) => r.kind === "llm" && r.state === "failed" && r.usedBy.includes(assistantId))
+        .map((r) => `Language model (${r.label}): ${r.problem ?? "the language model could not start."}`)
     const hearingProblems = (assistantId: string): Array<string> => {
       const stt = resources.status().filter((r) => r.kind === "stt")
       const mine = stt.filter((r) => r.usedBy.includes(assistantId))
@@ -947,6 +952,8 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       const names = secretNames()
       return problems.map((p) => {
         const missing = /^([A-Z][A-Z0-9_]*) is not set$/.exec(p.message)?.[1]
+        // OpenRouter's key is required (WP-13b: `notSetUpMessage`); a home model's key is optional.
+        if (/^OpenRouter is not set up: add its API key/.test(p.message)) return { ...p, message: KEYS_LOCKED_MESSAGE }
         return missing !== undefined && names.some((n) => missing.endsWith(n)) ? { ...p, message: KEYS_LOCKED_MESSAGE } : p
       })
     }
@@ -1093,6 +1100,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       checkOwn: host.checkOwn,
       engineState: () => theEngine.status().state,
       hearingProblems,
+      llmProblems,
       speechMemoryWarning,
       // TypeSafe is set up: the routing section is switched on, with a key and a valid address (WP-14).
       canAuto: routing.ready

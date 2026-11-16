@@ -67,6 +67,7 @@ describe("serve: handshake", () => {
     expect(snapshot.modules.map((m) => [m.id, m.state])).toEqual([["greeter", "running"]])
     expect(snapshot.sections.map((s) => [s.id, `${s.group}/${s.page?.id}`])).toEqual([
       ["home", "modules/home"],
+      ["llm-openai-accounts", "agents/openai-accounts"],
       ["language-model", "agents/provider"],
       ["llm-behaviour", "agents/behaviour"],
       ["stt-engine", "speech/engine"],

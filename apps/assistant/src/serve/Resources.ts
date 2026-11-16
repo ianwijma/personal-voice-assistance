@@ -1,5 +1,6 @@
 import { CurrentTurnTrace, Llm, LlmError, type Stt, SttError, Tts, TtsError, type VoiceRef, voiceKey } from "@pva/core"
 import { DEFAULT_BASE_URL } from "@pva/llm-anthropic"
+import { defaultAddress as openAiDefaultAddress } from "@pva/llm-openai-compatible"
 import type { AssistantHearing, AssistantLlm, LlmAccountId, ResourceInfo } from "@pva/protocol"
 import * as DeepgramStt from "@pva/stt-deepgram"
 import * as SherpaStt from "@pva/stt-sherpa"
@@ -17,7 +18,7 @@ import { ttsLayerFor, voiceConfigProvider, voiceEngineName } from "../voiceSelec
  * stays for the turns still running on it. One build failing is a problem of that resource only.
  *
  * Scope: language models (WP-9; the accounts `offline`, `anthropic` and the offline stand-in of
- * `claude-subscription`; `openrouter` and `home-model` report a problem until WP-13b), voices (WP-10: one `Tts`
+ * `claude-subscription`; `openrouter` and `home-model`, WP-13b), voices (WP-10: one `Tts`
  * per distinct voice, keyed by `voiceKey`; the voices of one local engine share it) and recognisers (WP-11: one per
  * `SttKey`, bound per hearing *place* (a device, or a device type's defaults) rather than per assistant, with the
  * place's hearer's stream options outside the key; `sttFor`).
@@ -43,8 +44,17 @@ export interface LlmSpec {
 
 /** The shared account settings an `LlmSpec` takes besides the assistant's own fields. */
 export interface LlmAccounts {
-  readonly anthropic?: { readonly address?: string | undefined; readonly credential?: string | undefined }
+  readonly anthropic?: LlmAccountShared
+  readonly openrouter?: LlmAccountShared
+  readonly "home-model"?: LlmAccountShared
 }
+export interface LlmAccountShared {
+  readonly address?: string | undefined
+  readonly credential?: string | undefined
+}
+
+/** The accounts built over `llm-openai-compatible`: they read model, longest reply, give-up time and warm-up only. */
+const isOpenAiAccount = (account: LlmAccountId): account is "openrouter" | "home-model" => account === "openrouter" || account === "home-model"
 
 /**
  * An assistant's `llm` as the pool keys it. Only what the account's adapter reads counts: the offline stand-ins
@@ -52,6 +62,23 @@ export interface LlmAccounts {
  * on them shares one instance.
  */
 export const llmSpecOf = (llm: AssistantLlm, accounts: LlmAccounts = {}): LlmSpec => {
+  if (isOpenAiAccount(llm.account)) {
+    // Effort and thinking are not read by these accounts, so they are not part of the key (equal settings share).
+    const address = accounts[llm.account]?.address
+    const credential = accounts[llm.account]?.credential
+    const shown = address === undefined || address === "" ? openAiDefaultAddress(llm.account) : address
+    return {
+      account: llm.account,
+      model: llm.model,
+      effort: "low",
+      thinking: "off",
+      maxTokens: llm.maxTokens,
+      giveUpMs: llm.giveUpMs,
+      warmUp: llm.warmUp,
+      ...(shown !== undefined ? { address: shown } : {}),
+      ...(credential !== undefined ? { credential } : {})
+    }
+  }
   if (llm.account !== "anthropic") {
     return { account: llm.account, model: llm.account === "offline" || llm.account === "claude-subscription" ? "" : llm.model, effort: "low", thinking: "off", maxTokens: 1024, giveUpMs: 5000, warmUp: false }
   }
@@ -93,6 +120,15 @@ export const llmKeyOf = (spec: LlmSpec): string =>
       spec.warmUp ? "warm" : "cold",
       shownAddress(spec.address ?? DEFAULT_BASE_URL)
     ].join("|")
+    : isOpenAiAccount(spec.account)
+    ? [
+      spec.account,
+      spec.model,
+      `${spec.maxTokens}tok`,
+      `${spec.giveUpMs}ms`,
+      spec.warmUp ? "warm" : "cold",
+      spec.address === undefined ? "(no address)" : shownAddress(spec.address)
+    ].join("|")
     : spec.model === ""
     ? spec.account
     : `${spec.account}|${spec.model}`
@@ -126,6 +162,17 @@ export const llmConfigOf = (spec: LlmSpec): Record<string, string> =>
       ANTHROPIC_WARM_UP: spec.warmUp ? "true" : "false",
       ...(spec.address !== undefined ? { ANTHROPIC_BASE_URL: spec.address } : {})
     }
+    : isOpenAiAccount(spec.account)
+    ? (() => {
+      const p = spec.account === "openrouter" ? "OPENROUTER_" : "HOME_MODEL_"
+      return {
+        [`${p}MODEL`]: spec.model,
+        [`${p}MAX_TOKENS`]: String(spec.maxTokens),
+        [`${p}TIMEOUT_MS`]: String(spec.giveUpMs),
+        [`${p}WARM_UP`]: spec.warmUp ? "true" : "false",
+        ...(spec.address !== undefined ? { [`${p}BASE_URL`]: spec.address } : {})
+      }
+    })()
     : {}
 
 export class ResourceBuildError extends Schema.TaggedError<ResourceBuildError>()("ResourceBuildError", { message: Schema.String }) {}
@@ -137,10 +184,10 @@ export type LlmBuilder = (spec: LlmSpec) => Effect.Effect<Llm["Service"], Resour
 export const defaultLlmBuilder = (configProvider: () => ConfigProvider.ConfigProvider): LlmBuilder => (spec) =>
   Effect.gen(function*() {
     if (!hasLlmAccountLayer(spec.account)) {
-      return yield* new ResourceBuildError({ message: `The ${accountLabels[spec.account]} account is not available yet.` })
+      return yield* new ResourceBuildError({ message: `The ${accountLabels[spec.account]} account is not available.` })
     }
     const provider = ConfigProvider.orElse(ConfigProvider.fromEnvRecord(llmConfigOf(spec)), configProvider())
-    const context = yield* Layer.build(llmAccountLayers[spec.account] as Layer.Layer<Llm, Config.ConfigError>).pipe(
+    const context = yield* Layer.build(llmAccountLayers[spec.account] as Layer.Layer<Llm, Config.ConfigError | LlmError>).pipe(
       Effect.provideService(ConfigProvider.ConfigProvider, provider),
       Effect.mapError((e) => new ResourceBuildError({ message: describeStartFailure(e) }))
     )

@@ -962,7 +962,7 @@ Deviations from §5:
   (so the key comes from the vault or the environment as before), with `awaitWarmUp` (new, additive option of
   `llm-anthropic`): the instance is ready only once its warm-up request has ended, so "ready" means "warm". `openrouter`
   and `home-model` have no layer yet: their resource is `failed` with "The … account is not available yet." (WP-13b
-  adds them in `llmAccountLayers`). The Claude subscription agent itself is still the module's (WP-13a).
+  adds them in `llmAccountLayers`; built, see "WP-13b" below). The Claude subscription agent itself is still the module's (WP-13a).
 - **Wanted** = every switched-on assistant on at least one effective list (each device type's defaults and each
   known device's own list). `reconcile` runs at start (awaited by `ServeHandle.ready`, so every wanted instance is
   built and warm before the first turn), after every successful settings-store save (`save…`, `create…`, `delete…`,
@@ -1649,3 +1649,69 @@ Every finished turn's trace carries `config` (protocol 7 `TraceConfig`, §5.4), 
   snapshot traces likewise). The subscription traces in `serveSubscriptionAssistants.test.ts`.
 - **Not built**: the Diagnostics page's snapshot popover and "changed since" (WP-15, apps/web). `config` is `undefined`
   for a turn whose device has no recogniser bound (no hearing to report; such a device has no assistant).
+
+### WP-13b OpenAI-compatible accounts: built 2026-11-16
+
+`openrouter` and `home-model` are real `Llm` instances in the pool, built by `packages/llm-openai-compatible`'s new
+`account.ts` (`accountConfig`, `makeAccount`, `accountLayer`) over the same `ConfigProvider` mechanism as `anthropic`.
+
+- **Shared settings** (new section `llm-openai-accounts`, page `agents/openai-accounts`, shown on Shared settings ›
+  Language model accounts; protected, live, secrets in the vault): `OPENROUTER_API_KEY` (secret, required),
+  `OPENROUTER_SORT_BY_LATENCY` (default on, advanced), `OPENROUTER_BASE_URL` (advanced; empty = the fixed
+  `https://openrouter.ai/api/v1`), `HOME_MODEL_BASE_URL` (required; `http://host:port` is enough, `/v1` is added),
+  `HOME_MODEL_API_KEY` (secret, optional). The web tree places these keys on the accounts page (`settingsTree.ts`,
+  one line).
+- **Per-assistant fields that apply**: `model`, `maxTokens` (`*_MAX_TOKENS`), `giveUpMs` (`*_TIMEOUT_MS`: no response
+  headers, or no data for that long, fails the call; one retry only before anything was emitted), `warmUp`. `effort` and
+  `thinking` do **not** apply: OpenRouter takes a reasoning effort only for models whose list entry names it and the pool
+  does not fetch the list; the home model sends none. They are therefore not part of these accounts' key (equal
+  settings share one instance, and changing effort or thinking builds nothing). `useModules` and
+  `freshSessionAfterMinutes` are the subscription's.
+- **Key and identity.** `llmKeyOf` for these accounts = account + model + maxTokens + giveUpMs + warm/cold + the address
+  without user info and query; the identity adds the full address and the key stamp, as for Anthropic (a changed key or
+  address builds a new instance, the old one is released after the grace period). `LlmAccounts` gains `openrouter` and
+  `home-model` (`serveMode.ts` `llmAccounts`).
+- **Warm-up** (`warmUp` on, awaited like `AnthropicLlm`'s `awaitWarmUp`, so "ready" means "warm"): OpenRouter opens the
+  connection with `GET /models` (also checks the key, at most the give-up time); the home model gets one one-token
+  request, which makes the server load the model (up to 60 s, `WARM_UP_LOAD_MS`, ends early on success). A failing
+  warm-up does not fail the build.
+- **Not set up.** No key (OpenRouter) or no address (home model) fails the build with "OpenRouter is not set up: add
+  its API key in Shared settings › Language model accounts." / "Home model is not set up: add the server address in
+  Shared settings › Language model accounts." (`notSetUpMessage`); a refused address or an empty model fails with its
+  own sentence, never with a credential. The resource is `failed` with that `problem`; the assistant's turns fail
+  (`turn_failed`) and every other assistant answers. `AssistantInfo.problems` gains "Language model (label): problem"
+  for a failed instance the assistant uses (also for Anthropic), and `resources.llm` is `failed` (`llmProblems` in
+  `assistants.ts`). With the vault locked, OpenRouter's problem reads as the locked-keys message. The admin's account
+  cards (`accountState` in `apps/web/src/lib/assistants.ts`) now read "Key set" / "Address set" from the shared
+  sections instead of the hard-coded "Not available yet".
+- **Streaming and tools** work as for Anthropic: the adapter streams text deltas, assembles tool calls from fragments,
+  never emits reasoning, ends at the finish reason and aborts the HTTP request when the consumer is interrupted (barge-in).
+  No gap needed fixing in the existing adapter; the additions are the account layer and `checkAccountAddress`.
+- **CLI.** `LLM_PROVIDER=openrouter|home-model` also works in the CLI modes and `bench --live` (flat `OPENROUTER_*`,
+  `HOME_MODEL_*` keys, incl. `HOME_MODEL_MODEL`).
+- **Tests.** `llm-openai-compatible/test/account.test.ts` (settings, not-set-up sentences, `/v1`, streamed text and
+  tool calls through the account layer against the local mock, the give-up time, awaited and failing warm-up, the
+  OpenRouter key and latency preference), the adapter's existing mock-server tests (streaming, tool calls, errors, stalls,
+  abort), `apps/assistant/test/serveOpenAiAccounts.test.ts` (an assistant on `home-model` answers through its own
+  instance at the mock; not set up is the account's problem while an offline assistant answers; setting the address
+  builds it; a changed address builds a new instance; two models are two instances, equal settings share one, a
+  different longest reply is separate, effort and thinking build nothing; OpenRouter without and with a key),
+  `apps/web/test/assistants.test.ts` (account states).
+- **Measurements** (this machine, 2026-11-16, load 1.3–2.0). Offline bench (`pnpm start bench`), two runs each of the
+  commit before (a detached worktree) and this package, alternated; end of turn → playback start, median / worst ms.
+  Orchestration overhead 0.9 / 1.5, 0.9 / 1.7 → 1.0 / 1.6, 0.9 / 1.8; session path overhead 0.7 / 1.2, 0.8 / 2.1 → 0.8 /
+  1.2, 0.8 / 1.2; eager off 508 / 736, 508 / 736 → 509 / 736, 508 / 737; eager on 307 / 536, 307 / 534 → 308 / 535,
+  307 / 534 (wake phrase and route-gate rows the same within 2 ms). The turn path is unchanged (nothing in `core` or the
+  session path was touched).
+- **Not measured: `llmFirstToken` against a live home model** (no server here; the mock server's timings say nothing
+  about a model). With the owner's server (the model name as the server lists it), each a fresh process whose first row
+  is a fresh instance:
+  `LLM_PROVIDER=home-model HOME_MODEL_BASE_URL=http://<host>:<port> HOME_MODEL_MODEL=<model> HOME_MODEL_WARM_UP=true pnpm start bench --live --rounds 3 bench-audio`
+  against `HOME_MODEL_WARM_UP=false` (compare the "1st token" column; the first row shows the cold model), and
+  `… --rounds 2 --sessions 2 bench-audio` with and without `--llm-per-session`. In the app: put an assistant on the
+  Home model account, then Diagnostics › Latency shows each turn's `llmFirstToken`.
+- **Not done or verified.** No real OpenRouter or home server was called. OpenRouter's per-model reasoning effort is not
+  sent. The model field on the assistant page is free text (the pickers' model lists from `listModels` are not wired).
+  A "not set up" warning on saving an assistant (§2.2) is not added: the problem shows on the assistant and in the
+  status. `apps/web/mock/assistants.ts` still fakes "not available yet" for these accounts (a dev mock).
+

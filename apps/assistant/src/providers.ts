@@ -1,7 +1,8 @@
 import * as FileAudio from "@pva/audio-file"
 import * as PipeWire from "@pva/audio-pipewire"
-import { type AudioInput, type AudioOutput, Llm, type Stt, type SttError, type Tts, type TtsError, type TtsVoices } from "@pva/core"
+import { type AudioInput, type AudioOutput, Llm, type LlmError, type Stt, type SttError, type Tts, type TtsError, type TtsVoices } from "@pva/core"
 import { AnthropicLlm } from "@pva/llm-anthropic"
+import { accountLayer as openAiAccountLayer } from "@pva/llm-openai-compatible"
 import * as DeepgramStt from "@pva/stt-deepgram"
 import * as SherpaStt from "@pva/stt-sherpa"
 import * as CartesiaTts from "@pva/tts-cartesia"
@@ -28,6 +29,10 @@ const llmProviders = {
     return FakeLlm.layerTimed({ firstTokenMs: firstTokenMs.value, tokensPerSecond })
   })),
   anthropic: AnthropicLlm.layerConfig,
+  // OpenAI-compatible accounts from the flat settings (OPENROUTER_*, HOME_MODEL_*: key, address, MODEL, MAX_TOKENS,
+  // TIMEOUT_MS, WARM_UP), for the CLI modes and `bench --live` (the app's pool builds them per assistant).
+  openrouter: openAiAccountLayer("openrouter"),
+  "home-model": openAiAccountLayer("home-model"),
   // The language model is the claude-subscription agent module (Claude Code with the owner's login), chosen per
   // turn from the running modules; this offline stand-in answers, with a notice, while that module is not running.
   "claude-subscription": FakeLlm.layer
@@ -38,14 +43,17 @@ const llmProviders = {
  * `serve/Resources.ts`): one layer per account, read from a `ConfigProvider` that carries the assistant's own `llm`
  * fields (`ANTHROPIC_MODEL`, …) over the shared settings (the account's key and address). `claude-subscription` is the
  * offline stand-in that answers while the agent module is not running (the agent itself is the module's, WP-13a).
- * `openrouter` and `home-model` are not here yet (WP-13b): the pool reports them as a problem of that resource.
- * An Anthropic instance is returned once its warm-up has ended (`awaitWarmUp`), so it is warm when it becomes ready.
+ * `openrouter` and `home-model` are `llm-openai-compatible`'s `accountLayer` (WP-13b): the shared key and address,
+ * and the assistant's `OPENROUTER_MODEL` / `HOME_MODEL_MODEL`, …; an account that is not set up fails the build.
+ * An instance is returned once its warm-up has ended (`awaitWarmUp`), so it is warm when it becomes ready.
  */
 export const llmAccountLayers = {
   offline: llmProviders.fake,
   anthropic: Layer.effect(Llm, Effect.flatMap(AnthropicLlm.config, (options) => AnthropicLlm.make({ ...options, awaitWarmUp: true }))),
+  openrouter: openAiAccountLayer("openrouter", true),
+  "home-model": openAiAccountLayer("home-model", true),
   "claude-subscription": llmProviders["claude-subscription"]
-} satisfies Record<string, Layer.Layer<Llm, Config.ConfigError>>
+} satisfies Record<string, Layer.Layer<Llm, Config.ConfigError | LlmError>>
 export type LlmAccountWithLayer = keyof typeof llmAccountLayers
 export const hasLlmAccountLayer = (account: string): account is LlmAccountWithLayer => Object.hasOwn(llmAccountLayers, account)
 
@@ -153,8 +161,8 @@ export const choose = <M extends Record<string, unknown>>(name: string, provider
     Config.map((key) => providers[key]!)
   )
 
-/** `LLM_PROVIDER`: `fake` (default, offline) | `anthropic` | `claude-subscription` (see `subscription.ts`). */
-export const LlmLayer: Layer.Layer<Llm, Config.ConfigError> = Layer.unwrap(choose("LLM_PROVIDER", llmProviders, "fake"))
+/** `LLM_PROVIDER`: `fake` (default, offline) | `anthropic` | `openrouter` | `home-model` | `claude-subscription` (see `subscription.ts`). */
+export const LlmLayer: Layer.Layer<Llm, Config.ConfigError | LlmError> = Layer.unwrap(choose("LLM_PROVIDER", llmProviders, "fake"))
 
 /** `STT_PROVIDER`: `sherpa` (default, local) | `deepgram`. A local model is loaded when the layer is built. */
 export const SttLayer: Layer.Layer<Stt, SttError | Config.ConfigError> = Layer.unwrap(choose("STT_PROVIDER", sttProviders, "sherpa"))

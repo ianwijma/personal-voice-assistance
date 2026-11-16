@@ -179,7 +179,7 @@ const SHARED_KEY_PAGE: Readonly<Record<string, string>> = {
   DEEPGRAM_MODEL: "speech"
 }
 const sharedPageOfKey = (key: string): string | undefined =>
-  SHARED_KEY_PAGE[key] ?? (key.startsWith("HOME_") ? "home" : key.startsWith("TYPESAFE_") ? "routing" : undefined)
+  SHARED_KEY_PAGE[key] ?? (key.startsWith("OPENROUTER_") || key.startsWith("HOME_MODEL_") ? "accounts" : key.startsWith("HOME_") ? "home" : key.startsWith("TYPESAFE_") ? "routing" : undefined)
 
 /** A field as shown on a shared page: always visible and plain (its switch, `LLM_PROVIDER`, no longer decides). */
 const plain = (f: SettingField): SettingField => {
