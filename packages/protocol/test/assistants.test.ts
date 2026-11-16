@@ -641,6 +641,12 @@ describe("makeAssistantId", () => {
     expect(makeAssistantId("123")).toBe("a123")
     expect(makeAssistantId("!!!")).toBe("assistant")
   })
+  it("never makes the device.pick value for \"whichever fits\", and the schema refuses it as an id", () => {
+    const id = makeAssistantId("TypeSafe")
+    expect(id).toBe("typesafe-2")
+    expect(accepts(Assistant.fields.id, id)).toBe(true)
+    expect(accepts(Assistant.fields.id, "typesafe")).toBe(false)
+  })
   it("adds a number when the id is taken", () => {
     expect(makeAssistantId("Keuken", ["keuken"])).toBe("keuken-2")
     expect(makeAssistantId("Keuken", ["keuken", "keuken-2"])).toBe("keuken-3")
