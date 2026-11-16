@@ -352,7 +352,14 @@ export const ConversationHistory = Schema.Struct({
   requestId: RequestId,
   assistantId: AssistantId,
   id: ConversationId,
-  history: Schema.Array(HistoryItem)
+  history: Schema.Array(HistoryItem),
+  /**
+   * Protocol 7: the turn whose exchange ends `history` (its user message and what followed it), when a turn of this
+   * session was committed last. The page may still show that turn as running (its `turn.end` is on the way): that
+   * running turn and this exchange are the same, and no other running turn is in `history`. Absent: the server does
+   * not say, or no turn of this session ends the history.
+   */
+  lastTurnId: Schema.optionalKey(TurnId)
 })
 
 /** Admin connections only: the whole list of assistants, order kept. */

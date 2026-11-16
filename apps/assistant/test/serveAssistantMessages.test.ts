@@ -581,19 +581,24 @@ describe("conversation.read", () => {
     const { client: page } = await voice()
     const watcher = await voice()
     const a = await admin()
-    expect((await typed(page, "hello to bravo")).assistantId).toBe("bravo")
-    expect((await typed(page, "hello to alpha", "alpha")).assistantId).toBe("alpha")
+    const toBravo = await typed(page, "hello to bravo")
+    expect(toBravo.assistantId).toBe("bravo")
+    const toAlpha = await typed(page, "hello to alpha", "alpha")
+    expect(toAlpha.assistantId).toBe("alpha")
     const from = page.messages.length
     const watcherFrom = watcher.client.messages.length
     page.send({ type: "conversation.read", requestId: "read-1", assistantId: "alpha" })
     const history = await page.waitFor("conversation.history", () => true, { from })
     expect(history).toMatchObject({ requestId: "read-1", assistantId: "alpha" })
     expect(history.history.map((h) => [h.role, h.text])).toEqual([["user", "hello to alpha"], ["assistant", "Reply to hello to alpha."]])
+    // The turn whose exchange ends the history, by id (the page tells a running turn apart from an equal question so).
+    expect(history.lastTurnId).toBe(toAlpha.turnId)
     expect(history.id).toMatch(/^[0-9a-f-]{36}$/)
     // Bravo's, too, and the snapshot of a new tab lists both conversations; the answering assistant is unchanged.
     page.send({ type: "conversation.read", requestId: "read-2", assistantId: "bravo" })
     const bravo = await page.waitFor("conversation.history", (m) => m.requestId === "read-2", { from })
     expect(bravo.history.map((h) => h.text)).toEqual(["hello to bravo", "Reply to hello to bravo."])
+    expect(bravo.lastTurnId).toBe(toBravo.turnId)
     expect(bravo.id).not.toBe(history.id)
     expect(page.messages.slice(from).some((m) => m.type === "device.setup")).toBe(false)
     await sleep(50)
@@ -614,7 +619,9 @@ describe("conversation.read", () => {
     const { client: page } = await voice()
     expect(await request(page, { type: "conversation.read", assistantId: "ghost" })).toMatchObject({ ok: false, error: { code: "unknown_assistant" } })
     page.send({ type: "conversation.read", requestId: "read-empty", assistantId: "bravo" })
-    expect(await page.waitFor("conversation.history", () => true)).toMatchObject({ requestId: "read-empty", assistantId: "bravo", history: [] })
+    const empty = await page.waitFor("conversation.history", () => true)
+    expect(empty).toMatchObject({ requestId: "read-empty", assistantId: "bravo", history: [] })
+    expect(empty.lastTurnId).toBeUndefined()
   })
 })
 
@@ -761,6 +768,67 @@ describe("changes that must hold together", () => {
     await typed(page, "hello to alpha", "alpha")
     expect(await request(page, { type: "conversation.new", assistantId: "ghost-three" })).toMatchObject({ ok: false, error: { code: "unknown_assistant" } })
     expect(await read("alpha")).toBe(alpha)
+  })
+
+  it("before its session exists, an assistant that stays on the device keeps its id while others come and go; one put back gets a new id", async () => {
+    const others = ["charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india", "juliet"]
+    await start((file) => {
+      for (const id of others) {
+        file.assistants.order.push(id)
+        file.assistants.byId[id] = { ...file.assistants.byId.bravo, id, name: `${id[0]!.toUpperCase()}${id.slice(1)}`, prompt: `You are ${id}.` }
+      }
+    })
+    const { client: page } = await voice()
+    const a = await admin()
+    const read = async (assistantId: string) => {
+      const requestId = `read-${++seq}`
+      const from = page.messages.length
+      page.send({ type: "conversation.read", requestId, assistantId })
+      return (await page.waitFor("conversation.history", (m) => m.requestId === requestId, { from })).id
+    }
+    /** The type's defaults (which the device follows): Alpha, answering as the first, and `second`. */
+    const withSecond = async (second: string) => {
+      const rev = typeOf(a).rev
+      const assistants = [{ assistant: "alpha", phrases: ["hey alpha"] }, { assistant: second, phrases: [`hey ${second}`] }]
+      expect(await request(a, { type: "device.save", target: { kind: "type", type: "web-voice" }, rev, settings: { assistants } })).toMatchObject({ ok: true })
+      await a.waitFor("device.types", (m) => m.types.some((t) => t.kind === "web-voice" && t.rev === rev + 1), { from: 0 })
+    }
+    const alpha = await read("alpha")
+    const bravo = await read("bravo")
+    // Ten assistants get a reservation in turn, but only two are ever on the device: Alpha's is never dropped.
+    for (const second of others) {
+      await withSecond(second)
+      await read(second)
+    }
+    expect(await read("alpha")).toBe(alpha)
+    // Bravo was taken off the device, and its reservation with it. Put back, it starts a new conversation: a new id.
+    await withSecond("bravo")
+    const bravoAgain = await read("bravo")
+    expect(bravoAgain).not.toBe(bravo)
+    expect(await read("alpha")).toBe(alpha)
+    // The session opens; both start in the ids reserved for them.
+    await typed(page, "hello to alpha", "alpha")
+    await typed(page, "hello to bravo", "bravo")
+    expect(await read("alpha")).toBe(alpha)
+    expect(await read("bravo")).toBe(bravoAgain)
+  })
+
+  it("before its session exists, a TypeSafe fallback that will answer has the device's id, and keeps it", async () => {
+    await start((file) => {
+      file.deviceTypes["web-voice"].withoutPhrase = { mode: "typesafe", fallback: "bravo", giveUpMs: 700 }
+    }, [greeterModule, deciderModule])
+    const { client: page, welcome } = await voice()
+    const read = async (assistantId: string) => {
+      const requestId = `read-${++seq}`
+      const from = page.messages.length
+      page.send({ type: "conversation.read", requestId, assistantId })
+      return (await page.waitFor("conversation.history", (m) => m.requestId === requestId, { from })).id
+    }
+    const bravo = await read("bravo")
+    expect(welcome.snapshot.conversations.find((c) => c.assistantId === "bravo")?.id).toBe(bravo)
+    expect(await read("alpha")).not.toBe(bravo)
+    await typed(page, "hello to bravo", "bravo")
+    expect(await read("bravo")).toBe(bravo)
   })
 
   it("assistant.create: placements that add up to more than 12 phrases for the assistant on one device are refused before anything is created", async () => {

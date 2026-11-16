@@ -86,6 +86,11 @@ export interface SessionConversation {
   /** When the last turn of this conversation was committed (epoch ms of the conversation's clock). */
   readonly lastTurnAt: () => number | undefined
   /**
+   * The turn whose exchange ends `history` (`Conversation.lastTurnId`), while the loop runs; `undefined` otherwise (the
+   * history then holds no turn that may still be running).
+   */
+  readonly lastTurnId: () => number | undefined
+  /**
    * Start a new conversation (`conversation.new`): the running turn is stopped as by Stop, the history dropped, the
    * id new (`onConversation` is called). Works without running engines.
    */
@@ -296,6 +301,7 @@ export const makeSessionConversation = (options: SessionConversationOptions): Ef
       history: Effect.suspend(() => live?.history ?? Effect.succeed(history)),
       conversation: () => conversationInfo,
       lastTurnAt: () => (live === undefined ? lastTurnAt : Effect.runSync(live.lastTurnAt)),
+      lastTurnId: () => (live === undefined ? undefined : Effect.runSync(live.lastTurnId)),
       newConversation: Effect.suspend(() => {
         if (live !== undefined) return Effect.map(live.newConversation("new"), () => conversationInfo)
         // No loop to tell them: the agents its runs used end the old conversation here.
