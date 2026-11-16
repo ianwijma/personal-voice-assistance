@@ -1,4 +1,4 @@
-# aurora-ribbons 1.0.0: frame digests of a scripted conversation at default settings (docs/CHARACTERS.md §6.6).
+# aurora-ribbons 1.1.0: frame digests of a scripted conversation at default settings (docs/CHARACTERS.md §6.6).
 # A change here must be deliberate: check the look, then update with `pnpm --filter @pva/web exec vitest run test/characters -u`.
 dark  0.5 idle          8 6b4a3c41
 dark  1.0 listening    16 a8c218ce
@@ -47,3 +47,26 @@ light 11.0 idle        646 385544d6
 overflow 160×140×1 2.0 px
 overflow 900×420×1 1.2 px
 overflow 720×240×2 1.2 px
+stage  0.5 idle          8 cbf7a1c1
+stage  1.0 listening    16 9366944e
+stage  1.5 listening    17 f4b9741c
+stage  2.0 hearing     538 03d7f28e
+stage  2.5 hearing    2185 e0baef4c
+stage  3.0 hearing    4088 0737a6e5
+stage  3.5 hearing    6379 75d376e6
+stage  4.0 hearing    8557 45dab874
+stage  4.5 hearing    8962 dce3913d
+stage  5.0 thinking   8868 99ea4d9c
+stage  5.5 thinking   7382 2f86019a
+stage  6.0 thinking   3414 101db621
+stage  6.5 speaking   2092 6a3032d5
+stage  7.0 speaking   2080 c7c05eb0
+stage  7.5 speaking   3825 7bb5ddac
+stage  8.0 speaking   5638 cd42260f
+stage  8.5 speaking   6312 8412cb8d
+stage  9.0 speaking   6649 fca4d710
+stage  9.5 listening  4709 7a8e703f
+stage 10.0 listening  2232 9d702c04
+stage 10.5 idle        610 44778e7f
+stage 11.0 idle        646 8fea804a
+stage 1280×800×1 focus 720×240 at 280,200: solid drawing x 278.8..1001.2, y 196.9..400.9

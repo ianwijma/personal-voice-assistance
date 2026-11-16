@@ -14,6 +14,10 @@ import { AttackRelease, approach, clamp, clamp01, clear2d, lerp, optChoice, optN
 import { ChoiceMix, type Col, css, Glide, GlowSprite, hueShift, mixInto, ModeMix, ONSET } from "../shared/light.ts"
 
 const POOL = 16
+/** On the stage, how far past the box the ribbons may swell at full level (as in sine-lines). */
+const REACH_SHARE = 0.25
+const REACH_MIN = 48
+const EDGE = 12
 const WHITE: Rgb = [255, 255, 255]
 /** Hue rotations along the register axis, deep → child: mint goes from sea-blue to spring green, amber from coral to gold. */
 const YOU_SHIFT = [34, 17, 0, -16, -32]
@@ -42,10 +46,13 @@ class Pool {
 
 const create = (canvas: HTMLCanvasElement): CharacterInstance => {
   let g = setup2d(canvas)
+  let CW = 1
+  let CH = 1
   let W = 1
   let H = 1
   let dpr = 1
   let n = 2
+  let tableW = -1 // the focus width the envelope tables were built for
   let envGather = new Float32Array(2)
   let envWide = new Float32Array(2)
   let env = new Float32Array(2)
@@ -185,24 +192,33 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
 
   return {
     resize(width, height, ratio) {
-      W = width
-      H = height
+      CW = width
+      CH = height
       dpr = ratio
       g = setup2d(canvas, dpr)
-      n = Math.floor(W / STEP) + 2
-      envGather = new Float32Array(n)
-      envWide = new Float32Array(n)
-      env = new Float32Array(n)
-      top = new Float32Array(n)
-      for (let j = 0; j < n; j++) {
-        const u = ((j * STEP) / W) * 2 - 1
-        const edge = Math.max(0, 1 - u * u)
-        envGather[j] = Math.exp(-(u * u) / (0.62 * 0.62)) * edge
-        envWide[j] = Math.pow(edge, 1.3)
-      }
+      // Sized for the widest focus there can be (the box is at most 720 px wide); used in part.
+      const len = Math.floor(Math.max(CW, 760) / STEP) + 2
+      envGather = new Float32Array(len)
+      envWide = new Float32Array(len)
+      env = new Float32Array(len)
+      top = new Float32Array(len)
+      tableW = -1
     },
 
     frame(f) {
+      const fo = f.focus
+      W = fo.width
+      H = fo.height
+      n = Math.min(env.length, Math.floor(W / STEP) + 2)
+      if (tableW !== W) {
+        tableW = W
+        for (let j = 0; j < n; j++) {
+          const u = ((j * STEP) / W) * 2 - 1
+          const edge = Math.max(0, 1 - u * u)
+          envGather[j] = Math.exp(-(u * u) / (0.62 * 0.62)) * edge
+          envWide[j] = Math.pow(edge, 1.3)
+        }
+      }
       const dt = f.dt
       const reduced = f.reducedMotion
       const p = f.palette
@@ -291,8 +307,11 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
       prevOnset = live ? v.onset : 0
 
       // Pointer: hovering swells the ribbons under it, pressing blooms one there.
-      const pu = f.pointer.inside ? (f.pointer.x / W) * 2 - 1 : 9
-      if (f.pointer.down && f.pointer.inside && !reduced && rand() < dt * 6) {
+      const px = f.pointer.x - fo.x
+      const py = f.pointer.y - fo.y
+      const over = f.pointer.inside && px >= 0 && px < W && py >= 0 && py < H
+      const pu = over ? (px / W) * 2 - 1 : 9
+      if (f.pointer.down && over && !reduced && rand() < dt * 6) {
         spawn(f.coreMode === "speaking" || f.coreMode === "thinking" ? 1 : 0, f)
       }
 
@@ -301,18 +320,23 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
       const loud = 0.06 + 0.94 * Math.pow(Math.min(1, L * 1.6), 0.8)
       const driveYou = mix.listening * 0.1 + mix.hearing * loud + mix.thinking * 0.32
       const driveVoice = mix.speaking * loud + mix.thinking * 0.32
-      const A = H * 0.48 * size
+      // On the stage the ribbons may swell past the box's top and bottom at full level (level²), where the
+      // page leaves room; zero when the box is the whole canvas.
+      const reachUp = Math.max(0, Math.min(fo.y - EDGE, Math.max(REACH_SHARE * H, REACH_MIN)))
+      const reachDn = Math.max(0, Math.min(CH - fo.y - H - EDGE, Math.max(REACH_SHARE * H, REACH_MIN)))
+      const boost = 1 + (L * L * Math.min(reachUp, reachDn)) / (0.5 * H)
+      const A = H * 0.48 * size * boost
       const gather = clamp01(mix.hearing + mix.listening + 0.5 * mix.thinking)
       for (let j = 0; j < n; j++) env[j] = lerp(envWide[j]!, envGather[j]!, gather / (gather + sp + 1e-3))
       // "Rising": the horizon sits low and the ribbons only grow upward, with the room that frees.
       const upS = (1 + 0.75 * rise * tiltK) * (1 + 1.0 * rising)
       const dnS = Math.max(0.1, 1 - 0.75 * rise * tiltK) * (1 - rising)
       const y0 = lerp(H / 2, H * 0.86, rising)
-      // Ribbons never leave the canvas, whatever the size and tilt.
-      const upMax = y0 - 3
-      const dnMax = H - y0 - 3
+      // Ribbons never leave the room they have, whatever the size and tilt.
+      const upMax = y0 - 3 + reachUp
+      const dnMax = H - y0 - 3 + reachDn
 
-      clear2d(g, dpr)
+      clear2d(g, dpr, fo)
       g.lineJoin = "round"
 
       // Haze: a soft glow behind the ribbons, tall and narrow while taking in, low and wide while
@@ -476,10 +500,11 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
 const character: Character = {
   id: "aurora-ribbons",
   name: "Aurora ribbons",
-  version: "1.0.0",
+  version: "1.1.0",
   contract: 1,
   family: "abstract",
   renderer: "2d",
+  canvas: "stage",
   summary: "Translucent lenses of light bloom and fade along a horizon; each one is born from a syllable and shaped by the voice that made it.",
   inspiredBy:
     "Siri's multicolour wave (iOS 9–13): random spawn and fade of curves under one amplitude, overlaps that glow. Taken further with per-syllable spawning, register, spectrum thirds and intonation, and Meta AI's inward-for-listening, outward-for-responding rule.",
@@ -502,7 +527,7 @@ const character: Character = {
     { signal: "active.brightness", effect: "Core of each ribbon: whiter (dark theme) or inkier (light theme) and denser for bright vowels." },
     { signal: "mode", effect: "Colour family (grey / mint / amber), drift direction (inward vs outward), spatial gather (centre bundle vs full width), lobe shape (smooth lenses vs pinched plumes); 350 ms crossfade." },
     { signal: "pointer", effect: "Hover swells ribbons under the pointer by up to 35 %; holding the button blooms new ribbons." },
-    { signal: "options", effect: "Size, ribbon count, rising vs mirrored form, intonation tilt, motion speed, haze, soft vs outline style and colour range change every mode; they glide over about 0.2 s (snap under reduced motion). Ribbons are clipped to stay inside the canvas." },
+    { signal: "options", effect: "Size, ribbon count, rising vs mirrored form, intonation tilt, motion speed, haze, soft vs outline style and colour range change every mode; they glide over about 0.2 s (snap under reduced motion). Ribbons keep the box's width and may swell past its top and bottom at full level, where the page has room." },
     { signal: "reducedMotion", effect: "No spawning, drift or ripple: six still lenses (fewer if the ribbon count is lower), gathered (person) or spread (assistant), height in quarter steps." }
   ],
   options: [
