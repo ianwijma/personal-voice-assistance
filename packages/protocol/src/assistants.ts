@@ -27,8 +27,17 @@ export const TOOL_NAME_CHARS = 64
 
 // -- Ids -------------------------------------------------------------------------------------------------------------
 
-/** Made from the name at creation ("jeff", "t3", "keuken-2"), never changed. */
-export const AssistantId = Schema.String.check(Schema.isPattern(/^[a-z][a-z0-9-]{0,31}$/))
+/**
+ * What `device.pick` sends for "whichever fits" (TypeSafe decides), in the same field as an assistant id: never an
+ * assistant's id, so the two cannot be confused.
+ */
+export const TYPESAFE_PICK = "typesafe"
+
+/** Made from the name at creation ("jeff", "t3", "keuken-2"), never changed. Never `TYPESAFE_PICK`. */
+export const AssistantId = Schema.String.check(
+  Schema.isPattern(/^[a-z][a-z0-9-]{0,31}$/),
+  Schema.makeFilter((s: string) => s !== TYPESAFE_PICK || `"${TYPESAFE_PICK}" is reserved and is not an assistant id`)
+)
 export type AssistantId = typeof AssistantId.Type
 
 export const ToolName = Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(TOOL_NAME_CHARS))
@@ -157,7 +166,7 @@ export const makeAssistantId = (name: string, taken: Iterable<string> = []): str
   if (base === "") base = "assistant"
   if (!/^[a-z]/.test(base)) base = `a${base}`
   base = base.slice(0, 32).replace(/-+$/, "")
-  if (!used.has(base)) return base
+  if (!used.has(base) && base !== TYPESAFE_PICK) return base
   for (let n = 2;; n++) {
     const suffix = `-${n}`
     const id = `${base.slice(0, 32 - suffix.length).replace(/-+$/, "")}${suffix}`
