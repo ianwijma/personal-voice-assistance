@@ -370,6 +370,10 @@ describe("typed text, TypeSafe candidates and fallback (section 2.6)", () => {
     expect(typedTextTarget(settings({ assistants: [], withoutPhrase: { mode: "nobody" } }), on)).toEqual({ dropped: "none" })
     expect(typedTextTarget(settings(), assistantsById([{ ...t3, on: false }, jeff]), { named: "t3" })).toEqual({ dropped: "off" })
   })
+  it("a named assistant that is not assigned to this device is ignored, even when it exists and is on", () => {
+    const jeffOnly = settings({ assistants: [{ assistant: "jeff", phrases: ["hey jeff"] }], withoutPhrase: { mode: "assistant", assistant: "jeff" } })
+    expect(typedTextTarget(jeffOnly, on, { named: "t3" })).toEqual({ assistant: "jeff" })
+  })
   it("TypeSafe never offers an off assistant; a fallback that is off means nobody", () => {
     const map = assistantsById([jeff, { ...t3, on: false }])
     expect(typesafeCandidates(settings(), map)).toEqual(["jeff"])

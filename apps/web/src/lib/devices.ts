@@ -138,13 +138,17 @@ export const draftOnRevision = (draft: DeviceDraft, rev: number, base: DeviceBas
     ? { edit: noEdit, rev }
     : draft
 
-/** The phrase without punctuation, as the tester compares a matched phrase. */
-const bare = (p: string) => p.trim().toLowerCase().replace(/[^\p{L}\p{N} ]/gu, "")
+/**
+ * A change to the draft. While a save is on its way the editor is inert and the change is ignored, so the draft stays
+ * exactly what was sent and the save's answer cannot drop it.
+ */
+export const editDraft = (draft: DeviceDraft, f: (e: DeviceEdit) => DeviceEdit, rev: number, saving: boolean): DeviceDraft =>
+  saving ? draft : { edit: f(draft.edit), rev: draft.edit === noEdit ? rev : draft.rev }
 
-/** The assistant a matched phrase wakes, among the assignments of the device that was tested (its saved settings). */
+/** The assistant a matched phrase wakes, among the assignments of the device that was tested (its saved settings), by the server's `phraseKey`. */
 export const wakesAssistant = (assignments: ReadonlyArray<Assignment>, phrase: string): string | undefined => {
-  const key = phrase.trim().toLowerCase()
-  return assignments.find((a) => a.phrases.some((p) => p.trim().toLowerCase() === key || bare(p) === bare(key)))?.assistant
+  const key = phraseKey(phrase)
+  return key === "" ? undefined : assignments.find((a) => a.phrases.some((p) => phraseKey(p) === key))?.assistant
 }
 
 // ---- Reading the list
