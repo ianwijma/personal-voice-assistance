@@ -890,14 +890,24 @@ export const makeResourcePool = (options: ResourcePoolOptions): Effect.Effect<Re
       keyOf: llmKeyOf,
       wrap: (entry, release) =>
         Llm.of({
+          // Counted from the start, the wait for the build included: a turn waiting for its instance keeps it alive when
+          // the assistant is rebound or switched off meanwhile (it finishes with the instance it started with).
           stream: (request) =>
-            Stream.unwrap(Effect.map(Deferred.await(entry.settled), () => {
-              const inner = entry.inner
-              if (inner === undefined) {
-                return Stream.fail(new LlmError({ message: entry.problem ?? "The language model could not start." }))
-              }
-              return counted(entry, release, Stream.suspend(() => inner.stream(request)))
-            }))
+            counted(
+              entry,
+              release,
+              Stream.unwrap(Effect.map(Deferred.await(entry.settled), () => {
+                const inner = entry.inner
+                if (inner === undefined) {
+                  return Stream.fail(new LlmError({ message: entry.problem ?? "The language model could not start." }))
+                }
+                // Released before this stream started (nothing kept it): its instance is shut down.
+                if (entry.closed) {
+                  return Stream.fail(new LlmError({ message: "The language model was released before the turn started." }))
+                }
+                return Stream.suspend(() => inner.stream(request))
+              }))
+            )
         }),
       describe: (spec) => ({
         kind: "llm",
@@ -948,14 +958,24 @@ export const makeResourcePool = (options: ResourcePoolOptions): Effect.Effect<Re
       keyOf: sttKeyOf,
       wrap: (entry, release): Recogniser => ({
         forStream: (stream) => ({
+          // Counted from the start, the wait for the build included: a turn waiting for its recogniser keeps it alive
+          // when its place is rebound or switched off meanwhile (it finishes with the recogniser it started with).
           transcribe: (audio) =>
-            Stream.unwrap(Effect.map(Deferred.await(entry.settled), () => {
-              const inner = entry.inner
-              if (inner === undefined || entry.state === "failed") {
-                return Stream.fail(new SttError({ message: entry.problem ?? "The speech recogniser could not start." }))
-              }
-              return counted(entry, release, Stream.suspend(() => inner.forStream(stream).transcribe(audio)))
-            }))
+            counted(
+              entry,
+              release,
+              Stream.unwrap(Effect.map(Deferred.await(entry.settled), () => {
+                const inner = entry.inner
+                if (inner === undefined || entry.state === "failed") {
+                  return Stream.fail(new SttError({ message: entry.problem ?? "The speech recogniser could not start." }))
+                }
+                // Released before this stream started (nothing kept it): its model is shut down.
+                if (entry.closed) {
+                  return Stream.fail(new SttError({ message: "The speech recogniser was released before the turn was heard." }))
+                }
+                return Stream.suspend(() => inner.forStream(stream).transcribe(audio))
+              }))
+            )
         })
       }),
       describe: (spec) => {

@@ -233,6 +233,21 @@ describe("serve: one recogniser per device, from its hearer (WP-11)", () => {
     expect(old.closed).toBe(true)
   })
 
+  it("an utterance closed by the switch holds the turn no longer: its assistant is not reported while the hearing tail lasts", async () => {
+    const fake = fakeRecognisers()
+    await start(fake, { hearerSwitchWaitMs: 300 })
+    await device("device-a")
+    await until("device-a hearing", () => streamOf(fake, "device-a") !== undefined)
+    const old = streamOf(fake, "device-a")!
+    // "hey alpha what…" is heard as Alpha's (no window opens before its end).
+    fake.emit(old, { _tag: "SpeechStarted" }, { _tag: "Interim", text: "hey alpha what" })
+    await until("heard as Alpha's", () => sessionOf("device-a").holder() === "alpha")
+    await saveHearing("alpha", { model: "model-c" })
+    await until("switched to model-c", () => streamOf(fake, "device-a")?.model === "model-c", 3_000)
+    // Closed without its end (it starts nothing): nobody has the turn, at once, not when the 2 s tail runs out.
+    expect(sessionOf("device-a").holder()).toBeNull()
+  })
+
   it("a device with no assistants runs no recogniser; one assigned later starts it", async () => {
     const fake = fakeRecognisers()
     await start(fake)

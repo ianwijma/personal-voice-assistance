@@ -5,7 +5,7 @@
 import { type Stt, SttError, type SttEvent } from "@pva/core"
 import type { AssistantHearing } from "@pva/protocol"
 import * as SherpaStt from "@pva/stt-sherpa"
-import { ConfigProvider, Deferred, Effect, Exit, Scope, Stream } from "effect"
+import { ConfigProvider, Deferred, Effect, Exit, Fiber, Scope, Stream } from "effect"
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
@@ -237,6 +237,101 @@ describe("resource pool: recognisers (WP-11)", () => {
     await reconcile(pool, entries, { retryFailed: true })
     expect(pool.sttFor("device:a")!.state).toBe("ready")
     expect(await hear(pool, "device:a")).toBe("parakeet-v2#2 after 600 ms")
+  })
+
+  /**
+   * Recognisers like the default builder's: a model that is shut down once its scope closes (it then refuses to
+   * hear); nemotron's build waits for `building`. device:c hears with parakeet, ready; device:a comes into use on
+   * nemotron, still loading.
+   */
+  const loadingNemotron = async () => {
+    const building = Deferred.makeUnsafe<void>()
+    const released: Array<string> = []
+    const build: SttBuilder = (spec) =>
+      Effect.gen(function*() {
+        if (spec.model === "nemotron-560") yield* Deferred.await(building)
+        let shut = false
+        yield* Effect.addFinalizer(() =>
+          Effect.sync(() => {
+            shut = true
+            released.push(spec.model)
+          })
+        )
+        return {
+          forStream: (stream): Stt["Service"] => ({
+            transcribe: () =>
+              Stream.suspend((): Stream.Stream<SttEvent, SttError> =>
+                shut
+                  ? Stream.fail(new SttError({ message: "model is shut down" }))
+                  : Stream.fromIterable<SttEvent>([{ _tag: "EndOfTurn", text: `${spec.model} after ${stream.finalSilenceMs} ms` }])
+              )
+          })
+        } satisfies Recogniser
+      })
+    const pool = await makePool(build)
+    const c: Places = { "device:c": { hearer: "t3", hearing: hearing("parakeet-v2") } }
+    await reconcile(pool, c)
+    const wanting = reconcile(pool, { "device:a": { hearer: "jeff", hearing: hearing("nemotron-560") }, ...c })
+    await sleep(10)
+    expect(pool.sttFor("device:a")!.key).toContain("nemotron-560")
+    return { pool, building, released, wanting, c }
+  }
+  const nemotronListed = (pool: ResourcePool) => sttStatus(pool).some((r) => r.key.includes("nemotron-560"))
+  const heardBy = (stt: Stt["Service"]) =>
+    run(Stream.runCollect(stt.transcribe(Stream.empty))).then((events) => {
+      const last = [...events].at(-1)
+      return last?._tag === "EndOfTurn" ? last.text : last?._tag
+    })
+
+  const lastUserGoes: ReadonlyArray<readonly [string, (c: Places) => Places]> = [
+    ["rebound to a ready recogniser", (c) => ({ "device:a": { hearer: "jeff", hearing: hearing("parakeet-v2") }, ...c })],
+    ["switched off", (c) => c]
+  ]
+  for (const [what, after] of lastUserGoes) {
+    it(`a turn waiting for its recogniser to load finishes with it when its place, the last user, is ${what} meanwhile; then the recogniser is released`, async () => {
+      const { pool, building, released, wanting, c } = await loadingNemotron()
+      const stt = pool.sttFor("device:a")!.stt
+      // The turn's stream starts and waits for the build.
+      const heard = heardBy(stt)
+      await sleep(10)
+      await reconcile(pool, after(c))
+      // Kept for the waiting turn, though nobody uses it any more.
+      await sleep(20)
+      expect(released).toEqual([])
+      expect(nemotronListed(pool)).toBe(true)
+      Deferred.doneUnsafe(building, Exit.void)
+      await wanting
+      expect(await heard).toBe("nemotron-560 after 600 ms")
+      // Done: released at once (it was never used after the turn), its model shut down.
+      await sleep(20)
+      expect(released).toEqual(["nemotron-560"])
+      expect(nemotronListed(pool)).toBe(false)
+    })
+  }
+
+  it("a turn stopped while it waits for its recogniser lets go of it: a recogniser nobody uses any more is released", async () => {
+    const { pool, building, wanting, c } = await loadingNemotron()
+    const stt = pool.sttFor("device:a")!.stt
+    const turn = Effect.runFork(Stream.runDrain(stt.transcribe(Stream.empty)))
+    await sleep(10)
+    await reconcile(pool, { "device:a": { hearer: "jeff", hearing: hearing("parakeet-v2") }, ...c })
+    expect(nemotronListed(pool)).toBe(true)
+    await run(Fiber.interrupt(turn))
+    expect(nemotronListed(pool)).toBe(false)
+    Deferred.doneUnsafe(building, Exit.void)
+    await wanting
+  })
+
+  it("a recogniser released before a turn's stream started fails it with an SttError instead of hearing with a shut-down model", async () => {
+    const { pool, building, wanting, c } = await loadingNemotron()
+    const stt = pool.sttFor("device:a")!.stt
+    await reconcile(pool, c)
+    expect(nemotronListed(pool)).toBe(false)
+    Deferred.doneUnsafe(building, Exit.void)
+    await wanting
+    const listening = run(Stream.runDrain(stt.transcribe(Stream.empty)))
+    await expect(listening).rejects.toBeInstanceOf(SttError)
+    await expect(listening).rejects.toMatchObject({ message: "The speech recogniser was released before the turn was heard." })
   })
 
   it("keys: the language counts only for a model that takes one; Deepgram is keyed by its shared model and address", () => {
