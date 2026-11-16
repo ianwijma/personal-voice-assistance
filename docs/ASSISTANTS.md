@@ -995,7 +995,8 @@ temporary root per run (`vitest.global-setup.ts`) so they no longer leave `pva-*
   a first sentence after a pause also pays the connection set-up; the live run had 1 s gaps and did not measure that (`--gap-ms 6000`
   does). The 0.5 thresholds, the option-order bias and recogniser output (the live run used typed sentences) are not tuned.
 - **Not built in the UI.** "Add as phrase" on the phrase tester's ignored lines; the memory sentence on the Hearing tab; the models of a
-  provider as a list on the Language model tab (the model is free text); a "not set up" warning on saving an assistant (the problem shows
+  provider as a list on the Language model tab (the model is free text; the server half, `/api/models/{llm,stt}`, is built:
+  docs/MODEL-PICKERS.md); a "not set up" warning on saving an assistant (the problem shows
   on the assistant and in the status); OpenRouter's per-model reasoning effort is not sent.
 - **Command-line modes.** They read the flat keys; `cliAssistant` resolves an assistant that no mode uses, and there is no `--assistant`
   flag. The CLI modes do not apply Home (no Home line, no linked defaults).

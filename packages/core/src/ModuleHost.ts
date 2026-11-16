@@ -1,4 +1,4 @@
-import type { ErrorInfo, FieldError, ModuleInfo, ModuleInstanceInfo, ModuleState, SettingsPatch, SettingValue, StatusLine } from "@pva/protocol"
+import type { ChoiceOption, ErrorInfo, FieldError, ModuleInfo, ModuleInstanceInfo, ModuleState, SettingsPatch, SettingValue, StatusLine } from "@pva/protocol"
 import { Cause, Clock, Effect, Exit, Scope, Stream } from "effect"
 import { actionTool, defineAction, Param, type RegisteredAction, registerActions } from "./Actions.ts"
 import type { Agent } from "./Agent.ts"
@@ -150,6 +150,11 @@ export interface ModuleHost {
    * `fieldActions[key]`, or the generated `test` of an agent or decision provider (docs/AGENTS-AND-INTENTS.md §1.6).
    */
   readonly fieldAction: (id: string, key: string) => Effect.Effect<FieldActionHostResult>
+  /**
+   * The `settingOptions` of a running module (its instance with the shared settings): choices known only while it
+   * runs, such as the models Claude Code reports at start. `undefined` when the module does not run or gives none.
+   */
+  readonly settingOptions: (id: string) => Readonly<Record<string, ReadonlyArray<ChoiceOption>>> | undefined
 }
 
 export interface ModuleHostOptions {
@@ -986,8 +991,20 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
     return checkOwnValues(entry.def.settings, own)
   }
 
+  const settingOptions = (id: string): Readonly<Record<string, ReadonlyArray<ChoiceOption>>> | undefined => {
+    const entry = byId.get(id)
+    const instance = entry === undefined ? undefined : mainOf(entry)?.running?.instance
+    if (instance?.settingOptions === undefined) return undefined
+    try {
+      return instance.settingOptions()
+    } catch {
+      return undefined
+    }
+  }
+
   return {
     fieldAction,
+    settingOptions,
     setSecrets,
     snapshot: () => snapshot,
     modules: () => entries.map(info),

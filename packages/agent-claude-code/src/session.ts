@@ -48,7 +48,8 @@ export const launchKeyOf = (config: Pick<SessionConfig, "model" | "effort" | "th
 export interface LoginInfo {
   readonly subscriptionType: string | undefined
   readonly apiKeySource: string | undefined
-  readonly models: ReadonlyArray<{ readonly value: string; readonly label: string }>
+  /** The models Claude Code reports at start (its `initialize` answer), as setting choices. */
+  readonly models: ReadonlyArray<{ readonly value: string; readonly label: string; readonly description?: string }>
 }
 
 export class SessionError extends Error {
@@ -215,7 +216,11 @@ export class ClaudeSession {
       this.login = {
         subscriptionType: init.account.subscriptionType,
         apiKeySource: init.account.apiKeySource,
-        models: init.models.map((m) => ({ value: m.value, label: m.displayName }))
+        models: init.models.map((m) => ({
+          value: m.value,
+          label: m.displayName,
+          ...(typeof m.description === "string" && m.description.trim() !== "" ? { description: m.description.trim().slice(0, 300) } : {})
+        }))
       }
       return this.login
     } catch (e) {

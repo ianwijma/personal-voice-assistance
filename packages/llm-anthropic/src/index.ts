@@ -470,3 +470,5 @@ export const layerConfig: Layer.Layer<Llm, Config.ConfigError> = Layer.effect(
 )
 
 export const AnthropicLlm = { layer, layerConfig, make, config } as const
+
+export * from "./models.ts"

@@ -85,6 +85,9 @@
  * for a voice on this machine while a device is in a turn), downloads (the Models page's jobs) and the assistant's voice
  * (ASSISTANT_VOICE, with the server's checks). POST /mock/voices/fail {"provider", "on"?} makes a provider's key
  * refused; POST /mock/voices/hold {"ms"} delays previews.
+ *
+ * The model pickers' API (docs/MODEL-PICKERS.md §4) is under /api/models/ (mock/modelPickers.ts: every provider state,
+ * recogniser downloads as the Models page's jobs); POST /mock/models/state {"provider", "state"} forces a state.
  */
 import { randomBytes } from "node:crypto"
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http"
@@ -136,6 +139,7 @@ import { createAssistantsMock } from "./assistants.ts"
 import { seedTraces } from "./traces.ts"
 import { createVoiceAssistants, scenarioSettings, scriptedTurn } from "./voiceAssistants.ts"
 import { encodeWav, MOCK_PROVIDERS } from "./voices.ts"
+import { createModelPickersMock } from "./modelPickers.ts"
 import type { Condition, FieldError } from "@pva/protocol"
 
 const PORT = Number(process.env.MOCK_PORT ?? 8787)
@@ -1190,6 +1194,7 @@ const resetState = () => {
   seedVoiceScenario()
   env = initialEnv()
   favourites = initialFavourites()
+  modelPickers.reset()
   providerFailures.clear()
   previewHold = 0
   for (const t of jobTimers.values()) clearInterval(t)
@@ -2410,6 +2415,18 @@ function initialFavourites(): Array<Favourite> {
   ]
 }
 let favourites: Array<Favourite> = initialFavourites()
+/** The model pickers (mock/modelPickers.ts), on the mock's own sections, modules, assistants and jobs. */
+const modelPickers = createModelPickersMock({
+  secretSet: (key) => secretSet(key),
+  valueOf: (key) => valueOf(key),
+  vaultLocked: () => vault.state === "locked",
+  subscriptionRunning: () => modules.some((m) => m.id === "claude-subscription" && m.enabled && m.state === "running"),
+  assistants: () => assistantsMock.assistants(),
+  sttItems: () => models.find((m) => m.tool === "stt-models")?.items ?? [],
+  runningJob: (target) => jobs.find((j) => j.tool === "stt-models" && j.target === target && j.state === "running"),
+  startJob: (target) => startJob("stt-models", target),
+  stopJob: (id) => stopJob(id)
+})
 /** POST /mock/voices/fail {"provider", "on"}: a hosted provider whose key is refused (status `error`). */
 const providerFailures = new Set<string>()
 /** POST /mock/voices/hold {"ms"}: previews answer after this long (default 300 ms). */
@@ -2662,6 +2679,8 @@ const apiRoute = async (req: IncomingMessage, res: ServerResponse, path: string,
     }
     return { status: 200, body: { default: defaultVoiceInfo() } }
   }
+  const picked = await modelPickers.route(method, path, query, body)
+  if (picked !== undefined) return picked
   throw new ApiFail(404, "not_found", `There is nothing at /api/${path}`)
 }
 
@@ -2737,6 +2756,10 @@ const http = createServer((req, res) => {
         dropAll()
         log("scenario", scenario)
         return json(res, 200, { scenario })
+      case "/mock/models/state": {
+        const answer = modelPickers.control(payload)
+        return json(res, answer.status, answer.body)
+      }
       case "/mock/reset":
         resetState()
         dropAll()
