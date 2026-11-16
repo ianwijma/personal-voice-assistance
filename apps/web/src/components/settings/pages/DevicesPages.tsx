@@ -275,13 +275,19 @@ function DeviceEditor({ type, device }: { readonly type: DeviceTypeInfo; readonl
     setSaving(true)
     setMessage(undefined)
     const patch = patchOf(base, edit)
-    // continuation(state): the draft is read again when the answer comes
-    const outcome = await client.saveDevice(
-      device === undefined ? { kind: "type", type: type.kind } : { kind: "device", id: device.id },
-      state.rev,
-      patch,
-      { label: name, ...(saveAnyway ? { saveAnyway: true } : {}), ...(edit.name !== undefined && edit.name.trim() !== savedName ? { name: edit.name.trim() } : {}) }
-    )
+    let outcome: Outcome
+    try {
+      // continuation(state): the draft is read again when the answer comes
+      outcome = await client.saveDevice(
+        device === undefined ? { kind: "type", type: type.kind } : { kind: "device", id: device.id },
+        state.rev,
+        patch,
+        { label: name, ...(saveAnyway ? { saveAnyway: true } : {}), ...(edit.name !== undefined && edit.name.trim() !== savedName ? { name: edit.name.trim() } : {}) }
+      )
+    } catch {
+      // A request that fails gives the editor back, with the draft as it was.
+      outcome = { kind: "refused", code: "internal", message: "Could not save. Try again." }
+    }
     savingNow.current = false
     setSaving(false)
     switch (outcome.kind) {
