@@ -705,7 +705,8 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       const spec = (key === undefined ? undefined : llmSpecs.get(key)) ?? llmSpecOf(assistant.llm)
       return {
         llm: passed !== undefined
-          ? { account: SUBSCRIPTION_PROVIDER, model: passed.model, effort: assistant.llm.effort, thinking: assistant.llm.thinking, maxTokens: assistant.llm.maxTokens }
+          // No token limit is passed to Claude Code (`ClaudeConversationOptions` has none): the stand-in's, as `llmSpecOf` keeps it.
+          ? { account: SUBSCRIPTION_PROVIDER, model: passed.model, effort: assistant.llm.effort, thinking: assistant.llm.thinking, maxTokens: 1024 }
           : { account: spec.account, model: spec.model, effort: spec.effort, thinking: spec.thinking, maxTokens: spec.maxTokens },
         voice: resources.ttsKeyFor(assistant.id) ?? voiceKey(assistant.voice),
         modules,

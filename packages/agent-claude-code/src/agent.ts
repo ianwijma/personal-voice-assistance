@@ -153,6 +153,11 @@ interface Slot {
   syncedThrough: number
   /** Its options' idle restart (ms; `Infinity`: never), from its last turn. */
   idleMs: number
+  /**
+   * The end of the last queued turn's acquisition (`queued`): every turn of the conversation takes, retunes and binds
+   * its session only after the ones before it finished (a cancelled turn's retune included), up to sending its message.
+   */
+  queue: Promise<void>
 }
 
 type Launch = Pick<SessionConfig, "model" | "effort" | "thinking">
@@ -294,11 +299,29 @@ export const makeClaudeAgent = async (options: ClaudeAgentOptions): Promise<Clau
 
   const slotFor = (conversationId: string): Slot => {
     let slot = slots.get(conversationId)
-    if (slot === undefined) slot = { conversationId, session: undefined, starting: undefined, syncedThrough: 0, idleMs: idleMsOf(defaults.sessionIdleMinutes) }
+    if (slot === undefined) {
+      slot = { conversationId, session: undefined, starting: undefined, syncedThrough: 0, idleMs: idleMsOf(defaults.sessionIdleMinutes), queue: Promise.resolve() }
+    }
     // Most recently used last.
     slots.delete(conversationId)
     slots.set(conversationId, slot)
     return slot
+  }
+
+  /**
+   * Wait for the turns of `slot` queued before this one (their acquisition, retune and bind, up to sending their message
+   * or giving up), then hold the queue: resolves with the release (idempotent). The queue does not depend on the turns'
+   * streams, so a cancelled turn's pending retune still holds it until Claude Code confirmed it or the session was killed,
+   * and the next turn compares its options with what the session acknowledged.
+   */
+  const queued = (slot: Slot): Promise<() => void> => {
+    const before = slot.queue
+    let release!: () => void
+    const mine = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    slot.queue = before.then(() => mine)
+    return before.then(() => release)
   }
 
   /** A ready session for this turn's conversation, prompt and tools, and the instructions to prepend when binding a provisional one. */
@@ -306,7 +329,8 @@ export const makeClaudeAgent = async (options: ClaudeAgentOptions): Promise<Clau
     slot: Slot,
     system: string,
     tools: ReadonlyArray<SessionTool>,
-    launch: Launch
+    launch: Launch,
+    signal: AbortSignal
   ): Promise<{ session: ClaudeSession; instructions?: string }> => {
     if (closed) throw new SessionError(`${AGENT_NAME} is stopped`, "unavailable")
     let session = slot.starting !== undefined ? await slot.starting.catch(() => undefined) : slot.session
@@ -322,6 +346,8 @@ export const makeClaudeAgent = async (options: ClaudeAgentOptions): Promise<Clau
     if (stale) {
       session?.kill("replaced")
       slot.session = undefined
+      // The turn was cancelled meanwhile (its retune was refused or timed out): no new session for it; the next turn starts one.
+      if (signal.aborted) throw new SessionError(`${AGENT_NAME}: the turn was interrupted`, "failed")
       if (slots.get(slot.conversationId) !== slot) slots.set(slot.conversationId, slot) // closed meanwhile: open again
       session = await take(slot, system, tools, launch)
     }
@@ -370,7 +396,19 @@ export const makeClaudeAgent = async (options: ClaudeAgentOptions): Promise<Clau
           }
           const slot = slotFor(input.conversationId)
           slot.idleMs = idleMsOf(conversation.sessionIdleMinutes)
-          const acquired = await acquire(slot, input.system, tools, launch)
+          // One turn at a time takes and tunes the conversation's session (`queued`); released once the message is sent.
+          const release = await queued(slot)
+          try {
+            await sendTurn(slot, tools, launch, release)
+          } finally {
+            release()
+          }
+        }
+
+        const sendTurn = async (slot: Slot, tools: ReadonlyArray<SessionTool>, launch: Launch, release: () => void): Promise<void> => {
+          // Cancelled while waiting: abandoned, before it touched the session.
+          if (controller.signal.aborted) return
+          const acquired = await acquire(slot, input.system, tools, launch, controller.signal)
           session = acquired.session
           if (controller.signal.aborted) return
           const fresh = !session.used
@@ -483,7 +521,11 @@ export const makeClaudeAgent = async (options: ClaudeAgentOptions): Promise<Clau
               reject(new SessionError(`${AGENT_NAME} stopped: ${reason}`, "unavailable"))
             }
             input.mark("llmRequestSent")
-            session!.send(text, { message: onMessage, died }, toolHandler)
+            try {
+              session!.send(text, { message: onMessage, died }, toolHandler)
+            } finally {
+              release()
+            }
           })
         }
 

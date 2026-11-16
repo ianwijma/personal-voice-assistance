@@ -34,6 +34,8 @@ export interface FakeQuery extends QueryHandle {
   readonly registered: Array<{ tools: ReadonlyArray<SessionTool>; viaSetMcpServers: boolean }>
   /** `setModel` and `applyFlagSettings` calls, in order. */
   readonly retunes: Array<{ model: string | undefined } | { effortLevel: string | null | undefined }>
+  /** The model it answers with now: the last `setModel` it received (applied on arrival, before it is acknowledged), else its launch model. */
+  readonly model: string | undefined
   /** The iterator throws `error` (an `Error` made from a string), as the SDK does when the process dies. */
   crash(error?: string | Error): void
 }
@@ -58,6 +60,8 @@ const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
 export const makeFakeSdk = (options: FakeSdkOptions = {}) => {
   const queries: Array<FakeQuery> = []
   const servers = new Map<object, { tools: ReadonlyArray<SessionTool>; handler: ToolHandler }>()
+  /** While set, `setModel` and `applyFlagSettings` apply at once but are acknowledged only when it resolves (`holdRetunes`). */
+  let retuneHold: Promise<void> | undefined
   let respond: Responder = options.respond ?? ((ctx) => {
     ctx.delta("Hello")
     ctx.delta(" there.")
@@ -81,6 +85,7 @@ export const makeFakeSdk = (options: FakeSdkOptions = {}) => {
       let currentTools: ReadonlyArray<SessionTool> = []
       const registered: FakeQuery["registered"] = []
       const retunes: FakeQuery["retunes"] = []
+      let model = queryOptions.model
       const push = (m: unknown) => {
         const r = { done: false, value: m as SDKMessage } as IteratorResult<SDKMessage, void>
         const w = waiters.shift()
@@ -111,13 +116,19 @@ export const makeFakeSdk = (options: FakeSdkOptions = {}) => {
         },
         registered,
         retunes,
-        setModel: async (model) => {
+        get model() {
+          return model
+        },
+        setModel: async (next) => {
           if (options.refuseRetune === true) throw new Error("setModel refused")
-          retunes.push({ model })
+          retunes.push({ model: next })
+          model = next
+          if (retuneHold !== undefined) await retuneHold
         },
         applyFlagSettings: async (settings) => {
           if (options.refuseRetune === true) throw new Error("applyFlagSettings refused")
           retunes.push({ effortLevel: settings.effortLevel })
+          if (retuneHold !== undefined) await retuneHold
         },
         next: () => {
           if (failure !== undefined) return Promise.reject(failure)
@@ -212,6 +223,17 @@ export const makeFakeSdk = (options: FakeSdkOptions = {}) => {
   return {
     sdk,
     queries,
-    setRespond: (r: Responder) => (respond = r)
+    setRespond: (r: Responder) => (respond = r),
+    /** Hold back the acknowledgement of retunes from now on (they still apply on arrival); the result releases them. */
+    holdRetunes: (): (() => void) => {
+      let release!: () => void
+      retuneHold = new Promise<void>((resolve) => {
+        release = resolve
+      })
+      return () => {
+        retuneHold = undefined
+        release()
+      }
+    }
   }
 }

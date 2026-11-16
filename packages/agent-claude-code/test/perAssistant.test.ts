@@ -2,8 +2,8 @@
 // with its assistant's own model and options. Fake SDK only: no Claude Code process is started.
 import { describe, expect, it } from "@effect/vitest"
 import { type Agent, type AgentEvent, type AgentTurnInput, makeTool, makeToolRegistry, type Message, type Trace } from "@pva/core"
-import { Effect, Schema, Stream } from "effect"
-import { type ClaudeConversationOptions, conversationOptionsOf, makeClaudeAgent, withConversationOptions } from "../src/index.ts"
+import { Effect, Fiber, Schema, Stream } from "effect"
+import { type ClaudeConversationOptions, conversationOptionsOf, launchKeyOf, makeClaudeAgent, withConversationOptions } from "../src/index.ts"
 import { makeFakeSdk } from "./fakeSdk.ts"
 
 const lightsTool = makeTool({
@@ -208,4 +208,83 @@ describe("Claude subscription per assistant (WP-13a)", () => {
       expect(session.dead).toBe("the conversation ended")
       handle.shutdown()
     }))
+  // Fourth review of #41: a cancelled turn's retune must be finished (or the session dropped) before the next turn of the
+  // conversation compares its options with the session; the session records only what Claude Code acknowledged.
+  describe("a turn cancelled while its retune is pending", () => {
+    const haiku: ClaudeConversationOptions = { model: "claude-haiku-5-5", tools: false, sessionIdleMinutes: 60 }
+    const sonnet: ClaudeConversationOptions = { ...haiku, model: "claude-sonnet-5-5" }
+    /** Answers with the model the fake session uses at the moment the message arrives. */
+    const answerWithModel = (fake: ReturnType<typeof makeFakeSdk>) =>
+      fake.setRespond((ctx) => {
+        ctx.delta(`answered with ${ctx.query.model ?? "?"}`)
+        ctx.result()
+      })
+    const textOf = (events: ReadonlyArray<AgentEvent>) =>
+      events.flatMap((e) => (e._tag === "TextDelta" ? [e.text] : [])).join("")
+
+    it.live("the next turn waits for it, then retunes back to the model it asks for", () =>
+      Effect.gen(function*() {
+        const fake = makeFakeSdk()
+        answerWithModel(fake)
+        const handle = yield* Effect.promise(() => makeClaudeAgent({ ...moduleSettings, sdk: fake.sdk }))
+        const agent = asAgent(handle)
+        // An established Haiku session.
+        const one = yield* collect(withConversationOptions(agent, haiku).turn(input("c", "One")))
+        expect(textOf(one)).toBe("answered with claude-haiku-5-5")
+        const session = handle.session("c")!
+        const q = fake.queries.find((x) => x.received.some((r) => r.endsWith("One")))!
+        const haikuLaunch = session.launch
+        // Sonnet is saved; its turn's setModel applies at once but its acknowledgement is held back.
+        const release = fake.holdRetunes()
+        const two = yield* Effect.forkChild(collect(withConversationOptions(agent, sonnet).turn(input("c", "Two"))))
+        yield* Effect.sleep("30 millis")
+        expect(q.retunes).toEqual([{ model: "claude-sonnet-5-5" }])
+        expect(q.model).toBe("claude-sonnet-5-5")
+        // Requested, not acknowledged: the session still records Haiku.
+        expect(session.launch).toBe(haikuLaunch)
+        // Haiku is saved again and another turn comes in, which cancels the Sonnet turn.
+        yield* Fiber.interrupt(two)
+        const three = yield* Effect.forkChild(collect(withConversationOptions(agent, haiku).turn(input("c", "Three"))))
+        yield* Effect.sleep("30 millis")
+        // It waits for the pending retune instead of comparing with the session's old options and sending.
+        expect(q.received.some((r) => r.endsWith("Three"))).toBe(false)
+        release()
+        const events = yield* Fiber.join(three)
+        // After the Sonnet acknowledgement the session is retuned back to Haiku before the message goes out.
+        expect(textOf(events)).toBe("answered with claude-haiku-5-5")
+        expect(q.retunes).toEqual([{ model: "claude-sonnet-5-5" }, { model: "claude-haiku-5-5" }])
+        expect(handle.session("c")).toBe(session)
+        expect(session.dead).toBeUndefined()
+        expect(session.launch).toBe(haikuLaunch)
+        // The cancelled turn's message was never sent.
+        expect(q.received.some((r) => r.endsWith("Two"))).toBe(false)
+        handle.shutdown()
+      }))
+
+    it.live("a retune that is never acknowledged drops the session; the next turn gets a new one with its model", () =>
+      Effect.gen(function*() {
+        const fake = makeFakeSdk()
+        answerWithModel(fake)
+        const handle = yield* Effect.promise(() => makeClaudeAgent({ ...moduleSettings, sdk: fake.sdk }))
+        const agent = asAgent(handle)
+        yield* collect(withConversationOptions(agent, haiku).turn(input("c", "One")))
+        const session = handle.session("c")!
+        const release = fake.holdRetunes()
+        const two = yield* Effect.forkChild(collect(withConversationOptions(agent, sonnet).turn(input("c", "Two"))))
+        yield* Effect.sleep("30 millis")
+        yield* Fiber.interrupt(two)
+        const three = yield* Effect.forkChild(collect(withConversationOptions(agent, haiku).turn(input("c", "Three"))))
+        // The Sonnet change times out (3 s): the session, which may answer with Sonnet, is killed, and the cancelled
+        // turn starts no session of its own.
+        const events = yield* Fiber.join(three)
+        expect(session.dead).toMatch(/could not change the model or effort/)
+        expect(textOf(events)).toBe("answered with claude-haiku-5-5")
+        const fresh = handle.session("c")!
+        expect(fresh).not.toBe(session)
+        expect(fresh.launch).toBe(launchKeyOf({ model: "claude-haiku-5-5" }))
+        expect(fake.queries.filter((x) => x.options.model === "claude-sonnet-5-5")).toEqual([])
+        release()
+        handle.shutdown()
+      }), 10_000)
+  })
 })
