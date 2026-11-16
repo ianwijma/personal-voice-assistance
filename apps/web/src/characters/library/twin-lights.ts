@@ -17,15 +17,17 @@ import { ChoiceMix, type Col, css, Glide, GlowSprite, hueShift, mixInto, ModeMix
 const MOTES = 48
 const WHITE: Rgb = [255, 255, 255]
 const STYLES = ["glowing", "flat", "rings"] as const
-/** Keep the lights' bodies and the motes' peaks this far (CSS px) from the canvas edges. */
+/** Keep the lights' bodies this far (CSS px) from the box's sides, and the motes' peaks from the canvas top. */
 const MARGIN = 6
 
 const create = (canvas: HTMLCanvasElement): CharacterInstance => {
   let g = setup2d(canvas)
-  let W = 1
+  let W = 1 // the focus (the box), set each frame
   let H = 1
   let dpr = 1
   let U = 100
+  let lastW = -1
+  let lastH = -1
 
   const mix = new ModeMix()
   const rand = rng(5)
@@ -64,7 +66,7 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
   let arcK = 1
   let trailK = 1
   let glowK = 1
-  let arcMax = 1e9 // highest a mote may fly above the lights, px (keeps it inside the canvas)
+  let arcMax = 1e9 // highest a mote may fly above the lights, px (keeps it inside the page)
 
   const glowYou = new GlowSprite(96)
   const glowVoice = new GlowSprite(96)
@@ -115,12 +117,9 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
   }
 
   return {
-    resize(width, height, ratio) {
-      W = width
-      H = height
+    resize(_width, _height, ratio) {
       dpr = ratio
       g = setup2d(canvas, dpr)
-      U = unit(W, H)
     },
 
     frame(f) {
@@ -129,6 +128,17 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
       const dark = p.dark
       const reduced = f.reducedMotion
       mix.step(f, 0.35)
+      // Layout comes from the focus (the box), not from the canvas, which is the whole page.
+      const fo = f.focus
+      W = fo.width
+      H = fo.height
+      const px = f.pointer.x - fo.x
+      const py = f.pointer.y - fo.y
+      if (W !== lastW || H !== lastH) {
+        lastW = W
+        lastH = H
+        U = unit(W, H)
+      }
 
       // Options.
       const o = f.options
@@ -179,7 +189,7 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
       }
       // Pointer: pressing near a light sends a mote from it to the other.
       if (f.pointer.down && f.pointer.inside && !reduced && rand() < dt * 5) {
-        const near = Math.abs(f.pointer.x - lx[0]!.value) < Math.abs(f.pointer.x - lx[1]!.value) ? 0 : 1
+        const near = Math.abs(px - lx[0]!.value) < Math.abs(px - lx[1]!.value) ? 0 : 1
         emit(near, 0.6, 0.15 + 0.3 * rand(), 0, 1, 0.5, 1)
       }
 
@@ -220,7 +230,7 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
         lr[k]!.step(t, dt)
       }
       placed = true
-      arcMax = 2 * (Math.min(ly[0]!.value, ly[1]!.value) - MARGIN)
+      arcMax = 2 * (Math.min(ly[0]!.value, ly[1]!.value) + fo.y - MARGIN)
 
       // Colours: grey when idle, otherwise each light its own colour; the light whose turn it
       // is shifts with the voice (register → hue).
@@ -235,7 +245,7 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
       glowYou.paint(dark ? c0 : mixInto(tmp, c0, p.bg, 0.15), 0.08, 2.2)
       glowVoice.paint(dark ? c1 : mixInto(tmp, c1, p.bg, 0.15), 0.08, 2.2)
 
-      clear2d(g, dpr)
+      clear2d(g, dpr, fo) // whole canvas cleared; (0, 0) is the box's top-left corner
       const comp: GlobalCompositeOperation = dark ? "lighter" : "source-over"
       g.globalCompositeOperation = comp
 
@@ -375,7 +385,7 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
       // Hover: the light under the pointer swells its glow.
       if (f.pointer.inside) {
         for (let k = 0; k < 2; k++) {
-          const d = Math.hypot(f.pointer.x - lx[k]!.value, f.pointer.y - ly[k]!.value)
+          const d = Math.hypot(px - lx[k]!.value, py - ly[k]!.value)
           const near = clamp01(1 - d / (U * 0.18))
           if (near <= 0) continue
           glowSoft.paint(k === 0 ? c0 : c1, 0.1, 2)
@@ -392,7 +402,8 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
 const character: Character = {
   id: "twin-lights",
   name: "Twin lights",
-  version: "1.0.0",
+  version: "1.1.0",
+  canvas: "stage",
   contract: 1,
   family: "abstract",
   renderer: "2d",
@@ -417,7 +428,7 @@ const character: Character = {
     { signal: "active.brightness", effect: "Whiter core of the speaker's light (dark theme)." },
     { signal: "mode", effect: "Which light is large, which way motes fly, apart vs circling, grey vs colour; 350 ms crossfade on springs." },
     { signal: "pointer", effect: "Hovering a light swells its glow; pressing near one sends motes from it to the other." },
-    { signal: "options", effect: "Size, distance apart, which side is yours, flight height, mote tails, motion speed, glow and style (glowing / flat / rings) change every mode; they glide over 0.2–0.3 s (snap under reduced motion). Swapping sides sends the lights past each other. Distance and flight height are capped so lights and motes stay inside the canvas." },
+    { signal: "options", effect: "Size, distance apart, which side is yours, flight height, mote tails, motion speed, glow and style (glowing / flat / rings) change every mode; they glide over 0.2–0.3 s (snap under reduced motion). Swapping sides sends the lights past each other. Distance is capped so the lights stay inside the box; motes and glow may fly out over the page." },
     { signal: "reducedMotion", effect: "No motes, orbit, breathing or creeping path; a still dotted path with chevrons shows which way the words go, light sizes show whose turn it is." }
   ],
   options: [

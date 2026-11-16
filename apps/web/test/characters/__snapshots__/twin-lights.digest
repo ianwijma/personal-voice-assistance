@@ -1,4 +1,4 @@
-# twin-lights 1.0.0: frame digests of a scripted conversation at default settings (docs/CHARACTERS.md §6.6).
+# twin-lights 1.1.0: frame digests of a scripted conversation at default settings (docs/CHARACTERS.md §6.6).
 # A change here must be deliberate: check the look, then update with `pnpm --filter @pva/web exec vitest run test/characters -u`.
 dark  0.5 idle         13 704f8866
 dark  1.0 listening    28 bdc1e9e0
@@ -47,3 +47,26 @@ light 11.0 idle         28 5e397460
 overflow 160×140×1 1.3 px
 overflow 900×420×1 0.0 px
 overflow 720×240×2 0.0 px
+stage  0.5 idle         13 6d02e1e6
+stage  1.0 listening    28 b21ee460
+stage  1.5 listening    28 432f8329
+stage  2.0 hearing      29 cb3c37a8
+stage  2.5 hearing      39 c6405414
+stage  3.0 hearing      53 c965a268
+stage  3.5 hearing      48 cc1eaa39
+stage  4.0 hearing      41 6bb6dadd
+stage  4.5 hearing      44 94689022
+stage  5.0 thinking     37 1ec64db4
+stage  5.5 thinking     23 798c7e37
+stage  6.0 thinking     16 64fa7f37
+stage  6.5 speaking     19 eb6b484f
+stage  7.0 speaking     26 12ac2ae5
+stage  7.5 speaking     40 0dd97540
+stage  8.0 speaking     48 70f1d4ed
+stage  8.5 speaking     44 1b8f65d2
+stage  9.0 speaking     27 9f463dc6
+stage  9.5 listening    32 75f47b9a
+stage 10.0 listening    29 2ca85419
+stage 10.5 idle         35 6c66728a
+stage 11.0 idle         28 f877cb49
+stage 1280×800×1 focus 720×240 at 280,200: solid drawing x 387.2..824.9, y 222.7..408.6
