@@ -72,11 +72,14 @@ export function ServerPage({ page, extra }: { readonly page: NavPage; readonly e
   })?.option.label
 
   const notInUse = !page.inUse
+  // A merged page can hold protected and unprotected forms: while the vault is locked only the protected ones are
+  // read-only, so Save and Cancel are there for the others.
+  const someEditable = forms.views.some((v) => !v.def.readOnly && v.def.form.fields.some((f) => f.locked === undefined))
   return (
     <div className="flex flex-1 flex-col" data-testid={`page-${page.group}-${page.id}`} data-locked={editable ? undefined : "true"}>
       <div className="flex flex-1 flex-col gap-7 pb-8">
         {forms.views.some((v) => v.def.form.fields.some((f) => f.locked === undefined)) && <div className="-mb-3"><MarkerLegend device={false} /></div>}
-        {!editable && <KeysLocked />}
+        {!editable && <KeysLocked partly={someEditable} />}
         {notInUse && sections.length > 0 && <NotInUse />}
         {page.id === "modules" && pageModules.length === 0 && (
           <p className="rounded-md border border-dashed border-line px-4 py-5 text-[14px] text-ink-muted" data-testid="no-modules">No modules are installed.</p>
@@ -96,7 +99,7 @@ export function ServerPage({ page, extra }: { readonly page: NavPage; readonly e
                   fieldKey={field.key}
                   view={forms.views.find((v) => v.def.key === `m:${m.id}` && v.def.only !== undefined)}
                   forms={forms}
-                  editable={editable}
+                  editable={!view.def.readOnly && (m.protected !== true || admin)}
                   saved={values.get(field.key)}
                 />
               )
@@ -108,7 +111,7 @@ export function ServerPage({ page, extra }: { readonly page: NavPage; readonly e
         ))}
         {extra}
       </div>
-      {editable && (forms.views.some((v) => !v.def.readOnly && v.def.form.fields.some((f) => f.locked === undefined)) || forms.dirty) && <PageFooter forms={forms} commitVia={commitVia} />}
+      {(someEditable || forms.dirty) && <PageFooter forms={forms} commitVia={commitVia} />}
     </div>
   )
 }
@@ -223,12 +226,12 @@ function FormBlock({ view, forms, heading, vault, renderAfter }: {
 }
 
 /** A protected page while the key vault is locked: say so, and take the vault password right here. */
-function KeysLocked() {
+function KeysLocked({ partly }: { readonly partly: boolean }) {
   return (
     <div className="flex flex-col gap-3 rounded-md border border-line bg-surface-2/40 px-4 py-3" data-testid="keys-locked">
       <p className="flex items-start gap-2 text-[13px] text-ink">
         <Icon name="key" size={15} className="mt-0.5 shrink-0 text-ink-muted" />
-        <span>The keys are locked, so this page cannot be changed. Type the vault password to unlock them.</span>
+        <span>The keys are locked, so {partly ? "some settings on this page" : "this page"} cannot be changed. Type the vault password to unlock them.</span>
       </p>
       <UnlockForm label="Unlock" compact idSuffix="page" />
     </div>
