@@ -38,6 +38,17 @@ export interface AssistantResult {
 }
 
 const OK: AssistantResult = { ok: true }
+
+/**
+ * The server's `withPlacement` (apps/assistant/src/serve/assistants.ts): the assistant added to the list; one already
+ * in it (a device following its type, placed on the type first) gets the phrase instead of a second entry.
+ */
+export const withPlacement = (list: ReadonlyArray<Assignment>, id: string, phrase: string | undefined): ReadonlyArray<Assignment> => {
+  const existing = list.find((x) => x.assistant === id)
+  if (existing === undefined) return [...list, { assistant: id, phrases: phrase !== undefined ? [phrase] : [] }]
+  if (phrase === undefined || existing.phrases.includes(phrase)) return list
+  return list.map((x) => (x === existing ? { ...x, phrases: [...x.phrases, phrase] } : x))
+}
 const fail = (code: ErrorInfo["code"], message: string, extra: { readonly fieldErrors?: ReadonlyArray<FieldError>; readonly warnings?: ReadonlyArray<FieldError> } = {}): AssistantResult => ({
   ok: false,
   error: { code, message, ...extra }
@@ -160,17 +171,6 @@ export interface AssistantsMock {
   readonly touch: (id: string, patch: Partial<AssistantBody>) => boolean
   /** A device was forgotten: its own settings go. */
   readonly forgetDevice: (id: string) => void
-}
-
-/**
- * The server's `withPlacement` (apps/assistant/src/serve/assistants.ts): the assistant added to the list; one already
- * in it (a device following its type, placed on the type first) gets the phrase instead of a second entry.
- */
-export const withPlacement = (list: ReadonlyArray<Assignment>, id: string, phrase: string | undefined): ReadonlyArray<Assignment> => {
-  const existing = list.find((x) => x.assistant === id)
-  if (existing === undefined) return [...list, { assistant: id, phrases: phrase !== undefined ? [phrase] : [] }]
-  if (phrase === undefined || existing.phrases.includes(phrase)) return list
-  return list.map((x) => (x === existing ? { ...x, phrases: [...x.phrases, phrase] } : x))
 }
 
 export const createAssistantsMock = (modules: () => ReadonlyArray<ModuleInfo>): AssistantsMock => {
