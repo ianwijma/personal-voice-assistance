@@ -1,0 +1,49 @@
+# profile-head 1.0.0: frame digests of a scripted conversation at default settings (docs/CHARACTERS.md §6.6).
+# A change here must be deliberate: check the look, then update with `pnpm --filter @pva/web exec vitest run test/characters -u`.
+dark  0.5 idle        308 24387684
+dark  1.0 listening   583 dc064daf
+dark  1.5 listening   324 3f86f679
+dark  2.0 hearing     324 fa0cd2f8
+dark  2.5 hearing     605 37ced7c7
+dark  3.0 hearing     614 40ad998e
+dark  3.5 hearing     620 108cf297
+dark  4.0 hearing     620 db672da4
+dark  4.5 hearing     629 e66f3982
+dark  5.0 thinking    684 54d81ea8
+dark  5.5 thinking    738 037b4338
+dark  6.0 thinking    467 f63241ca
+dark  6.5 speaking    443 4bc7eee7
+dark  7.0 speaking    448 f98c81df
+dark  7.5 speaking    372 fbf9533c
+dark  8.0 speaking    369 c1fb68e0
+dark  8.5 speaking    363 3a4e761c
+dark  9.0 speaking    354 b4425b09
+dark  9.5 listening   629 5e1e269c
+dark 10.0 listening   339 3e35b0f4
+dark 10.5 idle        336 439971c5
+dark 11.0 idle        605 1d1bb56d
+light  0.5 idle        308 62230da5
+light  1.0 listening   583 678482aa
+light  1.5 listening   324 1644dddd
+light  2.0 hearing     324 963017c7
+light  2.5 hearing     605 dcc34217
+light  3.0 hearing     614 b3f42a16
+light  3.5 hearing     620 38a0b292
+light  4.0 hearing     620 af29a138
+light  4.5 hearing     629 3140e28c
+light  5.0 thinking    684 2106d7e7
+light  5.5 thinking    738 46eb08b2
+light  6.0 thinking    467 6bbccf05
+light  6.5 speaking    443 53020e64
+light  7.0 speaking    448 ecf1fd6f
+light  7.5 speaking    372 76ae44ad
+light  8.0 speaking    369 daed54a8
+light  8.5 speaking    363 5e603318
+light  9.0 speaking    354 9396d69b
+light  9.5 listening   629 922d9d7e
+light 10.0 listening   339 6b664a7f
+light 10.5 idle        336 28a4e770
+light 11.0 idle        605 d848563e
+overflow 160×140×1 0.0 px
+overflow 900×420×1 0.0 px
+overflow 720×240×2 0.0 px
