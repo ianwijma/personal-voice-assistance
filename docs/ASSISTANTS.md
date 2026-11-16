@@ -424,7 +424,10 @@ RouteGate.replyStarted(assistant, now) / replyEnded(assistant, followUpMs, now)
   a phrase or dropped.
 - With the other two modes it accepts every utterance, as today's `always` does, but still matches and strips a
   leading phrase and tags the target.
-- `wake` and `wake.heard` gain the assistant.
+- `wake` and `wake.heard` gain the assistant. `wake.heard` carries it as `source: { deviceId?, assistantId? }`: the
+  device whose audio it was and the assistant the matched phrase belongs to there (both optional; the whole field is
+  absent from an older server). The admin tester shows exactly that and derives nothing from its session list or the
+  saved assignments; only a line without `source` is still worked out by the page.
 - The "awake" state is per assistant: an open armed or follow-up window names one assistant.
 - `wakeConfigFromProfile` (WakeGate.ts:69) is replaced by `routeConfigFrom(deviceSettings, assistants)`. The gate is
   reconfigured only when that part changes, which drops a held utterance, as today (VoiceSession.ts:354-362).

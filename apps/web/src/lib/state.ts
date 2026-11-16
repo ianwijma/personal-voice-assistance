@@ -89,9 +89,15 @@ export interface HeardLine {
   readonly accepted?: boolean
   readonly at: number
   /**
-   * Set by the phrase tester when it first shows the line: the device it was tested on and the assistant the matched
-   * phrase woke there, with that device's settings then. Kept with the line, so a later tester (another device's
-   * page, or the same page after a save) neither relabels it nor shows it as its own.
+   * Where the server heard it (`wake.heard.source`): the device, and the assistant the matched phrase belongs to
+   * there. Shown as it is; the tester derives nothing for such a line. Absent from an older server.
+   */
+  readonly source?: { readonly deviceId?: string; readonly assistantId?: string }
+  /**
+   * Only for a line without `source` (an older server): set by the phrase tester when it first shows the line, the
+   * device it was tested on and the assistant the matched phrase woke there, with that device's settings then. Kept
+   * with the line, so a later tester (another device's page, or the same page after a save) neither relabels it nor
+   * shows it as its own.
    */
   readonly judged?: HeardJudgement
 }
@@ -491,7 +497,13 @@ const server: ServerHandlers = {
     ...s,
     heard: [
       ...s.heard,
-      { text: m.text, ...(m.matched === undefined ? {} : { matched: m.matched }), ...(m.accepted === undefined ? {} : { accepted: m.accepted }), at: m.at }
+      {
+        text: m.text,
+        ...(m.matched === undefined ? {} : { matched: m.matched }),
+        ...(m.accepted === undefined ? {} : { accepted: m.accepted }),
+        ...(m.source === undefined ? {} : { source: m.source }),
+        at: m.at
+      }
     ].slice(-MAX_HEARD)
   }),
   session: (s, m) => ({ ...s, session: { ...s.session, role: m.role, ownerPresent: m.ownerPresent } }),

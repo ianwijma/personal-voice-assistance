@@ -109,9 +109,16 @@ export interface SessionHub {
   /**
    * One final transcript of a session, for admin connections with the phrase tester on that follow it (`wake.heard`;
    * `wake.test.deviceId`, else the most recently active session): the phrase it matched, and whether its wake gate
-   * accepted it.
+   * accepted it. `source`: the session's device and the matched phrase's assistant there, sent as they are, so the
+   * page does not have to guess which device a line came from.
    */
-  readonly wakeHeard: (key: string, text: string, phrase: string | undefined, accepted: boolean) => void
+  readonly wakeHeard: (
+    key: string,
+    text: string,
+    phrase: string | undefined,
+    accepted: boolean,
+    source: { readonly deviceId?: string; readonly assistantId?: string }
+  ) => void
 }
 
 export interface HubOptions {
@@ -1081,9 +1088,9 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
       for (const client of clients) sendVault(client)
     },
     refreshProfiles,
-    wakeHeard: (key, text, phrase, accepted) => {
+    wakeHeard: (key, text, phrase, accepted, source) => {
       const at = Date.now()
-      const message = encodeServerMessage({ type: "wake.heard", text, ...(phrase !== undefined ? { matched: phrase } : {}), accepted, at })
+      const message = encodeServerMessage({ type: "wake.heard", text, ...(phrase !== undefined ? { matched: phrase } : {}), accepted, source, at })
       const mostRecent = sessions.mostRecent()?.key
       for (const client of clients) {
         if (!client.helloed || client.wakeTestUntil <= at) continue

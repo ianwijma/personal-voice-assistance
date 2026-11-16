@@ -669,7 +669,14 @@ export const serverExamples: { readonly [T in ServerMessageType]: Extract<Server
   "frontends": { type: "frontends", frontends: [exampleFrontend] },
   "devices": { type: "devices", devices: [exampleDevice] },
   "wake": { type: "wake", phrase: "hey jeff", armed: true },
-  "wake.heard": { type: "wake.heard", text: "Hey go, what time is it?", at: 1_763_100_001_000 },
+  "wake.heard": {
+    type: "wake.heard",
+    text: "Hey Jeff, what time is it?",
+    matched: "hey jeff",
+    accepted: true,
+    source: { deviceId: exampleDevice.id, assistantId: exampleAssistant.id },
+    at: 1_763_100_001_000
+  },
   "conversation": { type: "conversation", id: "e1a7c3f9-2b4d-4e6a-8c0f-3d5b7a9e1c02", reason: "idle", startedAt: 1_763_100_600_000 },
   "sessions": { type: "sessions", sessions: [exampleSession] },
   "trace": { type: "trace", key: exampleDevice.id, deviceId: exampleDevice.id, trace: { ...exampleTrace, session: exampleDevice.name } },
