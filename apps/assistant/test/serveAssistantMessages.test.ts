@@ -636,3 +636,63 @@ describe("voice connection without a device", () => {
     expect(await request(client, { type: "device.pick", withoutPhrase: "alpha" })).toMatchObject({ ok: false, error: { code: "bad_message" } })
   })
 })
+
+describe("changes that must hold together", () => {
+  it("a type's defaults are refused when a device that follows them would no longer hold together", async () => {
+    await start()
+    const { client: page } = await voice()
+    const a = await admin()
+    await deviceKnown(a, page.device.id)
+    const device = { kind: "device", id: page.device.id } as const
+    const type = { kind: "type", type: "web-voice" } as const
+    // The device answers as Bravo without a phrase (its own section) and follows the type's list (Alpha and Bravo).
+    expect(await request(a, { type: "device.save", target: device, rev: deviceOf(a, page.device.id).rev, settings: { withoutPhrase: { mode: "assistant", assistant: "bravo" } } }))
+      .toMatchObject({ ok: true })
+    const rev = typeOf(a).rev
+    const onlyAlpha = { assistants: [{ assistant: "alpha", phrases: ["hey alpha"] }] }
+    expect(await request(a, { type: "device.save", target: type, rev, settings: onlyAlpha })).toMatchObject({
+      ok: false,
+      error: { code: "invalid_settings", message: expect.stringContaining("bravo") }
+    })
+    expect(typeOf(a).rev).toBe(rev)
+    expect(deviceOf(a, page.device.id).settings.assistants.map((x: any) => x.assistant)).toEqual(["alpha", "bravo"])
+    // Once the device follows the type's withoutPhrase again, the same defaults are saved.
+    expect(await request(a, { type: "device.save", target: device, rev: deviceOf(a, page.device.id).rev, settings: { withoutPhrase: null } })).toMatchObject({ ok: true })
+    expect(await request(a, { type: "device.save", target: type, rev, settings: onlyAlpha })).toMatchObject({ ok: true })
+  })
+
+  it("two creates with the same name at once: one is created, the other is refused as a taken name", async () => {
+    await start()
+    const a = await admin()
+    await refresh(a)
+    const results = await Promise.all([
+      request(a, { type: "assistant.create", assistant: body("Desk") }),
+      request(a, { type: "assistant.create", assistant: body("Desk") })
+    ])
+    expect(results.filter((r) => r.ok)).toHaveLength(1)
+    expect(results.find((r) => !r.ok)).toMatchObject({ ok: false, error: { code: "invalid_settings", fieldErrors: [{ key: "name" }] } })
+    const pushed = await a.waitFor("assistants", (m) => m.assistants.some((x) => x.name === "Desk"), { from: 0 })
+    expect(pushed.assistants.filter((x) => x.name === "Desk")).toHaveLength(1)
+  })
+
+  it("before its session exists, a device gives each assistant its own conversation id, and the session keeps them", async () => {
+    await start()
+    const { client: page } = await voice()
+    const read = async (assistantId: string) => {
+      const requestId = `read-${++seq}`
+      const from = page.messages.length
+      page.send({ type: "conversation.read", requestId, assistantId })
+      return (await page.waitFor("conversation.history", (m) => m.requestId === requestId, { from })).id
+    }
+    const alpha = await read("alpha")
+    const bravo = await read("bravo")
+    expect(bravo).not.toBe(alpha)
+    expect(await read("bravo")).toBe(bravo)
+    expect(await read("alpha")).toBe(alpha)
+    // The session opens; both assistants start in the ids read before.
+    await typed(page, "hello to alpha", "alpha")
+    await typed(page, "hello to bravo", "bravo")
+    expect(await read("alpha")).toBe(alpha)
+    expect(await read("bravo")).toBe(bravo)
+  })
+})
