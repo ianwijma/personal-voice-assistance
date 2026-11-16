@@ -123,7 +123,7 @@ export function ConnectingHint() {
   }, [])
   if (!late) return null
   return (
-    <p className="max-w-[420px] text-center text-[14px] text-ink-muted animate-[pva-fade-in_320ms_var(--ease-out)]">
+    <p className="stage-legible max-w-[420px] text-center text-[14px] text-ink-muted animate-[pva-fade-in_320ms_var(--ease-out)]">
       Is the assistant running? Start it with <code className="font-mono text-[13px] text-ink">pnpm start serve</code>.
     </p>
   )
@@ -166,13 +166,13 @@ export function StartHint() {
   const kbd = (k: string) => <kbd className="font-mono text-ink-muted">{k}</kbd>
   if (v.muted) {
     return (
-      <p data-testid="start-hint" className="text-center text-[13px] text-ink-faint animate-[pva-fade-in_320ms_var(--ease-out)]">
+      <p data-testid="start-hint" className="stage-legible text-center text-[13px] text-ink-faint animate-[pva-fade-in_320ms_var(--ease-out)]">
         {touch || !keys ? "Tap the microphone to unmute." : <>Press {kbd("M")} or the microphone to unmute.</>}
       </p>
     )
   }
   return (
-    <p data-testid="start-hint" className="text-center text-[13px] text-ink-faint animate-[pva-fade-in_320ms_var(--ease-out)]">
+    <p data-testid="start-hint" className="stage-legible text-center text-[13px] text-ink-faint animate-[pva-fade-in_320ms_var(--ease-out)]">
       {v.asleep ? "…then ask." : "Speak any time."}{" "}
       {touch ? (
         "Tap the microphone to mute, the square to stop a reply."
