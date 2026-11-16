@@ -3,8 +3,8 @@
  * the isolation rules of docs/CHARACTERS.md §4.6, and what it puts in the frame.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
-import type { Character, CharacterChoice, Frame, Mode } from "@/characters/contract.ts"
-import { type AudioTaps, type CharacterHost, type HostInput, type HostOptions, startCharacterHost } from "@/characters/host.ts"
+import type { Character, CharacterChoice, Focus, Frame, Mode, Pointer } from "@/characters/contract.ts"
+import { type AudioTaps, type CharacterHost, type HostInput, type HostOptions, STAGE_MAX_PIXELS, stageRatio, startCharacterHost } from "@/characters/host.ts"
 import { BASELINE_ID, registry as appRegistry, type Registry } from "@/characters/registry.ts"
 import { installFakeCanvas } from "./support/fakeCanvas.ts"
 import { installPage, type Page } from "./support/page.ts"
@@ -14,7 +14,9 @@ installFakeCanvas()
 
 /** A character that keeps a copy of what each frame told it, and can be told to fail or to be slow. */
 const spy = (over: Partial<Character> & { readonly onFrame?: (f: Frame) => void; readonly onCreate?: () => void; readonly onResize?: () => void } = {}) => {
-  const seen: Array<{ mode: Mode; coreMode: string; prevMode: Mode; modeAge: number; sinceInterrupt: number; ext: object; reduced: boolean; userLevel: number; userSpeaking: boolean; agentLevel: number; agentRms: number; options: object; you: readonly number[] }> = []
+  const seen: Array<{ mode: Mode; coreMode: string; prevMode: Mode; modeAge: number; sinceInterrupt: number; ext: object; reduced: boolean; userLevel: number; userSpeaking: boolean; agentLevel: number; agentRms: number; options: object; you: readonly number[]; focus: Focus; pointer: Pointer }> = []
+  const resizes: Array<readonly [number, number, number]> = []
+  const canvases: Array<HTMLCanvasElement> = []
   let disposed = 0
   const { onFrame, onCreate, onResize, ...manifest } = over
   const c: Character = {
@@ -30,11 +32,15 @@ const spy = (over: Partial<Character> & { readonly onFrame?: (f: Frame) => void;
     renderer: "2d",
     create: (canvas) => {
       onCreate?.()
+      canvases.push(canvas)
       canvas.getContext(c.renderer === "webgl2" ? "webgl2" : "2d")
       return {
-        resize: () => onResize?.(),
+        resize: (w, h, d) => {
+          resizes.push([w, h, d])
+          onResize?.()
+        },
         frame: (f) => {
-          seen.push({ mode: f.mode, coreMode: f.coreMode, prevMode: f.prevMode, modeAge: f.modeAge, sinceInterrupt: f.sinceInterrupt, ext: f.ext, reduced: f.reducedMotion, userLevel: f.user.level, userSpeaking: f.user.speaking, agentLevel: f.agent.level, agentRms: f.agent.rms, options: { ...f.options }, you: [...f.palette.you] })
+          seen.push({ mode: f.mode, coreMode: f.coreMode, prevMode: f.prevMode, modeAge: f.modeAge, sinceInterrupt: f.sinceInterrupt, ext: f.ext, reduced: f.reducedMotion, userLevel: f.user.level, userSpeaking: f.user.speaking, agentLevel: f.agent.level, agentRms: f.agent.rms, options: { ...f.options }, you: [...f.palette.you], focus: { ...f.focus }, pointer: { ...f.pointer } })
           onFrame?.(f)
         },
         dispose: () => {
@@ -44,7 +50,7 @@ const spy = (over: Partial<Character> & { readonly onFrame?: (f: Frame) => void;
     },
     ...manifest
   }
-  return { character: c, seen, disposed: () => disposed }
+  return { character: c, seen, resizes, canvases, disposed: () => disposed }
 }
 
 /** A registry with the real baseline and the given characters, each loaded lazily through a spy. */
@@ -394,5 +400,182 @@ describe("the loop and the canvas", () => {
     const n = s.seen.length
     page.frames(5)
     expect(s.seen.length).toBe(n)
+  })
+})
+
+describe("the full stage (docs/CHARACTERS.md §2.6)", () => {
+  /** Layout for jsdom (which has none): the stage layer covers the window, the box sits where the page puts it. */
+  let layer: HTMLDivElement
+  let layerRect = { left: 0, top: 0, width: 1280, height: 800 }
+  let boxRect = { left: 280, top: 197, width: 720, height: 240 }
+  const rect = (r: { left: number; top: number; width: number; height: number }) => ({ ...r, x: r.left, y: r.top, right: r.left + r.width, bottom: r.top + r.height, toJSON: () => r }) as DOMRect
+  let restoreRects: () => void = () => undefined
+  const setRatio = (d: number) => Object.defineProperty(window, "devicePixelRatio", { configurable: true, value: d })
+
+  beforeEach(() => {
+    layer = document.createElement("div")
+    document.body.prepend(layer)
+    layerRect = { left: 0, top: 0, width: 1280, height: 800 }
+    boxRect = { left: 280, top: 197, width: 720, height: 240 }
+    const original = Element.prototype.getBoundingClientRect
+    Element.prototype.getBoundingClientRect = function (this: Element) {
+      if (this === layer || (this instanceof HTMLElement && this.dataset.characterCanvas === "stage")) return rect(layerRect)
+      if (this === canvas || (this instanceof HTMLCanvasElement && this.parentElement === canvas.parentElement)) return rect(boxRect)
+      return original.call(this)
+    }
+    restoreRects = () => {
+      Element.prototype.getBoundingClientRect = original
+    }
+    setRatio(1)
+  })
+  afterEach(() => {
+    restoreRects()
+    setRatio(1)
+  })
+
+  const stageCanvases = () => layer.querySelectorAll("canvas")
+
+  it("gives a stage character a canvas of its own filling the layer, the stage's size, and the box as its focus", async () => {
+    const s = spy({ canvas: "stage" })
+    const { reg } = registryOf({ spy: s.character })
+    const host = start({ state: "idle", owner: false }, { character: "spy" }, { registry: reg, stage: layer })
+    await host.ready()
+    expect(stageCanvases()).toHaveLength(1)
+    const own = stageCanvases()[0]!
+    expect(s.canvases).toEqual([own])
+    expect(own.style.pointerEvents).toBe("none")
+    expect(own.getAttribute("aria-hidden")).toBe("true")
+    expect(canvas.style.visibility).toBe("hidden") // the box stays in the layout as the focus placeholder
+    expect(s.resizes).toEqual([[1280, 800, 1]])
+    expect([own.width, own.height]).toEqual([1280, 800])
+    expect(s.seen.at(-1)!.focus).toEqual({ x: 280, y: 197, width: 720, height: 240 })
+    expect(host.debug()).toMatchObject({ id: "spy", canvas: "stage", size: { width: 1280, height: 800, ratio: 1 }, focus: { x: 280, y: 197, width: 720, height: 240 } })
+  })
+
+  it("moves the focus with the box from one frame to the next, without a resize", async () => {
+    const s = spy({ canvas: "stage" })
+    const { reg } = registryOf({ spy: s.character })
+    const host = start({ state: "idle", owner: false }, { character: "spy" }, { registry: reg, stage: layer })
+    await host.ready()
+    page.frames(2)
+    boxRect = { left: 80, top: 150, width: 640, height: 200 } // the chat panel slid the stage aside, the layout scaled
+    page.frames(1)
+    expect(s.seen.at(-1)!.focus).toEqual({ x: 80, y: 150, width: 640, height: 200 })
+    layerRect = { ...layerRect, left: 10, top: 20 } // a layer that is not at the window's corner: focus is relative to it
+    page.frames(1)
+    expect(s.seen.at(-1)!.focus).toEqual({ x: 70, y: 130, width: 640, height: 200 })
+    expect(s.resizes).toHaveLength(1)
+  })
+
+  it("gives a stage character the pointer from the window, in its canvas's coordinates; a box character keeps the box's", async () => {
+    const s = spy({ canvas: "stage" })
+    const b = spy({ id: "boxed" })
+    const { reg } = registryOf({ spy: s.character, boxed: b.character })
+    const host = start({ state: "idle", owner: false }, { character: "spy" }, { registry: reg, stage: layer })
+    await host.ready()
+    const fire = (type: string, x: number, y: number, on: EventTarget = document.body, init: MouseEventInit = {}) => on.dispatchEvent(new MouseEvent(type, { bubbles: true, clientX: x, clientY: y, ...init }))
+    fire("pointermove", 50, 700) // over the dock, far from the box
+    page.frames(1)
+    expect(s.seen.at(-1)!.pointer).toEqual({ x: 50, y: 700, down: false, inside: true })
+    fire("pointerdown", 60, 710)
+    page.frames(1)
+    expect(s.seen.at(-1)!.pointer).toMatchObject({ x: 60, y: 710, down: true })
+    fire("pointerup", 60, 710)
+    fire("pointerout", 60, 710, document.body, { relatedTarget: null }) // left the window
+    page.frames(1)
+    expect(s.seen.at(-1)!.pointer).toMatchObject({ down: false, inside: false })
+    host.setChoice({ character: "boxed" })
+    await host.ready()
+    fire("pointerenter", 300, 207, canvas.parentElement!)
+    fire("pointermove", 300, 207, canvas.parentElement!)
+    page.frames(1)
+    expect(b.seen.at(-1)!.pointer).toEqual({ x: 20, y: 10, down: false, inside: true })
+  })
+
+  it("switches between box and stage characters at run time, both ways, with nothing left behind", async () => {
+    const boxed = spy({ id: "boxed" })
+    const gl = spy({ id: "gl", renderer: "webgl2", canvas: "stage" })
+    const { reg } = registryOf({ boxed: boxed.character, gl: gl.character })
+    const host = start({ state: "idle", owner: false }, undefined, { registry: reg, stage: layer })
+    // The baseline is a stage character.
+    expect(host.debug()).toMatchObject({ id: BASELINE_ID, canvas: "stage" })
+    expect(stageCanvases()).toHaveLength(1)
+    expect(canvas.style.visibility).toBe("hidden")
+    host.setChoice({ character: "boxed" })
+    await host.ready()
+    expect(host.debug()).toMatchObject({ id: "boxed", canvas: "box", size: { width: 720, height: 240 } })
+    expect(stageCanvases()).toHaveLength(0)
+    expect(canvas.style.visibility).toBe("")
+    expect(boxed.canvases).toEqual([canvas])
+    expect(boxed.seen.at(-1)!.focus).toEqual({ x: 0, y: 0, width: 720, height: 240 })
+    host.setChoice({ character: "gl" })
+    await host.ready()
+    expect(host.debug()).toMatchObject({ id: "gl", canvas: "stage", renderer: "webgl2" })
+    expect(stageCanvases()).toHaveLength(1)
+    expect(gl.canvases).toEqual([stageCanvases()[0]])
+    expect(canvas.parentElement!.querySelectorAll("canvas")).toHaveLength(1)
+    host.setChoice(undefined)
+    expect(gl.disposed()).toBe(1)
+    expect(host.debug()).toMatchObject({ id: BASELINE_ID, canvas: "stage" })
+    expect(stageCanvases()).toHaveLength(1)
+    host.stop()
+    expect(stageCanvases()).toHaveLength(0)
+    expect(canvas.style.visibility).toBe("")
+  })
+
+  it("a failing stage character falls back to the baseline on the stage, and its canvas goes", async () => {
+    let n = 0
+    const s = spy({ canvas: "stage", onFrame: () => { if (++n > 2) throw new Error("frame broke") } })
+    const { reg } = registryOf({ spy: s.character })
+    const host = start({ state: "idle", owner: false }, { character: "spy" }, { registry: reg, stage: layer })
+    await host.ready()
+    page.frames(5)
+    expect(host.debug()).toMatchObject({ id: BASELINE_ID, canvas: "stage", fallback: { id: "spy", reason: "frame" } })
+    expect(stageCanvases()).toHaveLength(1)
+    expect(stageCanvases()[0]).not.toBe(s.canvases[0])
+  })
+
+  it("without a stage layer, a stage character gets the box and the whole canvas as its focus", async () => {
+    const s = spy({ canvas: "stage" })
+    const { reg } = registryOf({ spy: s.character })
+    const host = start({ state: "idle", owner: false }, { character: "spy" }, { registry: reg })
+    await host.ready()
+    expect(host.debug()).toMatchObject({ canvas: "box", size: { width: 720, height: 240 } })
+    expect(s.canvases).toEqual([canvas])
+    expect(s.seen.at(-1)!.focus).toEqual({ x: 0, y: 0, width: 720, height: 240 })
+  })
+
+  it("caps a stage canvas's backing store, not a box's; follows a change of pixel ratio", async () => {
+    const s = spy({ canvas: "stage" })
+    const boxed = spy({ id: "boxed" })
+    const { reg } = registryOf({ spy: s.character, boxed: boxed.character })
+    layerRect = { left: 0, top: 0, width: 1920, height: 1080 }
+    setRatio(2)
+    const host = start({ state: "idle", owner: false }, { character: "spy" }, { registry: reg, stage: layer })
+    await host.ready()
+    const [w, h, d] = s.resizes.at(-1)!
+    expect([w, h]).toEqual([1920, 1080])
+    expect(d).toBeCloseTo(Math.sqrt(STAGE_MAX_PIXELS / (1920 * 1080)), 9)
+    const own = stageCanvases()[0]!
+    expect(own.width * own.height).toBeLessThanOrEqual(STAGE_MAX_PIXELS * 1.002)
+    expect(host.debug().size.ratio).toBe(d)
+    setRatio(1)
+    page.frames(2)
+    expect(s.resizes.at(-1)).toEqual([1920, 1080, 1])
+    setRatio(2)
+    host.setChoice({ character: "boxed" })
+    page.frames(2)
+    await host.ready()
+    expect(boxed.resizes.at(-1)).toEqual([720, 240, 2])
+    expect(canvas.width).toBe(1440)
+  })
+
+  it("the cap: ratio lowered to fit, never below 1 (or the device's own), never above the device's", () => {
+    expect(stageRatio(1280, 800, 2)).toBe(2) // 4.1 M device pixels: fits
+    expect(stageRatio(1920, 1080, 2)).toBeCloseTo(1.4235, 3)
+    expect(stageRatio(390, 844, 3)).toBe(3) // a phone: 2.96 M device pixels, under the cap
+    expect(stageRatio(3840, 2160, 1)).toBe(1)
+    expect(stageRatio(3840, 2160, 0.8)).toBe(0.8)
+    expect(stageRatio(1920, 1080, 1, 1_000_000)).toBe(1)
   })
 })
