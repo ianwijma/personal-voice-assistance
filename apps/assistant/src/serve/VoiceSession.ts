@@ -126,8 +126,8 @@ export interface VoiceSessionOptions {
   readonly turnTrace: TurnTrace["Service"]
   /** To every connection of this device. */
   readonly send: (message: ServerMessage) => void
-  /** One final transcript, for the phrase tester (`wake.heard`). */
-  readonly wakeHeard: (text: string, phrase: string | undefined, accepted: boolean) => void
+  /** One final transcript, for the phrase tester (`wake.heard`; `assistant`: whose phrase matched here, if anyone's). */
+  readonly wakeHeard: (text: string, phrase: string | undefined, accepted: boolean, assistant: string | undefined) => void
   /** Something admin's `sessions` shows changed (state, a turn, the conversation). */
   readonly onChange: (minor: boolean) => void
   /** A committed turn ended (the recent traces of every session, for admin). */
@@ -689,7 +689,7 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
           } else if (heardStopped) heardFor = undefined
           else if (routed !== undefined) heardFor = routedTo
           else if (e._tag === "SpeechStarted") heardFor = undefined
-          if (r.heard !== undefined) options.wakeHeard(r.heard.text, r.heard.phrase, r.heard.accepted)
+          if (r.heard !== undefined) options.wakeHeard(r.heard.text, r.heard.phrase, r.heard.accepted, r.heard.assistant)
           if (r.woke !== undefined) {
             // The phrase's utterance is still heard: its new holder goes out before `wake`, which the page shows until the next state.
             holderCheck()

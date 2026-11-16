@@ -47,7 +47,7 @@ export function PhraseTester({ onAdd, phrases: draftPhrases = [], savedPhrases =
   /** Test this device only (the device page), not "the device talking most recently". */
   readonly deviceId?: string
   readonly deviceName?: string
-  /** The assistant a phrase wakes on the tested device (`deviceId`: the device being tested; named after a matched line). */
+  /** Only for a line from an older server (without `source`): the assistant a phrase wakes on the tested device (`deviceId`: the device being tested). */
   readonly wakes?: (phrase: string, deviceId: string | undefined) => string | undefined
   /** The form's phrases now (draft) and as last saved: what "Added" / "Saved" is derived from. */
   readonly phrases?: ReadonlyArray<string>
@@ -77,16 +77,22 @@ export function PhraseTester({ onAdd, phrases: draftPhrases = [], savedPhrases =
   )
   /** The device the server tests: the one asked for, else the one that has the audio. */
   const tested = chosen !== "" ? chosen : owner?.id
+  const assistants = useClientState((s) => s.assistants)
   /**
-   * The device a line was heard on and the assistant a matched line woke, worked out once, when the line is first
-   * shown, from the tested device's settings then, and kept with the line in the store (`local/heard-judged`):
-   * saving other assignments later, or opening another device's page, does not relabel it.
+   * The device a line was heard on and the assistant a matched line woke. A line with `source` says both (the server
+   * knows them): taken as it is, nothing is derived from the sessions or the assignments. Only a line from an older
+   * server, without it, is worked out once, when it is first shown, from the tested device's settings then, and kept
+   * with the line in the store (`local/heard-judged`): saving other assignments later, or opening another device's
+   * page, does not relabel it.
    */
+  const nameOf = (id: string | undefined): string | undefined => (id === undefined ? undefined : assistants.find((x) => x.id === id)?.name ?? id)
   const judge = (l: HeardLine): HeardJudgement =>
-    l.judged ?? { deviceId: tested, woke: l.matched === undefined || wakes === undefined ? undefined : wakes(l.matched, tested) }
+    l.source !== undefined
+      ? { deviceId: l.source.deviceId, woke: l.matched === undefined ? undefined : nameOf(l.source.assistantId) }
+      : l.judged ?? { deviceId: tested, woke: l.matched === undefined || wakes === undefined ? undefined : wakes(l.matched, tested) }
   const wokeBy = (l: HeardLine): string | undefined => (l.matched === undefined ? undefined : judge(l).woke)
   useEffect(() => {
-    const lines = heard.flatMap((l) => (l.judged === undefined ? [{ at: l.at, text: l.text, judged: judge(l) }] : []))
+    const lines = heard.flatMap((l) => (l.judged === undefined && l.source === undefined ? [{ at: l.at, text: l.text, judged: judge(l) }] : []))
     if (lines.length > 0) client.store.dispatch({ type: "local/heard-judged", lines })
   }, [heard])
   const unsaved = useClientState((s) => s.ui.settingsDirty)

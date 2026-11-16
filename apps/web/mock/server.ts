@@ -48,7 +48,7 @@
  * POST /mock/turn (run the scripted voice turn now), POST /mock/send {"messages": [ServerMessage…]} (broadcast),
  * POST /mock/drop (terminate every socket), POST /mock/offline {"ms": 3000} (drop and refuse connections for a while),
  * POST /mock/admin/end {"reason": "idle" | "expired"} (end every admin session), POST /mock/wake {"phrase", "armed"}
- * (the owner said the wake phrase), POST /mock/heard {"text", "matched"?, "accepted"?} (a tester line; `accepted: null` leaves the field out), POST /mock/state
+ * (the owner said the wake phrase), POST /mock/heard {"text", "matched"?, "accepted"?, "source"?} (a tester line; `accepted: null` or `source: null` leaves that field out), POST /mock/state
  * {"state"} (set the assistant state, e.g. "asleep"), POST /mock/defaults {"patch"} (change the web-voice defaults).
  *
  * Protocol 6 (docs/VOICE-SESSIONS.md): one voice session per device (`hello.device.id`; a voice page without one has
@@ -87,6 +87,7 @@ import { randomBytes } from "node:crypto"
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http"
 import {
   hearerOf,
+  phraseKey,
   type AdminState,
   type ClientMessage,
   CloseCode,
@@ -1035,12 +1036,15 @@ const stayAwake = (v: VSession, ms: number) => {
  * A tester line from session `v` to admin connections that switched the tester on and follow that session (a device
  * id, or the most recently active session); without a session, to every tester. `accepted` defaults to what the
  * server's wake gate would say: matched a phrase, always listening, or inside an armed / follow-up window; `null`
- * leaves it out (an older server).
+ * leaves it out (an older server). `source`, as the real server sends it: the session's device and the assistant the
+ * matched phrase belongs to there (its saved assignments); left out without a session, or with `source: null`
+ * (an older server).
  */
-const sendHeard = (v: VSession | undefined, text: string, matched?: string, accepted?: boolean | null) => {
+const sendHeard = (v: VSession | undefined, text: string, matched?: string, accepted?: boolean | null, withSource = true) => {
   const now = Date.now()
   const taken = accepted === undefined ? matched !== undefined || v === undefined || !wakeMode(v) || v.awakeUntil > now : accepted
   const auto = targetSession()
+  const source = v === undefined || !withSource ? undefined : heardSource(v, matched)
   for (const c of conns) {
     if (!c.welcomed || !isAdminConn(c) || c.testerUntil === undefined || c.testerUntil < now) continue
     if (v !== undefined && (c.testerDevice === undefined ? auto !== v : c.testerDevice !== v.deviceId)) continue
@@ -1049,9 +1053,17 @@ const sendHeard = (v: VSession | undefined, text: string, matched?: string, acce
       text,
       ...(matched === undefined ? {} : { matched }),
       ...(taken === null ? {} : { accepted: taken }),
+      ...(source === undefined ? {} : { source }),
       at: now
     })
   }
+}
+/** Where a tester line was heard: the session's device, and whose phrase it matched there (like `RouteGate`'s `heard`). */
+const heardSource = (v: VSession, matched: string | undefined): { deviceId?: string; assistantId?: string } => {
+  const settings = v.deviceId === undefined ? assistantsMock.deviceTypes()[0]?.settings : assistantsMock.deviceFields(v.deviceId).settings
+  const key = matched === undefined ? "" : phraseKey(matched)
+  const who = key === "" || settings === undefined ? undefined : settings.assistants.find((a) => a.phrases.some((p) => phraseKey(p) === key))?.assistant
+  return { ...(v.deviceId === undefined ? {} : { deviceId: v.deviceId }), ...(who === undefined ? {} : { assistantId: who }) }
 }
 /** The session's owner said the wake phrase. */
 const wakeUp = (v: VSession, phrase: string, armed: boolean, assistantId: string | undefined = voice.phraseOwner(v.deviceId, phrase)) => {
@@ -2684,7 +2696,8 @@ const http = createServer((req, res) => {
           typeof payload.deviceId === "string" ? voiceSessions.get(payload.deviceId) : undefined,
           String(payload.text ?? ""),
           typeof payload.matched === "string" ? payload.matched : undefined,
-          typeof payload.accepted === "boolean" ? payload.accepted : payload.accepted === null ? null : undefined
+          typeof payload.accepted === "boolean" ? payload.accepted : payload.accepted === null ? null : undefined,
+          payload.source !== null
         )
         return json(res, 200, { ok: true })
       }
