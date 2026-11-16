@@ -93,7 +93,7 @@ test("the admin page never asks for the microphone and never claims the audio", 
       return original(c)
     }
   })
-  await loginAdmin(page, baseURL, "#settings/devices/type-web-voice")
+  await loginAdmin(page, baseURL, "#settings/devices/type.web-voice")
   await page.getByTestId("tester-listen").click()
   await page.waitForTimeout(500)
   expect(await page.evaluate(() => (window as unknown as { __gum: number }).__gum)).toBe(0)

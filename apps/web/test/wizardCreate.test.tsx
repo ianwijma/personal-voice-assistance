@@ -3,6 +3,8 @@ import { describe, expect, it, vi } from "vitest"
 import type { Outcome } from "@/lib/assistants.ts"
 import type { AssistantClient } from "@/lib/client.ts"
 import { navigateSettings } from "@/lib/settingsTree.ts"
+import { exampleAssistantInfo } from "@pva/protocol/examples"
+import { blankAssistantBody } from "@/lib/assistants.ts"
 import { initialState, reducer } from "@/lib/state.ts"
 import { createStore } from "@/lib/store.ts"
 import { ClientContext } from "@/components/context.tsx"
@@ -14,8 +16,8 @@ vi.mock("@/components/settings/pages/AssistantsPage.tsx", async (importOriginal)
   useVoiceNameOf: () => () => undefined
 }))
 
-const setup = (createAssistant: (...args: ReadonlyArray<unknown>) => Promise<Outcome>) => {
-  const store = createStore({ ...initialState, ui: { ...initialState.ui, settingsOpen: true, settingsPath: ["assistants", "new", "1"] } }, reducer)
+const setup = (createAssistant: (...args: ReadonlyArray<unknown>) => Promise<Outcome>, assistants: typeof initialState.assistants = []) => {
+  const store = createStore({ ...initialState, assistants, ui: { ...initialState.ui, settingsOpen: true, settingsPath: ["assistants", "new", "1"] } }, reducer)
   const create = vi.fn(createAssistant)
   const settings = vi.fn((to: Parameters<AssistantClient["settings"]>[0], options?: { readonly discard?: boolean }) =>
     store.dispatch({ type: "local/ui", patch: navigateSettings(store.get().ui, to, options?.discard === true) })
@@ -110,5 +112,56 @@ describe("New assistant wizard left while it creates (PR #35 review 4, finding 2
     await answer({ kind: "invalid", message: "Not valid.", fieldErrors: [{ key: "name", message: "Taken." }] })
     expect(settings).not.toHaveBeenCalled()
     expect(store.get().ui.settingsPath).toEqual(["devices", "kitchen"])
+  })
+})
+
+// PR #35 review 6, finding 1: Start from › Blank is not an assistant id, so an assistant called Blank (id `blank`) is
+// a copy like any other and choosing Blank gives the defaults.
+describe("New assistant wizard: Start from Blank next to an assistant called Blank", () => {
+  const custom = { ...exampleAssistantInfo, id: "blank", name: "Blank", prompt: "You are the custom Blank." }
+  const other = { ...exampleAssistantInfo, id: "t3", name: "T3", prompt: "You are T3." }
+  const radio = (value: string) => document.querySelector<HTMLElement>(`[role="radio"][data-value="${value}"]`)
+  const radios = () => [...document.querySelectorAll<HTMLElement>('[role="radio"]')]
+
+  it("lists Blank and Copy of Blank as two choices; Blank after a copy restores the defaults and sends no copyOf", async () => {
+    const { create, toStep } = setup(() => new Promise<Outcome>(() => undefined), [custom, other])
+    const values = radios().map((r) => r.dataset.value)
+    expect(new Set(values).size).toBe(values.length)
+    expect(radios().filter((r) => r.getAttribute("aria-checked") === "true")).toHaveLength(1)
+    expect(radios().find((r) => r.getAttribute("aria-checked") === "true")?.textContent).not.toMatch(/Copy of/)
+
+    fireEvent.change(nameField(), { target: { value: "Mia" } })
+    fireEvent.click(radio("t3")!)
+    expect(radio("t3")!.getAttribute("aria-checked")).toBe("true")
+    // Back to Blank: the first card, not the assistant called Blank.
+    const blankCard = radios().find((r) => !(r.textContent ?? "").includes("Copy of"))!
+    fireEvent.click(blankCard)
+    expect(blankCard.getAttribute("aria-checked")).toBe("true")
+    expect(radio("blank")!.getAttribute("aria-checked")).toBe("false")
+
+    toStep(7)
+    expect(screen.getByTestId("check-list").textContent).toContain("Started blank")
+    await act(async () => {
+      fireEvent.click(createButton())
+    })
+    const [body, options] = create.mock.calls[0]! as [{ readonly prompt: string }, { readonly copyOf?: string }]
+    expect(options.copyOf).toBeUndefined()
+    expect(body.prompt).toBe(blankAssistantBody("").prompt)
+    expect(body.prompt).not.toBe(custom.prompt)
+  })
+
+  it("Copy of Blank copies the assistant called Blank and says so on Check", async () => {
+    const { create, toStep } = setup(() => new Promise<Outcome>(() => undefined), [custom, other])
+    fireEvent.change(nameField(), { target: { value: "Mia" } })
+    fireEvent.click(radio("blank")!)
+    toStep(7)
+    expect(screen.getByTestId("check-list").textContent).toContain("Copy of Blank")
+    expect(screen.getByTestId("check-list").textContent).not.toContain("Started blank")
+    await act(async () => {
+      fireEvent.click(createButton())
+    })
+    const [body, options] = create.mock.calls[0]! as [{ readonly prompt: string }, { readonly copyOf?: string }]
+    expect(options.copyOf).toBe("blank")
+    expect(body.prompt).toBe(custom.prompt)
   })
 })
