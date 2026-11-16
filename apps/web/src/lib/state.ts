@@ -86,6 +86,17 @@ export interface HeardLine {
   /** The assistant took it (answered it, or the phrase alone made it listen); absent from an older server. */
   readonly accepted?: boolean
   readonly at: number
+  /**
+   * Set by the phrase tester when it first shows the line: the device it was tested on and the assistant the matched
+   * phrase woke there, with that device's settings then. Kept with the line, so a later tester (another device's
+   * page, or the same page after a save) neither relabels it nor shows it as its own.
+   */
+  readonly judged?: HeardJudgement
+}
+
+export interface HeardJudgement {
+  readonly deviceId: string | undefined
+  readonly woke: string | undefined
 }
 
 /**
@@ -279,6 +290,7 @@ export type LocalAction =
   | { readonly type: "local/profile-overlay-clear" }
   | { readonly type: "local/heard-clear" }
   | { readonly type: "local/playing"; readonly turnId: number | undefined }
+  | { readonly type: "local/heard-judged"; readonly lines: ReadonlyArray<{ readonly at: number; readonly text: string; readonly judged: HeardJudgement }> }
   | { readonly type: "local/request"; readonly requestId: string; readonly kind: string; readonly target?: string }
   | { readonly type: "local/request-done"; readonly requestId: string }
   | { readonly type: "local/toast"; readonly message: string; readonly tone: "error" | "info" }
@@ -585,6 +597,17 @@ const local = (s: ClientState, a: LocalAction): ClientState => {
     case "local/playing":
       if (a.turnId === undefined) return s.audio.playing === undefined ? s : { ...s, audio: withoutPlaying(s.audio) }
       return { ...s, audio: { ...s.audio, playing: { turnId: a.turnId } } }
+    case "local/heard-judged": {
+      let changed = false
+      const heard = s.heard.map((l) => {
+        if (l.judged !== undefined) return l
+        const hit = a.lines.find((x) => x.at === l.at && x.text === l.text)
+        if (hit === undefined) return l
+        changed = true
+        return { ...l, judged: hit.judged }
+      })
+      return changed ? { ...s, heard } : s
+    }
     case "local/request":
       return {
         ...s,

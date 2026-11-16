@@ -2,7 +2,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react"
 import { WAKE_TEST_MAX_MS } from "@pva/protocol"
 import { normalisePhrase, phraseFromHeard } from "@/lib/profileForm.ts"
-import { displayPhrase, type HeardLine, heardOutcome } from "@/lib/state.ts"
+import { displayPhrase, type HeardJudgement, type HeardLine, heardOutcome } from "@/lib/state.ts"
 import { shallowEqual } from "@/lib/store.ts"
 import { useClient, useClientState } from "../context.tsx"
 import { inputClass } from "../fields/types.ts"
@@ -75,16 +75,20 @@ export function PhraseTester({ onAdd, phrases: draftPhrases = [], savedPhrases =
     },
     shallowEqual
   )
+  /** The device the server tests: the one asked for, else the one that has the audio. */
+  const tested = chosen !== "" ? chosen : owner?.id
   /**
-   * The assistant a matched line woke, worked out once, when the line is first shown, from the tested device's
-   * settings then: saving other assignments later does not relabel a line the server judged with the old ones.
+   * The device a line was heard on and the assistant a matched line woke, worked out once, when the line is first
+   * shown, from the tested device's settings then, and kept with the line in the store (`local/heard-judged`):
+   * saving other assignments later, or opening another device's page, does not relabel it.
    */
-  const wokeOf = useRef(new WeakMap<HeardLine, string | undefined>())
-  const wokeBy = (l: HeardLine): string | undefined => {
-    if (l.matched === undefined || wakes === undefined) return undefined
-    if (!wokeOf.current.has(l)) wokeOf.current.set(l, wakes(l.matched, owner?.id))
-    return wokeOf.current.get(l)
-  }
+  const judge = (l: HeardLine): HeardJudgement =>
+    l.judged ?? { deviceId: tested, woke: l.matched === undefined || wakes === undefined ? undefined : wakes(l.matched, tested) }
+  const wokeBy = (l: HeardLine): string | undefined => (l.matched === undefined ? undefined : judge(l).woke)
+  useEffect(() => {
+    const lines = heard.flatMap((l) => (l.judged === undefined ? [{ at: l.at, text: l.text, judged: judge(l) }] : []))
+    if (lines.length > 0) client.store.dispatch({ type: "local/heard-judged", lines })
+  }, [heard])
   const unsaved = useClientState((s) => s.ui.settingsDirty)
   const [until, setUntil] = useState<number | undefined>()
   const [now, setNow] = useState(() => Date.now())
@@ -158,7 +162,8 @@ export function PhraseTester({ onAdd, phrases: draftPhrases = [], savedPhrases =
     if (!result.ok) client.store.dispatch({ type: "local/toast", message: result.error?.message ?? "The tester could not switch devices.", tone: "error" })
   }
 
-  const lines = [...heard].reverse()
+  // A device's page shows the lines heard on that device only (others stay in the store with their own device).
+  const lines = heard.filter((l) => deviceId === undefined || judge(l).deviceId === deviceId).reverse()
   return (
     <div className="flex flex-col gap-3 rounded-md border border-line bg-surface-2/30 p-3" data-testid="phrase-tester" data-on={on ? "true" : "false"}>
       <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
