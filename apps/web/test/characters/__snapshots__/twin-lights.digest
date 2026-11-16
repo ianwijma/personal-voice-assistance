@@ -1,0 +1,49 @@
+# twin-lights 1.0.0: frame digests of a scripted conversation at default settings (docs/CHARACTERS.md §6.6).
+# A change here must be deliberate: check the look, then update with `pnpm --filter @pva/web exec vitest run test/characters -u`.
+dark  0.5 idle         13 704f8866
+dark  1.0 listening    28 bdc1e9e0
+dark  1.5 listening    28 4d2b7969
+dark  2.0 hearing      29 b7652e28
+dark  2.5 hearing      39 cd6f3414
+dark  3.0 hearing      53 170b9f48
+dark  3.5 hearing      48 f44a94b9
+dark  4.0 hearing      41 cf38655d
+dark  4.5 hearing      44 cf5721c2
+dark  5.0 thinking     37 c34b5d34
+dark  5.5 thinking     23 590cfcb7
+dark  6.0 thinking     16 e69fd1b7
+dark  6.5 speaking     19 d996acef
+dark  7.0 speaking     26 5c8e8ae5
+dark  7.5 speaking     40 6c4a03c0
+dark  8.0 speaking     48 91a9bb6d
+dark  8.5 speaking     44 25e42e72
+dark  9.0 speaking     27 ba8d8846
+dark  9.5 listening    32 4188433a
+dark 10.0 listening    29 a9fb7199
+dark 10.5 idle         35 92d67d2a
+dark 11.0 idle         28 fd2c0bc9
+light  0.5 idle         13 58cec207
+light  1.0 listening    28 21a34835
+light  1.5 listening    28 1a262663
+light  2.0 hearing      29 322f3989
+light  2.5 hearing      39 fd242b7a
+light  3.0 hearing      50 40109559
+light  3.5 hearing      48 26b55f1f
+light  4.0 hearing      41 36af065c
+light  4.5 hearing      41 e3f2424b
+light  5.0 thinking     40 1306f2c3
+light  5.5 thinking     23 eb6a8277
+light  6.0 thinking     16 1c68381a
+light  6.5 speaking     19 c3a94dc5
+light  7.0 speaking     23 81a28240
+light  7.5 speaking     40 c3f8ca0c
+light  8.0 speaking     48 bedc1f71
+light  8.5 speaking     44 f3d4cbea
+light  9.0 speaking     27 1f719486
+light  9.5 listening    32 760473d2
+light 10.0 listening    29 39a47c7a
+light 10.5 idle         35 0e9a34b4
+light 11.0 idle         28 5e397460
+overflow 160×140×1 1.3 px
+overflow 900×420×1 0.0 px
+overflow 720×240×2 0.0 px
