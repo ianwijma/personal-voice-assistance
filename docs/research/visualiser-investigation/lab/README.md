@@ -31,7 +31,7 @@ A single-file page for trying out "listening" and "speaking" visualisers against
    export default design
    ```
 3. `src/designs/sine-lines.ts` is the worked example: complete metadata, reduced motion, smoothing with `dt`,
-   no allocation per frame.
+   smoothing buffers allocated in `create`/`resize`. (It still creates colour strings, small colour/share arrays and the thinking-sweep gradient per frame, so it is not strictly allocation-free; the application ports must be.)
 4. `src/kit.ts` has springs and smoothing (`approach`, `AttackRelease`, `Spring`), `noise2`/`noise3`/`fbm2`,
    `rng(seed)`, `clamp`/`lerp`/`smoothstep`/`remap`, colours on `Rgb` (`mix`, `rgba`, `lift`/`sink` that respect
    the theme), `setup2d`/`clear2d`, and for WebGL2 `glProgram` plus `FULLSCREEN_VERTEX`.
@@ -112,6 +112,7 @@ Rules:
   The mean covers the last 120 frames and the worst the last 300, both skipping the first 10. Allocate in `create`/`resize`, not per frame.
 - **Reduced motion** (`frame.reducedMotion`): no continuous motion and no flashes. The mode must still read from colour and shape.
   Try it with the "Reduced motion" button.
+  Known exception: the frozen prototypes `aurora-ribbons`, `cloud-orb` and `pitch-ink` do not hold still in this mode (fixed in their application ports); do not copy them for this rule.
 - **Both themes**: use `frame.palette` (it changes live). Mint `you` is the person and amber `voice` is the assistant.
   Draw on a transparent canvas, because the page background shows through.
 - **Sizes**: everything from a 280×160 tile (matrix cells are about 160×140) up to the 900×420 stage must look intentional.

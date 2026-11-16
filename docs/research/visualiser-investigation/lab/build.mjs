@@ -100,8 +100,11 @@ const build = async () => {
   }
   const css = (await esbuild.transform(readFileSync(join(src, "lab.css"), "utf8"), { loader: "css", minify: true })).code
   const js = result.outputFiles[0].text.replace(/<\/script/gi, "<\\/script")
+  const notices = readFileSync(join(here, "THIRD-PARTY-NOTICES.txt"), "utf8").replace(/--/g, "- -")
   const html = `<!doctype html>
 <html lang="en">
+<!--
+${notices}-->
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">

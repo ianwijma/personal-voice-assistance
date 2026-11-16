@@ -115,6 +115,11 @@ Known rough extremes: edge glow at maximum depth, light ring at maximum spectrum
 - Gliding between option values: checked from code and recordings, mostly not watched.
 - Any frame cost on real hardware, and the cloud orb on a GPU.
 - The designs on a phone.
+- **Reduced motion does not hold in three prototypes.** `aurora-ribbons`, `cloud-orb` and `pitch-ink` keep moving when the reduced-motion switch is on, which breaks the lab's own rule (no continuous motion). The prototypes are left as they were when reviewed, as the record of what was looked at; the three were corrected in their ports to the application. The other designs were checked from code and the reduced-motion button, not exhaustively on screen.
+
+## Third-party code
+
+- The cloud orb's shader contains the 3D simplex noise (`snoise`) from [ashima/webgl-noise](https://github.com/ashima/webgl-noise) by Ashima Arts and Stefan Gustavson, MIT licence. The full notice is in the shader's source comment (`lab/src/designs/cloud-orb.ts`), in `lab/THIRD-PARTY-NOTICES.txt`, and at the top of the built `visualiser-lab.html`. No other copied third-party code was found in the lab sources.
 
 ## Recommendation
 

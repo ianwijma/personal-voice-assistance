@@ -30,7 +30,8 @@ const TAIL = 0.35
 class Side {
   readonly player = new ClipPlayer()
   private extractor: FeatureExtractor = new FeatureExtractor(16000)
-  private readonly silence = new Float32Array(640)
+  /** Silence at the extractor's rate (40 ms), so a quiet side keeps its analysis rate. */
+  private silence = new Float32Array(640)
   clip: VoiceClip
   phrase = 0
   /** Copy of the extractor's features object, stable across extractor swaps. */
@@ -51,16 +52,20 @@ class Side {
 
   /** Feed one window (from `feed`, or silence) and advance by `dt`. */
   step(feed: Feed | null, dt: number, mixIn: Float32Array | null): void {
-    const rate = feed?.sampleRate ?? 16000
-    if (this.extractor.sampleRate !== rate) {
-      this.extractor = new FeatureExtractor(rate)
+    // The analysis rate follows the last real source. Silence keeps the current rate, so a phrase
+    // boundary never throws away the learned register, held pitch, envelopes or hangover; the
+    // extractor is replaced only when a feed with another sample rate (a real source change) arrives.
+    if (feed !== null && this.extractor.sampleRate !== feed.sampleRate) {
+      this.extractor = new FeatureExtractor(feed.sampleRate)
       this.features = this.extractor.features
+      this.silence = new Float32Array(Math.round(0.04 * feed.sampleRate))
     }
     let w = feed === null ? this.silence : feed.window()
     if (mixIn !== null && feed !== null && mixIn.length === w.length && feed.sampleRate === 16000) {
       // Room tone under the voice (both 16 kHz, same window length). `w` is the player's own buffer.
       for (let i = 0; i < w.length; i++) w[i] = w[i]! + mixIn[i]!
-    } else if (mixIn !== null && feed === null) {
+    } else if (mixIn !== null && feed === null && this.extractor.sampleRate === 16000) {
+      // Room tone is 16 kHz: only used while the extractor runs at 16 kHz.
       w = mixIn
     }
     this.extractor.process(w, dt)

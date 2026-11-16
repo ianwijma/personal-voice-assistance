@@ -117,6 +117,8 @@ export class FeatureExtractor {
 
   // Work buffers.
   private readonly x16 = new Float32Array(WIN)
+  /** Fixed view of the newest WAVE_SIZE samples of `x16`, made once so `process` allocates nothing. */
+  private readonly waveView = this.x16.subarray(WIN - WAVE_SIZE)
   private readonly x8 = new Float32Array(P_LEN)
   private readonly re = new Float32Array(NFFT)
   private readonly im = new Float32Array(NFFT)
@@ -217,7 +219,7 @@ export class FeatureExtractor {
     const n = this.resample(input)
     f.rms = Math.min(1, rms)
     const x = this.x16
-    f.wave.set(x.subarray(WIN - WAVE_SIZE))
+    f.wave.set(this.waveView)
 
     // 2. Level and voice activity.
     const db = 20 * Math.log10(rms + 1e-9)
@@ -382,7 +384,8 @@ export class FeatureExtractor {
     if (r === 1) {
       const n = Math.min(WIN, input.length)
       out.fill(0, 0, WIN - n)
-      out.set(input.subarray(input.length - n), WIN - n)
+      const from = input.length - n
+      for (let i = 0; i < n; i++) out[WIN - n + i] = input[from + i]!
       return n
     }
     const n = Math.min(WIN, Math.floor(input.length / r))

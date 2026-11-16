@@ -233,7 +233,7 @@ Three settings belong to the host, not to any character, and apply to all: the p
 
 - **Contract**: one integer. Raised only for a change §4.1 forbids. Characters declare the one they were written for; the host lists the ones it serves.
 - **Extension**: one integer each (`v`). Raised when its shape changes in a way old readers cannot ignore.
-- **Character**: semantic version. *Patch*: no visible change at default settings. *Minor*: new options or new use of an extension; defaults look the same. *Major*: the default look or an option's meaning changes; prefer shipping a new character id instead, so nobody's stage changes under them.
+- **Character**: semantic version. *Patch*: no visible change at default settings. *Minor*: new options or new use of an extension; defaults look the same. *Major*: the default look changes, and options may be added, removed or replaced under new ids (never an existing id with a new meaning, §4.4); prefer shipping a new character id instead, so nobody's stage changes under them.
 
 ### 4.6 Isolation and failure
 

@@ -237,3 +237,30 @@ describe("Conversation with a microphone", () => {
     expect(c.audible).not.toBeNull()
   })
 })
+
+describe("Conversation analysis at other sample rates", () => {
+  it("keeps the learned register through silence after a 44.1 kHz phrase", () => {
+    const rate = 44100
+    const phrase = { start: 0.5, end: 2 }
+    const user44 = (): VoiceClip => ({
+      samples: Float32Array.from({ length: rate * 3 }, (_, i) => (i / rate >= phrase.start && i / rate < phrase.end ? 0.2 * Math.sin((2 * Math.PI * 150 * i) / rate) : 0)),
+      sampleRate: rate,
+      phrases: [phrase],
+      label: "user44"
+    })
+    const c = new Conversation({ pin: "auto", user: user44(), agent: agent() })
+    untilMode(c, "hearing")
+    // Let the person speak for a while so the extractor learns their register.
+    for (let t = 0; t < 1.2; t += DT) c.step(DT)
+    const during = c.user
+    const registerDuring = during.register
+    expect(c.user.speaking).toBe(true)
+    expect(registerDuring).toBeGreaterThan(0)
+    // The phrase ends and the side is fed silence (thinking): the same extractor must carry on.
+    untilMode(c, "thinking")
+    for (let t = 0; t < 0.5; t += DT) c.step(DT)
+    expect(c.user).toBe(during)
+    expect(c.user.register).toBeCloseTo(registerDuring, 5)
+    expect(c.user.silenceFor).toBeGreaterThan(0)
+  })
+})
