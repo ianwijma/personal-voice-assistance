@@ -755,4 +755,37 @@ describe("changes that must hold together", () => {
     expect(await read("alpha")).toBe(alphaNew.id)
     expect(await read("bravo")).toBe(bravoNew.id)
   })
+  it("conversation.new refuses an assistant that is not on the device (unknown_assistant), with or without a session, and nothing is reserved for it", async () => {
+    const { page, read } = await alphaAnswersWithPick()
+    const alpha = await read("alpha")
+    const from = page.messages.length
+    for (const ghost of ["ghost-one", "ghost-two"]) {
+      expect(await request(page, { type: "conversation.new", assistantId: ghost })).toMatchObject({ ok: false, error: { code: "unknown_assistant" } })
+    }
+    expect(page.types(from)).not.toContain("conversation")
+    expect(await read("alpha")).toBe(alpha)
+    // With a session too.
+    await typed(page, "hello to alpha", "alpha")
+    expect(await request(page, { type: "conversation.new", assistantId: "ghost-three" })).toMatchObject({ ok: false, error: { code: "unknown_assistant" } })
+    expect(await read("alpha")).toBe(alpha)
+  })
+
+  it("assistant.create: placements that add up to more than 12 phrases for the assistant on one device are refused before anything is created", async () => {
+    await start()
+    const a = await admin()
+    await refresh(a)
+    const words = ["one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven", "twelve", "thirteen"]
+    const placements = (n: number) => words.slice(0, n).map((w) => ({ target: { kind: "type", type: "web-voice" } as const, phrase: `hey charlie ${w}` }))
+    const rev = typeOf(a).rev
+    expect(await request(a, { type: "assistant.create", assistant: body("Charlie"), placements: placements(13) })).toMatchObject({
+      ok: false,
+      error: { code: "limit_reached", fieldErrors: [{ key: "assistants.2.phrases" }] }
+    })
+    expect(assistantsOf(a).map((x) => x.id)).toEqual(["alpha", "bravo"])
+    expect(typeOf(a).rev).toBe(rev)
+    // Twelve fit, and the defaults still encode and push.
+    expect(await request(a, { type: "assistant.create", assistant: body("Charlie"), placements: placements(12) })).toMatchObject({ ok: true, assistantId: "charlie" })
+    const pushed = await a.waitFor("device.types", (m) => m.types.some((t) => t.settings.assistants.some((x) => x.assistant === "charlie")), { from: 0 })
+    expect(pushed.types.find((t) => t.kind === "web-voice")!.settings.assistants[2]!.phrases).toHaveLength(12)
+  })
 })

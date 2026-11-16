@@ -4,7 +4,7 @@
 import { CurrentTurnTrace, type Tts, TtsError, type TtsAudio, type VoiceRef, voiceKey } from "@pva/core"
 import type { LlmBuilder } from "../src/serve/Resources.ts"
 import * as SherpaTts from "@pva/tts-sherpa"
-import { ConfigProvider, Deferred, Effect, Exit, Scope, Stream } from "effect"
+import { ConfigProvider, Deferred, Effect, Exit, Fiber, Scope, Stream } from "effect"
 import { afterEach, describe, expect, it } from "vitest"
 import {
   defaultTtsBuilder,
@@ -160,6 +160,95 @@ describe("resource pool: voices", () => {
     await waiting
     await wanting
     expect(voice.sampleRate).toBe(24_000)
+  })
+
+  /**
+   * Voices like the default builder's: an engine that is shut down once its scope closes (it then refuses to speak);
+   * Kokoro's build waits for `building`. c speaks with Piper, ready; a comes into use on Kokoro, still being built.
+   */
+  const loadingKokoro = async () => {
+    const building = Deferred.makeUnsafe<void>()
+    const released: Array<string> = []
+    const build: TtsBuilder = (spec) =>
+      Effect.gen(function*() {
+        const key = ttsKeyOf(spec)
+        if (key === voiceKey(kokoro)) yield* Deferred.await(building)
+        let shut = false
+        yield* Effect.addFinalizer(() =>
+          Effect.sync(() => {
+            shut = true
+            released.push(key)
+          })
+        )
+        return {
+          sampleRate: key === voiceKey(kokoro) ? 24_000 : 22_050,
+          synthesize: (clauses: Stream.Stream<string>) =>
+            Stream.suspend((): Stream.Stream<TtsAudio, TtsError> =>
+              shut
+                ? Stream.fail(new TtsError({ message: "engine is shut down" }))
+                : clauses.pipe(Stream.zipWithIndex, Stream.map(([text, clause]): TtsAudio => ({ audio: new TextEncoder().encode(`${key}: ${text}`), clause })))
+            )
+        } satisfies Tts["Service"]
+      })
+    const pool = await makePool(build)
+    await reconcile(pool, { c: piper })
+    const wanting = reconcile(pool, { a: kokoro, c: piper })
+    await sleep(10)
+    expect(pool.ttsKeyFor("a")).toBe(voiceKey(kokoro))
+    return { pool, building, released, wanting }
+  }
+  const kokoroListed = (pool: ResourcePool) => pool.status().some((r) => r.key === voiceKey(kokoro))
+
+  const lastUserGoes: ReadonlyArray<readonly [string, Record<string, VoiceRef>]> = [
+    ["rebound to a ready voice", { a: piper, c: piper }],
+    ["switched off", { c: piper }]
+  ]
+  for (const [what, after] of lastUserGoes) {
+    it(`a turn waiting for its voice to load finishes with it when its assistant, the last user, is ${what} meanwhile; then the voice is released`, async () => {
+      const { pool, building, released, wanting } = await loadingKokoro()
+      const voice = pool.ttsFor("a")!
+      // The turn's synthesis starts and waits for the build.
+      const said = run(Stream.runCollect(voice.synthesize(Stream.make("hi")))).then((c) => new TextDecoder().decode(c[0]!.audio))
+      await sleep(10)
+      await reconcile(pool, after)
+      // Kept for the waiting turn, though nobody uses it any more.
+      await sleep(20)
+      expect(released).toEqual([])
+      expect(kokoroListed(pool)).toBe(true)
+      Deferred.doneUnsafe(building, Exit.void)
+      await wanting
+      expect(await said).toBe(`${voiceKey(kokoro)}: hi`)
+      expect(voice.sampleRate).toBe(24_000)
+      // Done: released at once (it was never used after the turn), its engine shut down.
+      await sleep(20)
+      expect(released).toEqual([voiceKey(kokoro)])
+      expect(kokoroListed(pool)).toBe(false)
+    })
+  }
+
+  it("a turn stopped while it waits for its voice lets go of it: a voice nobody uses any more is released", async () => {
+    const { pool, building, wanting } = await loadingKokoro()
+    const voice = pool.ttsFor("a")!
+    const turn = Effect.runFork(Stream.runDrain(voice.synthesize(Stream.make("hi"))))
+    await sleep(10)
+    await reconcile(pool, { a: piper, c: piper })
+    expect(kokoroListed(pool)).toBe(true)
+    await run(Fiber.interrupt(turn))
+    expect(kokoroListed(pool)).toBe(false)
+    Deferred.doneUnsafe(building, Exit.void)
+    await wanting
+  })
+
+  it("a voice released before a turn's synthesis started fails it with a TtsError instead of speaking on a shut-down engine", async () => {
+    const { pool, building, wanting } = await loadingKokoro()
+    const voice = pool.ttsFor("a")!
+    await reconcile(pool, { c: piper })
+    expect(kokoroListed(pool)).toBe(false)
+    Deferred.doneUnsafe(building, Exit.void)
+    await wanting
+    const speaking = run(Stream.runDrain(voice.synthesize(Stream.make("hi"))))
+    await expect(speaking).rejects.toBeInstanceOf(TtsError)
+    await expect(speaking).rejects.toMatchObject({ message: "The voice was released before the turn spoke." })
   })
 
   it("a voice nobody wants any more is released after the grace period, and kept when wanted again within it", async () => {
