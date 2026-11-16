@@ -273,8 +273,6 @@ export type LocalAction =
   | { readonly type: "local/toast-dismiss"; readonly id: number }
   | { readonly type: "local/ui"; readonly patch: Partial<ClientState["ui"]> }
   | { readonly type: "local/socket-lost" }
-  /** A pick on this page was accepted: nobody keeps the turn any more (the pick decides who answers). */
-  | { readonly type: "local/holder-clear" }
 
 export type Action = ServerMessage | LocalAction
 
@@ -441,9 +439,9 @@ const server: ServerHandlers = {
     // "Listening…" after the wake phrase lasts until the assistant hears something, or falls asleep again.
     // Asleep or idle: nobody has the turn any more.
     const sleeping = m.state === "asleep" || m.state === "idle"
-    // The server says who has the turn (protocol 7 `holder`, also when a window closed while the device keeps listening);
-    // a turn in flight keeps the assistant its `turn.start` named.
-    const told = m.holder === undefined ? s.holder : m.holder ?? (m.state === "thinking" || m.state === "speaking" ? s.holder : undefined)
+    // The server is the one authority on who has the turn (protocol 7 `holder`: the turn in flight or the utterance being
+    // heard, else an open window; also sent when only it changed). The page shows it and does not guess.
+    const told = m.holder === undefined ? s.holder : m.holder ?? undefined
     return { ...s, session, woke: m.state === "listening" && m.holder !== null ? s.woke : undefined, holder: sleeping ? undefined : told }
   },
   transcript: (s, m) => (s.liveTranscript === m.text ? s : { ...s, liveTranscript: m.text }),
@@ -547,8 +545,6 @@ const local = (s: ClientState, a: LocalAction): ClientState => {
       return a.status === "outdated"
         ? { ...s, toasts: [], connection: { ...s.connection, status: a.status, attempt: a.attempt } }
         : { ...s, connection: { ...s.connection, status: a.status, attempt: a.attempt } }
-    case "local/holder-clear":
-      return s.holder === undefined && s.woke === undefined ? s : { ...s, holder: undefined, woke: undefined }
     case "local/socket-lost":
       // Requests in flight will never be answered on this socket; the player was flushed.
       return { ...s, pending: {}, audio: withoutPlaying(s.audio), liveTranscript: "" }
