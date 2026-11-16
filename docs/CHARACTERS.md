@@ -6,6 +6,8 @@ This is a living document. Update it whenever a character is added, the contract
 
 **Status (2026-11-16).** The groundwork is in the app: the contract (`apps/web/src/characters/contract.ts`), the host that runs one character on the voice stage (`host.ts`), the feature extractor, kit, options and the shared helpers brought over from the lab, the registry, the baseline character (the sine lines, `library/sine-lines.ts`) and the compatibility tests of §6. Only the baseline is in the library so far; the 18 prototypes of the investigation (`docs/research/visualiser-investigation/`, where a character is called a *design*) are to be ported one file each (§7). The lab stays as a frozen research snapshot with its own copies. Extensions (§4.2, §5) are designed but none exists yet, and there is no settings page (§4.4). Port authors start at `apps/web/src/characters/README.md`.
 
+**Update (2026-11-16): the whole stage.** A character may now ask for a canvas covering the whole voice page instead of the box in its middle (`canvas: "stage"`, §2.6), and every frame says where the box is (`focus`). Characters that do not ask behave exactly as before. The baseline is a stage character (version 1.1.0). The 18 ports each move to the stage by the recipe in the README.
+
 ## 1. What a character is
 
 A **character** is a module that draws the assistant's presence on a canvas. It may be abstract (a flame, a ring of light) or a figure (a face, a pair of eyes, a creature). Both kinds follow the same contract and the same rules; "character" does not imply a face.
@@ -82,8 +84,8 @@ A figure can do what an abstract form cannot: show attention. It also fails in w
 - **2 ms per frame** on a laptop at stage size, at its heaviest settings. No allocation per frame. Measure; do not reason.
 - **Reduced motion** (`reducedMotion`): no continuous motion and no flashes. Hold poses. The mode still reads.
 - **Dark and light themes**, from the frame's palette. Additive glow that works on dark vanishes on a pale background: design for both from the start.
-- **Any size** from a 160 × 140 cell to a 900 × 420 stage, and stay inside the canvas at every size and setting.
-- **Transparent canvas.** Captions and overlays are drawn by the host on top; leave them room or stay out of the lower third.
+- **Any size** from a 160 × 140 cell to a 900 × 420 stage, and stay inside the canvas at every size and setting. A stage character (§2.6) sizes itself from `focus`, the same range, on a canvas up to the whole window.
+- **Transparent canvas.** Captions and overlays are drawn by the host on top; leave them room or stay out of the lower third. On the stage, the page's text sits below and around the box and carries a halo in the page colour (`stage-legible`), which keeps it readable over soft light, not over solid shapes.
 - **Works with nothing but the core frame** (§4.2). This is the rule the whole compatibility story rests on.
 
 ### 2.5 Checklist before a character is accepted
@@ -92,9 +94,35 @@ A figure can do what an abstract form cannot: show attention. It also fails in w
 2. Screenshots under whisper, normal, shouting; deep and high voice; slow and fast speech: are they tellably different?
 3. Reduced-motion screenshots of the five modes.
 4. Smallest and largest canvas; every option at both extremes together.
-5. Measured frame cost at the heaviest settings.
+5. Measured frame cost at the heaviest settings, for a stage character on the stage at 1280 × 800 and 1920 × 1080 (`__pvaStage.debug().frameMs`).
 6. The compatibility tests of §6 pass.
-7. Manifest complete and exact: modes, mappings, options with help text, `uses`.
+7. Manifest complete and exact: modes, mappings, options with help text, `uses`, `canvas`.
+8. A stage character: whole-page screenshots (the contact sheets show them) with no hard edge anywhere, in both themes, at desktop and phone size, with the chat panel open (the box slides 200 px left at 1024 to 1439 px wide); the text stays readable.
+
+### 2.6 Using the whole stage
+
+The box in the middle of the voice page (`.stage-vis`, at most 720 px wide and 48 to 240 px high) is too small for light: a glow cut off at its edges shows as a lit rectangle with hard edges, and a character that lights the screen's edge cannot reach the edge. So a character can ask for the whole stage.
+
+**What the host gives.** `canvas: "stage"` in the manifest. The canvas then covers the whole stage area of the voice page: the full viewport, behind the header, the captions, the controls and the chat panel. `resize(width, height, dpr)` reports that size. Each frame, `frame.focus` is the box's rectangle on that canvas (CSS pixels): where the character centres itself and what it sizes its main shape from. It is per frame because the box moves without the canvas resizing: the stage slides 200 px left while the chat panel is open (desktop widths 1024 to 1439 px, over 320 ms), the box's height and position scale with the window height, and the stage scrolls under long captions on short screens (the canvas does not scroll, so the focus moves, and can reach past the canvas edge). For a `"box"` character, `focus` is the whole canvas, so the same code serves both.
+
+**What the character does.**
+
+- Size and centre the main shape from `focus` (for most characters: draw exactly what it drew in the box, at the box's place; `clear2d(g, dpr, frame.focus)` does it for 2D code written from (0, 0)).
+- Clear the whole canvas, and draw glow, haze, particles and sparks wherever they reach: they now fade out on their own instead of being cut.
+- Keep everything essential inside `focus`: the mode must read from what is inside the box. What is outside is atmosphere: the page's text sits below and around the box.
+- Follow `focus` every frame, never cache it in `resize`; a jump of the focus (the panel opening, a scroll) must not leave things behind or spawn anything.
+- Stay a good box character too: a host without a stage (the lab, a voice node, the tests) gives a stage character the box with `focus` the whole canvas.
+
+**How much of the stage to use** depends on the character, not on a rule; every character gets the stage canvas unless there is a reason not to:
+
+| Kind | Uses the stage for | Examples |
+|---|---|---|
+| Edge light | The whole canvas: it lights the screen's edge and leaves the middle (and the focus) free. Ignores `focus` for its shape. | edge-glow |
+| Light and glow around a centred shape | Glow, halo, haze, sparks and particles beyond the box; the shape stays the box's size, centred on it. | flame, twin-lights, light-ring, cloud-orb, liquid-blob, particle-sphere, ripple-pond, aurora-ribbons |
+| Line-like | Keep the box's width (they fade at the ends); more room to move up and down. | sine-lines, pitch-ink |
+| Figures and solid shapes | Little: soft shadow or glow, motion (a bounce, a lean) that may leave the box a little. Box-like layout, stage canvas. | blob-buddy, line-face, lips, profile-head, robot-eyes, dot-quartet, dot-matrix, chladni-sand |
+
+**Cost.** A stage canvas has many more pixels than the box (1280 × 800 is 5.9 times a 720 × 240 box; 1920 × 1080 at pixel ratio 2 is 48 times a box at ratio 1). The host caps a stage canvas's backing store at 4.2 million device pixels (`STAGE_MAX_PIXELS` in `host.ts`: the pixel ratio is lowered until it fits, never below 1; 1280 × 800 at ratio 2 fits, 1920 × 1080 at ratio 2 gets ratio 1.42), so use the `dpr` from `resize`. Per-pixel work (full-canvas fills, `getImageData`, offscreen layers, shaders) grows with the canvas: size such work by a pixel budget, not by the canvas, and measure at 1920 × 1080 too. Measured (2026-11-16, headless Chromium, software raster, the baseline speaking / hearing with a loud voice): `frame()` itself 0.05 to 0.08 ms at every size; with the drawing rasterised (forced by a 1-pixel `getImageData`), 0.56 / 0.91 ms at 1280 × 800 ratio 1, 1.64 / 2.67 ms at 1280 × 800 ratio 2, 2.41 / 3.98 ms at 1920 × 1080 ratio 2 uncapped and 1.14 / 1.93 ms capped (the box today: 0.51 / 0.68 ms at ratio 1, 1.22 / 1.76 ms at ratio 2). In the page the host measured the baseline's `frame()` at 0.13 to 0.19 ms at 1280 × 800 ratio 1 and 0.14 to 0.19 ms at 1920 × 1080 ratio 2.
 
 ## 3. The manifest
 
@@ -108,6 +136,7 @@ What a character declares about itself: the `Character` object in `apps/web/src/
 | `version` | Semantic version of the character itself (§4.5). | Manifest check; stored with the choice |
 | `contract` | The contract major version it was written against: `1`. | Host refuses a version it does not serve |
 | `renderer` | What it draws with: `2d`, `webgl2`. | Host gives a `webgl2` character a canvas of its own; refuses a renderer it does not serve |
+| `canvas` | How much of the page its canvas covers: `"box"` (omitted: the default, as before the field existed) or `"stage"` (§2.6). | Host gives a stage character a canvas of its own on the page's full-stage layer and `focus` each frame; refuses a value it does not serve |
 | `modes` | One line per core mode. | Manifest check |
 | `extraModes` | The extra modes it draws itself (§4.3), one line each. | Host's mode resolution |
 | `mappings` | Signal → effect pairs. | Manifest check (the promises; shown in a future picker) |
@@ -128,9 +157,11 @@ Both directions follow from four rules.
 Within a contract major version:
 
 - A field of the frame is never removed, never renamed, and never changes meaning, unit or range. `level` is 0 to 1 perceived loudness for ever.
-- New information is added only as an **extension** (§4.2), never as a new required field.
+- New information is added only as an **extension** (§4.2), never as a new required field (the one exception, information every host has itself, is below).
 - The five core modes never change meaning and are never removed. New modes may be added, but a character is only ever handed a mode it has declared it supports (§4.3).
 - A host may give a character *more* than it asked for; a character must ignore what it does not know.
+- The manifest may gain optional fields whose absence means exactly the old behaviour (`canvas`, §2.6).
+- The core frame may gain a field only when every host can always supply it from its own knowledge (never from a server or a device that may lack it) and a character that never reads it is unaffected. `focus` (§2.6) is the one so far: every host knows where it put the character.
 
 A change that cannot follow these rules is a new contract major version. The host then keeps an adapter that feeds the old frame shape to characters written for the old version. Adapters are the host's cost, never the character author's. Expect this to be rare; nothing foreseen in §5 needs it.
 
@@ -138,7 +169,7 @@ A change that cannot follow these rules is a new contract major version. The hos
 
 The frame has two parts.
 
-**Core**: mode, both voices' features, time, pointer, reduced motion, palette, options. Every host supplies all of it, always. A character may depend on it without checking.
+**Core**: mode, both voices' features, time, pointer, focus, reduced motion, palette, options. Every host supplies all of it, always. A character may depend on it without checking.
 
 **Extensions**: everything else, each a named, versioned, optional block:
 
@@ -241,7 +272,8 @@ Three settings belong to the host, not to any character, and apply to all: the p
 - A character that fails to load, has an incomplete manifest, is written for a contract version or renderer the host does not serve, throws in `create`, `resize` or `frame`, or exceeds its frame budget persistently, is disposed and replaced by the baseline character (the sine lines) for the rest of the page's life, with one console warning. An unknown id in the choice also shows the baseline; the stored choice is never changed by the host. The conversation is never affected: audio does not depend on the stage.
 - **Persistently** (`host.ts`): the mean `frame()` cost over a window of 120 measured frames, each frame counted at most 16 ms (so one long pause cannot do it), is above 4 ms (twice the 2 ms budget of §2.4) in 3 consecutive windows, about 6 s at 60 Hz. The first 30 frames after a character starts, after a resize and after the tab comes back from the background are not measured, and a return from the background starts the count again. The baseline is never stopped for its cost.
 - A character is loaded on demand as its own chunk (4 to 9 KB gzipped each in the investigation; the registry's loaders are plain `import()`s, `scripts/build-characters.mjs`), so adding characters does not grow the page for people who do not use them. Whatever is on stage stays until the next character is ready (the baseline at page load); the swap happens inside one task, so there is no blank frame.
-- The host reads the current state through `window.__pvaStage.debug()` (character on stage, fallback and why, mean frame and feature cost), for tests and the console.
+- The host reads the current state through `window.__pvaStage.debug()` (character on stage, its canvas area, size and pixel ratio, the focus, fallback and why, mean frame and feature cost), for tests and the console.
+- A stage character's canvas is the host's: created on the page's full-stage layer (fixed, behind the page's content, no pointer events) when the character starts and removed when it stops, so switching between box and stage characters at run time leaves nothing behind; the box's canvas stays in the layout, hidden, as the focus placeholder. A stage character's pointer is read on the window, in its canvas's coordinates (`inside`: the pointer is in the window). The layout reads for `focus` happen before the character's frame is timed, so they never count against its budget.
 - A character has no access to audio, the socket, storage or application state. It cannot slow the audio path, which is what the latency budget in `docs/ARCHITECTURE.md` protects.
 - The baseline character is part of the host and has no extensions and no options that can fail. There is always something to fall back to.
 
@@ -296,11 +328,12 @@ Compatibility is kept by tests, not by intention. `apps/web/test/characters/comp
 3. **The unknown**: an extension name that does not exist and known-looking names with a version far too high, present throughout and then coming and going: no throw, and output equal to the core-only run. (There are no known extensions yet, so "every known extension present" is not tested; add it with the first extension.)
 4. **Options**: every option at minimum and at maximum together (host-level settings included) at the smallest cell, the largest stage and a 2× stage; every choice value; garbage stored values: validation gives a complete set and the character runs.
 5. **Reduced motion**: each core mode pinned with silent input: two frames a second apart are identical.
-6. **Defaults are stable**: a digest of the drawing calls every 0.5 s of the conversation at default settings, in both themes, plus how far solid drawing reaches past the canvas edge at the three sizes, is stored per character in `test/characters/__snapshots__/<id>.digest` (written on the first run; a change must be deliberate: check the look, then update with `-u`).
+6. **Defaults are stable**: a digest of the drawing calls every 0.5 s of the conversation at default settings, in both themes, plus how far solid drawing reaches past the canvas edge at the three sizes, is stored per character in `test/characters/__snapshots__/<id>.digest` (written on the first run; a change must be deliberate: check the look, then update with `-u`). These runs give no focus (the runner uses the whole canvas), exactly as before stage characters existed. A stage character's digest adds `stage` lines: the conversation on the desktop stage (1280 × 800, focus 720 × 240 at 280, 200) and where its solid drawing reached.
 7. **Manifest**: the checks of `manifest.ts` (id equals the file name, version is semver, contract is served, extra modes exist, `uses` entries complete, options valid, reserved ids with their kind and default).
 8. **Cost**: the mean `frame()` time over the conversation on the recording canvas stays under 20 ms. This only catches pathological cost; the real budget (2 ms, §2.4) is measured in the page (`window.__pvaStage.debug().frameMs`). No allocation per frame is not asserted.
+9. **The whole stage** (stage characters only; a box character passes trivially): the conversation on a desktop stage (1280 × 800, focus 720 × 240 at 280, 200) and a phone stage (390 × 844 at ratio 2, focus 358 × 160 at 16, 240) with no throw; for 2D, the solid drawing over the conversation is centred inside the focus or surrounds it (a character lighting the screen's edge); the five core modes differ on the stage; a focus that moves and changes size every frame; every option at its extremes with the moving focus.
 
-Also: `test/characters/isolation.test.ts` checks that files under `library/` and `shared/` import only the contract, the kit and the shared modules and name no page or network globals; `host.test.ts` covers loading, swapping, mode resolution, option validation on load and every fallback; `baseline.test.ts` checks the baseline's look in every visual state.
+Also: `test/characters/isolation.test.ts` checks that files under `library/` and `shared/` import only the contract, the kit and the shared modules and name no page or network globals; `host.test.ts` covers loading, swapping, mode resolution, option validation on load, every fallback, and the stage: the canvas on the layer, its size and backing-store cap, focus following the box without a resize, the window pointer, switching between box and stage characters both ways, falling back on the stage, and a stage character without a layer; `baseline.test.ts` checks the baseline's look in every visual state.
 
 Run against the 18 lab prototypes (wrapped with a version and contract) before they were ported, every check passes except (5) for aurora-ribbons (listening), cloud-orb (idle; the WebGL fake records its uniforms, so it may be a time uniform the shader ignores) and pitch-ink (listening; by design its pen keeps writing under reduced motion). Drawing past the canvas edge, recorded in (6), is 0 to 2 px for most, and up to 11 px (pitch-ink, light-ring at the small cell), 40 px (liquid-blob, light-ring on the large stage), 209 px (flame's sparks) and 304 px (particle-sphere's particles) at default settings: these are recorded, not judged, because particles and sparks may leave the frame on purpose, and a bounding box of path points cannot tell a visible overflow from one that fades out.
 
@@ -320,6 +353,6 @@ A contract change is accepted only when the full set of existing characters pass
 
 | id | Family | Since | Notes |
 |---|---|---|---|
-| `sine-lines` | baseline | 1.0.0 | The default and the fallback; bundled with the host; draws every extra mode. |
+| `sine-lines` | baseline | 1.0.0 | The default and the fallback; bundled with the host; draws every extra mode. 1.1.0: a stage character (lines keep the box's width, swing up to a quarter of the box's height, at least 48 px, past it at full voice). |
 
 The 18 prototypes and the recommendation of which to build first are in `docs/research/visualiser-investigation/README.md`.

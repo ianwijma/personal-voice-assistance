@@ -133,6 +133,33 @@ export interface Pointer {
   inside: boolean
 }
 
+/**
+ * Where on its canvas a character should be (`Frame.focus`): a rectangle in the canvas's CSS pixels, the same
+ * coordinates as drawing and `pointer`. A character centres itself on it and sizes its main shape from it.
+ */
+export interface Focus {
+  /** Left edge. */
+  x: number
+  /** Top edge. */
+  y: number
+  /** At least 1. */
+  width: number
+  /** At least 1. */
+  height: number
+}
+
+/**
+ * How much of the page a character's canvas covers (`Character.canvas`).
+ *
+ * - `"box"`: the stage box in the middle of the voice page (at most 720 px wide, 48 to 240 px high). `Frame.focus`
+ *   is always the whole canvas. What every character written before this field existed gets, unchanged.
+ * - `"stage"`: the whole stage area of the page (the full viewport, behind the header, the captions and the
+ *   controls). `resize` reports that size; `Frame.focus` is the box's place on it, per frame. A host that has no
+ *   stage area (another host, a test) gives a stage character the box, with focus the whole canvas: it must look
+ *   right then too.
+ */
+export type CanvasArea = "box" | "stage"
+
 export interface Frame {
   /** Seconds since the instance was created. */
   t: number
@@ -156,6 +183,16 @@ export interface Frame {
   /** Whichever side matters now: `agent` while speaking, otherwise `user`. */
   active: VoiceFeatures
   pointer: Pointer
+  /**
+   * Where to be, in this canvas's CSS pixels: centre on it and size the main shape from it. Always present.
+   * For a `"box"` character (the default) it is the whole canvas, `{ x: 0, y: 0, width, height }` of the last
+   * `resize`. For a `"stage"` character it is the rectangle the stage box occupies on the full-page canvas; it can
+   * change between any two frames without a `resize` (the chat panel opening slides the stage aside, the layout
+   * scales with the window height, the stage scrolls under long captions), and can reach past the canvas edge
+   * while the box is scrolled partly out of view. Follow it every frame; never cache it in `resize`.
+   * The object is reused between frames: copy what you keep.
+   */
+  focus: Focus
   /** `prefers-reduced-motion`: no continuous motion, no flashes; state must still read from colour and shape. */
   reducedMotion: boolean
   /** The app's theme colours, current for this frame (dark or light). `you` and `voice` may have been recoloured by the viewer. */
@@ -235,7 +272,10 @@ export interface Palette {
 export interface CharacterInstance {
   /**
    * The canvas changed size. `width` and `height` are CSS pixels; the harness
-   * has already set `canvas.width/height` to those times `dpr`.
+   * has already set `canvas.width/height` to those times `dpr` (rounded). For a
+   * `"stage"` character this is the whole stage area, and `dpr` may be below
+   * the device's pixel ratio: the host caps a stage canvas's backing store.
+   * Use the `dpr` given here, never `devicePixelRatio`.
    */
   resize(width: number, height: number, dpr: number): void
   /** Draw one frame. Clear the canvas yourself (transparent; the page background shows through). */
@@ -273,6 +313,13 @@ export interface Character {
   readonly uses?: ReadonlyArray<{ readonly ext: string; readonly gain: string; readonly without: string }>
   /** What it draws with. A host skips renderers it does not offer. */
   readonly renderer: "2d" | "webgl2"
+  /**
+   * How much of the page its canvas covers (`CanvasArea`). Omitted: `"box"`, exactly as before the field existed.
+   * `"stage"`: the canvas covers the whole stage area and `Frame.focus` says where the box is; the character
+   * centres and sizes itself on `focus`, may draw glow and particles over the whole canvas, keeps everything
+   * essential inside `focus`, and copes with `focus` moving between frames (docs/CHARACTERS.md §2.6).
+   */
+  readonly canvas?: CanvasArea
   /** The settings this character exposes, read each frame from `Frame.options`. Omitted or empty: nothing to tune. */
   readonly options?: ReadonlyArray<OptionSpec>
   create(canvas: HTMLCanvasElement): CharacterInstance
