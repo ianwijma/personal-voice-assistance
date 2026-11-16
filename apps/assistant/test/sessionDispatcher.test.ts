@@ -34,10 +34,12 @@ import {
   textDelta,
   turnResumed
 } from "@pva/core/testing"
+import type { DeviceSettings } from "@pva/protocol"
 import { Clock, Deferred, Effect, Exit, Fiber, Queue, Stream } from "effect"
 import { TestClock } from "effect/testing"
 import { makeEngine } from "../src/serve/Engine.ts"
 import { isSuperseded, type LeasePlayEnd, makeOutputLease, SUPERSEDED } from "../src/serve/OutputLease.ts"
+import { typesafeNow } from "../src/serve/routing.ts"
 import { makeSessionConversation, type SessionConversation } from "../src/serve/SessionConversation.ts"
 import {
   type DecideResult,
@@ -490,6 +492,78 @@ describe("SessionDispatcher: routing (recorder fakes)", () => {
         "alpha EndOfTurn(play music.)"
       ])
       assert.deepStrictEqual(r.dispatcher.routeOf("alpha"), { by: "decide", assistant: "alpha", fallback: true })
+    }))
+
+  it.effect("decide: a chosen answer that arrives after the device stopped routing by TypeSafe goes to nobody", () =>
+    Effect.gen(function*() {
+      const on = new Map([["alpha", { on: true }], ["bravo", { on: true }]])
+      let settings: Pick<DeviceSettings, "assistants" | "withoutPhrase"> = {
+        assistants: [{ assistant: "alpha", phrases: [] }, { assistant: "bravo", phrases: [] }],
+        withoutPhrase: { mode: "typesafe", fallback: "alpha", giveUpMs: 400 }
+      }
+      const asked = yield* Deferred.make<void>()
+      const answer = yield* Deferred.make<DecideResult>()
+      const decide: DecideRoute = () => Effect.andThen(Deferred.succeed(asked, undefined), Deferred.await(answer))
+      const r = recorder({ decide, decideNow: () => typesafeNow(settings, on) })
+      const feed = feedVia(makeRouteGate(routeConfig({ withoutPhrase: "decide", fallback: "alpha" })), r.dispatcher)
+      yield* feed([speechStarted])
+      const final = yield* Effect.forkChild(feed([endOfTurn("tell me a joke")]))
+      yield* Deferred.await(asked)
+      // Same assistants, same hearer: only "without a phrase" changes to nobody while TypeSafe is asked.
+      settings = { ...settings, withoutPhrase: { mode: "nobody" } }
+      yield* Deferred.succeed(answer, { assistant: "bravo", fallback: false })
+      yield* Fiber.join(final)
+      assert.deepStrictEqual(r.log, [], "bravo must not start a reply the device no longer routes to")
+      assert.deepStrictEqual(r.made, [])
+    }))
+
+  it.effect("decide: a none-fits answer with no fallback goes to the fallback the device has now", () =>
+    Effect.gen(function*() {
+      const device: { candidates: ReadonlyArray<string>; fallback: string | null } = { candidates: ["alpha"], fallback: null }
+      const decision = { outcome: "none-fits", fits: 0.1, ms: 0, sentAt: 0, receivedAt: 0 } as const
+      const asked = yield* Deferred.make<void>()
+      const answer = yield* Deferred.make<DecideResult>()
+      const decide: DecideRoute = () => Effect.andThen(Deferred.succeed(asked, undefined), Deferred.await(answer))
+      const r = recorder({ decide, decideNow: () => device })
+      const feed = feedVia(makeRouteGate(routeConfig({ withoutPhrase: "decide", fallback: null })), r.dispatcher)
+      yield* feed([speechStarted])
+      const final = yield* Effect.forkChild(feed([endOfTurn("tell me a joke")]))
+      yield* Deferred.await(asked)
+      device.fallback = "alpha" // the fallback is set while TypeSafe is asked
+      yield* Deferred.succeed(answer, { assistant: null, fallback: true, decision })
+      yield* Fiber.join(final)
+      assert.deepStrictEqual(r.log, ["alpha SpeechStarted", "alpha EndOfTurn(tell me a joke)"])
+      assert.deepStrictEqual(r.dispatcher.routeOf("alpha"), { by: "decide", assistant: "alpha", fallback: true, decision })
+    }))
+
+  it.effect("decide: a cached none-fits answer with no fallback is checked again at the final", () =>
+    Effect.gen(function*() {
+      const device: { candidates: ReadonlyArray<string>; fallback: string | null } = { candidates: ["alpha"], fallback: null }
+      const asked: Array<string> = []
+      const decide: DecideRoute = (request) =>
+        Effect.sync(() => {
+          asked.push(request.text)
+          const result: DecideResult = { assistant: null, fallback: true, decision: { outcome: "none-fits", ms: 0, sentAt: 0, receivedAt: 0 } }
+          return result
+        })
+      const r = recorder({ decide, decideNow: () => device })
+      const feed = feedVia(makeRouteGate(routeConfig({ withoutPhrase: "decide", fallback: null })), r.dispatcher)
+      yield* feed([speechStarted, eagerEndOfTurn("tell me a joke")])
+      assert.deepStrictEqual(r.log, [], "nobody answers at the eager point")
+      device.fallback = "alpha"
+      yield* feed([endOfTurn("tell me a joke.")])
+      assert.deepStrictEqual(asked, ["tell me a joke"], "the final reused the eager answer")
+      assert.deepStrictEqual(r.log, ["alpha SpeechStarted", "alpha EndOfTurn(tell me a joke.)"])
+    }))
+
+  it.effect("decide: routing not set up stays nobody, even when the device has a fallback", () =>
+    Effect.gen(function*() {
+      const decide: DecideRoute = () => Effect.succeed({ assistant: null, fallback: true, notSetUp: true })
+      const r = recorder({ decide, decideNow: () => ({ candidates: ["alpha"], fallback: "alpha" }) })
+      const feed = feedVia(makeRouteGate(routeConfig({ withoutPhrase: "decide", fallback: "alpha" })), r.dispatcher)
+      yield* feed([speechStarted, endOfTurn("tell me a joke")])
+      assert.deepStrictEqual(r.log, [])
+      assert.deepStrictEqual(r.made, [])
     }))
 })
 

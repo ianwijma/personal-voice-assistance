@@ -234,6 +234,15 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
   }
   const isOwner = (client: Client) => client.sessionKey !== undefined && owners.get(client.sessionKey)?.owner === client
   const sessionOf = (client: Client): VoiceSession | undefined => (client.sessionKey === undefined ? undefined : sessions.get(client.sessionKey))
+  /**
+   * Who answers on the connection's device while it has no session (no follow-up window yet), as the session decides
+   * (§5.3, `VoiceSession.answering`): the `withoutPhrase` assistant, else the TypeSafe fallback, else the first.
+   */
+  const answersWithoutSession = (client: Client): string | undefined => {
+    const setup = assistants.setupFor(client.device?.id, client.device?.kind)
+    const wp = setup.withoutPhrase
+    return wp.mode === "assistant" ? wp.assistant : wp.mode === "typesafe" && wp.fallback !== null ? wp.fallback : setup.assistants[0]?.id
+  }
   /** The conversation an admin connection's snapshot names (admin has no session). */
   const adminConversation: ConversationInfo = { id: globalThis.crypto.randomUUID(), startedAt: Date.now() }
   const maxPendingPerConnection = options.maxPendingPerConnection ?? 4
@@ -595,10 +604,12 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
       ownerPresent: o?.owner !== undefined,
       engine: engineSummary(options.engine.status()),
       ...(answering !== undefined ? { answering } : {}),
+      // Who has the turn now (an armed assistant too), apart from whose history this is.
+      ...(session !== undefined ? { holder: session.holder() } : {}),
       history: session === undefined ? [] : historyItems(Effect.runSync(session.conversation.history())),
       ...(client.role === "voice" ? { device: profileInfo(client) } : {}),
       admin: adminState(client, endReason),
-      conversation: key === undefined ? adminConversation : sessions.conversation(key),
+      conversation: key === undefined ? adminConversation : sessions.conversation(key, session === undefined ? answersWithoutSession(client) : undefined),
       ...(client.role === "voice" ? voicePart(client, session) : {})
     }
   }
@@ -792,7 +803,9 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
         if (client.role !== "voice" || client.sessionKey === undefined) {
           return result(client, message.requestId, failure("bad_message", "A new conversation is started from a voice page"))
         }
-        return limited(client, message.requestId, Effect.as(sessions.newConversation(client.sessionKey, message.assistantId), { ok: true } as HostResult))
+        // Without a session the reservation of the assistant asked for (absent: the one that will answer) is replaced.
+        const assistantId = message.assistantId ?? (sessionOf(client) === undefined ? answersWithoutSession(client) : undefined)
+        return limited(client, message.requestId, Effect.as(sessions.newConversation(client.sessionKey, assistantId), { ok: true } as HostResult))
       }
       case "admin.login":
         return login(client, message.requestId, message.password)
@@ -842,12 +855,17 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
         if (client.role !== "voice" || device === undefined) {
           return result(client, message.requestId, failure("bad_message", "This page did not say which device it is; reload it"))
         }
+        // An accepted pick decides who answers next: the device's open armed and follow-up windows close.
+        const picked = (r: Parameters<typeof afterAssistantsChange>[0]) => {
+          afterAssistantsChange(r)
+          if (r.ok) sessionOf(client)?.pickAccepted()
+        }
         // The device record is saved in the background at hello: make sure it exists before the pick writes to it.
         return limited(
           client,
           message.requestId,
           Effect.andThen(frontends.seen(device, connectedDevices()), assistants.pick(device.id, message.withoutPhrase)),
-          afterAssistantsChange
+          picked
         )
       }
       case "conversation.read": {
@@ -861,12 +879,8 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
           return result(client, message.requestId, failure("unknown_assistant", `${assistantId} is not one of the assistants on this device`))
         }
         const session = sessionOf(client)
-        // Without a session: the device's id is the one that will answer (as the session decides, §5.3); the others get their own.
-        const wp = setup.withoutPhrase
-        const answers = wp.mode === "assistant" ? wp.assistant : wp.mode === "typesafe" && wp.fallback !== null ? wp.fallback : setup.assistants[0]?.id
-        const info = session === undefined
-          ? sessions.conversation(client.sessionKey, assistantId === answers ? undefined : assistantId)
-          : session.conversation.conversation(assistantId)
+        // Without a session: the id reserved for that assistant (the session takes it over).
+        const info = session === undefined ? sessions.conversation(client.sessionKey, assistantId) : session.conversation.conversation(assistantId)
         return send(client, {
           type: "conversation.history",
           requestId: message.requestId,

@@ -6,6 +6,7 @@ import {
   baseOfDevice,
   baseOfType,
   draftOnRevision,
+  editDraft,
   followUpLabel,
   hearerId,
   isDirty,
@@ -279,6 +280,28 @@ describe("the draft when a new revision arrives", () => {
   })
 })
 
+// Review of PR #35, round 2, finding 1: a change made while a save is on its way (even one back to the saved value) is not lost.
+describe("a change to the draft while a save is on its way", () => {
+  const savedMatching = settingsOf(device, noEdit).matching
+  const other = savedMatching === "close" ? "exact" : "close"
+  const sent = setKeys(device, noEdit, { matching: other })
+  const back = (e: typeof sent) => setKeys(device, e, { matching: savedMatching })
+
+  it("is ignored: the draft stays exactly what was sent, and the save's revision leaves it clean and matching the server", () => {
+    const during = editDraft({ edit: sent, rev: 1 }, back, 1, true)
+    expect(during.edit).toBe(sent)
+    expect(settingsOf(device, during.edit).matching).toBe(other)
+    expect(draftOnRevision(during, 2, device, exampleDevice.name, sent)).toEqual({ edit: noEdit, rev: 2 })
+  })
+
+  it("is applied when no save is on its way; a first edit starts from the current revision", () => {
+    const after = editDraft({ edit: sent, rev: 1 }, back, 3, false)
+    expect(after.rev).toBe(1)
+    expect(settingsOf(device, after.edit).matching).toBe(savedMatching)
+    expect(editDraft({ edit: noEdit, rev: 1 }, (e) => setKeys(device, e, { matching: other }), 3, false)).toEqual({ edit: sent, rev: 3 })
+  })
+})
+
 // Review of PR #35, finding 3: the phrase tester names the assistant from the tested device's saved assignments.
 describe("wakesAssistant", () => {
   const saved: Assignment[] = [
@@ -290,6 +313,17 @@ describe("wakesAssistant", () => {
     expect(wakesAssistant(saved, "hey jeff")).toBe("jeff")
     expect(wakesAssistant(saved, "Hey, Jeff!")).toBe("jeff")
     expect(wakesAssistant(saved, "hey t3")).toBe("t3")
+  })
+
+  // Round 2, finding 2: punctuation separates words, as in the server's `phraseKey`; it is not deleted.
+  it("keeps word boundaries: \"hey-jeff\" and \"heyjeff\" are different phrases", () => {
+    const close: Assignment[] = [
+      { assistant: "jeff", phrases: ["hey-jeff"] },
+      { assistant: "t3", phrases: ["heyjeff"] }
+    ]
+    expect(wakesAssistant(close, "heyjeff")).toBe("t3")
+    expect(wakesAssistant(close, "hey jeff")).toBe("jeff")
+    expect(wakesAssistant(close, "Hey-Jeff")).toBe("jeff")
   })
 
   it("a phrase that is only in a draft, or on another device, wakes nobody here", () => {

@@ -252,7 +252,8 @@ Keys that do not apply to the kind (`voicePage`, `captions`, browser audio field
    assistant therefore never reaches another assistant. TypeSafe never offers an off assistant; a fallback that is off
    means nobody.
 
-**Typed text** (`text.send`): the `assistantId` it names (the voice page always names the conversation shown), else
+**Typed text** (`text.send`): the `assistantId` it names if that assistant is assigned to this device (the voice page always names the
+conversation shown; a name not assigned here is ignored), else
 step 3, else the `withoutPhrase` assistant, else the TypeSafe fallback, else the first in the list. Typed text never
 calls TypeSafe.
 
@@ -369,7 +370,10 @@ WebAudioInput ─▶ Stt(hearer) ─▶ EchoGate ─▶ RouteGate ─▶ Dispatc
   across resource switches as today across builds (:109-112). Its LLM is the pool's instance for the assistant's
   `LlmKey`, and its `Tts` the instance for its voice. A Claude subscription assistant uses `makeAgentConversation`
   with the subscription agents (§4.1). A conversation is made the first time something is routed to that assistant
-  on that device, so an assistant nobody talks to costs nothing.
+  on that device, so an assistant nobody talks to costs nothing. The kind (agents or one model) follows the pool's
+  binding in use, not the saved account: when a published binding changes it, that one conversation's loop restarts
+  with the other kind as on an engine rebuild (the turn in flight is dropped; history, id and idle clock are kept),
+  and the agents the ended loop used are told that the conversation ended (`endConversation`).
 - **Dispatcher** (`serve/SessionDispatcher.ts`, new) owns the routing state of one session:
   - **Barge-in owner**: the conversation whose committed turn is running, else none. `SpeechStarted` goes to it at
     once (barge-in as today; the echo gate has already dropped the assistant's own voice), and the dispatcher opens
@@ -603,12 +607,15 @@ DeviceSetup = { type: "device.setup", deviceId?,
 TurnStart       += { assistantId }      // also assistant.text, reply.start: assistantId
 Conversation    += { assistantId }      // conversation { id, reason, startedAt, assistantId }
 Wake            += { assistantId }
-State           += { holder?: AssistantId | null }   // who has the turn (open armed / follow-up window, reply playing);
-                                        // sent again with the same state when a window closes while listening
+State           += { holder?: AssistantId | null }   // who has the turn: the turn in flight or the utterance being
+                                        // heard, else an open armed / follow-up window, else null (nobody); sent again
+                                        // with the same state when only it changes. The page shows it, never guesses.
+                                        // An accepted device.pick closes the windows (the picked one answers next).
 Snapshot.conversations = Array<{ assistantId, id, startedAt, turns: number }>   // replaces snapshot.conversation
 Snapshot.history       = the history of the answering assistant (the follow-up holder, else withoutPhrase's, else
                          the first); the others are fetched on demand:
 Snapshot.answering     = that assistant (the page files `history` under it)
+Snapshot.holder        = who has the turn now, as State.holder (may be an armed assistant whose history it is not)
 ConversationHistory = { type: "conversation.history", requestId, assistantId, id, history: HistoryItem[] }
 
 // voice → server
