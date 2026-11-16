@@ -66,9 +66,29 @@ export const createModelCatalog = (kind: PickerKind, host: CatalogHost, api: Voi
   const json = async <S extends Schema.Top>(schema: S, path: string, init?: Parameters<VoiceApi["request"]>[1]): Promise<S["Type"]> =>
     decode(schema, await (await api.request(path, init)).json())
 
+  /**
+   * The downloads whose job had succeeded when a list was asked for (key → job id). That list says whether the model
+   * is still installed (it may have been deleted since), so their records go when it arrives (`settle`).
+   */
+  const finishedDownloads = (): ReadonlyMap<string, string> => {
+    const jobs = host.store.get().jobs
+    const out = new Map<string, string>()
+    for (const [key, d] of Object.entries(get().downloads)) {
+      const id = d.job?.id
+      if (id === undefined || d.starting === true) continue
+      if ((jobs.find((j) => j.id === id) ?? d.job)?.state === "succeeded") out.set(key, id)
+    }
+    return out
+  }
+  const settle = (downloads: ModelCatalogState["downloads"], finished: ReadonlyMap<string, string>): ModelCatalogState["downloads"] =>
+    finished.size === 0
+      ? downloads
+      : Object.fromEntries(Object.entries(downloads).filter(([key, d]) => d.starting === true || d.job?.id === undefined || finished.get(key) !== d.job?.id))
+
   let loadSeq = 0
   const reload = async (refresh = false) => {
     const seq = ++loadSeq
+    const finished = finishedDownloads()
     set((s) => ({ ...s, ...(s.load === "ready" ? { refreshing: true } : { load: "loading" as const }) }))
     try {
       const [models, favs] = await Promise.all([ // continuation(state): only the newest load writes (`seq`)
@@ -77,7 +97,7 @@ export const createModelCatalog = (kind: PickerKind, host: CatalogHost, api: Voi
       ])
       if (seq !== loadSeq) return
       const { loadError: _e, ...rest } = get()
-      set(() => ({ ...rest, load: "ready", refreshing: false, lists: models.providers, favourites: favs.favourites }))
+      set(() => ({ ...rest, load: "ready", refreshing: false, lists: models.providers, favourites: favs.favourites, downloads: settle(rest.downloads, finished) }))
     } catch (e) {
       if (seq !== loadSeq) return
       const message = messageOf(e, `The ${noun} could not be loaded.`)
@@ -87,10 +107,16 @@ export const createModelCatalog = (kind: PickerKind, host: CatalogHost, api: Voi
 
   const reloadProvider = async (id: string, refresh = false) => {
     if (refresh) set({ refreshing: true })
+    const finished = finishedDownloads()
     try {
       const answer = await json(ModelsResponse, `models/${kind}?provider=${encodeURIComponent(id)}${refresh ? "&refresh=1" : ""}`) // continuation(state): merges by provider id into the newest lists
       const fresh = answer.providers.find((p) => p.provider.id === id)
-      set((s) => ({ ...s, refreshing: false, lists: fresh === undefined ? s.lists : s.lists.map((p) => (p.provider.id === id ? fresh : p)) }))
+      set((s) => ({
+        ...s,
+        refreshing: false,
+        lists: fresh === undefined ? s.lists : s.lists.map((p) => (p.provider.id === id ? fresh : p)),
+        downloads: fresh === undefined ? s.downloads : settle(s.downloads, new Map([...finished].filter(([key]) => key.startsWith(`${id}:`))))
+      }))
     } catch (e) {
       set((s) => ({ ...s, refreshing: false, ...(refresh ? { notice: { tone: "error" as const, message: messageOf(e, `The ${noun} could not be loaded.`) } } : {}) }))
     }
@@ -151,23 +177,40 @@ export const createModelCatalog = (kind: PickerKind, host: CatalogHost, api: Voi
     })
   }
 
-  // ---- Favourites (on the server: the same on every device).
-  const toggleFavourite = async (key: string, name: string) => {
+  // ---- Favourites (on the server: the same on every device). The changes go to the server one at a time, in the
+  // order they were made, and only the newest one's answer is shown: an older answer would undo a newer star.
+  let favourites: Promise<void> = Promise.resolve()
+  let favSeq = 0
+  let favPending = 0
+  /** The server's list as of the last answer (while changes are pending). */
+  let favConfirmed: ReadonlyArray<ModelFavourite> = []
+  const toggleFavourite = (key: string, name: string): Promise<void> => {
     const ref = parseModelKey(key)
-    if (ref === undefined) return
+    if (ref === undefined) return favourites
     const before = get().favourites
+    if (favPending === 0) favConfirmed = before
+    favPending++
+    const seq = ++favSeq
     const on = before.some((f) => f.key === key)
     set({ favourites: on ? before.filter((f) => f.key !== key) : [...before, { model: ref, key, name, addedAt: Date.now() }] })
-    try {
-      const path = `models/${kind}/favourites/${encodeURIComponent(key)}`
-      const answer = on
-        ? await json(ModelFavouritesResponse, path, { method: "DELETE" }) // continuation(state): the answer is the whole list
-        : await json(ModelFavouriteResponse, path, { method: "PUT", body: { name: name.slice(0, 100) || ref.modelId } }) // continuation(state): see above
-      set({ favourites: answer.favourites })
-    } catch (e) {
-      if (on && e instanceof ApiError && e.code === "not_found") return
-      set({ favourites: before, notice: { key, tone: "error", message: messageOf(e, "The favourites could not be changed.") } })
+    const change = async () => {
+      let notice: CatalogNotice | undefined
+      try {
+        const path = `models/${kind}/favourites/${encodeURIComponent(key)}`
+        const answer = on
+          ? await json(ModelFavouritesResponse, path, { method: "DELETE" }) // continuation(state): the answer is the whole list; only the newest change writes it (`favSeq`)
+          : await json(ModelFavouriteResponse, path, { method: "PUT", body: { name: name.slice(0, 100) || ref.modelId } }) // continuation(state): see above
+        favConfirmed = answer.favourites
+      } catch (e) {
+        if (on && e instanceof ApiError && e.code === "not_found") favConfirmed = favConfirmed.filter((f) => f.key !== key)
+        else notice = { key, tone: "error", message: messageOf(e, "The favourites could not be changed.") }
+      }
+      favPending--
+      if (seq === favSeq) set({ favourites: favConfirmed })
+      if (notice !== undefined) set({ notice })
     }
+    favourites = favourites.then(change)
+    return favourites
   }
 
   // ---- Downloads of recogniser models on this machine (jobs, as on the Models page).

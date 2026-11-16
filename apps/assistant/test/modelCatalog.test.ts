@@ -2,8 +2,8 @@
 // through the real adapters (llm-anthropic, llm-openai-compatible) from local stand-in servers, the cache (lifetime,
 // refresh, a new key, the pause after a failure), the time limit, a failing provider next to working ones, the known
 // models when Anthropic's list fails, the models assistants use that a list lacks, and the recogniser presets.
-import type { Assistant, JobInfo, ProviderModels } from "@pva/protocol"
-import { ConfigProvider, Effect } from "effect"
+import { type Assistant, type JobInfo, ModelsResponse, type ProviderModels } from "@pva/protocol"
+import { ConfigProvider, Effect, Schema } from "effect"
 import { afterEach, describe, expect, it, vi } from "vitest"
 import { FAILED_RETRY_MS, LIST_MAX_AGE_MS, makeModelCatalog, type ModelCatalogOptions, PRESET_LANGUAGES, type SttItem, type SubscriptionView } from "../src/serve/ModelCatalog.ts"
 import * as SherpaStt from "@pva/stt-sherpa"
@@ -200,6 +200,14 @@ describe("model catalog: language model accounts", () => {
     expect(failed!.provider.message).toMatch(/404/)
     expect(failed!.provider.customModel).toBeDefined()
     expect(failed!.models.map((m) => [m.model.modelId, m.listed])).toEqual([["llama3.1:8b", false], ["mistral-small:24b", false]])
+  })
+
+  it("a listed id that is no valid model reference is left out; the answer still decodes", async () => {
+    const api = await track(fakeOpenAiApi([...homeModels, { id: "x".repeat(101), object: "model", created: 1, owned_by: "library" }]))
+    const { catalog: c } = catalog({ HOME_MODEL_BASE_URL: api.url })
+    const lists = await run(c.models("llm", undefined, false))
+    expect(byId(lists, "home-model").models.map((m) => m.model.modelId)).toEqual(["llama3.1:8b", "qwen2.5:14b"])
+    expect(() => Schema.decodeUnknownSync(ModelsResponse)({ kind: "llm", providers: lists })).not.toThrow()
   })
 
   it("an address that is refused is an error without a fetch", async () => {

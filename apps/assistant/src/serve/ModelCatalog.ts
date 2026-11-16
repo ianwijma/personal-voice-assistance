@@ -359,8 +359,13 @@ export const makeModelCatalog = (options: ModelCatalogOptions): ModelCatalog => 
     }
   }
 
-  /** The listed models, then the models assistants use that the list does not have (typed, or gone). */
-  const withUnlisted = (provider: LlmProviderId, list: ReadonlyArray<Described>): Array<ModelEntry> => {
+  /**
+   * The listed models, then the models assistants use that the list does not have (typed, or gone). A listed id that
+   * is not a valid model reference (over 100 characters, control characters) is left out: the answer's schema would
+   * refuse it, and with it every provider's list.
+   */
+  const withUnlisted = (provider: LlmProviderId, all: ReadonlyArray<Described>): Array<ModelEntry> => {
+    const list = all.filter((d) => parseModelKey(modelKey({ provider, modelId: d.id })) !== undefined)
     const ids = new Set(list.map((d) => d.id))
     const used = [...new Set(options.assistants().filter((a) => a.llm.account === provider && a.llm.model.trim() !== "" && !ids.has(a.llm.model)).map((a) => a.llm.model))]
     return [

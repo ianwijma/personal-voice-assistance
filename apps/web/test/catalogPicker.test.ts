@@ -1,7 +1,7 @@
 // The generic catalog picker's pure logic (docs/MODEL-PICKERS.md §6): rows of a provider, favourites, search with typed
 // models, trouble words, and the mapping of a model catalog's answer.
 import { describe, expect, it, vi } from "vitest"
-import type { ModelEntry, ModelFavourite, ProviderModels } from "@pva/protocol"
+import type { JobInfo, ModelEntry, ModelFavourite, ProviderModels } from "@pva/protocol"
 import {
   favouriteRows,
   type GenericFavourite,
@@ -223,6 +223,61 @@ describe("the model catalog's calls", () => {
     await failing.catalog.toggleFavourite("openrouter:x", "X")
     expect(failing.catalog.store.get().favourites.map((f) => f.key)).toEqual(["openrouter:x"])
     expect(failing.catalog.store.get().notice).toMatchObject({ tone: "error", message: "No." })
+  })
+
+  it("star, then unstar before the server answers: the changes go in order and the last choice stays", async () => {
+    const key = "anthropic:claude-haiku-5-5"
+    const ref = { provider: "anthropic", modelId: "claude-haiku-5-5" }
+    const changes: Array<string> = []
+    let answerPut = () => {}
+    const fetchFn = async (url: string, init?: RequestInit) => {
+      const method = init?.method ?? "GET"
+      if (method === "GET") return reply(url.includes("favourites") ? favs : sample)
+      changes.push(method)
+      if (method === "PUT") {
+        await new Promise<void>((resolve) => {
+          answerPut = () => resolve()
+        })
+        const f = { model: ref, key, name: "Claude Haiku 5.5", addedAt: 1 }
+        return reply({ favourite: f, favourites: [f] })
+      }
+      return reply({ favourites: [] })
+    }
+    const host = { store: createStore(initialState, (s) => s) }
+    const c = createModelCatalog("llm", host, makeVoiceApi(() => "http://h/api/", () => "token", fetchFn as unknown as typeof fetch))
+    await c.reload()
+    const star = c.toggleFavourite(key, "Claude Haiku 5.5")
+    expect(c.store.get().favourites.map((f) => f.key)).toEqual([key])
+    const unstar = c.toggleFavourite(key, "Claude Haiku 5.5")
+    expect(c.store.get().favourites).toEqual([])
+    await vi.waitFor(() => expect(changes).toEqual(["PUT"]))
+    answerPut()
+    await Promise.all([star, unstar])
+    expect(changes).toEqual(["PUT", "DELETE"])
+    expect(c.store.get().favourites).toEqual([])
+    expect(c.store.get().notice).toBeUndefined()
+  })
+
+  it("a finished download gives way to the list asked for after it: a model deleted since shows its download again", async () => {
+    const key = "sherpa:whisper-turbo"
+    const running: JobInfo = { id: "job-3", tool: "stt-models", target: "whisper-turbo", action: "download", label: "Whisper turbo", state: "running", log: [], startedAt: 1 }
+    const sherpa = (state: "installed" | "not_installed") =>
+      ({ kind: "stt", providers: [pm(info("sherpa", "On this machine", { location: "local" }), [entry("sherpa", "whisper-turbo", "Whisper turbo", { local: { state, sizeMb: 1, diskMb: 1 }, selectable: state === "installed" })])] })
+    const host = createStore(initialState, (s, u: Partial<typeof initialState>) => ({ ...s, ...u }))
+    const api = makeVoiceApi(() => "http://h/api/", () => "token", (async (url: string) =>
+      url.endsWith("models/stt/download") ? reply({ job: running }, 202) : reply(url.includes("favourites") ? favs : sherpa("not_installed"))) as unknown as typeof fetch)
+    const stt = createModelCatalog("stt", { store: host }, api)
+    await stt.reload()
+    await stt.download(key)
+    // While it runs, a new list keeps the record.
+    host.dispatch({ jobs: [running] })
+    await stt.reloadProvider("sherpa")
+    expect(stt.store.get().downloads[key]?.job?.id).toBe("job-3")
+    // It succeeded, and the model was deleted since: the list says so, and the record goes.
+    host.dispatch({ jobs: [{ ...running, state: "succeeded" }] })
+    await stt.reloadProvider("sherpa")
+    expect(stt.store.get().downloads[key]).toBeUndefined()
+    expect(stt.store.get().lists[0]!.models[0]!.local?.state).toBe("not_installed")
   })
 
   it("only recognisers download; the model goes in the body as a reference", async () => {
