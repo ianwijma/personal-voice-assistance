@@ -165,7 +165,7 @@ const bench = (args: ReadonlyArray<string>) =>
       return
     }
     if (args[0] === "--live") {
-      const usage = "Usage: bench --live [--rounds N] [--sessions N] [--stagger MS] <wav files or directories> (16 kHz mono)"
+      const usage = "Usage: bench --live [--rounds N] [--sessions N] [--stagger MS] [--llm-per-session] <wav files or directories> (16 kHz mono)"
       const parsed = parseLiveArgs(args.slice(1))
       if (typeof parsed === "string") return yield* new StartupError({ message: `${parsed}. ${usage}` })
       const once = yield* collectWavs(parsed.paths.map((p) => resolve(userCwd, p)))
@@ -190,11 +190,14 @@ const bench = (args: ReadonlyArray<string>) =>
       const settings = yield* AppConfig
       const modules = yield* startCliModules()
       const conversation = { ...settings, systemPrompt: withModuleInstructions(settings.systemPrompt, modules.instructions) }
-      const { sessions, staggerMs } = parsed
-      const perSession = yield* runLiveSessions({ files, outputDir, conversation, modules, sessions, staggerMs }).pipe(
+      const { sessions, staggerMs, llmPerSession } = parsed
+      // `--llm-per-session`: one language-model instance per session (serve mode's pool with two different settings).
+      const ownLlm = llmPerSession ? { llmPerSession: llm } : {}
+      const perSession = yield* runLiveSessions({ files, outputDir, conversation, modules, sessions, staggerMs, ...ownLlm }).pipe(
         Effect.provide(withVoiceTrace(providers, voice.ref))
       )
-      const together = sessions === 1 ? "" : `, ${sessions} sessions, user audio ends ${staggerMs === 0 ? "at the same moment" : `${staggerMs} ms apart`}`
+      const together = (sessions === 1 ? "" : `, ${sessions} sessions, user audio ends ${staggerMs === 0 ? "at the same moment" : `${staggerMs} ms apart`}`) +
+        (llmPerSession ? ", one LLM instance per session" : "")
       for (const [i, rows] of perSession.entries()) {
         const which = sessions === 1 ? "" : ` — session ${i + 1} of ${sessions}`
         console.log(formatReport(`live: ${files.length} turns, ${llmLabel}${together}, replies in ${outputDir}${which}`, rows, {
@@ -234,7 +237,7 @@ const program: Effect.Effect<void, unknown> = mode === "text"
   : mode === "serve"
   ? serveMode
   : new StartupError({
-    message: `Unknown mode "${mode}". Usage: assistant [text | voice | serve | bench [--sessions N | --live [--rounds N] [--sessions N] [--stagger MS] <wavs> | --make-wavs [dir]] | ` +
+    message: `Unknown mode "${mode}". Usage: assistant [text | voice | serve | bench [--sessions N | --live [--rounds N] [--sessions N] [--stagger MS] [--llm-per-session] <wavs> | --make-wavs [dir]] | ` +
       "say [--voice PROVIDER:VOICE] [--out FILE] <text> | transcribe <wav file> | compare-models [--models a,b] [--agc on|off|both] [--ref TEXT] <wavs>]"
   })
 

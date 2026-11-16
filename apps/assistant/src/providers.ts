@@ -1,6 +1,6 @@
 import * as FileAudio from "@pva/audio-file"
 import * as PipeWire from "@pva/audio-pipewire"
-import type { AudioInput, AudioOutput, Llm, Stt, SttError, Tts, TtsError, TtsVoices } from "@pva/core"
+import { type AudioInput, type AudioOutput, Llm, type Stt, type SttError, type Tts, type TtsError, type TtsVoices } from "@pva/core"
 import { AnthropicLlm } from "@pva/llm-anthropic"
 import * as DeepgramStt from "@pva/stt-deepgram"
 import * as SherpaStt from "@pva/stt-sherpa"
@@ -32,6 +32,22 @@ const llmProviders = {
   // turn from the running modules; this offline stand-in answers, with a notice, while that module is not running.
   "claude-subscription": FakeLlm.layer
 }
+
+/**
+ * The language-model accounts serve mode's resource pool builds instances of (docs/ASSISTANTS.md §3.2,
+ * `serve/Resources.ts`): one layer per account, read from a `ConfigProvider` that carries the assistant's own `llm`
+ * fields (`ANTHROPIC_MODEL`, …) over the shared settings (the account's key and address). `claude-subscription` is the
+ * offline stand-in that answers while the agent module is not running (the agent itself is the module's, WP-13a).
+ * `openrouter` and `home-model` are not here yet (WP-13b): the pool reports them as a problem of that resource.
+ * An Anthropic instance is returned once its warm-up has ended (`awaitWarmUp`), so it is warm when it becomes ready.
+ */
+export const llmAccountLayers = {
+  offline: llmProviders.fake,
+  anthropic: Layer.effect(Llm, Effect.flatMap(AnthropicLlm.config, (options) => AnthropicLlm.make({ ...options, awaitWarmUp: true }))),
+  "claude-subscription": llmProviders["claude-subscription"]
+} satisfies Record<string, Layer.Layer<Llm, Config.ConfigError>>
+export type LlmAccountWithLayer = keyof typeof llmAccountLayers
+export const hasLlmAccountLayer = (account: string): account is LlmAccountWithLayer => Object.hasOwn(llmAccountLayers, account)
 
 /** `sherpa` runs on this machine (models in `models/`); `deepgram` is hosted. */
 const sttProviders = {

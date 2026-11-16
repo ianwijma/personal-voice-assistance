@@ -31,7 +31,7 @@ import {
   WAKE_ARMED_MS
 } from "@pva/protocol"
 import { Effect, Queue, type Scope, Stream } from "effect"
-import type { Engine, EngineProviders, SessionLoop } from "./Engine.ts"
+import type { Engine, SessionLoop } from "./Engine.ts"
 import { type HeardAudio, makeHeardAudio } from "./HeardAudio.ts"
 import { makeOutputLease } from "./OutputLease.ts"
 import { makePublisher, type Publisher } from "./Publisher.ts"
@@ -53,13 +53,15 @@ import { makeStateTracker, type StateTracker } from "./StateTracker.ts"
  * never sound at once. Who owns the audio (which tab of the device) is the hub's business: it calls
  * `web.setOwner` / `setMicLive` and `ownerChanged`.
  *
- * WP-4b scope: the language model, the recogniser and the voice are still the one shared build (the engine's);
- * per-assistant resources are the resource pool's (WP-9 onwards).
+ * WP-9: each assistant's language model is the resource pool's instance for its settings (read at each turn start);
+ * the recogniser and the voice are still the one shared build (the engine's), until WP-10 and WP-11.
  */
 
 export interface AssistantSetup {
+  /** Read at each turn start: prompt, tools and (`TurnSetup.llm`) the resource pool's language model for the assistant. */
   readonly setup: Effect.Effect<TurnSetup>
-  readonly agentSetup?: (providers: EngineProviders) => Effect.Effect<AgentTurnSetup> | undefined
+  /** A `claude-subscription` assistant's agent setup (chosen at each run start; see `SessionConversation`). */
+  readonly agentSetup?: () => Effect.Effect<AgentTurnSetup> | undefined
 }
 
 export interface VoiceSessionOptions {

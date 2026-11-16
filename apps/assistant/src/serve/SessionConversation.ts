@@ -6,6 +6,7 @@ import {
   type ConversationEvent,
   type ConversationInput,
   Llm,
+  LlmError,
   makeAgentConversation,
   makeConversationWithSetup,
   type Message,
@@ -19,7 +20,7 @@ import {
 } from "@pva/core"
 import type { ConversationInfo } from "@pva/protocol"
 import { Effect, Queue, Stream } from "effect"
-import type { BuiltEngines, Engine, EngineProviders } from "./Engine.ts"
+import type { BuiltEngines, Engine } from "./Engine.ts"
 
 /**
  * One voice session's conversation on the shared engines (docs/VOICE-SESSIONS.md §2): the `Conversation` and its
@@ -40,10 +41,11 @@ export interface SessionConversationOptions {
   /** The turn setup (system prompt and tools), read at the start of each turn. */
   readonly setup: Effect.Effect<TurnSetup>
   /**
-   * An agent conversation for these providers (`LLM_PROVIDER=claude-subscription`), read at the start of each turn;
-   * `undefined`: the single-model conversation over `providers.llm` with `setup`.
+   * An agent conversation (a `claude-subscription` assistant), chosen at each run start, its setup read at the start
+   * of each turn; `undefined`: the single-model conversation with `setup`, whose `TurnSetup.llm` (the resource
+   * pool's instance) answers the turn (default: `providers.llm`, tests).
    */
-  readonly agentSetup?: (providers: EngineProviders) => Effect.Effect<AgentTurnSetup> | undefined
+  readonly agentSetup?: () => Effect.Effect<AgentTurnSetup> | undefined
   readonly onEvent: (event: ConversationEvent) => void
   /** A new conversation started (`newConversation`, or the conversation's idle reset). */
   readonly onConversation?: (conversation: ConversationInfo, reason: "new" | "idle") => void
@@ -96,6 +98,9 @@ export interface SessionConversation {
   readonly end: Effect.Effect<void>
 }
 
+/** The conversation's own `Llm` when neither the turn's setup nor the build names one: every turn fails. */
+const noLlm = Llm.of({ stream: () => Stream.fail(new LlmError({ message: "No language model is set up for this assistant." })) })
+
 /** A control input with the Stop generation it was accepted in (`undefined`: a speech event). */
 interface Control {
   readonly input: ConversationInput
@@ -147,10 +152,10 @@ export const makeSessionConversation = (options: SessionConversationOptions): Ef
           maxToolRounds: options.maxToolRounds?.() ?? providers.maxToolRounds,
           bargeIn: true
         }
-        const agentSetup = options.agentSetup?.(providers)
+        const agentSetup = options.agentSetup?.()
         const conversation = yield* (agentSetup !== undefined
           ? makeAgentConversation({ ...common, setup: agentSetup })
-          : makeConversationWithSetup({ ...common, setup: options.setup }).pipe(Effect.provideService(Llm, providers.llm))
+          : makeConversationWithSetup({ ...common, setup: options.setup }).pipe(Effect.provideService(Llm, providers.llm ?? noLlm))
         ).pipe(Effect.provideService(TurnTrace, options.turnTrace))
         live = conversation
         ready = true
@@ -203,8 +208,7 @@ export const makeSessionConversation = (options: SessionConversationOptions): Ef
     /** Tell the agents of the running build that this conversation ended. Never fails. */
     const endAgents = (conversationId: string): Effect.Effect<void> =>
       Effect.suspend(() => {
-        const built = options.engine.built()
-        const setup = built === undefined ? undefined : options.agentSetup?.(built.providers)
+        const setup = options.agentSetup?.()
         if (setup === undefined) return Effect.void
         return setup.pipe(
           Effect.flatMap((s) => {

@@ -946,3 +946,71 @@ Deviations from §5:
 - No module field is `overridable` yet (WP-12b), so any `own` value on a module choice is refused.
 - Saving through the new messages refreshes live sessions' route configuration through `refreshProfiles` (no reload); LLM, recogniser and voice stay the shared build until WP-9/10/11.
 - Deleting an assistant ends its conversations by `stop` plus `newConversation` on each live session that has one (the conversation of a deleted assistant is no longer reachable).
+
+### WP-9 resource pool, language models: built 2026-11-16
+
+`serve/Resources.ts` holds the language models; the recogniser and the voice are still the engine's one shared build
+(WP-10, WP-11), so `Engine.ts` is the full reload of those two plus the status, which gains `resources`.
+
+- **Keys.** `llmKeyOf` = account + model + effort + thinking + maxTokens + giveUpMs + warmUp + the address with its
+  user info and query removed. The instance's identity adds the full address and a stamp of the account's key (the
+  first 16 hex digits of its SHA-256; never shown, never the key), so a changed key or address builds new instances.
+  The offline accounts (`offline`, and `claude-subscription`'s stand-in) ignore the model fields: every assistant on
+  them shares one instance.
+- **Builders.** `providers.ts` `llmAccountLayers`: `offline` and the `claude-subscription` stand-in are the offline LLM;
+  `anthropic` is `AnthropicLlm.make` over a `ConfigProvider` with the assistant's fields on top of the shared settings
+  (so the key comes from the vault or the environment as before), with `awaitWarmUp` (new, additive option of
+  `llm-anthropic`): the instance is ready only once its warm-up request has ended, so "ready" means "warm". `openrouter`
+  and `home-model` have no layer yet: their resource is `failed` with "The … account is not available yet." (WP-13b
+  adds them in `llmAccountLayers`). The Claude subscription agent itself is still the module's (WP-13a).
+- **Wanted** = every switched-on assistant on at least one effective list (each device type's defaults and each
+  known device's own list). `reconcile` runs at start (awaited by `ServeHandle.ready`, so every wanted instance is
+  built and warm before the first turn), after every successful settings-store save (`save…`, `create…`, `delete…`,
+  `import…`, which also covers WP-5's handlers), and after a vault lock or unlock (an unlock retries failed
+  instances); a turn of an assistant that is not bound yet reconciles at once and waits for its instance.
+- **Switching.** Each turn reads its assistant's instance once, at its start (`TurnSetup.llm`, the one additive seam
+  in core, see ARCHITECTURE.md), and keeps it for every round of its tool loop. A changed configuration builds the
+  new instance while the assistant stays bound to the old one; once the new one is ready the assistant is rebound,
+  and its next turn start uses it. Nothing else is stopped: no engine reload, no other session or assistant touched.
+- **Release.** An instance nobody is bound to or wants is `unused` and is closed 10 s later (`RESOURCE_GRACE_MS`),
+  and not before the last stream running on it has ended; wanted again within the grace, it is kept. A failed or
+  never-ready instance is dropped at once.
+- **Failure.** A build failure is that resource's `state: "failed"` with its `problem` (a key that "is not set" while
+  the vault is locked is reworded as the locked-keys message). Its assistants' turns fail with that problem (logged;
+  the device gets `turn_failed`), every other assistant answers. A warm-up that fails (a wrong key) does not fail the
+  build, as before: the first turn then fails.
+- **Full reload.** The owner's reload (and the reloads for model directories and threads) also rebuilds every
+  instance in use, in the background: each assistant switches when its new instance is ready, and the reload does
+  not wait for it.
+- **Status.** `EngineStatus.resources` lists every instance (`kind: "llm"`, key, label, location, `usedBy`, state,
+  problem). While a changed instance is built both the old (still `usedBy` the assistant) and the new are listed. The
+  `engines` list keeps one `llm` row for pages before WP-6: the first switched-on assistant's account and model.
+- **Not yet.** The Provider page's flat keys (`LLM_PROVIDER`, `ANTHROPIC_MODEL`, …) are no longer read by serve mode
+  (§4.4): after migration only the assistant's `llm` (and the environment's locks) count, and changing a model in the
+  UI waits for the assistant pages (WP-5/WP-6); the page still marks them "reload". The CLI modes still use the flat
+  keys (§4.4's `--assistant` is not built). `TurnTrace`'s `config` snapshot is still not filled.
+- **Tests.** `test/resources.test.ts` (sharing, a change with a turn in flight, grace, failure and retry, rebuild, keys,
+  a key stamp change, the default builder), `test/serveResources.test.ts` (scripted client: two assistants answer from
+  their own instances and share one when equal; a model change on Alpha while turns of Bravo on another device and of
+  Alpha itself are in progress: both complete on their old instances, Alpha's next turns on either device use the new
+  one, no engine reload; a failed instance in the status, `turn_failed`, the other assistant answers),
+  `packages/core/test/TurnSetupLlm.test.ts` (a model published mid-turn applies from the next turn; absent = the
+  conversation's), `llm-anthropic` warm-up tests (`awaitWarmUp`).
+- **Bench.** `bench --live --llm-per-session` gives each session its own language-model instance (as two assistants
+  with different settings), to compare with the shared one.
+- **Measurements** (this machine, 2026-11-16, load 0.8–2.2). Offline bench (`pnpm start bench`), three runs each of
+  82f2d02 (a detached worktree) and this package, alternated; end of turn → playback start, median / worst ms.
+  Orchestration overhead: 1.1 / 1.9, 0.9 / 1.8, 1.0 / 2.2 → 0.9 / 3.4, 0.9 / 2.2, 0.9 / 1.5; session path overhead
+  0.7 / 1.3, 1.2 / 2.0, 0.8 / 1.2 → 0.8 / 1.4, 0.9 / 1.4, 0.8 / 1.2; every realistic row unchanged within 2 ms
+  (eager off 507–509 / 734–738, eager on 306–309 / 533–537). The offline bench builds `Conversation.layer`, not the
+  setup path, so the setup path was measured apart: 3000 text turns through `Conversation.layerWithSetup` with an
+  instant `Llm`, the first 500 dropped, `TurnTrace` `llmRequestSent` − turn start, median: 27, 27, 28 µs at 82f2d02;
+  28, 27, 29 µs now without `TurnSetup.llm`; 22–24 µs with a fixed or a per-turn-changing `TurnSetup.llm` (run after
+  the first mode in the same process, so warmer). No measurable cost.
+- **Not measured (no Anthropic key on this machine).** `llmFirstToken` of a freshly built Anthropic instance with and
+  without warm-up, and two Anthropic instances against one. With a key (`ANTHROPIC_API_KEY`, or the vault with
+  `PVA_VAULT_PASSWORD`), each run a fresh process whose first row is a fresh instance:
+  `LLM_PROVIDER=anthropic ANTHROPIC_WARM_UP=false pnpm start bench --live --rounds 3 bench-audio` against
+  `ANTHROPIC_WARM_UP=true` (five runs each, compare the first row's "1st token"), and
+  `LLM_PROVIDER=anthropic pnpm start bench --live --rounds 2 --sessions 2 bench-audio` against the same with
+  `--llm-per-session`.
