@@ -126,12 +126,14 @@ describe("latency page: what changed since a turn", () => {
 
   it("names a changed account, effort, thinking and reply length", () => {
     const a = now({ llm: { ...assistant.llm, account: "claude-subscription", useModules: true, effort: "high", thinking: "adaptive", maxTokens: 2048 } })
+    // The Claude subscription uses no longest reply: only the settings both accounts use are compared.
     expect(changedSince(trace(), ctx({ assistants: [a] }))).toEqual([
       "account Anthropic API → Claude subscription",
       "effort low → high",
-      "thinking off → adaptive",
-      "longest reply 1024 → 2048"
+      "thinking off → adaptive"
     ])
+    const api = now({ llm: { ...assistant.llm, maxTokens: 2048 } })
+    expect(changedSince(trace(), ctx({ assistants: [api] }))).toEqual(["longest reply 1024 → 2048"])
   })
 
   it("names changed tool rounds, and module and tool counts (a tool switched off counts)", () => {
@@ -174,6 +176,9 @@ describe("latency page: what changed since a turn", () => {
     const sub = { account: "claude-subscription", model: "claude-haiku-5-5", effort: "low", thinking: "off", maxTokens: 1024 } as const
     const blank = now({ llm: { ...assistant.llm, ...sub, model: "", useModules: true } })
     expect(changedSince(trace({ config: config({ llm: sub }) }), ctx({ assistants: [blank] }))).toEqual([])
+    // It passes no token limit: the server records the stand-in's 1024 whatever is saved, so a saved 2048 is no change.
+    const longer = now({ llm: { ...assistant.llm, ...sub, maxTokens: 2048, useModules: true } })
+    expect(changedSince(trace({ config: config({ llm: sub }) }), ctx({ assistants: [longer] }))).toEqual([])
     // An account that uses them still reports changed ones; a changed account names only the settings both use.
     const anthropic = now({ llm: { ...assistant.llm, effort: "high" } })
     expect(changedSince(trace(), ctx({ assistants: [anthropic] }))).toEqual(["effort low → high"])
