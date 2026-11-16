@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest"
 import type { DeviceSetup, ServerMessage } from "@pva/protocol"
-import { exampleDeviceSetup, serverExamples } from "@pva/protocol/examples"
+import { exampleConversation, exampleDeviceSetup, serverExamples } from "@pva/protocol/examples"
 import { type Action, type ClientState, initialState, profileOf, reducer } from "@/lib/state.ts"
 import { stageOverlays } from "@/ui/voiceRegistry.ts"
 import {
@@ -23,7 +23,13 @@ const run = (actions: ReadonlyArray<Action>, from: ClientState = initialState) =
 
 const assistant = (id: string, phrases: ReadonlyArray<string> = []) => ({ id, name: id.toUpperCase(), purpose: "", on: true, phrases: [...phrases] })
 const setup = (assistants: DeviceSetup["assistants"], withoutPhrase: DeviceSetup["withoutPhrase"]): DeviceSetup => ({ ...exampleDeviceSetup, assistants, withoutPhrase })
-const welcomeWith = (s: DeviceSetup): ServerMessage => ({ ...serverExamples.welcome, snapshot: { ...serverExamples.welcome.snapshot, setup: s, conversations: undefined } as never })
+const conversationOf = (assistantId: string) => ({ assistantId, id: exampleConversation.id, startedAt: exampleConversation.startedAt, turns: 2 })
+/** A welcome for this setup. By default the server lists only the answering assistant's conversation (the one `history` belongs to). */
+const welcomeWith = (s: DeviceSetup): ServerMessage => {
+  const answering = answeringId({ ...initialState, setup: s })
+  const conversations = answering === undefined ? [] : [conversationOf(answering)]
+  return { ...serverExamples.welcome, snapshot: { ...serverExamples.welcome.snapshot, setup: s, conversations } }
+}
 const setupMessage = (s: DeviceSetup): ServerMessage => ({ type: "device.setup", ...s })
 
 const two = setup([assistant("jeff"), assistant("t3", ["hey t3"])], { mode: "assistant", assistant: "jeff" })
@@ -141,12 +147,11 @@ describe("device.setup", () => {
   })
 })
 
-describe("welcome without a conversations list (a server that sends one history)", () => {
-  it("files the snapshot's history under the answering assistant, loaded, with the snapshot's count", () => {
+describe("welcome with only the answering assistant's conversation listed", () => {
+  it("files the snapshot's history under the answering assistant, loaded, with the listed count", () => {
     const s = run([welcomeWith(two)])
-    const snap = serverExamples.welcome.snapshot
     expect(Object.keys(s.conversations)).toEqual(["jeff"])
-    expect(s.conversations.jeff).toMatchObject({ id: snap.conversation.id, loaded: true, turns: snap.history.length })
+    expect(s.conversations.jeff).toMatchObject({ id: exampleConversation.id, loaded: true, turns: conversationOf("jeff").turns })
     expect(needsRead(s, "jeff")).toBe(false)
     expect(turnsOf(s, "jeff").every((t) => t.assistantId === "jeff")).toBe(true)
   })
