@@ -329,6 +329,129 @@ describe("the model catalog's calls", () => {
     expect(stt.store.get().lists[0]!.models[0]!.local?.state).toBe("not_installed")
   })
 
+  // Requests held open until the test answers them, by name (round 3: every writer of a list, the refresh mark and a
+  // download record checks one sequence shared by all requests that write it).
+  const holder = () => {
+    const waiting = new Map<string, () => void>()
+    const hold = (name: string) => new Promise<void>((resolve) => {
+      waiting.set(name, () => {
+        waiting.delete(name)
+        resolve()
+      })
+    })
+    const release = (name: string) => waiting.get(name)!()
+    return { waiting, hold, release }
+  }
+  const heldLlm = () => {
+    const { waiting, hold, release } = holder()
+    const ready = { kind: "llm", providers: [pm(info("anthropic", "Anthropic API"), [entry("anthropic", "old", "Old")])] }
+    const opts = { full: sample as unknown, holdFull: false, holdRetry: false, retryFails: false }
+    const fetchFn = async (url: string) => {
+      if (url.includes("favourites")) return reply(favs)
+      if (url.includes("provider=anthropic")) {
+        const fails = opts.retryFails
+        if (opts.holdRetry) await hold("retry")
+        return fails ? reply({ error: { code: "boom", message: "No." } }, 500) : reply(ready)
+      }
+      const answer = opts.full // the list as it was when it was asked for
+      if (opts.holdFull) await hold("full")
+      return reply(answer)
+    }
+    const host = { store: createStore(initialState, (s) => s) }
+    const c = createModelCatalog("llm", host, makeVoiceApi(() => "http://h/api/", () => "token", fetchFn as unknown as typeof fetch))
+    return { c, opts, waiting, release }
+  }
+  const keyless = { kind: "llm", providers: [pm(info("anthropic", "Anthropic API", { status: "needs_key", reason: "missing", message: "Anthropic is not set up." }), []), ...catalog.slice(1)] }
+  const anthropicOf = (c: ReturnType<typeof createModelCatalog>) => c.store.get().lists.find((p) => p.provider.id === "anthropic")!
+
+  it("a provider's Retry answered after a newer full load does not bring back its older list, nor the other way round", async () => {
+    const { c, opts, waiting, release } = heldLlm()
+    await c.reload()
+    // Retry waits; meanwhile the key is removed and the full load (asked for later) answers first: not set up.
+    opts.holdRetry = true
+    const retry = c.reloadProvider("anthropic", true)
+    await vi.waitFor(() => expect(waiting.has("retry")).toBe(true))
+    opts.full = keyless
+    await c.reload()
+    expect(anthropicOf(c).provider.status).toBe("needs_key")
+    release("retry")
+    await retry
+    expect(anthropicOf(c).provider.status).toBe("needs_key")
+    expect(anthropicOf(c).models).toEqual([])
+    expect(c.store.get().refreshing).toBe(false)
+    // A full load asked for first and answered last keeps the Retry's newer list, and takes the other providers.
+    opts.holdRetry = false
+    opts.holdFull = true
+    const load = c.reload(true)
+    await vi.waitFor(() => expect(waiting.has("full")).toBe(true))
+    await c.reloadProvider("anthropic", true)
+    expect(anthropicOf(c).models.map((m) => m.name)).toEqual(["Old"])
+    release("full")
+    await load
+    expect(anthropicOf(c).models.map((m) => m.name)).toEqual(["Old"])
+    expect(c.store.get().lists.map((p) => p.provider.id)).toEqual(["anthropic", "openrouter", "home-model", "offline"])
+    expect(c.store.get().refreshing).toBe(false)
+  })
+
+  it("a Retry that fails after a newer answer for its provider shows no error; one that fails last does", async () => {
+    const { c, opts, waiting, release } = heldLlm()
+    await c.reload()
+    opts.holdRetry = true
+    opts.retryFails = true
+    const retry = c.reloadProvider("anthropic", true)
+    await vi.waitFor(() => expect(waiting.has("retry")).toBe(true))
+    await c.reload()
+    release("retry")
+    await retry
+    expect(c.store.get().notice).toBeUndefined()
+    opts.holdRetry = false
+    await c.reloadProvider("anthropic", true)
+    expect(c.store.get().notice).toMatchObject({ tone: "error", message: "No." })
+  })
+
+  it("the refresh mark stays while any request that shows it is pending, not only until the first one ends", async () => {
+    const { c, opts, waiting, release } = heldLlm()
+    await c.reload()
+    opts.holdFull = true
+    const load = c.reload(true)
+    await vi.waitFor(() => expect(waiting.has("full")).toBe(true))
+    expect(c.store.get().refreshing).toBe(true)
+    await c.reloadProvider("anthropic") // the client's watch: not a refresh
+    expect(c.store.get().refreshing).toBe(true)
+    await c.reloadProvider("anthropic", true)
+    expect(c.store.get().refreshing).toBe(true)
+    release("full")
+    await load
+    expect(c.store.get().refreshing).toBe(false)
+  })
+
+  it("a cancel answered after a newer download of the same model does not replace its record", async () => {
+    const key = "sherpa:whisper-turbo"
+    const job = (id: string, state: JobInfo["state"]): JobInfo => ({ id, tool: "stt-models", target: "whisper-turbo", action: "download", label: "Whisper turbo", state, log: [], startedAt: 1 })
+    const list = { kind: "stt", providers: [pm(info("sherpa", "On this machine", { location: "local" }), [entry("sherpa", "whisper-turbo", "Whisper turbo", { local: { state: "not_installed", sizeMb: 1, diskMb: 1 }, selectable: false })])] }
+    const { waiting, hold, release } = holder()
+    let started = 0
+    const api = makeVoiceApi(() => "http://h/api/", () => "token", (async (url: string) => {
+      if (url.endsWith("models/stt/download")) return reply({ job: job(`job-${++started}`, "running") }, 202)
+      if (url.endsWith("models/stt/download/cancel")) {
+        await hold("cancel")
+        return reply({ cancelled: true, job: job("job-1", "cancelled") })
+      }
+      return reply(url.includes("favourites") ? favs : list)
+    }) as unknown as typeof fetch)
+    const stt = createModelCatalog("stt", { store: createStore(initialState, (s) => s) }, api)
+    await stt.reload()
+    await stt.download(key)
+    const cancel = stt.cancelDownload(key)
+    await vi.waitFor(() => expect(waiting.has("cancel")).toBe(true))
+    // The job ended meanwhile (the row offers Download again), and a new download starts before the cancel answers.
+    await stt.download(key)
+    expect(stt.store.get().downloads[key]?.job?.id).toBe("job-2")
+    release("cancel")
+    await cancel
+    expect(stt.store.get().downloads[key]?.job).toMatchObject({ id: "job-2", state: "running" })
+  })
+
   it("only recognisers download; the model goes in the body as a reference", async () => {
     const llm = setup(() => reply({ job: {} }))
     await llm.catalog.download("anthropic:claude-haiku-5-5")

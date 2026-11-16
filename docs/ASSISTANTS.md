@@ -815,8 +815,9 @@ The built pages follow the mock-ups; these are the differences that are not in Â
   not shown; Home and Routing appear when the server sends their section. Capability modules have no on/off switch (they run
   for the assistants that have them on; the shared Modules page shows "Used by" and each instance); agent and decision modules
   keep theirs.
-- **Language model tab.** The model is a free-text field; the models of a provider are not listed. Account cards say "Key set" or
-  "Address set" from the shared sections. "Ask before acting" is shown disabled.
+- **Language model and Hearing tabs.** The account cards and the model field, and the engine cards and the model list, are each
+  one picker (`LlmModelPicker`, `SttModelPicker`: every provider's models, favourites, a typed model, downloads of recogniser
+  models; docs/MODEL-PICKERS.md). "Ask before acting" is shown disabled.
 - **Device pages.** TypeSafe is listed and disabled ("which is not set up") until the routing section is on and has a key (the
   admin reads this from the section; `canAuto` goes only to voice pages). The phrase tester has no "Add as phrase" on ignored
   lines: a heard phrase belongs to an assistant, picked on the device page. The Hearing tab and device page do not show the
@@ -1004,10 +1005,9 @@ temporary root per run (`vitest.global-setup.ts`) so they no longer leave `pva-*
   and hand over only when it chooses another. No warm-up request keeps the connection open (Node closes an idle one after about 4 s), so
   a first sentence after a pause also pays the connection set-up; the live run had 1 s gaps and did not measure that (`--gap-ms 6000`
   does). The 0.5 thresholds, the option-order bias and recogniser output (the live run used typed sentences) are not tuned.
-- **Not built in the UI.** "Add as phrase" on the phrase tester's ignored lines; the memory sentence on the Hearing tab; the models of a
-  provider as a list on the Language model tab (the model is free text; the server half, `/api/models/{llm,stt}`, is built:
-  docs/MODEL-PICKERS.md); a "not set up" warning on saving an assistant (the problem shows
-  on the assistant and in the status); OpenRouter's per-model reasoning effort is not sent.
+- **Not built in the UI.** "Add as phrase" on the phrase tester's ignored lines; the memory sentence on the Hearing tab; a "not set up"
+  warning on saving an assistant (the problem shows on the assistant and in the status); OpenRouter's per-model reasoning effort is
+  not sent. (The model pickers are built, server and web: docs/MODEL-PICKERS.md.)
 - **Command-line modes.** They read the flat keys; `cliAssistant` resolves an assistant that no mode uses, and there is no `--assistant`
   flag. The CLI modes do not apply Home (no Home line, no linked defaults).
 - **Not measured.** `llmFirstToken` of a fresh Anthropic instance with and without warm-up, and two Anthropic instances against one (no

@@ -85,43 +85,77 @@ export const createModelCatalog = (kind: PickerKind, host: CatalogHost, api: Voi
       ? downloads
       : Object.fromEntries(Object.entries(downloads).filter(([key, d]) => d.starting === true || d.job?.id === undefined || finished.get(key) !== d.job?.id))
 
+  // Every request that writes a provider's list (a full load, or one provider's) takes the next `listSeq`; an answer
+  // writes a provider's list only if no newer request's answer has written it (`listAt`), whichever kind that was.
+  // So an older answer never brings back a list (or settings) a newer one replaced.
+  let listSeq = 0
+  const listAt = new Map<string, number>()
+  const newer = (id: string, at: number) => at > (listAt.get(id) ?? 0)
+  // `refreshing` is true while any request that shows it is pending, not only the one that ended last.
+  let busy = 0
+  const busyStart = () => {
+    busy++
+    set({ refreshing: true })
+  }
+  const busyEnd = () => {
+    busy--
+    if (busy === 0) set({ refreshing: false })
+  }
+
   let loadSeq = 0
   const reload = async (refresh = false) => {
     const seq = ++loadSeq
+    const at = ++listSeq
     const finished = finishedDownloads()
     // The favourites answer is shown only if no favourite change was pending when it was asked for or started since:
     // otherwise it may predate that change, and the change's own answer (or the optimistic state) is newer.
     const favAt = favPending === 0 ? favSeq : -1
-    set((s) => ({ ...s, ...(s.load === "ready" ? { refreshing: true } : { load: "loading" as const }) }))
+    const marked = get().load === "ready"
+    if (marked) busyStart()
+    else set({ load: "loading" })
     try {
-      const [models, favs] = await Promise.all([ // continuation(state): only the newest load writes (`seq`)
+      const [models, favs] = await Promise.all([ // continuation(state): only the newest load writes (`seq`), each list only if newest (`listAt`)
         json(ModelsResponse, `models/${kind}${refresh ? "?refresh=1" : ""}`),
         json(ModelFavouritesResponse, `models/${kind}/favourites`)
       ])
+      if (marked) busyEnd()
       if (seq !== loadSeq) return
       const { loadError: _e, ...rest } = get()
-      set(() => ({ ...rest, load: "ready", refreshing: false, lists: models.providers, favourites: favAt === favSeq && favPending === 0 ? favs.favourites : rest.favourites, downloads: settle(rest.downloads, finished) }))
+      const lists = models.providers.map((p) => {
+        const id = p.provider.id
+        const kept = newer(id, at) ? undefined : rest.lists.find((q) => q.provider.id === id)
+        if (kept !== undefined) return kept
+        listAt.set(id, Math.max(at, listAt.get(id) ?? 0))
+        return p
+      })
+      set(() => ({ ...rest, load: "ready", lists, favourites: favAt === favSeq && favPending === 0 ? favs.favourites : rest.favourites, downloads: settle(rest.downloads, finished) }))
     } catch (e) {
+      if (marked) busyEnd()
       if (seq !== loadSeq) return
       const message = messageOf(e, `The ${noun} could not be loaded.`)
-      set((s) => (s.load === "ready" ? { ...s, refreshing: false, notice: { tone: "error", message } } : { ...s, load: "error", refreshing: false, loadError: message }))
+      set((s) => (s.load === "ready" ? { ...s, notice: { tone: "error", message } } : { ...s, load: "error", loadError: message }))
     }
   }
 
   const reloadProvider = async (id: string, refresh = false) => {
-    if (refresh) set({ refreshing: true })
+    const at = ++listSeq
+    if (refresh) busyStart()
     const finished = finishedDownloads()
     try {
-      const answer = await json(ModelsResponse, `models/${kind}?provider=${encodeURIComponent(id)}${refresh ? "&refresh=1" : ""}`) // continuation(state): merges by provider id into the newest lists
+      const answer = await json(ModelsResponse, `models/${kind}?provider=${encodeURIComponent(id)}${refresh ? "&refresh=1" : ""}`) // continuation(state): writes this provider's list only if newest (`listAt`)
+      if (refresh) busyEnd()
       const fresh = answer.providers.find((p) => p.provider.id === id)
-      set((s) => ({
-        ...s,
-        refreshing: false,
-        lists: fresh === undefined ? s.lists : s.lists.map((p) => (p.provider.id === id ? fresh : p)),
-        downloads: fresh === undefined ? s.downloads : settle(s.downloads, new Map([...finished].filter(([key]) => key.startsWith(`${id}:`))))
-      }))
+      const s = get()
+      if (fresh === undefined || !newer(id, at) || !s.lists.some((p) => p.provider.id === id)) return
+      listAt.set(id, at)
+      set({
+        lists: s.lists.map((p) => (p.provider.id === id ? fresh : p)),
+        downloads: settle(s.downloads, new Map([...finished].filter(([key]) => key.startsWith(`${id}:`))))
+      })
     } catch (e) {
-      set((s) => ({ ...s, refreshing: false, ...(refresh ? { notice: { tone: "error" as const, message: messageOf(e, `The ${noun} could not be loaded.`) } } : {}) }))
+      if (refresh) busyEnd()
+      // A newer answer for this provider already arrived: this failure is old news.
+      if (refresh && newer(id, at)) set({ notice: { tone: "error", message: messageOf(e, `The ${noun} could not be loaded.`) } })
     }
   }
 
@@ -222,14 +256,21 @@ export const createModelCatalog = (kind: PickerKind, host: CatalogHost, api: Voi
       const { [key]: _old, ...rest } = s.downloads
       return { ...s, downloads: d === undefined ? rest : { ...rest, [key]: d } }
     })
+  // A model's record is written by its download and its cancel; only the newest of those started for it writes (`dlAt`).
+  let dlSeq = 0
+  const dlAt = new Map<string, number>()
   const download = async (key: string) => {
     const ref = parseModelKey(key)
     if (ref === undefined || kind !== "stt" || get().downloads[key]?.starting === true) return
+    const at = ++dlSeq
+    dlAt.set(key, at)
     setDownload(key, { ...get().downloads[key], starting: true })
     try {
-      const { job } = await json(JobResponse, "models/stt/download", { method: "POST", body: { model: ref } }) // continuation(state): writes only this model's entry
+      const { job } = await json(JobResponse, "models/stt/download", { method: "POST", body: { model: ref } }) // continuation(state): writes only this model's entry, only if newest (`dlAt`)
+      if (dlAt.get(key) !== at) return
       setDownload(key, { job })
     } catch (e) {
+      if (dlAt.get(key) !== at) return
       setDownload(key, undefined)
       if (e instanceof ApiError && e.code === "already_installed") return void reloadProvider(ref.provider)
       set({ notice: { key, tone: "error", message: messageOf(e, "The download did not start.") } })
@@ -238,10 +279,14 @@ export const createModelCatalog = (kind: PickerKind, host: CatalogHost, api: Voi
   const cancelDownload = async (key: string) => {
     const ref = parseModelKey(key)
     if (ref === undefined || kind !== "stt") return
+    const at = ++dlSeq
+    dlAt.set(key, at)
     try {
-      const answer = await json(CancelResponse, "models/stt/download/cancel", { method: "POST", body: { model: ref } }) // continuation(state): writes only this model's entry
+      const answer = await json(CancelResponse, "models/stt/download/cancel", { method: "POST", body: { model: ref } }) // continuation(state): writes only this model's entry, only if newest (`dlAt`)
+      if (dlAt.get(key) !== at) return
       setDownload(key, { job: answer.job })
     } catch (e) {
+      if (dlAt.get(key) !== at) return
       if (e instanceof ApiError && e.code === "not_found") return void reloadProvider(ref.provider)
       set({ notice: { key, tone: "error", message: messageOf(e, "The download could not be cancelled.") } })
     }
