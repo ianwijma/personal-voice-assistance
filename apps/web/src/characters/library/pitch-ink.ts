@@ -492,13 +492,14 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
           if (cPos[(head - count + mid + COLS) % COLS]! < want) lo = mid + 1
           else hi = mid
         }
-        // The pointer lies between columns lo - 1 and lo. Where both carry the same voice the ribbon between them is
-        // continuous, however far apart they are (a slow frame rate writes them wide apart): take the nearer one.
-        // At a break (silence, a dotted line, another speaker) or beyond the ends, only a column that is close.
+        // The pointer lies between columns lo - 1 and lo. Where the ribbon joins them (same owner, both inked: the test
+        // the drawing uses, which also holds across a short unvoiced consonant) it is continuous however far apart they
+        // are (a slow frame rate writes them wide apart): take the nearer one. At a break (silence, a dotted line,
+        // another speaker) or beyond the ends, only a column that is close.
         const jA = lo > 0 ? (head - count + lo - 1 + COLS) % COLS : -1
         const jB = count > 0 ? (head - count + lo + COLS) % COLS : -1
         const joined =
-          jA >= 0 && jB >= 0 && cHz[jA]! > 0 && cHz[jB]! > 0 && cOwn[jA] === cOwn[jB] && (cOwn[jA] === YOU || cOwn[jA] === AGENT) && cPos[jA]! <= want && want <= cPos[jB]!
+          jA >= 0 && jB >= 0 && cW[jA]! > 0.05 && cW[jB]! > 0.05 && cOwn[jA] === cOwn[jB] && (cOwn[jA] === YOU || cOwn[jA] === AGENT) && cPos[jA]! <= want && want <= cPos[jB]!
         let bestK = -1
         let bestD = joined ? Infinity : STEP * 1.5
         for (let k = Math.max(0, lo - 1); k <= Math.min(count - 1, lo); k++) {

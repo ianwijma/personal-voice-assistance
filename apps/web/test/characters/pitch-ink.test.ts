@@ -269,6 +269,18 @@ describe("pitch ink: hover", () => {
     expect(labels(last)).toEqual([])
   })
 
+  it("keeps the pitch over ink that continues through a short unvoiced consonant", () => {
+    // Fast paper (216 px/s), a settled voiced line, then one 50 ms frame of a consonant: still speaking, no pitch.
+    // The ribbon bridges it, and the new column is about 10.8 px from the last voiced one.
+    const r = make({ paper: 2.5 })
+    step(r, "hearing", secs(4), { user: voice({ pitchHz: 187.4 }) })
+    recording.log = []
+    r.step({ mode: "hearing", dt: 0.05, user: voice({ voicing: 0, pitchHz: 0 }), agent: silent, palette: PALETTES.dark, reducedMotion: false, pointer: { x: W * 0.8 - 6.8, y: H / 2, down: false, inside: true }, sinceInterrupt: Infinity })
+    const last = recording.log
+    recording.log = null
+    expect(labels(last)).toEqual(["187 Hz"])
+  })
+
   it("shows nothing off the paper's end, outside the canvas, or over a dotted line that carries no voice", () => {
     const r = make()
     // Only about a second of paper has been written, so far back there is nothing.
