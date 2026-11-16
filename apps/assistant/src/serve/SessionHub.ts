@@ -587,11 +587,14 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
     const key = client.sessionKey
     const session = sessionOf(client)
     const o = key === undefined ? undefined : owners.get(key)
+    // Whose conversation `history` is (it follows the follow-up holder): the page files it under that assistant.
+    const answering = session?.conversation.answering()
     return {
       state: session?.tracker.current().state ?? "idle",
       role: isOwner(client) ? "owner" : "observer",
       ownerPresent: o?.owner !== undefined,
       engine: engineSummary(options.engine.status()),
+      ...(answering !== undefined ? { answering } : {}),
       history: session === undefined ? [] : historyItems(Effect.runSync(session.conversation.history())),
       ...(client.role === "voice" ? { device: profileInfo(client) } : {}),
       admin: adminState(client, endReason),
@@ -853,11 +856,17 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
           return result(client, message.requestId, failure("bad_message", "Conversations are read on a voice page"))
         }
         const assistantId = message.assistantId
-        if (!assistants.setupFor(client.device?.id, client.device?.kind).assistants.some((a) => a.id === assistantId)) {
+        const setup = assistants.setupFor(client.device?.id, client.device?.kind)
+        if (!setup.assistants.some((a) => a.id === assistantId)) {
           return result(client, message.requestId, failure("unknown_assistant", `${assistantId} is not one of the assistants on this device`))
         }
         const session = sessionOf(client)
-        const info = session === undefined ? sessions.conversation(client.sessionKey) : session.conversation.conversation(assistantId)
+        // Without a session: the device's id is the one that will answer (as the session decides, §5.3); the others get their own.
+        const wp = setup.withoutPhrase
+        const answers = wp.mode === "assistant" ? wp.assistant : wp.mode === "typesafe" && wp.fallback !== null ? wp.fallback : setup.assistants[0]?.id
+        const info = session === undefined
+          ? sessions.conversation(client.sessionKey, assistantId === answers ? undefined : assistantId)
+          : session.conversation.conversation(assistantId)
         return send(client, {
           type: "conversation.history",
           requestId: message.requestId,

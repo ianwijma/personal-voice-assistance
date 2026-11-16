@@ -39,18 +39,22 @@ const echoLlm: LlmBuilder = () =>
 
 /**
  * Voices that speak 200 ms of silence per clause at their engine's rate (Kokoro 24 kHz, the others 22.05 kHz). A voice
- * in `holds` waits for its gate before its first audio (a turn in progress); a voice in `failing` cannot be built.
+ * in `holds` waits for its gate before its first audio (a turn in progress); a voice in `buildHolds` is still being
+ * built until its gate opens; a voice in `failing` cannot be built.
  */
 const fakeVoices = () => {
   const builds: Array<string> = []
   const released: Array<string> = []
   const holds = new Map<string, Deferred.Deferred<void>>()
+  const buildHolds = new Map<string, Deferred.Deferred<void>>()
   const failing = new Set<string>()
   const build: TtsBuilder = (spec) =>
     Effect.gen(function*() {
       const key = ttsKeyOf(spec)
       if (failing.has(key)) return yield* new ResourceBuildError({ message: `The voice ${spec.voice.voiceId} could not start.` })
       builds.push(key)
+      const building = buildHolds.get(key)
+      if (building !== undefined) yield* Deferred.await(building)
       yield* Effect.addFinalizer(() => Effect.sync(() => released.push(key)))
       const sampleRate = spec.voice.voiceId.startsWith("kokoro") ? 24_000 : 22_050
       return Tts.of({
@@ -68,11 +72,11 @@ const fakeVoices = () => {
           )
       })
     })
-  return { build, builds, released, holds, failing }
+  return { build, builds, released, holds, buildHolds, failing }
 }
 
-/** A data directory with Alpha (voice `alpha`) and Bravo (voice `bravo`) on the browser defaults. */
-const withVoices = async (voices: { alpha: string; bravo: string }): Promise<string> => {
+/** A data directory with Alpha (voice `alpha`) and Bravo (voice `bravo`) on the browser defaults; Bravo off with `bravoOff`. */
+const withVoices = async (voices: { alpha: string; bravo: string }, bravoOff = false): Promise<string> => {
   const dataDir = mkdtempSync(join(tmpdir(), "pva-voices-pool-"))
   const first = await startTestServer({ build: fakeBuild({ stt: controlledStt().stt, llm: scriptedLlm(() => "").llm }), dataDir })
   await first.close()
@@ -81,7 +85,7 @@ const withVoices = async (voices: { alpha: string; bravo: string }): Promise<str
   const base = file.assistants.byId[file.assistants.order[0]]
   const voice = (key: string) => ({ provider: key.slice(0, key.indexOf(":")), voiceId: key.slice(key.indexOf(":") + 1) })
   const make = (id: "alpha" | "bravo", name: string) => ({ ...base, id, rev: 0, name, prompt: `You are ${name}.`, voice: voice(voices[id]) })
-  file.assistants = { order: ["alpha", "bravo"], byId: { alpha: make("alpha", "Alpha"), bravo: make("bravo", "Bravo") } }
+  file.assistants = { order: ["alpha", "bravo"], byId: { alpha: make("alpha", "Alpha"), bravo: { ...make("bravo", "Bravo"), ...(bravoOff ? { on: false } : {}) } } }
   file.deviceTypes["web-voice"] = {
     ...file.deviceTypes["web-voice"],
     assistants: [{ assistant: "alpha", phrases: ["hey alpha"] }, { assistant: "bravo", phrases: ["hey bravo"] }],
@@ -269,5 +273,37 @@ describe("serve: voices from the resource pool (WP-10)", () => {
     expect((await spoken(device, "bravo", "again", "t3")).voices).toEqual([DUTCH])
     // The failed instance is gone at once (it held nothing a turn needs).
     expect(ttsStatus().some((r) => r.state === "failed")).toBe(false)
+  })
+
+  it("an assistant that just came into use answers Stop and typed text while its voice is still being built, and speaks at its rate once it is ready", async () => {
+    const voices = fakeVoices()
+    const building = Deferred.makeUnsafe<void>()
+    voices.buildHolds.set(KOKORO, building)
+    await start(await withVoices({ alpha: PIPER, bravo: KOKORO }, true), voices)
+    const device = await owner("device-a")
+    await Effect.runPromise(server!.handle.store.saveAssistantRecord({ ...assistantOf("bravo"), on: true }))
+    await until("bravo bound to its voice being built", () => server!.handle.resources.ttsKeyFor("bravo") === KOKORO)
+    expect(ttsStatus().find((r) => r.key === KOKORO)?.state).toBe("starting")
+
+    // A spoken turn starts at once (it waits for the voice itself, before it plays), and Stop ends it.
+    const from = device.messages.length
+    device.send({ type: "text.send", requestId: "b1", text: "hello", speak: true, assistantId: "bravo" })
+    const first = await device.waitFor("turn.start", (m) => m.assistantId === "bravo", { from, timeoutMs: 5_000 })
+    device.send({ type: "interrupt", turnId: first.turnId })
+    expect((await device.waitFor("turn.end", (m) => m.turnId === first.turnId, { from, timeoutMs: 5_000 })).outcome).toBe("interrupted")
+
+    // A typed reply that is not spoken does not wait for the voice either.
+    const typedFrom = device.messages.length
+    device.send({ type: "text.send", requestId: "b2", text: "typed", speak: false, assistantId: "bravo" })
+    const typed = await device.waitFor("turn.start", (m) => m.assistantId === "bravo", { from: typedFrom, timeoutMs: 5_000 })
+    expect((await device.waitFor("turn.end", (m) => m.turnId === typed.turnId, { from: typedFrom, timeoutMs: 5_000 })).outcome).toBe("completed")
+    expect(ttsStatus().find((r) => r.key === KOKORO)?.state).toBe("starting")
+
+    // A spoken turn that waits plays once the voice is built, at its own rate.
+    const later = spoken(device, "bravo", "now", "b3")
+    await sleep(100)
+    Deferred.doneUnsafe(building, Exit.void)
+    const b = await later
+    expect([b.end.outcome, b.voices, b.sampleRate]).toEqual(["completed", [KOKORO], 24_000])
   })
 })

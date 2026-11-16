@@ -43,6 +43,10 @@ export interface SectionContext {
   readonly defaultsName: string
   readonly deviceName: string
   readonly setBlocked: (id: string, blocked: boolean) => void
+  /** Changes when the draft is discarded or a section reset: the key of the number fields, so they start again. */
+  readonly generation: number
+  /** A reset of part of the draft: the number fields drop what was typed and its error. */
+  readonly renew: () => void
 }
 
 /** Section marks for `id`, wired to the draft. */
@@ -54,7 +58,10 @@ export function MarksFor({ ctx, section, title }: { readonly ctx: SectionContext
       own={isOwn(ctx.base, ctx.edit, section)}
       follows={ctx.defaultsName}
       isType={ctx.isType}
-      onReset={() => ctx.update((e) => resetSection(ctx.base, e, section))}
+      onReset={() => {
+        ctx.update((e) => resetSection(ctx.base, e, section))
+        ctx.renew()
+      }}
       resetTitle={`Go back to what ${ctx.defaultsName} says`}
     />
   )
@@ -188,7 +195,7 @@ export function AssignSection({ ctx, assistants, canAuto, hasRouting, serverErro
             </select>
           </DField>
           <DField label="Give up after" error={dg.localErrors.giveUp} help={`If TypeSafe has not answered by then, it counts as none fits. Default ${TYPESAFE_GIVE_UP_MS.default} ms.`}>
-            <NumberControl draft={dg} path="giveUp" min={TYPESAFE_GIVE_UP_MS.min} max={TYPESAFE_GIVE_UP_MS.max} step={50} unit="ms" label="Give up after" />
+            <NumberControl key={ctx.generation} draft={dg} path="giveUp" min={TYPESAFE_GIVE_UP_MS.min} max={TYPESAFE_GIVE_UP_MS.max} step={50} unit="ms" label="Give up after" />
           </DField>
           <p className="text-[13px] text-ink-muted">What is sent: the sentence as text, with the “Handles” line of each assistant here, to TypeSafe (hosted).</p>
           <p className="text-[13px] text-ink-muted">It adds a short delay before the reply starts, only for sentences without a phrase.</p>
@@ -373,6 +380,7 @@ function AssignmentRow({ ctx, index, assignment: e, info, hearsWith, recogniser 
                     onClick={() => {
                       const { followUpSeconds: _gone, ...rest } = e
                       patch(rest)
+                      ctx.renew()
                     }}
                     data-testid="fu-reset"
                   >
@@ -385,7 +393,7 @@ function AssignmentRow({ ctx, index, assignment: e, info, hearsWith, recogniser 
             </span>
           }
         >
-          <PresetControl draft={fu} path={`fu-${e.assistant}`} presets={FOLLOW_UP} unit="seconds" min={1} max={120} customDefault={10} label={`Keep listening after a reply for ${name}`} />
+          <PresetControl key={ctx.generation} draft={fu} path={`fu-${e.assistant}`} presets={FOLLOW_UP} unit="seconds" min={1} max={120} customDefault={10} label={`Keep listening after a reply for ${name}`} />
         </DField>
         {unreachable && <p className="text-[13px] text-warn" data-testid="unreachable">Cannot be reached on this device. Add a phrase, or let it answer without one.</p>}
         {info !== undefined && !info.on && <p className="text-[13px] text-ink-muted">{name} is switched off, so it does not answer anywhere.</p>}

@@ -545,6 +545,11 @@ describe("module settings (section 2.6)", () => {
       clock: { timeZone: "Europe/Amsterdam", locale: "nl-NL" }
     })
     expect(linkedModuleDefaults({ units: "metric", timeZone: "", dateFormat: "en-GB" }).weather?.units).toBe("celsius")
+    // Home accepts a zone with spaces around it (its check trims); the linked default is the bare zone.
+    expect(linkedModuleDefaults({ location: " Utrecht ", units: "metric", timeZone: " Asia/Tokyo ", dateFormat: "en-GB" })).toEqual({
+      weather: { defaultPlace: "Utrecht", units: "celsius" },
+      clock: { timeZone: "Asia/Tokyo", locale: "en-GB" }
+    })
     const eff = resolveModuleSettings({
       choice: undefined,
       overridable: ["timeZone", "locale"],
@@ -663,6 +668,12 @@ describe("makeAssistantId", () => {
     expect(makeAssistantId("Éloïse")).toBe("eloise")
     expect(makeAssistantId("123")).toBe("a123")
     expect(makeAssistantId("!!!")).toBe("assistant")
+  })
+  it("never makes the device.pick value for \"whichever fits\", and the schema refuses it as an id", () => {
+    const id = makeAssistantId("TypeSafe")
+    expect(id).toBe("typesafe-2")
+    expect(accepts(Assistant.fields.id, id)).toBe(true)
+    expect(accepts(Assistant.fields.id, "typesafe")).toBe(false)
   })
   it("adds a number when the id is taken", () => {
     expect(makeAssistantId("Keuken", ["keuken"])).toBe("keuken-2")
