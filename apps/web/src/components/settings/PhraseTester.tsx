@@ -16,11 +16,10 @@ const clock = (ms: number) => {
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`
 }
 
-/** The words for a line's outcome, as shown and as announced. */
-const outcomeText = (l: HeardLine, wakes?: (phrase: string) => string | undefined): string => {
+/** The words for a line's outcome, as shown and as announced (`who`: the assistant a matched line woke). */
+const outcomeText = (l: HeardLine, who?: string): string => {
   switch (heardOutcome(l)) {
     case "matched": {
-      const who = wakes?.(l.matched!)
       return `Matched ${displayPhrase(l.matched!)}${who !== undefined ? ` → wakes ${who}` : ""}`
     }
     case "accepted":
@@ -76,7 +75,16 @@ export function PhraseTester({ onAdd, phrases: draftPhrases = [], savedPhrases =
     },
     shallowEqual
   )
-  const wakesHere = wakes === undefined ? undefined : (phrase: string) => wakes(phrase, owner?.id)
+  /**
+   * The assistant a matched line woke, worked out once, when the line is first shown, from the tested device's
+   * settings then: saving other assignments later does not relabel a line the server judged with the old ones.
+   */
+  const wokeOf = useRef(new WeakMap<HeardLine, string | undefined>())
+  const wokeBy = (l: HeardLine): string | undefined => {
+    if (l.matched === undefined || wakes === undefined) return undefined
+    if (!wokeOf.current.has(l)) wokeOf.current.set(l, wakes(l.matched, owner?.id))
+    return wokeOf.current.get(l)
+  }
   const unsaved = useClientState((s) => s.ui.settingsDirty)
   const [until, setUntil] = useState<number | undefined>()
   const [now, setNow] = useState(() => Date.now())
@@ -131,7 +139,7 @@ export function PhraseTester({ onAdd, phrases: draftPhrases = [], savedPhrases =
   const latest = heard[heard.length - 1]
   useEffect(() => {
     if (latest === undefined || !onRef.current) return
-    setAnnouncement(`Heard “${latest.text}”: ${outcomeText(latest, wakesHere).toLowerCase()}.`)
+    setAnnouncement(`Heard “${latest.text}”: ${outcomeText(latest, wokeBy(latest)).toLowerCase()}.`)
   }, [latest])
   // Leaving the page stops it. When the session has ended (logout, restart) the server has already switched it off
   // and would refuse the request (`admin_required`), so nothing is sent then.
@@ -217,16 +225,16 @@ export function PhraseTester({ onAdd, phrases: draftPhrases = [], savedPhrases =
                   {outcome === "matched" ? (
                     <span className="inline-flex items-center gap-1 text-[12px] text-ok">
                       <Icon name="check" size={14} />
-                      {outcomeText(l, wakesHere)}
+                      {outcomeText(l, wokeBy(l))}
                     </span>
                   ) : outcome === "accepted" ? (
                     <span className="inline-flex items-center gap-1 text-[12px] text-you" title="Always listening, or the device was already listening (after the phrase or a reply)">
                       <Icon name="check" size={14} />
-                      {outcomeText(l, wakesHere)}
+                      {outcomeText(l, wokeBy(l))}
                     </span>
                   ) : (
                     <span className="inline-flex items-center gap-2">
-                      <span className="label text-[10px] text-ink-muted">{outcomeText(l, wakesHere)}</span>
+                      <span className="label text-[10px] text-ink-muted">{outcomeText(l, wokeBy(l))}</span>
                       {onAdd === undefined ? null : added[l.at] !== undefined && listHas(draftPhrases, added[l.at]!) ? (
                         // Derived from the form: in the draft only = not saved yet; also in the saved list = saved.
                         <span tabIndex={-1} data-added-at={l.at} className="text-[12px] text-ok outline-none focus-visible:underline" data-testid="added-status">
