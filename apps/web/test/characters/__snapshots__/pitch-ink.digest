@@ -1,0 +1,49 @@
+# pitch-ink 1.0.0: frame digests of a scripted conversation at default settings (docs/CHARACTERS.md §6.6).
+# A change here must be deliberate: check the look, then update with `pnpm --filter @pva/web exec vitest run test/characters -u`.
+dark  0.5 idle         57 a7bf887d
+dark  1.0 listening    57 40c4d8f6
+dark  1.5 listening    67 ca5d0eb4
+dark  2.0 hearing      69 5b004c63
+dark  2.5 hearing     105 0ac1d75f
+dark  3.0 hearing     163 082b1799
+dark  3.5 hearing     247 1b7fc5f4
+dark  4.0 hearing     281 ee3cca78
+dark  4.5 hearing     341 8d6145c5
+dark  5.0 thinking    371 ae99325b
+dark  5.5 thinking    383 c27931db
+dark  6.0 thinking    393 38559c89
+dark  6.5 speaking    397 3c241e1e
+dark  7.0 speaking    425 11121b3e
+dark  7.5 speaking    455 fa939b0f
+dark  8.0 speaking    529 edb65d8b
+dark  8.5 speaking    575 c3d3bfcc
+dark  9.0 speaking    607 c96c64e0
+dark  9.5 listening   621 dd10e7a4
+dark 10.0 listening   621 ea2127a0
+dark 10.5 idle        614 25ccf73c
+dark 11.0 idle        606 9f0afb35
+light  0.5 idle         57 64be8886
+light  1.0 listening    57 cf26ed19
+light  1.5 listening    67 448aef21
+light  2.0 hearing      69 5ff4f2b9
+light  2.5 hearing     105 c4018cef
+light  3.0 hearing     163 29561e56
+light  3.5 hearing     247 960af1c2
+light  4.0 hearing     281 8d294d8e
+light  4.5 hearing     341 df3626bb
+light  5.0 thinking    371 797cee8b
+light  5.5 thinking    383 cf669756
+light  6.0 thinking    393 b9e54959
+light  6.5 speaking    397 08ab9f9a
+light  7.0 speaking    425 8eb88303
+light  7.5 speaking    455 465e011e
+light  8.0 speaking    529 a63bdc08
+light  8.5 speaking    575 aef80459
+light  9.0 speaking    607 647c36eb
+light  9.5 listening   621 9594328a
+light 10.0 listening   621 29d699a5
+light 10.5 idle        614 a7fa8330
+light 11.0 idle        606 58957c96
+overflow 160×140×1 11.0 px
+overflow 900×420×1 11.0 px
+overflow 720×240×2 11.0 px
