@@ -587,11 +587,14 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
     const key = client.sessionKey
     const session = sessionOf(client)
     const o = key === undefined ? undefined : owners.get(key)
+    // Whose conversation `history` is (it follows the follow-up holder): the page files it under that assistant.
+    const answering = session?.conversation.answering()
     return {
       state: session?.tracker.current().state ?? "idle",
       role: isOwner(client) ? "owner" : "observer",
       ownerPresent: o?.owner !== undefined,
       engine: engineSummary(options.engine.status()),
+      ...(answering !== undefined ? { answering } : {}),
       history: session === undefined ? [] : historyItems(Effect.runSync(session.conversation.history())),
       ...(client.role === "voice" ? { device: profileInfo(client) } : {}),
       admin: adminState(client, endReason),
