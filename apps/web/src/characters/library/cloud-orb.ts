@@ -17,7 +17,7 @@ const FRAGMENT = `#version 300 es
 precision highp float;
 in vec2 uv;
 out vec4 outColor;
-uniform vec2 uRes;        // device px
+uniform vec2 uCen;        // orb centre, device px, y up (gl_FragCoord's frame)
 uniform float uR;         // sphere radius, device px
 uniform float uZoom;      // radial flow phase (increasing = inward)
 uniform float uChurn;     // slow evolution of the clouds
@@ -94,10 +94,17 @@ float clouds(vec2 q, float ph, float seed) {
 }
 
 void main() {
-  vec2 p = (gl_FragCoord.xy - 0.5 * uRes) / uR;
+  vec2 p = (gl_FragCoord.xy - uCen) / uR;
   float r = length(p);
   float aa = 1.5 / uR;
-  if (r > 1.0 + 1.2 * uHalo + aa) { outColor = vec4(0.0); return; }
+  // Halo reach: the tight halo dies within ~1.2 radii; the wide haze fades to nothing by 6 radii.
+  float reach = uHalo > 0.001 ? 6.0 : 0.0;
+  if (r > 1.0 + reach + aa) { outColor = vec4(0.0); return; }
+  // Wide, faint haze that spreads over the stage, starting outside the box's usual reach, with a
+  // smooth fade to zero at its far end (no edge anywhere).
+  float haze = uHalo * 0.1 * exp(-max(r - 1.4, 0.0) * 1.2) * smoothstep(1.1, 1.7, r) * (1.0 - smoothstep(2.0, 6.0, r));
+  // A hair of dither so the faint gradient does not band into rings.
+  haze = max(haze * (0.85 + 0.3 * fract(sin(dot(gl_FragCoord.xy, vec2(12.9898, 78.233))) * 43758.5453)), 0.0);
 
   float inside = 1.0 - smoothstep(1.0 - aa, 1.0 + aa, r);
   float z = sqrt(max(0.0, 1.0 - r * r));
@@ -149,12 +156,14 @@ void main() {
     // Halo: light spilling out around the sphere.
     float halo = uHalo * exp(-(r - 1.0) * 5.0) * (1.0 - inside);
     vec3 hc = mix(uB, uB2, uTwoTone * 0.5);
+    halo += haze * (1.0 - inside) / 0.55;
     outColor = vec4(col * a + hc * halo * 0.55, a + halo * 0.55);
   } else {
     // Light theme: a tinted volume, darker at the rim, with a soft coloured shadow outside.
     col = mix(col, uB * 0.82, rim * 0.55);
     a = inside * (0.9 + 0.1 * dens);
     float halo = uHalo * exp(-(r - 1.0) * 6.0) * (1.0 - inside) * 0.35;
+    halo += haze * 0.35 * (1.0 - inside);
     outColor = vec4(col * a + uB * halo, a + halo);
   }
 }`
@@ -172,7 +181,7 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
   const vao = gl.createVertexArray()
   const u = (name: string) => gl.getUniformLocation(prog, name)
   const U = {
-    res: u("uRes"),
+    cen: u("uCen"),
     r: u("uR"),
     zoom: u("uZoom"),
     churn: u("uChurn"),
@@ -198,6 +207,7 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
   }
   let W = 1
   let H = 1
+  let CH = 1 // the canvas's height, CSS px
   let dpr = 1
 
   const mix = new ModeMix()
@@ -263,14 +273,16 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
 
   return {
     resize(width, height, ratio) {
-      W = width
-      H = height
+      CH = height
       dpr = ratio
-      gl.viewport(0, 0, Math.round(W * dpr), Math.round(H * dpr))
+      gl.viewport(0, 0, Math.round(width * dpr), Math.round(height * dpr))
     },
 
     frame(f) {
       const dt = f.dt
+      const fo = f.focus
+      W = fo.width
+      H = fo.height
       const p = f.palette
       const reduced = f.reducedMotion
       // Hold the pose: under reduced motion every level jumps to its target (no continuous easing).
@@ -300,7 +312,7 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
 
       // Size: the person's loudness swells the orb; the reply only breathes it slightly.
       const R0 = Math.min(H * 0.36, W * 0.3)
-      const press = f.pointer.down && f.pointer.inside ? 0.95 : 1
+      const press = f.pointer.down && f.pointer.inside && f.pointer.x >= fo.x && f.pointer.x < fo.x + W && f.pointer.y >= fo.y && f.pointer.y < fo.y + H ? 0.95 : 1
       const breathe = reduced ? 1 : 1 + 0.025 * Math.sin(clock * 1.6) * mix.listening
       const sT = mix.of(0.62, 0.86, 0.9 + 0.38 * swellK * clamp01(Lu * 1.5), 0.8, 0.86 + 0.3 * swellK * clamp01(La * 1.6)) * breathe * press
       const s = reduced ? sT : size.step(sT, dt)
@@ -331,11 +343,13 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
       }
       drift += rise * dt * 0.6 * motion
       // Pointer: the light inside follows the pointer.
-      // The orb (not its fading halo) always fits the canvas, whatever the size and swell.
+      // The orb (not its fading halo) always fits the focus box, whatever the size and swell.
       const R = Math.min(R0 * s * sizeK, 0.48 * Math.min(W, H))
-      if (f.pointer.inside) {
-        lightX = ease(lightX, clamp((f.pointer.x - W / 2) / R, -0.7, 0.7), dt, 0.2)
-        lightY = ease(lightY, clamp(-(f.pointer.y - H / 2) / R, -0.7, 0.7), dt, 0.2)
+      const px = f.pointer.x - fo.x
+      const py = f.pointer.y - fo.y
+      if (f.pointer.inside && px >= 0 && px < W && py >= 0 && py < H) {
+        lightX = ease(lightX, clamp((f.pointer.x - fo.x - W / 2) / R, -0.7, 0.7), dt, 0.2)
+        lightY = ease(lightY, clamp(-(f.pointer.y - fo.y - H / 2) / R, -0.7, 0.7), dt, 0.2)
       } else lightX = ease(lightX, 0, dt, 0.4)
 
       // Onset rings: in from the rim for you, out from the centre for the assistant.
@@ -360,7 +374,7 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
       gl.clear(gl.COLOR_BUFFER_BIT)
       gl.useProgram(prog)
       gl.bindVertexArray(vao)
-      gl.uniform2f(U.res, W * dpr, H * dpr)
+      gl.uniform2f(U.cen, (fo.x + W / 2) * dpr, (CH - fo.y - H / 2) * dpr)
       gl.uniform1f(U.r, R * dpr)
       gl.uniform1f(U.zoom, zoom)
       gl.uniform1f(U.churn, churn)
@@ -393,10 +407,11 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
 const character: Character = {
   id: "cloud-orb",
   name: "Cloud orb",
-  version: "1.0.0",
+  version: "1.1.0",
   contract: 1,
   family: "abstract",
   renderer: "webgl2",
+  canvas: "stage",
   summary: "A soft sphere of churning cloud light: your loudness changes its size, the assistant's how fast the inside flows; clouds stream inward while it listens and outward while it speaks.",
   inspiredBy:
     "ChatGPT's Advanced Voice orb (a soft textured sphere with slow inner flow) and the ElevenLabs UI orb's split (input volume to size, output volume to flow speed, its speed curve reused). The inward / outward stream follows Meta AI's ring.",
@@ -420,7 +435,7 @@ const character: Character = {
     { signal: "active.syllableRate (hearing)", effect: "Churn speed of the clouds while you talk." },
     { signal: "mode", effect: "Colour (grey / mint / mint-and-amber marble / amber), size, flow direction and swirl; 400 ms crossfade." },
     { signal: "pointer", effect: "The inner light follows the pointer; pressing shrinks the orb 5 %." },
-    { signal: "options", effect: "Size, size reaction, follow pitch, motion speed, syllable rings, look (clouds / contour bands / smooth), cloud grain and halo change every mode; they glide over 0.2–0.3 s (snap under reduced motion). The orb is capped at 48 % of the short side so it never leaves the canvas." },
+    { signal: "options", effect: "Size, size reaction, follow pitch, motion speed, syllable rings, look (clouds / contour bands / smooth), cloud grain and halo change every mode; they glide over 0.2–0.3 s (snap under reduced motion). The orb is capped at 48 % of the short side of the box so it never leaves it." },
     { signal: "reducedMotion", effect: "No flow, churn, swirl, rings or breathing, and no easing: the orb holds its pose, a still orb whose colour, size and marble show the mode; levels in quarter steps, inner light position in quarters." }
   ],
   options: [
