@@ -4,7 +4,7 @@
  * side is on while listening or hearing, the assistant's while speaking), into a `Runner` on a recording canvas.
  * Fixed 60 Hz steps, so a run is deterministic.
  */
-import type { Character, FrameExtensions, Mode, OptionValues, Palette } from "@/characters/contract.ts"
+import type { Character, Focus, FrameExtensions, Mode, OptionValues, Palette } from "@/characters/contract.ts"
 import { coreOf, Runner } from "@/characters/runner.ts"
 import { agentOn, LiveVoice, userOn } from "@/characters/voices.ts"
 import { markStage, recording } from "./fakeCanvas.ts"
@@ -63,6 +63,11 @@ export interface RunOptions {
   readonly silent?: boolean
   readonly ext?: (t: number) => FrameExtensions | undefined
   readonly size?: readonly [width: number, height: number, dpr: number]
+  /**
+   * Where the box is on the canvas (CSS px), fixed or per time, as a host with a stage layer gives a `"stage"`
+   * character. Absent: none is given (the runner uses the whole canvas), exactly as before stage characters existed.
+   */
+  readonly focus?: Focus | ((t: number) => Focus)
   /** Times (s) at which to keep the frame's digest. Default: every 0.5 s. */
   readonly checkpoints?: ReadonlyArray<number>
 }
@@ -80,6 +85,8 @@ export interface RunResult {
   readonly overflow: number
   /** Mean `frame()` time, ms. */
   readonly meanFrameMs: number
+  /** The union of solid drawing over the run, CSS px on the canvas (2D only; null when nothing solid was drawn). */
+  readonly extent: { readonly minX: number; readonly minY: number; readonly maxX: number; readonly maxY: number } | null
 }
 
 export const STAGE_SIZE = [720, 240, 1] as const
@@ -107,6 +114,10 @@ export const run = (character: Character, o: RunOptions): RunResult => {
   let last = ""
   let lastCalls = 0
   let prev: Mode | null = null
+  let ex0 = Infinity
+  let ey0 = Infinity
+  let ex1 = -Infinity
+  let ey1 = -Infinity
   const steps = Math.round(o.seconds / DT)
   let next = 0
   for (let i = 1; i <= steps; i++) {
@@ -137,12 +148,17 @@ export const run = (character: Character, o: RunOptions): RunResult => {
     const af = agent.step(DT, aOn)
     recording.reset()
     const t0 = performance.now()
-    runner.step({ mode, dt: DT, user: uf, agent: af, palette: o.palette, reducedMotion: o.reducedMotion === true, pointer, sinceInterrupt: Infinity, ...(o.ext !== undefined ? { ext: o.ext(t) ?? {} } : {}) })
+    const focus = typeof o.focus === "function" ? o.focus(t) : o.focus
+    runner.step({ mode, dt: DT, user: uf, agent: af, palette: o.palette, reducedMotion: o.reducedMotion === true, pointer, sinceInterrupt: Infinity, ...(o.ext !== undefined ? { ext: o.ext(t) ?? {} } : {}), ...(focus !== undefined ? { focus } : {}) })
     spent += performance.now() - t0
     calls += recording.calls
     if (recording.minX !== Infinity) {
       const out = Math.max(-recording.minX, -recording.minY, recording.maxX - canvas.width, recording.maxY - canvas.height, 0) / dpr
       if (out > overflow) overflow = out
+      ex0 = Math.min(ex0, recording.minX / dpr)
+      ey0 = Math.min(ey0, recording.minY / dpr)
+      ex1 = Math.max(ex1, recording.maxX / dpr)
+      ey1 = Math.max(ey1, recording.maxY / dpr)
     }
     last = recording.digest
     lastCalls = recording.calls
@@ -152,5 +168,6 @@ export const run = (character: Character, o: RunOptions): RunResult => {
     }
   }
   runner.dispose()
-  return { frames, last, lastCalls, calls, overflow, meanFrameMs: spent / steps }
+  const extent = ex0 === Infinity ? null : { minX: ex0, minY: ey0, maxX: ex1, maxY: ey1 }
+  return { frames, last, lastCalls, calls, overflow, meanFrameMs: spent / steps, extent }
 }
