@@ -218,6 +218,12 @@ export class Conversation extends Context.Service<Conversation, {
   readonly conversationId: Effect.Effect<string>
   /** When the current conversation's last turn was committed (epoch ms; `Clock`), or `undefined` if none yet. */
   readonly lastTurnAt: Effect.Effect<number | undefined>
+  /**
+   * The id of the turn committed last in the current conversation: the exchange that ends `history` (its user message
+   * and what followed) is that turn's. `undefined` if none was committed by this conversation yet (or its history
+   * came from before, `initialHistory`).
+   */
+  readonly lastTurnId: Effect.Effect<number | undefined>
 }>()("@pva/core/Conversation") {
   static readonly layer = (options: ConversationOptions) =>
     Layer.effect(Conversation, makeConversation(options))
@@ -545,6 +551,7 @@ const makeConversationCore = Effect.fnUntraced(function*(options: AgentConversat
   let conversationEpoch = 0
   /** When the last turn was committed (epoch ms), for the idle reset. */
   let lastTurnAt: number | undefined = options.initialLastTurnAt
+  let lastTurnId: number | undefined
   /** The running voice loop's way to stop its turn and start a new conversation (`newConversation`). */
   let voiceControl: Queue.Queue<VoiceControl> | undefined
   let routerState: RouterState = options.initialRouterState ?? initialRouterState
@@ -581,6 +588,7 @@ const makeConversationCore = Effect.fnUntraced(function*(options: AgentConversat
       conversationEpoch++
       conversationId = newConversationId()
       lastTurnAt = undefined
+      lastTurnId = undefined
       pendingIntents.set(undefined)
       asked = undefined
       setRouterState(initialRouterState)
@@ -1319,6 +1327,7 @@ const makeConversationCore = Effect.fnUntraced(function*(options: AgentConversat
       if (current && outcome !== "discarded" && !log.canned) {
         commit(log, spoken, outcome === "completed" && log.shortened !== true)
         lastTurnAt = now
+        lastTurnId = trace.id
       }
       if (current) armProposal(log, trace, spoken, outcome, stopped)
       const logFailure = Exit.isFailure(exit) && outcome === "failed"
@@ -1752,6 +1761,7 @@ const makeConversationCore = Effect.fnUntraced(function*(options: AgentConversat
     routerState: Effect.sync(() => routerState),
     newConversation,
     conversationId: Effect.sync(() => conversationId),
-    lastTurnAt: Effect.sync(() => lastTurnAt)
+    lastTurnAt: Effect.sync(() => lastTurnAt),
+    lastTurnId: Effect.sync(() => lastTurnId)
   })
 })

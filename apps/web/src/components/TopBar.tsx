@@ -42,7 +42,7 @@ export function TopBar() {
     tone = v.owner ? "ok" : "neutral"
   }
   return (
-    <header className="relative z-20 flex h-14 shrink-0 items-center gap-3 pl-[max(12px,env(safe-area-inset-left))] pr-[max(8px,env(safe-area-inset-right))] sm:gap-5 sm:px-6">
+    <header className="stage-legible relative z-20 flex h-14 shrink-0 items-center gap-3 pl-[max(12px,env(safe-area-inset-left))] pr-[max(8px,env(safe-area-inset-right))] sm:gap-5 sm:px-6">
       <div className="flex min-w-0 items-center gap-2.5 pl-1" data-testid="connection-status-line">
         <ToneDot tone={tone} className={cx("size-2", tone === "warning" && "animate-pulse")} />
         <AssistantName />
