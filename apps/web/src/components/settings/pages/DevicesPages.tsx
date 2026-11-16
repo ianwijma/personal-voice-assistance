@@ -9,6 +9,7 @@ import {
   type DeviceDraft,
   type DeviceEdit,
   draftOnRevision,
+  editDraft,
   isDirty,
   isOwn,
   noEdit,
@@ -209,6 +210,8 @@ function DeviceEditor({ type, device }: { readonly type: DeviceTypeInfo; readonl
   /** Bumped when the draft is discarded or a section reset: the number fields start again (their text and errors). */
   const [generation, setGeneration] = useState(0)
   const revNow = useRef(rev)
+  /** Set while a save is on its way: the editor is inert and `update` ignores changes (they would not be in the save). */
+  const savingNow = useRef(false)
   const [justSaved, setJustSaved] = useState(false)
   const [errors, setErrors] = useState<ReadonlyArray<FieldError>>([])
   const [message, setMessage] = useState<string | undefined>()
@@ -232,7 +235,8 @@ function DeviceEditor({ type, device }: { readonly type: DeviceTypeInfo; readonl
     setJustSaved(false)
     setErrors([])
     setMessage(undefined)
-    setState((s) => ({ edit: f(s.edit), rev: s.edit === noEdit ? rev : s.rev }))
+    const busy = savingNow.current
+    setState((s) => editDraft(s, f, rev, busy))
   }, [rev])
   const setBlockedId = useCallback((key: string, on: boolean) => {
     setBlocked((s) => {
@@ -259,6 +263,7 @@ function DeviceEditor({ type, device }: { readonly type: DeviceTypeInfo; readonl
   const has = (s: ReturnType<typeof sectionsOf>[number]) => sections.includes(s)
 
   const save = async (saveAnyway = false): Promise<Outcome> => {
+    savingNow.current = true
     setSaving(true)
     setMessage(undefined)
     const patch = patchOf(base, edit)
@@ -269,6 +274,7 @@ function DeviceEditor({ type, device }: { readonly type: DeviceTypeInfo; readonl
       patch,
       { label: name, ...(saveAnyway ? { saveAnyway: true } : {}), ...(edit.name !== undefined && edit.name.trim() !== savedName ? { name: edit.name.trim() } : {}) }
     )
+    savingNow.current = false
     setSaving(false)
     switch (outcome.kind) {
       case "ok": {
@@ -315,7 +321,7 @@ function DeviceEditor({ type, device }: { readonly type: DeviceTypeInfo; readonl
     : session !== undefined ? `${turnsText(session.turns)}${session.lastTurnAt !== null ? ` · last ${agoText(session.lastTurnAt, now)}` : ""}` : "No conversation open"
 
   return (
-    <div className="flex flex-1 flex-col gap-8" data-testid="device-editor" data-target={isType ? `type:${type.kind}` : device.id}>
+    <div className="flex flex-1 flex-col gap-8" data-testid="device-editor" data-target={isType ? `type:${type.kind}` : device.id} inert={saving} aria-busy={saving}>
       <p className="-mt-4 text-[14px] text-ink-muted" data-testid="device-sub">
         {isType
           ? `Applies to ${memberCount} ${memberCount === 1 ? type.one : type.many} except where one has its own value. A change reaches running devices at once.`
