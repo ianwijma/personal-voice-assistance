@@ -131,15 +131,16 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
   const glowCss: string[] = ["", "", ""]
 
   return {
-    resize(width, height, ratio) {
-      W = width
-      H = height
+    resize(_width, _height, ratio) {
       dpr = ratio
       g = setup2d(canvas, dpr)
     },
 
     frame(f: Frame) {
       const dt = f.dt
+      const fo = f.focus
+      W = fo.width
+      H = fo.height
       const P = f.palette
       const reduced = f.reducedMotion
       pers.read(f)
@@ -165,7 +166,7 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
       const y0 = H / 2 - (CY * pitch)
 
       // Gaze, in pixels.
-      youDirection(f, W / 2, H / 2, pitch * 12 * kG, you, pers.followsPointer)
+      youDirection(f, fo.x + W / 2, fo.y + H / 2, pitch * 12 * kG, you, pers.followsPointer)
       let gx = you.x
       let gy = you.y
       let spread = 0.1
@@ -273,7 +274,7 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
       }
 
       // ---- Draw: unlit LEDs first (one path), then buckets per colour and level.
-      clear2d(g, dpr)
+      clear2d(g, dpr, fo) // the whole stage; (0, 0) is the box's corner, so the LED glow fades out freely
       if (cachedFor !== P) {
         cachedFor = P
         mixInto(offRgb, P.inkFaint, P.bg, P.dark ? 0.72 : 0.62)
@@ -339,7 +340,7 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
 const character: Character = {
   id: "dot-matrix",
   name: "Dot matrix",
-  version: "1.0.0",
+  version: "1.1.0",
   contract: 1,
   family: "figure",
   summary: "A face on a 27 × 13 LED matrix, as a small voice node could show it: pixel eyes and mouth, and edge 'ears' that meter your pitch and loudness in mint.",
@@ -380,6 +381,7 @@ const character: Character = {
     }
   ],
   renderer: "2d",
+  canvas: "stage",
   options: [
     sizeOption(0.5, 1),
     {
