@@ -50,3 +50,16 @@ describe("voice mock-up typed replies", () => {
     expect(document.querySelector("#msgs .empty-chat")).not.toBeNull()
   })
 })
+
+describe("voice mock-up End session", () => {
+  it("stays stopped when ended during the Auto demonstration", () => {
+    ;(document.querySelector('[data-preset="auto"]') as HTMLButtonElement).click()
+    expect(document.getElementById("end-btn")).not.toBeNull()
+    ;(document.getElementById("end-btn") as HTMLButtonElement).click()
+    expect(document.getElementById("state")?.textContent).toBe("Not started")
+    vi.advanceTimersByTime(6000)
+    expect(document.getElementById("state")?.textContent).toBe("Not started")
+    expect(document.getElementById("end-btn")).toBeNull()
+    expect(document.getElementById("start")).not.toBeNull()
+  })
+})
