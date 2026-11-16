@@ -125,7 +125,8 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
       const rho = d * 1.45
       const px = f.pointer.x - fo.x
       const py = f.pointer.y - fo.y
-      const over = px >= 0 && px < W && py >= 0 && py < H
+      // Over the box, and the pointer still on this canvas: a pointer that has left keeps its last coordinates.
+      const over = f.pointer.inside && px >= 0 && px < W && py >= 0 && py < H
       const press = f.pointer.down && over
       const lean = over ? clamp((px - cx) / (W * 0.5), -1, 1) : 0
 
