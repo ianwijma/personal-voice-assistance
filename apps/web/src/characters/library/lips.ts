@@ -9,7 +9,7 @@
  * gives a closed-mouth "mm-hm" (a press with the corners lifting), at a rising phrase end one
  * corner lifts, for a whisper the lips part a little ("oh?"), at a shout they tighten.
  */
-import type { Character, CharacterInstance, Frame } from "../contract.ts"
+import type { Character, CharacterInstance, Frame, Rgb } from "../contract.ts"
 import { WAVE_SIZE } from "../contract.ts"
 import { approach, clamp, clamp01, clear2d, lerp, noise2, optChoice, optColor, optNumber, optToggle, setup2d, smoothstep, Spring, TAU } from "../kit.ts"
 import {
@@ -43,6 +43,9 @@ const POUT: Five = [0, 0, 0, 0.45, 0]
 const ALERT: Five = [0, 1, 1, 1, 1]
 /** The "Lip colour" default: a muted clay made from the theme's danger and faint-ink tokens (its swatch shows the dark-theme value). */
 const CLAY = "#c07e73"
+/** Fixed mix partners, made once: `mixInto` only reads them, so no frame allocates. */
+const BLACK: Rgb = [0, 0, 0]
+const WHITE: Rgb = [255, 255, 255]
 
 const create = (canvas: HTMLCanvasElement): CharacterInstance => {
   let g = setup2d(canvas)
@@ -128,6 +131,7 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
 
       mouth.step(f, S.size, speakW, pers.mouthRange)
       if (S.ack && S.nodsOn && !reduced && hearW > 0.5 && S.question < 0.3) press.velocity += 9 * S.expr // "mm-hm"
+      if (reduced) press.set(0) // a press in flight when reduced motion switches on is cleared, not parked to resume
       const pr = reduced ? 0 : press.step(0, dt)
 
       // ---- Pose.
@@ -161,11 +165,11 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
       if (lipC === CLAY || typeof lipC !== "string") mixInto(lipRgb, P.danger, P.inkFaint, P.dark ? 0.52 : 0.6)
       else mixInto(lipRgb, optColor(f, "lipColor"), P.inkFaint, 0)
       mixInto(lipRgb, lipRgb, P.bg, (1 - alert) * 0.4 + (P.dark ? 0.08 : 0))
-      mixInto(upperRgb, lipRgb, [0, 0, 0], 0.22)
-      mixInto(hiRgb, lipRgb, [255, 255, 255], 0.4)
-      mixInto(cavRgb, P.bg, [0, 0, 0], P.dark ? 0.65 : 0.85)
-      mixInto(tongueRgb, lipRgb, [255, 255, 255], 0.12)
-      mixInto(lineRgb, upperRgb, [0, 0, 0], 0.35)
+      mixInto(upperRgb, lipRgb, BLACK, 0.22)
+      mixInto(hiRgb, lipRgb, WHITE, 0.4)
+      mixInto(cavRgb, P.bg, BLACK, P.dark ? 0.65 : 0.85)
+      mixInto(tongueRgb, lipRgb, WHITE, 0.12)
+      mixInto(lineRgb, upperRgb, BLACK, 0.35)
       // Line drawing: the lip colour gives way to the ink colour, dimmer when dozing.
       if (lineA > 0) {
         mixInto(tongueRgb, tongueRgb, P.inkFaint, lineA)
@@ -182,7 +186,8 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
       const tL = 0.22 - 0.08 * pressS + 0.11 * poutS
       // The jaw opens at most until the lower lip meets the bottom of the frame (a wide mouth range
       // at a large size would otherwise run off it).
-      const openD = Math.min(openS, Math.max(0, (H - 3 - oy) / unit - tL))
+      const room = unit > 1e-6 ? (H - 3 - oy) / unit - tL : 0 // no scale (a zero-size box): no room, never a division by zero
+      const openD = Math.min(openS, Math.max(0, room))
       const rnd = clamp01(roundS * 1.3 + poutS * 0.4)
       const pBump = lerp(1.0, 0.45, rnd) // opening profile: flat-wide .. circular
       const reach = 0.93 - 0.08 * clamp01(openD * 2) // the opening stops short of the corners
@@ -382,7 +387,7 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
 const design: Character = {
   id: "lips",
   name: "Lips",
-  version: "1.1.0",
+  version: "1.1.1",
   contract: 1,
   family: "figure",
   summary: "A mouth alone, in flat graphic shapes with teeth and tongue: real mouth shapes when it speaks, a sealed seam that carries your voice when it listens.",
@@ -415,13 +420,6 @@ const design: Character = {
       signal: "options",
       effect:
         "Size (capped so the widest shapes stay in frame), lip colour, filled or line drawing (cross-fade ~0.2 s), line weight (seam and drawing), teeth and tongue on/off; expressiveness scales the press, corner lift, parting and tightening; mouth range scales the jaw; nods switch off the 'mm-hm' press."
-    }
-  ],
-  uses: [
-    {
-      ext: "speech.phonemes",
-      gain: "Exact closures on m/b/p, lip-teeth contact on f/v and tongue-teeth on th, which the spectrum cannot distinguish.",
-      without: "The mouth shapes come from the spectral estimate, and the mouth never fully closes mid-word."
     }
   ],
   renderer: "2d",

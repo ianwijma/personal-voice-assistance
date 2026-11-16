@@ -5,8 +5,10 @@
  * shout poses, the thinking glint, and what the options promise (size cap, style, teeth, colour, mouth range).
  * Checked on the paths it draws, through the runner, on the recording canvas.
  */
+import { readFileSync } from "node:fs"
+import { join } from "node:path"
 import { beforeEach, describe, expect, it } from "vitest"
-import type { Focus, Mode, Palette, VoiceFeatures } from "@/characters/contract.ts"
+import type { Character, Focus, Mode, Palette, VoiceFeatures } from "@/characters/contract.ts"
 import { createVoiceFeatures } from "@/characters/features.ts"
 import lips from "@/characters/library/lips.ts"
 import { Runner } from "@/characters/runner.ts"
@@ -87,16 +89,25 @@ const settle = (r: Runner, mode: Mode, frames: number, o: StepOptions = {}): Arr
   return last
 }
 
-/** Every filled or stroked path of a frame: its colour and its points, in the box's coordinates. */
-const paths = (calls: ReadonlyArray<Call>): Array<Path> => {
+/**
+ * Every filled or stroked path of a frame: its colour and its points. By default in the box's own coordinates (the
+ * canvas transform ignored); with `stage` true, in the stage's CSS pixels (the last `setTransform` applied, divided
+ * by `dpr`), which is where the page sees them.
+ */
+const paths = (calls: ReadonlyArray<Call>, stage = false, dpr = 1): Array<Path> => {
   const out: Array<Path> = []
   let fillStyle = ""
   let strokeStyle = ""
   let pts: Array<Pt> = []
   let arcs: Array<Array<number>> = []
   let ellipses: Array<Array<number>> = []
+  let m = [1, 0, 0, 1, 0, 0]
+  const at = (x: number, y: number): Pt => (stage ? [(m[0]! * x + m[2]! * y + m[4]!) / dpr, (m[1]! * x + m[3]! * y + m[5]!) / dpr] : [x, y])
   for (const c of calls) {
     switch (c.name) {
+      case "setTransform":
+        m = c.args.length === 6 ? (c.args as Array<number>) : [1, 0, 0, 1, 0, 0]
+        break
       case "=fillStyle":
         fillStyle = String(c.args[0])
         break
@@ -110,10 +121,10 @@ const paths = (calls: ReadonlyArray<Call>): Array<Path> => {
         break
       case "moveTo":
       case "lineTo":
-        pts.push([c.args[0] as number, c.args[1] as number])
+        pts.push(at(c.args[0] as number, c.args[1] as number))
         break
       case "quadraticCurveTo":
-        pts.push([c.args[2] as number, c.args[3] as number])
+        pts.push(at(c.args[2] as number, c.args[3] as number))
         break
       case "arc":
         arcs.push(c.args as Array<number>)
@@ -134,15 +145,15 @@ const paths = (calls: ReadonlyArray<Call>): Array<Path> => {
 const rgba = (css: string) => css.match(/rgba\((\d+),(\d+),(\d+),([\d.]+)\)/)!.slice(1).map(Number) as [number, number, number, number]
 
 /** A lip edge or the opening: a polygon of at least two edges of `N` points. */
-const polygons = (calls: ReadonlyArray<Call>, op: "fill" | "stroke" = "fill") => paths(calls).filter((p) => p.op === op && p.pts.length >= 2 * N)
+const polygons = (calls: ReadonlyArray<Call>, op: "fill" | "stroke" = "fill", stage = false) => paths(calls, stage).filter((p) => p.op === op && p.pts.length >= 2 * N)
 /** The dark opening (the first polygon filled while the mouth is open): its edges are the upper then the lower edge. */
-const opening = (calls: ReadonlyArray<Call>) => {
-  const p = polygons(calls)[0]
+const opening = (calls: ReadonlyArray<Call>, stage = false) => {
+  const p = polygons(calls, "fill", stage)[0]
   if (p === undefined || p.pts.length !== 2 * N) return undefined
   const mid = (N - 1) / 2
   const top = p.pts[mid]!
   const bottom = p.pts[2 * N - 1 - mid]!
-  return { height: bottom[1] - top[1], width: p.pts[N - 1]![0] - p.pts[0]![0], left: p.pts[0]![0], right: p.pts[N - 1]![0] }
+  return { height: bottom[1] - top[1], width: p.pts[N - 1]![0] - p.pts[0]![0], left: p.pts[0]![0], right: p.pts[N - 1]![0], top: top[1], bottom: bottom[1] }
 }
 /** The seam: the stroke of one open line of `N` points in your colour. */
 const seam = (calls: ReadonlyArray<Call>, palette: Palette = PALETTES.dark) =>
@@ -446,16 +457,68 @@ describe("lips: the size option and the frame", () => {
     expect(width(1)).toBeLessThan(width(1.25) + 1e-6)
   })
 
-  it("draws in the focus on the stage, wherever the box is, and lays out from the focus's size", () => {
+  it("draws in the focus on the stage, wherever the box is (also when it moves on the same instance), and lays out from the focus's size", () => {
     const stage = [1280, 800] as const
-    const at = (focus: Focus) => opening(settle(make({}, stage), "speaking", 90, { agent: saying({ open: 0.5 }), focus }))!
-    const a = at({ x: 280, y: 200, width: W, height: H })
-    const b = at({ x: 100, y: 60, width: W, height: H })
+    const r = make({}, stage)
+    const at = (focus: Focus, frames = 90) => opening(settle(r, "speaking", frames, { agent: saying({ open: 0.5 }), focus }), true)!
+    const inFocus = (o: ReturnType<typeof at>, focus: Focus, label: string) => {
+      // In the stage's own coordinates the mouth sits in the focus rectangle, centred across it.
+      expect((o.left + o.right) / 2, `${label} centre`).toBeCloseTo(focus.x + focus.width / 2, 0)
+      expect(o.left, `${label} left`).toBeGreaterThanOrEqual(focus.x)
+      expect(o.right, `${label} right`).toBeLessThanOrEqual(focus.x + focus.width)
+      expect(o.top, `${label} top`).toBeGreaterThanOrEqual(focus.y)
+      expect(o.bottom, `${label} bottom`).toBeLessThanOrEqual(focus.y + focus.height)
+    }
+    const fa: Focus = { x: 280, y: 200, width: W, height: H }
+    const fb: Focus = { x: 100, y: 60, width: W, height: H }
+    const a = at(fa)
+    inFocus(a, fa, "first")
+    const b = at(fb, 3) // the same instance, the box moved (the chat panel slid the stage)
+    inFocus(b, fb, "moved")
+    expect(b.left - a.left).toBeCloseTo(fb.x - fa.x, 0)
+    expect(b.top - a.top).toBeCloseTo(fb.y - fa.y, 0)
     expect(b.width).toBeCloseTo(a.width, 3)
     expect(b.height).toBeCloseTo(a.height, 3)
-    expect((a.left + a.right) / 2).toBeCloseTo(W / 2, 0) // in the focus's own coordinates
-    const small = at({ x: 280, y: 200, width: 358, height: 160 })
+    const fs: Focus = { x: 280, y: 200, width: 358, height: 160 }
+    const small = at(fs)
+    inFocus(small, fs, "small")
     expect(small.width).toBeLessThan(a.width)
+  })
+
+  it("keeps every drawn point finite in a box with no width (no scale)", () => {
+    const probe: Character = {
+      ...lips,
+      create: (canvas) => {
+        const inst = lips.create(canvas)
+        return {
+          ...inst,
+          frame: (f) => {
+            f.focus.width = 0
+            f.focus.height = 6
+            inst.frame(f)
+          }
+        }
+      }
+    }
+    const canvas = document.createElement("canvas")
+    const r = new Runner(probe, canvas, {})
+    r.create()
+    r.resize(W, H, 1)
+    for (const mode of ["idle", "speaking"] as const) {
+      const calls = settle(r, mode, 5, { agent: saying({ open: 0.5 }), focus: { x: 0, y: 0, width: 1, height: 6 } })
+      for (const p of paths(calls)) for (const [x, y] of p.pts) expect(Number.isFinite(x) && Number.isFinite(y), `${mode} point ${x},${y}`).toBe(true)
+    }
+  })
+
+  it("makes no colour arrays per frame: the fixed mix partners are made once", () => {
+    const src = readFileSync(join(import.meta.dirname, "../../src/characters/library/lips.ts"), "utf8")
+    const body = src.slice(src.indexOf("frame(f: Frame)"), src.indexOf("dispose()"))
+    expect(body.length).toBeGreaterThan(1000)
+    expect(body).not.toMatch(/mixInto\([^)]*\[\s*\d/)
+  })
+
+  it("has no `uses` entry: no extension is read from frame.ext", () => {
+    expect("uses" in lips).toBe(false)
   })
 
   it("under reduced motion the mouth holds one half-open pose while speaking, whatever the voice does", () => {
@@ -465,6 +528,34 @@ describe("lips: the size option and the frame", () => {
     expect(b.height).toBeCloseTo(a.height, 6)
     expect(b.width).toBeCloseTo(a.width, 6)
     expect(a.height).toBeGreaterThan(0.05 * H)
+  })
+
+  it("under reduced motion the seam stays flat while the live voice keeps changing, and goes flat at once when it is switched on mid-voice", () => {
+    const r = make()
+    expect(wiggle(seam(settle(r, "hearing", 60, { user: talking({ cycles: 3 }) }))!)).toBeGreaterThan(0.5)
+    const first = seam(frame(r, "hearing", { user: talking({ cycles: 3 }), reduced: true }))!
+    expect(wiggle(first)).toBeLessThan(1e-6)
+    for (const level of [0.1, 0.5, 0.9, 0.3]) expect(wiggle(seam(settle(r, "hearing", 20, { user: talking({ level, cycles: 5 }), reduced: true }))!)).toBeLessThan(1e-6)
+  })
+
+  it("a 'mm-hm' press in flight is cleared when reduced motion switches on, and does not come back when it switches off", () => {
+    const hearing = (pitchDelta: number) => {
+      const u = talking()
+      u.pitchDelta = pitchDelta
+      return u
+    }
+    const press = make()
+    const control = make({ nods: false }) // the same frames without the press
+    const arcs = (calls: ReadonlyArray<Call>) => calls.filter((c) => c.name === "arc").length
+    settle(press, "hearing", 90, { user: hearing(0) })
+    settle(control, "hearing", 90, { user: hearing(0) })
+    let pressed = arcs(frame(press, "hearing", { user: hearing(-8) })) > arcs(frame(control, "hearing", { user: hearing(-8) }))
+    for (let i = 0; i < 30 && !pressed; i++) pressed = arcs(frame(press, "hearing", { user: hearing(0) })) > arcs(frame(control, "hearing", { user: hearing(0) }))
+    expect(pressed, "the press shows its smile lines").toBe(true)
+    // Reduced motion on, mid-press: no smile lines from the press, now or when it goes off again.
+    expect(arcs(frame(press, "hearing", { user: hearing(0), reduced: true }))).toBe(0)
+    frame(control, "hearing", { user: hearing(0) })
+    expect(arcs(frame(press, "hearing", { user: hearing(0) }))).toBe(arcs(frame(control, "hearing", { user: hearing(0) })))
   })
 
   it("smile lines hug both corners while it listens (a soft closed smile), and are not drawn at rest", () => {
