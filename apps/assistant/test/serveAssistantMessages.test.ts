@@ -816,7 +816,7 @@ describe("changes that must hold together", () => {
   it("before its session exists, a TypeSafe fallback that will answer has the device's id, and keeps it", async () => {
     await start((file) => {
       file.deviceTypes["web-voice"].withoutPhrase = { mode: "typesafe", fallback: "bravo", giveUpMs: 700 }
-    }, [greeterModule, deciderModule])
+    }, [greeterModule], routingEnv)
     const { client: page, welcome } = await voice()
     const read = async (assistantId: string) => {
       const requestId = `read-${++seq}`
