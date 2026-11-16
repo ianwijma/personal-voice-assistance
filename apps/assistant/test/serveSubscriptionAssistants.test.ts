@@ -10,9 +10,10 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterEach, describe, expect, it, vi } from "vitest"
 import { type FakeQuery, makeFakeSdk } from "../../../packages/agent-claude-code/test/fakeSdk.ts"
+import type { LlmBuilder } from "../src/serve/Resources.ts"
 import { SUBSCRIPTION_AGENT_ID, subscriptionAssistantOf, subscriptionSessionLimit } from "../src/subscription.ts"
 import { ScriptedClient, sleep } from "./support/scriptedClient.ts"
-import { controlledStt, fakeBuild, scriptedLlm, startTestServer, TEST_ADMIN_PASSWORD, type TestServer } from "./support/serveHarness.ts"
+import { controlledStt, fakeBuild, greeterModule, scriptedLlm, startTestServer, TEST_ADMIN_PASSWORD, type TestServer } from "./support/serveHarness.ts"
 
 vi.setConfig({ testTimeout: 30_000 })
 
@@ -211,6 +212,83 @@ describe("Claude subscription per assistant (WP-13a)", () => {
     expect([modelOf(qa), modelOf(qb)]).toEqual(["claude-sonnet-5-5", "claude-opus-5-5"])
     // The old agent's sessions get nothing more (the module host closes the old instance after its grace period).
     expect(fake.queries.slice(0, before).map((q) => q.received.length)).toEqual([1, 1])
+  })
+
+  it("a turn while a changed account is still being built is snapshotted as the binding that answers it, both ways", async () => {
+    // Gated builds: the Claude API instance, and (once re-armed) the subscription's stand-in, are ready when the test says.
+    let openApi = () => {}
+    const api = new Promise<void>((resolve) => {
+      openApi = () => resolve()
+    })
+    let openStandIn = () => {}
+    let standIn: Promise<void> = Promise.resolve()
+    const apiLlm = scriptedLlm((t) => `API: ${t}.`).llm
+    const standInLlm = scriptedLlm((t) => `Stand-in: ${t}.`).llm
+    const buildLlm: LlmBuilder = (spec) =>
+      spec.account === "anthropic" ? Effect.as(Effect.promise(() => api), apiLlm) : Effect.as(Effect.promise(() => standIn), standInLlm)
+    // Alpha on the subscription with Opus, high effort, adaptive thinking, no tools for Claude (useModules off), and the
+    // greeter module (one tool for a single model). Bravo is off, so nothing else holds the subscription's stand-in.
+    const dir = await dataDir()
+    const path = join(dir, "settings.json")
+    const file = JSON.parse(readFileSync(path, "utf8")) as Json
+    file.assistants.byId.alpha.llm = { ...file.assistants.byId.alpha.llm, model: "claude-opus-5-5", effort: "high", thinking: "adaptive", useModules: false }
+    file.assistants.byId.alpha.modules = { greeter: { on: true, offTools: [] } }
+    file.assistants.byId.bravo.on = false
+    file.modules = { ...file.modules, greeter: { enabled: true, settings: { greeting: "hello" } } }
+    writeFileSync(path, `${JSON.stringify(file, null, 2)}\n`)
+    const fake = makeFakeSdk({ respond: (ctx) => {
+      ctx.delta(`Claude heard: ${ctx.text.split("\n").at(-1)}`)
+      ctx.result()
+    } })
+    server = await startTestServer({
+      catalog: [claudeSubscriptionAgentModule({ sdk: fake.sdk, env: { PATH: "/usr/bin" } }), greeterModule],
+      build: fakeBuild({ stt: controlledStt().stt, llm: scriptedLlm((t) => `Build: ${t}.`).llm }),
+      buildLlm,
+      resourceGraceMs: 100,
+      dataDir: dir
+    })
+    const admin = await connect()
+    await admin.admin(TEST_ADMIN_PASSWORD)
+    await until("the agent module running", () => server!.handle.host.modules().find((m) => m.id === SUBSCRIPTION_AGENT_ID)?.state === "running")
+    const page = await connect("device-desk")
+    await page.hello()
+    const llmStatus = () => server!.handle.resources.status().filter((r) => r.kind === "llm")
+    const maxTokens = assistantOf("alpha").llm.maxTokens
+    const onSubscription = { account: "claude-subscription", model: "claude-opus-5-5", effort: "high", thinking: "adaptive", maxTokens }
+    const onApi = { account: "anthropic", model: "claude-opus-5-5", effort: "high", thinking: "adaptive", maxTokens }
+
+    expect(await typed(page, "alpha", "one", "t1")).toBe("Claude heard: one")
+    // To the Claude API, keeping the fields, with warm-up: while that instance is built the subscription binding answers.
+    await save({ ...assistantOf("alpha"), llm: { ...assistantOf("alpha").llm, account: "anthropic", warmUp: true } })
+    await until("the API instance starting", () => llmStatus().some((r) => r.key.startsWith("anthropic|") && r.state === "starting"))
+    expect(server!.handle.resources.keyFor("alpha")).toBe("claude-subscription")
+    expect(await typed(page, "alpha", "two", "t2")).toBe("Claude heard: two")
+    expect(modelOf(queryOf(fake.queries, "two"))).toBe("claude-opus-5-5")
+    openApi()
+    await until("Alpha on the API", () => server!.handle.resources.keyFor("alpha")?.startsWith("anthropic|") === true)
+    expect(await typed(page, "alpha", "three", "t3")).toBe("API: three.")
+
+    // And back: while the subscription's stand-in (released meanwhile) is built again, the API binding answers.
+    await until("the stand-in released", () => !llmStatus().some((r) => r.key === "claude-subscription"))
+    standIn = new Promise<void>((resolve) => {
+      openStandIn = () => resolve()
+    })
+    await save({ ...assistantOf("alpha"), llm: { ...assistantOf("alpha").llm, account: "claude-subscription" } })
+    await until("the stand-in starting", () => llmStatus().some((r) => r.key === "claude-subscription" && r.state === "starting"))
+    expect(server!.handle.resources.keyFor("alpha")?.startsWith("anthropic|")).toBe(true)
+    expect(await typed(page, "alpha", "four", "t4")).toBe("API: four.")
+    openStandIn()
+    await until("Alpha on the subscription", () => server!.handle.resources.keyFor("alpha") === "claude-subscription")
+    expect(await typed(page, "alpha", "five", "t5")).toBe("Claude heard: five")
+
+    await until("five traces", () => traces(admin).length === 5)
+    expect(traces(admin).map((t) => [t.config?.llm, t.config?.tools])).toEqual([
+      [onSubscription, 0],
+      [onSubscription, 0],
+      [onApi, 1],
+      [onApi, 1],
+      [onSubscription, 0]
+    ])
   })
 
   it("maxSessions: MAX_VOICE_SESSIONS × the switched-on assistants; past the bound the least recently used session closes", async () => {

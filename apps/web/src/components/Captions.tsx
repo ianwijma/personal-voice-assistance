@@ -37,7 +37,7 @@ export function Captions() {
       data-testid="captions"
       className={cx(
         // Two lines are reserved, so nothing under them moves when they appear; smaller on a short screen.
-        "mt-3 min-h-[3.2em] w-full max-w-[640px] px-6 text-center text-[16px] leading-[1.45] sm:text-caption short:mt-2 short:min-h-[2.9em] short:text-[16px]",
+        "stage-legible mt-3 min-h-[3.2em] w-full max-w-[640px] px-6 text-center text-[16px] leading-[1.45] sm:text-caption short:mt-2 short:min-h-[2.9em] short:text-[16px]",
         "transition-opacity ease-out",
         caption !== null ? "opacity-100 duration-[240ms]" : "opacity-0 delay-[2000ms] duration-500"
       )}

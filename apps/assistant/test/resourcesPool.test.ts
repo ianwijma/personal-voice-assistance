@@ -3,7 +3,7 @@
 // failed and never-used instances released at once, defects in a builder, the pool's own shutdown, `onChange`.
 import { Llm, type LlmEvent, LlmError } from "@pva/core"
 import type { AssistantLlm } from "@pva/protocol"
-import { Deferred, Effect, Exit, Scope, Stream } from "effect"
+import { Deferred, Effect, Exit, Fiber, Scope, Stream } from "effect"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import {
   llmConfigOf,
@@ -181,6 +181,100 @@ describe("resource pool: sharing and release", () => {
     await advance(20)
     expect(fake.released).toEqual([])
     expect(await ask(pool.llmFor("a"))).toBe("good#1")
+  })
+})
+
+describe("resource pool: a turn waiting for its instance to load", () => {
+  /**
+   * Instances like the real adapters': once the scope closes they are shut down and refuse to answer. "slow"'s build
+   * waits for `building`. c uses "m", ready; a comes into use on "slow", still being built.
+   */
+  const loadingSlow = async () => {
+    const building = Deferred.makeUnsafe<void>()
+    const builds: Array<string> = []
+    const released: Array<string> = []
+    const build: LlmBuilder = (s) =>
+      Effect.gen(function*() {
+        const name = `${s.model}#${builds.length + 1}`
+        builds.push(s.model)
+        if (s.model === "slow") yield* Deferred.await(building)
+        let shut = false
+        yield* Effect.addFinalizer(() =>
+          Effect.sync(() => {
+            shut = true
+            released.push(name)
+          })
+        )
+        return Llm.of({
+          stream: () =>
+            Stream.suspend((): Stream.Stream<LlmEvent, LlmError> =>
+              shut
+                ? Stream.fail(new LlmError({ message: "instance is shut down" }))
+                : Stream.make<Array<LlmEvent>>({ _tag: "TextDelta", text: name }, { _tag: "Done", stopReason: "end" })
+            )
+        })
+      })
+    const pool = await makePool({ buildLlm: build, graceMs: 60_000 })
+    await run(pool.reconcile(wanted({ c: spec("m") })))
+    const wanting = run(pool.reconcile(wanted({ a: spec("slow"), c: spec("m") })))
+    await advance(10)
+    expect(pool.keyFor("a")).toBe(llmKeyOf(spec("slow")))
+    return { pool, building, released, wanting }
+  }
+  const slowListed = (pool: ResourcePool) => pool.status().some((r) => r.key === llmKeyOf(spec("slow")))
+
+  const lastUserGoes: ReadonlyArray<readonly [string, Record<string, LlmSpec>]> = [
+    ["rebound to a ready instance", { a: spec("m"), c: spec("m") }],
+    ["switched off", { c: spec("m") }]
+  ]
+  for (const [what, after] of lastUserGoes) {
+    it(`a turn waiting for its instance to load finishes with it when its assistant, the last user, is ${what} meanwhile; then the instance is released`, async () => {
+      const { pool, building, released, wanting } = await loadingSlow()
+      const llm = pool.llmFor("a")
+      // The turn's stream starts and waits for the build.
+      const said = ask(llm)
+      await advance(10)
+      await run(pool.reconcile(wanted(after)))
+      // Kept for the waiting turn, though nobody uses it any more.
+      await advance(10)
+      expect(released).toEqual([])
+      expect(slowListed(pool)).toBe(true)
+      Deferred.doneUnsafe(building, Exit.void)
+      await wanting
+      expect(await said).toBe("slow#2")
+      // Done: released at once (it was never used after the turn), its instance shut down.
+      await advance(10)
+      expect(released).toEqual(["slow#2"])
+      expect(slowListed(pool)).toBe(false)
+    })
+  }
+
+  it("a turn stopped while it waits for its instance lets go of it: an instance nobody uses any more is released", async () => {
+    const { pool, building, released, wanting } = await loadingSlow()
+    const llm = pool.llmFor("a")!
+    const turn = Effect.runFork(Stream.runDrain(llm.stream({ system: "", messages: [{ role: "user", content: "hi" }], tools: [] })))
+    await advance(10)
+    await run(pool.reconcile(wanted({ a: spec("m"), c: spec("m") })))
+    expect(slowListed(pool)).toBe(true)
+    await run(Fiber.interrupt(turn))
+    expect(slowListed(pool)).toBe(false)
+    Deferred.doneUnsafe(building, Exit.void)
+    await wanting
+    await advance(10)
+    // The build finished into the closed scope: what it registered was released straight away.
+    expect(released).toEqual(["slow#2"])
+  })
+
+  it("an instance released before a turn's stream started fails it with an LlmError instead of answering on a shut-down instance", async () => {
+    const { pool, building, wanting } = await loadingSlow()
+    const llm = pool.llmFor("a")
+    await run(pool.reconcile(wanted({ c: spec("m") })))
+    expect(slowListed(pool)).toBe(false)
+    Deferred.doneUnsafe(building, Exit.void)
+    await wanting
+    const answering = ask(llm)
+    await expect(answering).rejects.toBeInstanceOf(LlmError)
+    await expect(answering).rejects.toMatchObject({ message: "The language model was released before the turn started." })
   })
 })
 

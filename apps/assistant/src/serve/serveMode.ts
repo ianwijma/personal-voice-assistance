@@ -692,19 +692,24 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     /**
      * The assistant's part of a turn's configuration snapshot (protocol 7 `TraceConfig`, docs/ASSISTANTS.md §3.7): the
      * language model the turn is bound to (the pool's instance: its spec, which during a change is still the old one;
-     * a Claude subscription assistant's agent answers with the assistant's own fields), the voice it is bound to, the
-     * modules and tools it has, and its reply-early and tool-round settings.
+     * a binding on the Claude subscription: the options its agent is passed, from the assistant's own fields), the
+     * voice it is bound to, the modules and tools it has, and its reply-early and tool-round settings.
      */
     const traceConfigOf = (assistant: Assistant, tools: number, modules: number): AssistantTraceConfig => {
       const key = resources.keyFor(assistant.id)
-      const bound = assistant.llm.account === SUBSCRIPTION_PROVIDER || key === undefined ? undefined : llmSpecs.get(key)
-      const llm = bound ?? (assistant.llm.account === SUBSCRIPTION_PROVIDER ? assistant.llm : llmSpecOf(assistant.llm))
-      const model = assistant.llm.account === SUBSCRIPTION_PROVIDER && llm.model.trim() === "" ? SUBSCRIPTION_DEFAULT_MODEL : llm.model
+      // The account of the binding in use, as `agentSetup` reads it (during a change the old binding answers, the old
+      // way), not the saved one. Not bound yet: the saved account.
+      const account = key === undefined ? assistant.llm.account : key.split("|")[0]
+      // On the subscription the agent answers with these options (`subscriptionAssistant`), not the pool's stand-in.
+      const passed = account === SUBSCRIPTION_PROVIDER ? subscriptionAssistantOf(assistant, 1).options : undefined
+      const spec = (key === undefined ? undefined : llmSpecs.get(key)) ?? llmSpecOf(assistant.llm)
       return {
-        llm: { account: llm.account, model, effort: llm.effort, thinking: llm.thinking, maxTokens: llm.maxTokens },
+        llm: passed !== undefined
+          ? { account: SUBSCRIPTION_PROVIDER, model: passed.model, effort: assistant.llm.effort, thinking: assistant.llm.thinking, maxTokens: assistant.llm.maxTokens }
+          : { account: spec.account, model: spec.model, effort: spec.effort, thinking: spec.thinking, maxTokens: spec.maxTokens },
         voice: resources.ttsKeyFor(assistant.id) ?? voiceKey(assistant.voice),
         modules,
-        tools: assistant.llm.account === SUBSCRIPTION_PROVIDER && !assistant.llm.useModules ? 0 : tools,
+        tools: passed !== undefined && !passed.tools ? 0 : tools,
         replyEarly: assistant.replyEarly,
         toolRounds: assistant.toolRounds
       }
