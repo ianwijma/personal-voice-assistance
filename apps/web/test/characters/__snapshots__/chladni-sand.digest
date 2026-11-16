@@ -1,4 +1,4 @@
-# chladni-sand 1.0.0: frame digests of a scripted conversation at default settings (docs/CHARACTERS.md §6.6).
+# chladni-sand 1.1.0: frame digests of a scripted conversation at default settings (docs/CHARACTERS.md §6.6).
 # A change here must be deliberate: check the look, then update with `pnpm --filter @pva/web exec vitest run test/characters -u`.
 dark  0.5 idle       1131 d8552481
 dark  1.0 listening  1131 319df84b
@@ -47,3 +47,26 @@ light 11.0 idle       1137 b45b68da
 overflow 160×140×1 0.0 px
 overflow 900×420×1 0.0 px
 overflow 720×240×2 0.0 px
+stage  0.5 idle       1131 08741e01
+stage  1.0 listening  1131 7be0e4cb
+stage  1.5 listening  1131 d5b2f906
+stage  2.0 hearing    1139 9d872350
+stage  2.5 hearing    1147 cb766195
+stage  3.0 hearing    1163 5b564b14
+stage  3.5 hearing    1163 3e8fa104
+stage  4.0 hearing    1155 fa503079
+stage  4.5 hearing    1163 442d409d
+stage  5.0 thinking   1155 bad540fb
+stage  5.5 thinking   1139 8d151d9e
+stage  6.0 thinking   1131 31be2d55
+stage  6.5 speaking   1137 27865799
+stage  7.0 speaking   1145 e7cf554c
+stage  7.5 speaking   1161 fba4c1d9
+stage  8.0 speaking   1161 108db4c2
+stage  8.5 speaking   1161 a0cdf6eb
+stage  9.0 speaking   1153 4db400eb
+stage  9.5 listening  1145 83ae6386
+stage 10.0 listening  1145 c350a4b9
+stage 10.5 idle       1137 d17206a4
+stage 11.0 idle       1137 ae4a3f9f
+stage 1280×800×1 focus 720×240 at 280,200: solid drawing x 532.0..748.0, y 212.0..428.0

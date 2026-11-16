@@ -171,13 +171,8 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
 
   return {
     resize(width, height, ratio) {
-      W = width
-      H = height
       dpr = ratio
       g = setup2d(canvas, dpr)
-      const L = Math.min(W * 0.9, H * 0.9)
-      nBase = Math.round(clamp(L * L * 0.024, 700, BASE_GRAINS))
-      setCount(nBase * grainsK)
     },
 
     frame(f: Frame) {
@@ -186,7 +181,14 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
       const reduced = f.reducedMotion
       mix.step(f)
       modeTone(tone, mix, p)
-      clear2d(g, dpr)
+      const fo = f.focus
+      clear2d(g, dpr, fo) // (0, 0) is the box's top-left corner; the plate lives in the box
+      W = fo.width
+      H = fo.height
+      {
+        const L0 = Math.min(W * 0.9, H * 0.9)
+        nBase = Math.round(clamp(L0 * L0 * 0.024, 700, BASE_GRAINS))
+      }
 
       // Options.
       const o = f.options
@@ -253,8 +255,8 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
       }
       lastOnset = v.onset
       const pt = f.pointer
-      const pu = (pt.x - cx) / half
-      const pv = (pt.y - cy) / half
+      const pu = (pt.x - fo.x - cx) / half
+      const pv = (pt.y - fo.y - cy) / half
       const onPlate = pt.inside && Math.abs(pu) < 1 && Math.abs(pv) < 1
       if (pt.down && !pressWas && onPlate && !reduced) {
         const q = nextFront
@@ -443,7 +445,7 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
 
 const character: Character = {
   id: "chladni-sand",
-  version: "1.0.0",
+  version: "1.1.0",
   contract: 1,
   name: "Chladni sand",
   family: "abstract",
@@ -469,6 +471,7 @@ const character: Character = {
     { signal: "reducedMotion", effect: "Sand does not hop or drift: when the figure, mode or plate changes it is placed straight into the settled figure, then holds still." }
   ],
   renderer: "2d",
+  canvas: "stage",
   options: [
     { id: "size", kind: "number", label: "Size", min: 0.5, max: 1, step: 0.05, default: 1, unit: "×", group: "Shape", help: "How big the plate is; at 1 it nearly fills the height." },
     { id: "grains", kind: "number", label: "Amount of sand", min: 0.3, max: 2, step: 0.05, default: 1, unit: "×", group: "Shape", help: "How much sand lies on the plate: a sparse sprinkle or thick, bold lines." },
