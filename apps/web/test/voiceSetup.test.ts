@@ -396,3 +396,90 @@ describe("what the chat shows", () => {
     expect(newConversationTip(one)).toBe("New conversation")
   })
 })
+
+describe("the server is the only authority on who has the turn, and a turn keeps its assistant (review round 4)", () => {
+  const traced = (turnId: number, assistantId: string): ServerMessage => ({
+    type: "turn.end",
+    turnId,
+    outcome: "completed",
+    trace: { turnId, mode: "voice", speculative: false, outcome: "completed", marks: {}, tools: [], voices: [], assistant: { id: assistantId, name: assistantId } }
+  })
+
+  it("an explicit holder is taken as sent in every state: a muted microphone (idle) inside T3's follow-up window keeps T3, as a tab joining then does", () => {
+    let s = run([welcomeWith(setup()), turnStart(1, "t3"), turnEnd(1), { type: "state", state: "listening", holder: "t3" }])
+    s = run([{ type: "state", state: "idle", holder: "t3" }], s)
+    expect(holderOf(s)).toBe("t3")
+    expect(topBarName(s)).toBe("T3")
+    expect(viewedId(s)).toBe("t3")
+    expect(newConversationTip(s)).toBe("New conversation with T3 (Jeff keeps its own)")
+    expect(holderOf(run([{ type: "state", state: "asleep", holder: "t3" }], s))).toBe("t3")
+    // A tab that joins at that moment sees the same.
+    const joined = run([welcomeWith(setup(), { state: "idle", holder: "t3" })])
+    expect(holderOf(joined)).toBe(holderOf(s))
+    // An explicit null is nobody, in any state.
+    expect(holderOf(run([{ type: "state", state: "thinking", turnId: 2, holder: null }], s))).toBeUndefined()
+    // Only a state without the field (a server that does not say) falls back: idle drops the holder.
+    const legacy = run([welcomeWith(setup()), turnStart(1, "t3"), { type: "state", state: "idle" }])
+    expect(holderOf(legacy)).toBeUndefined()
+  })
+
+  it("a sentence heard past the hearing timer: the server's listening state still names T3, and the page keeps it", () => {
+    let s = run([welcomeWith(setup()), { type: "state", state: "listening", holder: "t3" }, { type: "state", state: "hearing", holder: "t3" }])
+    s = run([{ type: "state", state: "listening", holder: "t3" }], s)
+    expect(holderOf(s)).toBe("t3")
+    expect(answeringId(s)).toBe("t3")
+  })
+
+  it("once the server names holders, wake and turn.start move nothing on the page", () => {
+    const told = run([welcomeWith(setup(), { holder: null })])
+    expect(told.holderTold).toBe(true)
+    expect(holderOf(run([{ type: "wake", phrase: "hey t3", armed: true, assistantId: "t3" }], told))).toBeUndefined()
+    expect(holderOf(run([turnStart(1, "t3")], told))).toBeUndefined()
+    expect(stripAssistantId(run([{ type: "wake", phrase: "hey t3", armed: true, assistantId: "t3" }], told))).toBeUndefined()
+    // The state that follows says it.
+    expect(holderOf(run([turnStart(1, "t3"), { type: "state", state: "thinking", turnId: 1, holder: "t3" }], told))).toBe("t3")
+    // From a server that never says, they still stand in for it.
+    expect(holderOf(run([{ type: "wake", phrase: "hey t3", armed: true, assistantId: "t3" }], run([welcomeWith(setup())])))).toBe("t3")
+  })
+
+  it("a tab that joined after T3's turn.start: tool.start makes the turn T3's, and it stays T3's when the turn passes back to Jeff", () => {
+    let s = run([welcomeWith(setup(), { holder: "t3" })])
+    s = run([
+      { type: "tool.start", turnId: 5, callId: "c1", tool: "search", moduleId: null, input: null, assistantId: "t3" },
+      { type: "assistant.text", turnId: 5, clause: null, text: "Found it.", assistantId: "t3" },
+      { type: "tool.end", turnId: 5, callId: "c1", ok: true, ms: 3, assistantId: "t3" },
+      turnEnd(5)
+    ], s)
+    expect(s.turns.find((t) => t.turnId === 5)?.assistantId).toBe("t3")
+    // T3's follow-up lapses: Jeff answers again; the turn does not move.
+    s = run([{ type: "state", state: "listening", holder: null }], s)
+    expect(answeringId(s)).toBe("jeff")
+    expect(turnsOf(s, "t3").map((t) => t.turnId)).toContain(5)
+    expect(turnsOf(s, "jeff").map((t) => t.turnId)).not.toContain(5)
+  })
+
+  it("a turn first made by an untagged message gets its assistant from the first tagged one (or its trace) and keeps it", () => {
+    const base = run([welcomeWith(setup(), { holder: "t3" })])
+    // An untagged tool.start (an older server), then assistant.text names T3.
+    let s = run([{ type: "tool.start", turnId: 6, callId: "c1", tool: "search", moduleId: null, input: null }], base)
+    expect(s.turns.find((t) => t.turnId === 6)?.assistantId).toBeUndefined()
+    s = run([{ type: "assistant.text", turnId: 6, clause: null, text: "Hi", assistantId: "t3" }], s)
+    expect(s.turns.find((t) => t.turnId === 6)?.assistantId).toBe("t3")
+    // Once set it never changes, whatever a later message says.
+    s = run([{ type: "assistant.text", turnId: 6, clause: null, text: "!", assistantId: "jeff" }, traced(6, "jeff")], s)
+    expect(s.turns.find((t) => t.turnId === 6)?.assistantId).toBe("t3")
+    // Only the trace of turn.end names the assistant: that is enough.
+    s = run([{ type: "tool.start", turnId: 7, callId: "c2", tool: "search", moduleId: null, input: null }, traced(7, "t3")], base)
+    expect(s.turns.find((t) => t.turnId === 7)?.assistantId).toBe("t3")
+    // turn.start for a turn an earlier message made fills in its assistant without replacing it.
+    s = run([{ type: "tool.start", turnId: 8, callId: "c3", tool: "search", moduleId: null, input: null }, turnStart(8, "t3", "Look it up")], base)
+    expect(s.turns.find((t) => t.turnId === 8)).toMatchObject({ assistantId: "t3", userText: "Look it up" })
+  })
+
+  it("a turn no message has named yet is filed under who answers without a phrase, not under who has the turn now", () => {
+    let s = run([welcomeWith(setup(), { holder: "t3" }), { type: "tool.start", turnId: 9, callId: "c1", tool: "search", moduleId: null, input: null }])
+    expect(turnsOf(s, "jeff").map((t) => t.turnId)).toContain(9)
+    s = run([{ type: "state", state: "listening", holder: null }], s)
+    expect(turnsOf(s, "jeff").map((t) => t.turnId)).toContain(9)
+  })
+})

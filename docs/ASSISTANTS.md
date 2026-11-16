@@ -604,7 +604,10 @@ DeviceSetup = { type: "device.setup", deviceId?,
   canAuto: boolean,                     // TypeSafe is set up (shows "Whichever fits" in the menu)
   interruptMode, audio: DeviceSettings["audio"], captions: DeviceSettings["captions"] }
 // changed
-TurnStart       += { assistantId }      // also assistant.text, reply.start: assistantId
+TurnStart       += { assistantId }      // also assistant.text, tool.start, tool.end, reply.start: assistantId;
+                                        // turn.end names it in trace.assistant. A turn is its assistant's for its
+                                        // whole life: the page files it by the first message that names it (a tab
+                                        // that joined mid-turn too), never by who has the turn now.
 Conversation    += { assistantId }      // conversation { id, reason, startedAt, assistantId }
 Wake            += { assistantId }
 State           += { holder?: AssistantId | null }   // who has the turn: the turn in flight or the utterance being
@@ -614,6 +617,11 @@ State           += { holder?: AssistantId | null }   // who has the turn: the tu
                                         // "Being heard": from its SpeechStarted to its EndOfTurn, then (words only)
                                         // until its turn is committed; not the 2 s hearing tail. Stop or a new
                                         // conversation for its assistant cancels it: it holds the turn no longer.
+                                        // Read from the routing state only (RouteGate, the open utterance, the turn
+                                        // in flight), never from the display (the hearing timer, a muted microphone:
+                                        // idle with a follow-up window open still names its assistant). The page
+                                        // takes a holder that is present as sent, in every state; only a state
+                                        // without the field (a server that does not say) leaves it to the page.
 Snapshot.conversations = Array<{ assistantId, id, startedAt, turns: number }>   // replaces snapshot.conversation
 Snapshot.history       = the history of the answering assistant (the follow-up holder, else withoutPhrase's, else
                          the first); the others are fetched on demand:
