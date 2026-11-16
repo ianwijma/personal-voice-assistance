@@ -371,3 +371,9 @@ describe("dot matrix: glow", () => {
     expect(blurred({ focus: { x: 0, y: 0, width: 200, height: 80 } })).toBe(false) // LEDs 5.5 px apart
   })
 })
+
+describe("dot matrix: manifest", () => {
+  it("declares no extension it does not read: `uses` is absent", () => {
+    expect("uses" in dotMatrix).toBe(false)
+  })
+})

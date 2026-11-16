@@ -340,7 +340,7 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
 const character: Character = {
   id: "dot-matrix",
   name: "Dot matrix",
-  version: "1.1.0",
+  version: "1.1.1",
   contract: 1,
   family: "figure",
   summary: "A face on a 27 × 13 LED matrix, as a small voice node could show it: pixel eyes and mouth, and edge 'ears' that meter your pitch and loudness in mint.",
@@ -371,13 +371,6 @@ const character: Character = {
       signal: "options",
       effect:
         "Size (shrinks the panel), grid 19 × 9, 27 × 13 or 39 × 19 (the face scales with it; a 0.3 s fade hides the swap), LEDs round or square (morph ~0.2 s) with or without the unlit ones; expressiveness scales nods, hops, tilt and squints; liveliness divides blink and saccade intervals; mouth range scales the opening; nods and pointer-following switch off."
-    }
-  ],
-  uses: [
-    {
-      ext: "speech.phonemes",
-      gain: "Exact mouth closures and timing for the pixel mouth, aligned to the played samples.",
-      without: "The mouth shapes are estimated from the reply's spectrum."
     }
   ],
   renderer: "2d",

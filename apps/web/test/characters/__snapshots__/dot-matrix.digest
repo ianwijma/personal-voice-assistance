@@ -1,4 +1,4 @@
-# dot-matrix 1.1.0: frame digests of a scripted conversation at default settings (docs/CHARACTERS.md §6.6).
+# dot-matrix 1.1.1: frame digests of a scripted conversation at default settings (docs/CHARACTERS.md §6.6).
 # A change here must be deliberate: check the look, then update with `pnpm --filter @pva/web exec vitest run test/characters -u`.
 dark  0.5 idle        763 73f71137
 dark  1.0 listening   767 ad21bd6e
