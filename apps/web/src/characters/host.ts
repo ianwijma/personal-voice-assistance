@@ -19,16 +19,23 @@
  * - One requestAnimationFrame loop, paused while the tab is hidden. The canvas follows its CSS box and the device
  *   pixel ratio. A canvas cannot change context type, so a "webgl2" character gets a fresh canvas of its own next
  *   to the page's (which "2d" characters share); its WebGL context is released and the canvas removed on dispose.
+ * - Canvas areas (`Character.canvas`): a "box" character (the default) draws on the page's canvas in the stage box,
+ *   as before. A "stage" character gets a fresh canvas of its own filling `HostOptions.stage` (the page's full-stage
+ *   layer), sized to it with a capped backing store (`STAGE_MAX_PIXELS`), and each frame `focus`: where the box
+ *   (`primary`) is on that canvas, read from the layout, so it follows the box when the page moves it without a
+ *   resize. The page's canvas stays in the layout, hidden, as the focus placeholder. Without a stage layer a
+ *   "stage" character is treated as a "box" one. Its pointer comes from the window (the layer takes no pointer
+ *   events), in its canvas's coordinates.
  *
  * Nothing here runs in or waits on the audio worklets: the host only reads what the audio code already left in
  * `levels` (a ring of microphone samples, the analyser), on the main thread, once per frame.
  */
 import { levels, readMicWindow } from "../lib/audio/levels.ts"
 import { BASELINE_ID } from "./choice.ts"
-import { type Character, type CharacterChoice, type Mode, type OptionValues, type Palette, type Pointer, type Rgb } from "./contract.ts"
+import { type CanvasArea, type Character, type CharacterChoice, type Focus, type Mode, type OptionValues, type Palette, type Pointer, type Rgb } from "./contract.ts"
 import { manifestProblems } from "./manifest.ts"
 import { registry as defaultRegistry, type Registry } from "./registry.ts"
-import { coreOf, Runner } from "./runner.ts"
+import { areaOf, coreOf, Runner } from "./runner.ts"
 import { agentOn, LiveVoice, standInAgent, standInUser, userOn } from "./voices.ts"
 
 /** The stage's live input, a plain object the page mutates in place (no React per frame). */
@@ -67,6 +74,27 @@ export interface HostOptions {
   /** Frames per measuring window. */
   readonly windowFrames?: number
   readonly warn?: (message: string, error?: unknown) => void
+  /**
+   * The page's full-stage layer: a positioned element covering the stage area, taking no pointer events, behind the
+   * page's content. A "stage" character's canvas is appended to it and fills it. Absent or null: "stage" characters
+   * get the box like any other.
+   */
+  readonly stage?: HTMLElement | null
+  /** Most device pixels a stage canvas's backing store may have (default `STAGE_MAX_PIXELS`). */
+  readonly stageMaxPixels?: number
+}
+
+/**
+ * The backing-store cap of a stage canvas, in device pixels: its pixel ratio is lowered until width × height ×
+ * ratio² fits, but never below 1 (or the device's own ratio, if that is lower). About 1280 × 800 at ratio 2; a
+ * 1920 × 1080 window at ratio 2 gets ratio 1.42. Box canvases are not capped (720 × 240 × 3² is 1.6 M).
+ */
+export const STAGE_MAX_PIXELS = 4_200_000
+
+/** The pixel ratio a stage canvas of `width` × `height` CSS px gets on a device of ratio `device`. */
+export const stageRatio = (width: number, height: number, device: number, maxPixels = STAGE_MAX_PIXELS): number => {
+  const fit = Math.sqrt(maxPixels / Math.max(1, width * height))
+  return Math.min(device, Math.max(Math.min(1, device), fit))
 }
 
 export const FRAME_BUDGET_MS = 2
@@ -86,6 +114,12 @@ export interface HostDebug {
   /** The character on stage now. */
   readonly id: string
   readonly renderer: "2d" | "webgl2" | null
+  /** The canvas area the current character got ("stage" only when it asked for it and the page has a stage layer). */
+  readonly canvas: CanvasArea | null
+  /** The current character's canvas: CSS size and the pixel ratio of its backing store. */
+  readonly size: { readonly width: number; readonly height: number; readonly ratio: number }
+  /** The focus of the latest frame (CSS px on the character's canvas). */
+  readonly focus: Focus
   /** An id being loaded, or null. */
   readonly loading: string | null
   /** Why the requested character is not on stage, or null. */
@@ -158,7 +192,14 @@ interface Active {
   readonly id: string
   readonly runner: Runner
   readonly canvas: HTMLCanvasElement
+  readonly area: CanvasArea
   frames: number
+}
+
+interface Size {
+  width: number
+  height: number
+  ratio: number
 }
 
 class PhaseError extends Error {
@@ -203,6 +244,8 @@ export const startCharacterHost = (primary: HTMLCanvasElement, input: HostInput,
   const limitWindows = options.budgetWindows ?? DEFAULT_WINDOWS
   const windowFrames = options.windowFrames ?? DEFAULT_WINDOW_FRAMES
   const warn = options.warn ?? ((m: string, e?: unknown) => console.warn(m, ...(e === undefined ? [] : [e])))
+  const stageEl = options.stage ?? null
+  const maxPixels = options.stageMaxPixels ?? STAGE_MAX_PIXELS
 
   // Theme, motion and pointer.
   const probeCanvas = document.createElement("canvas")
@@ -236,26 +279,76 @@ export const startCharacterHost = (primary: HTMLCanvasElement, input: HostInput,
     ["pointercancel", () => { pointer.down = false }]
   ]
   for (const [type, fn] of listeners) target.addEventListener(type, fn as EventListener)
+  // A stage character's pointer: the layer takes no pointer events, so it is read on the window (in the capture
+  // phase, so nothing on the page can hide it), kept in client coordinates and placed on the canvas per frame.
+  const stagePointer: Pointer = { x: 0, y: 0, down: false, inside: false }
+  const client = { x: 0, y: 0, in: false, down: false }
+  const onWindow = (e: PointerEvent) => {
+    client.x = e.clientX
+    client.y = e.clientY
+    if (e.type === "pointerout") {
+      if (e.relatedTarget === null) {
+        client.in = false
+        client.down = false
+      }
+      return
+    }
+    client.in = true
+    if (e.type === "pointerdown") client.down = true
+    else if (e.type === "pointerup" || e.type === "pointercancel") client.down = false
+  }
+  const windowEvents = ["pointermove", "pointerdown", "pointerup", "pointercancel", "pointerout"]
+  if (stageEl !== null) for (const type of windowEvents) window.addEventListener(type, onWindow as EventListener, { capture: true, passive: true })
 
-  // Size.
-  let W = 1
-  let H = 1
-  let dpr = 1
-  const measure = (): boolean => {
-    const r = primary.getBoundingClientRect()
+  // Size: the box (the page's canvas) and, with a stage layer, the stage.
+  const deviceRatio = () => Math.min(3, window.devicePixelRatio || 1)
+  let device = deviceRatio()
+  const box: Size = { width: 1, height: 1, ratio: 1 }
+  const stage: Size = { width: 1, height: 1, ratio: 1 }
+  const sizeOf = (area: CanvasArea): Size => (area === "stage" ? stage : box)
+  /** Re-read both sizes; true for an area whose size changed. */
+  const measureInto = (s: Size, el: HTMLElement, isStage: boolean): boolean => {
+    const r = el.getBoundingClientRect()
     const w = Math.max(1, r.width)
     const h = Math.max(1, r.height)
-    const d = Math.min(3, window.devicePixelRatio || 1)
-    if (w === W && h === H && d === dpr) return false
-    W = w
-    H = h
-    dpr = d
+    const d = isStage ? stageRatio(w, h, device, maxPixels) : device
+    if (w === s.width && h === s.height && d === s.ratio) return false
+    s.width = w
+    s.height = h
+    s.ratio = d
     return true
+  }
+  const measure = (): { readonly box: boolean; readonly stage: boolean } => {
+    device = deviceRatio()
+    return { box: measureInto(box, primary, false), stage: stageEl !== null && measureInto(stage, stageEl, true) }
   }
   measure()
   let resized = false
   const ro = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(() => { resized = true })
   ro?.observe(primary)
+  if (stageEl !== null) ro?.observe(stageEl)
+
+  // Focus: where the box is on a stage canvas, per frame (one layout read each of the box and the canvas).
+  const focus: Focus = { x: 0, y: 0, width: 1, height: 1 }
+  const place = (a: { readonly area: CanvasArea; readonly canvas: HTMLCanvasElement }): void => {
+    if (a.area !== "stage") {
+      focus.x = 0
+      focus.y = 0
+      focus.width = box.width
+      focus.height = box.height
+      return
+    }
+    const b = primary.getBoundingClientRect()
+    const c = a.canvas.getBoundingClientRect()
+    focus.x = b.left - c.left
+    focus.y = b.top - c.top
+    focus.width = Math.max(1, b.width)
+    focus.height = Math.max(1, b.height)
+    stagePointer.x = client.x - c.left
+    stagePointer.y = client.y - c.top
+    stagePointer.down = client.down
+    stagePointer.inside = client.in && stagePointer.x >= 0 && stagePointer.y >= 0 && stagePointer.x < c.width && stagePointer.y < c.height
+  }
 
   // Voices.
   const userLive = new LiveVoice()
@@ -319,6 +412,16 @@ export const startCharacterHost = (primary: HTMLCanvasElement, input: HostInput,
     return c
   }
 
+  /** A fresh canvas filling the stage layer, for a "stage" character (of either renderer). */
+  const stageCanvas = (layer: HTMLElement): HTMLCanvasElement => {
+    const c = document.createElement("canvas")
+    c.setAttribute("aria-hidden", "true")
+    c.dataset.characterCanvas = "stage"
+    c.style.cssText = "position:absolute;inset:0;width:100%;height:100%;display:block;pointer-events:none"
+    layer.append(c)
+    return c
+  }
+
   const sinceInterrupt = (now: number): number => {
     const at = taps.interruptedAt()
     return Number.isFinite(at) ? Math.max(0, (now - at) / 1000) : Infinity
@@ -350,27 +453,33 @@ export const startCharacterHost = (primary: HTMLCanvasElement, input: HostInput,
     return { user, agent }
   }
 
-  const draw = (runner: Runner, now: number, dt: number, user: ReturnType<typeof voices>["user"], agent: ReturnType<typeof voices>["agent"]) =>
-    runner.step({ mode: input.state, dt, user, agent, palette, reducedMotion: reduced, pointer, sinceInterrupt: sinceInterrupt(now) })
+  /** Draw one frame. Call `place(a)` first: the layout reads are kept out of the character's measured cost. */
+  const draw = (a: { readonly runner: Runner; readonly area: CanvasArea; readonly canvas: HTMLCanvasElement }, now: number, dt: number, user: ReturnType<typeof voices>["user"], agent: ReturnType<typeof voices>["agent"]) => {
+    const onStage = a.area === "stage"
+    a.runner.step({ mode: input.state, dt, user, agent, palette, reducedMotion: reduced, pointer: onStage ? stagePointer : pointer, sinceInterrupt: sinceInterrupt(now), ...(onStage ? { focus } : {}) })
+  }
 
   let lastVoices = voices(performance.now(), 1 / 60)
 
   /** Put `character` on stage, inside this task. Throws a PhaseError; on failure nothing of it remains. */
   const mount = (character: Character, id: string) => {
-    const canvas = character.renderer === "2d" ? primary : sibling()
+    const area: CanvasArea = areaOf(character) === "stage" && stageEl !== null ? "stage" : "box"
+    const canvas = area === "stage" ? stageCanvas(stageEl!) : character.renderer === "2d" ? primary : sibling()
     const old = active
     if (old !== null && old.canvas === canvas) {
       release(old, canvas)
       active = null
     }
     const runner = new Runner(character, canvas, storedFor(id))
+    const size = sizeOf(area)
     let phase: "create" | "resize" | "frame" = "create"
     try {
       runner.create()
       phase = "resize"
-      runner.resize(W, H, dpr)
+      runner.resize(size.width, size.height, size.ratio)
       phase = "frame"
-      draw(runner, performance.now(), 1 / 60, lastVoices.user, lastVoices.agent)
+      place({ area, canvas })
+      draw({ runner, area, canvas }, performance.now(), 1 / 60, lastVoices.user, lastVoices.agent)
     } catch (e) {
       runner.dispose()
       if (canvas !== primary) canvas.remove()
@@ -378,7 +487,7 @@ export const startCharacterHost = (primary: HTMLCanvasElement, input: HostInput,
     }
     if (active !== null) release(active, canvas)
     primary.style.visibility = canvas === primary ? "" : "hidden"
-    active = { id, runner, canvas, frames: 1 }
+    active = { id, runner, canvas, area, frames: 1 }
     frameCosts.reset()
     strikes = 0
     resetBudget()
@@ -512,19 +621,21 @@ export const startCharacterHost = (primary: HTMLCanvasElement, input: HostInput,
     if (a === null) return
     if (resized) {
       resized = false
-      if (measure()) {
+      if (measure()[a.area]) {
+        const size = sizeOf(a.area)
         try {
-          a.runner.resize(W, H, dpr)
+          a.runner.resize(size.width, size.height, size.ratio)
         } catch (e) {
           fail(a.id, "resize", new PhaseError("resize", e))
           return
         }
         resetBudget()
       }
-    } else if (Math.min(3, window.devicePixelRatio || 1) !== dpr) resized = true
+    } else if (deviceRatio() !== device) resized = true
+    place(a)
     const t1 = performance.now()
     try {
-      draw(a.runner, now, dt, lastVoices.user, lastVoices.agent)
+      draw(a, now, dt, lastVoices.user, lastVoices.agent)
     } catch (e) {
       fail(a.id, "frame", new PhaseError("frame", e))
       return
@@ -570,6 +681,9 @@ export const startCharacterHost = (primary: HTMLCanvasElement, input: HostInput,
       requested,
       id: active?.id ?? "",
       renderer: active?.runner.character.renderer ?? null,
+      canvas: active?.area ?? null,
+      size: { ...sizeOf(active?.area ?? "box") },
+      focus: { ...focus },
       loading,
       fallback,
       failed: [...failed.keys()],
@@ -588,6 +702,7 @@ export const startCharacterHost = (primary: HTMLCanvasElement, input: HostInput,
       schemeQuery.removeEventListener("change", onScheme)
       motionQuery.removeEventListener("change", onMotion)
       for (const [type, fn] of listeners) target.removeEventListener(type, fn as EventListener)
+      if (stageEl !== null) for (const type of windowEvents) window.removeEventListener(type, onWindow as EventListener, { capture: true })
       ro?.disconnect()
       if (active !== null) release(active, null)
       active = null
