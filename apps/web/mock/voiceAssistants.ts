@@ -4,7 +4,7 @@
  * assistants and the devices' settings from `assistants.ts` (what admin saved), so a pick on the voice page is visible
  * in the admin state. `server.ts` sends the messages and runs the turns; this module holds the rules and the data.
  */
-import type { ConversationInfo, DeviceProfile, DeviceSetup, DeviceSettings, DeviceSettingsPatch, HistoryItem, ProfileOverrides } from "@pva/protocol"
+import type { ConversationInfo, DeviceSetup, DeviceSettings, DeviceSettingsPatch, HistoryItem } from "@pva/protocol"
 import { deviceSetupFrom, WEB_VOICE_KIND } from "@pva/protocol"
 import type { AssistantResult, AssistantsMock } from "./assistants.ts"
 
@@ -92,46 +92,15 @@ export interface VoiceAssistants {
   readonly saveSettings: (deviceId: string | undefined, settings: DeviceSettingsPatch) => AssistantResult
 }
 
-/** The protocol 5 profile of a device, for the admin pages that still edit it: what it set itself, and what it comes to. */
-export type LegacyProfile = (deviceId: string | undefined) => { readonly overrides: ProfileOverrides; readonly profile: DeviceProfile }
-
-/**
- * The old profile edits that reach the voice page through the setup (the mock only: the pages that make them are
- * replaced by WP-7). What the profile set itself wins over the protocol 7 settings: interrupting, captions, microphone
- * processing, output path, and "wake phrase" activation, which makes the device sleep and leaves its first assistant,
- * woken by the profile's phrases (the one assistant the old world had).
- */
-const withLegacy = (s: DeviceSettings, { overrides: o, profile }: ReturnType<LegacyProfile>): DeviceSettings => {
-  let out = s
-  if (o.interruptMode !== undefined) out = { ...out, interruptMode: o.interruptMode }
-  if (o.captions !== undefined || o.speakReplies !== undefined) {
-    out = { ...out, captions: { captions: o.captions ?? out.captions.captions, speakTyped: o.speakReplies ?? out.captions.speakTyped } }
-  }
-  const audio = {
-    ...out.audio,
-    ...(o.echoCancellation !== undefined ? { echoCancellation: o.echoCancellation } : {}),
-    ...(o.noiseSuppression !== undefined ? { noiseSuppression: o.noiseSuppression } : {}),
-    ...(o.autoGainControl !== undefined ? { autoGainControl: o.autoGainControl } : {}),
-    ...(o.outputPath !== undefined ? { outputPath: o.outputPath } : {}),
-    ...(o.prebufferMs !== undefined ? { prebufferMs: o.prebufferMs } : {})
-  }
-  if (JSON.stringify(audio) !== JSON.stringify(out.audio)) out = { ...out, audio }
-  if (profile.activation === "wake-phrase" && o.activation !== undefined) {
-    const first = out.assistants[0]
-    out = { ...out, withoutPhrase: { mode: "nobody" }, assistants: first === undefined ? [] : [{ ...first, phrases: [...profile.wakePhrases] }] }
-  }
-  return out
-}
-
-export const createVoiceAssistants = (assistants: AssistantsMock, newConversationInfo: () => ConversationInfo, legacy: LegacyProfile): VoiceAssistants => {
+export const createVoiceAssistants = (assistants: AssistantsMock, newConversationInfo: () => ConversationInfo): VoiceAssistants => {
   let canAuto = false
   /** Conversations other than the session's first, by session then assistant. */
   let extra = new WeakMap<object, Map<string, Conv>>()
   let first = new WeakMap<object, string>()
   let holders = new WeakMap<object, string | undefined>()
 
-  /** The device's effective settings, with what the old profile set itself on top (kind defaults count for every device). */
-  const settingsOf = (deviceId: string | undefined) => withLegacy(assistants.deviceFields(deviceId ?? "").settings, legacy(deviceId))
+  /** The device's effective settings (without a device: the web-voice type's). */
+  const settingsOf = (deviceId: string | undefined) => assistants.deviceFields(deviceId ?? "").settings
   const known = new Map<string, { id: string; name: string; purpose: string; on: boolean }>()
   const setupFor = (deviceId: string | undefined): DeviceSetup => {
     known.clear()
@@ -191,8 +160,6 @@ export const createVoiceAssistants = (assistants: AssistantsMock, newConversatio
     sleeps: (deviceId) => settingsOf(deviceId).withoutPhrase.mode === "nobody",
     phraseOwner: (deviceId, phrase) => settingsOf(deviceId).assistants.find((a) => a.phrases.some((p) => norm(p) === norm(phrase)))?.assistant,
     followUpMs: (deviceId, assistantId) => {
-      const own = legacy(deviceId).overrides.followUpSeconds // an old profile that set it wins
-      if (own !== undefined) return own * 1000
       const assignment = settingsOf(deviceId).assistants.find((a) => a.assistant === assistantId)
       const assistant = assistants.assistants().find((a) => a.id === assistantId)
       return (assignment?.followUpSeconds ?? assistant?.followUpSeconds ?? 0) * 1000
@@ -232,7 +199,7 @@ export const createVoiceAssistants = (assistants: AssistantsMock, newConversatio
 
 /**
  * What the `wake` and `long-phrase` scenarios say about the web-voice type: the device sleeps until the phrase, and
- * Jeff is the one it wakes (the phrase of the old profile). Saved as admin would save it.
+ * Jeff is the one it wakes. Saved as admin would save it.
  */
 export const scenarioSettings = (scenario: string, longPhrase: string): DeviceSettingsPatch | undefined =>
   scenario === "wake"

@@ -95,8 +95,7 @@ export const mock = {
     await fetch(`${MOCK}/mock/typesafe`, { method: "POST", body: JSON.stringify({ on }) })
   },
   /**
-   * Protocol 7: the web-voice devices sleep until a phrase and Jeff is the only assistant, woken by `phrase` (what
-   * `mock.defaults({ activation: "wake-phrase" })` did for the voice page before protocol 7).
+   * Protocol 7: the web-voice devices sleep until a phrase and Jeff is the only assistant, woken by `phrase`.
    */
   sleeps: async (phrase = "hey jeff") => {
     const settings = { assistants: [{ assistant: "jeff", phrases: [phrase] }], withoutPhrase: { mode: "nobody" } }
@@ -134,10 +133,6 @@ export const mock = {
       method: "POST",
       body: JSON.stringify({ text, ...(matched === undefined ? {} : { matched }), ...(accepted === undefined ? {} : { accepted }), ...(deviceId === undefined ? {} : { deviceId }) })
     })
-  },
-  /** Change the web-voice defaults (as admin › Front ends would). */
-  defaults: async (patch: Record<string, unknown>) => {
-    await fetch(`${MOCK}/mock/defaults`, { method: "POST", body: JSON.stringify({ patch }) })
   },
   /** Make `admin.logout` fail (or work again). */
   logoutFails: async (on = true) => {

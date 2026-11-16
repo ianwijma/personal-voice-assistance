@@ -168,6 +168,8 @@ export interface ModuleCatalog {
   readonly toolNames: (moduleId: string) => ReadonlyArray<string>
   /** `ModuleHost.checkOwn`: the module's own fields refuse a value (field errors keyed by the field). */
   readonly checkOwn: (moduleId: string, own: Readonly<Record<string, unknown>>) => ReadonlyArray<{ readonly field: string; readonly message: string }>
+  /** The problem of a language-model account that is not set up (OpenRouter without a key, the home model without an address). */
+  readonly accountProblem: (account: string) => string | undefined
 }
 
 export const createAssistantsMock = (catalog: ModuleCatalog): AssistantsMock => {
@@ -221,13 +223,13 @@ export const createAssistantsMock = (catalog: ModuleCatalog): AssistantsMock => 
           ...usedOn.filter((u) => u.reach === "unreachable").map((u) => `Cannot be reached on ${nameOf(u.target)}: no wake phrase and not the one that answers without a phrase.`)
         ]
         const state = used ? "ready" : "unused"
-        // As the real server (WP-9): the accounts it has no builder for fail with this problem.
-        const unavailable = used && (a.llm.account === "openrouter" || a.llm.account === "home-model")
+        // As the real server (WP-13b): an account that is not set up fails its instance with this problem.
+        const accountProblem = used ? catalog.accountProblem(a.llm.account) : undefined
         return {
           ...clone(a),
           usedOn: [...usedOn],
-          resources: { llm: unavailable ? "failed" : state, voice: state },
-          problems: unavailable ? [...problems, `The ${a.llm.account === "home-model" ? "Home model" : "OpenRouter"} account is not available yet.`] : problems
+          resources: { llm: accountProblem !== undefined ? "failed" : state, voice: state },
+          problems: accountProblem !== undefined ? [...problems, `Language model (${a.llm.account}): ${accountProblem}`] : problems
         }
       })
     },

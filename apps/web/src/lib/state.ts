@@ -5,11 +5,9 @@ import {
   type AssistantState,
   type DeviceListInfo,
   type DeviceProfile,
-  type DeviceProfileInfo,
   type DeviceSetup,
   type EngineStatus,
   type EngineSummary,
-  type FrontendKindInfo,
   EnvInfo,
   type ErrorInfo,
   type HistoryItem,
@@ -132,21 +130,13 @@ export interface ClientState {
   }
   /** What every connection knows about the engines (protocol 5 `engine.summary`): ready or not, the enabled voices. */
   readonly summary: EngineSummary
-  /**
-   * This connection's device profile as the server sent it (`snapshot.device`, `device.profile`); undefined on admin
-   * connections and before `welcome`. `profileOverlay`: this page's own changes sent with `device.update` and not yet
-   * confirmed (optimistic; any `device.profile` replaces them). Read the effective profile with `profileOf`.
-   */
-  readonly device: DeviceProfileInfo | undefined
-  readonly profileOverlay: Partial<DeviceProfile>
   /** Admin access as this connection sees it (`snapshot.admin`, `admin.state`). */
   readonly admin: AdminState
   /** Counts `admin.state` messages, so a page can restart a countdown when the same `retryAfterMs` comes again. */
   readonly adminSeq: number
   /** The admin part of the state (`admin.snapshot`) has arrived for the current login. */
   readonly adminReady: boolean
-  /** Admin: the front-end kinds with their defaults, and the remembered devices (most recently seen first). */
-  readonly frontends: ReadonlyArray<FrontendKindInfo>
+  /** Admin: the remembered devices (most recently seen first). */
   readonly devices: ReadonlyArray<DeviceListInfo>
   /** Admin (protocol 7): the assistants with where they are used, and the device types with their defaults. */
   readonly assistants: ReadonlyArray<AssistantInfo>
@@ -224,12 +214,9 @@ export const initialState: ClientState = {
   session: { role: "observer", ownerPresent: false, serverState: "idle" },
   audio: { phase: "off", micLive: true },
   summary: emptySummary,
-  device: undefined,
-  profileOverlay: {},
   admin: noAdmin,
   adminSeq: 0,
   adminReady: false,
-  frontends: [],
   devices: [],
   assistants: [],
   deviceTypes: [],
@@ -265,7 +252,6 @@ const adminPart = {
   models: initialState.models,
   jobs: initialState.jobs,
   traces: initialState.traces,
-  frontends: initialState.frontends,
   devices: initialState.devices,
   assistants: initialState.assistants,
   deviceTypes: initialState.deviceTypes,
@@ -279,8 +265,6 @@ export type LocalAction =
   | { readonly type: "local/connection"; readonly status: ConnectionStatus; readonly attempt: number }
   | { readonly type: "local/audio"; readonly phase: AudioPhase; readonly error?: string }
   | { readonly type: "local/mic"; readonly live: boolean }
-  | { readonly type: "local/profile-overlay"; readonly patch: Partial<DeviceProfile> }
-  | { readonly type: "local/profile-overlay-clear" }
   | { readonly type: "local/heard-clear" }
   | { readonly type: "local/playing"; readonly turnId: number | undefined }
   | { readonly type: "local/request"; readonly requestId: string; readonly kind: string; readonly target?: string }
@@ -404,7 +388,6 @@ const server: ServerHandlers = {
     // The audio graph belongs to the page and survives reconnects; the player was flushed on loss.
     audio: withoutPlaying(s.audio),
     summary: m.snapshot.engine,
-    device: m.snapshot.device,
     admin: m.snapshot.admin,
     adminSeq: s.adminSeq + 1,
     // A reconnect with a valid admin token keeps the admin data on screen until the new `admin.snapshot` replaces it.
@@ -423,7 +406,6 @@ const server: ServerHandlers = {
     models: m.snapshot.models,
     jobs: m.snapshot.jobs,
     traces: m.snapshot.traces.slice(-MAX_TRACES),
-    frontends: m.snapshot.frontends,
     devices: m.snapshot.devices,
     assistants: m.snapshot.assistants ?? [],
     deviceTypes: m.snapshot.deviceTypes ?? [],
@@ -435,12 +417,6 @@ const server: ServerHandlers = {
     const next = { ...s, admin: m.admin, adminSeq: s.adminSeq + 1 }
     return m.admin.loggedIn ? next : { ...next, ...adminPart }
   },
-  "device.profile": (s, m) => ({
-    ...s,
-    device: m.deviceId === undefined ? { profile: m.profile, editable: m.editable } : { deviceId: m.deviceId, profile: m.profile, editable: m.editable },
-    profileOverlay: {}
-  }),
-  frontends: (s, m) => ({ ...s, frontends: m.frontends }),
   devices: (s, m) => ({ ...s, devices: m.devices }),
   // Protocol 6/7. A new conversation (New conversation, or after being quiet for a while) of one assistant starts with an
   // empty chat and a divider; `resumed` only says which conversation goes on (the chat stays).
@@ -580,10 +556,6 @@ const local = (s: ClientState, a: LocalAction): ClientState => {
     }
     case "local/mic":
       return { ...s, audio: { ...s.audio, micLive: a.live } }
-    case "local/profile-overlay":
-      return { ...s, profileOverlay: { ...s.profileOverlay, ...a.patch } }
-    case "local/profile-overlay-clear":
-      return Object.keys(s.profileOverlay).length === 0 ? s : { ...s, profileOverlay: {} }
     case "local/heard-clear":
       return s.heard.length === 0 ? s : { ...s, heard: [] }
     case "local/playing":
@@ -626,7 +598,6 @@ function pickAdmin(s: ClientState): Partial<ClientState> {
     models: s.models,
     jobs: s.jobs,
     traces: s.traces,
-    frontends: s.frontends,
     devices: s.devices,
     assistants: s.assistants,
     deviceTypes: s.deviceTypes,
@@ -652,8 +623,8 @@ export const reducer = (s: ClientState, a: Action): ClientState => {
 
 // ---- Derived values (selectors) ----
 
-/** This connection's effective device profile: the server's, with this page's unconfirmed changes on top. */
-export const profileOf = (s: ClientState): DeviceProfile => profileFromSetup(s.device?.profile, s.setup, s.profileOverlay)
+/** This connection's device profile fields the page uses, from its setup. */
+export const profileOf = (s: ClientState): DeviceProfile => profileFromSetup(s.setup)
 
 /** The engines failed and the key vault is locked: unlocking is the fix (the server reloads them). */
 export const engineNeedsKeys = (s: ClientState): boolean => s.engine.state === "failed" && s.vault.state === "locked"

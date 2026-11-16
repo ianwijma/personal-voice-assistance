@@ -10,15 +10,7 @@ import type { Assistant } from "./assistants.ts"
 import { BUILT_IN_WEB_VOICE_SETTINGS, type AssistantInfo, type DeviceListInfo, type DeviceRecordInfo, type DeviceSettings, type DeviceTypeInfo, deviceSetupFrom } from "./devices.ts"
 import type { EnvInfo } from "./env.ts"
 import type { JobInfo, ModelSet } from "./jobs.ts"
-import {
-  DEFAULT_DEVICE_PROFILE,
-  DEVICE_EDITABLE_FIELDS,
-  type DeviceProfile,
-  effectiveProfile,
-  type FrontendKindInfo,
-  PROFILE_FIELDS,
-  WEB_VOICE_KIND
-} from "./frontends.ts"
+import { WEB_VOICE_KIND } from "./frontends.ts"
 import {
   type AdminSnapshot,
   engineSummary,
@@ -286,22 +278,6 @@ export const exampleEngineStatus: EngineStatus = {
   ]
 }
 
-export const exampleProfile: DeviceProfile = {
-  ...DEFAULT_DEVICE_PROFILE,
-  activation: "wake-phrase",
-  voice: "natural",
-  interruptMode: "instant"
-}
-
-export const exampleFrontend: FrontendKindInfo = {
-  id: WEB_VOICE_KIND,
-  title: "Voice assistant in a browser",
-  description: "The voice front end on a phone, tablet or computer.",
-  fields: PROFILE_FIELDS,
-  defaults: { activation: "wake-phrase", wakePhrases: ["hey jeff", "hey jev", "hey geoff", "hey go"] },
-  profile: effectiveProfile({ activation: "wake-phrase", wakePhrases: ["hey jeff", "hey jev", "hey geoff", "hey go"] })
-}
-
 // -- Protocol 7 examples (docs/ASSISTANTS.md §2, §5) -------------------------------------------------------------------
 
 export const exampleAssistant: Assistant = {
@@ -419,8 +395,6 @@ export const exampleDevice: DeviceListInfo = {
   name: "iPhone · Safari",
   firstSeen: 1_763_000_000_000,
   lastSeen: 1_763_100_000_000,
-  overrides: { voice: "natural", interruptMode: "instant", conversationIdleMinutes: 5 },
-  profile: effectiveProfile(exampleFrontend.defaults, { voice: "natural", interruptMode: "instant", conversationIdleMinutes: 5 }),
   own: { interruptMode: "instant", withoutPhrase: { mode: "assistant", assistant: "jeff" } },
   settings: { ...exampleDeviceSettings, interruptMode: "instant", withoutPhrase: { mode: "assistant", assistant: "jeff" } },
   hearer: "jeff",
@@ -455,9 +429,9 @@ export const exampleSnapshot: Snapshot = {
     { role: "user", text: "Tell me a long story" },
     { role: "assistant", text: "Once upon a time,", interrupted: true, tools: [] }
   ],
-  device: { deviceId: exampleDevice.id, profile: exampleDevice.profile, editable: DEVICE_EDITABLE_FIELDS },
   admin: { enabled: true, loggedIn: false },
-  conversation: exampleConversation
+  conversations: [{ assistantId: "jeff", id: exampleConversation.id, startedAt: exampleConversation.startedAt, turns: 2 }],
+  setup: exampleDeviceSetup
 }
 
 /** The admin part, as `admin.snapshot` carries it. */
@@ -470,7 +444,6 @@ export const exampleAdminSnapshot: AdminSnapshot = {
   env: exampleEnv,
   models: exampleModels,
   jobs: [exampleJob],
-  frontends: [exampleFrontend],
   devices: [exampleDevice],
   sessions: [
     exampleSession,
@@ -580,14 +553,6 @@ export const clientExamples: { readonly [T in ClientMessageType]: Extract<Client
   "model.delete": { type: "model.delete", requestId: "r14", tool: "tts-models", target: "nl_NL-pim-medium" },
   "admin.login": { type: "admin.login", requestId: "r15", password: "correct horse battery" },
   "admin.logout": { type: "admin.logout", requestId: "r16" },
-  "device.update": { type: "device.update", requestId: "r17", patch: { activation: "wake-phrase", followUpSeconds: 12, voice: null } },
-  "frontend.update": {
-    type: "frontend.update",
-    requestId: "r18",
-    kind: WEB_VOICE_KIND,
-    patch: { wakePhrases: ["hey jeff", "hey jev", "hey geoff", "hey go"], wakeMatch: "close", prebufferMs: null }
-  },
-  "device.admin.update": { type: "device.admin.update", requestId: "r19", id: "d-5c1e0b7a42", name: "Kitchen phone", patch: { interruptMode: "instant" } },
   "device.forget": { type: "device.forget", requestId: "r20", id: "d-5c1e0b7a42" },
   "wake.test": { type: "wake.test", requestId: "r21", on: true, deviceId: "d-5c1e0b7a42" },
   "conversation.new": { type: "conversation.new", requestId: "r22" },
@@ -665,8 +630,6 @@ export const serverExamples: { readonly [T in ServerMessageType]: Extract<Server
   "engine.summary": { type: "engine.summary", engine: engineSummary(exampleEngineStatus) },
   "admin.state": { type: "admin.state", admin: { enabled: true, loggedIn: true, expiresAt: 1_763_143_200_000 } },
   "admin.snapshot": { type: "admin.snapshot", snapshot: exampleAdminSnapshot },
-  "device.profile": { type: "device.profile", deviceId: "d-5c1e0b7a42", profile: exampleProfile, editable: DEVICE_EDITABLE_FIELDS },
-  "frontends": { type: "frontends", frontends: [exampleFrontend] },
   "devices": { type: "devices", devices: [exampleDevice] },
   "wake": { type: "wake", phrase: "hey jeff", armed: true },
   "wake.heard": { type: "wake.heard", text: "Hey go, what time is it?", at: 1_763_100_001_000 },

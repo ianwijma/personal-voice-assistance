@@ -30,7 +30,7 @@
  *   wake            like voice, but the web-voice default is the wake phrase: after a claim the assistant is asleep;
  *                   "hey go …" is ignored (a tester line), then "hey jeff" alone wakes it (`wake`, armed) and the voice
  *                   turn follows; after the reply the follow-up window, then asleep again. Devices are seeded.
- *   devices         like typed, with two remembered devices (one with overrides) besides the ones that connect.
+ *   devices         like typed, with two remembered devices (the Kitchen iPad has its own assistant list) besides the ones that connect.
  *   long-phrase     like typed, with a six-word wake phrase ("hello my personal voice assistant please") as the
  *                   web-voice default (asleep after a claim) and a third device that has it among three phrases.
  *   admin-disabled  no admin password: `admin.state.enabled` is false and every login is refused.
@@ -39,9 +39,9 @@
  *
  * Protocol 5 (docs/FRONTENDS-AND-ACTIVATION.md): pages say `frontend: "voice" | "admin"` in hello. The admin
  * password is ADMIN_PASSWORD below ("admin password"); a login returns a token that a later hello may carry. The
- * admin part (settings, modules, engine status, vault, env, models, jobs, traces, front ends, devices) goes to
+ * admin part (settings, modules, engine status, vault, env, models, jobs, traces, assistants, devices) goes to
  * admin connections only, and every change needs one (`admin_required` otherwise). Voice pages get the voice part,
- * `engine.summary`, their device profile (`device.profile`, live), and `wake`. Admin pages that switched the
+ * `engine.summary`, their device setup (`device.setup`, live, protocol 7), and `wake`. Admin pages that switched the
  * tester on get `wake.heard`.
  *
  * Every scenario also has settings from a fake .env (Diagnostics › Settings from outside: Move works, keys are refused
@@ -75,8 +75,7 @@
  * (`snapshot.conversations`, `conversation.read` → `conversation.history`, `conversation.new { assistantId }`), turns,
  * `wake` and `reply.start` that name their assistant, `device.pick` (`not_allowed` unless the setup says `canPick`).
  * The first conversation of a session is the one that has the example history. The wake and long-phrase scenarios sleep
- * until the phrase (saved on the web-voice type). The protocol 5 profile edits of the old admin pages still reach the
- * voice page through the setup. POST /mock/turn {"assistantId"?, "phrase"?} runs the scripted turn for an assistant (woken
+ * until the phrase (saved on the web-voice type). POST /mock/turn {"assistantId"?, "phrase"?} runs the scripted turn for an assistant (woken
  * by the phrase), POST /mock/wake takes "assistantId"?, POST /mock/typesafe {"on"?} sets up "Whichever fits",
  * POST /mock/device {"deviceId"?, "settings"} saves a device's (default: the type's) settings as admin would.
  *
@@ -99,17 +98,8 @@ import {
   DEFAULT_CONVERSATION_IDLE_MINUTES,
   DEFAULT_MAX_VOICE_SESSIONS,
   DEFAULT_SESSION_DISCARD_MINUTES,
-  DEVICE_EDITABLE_FIELDS,
   type DeviceListInfo,
-  type DeviceProfile,
-  type DeviceProfileInfo,
-  type FrontendKindInfo,
-  applyProfilePatch,
   BUILT_IN_WEB_VOICE_SETTINGS,
-  effectiveProfile,
-  PROFILE_FIELDS,
-  type ProfileOverrides,
-  type ProfilePatch,
   WAKE_ARMED_MS,
   WAKE_TEST_MAX_MS,
   WEB_VOICE_KIND,
@@ -528,7 +518,7 @@ const initialSections = (): Array<SettingsSection> => [
     order: 30,
     form: {
       fields: [
-        { type: "number", key: "CONVERSATION_IDLE_MINUTES", label: "Start a new conversation after", description: "Minutes without a turn after which the next thing said starts a fresh conversation. 0 = never. A device's profile can say otherwise.", apply: "live", default: DEFAULT_CONVERSATION_IDLE_MINUTES, integer: true, min: 0, max: 240, step: 1, unit: "min", source: "default" },
+        { type: "number", key: "CONVERSATION_IDLE_MINUTES", label: "Start a new conversation after", description: "Minutes without a turn after which the next thing said starts a fresh conversation. 0 = never. An assistant's own setting wins.", apply: "live", default: DEFAULT_CONVERSATION_IDLE_MINUTES, integer: true, min: 0, max: 240, step: 1, unit: "min", source: "default" },
         { type: "number", key: "MAX_VOICE_SESSIONS", label: "Devices talking at once", description: "One more device is refused until one of them is done.", apply: "live", default: DEFAULT_MAX_VOICE_SESSIONS, integer: true, min: 1, max: 16, step: 1, source: "default" },
         { type: "number", key: "SESSION_DISCARD_MINUTES", label: "Forget a device's conversation after", description: "Minutes without any open page on that device.", apply: "live", default: DEFAULT_SESSION_DISCARD_MINUTES, integer: true, min: 1, max: 1440, step: 1, unit: "min", advanced: true, source: "default" }
       ],
@@ -612,6 +602,29 @@ const initialSections = (): Array<SettingsSection> => [
       ],
       values: { TYPESAFE_ROUTING: false, TYPESAFE_MODEL: "jev-1.14.0", TYPESAFE_BASE_URL: "https://api.typesafe.ai" },
       secrets: { TYPESAFE_API_KEY: { set: false, source: "none" } },
+      errors: []
+    },
+    revision: 1
+  },
+  {
+    // Protocol 7 (WP-13b): the OpenRouter key and the home model's address, as the real server's section has them.
+    id: "llm-openai-accounts",
+    title: "OpenRouter and home model",
+    description: "Language models over the OpenAI-compatible API: OpenRouter with your key, or a server on your own network.",
+    group: "agents",
+    page: { id: "openai-accounts", title: "OpenRouter and home model", description: "The OpenRouter key and the address of a model server on your network." },
+    order: 15,
+    protected: true,
+    form: {
+      fields: [
+        { type: "secret", key: "OPENROUTER_API_KEY", label: "OpenRouter API key", description: "From openrouter.ai/keys. Kept in the vault. What you say is sent to OpenRouter and the model's provider.", apply: "live", env: "OPENROUTER_API_KEY" },
+        { type: "boolean", key: "OPENROUTER_SORT_BY_LATENCY", label: "Prefer the fastest provider", description: "Ask OpenRouter to route to the provider with the lowest latency for the model.", apply: "live", default: true, advanced: true, source: "default" },
+        { type: "text", key: "OPENROUTER_BASE_URL", label: "OpenRouter address", description: "Only for a proxy or gateway in front of OpenRouter. Empty: https://openrouter.ai/api/v1.", apply: "live", default: "", placeholder: "https://openrouter.ai/api/v1", advanced: true, source: "default" },
+        { type: "text", key: "HOME_MODEL_BASE_URL", label: "Home model server address", description: "Ollama, llama.cpp, LM Studio, vLLM or any server with the OpenAI-compatible API. http://host:port is enough; /v1 is added. What you say stays on your network.", apply: "live", default: "", placeholder: "http://192.168.1.20:11434", source: "default" },
+        { type: "secret", key: "HOME_MODEL_API_KEY", label: "Home model API key", description: "Only if the server was started with a key (llama.cpp --api-key, vLLM --api-key). Kept in the vault.", apply: "live", env: "HOME_MODEL_API_KEY" }
+      ],
+      values: { OPENROUTER_SORT_BY_LATENCY: true, OPENROUTER_BASE_URL: "", HOME_MODEL_BASE_URL: "" },
+      secrets: { OPENROUTER_API_KEY: { set: false, source: "none" }, HOME_MODEL_API_KEY: { set: false, source: "none" } },
       errors: []
     },
     revision: 1
@@ -839,13 +852,11 @@ let modules = initialModules()
 const assistantsMock = createAssistantsMock({
   modules: () => modules,
   toolNames: (id) => runningTools(id).map((t) => t.name),
-  checkOwn: (id, own) => checkOwn(id, own)
+  checkOwn: (id, own) => checkOwn(id, own),
+  accountProblem: (account) => accountProblem(account)
 })
 /** Protocol 7, the voice connection's side: the device's setup, a conversation per assistant, who has the turn (mock/voiceAssistants.ts). */
-const voice = createVoiceAssistants(assistantsMock, () => newConversationInfo(), (id) => ({
-  overrides: { ...kindDefaults, ...(id === undefined ? {} : devices.get(id)?.overrides ?? {}) },
-  profile: deviceProfile(id)
-}))
+const voice = createVoiceAssistants(assistantsMock, () => newConversationInfo())
 /** The `wake` and `long-phrase` scenarios sleep until the phrase: saved on the web-voice type, as admin would. */
 const seedVoiceScenario = () => {
   const patch = scenarioSettings(scenario, LONG_PHRASE)
@@ -882,7 +893,6 @@ interface DeviceRecord {
   name: string
   firstSeen: number
   lastSeen: number
-  overrides: ProfileOverrides
 }
 const HOUR = 3_600_000
 const seededDevices = (): Map<string, DeviceRecord> => {
@@ -890,41 +900,26 @@ const seededDevices = (): Map<string, DeviceRecord> => {
   const now = Date.now()
   return new Map([
     ...(scenario === "long-phrase"
-      ? [["d-living-room-0003", { id: "d-living-room-0003", kind: WEB_VOICE_KIND, name: "Living room tablet", firstSeen: now - 20 * 24 * HOUR, lastSeen: now - 5 * 60_000, overrides: { activation: "wake-phrase", wakePhrases: [LONG_PHRASE, "hey computer", "ok house"] } }] as [string, DeviceRecord]]
+      ? [["d-living-room-0003", { id: "d-living-room-0003", kind: WEB_VOICE_KIND, name: "Living room tablet", firstSeen: now - 20 * 24 * HOUR, lastSeen: now - 5 * 60_000 }] as [string, DeviceRecord]]
       : []),
-    ["d-kitchen-ipad-0001", { id: "d-kitchen-ipad-0001", kind: WEB_VOICE_KIND, name: "Kitchen iPad", firstSeen: now - 40 * 24 * HOUR, lastSeen: now - 2 * HOUR, overrides: { activation: "wake-phrase", followUpSeconds: 15, voice: "natural" } }],
-    ["d-pixel-phone-0002", { id: "d-pixel-phone-0002", kind: WEB_VOICE_KIND, name: "Android phone · Chrome", firstSeen: now - 9 * 24 * HOUR, lastSeen: now - 3 * 24 * HOUR, overrides: {} }]
+    ["d-kitchen-ipad-0001", { id: "d-kitchen-ipad-0001", kind: WEB_VOICE_KIND, name: "Kitchen iPad", firstSeen: now - 40 * 24 * HOUR, lastSeen: now - 2 * HOUR }],
+    ["d-pixel-phone-0002", { id: "d-pixel-phone-0002", kind: WEB_VOICE_KIND, name: "Android phone · Chrome", firstSeen: now - 9 * 24 * HOUR, lastSeen: now - 3 * 24 * HOUR }]
   ])
 }
 /** Six words: wake phrases may be this long (the UI must not cut or jump on them). */
 const LONG_PHRASE = "hello my personal voice assistant please"
-const initialKindDefaults = (): ProfileOverrides =>
-  scenario === "wake" ? { activation: "wake-phrase" } : scenario === "long-phrase" ? { activation: "wake-phrase", wakePhrases: [LONG_PHRASE] } : {}
 let devices = seededDevices()
-let kindDefaults: ProfileOverrides = initialKindDefaults()
 seedVoiceScenario()
 
-const KIND_INFO = {
-  id: WEB_VOICE_KIND,
-  title: "Voice assistant in a browser",
-  description: "The voice front end opened in a browser: a phone, a tablet or a computer.",
-  fields: [...PROFILE_FIELDS]
-}
-const frontendInfos = (): Array<FrontendKindInfo> => [{ ...KIND_INFO, defaults: kindDefaults, profile: effectiveProfile(kindDefaults) }]
-const deviceProfile = (id: string | undefined): DeviceProfile => effectiveProfile(kindDefaults, id === undefined ? {} : devices.get(id)?.overrides ?? {})
 const deviceInfos = (): Array<DeviceListInfo> => {
   const now = Date.now()
   return [...devices.values()]
     .map((d) => {
       const connections = [...conns].filter((c) => c.welcomed && c.deviceId === d.id).length
-      return { ...d, lastSeen: connections > 0 ? now : d.lastSeen, profile: deviceProfile(d.id), connections, audioOwner: voiceSessions.get(d.id)?.owner !== undefined, ...assistantsMock.deviceFields(d.id) }
+      return { ...d, lastSeen: connections > 0 ? now : d.lastSeen, connections, audioOwner: voiceSessions.get(d.id)?.owner !== undefined, ...assistantsMock.deviceFields(d.id) }
     })
     .sort((a, b) => b.lastSeen - a.lastSeen)
 }
-const profileInfo = (c: Conn): DeviceProfileInfo =>
-  c.deviceId === undefined
-    ? { profile: effectiveProfile(kindDefaults), editable: [] }
-    : { deviceId: c.deviceId, profile: deviceProfile(c.deviceId), editable: [...DEVICE_EDITABLE_FIELDS] }
 const isAdminConn = (c: Conn) => c.session !== undefined && sessions.has(c.session)
 const adminState = (c: Conn, extra: Partial<AdminState> = {}): AdminState => {
   const wait = loginRefusedUntil - Date.now()
@@ -939,16 +934,20 @@ const adminState = (c: Conn, extra: Partial<AdminState> = {}): AdminState => {
 const sendAdminSnapshot = (c: Conn) =>
   sendTo(c, {
     type: "admin.snapshot",
-    snapshot: { engine, modules, sections, traces: traces.slice(-20), vault: vaultInfo(c), env, models, jobs, frontends: frontendInfos(), devices: deviceInfos(), sessions: sessionInfos(), assistants: assistantInfos(), deviceTypes: assistantsMock.deviceTypes() }
+    snapshot: { engine, modules, sections, traces: traces.slice(-20), vault: vaultInfo(c), env, models, jobs, devices: deviceInfos(), sessions: sessionInfos(), assistants: assistantInfos(), deviceTypes: assistantsMock.deviceTypes() }
   })
-const pushProfiles = () => {
-  for (const c of conns) if (c.welcomed && c.frontend === "voice") sendTo(c, { type: "device.profile", ...profileInfo(c) })
-  pushSetups() // the voice page follows the setup: what an old profile edit comes to reaches it too
-}
 const devicesChanged = () => broadcast({ type: "devices", devices: deviceInfos() })
 const assistantInfos = () => assistantsMock.infos([...devices.values()].map((d) => ({ id: d.id, name: d.name })))
 /** After an assistant or device save: the whole lists, as the real server pushes them (admin connections only). */
 /** The routing section changed: "Whichever fits" is offered when it is on and has a key (the server's `canAuto`). */
+/** As the real server: an account whose key or address is not set is a failed resource with this problem. */
+const accountProblem = (account: string): string | undefined => {
+  const x = sections.find((y) => y.id === "llm-openai-accounts")
+  if (account === "openrouter" && x?.form.secrets.OPENROUTER_API_KEY?.set !== true) return "OpenRouter is not set up: add its API key in Shared settings › Language model accounts."
+  const address = x?.form.values.HOME_MODEL_BASE_URL
+  if (account === "home-model" && (typeof address !== "string" || address.trim() === "")) return "Home model is not set up: add the server address in Shared settings › Language model accounts."
+  return undefined
+}
 const routingChanged = () => {
   const x = sections.find((y) => y.id === "routing")
   voice.setCanAuto(x?.form.values.TYPESAFE_ROUTING === true && x.form.secrets.TYPESAFE_API_KEY?.set === true)
@@ -974,7 +973,6 @@ const pushSetups = () => {
   }
   settleAll()
 }
-const frontendsChanged = () => broadcast({ type: "frontends", frontends: frontendInfos() })
 // ---- Voice sessions (protocol 6)
 
 /** A voice connection's session key: its device, or its own client id; admin connections have none. */
@@ -1099,10 +1097,13 @@ const scheduleDiscard = (v: VSession) => {
   }, numberSetting("SESSION_DISCARD_MINUTES", DEFAULT_SESSION_DISCARD_MINUTES) * 60_000)
 }
 
-const sessionProfile = (v: VSession): DeviceProfile => (v.deviceId === undefined ? effectiveProfile(kindDefaults) : deviceProfile(v.deviceId))
+/** Minutes of quiet after which the assistant's next turn starts a new conversation (its `newConversationAfter`; 0 = never). */
+const idleMinutesOf = (assistantId: string | undefined): number => {
+  const spell = assistantsMock.assistants().find((a) => a.id === assistantId)?.newConversationAfter
+  return spell === undefined || spell === "never" ? 0 : spell
+}
 /**
- * The device sleeps until a phrase: nobody answers without one (protocol 7 `withoutPhrase`; the old profile's
- * `activation: wake-phrase`, which the admin pages that edit it still set, comes to the same: mock/voiceAssistants.ts).
+ * The device sleeps until a phrase: nobody answers without one (protocol 7 `withoutPhrase: nobody`).
  */
 const wakeMode = (v: VSession) => v.owner !== undefined && voice.sleeps(v.deviceId)
 /** Keep the session awake (no phrase needed) for `ms`; then asleep again unless something is going on. */
@@ -1160,9 +1161,6 @@ const requireAdmin = (c: Conn, requestId: string): boolean => {
   result(c, requestId, false, { code: "admin_required", message: adminEnabled() ? "Log in to admin to change this." : "Admin is switched off: set PVA_ADMIN_PASSWORD in .env and restart." })
   return true
 }
-/** As the server: a device's own voice is retired (docs/VOICE-PROVIDERS.md §1); any other value than "" becomes "". */
-const cleanPatch = (patch: ProfilePatch): ProfilePatch =>
-  typeof patch.voice !== "string" || patch.voice === "" ? patch : { ...patch, voice: "" }
 
 const resetState = () => {
   for (const t of scriptTimers) clearTimeout(t)
@@ -1189,7 +1187,6 @@ const resetState = () => {
   assistantsMock.reset(scenario === "long-phrase")
   syncCapabilities()
   voice.reset()
-  kindDefaults = initialKindDefaults()
   seedVoiceScenario()
   env = initialEnv()
   favourites = initialFavourites()
@@ -1213,7 +1210,7 @@ const sendTo = (c: Conn, m: ServerMessage) => {
   if (c.ws.readyState === c.ws.OPEN) c.ws.send(encodeServerMessage(m))
 }
 /** Messages that carry admin data: only admin connections get them (protocol 5). */
-const ADMIN_ONLY: ReadonlySet<ServerMessage["type"]> = new Set(["engine", "module.changed", "section.changed", "vault", "env", "job", "models", "frontends", "devices", "assistants", "device.types", "sessions", "trace", "wake.heard", "admin.snapshot"])
+const ADMIN_ONLY: ReadonlySet<ServerMessage["type"]> = new Set(["engine", "module.changed", "section.changed", "vault", "env", "job", "models", "devices", "assistants", "device.types", "sessions", "trace", "wake.heard", "admin.snapshot"])
 let lastSummary = ""
 const broadcast = (m: ServerMessage) => {
   const adminOnly = ADMIN_ONLY.has(m.type)
@@ -1454,7 +1451,7 @@ const sessionUpdate = (v: VSession, reason: "claimed" | "released" | "taken_over
   devicesChanged()
   sessionsChanged()
 }
-/** After a change of profiles: every session that is not in a turn settles in its resting state. */
+/** After a change of devices or assistants: every session that is not in a turn settles in its resting state. */
 const settleAll = () => {
   for (const v of voiceSessions.values()) if (v.reply === undefined) setState(v, restingState(v))
 }
@@ -1612,7 +1609,7 @@ const runReply = (v: VSession, opts: {
   const conv = voice.convFor(v, assistantId)
   const withId = assistantId === undefined ? {} : { assistantId }
   // The idle reset, decided at the start of the turn: quiet for longer than the device's conversationIdleMinutes.
-  const idleMinutes = sessionProfile(v).conversationIdleMinutes
+  const idleMinutes = idleMinutesOf(assistantId)
   if (idleMinutes > 0 && conv.lastTurnAt !== null && Date.now() - conv.lastTurnAt > idleMinutes * 60_000) newConversation(v, "idle", assistantId)
   const turnId = ++turnSeq
   const endOfTurn = Date.now()
@@ -2073,6 +2070,7 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
       sections = committed.map((x) => (changed.has(x.id) ? { ...x, revision: x.revision + 1 } : x))
       for (const x of sections) if (changed.has(x.id)) broadcast({ type: "section.changed", section: x })
       if (changed.has("routing")) routingChanged()
+      if (changed.has("llm-openai-accounts")) assistantsChanged()
       result(c, m.requestId, true)
       const needsReload = Object.keys({ ...patch.values, ...patch.secrets }).some((k) => section.form.fields.find((f) => f.key === k)?.apply === "reload")
       const path = `${section.group ?? "general"}/${section.page?.id ?? section.id}`
@@ -2178,45 +2176,6 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
       if (c.session !== undefined) endSessions("logout", c.session)
       return
     }
-    case "device.update": {
-      if (c.frontend !== "voice" || c.deviceId === undefined) return result(c, m.requestId, false, { code: "bad_message", message: "This page has no device." })
-      const fields = Object.keys(m.patch)
-      if (fields.some((f) => !(DEVICE_EDITABLE_FIELDS as ReadonlyArray<string>).includes(f))) {
-        return result(c, m.requestId, false, { code: "admin_required", message: "Only admin can change that." })
-      }
-      const record = devices.get(c.deviceId)
-      if (record === undefined) return result(c, m.requestId, false, { code: "unknown_device", message: "This device is not known." })
-      record.overrides = applyProfilePatch(record.overrides, cleanPatch(m.patch))
-      pushProfiles()
-      result(c, m.requestId, true)
-      devicesChanged()
-      settleAll()
-      return
-    }
-    case "frontend.update": {
-      if (requireAdmin(c, m.requestId)) return
-      if (m.kind !== WEB_VOICE_KIND) return result(c, m.requestId, false, { code: "unknown_device", message: `No front-end kind ${m.kind}.` })
-      kindDefaults = applyProfilePatch(kindDefaults, cleanPatch(m.patch))
-      pushProfiles()
-      result(c, m.requestId, true)
-      frontendsChanged()
-      devicesChanged()
-      settleAll()
-      return
-    }
-    case "device.admin.update": {
-      if (requireAdmin(c, m.requestId)) return
-      const record = devices.get(m.id)
-      if (record === undefined) return result(c, m.requestId, false, { code: "unknown_device", message: "This device is not known (any more)." })
-      if (m.name !== undefined) record.name = m.name.trim()
-      if (m.patch !== undefined) record.overrides = applyProfilePatch(record.overrides, cleanPatch(m.patch))
-      pushProfiles()
-      result(c, m.requestId, true)
-      devicesChanged()
-      sessionsChanged()
-      settleAll()
-      return
-    }
     case "device.forget": {
       if (requireAdmin(c, m.requestId)) return
       const record = devices.get(m.id)
@@ -2225,8 +2184,8 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
       assistantsMock.forgetDevice(m.id)
       // A device that is connected now is recorded again as new.
       const now = Date.now()
-      if ([...conns].some((x) => x.welcomed && x.deviceId === m.id)) devices.set(m.id, { ...record, firstSeen: now, lastSeen: now, overrides: {} })
-      pushProfiles()
+      if ([...conns].some((x) => x.welcomed && x.deviceId === m.id)) devices.set(m.id, { ...record, firstSeen: now, lastSeen: now })
+      pushSetups()
       result(c, m.requestId, true)
       devicesChanged()
       return
@@ -2365,7 +2324,7 @@ wss.on("connection", (ws: WebSocket) => {
         const now = Date.now()
         const known = devices.get(m.device.id)
         devices.set(m.device.id, known === undefined
-          ? { id: m.device.id, kind: m.device.kind, name: m.device.name, firstSeen: now, lastSeen: now, overrides: {} }
+          ? { id: m.device.id, kind: m.device.kind, name: m.device.name, firstSeen: now, lastSeen: now }
           : { ...known, lastSeen: now })
         c.deviceId = m.device.id
       }
@@ -2397,10 +2356,8 @@ wss.on("connection", (ws: WebSocket) => {
           ownerPresent: v !== undefined && ownerPresentIn(v),
           engine: engineSummary(engine),
           history: answering === undefined ? [] : answering.history.slice(-200),
-          ...(m.frontend === "voice" ? { device: profileInfo(c) } : {}),
           admin: adminState(c, tokenSent !== undefined && c.session === undefined ? { endReason: "token" } : {}),
-          conversation: answering === undefined ? { id: "no-session", startedAt: Date.now() } : answering.conversation,
-          ...(setup !== undefined ? { setup, conversations: voice.conversationsOf(v, setup) } : {})
+          ...(setup !== undefined ? { setup, conversations: voice.conversationsOf(v, setup) } : { conversations: [] })
         }
       })
       if (isAdminConn(c)) sendAdminSnapshot(c)
@@ -2804,7 +2761,7 @@ const http = createServer((req, res) => {
         const v = targetSession(payload.deviceId)
         if (v === undefined) return json(res, 400, { error: "no session" })
         if (payload.now === true) newConversation(v, "idle")
-        else v.lastTurnAt = Date.now() - (Math.max(1, sessionProfile(v).conversationIdleMinutes) + 1) * 60_000
+        else v.lastTurnAt = Date.now() - (Math.max(1, idleMinutesOf(voice.answeringOf(v, v.deviceId))) + 1) * 60_000
         return json(res, 200, { ok: true })
       }
       case "/mock/max-sessions": {
@@ -2871,14 +2828,6 @@ const http = createServer((req, res) => {
         const ok = assistantsMock.touch(String(payload.id ?? ""), (payload.patch ?? {}) as Parameters<typeof assistantsMock.touch>[1])
         if (ok) assistantsChanged()
         return json(res, ok ? 200 : 404, { ok })
-      }
-      case "/mock/defaults": {
-        // The web-voice defaults, as admin › Front ends would set them (tests).
-        kindDefaults = applyProfilePatch(kindDefaults, (payload.patch ?? {}) as ProfilePatch)
-        pushProfiles()
-        frontendsChanged()
-        settleAll()
-        return json(res, 200, { ok: true })
       }
       case "/mock/voices/fail": {
         // A hosted provider whose key is refused (`on: false` makes it work again).

@@ -1,12 +1,12 @@
 import { describe, expect, it } from "vitest"
 import { DEFAULT_DEVICE_PROFILE, type ServerMessage } from "@pva/protocol"
-import { exampleAdminSnapshot, exampleDevice, exampleFrontend, serverExamples } from "@pva/protocol/examples"
+import { exampleDevice, serverExamples } from "@pva/protocol/examples"
 import { CUE_MS, CUE_RATE, wakeCue } from "@/lib/audio/cue.ts"
 import { deviceId, deviceNameFromUserAgent } from "@/lib/device.ts"
 import { lastSeenText, phraseFromHeard, phraseProblem } from "@/lib/profileForm.ts"
 import { buildSettingsTree, parentPath, resolveSettingsPath, typePageId } from "@/lib/settingsTree.ts"
 import { type Action, type ClientState, displayPhrase, heardOutcome, initialState, profileOf, reducer, visualState } from "@/lib/state.ts"
-import { profileMessage } from "./profile.ts"
+import { setupMessage } from "./profile.ts"
 
 const run = (actions: ReadonlyArray<Action>, from: ClientState = initialState) => actions.reduce(reducer, from)
 const welcome = serverExamples.welcome
@@ -34,28 +34,26 @@ describe("this browser as a device", () => {
   })
 })
 
-describe("reducer, protocol 5", () => {
-  it("welcome takes the voice part: the engine summary, the device profile and admin access", () => {
+describe("reducer, protocol 5 and 7", () => {
+  it("welcome takes the voice part: the engine summary, the device setup and admin access", () => {
     const s = run([welcome])
     expect(s.summary).toEqual(welcome.snapshot.engine)
-    expect(s.device).toEqual(welcome.snapshot.device)
+    expect(s.setup).toEqual(welcome.snapshot.setup)
     expect(s.admin).toEqual(welcome.snapshot.admin)
     expect(s.adminReady).toBe(false)
   })
 
-  it("device.profile replaces the profile and clears this page's unconfirmed changes", () => {
-    let s = run([welcome, profileMessage()])
-    s = reducer(s, { type: "local/profile-overlay", patch: { voice: "natural" } })
-    expect(profileOf(s).voice).toBe("natural")
-    expect(s.device!.profile.voice).toBe("")
-    s = reducer(s, profileMessage({ voice: "natural", activation: "wake-phrase" }))
-    expect(s.profileOverlay).toEqual({})
-    expect(profileOf(s)).toMatchObject({ voice: "natural", activation: "wake-phrase" })
+  it("device.setup replaces the setup the page's profile fields come from", () => {
+    let s = run([welcome])
+    expect(profileOf(s)).toMatchObject({ interruptMode: welcome.snapshot.setup!.interruptMode })
+    s = reducer(s, setupMessage({ captions: false, interruptMode: "manual", echoCancellation: false }))
+    expect(profileOf(s)).toMatchObject({ captions: false, interruptMode: "manual", echoCancellation: false })
+    expect(profileOf(s)).toBe(profileOf(s)) // cached: the same object while the setup is the same
     expect(profileOf(initialState)).toEqual(DEFAULT_DEVICE_PROFILE)
   })
 
   it("asleep: its own visual state; the phrase alone shows listening until the next state change", () => {
-    let s = run([welcome, owner, profileMessage({ activation: "wake-phrase" }), { type: "state", state: "asleep" }])
+    let s = run([welcome, owner, { type: "state", state: "asleep" }])
     expect(visualState(s)).toBe("asleep")
     s = reducer(s, { type: "wake", phrase: "hey jeff", armed: false })
     expect(visualState(s)).toBe("asleep") // a turn follows; nothing to show
@@ -70,14 +68,12 @@ describe("reducer, protocol 5", () => {
     expect(visualState(s)).toBe("asleep")
   })
 
-  it("admin: the snapshot, live front ends and devices; a session end empties the admin part", () => {
+  it("admin: the snapshot and live devices; a session end empties the admin part", () => {
     let s = run([{ ...welcome, snapshot: { ...welcome.snapshot, admin: { enabled: true, loggedIn: true } } }, serverExamples["admin.snapshot"]])
     expect(s.adminReady).toBe(true)
-    expect(s.frontends).toEqual(exampleAdminSnapshot.frontends)
+    expect(s.devices).toEqual(serverExamples["admin.snapshot"].type === "admin.snapshot" ? serverExamples["admin.snapshot"].snapshot.devices : [])
     s = reducer(s, { type: "devices", devices: [] })
     expect(s.devices).toEqual([])
-    s = reducer(s, { type: "frontends", frontends: [exampleFrontend] })
-    expect(s.frontends).toHaveLength(1)
     s = reducer(s, { type: "wake.heard", text: "hey go", at: 1 })
     s = reducer(s, { type: "wake.heard", text: "hey jeff", matched: "hey jeff", accepted: true, at: 2 })
     s = reducer(s, { type: "wake.heard", text: "and tomorrow", accepted: true, at: 3 })
@@ -92,7 +88,7 @@ describe("reducer, protocol 5", () => {
     const seq = s.adminSeq
     s = reducer(s, { type: "admin.state", admin: { enabled: true, loggedIn: false, endReason: "idle" } })
     expect(s.adminSeq).toBe(seq + 1)
-    expect(s).toMatchObject({ adminReady: false, modules: { order: [] }, sections: [], frontends: [], devices: [], heard: [] })
+    expect(s).toMatchObject({ adminReady: false, modules: { order: [] }, sections: [], devices: [], heard: [] })
     expect(s.admin.endReason).toBe("idle")
   })
 
@@ -101,7 +97,7 @@ describe("reducer, protocol 5", () => {
     const s = run([loggedIn, serverExamples["admin.snapshot"]])
     expect(run([loggedIn], s).adminReady).toBe(true)
     const refused = { ...welcome, snapshot: { ...welcome.snapshot, admin: { enabled: true, loggedIn: false, endReason: "token" as const } } }
-    expect(run([refused], s)).toMatchObject({ adminReady: false, frontends: [] })
+    expect(run([refused], s)).toMatchObject({ adminReady: false, devices: [] })
   })
 
   it("shows phrases with capitals", () => {

@@ -83,7 +83,7 @@ for (const width of [320, 390]) {
 
     test("every editable control is at least 16 px (no zoom on focus) and the layouts still fit", async ({ page, baseURL }) => {
       await mock.scenario("devices")
-      await mock.defaults({ activation: "wake-phrase" })
+      await mock.sleeps()
       // Admin login.
       await page.goto(adminUrl(baseURL))
       await expect(page.getByTestId("login-form")).toBeVisible()

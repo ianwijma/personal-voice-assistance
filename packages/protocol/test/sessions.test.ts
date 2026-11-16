@@ -11,7 +11,6 @@ import {
   encodeServerMessage,
   ErrorCode,
   PROFILE_FIELDS,
-  ProfilePatch,
   PROTOCOL_VERSION
 } from "../src/index.ts"
 import { clientExamples, exampleAdminSnapshot, exampleSnapshot, serverExamples } from "../src/examples.ts"
@@ -39,9 +38,9 @@ describe("protocol 6", () => {
     expect(decodeServerMessage(JSON.stringify(noStart))._tag).toBe("Invalid")
   })
 
-  it("the snapshot carries the conversation (required); the admin snapshot the sessions (required)", () => {
+  it("the snapshot carries the conversations (required); the admin snapshot the sessions (required)", () => {
     const welcome = serverExamples.welcome
-    const { conversation: _c, ...without } = exampleSnapshot
+    const { conversations: _c, ...without } = exampleSnapshot
     expect(decodeServerMessage(JSON.stringify({ ...welcome, snapshot: without }))._tag).toBe("Invalid")
     const { sessions: _s, ...noSessions } = exampleAdminSnapshot
     expect(decodeServerMessage(JSON.stringify({ type: "admin.snapshot", snapshot: noSessions }))._tag).toBe("Invalid")
@@ -88,7 +87,5 @@ describe("protocol 6", () => {
     }
     const { conversationIdleMinutes: _m, ...missing } = DEFAULT_DEVICE_PROFILE
     expect(valid(DeviceProfile as never, missing)).toBe(false)
-    expect(valid(ProfilePatch as never, { conversationIdleMinutes: null })).toBe(true)
-    expect(valid(ProfilePatch as never, { conversationIdleMinutes: 300 })).toBe(false)
   })
 })

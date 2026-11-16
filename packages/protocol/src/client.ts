@@ -14,7 +14,7 @@ import {
 import { MAX_TEXT_INPUT_CHARS } from "./constants.ts"
 import { MAX_MOVE_KEYS } from "./env.ts"
 import { DeviceSettingsPatch, DeviceTarget } from "./devices.ts"
-import { DeviceHello, DeviceId, DeviceName, FrontendKindId, FrontendRole, ProfilePatch, WakePhrase } from "./frontends.ts"
+import { DeviceHello, DeviceId, DeviceName, FrontendRole, WakePhrase } from "./frontends.ts"
 import { JobAction, ToolId } from "./jobs.ts"
 import { SettingsPatch } from "./settings.ts"
 import { Password } from "./vault.ts"
@@ -295,42 +295,6 @@ export const AdminLogout = Schema.Struct({
 })
 
 /**
- * Change this connection's own device profile: only `DEVICE_EDITABLE_FIELDS` (`voice`, `activation`,
- * `followUpSeconds`); a patch naming any other field is refused whole with `admin_required`. `null` removes the
- * device's override (back to the kind default). A voice connection without `hello.device` is refused (`bad_message`).
- * Every connection of the device then gets `device.profile`; admin connections get `devices`.
- */
-export const DeviceUpdate = Schema.Struct({
-  type: Schema.Literal("device.update"),
-  requestId: RequestId,
-  patch: ProfilePatch
-})
-
-/**
- * Admin only: change a front-end kind's defaults (Front ends › kind). Fields not in the kind's `fields` are refused
- * (`invalid_settings`, with `fieldErrors`). Unknown kind: `unknown_device`. Every affected device connection gets
- * `device.profile`; admin connections get `frontends` and `devices`.
- */
-export const FrontendUpdate = Schema.Struct({
-  type: Schema.Literal("frontend.update"),
-  requestId: RequestId,
-  kind: FrontendKindId,
-  patch: ProfilePatch
-})
-
-/**
- * Admin only: rename a device and/or change its overrides (any profile field that applies to its kind). Unknown
- * device: `unknown_device`. The device's connections get `device.profile`; admin connections get `devices`.
- */
-export const DeviceAdminUpdate = Schema.Struct({
-  type: Schema.Literal("device.admin.update"),
-  requestId: RequestId,
-  id: DeviceId,
-  name: Schema.optionalKey(DeviceName),
-  patch: Schema.optionalKey(ProfilePatch)
-})
-
-/**
  * Admin only: forget a device (its record and overrides). A device that is connected now is recorded again as new
  * (kind defaults) and its connections get `device.profile`. Unknown device: `unknown_device`.
  */
@@ -473,9 +437,6 @@ export const ClientMessage = Schema.Union([
   ModelDelete,
   AdminLogin,
   AdminLogout,
-  DeviceUpdate,
-  FrontendUpdate,
-  DeviceAdminUpdate,
   DeviceForget,
   WakeTest,
   ConversationNew,

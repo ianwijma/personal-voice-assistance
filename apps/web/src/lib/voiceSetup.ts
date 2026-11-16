@@ -169,21 +169,20 @@ export const needsRead = (s: ClientState, id: string | undefined): boolean => id
 
 // ---- The device's profile, from its setup
 
-const cache: { device?: DeviceProfile | undefined; setup?: DeviceSetup | undefined; overlay?: Partial<DeviceProfile>; value?: DeviceProfile } = {}
+const cache: { setup?: DeviceSetup | undefined; value?: DeviceProfile } = {}
 
 /**
  * The fields of the old profile the page still uses (microphone processing, output path, interrupting, captions),
- * from `device.setup` when the server has sent one: the setup is the source of truth in protocol 7. Cached by input,
- * so a change in the store that touches none of them returns the same object.
+ * from `device.setup`: the setup is the source of truth in protocol 7 (before it arrives: the built-in defaults).
+ * Cached by input, so a change in the store that touches none of them returns the same object.
  */
-export const profileFromSetup = (device: DeviceProfile | undefined, setup: DeviceSetup | undefined, overlay: Partial<DeviceProfile>): DeviceProfile => {
-  if (cache.value !== undefined && cache.device === device && cache.setup === setup && cache.overlay === overlay) return cache.value
-  const base = device ?? DEFAULT_DEVICE_PROFILE
-  const fromSetup: DeviceProfile =
+export const profileFromSetup = (setup: DeviceSetup | undefined): DeviceProfile => {
+  if (cache.value !== undefined && cache.setup === setup) return cache.value
+  const value: DeviceProfile =
     setup === undefined
-      ? base
+      ? DEFAULT_DEVICE_PROFILE
       : {
-        ...base,
+        ...DEFAULT_DEVICE_PROFILE,
         interruptMode: setup.interruptMode,
         captions: setup.captions.captions,
         speakReplies: setup.captions.speakTyped,
@@ -193,17 +192,14 @@ export const profileFromSetup = (device: DeviceProfile | undefined, setup: Devic
         outputPath: setup.audio.outputPath,
         prebufferMs: setup.audio.prebufferMs
       }
-  const value = Object.keys(overlay).length === 0 ? fromSetup : { ...fromSetup, ...overlay }
-  cache.device = device
   cache.setup = setup
-  cache.overlay = overlay
   cache.value = value
   return value
 }
 
 // ---- Reducer pieces (state.ts)
 
-type Snap = Pick<Snapshot, "history" | "conversation" | "setup" | "conversations">
+type Snap = Pick<Snapshot, "history" | "setup" | "conversations">
 
 /**
  * The part of the state a `welcome` sets: the setup, the conversations (the answering assistant's is the one the
@@ -217,7 +213,7 @@ export const atWelcome = (
   const setup = snapshot.setup
   const probe = { setup, holder: undefined, ui: previous.ui } as unknown as ClientState
   const answering = answeringId(probe) ?? ""
-  const list = snapshot.conversations ?? [{ assistantId: answering, id: snapshot.conversation.id, startedAt: snapshot.conversation.startedAt, turns: snapshot.history.length }]
+  const list = snapshot.conversations
   const conversations: Record<string, ConversationView> = {}
   for (const c of list) {
     const before = previous.conversations[c.assistantId]

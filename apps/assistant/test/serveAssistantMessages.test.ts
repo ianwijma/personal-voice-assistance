@@ -449,7 +449,7 @@ describe("device.save", () => {
 describe("what a voice connection receives", () => {
   const ALLOWED: ReadonlySet<ServerMessageType> = new Set<ServerMessageType>([
     "welcome", "session", "state", "transcript", "turn.start", "assistant.text", "assistant.playing", "tool.start", "tool.end",
-    "turn.end", "reply.start", "reply.end", "reply.stop", "result", "error", "engine.summary", "admin.state", "device.profile",
+    "turn.end", "reply.start", "reply.end", "reply.stop", "result", "error", "engine.summary", "admin.state",
     "wake", "pong", "device.setup", "conversation", "conversation.history"
   ])
 

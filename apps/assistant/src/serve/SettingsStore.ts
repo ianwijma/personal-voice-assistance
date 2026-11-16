@@ -25,16 +25,13 @@ import { userCwd } from "../env.ts"
 import type { DataDirLock } from "./DataDirLock.ts"
 import { flattenSections } from "./flatten.ts"
 import {
-  applyLegacyChange,
   type AssistantContext,
   type AssistantList,
   type AssistantsData,
   type EnvironmentLock,
-  type FrontendData,
+  type V3FrontendData,
   getPath,
-  idleBuiltInOf,
-  type LegacyDeviceRecord,
-  legacyFrontendData,
+  type V3DeviceRecord as V3Device,
   MIGRATED_ASSISTANT_ID,
   migrateToV4,
   mirrorFlatKeys,
@@ -66,9 +63,7 @@ import { isVaultText, type Vault, type VaultSecrets, type VaultWriter } from "./
  * Read-only loads migrate in memory only. A missing file is the default install: its assistant and browser defaults
  * are made in memory and written by the first save. Entries that do not decode are dropped at load with a problem.
  *
- * Until the server reads assistants and devices itself, today's front-end code reads a **legacy view**
- * (`frontendData`: kind default overrides and device profile overrides, derived from version 4), and its saves
- * (`saveFrontends`) are written back into version 4 field by field. Those saves are refused while the settings are
+ * The device registry's saves (`saveDeviceRecords`: a device seen, forgotten) are refused while the settings are
  * `blocked()`: a device registering must not count as the owner's word that settings from two saves belong
  * together. Saves of flat keys that became per assistant, and of module switches, are mirrored into the migrated
  * assistant (see `migrateAssistants.ts`).
@@ -123,9 +118,7 @@ import { isVaultText, type Vault, type VaultSecrets, type VaultWriter } from "./
  * next successful save clears it (the owner has then looked at and saved the settings).
  */
 
-/** A remembered device in the legacy view (profile overrides), as `serve/frontends.ts` reads it. */
-export type DeviceRecord = LegacyDeviceRecord
-export type { AssistantContext, AssistantList, AssistantsData, EnvironmentLock, FrontendData, MigrationRecord, SettingsFile, StoredDevice, StoredDeviceType }
+export type { AssistantContext, AssistantList, AssistantsData, EnvironmentLock, MigrationRecord, SettingsFile, StoredDevice, StoredDeviceType }
 
 /** A device record of a version-3 file. */
 const V3DeviceRecord = Schema.Struct({
@@ -201,9 +194,9 @@ const isKindId = Schema.is(FrontendKindId)
 const isDeviceId = Schema.is(DeviceId)
 
 /** The front-end maps of a version-3 file; entries that do not decode are dropped, each with a problem. */
-const readFrontendData = (u: Record<string, unknown>, problems: Array<string>): FrontendData => {
+const readFrontendData = (u: Record<string, unknown>, problems: Array<string>): V3FrontendData => {
   const frontends: Record<string, ProfileOverrides> = {}
-  const devices: Record<string, LegacyDeviceRecord> = {}
+  const devices: Record<string, V3Device> = {}
   for (const [kind, value] of Object.entries(isRecord(u.frontends) ? u.frontends : {})) {
     const decoded = decodeOverrides(value)
     if (isKindId(kind) && decoded._tag === "Some") frontends[kind] = decoded.value
@@ -361,15 +354,10 @@ export interface SettingsStore {
     secrets: Readonly<Record<string, string>>
   ) => Effect.Effect<void, SettingsStoreError>
   /**
-   * Save front-end data (kind defaults, device records): `change` maps the committed data to the new data. Refused
-   * while `blocked()` (see the header). Never touches the secrets.
+   * Save the remembered devices (a device seen for the first time, its last visit, forgotten): `change` maps the
+   * committed records to the new ones. Refused while `blocked()` (see the header). Never touches the secrets.
    */
-  readonly saveFrontends: (what: string, change: (committed: FrontendData) => FrontendData) => Effect.Effect<void, SettingsStoreError>
-  /**
-   * The legacy view of the device data (kind default overrides, device profile overrides) that today's front-end
-   * code reads (`serve/frontends.ts`), derived from version 4 (see `migrateAssistants.ts`).
-   */
-  readonly frontendData: () => FrontendData
+  readonly saveDeviceRecords: (what: string, change: (committed: Readonly<Record<string, StoredDevice>>) => Readonly<Record<string, StoredDevice>>) => Effect.Effect<void, SettingsStoreError>
   /** The assistants as stored, in the admin's order. */
   readonly assistants: () => ReadonlyArray<Assistant>
   /**
@@ -1211,26 +1199,15 @@ export const loadSettingsStore = (directory: string, options: LoadOptions = {}):
           ).pipe(Effect.map(() => count))
         })
 
-      const saveFrontends: SettingsStore["saveFrontends"] = (what, change) =>
+      const saveDeviceRecords: SettingsStore["saveDeviceRecords"] = (what, change) =>
         Effect.suspend(() =>
           blockedProblem !== undefined
             ? Effect.fail(new SettingsStoreError({ message: `${what} was not saved: ${blockedProblem}` }))
-            : persistSettings(what, (committed) => {
-              const idle = idleBuiltInOf(committed.settings.assistant, context)
-              const before = legacyFrontendData(committed.settings, idle)
-              const next = applyLegacyChange(committed.settings, before, change(before), idle)
-              return { settings: { ...committed.settings, ...next }, secrets: committed.secrets }
-            })
+            : persistSettings(what, (committed) => ({
+              settings: { ...committed.settings, devices: change(committed.settings.devices) },
+              secrets: committed.secrets
+            }))
         )
-
-      let legacyCache: { readonly settings: SettingsFile; readonly idle: number; readonly data: FrontendData } | undefined
-      const frontendData = (): FrontendData => {
-        const idle = idleBuiltInOf(settings.assistant, context)
-        if (legacyCache?.settings !== settings || legacyCache.idle !== idle) {
-          legacyCache = { settings, idle, data: legacyFrontendData(settings, idle) }
-        }
-        return legacyCache.data
-      }
 
       // -- Entities (docs/ASSISTANTS.md §1.2 "Admin transport"): saved whole, each with its `rev`.
       const refuse = (code: EntitySaveError["code"], message: string) => new EntitySaveError({ code, message })
@@ -1335,8 +1312,7 @@ export const loadSettingsStore = (directory: string, options: LoadOptions = {}):
         },
         saveModule,
         saveAssistant,
-        saveFrontends,
-        frontendData,
+        saveDeviceRecords,
         assistants: ordered,
         assistantsInEffect: () => ordered().map((a) => withEnvironment(a, context)),
         createAssistant,

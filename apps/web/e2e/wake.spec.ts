@@ -30,7 +30,6 @@ test("the sheet: who answers goes to the server as a pick; phrases and follow-up
 
   await sheet.getByTestId("sheet-assistant-none").click()
   await expect.poll(async () => (await mock.log()).messages.filter((m) => m.type === "device.pick").map((m) => m.withoutPhrase)).toEqual([""])
-  expect((await mock.log()).messages.filter((m) => m.type === "device.update")).toEqual([])
   // The server is the source of truth: after a reload the sheet shows what it stored.
   await page.reload()
   await page.getByTestId("settings-toggle").click()

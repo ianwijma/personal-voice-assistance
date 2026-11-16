@@ -12,7 +12,6 @@ import {
 } from "@pva/protocol"
 import {
   accountInfo,
-  accountNotAvailableYet,
   ACCOUNTS,
   accountState,
   errorsFor,
@@ -202,9 +201,7 @@ export function ModelFields({ draft }: { readonly draft: AssistantDraft }) {
         draft={draft}
         implication={info.implication}
         warn={
-          accountNotAvailableYet(a.llm.account)
-            ? `${info.title} is not available yet: ${name} cannot answer until it is.`
-            : needsSetup
+          needsSetup
             ? <>{info.title} is not set up yet: {name} cannot answer until you add it in <SettingsLink path={state.setUp ?? ["shared", "accounts"]}>Shared settings › Language model accounts</SettingsLink>.</>
             : undefined
         }

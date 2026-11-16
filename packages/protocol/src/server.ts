@@ -14,7 +14,7 @@ import {
 import { AdminSession, AdminState } from "./admin.ts"
 import { AssistantId } from "./assistants.ts"
 import { AssistantInfo, DeviceListInfo, DeviceSetup, DeviceTypeInfo } from "./devices.ts"
-import { DeviceId, DeviceProfileInfo, FrontendKindInfo, WakePhrase } from "./frontends.ts"
+import { DeviceId, WakePhrase } from "./frontends.ts"
 import { AdminSnapshot, EngineStatus, EngineSummary, HistoryItem, ModuleInfo, SettingsSection, Snapshot, TraceInfo } from "./snapshot.ts"
 import { EnvInfo } from "./env.ts"
 import { JobInfo, ModelSet } from "./jobs.ts"
@@ -238,22 +238,6 @@ export const AdminSnapshotMessage = Schema.Struct({
 })
 
 /**
- * Protocol 5: this connection's effective device profile changed (its own `device.update`, an admin change to its
- * kind or to the device, the device was forgotten, or a voice became disabled so `voice` fell back to `""`). Sent
- * to every connection of the device. Replaces `snapshot.device`.
- */
-export const DeviceProfileMessage = Schema.Struct({
-  type: Schema.Literal("device.profile"),
-  ...DeviceProfileInfo.fields
-})
-
-/** Protocol 5, admin connections only: the front-end kinds or their defaults changed. The whole list. */
-export const Frontends = Schema.Struct({
-  type: Schema.Literal("frontends"),
-  frontends: Schema.Array(FrontendKindInfo)
-})
-
-/**
  * Protocol 5, admin connections only: the devices changed (seen, renamed, overrides, forgotten, connected,
  * disconnected, audio owner). The whole list, most recently seen first; at most one per second while only
  * `lastSeen` / `connections` change. Protocol 7 adds `own`, `settings`, `hearer` and `rev` to each device
@@ -402,8 +386,6 @@ export const ServerMessage = Schema.Union([
   EngineSummaryMessage,
   AdminStateMessage,
   AdminSnapshotMessage,
-  DeviceProfileMessage,
-  Frontends,
   Devices,
   Wake,
   WakeHeard,

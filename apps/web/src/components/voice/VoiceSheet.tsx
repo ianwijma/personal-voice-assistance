@@ -190,7 +190,7 @@ function SheetBody() {
   const client = useClient()
   const v = useClientState(
     (s) => ({
-      hasDevice: s.device?.deviceId !== undefined,
+      hasDevice: s.setup?.deviceId !== undefined,
       running: s.audio.phase === "running" || s.audio.phase === "suspended"
     }),
     shallowEqual

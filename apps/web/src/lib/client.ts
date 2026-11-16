@@ -1,4 +1,4 @@
-import type { Assistant, AssistantBody, AssistantId, ClientMessage, DeviceProfile, DeviceSettingsPatch, DeviceTarget, FrontendKindId, FrontendRole, ProfilePatch, SettingsPatch, ToolId } from "@pva/protocol"
+import type { Assistant, AssistantBody, AssistantId, ClientMessage, DeviceProfile, DeviceSettingsPatch, DeviceTarget, FrontendRole, SettingsPatch, ToolId } from "@pva/protocol"
 import { type Outcome, outcomeOf } from "./assistants.ts"
 import { createDiagnosticsStore, type DiagnosticsStore, type MicProcessing } from "./audio/diagnostics.ts"
 import { CUE_RATE, wakeCue } from "./audio/cue.ts"
@@ -69,17 +69,10 @@ export interface AssistantClient {
   readonly deleteModel: (tool: ToolId, target: string) => Promise<ResultMessage>
   /** This browser's own choices (microphone, speaker). */
   readonly setPrefs: (patch: Partial<Prefs>) => void
-  /**
-   * Voice: change this device's own profile (`voice`, `activation`, `followUpSeconds`). Shown at once and reconciled
-   * with the server's `device.profile`; reverted with a toast when refused.
-   */
-  readonly updateDevice: (patch: ProfilePatch, opts?: { readonly toast?: boolean }) => Promise<ResultMessage>
   /** Admin: log in (the token is kept in `sessionStorage` for reloads and reconnects) and out. */
   readonly adminLogin: (password: string) => Promise<ResultMessage>
   readonly adminLogout: () => Promise<ResultMessage>
-  /** Admin: a front-end kind's defaults; a device's name and overrides; forget a device. `null` in a patch = inherit. */
-  readonly updateFrontend: (kind: FrontendKindId, patch: ProfilePatch) => Promise<ResultMessage>
-  readonly updateDeviceAdmin: (id: string, change: { readonly name?: string; readonly patch?: ProfilePatch }) => Promise<ResultMessage>
+  /** Admin: forget a device. */
   readonly forgetDevice: (id: string) => Promise<ResultMessage>
   /**
    * Admin, protocol 7 (docs/ASSISTANTS.md §5.2). Each answers with an `Outcome`: `ok` (create: with `assistantId`),
@@ -545,23 +538,6 @@ export const createAssistantClient = (options: { readonly frontend?: FrontendRol
     audio.playLocal(CUE_REPLY_ID, CUE_RATE, wakeCue())
   }
 
-  /**
-   * This device's own profile change (`device.update`), shown at once. A refusal puts the shown value back and, unless
-   * `toast: false` (the settings sheet shows it next to the control instead), raises a toast.
-   */
-  const updateDevice = async (patch: ProfilePatch, opts: { readonly toast?: boolean } = {}): Promise<ResultMessage> => {
-    const shown: Partial<DeviceProfile> = {}
-    for (const [k, v] of Object.entries(patch)) if (v !== null) (shown as Record<string, unknown>)[k] = v
-    dispatch({ type: "local/profile-overlay", patch: shown })
-    const result = await connection.request({ type: "device.update", patch }) // continuation(state): the overlay is the store's; cleared on refusal
-    if (!result.ok) {
-      dispatch({ type: "local/profile-overlay-clear" })
-      if (opts.toast !== false) dispatch({ type: "local/toast", message: result.error?.message ?? "The change was not saved.", tone: "error" })
-    }
-    // Accepted: the overlay stays until the server's `device.profile` replaces it (the server may correct a value).
-    return result
-  }
-
   // ---- Screen wake lock while this tab owns the audio ----
   let wakeLock: { release: () => Promise<void> } | undefined
   const requestWakeLock = () => {
@@ -657,17 +633,8 @@ export const createAssistantClient = (options: { readonly frontend?: FrontendRol
     cancelJob: (jobId) => connection.request({ type: "job.cancel", jobId }),
     deleteModel: (tool, target) => connection.request({ type: "model.delete", tool, target }),
     setPrefs,
-    updateDevice,
     adminLogin,
     adminLogout,
-    updateFrontend: (kind, patch) => connection.request({ type: "frontend.update", kind, patch }),
-    updateDeviceAdmin: (id, change) =>
-      connection.request({
-        type: "device.admin.update",
-        id,
-        ...(change.name !== undefined ? { name: change.name } : {}),
-        ...(change.patch !== undefined ? { patch: change.patch } : {})
-      }),
     forgetDevice: (id) => connection.request({ type: "device.forget", id }),
     saveAssistant: (assistant, options = {}) =>
       adminOutcome(connection.request({ type: "assistant.save", assistant, ...(options.saveAnyway === true ? { saveAnyway: true } : {}) }), options.name ?? assistant.name),

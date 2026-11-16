@@ -127,7 +127,7 @@ test("a denied microphone shows the reason and Try again", async ({ page, baseUR
 })
 
 test("the media-element output path also plays the reply and reports it", async ({ page, baseURL }) => {
-  await mock.defaults({ outputPath: "element" }) // a device-profile field since protocol 5
+  await mock.device({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, speakAloud: true, outputPath: "element", prebufferMs: 60 } })
   await page.goto(appUrl(baseURL))
   await page.getByTestId("start").click()
   await expectVisualState(page, "speaking", 10_000)

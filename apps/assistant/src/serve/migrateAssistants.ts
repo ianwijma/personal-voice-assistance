@@ -40,7 +40,7 @@ import { sectionDefinitions } from "./sectionDefinitions.ts"
  * - `migrateToV4`: one assistant (`MIGRATED_ASSISTANT_ID`) from today's effective settings (environment > saved >
  *   default), the front-end kind defaults as device-type defaults, every device's overrides as its own sections,
  *   and the notes of what changed or was lost.
- * - The **legacy view** (`legacyFrontendData`, `applyLegacyChange`): until the server reads assistants and devices
+ * - The **legacy view** (`legacyV3FrontendData`, `applyLegacyChange`): until the server reads assistants and devices
  *   itself (WP-4b, WP-5), it keeps reading front-end kind defaults and device profile overrides
  *   (`serve/frontends.ts`). Those are derived from the version-4 data, and a change made through them is written
  *   back into it, field by field, so data the old pages cannot see is kept.
@@ -58,8 +58,8 @@ export const MIGRATED_ASSISTANT_NAME = "Assistant"
 
 type ModulesSection = Readonly<Record<string, { readonly enabled?: boolean; readonly settings?: Readonly<Record<string, unknown>> }>>
 
-/** A remembered device as the front-end code (protocol 5/6) sees it: profile overrides. */
-export interface LegacyDeviceRecord {
+/** A remembered device as a version 3 file stores it: profile overrides (read by the migration only). */
+export interface V3DeviceRecord {
   readonly kind: string
   readonly name: string
   readonly firstSeen: number
@@ -67,16 +67,16 @@ export interface LegacyDeviceRecord {
   readonly overrides: ProfileOverrides
 }
 
-/** The front-end part of a version-3 `settings.json`, and the legacy view of a version-4 one. */
-export interface FrontendData {
+/** The front-end part of a version-3 `settings.json`. */
+export interface V3FrontendData {
   /** Kind id → its default profile overrides. */
   readonly frontends: Readonly<Record<string, ProfileOverrides>>
   /** Device id → its record. */
-  readonly devices: Readonly<Record<string, LegacyDeviceRecord>>
+  readonly devices: Readonly<Record<string, V3DeviceRecord>>
 }
 
 /** A version-3 `settings.json` (a version-2 or -1 file is read as this first). */
-export interface SettingsFileV3 extends FrontendData {
+export interface SettingsFileV3 extends V3FrontendData {
   readonly version: 3
   readonly revision?: number
   readonly modules: ModulesSection
@@ -486,10 +486,6 @@ const settingsFromProfile = (p: DeviceProfile, assistantId: string): DeviceSetti
 const presentFields = (overrides: ProfileOverrides): ReadonlySet<ProfileField> =>
   new Set(PROFILE_FIELDS.filter((f) => overrides[f] !== undefined))
 
-/** The fields whose override differs between `a` and `b`. */
-const changedFields = (a: ProfileOverrides, b: ProfileOverrides): ReadonlySet<ProfileField> =>
-  new Set(PROFILE_FIELDS.filter((f) => !sameJson(a[f], b[f])))
-
 /**
  * A device's own sections after a change of its profile overrides: each section touched by a field in `changed`
  * becomes own when any of its fields is overridden (the others filled from `inherited`, what the device would get
@@ -544,43 +540,11 @@ const ownFromOverrides = (
   return out as DeviceOwn
 }
 
-/** A type's complete settings after a change of its kind defaults: the sections touched by `changed`, from `profile`. */
-const typeFromProfile = (
-  settings: DeviceSettings,
-  changed: ReadonlySet<ProfileField>,
-  profile: DeviceProfile,
-  assistantId: string | undefined
-): DeviceSettings => {
-  const from = settingsFromProfile(profile, assistantId ?? MIGRATED_ASSISTANT_ID)
-  const touches = (fields: ReadonlyArray<ProfileField>) => fields.some((f) => changed.has(f))
-  return {
-    ...settings,
-    ...(touches(["activation"]) ? { withoutPhrase: withoutPhraseOf(profile.activation, assistantId) } : {}),
-    ...(touches(["wakePhrases"]) && assistantId !== undefined
-      ? { assistants: withAssignment(settings.assistants, assistantId, profile.wakePhrases, "keep") }
-      : {}),
-    ...(touches(["wakeMatch"]) ? { matching: from.matching } : {}),
-    ...(touches(["interruptMode"]) ? { interruptMode: from.interruptMode } : {}),
-    ...(touches(AUDIO_FIELDS) ? { audio: { ...from.audio, speakAloud: settings.audio.speakAloud } } : {}),
-    ...(touches(CAPTION_FIELDS) ? { captions: from.captions } : {})
-  }
-}
-
 const builtInOf = (kind: string): DeviceSettings => deviceTypeOf(kind)?.builtIn ?? BUILT_IN_WEB_VOICE_SETTINGS
 const stripRev = <A extends { readonly rev: number }>(a: A): Omit<A, "rev"> => {
   const { rev: _, ...rest } = a
   return rest
 }
-
-/** A type's settings as stored, else its built-in ones. */
-const typeSettings = (data: AssistantsData, kind: string): DeviceSettings => {
-  const stored = data.deviceTypes[kind]
-  return stored === undefined ? builtInOf(kind) : (stripRev(stored) as DeviceSettings)
-}
-
-/** The assistant today's profile fields speak about on these settings: the hearer, else the migrated one, else the first. */
-const legacyAssistantOf = (data: AssistantsData, settings: Pick<DeviceSettings, "assistants" | "withoutPhrase">): string | undefined =>
-  hearerOf(settings) ?? (data.assistants.byId[MIGRATED_ASSISTANT_ID] !== undefined ? MIGRATED_ASSISTANT_ID : data.assistants.order[0])
 
 // -- The migration ---------------------------------------------------------------------------------------------------
 
@@ -753,167 +717,10 @@ export const migrateToV4 = (input: MigrationInput): SettingsFile => {
   }
 }
 
-// -- The legacy view -------------------------------------------------------------------------------------------------
+// -- Migration helpers -----------------------------------------------------------------------------------------------
 
 /** Today's CONVERSATION_IDLE_MINUTES (environment > saved > default): the built-in under every kind's defaults. */
 export const idleBuiltInOf = (flat: Readonly<Record<string, unknown>>, context: AssistantContext): number => {
   const fromEnv = nonEmpty(context.env?.CONVERSATION_IDLE_MINUTES)
   return clampInt(fromEnv ?? flat.CONVERSATION_IDLE_MINUTES, 0, CONVERSATION_IDLE_MINUTES_LIMITS.max, DEFAULT_CONVERSATION_IDLE_MINUTES)
-}
-
-const legacyProfileOf = (settings: DeviceSettings, assistant: Assistant | undefined, idleBuiltIn: number): DeviceProfile => {
-  const id = assistant?.id
-  const phrases = settings.assistants.flatMap((a) => a.phrases).slice(0, WAKE_PHRASES_MAX)
-  const assignment = settings.assistants.find((a) => a.assistant === id) ?? settings.assistants[0]
-  return {
-    activation: settings.withoutPhrase.mode === "nobody" ? "wake-phrase" : "always",
-    wakePhrases: phrases.length > 0 ? phrases : DEFAULT_DEVICE_PROFILE.wakePhrases,
-    wakeMatch: settings.matching,
-    followUpSeconds: Math.min(FOLLOW_UP_SECONDS_MAX, assignment?.followUpSeconds ?? assistant?.followUpSeconds ?? DEFAULT_DEVICE_PROFILE.followUpSeconds),
-    voice: "",
-    interruptMode: settings.interruptMode,
-    conversationIdleMinutes: assistant === undefined ? idleBuiltIn : idleMinutesOf(assistant.newConversationAfter),
-    captions: settings.captions.captions,
-    speakReplies: settings.captions.speakTyped,
-    echoCancellation: settings.audio.echoCancellation,
-    noiseSuppression: settings.audio.noiseSuppression,
-    autoGainControl: settings.audio.autoGainControl,
-    outputPath: settings.audio.outputPath,
-    prebufferMs: settings.audio.prebufferMs
-  }
-}
-
-/** The fields of `profile` that differ from `base`. */
-const diffProfile = (profile: DeviceProfile, base: DeviceProfile): ProfileOverrides => {
-  const out: Record<string, unknown> = {}
-  for (const f of PROFILE_FIELDS) if (!sameJson(profile[f], base[f])) out[f] = profile[f]
-  return out as ProfileOverrides
-}
-
-/**
- * A device's own sections as profile overrides (only the fields of the sections it owns; its phrases only when they
- * differ from the ones it would inherit, so an own list that only carries a follow-up reads as that override alone).
- */
-const legacyDeviceOverrides = (own: DeviceOwn, effective: DeviceSettings, inherited: DeviceSettings, assistant: Assistant | undefined): ProfileOverrides => {
-  const p = legacyProfileOf(effective, assistant, 0)
-  const out: Record<string, unknown> = {}
-  if (own.withoutPhrase !== undefined) out.activation = p.activation
-  if (own.assistants !== undefined) {
-    const inheritedPhrases = legacyProfileOf(inherited, assistant, 0).wakePhrases
-    if (own.assistants.some((a) => a.phrases.length > 0) && !sameJson(p.wakePhrases, inheritedPhrases)) out.wakePhrases = p.wakePhrases
-    const assignment = own.assistants.find((a) => a.assistant === assistant?.id) ?? own.assistants[0]
-    if (assignment?.followUpSeconds !== undefined) out.followUpSeconds = Math.min(FOLLOW_UP_SECONDS_MAX, assignment.followUpSeconds)
-  }
-  if (own.matching !== undefined) out.wakeMatch = p.wakeMatch
-  if (own.interruptMode !== undefined) out.interruptMode = p.interruptMode
-  if (own.audio !== undefined) for (const f of AUDIO_FIELDS) out[f] = p[f]
-  if (own.captions !== undefined) for (const f of CAPTION_FIELDS) out[f] = p[f]
-  return out as ProfileOverrides
-}
-
-/**
- * The version-4 data as today's front-end code reads it: each type's defaults as kind overrides over the built-in
- * profile (follow-up and "new conversation after" come from the assistant), each device's own sections as overrides.
- * Effective profiles equal the ones before the migration, except a device's own voice and reset time (dropped).
- */
-export const legacyFrontendData = (data: AssistantsData, idleBuiltIn: number): FrontendData => {
-  const frontends: Record<string, ProfileOverrides> = {}
-  for (const [kind, stored] of Object.entries(data.deviceTypes)) {
-    const settings = stripRev(stored) as DeviceSettings
-    const assistantId = legacyAssistantOf(data, settings)
-    const overrides = diffProfile(
-      legacyProfileOf(settings, assistantId === undefined ? undefined : data.assistants.byId[assistantId], idleBuiltIn),
-      builtInProfile(idleBuiltIn)
-    )
-    if (Object.keys(overrides).length > 0) frontends[kind] = overrides
-  }
-  const devices: Record<string, LegacyDeviceRecord> = {}
-  for (const [id, record] of Object.entries(data.devices)) {
-    const inherited = typeSettings(data, record.kind)
-    const effective = effectiveDeviceSettings(builtInOf(record.kind), inherited, record.own)
-    const assistantId = legacyAssistantOf(data, effective)
-    devices[id] = {
-      kind: record.kind,
-      name: record.name,
-      firstSeen: record.firstSeen,
-      lastSeen: record.lastSeen,
-      overrides: legacyDeviceOverrides(record.own, effective, inherited, assistantId === undefined ? undefined : data.assistants.byId[assistantId])
-    }
-  }
-  return { frontends, devices }
-}
-
-const bumpAssistant = (assistants: AssistantList, next: Assistant): AssistantList => {
-  const before = assistants.byId[next.id]
-  if (before === undefined || sameJson(before, next)) return assistants
-  return { ...assistants, byId: { ...assistants.byId, [next.id]: { ...next, rev: before.rev + 1 } } }
-}
-
-/**
- * Write a change made through the legacy view (`before` → `after`) back into the version-4 data, field by field:
- * a kind's changed defaults set the matching sections of its type (follow-up and "new conversation after" go to
- * the assistant); a device's changed overrides recompute only the sections they touch; added and removed devices
- * are added and removed. What the legacy view does not show (other assignments, TypeSafe, `speakAloud`, …) is kept.
- * Entities whose settings changed get `rev + 1` (a device's `lastSeen` alone does not count).
- */
-export const applyLegacyChange = (data: AssistantsData, before: FrontendData, after: FrontendData, idleBuiltIn: number): AssistantsData => {
-  let assistants = data.assistants
-  const deviceTypes: Record<string, StoredDeviceType> = { ...data.deviceTypes }
-  const kinds = new Set([...Object.keys(before.frontends), ...Object.keys(after.frontends)])
-  for (const kind of kinds) {
-    const was = before.frontends[kind] ?? {}
-    const now = after.frontends[kind] ?? {}
-    const changed = changedFields(was, now)
-    if (changed.size === 0) continue
-    const settings = typeSettings(data, kind)
-    const assistantId = legacyAssistantOf({ ...data, assistants }, settings)
-    const profile = effectiveProfile(now, {}, builtInProfile(idleBuiltIn))
-    const next = typeFromProfile(settings, changed, profile, assistantId)
-    const stored = data.deviceTypes[kind]
-    if (!sameJson(next, settings) || stored === undefined) deviceTypes[kind] = { ...next, rev: stored === undefined ? 0 : stored.rev + 1 }
-    const assistant = assistantId === undefined ? undefined : assistants.byId[assistantId]
-    if (assistant !== undefined) {
-      let a = assistant
-      if (changed.has("followUpSeconds")) {
-        const assignment = next.assistants.find((x) => x.assistant === assistant.id)
-        if (assignment?.followUpSeconds !== undefined) {
-          const list = next.assistants.map((x) => (x === assignment ? { ...x, followUpSeconds: profile.followUpSeconds } : x))
-          deviceTypes[kind] = { ...deviceTypes[kind]!, assistants: list }
-        } else {
-          a = { ...a, followUpSeconds: profile.followUpSeconds }
-        }
-      }
-      if (changed.has("conversationIdleMinutes")) a = { ...a, newConversationAfter: quietSpellOf(profile.conversationIdleMinutes) }
-      assistants = bumpAssistant(assistants, a)
-    }
-  }
-  const nextData: AssistantsData = { assistants, deviceTypes, devices: data.devices }
-  const devices: Record<string, StoredDevice> = {}
-  for (const [id, record] of Object.entries(after.devices)) {
-    const old = before.devices[id]
-    const stored = data.devices[id]
-    const inherited = typeSettings(nextData, record.kind)
-    if (old === undefined || stored === undefined) {
-      const assistantId = legacyAssistantOf(nextData, inherited)
-      const own = ownFromOverrides({}, presentFields(record.overrides), record.overrides, inherited, assistantId)
-      devices[id] = { kind: record.kind, name: record.name, firstSeen: record.firstSeen, lastSeen: record.lastSeen, own, rev: 0 }
-      continue
-    }
-    const changed = changedFields(old.overrides, record.overrides)
-    let own = stored.own
-    if (changed.size > 0) {
-      const effective = effectiveDeviceSettings(builtInOf(record.kind), inherited, stored.own)
-      own = ownFromOverrides(stored.own, changed, record.overrides, inherited, legacyAssistantOf(nextData, effective))
-    }
-    const settingsChanged = !sameJson(own, stored.own) || record.name !== stored.name || record.kind !== stored.kind
-    devices[id] = {
-      kind: record.kind,
-      name: record.name,
-      firstSeen: record.firstSeen,
-      lastSeen: record.lastSeen,
-      own,
-      rev: settingsChanged ? stored.rev + 1 : stored.rev
-    }
-  }
-  return { assistants, deviceTypes, devices }
 }
