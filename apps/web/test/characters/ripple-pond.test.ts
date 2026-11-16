@@ -427,3 +427,59 @@ describe("on the whole stage", () => {
     expect(b.r).toBeCloseTo(0.47 * moved.width, 6)
   })
 })
+
+describe("review fixes", () => {
+  it("never draws an arc with a negative radius, even on a 1 × 1 focus (the fake canvas would hide it with abs)", () => {
+    for (const mode of ["idle", "listening", "hearing", "thinking", "speaking"] as const) {
+      for (const reduced of [false, true]) {
+        const r = make({}, [1, 1])
+        const calls: Array<Call> = []
+        for (let i = 0; i < 60; i++) {
+          const v = voice({ level: 0.8, onset: i % 6 === 0 ? 1 : 0, sibilance: 1 })
+          calls.push(...tick(r, mode, { user: v, agent: v, reduced, focus: { x: 0, y: 0, width: 1, height: 1 } }))
+        }
+        const arcs = calls.filter((c) => c.name === "arc")
+        expect(arcs.length, mode).toBeGreaterThan(0)
+        for (const c of arcs) expect(c.args[2] as number, `${mode} reduced=${reduced}`).toBeGreaterThanOrEqual(0)
+      }
+    }
+  })
+
+  it("a focus that moves under a resting pointer is not pointer travel: no trail ring", () => {
+    const rings = (moveFocus: boolean) => {
+      const r = make({ look: "lines" }, [1280, 800])
+      let calls: Array<Call> = []
+      for (let i = 0; i < 60; i++) {
+        const focus: Focus = moveFocus && i >= 50 ? { x: 260, y: 200, width: 720, height: 240 } : { x: 280, y: 200, width: 720, height: 240 }
+        calls = tick(r, "idle", { focus, pointer: { x: 640, y: 320, down: false, inside: true } })
+      }
+      return circles(calls).stroked.length
+    }
+    expect(rings(true)).toBe(rings(false))
+  })
+
+  it("reduced motion clears rings in flight: they do not come back when motion is allowed again", () => {
+    const last = (event: boolean) => {
+      const r = make({ look: "lines" })
+      let calls: Array<Call> = []
+      for (let i = 0; i < SETTLE + 20; i++) {
+        const v = voice({ onset: event && i === SETTLE ? 1 : 0 })
+        calls = tick(r, "hearing", { user: v, agent: v, reduced: i >= SETTLE + 10 && i < SETTLE + 15 })
+      }
+      return circles(calls).stroked
+    }
+    expect(last(true)).toHaveLength(last(false).length)
+  })
+
+  it("reduced motion holds a calm pose while the live level keeps changing inside one third", () => {
+    for (const mode of ["hearing", "speaking"] as const) {
+      const frame = (level: number) => {
+        const r = make({ look: "lines" })
+        let calls: Array<Call> = []
+        for (let i = 0; i < SETTLE; i++) calls = tick(r, mode, { user: voice({ level }), agent: voice({ level }), reduced: true })
+        return JSON.stringify(calls)
+      }
+      expect(frame(0.46), mode).toBe(frame(0.5))
+    }
+  })
+})

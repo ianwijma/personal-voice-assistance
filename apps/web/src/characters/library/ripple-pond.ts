@@ -206,7 +206,8 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
         const inPool = pt.inside && pxN * pxN + pyN * pyN < 1
         if (pt.down && !pointerWas && inPool) spawn(f, pxN, pyN, 1, 0.9, lam * 1.2, 0.5 * speedK, 3, tone)
         if (inPool && !pt.down) {
-          const moved = Math.hypot(pt.x - fo.x - lastPX, pt.y - fo.y - lastPY)
+          // Travel is measured on the canvas, so a moving focus (the chat panel opening) is not pointer travel.
+          const moved = Math.hypot(pt.x - lastPX, pt.y - lastPY)
           trailAcc += moved
           if (trailAcc > R * 0.12) {
             spawn(f, pxN, pyN, 1, 0.35, lam * 0.6, 0.35 * speedK, 1, tone)
@@ -214,8 +215,8 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
           }
         }
         pointerWas = pt.down
-        lastPX = pt.x - fo.x
-        lastPY = pt.y - fo.y
+        lastPX = pt.x
+        lastPY = pt.y
       }
       lastOnset = v.onset
 
@@ -248,13 +249,16 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
         g.lineWidth = px1 * (4 + rimLit * 8)
         g.strokeStyle = css(tone, rimLit * 0.18 * (1.5 - 0.5 * wallK))
         g.beginPath()
-        g.arc(cx, cy, R - px1 * (2 + rimLit * 4), 0, TAU)
+        g.arc(cx, cy, Math.max(0, R - px1 * (2 + rimLit * 4)), 0, TAU)
         g.stroke()
       }
 
+      // Loudness in thirds: all the still pose takes from live audio, so it does not wobble with it.
+      const steps = Math.round(clamp01(lv * 1.6) * 3)
       // ---- Rings. Outward rings run on past the wall and fade over the stage; inward ones (which start at
       // the wall, with crests trailing outside it) and the still reduced-motion set stay inside the water.
-      const poolClip = R - px1 * 0.5
+      // Never negative: a tiny focus (1 × 1 before the first resize) must not make arc() throw.
+      const poolClip = Math.max(0, R - px1 * 0.5)
       const crestRgb = c1
       const troughA = p.dark ? 0.55 : 0.75
       if (!reduced) {
@@ -348,13 +352,15 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
           g.stroke()
         }
       } else {
+        // Anything in flight is gone, so it neither stays on screen nor resumes when motion is allowed again.
+        rDir.fill(0)
+        fLive.fill(0)
         g.save()
         g.beginPath()
         g.arc(cx, cy, poolClip, 0, TAU)
         g.clip()
         // Reduced motion: a still picture of the mode. Inward modes put the strongest crest
         // innermost; speaking puts it outermost; loudness (in thirds) sets how many crests show.
-        const steps = Math.round(clamp01(lv * 1.6) * 3)
         const nRings = f.mode === "hearing" || f.mode === "speaking" ? 2 + steps : f.mode === "listening" ? 1 : 0
         liftInto(crestRgb, tone, 0.3, p)
         const lamPx = lam * R
@@ -429,8 +435,8 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
       g.restore()
 
       // ---- Centre: the upwelling where incoming rings meet (hearing), or the drop point (speaking).
-      sink = reduced ? (f.mode === "hearing" ? 0.3 + lv : 0) : approach(sink, 0, dt, 0.5)
-      splash = reduced ? (f.mode === "speaking" ? 0.3 + lv : 0) : approach(splash, 0, dt, 0.18)
+      sink = reduced ? (f.mode === "hearing" ? 0.3 + steps / 3 : 0) : approach(sink, 0, dt, 0.5)
+      splash = reduced ? (f.mode === "speaking" ? 0.3 + steps / 3 : 0) : approach(splash, 0, dt, 0.18)
       const listenDot = mix.listening * 0.5
       const cDot = Math.max(sink, listenDot)
       if (cDot > 0.02) {
@@ -486,7 +492,7 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
 const character: Character = {
   id: "ripple-pond",
   name: "Ripple pond",
-  version: "1.1.0",
+  version: "1.1.1",
   contract: 1,
   family: "abstract",
   summary: "A round basin of water seen from above: rings converge on the centre while it listens and run out from a falling drop while it speaks.",
