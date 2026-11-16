@@ -195,8 +195,12 @@ interface Entry {
   inner?: Llm["Service"]
   readonly scope: Scope.Closeable
   readonly settled: Deferred.Deferred<void>
-  /** The wrapper every user gets: waits for the build, answers with the problem, counts streams in flight. */
+  /**
+   * The wrapper every user gets: waits for the build, answers with the problem, counts what runs on it (each turn,
+   * held from its start to its end by `holdDuring`, and each stream, the wait for the build included).
+   */
   readonly service: Llm["Service"]
+  /** Turns and streams running on this instance: it is not closed while any runs. */
   inFlight: number
   /** Released (scheduled, or done): no longer offered. */
   retiring: boolean
@@ -240,7 +244,7 @@ export const makeResourcePool = (options: ResourcePoolOptions): Effect.Effect<Re
       options.log?.(`Language model released: ${entry.key}`)
     }
 
-    /** Closes `entry` once it is retiring and no stream runs on it any more. */
+    /** Closes `entry` once it is retiring and no turn or stream runs on it any more. */
     const closeWhenIdle = (entry: Entry) => {
       if (entry.retiring && entry.inFlight === 0 && entry.releaseTimer === undefined) {
         close(entry)
@@ -251,6 +255,15 @@ export const makeResourcePool = (options: ResourcePoolOptions): Effect.Effect<Re
     const makeEntry = (spec: LlmSpec): Entry => {
       const scope = Effect.runSync(Scope.make())
       const settled = Deferred.makeUnsafe<void>()
+      /** `stream` counted from its start to its end (completion, failure, interruption). */
+      const holding = <A, E, R>(stream: Stream.Stream<A, E, R>): Stream.Stream<A, E, R> =>
+        Stream.suspend(() => {
+          entry.inFlight++
+          return stream.pipe(Stream.ensuring(Effect.sync(() => {
+            entry.inFlight--
+            closeWhenIdle(entry)
+          })))
+        })
       const entry: Entry = {
         spec,
         key: llmKeyOf(spec),
@@ -262,12 +275,15 @@ export const makeResourcePool = (options: ResourcePoolOptions): Effect.Effect<Re
         retiring: false,
         closed: false,
         service: Llm.of({
+          // A turn (the model agent's whole tool loop) holds its instance from its start to its end: one whose
+          // assistant is rebound or switched off meanwhile keeps it, past the grace period too, for every model round
+          // and the tools between them.
+          holdDuring: holding,
           // Counted from the start, the wait for the build included: a turn waiting for its instance keeps it alive when
           // the assistant is rebound or switched off meanwhile (it finishes with the instance it started with).
           stream: (request) =>
-            Stream.suspend(() => {
-              entry.inFlight++
-              return Stream.unwrap(Effect.map(Deferred.await(settled), () => {
+            holding(
+              Stream.unwrap(Effect.map(Deferred.await(settled), () => {
                 const inner = entry.inner
                 if (inner === undefined) {
                   return Stream.fail(new LlmError({ message: entry.problem ?? "The language model could not start." }))
@@ -278,10 +294,7 @@ export const makeResourcePool = (options: ResourcePoolOptions): Effect.Effect<Re
                 }
                 return Stream.suspend(() => inner.stream(request))
               }))
-            }).pipe(Stream.ensuring(Effect.sync(() => {
-              entry.inFlight--
-              closeWhenIdle(entry)
-            })))
+            )
         })
       }
       return entry
