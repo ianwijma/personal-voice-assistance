@@ -329,7 +329,11 @@ export interface ResourcePool {
    * failed one): wait for `ttsReady` before reading it. `undefined`: the assistant is not in use.
    */
   readonly ttsFor: (assistant: string) => Tts["Service"] | undefined
-  /** Completes once the voice `assistant` is bound to has been built (or has failed): its sample rate is known. */
+  /**
+   * Completes once the voice `assistant` is bound to at this call (the one `ttsFor` returns now) has been built (or
+   * has failed): its sample rate is known. The voice is resolved when this is called, not when the effect runs, so a
+   * rebinding in between neither skips that voice's build nor waits on another voice.
+   */
   readonly ttsReady: (assistant: string) => Effect.Effect<void>
   /** The key of the voice `assistant` uses now. */
   readonly ttsKeyFor: (assistant: string) => string | undefined
@@ -529,10 +533,11 @@ const makeKind = <Spec, Svc>(config: KindConfig<Spec, Svc>, hooks: PoolHooks) =>
     },
     serviceFor: (assistant: string): Svc | undefined => bound.get(assistant)?.service,
     keyFor: (assistant: string): string | undefined => bound.get(assistant)?.key,
-    settledFor: (assistant: string): Effect.Effect<void> => Effect.suspend(() => {
+    /** Resolved now (not when run): it waits for the instance bound at the call, the one `serviceFor` returns now. */
+    settledFor: (assistant: string): Effect.Effect<void> => {
       const entry = bound.get(assistant)
       return entry === undefined ? Effect.void : Deferred.await(entry.settled)
-    }),
+    },
     info: (): Array<ResourceInfo> =>
       [...alive].map((entry) => {
         const usedBy = usersOf(entry)

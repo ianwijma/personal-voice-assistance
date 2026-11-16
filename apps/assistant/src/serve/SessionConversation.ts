@@ -1,4 +1,5 @@
 import {
+  type Agent,
   type AgentTurnSetup,
   type AudioInput,
   AudioOutput,
@@ -20,7 +21,7 @@ import {
   withTraceVoice
 } from "@pva/core"
 import type { ConversationInfo } from "@pva/protocol"
-import { type Cause, Effect, Fiber, Queue, Stream } from "effect"
+import { Deferred, Effect, Fiber, Queue, Stream } from "effect"
 import type { BuiltEngines, Engine } from "./Engine.ts"
 
 /**
@@ -42,10 +43,10 @@ export interface SessionConversationOptions {
   /** The turn setup (system prompt and tools), read at the start of each turn. */
   readonly setup: Effect.Effect<TurnSetup>
   /**
-   * An agent conversation (a `claude-subscription` assistant), chosen again at every input that can start a turn
-   * (the conversation is swapped for one of the other kind, history kept, when this changes), its setup read at the
-   * start of each turn; `undefined`: the single-model conversation with `setup`, whose `TurnSetup.llm` (the resource
-   * pool's instance) answers the turn (default: `providers.llm`, tests).
+   * An agent conversation (a `claude-subscription` assistant), chosen at each run start, its setup read at the start
+   * of each turn; `undefined`: the single-model conversation with `setup`, whose `TurnSetup.llm` (the resource
+   * pool's instance) answers the turn (default: `providers.llm`, tests). Read again at `bindingChanged`: when the
+   * kind differs from the running conversation's, the run restarts with the other kind.
    */
   readonly agentSetup?: () => Effect.Effect<AgentTurnSetup> | undefined
   readonly onEvent: (event: ConversationEvent) => void
@@ -94,6 +95,13 @@ export interface SessionConversation {
   /** Start running on the engines (now and after every rebuild) until `end`. */
   readonly start: () => void
   /**
+   * The assistant's language model binding may have changed (the resource pool published one). When `agentSetup`
+   * now gives the other kind of conversation (agents or the single model), this conversation's loop restarts as on
+   * an engine rebuild: the turn in flight and the inputs not yet taken are dropped, the history, conversation id and
+   * idle clock are kept, and the agents the ended run used are told that the conversation ended for them.
+   */
+  readonly bindingChanged: () => void
+  /**
    * Stop for good (the session is discarded): detach from the engines, wait for the loop to end, and tell the agents
    * that this conversation ended (a Claude subscription session closes).
    */
@@ -108,12 +116,6 @@ const noTts = Tts.of({
   sampleRate: 22_050,
   synthesize: () => Stream.fail(new TtsError({ message: "No voice is set up for this assistant." }))
 })
-
-/** The inputs of one conversation of a run, and its agents (`undefined`: the single model). */
-interface Segment {
-  readonly inbox: Queue.Queue<ConversationInput, Cause.Done>
-  readonly agentSetup: Effect.Effect<AgentTurnSetup> | undefined
-}
 
 /** A control input with the Stop generation it was accepted in (`undefined`: a speech event). */
 interface Control {
@@ -143,6 +145,13 @@ export const makeSessionConversation = (options: SessionConversationOptions): Ef
     let ready = false
     let detach: Effect.Effect<void> | undefined
     let voice: VoiceRef | undefined
+    /**
+     * The agents the runs of this conversation used (recorded from each turn's setup). Their sessions of it end when a
+     * run without agents starts (the kind changed), when it is reset without a running loop, and at `end`.
+     */
+    const usedAgents = new Set<Agent>()
+    /** The running conversation's kind, and the signal that restarts the run with the other kind (`bindingChanged`). */
+    let restart: { readonly agents: boolean; readonly signal: Deferred.Deferred<void> } | undefined
 
     const onEvent = (event: ConversationEvent) => {
       if (event._tag === "ConversationStarted") {
@@ -152,13 +161,47 @@ export const makeSessionConversation = (options: SessionConversationOptions): Ef
       options.onEvent(event)
     }
 
-    const run = (built: BuiltEngines): Effect.Effect<void, unknown> =>
+    /** Tell the agents the runs used that conversation `conversationId` ended (and forget them). Never fails. */
+    const endUsedAgents = (conversationId: string): Effect.Effect<void> =>
+      Effect.suspend(() => {
+        const agents = [...usedAgents]
+        usedAgents.clear()
+        return Effect.forEach(
+          agents,
+          (agent) => Effect.catchCause(Effect.suspend(() => agent.endConversation?.(conversationId) ?? Effect.void), () => Effect.void),
+          { discard: true }
+        )
+      })
+
+    /** One conversation of the kind `agentSetup` gives, on `built`, until its inputs end or it is interrupted. */
+    const runConversation = (built: BuiltEngines, agentSetup: Effect.Effect<AgentTurnSetup> | undefined): Effect.Effect<void, unknown> =>
       Effect.gen(function*() {
         const providers = built.providers
         voice = providers.voice
         // Every turn names its own voice (`TurnSetup.tts`, the pool's instance for the assistant's voice); this one
         // is for a conversation whose setup names none (tests that inject one voice).
         const tts = providers.tts !== undefined && providers.voice !== undefined ? withTraceVoice(providers.tts, voiceKey(providers.voice)) : noTts
+        const common = {
+          onEvent,
+          initialHistory: history,
+          initialConversationId: conversationInfo.id,
+          ...(lastTurnAt !== undefined ? { initialLastTurnAt: lastTurnAt } : {}),
+          ...(options.idleResetMs !== undefined ? { idleResetMs: options.idleResetMs } : {}),
+          maxToolRounds: options.maxToolRounds?.() ?? providers.maxToolRounds,
+          bargeIn: true
+        }
+        const conversation = yield* (agentSetup !== undefined
+          ? makeAgentConversation({
+            ...common,
+            setup: Effect.tap(agentSetup, (s) =>
+              Effect.sync(() => {
+                for (const agent of s.agents.agents.values()) if (agent.endConversation !== undefined) usedAgents.add(agent)
+              }))
+          })
+          : makeConversationWithSetup({ ...common, setup: options.setup }).pipe(Effect.provideService(Llm, providers.llm ?? noLlm))
+        ).pipe(Effect.provideService(TurnTrace, options.turnTrace))
+        live = conversation
+        ready = true
 
         const speech: Stream.Stream<ConversationInput, unknown> = options.speech !== undefined
           ? options.speech(built)
@@ -182,72 +225,10 @@ export const makeSessionConversation = (options: SessionConversationOptions): Ef
           }),
           Stream.map((c) => c.input)
         )
-
-        // The kind of conversation (agents for a `claude-subscription` assistant, else the single model) is chosen
-        // again at every input that can start a turn outside an utterance (typed text, a canned line, the start of
-        // speech), so an account change takes effect at the next turn without a reload. On a change the conversation
-        // in use gets what that input would do to its turn (speech: barge-in; typed: Stop), ends once its last turn
-        // has played, and one of the other kind continues with its history, conversation id and idle clock.
-        const segments = yield* Queue.unbounded<Segment, Cause.Done>()
-        const open = (agentSetup: Effect.Effect<AgentTurnSetup> | undefined) =>
-          Effect.gen(function*() {
-            const inbox = yield* Queue.unbounded<ConversationInput, Cause.Done>()
-            yield* Queue.offer(segments, { inbox, agentSetup })
-            return inbox
-          })
-        let agentSetup = options.agentSetup?.()
-        let inbox = yield* open(agentSetup)
-        let utteranceOpen = false
-        const driver = yield* Stream.runForEach(events, (input) =>
-          Effect.gen(function*() {
-            const startsTurn = input._tag === "TextInput" || input._tag === "Say" || (input._tag === "SpeechStarted" && !utteranceOpen)
-            if (input._tag === "SpeechStarted") utteranceOpen = true
-            else if (input._tag === "EndOfTurn") utteranceOpen = false
-            if (startsTurn) {
-              const next = options.agentSetup?.()
-              if ((next === undefined) !== (agentSetup === undefined)) {
-                const handover: ConversationInput = input._tag === "SpeechStarted" ? input : { _tag: "Interrupt" }
-                yield* Queue.offer(inbox, handover)
-                yield* Queue.end(inbox)
-                agentSetup = next
-                inbox = yield* open(next)
-              }
-            }
-            yield* Queue.offer(inbox, input)
-          })).pipe(
-            Effect.ensuring(Effect.suspend(() => Effect.andThen(Queue.end(inbox), Queue.end(segments)))),
-            Effect.forkChild
-          )
-
-        yield* Stream.runForEach(Stream.fromQueue(segments), (segment) =>
-          Effect.gen(function*() {
-            const previous = live
-            if (previous !== undefined) {
-              history = yield* previous.history
-              lastTurnAt = yield* previous.lastTurnAt
-            }
-            const common = {
-              onEvent,
-              initialHistory: history,
-              initialConversationId: conversationInfo.id,
-              ...(lastTurnAt !== undefined ? { initialLastTurnAt: lastTurnAt } : {}),
-              ...(options.idleResetMs !== undefined ? { idleResetMs: options.idleResetMs } : {}),
-              maxToolRounds: options.maxToolRounds?.() ?? providers.maxToolRounds,
-              bargeIn: true
-            }
-            const conversation = yield* (segment.agentSetup !== undefined
-              ? makeAgentConversation({ ...common, setup: segment.agentSetup })
-              : makeConversationWithSetup({ ...common, setup: options.setup }).pipe(Effect.provideService(Llm, providers.llm ?? noLlm))
-            ).pipe(Effect.provideService(TurnTrace, options.turnTrace))
-            live = conversation
-            ready = true
-            yield* conversation.voice(Stream.fromQueue(segment.inbox)).pipe(
-              Effect.provideService(Tts, tts),
-              Effect.provideService(AudioOutput, options.output)
-            )
-          }))
-        // The inputs ended: a failure of the speech stream is the loop's failure.
-        yield* Fiber.join(driver)
+        yield* conversation.voice(events).pipe(
+          Effect.provideService(Tts, tts),
+          Effect.provideService(AudioOutput, options.output)
+        )
       }).pipe(
         // However the loop ends (reload, failure, discard): keep what the next build starts from.
         // Inputs accepted for this run and not taken are dropped (as the engines stopping drops a turn).
@@ -267,19 +248,30 @@ export const makeSessionConversation = (options: SessionConversationOptions): Ef
         }))
       )
 
-    /** Tell the agents of the running build that this conversation ended. Never fails. */
-    const endAgents = (conversationId: string): Effect.Effect<void> =>
-      Effect.suspend(() => {
-        const setup = options.agentSetup?.()
-        if (setup === undefined) return Effect.void
-        return setup.pipe(
-          Effect.flatMap((s) => {
-            const ends = [...s.agents.agents.values()].flatMap((a) => (a.endConversation !== undefined ? [a.endConversation] : []))
-            return Effect.forEach(ends, (end) => Effect.catchCause(Effect.suspend(() => end(conversationId)), () => Effect.void), { discard: true })
-          }),
-          Effect.catchCause(() => Effect.void)
-        )
-      })
+    /**
+     * The session's loop on one build: one conversation at a time. A change of kind (`bindingChanged`) ends the
+     * running one as an engine rebuild does (`runConversation` keeps what the next one starts from) and starts one of
+     * the other kind on the same build; other sessions and the engines are not touched.
+     */
+    const run = (built: BuiltEngines): Effect.Effect<void, unknown> =>
+      Effect.gen(function*() {
+        while (true) {
+          const agentSetup = options.agentSetup?.()
+          // The agents an earlier run used, which this one does not: their session of this conversation ends.
+          if (agentSetup === undefined) yield* endUsedAgents(conversationInfo.id)
+          const signal = yield* Deferred.make<void>()
+          restart = { agents: agentSetup !== undefined, signal }
+          const fiber = yield* Effect.forkChild(runConversation(built, agentSetup))
+          const changed = yield* Effect.raceFirst(Effect.as(Fiber.join(fiber), false), Effect.as(Deferred.await(signal), true)).pipe(
+            Effect.onInterrupt(() => Fiber.interrupt(fiber))
+          )
+          if (!changed) return
+          // Waits for the conversation's own ending (its history kept) before the next one starts from it.
+          yield* Fiber.interrupt(fiber)
+        }
+      }).pipe(Effect.ensuring(Effect.sync(() => {
+        restart = undefined
+      })))
 
     const loop = { run }
 
@@ -306,23 +298,31 @@ export const makeSessionConversation = (options: SessionConversationOptions): Ef
       lastTurnAt: () => (live === undefined ? lastTurnAt : Effect.runSync(live.lastTurnAt)),
       newConversation: Effect.suspend(() => {
         if (live !== undefined) return Effect.map(live.newConversation("new"), () => conversationInfo)
-        return Effect.sync(() => {
-          history = []
-          lastTurnAt = undefined
-          conversationInfo = { id: globalThis.crypto.randomUUID(), startedAt: Date.now() }
-          options.onConversation?.(conversationInfo, "new")
-          return conversationInfo
-        })
+        // No loop to tell them: the agents its runs used end the old conversation here.
+        return Effect.andThen(
+          endUsedAgents(conversationInfo.id),
+          Effect.sync(() => {
+            history = []
+            lastTurnAt = undefined
+            conversationInfo = { id: globalThis.crypto.randomUUID(), startedAt: Date.now() }
+            options.onConversation?.(conversationInfo, "new")
+            return conversationInfo
+          })
+        )
       }),
       voice: () => voice,
       start: () => {
         detach ??= options.engine.attach(loop)
       },
+      bindingChanged: () => {
+        const r = restart
+        if (r !== undefined && (options.agentSetup?.() !== undefined) !== r.agents) Deferred.doneUnsafe(r.signal, Effect.void)
+      },
       end: Effect.suspend(() => {
         const d = detach
         detach = undefined
         const id = conversationInfo.id
-        return Effect.andThen(d ?? Effect.void, endAgents(id))
+        return Effect.andThen(d ?? Effect.void, endUsedAgents(id))
       })
     } satisfies SessionConversation
   })

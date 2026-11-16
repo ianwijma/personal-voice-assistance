@@ -311,7 +311,7 @@ export type TypedTarget = { readonly assistant: string } | { readonly dropped: "
  * Typed text (§2.6): the named assistant (the voice page names the conversation shown), else the one holding a
  * follow-up window, else the `withoutPhrase` assistant, else the TypeSafe fallback, else the first in the list.
  * Never asks TypeSafe. A switched-off target (or an unknown one) drops the text, as for speech.
- * `named` that does not exist is ignored.
+ * `named` that does not exist, or is not assigned to this device, is ignored.
  */
 export const typedTextTarget = (
   settings: Pick<DeviceSettings, "assistants" | "withoutPhrase">,
@@ -319,7 +319,9 @@ export const typedTextTarget = (
   input: { readonly named?: string | undefined; readonly followUpHolder?: string | undefined } = {}
 ): TypedTarget => {
   const wp = settings.withoutPhrase
-  const chosen = (input.named !== undefined && assistants.has(input.named) ? input.named : undefined) ??
+  const named = input.named
+  const assigned = named !== undefined && assistants.has(named) && settings.assistants.some((a) => a.assistant === named)
+  const chosen = (assigned ? named : undefined) ??
     input.followUpHolder ??
     (wp.mode === "assistant" ? wp.assistant : undefined) ??
     (wp.mode === "typesafe" && wp.fallback !== null ? wp.fallback : undefined) ??
