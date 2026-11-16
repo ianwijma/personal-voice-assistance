@@ -2573,11 +2573,6 @@ const http = createServer((req, res) => {
           phrase: typeof payload.phrase === "string" ? payload.phrase : undefined
         })
         return json(res, 200, { ok: true })
-      case "/mock/typesafe":
-        // "Whichever fits" is set up (or not): the menu offers it.
-        voice.setCanAuto(payload.on !== false)
-        pushSetups()
-        return json(res, 200, { ok: true })
       case "/mock/device": {
         // A device's (without `deviceId`: the web-voice type's) settings, saved as admin would (tests): the setups follow.
         const r = voice.saveSettings(typeof payload.deviceId === "string" ? payload.deviceId : undefined, (payload.settings ?? {}) as Parameters<typeof voice.saveSettings>[1])
@@ -2647,6 +2642,9 @@ const http = createServer((req, res) => {
         }
         modules = [...modules.filter((m) => m.id !== "typesafe"), next]
         broadcast({ type: "module.changed", module: next })
+        // The voice page's menu offers "Whichever fits" when it is set up.
+        voice.setCanAuto(on)
+        pushSetups()
         return json(res, 200, { ok: true })
       }
       case "/mock/assistant": {

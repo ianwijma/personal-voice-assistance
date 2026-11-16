@@ -144,8 +144,8 @@ test.describe("phone", () => {
     await page.getByTestId("chat-toggle").click()
     await expect(page.getByTestId("conversation-divider")).toHaveText("New conversation")
     await expect(page.getByTestId("turn")).toHaveCount(0)
-    // The header button is there too, as an icon with its label at this width.
-    await expect(page.getByTestId("new-conversation")).toContainText("New conversation")
+    // The header button is there too, as an icon whose name says which assistant's conversation it starts.
+    await expect(page.getByTestId("new-conversation")).toHaveAccessibleName("New conversation with Jeff (T3 keeps its own)")
     expect(await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)).toBe(0)
   })
 

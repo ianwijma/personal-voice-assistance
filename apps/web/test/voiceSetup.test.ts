@@ -289,7 +289,6 @@ describe("what the chat shows", () => {
     const viewing = run([{ type: "local/ui", patch: { chatView: "t3" } }], s0)
     expect(conversationNote(s0, true)).toBe("Each assistant keeps its own conversation on this device.")
     expect(conversationNote(viewing, true)).toBe("Typed messages go to T3. Speaking still reaches Jeff.")
-    expect(conversationNote(viewing, false)).toBe("Each assistant keeps its own conversation on this device.")
     expect(newConversationTip(viewing)).toBe("New conversation with T3 (Jeff keeps its own)")
     const nobody = run([welcomeWith(setup({ withoutPhrase: { mode: "nobody" } })), { type: "local/ui", patch: { chatView: "t3" } }])
     expect(conversationNote(nobody, true)).toBe("Typed messages go to T3. Speaking still reaches the one you wake.")

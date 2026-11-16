@@ -64,11 +64,10 @@ function Editor({ info }: { readonly info: AssistantInfo }) {
     elsewhere.length > 0 ? `Not saved: ${listJoin(elsewhere)} ${elsewhere.length === 1 ? "has" : "have"} a field to correct.` : undefined,
     Object.keys(draft.localErrors).length > 0 ? "Correct the field marked above first." : undefined
   ].filter((m): m is string => m !== undefined).join(" ") || undefined
-  const hearingChanged = draft.tabChanged("hearing")
   const note = draft.saving ? "Saving…" : draft.justSaved
     ? "Saved. Applies from the next turn."
     : draft.dirty
-    ? hearingChanged ? "Unsaved changes. Hearing settings are used from the next start." : "Unsaved changes"
+    ? "Unsaved changes"
     : ""
   const names = hearingModelNames(sections)
   const parts = summaryParts(draft.saved, Object.values(modules.byId), names, voiceName(draft.saved.voice))

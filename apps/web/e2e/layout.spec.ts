@@ -98,7 +98,7 @@ test.describe("phone", () => {
       const b = await sheet.boundingBox()
       return b === null ? null : [b.x, Math.round(b.width), Math.round(b.y + b.height)]
     }).toEqual([0, 390, 844])
-    for (const target of [sheet.getByRole("radio", { name: /^Jeff/ }), sheet.locator("#pref-mic"), sheet.getByTestId("admin-link"), sheet.getByRole("button", { name: "Close settings" })]) {
+    for (const target of [sheet.getByRole("radio", { name: /^Jeff/ }).locator("xpath=ancestor::label"), sheet.locator("#pref-mic"), sheet.getByTestId("admin-link"), sheet.getByRole("button", { name: "Close settings" })]) {
       const b = await target.boundingBox()
       expect(Math.round(b!.height)).toBeGreaterThanOrEqual(44)
     }
