@@ -1,4 +1,4 @@
-# pitch-ink 1.0.0: frame digests of a scripted conversation at default settings (docs/CHARACTERS.md §6.6).
+# pitch-ink 1.1.0: frame digests of a scripted conversation at default settings (docs/CHARACTERS.md §6.6).
 # A change here must be deliberate: check the look, then update with `pnpm --filter @pva/web exec vitest run test/characters -u`.
 dark  0.5 idle         57 a7bf887d
 dark  1.0 listening    57 40c4d8f6
@@ -47,3 +47,26 @@ light 11.0 idle        606 58957c96
 overflow 160×140×1 11.0 px
 overflow 900×420×1 11.0 px
 overflow 720×240×2 11.0 px
+stage  0.5 idle         57 a862bb97
+stage  1.0 listening    57 3fc60fb0
+stage  1.5 listening    67 6621694e
+stage  2.0 hearing      69 4307b95d
+stage  2.5 hearing     105 f716cd19
+stage  3.0 hearing     163 ff074771
+stage  3.5 hearing     247 32780896
+stage  4.0 hearing     281 ff61a312
+stage  4.5 hearing     341 374729cf
+stage  5.0 thinking    371 d4b30055
+stage  5.5 thinking    383 b13cdf0f
+stage  6.0 thinking    393 02b3dbf7
+stage  6.5 speaking    397 f7fc8288
+stage  7.0 speaking    425 c8b4ec8c
+stage  7.5 speaking    455 19214211
+stage  8.0 speaking    529 807f1db5
+stage  8.5 speaking    575 19feb716
+stage  9.0 speaking    607 02917e54
+stage  9.5 listening   621 4c9f65f8
+stage 10.0 listening   627 e3b563af
+stage 10.5 idle        627 7b74b052
+stage 11.0 idle        614 84986237
+stage 1280×800×1 focus 720×240 at 280,200: solid drawing x 254.8..978.4, y 232.2..410.0

@@ -29,9 +29,11 @@ const NIB_Y = [1, Math.cos(0.61), 1]
 
 const create = (canvas: HTMLCanvasElement): CharacterInstance => {
   let g = setup2d(canvas)
-  let W = 1
+  let W = 1 // the focus (the box) while drawing
   let H = 1
+  let CH = 1 // the whole canvas's height, from resize
   let dpr = 1
+  let reachF = 0 // how far past the stave's ends the pen may swing, as a fraction of H (0 when the box is the whole canvas)
 
   const cPos = new Float64Array(COLS) // paper position of the column (px)
   const cOwn = new Uint8Array(COLS)
@@ -81,10 +83,14 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
   const BOT0 = 0.55
   const BOT1 = 0.92
   const laneY = (side: number, pitch: number): number => {
-    const u = remap(pitch, 0.1, 0.92, 0, 1)
+    const raw = (pitch - 0.1) / 0.82
+    const u = raw < 0 ? 0 : raw > 1 ? 1 : raw
     const top = lerp(TOP0, BOT0, side)
     const bot = lerp(TOP1, BOT1, side)
-    return bot - u * (bot - top)
+    // On the stage a pitch beyond the stave's ends (a wide melody zoom) swings on past them, softly saturating.
+    const over = raw < 0 ? raw : raw > 1 ? raw - 1 : 0
+    const extra = over === 0 ? 0 : Math.sign(over) * (1 - Math.exp(-2.5 * Math.abs(over))) * reachF
+    return bot - u * (bot - top) - extra
   }
   /**
    * Where a height written in the two-stave layout shows now: with "One shared stave" both
@@ -115,14 +121,10 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
   }
 
   return {
-    resize(width_, height, ratio) {
-      W = width_
-      H = height
+    resize(_width, height, ratio) {
+      CH = height
       dpr = ratio
       g = setup2d(canvas, dpr)
-      if (!started) penX = W * 0.8
-      const sc = Math.max(0.42, Math.min(1.4, H / 420))
-      dash = [2 * sc, 4 * sc]
     },
 
     frame(f: Frame) {
@@ -131,8 +133,20 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
       const reduced = f.reducedMotion
       mix.step(f)
       modeTone(tone, mix, p)
-      clear2d(g, dpr)
+      // The whole canvas is cleared and (0, 0) is the box's corner: the drawing below is in box coordinates.
+      const fo = f.focus
+      clear2d(g, dpr, fo)
+      W = fo.width
+      H = fo.height
+      if (!started) penX = W * 0.8
       started = true
+      {
+        const sc = Math.max(0.42, Math.min(1.4, H / 420))
+        if (dash[0] !== 2 * sc) dash = [2 * sc, 4 * sc]
+      }
+      // Room beyond the box (above and below) the pen may swing into.
+      const room = Math.min(fo.y, CH - fo.y - fo.height) - 12
+      reachF = room > 0 ? Math.min(room, Math.max(0.25 * H, 48)) / H : 0
 
       // Options.
       const opts = f.options
@@ -269,13 +283,21 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
       const fadeL = W * 0.02
       const xOf = (j: number) => penX - (now - cPos[j]!)
       const idleDim = 1 - mix.idle * 0.45
+      const lead = fo.x > 0 ? Math.min(fadeL, fo.x) : 0
+      const cutX = -lead - 10
 
       for (let pass = 0; pass < 2; pass++) {
         const owner = pass === 0 ? YOU : AGENT
         const baseC = owner === YOU ? p.you : p.voice
         liftInto(cA, baseC, p.dark ? 0.12 : 0.1, p)
-        const grad = g.createLinearGradient(fadeL, 0, penX, 0)
-        grad.addColorStop(0, css(cA, 0.18 * idleDim))
+        // Past the box's left edge the ink fades out over the same distance, so it never ends in a visible cut.
+        const grad = g.createLinearGradient(lead > 0 ? -lead : fadeL, 0, penX, 0)
+        if (lead > 0) {
+          const span = penX + lead
+          grad.addColorStop(0, css(cA, 0))
+          grad.addColorStop(lead / span, css(cA, 0.18 * idleDim))
+          grad.addColorStop(Math.min(1, (lead + fadeL) / span), css(cA, 0.18 * idleDim))
+        } else grad.addColorStop(0, css(cA, 0.18 * idleDim))
         grad.addColorStop(1, css(cA, idleDim))
         g.fillStyle = grad
         // Walk the visible columns oldest to newest, filling each contiguous inked run as a ribbon.
@@ -283,7 +305,7 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
         let runLen = 0
         for (let k = count - 1; k >= -1; k--) {
           const j = k >= 0 ? (head - 1 - k + COLS * 2) % COLS : -1
-          const inked = j >= 0 && cOwn[j] === owner && cW[j]! > 0.05 && xOf(j) > -10
+          const inked = j >= 0 && cOwn[j] === owner && cW[j]! > 0.05 && xOf(j) > cutX
           if (inked) {
             if (runStart < 0) {
               runStart = j
@@ -337,7 +359,7 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
             const j = (head - 1 - k + COLS * 2) % COLS
             if (cOwn[j] !== owner) continue
             const x = xOf(j)
-            if (x < -10) break
+            if (x < cutX) break
             const id = Math.floor(cPos[j]! / STEP)
             const yj = yOf(j)
             if (part === 0) {
@@ -381,7 +403,7 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
         const o = cOwn[j]!
         if (o !== THINK && o !== WAIT) continue
         const x = xOf(j)
-        if (x < -10) break
+        if (x < cutX) break
         const r = Math.max(1, (o === THINK ? 1.5 : 0.9) * scale)
         const yj = yOf(j)
         g.moveTo(x + r, yj)
@@ -430,21 +452,23 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
 
       // ---- Hover: a hairline and the pitch under the pointer.
       const pt = f.pointer
-      if (pt.inside && pt.x < penX) {
+      const ptx = pt.x - fo.x
+      const pty = pt.y - fo.y
+      if (pt.inside && ptx >= 0 && ptx < W && pty >= 0 && pty < H && ptx < penX) {
         g.strokeStyle = css(p.inkFaint, 0.6)
         g.lineWidth = 1
         g.beginPath()
-        g.moveTo(pt.x, H * 0.04)
-        g.lineTo(pt.x, H * 0.96)
+        g.moveTo(ptx, H * 0.04)
+        g.lineTo(ptx, H * 0.96)
         g.stroke()
-        const back = Math.round((penX - pt.x) / STEP)
+        const back = Math.round((penX - ptx) / STEP)
         if (back >= 0 && back < count) {
           const j = (head - 1 - back + COLS * 2) % COLS
           const hz = cHz[j]!
           if (hz > 0 && (cOwn[j] === YOU || cOwn[j] === AGENT)) {
             g.font = `${Math.round(11 * clamp(scale, 0.8, 1.2))}px ui-monospace, monospace`
             g.fillStyle = css(cOwn[j] === YOU ? p.you : p.voice, 1)
-            g.fillText(`${Math.round(hz)} Hz`, pt.x + 6, yOf(j) - 10)
+            g.fillText(`${Math.round(hz)} Hz`, ptx + 6, yOf(j) - 10)
           }
         }
       }
@@ -457,7 +481,7 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
 const character: Character = {
   id: "pitch-ink",
   name: "Pitch ink",
-  version: "1.0.0",
+  version: "1.1.0",
   contract: 1,
   family: "abstract",
   summary: "A seismograph pen writes the melody of each voice on moving paper: you in the upper stave, the assistant in the lower; height is pitch, thickness is loudness.",
@@ -483,6 +507,7 @@ const character: Character = {
     { signal: "reducedMotion", effect: "Holds the pose: the paper never scrolls and the pen stays put. The trace advances in steps only when the voice changes (loudness in thirds, pitch in eighths); listening and thinking show their dotted line at once; halos stand still." }
   ],
   renderer: "2d",
+  canvas: "stage",
   options: [
     { id: "thickness", kind: "number", label: "Ink thickness", min: 0.4, max: 2.5, step: 0.1, default: 1, unit: "×", group: "Shape", help: "How thick the ink is at every loudness." },
     { id: "zoom", kind: "number", label: "Melody zoom", min: 0.5, max: 3, step: 0.1, default: 1, unit: "×", group: "Reaction", help: "Stretches the pitch scale around each voice's usual pitch, so small rises and falls show bigger." },
