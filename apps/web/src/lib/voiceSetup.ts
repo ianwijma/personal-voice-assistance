@@ -278,14 +278,15 @@ export const onHistory = (
   toTurns: (history: ReadonlyArray<HistoryItem>) => ReadonlyArray<TurnView>
 ): ClientState => {
   const key = m.assistantId
-  // A turn that is running on this page is the page's own view of the history's last message (a user message the server
-  // has noted but not answered yet): the turn stays, the message goes, so the exchange is not shown twice.
-  // Every other running turn stays too: the server commits an exchange when its turn ends, and equal text does not
-  // say that an exchange of the history is this turn (the same question may have been asked before).
+  // Turns are told apart by id, never by their text (the same question may be asked twice, and a stopped turn is
+  // committed without a reply). The server names the turn whose exchange ends the history (`lastTurnId`): a turn
+  // running on this page with that id is the page's live view of that exchange, so the exchange goes and the turn
+  // stays. Every other running turn is not in the history yet (an exchange is committed when its turn ends): it stays.
   const mine = (t: TurnView) => (t.assistantId ?? answeringId(s) ?? "") === key && t.turnId !== undefined && t.outcome === undefined
-  const last = m.history.at(-1)
-  const open = last !== undefined && last.role === "user" ? s.turns.find((t) => mine(t) && t.userText === last.text) : undefined
-  const items = open === undefined ? m.history : m.history.slice(0, -1)
+  const live = m.lastTurnId === undefined ? undefined : s.turns.find((t) => mine(t) && t.turnId === m.lastTurnId)
+  // That exchange starts at the history's last user message (each committed turn begins with its one user message).
+  const from = live === undefined ? -1 : m.history.findLastIndex((h) => h.role === "user")
+  const items = from < 0 ? m.history : m.history.slice(0, from)
   const fromHistory = toTurns(items).map((t) => ({ ...t, key: `${key}:${t.key}`, assistantId: key }))
   const running = s.turns.filter(mine)
   const others = withoutAssistant(s, key)
