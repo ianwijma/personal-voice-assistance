@@ -33,8 +33,7 @@ import {
   Social,
   sized,
   sizeOption,
-  SoftSpot,
-  youDirection
+  SoftSpot
 } from "../shared/figure.ts"
 
 const N = 48
@@ -105,14 +104,15 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
   const side = rand() < 0.5 ? -1 : 1
 
   return {
-    resize(width, height, ratio) {
-      W = width
-      H = height
+    resize(_width, _height, ratio) {
       dpr = ratio
       g = setup2d(canvas, dpr)
     },
 
     frame(f: Frame) {
+      const fo = f.focus
+      W = fo.width
+      H = fo.height
       const dt = f.dt
       const P = f.palette
       const reduced = f.reducedMotion
@@ -140,7 +140,17 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
       const ground = H / 2 + (0.95 + (shapeB - 0.72)) * s
 
       // Gaze.
-      youDirection(f, cx, H / 2, s * 2.2, you, pers.followsPointer)
+      // The pointer is in canvas coordinates; the figure reacts to it only over its box, as before.
+      const ptrX = f.pointer.x - fo.x
+      const ptrY = f.pointer.y - fo.y
+      const hover = f.pointer.inside && ptrX >= 0 && ptrX < W && ptrY >= 0 && ptrY < H
+      if (hover && pers.followsPointer) {
+        you.x = Math.max(-1, Math.min(1, (ptrX - cx) / (s * 2.2)))
+        you.y = Math.max(-1, Math.min(1, (ptrY - H / 2) / (s * 2.2)))
+      } else {
+        you.x = 0
+        you.y = 0.05
+      }
       let gx = you.x
       let gy = you.y
       let spread = 0.08
@@ -182,7 +192,7 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
       const sizeT = mix.pick(PUFF) * (1 + 0.1 * leanIn - 0.1 * back + speakW * (0.1 * S.size - 0.03 + 0.15 * (S.talkSlow - 0.3)))
       size = reduced ? sizeT : approach(size, sizeT, dt, 0.18)
       // Lean toward the pointer (if any) or toward you in front: whisper leans further.
-      const leanT = (f.pointer.inside ? you.x * 0.35 : 0) + thinkW * (reduced ? 0.12 * S.thinkSide : 0.16 * Math.sin(f.t * 0.8)) - (mix.idle > 0.5 ? 0.08 * side : 0)
+      const leanT = (hover ? you.x * 0.35 : 0) + thinkW * (reduced ? 0.12 * S.thinkSide : 0.16 * Math.sin(f.t * 0.8)) - (mix.idle > 0.5 ? 0.08 * side : 0)
       const ln = reduced ? leanT : lean.step(leanT, dt)
       const tiltT = hearW * 0.22 * S.question * (you.x < -0.1 ? -1 : 1) + mix.idle * 0.06 * side + thinkW * 0.05 * S.thinkSide
       const tl = reduced ? tiltT : tilt.step(tiltT, dt)
@@ -213,7 +223,7 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
       const toVoice = speakW + thinkW
       mixInto(accRgb, P.you, P.voice, toVoice / Math.max(1e-3, toVoice + hearW + mix.listening))
 
-      clear2d(g, dpr)
+      clear2d(g, dpr, fo)
       // Ground shadow: shrinks as it hops.
       g.fillStyle = ink.css(P.dark ? [0, 0, 0] : P.ink, (P.dark ? 0.35 : 0.1) * (1 - hop * 3))
       g.beginPath()
@@ -348,7 +358,7 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
 const character: Character = {
   id: "blob-buddy",
   name: "Blob buddy",
-  version: "1.0.0",
+  version: "1.1.0",
   contract: 1,
   family: "figure",
   summary: "A soft gumdrop creature with one antenna curl, animated with squash and stretch: it leans in to listen, shrinks from a shout, sways to think and hops on its syllables.",
@@ -388,6 +398,7 @@ const character: Character = {
     { ext: "reply.expression", gain: "A sentiment cue picks a body pose: a bigger, bouncier hop for good news, a smaller one for an apology.", without: "One neutral speaking pose." }
   ],
   renderer: "2d",
+  canvas: "stage",
   options: [
     sizeOption(0.5, 1),
     {

@@ -1,4 +1,4 @@
-# blob-buddy 1.0.0: frame digests of a scripted conversation at default settings (docs/CHARACTERS.md §6.6).
+# blob-buddy 1.1.0: frame digests of a scripted conversation at default settings (docs/CHARACTERS.md §6.6).
 # A change here must be deliberate: check the look, then update with `pnpm --filter @pva/web exec vitest run test/characters -u`.
 dark  0.5 idle        101 27412986
 dark  1.0 listening   110 77ece089
@@ -47,3 +47,26 @@ light 11.0 idle        110 c5c77d44
 overflow 160×140×1 0.0 px
 overflow 900×420×1 0.0 px
 overflow 720×240×2 0.0 px
+stage  0.5 idle        101 a4c22e06
+stage  1.0 listening   110 505bb109
+stage  1.5 listening   107 d7a8db73
+stage  2.0 hearing     107 6de6f3a1
+stage  2.5 hearing     107 06579562
+stage  3.0 hearing     107 ef312425
+stage  3.5 hearing     107 6b6c8583
+stage  4.0 hearing     107 08107da4
+stage  4.5 hearing     107 9e4790a4
+stage  5.0 thinking    108 f678d9c2
+stage  5.5 thinking    135 ac8ef53a
+stage  6.0 thinking    135 0c57c5be
+stage  6.5 speaking    134 3ac418d2
+stage  7.0 speaking    134 eb170fd9
+stage  7.5 speaking    134 d1c99cfb
+stage  8.0 speaking    134 e6a87012
+stage  8.5 speaking    134 4bd68d00
+stage  9.0 speaking    134 42fbc841
+stage  9.5 listening   135 bdb50837
+stage 10.0 listening   108 698614d1
+stage 10.5 idle        107 0d5ec570
+stage 11.0 idle        109 4a9f1f0a
+stage 1280×800×1 focus 720×240 at 280,200: solid drawing x 549.7..732.2, y 210.1..415.8
