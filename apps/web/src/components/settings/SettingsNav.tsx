@@ -155,7 +155,7 @@ export function SettingsNavList({ tree, group, page, badges, go }: {
             {open && listed.length > 1 && (
               <div className="mb-1 flex flex-col gap-0.5">
                 {inUse.map((p) => (
-                  <Row key={p.id} current={p.id === page?.id} level={1} onClick={() => go([g.slug, p.id])} testId={`nav-${g.slug}-${p.id}`}>
+                  <Row key={p.id} current={p.id === page?.id || p.id === page?.under} level={1} onClick={() => go([g.slug, p.id])} testId={`nav-${g.slug}-${p.id}`}>
                     <span className="truncate">{p.title}</span>
                     <Marks {...pageMarks(p, badges)} />
                   </Row>

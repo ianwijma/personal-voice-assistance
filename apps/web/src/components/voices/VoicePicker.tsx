@@ -3,6 +3,7 @@ import { type CSSProperties, type KeyboardEvent, type ReactNode, useEffect, useI
 import { createPortal } from "react-dom"
 import type { JobInfo, ProviderInfo, ProviderVoices, VoiceEntry, VoiceRefJson } from "@pva/protocol"
 import { MAX_PREVIEW_CHARS } from "@pva/protocol"
+import { currentSettingsPath } from "@/lib/settingsTree.ts"
 import { shallowEqual } from "@/lib/store.ts"
 import { jobOf } from "@/lib/voiceCatalog.ts"
 import {
@@ -449,7 +450,7 @@ function SettingsLink({ provider, onOpen, children }: { readonly provider: Provi
       className="mt-2 inline-flex min-h-8 items-center gap-1 text-voice underline-offset-4 hover:underline max-sm:min-h-11"
       onClick={() => {
         onOpen()
-        client.settings(provider.settingsPath.split("/").filter((p) => p !== ""))
+        client.settings(currentSettingsPath(provider.settingsPath.split("/").filter((p) => p !== "")))
       }}
     >
       {children} <Icon name="arrowRight" size={14} />

@@ -15,14 +15,14 @@ test.beforeEach(async () => {
 })
 
 test("a module that fails to start shows its error, and Retry after fixing the token starts it", async ({ page, baseURL }) => {
-  await openPage(page, baseURL, "modules/home-assistant")
+  await openPage(page, baseURL, "shared/modules")
   const card = page.getByTestId("module-home-assistant")
   await card.getByRole("switch").click()
   await expect(card).toHaveAttribute("data-state", "starting")
   await expect(card).toHaveAttribute("data-state", "error")
   await expect(card.getByRole("alert")).toContainText("rejected the token (HTTP 401)")
   await expect(page.getByRole("alert").filter({ hasText: "Home Assistant: Home Assistant rejected" })).toBeVisible() // toast
-  await expect(page.getByTestId("nav-modules-home-assistant").locator("[data-mark=error]")).toBeVisible()
+  await expect(page.getByTestId("nav-shared-modules").locator("[data-mark=error]")).toBeVisible()
   // Every field type renders from the server's description.
   const form = page.getByTestId("form-m-home-assistant")
   await expect(form.locator("[data-field-type=text]")).toBeVisible()
@@ -41,7 +41,7 @@ test("a module that fails to start shows its error, and Retry after fixing the t
 })
 
 test("validation errors from the server appear under their field; a valid value saves", async ({ page, baseURL }) => {
-  await openPage(page, baseURL, "modules/weather")
+  await openPage(page, baseURL, "shared/modules")
   const form = page.getByTestId("form-m-weather")
   const place = form.getByLabel("Home location")
   await place.fill("Atlantis")
@@ -63,50 +63,46 @@ test("validation errors from the server appear under their field; a valid value 
 })
 
 test("enabling and disabling a module; a choice with more than four options is a select; locked fields are read-only", async ({ page, baseURL }) => {
-  await openPage(page, baseURL, "modules/notes")
+  await openPage(page, baseURL, "shared/modules")
   const notes = page.getByTestId("module-notes")
   await notes.getByRole("switch").click()
   await expect(notes).toHaveAttribute("data-state", "running")
   await expect(notes).toContainText("12 notes in Inbox")
   const settings = page.getByTestId("settings")
-  await expect(settings.locator("select")).toHaveValue("inbox")
+  await expect(page.getByTestId("form-m-notes").locator("select")).toHaveValue("inbox")
   await expect(settings.getByText("Everything lands here first.")).toBeVisible()
   await expect(settings.getByText("READ-ONLY", { exact: false }).first()).toBeVisible()
   await notes.getByRole("switch").first().click()
   await expect(notes).toHaveAttribute("data-state", "disabled")
-  await page.getByTestId("nav-modules-clock").click()
   const clock = page.getByTestId("form-m-clock")
   await expect(clock.locator("[data-field=timeZone]")).toContainText("Set by CLOCK_TIME_ZONE in the environment")
   await expect(clock.locator("[data-field=timeZone] input")).toHaveCount(0)
 })
 
-test("assistant settings: a reload field marks a reload pending (named in the global bar); Reload now applies it", async ({ page, baseURL }) => {
+test("a shared setting that needs a reload marks one pending (named in the global bar); Reload now applies it", async ({ page, baseURL }) => {
   await openPage(page, baseURL, "overview/overview")
-  await expect(page.getByText("claude-haiku-5-5").first()).toBeVisible() // engines list
-  await page.getByTestId("nav-speech").click()
-  await page.getByTestId("nav-speech-turn-timing").click()
-  const form = page.getByTestId("form-s-stt-timing")
-  await form.getByLabel("End of turn after").fill("700")
+  await page.getByTestId("nav-shared").click()
+  await page.getByTestId("nav-shared-accounts").click()
+  const address = page.locator("[data-field=ANTHROPIC_BASE_URL]")
+  await address.getByRole("textbox").fill("https://proxy.example/anthropic")
   await expect(footer(page)).toContainText("Applies after an engine reload")
   await footer(page).getByRole("button", { name: "Save", exact: true }).click()
   const bar = page.getByTestId("reload-pending")
-  await expect(bar).toContainText("Speech recognition › Turn timing")
+  await expect(bar).toContainText("Shared settings › Language model accounts")
   // The bar is global: it stays on every page until the engines reload.
-  await page.getByTestId("nav-voices").click()
+  await page.getByTestId("nav-shared-limits").click()
   await expect(bar).toBeVisible()
   await bar.getByRole("button", { name: "Reload now" }).click()
   await expect(bar).toBeHidden({ timeout: 5000 })
   const types = (await mock.log()).messages.map((m) => m.type)
   expect(types).toContain("settings.update")
   expect(types).toContain("engine.reload")
-  // The voices section is the generated form too, with the voice picker for the assistant's voice.
-  await expect(page.getByTestId("form-s-voices").getByTestId("voice-picker")).toContainText("Lessac")
-  await page.getByTestId("nav-language-model").click()
-  await expect(page.getByTestId("page-language-model-provider")).toContainText("Set by ANTHROPIC_API_KEY in .env (not protected)")
+  await page.getByTestId("nav-shared-accounts").click()
+  await expect(page.getByTestId("page-shared-accounts")).toContainText("Set by ANTHROPIC_API_KEY in .env (not protected)")
 })
 
 test("a change from another tab updates a clean form and is flagged on a dirty one", async ({ page, baseURL }) => {
-  await openPage(page, baseURL, "modules/weather")
+  await openPage(page, baseURL, "shared/modules")
   const form = page.getByTestId("form-m-weather")
   const module = (place: string, revision: number) => ({
     type: "module.changed",

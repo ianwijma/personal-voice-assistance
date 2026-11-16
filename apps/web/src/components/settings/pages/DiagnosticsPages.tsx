@@ -59,7 +59,7 @@ export function ProblemsPage() {
         <li key={m.id} className="flex flex-wrap items-center gap-2 rounded-md border border-danger/40 bg-danger/5 px-3 py-2.5 text-[13px]">
           <span className="text-ink">{m.name}:</span>
           <span className="min-w-0 flex-1 text-ink-muted">{m.error ?? "Could not start"}</span>
-          <button type="button" className="text-voice underline-offset-4 hover:underline" onClick={() => client.settings([m.kind === "agent" || m.kind === "decider" ? "language-model" : "modules", m.id])}>
+          <button type="button" className="text-voice underline-offset-4 hover:underline" onClick={() => client.settings(["shared", m.kind === "agent" ? "accounts" : m.kind === "decider" ? "routing" : "modules"])}>
             Open
           </button>
         </li>

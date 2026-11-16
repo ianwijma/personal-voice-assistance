@@ -190,12 +190,12 @@ export const accountState = (
       return { tone: "ok", text: "Always ready" }
     case "anthropic": {
       const set = sections.some((s) => s.form.secrets.ANTHROPIC_API_KEY?.set === true)
-      return set ? { tone: "ok", text: "Key set" } : { tone: "todo", text: "Set up…", setUp: ["language-model", "provider"] }
+      return set ? { tone: "ok", text: "Key set" } : { tone: "todo", text: "Set up…", setUp: ["shared", "accounts"] }
     }
     case "claude-subscription": {
       const m = modules.find((x) => x.id === "claude-subscription")
       if (m?.enabled === true && m.state === "running") return { tone: "ok", text: "Logged in" }
-      return { tone: "todo", text: "Set up…", setUp: ["language-model", "claude-subscription"] }
+      return { tone: "todo", text: "Set up…", setUp: ["shared", "accounts"] }
     }
     default:
       return { tone: "muted", text: "Not available yet" }

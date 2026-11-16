@@ -1,22 +1,10 @@
 import { describe, expect, it } from "vitest"
-import { DEFAULT_DEVICE_PROFILE, PROFILE_FIELDS, type ServerMessage } from "@pva/protocol"
+import { DEFAULT_DEVICE_PROFILE, type ServerMessage } from "@pva/protocol"
 import { exampleAdminSnapshot, exampleDevice, exampleFrontend, serverExamples } from "@pva/protocol/examples"
 import { CUE_MS, CUE_RATE, wakeCue } from "@/lib/audio/cue.ts"
 import { deviceId, deviceNameFromUserAgent } from "@/lib/device.ts"
-import {
-  activationSummary,
-  clearOverride,
-  displayProfileValue,
-  draftPatch,
-  effectiveValue,
-  lastSeenText,
-  liveProfileFields,
-  phraseFromHeard,
-  phraseProblem,
-  PROFILE_GROUPS,
-  setOverride
-} from "@/lib/profileForm.ts"
-import { buildSettingsTree, parentPath, resolveSettingsPath } from "@/lib/settingsTree.ts"
+import { lastSeenText, phraseFromHeard, phraseProblem } from "@/lib/profileForm.ts"
+import { buildSettingsTree, parentPath, resolveSettingsPath, typePageId } from "@/lib/settingsTree.ts"
 import { type Action, type ClientState, displayPhrase, heardOutcome, initialState, profileOf, reducer, visualState } from "@/lib/state.ts"
 import { profileMessage } from "./profile.ts"
 
@@ -122,37 +110,7 @@ describe("reducer, protocol 5", () => {
   })
 })
 
-describe("the profile form", () => {
-  const saved = { activation: "wake-phrase" as const, followUpSeconds: 15 }
-
-  it("a draft becomes a patch: changed values, null for a reset, nothing for unchanged fields", () => {
-    let draft = setOverride(saved, "captions", false)
-    draft = clearOverride(draft, "followUpSeconds")
-    draft = setOverride(draft, "activation", "wake-phrase")
-    expect(draftPatch(saved, draft, ["activation", "followUpSeconds", "captions", "voice"])).toEqual({ followUpSeconds: null, captions: false })
-    expect(draftPatch(saved, saved, ["activation", "followUpSeconds"])).toEqual({})
-    // Lists compare by value.
-    expect(draftPatch({ wakePhrases: ["a"] }, { wakePhrases: ["a"] }, ["wakePhrases"])).toEqual({})
-    expect(draftPatch({ wakePhrases: ["a"] }, { wakePhrases: ["a", "b"] }, ["wakePhrases"])).toEqual({ wakePhrases: ["a", "b"] })
-  })
-
-  it("an inherited field shows the level below", () => {
-    expect(effectiveValue(saved, DEFAULT_DEVICE_PROFILE, "followUpSeconds")).toBe(15)
-    expect(effectiveValue({}, DEFAULT_DEVICE_PROFILE, "followUpSeconds")).toBe(8)
-    expect(displayProfileValue("followUpSeconds", 0)).toBe("Off")
-    expect(displayProfileValue("voice", "")).toBe("Assistant default")
-    expect(displayProfileValue("wakePhrases", ["hey jeff", "hey jev"])).toBe("2 phrases")
-    expect(displayProfileValue("interruptMode", "confirm")).toBe("A few words")
-    expect(activationSummary(DEFAULT_DEVICE_PROFILE)).toBe("Always listening")
-    expect(activationSummary({ ...DEFAULT_DEVICE_PROFILE, activation: "wake-phrase" })).toBe("Wake phrase · “hey jeff” +2")
-  })
-
-  it("leaves out the retired voice field (docs/VOICE-PROVIDERS.md §1)", () => {
-    expect(liveProfileFields(PROFILE_FIELDS)).not.toContain("voice")
-    expect(liveProfileFields(PROFILE_FIELDS).length).toBe(PROFILE_FIELDS.length - 1)
-    expect(PROFILE_GROUPS.flatMap((g) => g.fields)).not.toContain("voice")
-  })
-
+describe("the phrase checks and the device list", () => {
   it("checks a new phrase against the protocol's bounds and the list", () => {
     const list = ["hey jeff", "hey jev"]
     expect(phraseProblem("", list)).toMatch(/Type a phrase/)
@@ -180,25 +138,24 @@ describe("the profile form", () => {
   })
 })
 
-describe("the admin tree: Front ends and Devices", () => {
+describe("the admin tree: Devices", () => {
   const pages = [
-    { group: "frontends", id: "frontend", title: "Front end", order: 0, perItem: true },
     { group: "devices", id: "all", title: "All devices", order: 0 },
+    { group: "devices", id: "device-type", title: "Device type", order: 10, perItem: true },
     { group: "devices", id: "device", title: "Device", order: 100, perItem: true }
   ]
-  const tree = buildSettingsTree({ sections: [], modules: [], clientPages: pages, frontends: [exampleFrontend], devices: [exampleDevice] })
+  const tree = buildSettingsTree({ sections: [], modules: [], clientPages: pages, deviceTypes: [{ kind: "web-voice", title: "Browsers" }], devices: [exampleDevice] })
 
-  it("one Front ends page per kind; one unlisted page per device next to the list", () => {
-    const frontends = tree.find((g) => g.slug === "frontends")!
-    expect(frontends.pages.map((p) => [p.id, p.title, p.listed])).toEqual([[exampleFrontend.id, exampleFrontend.title, true]])
+  it("one unlisted defaults page per type and one unlisted page per device next to the list", () => {
     const devices = tree.find((g) => g.slug === "devices")!
-    expect(devices.pages.map((p) => [p.id, p.listed])).toEqual([["all", true], [exampleDevice.id, false]])
-    expect(tree.map((g) => g.slug).slice(0, 2)).toEqual(["frontends", "devices"])
+    expect(devices.pages.map((p) => [p.id, p.title, p.listed])).toEqual([["all", "All devices", true], [typePageId("web-voice"), "Every browser", false], [exampleDevice.id, exampleDevice.name, false]])
+    expect(tree.map((g) => g.slug)).toEqual(["devices", "shared"]) // Shared settings always lists Modules
   })
 
   it("a device page resolves by its id, and goes back to the list on every screen", () => {
     expect(resolveSettingsPath(tree, ["devices"], false).page?.id).toBe("all") // the only listed page
     expect(resolveSettingsPath(tree, ["devices", exampleDevice.id], true).page?.source).toEqual({ kind: "client", id: "device" })
+    expect(resolveSettingsPath(tree, ["devices", typePageId("web-voice")], true).page?.source).toEqual({ kind: "client", id: "device-type" })
     expect(parentPath(tree, ["devices", exampleDevice.id], true)).toEqual(["devices"])
     expect(parentPath(tree, ["devices", exampleDevice.id], false)).toEqual(["devices"])
     expect(parentPath(tree, ["devices", "all"], true)).toBeUndefined()

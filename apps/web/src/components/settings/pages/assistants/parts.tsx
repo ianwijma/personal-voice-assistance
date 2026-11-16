@@ -262,7 +262,7 @@ export function RadioCards<V extends string>({ label, value, cards, onChange, gr
     readonly value: V
     readonly title: string
     readonly tags: React.ComponentProps<typeof Tags>["tags"]
-    readonly description: string
+    readonly description: ReactNode
     readonly right?: ReactNode
   }>
   readonly onChange: (v: V) => void
@@ -341,13 +341,13 @@ export function StateChip({ on }: { readonly on: boolean }) {
 }
 
 /** The mono summary strip (model | hearing | voice | modules), the same on the list, the page and Diagnostics. */
-export function Strip({ parts, className }: { readonly parts: ReadonlyArray<string>; readonly className?: string }) {
+export function Strip({ parts, className, as: Tag = "p" }: { readonly parts: ReadonlyArray<string>; readonly className?: string; readonly as?: "p" | "span" }) {
   return (
-    <p className={cx("flex flex-wrap font-mono text-[12px] leading-5 text-ink-muted", className)} data-testid="assistant-strip">
+    <Tag className={cx("flex flex-wrap font-mono text-[12px] leading-5 text-ink-muted", className)} data-testid="assistant-strip">
       {parts.map((p, i) => (
         <span key={i} className={cx("whitespace-nowrap pr-2", i < parts.length - 1 && "mr-2 border-r border-line")}>{p}</span>
       ))}
-    </p>
+    </Tag>
   )
 }
 

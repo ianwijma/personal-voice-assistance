@@ -63,7 +63,8 @@
  * The endpoints that act on a session (/mock/turn, /mock/wake, /mock/state, /mock/heard) take an optional
  * "deviceId" (default: the most recently active session that has an owner); POST /mock/idle {"deviceId"?, "now"?}
  * makes the device's conversation old enough for the idle reset at its next turn (`now`: at once);
- * POST /mock/max-sessions {"n"} sets MAX_VOICE_SESSIONS.
+ * POST /mock/max-sessions {"n"} sets MAX_VOICE_SESSIONS. POST /mock/typesafe {"on"?} sets TypeSafe up (a running decision module, so
+ * the server's `canAuto` is true) or off.
  *
  * The voice picker's HTTP API (docs/VOICE-PROVIDERS.md §5) is under /api/ on the same port (admin token from a login,
  * CORS for the page's origin): the providers of mock/voices.ts (On this machine; Cartesia without a key, `vault_locked`
@@ -75,6 +76,7 @@
 import { randomBytes } from "node:crypto"
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http"
 import {
+  hearerOf,
   type AdminState,
   type ClientMessage,
   CloseCode,
@@ -351,9 +353,10 @@ const initialSections = (): Array<SettingsSection> => [
           source: "default",
           visibleWhen: anthropic,
           options: [{ value: "low", label: "Low" }, { value: "medium", label: "Medium", tags: ["slow-start"] }, { value: "high", label: "High", tags: ["slow-start"] }]
-        }
+        },
+        { type: "text", key: "ANTHROPIC_BASE_URL", label: "API address", description: "Only for a proxy or gateway in front of the Anthropic API.", apply: "reload", default: "https://api.anthropic.com", maxLength: 300, advanced: true, source: "default", visibleWhen: anthropic }
       ],
-      values: { LLM_PROVIDER: "anthropic", ANTHROPIC_MODEL: "claude-haiku-5-5", ANTHROPIC_EFFORT: "low" },
+      values: { LLM_PROVIDER: "anthropic", ANTHROPIC_MODEL: "claude-haiku-5-5", ANTHROPIC_EFFORT: "low", ANTHROPIC_BASE_URL: "https://api.anthropic.com" },
       secrets: { ANTHROPIC_API_KEY: { set: true, source: "env" } },
       errors: []
     },
@@ -867,6 +870,10 @@ const toSession = (v: VSession, m: ServerMessage) => {
 }
 const startedSessions = () => [...voiceSessions.values()].filter((v) => v.started).sort((a, b) => b.lastActive - a.lastActive)
 const ownerPresentIn = (v: VSession) => v.owner !== undefined || v.lastOwnerClientId === "c-another-tab"
+const answeringOf = (v: VSession): string | undefined => {
+  const settings = v.deviceId === undefined ? assistantsMock.deviceTypes()[0]?.settings : assistantsMock.deviceFields(v.deviceId).settings
+  return settings === undefined ? undefined : hearerOf(settings) ?? undefined
+}
 const sessionInfos = (): Array<SessionInfo> =>
   startedSessions().map((v) => ({
     key: v.key,
@@ -876,7 +883,9 @@ const sessionInfos = (): Array<SessionInfo> =>
     ownerPresent: ownerPresentIn(v),
     conversationId: v.conversation.id,
     turns: v.turns,
-    lastTurnAt: v.lastTurnAt
+    lastTurnAt: v.lastTurnAt,
+    // Protocol 7: who answers on that device now, and one conversation per assistant on it.
+    ...(answeringOf(v) === undefined ? {} : { answering: answeringOf(v)!, conversations: [{ assistantId: answeringOf(v)!, conversationId: v.conversation.id, turns: v.turns, lastTurnAt: v.lastTurnAt }] })
   }))
 let lastSessions = ""
 /** Admin connections get the list when it changed. */
@@ -1022,7 +1031,7 @@ const resetState = () => {
   loginRefusedUntil = 0
   logoutFails = false
   devices = seededDevices()
-  assistantsMock.reset()
+  assistantsMock.reset(scenario === "long-phrase")
   kindDefaults = initialKindDefaults()
   env = initialEnv()
   favourites = initialFavourites()
@@ -1937,7 +1946,7 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
     }
     case "assistant.create": {
       if (requireAdmin(c, m.requestId)) return
-      const r = assistantsMock.create(m)
+      const r = assistantsMock.create(m, [...devices.values()].map((d) => ({ id: d.id, name: d.name })))
       sendTo(c, r.ok ? { type: "result", requestId: m.requestId, ok: true, ...(r.assistantId !== undefined ? { assistantId: r.assistantId } : {}) } : { type: "result", requestId: m.requestId, ok: false, ...(r.error !== undefined ? { error: r.error } : {}) })
       if (r.ok) assistantsChanged()
       return
@@ -1959,7 +1968,13 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
     case "device.save": {
       if (requireAdmin(c, m.requestId)) return
       if (m.target.kind === "device" && !devices.has(m.target.id)) return result(c, m.requestId, false, { code: "unknown_device", message: "That device is not known." })
+      const name = m.name === undefined ? undefined : m.name.trim()
+      if (name !== undefined && m.target.kind === "device" && name === "") return result(c, m.requestId, false, { code: "invalid_settings", message: "A device needs a name.", fieldErrors: [{ key: "name", message: "A device needs a name." }] })
       const r = assistantsMock.saveDevice(m)
+      if (r.ok && name !== undefined && m.target.kind === "device") {
+        const record = devices.get(m.target.id)
+        if (record !== undefined) record.name = name
+      }
       sendTo(c, r.ok ? { type: "result", requestId: m.requestId, ok: true } : { type: "result", requestId: m.requestId, ok: false, ...(r.error !== undefined ? { error: r.error } : {}) })
       if (r.ok) assistantsChanged()
       return
@@ -2496,6 +2511,26 @@ const http = createServer((req, res) => {
           typeof payload.matched === "string" ? payload.matched : undefined,
           typeof payload.accepted === "boolean" ? payload.accepted : payload.accepted === null ? null : undefined
         )
+        return json(res, 200, { ok: true })
+      }
+      case "/mock/typesafe": {
+        // TypeSafe set up or not (tests): a running decision module is what the server's `canAuto` looks at.
+        const on = payload.on !== false
+        const next: ModuleInfo = {
+          id: "typesafe",
+          name: "TypeSafe",
+          description: "Routing: which assistant a sentence without a wake phrase is for.",
+          enabled: on,
+          state: on ? "running" : "disabled",
+          tools: [],
+          settings: { fields: [], values: {}, secrets: {}, errors: [] },
+          revision: (modules.find((m) => m.id === "typesafe")?.revision ?? 0) + 1,
+          protected: true,
+          kind: "decider",
+          group: "agents"
+        }
+        modules = [...modules.filter((m) => m.id !== "typesafe"), next]
+        broadcast({ type: "module.changed", module: next })
         return json(res, 200, { ok: true })
       }
       case "/mock/assistant": {

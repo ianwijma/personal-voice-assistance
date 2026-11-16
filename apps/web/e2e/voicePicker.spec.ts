@@ -1,11 +1,11 @@
 import type { Locator, Page } from "@playwright/test"
 import { expect, gotoAdmin, loginAdmin, MOCK, mock, test } from "./fixtures.ts"
 
-// The voice picker (docs/VOICE-PROVIDERS.md §4, §5; the mock's /api/): Voices › Voices shows the assistant's voice
+// The voice picker (docs/VOICE-PROVIDERS.md §4, §5; the mock's /api/): Assistants › Jeff › Voice shows the assistant's voice
 // as a picker in place of the ASSISTANT_VOICE text field. Mock data: On this machine (Lessac and Heart installed,
 // Alba and Pim not), Cartesia (no key), ElevenLabs (key set); favourites Charlotte, Heart, Skylar, Daniel, Lessac.
 
-const PAGE = "#settings/voices/overview"
+const PAGE = "#settings/assistants/jeff/voice"
 const picker = (page: Page) => page.getByTestId("voice-picker")
 const popup = (page: Page) => page.getByTestId("voice-popup")
 const rows = (page: Page) => popup(page).getByTestId("voice-row")
@@ -105,7 +105,7 @@ test("the rail lists one provider's voices; the provider that needs a key explai
   await expect(needs).toContainText("Replies are sent to Cartesia to be spoken.")
   await needs.getByTestId("open-provider-settings").click()
   await expect(popup(page)).toBeHidden()
-  await expect(page.getByTestId("page-voices-providers")).toBeVisible()
+  await expect(page.getByTestId("page-shared-providers")).toBeVisible()
   await expect(page.getByTestId("page-title")).toHaveText("Voice providers")
 })
 
@@ -240,7 +240,7 @@ test("a local voice that is not downloaded downloads, with progress and cancel; 
   await expect(action(pim, "preview")).toBeEnabled()
 })
 
-test("choosing a voice is a draft: Save sends ASSISTANT_VOICE, the reload bar follows, nothing reloads by itself", async ({ page }) => {
+test("choosing a voice is a draft on the assistant: Save sends assistant.save with the voice; no reload is asked for", async ({ page }) => {
   await open(page)
   await tab(page, "elevenlabs").click()
   await row(page, "elevenlabs:mk3Mt2gtIX5ys0Jd4Cc3").locator("[data-row-main]").click()
@@ -248,21 +248,15 @@ test("choosing a voice is a draft: Save sends ASSISTANT_VOICE, the reload bar fo
   await expect(picker(page)).toContainText("Daniel")
   await expect(picker(page).locator("[data-provider-mark=elevenlabs]")).toBeVisible()
   await expect(picker(page)).toBeFocused()
-  const field = page.locator("[data-field=ASSISTANT_VOICE]")
-  await expect(field.getByTestId("unsaved-marker")).toBeVisible()
-  expect((await mock.log()).messages.filter((m) => m.type === "settings.update")).toEqual([])
+  await expect(page.locator("[data-field=voice]").getByTestId("unsaved-marker")).toBeVisible()
+  expect((await mock.log()).messages.filter((m) => m.type === "assistant.save")).toEqual([])
   await page.getByTestId("page-footer").getByRole("button", { name: "Save", exact: true }).click()
-  await expect(page.getByTestId("reload-pending")).toContainText("Saved changes need an engine reload")
-  await expect(page.getByTestId("reload-pending")).toContainText("Voices")
-  const updates = (await mock.log()).messages.filter((m) => m.type === "settings.update")
-  expect(updates).toHaveLength(1)
-  expect(updates[0]).toMatchObject({ sectionId: "voices", patch: { values: { ASSISTANT_VOICE: "elevenlabs:mk3Mt2gtIX5ys0Jd4Cc3" } } })
+  await expect(page.getByTestId("footer-note")).toContainText("Saved")
+  const saves = (await mock.log()).messages.filter((m) => m.type === "assistant.save")
+  expect(saves).toHaveLength(1)
+  expect((saves[0] as unknown as { assistant: { id: string; voice: unknown } }).assistant).toMatchObject({ id: "jeff", voice: { provider: "elevenlabs", voiceId: "mk3Mt2gtIX5ys0Jd4Cc3" } })
   expect((await mock.log()).messages.filter((m) => m.type === "engine.reload")).toEqual([])
-  // The reload applies it: the Overview names the new voice.
-  await page.getByTestId("reload-pending").getByRole("button", { name: /Reload now/ }).click()
-  await expect(page.getByTestId("reload-pending")).toBeHidden({ timeout: 5000 })
-  await gotoAdmin(page, page.url().split("#")[0], "#settings/overview")
-  await expect(page.getByTestId("running-voice")).toContainText("Daniel")
+  await expect(page.getByTestId("reload-pending")).toHaveCount(0)
 })
 
 test("keyboard: open, arrows through the rail and the rows, Tab to a row's buttons, Enter selects", async ({ page }) => {

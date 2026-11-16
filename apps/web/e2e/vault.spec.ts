@@ -57,8 +57,8 @@ test("set a password → lock → protected pages wait for the keys → unlock i
   await expect(panel).toContainText("Protect your keys")
 
   // A logged-in admin may change everything: no padlocks while there are no locked keys.
-  await go(page, "language-model", "provider")
-  await expect(page.getByTestId("page-language-model-provider")).not.toHaveAttribute("data-locked", "true")
+  await go(page, "shared", "accounts")
+  await expect(page.getByTestId("page-shared-accounts")).not.toHaveAttribute("data-locked", "true")
   await expect(page.getByTestId("settings-nav").locator("[data-mark=lock]")).toHaveCount(0)
   await go(page, "keys", "access")
 
@@ -76,18 +76,17 @@ test("set a password → lock → protected pages wait for the keys → unlock i
   await panel.getByRole("button", { name: "Lock now" }).click()
   await expect(panel).toHaveAttribute("data-view", "unlock")
   await expect(panel.getByTestId("locked-explanation")).toContainText("locked from a page (Lock now)")
-  await expect(page.getByTestId("nav-language-model").locator("[data-mark=lock]").first()).toBeVisible()
-  await go(page, "modules", "home-assistant")
-  const haPage = page.getByTestId("page-modules-home-assistant")
+  await expect(page.getByTestId("nav-shared").locator("[data-mark=lock]").first()).toBeVisible()
+  await go(page, "shared", "modules")
+  const haPage = page.getByTestId("page-shared-modules")
   await expect(haPage).toHaveAttribute("data-locked", "true")
   await expect(page.getByTestId("module-home-assistant").getByRole("switch")).toBeDisabled()
-  await expect(page.getByTestId("nav-modules-home-assistant").locator("[data-mark=lock]")).toBeVisible()
-  await expect(page.getByTestId("page-footer")).toHaveCount(0)
-  await go(page, "modules", "weather")
-  await expect(page.getByTestId("page-modules-weather")).not.toHaveAttribute("data-locked", "true")
+  await expect(page.getByTestId("nav-shared-modules").locator("[data-mark=lock]")).toBeVisible()
+  // The page is read-only for its protected module only: the Weather module's switch still works.
+  await expect(page.getByTestId("module-weather").getByRole("switch")).toBeEnabled()
 
   // The vault password can be typed on the protected page itself: a wrong one is refused, the right one unlocks.
-  await go(page, "modules", "home-assistant")
+  await go(page, "shared", "modules")
   const inline = page.getByTestId("unlock-form-page")
   await expect(page.getByTestId("keys-locked")).toContainText("The keys are locked")
   await inline.getByLabel("Vault password").fill("wrong horse battery")
@@ -99,13 +98,13 @@ test("set a password → lock → protected pages wait for the keys → unlock i
   await expect(page.getByTestId("module-home-assistant").getByRole("switch")).toBeEnabled()
 
   // Change a protected setting.
-  await go(page, "language-model", "provider")
-  const provider = page.getByTestId("page-language-model-provider")
-  await provider.getByRole("radio", { name: /Offline stand-in/ }).click()
+  await go(page, "shared", "accounts")
+  const provider = page.getByTestId("page-shared-accounts")
+  await provider.locator("[data-field=ANTHROPIC_BASE_URL]").getByRole("textbox").fill("https://proxy.example/anthropic")
   await page.getByTestId("page-footer").getByRole("button", { name: "Save", exact: true }).click()
   await expect(page.getByTestId("page-footer").getByText("Saved")).toBeVisible()
   const results = (await mock.log()).messages.filter((m) => m.type === "settings.update")
-  expect(results.at(-1)).toMatchObject({ sectionId: "language-model", patch: { values: { LLM_PROVIDER: "fake" } } })
+  expect(results.at(-1)).toMatchObject({ sectionId: "language-model", patch: { values: { ANTHROPIC_BASE_URL: "https://proxy.example/anthropic" } } })
 
   // A connection that is not logged in is refused, whatever the vault's state.
   expect(await updateFromAVoiceClient()).toMatchObject({ type: "result", ok: false, error: { code: "admin_required" } })
@@ -114,19 +113,19 @@ test("set a password → lock → protected pages wait for the keys → unlock i
   await go(page, "keys", "access")
   await panel.getByRole("button", { name: "Lock now" }).click()
   await expect(panel).toHaveAttribute("data-view", "unlock")
-  await go(page, "language-model", "provider")
+  await go(page, "shared", "accounts")
   await expect(provider).toHaveAttribute("data-locked", "true")
   await expect(provider.getByTestId("keys-locked")).toBeVisible()
-  await expect(provider.getByRole("radio", { name: /Claude API/ })).toBeDisabled()
-  await go(page, "speech", "turn-timing")
-  await expect(page.getByTestId("form-s-stt-timing").getByLabel("End of turn after")).toBeEnabled()
+  await expect(provider.locator("[data-field=ANTHROPIC_BASE_URL]").getByRole("textbox")).toBeDisabled()
+  await go(page, "shared", "limits")
+  await expect(page.locator("[data-field=MAX_VOICE_SESSIONS]").getByRole("spinbutton")).toBeEnabled()
 
   // The keys list: every key, its state, and what uses it.
   await go(page, "keys", "keys")
   const keys = page.getByTestId("keys-list")
-  await expect(keys.locator("[data-key=DEEPGRAM_API_KEY]")).toContainText("Speech recognition › Deepgram")
+  await expect(keys.locator("[data-key=DEEPGRAM_API_KEY]")).toContainText("Shared settings › Speech recognition models")
   await expect(keys.locator("[data-key=ANTHROPIC_API_KEY]")).toContainText("Set by ANTHROPIC_API_KEY in .env (not protected)")
-  await keys.locator("[data-key=HOME_ASSISTANT_TOKEN]").getByRole("button", { name: "Modules › Home Assistant" }).click()
+  await keys.locator("[data-key=HOME_ASSISTANT_TOKEN]").getByRole("button", { name: "Shared settings › Modules" }).click()
   await expect(haPage).toBeVisible()
 })
 
@@ -140,10 +139,10 @@ test("the old 'type the vault password for edit access' is gone; another tab nee
   await expect(page.getByText("Get edit access")).toHaveCount(0)
 
   const second = await context.newPage()
-  await second.goto(adminUrl(baseURL, "#settings/modules/home-assistant"))
+  await second.goto(adminUrl(baseURL, "#settings/shared/modules"))
   await expect(second.getByTestId("login-form")).toBeVisible() // the token is per tab (sessionStorage)
-  await loginAdmin(second, baseURL, "#settings/modules/home-assistant")
-  await expect(second.getByTestId("page-modules-home-assistant")).not.toHaveAttribute("data-locked", "true")
+  await loginAdmin(second, baseURL, "#settings/shared/modules")
+  await expect(second.getByTestId("page-shared-modules")).not.toHaveAttribute("data-locked", "true")
   await expect(second.getByTestId("edit-access")).toHaveCount(0)
   await second.close()
 })

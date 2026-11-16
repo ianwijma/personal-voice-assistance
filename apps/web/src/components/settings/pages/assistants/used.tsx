@@ -2,6 +2,7 @@
 import { useState } from "react"
 import type { AssistantInfo, DeviceListInfo, DeviceTarget } from "@pva/protocol"
 import { plural, quoted, targetName } from "@/lib/assistants.ts"
+import { typePageId } from "@/lib/settingsTree.ts"
 import { useClient, useClientState } from "../../../context.tsx"
 import { Icon } from "../../../ui/Icon.tsx"
 import { Button, cx } from "../../../ui/controls.tsx"
@@ -42,7 +43,7 @@ export function UsedTab({ info }: { readonly info: AssistantInfo }) {
                     <li key={u.target.kind === "device" ? u.target.id : `type-${u.target.type}`}>
                       <button
                         type="button"
-                        onClick={() => client.settings(u.target.kind === "device" ? ["devices", u.target.id] : ["frontends", u.target.type])}
+                        onClick={() => client.settings(u.target.kind === "device" ? ["devices", u.target.id] : ["devices", typePageId(u.target.type)])}
                         className="flex min-h-16 w-full items-center gap-3 px-3 py-3 text-left transition-colors duration-[120ms] hover:bg-surface-2/60"
                         data-used={u.target.kind === "device" ? u.target.id : `type:${u.target.type}`}
                       >

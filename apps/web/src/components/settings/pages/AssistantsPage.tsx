@@ -1,5 +1,5 @@
 "use client"
-import { useEffect, useState } from "react"
+import { useEffect } from "react"
 import { hearingModelNames, plural, summaryParts } from "@/lib/assistants.ts"
 import { formatSettingsHash } from "@/lib/settingsTree.ts"
 import { useClient, useClientState } from "../../context.tsx"
@@ -7,7 +7,6 @@ import { useCatalogState, useVoiceCatalog } from "../../voices/useVoiceCatalog.t
 import { indexVoices } from "@/lib/voicePicker.ts"
 import { Icon } from "../../ui/Icon.tsx"
 import { Button } from "../../ui/controls.tsx"
-import { NewAssistantDialog } from "./assistants/dialogs.tsx"
 import { StateChip, Strip } from "./assistants/parts.tsx"
 
 /** The voice's name from the voice catalog, once it has loaded (a voice's id is shown until then). */
@@ -32,7 +31,6 @@ export function AssistantsPage() {
   const modules = useClientState((s) => s.modules)
   const sections = useClientState((s) => s.sections)
   const voiceName = useVoiceNameOf()
-  const [creating, setCreating] = useState(false)
   const names = hearingModelNames(sections)
   const moduleList = Object.values(modules.byId)
   const on = assistants.filter((a) => a.on).length
@@ -40,7 +38,7 @@ export function AssistantsPage() {
     <div className="flex flex-1 flex-col gap-4" data-testid="assistant-list">
       <div className="flex flex-wrap items-center gap-3">
         <span className="text-[13px] text-ink-muted" data-testid="assistant-count">{plural(assistants.length, "assistant")} · {on} switched on</span>
-        <Button variant="primary" className="ml-auto max-sm:h-11" onClick={() => setCreating(true)} data-testid="new-assistant">
+        <Button variant="primary" className="ml-auto max-sm:h-11" onClick={() => client.settings(["assistants", "new", "1"])} data-testid="new-assistant">
           <Icon name="plus" size={16} />
           New assistant
         </Button>
@@ -80,10 +78,6 @@ export function AssistantsPage() {
         An assistant is who answers. Where it listens and which phrase wakes it is set under{" "}
         <a href={formatSettingsHash(["devices"])} className="text-voice underline-offset-4 hover:underline">Devices</a>.
       </p>
-      {creating && <NewAssistantDialog onClose={() => setCreating(false)} onCreated={(id) => {
-        setCreating(false)
-        client.settings(["assistants", id])
-      }} />}
     </div>
   )
 }

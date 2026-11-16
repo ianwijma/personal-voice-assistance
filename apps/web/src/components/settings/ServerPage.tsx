@@ -2,7 +2,7 @@
 import { useEffect, useMemo, useRef, useState } from "react"
 import type { ChoiceOption, FieldError, ModuleInfo, SettingField, SettingsSection } from "@pva/protocol"
 import { type Draft, errorsByKey, setDraftValue, splitAdvanced } from "@/lib/forms.ts"
-import { type NavPage, savedValues } from "@/lib/settingsTree.ts"
+import { formatSettingsHash, type NavPage, savedValues } from "@/lib/settingsTree.ts"
 import { shallowEqual } from "@/lib/store.ts"
 import { useClient, useClientState } from "../context.tsx"
 import { UnlockForm } from "../KeysPanel.tsx"
@@ -28,30 +28,28 @@ const linkedOptions = (sections: ReadonlyArray<SettingsSection>) =>
  * has keys, chooses providers or is an agent) is read-only only while the key vault is locked, and offers Unlock
  * right here. One sticky footer saves every form on the page.
  */
-export function ServerPage({ page }: { readonly page: NavPage }) {
+export function ServerPage({ page, extra }: { readonly page: NavPage; readonly extra?: React.ReactNode }) {
   const client = useClient()
   const keysLocked = useClientState((s) => s.vault.state === "locked")
   const admin = !keysLocked
   const vault = useClientState((s) => s.vault, shallowEqual)
   const allSections = useClientState((s) => s.sections)
   const modules = useClientState((s) => s.modules.byId)
-  const sections = page.source.kind === "sections" ? page.source.sections : []
-  const module = page.source.kind === "module" ? modules[page.source.moduleId] : undefined
+  const sections = page.source.kind === "server" ? page.source.sections : []
+  const pageModules = (page.source.kind === "server" ? page.source.moduleIds : []).flatMap((id) => (modules[id] !== undefined ? [modules[id]!] : []))
   const links = linkedOptions(sections)
   const editable = !page.protected || admin
 
   const defs: ReadonlyArray<PageFormDef> = useMemo(() => [
     ...sections.map((s): PageFormDef => ({ key: `s:${s.id}`, kind: "section", id: s.id, form: s.form, revision: s.revision, readOnly: s.protected === true && !admin })),
-    ...(module !== undefined
-      ? [{ key: `m:${module.id}`, kind: "module" as const, id: module.id, form: module.settings, revision: module.revision, readOnly: module.protected === true && !admin }]
-      : []),
+    ...pageModules.map((module) => ({ key: `m:${module.id}`, kind: "module" as const, id: module.id, form: module.settings, revision: module.revision, readOnly: module.protected === true && !admin })),
     ...links.flatMap((l) => {
       const m = modules[l.module.id]
       return m === undefined || l.module.optIn === undefined
         ? []
         : [{ key: `m:${m.id}`, kind: "module" as const, id: m.id, form: m.settings, revision: m.revision, readOnly: m.protected === true && !admin, only: [l.module.optIn] }]
     })
-  ], [sections, module, links.map((l) => `${l.module.id}:${modules[l.module.id]?.revision}`).join(","), modules, admin])
+  ], [sections, pageModules.map((m) => `${m.id}:${m.revision}:${m.protected}`).join(","), links.map((l) => `${l.module.id}:${modules[l.module.id]?.revision}`).join(","), modules, admin])
 
   const values = useMemo(() => savedValues(allSections), [allSections])
   const forms = usePageForms(defs, (key) => values.get(key), {
@@ -80,8 +78,10 @@ export function ServerPage({ page }: { readonly page: NavPage }) {
         {forms.views.some((v) => v.def.form.fields.some((f) => f.locked === undefined)) && <div className="-mb-3"><MarkerLegend device={false} /></div>}
         {!editable && <KeysLocked />}
         {notInUse && sections.length > 0 && <NotInUse />}
-        {module !== undefined && <ModuleHeader module={module} editable={editable} />}
-        {forms.views.filter((v) => v.def.only === undefined).map((view) => (
+        {page.id === "modules" && pageModules.length === 0 && (
+          <p className="rounded-md border border-dashed border-line px-4 py-5 text-[14px] text-ink-muted" data-testid="no-modules">No modules are installed.</p>
+        )}
+        {forms.views.filter((v) => v.def.only === undefined && v.def.kind === "section").map((view) => (
           <FormBlock key={view.def.key} view={view} forms={forms} heading={sections.length > 1 ? sections.find((s) => `s:${s.id}` === view.def.key)?.title : undefined} vault={vault}
             renderAfter={(field) => {
               const link = links.find((l) => l.field.key === field.key && `s:${l.section.id}` === view.def.key)
@@ -103,10 +103,50 @@ export function ServerPage({ page }: { readonly page: NavPage }) {
             }}
           />
         ))}
-        {module !== undefined && <ModuleTools module={module} />}
+        {pageModules.map((module, i) => (
+          <ModuleBlock key={module.id} module={module} editable={module.protected !== true || admin} first={i === 0 && sections.length === 0} forms={forms} vault={vault} />
+        ))}
+        {extra}
       </div>
       {editable && (forms.views.some((v) => !v.def.readOnly && v.def.form.fields.some((f) => f.locked === undefined)) || forms.dirty) && <PageFooter forms={forms} commitVia={commitVia} />}
     </div>
+  )
+}
+
+/** One module on a shared page: its name, who uses it, its switch and state, its form and its tools. */
+function ModuleBlock({ module: m, editable, first, forms, vault }: {
+  readonly module: ModuleInfo
+  readonly editable: boolean
+  readonly first: boolean
+  readonly forms: PageForms
+  readonly vault: Parameters<typeof FieldRow>[0]["vault"]
+}) {
+  const view = forms.views.find((v) => v.def.key === `m:${m.id}` && v.def.only === undefined)
+  const users = useClientState((s) => s.assistants.filter((a) => a.modules[m.id]?.on === true).map((a) => ({ id: a.id, name: a.name })), shallowEqual)
+  return (
+    <section className={cx("flex flex-col gap-5", !first && "border-t border-line/60 pt-7")} data-testid={`module-block-${m.id}`}>
+      <div className="flex flex-col gap-1">
+        <h3 className="text-[16px] font-medium text-ink">{m.name}</h3>
+        {m.kind !== "agent" && m.kind !== "decider" && (
+          <p className="text-[13px] text-ink-muted" data-testid="used-by">
+            {users.length === 0 ? "Used by: no assistant yet" : (
+              <>
+                Used by:{" "}
+                {users.map((u, i) => (
+                  <span key={u.id}>
+                    {i > 0 && ", "}
+                    <a href={formatSettingsHash(["assistants", u.id, "modules"])} className="text-voice underline-offset-4 hover:underline">{u.name}</a>
+                  </span>
+                ))}
+              </>
+            )}
+          </p>
+        )}
+      </div>
+      <ModuleHeader module={m} editable={editable} />
+      {view !== undefined && <FormBlock view={view} forms={forms} heading={undefined} vault={vault} renderAfter={() => null} />}
+      <ModuleTools module={m} />
+    </section>
   )
 }
 

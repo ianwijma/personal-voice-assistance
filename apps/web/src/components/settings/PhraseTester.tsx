@@ -2,7 +2,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react"
 import { WAKE_TEST_MAX_MS } from "@pva/protocol"
 import { normalisePhrase, phraseFromHeard } from "@/lib/profileForm.ts"
-import { displayPhrase, type HeardLine, heardOutcome, profileOf } from "@/lib/state.ts"
+import { displayPhrase, type HeardLine, heardOutcome } from "@/lib/state.ts"
 import { shallowEqual } from "@/lib/store.ts"
 import { useClient, useClientState } from "../context.tsx"
 import { inputClass } from "../fields/types.ts"
@@ -17,10 +17,12 @@ const clock = (ms: number) => {
 }
 
 /** The words for a line's outcome, as shown and as announced. */
-const outcomeText = (l: HeardLine): string => {
+const outcomeText = (l: HeardLine, wakes?: (phrase: string) => string | undefined): string => {
   switch (heardOutcome(l)) {
-    case "matched":
-      return `Matched ${displayPhrase(l.matched!)}`
+    case "matched": {
+      const who = wakes?.(l.matched!)
+      return `Matched ${displayPhrase(l.matched!)}${who !== undefined ? ` → wakes ${who}` : ""}`
+    }
     case "accepted":
       return "Accepted without a phrase"
     case "ignored":
@@ -28,25 +30,6 @@ const outcomeText = (l: HeardLine): string => {
     case "no-match":
       return "No phrase matched"
   }
-}
-
-/** Profile fields that decide what the tester shows: a device that overrides one of them is tested with its own. */
-const WAKE_FIELDS = ["activation", "wakePhrases", "wakeMatch", "followUpSeconds"] as const
-const WAKE_LABEL: Record<(typeof WAKE_FIELDS)[number], string> = {
-  activation: "activation",
-  wakePhrases: "phrases",
-  wakeMatch: "matching",
-  followUpSeconds: "follow-up time"
-}
-/** "a", "a and b", "a, b and c". */
-const listOf = (items: ReadonlyArray<string>): string => (items.length <= 1 ? items.join("") : `${items.slice(0, -1).join(", ")} and ${items[items.length - 1]}`)
-/** What the device overrides and what still comes from these defaults, in words. */
-export const ownSettingsNote = (name: string, overridden: ReadonlyArray<string>): string => {
-  const own = WAKE_FIELDS.filter((f) => overridden.includes(f)).map((f) => WAKE_LABEL[f])
-  const rest = WAKE_FIELDS.filter((f) => !overridden.includes(f)).map((f) => WAKE_LABEL[f])
-  return rest.length === 0
-    ? `${name} overrides ${listOf(own)}, so these defaults do not decide what it accepts.`
-    : `${name} overrides ${listOf(own)}; its ${listOf(rest)} use${rest.length === 1 ? "s" : ""} these defaults.`
 }
 
 /**
@@ -59,17 +42,23 @@ export const ownSettingsNote = (name: string, overridden: ReadonlyArray<string>)
  * tested. Start, stop, expiry and each new line are announced through one polite region (the countdown is not).
  * It switches off after 5 minutes and when the page is left.
  */
-export function PhraseTester({ onAdd, phrases: draftPhrases = [], savedPhrases = [] }: {
-  readonly onAdd: (phrase: string) => string | undefined
+export function PhraseTester({ onAdd, phrases: draftPhrases = [], savedPhrases = [], deviceId, deviceName, wakes }: {
+  /** Turn a mishearing into a phrase of the form; without it the lines have no Add button. */
+  readonly onAdd?: (phrase: string) => string | undefined
+  /** Test this device only (the device page), not "the device talking most recently". */
+  readonly deviceId?: string
+  readonly deviceName?: string
+  /** The assistant a phrase wakes on the tested device (named after a matched line). */
+  readonly wakes?: (phrase: string) => string | undefined
   /** The form's phrases now (draft) and as last saved: what "Added" / "Saved" is derived from. */
   readonly phrases?: ReadonlyArray<string>
   readonly savedPhrases?: ReadonlyArray<string>
 }) {
   const client = useClient()
   const heard = useClientState((s) => s.heard)
-  const phrases = useClientState((s) => s.frontends[0]?.profile.wakePhrases ?? profileOf(s).wakePhrases, shallowEqual)
+  const phrases = draftPhrases
   /** "Listen to": a device id, or "" for the most recently active session. */
-  const [chosen, setChosen] = useState("")
+  const [chosen, setChosen] = useState(deviceId ?? "")
   const choices = useClientState(
     (s) => s.sessions.flatMap((x) => (x.deviceId === undefined ? [] : [`${x.deviceId}\u0000${x.name}`])),
     shallowEqual
@@ -80,12 +69,10 @@ export function PhraseTester({ onAdd, phrases: draftPhrases = [], savedPhrases =
         ? s.sessions.find((x) => x.deviceId === chosen)
         : s.sessions.find((x) => x.ownerPresent)
       // A server that lists no sessions: the device that has the audio.
-      const deviceId = session !== undefined ? session.deviceId : s.sessions.length === 0 ? s.devices.find((x) => x.audioOwner)?.id : undefined
-      if (session === undefined && deviceId === undefined) return undefined
-      const d = s.devices.find((x) => x.id === deviceId)
-      return d === undefined
-        ? { id: undefined, name: session?.name ?? "another device", own: "" }
-        : { id: d.id, name: d.name, own: WAKE_FIELDS.filter((f) => Object.hasOwn(d.overrides, f)).join(",") }
+      const id = session !== undefined ? session.deviceId : s.sessions.length === 0 ? s.devices.find((x) => x.audioOwner)?.id : undefined
+      if (session === undefined && id === undefined) return undefined
+      const d = s.devices.find((x) => x.id === id)
+      return { id: d?.id, name: d?.name ?? session?.name ?? "another device" }
     },
     shallowEqual
   )
@@ -143,7 +130,7 @@ export function PhraseTester({ onAdd, phrases: draftPhrases = [], savedPhrases =
   const latest = heard[heard.length - 1]
   useEffect(() => {
     if (latest === undefined || !onRef.current) return
-    setAnnouncement(`Heard “${latest.text}”: ${outcomeText(latest).toLowerCase()}.`)
+    setAnnouncement(`Heard “${latest.text}”: ${outcomeText(latest, wakes).toLowerCase()}.`)
   }, [latest])
   // Leaving the page stops it. When the session has ended (logout, restart) the server has already switched it off
   // and would refuse the request (`admin_required`), so nothing is sent then.
@@ -173,7 +160,9 @@ export function PhraseTester({ onAdd, phrases: draftPhrases = [], savedPhrases =
           </p>
           <p className="text-[13px] text-ink-muted" data-testid="tester-scope">
             {owner === undefined
-              ? on
+              ? deviceId !== undefined
+                ? `${on ? "Listening" : "Ready to listen"}${deviceName !== undefined ? ` to ${deviceName}` : ""}, but it has no voice page open now. Start talking on it.`
+                : on
                 ? "Listening, but no device has the audio. Start talking on a device."
                 : "Say your phrase to a device and see what the recogniser heard."
               : <>{on ? "Testing" : "Ready to test"} {owner.name} with its saved settings.{on && <span className="tabular-nums"> Stops in {clock(Math.min(WAKE_TEST_MAX_MS, (until ?? now) - now))}.</span>}</>}
@@ -188,7 +177,7 @@ export function PhraseTester({ onAdd, phrases: draftPhrases = [], savedPhrases =
           </Button>
         )}
       </div>
-      {(choices.length > 1 || chosen !== "") && (
+      {deviceId === undefined && (choices.length > 1 || chosen !== "") && (
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
           <label htmlFor="tester-device" className="text-[13px] text-ink-muted">Listen to</label>
           <select
@@ -206,14 +195,6 @@ export function PhraseTester({ onAdd, phrases: draftPhrases = [], savedPhrases =
             {chosen !== "" && !choices.some((c) => c.startsWith(`${chosen}\u0000`)) && <option value={chosen}>A device without a session now</option>}
           </select>
         </div>
-      )}
-      {owner !== undefined && owner.own !== "" && owner.id !== undefined && (
-        <p className="text-[13px] text-ink-muted" data-testid="tester-own-settings">
-          {ownSettingsNote(owner.name, owner.own.split(","))}{" "}
-          <button type="button" className="text-voice underline underline-offset-4" onClick={() => client.settings(["devices", owner.id!])}>
-            See its device page
-          </button>
-        </p>
       )}
       {unsaved && (
         <p className="flex items-start gap-2 rounded-md border border-warn/40 bg-warn/5 px-3 py-2 text-[13px] text-ink" data-testid="tester-unsaved">
@@ -235,17 +216,17 @@ export function PhraseTester({ onAdd, phrases: draftPhrases = [], savedPhrases =
                   {outcome === "matched" ? (
                     <span className="inline-flex items-center gap-1 text-[12px] text-ok">
                       <Icon name="check" size={14} />
-                      {outcomeText(l)}
+                      {outcomeText(l, wakes)}
                     </span>
                   ) : outcome === "accepted" ? (
                     <span className="inline-flex items-center gap-1 text-[12px] text-you" title="Always listening, or the device was already listening (after the phrase or a reply)">
                       <Icon name="check" size={14} />
-                      {outcomeText(l)}
+                      {outcomeText(l, wakes)}
                     </span>
                   ) : (
                     <span className="inline-flex items-center gap-2">
-                      <span className="label text-[10px] text-ink-muted">{outcomeText(l)}</span>
-                      {added[l.at] !== undefined && listHas(draftPhrases, added[l.at]!) ? (
+                      <span className="label text-[10px] text-ink-muted">{outcomeText(l, wakes)}</span>
+                      {onAdd === undefined ? null : added[l.at] !== undefined && listHas(draftPhrases, added[l.at]!) ? (
                         // Derived from the form: in the draft only = not saved yet; also in the saved list = saved.
                         <span tabIndex={-1} data-added-at={l.at} className="text-[12px] text-ok outline-none focus-visible:underline" data-testid="added-status">
                           {listHas(savedPhrases, added[l.at]!) ? `Saved “${added[l.at]}”` : `Added “${added[l.at]}”, not saved yet`}
@@ -256,7 +237,7 @@ export function PhraseTester({ onAdd, phrases: draftPhrases = [], savedPhrases =
                           <Button
                             size="sm"
                             onClick={() => {
-                              const problem = onAdd(phrase)
+                              const problem = onAdd?.(phrase)
                               if (problem !== undefined) {
                                 setErrors((e) => ({ ...e, [l.at]: problem }))
                                 setAnnouncement(`Not added: ${problem}`)

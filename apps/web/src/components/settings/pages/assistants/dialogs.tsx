@@ -1,7 +1,7 @@
 "use client"
 import { useState } from "react"
 import type { AssistantInfo, Assignment, DeviceListInfo, DeviceTarget, DeviceTypeInfo } from "@pva/protocol"
-import { blankAssistantBody, copyName, targetKey, targetName, toBody } from "@/lib/assistants.ts"
+import { type blankAssistantBody, copyName, targetKey, targetName, toBody } from "@/lib/assistants.ts"
 import { useClient, useClientState } from "../../../context.tsx"
 import { inputClass } from "../../../fields/types.ts"
 import { Dialog, DialogButtons } from "./parts.tsx"
@@ -118,21 +118,6 @@ export function DuplicateDialog({ info, onClose, onCreated }: { readonly info: A
       confirm="Duplicate"
       initial={copyName(info.name, names)}
       make={(name) => ({ body: { ...toBody(info), name }, copyOf: info.id })}
-      onClose={onClose}
-      onCreated={onCreated}
-    />
-  )
-}
-
-/** "New assistant": a blank one; the wizard (a later package) does more. */
-export function NewAssistantDialog({ onClose, onCreated }: { readonly onClose: () => void; readonly onCreated: (id: string) => void }) {
-  return (
-    <NameDialog
-      title="New assistant"
-      text="Starts a blank assistant on the Claude API with the local recogniser and the default voice. You set the rest on its pages, then assign it to a device under Devices."
-      confirm="Create"
-      initial=""
-      make={(name) => ({ body: blankAssistantBody(name) })}
       onClose={onClose}
       onCreated={onCreated}
     />
