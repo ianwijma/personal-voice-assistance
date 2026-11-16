@@ -218,7 +218,8 @@ export class FeatureExtractor {
     const n = this.resample(input)
     f.rms = Math.min(1, rms)
     const x = this.x16
-    f.wave.set(x.subarray(WIN - WAVE_SIZE))
+    const wave = f.wave
+    for (let i = 0; i < WAVE_SIZE; i++) wave[i] = x[WIN - WAVE_SIZE + i]! // by index: a `subarray` view allocates
 
     // 2. Level and voice activity.
     const db = 20 * Math.log10(rms + 1e-9)
@@ -383,7 +384,8 @@ export class FeatureExtractor {
     if (r === 1) {
       const n = Math.min(WIN, input.length)
       out.fill(0, 0, WIN - n)
-      out.set(input.subarray(input.length - n), WIN - n)
+      const from = input.length - n
+      for (let i = 0; i < n; i++) out[WIN - n + i] = input[from + i]! // by index: a `subarray` view allocates
       return n
     }
     const n = Math.min(WIN, Math.floor(input.length / r))

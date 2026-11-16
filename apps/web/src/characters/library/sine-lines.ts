@@ -21,7 +21,7 @@
  * without a stage) the drawing is call for call what version 1.0.0 drew.
  */
 import type { Character, CharacterInstance, Frame, Mode, Rgb } from "../contract.ts"
-import { approach, clamp01, clear2d, mix, optNumber, optToggle, rgba, setup2d } from "../kit.ts"
+import { approach, clamp01, clear2d, optNumber, optToggle, rgba, setup2d } from "../kit.ts"
 
 type Triple = readonly [number, number, number]
 type ColorKey = "inkFaint" | "voice" | "you" | "danger"
@@ -90,6 +90,21 @@ const INTERRUPT_FOR = 0.6
 const REACH_SHARE = 0.25
 const REACH_MIN = 48
 const EDGE = 12
+/** Reduced motion: the shape (amplitude and line weights) is held and steps to the voice at most this often, s. */
+const HOLD_S = 1
+
+type MutableRgb = [number, number, number]
+const copyRgb = (to: MutableRgb, from: Rgb): void => {
+  to[0] = from[0]
+  to[1] = from[1]
+  to[2] = from[2]
+}
+/** `mix(a, b, t)` of the kit, into `out` (no array per frame). */
+const mixInto = (out: MutableRgb, a: Rgb, b: Rgb, t: number): void => {
+  out[0] = a[0] + (b[0] - a[0]) * t
+  out[1] = a[1] + (b[1] - a[1]) * t
+  out[2] = a[2] + (b[2] - a[2]) * t
+}
 
 /** The level the lines move toward (0..1): the app's formulas, on the raw window RMS. */
 const targetLevel = (f: Frame): number => {
@@ -125,12 +140,15 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
   let thick = 1
   let glow = 1
   let started = false
-  let rgb: Rgb = [128, 128, 120]
+  const rgb: MutableRgb = [128, 128, 120]
   let alpha = 1
-  let fromRgb: Rgb = rgb
+  const fromRgb: MutableRgb = [128, 128, 120]
   let fromAlpha = alpha
   let fade = 1 // 0..1 progress of the 240 ms colour crossfade
   let shown: Mode | null = null
+  // Reduced motion: seconds until the held shape may step again, and the mode it was taken in.
+  let hold = 0
+  let held: Mode | null = null
 
   return {
     resize(width, height, ratio) {
@@ -160,25 +178,33 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
 
       // Colour: crossfade 240 ms on a mode change (instant with reduced motion).
       if (shown !== f.mode) {
-        fromRgb = shown === null ? target : rgb
+        copyRgb(fromRgb, shown === null ? target : rgb)
         fromAlpha = shown === null ? p.alpha : alpha
         fade = reduced || shown === null ? 1 : 0
         shown = f.mode
       }
       fade = Math.min(1, fade + dt / 0.24)
       const e = 1 - (1 - fade) * (1 - fade)
-      rgb = mix(fromRgb, target, e)
+      mixInto(rgb, fromRgb, target, e)
       alpha = fromAlpha + (p.alpha - fromAlpha) * e
 
-      // Level: fast rise (40 ms), slower fall (180 ms, 60 ms just after an interruption); reduced motion quantises to thirds.
-      let goal = targetLevel(f)
-      let tau: number
+      // Level: fast rise (40 ms), slower fall (180 ms, 60 ms just after an interruption). Reduced motion holds the
+      // shape: amplitude (in thirds) and weights step to the voice at once on a mode change, then at most every HOLD_S.
+      const goal = targetLevel(f)
+      let take = false
       if (reduced) {
-        goal = Math.round(goal * 3) / 3
-        tau = 0.15
-      } else if (goal > level) tau = 0.04
-      else tau = f.sinceInterrupt < INTERRUPT_FOR ? INTERRUPT_TAU : 0.18
-      level = approach(level, goal, dt, tau)
+        hold -= dt
+        take = hold <= 0 || held !== f.mode
+        if (take) {
+          hold = HOLD_S
+          held = f.mode
+          level = Math.round(goal * 3) / 3
+        }
+      } else {
+        held = null
+        const tau = goal > level ? 0.04 : f.sinceInterrupt < INTERRUPT_FOR ? INTERRUPT_TAU : 0.18
+        level = approach(level, goal, dt, tau)
+      }
 
       // Speed and weights glide (240 ms), so a mode change never jumps.
       const a = f.agent
@@ -191,8 +217,9 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
         const share = total > 0 ? (b === 0 ? e0 : b === 1 ? e1 : e2) / total : 1 / 3
         const base = p.weights === "bands" ? BAND_BASE[b]! + (1 - BAND_BASE[b]!) * share : p.weights[Math.min(i, 2)]!
         const w = base * outerWeight(i)
-        weights[i] = approach(weights[i]!, w, dt, p.weights === "bands" ? 0.12 : 0.24)
-        omega[i] = approach(omega[i]!, reduced ? 0 : p.omega[Math.min(i, 2)]! * outerOmega(i) * speed, dt, 0.24)
+        if (!reduced) weights[i] = approach(weights[i]!, w, dt, p.weights === "bands" ? 0.12 : 0.24)
+        else if (take) weights[i] = w
+        omega[i] = reduced ? 0 : approach(omega[i]!, p.omega[Math.min(i, 2)]! * outerOmega(i) * speed, dt, 0.24)
         theta[i] = (theta[i]! + omega[i]! * dt) % (Math.PI * 2000)
       }
 
@@ -288,7 +315,7 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
 const character: Character = {
   id: "sine-lines",
   name: "Sine lines",
-  version: "1.1.0",
+  version: "1.1.1",
   contract: 1,
   family: "baseline",
   summary: "Three superimposed sine lines whose colour, speed and height follow the conversation.",
@@ -315,7 +342,7 @@ const character: Character = {
     { signal: "sinceInterrupt", effect: "For 0.6 s after an interruption the line falls with a 60 ms time constant instead of 180 ms." },
     { signal: "mode", effect: "Colour (grey / mint / amber / danger, 240 ms crossfade), line speed and minimum height, glow, breathing, sweep, dashes, the muted gap." },
     { signal: "options", effect: "lines (1 to 5), thickness, density, speed and glow change the drawing in every mode; they glide over about 0.2 s, apart from reduced motion, which snaps." },
-    { signal: "reducedMotion", effect: "Lines stop moving sideways; amplitude snaps to thirds; no breathing, sweep or glow; colour still shows the mode." }
+    { signal: "reducedMotion", effect: "Lines stop moving sideways; the shape is held: amplitude (in thirds) and line weights step to the voice on a mode change and then at most once a second; no breathing, sweep or glow; colour still shows the mode." }
   ],
   renderer: "2d",
   canvas: "stage",

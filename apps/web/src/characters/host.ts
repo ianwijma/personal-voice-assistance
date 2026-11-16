@@ -32,10 +32,10 @@
  */
 import { levels, readMicWindow } from "../lib/audio/levels.ts"
 import { BASELINE_ID } from "./choice.ts"
-import { type CanvasArea, type Character, type CharacterChoice, type Focus, type Mode, type OptionValues, type Palette, type Pointer, type Rgb } from "./contract.ts"
+import { type CanvasArea, type Character, type CharacterChoice, type Focus, type Mode, type OptionValues, type Palette, type Pointer, type Rgb, type VoiceFeatures } from "./contract.ts"
 import { manifestProblems } from "./manifest.ts"
 import { registry as defaultRegistry, type Registry } from "./registry.ts"
-import { areaOf, coreOf, Runner } from "./runner.ts"
+import { areaOf, coreOf, Runner, type StepInput } from "./runner.ts"
 import { agentOn, LiveVoice, standInAgent, standInUser, userOn } from "./voices.ts"
 
 /** The stage's live input, a plain object the page mutates in place (no React per frame). */
@@ -85,16 +85,26 @@ export interface HostOptions {
 }
 
 /**
- * The backing-store cap of a stage canvas, in device pixels: its pixel ratio is lowered until width × height ×
- * ratio² fits, but never below 1 (or the device's own ratio, if that is lower). About 1280 × 800 at ratio 2; a
- * 1920 × 1080 window at ratio 2 gets ratio 1.42. Box canvases are not capped (720 × 240 × 3² is 1.6 M).
+ * The backing-store cap of a stage canvas, in device pixels: its pixel ratio is lowered until the backing store
+ * (each side rounded to whole pixels, as the runner sizes it) fits, below 1 too when the CSS viewport alone is
+ * larger than the cap, but never below `STAGE_MIN_RATIO` (or the device's own ratio, if that is lower). About
+ * 1280 × 800 at ratio 2; a 1920 × 1080 window at ratio 2 gets ratio 1.42, a 3840 × 2160 one at ratio 1 gets
+ * 0.71. Only a viewport of more than four times the cap in CSS pixels (about 4100 × 4100) goes past it, at ratio
+ * 0.5. Box canvases are not capped (720 × 240 × 3² is 1.6 M).
  */
 export const STAGE_MAX_PIXELS = 4_200_000
+/** The lowest pixel ratio the cap lowers a stage canvas to. */
+export const STAGE_MIN_RATIO = 0.5
 
 /** The pixel ratio a stage canvas of `width` × `height` CSS px gets on a device of ratio `device`. */
 export const stageRatio = (width: number, height: number, device: number, maxPixels = STAGE_MAX_PIXELS): number => {
-  const fit = Math.sqrt(maxPixels / Math.max(1, width * height))
-  return Math.min(device, Math.max(Math.min(1, device), fit))
+  const w = Math.max(1, width)
+  const h = Math.max(1, height)
+  if (Math.max(1, Math.round(w * device)) * Math.max(1, Math.round(h * device)) <= maxPixels) return device
+  // The largest r with (w·r + ½)(h·r + ½) ≤ maxPixels: each side of the backing store rounds up by at most ½ px.
+  const b = (w + h) / 2
+  const fit = (-b + Math.sqrt(b * b - 4 * w * h * (0.25 - maxPixels))) / (2 * w * h)
+  return Math.max(Math.min(STAGE_MIN_RATIO, device), Math.min(device, fit))
 }
 
 export const FRAME_BUDGET_MS = 2
@@ -187,6 +197,8 @@ const hostLevel = (o: OptionValues | undefined): OptionValues | undefined => {
   for (const [k, v] of Object.entries(o)) if (k.startsWith("$")) out[k] = v
   return out
 }
+
+type Mutable<T> = { -readonly [K in keyof T]: T[K] }
 
 interface Active {
   readonly id: string
@@ -357,6 +369,8 @@ export const startCharacterHost = (primary: HTMLCanvasElement, input: HostInput,
   const agentStand = standInAgent()
   let outBuf = new Float32Array(2048)
   let clock = 0
+  /** This frame's voices, one object reused every frame (nothing is allocated per frame). */
+  const pair: { user: VoiceFeatures; agent: VoiceFeatures } = { user: userLive.features, agent: agentLive.features }
 
   // Characters.
   let choice = initial
@@ -388,17 +402,22 @@ export const startCharacterHost = (primary: HTMLCanvasElement, input: HostInput,
 
   const storedFor = (id: string): OptionValues | undefined => (choice !== undefined && choice.character === id ? choice.options : hostLevel(choice?.options))
 
+  /** Remove a canvas of the host's own (not the page's); a WebGL one gives its context back at once, not at GC. */
+  const dropCanvas = (canvas: HTMLCanvasElement, renderer: Character["renderer"]) => {
+    if (renderer === "webgl2") {
+      try {
+        canvas.getContext("webgl2")?.getExtension("WEBGL_lose_context")?.loseContext()
+      } catch {
+        // already lost
+      }
+    }
+    canvas.remove()
+  }
+
   const release = (a: Active, next: HTMLCanvasElement | null) => {
     a.runner.dispose()
     if (a.canvas !== primary) {
-      if (a.runner.character.renderer === "webgl2") {
-        try {
-          a.canvas.getContext("webgl2")?.getExtension("WEBGL_lose_context")?.loseContext()
-        } catch {
-          // already lost
-        }
-      }
-      a.canvas.remove()
+      dropCanvas(a.canvas, a.runner.character.renderer)
     } else if (next !== primary) {
       primary.width = primary.width // clears it
     }
@@ -445,18 +464,30 @@ export const startCharacterHost = (primary: HTMLCanvasElement, input: HostInput,
         for (let i = 0; i < n; i++) w[w.length - n + i] = outBuf[outBuf.length - n + i]!
         hasAgent = true
       }
-      const agent = agentLive.step(dt, hasAgent)
-      return { user, agent }
+      pair.agent = agentLive.step(dt, hasAgent)
+      pair.user = user
+      return pair
     }
-    const user = userStand.step(core === "hearing" ? "voice" : core === "listening" ? "room" : "silent", clock, dt)
-    const agent = agentStand.step(core === "speaking" ? "voice" : "silent", clock, dt)
-    return { user, agent }
+    pair.user = userStand.step(core === "hearing" ? "voice" : core === "listening" ? "room" : "silent", clock, dt)
+    pair.agent = agentStand.step(core === "speaking" ? "voice" : "silent", clock, dt)
+    return pair
   }
 
+  // The runner's input, two objects (a box's, without a focus, and a stage's) filled in place every frame.
+  const boxStep: Mutable<StepInput> = { mode: input.state, dt: 0, user: pair.user, agent: pair.agent, palette, reducedMotion: reduced, pointer, sinceInterrupt: Infinity }
+  const stageStep: Mutable<StepInput> = { ...boxStep, pointer: stagePointer, focus }
+
   /** Draw one frame. Call `place(a)` first: the layout reads are kept out of the character's measured cost. */
-  const draw = (a: { readonly runner: Runner; readonly area: CanvasArea; readonly canvas: HTMLCanvasElement }, now: number, dt: number, user: ReturnType<typeof voices>["user"], agent: ReturnType<typeof voices>["agent"]) => {
-    const onStage = a.area === "stage"
-    a.runner.step({ mode: input.state, dt, user, agent, palette, reducedMotion: reduced, pointer: onStage ? stagePointer : pointer, sinceInterrupt: sinceInterrupt(now), ...(onStage ? { focus } : {}) })
+  const draw = (a: { readonly runner: Runner; readonly area: CanvasArea; readonly canvas: HTMLCanvasElement }, now: number, dt: number, user: VoiceFeatures, agent: VoiceFeatures) => {
+    const s = a.area === "stage" ? stageStep : boxStep
+    s.mode = input.state
+    s.dt = dt
+    s.user = user
+    s.agent = agent
+    s.palette = palette
+    s.reducedMotion = reduced
+    s.sinceInterrupt = sinceInterrupt(now)
+    a.runner.step(s)
   }
 
   let lastVoices = voices(performance.now(), 1 / 60)
@@ -481,8 +512,10 @@ export const startCharacterHost = (primary: HTMLCanvasElement, input: HostInput,
       place({ area, canvas })
       draw({ runner, area, canvas }, performance.now(), 1 / 60, lastVoices.user, lastVoices.agent)
     } catch (e) {
+      // A character that took a WebGL context and then failed (a shader that does not compile, say) has no instance
+      // to dispose; its context is released here as on a normal release.
       runner.dispose()
-      if (canvas !== primary) canvas.remove()
+      if (canvas !== primary) dropCanvas(canvas, character.renderer)
       throw new PhaseError(phase, e)
     }
     if (active !== null) release(active, canvas)
