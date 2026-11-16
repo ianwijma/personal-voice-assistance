@@ -31,6 +31,7 @@ import {
   typedTextTarget,
   TYPESAFE_GIVE_UP_MS,
   typesafeCandidates,
+  typesafeFallback,
   WAKE_ARMED_MS
 } from "@pva/protocol"
 import { Cause, Deferred, Effect, Exit, Fiber, Queue, type Scope, Stream } from "effect"
@@ -521,6 +522,12 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
     const dispatcher = makeSessionDispatcher<Target>({
       replyEarly: (assistant) => assistantOf(assistant)?.replyEarly ?? true,
       decide,
+      // The device may have changed while TypeSafe was asked: the answer goes only to an assistant it still has.
+      decideNow: () => {
+        const settings = options.deviceSettings()
+        const assistants = options.assistants()
+        return { candidates: typesafeCandidates(settings, assistants), fallback: typesafeFallback(settings, assistants) }
+      },
       make: (assistant, hooks) =>
         Effect.gen(function*() {
           const inbox = yield* Queue.unbounded<ConversationInput>()
