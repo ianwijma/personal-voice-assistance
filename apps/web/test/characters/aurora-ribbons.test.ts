@@ -70,6 +70,7 @@ interface VoiceOpts {
   register?: number
   syllableRate?: number
   bands?: number
+  brightness?: number
 }
 const voice = (o: VoiceOpts = {}): VoiceFeatures => {
   const f = createVoiceFeatures()
@@ -83,6 +84,7 @@ const voice = (o: VoiceOpts = {}): VoiceFeatures => {
   f.register = o.register ?? f.register
   f.syllableRate = o.syllableRate ?? 0
   f.bands.fill(o.bands ?? 0)
+  f.brightness = o.brightness ?? f.brightness
   return f
 }
 
@@ -160,6 +162,12 @@ describe("ribbons are born from syllables", () => {
   it("reduced motion spawns nothing: syllables change nothing in the still set", () => {
     const set = (voiceAt: (i: number) => VoiceFeatures) => JSON.stringify(closedPaths(play("hearing", 60, voiceAt, { reduced: true })))
     expect(set(syllables(5, { level: 0.5 }))).toBe(set(steady({ level: 0.5 })))
+  })
+
+  it("reduced motion holds the lenses while live pitch, spectrum, voicing and brightness keep changing", () => {
+    const live = (i: number) => voice({ level: 0.5, speaking: true, pitchDelta: 7 * Math.sin(i / 5), bands: 0.5 + 0.5 * Math.sin(i / 7), voicing: 0.5 + 0.5 * Math.cos(i / 9), brightness: 0.5 + 0.5 * Math.sin(i / 11) })
+    const held = (voiceAt: (i: number) => VoiceFeatures) => JSON.stringify(closedPaths(play("hearing", 120, voiceAt, { reduced: true })))
+    expect(held(live)).toBe(held(steady({ level: 0.5, speaking: true })))
   })
 
   it("never shows more ribbons than the ribbons option allows, however many syllables arrive", () => {
@@ -259,6 +267,19 @@ describe("form, style and the room they keep", () => {
       expect(hi(ys), `${form} bottom`).toBeLessThanOrEqual(H - 3 + 1e-6)
       expect(lo(xs), `${form} left`).toBeGreaterThanOrEqual(0)
       expect(hi(xs), `${form} right`).toBeLessThanOrEqual(W)
+    }
+  })
+
+  it("a falling or rising voice at the strongest tilt never pushes a ribbon outside the box, in either form", () => {
+    for (const form of ["mirrored", "rising"]) {
+      for (const pitchDelta of [-7, 7]) {
+        const voiceAt = syllables(6, { level: 1, speaking: true, syllableRate: 4, bands: 1, pitchDelta })
+        const ys: Array<number> = []
+        play("hearing", 300, voiceAt, { stored: { form, size: 1.4, intonation: 2 }, each: (calls) => ribbons(calls).forEach((p) => ys.push(...p.ys)) })
+        expect(ys.length, `${form} ${pitchDelta}`).toBeGreaterThan(0)
+        expect(lo(ys), `${form} ${pitchDelta} top`).toBeGreaterThanOrEqual(3 - 1e-6)
+        expect(hi(ys), `${form} ${pitchDelta} bottom`).toBeLessThanOrEqual(H - 3 + 1e-6)
+      }
     }
   })
 

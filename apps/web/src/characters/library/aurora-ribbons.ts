@@ -245,7 +245,11 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
       const L = lvl.step(reduced ? Math.round(level * 4) / 4 : level, dt)
       // Reduced motion holds the pose: the register (width and ripple of the still lenses) stays where it is.
       if (!reduced) reg = approach(reg, v.register, dt, 0.6)
-      if (live && v.speaking) {
+      // Reduced motion also holds the continuous drivers (intonation, liveliness, voicing, brightness, spectrum
+      // thirds): the lenses keep their pose while live audio changes; the tilt eases back to level.
+      if (reduced) {
+        rise = approach(rise, 0, dt, 0.6)
+      } else if (live && v.speaking) {
         rise = approach(rise, clamp(v.pitchDelta / 7, -1, 1), dt, 0.3)
         lively = approach(lively, clamp01(Math.abs(v.pitchDelta) / 7), dt, 0.8)
         rate = approach(rate, v.syllableRate, dt, 0.6)
@@ -261,9 +265,11 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
         mi += b[i + 8]!
         hi += b[i + 16]!
       }
-      band[0] = approach(band[0]!, lo / 8, dt, 0.08)
-      band[1] = approach(band[1]!, mi / 8, dt, 0.08)
-      band[2] = approach(band[2]!, hi / 8, dt, 0.08)
+      if (!reduced) {
+        band[0] = approach(band[0]!, lo / 8, dt, 0.08)
+        band[1] = approach(band[1]!, mi / 8, dt, 0.08)
+        band[2] = approach(band[2]!, hi / 8, dt, 0.08)
+      }
 
       // Spawning: every syllable onset blooms a ribbon; a quiet background rate keeps it alive.
       if (!reduced) {
@@ -329,7 +335,8 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
       const gather = clamp01(mix.hearing + mix.listening + 0.5 * mix.thinking)
       for (let j = 0; j < n; j++) env[j] = lerp(envWide[j]!, envGather[j]!, gather / (gather + sp + 1e-3))
       // "Rising": the horizon sits low and the ribbons only grow upward, with the room that frees.
-      const upS = (1 + 0.75 * rise * tiltK) * (1 + 1.0 * rising)
+      // Never negative: a strong falling tilt must not flip the upper half below the line.
+      const upS = Math.max(0, 1 + 0.75 * rise * tiltK) * (1 + 1.0 * rising)
       const dnS = Math.max(0.1, 1 - 0.75 * rise * tiltK) * (1 - rising)
       const y0 = lerp(H / 2, H * 0.86, rising)
       // Ribbons never leave the room they have, whatever the size and tilt.
@@ -402,8 +409,8 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
           const sc = pass === 0 ? 1 : 0.5
           g.beginPath()
           g.moveTo(j0 * STEP, y0)
-          for (let j = j0; j <= j1; j++) g.lineTo(j * STEP, y0 - Math.min(upMax, top[j]! * sc * upS))
-          for (let j = j1; j >= j0; j--) g.lineTo(j * STEP, y0 + Math.min(dnMax, top[j]! * sc * dnS))
+          for (let j = j0; j <= j1; j++) g.lineTo(j * STEP, y0 - Math.max(0, Math.min(upMax, top[j]! * sc * upS)))
+          for (let j = j1; j >= j0; j--) g.lineTo(j * STEP, y0 + Math.max(0, Math.min(dnMax, top[j]! * sc * dnS)))
           g.closePath()
           if (pass === 0) {
             if (fillA > 0.002) {
@@ -500,7 +507,7 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
 const character: Character = {
   id: "aurora-ribbons",
   name: "Aurora ribbons",
-  version: "1.1.0",
+  version: "1.1.1",
   contract: 1,
   family: "abstract",
   renderer: "2d",
