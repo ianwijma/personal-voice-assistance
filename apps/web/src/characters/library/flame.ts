@@ -218,7 +218,7 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
       const flick = soft((reduced ? 0.25 * (mix.hearing + mix.speaking) : mix.blend(0.15, 0.1, 0.6, 0.35, 0.75) + lv * 0.9) * stFlick, 1.7, 0.5)
       const tongues = Math.max(1.4, lerp(2.2, 5.5, voiceHi) + blendS(ST_TONGUES))
       // Never past the top of the canvas (not the box: the flame may rise above it), tongues included.
-      const hf = Math.min(heightS * S, (baseY + fo.y - CH * 0.02) / (1 + flick * 0.06))
+      const hf = Math.min(heightS * S, Math.max(0, baseY + fo.y - CH * 0.02) / (1 + flick * 0.06))
 
       // Pointer: hovering draws the flame toward it; a press blows it away from the finger.
       const pt = f.pointer
@@ -306,6 +306,7 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
       }
       g.fillStyle = css(cMid, 0.8)
       for (let k = 0; k < MAX_LICKS; k++) {
+        if (reduced) lAge[k] = 9 // a calm pose: licks already in flight are cleared, not frozen or left moving
         if (lAge[k]! > 0.45) continue
         lAge[k] = lAge[k]! + dt
         const a = lAge[k]! / 0.45
@@ -344,7 +345,11 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
       lastOnset = v.onset
       for (let i = 0; i < MAX_MOTES; i++) {
         if (mKind[i] === 0) continue
-        if (!reduced) {
+        if (reduced) {
+          mKind[i] = 0 // motes and sparks already in flight are cleared, not frozen or left moving
+          continue
+        }
+        {
           mLife[i] = mLife[i]! - dt
           if (mLife[i]! <= 0) {
             mKind[i] = 0
@@ -435,7 +440,7 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
 
 const design: Character = {
   id: "flame",
-  version: "1.1.0",
+  version: "1.1.1",
   contract: 1,
   name: "Flame",
   family: "abstract",

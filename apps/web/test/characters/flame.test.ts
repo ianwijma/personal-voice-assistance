@@ -126,6 +126,49 @@ describe("flame: stays on the canvas", () => {
   }
 })
 
+describe("flame: scrolled partly off the canvas", () => {
+  it("a box scrolled above the canvas gives a flat flame in reduced motion, never one drawn downward from the wick", async () => {
+    const r = new Runner(await fresh(), document.createElement("canvas"), { sparks: false, air: false })
+    r.create()
+    r.resize(1280, 800, 1)
+    const quiet = createVoiceFeatures()
+    recording.log = []
+    r.step({ mode: "listening", dt: 1 / 60, user: quiet, agent: quiet, palette: PALETTES.dark, reducedMotion: true, pointer: { x: 0, y: 0, down: false, inside: false }, sinceInterrupt: Infinity, focus: { x: 280, y: -200, width: 720, height: 240 } })
+    const ys = recording.log.filter((c) => c.name === "lineTo").map((c) => (c.args as [number, number])[1])
+    recording.log = null
+    r.dispose()
+    expect(ys.length).toBeGreaterThan(0)
+    expect(Math.max(...ys) - Math.min(...ys)).toBeLessThan(1e-6)
+  })
+})
+
+describe("flame: reduced motion switched on mid-animation", () => {
+  it("clears the licks and sparks already in flight and draws only the fixed pose", async () => {
+    const r = new Runner(await fresh(), document.createElement("canvas"), { air: false })
+    r.create()
+    r.resize(720, 240, 1)
+    const quiet = createVoiceFeatures()
+    const loud = createVoiceFeatures()
+    const step = (reducedMotion: boolean, onset: number) => {
+      loud.level = 0.8
+      loud.onset = onset
+      recording.log = []
+      r.step({ mode: "speaking", dt: 1 / 60, user: quiet, agent: loud, palette: PALETTES.dark, reducedMotion, pointer: { x: 0, y: 0, down: false, inside: false }, sinceInterrupt: Infinity })
+      const log = recording.log
+      recording.log = null
+      return { lines: log.filter((c) => c.name === "lineTo").length, arcs: log.filter((c) => c.name === "arc").length }
+    }
+    step(false, 0)
+    const live = step(false, 0.9) // the loud onset throws a lick
+    for (let i = 0; i < 5; i++) step(false, 0.9)
+    expect(live.lines, "a lick is on screen before").toBeGreaterThan(3 * 55)
+    const calm = step(true, 0.9)
+    r.dispose()
+    expect(calm.lines).toBe(3 * 55) // the three flame layers only, no lick
+    expect(calm.arcs).toBe(5) // the fixed sparks only, none in flight
+  })
+})
+
 describe("flame: pointer", () => {
   /**
    * Where the tip of the flame (the first point of its outer outline, the highest one) is, across the box, after a
