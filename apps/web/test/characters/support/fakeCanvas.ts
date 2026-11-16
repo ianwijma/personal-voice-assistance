@@ -5,11 +5,36 @@
  * extent of what is filled or stroked on a canvas marked as the stage, for the "stays inside the canvas" check.
  * The WebGL2 fake answers enough for a character to compile, link and draw (every shader compiles); its calls are
  * hashed too.
+ *
+ * Painted output is recorded apart from the call digest (`paints`, `paintDigest`): only a call that puts pixels on
+ * a canvas counts (2D `fill`, `stroke`, `fillRect`, `strokeRect`, `fillText`, `strokeText`, `drawImage`,
+ * `putImageData`; WebGL `draw*`), and the paint digest folds, at each paint, the calls since the previous paint
+ * and the state the paint is made with (styles, transform, dash; a drawn layer's content; WebGL's last value of
+ * each setting and uniform). Calls after the last paint, which show nothing, do not reach it.
+ *
+ * Like a browser, the 2D fake throws for a negative radius: `arc`, `arcTo`, `ellipse` and `createRadialGradient`
+ * an `IndexSizeError`, `roundRect` a `RangeError`; with a non-finite argument the path calls do nothing, as in a
+ * browser, and are counted (`nonFinite`).
  */
+
+const FNV = 0x811c9dc5
+const fold = (acc: number, n: number): number => Math.imul(acc ^ (n | 0), 0x01000193) >>> 0
 
 /** What one frame (or one run) drew. */
 export class Recording {
   calls = 0
+  /** Calls that put pixels on a canvas (see the header). */
+  paints = 0
+  /** 2D geometry calls given a non-finite number (a browser ignores them: the shape is not drawn). */
+  nonFinite = 0
+  /** Folded at each paint: the calls since the previous paint and the paint's state. */
+  paintHash = FNV
+  /** The calls since the previous paint. */
+  private pending = FNV
+  /** A scratch recording for state snapshots: objects with a `__digest` (gradients, layers) count by it. */
+  private readonly objects: boolean
+  /** While set, `mix` adds to the call digest only (a property set: a paint reads properties by value). */
+  quiet = false
   /** When set, every 2D call and property set is also appended here (for tests that look at what was drawn). */
   log: Array<{ readonly name: string; readonly args: ReadonlyArray<unknown> }> | null = null
   hash = 0x811c9dc5
@@ -19,9 +44,17 @@ export class Recording {
   maxX = -Infinity
   maxY = -Infinity
 
+  constructor(objects = false) {
+    this.objects = objects
+  }
+
   reset(): void {
     this.calls = 0
     this.hash = 0x811c9dc5
+    this.paints = 0
+    this.nonFinite = 0
+    this.paintHash = FNV
+    this.pending = FNV
     this.minX = this.minY = Infinity
     this.maxX = this.maxY = -Infinity
   }
@@ -30,6 +63,18 @@ export class Recording {
     let h = this.hash ^ (n | 0)
     h = Math.imul(h, 0x01000193)
     this.hash = h >>> 0
+    if (!this.quiet) this.pending = fold(this.pending, n)
+  }
+
+  /** One paint, made with the state digest `state`. */
+  paint(state: number): void {
+    this.paints++
+    this.paintHash = fold(fold(this.paintHash, this.pending), state)
+    this.pending = FNV
+  }
+
+  get paintDigest(): string {
+    return this.paintHash.toString(16).padStart(8, "0")
   }
 
   str(s: string): void {
@@ -50,6 +95,13 @@ export class Recording {
     } else if (Array.isArray(v)) {
       for (const x of v) this.value(x)
       this.mix(v.length)
+    } else if (this.objects && typeof (v as { __digest?: unknown }).__digest === "function") this.mix((v as { __digest: () => number }).__digest())
+    else if (this.objects && ArrayBuffer.isView((v as { data?: unknown }).data)) {
+      // Image data: a spread sample of its bytes.
+      const a = (v as { data: ArrayLike<number> }).data
+      const stride = Math.max(1, Math.floor(a.length / 256))
+      for (let i = 0; i < a.length; i += stride) this.mix(a[i]!)
+      this.mix(a.length)
     } else this.mix(4)
   }
 
@@ -112,17 +164,85 @@ const imageData = (w: number, h: number) => {
   return { width, height, data: new Uint8ClampedArray(width * height * 4), colorSpace: "srgb" }
 }
 
-const gradient = (rec: Recording) => ({
-  addColorStop: (offset: number, color: string) => {
-    rec.mix(idOf("addColorStop"))
-    rec.value(offset)
-    rec.value(color)
+/** A gradient; `__digest` (for paint state only) covers how it was made and its stops. */
+const gradient = (rec: Recording, kind: string, args: ReadonlyArray<unknown>) => {
+  const own = new Recording(true)
+  own.str(kind)
+  for (const a of args) own.value(a)
+  return {
+    addColorStop: (offset: number, color: string) => {
+      rec.mix(idOf("addColorStop"))
+      rec.value(offset)
+      rec.value(color)
+      own.value(offset)
+      own.value(color)
+    },
+    __digest: () => own.hash
   }
-})
+}
+
+/** What is on each fake canvas, as a digest (for a `drawImage` of it): every paint since it was last cleared. */
+const contents = new WeakMap<object, () => number>()
+
+const PAINTS_2D = new Set(["fill", "stroke", "fillRect", "strokeRect", "fillText", "strokeText", "drawImage", "putImageData"])
+const PAINTS_GL = new Set(["drawArrays", "drawElements", "drawArraysInstanced", "drawElementsInstanced", "drawRangeElements"])
+/** 2D calls whose numbers are geometry: a non-finite one makes a browser skip the call. */
+const GEOMETRY = new Set(["moveTo", "lineTo", "quadraticCurveTo", "bezierCurveTo", "arc", "arcTo", "ellipse", "rect", "roundRect", "fillRect", "strokeRect", "clearRect", "fillText", "strokeText", "translate", "scale", "rotate", "transform", "setTransform", "drawImage"])
+
+const finite = (args: ReadonlyArray<unknown>): boolean => {
+  for (const a of args) if (typeof a === "number" && !Number.isFinite(a)) return false
+  return true
+}
+const negativeRadius = (call: string, r: number): never => {
+  throw new DOMException(`Failed to execute '${call}' on 'CanvasRenderingContext2D': The radius provided (${r}) is negative.`, "IndexSizeError")
+}
+/** `roundRect`'s radii, as a browser checks them: 1 to 4 of them, none negative. True when they are all finite. */
+const checkRadii = (radii: unknown): boolean => {
+  if (radii === undefined) return true
+  const list: ReadonlyArray<unknown> = Array.isArray(radii) ? radii : [radii]
+  if (list.length < 1 || list.length > 4) throw new RangeError(`Failed to execute 'roundRect' on 'CanvasRenderingContext2D': ${list.length} radii provided. Between one and four radii are necessary.`)
+  let ok = true
+  for (const r of list) {
+    const parts = typeof r === "number" ? [r] : typeof r === "object" && r !== null ? [Number((r as { x?: unknown }).x ?? 0), Number((r as { y?: unknown }).y ?? 0)] : [Number(r)]
+    for (const v of parts) {
+      if (!Number.isFinite(v)) ok = false
+      else if (v < 0) throw new RangeError(`Failed to execute 'roundRect' on 'CanvasRenderingContext2D': Radius value ${v} is negative.`)
+    }
+  }
+  return ok
+}
 
 interface CanvasLike {
   width: number
   height: number
+}
+
+/** Fold a call's arguments into `h` (numbers to 0.1, strings by their characters; objects count as one value). */
+const foldArgs = (h: number, args: ReadonlyArray<unknown>): number => {
+  for (const a of args) {
+    if (typeof a === "number") h = fold(h, Number.isFinite(a) ? Math.round(a * 10) : 0x7fffffff)
+    else if (typeof a === "string") {
+      for (let i = 0; i < a.length; i++) h = fold(h, a.charCodeAt(i))
+      h = fold(h, a.length)
+    } else if (typeof a === "boolean") h = fold(h, a ? 1 : 2)
+    else h = fold(h, 4)
+  }
+  return h
+}
+
+/** The 2D properties every paint is made with, and those each kind of paint adds. */
+const COMMON_STATE = ["globalAlpha", "globalCompositeOperation", "filter", "shadowBlur", "shadowColor", "shadowOffsetX", "shadowOffsetY"]
+const TEXT_STATE = ["font", "textAlign", "textBaseline", "direction", "letterSpacing", "wordSpacing", "fontKerning"]
+const STROKE_STATE = ["strokeStyle", "lineWidth", "lineCap", "lineJoin", "miterLimit", "lineDashOffset"]
+const PAINT_STATE: { readonly [paint: string]: ReadonlyArray<string> } = {
+  fill: [...COMMON_STATE, "fillStyle"],
+  fillRect: [...COMMON_STATE, "fillStyle"],
+  fillText: [...COMMON_STATE, "fillStyle", ...TEXT_STATE],
+  stroke: [...COMMON_STATE, ...STROKE_STATE],
+  strokeRect: [...COMMON_STATE, ...STROKE_STATE],
+  strokeText: [...COMMON_STATE, ...STROKE_STATE, ...TEXT_STATE],
+  drawImage: [...COMMON_STATE, "imageSmoothingEnabled", "imageSmoothingQuality"],
+  putImageData: []
 }
 
 /** A recording 2D context for `canvas`. */
@@ -139,6 +259,41 @@ export const fake2d = (canvas: CanvasLike, rec: Recording = recording): CanvasRe
   let pMaxX = -Infinity
   let pMaxY = -Infinity
   const track = stages.has(canvas)
+  // Paint state: the properties this kind of paint uses (wherever they were set, this frame or before) and the
+  // transform; for `fill` and `stroke` the path since `beginPath`; and what a drawn canvas holds (every paint on it
+  // since it was last cleared).
+  const scratch = new Recording(true)
+  let pathHash = FNV
+  let content = FNV
+  contents.set(canvas, () => content)
+  const stateDigest = (prop: string): number => {
+    scratch.reset()
+    for (const k of PAINT_STATE[prop] ?? COMMON_STATE) {
+      const v = props.get(k)
+      if (v === undefined) continue
+      scratch.str(k)
+      scratch.value(v)
+    }
+    for (const v of m) scratch.value(v)
+    if (prop === "stroke" || prop === "strokeRect" || prop === "strokeText") scratch.value(dash)
+    return scratch.hash
+  }
+  const paintNow = (id: number, prop: string, args: ReadonlyArray<unknown>) => {
+    let h = fold(stateDigest(prop), id)
+    if (prop === "fill" || prop === "stroke") h = fold(h, pathHash)
+    h = foldArgs(h, args)
+    if (prop === "drawImage") {
+      const src = args[0]
+      const c = typeof src === "object" && src !== null ? contents.get(src) : undefined
+      if (c !== undefined) h = fold(h, c())
+    } else if (prop === "putImageData") {
+      scratch.reset()
+      scratch.value(args[0])
+      h = fold(h, scratch.hash)
+    }
+    rec.paint(h)
+    content = fold(content, h)
+  }
   const point = (x: number, y: number) => {
     if (!track || !Number.isFinite(x) || !Number.isFinite(y)) return
     const dx = m[0] * x + m[2] * y + m[4]
@@ -206,6 +361,11 @@ export const fake2d = (canvas: CanvasLike, rec: Recording = recording): CanvasRe
       props.clear()
       stack.length = 0
       resetPath()
+      pathHash = FNV
+      content = FNV
+    },
+    clearRect: () => {
+      content = FNV
     },
     setTransform: ((a: number | { a: number; b: number; c: number; d: number; e: number; f: number } = 1, b = 0, c = 0, d = 1, e = 0, f = 0) => {
       m = typeof a === "object" ? [a.a, a.b, a.c, a.d, a.e, a.f] : [a, b, c, d, e, f]
@@ -223,18 +383,33 @@ export const fake2d = (canvas: CanvasLike, rec: Recording = recording): CanvasRe
     lineTo: ((x: number, y: number) => point(x, y)) as never,
     quadraticCurveTo: ((_cx: number, _cy: number, x: number, y: number) => point(x, y)) as never,
     bezierCurveTo: ((_a: number, _b: number, _c: number, _d: number, x: number, y: number) => point(x, y)) as never,
-    arcTo: ((x1: number, y1: number, x2: number, y2: number) => {
+    arcTo: ((x1: number, y1: number, x2: number, y2: number, r: number) => {
+      if (!finite([x1, y1, x2, y2, r])) return
+      if (r < 0) negativeRadius("arcTo", r)
       point(x1, y1)
       point(x2, y2)
     }) as never,
-    arc: ((x: number, y: number, r: number, a0: number, a1: number, ccw = false) => arcPoints(x, y, Math.abs(r), Math.abs(r), 0, a0, a1, ccw)) as never,
-    ellipse: ((x: number, y: number, rx: number, ry: number, rot: number, a0: number, a1: number, ccw = false) => arcPoints(x, y, Math.abs(rx), Math.abs(ry), rot, a0, a1, ccw)) as never,
+    arc: ((x: number, y: number, r: number, a0: number, a1: number, ccw = false) => {
+      if (!finite([x, y, r, a0, a1])) return
+      if (r < 0) negativeRadius("arc", r)
+      arcPoints(x, y, r, r, 0, a0, a1, ccw)
+    }) as never,
+    ellipse: ((x: number, y: number, rx: number, ry: number, rot: number, a0: number, a1: number, ccw = false) => {
+      if (!finite([x, y, rx, ry, rot, a0, a1])) return
+      if (rx < 0) negativeRadius("ellipse", rx)
+      if (ry < 0) negativeRadius("ellipse", ry)
+      arcPoints(x, y, rx, ry, rot, a0, a1, ccw)
+    }) as never,
     clip: () => {
       if (pMinX === Infinity) return
       clip = [Math.max(clip[0], pMinX), Math.max(clip[1], pMinY), Math.min(clip[2], pMaxX), Math.min(clip[3], pMaxY)]
     },
     rect: ((x: number, y: number, w: number, h: number) => box(x, y, w, h)) as never,
-    roundRect: ((x: number, y: number, w: number, h: number) => box(x, y, w, h)) as never,
+    roundRect: ((x: number, y: number, w: number, h: number, radii?: unknown) => {
+      if (!finite([x, y, w, h])) return
+      if (!checkRadii(radii)) return
+      box(x, y, w, h)
+    }) as never,
     // Only solid paint counts towards the extent: a gradient or pattern is a glow or a halo, meant to fade out at
     // the canvas edge, and its geometry (often a big circle) says nothing about where it is visible.
     fill: () => {
@@ -271,9 +446,12 @@ export const fake2d = (canvas: CanvasLike, rec: Recording = recording): CanvasRe
       dash = [...d]
     }) as never,
     getLineDash: () => [...dash],
-    createLinearGradient: () => gradient(rec),
-    createRadialGradient: () => gradient(rec),
-    createConicGradient: () => gradient(rec),
+    createLinearGradient: ((...a: Array<unknown>) => gradient(rec, "linear", a)) as never,
+    createRadialGradient: ((x0: number, y0: number, r0: number, x1: number, y1: number, r1: number) => {
+      if (r0 < 0 || r1 < 0) throw new DOMException(`Failed to execute 'createRadialGradient' on 'CanvasRenderingContext2D': The ${r0 < 0 ? "r0" : "r1"} provided is less than 0.`, "IndexSizeError")
+      return gradient(rec, "radial", [x0, y0, r0, x1, y1, r1])
+    }) as never,
+    createConicGradient: ((...a: Array<unknown>) => gradient(rec, "conic", a)) as never,
     createPattern: () => ({ setTransform: () => undefined }),
     createImageData: ((w: number | { width: number; height: number }, h?: number) => (typeof w === "object" ? imageData(w.width, w.height) : imageData(w, h ?? 1))) as never,
     getImageData: ((_x: number, _y: number, w: number, h: number) => imageData(w, h)) as never,
@@ -295,12 +473,20 @@ export const fake2d = (canvas: CanvasLike, rec: Recording = recording): CanvasRe
       if (fn === undefined) {
         const id = idOf(prop)
         const own = special[prop] as ((...a: Array<unknown>) => unknown) | undefined
+        const paints = PAINTS_2D.has(prop)
+        const geometry = GEOMETRY.has(prop)
+        const begins = prop === "beginPath"
         fn = (...args: Array<unknown>) => {
           rec.calls++
           rec.mix(id)
           for (const a of args) rec.value(a)
           rec.log?.push({ name: prop, args })
-          return own?.(...args)
+          if (geometry && !finite(args)) rec.nonFinite++
+          const out = own?.(...args)
+          if (paints) paintNow(id, prop, args)
+          else if (begins) pathHash = FNV
+          else pathHash = foldArgs(fold(pathHash, id), args)
+          return out
         }
         fns.set(prop, fn)
       }
@@ -309,8 +495,11 @@ export const fake2d = (canvas: CanvasLike, rec: Recording = recording): CanvasRe
     set(_t, prop, value) {
       if (typeof prop === "symbol") return true
       props.set(prop, value)
+      // In the call digest as before, but not in what the next paint folds: a paint counts a property by its value.
+      rec.quiet = true
       rec.mix(idOf(prop))
       rec.value(value)
+      rec.quiet = false
       rec.log?.push({ name: `=${prop}`, args: [value] })
       return true
     }
@@ -321,6 +510,23 @@ export const fake2d = (canvas: CanvasLike, rec: Recording = recording): CanvasRe
 /** A WebGL2 context that accepts everything: shaders compile, programs link, draws are hashed. */
 export const fakeWebgl2 = (canvas: CanvasLike, rec: Recording = recording): WebGL2RenderingContext => {
   const fns = new Map<string, (...a: Array<unknown>) => unknown>()
+  // Paint state: the last arguments of every setting call, by call and target (a uniform by its name).
+  const settings = new Map<string, ReadonlyArray<unknown>>()
+  const scratch = new Recording(true)
+  let content = FNV
+  contents.set(canvas, () => content)
+  const keyOf = (prop: string, a0: unknown): string =>
+    `${prop}:${typeof a0 === "object" && a0 !== null && "uniform" in a0 ? String((a0 as { uniform: unknown }).uniform) : typeof a0 === "number" || typeof a0 === "string" ? String(a0) : ""}`
+  const paintNow = (id: number, args: ReadonlyArray<unknown>) => {
+    scratch.reset()
+    for (const [k, v] of settings) {
+      scratch.str(k)
+      for (const a of v) scratch.value(a)
+    }
+    const h = foldArgs(fold(scratch.hash, id), args)
+    rec.paint(h)
+    content = fold(content, h)
+  }
   const answer = (prop: string, args: Array<unknown>): unknown => {
     if (prop.startsWith("create")) return { kind: prop }
     switch (prop) {
@@ -366,10 +572,14 @@ export const fakeWebgl2 = (canvas: CanvasLike, rec: Recording = recording): WebG
       let fn = fns.get(prop)
       if (fn === undefined) {
         const id = idOf(prop)
+        const paints = PAINTS_GL.has(prop)
+        const setting = !paints && !/^(get|create|is|check)/.test(prop)
         fn = (...args: Array<unknown>) => {
           rec.calls++
           rec.mix(id)
           for (const a of args) rec.value(a)
+          if (paints) paintNow(id, args)
+          else if (setting) settings.set(keyOf(prop, args[0]), args)
           return answer(prop, args)
         }
         fns.set(prop, fn)

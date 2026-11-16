@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
-import { STOP_FALLBACK_MS, VoiceAudio } from "../src/lib/audio/VoiceAudio.ts"
+import { analyserSize, STOP_FALLBACK_MS, VoiceAudio } from "../src/lib/audio/VoiceAudio.ts"
 import { flush, installFakeAudio, tokenFor } from "./fakeAudio.ts"
 
 let fake: ReturnType<typeof installFakeAudio>
@@ -226,5 +226,19 @@ describe("VoiceAudio unconfirmed items (second review)", () => {
     await expect(Promise.race([resumed.then(() => "done"), new Promise((r) => setTimeout(() => r("stuck"), 200))])).resolves.toBe("done")
     expect(ctx.state).toBe("running")
     expect(el.paused).toBe(false)
+  })
+})
+
+describe("the output analyser's size (review of #12, finding 1)", () => {
+  it("covers the stage's 40 ms window at the context's rate; 44.1 and 48 kHz keep 2048", () => {
+    expect(analyserSize(44_100)).toBe(2048)
+    expect(analyserSize(48_000)).toBe(2048)
+    expect(analyserSize(16_000)).toBe(2048)
+    expect(analyserSize(88_200)).toBe(4096)
+    expect(analyserSize(96_000)).toBe(4096) // 3840 samples needed
+    expect(analyserSize(192_000)).toBe(8192)
+    expect(analyserSize(768_000)).toBe(32768)
+    expect(analyserSize(Number.NaN)).toBe(2048)
+    for (const rate of [22_050, 44_100, 48_000, 88_200, 96_000, 176_400, 192_000, 384_000]) expect(analyserSize(rate)).toBeGreaterThanOrEqual(0.04 * rate)
   })
 })

@@ -804,7 +804,7 @@ Drawn with the device pixel ratio for crisp lines; per-frame work under 2 ms (on
 - **Transitions**: colour crossfades over 240 ms (draw the old and new colour with complementary alpha). On an interruption (`turn.end` interrupted, or local Stop), the falling time constant drops to 60 ms so the amber line collapses quickly, then mint takes over.
 - **Label** under the line: mono 12 px upper case: `LISTENING`, `HEARING YOU`, `THINKING`, `SPEAKING · <voice>` (voice name shown when more than one voice is enabled), `MIC OFF`, `RECONNECTING · n`, `NOT CONNECTED`. It is an `aria-live="polite"` region (the only announcement of state changes).
 - **Captions** (on by default; per-device toggle): under the label, centred, at most two lines. In `hearing`: the interim transcript in `you`. In `speaking`: the clause that is playing in `ink`, the next one in `ink-muted`. They fade out 2 s after the state ends.
-- **Reduced motion** (`prefers-reduced-motion: reduce`): `ω = 0`, no breathing, no sweep, no glow; the amplitude still follows the level but is quantised to 4 steps and smoothed with τ = 150 ms, and colour changes are instant. The label carries the state.
+- **Reduced motion** (`prefers-reduced-motion: reduce`): `ω = 0`, no breathing, no sweep, no glow; the shape is held: the amplitude still follows the level, quantised to 4 steps, and the line weights still follow the spectrum, but both step to the current values only on a mode change and then at most once a second, with no gliding in between (sine-lines 1.1.1); colour changes are instant. The label carries the state.
 
 ### 3.4 Starting
 

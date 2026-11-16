@@ -306,9 +306,10 @@ export interface Character {
   /** Which voice signal moves what. Be exact: these are the character's promises. */
   readonly mappings: ReadonlyArray<{ readonly signal: string; readonly effect: string }>
   /**
-   * Extensions this character can take advantage of, each with what it does
-   * without them. All optional: the character works with none. The host uses
-   * this to decide what is worth producing.
+   * The extensions this character's code reads from `frame.ext` today, each with
+   * what it does without them; only those (not one it might use one day). All
+   * optional: the character works with none. The host uses this to decide what is
+   * worth producing (docs/CHARACTERS.md §3, §4.2).
    */
   readonly uses?: ReadonlyArray<{ readonly ext: string; readonly gain: string; readonly without: string }>
   /** What it draws with. A host skips renderers it does not offer. */

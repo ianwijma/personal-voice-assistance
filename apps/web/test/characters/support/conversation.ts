@@ -79,6 +79,11 @@ export interface RunResult {
   readonly last: string
   /** Drawing calls in the last frame. */
   readonly lastCalls: number
+  /** Calls that put pixels on a canvas in the last frame (`fakeCanvas.ts`), and their digest: what it showed. */
+  readonly lastPaints: number
+  readonly lastPaint: string
+  /** 2D geometry calls given a non-finite number over the run (a browser skips them). */
+  readonly nonFinite: number
   /** Total drawing calls over the run. */
   readonly calls: number
   /** How far drawing went outside the canvas over the run, CSS px (0 when it stayed inside). */
@@ -113,6 +118,9 @@ export const run = (character: Character, o: RunOptions): RunResult => {
   let spent = 0
   let last = ""
   let lastCalls = 0
+  let lastPaints = 0
+  let lastPaint = ""
+  let nonFinite = 0
   let prev: Mode | null = null
   let ex0 = Infinity
   let ey0 = Infinity
@@ -162,6 +170,9 @@ export const run = (character: Character, o: RunOptions): RunResult => {
     }
     last = recording.digest
     lastCalls = recording.calls
+    lastPaint = recording.paintDigest
+    lastPaints = recording.paints
+    nonFinite += recording.nonFinite
     while (next < checkpoints.length && t + 1e-9 >= checkpoints[next]!) {
       frames.push({ t: Math.round(checkpoints[next]! * 100) / 100, mode, calls: recording.calls, digest: recording.digest })
       next++
@@ -169,5 +180,5 @@ export const run = (character: Character, o: RunOptions): RunResult => {
   }
   runner.dispose()
   const extent = ex0 === Infinity ? null : { minX: ex0, minY: ey0, maxX: ex1, maxY: ey1 }
-  return { frames, last, lastCalls, calls, overflow, meanFrameMs: spent / steps, extent }
+  return { frames, last, lastCalls, lastPaints, lastPaint, nonFinite, calls, overflow, meanFrameMs: spent / steps, extent }
 }

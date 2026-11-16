@@ -4,7 +4,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import type { Character, CharacterChoice, Focus, Frame, Mode, Pointer } from "@/characters/contract.ts"
-import { type AudioTaps, type CharacterHost, type HostInput, type HostOptions, STAGE_MAX_PIXELS, stageRatio, startCharacterHost } from "@/characters/host.ts"
+import { type AudioTaps, type CharacterHost, type HostInput, type HostOptions, STAGE_MAX_PIXELS, STAGE_MIN_RATIO, stageRatio, startCharacterHost } from "@/characters/host.ts"
 import { BASELINE_ID, registry as appRegistry, type Registry } from "@/characters/registry.ts"
 import { installFakeCanvas } from "./support/fakeCanvas.ts"
 import { installPage, type Page } from "./support/page.ts"
@@ -118,7 +118,10 @@ describe("loading and swapping", () => {
     expect(appRegistry.ids).toContain(BASELINE_ID)
     expect(await appRegistry.load(BASELINE_ID)).toBe(appRegistry.baseline)
     expect(appRegistry.load("no-such-character")).toBeUndefined()
-    for (const id of appRegistry.ids) expect(appRegistry.load(id)).toBeInstanceOf(Promise)
+    // Awaited, so no load is still running when the test environment is torn down.
+    const loads = appRegistry.ids.map((id) => appRegistry.load(id))
+    for (const l of loads) expect(l).toBeInstanceOf(Promise)
+    for (const c of await Promise.all(loads)) expect(c).toBeDefined()
   })
 
   it("a choice that arrives while another is loading wins", async () => {
@@ -390,6 +393,58 @@ describe("the loop and the canvas", () => {
     expect(host.debug().id).toBe(BASELINE_ID)
   })
 
+  it("releases the WebGL context of a character that fails while it is put on stage (create, resize or first frame)", async () => {
+    // A WebGL context whose release can be seen: `WEBGL_lose_context.loseContext()` counts, per canvas.
+    const proto = HTMLCanvasElement.prototype as unknown as { getContext: (this: HTMLCanvasElement, type: string, ...rest: Array<unknown>) => unknown }
+    const original = proto.getContext
+    const lost: Array<HTMLCanvasElement> = []
+    const gls = new WeakMap<HTMLCanvasElement, object>()
+    const glFor = (el: HTMLCanvasElement) => ({ getExtension: (name: string) => (name === "WEBGL_lose_context" ? { loseContext: () => void lost.push(el) } : null) })
+    proto.getContext = function (this: HTMLCanvasElement, type: string, ...rest: Array<unknown>) {
+      if (type !== "webgl2") return original.call(this, type, ...rest)
+      let gl = gls.get(this)
+      if (gl === undefined) {
+        gl = glFor(this)
+        gls.set(this, gl)
+      }
+      return gl
+    }
+    try {
+      const failing = (id: string, phase: "create" | "resize" | "frame"): Character => ({
+        ...spy({ id }).character,
+        renderer: "webgl2",
+        create: (c) => {
+          c.getContext("webgl2") // took a context, then the shader did not compile
+          if (phase === "create") throw new Error("shader compile failed")
+          return {
+            resize: () => {
+              if (phase === "resize") throw new Error("resize broke")
+            },
+            frame: () => {
+              throw new Error("frame broke")
+            },
+            dispose: () => undefined
+          }
+        }
+      })
+      const chars = { a: failing("a", "create"), b: failing("b", "resize"), c: failing("c", "frame") }
+      const { reg } = registryOf(chars)
+      const host = start({ state: "idle", owner: false }, undefined, { registry: reg })
+      const box = canvas.parentElement!
+      for (const [id, phase] of [["a", "create"], ["b", "resize"], ["c", "frame"]] as const) {
+        const before = lost.length
+        host.setChoice({ character: id })
+        await host.ready()
+        expect(host.debug(), id).toMatchObject({ id: BASELINE_ID, fallback: { id, reason: phase } })
+        expect(lost.length - before, `${id}: its context was released`).toBe(1)
+        expect(lost.at(-1)!.isConnected, `${id}: its canvas was removed`).toBe(false)
+        expect(box.querySelectorAll("canvas"), id).toHaveLength(1)
+      }
+    } finally {
+      proto.getContext = original
+    }
+  })
+
   it("disposes everything on stop", async () => {
     const s = spy()
     const { reg } = registryOf({ spy: s.character })
@@ -555,9 +610,10 @@ describe("the full stage (docs/CHARACTERS.md §2.6)", () => {
     await host.ready()
     const [w, h, d] = s.resizes.at(-1)!
     expect([w, h]).toEqual([1920, 1080])
-    expect(d).toBeCloseTo(Math.sqrt(STAGE_MAX_PIXELS / (1920 * 1080)), 9)
+    expect(d).toBe(stageRatio(1920, 1080, 2))
+    expect(d).toBeCloseTo(Math.sqrt(STAGE_MAX_PIXELS / (1920 * 1080)), 3)
     const own = stageCanvases()[0]!
-    expect(own.width * own.height).toBeLessThanOrEqual(STAGE_MAX_PIXELS * 1.002)
+    expect(own.width * own.height).toBeLessThanOrEqual(STAGE_MAX_PIXELS)
     expect(host.debug().size.ratio).toBe(d)
     setRatio(1)
     page.frames(2)
@@ -570,12 +626,24 @@ describe("the full stage (docs/CHARACTERS.md §2.6)", () => {
     expect(canvas.width).toBe(1440)
   })
 
-  it("the cap: ratio lowered to fit, never below 1 (or the device's own), never above the device's", () => {
+  it("the cap: ratio lowered until the rounded backing store fits, below 1 if need be, never below 0.5 (or the device's own), never above the device's", () => {
+    const store = (w: number, h: number, r: number) => Math.max(1, Math.round(w * r)) * Math.max(1, Math.round(h * r))
     expect(stageRatio(1280, 800, 2)).toBe(2) // 4.1 M device pixels: fits
-    expect(stageRatio(1920, 1080, 2)).toBeCloseTo(1.4235, 3)
+    expect(stageRatio(1920, 1080, 2)).toBeCloseTo(1.4228, 3)
     expect(stageRatio(390, 844, 3)).toBe(3) // a phone: 2.96 M device pixels, under the cap
-    expect(stageRatio(3840, 2160, 1)).toBe(1)
-    expect(stageRatio(3840, 2160, 0.8)).toBe(0.8)
-    expect(stageRatio(1920, 1080, 1, 1_000_000)).toBe(1)
+    expect(stageRatio(1920, 1080, 1)).toBe(1)
+    // A CSS viewport larger than the cap: the ratio goes below 1 (the cap is a real cap), down to 0.5.
+    expect(stageRatio(3840, 2160, 1)).toBeCloseTo(0.7114, 3)
+    expect(stageRatio(3840, 2160, 0.8)).toBeCloseTo(0.7114, 3)
+    expect(stageRatio(3840, 2160, 0.6)).toBe(0.6)
+    expect(stageRatio(1920, 1080, 1, 1_000_000)).toBeCloseTo(0.6941, 3)
+    expect(stageRatio(8000, 6000, 2)).toBe(STAGE_MIN_RATIO)
+    expect(stageRatio(8000, 6000, 0.4)).toBe(0.4)
+    // The backing store the runner makes (each side rounded) never exceeds the cap, unless the 0.5 floor is reached.
+    for (const [w, h, d] of [[1920, 1080, 2], [3840, 2160, 1], [2560, 1440, 2], [5120, 2880, 2], [1921, 1081, 3], [2999.5, 1700.25, 1.75], [1280, 801, 2]] as const) {
+      const r = stageRatio(w, h, d)
+      expect(store(w, h, r), `${w}×${h} at ${d}`).toBeLessThanOrEqual(STAGE_MAX_PIXELS)
+      expect(r).toBeLessThanOrEqual(d)
+    }
   })
 })

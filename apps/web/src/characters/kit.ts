@@ -67,9 +67,41 @@ export class Spring {
     this.value = initial
   }
   step(target: number, dt: number): number {
-    // Semi-implicit Euler in sub-steps of at most 1/240 s: stable for any dt the host sends.
     const omega = 1.678 / Math.max(1e-3, this.halfLife) // (1 + ωt)·e^(−ωt) = ½ at ωt ≈ 1.678
     const zeta = 1 - clamp(this.bounce, 0, 0.9)
+    if (!(dt > 0)) return this.value
+    // Fully decayed (e^−50 ≈ 2e-22): snap, so an enormous dt costs nothing and cannot overflow.
+    if (dt * zeta * omega > 50) {
+      this.value = target
+      this.velocity = 0
+      return this.value
+    }
+    if (omega * (1 / 240) > 0.5) {
+      // Stiff spring (half-life under ~14 ms): explicit Euler is unstable at frame-sized steps, so use
+      // the exact solution of the damped oscillator, which is stable for any dt and any half-life > 0.
+      const x0 = this.value - target
+      const v0 = this.velocity
+      const a = zeta * omega
+      const decay = Math.exp(-a * dt)
+      let x: number
+      let v: number
+      if (zeta >= 1) {
+        const b = v0 + a * x0
+        x = decay * (x0 + b * dt)
+        v = decay * (v0 - a * b * dt)
+      } else {
+        const wd = omega * Math.sqrt(1 - zeta * zeta)
+        const c = Math.cos(wd * dt)
+        const s = Math.sin(wd * dt)
+        const b = (v0 + a * x0) / wd
+        x = decay * (x0 * c + b * s)
+        v = decay * ((wd * b - a * x0) * c - (a * b + wd * x0) * s)
+      }
+      this.value = target + x
+      this.velocity = v
+      return this.value
+    }
+    // Semi-implicit Euler in sub-steps of at most 1/240 s: stable while ω/240 ≤ 0.5 (checked above).
     let left = dt
     while (left > 0) {
       const h = Math.min(left, 1 / 240)
