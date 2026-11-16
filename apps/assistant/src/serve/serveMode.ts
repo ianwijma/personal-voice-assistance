@@ -733,7 +733,14 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
             home,
             llm,
             tts,
-            setup: { system: systemFor(base, instructions), registry: mine.registry, llm: llm ?? notInUse, tts: tts ?? noVoice },
+            setup: {
+              system: systemFor(base, instructions),
+              registry: mine.registry,
+              llm: llm ?? notInUse,
+              tts: tts ?? noVoice,
+              // The limit the turn runs with and the one its snapshot (`config`) reports: both from this `assistant`.
+              ...(assistant !== undefined ? { maxToolRounds: assistant.toolRounds } : {})
+            },
             instructions,
             config: assistant === undefined ? undefined : traceConfigOf(assistant, mine.registry.specs.length, mine.modules)
           }

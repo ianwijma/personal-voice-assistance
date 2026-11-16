@@ -166,6 +166,12 @@ export interface TurnSetup {
    * speaking (docs/ASSISTANTS.md §3.2). Its `sampleRate` must be final when the setup is read.
    */
   readonly tts?: Tts["Service"] | undefined
+  /**
+   * The tool rounds this turn may use, fixed at its start. Absent: the agent set's `maxToolRounds`, else the
+   * conversation's. Serve mode sets it to the assistant's `toolRounds`, read with the rest of the setup, so a changed
+   * limit applies from the next turn start and the turn's configuration snapshot reports the limit it ran with.
+   */
+  readonly maxToolRounds?: number | undefined
 }
 
 /**
