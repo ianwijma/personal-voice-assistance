@@ -1533,7 +1533,6 @@ const runReply = (v: VSession, opts: {
   v.hearingFor = undefined
   toSession(v, { type: "transcript", text: "" })
   toSession(v, { type: "turn.start", turnId, source: opts.source, userText: opts.userText, spoken: opts.spoken, ...withId })
-  setState(v, "thinking", turnId)
   let startSample = 0
   const pcms = opts.clauses.map((text, i) => synthesize(text, i * 1.7 + turnId))
   const clauses = opts.clauses.map((text, i) => {
@@ -1543,14 +1542,16 @@ const runReply = (v: VSession, opts: {
   })
   const r: Reply = { turnId, clauses, endOfTurn, spoken: opts.spoken, tools: [], source: opts.source, owner: v.owner, session: v, conversationId: conv.conversation.id, assistantId, playedClause: -1, lastReport: Date.now(), timers: [], ended: false }
   v.reply = r
+  // After the reply is recorded: the state names its assistant as the holder (the turn in flight), as the server does.
+  setState(v, "thinking", turnId)
   let t = 120
   if (opts.tool !== undefined) {
     const tool = opts.tool
-    r.timers.push(setTimeout(() => toSession(v, { type: "tool.start", turnId, callId: `toolu_${turnId}`, tool: tool.name, moduleId: tool.moduleId, input: tool.input as never }), t))
+    r.timers.push(setTimeout(() => toSession(v, { type: "tool.start", turnId, callId: `toolu_${turnId}`, tool: tool.name, moduleId: tool.moduleId, input: tool.input as never, ...withId }), t))
     t += tool.ms
     r.timers.push(setTimeout(() => {
       r.tools.push({ name: tool.name, ms: tool.ms })
-      toSession(v, { type: "tool.end", turnId, callId: `toolu_${turnId}`, ok: tool.ok ?? true, ms: tool.ms, ...(tool.error !== undefined ? { error: tool.error } : {}) })
+      toSession(v, { type: "tool.end", turnId, callId: `toolu_${turnId}`, ok: tool.ok ?? true, ms: tool.ms, ...(tool.error !== undefined ? { error: tool.error } : {}), ...withId })
     }, t))
     t += 40
   }
