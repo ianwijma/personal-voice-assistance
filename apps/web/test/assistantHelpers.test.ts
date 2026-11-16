@@ -129,17 +129,20 @@ describe("naming helpers", () => {
     expect(copyName("Jeff", ["  JEFF COPY  "])).toBe("Jeff copy 2")
     expect(copyName("A".repeat(24), [])).toBe(`${"A".repeat(24)} copy`)
   })
-  // BUG: the candidate is cut to 32 characters AFTER the number is added, so for a name of 28 or more characters every
-  // candidate is the same text; once that text is taken (a second copy of the same assistant) the loop never ends and
-  // the page hangs. Skipped (it would hang the run, and `it.fails` cannot stop an endless loop). Listed in the PR body.
-  it.skip("copyName finds a free name for a long name whose first copy is taken", () => {
+  // Regression: the candidate used to be cut to 32 characters AFTER the number was added, so for a name of 28 or more
+  // characters every candidate was the same text and the loop never ended. The timeout makes a regression fail, not hang.
+  it("copyName finds a free name for a long name whose first copy is taken", () => {
     const long = "A".repeat(30)
     const first = copyName(long, [long])
     expect(first).toHaveLength(32)
     const second = copyName(long, [long, first])
     expect(second).not.toBe(first)
     expect(second.length).toBeLessThanOrEqual(32)
-  })
+    expect(second.endsWith(" copy 2")).toBe(true)
+    const third = copyName(long, [long, first, second])
+    expect(new Set([first, second, third]).size).toBe(3)
+    expect(third.length).toBeLessThanOrEqual(32)
+  }, 2000)
 })
 
 describe("the summary strip", () => {
