@@ -104,6 +104,28 @@ describe("WebAudioOutput.play", () => {
       assert.strictEqual(web.playingTurn(), undefined)
     }).pipe(Effect.scoped))
 
+  it.effect("protocol 7: reply.start names the turn's assistant when the trace has one, and omits assistantId otherwise", () =>
+    Effect.gen(function*() {
+      const web = yield* makeWebAudio()
+      const owner = fakeLink()
+      web.setOwner(owner.link)
+      const named: Trace = { ...trace(20), assistant: { id: "jarvis", name: "Jarvis" } }
+      for (const tr of [named, trace(21)]) {
+        const fiber = yield* web.output.play(Stream.make(pcm(100)), 22_050).pipe(
+          Effect.provideService(CurrentTurnTrace, tr),
+          Effect.forkChild
+        )
+        yield* Effect.yieldNow
+        web.report({ type: "playback.finished", turnId: tr.id, playedSamples: 100 })
+        yield* Fiber.join(fiber)
+      }
+      const starts = owner.messages.filter((m) => m.type === "reply.start")
+      assert.deepStrictEqual(starts, [
+        { type: "reply.start", turnId: 20, sampleRate: 22_050, assistantId: "jarvis" },
+        { type: "reply.start", turnId: 21, sampleRate: 22_050 }
+      ])
+    }).pipe(Effect.scoped))
+
   it.effect("no owner: fails at once", () =>
     Effect.gen(function*() {
       const web = yield* makeWebAudio()
