@@ -161,8 +161,12 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
       // Ring radius: small and still when ready, full while hearing or speaking.
       const loud = clamp01(L * 1.6)
       const press = f.pointer.down && overBox ? 0.94 : 1
-      // Size, capped so the ring and its thickest spectrum band stay inside the canvas.
-      const fit = (0.5 * Math.min(W, H) - 2) / (1.07 + (0.105 + 0.219 * specK) * thickK)
+      // Size, capped so the ring and its thickest spectrum band stay inside the canvas. The band is
+      // (0.105 + 0.219 * specK) * 40 stroke units thick, and a unit is max(1, Rs / 40) * thickK (see unitW below):
+      // proportional to Rs from 40 px up, but a flat thickK below that. Both cases must fit.
+      const room = 0.5 * Math.min(W, H) - 2
+      const bandK = 0.105 + 0.219 * specK
+      const fit = Math.max(0, Math.min(room / (1.07 + bandK * thickK), (room - 40 * bandK * thickK) / 1.07))
       const Rs = Math.min(R * sizeK, fit)
       const rT = Rs * press * mix.of(0.5, 0.56, 1, 0.86, 1 + 0.07 * loud)
       const r = radius.step(rT, dt)
