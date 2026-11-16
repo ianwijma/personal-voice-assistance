@@ -31,7 +31,6 @@ import {
   typedTextTarget,
   TYPESAFE_GIVE_UP_MS,
   typesafeCandidates,
-  typesafeFallback,
   WAKE_ARMED_MS
 } from "@pva/protocol"
 import { Cause, Deferred, Effect, Exit, Fiber, Queue, type Scope, Stream } from "effect"
@@ -39,7 +38,7 @@ import type { Engine, SessionLoop } from "./Engine.ts"
 import { type HeardAudio, makeHeardAudio } from "./HeardAudio.ts"
 import { makeOutputLease } from "./OutputLease.ts"
 import { makePublisher, type Publisher } from "./Publisher.ts"
-import { makeTypesafeDecide, type RoutingService } from "./routing.ts"
+import { makeTypesafeDecide, type RoutingService, typesafeNow } from "./routing.ts"
 import { makeSessionConversation, type SendOutcome, type SessionConversation } from "./SessionConversation.ts"
 import { type DispatchRoute, type DispatchTarget, makeSessionDispatcher, type RouteDecision, type SessionDispatcher } from "./SessionDispatcher.ts"
 import { makeStateTracker, type StateTracker } from "./StateTracker.ts"
@@ -553,12 +552,9 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
     const dispatcher = makeSessionDispatcher<Target>({
       replyEarly: (assistant) => assistantOf(assistant)?.replyEarly ?? true,
       decide,
-      // The device may have changed while TypeSafe was asked: the answer goes only to an assistant it still has.
-      decideNow: () => {
-        const settings = options.deviceSettings()
-        const assistants = options.assistants()
-        return { candidates: typesafeCandidates(settings, assistants), fallback: typesafeFallback(settings, assistants) }
-      },
+      // The device may have changed while TypeSafe was asked: the answer goes only to an assistant it still has, and
+      // to nobody once the device no longer routes by TypeSafe.
+      decideNow: () => typesafeNow(options.deviceSettings(), options.assistants()),
       make: (assistant, hooks) =>
         Effect.gen(function*() {
           const inbox = yield* Queue.unbounded<ConversationInput>()
