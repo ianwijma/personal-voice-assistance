@@ -1,0 +1,49 @@
+# chladni-sand 1.0.0: frame digests of a scripted conversation at default settings (docs/CHARACTERS.md §6.6).
+# A change here must be deliberate: check the look, then update with `pnpm --filter @pva/web exec vitest run test/characters -u`.
+dark  0.5 idle       1131 d8552481
+dark  1.0 listening  1131 319df84b
+dark  1.5 listening  1131 73038e86
+dark  2.0 hearing    1139 f11a71d0
+dark  2.5 hearing    1147 f3b2fd15
+dark  3.0 hearing    1163 dd3fbf94
+dark  3.5 hearing    1163 65d61584
+dark  4.0 hearing    1155 0c6d2bf9
+dark  4.5 hearing    1163 1a882a1d
+dark  5.0 thinking   1155 841a577b
+dark  5.5 thinking   1139 d57bbf1e
+dark  6.0 thinking   1131 529be1d5
+dark  6.5 speaking   1137 dc225119
+dark  7.0 speaking   1145 5e1daecc
+dark  7.5 speaking   1161 8bc44259
+dark  8.0 speaking   1161 23980d42
+dark  8.5 speaking   1161 a90e676b
+dark  9.0 speaking   1153 26b0ae6b
+dark  9.5 listening  1145 ac690906
+dark 10.0 listening  1145 43538739
+dark 10.5 idle       1137 32c9da24
+dark 11.0 idle       1137 9cd00e1f
+light  0.5 idle       1131 11639adb
+light  1.0 listening  1131 80158bce
+light  1.5 listening  1131 84cddc16
+light  2.0 hearing    1139 50c0d5bb
+light  2.5 hearing    1147 1a203386
+light  3.0 hearing    1163 02490873
+light  3.5 hearing    1163 ac0a67f9
+light  4.0 hearing    1155 09d337a0
+light  4.5 hearing    1163 f5b4dea4
+light  5.0 thinking   1155 7c13dabb
+light  5.5 thinking   1139 55b057f0
+light  6.0 thinking   1131 c46b6b42
+light  6.5 speaking   1137 d813e86b
+light  7.0 speaking   1145 e8ba5c5d
+light  7.5 speaking   1161 9003faa3
+light  8.0 speaking   1161 435dea09
+light  8.5 speaking   1161 18ef6b34
+light  9.0 speaking   1153 350f63f7
+light  9.5 listening  1145 efafd4f5
+light 10.0 listening  1145 3713f397
+light 10.5 idle       1137 239c3124
+light 11.0 idle       1137 b45b68da
+overflow 160×140×1 0.0 px
+overflow 900×420×1 0.0 px
+overflow 720×240×2 0.0 px
