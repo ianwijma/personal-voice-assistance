@@ -452,6 +452,142 @@ describe("the model catalog's calls", () => {
     expect(stt.store.get().downloads[key]?.job).toMatchObject({ id: "job-2", state: "running" })
   })
 
+  // Round 4: the store's rule for every load kind: an answer is installed only if no invalidation of its scope (a
+  // settings change: every list; a change on this machine: its own list) arrived since it was asked for. These go
+  // through `ensure()` and the client watch, as the page does.
+  const watched = (kind: "llm" | "stt", first: unknown) => {
+    // Every request for the lists waits until the test answers it, with the body as it was when it was asked for.
+    const pending: Array<{ url: string; answer: () => void }> = []
+    const opts = { body: first, fails: false }
+    const fetchFn = async (url: string) => {
+      if (url.includes("favourites")) return reply(favs)
+      if (url.endsWith("models/stt/download")) return reply({ job: { id: "job-9", tool: "stt-models", target: "whisper-turbo", action: "download", label: "Whisper turbo", state: "succeeded", log: [], startedAt: 1 } }, 202)
+      const body = opts.body
+      const fails = opts.fails
+      await new Promise<void>((resolve) => pending.push({ url, answer: resolve }))
+      return fails ? reply({ error: { code: "boom", message: "No." } }, 500) : reply(body)
+    }
+    const host = createStore(initialState, (s, u: Partial<typeof initialState>) => ({ ...s, ...u }))
+    const c = createModelCatalog(kind, { store: host }, makeVoiceApi(() => "http://h/api/", () => "token", fetchFn as unknown as typeof fetch))
+    const settingsChanged = () => host.dispatch({ vault: { state: host.get().vault.state === "unlocked" ? "locked" : "unlocked", admin: false } })
+    const machineChanged = () => host.dispatch({ models: [] })
+    // Answer request `i`, then let its continuation run.
+    const answer = async (i: number) => {
+      await vi.waitFor(() => expect(pending.length).toBeGreaterThan(i))
+      pending[i]!.answer()
+      await new Promise((r) => setTimeout(r, 10))
+    }
+    // Every state the store showed as loaded, as `provider:status:names` per list.
+    const shown: Array<string> = []
+    c.store.subscribe(() => {
+      const s = c.store.get()
+      if (s.load === "ready") shown.push(s.lists.map((p) => `${p.provider.id}:${p.provider.status}:${p.models.map((m) => m.name).join("+")}`).join(" "))
+    })
+    return { c, opts, pending, answer, settingsChanged, machineChanged, shown }
+  }
+  const oldAnthropic = { kind: "llm", providers: [pm(info("anthropic", "Anthropic API"), [entry("anthropic", "old", "Old")]), ...catalog.slice(1)] }
+
+  it("the first load, answered after the settings changed, is not shown; the new load is (before or after the watch acts, or failing)", async () => {
+    for (const when of ["before the watch", "after the watch", "failing"] as const) {
+      const w = watched("llm", oldAnthropic)
+      w.opts.fails = when === "failing"
+      w.c.ensure()
+      await vi.waitFor(() => expect(w.pending).toHaveLength(1))
+      // The key is removed in another tab while the first answer is on its way.
+      w.opts.body = keyless
+      w.opts.fails = false
+      w.settingsChanged()
+      if (when === "after the watch") await vi.waitFor(() => expect(w.pending).toHaveLength(2))
+      await w.answer(0)
+      expect(w.c.store.get().load).toBe("loading")
+      expect(w.c.store.get().loadError).toBeUndefined()
+      await w.answer(1)
+      expect(w.c.store.get().load).toBe("ready")
+      expect(anthropicOf(w.c).provider.status).toBe("needs_key")
+      expect(w.shown.some((x) => x.includes("Old"))).toBe(false)
+      expect(w.pending).toHaveLength(2)
+    }
+  })
+
+  it("a full refresh or a provider's Retry answered after the settings changed is not shown; the watch's new load is", async () => {
+    for (const load of ["refresh", "retry"] as const) {
+      const w = watched("llm", sample)
+      w.c.ensure()
+      await w.answer(0)
+      w.opts.body = oldAnthropic
+      const asked = load === "refresh" ? w.c.reload(true) : w.c.reloadProvider("anthropic", true)
+      await vi.waitFor(() => expect(w.pending).toHaveLength(2))
+      w.opts.body = keyless
+      w.settingsChanged()
+      await w.answer(1) // before the watch acts
+      await asked
+      expect(w.shown.some((x) => x.includes("Old"))).toBe(false)
+      expect(w.c.store.get().notice).toBeUndefined()
+      expect(w.c.store.get().refreshing).toBe(false)
+      await w.answer(2)
+      expect(w.pending[2]!.url).toBe("http://h/api/models/llm")
+      expect(anthropicOf(w.c).provider.status).toBe("needs_key")
+    }
+  })
+
+  it("a change on this machine: an older first load waits, a refresh keeps the machine's list, the machine's list is asked again", async () => {
+    const machine = (name: string, state: "installed" | "not_installed" = "installed") =>
+      pm(info("sherpa", "On this machine", { location: "local" }), [entry("sherpa", "whisper-turbo", name, { local: { state, sizeMb: 1, diskMb: 1 }, selectable: state === "installed" })])
+    const hosted = (name: string) => pm(info("deepgram", "Deepgram"), [entry("deepgram", "nova", name)])
+    const list = (m: string, h: string, state: "installed" | "not_installed" = "installed") => ({ kind: "stt", providers: [machine(m, state), hosted(h)] })
+    // The first load: its answer is not shown; the watch loads everything again (there is no list to keep).
+    const first = watched("stt", list("M0", "H0"))
+    first.c.ensure()
+    await vi.waitFor(() => expect(first.pending).toHaveLength(1))
+    first.opts.body = list("M1", "H1")
+    first.machineChanged()
+    await first.answer(0)
+    expect(first.c.store.get().load).toBe("loading")
+    await first.answer(1)
+    expect(first.pending[1]!.url).toBe("http://h/api/models/stt")
+    expect(first.shown.every((x) => x.includes("M1") && x.includes("H1"))).toBe(true)
+    // A full refresh: the hosted list is taken, the machine's older list is kept until the machine's new one answers.
+    const w = watched("stt", list("M0", "H0"))
+    w.c.ensure()
+    await w.answer(0)
+    w.opts.body = list("M1", "H1")
+    const refresh = w.c.reload(true)
+    await vi.waitFor(() => expect(w.pending).toHaveLength(2))
+    w.opts.body = list("M2", "H2")
+    w.machineChanged()
+    await w.answer(1)
+    await refresh
+    expect(w.shown.at(-1)).toBe("sherpa:ready:M0 deepgram:ready:H1")
+    await w.answer(2)
+    expect(w.pending[2]!.url).toBe("http://h/api/models/stt?provider=sherpa")
+    expect(w.shown.at(-1)).toBe("sherpa:ready:M2 deepgram:ready:H1")
+    expect(w.shown.some((x) => x.includes("M1"))).toBe(false)
+  })
+
+  it("the machine's list answered after a change on the machine settles no download; the new one does", async () => {
+    const key = "sherpa:whisper-turbo"
+    const list = (state: "installed" | "not_installed") =>
+      ({ kind: "stt", providers: [pm(info("sherpa", "On this machine", { location: "local" }), [entry("sherpa", "whisper-turbo", "Whisper turbo", { local: { state, sizeMb: 1, diskMb: 1 }, selectable: state === "installed" })])] })
+    const w = watched("stt", list("not_installed"))
+    w.c.ensure()
+    await w.answer(0)
+    await w.c.download(key) // its job has succeeded
+    expect(w.c.store.get().downloads[key]?.job?.id).toBe("job-9")
+    w.opts.body = list("not_installed")
+    const asked = w.c.reloadProvider("sherpa")
+    await vi.waitFor(() => expect(w.pending).toHaveLength(2))
+    w.opts.body = list("installed")
+    w.machineChanged()
+    await w.answer(1)
+    await asked
+    expect(w.c.store.get().downloads[key]?.job?.id).toBe("job-9")
+    expect(w.c.store.get().lists[0]!.models[0]!.local?.state).toBe("not_installed")
+    await w.answer(2)
+    expect(w.pending[2]!.url).toBe("http://h/api/models/stt?provider=sherpa")
+    expect(w.c.store.get().downloads[key]).toBeUndefined()
+    expect(w.c.store.get().lists[0]!.models[0]!.local?.state).toBe("installed")
+  })
+
   it("only recognisers download; the model goes in the body as a reference", async () => {
     const llm = setup(() => reply({ job: {} }))
     await llm.catalog.download("anthropic:claude-haiku-5-5")

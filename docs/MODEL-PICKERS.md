@@ -282,7 +282,9 @@ The Language model tab then keeps its options below: `onChange(_, { apply })` wr
 `apply.hearing` (for Deepgram only the engine). Data: one catalog per kind and client, as `lib/voiceCatalog.ts`: it
 follows `job` messages for `stt-models` (progress in the row) and re-reads `models/stt?provider=sherpa` when such a job
 starts or ends or a `models` message arrives; it re-reads `models/llm` after a vault change or a change of the
-`llm-openai-accounts`, `language-model` or the subscription module's section.
+`llm-openai-accounts`, `language-model` or the subscription module's section. Each such change invalidates the lists it
+affects at once: an answer asked for before it is never shown as current (also during the first load), and a new load
+starts. Among current answers the one asked for last wins.
 
 ### 6.3 The typed model
 

@@ -91,6 +91,20 @@ export const createModelCatalog = (kind: PickerKind, host: CatalogHost, api: Voi
   let listSeq = 0
   const listAt = new Map<string, number>()
   const newer = (id: string, at: number) => at > (listAt.get(id) ?? 0)
+  // The store's rule, for every answer (the first load, a full refresh, one provider's list, and the downloads it
+  // settles): it is installed as current only if no invalidation of its scope arrived since its request was sent.
+  // Otherwise it is dropped (a provider's older list is kept as it was) and the watch, which sees every invalidation,
+  // starts a new load, also while the first load is still pending. A settings change invalidates every list
+  // (`allGen`); a change on this machine, the machine's own list (`provGen`). Among current answers the newest request
+  // wins (`listAt`). The favourites' invalidations are their changes (`favSeq` below); a change's own answer is the
+  // whole list, so it needs no new load.
+  let allGen = 0
+  const provGen = new Map<string, number>()
+  const genOf = (id: string) => `${allGen}:${provGen.get(id) ?? 0}`
+  const invalidate = (id?: string) => {
+    if (id === undefined) allGen++
+    else provGen.set(id, (provGen.get(id) ?? 0) + 1)
+  }
   // `refreshing` is true while any request that shows it is pending, not only the one that ended last.
   let busy = 0
   const busyStart = () => {
@@ -106,6 +120,10 @@ export const createModelCatalog = (kind: PickerKind, host: CatalogHost, api: Voi
   const reload = async (refresh = false) => {
     const seq = ++loadSeq
     const at = ++listSeq
+    const all = allGen
+    const gens = new Map(provGen)
+    const current = (id: string) => allGen === all && (provGen.get(id) ?? 0) === (gens.get(id) ?? 0)
+    const invalidated = () => allGen !== all || [...provGen].some(([id, g]) => (gens.get(id) ?? 0) !== g)
     const finished = finishedDownloads()
     // The favourites answer is shown only if no favourite change was pending when it was asked for or started since:
     // otherwise it may predate that change, and the change's own answer (or the optimistic state) is newer.
@@ -119,19 +137,24 @@ export const createModelCatalog = (kind: PickerKind, host: CatalogHost, api: Voi
         json(ModelFavouritesResponse, `models/${kind}/favourites`)
       ])
       if (marked) busyEnd()
-      if (seq !== loadSeq) return
+      if (seq !== loadSeq || allGen !== all) return // invalidated: the watch loads again
       const { loadError: _e, ...rest } = get()
+      // A provider invalidated since, with no list to keep: nothing current to show for it, so wait for the new load.
+      if (models.providers.some((p) => !current(p.provider.id) && !rest.lists.some((q) => q.provider.id === p.provider.id))) return
+      const installed = new Set<string>()
       const lists = models.providers.map((p) => {
         const id = p.provider.id
-        const kept = newer(id, at) ? undefined : rest.lists.find((q) => q.provider.id === id)
+        const kept = newer(id, at) && current(id) ? undefined : rest.lists.find((q) => q.provider.id === id)
         if (kept !== undefined) return kept
         listAt.set(id, Math.max(at, listAt.get(id) ?? 0))
+        installed.add(id)
         return p
       })
-      set(() => ({ ...rest, load: "ready", lists, favourites: favAt === favSeq && favPending === 0 ? favs.favourites : rest.favourites, downloads: settle(rest.downloads, finished) }))
+      const settled = new Map([...finished].filter(([key]) => [...installed].some((id) => key.startsWith(`${id}:`))))
+      set(() => ({ ...rest, load: "ready", lists, favourites: favAt === favSeq && favPending === 0 ? favs.favourites : rest.favourites, downloads: settle(rest.downloads, settled) }))
     } catch (e) {
       if (marked) busyEnd()
-      if (seq !== loadSeq) return
+      if (seq !== loadSeq || invalidated()) return
       const message = messageOf(e, `The ${noun} could not be loaded.`)
       set((s) => (s.load === "ready" ? { ...s, notice: { tone: "error", message } } : { ...s, load: "error", loadError: message }))
     }
@@ -139,6 +162,7 @@ export const createModelCatalog = (kind: PickerKind, host: CatalogHost, api: Voi
 
   const reloadProvider = async (id: string, refresh = false) => {
     const at = ++listSeq
+    const gen = genOf(id)
     if (refresh) busyStart()
     const finished = finishedDownloads()
     try {
@@ -146,7 +170,7 @@ export const createModelCatalog = (kind: PickerKind, host: CatalogHost, api: Voi
       if (refresh) busyEnd()
       const fresh = answer.providers.find((p) => p.provider.id === id)
       const s = get()
-      if (fresh === undefined || !newer(id, at) || !s.lists.some((p) => p.provider.id === id)) return
+      if (fresh === undefined || genOf(id) !== gen || !newer(id, at) || !s.lists.some((p) => p.provider.id === id)) return
       listAt.set(id, at)
       set({
         lists: s.lists.map((p) => (p.provider.id === id ? fresh : p)),
@@ -154,8 +178,8 @@ export const createModelCatalog = (kind: PickerKind, host: CatalogHost, api: Voi
       })
     } catch (e) {
       if (refresh) busyEnd()
-      // A newer answer for this provider already arrived: this failure is old news.
-      if (refresh && newer(id, at)) set({ notice: { tone: "error", message: messageOf(e, `The ${noun} could not be loaded.`) } })
+      // A newer answer for this provider already arrived, or it was invalidated since: this failure is old news.
+      if (refresh && genOf(id) === gen && newer(id, at)) set({ notice: { tone: "error", message: messageOf(e, `The ${noun} could not be loaded.`) } })
     }
   }
 
@@ -176,15 +200,19 @@ export const createModelCatalog = (kind: PickerKind, host: CatalogHost, api: Voi
     const seen = new Set(host.store.get().jobs.map((j) => (j.state === "running" ? `r:${j.id}` : `e:${j.id}`)))
     let timer: ReturnType<typeof setTimeout> | undefined
     let full = false
+    // Every change invalidates its scope at once (`invalidate`), so no answer asked for before it is installed; the
+    // new load starts shortly after, whatever state the load is in (a pending first load included).
     const soon = (all: boolean) => {
+      invalidate(all ? undefined : "sherpa")
       full ||= all
       if (timer !== undefined) return
       timer = setTimeout(() => {
         timer = undefined
         const all = full
         full = false
-        if (get().load !== "ready") return
-        if (all) void reload()
+        const load = get().load
+        if (load === "idle" || load === "error") return
+        if (all || load !== "ready" || !get().lists.some((p) => p.provider.id === "sherpa")) void reload()
         else void reloadProvider("sherpa")
       }, 150)
     }
