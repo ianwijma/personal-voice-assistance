@@ -7,7 +7,7 @@
  *   noise     rng (seeded), noise2 / noise3 (simplex, about −1..1), fbm2
  *   colour    mix, rgba, lighten, darken, lift / sink (theme-aware)
  *   options   optNumber, optToggle, optChoice, optColor: read `frame.options` (docs/CHARACTERS.md §4.4)
- *   canvas    setup2d (size + transform), clear2d, glProgram (WebGL2 shader pair)
+ *   canvas    setup2d (size + transform), clear2d (optionally at the focus), glProgram (WebGL2 shader pair)
  *
  * All smoothing helpers take `dt` in seconds, so they behave the same at 60 and 120 Hz.
  * Copied from the lab (docs/research/visualiser-investigation/lab/src/kit.ts); behaviour unchanged.
@@ -239,11 +239,16 @@ export const setup2d = (canvas: HTMLCanvasElement, dpr = 1): CanvasRenderingCont
   return g
 }
 
-/** Clear the whole canvas (transparent) and restore the CSS-pixel transform. Call at the top of `frame`. */
-export const clear2d = (g: CanvasRenderingContext2D, dpr: number): void => {
+/**
+ * Clear the whole canvas (transparent) and restore the CSS-pixel transform. Call at the top of `frame`.
+ * `origin`: put (0, 0) at this point instead of the canvas corner; a stage character passes `frame.focus`, so code
+ * written for a box from (0, 0) to (focus.width, focus.height) draws on the box's place on the stage
+ * (docs/CHARACTERS.md §2.6). With the origin at (0, 0) the calls are exactly those without it.
+ */
+export const clear2d = (g: CanvasRenderingContext2D, dpr: number, origin?: { readonly x: number; readonly y: number }): void => {
   g.setTransform(1, 0, 0, 1, 0, 0)
   g.clearRect(0, 0, g.canvas.width, g.canvas.height)
-  g.setTransform(dpr, 0, 0, dpr, 0, 0)
+  g.setTransform(dpr, 0, 0, dpr, origin === undefined ? 0 : dpr * origin.x, origin === undefined ? 0 : dpr * origin.y)
 }
 
 /** Compile and link a WebGL2 program from two GLSL ES 3.00 sources; throws with the info log on failure. */

@@ -9,11 +9,11 @@ What a character is and the rules it follows: [`docs/CHARACTERS.md`](../../../..
 | File | What |
 |---|---|
 | `contract.ts` | The contract. Fixed: never edit it in a port. |
-| `kit.ts` | Small allocation-free helpers (smoothing, springs, noise, colour, canvas setup, option readers). |
+| `kit.ts` | Small allocation-free helpers (smoothing, springs, noise, colour, canvas setup, option readers). `clear2d(g, dpr, origin)` puts (0, 0) at the focus. |
 | `shared/figure.ts` | The figures' rig: blinks, gaze, the listening model (`Social`), the mouth, personality options. Was the lab's `designs/_character.ts`. |
 | `shared/light.ts` | Helpers of the light family. Was `designs/_light.ts`. |
 | `shared/matter.ts` | Helpers of the matter family. Was `designs/_matter.ts`. |
-| `library/sine-lines.ts` | The baseline, a worked example. |
+| `library/sine-lines.ts` | The baseline, a worked example, including of a stage character. |
 | `host.ts`, `runner.ts`, `voices.ts`, `features.ts`, `options.ts`, `manifest.ts`, `choice.ts`, `registry.ts` | The host side. A character never imports these. |
 
 A file in `library/` may import `../contract.ts`, `../kit.ts` and `../shared/*.ts`, and nothing else: no application code, no packages, no page globals (`document`, `window`, `fetch`, timers, …). `test/characters/isolation.test.ts` enforces it. The shared modules are used by six characters each: import them, never edit them in a port (a change there changes five other characters, and two ports editing them would conflict).
@@ -28,6 +28,55 @@ The lab's `designs/<id>.ts` becomes `library/<id>.ts`, behaviour unchanged:
 - The shared helpers read `frame.coreMode` instead of `frame.mode`; nothing else changed in them.
 
 Measured on the lab designs before porting (docs/CHARACTERS.md §6): every check passes except "(5) reduced motion" for `aurora-ribbons`, `cloud-orb` and `pitch-ink`, which still change between two frames a second apart in a pinned, silent mode. Those ports need a decision (hold the pose, or ask the lead to relax the check), not a silent change.
+
+## Making a character use the whole stage
+
+Background and design rules: docs/CHARACTERS.md §2.6. In short: with `canvas: "stage"` the canvas covers the whole voice page, `resize` reports that size, and `frame.focus` (`{ x, y, width, height }`, CSS px, per frame) is where the old box is. Everything gets the stage canvas unless there is a reason not to; the question is only how much of it a character uses (the table in §2.6: edge light uses all of it; glowing shapes put their glow and particles beyond the box; line-like ones keep the box's width and gain vertical room; figures keep a box-like layout and gain uncut shadows, glow and motion room). `library/sine-lines.ts` is the worked example (diff it against its 1.0.0 in git: `git log -p -- apps/web/src/characters/library/sine-lines.ts`).
+
+### The change, for a ported 2D `library/<id>.ts` drawn in the box from (0, 0)
+
+1. Manifest: add `canvas: "stage",` after `renderer`; raise `version` by a minor step (`"1.0.0"` → `"1.1.0"`). Update a mapping or a mode line only if what it promises changed (say "the box" where it says "the canvas" or "the height").
+2. Keep the canvas's own size from `resize` under other names (for example `CW`, `CH`); the character's layout no longer comes from it.
+3. At the top of `frame`, replace `clear2d(g, dpr)` with:
+
+   ```ts
+   const fo = f.focus
+   clear2d(g, dpr, fo) // clears the whole canvas; (0, 0) is now the box's top-left corner
+   W = fo.width
+   H = fo.height
+   ```
+
+   and leave the drawing code as it is: what it drew from (0, 0) to (W, H) now lands on the box, and anything beyond (glow, haze, sparks) is no longer cut. The canvas spans `-fo.x .. CW - fo.x` by `-fo.y .. CH - fo.y` in these coordinates.
+4. Pointer: `f.pointer` is in canvas coordinates, so use `f.pointer.x - fo.x`, `f.pointer.y - fo.y`. `f.pointer.inside` now means "in the window"; a character that reacts to hovering itself tests the box: `px >= 0 && px < W && py >= 0 && py < H`.
+5. Run the tests (below). The `dark` / `light` / `overflow` lines of the digest must not change (only the header's version and the new `stage` lines): `clear2d` with the origin at (0, 0) makes exactly the calls it made without it, so if box lines changed, the box look changed, and step 3 or a trap below was done wrong. Then update with `-u` and look at the page (below).
+
+That is all for most characters (flame needed exactly this). Then go through the traps; each is a place where the old code assumed the canvas is the box.
+
+### Traps
+
+- **Layout computed in `resize`.** Sizes, centres, radii, path or gradient caches, grid geometry, particle bounds computed from `width`/`height` in `resize` are now the whole page. Compute them in `frame` from `fo.width`/`fo.height`, or keep the cache and rebuild it when the focus size changes (compare with the last size; the focus's position changes often, its size rarely: on a window resize, or the layout scaling with the height). Never rebuild on a position change.
+- **Arrays sized for the old box** (one sample per 2 px across the width, a grid per cell): allocate in `resize` for the canvas (the largest the focus can be), and use the part the focus needs each frame (`Math.min(arr.length, …)`). sine-lines does this with `ys`.
+- **Offscreen canvases and layers** (`new OffscreenCanvas(w, h)` in `resize`, a glow layer, a trail buffer): decide what each holds. The shape's own layer: size it to the focus (rebuild on a size change only) and draw it with `drawImage` at (0, 0) after `clear2d(g, dpr, fo)`. A glow or haze layer meant to spread: size it to the canvas but by a pixel budget (draw it at reduced resolution and scale it up), because a full-page layer at full resolution costs many times the box's. A layer drawn with `drawImage(layer, 0, 0, W, H)` while `W`, `H` are still the canvas size draws a page-sized layer into the box.
+- **Transforms reset inside `frame`.** `g.setTransform(dpr, 0, 0, dpr, 0, 0)`, `g.setTransform(1, 0, 0, 1, 0, 0)`, `g.resetTransform()` or a second `clear2d(g, dpr)` drop the focus offset: everything after it is drawn at the page's corner. Use `g.save()`/`g.restore()` around temporary transforms, or set `g.setTransform(dpr, 0, 0, dpr, dpr * fo.x, dpr * fo.y)` again.
+- **`clearRect`, `fillRect(0, 0, W, H)` and clips.** `clearRect(0, 0, W, H)` with the focus size clears only the box: clear with `clear2d` at the top of the frame only. A wash, vignette or background painted with `fillRect(0, 0, W, H)` becomes a box-shaped patch with hard edges: make it a radial gradient that reaches alpha 0, or paint the whole canvas (`fillRect(-fo.x, -fo.y, CW, CH)`). `g.rect(0, 0, W, H); g.clip()` cuts the glow at the box again: remove it unless it is the shape's own outline.
+- **Radial glows with hard edges.** A radial gradient filled into a square shows that square when the last stop's alpha is above 0, or when the square is smaller than the gradient's radius (`fillRect(cx - r, cy - r, 2r, 2r)` with the gradient's outer radius `r` is right). In the box these were hidden by the box's edge; on the stage every one shows.
+- **Clamps that kept things inside the canvas** (`Math.min(top, H * 0.98)`, particles killed or wrapped at `x < 0 || x > W`, "never past the top of the canvas"): they now hold things inside the box. Keep them for the essential shape; let sparks, particles and glow go to the canvas edge (`-fo.x .. CW - fo.x`) or fade out on their own. Particles stored in box coordinates move with the box when the focus moves; that is fine.
+- **Helpers that take a size** (`unit(w, h)` in `shared/light.ts`, a figure's scale): pass the focus size.
+- **WebGL2.** Keep `gl.viewport(0, 0, canvas.width, canvas.height)` (the whole canvas) in `resize`. Pass the shape's centre and scale per frame from the focus, in device pixels with y flipped (`gl_FragCoord` starts at the bottom): `cx = (fo.x + fo.width / 2) * dpr`, `cy = (CH - fo.y - fo.height / 2) * dpr`, scale from `fo.width`/`fo.height` times `dpr`, never from the resolution uniform. A full-canvas fragment shader costs per pixel of the whole page: return early far from the shape, or render the glow into a smaller framebuffer.
+- **The pixel ratio.** Use the `dpr` from `resize`: for a stage canvas the host may have lowered it (backing store capped at 4.2 million device pixels; 1920 × 1080 at ratio 2 gets 1.42). Never read `devicePixelRatio`.
+- **Cost.** Measure on the stage at 1280 × 800 and at 1920 × 1080 (`__pvaStage.debug().frameMs`, after 2 s in each mode; the limit before the host stops a character is 4 ms, the target 2 ms). Edge glow with nothing but `canvas: "stage"` measured 5.5 ms at 1280 × 800 and 10.8 ms at 1920 × 1080: its glow work surface follows the canvas size; give it a pixel budget.
+
+### Edge light
+
+A character that lights the screen's edge (edge-glow) uses the whole canvas and ignores `focus` for its shape: keep `clear2d(g, dpr)`, keep `W`, `H` from `resize` (now the page), and fix the cost. It may use the focus to keep its light clear of the box. Check (9) of the suite accepts a drawing that surrounds the focus.
+
+### Staying box-like
+
+A figure or a solid shape keeps its layout in the box (the recipe above does exactly that) and gains uncut shadows and glow and room for a bounce or a lean. A character should stay `"box"` (leave the field out) only if it cannot work on a larger canvas at all; say why in the pull request. None of the 18 is known to need it.
+
+### Digest and pictures
+
+The compatibility suite runs a stage character as before (no focus: the box) for the `dark`, `light` and `overflow` lines, and on the desktop stage for the `stage` lines and check (9) (offset focus, moving focus, option extremes, centred on the focus). A deliberate change of the stage look regenerates the digest the usual way (`-u`, below); check with `git diff` that only the lines you meant changed. The contact sheets (below) show the whole page, so glow and edges can be judged; also look at a phone width (390 × 844) and with the chat panel open (`C`; at 1280 px wide the box slides 200 px left), in both themes.
 
 ## Tests
 
@@ -78,6 +127,6 @@ It builds the static export (set `SKIP_BUILD=1` to reuse an existing one in `out
 - `apps/web/screenshots/characters/<id>-dark.png`
 - `apps/web/screenshots/characters/<id>-light.png`
 
-Each is a row of five panels, IDLE, LISTENING, HEARING, THINKING, SPEAKING: the voice page's stage area at the desktop size (1280 x 800 window) with your character in that state, composed into one image in the browser. Every panel is a fresh page. HEARING runs on Chromium's fake microphone (the speech-like tone of `e2e/fakeMic.ts`), SPEAKING on the mock's scripted turn with real reply audio (`/mock/turn`); the other three are captioned as having no audio. The command fails, with the reason, if your character is not on stage or the host fell back (`__pvaStage.debug()`), so a broken port cannot produce a sheet of the baseline.
+Each is a row of five panels, IDLE, LISTENING, HEARING, THINKING, SPEAKING: the whole voice page at the desktop size (1280 x 800 window, so glow beyond the box and the text over it show) with your character in that state, composed into one image in the browser. Every panel is a fresh page. HEARING runs on Chromium's fake microphone (the speech-like tone of `e2e/fakeMic.ts`), SPEAKING on the mock's scripted turn with real reply audio (`/mock/turn`); the other three are captioned as having no audio. The command fails, with the reason, if your character is not on stage or the host fell back (`__pvaStage.debug()`), so a broken port cannot produce a sheet of the baseline.
 
-For a one-off picture in some other state, write a Playwright file as `e2e/screenshots.shots.ts` does (`appUrl(baseURL, "&character=<id>")`, `mock.state(...)`, `page.locator(".stage-vis").screenshot(...)`) and run it with `pnpm --filter @pva/web screenshots`; keep it out of your pull request.
+For a one-off picture in some other state, write a Playwright file as `e2e/screenshots.shots.ts` does (`appUrl(baseURL, "&character=<id>")`, `mock.state(...)`, `page.screenshot(...)`) and run it with `pnpm --filter @pva/web screenshots`; keep it out of your pull request.
