@@ -8,7 +8,8 @@ export default defineConfig({
           name: "node",
           environment: "node",
           include: ["packages/*/test/**/*.test.ts", "apps/*/test/**/*.test.ts"],
-          exclude: ["**/node_modules/**", "apps/web/**"]
+          exclude: ["**/node_modules/**", "apps/web/**"],
+          globalSetup: ["./vitest.global-setup.ts"]
         }
       },
       // The web app has its own config (jsdom, path aliases).
