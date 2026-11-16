@@ -296,6 +296,9 @@ export const Wake = Schema.Struct({
  * none). `accepted`: the assistant took the utterance (it answers it, or the phrase alone made it listen); `true`
  * without `matched` means it was accepted without a phrase (always listening, or inside an armed or follow-up
  * window), `false` that it was ignored. Absent from an older server: the page then only knows "no phrase matched".
+ * `source` (protocol 7, additive): where the server heard it, so the page need not guess from its session list:
+ * `deviceId` the device whose audio it was (absent: a voice page without a device), `assistantId` the assistant the
+ * matched phrase belongs to there (absent: no phrase matched, or it is nobody's). Absent from an older server.
  * Never stored.
  */
 export const WakeHeard = Schema.Struct({
@@ -303,6 +306,7 @@ export const WakeHeard = Schema.Struct({
   text: Schema.String,
   matched: Schema.optionalKey(WakePhrase),
   accepted: Schema.optionalKey(Schema.Boolean),
+  source: Schema.optionalKey(Schema.Struct({ deviceId: Schema.optionalKey(DeviceId), assistantId: Schema.optionalKey(AssistantId) })),
   /** Epoch milliseconds. */
   at: NonNegativeFinite
 })

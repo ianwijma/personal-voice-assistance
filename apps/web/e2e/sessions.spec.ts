@@ -241,7 +241,7 @@ test("admin: the phrase tester can follow one device's session", async ({ page, 
   await phone.page.getByTestId("start").click()
   await desk.page.getByTestId("start").click()
   await expectVisualState(desk.page, "listening")
-  await loginAdmin(page, baseURL, "#settings/devices/type-web-voice")
+  await loginAdmin(page, baseURL, "#settings/devices/type.web-voice")
   const tester = page.getByTestId("phrase-tester")
   const picker = tester.getByTestId("tester-device")
   await expect(picker).toBeVisible()
@@ -265,7 +265,7 @@ test("admin: the phrase tester can follow one device's session", async ({ page, 
 
 test("admin: the quiet time is set on each assistant; the device page says so; the limit is a shared setting", async ({ page, baseURL }) => {
   await mock.scenario("typed")
-  await loginAdmin(page, baseURL, "#settings/devices/type-web-voice")
+  await loginAdmin(page, baseURL, "#settings/devices/type.web-voice")
   const help = page.getByTestId("conversation-help")
   await expect(help).toContainText("Each assistant keeps its own conversation on these browsers")
   await expect(help).toContainText("Jeff after 10 min quiet")

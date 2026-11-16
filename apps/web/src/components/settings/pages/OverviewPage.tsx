@@ -104,8 +104,11 @@ function Reach({ settings, assistant, max }: { readonly settings: DeviceListInfo
   )
 }
 
-/** "Who answers where" (docs/ASSISTANTS.md §7.1): devices against assistants; a cell opens the device to change it. */
-function WhoAnswersWhere() {
+/**
+ * "Who answers where" (docs/ASSISTANTS.md §7.1): devices against assistants; a cell opens the device to change it.
+ * A row's key is a device id or `type:<kind>`, a group heading's `g:<kind>`: the colons keep them from any device id.
+ */
+export function WhoAnswersWhere() {
   const client = useClient()
   const types = useClientState((s) => s.deviceTypes)
   const devices = useClientState((s) => s.devices)
@@ -163,7 +166,7 @@ function WhoAnswersWhere() {
               </thead>
               <tbody>
                 {types.flatMap((t) => [
-                  <tr key={`g-${t.kind}`}><th colSpan={assistants.length + 1} scope="colgroup" className="label px-3 pb-1 pt-4 text-left text-[10px] font-normal text-ink-faint">{t.title}</th></tr>,
+                  <tr key={`g:${t.kind}`}><th colSpan={assistants.length + 1} scope="colgroup" className="label px-3 pb-1 pt-4 text-left text-[10px] font-normal text-ink-faint">{t.title}</th></tr>,
                   ...entries(t).map((e) => (
                     <tr key={e.key} className={cx("border-t border-line/60", e.follows && "opacity-70")} data-row={e.key}>
                       <th scope="row" className="p-0 text-left font-normal">
@@ -191,7 +194,7 @@ function WhoAnswersWhere() {
           </div>
           <ul className="flex flex-col divide-y divide-line/60 rounded-md border border-line lg:hidden" data-testid="grid-list">
             {types.flatMap((t) => [
-              <li key={`g-${t.kind}`} className="px-3 py-2"><span className="label text-[10px] text-ink-faint">{t.title}</span></li>,
+              <li key={`g:${t.kind}`} className="px-3 py-2"><span className="label text-[10px] text-ink-faint">{t.title}</span></li>,
               ...entries(t).map((e) => (
                 <li key={e.key}>
                   <button type="button" className="flex w-full flex-col gap-1.5 px-3 py-3 text-left hover:bg-surface-2/50" onClick={() => client.settings(["devices", e.path])}>
