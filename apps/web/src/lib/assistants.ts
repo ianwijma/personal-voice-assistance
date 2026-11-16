@@ -327,7 +327,9 @@ export const blankAssistantBody = (name: string, from?: Assistant | AssistantInf
 export const copyName = (name: string, taken: ReadonlyArray<string>): string => {
   const used = new Set(taken.map((n) => n.trim().toLowerCase()))
   for (let n = 1; ; n++) {
-    const candidate = `${name} copy${n === 1 ? "" : ` ${n}`}`.slice(0, 32)
+    const suffix = ` copy${n === 1 ? "" : ` ${n}`}`
+    // Cut the base name, not the whole candidate, so the suffix always survives and every number gives a new name.
+    const candidate = `${name.slice(0, Math.max(0, 32 - suffix.length)).trimEnd()}${suffix}`
     if (!used.has(candidate.toLowerCase())) return candidate
   }
 }

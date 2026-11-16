@@ -614,10 +614,10 @@ const settings = {
   }),
   sessionIdleMinutes: Setting.number({
     label: "Start a fresh session after",
-    description: "Minutes without a question to Claude; the new session is told what was said before.",
+    description: "Minutes without a question to Claude; the new session is told what was said before. 0 = never.",
     default: 60,
     integer: true,
-    min: 5,
+    min: 0,
     max: 1440,
     unit: "min",
     advanced: true
