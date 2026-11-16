@@ -770,6 +770,67 @@ describe("changes that must hold together", () => {
     expect(await read("alpha")).toBe(alpha)
   })
 
+  it("before its session exists, an assistant that stays on the device keeps its id while others come and go; one put back gets a new id", async () => {
+    const others = ["charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india", "juliet"]
+    await start((file) => {
+      for (const id of others) {
+        file.assistants.order.push(id)
+        file.assistants.byId[id] = { ...file.assistants.byId.bravo, id, name: `${id[0]!.toUpperCase()}${id.slice(1)}`, prompt: `You are ${id}.` }
+      }
+    })
+    const { client: page } = await voice()
+    const a = await admin()
+    const read = async (assistantId: string) => {
+      const requestId = `read-${++seq}`
+      const from = page.messages.length
+      page.send({ type: "conversation.read", requestId, assistantId })
+      return (await page.waitFor("conversation.history", (m) => m.requestId === requestId, { from })).id
+    }
+    /** The type's defaults (which the device follows): Alpha, answering as the first, and `second`. */
+    const withSecond = async (second: string) => {
+      const rev = typeOf(a).rev
+      const assistants = [{ assistant: "alpha", phrases: ["hey alpha"] }, { assistant: second, phrases: [`hey ${second}`] }]
+      expect(await request(a, { type: "device.save", target: { kind: "type", type: "web-voice" }, rev, settings: { assistants } })).toMatchObject({ ok: true })
+      await a.waitFor("device.types", (m) => m.types.some((t) => t.kind === "web-voice" && t.rev === rev + 1), { from: 0 })
+    }
+    const alpha = await read("alpha")
+    const bravo = await read("bravo")
+    // Ten assistants get a reservation in turn, but only two are ever on the device: Alpha's is never dropped.
+    for (const second of others) {
+      await withSecond(second)
+      await read(second)
+    }
+    expect(await read("alpha")).toBe(alpha)
+    // Bravo was taken off the device, and its reservation with it. Put back, it starts a new conversation: a new id.
+    await withSecond("bravo")
+    const bravoAgain = await read("bravo")
+    expect(bravoAgain).not.toBe(bravo)
+    expect(await read("alpha")).toBe(alpha)
+    // The session opens; both start in the ids reserved for them.
+    await typed(page, "hello to alpha", "alpha")
+    await typed(page, "hello to bravo", "bravo")
+    expect(await read("alpha")).toBe(alpha)
+    expect(await read("bravo")).toBe(bravoAgain)
+  })
+
+  it("before its session exists, a TypeSafe fallback that will answer has the device's id, and keeps it", async () => {
+    await start((file) => {
+      file.deviceTypes["web-voice"].withoutPhrase = { mode: "typesafe", fallback: "bravo", giveUpMs: 700 }
+    }, [greeterModule, deciderModule])
+    const { client: page, welcome } = await voice()
+    const read = async (assistantId: string) => {
+      const requestId = `read-${++seq}`
+      const from = page.messages.length
+      page.send({ type: "conversation.read", requestId, assistantId })
+      return (await page.waitFor("conversation.history", (m) => m.requestId === requestId, { from })).id
+    }
+    const bravo = await read("bravo")
+    expect(welcome.snapshot.conversation.id).toBe(bravo)
+    expect(await read("alpha")).not.toBe(bravo)
+    await typed(page, "hello to bravo", "bravo")
+    expect(await read("bravo")).toBe(bravo)
+  })
+
   it("assistant.create: placements that add up to more than 12 phrases for the assistant on one device are refused before anything is created", async () => {
     await start()
     const a = await admin()
