@@ -43,6 +43,8 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
   const hs = [new Spring(0.045, 0, 0.3), new Spring(0.045, 0, 0.3), new Spring(0.045, 0, 0.3), new Spring(0.045, 0, 0.3)]
   const ws = [new Spring(0.1), new Spring(0.1), new Spring(0.1), new Spring(0.1)]
   let placed = false
+  let lastW = -1
+  let lastH = -1
 
   // The leading pair follows the level at once, the trailing pair a beat behind.
   const lead = new AttackRelease(0.03, 0.16)
@@ -91,7 +93,11 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
       const outline = shp[2]!
       const speed = optNumber(o, "speed")
       clock = clock < 0 ? f.t : clock + dt * speed
-      d = d0 * size
+      // Tiny boxes: the margin shrinks with the box, and the dots shrink until the row (widest bar
+      // 1.47 dots, spacing at least 1.4) and a bar's height fit inside it. Under 2 px nothing is drawn.
+      const tiny = W < 2 || H < 2
+      const m = Math.min(MARGIN, Math.min(W, H) / 10)
+      d = tiny ? 1 : Math.min(d0 * size, H - 2 * m, (W - 2 * m) / 5.7)
 
       const speaking = f.mode === "speaking"
       const live = f.mode === "hearing" || speaking
@@ -119,7 +125,7 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
       const wSpeak = mix.speaking
       // The row always fits the width, whatever the size and gap, and neighbours never touch
       // (the widest bar is 1.28 dots; 1.4 is the default's tightest spacing, while hearing).
-      const spacing = Math.min(Math.max(d * mix.of(1.9, 1.6, 1.45, 1.7, 2.5) * gap, d * 1.4), (W - 2 * MARGIN - d * 1.45) / 3)
+      const spacing = Math.min(Math.max(d * mix.of(1.9, 1.6, 1.45, 1.7, 2.5) * gap, d * 1.4), (W - 2 * m - d * 1.45) / 3)
       if (!reduced) orbit += dt * TAU * 0.85 * (0.4 + mix.thinking) * speed
       else orbit = Math.PI / 4
       const rho = d * 1.45
@@ -130,6 +136,10 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
       const press = f.pointer.down && over
       const lean = over ? clamp((px - cx) / (W * 0.5), -1, 1) : 0
 
+      // A focus of another size: the positions the springs hold belong to the old box, so they start over.
+      const resized = placed && (fo.width !== lastW || fo.height !== lastH)
+      lastW = fo.width
+      lastH = fo.height
       for (let i = 0; i < 4; i++) {
         const outer = i === 0 || i === 3
         // Row position (with the hover lean), and the orbit position for thinking.
@@ -157,9 +167,11 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
           th_ *= 0.82
           tw *= 1.15
         }
-        if (!placed) {
+        if (!placed || resized) {
           xs[i]!.set(tx)
           ys[i]!.set(ty)
+        }
+        if (!placed) {
           hs[i]!.set(th_)
           ws[i]!.set(tw)
         }
@@ -171,6 +183,8 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
       placed = true
 
       clear2d(g, dpr, fo) // (0, 0) is the box's top-left corner; the glow may spread over the whole stage
+
+      if (tiny) return
 
       // Colour: grey, mint for the person, amber for the reply; while thinking the orbiting dots
       // alternate mint and amber (the turn is being handed over).
@@ -216,9 +230,9 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
         const core = mixInto(tmp, i % 2 === 0 ? dotA : dotB, WHITE, whiten)
         const w = ws[i]!.value
         // Bars never leave the box, at any size or loudness.
-        const h = Math.min(Math.max(w, hs[i]!.value), H - 2 * MARGIN)
-        const x = xs[i]!.value - w / 2
-        const y = clamp(ys[i]!.value - h / 2, MARGIN, H - MARGIN - h)
+        const h = Math.min(Math.max(w, hs[i]!.value), H - 2 * m)
+        const x = clamp(xs[i]!.value - w / 2, m, W - m - w)
+        const y = clamp(ys[i]!.value - h / 2, m, H - m - h)
         g.beginPath()
         g.roundRect(x, y, w, h, (w / 2) * (1 - 0.78 * square))
         const a = mix.idle * 0.7 + (1 - mix.idle)
@@ -237,7 +251,7 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
 
 const design: Character = {
   id: "dot-quartet",
-  version: "1.1.0",
+  version: "1.1.1",
   contract: 1,
   name: "Dot quartet",
   family: "abstract",
@@ -263,7 +277,7 @@ const design: Character = {
     { signal: "mode", effect: "Spacing (1.45 dot apart hearing, 2.5 speaking), V vs Λ envelope, which pair leads, row vs orbit, colour grey / mint / alternating mint-and-amber / amber; 250 ms crossfade on springs." },
     { signal: "pointer", effect: "The row leans toward the pointer; pressing squashes the dots (shorter, wider)." },
     { signal: "options", effect: "Size, gap, shape, glow, spectrum detail, pitch staircase, motion speed and comet tails change the drawing in every mode; they glide over about 0.2 s (snap under reduced motion). Bars are kept inside the stage box; the glow spreads over the whole page." },
-    { signal: "reducedMotion", effect: "No bobbing or orbiting: thinking is a still diamond of four dots; heights in quarter steps with no lag." }
+    { signal: "reducedMotion", effect: "No bobbing or orbiting: thinking is a still diamond of four dots; heights in quarter steps of the level (the usual 30/160 ms envelope and height spring still smooth each change; only the trailing pair's extra 90 ms lag is dropped)." }
   ],
   options: [
     { id: "size", kind: "number", label: "Size", min: 0.5, max: 1.5, step: 0.05, default: 1, unit: "×", group: "Shape", help: "How big the dots are and how tall the bars grow." },

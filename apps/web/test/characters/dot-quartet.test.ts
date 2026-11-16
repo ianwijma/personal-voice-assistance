@@ -303,6 +303,36 @@ describe("dot quartet: bars stay in the box", () => {
     }
   })
 
+  it("dots stay inside a focus that shrinks abruptly", () => {
+    const rig = make({}, [900, 420])
+    step(rig, "idle", secs(1))
+    rig.r.resize(160, 140, 1)
+    const b = bars(step(rig, "idle", 1))
+    expect(b).toHaveLength(4)
+    for (const x of b) {
+      expect(x.x).toBeGreaterThanOrEqual(0)
+      expect(x.x + x.w).toBeLessThanOrEqual(160)
+    }
+  })
+
+  it("tiny focus rectangles never give a negative size or a bar outside the box", () => {
+    for (const size of [[200, 1], [20, 100], [12, 9], [1, 1]] as const) {
+      for (const mode of ["idle", "hearing", "speaking"] as const) {
+        const loud = voice({ level: 1, bands: new Float32Array(24).fill(1) })
+        const { r, W, H } = make({}, [size[0], size[1]])
+        for (const x of bars(step({ r, W, H }, mode, secs(1), { user: loud, agent: loud }))) {
+          const label = `${mode} ${W}x${H}`
+          expect(x.w, label).toBeGreaterThanOrEqual(0)
+          expect(x.h, label).toBeGreaterThanOrEqual(0)
+          expect(x.x, label).toBeGreaterThanOrEqual(-1e-6)
+          expect(x.y, label).toBeGreaterThanOrEqual(-1e-6)
+          expect(x.x + x.w, label).toBeLessThanOrEqual(W + 1e-6)
+          expect(x.y + x.h, label).toBeLessThanOrEqual(H + 1e-6)
+        }
+      }
+    }
+  })
+
   it("heights are quantised to quarters of the level under reduced motion", () => {
     const height = (level: number) => bars(step(make(), "hearing", secs(2), { user: voice({ level }), reduced: true }))[0]!.h
     expect(height(0.55)).toBeCloseTo(height(0.5), 3)
