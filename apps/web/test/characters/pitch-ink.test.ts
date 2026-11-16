@@ -256,6 +256,19 @@ describe("pitch ink: hover", () => {
     expect(labels(last)).toEqual(["187 Hz"])
   })
 
+  it("shows no pitch over the blank paper after a voice stops, also at a slow frame rate", () => {
+    // Voiced ink, then one silent frame: the pointer 4 px past the last voiced column is over blank paper.
+    const r = make()
+    let last: Array<Call> = []
+    for (let i = 0; i < 61; i++) {
+      recording.log = []
+      r.step({ mode: "hearing", dt: 0.1, user: i < 60 ? voice({ pitchHz: 187.4 }) : silent, agent: silent, palette: PALETTES.dark, reducedMotion: false, pointer: { x: W * 0.8 - 4.6, y: H / 2, down: false, inside: true }, sinceInterrupt: Infinity })
+      last = recording.log
+    }
+    recording.log = null
+    expect(labels(last)).toEqual([])
+  })
+
   it("shows nothing off the paper's end, outside the canvas, or over a dotted line that carries no voice", () => {
     const r = make()
     // Only about a second of paper has been written, so far back there is nothing.

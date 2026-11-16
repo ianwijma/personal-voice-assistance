@@ -492,12 +492,15 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
           if (cPos[(head - count + mid + COLS) % COLS]! < want) lo = mid + 1
           else hi = mid
         }
-        // Between the first and the last recorded column the ribbon is continuous, however far apart the columns are
-        // (a slow frame rate writes them wide apart): take the nearest. Beyond either end, only one that is close.
-        const first = count > 0 ? cPos[(head - count + COLS) % COLS]! : 0
-        const last = count > 0 ? cPos[(head - 1 + COLS) % COLS]! : 0
+        // The pointer lies between columns lo - 1 and lo. Where both carry the same voice the ribbon between them is
+        // continuous, however far apart they are (a slow frame rate writes them wide apart): take the nearer one.
+        // At a break (silence, a dotted line, another speaker) or beyond the ends, only a column that is close.
+        const jA = lo > 0 ? (head - count + lo - 1 + COLS) % COLS : -1
+        const jB = count > 0 ? (head - count + lo + COLS) % COLS : -1
+        const joined =
+          jA >= 0 && jB >= 0 && cHz[jA]! > 0 && cHz[jB]! > 0 && cOwn[jA] === cOwn[jB] && (cOwn[jA] === YOU || cOwn[jA] === AGENT) && cPos[jA]! <= want && want <= cPos[jB]!
         let bestK = -1
-        let bestD = count > 0 && want >= first && want <= last ? Infinity : STEP * 1.5
+        let bestD = joined ? Infinity : STEP * 1.5
         for (let k = Math.max(0, lo - 1); k <= Math.min(count - 1, lo); k++) {
           const d = Math.abs(cPos[(head - count + k + COLS) % COLS]! - want)
           if (d < bestD) {
