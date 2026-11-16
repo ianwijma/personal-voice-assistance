@@ -296,11 +296,40 @@ describe("line face: leaning in and pulling back", () => {
     expect(scale(voice({ level: 0.9 }))).toBeLessThan(normal * 0.95)
   })
 
-  it("a loud onset makes it flinch, and it settles again", () => {
-    const r = make()
-    const calm = faceScale(step(r, "hearing", secs(1), { user: voice({ level: 0.3 }) }))
-    const hit = faceScale(step(r, "hearing", 6, (i) => ({ user: voice({ level: 0.7, onset: i === 0 ? 1 : 0 }) })))
-    expect(hit).toBeLessThan(calm)
+  it("a loud onset makes it flinch for a moment on top of the loudness, and it settles again", () => {
+    // The flinch (shared/figure.ts) is an impulse of (level - 0.5) * 2.4 on a loud onset, here 0.48 at level
+    // 0.7, that decays with a 0.3 s time constant and takes 6 % of the face scale at full strength. Loudness on
+    // its own also shrinks the face (brace), so the onset is isolated by running the same loudness twice, one
+    // run with the onset and one without, and comparing them frame by frame.
+    const LOUD = 0.7
+    const run = (withOnset: boolean) => {
+      const r = make()
+      step(r, "hearing", secs(1), { user: voice({ level: 0.3 }) })
+      const scales: Array<number> = []
+      for (let i = 0; i < secs(3); i++) {
+        scales.push(faceScale(step(r, "hearing", 1, { user: voice({ level: LOUD, onset: withOnset && i === 0 ? 1 : 0 }) })))
+      }
+      return scales
+    }
+    const plain = run(false)
+    const hit = run(true)
+    // How much smaller the flinching face is than the one that only heard the same loudness.
+    const shrink = (i: number) => (plain[i]! - hit[i]!) / plain[i]!
+
+    // The two runs differ only through the flinch. At full strength it takes 0.06 * 0.48 = 2.9 % of the scale,
+    // but the scale glides (0.18 s) while the flinch decays (0.3 s), so the deepest gap is about 1.3 %, reached
+    // within a fifth of a second. The flinching face is never larger than the plain one.
+    const deepest = Math.max(...hit.map((_, i) => shrink(i)))
+    expect(deepest).toBeGreaterThan(0.008)
+    expect(deepest).toBeLessThan(0.03)
+    for (let i = 0; i < plain.length; i++) expect(hit[i]!, `frame ${i}`).toBeLessThanOrEqual(plain[i]! + 1e-9)
+    expect(shrink(secs(0.2))).toBeGreaterThan(0.008)
+    // Half a second on it is still visibly smaller, and the gap is closing.
+    expect(shrink(secs(0.5))).toBeGreaterThan(0.004)
+    expect(shrink(secs(0.5))).toBeLessThan(shrink(secs(0.2)))
+
+    // It recovers: the flinch has decayed to nothing (e^-10 after 3 s) and the two faces are the same size again.
+    expect(shrink(secs(3) - 1)).toBeLessThan(1e-4)
   })
 })
 
