@@ -492,8 +492,12 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
           if (cPos[(head - count + mid + COLS) % COLS]! < want) lo = mid + 1
           else hi = mid
         }
+        // Between the first and the last recorded column the ribbon is continuous, however far apart the columns are
+        // (a slow frame rate writes them wide apart): take the nearest. Beyond either end, only one that is close.
+        const first = count > 0 ? cPos[(head - count + COLS) % COLS]! : 0
+        const last = count > 0 ? cPos[(head - 1 + COLS) % COLS]! : 0
         let bestK = -1
-        let bestD = STEP * 1.5
+        let bestD = count > 0 && want >= first && want <= last ? Infinity : STEP * 1.5
         for (let k = Math.max(0, lo - 1); k <= Math.min(count - 1, lo); k++) {
           const d = Math.abs(cPos[(head - count + k + COLS) % COLS]! - want)
           if (d < bestD) {

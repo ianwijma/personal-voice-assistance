@@ -243,6 +243,19 @@ describe("pitch ink: hover", () => {
     expect(framesBack).toBeLessThan(60)
   })
 
+  it("still shows the pitch over continuous ink when a slow frame rate writes the columns far apart", () => {
+    // At 10 frames a second the columns are about 8.6 px apart: a pointer 4 px behind the nib is more than 3 px from both neighbours.
+    const r = make()
+    let last: Array<Call> = []
+    for (let i = 0; i < 60; i++) {
+      recording.log = []
+      r.step({ mode: "hearing", dt: 0.1, user: voice({ pitchHz: 187.4 }), agent: silent, palette: PALETTES.dark, reducedMotion: false, pointer: { x: W * 0.8 - 4, y: H / 2, down: false, inside: true }, sinceInterrupt: Infinity })
+      last = recording.log
+    }
+    recording.log = null
+    expect(labels(last)).toEqual(["187 Hz"])
+  })
+
   it("shows nothing off the paper's end, outside the canvas, or over a dotted line that carries no voice", () => {
     const r = make()
     // Only about a second of paper has been written, so far back there is nothing.
