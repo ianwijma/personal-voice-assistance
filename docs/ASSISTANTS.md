@@ -72,7 +72,7 @@ page share the bounds, as `frontends.ts` does today). Types are written as their
 ### 2.1 Ids and limits
 
 ```ts
-AssistantId   = String, /^[a-z][a-z0-9-]{0,31}$/   // made from the name at creation ("jeff", "t3", "keuken-2"), never changed
+AssistantId   = String, /^[a-z][a-z0-9-]{0,31}$/   // made from the name at creation ("jeff", "t3", "keuken-2"), never changed; never "typesafe" (device.pick's "whichever fits")
 DeviceKind    = FrontendKindId                     // "web-voice" (Browsers); "voice-node" is added by voice nodes (§5.1)
 DeviceId      = existing (protocol/frontends.ts:34)
 ModuleId      = existing; ToolName = String ≤ 64; FieldKey = existing settings key
