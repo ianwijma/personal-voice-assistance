@@ -928,3 +928,21 @@ follow-up (assignment, else assistant), quiet spell (`newConversationAfter`), `r
   (route gate, dispatcher, inbox, lease): overhead 0.8 / 1.2, 0.8 / 1.1, 0.8 / 1.0; realistic eager on with three
   assistants 308 / 534, 307 / 533, 307 / 534 (direct route-gate row 307 / 535, 305 / 535, 307 / 534).
 - Evidence: `docs/assistants-evidence/thin-slice-transcript.txt` (real server, local recogniser and voice, offline LLM).
+
+### WP-5 server messages: built 2026-11-16
+
+`serve/assistants.ts` (new) holds the handlers and the data of the pushes; `serve/devices.ts` (new) the pure device-type and device views of the v4 file; `SessionHub` does access and fan-out. `frontends.ts` is **not** replaced yet: it still serves the protocol 5 messages that stay until the UI packages (WP-6 to WP-8) drop them. Protocol is 7.
+
+Messages (client → server): `assistant.create`, `assistant.save`, `assistant.delete`, `device.save` (admin only, `admin_required` otherwise); `device.pick`, `conversation.read` (voice connections only, `bad_message` from an admin connection or a page without a device). Server → client: `assistants`, `device.types` (admin connections only, never a voice connection), `device.setup` (the voice connection of that device only, sent when it changes), `conversation.history` (the requester only), `devices` (admin only, as before), `result` (with `assistantId` after `assistant.create`).
+
+Deviations from §5:
+
+- **Tag collisions.** `devices` and `result` are one tag each, extended compatibly: `devices` entries are `DeviceListInfo` (the protocol 5 `DeviceInfo` plus `own`, `settings`, `hearer`, `rev`), and `result.assistantId` is an optional field. No temporary tag exists. Clean-up (WP-16): drop `profile`/`overrides` from `DeviceListInfo`. The error codes are in the one `ErrorCode` list. `frontends`, `device.profile`, `device.update`, `frontend.update`, `device.admin.update` stay.
+- `FieldError.key` accepts dotted paths (`hearing.finalSilenceMs`).
+- `assistants`/`device.types` are pushed as whole lists after any successful assistant, device or protocol 5 front-end save (not after shared-settings saves).
+- Validation errors are `invalid_settings` with `fieldErrors`; a "cannot be reached" warning asks for `saveAnyway`; `duplicate_phrase`, `unknown_assistant`, `limit_reached` are the code when validation finds that case. `assistant.save` on an unknown id is `unknown_assistant` before validation; a missing device or type is `unknown_device`.
+- `usedOn[].hears` and `resources` in `assistants` are coarse: `resources` is the engine's state (`unused` when the assistant is off or on no device) until the resource pool (WP-9) lands.
+- `canAuto` is "a decision provider module is running" until WP-14 adds the `routing` section.
+- No module field is `overridable` yet (WP-12b), so any `own` value on a module choice is refused.
+- Saving through the new messages refreshes live sessions' route configuration through `refreshProfiles` (no reload); LLM, recogniser and voice stay the shared build until WP-9/10/11.
+- Deleting an assistant ends its conversations by `stop` plus `newConversation` on each live session that has one (the conversation of a deleted assistant is no longer reachable).

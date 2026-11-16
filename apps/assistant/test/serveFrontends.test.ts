@@ -214,7 +214,7 @@ const adminOnly: ReadonlyArray<RequestInput> = [
 const VOICE_TYPES: ReadonlySet<ServerMessageType> = new Set<ServerMessageType>([
   "welcome", "session", "state", "transcript", "turn.start", "assistant.text", "assistant.playing", "tool.start", "tool.end",
   "turn.end", "reply.start", "reply.end", "reply.stop", "result", "error", "engine.summary", "admin.state", "device.profile",
-  "wake", "pong"
+  "wake", "pong", "device.setup", "conversation", "conversation.history"
 ])
 
 describe("role-shaped data", () => {

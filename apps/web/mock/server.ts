@@ -84,11 +84,12 @@ import {
   DEFAULT_MAX_VOICE_SESSIONS,
   DEFAULT_SESSION_DISCARD_MINUTES,
   DEVICE_EDITABLE_FIELDS,
-  type DeviceInfo,
+  type DeviceListInfo,
   type DeviceProfile,
   type DeviceProfileInfo,
   type FrontendKindInfo,
   applyProfilePatch,
+  BUILT_IN_WEB_VOICE_SETTINGS,
   effectiveProfile,
   PROFILE_FIELDS,
   type ProfileOverrides,
@@ -780,12 +781,13 @@ const KIND_INFO = {
 }
 const frontendInfos = (): Array<FrontendKindInfo> => [{ ...KIND_INFO, defaults: kindDefaults, profile: effectiveProfile(kindDefaults) }]
 const deviceProfile = (id: string | undefined): DeviceProfile => effectiveProfile(kindDefaults, id === undefined ? {} : devices.get(id)?.overrides ?? {})
-const deviceInfos = (): Array<DeviceInfo> => {
+const deviceInfos = (): Array<DeviceListInfo> => {
   const now = Date.now()
   return [...devices.values()]
     .map((d) => {
       const connections = [...conns].filter((c) => c.welcomed && c.deviceId === d.id).length
-      return { ...d, lastSeen: connections > 0 ? now : d.lastSeen, profile: deviceProfile(d.id), connections, audioOwner: voiceSessions.get(d.id)?.owner !== undefined }
+      // Protocol 7 fields: the mock has no assistants yet (the UI packages add them).
+      return { ...d, lastSeen: connections > 0 ? now : d.lastSeen, profile: deviceProfile(d.id), connections, audioOwner: voiceSessions.get(d.id)?.owner !== undefined, own: {}, settings: BUILT_IN_WEB_VOICE_SETTINGS, hearer: null, rev: 0 }
     })
     .sort((a, b) => b.lastSeen - a.lastSeen)
 }

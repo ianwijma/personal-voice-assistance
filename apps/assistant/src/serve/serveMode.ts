@@ -50,6 +50,8 @@ import { type Jobs, makeJobs } from "./jobs.ts"
 import { makeModels, type Models, type PresetDownloader, presetsInUse } from "./models.ts"
 import { type Keys, makeKeys } from "./Keys.ts"
 import { makeSections } from "./sections.ts"
+import { makeAssistants } from "./assistants.ts"
+import { deviceSettingsFrom } from "./devices.ts"
 import { makeSessionHub, type SessionHub } from "./SessionHub.ts"
 import { DataDirConfig, KEYS_LOCKED_MESSAGE, loadSettingsStore, SettingsStoreError } from "./SettingsStore.ts"
 import { makeApi } from "./api.ts"
@@ -275,13 +277,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       return assistantsCache.byId
     }
     /** A device's effective settings: its own sections ← its type's defaults ← the built-in (no device: the browser defaults). */
-    const deviceSettingsOf = (deviceId: string | undefined): DeviceSettings => {
-      const file = store.settings()
-      const record = deviceId === undefined ? undefined : file.devices[deviceId]
-      const kind = record?.kind ?? WEB_VOICE_KIND
-      const type = deviceTypeOf(kind) ?? WEB_VOICE_DEVICE_TYPE
-      return effectiveDeviceSettings(type.builtIn, file.deviceTypes[kind], record === undefined ? undefined : applicableOwn(type, record.own))
-    }
+    const deviceSettingsOf = (deviceId: string | undefined): DeviceSettings => deviceSettingsFrom(store.settings(), deviceId)
     /** Modules an assistant chooses (capabilities); agent and decision modules are not per assistant and always pass. */
     const isCapability = (moduleId: string) => {
       const def = catalog.find((d) => d.id === moduleId)
@@ -476,9 +472,18 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     // no recording write or rotation happens after it.
     yield* Effect.addFinalizer(() => sessions.closeAll)
 
+    const assistants = makeAssistants({
+      store,
+      sessions,
+      modules: () => host.modules(),
+      engineState: () => theEngine.status().state,
+      // TypeSafe is set up when a decision provider runs (the routing section arrives with WP-14).
+      canAuto: () => host.modules().some((m) => m.kind === "decider" && m.state === "running")
+    })
     hub = makeSessionHub({
       admin,
       frontends,
+      assistants,
       env: envMover,
       models,
       jobs,

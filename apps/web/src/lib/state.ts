@@ -539,7 +539,12 @@ const server: ServerHandlers = {
     if (e.turnId !== undefined) next = withTurn(next, e.turnId, (t) => ({ ...t, error: describeError(e) }))
     return addToast(next, describeError(e), e.code === "mic_gap" ? "info" : "error")
   },
-  pong: (s) => s
+  pong: (s) => s,
+  // Protocol 7 messages the UI packages (WP-6 to WP-8) take over; the pages do not read them yet.
+  "device.setup": (s) => s,
+  "conversation.history": (s) => s,
+  assistants: (s) => s,
+  "device.types": (s) => s
 }
 
 const local = (s: ClientState, a: LocalAction): ClientState => {

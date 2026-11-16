@@ -126,6 +126,8 @@ export interface SessionConversations {
   readonly history: (assistant?: string) => Effect.Effect<ReadonlyArray<Message>>
   readonly conversation: (assistant?: string) => ConversationInfo
   readonly lastTurnAt: (assistant?: string) => number | undefined
+  /** Committed turns in `assistant`'s current conversation. */
+  readonly turnsOf: (assistant?: string) => number
   readonly newConversation: (assistant?: string) => Effect.Effect<ConversationInfo>
   /** The answering assistant now (`undefined`: the device has none). */
   readonly answering: () => string | undefined
@@ -576,6 +578,7 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
         return conversationOf(a)?.conversation() ?? reservedFor(a ?? "")
       },
       lastTurnAt: (assistant) => conversationOf(assistant ?? answering())?.lastTurnAt(),
+      turnsOf: (assistant) => turnsBy.get(assistant ?? answering() ?? "") ?? 0,
       newConversation: (assistant) =>
         Effect.suspend(() => {
           const a = assistant ?? answering()
@@ -641,7 +644,14 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
           ownerPresent: owner.present,
           conversationId: conversations.conversation().id,
           turns: turnsBy.get(answering() ?? "") ?? 0,
-          lastTurnAt: last ?? null
+          lastTurnAt: last ?? null,
+          ...(answering() !== undefined ? { answering: answering()! } : {}),
+          conversations: [...dispatcher.conversations().entries()].map(([assistantId, target]) => ({
+            assistantId,
+            conversationId: target.conversation.conversation().id,
+            turns: turnsBy.get(assistantId) ?? 0,
+            lastTurnAt: target.conversation.lastTurnAt() ?? null
+          }))
         }
       }
     } satisfies VoiceSession

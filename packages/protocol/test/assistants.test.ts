@@ -9,6 +9,8 @@ import {
   AssistantInfo,
   assistantsById,
   AssistantsClientMessage,
+  ClientMessage,
+  ServerMessage,
   AssistantsServerMessage,
   assistantUsedOn,
   BUILT_IN_WEB_VOICE_SETTINGS,
@@ -53,6 +55,7 @@ import {
   exampleAssistant,
   exampleAssistantInfo,
   exampleAssistantT3,
+  exampleDevice,
   exampleDeviceRecord,
   exampleDeviceSettings,
   exampleDeviceSetup,
@@ -73,9 +76,9 @@ const t3 = exampleAssistantT3
 const byId = assistantsById([jeff, t3])
 const settings = (patch: Partial<DeviceSettings> = {}): DeviceSettings => ({ ...exampleDeviceSettings, ...patch })
 
-describe("protocol 7 is additive", () => {
-  it("does not bump the version", () => {
-    expect(PROTOCOL_VERSION).toBe(6)
+describe("protocol 7", () => {
+  it("is protocol version 7", () => {
+    expect(PROTOCOL_VERSION).toBe(7)
   })
 })
 
@@ -224,13 +227,21 @@ describe("protocol 7 messages", () => {
     expect(accepts(AssistantsClientMessage, { ...ex["device.save"], target: { kind: "device", id: "x" } })).toBe(false)
     expect(accepts(AssistantsClientMessage, { ...ex["device.save"], settings: { interruptMode: "x" } })).toBe(false)
   })
-  it("a successful create result carries the id; the new error codes decode", () => {
+  it("a successful create result carries the id; the new error codes decode on the one result", () => {
     const ok = { type: "result", requestId: "a1", ok: true, assistantId: "keuken-2" } as const
-    expect(roundTrip(AssistantsServerMessage, ok)).toEqual(ok)
+    expect(roundTrip(ServerMessage, ok)).toEqual(ok)
     for (const code of ["stale", "duplicate_phrase", "unknown_assistant", "limit_reached", "not_allowed", "admin_required", "invalid_settings"]) {
-      expect(accepts(AssistantsServerMessage, { type: "result", requestId: "r", ok: false, error: { code, message: "m" } })).toBe(true)
+      expect(accepts(ServerMessage, { type: "result", requestId: "r", ok: false, error: { code, message: "m" } })).toBe(true)
     }
-    expect(accepts(AssistantsServerMessage, { type: "result", requestId: "r", ok: false, error: { code: "nope", message: "m" } })).toBe(false)
+    expect(accepts(ServerMessage, { type: "result", requestId: "r", ok: false, error: { code: "nope", message: "m" } })).toBe(false)
+    expect(accepts(ServerMessage, { type: "result", requestId: "r", ok: false, error: { code: "invalid_settings", message: "m", fieldErrors: [{ key: "hearing.finalSilenceMs", message: "m" }] } })).toBe(true)
+  })
+  it("the new messages are members of the main unions; devices entries are a superset of the protocol 5 ones", () => {
+    for (const type of AssistantsClientMessage.discriminants) expect(ClientMessage.discriminants).toContain(type)
+    for (const type of AssistantsServerMessage.discriminants) expect(ServerMessage.discriminants).toContain(type)
+    const { own: _o, settings: _s, hearer: _h, rev: _r, ...old } = exampleDevice
+    expect(accepts(ServerMessage, { type: "devices", devices: [old] })).toBe(false)
+    expect(accepts(ServerMessage, { type: "devices", devices: [exampleDevice] })).toBe(true)
   })
 })
 
