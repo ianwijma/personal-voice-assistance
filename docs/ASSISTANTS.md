@@ -1625,10 +1625,10 @@ Every finished turn's trace carries `config` (protocol 7 `TraceConfig`, §5.4), 
 
 | Field | From |
 |---|---|
-| `llm.account`, `model`, `effort`, `thinking`, `maxTokens` | the spec of the language-model instance the turn is bound to (`ResourcePool.keyFor` → the spec recorded for that key: during a change, still the old one), for an offline account its normalised spec; a Claude subscription assistant: its own `llm` fields (what the agent is given) |
+| `llm.account`, `model`, `effort`, `thinking`, `maxTokens` | the spec of the language-model instance the turn is bound to (`ResourcePool.keyFor` → the spec recorded for that key: during a change, still the old one), for an offline account its normalised spec; bound to the Claude subscription (the binding's account, as `agentSetup` reads it, not the saved one): the assistant's own `llm` fields, as the agent is given them (`subscriptionAssistantOf`), not its stand-in's spec |
 | `hearing.hearer`, `engine`, `model`, `language`, `eagerSilenceMs`, `finalSilenceMs`, `eotThreshold` | the recogniser binding the device's stream runs on (`SttBinding.spec` and the hearer): stt-sherpa with its end pauses (the language only for a model that takes one), Deepgram with `eotThreshold`; typed text while no stream runs: the device's binding now |
 | `voice` | the key of the voice the turn is bound to (`ttsKeyFor`) |
-| `modules`, `tools` | the capability modules the assistant has on that run, and the tools in its registry (0 for a subscription assistant with `useModules` off) |
+| `modules`, `tools` | the capability modules the assistant has on that run, and the tools in its registry (0 when bound to the Claude subscription with `useModules` off) |
 | `replyEarly`, `toolRounds` | the assistant's fields |
 
 - **Captured at the turn's start**: `assistantTurnTrace.begin` (the per-conversation trace service of `VoiceSession`)
