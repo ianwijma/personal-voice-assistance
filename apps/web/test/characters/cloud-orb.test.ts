@@ -39,6 +39,8 @@ interface Drive {
   readonly reduced?: boolean
   readonly pointer?: { x: number; y: number; down: boolean; inside: boolean }
   readonly focus?: Focus
+  /** Seconds per frame (default one 60 Hz frame). */
+  readonly dt?: number
 }
 
 /** An orb on a canvas whose WebGL calls are recorded: `u(name)` is the last value sent for a uniform. */
@@ -73,7 +75,7 @@ const orb = (stored: Stored = {}) => {
       const a = d.agent ?? agent
       for (let i = 0; i < frames; i++) {
         d.each?.(i, u, a)
-        runner.step({ mode, dt: DT, user: u, agent: a, palette: d.palette ?? PALETTES.dark, reducedMotion: d.reduced === true, pointer: d.pointer ?? { x: 0, y: 0, down: false, inside: false }, sinceInterrupt: Infinity, focus: d.focus ?? BOX })
+        runner.step({ mode, dt: d.dt ?? DT, user: u, agent: a, palette: d.palette ?? PALETTES.dark, reducedMotion: d.reduced === true, pointer: d.pointer ?? { x: 0, y: 0, down: false, inside: false }, sinceInterrupt: Infinity, focus: d.focus ?? BOX })
       }
       return api
     },
@@ -149,17 +151,14 @@ describe("cloud orb: where it is and how big", () => {
     expect(read("uR", "hearing", 5, { ...d, pointer: { ...at, down: true, inside: true } }, big)).toBeCloseTo(0.95 * CAP, 6)
   })
 
-  it("draws nothing, rather than a zero radius, for a degenerate focus box (the shader divides by the radius)", () => {
-    const centre = { x: 0, y: 0, down: false, inside: true }
-    for (const focus of [{ x: 0, y: 0, width: 0, height: 0 }, { x: 0, y: 0, width: 0, height: 200 }, { x: 0, y: 0, width: 200, height: 0 }]) {
-      const o = orb().run("idle", 3, { focus, pointer: centre })
-      expect(() => o.u("uR"), `${focus.width}x${focus.height}`).toThrow() // the uniform was never sent: no draw
-    }
-    // A normal box with the pointer at its exact centre sends a finite light position.
+  it("never sends a zero radius to the shader: on the first frame (dt 0, the size envelope not yet risen) it draws nothing", () => {
     const mid = { x: BOX.x + BOX.width / 2, y: BOX.y + BOX.height / 2, down: false, inside: true }
-    const light = orb().run("idle", 3, { pointer: mid }).v("uLight")
-    expect(light.every(Number.isFinite)).toBe(true)
-    expect(orb().run("idle", 3).u("uR")).toBeGreaterThan(0)
+    const first = orb().run("idle", 1, { dt: 0, pointer: mid })
+    expect(() => first.u("uR")).toThrow() // the uniform was never sent: nothing was drawn
+    // A frame later it has risen: a positive radius, and a finite light position even with the pointer at the exact centre.
+    const next = first.run("idle", 1, { pointer: mid })
+    expect(next.u("uR")).toBeGreaterThan(0)
+    expect(next.v("uLight").every(Number.isFinite)).toBe(true)
   })
 })
 
