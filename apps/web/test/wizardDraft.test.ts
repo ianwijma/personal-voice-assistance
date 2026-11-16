@@ -44,6 +44,20 @@ describe("useWizardDraft", () => {
     expect(result.current.current).toBe(next)
   })
 
+  it("while frozen (a create on its way) set, update and replace change nothing; the refusal's errors still land", () => {
+    let frozen = true
+    const { result } = renderHook(() => useWizardDraft(() => exampleAssistant, () => frozen))
+    act(() => result.current.set("name", "Zed"))
+    act(() => result.current.update((a) => ({ ...a, purpose: "Other" })))
+    act(() => result.current.replace({ ...exampleAssistant, name: "Replaced" }))
+    expect(result.current.current).toBe(exampleAssistant)
+    act(() => result.current.setErrors([{ key: "name", message: "Taken." }]))
+    expect(result.current.errors).toEqual([{ key: "name", message: "Taken." }])
+    frozen = false
+    act(() => result.current.set("name", "Zed"))
+    expect(result.current.current.name).toBe("Zed")
+  })
+
   it("reset, cancel and dismissWarnings do nothing", () => {
     const { result } = start()
     act(() => result.current.set("name", "Zed"))
