@@ -2072,9 +2072,9 @@ document.addEventListener('click', e => {
       const a = { id, name, purpose: w.purpose.trim() || 'No purpose yet.', handles: (w.handles || '').trim(), on:true, prompt: w.prompt || `You are ${name}. Answer in one or two short sentences: your replies are spoken.`,
         toolRounds: src ? src.toolRounds : 5, followUp: w.followUp, quiet: w.quiet, early: src ? src.early : true, askBefore:'off', llm: clone(w.llm), stt: clone(w.stt), voice: w.voice, modules: clone(w.modules) };
       DATA.assistants.push(a);
-      const placed = [];
+      const placed = []; const before = Object.fromEntries(DATA.devices.map(d => [d.id, clone(eff(d, 'assign'))]));
       Object.entries(w.where).filter(([, x]) => x.on).forEach(([did, x]) => { const d = DEV(did); if (!d) return; const entry = { a:id, p: x.phrase.trim() ? [cap(x.phrase)] : [] };
-        if (d.defaults) d.s.assign.list.push(entry); else { if (!d.own.assign) d.own.assign = clone(eff(d, 'assign')); d.own.assign.list.push(entry); } placed.push(d.name); });
+        if (d.defaults) d.s.assign.list.push(entry); else { if (!d.own.assign) d.own.assign = before[d.id]; d.own.assign.list.push(entry); } placed.push(d.name); });
       S.wizard = null; S.page = null; location.hash = '#assistants/' + id + '/basics';
       setTimeout(() => toast(placed.length ? `Created ${name}. It answers on ${listJoin(placed)}.` : `Created ${name}. It is not on any device yet: add it under Devices.`), 0);
       break; }
