@@ -1,8 +1,9 @@
 import { describe, expect, it } from "vitest"
-import { exampleAssistantInfo, exampleWeatherModule } from "@pva/protocol/examples"
-import type { AssistantInfo, TraceConfig, TraceInfo } from "@pva/protocol"
+import { exampleAdminSnapshot, exampleAssistantInfo, exampleWeatherModule, serverExamples } from "@pva/protocol/examples"
+import type { AssistantInfo, ModuleInfo, ServerMessage, TraceConfig, TraceInfo } from "@pva/protocol"
 import { prettyVoice } from "@/lib/assistants.ts"
-import { changedSince, chosenBy, factsOf, type LatencyContext, ROUTE_FILTERS, TRACE_COLUMNS, traceKeys, voiceLabel } from "@/components/settings/latency.tsx"
+import { type ClientState, initialState, MAX_TRACES, reducer } from "@/lib/state.ts"
+import { changedSince, chosenBy, factsOf, type LatencyContext, LLM_KNOBS, ROUTE_FILTERS, TRACE_COLUMNS, voiceLabel } from "@/components/settings/latency.tsx"
 
 const assistant: AssistantInfo = {
   ...exampleAssistantInfo,
@@ -138,8 +139,45 @@ describe("latency page: what changed since a turn", () => {
     expect(changedSince(trace(), ctx({ assistants: [off] }))).toEqual(["tools 1 → 0", "tool rounds 5 → 2"])
     const none = now({ modules: { weather: { on: false, offTools: [] } } })
     expect(changedSince(trace(), ctx({ assistants: [none] }))).toEqual(["modules 1 → 0", "tools 1 → 0"])
-    // A module that is no longer installed contributes no tools.
-    expect(changedSince(trace({ config: config({ tools: 0 }) }), ctx({ modules: [] }))).toEqual([])
+    // A module that is no longer installed runs no more and contributes no tools.
+    expect(changedSince(trace({ config: config({ tools: 0 }) }), ctx({ modules: [] }))).toEqual(["modules 1 → 0"])
+  })
+
+  it("counts the modules that run for the assistant, as the server records them", () => {
+    const weather = (over: Partial<ModuleInfo>): ModuleInfo => ({ ...exampleWeatherModule, ...over })
+    // Recorded while Weather was in error (the server counts no module and no tool); still in error: nothing changed.
+    const failed = trace({ config: config({ modules: 0, tools: 0 }) })
+    expect(changedSince(failed, ctx({ modules: [weather({ state: "error", tools: [] })] }))).toEqual([])
+    // This assistant's own instance fails while the module as a whole runs: its tools do not count either.
+    const ownFails = weather({ instances: [{ assistants: ["jeff"], own: ["units"], state: "error" }, { assistants: ["other"], own: [], state: "running" }] })
+    expect(changedSince(failed, ctx({ modules: [ownFails] }))).toEqual([])
+    // Its instance runs again: one module and its tool.
+    const ownRuns = weather({ instances: [{ assistants: ["jeff"], own: ["units"], state: "running" }] })
+    expect(changedSince(failed, ctx({ modules: [ownRuns] }))).toEqual(["modules 0 → 1", "tools 0 → 1"])
+    // An agent or decision provider is not one of the assistant's modules.
+    expect(changedSince(failed, ctx({ modules: [weather({ kind: "agent" })] }))).toEqual([])
+  })
+
+  it("compares only the language-model settings the account uses, as the server records them", () => {
+    // An offline assistant saved with effort high, thinking adaptive and 2048 tokens: the server records its stand-in
+    // (no model, low, off, 1024). Nothing changed after the turn, so nothing is reported.
+    const offline = now({ llm: { ...assistant.llm, account: "offline", model: "", effort: "high", thinking: "adaptive", maxTokens: 2048 } })
+    const offlineTurn = trace({ config: config({ llm: { account: "offline", model: "", effort: "low", thinking: "off", maxTokens: 1024 } }) })
+    expect(changedSince(offlineTurn, ctx({ assistants: [offline] }))).toEqual([])
+    // OpenRouter and the home model use the model and the longest reply, not effort or thinking.
+    const or = (over: Partial<AssistantInfo["llm"]>) => now({ llm: { ...assistant.llm, account: "openrouter", model: "vendor/m", effort: "high", thinking: "adaptive", maxTokens: 2048, ...over } })
+    const orTurn = trace({ config: config({ llm: { account: "openrouter", model: "vendor/m", effort: "low", thinking: "off", maxTokens: 2048 } }) })
+    expect(changedSince(orTurn, ctx({ assistants: [or({})] }))).toEqual([])
+    expect(changedSince(orTurn, ctx({ assistants: [or({ model: "vendor/n", maxTokens: 512 })] }))).toEqual(["model vendor/m → vendor/n", "longest reply 2048 → 512"])
+    expect(LLM_KNOBS["home-model"]).toEqual(LLM_KNOBS.openrouter)
+    // A Claude subscription assistant without a model answers with the first Claude model (as the server records it).
+    const sub = { account: "claude-subscription", model: "claude-haiku-5-5", effort: "low", thinking: "off", maxTokens: 1024 } as const
+    const blank = now({ llm: { ...assistant.llm, ...sub, model: "", useModules: true } })
+    expect(changedSince(trace({ config: config({ llm: sub }) }), ctx({ assistants: [blank] }))).toEqual([])
+    // An account that uses them still reports changed ones; a changed account names only the settings both use.
+    const anthropic = now({ llm: { ...assistant.llm, effort: "high" } })
+    expect(changedSince(trace(), ctx({ assistants: [anthropic] }))).toEqual(["effort low → high"])
+    expect(changedSince(offlineTurn, ctx({ assistants: [anthropic] }))).toEqual(["account Offline stand-in → Anthropic API"])
   })
 
   it("counts no tools for a Claude subscription assistant that may not use its modules", () => {
@@ -193,18 +231,41 @@ describe("latency page: what changed since a turn", () => {
   })
 })
 
-describe("latency page: trace keys", () => {
-  it("keeps a row's key when a newer trace arrives, and tells devices, assistants and repeated turn numbers apart", () => {
-    const a = trace({ turnId: 1 })
-    const b = trace({ turnId: 1, deviceId: "d2" })
-    const c = trace({ turnId: 1, assistant: { id: "keuken", name: "Keuken" } })
-    const before = traceKeys([a, b, c])
-    expect(new Set(before).size).toBe(3)
-    // Another device finishes a turn: the earlier rows keep their keys.
-    expect(traceKeys([a, b, c, trace({ turnId: 2, deviceId: "d3" })]).slice(0, 3)).toEqual(before)
-    // A device whose turn numbers started over: the same number again gets its own key, and the first keeps its own.
-    const again = traceKeys([a, b, c, trace({ turnId: 1 })])
-    expect(again.slice(0, 3)).toEqual(before)
-    expect(new Set(again).size).toBe(4)
+describe("latency page: trace ids", () => {
+  const loggedIn = { ...serverExamples.welcome, snapshot: { ...serverExamples.welcome.snapshot, admin: { enabled: true, loggedIn: true } } }
+  const run = (actions: ReadonlyArray<ServerMessage>, from: ClientState = initialState) => actions.reduce((s, m) => reducer(s, m), from)
+  const traceMsg = (turnId: number, deviceId = "d1"): ServerMessage => ({ type: "trace", key: deviceId, trace: trace({ turnId, deviceId }) })
+  const ids = (s: ClientState) => new Map(s.traces.map((t, i) => [t, s.traceIds[i]]))
+
+  it("gives each trace its own id when it arrives, which a newer trace does not change", () => {
+    let s = run([loggedIn, { type: "admin.snapshot", snapshot: { ...exampleAdminSnapshot, traces: [trace({ turnId: 7 })] } }])
+    s = run([traceMsg(1), traceMsg(1, "d2")], s)
+    expect(s.traceIds.length).toBe(s.traces.length)
+    expect(new Set(s.traceIds).size).toBe(3)
+    const before = ids(s)
+    s = run([traceMsg(2, "d3")], s)
+    for (const [t, id] of before) expect(ids(s).get(t)).toBe(id)
+  })
+
+  it("keeps the ids when the oldest traces are dropped, also for a turn number that came back", () => {
+    let s = run([loggedIn, { type: "admin.snapshot", snapshot: { ...exampleAdminSnapshot, traces: [] } }])
+    // The device's session started over: turn 1 twice, from the same device and assistant.
+    s = run([traceMsg(1), traceMsg(1)], s)
+    const second = s.traces[1]!
+    const secondId = s.traceIds[1]
+    s = run(Array.from({ length: MAX_TRACES - 1 }, (_, i) => traceMsg(100 + i, "d9")), s)
+    // The first turn 1 was dropped; the second keeps its id (so its open row stays open and no other row opens).
+    expect(s.traces.length).toBe(MAX_TRACES)
+    expect(s.traces[0]).toBe(second)
+    expect(s.traceIds[0]).toBe(secondId)
+    expect(new Set(s.traceIds).size).toBe(MAX_TRACES)
+  })
+
+  it("never gives an id twice, also after a new snapshot or a logout", () => {
+    let s = run([loggedIn, { type: "admin.snapshot", snapshot: { ...exampleAdminSnapshot, traces: [trace({ turnId: 1 })] } }, traceMsg(2)])
+    const seen = [...s.traceIds]
+    s = run([loggedIn, { type: "admin.snapshot", snapshot: { ...exampleAdminSnapshot, traces: [trace({ turnId: 1 })] } }], s)
+    s = run([{ type: "admin.state", admin: { enabled: true, loggedIn: false } }, loggedIn, { type: "admin.snapshot", snapshot: { ...exampleAdminSnapshot, traces: [trace({ turnId: 1 })] } }], s)
+    expect(s.traceIds.some((id) => seen.includes(id))).toBe(false)
   })
 })

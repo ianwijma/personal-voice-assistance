@@ -6,7 +6,7 @@ import { firstSoundMs, modulesInOrder } from "@/lib/state.ts"
 import { shallowEqual } from "@/lib/store.ts"
 import { inputClass } from "../../fields/types.ts"
 import { useClient, useClientState } from "../../context.tsx"
-import { changedSince, factsOf, type LatencyContext, latencyTone, median, ROUTE_FILTERS, TRACE_COLUMNS, TraceRow, TracePopover, traceKeys, type TraceView, voiceLabel } from "../latency.tsx"
+import { changedSince, factsOf, type LatencyContext, latencyTone, median, ROUTE_FILTERS, TRACE_COLUMNS, TraceRow, TracePopover, type TraceView, voiceLabel } from "../latency.tsx"
 import { cx, Segmented } from "../../ui/controls.tsx"
 import { SELECT_CHEVRON } from "./assistants/parts.tsx"
 import { useVoiceNameOf } from "./AssistantsPage.tsx"
@@ -35,6 +35,8 @@ function FilterSelect({ label, value, options, onChange, testId }: {
  */
 export function LatencyPage() {
   const traces = useClientState((s) => s.traces, shallowEqual)
+  // Each trace's own id (given when it arrived): a row keeps its key, open state and popover while it is listed.
+  const traceIds = useClientState((s) => s.traceIds, shallowEqual)
   const assistants = useClientState((s) => s.assistants)
   const devices = useClientState((s) => s.devices)
   const moduleState = useClientState((s) => s.modules)
@@ -53,8 +55,7 @@ export function LatencyPage() {
     hearingName: hearingModelNames(sections).hearing,
     voiceName
   }
-  const keys = traceKeys(traces)
-  const all: ReadonlyArray<TraceView> = traces.map((t, i) => ({ key: keys[i]!, t, voices: t.voices.map((v) => voiceLabel(v, ctx)), facts: factsOf(t, ctx), changed: changedSince(t, ctx) })).reverse()
+  const all: ReadonlyArray<TraceView> = traces.map((t, i) => ({ key: `t${traceIds[i] ?? `-${i}`}`, t, voices: t.voices.map((v) => voiceLabel(v, ctx)), facts: factsOf(t, ctx), changed: changedSince(t, ctx) })).reverse()
 
   // The filters offer who is in the turns (an assistant or device since removed still shows in them).
   const assistantOptions = [...new Map(all.flatMap(({ t }) => (t.assistant === undefined ? [] : [[t.assistant.id, t.assistant.name] as const]))).entries()]

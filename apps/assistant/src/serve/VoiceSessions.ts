@@ -1,4 +1,4 @@
-import type { ConversationInfo, SessionInfo, TraceInfo } from "@pva/protocol"
+import { type ConversationInfo, MAX_ASSIGNMENTS, type SessionInfo, type TraceInfo } from "@pva/protocol"
 import { Effect, Exit, Scope } from "effect"
 import { MAX_TRACES } from "./Publisher.ts"
 import type { VoiceSession } from "./VoiceSession.ts"
@@ -74,6 +74,8 @@ export interface VoiceSessions {
 
 /** Device ids remembered with a conversation id before their session exists. */
 const MAX_RESERVED = 64
+/** Assistants remembered per device (its list, and `""`); the least recently used is forgotten past it (the list changed). */
+const MAX_RESERVED_PER_DEVICE = MAX_ASSIGNMENTS + 1
 
 export const makeVoiceSessions = (options: VoiceSessionsOptions): VoiceSessions => {
   const sessions = new Map<string, { readonly session: VoiceSession; readonly scope: Scope.Closeable }>()
@@ -92,15 +94,16 @@ export const makeVoiceSessions = (options: VoiceSessionsOptions): VoiceSessions 
     while (reserved.size > MAX_RESERVED) reserved.delete(reserved.keys().next().value!)
     return byAssistant
   }
-  const reservedFor = (key: string, assistant: string | undefined): ConversationInfo => {
+  /** Reserve `info` for `assistant` on the device (most recently used last; the oldest past `MAX_RESERVED_PER_DEVICE` is forgotten). */
+  const reserve = (key: string, assistant: string | undefined, info: ConversationInfo): ConversationInfo => {
     const byAssistant = reservationsOf(key)
-    let info = byAssistant.get(assistant ?? "")
-    if (info === undefined) {
-      info = fresh()
-      byAssistant.set(assistant ?? "", info)
-    }
+    byAssistant.delete(assistant ?? "")
+    byAssistant.set(assistant ?? "", info)
+    while (byAssistant.size > MAX_RESERVED_PER_DEVICE) byAssistant.delete(byAssistant.keys().next().value!)
     return info
   }
+  const reservedFor = (key: string, assistant: string | undefined): ConversationInfo =>
+    reserve(key, assistant, reserved.get(key)?.get(assistant ?? "") ?? fresh())
 
   const stop = (entry: { readonly session: VoiceSession; readonly scope: Scope.Closeable }) =>
     Effect.andThen(
@@ -174,8 +177,7 @@ export const makeVoiceSessions = (options: VoiceSessionsOptions): VoiceSessions 
         const session = sessions.get(key)?.session
         if (session !== undefined) return session.conversation.newConversation(assistant)
         return Effect.sync(() => {
-          const info = fresh()
-          reservationsOf(key).set(assistant ?? "", info)
+          const info = reserve(key, assistant, fresh())
           options.announce(key, info, assistant)
           return info
         })
