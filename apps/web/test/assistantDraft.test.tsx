@@ -292,6 +292,43 @@ describe("useAssistantDraft", () => {
     expect(result.current.message).toBe("Could not save. Try again.")
   })
 
+  it("an edit typed back to the saved value leaves no draft: a push from elsewhere is then followed (PR #34 review 2, finding 2)", async () => {
+    const { result, rerender, saveAssistant } = setup()
+    const original = result.current.saved.purpose
+    act(() => result.current.set("purpose", "Mine"))
+    act(() => result.current.set("purpose", original))
+    expect(result.current.dirty).toBe(false)
+    // Another admin changes the prompt.
+    rerender({ info: info({ prompt: "Be brief.", rev: 4 }) })
+    expect(result.current.behind).toBe(false)
+    expect(result.current.dirty).toBe(false)
+    expect(result.current.current).toMatchObject({ prompt: "Be brief.", rev: 4 })
+    // A new edit is saved under the new revision.
+    act(() => result.current.set("purpose", "Mine"))
+    await act(async () => void (await result.current.save()))
+    expect(saveAssistant.mock.calls[0]![0]).toMatchObject({ purpose: "Mine", prompt: "Be brief.", rev: 4 })
+  })
+
+  it("a field edited back to the old value while its save is on its way stays as a change after the save (PR #34 review 2, finding 2)", async () => {
+    let release: (o: Outcome) => void = () => {}
+    const { result } = setup(() => new Promise<Outcome>((r) => (release = r)))
+    const original = result.current.saved.purpose
+    act(() => result.current.set("purpose", "Mine"))
+    let first: Promise<Outcome> | undefined
+    act(() => {
+      first = result.current.save()
+    })
+    act(() => result.current.set("purpose", original))
+    await act(async () => {
+      release({ kind: "ok" })
+      await first
+    })
+    expect(result.current.saved).toMatchObject({ purpose: "Mine", rev: 4 })
+    expect(result.current.current).toMatchObject({ purpose: original, rev: 4 })
+    expect(result.current.dirty).toBe(true)
+    expect(result.current.changed("purpose")).toBe(true)
+  })
+
   describe("a push while editing", () => {
     it("a clean draft follows it", () => {
       const { result, rerender } = setup()

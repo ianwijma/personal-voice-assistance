@@ -47,7 +47,9 @@ const fakeSessions = (send: (input: unknown) => string = () => "accepted") => {
     },
     syncProfile: () => {},
     ownerChanged: () => {},
-    touch: () => {}
+    touch: () => {},
+    holder: () => null,
+    pickAccepted: () => {}
   })
   return {
     get: (key: string) => sessions.get(key),

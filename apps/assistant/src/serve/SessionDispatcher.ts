@@ -91,6 +91,11 @@ export interface DecideResult {
   readonly fallback: boolean
   /** A routing call was made (absent: answered without one, e.g. `decideByFallback`). */
   readonly decision?: RouteDecision
+  /**
+   * Routing is not set up, so nobody answers without a phrase (`assistant: null`); the answer stands as it is. Any
+   * other fallback answer, `null` included, is checked against the fallback the device has now (`decideNow`).
+   */
+  readonly notSetUp?: boolean
 }
 
 /**
@@ -197,9 +202,9 @@ export const makeSessionDispatcher = <C extends DispatchTarget>(
   const decide = options.decide ?? decideByFallback
   /** A `decide` answer checked against the device as it is now (`decideNow`). */
   const stillValid = (result: DecideResult): DecideResult => {
-    if (options.decideNow === undefined || result.assistant === null) return result
+    if (options.decideNow === undefined || result.notSetUp === true) return result
     const now = options.decideNow()
-    const valid = result.fallback ? result.assistant === now.fallback : now.candidates.includes(result.assistant)
+    const valid = result.fallback ? result.assistant === now.fallback : result.assistant !== null && now.candidates.includes(result.assistant)
     return valid ? result : { ...result, assistant: now.fallback, fallback: true }
   }
   const books = new Map<string, Book<C>>()

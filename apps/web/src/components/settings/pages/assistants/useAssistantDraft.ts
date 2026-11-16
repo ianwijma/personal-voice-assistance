@@ -87,6 +87,8 @@ export const useAssistantDraft = (info: AssistantInfo): AssistantDraft => {
       const from = s.edited ?? base
       const next = f(from)
       const errors = touched === undefined ? s.errors : s.errors.filter((e) => e.key !== touched && !(e.key?.startsWith(`${touched}.`) ?? false))
+      // Edited back to what is saved: no draft is kept, so the next push is followed (not marked "Changed elsewhere").
+      if (deepEqual({ ...next, rev: 0 }, { ...base, rev: 0 })) return { ...s, edited: undefined, errors, warnings: [], message: undefined, rev: base.rev, behind: false }
       return { ...s, edited: next, errors, warnings: [], message: undefined, rev: s.edited === undefined ? base.rev : s.rev }
     })
   }
@@ -140,8 +142,9 @@ export const useAssistantDraft = (info: AssistantInfo): AssistantDraft => {
       switch (outcome.kind) {
         case "ok":
           setAwaiting(edited)
-          // Edits made while the save was on its way are kept, on top of the revision just saved.
-          setState((s) => s.edited === edited ? clean(edited.rev + 1) : { ...clean(edited.rev + 1), edited: s.edited === undefined ? undefined : { ...s.edited, rev: edited.rev + 1 }, localErrors: s.localErrors })
+          // Edits made while the save was on its way are kept, on top of the revision just saved. No draft left means
+          // they were edited back to the version before this save (`base` here): that is kept as the draft.
+          setState((s) => s.edited === edited ? clean(edited.rev + 1) : { ...clean(edited.rev + 1), edited: { ...(s.edited ?? base), rev: edited.rev + 1 }, localErrors: s.localErrors })
           setJustSaved(true)
           break
         case "stale":

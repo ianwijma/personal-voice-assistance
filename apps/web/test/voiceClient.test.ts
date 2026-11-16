@@ -81,11 +81,15 @@ describe("pickAssistant (device.pick)", () => {
     ])
   })
 
-  it("an accepted pick clears who has the turn and the 'Listening…' state, and returns the result", async () => {
+  it("an accepted pick returns the result and leaves who has the turn to the server: the state that follows says it", async () => {
     const { c } = client(ok())
     withTurnHeld(c)
     const result = await c.pickAssistant("jeff")
     expect(result.ok).toBe(true)
+    // No guess on the page: T3 keeps the turn until the server says otherwise.
+    expect(c.store.get().holder).toBe("t3")
+    // The server closed its windows on the pick: its next state names nobody.
+    c.store.dispatch({ type: "state", state: "listening", holder: null })
     expect(c.store.get().holder).toBeUndefined()
     expect(c.store.get().woke).toBeUndefined()
   })
