@@ -103,7 +103,7 @@ test("a reload stays logged in; Log out ends it, also for a second tab of the sa
   await instrument(a, " A")
   await instrument(b, " B")
   try {
-    await loginAdmin(a, assistant.url, "#settings/voices")
+    await loginAdmin(a, assistant.url, "#settings/overview")
     await a.reload()
     await expect(a.getByTestId("settings")).toBeVisible()
     await expect(a.getByTestId("login-form")).toHaveCount(0)
@@ -111,10 +111,9 @@ test("a reload stays logged in; Log out ends it, also for a second tab of the sa
     const token = await a.evaluate(() => sessionStorage.getItem("pva.adminToken"))
     expect(token).toMatch(/^[A-Za-z0-9_-]{43}$/)
     await b.addInitScript({ content: `sessionStorage.setItem("pva.adminToken", ${JSON.stringify(token)})` })
-    await b.goto(`${assistant.url}/admin/#settings/frontends/web-voice`)
+    await b.goto(`${assistant.url}/admin/#settings/devices/type-web-voice`)
     await expect(b.getByTestId("settings")).toBeVisible()
     // B listens with the phrase tester; A logs out: both land on the login, B with "ended elsewhere", no error shown.
-    await b.getByTestId("wake-settings-folded").locator("summary").click() // always listening: the tester is folded away
     await b.getByTestId("tester-listen").click()
     await expect(b.getByTestId("phrase-tester")).toHaveAttribute("data-on", "true")
     await a.getByTestId("logout").click()
@@ -136,9 +135,10 @@ test("a reload stays logged in; Log out ends it, also for a second tab of the sa
 })
 
 test("after a restart the server no longer knows the session: the login says so; logging in again works", async ({ page }) => {
-  await loginAdmin(page, assistant.url, "#settings/frontends/web-voice")
+  await loginAdmin(page, assistant.url, "#settings/devices/type-web-voice")
   // An unsaved edit and a running tester when the server goes away.
-  await page.getByTestId("profile-frontend-web-voice").getByRole("radio", { name: "Wake phrase" }).click()
+  await page.getByTestId("group-audio").locator("summary").click()
+  await page.getByRole("switch", { name: "Echo cancellation" }).click()
   await page.getByTestId("tester-listen").click()
   await restart()
   await expect(page.getByTestId("login-reason")).toContainText("restarted", { timeout: 20_000 })
@@ -147,7 +147,7 @@ test("after a restart the server no longer knows the session: the login says so;
   await page.locator("#admin-password").fill(E2E_ADMIN_PASSWORD)
   await page.getByRole("button", { name: "Log in" }).click()
   await expect(page.getByTestId("settings")).toBeVisible()
-  await expect(page.getByTestId("page-frontends-frontend")).toBeVisible()
+  await expect(page.getByTestId("page-devices-device-type")).toBeVisible()
   expect(await alerts(page)).toEqual([])
 })
 
@@ -166,7 +166,7 @@ test("admin_required: a logged-out admin page and a voice page asking for admin 
       WebSocket.prototype.send = function(this: WebSocket, data) {
         WebSocket.prototype.send = send
         send.call(this, data)
-        send.call(this, JSON.stringify({ type: "frontend.update", requestId: "stale-1", kind: "web-voice", patch: { captions: false } }))
+        send.call(this, JSON.stringify({ type: "wake.test", requestId: "stale-1", on: false }))
       }
     })
   }

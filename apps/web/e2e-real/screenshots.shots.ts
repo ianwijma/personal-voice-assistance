@@ -66,32 +66,25 @@ const run = async (browser: Browser, size: "desktop" | "phone") => {
     await page.waitForTimeout(400)
     await shot("voice", "03-settings-sheet")
 
-    // Admin, logged in with the test password: a real module page, the Overview, the voices page, the front end.
+    // Admin, logged in with the test password: the shared Modules page (a capability module runs for the assistants that
+    // have it on), the Overview, the assistant's Voice tab, and the browsers' device defaults.
     await page.goto(`${assistant.url}/admin/`)
     await page.locator("#admin-password").fill(E2E_ADMIN_PASSWORD)
     await page.getByRole("button", { name: "Log in" }).click()
     await page.getByTestId("settings").waitFor()
-    const open = async (group: string, id: string) => {
-      // On a phone, back up to the category list first (drill-down).
-      while (size === "phone" && await page.getByTestId("settings-back").isVisible()) await page.getByTestId("settings-back").click()
-      await page.getByTestId(`nav-${group}`).click()
-      if (await page.getByTestId(`nav-${group}-${id}`).isVisible()) await page.getByTestId(`nav-${group}-${id}`).click()
-      await page.getByTestId(`page-${group}-${id}`).waitFor()
+    const open = async (hash: string) => {
+      await page.evaluate((h) => { location.hash = h }, hash)
+      await page.waitForTimeout(300)
     }
-    await open("modules", "clock")
-    await page.waitForTimeout(300)
+    await open("#settings/shared/modules")
+    await page.getByTestId("module-clock").waitFor()
     await shot("admin", "01-module")
-    await open("overview", "overview")
-    await page.waitForTimeout(300)
+    await open("#settings/overview")
     await shot("admin", "02-overview")
-    await open("voices", "overview")
-    await page.waitForTimeout(200)
+    await open("#settings/assistants/assistant/voice")
+    await page.getByTestId("assistant-page").waitFor()
     await shot("admin", "03-voices")
-    // Front ends has one page per kind (no page list): on a phone, back up first, as `open` does.
-    while (size === "phone" && await page.getByTestId("settings-back").isVisible()) await page.getByTestId("settings-back").click()
-    await page.getByTestId("nav-frontends").click()
-    await page.getByTestId("page-frontends-frontend").waitFor()
-    await page.waitForTimeout(200)
+    await open("#settings/devices/type-web-voice")
     await shot("admin", "04-front-end")
   } finally {
     await ctx.close()
