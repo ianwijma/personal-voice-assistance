@@ -155,6 +155,38 @@ describe("field semantics", () => {
     expect(shown.error?.fieldErrors?.map((e) => e.key)).toEqual(["ANTHROPIC_MODEL"])
   })
 
+  it("the shared Anthropic account (key, address) is validated and saved whatever LLM_PROVIDER says", async () => {
+    const server = await start()
+    const { client, welcome } = await helloed(server)
+    expect(section(welcome.snapshot.sections, "language-model").form.values.LLM_PROVIDER).toBe("fake")
+    const llm = section(welcome.snapshot.sections, "language-model")
+    expect(field(llm, "ANTHROPIC_API_KEY").visibleWhen).toBeUndefined()
+    expect(field(llm, "ANTHROPIC_BASE_URL").visibleWhen).toBeUndefined()
+    // A bad address is refused, not silently skipped.
+    const bad = await request(client, { type: "settings.update", sectionId: "language-model", patch: { values: { ANTHROPIC_BASE_URL: "not an address" }, secrets: {} } })
+    expect(bad.error?.fieldErrors?.map((e) => e.key)).toEqual(["ANTHROPIC_BASE_URL"])
+    const saved = await request(client, {
+      type: "settings.update",
+      sectionId: "language-model",
+      patch: { values: { ANTHROPIC_BASE_URL: "http://proxy.local:8080" }, secrets: { ANTHROPIC_API_KEY: "sk-ant-shared" } }
+    })
+    expect(saved.ok).toBe(true)
+    const after = section((await helloed(server)).welcome.snapshot.sections, "language-model")
+    expect(after.form.values.LLM_PROVIDER).toBe("fake")
+    expect(after.form.values.ANTHROPIC_BASE_URL).toBe("http://proxy.local:8080")
+    expect(after.form.secrets.ANTHROPIC_API_KEY?.set).toBe(true)
+    expect(JSON.parse(readFileSync(join(server.dataDir, "settings.json"), "utf8")).assistant).toMatchObject({ ANTHROPIC_BASE_URL: "http://proxy.local:8080" })
+  })
+
+  it("the shared Anthropic address stays locked by the environment with LLM_PROVIDER fake", async () => {
+    const server = await start({ env: { ANTHROPIC_BASE_URL: "http://from-env:1" } })
+    const { client, welcome } = await helloed(server)
+    expect(field(section(welcome.snapshot.sections, "language-model"), "ANTHROPIC_BASE_URL").locked).toBeDefined()
+    const refused = await request(client, { type: "settings.update", sectionId: "language-model", patch: { values: { ANTHROPIC_BASE_URL: "http://other:2" }, secrets: {} } })
+    expect(refused.ok).toBe(false)
+    expect(refused.error?.fieldErrors?.map((e) => e.key)).toEqual(["ANTHROPIC_BASE_URL"])
+  })
+
   it("a cross-field error refuses the save under its field: the turn must end after the early reply", async () => {
     const server = await start()
     const { client } = await helloed(server)

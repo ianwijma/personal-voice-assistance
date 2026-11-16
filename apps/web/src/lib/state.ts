@@ -26,7 +26,7 @@ import {
   type VaultInfo
 } from "@pva/protocol"
 import type { SettingsPath } from "./settingsTree.ts"
-import { atWelcome, type ConversationView, onConversation, onHistory, onSetup, ownerKey, profileFromSetup } from "./voiceSetup.ts"
+import { atWelcome, type ConversationView, onConversation, onHistory, onSetup, profileFromSetup } from "./voiceSetup.ts"
 
 /**
  * Client state: one immutable value, changed only by `reducer`. Reply audio
@@ -88,6 +88,17 @@ export interface HeardLine {
   /** The assistant took it (answered it, or the phrase alone made it listen); absent from an older server. */
   readonly accepted?: boolean
   readonly at: number
+  /**
+   * Set by the phrase tester when it first shows the line: the device it was tested on and the assistant the matched
+   * phrase woke there, with that device's settings then. Kept with the line, so a later tester (another device's
+   * page, or the same page after a save) neither relabels it nor shows it as its own.
+   */
+  readonly judged?: HeardJudgement
+}
+
+export interface HeardJudgement {
+  readonly deviceId: string | undefined
+  readonly woke: string | undefined
 }
 
 /**
@@ -160,6 +171,11 @@ export interface ClientState {
   readonly setup: DeviceSetup | undefined
   /** The assistant that has the turn now: a phrase woke it, or it answered last and may keep listening (docs/ASSISTANTS.md §7.2). */
   readonly holder: string | undefined
+  /**
+   * The server says who has the turn (`state.holder`, `snapshot.holder`): the page then takes it only from those and
+   * derives nothing itself (no holder from `wake` or `turn.start`, which serve a server that does not say).
+   */
+  readonly holderTold: boolean
   /** One conversation per assistant on this device, by assistant id (`lib/voiceSetup.ts`). */
   readonly conversations: Readonly<Record<string, ConversationView>>
   /** Admin phrase tester: what the recogniser heard while it was on, oldest first. */
@@ -236,6 +252,7 @@ export const initialState: ClientState = {
   woke: undefined,
   setup: undefined,
   holder: undefined,
+  holderTold: false,
   conversations: {},
   heard: [],
   engine: emptyEngine,
@@ -283,6 +300,7 @@ export type LocalAction =
   | { readonly type: "local/profile-overlay-clear" }
   | { readonly type: "local/heard-clear" }
   | { readonly type: "local/playing"; readonly turnId: number | undefined }
+  | { readonly type: "local/heard-judged"; readonly lines: ReadonlyArray<{ readonly at: number; readonly text: string; readonly judged: HeardJudgement }> }
   | { readonly type: "local/request"; readonly requestId: string; readonly kind: string; readonly target?: string }
   | { readonly type: "local/request-done"; readonly requestId: string }
   | { readonly type: "local/toast"; readonly message: string; readonly tone: "error" | "info" }
@@ -354,6 +372,13 @@ const withTurn = (
   turns[idx] = f(turns[idx]!)
   return { ...s, turns }
 }
+
+/**
+ * A turn belongs to one assistant for its whole life: the first message that names it (`assistantId`, a trace's
+ * assistant) sets it, and nothing changes it after that.
+ */
+const ownedBy = (t: TurnView, assistantId: string | undefined): TurnView =>
+  t.assistantId !== undefined || assistantId === undefined ? t : { ...t, assistantId }
 
 const findTurn = (turns: ReadonlyArray<TurnView>, turnId: number): number => {
   for (let i = turns.length - 1; i >= 0; i--) if (turns[i]!.turnId === turnId) return i
@@ -448,7 +473,7 @@ const server: ServerHandlers = {
   trace: (s, m) => ({ ...s, traces: [...s.traces, m.trace].slice(-MAX_TRACES) }),
   // The phrase and the request in one sentence (`armed: false`): a turn follows, nothing to show.
   wake: (s, m) =>
-    m.armed ? { ...s, woke: m.assistantId === undefined ? { phrase: m.phrase } : { phrase: m.phrase, assistantId: m.assistantId }, holder: m.assistantId ?? s.holder } : s,
+    m.armed ? { ...s, woke: m.assistantId === undefined ? { phrase: m.phrase } : { phrase: m.phrase, assistantId: m.assistantId }, holder: s.holderTold ? s.holder : m.assistantId ?? s.holder } : s,
   "wake.heard": (s, m) => ({
     ...s,
     heard: [
@@ -461,47 +486,48 @@ const server: ServerHandlers = {
     const { stateTurnId: _previous, ...rest } = s.session
     const session = m.turnId === undefined ? { ...rest, serverState: m.state } : { ...rest, serverState: m.state, stateTurnId: m.turnId }
     // "Listening…" after the wake phrase lasts until the assistant hears something, or falls asleep again.
-    // Asleep or idle: nobody has the turn any more.
-    const sleeping = m.state === "asleep" || m.state === "idle"
     // The server is the one authority on who has the turn (protocol 7 `holder`: the turn in flight or the utterance being
-    // heard, else an open window; also sent when only it changed). The page shows it and does not guess.
-    const told = m.holder === undefined ? s.holder : m.holder ?? undefined
-    return { ...s, session, woke: m.state === "listening" && m.holder !== null ? s.woke : undefined, holder: sleeping ? undefined : told }
+    // heard, else an open window; also sent when only it changed). The page takes it as sent, whatever the state (a
+    // muted microphone is idle while a follow-up window still holds). Only a state without the field (a server that does
+    // not say) falls back: asleep or idle, nobody has the turn any more.
+    if (m.holder !== undefined) return { ...s, session, woke: m.state === "listening" && m.holder !== null ? s.woke : undefined, holder: m.holder ?? undefined, holderTold: true }
+    const sleeping = m.state === "asleep" || m.state === "idle"
+    return { ...s, session, woke: m.state === "listening" ? s.woke : undefined, holder: sleeping ? undefined : s.holder }
   },
   transcript: (s, m) => (s.liveTranscript === m.text ? s : { ...s, liveTranscript: m.text }),
   "turn.start": (s, m) => {
     const fresh = s.staleTurns.includes(m.turnId) ? { ...s, staleTurns: s.staleTurns.filter((id) => id !== m.turnId) } : s
-    const owner = ownerKey(fresh, m.assistantId)
     const next = withTurn(
       fresh,
       m.turnId,
-      (t) => ({ ...t, assistantId: owner, source: m.source, userText: m.userText, spoken: m.spoken }),
-      () => newTurn(`t${m.turnId}`, { turnId: m.turnId, assistantId: owner, source: m.source, userText: m.userText, spoken: m.spoken })
+      (t) => ({ ...ownedBy(t, m.assistantId), source: m.source, userText: m.userText, spoken: m.spoken }),
+      () => newTurn(`t${m.turnId}`, { turnId: m.turnId, source: m.source, userText: m.userText, spoken: m.spoken })
     )
-    return { ...next, liveTranscript: "", woke: undefined, holder: m.assistantId ?? next.holder }
+    return { ...next, liveTranscript: "", woke: undefined, holder: next.holderTold ? next.holder : m.assistantId ?? next.holder }
   },
   "assistant.text": (s, m) =>
     withTurn(
       s,
       m.turnId,
-      (t) => {
+      (owned) => {
+        const t = ownedBy(owned, m.assistantId)
         if (m.clause === null) return { ...t, text: t.text + m.text }
         const clauses = t.clauses.slice()
         while (clauses.length < m.clause) clauses.push({ text: "" })
         clauses[m.clause] = m.voice === undefined ? { text: m.text } : { text: m.text, voice: m.voice }
         return { ...t, spoken: true, clauses }
       },
-      () => newTurn(`t${m.turnId}`, { turnId: m.turnId, assistantId: ownerKey(s, m.assistantId), source: "voice", spoken: m.clause !== null })
+      () => newTurn(`t${m.turnId}`, { turnId: m.turnId, source: "voice", spoken: m.clause !== null })
     ),
   "assistant.playing": (s, m) => withTurn(s, m.turnId, (t) => (m.clause > t.playedClause ? { ...t, playedClause: m.clause } : t)),
   "tool.start": (s, m) =>
     withTurn(s, m.turnId, (t) => ({
-      ...t,
+      ...ownedBy(t, m.assistantId),
       tools: [...t.tools.filter((x) => x.callId !== m.callId), { callId: m.callId, tool: m.tool, input: m.input, status: "running" }]
     })),
   "tool.end": (s, m) =>
     withTurn(s, m.turnId, (t) => ({
-      ...t,
+      ...ownedBy(t, m.assistantId),
       tools: t.tools.some((x) => x.callId === m.callId)
         ? t.tools.map((x) =>
           x.callId === m.callId
@@ -519,7 +545,7 @@ const server: ServerHandlers = {
     })),
   "turn.end": (s, m) => {
     if (findTurn(s.turns, m.turnId) === -1 && s.staleTurns.includes(m.turnId)) return s
-    const next = withTurn(s, m.turnId, (t) => ({ ...t, outcome: m.outcome, trace: m.trace }))
+    const next = withTurn(s, m.turnId, (t) => ({ ...ownedBy(t, m.trace.assistant?.id), outcome: m.outcome, trace: m.trace }))
     const traces = [...next.traces.filter((t) => t.turnId !== m.trace.turnId), m.trace].slice(-MAX_TRACES)
     const unread = next.ui.chatOpen ? next.ui.unread : next.ui.unread + 1
     return { ...next, traces, ui: { ...next.ui, unread } }
@@ -588,6 +614,17 @@ const local = (s: ClientState, a: LocalAction): ClientState => {
     case "local/playing":
       if (a.turnId === undefined) return s.audio.playing === undefined ? s : { ...s, audio: withoutPlaying(s.audio) }
       return { ...s, audio: { ...s.audio, playing: { turnId: a.turnId } } }
+    case "local/heard-judged": {
+      let changed = false
+      const heard = s.heard.map((l) => {
+        if (l.judged !== undefined) return l
+        const hit = a.lines.find((x) => x.at === l.at && x.text === l.text)
+        if (hit === undefined) return l
+        changed = true
+        return { ...l, judged: hit.judged }
+      })
+      return changed ? { ...s, heard } : s
+    }
     case "local/request":
       return {
         ...s,
