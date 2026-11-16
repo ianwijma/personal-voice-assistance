@@ -24,7 +24,7 @@ The lab's `designs/<id>.ts` becomes `library/<id>.ts`, behaviour unchanged:
 
 - Imports: `../contract.ts` and `../kit.ts` stay; `./_character.ts` → `../shared/figure.ts`, `./_light.ts` → `../shared/light.ts`, `./_matter.ts` → `../shared/matter.ts`.
 - Types: `Design` → `Character`, `DesignInstance` → `CharacterInstance`. A table keyed by mode (`{ [M in Mode]: … }`) becomes `{ [M in CoreMode]: … }` and is read with `f.coreMode` (for a character that declares no extra modes `f.mode` is always a core mode, but its type is the wider `Mode`).
-- Manifest: add `version: "1.0.0"` and `contract: 1`; `family: "character"` becomes `"figure"`; `serverNeeds` goes, and what it said becomes `uses` entries (`{ ext, gain, without }`, names from docs/CHARACTERS.md §5.2) or nothing when it said "none". `extraModes` only if you design those modes (docs/CHARACTERS.md §4.3).
+- Manifest: add `version: "1.0.0"` and `contract: 1`; `family: "character"` becomes `"figure"`; `serverNeeds` goes. Do not turn what it said into `uses`: it described what a design *could* use one day, while `uses` lists only extensions the code reads from `frame.ext` today (docs/CHARACTERS.md §3, §4.2). A ported design reads none, so it has no `uses`; add an entry (`{ ext, gain, without }`, names from docs/CHARACTERS.md §5.2) in the same change that makes the code read that extension. `extraModes` only if you design those modes (docs/CHARACTERS.md §4.3).
 - The shared helpers read `frame.coreMode` instead of `frame.mode`; nothing else changed in them.
 
 Measured on the lab designs before porting (docs/CHARACTERS.md §6): every check passes except "(5) reduced motion" for `aurora-ribbons`, `cloud-orb` and `pitch-ink`, which still change between two frames a second apart in a pinned, silent mode. Those ports need a decision (hold the pose, or ask the lead to relax the check), not a silent change.
@@ -63,7 +63,7 @@ That is all for most characters (flame needed exactly this). Then go through the
 - **Clamps that kept things inside the canvas** (`Math.min(top, H * 0.98)`, particles killed or wrapped at `x < 0 || x > W`, "never past the top of the canvas"): they now hold things inside the box. Keep them for the essential shape; let sparks, particles and glow go to the canvas edge (`-fo.x .. CW - fo.x`) or fade out on their own. Particles stored in box coordinates move with the box when the focus moves; that is fine.
 - **Helpers that take a size** (`unit(w, h)` in `shared/light.ts`, a figure's scale): pass the focus size.
 - **WebGL2.** Keep `gl.viewport(0, 0, canvas.width, canvas.height)` (the whole canvas) in `resize`. Pass the shape's centre and scale per frame from the focus, in device pixels with y flipped (`gl_FragCoord` starts at the bottom): `cx = (fo.x + fo.width / 2) * dpr`, `cy = (CH - fo.y - fo.height / 2) * dpr`, scale from `fo.width`/`fo.height` times `dpr`, never from the resolution uniform. A full-canvas fragment shader costs per pixel of the whole page: return early far from the shape, or render the glow into a smaller framebuffer.
-- **The pixel ratio.** Use the `dpr` from `resize`: for a stage canvas the host may have lowered it (backing store capped at 4.2 million device pixels; 1920 × 1080 at ratio 2 gets 1.42). Never read `devicePixelRatio`.
+- **The pixel ratio.** Use the `dpr` from `resize`: for a stage canvas the host may have lowered it, below 1 too (backing store capped at 4.2 million device pixels; 1920 × 1080 at ratio 2 gets 1.42, 3840 × 2160 at ratio 1 gets 0.71; never below 0.5). Never read `devicePixelRatio`.
 - **Cost.** Measure on the stage at 1280 × 800 and at 1920 × 1080 (`__pvaStage.debug().frameMs`, after 2 s in each mode; the limit before the host stops a character is 4 ms, the target 2 ms). Edge glow with nothing but `canvas: "stage"` measured 5.5 ms at 1280 × 800 and 10.8 ms at 1920 × 1080: its glow work surface follows the canvas size; give it a pixel budget.
 
 ### Edge light
@@ -89,7 +89,7 @@ pnpm --filter @pva/web exec vitest run test/characters/compat.test.ts -t '"<id>"
 pnpm check && pnpm test
 ```
 
-The suite drives your character with simulated voices through the real feature extractor, on a recording fake canvas (jsdom has none; the fake also provides `OffscreenCanvas` and a WebGL2 context that accepts everything). It checks the five core modes are different, extra modes and their fallbacks, unknown extensions, option extremes and garbage, reduced motion, the default-look digest, the manifest and a generous cost bound. The real 2 ms budget is measured in the page (below).
+The suite drives your character with simulated voices through the real feature extractor, on a recording fake canvas (jsdom has none; the fake also provides `OffscreenCanvas` and a WebGL2 context that accepts everything). It checks the five core modes paint something and paint something different (clearing and setting state is not painting), extra modes and their fallbacks, unknown extensions, option extremes and garbage, reduced motion, the default-look digest, the manifest, a 1 × 1 canvas and focus and a focus partly off the canvas, and a generous cost bound. Like a browser, the fake throws for a negative radius (`arc`, `arcTo`, `ellipse`, `createRadialGradient`, `roundRect`), so clamp computed radii at 0. The real 2 ms budget is measured in the page (below).
 
 ## Looking at it in the app
 

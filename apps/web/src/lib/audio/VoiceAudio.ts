@@ -119,6 +119,17 @@ export class MicFallbackError extends Error {
  * reply uses up the allowance within one or two replies, and short next to a session, so isolated failures far
  * apart are each recovered.
  */
+/**
+ * The output analyser's `fftSize` at a context rate: the next power of two covering the stage's 40 ms window, never
+ * below 2048 (what 44.1 and 48 kHz always had) and never above the Web Audio maximum, 32768.
+ */
+export const analyserSize = (sampleRate: number): number => {
+  const need = Math.ceil(0.04 * (Number.isFinite(sampleRate) && sampleRate > 0 ? sampleRate : 48_000))
+  let size = 2048
+  while (size < need && size < 32768) size *= 2
+  return size
+}
+
 export const MAX_PLAYER_REPLACEMENTS = 2
 export const PLAYER_FAILURE_WINDOW_MS = 60_000
 export const PLAYER_FAILED_MESSAGE =
@@ -347,9 +358,10 @@ export class VoiceAudio {
       // publishes its live count into shared memory where the page may have it (cross-origin isolated),
       // otherwise by message (see `playback.ts`, `createPlayer`).
       this.analyser = ctx.createAnalyser()
-      // 2048 samples is 43 ms at 48 kHz: the stage's feature extractor needs about 40 ms for pitch. The size only
-      // changes what the tap reports when read (on the main thread); the audio passes through unchanged.
-      this.analyser.fftSize = 2048
+      // The stage's feature extractor reads the last 40 ms (pitch needs about that): at least 2048 samples (43 ms
+      // at 48 kHz, 46 ms at 44.1 kHz), more at a higher native rate (4096 at 96 kHz). The size only changes what the
+      // tap reports when read (on the main thread); the audio passes through unchanged.
+      this.analyser.fftSize = analyserSize(ctx.sampleRate)
       this.analyser.smoothingTimeConstant = 0.5
       this.createPlayer(ctx, SharedCounter.available(), ROUTE_REASONS.notIsolated)
       this.routeOutput()

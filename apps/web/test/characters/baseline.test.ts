@@ -142,6 +142,36 @@ describe("the baseline in every visual state", () => {
     expect(h.filter((c) => c.name === "=shadowBlur").every((c) => c.args[0] === 0)).toBe(true)
   })
 
+  it("reduced motion with a live, changing voice: the shape is held and steps at most once a second", () => {
+    for (const [mode, side] of [["hearing", "user"], ["speaking", "agent"]] as const) {
+      const r = make()
+      const v = createVoiceFeatures()
+      let prev: string | null = null
+      let lastChange = -Infinity
+      let changes = 0
+      const frames = 300
+      for (let i = 0; i < frames; i++) {
+        const t = i * DT
+        // A voice whose loudness and spectrum change every frame.
+        v.rms = 0.03 + 0.028 * Math.sin(3.1 * t)
+        v.level = 0.5 + 0.3 * Math.sin(3.1 * t)
+        v.low = 0.5 + 0.4 * Math.sin(5 * t)
+        v.mid = 0.5 + 0.4 * Math.sin(3 * t + 1)
+        v.high = 0.5 + 0.4 * Math.sin(4 * t + 2)
+        const calls = step(r, mode, 1, side === "user" ? { reduced: true, user: v } : { reduced: true, agent: v })
+        const shape = JSON.stringify(points(calls))
+        if (prev !== null && shape !== prev) {
+          changes++
+          expect(i - lastChange, `${mode}: frames between two steps of the shape`).toBeGreaterThanOrEqual(59)
+          lastChange = i
+        }
+        prev = shape
+      }
+      expect(changes, `${mode}: steps in ${frames} frames`).toBeLessThanOrEqual(Math.ceil(frames * DT))
+      expect(changes, `${mode}: the held shape still follows the voice`).toBeGreaterThan(0)
+    }
+  })
+
   it("keeps the lab's options: five lines, no glow", () => {
     const calls = step(make({ lines: 5, glow: false }), "hearing", 30, { user: loud() })
     expect(calls.filter((c) => c.name === "stroke")).toHaveLength(5)
