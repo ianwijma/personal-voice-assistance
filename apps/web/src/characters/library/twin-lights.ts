@@ -79,6 +79,9 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
   const c0: Col = [0, 0, 0]
   const c1: Col = [0, 0, 0]
   const tmp: Col = [0, 0, 0]
+  // Line-dash arrays, reused every frame (never allocate in the frame loop).
+  const dashOn: Array<number> = [0, 0]
+  const dashOff: Array<number> = []
 
   const emit = (from: number, size: number, arc: number, bend: number, voicedness: number, hue: number, speed: number): void => {
     let s = 0
@@ -112,7 +115,7 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
     const a = mFrom[i]!
     const y0 = ly[a]!.value
     const y1 = ly[1 - a]!.value
-    const yc = (y0 + y1) / 2 - Math.min(mArc[i]! * U * arcK, arcMax)
+    const yc = (y0 + y1) / 2 - Math.min(mArc[i]! * U * arcK, arcMax) // arcMax is never below 0: the arc never bends downward
     return (1 - t) * (1 - t) * y0 + 2 * (1 - t) * t * yc + t * t * y1
   }
 
@@ -188,7 +191,9 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
         emit(from, 0.5 + 0.8 * loud, arc, rise, voiced, v.register, lerp(0.75, 1.25, pace) * (0.9 + 0.2 * rand()))
       }
       // Pointer: pressing near a light sends a mote from it to the other.
-      if (f.pointer.down && f.pointer.inside && !reduced && rand() < dt * 5) {
+      // On the stage `inside` means anywhere in the window, so the press must also be in the focus (the box).
+      const pressed = f.pointer.down && f.pointer.inside && px >= 0 && px <= W && py >= 0 && py <= H
+      if (pressed && !reduced && rand() < dt * 5) {
         const near = Math.abs(px - lx[0]!.value) < Math.abs(px - lx[1]!.value) ? 0 : 1
         emit(near, 0.6, 0.15 + 0.3 * rand(), 0, 1, 0.5, 1)
       }
@@ -230,7 +235,7 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
         lr[k]!.step(t, dt)
       }
       placed = true
-      arcMax = 2 * (Math.min(ly[0]!.value, ly[1]!.value) + fo.y - MARGIN)
+      arcMax = Math.max(0, 2 * (Math.min(ly[0]!.value, ly[1]!.value) + fo.y - MARGIN))
 
       // Colours: grey when idle, otherwise each light its own colour; the light whose turn it
       // is shifts with the voice (register → hue).
@@ -266,7 +271,9 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
         const y0 = ly[0]!.value
         const x1 = lx[1]!.value
         const y1 = ly[1]!.value
-        g.setLineDash([Math.max(1.5, U * 0.006), Math.max(4, U * 0.02)])
+        dashOn[0] = Math.max(1.5, U * 0.006)
+        dashOn[1] = Math.max(4, U * 0.02)
+        g.setLineDash(dashOn)
         g.lineWidth = Math.max(1, U * 0.004)
         g.lineCap = "round"
         g.strokeStyle = css(speaking ? c1 : c0, pathA)
@@ -275,7 +282,7 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
         g.moveTo(x0 + (x1 - x0) * 0.15, y0 + (y1 - y0) * 0.15)
         g.lineTo(x0 + (x1 - x0) * 0.85, y0 + (y1 - y0) * 0.85)
         g.stroke()
-        g.setLineDash([])
+        g.setLineDash(dashOff)
         g.lineDashOffset = 0
         if (reduced && (mix.hearing + mix.speaking) > 0.3) {
           const dir = (speaking ? -1 : 1) * (x1 >= x0 ? 1 : -1)
@@ -294,7 +301,8 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
         }
       }
 
-      // Motes.
+      // Motes. Reduced motion shows none, also when it is switched on while some are in flight.
+      if (reduced) mAlive.fill(0)
       for (let i = 0; i < MOTES; i++) {
         if (!mAlive[i]) continue
         if (!reduced) mT[i] = mT[i]! + sdt * mSpeed[i]! * 0.9
@@ -402,7 +410,7 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
 const character: Character = {
   id: "twin-lights",
   name: "Twin lights",
-  version: "1.1.0",
+  version: "1.1.1",
   canvas: "stage",
   contract: 1,
   family: "abstract",

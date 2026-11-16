@@ -372,6 +372,10 @@ describe("twin lights: the pointer", () => {
       expect(motes(frame(r, "idle", { pointer: press(W / 2, { inside: false }) }))).toHaveLength(0)
       expect(motes(frame(r, "idle", { pointer: { x: W / 2, y: H / 2, down: false, inside: true } }))).toHaveLength(0)
     }
+    // On the stage `inside` is true anywhere in the window: a press outside the box sends nothing.
+    for (const [x, y] of [[-50, H / 2], [W + 50, H / 2], [W / 2, -50], [W / 2, H + 50]] as const) {
+      for (let i = 0; i < 60; i++) expect(motes(frame(r, "idle", { pointer: { x, y, down: true, inside: true } })), `${x},${y}`).toHaveLength(0)
+    }
     const calm = make()
     settle(calm, "idle", 30, { reduced: true })
     for (let i = 0; i < 60; i++) expect(shapes(frame(calm, "idle", { reduced: true, pointer: press(W / 2) }))).toHaveLength(2)
@@ -436,6 +440,19 @@ describe("twin lights: reduced motion", () => {
     expect(quietRun("listening").some((c) => c.name === "setLineDash" && (c.args[0] as Array<number>).length === 2)).toBe(true)
   })
 
+  it("switching it on while motes are in the air clears them, and none come back", () => {
+    for (const mode of ["hearing", "speaking"] as const) {
+      const who = mode === "hearing" ? "user" : "agent"
+      const r = make()
+      const before = run(r, mode, 20, who, syllables([2]))
+      expect(motes(before[19]!).length, mode).toBeGreaterThan(0)
+      for (let i = 0; i < 120; i++) expect(shapes(frame(r, mode, { reduced: true, [who]: voice() })), mode).toHaveLength(2)
+      expect(shapes(frame(r, "idle", { reduced: true }))).toHaveLength(2)
+      // Switched off again: nothing left over from before.
+      expect(motes(frame(r, "idle"))).toHaveLength(0)
+    }
+  })
+
   it("is the same on every frame: no orbit, no breathing, no creeping dashes", () => {
     for (const mode of ["listening", "thinking", "hearing", "speaking"] as const) {
       const r = make()
@@ -449,6 +466,37 @@ describe("twin lights: reduced motion", () => {
         for (const k of ["x", "y", "r"] as const) expect(s[k], `${mode} ${k}`).toBeCloseTo(before[i]![k], 4)
       })
       expect(b.filter((c) => c.name === "=lineDashOffset").every((c) => c.args[0] === 0), mode).toBe(true)
+    }
+  })
+})
+
+describe("twin lights: per-frame allocation", () => {
+  const dashes = (calls: ReadonlyArray<Call>) => calls.filter((c) => c.name === "setLineDash").map((c) => c.args[0] as Array<number>)
+
+  it("the dash arrays are the same objects on every frame, also under reduced motion", () => {
+    for (const [mode, reduced] of [["listening", false], ["hearing", true], ["speaking", true]] as const) {
+      const r = make()
+      const o: StepOptions = { reduced, user: voice(), agent: voice() }
+      settle(r, mode, 60, o)
+      const a = dashes(frame(r, mode, o))
+      const b = dashes(frame(r, mode, o))
+      expect(a.length, mode).toBe(2)
+      expect(b.length, mode).toBe(2)
+      expect(b[0], `${mode}: the dash`).toBe(a[0])
+      expect(b[1], `${mode}: the reset`).toBe(a[1])
+    }
+  })
+})
+
+describe("twin lights: a focus partly above the page", () => {
+  it("the motes never bend downward, whatever the focus's top is", () => {
+    for (const y of [-150, -400]) {
+      const focus: Focus = { x: 280, y, width: W, height: H }
+      const frames = run(make({}, [1280, 800]), "hearing", 90, "user", syllables([2], { pitch: 0.9 }), { focus })
+      const [a, b] = lights(frames[89]!)
+      const ys = frames.flatMap((c) => motes(c).map((m) => m.y))
+      expect(ys.length, `y ${y}`).toBeGreaterThan(0)
+      expect(Math.max(...ys), `y ${y}`).toBeLessThanOrEqual(Math.max(a.y, b.y) + 1)
     }
   })
 })
