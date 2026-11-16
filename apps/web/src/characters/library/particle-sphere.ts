@@ -191,8 +191,13 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
       if (reduced) lv = Math.round(clamp01(lv * 1.6) * 3) / 3 / 1.6
       const pitch = voiceOf(f, mix, "pitch")
       const reg = voiceOf(f, mix, "register")
-      const voiceHi = clamp01(0.5 + (clamp01(reg * 0.6 + pitch * 0.4) - 0.5) * pitchK)
-      for (let b = 0; b < 24; b++) bandS[b] = approach(bandS[b]!, on ? bandShape(v, b) : 0, dt, 0.07)
+      const voiceHiLive = clamp01(0.5 + (clamp01(reg * 0.6 + pitch * 0.4) - 0.5) * pitchK)
+      // Reduced motion: the voice's grain and surface are held in coarse steps (thirds), never eased.
+      const voiceHi = reduced ? Math.round(voiceHiLive * 3) / 3 : voiceHiLive
+      for (let b = 0; b < 24; b++) {
+        const goal = on ? bandShape(v, b) : 0
+        bandS[b] = reduced ? Math.round(goal * 3) / 3 : approach(bandS[b]!, goal, dt, 0.07)
+      }
       if (on && v.onset > 0.6 && lastOnset <= 0.6) kickEnv.value = Math.max(kickEnv.value, 0.4 + v.level)
       const kick = reduced ? 0 : kickEnv.step(0, dt)
 
@@ -206,7 +211,7 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
         phase += dt * (1.2 + 0.4 * clamp(v.syllableRate, 0, 7)) * speedK
       }
       const pd = on ? clamp((v.pitchDelta / 10) * pitchK, -1.5, 1.5) : 0
-      tilt = approach(tilt, 0.38 - pd * 0.25, dt, 0.3)
+      tilt = reduced ? 0.38 : approach(tilt, 0.38 - pd * 0.25, dt, 0.3) // reduced motion: the axis stays at rest
       const cyaw = Math.cos(yaw)
       const syaw = Math.sin(yaw)
       const ct = Math.cos(tilt)
@@ -215,14 +220,14 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
       const lumps = Math.round(lerp(2, 9, voiceHi))
       const dispAmp = (lv * 0.32 + kick * 0.06) * reliefK
       const lumpAmp = lerp(1.0, 0.35, voiceHi)
-      grainS = approach(grainS, voiceHi, dt, 0.4)
+      grainS = reduced ? voiceHi : approach(grainS, voiceHi, dt, 0.4)
       const keep = lerp(0.42, 1, grainS)
       // A smaller sphere or fewer points shrink the points less than in proportion, so they stay visible.
       const grain = lerp(1.75, 0.8, grainS) * Math.pow(sizeK, -0.5) * Math.pow(pointsK, -0.35)
       const faceW = mix.hearing + mix.listening * 0.5 // patent idea: ripple mostly the side facing the voice
       const outW = mix.speaking
       const th = mix.thinking
-      const sib = on ? clamp01((v.sibilance - 0.35) * 1.5) : 0
+      const sib = on && !reduced ? clamp01((v.sibilance - 0.35) * 1.5) : 0
       const wDash = styleW[1]!
       const wSpine = styleW[2]!
 
@@ -306,7 +311,7 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
         sy[i] = cy - Y * R * persp
         const depth = clamp01((Z + 1) * 0.5) // 0 back .. 1 front
         sb[i] = Math.min(BUCKETS - 1, Math.floor(depth * BUCKETS))
-        const big = 1 + (seed[i]! > 0.93 ? 0.8 * clamp01(v.brightness * 1.4) * (on ? 1 : 0) : 0)
+        const big = 1 + (seed[i]! > 0.93 ? 0.8 * clamp01(v.brightness * 1.4) * (on && !reduced ? 1 : 0) : 0)
         sr[i] = (R / 110) * persp * (0.55 + 0.75 * depth) * (0.85 + lv * 0.9) * big * grain * (1 + 0.45 * th)
         if (wDash > 0.01) {
           // Along the spin: the tangent of the point's latitude circle, turned like the point.
@@ -384,6 +389,11 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
 
       // ---- Streaks: in while taking in, out while speaking.
       const dir: 1 | -1 = f.mode === "speaking" ? 1 : -1
+      // Reduced motion: streaks already in flight are cleared (the still fan below replaces them).
+      if (reduced) {
+        kDir.fill(0)
+        spawnAcc = 0
+      }
       if (!reduced) {
         // Mostly syllable-driven, so fast speech fills the air and slow speech leaves it sparse.
         const rate = f.mode === "hearing" ? 4 + 40 * lv : f.mode === "speaking" ? 6 + 60 * lv : f.mode === "listening" ? 7 : 0
@@ -402,12 +412,10 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
       for (let i = 0; i < MAX_STREAKS; i++) {
         const d = kDir[i]!
         if (d === 0) continue
-        if (!reduced) {
-          kRho[i] = kRho[i]! + d * kSpd[i]! * dt
-          if ((d > 0 && kRho[i]! > 2.5) || (d < 0 && kRho[i]! < 1.03)) {
-            kDir[i] = 0
-            continue
-          }
+        kRho[i] = kRho[i]! + d * kSpd[i]! * dt
+        if ((d > 0 && kRho[i]! > 2.5) || (d < 0 && kRho[i]! < 1.03)) {
+          kDir[i] = 0
+          continue
         }
         const rho = kRho[i]!
         // Fade near the far end; the head is where the particle is going.
@@ -487,7 +495,7 @@ const character: Character = {
   id: "particle-sphere",
   name: "Particle sphere",
   family: "abstract",
-  version: "1.1.0",
+  version: "1.1.1",
   contract: 1,
   summary: "A turning sphere of points: the voice displaces its surface; particles stream into it while it listens and out of it while it speaks.",
   inspiredBy:

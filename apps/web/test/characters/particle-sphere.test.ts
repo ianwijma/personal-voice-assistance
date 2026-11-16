@@ -317,6 +317,13 @@ describe("particle sphere: the streaks", () => {
     expect(amount(1)).toBeGreaterThan(amount(0.3))
   })
 
+  it("switching reduced motion on clears the streaks already in flight", () => {
+    const r = make({ points: "dashes" })
+    run(r, "speaking", 40, "agent", syllables([2]))
+    expect(heads(frame(r, "speaking", { agent: voice() })).length).toBeGreaterThan(5)
+    expect(heads(frame(r, "idle", { reduced: true }))).toHaveLength(0)
+  })
+
   describe("under reduced motion", () => {
     const fan = (mode: Mode, v: VoiceFeatures, stored: Stored = {}) => heads(settle(make({ points: "dashes", ...stored }), mode, 30, { reduced: true, user: v, agent: v }))
 
@@ -341,6 +348,36 @@ describe("particle sphere: the streaks", () => {
       const outHeads = mean(fan("speaking", quiet).map(dist))
       expect(outHeads).toBeGreaterThan(inHeads * 1.1)
     })
+  })
+})
+
+describe("particle sphere: reduced motion holds a calm pose", () => {
+  /** Speaking at full level, reduced; a first voice for a while, then a second: the points just after the change and long after it. */
+  const held = (first: Partial<VoiceFeatures>, second: Partial<VoiceFeatures>) => {
+    const r = make()
+    const o = { reduced: true }
+    settle(r, "speaking", 200, { ...o, agent: voice({ level: 1, ...first }) })
+    const next = voice({ level: 1, ...second })
+    settle(r, "speaking", 2, { ...o, agent: next })
+    const soon = dots(frame(r, "speaking", { ...o, agent: next }))
+    settle(r, "speaking", 120, { ...o, agent: next })
+    return { soon, late: dots(frame(r, "speaking", { ...o, agent: next })) }
+  }
+
+  it("a rising tone does not keep tilting the axis", () => {
+    const { soon, late } = held({}, { pitchDelta: 10 })
+    expect(soon.length).toBeGreaterThan(100)
+    expect(late).toEqual(soon)
+  })
+
+  it("a change of voice is not eased in: the grain is the same at once and a few seconds later", () => {
+    const { soon, late } = held({ register: 0, pitch: 0 }, { register: 1, pitch: 1 })
+    expect(late).toEqual(soon)
+  })
+
+  it("the spectrum does not keep easing the surface", () => {
+    const { soon, late } = held({ bands: bandsIn(0, -1) }, { bands: bandsIn(0, 23) })
+    expect(late).toEqual(soon)
   })
 })
 
