@@ -89,7 +89,9 @@ const describeError = (e: unknown): string => (e instanceof Error ? `${e.name}: 
 const sameFrames = (a: RunResult, b: RunResult) => expect(a.frames.map((f) => f.digest)).toEqual(b.frames.map((f) => f.digest))
 
 export const compatSuite = (id: string, load: () => Promise<unknown>) =>
-  describe(`character "${id}"`, () => {
+  // Each check drives a whole conversation or every option; on a busy CI runner that can take longer than the
+  // default 5 s (seen: check (4) timing out), so the suite gets a wider limit. Check (8) guards the real cost.
+  describe(`character "${id}"`, { timeout: 30_000 }, () => {
     let c: Character
     const fresh = async (): Promise<Character> => (await load()) as Character
     const runFresh = async (o: Omit<RunOptions, "palette"> & { readonly palette?: RunOptions["palette"] }): Promise<RunResult> =>
