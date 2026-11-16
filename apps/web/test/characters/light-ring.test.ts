@@ -494,10 +494,7 @@ describe("light ring: staying inside the box", () => {
     }
   })
 
-  // BUG (see the PR description, "Bugs found"): `fit` sizes the cap as if a stroke unit were Rs / 40, but `unitW` is
-  // floored at 1 (× thickness) once Rs < 40, so in the small cells the band is thicker than the cap allows and
-  // reaches past the box: 79 px from the centre in a 160 × 140 box (limit 70), 83 px in 358 × 160 (limit 80).
-  it.fails("the ring and its band stay inside the small cells at the biggest size, thickness and detail", () => {
+  it("the ring and its band stay inside the small cells at the biggest size, thickness and detail", () => {
     for (const size of [[160, 140], [358, 160]] as const) expect(overshoot(EXTREMES, size), size.join("×")).toBeLessThanOrEqual(0.01)
   })
 
