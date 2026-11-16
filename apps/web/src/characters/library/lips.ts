@@ -91,13 +91,17 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
 
   return {
     resize(width, height, ratio) {
-      W = width
-      H = height
+      // The canvas is the whole stage; the layout comes from the focus each frame.
+      void width
+      void height
       dpr = ratio
       g = setup2d(canvas, dpr)
     },
 
     frame(f: Frame) {
+      const fo = f.focus
+      W = fo.width
+      H = fo.height
       const dt = f.dt
       const P = f.palette
       const reduced = f.reducedMotion
@@ -213,7 +217,7 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
         } else seam[i] = 0
       }
 
-      clear2d(g, dpr)
+      clear2d(g, dpr, fo) // the whole canvas; (0, 0) is the box's top-left corner
       g.lineJoin = "round"
       g.lineCap = "round"
       const lw = Math.max(1.3, 0.03 * s) * weight
@@ -378,7 +382,7 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
 const design: Character = {
   id: "lips",
   name: "Lips",
-  version: "1.0.0",
+  version: "1.1.0",
   contract: 1,
   family: "figure",
   summary: "A mouth alone, in flat graphic shapes with teeth and tongue: real mouth shapes when it speaks, a sealed seam that carries your voice when it listens.",
@@ -421,6 +425,7 @@ const design: Character = {
     }
   ],
   renderer: "2d",
+  canvas: "stage",
   options: [
     sizeOption(0.5, 1.25),
     {

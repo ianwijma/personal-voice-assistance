@@ -1,4 +1,4 @@
-# lips 1.0.0: frame digests of a scripted conversation at default settings (docs/CHARACTERS.md §6.6).
+# lips 1.1.0: frame digests of a scripted conversation at default settings (docs/CHARACTERS.md §6.6).
 # A change here must be deliberate: check the look, then update with `pnpm --filter @pva/web exec vitest run test/characters -u`.
 dark  0.5 idle        244 30b57e97
 dark  1.0 listening   279 2ccb9902
@@ -47,3 +47,26 @@ light 11.0 idle        279 a640e7db
 overflow 160×140×1 0.0 px
 overflow 900×420×1 0.0 px
 overflow 720×240×2 0.0 px
+stage  0.5 idle        244 2eaeab17
+stage  1.0 listening   279 33793a82
+stage  1.5 listening   188 01b641aa
+stage  2.0 hearing     188 ccf10427
+stage  2.5 hearing     279 96decbfb
+stage  3.0 hearing     279 f2044687
+stage  3.5 hearing     279 ef87ace1
+stage  4.0 hearing     279 a46d3c37
+stage  4.5 hearing     182 59e286ba
+stage  5.0 thinking    285 0840af1e
+stage  5.5 thinking    185 cc545de1
+stage  6.0 thinking    185 030860b0
+stage  6.5 speaking    185 a7689c38
+stage  7.0 speaking    270 e1b58c5e
+stage  7.5 speaking    273 0688b295
+stage  8.0 speaking    273 cf84e82d
+stage  8.5 speaking    273 468598eb
+stage  9.0 speaking    247 c78537ef
+stage  9.5 listening   273 4d2f273a
+stage 10.0 listening   188 ce0afc36
+stage 10.5 idle        188 de8c40a7
+stage 11.0 idle        279 a8144f68
+stage 1280×800×1 focus 720×240 at 280,200: solid drawing x 490.7..797.4, y 280.9..410.6
