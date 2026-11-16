@@ -130,11 +130,11 @@ describe("who has the turn", () => {
     expect(stripAssistantId(s)).toBe("t3")
   })
 
-  it("asleep or idle: nobody has the turn; a changed pick, or an assistant that left, drops it", () => {
+  it("asleep or idle: nobody has the turn; an assistant that left drops it; a changed default does not (the server says when the turn moves)", () => {
     let s = run([turnStart(1, "t3")], base())
     expect(holderOf(run([{ type: "state", state: "asleep" }], s))).toBeUndefined()
     expect(holderOf(run([{ type: "state", state: "idle" }], s))).toBeUndefined()
-    expect(holderOf(run([setupMessage(setup({ withoutPhrase: { mode: "nobody" } }))], s))).toBeUndefined()
+    expect(holderOf(run([setupMessage(setup({ withoutPhrase: { mode: "nobody" } }))], s))).toBe("t3")
     // The same setup again changes nothing.
     expect(holderOf(run([setupMessage(setup())], s))).toBe("t3")
     s = run([setupMessage(setup({ assistants: [setup().assistants[0]!] }))], s)
@@ -269,10 +269,12 @@ describe("one conversation per assistant", () => {
     expect(answeringId(s)).toBe("jeff")
     expect(stripAssistantId(s)).toBeUndefined()
     expect(newConversationTip(s)).toBe("New conversation with Jeff (T3 keeps its own)")
-    // A turn in flight keeps the assistant its turn.start named; a state without holder (a server that does not say) keeps it too.
-    s = run([turnStart(2, "t3"), { type: "state", state: "thinking", turnId: 2, holder: null }], s)
+    // A turn in flight is named by the server too; a state without holder (a server that does not say) keeps the page's.
+    s = run([turnStart(2, "t3"), { type: "state", state: "thinking", turnId: 2, holder: "t3" }], s)
     expect(holderOf(s)).toBe("t3")
     expect(holderOf(run([{ type: "state", state: "listening" }], s))).toBe("t3")
+    // `null` is the server saying nobody: the page does not keep a guess of its own.
+    expect(holderOf(run([{ type: "state", state: "thinking", turnId: 2, holder: null }], s))).toBeUndefined()
     // An armed window that lapses ends "Listening…" for its assistant.
     const armed = run([{ type: "wake", phrase: "hey t3", armed: true, assistantId: "t3" }, { type: "state", state: "listening", holder: "t3" }], base())
     expect(armed.woke).toBeDefined()
@@ -281,12 +283,44 @@ describe("one conversation per assistant", () => {
     expect(holderOf(lapsed)).toBeUndefined()
   })
 
-  it("a pick accepted on this page clears who has the turn", () => {
-    const s = run([welcomeWith(setup()), turnStart(1, "t3"), { type: "wake", phrase: "hey t3", armed: true, assistantId: "t3" }])
+  it("the phrase alone, then the next sentence is heard: hearing still names T3 (the server's holder), so the chat and New conversation stay on T3", () => {
+    let s = run([welcomeWith(setup()), { type: "state", state: "listening", holder: null }, { type: "state", state: "hearing", holder: "t3" }])
+    s = run([{ type: "wake", phrase: "hey t3", armed: true, assistantId: "t3" }, { type: "state", state: "listening", holder: "t3" }], s)
+    expect(s.woke).toBeDefined()
+    s = run([{ type: "state", state: "hearing", holder: "t3" }], s)
     expect(holderOf(s)).toBe("t3")
-    const cleared = run([{ type: "local/holder-clear" }], s)
-    expect(holderOf(cleared)).toBeUndefined()
-    expect(cleared.woke).toBeUndefined()
+    expect(answeringId(s)).toBe("t3")
+    expect(stripAssistantId(s)).toBe("t3")
+    expect(topBarName(s)).toBe("T3")
+    expect(newConversationTip(s)).toBe("New conversation with T3 (Jeff keeps its own)")
+  })
+
+  it("a pick does not move the turn by itself: the page keeps the server's holder until the state that follows the pick", () => {
+    let s = run([welcomeWith(setup()), { type: "wake", phrase: "hey t3", armed: true, assistantId: "t3" }, { type: "state", state: "listening", holder: "t3" }])
+    expect(holderOf(s)).toBe("t3")
+    // The pick's device.setup (Jeff answers without a phrase, as before): T3 still has the turn as far as the server said.
+    s = run([setupMessage(setup({ withoutPhrase: { mode: "assistant", assistant: "jeff" } }))], s)
+    expect(holderOf(s)).toBe("t3")
+    expect(topBarName(s)).toBe("T3")
+    // The server closed its windows on the accepted pick and says so.
+    s = run([{ type: "state", state: "listening", holder: null }], s)
+    expect(holderOf(s)).toBeUndefined()
+    expect(s.woke).toBeUndefined()
+    expect(topBarName(s)).toBe("Jeff")
+  })
+
+  it("a welcome in T3's armed window: the turn is T3's (snapshot.holder) while the history stays Jeff's (snapshot.answering)", () => {
+    const s = run([welcomeWith(setup(), { answering: "jeff", holder: "t3" })])
+    expect(turnsOf(s, "jeff")).toHaveLength(2)
+    expect(turnsOf(s, "t3")).toEqual([])
+    expect(s.conversations.jeff!.loaded).toBe(true)
+    expect(needsRead(s, "t3")).toBe(true)
+    expect(holderOf(s)).toBe("t3")
+    expect(topBarName(s)).toBe("T3")
+    // The server says nobody: no holder, even with a follow-up holder's history (its window closed meanwhile).
+    const nobody = run([welcomeWith(setup(), { answering: "t3", holder: null })])
+    expect(turnsOf(nobody, "t3")).toHaveLength(2)
+    expect(holderOf(nobody)).toBeUndefined()
   })
 
   it("a new conversation of one assistant clears only its chat and gives it the divider", () => {

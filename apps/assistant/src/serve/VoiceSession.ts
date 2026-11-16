@@ -32,7 +32,6 @@ import {
   typedTextTarget,
   TYPESAFE_GIVE_UP_MS,
   typesafeCandidates,
-  typesafeFallback,
   WAKE_ARMED_MS
 } from "@pva/protocol"
 import { Cause, Deferred, Effect, Exit, Fiber, Queue, type Scope, Stream } from "effect"
@@ -40,7 +39,7 @@ import type { Engine, SessionLoop } from "./Engine.ts"
 import { type HeardAudio, makeHeardAudio } from "./HeardAudio.ts"
 import { makeOutputLease } from "./OutputLease.ts"
 import { makePublisher, type Publisher } from "./Publisher.ts"
-import { makeTypesafeDecide, type RoutingService } from "./routing.ts"
+import { makeTypesafeDecide, type RoutingService, typesafeNow } from "./routing.ts"
 import { makeSessionConversation, type SendOutcome, type SessionConversation } from "./SessionConversation.ts"
 import { type DispatchRoute, type DispatchTarget, makeSessionDispatcher, type RouteDecision, type SessionDispatcher } from "./SessionDispatcher.ts"
 import { makeStateTracker, type StateTracker } from "./StateTracker.ts"
@@ -227,6 +226,13 @@ export interface VoiceSession {
   readonly lastActiveAt: () => number
   readonly touch: () => void
   readonly info: () => SessionInfo
+  /**
+   * Who has the turn on the device (`state.holder`, `snapshot.holder`): the assistant of the turn in flight or of the
+   * utterance being heard, else the one whose armed or follow-up window is open, else `null` (nobody).
+   */
+  readonly holder: () => string | null
+  /** A `device.pick` was accepted: the open windows close, so the picked assistant answers the next sentence (§5.3). */
+  readonly pickAccepted: () => void
 }
 
 /**
@@ -324,8 +330,21 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
     const followUpOf = (assistant: string | undefined) => (assistant === undefined ? 0 : route.config().followUpMs?.[assistant] ?? 0)
     const longestFollowUp = () => Math.max(0, ...Object.values(route.config().followUpMs ?? {}))
     const armedMs = () => route.config().armedMs ?? WAKE_ARMED_MS
-    /** Who has the turn (an open armed or follow-up window, a reply playing), as `state.holder` last told the pages. */
-    const holderNow = (): string | null => route.window(now())?.assistant ?? null
+    /** The assistant the utterance being heard goes to (its route target); `undefined` while TypeSafe decides, or nobody. */
+    let heardFor: string | undefined
+    /**
+     * Who has the turn, the one rule the pages show (`state.holder`, `snapshot.holder`): the assistant of the turn in
+     * flight or of the utterance being heard (an armed window is consumed when the utterance starts, its assistant keeps
+     * the turn), else the one whose armed or follow-up window is open, else nobody.
+     */
+    const holderNow = (): string | null => {
+      const s = tracker.current()
+      if (s.state === "hearing" || s.state === "thinking" || s.state === "speaking") {
+        const busy = (s.turnId === undefined ? undefined : assistantOfTurn(s.turnId)) ?? heardFor
+        if (busy !== undefined) return busy
+      }
+      return route.window(now())?.assistant ?? null
+    }
     let holderSent: string | null = null
     const tracker = makeStateTracker({
       onChange: (s) => {
@@ -578,12 +597,9 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
     const dispatcher = makeSessionDispatcher<Target>({
       replyEarly: (assistant) => assistantOf(assistant)?.replyEarly ?? true,
       decide,
-      // The device may have changed while TypeSafe was asked: the answer goes only to an assistant it still has.
-      decideNow: () => {
-        const settings = options.deviceSettings()
-        const assistants = options.assistants()
-        return { candidates: typesafeCandidates(settings, assistants), fallback: typesafeFallback(settings, assistants) }
-      },
+      // The device may have changed while TypeSafe was asked: the answer goes only to an assistant it still has, and
+      // to nobody once the device no longer routes by TypeSafe.
+      decideNow: () => typesafeNow(options.deviceSettings(), options.assistants()),
       make: (assistant, hooks) =>
         Effect.gen(function*() {
           const inbox = yield* Queue.unbounded<ConversationInput>()
@@ -681,8 +697,14 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
         for (const e of echo.events) {
           const r = route.filter(e, t)
           results.push(r)
+          // The utterance's assistant (a phrase in it may change it), before the state that names it is sent.
+          const routed = r.target
+          if (routed !== undefined) heardFor = routed.by === "decide" || routed.by === "dropped" ? undefined : routed.assistant
+          else if (e._tag === "SpeechStarted") heardFor = undefined
           if (r.heard !== undefined) options.wakeHeard(r.heard.text, r.heard.phrase, r.heard.accepted)
           if (r.woke !== undefined) {
+            // The phrase's utterance is still heard: its new holder goes out before `wake`, which the page shows until the next state.
+            if (tracker.current().state === "hearing") holderCheck()
             if (r.woke.armed) armedPhrase.set(r.woke.assistant, r.woke.phrase)
             options.send({ type: "wake", phrase: r.woke.phrase, armed: r.woke.armed, assistantId: r.woke.assistant })
             wakeChanged(r.woke.armed ? armedMs() : followUpOf(r.woke.assistant))
@@ -707,6 +729,8 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
           else heard.event(event)
         }
         if (echo.dropped) transcript("")
+        // A phrase inside the utterance may have changed who has the turn while the state stayed `hearing`.
+        holderCheck()
         return Effect.forEach(results, dispatcher.dispatch, { discard: true })
       })
 
@@ -919,6 +943,11 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
       turns: () => turnsBy.get(answering() ?? "") ?? 0,
       lastActiveAt: () => lastActive,
       touch,
+      holder: holderNow,
+      pickAccepted: () => {
+        route.release()
+        wakeChanged()
+      },
       info: (): SessionInfo => {
         const last = conversations.lastTurnAt()
         return {

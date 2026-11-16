@@ -208,11 +208,12 @@ type Snap = Pick<Snapshot, "history" | "conversation" | "setup" | "conversations
 /**
  * The part of the state a `welcome` sets: the setup, the conversations (the snapshot's history is the answering
  * assistant's, `snapshot.answering` when the server says, which may be a follow-up holder; the others are read when the
- * chat shows them) and the holder (that follow-up holder, else nobody).
+ * chat shows them) and the holder: `snapshot.holder`, who has the turn as the server says it (an armed assistant too,
+ * whose history the snapshot does not carry); from a server that does not say, the follow-up holder, else nobody.
  */
 export const atWelcome = (
   previous: ClientState,
-  snapshot: Snap & Pick<Snapshot, "answering">,
+  snapshot: Snap & Pick<Snapshot, "answering" | "holder">,
   toTurns: (history: ReadonlyArray<HistoryItem>) => ReadonlyArray<TurnView>
 ): Pick<ClientState, "setup" | "holder" | "conversations" | "turns"> => {
   const setup = snapshot.setup
@@ -233,16 +234,20 @@ export const atWelcome = (
     }
   }
   const turns = toTurns(snapshot.history).map((t) => ({ ...t, assistantId: answering }))
-  // The history's assistant has the turn when it is not the one that answers anyway (a follow-up window is open).
-  return { setup, holder: answering === answeringId({ ...probe, holder: undefined }) ? undefined : holderOf(probe), conversations, turns }
+  // The server's holder when it says; else the history's assistant has the turn when it is not the one that answers anyway.
+  const holder = snapshot.holder !== undefined
+    ? snapshot.holder ?? undefined
+    : answering === answeringId({ ...probe, holder: undefined }) ? undefined : holderOf(probe)
+  return { setup, holder, conversations, turns }
 }
 
-/** `device.setup`: the new setup; the holder is dropped when it left the device or the pick changed who answers. */
+/**
+ * `device.setup`: the new setup; the holder is dropped only when it left the device. A new default does not move the
+ * turn: the server says when it does (an accepted pick closes its windows, and the `state` that follows names the holder).
+ */
 export const onSetup = (s: ClientState, m: Extract<ServerMessage, { type: "device.setup" }>): ClientState => {
   const { type: _type, ...setup } = m
-  const before = s.setup?.withoutPhrase
-  const changed = before === undefined || JSON.stringify(before) !== JSON.stringify(setup.withoutPhrase)
-  const holder = changed || (s.holder !== undefined && !setup.assistants.some((a) => a.id === s.holder)) ? undefined : s.holder
+  const holder = s.holder !== undefined && !setup.assistants.some((a) => a.id === s.holder) ? undefined : s.holder
   return { ...s, setup, holder }
 }
 
