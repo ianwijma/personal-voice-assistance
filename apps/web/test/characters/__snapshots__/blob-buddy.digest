@@ -1,0 +1,72 @@
+# blob-buddy 1.1.1: frame digests of a scripted conversation at default settings (docs/CHARACTERS.md §6.6).
+# A change here must be deliberate: check the look, then update with `pnpm --filter @pva/web exec vitest run test/characters -u`.
+dark  0.5 idle        101 27412986
+dark  1.0 listening   110 77ece089
+dark  1.5 listening   107 4a1a9cf3
+dark  2.0 hearing     107 42c4be21
+dark  2.5 hearing     107 d7c953e2
+dark  3.0 hearing     107 196a8ba5
+dark  3.5 hearing     107 f189b803
+dark  4.0 hearing     107 7770dc24
+dark  4.5 hearing     107 a5e4b624
+dark  5.0 thinking    108 45acb242
+dark  5.5 thinking    135 8c3b3aba
+dark  6.0 thinking    135 0a20713e
+dark  6.5 speaking    134 02874152
+dark  7.0 speaking    134 edd37e59
+dark  7.5 speaking    134 58f8307b
+dark  8.0 speaking    134 174aa992
+dark  8.5 speaking    134 594e6e80
+dark  9.0 speaking    134 6f34e4c1
+dark  9.5 listening   135 1780c4b7
+dark 10.0 listening   108 3c9c5151
+dark 10.5 idle        107 bf05e3f0
+dark 11.0 idle        109 bb12b88a
+light  0.5 idle        102 291ddf6e
+light  1.0 listening   111 4ab6be10
+light  1.5 listening   108 aa999ef8
+light  2.0 hearing     108 9a0439e9
+light  2.5 hearing     108 92346508
+light  3.0 hearing     108 e75750ac
+light  3.5 hearing     108 184e65d8
+light  4.0 hearing     108 c84a614f
+light  4.5 hearing     108 c6356a1e
+light  5.0 thinking    109 9cbab0d5
+light  5.5 thinking    136 dc3ae7f3
+light  6.0 thinking    136 3b72b7ad
+light  6.5 speaking    135 6206f4da
+light  7.0 speaking    135 644c5dd6
+light  7.5 speaking    135 8cbb3e42
+light  8.0 speaking    135 07be09fb
+light  8.5 speaking    135 ae378655
+light  9.0 speaking    135 4b7eb6c3
+light  9.5 listening   136 57c1f4a3
+light 10.0 listening   109 ea6692a6
+light 10.5 idle        108 2c7debd2
+light 11.0 idle        110 c5c77d44
+overflow 160×140×1 0.0 px
+overflow 900×420×1 0.0 px
+overflow 720×240×2 0.0 px
+stage  0.5 idle        101 a4c22e06
+stage  1.0 listening   110 505bb109
+stage  1.5 listening   107 d7a8db73
+stage  2.0 hearing     107 6de6f3a1
+stage  2.5 hearing     107 06579562
+stage  3.0 hearing     107 ef312425
+stage  3.5 hearing     107 6b6c8583
+stage  4.0 hearing     107 08107da4
+stage  4.5 hearing     107 9e4790a4
+stage  5.0 thinking    108 f678d9c2
+stage  5.5 thinking    135 ac8ef53a
+stage  6.0 thinking    135 0c57c5be
+stage  6.5 speaking    134 3ac418d2
+stage  7.0 speaking    134 eb170fd9
+stage  7.5 speaking    134 d1c99cfb
+stage  8.0 speaking    134 e6a87012
+stage  8.5 speaking    134 4bd68d00
+stage  9.0 speaking    134 42fbc841
+stage  9.5 listening   135 bdb50837
+stage 10.0 listening   108 698614d1
+stage 10.5 idle        107 0d5ec570
+stage 11.0 idle        109 4a9f1f0a
+stage 1280×800×1 focus 720×240 at 280,200: solid drawing x 549.7..732.2, y 210.1..415.8

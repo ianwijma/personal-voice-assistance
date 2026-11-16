@@ -770,7 +770,7 @@ Components: buttons are 40 px (56 px round dock buttons on phones, 48 px on desk
 
 ### 3.3 The visualiser
 
-A `<canvas>` drawn on `requestAnimationFrame`, outside React. It reads a plain mutable object (`levels`, below) and the current visual state; React never re-renders per frame.
+A `<canvas>` drawn on `requestAnimationFrame`, outside React, by the **character host** (`apps/web/src/characters/host.ts`): it runs one *character*, a pluggable drawing module, and hands it each frame the visual state (as a mode), both voices' features, the theme colours and the viewer's settings. What a character is, how the host resolves modes, loads characters, validates their options and isolates failures, and how to add one: `docs/CHARACTERS.md`. The default character, and the fallback whenever another fails, is the **sine lines** described below (`characters/library/sine-lines.ts`), which draws every visual state of this section. The host reads a plain mutable object (`levels`, below) and the current visual state; React never re-renders per frame. The choice of character is a per-browser preference with no visible UI yet (`?character=<id>` on the voice page; docs/CHARACTERS.md §4.4).
 
 **Shape.** Three superimposed lines across the canvas width `W`, centred at `y0 = H/2`, sampled every 2 CSS px:
 
@@ -800,11 +800,11 @@ Drawn with the device pixel ratio for crisp lines; per-frame work under 2 ms (on
 | listening | server state `listening` | `you` 85 % | owner: `micRms · 4` | 2 px | [0.6, 0.9, 1.3] | [1, 0.6, 0.35] | Breathing: global opacity 0.75 ↔ 1 over 4 s |
 | idle | otherwise (observer, nobody owns the audio) | `ink-faint` | 0 | 1 px | [0.3, 0.4, 0.5] | [1, 0.5, 0.3] | — |
 
-- **Drivers**: microphone level comes from the 20 ms PCM frames the capture worklet already produces (RMS of each frame, on the main thread), so the line reacts to your voice with no network delay; in `listening` it already moves a little, in `hearing` fully. Output level and bands come from an `AnalyserNode` (fftSize 1024) on the player node, read once per frame: `outRms` from the time-domain data, band energies low 80–300 Hz, mid 300–1500 Hz, high 1500–4000 Hz, normalised to their sum and smoothed (τ 120 ms) into weights `a = [0.5 + 0.5·low, 0.3 + 0.7·mid, 0.2 + 0.8·high]`.
+- **Drivers**: the host computes both voices' features with the feature extractor (`characters/features.ts`) once per frame. The person: the 20 ms PCM frames the capture worklet already produces are copied into a ring buffer (`levels.mic`, on the main thread, as they arrive); the host analyses the latest 40 ms, so the line reacts to your voice with no network delay; in `listening` it already moves a little, in `hearing` fully. The assistant: the time-domain data of an `AnalyserNode` (fftSize 2048, 43 ms at 48 kHz) on the player node. Only the side that is on gets audio (the person in listening and hearing, the assistant in speaking); the other decays to silence. The sine lines use `micRms` / `outRms` as the window RMS (`rms`) and the extractor's `low`, `mid`, `high` raised to the 4th power as energy shares for the weights `a = [0.5 + 0.5·low, 0.3 + 0.7·mid, 0.2 + 0.8·high]` (smoothed, τ 120 ms). An observer tab (no audio) gets stand-in features from smooth pseudo-noise, scaled so the levels are the observer levels of the table.
 - **Transitions**: colour crossfades over 240 ms (draw the old and new colour with complementary alpha). On an interruption (`turn.end` interrupted, or local Stop), the falling time constant drops to 60 ms so the amber line collapses quickly, then mint takes over.
 - **Label** under the line: mono 12 px upper case: `LISTENING`, `HEARING YOU`, `THINKING`, `SPEAKING · <voice>` (voice name shown when more than one voice is enabled), `MIC OFF`, `RECONNECTING · n`, `NOT CONNECTED`. It is an `aria-live="polite"` region (the only announcement of state changes).
 - **Captions** (on by default; per-device toggle): under the label, centred, at most two lines. In `hearing`: the interim transcript in `you`. In `speaking`: the clause that is playing in `ink`, the next one in `ink-muted`. They fade out 2 s after the state ends.
-- **Reduced motion** (`prefers-reduced-motion: reduce`): `ω = 0`, no breathing, no sweep, no glow; the amplitude still follows the level but is quantised to 4 steps and smoothed with τ = 150 ms, and colour changes are instant. The label carries the state.
+- **Reduced motion** (`prefers-reduced-motion: reduce`): `ω = 0`, no breathing, no sweep, no glow; the shape is held: the amplitude still follows the level, quantised to 4 steps, and the line weights still follow the spectrum, but both step to the current values only on a mode change and then at most once a second, with no gliding in between (sine-lines 1.1.1); colour changes are instant. The label carries the state.
 
 ### 3.4 Starting
 
@@ -936,8 +936,16 @@ apps/web/
     state.ts                ClientState, initial state, reducer(state, ServerMessage | LocalAction): pure, tested
     connection.ts           the Effect connection program (below); send(), request()
     audio/VoiceAudio.ts     AudioContext, capture and player graphs, devices, analysers (from the research)
-    audio/levels.ts         the mutable levels object written by audio, read by the visualiser
-    prefs.ts                per-device preferences (localStorage)
+    audio/levels.ts         the mutable levels object written by audio (incl. a ring of microphone samples), read by the host
+    prefs.ts                per-browser preferences (localStorage), incl. the stage's character choice
+  src/characters/           the stage's characters (docs/CHARACTERS.md; apps/web/src/characters/README.md):
+    contract.ts             the contract between host and character
+    host.ts                 the character host: loop, voices, loading, mode resolution, fallback (replaces visualiser.ts)
+    runner.ts, voices.ts    building one frame; both voices' features (extractor or observer stand-ins)
+    features.ts, kit.ts, options.ts, manifest.ts, choice.ts, registry.ts
+    shared/                 helpers shared by families of characters (figure, light, matter)
+    library/<id>.ts         one character per file; sine-lines.ts is the baseline
+  scripts/build-characters.mjs  lists library/ into the git-ignored library.generated.ts (predev/prebuild/check/test)
   src/components/           App, TopBar, LatencyReadout, Stage, Visualiser, StateLabel, Captions, StartPrompt,
                             ObserverBanner, EngineBanner, ControlDock, ChatPanel, MessageList, AssistantMessage,
                             ToolChip, Composer, KeysPanel, fields/{Text,Secret,Number,Boolean,Choice,MultiChoice}Field,
