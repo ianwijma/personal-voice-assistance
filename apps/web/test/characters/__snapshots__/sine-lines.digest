@@ -1,0 +1,72 @@
+# sine-lines 1.1.1: frame digests of a scripted conversation at default settings (docs/CHARACTERS.md §6.6).
+# A change here must be deliberate: check the look, then update with `pnpm --filter @pva/web exec vitest run test/characters -u`.
+dark  0.5 idle       1094 f8459ef9
+dark  1.0 listening  1094 52f7ded7
+dark  1.5 listening  1094 e24b91b8
+dark  2.0 hearing    1094 50bf1a15
+dark  2.5 hearing    1094 fd657c86
+dark  3.0 hearing    1094 6cfee438
+dark  3.5 hearing    1094 ace38f04
+dark  4.0 hearing    1094 c7b2ed85
+dark  4.5 hearing    1094 e6238830
+dark  5.0 thinking   1214 b7099383
+dark  5.5 thinking   1132 c1792cd9
+dark  6.0 thinking   1214 f0330b68
+dark  6.5 speaking   1094 9b45c1bb
+dark  7.0 speaking   1094 02c2ea7b
+dark  7.5 speaking   1094 195c2b26
+dark  8.0 speaking   1094 ba260e7e
+dark  8.5 speaking   1094 b3050f01
+dark  9.0 speaking   1094 89db2709
+dark  9.5 listening  1094 6b021964
+dark 10.0 listening  1094 76c6d7ed
+dark 10.5 idle       1094 1ddc07cb
+dark 11.0 idle       1094 8262d569
+light  0.5 idle       1094 9299736f
+light  1.0 listening  1094 d567eb93
+light  1.5 listening  1094 cfdad31f
+light  2.0 hearing    1094 88f90fb5
+light  2.5 hearing    1094 6bd7576a
+light  3.0 hearing    1094 9e6e0a0c
+light  3.5 hearing    1094 a22a0f20
+light  4.0 hearing    1094 6d63a695
+light  4.5 hearing    1094 e81d71e4
+light  5.0 thinking   1214 5a38a247
+light  5.5 thinking   1132 303cea10
+light  6.0 thinking   1214 976f9b51
+light  6.5 speaking   1094 c7c913df
+light  7.0 speaking   1094 43026583
+light  7.5 speaking   1094 4538f162
+light  8.0 speaking   1094 2dd05a72
+light  8.5 speaking   1094 6fbaf4ad
+light  9.0 speaking   1094 54987455
+light  9.5 listening  1094 e05e4c93
+light 10.0 listening  1094 1646b42c
+light 10.5 idle       1094 2ded8f6b
+light 11.0 idle       1094 51975939
+overflow 160×140×1 0.0 px
+overflow 900×420×1 0.0 px
+overflow 720×240×2 0.0 px
+stage  0.5 idle       1094 c35da879
+stage  1.0 listening  1094 5d0cf657
+stage  1.5 listening  1094 ef79bad3
+stage  2.0 hearing    1094 2c859857
+stage  2.5 hearing    1094 ca95cdfd
+stage  3.0 hearing    1094 9fb09988
+stage  3.5 hearing    1094 36c92108
+stage  4.0 hearing    1094 14e6dc44
+stage  4.5 hearing    1094 a12ba48c
+stage  5.0 thinking   1214 81e6d4e9
+stage  5.5 thinking   1132 d76f9e94
+stage  6.0 thinking   1214 095d637f
+stage  6.5 speaking   1094 b5307f06
+stage  7.0 speaking   1094 505c18a6
+stage  7.5 speaking   1094 8ac2eb5a
+stage  8.0 speaking   1094 feca2083
+stage  8.5 speaking   1094 094fb4c9
+stage  9.0 speaking   1094 57dd11b3
+stage  9.5 listening  1094 af6f3ad7
+stage 10.0 listening  1094 c6137c1f
+stage 10.5 idle       1094 80cb1122
+stage 11.0 idle       1094 0f3fbce9
+stage 1280×800×1 focus 720×240 at 280,200: solid drawing x 280.0..1000.0, y 244.6..398.4
