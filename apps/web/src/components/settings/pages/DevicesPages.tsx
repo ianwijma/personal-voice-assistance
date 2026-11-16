@@ -6,7 +6,9 @@ import {
   baseOfDevice,
   baseOfType,
   type DeviceBase,
+  type DeviceDraft,
   type DeviceEdit,
+  draftOnRevision,
   isDirty,
   isOwn,
   noEdit,
@@ -15,7 +17,8 @@ import {
   quietLabel,
   sectionsOf,
   setKeys,
-  settingsOf
+  settingsOf,
+  wakesAssistant
 } from "@/lib/devices.ts"
 import { INTERRUPT_CHOICES, lastSeenText } from "@/lib/profileForm.ts"
 import { agoText, stateWord, turnsText } from "@/lib/sessions.ts"
@@ -186,6 +189,7 @@ const SECTION_HELP = {
 function DeviceEditor({ type, device }: { readonly type: DeviceTypeInfo; readonly device: DeviceListInfo | undefined }) {
   const client = useClient()
   const assistants = useClientState((s) => s.assistants)
+  const devices = useClientState((s) => s.devices)
   const session = useClientState((s) => (device === undefined ? undefined : s.sessions.find((x) => x.deviceId === device.id)), shallowEqual)
   const canAuto = useCanAuto()
   const hasRouting = useHasRouting()
@@ -197,26 +201,34 @@ function DeviceEditor({ type, device }: { readonly type: DeviceTypeInfo; readonl
   const savedName = device?.name
 
   // The edits, the revision they started from, and what the last save said.
-  const [state, setState] = useState<{ readonly edit: DeviceEdit; readonly rev: number }>({ edit: noEdit, rev })
+  const [state, setState] = useState<DeviceDraft>({ edit: noEdit, rev })
   const [blocked, setBlocked] = useState<ReadonlySet<string>>(new Set())
   const [saving, setSaving] = useState(false)
-  const [submitted, setSubmitted] = useState(false)
+  /** The edits of the last save that went through, until its revision arrives. */
+  const [acked, setAcked] = useState<DeviceEdit | undefined>()
+  /** Bumped when the draft is discarded or a section reset: the number fields start again (their text and errors). */
+  const [generation, setGeneration] = useState(0)
+  const revNow = useRef(rev)
   const [justSaved, setJustSaved] = useState(false)
   const [errors, setErrors] = useState<ReadonlyArray<FieldError>>([])
   const [message, setMessage] = useState<string | undefined>()
   const [warnings, setWarnings] = useState<ReadonlyArray<FieldError>>([])
   const edit = state.edit
-  const dirty = !submitted && isDirty(base, edit, savedName)
+  const dirty = edit !== acked && isDirty(base, edit, savedName)
   const behind = dirty && state.rev !== rev
 
-  // A new version from the server: a clean draft follows it (the edits of a save that went through are dropped).
+  // A new version from the server: a clean draft follows it (the edits of a save that went through are dropped, later ones kept).
   useEffect(() => {
-    setState((s) => (s.rev === rev ? s : s.edit === noEdit || submitted || !isDirty(base, s.edit, savedName) ? { edit: noEdit, rev } : s))
-    setSubmitted(false)
+    revNow.current = rev
+    setState((s) => draftOnRevision(s, rev, base, savedName, acked))
+    setAcked(undefined)
   }, [rev]) // eslint-disable-line react-hooks/exhaustive-deps
 
+  const discard = () => {
+    setState({ edit: noEdit, rev })
+    setGeneration((g) => g + 1)
+  }
   const update = useCallback((f: (e: DeviceEdit) => DeviceEdit) => {
-    setSubmitted(false)
     setJustSaved(false)
     setErrors([])
     setMessage(undefined)
@@ -242,7 +254,7 @@ function DeviceEditor({ type, device }: { readonly type: DeviceTypeInfo; readonl
   const defaultsName = `Every ${type.one}`
   const thisWord = isType ? `these ${type.many}` : `this ${type.one}`
   const name = edit.name ?? device?.name ?? defaultsName
-  const ctx: SectionContext = { base, edit, update, settings, isType, thisWord, defaultsName, deviceName: name, setBlocked: setBlockedId }
+  const ctx: SectionContext = { base, edit, update, settings, isType, thisWord, defaultsName, deviceName: name, setBlocked: setBlockedId, generation, renew: () => setGeneration((g) => g + 1) }
   const sections = sectionsOf(type)
   const has = (s: ReturnType<typeof sectionsOf>[number]) => sections.includes(s)
 
@@ -259,14 +271,18 @@ function DeviceEditor({ type, device }: { readonly type: DeviceTypeInfo; readonl
     )
     setSaving(false)
     switch (outcome.kind) {
-      case "ok":
-        setSubmitted(true)
+      case "ok": {
+        // Only what was sent is saved: edits made meanwhile stay. Its revision may have arrived before the answer.
+        const r = revNow.current
+        if (r !== state.rev) setState((s) => draftOnRevision(s, r, base, savedName, edit))
+        else setAcked(edit)
         setJustSaved(true)
         setWarnings([])
         setErrors([])
         break
+      }
       case "stale":
-        setState({ edit: noEdit, rev })
+        discard()
         break
       case "invalid":
         setErrors(outcome.fieldErrors)
@@ -285,10 +301,11 @@ function DeviceEditor({ type, device }: { readonly type: DeviceTypeInfo; readonl
 
   const assignError = errors.filter((e) => e.key !== null && (e.key === "assistants" || e.key.startsWith("assistants.") || e.key.startsWith("withoutPhrase"))).map((e) => e.message).join(" ") || undefined
   const otherError = [message, ...errors.filter((e) => e.key === null || !(e.key === "assistants" || e.key.startsWith("assistants.") || e.key.startsWith("withoutPhrase"))).map((e) => e.message)].filter((m): m is string => m !== undefined).join(" ") || undefined
-  const wakesOf = (phrase: string): string | undefined => {
-    const key = phrase.trim().toLowerCase()
-    const hit = settings.assistants.find((a) => a.phrases.some((p) => p.trim().toLowerCase() === key || p.trim().toLowerCase().replace(/[^\p{L}\p{N} ]/gu, "") === key.replace(/[^\p{L}\p{N} ]/gu, "")))
-    return hit === undefined ? undefined : assistants.find((a) => a.id === hit.assistant)?.name ?? hit.assistant
+  // The server judges a line with the tested device's saved settings, not with this page's draft.
+  const wakesOf = (phrase: string, testedId: string | undefined): string | undefined => {
+    const tested = devices.find((d) => d.id === testedId)
+    const hit = tested === undefined ? undefined : wakesAssistant(tested.settings.assistants, phrase)
+    return hit === undefined ? undefined : assistants.find((a) => a.id === hit)?.name ?? hit
   }
   const allPhrases = settings.assistants.flatMap((a) => a.phrases)
   const savedPhrases = base.saved.assistants.flatMap((a) => a.phrases)
@@ -336,7 +353,7 @@ function DeviceEditor({ type, device }: { readonly type: DeviceTypeInfo; readonl
       {behind && (
         <div className="flex items-center gap-3 rounded-md border border-line bg-surface-2/50 px-3 py-2 text-[13px] text-ink-muted" data-testid="behind">
           Changed somewhere else since you started.
-          <button type="button" className="ml-auto text-voice hover:underline" onClick={() => setState({ edit: noEdit, rev })}>Load latest</button>
+          <button type="button" className="ml-auto text-voice hover:underline" onClick={discard}>Load latest</button>
         </div>
       )}
       {has("assign") && <AssignSection ctx={ctx} assistants={assistants} canAuto={canAuto} hasRouting={hasRouting} serverError={assignError} />}
@@ -427,7 +444,7 @@ function DeviceEditor({ type, device }: { readonly type: DeviceTypeInfo; readonl
         saveDisabled={!dirty || saving || blocked.size > 0 || (edit.name !== undefined && edit.name.trim() === "")}
         onSave={() => void save()}
         onCancel={() => {
-          setState({ edit: noEdit, rev })
+          discard()
           setErrors([])
           setMessage(undefined)
         }}

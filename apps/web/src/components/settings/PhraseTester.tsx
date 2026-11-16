@@ -48,8 +48,8 @@ export function PhraseTester({ onAdd, phrases: draftPhrases = [], savedPhrases =
   /** Test this device only (the device page), not "the device talking most recently". */
   readonly deviceId?: string
   readonly deviceName?: string
-  /** The assistant a phrase wakes on the tested device (named after a matched line). */
-  readonly wakes?: (phrase: string) => string | undefined
+  /** The assistant a phrase wakes on the tested device (`deviceId`: the device being tested; named after a matched line). */
+  readonly wakes?: (phrase: string, deviceId: string | undefined) => string | undefined
   /** The form's phrases now (draft) and as last saved: what "Added" / "Saved" is derived from. */
   readonly phrases?: ReadonlyArray<string>
   readonly savedPhrases?: ReadonlyArray<string>
@@ -76,6 +76,7 @@ export function PhraseTester({ onAdd, phrases: draftPhrases = [], savedPhrases =
     },
     shallowEqual
   )
+  const wakesHere = wakes === undefined ? undefined : (phrase: string) => wakes(phrase, owner?.id)
   const unsaved = useClientState((s) => s.ui.settingsDirty)
   const [until, setUntil] = useState<number | undefined>()
   const [now, setNow] = useState(() => Date.now())
@@ -130,7 +131,7 @@ export function PhraseTester({ onAdd, phrases: draftPhrases = [], savedPhrases =
   const latest = heard[heard.length - 1]
   useEffect(() => {
     if (latest === undefined || !onRef.current) return
-    setAnnouncement(`Heard “${latest.text}”: ${outcomeText(latest, wakes).toLowerCase()}.`)
+    setAnnouncement(`Heard “${latest.text}”: ${outcomeText(latest, wakesHere).toLowerCase()}.`)
   }, [latest])
   // Leaving the page stops it. When the session has ended (logout, restart) the server has already switched it off
   // and would refuse the request (`admin_required`), so nothing is sent then.
@@ -216,16 +217,16 @@ export function PhraseTester({ onAdd, phrases: draftPhrases = [], savedPhrases =
                   {outcome === "matched" ? (
                     <span className="inline-flex items-center gap-1 text-[12px] text-ok">
                       <Icon name="check" size={14} />
-                      {outcomeText(l, wakes)}
+                      {outcomeText(l, wakesHere)}
                     </span>
                   ) : outcome === "accepted" ? (
                     <span className="inline-flex items-center gap-1 text-[12px] text-you" title="Always listening, or the device was already listening (after the phrase or a reply)">
                       <Icon name="check" size={14} />
-                      {outcomeText(l, wakes)}
+                      {outcomeText(l, wakesHere)}
                     </span>
                   ) : (
                     <span className="inline-flex items-center gap-2">
-                      <span className="label text-[10px] text-ink-muted">{outcomeText(l, wakes)}</span>
+                      <span className="label text-[10px] text-ink-muted">{outcomeText(l, wakesHere)}</span>
                       {onAdd === undefined ? null : added[l.at] !== undefined && listHas(draftPhrases, added[l.at]!) ? (
                         // Derived from the form: in the draft only = not saved yet; also in the saved list = saved.
                         <span tabIndex={-1} data-added-at={l.at} className="text-[12px] text-ok outline-none focus-visible:underline" data-testid="added-status">

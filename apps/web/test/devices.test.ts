@@ -5,6 +5,7 @@ import {
   answersWithoutPhrase,
   baseOfDevice,
   baseOfType,
+  draftOnRevision,
   followUpLabel,
   hearerId,
   isDirty,
@@ -22,7 +23,8 @@ import {
   sectionsOf,
   setKeys,
   settingsOf,
-  valueOf
+  valueOf,
+  wakesAssistant
 } from "@/lib/devices.ts"
 
 // The device and defaults pages' pure core (docs/ASSISTANTS.md §2.3, §7.1): sections, edits over what is saved, the patch.
@@ -246,5 +248,52 @@ describe("labels", () => {
   it("followUpLabel: 0 is Off", () => {
     expect(followUpLabel(0)).toBe("Off")
     expect(followUpLabel(8)).toBe("8 seconds")
+  })
+})
+
+// Review of PR #35, finding 1: a save that went through takes only what it sent; edits made meanwhile stay.
+describe("the draft when a new revision arrives", () => {
+  const sent = setKeys(device, noEdit, { matching: "exact" })
+  const renamed = { ...sent, name: "Kitchen" }
+
+  it("the edits of this page's save that went through: a clean draft on the new revision", () => {
+    expect(draftOnRevision({ edit: sent, rev: 1 }, 2, device, exampleDevice.name, sent)).toEqual({ edit: noEdit, rev: 2 })
+  })
+
+  it("a rename made while that save was on its way is kept, on the new revision (not dropped, not shown as behind)", () => {
+    const next = draftOnRevision({ edit: renamed, rev: 1 }, 2, device, exampleDevice.name, sent)
+    expect(next.rev).toBe(2)
+    expect(next.edit).toBe(renamed)
+    expect(isDirty(device, next.edit, exampleDevice.name)).toBe(true)
+  })
+
+  it("without a save of this page: a draft with nothing to save follows, one with edits stays where it was", () => {
+    expect(draftOnRevision({ edit: noEdit, rev: 1 }, 2, device, exampleDevice.name, undefined)).toEqual({ edit: noEdit, rev: 2 })
+    const draft = { edit: renamed, rev: 1 }
+    expect(draftOnRevision(draft, 2, device, exampleDevice.name, undefined)).toBe(draft)
+  })
+
+  it("the same revision changes nothing", () => {
+    const draft = { edit: renamed, rev: 2 }
+    expect(draftOnRevision(draft, 2, device, exampleDevice.name, sent)).toBe(draft)
+  })
+})
+
+// Review of PR #35, finding 3: the phrase tester names the assistant from the tested device's saved assignments.
+describe("wakesAssistant", () => {
+  const saved: Assignment[] = [
+    { assistant: "jeff", phrases: ["Hey Jeff"] },
+    { assistant: "t3", phrases: ["hey t3"] }
+  ]
+
+  it("finds the assistant whose phrase matched, whatever the case and punctuation", () => {
+    expect(wakesAssistant(saved, "hey jeff")).toBe("jeff")
+    expect(wakesAssistant(saved, "Hey, Jeff!")).toBe("jeff")
+    expect(wakesAssistant(saved, "hey t3")).toBe("t3")
+  })
+
+  it("a phrase that is only in a draft, or on another device, wakes nobody here", () => {
+    expect(wakesAssistant(saved, "ok computer")).toBeUndefined()
+    expect(wakesAssistant([], "hey jeff")).toBeUndefined()
   })
 })
