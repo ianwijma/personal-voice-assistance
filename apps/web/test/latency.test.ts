@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest"
-import { exampleAssistantInfo } from "@pva/protocol/examples"
+import { exampleAssistantInfo, exampleWeatherModule } from "@pva/protocol/examples"
 import type { AssistantInfo, TraceInfo } from "@pva/protocol"
 import { changedSince, chosenBy, factsOf, type LatencyContext, median } from "@/components/settings/latency.tsx"
 
@@ -16,7 +16,7 @@ const assistant: AssistantInfo = {
 const ctx = (a: AssistantInfo = assistant, hearer: string | null = "jeff"): LatencyContext => ({
   assistants: [a],
   devices: [{ id: "d1", name: "Kitchen iPad", hearer }],
-  modules: [],
+  modules: [{ ...exampleWeatherModule, id: "clock", name: "Clock", tools: [] }],
   hearingName: (p) => p,
   voiceName: () => undefined
 })
