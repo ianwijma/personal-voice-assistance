@@ -64,16 +64,24 @@ describe("house model", () => {
   })
 })
 
-const settingsFor = (url: string, token: string | undefined, extra: { aliases?: string; timeoutMs?: number } = {}) => ({
+const settingsFor = (
+  url: string,
+  token: string | undefined,
+  extra: { aliases?: string; timeoutMs?: number; domains?: ReadonlyArray<"light"> } = {}
+) => ({
   baseUrl: url,
   token,
-  domains: ["light"] as ReadonlyArray<"light">,
+  domains: extra.domains ?? (["light"] as ReadonlyArray<"light">),
   aliases: extra.aliases ?? "",
   timeoutMs: extra.timeoutMs ?? 1000
 })
 
 /** Start the module in a scope the test closes; returns the instance and the status lines. */
-const start = (url: string, token: string | undefined, extra: { aliases?: string; timeoutMs?: number; refreshMs?: number } = {}) =>
+const start = (
+  url: string,
+  token: string | undefined,
+  extra: { aliases?: string; timeoutMs?: number; refreshMs?: number; domains?: ReadonlyArray<"light"> } = {}
+) =>
   Effect.gen(function*() {
     const statuses: Array<StatusLine | undefined> = []
     const scope = yield* Scope.make()
@@ -152,6 +160,19 @@ describe("home-assistant module", () => {
       const status = yield* action(instance, "lights_status").run({})
       expect(status).toEqual({ say: "Desk lamp is on." })
       expect(action(instance, "lights_status").speculative).toBe(true)
+      yield* close
+      yield* Effect.promise(() => ha.close())
+    }))
+
+  it.live("with no allowed domains it offers no light tool or action and calls no service", () =>
+    Effect.gen(function*() {
+      const ha = yield* Effect.promise(() => startFakeHomeAssistant())
+      const { exit, close } = yield* start(ha.url, ha.token, { domains: [] })
+      const instance = instanceOf(exit)
+      expect(instance.actions ?? []).toEqual([])
+      expect(instance.tools ?? []).toEqual([])
+      expect(instance.instructions).toBeUndefined()
+      expect(ha.requests.some((r) => r.path.startsWith("/api/services/"))).toBe(false)
       yield* close
       yield* Effect.promise(() => ha.close())
     }))

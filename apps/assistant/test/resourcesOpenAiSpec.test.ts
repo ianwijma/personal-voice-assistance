@@ -2,7 +2,7 @@
 // shown in the status, and the settings `llmConfigOf` hands the account's adapter. Pure functions, no network.
 import type { AssistantLlm } from "@pva/protocol"
 import { describe, expect, it } from "vitest"
-import { llmConfigOf, llmKeyOf, llmLabelOf, llmSpecOf } from "../src/serve/Resources.ts"
+import { llmConfigOf, llmIdentityOf, llmKeyOf, llmLabelOf, llmSpecOf } from "../src/serve/Resources.ts"
 
 const assistantLlm = (account: AssistantLlm["account"], model: string, over: Partial<AssistantLlm> = {}): AssistantLlm => ({
   account,
@@ -78,6 +78,18 @@ describe("llmKeyOf: OpenRouter and home model", () => {
     expect(llmKeyOf(one)).toBe(llmKeyOf(two))
     expect(one.credential).not.toBe(two.credential)
   })
+
+  it("OpenRouter's \"Prefer the fastest provider\" changes the instance's identity but not the key shown; a home model ignores it", () => {
+    const or = (sortByLatency?: boolean) => llmSpecOf(assistantLlm("openrouter", "m"), { openrouter: { credential: "k", sortByLatency } })
+    expect(or(true).sortByLatency).toBe(true)
+    expect(or().sortByLatency).toBeUndefined()
+    expect(llmKeyOf(or(true))).toBe(llmKeyOf(or(false)))
+    expect(llmIdentityOf(or(true))).not.toBe(llmIdentityOf(or(false)))
+    expect(llmIdentityOf(or(true))).not.toBe(llmIdentityOf(or()))
+    expect(llmIdentityOf(or(true))).toBe(llmIdentityOf(or(true)))
+    const accounts = { openrouter: { sortByLatency: true }, "home-model": { address: "http://h:1" } }
+    expect(llmSpecOf(assistantLlm("home-model", "m"), accounts).sortByLatency).toBeUndefined()
+  })
 })
 
 describe("llmConfigOf and llmLabelOf: OpenRouter and home model", () => {
@@ -95,6 +107,13 @@ describe("llmConfigOf and llmLabelOf: OpenRouter and home model", () => {
     const config = llmConfigOf(llmSpecOf(assistantLlm("home-model", "qwen3")))
     expect(config).toEqual({ HOME_MODEL_MODEL: "qwen3", HOME_MODEL_MAX_TOKENS: "300", HOME_MODEL_TIMEOUT_MS: "4000", HOME_MODEL_WARM_UP: "true" })
     expect(llmConfigOf(llmSpecOf(assistantLlm("home-model", "qwen3"), { "home-model": { address: "http://h:1" } })).HOME_MODEL_BASE_URL).toBe("http://h:1")
+  })
+
+  it("OpenRouter: the shared sorting setting is handed to the adapter when set, so a rebuilt instance follows a save", () => {
+    const config = (sortByLatency?: boolean) => llmConfigOf(llmSpecOf(assistantLlm("openrouter", "m"), { openrouter: { sortByLatency } }))
+    expect(config(false).OPENROUTER_SORT_BY_LATENCY).toBe("false")
+    expect(config(true).OPENROUTER_SORT_BY_LATENCY).toBe("true")
+    expect("OPENROUTER_SORT_BY_LATENCY" in config()).toBe(false)
   })
 
   it("never puts the key in the settings", () => {

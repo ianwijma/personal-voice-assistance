@@ -157,13 +157,29 @@ export const changedSince = (t: TraceInfo, ctx: LatencyContext): ReadonlyArray<s
   const nowKey = `${a.voice.provider}:${a.voice.voiceId}`
   if (c.voice !== nowKey) out.push(`voice ${was.name} → ${voiceOf(nowKey, ctx).name}`)
   diff("modules", c.modules, Object.values(a.modules).filter((m) => m.on).length)
-  diff("tools", c.tools, toolCount(a, ctx.modules))
+  // A Claude subscription assistant not let to use its modules has no tools, whatever its modules (as the server records it).
+  diff("tools", c.tools, a.llm.account === "claude-subscription" && !a.llm.useModules ? 0 : toolCount(a, ctx.modules))
   if (c.replyEarly !== a.replyEarly) out.push(`reply early ${c.replyEarly ? "on" : "off"} → ${a.replyEarly ? "on" : "off"}`)
   diff("tool rounds", c.toolRounds, a.toolRounds)
   return out
 }
 
 const changedText = (parts: ReadonlyArray<string>) => parts.join("; ")
+
+/**
+ * The turns' own keys, oldest first: device, assistant and turn number (turn numbers count per device), and how many
+ * earlier traces had those (a device's numbers can start over). Not the list position: a new trace must not change the
+ * keys of the rows already shown (their open state and popover are kept by key).
+ */
+export const traceKeys = (traces: ReadonlyArray<TraceInfo>): ReadonlyArray<string> => {
+  const seen = new Map<string, number>()
+  return traces.map((t) => {
+    const base = `${t.deviceId ?? t.session ?? ""}:${t.assistant?.id ?? ""}:${t.turnId}`
+    const n = seen.get(base) ?? 0
+    seen.set(base, n + 1)
+    return n === 0 ? base : `${base}:${n}`
+  })
+}
 
 // ---- Rows
 

@@ -204,6 +204,8 @@ interface Instance {
   ownKeys: ReadonlyArray<string>
   /** The assistants that use it (empty for a module without demand). */
   users: ReadonlyArray<string>
+  /** Assistants that moved to another instance and use this one until that operation has settled its starts. */
+  departing: ReadonlyArray<string>
   state: "starting" | "running" | "error"
   error: string | undefined
   status: StatusLine | undefined
@@ -335,6 +337,7 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
     key: group.key,
     ownKeys: group.ownKeys,
     users: group.users,
+    departing: [],
     state: "starting",
     error: undefined,
     status: undefined,
@@ -354,6 +357,7 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
   const instanceFor = (entry: Entry, assistantId: string): Instance | undefined => {
     for (const r of entry.instances.values()) if (r.running !== undefined && r.users.includes(assistantId)) return r
     for (const r of entry.leaving) if (r.running !== undefined && r.users.includes(assistantId)) return r
+    for (const r of entry.instances.values()) if (r.running !== undefined && r.departing.includes(assistantId)) return r
     return undefined
   }
 
@@ -572,7 +576,12 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
   /** Retire every leaving instance (their replacements have settled) and publish the snapshot without them. */
   const finishLeaving = (entry: Entry) =>
     Effect.suspend(() => {
-      if (entry.leaving.size === 0) return Effect.void
+      const departed = [...entry.instances.values()].filter((r) => r.departing.length > 0)
+      for (const r of departed) r.departing = []
+      if (entry.leaving.size === 0) {
+        if (departed.length > 0) rebuild()
+        return Effect.void
+      }
       const leaving = [...entry.leaving]
       entry.leaving.clear()
       rebuild()
@@ -760,6 +769,8 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
           starts.push({ group, rec, isNew: true })
         } else {
           if (rec.users.join("\n") !== group.users.join("\n") || rec.ownKeys.join("\n") !== group.ownKeys.join("\n")) changed = true
+          // An assistant moving to an instance that still starts keeps this one until then (`finishLeaving`).
+          rec.departing = rec.users.filter((u) => !group.users.includes(u))
           rec.users = group.users
           rec.ownKeys = group.ownKeys
           if (retry && rec.state === "error") starts.push({ group, rec, isNew: false })

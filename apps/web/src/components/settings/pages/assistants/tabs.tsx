@@ -577,16 +577,16 @@ function OwnSettings({ draft, module: m, fields }: { readonly draft: AssistantDr
         const shared = m.settings.values[f.key]
         const isOwn = Object.hasOwn(own, f.key)
         const value = isOwn ? own[f.key] : shared
-        const differs = isOwn && !sameValue(value, shared)
         const id = `own-${m.id}-${f.key}`
         const errors = errorsFor(draft.errors, fieldPath)
         const sharedText = displayValue(f, shared)
         return (
-          <div key={f.key} className="flex flex-col gap-1.5" data-field={fieldPath} data-own-value={differs ? "true" : "false"}>
+          <div key={f.key} className="flex flex-col gap-1.5" data-field={fieldPath} data-own-value={isOwn ? "true" : "false"}>
             <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
               <label htmlFor={id} className="text-[13px] font-medium text-ink">{f.label}</label>
               <span className="ml-auto inline-flex items-center gap-2">
-                {differs ? (
+                {/* An own value equal to the shared one is still own (it stays when the shared value changes): Reset stays. */}
+                {isOwn ? (
                   <>
                     <span className="label rounded-sm border border-ink-faint px-1 text-[11px] leading-[14px] text-ink-muted" data-testid="own-marker">Own value</span>
                     <button
@@ -632,7 +632,6 @@ function OwnSettings({ draft, module: m, fields }: { readonly draft: AssistantDr
 }
 
 const ownable = (f: SettingField): boolean => f.overridable === true && f.type !== "secret"
-const sameValue = (a: unknown, b: unknown): boolean => JSON.stringify(a) === JSON.stringify(b)
 
 /** The module rows (switch, tools, own settings); the wizard shows them too, without the tools and own settings (`compact`). */
 export function ModuleList({ draft, compact = false }: { readonly draft: AssistantDraft; readonly compact?: boolean }) {

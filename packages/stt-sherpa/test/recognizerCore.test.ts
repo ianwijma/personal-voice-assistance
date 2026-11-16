@@ -319,6 +319,21 @@ describe("recognizerCore, per-stream options: which option wins (docs/ASSISTANTS
     assert.strictEqual(core.inspect().sessions, 0)
   })
 
+  it("idle detectors are bounded: a session reopened with one threshold after another does not keep one per threshold", () => {
+    const { core, vadsMade } = setup({ vad: { threshold: 0.5 } })
+    const thresholds = [0.1, 0.2, 0.3, 0.4, 0.6, 0.7, 0.8, 0.9]
+    for (const vadThreshold of thresholds) core.onMessage({ type: "open", session: 1, options: { vadThreshold } })
+    core.onMessage({ type: "end", session: 1 })
+    assert.deepStrictEqual(vadsMade, thresholds, "each new threshold needed a detector")
+    assert.strictEqual(core.inspect().idleVads, 4, "only the most recently given back are kept")
+    // A recent threshold is still served from the idle ones; an old one (and the startup default) is made again.
+    core.onMessage({ type: "open", session: 2, options: { vadThreshold: 0.9 } })
+    assert.strictEqual(vadsMade.length, thresholds.length)
+    core.onMessage({ type: "open", session: 3, options: { vadThreshold: 0.5 } })
+    assert.deepStrictEqual(vadsMade.slice(thresholds.length), [0.5])
+    assert.strictEqual(core.inspect().idleVads, 3)
+  })
+
   it("opening an id again replaces that session and hands its detector back for the new options", () => {
     const { core, vadsMade } = setup({ vad: { threshold: 0.5 } })
     core.onMessage({ type: "open", session: 1, options: { vadThreshold: 0.7 } })

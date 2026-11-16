@@ -34,12 +34,13 @@ import {
   textDelta,
   turnResumed
 } from "@pva/core/testing"
-import { Clock, Effect, Exit, Fiber, Queue, Stream } from "effect"
+import { Clock, Deferred, Effect, Exit, Fiber, Queue, Stream } from "effect"
 import { TestClock } from "effect/testing"
 import { makeEngine } from "../src/serve/Engine.ts"
 import { isSuperseded, type LeasePlayEnd, makeOutputLease, SUPERSEDED } from "../src/serve/OutputLease.ts"
 import { makeSessionConversation, type SessionConversation } from "../src/serve/SessionConversation.ts"
 import {
+  type DecideResult,
   type DecideRoute,
   type DispatchHooks,
   type DispatchTarget,
@@ -347,6 +348,65 @@ describe("SessionDispatcher: routing (recorder fakes)", () => {
       ])
     }))
 
+  it.effect("Stop while the route is being decided: the decided assistant never gets the stopped utterance", () =>
+    Effect.gen(function*() {
+      const gate = yield* Deferred.make<void>()
+      const asked: Array<string> = []
+      const decide: DecideRoute = (request) =>
+        Effect.sync(() => void asked.push(request.text)).pipe(
+          Effect.andThen(Deferred.await(gate)),
+          Effect.as({ assistant: "bravo", fallback: false })
+        )
+      const r = recorder({ decide })
+      const feed = feedVia(makeRouteGate(routeConfig({ withoutPhrase: "decide", fallback: null })), r.dispatcher)
+      yield* r.dispatcher.send("alpha", { _tag: "TextInput", text: "story", speak: true })
+      const story = r.turn("alpha")
+      yield* feed([speechStarted]) // to alpha, the barge-in owner
+      const deciding = yield* Effect.forkChild(feed([endOfTurn("lights on")]))
+      yield* Effect.repeat(Effect.yieldNow, { times: 50 })
+      assert.deepStrictEqual(asked, ["lights on"], "the final is being decided")
+      assert.strictEqual(r.dispatcher.stop(), "accepted")
+      story.end("interrupted")
+      yield* Deferred.succeed(gate, undefined)
+      yield* Fiber.join(deciding)
+      assert.deepStrictEqual(r.log.slice(1), [
+        "alpha SpeechStarted",
+        "alpha send Interrupt",
+        "alpha EndOfTurn(lights on)" // swallowed by alpha's stopped conversation; not handed to bravo
+      ])
+      assert.deepStrictEqual(r.made, ["alpha"], "bravo's conversation is not even made")
+    }))
+
+  it.effect("Stop while an undelivered utterance is decided: nobody gets it", () =>
+    Effect.gen(function*() {
+      const gate = yield* Deferred.make<void>()
+      const decide: DecideRoute = () => Effect.as(Deferred.await(gate), { assistant: "bravo", fallback: false })
+      const r = recorder({ decide })
+      const feed = feedVia(makeRouteGate(routeConfig({ withoutPhrase: "decide", fallback: null })), r.dispatcher)
+      const deciding = yield* Effect.forkChild(feed([speechStarted, endOfTurn("lights on")]))
+      yield* Effect.repeat(Effect.yieldNow, { times: 50 })
+      assert.strictEqual(r.dispatcher.stop(), "accepted")
+      yield* Deferred.succeed(gate, undefined)
+      yield* Fiber.join(deciding)
+      assert.deepStrictEqual(r.log, [])
+      assert.deepStrictEqual(r.made, [])
+    }))
+
+  it.effect("New conversation cancels the open utterance: its rest is not handed to another assistant", () =>
+    Effect.gen(function*() {
+      const r = recorder()
+      const feed = feedVia(makeRouteGate(routeConfig()), r.dispatcher)
+      yield* feed([speechStarted])
+      r.dispatcher.cancelUtterance("bravo") // not bravo's utterance: nothing changes
+      r.dispatcher.cancelUtterance("alpha")
+      yield* feed([endOfTurn("hey bravo turn on the lights")])
+      assert.deepStrictEqual(r.log, [
+        "alpha SpeechStarted",
+        "alpha EndOfTurn(turn on the lights)" // alpha's reset conversation swallows it
+      ])
+      assert.deepStrictEqual(r.made, ["alpha"])
+    }))
+
   it.effect("typed text interrupts another conversation's reply, but not one the owner is speaking to", () =>
     Effect.gen(function*() {
       const r = recorder()
@@ -364,6 +424,72 @@ describe("SessionDispatcher: routing (recorder fakes)", () => {
       r.turn("bravo")
       yield* feed([endOfTurn("lights on")])
       assert.deepStrictEqual(r.log.slice(1), ["alpha EndOfTurn(lights on)", "bravo Interrupt"])
+    }))
+
+  it.effect("Stop while TypeSafe decides: the late answer moves nothing, and no conversation gets the final", () =>
+    Effect.gen(function*() {
+      const asked = yield* Deferred.make<void>()
+      const answer = yield* Deferred.make<DecideResult>()
+      const decide: DecideRoute = () => Effect.andThen(Deferred.succeed(asked, undefined), Deferred.await(answer))
+      const r = recorder({ decide })
+      const feed = feedVia(makeRouteGate(routeConfig({ withoutPhrase: "decide", fallback: null })), r.dispatcher)
+      yield* feed([speechStarted])
+      const final = yield* Effect.forkChild(feed([endOfTurn("lights on")]))
+      yield* Deferred.await(asked)
+      assert.strictEqual(r.dispatcher.stop(), "accepted")
+      yield* Deferred.succeed(answer, { assistant: "bravo", fallback: false })
+      yield* Fiber.join(final)
+      assert.deepStrictEqual(r.log, [], "bravo never got an Interrupt, so it must not get the utterance")
+      assert.deepStrictEqual(r.made, [])
+      assert.strictEqual(r.dispatcher.delivering(), undefined)
+    }))
+
+  it.effect("decide: an answer naming an assistant the device no longer has goes to the fallback the device has now", () =>
+    Effect.gen(function*() {
+      const device: { candidates: ReadonlyArray<string>; fallback: string | null } = { candidates: ["alpha", "bravo"], fallback: "alpha" }
+      const asked = yield* Deferred.make<void>()
+      const answer = yield* Deferred.make<DecideResult>()
+      const decide: DecideRoute = () => Effect.andThen(Deferred.succeed(asked, undefined), Deferred.await(answer))
+      const r = recorder({ decide, decideNow: () => device })
+      const feed = feedVia(makeRouteGate(routeConfig({ withoutPhrase: "decide", fallback: "alpha" })), r.dispatcher)
+      yield* feed([speechStarted])
+      const eager = yield* Effect.forkChild(feed([eagerEndOfTurn("play music")]))
+      yield* Deferred.await(asked)
+      device.candidates = ["alpha"] // bravo is taken off this device while TypeSafe is asked
+      yield* Deferred.succeed(answer, { assistant: "bravo", fallback: false })
+      yield* Fiber.join(eager)
+      assert.deepStrictEqual(r.log, ["alpha SpeechStarted", "alpha EagerEndOfTurn(play music)"])
+      assert.deepStrictEqual(r.made, ["alpha"])
+      assert.deepStrictEqual(r.dispatcher.routeOf("alpha"), { by: "decide", assistant: "alpha", fallback: true })
+      // The fallback is taken off too before the final, which reuses the eager answer: checked again, nobody answers.
+      device.fallback = null
+      yield* feed([endOfTurn("play music.")])
+      assert.deepStrictEqual(r.log.slice(2), ["alpha EndOfTurn()"])
+    }))
+
+  it.effect("decide: an eager answer reused at the final is checked against the device again", () =>
+    Effect.gen(function*() {
+      const device: { candidates: ReadonlyArray<string>; fallback: string | null } = { candidates: ["alpha", "bravo"], fallback: "alpha" }
+      const asked: Array<string> = []
+      const decide: DecideRoute = (request) =>
+        Effect.sync(() => {
+          asked.push(request.text)
+          return { assistant: "bravo", fallback: false }
+        })
+      const r = recorder({ decide, decideNow: () => device })
+      const feed = feedVia(makeRouteGate(routeConfig({ withoutPhrase: "decide", fallback: "alpha" })), r.dispatcher)
+      yield* feed([speechStarted, eagerEndOfTurn("play music")])
+      device.candidates = ["alpha"]
+      yield* feed([endOfTurn("play music.")])
+      assert.deepStrictEqual(asked, ["play music"], "the final reused the eager answer")
+      assert.deepStrictEqual(r.log, [
+        "bravo SpeechStarted",
+        "bravo EagerEndOfTurn(play music)",
+        "bravo EndOfTurn()", // closes it there: discards bravo's speculative turn
+        "alpha SpeechStarted",
+        "alpha EndOfTurn(play music.)"
+      ])
+      assert.deepStrictEqual(r.dispatcher.routeOf("alpha"), { by: "decide", assistant: "alpha", fallback: true })
     }))
 })
 

@@ -87,19 +87,23 @@ describe("language model accounts", () => {
     })
     it("the Anthropic API is ready when its key is set, else points at where to set it", () => {
       expect(accountState("anthropic", [section([], { ANTHROPIC_API_KEY: { set: true } })], [])).toEqual({ tone: "ok", text: "Key set" })
-      expect(accountState("anthropic", [section([], { ANTHROPIC_API_KEY: { set: false } })], [])).toMatchObject({ tone: "todo", setUp: ["language-model", "provider"] })
+      expect(accountState("anthropic", [section([], { ANTHROPIC_API_KEY: { set: false } })], [])).toMatchObject({ tone: "todo", setUp: ["shared", "accounts"] })
       expect(accountState("anthropic", [section([])], [])).toMatchObject({ tone: "todo" })
     })
     it("the subscription is ready only when its module is on and running", () => {
       expect(accountState("claude-subscription", [], [mod("claude-subscription", [])])).toEqual({ tone: "ok", text: "Logged in" })
       for (const m of [mod("claude-subscription", [], { enabled: false }), mod("claude-subscription", [], { state: "starting" })]) {
-        expect(accountState("claude-subscription", [], [m])).toMatchObject({ tone: "todo", setUp: ["language-model", "claude-subscription"] })
+        expect(accountState("claude-subscription", [], [m])).toMatchObject({ tone: "todo", setUp: ["shared", "accounts"] })
       }
       expect(accountState("claude-subscription", [], [])).toMatchObject({ tone: "todo" })
     })
-    it("the accounts the server cannot build yet say so", () => {
-      expect(accountState("openrouter", [], [])).toEqual({ tone: "muted", text: "Not available yet" })
-      expect(accountState("home-model", [], [])).toEqual({ tone: "muted", text: "Not available yet" })
+    it("OpenRouter is ready when its key is set, the home model when its address is set", () => {
+      const withAddress = (address: string) => ({ form: { fields: [], secrets: {}, values: { HOME_MODEL_BASE_URL: address } } }) as unknown as SettingsSection
+      expect(accountState("openrouter", [section([], { OPENROUTER_API_KEY: { set: true } })], [])).toEqual({ tone: "ok", text: "Key set" })
+      expect(accountState("openrouter", [], [])).toMatchObject({ tone: "todo", setUp: ["shared", "accounts"] })
+      expect(accountState("home-model", [withAddress("http://localhost:11434/v1")], [])).toEqual({ tone: "ok", text: "Address set" })
+      expect(accountState("home-model", [withAddress("  ")], [])).toMatchObject({ tone: "todo", setUp: ["shared", "accounts"] })
+      expect(accountState("home-model", [], [])).toMatchObject({ tone: "todo" })
     })
   })
 })

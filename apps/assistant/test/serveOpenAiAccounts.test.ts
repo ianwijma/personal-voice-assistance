@@ -135,7 +135,7 @@ const until = async (what: string, check: () => boolean) => {
 }
 
 const llmResources = () => server!.handle.resources.status().filter((r) => r.kind === "llm")
-const saveShared = async (admin: ScriptedClient, id: string, values: Record<string, string>) => {
+const saveShared = async (admin: ScriptedClient, id: string, values: Record<string, string | boolean>) => {
   admin.send({ type: "settings.update", requestId: id, sectionId: "llm-openai-accounts", patch: { values, secrets: {} } })
   expect(await admin.waitFor("result", (m) => m.requestId === id)).toMatchObject({ ok: true })
 }
@@ -242,5 +242,26 @@ describe("serve: OpenAI-compatible accounts from the resource pool (WP-13b)", ()
     expect(api.turns()[0]!.body).toMatchObject({ model: "vendor/model-x", max_tokens: 321, provider: { sort: "latency" } })
     // The key is never in a status line or a problem.
     expect(JSON.stringify(llmResources())).not.toContain("sk-or-test-key")
+
+    // "Prefer the fastest provider" switched off: a new instance (same key shown), whose turns ask for no sorting.
+    const admin = await connect()
+    await admin.admin(TEST_ADMIN_PASSWORD)
+    const sorted = server!.handle.resources.llmFor("alpha")
+    await saveShared(admin, "s1", { OPENROUTER_SORT_BY_LATENCY: false })
+    await until("alpha on an unsorted instance", () => {
+      const now = server!.handle.resources.llmFor("alpha")
+      return now !== undefined && now !== sorted
+    })
+    expect((await typed(voice2, "alpha", "again", "t4")).reply).toBe("or|vendor/model-x|again")
+    expect(api.turns().at(-1)!.body.provider).toBeUndefined()
+    // And on again: the turns sort by latency again.
+    const unsorted = server!.handle.resources.llmFor("alpha")
+    await saveShared(admin, "s2", { OPENROUTER_SORT_BY_LATENCY: true })
+    await until("alpha on a sorted instance", () => {
+      const now = server!.handle.resources.llmFor("alpha")
+      return now !== undefined && now !== unsorted
+    })
+    await typed(voice2, "alpha", "once more", "t5")
+    expect(api.turns().at(-1)!.body).toMatchObject({ provider: { sort: "latency" } })
   })
 })

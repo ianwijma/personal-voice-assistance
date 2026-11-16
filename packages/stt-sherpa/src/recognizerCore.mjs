@@ -668,13 +668,17 @@ export const makeRecognizerCore = (deps) => {
   // different microphone settings share the worker). VADs and AGCs are reused per set of options: a session that
   // ends gives its VAD back (reset), so the one loaded at startup serves the first session with the default
   // threshold as before, and a new one is created only while more sessions with those options are open at once
-  // than ever before.
+  // than ever before. At most IDLE_VADS_MAX detectors wait idle (any thresholds): giving back one more drops the
+  // longest idle, so thresholds saved one after another do not keep a detector each (its native memory goes with
+  // its wrapper, at the next collection).
 
   /** Open sessions by id. */
   const sessions = new Map()
   const defaultThreshold = config.vad?.threshold
-  /** Idle VADs by threshold, idle AGCs by their options. */
-  const idleVads = new Map()
+  /** Idle VADs, longest idle first, with their threshold; idle AGCs by their options. */
+  const IDLE_VADS_MAX = 4
+  /** @type {Array<{ key: string, vad: any }>} */
+  const idleVads = []
   const idleAgcs = new Map()
   const idle = (pool, key) => {
     let list = pool.get(key)
@@ -684,10 +688,16 @@ export const makeRecognizerCore = (deps) => {
     }
     return list
   }
-  if (deps.vad) idle(idleVads, String(defaultThreshold)).push(deps.vad)
+  const giveBackVad = (threshold, vad) => {
+    idleVads.push({ key: String(threshold), vad })
+    if (idleVads.length > IDLE_VADS_MAX) idleVads.shift()
+  }
+  if (deps.vad) giveBackVad(defaultThreshold, deps.vad)
   if (deps.agc) idle(idleAgcs, JSON.stringify(config.agc ?? {})).push(deps.agc)
   const takeVad = (threshold) => {
-    const vad = idle(idleVads, String(threshold)).pop() ?? deps.makeVad?.(threshold)
+    let i = idleVads.length - 1
+    while (i >= 0 && idleVads[i].key !== String(threshold)) i--
+    const vad = i >= 0 ? idleVads.splice(i, 1)[0].vad : deps.makeVad?.(threshold)
     if (!vad) throw new Error("No voice-activity detector for another session (makeVad not given)")
     return vad
   }
@@ -707,7 +717,7 @@ export const makeRecognizerCore = (deps) => {
     sessions.delete(id)
     s.state.end()
     s.state.vad.reset()
-    idle(idleVads, String(s.threshold)).push(s.state.vad)
+    giveBackVad(s.threshold, s.state.vad)
     if (s.state.agc) {
       s.state.agc.reset()
       idle(idleAgcs, JSON.stringify(s.agc)).push(s.state.agc)
@@ -770,6 +780,7 @@ export const makeRecognizerCore = (deps) => {
         retainedStreamingFrames,
         pieces,
         sessions: sessions.size,
+        idleVads: idleVads.length,
         stats: { ...stats }
       }
     }

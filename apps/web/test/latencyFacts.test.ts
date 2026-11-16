@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest"
 import { exampleAssistantInfo, exampleWeatherModule } from "@pva/protocol/examples"
 import type { AssistantInfo, TraceConfig, TraceInfo } from "@pva/protocol"
 import { prettyVoice } from "@/lib/assistants.ts"
-import { changedSince, chosenBy, factsOf, type LatencyContext, ROUTE_FILTERS, TRACE_COLUMNS, voiceLabel } from "@/components/settings/latency.tsx"
+import { changedSince, chosenBy, factsOf, type LatencyContext, ROUTE_FILTERS, TRACE_COLUMNS, traceKeys, voiceLabel } from "@/components/settings/latency.tsx"
 
 const assistant: AssistantInfo = {
   ...exampleAssistantInfo,
@@ -142,6 +142,18 @@ describe("latency page: what changed since a turn", () => {
     expect(changedSince(trace({ config: config({ tools: 0 }) }), ctx({ modules: [] }))).toEqual([])
   })
 
+  it("counts no tools for a Claude subscription assistant that may not use its modules", () => {
+    const sub = { account: "claude-subscription", model: "claude-haiku-5-5", effort: "low", thinking: "off", maxTokens: 1024 } as const
+    const gated = now({ llm: { ...assistant.llm, ...sub, useModules: false } })
+    // The server recorded 0 tools (modules switched on, but the subscription may not use them): nothing changed.
+    expect(changedSince(trace({ config: config({ llm: sub, tools: 0 }) }), ctx({ assistants: [gated] }))).toEqual([])
+    // Let it use them again: its modules' tools count.
+    const allowed = now({ llm: { ...assistant.llm, ...sub, useModules: true } })
+    expect(changedSince(trace({ config: config({ llm: sub, tools: 0 }) }), ctx({ assistants: [allowed] }))).toEqual(["tools 0 → 1"])
+    // The switch means nothing for another account.
+    expect(changedSince(trace(), ctx({ assistants: [now({ llm: { ...assistant.llm, useModules: false } })] }))).toEqual([])
+  })
+
   it("compares hearing engine, model, language and pauses when the same assistant still hears", () => {
     const h = now({ hearing: { ...assistant.hearing, model: "large", language: "nl", eagerSilenceMs: 200 } })
     expect(changedSince(trace(), ctx({ assistants: [h] }))).toEqual(["hearing model <small> → <large>", "hearing language en → nl", "early pause 300 → 200"])
@@ -178,5 +190,21 @@ describe("latency page: what changed since a turn", () => {
 
   it("reports nothing for a turn without an assistant", () => {
     expect(changedSince(trace({ assistant: undefined }), ctx({ assistants: [now({ replyEarly: false })] }))).toEqual([])
+  })
+})
+
+describe("latency page: trace keys", () => {
+  it("keeps a row's key when a newer trace arrives, and tells devices, assistants and repeated turn numbers apart", () => {
+    const a = trace({ turnId: 1 })
+    const b = trace({ turnId: 1, deviceId: "d2" })
+    const c = trace({ turnId: 1, assistant: { id: "keuken", name: "Keuken" } })
+    const before = traceKeys([a, b, c])
+    expect(new Set(before).size).toBe(3)
+    // Another device finishes a turn: the earlier rows keep their keys.
+    expect(traceKeys([a, b, c, trace({ turnId: 2, deviceId: "d3" })]).slice(0, 3)).toEqual(before)
+    // A device whose turn numbers started over: the same number again gets its own key, and the first keeps its own.
+    const again = traceKeys([a, b, c, trace({ turnId: 1 })])
+    expect(again.slice(0, 3)).toEqual(before)
+    expect(new Set(again).size).toBe(4)
   })
 })

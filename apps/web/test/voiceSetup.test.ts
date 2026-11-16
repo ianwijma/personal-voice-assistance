@@ -213,9 +213,20 @@ describe("one conversation per assistant", () => {
     expect(turnsOf(s, "jeff").map((t) => t.userText)).not.toContain("Start a thread")
     s = run([history("t3", "Earlier")], s)
     expect(turnsOf(s, "t3").map((t) => t.userText)).toEqual(["Earlier", "Start a thread"])
-    // Once it is committed the server's history has it: no twin.
-    s = run([history("t3", "Earlier", "Start a thread")], s)
-    expect(turnsOf(s, "t3").map((t) => t.userText)).toEqual(["Earlier", "Start a thread"])
+  })
+
+  it("a running turn asking what an earlier exchange asked survives a read of the history (equal text is not the same turn)", () => {
+    // T3 answered "Hello" before; "Hello" again is running (streaming) when the chat reads T3's history, which the server
+    // commits only when a turn ends: it still ends with the first exchange.
+    let s = run([welcomeWith(setup()), history("t3", "Hello"), turnStart(8, "t3", "Hello")])
+    s = run([{ type: "assistant.text", turnId: 8, clause: null, text: "Hi again", assistantId: "t3" }, history("t3", "Hello")], s)
+    const t3 = turnsOf(s, "t3")
+    expect(t3.map((t) => t.userText)).toEqual(["Hello", "Hello"])
+    expect(t3[1]).toMatchObject({ turnId: 8, text: "Hi again" })
+    expect(t3[1]!.outcome).toBeUndefined()
+    // Its next delta and its end land on the same turn.
+    s = run([{ type: "assistant.text", turnId: 8, clause: null, text: ".", assistantId: "t3" }, turnEnd(8)], s)
+    expect(turnsOf(s, "t3").map((t) => [t.userText, t.text, t.outcome])).toEqual([["Hello", "re: Hello", "completed"], ["Hello", "Hi again.", "completed"]])
   })
 
   it("a history that ends with the message a running turn is answering does not show it twice", () => {
@@ -231,6 +242,43 @@ describe("one conversation per assistant", () => {
     expect(turnsOf(s, "t3")[1]!.turnId).toBe(7)
     // The turn's end finds it and completes it.
     expect(turnsOf(run([turnEnd(7)], s), "t3")[1]!.outcome).toBe("completed")
+  })
+
+  it("a welcome during T3's follow-up window files the snapshot's history under T3 (snapshot.answering), not under who answers without a phrase", () => {
+    const s = run([welcomeWith(setup(), { answering: "t3" })])
+    expect(turnsOf(s, "t3").map((t) => t.userText)).toEqual(["What's the weather like?", "Tell me a long story"])
+    expect(turnsOf(s, "jeff")).toEqual([])
+    expect(s.conversations.t3!.loaded).toBe(true)
+    expect(needsRead(s, "jeff")).toBe(true) // Jeff's own history is read when the chat shows it
+    expect(holderOf(s)).toBe("t3")
+    // The answering assistant is the one that answers anyway: nobody holds the turn.
+    const plain = run([welcomeWith(setup(), { answering: "jeff" })])
+    expect(turnsOf(plain, "jeff")).toHaveLength(2)
+    expect(needsRead(plain, "t3")).toBe(true)
+    expect(holderOf(plain)).toBeUndefined()
+  })
+
+  it("the server's holder on state: a window that closes while the device keeps listening gives the turn back", () => {
+    const base = () => run([welcomeWith(setup()), { type: "state", state: "listening" }])
+    let s = run([turnStart(1, "t3"), turnEnd(1), { type: "state", state: "listening", holder: "t3" }], base())
+    expect(holderOf(s)).toBe("t3")
+    expect(answeringId(s)).toBe("t3")
+    // T3's follow-up window lapsed; the state stays listening.
+    s = run([{ type: "state", state: "listening", holder: null }], s)
+    expect(holderOf(s)).toBeUndefined()
+    expect(answeringId(s)).toBe("jeff")
+    expect(stripAssistantId(s)).toBeUndefined()
+    expect(newConversationTip(s)).toBe("New conversation with Jeff (T3 keeps its own)")
+    // A turn in flight keeps the assistant its turn.start named; a state without holder (a server that does not say) keeps it too.
+    s = run([turnStart(2, "t3"), { type: "state", state: "thinking", turnId: 2, holder: null }], s)
+    expect(holderOf(s)).toBe("t3")
+    expect(holderOf(run([{ type: "state", state: "listening" }], s))).toBe("t3")
+    // An armed window that lapses ends "Listening…" for its assistant.
+    const armed = run([{ type: "wake", phrase: "hey t3", armed: true, assistantId: "t3" }, { type: "state", state: "listening", holder: "t3" }], base())
+    expect(armed.woke).toBeDefined()
+    const lapsed = run([{ type: "state", state: "listening", holder: null }], armed)
+    expect(lapsed.woke).toBeUndefined()
+    expect(holderOf(lapsed)).toBeUndefined()
   })
 
   it("a pick accepted on this page clears who has the turn", () => {

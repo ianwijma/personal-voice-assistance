@@ -77,7 +77,7 @@ page share the bounds, as `frontends.ts` does today). Types are written as their
 ### 2.1 Ids and limits
 
 ```ts
-AssistantId   = String, /^[a-z][a-z0-9-]{0,31}$/   // made from the name at creation ("jeff", "t3", "keuken-2"), never changed
+AssistantId   = String, /^[a-z][a-z0-9-]{0,31}$/   // made from the name at creation ("jeff", "t3", "keuken-2"), never changed; never "typesafe" (device.pick's "whichever fits")
 DeviceKind    = FrontendKindId                     // "web-voice" (Browsers); "voice-node" is added by voice nodes (§5.1)
 DeviceId      = existing (protocol/frontends.ts:34)
 ModuleId      = existing; ToolName = String ≤ 64; FieldKey = existing settings key
@@ -633,9 +633,12 @@ DeviceSetup = { type: "device.setup", deviceId?,
 TurnStart       += { assistantId }      // also assistant.text, reply.start: assistantId
 Conversation    += { assistantId }      // conversation { id, reason, startedAt, assistantId }
 Wake            += { assistantId }
+State           += { holder?: AssistantId | null }   // who has the turn (open armed / follow-up window, reply playing);
+                                        // sent again with the same state when a window closes while listening
 Snapshot.conversations = Array<{ assistantId, id, startedAt, turns: number }>   // replaces snapshot.conversation
 Snapshot.history       = the history of the answering assistant (the follow-up holder, else withoutPhrase's, else
                          the first); the others are fetched on demand:
+Snapshot.answering     = that assistant (the page files `history` under it)
 ConversationHistory = { type: "conversation.history", requestId, assistantId, id, history: HistoryItem[] }
 
 // voice → server

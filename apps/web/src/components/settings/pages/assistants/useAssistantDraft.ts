@@ -122,14 +122,26 @@ export const useAssistantDraft = (info: AssistantInfo): AssistantDraft => {
     save: async (options = {}) => {
       const edited = state.edited
       if (edited === undefined || saving || Object.keys(state.localErrors).length > 0) return { kind: "refused", code: "internal", message: "Nothing to save." }
+      if (edited.name.trim() === "") {
+        // The protocol refuses an empty name before it is sent (the request would throw): say so on the field.
+        const fieldErrors = [{ key: "name", message: "Enter a name." }]
+        setState((s) => ({ ...s, errors: fieldErrors, warnings: [], message: undefined }))
+        return { kind: "invalid", message: "Enter a name.", fieldErrors }
+      }
       setSaving(true)
       setJustSaved(false)
-      const outcome = await client.saveAssistant({ ...edited, rev: state.rev }, options.saveAnyway === true ? { saveAnyway: true } : {}) // continuation(state): the draft state is read again when the answer comes
+      let outcome: Outcome
+      try {
+        outcome = await client.saveAssistant({ ...edited, rev: state.rev }, options.saveAnyway === true ? { saveAnyway: true } : {}) // continuation(state): the draft state is read again when the answer comes
+      } catch {
+        outcome = { kind: "refused", code: "internal", message: "Could not save. Try again." }
+      }
       setSaving(false)
       switch (outcome.kind) {
         case "ok":
           setAwaiting(edited)
-          setState(clean(edited.rev + 1))
+          // Edits made while the save was on its way are kept, on top of the revision just saved.
+          setState((s) => s.edited === edited ? clean(edited.rev + 1) : { ...clean(edited.rev + 1), edited: s.edited === undefined ? undefined : { ...s.edited, rev: edited.rev + 1 }, localErrors: s.localErrors })
           setJustSaved(true)
           break
         case "stale":
