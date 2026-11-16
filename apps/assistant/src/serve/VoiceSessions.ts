@@ -22,7 +22,9 @@ export interface VoiceSessionsOptions {
   readonly make: (
     key: string,
     device: { readonly id: string; readonly name: string } | undefined,
-    initial: ConversationInfo | undefined
+    initial: ConversationInfo | undefined,
+    /** Ids reserved for other assistants of the device (`conversation(key, assistant)`), by assistant. */
+    others?: ReadonlyMap<string, ConversationInfo>
   ) => Effect.Effect<VoiceSession, never, Scope.Scope>
   /** `MAX_VOICE_SESSIONS`, live. */
   readonly max: () => number
@@ -46,8 +48,12 @@ export interface VoiceSessions {
   readonly open: (key: string, device: { readonly id: string; readonly name: string } | undefined) => VoiceSession | "full"
   /** The device's connections now (0 starts the discard timer, more cancels it). */
   readonly connections: (key: string, count: number) => void
-  /** The device's conversation: its session's, else the one its first turn will start in. */
-  readonly conversation: (key: string) => ConversationInfo
+  /**
+   * The device's conversation: its session's, else the one its first turn will start in. `assistant`: that
+   * assistant's in the session, else an id reserved for it (the session gives it to that assistant). Without a
+   * session, leave `assistant` out for the one that will answer: the device's id is its.
+   */
+  readonly conversation: (key: string, assistant?: string) => ConversationInfo
   /**
    * `conversation.new` on a device: `assistant`'s conversation in its session (absent: the answering assistant's),
    * else a new reserved id (announced).
@@ -72,6 +78,8 @@ const MAX_RESERVED = 64
 export const makeVoiceSessions = (options: VoiceSessionsOptions): VoiceSessions => {
   const sessions = new Map<string, { readonly session: VoiceSession; readonly scope: Scope.Closeable }>()
   const reserved = new Map<string, ConversationInfo>()
+  /** Per device, ids reserved for its other assistants (`conversation(key, assistant)`). */
+  const reservedOthers = new Map<string, Map<string, ConversationInfo>>()
   const timers = new Map<string, ReturnType<typeof setTimeout>>()
   const traces: Array<TraceInfo> = []
   let closed = false
@@ -81,6 +89,18 @@ export const makeVoiceSessions = (options: VoiceSessionsOptions): VoiceSessions 
     reserved.delete(key)
     reserved.set(key, info)
     while (reserved.size > MAX_RESERVED) reserved.delete(reserved.keys().next().value!)
+    return info
+  }
+  const reservedOther = (key: string, assistant: string): ConversationInfo => {
+    const byAssistant = reservedOthers.get(key) ?? new Map<string, ConversationInfo>()
+    reservedOthers.delete(key)
+    reservedOthers.set(key, byAssistant)
+    while (reservedOthers.size > MAX_RESERVED) reservedOthers.delete(reservedOthers.keys().next().value!)
+    let info = byAssistant.get(assistant)
+    if (info === undefined) {
+      info = fresh()
+      byAssistant.set(assistant, info)
+    }
     return info
   }
 
@@ -95,6 +115,7 @@ export const makeVoiceSessions = (options: VoiceSessionsOptions): VoiceSessions 
     if (entry === undefined) return
     sessions.delete(key)
     reserved.delete(key)
+    reservedOthers.delete(key)
     options.onDiscard(key)
     options.onChange(false)
     options.run(stop(entry))
@@ -130,7 +151,9 @@ export const makeVoiceSessions = (options: VoiceSessionsOptions): VoiceSessions 
       const scope = options.runSync(Scope.make())
       const initial = reserved.get(key)
       reserved.delete(key)
-      const session = options.runSync(Scope.provide(options.make(key, device, initial), scope))
+      const others = reservedOthers.get(key)
+      reservedOthers.delete(key)
+      const session = options.runSync(Scope.provide(options.make(key, device, initial, others), scope))
       sessions.set(key, { session, scope })
       session.conversation.start()
       options.onChange(false)
@@ -146,7 +169,11 @@ export const makeVoiceSessions = (options: VoiceSessionsOptions): VoiceSessions 
       timer.unref?.()
       timers.set(key, timer)
     },
-    conversation: (key) => sessions.get(key)?.session.conversation.conversation() ?? reserved.get(key) ?? reserve(key, fresh()),
+    conversation: (key, assistant) => {
+      const session = sessions.get(key)?.session
+      if (session !== undefined) return session.conversation.conversation(assistant)
+      return assistant === undefined ? reserved.get(key) ?? reserve(key, fresh()) : reservedOther(key, assistant)
+    },
     newConversation: (key, assistant) =>
       Effect.suspend(() => {
         const session = sessions.get(key)?.session

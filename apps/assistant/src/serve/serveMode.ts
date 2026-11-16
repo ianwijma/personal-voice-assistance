@@ -426,7 +426,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       return stt === undefined ? "unknown" : `${stt.provider} ${stt.detail}`
     }
     const sessions: VoiceSessions = makeVoiceSessions({
-      make: (key, device, initial) =>
+      make: (key, device, initial, others) =>
         makeVoiceSession({
           key,
           ...(device !== undefined ? { deviceId: device.id } : {}),
@@ -447,6 +447,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
           },
           minuteMs,
           ...(initial !== undefined ? { initialConversation: initial } : {}),
+          ...(others !== undefined ? { reservedConversations: others } : {}),
           ...(options.stallMs !== undefined ? { stallMs: options.stallMs } : {}),
           heard: {
             dir: recordings,

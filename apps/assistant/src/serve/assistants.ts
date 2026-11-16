@@ -30,7 +30,7 @@ import {
   validateDeviceSettings,
   type WithoutPhrase
 } from "@pva/protocol"
-import { Effect } from "effect"
+import { Effect, Semaphore } from "effect"
 import { deviceListInfos, deviceSettingsFrom, deviceTypeInfos, typeSettingsFrom } from "./devices.ts"
 import { EntitySaveError, type SettingsStore, SettingsStoreError } from "./SettingsStore.ts"
 import type { VoiceSessions } from "./VoiceSessions.ts"
@@ -189,6 +189,27 @@ export const makeAssistants = (options: AssistantsOptions): Assistants => {
     return out as DeviceOwn
   }
 
+  /**
+   * A type's new defaults checked on every device of the type: a device follows the sections it has no own value
+   * for, so its own `withoutPhrase` may name an assistant the new defaults drop from its list. Only problems the
+   * device did not have before count.
+   */
+  const inheritorsRefusal = (kind: string, next: DeviceSettings): AssistantResult | undefined => {
+    const file = store.settings()
+    const type = deviceTypeOf(kind)
+    if (type === undefined) return undefined
+    const ids = knownIds()
+    for (const [id, record] of Object.entries(file.devices)) {
+      if (record.kind !== kind) continue
+      const own = applicableOwn(type, record.own)
+      const old = new Set(validateDeviceSettings(effectiveDeviceSettings(type.builtIn, file.deviceTypes[kind], own), ids).errors.map((e) => e.path))
+      const fresh = validateDeviceSettings(effectiveDeviceSettings(type.builtIn, next, own), ids).errors.filter((e) => !old.has(e.path))
+      if (fresh.length === 0) continue
+      return fail("invalid_settings", `${record.name || id} follows these defaults and would no longer hold together: ${fresh[0]!.message} Change that device first.`)
+    }
+    return undefined
+  }
+
   const saveDevice: Assistants["saveDevice"] = (message) =>
     Effect.suspend(() => {
       const file = store.settings()
@@ -207,6 +228,8 @@ export const makeAssistants = (options: AssistantsOptions): Assistants => {
         const next = { ...before, ...Object.fromEntries(Object.entries(patch).filter(([, v]) => v !== undefined)) } as DeviceSettings
         const refused = settingsRefusal(next, before, saveAnyway)
         if (refused !== undefined) return Effect.succeed(refused)
+        const inherited = inheritorsRefusal(target.type, next)
+        if (inherited !== undefined) return Effect.succeed(inherited)
         return store.saveDeviceType(target.type, message.rev, next).pipe(
           Effect.as(OK),
           Effect.catch((e) => Effect.succeed(entityFailure(e)))
@@ -374,14 +397,21 @@ export const makeAssistants = (options: AssistantsOptions): Assistants => {
       )
     })
 
+  /**
+   * The changes check against the committed settings and then save them, so two at once must not interleave: both
+   * would check the same state (two creates named "Desk" would both pass the unique-name check). One at a time.
+   */
+  const serial = Semaphore.makeUnsafe(1)
+  const one = <A extends ReadonlyArray<unknown>>(f: (...args: A) => Effect.Effect<AssistantResult>) => (...args: A) => serial.withPermit(f(...args))
+
   return {
     deviceTypes: () => deviceTypeInfos(store.settings()),
     devices: (base) => deviceListInfos(store.settings(), base),
     infos,
-    setupFor, create,
-    save,
-    remove,
-    saveDevice,
-    pick
+    setupFor, create: one(create),
+    save: one(save),
+    remove: one(remove),
+    saveDevice: one(saveDevice),
+    pick: one(pick)
   }
 }
