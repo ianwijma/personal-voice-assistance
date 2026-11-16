@@ -4,7 +4,7 @@
 import { Llm, type LlmEvent, LlmError } from "@pva/core"
 import type { AssistantLlm } from "@pva/protocol"
 import { Deferred, Effect, Exit, Scope, Stream } from "effect"
-import { afterEach, describe, expect, it } from "vitest"
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import {
   llmConfigOf,
   llmKeyOf,
@@ -17,7 +17,6 @@ import {
   type ResourcePool,
   type ResourcePoolOptions
 } from "../src/serve/Resources.ts"
-import { sleep } from "./support/scriptedClient.ts"
 
 const anthropic = (model: string, over: Partial<AssistantLlm> = {}): AssistantLlm => ({
   account: "anthropic",
@@ -54,10 +53,20 @@ const fakeBuilder = () => {
   return { build, builds, released, holds, failWith }
 }
 
+// The pool schedules its releases with `setTimeout`, so the clock is faked: nothing is released until the test moves
+// time forward, and a slow runner cannot make an eviction fire early. Only the timer functions are faked; Effect's own
+// scheduling keeps running on real microtasks.
+beforeEach(() => {
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] })
+})
+/** Moves the fake clock forward and lets everything that became due (releases, finalizers) finish. */
+const advance = (ms: number) => vi.advanceTimersByTimeAsync(ms)
+
 let scope: Scope.Closeable | undefined
 afterEach(async () => {
   if (scope !== undefined) await Effect.runPromise(Scope.close(scope, Exit.void))
   scope = undefined
+  vi.useRealTimers()
 })
 const makePool = async (options: ResourcePoolOptions): Promise<ResourcePool> => {
   scope = Effect.runSync(Scope.make())
@@ -80,11 +89,13 @@ describe("resource pool: sharing and release", () => {
     expect(pool.keyFor("a")).toBeUndefined()
     expect(pool.llmFor("b")).toBe(shared)
     expect(pool.status()).toMatchObject([{ state: "ready", usedBy: ["b"] }])
-    await sleep(100)
+    await advance(100)
     expect(fake.released).toEqual([])
     await run(pool.reconcile(wanted({})))
     expect(pool.status()).toMatchObject([{ state: "unused", usedBy: [] }])
-    await sleep(100)
+    await advance(39)
+    expect(fake.released).toEqual([])
+    await advance(1)
     expect(fake.released).toEqual(["m#1"])
     expect(pool.status()).toEqual([])
   })
@@ -99,7 +110,9 @@ describe("resource pool: sharing and release", () => {
     await run(pool.reconcile(wanted({ a: spec("old") })))
     expect(pool.llmFor("a")).toBe(old)
     expect(fake.builds).toEqual(["old", "new"])
-    await sleep(150)
+    await advance(59)
+    expect(fake.released).toEqual([])
+    await advance(1)
     // "new" is the one nobody uses now; "old" was never released.
     expect(fake.released).toEqual(["new#2"])
     expect(await ask(pool.llmFor("a"))).toBe("old#1")
@@ -138,11 +151,12 @@ describe("resource pool: sharing and release", () => {
     fake.holds.set("slow", gate)
     const pool = await makePool({ buildLlm: fake.build, graceMs: 20 })
     const first = run(pool.reconcile(wanted({ a: spec("slow") })))
-    await sleep(10)
+    await advance(10)
+    expect(fake.builds).toEqual(["slow"])
     await run(pool.reconcile(wanted({})))
     Deferred.doneUnsafe(gate, Exit.void)
     await first
-    await sleep(80)
+    await advance(80)
     expect(pool.status()).toEqual([])
     // Whatever the build produced is closed: the finalizer it registered ran (or it never registered one).
     expect(fake.released.length).toBe(fake.builds.length)
@@ -157,10 +171,16 @@ describe("resource pool: sharing and release", () => {
     // The new instance settled as failed: the assistant is bound to it and gets its problem on the next turn.
     expect(pool.keyFor("a")).toBe(llmKeyOf(spec("bad")))
     await expect(ask(pool.llmFor("a"))).rejects.toThrow("bad model")
-    // Switching back to the working configuration within the grace period needs no new build.
+    // Switching back to the working configuration within the grace period needs no new build. The fake clock has not
+    // moved, so "good"'s release timer cannot have fired, however slow the machine is.
+    expect(fake.released).toEqual([])
     await run(pool.reconcile(wanted({ a: spec("good") })))
     expect(await ask(pool.llmFor("a"))).toBe("good#1")
     expect(fake.builds).toEqual(["good", "bad"])
+    // Once the grace period has passed nothing is released: "good" is in use again, and "bad" holds nothing.
+    await advance(20)
+    expect(fake.released).toEqual([])
+    expect(await ask(pool.llmFor("a"))).toBe("good#1")
   })
 })
 
@@ -236,10 +256,8 @@ describe("resource pool: error paths", () => {
 })
 
 describe("resource pool: shutdown", () => {
-  it("closing the pool releases every instance, builds still running included, and later reconciles do nothing", async () => {
+  it("closing the pool releases every unused instance and later reconciles do nothing", async () => {
     const fake = fakeBuilder()
-    const gate = Deferred.makeUnsafe<void>()
-    fake.holds.set("slow", gate)
     const pool = await makePool({ buildLlm: fake.build, graceMs: 60_000 })
     await run(pool.reconcile(wanted({ a: spec("one") })))
     await run(pool.reconcile(wanted({})))
@@ -251,6 +269,41 @@ describe("resource pool: shutdown", () => {
     await run(pool.reconcile(wanted({ a: spec("two") })))
     expect(fake.builds).toEqual(["one"])
     expect(pool.llmFor("a")).toBeUndefined()
+  })
+
+  it("closing the pool while a build is still running stops that build, releases the others and lets the waiting reconcile finish", async () => {
+    const fake = fakeBuilder()
+    const gate = Deferred.makeUnsafe<void>()
+    fake.holds.set("slow", gate)
+    const pool = await makePool({ buildLlm: fake.build, graceMs: 60_000 })
+    await run(pool.reconcile(wanted({ a: spec("one") })))
+    let finished = false
+    const pending = run(pool.reconcile(wanted({ a: spec("one"), b: spec("slow") }))).then(() => {
+      finished = true
+    })
+    await advance(10)
+    // The build of "slow" is under way and held at the gate; the pool is not done reconciling.
+    expect(fake.builds).toEqual(["one", "slow"])
+    expect(pool.status()).toMatchObject([{ state: "ready" }, { state: "starting" }])
+    expect(finished).toBe(false)
+
+    await Effect.runPromise(Scope.close(scope!, Exit.void))
+    scope = undefined
+    await pending
+    expect(finished).toBe(true)
+    expect(pool.status()).toEqual([])
+    expect(pool.llmFor("a")).toBeUndefined()
+    expect(pool.llmFor("b")).toBeUndefined()
+    // "one" was released; "slow" never got as far as holding anything.
+    expect(fake.released).toEqual(["one#1"])
+
+    // Letting the abandoned build go changes nothing, and neither does a later reconcile.
+    Deferred.doneUnsafe(gate, Exit.void)
+    await advance(10)
+    await run(pool.reconcile(wanted({ a: spec("two") })))
+    expect(fake.builds).toEqual(["one", "slow"])
+    expect(fake.released).toEqual(["one#1"])
+    expect(pool.status()).toEqual([])
   })
 })
 
