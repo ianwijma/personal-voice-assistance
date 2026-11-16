@@ -60,7 +60,7 @@ export function StateLabel() {
     tone === "faint" && "text-ink-faint"
   )
   return (
-    <div data-testid="state-label-box" className="mt-4 grid min-h-4 w-full max-w-[calc(100%-32px)] shrink-0 items-start justify-items-center short:mt-2">
+    <div data-testid="state-label-box" className="stage-legible mt-4 grid min-h-4 w-full max-w-[calc(100%-32px)] shrink-0 items-start justify-items-center short:mt-2">
       {reserve !== undefined && <span aria-hidden="true" className="label invisible col-start-1 row-start-1 select-none break-words text-center">{reserve}</span>}
       <p data-testid="state-label" className={cx("label col-start-1 row-start-1 break-words text-center transition-colors duration-[240ms] ease-out", colour)}>
         {text}
