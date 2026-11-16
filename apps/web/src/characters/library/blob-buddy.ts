@@ -199,8 +199,19 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
 
       // Body half-sizes (area-preserving squash).
       const st = stretch * (1 + 0.1 * Math.max(0, beat)) * (1 + land)
-      const a = shapeA * s * size / Math.sqrt(st)
-      const b = shapeB * s * size * st
+      let a = shapeA * s * size / Math.sqrt(st)
+      let b = shapeB * s * size * st
+      // Headroom: what the antenna adds above the body (from last frame's angle: close enough to
+      // bound the tip). Where the scale is set by the height (a wide stage), a puffed, stretched
+      // body with its antenna up can stand taller than the room above the ground even without a
+      // hop; then it squashes just enough to fit (area kept), so its tip stays in the frame.
+      const angPrev = antenna.value
+      const antennaReach = -0.02 * s + Math.cos(angPrev) * 0.42 * s * (0.95 + 0.1 * size) * (1 - 0.25 * Math.abs(Math.sin(angPrev))) + 0.075 * s
+      const bRoom = (ground - 1 - antennaReach) / 2
+      if (b > bRoom && bRoom > 0) {
+        a *= Math.sqrt(b / bRoom)
+        b = bRoom
+      }
       const nod = reduced ? 0 : S.nod * 0.06 * s
 
       // ---- Colours.
@@ -232,8 +243,7 @@ const create = (canvas: HTMLCanvasElement): CharacterInstance => {
 
       // Body frame: origin at the contact point, tilted about it, lifted by the hop. A hop never
       // lifts the antenna tip out of the frame (a big, animated hop on a tall pose in a small tile).
-      const angPrev = antenna.value // last frame's antenna angle: close enough to bound the tip
-      const reach = 2 * b - 0.02 * s + Math.cos(angPrev) * 0.42 * s * (0.95 + 0.1 * size) * (1 - 0.25 * Math.abs(Math.sin(angPrev))) + 0.075 * s
+      const reach = 2 * b + antennaReach
       // (The gumdrop at normal expressiveness keeps today's hop exactly, even where its tip grazes the top.)
       const asDesigned = shapeB === 0.72 ? (hop * s) / Math.max(1, S.expr) : 0
       const lift = Math.min(hop * s, Math.max(0, ground - 1 - reach, asDesigned))

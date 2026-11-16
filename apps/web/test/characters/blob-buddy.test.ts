@@ -105,8 +105,7 @@ describe("blob buddy: stays in its frame", () => {
   }
   for (const bodyShape of ["round", "tall"]) {
     it(`${bodyShape} in the smallest tile keeps its antenna below the top edge while hopping at the strongest expressiveness`, hopping(bodyShape, [160, 140, 1]))
-    // BUG (see the PR description): on a large canvas the tip rises above the top edge, by up to ~14 px (tall, 900×420).
-    it.fails(`${bodyShape} on a 900×420 stage keeps its antenna below the top edge while hopping at the strongest expressiveness`, hopping(bodyShape, [900, 420, 1]))
+    it(`${bodyShape} on a 900×420 stage keeps its antenna below the top edge while hopping at the strongest expressiveness`, hopping(bodyShape, [900, 420, 1]))
   }
 })
 
