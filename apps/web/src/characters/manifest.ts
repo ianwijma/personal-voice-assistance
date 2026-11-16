@@ -9,6 +9,8 @@ import { optionProblems, reservedOptionProblems } from "./options.ts"
 export const SERVED_CONTRACTS: ReadonlyArray<number> = [CONTRACT_VERSION]
 /** The renderers this host can give a canvas for. */
 export const SERVED_RENDERERS: ReadonlyArray<string> = ["2d", "webgl2"]
+/** The canvas areas (`Character.canvas`) this host can give. */
+export const SERVED_CANVASES: ReadonlyArray<string> = ["box", "stage"]
 
 const FAMILIES = ["baseline", "abstract", "figure"]
 const ID = /^[a-z][a-z0-9]*(-[a-z0-9]+)*$/
@@ -28,6 +30,7 @@ export const manifestProblems = (c: unknown, id: string): ReadonlyArray<string> 
   if (typeof c.contract !== "number" || !SERVED_CONTRACTS.includes(c.contract)) out.push(`contract ${JSON.stringify(c.contract)} is not served (this host serves ${SERVED_CONTRACTS.join(", ")})`)
   if (typeof c.family !== "string" || !FAMILIES.includes(c.family)) out.push(`family must be one of ${FAMILIES.join(", ")}`)
   if (typeof c.renderer !== "string" || !SERVED_RENDERERS.includes(c.renderer)) out.push(`renderer ${JSON.stringify(c.renderer)} is not served (this host serves ${SERVED_RENDERERS.join(", ")})`)
+  if (c.canvas !== undefined && !SERVED_CANVASES.includes(c.canvas as string)) out.push(`canvas ${JSON.stringify(c.canvas)} is not served (this host serves ${SERVED_CANVASES.join(", ")}, or leave it out for "box")`)
   if (typeof c.create !== "function") out.push("create(canvas) is missing")
   const modes = isObj(c.modes) ? c.modes : undefined
   for (const m of CORE_MODES) if (!text(modes?.[m])) out.push(`modes.${m} is missing`)

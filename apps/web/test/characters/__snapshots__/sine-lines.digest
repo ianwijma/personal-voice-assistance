@@ -1,4 +1,4 @@
-# sine-lines 1.0.0: frame digests of a scripted conversation at default settings (docs/CHARACTERS.md §6.6).
+# sine-lines 1.1.0: frame digests of a scripted conversation at default settings (docs/CHARACTERS.md §6.6).
 # A change here must be deliberate: check the look, then update with `pnpm --filter @pva/web exec vitest run test/characters -u`.
 dark  0.5 idle       1094 f8459ef9
 dark  1.0 listening  1094 52f7ded7
@@ -47,3 +47,26 @@ light 11.0 idle       1094 51975939
 overflow 160×140×1 0.0 px
 overflow 900×420×1 0.0 px
 overflow 720×240×2 0.0 px
+stage  0.5 idle       1094 c35da879
+stage  1.0 listening  1094 5d0cf657
+stage  1.5 listening  1094 ef79bad3
+stage  2.0 hearing    1094 2c859857
+stage  2.5 hearing    1094 ca95cdfd
+stage  3.0 hearing    1094 9fb09988
+stage  3.5 hearing    1094 36c92108
+stage  4.0 hearing    1094 14e6dc44
+stage  4.5 hearing    1094 a12ba48c
+stage  5.0 thinking   1214 81e6d4e9
+stage  5.5 thinking   1132 d76f9e94
+stage  6.0 thinking   1214 095d637f
+stage  6.5 speaking   1094 b5307f06
+stage  7.0 speaking   1094 505c18a6
+stage  7.5 speaking   1094 8ac2eb5a
+stage  8.0 speaking   1094 feca2083
+stage  8.5 speaking   1094 094fb4c9
+stage  9.0 speaking   1094 57dd11b3
+stage  9.5 listening  1094 af6f3ad7
+stage 10.0 listening  1094 c6137c1f
+stage 10.5 idle       1094 80cb1122
+stage 11.0 idle       1094 0f3fbce9
+stage 1280×800×1 focus 720×240 at 280,200: solid drawing x 280.0..1000.0, y 244.6..398.4
