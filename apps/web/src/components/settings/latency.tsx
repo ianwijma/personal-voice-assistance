@@ -125,12 +125,13 @@ const ALL_KNOBS: ReadonlyArray<LlmKnob> = ["model", "effort", "thinking", "maxTo
 /**
  * The language-model settings each account uses, as the server keeps them (`llmSpecOf`) and a turn's snapshot records
  * them (`traceConfigOf`). A setting an account does not use is recorded as a stand-in (offline: no model, effort low,
- * thinking off, 1024 tokens; OpenRouter and the home model: effort low, thinking off), whatever the assistant has saved,
+ * thinking off, 1024 tokens; OpenRouter and the home model: effort low, thinking off; the Claude subscription, which passes
+ * no token limit: 1024 tokens), whatever the assistant has saved,
  * so "changed since" does not compare it. An account the app does not know uses all of them.
  */
 export const LLM_KNOBS: Readonly<Record<string, ReadonlyArray<LlmKnob>>> = {
   anthropic: ALL_KNOBS,
-  "claude-subscription": ALL_KNOBS,
+  "claude-subscription": ["model", "effort", "thinking"],
   openrouter: ["model", "maxTokens"],
   "home-model": ["model", "maxTokens"],
   offline: []

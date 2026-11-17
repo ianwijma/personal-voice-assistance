@@ -168,6 +168,12 @@ export interface TurnSetup {
    */
   readonly tts?: Tts["Service"] | undefined
   /**
+   * The tool rounds this turn may use, fixed at its start. Absent: the agent set's `maxToolRounds`, else the
+   * conversation's. Serve mode sets it to the assistant's `toolRounds`, read with the rest of the setup, so a changed
+   * limit applies from the next turn start and the turn's configuration snapshot reports the limit it ran with.
+   */
+  readonly maxToolRounds?: number | undefined
+  /**
    * Completes once `tts.sampleRate` is final (a voice still being built). A spoken turn waits for it inside the turn,
    * just before it starts to play, so Stop, barge-in and a new conversation interrupt the wait, and a typed reply that
    * is not spoken never waits. Absent: `tts.sampleRate` is final already.

@@ -1,5 +1,5 @@
 import type { ConversationEvent, Message, Trace } from "@pva/core"
-import type { HistoryItem, ServerMessage, TraceInfo } from "@pva/protocol"
+import type { HistoryItem, ServerMessage, TraceConfig, TraceInfo } from "@pva/protocol"
 
 /**
  * Turns `ConversationEvent`s into protocol messages (docs/UI-AND-MODULES.md
@@ -77,7 +77,10 @@ export const traceInfo = (trace: Trace): TraceInfo => {
     ...(trace.assistant !== undefined ? { assistant: { id: trace.assistant.id, name: trace.assistant.name } } : {}),
     ...(trace.deviceId !== undefined ? { deviceId: trace.deviceId } : {}),
     ...(trace.device !== undefined ? { device: trace.device } : {}),
-    ...(trace.route !== undefined ? { route: { ...trace.route } } : {})
+    ...(trace.route !== undefined ? { route: { ...trace.route } } : {}),
+    // The configuration the turn began with (docs/ASSISTANTS.md §3.7): an object made at its start and never changed,
+    // shared by the traces of every turn that began with the same one.
+    ...(trace.config !== undefined ? { config: trace.config as TraceConfig } : {})
   }
 }
 
@@ -178,10 +181,10 @@ export const makePublisher = (options: PublisherOptions): Publisher => {
         const info = traceInfo(event.trace)
         traces.push(info)
         if (traces.length > MAX_TRACES) traces.shift()
-        // Admin's traces carry the session and the device (its name, which admin sets); the device's own tabs do not
-        // need them.
+        // Admin's traces carry the session, the device (its name, which admin sets) and the configuration snapshot;
+        // the device's own tabs do not need the first two and may not learn the model (docs/ASSISTANTS.md §5.3).
         options.onTrace?.(info)
-        const { session: _session, device: _device, deviceId: _deviceId, ...forDevice } = info
+        const { session: _session, device: _device, deviceId: _deviceId, config: _config, ...forDevice } = info
         options.broadcast({ type: "turn.end", turnId: event.turnId, outcome: event.outcome, trace: forDevice })
         if (event.outcome === "failed") {
           options.broadcast({

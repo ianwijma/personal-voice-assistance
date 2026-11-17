@@ -527,7 +527,7 @@ export const makeConversationWithSetup = Effect.fnUntraced(function*(options: Co
   return yield* makeConversationCore(
     {
       ...options,
-      setup: Effect.map(options.setup, (s): AgentTurnSetup => ({ system: s.system, registry: s.registry, agents: agentsFor(s.registry, s.llm ?? defaultLlm), ...(s.tts !== undefined ? { tts: s.tts } : {}), ...(s.ttsReady !== undefined ? { ttsReady: s.ttsReady } : {}) }))
+      setup: Effect.map(options.setup, (s): AgentTurnSetup => ({ system: s.system, registry: s.registry, agents: agentsFor(s.registry, s.llm ?? defaultLlm), ...(s.tts !== undefined ? { tts: s.tts } : {}), ...(s.maxToolRounds !== undefined ? { maxToolRounds: s.maxToolRounds } : {}), ...(s.ttsReady !== undefined ? { ttsReady: s.ttsReady } : {}) }))
     },
     true
   )
@@ -1029,7 +1029,7 @@ const makeConversationCore = Effect.fnUntraced(function*(options: AgentConversat
       const setup = plan.setup!
       const decision = plan.decision!
       const set = setup.agents
-      const maxToolRounds = set.maxToolRounds ?? options.maxToolRounds ?? 5
+      const maxToolRounds = setup.maxToolRounds ?? set.maxToolRounds ?? options.maxToolRounds ?? 5
 
       return Stream.unwrap(Effect.map(setup.registry.context, (context) => {
         /**

@@ -346,6 +346,34 @@ export const mirrorModuleSwitch = (assistant: Assistant, moduleId: string, enabl
 
 const isCapability = (def: ModuleDefinition<any>) => def.kind === undefined || def.kind === "capability"
 
+/**
+ * Mirror a save of the Claude subscription agent's settings (`SettingsStore.saveModule`) into the migrated assistant,
+ * when it is on that account (docs/ASSISTANTS.md §4.1: those settings became the assistant's, WP-13a). Only the
+ * settings the save changed: `model` → `llm.model` (unless `CLAUDE_SUBSCRIPTION_MODEL` is set in the environment,
+ * which locks it), `tools` → `llm.useModules`, `sessionIdleMinutes` → `llm.freshSessionAfterMinutes`, `speculate` →
+ * `replyEarly`, a non-empty `systemPrompt` → `prompt`. The shared settings (opt-in, program, proxy, debug logs) stay
+ * the module's.
+ */
+export const mirrorSubscriptionSettings = (
+  assistant: Assistant,
+  before: Readonly<Record<string, unknown>>,
+  after: Readonly<Record<string, unknown>>,
+  context: AssistantContext
+): Assistant => {
+  if (assistant.llm.account !== "claude-subscription") return assistant
+  const was = subscriptionSettings({ [SUBSCRIPTION_ID]: { settings: before } }, { ...context, env: {} })
+  const now = subscriptionSettings({ [SUBSCRIPTION_ID]: { settings: after } }, { ...context, env: {} })
+  let out = assistant
+  if (now.model !== was.model && nonEmpty(context.env?.CLAUDE_SUBSCRIPTION_MODEL) === undefined) {
+    out = { ...out, llm: { ...out.llm, model: now.model.slice(0, 100) } }
+  }
+  if (now.tools !== was.tools) out = { ...out, llm: { ...out.llm, useModules: now.tools } }
+  if (now.sessionIdleMinutes !== was.sessionIdleMinutes) out = { ...out, llm: { ...out.llm, freshSessionAfterMinutes: now.sessionIdleMinutes } }
+  if (now.speculate !== was.speculate) out = { ...out, replyEarly: now.speculate }
+  if (now.systemPrompt !== was.systemPrompt && now.systemPrompt.trim() !== "") out = { ...out, prompt: now.systemPrompt.slice(0, 4000) }
+  return out
+}
+
 // -- Effective v3 values ---------------------------------------------------------------------------------------------
 
 /** Saved values from earlier versions: renamed recogniser presets (as `sections.ts` reads them). */

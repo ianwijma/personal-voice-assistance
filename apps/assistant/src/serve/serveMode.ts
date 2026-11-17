@@ -35,6 +35,7 @@ import {
   engineSummary,
   type VoiceInfo,
   type ServerMessage,
+  type TraceConfig,
   WEB_VOICE_DEVICE_TYPE,
   WEB_VOICE_KIND
 } from "@pva/protocol"
@@ -47,7 +48,15 @@ import { defaultSystemPrompt } from "../config.ts"
 import { envView as processEnvView, userCwd } from "../env.ts"
 import { type EnvView, makeEnvView } from "../envView.ts"
 import { moduleCatalog, withModuleInstructions } from "../modules.ts"
-import { makeSubscriptionAgents, SUBSCRIPTION_AGENT_ID, SUBSCRIPTION_PROVIDER } from "../subscription.ts"
+import {
+  makeSubscriptionAgents,
+  SUBSCRIPTION_AGENT_ID,
+  SUBSCRIPTION_DEFAULT_MODEL,
+  SUBSCRIPTION_PROVIDER,
+  type SubscriptionAssistant,
+  subscriptionAssistantOf,
+  subscriptionSessionLimit
+} from "../subscription.ts"
 import { makeAccessPolicy } from "./access.ts"
 import { adminPasswordProblem, makeAdminSessions } from "./AdminSessions.ts"
 import { acquireDataDirLock, type DataDirLockError } from "./DataDirLock.ts"
@@ -64,6 +73,7 @@ import {
   defaultTtsBuilder,
   type LlmAccounts,
   type LlmBuilder,
+  llmKeyOf,
   type LlmSpec,
   llmSpecOf,
   makeResourcePool,
@@ -99,7 +109,7 @@ import { makeApi } from "./api.ts"
 import { makeAssistantVoice } from "./AssistantVoice.ts"
 import { type Favourites, makeFavourites } from "./Favourites.ts"
 import { makeVoiceCatalog, type VoiceCatalog, type VoiceCatalogOptions } from "./VoiceCatalog.ts"
-import { type Hearing, makeVoiceSession, type VoiceSession } from "./VoiceSession.ts"
+import { type AssistantTraceConfig, type Hearing, makeVoiceSession, type VoiceSession } from "./VoiceSession.ts"
 import { makeVoiceSessions, type VoiceSessions } from "./VoiceSessions.ts"
 import { makeRoutingService, ROUTING_KEYS } from "./routing.ts"
 import { type KdfParams, openVault, type Vault, VaultPathConfig } from "./Vault.ts"
@@ -354,9 +364,10 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     // LLM_PROVIDER=claude-subscription: an agent conversation whose agent is the running claude-subscription module.
     // Every session's conversation uses that one agent; it keeps one Claude Code session per conversation id.
     const subscriptionModule = () => host.modules().find((m) => m.id === SUBSCRIPTION_AGENT_ID)
-    const subscriptionDetail = () => {
+    /** The engine row's detail: `model` is the assistant's (WP-13a: each assistant on the account has its own). */
+    const subscriptionDetail = (assistantModel: string) => {
       const m = subscriptionModule()
-      const model = String(m?.settings.values.model ?? "claude-haiku-5-5")
+      const model = assistantModel.trim() === "" ? SUBSCRIPTION_DEFAULT_MODEL : assistantModel.trim()
       if (m?.state === "running") return model
       return `${model} · module ${m === undefined || !m.enabled ? "off" : m.state}: the offline stand-in answers`
     }
@@ -430,11 +441,14 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
         const off = new Set(choice.offTools)
         return [{ ...part, module: { ...part.module, tools: (part.module.tools ?? []).filter((t) => !off.has(t.name)) } }]
       })
+      /** The modules it has on that run (capabilities; for the turn's configuration snapshot). */
+      const modules = parts.reduce((n, p) => (isCapability(p.moduleId) ? n + 1 : n), 0)
       const same = parts.length === snapshot.parts.length && parts.every((p, i) => p === snapshot.parts[i])
-      if (same) return { registry: snapshot.registry, instructions: snapshot.instructions }
+      if (same) return { registry: snapshot.registry, instructions: snapshot.instructions, modules }
       return {
         registry: makeToolRegistry(parts.map((p) => p.module)),
-        instructions: parts.flatMap((p) => (p.instructions.length > 0 ? [p.instructions] : []))
+        instructions: parts.flatMap((p) => (p.instructions.length > 0 ? [p.instructions] : [])),
+        modules
       }
     }
 
@@ -549,10 +563,27 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       const voices = new Map<string, TtsSpec>()
       for (const assistant of assistantsNow().values()) {
         if (!assistant.on || !listed.has(assistant.id)) continue
-        llms.set(assistant.id, llmSpecOf(assistant.llm, accounts))
+        const spec = llmSpecOf(assistant.llm, accounts)
+        llms.set(assistant.id, spec)
+        rememberLlmSpec(spec)
         voices.set(assistant.id, ttsSpecOf(assistant.voice, voiceAccounts))
       }
       return { llms, voices, recognisers: recognisersOf(placesNow(), assistantsNow()) }
+    }
+    /**
+     * The spec of every language-model key asked for, so a turn's trace can say what the instance it is bound to was
+     * built with (`ResourcePool.keyFor` names the key; the binding may still be the old instance during a change).
+     * Bounded: entries whose key the pool no longer lists are dropped when it grows.
+     */
+    const llmSpecs = new Map<string, LlmSpec>()
+    const rememberLlmSpec = (spec: LlmSpec) => {
+      const key = llmKeyOf(spec)
+      if (llmSpecs.get(key) === spec) return
+      llmSpecs.set(key, spec)
+      if (llmSpecs.size > 64) {
+        const live = new Set(resources.status().map((r) => r.key))
+        for (const k of llmSpecs.keys()) if (k !== key && !live.has(k)) llmSpecs.delete(k)
+      }
     }
     const explainProblem = (message: string): string => explainProblems([{ stage: "", message }])[0]!.message
     // Tests that inject the shared build answer with its `llm`, through the pool (one instance per configuration still).
@@ -631,6 +662,41 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       synthesize: () => Stream.fail(new TtsError({ message: "This assistant is not in use on any device, so it has no voice." }))
     })
 
+    /** The Claude subscription account's bound on open sessions (§3.3), the same number while nothing it reads changes. */
+    let limitOf: { readonly assistants: ReadonlyMap<string, Assistant>; readonly max: number; readonly limit: number } | undefined
+    const subscriptionLimit = (): number => {
+      const assistants = assistantsNow()
+      const max = Number(sections.value("MAX_VOICE_SESSIONS") ?? DEFAULT_MAX_VOICE_SESSIONS)
+      if (limitOf?.assistants !== assistants || limitOf.max !== max) limitOf = { assistants, max, limit: subscriptionSessionLimit(max, assistants.values()) }
+      return limitOf.limit
+    }
+    /**
+     * The assistant's part of a turn's configuration snapshot (protocol 7 `TraceConfig`, docs/ASSISTANTS.md §3.7): the
+     * language model the turn is bound to (the pool's instance: its spec, which during a change is still the old one;
+     * a binding on the Claude subscription: the options its agent is passed, from the assistant's own fields), the
+     * voice it is bound to, the modules and tools it has, and its reply-early and tool-round settings.
+     */
+    const traceConfigOf = (assistant: Assistant, tools: number, modules: number): AssistantTraceConfig => {
+      const key = resources.keyFor(assistant.id)
+      // The account of the binding in use, as `agentSetup` reads it (during a change the old binding answers, the old
+      // way), not the saved one. Not bound yet: the saved account.
+      const account = key === undefined ? assistant.llm.account : key.split("|")[0]
+      // On the subscription the agent answers with these options (`subscriptionAssistant`), not the pool's stand-in.
+      const passed = account === SUBSCRIPTION_PROVIDER ? subscriptionAssistantOf(assistant, 1).options : undefined
+      const spec = (key === undefined ? undefined : llmSpecs.get(key)) ?? llmSpecOf(assistant.llm)
+      return {
+        llm: passed !== undefined
+          // No token limit is passed to Claude Code (`ClaudeConversationOptions` has none): the stand-in's, as `llmSpecOf` keeps it.
+          ? { account: SUBSCRIPTION_PROVIDER, model: passed.model, effort: assistant.llm.effort, thinking: assistant.llm.thinking, maxTokens: 1024 }
+          : { account: spec.account, model: spec.model, effort: spec.effort, thinking: spec.thinking, maxTokens: spec.maxTokens },
+        voice: resources.ttsKeyFor(assistant.id) ?? voiceKey(assistant.voice),
+        modules,
+        tools: passed !== undefined && !passed.tools ? 0 : tools,
+        replyEarly: assistant.replyEarly,
+        toolRounds: assistant.toolRounds
+      }
+    }
+
     /**
      * One assistant's turn setup in one session (and its agent setup): its prompt, the Home line, the instructions
      * of its modules, a registry of its tools, and its language model (the pool's instance for its `llm` settings,
@@ -639,7 +705,17 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
      */
     const conversationSetup = (assistantId: string) => {
       let cached:
-        | { snapshot: ModuleSnapshot; assistant: Assistant | undefined; home: string | undefined; llm: Llm["Service"] | undefined; tts: Tts["Service"] | undefined; setup: TurnSetup; instructions: ReadonlyArray<string> }
+        | {
+          snapshot: ModuleSnapshot
+          assistant: Assistant | undefined
+          home: string | undefined
+          llm: Llm["Service"] | undefined
+          tts: Tts["Service"] | undefined
+          setup: TurnSetup
+          instructions: ReadonlyArray<string>
+          /** The turn's configuration snapshot (`TraceConfig` without the hearing, which is the device's). */
+          config: AssistantTraceConfig | undefined
+        }
         | undefined
       const llmNow = () => {
         const bound = resources.llmFor(assistantId)
@@ -665,7 +741,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
         const tts = ttsNow()
         if (cached?.snapshot !== snapshot || cached.assistant !== assistant || cached.home !== home || cached.llm !== llm || cached.tts !== tts) {
           // An assistant that does not exist (any more) is never routed; should a turn still start, it gets no tools.
-          const mine = assistant === undefined ? { registry: makeToolRegistry([]), instructions: [] } : modulesFor(snapshot, assistant)
+          const mine = assistant === undefined ? { registry: makeToolRegistry([]), instructions: [], modules: 0 } : modulesFor(snapshot, assistant)
           const base = assistant?.prompt ?? defaultSystemPrompt
           const instructions = home === undefined ? mine.instructions : [home, ...mine.instructions]
           // `TurnSetup.ttsReady`: completes once this `tts` (the instance bound now, not a later one) is built.
@@ -676,8 +752,17 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
             home,
             llm,
             tts,
-            setup: { system: systemFor(base, instructions), registry: mine.registry, llm: llm ?? notInUse, tts: tts ?? noVoice, ...(tts !== undefined ? { ttsReady } : {}) },
-            instructions
+            setup: {
+              system: systemFor(base, instructions),
+              registry: mine.registry,
+              llm: llm ?? notInUse,
+              tts: tts ?? noVoice,
+              ...(tts !== undefined ? { ttsReady } : {}),
+              // The limit the turn runs with and the one its snapshot (`config`) reports: both from this `assistant`.
+              ...(assistant !== undefined ? { maxToolRounds: assistant.toolRounds } : {})
+            },
+            instructions,
+            config: assistant === undefined ? undefined : traceConfigOf(assistant, mine.registry.specs.length, mine.modules)
           }
         }
         return cached
@@ -685,7 +770,30 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       // The setup never waits (the conversation's input loop reads it, so Stop and barge-in would wait too): a spoken
       // turn waits for a voice still being built (the assistant came into use just now) itself, before it plays.
       const setup = Effect.sync((): TurnSetup => current().setup)
-      // A Claude subscription assistant: the agent module answers; the pool's instance is the offline stand-in.
+      /**
+       * The turn's configuration snapshot, read when its trace begins: the values `current()` resolved for the setup,
+       * made again only when the module snapshot, the assistant or its bindings changed (reference compares, no
+       * prompt or registry work). The object is never changed afterwards: a trace keeps the one its turn began with.
+       */
+      const config = (): AssistantTraceConfig | undefined => {
+        const c = cached
+        if (c !== undefined && c.snapshot === host.snapshot() && c.assistant === assistantsNow().get(assistantId) &&
+          c.llm === resources.llmFor(assistantId) && c.tts === resources.ttsFor(assistantId)) return c.config
+        return current().config
+      }
+      // WP-13a: a Claude subscription assistant's options for its conversations (the same object while unchanged).
+      let subscriptionOf: { readonly assistant: Assistant; readonly limit: number; readonly value: SubscriptionAssistant } | undefined
+      const subscriptionAssistant = (): SubscriptionAssistant | undefined => {
+        const assistant = assistantsNow().get(assistantId)
+        if (assistant === undefined) return undefined
+        const limit = subscriptionLimit()
+        if (subscriptionOf?.assistant !== assistant || subscriptionOf.limit !== limit) {
+          subscriptionOf = { assistant, limit, value: subscriptionAssistantOf(assistant, limit) }
+        }
+        return subscriptionOf.value
+      }
+      // A Claude subscription assistant: the agent module answers with the assistant's model and options; the pool's
+      // instance is the offline stand-in.
       let subscription: { readonly fallback: Llm["Service"]; readonly toAgents: (setup: TurnSetup) => AgentTurnSetup } | undefined
       const agentSetup = () => {
         // The account of the binding in use (a key starts with its account), not the saved one: while a changed
@@ -702,6 +810,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
                 fallbackLlm: fallback,
                 agents: () => host.snapshot().agents,
                 module: subscriptionModule,
+                assistant: subscriptionAssistant,
                 promptFor: (agent, t) => agent.systemPrompt === undefined ? t.system : systemFor(agent.systemPrompt, current().instructions)
               })
             }
@@ -709,7 +818,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
           return subscription.toAgents(turn)
         })
       }
-      return { setup, agentSetup }
+      return { setup, agentSetup, config }
     }
 
     /** The engine list's `llm` row (pages before WP-6 read it): the first switched-on assistant's language model. */
@@ -724,7 +833,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
         case "anthropic":
           return { stage: "llm", provider: "anthropic", detail: first.llm.model, location: "hosted" }
         case "claude-subscription":
-          return { stage: "llm", provider: SUBSCRIPTION_PROVIDER, detail: subscriptionDetail(), location: "hosted" }
+          return { stage: "llm", provider: SUBSCRIPTION_PROVIDER, detail: subscriptionDetail(first.llm.model), location: "hosted" }
         default:
           return { stage: "llm", provider: account, detail: first.llm.model, location: "hosted" }
       }
@@ -782,18 +891,42 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
      * What this device hears with (§2.6, §3.5): the pool's recogniser of its place, with its hearer's stream options.
      * No assistant on the device: none. Not bound yet: the pool reconciles at once.
      */
-    const hearingOf = (deviceId: string | undefined) => (): Hearing => {
-      const hearer = hearerOf(deviceSettingsOf(deviceId))
-      if (hearer === null || !assistantsNow().has(hearer)) return { kind: "none" }
-      const place = placeOf(deviceId)
-      let binding = resources.sttFor(place)
-      if (binding === undefined) {
-        runSync(Effect.asVoid(Effect.forkDetach(syncResources(), { startImmediately: true })))
-        binding = resources.sttFor(place)
+    const hearingOf = (deviceId: string | undefined) => {
+      /** The hearing part of the turns' configuration snapshot: one object per binding and hearer. */
+      let traced: { readonly id: string; readonly hearer: string; readonly value: TraceConfig["hearing"] } | undefined
+      return (): Hearing => {
+        const hearer = hearerOf(deviceSettingsOf(deviceId))
+        if (hearer === null || !assistantsNow().has(hearer)) return { kind: "none" }
+        const place = placeOf(deviceId)
+        let binding = resources.sttFor(place)
+        if (binding === undefined) {
+          runSync(Effect.asVoid(Effect.forkDetach(syncResources(), { startImmediately: true })))
+          binding = resources.sttFor(place)
+        }
+        if (binding === undefined) return { kind: "waiting" }
+        if (traced?.id !== binding.id || traced.hearer !== hearer) traced = { id: binding.id, hearer, value: hearingTraceOf(hearer, binding.spec) }
+        return {
+          kind: "ready",
+          id: binding.id,
+          stt: binding.stt,
+          key: binding.key,
+          trace: traced.value,
+          ...(binding.problem !== undefined ? { problem: binding.problem } : {})
+        }
       }
-      if (binding === undefined) return { kind: "waiting" }
-      return { kind: "ready", id: binding.id, stt: binding.stt, key: binding.key, ...(binding.problem !== undefined ? { problem: binding.problem } : {}) }
     }
+    /** The recogniser a device hears with, as a turn's configuration snapshot says it (`TraceConfig.hearing`). */
+    const hearingTraceOf = (hearer: string, spec: SttSpec): TraceConfig["hearing"] =>
+      spec.engine === "deepgram"
+        ? { hearer, engine: spec.engine, model: spec.model, eotThreshold: spec.stream.eotThreshold }
+        : {
+          hearer,
+          engine: spec.engine,
+          model: spec.model,
+          ...(spec.language !== "" ? { language: spec.language } : {}),
+          eagerSilenceMs: spec.stream.eagerSilenceMs,
+          finalSilenceMs: spec.stream.finalSilenceMs
+        }
     /** What a session's recordings say they were heard with. */
     const hearingModelOf = (deviceId: string | undefined) => (): string => {
       const binding = resources.sttFor(placeOf(deviceId))

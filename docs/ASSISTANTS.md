@@ -1567,3 +1567,113 @@ section on and adds a key, and only from devices set to TypeSafe.
 - **Not done / not verified**: `e2e-real` (real server) was not updated or run; its module test still clicks a
   capability's switch. The real server fills `config` in another change: the counts of modules and tools in "changed
   since" are the web's own (`toolCount`) and may differ from the server's until both are checked together.
+
+### WP-13a Claude subscription per assistant: built 2026-11-16
+
+Several assistants can be on the `claude-subscription` account at once, each with its own model and options; the
+account (the agent module's opt-in, Claude Code program, proxy and debug logs, its login) is shared.
+
+- **Keyed per assistant.** Claude Code sessions stay keyed by conversation id (`AgentTurnInput.conversationId`), and a
+  conversation belongs to one (device, assistant) pair (§3.3), so every assistant on every device has its own session
+  and catch-up position. The agent is still the one module instance; serve mode wraps it per assistant
+  (`subscription.ts` `makeSubscriptionAgents({ assistant })`) with `withConversationOptions` (new export of
+  `@pva/agent-claude-code`), which puts the assistant's options on each turn's input (a symbol-keyed field only this
+  agent reads; no change in core): `model` (empty → `claude-haiku-5-5`), `effort`, `thinking`, `tools` ← `useModules`,
+  `sessionIdleMinutes` ← `freshSessionAfterMinutes` (0 = never), and the account's `maxSessions`. The wrapper also sets
+  `speculate` ← `replyEarly` and drops the module's own system prompt (the assistant's prompt is the turn's). A turn
+  without options (the module used outside serve mode) behaves as before, with the module's settings.
+- **When a change applies.** Read at every turn (`subscriptionAssistantOf`, one object per assistant revision). A
+  changed model or effort applies from that conversation's next turn **on its running session**: `setModel` and the
+  `effortLevel` flag setting (as Claude Code's /model and /effort), so it keeps what was said and starts no process;
+  verified against the real Claude Code (below: the next reply reported the new model). A changed `thinking`, or a
+  change Claude Code does not confirm within 3 s, replaces the session at that turn (the new one is primed from the
+  history). `tools` (the tool set) and the fresh-session time are read per turn as before. No other assistant's
+  session is touched. The warm spare (started with the module's model at start, later with the last turn's options) is
+  retuned the same way before its first message, so a first turn still takes it.
+- **Bound.** `maxSessions` = `MAX_VOICE_SESSIONS` × the switched-on assistants on the account (at least 1;
+  `subscriptionSessionLimit`), passed with every turn; the latest value counts. When a conversation needs a session and
+  the bound is reached, the least recently used session (an idle one first) is closed, as before; it primes from the
+  history when its conversation comes back. A shrinking bound closes nothing by itself: it is applied when the next
+  session is needed (also when the warm spare is taken).
+- **Shared settings.** A `module.configure` of the account (program, proxy, debug logs, opt-in) restarts the module: both
+  assistants' next turns open sessions of the new agent with the new settings, each with its own model. The old
+  instance's sessions get no more turns (the module host closes the old instance after its grace period).
+- **Migration left open, now mirrored.** A save of the agent module's per-assistant settings (`model`, `tools`,
+  `sessionIdleMinutes`, `speculate`, a non-empty `systemPrompt`) is mirrored into the migrated assistant when it is on
+  the account (`mirrorSubscriptionSettings`, called by `SettingsStore.saveModule`): only the settings that save changed,
+  so an assistant's own later edit is kept when a shared field is saved; `CLAUDE_SUBSCRIPTION_MODEL` in the environment
+  keeps locking the model. Other assistants are not touched.
+- **Engine row** for a subscription assistant shows the assistant's model (was the module's).
+- **Deviations.** (1) A model or effort change is applied in place (§4.1 said "a session opened with the assistant's
+  model"); only thinking needs a new session. (2) The warm spare fits one launch at a time: with assistants on
+  different thinking settings, the first turn of the other kind starts a process (about 1–2.5 s, measured below as the
+  first turn). (3) The module's own `speculate`, `systemPrompt`, `model`, `tools` and `sessionIdleMinutes` fields stay
+  in its form; in serve mode they only matter through the mirror into the migrated assistant.
+- **Tests.** `packages/agent-claude-code/test/perAssistant.test.ts` (fake SDK: two assistants' sessions with their own
+  model, effort, thinking and tools, the spare retuned; no options = the module's; a model and effort change on the
+  running session, the other untouched, no retune when unchanged; a thinking change and a refused retune open a new
+  primed session; the per-turn bound closes the least recently used; per-conversation fresh-session time, 0 = never;
+  `endConversation` kept). `apps/assistant/test/serveSubscriptionAssistants.test.ts` (real server, fake SDK: the bound
+  and the options as pure functions; two assistants answer from sessions with their own model and options and their
+  traces say so; Alpha's model change applies at its next turn on its own session, Bravo's untouched, no new process;
+  a changed program is used by both assistants' new sessions; with `MAX_VOICE_SESSIONS=1` and Bravo switched off, Alpha's
+  new conversation closes Bravo's session). `migrateAssistants.test.ts` (the mirror, the environment lock, another
+  account untouched). `packages/agent-claude-code/test/liveAssistants.test.ts` (opt-in, real Claude Code).
+- **Measurements** (this machine, 2026-11-16, the owner's Claude login, Ultra plan, Haiku 5.5 with low effort; the
+  opt-in live test, `CLAUDE_SUBSCRIPTION_LIVE=1 ROUNDS=4 pnpm --filter @pva/agent-claude-code exec vitest run
+  test/liveAssistants.test.ts`; 18 short messages). The figure is the turn's `llmFirstToken` mark (what `TurnTrace`
+  records), ms after the turn's input reached the agent.
+  - Retune: Haiku answered "Blue." (first token 1538 ms); then the same session with `claude-sonnet-5-5`: the reply
+    reported `claude-sonnet-5-5` (2668 ms), same session, no process start.
+  - First turn after a quiet spell, fresh-session time **on** (1 min: the idle check closed the session and started a
+    warm spare, which the turn took and primed from the history) vs **off** (0: the same session answered), 4 rounds
+    alternated: on 2157, 1154, 1362, 1845 → median **1603 ms**; off 890, 1683, 1344, 1379 → median **1361 ms**. The
+    quiet spell was simulated by moving the agent's clock (the real gap was about 30 s), so Claude's prompt cache was
+    still warm for "off"; after a real hour both would miss it, and the difference measured here (about 240 ms, with a
+    spread of ±400 ms between runs) is an upper bound of what "on" costs. The first turn of each conversation (a new
+    conversation on the spare, retuned) took 1076–2647 ms.
+  - **Not measured**: the memory of a Claude Code process (§9's risk); more than one assistant's sessions under load.
+- **Not verified**: the web Language model tab (another package) saving `freshSessionAfterMinutes` and the model of a
+  subscription assistant (exercised through the store and the module form in tests); the effort setting's effect on
+  the reply (Claude Code accepted `effortLevel` for Haiku; whether Haiku uses it was not checked).
+
+### Per-turn configuration snapshot (`TraceInfo.config`): built 2026-11-16
+
+Every finished turn's trace carries `config` (protocol 7 `TraceConfig`, §5.4), filled for voice and typed turns alike:
+
+| Field | From |
+|---|---|
+| `llm.account`, `model`, `effort`, `thinking`, `maxTokens` | the spec of the language-model instance the turn is bound to (`ResourcePool.keyFor` → the spec recorded for that key: during a change, still the old one), for an offline account its normalised spec; bound to the Claude subscription (the binding's account, as `agentSetup` reads it, not the saved one): the assistant's own `llm` fields, as the agent is given them (`subscriptionAssistantOf`), not its stand-in's spec, and `maxTokens` 1024 (the stand-in's: no token limit is passed to Claude Code) |
+| `hearing.hearer`, `engine`, `model`, `language`, `eagerSilenceMs`, `finalSilenceMs`, `eotThreshold` | the recogniser binding the device's stream runs on (`SttBinding.spec` and the hearer): stt-sherpa with its end pauses (the language only for a model that takes one), Deepgram with `eotThreshold`; typed text while no stream runs: the device's binding now |
+| `voice` | the key of the voice the turn is bound to (`ttsKeyFor`) |
+| `modules`, `tools` | the capability modules the assistant has on that run, and the tools in its registry (0 when bound to the Claude subscription with `useModules` off) |
+| `replyEarly`, `toolRounds` | the assistant's fields |
+
+- **Captured at the turn's start**: `assistantTurnTrace.begin` (the per-conversation trace service of `VoiceSession`)
+  reads it once and the trace keeps the object; it is never changed afterwards, so a later save leaves earlier traces
+  (live `trace` pushes and `admin.snapshot.traces`) as they were. A voice turn's setup is read before `begin`, a typed
+  turn's just after; both see the same bindings.
+- **Cost on the turn path**: the assistant's part is built when the setup cache (`conversationSetup.current()`) is
+  rebuilt, i.e. only when the module snapshot, the assistant or its bindings change; at `begin` it is four reference
+  compares and the join with the hearing part (one object per binding id and hearer), made again only when either
+  changes. No prompt, registry or settings work.
+- **Who sees it**: admin connections only (`trace`, `admin.snapshot`). The device's own `turn.end` trace drops it, as it
+  drops the device fields: a voice connection never learns a model (§5.3).
+- **Measurements** (this machine, 2026-11-16, load 0.5–2.7; before = the branch's base 121ef70 in a detached worktree,
+  after = this change, alternated). Offline bench (`pnpm start bench`), three runs each, end of turn → playback start,
+  median / worst ms. The bench's session path now uses `assistantTurnTrace` with a configuration snapshot looked up
+  the way serve mode does (before: the plain trace service), so the "after" row includes the wrapper too.
+  Session path overhead 0.9 / 1.4, 0.7 / 1.2, 0.9 / 2.0 → 0.8 / 1.2, 0.9 / 1.2, 0.9 / 1.4; session path realistic
+  eager on 307 / 534, 306 / 534, 307 / 536 → 307 / 536, 307 / 535, 306 / 535; orchestration overhead (not on the
+  changed path) 0.9 / 1.7, 1.0 / 1.7, 0.9 / 1.7 → 1.0 / 1.7, 1.1 / 3.2, 1.0 / 1.6; every other realistic row within
+  3 ms. The real serve path was measured apart (a temporary scripted-client test, not committed): 1200 typed turns
+  alternating two Anthropic assistants with the greeter module on an instant stand-in model, `TurnTrace`
+  `llmRequestSent − startedAt` at full precision (trace begin with its snapshot, setup, prompt, registry), the first 200
+  dropped, three runs each: before median 151.2, 151.7, 156.0 µs (p90 208, 201, 214) → after 152.0, 152.0, 150.6 µs
+  (p90 206, 205, 200). No measurable cost.
+- **Tests.** `apps/assistant/test/serveTraceConfig.test.ts` (scripted client: voice and typed turns of Alpha and Bravo
+  with their exact snapshots, decoded by the protocol schema; the device's `turn.end` has none; after a model, tool
+  rounds and voice change, the earlier traces are unchanged and the new turns carry the new values; a new admin page's
+  snapshot traces likewise). The subscription traces in `serveSubscriptionAssistants.test.ts`.
+- **Not built**: the Diagnostics page's snapshot popover and "changed since" (WP-15, apps/web). `config` is `undefined`
+  for a turn whose device has no recogniser bound (no hearing to report; such a device has no assistant).

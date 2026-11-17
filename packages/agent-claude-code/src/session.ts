@@ -20,6 +20,10 @@ import { type ClaudeSdk, MCP_SERVER_NAME, type QueryHandle, type SDKMessage, typ
 
 export interface SessionConfig {
   readonly model: string
+  /** The reasoning effort Claude Code sends (absent: its default for the model). */
+  readonly effort?: SessionEffort | undefined
+  /** Adaptive thinking, or none (absent: none). */
+  readonly thinking?: SessionThinking | undefined
   readonly claudePath: string | undefined
   readonly env: Readonly<Record<string, string | undefined>>
   /** The agent's "Proxy for Claude Code" secret (see `sessionEnv`). */
@@ -30,6 +34,16 @@ export interface SessionConfig {
   readonly system: string | undefined
   readonly tools: ReadonlyArray<SessionTool>
 }
+
+export type SessionEffort = "low" | "medium" | "high"
+export type SessionThinking = "off" | "adaptive"
+
+/**
+ * What a session answers with: model, effort and thinking. Model and effort can be changed on a running session
+ * (`ClaudeSession.retune`); thinking cannot (a session launched with other thinking is replaced).
+ */
+export const launchKeyOf = (config: Pick<SessionConfig, "model" | "effort" | "thinking">): string =>
+  `${config.model}|${config.effort ?? ""}|${config.thinking ?? "off"}`
 
 export interface LoginInfo {
   readonly subscriptionType: string | undefined
@@ -112,6 +126,13 @@ export class ClaudeSession {
   initChecked = false
   /** What its error texts are redacted with (`proxySecrets`). */
   readonly secrets: ReadonlyArray<string>
+  /** Model, effort and thinking it answers with now (`launchKeyOf`; `retune` changes the first two). */
+  launch: string
+  model: string
+  effort: SessionEffort | undefined
+  readonly thinking: SessionThinking
+  /** The model Claude Code reported in its last reply (diagnostics; the live test checks a retune with it). */
+  answeredWith: string | undefined
 
   private readonly query: QueryHandle
   private readonly queue: Array<SDKUserMessage> = []
@@ -130,6 +151,10 @@ export class ClaudeSession {
     this.sdk = sdk
     this.config = config
     this.secrets = proxySecrets(config.proxy)
+    this.launch = launchKeyOf(config)
+    this.model = config.model
+    this.effort = config.effort
+    this.thinking = config.thinking ?? "off"
     this.now = now
     this.system = config.system
     this.toolKey = toolKey(config.tools)
@@ -156,6 +181,8 @@ export class ClaudeSession {
       prompt: input(),
       options: sessionOptions({
         model: config.model,
+        effort: config.effort,
+        thinking: config.thinking,
         system: provisional ? PROVISIONAL_SYSTEM_PROMPT : config.system!,
         tools: provisional ? [] : config.tools.map((t) => t.name),
         mcpServer: provisional ? undefined : this.mcp,
@@ -209,6 +236,24 @@ export class ClaudeSession {
     }
     this.toolKey = toolKey(tools)
     this.system = system
+  }
+
+  /**
+   * Answer with another model or effort from the next message on (the assistant's settings changed), keeping the
+   * session and what was said in it: `setModel` and the `effortLevel` flag setting, as Claude Code's /model and
+   * /effort do. Thinking cannot be changed this way. Rejects (the caller replaces the session) when Claude Code does
+   * not confirm within `timeoutMs`.
+   */
+  async retune(launch: Pick<SessionConfig, "model" | "effort">, timeoutMs: number): Promise<void> {
+    if (launch.model !== this.model) {
+      await withTimeout(this.query.setModel(launch.model), timeoutMs, "Changing the model timed out")
+      this.model = launch.model
+    }
+    if (launch.effort !== this.effort) {
+      await withTimeout(this.query.applyFlagSettings({ effortLevel: launch.effort ?? null }), timeoutMs, "Changing the effort timed out")
+      this.effort = launch.effort
+    }
+    this.launch = launchKeyOf({ model: this.model, effort: this.effort, thinking: this.thinking })
   }
 
   /** Start a turn: `listener` gets every message until it is removed with `endTurn`. */

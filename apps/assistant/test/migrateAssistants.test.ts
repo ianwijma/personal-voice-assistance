@@ -481,6 +481,42 @@ describe("today's pages on version 4", () => {
     expect(store.assistants()[0]!.modules["claude-subscription"]).toBeUndefined()
   })
 
+  it("the Claude subscription agent's per-assistant settings changed after migration are mirrored into the migrated assistant (WP-13a)", async () => {
+    const store = await run(openStore(tmp(), withCatalog({ LLM_PROVIDER: "claude-subscription" })))
+    const before = store.assistants()[0]!
+    expect(before.llm).toMatchObject({ account: "claude-subscription", model: "claude-haiku-5-5", useModules: true, freshSessionAfterMinutes: 60 })
+    expect(before.replyEarly).toBe(false)
+    await run(store.saveModule("claude-subscription", {
+      enabled: true,
+      settings: { optIn: true, model: "claude-sonnet-5-5", tools: false, sessionIdleMinutes: 30, speculate: true, systemPrompt: "Be brief." },
+      secrets: {}
+    }))
+    expect(store.assistants()[0]).toMatchObject({
+      prompt: "Be brief.",
+      replyEarly: true,
+      llm: { account: "claude-subscription", model: "claude-sonnet-5-5", useModules: false, freshSessionAfterMinutes: 30 },
+      rev: before.rev + 1
+    })
+    // Only what the save changed: the assistant's own later edit of its model is kept when the module's model is not
+    // touched (a shared setting saved: the program).
+    await run(store.saveAssistantRecord({ ...store.assistants()[0]!, llm: { ...store.assistants()[0]!.llm, model: "claude-opus-5-5" } }))
+    await run(store.saveModule("claude-subscription", {
+      enabled: true,
+      settings: { optIn: true, model: "claude-sonnet-5-5", tools: false, sessionIdleMinutes: 30, speculate: true, systemPrompt: "Be brief.", claudePath: "/opt/claude" },
+      secrets: {}
+    }))
+    expect(store.assistants()[0]!.llm.model).toBe("claude-opus-5-5")
+
+    // The environment's CLAUDE_SUBSCRIPTION_MODEL locks the model; an assistant on another account is not touched.
+    const locked = await run(openStore(tmp(), withCatalog({ LLM_PROVIDER: "claude-subscription", CLAUDE_SUBSCRIPTION_MODEL: "claude-haiku-5-5" })))
+    await run(locked.saveModule("claude-subscription", { enabled: true, settings: { model: "claude-sonnet-5-5", tools: false }, secrets: {} }))
+    expect(locked.assistants()[0]!.llm).toMatchObject({ model: "claude-haiku-5-5", useModules: false })
+    const other = await run(openStore(tmp(), withCatalog({ LLM_PROVIDER: "anthropic" })))
+    const otherBefore = other.assistants()[0]!
+    await run(other.saveModule("claude-subscription", { enabled: true, settings: { model: "claude-sonnet-5-5", tools: false }, secrets: {} }))
+    expect(other.assistants()[0]).toEqual(otherBefore)
+  })
+
   it("Move to settings: a per-assistant key is an assistant-field target; moving it writes the migrated assistant and unlocks it", async () => {
     expect(makeEnvCatalog(moduleCatalog).target("SYSTEM_PROMPT")).toMatchObject({ kind: "assistant-field", assistantId: MIGRATED_ASSISTANT_ID, field: "prompt" })
     expect(makeEnvCatalog(moduleCatalog).target("ANTHROPIC_API_KEY")?.kind).toBe("section")

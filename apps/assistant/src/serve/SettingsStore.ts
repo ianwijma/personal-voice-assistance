@@ -39,6 +39,7 @@ import {
   migrateToV4,
   mirrorFlatKeys,
   mirrorModuleSwitch,
+  mirrorSubscriptionSettings,
   type MigrationRecord,
   setPath,
   type SettingsFile,
@@ -472,6 +473,8 @@ const startupGate = (directory: string, options: LoadOptions): StartupGate => as
 type SecretsKind = "file" | "vault"
 
 const JOURNAL_VERSION = 2
+/** The Claude subscription agent module, whose per-assistant settings are mirrored into the migrated assistant. */
+const SUBSCRIPTION_MODULE_ID = "claude-subscription"
 
 interface Journal {
   /** 1: written before the settings screen (secrets always in `secrets.json`). */
@@ -1122,7 +1125,13 @@ export const loadSettingsStore = (directory: string, options: LoadOptions = {}):
         persistSettings(`the settings of module ${id}`, (committed) => ({
           settings: withMigrated(
             { ...committed.settings, modules: { ...committed.settings.modules, [id]: { enabled: record.enabled, settings: record.settings } } },
-            (a) => mirrorModuleSwitch(a, id, record.enabled, context)
+            (a) => {
+              const switched = mirrorModuleSwitch(a, id, record.enabled, context)
+              // The Claude subscription agent's per-assistant settings (WP-13a), changed in its module form.
+              return id === SUBSCRIPTION_MODULE_ID
+                ? mirrorSubscriptionSettings(switched, committed.settings.modules[id]?.settings ?? {}, record.settings, context)
+                : switched
+            }
           ),
           secrets: { ...committed.secrets, modules: withSecrets(committed.secrets.modules, id, record.secrets) }
         }))

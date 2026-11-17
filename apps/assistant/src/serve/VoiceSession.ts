@@ -26,6 +26,7 @@ import {
   routeConfigFrom,
   type ServerMessage,
   type SessionInfo,
+  type TraceConfig,
   type TraceInfo,
   type TraceRoute,
   typedTextTarget,
@@ -64,11 +65,19 @@ import { makeStateTracker, type StateTracker } from "./StateTracker.ts"
  * each turn start).
  */
 
+/** The assistant's part of a turn's configuration snapshot (everything but the hearing, which is the device's). */
+export type AssistantTraceConfig = Omit<TraceConfig, "hearing">
+
 export interface AssistantSetup {
   /** Read at each turn start: prompt, tools and (`TurnSetup.llm`) the resource pool's language model for the assistant. */
   readonly setup: Effect.Effect<TurnSetup>
   /** A `claude-subscription` assistant's agent setup (chosen at each run start; see `SessionConversation`). */
   readonly agentSetup?: () => Effect.Effect<AgentTurnSetup> | undefined
+  /**
+   * Read when a turn's trace begins: what the turn uses (`TraceConfig` without the hearing). Must be cheap (the turn
+   * path) and return an object that is never changed afterwards (the trace keeps it).
+   */
+  readonly config?: () => AssistantTraceConfig | undefined
 }
 
 /**
@@ -88,6 +97,8 @@ export type Hearing =
     readonly key: string
     /** The instance failed (its streams fail with this problem until it is built again). */
     readonly problem?: string
+    /** What it is, as a turn's configuration snapshot says it (`TraceConfig.hearing`); the same object while unchanged. */
+    readonly trace?: TraceConfig["hearing"]
   }
 
 /** Longest wait for silence before a hearer switch closes an utterance that is still open (§3.5). */
@@ -241,6 +252,8 @@ export const assistantTurnTrace = (
     readonly route?: () => TraceRoute | undefined
     /** The routing call's times (trace clock) of the route, when TypeSafe was asked. */
     readonly routeTimes?: () => Pick<RouteDecision, "sentAt" | "receivedAt"> | undefined
+    /** The configuration snapshot of the turn (docs/ASSISTANTS.md §3.7), read once at its start; never changed after. */
+    readonly config?: () => TraceConfig | undefined
   }
 ): TurnTrace["Service"] => {
   /** `routeSent`/`routeReceived` of the current route (replaced: the final may have asked again). */
@@ -258,6 +271,7 @@ export const assistantTurnTrace = (
       const session = fields.session()
       const assistant = fields.assistant?.()
       const route = fields.route?.()
+      const config = fields.config?.()
       const trace: Trace = {
         id: counter.next++,
         mode,
@@ -269,7 +283,8 @@ export const assistantTurnTrace = (
         session,
         ...(assistant !== undefined ? { assistant, device: session } : {}),
         ...(assistant !== undefined && fields.deviceId !== undefined ? { deviceId: fields.deviceId } : {}),
-        ...(route !== undefined ? { route } : {})
+        ...(route !== undefined ? { route } : {}),
+        ...(config !== undefined ? { config } : {})
       }
       if (mode === "voice") markRoute(trace)
       return trace
@@ -379,6 +394,16 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
       if (own !== undefined) return own
       const voice = options.engine.voice()
       return voice === undefined ? "" : voiceKey(voice)
+    }
+
+    /**
+     * The hearing part of a turn's configuration snapshot: the recogniser the stream runs on (a voice turn was heard
+     * with it), else the one the device would hear with now (typed text while no stream runs).
+     */
+    const hearingTrace = (): TraceConfig["hearing"] | undefined => {
+      if (streamHearing?.trace !== undefined) return streamHearing.trace
+      const now = options.hearing?.()
+      return now?.kind === "ready" ? now.trace : undefined
     }
 
     // Late-bound: the dispatcher's conversations report their turns here.
@@ -592,7 +617,16 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
         Effect.gen(function*() {
           const inbox = yield* Queue.unbounded<ConversationInput>()
           let runs = 0
-          const { setup, agentSetup } = options.conversationSetup(assistant)
+          const { setup, agentSetup, config: assistantConfig } = options.conversationSetup(assistant)
+          /** The assistant's part and the device's hearing, joined once per change of either (the turn path reads it). */
+          let joined: { readonly part: AssistantTraceConfig; readonly hearing: TraceConfig["hearing"]; readonly value: TraceConfig } | undefined
+          const traceConfig = (): TraceConfig | undefined => {
+            const part = assistantConfig?.()
+            const hearing = hearingTrace()
+            if (part === undefined || hearing === undefined) return undefined
+            if (joined?.part !== part || joined.hearing !== hearing) joined = { part, hearing, value: { ...part, hearing } }
+            return joined.value
+          }
           const initial = reservedFor(assistant)
           reserved.delete(assistant)
           const conversation = yield* makeSessionConversation({
@@ -609,7 +643,8 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
               routeTimes: () => {
                 const r = dispatcherRef?.routeOf(assistant)
                 return r?.by === "decide" ? r.decision : undefined
-              }
+              },
+              config: traceConfig
             }),
             setup,
             ...(agentSetup !== undefined ? { agentSetup } : {}),
@@ -734,6 +769,8 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
       Deferred.doneUnsafe(was, Effect.void)
     }
     let streamKey: string | undefined
+    /** The hearing the recogniser stream runs on now (what an utterance was heard with). */
+    let streamHearing: Extract<Hearing, { kind: "ready" }> | undefined
     const switchWaitMs = options.hearerSwitchWaitMs ?? HEARER_SWITCH_WAIT_MS
     /** The id of a recogniser whose stream failed: not tried again until the hearing changes. */
     let failedId: string | undefined
@@ -765,6 +802,7 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
     const runStream = (hearing: Extract<Hearing, { kind: "ready" }>, hearingNow: () => Hearing): Effect.Effect<void> =>
       Effect.gen(function*() {
         streamKey = hearing.key
+        streamHearing = hearing
         const fiber = yield* Effect.forkChild(Effect.exit(Stream.runForEach(hearing.stt.transcribe(input), (event) =>
           Effect.suspend(() => {
             if (event._tag === "SpeechStarted") utteranceOpen = true
@@ -779,6 +817,7 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
           )
           if (ended.ended !== undefined) {
             streamKey = undefined
+            streamHearing = undefined
             const exit = ended.ended
             if (Exit.isFailure(exit) && !Cause.hasInterruptsOnly(exit.cause)) {
               const squashed = Cause.squash(exit.cause)
@@ -792,13 +831,19 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
           }
           const next = hearingNow()
           // A recogniser still being bound (`waiting`) keeps the current one: the device goes on hearing.
-          if (next.kind === "waiting" || sameHearing(next, hearing)) continue
+          if (next.kind === "waiting") continue
+          if (sameHearing(next, hearing)) {
+            // The same recogniser, perhaps for another hearer (same hearing settings): the snapshot names the one now.
+            if (next.kind === "ready") streamHearing = next
+            continue
+          }
           // §3.5: the new recogniser is ready (the pool binds it only then); switch at the next silence, waiting at
           // most `switchWaitMs` for an open utterance to end.
           const deadline = now() + switchWaitMs
           while (utteranceOpen && now() < deadline) yield* Effect.sleep(20)
           yield* Fiber.interrupt(fiber)
           streamKey = undefined
+          streamHearing = undefined
           yield* closeOpenUtterance
           return
         }
@@ -831,6 +876,7 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
           }
         }).pipe(Effect.ensuring(Effect.sync(() => {
           streamKey = undefined
+          streamHearing = undefined
         })))
     }
     let detach: Effect.Effect<void> | undefined
