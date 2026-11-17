@@ -122,18 +122,13 @@ describe("pair", () => {
     expect((received[0]!.body as { hostname: string }).hostname).toBe(platformInfo().hostname)
   })
 
-  it("lets --name win over the name the server suggests, keeps the tls pin, and works without a name", async () => {
+  it("lets --name win over the name the server suggests and keeps the tls pin", async () => {
     const pin = `sha256:${"ab".repeat(32)}`
     reply = answer({ deviceId: "node-kitchen-1", credential: "B".repeat(43), name: "Kitchen" })
     // A pin only matters for https; over plain http it is kept in the config and not checked.
     const named = await Effect.runPromise(pair({ server: base, code: "K7QM2XHP", configPath: configPath("named"), name: "Hall", tlsPin: pin }))
     expect(named.name).toBe("Hall")
     expect(named.tlsPin).toBe(pin)
-
-    reply = answer({ deviceId: "node-kitchen-2", credential: "C".repeat(43) })
-    const unnamed = await Effect.runPromise(pair({ server: base, code: "K7QM2XHP", configPath: configPath("unnamed") }))
-    expect(unnamed).toEqual({ server: base, deviceId: "node-kitchen-2", credential: "C".repeat(43) })
-    expect("name" in unnamed).toBe(false)
   })
 
   it("refuses a malformed code before sending anything", async () => {
@@ -153,18 +148,34 @@ describe("pair", () => {
     expect((await run("K7QM2XHP")).message).toContain("PVA_ADMIN_PASSWORD is not set")
   })
 
+  it("says how long to wait after too many wrong codes (429)", async () => {
+    reply = answer({ error: "rate_limited", retryAfterMs: 12_345 }, 429)
+    expect((await run("K7QM2XHP")).message).toBe("pairing failed: too many wrong codes: try again in 13 s")
+
+    reply = answer({ error: "rate_limited", retryAfterMs: 100 }, 429)
+    expect((await run("K7QM2XHP")).message).toBe("pairing failed: too many wrong codes: try again in 1 s")
+
+    reply = answer({ error: "rate_limited" }, 429)
+    expect((await run("K7QM2XHP")).message).toBe("pairing failed: too many wrong codes: try again later")
+  })
+
+  it("says so when the server did not accept the request (400) or cannot save the node (503)", async () => {
+    reply = answer({ error: "bad_request" }, 400)
+    expect((await run("K7QM2XHP")).message).toBe("pairing failed: the server did not accept the request (bad_request); is this pva-node as new as the assistant?")
+
+    reply = answer({ error: "unavailable" }, 503)
+    expect((await run("K7QM2XHP")).message).toContain("cannot save the new node")
+  })
+
   it("says so when the server has no pairing, and passes an unknown error through", async () => {
     reply = { status: 404, body: "Not found" }
     expect((await run("K7QM2XHP")).message).toContain("does not offer pairing (/node/pair)")
-
-    reply = answer({ error: "rate_limited" }, 429)
-    expect((await run("K7QM2XHP")).message).toBe("pairing failed: rate_limited")
 
     reply = { status: 500, body: "<html>oops</html>" }
     expect((await run("K7QM2XHP")).message).toBe("pairing failed: HTTP 500")
   })
 
-  it("refuses an answer that is not a pairing result, or that does not make a valid config, and writes nothing", async () => {
+  it("refuses an answer that is not a pairing result and writes nothing", async () => {
     const path = configPath("refused")
     reply = answer({ hello: "world" })
     expect((await run("K7QM2XHP", {}, path)).message).toContain("not a pairing result")
@@ -172,8 +183,14 @@ describe("pair", () => {
     reply = { status: 200, body: "not json" }
     expect((await run("K7QM2XHP", {}, path)).message).toContain("not a pairing result")
 
-    reply = answer({ deviceId: "x", credential: "A".repeat(43) }) // device ids have a minimum length
-    expect((await run("K7QM2XHP", {}, path)).message).toContain("does not make a valid config")
+    reply = answer({ deviceId: "node-kitchen-1", credential: "A".repeat(43) }) // no name
+    expect((await run("K7QM2XHP", {}, path)).message).toContain("not a pairing result")
+
+    reply = answer({ deviceId: "x", credential: "A".repeat(43), name: "Kitchen" }) // device ids have a minimum length
+    expect((await run("K7QM2XHP", {}, path)).message).toContain("not a pairing result")
+
+    reply = answer({ deviceId: "node-kitchen-1", credential: "short", name: "Kitchen" })
+    expect((await run("K7QM2XHP", {}, path)).message).toContain("not a pairing result")
 
     expect(() => statSync(path)).toThrow()
   })

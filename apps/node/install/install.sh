@@ -12,7 +12,7 @@
 # Options
 #   --server <url>        the assistant, e.g. http://assistant.lan:8787 (remembered for later runs)
 #   --code <code>         pairing code from admin (asked for when missing and the node is not paired yet)
-#   --no-pair             write node.json without pairing (servers without /node/pair); with --device-id, --name
+#   --name <name>         suggested device name (default: the hostname; the name set in admin wins)
 #   --tls-pin sha256:<hex> SHA-256 of the server certificate's public key (a self-signed https server)
 #   --audio auto|alsa|pipewire  default auto: PipeWire when --user is given and that user's PipeWire runs, else ALSA
 #   --user <name>         run as this desktop user's systemd user service (PipeWire); default: system service
@@ -45,8 +45,6 @@ usage() { sed -n '2,/^set -eu/p' "$0" 2>/dev/null | sed -e '/^set -eu/d' -e 's/^
 
 SERVER=''
 CODE=''
-NO_PAIR=0
-DEVICE_ID=''
 NAME=''
 TLS_PIN=''
 AUDIO=''
@@ -62,9 +60,6 @@ while [ $# -gt 0 ]; do
 	--server=*) SERVER=${1#*=}; shift ;;
 	--code) need_value "$1" $#; CODE=$2; shift 2 ;;
 	--code=*) CODE=${1#*=}; shift ;;
-	--no-pair) NO_PAIR=1; shift ;;
-	--device-id) need_value "$1" $#; DEVICE_ID=$2; shift 2 ;;
-	--device-id=*) DEVICE_ID=${1#*=}; shift ;;
 	--name) need_value "$1" $#; NAME=$2; shift 2 ;;
 	--name=*) NAME=${1#*=}; shift ;;
 	--tls-pin) need_value "$1" $#; TLS_PIN=$2; shift 2 ;;
@@ -373,16 +368,14 @@ own_files() {
 }
 
 write_config() {
+	# The server refuses a node that was not paired, so a config comes from pairing and from nothing else.
 	if [ -n "$CODE" ]; then
-		[ "$NO_PAIR" = 0 ] || die "--code and --no-pair exclude each other"
 		set -- pair --server "$SERVER" --code "$CODE" --config "$CONFIG"
-	elif [ "$NO_PAIR" = 1 ]; then
-		set -- configure --server "$SERVER" --config "$CONFIG"
-		if [ -n "$DEVICE_ID" ]; then set -- "$@" --device-id "$DEVICE_ID"; fi
-	elif [ -f "$CONFIG" ]; then
+	elif [ -f "$CONFIG" ] && grep -q '"credential"' "$CONFIG"; then
 		say "keeping $CONFIG (pass --code to pair again)"
 		return 0
 	else
+		# No config, or one from before pairing (no credential): the server would refuse it.
 		[ -r /dev/tty ] && [ -w /dev/tty ] || die "this node is not paired: pass --code <code> (Admin › Devices › Add voice node)"
 		printf 'Pairing code (Admin › Devices › Add voice node): ' >/dev/tty
 		read -r CODE </dev/tty || die "no pairing code"

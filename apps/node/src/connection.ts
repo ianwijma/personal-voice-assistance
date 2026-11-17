@@ -3,7 +3,7 @@
  * and report why it ended. The reconnect policy (`reconnectDelay`, `closeAction`) is pure so it can be tested.
  *
  * Uses the `ws` package rather than Node 22's global `WebSocket`: it exposes `bufferedAmount` the same way, and
- * takes an `https.Agent` / `checkServerIdentity`, which WP-10 needs for the `tlsPin` of a self-signed server.
+ * lets a `tlsPin` replace the certificate check for a self-signed server (§8).
  */
 import {
   type ClientMessage,
@@ -15,7 +15,9 @@ import {
   type ServerMessage
 } from "@pva/protocol"
 import { Data, Deferred, Effect, type Scope } from "effect"
+import type { TLSSocket } from "node:tls"
 import WebSocket from "ws"
+import { parseTlsPin, peerKeySha256 } from "./update.ts"
 
 export interface Timing {
   readonly openTimeoutMs: number
@@ -25,10 +27,13 @@ export interface Timing {
   /** Reconnect backoff: `backoffBaseMs` doubling to `backoffMaxMs`, with jitter (§7.4: 0.5 s → 30 s, for ever). */
   readonly backoffBaseMs: number
   readonly backoffMaxMs: number
-  /** After the server refused this node's credential (4403, §5.1): retry only this often. */
+  /** After the server refused this node's credential (4403): retry only this often. */
   readonly unauthorizedRetryMs: number
   /** After `sessions_full`: claim again this much later. */
   readonly claimRetryMs: number
+  /** `node.status`: the device lists are read this often, and a changed status is sent at most this often. */
+  readonly statusPollMs: number
+  readonly statusThrottleMs: number
 }
 
 export const defaultTiming: Timing = {
@@ -39,14 +44,13 @@ export const defaultTiming: Timing = {
   backoffBaseMs: 500,
   backoffMaxMs: 30_000,
   unauthorizedRetryMs: 10 * 60_000,
-  claimRetryMs: 10_000
+  claimRetryMs: 10_000,
+  statusPollMs: 5000,
+  statusThrottleMs: 1000
 }
 
-/**
- * TODO(WP-6): protocol 7's `CloseCode.unauthorized` (a voice-node hello without a valid credential, or a removed
- * node). Declared here so the reconnect policy already handles it; replace with the protocol constant.
- */
-export const UNAUTHORIZED_CLOSE_CODE = 4403
+/** Why a connection to a pinned server was dropped before `hello`: shown in the log and as `lastError`. */
+export const PIN_MISMATCH = "the server's certificate does not match the pin"
 
 /** Delay before reconnect attempt `attempt` (1-based): exponential, capped, "equal jitter" (half fixed, half random). */
 export const reconnectDelay = (attempt: number, timing: Pick<Timing, "backoffBaseMs" | "backoffMaxMs">, random: () => number = Math.random): number => {
@@ -57,7 +61,7 @@ export const reconnectDelay = (attempt: number, timing: Pick<Timing, "backoffBas
 export type CloseAction = "retry" | "outdated" | "unauthorized"
 
 export const closeAction = (code: number): CloseAction =>
-  code === CloseCode.protocolMismatch ? "outdated" : code === UNAUTHORIZED_CLOSE_CODE ? "unauthorized" : "retry"
+  code === CloseCode.protocolMismatch ? "outdated" : code === CloseCode.unauthorized ? "unauthorized" : "retry"
 
 export class ConnectionLost extends Data.TaggedError("ConnectionLost")<{
   readonly code: number
@@ -69,7 +73,8 @@ export class ConnectionLost extends Data.TaggedError("ConnectionLost")<{
 /** What the connection hands to whoever drives the protocol. */
 export interface ConnectionHandlers {
   readonly onMessage: (message: ServerMessage) => void
-  readonly onUndecodable: (text: string) => void
+  /** A text frame the codec could not decode (not a protocol-9 message). Default: ignored. */
+  readonly onUndecodable?: (text: string) => void
   readonly onReplyFrame: (turnId: number, pcm: Uint8Array) => void
 }
 
@@ -86,11 +91,30 @@ const toBytes = (data: WebSocket.RawData): Uint8Array => {
   return new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength)
 }
 
-const openSocket = (url: string, timing: Timing) =>
+/**
+ * Open the socket. With a `pin` the certificate is not checked by the system (a self-signed server); instead, on
+ * `open` and before anything is sent, the SHA-256 of the peer's public key must equal the pin, or the socket is
+ * dropped. Nothing, the credential least of all, is sent before that.
+ */
+const openSocket = (url: string, timing: Timing, pin: string | undefined) =>
   Effect.callback<WebSocket, ConnectionLost>((resume) => {
-    const ws = new WebSocket(url, { maxPayload: 4 * 1024 * 1024 })
+    const secure = url.startsWith("wss:")
+    const ws = new WebSocket(url, { maxPayload: 4 * 1024 * 1024, ...(secure && pin !== undefined ? { rejectUnauthorized: false } : {}) })
     const fail = (code: number, reason: string) => resume(Effect.fail(new ConnectionLost({ code, reason, welcomed: false })))
-    ws.once("open", () => resume(Effect.succeed(ws)))
+    let upgraded: TLSSocket | undefined
+    ws.once("upgrade", (res) => {
+      upgraded = res.socket as TLSSocket
+    })
+    ws.once("open", () => {
+      if (secure && pin !== undefined) {
+        const key = upgraded === undefined ? undefined : peerKeySha256(upgraded)
+        if (key !== pin) {
+          ws.terminate()
+          return fail(0, PIN_MISMATCH)
+        }
+      }
+      resume(Effect.succeed(ws))
+    })
     ws.once("error", (e) => fail(0, e.message))
     ws.once("unexpected-response", (_req, res) => fail(0, `HTTP ${res.statusCode ?? "?"} instead of a WebSocket`))
     return Effect.sync(() => ws.terminate())
@@ -109,10 +133,12 @@ export const connectOnce = (
   url: string,
   hello: HelloMessage,
   attach: (socket: OpenSocket) => ConnectionHandlers,
-  timing: Timing = defaultTiming
+  timing: Timing = defaultTiming,
+  tlsPin?: string | undefined
 ): Effect.Effect<never, ConnectionLost, Scope.Scope> =>
   Effect.gen(function*() {
-    const ws = yield* Effect.acquireRelease(openSocket(url, timing), (ws) =>
+    const pin = parseTlsPin(tlsPin)
+    const ws = yield* Effect.acquireRelease(openSocket(url, timing, pin), (ws) =>
       Effect.sync(() => {
         ws.removeAllListeners()
         ws.on("error", () => {})
@@ -152,7 +178,7 @@ export const connectOnce = (
         const decoded = decodeServerMessage(Buffer.from(text.buffer, text.byteOffset, text.byteLength).toString("utf8"))
         if (decoded._tag === "Unknown") return
         if (decoded._tag === "Invalid") {
-          handlers.onUndecodable(Buffer.from(text.buffer, text.byteOffset, text.byteLength).toString("utf8"))
+          handlers.onUndecodable?.(Buffer.from(text.buffer, text.byteOffset, text.byteLength).toString("utf8"))
           return
         }
         const m = decoded.message

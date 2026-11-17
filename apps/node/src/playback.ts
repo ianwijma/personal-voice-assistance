@@ -86,8 +86,11 @@ export const applyGain = (pcm: Uint8Array, gain: number): Uint8Array => {
 }
 
 export interface ReplyPlayerOptions {
-  readonly output: AudioOutput["Service"]
-  readonly cueOutput: AudioOutput["Service"]
+  /** The output now in use: read at each reply and cue, so a changed `soundDevices.output` applies from the next play. */
+  readonly output: () => AudioOutput["Service"]
+  readonly cueOutput: () => AudioOutput["Service"]
+  /** A reply or cue could not be played (the device failed to open or the player died). */
+  readonly onPlayFailed?: (cause: string) => void
   /** Reported as `playback.started.outputLatencyMs` and used by the clock. */
   readonly outputLatencyMs: number
   /** 0..100, read at each frame (so a profile change applies within a reply). */
@@ -175,7 +178,7 @@ export const makeReplyPlayer = (options: ReplyPlayerOptions): ReplyPlayer => {
     const audio = Stream.fromQueue(reply.queue).pipe(Stream.tap(onWrite))
     return Effect.scoped(Effect.gen(function*() {
       yield* Effect.forkScoped(progress)
-      yield* options.output.play(audio, reply.sampleRate)
+      yield* options.output().play(audio, reply.sampleRate)
     })).pipe(
       Effect.matchCause({
         onSuccess: () => {
@@ -185,6 +188,7 @@ export const makeReplyPlayer = (options: ReplyPlayerOptions): ReplyPlayer => {
         },
         onFailure: (cause) => {
           log(`reply ${reply.turnId}: playback failed: ${String(cause)}`)
+          options.onPlayFailed?.(String(cause))
           finalStopped(reply)
         }
       }),
@@ -246,8 +250,13 @@ export const makeReplyPlayer = (options: ReplyPlayerOptions): ReplyPlayer => {
       if (current !== undefined) return
       stopCue()
       const scaled = applyGain(new Uint8Array(samples.buffer, samples.byteOffset, samples.byteLength), volumeGain(options.volume()))
-      const fiber = options.fork(options.cueOutput.play(Stream.make(scaled), sampleRate).pipe(
-        Effect.catchCause((cause) => Effect.sync(() => log(`cue failed: ${String(cause)}`)))
+      const fiber = options.fork(options.cueOutput().play(Stream.make(scaled), sampleRate).pipe(
+        Effect.catchCause((cause) =>
+          Effect.sync(() => {
+            log(`cue failed: ${String(cause)}`)
+            options.onPlayFailed?.(String(cause))
+          })
+        )
       ))
       cueFiber = fiber
       fiber.addObserver(() => {

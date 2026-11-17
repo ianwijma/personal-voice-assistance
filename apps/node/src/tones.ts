@@ -42,11 +42,11 @@ export const wakeCue = (rate = TONE_RATE) => toneSequence([{ hz: 660, ms: 70 }, 
 /** Lapse cue: 990 → 660 Hz (the armed window closed with nothing said). */
 export const lapseCue = (rate = TONE_RATE) => toneSequence([{ hz: 990, ms: 70 }, { hz: 660, ms: 90 }], CUE_PEAK, rate)
 
-/** Identify: three rising tones, about 1.2 s (WP-10's `node.command identify`; also `test-tone --identify`). */
+/** Identify: three rising tones, about 1.2 s (`node.command identify`; also `test-tone --sound identify`). */
 export const identifySound = (rate = TONE_RATE) =>
   toneSequence([{ hz: 523, ms: 380 }, { hz: 659, ms: 380 }, { hz: 784, ms: 400 }], CUE_PEAK, rate)
 
-/** Test tone: a pure 1 kHz sine at −20 dBFS (`test-tone`, WP-10's `test-speaker`). */
+/** Test tone: a pure 1 kHz sine at −20 dBFS (`test-tone`, `node.command test-speaker`). */
 export const testTone = (durationMs = 1000, rate = TONE_RATE) => toneSequence([{ hz: 1000, ms: durationMs }], CUE_PEAK, rate, 0)
 
 export const asBytes = (samples: Int16Array): Uint8Array => new Uint8Array(samples.buffer, samples.byteOffset, samples.byteLength)

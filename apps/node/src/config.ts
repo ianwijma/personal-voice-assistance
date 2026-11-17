@@ -1,13 +1,11 @@
 /**
- * The node's own file, `/etc/pva-node/node.json` (docs/VOICE-NODES.md §2, §7.1): where the server is and who this
- * node is. Everything else (wake phrases, voice, volume, audio devices) comes from the server's profile.
- *
- * WP-3 (protocol 5): `credential` and `tlsPin` are read and kept but not used yet. WP-10 sends the credential in
- * `hello.node` and makes it required; `pair --code` (WP-10) writes this file with `writeConfig`.
+ * The node's own file, `/etc/pva-node/node.json` (docs/VOICE-NODES.md §5, §8): where the server is, who this node is
+ * and the credential pairing gave it. Everything else (wake phrases, voice, volume, audio devices) comes from the
+ * server's `device.setup`. A file without a credential is not a node config: the server refuses an unpaired node.
  */
 import { chmod, readFile, rename, writeFile } from "node:fs/promises"
 import { hostname } from "node:os"
-import { DeviceId, DeviceName, MAX_DEVICE_NAME_CHARS, WS_PATH } from "@pva/protocol"
+import { DeviceId, DeviceName, MAX_DEVICE_NAME_CHARS, NodeCredential, WS_PATH } from "@pva/protocol"
 import { Effect, Schema } from "effect"
 
 export const DEFAULT_CONFIG_PATH = "/etc/pva-node/node.json"
@@ -18,9 +16,9 @@ export const NodeConfig = Schema.Struct({
   deviceId: DeviceId,
   /** Suggested device name for `hello` (the server keeps the admin-set name for a paired node). Default: hostname. */
   name: Schema.optionalKey(DeviceName),
-  /** The node credential from pairing (WP-10 sends it; unused on protocol 5). */
-  credential: Schema.optionalKey(Schema.String),
-  /** `sha256:<hex>` of a self-signed server certificate (WP-10; unused on protocol 5). */
+  /** The node credential from pairing, sent in `hello.node`. */
+  credential: NodeCredential,
+  /** `sha256:<hex>` of a self-signed server certificate: checked before `hello` is sent, and for `/node/*`. */
   tlsPin: Schema.optionalKey(Schema.String)
 })
 export type NodeConfig = typeof NodeConfig.Type
@@ -66,12 +64,6 @@ export const webSocketUrl = (server: string): string => {
   else if (url.protocol === "https:") url.protocol = "wss:"
   if (url.pathname === "" || url.pathname === "/") url.pathname = WS_PATH
   return url.toString()
-}
-
-/** A device id for development runs without a config file: stable per host, so the server sees one device. */
-export const defaultDeviceId = (host = hostname()): string => {
-  const cleaned = host.replace(/[^A-Za-z0-9_-]/g, "-").slice(0, 50)
-  return `node-${cleaned}`.padEnd(8, "0")
 }
 
 export const defaultDeviceName = (host = hostname()): string => {

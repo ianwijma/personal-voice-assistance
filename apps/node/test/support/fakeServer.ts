@@ -3,19 +3,27 @@
  * the real protocol codecs of `@pva/protocol` (text frames through `decodeClientMessage` / `encodeServerMessage`,
  * binary frames through `decodeMicFrame` / `encodeReplyFrame`). It answers `hello` with `welcome` (protocol-version
  * checked, as the server does) and `ping` with `pong`; everything else is driven by the test.
+ *
+ * Protocol 9 (docs/VOICE-NODES.md §6.1): a `hello` without `node`, from a device that is not a `voice-node`, or with
+ * a credential other than `credential` (when given) is closed with 4403 and no `welcome`. `setup` is sent in
+ * `welcome.snapshot.setup`. With `tls` the server speaks wss on a self-signed certificate (for the pin tests).
  */
+import * as https from "node:https"
 import type { AddressInfo } from "node:net"
 import {
   type ClientMessage,
   type ClientMessageOf,
   type ClientMessageType,
   decodeClientMessage,
+  CloseCode,
   decodeMicFrame,
+  type DeviceSetup,
   encodeReplyFrame,
   encodeServerMessage,
   type MicFrame,
   PROTOCOL_VERSION,
-  type ServerMessage
+  type ServerMessage,
+  VOICE_NODE_KIND
 } from "@pva/protocol"
 import { exampleSnapshot } from "@pva/protocol/examples"
 import { type WebSocket, WebSocketServer } from "ws"
@@ -25,11 +33,19 @@ export interface FakeServerOptions {
   readonly welcome?: boolean
   /** Make the welcomed connection the audio owner on its `audio.claim` (default true). */
   readonly grantClaims?: boolean
+  /** The only credential accepted (default: any well-formed one, as the codec checked it). */
+  readonly credential?: string
+  /** `welcome.snapshot.setup`. */
+  readonly setup?: DeviceSetup
+  /** Serve wss with this key and certificate instead of ws. */
+  readonly tls?: { readonly key: string; readonly cert: string }
 }
 
 interface FakeServerState {
   welcome: boolean
   grantClaims: boolean
+  credential: string | undefined
+  setup: DeviceSetup | undefined
 }
 
 interface Waiter {
@@ -68,8 +84,19 @@ export class FakeConnection {
     this.messages.push({ at: performance.now(), message: m })
     if (m.type === "hello") {
       if (m.protocol !== PROTOCOL_VERSION) return this.ws.close(4400, "protocol mismatch")
+      const credential = m.node?.credential
+      if (m.device?.kind !== VOICE_NODE_KIND || credential === undefined || (this.options.credential !== undefined && credential !== this.options.credential)) {
+        return this.ws.close(CloseCode.unauthorized, "unauthorized")
+      }
       if (this.options.welcome) {
-        this.send({ type: "welcome", protocol: PROTOCOL_VERSION, server: { name: "fake", version: "0" }, connectionId: "c1", snapshot: { ...exampleSnapshot, role: "observer", ownerPresent: false } })
+        const setup = this.options.setup
+        this.send({
+          type: "welcome",
+          protocol: PROTOCOL_VERSION,
+          server: { name: "fake", version: "0" },
+          connectionId: "c1",
+          snapshot: { ...exampleSnapshot, role: "observer", ownerPresent: false, ...(setup !== undefined ? { setup } : {}) }
+        })
       }
     } else if (m.type === "ping") {
       this.send({ type: "pong", id: m.id })
@@ -131,9 +158,14 @@ export class FakeServer {
   /** Read on every message, so a test can change it while connections are open. */
   readonly options: FakeServerState
 
-  private constructor(wss: WebSocketServer, options: FakeServerOptions) {
+  private readonly tlsServer: https.Server | undefined
+  private readonly secure: boolean
+
+  private constructor(wss: WebSocketServer, options: FakeServerOptions, tlsServer?: https.Server) {
     this.wss = wss
-    this.options = { welcome: options.welcome ?? true, grantClaims: options.grantClaims ?? true }
+    this.tlsServer = tlsServer
+    this.secure = tlsServer !== undefined
+    this.options = { welcome: options.welcome ?? true, grantClaims: options.grantClaims ?? true, credential: options.credential, setup: options.setup }
     wss.on("connection", (ws) => {
       const connection = new FakeConnection(ws, this.options)
       this.connections.push(connection)
@@ -147,13 +179,22 @@ export class FakeServer {
   }
 
   static start(options: FakeServerOptions = {}): Promise<FakeServer> {
+    const tls = options.tls
+    if (tls !== undefined) {
+      return new Promise((resolve) => {
+        const tlsServer = https.createServer(tls)
+        const wss: WebSocketServer = new WebSocketServer({ server: tlsServer, path: "/ws" })
+        tlsServer.listen(0, "127.0.0.1", () => resolve(new FakeServer(wss, options, tlsServer)))
+      })
+    }
     return new Promise((resolve) => {
       const wss: WebSocketServer = new WebSocketServer({ host: "127.0.0.1", port: 0, path: "/ws" }, (): void => resolve(new FakeServer(wss, options)))
     })
   }
 
   get url(): string {
-    return `http://127.0.0.1:${(this.wss.address() as AddressInfo).port}`
+    const port = this.tlsServer !== undefined ? (this.tlsServer.address() as AddressInfo).port : (this.wss.address() as AddressInfo).port
+    return `${this.secure ? "https" : "http"}://127.0.0.1:${port}`
   }
 
   /** The `n`-th connection (1-based), once it exists. */
@@ -170,6 +211,11 @@ export class FakeServer {
 
   stop(): Promise<void> {
     for (const c of this.connections) c.ws.terminate()
-    return new Promise((resolve) => this.wss.close(() => resolve()))
+    return new Promise((resolve) =>
+      this.wss.close(() => {
+        if (this.tlsServer !== undefined) this.tlsServer.close(() => resolve())
+        else resolve()
+      })
+    )
   }
 }

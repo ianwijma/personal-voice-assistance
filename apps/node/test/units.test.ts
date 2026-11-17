@@ -6,10 +6,10 @@ import { exampleTrace } from "@pva/protocol/examples"
 import { Effect, Stream } from "effect"
 import { describe, expect, it } from "vitest"
 import { fileCapture, inputFiles } from "../src/audio.ts"
-import { defaultDeviceId, parseConfig, readConfig, webSocketUrl, writeConfig } from "../src/config.ts"
+import { parseConfig, readConfig, webSocketUrl, writeConfig } from "../src/config.ts"
 import { closeAction, reconnectDelay } from "../src/connection.ts"
 import { applyGain, PlaybackClock, volumeGain } from "../src/playback.ts"
-import { formatTraceInfo, isSessionsFull } from "../src/session.ts"
+import { formatTraceInfo } from "../src/session.ts"
 import { identifySound, testTone, TONE_RATE, wakeCue } from "../src/tones.ts"
 
 describe("PlaybackClock", () => {
@@ -89,12 +89,10 @@ describe("config", () => {
     expect(notJson.message).toContain("not valid JSON")
   })
 
-  it("derives the WebSocket URL and a device id", () => {
+  it("derives the WebSocket URL", () => {
     expect(webSocketUrl("http://assistant.lan:8787")).toBe("ws://assistant.lan:8787/ws")
     expect(webSocketUrl("https://assistant.lan/")).toBe("wss://assistant.lan/ws")
     expect(webSocketUrl("ws://10.0.0.2:8787/ws")).toBe("ws://10.0.0.2:8787/ws")
-    expect(defaultDeviceId("kitchen.local")).toBe("node-kitchen-local")
-    expect(defaultDeviceId("a")).toMatch(/^[A-Za-z0-9_-]{8,64}$/)
   })
 })
 
@@ -105,12 +103,6 @@ describe("session helpers", () => {
     if (exampleTrace.marks.playbackStart !== undefined) {
       expect(line).toContain(`audible=${Math.round(exampleTrace.marks.playbackStart + 20)}ms`)
     }
-  })
-
-  it("recognises the protocol-6 sessions_full error from raw text", () => {
-    expect(isSessionsFull(JSON.stringify({ type: "error", error: { code: "sessions_full", message: "full" } }))).toBe(true)
-    expect(isSessionsFull(JSON.stringify({ type: "error", error: { code: "bad_message", message: "x" } }))).toBe(false)
-    expect(isSessionsFull("not json")).toBe(false)
   })
 })
 

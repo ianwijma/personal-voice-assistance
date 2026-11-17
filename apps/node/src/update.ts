@@ -1,7 +1,7 @@
 /**
  * Self-update from the node's own server (docs/VOICE-NODES.md §7.3).
  *
- * Before every connection attempt (and after a 4400, and on WP-10's `node.command update`) the node fetches
+ * Before every connection attempt (and after a 4400, and on `node.command update`) the node fetches
  * `<server>/node/manifest.json`. When the manifest's `bundle.sha256` is not the running bundle's, it downloads the
  * bundle (at most `bundle.bytes`), refuses it unless its length and SHA-256 match the manifest, stores it as a new
  * release, switches `current` atomically and exits 0; the service manager starts the new release through the boot
@@ -13,8 +13,8 @@
  * directory named by the file's own SHA-256). A development run (`tsx src/main.ts`) or a bundle started from
  * `dist/` never replaces itself.
  *
- * The manifest format (`Manifest`) is the contract with the server's `/node/*` routes (WP-7); `scripts/bundle.mjs`
- * writes it.
+ * The manifest format (`NodeManifest` of `@pva/protocol`) is the contract with the server's `/node/*` routes;
+ * `scripts/bundle.mjs` writes it.
  */
 import { X509Certificate } from "node:crypto"
 import { existsSync, readFileSync, realpathSync } from "node:fs"
@@ -24,6 +24,7 @@ import { arch } from "node:os"
 import { basename, dirname } from "node:path"
 import type { TLSSocket } from "node:tls"
 import { fileURLToPath } from "node:url"
+import { NodeManifest } from "@pva/protocol"
 import { Effect, Schema } from "effect"
 import { installRelease, isSha256, readState, recordError, ReleaseInstallError, confirmRelease, sha256Hex } from "./releases.ts"
 
@@ -39,28 +40,8 @@ export const NODE_VERSION = BUILD?.version ?? "dev"
 
 // --- the manifest ------------------------------------------------------------------------------------------------
 
-export const MANIFEST_FORMAT = 1
-const Sha256 = Schema.String.check(Schema.isPattern(/^[0-9a-f]{64}$/))
-/** A file next to the manifest. `path` is resolved against the manifest's URL. */
-export const Artifact = Schema.Struct({ path: Schema.String, sha256: Sha256, bytes: Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)) })
-const RuntimePin = Schema.Struct({ url: Schema.String, sha256: Sha256 })
-
-export const Manifest = Schema.Struct({
-  format: Schema.Literal(MANIFEST_FORMAT),
-  /** `PROTOCOL_VERSION` of the bundle. */
-  protocol: Schema.Int,
-  version: Schema.String,
-  builtAt: Schema.optionalKey(Schema.String),
-  /** `pva-node.mjs`: what the node runs. */
-  bundle: Artifact,
-  /** `pva-node-boot.mjs`: the boot guard (installed by install.sh, never by the node). */
-  boot: Artifact,
-  /** `install.sh`, for admin's command and for checking a downloaded copy. */
-  installer: Schema.optionalKey(Artifact),
-  /** The pinned Node runtime (`scripts/runtime.json`). */
-  runtime: Schema.Struct({ version: Schema.String, "linux-arm64": RuntimePin, "linux-x64": RuntimePin })
-})
-export type Manifest = typeof Manifest.Type
+/** The manifest is `NodeManifest` of `@pva/protocol` (the server reads it too); `scripts/bundle.mjs` writes it. */
+export type Manifest = NodeManifest
 
 export class UpdateError extends Schema.TaggedError<UpdateError>()("UpdateError", {
   message: Schema.String,
@@ -88,7 +69,7 @@ export const decodeManifest = (bytes: Uint8Array): Effect.Effect<Manifest, Updat
     try: (): unknown => JSON.parse(Buffer.from(bytes).toString("utf8")),
     catch: () => new UpdateError({ message: "the manifest is not valid JSON", unreachable: false })
   }).pipe(
-    Effect.flatMap((json) => Schema.decodeUnknownEffect(Manifest)(json)),
+    Effect.flatMap((json) => Schema.decodeUnknownEffect(NodeManifest)(json)),
     Effect.mapError((e) => e instanceof UpdateError ? e : new UpdateError({ message: `not a node manifest: ${e.message}`, unreachable: false }))
   )
 

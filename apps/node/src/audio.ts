@@ -11,9 +11,8 @@
  * ALSA otherwise (headless boxes, and the system service, which has no user session) — `chooseBackend`. Device
  * lists come from `pw-dump` and `arecord -L` / `aplay -L` (`listDevices`).
  *
- * Seams:
- * - **WP-10**: the profile's `audioInput` / `audioOutput` arrive as `inputDevice` / `outputDevice`; reopening on a
- *   profile change rebuilds these layers.
+ * The pushed `soundDevices` (protocol 9) arrive as `inputDevice` / `outputDevice`; `buildAudio` makes the services
+ * for one choice again, so `runNode` can reopen the capture and use another output from the next play.
  */
 import { accessSync, constants, existsSync, readdirSync, statSync } from "node:fs"
 import { delimiter, join } from "node:path"
@@ -25,7 +24,6 @@ import {
 } from "@pva/audio-alsa"
 import { loadInputPcm, makeFileOutput, pacedFrames } from "@pva/audio-file"
 import {
-  type AudioDeviceInfo,
   captureCommand,
   defaultOptions as pipeWireDefaults,
   listPipeWireDevices,
@@ -34,13 +32,13 @@ import {
   playbackCommand
 } from "@pva/audio-pipewire"
 import { AudioError, AudioInput, AudioOutput } from "@pva/core"
+import type { AudioDeviceInfo } from "@pva/protocol"
 import { Context, Effect, Layer, Stream } from "effect"
 
 export type DeviceBackend = "pipewire" | "alsa"
 export type BackendChoice = DeviceBackend | "auto"
 export type AudioBackendName = DeviceBackend | "file"
 
-/** Protocol 7's `AudioDeviceInfo` (WP-6 moves it to `@pva/protocol`); the one `@pva/audio-pipewire` defines. */
 export type { AudioDeviceInfo }
 
 /** What `chooseBackend` looks at; injectable for tests. */
@@ -117,7 +115,7 @@ export interface NodeAudioOptions {
   readonly outputWav?: string | undefined
   /** Silence between two input files, so the reply to one can finish before the next. */
   readonly inputGapMs?: number | undefined
-  /** Backend device ids (`""` / undefined = the backend's default). WP-10 fills them from the profile. */
+  /** Backend device ids (`""` / undefined = the backend's default); `soundDevices` of the pushed setup. */
   readonly inputDevice?: string | undefined
   readonly outputDevice?: string | undefined
   readonly captureLatencyMs?: number | undefined
@@ -190,40 +188,55 @@ const alsaLayers = (options: NodeAudioOptions): DeviceLayers => {
   }
 }
 
-const deviceLayers = (options: NodeAudioOptions): Effect.Effect<DeviceLayers, AudioError> =>
-  Effect.succeed(options.backend === "alsa" ? alsaLayers(options) : pipeWireLayers(options))
+/** What the node plays and records with, for one choice of devices. */
+export interface NodeAudio {
+  readonly input: AudioInput["Service"]
+  readonly output: AudioOutput["Service"]
+  readonly info: NodeAudioInfo["Service"]
+}
 
-/** `AudioInput`, `AudioOutput` and `NodeAudioInfo` for these options. Device backends are only built when used. */
-export const audioLayer = (options: NodeAudioOptions): Layer.Layer<AudioInput | AudioOutput | NodeAudioInfo, AudioError> =>
-  Layer.effectContext(Effect.gen(function*() {
-    const needsDevice = options.inputWav === undefined || options.outputWav === undefined
-    const device = needsDevice ? yield* deviceLayers(options) : undefined
-    const input = options.inputWav !== undefined
-      ? AudioInput.of({
-        stream: Stream.unwrap(Effect.try({
-          try: () => fileCapture(inputFiles(options.inputWav!), options.inputGapMs ?? DEFAULT_INPUT_GAP_MS),
-          catch: (cause) => new AudioError({ message: `cannot read ${options.inputWav}`, cause })
-        }))
-      })
-      : device!.input
-    const fileOutput = options.outputWav !== undefined
-    const output = fileOutput ? makeFileOutput({ directory: options.outputWav! }) : device!.output
-    const cueOutput = fileOutput ? makeFileOutput({ directory: options.outputWav!, prefix: "cue" }) : output
-    return Context.make(AudioInput, input).pipe(
-      Context.add(AudioOutput, output),
-      Context.add(NodeAudioInfo, NodeAudioInfo.of({
-        input: options.inputWav !== undefined ? "file" : options.backend,
-        output: fileOutput ? "file" : options.backend,
-        outputLatencyMs: fileOutput ? 0 : device!.outputLatencyMs,
-        cueOutput
+/** The audio services for these options (device backends are only built when used). */
+export const buildAudio = (options: NodeAudioOptions): NodeAudio => {
+  const needsDevice = options.inputWav === undefined || options.outputWav === undefined
+  const device = needsDevice ? (options.backend === "alsa" ? alsaLayers(options) : pipeWireLayers(options)) : undefined
+  const input = options.inputWav !== undefined
+    ? AudioInput.of({
+      stream: Stream.unwrap(Effect.try({
+        try: () => fileCapture(inputFiles(options.inputWav!), options.inputGapMs ?? DEFAULT_INPUT_GAP_MS),
+        catch: (cause) => new AudioError({ message: `cannot read ${options.inputWav}`, cause })
       }))
-    )
+    })
+    : device!.input
+  const fileOutput = options.outputWav !== undefined
+  const output = fileOutput ? makeFileOutput({ directory: options.outputWav! }) : device!.output
+  const cueOutput = fileOutput ? makeFileOutput({ directory: options.outputWav!, prefix: "cue" }) : output
+  return {
+    input,
+    output,
+    info: NodeAudioInfo.of({
+      input: options.inputWav !== undefined ? "file" : options.backend,
+      output: fileOutput ? "file" : options.backend,
+      outputLatencyMs: fileOutput ? 0 : device!.outputLatencyMs,
+      cueOutput
+    })
+  }
+}
+
+/** `AudioInput`, `AudioOutput` and `NodeAudioInfo` for these options. */
+export const audioLayer = (options: NodeAudioOptions): Layer.Layer<AudioInput | AudioOutput | NodeAudioInfo, AudioError> =>
+  Layer.effectContext(Effect.sync(() => {
+    const audio = buildAudio(options)
+    return Context.make(AudioInput, audio.input).pipe(Context.add(AudioOutput, audio.output), Context.add(NodeAudioInfo, audio.info))
   }))
 
+/** The programs a backend needs that are not on `PATH` (`node.status.missingTools`). */
+export const missingTools = (backend: DeviceBackend, probe: BackendProbe = systemProbe): Array<string> =>
+  (backend === "alsa" ? ["arecord", "aplay"] : ["pw-record", "pw-cat", "pw-dump"]).filter((program) => !probe.onPath(program))
+
 /**
- * The devices of a backend for `pva-node devices` (and WP-10's `node.status`): PipeWire's sources and sinks from
+ * The devices of a backend for `pva-node devices` (and `node.status`): PipeWire's sources and sinks from
  * `pw-dump` (ids are `node.name`s), ALSA's `default` and `plughw:CARD=…` PCMs from `arecord -L` / `aplay -L`. Each id
- * is what `--input-device` / `--output-device` (and the profile's `audioInput` / `audioOutput`) take; `""` always
+ * is what `--input-device` / `--output-device` (and `soundDevices`) take; `""` always
  * means the backend's default. Fails with `AudioError` when the listing program is missing or fails.
  */
 export const listDevices = (backend: DeviceBackend): Effect.Effect<AudioDevices, AudioError> =>
