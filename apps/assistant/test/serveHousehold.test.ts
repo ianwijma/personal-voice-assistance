@@ -111,7 +111,10 @@ describe("household data in serve mode", () => {
     const live = await study.waitFor("household.event")
     expect(changeOf(live)).toMatchObject({ collection: "board", op: "put", value: { text: "study only" } })
     await sleep(150)
-    expect(events(kitchen)).toHaveLength(0)
+    // The kitchen could have been shown a household row, so it is told this one is not for it: the collection and the
+    // id only, nothing of the row.
+    expect(events(kitchen).map((e) => Object.keys(changeOf(e)).sort())).toEqual([["collection", "id", "op"]])
+    expect(JSON.stringify(kitchen.messages)).not.toContain("study only")
     expect(JSON.stringify(kitchen.messages)).not.toContain("not for pages")
     expect(JSON.stringify(study.messages)).not.toContain("not for pages")
 
@@ -158,10 +161,13 @@ describe("household data in serve mode", () => {
     for (let i = 0; i < 150; i += 2) await run(store!.collection(board).update(`b${i}`, (v) => (v.device === undefined ? { ...v, device: "study-00001" } : { text: v.text })))
     for (let i = 0; i < 450; i += 5) await run(store!.collection(wall).remove(`x${i}`))
     await studyHello
+    // What is committed now, from the writes above.
     const all = new Map<string, Note>()
-    for (const c of [board, wall]) {
-      for (const order of ["asc", "desc"] as const) for (const r of await run(store!.collection(c).list({ limit: 1000, orderBy: { field: "updatedAt", direction: order } }))) all.set(`${c.name}/${r.id}`, r.value)
+    for (let i = 0; i < 150; i++) {
+      const before: Note = { text: `before ${i}`, ...(i % 3 === 0 ? { device: "study-00001" } : {}) }
+      all.set(`board/b${i}`, i % 2 !== 0 ? before : before.device === undefined ? { ...before, device: "study-00001" } : { text: before.text })
     }
+    for (let i = 0; i < 450; i++) if (i % 5 !== 0) all.set(`wall/x${i}`, { text: `burst ${i}`, device: "kitchen-0001" })
     const visibleTo = (device: string) => new Map([...all].filter(([, v]) => v.device === undefined || v.device === device).map(([key, v]) => [key, { text: v.text }] as const))
     for (const [client, device] of [[kitchen, "kitchen-0001"], [study, "study-00001"]] as const) {
       const expected = visibleTo(device)

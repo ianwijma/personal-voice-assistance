@@ -1,7 +1,7 @@
-import type { HouseholdChange, HouseholdCollectionRows, HouseholdEventInfo, HouseholdRow, HouseholdSnapshotMessage } from "@pva/protocol"
+import type { HouseholdChange, HouseholdCollectionRef, HouseholdCollectionRows, HouseholdEventInfo, HouseholdRow, HouseholdSnapshotMessage } from "@pva/protocol"
 import { Effect } from "effect"
 import type { EventType, HouseholdEvent } from "./EventBus.ts"
-import { type Collection, type HouseholdStore, isStoreFailure, MAX_VALUE_CHARS, type Row, type ScopeRef, type TargetDevice } from "./HouseholdStore.ts"
+import { type Collection, type HouseholdStore, isStoreFailure, MAX_VALUE_CHARS, type PageCursor, type Row, type ScopeKind, type ScopeRef, scopeKey, type TargetDevice } from "./HouseholdStore.ts"
 
 /**
  * What voice pages receive of the household data (docs/STORING-DATA.md "Pages"; docs/MODULES-PLAN.md §4 P4).
@@ -12,16 +12,17 @@ import { type Collection, type HouseholdStore, isStoreFailure, MAX_VALUE_CHARS, 
  * the row is read as it is committed at that moment and projected with the server's record of the device then. So a
  * row that was removed or moved away before its frame was built never travels, whatever happened earlier.
  *
- * - **Snapshot** (`snapshot`): after every `welcome` (a reconnect too), after a change to the page's device record,
- *   and when a page fell too far behind. A run of bounded steps (`SnapshotRun.step`), each reading at most
- *   `SNAPSHOT_PAGE_ROWS` rows of one collection and scope through an index and returning the frames to send at once.
- *   Every frame, envelopes included, has at most `SNAPSHOT_PART_CHARS` characters, and the whole snapshot at most
- *   `SNAPSHOT_MAX_CHARS` (both well under the protocol's frame limit of 1,048,576); at most `SNAPSHOT_ROWS` rows per
- *   collection and scope and `SNAPSHOT_READ_ROWS` rows read in all. A collection with nothing visible sends nothing;
- *   one left out or cut short is `truncated`. The last frame is `final`.
- * - **Changes** (`change`): a row a committed change touched, read now: `put` when the page may see it, `remove` when
- *   it may not but the page holds it (in the scope and at the rev the page was given, nothing of what replaced it),
- *   nothing otherwise.
+ * - **Snapshot** (`snapshot`): a run of bounded steps (`SnapshotRun.step`), each reading at most `SNAPSHOT_PAGE_ROWS`
+ *   rows of one collection and scope through an index and returning the frames to send at once. Every frame has at
+ *   most `SNAPSHOT_PART_CHARS` characters and the whole snapshot at most `SNAPSHOT_MAX_CHARS`, every frame counted
+ *   whole as it is encoded (both under the protocol's frame limit of 1,048,576); at most `SNAPSHOT_ROWS` rows per
+ *   collection and scope and `SNAPSHOT_READ_ROWS` rows read in all. The final frame names every collection whose
+ *   visible rows were not all sent (`truncated`); room for naming all of them is kept from the start, so that list
+ *   always fits.
+ * - **Changes** (`change`): a row a committed change touched, read now: `put` when the page may see it; otherwise
+ *   `remove` (the collection and the id, nothing else) when the page's device could have been shown one of the scopes
+ *   the row was in, nothing otherwise. Nothing is remembered per page about the rows it holds: a page ignores the
+ *   removal of an id it does not have.
  * - **Module events** (`live`): an event type's projection, now.
  *
  * A projection that throws, returns something that is not plain JSON or more than `MAX_VALUE_CHARS` of it, is treated
@@ -65,12 +66,19 @@ export const SNAPSHOT_ROWS = 500
 export const SNAPSHOT_PAGE_ROWS = 20
 /** The most rows a snapshot reads in all (visible or not). */
 export const SNAPSHOT_READ_ROWS = 5000
-/** The most characters of one `household.snapshot` message, envelopes included. */
+/** The most characters of one `household.snapshot` message, everything in it included. */
 export const SNAPSHOT_PART_CHARS = 256_000
-/** The most characters of one whole snapshot, all its messages together. */
+/** The most characters of one whole snapshot, all its messages together, each counted whole. */
 export const SNAPSHOT_MAX_CHARS = 900_000
+/**
+ * The most collections pages are sent (all modules together): the final frame must be able to name every one of them
+ * as `truncated`. A declaration beyond it is not sent, and reported.
+ */
+export const MAX_FEED_COLLECTIONS = 1500
+/** The most scopes a queued change remembers for its row; beyond, a removal goes to every page that sees the kind. */
+export const MAX_CHANGE_SCOPES = 16
 
-/** A projection that failed (`report`). */
+/** A projection that failed, or a declaration the feed cannot carry (`report`). */
 export interface FeedProblem {
   readonly module: string
   /** The collection or the event type. */
@@ -78,28 +86,33 @@ export interface FeedProblem {
   readonly message: string
 }
 
-/** What a page holds: per row (`module/collection/id`), the scope and rev it was given. */
-export interface FeedCursor {
-  readonly visible: Map<string, { readonly scope: ScopeRef; readonly rev: number }>
-}
-
-/** A row a committed change touched: which one, and in which scope. */
+/**
+ * A row committed changes touched: which one, and the scopes it was in (those changes' scopes, so a page that could
+ * see the row where it was is told it is gone); `"any"` when there were more than `MAX_CHANGE_SCOPES`.
+ */
 export interface FeedChange {
   readonly module: string
   readonly collection: string
   readonly id: string
-  readonly scope: ScopeRef
+  readonly scopes: ReadonlyArray<ScopeRef> | "any"
 }
 
-/** The key of a row in `FeedCursor.visible` and in a page's queue. */
+/** The key of a row in a page's queue. */
 export const feedRowKey = (module: string, collection: string, id: string) => `${module}/${collection}/${id}`
+
+/** Another change of the same row: its scopes added to those already queued. */
+export const mergeScopes = (queued: FeedChange["scopes"], scope: ScopeRef): FeedChange["scopes"] => {
+  if (queued === "any") return "any"
+  if (queued.some((s) => scopeKey(s) === scopeKey(scope))) return queued
+  return queued.length >= MAX_CHANGE_SCOPES ? "any" : [...queued, { ...scope }]
+}
+
+type SnapshotFrame = typeof HouseholdSnapshotMessage.Type
 
 /** A snapshot being sent: `step()` until `done`, sending each step's frames at once. */
 export interface SnapshotRun {
   readonly seq: number
-  /** What the page holds once the snapshot is complete (filled as steps run). */
-  readonly cursor: FeedCursor
-  readonly step: () => { readonly frames: ReadonlyArray<typeof HouseholdSnapshotMessage.Type>; readonly done: boolean }
+  readonly step: () => { readonly frames: ReadonlyArray<SnapshotFrame>; readonly done: boolean }
 }
 
 export interface HouseholdFeed {
@@ -111,13 +124,13 @@ export interface HouseholdFeed {
   readonly sendsCollection: (module: string, collection: string) => boolean
   /** Start a snapshot for `device` (read when each step runs). */
   readonly snapshot: (device: TargetDevice) => SnapshotRun
-  /** What `device` gets now of a row a change touched, or `undefined`; updates `cursor`. */
-  readonly change: (change: FeedChange, device: TargetDevice, cursor: FeedCursor) => HouseholdEventInfo | undefined
+  /** What `device` gets now of a row changes touched, or `undefined`. */
+  readonly change: (change: FeedChange, device: TargetDevice) => HouseholdEventInfo | undefined
   /** What `device` gets of a module event now, or `undefined`. */
   readonly live: (event: HouseholdEvent, device: TargetDevice) => HouseholdEventInfo | undefined
 }
 
-type Projected = { readonly visible: true; readonly value: unknown; readonly chars: number } | { readonly visible: false; readonly problem?: string }
+type Projected = { readonly visible: true; readonly value: unknown } | { readonly visible: false; readonly problem?: string }
 
 const HIDDEN: Projected = { visible: false }
 
@@ -139,7 +152,7 @@ const runProjection = <T>(project: ((x: T, device: TargetDevice) => unknown) | u
   }
   if (text === undefined) return { visible: false, problem: "the projection's result is not JSON" }
   if (text.length > MAX_VALUE_CHARS) return { visible: false, problem: `the projection's result has ${text.length} characters (at most ${MAX_VALUE_CHARS})` }
-  return { visible: true, value: JSON.parse(text) as unknown, chars: text.length }
+  return { visible: true, value: JSON.parse(text) as unknown }
 }
 
 /** What `device` may see of `row` (`undefined`: nothing, also when the projection fails). Plain JSON. */
@@ -151,6 +164,10 @@ export const projectRow = (collection: Collection<any>, row: Row<unknown> | unde
 
 const chars = (x: unknown) => JSON.stringify(x).length
 
+/** Whether a page on `device` could ever be shown a row of this scope kind (for a removal whose scopes are unknown). */
+const kindVisibleTo = (kind: ScopeKind, device: TargetDevice) =>
+  kind === "household" ? true : kind === "device" ? device.id !== undefined : false
+
 export const makeHouseholdFeed = (options: {
   readonly store: HouseholdStore
   readonly modules: ReadonlyArray<FeedModule>
@@ -158,15 +175,6 @@ export const makeHouseholdFeed = (options: {
   readonly report?: (problem: FeedProblem) => void
 }): HouseholdFeed => {
   const { store } = options
-  const collections = new Map<string, Collection<any>>()
-  const eventTypes = new Map<string, EventType>()
-  for (const m of options.modules) {
-    for (const c of m.collections) if (c.project !== undefined) collections.set(`${m.moduleId}/${c.name}`, c)
-    for (const e of m.events) if (e.project !== undefined) eventTypes.set(`${m.moduleId}.${e.type}`, e)
-  }
-  const sent = [...collections.entries()].map(([key, c]) => ({ moduleId: key.slice(0, key.indexOf("/")), collection: c }))
-  /** A module whose data cannot be used here (newer, failed upgrade) is never read for pages. */
-  const usable = (moduleId: string) => store.availability(moduleId) === undefined
   const report = (module: string, what: string, message: string) => {
     try {
       options.report?.({ module, what, message })
@@ -174,6 +182,22 @@ export const makeHouseholdFeed = (options: {
       // Reporting must not break delivery.
     }
   }
+  const collections = new Map<string, Collection<any>>()
+  const eventTypes = new Map<string, EventType>()
+  for (const m of options.modules) {
+    for (const c of m.collections) {
+      if (c.project === undefined) continue
+      if (collections.size >= MAX_FEED_COLLECTIONS) {
+        report(m.moduleId, c.name, `not sent to pages: pages are sent at most ${MAX_FEED_COLLECTIONS} collections`)
+        continue
+      }
+      collections.set(`${m.moduleId}/${c.name}`, c)
+    }
+    for (const e of m.events) if (e.project !== undefined) eventTypes.set(`${m.moduleId}.${e.type}`, e)
+  }
+  const sent = [...collections.entries()].map(([key, c]) => ({ moduleId: key.slice(0, key.indexOf("/")), collection: c }))
+  /** A module whose data cannot be used here (newer, failed upgrade) is never read for pages. */
+  const usable = (moduleId: string) => store.availability(moduleId) === undefined
 
   const projectFor = (moduleId: string, collection: Collection<any>, row: Row<unknown> | undefined, device: TargetDevice): Projected => {
     if (row === undefined || !mayRevealScopeTo(row.scope, device)) return HIDDEN
@@ -206,65 +230,72 @@ export const makeHouseholdFeed = (options: {
 
   const snapshot = (device: TargetDevice): SnapshotRun => {
     const seq = lastSeqNow(store)
-    const cursor: FeedCursor = { visible: new Map() }
     // The work: one entry per collection and visible scope.
     const todo = sent.flatMap(({ moduleId, collection }) => scopesOf(collection, device).map((scope) => ({ moduleId, collection, scope })))
+    /** The collections cut short so far (by `module/collection`), in the order found. */
+    const truncated = new Map<string, HouseholdCollectionRef>()
+    const refOf = (module: string, collection: string): HouseholdCollectionRef => ({ module, collection })
+    const frameOf = (part: number, final: boolean, collections: ReadonlyArray<HouseholdCollectionRows>, cut: ReadonlyArray<HouseholdCollectionRef>): SnapshotFrame =>
+      ({ type: "household.snapshot", seq, part, final, collections, truncated: cut })
+    let part = 0
+    // The final frame's cost when it names every collection this snapshot could cut short: kept free from the start.
+    const allRefs = [...new Map(todo.map((t) => [`${t.moduleId}/${t.collection.name}`, refOf(t.moduleId, t.collection.name)])).values()]
+    const finalReserve = chars(frameOf(999_999, true, [], allRefs))
+    /** Characters of the frames already sent, each counted whole (as `encodeServerMessage` writes it). */
+    let sentChars = 0
     let at = 0
-    let after: { updatedAt: number; id: string } | undefined
+    let after: PageCursor | undefined
     let rowsHere = 0
     let read = 0
-    /** Characters of the frames already sent (each counted whole, its envelope included). */
-    let sentChars = 0
-    let part = 0
     let finished = false
-    const frameOverhead = chars({ type: "household.snapshot", seq, part: 999_999, final: false, collections: [] })
+    const cut = (module: string, collection: string) => void truncated.set(`${module}/${collection}`, refOf(module, collection))
 
     const step = () => {
       if (finished) return { frames: [], done: true }
-      const frames: Array<typeof HouseholdSnapshotMessage.Type> = []
-      let chunks: Array<HouseholdCollectionRows> = []
-      let frameChars = frameOverhead
+      const frames: Array<SnapshotFrame> = []
+      let chunks: Array<{ module: string; collection: string; rows: Array<HouseholdRow> }> = []
+      // Lengths are exact and kept as rows are added (JSON: "[" + items joined by "," + "]"), never estimated.
+      const emptyLen = (n: number) => chars(frameOf(n, false, [], []))
+      let frameLen = emptyLen(part)
       const flush = () => {
         if (chunks.length === 0) return
-        frames.push({ type: "household.snapshot", seq, part: part++, final: false, collections: chunks })
-        sentChars += frameChars
+        const frame = frameOf(part++, false, chunks, [])
+        sentChars += frameLen
+        frames.push(frame)
         chunks = []
-        frameChars = frameOverhead
+        frameLen = emptyLen(part)
       }
-      /** Add one chunk (or rows to the last chunk of the same collection); `false` when the snapshot is full. */
-      const add = (module: string, collection: string, row: HouseholdRow | undefined, truncated: boolean): boolean => {
-        const envelope = chars({ module, collection, rows: [], truncated: true }) + 1
-        const rowChars = row === undefined ? 0 : chars(row) + 1
-        let last = chunks.at(-1)
-        const fresh = last === undefined || last.module !== module || last.collection !== collection
-        const cost = rowChars + (fresh ? envelope : 0)
-        // What is sent so far, this frame, this addition, and the final frame still to come stay within the bound.
-        if (sentChars + frameChars + cost + frameOverhead > SNAPSHOT_MAX_CHARS) return false
-        if (frameChars + cost > SNAPSHOT_PART_CHARS) {
-          flush()
-          last = undefined
+      /** Add one row: `false` when it does not fit the whole snapshot's bound (nothing is changed then). */
+      const add = (module: string, collection: string, row: HouseholdRow): boolean => {
+        const rowChars = chars(row)
+        const last = chunks.at(-1)
+        const same = last !== undefined && last.module === module && last.collection === collection
+        const envelope = chars({ module, collection, rows: [] })
+        const grow = same ? rowChars + (last.rows.length > 0 ? 1 : 0) : (chunks.length > 0 ? 1 : 0) + envelope + rowChars
+        if (frameLen + grow <= SNAPSHOT_PART_CHARS) {
+          if (sentChars + frameLen + grow + finalReserve > SNAPSHOT_MAX_CHARS) return false
+          if (same) last.rows.push(row)
+          else chunks.push({ module, collection, rows: [row] })
+          frameLen += grow
+          return true
         }
-        if (last === undefined || last.module !== module || last.collection !== collection) {
-          last = { module, collection, rows: [], truncated: false }
-          chunks.push(last)
-          frameChars += envelope
-        }
-        if (row !== undefined) (last.rows as Array<HouseholdRow>).push(row)
-        if (truncated) chunks[chunks.length - 1] = { ...last, truncated: true }
-        frameChars += rowChars
+        // A new frame: this one is sent as it is (if it holds anything), the row starts the next with its envelope.
+        const freshLen = emptyLen(chunks.length > 0 ? part + 1 : part) + envelope + rowChars
+        const flushed = chunks.length > 0 ? frameLen : 0
+        if (freshLen > SNAPSHOT_PART_CHARS || sentChars + flushed + freshLen + finalReserve > SNAPSHOT_MAX_CHARS) return false
+        flush()
+        chunks.push({ module, collection, rows: [row] })
+        frameLen = freshLen
         return true
       }
-      const markRestTruncated = () => {
-        for (let i = at; i < todo.length; i++) if (!add(todo[i]!.moduleId, todo[i]!.collection.name, undefined, true)) break
-        at = todo.length
-      }
-      const work = todo[at]
-      if (work === undefined) {
-        finished = true
+      const finish = () => {
         flush()
-        frames.push({ type: "household.snapshot", seq, part: part++, final: true, collections: [] })
+        finished = true
+        frames.push(frameOf(part++, true, [], [...truncated.values()]))
         return { frames, done: true }
       }
+      const work = todo[at]
+      if (work === undefined) return finish()
       const { moduleId, collection, scope } = work
       const next = () => {
         at++
@@ -276,9 +307,10 @@ export const makeHouseholdFeed = (options: {
         return { frames, done: false }
       }
       if (read >= SNAPSHOT_READ_ROWS) {
-        markRestTruncated()
-        flush()
-        return { frames, done: false }
+        // The reading budget is spent: every collection still to do may have rows; say so.
+        for (let i = at; i < todo.length; i++) cut(todo[i]!.moduleId, todo[i]!.collection.name)
+        at = todo.length
+        return finish()
       }
       const reader = store.reader(moduleId, collection)
       let rows: ReadonlyArray<Row<unknown>> = []
@@ -286,7 +318,7 @@ export const makeHouseholdFeed = (options: {
         rows = reader === undefined ? [] : reader.page(scope, after, Math.min(SNAPSHOT_PAGE_ROWS, SNAPSHOT_ROWS - rowsHere))
       } catch (e) {
         report(moduleId, collection.name, `could not be read for a page: ${isStoreFailure(e) ? e.message : String(e)}`)
-        add(moduleId, collection.name, undefined, true)
+        cut(moduleId, collection.name)
         next()
         flush()
         return { frames, done: false }
@@ -296,53 +328,54 @@ export const makeHouseholdFeed = (options: {
         const p = projectFor(moduleId, collection, row, device)
         if (!p.visible) continue
         const out: HouseholdRow = { id: row.id, rev: row.rev, scope: row.scope, value: p.value, updatedAt: row.updatedAt }
-        if (!add(moduleId, collection.name, out, false)) {
-          // Full: this collection is cut short here, the rest is left out.
-          add(moduleId, collection.name, undefined, true)
-          markRestTruncated()
-          flush()
-          return { frames, done: false }
+        if (!add(moduleId, collection.name, out)) {
+          // Full: this collection and every one after it may have rows left out.
+          for (let i = at; i < todo.length; i++) cut(todo[i]!.moduleId, todo[i]!.collection.name)
+          at = todo.length
+          return finish()
         }
-        cursor.visible.set(feedRowKey(moduleId, collection.name, row.id), { scope: row.scope, rev: row.rev })
       }
       rowsHere += rows.length
       const last = rows.at(-1)
       if (rows.length < SNAPSHOT_PAGE_ROWS || last === undefined) next()
       else if (rowsHere >= SNAPSHOT_ROWS) {
-        add(moduleId, collection.name, undefined, true)
+        cut(moduleId, collection.name)
         next()
-      } else after = { updatedAt: last.updatedAt, id: last.id }
+      } else after = { updatedAt: last.updatedAt, createdAt: last.createdAt, id: last.id }
       flush()
       return { frames, done: false }
     }
-    return { seq, cursor, step }
+    return { seq, step }
   }
 
-  const change = (c: FeedChange, device: TargetDevice, cursor: FeedCursor): HouseholdEventInfo | undefined => {
-    const key = feedRowKey(c.module, c.collection, c.id)
+  const change = (c: FeedChange, device: TargetDevice): HouseholdEventInfo | undefined => {
     const collection = collections.get(`${c.module}/${c.collection}`)
-    if (collection === undefined) return undefined
+    if (collection === undefined || !usable(c.module)) return undefined
+    const type = `${c.module}.${c.collection}.changed`
+    const could = c.scopes === "any" ? kindVisibleTo(collection.scope, device) : c.scopes.some((s) => mayRevealScopeTo(s, device))
+    if (!could) return undefined
+    // The row now, in whichever of its scopes this page may see.
     let row: Row<unknown> | undefined
-    if (usable(c.module) && mayRevealScopeTo(c.scope, device)) {
-      try {
-        row = store.reader(c.module, collection)?.get(c.id, c.scope)
-      } catch (e) {
-        report(c.module, collection.name, `row ${c.id} could not be read for a page: ${isStoreFailure(e) ? e.message : String(e)}`)
+    const reader = store.reader(c.module, collection)
+    const candidates = c.scopes === "any" ? scopesOf(collection, device) : c.scopes.filter((s) => mayRevealScopeTo(s, device))
+    try {
+      for (const scope of candidates) {
+        row = reader?.get(c.id, scope)
+        if (row !== undefined) break
       }
+    } catch (e) {
+      report(c.module, collection.name, `row ${c.id} could not be read for a page: ${isStoreFailure(e) ? e.message : String(e)}`)
+      row = undefined
     }
     const p = projectFor(c.module, collection, row, device)
-    const type = `${c.module}.${c.collection}.changed`
     if (p.visible && row !== undefined) {
-      cursor.visible.set(key, { scope: row.scope, rev: row.rev })
       const data: HouseholdChange = { collection: collection.name, id: c.id, op: "put", rev: row.rev, value: p.value }
       return { seq: row.rev, at: row.updatedAt, module: c.module, type, scope: row.scope, data }
     }
-    const held = cursor.visible.get(key)
-    if (held === undefined) return undefined
-    cursor.visible.delete(key)
-    // The removal names what the page was given: its scope and rev, nothing of a row that may have replaced it.
-    const data: HouseholdChange = { collection: collection.name, id: c.id, op: "remove", rev: held.rev }
-    return { seq: held.rev, at: Date.now(), module: c.module, type, scope: held.scope, data }
+    // Gone, or no longer for this page: the collection and the id only, in a scope this page may see anyway.
+    const data: HouseholdChange = { collection: collection.name, id: c.id, op: "remove" }
+    const scope: ScopeRef = candidates[0] ?? { kind: "household" }
+    return { at: Date.now(), module: c.module, type, scope, data }
   }
 
   return {

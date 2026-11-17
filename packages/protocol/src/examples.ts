@@ -707,9 +707,9 @@ export const serverExamples: { readonly [T in ServerMessageType]: Extract<Server
     collections: [{
       module: "timers",
       collection: "timers",
-      rows: [{ id: "t1", rev: 40, scope: { kind: "household" }, value: { label: "pasta", dueAt: 1_763_100_600_000 }, updatedAt: 1_763_100_000_000 }],
-      truncated: false
-    }]
+      rows: [{ id: "t1", rev: 40, scope: { kind: "household" }, value: { label: "pasta", dueAt: 1_763_100_600_000 }, updatedAt: 1_763_100_000_000 }]
+    }],
+    truncated: [{ module: "shopping", collection: "items" }]
   },
   "household.event": {
     type: "household.event",
@@ -722,6 +722,7 @@ export const serverExamples: { readonly [T in ServerMessageType]: Extract<Server
       data: { collection: "timers", id: "t1", op: "put", rev: 43, value: { label: "pasta", dueAt: 1_763_100_900_000 } }
     }
   },
+  "household.gap": { type: "household.gap", reason: "overflow" },
   ...assistantsServerExamples
 }
 

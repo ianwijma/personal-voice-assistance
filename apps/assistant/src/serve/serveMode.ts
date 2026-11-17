@@ -1382,7 +1382,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
         detail: `${p.what}: ${p.message}`.slice(0, 1900)
       })))
     reportFeed()
-    // Daily backups and change-log retention (never on a turn's path); a failing backup shows on the Health page.
+    // Daily backups and their retention (never on a turn's path); a failing backup shows on the Health page.
     if (household.sqlite !== undefined) {
       const sqlite = household.sqlite
       yield* Effect.forkScoped(runMaintenance(sqlite, {
@@ -1393,7 +1393,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
             severity: "warning",
             title: "The household backup failed",
             detail: problem.slice(0, 1900),
-            fix: { kind: "command", label: "Back up by hand", value: "pnpm start household backup" }
+            fix: { kind: "link", label: "About backups", value: "docs/STORING-DATA.md#backups" }
           }])
       }))
     }

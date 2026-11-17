@@ -1,9 +1,9 @@
-// The SQLite store's files and data safety (review round 1): private files, a newer file refused untouched,
-// backups that cannot meet, the checkpoint after an erase, retention of every archive, collection-only upgrades,
-// index names, the index every list shape uses, module namespaces, and a complete, consistent export.
+// The SQLite store's files and data safety: private files, a newer file refused untouched, backups one at a time in the
+// serving process, the checkpoint after a removal, retention of every archive, upgrades after a backup (also copied
+// to the second directory), index names, and the index every list shape uses.
 import { assert, describe, it } from "@effect/vitest"
 import { defineCollection, type StoreError } from "@pva/core"
-import { checkQuery } from "@pva/core/store-backend"
+import { checkQuery, layoutOf } from "@pva/core/store-backend"
 import { Effect, Exit, Fiber, Schema } from "effect"
 import { createHash } from "node:crypto"
 import { chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, statSync, utimesSync, writeFileSync } from "node:fs"
@@ -63,7 +63,7 @@ describe("SQLite store files", () => {
       again.close()
     }))
 
-  it.effect("concurrent backups of one day never overlap: one at a time through the lock, each through its own file, published whole", () =>
+  it.effect("concurrent backups of one day never overlap: one at a time in the serving process, each through its own file, published whole; no lock file", () =>
     Effect.gen(function*() {
       const dir = tmp()
       const file = join(dir, "household.db")
@@ -71,11 +71,9 @@ describe("SQLite store files", () => {
       const writer = yield* makeSqliteStore({ filename: file, backupCopyDir: copyDir })
       yield* writer.prepare([{ id: "shop", storage: { collections: [items] } }])
       for (let i = 0; i < 200; i++) yield* writer.forModule("shop").collection(items).insert({ text: `item ${i} ${"z".repeat(500)}` })
-      const reader = yield* makeSqliteStore({ filename: file, readOnly: true, backupCopyDir: copyDir })
       const now = Date.UTC(2026, 10, 18, 12)
-      const results = yield* Effect.all([writer.backup({ now }), writer.backup({ now }), reader.backup({ now }), reader.backup({ now })], { concurrency: "unbounded" })
+      const results = yield* Effect.all([writer.backup({ now }), writer.backup({ now }), writer.backup({ now })], { concurrency: "unbounded" })
       assert.strictEqual(new Set(results.map((r) => r.path)).size, 1)
-      // One at a time, across stores (and processes): the lock is gone afterwards.
       assert.isFalse(existsSync(join(dir, "backups", ".backup.lock")))
       for (const d of [join(dir, "backups"), copyDir]) {
         assert.deepStrictEqual(readdirSync(d).filter((n) => n.includes(".part-")), [], d)
@@ -86,29 +84,33 @@ describe("SQLite store files", () => {
       }
     }).pipe(Effect.scoped))
 
-  it.effect("a collection-only upgrade makes a backup first, which holds the rows as they were", () =>
+  it.effect("an upgrade makes a backup first, which holds the rows as they were, and copies it to the second directory; it does not count as the day's backup", () =>
     Effect.gen(function*() {
       const dir = tmp()
       const file = join(dir, "household.db")
-      const v2 = defineCollection({ name: "items", scope: "household", version: 2, schema: Schema.Struct({ text: Schema.String, n: Schema.Finite }), migrate: { 1: (v: { text: string }) => ({ ...v, n: 1 }) } })
+      const copyDir = join(dir, "share")
+      const v2 = defineCollection({ name: "items", scope: "household", schema: Schema.Struct({ text: Schema.String, n: Schema.Finite }), migrate: { 1: (v: { text: string }) => ({ ...v, n: 1 }) } })
       yield* Effect.scoped(Effect.gen(function*() {
         const store = yield* makeSqliteStore({ filename: file })
         yield* store.prepare([{ id: "shop", storage: { collections: [items] } }])
         yield* store.forModule("shop").collection(items).insert({ text: "as it was" })
       }))
       yield* Effect.scoped(Effect.gen(function*() {
-        const store = yield* makeSqliteStore({ filename: file })
-        yield* store.prepare([{ id: "shop", storage: { collections: [v2] } }])
+        const store = yield* makeSqliteStore({ filename: file, backupCopyDir: copyDir })
+        yield* store.prepare([{ id: "shop", storage: { version: 2, collections: [v2] } }])
         assert.strictEqual(store.availability("shop"), undefined)
+        // A pre-upgrade backup is not the day's backup: maintenance still makes (and copies) that one.
+        assert.strictEqual(yield* store.lastBackupAt, undefined)
       }))
       const backup = readdirSync(join(dir, "backups")).find((n) => /-before-shop\.db$/.test(n))
       assert.isDefined(backup)
+      assert.include(readdirSync(copyDir), backup!)
       const raw = new DatabaseSync(join(dir, "backups", backup!), { readOnly: true })
       assert.deepStrictEqual({ ...(raw.prepare("SELECT v, value FROM pva_docs").get() as object) }, { v: 1, value: "{\"text\":\"as it was\"}" })
       raw.close()
     }))
 
-  it.effect("every archive is removed after 14 days: daily backups, pre-upgrade backups; temporary files of others are left", () =>
+  it.effect("every archive is removed after 14 days, without exception: daily backups, pre-upgrade backups; temporary files of others are left", () =>
     Effect.gen(function*() {
       const dir = tmp()
       const file = join(dir, "household.db")
@@ -174,39 +176,55 @@ describe("SQLite store: a removal reaches the files", () => {
 })
 
 describe("SQLite store: names and indexes", () => {
-  it.effect("index names cannot collide: case-distinct fields and names with __ each get their own index; a dropped field loses its index", () =>
+  it.effect("index names cannot collide: owners and collections with __ or dots, fields of any case each get their own index; a changed declaration keeps only its own", () =>
     Effect.gen(function*() {
-      const store = yield* makeSqliteStore({ filename: ":memory:" })
+      const dir = tmp()
+      const file = join(dir, "household.db")
+      const store = yield* makeSqliteStore({ filename: file })
       const Two = Schema.Struct({ Title: Schema.optionalKey(Schema.String), title: Schema.optionalKey(Schema.String), c__d: Schema.optionalKey(Schema.String), d: Schema.optionalKey(Schema.String) })
-      const both = defineCollection({ name: "b", scope: "household", schema: Two, indexes: ["Title", "title", "c__d"] })
+      const both = defineCollection({ name: "b", scope: "household", schema: Two, indexes: ["Title", "title", "c__d", ["Title", "title"]] })
       const other = defineCollection({ name: "b__c", scope: "household", schema: Two, indexes: ["d"] })
-      yield* store.prepare([{ id: "m", storage: { collections: [both, other] } }])
-      const names = [indexName("m", "b", "Title"), indexName("m", "b", "title"), indexName("m", "b", "c__d"), indexName("m", "b__c", "d")]
-      assert.strictEqual(new Set(names).size, 4)
+      yield* store.prepare([{ id: "m", storage: { collections: [both, other] } }], [{ owner: "core.m", storage: { collections: [other] } }])
+      const names = [
+        ...layoutOf(both).map((spec) => indexName("m", "b", spec)),
+        ...layoutOf(other).map((spec) => indexName("m", "b__c", spec)),
+        ...layoutOf(other).map((spec) => indexName("core.m", "b__c", spec))
+      ]
+      assert.strictEqual(new Set(names).size, names.length)
       const c = store.forModule("m").collection(both)
       yield* c.insert({ Title: "X", title: "y" }, { id: "1" })
       yield* c.insert({ Title: "y", title: "X" }, { id: "2" })
       assert.deepStrictEqual((yield* c.list({ where: { Title: "X" } })).map((r) => r.id), ["1"])
       assert.deepStrictEqual((yield* c.list({ where: { title: "X" } })).map((r) => r.id), ["2"])
-      // The module drops `title` from its indexes: the index goes.
+      // The module drops `title` (a new version): its indexes go; the other collection's and the core's stay.
       const fewer = defineCollection({ name: "b", scope: "household", schema: Two, indexes: ["Title"] })
-      yield* store.prepare([{ id: "m", storage: { collections: [fewer, other] } }])
+      yield* store.prepare([{ id: "m", storage: { version: 2, collections: [fewer, other] } }], [{ owner: "core.m", storage: { collections: [other] } }])
       const exit = yield* Effect.exit(store.forModule("m").collection(fewer).list({ where: { title: "X" } as never }))
       assert.strictEqual(errorOf(exit)?.reason, "invalid")
-      const raw = yield* store.core("probe").query<{ name: string }>("SELECT name FROM sqlite_schema WHERE type = 'index' AND name LIKE 'pva_ix_%' ORDER BY name")
-      assert.sameMembers(raw.map((r) => r.name), [indexName("m", "b", "Title"), indexName("m", "b__c", "d")])
+      const raw = new DatabaseSync(file, { readOnly: true })
+      const have = (raw.prepare("SELECT name FROM sqlite_schema WHERE type = 'index' AND name LIKE 'pva_ix_%' ORDER BY name").all() as Array<{ name: string }>).map((r) => r.name)
+      raw.close()
+      assert.sameMembers(have, [
+        ...layoutOf(fewer).map((spec) => indexName("m", "b", spec)),
+        ...layoutOf(other).map((spec) => indexName("m", "b__c", spec)),
+        ...layoutOf(other).map((spec) => indexName("core.m", "b__c", spec))
+      ])
     }).pipe(Effect.scoped))
 
   it.effect("every list shape reads one index in its own order (no sort of the matching rows), on a large table", () =>
     Effect.gen(function*() {
-      const store = yield* makeSqliteStore({ filename: ":memory:" })
+      const dir = tmp()
+      const file = join(dir, "household.db")
+      const store = yield* makeSqliteStore({ filename: file })
       const Timer = Schema.Struct({ state: Schema.String, due: Schema.Finite, label: Schema.String })
-      const timers = defineCollection({ name: "timers", scope: "household", schema: Timer, indexes: ["state", "due"] })
+      const timers = defineCollection({ name: "timers", scope: "household", schema: Timer, indexes: ["state", "due", ["state", "due"]] })
       yield* store.prepare([{ id: "timers", storage: { collections: [timers] } }])
       const c = store.forModule("timers").collection(timers)
-      yield* store.forModule("timers").transaction((tx) => {
-        for (let i = 0; i < 3000; i++) tx.collection(timers).insert({ state: i % 3 === 0 ? "running" : "done", due: i % 50, label: `t${i}` })
-      })
+      for (let k = 0; k < 30; k++) {
+        yield* store.forModule("timers").transaction((tx) => {
+          for (let i = 0; i < 100; i++) tx.collection(timers).insert({ state: (k * 100 + i) % 3 === 0 ? "running" : "done", due: i % 50, label: `t${k}.${i}` })
+        })
+      }
       const shapes = [
         undefined,
         { orderBy: { field: "updatedAt" as const, direction: "asc" as const } },
@@ -215,18 +233,22 @@ describe("SQLite store: names and indexes", () => {
         { orderBy: { field: "due" as const, direction: "desc" as const } },
         { where: { state: "running" } },
         { where: { state: "running" }, orderBy: { field: "updatedAt" as const, direction: "asc" as const } },
+        { where: { state: "running" }, orderBy: { field: "createdAt" as const } },
         { where: { state: "running" }, orderBy: { field: "state" as const } },
+        { where: { state: "running" }, orderBy: { field: "due" as const } },
+        { where: { state: "running" }, orderBy: { field: "due" as const, direction: "desc" as const } },
         { where: { due: 3 } }
       ]
-      const raw = store.core("probe")
+      const raw = new DatabaseSync(file, { readOnly: true })
       for (const shape of shapes) {
         const checked = checkQuery(timers, { ...shape, limit: 20 })
         const { sql, params } = listSql("timers", "timers", { kind: "household" }, checked)
-        const plan = (yield* raw.query<{ detail: string }>(`EXPLAIN QUERY PLAN ${sql}`, params as ReadonlyArray<string | number>)).map((r) => r.detail).join(" | ")
+        const plan = (raw.prepare(`EXPLAIN QUERY PLAN ${sql}`).all(...params) as Array<{ detail: string }>).map((r) => r.detail).join(" | ")
         assert.notMatch(plan, /TEMP B-TREE|SCAN pva_docs(?! USING)/, `${JSON.stringify(shape)}: ${plan}`)
         assert.match(plan, /USING (COVERING )?INDEX/, `${JSON.stringify(shape)}: ${plan}`)
         assert.isTrue((yield* c.list({ ...shape, limit: 20 })).length <= 20)
       }
+      raw.close()
     }).pipe(Effect.scoped))
 })
 

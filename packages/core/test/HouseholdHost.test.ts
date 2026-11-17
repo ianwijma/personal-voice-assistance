@@ -57,7 +57,7 @@ describe("household store in the module host", () => {
 
   it.effect("data written by a newer version makes the module unavailable, with the reason; it never starts", () =>
     Effect.gen(function*() {
-      const h = yield* makeTestHousehold([shop], { storedVersions: { shop: { "collection:items": 2 } } })
+      const h = yield* makeTestHousehold([shop], { storedVersions: { shop: 2 } })
       const host = yield* makeModuleHost({ catalog: [shop], persistence: readOnlyPersistence(), env: {}, household: h.household })
       yield* host.startEnabled
       const info = host.modules()[0]!

@@ -1,33 +1,52 @@
 import "./quiet.ts"
 import {
   type Collection,
-  type CoreSql,
-  type CoreTx,
   type HouseholdStore,
-  readOnlyError,
+  type IndexKey,
   type ScopeRef,
   scopeFromColumns,
   scopeIdOf,
-  type SqlValue,
   StoreError
 } from "@pva/core"
-import { type CheckedQuery, makeStoreEngine, type StoredDoc, type SyncBackend, TX_CONTROL } from "@pva/core/store-backend"
+import { type BulkRow, type CheckedQuery, type IndexSpec, layoutOf, makeStoreEngine, type StoredCollection, type StoredDoc, type SyncBackend } from "@pva/core/store-backend"
 import { Clock, Effect, Semaphore, type Scope } from "effect"
+import { existsSync } from "node:fs"
 import { open, stat } from "node:fs/promises"
 import type { DatabaseSync, StatementSync } from "node:sqlite"
-import { dirname, join } from "node:path"
-import { checkpointFile, copyDatabase, copyFilePrivately, type FileGuard, lastBackupIn, narrow, privateDir, pruneArchives, type PruneResult, sqlite, unguarded, withBackupLock } from "./files.ts"
+import { basename, dirname, join } from "node:path"
+import {
+  copyDatabase,
+  copyFilePrivately,
+  DAILY,
+  type FileGuard,
+  lastBackupIn,
+  makeCheckpointer,
+  narrow,
+  privateDir,
+  pruneArchives,
+  type PruneResult,
+  sqlite,
+  unguarded,
+  walBytes
+} from "./files.ts"
 
 /**
  * The household store on SQLite (docs/STORING-DATA.md): one file (`data/household.db`, mode 0600 in a 0700
  * directory), WAL, `synchronous = NORMAL`, `secure_delete = ON`, one connection through Node's built-in `node:sqlite`
  * (`DatabaseSync`, no native build, no driver in between), under the engine of `@pva/core/store-backend`.
  *
- * Every statement on that connection is synchronous on the main thread, which also frames audio. A transaction is one
- * synchronous step (`BEGIN IMMEDIATE`, the function, `COMMIT`), so nothing can come between its statements. Every read
- * a turn can make is one index range with a row limit (`INDEXED BY`, so a query that cannot use its index fails instead
- * of scanning) and writes touch single rows. What is long runs elsewhere: backups on a connection of their own (one
- * step on SQLite's worker thread), the checkpoint after a removal on a worker thread of its own.
+ * Every statement on that connection is synchronous on the main thread, which also frames audio, so nothing unbounded
+ * runs on it: a transaction is one synchronous step (`BEGIN IMMEDIATE`, the function, `COMMIT`); every read a turn can
+ * make is one index range with a row limit (`INDEXED BY`, so a query that cannot use its index fails instead of
+ * scanning); writes touch single rows; the connection never checkpoints (`wal_autocheckpoint = 0`) and never waits for
+ * a lock (`busy_timeout = 0`: a lock held elsewhere is a `busy` failure, which a transaction retries a few times on a
+ * timer, off the event loop). What is long runs elsewhere: backups on a connection of their own (one step on SQLite's
+ * worker thread), checkpoints on a worker thread of their own (passive ones regularly, a truncating one after a
+ * removal and at start).
+ *
+ * The value of every indexed field is kept in a column of its own (`k0` … `k7`), bound from JavaScript: SQLite never
+ * re-parses a number from the row's JSON (its parser is not exact), so filters and orders see exactly the values the
+ * in-memory store sees.
  */
 
 /** The store's own schema version (`pva_meta.schema`). A file with a higher one is refused before it is opened for writing. */
@@ -36,10 +55,17 @@ export const CORE_SCHEMA_VERSION = 1
 /** How many days a backup is kept (docs/STORING-DATA.md "What is kept how long"). */
 export const KEEP_DAYS = 14
 
+/** A write-ahead log above this many bytes is a Health issue (something keeps the checkpoints from finishing). */
+export const WAL_WARN_BYTES = 64 * 1024 * 1024
+/** A passive checkpoint is made when the log holds more than this many bytes. */
+const PASSIVE_AT_BYTES = 1024 * 1024
+/** Key columns: one per distinct indexed field (`MAX_INDEXES`). */
+const KEY_COLUMNS = 8
+
 export interface SqliteStoreOptions {
   /** The database file, or `:memory:` (tests; the CLI modes when there is no file yet). */
   readonly filename: string
-  /** Read only (the CLI modes): writes are refused; a file is opened read-only. */
+  /** Read only (the CLI modes): writes are refused; a file is opened read-only; no backups. */
   readonly readOnly?: boolean
   /** Where backups go. Default `<directory of the file>/backups`. */
   readonly backupDir?: string
@@ -53,18 +79,37 @@ export interface SqliteStoreOptions {
   readonly guard?: FileGuard
   /** First retry of a checkpoint a reader blocked, in ms (tests). Default 1000. */
   readonly scrubRetryMs?: number
+  /** How often the log's size is looked at (and a passive checkpoint made when it grew), in ms. Default 10,000. */
+  readonly checkpointEveryMs?: number
+  /** A log above this many bytes is a Health issue. Default `WAL_WARN_BYTES`. */
+  readonly walWarnBytes?: number
+  /** The most pages the file may have (`PRAGMA max_page_count`; tests make a full disk with it). Default: SQLite's. */
+  readonly maxPageCount?: number
 }
 
 export interface SqliteHouseholdStore extends HouseholdStore {
-  /** The newest backup's time (epoch ms), or `undefined` when there is none. */
-  readonly lastBackupAt: Effect.Effect<number | undefined>
+  /** The newest daily backup's time (epoch ms), or `undefined` when there is none. Fails when the directory cannot be read. */
+  readonly lastBackupAt: Effect.Effect<number | undefined, StoreError>
+  /** The newest daily backup's time in the second directory (`undefined`: none, or no second directory). */
+  readonly lastCopyAt: Effect.Effect<number | undefined, StoreError>
+  /** Copy the newest daily backup to the second directory again (after that copy failed). */
+  readonly copyLatest: Effect.Effect<void, StoreError>
   readonly backupDir: string | undefined
+  readonly backupCopyDir: string | undefined
   /** `PRAGMA quick_check` (doctor; it reads the whole file, so never on a turn). */
   readonly check: Effect.Effect<string, StoreError>
-  /** Remove backups past their time (maintenance): what was removed, and what could not be. */
+  /** Remove backups past their time (maintenance): what was removed, and what could not be done. */
   readonly pruneBackups: (options?: { readonly now?: number }) => Effect.Effect<PruneResult>
   /** The last pruning's failures (a Health issue while there are any). */
   readonly pruneFailures: () => ReadonlyArray<string>
+  /** The last copy to the second directory that failed, or `undefined`. */
+  readonly copyFailure: () => string | undefined
+  /** Data or backup directories other users may write to, which the store could not make private (Health errors). */
+  readonly directoryProblems: () => ReadonlyArray<string>
+  /** The write-ahead log's size when it was last looked at, in bytes. */
+  readonly walSize: () => number
+  /** The size above which the log is a Health issue. */
+  readonly walWarnBytes: number
   /**
    * Since when a removed row's content may still be in the write-ahead log (its checkpoint waits for a reader that
    * holds an older snapshot; it is retried), or `undefined` when every removal is checkpointed.
@@ -74,67 +119,77 @@ export interface SqliteHouseholdStore extends HouseholdStore {
   readonly scrubbed: Effect.Effect<void>
 }
 
+const keyColumns = Array.from({ length: KEY_COLUMNS }, (_, i) => `k${i}`)
+
 const CORE_DDL = `
   CREATE TABLE pva_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID;
-  CREATE TABLE pva_versions (owner TEXT NOT NULL, name TEXT NOT NULL, version INTEGER NOT NULL, PRIMARY KEY (owner, name)) WITHOUT ROWID;
+  CREATE TABLE pva_owners (owner TEXT PRIMARY KEY, version INTEGER NOT NULL) WITHOUT ROWID;
+  CREATE TABLE pva_collections (
+    owner TEXT NOT NULL, name TEXT NOT NULL, version INTEGER NOT NULL, scope TEXT NOT NULL, shape TEXT NOT NULL,
+    PRIMARY KEY (owner, name)
+  ) WITHOUT ROWID;
   CREATE TABLE pva_docs (
-    module TEXT NOT NULL, collection TEXT NOT NULL, id TEXT NOT NULL,
+    owner TEXT NOT NULL, collection TEXT NOT NULL, id TEXT NOT NULL,
     scope_kind TEXT NOT NULL, scope_id TEXT NOT NULL,
     rev INTEGER NOT NULL, v INTEGER NOT NULL, value TEXT NOT NULL,
     created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, updated_by TEXT NOT NULL,
-    PRIMARY KEY (module, collection, id)
+    ${keyColumns.join(", ")},
+    PRIMARY KEY (owner, collection, id)
   ) WITHOUT ROWID;
-  CREATE INDEX pva_docs_updated ON pva_docs (module, collection, scope_kind, scope_id, updated_at, id);
-  CREATE INDEX pva_docs_created ON pva_docs (module, collection, scope_kind, scope_id, created_at, id);
-  CREATE INDEX pva_docs_conversation ON pva_docs (scope_id) WHERE scope_kind = 'conversation';
-  CREATE TABLE pva_indexes (name TEXT PRIMARY KEY, module TEXT NOT NULL, collection TEXT NOT NULL, field TEXT NOT NULL, ddl TEXT NOT NULL) WITHOUT ROWID;
+  CREATE INDEX pva_docs_updated ON pva_docs (owner, collection, scope_kind, scope_id, updated_at, created_at, id);
+  CREATE INDEX pva_docs_created ON pva_docs (owner, collection, scope_kind, scope_id, created_at, id);
+  CREATE INDEX pva_docs_conversation ON pva_docs (scope_id, owner, collection, id) WHERE scope_kind = 'conversation';
+  CREATE TABLE pva_indexes (name TEXT PRIMARY KEY, owner TEXT NOT NULL, collection TEXT NOT NULL, ddl TEXT NOT NULL) WITHOUT ROWID;
 `
 
 const lit = (s: string) => `'${s.replace(/'/g, "''")}'`
-const OWNER = /^[a-z][a-z0-9]{0,30}$/
 const hex = (s: string) => Buffer.from(s, "utf8").toString("hex")
 
+/** The columns of an index after (owner, collection, scope_kind, scope_id), in its order. */
+const columnsOf = (index: CheckedQuery["index"]): ReadonlyArray<string> => {
+  switch (index.kind) {
+    case "updated":
+      return ["updated_at", "created_at", "id"]
+    case "created":
+      return ["created_at", "id"]
+    case "s":
+      return [`k${index.slots[0]}`, "created_at", "id"]
+    case "u":
+      return [`k${index.slots[0]}`, "updated_at", "created_at", "id"]
+    case "p":
+      return [`k${index.slots[0]}`, `k${index.slots[1]}`, "created_at", "id"]
+  }
+}
+
 /**
- * The index of a collection's field. Injective by construction: the module id, collection name and field (case kept)
- * each in hex, which has no `_`, joined by `_`. (SQLite names are case-insensitive; hex digits are lower case.)
+ * The index of one collection's index declaration. Injective by construction: the owner and collection in hex (no
+ * `_`), the kind (`s`, `u`, `p`: not hex digits) and the key columns' numbers, joined by `_`.
  */
-export const indexName = (module: string, collection: string, field: string) => `pva_ix_${hex(module)}_${hex(collection)}_${hex(field)}`
-const fieldExpr = (field: string) => `json_extract(value, '$.${field}')`
-const indexDdl = (name: string, module: string, collection: string, field: string) =>
-  `CREATE INDEX ${name} ON pva_docs (module, collection, scope_kind, scope_id, ${fieldExpr(field)}, updated_at, id) WHERE module = ${lit(module)} AND collection = ${lit(collection)}`
+export const indexName = (owner: string, collection: string, spec: IndexSpec) => `pva_ix_${hex(owner)}_${hex(collection)}_${spec.kind}_${spec.slots.join("_")}`
+const indexDdl = (name: string, owner: string, collection: string, spec: IndexSpec) =>
+  `CREATE INDEX ${name} ON pva_docs (owner, collection, scope_kind, scope_id, ${columnsOf(spec).join(", ")}) WHERE owner = ${lit(owner)} AND collection = ${lit(collection)}`
 
 /**
  * The SQL of one list read (`CheckedQuery`). Each shape names its index (`INDEXED BY`): a query that could not use it
  * fails ("no query solution") instead of scanning, and the order is the index's own, so SQLite never sorts the
  * matching rows: it reads at most `limit` index entries.
  */
-export const listSql = (module: string, collection: string, scope: ScopeRef, q: CheckedQuery): { readonly sql: string; readonly params: ReadonlyArray<SqlValue> } => {
-  const dir = q.order.desc ? "DESC" : "ASC"
-  const where = [`module = ${lit(module)}`, `collection = ${lit(collection)}`, "scope_kind = ?", "scope_id = ?"]
-  const params: Array<SqlValue> = [scope.kind, scopeIdOf(scope)]
-  let index: string
-  let order: string
-  if (q.where !== undefined) {
-    const [field, value] = q.where
-    index = indexName(module, collection, field)
-    where.push(`${fieldExpr(field)} = ?`)
-    params.push(typeof value === "boolean" ? (value ? 1 : 0) : value)
-    // Ordered by the filtered field itself: it is the same in every row, so the order is its tie-break's.
-    order = `updated_at ${dir}, id ${dir}`
-  } else if (q.order.column) {
-    const created = q.order.field === "createdAt"
-    index = created ? "pva_docs_created" : "pva_docs_updated"
-    order = `${created ? "created_at" : "updated_at"} ${dir}, id ${dir}`
-  } else {
-    index = indexName(module, collection, q.order.field)
-    order = `${fieldExpr(q.order.field)} ${dir}, updated_at ${dir}, id ${dir}`
+export const listSql = (owner: string, collection: string, scope: ScopeRef, q: CheckedQuery): { readonly sql: string; readonly params: ReadonlyArray<string | number> } => {
+  const dir = q.desc ? "DESC" : "ASC"
+  const index = "slots" in q.index ? indexName(owner, collection, q.index) : q.index.kind === "updated" ? "pva_docs_updated" : "pva_docs_created"
+  const columns = columnsOf(q.index)
+  const where = [`owner = ${lit(owner)}`, `collection = ${lit(collection)}`, "scope_kind = ?", "scope_id = ?"]
+  const params: Array<string | number> = [scope.kind, scopeIdOf(scope)]
+  if (q.where !== undefined && q.where !== null) {
+    where.push(`${columns[0]} = ?`)
+    params.push(q.where)
   }
   params.push(q.limit)
-  return { sql: `SELECT * FROM pva_docs INDEXED BY ${index} WHERE ${where.join(" AND ")} ORDER BY ${order} LIMIT ?`, params }
+  return { sql: `SELECT * FROM pva_docs INDEXED BY ${index} WHERE ${where.join(" AND ")} ORDER BY ${columns.map((c) => `${c} ${dir}`).join(", ")} LIMIT ?`, params }
 }
 
 interface DocRow {
-  readonly module: string
+  readonly owner: string
   readonly collection: string
   readonly id: string
   readonly scope_kind: string
@@ -148,7 +203,7 @@ interface DocRow {
 }
 
 const toDoc = (r: DocRow): StoredDoc => ({
-  module: r.module,
+  owner: r.owner,
   collection: r.collection,
   id: r.id,
   scope: scopeFromColumns(r.scope_kind, r.scope_id),
@@ -159,6 +214,8 @@ const toDoc = (r: DocRow): StoredDoc => ({
   updatedAt: Number(r.updated_at),
   updatedBy: r.updated_by
 })
+
+const padKeys = (keys: ReadonlyArray<IndexKey>): Array<IndexKey> => Array.from({ length: KEY_COLUMNS }, (_, i) => keys[i] ?? null)
 
 const localDate = (ms: number) => {
   const d = new Date(ms)
@@ -196,23 +253,38 @@ export const makeSqliteStore = (options: SqliteStoreOptions): Effect.Effect<Sqli
   Effect.gen(function*() {
     const memory = options.filename === ":memory:"
     const readOnly = options.readOnly === true
+    const serving = !memory && !readOnly
     const log = options.log ?? (() => {})
     const keep = options.keepBackups ?? KEEP_DAYS
     const guard = options.guard ?? unguarded
     const backupDir = memory ? options.backupDir : options.backupDir ?? join(dirname(options.filename), "backups")
+    const copyDir = options.backupCopyDir
     const files = <A>(what: string, run: () => Promise<A>) =>
       Effect.tryPromise({ try: () => guard(what, run), catch: (cause) => new StoreError({ reason: "failed", message: `${what} failed: ${cause instanceof Error ? cause.message : String(cause)}`, cause }) })
     const failed = (what: string, e: unknown) =>
       new StoreError({ reason: /readonly|read-only/i.test(String(e)) ? "read-only" : "failed", message: `${what}: ${e instanceof Error ? e.message : String(e)}`, cause: e })
 
-    // ---- Open: read-only first (a newer file is refused untouched), private files, then the connection
+    /** Directories other users may write to that could not be made private, by directory. */
+    const dirProblems = new Map<string, string>()
+    const noteDir = (dir: string, problem: string | undefined) => {
+      if (problem === undefined) dirProblems.delete(dir)
+      else {
+        dirProblems.set(dir, problem)
+        log(`Household data: ${problem}`)
+      }
+    }
+
+    // ---- Open: read-only first (a newer file is refused untouched), private files and directories, then the connection
 
     if (!memory) {
       const refused = yield* Effect.promise(() => preflight(options.filename))
       if (refused !== undefined) return yield* new StoreError({ reason: "unavailable", message: refused })
       if (!readOnly) {
         yield* files(`Preparing ${options.filename}`, async () => {
-          await privateDir(dirname(options.filename))
+          const dir = dirname(options.filename)
+          noteDir(dir, await privateDir(dir))
+          if (backupDir !== undefined) noteDir(backupDir, await privateDir(backupDir))
+          if (copyDir !== undefined && existsSync(copyDir)) noteDir(copyDir, await privateDir(copyDir))
           // A new database is created 0600 (SQLite gives its -wal and -shm the same mode); an existing one is narrowed.
           const handle = await open(options.filename, "a", 0o600)
           await handle.close()
@@ -245,30 +317,31 @@ export const makeSqliteStore = (options: SqliteStoreOptions): Effect.Effect<Sqli
       }
       return st
     }
-    const all = <R>(sql: string, params: ReadonlyArray<SqlValue> = []) => prepared(sql).all(...(params as Array<SqlValue>)) as unknown as ReadonlyArray<R>
-    const one = <R>(sql: string, params: ReadonlyArray<SqlValue> = []) => prepared(sql).get(...(params as Array<SqlValue>)) as unknown as R | undefined
-    const run = (sql: string, params: ReadonlyArray<SqlValue> = []) => {
-      const r = prepared(sql).run(...(params as Array<SqlValue>))
-      return { changes: Number(r.changes), lastInsertRowid: Number(r.lastInsertRowid) }
-    }
+    type Param = string | number | null
+    const all = <R>(sql: string, params: ReadonlyArray<Param> = []) => prepared(sql).all(...(params as Array<Param>)) as unknown as ReadonlyArray<R>
+    const one = <R>(sql: string, params: ReadonlyArray<Param> = []) => prepared(sql).get(...(params as Array<Param>)) as unknown as R | undefined
+    const run = (sql: string, params: ReadonlyArray<Param> = []) => Number(prepared(sql).run(...(params as Array<Param>)).changes)
 
     // ---- Settings, the core schema
 
     yield* Effect.try({
       try: () => {
-        if (!readOnly && !memory) {
+        if (serving) {
           db.exec("PRAGMA journal_mode = WAL")
-          // The log is checkpointed back to this size after it grew (a reader held it).
+          // The log is cut back to this size when it is reset after a complete checkpoint.
           db.exec("PRAGMA journal_size_limit = 4194304")
         }
         if (!readOnly) {
+          // This connection never checkpoints: the checkpointer's worker thread does (`makeCheckpointer`).
+          db.exec("PRAGMA wal_autocheckpoint = 0")
           db.exec("PRAGMA synchronous = NORMAL")
           db.exec("PRAGMA secure_delete = ON")
         }
-        // Waits only when the checkpoint after a removal truncates the log, a few milliseconds (docs: "Latency").
-        db.exec(`PRAGMA busy_timeout = ${readOnly ? 1000 : 100}`)
+        // Never wait for a lock on the event loop: a lock held elsewhere is a `busy` failure (retried on a timer).
+        db.exec("PRAGMA busy_timeout = 0")
         // Views and triggers may not call functions with side effects.
         db.exec("PRAGMA trusted_schema = OFF")
+        if (options.maxPageCount !== undefined) db.exec(`PRAGMA max_page_count = ${Math.max(1, Math.floor(options.maxPageCount))}`)
       },
       catch: (e) => failed(`Could not set up ${options.filename}`, e)
     })
@@ -300,13 +373,17 @@ export const makeSqliteStore = (options: SqliteStoreOptions): Effect.Effect<Sqli
       }
     }
 
-    // ---- Removal: the checkpoint after a removal, on a worker thread, retried while a reader holds an old snapshot
+    // ---- Checkpoints: a worker thread; a truncating one at start (it also settles a removal a stopped process left
+    // pending) and after every removal, retried while a reader holds an older snapshot; passive ones as the log grows
 
-    /** Removals committed (a generation each), and the newest one a successful checkpoint covered. */
+    const checkpointer = serving ? makeCheckpointer(options.filename) : undefined
+    if (checkpointer !== undefined) yield* Effect.addFinalizer(() => Effect.promise(() => checkpointer.close()))
+    /** Removals committed (a generation each; the start is one), and the newest one a successful checkpoint covered. */
     let removals = 0
     let checkpointed = 0
     let pendingSince: number | undefined
     let scrubbing = false
+    let walNow = 0
     const waiting = new Set<() => void>()
     const settle = () => {
       if (checkpointed < removals) return
@@ -318,14 +395,14 @@ export const makeSqliteStore = (options: SqliteStoreOptions): Effect.Effect<Sqli
       while (checkpointed < removals) {
         // Every removal committed before the checkpoint starts is covered by it when it succeeds.
         const covers = removals
-        const done = yield* Effect.tryPromise(() => checkpointFile(options.filename)).pipe(Effect.orElseSucceed(() => false))
+        const done = yield* Effect.promise(() => checkpointer!.truncate())
         if (done) {
           checkpointed = Math.max(checkpointed, covers)
           settle()
           wait = options.scrubRetryMs ?? 1000
           continue
         }
-        log(`A removed item is still in the household log: a reader holds an older snapshot; retrying in ${Math.round(wait / 1000)} s`)
+        log(`A removed item may still be in the household log: a reader holds an older snapshot; retrying in ${Math.round(wait / 1000)} s`)
         yield* Effect.sleep(wait)
         wait = Math.min(wait * 2, 60_000)
       }
@@ -334,13 +411,34 @@ export const makeSqliteStore = (options: SqliteStoreOptions): Effect.Effect<Sqli
     })))
     const services = yield* Effect.context<never>()
     const scope = yield* Effect.scope
-    const scheduleScrub = () => {
-      if (memory || readOnly) return
-      removals++
-      pendingSince ??= Date.now()
+    const startScrub = () => {
       if (scrubbing) return
       scrubbing = true
       Effect.runForkWith(services)(Effect.forkIn(scrubLoop, scope))
+    }
+    const scheduleScrub = () => {
+      if (checkpointer === undefined) return
+      removals++
+      pendingSince ??= Date.now()
+      startScrub()
+    }
+    if (checkpointer !== undefined) {
+      removals = 1
+      checkpointed = (yield* Effect.promise(() => checkpointer.truncate())) ? 1 : 0
+      if (checkpointed < removals) {
+        pendingSince = Date.now()
+        log("The household log could not be emptied at start (a reader holds an older snapshot); retrying")
+        startScrub()
+      }
+      const every = options.checkpointEveryMs ?? 10_000
+      yield* Effect.forkScoped(Effect.forever(Effect.gen(function*() {
+        yield* Effect.sleep(every)
+        walNow = yield* Effect.promise(() => walBytes(options.filename).catch(() => walNow))
+        if (walNow > PASSIVE_AT_BYTES) {
+          yield* Effect.promise(() => checkpointer.passive())
+          walNow = yield* Effect.promise(() => walBytes(options.filename).catch(() => walNow))
+        }
+      })))
     }
     const scrubbed: Effect.Effect<void> = Effect.callback<void>((resume) => {
       if (checkpointed >= removals) return resume(Effect.void)
@@ -354,14 +452,12 @@ export const makeSqliteStore = (options: SqliteStoreOptions): Effect.Effect<Sqli
 
     // ---- The backend the engine runs on
 
-    const coreOf = (owner: string): CoreTx => {
-      if (!OWNER.test(owner)) throw new StoreError({ reason: "invalid", message: `"${owner}" is not a core owner name` })
-      return {
-        prefix: `core_${owner}__`,
-        query: <R>(sql: string, params: ReadonlyArray<SqlValue> = []) => all<R>(sql, params),
-        run: (sql, params = []) => run(sql, params)
-      }
-    }
+    const indexExists = (name: string) => one<{ n: number }>("SELECT count(*) AS n FROM sqlite_schema WHERE type = 'index' AND name = ?", [name])?.n !== 0
+    const wanted = (owner: string, c: Collection<any>) =>
+      layoutOf(c).map((spec) => {
+        const name = indexName(owner, c.name, spec)
+        return { name, ddl: indexDdl(name, owner, c.name, spec) }
+      })
 
     const backend: SyncBackend = {
       readOnly,
@@ -369,101 +465,135 @@ export const makeSqliteStore = (options: SqliteStoreOptions): Effect.Effect<Sqli
       commit: () => db.exec("COMMIT"),
       rollback: () => db.exec("ROLLBACK"),
       inTransaction: () => db.isTransaction,
-      read: (module, collection, id) => {
-        const r = one<DocRow>("SELECT * FROM pva_docs WHERE module = ? AND collection = ? AND id = ?", [module, collection, id])
+      read: (owner, collection, id) => {
+        const r = one<DocRow>("SELECT * FROM pva_docs WHERE owner = ? AND collection = ? AND id = ?", [owner, collection, id])
         return r === undefined ? undefined : toDoc(r)
       },
-      list: (module, collection, scope, q) => {
-        const { sql, params } = listSql(module, collection, scope, q)
+      list: (owner, collection, scope, q) => {
+        const { sql, params } = listSql(owner, collection, scope, q)
         return all<DocRow>(sql, params).map(toDoc)
       },
-      page: (module, collection, scope, after, limit) =>
+      page: (owner, collection, scope, after, limit) =>
         (after === undefined
           ? all<DocRow>(
-            `SELECT * FROM pva_docs INDEXED BY pva_docs_updated WHERE module = ? AND collection = ? AND scope_kind = ? AND scope_id = ?
-             ORDER BY updated_at DESC, id DESC LIMIT ?`,
-            [module, collection, scope.kind, scopeIdOf(scope), limit]
+            `SELECT * FROM pva_docs INDEXED BY pva_docs_updated WHERE owner = ? AND collection = ? AND scope_kind = ? AND scope_id = ?
+             ORDER BY updated_at DESC, created_at DESC, id DESC LIMIT ?`,
+            [owner, collection, scope.kind, scopeIdOf(scope), limit]
           )
           : all<DocRow>(
-            `SELECT * FROM pva_docs INDEXED BY pva_docs_updated WHERE module = ? AND collection = ? AND scope_kind = ? AND scope_id = ?
-             AND (updated_at, id) < (?, ?) ORDER BY updated_at DESC, id DESC LIMIT ?`,
-            [module, collection, scope.kind, scopeIdOf(scope), after.updatedAt, after.id, limit]
+            `SELECT * FROM pva_docs INDEXED BY pva_docs_updated WHERE owner = ? AND collection = ? AND scope_kind = ? AND scope_id = ?
+             AND (updated_at, created_at, id) < (?, ?, ?) ORDER BY updated_at DESC, created_at DESC, id DESC LIMIT ?`,
+            [owner, collection, scope.kind, scopeIdOf(scope), after.updatedAt, after.createdAt, after.id, limit]
           )).map(toDoc),
-      put: (doc, expect) =>
+      put: (doc, keys, expect) =>
         (expect === "absent"
           ? run(
-            `INSERT INTO pva_docs (module, collection, id, scope_kind, scope_id, rev, v, value, created_at, updated_at, updated_by)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING`,
-            [doc.module, doc.collection, doc.id, doc.scope.kind, scopeIdOf(doc.scope), doc.rev, doc.v, doc.text, doc.createdAt, doc.updatedAt, doc.updatedBy]
+            `INSERT INTO pva_docs (owner, collection, id, scope_kind, scope_id, rev, v, value, created_at, updated_at, updated_by, ${keyColumns.join(", ")})
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ${keyColumns.map(() => "?").join(", ")}) ON CONFLICT DO NOTHING`,
+            [doc.owner, doc.collection, doc.id, doc.scope.kind, scopeIdOf(doc.scope), doc.rev, doc.v, doc.text, doc.createdAt, doc.updatedAt, doc.updatedBy, ...padKeys(keys)]
           )
           : run(
-            `UPDATE pva_docs SET rev = ?, v = ?, value = ?, updated_at = ?, updated_by = ?
-             WHERE module = ? AND collection = ? AND id = ? AND rev = ? AND scope_kind = ? AND scope_id = ?`,
-            [doc.rev, doc.v, doc.text, doc.updatedAt, doc.updatedBy, doc.module, doc.collection, doc.id, expect, doc.scope.kind, scopeIdOf(doc.scope)]
-          )).changes === 1,
-      remove: (module, collection, id, scope, expect) =>
-        run("DELETE FROM pva_docs WHERE module = ? AND collection = ? AND id = ? AND rev = ? AND scope_kind = ? AND scope_id = ?", [module, collection, id, expect, scope.kind, scopeIdOf(scope)])
-          .changes === 1,
+            `UPDATE pva_docs SET rev = ?, v = ?, value = ?, updated_at = ?, updated_by = ?, ${keyColumns.map((k) => `${k} = ?`).join(", ")}
+             WHERE owner = ? AND collection = ? AND id = ? AND rev = ? AND scope_kind = ? AND scope_id = ?`,
+            [doc.rev, doc.v, doc.text, doc.updatedAt, doc.updatedBy, ...padKeys(keys), doc.owner, doc.collection, doc.id, expect, doc.scope.kind, scopeIdOf(doc.scope)]
+          )) === 1,
+      remove: (owner, collection, id, scope, expect) =>
+        run("DELETE FROM pva_docs WHERE owner = ? AND collection = ? AND id = ? AND rev = ? AND scope_kind = ? AND scope_id = ?", [owner, collection, id, expect, scope.kind, scopeIdOf(scope)]) === 1,
       nextRev: () => Number(one<{ value: string }>("UPDATE pva_meta SET value = CAST(value AS INTEGER) + 1 WHERE key = 'rev' RETURNING value")!.value),
       lastRev: () => Number(one<{ value: string }>("SELECT value FROM pva_meta WHERE key = 'rev'")?.value ?? 0),
-      scan: (module, collection, afterId, limit) =>
-        all<DocRow>("SELECT * FROM pva_docs WHERE module = ? AND collection = ? AND id > ? ORDER BY id LIMIT ?", [module, collection, afterId, limit]).map(toDoc),
-      count: (module, collection, cap) =>
-        Number(one<{ n: number }>("SELECT count(*) AS n FROM (SELECT 1 FROM pva_docs WHERE module = ? AND collection = ? LIMIT ?)", [module, collection, cap + 1])?.n ?? 0),
-      rewrite: (doc, v, text) => void run("UPDATE pva_docs SET v = ?, value = ? WHERE module = ? AND collection = ? AND id = ?", [v, text, doc.module, doc.collection, doc.id]),
-      conversationDocs: (conversationId) =>
-        (conversationId === undefined
-          ? all<DocRow>("SELECT * FROM pva_docs INDEXED BY pva_docs_conversation WHERE scope_kind = 'conversation'")
-          : all<DocRow>("SELECT * FROM pva_docs INDEXED BY pva_docs_conversation WHERE scope_kind = 'conversation' AND scope_id = ?", [conversationId])).map(toDoc),
-      versions: (owner) => new Map(all<{ name: string; version: number }>("SELECT name, version FROM pva_versions WHERE owner = ?", [owner]).map((r) => [r.name, Number(r.version)])),
-      setVersion: (owner, name, version) =>
-        void run("INSERT INTO pva_versions (owner, name, version) VALUES (?, ?, ?) ON CONFLICT (owner, name) DO UPDATE SET version = excluded.version", [owner, name, version]),
-      syncIndexes: (moduleId, collections: ReadonlyArray<Collection<any>>) => {
-        const want = new Map<string, { collection: string; field: string; ddl: string }>()
-        for (const c of collections) {
-          for (const field of c.indexes) {
-            const name = indexName(moduleId, c.name, field)
-            want.set(name, { collection: c.name, field, ddl: indexDdl(name, moduleId, c.name, field) })
-          }
+      scan: (owner, collection, afterId, limit) =>
+        all<DocRow>("SELECT * FROM pva_docs WHERE owner = ? AND collection = ? AND id > ? ORDER BY id LIMIT ?", [owner, collection, afterId, limit]).map(toDoc),
+      count: (owner, collection, cap) =>
+        Number(one<{ n: number }>("SELECT count(*) AS n FROM (SELECT 1 FROM pva_docs WHERE owner = ? AND collection = ? LIMIT ?)", [owner, collection, cap + 1])?.n ?? 0),
+      rewrite: (doc, v, text, keys) =>
+        void run(`UPDATE pva_docs SET v = ?, value = ?, ${keyColumns.map((k) => `${k} = ?`).join(", ")} WHERE owner = ? AND collection = ? AND id = ?`, [v, text, ...padKeys(keys), doc.owner, doc.collection, doc.id]),
+      conversationRows: (conversationId, after, limit) => {
+        const where = ["scope_kind = 'conversation'"]
+        const params: Array<Param> = []
+        if (conversationId !== undefined) {
+          where.push("scope_id = ?")
+          params.push(conversationId)
         }
-        const have = all<{ name: string; ddl: string }>("SELECT name, ddl FROM pva_indexes WHERE module = ?", [moduleId])
-        const existing = new Set(all<{ name: string }>("SELECT name FROM sqlite_schema WHERE type = 'index' AND name LIKE 'pva_ix_%'").map((r) => r.name))
-        for (const h of have) {
-          const w = want.get(h.name)
-          if (w !== undefined && w.ddl === h.ddl && existing.has(h.name)) {
+        if (after !== undefined) {
+          where.push("(scope_id, owner, collection, id) > (?, ?, ?, ?)")
+          params.push(after.scopeId, after.owner, after.collection, after.id)
+        }
+        params.push(limit)
+        return all<{ owner: string; collection: string; id: string; scope_id: string; rev: number }>(
+          `SELECT owner, collection, id, scope_id, rev FROM pva_docs INDEXED BY pva_docs_conversation WHERE ${where.join(" AND ")} ORDER BY scope_id, owner, collection, id LIMIT ?`,
+          params
+        ).map((r): BulkRow => ({ scopeId: r.scope_id, owner: r.owner, collection: r.collection, id: r.id, scope: { kind: "conversation", id: r.scope_id }, rev: Number(r.rev) }))
+      },
+      ownerVersion: (owner) => {
+        const r = one<{ version: number }>("SELECT version FROM pva_owners WHERE owner = ?", [owner])
+        return r === undefined ? undefined : Number(r.version)
+      },
+      setOwnerVersion: (owner, version) => void run("INSERT INTO pva_owners (owner, version) VALUES (?, ?) ON CONFLICT (owner) DO UPDATE SET version = excluded.version", [owner, version]),
+      storedCollections: (owner) =>
+        new Map(all<{ name: string; version: number; scope: string; shape: string }>("SELECT name, version, scope, shape FROM pva_collections WHERE owner = ?", [owner])
+          .map((r): [string, StoredCollection] => [r.name, { version: Number(r.version), scope: r.scope, shape: r.shape }])),
+      allCollections: () => all<{ owner: string; name: string; version: number }>("SELECT owner, name, version FROM pva_collections ORDER BY owner, name").map((r) => ({ owner: r.owner, name: r.name, version: Number(r.version) })),
+      setCollection: (owner, name, meta) =>
+        void run(
+          "INSERT INTO pva_collections (owner, name, version, scope, shape) VALUES (?, ?, ?, ?, ?) ON CONFLICT (owner, name) DO UPDATE SET version = excluded.version, scope = excluded.scope, shape = excluded.shape",
+          [owner, name, meta.version, meta.scope, meta.shape]
+        ),
+      syncIndexes: (owner, c) => {
+        const want = new Map(wanted(owner, c).map((w) => [w.name, w.ddl]))
+        for (const h of all<{ name: string; ddl: string }>("SELECT name, ddl FROM pva_indexes WHERE owner = ? AND collection = ?", [owner, c.name])) {
+          if (want.get(h.name) === h.ddl && indexExists(h.name)) {
             want.delete(h.name)
             continue
           }
           db.exec(`DROP INDEX IF EXISTS ${h.name}`)
           run("DELETE FROM pva_indexes WHERE name = ?", [h.name])
         }
-        for (const [name, w] of want) {
+        for (const [name, ddl] of want) {
           db.exec(`DROP INDEX IF EXISTS ${name}`)
-          db.exec(w.ddl)
-          run("INSERT INTO pva_indexes (name, module, collection, field, ddl) VALUES (?, ?, ?, ?, ?)", [name, moduleId, w.collection, w.field, w.ddl])
+          db.exec(ddl)
+          run("INSERT INTO pva_indexes (name, owner, collection, ddl) VALUES (?, ?, ?, ?)", [name, owner, c.name, ddl])
         }
       },
-      core: coreOf,
+      indexesReady: (owner, c) =>
+        wanted(owner, c).every((w) => one<{ ddl: string }>("SELECT ddl FROM pva_indexes WHERE name = ?", [w.name])?.ddl === w.ddl && indexExists(w.name)),
       removed: scheduleScrub
     }
 
-    // ---- Backups (a connection of their own, the copy on SQLite's worker thread), one at a time: in this process (the
-    // semaphore) and across processes (the lock file in the backup directory)
+    // ---- Backups (serve mode only: a connection of their own, the copy on SQLite's worker thread), one at a time
 
-    const backupLock = Semaphore.makeUnsafe(1)
+    const backups = Semaphore.makeUnsafe(1)
     let backedUpForUpgrade: string | undefined
     let lastPrune: PruneResult = { removed: [], failed: [] }
+    let copyProblem: string | undefined
 
-    /** A backup before the first upgrade of this start (never of a new or in-memory file). */
+    const noBackups = new StoreError({ reason: "unavailable", message: "Backups are made by the server (serve mode); this store makes none" })
+
+    /** Copy a finished backup to the second directory; a failure is kept (a Health issue) and retried by maintenance. */
+    const copyOut = (path: string) =>
+      Effect.gen(function*() {
+        if (copyDir === undefined) return
+        const target = join(copyDir, basename(path))
+        const done = yield* Effect.result(files(`Copying ${path} to ${target}`, () => copyFilePrivately(path, target)))
+        if (done._tag === "Failure") {
+          copyProblem = done.failure.message
+          log(`The household backup could not be copied to ${copyDir}: ${done.failure.message}`)
+          return
+        }
+        copyProblem = undefined
+        noteDir(copyDir, done.success)
+      })
+
+    /** A backup before the first upgrade of this start (never of a new or in-memory file), copied to the second directory too. */
     const backupBeforeUpgrade = (what: string) =>
-      backupLock.withPermits(1)(Effect.gen(function*() {
-        if (memory || backupDir === undefined || backedUpForUpgrade !== undefined) return backedUpForUpgrade
+      backups.withPermits(1)(Effect.gen(function*() {
+        if (!serving || backupDir === undefined || backedUpForUpgrade !== undefined) return backedUpForUpgrade
         if (created) return undefined
         const at = yield* Clock.currentTimeMillis
         const path = join(backupDir, `household-${localDate(at)}-before-${what}.db`)
-        yield* files(`Backing up to ${path}`, () => withBackupLock(backupDir, () => copyDatabase(options.filename, path)))
+        noteDir(backupDir, yield* files(`Backing up to ${path}`, () => copyDatabase(options.filename, path)))
         backedUpForUpgrade = path
         log(`Household data backed up to ${path} before upgrading ${what}`)
+        yield* copyOut(path)
         return path
       }))
 
@@ -471,7 +601,7 @@ export const makeSqliteStore = (options: SqliteStoreOptions): Effect.Effect<Sqli
       Effect.gen(function*() {
         if (memory) return { removed: [], failed: [] } satisfies PruneResult
         const now = opts?.now ?? (yield* Clock.currentTimeMillis)
-        const dirs = [backupDir, options.backupCopyDir].filter((d): d is string => d !== undefined)
+        const dirs = [backupDir, copyDir].filter((d): d is string => d !== undefined)
         const removed: Array<string> = []
         const failures: Array<string> = []
         for (const dir of dirs) {
@@ -482,31 +612,42 @@ export const makeSqliteStore = (options: SqliteStoreOptions): Effect.Effect<Sqli
           failures.push(...done.failed)
         }
         if (removed.length > 0) log(`Household backups past ${keep} days removed: ${removed.join(", ")}`)
-        if (failures.length > 0) log(`Household backups past ${keep} days could not be removed: ${failures.join("; ")}`)
+        if (failures.length > 0) log(`Household backups past ${keep} days: not all could be checked or removed: ${failures.join("; ")}`)
         lastPrune = { removed, failed: failures }
         return lastPrune
       })
 
     const backup = (opts?: { readonly now?: number }) =>
-      backupLock.withPermits(1)(Effect.gen(function*() {
-        if (memory || backupDir === undefined) return yield* new StoreError({ reason: "unavailable", message: "An in-memory store has no backups" })
+      backups.withPermits(1)(Effect.gen(function*() {
+        if (!serving || backupDir === undefined) return yield* noBackups
         const at = opts?.now ?? (yield* Clock.currentTimeMillis)
-        const name = `household-${localDate(at)}.db`
-        const path = join(backupDir, name)
-        const copyDir = options.backupCopyDir
-        yield* files(`Backing up to ${path}`, () =>
-          withBackupLock(backupDir, async () => {
-            await copyDatabase(options.filename, path)
-            if (copyDir !== undefined) await copyFilePrivately(path, join(copyDir, name))
-          }))
+        const path = join(backupDir, `household-${localDate(at)}.db`)
+        noteDir(backupDir, yield* files(`Backing up to ${path}`, () => copyDatabase(options.filename, path)))
+        yield* copyOut(path)
         yield* pruneBackups({ now: at })
         return { path }
       }))
 
-    // ---- The engine, core SQL, the rest
+    const newestIn = (dir: string | undefined) =>
+      dir === undefined
+        ? Effect.succeed(undefined)
+        : Effect.tryPromise({ try: () => lastBackupIn(dir), catch: (e) => new StoreError({ reason: "failed", message: `${dir} could not be read: ${e instanceof Error ? e.message : String(e)}`, cause: e }) })
+
+    const copyLatest = backups.withPermits(1)(Effect.gen(function*() {
+      if (!serving || backupDir === undefined) return yield* noBackups
+      if (copyDir === undefined) return
+      const names = yield* Effect.tryPromise({
+        try: async () => (await import("node:fs/promises")).readdir(backupDir),
+        catch: (e) => new StoreError({ reason: "failed", message: `${backupDir} could not be read: ${String(e)}`, cause: e })
+      })
+      const newest = names.filter((n) => DAILY.test(n)).sort().at(-1)
+      if (newest !== undefined) yield* copyOut(join(backupDir, newest))
+    }))
+
+    // ---- The engine, the rest
 
     const engine = makeStoreEngine({ backend, backupBeforeUpgrade, log })
-    const { runTx, inTransaction: _inTransaction, ...shared } = engine
+    const { inTransaction: _inTransaction, ...shared } = engine
 
     const step = <X>(what: string, f: () => X): Effect.Effect<X, StoreError> =>
       Effect.suspend(() => {
@@ -517,52 +658,21 @@ export const makeSqliteStore = (options: SqliteStoreOptions): Effect.Effect<Sqli
         }
       })
 
-    const core = (owner: string): CoreSql => {
-      const prefix = `core_${owner}__`
-      return {
-        prefix,
-        query: (sql, params = []) =>
-          step(`A query of ${owner}`, () => {
-            if (TX_CONTROL.test(sql)) throw new StoreError({ reason: "invalid", message: `Core ${owner}: a statement may not begin or end a transaction` })
-            return coreOf(owner).query(sql, params)
-          }),
-        run: (sql, params = []) =>
-          step(`A write of ${owner}`, () => {
-            if (readOnly) throw readOnlyError(`core ${owner}`)
-            if (TX_CONTROL.test(sql)) throw new StoreError({ reason: "invalid", message: `Core ${owner}: a statement may not begin or end a transaction; it runs in the store's` })
-            return runTx(() => coreOf(owner).run(sql, params))
-          }),
-        migrate: (migrations) =>
-          Effect.gen(function*() {
-            yield* step(`The ${owner} tables`, () => coreOf(owner))
-            const at = (yield* step("Reading versions", () => backend.versions(`core:${owner}`))).get("sql") ?? 0
-            if (at > migrations.length) {
-              return yield* new StoreError({ reason: "unavailable", message: `The ${owner} tables were written by a newer version of the assistant (${at} > ${migrations.length})` })
-            }
-            if (at === migrations.length) return
-            if (readOnly) return yield* new StoreError({ reason: "unavailable", message: `The ${owner} tables need an upgrade, which the server makes when it starts` })
-            yield* backupBeforeUpgrade(owner)
-            yield* step(`Upgrading the ${owner} tables`, () =>
-              runTx(() => {
-                for (let i = at; i < migrations.length; i++) {
-                  db.exec(migrations[i]!)
-                  if (!db.isTransaction) throw new StoreError({ reason: "failed", message: `The ${owner} migration ${i + 1} ended the transaction` })
-                  backend.setVersion(`core:${owner}`, "sql", i + 1)
-                }
-              }))
-          })
-      }
-    }
-
     const store: SqliteHouseholdStore = {
       ...shared,
       info: { kind: "sqlite", readOnly, ...(memory ? {} : { path: options.filename }) },
-      core,
       backup,
-      lastBackupAt: backupDir === undefined ? Effect.succeed(undefined) : Effect.promise(() => lastBackupIn(backupDir)),
+      lastBackupAt: newestIn(backupDir),
+      lastCopyAt: newestIn(copyDir),
+      copyLatest,
       backupDir,
+      backupCopyDir: copyDir,
       pruneBackups,
       pruneFailures: () => lastPrune.failed,
+      copyFailure: () => copyProblem,
+      directoryProblems: () => [...dirProblems.values()],
+      walSize: () => walNow,
+      walWarnBytes: options.walWarnBytes ?? WAL_WARN_BYTES,
       removalPendingSince: () => pendingSince,
       scrubbed,
       check: step("The quick check", () => all<Record<string, unknown>>("PRAGMA quick_check").map((x) => String(Object.values(x)[0])).join("; "))

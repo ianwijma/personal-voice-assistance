@@ -18,10 +18,14 @@ import { EVENT_TYPE, RESERVED_MODULE_IDS } from "./StoreEngine.ts"
  * `host.module.state`) and events modules publish (`<moduleId>.<type>`, docs/MODULES-PLAN.md §2 row 12). The `host.`
  * namespace is the host's: no module can have the id `host`, and a module's `publish` always prefixes its own id.
  *
- * Publishing is synchronous and never waits: every subscriber has its own bounded queue (default 256 events), and a
- * subscriber that falls behind loses the newest events, counted and logged at most once per 10 s per subscriber. So a
- * slow subscriber never holds up a publisher, the turn path or the other subscribers, and a failing logger or clock
- * does not either.
+ * Publishing is synchronous and never waits: every subscriber has its own bounded queue (default 256 events, 1 to
+ * `MAX_SUBSCRIBER_CAPACITY`: any other `capacity` is brought into that range, so no option makes a queue unbounded or
+ * hands events over synchronously), and a subscriber that falls behind loses the newest events, counted and logged at
+ * most once per 10 s per subscriber. **No subscriber code ever runs on a publisher's stack** (nor on a committing
+ * transaction's): an event is handed to the subscriber's fiber through the queue's scheduler, and a subscription that
+ * ends (its gate says so) is taken out of the fan-out at once and its stream completed in a microtask, after the
+ * publisher returned. So a slow subscriber never holds up a publisher, the turn path or the other subscribers, and a
+ * failing logger or clock does not either.
  *
  * Nothing may depend on an event for correctness (docs/MODULES-PLAN.md §5.2): events are lost at a restart and by
  * a slow subscriber. Data is in the store.
@@ -56,7 +60,17 @@ export interface EventFilter {
  */
 export type SubscriptionGate = () => "live" | "waiting" | "ended"
 
+/** The largest queue a subscriber may ask for. */
+export const MAX_SUBSCRIBER_CAPACITY = 4096
+/** The queue a subscriber gets when it asks for none. */
+export const DEFAULT_SUBSCRIBER_CAPACITY = 256
+
+/** A queue size from an option: a whole number from 1 to `MAX_SUBSCRIBER_CAPACITY` (anything else is brought into it). */
+export const subscriberCapacity = (asked: number | undefined, fallback = DEFAULT_SUBSCRIBER_CAPACITY): number =>
+  typeof asked === "number" && Number.isFinite(asked) ? Math.min(MAX_SUBSCRIBER_CAPACITY, Math.max(1, Math.floor(asked))) : fallback
+
 export interface SubscribeOptions {
+  /** This subscriber's queue: 1 to `MAX_SUBSCRIBER_CAPACITY` (default 256). */
   readonly capacity?: number
   readonly name?: string
   readonly gate?: SubscriptionGate
@@ -67,7 +81,8 @@ export interface EventBus {
   readonly publish: (event: HouseholdEvent) => void
   /**
    * The events matching `filter` from the moment the stream starts, until its consumer stops (the stream lives in the
-   * caller's scope). `capacity`: this subscriber's queue (default 256); `name` appears in the drop warning.
+   * caller's scope). `capacity`: this subscriber's queue (default 256, 1 to `MAX_SUBSCRIBER_CAPACITY`); `name` appears
+   * in the drop warning.
    */
   readonly subscribe: (filter?: EventFilter, options?: SubscribeOptions) => Stream.Stream<HouseholdEvent>
   /** Events published, events dropped for slow subscribers, and subscribers now. */
@@ -132,6 +147,7 @@ export interface EventBusOptions {
   readonly log?: (line: string) => void
   /** Clock for warnings (ms). Default `Date.now`. */
   readonly now?: () => number
+  /** The queue of a subscriber that asks for none (1 to `MAX_SUBSCRIBER_CAPACITY`; default 256). */
   readonly defaultCapacity?: number
   /** Sees every event as it is published (tests: `makeRecordingEventBus`). */
   readonly observe?: (event: HouseholdEvent) => void
@@ -152,6 +168,7 @@ export const makeEventBus = (options: EventBusOptions = {}): EventBus => {
     }
   }
   const now = () => safely(options.now ?? Date.now, 0)
+  const defaultCapacity = subscriberCapacity(options.defaultCapacity)
   let published = 0
   let dropped = 0
 
@@ -163,8 +180,10 @@ export const makeEventBus = (options: EventBusOptions = {}): EventBus => {
       const gate = s.gate === undefined ? "live" : safely(s.gate, "ended" as const)
       if (gate === "waiting") continue
       if (gate === "ended") {
+        // Out of the fan-out now; the stream ends after this publisher returned (ending it here would resume its
+        // consumer, and run its finalizers, on this stack).
         subscribers.delete(s)
-        Queue.endUnsafe(s.queue)
+        queueMicrotask(() => Queue.endUnsafe(s.queue))
         continue
       }
       if (Queue.offerUnsafe(s.queue, event)) continue
@@ -187,7 +206,7 @@ export const makeEventBus = (options: EventBusOptions = {}): EventBus => {
           return s
         }),
         (s) => Effect.sync(() => subscribers.delete(s))
-      ), { bufferSize: opts?.capacity ?? options.defaultCapacity ?? 256, strategy: "dropping" })
+      ), { bufferSize: subscriberCapacity(opts?.capacity, defaultCapacity), strategy: "dropping" })
 
   const forModule: EventBus["forModule"] = (moduleId, moduleOptions) => ({
     publish: (type, data, scope) =>

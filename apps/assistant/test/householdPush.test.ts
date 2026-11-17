@@ -1,6 +1,7 @@
 // The household push to voice pages (docs/STORING-DATA.md "Pages"), on the in-memory store: every frame is built when
 // it is handed to the socket; nothing of the queue comes before a snapshot's final part, and nothing is lost after it;
-// module events keep their place among the changes; a renamed device's pages get a fresh snapshot; an overflow too.
+// module events keep their place among the changes; a renamed device's pages get a fresh snapshot, and the module
+// events queued before it follow it; an overflow is signalled (`household.gap`) before its fresh snapshot.
 import { assert, describe, it } from "@effect/vitest"
 import { connectStoreToBus, defineCollection, defineEventType, makeEventBus, makeHouseholdFeed, type Row, type TargetDevice } from "@pva/core"
 import { makeMemoryHouseholdStore } from "@pva/core/testing"
@@ -45,7 +46,7 @@ const setup = Effect.gen(function*() {
 
 const settle = Effect.repeat(Effect.yieldNow, { times: 200 })
 const kinds = (sent: ReadonlyArray<ServerMessage>) =>
-  sent.map((x) => (x.type === "household.snapshot" ? `snapshot${x.part}${x.final ? "!" : ""}` : x.type === "household.event" ? (x.event.data as HouseholdChange).op ?? x.event.type : x.type))
+  sent.map((x) => (x.type === "household.snapshot" ? `snapshot${x.part}${x.final ? "!" : ""}` : x.type === "household.event" ? (x.event.data as HouseholdChange)?.op ?? x.event.type : x.type))
 const held = (sent: ReadonlyArray<ServerMessage>) => {
   let rows = new Map<string, unknown>()
   let incoming = new Map<string, unknown>()
@@ -145,10 +146,38 @@ describe("household push", () => {
       }))
       yield* settle
       assert.strictEqual(snapshots(), 2)
-      // The snapshot holds at most 500 rows per collection; it says so.
-      const last = sent.filter((x) => x.type === "household.snapshot")
-      assert.isTrue(last.some((x) => x.type === "household.snapshot" && x.collections.some((c) => c.truncated)))
-      // It ends with what it may see, as far as a snapshot holds it.
+      // The page is told first that it may have missed something.
+      const gap = sent.findIndex((x) => x.type === "household.gap")
+      assert.deepStrictEqual(sent[gap], { type: "household.gap", reason: "overflow" })
+      const next = sent[gap + 1]
+      assert.strictEqual(next?.type === "household.snapshot" ? next.part : undefined, 0)
+      // The snapshot holds at most 500 rows per collection; its final part says the collection was cut short.
+      const final = sent.filter((x) => x.type === "household.snapshot" && x.final).at(-1)
+      assert.deepStrictEqual(final?.type === "household.snapshot" ? final.truncated : undefined, [{ module: "m", collection: "notes" }])
       assert.strictEqual(held(sent).size, 500)
+    }).pipe(Effect.scoped))
+
+  it.effect("a module event queued before a device refresh is sent once, after the new snapshot's final part, with the new record", () =>
+    Effect.gen(function*() {
+      const { m, page, push, sent, names, events } = yield* setup
+      yield* m.transaction((tx) => {
+        for (let i = 0; i < 100; i++) tx.collection(notes).insert({ text: `n${i}` }, { id: `n${String(i).padStart(3, "0")}` })
+      })
+      push.hooks.connected(page)
+      // Part-way through the snapshot: an event is accepted, then the device is renamed before the page drains.
+      yield* Effect.yieldNow
+      yield* events.publish("ping", { n: 7 })
+      names.set("kitchen-01", "Renamed")
+      push.hooks.devicesChanged()
+      yield* settle
+      const k = kinds(sent)
+      const lastStart = k.lastIndexOf("snapshot0")
+      const final = k.findIndex((x, i) => i > lastStart && x.endsWith("!"))
+      assert.isAbove(lastStart, 0, k.join(" "))
+      assert.deepStrictEqual(k.filter((x) => x === "m.ping"), ["m.ping"])
+      assert.isAbove(k.indexOf("m.ping"), final)
+      const pings = sent.flatMap((x) => (x.type === "household.event" && x.event.type === "m.ping" ? [x.event.data] : []))
+      assert.deepStrictEqual(pings, [{ n: 7, to: "Renamed" }])
+      assert.isFalse(sent.some((x) => x.type === "household.gap"))
     }).pipe(Effect.scoped))
 })

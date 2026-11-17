@@ -125,8 +125,9 @@ export interface ModuleDefinition<S extends SettingsSpec = SettingsSpec> {
    */
   readonly uses?: ReadonlyArray<string>
   /**
-   * Its data (version 2; docs/STORING-DATA.md): the collections it uses and its own SQL migrations. Judged and upgraded
-   * before anything starts; data written by a newer version of the module makes it `unavailable`.
+   * Its data (version 2; docs/STORING-DATA.md): its data version (`version`, raised with every change of shape) and the
+   * document collections it uses, each with its migrations from older data versions (`defineCollection({ migrate })`).
+   * Judged and upgraded before anything starts; data written by a newer version of the module makes it `unavailable`.
    */
   readonly storage?: ModuleStorage
   /** The event types it publishes that voice pages may see (each with a projection). Others stay on the server. */
@@ -225,7 +226,7 @@ export const defineModule = <const S extends SettingsSpec = {}, const V extends 
     throw new Error(`Module id "${definition.id}" must match /^[a-z][a-z0-9-]{0,39}$/`)
   }
   // `host` is the host's own event namespace (`host.turn.ended`, …): no module may take it.
-  if (RESERVED_MODULE_IDS.has(definition.id)) throw new Error(`Module id "${definition.id}" is reserved for the host`)
+  if (RESERVED_MODULE_IDS.has(definition.id)) throw new Error(`Module id "${definition.id}" is reserved for the host and the core services`)
   checkManifest(definition.id, definition)
   return {
     id: definition.id,
