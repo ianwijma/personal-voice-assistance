@@ -25,6 +25,8 @@ export type Scenario =
   | "latency"
   | "admin-disabled"
   | "admin-backoff"
+  | "nodes"
+  | "nodes-empty"
 
 /** The mock's admin password (`ADMIN_PASSWORD` in mock/server.ts). */
 export const ADMIN_PASSWORD = "admin password"
@@ -102,6 +104,21 @@ export const mock = {
   /** Protocol 6: the device's conversation has been quiet too long; its next turn starts a new one (`now`: at once). */
   idle: async (deviceId?: string, now = false) => {
     await fetch(`${MOCK}/mock/idle`, { method: "POST", body: JSON.stringify({ ...(deviceId === undefined ? {} : { deviceId }), now }) })
+  },
+  /** Protocol 9: how the server reports itself in `result.pairing` and how the next box behaves (mock/nodes.ts `PairingConfig`). */
+  nodes: async (config: { tls?: boolean; tlsPin?: string | null; loopbackOnly?: boolean; built?: boolean; redeemAfterMs?: number; ttlMs?: number; hostname?: string; transport?: "ws" | "wss" }) => {
+    const r = await fetch(`${MOCK}/mock/nodes`, { method: "POST", body: JSON.stringify(config) })
+    expect(r.ok).toBe(true)
+  },
+  /** Protocol 9: the box redeems a code (default: the newest). */
+  redeem: async (code?: string) => {
+    const r = await fetch(`${MOCK}/mock/node/redeem`, { method: "POST", body: JSON.stringify(code === undefined ? {} : { code }) })
+    expect(r.ok).toBe(true)
+  },
+  /** Protocol 9: a node's state as the box would report it. */
+  node: async (deviceId: string, patch: { online?: boolean; upToDate?: boolean; transport?: "ws" | "wss"; lastError?: string | null; status?: null }) => {
+    const r = await fetch(`${MOCK}/mock/node`, { method: "POST", body: JSON.stringify({ deviceId, ...patch }) })
+    expect(r.ok).toBe(true)
   },
   /** Protocol 6: MAX_VOICE_SESSIONS. */
   maxSessions: async (n: number) => {
