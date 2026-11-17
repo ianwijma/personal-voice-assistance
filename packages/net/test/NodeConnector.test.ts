@@ -2,7 +2,7 @@ import { describe, expect, it } from "@effect/vitest"
 import { Effect } from "effect"
 import http from "node:http"
 import type { AddressInfo } from "node:net"
-import { nodeConnector, safeFetch } from "../src/SafeFetch.ts"
+import { fetchOwnerConfiguredLan, nodeConnector } from "../src/SafeFetch.ts"
 
 const serve = async (handler: http.RequestListener) => {
   const server = http.createServer(handler)
@@ -16,8 +16,7 @@ describe("nodeConnector (a real socket on this machine)", () => {
     const s = await serve((req, res) => { host = req.headers.host; res.setHeader("X-A", "1"); res.end("hi") })
     try {
       // The name never resolves; the connector connects to the address it is given.
-      const res = await Effect.runPromise(safeFetch(`http://pretend.example:${s.port}/p?q=1`, {
-        allowLan: true,
+      const res = await Effect.runPromise(fetchOwnerConfiguredLan(`http://pretend.example:${s.port}/p?q=1`, {
         resolver: async () => ["192.168.0.1"],
         connector: (r) => nodeConnector({ ...r, address: "127.0.0.1" })
       }))

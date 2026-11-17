@@ -4,8 +4,8 @@ import { Data } from "effect"
 export type RefusedRule =
   | "scheme" // not http or https
   | "credentials" // user:password in the URL
-  | "port" // a port other than 80 or 443 (unless allowLan)
-  | "host-name" // .local, .lan, .home.arpa, .internal, .localhost or a name without a dot (unless allowLan)
+  | "port" // a port other than 80 or 443 (unless fetchOwnerConfiguredLan)
+  | "host-name" // .local, .lan, .home.arpa, .internal, .localhost or a name without a dot (unless fetchOwnerConfiguredLan)
   | "address" // the host is, or resolves to, a non-public address
   | "redirect-limit" // more redirects than allowed
   | "redirect-target" // a redirect without a usable Location

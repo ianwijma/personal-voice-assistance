@@ -1,17 +1,17 @@
 import { describe, expect, it } from "@effect/vitest"
 import { Effect, Exit, Fiber } from "effect"
 import { NetAborted, NetFailure, NetRefused, NetTimeout, NetTooLarge } from "../src/Errors.ts"
-import { safeFetch, type SafeFetchOptions } from "../src/SafeFetch.ts"
+import { fetchOwnerConfiguredLan, safeFetch, type SafeFetchOptions } from "../src/SafeFetch.ts"
 import { chunks, fakeConnector, fakeResolver, reply } from "./helpers.ts"
 
-const failure = async (url: string, options: SafeFetchOptions) => {
-  const exit = await Effect.runPromiseExit(safeFetch(url, options))
+const failure = async (url: string, options: SafeFetchOptions, lan = false) => {
+  const exit = await Effect.runPromiseExit((lan ? fetchOwnerConfiguredLan : safeFetch)(url, options))
   if (!Exit.isFailure(exit)) throw new Error("expected a failure")
   const error = exit.cause.reasons.map((r) => (r._tag === "Fail" ? r.error : undefined)).find((e) => e !== undefined)
   return error
 }
-const refusedRule = async (url: string, options: SafeFetchOptions) => {
-  const error = await failure(url, options)
+const refusedRule = async (url: string, options: SafeFetchOptions, lan = false) => {
+  const error = await failure(url, options, lan)
   expect(error).toBeInstanceOf(NetRefused)
   return (error as NetRefused).rule
 }
@@ -248,26 +248,26 @@ describe("safeFetch: abort and interruption", () => {
   })
 })
 
-describe("safeFetch: allowLan", () => {
+describe("fetchOwnerConfiguredLan", () => {
   const resolver = fakeResolver({ "nas.local": ["192.168.1.5"], "meta.example": ["169.254.169.254"], "box.lan": ["10.0.0.9"], "lo.example": ["127.0.0.1"] })
   const connector = fakeConnector(() => reply(200, "lan"))
-  it("is off by default", async () => {
+  it("safeFetch cannot reach the LAN, and has no option that does", async () => {
     expect(await refusedRule("http://192.168.1.5/", { connector, resolver })).toBe("address")
     expect(await refusedRule("http://nas.local/", { connector, resolver })).toBe("host-name")
     expect(await refusedRule("http://8.8.8.8:8123/", { connector, resolver })).toBe("port")
   })
   it("lets private, unique-local and CGNAT addresses, local names and other ports through", async () => {
     for (const url of ["http://192.168.1.5:8123/", "http://nas.local/", "http://box.lan:3000/", "http://[fd00::1]/", "http://100.64.0.2/", "http://printer/"]) {
-      const res = await Effect.runPromise(safeFetch(url, { connector, resolver: fakeResolver({ nas: ["10.0.0.1"], "nas.local": ["192.168.1.5"], "box.lan": ["10.0.0.9"], printer: ["192.168.1.7"] }), allowLan: true }))
+      const res = await Effect.runPromise(fetchOwnerConfiguredLan(url, { connector, resolver: fakeResolver({ nas: ["10.0.0.1"], "nas.local": ["192.168.1.5"], "box.lan": ["10.0.0.9"], printer: ["192.168.1.7"] }) }))
       expect(res.status).toBe(200)
     }
   })
   it("still refuses loopback, link-local (cloud metadata) and multicast", async () => {
     for (const url of ["http://127.0.0.1/", "http://[::1]/", "http://169.254.169.254/", "http://meta.example/", "http://lo.example/", "http://224.0.0.1/", "http://0.0.0.0/"])
-      expect(await refusedRule(url, { connector, resolver, allowLan: true })).toBe("address")
+      expect(await refusedRule(url, { connector, resolver }, true)).toBe("address")
   })
   it("still refuses other schemes and credentials", async () => {
-    expect(await refusedRule("ftp://192.168.1.5/", { connector, resolver, allowLan: true })).toBe("scheme")
-    expect(await refusedRule("http://a:b@192.168.1.5/", { connector, resolver, allowLan: true })).toBe("credentials")
+    expect(await refusedRule("ftp://192.168.1.5/", { connector, resolver }, true)).toBe("scheme")
+    expect(await refusedRule("http://a:b@192.168.1.5/", { connector, resolver }, true)).toBe("credentials")
   })
 })

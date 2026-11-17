@@ -30,8 +30,6 @@ export type Connector = (request: ConnectRequest) => Promise<ConnectResponse>
 export interface SafeFetchOptions {
   readonly method?: "GET" | "HEAD"
   readonly headers?: Readonly<Record<string, string>>
-  /** Owner switch: also allow private (RFC 1918), unique-local and CGNAT addresses, local names and any port. Loopback, link-local (cloud metadata), multicast and the like stay refused. */
-  readonly allowLan?: boolean
   /** Default 2 MiB. */
   readonly maxBytes?: number
   /** Total, redirects and body included. Default 6000. */
@@ -190,8 +188,7 @@ const readBody = async (body: AsyncIterable<Uint8Array>, limit: number, url: str
 
 const sameOrigin = (a: URL, b: URL) => a.origin === b.origin
 
-const run = async (input: string | URL, options: SafeFetchOptions, signal: AbortSignal): Promise<SafeResponse> => {
-  const allowLan = options.allowLan === true
+const run = async (input: string | URL, options: SafeFetchOptions, allowLan: boolean, signal: AbortSignal): Promise<SafeResponse> => {
   const limit = options.maxBytes ?? defaultMaxBytes
   const maxRedirects = options.maxRedirects ?? defaultMaxRedirects
   const resolver = options.resolver ?? nodeResolver
@@ -260,10 +257,10 @@ const run = async (input: string | URL, options: SafeFetchOptions, signal: Abort
 /**
  * Fetch a URL a model or a user chose. Resolves the host itself and refuses private, loopback, link-local,
  * unique-local and other non-public addresses (IPv4, IPv6, IPv4-mapped); connects to the address it checked; checks
- * every redirect again; http and https only; no credentials; ports 80 and 443 (any with `allowLan`); size and total
+ * every redirect again; http and https only; no credentials; ports 80 and 443; size and total
  * time limits; honours `options.signal` and Effect interruption. Errors say which rule refused (`NetRefused.rule`).
  */
-export const safeFetch = (url: string | URL, options: SafeFetchOptions = {}): Effect.Effect<SafeResponse, SafeFetchError> =>
+const fetchChecked = (url: string | URL, options: SafeFetchOptions, allowLan: boolean): Effect.Effect<SafeResponse, SafeFetchError> =>
   Effect.tryPromise({
     try: (effectSignal) => {
       const timeoutMs = options.timeoutMs ?? defaultTimeoutMs
@@ -276,7 +273,7 @@ export const safeFetch = (url: string | URL, options: SafeFetchOptions = {}): Ef
         if (s.aborted) abort()
         else s.addEventListener("abort", abort, { once: true })
       }
-      return run(url, options, controller.signal).finally(() => {
+      return run(url, options, allowLan, controller.signal).finally(() => {
         clearTimeout(timer)
         for (const s of outside) s.removeEventListener("abort", abort)
         // Stop whatever connection is still open.
@@ -288,3 +285,15 @@ export const safeFetch = (url: string | URL, options: SafeFetchOptions = {}): Ef
         ? e
         : new NetFailure({ url: String(url), stage: "response", detail: e instanceof Error ? e.message : String(e) })
   })
+
+export const safeFetch = (url: string | URL, options: SafeFetchOptions = {}): Effect.Effect<SafeResponse, SafeFetchError> =>
+  fetchChecked(url, options, false)
+
+/**
+ * Fetch an endpoint **the owner configured** on the home network (Home Assistant, a Grocy, a SearXNG on the LAN): like `safeFetch`, but
+ * private (RFC 1918), unique-local and CGNAT addresses, local names (`.local`, `.lan`, single labels) and any port are allowed. Loopback,
+ * link-local (cloud metadata), multicast and the other classes stay refused, and so do other schemes and credentials in the URL.
+ * Never call this with a URL a model or a page produced; use `safeFetch`.
+ */
+export const fetchOwnerConfiguredLan = (url: string | URL, options: SafeFetchOptions = {}): Effect.Effect<SafeResponse, SafeFetchError> =>
+  fetchChecked(url, options, true)
