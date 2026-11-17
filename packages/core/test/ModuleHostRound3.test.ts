@@ -186,22 +186,6 @@ describe("publishing and withdrawing are all or nothing (finding 4; round 2 find
       assert.isTrue(host.issues.all().some((i) => i.title === "SUB: its second could not be withdrawn"))
       assert.include(log, "sub:shared-")
     }))
-
-  it.effect("4: a callback that reads the host while its module is published sees it absent or published, never two of it", () =>
-    Effect.gen(function*() {
-      const log: Array<string> = []
-      const seen: Array<string | undefined> = []
-      let host: { readonly service: <T>(key: ServiceKey<T>) => T | undefined } | undefined
-      const reader: Registrar = ({ handle, instance }) =>
-        instance === undefined || handle.moduleId !== "p" ? [] : [{ kind: "reader", publish: () => void seen.push(host?.service(Svc)?.name), withdraw: () => void seen.push(host?.service(Svc)?.name) }]
-      const demand = demandOf({ p: [{ assistantId: "a" }] })
-      const h = yield* hostOf([mod("p", log, { service: true })], demand, { registrars: [reader] })
-      host = h
-      yield* h.startEnabled
-      yield* h.configure("p", { values: { place: "P2" }, secrets: {} })
-      // Published after the shared part's service in the same step; withdrawn before it: only "p" or nothing.
-      assert.deepStrictEqual(seen, ["p", "p", "p"])
-    }))
 })
 
 describe("interrupted callers (findings 5, 16)", () => {

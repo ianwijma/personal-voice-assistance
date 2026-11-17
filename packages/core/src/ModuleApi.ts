@@ -154,6 +154,10 @@ export interface DeclaredAction {
  * `export const Lists = ServiceKey<ListsService>("lists")`, provided with `services: [Lists.of(impl)]`. Keys are
  * compared by `id`; one module may provide a key (a second provider is a start error for the second). The shared keys
  * live in `@pva/module-contracts` (P11).
+ *
+ * The grace period of a stop covers the calls admitted to the stopping module itself (its tools, actions, context
+ * providers). A call another module makes into its service while it stops (or restarts) may fail: the consumer
+ * handles that failure like any other (and finds the service absent at its next lookup).
  */
 export interface ServiceKey<T> {
   readonly _tag: "ServiceKey"
@@ -343,7 +347,9 @@ export interface ModuleHostApi {
   readonly view: () => HostView
   /**
    * The service under `key` from a demanded module's `shared` part, or `undefined` while none is published (a
-   * provider starts and stops on its own; look it up at each use, never keep it).
+   * provider starts and stops on its own; look it up at each use, never keep it). A call into it may fail while its
+   * provider stops: the provider's grace period covers only calls admitted to the provider itself, so handle that
+   * failure.
    */
   readonly service: <T>(key: ServiceKey<T>) => T | undefined
   /**
@@ -368,9 +374,12 @@ export interface ModuleHostApi {
   /**
    * Ask the host to stop this module and start it again (a tool list that changed at run time, an MCP server's, then
    * applies from the next turn). Returns at once; the module's worker stops it (its tools are withdrawn, calls in
-   * flight get the grace period) and starts it again, at most once every 5 s: requests in between are merged into
-   * the next restart, and one made after the last restart began always leads to another. From `shared` or `start`,
-   * it applies once the module is published; from a part that was stopped since, it is ignored. The new start runs
+   * flight get the grace period) and starts it again. Requests are taken up at most once every 5 s, the ones in
+   * between merged into the next: a module cannot restart itself in a tight loop (this is not a minimum distance
+   * between two restarts). One made after the last one was taken up always leads to another. The request is
+   * recorded in one step: a caller interrupted right after it has made it whole or not at all. Only a live part asks:
+   * from `shared` or `start` while it starts, from a start that failed, or from a part being stopped (a finalizer),
+   * it is ignored (logged at debug); from a part whose scope has closed it dies with `ModuleStopped`. The new start runs
    * outside any turn: it never sees the caller's `CurrentTurn`. Settings are the module's current ones; a vault
    * locked since does not stop it (it starts with the secrets it ran with).
    */
