@@ -5,7 +5,7 @@ import * as SherpaTts from "@pva/tts-sherpa"
 import { Effect } from "effect"
 import { CliSettingsRef } from "./cliSettings.ts"
 import { type CoreCheckOptions, runCoreChecks } from "./coreChecks.ts"
-import { moduleCatalog } from "./modules.ts"
+import { moduleCatalog, moduleDemandOf } from "./modules.ts"
 import { makeRequirementChecker, type Prober } from "./requirements.ts"
 import type { SttShared } from "./serve/Resources.ts"
 import { makeSections } from "./serve/sections.ts"
@@ -50,27 +50,21 @@ export const runDoctor = (options: DoctorOptions): Effect.Effect<ReadonlyArray<I
       ...options.core
     })
     yield* checker.probeCatalog(options.catalog, { force: true })
+    // Which modules the assistants use (serve mode's demand, read-only: nothing starts): a module one of them has on,
+    // or one such a module names in `uses`, is an error when it cannot run; a module nobody uses only a warning.
+    const demand = options.assistants === undefined ? undefined : moduleDemandOf(options.catalog, options.assistants)
     const host = yield* makeModuleHost({
       catalog: options.catalog,
       persistence: readOnlyPersistence(options.persistence),
       env: options.env,
       platform: options.platform ?? { os: process.platform, arch: process.arch },
-      requirements: checker.check
+      requirements: checker.check,
+      localPrincipal: true,
+      ...(demand !== undefined ? { demand: () => demand } : {})
     })
+    yield* host.evaluate
     yield* host.checkHealth
-    // Which capabilities an assistant uses (serve mode's demand): a module nobody uses is never an error here.
-    const inUse = options.assistants === undefined
-      ? undefined
-      : new Set(options.assistants.filter((a) => a.on).flatMap((a) => Object.entries(a.modules).filter(([, c]) => c.on).map(([id]) => id)))
-    const capability = (id: string) => {
-      const kind = options.catalog.find((d) => d.id === id)?.kind
-      return kind === undefined || kind === "capability"
-    }
-    const modules = host.issues.all().map((issue): Issue =>
-      issue.severity === "error" && issue.module !== undefined && inUse !== undefined && capability(issue.module) && !inUse.has(issue.module)
-        ? { ...issue, severity: "warning", detail: `${issue.detail} (No assistant has it on.)` }
-        : issue
-    )
+    const modules = host.issues.all()
     return [...core, ...modules]
   }))
 

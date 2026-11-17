@@ -1,5 +1,5 @@
 import type { AudioClientLink } from "@pva/audio-web"
-import type { HostDeviceView, HostResult, ModuleHost } from "@pva/core"
+import { type ConnectionRef, type HostDeviceView, type HostResult, makeConnectionRef, type ModuleHost } from "@pva/core"
 import {
   type AdminSnapshot,
   type AdminState,
@@ -117,6 +117,8 @@ export interface SessionHub {
   ) => void
   /** The known devices with their open connections now, most recently seen first (`ModuleHostApi.view().devices`). */
   readonly deviceViews: () => ReadonlyArray<HostDeviceView>
+  /** The connection that owns a session's audio now (a voice turn's `CurrentTurn.connection`). */
+  readonly audioOwnerOf: (sessionKey: string) => ConnectionRef | undefined
 }
 
 export interface HubOptions {
@@ -178,6 +180,8 @@ export const ADMIN_ONLY: ReadonlySet<ServerMessageType> = new Set<ServerMessageT
 
 interface Client {
   readonly connection: HubConnection
+  /** This connection as a turn names it (`CurrentTurn.connection`, module API v2): opaque, one per connection. */
+  readonly ref: ConnectionRef
   helloed: boolean
   closed: boolean
   clientId: string | undefined
@@ -766,7 +770,7 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
         // the follow-up holder, else who answers without a phrase, … Its conversation is made on first use.
         const requestId = message.requestId
         return options.run(Effect.map(
-          session.conversation.sendText(message.text, message.speak && isOwner(client), message.assistantId),
+          session.conversation.sendText(message.text, message.speak && isOwner(client), message.assistantId, client.ref),
           (outcome) =>
             result(
               client,
@@ -911,8 +915,11 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
         if (!allowed(client, message.requestId)) return
         const health = options.health
         if (health === undefined) return result(client, message.requestId, failure("internal", "Health checks are not available here"))
-        // The new registry reaches every admin page as `health` (the service's subscription).
-        return limited(client, message.requestId, Effect.as(health.check, { ok: true } as const))
+        // Answered as soon as it has started (a check can outlast the page's request timeout): this page gets
+        // `health` with `checking` first, then every admin page gets the outcome as `health` (the subscription).
+        health.begin()
+        send(client, { type: "health", health: health.info() })
+        return result(client, message.requestId, { ok: true })
       }
       case "vault.setup":
         if (!allowed(client, message.requestId)) return
@@ -967,6 +974,7 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
       }
       const client: Client = {
         connection,
+        ref: makeConnectionRef(connection.id),
         helloed: false,
         closed: false,
         clientId: undefined,
@@ -1056,6 +1064,7 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
       for (const client of clients) sendVault(client)
     },
     refreshDevices,
+    audioOwnerOf: (key) => owners.get(key)?.owner?.ref,
     deviceViews: () =>
       [...registry.devices(live)].sort((a, b) => b.lastSeen - a.lastSeen).map((d) => ({ id: d.id, name: d.name, kind: d.kind, connections: d.connections })),
     wakeHeard: (key, text, phrase, accepted, source) => {

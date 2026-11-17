@@ -34,7 +34,8 @@ const rejectingHub = (): SessionHub & { rejected: number } => {
     vaultChanged: () => {},
     refreshDevices: () => {},
     wakeHeard: () => {},
-    deviceViews: () => []
+    deviceViews: () => [],
+    audioOwnerOf: () => undefined
   }
   return hub
 }

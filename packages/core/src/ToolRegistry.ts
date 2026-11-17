@@ -1,7 +1,7 @@
 import { Context, Effect, Layer, Schema } from "effect"
 import type { ActionError, ActionOutcome, RegisteredAction } from "./Actions.ts"
 import type { ToolCall, ToolResult, ToolSpec } from "./Domain.ts"
-import { defaultGateway, type ExecutionGateway } from "./Gateway.ts"
+import { defaultGateway, type ExecutionGateway, prepareTool } from "./Gateway.ts"
 import type { AssistantModule, ContextProvider, Tool } from "./Module.ts"
 
 /**
@@ -16,6 +16,11 @@ export class ToolRegistry extends Context.Service<ToolRegistry, {
   run(call: ToolCall): Effect.Effect<ToolResult>
   /** The action a generated action tool stands for (`Tool.action`); absent for other tools and in hand-made registries. */
   readonly actionFor?: (name: string) => RegisteredAction | undefined
+  /**
+   * Every action of the registry's modules, for intent agents, in module order: those of its generated action tools
+   * and those its modules offer only to intent agents (`AssistantModule.intentActions`). Absent in hand-made registries.
+   */
+  readonly actions?: ReadonlyArray<RegisteredAction>
   /**
    * Run an action with its values through the registry's gateway (the intent agent, a confirmed action). Absent in
    * hand-made registries: callers use `defaultGateway.action`.
@@ -62,11 +67,16 @@ export const makeToolRegistry = (modules: ReadonlyArray<AssistantModule>, option
   const gateway = options.gateway ?? defaultGateway
   const tools = new Map<string, { readonly tool: Tool; readonly moduleId: string }>()
   const providers: Array<ContextProvider> = []
+  const actions: Array<RegisteredAction> = []
   for (const module of modules) {
     for (const tool of module.tools ?? []) {
       if (tools.has(tool.name)) throw new Error(`Duplicate tool name "${tool.name}" (module ${module.name})`)
       tools.set(tool.name, { tool, moduleId: module.name })
+      // The input decoder is made here, once per tool (cached across registries), never on a call.
+      prepareTool(tool)
+      if (tool.action !== undefined) actions.push(tool.action)
     }
+    actions.push(...(module.intentActions ?? []))
     providers.push(...(module.context ?? []))
   }
   const specs = Array.from(tools.values(), ({ tool }) => toSpec(tool))
@@ -93,6 +103,7 @@ export const makeToolRegistry = (modules: ReadonlyArray<AssistantModule>, option
     specs,
     isSpeculative: (name) => tools.get(name)?.tool.speculative === true,
     actionFor: (name) => tools.get(name)?.tool.action,
+    actions,
     runAction: gateway.action,
     run,
     context

@@ -17,6 +17,8 @@ catalog:
   tsx: 4.23.15
   "@playwright/test": 1.65.0
   ical.js: 2.2.1
+  semver: 7.8.6
+  "@types/semver": 7.7.1
 
 onlyBuiltDependencies:
   - esbuild
