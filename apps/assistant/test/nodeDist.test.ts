@@ -245,6 +245,7 @@ describe("http.ts node option", () => {
     micFramesLost: () => 0,
     vaultChanged: () => {},
     refreshDevices: () => {},
+    nodeBundleChanged: () => {},
     wakeHeard: () => {}
   })
 
