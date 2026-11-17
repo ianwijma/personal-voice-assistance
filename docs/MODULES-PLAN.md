@@ -159,12 +159,17 @@ Service keys and interfaces that the core provides or calls (`People`, `Privacy`
     `ctx.settingsFor(assistantId)` gives the module's effective settings for an assistant (its own values over the
     shared ones), and the shared values when there is no assistant. A weather briefing section therefore uses the
     asking assistant's place and units.
-  - *Replacement.* A change to a shared setting starts a new generation: the new shared part and every instance
-    start, then the snapshot switches to them at once, then the old generation is retired. If the new generation
-    fails to start, the old one keeps serving and the Health page says why. The old shared part's handlers, routes,
-    subscriptions, services and contributions are withdrawn at the switch, never live beside the new ones; the old
-    scope itself closes after the existing grace period for calls in flight. `requestRestart` from an instance
-    restarts that instance; from the shared part it starts a new generation.
+  - *One thing at a time.* The host keeps a desired state (settings, switches, the vault, probe results, restart
+    requests) and one worker that brings the running modules in line with it, one module at a time, in `uses`
+    order. Nothing else starts or stops module code, so no two lifecycle operations ever interleave.
+  - *Replacement is stop, then start.* When what a module should run changes, its tools and registrations are
+    withdrawn, calls in flight get the existing grace period, the old instances and then the old shared part are
+    closed, and only then are the new ones started and published. For that moment the module is absent: its tools
+    are not offered and its services are not there, which consumers must handle anyway. If the new one fails to
+    start, the module is down with its error on the Health page, as on `main` today; there is no old version kept
+    running beside a new one, and so nothing of a module is ever live twice. Every call into module code (a start,
+    a finalizer) has a time limit, after which the host moves on and reports it. `requestRestart` asks the worker
+    for exactly this, at most once every few seconds per module.
   - *Order.* A module starts after the shared parts of the modules in its `uses` have started or failed. A cycle in
     `uses` is an error for every module in it, found when the catalogue is read. A consumer never keeps a service
     it looked up at start: it looks it up at each use, so a provider that fails, restarts or comes back later is
@@ -204,11 +209,17 @@ Service keys and interfaces that the core provides or calls (`People`, `Privacy`
 - `host` also gives a read-only view (module states, vault locked or not, engine summary, connected devices, the
   Home section's values) and `requestRestart(reason)`, so a module whose tool list changed at run time is started
   again.
-- Requirements: the `Requirement` type, one tool registry in the app with probes, probing at start and on "Check
-  again", a new module state `unavailable` with a reason and a fix, and one instructions line per unavailable module
-  so the assistant says "music is not set up on this server" instead of improvising.
-- Health: `health()` returning issues; an issue registry; `pnpm start doctor` with the core checks and every module's
-  requirements and health; an admin Health page.
+- Requirements: the `Requirement` type for a program on the server (with an optional version range) and for the
+  network; one registry of programs in the app with probes, which starts empty, because no first version in §5
+  needs a program, and gains an entry with the module that needs one; probing at start and on "Check again", never
+  on a turn; a version is read as strict semver or counts as unknown, and unknown does not satisfy a range; a new
+  module state `unavailable` with a reason and a fix; and one instructions line per unavailable module so the
+  assistant says "music is not set up on this server" instead of improvising. Requirements on a device, on memory,
+  disk or a GPU are not part of this version.
+- Health: `health()` returning issues; an issue registry; an admin Health page with "Check again", which also
+  retries modules that failed to start; `pnpm start doctor`, which prints every module's requirements and health
+  and the store's checks, one line each, and exits non-zero on an error. The wider checks of the machine that the
+  research lists for `doctor` (disk space, TLS files, the port, speech models) belong to the deployment work (§7).
 - Templates: plain data on the manifest; the new-assistant wizard offers them.
 - Protocol: `ModuleState` gains `unavailable`; version bump.
 
@@ -554,7 +565,8 @@ Events follow §2 row 12. Other modules may subscribe; nothing may depend on an 
 
 ## 7. Out of scope
 
-- Deployment: the installer, the system unit, `systemd-creds` for the vault, a second backup location.
+- Deployment: the installer, the system unit, `systemd-creds` for the vault, a second backup location, and
+  `doctor`'s checks of the machine itself.
 - Voice nodes (PR #4) and anything that needs one.
 - Phone channels (ntfy, Web Push, the HA companion app).
 - Authenticated devices, and with them trusted devices, `money` and `security` actions, and stored secrets.
