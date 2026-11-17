@@ -2,7 +2,7 @@ import type { AgentKind, HealthIssue as Issue, ModuleKind, StatusLine } from "@p
 import { Effect, Schema, type Scope } from "effect"
 import type { AssistantModule, ContextProvider, Tool } from "./Module.ts"
 import type { HealthContext, ModuleServicesV2, ModuleTemplate, Platforms, Requirement, SharedContext, SharedPart } from "./ModuleApi.ts"
-import type { ModuleContributions } from "./ModuleContributions.ts"
+import type { FieldActionHandler, ModuleContributions } from "./ModuleContributions.ts"
 import type { SettingsOf, SettingsSpec } from "./Settings.ts"
 
 /**
@@ -45,6 +45,12 @@ export interface ModuleContext<A> {
  */
 export interface ModuleContextV2<A, X = undefined> extends ModuleContext<A>, ModuleServicesV2 {
   readonly shared: X
+  /**
+   * P3: the values of the instance's `info` fields or the options of its `combo` fields (`info()`,
+   * `settingOptions()`) changed: describe the form again (coalesced like the status line). Version 1 modules are
+   * described again with every status line.
+   */
+  readonly refreshForm: () => void
 }
 
 /** The context of a module of API version `V`: version 1 gets `ModuleContext`, any later one `ModuleContextV2`. */
@@ -133,6 +139,11 @@ export interface ModuleDefinition<S extends SettingsSpec = SettingsSpec> {
    * `defineModule`, which types the parameter by `apiVersion`). Method syntax keeps both assignable here.
    */
   start(context: ModuleContext<SettingsOf<S>>): Effect.Effect<ModuleInstance, ModuleStartError, Scope.Scope>
+  /**
+   * Handlers of `action` fields (`Setting.action`) that run without a running instance, with the module's settings
+   * (`FieldActionInput`): a "Test" button that checks an address before it is saved. 8 s each.
+   */
+  readonly fieldActions?: Readonly<Record<string, FieldActionHandler<SettingsOf<S>>>>
 }
 
 const TEMPLATE_ID = /^[a-z][a-z0-9_-]{0,39}$/
@@ -191,6 +202,7 @@ export const defineModule = <const S extends SettingsSpec = {}, const V extends 
   readonly uses?: ReadonlyArray<string>
   readonly shared?: (context: SharedContext<SettingsOf<S>>) => Effect.Effect<SharedPart<X>, ModuleStartError, Scope.Scope>
   readonly start: (context: ModuleContextOf<V, SettingsOf<S>, X>) => Effect.Effect<ModuleInstance, ModuleStartError, Scope.Scope>
+  readonly fieldActions?: Readonly<Record<string, FieldActionHandler<SettingsOf<S>>>>
 }): ModuleDefinition<S> => {
   if (!/^[a-z][a-z0-9-]{0,39}$/.test(definition.id)) {
     throw new Error(`Module id "${definition.id}" must match /^[a-z][a-z0-9-]{0,39}$/`)
@@ -212,6 +224,7 @@ export const defineModule = <const S extends SettingsSpec = {}, const V extends 
     ...(definition.templates !== undefined ? { templates: definition.templates } : {}),
     ...(definition.uses !== undefined ? { uses: definition.uses } : {}),
     ...(definition.shared !== undefined ? { shared: definition.shared as NonNullable<ModuleDefinition<S>["shared"]> } : {}),
+    ...(definition.fieldActions !== undefined ? { fieldActions: definition.fieldActions } : {}),
     // The host passes the context of the module's version (`ModuleContextOf`).
     start: definition.start as ModuleDefinition<S>["start"]
   }

@@ -7,6 +7,8 @@ import type {
   ModuleInstanceInfo,
   ModuleState,
   ModuleUnavailable,
+  SettingField,
+  SettingsForm,
   SettingsPatch,
   SettingValue,
   StatusLine
@@ -48,9 +50,18 @@ import {
   type ServiceKey,
   type SharedPart
 } from "./ModuleApi.ts"
-import type { FieldActionResult } from "./ModuleContributions.ts"
+import type { FieldActionHandler, FieldActionResult } from "./ModuleContributions.ts"
+import { type ModuleRoute, RouteTokenError, type RouteTokens, routeInfo, routeProblem, type RouteTokenStore } from "./ModuleRoutes.ts"
 import { type ModuleDefinition, type ModuleInstance, ModuleStartError } from "./ModuleDefinition.ts"
-import { applicableOwnValues, applySettingsPatch, checkOwnValues, overridableKeys, type ResolvedSettings, resolveSettings } from "./Settings.ts"
+import {
+  applicableOwnValues,
+  applySettingsPatch,
+  checkOwnValues,
+  isEditableSetting,
+  overridableKeys,
+  type ResolvedSettings,
+  resolveSettings
+} from "./Settings.ts"
 import { CurrentTurn } from "./TurnContext.ts"
 import { makeToolRegistry, type ToolRegistry } from "./ToolRegistry.ts"
 
@@ -150,7 +161,10 @@ export interface ModuleDemand {
 /** Result of `ModuleHost.fieldAction`. */
 export type FieldActionHostResult =
   | { readonly ok: true; readonly result: FieldActionResult }
-  | { readonly ok: false; readonly code: "unknown_module" | "unknown_action" | "not_running"; readonly message: string }
+  | { readonly ok: false; readonly code: "unknown_module" | "unknown_action" | "not_running" | "busy"; readonly message: string }
+
+/** Time a field action's handler has (`ModuleHostOptions.fieldActionTimeoutMs`). Below the page's 10 s request limit. */
+export const FIELD_ACTION_TIMEOUT_MS = 8_000
 
 export type HostResult = { readonly ok: true } | { readonly ok: false; readonly error: ErrorInfo }
 
@@ -196,10 +210,16 @@ export interface ModuleHost {
   /** Called with a module's new info whenever it changes (state, settings, status). Returns an unsubscribe function. */
   readonly subscribe: (listener: (info: ModuleInfo) => void) => () => void
   /**
-   * Press an `action` field of a running module (its instance with the shared settings): its own
-   * `fieldActions[key]`, or the generated `test` of an agent or decision provider (docs/AGENTS-AND-INTENTS.md §1.6).
+   * Press an `action` field (docs/UI-AND-MODULES.md §1.7): the definition's `fieldActions[key]` (runs without an
+   * instance), else the running instance's (its instance with the shared settings), else the generated `test` of an
+   * agent or decision provider (docs/AGENTS-AND-INTENTS.md §1.6). `values`: the page's draft, used only for an
+   * `action` field with `requiresSaved: false` (applied over the saved settings; secrets stay the saved ones; a draft
+   * value the field refuses is reported as the result). One press per field at a time (`busy`), 8 s each; afterwards
+   * the module is announced again, so changed `info` values reach the page.
    */
-  readonly fieldAction: (id: string, key: string) => Effect.Effect<FieldActionHostResult>
+  readonly fieldAction: (id: string, key: string, values?: Readonly<Record<string, unknown>>) => Effect.Effect<FieldActionHostResult>
+  /** P3: the routes of every published shared part, live (a module that stops takes its routes with it). */
+  readonly routes: () => ReadonlyArray<{ readonly moduleId: string; readonly route: ModuleRoute }>
   /**
    * The `settingOptions` of a running module (its instance with the shared settings): choices known only while it
    * runs, such as the models Claude Code reports at start. `undefined` when the module does not run or gives none.
@@ -284,6 +304,10 @@ export interface ModuleHostOptions {
   readonly issues?: IssueRegistry
   /** Time a module's `health()` may take. Default 5 s. */
   readonly healthTimeoutMs?: number
+  /** P3: where route tokens are kept (serve mode: the key vault). Absent: `host.routeTokens` fails `unavailable`. */
+  readonly routeTokens?: RouteTokenStore
+  /** P3: time a field action may take. Default `FIELD_ACTION_TIMEOUT_MS`. */
+  readonly fieldActionTimeoutMs?: number
 }
 
 interface Running {
@@ -627,16 +651,63 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
         const { risk, ...meta } = toolMetadata(t)
         return { name: t.name, description: t.description, speculative: t.speculative === true, ...(risk !== undefined ? { risk } : {}), ...meta }
       }),
-      settings: resolve(entry).form,
+      settings: decorateForm(entry, resolve(entry).form),
       revision: entry.revision,
       ...(entry.def.kind !== undefined ? { kind: entry.def.kind } : {}),
       ...(entry.demand !== undefined ? { instances: [...entry.instances.values()].map(instanceInfo) } : {}),
       ...(entry.unavailable !== undefined ? { unavailable: entry.unavailable } : {}),
       ...(entry.def.version !== undefined ? { version: entry.def.version } : {}),
       ...(entry.def.apiVersion !== undefined ? { apiVersion: entry.def.apiVersion } : {}),
-      ...(entry.def.templates !== undefined && entry.def.templates.length > 0 ? { templates: templatesOf(entry) } : {})
+      ...(entry.def.templates !== undefined && entry.def.templates.length > 0 ? { templates: templatesOf(entry) } : {}),
+      ...((entry.shared?.part.routes?.length ?? 0) > 0 ? { routes: entry.shared!.part.routes!.map((r) => routeInfo(entry.def.id, r)) } : {})
     }
   }
+
+  /**
+   * The form as the page sees it (P3): `info` values and `combo` options from the running instance with the shared
+   * settings (`info()`, `settingOptions()`; a throwing one gives nothing), and the generated `test` button of an
+   * agent or decision provider. Never part of an instance's settings key.
+   */
+  const decorateForm = (entry: Entry, form: SettingsForm): SettingsForm => {
+    const instance = mainOf(entry)?.running?.instance
+    const read = <T>(f: (() => T) | undefined): T | undefined => {
+      try {
+        return f?.()
+      } catch {
+        return undefined
+      }
+    }
+    const infos = read(instance?.info)
+    const options = read(instance?.settingOptions)
+    const generated = (entry.def.kind === "agent" || entry.def.kind === "decider") && !Object.hasOwn(entry.def.settings, "test")
+    if (infos === undefined && options === undefined && !generated && !form.fields.some((f) => f.type === "combo")) return form
+    const values: Record<string, SettingValue> = { ...form.values }
+    const fields = form.fields.map((field): SettingField => {
+      if (field.type === "info" && typeof infos?.[field.key] === "string") values[field.key] = infos[field.key]!.slice(0, 1000)
+      if (field.type !== "combo") return field
+      const extra = options?.[field.key]
+      const known = new Set(field.options.map((o) => o.value))
+      const added = (extra ?? []).filter((o) => !known.has(o.value) && (known.add(o.value), true))
+      const note = instance === undefined ? "Not running: type a name" : extra !== undefined ? `${added.length + field.options.length} suggestions from ${entry.def.name}` : undefined
+      return { ...field, options: [...field.options, ...added], ...(note !== undefined && field.optionsNote === undefined ? { optionsNote: note } : {}) }
+    })
+    if (generated) {
+      fields.push({
+        type: "action",
+        key: "test",
+        label: "Test",
+        description: "Sends one short message and reports the first answer and how long it took.",
+        apply: "live",
+        buttonLabel: "Test",
+        requiresSaved: true,
+        source: "default"
+      })
+    }
+    return { ...form, fields, values }
+  }
+
+  /** Field presses in progress (module id, key): a second press of the same button waits for the first. */
+  const pressing = new Set<string>()
 
   const templatesOf = (entry: Entry): Array<AssistantTemplate> =>
     (entry.def.templates ?? []).map((t) => ({
@@ -929,8 +1000,11 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
       }
       // Version 1 modules get exactly the context they always had; version 2 modules also get the host's services and
       // what their `shared` part returned.
+      const refreshForm = () => {
+        if (rec.running?.generation === generation) scheduleStatus(entry)
+      }
       const context = (entry.def.apiVersion ?? 1) >= 2
-        ? { settings: settings as never, setStatus, shared: shared?.part.value, ...servicesFor(entry, { rec, generation }) }
+        ? { settings: settings as never, setStatus, refreshForm, shared: shared?.part.value, ...servicesFor(entry, { rec, generation }) }
         : { settings: settings as never, setStatus }
       const exit = yield* Effect.suspend(() => entry.def.start(context)).pipe(
         Scope.provide(scope),
@@ -1343,21 +1417,65 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
     )
   )
 
-  const fieldAction = (id: string, key: string): Effect.Effect<FieldActionHostResult> =>
+  const fieldAction = (id: string, key: string, values?: Readonly<Record<string, unknown>>): Effect.Effect<FieldActionHostResult> =>
     Effect.suspend((): Effect.Effect<FieldActionHostResult> => {
       const entry = byId.get(id)
       if (entry === undefined) return Effect.succeed({ ok: false, code: "unknown_module", message: `There is no module "${id}"` } as const)
+      const declared = Object.hasOwn(entry.def.settings, key) ? entry.def.settings[key]! : undefined
+      if (declared !== undefined && declared.value !== "none") {
+        return Effect.succeed({ ok: false, code: "unknown_action", message: `${entry.def.name}: "${key}" is not a button` } as const)
+      }
       const instance = mainOf(entry)?.running?.instance
-      if (instance === undefined) return Effect.succeed({ ok: false, code: "not_running", message: `${entry.def.name} is not running` } as const)
-      const own = instance.fieldActions?.[key]
-      const handler = own ?? (key === "test" ? generatedTest(instance) : undefined)
-      if (handler === undefined) return Effect.succeed({ ok: false, code: "unknown_action", message: `${entry.def.name} has no action "${key}"` } as const)
+      const fromDefinition = entry.def.fieldActions?.[key] as FieldActionHandler | undefined
+      const handler = fromDefinition ?? instance?.fieldActions?.[key] ?? (key === "test" && instance !== undefined ? generatedTest(instance) : undefined)
+      if (handler === undefined) {
+        const known = declared !== undefined || (key === "test" && (entry.def.kind === "agent" || entry.def.kind === "decider"))
+        return Effect.succeed(
+          known && instance === undefined
+            ? { ok: false, code: "not_running", message: `${entry.def.name} is not running` } as const
+            : { ok: false, code: "unknown_action", message: `${entry.def.name} has no action "${key}"` } as const
+        )
+      }
+      const pressKey = `${id}\u0000${key}`
+      if (pressing.has(pressKey)) return Effect.succeed({ ok: false, code: "busy", message: "That button is still running" } as const)
+      // The settings it sees: the saved shared ones, or (requiresSaved: false) the page's draft over them.
+      const useDraft = values !== undefined && declared !== undefined && (declared.describe(key) as { readonly requiresSaved?: boolean }).requiresSaved === false
+      const prepared = useDraft ? draftSettings(entry, values) : { ok: true as const, settings: resolve(entry).value as Readonly<Record<string, unknown>> | undefined }
+      if (!prepared.ok) return Effect.succeed({ ok: true, result: { ok: false, text: prepared.message.slice(0, 500), tone: "error" } } as const)
+      pressing.add(pressKey)
       // Suspended: a handler that throws is reported like one that fails.
-      return Effect.suspend(handler).pipe(
+      return Effect.suspend(() => handler({ settings: prepared.settings ?? {}, draft: useDraft })).pipe(
+        Effect.timeoutOrElse({
+          duration: options.fieldActionTimeoutMs ?? FIELD_ACTION_TIMEOUT_MS,
+          orElse: () => Effect.succeed<FieldActionResult>({ ok: false, text: `Did not finish within ${Math.round((options.fieldActionTimeoutMs ?? FIELD_ACTION_TIMEOUT_MS) / 1000)} s`, tone: "error" })
+        }),
         Effect.catchCause((cause) => Effect.succeed<FieldActionResult>({ ok: false, text: `Failed: ${Cause.pretty(cause).split("\n")[0]}`.slice(0, 500), tone: "error" })),
-        Effect.map((result) => ({ ok: true, result }) as const)
+        Effect.map((result) => ({ ok: true, result: { ...result, text: String(result.text).slice(0, 500) } }) as const),
+        Effect.ensuring(Effect.sync(() => {
+          pressing.delete(pressKey)
+          // `info` values may have changed with the press.
+          notify(entry)
+        }))
       )
     })
+
+  /** The shared settings with a page's draft applied (non-secret, editable, known fields only), or why not. */
+  const draftSettings = (entry: Entry, values: Readonly<Record<string, unknown>>):
+    | { readonly ok: true; readonly settings: Readonly<Record<string, unknown>> }
+    | { readonly ok: false; readonly message: string } => {
+    const spec = entry.def.settings
+    const patchValues: Record<string, SettingValue> = {}
+    for (const [k, v] of Object.entries(values)) {
+      const setting = Object.hasOwn(spec, k) ? spec[k]! : undefined
+      if (setting === undefined || setting.secret || !isEditableSetting(setting) || setting.env !== undefined && (options.env[setting.env] ?? "") !== "") continue
+      patchValues[k] = v as SettingValue
+    }
+    const patched = applySettingsPatch(spec, { stored: entry.stored, secrets: entry.secrets, env: options.env, ...linked(entry) }, { values: patchValues, secrets: {} })
+    if (!patched.ok) return { ok: false, message: `Not tested: ${patched.errors.map((e) => (e.key === null ? e.message : `${spec[e.key]?.describe(e.key).label ?? e.key}: ${e.message}`)).join("; ")}` }
+    const resolved = resolve(entry, patched.stored, patched.secrets)
+    if (resolved.value === undefined) return { ok: false, message: `Not tested: ${resolved.form.errors.map((e) => e.message).join("; ")}` }
+    return { ok: true, settings: resolved.value as Readonly<Record<string, unknown>> }
+  }
 
   const setSecrets = (all: Readonly<Record<string, Readonly<Record<string, string>>>>) =>
     Effect.suspend(() => {
@@ -1673,7 +1791,7 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
             Effect.exit,
             Effect.flatMap((exit): Effect.Effect<SharedPrepared> => {
               if (Exit.isFailure(exit)) return Effect.as(closeShared({ key, scope, part: { value: undefined } }), { ok: false, message: describeStartFailure(exit.cause) })
-              const clash = serviceClash(entry, exit.value)
+              const clash = serviceClash(entry, exit.value) ?? routeProblem(exit.value.routes)
               if (clash !== undefined) return Effect.as(closeShared({ key, scope, part: exit.value }), { ok: false, message: clash })
               return Effect.succeed({ ok: true, run: { key, scope, part: exit.value }, fresh: true })
             })
@@ -1755,6 +1873,7 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
   function servicesFor(entry: Entry, target: { readonly rec: Instance; readonly generation: number } | "all"): ModuleServicesV2 {
     return {
       host: {
+        routeTokens: routeTokensFor(entry.def.id),
         view,
         service,
         contributions,
@@ -1766,6 +1885,16 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
 
   for (const entry of entries) issues.set(`module:${entry.def.id}`, moduleIssues(entry))
   if (entries.some((e) => e.unavailable !== undefined)) rebuild()
+
+  /** P3: `host.routeTokens` of one module. */
+  function routeTokensFor(moduleId: string): RouteTokens {
+    if (options.routeTokens !== undefined) return options.routeTokens.forModule(moduleId)
+    const none = new RouteTokenError({ reason: "unavailable", message: "Route tokens are kept by the server (serve mode) only" })
+    return { mint: () => Effect.fail(none), list: Effect.fail(none), revoke: () => Effect.fail(none) }
+  }
+
+  const routes = (): ReadonlyArray<{ readonly moduleId: string; readonly route: ModuleRoute }> =>
+    entries.flatMap((entry) => (entry.shared?.part.routes ?? []).map((route) => ({ moduleId: entry.def.id, route })))
 
   const settingOptions = (id: string): Readonly<Record<string, ReadonlyArray<ChoiceOption>>> | undefined => {
     const entry = byId.get(id)
@@ -1788,6 +1917,7 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
     contributions,
     gateway,
     fieldAction,
+    routes,
     settingOptions,
     setSecrets,
     snapshot: () => snapshot,
