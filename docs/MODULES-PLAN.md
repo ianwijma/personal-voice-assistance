@@ -369,6 +369,20 @@ version in §5 needs them.
   at 600 characters, behind a household switch that is off until the owner has measured, with `bench --live
   --ambient`, what the added context costs their model's first token.
 
+**Decided after review round 4**:
+
+- The work of a `list` is bounded by a product: a collection declares `maxChars` for its values (default 2,000, at
+  most 16,000) and a list may ask for at most `min(100, LIST_BUDGET_CHARS / maxChars)` rows. The budget is set by
+  measuring structured values so the worst legal list stays well under 10 ms.
+- `list` takes `after: <the last row of the previous page>` to continue; nothing else pages.
+- Migrations run only when the store is prepared; a read never migrates.
+- `updatedAt`, `createdAt`, `id`, `rev` and `scope` cannot be named in an index declaration.
+- Shape detection covers a schema's structure and built-in checks. Changing a custom check's function needs a
+  version bump by the author.
+- The second backup directory is reconciled hourly by name; a copy keeps its archive's time.
+- Event handlers are not calls in flight: a handler running when its module stops is interrupted when the part
+  closes.
+
 ### P5. People, rooms and device capabilities
 
 - `hello.device.capabilities` (`DeviceCapabilities`: display class and size, touch, renderable kinds, speaker,
