@@ -1214,8 +1214,14 @@ const sessionFor = (c: Conn): VSession | undefined => {
 }
 const sessionName = (v: VSession) => (v.deviceId === undefined ? "A browser tab without a device id" : devices.get(v.deviceId)?.name ?? "A device")
 const connsOf = (v: VSession) => [...conns].filter((c) => c.welcomed && keyOf(c) === v.key)
-/** A message about a session's turns: only to that device's connections. */
+/**
+ * Review round 3: the session is still the device's (not dropped). A delayed callback of a dropped session (a boundary
+ * change, a discard) sends nothing, also not to its successor, which has the same key.
+ */
+const alive = (v: VSession) => voiceSessions.get(v.key) === v
+/** A message about a session's turns: only to that device's connections, and only while it is the device's session. */
 const toSession = (v: VSession, m: ServerMessage) => {
+  if (!alive(v)) return
   for (const c of connsOf(v)) sendTo(c, m)
 }
 const startedSessions = () => [...voiceSessions.values()].filter((v) => v.started).sort((a, b) => b.lastActive - a.lastActive)
@@ -1304,6 +1310,10 @@ const dropSession = (v: VSession) => {
   v.discardTimer = undefined
   if (v.reply !== undefined) clearReply(v.reply)
   if (v.awakeTimer !== undefined) clearTimeout(v.awakeTimer)
+  // Its sentence being heard goes too (the scripted turn it would start).
+  if (v.hearingEnd !== undefined) clearTimeout(v.hearingEnd)
+  v.hearingEnd = undefined
+  v.hearingFor = undefined
   voiceSessions.delete(v.key)
   sessionsChanged()
 }
@@ -1910,7 +1920,15 @@ const runReply = (v: VSession, opts: {
     return
   }
   const c = v.owner
+  // Review round 3: speech is decided again where audio would leave (a declaration may have taken it away since the
+  // turn started): the play stops there, as the server stops it.
+  const mayStillSpeak = () => {
+    if (speakerAllowedOf(v.deviceId)) return true
+    interruptReply(r)
+    return false
+  }
   r.timers.push(setTimeout(() => {
+    if (!alive(v) || r.ended || r.awaitingStop === true || !mayStillSpeak()) return
     if (c === undefined || c.ws.readyState !== c.ws.OPEN) {
       toSession(v, { type: "error", error: { code: "turn_failed", message: "No audio client: the reply could not be played.", turnId } })
       endTurn(r, "failed")
@@ -1931,6 +1949,7 @@ const runReply = (v: VSession, opts: {
   // Clauses go to TTS one after another, faster than real time.
   opts.clauses.forEach((text, i) => {
     r.timers.push(setTimeout(() => {
+      if (!alive(v) || r.ended || r.awaitingStop === true || !mayStillSpeak()) return
       toSession(v, { type: "assistant.text", turnId, clause: i, text, voice: runningVoiceKey(), ...withId })
       if (c !== undefined) sendReplyAudio(c, turnId, pcms[i]!)
       if (i === opts.clauses.length - 1 && c !== undefined) sendTo(c, { type: "reply.end", turnId })
@@ -1952,7 +1971,7 @@ const WEATHER_TURN = {
  * `armed: false` names the assistant first).
  */
 const runVoiceTurn = (v: VSession | undefined, opts: { assistantId?: string | undefined; phrase?: string | undefined } = {}) => {
-  if (v === undefined || v.owner === undefined) return
+  if (v === undefined || v.owner === undefined || !alive(v)) return
   const assistantId = opts.assistantId ?? voice.answeringOf(v, v.deviceId)
   const script = scriptedTurn(assistantId, WEATHER_TURN)
   v.hearingFor = assistantId
@@ -1964,6 +1983,7 @@ const runVoiceTurn = (v: VSession | undefined, opts: { assistantId?: string | un
   words.forEach((w, i) => after(250 + i * 260, () => toSession(v, { type: "transcript", text: w })))
   v.hearingEnd = after(250 + words.length * 260 + 350, () => {
     v.hearingEnd = undefined
+    if (!alive(v)) return
     sendHeard(v, script.userText, opts.phrase, true)
     runReply(v, { source: "voice", userText: script.userText, clauses: script.clauses, spoken: true, tool: script.tool, assistantId })
   })

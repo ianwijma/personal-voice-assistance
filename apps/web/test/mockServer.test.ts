@@ -178,6 +178,62 @@ describe("the mock, through its handlers, as the server", { timeout: 30_000 }, (
     a.ws.close()
   })
 
+  // Review round 3 (p5-r3b finding 6): a dropped session's delayed work never reaches its successor on the device.
+  it("a privacy change while the scripted turn is being heard: the reconnected page gets nothing of the old session", async () => {
+    const a = await admin()
+    const id = "d-mock-pending01"
+    const page = await Peer.open({ device: { id, kind: "web-voice", name: "Pending" } })
+    await a.waitFor("devices", (m) => m.devices.some((d) => d.id === id))
+    page.send({ type: "audio.claim", audio: { contextSampleRate: 48_000, outputPath: "direct", outputLatencyMs: 10 } })
+    await page.waitFor("session", (m) => m.role === "owner")
+    const http = url.replace(/^ws/, "http").replace(/\/ws$/, "")
+    await fetch(`${http}/mock/turn`, { method: "POST", body: JSON.stringify({ deviceId: id }) })
+    await page.waitFor("transcript", (m) => m.text !== "")
+    const place = { room: "", privacy: "public", alwaysOn: false, acceptsFromOthers: true, quietRoom: false, defaultPerson: null }
+    expect((await a.request({ type: "device.save", target: { kind: "device", id }, rev: revOf(a, id), settings: { place } })).ok).toBe(true)
+    expect(await page.closed).toBe(CloseCode.settingsChanged)
+    const next = await Peer.open({ device: { id, kind: "web-voice", name: "Pending" } })
+    const from = next.messages.length
+    // Longer than the rest of the scripted sentence and its reply would take.
+    await new Promise((r) => setTimeout(r, 4000))
+    const old = next.messages.slice(from).filter((m) => ["transcript", "turn.start", "turn.end", "assistant.text", "reply.start", "wake", "error", "tool.start"].includes(m.type))
+    expect(old.map((m) => m.type)).toEqual([])
+    next.ws.close()
+    a.ws.close()
+  })
+
+  // Review round 3 (p5-r3b finding 7): speech is checked again where delayed reply audio would leave.
+  it("a declaration without speech during a spoken reply stops it (reply.stop); with speech, the same reply plays to its end", async () => {
+    const speaks = { v: 1, display: { class: "standard", widthPx: 1024, heightPx: 768, dpr: 1, touch: "coarse", colour: true }, speaker: { media: ["speech", "audio"] } } as const
+    const run = async (id: string, revoke: boolean) => {
+      const page = await Peer.open({ device: { id, kind: "web-voice", name: "Speaker", capabilities: speaks } })
+      page.send({ type: "audio.claim", audio: { contextSampleRate: 48_000, outputPath: "direct", outputLatencyMs: 10 } })
+      await page.waitFor("session", (m) => m.role === "owner")
+      const from = page.messages.length
+      expect((await page.request({ type: "text.send", text: "tell me a long story", speak: true })).ok).toBe(true)
+      const start = await page.waitFor("turn.start", () => true, from)
+      expect(start.spoken).toBe(true)
+      await page.waitFor("reply.start", () => true, from)
+      const at = page.messages.length
+      if (revoke) {
+        const { speaker: _, ...mute } = speaks
+        page.send({ type: "device.caps", capabilities: mute } as ClientMessage)
+        // At once (well before the mock's 2 s stall watch, which a page that never reports playback would meet).
+        await page.waitFor("reply.stop", () => true, at, 1000)
+      }
+      await page.waitFor("turn.end", () => true, from, 15_000)
+      const after = page.messages.slice(at)
+      page.ws.close()
+      return after
+    }
+    const control = await run("d-mock-speaks01", false)
+    // (This page never reports playback, so the mock's stall watch may stop it later; every clause was sent first.)
+    expect(control.some((m) => m.type === "reply.end")).toBe(true)
+    const revoked = await run("d-mock-revoke01", true)
+    expect(revoked.some((m) => m.type === "reply.end")).toBe(false)
+    expect(revoked.find((m): m is ServerMessageOf<"turn.end"> => m.type === "turn.end")?.outcome).toBe("interrupted")
+  })
+
   it("no reply audio where the declaration has no speech, and the setup says so; a newline in a device name is refused", async () => {
     const a = await admin()
     const id = "d-mock-nospeech1"
