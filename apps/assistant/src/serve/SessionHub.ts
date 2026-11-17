@@ -346,7 +346,13 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
     send(
       client,
       outcome.ok
-        ? { type: "result", requestId, ok: true, ...("assistantId" in outcome && outcome.assistantId !== undefined ? { assistantId: outcome.assistantId } : {}) }
+        ? {
+          type: "result",
+          requestId,
+          ok: true,
+          ...("assistantId" in outcome && outcome.assistantId !== undefined ? { assistantId: outcome.assistantId } : {}),
+          ...("rev" in outcome && outcome.rev !== undefined ? { rev: outcome.rev } : {})
+        }
         : { type: "result", requestId, ok: false, error: outcome.error }
     )
 
