@@ -113,6 +113,11 @@ export interface SessionHub {
    */
   readonly refreshDevices: () => void
   /**
+   * The voice node bundle the server serves changed (`apps/node/dist` rebuilt while it runs): admin gets `devices`,
+   * whose nodes' `upToDate` is worked out against the new manifest, so "Update pending" and "Update now" show.
+   */
+  readonly nodeBundleChanged: () => void
+  /**
    * One final transcript of a session, for admin connections with the phrase tester on that follow it (`wake.heard`;
    * `wake.test.deviceId`, else the most recently active session): the phrase it matched, and whether its wake gate
    * accepted it. `source`: the session's device and the matched phrase's assistant there, sent as they are, so the
@@ -1159,6 +1164,7 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
       for (const client of clients) sendVault(client)
     },
     refreshDevices,
+    nodeBundleChanged: () => devicesChanged(false),
     wakeHeard: (key, text, phrase, accepted, source) => {
       const at = Date.now()
       const message = encodeServerMessage({ type: "wake.heard", text, ...(phrase !== undefined ? { matched: phrase } : {}), accepted, source, at })

@@ -322,6 +322,47 @@ describe("node messages", () => {
     expect(lastDevices(admin).find((d) => d.id === paired.deviceId)?.node?.status).toEqual(status(5))
   })
 
+  it("a bundle rebuilt while the server runs reaches admin: the node's upToDate turns false without a reload", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pva-bundle-poll-"))
+    server = await startTestServer({ build: fakeBuild({ stt: controlledStt().stt, llm: scriptedLlm(() => "ok").llm }), dataDir: dir, nodeBundlePollMs: 50 })
+    // The harness serves `<dataDir>/no-node` (empty: not built). Write a built dist into it.
+    const dist = join(dir, "no-node")
+    const { mkdirSync } = await import("node:fs")
+    const { createHash } = await import("node:crypto")
+    mkdirSync(dist, { recursive: true })
+    const sha = (b: Buffer) => createHash("sha256").update(b).digest("hex")
+    const pin = { url: "https://nodejs.org/x.tar.gz", sha256: "0".repeat(64) }
+    const writeDist = (bundle: Buffer) => {
+      const boot = Buffer.from("export {}\n")
+      writeFileSync(join(dist, "pva-node.mjs"), bundle)
+      writeFileSync(join(dist, "pva-node-boot.mjs"), boot)
+      writeFileSync(join(dist, "manifest.json"), JSON.stringify({
+        format: 1, protocol: 9, version: `0.0.0+${sha(bundle).slice(0, 10)}`,
+        bundle: { path: "pva-node.mjs", sha256: sha(bundle), bytes: bundle.length },
+        boot: { path: "pva-node-boot.mjs", sha256: sha(boot), bytes: boot.length },
+        runtime: { version: "22.23.5", "linux-arm64": pin, "linux-x64": pin }
+      }))
+      return sha(bundle)
+    }
+    const first = writeDist(Buffer.from("export const a = 1\n"))
+    const paired = await pair()
+    const admin = await connect()
+    await admin.admin(TEST_ADMIN_PASSWORD)
+    const node = await connect()
+    nodeHello(node, paired.deviceId, paired.credential, { bundleSha256: first })
+    await node.waitFor("welcome")
+    await vi.waitFor(() => expect(lastDevices(admin).find((d) => d.id === paired.deviceId)?.node?.upToDate).toBe(true))
+    // Quiet: the pushes that follow a connection (throttled to 1 s) are over.
+    await sleep(1_500)
+    const from = admin.position
+    // Rebuilt (a different size, so the manifest's stat changes even within one mtime tick): nothing else happens.
+    writeDist(Buffer.from("export const a = 2 // rebuilt\n"))
+    await vi.waitFor(() => {
+      const pushed = admin.messages.slice(from).filter((m): m is Extract<ServerMessage, { type: "devices" }> => m.type === "devices")
+      expect(pushed.at(-1)?.devices.find((d) => d.id === paired.deviceId)?.node?.upToDate).toBe(false)
+    }, { timeout: 2_000 })
+  })
+
   it("commands reach only that node; test-mic levels reach admin only, within the window; unknown or offline nodes are unknown_device", async () => {
     await start()
     const a = await pair("node-a")

@@ -236,6 +236,8 @@ export interface ServeOptions {
   readonly nodeDir?: string
   /** Tests: the pairing codes' and back-offs' clock (epoch ms). Default `Date.now`. */
   readonly nodesNow?: () => number
+  /** How often the served node bundle is checked for a rebuild (default 5 s; tests shorten it). */
+  readonly nodeBundlePollMs?: number
 }
 
 export interface ServeHandle {
@@ -1300,6 +1302,17 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       ...(options.helloTimeoutMs !== undefined ? { helloTimeoutMs: options.helloTimeoutMs } : {})
     })
     const hubNow = hub
+    // A rebuilt apps/node/dist (`pnpm --filter @pva/node bundle` while the server runs) changes every node's
+    // `upToDate`: admin is told, so "Update pending" and "Update now" appear without a reload.
+    let servedBundle = nodeDist.manifest()?.bundle.sha256
+    const bundlePoll = setInterval(() => {
+      const now = nodeDist.manifest()?.bundle.sha256
+      if (now === servedBundle) return
+      servedBundle = now
+      hubNow.nodeBundleChanged()
+    }, options.nodeBundlePollMs ?? 5_000)
+    bundlePoll.unref()
+    yield* Effect.addFinalizer(() => Effect.sync(() => clearInterval(bundlePoll)))
     host.subscribe((module) => {
       hubNow.broadcast({ type: "module.changed", module: access.module(module) })
       if (module.id === SUBSCRIPTION_AGENT_ID && theEngine.status().engines.some((e) => e.provider === SUBSCRIPTION_PROVIDER)) theEngine.refreshStatus()
