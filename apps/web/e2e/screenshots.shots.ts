@@ -878,3 +878,116 @@ test.describe("voice picker, phone, dark", () => {
     }, true)
   })
 })
+
+// ---------------------------------------------------------------------------------------------------------------
+// Admin › Assistants (docs/ASSISTANTS.md §7.1, mock-up docs/mockups/assistants/admin.html)
+// ---------------------------------------------------------------------------------------------------------------
+
+/** Open an assistant's tab (or the list), logging in on first use; the pointer is parked so no row shows its hover. */
+const assistantsAt = async (page: Page, baseURL: string | undefined, hash: string) => {
+  await loginAdmin(page, baseURL, `#settings/assistants/${hash}`)
+  await expect(page.getByTestId(hash === "all" ? "assistant-list" : "assistant-page")).toBeVisible()
+  await page.mouse.move(2, 2)
+  await settle(page, 400)
+}
+
+test.describe("admin, assistants, desktop, dark", () => {
+  test.use({ colorScheme: "dark", ...DESKTOP })
+
+  test("the list, every tab, the delete dialog, a refused field, an assistant changed elsewhere", async ({ page, baseURL }) => {
+    await mock.scenario("devices")
+    await assistantsAt(page, baseURL, "all")
+    await shot(page, "admin-desktop-30-assistants-list")
+    const tab = (k: string) => page.locator(`[role=tab][data-tab=${k}]`)
+    const at = async (k: string, name: string) => {
+      await tab(k).click()
+      await page.mouse.move(2, 2)
+      await settle(page, 350)
+      await shot(page, name)
+    }
+    await page.getByTestId("assistant-list").locator("[data-assistant=jeff]").click()
+    await expect(page.getByTestId("assistant-page")).toBeVisible()
+    await settle(page, 350)
+    await shot(page, "admin-desktop-31-assistant-basics")
+    await at("behaviour", "admin-desktop-32-assistant-behaviour")
+    await at("model", "admin-desktop-33-assistant-model")
+    await at("hearing", "admin-desktop-35-assistant-hearing")
+    await page.getByRole("region", { name: "Turn timing" }).scrollIntoViewIfNeeded()
+    await page.getByLabel("Speech detection threshold").scrollIntoViewIfNeeded()
+    await settle(page, 200)
+    await shot(page, "admin-desktop-35b-assistant-hearing-timing")
+    await at("voice", "admin-desktop-36-assistant-voice")
+    await at("modules", "admin-desktop-37-assistant-modules")
+    await page.locator("[data-module=clock]").getByTestId("tools-toggle").click()
+    await settle(page, 200)
+    await shot(page, "admin-desktop-38-assistant-modules-tools")
+    await at("used", "admin-desktop-39-assistant-used-on")
+    // T3: the Claude subscription account shows its own block.
+    await page.getByTestId("nav-assistants-t3").click()
+    await expect(page.getByTestId("assistant-page")).toHaveAttribute("data-assistant", "t3")
+    await at("model", "admin-desktop-34-assistant-model-subscription")
+    await page.getByLabel("Start a fresh Claude session after").scrollIntoViewIfNeeded()
+    await settle(page, 200)
+    await shot(page, "admin-desktop-34b-assistant-model-subscription-limits")
+    // Edits: the dirty marks on the tab, the field and the navigation; then a field the server refuses.
+    await at("basics", "admin-desktop-40-assistant-basics-t3")
+    await page.getByLabel("Purpose").fill("Coding work, started and checked by voice.")
+    await page.getByLabel("Name", { exact: true }).fill("Keuken")
+    await page.mouse.move(2, 2)
+    await settle(page, 300)
+    await shot(page, "admin-desktop-41-assistant-unsaved")
+    await page.getByTestId("page-footer").getByRole("button", { name: "Save", exact: true }).click()
+    await expect(page.getByTestId("field-error").first()).toBeVisible()
+    await settle(page, 300)
+    await shot(page, "admin-desktop-42-assistant-field-error")
+    // Changed somewhere else, while edits are open.
+    await page.getByLabel("Name", { exact: true }).fill("T3")
+    await fetch(`${MOCK}/mock/assistant`, { method: "POST", body: JSON.stringify({ id: "t3", patch: { purpose: "Changed in another window." } }) })
+    await expect(page.getByTestId("behind")).toBeVisible()
+    await settle(page, 300)
+    await shot(page, "admin-desktop-43-assistant-changed-elsewhere")
+    // The delete dialog, naming the devices.
+    await page.getByTestId("page-footer").getByRole("button", { name: "Cancel" }).click()
+    await page.getByTestId("delete").click()
+    await expect(page.getByTestId("delete-dialog")).toBeVisible()
+    await settle(page, 250)
+    await shot(page, "admin-desktop-44-assistant-delete-dialog")
+  })
+})
+
+test.describe("admin, assistants, desktop, light", () => {
+  test.use({ colorScheme: "light", ...DESKTOP })
+
+  test("the list and the language model tab", async ({ page, baseURL }) => {
+    await mock.scenario("devices")
+    await assistantsAt(page, baseURL, "all")
+    await shot(page, "admin-desktop-light-15-assistants-list")
+    await page.getByTestId("assistant-list").locator("[data-assistant=jeff]").click()
+    await page.locator("[role=tab][data-tab=model]").click()
+    await page.mouse.move(2, 2)
+    await settle(page, 350)
+    await shot(page, "admin-desktop-light-16-assistant-model")
+  })
+})
+
+test.describe("admin, assistants, phone, dark", () => {
+  test.use({ colorScheme: "dark", ...PHONE })
+
+  test("the list, an assistant's Basics and Language model, the delete dialog", async ({ page, baseURL }) => {
+    await mock.scenario("devices")
+    await assistantsAt(page, baseURL, "all")
+    await shot(page, "admin-phone-16-assistants-list")
+    await page.getByTestId("assistant-list").locator("[data-assistant=jeff]").tap()
+    await expect(page.getByTestId("assistant-page")).toBeVisible()
+    await settle(page, 350)
+    await shot(page, "admin-phone-17-assistant-basics")
+    await page.locator("[role=tab][data-tab=model]").tap()
+    await settle(page, 350)
+    await shot(page, "admin-phone-18-assistant-model")
+    await page.locator("[role=tab][data-tab=basics]").tap()
+    await page.getByTestId("delete").tap()
+    await expect(page.getByTestId("delete-dialog")).toBeVisible()
+    await settle(page, 250)
+    await shot(page, "admin-phone-19-assistant-delete-dialog")
+  })
+})

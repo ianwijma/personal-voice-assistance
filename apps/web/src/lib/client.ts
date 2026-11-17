@@ -1,4 +1,5 @@
-import type { ClientMessage, DeviceProfile, FrontendKindId, FrontendRole, ProfilePatch, SettingsPatch, ToolId } from "@pva/protocol"
+import type { Assistant, AssistantBody, AssistantId, ClientMessage, DeviceProfile, DeviceSettingsPatch, DeviceTarget, FrontendKindId, FrontendRole, ProfilePatch, SettingsPatch, ToolId } from "@pva/protocol"
+import { type Outcome, outcomeOf } from "./assistants.ts"
 import { createDiagnosticsStore, type DiagnosticsStore, type MicProcessing } from "./audio/diagnostics.ts"
 import { CUE_RATE, wakeCue } from "./audio/cue.ts"
 import { levels, markInterrupted } from "./audio/levels.ts"
@@ -79,6 +80,24 @@ export interface AssistantClient {
   readonly updateFrontend: (kind: FrontendKindId, patch: ProfilePatch) => Promise<ResultMessage>
   readonly updateDeviceAdmin: (id: string, change: { readonly name?: string; readonly patch?: ProfilePatch }) => Promise<ResultMessage>
   readonly forgetDevice: (id: string) => Promise<ResultMessage>
+  /**
+   * Admin, protocol 7 (docs/ASSISTANTS.md §5.2). Each answers with an `Outcome`: `ok` (create: with `assistantId`),
+   * `invalid` (field errors by dotted path), `warnings` (send again with `saveAnyway`), `stale` (the entity changed:
+   * the user is told with a toast, and the caller drops its draft: the newest version is already in the state) or
+   * `refused`. The new lists arrive as `assistants` / `device.types` / `devices` pushes.
+   */
+  readonly saveAssistant: (assistant: Assistant, options?: { readonly saveAnyway?: boolean; readonly name?: string }) => Promise<Outcome>
+  readonly createAssistant: (
+    assistant: AssistantBody,
+    options?: { readonly copyOf?: AssistantId; readonly placements?: ReadonlyArray<{ readonly target: DeviceTarget; readonly phrase?: string }> }
+  ) => Promise<Outcome>
+  readonly deleteAssistant: (id: AssistantId, rev: number, name?: string) => Promise<Outcome>
+  readonly saveDevice: (
+    target: DeviceTarget,
+    rev: number,
+    settings: DeviceSettingsPatch,
+    options?: { readonly saveAnyway?: boolean; readonly name?: string; readonly label?: string }
+  ) => Promise<Outcome>
   /**
    * Admin: the phrase tester (`wake.heard` lines arrive while it is on), for one device's session (`deviceId`) or,
    * without one, the most recently active session.
@@ -166,6 +185,14 @@ export const createAssistantClient = (options: { readonly frontend?: FrontendRol
   const prefs = createPrefsStore()
   const diagnostics = createDiagnosticsStore()
   const dispatch = store.dispatch
+  /** An answer to an assistant or device message as an `Outcome`; a stale one is told to the user here. */
+  const adminOutcome = async (pending: Promise<ResultMessage>, name: string): Promise<Outcome> => {
+    const outcome = outcomeOf(await pending) // continuation(none): turns the answer into an outcome; the toast below is the only effect
+    if (outcome.kind === "stale") {
+      dispatch({ type: "local/toast", message: `${name} was changed somewhere else. Showing the latest version; your edits were not saved.`, tone: "error" })
+    }
+    return outcome
+  }
   let localPlayback: ((e: PlayerEvent) => void) | undefined
   /**
    * The echo test that runs now (its own token): it owns the microphone gate (held shut) and the local
@@ -629,6 +656,31 @@ export const createAssistantClient = (options: { readonly frontend?: FrontendRol
         ...(change.patch !== undefined ? { patch: change.patch } : {})
       }),
     forgetDevice: (id) => connection.request({ type: "device.forget", id }),
+    saveAssistant: (assistant, options = {}) =>
+      adminOutcome(connection.request({ type: "assistant.save", assistant, ...(options.saveAnyway === true ? { saveAnyway: true } : {}) }), options.name ?? assistant.name),
+    createAssistant: (assistant, options = {}) =>
+      adminOutcome(
+        connection.request({
+          type: "assistant.create",
+          assistant,
+          ...(options.copyOf !== undefined ? { copyOf: options.copyOf } : {}),
+          ...(options.placements !== undefined ? { placements: options.placements.map((p) => ({ target: p.target, ...(p.phrase !== undefined ? { phrase: p.phrase } : {}) })) } : {})
+        }),
+        assistant.name
+      ),
+    deleteAssistant: (id, rev, name) => adminOutcome(connection.request({ type: "assistant.delete", id, rev }), name ?? id),
+    saveDevice: (target, rev, settings, options = {}) =>
+      adminOutcome(
+        connection.request({
+          type: "device.save",
+          target,
+          rev,
+          settings,
+          ...(options.name !== undefined ? { name: options.name } : {}),
+          ...(options.saveAnyway === true ? { saveAnyway: true } : {})
+        }),
+        options.label ?? "The device"
+      ),
     wakeTest: (on, deviceId) => connection.request(deviceId === undefined ? { type: "wake.test", on } : { type: "wake.test", on, deviceId }),
     newConversation: () => connection.request({ type: "conversation.new" }),
     diagnostics,

@@ -661,3 +661,10 @@ describe("makeAssistantId", () => {
     expect(id.endsWith("-2")).toBe(true)
   })
 })
+
+describe("reserved assistant ids", () => {
+  it("never gives an assistant an id the admin pages use as an address", () => {
+    expect(makeAssistantId("All")).toBe("all-2")
+    expect(makeAssistantId("New")).toBe("new-2")
+  })
+})
