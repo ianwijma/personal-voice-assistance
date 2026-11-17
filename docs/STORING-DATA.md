@@ -271,7 +271,7 @@ one that cannot be opened here, they get an empty read-only store. Ambient facts
 `bench --live --ambient`). A command-line mode that keeps a read open holds an older snapshot, which delays the
 checkpoint after an erase until it lets go.
 
-## Backup and restore
+## Backups
 
 - The server makes `data/backups/household-<date>.db` once a day, and copies each to `HOUSEHOLD_BACKUP_COPY_DIR` when
   set. A backup is SQLite's online backup made through a **connection of its own**, in one step on a worker thread,
@@ -280,10 +280,6 @@ checkpoint after an erase until it lets go.
   `pnpm start household backup`) never meet. A backup is one self-contained file (no log beside it). Every file and
   directory the store makes is private to the user (`0600`, `0700`), whatever the umask.
 - On demand: `pnpm start household backup` (works while the server runs).
-- Export one module's data as JSON: `pnpm start household export <module id> [file]`: every row of its collections
-  and SQL tables (no limit), the content of its full-text tables, from one consistent snapshot read through a
-  connection of its own, 500 rows at a time; `omitted` names a full-text index whose content lives in another table
-  (that table is exported) or that has none.
 - `pnpm start doctor` checks that the database opens, passes SQLite's quick check, is not from a newer version, and
   that the last backup is less than 48 hours old. The Health page in serve mode shows the backup checks and a pending
   erase at every check ("Check again" too; they read only file times); the quick check reads the whole file, so it is
@@ -295,26 +291,18 @@ checkpoint after an erase until it lets go.
 |---|---|---|
 | Daily backups | `data/backups/household-<date>.db`, and the second directory | beyond the newest 14, and when older than 14 days (the newest one is always kept) |
 | Backups before an upgrade | `data/backups/household-<date>-before-<module>.db` | when older than 14 days |
-| The database a restore set aside | `data/household.db.before-restore-<time>` | when older than 14 days |
 | Change-log rows (with the values of `history: "full"`) | `pva_changes` | after 90 days |
 
 The server prunes them once a day and after every backup. So 14 days after an erase, the erased item is in no file
 the store manages (if the server ran meanwhile).
 
-### Restore
+### Restoring a backup
 
 1. Stop the server (`systemctl --user stop pva` or Ctrl+C).
-2. `pnpm start household restore data/backups/household-2026-11-17.db`. It takes the writer lock (so it refuses while
-   the server runs), then: refuses the live database itself as the source; checks the source as SQLite reads it, with
-   its write-ahead log (quick check, household data, a schema this version knows); copies it, log included, to a new
-   file beside `household.db` and checks the copy; copies the current database, log included, aside as
-   `household.db.before-restore-<time>`; folds the current log into the current file; and only then puts the copy in
-   place with one `rename`. A failure before that leaves everything as it was. Interrupted (Ctrl+C), it still runs to
-   its end before the lock is released, so a server cannot open the database in between.
-3. Start the server. Pages reconnect and get a fresh snapshot.
-
-By hand: with the server stopped, keep the old `household.db`, `household.db-wal` and `household.db-shm` somewhere,
-delete them, and copy the backup (one self-contained file) to `data/household.db`.
+2. Move `data/household.db`, `data/household.db-wal` and `data/household.db-shm` somewhere else (keep them until the
+   restored data is known to be right).
+3. Copy the backup (one self-contained file) to `data/household.db` and make it private: `chmod 600 data/household.db`.
+4. Start the server. Pages reconnect and get a fresh snapshot.
 
 ## Latency
 

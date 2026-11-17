@@ -514,19 +514,6 @@ export interface CoreSql {
   readonly migrate: (migrations: ReadonlyArray<string>) => Effect.Effect<void, StoreError>
 }
 
-/**
- * One module's data as JSON (`HouseholdStore.exportModule`): every row of every collection and every row of its SQL
- * tables, read from one consistent snapshot. `omitted` names what is not in it and why (a full-text table whose
- * content lives in another table, or no content at all: its source table is exported instead).
- */
-export interface ModuleExport {
-  readonly module: string
-  readonly exportedAt: number
-  readonly collections: Readonly<Record<string, ReadonlyArray<{ readonly id: string; readonly rev: number; readonly scope: ScopeRef; readonly value: unknown; readonly createdAt: number; readonly updatedAt: number }>>>
-  readonly tables: Readonly<Record<string, ReadonlyArray<Record<string, unknown>>>>
-  readonly omitted: ReadonlyArray<{ readonly table: string; readonly reason: string }>
-}
-
 export interface StoreInfo {
   readonly kind: "sqlite" | "memory" | "closed"
   readonly readOnly: boolean
@@ -577,8 +564,6 @@ export interface HouseholdStore {
   readonly pruneChanges: (options?: { readonly now?: number; readonly maxAgeMs?: number }) => Effect.Effect<number, StoreError>
   /** An online backup to `<dir>/household-<date>.db` (see docs/STORING-DATA.md "Backups" for what is kept how long). */
   readonly backup: (options?: { readonly now?: number }) => Effect.Effect<{ readonly path: string }, StoreError>
-  /** One module's data as JSON. */
-  readonly exportModule: (moduleId: string) => Effect.Effect<ModuleExport, StoreError>
   /** Called after each commit with what it committed, in order (the event bus). Returns an unsubscribe function. */
   readonly onCommit: (listener: (changes: ReadonlyArray<CommittedChange>) => void) => () => void
 }
@@ -808,7 +793,6 @@ export const makeClosedStore = (reason: string): HouseholdStore => {
     sweepConversations: Effect.succeed(0),
     pruneChanges: () => Effect.succeed(0),
     backup: () => fail,
-    exportModule: () => fail,
     onCommit: () => () => {}
   }
 }

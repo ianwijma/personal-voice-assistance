@@ -92,7 +92,6 @@ describe("SQLite store latency on 100,000 rows of ~1 KB", () => {
       }
       const background: Record<string, Effect.Effect<unknown, unknown>> = {
         "backup (own connection, worker thread)": store.backup(),
-        "export of the module (own connection, pages of 500)": store.exportModule("big"),
         "prune 100,000 changes (100 per transaction)": store.pruneChanges({ now: 91 * 86_400_000 })
       }
       let worstBackground = 0

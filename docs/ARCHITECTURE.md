@@ -353,7 +353,7 @@ CollectionHandle<A> = { get(id, { scope? }); list({ scope?, where?, orderBy?, li
 ModuleSql = { prefix: sqlPrefixOf(id); table(name); fts5; query(sql, params); run(sql, params) }   // one guarded statement per call
 ModuleEvents (ctx.events) = { publish(type, data, scope?): Effect<void>; subscribe(filter?): Stream<HouseholdEvent> }
 HouseholdStore (host) = { prepare(modules); availability(id); forModule(id); transaction; afterCommit(f); core(owner): CoreSql;
-                          changesSince; lastSeq; endConversation; sweepConversations; pruneChanges; backup; exportModule; onCommit }
+                          changesSince; lastSeq; endConversation; sweepConversations; pruneChanges; backup; onCommit }
 EventBus = { publish(event); subscribe(filter?, { capacity? }); stats(); forModule(id); connect(store) }
 HouseholdFeed = { active; snapshot(device): { seq, parts, cursor }; catchUp(device, cursor): changes | resync; live(moduleEvent, device) }
 ```
@@ -406,9 +406,8 @@ HouseholdFeed = { active; snapshot(device): { seq, parts, cursor }; catchUp(devi
   **off by default** until measured with `bench --live --ambient`) appended to each assistant's registry in serve mode
   (`withContextProvider`).
 - **Backups**: daily `data/backups/household-<date>.db` (optional `HOUSEHOLD_BACKUP_COPY_DIR`), each through its own
-  temporary file and one `rename`; every archive (daily, pre-upgrade, restore-aside) removed after 14 days; `pnpm start
-  household backup | export <module> | restore <file>` (restore: checked copy beside the file, the old one set aside,
-  one `rename`, all under the writer lock's guard); `doctor` checks the database and the last backup's age, the Health
+  temporary file and one `rename`; every archive (daily, pre-upgrade) removed after 14 days; `pnpm start household
+  backup`; restoring is a manual step with the server stopped (docs/STORING-DATA.md); `doctor` checks the database and the last backup's age, the Health
   page the backup's age and a pending erase.
 
 Adding a feature = one new file exporting `defineModule({...})` + one line in `moduleCatalog` in `apps/assistant/src/modules.ts`. Adding a provider = one new package implementing a core interface + one line in `apps/assistant/src/providers.ts`. Adding a voice provider = an adapter with `layerConfig` (`Tts`) and `makeVoices` (`TtsVoices`), and one entry in `ttsProviders`, `ttsProviderInfo` and (hosted) `hostedTtsVoices` in `providers.ts`. A voice needs no code: it is chosen by its key.

@@ -63,7 +63,7 @@ export const householdIssues = (dataDir: string, options: { readonly backupDir?:
         severity: "error",
         title: "The household database cannot be opened",
         detail: opened.failure.message,
-        fix: { kind: "link", label: "How to restore a backup", value: "docs/STORING-DATA.md#restore" }
+        fix: { kind: "link", label: "How to restore a backup", value: "docs/STORING-DATA.md#restoring-a-backup" }
       }] satisfies ReadonlyArray<Issue>
     }
     const store = opened.success
@@ -75,7 +75,7 @@ export const householdIssues = (dataDir: string, options: { readonly backupDir?:
         severity: "error",
         title: "The household database is damaged",
         detail: check._tag === "Failure" ? check.failure.message : check.success.slice(0, 1500),
-        fix: { kind: "link", label: "Restore the last backup", value: "docs/STORING-DATA.md#restore" }
+        fix: { kind: "link", label: "Restore the last backup", value: "docs/STORING-DATA.md#restoring-a-backup" }
       })
     }
     issues.push(...(yield* householdBackupIssues(store)))

@@ -8,7 +8,6 @@ import {
   type CommittedChange,
   type CoreSql,
   type HouseholdStore,
-  type ModuleExport,
   type ModuleSql,
   makeTransactions,
   type OutboxItem,
@@ -254,7 +253,7 @@ const preflight = async (filename: string): Promise<string | undefined> => {
     const schema = Number((db.prepare("SELECT value FROM pva_meta WHERE key = 'schema'").get() as { value: string } | undefined)?.value ?? "0")
     if (schema > CORE_SCHEMA_VERSION) {
       return `${filename} was written by a newer version of the assistant (household schema ${schema}; this version knows ${CORE_SCHEMA_VERSION}). ` +
-        "Update the assistant, or restore a backup made by this version (docs/STORING-DATA.md, \"Restore\")."
+        "Update the assistant, or restore a backup made by this version (docs/STORING-DATA.md, \"Restoring a backup\")."
     }
     return undefined
   } catch (e) {
@@ -841,97 +840,6 @@ export const makeSqliteStore = (options: SqliteStoreOptions): Effect.Effect<Sqli
       }
     }
 
-    // ---- Export: one consistent snapshot on a connection of its own, in pages with a yield between them
-
-    const exportModule = (moduleId: string) =>
-      Effect.gen(function*() {
-        const at = yield* Clock.currentTimeMillis
-        if (memory) return yield* tx.statement(exportFrom(moduleId, at, undefined))
-        const { DatabaseSync } = yield* Effect.promise(() => sqlite())
-        return yield* Effect.acquireUseRelease(
-          Effect.try({
-            try: () => {
-              const db = new DatabaseSync(options.filename, { readOnly: true })
-              // The snapshot starts with the first read: take it now, so every table is read as of this moment.
-              db.exec("BEGIN")
-              db.prepare("SELECT count(*) FROM sqlite_schema").get()
-              return db
-            },
-            catch: (cause) => new StoreError({ reason: "failed", message: `Could not open ${options.filename} to export: ${String(cause)}`, cause })
-          }),
-          (db) => exportFrom(moduleId, at, db),
-          (db) => Effect.sync(() => {
-            try {
-              db.exec("COMMIT")
-            } finally {
-              db.close()
-            }
-          })
-        )
-      }).pipe(Effect.scoped)
-
-    /** Read a module's data from `db` (a read transaction of its own) or, in memory, from the store's connection. */
-    const exportFrom = (moduleId: string, at: number, db: InstanceType<typeof import("node:sqlite").DatabaseSync> | undefined) =>
-      Effect.gen(function*() {
-        const plain = (v: unknown): unknown => (v instanceof Uint8Array ? { base64: Buffer.from(v).toString("base64") } : typeof v === "bigint" ? (v >= BigInt(Number.MIN_SAFE_INTEGER) && v <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(v) : String(v)) : v)
-        /** Every row of a query, handed to `each` 500 at a time with a yield between: no long stretch on the event loop. */
-        const each = (sql: string, params: ReadonlyArray<SqlValue>, f: (row: Record<string, unknown>) => void) =>
-          Effect.gen(function*() {
-            if (db === undefined) {
-              const rows = (yield* query<Record<string, unknown>>(sql, [...params])) as ReadonlyArray<Record<string, unknown>>
-              for (const row of rows) f(row)
-              return
-            }
-            const statement = db.prepare(sql)
-            statement.setReadBigInts(true)
-            const it = statement.iterate(...params) as Iterator<Record<string, unknown>>
-            for (;;) {
-              for (let n = 0; n < 500; n++) {
-                const next = it.next()
-                if (next.done === true) return
-                f(next.value)
-              }
-              yield* Effect.yieldNow
-            }
-          })
-        const grouped = new Map<string, Array<ModuleExport["collections"][string][number]>>()
-        yield* each("SELECT * FROM pva_docs WHERE module = ? ORDER BY module, collection, id", [moduleId], (r) => {
-          const d = toDoc({ ...(r as unknown as DocRow), rev: Number(r.rev), v: Number(r.v), created_at: Number(r.created_at), updated_at: Number(r.updated_at) })
-          let rows = grouped.get(d.collection)
-          if (rows === undefined) grouped.set(d.collection, rows = [])
-          rows.push({ id: d.id, rev: d.rev, scope: d.scope, value: JSON.parse(d.text), createdAt: d.createdAt, updatedAt: d.updatedAt })
-        })
-        const prefix = sqlPrefixOf(moduleId)
-        const objects: Array<{ name: string; sql: string | null }> = []
-        yield* each("SELECT name, sql FROM sqlite_schema WHERE type = 'table' AND substr(name, 1, ?) = ? ORDER BY name", [prefix.length, prefix], (r) => {
-          objects.push({ name: String(r.name), sql: r.sql === null ? null : String(r.sql) })
-        })
-        const virtual = objects.filter((o) => /^\s*create\s+virtual/i.test(o.sql ?? ""))
-        const shadowOf = (n: string) => virtual.some((v) => n.startsWith(`${v.name}_`) && n !== v.name)
-        const tables = new Map<string, ReadonlyArray<Record<string, unknown>>>()
-        const omitted: Array<{ table: string; reason: string }> = []
-        const quote = (n: string) => `"${n.replace(/"/g, "\"\"")}"`
-        for (const o of objects) {
-          const short = o.name.slice(prefix.length)
-          if (shadowOf(o.name)) continue
-          const isVirtual = virtual.includes(o)
-          if (isVirtual) {
-            const content = /content\s*=\s*(?:'([^']*)'|"([^"]*)"|([A-Za-z0-9_]+))/i.exec(o.sql ?? "")
-            const source = content === null ? undefined : content[1] ?? content[2] ?? content[3] ?? ""
-            if (source !== undefined) {
-              omitted.push({ table: short, reason: source === "" ? "a full-text index without content of its own" : `a full-text index of ${source}, which holds the content` })
-              continue
-            }
-          }
-          const rows: Array<Record<string, unknown>> = []
-          yield* each(isVirtual ? `SELECT rowid AS rowid, * FROM ${quote(o.name)}` : `SELECT * FROM ${quote(o.name)}`, [], (row) => {
-            rows.push(Object.fromEntries(Object.entries(row).map(([k, v]) => [k, plain(v)])))
-          })
-          tables.set(short, rows)
-        }
-        return { module: moduleId, exportedAt: at, collections: Object.fromEntries(grouped), tables: Object.fromEntries(tables), omitted } satisfies ModuleExport
-      })
-
     const store: SqliteHouseholdStore = {
       info: { kind: "sqlite", readOnly, fts5, ...(memory ? {} : { path: options.filename }) },
       prepare: (modules) => Effect.forEach(modules, prepareOne, { discard: true }),
@@ -964,7 +872,6 @@ export const makeSqliteStore = (options: SqliteStoreOptions): Effect.Effect<Sqli
           }
         }),
       backup,
-      exportModule,
       onCommit: (listener) => {
         listeners.add(listener)
         return () => listeners.delete(listener)

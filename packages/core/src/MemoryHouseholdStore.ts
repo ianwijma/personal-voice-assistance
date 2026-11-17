@@ -10,7 +10,6 @@ import {
   type HouseholdStore,
   indexedEquals,
   matchesTokens,
-  type ModuleExport,
   type ModuleSql,
   readOnlyError,
   scopeKey,
@@ -299,19 +298,6 @@ export const makeMemoryHouseholdStore = (options: MemoryStoreOptions = {}): Hous
 
   const oldestSeq = () => state.changes[0]?.seq ?? state.nextSeq
 
-  const exportModule = (moduleId: string): Effect.Effect<ModuleExport, StoreError> =>
-    tx.statement(Effect.gen(function*() {
-      const at = yield* Clock.currentTimeMillis
-      const grouped = new Map<string, Array<ModuleExport["collections"][string][number]>>()
-      const docs = [...state.docs.values()].filter((d) => d.module === moduleId).sort((a, b) => compareCodePoints(a.collection, b.collection) || compareCodePoints(a.id, b.id))
-      for (const d of docs) {
-        let rows = grouped.get(d.collection)
-        if (rows === undefined) grouped.set(d.collection, rows = [])
-        rows.push({ id: d.id, rev: d.rev, scope: d.scope, value: JSON.parse(d.text), createdAt: d.createdAt, updatedAt: d.updatedAt })
-      }
-      return { module: moduleId, exportedAt: at, collections: Object.fromEntries(grouped), tables: {}, omitted: [] }
-    }))
-
   return {
     info: { kind: "memory", readOnly, fts5: false },
     prepare: (modules) => Effect.forEach(modules, prepareOne, { discard: true }),
@@ -344,7 +330,6 @@ export const makeMemoryHouseholdStore = (options: MemoryStoreOptions = {}): Hous
         return before - state.changes.length
       })),
     backup: () => Effect.fail(new StoreError({ reason: "unavailable", message: "The in-memory store has no backups" })),
-    exportModule,
     onCommit: (listener) => {
       listeners.add(listener)
       return () => listeners.delete(listener)

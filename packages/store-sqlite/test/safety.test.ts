@@ -1,4 +1,4 @@
-// The SQLite store's files and data safety (review round 1): private files, a newer file refused untouched, restore,
+// The SQLite store's files and data safety (review round 1): private files, a newer file refused untouched,
 // backups that cannot meet, the checkpoint after an erase, retention of every archive, collection-only upgrades,
 // index names, the index every list shape uses, module namespaces, and a complete, consistent export.
 import { assert, describe, it } from "@effect/vitest"
@@ -9,7 +9,7 @@ import { chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, statSync
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { DatabaseSync } from "node:sqlite"
-import { indexName, listSql, makeSqliteStore, restoreDatabase } from "../src/index.ts"
+import { indexName, listSql, makeSqliteStore } from "../src/index.ts"
 
 const tmp = () => mkdtempSync(join(tmpdir(), "pva-safety-"))
 const Item = Schema.Struct({ text: Schema.String })
@@ -105,7 +105,7 @@ describe("SQLite store files", () => {
       raw.close()
     }))
 
-  it.effect("every archive is removed after 14 days: daily backups, pre-upgrade backups, restore-aside copies; temporary files of others are left", () =>
+  it.effect("every archive is removed after 14 days: daily backups, pre-upgrade backups; temporary files of others are left", () =>
     Effect.gen(function*() {
       const dir = tmp()
       const file = join(dir, "household.db")
@@ -122,90 +122,12 @@ describe("SQLite store files", () => {
       }
       old("household-2026-11-01-before-shop.db", 29)
       old("household-2026-11-25-before-lists.db", 5)
-      old("household.db.before-restore-2026-11-01T10-00-00-000Z", 29)
       old("household-2026-11-30.db.part-1234-0123456789ab", 0)
       utimesSync(join(backups, "household-2026-11-10.db"), (now - 20 * DAY) / 1000, (now - 20 * DAY) / 1000)
       const removed = yield* store.pruneBackups({ now })
-      assert.sameMembers([...removed], ["household-2026-11-10.db", "household-2026-11-01-before-shop.db", "household.db.before-restore-2026-11-01T10-00-00-000Z"])
+      assert.sameMembers([...removed], ["household-2026-11-10.db", "household-2026-11-01-before-shop.db"])
       assert.sameMembers(readdirSync(backups), ["household-2026-11-30.db", "household-2026-11-25-before-lists.db", "household-2026-11-30.db.part-1234-0123456789ab"])
     }).pipe(Effect.scoped))
-})
-
-describe("SQLite store: restore", () => {
-  const seed = (file: string, texts: ReadonlyArray<string>) =>
-    Effect.scoped(Effect.gen(function*() {
-      const store = yield* makeSqliteStore({ filename: file })
-      yield* store.prepare([{ id: "shop", storage: { collections: [items] } }])
-      for (const text of texts) yield* store.forModule("shop").collection(items).insert({ text })
-    }))
-  const textsIn = (file: string) => {
-    const raw = new DatabaseSync(file, { readOnly: true })
-    const out = (raw.prepare("SELECT value FROM pva_docs ORDER BY value").all() as Array<{ value: string }>).map((r) => (JSON.parse(r.value) as { text: string }).text)
-    raw.close()
-    return out
-  }
-
-  it.effect("restores a source with rows only in its log, sets the current one aside whole, leaves no stale log", () =>
-    Effect.gen(function*() {
-      const dir = tmp()
-      const live = join(dir, "household.db")
-      yield* seed(live, ["live one"])
-      // A live log the restore must fold in before it replaces the file.
-      const holder = new DatabaseSync(live)
-      holder.exec("PRAGMA wal_autocheckpoint = 0")
-      holder.prepare("INSERT INTO pva_meta (key, value) VALUES ('live-wal', 'yes')").run()
-      holder.close()
-      const source = join(tmp(), "backup.db")
-      yield* seed(source, ["from backup"])
-      // A committed row only in the source's write-ahead log (no checkpoint, the connection kept open).
-      const writer = new DatabaseSync(source)
-      writer.exec("PRAGMA wal_autocheckpoint = 0")
-      writer.prepare("INSERT INTO pva_docs (module, collection, id, scope_kind, scope_id, rev, v, value, created_at, updated_at, updated_by) VALUES ('shop', 'items', 'w', 'household', '', 99, 1, '{\"text\":\"only in the wal\"}', 0, 0, '{}')").run()
-      assert.isTrue(statSync(`${source}-wal`).size > 0)
-      const done = yield* Effect.promise(() => restoreDatabase({ source, target: live, knownSchema: 1, now: Date.UTC(2026, 10, 18) }))
-      writer.close()
-      assert.deepStrictEqual(textsIn(live), ["from backup", "only in the wal"])
-      assert.isFalse(existsSync(`${live}-wal`) && statSync(`${live}-wal`).size > 0)
-      assert.strictEqual(mode(live), 0o600)
-      assert.isDefined(done.aside)
-      assert.strictEqual(mode(done.aside!), 0o600)
-      assert.deepStrictEqual(textsIn(done.aside!), ["live one"])
-      const aside = new DatabaseSync(done.aside!, { readOnly: true })
-      assert.strictEqual((aside.prepare("SELECT value FROM pva_meta WHERE key = 'live-wal'").get() as { value: string }).value, "yes")
-      aside.close()
-      // The restored file opens as the store.
-      yield* Effect.scoped(Effect.gen(function*() {
-        const store = yield* makeSqliteStore({ filename: live })
-        yield* store.prepare([{ id: "shop", storage: { collections: [items] } }])
-        assert.strictEqual((yield* store.forModule("shop").collection(items).list()).length, 2)
-      }))
-    }))
-
-  it.effect("refuses the live file itself, a damaged or foreign source and a newer one, and then changes nothing", () =>
-    Effect.gen(function*() {
-      const dir = tmp()
-      const live = join(dir, "household.db")
-      yield* seed(live, ["keep me"])
-      const before = readdirSync(dir).sort()
-      const attempt = (source: string) => Effect.exit(Effect.tryPromise(() => restoreDatabase({ source, target: live, knownSchema: 1, now: 0 })))
-      for (const source of [live, `${live}-wal`]) assert.isTrue(Exit.isFailure(yield* attempt(source)), source)
-      const junk = join(tmp(), "junk.db")
-      writeFileSync(junk, "this is not a database at all, just text that is long enough to look like a file".repeat(100))
-      assert.isTrue(Exit.isFailure(yield* attempt(junk)))
-      const foreign = join(tmp(), "foreign.db")
-      const f = new DatabaseSync(foreign)
-      f.exec("CREATE TABLE t (x)")
-      f.close()
-      assert.isTrue(Exit.isFailure(yield* attempt(foreign)))
-      const newer = join(tmp(), "newer.db")
-      yield* seed(newer, ["from the future"])
-      const n = new DatabaseSync(newer)
-      n.exec("UPDATE pva_meta SET value = '99' WHERE key = 'schema'")
-      n.close()
-      assert.isTrue(Exit.isFailure(yield* attempt(newer)))
-      assert.deepStrictEqual(readdirSync(dir).sort(), before)
-      assert.deepStrictEqual(textsIn(live), ["keep me"])
-    }))
 })
 
 describe("SQLite store: erase reaches the files", () => {
@@ -317,46 +239,6 @@ describe("SQLite store: names and indexes", () => {
         assert.match(plan, /USING (COVERING )?INDEX/, `${JSON.stringify(shape)}: ${plan}`)
         assert.isTrue((yield* c.list({ ...shape, limit: 20 })).length <= 20)
       }
-    }).pipe(Effect.scoped))
-})
-
-describe("SQLite store: export", () => {
-  it.effect("all rows of every table (more than 100,000), the content of full-text tables, and what is left out and why, from one snapshot", () =>
-    Effect.gen(function*() {
-      const dir = tmp()
-      const file = join(dir, "household.db")
-      const store = yield* makeSqliteStore({ filename: file })
-      yield* store.prepare([{
-        id: "notes",
-        storage: {
-          collections: [items],
-          sql: {
-            migrations: [
-              "CREATE TABLE m_notes__rows (id INTEGER PRIMARY KEY, body TEXT); CREATE TABLE m_notes____proto__ (x)",
-              "CREATE VIRTUAL TABLE m_notes__fts USING fts5(body); CREATE VIRTUAL TABLE m_notes__ext USING fts5(body, content='m_notes__rows', content_rowid='id'); CREATE VIRTUAL TABLE m_notes__bare USING fts5(body, content='')"
-            ]
-          }
-        }
-      }])
-      const sql = store.forModule("notes").sql
-      yield* sql.run("INSERT INTO m_notes__rows (id, body) SELECT value, 'row ' || value FROM json_each(?)", [JSON.stringify(Array.from({ length: 100_005 }, (_, i) => i + 1))])
-      yield* sql.run("INSERT INTO m_notes__fts (body) VALUES ('contentful text')")
-      yield* sql.run("INSERT INTO m_notes____proto__ (x) VALUES (1)")
-      yield* store.forModule("notes").collection(items).insert({ text: "a note" })
-      // A write during the export does not show up in it (one snapshot).
-      const exportFiber = yield* Effect.forkChild(store.exportModule("notes"))
-      // The export reads 500 rows at a time with a yield between: this write lands while it reads.
-      yield* Effect.repeat(Effect.yieldNow, { times: 20 })
-      assert.isUndefined(exportFiber.pollUnsafe(), "the export is still reading")
-      yield* sql.run("INSERT INTO m_notes__rows (id, body) VALUES (200000, 'late')")
-      const out = yield* Fiber.join(exportFiber)
-      assert.strictEqual(out.tables["rows"]!.length, 100_005)
-      assert.deepStrictEqual(out.tables["fts"]!.map((r) => r.body), ["contentful text"])
-      assert.isTrue(Object.hasOwn(out.tables, "__proto__"))
-      assert.strictEqual(JSON.parse(JSON.stringify(out)).tables.__proto__.length, 1)
-      assert.sameMembers(out.omitted.map((o) => o.table), ["ext", "bare"])
-      assert.isFalse(Object.keys(out.tables).some((t) => t.startsWith("fts_")))
-      assert.strictEqual(out.collections["items"]!.length, 1)
     }).pipe(Effect.scoped))
 })
 

@@ -733,19 +733,6 @@ export const householdStoreContract = (name: string, make: MakeStore) =>
         // Person-scoped events are withheld from every page until Privacy.mayReveal exists.
         assert.strictEqual(feed.live({ ...event, scope: { kind: "person", id: "sam" } }, { id: "kitchen-01" }), undefined)
       }).pipe(Effect.scoped))
-
-    it.effect("export: every collection, also one named like an object's own property", () =>
-      Effect.gen(function*() {
-        const store = yield* prepared(make)
-        yield* store.forModule("kit").collection(constructorCollection).insert({ text: "built" })
-        yield* store.forModule("kit").collection(notes).insert({ text: "note" })
-        const out = yield* store.exportModule("kit")
-        assert.isTrue(Object.hasOwn(out.collections, "constructor"))
-        assert.strictEqual(out.collections["constructor"]!.length, 1)
-        assert.strictEqual(out.collections["notes"]!.length, 1)
-        assert.strictEqual(JSON.parse(JSON.stringify(out)).collections.constructor.length, 1)
-      }).pipe(Effect.scoped))
-
     it.effect("a read-only store reads and refuses every write", () =>
       Effect.gen(function*() {
         const store = yield* make({ readOnly: true })

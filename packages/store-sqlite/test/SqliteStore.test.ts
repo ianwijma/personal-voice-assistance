@@ -1,4 +1,4 @@
-// What only the SQLite store does: module SQL and its migrations, refusing newer data, backups and restore, export,
+// What only the SQLite store does: module SQL and its migrations, refusing newer data, backups,
 // erase on disk, core services joining a module's transaction, read-only opening, and the quiet warning.
 import { assert, describe, it } from "@effect/vitest"
 import { defineCollection, type StoreError } from "@pva/core"
@@ -95,7 +95,7 @@ describe("SQLite household store", () => {
       assert.strictEqual(issues.find((i) => i.id === "core.household.open")?.severity, "error")
     }))
 
-  it.effect("backup and restore round trip; 14 kept; a copy in the second directory", () =>
+  it.effect("a backup opens as a database; 14 kept; a copy in the second directory", () =>
     Effect.gen(function*() {
       const dir = tmp()
       const copyDir = join(dir, "share")
@@ -112,7 +112,7 @@ describe("SQLite household store", () => {
       const backups = readdirSync(join(dir, "backups")).filter((n) => /^household-\d{4}-\d{2}-\d{2}\.db$/.test(n)).sort()
       assert.strictEqual(backups.length, 14)
       assert.strictEqual(readdirSync(copyDir).length, 14)
-      // Restore = the backup file as the database (docs/STORING-DATA.md "Restore").
+      // A backup is a database of its own (docs/STORING-DATA.md "Restoring a backup").
       const restored = join(backups.at(-1) === undefined ? dir : join(dir, "backups"), backups.at(-1)!)
       yield* Effect.scoped(Effect.gen(function*() {
         const store = yield* makeSqliteStore({ filename: restored, readOnly: true })
@@ -122,20 +122,6 @@ describe("SQLite household store", () => {
       const issues = yield* householdIssues(dir)
       assert.isUndefined(issues.find((i) => i.severity === "error"))
     }))
-
-  it.effect("export one module's data as JSON: collections and tables", () =>
-    Effect.gen(function*() {
-      const store = yield* makeSqliteStore({ filename: ":memory:" })
-      yield* store.prepare([{ id: "lists", storage: { collections: [items], sql: { migrations: LISTS_V1 } } }])
-      yield* store.forModule("lists").collection(items).insert({ text: "tea" })
-      yield* store.forModule("lists").sql.run("INSERT INTO m_lists__items (id, text) VALUES ('1', 'milk')")
-      const out = yield* store.exportModule("lists")
-      assert.strictEqual(out.module, "lists")
-      assert.deepStrictEqual(out.collections.items?.map((r) => r.value), [{ text: "tea" }])
-      assert.deepStrictEqual(out.tables.items, [{ id: "1", text: "milk" }])
-      JSON.stringify(out)
-    }).pipe(Effect.scoped))
-
   it.effect("erase leaves no trace of the content in the database files", () =>
     Effect.gen(function*() {
       const dir = tmp()
