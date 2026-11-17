@@ -1,5 +1,6 @@
 "use client"
-import { capabilityWords, type DeviceListInfo, type DevicePlace, type DevicePrivacy, effectiveCapabilities, KNOWN_PRESENT_KINDS, MAX_ROOM_CHARS } from "@pva/protocol"
+import { useEffect } from "react"
+import { capabilityWords, type DeviceListInfo, type DevicePlace, type DevicePrivacy, effectiveCapabilities, isOneLine, KNOWN_PRESENT_KINDS, MAX_PRESENT_KINDS, MAX_ROOM_CHARS } from "@pva/protocol"
 import { setKeys } from "@/lib/devices.ts"
 import { BOUNDARY_NOTE, declaredRows, kindsFor, membersOf, PRIVACY_CHOICES } from "@/lib/place.ts"
 import { agoText } from "@/lib/sessions.ts"
@@ -27,6 +28,26 @@ function Toggle({ label, checked, onChange, testId }: { readonly label: string; 
 }
 
 /**
+ * P5 round 3: a field shown invalid blocks Save through the page's blocking mechanism (`SectionContext.setBlocked`),
+ * and stops blocking when it is valid again or leaves the page.
+ */
+const useBlocking = (ctx: SectionContext, id: string, invalid: boolean) => {
+  const { setBlocked } = ctx
+  useEffect(() => {
+    setBlocked(id, invalid)
+  }, [setBlocked, id, invalid])
+  useEffect(() => () => setBlocked(id, false), [setBlocked, id])
+}
+
+/** The room as the wire schema takes it (`DevicePlace.room`): one line, at most `MAX_ROOM_CHARS`. */
+export const roomProblem = (room: string): string | undefined =>
+  room.length > MAX_ROOM_CHARS
+    ? `At most ${MAX_ROOM_CHARS} characters.`
+    : !isOneLine(room)
+    ? "A room is one line of text, without line breaks, control or direction characters."
+    : undefined
+
+/**
  * Next to every field whose change ends the device's session (privacy, default person, its speaker, screen and kinds):
  * what happens when it is saved. Room, always on, accepts and quiet room have none: they do not end it.
  */
@@ -43,6 +64,9 @@ export function PlaceSection({ ctx }: { readonly ctx: SectionContext }) {
   const people = useClientState((s) => membersOf(s.sections), (a, b) => JSON.stringify(a) === JSON.stringify(b))
   const set = (patch: Partial<DevicePlace>) => ctx.update((e) => setKeys(ctx.base, e, { place: { ...place, ...patch } }))
   const missing = place.defaultPerson !== null && !people.some((p) => p.id === place.defaultPerson)
+  const room = roomProblem(place.room)
+  useBlocking(ctx, "place-room", room !== undefined)
+  useBlocking(ctx, "place-person", missing)
   const privacyHelp = PRIVACY_CHOICES.find((c) => c.value === place.privacy)?.help
   return (
     <section className="flex flex-col gap-5" aria-labelledby="h-place" data-testid="section-place">
@@ -51,10 +75,16 @@ export function PlaceSection({ ctx }: { readonly ctx: SectionContext }) {
         <MarksFor ctx={ctx} section="place" title="Place" />
       </div>
       <p className="-mt-3 text-[13px] text-ink-muted">Where {ctx.thisWord} {ctx.isType ? "are" : "is"} and who uses {ctx.isType ? "them" : "it"}. Nothing here is detected; modules and the other devices read it.</p>
-      <DField label="Room" htmlFor="place-room" help="Free text, such as Kitchen. Devices with the same room are together; Home Assistant matches it to an area by name.">
+      <DField
+        label="Room"
+        htmlFor="place-room"
+        help="Free text, such as Kitchen. Devices with the same room are together; Home Assistant matches it to an area by name."
+        {...(room !== undefined ? { error: room } : {})}
+      >
         <input
           id="place-room"
           value={place.room}
+          aria-invalid={room !== undefined ? true : undefined}
           maxLength={MAX_ROOM_CHARS}
           placeholder="Kitchen"
           onChange={(e) => set({ room: e.target.value })}
@@ -83,6 +113,7 @@ export function PlaceSection({ ctx }: { readonly ctx: SectionContext }) {
           id="place-person"
           className={inputClass}
           value={place.defaultPerson ?? ""}
+          aria-invalid={missing ? true : undefined}
           onChange={(e) => set({ defaultPerson: e.target.value === "" ? null : e.target.value })}
           data-testid="place-person"
         >
@@ -121,6 +152,9 @@ export function CapabilitiesSection({ ctx, device, now, typeKind }: {
   // declared, and what is excluded already, so an exclusion can always be taken back and made again.
   const kinds = kindsFor({ known: KNOWN_PRESENT_KINDS, declared: device !== undefined ? [device] : devices.filter((d) => d.kind === typeKind), excluded: overrides.excludeKinds })
   const effective = declared === undefined ? undefined : effectiveCapabilities(declared.capabilities, overrides)
+  // P5 round 3: the wire's bound on switched-off kinds, shown and enforced here; what is stored is never dropped.
+  const tooMany = overrides.excludeKinds.length > MAX_PRESENT_KINDS
+  useBlocking(ctx, "caps-kinds", tooMany)
   return (
     <section className="flex flex-col gap-5" aria-labelledby="h-caps" data-testid="section-capabilities">
       <div className="flex items-baseline gap-2">
@@ -160,7 +194,11 @@ export function CapabilitiesSection({ ctx, device, now, typeKind }: {
         <Toggle label="Use its speaker" checked={!overrides.noSpeaker} onChange={(v) => set({ noSpeaker: !v })} testId="caps-speaker" />
         <BoundaryNote ctx={ctx} testId="caps-boundary-note" />
       </DField>
-      <DField label="What it may show">
+      <DField
+        label="What it may show"
+        {...(kinds.length > 0 ? { help: `At most ${MAX_PRESENT_KINDS} kinds can be switched off (${overrides.excludeKinds.length} now).` } : {})}
+        {...(tooMany ? { error: `At most ${MAX_PRESENT_KINDS} kinds can be switched off: switch ${overrides.excludeKinds.length - MAX_PRESENT_KINDS === 1 ? "one" : overrides.excludeKinds.length - MAX_PRESENT_KINDS} back on to save.` } : {})}
+      >
         {kinds.length === 0
           ? <p className="text-[13px] text-ink-faint" data-testid="caps-kinds-none">None yet: kinds of things to show arrive with the presentation stage.</p>
           : (
