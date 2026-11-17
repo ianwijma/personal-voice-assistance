@@ -153,12 +153,21 @@ const JUMP = 50_000
  */
 const heldTypeSafe = async () => {
   let requests = 0
+  /** When the held request arrived, and when its caller gave up on it (closed it unanswered); `performance.now()`. */
+  let arrivedAt: number | undefined
+  let abandonedAt: number | undefined
   let release = () => {}
   const held = new Promise<void>((resolve) => (release = resolve))
   const jev = Http.createServer((req, res) => {
     req.resume()
     req.on("end", () => {
       const first = ++requests === 1
+      if (first) {
+        arrivedAt = performance.now()
+        res.on("close", () => {
+          if (!res.writableEnded) abandonedAt = performance.now()
+        })
+      }
       void (first ? held : Promise.resolve()).then(() => {
         if (res.destroyed) return
         res.writeHead(200, { "content-type": "application/json" })
@@ -173,6 +182,8 @@ const heldTypeSafe = async () => {
       withoutPhrase: { mode: "typesafe", fallback: "alpha", giveUpMs: 2_000 }
     },
     requests: () => requests,
+    /** How long after it arrived the held request was abandoned unanswered (`undefined`: not yet). */
+    abandonedAfter: () => (arrivedAt === undefined || abandonedAt === undefined ? undefined : abandonedAt - arrivedAt),
     release: () => release(),
     close: () => {
       release()
@@ -361,6 +372,11 @@ describe("serve: one recogniser per device, from its hearer (WP-11)", () => {
       await until("the next start stamped", () => clock.reads() >= read + 2)
       await saveHearing("alpha", { model: "model-c" })
       await until("switched to model-c", () => streamOf(fake, "device-a")?.model === "model-c" && old.closed, 3_000)
+      // The precondition, observed: the switch cut the routing call (interrupting the old stream's dispatch abandoned
+      // the held request) before TypeSafe's 2 s give-up could. Given up first, the Alpha fallback would have answered the
+      // old final (`neverAnswered` fails then too) and closed the utterance normally.
+      await until("the routing call abandoned", () => jev.abandonedAfter() !== undefined)
+      expect(jev.abandonedAfter()!).toBeLessThan(1_900)
       neverAnswered(client, "what is the weather")
       // Everything of the new utterance (and its routing call) is recorded at JUMP; the dropped start was at 0.
       clock.set(JUMP)
@@ -395,9 +411,16 @@ describe("serve: one recogniser per device, from its hearer (WP-11)", () => {
       fake.emit(old, { _tag: "SpeechStarted" }, { _tag: "EndOfTurn", text: "what is the weather" })
       await until("the routing call", () => jev.requests() === 1)
       // While the routing call is pending (held): nobody answers without a phrase now, and the engines reload.
+      // "nobody" before the reload: the reload's route-gate flush is then dropped (the gate had closed the utterance at
+      // its final), which is what leaves the dispatcher's utterance open. In "decide" mode the flush would close it.
       await saveOwn("device-a", { withoutPhrase: { mode: "nobody" } })
       expect((await Effect.runPromise(server!.handle.engine.reload)).ok).toBe(true)
       await until("a new stream", () => streamOf(fake, "device-a") !== undefined && streamOf(fake, "device-a") !== old && old.closed, 5_000)
+      // The precondition, observed: the reload cut the routing call (the old loop's interruption abandoned the held
+      // request) before TypeSafe's 2 s give-up could. Given up first, the answer would be nobody now ("nobody" mode),
+      // the dispatcher would close the utterance itself, and the test would prove nothing: it fails here instead.
+      await until("the routing call abandoned", () => jev.abandonedAfter() !== undefined)
+      expect(jev.abandonedAfter()!).toBeLessThan(1_900)
       neverAnswered(client, "what is the weather")
       // Everything of the new utterance is recorded at JUMP; the reloaded-away one at 0.
       clock.set(JUMP)
