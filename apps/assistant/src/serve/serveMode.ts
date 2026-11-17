@@ -24,10 +24,12 @@ import {
   DEFAULT_MAX_VOICE_SESSIONS,
   DEFAULT_SESSION_DISCARD_MINUTES,
   type DeviceSettings,
+  type DeviceUser,
   type DeviceVoice,
   deviceTypeOf,
   effectiveDeviceSettings,
   type EngineInfo,
+  type ResourceInfo,
   hearerOf,
   homeLineOf,
   linkedModuleDefaults,
@@ -543,6 +545,34 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       for (const id of Object.keys(file.devices)) places.set(`device:${id}`, deviceSettingsFrom(file, id))
       if (override !== undefined) places.set(override.place, override.settings)
       return places
+    }
+    /**
+     * The devices that speak with each voice as their own (`voice: { from: "device" }`), by voice key, from the
+     * effective settings of every place (a device's own value, else its type's defaults), so it is always current. A
+     * device that follows a type's own voice is listed beside "Every <type>" (it speaks with it too).
+     */
+    const deviceUsersByVoice = (): ReadonlyMap<string, ReadonlyArray<DeviceUser>> => {
+      const file = store.settings()
+      const out = new Map<string, Array<DeviceUser>>()
+      for (const [place, settings] of placesNow()) {
+        if (settings.voice.from !== "device") continue
+        const user: DeviceUser = place.startsWith("type:")
+          ? { target: { kind: "type", type: place.slice("type:".length) }, name: `Every ${deviceTypeOf(place.slice("type:".length))?.one ?? place.slice("type:".length)}` }
+          : { target: { kind: "device", id: place.slice("device:".length) }, name: file.devices[place.slice("device:".length)]?.name || place.slice("device:".length) }
+        const key = voiceKey(settings.voice.voice)
+        out.set(key, [...(out.get(key) ?? []), user])
+      }
+      return out
+    }
+    /** Pool status for the snapshot: users `assistant@place` count as the assistant; the devices come from the settings. */
+    const resourceStatus = (): Array<ResourceInfo> => {
+      const devices = deviceUsersByVoice()
+      return resources.status().map((r) => {
+        if (r.kind !== "tts") return r
+        const usedBy = [...new Set(r.usedBy.map((u) => u.split("@")[0]!))]
+        const usedByDevices = devices.get(r.key) ?? []
+        return { ...r, usedBy, ...(usedByDevices.length > 0 ? { usedByDevices: [...usedByDevices] } : {}) }
+      })
     }
     /**
      * The recogniser of every hearing place: its hearer's hearing (switched on or not, §2.6: switching an assistant
@@ -1075,7 +1105,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
         ...engines.filter((e) => e.stage !== "llm" && e.stage !== "tts" && e.stage !== "stt"),
         ...(ttsRows().length > 0 ? ttsRows() : engines.filter((e) => e.stage === "tts"))
       ],
-      resources: { status: resources.status, rebuild: syncResources({ rebuild: true }), voices: voiceInfos },
+      resources: { status: resourceStatus, rebuild: syncResources({ rebuild: true }), voices: voiceInfos },
       explainProblems,
       blocked: settingsProblem
     })
@@ -1252,6 +1282,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       live: (voice) => resources.tts(voiceKey(voice)),
       busy: () => sessions.list().some((s) => inTurn.has(s.state)),
       usedBy: assistantVoice.usedBy,
+      usedByDevices: () => deviceUsersByVoice(),
       isFavourite: favourites.has,
       // Every voice of a shared archive (Kokoro) reports the one job that downloads it.
       download: (preset) => jobs.running("tts-models", SherpaTts.archiveOwner(preset) ?? preset),

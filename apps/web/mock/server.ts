@@ -2547,6 +2547,7 @@ const providerStatus = (p: (typeof MOCK_PROVIDERS)[number]): ProviderInfo => {
 const providerVoices = (p: (typeof MOCK_PROVIDERS)[number]): ProviderVoices => {
   const info = providerStatus(p)
   const selected = assistantVoiceKey()
+  const deviceUsers = assistantsMock.voiceUsers([...devices.values()].map((d) => ({ id: d.id, name: d.name })))
   const listed = info.status === "needs_key" ? [] : p.voices
   const voices: Array<VoiceEntry> = listed.map((v) => {
     const key = `${p.id}:${v.voiceId}`
@@ -2564,6 +2565,7 @@ const providerVoices = (p: (typeof MOCK_PROVIDERS)[number]): ProviderVoices => {
       ...(local !== undefined ? { local } : {}),
       previewable: info.status === "ready" && (local === undefined || local.state === "installed"),
       usedBy: key === selected ? ["jeff"] : [],
+      usedByDevices: deviceUsers.get(key) ?? [],
       favourite: favourites.some((f) => f.key === key)
     }
   })

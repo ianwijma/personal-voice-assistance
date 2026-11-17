@@ -7,6 +7,8 @@
 > `ASSISTANT_VOICE` is kept for the command-line modes and for migrating an install from before assistants. `GET
 > /api/voices/default` answers with the first switched-on assistant's voice, `PUT /api/voices/default` answers `410 gone`
 > and `VoiceEntry.selected` is `usedBy` (§5.8). A changed voice applies at the assistant's next turn, with no engine reload.
+> Devices that use a voice as their own (docs/LOOKS-AND-VOICES.md §3) are listed beside `usedBy` in the additive, optional
+> `VoiceEntry.usedByDevices` (`{ target, name }` per device or type's defaults); `usedBy` stays the assistants.
 > Sections 5.8, 6.1 and 7.3 say what they described and what replaced it.
 
 Design written 2026-11-16 at the owner's request. It changes four things:

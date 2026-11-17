@@ -42,7 +42,7 @@ export interface VoicePickerProps {
 const providersCache = new WeakMap<ReadonlyArray<ProviderVoices>, ReadonlyArray<GenericProvider>>()
 const favouritesCache = new WeakMap<ReadonlyArray<{ readonly key: string }>, ReadonlyArray<GenericFavourite>>()
 
-const mapVoice = (v: VoiceEntry): GenericRow => {
+export const mapVoice = (v: VoiceEntry): GenericRow => {
   const meta = voiceMeta(v)
   return {
     key: v.key,
@@ -56,6 +56,7 @@ const mapVoice = (v: VoiceEntry): GenericRow => {
     listed: true,
     favourite: v.favourite,
     usedBy: v.usedBy,
+    usedByDevices: v.usedByDevices ?? [],
     choice: { voice: v.voice }
   }
 }

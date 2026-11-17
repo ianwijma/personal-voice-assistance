@@ -58,3 +58,17 @@ describe("DefaultVoice.source", () => {
     expect(accepts(DefaultVoice, defaultVoice("assistants"))).toBe(false)
   })
 })
+
+describe("VoiceEntry.usedByDevices", () => {
+  const kitchen = { target: { kind: "device", id: "d-kitchen-ipad-0001" }, name: "Kitchen iPad" }
+  it("is optional (an older server leaves it out) and lists devices and device types with their names", () => {
+    expect(accepts(VoiceEntry, entry())).toBe(true)
+    expect(accepts(VoiceEntry, entry({ usedByDevices: [] }))).toBe(true)
+    expect(accepts(VoiceEntry, entry({ usedByDevices: [kitchen, { target: { kind: "type", type: "web-voice" }, name: "Every browser" }] }))).toBe(true)
+  })
+  it("refuses a user without a target or a name", () => {
+    expect(accepts(VoiceEntry, entry({ usedByDevices: [{ name: "x" }] }))).toBe(false)
+    expect(accepts(VoiceEntry, entry({ usedByDevices: [{ target: kitchen.target }] }))).toBe(false)
+    expect(accepts(VoiceEntry, entry({ usedByDevices: [{ target: { kind: "device", id: "x" }, name: "x" }] }))).toBe(false)
+  })
+})

@@ -74,7 +74,11 @@ DeviceSettings += { look: DeviceLook, voice: DeviceVoice }   // two new section 
 - **Saves.** `assistant.create`/`save` carry `look` as any field (absent stays absent). `device.save` takes `look` and
   `voice` for a type and a device (`null` resets a device). A device voice of its own is checked by `voiceProblem`
   (serve mode): a local voice that is not downloaded (or unknown) is refused, a hosted provider without a key is a
-  warning that `saveAnyway` overrides. (There is no such check on an assistant's own voice yet; ASSISTANTS.md §2.2 names one.)
+  warning that `saveAnyway` overrides. The same check, through the same path and shapes, runs on `assistant.create` and
+  `assistant.save` for the assistant's own voice (`assistant.create` takes an additive `saveAnyway`). A voice that is new
+  or changed is checked as above. A voice the stored assistant already has is never refused (that would block every
+  other edit of the assistant): if it became unavailable it only warns, and `saveAnyway` keeps it; a fine unchanged
+  voice is not affected.
 - **Run time.** The resource pool binds voices per *user*: the assistant itself while it speaks with its own voice, else
   `assistant@place` for each place (a device, or the type's defaults) whose `voice` section is `{ from: "device" }`. A
   turn reads the binding at its start (`conversationSetup(assistant, deviceId)`, `voiceOf`), so a change applies at the
@@ -85,13 +89,23 @@ DeviceSettings += { look: DeviceLook, voice: DeviceVoice }   // two new section 
 - **Pushes.** `device.setup` is compared as a whole before sending, so a change of an assistant's look, the type's or
   the device's own look sends it again, and a change the device does not show (an assistant's look hidden by the
   device's own) sends nothing. The admin lists carry both keys through the schema.
-- **Not covered.** The voice catalogue's `usedBy` still lists assistants only, not devices that use a voice as theirs.
+- **Who uses a voice.** `usedBy` stays the assistants. Beside it the voice catalogue entry (`VoiceEntry`) and the
+  resource status (`ResourceInfo`, `tts`) carry an additive, optional `usedByDevices: Array<{ target: DeviceTarget, name }>`
+  (`DeviceUser`, `packages/protocol/src/deviceUsers.ts`): every device, and every type's defaults ("Every browser"),
+  whose *effective* `voice` section is its own, computed from the settings when asked (a device's own value, else its
+  type's), so it is always current. A device that follows a type's own voice is listed beside the type; Reset or
+  "Follows the assistant" removes it. An assistant whose voice every device hides is still listed in `usedBy` (its voice
+  is still its configuration). On resource status the pool's users `assistant@place` count as the assistant in `usedBy`;
+  no raw key leaves the server. Model pickers keep their `usedBy` (devices cannot override those).
 - **Latency.** Not measured: the change only picks a different pool key at the start of a turn.
 - Tests: `apps/assistant/test/serveLooksAndVoices.test.ts`.
 
 ### 5.1 Web (`apps/web`, 2026-11-17)
 
-No protocol change: the web half uses the schemas of §2 as they are.
+The web half uses the schemas of §2, plus the additive `usedByDevices` of §5.0. **Used by** (`components/pickers/UsedBy.tsx`):
+a voice's row in the picker shows a second line "Used by Jeff, T3 · Kitchen iPad, Every browser", each name linking to
+its page (an assistant's Voice tab, a device, or the type's defaults); nothing when it has no users. The web has no page
+that lists the resource status's users yet, so `ResourceInfo.usedByDevices` is carried by the protocol and the server only.
 
 **Assistant › Look** (`components/settings/pages/assistants/LookTab.tsx`, the editor in `components/looks/`). A tab
 between Voice and Modules, on the assistant's one draft: dirty mark, "Unsaved", Save and Cancel as on every tab; the look

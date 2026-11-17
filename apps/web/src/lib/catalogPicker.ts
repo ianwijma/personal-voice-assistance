@@ -1,4 +1,4 @@
-import type { JobInfo, ModelApply, ModelEntry, ModelFavourite, ModelProviderInfo, ProviderModels, VoiceRefJson } from "@pva/protocol"
+import type { DeviceUser, JobInfo, ModelApply, ModelEntry, ModelFavourite, ModelProviderInfo, ProviderModels, VoiceRefJson } from "@pva/protocol"
 import { ModelIdString } from "@pva/protocol"
 import { Schema } from "effect"
 
@@ -33,6 +33,8 @@ export interface GenericRow {
   readonly listed: boolean
   readonly favourite: boolean
   readonly usedBy: ReadonlyArray<string>
+  /** Voices only: the devices (and device types' defaults) that speak with it as their own; absent = this kind of row does not show its users. */
+  readonly usedByDevices?: ReadonlyArray<DeviceUser>
   readonly choice: PickerChoice
 }
 
@@ -262,3 +264,6 @@ export const llmValue = (account: string, model: string): string => (account ===
 /** The key the recogniser picker shows as chosen: the local model, or Deepgram's one row (named by the catalog). */
 export const sttValue = (engine: string, model: string, lists: ReadonlyArray<GenericProvider>): string =>
   engine === "deepgram" ? lists.find((p) => p.id === "deepgram")?.rows[0]?.key ?? "deepgram:flux-general-en" : `sherpa:${model}`
+
+/** The Devices page of a user the server named: a device's own page, or its type's defaults (`#settings/devices/type.<kind>`). */
+export const deviceUserPath = (u: DeviceUser): ReadonlyArray<string> => ["devices", u.target.kind === "type" ? `type.${u.target.type}` : u.target.id]
