@@ -311,7 +311,14 @@ describe("action buttons after review round 1", () => {
   it("finish a press under StrictMode, and a second one too", async () => {
     let finish: (v: unknown) => void = () => undefined
     const request = vi.fn(() => new Promise((resolve) => (finish = resolve))) as unknown as AssistantClient["request"]
-    withClient(request, <StrictMode><Harness field={allOff} initial={undefined} context={{ form: { kind: "module", id: "demo-home" }, dirty: false, draftValues: {} }} /></StrictMode>)
+    // At the root, as Next's development mode does (a StrictMode nested below a provider does not run effects twice).
+    render(
+      <StrictMode>
+        <ClientContext.Provider value={{ request } as unknown as AssistantClient}>
+          <Harness field={allOff} initial={undefined} context={{ form: { kind: "module", id: "demo-home" }, dirty: false, draftValues: {} }} />
+        </ClientContext.Provider>
+      </StrictMode>
+    )
     const button = screen.getByRole("button", { name: "Switch everything off" })
     for (const text of ["Switched 2 lights off.", "Every light was already off."]) {
       fireEvent.click(button)
@@ -382,7 +389,7 @@ describe("module routes view after review round 1", () => {
   })
 
   it("shows a stopped module's tokens, to be revoked, and marks lan routes unreachable behind a proxy", async () => {
-    const stopped = { ...base, state: "off" as const, enabled: false }
+    const stopped: ModuleInfo = { ...base, state: "disabled", enabled: false }
     const view: ModuleRoutesResponse = {
       modules: [{ moduleId: "hooks", running: false, routes: [], tokens: [{ id: "a1b2c3d4e5f6", moduleId: "hooks", name: "hook", label: "Doorbell", createdAt: 0 }] }],
       tokensLocked: false,
@@ -396,10 +403,25 @@ describe("module routes view after review round 1", () => {
     await act(async () => fireEvent.click(screen.getByRole("button", { name: "Revoke" })))
     expect(calls.map((c) => c[0])).toContain("module-routes/hooks/tokens/a1b2c3d4e5f6")
 
-    const lan = { ...base, routes: [{ ...route("hook", "hook"), guards: ["lan" as const], token: undefined as never }] }
-    const { token: _t, ...lanRoute } = lan.routes[0]!
+    const { token: _t, ...hook } = route("hook", "hook")
+    const lanRoute = { ...hook, guards: ["lan" as const] }
     const proxied: ModuleRoutesResponse = { modules: [{ moduleId: "hooks", running: true, routes: [{ ...lanRoute, calls: [] }], tokens: [] }], tokensLocked: false, behindProxy: true }
     await act(async () => void render(<ModuleRoutes module={{ ...base, routes: [lanRoute] }} api={apiWith(proxied, [])} />))
     expect(screen.getByTestId("route-unreachable")).toHaveTextContent("SERVE_BEHIND_PROXY")
+  })
+})
+
+describe("forms with prototype-style field keys (review round 1)", () => {
+  it("never sees an inherited value as an edit", () => {
+    const form: SettingsForm = {
+      fields: [
+        { type: "text", key: "constructor", label: "Builder", apply: "live", default: "", source: "default" },
+        { type: "textList", key: "toString", label: "Words", apply: "live", default: [], source: "default" }
+      ],
+      values: {},
+      secrets: {},
+      errors: []
+    }
+    expect(computePatch(form, initialDraft(form))).toEqual({ values: {}, secrets: {} })
   })
 })

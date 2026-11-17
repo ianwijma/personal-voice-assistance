@@ -1,7 +1,7 @@
 "use client"
 import { useEffect, useState } from "react"
 import type { ChoiceOption, SettingField, SettingsForm, SettingValue, VaultInfo } from "@pva/protocol"
-import { type Draft, fieldDefault, hasOwnerValue, resetDraftValue, setDraftValue, valueEqual } from "@/lib/forms.ts"
+import { type Draft, fieldDefault, hasOwnerValue, ownValue, resetDraftValue, setDraftValue, valueEqual } from "@/lib/forms.ts"
 import type { FieldContext } from "@/components/fields/types.ts"
 import { secretStatus } from "@/lib/vault.ts"
 import { rendererFor } from "@/ui/fieldRenderers.ts"
@@ -76,7 +76,7 @@ export function FieldRow({ field, form, draft, idPrefix, errors, warnings, readO
   /** The default, in words (secrets have none). */
   const defaultText = field.type === "secret" ? "" : displayValue(field, fieldDefault(field))
   // Edited here and not saved yet (secrets show their own state).
-  const unsaved = field.type !== "secret" && hasOwnerValue(field) && field.locked === undefined && (resetPending || (draft.values[field.key] !== undefined && !valueEqual(draft.values[field.key], draft.base[field.key])))
+  const unsaved = field.type !== "secret" && hasOwnerValue(field) && field.locked === undefined && (resetPending || (ownValue(draft.values, field.key) !== undefined && !valueEqual(ownValue(draft.values, field.key), ownValue(draft.base, field.key))))
   const secret = form.secrets[field.key]
   // A newly chosen model that is not downloaded: offer Download, and hold Save until it is there (§3.3).
   const toDownload = field.locked === undefined ? optionsToDownload(field, draft.values[field.key]) : []

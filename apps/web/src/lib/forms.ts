@@ -67,6 +67,9 @@ const deepEqual = (a: unknown, b: unknown): boolean => {
   return ka.length === kb.length && ka.every((k) => Object.hasOwn(b, k) && deepEqual((a as Record<string, unknown>)[k], (b as Record<string, unknown>)[k]))
 }
 
+/** `record[key]` when `key` is the record's own (a field named `constructor` is not `Object`), else `undefined`. */
+export const ownValue = <V>(record: Readonly<Record<string, V>>, key: string): V | undefined => (Object.hasOwn(record, key) ? record[key] : undefined)
+
 /** Fields whose value the owner sets (protocol 10: an `action` has none, an `info` value is the server's). */
 export const hasOwnerValue = (field: SettingField): boolean => field.type !== "action" && field.type !== "info"
 
@@ -86,7 +89,7 @@ export const computePatch = (form: SettingsForm, draft: Draft, shown: (field: Se
       if (field.key in draft.secrets) secrets[field.key] = draft.secrets[field.key]!
       continue
     }
-    const next = draft.values[field.key]
+    const next = ownValue(draft.values, field.key)
     if (draft.reset?.includes(field.key) === true && field.source === "saved" && valueEqual(next, fieldDefault(field))) {
       values[field.key] = null
       continue

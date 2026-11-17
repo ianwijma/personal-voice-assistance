@@ -595,9 +595,13 @@ an action or info key are ignored and dropped by the next save.
 
 **Info and combo options.** The host describes the form with the values of the running instance (its instance with
 the shared settings): `info()[key]` fills an info field ("" while it does not run), and `settingOptions()[key]` is
-added to a combo's static options, with `optionsNote` saying where they came from ("Not running: type a name"). Both
-are read whenever the module is described: on every status line, after every button press, and when a version 2
-instance calls `refreshForm()`. They never take part in an instance's settings key.
+added to the static options of an open combo (`allowCustom`), with `optionsNote` saying where they came from ("Not
+running: type a name"). A closed combo accepts only its static options on every path a value arrives by (the form,
+the environment, an assistant's own value, a button's draft), so only those are shown on it. Both are read whenever
+the module is described: on every status line, after every button press, and when a version 2 instance calls
+`refreshForm()`; `info` and `settingOptions` are called on the instance (a class's methods may use `this`), and only
+the instance's own keys count. An info value has every secret of the module replaced by `[secret]`. They never take
+part in an instance's settings key.
 
 **Field actions.** A button's handler is, in this order: the definition's `fieldActions[key]` (runs whether or not
 the module runs: a Test button that checks an address before it is saved), the running instance's
@@ -605,8 +609,15 @@ the module runs: a Test button that checks an address before it is saved), the r
 decision provider (whose form now ends with that button). A handler gets `{ settings, draft }`: the module's
 settings (environment > saved > linked default, secrets included, no assistant's own values), or, for a button with
 `requiresSaved: false` pressed while the form has edits, the page's draft values applied over them (secrets are
-always the saved ones; a draft value the field refuses is reported as the result and nothing runs). It has 8 s; one
-press of a button at a time (`busy`). The page sends `module.action { moduleId, key, values? }` (admin only); the
+always the saved ones). Settings that do not resolve are the result and nothing runs ("Not run: Token: Not set"; a
+draft value the field refuses, a required key not saved, a saved value no longer valid). Handlers are an object's own
+keys or its class's methods, never inherited names such as `constructor`, and are called on their object. It has 8 s:
+at the deadline the press is answered "Did not finish within 8 s" at once, while the handler's interruption and
+finalizers run on in the background, bounded by 10 s (`FIELD_ACTION_CLEANUP_MS`; logged if it overruns); the button
+stays `busy` until the handler has really ended or that bound has passed. A failure or defect is answered with one
+generic sentence ("It failed; the server's log says why.") and its details go to the server's log; and before any
+result text leaves the host, every secret value of the module (saved or from the environment) in it is replaced by
+`[secret]`, then it is clipped to 500 characters. The page sends `module.action { moduleId, key, values? }` (admin only); the
 `result` carries `action: { ok, text, tone }`, shown next to the button. Codes: `unknown_module`,
 `unknown_action` (not a button), `not_running` (an instance handler of a module that does not run), `busy`.
 
@@ -617,9 +628,9 @@ press of a button at a time (`busy`). The page sends `module.action { moduleId, 
 ```ts
 interface ModuleRoute {
   method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE"
-  path: string                       // "hook/:name": segments of [A-Za-z0-9._~-] or :param; "" = the module's root
+  path: string                       // "hook/:name": segments of [A-Za-z0-9._~-] (not . or ..) or :param; "" = root
   guards?: ReadonlyArray<"admin" | "token" | "lan">   // every declared guard must pass
-  public?: boolean                   // required (and only allowed) without guards; a public route reads no body
+  public?: boolean                   // required (and only allowed) without guards; a public route is a GET, no body
   token?: string                     // the token name a `token` guard accepts
   body?: "json" | "bytes" | "none"   // default json for POST/PUT/PATCH, none for GET/DELETE
   bodyLimitBytes?: number            // default 8 KB, at most 1 MB
@@ -629,37 +640,67 @@ interface ModuleRoute {
   handler: (req: RouteRequest) => Effect<RouteResponse, unknown>
 }
 RouteRequest  = { method, path, params, query, queryAll, headers /* no authorization */, body, address, token?: { id, name, label } }
-RouteResponse = { status, headers?, body?: string | Uint8Array | json }
+                // params, query, queryAll and headers have no prototype: `query.constructor` is a parameter or undefined
+RouteResponse = { status /* 200–599 */, headers?, body?: string | Uint8Array | json }
 ```
 
 - **Start checks** (`routeProblem`, a start error of the shared part): a route without guards and without
-  `public: true`; a public route with guards or a body; `admin` together with `token` (both read the one
-  `Authorization` header); a `token` guard without a token name (or a name without the guard); bad paths, duplicate
-  routes, limits out of range.
-- **Order of a request**: path (404), method (405 with `Allow`), rate limit per caller address and per route (429 with
+  `public: true`; a public route with guards, a body or a method other than GET; `admin` together with `token` (both
+  read the one `Authorization` header); a `token` guard without a token name (or a name without the guard); bad paths
+  (a `.` or `..` segment too, which a URL resolves away), duplicate routes, limits out of range.
+- **Order of a request**: path (404; `..` is resolved first and what is left must still be under `/api/modules/`),
+  method (405 with `Allow`), another site (403, below), rate limit per caller address and per route (429 with
   `Retry-After`; before the guards, so tokens cannot be guessed quickly), guards (`lan` 403, `admin` 401, `token` 503
   while the vault is locked, else 401), body (413 over the limit or on a route that reads none, 415 not JSON, 400 bad
-  JSON), then the handler in its own fiber with its time limit (504) and a failure answering 500 (logged; nothing of
-  it is sent). Nothing here runs on a turn or the WebSocket. Answers carry `Cache-Control: no-store` and `nosniff`;
-  a handler cannot set framing headers.
+  JSON; a chunked body is counted as it arrives), the route is still its module's published one (503 "restarted or
+  stopped meanwhile": the body may have taken its time), then the handler. Whatever goes wrong unexpectedly in any of
+  these steps is a 500 for that request, never the process's.
+- **The handler** runs in its own fiber in its shared part's scope: when that part is closed (a restart's or a stop's
+  grace period over) the handler is interrupted and the caller gets 503. At its time limit the caller gets 504 at
+  once; the interruption and the handler's finalizers run on in the background, bounded by 10 s
+  (`ROUTE_CLEANUP_MS`) and logged if they overrun. A failure or defect answers 500 (logged; nothing of it is sent).
+  The response must have a final status (200–599; anything else is a 500, logged), and header names and values must
+  be valid (else the whole answer is a 500, and the call log records the status really sent). Nothing here runs on a
+  turn or the WebSocket. Answers carry `Cache-Control: no-store` and `nosniff`; a handler cannot set framing headers
+  or CORS headers (dropped): no CORS header is ever sent for module routes.
+- **Another site**: every route that is not `public` refuses (403) a request a browser marks as cross-site, before the
+  rate limit, the guards and the body: `Sec-Fetch-Site` other than `same-origin`, `same-site` or `none`, or an `Origin`
+  that is not this server's own (`<scheme>://<Host>`, the Host having passed the allowed-hosts check of §4.6;
+  `SERVE_ALLOWED_ORIGINS` does not count, as no CORS is sent). A page elsewhere could otherwise make the browser of
+  someone at home send a simple POST from a home address. A request with neither header (a script, a webhook
+  sender) is judged by the guards alone. A `public` route answers only GET (the browser arriving on an OAuth callback
+  from the provider's site) and reads no body.
+- **Rate limits**: a route's total is counted apart from the per-address windows and is never pushed out by many
+  addresses; per-address windows are bounded (4096, the oldest goes first), an IPv6 caller is counted by its /64, and
+  no window is made for an address once the route's total is reached.
 - **`lan`**: the socket's address is private or loopback (IPv4 10/8, 172.16/12, 192.168/16, 127/8, 169.254/16; IPv6
-  ::1, fc00::/7, fe80::/10; IPv4-mapped judged as IPv4; 100.64/10 is not the home network). **Reverse proxies:**
-  forwarding headers (`Forwarded`, `X-Forwarded-For`, `X-Real-IP`, …) are never read for the address, and their
-  presence fails `lan`, because behind a proxy the socket's address is the proxy's. A `lan` route is therefore not
-  reachable through a proxy; a caller from outside the home uses a `token` route. The host check (§4.6) applies first:
-  a hook called by a name other than an IP or `localhost` needs that name in `SERVE_ALLOWED_HOSTS`.
+  ::1, fc00::/7, fe80::/10; IPv4-mapped judged as IPv4; 100.64/10 is not the home network). **Reverse proxies:** the
+  server cannot tell a proxied request from a local one by itself: a proxy on the same host that forwards to
+  `127.0.0.1` without adding any header makes every outside caller look like loopback. So the owner says so with the
+  start-up setting `SERVE_BEHIND_PROXY` (default false, shown with where it is set among the start-up values of the
+  environment view). Declared, the `lan` guard refuses every request (a `lan` route is then unreachable by design, and
+  the module page says so on each such route); callers from outside use a `token` route. Not declared, the socket's
+  address is trusted as it is, so a proxy in front that is not declared defeats `lan`. Forwarding headers
+  (`Forwarded`, `X-Forwarded-For`, `X-Real-IP`, …) are never read for the address either way, and without a declared
+  proxy their presence still fails `lan`. The host check (§4.6) applies first: a hook called by a name other than an
+  IP or `localhost` needs that name in `SERVE_ALLOWED_HOSTS`.
 - **`admin`**: the admin session token (`Authorization: Bearer`), as the voice API.
 - **`token`**: a route token of this module with the route's token name. Tokens are minted one per caller (`label`:
   who it is for), kept with the module secrets under `@route-tokens` (in the key vault once there is one, before that
   in `data/secrets.json` 0600; moved into the vault with the other keys), only as a SHA-256 of the secret, which is
   shown once. A presented token is hashed and compared with every candidate in constant time. Revoking one stops it
   at once. While the vault is locked tokens cannot be checked, listed or minted: token routes answer 503 with a plain
-  reason. Modules mint, list and revoke their own through `host.routeTokens` (`mint(name, label)`, `list`,
-  `revoke(id)`); the owner does it on the module page.
+  reason. A module holds at most 20 tokens, judged inside the store's serialized save (two mints at once cannot both
+  take the last place). Modules mint, list and revoke their own through `host.routeTokens` (`mint(name, label)`,
+  `list`, `revoke(id)`); the owner does it on the module page, choosing the token's purpose (its name) when the
+  module's routes accept more than one.
 - **Admin view** (`GET /api/module-routes[?module=<id>]`, admin token): each module's routes with guards and limits,
   the last 20 calls of each (time, caller address, status, token label, why it was refused; memory only), and its
-  tokens; `POST /api/module-routes/<id>/tokens { name, label }` mints (201, the secret once), `DELETE
-  /api/module-routes/<id>/tokens/<tokenId>` revokes. The module page shows this as "Web addresses".
+  tokens (also of a module that does not run, so a stopped module's tokens can be revoked without starting it), and
+  `behindProxy`; `POST /api/module-routes/<id>/tokens { name, label }` mints (201, the secret once), `DELETE
+  /api/module-routes/<id>/tokens/<tokenId>` revokes; a module that is not installed is 404 (a stopped one is fine).
+  The log keeps the last 20 calls of at most 256 routes (the least recently called goes first). The module page shows
+  this as "Web addresses", for any module that has routes or tokens, running or not.
 
 ---
 
@@ -1236,7 +1277,7 @@ packages/audio-web/   WebAudioInput / WebAudioOutput over an abstract link (no w
 packages/core/        additive changes (§4.3) + ModuleHost.ts + EchoGate.ts
 ```
 
-`pnpm start serve` runs it; settings: `SERVE_HOST` (default `127.0.0.1`), `SERVE_PORT` (8787), `SERVE_ALLOWED_ORIGINS`, `SERVE_ALLOWED_HOSTS`, `SERVE_TLS_CERT` + `SERVE_TLS_KEY` (PEM paths; when both are set the server speaks HTTPS/WSS on the same port), `PVA_WEB_DIR` (default `<repo>/apps/web/out`), `PVA_DATA_DIR`.
+`pnpm start serve` runs it; settings: `SERVE_HOST` (default `127.0.0.1`), `SERVE_PORT` (8787), `SERVE_ALLOWED_ORIGINS`, `SERVE_ALLOWED_HOSTS`, `SERVE_BEHIND_PROXY` (default false: say true when a reverse proxy is in front, so module routes' `lan` guard refuses everyone, §1.11), `SERVE_TLS_CERT` + `SERVE_TLS_KEY` (PEM paths; when both are set the server speaks HTTPS/WSS on the same port), `PVA_WEB_DIR` (default `<repo>/apps/web/out`), `PVA_DATA_DIR`.
 
 Startup order: HTTP first (so the UI loads and shows "starting"), then in parallel the module host and the engine build. The engine runs the voice loop over `AudioInput` from the web backend; when nobody owns the audio, that input is the noise floor.
 

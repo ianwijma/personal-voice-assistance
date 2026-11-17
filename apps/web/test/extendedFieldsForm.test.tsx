@@ -24,6 +24,7 @@ const lists: ModuleInfo = {
   settings: {
     fields: [
       { type: "text", key: "title", label: "Title", apply: "live", default: "", source: "default" },
+      { type: "text", key: "constructor", label: "Builder", apply: "live", default: "", source: "default" },
       { type: "textList", key: "greetings", label: "Greetings", apply: "live", default: [], maxItems: 5, itemMaxLength: 10, source: "default" },
       {
         type: "records",
@@ -41,7 +42,7 @@ const lists: ModuleInfo = {
         source: "saved"
       }
     ],
-    values: { title: "", greetings: ["hey"], levels: [{ name: "A", low: 1 }, { name: "B", low: 2 }] },
+    values: { title: "", constructor: "", greetings: ["hey"], levels: [{ name: "A", low: 1 }, { name: "B", low: 2 }] },
     secrets: {},
     errors: []
   }
@@ -113,5 +114,17 @@ describe("extended fields in their form", () => {
     await act(async () => fireEvent.click(save()))
     expect(configureModule).toHaveBeenCalledTimes(1)
     expect(configureModule.mock.calls[0]![1].values).toEqual({ levels: [{ name: "B", low: 5 }] })
+  })
+})
+
+describe("a field named like an Object member (review round 1)", () => {
+  it("has no inherited local error, and saves like any other", async () => {
+    const { configureModule, save } = setup()
+    const builder = screen.getByLabelText("Builder")
+    expect(builder).not.toHaveAttribute("aria-invalid", "true")
+    fireEvent.change(builder, { target: { value: "Bob" } })
+    expect(save().disabled).toBe(false)
+    await act(async () => fireEvent.click(save()))
+    expect(configureModule.mock.calls[0]![1].values).toEqual({ constructor: "Bob" })
   })
 })

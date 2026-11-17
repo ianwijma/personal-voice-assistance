@@ -197,7 +197,7 @@ function FormBlock({ view, forms, heading, vault, renderAfter }: {
         form={def.form}
         draft={state.sync.draft}
         idPrefix={def.key.replace(":", "-")}
-        errors={[...(errors.get(field.key) ?? []), ...(state.localErrors[field.key] !== undefined ? [state.localErrors[field.key]!] : [])]}
+        errors={[...(errors.get(field.key) ?? []), ...(Object.hasOwn(state.localErrors, field.key) ? [state.localErrors[field.key]!] : [])]}
         warnings={warnings.get(field.key) ?? []}
         readOnly={def.readOnly}
         saving={forms.saving}
