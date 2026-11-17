@@ -179,7 +179,7 @@ export function WhoAnswersWhere() {
                             {e.talking && <span className="label rounded-sm border border-you/50 px-1 text-[9px] leading-[14px] text-you">Talking now</span>}
                           </span>
                           <span className="text-[12px] font-normal text-ink-faint">{e.sub}</span>
-                          <LookVoiceLine settings={e.settings} own={e.own} defaults={e.defaults} />
+                          <LookVoiceLine settings={e.settings} own={e.own} defaults={e.defaults} keys={t.keys} />
                         </button>
                       </th>
                       {assistants.map((a) => (
@@ -207,7 +207,7 @@ export function WhoAnswersWhere() {
                       {e.talking && <span className="label rounded-sm border border-you/50 px-1 text-[9px] leading-[14px] text-you">Talking now</span>}
                     </span>
                     <span className="text-[12px] text-ink-faint">{e.sub}</span>
-                    <LookVoiceLine settings={e.settings} own={e.own} defaults={e.defaults} />
+                    <LookVoiceLine settings={e.settings} own={e.own} defaults={e.defaults} keys={t.keys} />
                     {e.settings.assistants.map((x) => (
                       <span key={x.assistant} className="flex flex-wrap items-center gap-2 text-[13px] text-ink-muted">
                         <span className="min-w-12 text-ink">{assistants.find((a) => a.id === x.assistant)?.name ?? x.assistant}</span>

@@ -9,11 +9,13 @@ import {
   type AssistantBody,
   type AssistantInfo,
   assistantUsedOn,
+  BUILT_IN_VOICE_NODE_SETTINGS,
   BUILT_IN_WEB_VOICE_SETTINGS,
   type DeviceOwn,
   type DeviceSettings,
   type DeviceSettingsPatch,
   type DeviceTarget,
+  type DeviceTypeDefinition,
   type DeviceTypeInfo,
   type ErrorInfo,
   type FieldError,
@@ -27,6 +29,8 @@ import {
   removeAssistantFromSettings,
   validateAssistant,
   validateDeviceSettings,
+  VOICE_NODE_DEVICE_TYPE,
+  VOICE_NODE_KIND,
   WEB_VOICE_DEVICE_TYPE,
   WEB_VOICE_KIND
 } from "@pva/protocol"
@@ -151,6 +155,22 @@ const seedDeviceOwn = (longPhrase = false): Map<string, { own: DeviceOwn; rev: n
     ["d-kitchen-ipad-0001", { rev: 0, own: { assistants: [{ assistant: "jeff", phrases: ["Hey Jeff"] }, { assistant: "keuken", phrases: ["Hé keuken", "Hey keuken"], followUpSeconds: 15 }], captions: { captions: false, speakTyped: false } } }]
   ])
 
+/** The device types the mock knows (the real server's `DEVICE_TYPES`); the voice-node one is listed only when the server says so. */
+const DEFS: ReadonlyArray<DeviceTypeDefinition> = [WEB_VOICE_DEVICE_TYPE, VOICE_NODE_DEVICE_TYPE]
+const defOf = (kind: string): DeviceTypeDefinition => DEFS.find((d) => d.kind === kind) ?? WEB_VOICE_DEVICE_TYPE
+
+/** A type's saved defaults. `saved: false`: never saved (the voice-node type before its first pairing seeds it, §3.4). */
+interface TypeState {
+  settings: DeviceSettings
+  rev: number
+  saved: boolean
+}
+const seedTypes = (): Map<string, TypeState> =>
+  new Map([
+    [WEB_VOICE_KIND, { settings: seedTypeSettings(), rev: 0, saved: true }],
+    [VOICE_NODE_KIND, { settings: clone(BUILT_IN_VOICE_NODE_SETTINGS), rev: 0, saved: false }]
+  ])
+
 export interface Known {
   readonly id: string
   readonly name: string
@@ -173,6 +193,14 @@ export interface AssistantsMock {
   readonly touch: (id: string, patch: Partial<AssistantBody>) => boolean
   /** A device was forgotten: its own settings go. */
   readonly forgetDevice: (id: string) => void
+  /**
+   * Protocol 9, the first `node.pair.create` (docs/VOICE-NODES.md §3.4): while the voice-node type was never saved, its
+   * defaults become the browsers' assistants without their follow-up values, the browsers' matching, nobody without a
+   * phrase. Nothing when the browsers have no assistant. True when it seeded.
+   */
+  readonly seedNodeType: () => boolean
+  /** Set a type's defaults as if the owner had saved them (scenario data). */
+  readonly setTypeSettings: (kind: string, settings: Partial<DeviceSettings>) => void
 }
 
 /** What the server knows about modules that the assistants' checks need (mock/server.ts gives it). */
@@ -184,14 +212,21 @@ export interface ModuleCatalog {
   readonly checkOwn: (moduleId: string, own: Readonly<Record<string, unknown>>) => ReadonlyArray<{ readonly field: string; readonly message: string }>
   /** The problem of a language-model account that is not set up (OpenRouter without a key, the home model without an address). */
   readonly accountProblem: (account: string) => string | undefined
+  /** A remembered device's kind (default: a browser). */
+  readonly kindOf?: (deviceId: string) => string | undefined
+  /** Whether the voice-node type is listed (the node scenarios). */
+  readonly nodeTypeListed?: () => boolean
 }
 
 export const createAssistantsMock = (catalog: ModuleCatalog): AssistantsMock => {
   const modules = catalog.modules
   let assistants = seedAssistants()
-  let typeSettings = seedTypeSettings()
-  let typeRev = 0
+  let types = seedTypes()
   let deviceOwn = seedDeviceOwn()
+  const typeOf = (kind: string): TypeState => types.get(kind) ?? types.get(WEB_VOICE_KIND)!
+  const listedDefs = (): ReadonlyArray<DeviceTypeDefinition> => DEFS.filter((d) => d.kind === WEB_VOICE_KIND || catalog.nodeTypeListed?.() === true)
+  const listed = (kind: string) => listedDefs().some((d) => d.kind === kind)
+  const kindOfDevice = (id: string): string => catalog.kindOf?.(id) ?? WEB_VOICE_KIND
 
   /** The capability modules the assistants can switch on (running or not: a module runs while one assistant has it on). */
   const offers = (): Record<string, ModuleOffer> =>
@@ -213,13 +248,12 @@ export const createAssistantsMock = (catalog: ModuleCatalog): AssistantsMock => 
     return out
   }
 
-  const effective = (own: DeviceOwn | undefined): DeviceSettings => effectiveDeviceSettings(BUILT_IN_WEB_VOICE_SETTINGS, typeSettings, own)
+  const effective = (own: DeviceOwn | undefined, kind: string = WEB_VOICE_KIND): DeviceSettings => effectiveDeviceSettings(defOf(kind).builtIn, typeOf(kind).settings, own)
 
   const mock: AssistantsMock = {
     reset: (longPhrase = false) => {
       assistants = seedAssistants()
-      typeSettings = seedTypeSettings()
-      typeRev = 0
+      types = seedTypes()
       deviceOwn = seedDeviceOwn(longPhrase)
     },
     assistants: () => assistants,
@@ -230,16 +264,16 @@ export const createAssistantsMock = (catalog: ModuleCatalog): AssistantsMock => 
         const key = `${settings.voice.voice.provider}:${settings.voice.voice.voiceId}`
         out.set(key, [...(out.get(key) ?? []), { target, name }])
       }
-      add(typeSettings, { kind: "type", type: WEB_VOICE_KIND }, `Every ${WEB_VOICE_DEVICE_TYPE.one}`)
-      for (const d of devices) add(effective(deviceOwn.get(d.id)?.own), { kind: "device", id: d.id }, d.name)
+      for (const def of listedDefs()) add(typeOf(def.kind).settings, { kind: "type", type: def.kind }, `Every ${def.one}`)
+      for (const d of devices) add(effective(deviceOwn.get(d.id)?.own, kindOfDevice(d.id)), { kind: "device", id: d.id }, d.name)
       return out
     },
     infos: (devices) => {
       const entries = [
-        { target: { kind: "type", type: WEB_VOICE_KIND } as DeviceTarget, settings: typeSettings },
-        ...devices.map((d) => ({ target: { kind: "device", id: d.id } as DeviceTarget, settings: effective(deviceOwn.get(d.id)?.own) }))
+        ...listedDefs().map((def) => ({ target: { kind: "type", type: def.kind } as DeviceTarget, settings: typeOf(def.kind).settings })),
+        ...devices.map((d) => ({ target: { kind: "device", id: d.id } as DeviceTarget, settings: effective(deviceOwn.get(d.id)?.own, kindOfDevice(d.id)) }))
       ]
-      const nameOf = (t: DeviceTarget) => (t.kind === "type" ? WEB_VOICE_DEVICE_TYPE.title : devices.find((d) => d.id === t.id)?.name ?? t.id)
+      const nameOf = (t: DeviceTarget) => (t.kind === "type" ? defOf(t.type).title : devices.find((d) => d.id === t.id)?.name ?? t.id)
       return assistants.map((a) => {
         const usedOn = assistantUsedOn(a.id, entries)
         const used = a.on && usedOn.length > 0
@@ -258,10 +292,21 @@ export const createAssistantsMock = (catalog: ModuleCatalog): AssistantsMock => 
         }
       })
     },
-    deviceTypes: () => [{ kind: WEB_VOICE_KIND, title: WEB_VOICE_DEVICE_TYPE.title, one: WEB_VOICE_DEVICE_TYPE.one, many: WEB_VOICE_DEVICE_TYPE.many, description: WEB_VOICE_DEVICE_TYPE.description, keys: [...WEB_VOICE_DEVICE_TYPE.keys], settings: clone(typeSettings), rev: typeRev }],
+    deviceTypes: () =>
+      listedDefs().map((def) => ({
+        kind: def.kind,
+        title: def.title,
+        one: def.one,
+        many: def.many,
+        description: def.description,
+        keys: [...def.keys],
+        settings: clone(typeOf(def.kind).settings),
+        rev: typeOf(def.kind).rev,
+        ...(def.followUpUnset !== undefined ? { followUpUnset: def.followUpUnset } : {})
+      })),
     deviceFields: (id) => {
       const record = deviceOwn.get(id)
-      const settings = effective(record?.own)
+      const settings = effective(record?.own, kindOfDevice(id))
       return { own: clone(record?.own ?? {}), settings: clone(settings), hearer: hearerOf(settings), rev: record?.rev ?? 0 }
     },
     create: ({ assistant, copyOf, placements }, devices) => {
@@ -273,29 +318,32 @@ export const createAssistantsMock = (catalog: ModuleCatalog): AssistantsMock => 
       // Placements (the wizard's Where step): the assistant is appended to each target's list, with its phrase. A device
       // that followed its type's defaults gets its own list (the type's, then this). Refused as a whole if a phrase clashes.
       const known = new Set([...assistants.map((a) => a.id), id])
-      let nextType = typeSettings
+      const nextTypes = new Map([...types].map(([k, t]) => [k, t.settings]))
       const nextOwn = new Map(deviceOwn)
       for (const p of placements ?? []) {
         const phrase = p.phrase === undefined || p.phrase.trim() === "" ? undefined : p.phrase.trim()
         if (p.target.kind === "type") {
-          if (p.target.type !== WEB_VOICE_KIND) return fail("unknown_device", `No device type ${p.target.type}.`)
-          nextType = { ...nextType, assistants: withPlacement(nextType.assistants, id, phrase) }
-          const v = validateDeviceSettings(nextType, known)
+          const kind = p.target.type
+          if (!listed(kind)) return fail("unknown_device", `No device type ${kind}.`)
+          const next = { ...nextTypes.get(kind)!, assistants: withPlacement(nextTypes.get(kind)!.assistants, id, phrase) }
+          nextTypes.set(kind, next)
+          const v = validateDeviceSettings(next, known)
           if (v.errors.length > 0) return refusal(v.errors)
           continue
         }
         const target = p.target
         if (!devices.some((d) => d.id === target.id)) return fail("unknown_device", "That device is not known.")
+        const kind = kindOfDevice(target.id)
         const record = nextOwn.get(target.id) ?? { own: {}, rev: 0 }
-        const list = effectiveDeviceSettings(BUILT_IN_WEB_VOICE_SETTINGS, nextType, record.own).assistants
+        const list = effectiveDeviceSettings(defOf(kind).builtIn, nextTypes.get(kind)!, record.own).assistants
         const own = { ...record.own, assistants: withPlacement(list, id, phrase) } as DeviceOwn
-        const v = validateDeviceSettings(effectiveDeviceSettings(BUILT_IN_WEB_VOICE_SETTINGS, nextType, own), known)
+        const v = validateDeviceSettings(effectiveDeviceSettings(defOf(kind).builtIn, nextTypes.get(kind)!, own), known)
         if (v.errors.length > 0) return refusal(v.errors)
         nextOwn.set(target.id, { own, rev: record.rev + 1 })
       }
-      if (nextType !== typeSettings) {
-        typeSettings = nextType
-        typeRev += 1
+      for (const [kind, next] of nextTypes) {
+        const t = typeOf(kind)
+        if (next !== t.settings) types.set(kind, { settings: next, rev: t.rev + 1, saved: true })
       }
       deviceOwn = nextOwn
       assistants = [...assistants, { ...clone(assistant), id, rev: 0 }]
@@ -315,12 +363,11 @@ export const createAssistantsMock = (catalog: ModuleCatalog): AssistantsMock => 
       if (current === undefined) return fail("unknown_assistant", `There is no assistant ${id}.`)
       if (rev !== current.rev) return fail("stale", `${current.name} changed since this page read it; reload it.`)
       assistants = assistants.filter((a) => a.id !== id)
-      typeSettings = removeAssistantFromSettings(typeSettings, id) as DeviceSettings
-      typeRev += 1
+      for (const [kind, t] of types) types.set(kind, { ...t, settings: removeAssistantFromSettings(t.settings, id) as DeviceSettings, rev: t.rev + 1 })
       for (const d of devices) {
         const record = deviceOwn.get(d.id)
         if (record === undefined) continue
-        deviceOwn.set(d.id, { own: removeAssistantFromSettings(record.own, id, typeSettings.assistants), rev: record.rev + 1 })
+        deviceOwn.set(d.id, { own: removeAssistantFromSettings(record.own, id, typeOf(kindOfDevice(d.id)).settings.assistants), rev: record.rev + 1 })
       }
       return OK
     },
@@ -328,19 +375,23 @@ export const createAssistantsMock = (catalog: ModuleCatalog): AssistantsMock => 
       const patch = Object.fromEntries(Object.entries(settings).filter(([, v]) => v !== undefined)) as Record<string, unknown>
       const known = new Set(assistants.map((a) => a.id))
       if (target.kind === "type") {
-        if (target.type !== WEB_VOICE_KIND) return fail("unknown_device", `No device type ${target.type}.`)
-        if (rev !== typeRev) return fail("stale", "The defaults changed since this page read them; reload them.")
+        if (!listed(target.type)) return fail("unknown_device", `No device type ${target.type}.`)
+        const t = typeOf(target.type)
+        const type = defOf(target.type)
+        if (rev !== t.rev) return fail("stale", "The defaults changed since this page read them; reload them.")
         if (Object.values(patch).some((v) => v === null)) return fail("bad_message", "A type's defaults have no value to go back to.")
-        const next = { ...typeSettings, ...patch } as DeviceSettings
-        const v = validateDeviceSettings(next, known)
+        const next = { ...t.settings, ...patch } as DeviceSettings
+        // As the server (§6.1): the type goes to the check, so a voice node that answers without a phrase warns.
+        const v = validateDeviceSettings(next, known, { type })
         if (v.errors.length > 0) return refusal(v.errors)
-        const before = new Set(validateDeviceSettings(typeSettings, known).warnings.map((w) => w.path))
+        const before = new Set(validateDeviceSettings(t.settings, known, { type }).warnings.map((w) => w.path))
         const fresh = v.warnings.filter((w) => !before.has(w.path))
         if (fresh.length > 0 && saveAnyway !== true) return fail("invalid_settings", `${fresh[0]!.message} Save anyway to keep it.`, { warnings: fieldErrorsOf(fresh) })
-        typeSettings = next
-        typeRev += 1
+        types.set(target.type, { settings: next, rev: t.rev + 1, saved: true })
         return OK
       }
+      const kind = kindOfDevice(target.id)
+      const type = defOf(kind)
       const record = deviceOwn.get(target.id) ?? { own: {}, rev: 0 }
       if (rev !== record.rev) return fail("stale", "The device changed since this page read it; reload it.")
       const own: Record<string, unknown> = { ...record.own }
@@ -348,9 +399,9 @@ export const createAssistantsMock = (catalog: ModuleCatalog): AssistantsMock => 
         if (v === null) delete own[k]
         else own[k] = v
       }
-      const v = validateDeviceSettings(effective(own as DeviceOwn), known)
+      const v = validateDeviceSettings(effective(own as DeviceOwn, kind), known, { type })
       if (v.errors.length > 0) return refusal(v.errors)
-      const before = new Set(validateDeviceSettings(effective(record.own), known).warnings.map((w) => w.path))
+      const before = new Set(validateDeviceSettings(effective(record.own, kind), known, { type }).warnings.map((w) => w.path))
       const fresh = v.warnings.filter((w) => !before.has(w.path))
       if (fresh.length > 0 && saveAnyway !== true) return fail("invalid_settings", `${fresh[0]!.message} Save anyway to keep it.`, { warnings: fieldErrorsOf(fresh) })
       deviceOwn.set(target.id, { own: own as DeviceOwn, rev: record.rev + 1 })
@@ -364,6 +415,24 @@ export const createAssistantsMock = (catalog: ModuleCatalog): AssistantsMock => 
     },
     forgetDevice: (id) => {
       deviceOwn.delete(id)
+    },
+    seedNodeType: () => {
+      const t = typeOf(VOICE_NODE_KIND)
+      if (t.saved) return false
+      const web = typeOf(WEB_VOICE_KIND).settings
+      if (web.assistants.length === 0) return false
+      const settings: DeviceSettings = {
+        ...clone(BUILT_IN_VOICE_NODE_SETTINGS),
+        assistants: web.assistants.map(({ followUpSeconds: _gone, ...a }) => clone(a)),
+        matching: web.matching,
+        withoutPhrase: { mode: "nobody" }
+      }
+      types.set(VOICE_NODE_KIND, { settings, rev: t.rev + 1, saved: true })
+      return true
+    },
+    setTypeSettings: (kind, settings) => {
+      const t = typeOf(kind)
+      types.set(kind, { settings: { ...t.settings, ...clone(settings) }, rev: t.rev + 1, saved: true })
     }
   }
   return mock

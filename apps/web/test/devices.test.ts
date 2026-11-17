@@ -45,7 +45,8 @@ describe("sections of a device type", () => {
   })
 
   it("an unknown type shows every section", () => {
-    expect(sectionsOf(undefined)).toHaveLength(8)
+    // Protocol 9 added Sound and Sound devices (voice nodes).
+    expect(sectionsOf(undefined)).toHaveLength(10)
   })
 })
 

@@ -213,6 +213,11 @@ export interface ClientState {
   /** Admin (protocol 7): the assistants with where they are used, and the device types with their defaults. */
   readonly assistants: ReadonlyArray<AssistantInfo>
   readonly deviceTypes: ReadonlyArray<DeviceTypeInfo>
+  /**
+   * Admin, protocol 9: the pairing codes redeemed while this page was open (`node.paired`), newest last, so the Add
+   * voice node dialog that shows a code learns that its box is paired.
+   */
+  readonly pairedNodes: ReadonlyArray<PairedNode>
   /** The audio owner said the wake phrase alone (`wake` with `armed`): "Listening…" until the next state change. */
   readonly woke: { readonly phrase: string; readonly assistantId?: string } | undefined
   /**
@@ -283,6 +288,14 @@ export interface ClientState {
   }
 }
 
+/** A `node.paired`: the code that was redeemed, and the node it made. */
+export interface PairedNode {
+  readonly code: string
+  readonly deviceId: string
+  readonly name: string
+}
+export const MAX_PAIRED_NODES = 8
+
 export const MAX_TURNS = 300
 export const MAX_TRACES = 50
 export const MAX_TOASTS = 3
@@ -304,6 +317,7 @@ export const initialState: ClientState = {
   devices: [],
   assistants: [],
   deviceTypes: [],
+  pairedNodes: [],
   woke: undefined,
   setup: undefined,
   holder: undefined,
@@ -343,6 +357,7 @@ const adminPart = {
   devices: initialState.devices,
   assistants: initialState.assistants,
   deviceTypes: initialState.deviceTypes,
+  pairedNodes: initialState.pairedNodes,
   sessions: initialState.sessions,
   heard: initialState.heard,
   adminReady: false
@@ -641,9 +656,11 @@ const server: ServerHandlers = {
   "conversation.history": (s, m) => onHistory(s, m, historyToTurns),
   assistants: (s, m) => ({ ...s, assistants: m.assistants }),
   "device.types": (s, m) => ({ ...s, deviceTypes: m.types }),
-  // N4: node.paired and node.meter are read by the Voice nodes pages; node.command goes to a node, never to a page.
+  // Protocol 9 (docs/VOICE-NODES.md §7.4): `node.command` goes to a node, never to a page.
   "node.command": (s) => s,
-  "node.paired": (s) => s,
+  // A code was redeemed: the Add voice node dialog showing it moves on to "paired".
+  "node.paired": (s, m) => ({ ...s, pairedNodes: [...s.pairedNodes.filter((p) => p.code !== m.code), { code: m.code, deviceId: m.deviceId, name: m.name }].slice(-MAX_PAIRED_NODES) }),
+  // N8: the Test microphone meter reads these.
   "node.meter": (s) => s
 }
 
@@ -737,6 +754,7 @@ function pickAdmin(s: ClientState): Partial<ClientState> {
     devices: s.devices,
     assistants: s.assistants,
     deviceTypes: s.deviceTypes,
+    pairedNodes: s.pairedNodes,
     sessions: s.sessions,
     heard: s.heard,
     adminReady: s.adminReady
