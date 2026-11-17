@@ -1020,3 +1020,118 @@ describe("review round 3: Members are read repaired at load, before anything is 
     expect(new Set((onDisk.assistant.HOUSEHOLD_MEMBERS as ReadonlyArray<Json>).map((m) => m.id)).size).toBe(2)
   })
 })
+
+// ---- Review round 3 (p5-r3a finding 4): a room-only commit refreshes the pages in the commit's own step.
+
+describe("review round 3: a room-only change reaches a snapshot in progress at once", () => {
+  /** Every projection's room, and "COMMIT" where the room change committed. */
+  const projected: Array<string> = []
+  let projectionDelayMs = 0
+  let onFirstProjection: (() => void) | undefined
+  const Spot = Schema.Struct({ n: Schema.Number })
+  const spots = defineCollection({
+    name: "spots",
+    scope: "household",
+    schema: Spot,
+    project: (row: Row<typeof Spot.Type>, device) => {
+      const hook = onFirstProjection
+      onFirstProjection = undefined
+      hook?.()
+      // A slow projection (blocking, as a module's may be): the snapshot takes many steps, with the event loop free
+      // only between them.
+      const until = performance.now() + projectionDelayMs
+      while (performance.now() < until) {}
+      projected.push(device.room ?? "")
+      return { n: row.value.n, room: device.room ?? "" }
+    }
+  })
+  let roomyStore: ModuleStore | undefined
+  const roomy = defineModule({
+    apiVersion: 2,
+    id: "roomy",
+    name: "Roomy",
+    description: "Shows rows with the room of the page",
+    storage: { collections: [spots] },
+    shared: (ctx) =>
+      Effect.sync(() => {
+        roomyStore = ctx.store
+        return { value: undefined }
+      }),
+    start: () => Effect.succeed({})
+  })
+
+  it("a snapshot being sent when the room alone changes in a commit made outside admin: no later part has the old room", async () => {
+    const dataDir = await dataDirWithAlpha()
+    const path = join(dataDir, "settings.json")
+    const file = JSON.parse(readFileSync(path, "utf8")) as Json
+    file.assistants.byId.alpha.modules.roomy = { on: true, offTools: [] }
+    writeFileSync(path, JSON.stringify(file))
+    // The room change's write is held until the snapshot is under way (released on its first projection).
+    let armed = false
+    let release: (() => void) | undefined
+    server = await startTestServer({
+      build: fakeBuild({ stt: controlledStt().stt, llm: scriptedLlm(() => "Ok.").llm }),
+      dataDir,
+      catalog: [greeterModule, probe, roomy],
+      settingsBeforeStep: (step) => {
+        if (step !== "settings" || !armed) return
+        armed = false
+        return new Promise<void>((resolve) => {
+          release = resolve
+        })
+      }
+    })
+    const store = server.handle.store
+    await until("the module's store", () => roomyStore !== undefined)
+    // The store of the module's running part (a part made at start may be replaced once while the server settles).
+    for (let n = 0; n < 500; n++) {
+      for (let tries = 0; ; tries++) {
+        const exit = await Effect.runPromise(Effect.exit(roomyStore!.collection(spots).insert({ n })))
+        if (exit._tag === "Success") break
+        if (tries > 50) throw new Error("the module's store does not answer")
+        await sleep(20)
+      }
+    }
+    const id = "room-tab-0001"
+    const admin = await ScriptedClient.connect({ url: server.url })
+    clients.push(admin)
+    await admin.admin(TEST_ADMIN_PASSWORD)
+    let page = await pageOn(id)
+    expect((await saveDevice(admin, id, { place: { ...placeOf(null), room: "Kitchen" } })).ok).toBe(true)
+    const closed = await Promise.race([page.closed.then(() => true), sleep(500).then(() => false)])
+    if (closed) page = await reconnect(page)
+    await page.waitFor("household.snapshot", (m) => m.final, { timeoutMs: 10_000 })
+    // The next snapshot (a new page of the same device) is slow; on its first projection the room is changed by a
+    // save straight to the settings (no admin continuation runs after it).
+    projected.length = 0
+    projectionDelayMs = 1
+    let sentAtCommit = 0
+    const off = store.onCommitted((before, after) => {
+      // Only the room change (a page's hello writes the device record too).
+      if (before.devices[id]?.own.place?.room === "Bedroom" || after.devices[id]?.own.place?.room !== "Bedroom") return
+      projected.push("COMMIT")
+      sentAtCommit = second?.messages.length ?? 0
+    })
+    let second: ScriptedClient | undefined
+    const record = store.settings().devices[id]!
+    armed = true
+    const save = Effect.runPromise(store.saveDevice(id, record.rev, { own: { ...record.own, place: { ...placeOf(null), ...record.own.place, room: "Bedroom" } } }))
+    await until("the room change's write held", () => release !== undefined)
+    onFirstProjection = () => release!()
+    second = await ScriptedClient.connect({ url: server.url, deviceId: id })
+    clients.push(second)
+    await second.hello({ device: { ...second.device, capabilities: tablet } })
+    await until("the room change committed", () => projected.includes("COMMIT"))
+    await save
+    const final = await second.waitFor("household.snapshot", (m) => m.final, { from: sentAtCommit, timeoutMs: 20_000 })
+    // (What the page received after the commit is not the test: parts sent before it may still be on the way.)
+    off()
+    projectionDelayMs = 0
+    const at = projected.indexOf("COMMIT")
+    // The snapshot was still being sent when the change committed, and nothing after it was projected for the Kitchen.
+    expect(projected.slice(0, at).length).toBeGreaterThan(0)
+    expect(projected.slice(0, at).length).toBeLessThan(500)
+    expect(projected.slice(at + 1).filter((r) => r !== "Bedroom")).toEqual([])
+    expect(final.final).toBe(true)
+  })
+})

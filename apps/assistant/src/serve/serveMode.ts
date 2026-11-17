@@ -1511,6 +1511,9 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       const everyone = membersRemoved(before, after)
       const ended = hubNow.endSessions((deviceId, kind) => everyone || boundaryChanged(before, after, deviceId, kind))
       if (ended > 0) runFork(Effect.logInfo(`Settings that decide what ${ended === 1 ? "a device" : `${ended} connections`} may be sent changed: the session started again`))
+      // Review round 3: then, in the same step, every page whose device record changed (a room alone, a name) drops
+      // the snapshot it was sending and starts one of the new record, so no later part is built with the old one.
+      push.hooks.devicesChanged()
     })
     yield* Effect.addFinalizer(() => Effect.sync(stopBoundary))
     // P5: a person removed from Members is no device's default person any more (also at start, after a crash between
