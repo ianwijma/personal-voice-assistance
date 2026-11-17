@@ -1,4 +1,4 @@
-import { HealthIssue, type HealthIssue as Issue, MAX_HEALTH_ISSUES } from "@pva/protocol"
+import { HealthIssue, type HealthIssue as Issue, MAX_HEALTH_BYTES, MAX_HEALTH_ISSUES } from "@pva/protocol"
 import { Schema } from "effect"
 
 /**
@@ -22,8 +22,8 @@ export interface IssueRegistry {
 
 const RANK: Readonly<Record<Issue["severity"], number>> = { error: 0, warning: 1, info: 2 }
 
-/** The UTF-8 size all issues together may have on the wire (well under the 1 MiB frame, with the rest of a snapshot). */
-export const ISSUES_BUDGET_BYTES = 256 * 1024
+/** The UTF-8 size all issues together may have on the wire: the protocol's `MAX_HEALTH_BYTES` (under the 1 MiB frame, with the rest of a snapshot). */
+export const ISSUES_BUDGET_BYTES = MAX_HEALTH_BYTES
 
 const isWireIssue = Schema.is(HealthIssue)
 

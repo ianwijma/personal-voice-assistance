@@ -1,7 +1,8 @@
 // Module API v2, review round 4 (p1-r4a): each test is the reviewer's sequence of events for one host finding that the
 // lead decided to fix (docs/MODULES-PLAN.md §4 P1, "Decided after review round 4"), against the host as it is now.
 import { assert, describe, it } from "@effect/vitest"
-import type { ModuleInfo } from "@pva/protocol"
+import { decodeServerMessage, encodeServerMessage, type ModuleInfo } from "@pva/protocol"
+import { exampleAdminSnapshot } from "@pva/protocol/examples"
 import { Cause, Deferred, Effect, Exit, Fiber, Scheduler, Schema, Scope } from "effect"
 import { TestClock } from "effect/testing"
 import { makeIssueRegistry } from "../src/Issues.ts"
@@ -405,3 +406,24 @@ describe("issue count (finding 20)", () => {
 // Kept for the reader: the stopped error is what a context answers after close (finding 2 above).
 void isModuleStopped
 void Cause
+
+describe("the registry's health fits the frame (p1-r4c finding 2)", () => {
+  it("issues at every field maximum, all escaped: what the registry keeps encodes and decodes, standalone and in an admin snapshot", () => {
+    const nul = (n: number) => "\u0000".repeat(n)
+    const registry = makeIssueRegistry()
+    registry.set("s", Array.from({ length: 150 }, (_, i) => ({
+      id: `i${i}`,
+      severity: "error" as const,
+      title: nul(200),
+      device: nul(200),
+      detail: nul(2000),
+      fix: { kind: "command" as const, label: nul(200), value: nul(1000) }
+    })))
+    const health = { issues: [...registry.all()], checking: false, checkedAt: 1 }
+    const standalone = decodeServerMessage(encodeServerMessage({ type: "health", health }))
+    assert.strictEqual(standalone._tag, "Ok")
+    const snapshot = decodeServerMessage(encodeServerMessage({ type: "admin.snapshot", snapshot: { ...exampleAdminSnapshot, health } }))
+    assert.strictEqual(snapshot._tag, "Ok")
+    assert.match(health.issues.at(-1)!.title, /^And \d+ more issues$/)
+  })
+})

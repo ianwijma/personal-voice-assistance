@@ -329,7 +329,7 @@ The **module host** (`packages/core/src/ModuleHost.ts`, new, Node-free; persiste
 |---|---|---|---|
 | `disabled` | Not running; intent off | startup with intent off; disable completed | `starting` on enable |
 | `starting` | `start` is running (10 s limit) | enable; startup with intent on; retry | `running`, `error` |
-| `running` | Instance is in the snapshot | `start` succeeded | `stopping` on disable; stays `running` on reconfigure |
+| `running` | Instance is in the snapshot | `start` succeeded | `stopping` on disable, and on a reconfigure that changes what it runs (then `starting`); stays `running` on one that does not |
 | `stopping` | Removed from the snapshot; its calls in flight get up to 10 s, then its scope closes | disable; a change of what it runs | `disabled`, or `starting` again |
 | `error` | Intent on, not running. `error` says why | start failed or timed out; saved settings invalid; tool name clash | `starting` on enable (retry) or reconfigure; `disabled` on disable |
 | `unavailable` | Cannot run on this server (protocol 9, §1.10.3); `unavailable` says why and how to fix it | a required program or the platform is missing, or an unsupported `apiVersion` | `starting` (if wanted) once "Check again" finds it available |
@@ -349,8 +349,9 @@ Rules:
 - **System prompt and cache.** The system prompt of a turn is `base prompt + instructions of running modules (catalog order) + voice block`, built when the snapshot changes. A module change that alters the tool list or the instructions changes the cached prefix (tools → system → messages), so the next request writes a new cache entry: expect a slower first token on that one turn, visible in its trace. Context providers do not affect the cache.
 - **Context providers** are wrapped by the host with a 50 ms timeout; a slow provider contributes nothing to that turn and logs a warning (it must not add latency to every turn).
 - **Runtime trouble after start** (the Home Assistant server goes away): tools return `ToolError` as today; the module may set an `error`-tone status. The host does not restart modules automatically.
-- **Startup**: modules with intent on start concurrently with the engine build; neither waits for the other. A module still starting when the first turn begins is simply not in that turn's snapshot.
-- **Shutdown**: every module is stopped, consumers first, without grace; the whole close is bounded (30 s), and module code that does not finish closing in time is left to finish on its own and logged.
+- **Startup**: in the CLI modes, modules with intent on start concurrently with the engine build; neither waits for the other. In serve mode the host starts nothing before `startEnabled`, which serve mode calls once what the modules depend on is built. A module still starting when the first turn begins is simply not in that turn's snapshot.
+- **Shutdown**: every module is withdrawn first, in one step (nothing of any module stays published or callable, and every host object answers `ModuleStopped`); then the parts are closed, consumers first, without grace; the whole close is bounded (30 s), and module code that does not finish closing in time is left to finish on its own and logged.
+- **The grace period** covers the calls admitted to the stopping module itself (its tools, actions and context providers). A call another module makes into its service while it stops may fail; the consumer handles that failure.
 
 ### 1.5 Validation and error reporting
 
@@ -542,10 +543,12 @@ host"):
   a provider follows its consumers transitively.
 - A module used only through `uses` (no instance) is `running` while its shared part runs, and its `health()` gets
   `running: true`.
-- `requestRestart` (from the shared part or an instance) stops the module and starts it again, at most once every 5 s:
-  requests in between are merged into the next restart, and one made after the last restart began always leads to
-  another, so a tool list that changed again is not lost. One made during the part's own start applies once it is
-  published. The restart starts with the module's current settings and the secrets it ran with (a locked vault does
+- `requestRestart` (from a live shared part or instance) stops the module and starts it again. It is recorded in one
+  step (an interrupted caller made it whole or not at all). Requests are taken up at most once per 5 s, the ones in
+  between merged into the next restart: a module cannot restart itself in a tight loop (this is not a minimum
+  distance between two restarts). One made after the last one was taken up always leads to another, so a tool list
+  that changed again is not lost. A request from a part that is starting, from a start that failed, or from a part
+  being stopped (a finalizer) is ignored. The restart starts with the module's current settings and the secrets it ran with (a locked vault does
   not stop it). Restarts and every other start run outside any turn: the new start never sees the requesting tool's
   `CurrentTurn`. A host object that old code keeps after its part closed answers with `ModuleStopped`.
 #### 1.10.2 Services and contributions
