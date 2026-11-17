@@ -63,7 +63,7 @@ const reference = (c: Case, after: number, n: number): { instants: Array<number>
   const until = c.rule.until === undefined ? Infinity : untilMs(c.rule.until)
   const startT = utcOfDay(c.start)
   // Without COUNT, days long before `after` cannot matter: start two days before its local day (membership is still from DTSTART).
-  const afterT = after === -Infinity || after < startT ? startT : utcOfDay(wallOf(after, c.zone)) - 2 * DAY
+  const afterT = after === -Infinity || after < startT ? startT : after > 8.64e15 ? utcOfDay(lastDay) + DAY : utcOfDay(wallOf(after, c.zone)) - 2 * DAY
   let t = c.rule.count !== undefined ? startT : Math.max(startT, afterT)
   const first = new Date(t)
   const x = { year: first.getUTCFullYear(), month: first.getUTCMonth() + 1, day: first.getUTCDate() }
@@ -122,7 +122,11 @@ const zoneDays: Record<string, ReadonlyArray<Day>> = {
   "Pacific/Apia": [{ year: 2011, month: 12, day: 28 }, { year: 2011, month: 12, day: 29 }, { year: 2011, month: 12, day: 31 }],
   "America/New_York": [{ year: 2026, month: 3, day: 8 }, { year: 2026, month: 11, day: 1 }],
   "Australia/Lord_Howe": [{ year: 2026, month: 4, day: 5 }, { year: 2026, month: 10, day: 4 }],
-  UTC: [{ year: 2199, month: 12, day: 27 }, { year: 2199, month: 11, day: 30 }, { year: 2000, month: 2, day: 29 }]
+  UTC: [{ year: 2199, month: 12, day: 27 }, { year: 2199, month: 11, day: 30 }, { year: 2000, month: 2, day: 29 }],
+  // The end of the range far east and far west of UTC (review round 5, finding 4): in Kiritimati (UTC+14) the first day of 2200 begins
+  // on 31 December 2199 UTC, so an UNTIL on that day can still let an instance of 2200 through; in Pago Pago (UTC−11) it cannot.
+  "Pacific/Kiritimati": [{ year: 2199, month: 12, day: 30 }, { year: 2199, month: 12, day: 27 }, { year: 2199, month: 11, day: 30 }],
+  "Pacific/Pago_Pago": [{ year: 2199, month: 12, day: 30 }, { year: 2199, month: 12, day: 27 }]
 }
 const times: ReadonlyArray<readonly [number, number, number]> = [[2, 30, 0], [0, 0, 0], [9, 0, 30], [1, 45, 0]]
 
@@ -163,6 +167,11 @@ const cases: Array<Case> = []
       const until = (() => {
         const choice = r.int(0, 2)
         if (choice === 0 && untilAt(s, hour, minute, second, zone) >= "2000") return untilAt(s, hour, minute, second, zone)
+        // A start in the last year: an UNTIL on its last day, at a few times (round 5, finding 4), unless that is before DTSTART.
+        if (s.year === 2199) {
+          const text = ["21991231T230000Z", "21991231T100000Z", "21991231T235959Z", "21991231T160000Z"][(k + hour + choice) % 4]!
+          return text < untilAt(s, hour, minute, second, zone) ? untilAt(s, hour, minute, second, zone) : text
+        }
         const later = choice === 1 ? { year: s.year + 1, month: s.month, day: Math.min(s.day, 28) } : { year: s.year + 3, month: s.month, day: Math.min(s.day, 28) }
         const text = `${pad(Math.min(later.year, 2199), 4)}${pad(later.month)}${pad(later.day)}T${pad(hour)}${pad(minute)}${pad(second)}Z`
         // Near the end of the range "a year on" can fall before DTSTART: then UNTIL is DTSTART itself.
@@ -180,7 +189,7 @@ function untilAt(s: Day, hour: number, minute: number, second: number, zone: str
   return `${pad(d.getUTCFullYear(), 4)}${pad(d.getUTCMonth() + 1)}${pad(d.getUTCDate())}T${pad(d.getUTCHours())}${pad(d.getUTCMinutes())}${pad(d.getUTCSeconds())}Z`
 }
 
-const iso = (t: number) => new Date(t).toISOString()
+const iso = (t: number) => (Number.isFinite(t) ? new Date(t).toISOString() : String(t))
 
 describe("the recurrence engine against a brute-force reference", () => {
   it(`agrees on ${cases.length} rules over many instants, with the same reason for stopping`, () => {
@@ -197,6 +206,8 @@ describe("the recurrence engine against a brute-force reference", () => {
       const afters = [utcOfDay(c.start) - 30 * DAY, ...first.instants.slice(0, 3).flatMap((t) => [t - 1, t])]
       for (let k = 0; k < 2; k++) afters.push(utcOfDay(c.start) + r.int(0, 4 * 365) * DAY + r.int(0, DAY))
       if (c.rule.count === undefined && c.rule.until === undefined && r.chance(0.1)) afters.push(Date.UTC(2150, 5, 1), Date.UTC(2199, 11, 31, 12), Date.UTC(2300, 0, 1))
+      // Near the end of the range: `after` inside its last day and beyond it (round 5, finding 4).
+      else if (c.start.year === 2199) afters.push(Date.UTC(2199, 11, 31, 12), Date.UTC(2200, 0, 10), Infinity)
       for (const after of afters) {
         const want = reference(c, after, 3)
         const got = occurrencesAfter(spec, after, 3)!
@@ -330,6 +341,7 @@ describe("the recurrence engine against a brute-force reference", () => {
     }
     const problems: Array<string> = []
     let checked = 0
+    let repeated = 0
     for (const [k, c] of cases.entries()) {
       if (k % 2 === 1 && c.rule.interval === 1) continue
       const language = (k >> 1) % 2 === 0 ? "en" : "nl"
@@ -338,6 +350,16 @@ describe("the recurrence engine against a brute-force reference", () => {
       const start = { year: c.start.year, month: c.start.month, day: c.start.day }
       const time = { hour: c.start.hour, minute: c.start.minute }
       const text = describeRRule(c.rule, language, { time, start, timeZone: c.zone })
+      // An UNTIL in an hour the clocks repeat cannot say which of the two it is: no description (review round 5, finding 3). Decided
+      // by the test's own zone lookup: the UNTIL's wall clock happens twice.
+      if (c.rule.until !== undefined) {
+        const w = wallOf(untilMs(c.rule.until), c.zone)
+        if (instantsOf(w, c.zone).length > 1) {
+          if (text !== undefined) problems.push(`${language} ${spec.rrule} ${spec.dtstart}: "${text}" describes an UNTIL in a repeated hour`)
+          repeated++
+          continue
+        }
+      }
       if (text === undefined) { problems.push(`${spec.rrule}: no description`); continue }
       const fail = (what: string) => problems.push(`${language} ${spec.rrule} ${spec.dtstart}: "${text}" does not say ${what}`)
       const lower = text.toLowerCase()
@@ -397,6 +419,7 @@ describe("the recurrence engine against a brute-force reference", () => {
     }
     expect(problems.slice(0, 10)).toEqual([])
     expect(checked).toBeGreaterThan(2000)
+    expect(repeated).toBeGreaterThan(5)
   }, 60_000)
 
   it("a plain weekly, monthly or yearly rule is not described without the start it takes its day from (findings 7, 8)", () => {

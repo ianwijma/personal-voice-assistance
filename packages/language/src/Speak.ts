@@ -81,8 +81,15 @@ export interface SpeakAmountOptions {
 }
 
 const article = (language: Language, word: string): string => (language === "nl" ? "een" : /^[aeiou]/.test(word) ? "an" : "a")
-/** Whole hundredths (to a millionth of one, the error of a decimal fraction in binary): `x` said by `speakNumber` is `x` itself. */
-const exact = (x: number): boolean => Math.abs(x * 100 - Math.round(x * 100)) < 1e-6
+/**
+ * Whole hundredths: `x` said by `speakNumber` is `x` itself. The allowance is a few units in the last place of `x * 100` (the error a
+ * decimal fraction and a sum or unit change of them leave in binary: 0.1 + 0.2 is 0.3), scaled to the number's size, not a fixed
+ * amount: 1.000000001 is not whole hundredths (review round 5, finding 6).
+ */
+const exact = (x: number): boolean => {
+  const h = Math.round(x * 100)
+  return Math.abs(x * 100 - h) <= 4 * Number.EPSILON * Math.abs(h)
+}
 
 /**
  * An amount with its unit, as it is said: "about 750 grams of rice", "2 kilo bloem", "a pack of milk", "a handful of nuts", "3
@@ -141,7 +148,10 @@ export const speakAmount: (q: AmountLike, language: Language, options?: SpeakAmo
 export interface SpeakTimeOptions {
   /** "12h": "half past seven", "kwart over zeven". "24h": "nineteen thirty", "negentien uur dertig". Default "12h". */
   readonly style?: "12h" | "24h"
-  /** 12h only: add "in the evening" / "'s avonds" so that the part of the day is said. Default false. */
+  /**
+   * Add "in the evening" / "'s avonds" so that the part of the day is said. In the 24-hour style only to an hour 1–12 (the others are
+   * settled by their words). Default false.
+   */
   readonly period?: boolean
 }
 
@@ -163,14 +173,17 @@ export const speakTime: (t: ClockTime, language: Language, options?: SpeakTimeOp
   const style = options?.style ?? "12h"
   if (!Number.isInteger(hour) || !Number.isInteger(minute) || hour < 0 || hour > 23 || minute < 0 || minute > 59 || (style !== "12h" && style !== "24h")) return undefined
   if (style === "24h") {
+    // With `period`, an hour 1–12 says its part of the day too, so that it reads back exactly (review round 5, finding 2): "een uur
+    // dertig 's nachts", "ten thirty in the morning". Hours 0 and 13–23 are settled by their words.
+    const part = options?.period === true && hour >= 1 && hour <= 12 ? " " + periodText[language][dayPart(hour)] : ""
     if (language === "en") {
       if (hour === 0 && minute === 0) return "midnight"
       const h = hour === 0 ? "zero" : hour < 10 ? `oh ${words(hour, "en")}` : words(hour, "en")
       const m = minute === 0 ? "hundred" : minute < 10 ? `oh ${words(minute, "en")}` : words(minute, "en")
-      return `${h} ${m}`
+      return `${h} ${m}${part}`
     }
     if (hour === 0 && minute === 0) return "middernacht"
-    return `${words(hour, "nl")} uur${minute === 0 ? "" : " " + words(minute, "nl")}`
+    return `${words(hour, "nl")} uur${minute === 0 ? "" : " " + words(minute, "nl")}${part}`
   }
   if (language === "nl" && hour === 0 && minute === 0) return "middernacht"
   const h12 = (x: number) => (x % 12 === 0 ? 12 : x % 12)

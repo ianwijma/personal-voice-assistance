@@ -61,7 +61,8 @@ describe("quantities: speakAmount never states another quantity (round 4, findin
         if (unit === "piece" && item === "" && r.chance(0.5)) continue
         const humanize = firstRounds ? k % 4 < 2 : r.chance(0.5)
         const text = speakAmount({ amount, unit, approx }, language, { item, humanize })
-        const hundredths = Math.abs(amount * 100 - Math.round(amount * 100)) < 1e-6
+        // Whole hundredths by the test's own definition: the amount is the double nearest to its hundredths (round 5, finding 6).
+        const hundredths = Math.round(amount * 100) / 100 === amount
         // An amount of whole hundredths in its own unit is always said (it needs no rounding).
         if (text === undefined) {
           if (hundredths && amount <= 999_999.99) throw new Error(`${language} ${amount} ${unit}: an exact amount was not said`)

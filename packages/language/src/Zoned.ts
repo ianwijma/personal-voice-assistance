@@ -128,6 +128,28 @@ export const zonedInstants = (t: LocalDate & Partial<ClockTime> & { readonly sec
  */
 export const zonedToInstant = (t: LocalDate & Partial<ClockTime> & { readonly second?: number }, timeZone: string): number => zonedInstants(t, timeZone)[0]!
 
+/**
+ * Whether a calendar day happens at all in a zone: false only for a day the clocks jump over altogether (Pacific/Apia, 30 December
+ * 2011). A gap that merely takes part of the day — also one that pushes a late time past midnight (America/Nuuk, 28 March 2026, 23:00
+ * to 00:00) — leaves the day (review round 5, finding 1). When midnight itself is skipped, the day happens if the jump lands on it:
+ * the first instant whose local date is not before the day is found by bisection and its date compared.
+ */
+export const dayHappens = (d: LocalDate, timeZone: string): boolean => {
+  const n = dayNumber(d.year, d.month, d.day)
+  const dayOf = (instant: number): number => { const p = localParts(instant, timeZone); return dayNumber(p.year, p.month, p.day) }
+  let hi = zonedToInstant({ ...d, hour: 0, minute: 0, second: 0 }, timeZone)
+  if (dayOf(hi) === n) return true
+  // Midnight is in a gap and its reading lands later: bisect, to the second, for the jump between a day before `d` and `hi`.
+  let lo = hi - 3 * dayMs
+  if (dayOf(lo) >= n) return false
+  while (hi - lo > 1000) {
+    const mid = lo + Math.floor((hi - lo) / 2000) * 1000
+    if (dayOf(mid) >= n) hi = mid
+    else lo = mid
+  }
+  return dayOf(hi) === n
+}
+
 const isLeap = (y: number): boolean => (y % 4 === 0 && y % 100 !== 0) || y % 400 === 0
 export const daysInMonth = (year: number, month: number): number =>
   month === 2 ? (isLeap(year) ? 29 : 28) : month === 4 || month === 6 || month === 9 || month === 11 ? 30 : 31

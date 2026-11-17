@@ -66,3 +66,16 @@ export const instantsOf = (w: Wall, zone: string): ReadonlyArray<number> => {
   instantsCache.set(key, out)
   return out
 }
+
+/**
+ * Whether a local day happens at all in a zone: some quarter hour of the instants that could be on it (UTC −15 h to +39 h of its
+ * midnight) is on it by the wall clock. False only for a day the clocks jump over (Pacific/Apia, 30 December 2011); a gap that pushes
+ * a late time past midnight (America/Nuuk, 28 March 2026) leaves the day (review round 5, finding 1).
+ */
+export const dayHappensRef = (d: Day, zone: string): boolean => {
+  for (let t = utcOfDay(d) - 15 * 3_600_000; t <= utcOfDay(d) + 39 * 3_600_000; t += 900_000) if (sameDay(wallOf(t, zone), d)) return true
+  return false
+}
+
+/** The zone's canonical name as this machine's Intl spells it ("America/Nuuk" may be "America/Godthab"), as a TZID is written. */
+export const canonicalZone = (zone: string): string => new Intl.DateTimeFormat("en-US", { timeZone: zone }).resolvedOptions().timeZone
