@@ -25,6 +25,7 @@ export type Scenario =
   | "latency"
   | "admin-disabled"
   | "admin-backoff"
+  | "health"
 
 /** The mock's admin password (`ADMIN_PASSWORD` in mock/server.ts). */
 export const ADMIN_PASSWORD = "admin password"
