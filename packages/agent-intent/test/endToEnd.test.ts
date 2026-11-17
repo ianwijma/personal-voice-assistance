@@ -107,7 +107,8 @@ describe("hey Jev, end to end with the keyword decider and the demo home", () =>
         "<(conversational answer to Thanks!)>"
       ])
       assert.deepStrictEqual(yield* t.lights, ["Living room", "Bedroom"])
-      // The first command was decided and announced during the speculative turn and played at promotion.
+      // The first command was decided during the speculative turn; its announcement follows promotion and the final
+      // admission (review round 4) and plays then.
       assert.strictEqual(t.out.probe.chunks[0]!.at, Date.UTC(2026, 10, 13, 13, 32) + 270)
       const decisions = t.events.flatMap((e) => (e._tag === "IntentDecided" ? [`${e.decision.outcome}${e.decision.action ? ` ${e.decision.action.id}` : ""}${e.decision.reason ? ` (${e.decision.reason})` : ""}`] : []))
       assert.deepStrictEqual(decisions, [

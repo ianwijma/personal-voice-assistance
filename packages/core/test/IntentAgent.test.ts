@@ -104,7 +104,9 @@ describe("intent agent", () => {
       assert.deepStrictEqual(marks, ["decisionSent", "decisionReceived", "actionStarted", "actionFinished"])
     }))
 
-  it.effect("the announcement comes before promotion; the action waits for it", () =>
+  // Review round 4 (p1-r4b finding 4, the lead's decision): the announcement is released only after the gateway's
+  // admission just before the action runs, which follows promotion; before that the turn says nothing of success.
+  it.effect("the announcement comes after promotion and the final admission; the action waits for promotion", () =>
     Effect.gen(function*() {
       const home = makeHome()
       const decider = makeScriptedDecider(wants("home.lights_on", { "home.lights_on/target": choiceAnswer({ "area:kitchen": 0.9, "area:living_room": 0.1 }) }))
@@ -118,10 +120,11 @@ describe("intent agent", () => {
         speculative: true
       })).pipe(Stream.runForEach((e) => Effect.sync(() => seen.push(e))), Effect.forkChild)
       yield* advance(100)
-      assert.strictEqual(spoken(seen), "Kitchen lights on.")
+      assert.strictEqual(spoken(seen), "", "no success sentence before the turn is committed")
       assert.deepStrictEqual(home.runs, [], "nothing switched before the turn is committed")
       yield* Deferred.succeed(promoted, undefined)
       yield* Fiber.join(fiber)
+      assert.strictEqual(spoken(seen), "Kitchen lights on.")
       assert.deepStrictEqual(home.runs.map((r) => [r.action, r.at]), [["lights_on", 100]])
     }))
 

@@ -20,6 +20,9 @@ import {
  * intent agent (`ToolRegistry.runAction`), and a module's `host.actions.run` all come here; later a phrase command, a
  * tap on a presentation, a routine step and a notification action do too. Every tool and action the module host
  * publishes is sealed (`GatewayPrivate.ts`): its own `execute` / `run` refuses, and only this file runs the real one.
+ * Sealing stops accidental direct calls; it is not a security boundary against code compiled into the process
+ * (docs/MODULES-PLAN.md §3.5): such code can hand a sealed handle to another gateway, relabel it, or read what a
+ * registrar receives.
  *
  * For every call it resolves **on whose behalf** it runs (`Principal`): the explicit one a caller passes (a
  * notification, P9), else the turn (`CurrentTurn`), else the job (`CurrentJob`), else the principal of the gateway
@@ -122,8 +125,9 @@ export interface GatewayCallOptions {
 /** How one action call is made. */
 export interface ActionCallOptions extends GatewayCallOptions {
   /**
-   * Run once the call is admitted, just before the action runs (the intent agent speaks its announcement then, never
-   * before admission). Not run for a refused call.
+   * Run once the call has passed the admission that immediately precedes its run (after `holdUntil` and the second
+   * admission, when there is one), just before the action runs: the intent agent releases its announcement then,
+   * never before. Not run for a refused call.
    */
   readonly onAdmitted?: Effect.Effect<void>
   /**
@@ -313,8 +317,9 @@ export const makeExecutionGateway = (options: GatewayOptions = {}): ExecutionGat
       const started = performance.now()
       try {
         risk = riskOf(meta, call.input)
-      } catch (error) {
-        failure = error instanceof Error ? error.message : String(error)
+      } catch {
+        // A bounded category only: what the module threw (or answered) may hold anything, so it is not logged.
+        failure = "its risk function threw or answered a class it does not declare"
       }
       const ms = performance.now() - started
       if (failure === undefined && ms > RISK_BUDGET_MS) failure = `its risk function took ${ms.toFixed(1)} ms (at most ${RISK_BUDGET_MS} ms)`
@@ -376,12 +381,12 @@ export const makeExecutionGateway = (options: GatewayOptions = {}): ExecutionGat
       )
       const refused = yield* admitCall(call, def)
       if (refused !== undefined) return yield* refusedAction(refused)
-      if (actionOptions.onAdmitted !== undefined) yield* actionOptions.onAdmitted
       if (actionOptions.holdUntil !== undefined) {
         yield* actionOptions.holdUntil
         const again = yield* admitCall(call, def)
         if (again !== undefined) return yield* refusedAction(again)
       }
+      if (actionOptions.onAdmitted !== undefined) yield* actionOptions.onAdmitted
       return yield* asPrincipal(principal, Effect.suspend(() => actionRunnerOf(registered)(values)))
     })
 

@@ -6,7 +6,11 @@ import type { Tool } from "./Module.ts"
 /**
  * The execution gateway's private half: how a call it admitted reaches module code. This file is deliberately not
  * exported from the package (`src/index.ts` leaves it out, and `package.json` exports only the index), so nothing
- * outside core can run a published tool or action without admission.
+ * outside core runs a published tool or action by accident without admission. That is all sealing does: it stops
+ * accidental direct calls. It is not a security boundary against code compiled into the process (docs/MODULES-PLAN.md
+ * §3.5): a runner is found by the published object, not by the gateway that published it, so any gateway (the
+ * default one too) runs a sealed handle it is given, and the module id a caller passes is not checked against the
+ * handle's owner.
  *
  * The module host **seals** every tool and action it publishes: the published object's `execute` / `run` only
  * refuses, and the real one (wrapped in the host's in-flight tracking) is kept here, where only the gateway looks it
