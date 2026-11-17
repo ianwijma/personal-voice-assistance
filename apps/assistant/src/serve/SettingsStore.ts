@@ -1305,7 +1305,8 @@ export const loadSettingsStore = (directory: string, options: LoadOptions = {}):
           if (stored === undefined && deviceTypeOf(kind) === undefined) throw refuse("unknown_device", `There is no device type ${kind}`)
           const storedRev = stored?.rev ?? 0
           if (rev !== storedRev) throw stale(`The defaults of ${kind}`, rev, storedRev)
-          const next: StoredDeviceType = { ...deviceSettings, rev: stored === undefined ? 0 : storedRev + 1 }
+          // A type with no stored defaults is reported at rev 0, so its first save stores 1: every save moves the rev on.
+          const next: StoredDeviceType = { ...deviceSettings, rev: storedRev + 1 }
           return { file: { ...file, deviceTypes: { ...file.deviceTypes, [kind]: next } }, result: next }
         })
 
