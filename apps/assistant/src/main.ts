@@ -7,7 +7,6 @@ import {
   routeConfigFromWake,
   Stt,
   SttError,
-  ToolRegistry,
   TurnTrace,
   type WakeConfig,
   wakeConfigFromProfile
@@ -38,7 +37,6 @@ import { buildProviders, describeConfigError, StartupError } from "./startup.ts"
 import { runTextTurns } from "./text.ts"
 import { compareModelsCommand } from "./compareModels.ts"
 import { doctorCommand } from "./doctor.ts"
-import { householdCommand } from "./household.ts"
 import { transcribeCommand } from "./transcribe.ts"
 import { voiceMode } from "./voice.ts"
 import { assistantVoiceStage, withVoiceTrace } from "./voiceSelection.ts"
@@ -66,21 +64,21 @@ const StderrLogger = Logger.layer([
 // or with CLAUDE_SUBSCRIPTION_OPT_IN) answers; the offline stand-in answers, with a notice, when it is not running.
 const ConversationLayer = Layer.unwrap(Effect.gen(function*() {
   const settings = yield* AppConfig
+  // The module set is read at every turn's start (`CliModules`): a restarted or withdrawn module is never offered.
   const modules = yield* startCliModules()
-  const systemPrompt = withModuleInstructions(settings.systemPrompt, modules.instructions)
   const llmProvider = yield* Config.String("LLM_PROVIDER").pipe(Config.withDefault("fake"))
   if (llmProvider === SUBSCRIPTION_PROVIDER) {
     const fallbackLlm = yield* Llm
     const toAgents = makeSubscriptionAgents({
       fallbackLlm,
-      agents: () => modules.agents,
-      module: () => modules.infos.find((m) => m.id === SUBSCRIPTION_AGENT_ID),
+      agents: () => modules.snapshot().agents,
+      module: () => modules.infos().find((m) => m.id === SUBSCRIPTION_AGENT_ID),
       promptFor: (agent, turn) =>
-        agent.systemPrompt === undefined ? turn.system : withModuleInstructions(agent.systemPrompt, modules.instructions)
+        agent.systemPrompt === undefined ? turn.system : withModuleInstructions(agent.systemPrompt, modules.snapshot().instructions)
     })
-    return Conversation.layerWithAgents({ ...settings, setup: Effect.succeed(toAgents({ system: systemPrompt, registry: modules.registry })) })
+    return Conversation.layerWithAgents({ ...settings, setup: Effect.map(modules.setup(settings.systemPrompt), toAgents) })
   }
-  return Conversation.layer({ ...settings, systemPrompt }).pipe(Layer.provide(Layer.succeed(ToolRegistry, modules.registry)))
+  return Conversation.layerWithSetup({ ...settings, setup: modules.setup(settings.systemPrompt) })
 })).pipe(
   Layer.provide(Layer.mergeAll(LlmLayer, TurnTrace.layer()))
 )
@@ -215,7 +213,7 @@ const bench = (args: ReadonlyArray<string>) =>
       // `--ambient`: every turn's context also has the household's ambient facts (read-only, as serve mode would give
       // them with HOME_AMBIENT_FACTS=all), so llmFirstToken can be compared with and without (docs/STORING-DATA.md).
       const modules = yield* startCliModules({ ambient: parsed.ambient })
-      const conversation = { ...settings, systemPrompt: withModuleInstructions(settings.systemPrompt, modules.instructions) }
+      const conversation = settings
       const { sessions, staggerMs, llmPerSession } = parsed
       // `--llm-per-session`: one language-model instance per session (serve mode's pool with two different settings).
       const ownLlm = llmPerSession ? { llmPerSession: llm } : {}
@@ -290,10 +288,8 @@ const program: Effect.Effect<void, unknown> = mode === "text"
   ? serveMode
   : mode === "doctor"
   ? doctorCommand
-  : mode === "household"
-  ? householdCommand(args)
   : new StartupError({
-    message: `Unknown mode "${mode}". Usage: assistant [text | voice | serve | doctor | household backup|export|restore | bench [--sessions N | --typesafe | --typesafe-live [--count N] [--gap-ms MS] | --live [--rounds N] [--sessions N] [--stagger MS] [--llm-per-session] <wavs> | --make-wavs [dir]] | ` +
+    message: `Unknown mode "${mode}". Usage: assistant [text | voice | serve | doctor | bench [--sessions N | --typesafe | --typesafe-live [--count N] [--gap-ms MS] | --live [--rounds N] [--sessions N] [--stagger MS] [--llm-per-session] <wavs> | --make-wavs [dir]] | ` +
       "say [--voice PROVIDER:VOICE] [--out FILE] <text> | transcribe <wav file> | compare-models [--models a,b] [--agc on|off|both] [--ref TEXT] <wavs>]"
   })
 
@@ -317,8 +313,8 @@ const withSavedSettings = <A, E>(effect: Effect.Effect<A, E>): Effect.Effect<A, 
   })
 
 NodeRuntime.runMain(
-  // `household` reads only the database (no settings, no vault password).
-  (mode === "serve" || mode === "household" ? program : withSavedSettings(program)).pipe(
+  // Serve mode and doctor read the saved settings themselves (doctor strictly: never on defaults).
+  (mode === "serve" || mode === "doctor" ? program : withSavedSettings(program)).pipe(
     Effect.catch((e) => {
       const described = e instanceof StartupError
         ? e.message

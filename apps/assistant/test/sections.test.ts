@@ -76,6 +76,17 @@ describe("Sections: effective values", () => {
     const bad = await Effect.runPromise(sections.update("home", { values: { HOME_TIME_ZONE: "Mars/Olympus" }, secrets: {} }))
     expect(bad.result.ok).toBe(false)
     expect(sections.value("HOME_TIME_ZONE") ?? "").toBe("")
+    // A fixed offset is not a zone name: it cannot be a recurrence's TZID (modules P2, review round 2, finding 24).
+    for (const offset of ["+01:00", "+0100", "-05:00", " +01 "]) {
+      const refused = await Effect.runPromise(sections.update("home", { values: { HOME_TIME_ZONE: offset }, secrets: {} }))
+      expect(refused.result.ok, offset).toBe(false)
+    }
+    expect(sections.value("HOME_TIME_ZONE") ?? "").toBe("")
+    // Any three capital letters are a currency code; the description says so (finding 25).
+    expect((await Effect.runPromise(sections.update("home", { values: { HOME_CURRENCY: "ZZZ" }, secrets: {} }))).result.ok).toBe(true)
+    expect(sections.value("HOME_CURRENCY")).toBe("ZZZ")
+    for (const code of ["eur", "EU", "EURO", "E1R"]) expect((await Effect.runPromise(sections.update("home", { values: { HOME_CURRENCY: code }, secrets: {} }))).result.ok, code).toBe(false)
+    expect(home?.form.fields.find((f) => f.key === "HOME_CURRENCY")?.description).toContain("any three capital letters")
 
     for (const zone of ["Europe/Amsterdam", " Asia/Tokyo ", ""]) {
       const saved = await Effect.runPromise(sections.update("home", { values: { HOME_TIME_ZONE: zone }, secrets: {} }))
@@ -86,5 +97,32 @@ describe("Sections: effective values", () => {
     const units = await Effect.runPromise(sections.update("home", { values: { HOME_UNITS: "furlongs" }, secrets: {} }))
     expect(units.result.ok).toBe(false)
     expect(sections.value("HOME_UNITS")).toBe("metric")
+  })
+  it("the Home section's currency, cup size and API contact: saved, kept across a restart, defaults for older settings, header-safe contact (modules P2)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pva-sections-"))
+    // Settings saved before the three fields existed: they read their defaults.
+    const older = makeSections(await Effect.runPromise(openStore(dir)), {})
+    expect((await Effect.runPromise(older.update("home", { values: { HOME_LOCATION: "Utrecht, Netherlands" }, secrets: {} }))).result.ok).toBe(true)
+    const reopened = makeSections(await Effect.runPromise(openStore(dir)), {})
+    expect(reopened.value("HOME_LOCATION")).toBe("Utrecht, Netherlands")
+    expect(reopened.value("HOME_CURRENCY")).toBe("EUR")
+    expect(reopened.value("HOME_CUP_SIZE")).toBe("metric")
+    expect(reopened.value("HOME_API_CONTACT") ?? "").toBe("")
+    // Valid values are saved and survive a restart.
+    const saved = await Effect.runPromise(reopened.update("home", { values: { HOME_CURRENCY: "GBP", HOME_CUP_SIZE: "us", HOME_API_CONTACT: "me@example.com" }, secrets: {} }))
+    expect(saved.result.ok).toBe(true)
+    const again = makeSections(await Effect.runPromise(openStore(dir)), {})
+    expect(again.value("HOME_CURRENCY")).toBe("GBP")
+    expect(again.value("HOME_CUP_SIZE")).toBe("us")
+    expect(again.value("HOME_API_CONTACT")).toBe("me@example.com")
+    // A contact a header cannot hold is refused with a message, and the saved one stays.
+    for (const contact of ["https://example.com/联系", "me@exämple.com", "a\r\nX-Evil: 1"]) {
+      const refused = await Effect.runPromise(again.update("home", { values: { HOME_API_CONTACT: contact }, secrets: {} }))
+      expect(refused.result.ok, contact).toBe(false)
+      expect(JSON.stringify(refused.result)).toContain("ASCII")
+    }
+    expect(again.value("HOME_API_CONTACT")).toBe("me@example.com")
+    const cup = await Effect.runPromise(again.update("home", { values: { HOME_CUP_SIZE: "teacup" }, secrets: {} }))
+    expect(cup.result.ok).toBe(false)
   })
 })

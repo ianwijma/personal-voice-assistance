@@ -1,4 +1,5 @@
 import {
+  actionToolName,
   type AgentTurnSetup,
   type HostResult,
   Llm,
@@ -6,6 +7,7 @@ import {
   makeModuleHost,
   makeToolRegistry,
   type ModuleDemand,
+  type Principal,
   makeTurnTrace,
   type ModuleDefinition,
   type ModuleHost,
@@ -51,8 +53,7 @@ import { fileURLToPath } from "node:url"
 import { defaultSystemPrompt } from "../config.ts"
 import { envView as processEnvView, userCwd } from "../env.ts"
 import { type EnvView, makeEnvView } from "../envView.ts"
-import { moduleCatalog, withModuleInstructions } from "../modules.ts"
-import { runCoreChecks } from "../coreChecks.ts"
+import { moduleCatalog, moduleDemandOf, withModuleInstructions } from "../modules.ts"
 import { makeRequirementChecker } from "../requirements.ts"
 import { makeHealthService } from "./health.ts"
 import {
@@ -164,6 +165,12 @@ export interface ServeOptions {
   readonly allowedOrigins: ReadonlyArray<string>
   /** Host names the server answers to besides IP literals and `localhost` (`SERVE_ALLOWED_HOSTS`). */
   readonly allowedHosts?: ReadonlyArray<string>
+  /**
+   * A reverse proxy is in front of the server (`SERVE_BEHIND_PROXY`, default false). The server cannot tell a proxied
+   * request from a local one, so then no caller counts as on the home network: module routes with the `lan` guard
+   * refuse every request (docs/UI-AND-MODULES.md §1.11).
+   */
+  readonly behindProxy?: boolean
   readonly tls?: { readonly certFile: string; readonly keyFile: string } | undefined
   /** Cross-origin isolation headers on the page and its files (`SERVE_CROSS_ORIGIN_ISOLATION`). Default on. */
   readonly crossOriginIsolation?: boolean
@@ -403,12 +410,20 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       platform: { os: process.platform, arch: process.arch },
       requirements: checker.check,
       household: { store: household.store, events: household.bus },
+      // A program a module requires failed to run (ENOENT, EACCES): missing from now on; the host judges again.
+      programMissing: (tool) => checker.markMissing(tool),
+      // Serve mode: a call with no turn and no job is refused (a missing context never means "allowed").
+      localPrincipal: false,
       // The execution gateway's first checks, on every call (and the turn's action catalogue): the assistant has the
       // module on, and the tool is not one it switched off. Agents and decision providers are not per assistant.
       access: {
         moduleOn: (assistantId, moduleId) => !isCapability(moduleId) || assistantsNow().get(assistantId)?.modules[moduleId]?.on === true,
         toolOff: (assistantId, moduleId, toolName) =>
-          isCapability(moduleId) && (assistantsNow().get(assistantId)?.modules[moduleId]?.offTools.includes(toolName) ?? false)
+          isCapability(moduleId) && (assistantsNow().get(assistantId)?.modules[moduleId]?.offTools.includes(toolName) ?? false),
+        // The parts of a principal must belong together (or the call is refused): the assistant exists, the device
+        // is known and has that assistant, the connection is that device's, the person (P5) is in Members and the
+        // device's default person.
+        principalProblem: (principal) => principalProblem(principal)
       },
       // What modules may read about the assistant (`host.view()`): every read is a reference read or a small copy.
       view: {
@@ -419,6 +434,35 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
         home: () => sections.list().find((x) => x.id === "home")?.form.values ?? {}
       }
     })
+    /** Serve mode's check that a principal's parts belong together (`GatewayAccess.principalProblem`). */
+    const principalProblem = (principal: Principal): string | undefined => {
+      const parts = principal._tag === "turn"
+        ? { assistantId: principal.turn.assistantId, deviceId: principal.turn.deviceId, connection: principal.turn.connection, person: principal.turn.person }
+        : principal._tag === "job"
+        ? { assistantId: principal.job.assistantId, deviceId: principal.job.deviceId, connection: undefined, person: principal.job.person }
+        : principal._tag === "notification"
+        ? { assistantId: undefined, deviceId: principal.notification.deviceId, connection: principal.notification.connection, person: principal.notification.person }
+        : undefined
+      if (parts === undefined) return undefined
+      const { assistantId, connection, deviceId, person } = parts
+      if (assistantId !== undefined && !assistantsNow().has(assistantId)) return `the assistant "${assistantId}" does not exist.`
+      if (deviceId === undefined) return undefined
+      if (!devices.known(deviceId) && hub?.deviceConnected(deviceId) !== true) return `the device "${deviceId}" is not known.`
+      if (assistantId !== undefined) {
+        const settings = deviceSettingsOf(deviceId)
+        const assigned = settings.assistants.some((a) => a.assistant === assistantId) ||
+          (settings.withoutPhrase.mode === "assistant" && settings.withoutPhrase.assistant === assistantId)
+        if (!assigned) return `the assistant "${assistantId}" is not on the device "${deviceId}".`
+      }
+      if (connection !== undefined && hub?.deviceOfConnection(connection) !== deviceId) return `the request did not come from the device "${deviceId}".`
+      // P5: a person is someone in Members and the device's default person (the only way a turn has a person: there is
+      // no voice identification). The person's id is not quoted: it may come from module code.
+      if (person !== undefined) {
+        if (people.get(person.id) === undefined) return "the person is not in Members."
+        if (deviceFacts.placeOf(deviceId)?.defaultPerson !== person.id) return `the person is not the default person of the device "${deviceId}".`
+      }
+      return undefined
+    }
     const keys = makeKeys({ vault, store, host })
     const access = makeAccessPolicy({ catalog, sections: sections.list, vaultState: keys.state })
 
@@ -503,16 +547,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
      * values. Each capability has an entry (an empty list: nobody, so it does not run); agents and decision providers
      * have none and follow their own switch.
      */
-    const moduleDemand = (): ReadonlyMap<string, ReadonlyArray<ModuleDemand>> => {
-      const demand = new Map<string, Array<ModuleDemand>>(catalog.filter((d) => isCapability(d.id)).map((d) => [d.id, []]))
-      for (const assistant of assistantsNow().values()) {
-        if (!assistant.on) continue
-        for (const [moduleId, choice] of Object.entries(assistant.modules)) {
-          if (choice.on) demand.get(moduleId)?.push({ assistantId: assistant.id, ...(choice.own !== undefined ? { own: choice.own } : {}) })
-        }
-      }
-      return demand
-    }
+    const moduleDemand = (): ReadonlyMap<string, ReadonlyArray<ModuleDemand>> => moduleDemandOf(catalog, assistantsNow().values())
     /** Bring the module instances in line with the assistants and Home (after every save; not while blocked). */
     const syncModules = (): Effect.Effect<void> => Effect.suspend(() => (store.blocked() !== undefined ? Effect.void : host.refresh))
     /**
@@ -545,7 +580,11 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
         if (choice === undefined || !choice.on) return []
         if (choice.offTools.length === 0) return [part]
         const off = new Set(choice.offTools)
-        return [{ ...part, module: { ...part.module, tools: (part.module.tools ?? []).filter((t) => !off.has(t.name)) } }]
+        const intentActions = part.module.intentActions?.filter((a) => !off.has(actionToolName(a.moduleId, a.definition.id)))
+        return [{
+          ...part,
+          module: { ...part.module, tools: (part.module.tools ?? []).filter((t) => !off.has(t.name)), ...(intentActions !== undefined ? { intentActions } : {}) }
+        }]
       })
       /** The modules it has on that run (capabilities; for the turn's configuration snapshot). */
       const modules = parts.reduce((n, p) => (isCapability(p.moduleId) && p.unavailable !== true ? n + 1 : n), 0)
@@ -1305,6 +1344,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
           ...(options.hearerSwitchWaitMs !== undefined ? { hearerSwitchWaitMs: options.hearerSwitchWaitMs } : {}),
           assistants: assistantsNow,
           conversationSetup,
+          audioConnection: () => hub?.audioOwnerOf(key),
           voiceOf: (assistant, deviceId) => resources.ttsKeyFor(voiceUserFor(assistant, deviceId)),
           moduleOfTool: (name) => host.snapshot().toolModules.get(name) ?? null,
           routing: () => routing,
@@ -1381,28 +1421,27 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       host,
       checker,
       catalog,
-      core: Effect.suspend(() =>
-        Effect.zipWith(
-          runCoreChecks({
-            checker,
-            env,
-            dataDir: options.dataDir,
-            modelDirs: sections.modelDirs(),
-            serving: true,
-            vault: { state: vault.state(), path: vault.path },
-            assistants: [...assistantsNow().values()],
-            sttShared: sttShared()
-          }),
-          // The household's cheap checks (backup age, a pending erase); its quick check is `pnpm start doctor`'s.
-          household.sqlite !== undefined ? householdBackupIssues(household.sqlite) : Effect.succeed([]),
-          (a, b) => [...a, ...b]
-        )
-      )
+      fork: run,
+      // The household's cheap checks (backup age, directories, the log's size); its quick check is `pnpm start doctor`'s.
+      ...(household.sqlite !== undefined ? { checks: { "household-checks": householdBackupIssues(household.sqlite) } } : {})
     })
-    const push = makeHouseholdPush({ feed: household.feed, bus: household.bus, store: household.store, run, log: (line) => runFork(Effect.logWarning(line)) })
+    const push = makeHouseholdPush({
+      feed: household.feed,
+      bus: household.bus,
+      store: household.store,
+      // Projections see the server's record of a device (its saved name; P5: its room, privacy and default person,
+      // `DeviceFacts.targetOf`), never what a page said in its hello. A device not recorded: its id only, so no
+      // person-scoped data.
+      device: (id) => {
+        if (id === undefined) return {}
+        const name = devices.nameOf(id)
+        return name === undefined ? { id } : deviceFacts.targetOf({ id, name })
+      },
+      run,
+      log: (line) => runFork(Effect.logWarning(line))
+    })
     hub = makeSessionHub({
       household: push.hooks,
-      targetDevice: deviceFacts.targetOf,
       onDeviceChange: deviceFacts.changed,
       speakerAllowed: deviceFacts.speakerAllowed,
       admin,
@@ -1437,10 +1476,11 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
         id: `core.household.projection.${moduleId}`,
         severity: "warning" as const,
         title: `Module ${moduleId}: what it shows on voice pages failed`,
-        detail: `${p.what}: ${p.message}`.slice(0, 1900)
+        // The projection's error is the module's own text: through the page boundary (P3), like its other words.
+        detail: host.pageText(moduleId, `${p.what}: ${p.message}`, 1900)
       })))
     reportFeed()
-    // Daily backups and change-log retention (never on a turn's path); a failing backup shows on the Health page.
+    // Daily backups and their retention (never on a turn's path); a failing backup shows on the Health page.
     if (household.sqlite !== undefined) {
       const sqlite = household.sqlite
       yield* Effect.forkScoped(runMaintenance(sqlite, {
@@ -1451,7 +1491,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
             severity: "warning",
             title: "The household backup failed",
             detail: problem.slice(0, 1900),
-            fix: { kind: "command", label: "Back up by hand", value: "pnpm start household backup" }
+            fix: { kind: "link", label: "About backups", value: "docs/STORING-DATA.md#backups" }
           }])
       }))
     }
@@ -1561,7 +1601,15 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       ...(options.modelCatalogNow !== undefined ? { now: options.modelCatalogNow } : {})
     })
     // P3: module HTTP routes under /api/modules/ (docs/UI-AND-MODULES.md §1.11), and their admin view in the API.
-    const moduleRouter = makeModuleRouter({ host, admin, tokens: routeTokens, services })
+    const moduleRouter = makeModuleRouter({
+      host,
+      issues: host.issues,
+      admin,
+      tokens: routeTokens,
+      services,
+      scheme: options.tls === undefined ? "http" : "https",
+      behindProxy: options.behindProxy === true
+    })
     const api = makeApi({
       moduleRoutes: moduleRouter,
       admin,
@@ -1652,7 +1700,8 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
             // `startIfStopped`: after waiting out a `busy` (a reload the owner sent meanwhile), the engines
             // that reload brought up must not be rebuilt.
             whenIdle("the engines", () => true, theEngine.startIfStopped),
-            Effect.andThen(syncModules(), reconcileModules),
+            // The host starts nothing before `startEnabled`, which is the first start of the modules here.
+            Effect.andThen(host.startEnabled, reconcileModules),
             syncResources()
           ], { concurrency: 3, discard: true })
         }))
@@ -1691,6 +1740,8 @@ export const ServeConfig = Config.all({
     Config.withDefault(""),
     Config.map((s) => s.split(",").map((h) => h.trim()).filter((h) => h.length > 0))
   ),
+  // A reverse proxy in front (docs/UI-AND-MODULES.md §1.11): then no module route caller counts as on the home network.
+  behindProxy: Config.Boolean("SERVE_BEHIND_PROXY").pipe(Config.withDefault(false)),
   // Off only to rule it out when the page fails to load on some browser (see the README).
   crossOriginIsolation: Config.Boolean("SERVE_CROSS_ORIGIN_ISOLATION").pipe(Config.withDefault(true)),
   tlsCert: Config.option(Config.String("SERVE_TLS_CERT")),

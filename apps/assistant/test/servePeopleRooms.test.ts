@@ -50,13 +50,15 @@ let storeRef: ModuleStore | undefined
 
 const Item = Schema.Struct({ text: Schema.String })
 const items = defineCollection({ name: "items", scope: "person", schema: Item, project: (row: Row<typeof Item.Type>) => ({ text: row.value.text }) })
+/** Rows of one conversation: erased when it ends (P4's `endConversation`). */
+const notes = defineCollection({ name: "notes", scope: "conversation", schema: Item })
 
 const probe = defineModule({
   apiVersion: 2,
   id: "probe",
   name: "Probe",
   description: "Reads the turn and the core's services",
-  storage: { collections: [items] },
+  storage: { collections: [items, notes] },
   shared: (ctx) =>
     Effect.sync(() => {
       hostRef = ctx.host
@@ -226,6 +228,18 @@ describe("people, rooms and device capabilities in serve mode", () => {
     expect(t1.diet).toEqual({ allergies: ["nuts"], diets: ["vegetarian"], dislikes: [] })
     expect(t1.reveal).toEqual({ sam: true, robin: false })
     expect(t1.screens).toBe(1)
+    // Merged P1/P4: the gateway's principal check (`principalProblem`) admits a turn's person only when it is in
+    // Members and the device's default person.
+    const host = server.handle.host
+    const where = (host.snapshot().assistantParts.get("alpha") ?? []).find((p) => p.moduleId === "probe")!.module.tools!.find((t) => t.name === "where")!
+    const asPerson = async (person: NonNullable<TurnContext["person"]>) => {
+      const principal = { _tag: "turn", turn: { turnId: 99, conversationId: "c", source: "text", assistantId: "alpha", deviceId: "kitchen-tab-1", person } } as const
+      const exit = await Effect.runPromise(Effect.exit(host.gateway.tool("probe", where, {}, { principal })))
+      return exit._tag === "Success" ? "ran" : String((exit.cause as { readonly reasons?: ReadonlyArray<{ readonly error?: { readonly message?: string } }> }).reasons?.[0]?.error?.message ?? "failed")
+    }
+    expect(await asPerson({ id: samId, how: "device-default" })).toBe("ran")
+    expect(await asPerson({ id: robinId, how: "chosen" })).toBe('Not run: the person is not the default person of the device "kitchen-tab-1".')
+    expect(await asPerson({ id: "p-nobody00", how: "chosen" })).toBe("Not run: the person is not in Members.")
     // The device line is per-turn context, never part of the cached system prompt.
     const context = requests.at(-2)!.context ?? ""
     expect(context).toContain("## This device\nDevice: \"Test browser\" (tablet-size screen, touch, speaker (speech and sound), microphone; room \"Kitchen\"; shared, usually \"Sam\"). Other screens: none.")
@@ -289,15 +303,23 @@ describe("people, rooms and device capabilities in serve mode", () => {
     clients.push(page)
     await page.hello()
     const texts = (m: ServerMessageOf<"household.snapshot">) => m.collections.flatMap((c) => c.rows.map((r) => (r.value as { text: string }).text)).sort()
+    // Merged P4: a snapshot comes in parts (one per step of the page's queue, a person's rows in a part of their own),
+    // so its rows are those of every part from part 0 to the final one.
+    const snapshotTexts = async (client: ScriptedClient, from = 0) => {
+      const final = await client.waitFor("household.snapshot", (m) => m.final, { from })
+      const parts = client.messages.slice(from).filter((m): m is ServerMessageOf<"household.snapshot"> => m.type === "household.snapshot")
+      const upTo = parts.slice(0, parts.indexOf(final) + 1)
+      return upTo.slice(upTo.map((p) => p.part).lastIndexOf(0)).flatMap(texts).sort()
+    }
     // Shared and nobody's (the built-in): neither list.
-    expect(texts(await page.waitFor("household.snapshot"))).toEqual([])
+    expect((await snapshotTexts(page))).toEqual([])
     await until("the device record", () => lastDevices(admin).some((d) => d.id === "kitchen-tab-2"))
     const rev = () => lastDevices(admin).find((d) => d.id === "kitchen-tab-2")?.rev ?? 0
     const place = { room: "Kitchen", privacy: "shared" as const, alwaysOn: false, acceptsFromOthers: true, quietRoom: false, defaultPerson: samId! }
     expect((await request(admin, { type: "device.save", target: { kind: "device", id: "kitchen-tab-2" }, rev: rev(), settings: { place } })).ok).toBe(true)
     // A new default person ends the page's session: its successor's first snapshot is of the new place.
     page = await reconnect(page, undefined)
-    expect(texts(await page.waitFor("household.snapshot"))).toEqual(["Sam's list"])
+    expect((await snapshotTexts(page))).toEqual(["Sam's list"])
     let from = page.messages.length
     // Live: Robin's new row does not reach Sam's kitchen; Sam's does.
     from = page.messages.length
@@ -308,15 +330,15 @@ describe("people, rooms and device capabilities in serve mode", () => {
     // Private: both (a change of privacy ends the session too).
     expect((await request(admin, { type: "device.save", target: { kind: "device", id: "kitchen-tab-2" }, rev: rev(), settings: { place: { ...place, privacy: "private" } } })).ok).toBe(true)
     page = await reconnect(page, undefined)
-    expect(texts(await page.waitFor("household.snapshot"))).toEqual(["Robin's list", "Robin's second", "Sam's list", "Sam's second"])
+    expect((await snapshotTexts(page))).toEqual(["Robin's list", "Robin's second", "Sam's list", "Sam's second"])
     // Public: none.
     expect((await request(admin, { type: "device.save", target: { kind: "device", id: "kitchen-tab-2" }, rev: rev(), settings: { place: { ...place, privacy: "public" } } })).ok).toBe(true)
     page = await reconnect(page, undefined)
-    expect(texts(await page.waitFor("household.snapshot"))).toEqual([])
+    expect((await snapshotTexts(page))).toEqual([])
     // Only the room: the same page goes on, with a fresh snapshot of the new place.
     from = page.messages.length
     expect((await request(admin, { type: "device.save", target: { kind: "device", id: "kitchen-tab-2" }, rev: rev(), settings: { place: { ...place, privacy: "public", room: "Den" } } })).ok).toBe(true)
-    expect(texts(await page.waitFor("household.snapshot", () => true, { from }))).toEqual([])
+    expect((await snapshotTexts(page, from))).toEqual([])
   })
 })
 
@@ -364,6 +386,31 @@ const typedOn = async (page: ScriptedClient, text: string, speak = false) => {
 }
 
 describe("review round 2: a change of what a device may be told or sent ends its session", () => {
+  // Merged P4: ending the session ends its conversation in the household store (conversation-scoped rows erased) by
+  // the same path as any other end of a session, and the successor's conversation is left alone.
+  it("the ended session's conversation rows are erased; the successor's stay", async () => {
+    const { admin, samId } = await boot()
+    let page = await pageOn("kitchen-cv-01")
+    expect((await saveDevice(admin, "kitchen-cv-01", { place: placeOf(samId) })).ok).toBe(true)
+    page = await reconnect(page)
+    await typedOn(page, "remember this")
+    const first = (await historyOf(page)).id
+    await until("the probe's store", () => storeRef !== undefined)
+    const rowsOf = (id: string) => Effect.runPromise(storeRef!.collection(notes).list({ scope: { kind: "conversation", id }, limit: 10 }))
+    await Effect.runPromise(storeRef!.collection(notes).insert({ text: "first" }, { scope: { kind: "conversation", id: first } }))
+    expect(await rowsOf(first)).toHaveLength(1)
+    expect((await saveDevice(admin, "kitchen-cv-01", { place: placeOf(samId, "private") })).ok).toBe(true)
+    page = await reconnect(page)
+    await typedOn(page, "and again")
+    const second = (await historyOf(page)).id
+    expect(second).not.toBe(first)
+    await Effect.runPromise(storeRef!.collection(notes).insert({ text: "second" }, { scope: { kind: "conversation", id: second } }))
+    for (let i = 0; i < 200 && (await rowsOf(first)).length > 0; i++) await sleep(10)
+    expect(await rowsOf(first)).toEqual([])
+    await sleep(300)
+    expect((await rowsOf(second)).map((r) => r.value.text)).toEqual(["second"])
+  })
+
   it("privacy, default person and output overrides close the page with settingsChanged; its successor has a new conversation; a room alone does not", async () => {
     const { admin, samId, robinId } = await boot()
     let page = await pageOn("kitchen-hb-01")

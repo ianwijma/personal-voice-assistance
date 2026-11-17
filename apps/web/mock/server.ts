@@ -143,11 +143,12 @@ import {
 import { exampleEngineStatus, exampleHealth, exampleSnapshot, exampleUnavailableModule, exampleVoiceSection, exampleWeatherModule } from "@pva/protocol/examples"
 import { type WebSocket, WebSocketServer } from "ws"
 import { createAssistantsMock, SAM_ID } from "./assistants.ts"
+import { fieldValueError } from "./fieldChecks.ts"
 import { seedTraces } from "./traces.ts"
 import { createVoiceAssistants, scenarioSettings, scriptedTurn } from "./voiceAssistants.ts"
 import { encodeWav, MOCK_PROVIDERS } from "./voices.ts"
 import { createModelPickersMock } from "./modelPickers.ts"
-import { createModuleRoutesMock, demoHomeAction, demoHomeModule } from "./demoHome.ts"
+import { createModuleRoutesMock, demoHomeAction, demoHomeModule, TokenRefusal } from "./demoHome.ts"
 import { boundaryKey, checkDietList, checkMembersValue, cleanDeviceName, type Condition, type FieldError, speakerAllowedFrom } from "@pva/protocol"
 
 const PORT = Number(process.env.MOCK_PORT ?? 8787)
@@ -560,7 +561,7 @@ const initialSections = (): Array<SettingsSection> => [
     form: {
       fields: [
         { type: "text", key: "HOME_LOCATION", label: "Location", description: "Town and country, e.g. \"Amsterdam, Netherlands\". Every assistant is told; the weather uses it when you name no place.", apply: "live", default: "", placeholder: "Amsterdam, Netherlands", maxLength: 200, source: "default" },
-        { type: "text", key: "HOME_TIME_ZONE", label: "Time zone", description: "IANA name, e.g. Europe/Amsterdam. Empty: this machine's zone.", apply: "live", default: "", placeholder: "Europe/Amsterdam", maxLength: 64, source: "default" },
+        { type: "text", key: "HOME_TIME_ZONE", label: "Time zone", description: "IANA name, e.g. Europe/Amsterdam (not an offset such as +01:00). Empty: this machine's zone.", apply: "live", default: "", placeholder: "Europe/Amsterdam", maxLength: 64, source: "default" },
         {
           type: "choice",
           key: "HOME_LANGUAGE",
@@ -590,9 +591,21 @@ const initialSections = (): Array<SettingsSection> => [
           default: "en-GB",
           options: [{ value: "en-GB", label: "13 November 2026" }, { value: "en-US", label: "November 13, 2026" }, { value: "nl-NL", label: "13 november 2026" }],
           source: "default"
-        }
+        },
+        { type: "text", key: "HOME_CURRENCY", label: "Currency", description: "Three-letter code of the household's money, e.g. EUR, USD, GBP (any three capital letters are accepted; use the ISO 4217 code). The default of modules that handle prices.", apply: "live", default: "EUR", placeholder: "EUR", maxLength: 3, source: "default" },
+        {
+          type: "choice",
+          key: "HOME_CUP_SIZE",
+          label: "Cup size",
+          description: "How big \"a cup\" is in recipes and shopping lists.",
+          apply: "live",
+          default: "metric",
+          options: [{ value: "metric", label: "Metric cup (250 ml)" }, { value: "us", label: "US cup (236.6 ml)" }],
+          source: "default"
+        },
+        { type: "text", key: "HOME_API_CONTACT", label: "API contact", description: "An email address or web address put in the User-Agent of requests to public web services that ask who is calling. Empty: none is sent.", apply: "live", default: "", placeholder: "you@example.com", maxLength: 200, source: "default" }
       ],
-      values: { HOME_LOCATION: "", HOME_TIME_ZONE: "", HOME_LANGUAGE: "en-GB", HOME_UNITS: "metric", HOME_DATE_FORMAT: "en-GB" },
+      values: { HOME_LOCATION: "", HOME_TIME_ZONE: "", HOME_LANGUAGE: "en-GB", HOME_UNITS: "metric", HOME_DATE_FORMAT: "en-GB", HOME_CURRENCY: "EUR", HOME_CUP_SIZE: "metric", HOME_API_CONTACT: "" },
       secrets: {},
       errors: []
     },
@@ -943,7 +956,8 @@ let connSeq = 0
 const voiceSessions = new Map<string, VSession>()
 let conversationSeq = 0
 let modules = initialModules()
-const moduleRoutesMock = createModuleRoutesMock()
+// Reads the mock's vault each time (declared below): locked, tokens are neither listed nor changed.
+const moduleRoutesMock = createModuleRoutesMock(() => vault.state === "locked")
 /** Protocol 7: assistants, device types and the devices' own sections (mock/assistants.ts). */
 const assistantsMock = createAssistantsMock({
   modules: () => modules,
@@ -1392,6 +1406,7 @@ const resetState = () => {
   voiceSessions.clear()
   lastSessions = ""
   modules = initialModules()
+  moduleRoutesMock.reset()
   forcedErrors.clear()
   models = initialModels()
   sections = withWarnings(initialSections())
@@ -1997,6 +2012,7 @@ const validate = (form: SettingsForm, patch: SettingsPatch) => {
     const field = form.fields.find((f) => f.key === k)
     if (field === undefined) errors.push({ key: null, message: `Unknown setting ${k}.` })
     else if (field.locked !== undefined) errors.push({ key: k, message: `${field.locked.reason}; change it there.` })
+    else if (fieldValueError(field, v) !== undefined) errors.push({ key: k, message: fieldValueError(field, v)! })
     else if (field.type === "number" && typeof v === "number" && ((field.min !== undefined && v < field.min) || (field.max !== undefined && v > field.max))) {
       errors.push({ key: k, message: `Must be between ${field.min} and ${field.max}.` })
     } else if (k === "defaultPlace" && typeof v === "string" && /atlantis/i.test(v)) errors.push({ key: k, message: "Open-Meteo does not know this place." })
@@ -2374,12 +2390,15 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
     }
     case "health.check": {
       if (requireAdmin(c, m.requestId)) return
+      // As the server: answered once it has started; the outcome follows as `health`. A check already running is
+      // joined, not started again (one completion for any number of requests).
+      result(c, m.requestId, true)
+      if (health.checking) return
       health = { ...health, checking: true }
       broadcast({ type: "health", health })
       after(1000, () => {
-        health = { issues: health.issues.filter((i) => i.id !== "core.clock"), checkedAt: Date.now(), checking: false }
+        health = { issues: health.issues.filter((i) => i.id !== "music.speaker.kitchen"), checkedAt: Date.now(), checking: false }
         broadcast({ type: "health", health })
-        result(c, m.requestId, true)
       })
       return
     }
@@ -2888,6 +2907,15 @@ const apiRoute = async (req: IncomingMessage, res: ServerResponse, path: string,
       throw new ApiFail(400, "invalid_request", "The request body is not valid JSON")
     }
   }
+  /** A refused token operation, answered as the real server does (status and code). */
+  const refusedAs = <A>(f: () => A): A => {
+    try {
+      return f()
+    } catch (error) {
+      if (error instanceof TokenRefusal) throw new ApiFail(error.status, error.code, error.message)
+      throw error
+    }
+  }
   // Protocol 10: the admin view of module routes and their tokens (as the real server's /api/module-routes).
   const routesMatch = /^module-routes(?:\/([a-z][a-z0-9-]{0,39})\/tokens(?:\/([a-f0-9]{8,32}))?)?$/.exec(path)
   if (routesMatch !== null) {
@@ -2897,16 +2925,20 @@ const apiRoute = async (req: IncomingMessage, res: ServerResponse, path: string,
       const id = query.get("module")
       return { status: 200, body: moduleRoutesMock.view(modules.filter((x) => id === null || x.id === id)) }
     }
+    // As the server: tokens only for an installed module (running or not).
+    if (!modules.some((x) => x.id === moduleId)) throw new ApiFail(404, "not_found", `There is no module "${moduleId}"`)
     if (tokenId === undefined) {
       only("POST")
       const b = await body()
       if (typeof b.name !== "string" || !/^[a-z][a-z0-9-]{0,31}$/.test(b.name) || typeof b.label !== "string" || b.label.trim() === "") {
         throw new ApiFail(400, "invalid_request", "A token needs a name and a label")
       }
-      return { status: 201, body: moduleRoutesMock.mint(moduleId, b.name, b.label.trim()) }
+      const name = b.name
+      const label = b.label
+      return { status: 201, body: refusedAs(() => moduleRoutesMock.mint(moduleId, name, label)) }
     }
     only("DELETE")
-    if (!moduleRoutesMock.revoke(moduleId, tokenId)) throw new ApiFail(404, "not_found", "There is no such token (it may have been revoked already)")
+    if (!refusedAs(() => moduleRoutesMock.revoke(moduleId, tokenId))) throw new ApiFail(404, "not_found", "There is no such token (it may have been revoked already)")
     return { status: 200, body: { revoked: true } }
   }
   if (path === "voice-providers") {

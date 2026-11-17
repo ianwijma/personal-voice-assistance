@@ -145,7 +145,15 @@ export const exampleHealth: HealthInfo = {
       detail: "Music needs it: Resolves stream URLs.",
       fix: { kind: "command", label: "Install yt-dlp", value: "sudo apt install yt-dlp" }
     },
-    { id: "core.clock", severity: "warning", title: "The clock is not synchronised", detail: "Timers and alarms may fire at the wrong time.", fix: { kind: "command", label: "Turn on time synchronisation", value: "sudo timedatectl set-ntp true" } }
+    {
+      id: "music.speaker.kitchen",
+      module: "music",
+      device: "d-kitchen-0001",
+      severity: "warning",
+      title: "The speaker did not answer",
+      detail: "Music could not reach it at the last check.",
+      fix: { kind: "link", label: "Open Music", value: "#settings/shared/modules/music" }
+    }
   ],
   checkedAt: 1_763_100_000_000,
   checking: false
@@ -724,9 +732,9 @@ export const serverExamples: { readonly [T in ServerMessageType]: Extract<Server
     collections: [{
       module: "timers",
       collection: "timers",
-      rows: [{ id: "t1", rev: 40, scope: { kind: "household" }, value: { label: "pasta", dueAt: 1_763_100_600_000 }, updatedAt: 1_763_100_000_000 }],
-      truncated: false
-    }]
+      rows: [{ id: "t1", rev: 40, scope: { kind: "household" }, value: { label: "pasta", dueAt: 1_763_100_600_000 }, updatedAt: 1_763_100_000_000 }]
+    }],
+    truncated: [{ module: "shopping", collection: "items" }]
   },
   "household.event": {
     type: "household.event",
@@ -739,6 +747,7 @@ export const serverExamples: { readonly [T in ServerMessageType]: Extract<Server
       data: { collection: "timers", id: "t1", op: "put", rev: 43, value: { label: "pasta", dueAt: 1_763_100_900_000 } }
     }
   },
+  "household.gap": { type: "household.gap", reason: "overflow" },
   ...assistantsServerExamples
 }
 

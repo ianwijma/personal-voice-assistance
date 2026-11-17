@@ -1,5 +1,5 @@
 import type { AudioClientLink } from "@pva/audio-web"
-import type { HostDeviceView, HostResult, ModuleHost, TargetDevice } from "@pva/core"
+import { type ConnectionRef, type HostDeviceView, type HostResult, makeConnectionRef, type ModuleHost } from "@pva/core"
 import {
   type AdminSnapshot,
   type AdminState,
@@ -131,6 +131,12 @@ export interface SessionHub {
   ) => void
   /** The known devices with their open connections now, most recently seen first (`ModuleHostApi.view().devices`). */
   readonly deviceViews: () => ReadonlyArray<HostDeviceView>
+  /** The connection that owns a session's audio now (a voice turn's `CurrentTurn.connection`). */
+  readonly audioOwnerOf: (sessionKey: string) => ConnectionRef | undefined
+  /** The device a connection said hello as (its id), while it is open; `undefined` otherwise. */
+  readonly deviceOfConnection: (ref: ConnectionRef) => string | undefined
+  /** A connection of this device is open now (it said hello; its record may not be saved yet). */
+  readonly deviceConnected: (deviceId: string) => boolean
   /** The open voice connections, for household pushes (`HouseholdPush.ts`). */
   readonly voiceConnections: () => ReadonlyArray<VoiceConnection>
   /** P5: whether a device is connected now, whether one of its tabs is visible, and when it was last used. */
@@ -147,13 +153,14 @@ export interface SessionHub {
 }
 
 /**
- * A voice connection as the household push sees it: its device and a send that checks it is still open. `device` is
- * read when used: P5 keeps it current with the device's place (its room; privacy and default person are fixed for the
- * connection's life, since a change of either ends it).
+ * A voice connection as the household push sees it: the device id it claimed in `hello` (not authenticated: §2 rows 5
+ * and 7 of docs/MODULES-PLAN.md) and a send that checks it is still open. What the device is called is the server's
+ * record of it, looked up by the push (`makeHouseholdPush({ device })`), never what the page said; P5: so are its
+ * room, privacy and default person (`DeviceFacts.targetOf`).
  */
 export interface VoiceConnection {
   readonly id: string
-  readonly device: TargetDevice
+  readonly deviceId: string | undefined
   readonly send: (message: ServerMessage) => void
 }
 
@@ -163,14 +170,11 @@ export interface HouseholdHooks {
   readonly connected: (connection: VoiceConnection) => void
   /** That connection closed: stop sending to it. */
   readonly closed: (connection: VoiceConnection) => void
+  /** A device's record may have changed (a save, a newly recorded device): pages whose device record changed get a fresh snapshot. */
+  readonly devicesChanged: () => void
   /** A device's first connection opened / its last one closed (`host.device.connected` / `.disconnected`). */
   readonly deviceConnected: (deviceId: string) => void
   readonly deviceDisconnected: (deviceId: string) => void
-  /**
-   * P5: the connection's device changed room (`device` is the new one): send it a fresh snapshot. A change of privacy
-   * or default person never comes here: it ends the device's session with its connections (`endSessions`).
-   */
-  readonly placeChanged?: (connection: VoiceConnection) => void
 }
 
 export interface HubOptions {
@@ -196,11 +200,6 @@ export interface HubOptions {
   readonly env?: EnvMover
   /** Household data for voice pages and device events (P4). Absent: none sent. */
   readonly household?: HouseholdHooks
-  /**
-   * P5: what the household feed sees of a voice connection's device (its room, privacy and default person). Absent:
-   * its id and name only.
-   */
-  readonly targetDevice?: (device: { readonly id: string; readonly name: string } | undefined) => TargetDevice
   /** P5: a device's connections, declaration or live state changed (the device facts rebuild their list). */
   readonly onDeviceChange?: () => void
   /**
@@ -246,6 +245,8 @@ export const ADMIN_ONLY: ReadonlySet<ServerMessageType> = new Set<ServerMessageT
 
 interface Client {
   readonly connection: HubConnection
+  /** This connection as a turn names it (`CurrentTurn.connection`, module API v2): opaque, one per connection. */
+  readonly ref: ConnectionRef
   helloed: boolean
   closed: boolean
   clientId: string | undefined
@@ -273,8 +274,6 @@ interface Client {
   wakeTestDevice: string | undefined
   /** This connection for household pushes (voice connections, after hello). */
   voice?: VoiceConnection
-  /** P5: the device as the household feed saw it last (JSON), to notice a change of place. */
-  lastTarget?: string
   /**
    * P5: the household feed follows this connection. A device the server has not recorded yet starts once its first
    * registration is written, so its first snapshot is of the place it has (not one of an unknown device, at once
@@ -573,26 +572,10 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
     deviceChanged()
     for (const session of sessions.all()) session.syncProfile()
     refreshSetups()
-    refreshTargets()
-  }
-
-  /**
-   * P5: the target device of every voice connection; one whose room changed gets a fresh snapshot (a change of
-   * privacy or default person ends the device's session instead: `endSessions`).
-   */
-  const targetOf = (client: Client): TargetDevice => {
-    const device = client.device
-    if (options.targetDevice !== undefined) return options.targetDevice(device === undefined ? undefined : { id: device.id, name: registry.nameOf(device.id) ?? device.name })
-    return device === undefined ? {} : { id: device.id, name: device.name }
-  }
-  const refreshTargets = () => {
-    for (const client of clients) {
-      if (!client.helloed || client.closed || client.voice === undefined || client.householdStarted !== true) continue
-      const text = JSON.stringify(targetOf(client))
-      if (text === client.lastTarget) continue
-      client.lastTarget = text
-      options.household?.placeChanged?.(client.voice)
-    }
+    // Pages whose device record changed (its name; P5: its room, or a person added to Members) get a fresh snapshot. A
+    // change of privacy or default person never needs one: it ends the device's session with its connections
+    // (`endSessions`), and the successor starts from its own snapshot.
+    options.household?.devicesChanged()
   }
 
   /** Send `device.setup` to every voice connection whose setup changed (never to admin connections: it is the voice page's). */
@@ -631,7 +614,6 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
   const startHousehold = (client: Client) => {
     if (client.voice === undefined || client.householdStarted === true || client.closed || options.household === undefined) return
     client.householdStarted = true
-    client.lastTarget = JSON.stringify(targetOf(client))
     options.household.connected(client.voice)
   }
 
@@ -933,10 +915,7 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
       const device = client.device
       client.voice = {
         id: client.connection.id,
-        // Read at each use: the device's place as it is now (P5).
-        get device() {
-          return targetOf(client)
-        },
+        deviceId: device?.id,
         send: (m) => send(client, m)
       }
       if (firstOfDevice) options.household.deviceConnected(device!.id)
@@ -1056,7 +1035,7 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
         const requestId = message.requestId
         return options.run(Effect.map(
           // P5: never spoken on a device that may not speak ("Don't use its speaker", or a declaration without one).
-          session.conversation.sendText(message.text, message.speak && isOwner(client) && speakerAllowed(client), message.assistantId),
+          session.conversation.sendText(message.text, message.speak && isOwner(client) && speakerAllowed(client), message.assistantId, client.ref),
           (outcome) =>
             result(
               client,
@@ -1203,8 +1182,11 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
         if (!allowed(client, message.requestId)) return
         const health = options.health
         if (health === undefined) return result(client, message.requestId, failure("internal", "Health checks are not available here"))
-        // The new registry reaches every admin page as `health` (the service's subscription).
-        return limited(client, message.requestId, Effect.as(health.check, { ok: true } as const))
+        // Answered as soon as it has started (a check can outlast the page's request timeout): this page gets
+        // `health` with `checking` first, then every admin page gets the outcome as `health` (the subscription).
+        health.begin()
+        send(client, { type: "health", health: health.info() })
+        return result(client, message.requestId, { ok: true })
       }
       case "vault.setup":
         if (!allowed(client, message.requestId)) return
@@ -1310,6 +1292,7 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
       }
       const client: Client = {
         connection,
+        ref: makeConnectionRef(connection.id),
         helloed: false,
         closed: false,
         clientId: undefined,
@@ -1389,6 +1372,15 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
     entitiesChanged: () => afterAssistantsChange({ ok: true }),
     deviceLive,
     voiceConnections: () => [...clients].flatMap((c) => (c.voice !== undefined && c.helloed && !c.closed ? [c.voice] : [])),
+    audioOwnerOf: (key) => owners.get(key)?.owner?.ref,
+    deviceConnected: (deviceId) => {
+      for (const client of clients) if (!client.closed && client.device?.id === deviceId) return true
+      return false
+    },
+    deviceOfConnection: (ref) => {
+      for (const client of clients) if (client.ref === ref) return client.closed ? undefined : client.device?.id
+      return undefined
+    },
     deviceViews: () =>
       [...registry.devices(live)].sort((a, b) => b.lastSeen - a.lastSeen).map((d) => ({ id: d.id, name: d.name, kind: d.kind, connections: d.connections })),
     wakeHeard: (key, text, phrase, accepted, source) => {

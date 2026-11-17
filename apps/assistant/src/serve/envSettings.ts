@@ -33,7 +33,8 @@ export const BOOTSTRAP_KEYS: ReadonlySet<string> = new Set([
   "SERVE_HOST",
   "SERVE_PORT",
   "SERVE_TLS_CERT",
-  "SERVE_TLS_KEY"
+  "SERVE_TLS_KEY",
+  "SERVE_BEHIND_PROXY"
 ])
 
 /** Benchmarks, tests and the command-line modes' audio (docs/SETTINGS-UI.md §1). */

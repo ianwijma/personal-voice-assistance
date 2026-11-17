@@ -50,7 +50,7 @@ export interface RouteTokenKeeper extends RouteTokenStore {
 }
 
 export const makeRouteTokens = (options: {
-  readonly store: Pick<SettingsStore, "secrets" | "saveRouteTokens">
+  readonly store: Pick<SettingsStore, "secrets" | "saveRouteTokens" | "blocked">
   /** The key vault exists and is locked. */
   readonly locked: () => boolean
   readonly now?: () => number
@@ -72,28 +72,44 @@ export const makeRouteTokens = (options: {
   })
   const lockedError = () => new RouteTokenError({ reason: "locked", message: "The key vault is locked: unlock it in Settings → Keys & access first" })
   const whenReadable = <A>(f: () => Effect.Effect<A, RouteTokenError>) => Effect.suspend(() => (options.locked() ? Effect.fail(lockedError()) : f()))
+  /** A change is refused while the settings are damaged (the store checks again inside its serialized save). */
+  const whenWritable = <A>(f: () => Effect.Effect<A, RouteTokenError>) =>
+    whenReadable(() => {
+      const blocked = options.store.blocked()
+      return blocked === undefined
+        ? f()
+        : Effect.fail(new RouteTokenError({ reason: "blocked", message: `Tokens cannot be changed until the settings are saved once: ${blocked}` }))
+    })
   const saveFailed = (e: { readonly message: string }) => new RouteTokenError({ reason: "failed", message: e.message })
 
   const forModule = (moduleId: string): RouteTokens => ({
     list: whenReadable(() => Effect.succeed(all().filter(([, t]) => t.moduleId === moduleId).map(([id, t]) => infoOf(id, t)))),
     mint: (name, label) =>
-      whenReadable(() => {
+      whenWritable(() => {
         const text = label.trim()
         if (!NAME.test(name)) return Effect.fail(new RouteTokenError({ reason: "invalid", message: `A token name must match ${NAME}` }))
         if (text.length === 0 || text.length > 80) return Effect.fail(new RouteTokenError({ reason: "invalid", message: "Say who the token is for, in 1 to 80 characters" }))
-        if (all().filter(([, t]) => t.moduleId === moduleId).length >= MAX_ROUTE_TOKENS_PER_MODULE) {
-          return Effect.fail(new RouteTokenError({ reason: "limit", message: `A module may hold at most ${MAX_ROUTE_TOKENS_PER_MODULE} tokens; revoke one first` }))
-        }
         const secret = randomBytes(32).toString("base64url")
         const id = randomBytes(6).toString("hex")
         const stored: Stored = { moduleId, name, label: text, hash: sha256(secret).toString("hex"), createdAt: now() }
-        return options.store.saveRouteTokens((committed) => ({ ...committed, [id]: JSON.stringify(stored) })).pipe(
+        // The limit is judged on the committed tokens inside the store's serialized save, so two mints at once cannot
+        // both take the last place.
+        let full = false
+        return options.store.saveRouteTokens((committed) => {
+          const held = Object.values(committed).filter((t) => parse(t)?.moduleId === moduleId).length
+          full = held >= MAX_ROUTE_TOKENS_PER_MODULE
+          return full ? committed : { ...committed, [id]: JSON.stringify(stored) }
+        }).pipe(
           Effect.mapError(saveFailed),
-          Effect.as({ token: infoOf(id, stored), secret })
+          Effect.flatMap(() =>
+            full
+              ? Effect.fail(new RouteTokenError({ reason: "limit", message: `A module may hold at most ${MAX_ROUTE_TOKENS_PER_MODULE} tokens; revoke one first` }))
+              : Effect.succeed({ token: infoOf(id, stored), secret })
+          )
         )
       }),
     revoke: (id) =>
-      whenReadable(() => {
+      whenWritable(() => {
         const found = all().some(([tid, t]) => tid === id && t.moduleId === moduleId)
         if (!found) return Effect.succeed(false)
         lastUsed.delete(id)

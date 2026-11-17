@@ -9,7 +9,7 @@ import { join } from "node:path"
 import { afterEach, describe, expect, it, vi } from "vitest"
 import { cliConfigProvider, explainMissingKey, loadCliSettings } from "../src/cliSettings.ts"
 import { commentOutKeys, makeEnvView, parseEnvFile, scanEnvAssignments } from "../src/envView.ts"
-import { makeEnvMover } from "../src/serve/envSettings.ts"
+import { envInfo, makeEnvCatalog, makeEnvMover } from "../src/serve/envSettings.ts"
 import { makeSections } from "../src/serve/sections.ts"
 import { loadSettingsStore } from "../src/serve/SettingsStore.ts"
 import { openVault } from "../src/serve/Vault.ts"
@@ -362,5 +362,22 @@ describe("CLI modes on the saved settings", () => {
     const { dir, vaultPath } = await withVault()
     const loaded = await quiet(loadCliSettings({ env: {}, dataDir: dir, vaultPath }))
     expect(loaded.settings.vaultState).toBe("locked")
+  })
+})
+
+describe("SERVE_BEHIND_PROXY (PR 90 review round 1)", () => {
+  it("is a start-up value: shown with where it is set (file and line, or the process), never movable", () => {
+    const view = makeEnvView({ processEnv: {}, files: [{ path: "/x/.env", text: "SERVE_PORT=1\nSERVE_BEHIND_PROXY=true\n" }] })
+    expect(envInfo(view, makeEnvCatalog([])).entries.find((e) => e.key === "SERVE_BEHIND_PROXY")).toEqual({
+      key: "SERVE_BEHIND_PROXY",
+      origin: "file",
+      file: "/x/.env",
+      line: 2,
+      kind: "bootstrap",
+      secret: false,
+      movable: false
+    })
+    const fromProcess = makeEnvView({ processEnv: { SERVE_BEHIND_PROXY: "1" }, files: [] })
+    expect(envInfo(fromProcess, makeEnvCatalog([])).entries.find((e) => e.key === "SERVE_BEHIND_PROXY")).toMatchObject({ origin: "process", kind: "bootstrap" })
   })
 })

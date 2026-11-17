@@ -10,12 +10,13 @@ import { type IsMember, isDeviceId, mayRevealTo } from "./Privacy.ts"
  * 2. A person-scoped row or event goes to a page only by the privacy rule (`mayRevealPersonScopeTo`, which calls
  *    `mayRevealTo`): a known device, an owner who is in Members now.
  * 3. The person scopes a snapshot reads (`personScopesFor`): the device's default person, then every member; the rule
- *    then decides. They share one collection's `SNAPSHOT_ROWS` (the
- *    `left` budget in `HouseholdFeed.snapshot`), so 24 people do not make 24 × 500 rows.
+ *    then decides. Each is a scope of its own under the snapshot's bounds (`SNAPSHOT_ROWS` per collection and scope,
+ *    `SNAPSHOT_READ_ROWS` and `SNAPSHOT_MAX_CHARS` in all), so 24 people do not make an unbounded snapshot.
  * 4. The triggers: a change of the device's privacy or default person, or a person leaving Members, ends the device's
  *    session with its connections (`SessionHub.endSessions`, at the commit): its pages start again from a new
- *    snapshot. A change of its room, or a person added, gives its pages a fresh snapshot (`HouseholdHooks.placeChanged`
- *    and `resync` in `HouseholdPush.ts`, called by `SessionHub.refreshTargets` and serve mode's Members listener).
+ *    snapshot. A change of its room, or a person added, gives its pages a fresh snapshot (the device record changed:
+ *    `HouseholdHooks.devicesChanged` from `SessionHub.refreshDevices`; `resync` from serve mode's Members listener;
+ *    both `HouseholdPage.refresh` in `HouseholdPush.ts`).
  */
 
 /** Members now, read at each call (`people`: the household's person ids). Absent or failing: nobody. */

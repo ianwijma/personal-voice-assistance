@@ -9,7 +9,7 @@ import type {
   ToolRisk,
   ToolSensitivity
 } from "@pva/protocol"
-import type { Effect } from "effect"
+import { type Effect, Schema } from "effect"
 import type { ActionParam } from "./Actions.ts"
 import type { ModuleEvents } from "./EventBus.ts"
 import type { ModuleStore } from "./HouseholdStore.ts"
@@ -44,37 +44,29 @@ export type ModuleApiVersion = (typeof MODULE_API.supports)[number]
 // ---------------------------------------------------------------------------------------------------------------------
 // Requirements (§C.3)
 
-/** Where a required program must run. Only `server` is judged in this version; the device places are not checked yet. */
-export type RequirementPlace = "server" | "playback-device" | "listening-device"
-
 /**
- * Something a module needs outside the process, declared on the manifest and judged before `start` (never on a turn).
- * A required (`optional` not true) requirement that is missing makes the module `unavailable`; a missing optional one
- * is a warning on the Health page.
+ * Something a module needs outside the process, declared on the manifest and judged before it starts (never on a
+ * turn). A required (`optional` not true) requirement that is missing makes the module `unavailable`; a missing
+ * optional one is a warning on the Health page. Two kinds, both on the server:
  *
- * - `tool`: a program, by its id in the app's tool registry (`apps/assistant/src/requirements.ts`: how to probe it,
- *   which package installs it). `version` is a range on its reported version (`>=0.35`, `^6`, `>=5 <8`). An id the
- *   registry does not know is probed with `<id> --version`.
+ * - `tool`: a program, by its id in the app's program registry (`apps/assistant/src/requirements.ts`: how to probe it,
+ *   which package installs it; the registry starts empty, and the PR of the first module that needs a program adds its
+ *   entry). `version` is a semver range on the version the probe reads (`>=0.35`, `^6`, `>=5 <8`); a version that is
+ *   not strict semver counts as unknown, and unknown does not satisfy a range. A program the registry does not know
+ *   is missing.
  * - `network`: access to the LAN or the internet. Not probed in this version (shown as not checked).
- * - `memoryMb` / `diskMb`: total memory, and free space in the data directory.
- * - `gpu`: a CUDA or Vulkan device (probed through `nvidia-smi` / `vulkaninfo`).
+ *
+ * Requirements on a device, on memory, on disk or on a GPU are not part of this version.
  */
 export type Requirement =
   | {
     readonly tool: string
-    /** Default `server`. */
-    readonly where?: RequirementPlace
     readonly version?: string
     readonly optional?: boolean
-    /** A managed copy the server could install (§C.6; not offered yet). */
-    readonly managed?: string
     /** Why the module needs it, one sentence: "Resolves stream URLs". */
     readonly why: string
   }
   | { readonly network: "lan" | "internet"; readonly optional?: boolean; readonly why?: string }
-  | { readonly memoryMb: number; readonly optional?: boolean; readonly why?: string }
-  | { readonly diskMb: number; readonly optional?: boolean; readonly why?: string }
-  | { readonly gpu: "cuda" | "vulkan"; readonly optional?: boolean; readonly why?: string }
 
 /** The operating systems and processor architectures a module runs on (`process.platform`, `process.arch` names). */
 export interface Platforms {
@@ -85,9 +77,9 @@ export interface Platforms {
 /** How one requirement stands on this server, from the app's probes (cached; judged at start and on "Check again"). */
 export interface RequirementStatus {
   readonly requirement: Requirement
-  /** `unchecked`: not judged here (a network, a program on a device); never makes a module unavailable. */
+  /** `unchecked`: not judged here (a network); never makes a module unavailable. */
   readonly state: "met" | "missing" | "unchecked"
-  /** One line: "ffmpeg 6.1", "yt-dlp is missing", "ffmpeg 4.4 is older than >=5". */
+  /** One line: "ffmpeg 6.1.0", "yt-dlp is missing", "ffmpeg 4.4.0 is older than >=5". */
   readonly detail: string
   readonly fix?: IssueFix
 }
@@ -95,24 +87,22 @@ export interface RequirementStatus {
 /** The app's judgement of a module's requirements: synchronous, from the probe cache. */
 export type RequirementCheck = (requirements: ReadonlyArray<Requirement>) => ReadonlyArray<RequirementStatus>
 
-/** The requirement's subject in a few words: "ffmpeg", "internet access", "4096 MB of memory". */
+/** The requirement's subject in a few words: "ffmpeg", "internet access". */
 export const describeRequirement = (r: Requirement): string =>
-  "tool" in r ? r.tool
-  : "network" in r ? (r.network === "internet" ? "internet access" : "access to the local network")
-  : "memoryMb" in r ? `${r.memoryMb} MB of memory`
-  : "diskMb" in r ? `${r.diskMb} MB of free disk space`
-  : r.gpu === "cuda" ? "a CUDA graphics card" : "a Vulkan graphics device"
+  "tool" in r ? r.tool : r.network === "internet" ? "internet access" : "access to the local network"
 
-/** A short key for a requirement, used in issue ids ("yt-dlp", "network-internet", "memory"). */
-export const requirementKey = (r: Requirement): string =>
-  "tool" in r ? r.tool : "network" in r ? `network-${r.network}` : "memoryMb" in r ? "memory" : "diskMb" in r ? "disk" : `gpu-${r.gpu}`
+/** A short key for a requirement, used in issue ids ("yt-dlp", "network-internet"). */
+export const requirementKey = (r: Requirement): string => ("tool" in r ? r.tool : `network-${r.network}`)
 
 export const isOptionalRequirement = (r: Requirement): boolean => r.optional === true
 
 // ---------------------------------------------------------------------------------------------------------------------
 // Health (§C.5)
 
-/** What a module's `health()` receives: its shared settings (`undefined` when they are not valid) and whether it runs. */
+/**
+ * What a module's `health()` receives: its shared settings (`undefined` when they are not valid) and whether it runs:
+ * an instance runs, or its `shared` part runs (a module demanded only through another module's `uses`).
+ */
 export interface HealthContext<A> {
   readonly settings: A | undefined
   readonly running: boolean
@@ -139,6 +129,23 @@ export interface ModuleTemplate {
   readonly handles?: string
   readonly modules?: ReadonlyArray<string>
   readonly suggestedPhrases?: ReadonlyArray<string>
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Declared actions (§C.4)
+
+/**
+ * An action a module offers, declared on the manifest (`ModuleDefinition.declaredActions`) so it stays known while the
+ * module is `unavailable` (never started): the intent agent can still recognise "play jazz" as the music module's,
+ * and core answers with the module's "not set up" line instead of running some other action. Only what a decision
+ * model needs to recognise it; the running module's own actions (from `start`) are what runs. `id` is the action's
+ * id (`/^[a-z][a-z0-9_]{0,39}$/`).
+ */
+export interface DeclaredAction {
+  readonly id: string
+  readonly label: string
+  readonly description: string
+  readonly examples?: ReadonlyArray<string>
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -277,6 +284,8 @@ export interface CatalogAction {
   readonly confirm: boolean
   /** The declared or inferred class; `undefined` when it depends on the values. */
   readonly risk: ToolRisk | undefined
+  /** Every class a run can have (`[risk]`, or the declared list when it depends on the values). */
+  readonly risks: ReadonlyArray<ToolRisk>
   readonly sensitivity: ToolSensitivity
   readonly latency: ToolLatency
 }
@@ -285,8 +294,20 @@ export type ActionRunResult =
   | { readonly ok: true; readonly say?: string }
   | {
     readonly ok: false
-    /** `refused`: the execution gateway did not admit it (the module or the action is off for the assistant, or a later policy). */
-    readonly code: "unknown_module" | "not_running" | "unknown_action" | "invalid_params" | "needs_confirmation" | "refused" | "failed"
+    /**
+     * `refused`: the execution gateway did not admit it (the module or the action is off for the assistant, no turn or
+     * job to run for, or a later policy). `unavailable`: the module cannot run on this server; `message` is its
+     * "not set up" line.
+     */
+    readonly code:
+      | "unknown_module"
+      | "not_running"
+      | "unavailable"
+      | "unknown_action"
+      | "invalid_params"
+      | "needs_confirmation"
+      | "refused"
+      | "failed"
     readonly message: string
   }
 
@@ -303,55 +324,105 @@ export interface ActionRunRequest {
 }
 
 /**
+ * A host object kept by module code after its part's scope closed: every member answers with this, as a defect (an
+ * effect dies with it, a synchronous member throws it), so the members' types stay what they are while the module
+ * runs. `isModuleStopped` recognises it.
+ */
+export class ModuleStopped extends Schema.TaggedError<ModuleStopped>()("ModuleStopped", { message: Schema.String }) {}
+
+export const isModuleStopped = (u: unknown): u is ModuleStopped => u instanceof ModuleStopped
+
+/** The turn's action catalogue (`ModuleHostApi.actions`). */
+export interface ActionCatalogue {
+  readonly list: Effect.Effect<ReadonlyArray<CatalogAction>>
+  /**
+   * Run one action of the turn's catalogue through the execution gateway (routines). Every refusal and failure is a
+   * result. The action's 5 s limit applies; the caller's `CurrentTurn` is the action's. An action that needs
+   * confirmation is refused (`needs_confirmation`): the gateway refuses it on every path while confirmation is off.
+   */
+  readonly run: (request: ActionRunRequest) => Effect.Effect<ActionRunResult>
+}
+
+/**
  * The host as a version 2 module sees it (`ModuleServicesV2.host`, in `shared` and in `start`). Every lookup is live.
+ * Once the part's scope has closed (the module stopped), every member answers with `ModuleStopped`: an effect dies
+ * with it, a synchronous member throws it.
  */
 export interface ModuleHostApi {
   /** P3: this module's route tokens (`ModuleRoutes.ts`), in the key vault. Fails `unavailable` outside serve mode. */
   readonly routeTokens: RouteTokens
   /** A read-only snapshot of the assistant: module states, vault, engines, devices, Home values. */
   readonly view: () => HostView
-  /** The service under `key` from a demanded module's `shared` part, or `undefined` while none provides it. */
-  readonly service: <T>(key: ServiceKey<T>) => T | undefined
-  /** Every value contributed under `key` by the demanded modules' `shared` parts now, in catalog order. */
-  readonly contributions: <T>(key: ContributionKey<T>) => ReadonlyArray<T>
   /**
-   * The turn's action catalogue (`CurrentTurn`): the actions of the modules the calling assistant has on, from the
-   * instance it uses, without those it switched off. Outside a turn (or a turn without an assistant): the actions of
-   * every running module.
+   * The service under `key` from a demanded module's `shared` part, or `undefined` while none is published (a
+   * provider starts and stops on its own; look it up at each use, never keep it).
    */
-  readonly actions: {
-    readonly list: Effect.Effect<ReadonlyArray<CatalogAction>>
-    /**
-     * Run one action of the turn's catalogue through the execution gateway (routines). Never fails: every refusal and
-     * failure is a result. The action's 5 s limit applies; the caller's `CurrentTurn` is the action's. An action that
-     * needs confirmation is refused.
-     */
-    readonly run: (request: ActionRunRequest) => Effect.Effect<ActionRunResult>
-  }
+  readonly service: <T>(key: ServiceKey<T>) => T | undefined
   /**
-   * Ask the host to start this module's instances again with the same settings (from `start`: that instance; from
-   * `shared`: every instance), so a tool list that changed at run time (an MCP server's) applies from the next turn.
-   * The new instance is published once it has started; the old one serves until then and keeps its grace period.
-   * If the new start fails, the old instance keeps serving and the Health page says why. Returns at once; repeated
-   * calls before the restart starts count once.
+   * Every value contributed under `key` by the published shared parts now, in catalog order; for a caller acting for
+   * an assistant (the calling fiber's `CurrentTurn`, or a job made for an assistant) only those of the modules that
+   * assistant has on. Effectful, so the caller is read from the fiber's own context, which survives every `yield*`
+   * (an `await` inside native code does not carry a fiber: capture the assistant first and use `contributionsFor`).
+   */
+  readonly contributions: <T>(key: ContributionKey<T>) => Effect.Effect<ReadonlyArray<T>>
+  /**
+   * The same for an assistant named explicitly; `undefined` asks deliberately for every provider's (shared code
+   * acting for nobody in particular). Synchronous, for native callbacks.
+   */
+  readonly contributionsFor: <T>(key: ContributionKey<T>, assistantId: string | undefined) => ReadonlyArray<T>
+  /**
+   * The turn's action catalogue: the actions of the modules the calling assistant has on (`CurrentTurn`, or a job
+   * made for an assistant), from the instance it uses, without those it switched off; an unavailable module's
+   * declared actions are listed too (running one answers with its "not set up" line). The local principal of the
+   * CLI modes sees every running module's actions; in serve mode a caller with no turn or job sees none.
+   */
+  readonly actions: ActionCatalogue
+  /**
+   * Ask the host to stop this module and start it again (a tool list that changed at run time, an MCP server's, then
+   * applies from the next turn). Returns at once; the module's worker stops it (its tools are withdrawn, calls in
+   * flight get the grace period) and starts it again, at most once every 5 s: requests in between are merged into
+   * the next restart, and one made after the last restart began always leads to another. From `shared` or `start`,
+   * it applies once the module is published; from a part that was stopped since, it is ignored. The new start runs
+   * outside any turn: it never sees the caller's `CurrentTurn`. Settings are the module's current ones; a vault
+   * locked since does not stop it (it starts with the secrets it ran with).
    */
   readonly requestRestart: (reason: string) => Effect.Effect<void>
+  /**
+   * A program the module `requires` failed to start with ENOENT or EACCES (`isMissingProgramError`): the host marks
+   * it missing at once and judges every module again (it becomes `unavailable` and Health says why), without probing
+   * on the turn path. A program the module does not require is ignored. Returns at once.
+   */
+  readonly reportMissingProgram: (tool: string) => Effect.Effect<void>
+}
+
+/** Whether an error from spawning a program means it is not there or cannot be run (`ENOENT`, `EACCES`). */
+export const isMissingProgramError = (error: unknown): boolean => {
+  const code = typeof error === "object" && error !== null ? (error as { readonly code?: unknown }).code : undefined
+  return code === "ENOENT" || code === "EACCES"
 }
 
 /**
  * The context members a version 2 module gets in `shared` and in `start`. Later PRs add one member each here
  * (`store`, `events`, `scheduler`, `speech`, `notify`, `present`, `connections`) and one line in the host's
- * `servicesFor`. A version 1 module never gets them.
+ * `servicesFor`, which receives the part's `PartHandle` (`ModuleRegistrations.ts`): a member that registers something
+ * (a job handler, a subscription) registers it through the handle during the part's start, so it is published and
+ * withdrawn with the module. A version 1 module never gets them.
  */
 export interface ModuleServicesV2 {
   readonly host: ModuleHostApi
   /**
-   * The module's data (docs/STORING-DATA.md): its declared collections, its SQL, transactions. Shared by every instance
+   * The module's data (docs/STORING-DATA.md): its declared collections and synchronous transactions. Shared by every instance
    * and the `shared` part. In the CLI modes it reads and refuses writes (`read-only`); without a store, every call fails
-   * `unavailable`.
+   * `unavailable`. Usable until the part it was given to has closed (through a stop's grace period and the part's own
+   * finalizers); after that every call dies with `ModuleStopped`, also on a collection handle taken earlier.
    */
   readonly store: ModuleStore
-  /** The household event bus: publish `<moduleId>.<type>`, subscribe to anything (a stream in the caller's scope). */
+  /**
+   * The household event bus: publish `<moduleId>.<type>`, subscribe to anything (a stream in the caller's scope). A
+   * subscription receives events only while the part that made it (`shared` or an instance) is published: none while
+   * its module starts, none once it is withdrawn; it ends when the part's scope closes. After that, `publish` and
+   * `subscribe` die with `ModuleStopped`.
+   */
   readonly events: ModuleEvents
 }
 
@@ -361,4 +432,13 @@ export interface ModuleServicesV2 {
  */
 export interface SharedContext<A> extends ModuleServicesV2 {
   readonly settings: Partial<A>
+  /**
+   * The module's effective settings for an assistant, from the desired state this module was started with: the
+   * assistant's own values of `overridable` fields over the shared ones; with no assistant (or one that does not have
+   * the module on), the shared ones. A change of either restarts the module, so the answer is always that of the
+   * settings it runs with. Shared code that acts for a caller asks with the caller's assistant (`CurrentTurn`), so a
+   * weather briefing uses the asking assistant's place. `undefined` when those values are not valid (a required field
+   * with no value for that assistant). Throws `ModuleStopped` once the module has stopped.
+   */
+  readonly settingsFor: (assistantId: string | undefined) => A | undefined
 }

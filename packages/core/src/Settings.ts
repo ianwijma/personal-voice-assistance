@@ -416,7 +416,8 @@ export const resolveSettings = <S extends SettingsSpec>(spec: S, sources: Settin
     } else if (fromEnv !== undefined) {
       source = origin(setting.env!)
       decoded = setting.fromEnv(fromEnv)
-      if (!decoded.ok) decoded = fail(`${setting.env}=${fromEnv} is not valid: ${decoded.error}`)
+      // The environment's value is never quoted (whatever the field is): the variable's name says where to look.
+      if (!decoded.ok) decoded = fail(`${setting.env} in the environment is not valid: ${decoded.error}`)
     } else if (Object.hasOwn(sources.stored, key)) {
       source = "saved"
       decoded = setting.decode(sources.stored[key])

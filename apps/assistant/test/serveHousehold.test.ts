@@ -98,10 +98,12 @@ describe("household data in serve mode", () => {
     await kitchen.hello()
     await study.hello()
     const snapK = await kitchen.waitFor("household.snapshot")
-    const snapS = await study.waitFor("household.snapshot")
-    expect(snapK.collections.map((c) => c.collection)).toEqual(["board", "flaky", "wall"])
-    expect(snapK.collections[0]!.rows.map((r) => (r.value as Note).text).sort()).toEqual(["for everyone", "kitchen only"])
-    expect(snapS.collections[0]!.rows.map((r) => r.value)).toEqual([{ text: "for everyone" }])
+    await kitchen.waitFor("household.snapshot", (m) => m.final)
+    await study.waitFor("household.snapshot", (m) => m.final)
+    // A collection with nothing the page may see is not in its snapshot.
+    expect(snapK.collections.map((c) => c.collection)).toEqual(["board"])
+    expect([...held(kitchen).values()].map((v) => (v as Note).text).sort()).toEqual(["for everyone", "kitchen only"])
+    expect([...held(study).values()]).toEqual([{ text: "for everyone" }])
 
     // Live, after commit: the study's note reaches the study only; the scratch collection reaches nobody.
     await run(store!.collection(board).insert({ text: "study only", device: "study-00001" }))
@@ -109,7 +111,10 @@ describe("household data in serve mode", () => {
     const live = await study.waitFor("household.event")
     expect(changeOf(live)).toMatchObject({ collection: "board", op: "put", value: { text: "study only" } })
     await sleep(150)
-    expect(events(kitchen)).toHaveLength(0)
+    // The kitchen could have been shown a household row, so it is told this one is not for it: the collection and the
+    // id only, nothing of the row.
+    expect(events(kitchen).map((e) => Object.keys(changeOf(e)).sort())).toEqual([["collection", "id", "op"]])
+    expect(JSON.stringify(kitchen.messages)).not.toContain("study only")
     expect(JSON.stringify(kitchen.messages)).not.toContain("not for pages")
     expect(JSON.stringify(study.messages)).not.toContain("not for pages")
 
@@ -126,8 +131,8 @@ describe("household data in serve mode", () => {
     await back.hello()
     const again = await back.waitFor("household.snapshot")
     expect(again.part).toBe(0)
-    expect(again.final).toBe(true)
-    expect(again.collections[0]!.rows.map((r) => (r.value as Note).text).sort()).toEqual(["for everyone", "new for everyone"])
+    await back.waitFor("household.snapshot", (m) => m.final)
+    expect([...held(back).values()].map((v) => (v as Note).text).sort()).toEqual(["for everyone", "new for everyone"])
     expect(JSON.stringify(back.messages)).not.toContain("moved to the study")
     expect(JSON.stringify(back.messages)).not.toContain("study only")
 
@@ -146,18 +151,23 @@ describe("household data in serve mode", () => {
     const study = await ScriptedClient.connect({ url: server.url, deviceId: "study-00001" })
     clients.push(kitchen, study)
     await kitchen.hello()
-    await kitchen.waitFor("household.snapshot")
-    // The study says hello while the writes below run, so they meet its snapshot. The kitchen gets a burst of more
-    // changes than any queue would hold (1,500 rows in one commit), rows shown and hidden, rows removed.
+    await kitchen.waitFor("household.snapshot", (m) => m.final)
+    // The study says hello while the writes below run, so they meet its snapshot. The kitchen gets a burst (450 rows in
+    // one commit, within what a snapshot holds), rows shown and hidden, rows removed.
     const studyHello = study.hello()
-    await run(store!.transaction(Effect.forEach(Array.from({ length: 1500 }, (_, i) => i), (i) => store!.collection(wall).insert({ text: `burst ${i}`, device: "kitchen-0001" }, { id: `x${i}` }), { discard: true })))
+    await run(store!.transaction((tx) => {
+      for (let i = 0; i < 450; i++) tx.collection(wall).insert({ text: `burst ${i}`, device: "kitchen-0001" }, { id: `x${i}` })
+    }))
     for (let i = 0; i < 150; i += 2) await run(store!.collection(board).update(`b${i}`, (v) => (v.device === undefined ? { ...v, device: "study-00001" } : { text: v.text })))
-    for (let i = 0; i < 1500; i += 5) await run(store!.collection(wall).remove(`x${i}`))
+    for (let i = 0; i < 450; i += 5) await run(store!.collection(wall).remove(`x${i}`))
     await studyHello
+    // What is committed now, from the writes above.
     const all = new Map<string, Note>()
-    for (const c of [board, wall]) {
-      for (const order of ["asc", "desc"] as const) for (const r of await run(store!.collection(c).list({ limit: 1000, orderBy: { field: "updatedAt", direction: order } }))) all.set(`${c.name}/${r.id}`, r.value)
+    for (let i = 0; i < 150; i++) {
+      const before: Note = { text: `before ${i}`, ...(i % 3 === 0 ? { device: "study-00001" } : {}) }
+      all.set(`board/b${i}`, i % 2 !== 0 ? before : before.device === undefined ? { ...before, device: "study-00001" } : { text: before.text })
     }
+    for (let i = 0; i < 450; i++) if (i % 5 !== 0) all.set(`wall/x${i}`, { text: `burst ${i}`, device: "kitchen-0001" })
     const visibleTo = (device: string) => new Map([...all].filter(([, v]) => v.device === undefined || v.device === device).map(([key, v]) => [key, { text: v.text }] as const))
     for (const [client, device] of [[kitchen, "kitchen-0001"], [study, "study-00001"]] as const) {
       const expected = visibleTo(device)

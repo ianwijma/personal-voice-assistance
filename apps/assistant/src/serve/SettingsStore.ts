@@ -466,7 +466,9 @@ export interface SettingsStore {
   /**
    * P3: replace the module route tokens (`RouteTokens.ts`), kept with the module secrets under the entry
    * `ROUTE_TOKENS_ENTRY` (not a module id), so they live in the key vault once there is one. `change` maps the
-   * committed entry to the new one. Refused while the vault is locked.
+   * committed entry to the new one. Refused while the vault is locked, and while the settings are `blocked()`
+   * (checked again inside the serialized save): like a device registering, a token change is never the owner's word
+   * that damaged settings are right, so it never acknowledges them or lets anything start.
    */
   readonly saveRouteTokens: (change: (committed: Readonly<Record<string, string>>) => Readonly<Record<string, string>>) => Effect.Effect<void, SettingsStoreError>
 }
@@ -1489,13 +1491,22 @@ export const loadSettingsStore = (directory: string, options: LoadOptions = {}):
           save: saveModule
         },
         saveRouteTokens: (change) =>
-          persistSettings("the route tokens", (committed) => ({
-            settings: committed.settings,
-            secrets: {
-              ...committed.secrets,
-              modules: withSecrets(committed.secrets.modules, ROUTE_TOKENS_ENTRY, change(committed.secrets.modules[ROUTE_TOKENS_ENTRY] ?? {}))
-            }
-          }))
+          Effect.suspend(() =>
+            blockedProblem !== undefined
+              ? Effect.fail(new SettingsStoreError({ message: `The route tokens were not saved: ${blockedProblem}` }))
+              : persistSettings("the route tokens", (committed) => {
+                // Inside the serialized save too: a token change queued behind another save never reaches the files
+                // of a blocked store.
+                if (blockedProblem !== undefined) throw new KeysUnavailable(`The route tokens were not saved: ${blockedProblem}`)
+                return {
+                  settings: committed.settings,
+                  secrets: {
+                    ...committed.secrets,
+                    modules: withSecrets(committed.secrets.modules, ROUTE_TOKENS_ENTRY, change(committed.secrets.modules[ROUTE_TOKENS_ENTRY] ?? {}))
+                  }
+                }
+              })
+          )
       }
       return store
     },

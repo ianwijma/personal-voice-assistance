@@ -5,7 +5,6 @@ import { BUILT_IN_PLACE, type DeviceCapabilities, type DevicePlace } from "@pva/
 import { Effect, Schema } from "effect"
 import {
   ambientLines,
-  type CatchUp,
   CurrentTurn,
   defineCollection,
   deviceContextLine,
@@ -24,9 +23,13 @@ import {
   type PrivacyPlace,
   rankOtherScreens,
   type Row,
-  type Snapshot,
+  type HouseholdFeed,
+  type SnapshotRun,
+  type TargetDevice,
   type TurnContext,
+  SNAPSHOT_MAX_CHARS,
   SNAPSHOT_PART_CHARS,
+  SNAPSHOT_READ_ROWS,
   SNAPSHOT_ROWS,
   CONTEXT_LINE_MAX_CHARS,
   plainName,
@@ -34,6 +37,8 @@ import {
   quotedName
 } from "../src/index.ts"
 import { makeMemoryHouseholdStore } from "../src/testing.ts"
+
+type SnapshotFrame = ReturnType<SnapshotRun["step"]>["frames"][number]
 
 const person = (id: string, name: string, aliases: ReadonlyArray<string> = [], diet: Partial<Person["diet"]> = {}): Person => ({
   id,
@@ -336,7 +341,22 @@ describe("household rows on voice pages: person scope through Privacy.mayReveal 
     expect(mayRevealScopeTo({ kind: "household" }, { privacy: "public" })).toBe(true)
   })
 
-  it.effect("the snapshot and live changes carry a person's rows only where they may be shown", () =>
+  /** A whole snapshot, run step by step as a page's queue runs it: its rows and what its final frame names as cut short. */
+  const snapshotOf = (feed: HouseholdFeed, device: TargetDevice) => {
+    const run = feed.snapshot(device)
+    const frames: Array<SnapshotFrame> = []
+    for (let i = 0; i < 100_000; i++) {
+      const r = run.step()
+      frames.push(...r.frames)
+      if (r.done) break
+    }
+    const final = frames.at(-1)!
+    expect(final.final).toBe(true)
+    return { frames, rows: frames.flatMap((f) => f.collections.flatMap((c) => c.rows)), truncated: final.truncated }
+  }
+  const texts = (s: ReturnType<typeof snapshotOf>) => s.rows.map((r) => (r.value as { text: string }).text).sort()
+
+  it.effect("the snapshot and changes carry a person's rows only where they may be shown", () =>
     Effect.gen(function*() {
       const store = makeMemoryHouseholdStore()
       yield* store.prepare([{ id: "lists", storage: { collections: [items] } }])
@@ -344,29 +364,32 @@ describe("household rows on voice pages: person scope through Privacy.mayReveal 
       yield* m.collection(items).insert({ text: "Sam's" }, { scope: { kind: "person", id: "p-sam" } })
       yield* m.collection(items).insert({ text: "Robin's" }, { scope: { kind: "person", id: "p-robin" } })
       const feed = makeHouseholdFeed({ store, modules: [{ moduleId: "lists", collections: [items], events: [] }], people: () => ["p-sam", "p-robin"] })
-      const texts = (s: Snapshot) => s.parts.flat().flatMap((c) => c.rows.map((r) => (r.value as { text: string }).text)).sort()
-      expect(texts(yield* feed.snapshot({ id: "phone-0001", privacy: "private" }))).toEqual(["Robin's", "Sam's"])
-      expect(texts(yield* feed.snapshot({ id: "kitchen-01", privacy: "shared", defaultPerson: "p-sam" }))).toEqual(["Sam's"])
-      expect(texts(yield* feed.snapshot({ id: "kitchen-01", privacy: "shared" }))).toEqual([])
-      expect(texts(yield* feed.snapshot({ id: "hall-0001", privacy: "public", defaultPerson: "p-sam" }))).toEqual([])
+      expect(texts(snapshotOf(feed, { id: "phone-0001", privacy: "private" }))).toEqual(["Robin's", "Sam's"])
+      expect(texts(snapshotOf(feed, { id: "kitchen-01", privacy: "shared", defaultPerson: "p-sam" }))).toEqual(["Sam's"])
+      expect(texts(snapshotOf(feed, { id: "kitchen-01", privacy: "shared" }))).toEqual([])
+      expect(texts(snapshotOf(feed, { id: "hall-0001", privacy: "public", defaultPerson: "p-sam" }))).toEqual([])
       // Changes: an update of Robin's row reaches the private phone and Robin's kitchen, not Sam's kitchen.
       const phone = { id: "phone-0001", privacy: "private" } as const
       const samKitchen = { id: "kitchen-01", privacy: "shared", defaultPerson: "p-sam" } as const
       const robinKitchen = { id: "kitchen-01", privacy: "shared", defaultPerson: "p-robin" } as const
-      const cursors = {
-        phone: (yield* feed.snapshot(phone)).cursor,
-        sam: (yield* feed.snapshot(samKitchen)).cursor,
-        robin: (yield* feed.snapshot(robinKitchen)).cursor
-      }
       const row = (yield* m.collection(items).list({ scope: { kind: "person", id: "p-robin" }, limit: 5 }))[0]!
       yield* m.collection(items).update(row.id, () => ({ text: "Robin's 2" }), { scope: row.scope })
-      const changes = (r: CatchUp) => (r.kind === "changes" ? r.events.map((e) => e.data) : [])
-      expect(changes(yield* feed.catchUp(phone, cursors.phone))).toMatchObject([{ op: "put", value: { text: "Robin's 2" } }])
-      expect(changes(yield* feed.catchUp(samKitchen, cursors.sam))).toEqual([])
-      expect(changes(yield* feed.catchUp(robinKitchen, cursors.robin))).toMatchObject([{ op: "put" }])
+      const change = { module: "lists", collection: "items", id: row.id, scopes: [row.scope] }
+      expect(feed.change(change, phone)?.data).toMatchObject({ op: "put", value: { text: "Robin's 2" } })
+      expect(feed.change(change, samKitchen)).toBeUndefined()
+      expect(feed.change(change, robinKitchen)?.data).toMatchObject({ op: "put" })
+      // A change whose scopes were too many to remember ("any"): the same rule, over the people the device may see.
+      const any = { ...change, scopes: "any" as const }
+      expect(feed.change(any, phone)?.data).toMatchObject({ op: "put", value: { text: "Robin's 2" } })
+      expect(feed.change(any, robinKitchen)?.data).toMatchObject({ op: "put" })
+      expect(feed.change(any, samKitchen)?.data).toMatchObject({ op: "remove", id: row.id })
+      expect(feed.change(any, { id: "hall-0001", privacy: "public", defaultPerson: "p-sam" })).toBeUndefined()
     }))
 
-  it.effect("a person removed from Members: their rows stay stored, and snapshot and changes agree that no page gets them", () =>
+  // Merged P4: the feed remembers nothing per page, so a page that held a removed person's row is not told `remove`
+  // by a later change of it. It never needs to be: removing any member ends every device's session with its
+  // connections (serve mode, `membersRemoved`), and the page starts again from a snapshot without those rows.
+  it.effect("a person removed from Members: their rows stay stored, and neither snapshot nor changes give them to any page", () =>
     Effect.gen(function*() {
       const store = makeMemoryHouseholdStore()
       yield* store.prepare([{ id: "lists", storage: { collections: [items] } }])
@@ -376,48 +399,57 @@ describe("household rows on voice pages: person scope through Privacy.mayReveal 
       let people = ["p-sam", "p-robin"]
       const feed = makeHouseholdFeed({ store, modules: [{ moduleId: "lists", collections: [items], events: [] }], people: () => people })
       const phone = { id: "phone-0001", privacy: "private" } as const
-      const before = yield* feed.snapshot(phone)
-      expect(before.parts.flat().flatMap((c) => c.rows)).toHaveLength(1)
+      expect(snapshotOf(feed, phone).rows).toHaveLength(1)
       people = ["p-robin"]
-      // Snapshot: not read. Changes: a change of the row is a remove for the page that held it, nothing for others.
-      expect((yield* feed.snapshot(phone)).parts.flat().flatMap((c) => c.rows)).toEqual([])
+      expect(snapshotOf(feed, phone).rows).toEqual([])
       const row = (yield* m.collection(items).list({ scope: sam, limit: 5 }))[0]!
       yield* m.collection(items).update(row.id, () => ({ text: "Sam's 2" }), { scope: sam })
-      const r = yield* feed.catchUp(phone, before.cursor)
-      expect(r.kind === "changes" ? r.events.map((e) => e.data) : []).toMatchObject([{ op: "remove", id: row.id }])
+      const change = { module: "lists", collection: "items", id: row.id, scopes: [sam] }
+      expect(feed.change(change, phone)).toBeUndefined()
+      // Its scopes unknown ("any"): at most a removal of the id in a scope the page may see (Robin's), never the row.
+      const any = feed.change({ ...change, scopes: "any" }, phone)
+      expect(any === undefined || (any.data as { op: string }).op === "remove").toBe(true)
       // Even a page whose device names the removed person as its default.
-      const fresh = (yield* feed.snapshot({ id: "kitchen-01", privacy: "shared", defaultPerson: "p-sam" })).cursor
-      yield* m.collection(items).update(row.id, () => ({ text: "Sam's 3" }), { scope: sam })
-      const r2 = yield* feed.catchUp({ id: "kitchen-01", privacy: "shared", defaultPerson: "p-sam" }, fresh)
-      expect(r2.kind === "changes" ? r2.events : []).toEqual([])
+      const kitchen = { id: "kitchen-01", privacy: "shared", defaultPerson: "p-sam" } as const
+      expect(snapshotOf(feed, kitchen).rows).toEqual([])
+      expect(feed.change(change, kitchen)).toBeUndefined()
       // The data itself is kept.
-      expect((yield* m.collection(items).list({ scope: sam, limit: 5 })).map((x) => x.value.text)).toEqual(["Sam's 3"])
+      expect((yield* m.collection(items).list({ scope: sam, limit: 5 })).map((x) => x.value.text)).toEqual(["Sam's 2"])
     }))
 
-  it.effect("a snapshot's rows of a person-scoped collection share one budget over all people, and say truthfully when rows were left out", () =>
+  // Merged P4: the snapshot's bounds are now per collection and scope (`SNAPSHOT_ROWS`), with `SNAPSHOT_READ_ROWS` and
+  // `SNAPSHOT_MAX_CHARS` over the whole snapshot, so P5's shared per-collection budget over all people is gone; each
+  // person is a scope of its own, and many people cannot make an unbounded snapshot.
+  it.effect("each person of a person-scoped collection is a scope of its own, and the whole snapshot stays within its bounds", () =>
     Effect.gen(function*() {
       const store = makeMemoryHouseholdStore()
       yield* store.prepare([{ id: "lists", storage: { collections: [items] } }])
       const m = store.forModule("lists")
       const ids = Array.from({ length: 24 }, (_, i) => `p-person${String(i).padStart(2, "0")}`)
-      // 24 people with 30 rows each: 720 rows, over the 500 of one collection.
+      // 24 people with 30 rows each: 720 rows, more than one scope's 500, all sent.
       for (const id of ids) for (let i = 0; i < 30; i++) yield* m.collection(items).insert({ text: `${id} ${i} ${"x".repeat(100)}` }, { scope: { kind: "person", id } })
       const feed = makeHouseholdFeed({ store, modules: [{ moduleId: "lists", collections: [items], events: [] }], people: () => ids })
-      const snap = yield* feed.snapshot({ id: "phone-0001", privacy: "private" })
-      const chunks = snap.parts.flat()
-      expect(chunks.flatMap((c) => c.rows)).toHaveLength(SNAPSHOT_ROWS)
-      expect(chunks.some((c) => c.truncated)).toBe(true)
-      // Every part fits one frame.
-      for (const part of snap.parts) expect(JSON.stringify(part).length).toBeLessThan(SNAPSHOT_PART_CHARS + 50_000)
-      // Exactly at the budget: not truncated (one more row is read to know).
-      const few = ids.slice(0, 2)
-      const small = makeHouseholdFeed({ store, modules: [{ moduleId: "lists", collections: [items], events: [] }], people: () => few })
-      const exact = yield* small.snapshot({ id: "phone-0001", privacy: "private" })
-      expect(exact.parts.flat().flatMap((c) => c.rows)).toHaveLength(60)
-      expect(exact.parts.flat().some((c) => c.truncated)).toBe(false)
-    }))
+      const all = snapshotOf(feed, { id: "phone-0001", privacy: "private" })
+      expect(all.rows).toHaveLength(720)
+      expect(all.truncated).toEqual([])
+      for (const frame of all.frames) expect(JSON.stringify(frame).length).toBeLessThanOrEqual(SNAPSHOT_PART_CHARS)
+      // A shared device sees only its default person's 30.
+      const kitchen = snapshotOf(feed, { id: "kitchen-01", privacy: "shared", defaultPerson: ids[3]! })
+      expect(kitchen.rows).toHaveLength(30)
+      expect(kitchen.rows.every((r) => r.scope.kind === "person" && r.scope.id === ids[3])).toBe(true)
+      // 24 people with 220 rows each: 5,280 rows, past what one snapshot reads in all.
+      for (const id of ids) for (let i = 30; i < 220; i++) yield* m.collection(items).insert({ text: `${i}` }, { scope: { kind: "person", id } })
+      const many = snapshotOf(feed, { id: "phone-0001", privacy: "private" })
+      expect(many.rows.length).toBeLessThanOrEqual(SNAPSHOT_READ_ROWS)
+      expect(many.rows.length).toBeGreaterThan(0)
+      expect(many.truncated).toEqual([{ module: "lists", collection: "items" }])
+      expect(many.frames.reduce((n, f) => n + JSON.stringify(f).length, 0)).toBeLessThanOrEqual(SNAPSHOT_MAX_CHARS)
+    }), 60_000)
 
-  it.effect("truncated only when a row the page would get was left out: exactly the budget, an empty or hidden-only scope after it (round 2, finding 10)", () =>
+  // Merged P4: P5's round-2 rule ("truncated only when a visible row was left out", with a probe past the budget) is
+  // replaced by the feed's own contract: a collection not named in `truncated` is complete; one named may have rows
+  // missing. These are the cases of that test under the new per-scope bound.
+  it.effect("truncated: a collection not named is complete, per person scope; hidden rows are never sent", () =>
     Effect.gen(function*() {
       // Rows whose text starts with "hidden" are projected to nothing.
       const shown = defineCollection({
@@ -433,18 +465,17 @@ describe("household rows on voice pages: person scope through Privacy.mayReveal 
           const m = store.forModule("lists")
           for (const [id, texts] of Object.entries(rows)) for (const text of texts) yield* m.collection(shown).insert({ text }, { scope: { kind: "person", id } })
           const feed = makeHouseholdFeed({ store, modules: [{ moduleId: "lists", collections: [shown], events: [] }], people: () => ["p-sam", "p-robin"] })
-          const snap = yield* feed.snapshot({ id: "phone-0001", privacy: "private", defaultPerson: "p-sam" })
-          const chunks = snap.parts.flat()
-          return { rows: chunks.flatMap((c) => c.rows).length, truncated: chunks.some((c) => c.truncated) }
+          const snap = snapshotOf(feed, { id: "phone-0001", privacy: "private", defaultPerson: "p-sam" })
+          return { rows: snap.rows.length, truncated: snap.truncated.length > 0 }
         })
       const n = (count: number, prefix = "row") => Array.from({ length: count }, (_, i) => `${prefix} ${i}`)
-      expect(yield* run({ "p-sam": n(SNAPSHOT_ROWS), "p-robin": [] })).toEqual({ rows: SNAPSHOT_ROWS, truncated: false })
-      expect(yield* run({ "p-sam": n(SNAPSHOT_ROWS), "p-robin": n(10, "hidden") })).toEqual({ rows: SNAPSHOT_ROWS, truncated: false })
-      expect(yield* run({ "p-sam": [...n(SNAPSHOT_ROWS), ...n(5, "hidden")] })).toEqual({ rows: SNAPSHOT_ROWS, truncated: false })
+      expect(yield* run({ "p-sam": n(SNAPSHOT_ROWS - 1), "p-robin": [] })).toEqual({ rows: SNAPSHOT_ROWS - 1, truncated: false })
+      // Two people do not share one budget: each scope has its own.
+      expect(yield* run({ "p-sam": n(SNAPSHOT_ROWS - 1), "p-robin": n(10) })).toEqual({ rows: SNAPSHOT_ROWS + 9, truncated: false })
+      expect(yield* run({ "p-sam": n(SNAPSHOT_ROWS - 1), "p-robin": n(10, "hidden") })).toEqual({ rows: SNAPSHOT_ROWS - 1, truncated: false })
       expect(yield* run({ "p-sam": n(SNAPSHOT_ROWS + 1) })).toEqual({ rows: SNAPSHOT_ROWS, truncated: true })
-      expect(yield* run({ "p-sam": n(SNAPSHOT_ROWS), "p-robin": ["robin 0"] })).toEqual({ rows: SNAPSHOT_ROWS, truncated: true })
-      // Hidden rows among the first ones do not use the budget up.
-      expect(yield* run({ "p-sam": [...n(20, "hidden"), ...n(SNAPSHOT_ROWS - 10)] })).toEqual({ rows: SNAPSHOT_ROWS - 10, truncated: false })
+      // Hidden rows are read but never sent.
+      expect(yield* run({ "p-sam": [...n(20, "hidden"), ...n(SNAPSHOT_ROWS - 30)] })).toEqual({ rows: SNAPSHOT_ROWS - 30, truncated: false })
     }), 60_000)
 })
 

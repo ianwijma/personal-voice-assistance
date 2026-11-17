@@ -6,6 +6,7 @@ import {
   blankAssistantBody,
   deepEqual,
   hearingModelNames,
+  identityOnStart,
   listJoin,
   type Outcome,
   plural,
@@ -63,6 +64,25 @@ const NO_PLACEMENT: Placement = { on: false, phrase: "" }
  * dashes), so an assistant called "Blank" (id `blank`) is a copy like any other. Every other value is an id.
  */
 export const BLANK_START = "(blank)"
+
+/** The modules a template names that this server has no capability of (they are not switched on; the owner is told). */
+export const absentModules = (t: Pick<AssistantTemplate, "modules">, capabilities: ReadonlyArray<string>): ReadonlyArray<string> =>
+  t.modules.filter((id) => !capabilities.includes(id))
+
+/** Where a new assistant's draft started, in words: blank, a copy of an assistant, or a module's suggestion. */
+export const startOrigin = (
+  value: string,
+  known: { readonly assistants: ReadonlyArray<{ readonly id: string; readonly name: string }>; readonly templates: ReadonlyArray<AssistantTemplate>; readonly capabilities: ReadonlyArray<string> }
+): string => {
+  if (value === BLANK_START) return "Started blank"
+  const template = templateOfStart(value)
+  if (template !== undefined) {
+    const t = known.templates.find((x) => x.id === template)
+    const absent = t === undefined ? [] : absentModules(t, known.capabilities)
+    return `From the suggestion ${t?.name ?? template}${absent.length > 0 ? ` (not on this server: ${absent.join(", ")})` : ""}`
+  }
+  return `Copy of ${known.assistants.find((x) => x.id === value)?.name ?? value}`
+}
 
 /** Start from › a module's template (protocol 9), as the radio value: `template:<moduleId>.<id>`, never an assistant id. */
 export const templateStart = (id: string): string => `template:${id}`
@@ -131,6 +151,10 @@ export function NewAssistantWizard() {
   }
   const next = () => go(Math.min(LAST, step + 1))
 
+  const absentOf = (t: AssistantTemplate) => absentModules(t, capability.map((m) => m.id))
+  /** The template whose name, purpose and Handles were filled in last (they are replaced, not kept, when it changes). */
+  const filledFrom = useRef<AssistantTemplate | undefined>(undefined)
+
   /** Start from: a copy takes the prompt, language model, hearing, voice and modules; the typed name, purpose and Handles stay. */
   const chooseFrom = (id: string) => {
     if (creating.current) return
@@ -141,12 +165,15 @@ export function NewAssistantWizard() {
     const source = id === BLANK_START ? undefined : assistants.find((x) => x.id === id)
     const fresh = blank()
     const body = source === undefined ? toBody(fresh) : toBody(source)
-    draft.replace({ ...a, ...body, name: a.name, purpose: a.purpose, handles: a.handles, on: true, confirmActions: "off" })
+    // What only the previous template filled in goes; what the owner typed stays.
+    const identity = identityOnStart(a, filledFrom.current, undefined)
+    filledFrom.current = undefined
+    draft.replace({ ...a, ...body, ...identity, on: true, confirmActions: "off" })
   }
 
   /**
    * Start from a template: good defaults with the template's prompt and its modules on (the others off); its name,
-   * purpose and Handles fill only what has not been typed. Nothing else of the template is kept once it is created.
+   * purpose and Handles fill what has not been typed (an earlier template's values count as not typed). Nothing else of the template is kept once it is created.
    */
   const fromTemplate = (t: AssistantTemplate | undefined) => {
     if (t === undefined) return
@@ -154,18 +181,21 @@ export function NewAssistantWizard() {
     const on = new Set(t.modules)
     const mods = Object.fromEntries(capability.map((m) => [m.id, { on: on.has(m.id), offTools: [] }]))
     setSuggested(t.suggestedPhrases?.[0] ?? "")
+    // Typed values stay; empty ones, and those the previous template filled in, take this template's.
+    const identity = identityOnStart(a, filledFrom.current, t)
+    filledFrom.current = t
     draft.replace({
       ...a,
       ...fresh,
-      name: a.name.trim() === "" ? t.name : a.name,
-      purpose: a.purpose.trim() === "" ? t.purpose ?? "" : a.purpose,
-      handles: a.handles.trim() === "" ? t.handles ?? "" : a.handles,
+      ...identity,
       prompt: t.prompt,
       modules: mods,
       on: true,
       confirmActions: "off"
     })
   }
+
+  const originOf = (value: string) => startOrigin(value, { assistants, templates, capabilities: capability.map((m) => m.id) })
 
   const create = async (saveAnyway = false) => {
     if (creating.current) return
@@ -249,6 +279,9 @@ export function NewAssistantWizard() {
                   description: [
                     t.purpose,
                     `Modules: ${listJoin(t.modules.map((id) => modules.byId[id]?.name ?? id))}`,
+                    // A module the template names that this server does not have (or that is not a capability): it
+                    // is not switched on, and the owner is told.
+                    absentOf(t).length > 0 ? `Not on this server: ${listJoin(absentOf(t))}` : undefined,
                     t.suggestedPhrases !== undefined && t.suggestedPhrases.length > 0 ? `Suggests ${listJoin(t.suggestedPhrases.map(quoted))}` : undefined
                   ].filter((x) => x !== undefined && x !== "").join(" · ")
                 }))
@@ -386,7 +419,7 @@ export function NewAssistantWizard() {
             <CheckRow n={1} label="Start" go={go}>
               {a.name.trim() !== "" ? <span className="text-ink">{a.name.trim()}</span> : <span className="text-warn">No name yet</span>}
               {a.purpose !== "" && <span className="text-ink-muted"> · {a.purpose}</span>}
-              <span className="block text-[12px] text-ink-faint">{from === BLANK_START ? "Started blank" : `Copy of ${assistants.find((x) => x.id === from)?.name ?? from}`}</span>
+              <span className="block text-[12px] text-ink-faint" data-testid="check-origin">{originOf(from)}</span>
             </CheckRow>
             <CheckRow n={2} label="Language model" go={go}>
               {accountInfo(a.llm.account).title} · <span className="font-mono text-[13px]">{a.llm.account === "offline" ? "no model" : a.llm.model} · effort {a.llm.effort}</span>

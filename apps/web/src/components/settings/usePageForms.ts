@@ -12,6 +12,7 @@ import {
   isEmptyPatch,
   onlyReloadFields,
   reconcile,
+  resetDraftValue,
   someReloadFields
 } from "@/lib/forms.ts"
 
@@ -45,7 +46,19 @@ export interface FormState {
   readonly localErrors: Readonly<Record<string, string>>
   /** Warnings returned by the last save: shown above the footer until "Save anyway" or an edit. */
   readonly confirm: ReadonlyArray<FieldError>
+  /**
+   * New for every fresh draft (Cancel, a save, a new form): the fields are drawn again from it, so text a renderer
+   * keeps for itself (a number being typed, a list item not added yet) goes with the draft it belonged to.
+   */
+  readonly epoch: number
+  /**
+   * Per field, raised by "Reset to the default": that field alone is drawn again, so its renderer's private state
+   * (text being typed, a rejected item, a record's row state) and its local error go with the value it replaced.
+   */
+  readonly fieldEpochs: Readonly<Record<string, number>>
 }
+
+let epochSeq = 0
 
 export interface PageFormView {
   readonly def: PageFormDef
@@ -54,6 +67,11 @@ export interface PageFormView {
   readonly shown: (field: SettingField) => boolean
   readonly patch: SettingsPatch
   readonly dirty: boolean
+  /**
+   * The local errors that count: those of fields still in the form and shown now. A field hidden by `visibleWhen`,
+   * left out by `only`, or gone from a new form is not saved, so its leftover error cannot hold Save.
+   */
+  readonly localErrors: Readonly<Record<string, string>>
 }
 
 export interface SaveFns {
@@ -66,7 +84,9 @@ const fresh = (def: PageFormDef): FormState => ({
   sync: { draft: initialDraft(def.form), baseRevision: def.revision, stale: false },
   serverErrors: [],
   localErrors: {},
-  confirm: []
+  confirm: [],
+  epoch: ++epochSeq,
+  fieldEpochs: {}
 })
 
 export const usePageForms = (defs: ReadonlyArray<PageFormDef>, saved: (key: string) => unknown, fns: SaveFns) => {
@@ -106,7 +126,7 @@ export const usePageForms = (defs: ReadonlyArray<PageFormDef>, saved: (key: stri
 
   const dirtyViews = views.filter((v) => v.dirty)
   const dirty = dirtyViews.length > 0
-  const hasLocalErrors = views.some((v) => Object.keys(v.state.localErrors).length > 0)
+  const hasLocalErrors = views.some((v) => Object.keys(v.localErrors).length > 0)
 
   return {
     views,
@@ -122,6 +142,25 @@ export const usePageForms = (defs: ReadonlyArray<PageFormDef>, saved: (key: stri
     setDraft: (key: string, f: (d: Draft) => Draft) => {
       setSavedFlash(false)
       update(key, (s) => ({ ...s, confirm: [], sync: { ...s.sync, draft: f(s.sync.draft) } }))
+    },
+    /**
+     * "Reset to the default" of one field: its value replaced by the default (saved as `null`), its local error
+     * cleared and its renderer drawn again (`fieldEpochs`), other fields untouched.
+     */
+    resetField: (key: string, field: SettingField) => {
+      setSavedFlash(false)
+      update(key, (s) => {
+        const { [field.key]: _gone, ...localErrors } = s.localErrors
+        return {
+          ...s,
+          confirm: [],
+          localErrors,
+          // The refused save's errors of this field were about the value it no longer has.
+          serverErrors: s.serverErrors.filter((e) => e.key !== field.key),
+          fieldEpochs: { ...s.fieldEpochs, [field.key]: (s.fieldEpochs[field.key] ?? 0) + 1 },
+          sync: { ...s.sync, draft: resetDraftValue(s.sync.draft, field) }
+        }
+      })
     },
     setLocalError: (key: string, field: string, message: string | undefined) =>
       update(key, (s) => {
@@ -211,6 +250,11 @@ const computeViews = (
     const lookup = def.kind === "section" ? pageLookup : draftLookup(state.sync.draft, () => undefined)
     const shown = (field: SettingField) => (def.only === undefined || def.only.includes(field.key)) && fieldVisible(field, lookup)
     const patch = def.readOnly ? { values: {}, secrets: {} } : computePatch(def.form, state.sync.draft, shown)
-    return { def, state, lookup, shown, patch, dirty: !isEmptyPatch(patch) }
+    const localErrors: Record<string, string> = {}
+    for (const field of def.form.fields) {
+      if (Object.hasOwn(state.localErrors, field.key) && shown(field)) localErrors[field.key] = state.localErrors[field.key]!
+    }
+    // Text a field could not take yet (`localErrors`) is an edit too: leaving the page asks first, Cancel is offered.
+    return { def, state, lookup, shown, patch, localErrors, dirty: !isEmptyPatch(patch) || Object.keys(localErrors).length > 0 }
   })
 }
