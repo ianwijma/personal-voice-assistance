@@ -6,15 +6,23 @@ import { checkHeaders, contentTypes, safeFetch, type SafeFetchOptions, type Safe
 export interface JsonCacheEntry {
   readonly value: unknown
   readonly etag?: string
-  /** When the value was fetched or last confirmed (clock milliseconds). */
+  /** When the value was fetched or last confirmed (clock milliseconds): for the TTL and the age only, never for ordering. */
   readonly storedAt: number
+  /** The `sequence()` number taken when the request that produced this entry started. */
+  readonly sequence: number
 }
 
-/** Where fetched values live. The in-memory one below is the default; a store-backed one can implement this. */
+/**
+ * Where fetched values live. The in-memory one below is the default; a store-backed one can implement this. `sequence` hands out
+ * strictly increasing numbers (per cache, shared by every client of it); `setIfNewer` stores the entry only when the key holds
+ * nothing or an entry with a lower `sequence`, and says whether it did. A cache shared by several processes must make
+ * `setIfNewer` one atomic step (a transaction), and `sequence` monotonic across them.
+ */
 export interface JsonCache {
   readonly get: (key: string) => JsonCacheEntry | undefined
-  readonly set: (key: string, entry: JsonCacheEntry) => void
+  readonly setIfNewer: (key: string, entry: JsonCacheEntry) => boolean
   readonly delete: (key: string) => void
+  readonly sequence: () => number
 }
 
 /**
@@ -24,14 +32,19 @@ export interface JsonCache {
 export const makeMemoryJsonCache = (maxEntries = 200): JsonCache => {
   if (!Number.isSafeInteger(maxEntries) || maxEntries < 1 || maxEntries > 1_000_000) throw new RangeError(`maxEntries must be a whole number from 1 to 1000000, not ${maxEntries}`)
   const map = new Map<string, JsonCacheEntry>()
+  let counter = 0
   return {
     get: (key) => map.get(key),
-    set: (key, entry) => {
+    setIfNewer: (key, entry) => {
+      const current = map.get(key)
+      if (current !== undefined && current.sequence >= entry.sequence) return false
       map.delete(key)
       map.set(key, entry)
       while (map.size > maxEntries) map.delete(map.keys().next().value!)
+      return true
     },
-    delete: (key) => void map.delete(key)
+    delete: (key) => void map.delete(key),
+    sequence: () => ++counter
   }
 }
 
@@ -123,7 +136,7 @@ const untilAborted = <A, E>(effect: Effect.Effect<A, E>, signal: AbortSignal | u
  * served for up to `staleIfErrorMs` more, its age taken when the failure is known. The key is the URL with the request headers
  * (`representationKey`). Callers that miss the cache at the same time share one request: each waits on its own terms (its signal
  * makes it fail with `NetAborted`, its interruption only stops its wait), and the request is cancelled when no one waits for it any
- * more. A request never overwrites an entry newer than itself.
+ * more. A request never overwrites an entry stored by a request that started after it (the cache's `sequence`, not the clock).
  */
 export const makeCachedJson = (deps: CachedJsonDeps = {}): CachedJson => {
   const cache = deps.cache ?? makeMemoryJsonCache()
@@ -133,16 +146,17 @@ export const makeCachedJson = (deps: CachedJsonDeps = {}): CachedJson => {
 
   const refresh = (url: string, key: string, headers: Record<string, string>, options: GetJsonOptions): Effect.Effect<Outcome, CachedJsonError> =>
     Effect.gen(function* () {
-      const startedAt = now()
+      // The order of refreshes is the order they started in, by the cache's sequence: a slower, older request never replaces what a
+      // newer one stored, whatever the clocks say (review round 2, finding 18).
+      const sequence = cache.sequence()
       const entry = cache.get(key)
       const sent: Record<string, string> = { ...headers }
       if (entry?.etag !== undefined) sent["if-none-match"] = entry.etag
       const { signal: _signal, ...limits } = options.fetch ?? {}
       const response = yield* fetch(url, { ...limits, accept: contentTypes.json, method: "GET", headers: sent })
-      const newer = (): boolean => (cache.get(key)?.storedAt ?? -Infinity) > startedAt
       if (response.status === 304 && entry !== undefined) {
         const etag = response.headers["etag"] ?? entry.etag
-        if (!newer()) cache.set(key, { value: entry.value, ...(etag !== undefined ? { etag } : {}), storedAt: now() })
+        cache.setIfNewer(key, { value: entry.value, ...(etag !== undefined ? { etag } : {}), storedAt: now(), sequence })
         return { kind: "value", value: entry.value, ageMs: 0, source: "revalidated" } satisfies Outcome
       }
       if (response.status < 200 || response.status > 299) return yield* Effect.fail(new NetHttpStatus({ url, status: response.status }))
@@ -153,8 +167,7 @@ export const makeCachedJson = (deps: CachedJsonDeps = {}): CachedJson => {
         return yield* Effect.fail(new NetBadJson({ url, detail: e instanceof Error ? e.message : String(e) }))
       }
       const etag = response.headers["etag"]
-      // A slower request must not replace what a newer one stored meanwhile (another process sharing a store, say).
-      if (!newer()) cache.set(key, { value, ...(etag !== undefined ? { etag } : {}), storedAt: now() })
+      cache.setIfNewer(key, { value, ...(etag !== undefined ? { etag } : {}), storedAt: now(), sequence })
       return { kind: "value", value, ageMs: 0, source: "network" } satisfies Outcome
     })
 

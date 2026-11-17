@@ -90,7 +90,8 @@ const unitTable = dicts<Language, UnitInfo>({
     doos: pack("box"), dozen: pack("box"), doosje: pack("box"), doosjes: pack("box"), bak: pack("tub"), bakken: pack("tub"), bakje: pack("tub"), bakjes: pack("tub"),
     rol: pack("roll"), rollen: pack("roll"),
     handvol: { unit: "handful", dimension: "vague", approx: true }, handje: { unit: "handful", dimension: "vague", approx: true },
-    snufje: { unit: "pinch", dimension: "vague", approx: true }, snuf: { unit: "pinch", dimension: "vague", approx: true }, mespunt: { unit: "pinch", dimension: "vague", approx: true },
+    snufje: { unit: "pinch", dimension: "vague", approx: true }, snufjes: { unit: "pinch", dimension: "vague", approx: true },
+    handjes: { unit: "handful", dimension: "vague", approx: true }, scheutjes: { unit: "splash", dimension: "vague", approx: true }, mespunten: { unit: "pinch", dimension: "vague", approx: true }, snuf: { unit: "pinch", dimension: "vague", approx: true }, mespunt: { unit: "pinch", dimension: "vague", approx: true },
     scheutje: { unit: "splash", dimension: "vague", approx: true }, scheut: { unit: "splash", dimension: "vague", approx: true }
   }
 })
@@ -113,6 +114,7 @@ const restWords: Record<Language, ReadonlyArray<ReadonlyArray<string>>> = {
 }
 const linkWords: Record<Language, ReadonlySet<string>> = { en: new Set(["of"]), nl: new Set(["van", "aan"]) }
 const joinWords: Record<Language, ReadonlySet<string>> = { en: new Set(["and", "or", "plus", "to", "nor", "versus", "vs"]), nl: new Set(["en", "of", "plus", "tot", "noch"]) }
+const orWords: Record<Language, ReadonlySet<string>> = { en: new Set(["or", "nor"]), nl: new Set(["of", "noch", "ofwel"]) }
 const fractionWords: ReadonlySet<string> = new Set(["half", "halve", "quarter", "quarters", "kwart", "anderhalf", "anderhalve", "driekwart", "third", "thirds", "derde"])
 const articles: ReadonlySet<string> = new Set(["a", "an", "een"])
 
@@ -135,6 +137,8 @@ const itemHoldsAmount = (toks: ReadonlyArray<Tok>, from: number, language: Langu
   const norms = toks.map((t) => t.norm)
   // An item that starts or ends with "and" / "or" ("2 kg and flour", "2 kg flour or") is not one thing either.
   if (from < toks.length && (joinWords[language].has(norms[from]!) || joinWords[language].has(norms[toks.length - 1]!))) return true
+  // "salt or pepper", "flour or so", "zout of peper": alternatives are not one item (decision 1 of review round 2).
+  if (norms.slice(from).some((w) => orWords[language].has(w))) return true
   for (let k = from; k < toks.length; k++) {
     const w = norms[k]!
     if (/\d/.test(w)) return true
@@ -166,7 +170,7 @@ export const parseQuantity = (text: string, language: Language, options: Quantit
   if (toks.length === 0 || !onlyWords(text, toks)) return notUnderstood
   let k = 0
   let approx = false
-  while (k < toks.length && approxWords[language].has(norms[k]!)) { approx = true; k++ }
+  if (k < toks.length && approxWords[language].has(norms[k]!)) { approx = true; k++ }
   const finish = (q: Omit<Quantity, "said" | "item" | "approx"> & { approx?: boolean }, next: number, needsItem = false): Parsed<Quantity> => {
     let n = next
     if (linkWords[language].has(norms[n] ?? "")) n++

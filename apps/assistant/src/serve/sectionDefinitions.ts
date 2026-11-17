@@ -121,20 +121,26 @@ const checkVoiceKey = (value: string): string | undefined => {
   return isTtsProvider(ref.provider) ? undefined : `There is no voice provider "${ref.provider}"`
 }
 
-/** An IANA time zone this machine knows (empty = this machine's own). */
+/** An IANA name, not a fixed offset such as "+01:00": recurrences store the zone as an iCalendar TZID (modules P2, review round 2). */
+const ianaZoneName = /^[A-Za-z][A-Za-z0-9_+\-]*(?:\/[A-Za-z0-9_+\-]+)*$/
+
+/** An IANA time zone this machine knows (empty = this machine's own). Fixed offsets ("+01:00", "+0100") are refused. */
 const checkTimeZone = (zone: string): string | undefined => {
-  if (zone.trim() === "") return undefined
+  const trimmed = zone.trim()
+  if (trimmed === "") return undefined
+  const refusal = "Unknown time zone (use an IANA name such as Europe/Amsterdam, not an offset)"
+  if (!ianaZoneName.test(trimmed)) return refusal
   try {
-    new Intl.DateTimeFormat("en", { timeZone: zone.trim() })
-    return undefined
+    const resolved = new Intl.DateTimeFormat("en", { timeZone: trimmed }).resolvedOptions().timeZone
+    return ianaZoneName.test(resolved) ? undefined : refusal
   } catch {
-    return "Unknown time zone (use an IANA name such as Europe/Amsterdam)"
+    return refusal
   }
 }
 
-/** An ISO 4217 code: three letters, in capitals. */
+/** Three capital letters. Any such code is accepted, also one ISO 4217 does not list (review round 2, finding 25). */
 const checkCurrency = (code: string): string | undefined =>
-  /^[A-Z]{3}$/.test(code) ? undefined : "Use a three-letter ISO 4217 code in capitals, e.g. EUR"
+  /^[A-Z]{3}$/.test(code) ? undefined : "Use a three-letter currency code in capitals, e.g. EUR"
 
 /**
  * The API contact goes in a `User-Agent` header, which holds printable ASCII only: an address with accents or another script
@@ -165,7 +171,7 @@ export const homeSection: SectionDefinition = {
     }),
     HOME_TIME_ZONE: Setting.text({
       label: "Time zone",
-      description: "IANA name, e.g. Europe/Amsterdam. Empty: this machine's zone.",
+      description: "IANA name, e.g. Europe/Amsterdam (not an offset such as +01:00). Empty: this machine's zone.",
       env: "HOME_TIME_ZONE",
       placeholder: Intl.DateTimeFormat().resolvedOptions().timeZone,
       maxLength: 64,
@@ -203,7 +209,7 @@ export const homeSection: SectionDefinition = {
     }),
     HOME_CURRENCY: Setting.text({
       label: "Currency",
-      description: "ISO 4217 code of the household's money, e.g. EUR, USD, GBP. The default of modules that handle prices.",
+      description: "Three-letter code of the household's money, e.g. EUR, USD, GBP (any three capital letters are accepted; use the ISO 4217 code). The default of modules that handle prices.",
       env: "HOME_CURRENCY",
       default: "EUR",
       placeholder: "EUR",

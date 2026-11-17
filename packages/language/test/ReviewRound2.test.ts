@@ -422,6 +422,33 @@ describe("finding 24: a time zone that is not an IANA name is refused everywhere
   })
 })
 
+describe("found by the self-review scripts", () => {
+  it("a range is not a clock time: \"seven to eight\" is not 7:53", () => {
+    for (const t of ["seven to eight", "two to three", "seven past eight", "three past four"]) expect(parseTimeOfDay(t, "en").kind, t).toBe("not-understood")
+    for (const t of ["drie voor acht", "zeven over acht"]) expect(parseTimeOfDay(t, "nl").kind, t).toBe("not-understood")
+    expect(parseTimeOfDay("seven minutes to eight", "en").kind).toBe("ok")
+    expect(parseTimeOfDay("five to eight", "en").kind).toBe("ok")
+    expect(parseTimeOfDay("drie minuten voor acht", "nl").kind).toBe("ok")
+  })
+  it("one lead word, only first; one approximator; a part of the day once; \"on\" only before a weekday or a date", () => {
+    for (const t of ["at at seven", "seven at", "half past seven at"]) expect(parseTimeOfDay(t, "en").kind, t).toBe("not-understood")
+    for (const t of ["on tomorrow at five", "on in two hours", "tonight night", "on tonight"]) expect(date(t), t).toBe("not-understood")
+    for (const t of ["op morgen om vijf uur", "vanavond avond", "vrijdagavond avond"]) expect(date(t, "nl"), t).toBe("not-understood")
+    for (const t of ["about about 2 kg flour", "roughly about 2 kg flour"]) expect(qty(t), t).toBe("not-understood")
+    expect(date("on Friday at five")).toBe("2026-11-20 17:00")
+  })
+  it("weekdays without \"and\" are a list only with a comma between them", () => {
+    expect(rec("every Monday Tuesday")).toBe("not-understood")
+    expect(rec("every second Monday Tuesday")).toBe("not-understood")
+    expect(rec("every Monday, Wednesday and Friday")).toBe("FREQ=WEEKLY;BYDAY=MO,WE,FR @ 20261120T090000")
+    expect(rec("de laatste vrijdag van om de maand", "nl")).toBe("not-understood")
+  })
+  it("an item with an alternative in it, or a Dutch plural unit, is refused", () => {
+    for (const t of ["2 kg salt or pepper", "2 kg flour or so", "a kilo of rice or pasta"]) expect(qty(t), t).toBe("not-understood")
+    for (const t of ["2 kg zout of peper", "twee snufjes zout"]) expect(t === "twee snufjes zout" ? qty(t, "nl") : qty(t, "nl"), t).toBe(t === "twee snufjes zout" ? "2 pinch zout" : "not-understood")
+  })
+})
+
 describe("the index exports what the README lists", () => {
   it("parsers, the engine and the helpers", () => {
     for (const name of ["parseTimeOfDay", "parseDateTime", "parseQuantity", "parseRecurrence", "parseRRule", "formatRRule", "parseDtstart", "formatDtstart", "readSeries", "seriesAfter",

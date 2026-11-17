@@ -74,6 +74,17 @@ describe("Sections: effective values", () => {
     const bad = await Effect.runPromise(sections.update("home", { values: { HOME_TIME_ZONE: "Mars/Olympus" }, secrets: {} }))
     expect(bad.result.ok).toBe(false)
     expect(sections.value("HOME_TIME_ZONE") ?? "").toBe("")
+    // A fixed offset is not a zone name: it cannot be a recurrence's TZID (modules P2, review round 2, finding 24).
+    for (const offset of ["+01:00", "+0100", "-05:00", " +01 "]) {
+      const refused = await Effect.runPromise(sections.update("home", { values: { HOME_TIME_ZONE: offset }, secrets: {} }))
+      expect(refused.result.ok, offset).toBe(false)
+    }
+    expect(sections.value("HOME_TIME_ZONE") ?? "").toBe("")
+    // Any three capital letters are a currency code; the description says so (finding 25).
+    expect((await Effect.runPromise(sections.update("home", { values: { HOME_CURRENCY: "ZZZ" }, secrets: {} }))).result.ok).toBe(true)
+    expect(sections.value("HOME_CURRENCY")).toBe("ZZZ")
+    for (const code of ["eur", "EU", "EURO", "E1R"]) expect((await Effect.runPromise(sections.update("home", { values: { HOME_CURRENCY: code }, secrets: {} }))).result.ok, code).toBe(false)
+    expect(home?.form.fields.find((f) => f.key === "HOME_CURRENCY")?.description).toContain("any three capital letters")
 
     for (const zone of ["Europe/Amsterdam", " Asia/Tokyo ", ""]) {
       const saved = await Effect.runPromise(sections.update("home", { values: { HOME_TIME_ZONE: zone }, secrets: {} }))

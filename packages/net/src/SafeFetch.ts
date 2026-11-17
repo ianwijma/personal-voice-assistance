@@ -2,6 +2,7 @@ import { Effect } from "effect"
 import dns from "node:dns"
 import http from "node:http"
 import https from "node:https"
+import tls from "node:tls"
 import zlib from "node:zlib"
 import { classifyAddress, type AddressClass } from "./Address.ts"
 import {
@@ -45,8 +46,8 @@ export interface ContentTypePolicy {
 
 /** The presets. A caller may also pass its own policy (no wildcards other than the `type/*+suffix` form). */
 export const contentTypes = {
-  /** A page a model asked to read: HTML, plain text, PDF (web-search §13, rule 5). */
-  webPage: { name: "web page", types: ["text/html", "application/xhtml+xml", "text/plain", "application/pdf"] },
+  /** A page a model asked to read: HTML, plain text, PDF, exactly the list of web-search §13, rule 5. */
+  webPage: { name: "web page", types: ["text/html", "text/plain", "application/pdf"] },
   /** An API answer. */
   json: { name: "JSON", types: ["application/json", "application/*+json"] },
   /** RSS, Atom, JSON Feed and the XML types feeds are served as. */
@@ -115,11 +116,19 @@ export const nodeResolver: Resolver = async (host, signal) => {
   return found.map((a) => a.address)
 }
 
+export interface NodeConnectorOptions {
+  /**
+   * Certificates to trust instead of the system's (PEM): for an owner-configured LAN endpoint with its own CA, and for tests. The
+   * certificate is always verified, against the URL's host name.
+   */
+  readonly ca?: string | ReadonlyArray<string>
+}
+
 /**
  * The connector of `node:http(s)`: dials the checked IP. The Host header and the TLS name (SNI and the certificate check) come
  * from `url` only, set after the caller's headers so nothing can replace them, and the request asks for `identity`.
  */
-export const nodeConnector: Connector = ({ url, address, method, headers, signal }) =>
+export const makeNodeConnector = (connectorOptions: NodeConnectorOptions = {}): Connector => ({ url, address, method, headers, signal }) =>
   new Promise<ConnectResponse>((resolve, reject) => {
     const secure = url.protocol === "https:"
     const hostname = url.hostname.startsWith("[") ? url.hostname.slice(1, -1) : url.hostname
@@ -138,9 +147,18 @@ export const nodeConnector: Connector = ({ url, address, method, headers, signal
       agent: false,
       signal,
       // TLS: SNI and the certificate check use the URL's name (Node checks `servername`); an IP-literal URL is checked against that IP.
-      ...(secure && !isIp ? { servername: hostname } : {})
+      ...(secure && !isIp ? { servername: hostname } : {}),
+      ...(secure ? { rejectUnauthorized: true, checkServerIdentity: (_host: string, cert: import("node:tls").PeerCertificate) => tls.checkServerIdentity(hostname, cert) } : {}),
+      ...(secure && connectorOptions.ca !== undefined ? { ca: typeof connectorOptions.ca === "string" ? connectorOptions.ca : [...connectorOptions.ca] } : {})
     }
     const req = (secure ? https : http).request(options, (res) => {
+      // Errors of the body reach whoever reads it (the async iterator); a body nobody reads any more must not crash the process.
+      res.on("error", () => undefined)
+      if (signal.aborted) {
+        res.destroy()
+        reject(signal.reason)
+        return
+      }
       const out: Record<string, string> = Object.create(null)
       for (const [k, v] of Object.entries(res.headers)) if (v !== undefined) out[k] = Array.isArray(v) ? v.join(", ") : v
       resolve({ status: res.statusCode ?? 0, headers: out, body: res })
@@ -149,8 +167,16 @@ export const nodeConnector: Connector = ({ url, address, method, headers, signal
     req.end()
   })
 
-/** Race a promise against an abort signal (the promise's own work is not cancelled; the caller aborts what it can). */
+/** `makeNodeConnector()` with the system's certificates. */
+export const nodeConnector: Connector = makeNodeConnector()
+
+/**
+ * Race a promise against an abort signal (the promise's own work is not cancelled; the caller aborts what it can). The promise's
+ * rejection is always handled, also when the signal has already fired: a connector that rejects after the race is lost must not
+ * become an unhandled rejection, which ends a Node process (review round 2, finding 1).
+ */
 const raceAbort = <A>(promise: Promise<A>, signal: AbortSignal): Promise<A> => {
+  promise.catch(() => undefined)
   if (signal.aborted) return Promise.reject(signal.reason)
   return new Promise<A>((resolve, reject) => {
     const onAbort = () => reject(signal.reason)
@@ -300,15 +326,36 @@ async function* rawChunks(body: AsyncIterable<Uint8Array>, limit: number, url: s
 const isZlibHeader = (b: Uint8Array): boolean => b.length >= 2 && (b[0]! & 0x0f) === 8 && ((b[0]! << 8) | b[1]!) % 31 === 0
 
 /**
+ * The first chunks of a body until they hold `n` bytes (or the body ends), joined, so a decision about the format never rests on a
+ * chunk boundary: HTTP chunks and TCP segments may split anywhere, even inside a two-byte header (review round 2, finding 19).
+ */
+const prefixOf = async (raw: AsyncGenerator<Uint8Array>, n: number): Promise<{ head: Uint8Array; done: boolean }> => {
+  const parts: Array<Uint8Array> = []
+  let total = 0
+  for (;;) {
+    if (total >= n) return { head: concat(parts), done: false }
+    const next = await raw.next()
+    if (next.done === true) return { head: concat(parts), done: true }
+    parts.push(next.value)
+    total += next.value.byteLength
+  }
+}
+
+/**
  * Decompress as the chunks arrive and count the decompressed bytes against `limit`, so a small compressed body cannot expand past it
  * (review round 1, finding 3). Compressed bytes are counted too.
  */
 const decodeBody = async (encoding: Exclude<Encoding, "identity">, body: AsyncIterable<Uint8Array>, limit: number, url: string, signal: AbortSignal): Promise<Array<Uint8Array>> => {
   const raw = rawChunks(body, limit, url, signal)
-  let first: IteratorResult<Uint8Array> | undefined = await raw.next()
+  // The platform's streaming decompressors; for deflate, the first two bytes say whether it is zlib-wrapped (RFC 9110 §8.4.1.2) or
+  // raw, as some servers send it.
+  const prefix = await prefixOf(raw, 2)
+  // No bytes at all: an empty body, whatever the header says (servers label empty answers too).
+  if (prefix.done && prefix.head.byteLength === 0) return []
+  let first: IteratorResult<Uint8Array> | undefined = prefix.head.byteLength > 0 ? { done: false, value: prefix.head } : prefix.done ? { done: true, value: undefined } : undefined
   const stream: zlib.Gunzip | zlib.Inflate | zlib.InflateRaw | zlib.BrotliDecompress =
     encoding === "gzip" ? zlib.createGunzip() : encoding === "br" ? zlib.createBrotliDecompress()
-      : first.done !== true && !isZlibHeader(first.value) ? zlib.createInflateRaw() : zlib.createInflate()
+      : prefix.head.byteLength > 0 && !isZlibHeader(prefix.head) ? zlib.createInflateRaw() : zlib.createInflate()
   const out: Array<Uint8Array> = []
   let total = 0
   let failure: unknown
@@ -330,8 +377,8 @@ const decodeBody = async (encoding: Exclude<Encoding, "identity">, body: AsyncIt
   const onAbort = () => { failure ??= signal.reason; stream.destroy() }
   signal.addEventListener("abort", onAbort, { once: true })
   try {
-    for (;;) {
-      const next = first ?? (await raw.next())
+    for (let k = 0; ; k++) {
+      const next: IteratorResult<Uint8Array> = first ?? (prefix.done && k > 0 ? { done: true, value: undefined } : await raw.next())
       first = undefined
       if (failure !== undefined) break
       if (next.done === true) { stream.end(); break }
@@ -421,14 +468,17 @@ const run = async (input: string | URL, options: SafeFetchOptions, allowLan: boo
   if (current instanceof NetRefused) throw current
   for (let hop = 0; ; hop++) {
     const url: URL = current
+    // Nothing is started for a request that is already cancelled.
+    if (signal.aborted) throw signal.reason
     const resolved = await resolveHop(url, allowLan, resolver, signal)
     if (resolved instanceof NetRefused || resolved instanceof NetFailure) throw resolved
     // Connect to an address we checked; try the next one only when a connection cannot be made.
     let response: ConnectResponse | undefined
     let lastError = "no address"
     for (const address of resolved.addresses) {
+      if (signal.aborted) throw signal.reason
       try {
-        response = await raceAbort(connector({ url, address, method, headers, signal }), signal)
+        response = await raceAbort(Promise.resolve().then(() => connector({ url, address, method, headers, signal })), signal)
         break
       } catch (e) {
         if (signal.aborted) throw signal.reason

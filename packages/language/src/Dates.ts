@@ -41,6 +41,8 @@ interface Atom {
   /** Moments relative to now ("in two hours"). */
   readonly offsetMs?: number
   readonly reason?: string
+  /** A weekday or a calendar date, which "on" / "op" may lead ("on Friday"; not "on tomorrow"). */
+  readonly leadable?: boolean
 }
 /** A date expression that was recognised but cannot be read as said ("29 February 2027", "Tuesday 3 March 2027"). */
 const invalid = "invalid" as const
@@ -222,7 +224,7 @@ const withPeriod = (c: Ctx, a: Atom): Atom | typeof invalid => {
   if (a.offsetMs !== undefined) return a
   const p = dayPeriod(c, a.next)
   if (p === undefined) return a
-  if (a.period !== undefined && a.period !== p.period) return invalid
+  if (a.period !== undefined) return invalid // "tonight night", "vrijdagavond avond"
   return { ...a, next: p.next, period: p.period }
 }
 
@@ -270,12 +272,12 @@ const dateAtom = (c: Ctx, i: number): AtomRead => {
     // "Wednesday 3 March 2027", "Friday the 20th": the date decides, and the weekday must be its weekday.
     const explicit = compound === undefined ? readCalendarDate(c, next) : undefined
     if (explicit === invalid) return invalid
-    if (explicit !== undefined) return mod === undefined && isoWeekday(explicit.date) === wd ? { from: i, next: explicit.next, dates: [explicit.date] } : invalid
+    if (explicit !== undefined) return mod === undefined && isoWeekday(explicit.date) === wd ? { from: i, next: explicit.next, dates: [explicit.date], leadable: true } : invalid
     const weekAfter = nextWeekWord(next) || (language === "nl" && norms[next] === "over" && norms[next + 1] === "een" && norms[next + 2] === "week")
     const mondayThis = addDays(today, -(todayWd - 1))
     if (weekAfter) {
       if (mod !== undefined) return invalid // "next Friday next week"
-      return { from: i, next: next + (language === "nl" && norms[next] === "over" ? 3 : 2), dates: [addDays(mondayThis, 7 + wd - 1)], ...period }
+      return { from: i, next: next + (language === "nl" && norms[next] === "over" ? 3 : 2), dates: [addDays(mondayThis, 7 + wd - 1)], leadable: true, ...period }
     }
     if (mod === "next") {
       if (nextWeekWord(i)) return { from: i, next, dates: [addDays(mondayThis, 7 + wd - 1)], ...period }
@@ -283,8 +285,8 @@ const dateAtom = (c: Ctx, i: number): AtomRead => {
       const dates = ahead === 0 ? [addDays(today, 7)] : [addDays(today, first), addDays(today, first + 7)]
       return { from: i, next, dates, reason: `"next ${norms[k]}" can mean the coming one or the one after`, ...period }
     }
-    if (mod === "this") return { from: i, next, dates: [addDays(today, ahead)], ...period }
-    return { from: i, next, dates: [addDays(today, ahead === 0 ? 7 : ahead)], ...period }
+    if (mod === "this") return { from: i, next, dates: [addDays(today, ahead)], leadable: mod === undefined, ...period }
+    return { from: i, next, dates: [addDays(today, ahead === 0 ? 7 : ahead)], leadable: true, ...period }
   }
   if (mod !== undefined) return undefined
   // 3 March [2027], the 3rd of March, March 3rd, the 3rd, de derde, 3 maart
@@ -293,7 +295,7 @@ const dateAtom = (c: Ctx, i: number): AtomRead => {
   if (date !== undefined) {
     const after = weekdayAfter(c, date.next, date.date)
     if (after === invalid) return invalid
-    return { from: i, next: after, dates: [date.date] }
+    return { from: i, next: after, dates: [date.date], leadable: true }
   }
   return undefined
 }
@@ -323,7 +325,7 @@ const readings = (c: Ctx, pos: number, so: Reading): Array<Reading> => {
     const lead = dateLeads[language][norms[pos]!] !== undefined ? 1 : 0
     const a = toks[pos + lead] === undefined ? undefined : dateAtom(c, pos + lead)
     if (a === invalid) return [{ atom: { from: pos, next: pos, dates: [], reason: invalid } }]
-    if (a !== undefined) {
+    if (a !== undefined && (lead === 0 || a.leadable === true)) {
       const full = withPeriod(c, a)
       if (full === invalid) return [{ atom: { from: pos, next: pos, dates: [], reason: invalid } }]
       out.push(...readings(c, full.next, { ...so, atom: { ...full, from: pos } }))

@@ -152,8 +152,11 @@ const minutesBefore = (toks: ReadonlyArray<Tok>, k: number, language: Language):
     found = v === undefined ? [] : [{ value: v, next: k + 1 }]
   }
   const unit: ReadonlySet<string> = language === "en" ? new Set(["minutes", "minute", "mins", "min"]) : new Set(["minuten", "minuut"])
+  // Without "minutes" only the counts a clock is read in: "five to eight", "twenty past seven". "seven to eight" and "two to three"
+  // are ranges, not 7:53 and 2:58.
+  const spoken: ReadonlySet<number> = new Set([5, 10, 15, 20, 25])
   return found.filter((f) => f.value >= 1 && f.value <= 29)
-    .flatMap((f) => unit.has(toks[f.next]?.norm ?? "") ? [{ value: f.value, next: f.next + 1 }, f] : [f])
+    .flatMap((f) => unit.has(toks[f.next]?.norm ?? "") ? [{ value: f.value, next: f.next + 1 }] : spoken.has(f.value) ? [f] : [])
 }
 
 /** hour (1–12) minus one hour, keeping the 12-hour openness. */
@@ -336,7 +339,7 @@ export const resolveTime = (m: TimeMatch, options?: TimeOptions): Resolved | und
   return { time: { ...chosen, guessed: true, alternatives: inBand.filter((c) => c !== chosen) }, nextDay, carry: false }
 }
 
-/** The words a time phrase may hold besides the time: "at seven", "om zeven uur". */
+/** The one word a time phrase may start with besides the time: "at seven", "om zeven uur". */
 export const timeFillers: Record<Language, ReadonlySet<string>> = { en: new Set(["at"]), nl: new Set(["om"]) }
 
 /**
@@ -351,12 +354,10 @@ export const parseTimeOfDay = (text: string, language: Language, options?: TimeO
   if (typeof text !== "string") return notUnderstood
   const toks = tokenize(text)
   if (!onlyWords(text, toks)) return notUnderstood
-  const fillers = timeFillers[language]
-  let i = 0
-  while (i < toks.length && fillers.has(toks[i]!.norm)) i++
+  // One lead word, first; then the time, and nothing after it.
+  const i = toks.length > 0 && timeFillers[language].has(toks[0]!.norm) ? 1 : 0
   for (const m of matchTimes(toks, i, language, true)) {
-    const consumed = new Set(range(i, m.next))
-    if (!accountedFor(toks, consumed, fillers)) continue
+    if (!accountedFor(toks, new Set(range(0, m.next)), new Set())) continue
     if (!numbersWhole(text, toks, [{ start: toks[i]!.start, end: toks[m.next - 1]!.end }])) return notUnderstood
     if (m.hour === 24) return notUnderstood
     const said = sliceText(text, toks, i, m.next)

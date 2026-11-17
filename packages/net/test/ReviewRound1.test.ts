@@ -104,7 +104,7 @@ describe("finding 4: the caller cannot steer the authority or the connection", (
     const connector = fakeConnector((r) => (r.url.hostname === "a.example" ? reply(302, "", { location: "http://b.example/" }) : reply(200, "ok")))
     await Effect.runPromise(safeFetch("http://a.example/", page({ resolver, connector, headers: { "X-Api-Key": "k", "User-Agent": "ua", "Accept-Language": "nl", Authorization: "Bearer x" } })))
     expect(connector.requests[0]!.headers["x-api-key"]).toBe("k")
-    expect({ ...connector.requests[1]!.headers }).toEqual({ "user-agent": "ua", "accept-language": "nl", accept: "text/html, application/xhtml+xml, text/plain, application/pdf" })
+    expect({ ...connector.requests[1]!.headers }).toEqual({ "user-agent": "ua", "accept-language": "nl", accept: "text/html, text/plain, application/pdf" })
   })
 })
 
@@ -339,8 +339,8 @@ describe("finding 31: cache capacities", () => {
     it(`${bad} is refused`, () => expect(() => makeMemoryJsonCache(bad)).toThrow(RangeError))
   it("1 keeps one entry", () => {
     const c = makeMemoryJsonCache(1)
-    c.set("a", { value: 1, storedAt: 0 })
-    c.set("b", { value: 2, storedAt: 0 })
+    c.setIfNewer("a", { value: 1, storedAt: 0, sequence: c.sequence() })
+    c.setIfNewer("b", { value: 2, storedAt: 0, sequence: c.sequence() })
     expect([c.get("a"), c.get("b")?.value]).toEqual([undefined, 2])
   })
 })

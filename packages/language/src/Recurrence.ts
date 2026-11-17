@@ -81,6 +81,7 @@ const partTimes = dict<ClockTime>({ morning: { hour: 8, minute: 0 }, afternoon: 
 const maxDays = [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
 
 interface G {
+  readonly text: string
   readonly toks: ReadonlyArray<Tok>
   readonly norms: ReadonlyArray<string>
   readonly language: Language
@@ -137,7 +138,9 @@ const weekdayList = (g: G, k: number, plural: boolean): { days: Array<number>; n
       part = compound.part
     }
     if (is(g, at, g.language === "en" ? "and" : "en") && ((plural ? weekdayPluralAt(g, at + 1) : weekdayAt(g, at + 1) ?? nlCompoundAt(g, at + 1)?.days) !== undefined)) { at++; continue }
-    if ((plural ? weekdayPluralAt(g, at) : weekdayAt(g, at) ?? nlCompoundAt(g, at)?.days) !== undefined) continue
+    // "Monday, Wednesday and Friday": a list goes on after a comma; "Monday Tuesday" is not a list.
+    const comma = g.toks[at] !== undefined && g.text.slice(g.toks[at - 1]!.end, g.toks[at]!.start).includes(",")
+    if (comma && (plural ? weekdayPluralAt(g, at) : weekdayAt(g, at) ?? nlCompoundAt(g, at)?.days) !== undefined) continue
     break
   }
   if (new Set(days).size !== days.length) return undefined // "every Monday and Monday", "every weekday and Friday"
@@ -230,8 +233,8 @@ const nthWeekdayPhrase = (g: G, k: number, article: boolean): { n: number; wd: n
 const ofMonthTail = (g: G, k: number): { interval: number; next: number } | undefined => {
   if (!is(g, k, g.language === "en" ? "of" : "van")) return undefined
   if (is(g, k + 1, g.language === "en" ? "the" : "de") && is(g, k + 2, g.language === "en" ? "month" : "maand")) return { interval: 1, next: k + 3 }
-  const p = intervalPhrase(g, k + 1)
-  return p !== undefined && p.unit === "month" && adverbs[g.language][g.norms[k + 1] ?? ""] === undefined ? { interval: p.interval, next: p.next } : undefined
+  const p = isEvery(g, k + 1) ? intervalPhrase(g, k + 1) : undefined
+  return p !== undefined && p.unit === "month" ? { interval: p.interval, next: p.next } : undefined
 }
 
 /** A date in a year: "3 March", "the 3rd of March", "March 3rd", "March the third"; Dutch "3 maart", "drie maart", "de derde maart". */
@@ -445,7 +448,7 @@ export const parseRecurrence = (text: string, language: Language, options: Recur
   if (zone === undefined || !Number.isFinite(now) || typeof text !== "string") return notUnderstood
   const toks = tokenize(text)
   if (toks.length === 0 || !onlyWords(text, toks)) return notUnderstood
-  const g: G = { toks, norms: toks.map((t) => t.norm), language }
+  const g: G = { text, toks, norms: toks.map((t) => t.norm), language }
   const nowParts = localParts(now, zone)
   const today: LocalDate = { year: nowParts.year, month: nowParts.month, day: nowParts.day }
   const results: Array<Recurrence> = []
