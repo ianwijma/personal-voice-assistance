@@ -4,6 +4,7 @@ import {
   type ErrorInfo,
   type FieldError,
   MAX_COMBO_OPTIONS,
+  MAX_FIELD_LABEL,
   MAX_MODULE_TEMPLATES,
   MAX_OPTIONS_JSON,
   MAX_ROUTE_DESCRIPTION,
@@ -14,13 +15,13 @@ import {
   type ModuleRouteInfo,
   type ModuleState,
   ModuleUnavailable,
-  type SettingField,
+  SettingField,
   type SettingsForm,
   type SettingsPatch,
   type SettingValue,
   type StatusLine
 } from "@pva/protocol"
-import { Cause, Clock, Deferred, Effect, Exit, Fiber, Option, Schema, Scope, Stream } from "effect"
+import { Cause, Clock, Deferred, Effect, Exit, Fiber, Option, Result, Schema, Scope, Stream } from "effect"
 import {
   ACTION_TIMEOUT_MS,
   ActionError,
@@ -198,6 +199,16 @@ export type { PublishedRoute } from "./ModuleRoutes.ts"
 
 /** Time a field action's handler has (`ModuleHostOptions.fieldActionTimeoutMs`). Below the page's 10 s request limit. */
 export const FIELD_ACTION_TIMEOUT_MS = 8_000
+
+/**
+ * What one module's settings form may take on the wire (UTF-8 bytes of its fields as JSON, with what the running
+ * instance adds: `combo` suggestions and `info` values). Every module's form travels in the one `admin.snapshot`
+ * frame (1 MiB, `MAX_TEXT_FRAME_BYTES`) beside the Health issues (256 KiB) and the templates (128 KiB): 40 modules at
+ * this budget take 320 KiB, leaving about 300 KiB for everything else. A module whose described form does not encode
+ * or is larger does not start (its error names the field); what the instance adds is trimmed to what is left, with
+ * "and N more" shown.
+ */
+export const MODULE_FORM_BUDGET_BYTES = 8 * 1024
 
 export type HostResult = { readonly ok: true } | { readonly ok: false; readonly error: ErrorInfo }
 
@@ -648,7 +659,9 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
     return {
       def,
       rank: 0,
-      catalogError: cycle === undefined ? undefined : `Its "uses" form a cycle (${[...cycle, cycle[0]].join(" → ")}), so it cannot start. Fix the module catalogue.`,
+      catalogError: cycle === undefined
+        ? formProblem(def, (def.kind === "agent" || def.kind === "decider") && !Object.hasOwn(def.settings, "test"))
+        : `Its "uses" form a cycle (${[...cycle, cycle[0]].join(" → ")}), so it cannot start. Fix the module catalogue.`,
       want,
       shown: want,
       run: undefined,
@@ -1031,7 +1044,8 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
           risks: [...meta.risks]
         }
       }),
-      settings: decorateForm(entry, resolve(entry).form),
+      // A form that cannot be sent (the module does not start, `formProblem`) is not sent either.
+      settings: entry.catalogError !== undefined && !cycles.has(id) ? EMPTY_FORM : decorateForm(entry, resolve(entry).form),
       revision: entry.revision,
       ...(entry.def.kind !== undefined ? { kind: entry.def.kind } : {}),
       ...(entry.want.demand !== undefined ? { instances: instanceInfos(entry) } : {}),
@@ -1086,10 +1100,17 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
     const checked = { ...form, errors, ...(warnings !== undefined ? { warnings } : {}) }
     if (infos === undefined && options === undefined && !generated && !form.fields.some((f) => f.type === "combo")) return checked
     const values: Record<string, SettingValue> = { ...form.values }
-    const fields = form.fields.map((field): SettingField => {
+    const base = generated ? [...form.fields, GENERATED_TEST_FIELD] : form.fields
+    // What the instance adds fits in what the described form leaves of the module's budget (`MODULE_FORM_BUDGET_BYTES`).
+    let room = MODULE_FORM_BUDGET_BYTES - formBytes(base)
+    const fields = base.map((field): SettingField => {
       const info = own(infos, field.key)
       // Through the boundary: an info value never carries one of the module's secrets to the page.
-      if (field.type === "info" && typeof info === "string") values[field.key] = boundary.text(entry.def.id, info, 1000)
+      if (field.type === "info" && typeof info === "string") {
+        const shown = withinBytes(boundary.text(entry.def.id, info, 1000), room)
+        values[field.key] = shown
+        room -= jsonBytes(shown)
+      }
       if (field.type !== "combo") return field
       // A closed combo accepts only its static options (`Setting.combo`), so only an open one shows the instance's.
       if (!field.allowCustom) return field
@@ -1097,23 +1118,23 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
       const list = boundary.options(entry.def.id, own(options, field.key))
       const known = new Set(field.options.map((o) => o.value))
       const added = (list ?? []).filter((o) => !known.has(o.value) && (known.add(o.value), true))
-      // Within the wire's bounds: at most MAX_COMBO_OPTIONS in all and MAX_OPTIONS_JSON as JSON (the last go).
-      const all = withinOptionBounds([...field.options, ...added], field.options.length)
-      const note = instance === undefined ? "Not running: type a name" : list !== undefined ? `${all.length} suggestions from ${entry.def.name}` : undefined
-      return { ...field, options: all, ...(note !== undefined && field.optionsNote === undefined ? { optionsNote: note } : {}) }
+      // Within the wire's bounds: at most MAX_COMBO_OPTIONS in all and MAX_OPTIONS_JSON as JSON (the last go), and
+      // within the module's budget.
+      const bounded = withinOptionBounds([...field.options, ...added], field.options.length)
+      const all = [...field.options]
+      for (const option of bounded.slice(field.options.length)) {
+        const cost = jsonBytes(option) + 1
+        if (cost > room) break
+        room -= cost
+        all.push(option)
+      }
+      const more = field.options.length + added.length - all.length
+      const counted = more > 0 ? `${all.length} suggestions from ${entry.def.name} and ${more} more` : `${all.length} suggestions from ${entry.def.name}`
+      const note = instance === undefined ? "Not running: type a name" : list !== undefined ? counted : undefined
+      // "and N more" is always visible, also beside the field's own note.
+      const shownNote = more > 0 && field.optionsNote !== undefined ? `${field.optionsNote} (and ${more} more)` : field.optionsNote ?? note
+      return { ...field, options: all, ...(shownNote !== undefined ? { optionsNote: clip(shownNote, MAX_FIELD_LABEL) } : {}) }
     })
-    if (generated) {
-      fields.push({
-        type: "action",
-        key: "test",
-        label: "Test",
-        description: "Sends one short message and reports the first answer and how long it took.",
-        apply: "live",
-        buttonLabel: "Test",
-        requiresSaved: true,
-        source: "default"
-      })
-    }
     return { ...checked, fields, values }
   }
 
@@ -1131,7 +1152,7 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
     const unused = severity === "warning" && entry.want.demand !== undefined ? " (No assistant has it on.)" : ""
     const page = { kind: "link", label: `Open ${name}`, value: `#settings/shared/modules/${id}` } as const
     if (entry.catalogError !== undefined) {
-      out.push({ id: `${id}.uses`, module: id, severity: "error", title: `${name} cannot start`, detail: entry.catalogError })
+      out.push({ id: cycles.has(id) ? `${id}.uses` : `${id}.form`, module: id, severity: "error", title: `${name} cannot start`, detail: entry.catalogError })
     }
     for (const st of entry.want.statuses) {
       if (st.state !== "missing") continue
@@ -2743,6 +2764,69 @@ function normaliseIssues(
       const safe = wireSafeIssue(issue, id, i)
       return safe.module === undefined ? { ...safe, module: id } : safe
     })
+}
+
+// ---------------------------------------------------------------------------
+// The form's budget (`MODULE_FORM_BUDGET_BYTES`)
+
+const utf8 = new TextEncoder()
+const jsonBytes = (value: unknown): number => utf8.encode(JSON.stringify(value)).length
+/** Room kept per field for what the host adds at run time beside the instance's values: a combo's note, a cut marker. */
+const NOTE_RESERVE_BYTES = 256
+/** The described fields' size, with the room their run-time notes need. */
+const formBytes = (fields: ReadonlyArray<SettingField>): number =>
+  jsonBytes(fields) + fields.filter((f) => f.type === "combo" || f.type === "info").length * NOTE_RESERVE_BYTES
+
+/** `text` cut to `room` bytes as JSON, saying how much was left out. */
+const withinBytes = (text: string, room: number): string => {
+  if (jsonBytes(text) <= room) return text
+  let keep = Math.max(0, Math.min(text.length, room - 64))
+  while (keep > 0 && jsonBytes(text.slice(0, keep)) > room - 64) keep = Math.floor(keep * 0.9)
+  return `${text.slice(0, keep)}… (and ${text.length - keep} more characters)`
+}
+
+const encodeField = Schema.encodeUnknownResult(SettingField)
+
+/** The generated Test button of an agent or decision provider without a `test` field of its own. */
+const GENERATED_TEST_FIELD: SettingField = {
+  type: "action",
+  key: "test",
+  label: "Test",
+  description: "Sends one short message and reports the first answer and how long it took.",
+  apply: "live",
+  buttonLabel: "Test",
+  requiresSaved: true,
+  source: "default"
+}
+
+/** The form sent for a module whose own form cannot be sent. */
+const EMPTY_FORM: SettingsForm = { fields: [], values: {}, secrets: {}, errors: [] }
+
+/**
+ * Why a module's described form cannot be sent, naming the field, or `undefined`: checked once, when the host is made,
+ * against the wire's own schema (`SettingField`, every nested record item and option included) and the module's budget
+ * (`MODULE_FORM_BUDGET_BYTES`). Such a module does not start.
+ */
+const formProblem = (def: ModuleDefinition<any>, generatedTest = false): string | undefined => {
+  let fields: ReadonlyArray<SettingField>
+  try {
+    fields = resolveSettings(def.settings, { stored: {}, secrets: {}, env: {} }).form.fields
+  } catch (error) {
+    return `Its settings form could not be described: ${describe(error)}`
+  }
+  const all = generatedTest ? [...fields, GENERATED_TEST_FIELD] : fields
+  let used = 0
+  for (const field of all) {
+    const encoded = encodeField(field)
+    if (Result.isFailure(encoded)) {
+      return `Its settings field "${field.key}" cannot be sent to the admin page: ${clip(encoded.failure.message.replace(/\s+/g, " "), 300)}. Fix the module.`
+    }
+    used += formBytes([encoded.success as SettingField]) - 2
+    if (used > MODULE_FORM_BUDGET_BYTES) {
+      return `Its settings form is larger than the ${MODULE_FORM_BUDGET_BYTES} bytes a module's form may take, from the field "${field.key}" on. Fix the module.`
+    }
+  }
+  return undefined
 }
 
 // ---------------------------------------------------------------------------

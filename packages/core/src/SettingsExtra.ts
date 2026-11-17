@@ -69,6 +69,7 @@ const declareOptions = (what: string, options: ReadonlyArray<ChoiceOption> | und
   declare(what, options.length <= MAX_COMBO_OPTIONS, `at most ${MAX_COMBO_OPTIONS} options`)
   for (const option of options) {
     declare(what, option.value.length >= 1 && option.value.length <= 200, "an option value has 1 to 200 characters")
+    declare(what, option.tags === undefined || option.tags.length <= 6, "an option has at most 6 tags")
     textBound(`${what} option label`, option.label, MAX_FIELD_LABEL)
     textBound(`${what} option description`, option.description, 500)
     textBound(`${what} option implication`, option.implication, 500)
@@ -76,6 +77,14 @@ const declareOptions = (what: string, options: ReadonlyArray<ChoiceOption> | und
   declare(what, JSON.stringify(options).length <= MAX_OPTIONS_JSON, `the options must be at most ${MAX_OPTIONS_JSON} characters as JSON`)
 }
 const tooLarge = (value: unknown) => JSON.stringify(value).length > MAX_LIST_JSON
+/**
+ * A field's default goes through its own decoder: a default the field refuses is a declaration error, and the decoded
+ * value (trimmed, without duplicates) is the one kept, in `defaultValue` and in the described field alike.
+ */
+const declaredDefault = <A>(what: string, decoded: Decoded<A>): A => {
+  if (!decoded.ok) throw new Error(`${what}: must be a value the field accepts (${decoded.error})`)
+  return decoded.value
+}
 
 const commonFields = (key: string, o: Common) => ({
   key,
@@ -121,18 +130,18 @@ const textList = (o: Common & {
     if (items.length > maxItems) return fail(`At most ${maxItems} items`)
     return tooLarge(items) ? fail(`The list is too long (at most ${MAX_LIST_JSON} characters in all)`) : ok(items)
   }
-  declare("A text list's default", decode(o.default ?? []).ok, "must be a value the field accepts")
+  const defaultValue = declaredDefault("A text list's default", decode(o.default ?? []))
   return {
     type: "textList",
     secret: false,
     ...visibility(o),
     env: o.env,
     value: "editable",
-    defaultValue: o.default ?? [],
+    defaultValue,
     describe: (key) => ({
       type: "textList",
       ...commonFields(key, o),
-      default: o.default ?? [],
+      default: defaultValue,
       maxItems,
       itemMaxLength,
       ...(o.placeholder !== undefined ? { placeholder: o.placeholder } : {})
@@ -208,18 +217,18 @@ const records = <const I extends ItemSpec>(o: Common & {
     const problem = o.check?.(result)
     return problem === undefined ? ok(result) : fail(problem)
   }
-  declare("A records field's default", decode(o.default ?? []).ok, "must be a value the field accepts")
+  const defaultValue = declaredDefault("A records field's default", decode(o.default ?? []))
   return {
     type: "records",
     secret: false,
     ...visibility(o),
     env: o.env,
     value: "editable",
-    defaultValue: o.default ?? [],
+    defaultValue,
     describe: (key) => ({
       type: "records",
       ...commonFields(key, o),
-      default: (o.default ?? []) as never,
+      default: defaultValue as never,
       itemFields: Object.entries(o.item).map(([k, s]) => itemField(k, s)),
       itemLabel: o.itemLabel,
       titleKey: o.titleKey,
@@ -267,17 +276,19 @@ const combo = (o: Common & {
     if (!allowCustom && !known.has(value)) return fail(`Must be one of: ${[...known].join(", ")}`)
     return ok(value)
   }
+  // A closed combo's default must be one of its static options; an open one's must be text it accepts.
+  const defaultValue = declaredDefault("A combo's default", decode(o.default))
   return {
     type: "combo",
     secret: false,
     ...visibility(o),
     env: o.env,
     value: "editable",
-    defaultValue: o.default,
+    defaultValue,
     describe: (key) => ({
       type: "combo",
       ...commonFields(key, o),
-      default: o.default,
+      default: defaultValue,
       options: o.options ?? [],
       allowCustom,
       maxLength,

@@ -78,7 +78,7 @@ describe("host diagnostics are matched whole before they are shortened (4a-4)", 
         settings: key,
         health: ({ settings }) =>
           Effect.sync(() => {
-            throw new Error(String(settings.key))
+            throw new Error(String(settings?.key))
           }),
         start: () => Effect.succeed({})
       })

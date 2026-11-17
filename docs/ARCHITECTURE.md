@@ -406,7 +406,15 @@ CurrentPrincipal: Context.Reference<Principal | undefined>       // the admitted
   `packages/protocol/src/settings.ts` and `moduleRoutes.ts`; a records or text-list value at most 32 KB as JSON, at
   most 200 options per combo and 32 KB of options), the core constructors refuse declarations outside them, and the
   host cuts what a module returns at run time (`info` 1000 characters, results 500, options to the bound) before it is
-  sent, so one module form stays far below the 1 MB frame.
+  sent. **One check of the whole form** (round 4): when the host is made, each module's described form is encoded with
+  the wire's own `SettingField` schema (record items and options included) and measured against
+  `MODULE_FORM_BUDGET_BYTES` (8 KiB of fields as JSON, with 256 bytes kept per `combo` and `info` field for run-time
+  notes); a module whose form does not encode or is larger does not start (Health `<module>.form`, its error names the
+  field) and its form is not sent. Every module's form travels in the one `admin.snapshot` frame (1 MiB) beside the
+  Health issues (256 KiB) and templates (128 KiB): 40 modules at their budget take 320 KiB. What the running instance
+  adds (`combo` suggestions, `info` values) is trimmed to what the form leaves of the budget, the note saying "and N
+  more". A field's default goes through its own decoder: one the field refuses is a declaration error, and the decoded
+  value is kept in `defaultValue` and the description.
 - **Slots** (P3, `ModuleSlots.ts`): a route handler or a press runs in a slot of its module, taken before its fiber
   starts and given back exactly once when that fiber has really ended (`ModuleSlots.run` takes it, starts the fiber
   and installs the observer; there is no other way to start one). At most 16 handlers (`MAX_ROUTE_SLOTS`) and 4
