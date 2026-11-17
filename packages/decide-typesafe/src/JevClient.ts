@@ -186,9 +186,14 @@ const statusError = (status: number, body: string, retryAfterHeader: string | nu
 // ---------------------------------------------------------------------------
 // Client
 
+export interface JevCallOptions {
+  /** This call's time limit instead of the client's `timeoutMs` (routing: the device's give-up time). */
+  readonly timeoutMs?: number
+}
+
 export interface JevClient {
-  /** One decision; at most `timeoutMs`; interruptible (aborts the request). */
-  readonly decide: (request: DecisionRequest) => Effect.Effect<DecisionResponse, DecisionError>
+  /** One decision; at most `timeoutMs` (or the call's own); interruptible (aborts the request). */
+  readonly decide: (request: DecisionRequest, call?: JevCallOptions) => Effect.Effect<DecisionResponse, DecisionError>
   /** Milliseconds of the last successful decision, for the status line. */
   readonly lastMs: () => number | undefined
 }
@@ -222,11 +227,12 @@ export const makeJevClient = (options: JevClientOptions): JevClient => {
   let keyRejected: DecisionError | undefined
   let last: number | undefined
 
-  const attempt = (request: DecisionRequest): Effect.Effect<DecisionResponse, DecisionError> =>
+  const attempt = (request: DecisionRequest, call: JevCallOptions): Effect.Effect<DecisionResponse, DecisionError> =>
     Effect.suspend(() => {
       if (setup instanceof DecisionError) return Effect.fail(setup)
       if (keyRejected !== undefined) return Effect.fail(keyRejected)
-      const { baseUrl, model, timeoutMs, fetchFn, apiKey } = setup
+      const { baseUrl, model, fetchFn, apiKey } = setup
+      const timeoutMs = call.timeoutMs ?? setup.timeoutMs
       const started = performance.now()
       return Effect.tryPromise({
         try: async (signal) => {
@@ -277,8 +283,8 @@ export const makeJevClient = (options: JevClientOptions): JevClient => {
     })
 
   // The last resort: anything unexpected (a defect) leaves as a sanitised `DecisionError`.
-  const decide = (request: DecisionRequest): Effect.Effect<DecisionResponse, DecisionError> =>
-    attempt(request).pipe(
+  const decide = (request: DecisionRequest, call: JevCallOptions = {}): Effect.Effect<DecisionResponse, DecisionError> =>
+    attempt(request, call).pipe(
       Effect.catchDefect((defect) =>
         Effect.fail(decisionError(secrets, { reason: "unavailable", message: `The TypeSafe decision failed unexpectedly: ${fromUpstream(defect, secrets)}`, cause: defect }))
       ),

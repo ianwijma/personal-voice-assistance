@@ -16,6 +16,7 @@
     "@pva/audio-pipewire": "workspace:*",
     "@pva/audio-web": "workspace:*",
     "@pva/core": "workspace:*",
+    "@pva/decide-typesafe": "workspace:*",
     "@pva/llm-anthropic": "workspace:*",
     "@pva/module-home-assistant": "workspace:*",
     "@pva/modules-builtin": "workspace:*",

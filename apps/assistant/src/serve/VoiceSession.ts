@@ -29,6 +29,8 @@ import {
   type TraceInfo,
   type TraceRoute,
   typedTextTarget,
+  TYPESAFE_GIVE_UP_MS,
+  typesafeCandidates,
   WAKE_ARMED_MS
 } from "@pva/protocol"
 import { Cause, Deferred, Effect, Exit, Fiber, Queue, type Scope, Stream } from "effect"
@@ -36,8 +38,9 @@ import type { Engine, SessionLoop } from "./Engine.ts"
 import { type HeardAudio, makeHeardAudio } from "./HeardAudio.ts"
 import { makeOutputLease } from "./OutputLease.ts"
 import { makePublisher, type Publisher } from "./Publisher.ts"
+import { makeTypesafeDecide, type RoutingService, typesafeNow } from "./routing.ts"
 import { makeSessionConversation, type SendOutcome, type SessionConversation } from "./SessionConversation.ts"
-import { type DispatchRoute, type DispatchTarget, makeSessionDispatcher, type SessionDispatcher } from "./SessionDispatcher.ts"
+import { type DispatchRoute, type DispatchTarget, makeSessionDispatcher, type RouteDecision, type SessionDispatcher } from "./SessionDispatcher.ts"
 import { makeStateTracker, type StateTracker } from "./StateTracker.ts"
 
 /**
@@ -114,6 +117,11 @@ export interface VoiceSessionOptions {
   readonly voiceOf?: (assistant: string) => string | undefined
   /** The module that contributes a tool (module host snapshot). */
   readonly moduleOfTool: (name: string) => string | null
+  /**
+   * TypeSafe routing (the shared `routing` section, docs/ASSISTANTS.md §3.6): asked for an utterance the route gate
+   * leaves to `decide` (a TypeSafe device, no phrase, no open window). Absent or not ready: nobody answers it.
+   */
+  readonly routing?: () => RoutingService | undefined
   /** The shared trace service (log line, recent list); this session numbers its own turns and sets `session`. */
   readonly turnTrace: TurnTrace["Service"]
   /** To every connection of this device. */
@@ -231,9 +239,20 @@ export const assistantTurnTrace = (
     readonly deviceId?: string | undefined
     readonly assistant?: () => { readonly id: string; readonly name: string } | undefined
     readonly route?: () => TraceRoute | undefined
+    /** The routing call's times (trace clock) of the route, when TypeSafe was asked. */
+    readonly routeTimes?: () => Pick<RouteDecision, "sentAt" | "receivedAt"> | undefined
   }
-): TurnTrace["Service"] =>
-  TurnTrace.of({
+): TurnTrace["Service"] => {
+  /** `routeSent`/`routeReceived` of the current route (replaced: the final may have asked again). */
+  const markRoute = (trace: Trace) => {
+    const times = fields.routeTimes?.()
+    delete trace.marks.routeSent
+    delete trace.marks.routeReceived
+    if (times === undefined) return
+    trace.marks.routeSent = times.sentAt
+    if (times.receivedAt !== undefined) trace.marks.routeReceived = times.receivedAt
+  }
+  return TurnTrace.of({
     now: shared.now,
     begin: (mode, speculative = false) => {
       const session = fields.session()
@@ -252,18 +271,23 @@ export const assistantTurnTrace = (
         ...(assistant !== undefined && fields.deviceId !== undefined ? { deviceId: fields.deviceId } : {}),
         ...(route !== undefined ? { route } : {})
       }
+      if (mode === "voice") markRoute(trace)
       return trace
     },
     mark: (trace, mark) => {
       shared.mark(trace, mark)
       if (mark === "endOfTurn" && fields.route !== undefined) {
         const route = fields.route()
-        if (route !== undefined) trace.route = route
+        if (route !== undefined) {
+          trace.route = route
+          markRoute(trace)
+        }
       }
     },
     finish: shared.finish,
     recent: shared.recent
   })
+}
 
 /** One assistant's conversation in a session, as the dispatcher holds it. */
 export interface AssistantConversation extends DispatchTarget {
@@ -506,9 +530,19 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
         case "default":
         case "typed":
           return { by: r.by }
-        // No TypeSafe yet (WP-14): a `decide` utterance is answered by the fallback, the device's default answerer.
-        case "decide":
-          return { by: "default" }
+        // TypeSafe (§3.6): its outcome and time; without a call (no candidate) the fallback, as the device's default.
+        case "decide": {
+          const d = r.decision
+          if (d === undefined) return { by: "default" }
+          return {
+            by: "typesafe",
+            outcome: d.outcome,
+            ...(d.probability !== undefined ? { probability: Math.round(d.probability * 1000) / 1000 } : {}),
+            ...(d.fits !== undefined ? { fits: Math.round(d.fits * 1000) / 1000 } : {}),
+            ms: Math.round(d.ms * 10) / 10,
+            fallback: r.fallback
+          }
+        }
         // It was replying (the barge-in owner) and no transcript chose otherwise.
         case "barge-in":
           return { by: "follow-up" }
@@ -530,8 +564,30 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
       return info
     }
 
+    // TypeSafe routing for `decide` utterances (§3.6): the device's switched-on assistants, described by their Handles.
+    const decide = makeTypesafeDecide({
+      routing: () => options.routing?.(),
+      candidates: () => {
+        const assistants = options.assistants()
+        return typesafeCandidates(options.deviceSettings(), assistants).map((id) => {
+          const a = assistants.get(id)!
+          return { id, name: a.name, purpose: a.purpose, handles: a.handles }
+        })
+      },
+      giveUpMs: () => {
+        const wp = options.deviceSettings().withoutPhrase
+        return wp.mode === "typesafe" ? wp.giveUpMs : TYPESAFE_GIVE_UP_MS.default
+      },
+      now: options.turnTrace.now,
+      log: (line) => options.log(`${options.name()}: ${line}`)
+    })
+
     const dispatcher = makeSessionDispatcher<Target>({
       replyEarly: (assistant) => assistantOf(assistant)?.replyEarly ?? true,
+      decide,
+      // The device may have changed while TypeSafe was asked: the answer goes only to an assistant it still has, and
+      // to nobody once the device no longer routes by TypeSafe.
+      decideNow: () => typesafeNow(options.deviceSettings(), options.assistants()),
       make: (assistant, hooks) =>
         Effect.gen(function*() {
           const inbox = yield* Queue.unbounded<ConversationInput>()
@@ -549,7 +605,11 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
                 const a = assistantOf(assistant)
                 return { id: assistant, name: a?.name ?? assistant }
               },
-              route: () => traceRouteOf(assistant)
+              route: () => traceRouteOf(assistant),
+              routeTimes: () => {
+                const r = dispatcherRef?.routeOf(assistant)
+                return r?.by === "decide" ? r.decision : undefined
+              }
             }),
             setup,
             ...(agentSetup !== undefined ? { agentSetup } : {}),

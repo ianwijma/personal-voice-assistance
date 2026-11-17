@@ -75,6 +75,7 @@ describe("serve: handshake", () => {
       ["stt-deepgram", "speech/deepgram"],
       ["voices", "voices/overview"],
       ["voice-providers", "voices/providers"],
+      ["routing", "agents/routing"],
       ["recordings", "diagnostics/recordings"]
     ])
     expect(snapshot.modules[0]).toMatchObject({ id: "greeter", group: "modules" })

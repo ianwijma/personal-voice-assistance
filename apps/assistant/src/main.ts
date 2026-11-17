@@ -21,6 +21,7 @@ import { collectWavs, parseLiveArgs, runLiveSessions } from "./bench/live.ts"
 import { makeBenchWavs } from "./bench/makeWavs.ts"
 import { runOffline, runOfflineSessions, type SimulatedDelays, zeroDelays } from "./bench/offline.ts"
 import { formatReport } from "./bench/report.ts"
+import { formatLive, parseTypesafeLiveArgs, runTypesafeLive, typesafeScenarios } from "./bench/typesafe.ts"
 import { AppConfig } from "./config.ts"
 import { userCwd } from "./env.ts"
 import { moduleCatalog, startCliModules, withModuleInstructions } from "./modules.ts"
@@ -235,6 +236,28 @@ const bench = (args: ReadonlyArray<string>) =>
       )
       return
     }
+    if (args[0] === "--typesafe") {
+      // WP-14: what a TypeSafe decision costs a turn, simulated (docs/ASSISTANTS.md §3.6).
+      const rounds = yield* Config.Int("BENCH_ROUNDS").pipe(Config.withDefault(3))
+      for (const scenario of typesafeScenarios(yield* RealisticDelays)) {
+        const rows = yield* runOffline(scenario, rounds)
+        yield* Effect.sync(() => console.log(formatReport(scenario.name, rows, { headline: { key: "EOT->PLAY", label: "recogniser EndOfTurn -> playback start" } })))
+      }
+      console.log("Trace columns are relative to the conversation's end of turn (after a decision held at the final); EOT->PLAY is from the recogniser's.")
+      return
+    }
+    if (args[0] === "--typesafe-live") {
+      // WP-14: real routing requests with the owner's key (environment or vault). Sends the utterances to TypeSafe.
+      const parsed = parseTypesafeLiveArgs(args.slice(1))
+      if (typeof parsed === "string") return yield* new StartupError({ message: `${parsed}. Usage: bench --typesafe-live [--count N] [--gap-ms MS] [--timeout-ms MS]` })
+      const apiKey = yield* Config.String("TYPESAFE_API_KEY").pipe(Config.withDefault(""))
+      if (apiKey.trim() === "") return yield* new StartupError({ message: "bench --typesafe-live needs TYPESAFE_API_KEY (in the environment, or saved in the vault with PVA_VAULT_PASSWORD)." })
+      const baseUrl = yield* Config.String("TYPESAFE_BASE_URL").pipe(Config.withDefault(""))
+      const model = yield* Config.String("TYPESAFE_MODEL").pipe(Config.withDefault(""))
+      const rows = yield* runTypesafeLive({ apiKey, ...parsed, ...(baseUrl !== "" ? { baseUrl } : {}), ...(model !== "" ? { model } : {}) })
+      console.log(formatLive(rows, `TypeSafe routing, live: ${rows.length} requests to ${baseUrl || "https://api.typesafe.ai"}, ${parsed.gapMs} ms apart, model ${model || "jev-1.14.0"}`))
+      return
+    }
     if (args[0] === "--sessions") {
       const n = Number(args[1])
       if (!Number.isInteger(n) || n < 1 || n > 16) return yield* new StartupError({ message: "Usage: bench --sessions N (1..16)" })
@@ -261,7 +284,7 @@ const program: Effect.Effect<void, unknown> = mode === "text"
   : mode === "serve"
   ? serveMode
   : new StartupError({
-    message: `Unknown mode "${mode}". Usage: assistant [text | voice | serve | bench [--sessions N | --live [--rounds N] [--sessions N] [--stagger MS] [--llm-per-session] <wavs> | --make-wavs [dir]] | ` +
+    message: `Unknown mode "${mode}". Usage: assistant [text | voice | serve | bench [--sessions N | --typesafe | --typesafe-live [--count N] [--gap-ms MS] | --live [--rounds N] [--sessions N] [--stagger MS] [--llm-per-session] <wavs> | --make-wavs [dir]] | ` +
       "say [--voice PROVIDER:VOICE] [--out FILE] <text> | transcribe <wav file> | compare-models [--models a,b] [--agc on|off|both] [--ref TEXT] <wavs>]"
   })
 

@@ -379,7 +379,7 @@ const phraseEntries = (assignments: ReadonlyArray<Assignment>) =>
 export interface DeviceValidation {
   /** Refuse the save. `code` is one of `duplicate_phrase`, `unknown_assistant`, `limit_reached`, `invalid`. */
   readonly errors: ReadonlyArray<Issue>
-  /** Ask "Save anyway": assistants that cannot be reached. */
+  /** Ask "Save anyway": assistants that cannot be reached; on a TypeSafe device, switched-on assistants without Handles. */
   readonly warnings: ReadonlyArray<Issue>
 }
 
@@ -387,11 +387,14 @@ export interface DeviceValidation {
  * A device's (or type's) effective settings against the known assistant ids: every assignment's assistant exists
  * and appears once; `withoutPhrase` and `fallback` name only assigned assistants; one phrase (after `wakeWords`)
  * belongs to one assignment only (`duplicate_phrase`); at most `MAX_ASSIGNMENTS` assignments and
- * `MAX_PHRASES_PER_DEVICE` phrases. A warning for each assigned assistant that cannot be reached.
+ * `MAX_PHRASES_PER_DEVICE` phrases. A warning for each assigned assistant that cannot be reached. With `assistants`
+ * (their records): on a TypeSafe device, a warning (`no_handles`) for each switched-on assigned assistant whose Handles
+ * is empty (§2.2: TypeSafe then goes by its name and purpose only).
  */
 export const validateDeviceSettings = (
   settings: Pick<DeviceSettings, "assistants" | "withoutPhrase">,
-  knownAssistants: ReadonlySet<string>
+  knownAssistants: ReadonlySet<string>,
+  options: { readonly assistants?: ReadonlyMap<string, Pick<Assistant, "name" | "on" | "handles">> } = {}
 ): DeviceValidation => {
   const errors: Array<Issue> = []
   const warnings: Array<Issue> = []
@@ -439,6 +442,14 @@ export const validateDeviceSettings = (
         code: "unreachable",
         path: `assistants.${a.assistant}`,
         message: `${a.assistant} cannot be reached: no wake phrase, not the one that answers without a phrase, and no TypeSafe.`
+      })
+    }
+    const record = options.assistants?.get(a.assistant)
+    if (wp.mode === "typesafe" && record !== undefined && record.on && record.handles.trim() === "") {
+      warnings.push({
+        code: "no_handles",
+        path: `assistants.${a.assistant}.handles`,
+        message: `${record.name} has no Handles text, so TypeSafe can only go by its name and purpose.`
       })
     }
   }

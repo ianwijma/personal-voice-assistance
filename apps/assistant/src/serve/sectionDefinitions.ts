@@ -15,6 +15,7 @@ import { SUBSCRIPTION_AGENT_ID, SUBSCRIPTION_PROVIDER } from "../subscription.ts
 import { defaultSystemPrompt } from "../config.ts"
 import { parseVoiceKey, voiceKey } from "@pva/core"
 import { isTtsProvider, ttsProviderInfo } from "../providers.ts"
+import { checkUrl, defaults as jevDefaults } from "@pva/decide-typesafe"
 import { ASSISTANT_VOICE, DEFAULT_ASSISTANT_VOICE } from "../voiceSelection.ts"
 
 /**
@@ -187,6 +188,57 @@ export const homeSection: SectionDefinition = {
       ]
     })
   }
+}
+
+/**
+ * The shared `routing` section (WP-14). Off by default: sentences leave this machine only once the owner switches it
+ * on and adds a key, and only from devices set to "TypeSafe decides". Applied live (each decision reads it).
+ */
+const routingSection: SectionDefinition = {
+  id: "routing",
+  title: "TypeSafe",
+  description: "TypeSafe's Jev model picks which assistant on a device a sentence without a wake phrase is for, from each assistant's Handles line.",
+  group: "agents",
+  page: { id: "routing", title: "Routing", description: "Who a sentence is for, when no wake phrase was said. Used only on devices that let TypeSafe decide." },
+  order: 40,
+  protected: true,
+  spec: {
+    TYPESAFE_ROUTING: Setting.boolean({
+      label: "Let TypeSafe choose the assistant",
+      description: "Hosted and optional. What is sent: the sentence as text and the Handles line of each assistant on that device. " +
+        "A wake phrase always wins and skips TypeSafe; so does the next sentence within an assistant's follow-up time. " +
+        "It adds a delay before the reply starts, only for sentences without a phrase (see Diagnostics › Latency, Routing).",
+      env: "TYPESAFE_ROUTING",
+      default: false
+    }),
+    TYPESAFE_API_KEY: Setting.secret({
+      label: "TypeSafe API key",
+      description: "From console.typesafe.ai/keys. Kept in the vault. Without it, devices set to \"The one that fits\" answer nobody without a phrase.",
+      env: "TYPESAFE_API_KEY"
+    }),
+    TYPESAFE_MODEL: Setting.text({
+      label: "Model",
+      description: "A pinned version: the decision thresholds are tuned for one version, and jev-latest moves.",
+      env: "TYPESAFE_MODEL",
+      default: jevDefaults.model,
+      maxLength: 100,
+      check: (v) => (v.trim() === "" ? "Must not be empty" : undefined)
+    }),
+    TYPESAFE_BASE_URL: Setting.text({
+      label: "Server address",
+      description: "Any server that speaks /v1/systemone.",
+      env: "TYPESAFE_BASE_URL",
+      default: jevDefaults.baseUrl,
+      advanced: true,
+      check: checkUrl
+    })
+  },
+  checks: [
+    (v) =>
+      v.value("TYPESAFE_ROUTING") === true && !v.secretSet("TYPESAFE_API_KEY")
+        ? [warn("TYPESAFE_API_KEY", "TypeSafe is switched on but there is no API key: devices set to \"The one that fits\" answer nobody without a phrase until you add it.")]
+        : []
+  ]
 }
 
 export const sectionDefinitions = (dirs: ModelDirs = defaultModelDirs): ReadonlyArray<SectionDefinition> => {
@@ -606,6 +658,9 @@ export const sectionDefinitions = (dirs: ModelDirs = defaultModelDirs): Readonly
         })
       }
     },
+
+    // ---- Routing (docs/ASSISTANTS.md §2.4, §3.6): TypeSafe chooses the assistant for a sentence without a phrase
+    routingSection,
 
     // ---- Diagnostics
     {
