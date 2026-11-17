@@ -28,7 +28,20 @@ export const MAX_TOOL_RISKS = 5
  */
 export const MAX_HEALTH_BYTES = 256 * 1024
 
-const utf8 = new TextEncoder()
+/** UTF-8 length of a string (the protocol package has no DOM or Node types, so no `TextEncoder`). */
+const utf8Length = (text: string): number => {
+  let n = 0
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charCodeAt(i)
+    if (c < 0x80) n += 1
+    else if (c < 0x800) n += 2
+    else if (c >= 0xd800 && c <= 0xdbff && i + 1 < text.length) {
+      n += 4
+      i++
+    } else n += 3
+  }
+  return n
+}
 
 /** How bad an issue is: `error` stops something working (doctor exits non-zero), `warning` may, `info` is a fact. */
 export const IssueSeverity = Schema.Literals(["error", "warning", "info"])
@@ -71,7 +84,7 @@ export const HealthInfo = Schema.Struct({
   checkedAt: Schema.optionalKey(NonNegativeFinite),
   /** A check ("Check again", or the one at start) is running. */
   checking: Schema.Boolean
-}).check(Schema.makeFilter((h) => utf8.encode(JSON.stringify(h)).length <= MAX_HEALTH_BYTES || `the issues take more than ${MAX_HEALTH_BYTES} bytes`))
+}).check(Schema.makeFilter((h) => utf8Length(JSON.stringify(h)) <= MAX_HEALTH_BYTES || `the issues take more than ${MAX_HEALTH_BYTES} bytes`))
 export type HealthInfo = typeof HealthInfo.Type
 
 /**
