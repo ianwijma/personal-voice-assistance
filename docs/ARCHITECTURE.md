@@ -343,59 +343,76 @@ ModuleHostApi = {
 ### Household store and event bus (docs/MODULES-PLAN.md §4 P4; how to use it: [docs/STORING-DATA.md](STORING-DATA.md))
 
 ```ts
-defineModule({ apiVersion: 2, storage?: { collections?: [Collection] }, events?: [EventType], … })
+defineModule({ apiVersion: 2, storage?: { collections?: [Collection] }, events?: [EventType], … })      // id "host" is reserved
 defineCollection({ name, scope: "household" | "person" | "assistant" | "device" | "conversation", schema, version?, migrate?,
                    indexes?, ambient?(rows, { now, turn }), ambientRows?, project?(row, device) })
-ModuleStore (ctx.store) = { collection(c): CollectionHandle<A>; transaction(work); readOnly }
+ModuleStore (ctx.store) = { moduleId; readOnly; collection(c): CollectionHandle<A>; transaction<X>(f: (tx: StoreTx) => X): Effect<X, StoreFailure> }
 CollectionHandle<A> = { get(id, { scope? }); list({ scope?, where?, orderBy?, limit? });
-                        insert(value, { id?, scope?, actor? }); update(id, f, { expectRev?, scope?, actor? }); remove(id, …) }      // Row<A> = { id, rev, scope, value, createdAt, updatedAt, updatedBy: Actor }
+                        insert(value, { id?, scope?, actor? }); update(id, f, { expectRev?, scope?, actor? }); remove(id, { expectRev?, scope?, actor? }) }
+                        // each an Effect and one synchronous step; Row<A> = { id, rev, scope, value, createdAt, updatedAt, updatedBy: Actor }
+StoreTx = { collection(c): TxCollection<A>  /* the same five, synchronous, throwing StoreFailure */; publish(type, data, scope?);
+            core(owner): CoreTx; afterCommit(f); onRollback(f) }
 ModuleEvents (ctx.events) = { publish(type, data, scope?): Effect<void>; subscribe(filter?): Stream<HouseholdEvent> }
-HouseholdStore (host) = { prepare(modules); availability(id); forModule(id); transaction; afterCommit(f); core(owner): CoreSql;
-                          lastSeq; endConversation; sweepConversations; backup; onCommit }
-EventBus = { publish(event); subscribe(filter?, { capacity? }); stats(); forModule(id); connect(store) }
-HouseholdFeed = { active; snapshot(device): { seq, parts, cursor }; catchUp(device, cursor): changes | resync; live(moduleEvent, device) }
+HouseholdStore (host) = { info; prepare(modules); availability(id); forModule(id); transaction(f: (tx: HostTx) => X); afterCommit(f);
+                          publish(moduleEvent); core(owner): CoreSql; reader(module, c): CollectionReader | undefined; lastSeq;
+                          endConversation(id); sweepConversations; backup; onCommit(listener: (released: Released[]) => void) }
+CoreSql = { prefix; query(sql, params); run(sql, params); migrate(migrations) }    CoreTx = { prefix; query; run }  // synchronous, in a transaction
+EventBus = { publish(event); subscribe(filter?, { capacity?, gate? }); stats(); forModule(id, { gate? }); connect(store) }
+HouseholdFeed = { active; sendsEvent; sendsCollection; snapshot(device): SnapshotRun; change(change, device, cursor); live(event, device) }
 ```
 
-- **One file**, `data/household.db` (mode `0600`, directory `0700`), SQLite through `@effect/sql-sqlite-node` on
-  `node:sqlite` (`packages/store-sqlite`; `effect/sql` is unstable, so it stays behind `HouseholdStore`): WAL,
-  `synchronous = NORMAL`, `secure_delete = ON`, one connection. Calls are synchronous on the main thread, which also
-  frames audio, so every read a turn can make is bounded by construction: a `list` is one named index (`INDEXED BY`)
-  read in its own order up to its limit (other shapes are `invalid`), indexed fields are scalars. Backups and exports read through a connection of their own (backups in one step on a worker thread),
-  the checkpoint after a removal runs in the background and never waits
-  for a reader; the longest stop measured on 100,000 rows is 10 ms (docs/STORING-DATA.md "Latency"). Serve mode opens
-  the file read-write after the writer lock (a newer file is refused after a read-only look, untouched); the CLI modes
+- **One file**, `data/household.db` (mode `0600`, directory `0700`), Node's built-in `node:sqlite` (`DatabaseSync`, no
+  driver in between; `packages/store-sqlite`): WAL, `synchronous = NORMAL`, `secure_delete = ON`, one connection.
+  Both stores run one engine (`packages/core/src/StoreEngine.ts`) over a small synchronous backend (SQLite's
+  statements, or maps with an undo list in `MemoryHouseholdStore.ts`). Calls are synchronous on the main thread, which
+  also frames audio, so every read a turn can make is bounded by construction: a `list` is one named index
+  (`INDEXED BY`) read in its own order up to its limit (other shapes are `invalid`). Serve mode opens the file
+  read-write after the writer lock (a newer file is refused after a read-only look, untouched); the CLI modes
   read-only (writes fail `read-only`); node's `ExperimentalWarning` for `node:sqlite`, and only that text, is filtered
   (`store-sqlite/src/quiet.ts`).
-- **Transactions** (`packages/core/src/StoreTransactions.ts`, the same model in both stores): one transaction at a time
-  (a store lock held from begin until its events are out); inside it one frame at a time (a savepoint holds its
-  parent's mutex, so its rollback never takes a sibling's or the parent's write); a fiber that outlives its
-  transaction is refused; data changes and module events go into the frame's outbox and are released after the
-  outermost commit, under the lock, in change-log order; `onRollback` hooks for state outside the backend.
-- **Scopes** come from `CurrentTurn` or are passed; every row operation carries its scope;
-  a person-scoped call with no known person is `ScopeUnknown`, never a household write. Conversation-scoped rows are
-  removed when the conversation ends (`SessionConversation`), and at serve start for conversations of a previous run.
+- **Collections only** for modules: values are JSON objects (at most 64,000 characters), indexed fields a well-formed
+  string without NUL (≤ 500), a finite number or a boolean, row and scope ids 1–200 of `[A-Za-z0-9_.:-]`; index names
+  hex-encode module, collection and field, so they are injective. No module SQL, no full-text search, no change log,
+  no undo; `rev` comes from one counter of the store (`pva_meta.rev`) and is never reused.
+- **Transactions are synchronous and flat**: `transaction(f)` begins, runs `f` (no awaits) and commits, or rolls back
+  when `f` throws, in one step that never yields, so nothing interleaves; a `transaction` started inside one joins it.
+  A failed statement is followed by a check that SQLite's transaction is still open (one SQLite ended itself fails);
+  core SQL may not begin or end one. Events of a transaction (changes, `tx.publish`, `afterCommit`) are a list on it,
+  released after the commit in order, never re-entrantly; `onRollback` hooks run newest first on a rollback. Core
+  services take part through `tx.core(owner)`.
+- **Removal**: `remove` deletes the row (`secure_delete`); after the commit a worker thread checkpoints the log
+  (`PASSIVE`, then `TRUNCATE`, never waiting), retried while a reader holds an old snapshot; a removal counts as done
+  only when a checkpoint that started after it succeeded. Backups keep it until they rotate out (14 days).
+- **Scopes** come from `CurrentTurn` or are passed; every row operation carries its scope; a person-scoped call with
+  no known person is `ScopeUnknown`, never a household write. Conversation-scoped rows are removed when the
+  conversation ends (`SessionConversation`), and at serve start for conversations of a previous run.
 - **Versions**: `prepare` (before the module host is made) migrates a collection whose version rose eagerly (every row
-  through the write checks, its indexes), in one transaction after a
-  backup; a failure leaves the data and makes the module `unavailable`; a module whose stored data is newer is
-  `unavailable` (`ModuleHostOptions.household`; the host's `judge` reads `store.availability`), and every call of its
-  store fails `unavailable`. A newer core schema stops serve mode.
-- **Bus**: data changes after commit in change-log order, module events (`<moduleId>.<type>`, held until their
-  transaction commits), `host.turn.ended`, `host.device.connected`, `host.device.disconnected`, `host.module.state`.
-  One queue of 256 per subscriber, dropping and counting when full, so a slow subscriber never holds up a publisher or
-  the turn path.
+  through the write checks, at most 20,000 rows), in one transaction after a backup; a failure leaves the data and
+  makes the module `unavailable`; a module whose stored data is newer is `unavailable` (`ModuleHostOptions.household`;
+  the host's `judge` reads `store.availability`), and every call of its store fails `unavailable`. A newer core schema
+  stops serve mode.
+- **Bus**: what the store releases after each commit (data changes and module events, in one order; module events go
+  through `HouseholdStore.publish`), and `host.turn.ended`, `host.device.connected`, `host.device.disconnected`,
+  `host.module.state`. One queue of 256 per subscriber, dropping and counting when full, so a slow subscriber never
+  holds up a publisher or the turn path. A `shared` part's subscriptions are gated by its generation
+  (`ModuleHost.sharedGate`): nothing while it is a candidate, ended once it is replaced or retired.
 - **Pages**: only collections and event types with a projection, through `mayRevealScopeTo` (household to every voice
-  page, device to its own, person withheld until P5's `Privacy.mayReveal`). After every `hello` a fresh
-  `household.snapshot` in parts that fit a frame (bounded rows and characters), then per connection a fiber that reads
-  the change log after its cursor and sends each changed row's **current** projection (`put`) or a `remove` for a row
-  the page holds and may no longer see; a pruned gap gets a fresh snapshot. A projection that fails hides its row and
-  is a Health issue; nothing else stops. `HouseholdFeed.ts`, `serve/HouseholdPush.ts`.
-- **Ambient facts**: one host context provider (`Household`, 600 characters, bounded reads, `HOME_AMBIENT_FACTS`,
-  **off by default** until measured with `bench --live --ambient`) appended to each assistant's registry in serve mode
-  (`withContextProvider`).
-- **Backups**: daily `data/backups/household-<date>.db` (optional `HOUSEHOLD_BACKUP_COPY_DIR`), each through its own
-  temporary file and one `rename`; every archive (daily, pre-upgrade) removed after 14 days; `pnpm start household
-  backup`; restoring is a manual step with the server stopped (docs/STORING-DATA.md); `doctor` checks the database and the last backup's age, the Health
-  page the backup's age and a pending removal checkpoint.
+  page, device to its own, person withheld until P5's `Privacy.mayReveal`; device ids are claimed, not authenticated).
+  Per connection a queue filled from the store's commit listener (rows coalesced, module events in order) and a fiber
+  that sends a snapshot in bounded steps (every message and the whole snapshot under the frame limit, envelopes
+  counted), then the queue; **every frame is built when it is handed to the socket**, from committed state and the
+  server's record of the device (`makeHouseholdPush({ device })`). A saved change to a device's record, or an overflow,
+  gives its pages a fresh snapshot. A projection that fails hides its row and is a Health issue.
+  `HouseholdFeed.ts`, `serve/HouseholdPush.ts`.
+- **Ambient facts**: one host context provider (`Household`, 600 characters, bounded synchronous reads with a time
+  check, `HOME_AMBIENT_FACTS`, **off by default** until measured with `bench --live --ambient`) appended to each
+  assistant's registry in serve mode (`withContextProvider`).
+- **Backups**: daily `data/backups/household-<date>.db` (optional `HOUSEHOLD_BACKUP_COPY_DIR`), one at a time, each
+  through its own temporary file and one `rename`; every backup removed after 14 days without exception (failures
+  reported, kept ones narrowed to `0600`); `pnpm start household backup`; restoring is a manual step with the server
+  stopped (docs/STORING-DATA.md). `doctor` checks that the database opens, the quick check, module data newer than the
+  code, the last backup's age; the Health page the backup's age, failed removals of old backups and a pending
+  removal checkpoint.
 
 Adding a feature = one new file exporting `defineModule({...})` + one line in `moduleCatalog` in `apps/assistant/src/modules.ts`. Adding a provider = one new package implementing a core interface + one line in `apps/assistant/src/providers.ts`. Adding a voice provider = an adapter with `layerConfig` (`Tts`) and `makeVoices` (`TtsVoices`), and one entry in `ttsProviders`, `ttsProviderInfo` and (hosted) `hostedTtsVoices` in `providers.ts`. A voice needs no code: it is chosen by its key.
 
@@ -453,7 +470,7 @@ packages/
                     time of day (the "half" rules), dates and date-times, quantities with units and conversion, speakable numbers, amounts,
                     durations, clock times, dates and lists, RFC 5545 recurrence (build, describe, next occurrence, daylight-saving safe);
                     re-exports core's `parseDuration`; README in the package
-  store-sqlite/     `@pva/store-sqlite`: the household store on `data/household.db` (node:sqlite via @effect/sql-sqlite-node), the module
+  store-sqlite/     `@pva/store-sqlite`: the household store on `data/household.db` (node:sqlite),
                     backups, the maintenance fiber and the doctor check (docs/STORING-DATA.md)
   net/              `@pva/net`: `safeFetch` for URLs a model or user chose (resolves the host itself, refuses non-public addresses on every
                     hop, connects to the checked address, size and time limits), a cached JSON GET (TTL, ETag, stale-if-error) and the

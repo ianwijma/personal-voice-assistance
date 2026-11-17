@@ -57,11 +57,24 @@ export const makeHouseholdPush = (options: {
     /** Start again from a snapshot (device record changed, overflow). */
     fresh: boolean
     signal: Deferred.Deferred<void>
+    /** A wake-up is on its way (`wake`). */
+    waking: boolean
     readonly closed: Deferred.Deferred<void>
   }
   const followers = new Map<string, Follower>()
 
-  const wake = (f: Follower) => Deferred.doneUnsafe(f.signal, Effect.void)
+  /**
+   * Wake a page's fiber, never on the stack of the commit that queued its work: a commit's listener only queues (so an
+   * overflow is seen whole, and no page's frames are built inside someone else's transaction release).
+   */
+  const wake = (f: Follower) => {
+    if (f.waking) return
+    f.waking = true
+    queueMicrotask(() => {
+      f.waking = false
+      Deferred.doneUnsafe(f.signal, Effect.void)
+    })
+  }
   const waitForWake = (f: Follower) =>
     Effect.suspend(() => {
       if (f.fresh || f.queue.size > 0) return Effect.void
@@ -142,7 +155,7 @@ export const makeHouseholdPush = (options: {
       if (!feed.active) return
       const previous = followers.get(connection.id)
       if (previous !== undefined) Deferred.doneUnsafe(previous.closed, Effect.void)
-      const f: Follower = { connection, queue: new Map(), next: 0, device: {}, fresh: false, signal: Deferred.makeUnsafe<void>(), closed: Deferred.makeUnsafe<void>() }
+      const f: Follower = { connection, queue: new Map(), next: 0, device: {}, fresh: false, signal: Deferred.makeUnsafe<void>(), waking: false, closed: Deferred.makeUnsafe<void>() }
       followers.set(connection.id, f)
       options.run(Effect.raceFirst(follow(f), Deferred.await(f.closed)).pipe(
         Effect.ensuring(Effect.sync(() => {

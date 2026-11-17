@@ -2,11 +2,13 @@
 // version 2 modules, a module whose data is newer is `unavailable`, host events, and a slow subscriber.
 import { assert, describe, it } from "@effect/vitest"
 import { Effect, Fiber, Schema, Stream } from "effect"
+import { TestClock } from "effect/testing"
 import { hostEvent, makeEventBus } from "../src/EventBus.ts"
 import { defineCollection, type ModuleStore, StoreError } from "../src/HouseholdStore.ts"
 import type { ModuleEvents } from "../src/EventBus.ts"
 import { defineModule, ModuleStartError } from "../src/ModuleDefinition.ts"
-import { makeModuleHost, readOnlyPersistence } from "../src/ModuleHost.ts"
+import { type ModuleDemand, makeModuleHost, readOnlyPersistence } from "../src/ModuleHost.ts"
+import { Setting } from "../src/Settings.ts"
 import { makeTestHousehold } from "../src/testing.ts"
 
 const Item = Schema.Struct({ text: Schema.String })
@@ -74,6 +76,57 @@ describe("household store in the module host", () => {
       assert.isTrue(exit._tag === "Failure")
     }).pipe(Effect.scoped))
 
+  it.effect("a shared part's subscriptions follow its generation: nothing while a candidate, nothing once replaced or retired", () =>
+    Effect.gen(function*() {
+      const handled: Array<string> = []
+      let release: (() => void) | undefined
+      const watcher = defineModule({
+        apiVersion: 2,
+        id: "watcher",
+        name: "Watcher",
+        description: "Counts turns",
+        settings: { label: Setting.text({ label: "Label", default: "one" }) },
+        shared: ({ settings, events }) =>
+          Effect.gen(function*() {
+            const label = settings.label ?? ""
+            yield* Effect.forkScoped(Stream.runForEach(events.subscribe({ type: "host.turn.ended" }), () => Effect.sync(() => handled.push(label))))
+            // The second generation is slow to start: events published meanwhile must not reach it yet.
+            if (label === "two") yield* Effect.callback<void>((resume) => void (release = () => resume(Effect.void)))
+            return { value: undefined }
+          }),
+        start: () => Effect.succeed({})
+      })
+      const h = yield* makeTestHousehold([watcher])
+      const demand = { current: new Map<string, ReadonlyArray<ModuleDemand>>([["watcher", [{ assistantId: "a" }]]]) }
+      const host = yield* makeModuleHost({ catalog: [watcher], persistence: readOnlyPersistence(), env: {}, demand: () => demand.current, household: h.household })
+      yield* host.startEnabled
+      const tick = Effect.andThen(Effect.sync(() => h.bus.publish(hostEvent("turn.ended", {}))), Effect.repeat(Effect.yieldNow, { times: 20 }))
+      // Let the shared part's subscription start.
+      yield* Effect.repeat(Effect.yieldNow, { times: 50 })
+      yield* tick
+      assert.deepStrictEqual(handled, ["one"])
+      // Replace the shared part: while the new one starts, the old one still handles; the candidate does not.
+      const fiber = yield* Effect.forkChild(host.configure("watcher", { values: { label: "two" }, secrets: {} }))
+      yield* Effect.repeat(Effect.yieldNow, { times: 50 })
+      yield* tick
+      assert.deepStrictEqual(handled, ["one", "one"])
+      release!()
+      assert.isTrue((yield* Fiber.join(fiber)).ok)
+      // Published: only the new one handles, although the old one's scope stays open for its grace period.
+      yield* tick
+      assert.deepStrictEqual(handled, ["one", "one", "two"])
+      // Demand ends: the retiring part handles nothing more.
+      demand.current = new Map([["watcher", []]])
+      yield* host.refresh
+      yield* tick
+      assert.deepStrictEqual(handled, ["one", "one", "two"])
+      yield* TestClock.adjust(10_000)
+    }).pipe(Effect.scoped))
+
+  it("the host's event namespace is reserved: no module may have the id host", () => {
+    assert.throws(() => defineModule({ apiVersion: 2, id: "host", name: "Host", description: "", start: () => Effect.succeed({}) }), /reserved/)
+  })
+
   it("storage needs module API 2", () => {
     assert.throws(() => defineModule({ id: "old", name: "Old", description: "", storage: { collections: [items] }, start: () => Effect.succeed({}) }))
     void StoreError
@@ -81,6 +134,30 @@ describe("household store in the module host", () => {
 })
 
 describe("event bus", () => {
+  it.effect("a logger or clock that throws stops nothing: every other subscriber still gets the event", () =>
+    Effect.gen(function*() {
+      const bus = makeEventBus({ log: () => { throw new Error("logger bug") }, now: () => { throw new Error("clock bug") } })
+      const fast: Array<string> = []
+      const slow = yield* Effect.forkChild(Stream.runForEach(bus.subscribe(undefined, { capacity: 1, name: "slow" }), () => Effect.never))
+      const quick = yield* Effect.forkChild(Stream.runForEach(bus.subscribe(), (e) => Effect.sync(() => fast.push(e.type))))
+      yield* Effect.repeat(Effect.yieldNow, { times: 20 })
+      for (let i = 0; i < 5; i++) assert.doesNotThrow(() => bus.publish(hostEvent("turn.ended", { i })))
+      yield* Effect.repeat(Effect.yieldNow, { times: 20 })
+      assert.strictEqual(fast.length, 5)
+      assert.isAbove(bus.stats().dropped, 0)
+      yield* Fiber.interrupt(slow)
+      yield* Fiber.interrupt(quick)
+    }))
+
+  it.effect("a module cannot publish in the host's namespace", () =>
+    Effect.gen(function*() {
+      const seenTypes: Array<string> = []
+      const bus = makeEventBus({ observe: (e) => seenTypes.push(`${e.module}:${e.type}`) })
+      yield* bus.forModule("host").publish("turn.ended", {})
+      yield* bus.forModule("shop").publish("turn.ended", {})
+      assert.deepStrictEqual(seenTypes, ["shop:shop.turn.ended"])
+    }))
+
   it.live("filters by module, type and prefix; a slow subscriber drops (counted) without holding up the others", () =>
     Effect.gen(function*() {
       const warnings: Array<string> = []

@@ -3,11 +3,11 @@
 import { assert, describe, it } from "@effect/vitest"
 import { defineCollection, type StoreError } from "@pva/core"
 import { Effect, Exit, Schema } from "effect"
-import { existsSync, mkdtempSync, readdirSync, readFileSync } from "node:fs"
+import { chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, utimesSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { DatabaseSync } from "node:sqlite"
-import { householdIssues, makeSqliteStore } from "../src/index.ts"
+import { householdBackupIssues, householdIssues, makeSqliteStore } from "../src/index.ts"
 
 const tmp = () => mkdtempSync(join(tmpdir(), "pva-sqlite-"))
 const Item = Schema.Struct({ text: Schema.String })
@@ -138,4 +138,103 @@ describe("SQLite household store", () => {
     process.off("warning", listener)
     assert.deepStrictEqual(seen, ["ExperimentalWarning: Something else"])
   })
+})
+
+describe("SQLite household store: what review round 2 found", () => {
+  it.effect("SQLite ending a transaction itself (the disk is full) fails it whole, also when the function caught the error", () =>
+    Effect.gen(function*() {
+      const store = yield* makeSqliteStore({ filename: ":memory:" })
+      const Big = Schema.Struct({ text: Schema.String })
+      const bigs = defineCollection({ name: "bigs", scope: "household", schema: Big })
+      yield* store.prepare([{ id: "fill", storage: { collections: [bigs] } }])
+      const pages = Number((yield* store.core("probe").query<{ page_count: number }>("PRAGMA page_count"))[0]!.page_count)
+      yield* store.core("probe").query(`PRAGMA max_page_count = ${pages + 8}`)
+      const exit = yield* Effect.exit(store.forModule("fill").transaction((tx) => {
+        const c = tx.collection(bigs)
+        c.insert({ text: "first" }, { id: "first" })
+        try {
+          for (let i = 0; i < 100; i++) c.insert({ text: "x".repeat(60_000) }, { id: `big${i}` })
+        } catch {
+          // The module catches the failure and carries on: the store must not let the next write autocommit.
+        }
+        c.insert({ text: "after" }, { id: "after" })
+      }))
+      assert.isTrue(Exit.isFailure(exit))
+      yield* store.core("probe").query("PRAGMA max_page_count = 1073741823")
+      const rows = yield* store.forModule("fill").collection(bigs).list({ limit: 1000 })
+      assert.deepStrictEqual(rows.map((r) => r.id), [])
+      // The store goes on working.
+      yield* store.forModule("fill").collection(bigs).insert({ text: "later" }, { id: "later" })
+      assert.strictEqual((yield* store.forModule("fill").collection(bigs).list()).length, 1)
+    }).pipe(Effect.scoped))
+
+  it.live("each removal is acknowledged only by a checkpoint that started after it: a second removal while the first is checkpointed stays pending", () =>
+    Effect.gen(function*() {
+      const dir = tmp()
+      const file = join(dir, "household.db")
+      const store = yield* makeSqliteStore({ filename: file, scrubRetryMs: 20 })
+      yield* store.prepare([{ id: "memory", storage: { collections: [items] } }])
+      const c = store.forModule("memory").collection(items)
+      yield* c.insert({ text: "zebrafirst" }, { id: "a" })
+      yield* c.insert({ text: "zebrasecond" }, { id: "b" })
+      assert.isTrue(yield* c.remove("a"))
+      // The first checkpoint is on its way; a reader now holds a snapshot, then the second removal commits.
+      const reader = new DatabaseSync(file, { readOnly: true })
+      reader.exec("BEGIN")
+      reader.prepare("SELECT count(*) FROM pva_docs").get()
+      assert.isTrue(yield* c.remove("b"))
+      yield* Effect.sleep(200)
+      assert.isDefined(store.removalPendingSince(), "the second removal waits for the reader")
+      reader.exec("COMMIT")
+      reader.close()
+      yield* store.scrubbed.pipe(Effect.timeout(5000))
+      assert.isUndefined(store.removalPendingSince())
+      for (const name of readdirSync(dir).filter((n) => n.startsWith("household.db"))) {
+        assert.isFalse(readFileSync(join(dir, name)).includes("zebrasecond"), `${name} still holds the removed text`)
+      }
+    }).pipe(Effect.scoped))
+
+  it.effect("a backup that could not be removed is reported, never counted as removed, and shows on the Health page", () =>
+    Effect.gen(function*() {
+      if (process.getuid?.() === 0) return
+      const dir = tmp()
+      const file = join(dir, "household.db")
+      const store = yield* makeSqliteStore({ filename: file })
+      const backups = join(dir, "backups")
+      yield* store.backup({ now: Date.now() })
+      const old = join(backups, "household-2026-01-01.db")
+      writeFileSync(old, "x", { mode: 0o600 })
+      utimesSync(old, Date.UTC(2026, 0, 1) / 1000, Date.UTC(2026, 0, 1) / 1000)
+      chmodSync(backups, 0o500)
+      try {
+        // (The test clock stands at 0: give the real time.)
+        const pruned = yield* store.pruneBackups({ now: Date.now() })
+        assert.deepStrictEqual(pruned.removed, [])
+        assert.strictEqual(pruned.failed.length, 1)
+        assert.isTrue(existsSync(old))
+        const issues = yield* householdBackupIssues(store)
+        assert.isTrue(issues.some((i) => i.id === "core.household.retention"))
+      } finally {
+        chmodSync(backups, 0o700)
+      }
+    }).pipe(Effect.scoped))
+
+  it.effect("doctor says which module's stored data is newer than the module, without changing the file", () =>
+    Effect.gen(function*() {
+      const dir = tmp()
+      const file = join(dir, "household.db")
+      const v2 = defineCollection({ name: "items", scope: "household", schema: Item, version: 2, migrate: { 1: (v: unknown) => v } })
+      yield* Effect.scoped(Effect.gen(function*() {
+        const store = yield* makeSqliteStore({ filename: file })
+        yield* store.prepare([{ id: "shop", storage: { collections: [v2] } }])
+        yield* store.forModule("shop").collection(v2).insert({ text: "x" })
+        yield* store.backup()
+      }))
+      const before = readFileSync(file)
+      const issues = yield* householdIssues(dir, { modules: [{ id: "shop", name: "Shop", storage: { collections: [items] } }] })
+      const mine = issues.find((i) => i.id === "core.household.module.shop")
+      assert.strictEqual(mine?.severity, "error")
+      assert.match(mine!.detail ?? "", /newer version/)
+      assert.isTrue(readFileSync(file).equals(before))
+    }))
 })
