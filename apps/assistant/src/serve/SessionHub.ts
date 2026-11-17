@@ -1,5 +1,5 @@
 import type { AudioClientLink } from "@pva/audio-web"
-import type { HostDeviceView, HostResult, ModuleHost } from "@pva/core"
+import type { HostDeviceView, HostResult, ModuleHost, TargetDevice } from "@pva/core"
 import {
   type AdminSnapshot,
   type AdminState,
@@ -117,6 +117,24 @@ export interface SessionHub {
   ) => void
   /** The known devices with their open connections now, most recently seen first (`ModuleHostApi.view().devices`). */
   readonly deviceViews: () => ReadonlyArray<HostDeviceView>
+  /** The open voice connections, for household pushes (`HouseholdPush.ts`). */
+  readonly voiceConnections: () => ReadonlyArray<VoiceConnection>
+}
+
+/** A voice connection as the household push sees it: its device and a send that checks it is still open. */
+export interface VoiceConnection {
+  readonly id: string
+  readonly device: TargetDevice
+  readonly send: (message: ServerMessage) => void
+}
+
+/** What the hub tells the household push (docs/STORING-DATA.md "Pages"). */
+export interface HouseholdHooks {
+  /** A voice connection finished its hello: send it the snapshot, or the replay after `seq` (`hello.household`). */
+  readonly connected: (connection: VoiceConnection, seq: number | undefined) => void
+  /** A device's first connection opened / its last one closed (`host.device.connected` / `.disconnected`). */
+  readonly deviceConnected: (deviceId: string) => void
+  readonly deviceDisconnected: (deviceId: string) => void
 }
 
 export interface HubOptions {
@@ -140,6 +158,8 @@ export interface HubOptions {
   readonly assistants: Assistants
   /** Settings from outside the UI and "Move to settings". Absent: no `env` in the snapshot, moves refused. */
   readonly env?: EnvMover
+  /** Household data for voice pages and device events (P4). Absent: none sent. */
+  readonly household?: HouseholdHooks
   /** Diagnostics › Health (`health`, `health.check`). Absent: no `health` in the admin snapshot, checks refused. */
   readonly health?: HealthService
   /** Model downloads (jobs). Absent: none offered. */
@@ -203,6 +223,8 @@ interface Client {
   wakeTestUntil: number
   /** The device whose session the phrase tester follows (`undefined`: the most recently active one). */
   wakeTestDevice: string | undefined
+  /** This connection for household pushes (voice connections, after hello). */
+  voice?: VoiceConnection
 }
 
 /** Who owns a session's audio (per device), and what the hub remembers about it. */
@@ -546,6 +568,8 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
     if (client.device !== undefined) {
       registry.left(client.device.id)
       devicesChanged(true)
+      const id = client.device.id
+      if (![...clients].some((c) => c.helloed && c.device?.id === id)) options.household?.deviceDisconnected(id)
     }
     const key = client.sessionKey
     if (key === undefined) return
@@ -654,8 +678,19 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
       snapshot: first
     })
     if (client.adminToken !== undefined) send(client, { type: "admin.snapshot", snapshot: adminSnapshot() })
+    const firstOfDevice = client.device !== undefined && ![...clients].some((c) => c !== client && c.helloed && !c.closed && c.device?.id === client.device!.id)
     client.helloed = true
     if (client.device !== undefined) registerDevice(client.device)
+    if (client.role === "voice" && options.household !== undefined) {
+      const device = client.device
+      client.voice = {
+        id: client.connection.id,
+        device: device === undefined ? {} : { id: device.id, name: device.name },
+        send: (m) => send(client, m)
+      }
+      if (firstOfDevice) options.household.deviceConnected(device!.id)
+      options.household.connected(client.voice, message.household?.seq)
+    }
     if (key !== undefined) sessions.connections(key, connectionsOf(key))
     if (opened === "full") send(client, { type: "error", error: sessionsFull() })
     if (resumed !== undefined) {
@@ -1056,6 +1091,7 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
       for (const client of clients) sendVault(client)
     },
     refreshDevices,
+    voiceConnections: () => [...clients].flatMap((c) => (c.voice !== undefined && c.helloed && !c.closed ? [c.voice] : [])),
     deviceViews: () =>
       [...registry.devices(live)].sort((a, b) => b.lastSeen - a.lastSeen).map((d) => ({ id: d.id, name: d.name, kind: d.kind, connections: d.connections })),
     wakeHeard: (key, text, phrase, accepted, source) => {

@@ -147,6 +147,8 @@ export interface VoiceSessionOptions {
   readonly onChange: (minor: boolean) => void
   /** A committed turn ended (the recent traces of every session, for admin). */
   readonly onTrace?: (trace: TraceInfo) => void
+  /** One of its conversations ended (conversation-scoped household data is deleted). */
+  readonly conversationEnded?: (conversationId: string) => void
   /** What one minute of `newConversationAfter` is, in ms (tests shorten it). Default 60 000. */
   readonly minuteMs?: number
   readonly maxPendingInputs?: number
@@ -678,6 +680,7 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
               options.send({ type: "conversation", id: info.id, reason, startedAt: info.startedAt, assistantId: assistant })
               options.onChange(false)
             },
+            ...(options.conversationEnded !== undefined ? { onConversationEnded: options.conversationEnded } : {}),
             // Events queued while the engines were rebuilt are stale: each run after the first starts empty.
             speech: () => (runs++ === 0 ? Stream.fromQueue(inbox) : Stream.unwrap(Effect.as(Queue.clear(inbox), Stream.fromQueue(inbox)))),
             // The assistant's quiet spell ("never" = no reset) and tool rounds, read live.

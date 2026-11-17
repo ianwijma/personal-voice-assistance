@@ -8,6 +8,7 @@ import { CliSettingsRef } from "./cliSettings.ts"
 import { makeRequirementChecker } from "./requirements.ts"
 import { DataDirConfig, loadSettingsStore } from "./serve/SettingsStore.ts"
 import { openVault, VaultPathConfig } from "./serve/Vault.ts"
+import { openCliHousehold } from "./serve/household.ts"
 
 /**
  * The capabilities, in display order (also the order of their instructions in
@@ -60,11 +61,16 @@ export const startCliModules = (
     }).pipe(Effect.catchCause((cause) => Effect.as(Effect.logWarning("Could not read the saved settings; using defaults", cause), readOnlyPersistence()))))
     const catalog = options.catalog ?? moduleCatalog
     // Module API v2: what the modules need is probed once, before any starts (never on a turn).
-    const checker = makeRequirementChecker({ dataDir: yield* DataDirConfig.pipe(Effect.orElseSucceed(() => "data")) })
+    const dataDir = yield* DataDirConfig.pipe(Effect.orElseSucceed(() => "data"))
+    const checker = makeRequirementChecker({ dataDir })
     yield* checker.probeCatalog(catalog)
+    // The household data read-only (serve is its one writer): version 2 modules read it here and every write is refused.
+    const services = yield* Effect.context<never>()
+    const household = yield* openCliHousehold({ dataDir, catalog, log: (line) => void Effect.runForkWith(services)(Effect.logWarning(line)) })
     const host = yield* makeModuleHost({
       catalog,
       persistence,
+      household: { store: household.store, events: household.bus },
       env: process.env,
       platform: { os: process.platform, arch: process.arch },
       requirements: checker.check

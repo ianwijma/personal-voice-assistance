@@ -38,6 +38,7 @@ import { buildProviders, describeConfigError, StartupError } from "./startup.ts"
 import { runTextTurns } from "./text.ts"
 import { compareModelsCommand } from "./compareModels.ts"
 import { doctorCommand } from "./doctor.ts"
+import { householdCommand } from "./household.ts"
 import { transcribeCommand } from "./transcribe.ts"
 import { voiceMode } from "./voice.ts"
 import { assistantVoiceStage, withVoiceTrace } from "./voiceSelection.ts"
@@ -286,8 +287,10 @@ const program: Effect.Effect<void, unknown> = mode === "text"
   ? serveMode
   : mode === "doctor"
   ? doctorCommand
+  : mode === "household"
+  ? householdCommand(args)
   : new StartupError({
-    message: `Unknown mode "${mode}". Usage: assistant [text | voice | serve | doctor | bench [--sessions N | --typesafe | --typesafe-live [--count N] [--gap-ms MS] | --live [--rounds N] [--sessions N] [--stagger MS] [--llm-per-session] <wavs> | --make-wavs [dir]] | ` +
+    message: `Unknown mode "${mode}". Usage: assistant [text | voice | serve | doctor | household backup|export|restore | bench [--sessions N | --typesafe | --typesafe-live [--count N] [--gap-ms MS] | --live [--rounds N] [--sessions N] [--stagger MS] [--llm-per-session] <wavs> | --make-wavs [dir]] | ` +
       "say [--voice PROVIDER:VOICE] [--out FILE] <text> | transcribe <wav file> | compare-models [--models a,b] [--agc on|off|both] [--ref TEXT] <wavs>]"
   })
 
@@ -311,7 +314,8 @@ const withSavedSettings = <A, E>(effect: Effect.Effect<A, E>): Effect.Effect<A, 
   })
 
 NodeRuntime.runMain(
-  (mode === "serve" ? program : withSavedSettings(program)).pipe(
+  // `household` reads only the database (no settings, no vault password).
+  (mode === "serve" || mode === "household" ? program : withSavedSettings(program)).pipe(
     Effect.catch((e) => {
       const described = e instanceof StartupError
         ? e.message

@@ -10,6 +10,7 @@ import { makeRequirementChecker, type Prober } from "./requirements.ts"
 import type { SttShared } from "./serve/Resources.ts"
 import { makeSections } from "./serve/sections.ts"
 import { DataDirConfig } from "./serve/SettingsStore.ts"
+import { householdIssues } from "@pva/store-sqlite"
 
 /**
  * `pnpm start doctor` (module-definition-config-and-dependencies.md §C.5, after `brew doctor` and `flutter doctor`):
@@ -71,7 +72,9 @@ export const runDoctor = (options: DoctorOptions): Effect.Effect<ReadonlyArray<I
         ? { ...issue, severity: "warning", detail: `${issue.detail} (No assistant has it on.)` }
         : issue
     )
-    return [...core, ...modules]
+    // The household database: opens, passes SQLite's quick check, is not from a newer version, has a recent backup.
+    const household = yield* householdIssues(options.dataDir)
+    return [...core, ...household, ...modules]
   }))
 
 const LABEL: Readonly<Record<Issue["severity"], string>> = { error: "error  ", warning: "warning", info: "info   " }

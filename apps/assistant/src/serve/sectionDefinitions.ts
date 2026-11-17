@@ -214,6 +214,17 @@ export const homeSection: SectionDefinition = {
       env: "HOME_API_CONTACT",
       placeholder: "you@example.com",
       maxLength: 200
+    }),
+    HOME_AMBIENT_FACTS: Setting.choice({
+      label: "Household facts in every reply",
+      description: "Running timers, the next alarm and other short facts modules keep, told to the assistant with each turn (at most 600 characters), so any assistant can answer \"how long is left on the pasta?\".",
+      env: "HOME_AMBIENT_FACTS",
+      default: "all",
+      options: [
+        { value: "all", label: "For every assistant" },
+        { value: "module-on", label: "Only for assistants that have the module on" },
+        { value: "off", label: "Off" }
+      ]
     })
   }
 }

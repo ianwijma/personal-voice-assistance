@@ -120,6 +120,10 @@ import { makeModelFavourites } from "./ModelFavourites.ts"
 import { type AssistantTraceConfig, type Hearing, makeVoiceSession } from "./VoiceSession.ts"
 import { makeVoiceSessions, type VoiceSessions } from "./VoiceSessions.ts"
 import { makeRoutingService, ROUTING_KEYS } from "./routing.ts"
+import { openServeHousehold } from "./household.ts"
+import { makeHouseholdPush } from "./HouseholdPush.ts"
+import { hostEvent, withContextProvider } from "@pva/core"
+import { runMaintenance } from "@pva/store-sqlite"
 import { type KdfParams, openVault, type Vault, VaultPathConfig } from "./Vault.ts"
 import * as SherpaStt from "@pva/stt-sherpa"
 import * as SherpaTts from "@pva/tts-sherpa"
@@ -310,6 +314,16 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     // Module API v2: what the modules need is probed before any starts (concurrently, 5 s at most; never on a turn).
     const checker = makeRequirementChecker({ dataDir: options.dataDir })
     yield* checker.probeCatalog(catalog)
+    // The household store (docs/STORING-DATA.md): opened after the writer lock, and every module's data judged and
+    // upgraded before any module is made. A database from a newer assistant stops the start here.
+    const logContext = yield* Effect.context<never>()
+    const logInfo = (line: string) => void Effect.runForkWith(logContext)(Effect.logInfo(line))
+    const household = yield* openServeHousehold({
+      dataDir: options.dataDir,
+      catalog,
+      backupCopyDir: env.HOUSEHOLD_BACKUP_COPY_DIR,
+      log: logInfo
+    }).pipe(Effect.mapError((e) => new SettingsStoreError({ message: e.message, cause: e })))
     // Capabilities run for the assistants that switch them on (`moduleDemand`, below; read from startEnabled on).
     const host = yield* makeModuleHost({
       catalog,
@@ -321,6 +335,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       demand: () => moduleDemand(),
       platform: { os: process.platform, arch: process.arch },
       requirements: checker.check,
+      household: { store: household.store, events: household.bus },
       // The execution gateway's first checks, on every call (and the turn's action catalogue): the assistant has the
       // module on, and the tool is not one it switched off. Agents and decision providers are not per assistant.
       access: {
@@ -476,6 +491,15 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
         modules
       }
     }
+
+    /** The household's ambient facts in every turn's context (`HOME_AMBIENT_FACTS`, read at each turn). */
+    const ambientFacts = household.ambient({
+      mode: () => {
+        const v = sections.value("HOME_AMBIENT_FACTS")
+        return v === "off" || v === "module-on" ? v : "all"
+      },
+      moduleOn: (assistantId, moduleId) => assistantsNow().get(assistantId)?.modules[moduleId]?.on === true
+    })
 
     // ---- The resource pool: one language-model instance per distinct configuration (docs/ASSISTANTS.md §3.2, WP-9)
 
@@ -869,7 +893,8 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
             voiceSource,
             setup: {
               system: systemFor(base, instructions),
-              registry: mine.registry,
+              // The household's ambient facts (docs/STORING-DATA.md), after the modules' context.
+              registry: withContextProvider(mine.registry, ambientFacts),
               llm: llm ?? notInUse,
               tts: tts ?? noVoice,
               ...(tts !== undefined ? { ttsReady } : {}),
@@ -1217,10 +1242,18 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
           onChange: (minor) => hub?.sessionsChanged(minor),
           onTrace: (trace) => {
             sessions.addTrace(trace)
+            household.bus.publish(hostEvent("turn.ended", {
+              turnId: trace.turnId,
+              outcome: trace.outcome,
+              ...(device !== undefined ? { deviceId: device.id } : {}),
+              ...(trace.assistant !== undefined ? { assistantId: trace.assistant.id } : {})
+            }, device !== undefined ? { kind: "device", id: device.id } : { kind: "household" }))
             // Admin's Diagnostics › Latency grows live (admin connections get no `turn.*`; ADMIN_ONLY).
             hub?.broadcast({ type: "trace", key, ...(device !== undefined ? { deviceId: device.id } : {}), trace })
           },
           minuteMs,
+          conversationEnded: (conversationId) =>
+            run(household.store.endConversation(conversationId).pipe(Effect.asVoid, Effect.catch((e) => Effect.logWarning(`Conversation data not deleted: ${e.message}`)))),
           ...(reserved !== undefined ? { reservedConversations: reserved } : {}),
           ...(options.stallMs !== undefined ? { stallMs: options.stallMs } : {}),
           heard: {
@@ -1280,7 +1313,9 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
         })
       )
     })
+    const push = makeHouseholdPush({ feed: household.feed, bus: household.bus, run, log: (line) => runFork(Effect.logWarning(line)) })
     hub = makeSessionHub({
+      household: push.hooks,
       admin,
       health,
       devices,
@@ -1306,6 +1341,22 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       ...(options.helloTimeoutMs !== undefined ? { helloTimeoutMs: options.helloTimeoutMs } : {})
     })
     const hubNow = hub
+    yield* push.forward(() => hubNow.voiceConnections())
+    // Daily backups and change-log retention (never on a turn's path); a failing backup shows on the Health page.
+    if (household.sqlite !== undefined) {
+      const sqlite = household.sqlite
+      yield* Effect.forkScoped(runMaintenance(sqlite, {
+        log: logInfo,
+        onBackup: (problem) =>
+          host.issues.set("household", problem === undefined ? [] : [{
+            id: "core.household.backup",
+            severity: "warning",
+            title: "The household backup failed",
+            detail: problem.slice(0, 1900),
+            fix: { kind: "command", label: "Back up by hand", value: "pnpm start household backup" }
+          }])
+      }))
+    }
     health.subscribe((info) => hubNow.broadcast({ type: "health", health: info }))
     host.subscribe((module) => {
       hubNow.broadcast({ type: "module.changed", module: access.module(module) })

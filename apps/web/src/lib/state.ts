@@ -647,7 +647,10 @@ const server: ServerHandlers = {
   "conversation.history": (s, m) => onHistory(s, m, historyToTurns),
   assistants: (s, m) => ({ ...s, assistants: m.assistants }),
   "device.types": (s, m) => ({ ...s, deviceTypes: m.types }),
-  health: (s, m) => ({ ...s, health: m.health })
+  health: (s, m) => ({ ...s, health: m.health }),
+  // Household data (docs/STORING-DATA.md "Pages"): no page shows it yet (P10 is the first).
+  "household.snapshot": (s) => s,
+  "household.event": (s) => s
 }
 
 const local = (s: ClientState, a: LocalAction): ClientState => {

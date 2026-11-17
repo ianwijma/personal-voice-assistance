@@ -292,7 +292,7 @@ defineModule({
 })
 SharedContext<A>      = { settings: Partial<A> /* no overridable fields */ } & ModuleServicesV2
 ModuleContextV2<A, X> = ModuleContext<A> & ModuleServicesV2 & { shared: X }
-ModuleServicesV2      = { host: ModuleHostApi }   // later PRs add store, events, scheduler, speech, notify, present, connections
+ModuleServicesV2      = { host: ModuleHostApi; store: ModuleStore; events: ModuleEvents }   // later PRs add scheduler, speech, notify, present, connections
 SharedPart<X>         = { value: X; services?: [ServiceKey<T>.of(impl)]; contributions?: [ContributionKey<T>.of(value)] }
 ModuleHostApi = {
   view(): HostView                                  // module states, vault locked, engine summary, devices, Home values
@@ -327,6 +327,49 @@ ModuleHostApi = {
   restarts, each module's `health()`), the app adds the core checks (`apps/assistant/src/coreChecks.ts`). `pnpm start
   doctor` prints them and exits 1 on an error; admin's Diagnostics › Health shows them (`health`, `health.check`).
 - **Templates** are plain data (`ModuleInfo.templates`, ids `<moduleId>.<id>`) that the new-assistant wizard offers.
+
+### Household store and event bus (docs/MODULES-PLAN.md §4 P4; how to use it: [docs/STORING-DATA.md](STORING-DATA.md))
+
+```ts
+defineModule({ apiVersion: 2, storage?: { collections?: [Collection], sql?: { migrations: [SqlMigration] } }, events?: [EventType], … })
+defineCollection({ name, scope: "household" | "person" | "assistant" | "device" | "conversation", schema, version?, migrate?,
+                   indexes?, search?, history?: "full" | "none", ambient?(rows, { now, turn }), ambientRows?, project?(row, device) })
+ModuleStore (ctx.store) = { collection(c): CollectionHandle<A>; sql: ModuleSql; transaction(work); logChange(change); readOnly; fts5 }
+CollectionHandle<A> = { get(id, { scope? }); list({ scope?, where?, orderBy?, limit? }); search(text, { scope?, limit? });
+                        insert(value, { id?, scope?, actor? }); update(id, f, { expectRev?, scope?, actor? }); remove(id, …);
+                        erase(id, …); undo({ actor? }) }      // Row<A> = { id, rev, scope, value, createdAt, updatedAt, updatedBy: Actor }
+ModuleSql = { prefix: "m_<id>__"; table(name); fts5; query(sql, params); run(sql, params) }   // one guarded statement per call
+ModuleEvents (ctx.events) = { publish(type, data, scope?): Effect<void>; subscribe(filter?): Stream<HouseholdEvent> }
+HouseholdStore (host) = { prepare(modules); availability(id); forModule(id); transaction; core(owner): CoreSql; changesSince;
+                          lastSeq; endConversation; pruneChanges; backup; exportModule; onCommit }
+EventBus = { publish(event); subscribe(filter?, { capacity? }); stats(); forModule(id) }
+```
+
+- **One file**, `data/household.db`, SQLite through `@effect/sql-sqlite-node` on `node:sqlite` (`packages/store-sqlite`;
+  `effect/sql` is unstable, so it stays behind `HouseholdStore`): WAL, `synchronous = NORMAL`, `secure_delete = ON`, one
+  connection, writes serialised. Calls are synchronous on the main thread, which also frames audio: every statement is
+  small (single-row writes, indexed reads), and nothing waits on the network inside a transaction. Serve mode opens it
+  read-write after the writer lock; the CLI modes read-only (writes fail `read-only`); node's `ExperimentalWarning` for
+  `node:sqlite` is filtered (`store-sqlite/src/quiet.ts`).
+- **Scopes** come from `CurrentTurn` or are passed; a person-scoped call with no known person is `ScopeUnknown`, never
+  a household write. Conversation-scoped rows are deleted when the conversation ends (`SessionConversation`).
+- **Change log** (`pva_changes`): one row per write in the same transaction (seq, op id, module, collection, scope, row
+  id, op, rev, actor, time, the values before and after unless `history: "none"`); 90 days kept; `undo` per actor and
+  collection; `erase` removes a row with every earlier payload and its search entries (daily backups keep it 14 days).
+- **Versions**: `prepare` (before the module host is made) migrates older data after a backup, in a transaction, and
+  makes a module whose stored data is newer `unavailable` (`ModuleHostOptions.household`; the host's `judge` reads
+  `store.availability`). A newer core schema stops serve mode.
+- **Bus**: data changes after commit, module events (`<moduleId>.<type>`), `host.turn.ended`, `host.device.connected`,
+  `host.device.disconnected`, `host.module.state`. One queue of 256 per subscriber, dropping and counting when full, so a
+  slow subscriber never holds up a publisher or the turn path.
+- **Pages**: `household.snapshot` after `welcome` and `household.event` after each commit, only for collections and
+  event types with a projection, through `mayRevealScopeTo` (household to every voice page, device to its own, person
+  withheld until P5's `Privacy.mayReveal`) and the projection, the same on all three paths (snapshot, live, replay from
+  `hello.household.seq`). `HouseholdFeed.ts`, `serve/HouseholdPush.ts`.
+- **Ambient facts**: one host context provider (`Household`, 50 ms, 600 characters, `HOME_AMBIENT_FACTS`) appended to
+  each assistant's registry in serve mode (`withContextProvider`).
+- **Backups**: daily `data/backups/household-<date>.db` (14 kept, optional `HOUSEHOLD_BACKUP_COPY_DIR`), and `pnpm start
+  household backup | export <module> | restore <file>`; `doctor` checks the database and the last backup's age.
 
 Adding a feature = one new file exporting `defineModule({...})` + one line in `moduleCatalog` in `apps/assistant/src/modules.ts`. Adding a provider = one new package implementing a core interface + one line in `apps/assistant/src/providers.ts`. Adding a voice provider = an adapter with `layerConfig` (`Tts`) and `makeVoices` (`TtsVoices`), and one entry in `ttsProviders`, `ttsProviderInfo` and (hosted) `hostedTtsVoices` in `providers.ts`. A voice needs no code: it is chosen by its key.
 
@@ -384,6 +427,8 @@ packages/
                     time of day (the "half" rules), dates and date-times, quantities with units and conversion, speakable numbers, amounts,
                     durations, clock times, dates and lists, RFC 5545 recurrence (build, describe, next occurrence, daylight-saving safe);
                     re-exports core's `parseDuration`; README in the package
+  store-sqlite/     `@pva/store-sqlite`: the household store on `data/household.db` (node:sqlite via @effect/sql-sqlite-node), the module
+                    SQL guard, backups, export, the maintenance fiber and the doctor check (docs/STORING-DATA.md)
   net/              `@pva/net`: `safeFetch` for URLs a model or user chose (resolves the host itself, refuses non-public addresses on every
                     hop, connects to the checked address, size and time limits), a cached JSON GET (TTL, ETag, stale-if-error) and the
                     outgoing `User-Agent` from the household API contact (`HOME_API_CONTACT`); README in the package

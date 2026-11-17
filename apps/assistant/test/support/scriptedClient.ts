@@ -142,6 +142,8 @@ export class ScriptedClient {
     readonly frontend?: FrontendRole
     readonly device?: DeviceHello | false
     readonly adminToken?: string
+    /** `hello.household.seq`: the last household change this page saw (replay after a reconnect). */
+    readonly householdSeq?: number
   } = {}): Promise<ServerMessageOf<"welcome">> {
     const frontend = options.frontend ?? "voice"
     const device = frontend === "voice" && options.device !== false ? options.device ?? this.device : undefined
@@ -152,7 +154,8 @@ export class ScriptedClient {
       resumeOwner: options.resumeOwner ?? false,
       frontend,
       ...(device !== undefined ? { device } : {}),
-      ...(options.adminToken !== undefined ? { adminToken: options.adminToken } : {})
+      ...(options.adminToken !== undefined ? { adminToken: options.adminToken } : {}),
+      ...(options.householdSeq !== undefined ? { household: { seq: options.householdSeq } } : {})
     })
     return this.waitFor("welcome")
   }
