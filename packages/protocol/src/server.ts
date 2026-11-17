@@ -219,7 +219,12 @@ export const Result = Schema.Struct({
   /** Protocol 5: present only on the successful result of `admin.login`. */
   admin: Schema.optionalKey(AdminSession),
   /** Protocol 7: present only on the successful result of `assistant.create`: the id the server made. */
-  assistantId: Schema.optionalKey(AssistantId)
+  assistantId: Schema.optionalKey(AssistantId),
+  /**
+   * Protocol 7: present only on the successful result of `device.save`: the revision the saved device or defaults
+   * have now, so the page can wait until that revision has reached it (the lists are pushed after the result).
+   */
+  rev: Schema.optionalKey(NonNegativeInt)
 })
 
 /**
