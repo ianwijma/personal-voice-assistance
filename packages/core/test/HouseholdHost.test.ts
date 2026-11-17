@@ -157,8 +157,8 @@ describe("household store in the module host", () => {
                 handled.push((e.data as { i: number }).i)
                 return handled.length === 1 ? Deferred.await(handlerGate) : Effect.void
               })))
-            // One run outside the part's scope: it ends when the part's scope closes all the same.
-            yield* Effect.forkDetach(Stream.runDrain(ctx.events.subscribe({ type: "nobody.publishes.this" })))
+            // A second one in its scope, whose handler is still waiting when the part closes: interrupted, released.
+            yield* Effect.forkScoped(Stream.runForEach(ctx.events.subscribe({ type: "host.turn.ended" }), () => Effect.never))
             return {
               tools: [makeTool({
                 name: "note",
@@ -194,7 +194,7 @@ describe("household store in the module host", () => {
       assert.strictEqual(yield* Fiber.join(call), "in grace", "a call in flight still writes during the grace period")
       yield* Fiber.join(stopping)
       assert.strictEqual(host.modules()[0]!.state, "disabled")
-      assert.strictEqual(h.bus.stats().subscribers, 0, "both released, the detached one too")
+      assert.strictEqual(h.bus.stats().subscribers, 0, "both released with the part, the one whose handler was waiting when it closed too")
       // Closed: every member dies with ModuleStopped, a collection handle taken earlier too (taken now: the same).
       const stopped = (exit: Exit.Exit<unknown, unknown>) => Exit.isFailure(exit) && Cause.squash(exit.cause) instanceof ModuleStopped
       assert.isTrue(stopped(yield* Effect.exit(kept.store!.collection(items).list())))

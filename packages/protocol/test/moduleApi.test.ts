@@ -2,7 +2,7 @@
 // registry messages.
 import { Schema } from "effect"
 import { describe, expect, it } from "vitest"
-import { exampleHealth, exampleUnavailableModule, serverExamples } from "../src/examples.ts"
+import { exampleHealth, exampleHouseholdSnapshotFinal, exampleUnavailableModule, serverExamples } from "../src/examples.ts"
 import { AssistantTemplate, decodeClientMessage, decodeServerMessage, HealthIssue, ModuleInfo, ModuleState, PROTOCOL_VERSION, ToolInfo } from "../src/index.ts"
 
 const decodes = (schema: Schema.Top, value: unknown) => Schema.decodeUnknownResult(schema as Schema.Codec<unknown, unknown>)(value)._tag === "Success"
@@ -32,5 +32,13 @@ describe("protocol 9", () => {
     expect(decodeServerMessage(JSON.stringify(serverExamples.health))).toMatchObject({ _tag: "Ok", message: { type: "health", health: exampleHealth } })
     expect(decodeClientMessage(JSON.stringify({ type: "health.check", requestId: "h1" }))).toMatchObject({ _tag: "Ok" })
     expect(decodes(HealthIssue, { id: "x", severity: "fatal", title: "", detail: "" })).toBe(false)
+  })
+
+  it("the snapshot example is the sequence the feed sends: a part with rows, then the empty final part naming what was cut", () => {
+    const parts = [serverExamples["household.snapshot"], exampleHouseholdSnapshotFinal]
+    for (const part of parts) expect(decodeServerMessage(JSON.stringify(part))).toMatchObject({ _tag: "Ok" })
+    expect(parts.map((p) => [p.part, p.final, p.collections.length > 0])).toEqual([[0, false, true], [1, true, false]])
+    expect(parts[0]!.truncated).toEqual([])
+    expect(parts[1]!.truncated.length).toBeGreaterThan(0)
   })
 })

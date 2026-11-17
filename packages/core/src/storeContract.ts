@@ -9,7 +9,7 @@ import { Cause, Deferred, Effect, Exit, Fiber, Schema, type Scope, Stream } from
 import { TestClock } from "effect/testing"
 import { connectStoreToBus, defineEventType, type HouseholdEvent, makeEventBus } from "./EventBus.ts"
 import { ambientLines } from "./HouseholdAmbient.ts"
-import { type FeedProblem, makeHouseholdFeed, MAX_FEED_COLLECTIONS, SNAPSHOT_MAX_CHARS, SNAPSHOT_PART_CHARS, type SnapshotRun } from "./HouseholdFeed.ts"
+import { type FeedProblem, makeHouseholdFeed, MAX_FEED_COLLECTIONS, SNAPSHOT_MAX_CHARS, SNAPSHOT_PART_CHARS, SNAPSHOT_READ_ROWS, type SnapshotRun } from "./HouseholdFeed.ts"
 import { makeHouseholdPage, type PageMessage } from "./HouseholdPage.ts"
 import {
   type Actor,
@@ -1055,7 +1055,8 @@ export const householdStoreContract = (name: string, make: MakeStore) =>
         const finalAt = after.findIndex((m) => m.type === "household.snapshot" && m.final)
         const delivered = after.flatMap((m, i) => (m.type === "household.event" ? [{ i, n: (m.event.data as { n: number }).n }] : []))
         assert.isTrue(delivered.every((d) => d.i > finalAt))
-        assert.deepStrictEqual(delivered.map((d) => d.n), [21, 22, 23, 24, 25, 26, 27, 28, 29])
+        // (The bound keeps room for a snapshot: the 20th waiting entry overflows when no snapshot is queued.)
+        assert.deepStrictEqual(delivered.map((d) => d.n), [20, 21, 22, 23, 24, 25, 26, 27, 28, 29])
         assert.strictEqual(page.size(), 0)
       }).pipe(Effect.scoped))
 
@@ -1127,6 +1128,40 @@ export const householdStoreContract = (name: string, make: MakeStore) =>
         const crowd = Array.from({ length: MAX_FEED_COLLECTIONS + 1 }, (_, i) => defineCollection({ name: `x${i}`, scope: "household", schema: Note, project: () => ({}) }))
         makeHouseholdFeed({ store, modules: [{ moduleId: "crowd", collections: crowd, events: [] }], report: (p) => tooMany.push(p) })
         assert.strictEqual(tooMany.length, 1)
+      }).pipe(Effect.scoped))
+
+    it.effect("pages: a snapshot reads at most SNAPSHOT_READ_ROWS rows in all, a page shortened by that budget included, and the collection it cut is named", () =>
+      Effect.gen(function*() {
+        const tiny = Array.from({ length: 11 }, (_, i) => defineCollection({ name: `t${i}`, scope: "household", schema: Note, project: () => ({}) }))
+        const store = yield* make()
+        yield* store.prepare([{ id: "many", storage: { collections: tiny } }])
+        // 499 rows, then nine of SNAPSHOT_ROWS (500): 4,999 read before the last collection, which has more than a page.
+        const counts = [499, ...Array.from({ length: 9 }, () => 500), 40]
+        for (const [i, c] of tiny.entries()) {
+          yield* store.forModule("many").transaction((tx) => {
+            for (let k = 0; k < counts[i]!; k++) tx.collection(c).insert({ text: "x" })
+          })
+        }
+        let read = 0
+        const counting: HouseholdStore = {
+          ...store,
+          reader: (owner, c) => {
+            const r = store.reader(owner, c)
+            return r === undefined ? undefined : {
+              ...r,
+              page: (scope, after, limit) => {
+                const rows = r.page(scope, after, limit)
+                read += rows.length
+                return rows
+              }
+            }
+          }
+        }
+        const feed = makeHouseholdFeed({ store: counting, modules: [{ moduleId: "many", collections: tiny, events: [] }] })
+        const frames = allFrames(feed.snapshot({ id: "kitchen-01" }))
+        assert.strictEqual(read, SNAPSHOT_READ_ROWS)
+        assert.include(frames.at(-1)!.truncated.map((t) => t.collection), "t10")
+        assert.notInclude(frames.at(-1)!.truncated.map((t) => t.collection), "t0")
       }).pipe(Effect.scoped))
 
     it.effect("module events reach pages only through a declared projection, which may fail on its own; host events never", () =>

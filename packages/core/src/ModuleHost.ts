@@ -451,7 +451,7 @@ interface Part {
   readonly handle: PartHandle
   /**
    * P4: completed by the first finalizer added to its scope (so it runs last, after the module's own): a subscription
-   * the part made ends there wherever the module runs it (`servicesFor`).
+   * the part made, consumed in the part's scope, ends there (`servicesFor`).
    */
   readonly closed: Deferred.Deferred<void>
   /**
@@ -2563,7 +2563,9 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
    * P4: `ctx.events` of one part. A subscription lives with the part: it receives events only while the part is `live`
    * (published with its module; an event published while it starts is not kept for it), each event checked as it is
    * handed to the module's code, so none reaches a handler once the module is withdrawn; and it ends when the part's
-   * scope closes, wherever the module runs the stream. `publish` and `subscribe` die with `ModuleStopped` once the scope
+   * scope closes, consumed in that scope (a stream run detached from it is not supported: nothing is promised about
+   * when it is released). Handlers are not calls in flight: no grace period, interrupted as the scope closes.
+   * `publish` and `subscribe` die with `ModuleStopped` once the scope
    * has closed. No registration: the part's state is the registrations' own lifetime (`live` from publication to
    * withdrawal), and a module may subscribe at any time while it runs, not only during its start.
    */

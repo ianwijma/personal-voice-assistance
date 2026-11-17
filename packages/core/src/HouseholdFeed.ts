@@ -313,8 +313,10 @@ export const makeHouseholdFeed = (options: {
         return finish()
       }
       const reader = store.reader(moduleId, collection)
-      // A page of at most what one list of the collection may read (`maxListRows`: rows of a large maxChars are fewer).
-      const want = Math.min(SNAPSHOT_PAGE_ROWS, SNAPSHOT_ROWS - rowsHere, maxListRows(collection))
+      // A page of at most what one list of the collection may read (`maxListRows`: rows of a large maxChars are fewer)
+      // and what is left of the snapshot's reading budget; a page that budget cut short leaves the collection unfinished,
+      // so the next step names it as cut.
+      const want = Math.min(SNAPSHOT_PAGE_ROWS, SNAPSHOT_ROWS - rowsHere, SNAPSHOT_READ_ROWS - read, maxListRows(collection))
       let rows: ReadonlyArray<Row<unknown>> = []
       try {
         rows = reader === undefined ? [] : reader.page(scope, after, want)
