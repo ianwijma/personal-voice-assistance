@@ -50,6 +50,7 @@ export function LookTab({ draft }: TabProps) {
       <AField label="Look" path="look" draft={draft} help="Saved with the assistant. Voice pages showing it change when it is saved.">
         <LookEditor
           value={a.look}
+          epoch={draft.epoch}
           idPrefix="a-look"
           whose={`${name}'s`}
           onChange={(look) =>

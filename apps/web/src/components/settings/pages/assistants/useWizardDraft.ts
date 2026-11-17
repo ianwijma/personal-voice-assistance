@@ -20,6 +20,7 @@ export const useWizardDraft = (initial: () => Assistant, frozen: () => boolean =
   const [errors, setErrorList] = useState<ReadonlyArray<FieldError>>([])
   const [message, setMessage] = useState<string | undefined>()
   const [localErrors, setLocal] = useState<Readonly<Record<string, string>>>({})
+  const [epoch, setEpoch] = useState(0)
   const edit = (f: (x: Assistant) => Assistant, touched?: string) => {
     if (frozen()) return
     setA(f)
@@ -28,6 +29,7 @@ export const useWizardDraft = (initial: () => Assistant, frozen: () => boolean =
   }
   return {
     current: a,
+    epoch,
     saved: a,
     dirty: false,
     saving: false,
@@ -53,7 +55,9 @@ export const useWizardDraft = (initial: () => Assistant, frozen: () => boolean =
     cancel: () => undefined,
     dismissWarnings: () => undefined,
     replace: (next) => {
-      if (!frozen()) setA(next)
+      if (frozen()) return
+      setEpoch((e) => e + 1)
+      setA(next)
     },
     setErrors: (list, m) => {
       setErrorList(list)

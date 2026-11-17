@@ -85,7 +85,7 @@ export function LookSection({ ctx, assistants }: { readonly ctx: SectionContext;
         : (
           <>
             <Callout testId="look-own-note">{ctx.isType ? `The default for ${ctx.thisWord}; one with a Look of its own keeps it.` : `For ${ctx.thisWord} only.`} The assistants' own looks are not changed.</Callout>
-            <LookEditor value={look.look} idPrefix="d-look" whose={`${ctx.deviceName}'s own`} foldPicker onChange={(l) => set({ from: "device", look: l })} />
+            <LookEditor value={look.look} epoch={ctx.epoch} idPrefix="d-look" whose={`${ctx.deviceName}'s own`} foldPicker onChange={(l) => set({ from: "device", look: l })} />
           </>
         )}
     </section>

@@ -219,6 +219,8 @@ function DeviceEditor({ type, device }: { readonly type: DeviceTypeInfo; readonl
   const [acked, setAcked] = useState<DeviceEdit | undefined>()
   /** Bumped when the draft is discarded or a section reset: the number fields start again (their text and errors). */
   const [generation, setGeneration] = useState(0)
+  /** Bumped when the draft is discarded, a section reset or a save sent: an edit still on its way (a character loading) is dropped. */
+  const [epoch, setEpoch] = useState(0)
   const revNow = useRef(rev)
   /**
    * Set while a save is on its way: the editor is inert and `update` ignores changes (they would not be in the save).
@@ -271,6 +273,7 @@ function DeviceEditor({ type, device }: { readonly type: DeviceTypeInfo; readonl
   const discard = () => {
     setState({ edit: noEdit, rev })
     setGeneration((g) => g + 1)
+    setEpoch((g) => g + 1)
   }
   const update = useCallback((f: (e: DeviceEdit) => DeviceEdit) => {
     setJustSaved(false)
@@ -299,11 +302,16 @@ function DeviceEditor({ type, device }: { readonly type: DeviceTypeInfo; readonl
   const defaultsName = `Every ${type.one}`
   const thisWord = isType ? `these ${type.many}` : `this ${type.one}`
   const name = edit.name ?? device?.name ?? defaultsName
-  const ctx: SectionContext = { base, edit, update, settings, isType, thisWord, defaultsName, deviceName: name, setBlocked: setBlockedId, generation, renew: () => setGeneration((g) => g + 1) }
+  const ctx: SectionContext = { base, edit, update, settings, isType, thisWord, defaultsName, deviceName: name, setBlocked: setBlockedId, generation, epoch, renew: () => {
+    setGeneration((g) => g + 1)
+    setEpoch((g) => g + 1)
+  } }
   const sections = sectionsOf(type)
   const has = (s: ReturnType<typeof sectionsOf>[number]) => sections.includes(s)
 
   const save = async (saveAnyway = false): Promise<Outcome> => {
+    // The save takes the draft as shown: an edit still on its way is not in it and must not land after it.
+    setEpoch((g) => g + 1)
     savingNow.current = true
     setSaving(true)
     setMessage(undefined)

@@ -24,8 +24,13 @@ const sameLook = (a: Look | undefined, b: Look | undefined): boolean => deepEqua
  * A look naming a character this version does not have is shown as such and left untouched until another is picked:
  * the stage shows the baseline for it (docs/CHARACTERS.md §4.6).
  */
-export function LookEditor({ value, onChange, idPrefix, whose, foldPicker = false }: {
+export function LookEditor({ value, onChange, idPrefix, whose, foldPicker = false, epoch = 0 }: {
   readonly value: Look | undefined
+  /**
+   * The draft's discard generation (Cancel, Load latest, a reset, a save sent): when it changes, a load still on its
+   * way is dropped, whether or not the look itself changed (another field may be all that was put back).
+   */
+  readonly epoch?: number
   readonly onChange: (look: Look) => void
   readonly idPrefix: string
   /** Whose look this is, for the headings: "Jeff's", "Kitchen iPad's own". */
@@ -48,9 +53,9 @@ export function LookEditor({ value, onChange, idPrefix, whose, foldPicker = fals
     onChange(look)
   }
 
-  // A load still on its way is dropped when the editor goes away (the person chose "Each assistant's own look") and
-  // when the look is changed from outside it (Cancel, a reset, a save from elsewhere): it must not bring back a
-  // character on a look that is no longer the one it was picked on.
+  // A load still on its way is dropped when the editor goes away (the person chose "Each assistant's own look"), when
+  // the look is changed from outside it (a save from elsewhere), and when the draft is discarded, reset or saved
+  // (`epoch`, below) even with the look unchanged: it must not bring back a character on a draft it was not picked on.
   const seen = useRef(value)
   useEffect(() => {
     if (sameLook(value, seen.current)) return
@@ -59,6 +64,13 @@ export function LookEditor({ value, onChange, idPrefix, whose, foldPicker = fals
     own.current = undefined
     if (!mine) pickToken.current++
   }, [value])
+  const seenEpoch = useRef(epoch)
+  useEffect(() => {
+    if (epoch === seenEpoch.current) return
+    seenEpoch.current = epoch
+    own.current = undefined
+    pickToken.current++
+  }, [epoch])
   useEffect(() => () => {
     pickToken.current++
   }, [])
