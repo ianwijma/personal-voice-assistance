@@ -392,6 +392,40 @@ describe("the version-4 file", () => {
     for (let i = 0; i < 15; i++) await run(restarted.createAssistant({ ...a, name: `A${i}` }))
     expect(await run(Effect.flip(restarted.createAssistant({ ...a, name: "One too many" })))).toMatchObject({ code: "limit_reached" })
   })
+
+  it("a type without stored defaults (missing or dropped) is rev 0; the first record any save makes is rev 1", async () => {
+    const dir = v3Dir({})
+    const first = await run(openStore(dir, withCatalog()))
+    await run(saveSection(first, "recordings", { RECORD_HEARD_AUDIO: true }, {}))
+    const { rev: _, ...webSettings } = first.settings().deviceTypes[WEB_VOICE_KIND]!
+    const rewrite = (deviceType: unknown) => {
+      const file = onDisk(dir)
+      if (deviceType === undefined) delete file.deviceTypes[WEB_VOICE_KIND]
+      else file.deviceTypes[WEB_VOICE_KIND] = deviceType
+      writeFileSync(join(dir, "settings.json"), `${JSON.stringify(file, null, 2)}\n`)
+    }
+
+    // Missing: `device.save`'s path.
+    rewrite(undefined)
+    const missing = await run(openStore(dir, withCatalog()))
+    expect(missing.settings().deviceTypes[WEB_VOICE_KIND]).toBeUndefined()
+    expect((await run(missing.saveDeviceType(WEB_VOICE_KIND, 0, { ...webSettings, matching: "exact" }))).rev).toBe(1)
+    expect(await run(Effect.flip(missing.saveDeviceType(WEB_VOICE_KIND, 0, webSettings)))).toMatchObject({ code: "stale" })
+    expect((await run(missing.saveDeviceType(WEB_VOICE_KIND, 1, webSettings))).rev).toBe(2)
+
+    // Not valid, so dropped at load (its old rev is gone with it): the same.
+    rewrite({ ...webSettings, matching: "sideways", rev: 7 })
+    const dropped = await run(openStore(dir, withCatalog()))
+    expect(dropped.problems.some((p) => p.includes("were not valid and were dropped"))).toBe(true)
+    expect(dropped.settings().deviceTypes[WEB_VOICE_KIND]).toBeUndefined()
+    expect((await run(dropped.saveDeviceType(WEB_VOICE_KIND, 0, webSettings))).rev).toBe(1)
+
+    // Missing, then changed through the legacy view (`frontend.update`): also rev 1.
+    rewrite(undefined)
+    const legacy = await run(openStore(dir, withCatalog()))
+    await run(legacy.saveFrontends("kind defaults", (d) => ({ ...d, frontends: { [WEB_VOICE_KIND]: { captions: false } } })))
+    expect(legacy.settings().deviceTypes[WEB_VOICE_KIND]).toMatchObject({ rev: 1, captions: { captions: false } })
+  })
 })
 
 describe("today's pages on version 4", () => {
