@@ -720,7 +720,7 @@ function Row({ source, row: line, index, active, selected, favourite, onSelect, 
       </button>
       {entry?.usedByDevices !== undefined && (entry.usedBy.length > 0 || entry.usedByDevices.length > 0) && (
         <p className="basis-full truncate pb-1.5 pl-9 pr-2 text-[12px] text-ink-muted max-sm:pl-8" data-testid={`${noun}-used-by`}>
-          <UsedBy assistants={entry.usedBy} devices={entry.usedByDevices} testId={`${noun}-used-by-text`} />
+          <UsedBy assistants={entry.usedBy} devices={entry.usedByDevices} testId={`${noun}-used-by-text`} plain />
         </p>
       )}
     </li>

@@ -14,11 +14,11 @@ import { createStore } from "@/lib/store.ts"
 const kitchen: DeviceUser = { target: { kind: "device", id: "d-kitchen-ipad-0001" }, name: "Kitchen iPad" }
 const everyBrowser: DeviceUser = { target: { kind: "type", type: "web-voice" }, name: "Every browser" }
 
-const view = (assistants: ReadonlyArray<string>, devices: ReadonlyArray<DeviceUser>) => {
+const view = (assistants: ReadonlyArray<string>, devices: ReadonlyArray<DeviceUser>, plain = false) => {
   const info = (id: string, name: string) => ({ ...exampleAssistant, id, name, usedOn: [], resources: { llm: "unused", voice: "unused" }, problems: [] }) as unknown as AssistantInfo
   const store = createStore({ ...initialState, assistants: [info("jeff", "Jeff"), info("t3", "T3")] }, reducer)
   const client = { store } as unknown as AssistantClient
-  return render(<ClientContext.Provider value={client}><UsedBy assistants={assistants} devices={devices} /></ClientContext.Provider>)
+  return render(<ClientContext.Provider value={client}><UsedBy assistants={assistants} devices={devices} plain={plain} /></ClientContext.Provider>)
 }
 
 describe("UsedBy", () => {
@@ -32,6 +32,12 @@ describe("UsedBy", () => {
       ["Kitchen iPad", "#settings/devices/d-kitchen-ipad-0001"],
       ["Every browser", "#settings/devices/type.web-voice"]
     ])
+  })
+
+  it("plain (a picker row): the same names, no links, so the row's Tab order is unchanged", () => {
+    view(["jeff"], [kitchen], true)
+    expect(screen.getByTestId("used-by").textContent).toBe("Used by Jeff · Kitchen iPad")
+    expect(screen.queryAllByRole("link")).toEqual([])
   })
 
   it("shows devices alone, assistants alone, and nothing when there are none", () => {
