@@ -21,11 +21,11 @@ const label = (v: string) => (v === "close" ? "Close" : "Exact")
 const savedDevice = (rev: number): DeviceListInfo => ({ ...exampleDevice, own: { ...exampleDevice.own, matching: to }, settings: { ...exampleDevice.settings, matching: to }, rev })
 const savedType = (rev: number): DeviceTypeInfo => ({ ...exampleDeviceType, settings: { ...exampleDeviceType.settings, matching: to }, rev })
 
-const setup = (page: "device" | "type" = "device") => {
+const setup = (page: "device" | "type" = "device", deviceType: DeviceTypeInfo = exampleDeviceType) => {
   const store = createStore(
     {
       ...initialState,
-      deviceTypes: [exampleDeviceType],
+      deviceTypes: [deviceType],
       devices: [exampleDevice],
       assistants: [exampleAssistantInfo, { ...exampleAssistantT3, usedOn: [], resources: { llm: "ready", voice: "ready" }, problems: [] }],
       ui: { ...initialState.ui, settingsOpen: true, settingsPath: ["devices", page === "device" ? exampleDevice.id : typePageId(exampleDeviceType.kind)] }
@@ -185,5 +185,24 @@ describe("Device editor: a save is over when its revision has arrived", () => {
     t.pick(from)
     expect(t.checked()).toBe(from)
     expect(t.dirty()).toBe(true)
+  })
+
+  // PR #35 review 9: a type with no stored defaults is reported at rev 0; the server's first save of it stores, pushes
+  // and answers rev 1 (before, it answered 0 and the editor was freed before the push).
+  it("the defaults page of a type with no stored defaults (rev 0): the first save answers rev 1 and waits for it", async () => {
+    const t = setup("type", { ...exampleDeviceType, settings: { ...exampleDeviceType.settings, matching: from }, rev: 0 })
+    await t.send()
+    await t.respond({ kind: "ok", rev: 1 })
+    expect(t.busy()).toBe(true)
+    t.pick(from)
+    expect(t.checked()).toBe(to)
+    await t.push({ type: "device.types", types: [savedType(1)] })
+    expect(t.busy()).toBe(false)
+    expect(t.checked()).toBe(to)
+    expect(t.dirty()).toBe(false)
+    t.pick(from)
+    expect(t.checked()).toBe(from)
+    expect(t.dirty()).toBe(true)
+    expect(t.saveButton()!.disabled).toBe(false)
   })
 })
