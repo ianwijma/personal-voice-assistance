@@ -1,5 +1,5 @@
 import { expect, type Page } from "@playwright/test"
-import { loginAdmin, mock, test } from "./fixtures.ts"
+import { loginAdmin, MOCK, mock, test } from "./fixtures.ts"
 
 // Admin › Assistants › New assistant (docs/ASSISTANTS.md §7.1, mock-up `pWizard`): seven steps at
 // `#settings/assistants/new/<n>`; nothing is sent before "Create assistant", which sends assistant.create with placements.
@@ -95,6 +95,24 @@ test("Start from a copy takes the settings of that assistant, not its devices; a
   const body = (await created()).at(-1)
   expect(body!.copyOf).toBe("keuken")
   expect(body!.assistant).toMatchObject({ name: "Keuken twee", llm: { account: "home-model", model: "qwen3-14b" }, voice: { voiceId: "nl_NL-pim-medium" } })
+})
+
+test("a copy of an assistant whose hosted voice has no key: Create warns, Go back, Create anyway sends saveAnyway", async ({ page, baseURL }) => {
+  // PR #84 review, finding 2. Cartesia has no key in the mock; Keuken speaks with a Cartesia voice (changed elsewhere).
+  const r = await fetch(`${MOCK}/mock/assistant`, { method: "POST", body: JSON.stringify({ id: "keuken", patch: { voice: { provider: "cartesia", voiceId: "db6b0ed5-d5d3-463d-ae85-518a07d3c2b4" } } }) })
+  expect(r.ok).toBe(true)
+  await loginAdmin(page, baseURL, "#settings/assistants/new/1")
+  await page.getByLabel("Name", { exact: true }).fill("Mia")
+  await page.getByRole("radio", { name: /Copy of Keuken/ }).click()
+  for (let step = 1; step < 7; step++) await next(page)
+  await page.getByTestId("wizard-create").click()
+  await expect(page.getByTestId("save-warnings")).toContainText("Cartesia has no API key yet")
+  await page.getByTestId("page-footer").getByRole("button", { name: "Go back" }).click()
+  await expect(page.getByTestId("save-warnings")).toHaveCount(0)
+  await page.getByTestId("wizard-create").click()
+  await page.getByTestId("wizard-create-anyway").click()
+  await expect(page.getByTestId("assistant-page")).toHaveAttribute("data-assistant", "mia")
+  expect((await created()).map((m) => (m as { saveAnyway?: boolean }).saveAnyway)).toEqual([undefined, undefined, true])
 })
 
 test("a duplicate phrase on a device refuses the create at Where; typed work asks before leaving", async ({ page, baseURL }) => {

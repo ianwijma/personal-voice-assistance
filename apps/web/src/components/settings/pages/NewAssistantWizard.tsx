@@ -102,6 +102,10 @@ export function NewAssistantWizard() {
   const [busy, setBusy] = useState(false)
   const [whereMessage, setWhereMessage] = useState<string | undefined>()
   const [createError, setCreateError] = useState<string | undefined>()
+  /** The warnings of a create (a hosted voice without its key): nothing was created; "Create anyway" sends `saveAnyway`. */
+  const [warnings, setWarnings] = useState<ReadonlyArray<string>>([])
+  // Another step (Edit, Back, the browser's buttons) may change what is sent, so the warnings are asked again.
+  useEffect(() => setWarnings([]), [step])
   const [now] = useState(() => Date.now())
 
   // The settings screen asks "Leave without saving?" once anything has been typed or chosen.
@@ -129,10 +133,11 @@ export function NewAssistantWizard() {
     draft.replace({ ...a, ...body, name: a.name, purpose: a.purpose, handles: a.handles, on: true, confirmActions: "off" })
   }
 
-  const create = async () => {
+  const create = async (saveAnyway = false) => {
     if (creating.current) return
     setCreateError(undefined)
     setWhereMessage(undefined)
+    setWarnings([])
     if (a.name.trim() === "") {
       draft.setErrors([{ key: "name", message: "An assistant needs a name." }])
       return go(1)
@@ -145,7 +150,7 @@ export function NewAssistantWizard() {
     const body = { ...toBody(a), name: a.name.trim() }
     let outcome: Outcome
     try {
-      outcome = await client.createAssistant(body, { ...(from !== BLANK_START ? { copyOf: from } : {}), placements }) // continuation(identity): only this page's own state; it navigates only while this wizard is still mounted (`alive`)
+      outcome = await client.createAssistant(body, { ...(from !== BLANK_START ? { copyOf: from } : {}), placements, ...(saveAnyway ? { saveAnyway: true } : {}) }) // continuation(identity): only this page's own state; it navigates only while this wizard is still mounted (`alive`)
     } catch {
       outcome = { kind: "refused", code: "internal", message: "Could not create it. Try again." }
     }
@@ -158,6 +163,7 @@ export function NewAssistantWizard() {
       return client.settings(["assistants", outcome.assistantId], { discard: true })
     }
     if (!alive.current) return
+    if (outcome.kind === "warnings") return setWarnings(outcome.warnings.map((w) => w.message))
     if (outcome.kind === "invalid") {
       draft.setErrors(outcome.fieldErrors)
       const first = Math.min(...outcome.fieldErrors.map((e: FieldError) => stepOfPath(e.key)))
@@ -366,6 +372,19 @@ export function NewAssistantWizard() {
         style={{ bottom: inset, paddingBottom: "max(12px, env(safe-area-inset-bottom))" }}
         data-testid="page-footer"
       >
+        {step === LAST && warnings.length > 0 ? (
+          // As the edit page's footer: the save would work but looks like a mistake; only "anyway" or back.
+          <div className="flex flex-col gap-2.5 rounded-md border border-warn/40 bg-warn/5 px-3 py-2.5" role="alert" data-testid="save-warnings">
+            {warnings.map((w, i) => <p key={i} className="text-[13px] text-ink">{w}</p>)}
+            <div className="flex flex-wrap gap-2">
+              <Button variant="primary" className="max-sm:h-11" onClick={() => void create(true)} disabled={busy} data-testid="wizard-create-anyway">
+                {busy && <Spinner size={12} />}
+                Create anyway
+              </Button>
+              <Button className="max-sm:h-11" onClick={() => setWarnings([])} disabled={busy}>Go back</Button>
+            </div>
+          </div>
+        ) : (
         <div className="flex flex-wrap items-center gap-2">
           {step > 1
             ? <Button variant="quiet" onClick={() => go(step - 1)} data-testid="wizard-back"><Icon name="back" size={16} />Back</Button>
@@ -380,6 +399,7 @@ export function NewAssistantWizard() {
               </Button>
             )}
         </div>
+        )}
       </div>
     </div>
   )

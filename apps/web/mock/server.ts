@@ -694,6 +694,19 @@ const checks = (list: ReadonlyArray<SettingsSection>): { errors: Array<FieldErro
   return { errors, warnings }
 }
 
+/**
+ * The real server's voice check on `assistant.create` (docs/LOOKS-AND-VOICES.md §5.0), its warning half: a hosted
+ * voice whose provider has no key asks for `saveAnyway` (a copy of an assistant with such a voice too). The mock's
+ * `assistant.save` does not check the voice.
+ */
+const assistantVoiceWarning = (voice: { readonly provider: string; readonly voiceId: string }, saveAnyway: boolean) => {
+  if (saveAnyway) return undefined
+  const provider = MOCK_PROVIDERS.find((p) => p.id === voice.provider)
+  if (provider?.keyField === undefined || secretSet(provider.keyField)) return undefined
+  const message = `${provider.label} has no API key yet, so this voice cannot speak.`
+  return { code: "invalid_settings" as const, message: `${message} Save anyway to keep it.`, warnings: [{ key: "voice", message }] }
+}
+
 /** The sections with their forms' warnings for the saved values. */
 const withWarnings = (list: Array<SettingsSection>): Array<SettingsSection> => {
   const { warnings } = checks(list)
@@ -2267,6 +2280,8 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
     }
     case "assistant.create": {
       if (requireAdmin(c, m.requestId)) return
+      const warned = assistantVoiceWarning(m.assistant.voice, m.saveAnyway === true)
+      if (warned !== undefined) return result(c, m.requestId, false, warned)
       const r = assistantsMock.create(m, [...devices.values()].map((d) => ({ id: d.id, name: d.name })))
       sendTo(c, r.ok ? { type: "result", requestId: m.requestId, ok: true, ...(r.assistantId !== undefined ? { assistantId: r.assistantId } : {}) } : { type: "result", requestId: m.requestId, ok: false, ...(r.error !== undefined ? { error: r.error } : {}) })
       if (r.ok) assistantsChanged()

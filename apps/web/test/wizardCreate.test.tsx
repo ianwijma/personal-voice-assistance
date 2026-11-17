@@ -165,3 +165,49 @@ describe("New assistant wizard: Start from Blank next to an assistant called Bla
     expect(body.prompt).toBe(custom.prompt)
   })
 })
+
+// PR #84 review, finding 2: a create the server answers with a warning (a hosted voice without its key) can be sent
+// again with saveAnyway, as the edit page's "Save anyway".
+describe("New assistant wizard: a create that warns", () => {
+  const warning: Outcome = { kind: "warnings", message: "Cartesia has no API key yet, so this voice cannot speak. Save anyway to keep it.", warnings: [{ key: "voice", message: "Cartesia has no API key yet, so this voice cannot speak." }] }
+
+  it("shows the warning with Create anyway and Go back; Create anyway sends saveAnyway and lands on the assistant", async () => {
+    const answers: Array<Outcome> = [warning, { kind: "ok", assistantId: "mia" }]
+    const { create, settings, toStep } = setup(async () => answers.shift()!)
+    fireEvent.change(nameField(), { target: { value: "Mia" } })
+    toStep(7)
+    await act(async () => {
+      fireEvent.click(createButton())
+    })
+    expect(screen.getByTestId("save-warnings").textContent).toContain("Cartesia has no API key yet")
+    expect(screen.queryByTestId("wizard-create")).toBeNull()
+    expect((create.mock.calls[0]![1] as { readonly saveAnyway?: boolean }).saveAnyway).toBeUndefined()
+    expect(settings).not.toHaveBeenCalled()
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("wizard-create-anyway"))
+    })
+    expect(create).toHaveBeenCalledTimes(2)
+    expect((create.mock.calls[1]![1] as { readonly saveAnyway?: boolean }).saveAnyway).toBe(true)
+    expect(settings).toHaveBeenCalledWith(["assistants", "mia"], { discard: true })
+  })
+
+  it("Go back dismisses the warning and the next Create asks again (no saveAnyway); another step drops it too", async () => {
+    const { create, toStep } = setup(async () => warning)
+    fireEvent.change(nameField(), { target: { value: "Mia" } })
+    toStep(7)
+    await act(async () => {
+      fireEvent.click(createButton())
+    })
+    fireEvent.click(screen.getByRole("button", { name: "Go back" }))
+    expect(screen.queryByTestId("save-warnings")).toBeNull()
+    await act(async () => {
+      fireEvent.click(createButton())
+    })
+    expect(create).toHaveBeenCalledTimes(2)
+    expect((create.mock.calls[1]![1] as { readonly saveAnyway?: boolean }).saveAnyway).toBeUndefined()
+    expect(screen.getByTestId("save-warnings")).toBeTruthy()
+    toStep(4)
+    toStep(7)
+    expect(screen.queryByTestId("save-warnings")).toBeNull()
+  })
+})
