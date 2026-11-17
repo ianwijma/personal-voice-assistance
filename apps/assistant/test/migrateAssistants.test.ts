@@ -158,7 +158,10 @@ describe("migration fixtures", () => {
       audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, speakAloud: true, outputPath: "direct", prebufferMs: 60 },
       captions: { captions: true, speakTyped: true },
       look: { from: "assistant" },
-      voice: { from: "assistant" }
+      voice: { from: "assistant" },
+      // Protocol 9: complete settings carry the node sections too (not in the browsers' keys, so ignored there).
+      sound: { volume: 80, cues: true },
+      soundDevices: { input: "", output: "" }
     })
     expect(isDeviceSettings(web)).toBe(true)
     expect(existsSync(join(dir, "settings.json"))).toBe(false)
