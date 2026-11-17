@@ -132,6 +132,7 @@ export function ModuleInstances({ module: m }: { readonly module: ModuleInfo }) 
   const nameOf = (id: string) => names[id] ?? id
   return (
     <div className="flex flex-col gap-2" data-testid={`module-${m.id}`} data-state={m.state}>
+      {m.version !== undefined && <span className="text-[12px] text-ink-faint" data-testid="module-version">version {m.version}</span>}
       {m.state === "unavailable" ? (
         <ModuleUnavailableNote module={m} />
       ) : instances.length === 0 && runsForOthers(m) ? (

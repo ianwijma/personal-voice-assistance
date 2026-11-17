@@ -250,7 +250,7 @@ ModuleInstance = { tools?: ReadonlyArray<Tool>; context?: ReadonlyArray<ContextP
 // module API v2 adds optional apiVersion, version, requires, platforms, health, templates, uses, shared (below)
 ```
 
-Settings use a closed set of field types (`Setting.text`, `secret`, `number`, `boolean`, `choice`, `multichoice`; `packages/core/src/Settings.ts`); precedence is environment > saved value > default, and an environment value locks the field in the UI. Since WP-12 (docs/ASSISTANTS.md §2.6) a field may be `overridable` (never a secret; modules do not mark addresses): an assistant may then hold its own value for it (`ModuleChoice.own`), which wins over the environment and the saved value for that assistant, and the field description sent to the admin says `overridable: true`; a module's default may be a *linked default* computed from the shared Home section (`ModuleHostOptions.defaults`: Weather place and units, Clock time zone and date format), used when nothing is saved and the environment does not set the field. Every field reports its `source` (default, saved, `.env` file or process environment) and may carry `visibleWhen` (shown, validated and saved only while another field has one of some values); choice options may carry `tags` (hosted, needs key, …) and an `implication` line; `runSettingsChecks` runs cross-field checks. The **module host** (`packages/core/src/ModuleHost.ts`, no Node dependency; persistence injected) starts enabled modules, enables, disables and reconfigures them while the assistant runs (one operation per module at a time; a replaced or disabled instance keeps running for a 10 s grace period so tool calls in flight finish; `start` has 10 s; a context provider has 50 ms per turn or contributes nothing), and publishes an immutable snapshot (tool registry, instructions in catalog order, tool → module map) that each turn reads once through `ConversationSetupOptions.setup`. `setSecrets` replaces the modules' saved secrets without saving them (the app's key vault was unlocked or locked) and restarts enabled modules that failed. A module runs as **instances**: without `ModuleHostOptions.demand` (the CLI modes; agent and decision-provider modules always) one at most, following its saved switch, exactly as before. With `demand` (serve mode, for every capability) the module runs while at least one switched-on assistant has it on, one instance per distinct set of effective settings (own values over shared over linked defaults), shared by every assistant whose settings are equal; its own switch is then not read (`enable`/`disable` answer `not_allowed`). `refresh` (after every settings save, and after a Home save) starts the instances now wanted and retires, with the grace period, the ones no longer wanted; a replaced instance serves until its replacement has started. `configure` restarts only the instances whose effective settings change (every one when a secret changes), all or nothing. One instance failing to start is that instance's `error` only (`ModuleInfo.instances` lists each with its assistants; the module's `state` is `error` while one fails); the others run. The snapshot keeps one instance per module in `registry`/`parts` (the shared-settings one when it runs) and adds `assistantParts`: per assistant, the parts of the instances it uses, from which serve mode builds that assistant's registry and instructions (filtered by its module and tool switches) at its turn start. `checkOwn` validates an assistant's own values with the fields' own validators (`assistant.save` refuses a secret, a field that is not overridable, or a value the field refuses). The system prompt of a turn is base prompt + (serve mode) the Home line (`homeLineOf`: location, time zone, language of the `home` section) + running modules' instructions; changing the tool list or the instructions changes the cached prefix once. The CLI modes start the catalog through the same host with the saved settings and no live changes; they read the assistant settings the same way as serve mode, environment > saved > default, with the vault's keys (`cliSettings.ts`: unlocked by `PVA_VAULT_PASSWORD`, or a password prompt on a terminal). A module may set `enabledWhenSet: <secret key>`: until the owner chooses, it is on once that key is set in the environment or the vault (judged by the host, re-checked when the vault unlocks). Full lifecycle: docs/UI-AND-MODULES.md §1.4.
+Settings use a closed set of field types (`Setting.text`, `secret`, `number`, `boolean`, `choice`, `multichoice`; `packages/core/src/Settings.ts`); precedence is environment > saved value > default, and an environment value locks the field in the UI. Since WP-12 (docs/ASSISTANTS.md §2.6) a field may be `overridable` (never a secret; modules do not mark addresses): an assistant may then hold its own value for it (`ModuleChoice.own`), which wins over the environment and the saved value for that assistant, and the field description sent to the admin says `overridable: true`; a module's default may be a *linked default* computed from the shared Home section (`ModuleHostOptions.defaults`: Weather place and units, Clock time zone and date format), used when nothing is saved and the environment does not set the field. Every field reports its `source` (default, saved, `.env` file or process environment) and may carry `visibleWhen` (shown, validated and saved only while another field has one of some values); choice options may carry `tags` (hosted, needs key, …) and an `implication` line; `runSettingsChecks` runs cross-field checks. The **module host** (`packages/core/src/ModuleHost.ts`, no Node dependency; persistence injected) starts enabled modules, enables, disables and reconfigures them while the assistant runs (one worker, one module at a time, stop before start: "Module host" below; the calls in flight of a module that stops get a 10 s grace period; `start` has 10 s; a context provider has 50 ms per turn or contributes nothing), and publishes an immutable snapshot (tool registry, instructions in catalog order, tool → module map) that each turn reads once through `ConversationSetupOptions.setup`. `setSecrets` replaces the modules' saved secrets without saving them (the app's key vault was unlocked or locked) and restarts enabled modules that failed. A module runs as **instances**: without `ModuleHostOptions.demand` (the CLI modes; agent and decision-provider modules always) one at most, following its saved switch, exactly as before. With `demand` (serve mode, for every capability) the module runs while at least one switched-on assistant has it on, one instance per distinct set of effective settings (own values over shared over linked defaults), shared by every assistant whose settings are equal; its own switch is then not read (`enable`/`disable` answer `not_allowed`). `refresh` (after every settings save, and after a Home save) and `configure` bring the module in line: when what it should run changes (its shared settings, the set of its instances' settings, a configured secret), the whole module is stopped and then started again with every instance it now needs; for that moment it is absent. Assistants that only move between equal instances change nothing that runs. An instance that fails to start leaves the whole module down with its error (`ModuleInfo.instances` lists each with its assistants and the error); an assistant whose own values are not valid has an error of its own and the others run. The lifecycle in full: "Module host" below. The snapshot keeps one instance per module in `registry`/`parts` (the shared-settings one when it runs) and adds `assistantParts`: per assistant, the parts of the instances it uses, from which serve mode builds that assistant's registry and instructions (filtered by its module and tool switches) at its turn start. `checkOwn` validates an assistant's own values with the fields' own validators (`assistant.save` refuses a secret, a field that is not overridable, or a value the field refuses). The system prompt of a turn is base prompt + (serve mode) the Home line (`homeLineOf`: location, time zone, language of the `home` section) + running modules' instructions; changing the tool list or the instructions changes the cached prefix once. The CLI modes start the catalog through the same host with the saved settings and no live changes; they read the assistant settings the same way as serve mode, environment > saved > default, with the vault's keys (`cliSettings.ts`: unlocked by `PVA_VAULT_PASSWORD`, or a password prompt on a terminal). A module may set `enabledWhenSet: <secret key>`: until the owner chooses, it is on once that key is set in the environment or the vault (judged by the host, re-checked when the vault unlocks). Full lifecycle: docs/UI-AND-MODULES.md §1.4.
 
 The pieces a module returns are the original capability shapes (an `AssistantModule` is still accepted by `makeToolRegistry`, and `fromAssistantModule` wraps one as a definition):
 
@@ -300,7 +300,7 @@ ModuleHostApi = {
   contributions<T>(key: ContributionKey<T>): Effect<ReadonlyArray<T>>   // for the calling fiber's principal (its context)
   contributionsFor<T>(key, assistantId | undefined): ReadonlyArray<T>    // explicit, for native callbacks; undefined: all
   actions: { list: Effect<CatalogAction[]>; run(req): Effect<ActionRunResult> }  // the turn's (calling assistant's) catalogue
-  requestRestart(reason): Effect<void>             // stop the module, then start it again (at most every 5 s, merged)
+  requestRestart(reason): Effect<void>             // stop the module, then start it again (live parts only; one request taken up per 5 s, merged)
   reportMissingProgram(tool): Effect<void>         // ENOENT/EACCES at run time: judged unavailable at once
 }                                                   // after its part closed, every member answers ModuleStopped (a defect)
 Principal = { turn } | { job } | { local } | { notification }   // TurnContext.ts: on whose behalf a call runs
@@ -313,8 +313,8 @@ CurrentPrincipal: Context.Reference<Principal | undefined>       // the admitted
   Services (one provider per key: a second is a start error) and contributions (any number; inside a turn only those
   of modules the turn's assistant has on, read from the caller's own context) come from `shared` and are looked up
   live. A module's shared part and instances are started, published, stopped and closed **together** (the module
-  host, below). `settingsFor(assistantId)` answers from the desired state the module was started with (a change of it
-  restarts the module). Module code the host starts (and `health()`) runs without `CurrentTurn`/`CurrentJob`/
+  host, below). `settingsFor(assistantId)` answers from what the run runs for now: the current membership and own
+  values, saved values and defaults of the latest pass that kept it, with the secrets it started with. Module code the host starts (and `health()`) runs without `CurrentTurn`/`CurrentJob`/
   `CurrentPrincipal`, whoever asked (`outsideTurns`). The CLI modes run every module whose saved switch is on, one
   instance each, through the same host and gateway, and read the snapshot at every turn's start
   (`apps/assistant/src/modules.ts`, `CliModules`).
@@ -323,7 +323,9 @@ CurrentPrincipal: Context.Reference<Principal | undefined>       // the admitted
   `host.actions.run`; later phrase commands, taps, routine steps and notification actions. Every tool and action the
   host publishes is **sealed**: its own `execute`/`run` only refuses, and the real one (inside the host's in-flight
   tracking) is reachable only from the gateway (`GatewayPrivate.ts`, not exported from the package); a generated
-  action tool's `execute` refuses too. Its admission takes a principal (`Principal`): the explicit one a caller passes
+  action tool's `execute` refuses too. Sealing stops **accidental** direct calls; it is not a security boundary against
+  code compiled into the process (docs/MODULES-PLAN.md §3.5): any gateway runs a sealed handle it is handed, the module
+  id a caller passes is not checked against the handle's owner, and registrars receive the raw instance. Its admission takes a principal (`Principal`): the explicit one a caller passes
   (a notification, P9), else `CurrentTurn`, else `CurrentJob`, else the local or notification principal of the
   gateway call it is made from (`CurrentPrincipal`), else the local principal in the CLI modes
   (`ModuleHostOptions.localPrincipal`, default: without `access`). In serve mode a call with none is refused, so is a
@@ -343,12 +345,26 @@ CurrentPrincipal: Context.Reference<Principal | undefined>       // the admitted
   action declared `confirm: true` is refused on every public path (confirmation is off in this stack); only core's own
   confirmed path (`Conversation`, after a consumed spoken yes, while `confirmActions` is "on") runs one. There is no
   confirmation hook and no caller can claim a confirmation. `onAdmitted` / `holdUntil` (`ActionCallOptions`) let the
-  intent agent speak an action's announcement only once it is admitted, and hold a non-speculative action until its
-  turn is promoted (the same call is admitted again just before it runs). The host's registries and serve mode's
+  intent agent speak an action's announcement once it is admitted (so it is synthesised during the speculative window
+  and plays at promotion), and hold a non-speculative action until its turn is promoted (the same call is admitted
+  again just before it runs). Waiting for promotion is bounded by the agent's `pendingMs`; the action itself by
+  `ACTION_TIMEOUT_MS` (5 s) from the moment it starts. **Known limit:** if access to the action is withdrawn between
+  the eager end of turn and promotion, the second admission refuses it and it does not run, but the person may hear
+  the start of the success sentence followed by the refusal. It is left because closing it by releasing the sentence
+  only after the second admission was measured to delay the first audio of every held intent turn by one first-clause
+  synthesis (review round 4); a playback gate in `Conversation` that holds pre-synthesised audio until the final
+  admission would close it without that cost, a possible later change. A risk function's failure is logged as a
+  bounded category, never with what it threw. The host's registries and serve mode's
   per-assistant registries all carry `host.gateway`; a hand-made registry uses `defaultGateway` (no access checks,
-  local principal). Input decoders are made when a registry is built. **Cost** (`TurnTrace` tool times, 350 warm
-  turns, `GatewayRound3.test.ts`): a module tool through the host's gateway (access checks, a risk function, sealing,
-  in-flight tracking) takes 0.016 ms at the median against 0.012 ms for a bare registry.
+  local principal). Input decoders are made when a registry is built. **A micro-comparison, not a turn's cost**
+  (`TurnTrace` tool times, 350 warm turns, `GatewayRound3.test.ts`): one module tool call through the host's gateway
+  (access checks, a risk function, sealing, in-flight tracking) against the same tool in a bare registry, both through
+  this PR's gateway: 0.016 ms against 0.012 ms at the median. It does not measure P1 against the code before it, nor
+  turn setup, context gathering or the Claude Code bridge. **Before and after** (the offline bench, `pnpm start
+  bench`, no network; `TurnTrace`, 12 turns per scenario): with every simulated delay 0, end of turn → playback start
+  is 0.9 ms at the median before P1 (`main` at `548f5d2`) and 0.8 ms with it, 0.8 and 0.7 ms on the session path, and
+  the tool turn's `current_time` takes 0.2 ms in both; every realistic scenario is within 1 ms. The bench's tools are a
+  hand-made registry (through `defaultGateway` with P1), not the module host, and it has no Claude Code bridge.
 - **Availability.** `requires`, `platforms` and `apiVersion` are judged before anything starts, from the app's probes
   (`apps/assistant/src/requirements.ts`). Two kinds of requirement: a **program on the server** (`{ tool, version?,
   why }`) and the **network** (`{ network }`, not probed yet: `unchecked`). One program registry (argv and a version
@@ -367,16 +383,20 @@ CurrentPrincipal: Context.Reference<Principal | undefined>       // the admitted
   code that hung, each module's `health()`). Every issue is normalised where it enters (`wireSafeIssue`): id, module,
   device, title and the fix's label and value are one line, a detail keeps its line breaks, no other control
   character survives, every text is clipped to the wire's limits; at most 20 issues per module and, in all,
-  `MAX_HEALTH_ISSUES` (100) and 256 KB, the rest said in one last issue ("And 12 more issues"). `pnpm start doctor`
-  prints every module's requirements and health, one line per issue with its fix (no control characters, no line
-  breaks), exits 1 on an error (a requirement is an error for a module the assistants use, directly or through `uses`;
+  `MAX_HEALTH_ISSUES` (100) and 256 KB, the most severe kept (a source's own list is sorted by severity before it is
+  bounded), the true number left out said in one last issue ("And 12 more issues"). The protocol bounds the whole
+  `HealthInfo` too (`MAX_HEALTH_BYTES`, 256 KB serialised), so an accepted health message always fits a frame.
+  `pnpm start doctor` prints one line per module (its requirements as judged, and its health: healthy, so many issues,
+  not checked, or no check), then one line per issue with its fix and the device it is about (no control characters,
+  no line breaks), exits 1 on an error (a requirement is an error for a module the assistants use, directly or through `uses`;
   doctor reads their demand and starts nothing: `ModuleHost.evaluate`), and says nothing about the machine itself
   (disk, TLS, the port, speech models: the deployment work, docs/MODULES-PLAN.md §7). It reads the saved settings and
-  the vault read-only and strictly: when either cannot be read (or the vault stays locked, or parts of the settings
-  were dropped) it says why and exits 2, never judging the defaults. Admin's Diagnostics › Health shows the registry
+  the vault read-only and strictly: when either cannot be read (a missing data directory or `settings.json`, the vault
+  stays locked, parts of the settings were dropped) it says why and exits 2, never judging the defaults. Admin's Diagnostics › Health shows the registry
   by module and, within one, the device an issue is about (`health`, `health.check`, answered once the check has
-  started); "Check again" probes again, judges again and **tries again every module that is down after a failed
-  start**, whether or not a probe result changed.
+  started); "Check again" probes again, judges again and **starts a fresh attempt for every module that is not live**
+  (down after a failed start, or with a start under way that will fail), whether or not a probe result changed. A
+  `health()` that fails, throws, interrupts itself or does not finish in 5 s is that module's warning.
 - **Templates** are plain data (`ModuleInfo.templates`, ids `<moduleId>.<id>`, at most 8 per module and 128 KB for all
   modules together, the rest said on the Health page) that the new-assistant wizard offers; a module a template names
   that this server does not have is named there, never silently dropped.
@@ -426,15 +446,34 @@ down with the reason; the worker itself ends only when the host closes. A `valid
 throws is caught: before publishing it refuses the start; during publishing it withdraws what this step published of
 the module and the module is down; during withdrawing it is reported and the stop goes on.
 
-**Closing the host** is the same walk with nothing wanted, consumers first, without grace (calls in flight are
-interrupted), bounded by `closeTimeoutMs` (30 s) in all; past that, what is left is abandoned and logged and close
-returns. Pending saves are waited for within the same bound.
+**The grace period covers the stopping module's own calls**: its tools, actions and context providers admitted before
+the withdrawal (routes and field actions join when P3 gives them their place in a stop). A call another module makes
+into its service while it stops may fail: the consumer handles that failure like any other, and finds the service
+absent at its next lookup (`host.service` is a live lookup; never keep a service).
 
-**Restarts.** `requestRestart` counts at once; the restart counter in the desired state follows at most once every
-5 s per module, every request in between merged into the next, and a request made after the last restart was applied
-always leads to another. One made during the part's own start applies once it is published (dropped if it is not).
-A restart with the same configured secrets starts with the secrets the module ran with (a vault locked since does not
-stop it).
+**Closing the host** first withdraws every module in one synchronous step: all registrations out of what is published,
+the snapshot empty, every run refused (tools, actions, context providers), every module's host object answering with
+`ModuleStopped`. Only then does it close the parts, consumers first, without grace (calls in flight are interrupted),
+bounded by `closeTimeoutMs` (30 s) in all; past that, what is left is abandoned and logged and close returns, with
+nothing of any module still published or callable. Pending saves are waited for within the same bound.
+
+**Restarts.** A `requestRestart` is recorded in one synchronous step (a caller interrupted right after the call has
+made it whole or not at all): counted, and written to the desired state at once, or held by the host's restart timer
+when the last request was taken up less than 5 s ago; the timer takes up every held request when the interval is
+over, all of a module's requests in between merged into one restart. The interval keeps a module from restarting
+itself in a tight loop: at most one request is taken up per interval. It is not a minimum distance between two
+restarts (a pass busy with another module can bring two closer together). A request made after the last one was taken
+up always leads to another. Only a **live** part asks: a request from a part that is starting, from a start that
+failed (its finalizers run while it is closed), or from a part being stopped is ignored and logged at debug. A restart
+with the same configured secrets starts with the secrets the module ran with (a vault locked since does not stop it).
+
+**Check again** (`recheck`) judges every module's requirements again and starts a fresh attempt for every module that
+is not live, whether or not its failure is recorded yet. **Settings code that throws** (a field's `check` or decoder a
+module supplies) is caught where the host calls it, in planning, saving, the form and `checkOwn`: the module is down
+with that error, never the host.
+
+**`settingsFor`** answers from what the run runs for now: who has the module on and with which own values, the saved
+values and linked defaults of the latest pass that kept it, with the secrets it started with.
 
 **A host object kept by module code** after its part's scope closed answers every member with `ModuleStopped` (an
 effect dies with it, a synchronous member throws it; `isModuleStopped`).
@@ -468,6 +507,28 @@ Only the worker publishes and withdraws, all of a module's registrations togethe
   the part has started is refused: there is no registration outside the worker.
 
 `ModuleHostOptions.registrars` adds kinds an app keeps itself (and tests).
+
+**The registrar contract.** Registrars are host code, not a boundary (docs/MODULES-PLAN.md §3.5): they receive what the
+host has (a part's value, its instance as it started). A registration's `validate`, `publish` and `withdraw` write the
+registrar's own table and nothing else, must not throw, and must not read the host (`view`, `service`, `snapshot`, …)
+while they run: the host is in the middle of publishing or withdrawing the module then, and what such a read sees is
+not defined. A part registers only during its own `shared` / `start`: once that has returned (while the module's other
+parts still start, or from a registration's callback) `register` is refused.
+
+#### What the host survives
+
+The rule for module authors and host maintainers (docs/MODULES-PLAN.md §3.5). Modules are compiled in and trusted.
+The host behaves correctly for everything from outside the process (requests, the admin pages, settings files, the
+environment, what a model produces or a person says, and their timing); for ordinary module faults (an Effect that
+fails, dies or takes too long and stops when interrupted; a settings check, decoder or classifier that throws, caught
+where it is called and made that module's error); for callers interrupted at any point (a request is recorded whole or
+not at all); and for operational faults (a full disk, a locked vault, a lost connection, the process killed: durable
+state stays consistent). It only fails loudly, without corrupting durable state or crossing a security boundary, for
+module code that breaks the runtime's rules (ignores interruption, blocks the event loop, hands over objects whose
+properties throw or change), for its own dependencies misbehaving (persistence, a registry, the clock, a registrar
+that throws or never returns), for code that goes around a seam on purpose (sealing stops accidental calls, it is not
+a security boundary), and for constructor options nothing in the app or the test kit uses. Where the host gives up on
+such code after a time limit, the owner is told and stopping the process works; nothing more is promised.
 
 Adding a feature = one new file exporting `defineModule({...})` + one line in `moduleCatalog` in `apps/assistant/src/modules.ts`. Adding a provider = one new package implementing a core interface + one line in `apps/assistant/src/providers.ts`. Adding a voice provider = an adapter with `layerConfig` (`Tts`) and `makeVoices` (`TtsVoices`), and one entry in `ttsProviders`, `ttsProviderInfo` and (hosted) `hostedTtsVoices` in `providers.ts`. A voice needs no code: it is chosen by its key.
 

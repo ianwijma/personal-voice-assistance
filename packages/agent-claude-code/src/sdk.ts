@@ -34,8 +34,18 @@ export interface SessionTool {
   readonly inputSchema: Readonly<Record<string, unknown>>
 }
 
-/** Runs one tool call for the harness. Never rejects: failures are error results. */
-export type ToolHandler = (name: string, args: Record<string, unknown>) => Promise<{ readonly content: string; readonly isError: boolean }>
+/**
+ * Runs one tool call for the harness. Never rejects: failures are error results. `toolUseId` is the model's
+ * `tool_use` id when Claude Code sends it with the MCP request (`_meta["claudecode/toolUseId"]`).
+ */
+export type ToolHandler = (name: string, args: Record<string, unknown>, toolUseId?: string) => Promise<{ readonly content: string; readonly isError: boolean }>
+
+/** The `tool_use` id Claude Code puts on an MCP `tools/call` request (`params._meta["claudecode/toolUseId"]`), if any. */
+export const toolUseIdOf = (extra: unknown): string | undefined => {
+  const meta = extra !== null && typeof extra === "object" ? (extra as { readonly _meta?: unknown })._meta : undefined
+  const id = meta !== null && typeof meta === "object" ? (meta as Record<string, unknown>)["claudecode/toolUseId"] : undefined
+  return typeof id === "string" && id.length > 0 ? id : undefined
+}
 
 export interface ClaudeSdk {
   readonly query: (params: { readonly prompt: AsyncIterable<SDKUserMessage>; readonly options: Options }) => QueryHandle
@@ -85,8 +95,8 @@ export const loadClaudeSdk = async (): Promise<ClaudeSdk> => {
         // research saw a fresh session miss an in-process tool on its first turn.
         alwaysLoad: true,
         tools: tools.map((t) =>
-          sdk.tool(t.name, t.description, toShape(t.inputSchema), async (args) => {
-            const result = await handler(t.name, args as Record<string, unknown>)
+          sdk.tool(t.name, t.description, toShape(t.inputSchema), async (args, extra) => {
+            const result = await handler(t.name, args as Record<string, unknown>, toolUseIdOf(extra))
             return { content: [{ type: "text" as const, text: result.content }], isError: result.isError }
           })
         )

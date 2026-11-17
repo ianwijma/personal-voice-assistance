@@ -3,7 +3,7 @@
 import { describe, expect, it } from "@effect/vitest"
 import { type AgentEvent, type AgentTurnInput, CurrentTurn, makeExecutionGateway, makeTool, makeToolRegistry, type Trace, type TurnContext } from "@pva/core"
 import { Deferred, Effect, Fiber, Schema, Stream } from "effect"
-import type { ToolHandler } from "../src/sdk.ts"
+import { type ToolHandler, toolUseIdOf } from "../src/sdk.ts"
 import { makeClaudeAgent } from "../src/index.ts"
 import { makeFakeSdk } from "./fakeSdk.ts"
 
@@ -60,6 +60,16 @@ const inputOf = (turnId: number, options: { readonly speculative?: boolean; read
 const agentOf = (fake: ReturnType<typeof makeFakeSdk>) =>
   Effect.promise(() => makeClaudeAgent({ model: "claude-haiku-5-5", tools: true, speculate: false, sessionIdleMinutes: 60, env: { PATH: "/usr/bin" }, sdk: fake.sdk }))
 
+describe("the tool_use id Claude Code sends with an MCP call (round 4)", () => {
+  it("is read from the request's _meta, and absent otherwise", () => {
+    // What the live test saw on the handler's second argument (Claude Code 0.3.323).
+    expect(toolUseIdOf({ requestId: 1, _meta: { "claudecode/toolUseId": "toolu_01XX", progressToken: 2 } })).toBe("toolu_01XX")
+    expect(toolUseIdOf({ _meta: { progressToken: 2 } })).toBeUndefined()
+    expect(toolUseIdOf({ _meta: { "claudecode/toolUseId": 7 } })).toBeUndefined()
+    expect(toolUseIdOf(undefined)).toBeUndefined()
+  })
+})
+
 describe("the Claude Code bridge attributes a call to the turn that issued it", () => {
   it.live("1: after a barge-in, a call the first turn's stream announced never runs, not even as the next turn", () =>
     Effect.gen(function*() {
@@ -92,6 +102,42 @@ describe("the Claude Code bridge attributes a call to the turn that issued it", 
       expect(fake.queries.length).toBe(1)
       agent.shutdown()
     }))
+
+  it.live("round 4: an identical call of a cancelled turn, arriving after the purge, does not take the next turn's claim (matched by tool_use id)", () =>
+    Effect.gen(function*() {
+      ran.length = 0
+      let kept: ToolHandler | undefined
+      let firstId = ""
+      const results: Record<string, { content: string; isError: boolean }> = {}
+      const fake = makeFakeSdk()
+      fake.setRespond(async (ctx) => {
+        ctx.delta("Let me check.")
+        firstId = ctx.announce("echo", { text: "same" })
+        kept = ctx.mcp()
+        await ctx.interrupted
+      })
+      const agent = yield* agentOf(fake)
+      yield* Stream.runHead(agent.turn(inputOf(1)).pipe(Stream.provideService(CurrentTurn, turnOf(1))))
+      fake.setRespond(async (ctx) => {
+        // Turn 2 (another tab) announces the same call; turn 1's delayed request comes first, then turn 2's own.
+        await new Promise((resolve) => setImmediate(resolve))
+        const secondId = ctx.announce("echo", { text: "same" })
+        results.late = await kept!("echo", { text: "same" }, firstId)
+        results.own = await kept!("echo", { text: "same" }, secondId)
+        // Call first, announcement after: still matched to its own announcement.
+        const early = kept!("echo", { text: "same" }, "toolu_call_first")
+        ctx.announce("echo", { text: "same" }, "toolu_call_first")
+        results.callFirst = await early
+        ctx.delta("Done.")
+        ctx.result()
+      })
+      yield* Stream.runDrain(agent.turn(inputOf(2)).pipe(Stream.provideService(CurrentTurn, turnOf(2))))
+      expect(results.late?.isError).toBe(true)
+      expect(results.own).toEqual({ content: "same", isError: false })
+      expect(results.callFirst).toEqual({ content: "same", isError: false })
+      expect(ran).toEqual([{ text: "same", turn: 2, connection: "tab-2" }, { text: "same", turn: 2, connection: "tab-2" }])
+      agent.shutdown()
+    }), 20_000)
 
   it.live("1: a call made after its turn finished is refused (it would otherwise reach the next turn's handler)", () =>
     Effect.gen(function*() {

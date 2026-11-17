@@ -358,6 +358,8 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       if (parts === undefined) return undefined
       const { assistantId, connection, deviceId, person } = parts
       if (assistantId !== undefined && !assistantsNow().has(assistantId)) return `the assistant "${assistantId}" does not exist.`
+      // A person is checked whether or not the call names a device (a job may name a person and no device).
+      if (person !== undefined) return "this server knows no people yet."
       if (deviceId === undefined) return undefined
       if (!devices.known(deviceId) && hub?.deviceConnected(deviceId) !== true) return `the device "${deviceId}" is not known.`
       if (assistantId !== undefined) {
@@ -367,7 +369,6 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
         if (!assigned) return `the assistant "${assistantId}" is not on the device "${deviceId}".`
       }
       if (connection !== undefined && hub?.deviceOfConnection(connection) !== deviceId) return `the request did not come from the device "${deviceId}".`
-      if (person !== undefined) return "this server knows no people yet."
       return undefined
     }
     const keys = makeKeys({ vault, store, host })

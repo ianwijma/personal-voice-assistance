@@ -414,8 +414,8 @@ export const DevicePick = Schema.Struct({
 
 /**
  * Protocol 9, admin only: "Check again" on the Health page. The server probes every program the modules need again,
- * re-judges which modules are available (starting those that now are), runs every module's `health()` and the core
- * checks, and sends `health`. Answered with `result` as soon as the check has started (it can take longer than a
+ * re-judges which modules are available (starting those that now are, and trying again every module that is not
+ * running), runs every module's `health()`, and sends `health`. Answered with `result` as soon as the check has started (it can take longer than a
  * page waits for an answer): `health` with `checking: true` comes first, and the outcome arrives as `health` with
  * `checking: false`. A check already running is not started twice.
  */

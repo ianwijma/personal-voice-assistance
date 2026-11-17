@@ -375,10 +375,10 @@ interface Part {
   readonly kind: "shared" | "instance"
   readonly scope: Scope.Closeable
   state: PartState
+  /** Its own `shared` / `start` has not returned yet: `PartHandle.register` is open only until then. */
+  registering: boolean
   /** Registrations it made during its start (`PartHandle.register`): published with the module. */
   readonly staged: Array<Registration>
-  /** `requestRestart` called during its own start: applied once it is published, dropped if it is not. */
-  stagedRestart: string | undefined
   readonly handle: PartHandle
 }
 
@@ -399,6 +399,11 @@ interface Run {
   readonly id: number
   readonly entry: Entry
   readonly target: HostTarget
+  /**
+   * The desired state it runs for now: its start's, then that of every later pass that kept it (assistants moving
+   * between equal instances, a changed default of an overridable field). `settingsFor` answers from it.
+   */
+  accepted: Desired
   state: "starting" | "live" | "withdrawn" | "closed"
   shared: { readonly part: Part; readonly value: SharedPart<unknown> } | undefined
   readonly instances: Map<string, InstanceRun>
@@ -528,7 +533,10 @@ const usesCycles = (catalog: ReadonlyArray<ModuleDefinition<any>>): Map<string, 
   return out
 }
 
-/** Restarts of one module are at least this far apart; requests in between are merged into the next one. */
+/**
+ * A module's restart requests are taken up at most once per this interval (the requests in between are merged into
+ * the next one): a module cannot restart itself in a tight loop. Not a minimum distance between two restarts.
+ */
 const RESTART_INTERVAL_MS = 5_000
 
 /** The template text all modules together may send (UTF-8 bytes), so the admin snapshot stays under the frame limit. */
@@ -618,21 +626,38 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
     ...(options.envLocation !== undefined ? { envLocation: options.envLocation } : {})
   }
 
-  /** The module's settings from these sources. */
+  /**
+   * A plain function the module supplies (a field's `check` or decoder) run where the host calls it: one that throws
+   * becomes that module's error (`fallback` with a bounded message), never the host's (docs/MODULES-PLAN.md §3.5).
+   */
+  const moduleCode = <A>(entry: Entry, f: () => A, fallback: (message: string) => A): A => {
+    try {
+      return f()
+    } catch (error) {
+      return fallback(`${entry.def.name}: its settings could not be read (${clip(describe(error).replace(/\s+/g, " "), 200)})`)
+    }
+  }
+
+  /** The module's settings from these sources (a check or decoder that throws: not valid, with that error). */
   const resolveFrom = (
     entry: Entry,
     src: { readonly stored: Readonly<Record<string, unknown>>; readonly secrets: Readonly<Record<string, string>> },
     own: Readonly<Record<string, unknown>> | undefined,
     defaults: Readonly<Record<string, unknown>> | undefined
-  ) =>
-    resolveSettings(entry.def.settings, {
-      stored: src.stored,
-      secrets: src.secrets,
-      env: options.env,
-      ...envOrigin,
-      ...(defaults !== undefined ? { defaults } : {}),
-      ...(own !== undefined ? { own } : {})
-    })
+  ): ResolvedSettings<any> =>
+    moduleCode(
+      entry,
+      () =>
+        resolveSettings(entry.def.settings, {
+          stored: src.stored,
+          secrets: src.secrets,
+          env: options.env,
+          ...envOrigin,
+          ...(defaults !== undefined ? { defaults } : {}),
+          ...(own !== undefined ? { own } : {})
+        }),
+      (message) => ({ value: undefined, form: { fields: [], values: {}, secrets: {}, errors: [{ key: null, message }] } })
+    )
   /** The settings as saved now (what the form shows). */
   const resolve = (entry: Entry) => resolveFrom(entry, entry.want, undefined, entry.want.defaults)
 
@@ -1116,7 +1141,9 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
     JSON.stringify(entries.map((e) => [
       e.shown.unavailable === undefined ? null : [e.shown.unavailable.reason, e.shown.demand === undefined ? switchOn(e, e.shown) : e.shown.demand.map((d) => d.assistantId)],
       e.run?.id ?? null,
-      [...(e.run?.instances.values() ?? [])].map((r) => [r.key, r.users, r.ownKeys.length])
+      [...(e.run?.instances.values() ?? [])].map((r) => [r.key, r.users, r.ownKeys.length]),
+      // Who wants it, running or not: `assistantParts` has an entry per assistant named anywhere.
+      e.shown.demand?.map((d) => d.assistantId) ?? null
     ]))
   /** The snapshot of what is published, from the runs and the picture each module was published with. */
   const buildSnapshot = (): ModuleSnapshot => {
@@ -1353,8 +1380,8 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
         kind,
         scope,
         state: "starting",
+        registering: true,
         staged,
-        stagedRestart: undefined,
         handle: {
           moduleId: entry.def.id,
           moduleName: entry.def.name,
@@ -1363,7 +1390,7 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
           state: () => part.state,
           scope,
           register: (registration) => {
-            if (part.state !== "starting") return { ok: false, reason: `${entry.def.name}: registrations are made while the module starts` }
+            if (part.state !== "starting" || !part.registering) return { ok: false, reason: `${entry.def.name}: registrations are made while the part itself starts` }
             staged.push(registration)
             return { ok: true }
           }
@@ -1400,6 +1427,8 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
     Effect.map(
       bounded(Effect.suspend(start).pipe(Scope.provide(part.scope)), startTimeoutMs, true),
       (outcome): { readonly ok: true; readonly value: A } | { readonly ok: false; readonly message: string } => {
+        // Its start has returned (or was abandoned): what it did not register by now it never will.
+        part.registering = false
         if (outcome._tag === "hung") return { ok: false, message: closing ? "The assistant is stopping" : `${label} within ${Math.round(startTimeoutMs / 1000)} s` }
         return Exit.isSuccess(outcome.exit) ? { ok: true, value: outcome.exit.value } : { ok: false, message: describeStartFailure(outcome.exit.cause) }
       }
@@ -1447,6 +1476,7 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
         id: ++nextId,
         entry,
         target,
+        accepted: target.desired,
         state: "starting",
         shared: undefined,
         instances: new Map(),
@@ -1466,7 +1496,7 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
       if (entry.def.shared !== undefined) {
         const part = yield* newPart(entry, "shared")
         opened.push(part)
-        const context = { settings: target.shared!.settings as never, settingsFor: settingsForOf(entry, part, target) as never, ...servicesFor(entry, part) }
+        const context = { settings: target.shared!.settings as never, settingsFor: settingsForOf(entry, part, run) as never, ...servicesFor(entry, part) }
         const started = yield* runCode(part, "Its shared part did not start", () => entry.def.shared!(context))
         if (!started.ok) return yield* giveUp(started.message)
         const keys = (started.value.services ?? []).map((p) => p.key.id)
@@ -1522,6 +1552,8 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
       } catch (error) {
         return yield* giveUp(`Its registrations could not be read: ${describe(error)}`)
       }
+      // Nothing is published once the host has begun to close (it withdrew everything in one step).
+      if (closing) return yield* giveUp("The assistant is stopping")
       const refused = refusalOf(entry, regs)
       if (refused !== undefined) return yield* giveUp(refused)
       // Published in one synchronous step: no other fiber sees part of it.
@@ -1536,11 +1568,6 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
       entry.starting = undefined
       rebuildSnapshot()
       announceAll()
-      for (const part of opened) {
-        const reason = part.stagedRestart
-        part.stagedRestart = undefined
-        if (reason !== undefined) yield* requestRestart(entry, reason)
-      }
     }).pipe(Effect.ensuring(Effect.sync(() => {
       entry.phase = "idle"
       entry.starting = undefined
@@ -1555,13 +1582,26 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
       const run = entry.run
       if (run === undefined) return
       entry.phase = "stopping"
-      run.state = "withdrawn"
-      entry.run = undefined
-      for (const inst of run.instances.values()) inst.part.state = "withdrawn"
-      if (run.shared !== undefined) run.shared.part.state = "withdrawn"
-      withdrawAll(entry, run.registrations)
+      withdrawRun(entry, run)
       rebuildSnapshot()
       announceAll()
+      yield* closeRun(run, grace)
+    }).pipe(Effect.ensuring(Effect.sync(() => {
+      entry.phase = "idle"
+    })))
+
+  /** Take a published run out (synchronous): its calls are refused from now on, its registrations are withdrawn. */
+  const withdrawRun = (entry: Entry, run: Run) => {
+    run.state = "withdrawn"
+    if (entry.run === run) entry.run = undefined
+    for (const inst of run.instances.values()) inst.part.state = "withdrawn"
+    if (run.shared !== undefined) run.shared.part.state = "withdrawn"
+    withdrawAll(entry, run.registrations)
+  }
+
+  /** Close a withdrawn run: the grace period for its calls in flight (none while the host closes), then its parts. */
+  const closeRun = (run: Run, grace: number): Effect.Effect<void> =>
+    Effect.gen(function*() {
       if (run.inflight > 0 && grace > 0 && !closing) {
         const idle = Deferred.makeUnsafe<void>()
         run.idle = idle
@@ -1571,9 +1611,26 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
       for (const inst of run.instances.values()) yield* closePart(inst.part)
       if (run.shared !== undefined) yield* closePart(run.shared.part)
       run.state = "closed"
-    }).pipe(Effect.ensuring(Effect.sync(() => {
-      entry.phase = "idle"
-    })))
+    })
+
+  /** Runs the host withdrew when it began to close (`revokeAll`), consumers first: the shutdown walk closes them. */
+  const revoked: Array<Run> = []
+
+  /**
+   * The host begins to close: every published run is withdrawn in one synchronous step, before any part is closed, so
+   * nothing of any module stays callable or published however long (or not at all) the closing then takes. Its calls
+   * in flight are interrupted at once.
+   */
+  const revokeAll = () => {
+    for (const entry of [...ordered].reverse()) {
+      const run = entry.run
+      if (run === undefined) continue
+      withdrawRun(entry, run)
+      Deferred.doneUnsafe(run.killed, Effect.void)
+      revoked.push(run)
+    }
+    rebuildSnapshot()
+  }
 
   /** One module's step in a pass: whatever goes wrong in the host's own handling marks it down and the walk goes on. */
   const contained = (entry: Entry, attempt: string, step: Effect.Effect<void>): Effect.Effect<void> =>
@@ -1601,21 +1658,35 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
     const picture = new Map(entries.map((e) => [e, e.want] as const))
     const demanded = demandedIn((e) => picture.get(e)!)
     const items = ordered.map((entry) => {
-      const target = targetOf(entry, picture.get(entry)!, demanded)
-      return { entry, target, plan: planModule(target, { running: entry.run?.target.fingerprint, failed: entry.failure?.attempt }) }
+      const d = picture.get(entry)!
+      try {
+        const target = targetOf(entry, d, demanded)
+        return { entry, target, plan: planModule(target, { running: entry.run?.target.fingerprint, failed: entry.failure?.attempt }), unplanned: undefined }
+      } catch (error) {
+        // It could not be planned (something of the module's threw): stopped and down with that error, never taken
+        // as converged; the next pass plans it again.
+        const message = `${entry.def.name} could not be planned: ${clip(describe(error).replace(/\s+/g, " "), 200)}`
+        const target: HostTarget = { id: entry.def.id, runs: false, invalid: message, instances: [], fingerprint: "", attempt: `unplanned:${desiredVersion}`, shared: undefined, fieldErrors: undefined, secrets: {}, desired: d }
+        return { entry, target, plan: { id: entry.def.id, stop: entry.run !== undefined, start: false, keep: false, forget: false }, unplanned: message }
+      }
     })
     for (const { entry, plan, target } of [...items].reverse()) {
       if (plan.stop) yield* contained(entry, target.attempt, stopModule(entry, graceMs))
     }
-    for (const { entry, plan, target } of items) {
+    for (const { entry, plan, target, unplanned } of items) {
       if (closing) break
       entry.shown = target.desired
       entry.invalid = target.instances.filter((i) => i.invalid !== undefined)
-      if (plan.forget) entry.failure = undefined
+      if (unplanned !== undefined) entry.failure = { attempt: target.attempt, message: unplanned, instances: [] }
+      else if (plan.forget) entry.failure = undefined
       else if (target.invalid !== undefined) {
         entry.failure = { attempt: target.attempt, message: target.invalid, ...(target.fieldErrors !== undefined ? { fieldErrors: target.fieldErrors } : {}), instances: [] }
+      } else if (!plan.start && entry.run === undefined && entry.failure !== undefined && entry.failure.attempt === target.attempt) {
+        // Down for the same attempt: its error is shown for the assistants that want it now.
+        entry.failure = { ...entry.failure, instances: target.instances.filter((i) => i.invalid === undefined) }
       }
       if (plan.keep && entry.run !== undefined) {
+        entry.run.accepted = target.desired
         for (const t of target.instances) {
           const inst = entry.run.instances.get(t.key)
           if (inst === undefined) continue
@@ -1629,8 +1700,9 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
     announceAll()
   })
 
-  /** Closing the host: the same walk with nothing wanted, consumers first, without grace. */
+  /** Closing the host: close what `revokeAll` withdrew (and anything published since), consumers first, without grace. */
   const shutdownWalk = Effect.gen(function*() {
+    for (const run of revoked.splice(0)) yield* contained(run.entry, "", closeRun(run, 0))
     for (const entry of [...ordered].reverse()) {
       if (entry.run !== undefined) yield* contained(entry, "", stopModule(entry, 0))
     }
@@ -1668,15 +1740,20 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
 
   // -- Saving ---------------------------------------------------------------------------------------------------------
 
-  /** Modules whose desired state changed since their last save; one saver saves them one at a time, the latest state. */
-  const saveQueue = new Set<Entry>()
+  /**
+   * Modules whose desired state changed since their last save, with the switch to save (decided when the save was
+   * asked for, never from what happens to run when the saver gets to it); one saver saves them one at a time, the
+   * latest state.
+   */
+  const saveQueue = new Map<Entry, boolean>()
   let saveWake = Deferred.makeUnsafe<void>()
   let saveDone = Deferred.makeUnsafe<void>()
   let saving = false
   /** Ask for a save of `entry` (synchronously, inside the write): returns the number its caller waits for. */
   const requestSave = (entry: Entry): number => {
     entry.saveRequested++
-    saveQueue.add(entry)
+    // An owner who never chose: what its default makes it (on while its key is set, or while it runs by it).
+    saveQueue.set(entry, entry.want.chosen ? entry.want.enabled : switchOn(entry, entry.want))
     Deferred.doneUnsafe(saveWake, Effect.void)
     return entry.saveRequested
   }
@@ -1688,15 +1765,14 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
         if (signal === saveWake) saveWake = Deferred.makeUnsafe<void>()
         continue
       }
-      const entry = [...saveQueue][0]!
+      const [entry, enabled] = [...saveQueue][0]!
       saveQueue.delete(entry)
       const seq = entry.saveRequested
       const d = entry.want
       saving = true
       yield* Effect.suspend(() =>
         options.persistence.save(entry.def.id, {
-          // An owner who never chose: what its default makes it (on while its key is set), as before.
-          enabled: d.chosen ? d.enabled : switchOn(entry, d),
+          enabled,
           settings: d.stored as Record<string, SettingValue>,
           secrets: d.secrets
         })
@@ -1719,6 +1795,7 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
   yield* Effect.addFinalizer(() =>
     Effect.gen(function*() {
       closing = true
+      revokeAll()
       Deferred.doneUnsafe(closingSignal, Effect.void)
       Deferred.doneUnsafe(wake, Effect.void)
       const deadline = (yield* Clock.currentTimeMillis) + closeTimeoutMs
@@ -1816,11 +1893,16 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
       if (entry === undefined) return Effect.succeed(unknown(id))
       readDefaults()
       const base = entry.want
-      const patched = applySettingsPatch(
-        entry.def.settings,
-        { stored: base.stored, secrets: base.secrets, env: options.env, ...envOrigin, ...(base.defaults !== undefined ? { defaults: base.defaults } : {}) },
-        patch,
-        configureOptions
+      const patched = moduleCode(
+        entry,
+        () =>
+          applySettingsPatch(
+            entry.def.settings,
+            { stored: base.stored, secrets: base.secrets, env: options.env, ...envOrigin, ...(base.defaults !== undefined ? { defaults: base.defaults } : {}) },
+            patch,
+            configureOptions
+          ),
+        (message): ReturnType<typeof applySettingsPatch> => ({ ok: false, errors: [{ key: null, message }] })
       )
       if (!patched.ok) return Effect.succeed(failure("invalid_settings", "Some settings are not valid", { moduleId: id, fieldErrors: patched.errors }))
       // While it runs, settings it could not start with are refused at once (what runs keeps running).
@@ -1882,10 +1964,11 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
   const recheck = Effect.suspend(() =>
     settled(write(() => {
       judgeAll()
-      // Check again tries every module that is down after a failed start again, whatever the probes say now, and
-      // clears what was reported of code that hung (it is reported again if it hangs again).
+      // Check again starts a fresh attempt for every module that is not live (down after a failed start, or with a
+      // start under way whose failure is not recorded yet), whatever the probes say now, and clears what was reported
+      // of code that hung (it is reported again if it hangs again).
       for (const entry of entries) {
-        if (entry.failure !== undefined) entry.want = { ...entry.want, retry: entry.want.retry + 1 }
+        if (entry.run === undefined) entry.want = { ...entry.want, retry: entry.want.retry + 1 }
         entry.problems = []
       }
     }))
@@ -1897,40 +1980,61 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
   const checkOwn = (id: string, own: Readonly<Record<string, unknown>>): ReadonlyArray<FieldError> => {
     const entry = byId.get(id)
     if (entry === undefined) return [{ key: null, message: `There is no module "${id}"` }]
-    return checkOwnValues(entry.def.settings, own)
+    return moduleCode(entry, () => checkOwnValues(entry.def.settings, own), (message) => [{ key: null, message }])
   }
 
   // -- Restarts -------------------------------------------------------------------------------------------------------
 
+  /** A module's recorded restart requests become desired state (the worker restarts it in a later pass). */
+  const applyRestart = (entry: Entry, at: number) => {
+    entry.lastRestartAt = at
+    write(() => {
+      entry.want = { ...entry.want, restarts: entry.restartRequests }
+    })
+  }
+
+  /** Wakes the restart timer: a module's request was held back by the interval. */
+  let restartWake = Deferred.makeUnsafe<void>()
+
   /**
-   * A restart of the module: counted at once; applied (written to the desired state) at most once every
-   * `RESTART_INTERVAL_MS`, every request since the last one merged into the next. A request made after the last
-   * restart was applied always leads to another.
+   * A restart of the module, recorded in one synchronous step (an interrupted caller either made it whole or not at
+   * all): counted, then either written to the desired state at once or, within `RESTART_INTERVAL_MS` of the last one
+   * taken up, held for the restart timer, which takes up every held request when the interval is over (all of a
+   * module's requests in between merged into one). A request made after the last one was taken up always leads to
+   * another restart. The interval only keeps a module from restarting itself in a tight loop: it is not a minimum
+   * distance between two restarts (a pass that is busy elsewhere can bring two closer together).
    */
   const requestRestart = (entry: Entry, reason: string): Effect.Effect<void> =>
-    Effect.gen(function*() {
-      entry.restartRequests++
-      yield* Effect.logInfo(`Module ${entry.def.id} is to be started again: ${reason}`)
-      if (entry.restartTimer) return
+    Clock.clockWith((clock) =>
+      Effect.sync(() => {
+        entry.restartRequests++
+        if (entry.restartTimer) return
+        const now = clock.currentTimeMillisUnsafe()
+        if (now - entry.lastRestartAt >= RESTART_INTERVAL_MS) return applyRestart(entry, now)
+        entry.restartTimer = true
+        Deferred.doneUnsafe(restartWake, Effect.void)
+      })
+    ).pipe(Effect.andThen(Effect.logInfo(`Module ${entry.def.id} is to be started again: ${reason}`)))
+
+  /** The restart timer: one fiber of the host's, which takes up the held requests once their interval is over. */
+  const restartTimer = Effect.gen(function*() {
+    for (;;) {
       const now = yield* Clock.currentTimeMillis
-      const apply = (at: number) => {
-        entry.lastRestartAt = at
-        write(() => {
-          entry.want = { ...entry.want, restarts: entry.restartRequests }
-        })
-      }
-      const wait = entry.lastRestartAt + RESTART_INTERVAL_MS - now
-      if (wait <= 0) return apply(now)
-      entry.restartTimer = true
-      yield* Effect.forkIn(
-        outsideTurns(Effect.gen(function*() {
-          yield* Effect.sleep(wait)
+      let next = Infinity
+      for (const entry of entries) {
+        if (!entry.restartTimer) continue
+        const due = entry.lastRestartAt + RESTART_INTERVAL_MS
+        if (due <= now) {
           entry.restartTimer = false
-          apply(yield* Clock.currentTimeMillis)
-        })),
-        hostScope
-      )
-    })
+          applyRestart(entry, now)
+        } else next = Math.min(next, due - now)
+      }
+      const signal = restartWake
+      yield* next === Infinity ? Deferred.await(signal) : Effect.raceFirst(Deferred.await(signal), Effect.sleep(next))
+      if (signal === restartWake && Deferred.isDoneUnsafe(signal)) restartWake = Deferred.makeUnsafe<void>()
+    }
+  })
+  yield* Effect.forkIn(outsideTurns(restartTimer), hostScope)
 
   /** `reportMissingProgram`: a required program failed to start; the app marks it missing, then every module is judged again. */
   const reportMissingProgram = (entry: Entry, tool: string): Effect.Effect<void> =>
@@ -1956,19 +2060,21 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
         }
         const settings = resolve(entry).value
         const own = (title: string, detail: string): ReadonlyArray<Issue> => [{ id: `${entry.def.id}.health`, module: entry.def.id, severity: "warning", title, detail }]
-        // Suspended: a health check that throws is reported like one that fails.
-        return Effect.suspend(() => health({ settings, running: entry.run !== undefined })).pipe(
-          Effect.timeoutOrElse({
-            duration: healthTimeoutMs,
-            orElse: () => Effect.succeed(own(`${entry.def.name}'s health check did not finish`, `It took longer than ${Math.round(healthTimeoutMs / 1000)} s.`))
-          }),
-          Effect.catchCause((cause) =>
-            Cause.hasInterruptsOnly(cause)
-              ? Effect.interrupt
-              : Effect.succeed(own(`${entry.def.name}'s health check failed`, firstLine(cause)))
-          ),
-          Effect.flatMap((list) => Effect.sync(() => issues.set(source, normaliseIssues(entry.def.id, entry.def.name, Array.isArray(list) ? list : []))))
-        )
+        // In a fiber of its own, awaited as its Exit: one that throws, fails or interrupts itself is that module's
+        // issue, never the whole check's; one that does not finish in time is left (interrupted, not waited for).
+        return Effect.gen(function*() {
+          const fiber = yield* Effect.forkChild(Effect.suspend(() => health({ settings, running: entry.run !== undefined })))
+          const exit = yield* Effect.timeoutOption(Fiber.await(fiber), healthTimeoutMs)
+          if (Option.isNone(exit)) {
+            fiber.interruptUnsafe()
+            return own(`${entry.def.name}'s health check did not finish`, `It took longer than ${Math.round(healthTimeoutMs / 1000)} s.`)
+          }
+          if (Exit.isFailure(exit.value)) {
+            const cause = exit.value.cause
+            return own(`${entry.def.name}'s health check failed`, Cause.hasInterruptsOnly(cause) ? "It was interrupted." : firstLine(cause))
+          }
+          return exit.value.value
+        }).pipe(Effect.flatMap((list) => Effect.sync(() => issues.set(source, normaliseIssues(entry.def.id, entry.def.name, Array.isArray(list) ? list : [])))))
       }),
     { concurrency: "unbounded", discard: true }
   ))
@@ -1981,9 +2087,15 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
     return assistantId !== undefined && entry.shown.demand !== undefined ? instanceFor(entry, assistantId) : mainOf(entry)
   }
 
-  /** The assistant may use this module (the gateway's own first check, so the catalogue lists what would run). */
+  /**
+   * The assistant may use this module (the gateway's own first check, so the catalogue lists what would run). Without
+   * `access`: the assistant wants it directly (`demand`; a module without demand is everyone's).
+   */
   const moduleOnFor = (assistantId: string | undefined, entry: Entry) =>
-    assistantId === undefined || options.access === undefined || options.access.moduleOn(assistantId, entry.def.id)
+    assistantId === undefined ||
+    (options.access === undefined
+      ? entry.shown.demand === undefined || entry.shown.demand.some((d) => d.assistantId === assistantId)
+      : options.access.moduleOn(assistantId, entry.def.id))
 
   /** The assistant may use this action (the gateway's first two checks). */
   const offered = (assistantId: string | undefined, entry: Entry, actionId: string) =>
@@ -2126,12 +2238,15 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
       // Serve mode: a caller with no complete principal gets none (deliberately all: `contributionsFor(key, undefined)`).
       "refused" in principal ? (options.access === undefined ? contributionsFor(key, undefined) : []) : contributionsFor(key, assistantOf(principal)))
 
-  /** `ctx.settingsFor` of a shared part: from the desired state its module was started with. */
-  const settingsForOf = (entry: Entry, part: Part, target: HostTarget) => (assistantId: string | undefined): unknown => {
-    if (part.state === "closed" || part.state === "abandoned") throw stoppedError(entry)
-    const d = target.desired
+  /**
+   * `ctx.settingsFor` of a shared part: from the desired state its run runs for now (`Run.accepted`: who has it on,
+   * the saved values and defaults), with the secrets it was started with.
+   */
+  const settingsForOf = (entry: Entry, part: Part, run: Run) => (assistantId: string | undefined): unknown => {
+    if (closing || part.state === "closed" || part.state === "abandoned") throw stoppedError(entry)
+    const d = run.accepted
     const own = assistantId === undefined ? undefined : d.demand?.find((x) => x.assistantId === assistantId)?.own
-    return resolveFrom(entry, { stored: d.stored, secrets: target.secrets }, own === undefined ? undefined : applicableOwnValues(entry.def.settings, own), d.defaults).value
+    return resolveFrom(entry, { stored: d.stored, secrets: run.target.secrets }, own === undefined ? undefined : applicableOwnValues(entry.def.settings, own), d.defaults).value
   }
 
   const stoppedError = (entry: Entry) => new ModuleStopped({ message: `${entry.def.name} has stopped; this host object no longer answers.` })
@@ -2143,12 +2258,14 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
    * closed, every member answers with `ModuleStopped`.
    */
   function servicesFor(entry: Entry, part: Part): ModuleServicesV2 {
-    const isStopped = () => part.state === "closed" || part.state === "abandoned"
+    // Once the host has begun to close, every module's context answers with ModuleStopped (`revokeAll`).
+    const isStopped = () => closing || part.state === "closed" || part.state === "abandoned"
     const now = <A>(f: () => A): A => {
       if (isStopped()) throw stoppedError(entry)
       return f()
     }
     const effect = <A>(f: () => Effect.Effect<A>): Effect.Effect<A> => Effect.suspend(() => (isStopped() ? Effect.die(stoppedError(entry)) : f()))
+    let refusedRestart = false
     return {
       host: {
         view: () => now(view),
@@ -2158,11 +2275,12 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
         actions: { list: effect(() => actions.list), run: (request) => effect(() => actions.run(request)) },
         requestRestart: (reason) =>
           effect(() => {
-            // During its own start: applied once it is published (dropped if it is not). While it runs or is being
-            // stopped (only ever before its module's next start): counted, so the next start comes after it.
-            if (part.state === "starting") {
-              part.stagedRestart = reason
-              return Effect.void
+            // Only a live part asks: one that is starting, was never published or is being closed (a "restart on
+            // disconnect" finalizer) is refused, so a failed start cannot restart itself.
+            if (part.state !== "live") {
+              if (refusedRestart) return Effect.void
+              refusedRestart = true
+              return Effect.logDebug(`Module ${entry.def.id}: a restart asked for by its ${part.kind} part while it is ${part.state} is ignored: ${reason}`)
             }
             return requestRestart(entry, reason)
           }),
