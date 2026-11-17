@@ -123,6 +123,7 @@ import { type AssistantTraceConfig, type Hearing, makeVoiceSession } from "./Voi
 import { makeVoiceSessions, type VoiceSessions } from "./VoiceSessions.ts"
 import { makeRoutingService, ROUTING_KEYS } from "./routing.ts"
 import { openServeHousehold } from "./household.ts"
+import { openServeScheduler } from "./scheduler.ts"
 import { makeHouseholdPush } from "./HouseholdPush.ts"
 import { hostEvent, withContextProvider } from "@pva/core"
 import { runMaintenance } from "@pva/store-sqlite"
@@ -329,6 +330,13 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       backupCopyDir: env.HOUSEHOLD_BACKUP_COPY_DIR,
       log: logInfo
     }).pipe(Effect.mapError((e) => new SettingsStoreError({ message: e.message, cause: e })))
+    // P6: the scheduler (docs/SCHEDULING.md) on the household store; its issues go to the host's registry.
+    const { issues, scheduler } = yield* openServeScheduler({
+      store: household.store,
+      catalog,
+      timeZone: () => String(sections.value("HOME_TIME_ZONE") ?? ""),
+      log: logInfo
+    }).pipe(Effect.mapError((e) => new SettingsStoreError({ message: e.message, cause: e })))
     // Capabilities run for the assistants that switch them on (`moduleDemand`, below; read from startEnabled on).
     const host = yield* makeModuleHost({
       routeTokens,
@@ -342,6 +350,8 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       platform: { os: process.platform, arch: process.arch },
       requirements: checker.check,
       household: { store: household.store, events: household.bus },
+      issues,
+      scheduler,
       // The execution gateway's first checks, on every call (and the turn's action catalogue): the assistant has the
       // module on, and the tool is not one it switched off. Agents and decision providers are not per assistant.
       access: {
@@ -1430,6 +1440,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     const moduleRouter = makeModuleRouter({ host, admin, tokens: routeTokens, services })
     const api = makeApi({
       moduleRoutes: moduleRouter,
+      scheduler,
       admin,
       catalog: voiceCatalog,
       favourites,

@@ -221,62 +221,13 @@ export const makeSchedulerEngine = (options: SchedulerEngineOptions): Effect.Eff
 
     const moduleName = (id: string) => options.modules?.().find((m) => m.id === id)?.name ?? id
     const isOrphan = (id: string) => options.modules !== undefined && !options.modules().some((m) => m.id === id)
-    const describe = (j: JobRow) => j.label ?? j.key ?? (j.onDue !== undefined && "handler" in j.onDue ? j.onDue.handler : j.kind)
 
     const refreshIssues: Effect.Effect<void> = options.issues === undefined
       ? Effect.void
       : Effect.gen(function*() {
         const live = yield* table.query({ states: LIVE_STATES, limit: 2000 })
         const failed = yield* table.query({ states: ["failed"], limit: 50 })
-        const list: Array<Issue> = []
-        const fix = { kind: "link" as const, label: "Open Scheduled jobs", value: "#settings/diagnostics/scheduled" }
-        const known = (m: string) => (isOrphan(m) ? {} : { module: m })
-        for (const j of failed) {
-          list.push({
-            id: `core.scheduler.failed.${j.id}`,
-            ...known(j.module),
-            severity: "warning",
-            title: `A ${j.kind} of ${moduleName(j.module)} failed: ${describe(j)}`.slice(0, 200),
-            detail: (j.lastError ?? "").slice(0, 1900),
-            fix
-          })
-        }
-        for (const j of live.filter((x) => x.lastFailedAt !== undefined)) {
-          list.push({
-            id: `core.scheduler.failed.${j.id}`,
-            ...known(j.module),
-            severity: "warning",
-            title: `The last run of ${describe(j)} (${moduleName(j.module)}) failed`.slice(0, 200),
-            detail: `${(j.lastError ?? "").slice(0, 1500)} It runs again at its next time.`,
-            fix
-          })
-        }
-        const byModule = (rows: ReadonlyArray<JobRow>) => {
-          const m = new Map<string, Array<JobRow>>()
-          for (const r of rows) m.set(r.module, [...(m.get(r.module) ?? []), r])
-          return m
-        }
-        for (const [m, rows] of byModule(live.filter((x) => x.waiting && !isOrphan(x.module)))) {
-          list.push({
-            id: `core.scheduler.waiting.${m}`,
-            module: m,
-            severity: "warning",
-            title: `${rows.length} job${rows.length === 1 ? "" : "s"} of ${moduleName(m)} wait${rows.length === 1 ? "s" : ""} for the module to run`,
-            detail: `Due, but ${moduleName(m)} is not running, so ${rows.length === 1 ? "it" : "they"} cannot fire (${rows.slice(0, 3).map(describe).join(", ")}). ` +
-              "They fire when the module runs again, as their missed policy allows; an assistant must have the module on.",
-            fix
-          })
-        }
-        for (const [m, rows] of byModule(live.filter((x) => isOrphan(x.module)))) {
-          list.push({
-            id: `core.scheduler.orphaned.${m}`,
-            severity: "warning",
-            title: `${rows.length} scheduled job${rows.length === 1 ? "" : "s"} of a removed module (${m})`,
-            detail: "The module is no longer installed. Its notifications still fire; anything else waits. Cancel them on the Scheduled jobs page.",
-            fix
-          })
-        }
-        options.issues!.set("scheduler", list)
+        options.issues!.set("scheduler", schedulerIssues({ live, failed, moduleName, isOrphan }))
       }).pipe(Effect.catch((e) => Effect.sync(() => log(`Scheduler: issues not refreshed: ${e.message}`))))
 
     // ---- Firing
@@ -815,6 +766,73 @@ export const makeSchedulerEngine = (options: SchedulerEngineOptions): Effect.Eff
     }
     return engine
   })
+
+const describeJob = (j: JobRow) => j.label ?? j.key ?? (j.onDue !== undefined && "handler" in j.onDue ? j.onDue.handler : j.kind)
+
+/**
+ * The scheduler's Health issues (source `scheduler`; `pnpm start doctor` reads the same from the database): each failed
+ * job, each recurring job whose last run failed, the jobs of each module that wait for its handler, and the jobs of
+ * each module that is no longer in the catalogue.
+ */
+export const schedulerIssues = (input: {
+  readonly live: ReadonlyArray<JobRow>
+  readonly failed: ReadonlyArray<JobRow>
+  readonly moduleName: (id: string) => string
+  readonly isOrphan: (id: string) => boolean
+}): ReadonlyArray<Issue> => {
+  const { failed, isOrphan, live, moduleName } = input
+  const list: Array<Issue> = []
+  const fix = { kind: "link" as const, label: "Open Scheduled jobs", value: "#settings/diagnostics/scheduled" }
+  const known = (m: string) => (isOrphan(m) ? {} : { module: m })
+  for (const j of failed) {
+    list.push({
+      id: `core.scheduler.failed.${j.id}`,
+      ...known(j.module),
+      severity: "warning",
+      title: `A ${j.kind} of ${moduleName(j.module)} failed: ${describeJob(j)}`.slice(0, 200),
+      detail: (j.lastError ?? "").slice(0, 1900),
+      fix
+    })
+  }
+  for (const j of live.filter((x) => x.lastFailedAt !== undefined)) {
+    list.push({
+      id: `core.scheduler.failed.${j.id}`,
+      ...known(j.module),
+      severity: "warning",
+      title: `The last run of ${describeJob(j)} (${moduleName(j.module)}) failed`.slice(0, 200),
+      detail: `${(j.lastError ?? "").slice(0, 1500)} It runs again at its next time.`,
+      fix
+    })
+  }
+  const byModule = (rows: ReadonlyArray<JobRow>) => {
+    const m = new Map<string, Array<JobRow>>()
+    for (const r of rows) m.set(r.module, [...(m.get(r.module) ?? []), r])
+    return m
+  }
+  for (const [m, rows] of byModule(live.filter((x) => x.waiting && !isOrphan(x.module)))) {
+    const one = rows.length === 1
+    list.push({
+      id: `core.scheduler.waiting.${m}`,
+      module: m,
+      severity: "warning",
+      title: `${rows.length} job${one ? "" : "s"} of ${moduleName(m)} wait${one ? "s" : ""} for the module to run`,
+      detail: `Due, but ${moduleName(m)} is not running, so ${one ? "it" : "they"} cannot fire (${rows.slice(0, 3).map(describeJob).join(", ")}). ` +
+        "They fire when the module runs again, as their missed policy allows; an assistant must have the module on.",
+      fix
+    })
+  }
+  for (const [m, rows] of byModule(live.filter((x) => isOrphan(x.module)))) {
+    const one = rows.length === 1
+    list.push({
+      id: `core.scheduler.orphaned.${m}`,
+      severity: "warning",
+      title: `${rows.length} scheduled job${one ? "" : "s"} of a removed module (${m})`,
+      detail: "The module is no longer installed. Its notifications still fire; anything else waits. Cancel them on the Scheduled jobs page.",
+      fix
+    })
+  }
+  return list
+}
 
 /** A short summary of counts: "4 scheduled, 1 failed, 2 waiting for their module". */
 export const describeCounts = (c: SchedulerCounts): string =>

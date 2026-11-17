@@ -25,6 +25,7 @@ import type { Jobs } from "./jobs.ts"
 import type { ModelCatalog } from "./ModelCatalog.ts"
 import type { ModelFavourites } from "./ModelFavourites.ts"
 import type { ModuleRouter } from "./moduleRoutes.ts"
+import { type AdminScheduler, schedulerRoute } from "./schedulerApi.ts"
 import type { Models } from "./models.ts"
 import { ApiFailure, type VoiceCatalog } from "./VoiceCatalog.ts"
 
@@ -53,6 +54,8 @@ export interface ApiOptions {
   readonly scheme: "http" | "https"
   /** P3: the admin view of module routes and their tokens (`/api/module-routes`). Absent: 404. */
   readonly moduleRoutes?: ModuleRouter
+  /** P6: the scheduled jobs (`/api/scheduler/jobs`, `schedulerApi.ts`). Absent: an empty list, `available: false`. */
+  readonly scheduler?: AdminScheduler
 }
 
 /** A JSON answer, or a WAV body. */
@@ -175,6 +178,8 @@ export const makeApi = (options: ApiOptions) => {
         if (!revoked) return yield* fail(404, "not_found", "There is no such token (it may have been revoked already)")
         return json(200, { revoked: true })
       }
+      const scheduled = schedulerRoute(path, method, options.scheduler)
+      if (scheduled !== undefined) return yield* scheduled
       if (path === "voice-providers") {
         yield* only("GET")
         return json(200, { providers: yield* catalog.providers })

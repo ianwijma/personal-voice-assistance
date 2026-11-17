@@ -11,6 +11,7 @@ import type { SttShared } from "./serve/Resources.ts"
 import { makeSections } from "./serve/sections.ts"
 import { DataDirConfig } from "./serve/SettingsStore.ts"
 import { householdIssues } from "@pva/store-sqlite"
+import { schedulerDoctorIssues } from "./serve/scheduler.ts"
 
 /**
  * `pnpm start doctor` (module-definition-config-and-dependencies.md §C.5, after `brew doctor` and `flutter doctor`):
@@ -74,7 +75,9 @@ export const runDoctor = (options: DoctorOptions): Effect.Effect<ReadonlyArray<I
     )
     // The household database: opens, passes SQLite's quick check, is not from a newer version, has a recent backup.
     const household = yield* householdIssues(options.dataDir)
-    return [...core, ...household, ...modules]
+    // P6: scheduled jobs (read from the database; the engine runs only in the server): the count, failed and waiting jobs.
+    const scheduled = yield* schedulerDoctorIssues(options.dataDir, options.catalog)
+    return [...core, ...household, ...scheduled, ...modules]
   }))
 
 const LABEL: Readonly<Record<Issue["severity"], string>> = { error: "error  ", warning: "warning", info: "info   " }
