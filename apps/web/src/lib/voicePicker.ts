@@ -1,4 +1,5 @@
-import type { Favourite, JobInfo, ProviderInfo, ProviderVoices, VoiceEntry } from "@pva/protocol"
+import type { AssistantInfo, DeviceListInfo, DeviceTypeInfo, DeviceUser, Favourite, JobInfo, ProviderInfo, ProviderVoices, VoiceEntry } from "@pva/protocol"
+import { deviceVoiceUser, typeVoiceUser, voiceUsersOf } from "@pva/protocol"
 
 /**
  * The voice picker's pure logic (docs/VOICE-PROVIDERS.md §4.2): what a list shows for a rail tab or a search, the
@@ -16,6 +17,34 @@ export const parseKey = (key: string): { readonly provider: string; readonly voi
   const provider = key.slice(0, i)
   const voiceId = key.slice(i + 1)
   return /^[a-z][a-z0-9-]{0,31}$/.test(provider) && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(voiceId) ? { provider, voiceId } : undefined
+}
+
+/** Who speaks with each voice (`usedBy`, `usedByDevices` of the catalogue), by voice key. */
+export interface VoiceUsers {
+  readonly assistants: ReadonlyMap<string, ReadonlyArray<string>>
+  readonly devices: ReadonlyMap<string, ReadonlyArray<DeviceUser>>
+}
+
+let lastUsers: { readonly a: unknown; readonly d: unknown; readonly t: unknown; readonly users: VoiceUsers } | undefined
+
+/**
+ * The voices' users from the admin state this page already has (docs/LOOKS-AND-VOICES.md §5.1), by the server's own
+ * rule (`voiceUsersOf`): every assistant by its voice, every device type's defaults and every device by its
+ * effective voice section. The catalogue is loaded once, so the picker shows these instead of the answer's, and a
+ * saved device, device type or assistant shows at once. The same lists give the same object.
+ */
+export const voiceUsersFrom = (
+  assistants: ReadonlyArray<Pick<AssistantInfo, "id" | "voice">>,
+  devices: ReadonlyArray<Pick<DeviceListInfo, "id" | "name" | "settings">>,
+  deviceTypes: ReadonlyArray<Pick<DeviceTypeInfo, "kind" | "one" | "settings">>
+): VoiceUsers => {
+  if (lastUsers !== undefined && lastUsers.a === assistants && lastUsers.d === devices && lastUsers.t === deviceTypes) return lastUsers.users
+  const users = voiceUsersOf(assistants, [
+    ...deviceTypes.map((t) => ({ user: typeVoiceUser(t.kind, t.one), voice: t.settings.voice })),
+    ...devices.map((d) => ({ user: deviceVoiceUser(d.id, d.name), voice: d.settings.voice }))
+  ])
+  lastUsers = { a: assistants, d: devices, t: deviceTypes, users }
+  return users
 }
 
 /** Case- and accent-insensitive form of a text, for matching. */

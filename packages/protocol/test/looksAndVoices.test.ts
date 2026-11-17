@@ -9,7 +9,10 @@ import {
   DEVICE_SETTINGS_KEYS,
   DeviceSettings,
   DeviceSettingsKey,
-  PROTOCOL_VERSION
+  deviceVoiceUser,
+  PROTOCOL_VERSION,
+  typeVoiceUser,
+  voiceUsersOf
 } from "../src/index.ts"
 import { assistantsClientExamples, clientExamples, exampleDevice, serverExamples } from "../src/examples.ts"
 
@@ -45,5 +48,27 @@ describe("protocol 8", () => {
     expect(decodeClientMessage(JSON.stringify(save))).toMatchObject({ _tag: "Ok" })
     const create = { ...assistantsClientExamples["assistant.create"], saveAnyway: true }
     expect(decodeClientMessage(JSON.stringify(create))).toMatchObject({ _tag: "Ok", message: { saveAnyway: true } })
+  })
+})
+
+describe("who uses a voice (voiceUsersOf, the one rule of the server and the web)", () => {
+  const lessac = { provider: "piper", voiceId: "en_US-lessac-medium" }
+  const amy = { provider: "piper", voiceId: "en_US-amy-medium" }
+  it("every assistant by its voice; every place whose effective voice is its own; a place that follows the assistant is no user", () => {
+    const users = voiceUsersOf(
+      [{ id: "jeff", voice: lessac }, { id: "t3", voice: lessac }],
+      [
+        { user: typeVoiceUser("web-voice", "browser"), voice: { from: "device", voice: amy } },
+        { user: deviceVoiceUser("d-kitchen-ipad-0001", "Kitchen iPad"), voice: { from: "device", voice: amy } },
+        { user: deviceVoiceUser("d-hall-0000000001", ""), voice: { from: "assistant" } }
+      ]
+    )
+    expect(users.assistants.get("piper:en_US-lessac-medium")).toEqual(["jeff", "t3"])
+    expect(users.devices.get("piper:en_US-amy-medium")).toEqual([
+      { target: { kind: "type", type: "web-voice" }, name: "Every browser" },
+      { target: { kind: "device", id: "d-kitchen-ipad-0001" }, name: "Kitchen iPad" }
+    ])
+    expect(users.devices.has("piper:en_US-lessac-medium")).toBe(false)
+    expect(deviceVoiceUser("d-hall-0000000001", "").name).toBe("d-hall-0000000001")
   })
 })

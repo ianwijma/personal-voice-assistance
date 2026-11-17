@@ -1,6 +1,7 @@
 import { Schema } from "effect"
 import { VoiceRefSchema } from "./voices.ts"
 import type { VoiceRefJson } from "./voices.ts"
+import type { DeviceUser } from "./deviceUsers.ts"
 
 /**
  * Looks and voices of assistants and devices (docs/LOOKS-AND-VOICES.md). Pure and browser-safe.
@@ -60,3 +61,44 @@ export const lookFor = (device: DeviceLook, assistant: { readonly look?: Look | 
 /** The voice `assistant` speaks with on a device: the device's own, else the assistant's. */
 export const voiceFor = (device: DeviceVoice, assistant: { readonly voice: VoiceRefJson }): VoiceRefJson =>
   device.from === "device" ? device.voice : assistant.voice
+
+// -- Who uses a voice (§5.0) -----------------------------------------------------------------------------------------
+
+/** A voice's key, `provider:voiceId` (the catalogue's `VoiceEntry.key`; the same as `voiceKey` in `@pva/core`). */
+export const voiceRefKey = (ref: VoiceRefJson): string => `${ref.provider}:${ref.voiceId}`
+
+/** A place that may speak with its own voice: a device type's defaults or one device, with its *effective* voice section. */
+export interface VoicePlace {
+  readonly user: DeviceUser
+  readonly voice: DeviceVoice
+}
+
+/** A device type's defaults as a user ("Every browser"). */
+export const typeVoiceUser = (kind: string, one: string): DeviceUser => ({ target: { kind: "type", type: kind }, name: `Every ${one}` })
+
+/** One device as a user, by its name (its id when it has none). */
+export const deviceVoiceUser = (id: string, name: string): DeviceUser => ({ target: { kind: "device", id }, name: name || id })
+
+/**
+ * Who speaks with each voice, by voice key: `assistants`, every assistant by its own voice (switched on or not, even
+ * when every device hides it), and `devices`, every place whose effective voice section is its own. The one rule the
+ * server (the catalogue's `usedBy`/`usedByDevices`) and the web (which recomputes it from the admin state it already
+ * has, so a save shows at once) both use.
+ */
+export const voiceUsersOf = (
+  assistants: Iterable<{ readonly id: string; readonly voice: VoiceRefJson }>,
+  places: Iterable<VoicePlace>
+): { readonly assistants: ReadonlyMap<string, ReadonlyArray<string>>; readonly devices: ReadonlyMap<string, ReadonlyArray<DeviceUser>> } => {
+  const byAssistant = new Map<string, Array<string>>()
+  for (const a of assistants) {
+    const key = voiceRefKey(a.voice)
+    byAssistant.set(key, [...(byAssistant.get(key) ?? []), a.id])
+  }
+  const byDevice = new Map<string, Array<DeviceUser>>()
+  for (const p of places) {
+    if (p.voice.from !== "device") continue
+    const key = voiceRefKey(p.voice.voice)
+    byDevice.set(key, [...(byDevice.get(key) ?? []), p.user])
+  }
+  return { assistants: byAssistant, devices: byDevice }
+}

@@ -1,10 +1,12 @@
-import { render, screen } from "@testing-library/react"
+import { act, render, screen } from "@testing-library/react"
 import { describe, expect, it } from "vitest"
 import type { AssistantInfo, DeviceUser, VoiceEntry } from "@pva/protocol"
-import { exampleAssistant } from "@pva/protocol/examples"
+import { exampleAssistant, exampleDevice, exampleDeviceType } from "@pva/protocol/examples"
 import { ClientContext } from "@/components/context.tsx"
 import { UsedBy } from "@/components/pickers/UsedBy.tsx"
-import { mapVoice } from "@/components/voices/VoicePicker.tsx"
+import type { PickerSource } from "@/components/pickers/CatalogPicker.tsx"
+import { mapVoice, voiceSource } from "@/components/voices/VoicePicker.tsx"
+import { catalogFor } from "@/components/voices/useVoiceCatalog.ts"
 import type { AssistantClient } from "@/lib/client.ts"
 import { deviceUserPath } from "@/lib/catalogPicker.ts"
 import { initialState, reducer } from "@/lib/state.ts"
@@ -64,5 +66,74 @@ describe("the voice catalogue's rows", () => {
   it("link a type's defaults to their page", () => {
     expect(deviceUserPath(everyBrowser)).toEqual(["devices", "type.web-voice"])
     expect(deviceUserPath(kitchen)).toEqual(["devices", "d-kitchen-ipad-0001"])
+  })
+})
+
+describe("the voice picker's users follow the admin state (the catalogue is loaded once)", () => {
+  const lessac = { provider: "piper", voiceId: "en_US-lessac-medium" } as const
+  const amy = { provider: "piper", voiceId: "en_US-amy-medium" } as const
+  const entry = (voice: { readonly provider: string; readonly voiceId: string }, name: string): VoiceEntry =>
+    ({ voice, key: `${voice.provider}:${voice.voiceId}`, name, tags: [], previewable: true, usedBy: [], favourite: false })
+  const info = (id: string, name: string, voice: typeof lessac | typeof amy) =>
+    ({ ...exampleAssistant, id, name, voice, usedOn: [], resources: { llm: "unused", voice: "unused" }, problems: [] }) as unknown as AssistantInfo
+
+  function Probe({ source }: { readonly source: PickerSource }) {
+    const { lists } = source.useState()
+    return (
+      <ul>
+        {lists.flatMap((p) => p.rows).map((r) => (
+          <li key={r.key} data-testid={r.key}>{[...r.usedBy, "|", ...(r.usedByDevices ?? []).map((d) => d.name)].join(" ")}</li>
+        ))}
+      </ul>
+    )
+  }
+
+  it("a device's own voice, then its reset, and an assistant's new voice show at once", () => {
+    const store = createStore({
+      ...initialState,
+      adminReady: true,
+      assistants: [info("jeff", "Jeff", lessac)],
+      devices: [exampleDevice],
+      deviceTypes: [exampleDeviceType]
+    }, reducer)
+    const client = { store, subscribe: store.subscribe } as unknown as AssistantClient
+    const catalog = catalogFor(client)
+    // The catalogue's answer, loaded before any of the saves below (its own users are those of that moment).
+    catalog.store.dispatch({
+      load: "ready",
+      lists: [{ provider: { id: "piper", label: "Piper", location: "local", status: "ready", settingsPath: [] }, voices: [entry(lessac, "Lessac"), entry(amy, "Amy")] }] as never
+    })
+    render(<ClientContext.Provider value={client}><Probe source={voiceSource(catalog)} /></ClientContext.Provider>)
+    const users = (key: string) => screen.getByTestId(key).textContent
+    expect(users("piper:en_US-lessac-medium")).toBe("jeff |")
+    expect(users("piper:en_US-amy-medium")).toBe("|")
+
+    // The device gets its own voice (device.save → `devices`).
+    const own = { ...exampleDevice, own: { ...exampleDevice.own, voice: { from: "device" as const, voice: amy } }, settings: { ...exampleDevice.settings, voice: { from: "device" as const, voice: amy } } }
+    act(() => store.dispatch({ type: "devices", devices: [own] }))
+    expect(users("piper:en_US-amy-medium")).toBe("| iPhone · Safari")
+
+    // The type's defaults get one too, and then the device is reset (follows the type again: it speaks with the type's voice).
+    act(() => store.dispatch({ type: "device.types", types: [{ ...exampleDeviceType, settings: { ...exampleDeviceType.settings, voice: { from: "device", voice: lessac } } }] }))
+    act(() => store.dispatch({ type: "devices", devices: [{ ...exampleDevice, settings: { ...exampleDevice.settings, voice: { from: "device", voice: lessac } } }] }))
+    expect(users("piper:en_US-amy-medium")).toBe("|")
+    expect(users("piper:en_US-lessac-medium")).toBe("jeff | Every browser iPhone · Safari")
+
+    // The assistant's voice changes (assistant.save → `assistants`).
+    act(() => store.dispatch({ type: "assistants", assistants: [info("jeff", "Jeff", amy)] }))
+    expect(users("piper:en_US-amy-medium")).toBe("jeff |")
+    expect(users("piper:en_US-lessac-medium")).toBe("| Every browser iPhone · Safari")
+  })
+
+  it("before the admin state has arrived, the catalogue's own answer is shown", () => {
+    const store = createStore({ ...initialState, adminReady: false }, reducer)
+    const client = { store } as unknown as AssistantClient
+    const catalog = catalogFor(client)
+    catalog.store.dispatch({
+      load: "ready",
+      lists: [{ provider: { id: "piper", label: "Piper", location: "local", status: "ready", settingsPath: [] }, voices: [{ ...entry(lessac, "Lessac"), usedBy: ["jeff"], usedByDevices: [kitchen] }] }] as never
+    })
+    render(<ClientContext.Provider value={client}><Probe source={voiceSource(catalog)} /></ClientContext.Provider>)
+    expect(screen.getByTestId("piper:en_US-lessac-medium").textContent).toBe("jeff | Kitchen iPad")
   })
 })

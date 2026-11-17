@@ -6,7 +6,7 @@ import type { GenericFavourite, GenericProvider, GenericRow } from "@/lib/catalo
 import { shallowEqual } from "@/lib/store.ts"
 import type { VoiceCatalog } from "@/lib/voiceCatalog.ts"
 import { jobOf } from "@/lib/voiceCatalog.ts"
-import { DEFAULT_PREVIEW_TEXT, indexVoices, languageLabel, needsKeyText, parseKey, voiceMeta } from "@/lib/voicePicker.ts"
+import { DEFAULT_PREVIEW_TEXT, indexVoices, languageLabel, needsKeyText, parseKey, voiceMeta, type VoiceUsers, voiceUsersFrom } from "@/lib/voicePicker.ts"
 import { useClient, useClientState } from "../context.tsx"
 import { CatalogPicker, type PickerSource, type RowActionProps } from "../pickers/CatalogPicker.tsx"
 import { Icon, Spinner } from "../ui/Icon.tsx"
@@ -79,6 +79,20 @@ const mapProvider = (p: ProviderVoices): GenericProvider => ({
   rows: p.voices.map(mapVoice)
 })
 
+/** The rows with their users from the admin state (`voiceUsersFrom`), once per answer and users. */
+const usersCache = new WeakMap<VoiceUsers, WeakMap<ReadonlyArray<GenericProvider>, ReadonlyArray<GenericProvider>>>()
+export const withUsers = (lists: ReadonlyArray<GenericProvider>, users: VoiceUsers | undefined): ReadonlyArray<GenericProvider> => {
+  if (users === undefined) return lists
+  let byLists = usersCache.get(users)
+  if (byLists === undefined) usersCache.set(users, (byLists = new WeakMap()))
+  let out = byLists.get(lists)
+  if (out === undefined) {
+    out = lists.map((p) => ({ ...p, rows: p.rows.map((r) => ({ ...r, usedBy: users.assistants.get(r.key) ?? [], usedByDevices: users.devices.get(r.key) ?? [] })) }))
+    byLists.set(lists, out)
+  }
+  return out
+}
+
 const sources = new WeakMap<VoiceCatalog, PickerSource>()
 
 /** The voice source of a catalog (one per catalog, so its identity is stable). */
@@ -104,8 +118,11 @@ export const voiceSource = (catalog: VoiceCatalog): PickerSource => {
       emptyIcon: "speaker",
       useState: () => {
         const s = useCatalogState((x) => ({ load: x.load, loadError: x.loadError, refreshing: x.refreshing, lists: x.lists, favourites: x.favourites }), shallowEqual)
-        let lists = providersCache.get(s.lists)
-        if (lists === undefined) providersCache.set(s.lists, (lists = s.lists.map(mapProvider)))
+        // The users come from the admin state when it has arrived (current after every save), else from the answer.
+        const users = useClientState((c) => (c.adminReady ? voiceUsersFrom(c.assistants, c.devices, c.deviceTypes) : undefined))
+        let mapped = providersCache.get(s.lists)
+        if (mapped === undefined) providersCache.set(s.lists, (mapped = s.lists.map(mapProvider)))
+        const lists = withUsers(mapped, users)
         let favourites = favouritesCache.get(s.favourites)
         if (favourites === undefined) {
           favouritesCache.set(s.favourites, (favourites = s.favourites.map((f) => ({ key: f.key, providerId: f.voice.provider, name: f.name, addedAt: f.addedAt }))))

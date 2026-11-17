@@ -113,7 +113,10 @@ DeviceSettings += { look: DeviceLook, voice: DeviceVoice }   // two new section 
 
 The web half uses the schemas of §2, plus the additive `usedByDevices` of §5.0. **Used by** (`components/pickers/UsedBy.tsx`):
 a voice's row in the picker shows a second line "Used by Jeff, T3 · Kitchen iPad, Every browser", each name linking to
-its page (an assistant's Voice tab, a device, or the type's defaults); nothing when it has no users. The web has no page
+its page (an assistant's Voice tab, a device, or the type's defaults); nothing when it has no users. The voice catalogue
+is loaded once per page, so once the admin state has arrived the picker recomputes the users from it (assistants,
+devices, device types) with the server's own rule (`voiceUsersOf`, `packages/protocol/src/looks.ts`): a saved device
+voice, its reset, or an assistant's new voice shows at once, without asking the server again. The web has no page
 that lists the resource status's users yet, so `ResourceInfo.usedByDevices` is carried by the protocol and the server only.
 
 **Assistant › Look** (`components/settings/pages/assistants/LookTab.tsx`, the editor in `components/looks/`). A tab

@@ -26,6 +26,7 @@ import {
   type DeviceSettings,
   type DeviceUser,
   deviceTypeOf,
+  deviceVoiceUser,
   effectiveDeviceSettings,
   type EngineInfo,
   type ResourceInfo,
@@ -36,7 +37,10 @@ import {
   type VoiceInfo,
   type ServerMessage,
   type TraceConfig,
+  typeVoiceUser,
   voiceFor,
+  type VoicePlace,
+  voiceUsersOf,
   WEB_VOICE_KIND
 } from "@pva/protocol"
 import { Cause, Config, ConfigProvider, Effect, Exit, Fiber, FiberSet, Option, type Scope, Stream } from "effect"
@@ -559,16 +563,14 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
      */
     const deviceUsersByVoice = (): ReadonlyMap<string, ReadonlyArray<DeviceUser>> => {
       const file = store.settings()
-      const out = new Map<string, Array<DeviceUser>>()
-      for (const [place, settings] of placesNow()) {
-        if (settings.voice.from !== "device") continue
-        const user: DeviceUser = place.startsWith("type:")
-          ? { target: { kind: "type", type: place.slice("type:".length) }, name: `Every ${deviceTypeOf(place.slice("type:".length))?.one ?? place.slice("type:".length)}` }
-          : { target: { kind: "device", id: place.slice("device:".length) }, name: file.devices[place.slice("device:".length)]?.name || place.slice("device:".length) }
-        const key = voiceKey(settings.voice.voice)
-        out.set(key, [...(out.get(key) ?? []), user])
-      }
-      return out
+      const places = [...placesNow()].map(([place, settings]): VoicePlace => {
+        const id = place.slice(place.indexOf(":") + 1)
+        return {
+          user: place.startsWith("type:") ? typeVoiceUser(id, deviceTypeOf(id)?.one ?? id) : deviceVoiceUser(id, file.devices[id]?.name ?? ""),
+          voice: settings.voice
+        }
+      })
+      return voiceUsersOf([], places).devices
     }
     /** Pool status for the snapshot: users `assistant@place` count as the assistant; the devices come from the settings. */
     const resourceStatus = (): Array<ResourceInfo> => {
