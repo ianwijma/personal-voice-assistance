@@ -26,6 +26,7 @@ export const DisplayClass = Schema.Literals(["glance", "compact", "standard", "l
 export type DisplayClass = typeof DisplayClass.Type
 
 /** A presentation kind name ("card", "list", "timer"); at most `MAX_PRESENT_KINDS` per device. */
+/** A key that is not a kind name is left out of `present.kinds` when it is decoded. */
 export const PresentKind = Schema.String.check(Schema.isPattern(/^[a-z][a-z0-9-]{0,31}$/))
 export type PresentKind = typeof PresentKind.Type
 export const MAX_PRESENT_KINDS = 64

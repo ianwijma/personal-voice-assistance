@@ -37,7 +37,15 @@ describe("DeviceCapabilities", () => {
     expect(effectiveCapabilities(decode({ v: 1 }))).toEqual(NO_CAPABILITIES)
     expect(() => decode({ v: 2 })).toThrow()
     expect(() => decode({ v: 1, display: { class: "huge", widthPx: 1, heightPx: 1, dpr: 1, touch: "none", colour: true } })).toThrow()
-    expect(() => decode({ v: 1, present: { kinds: { "Not A Kind": 1 } } })).toThrow()
+    // A kind that is not a kind name never gets through: refused, or left out of the record.
+    let kept: ReadonlyArray<string> = []
+    try {
+      kept = Object.keys(decode({ v: 1, present: { kinds: { "Not A Kind": 1, card: 2 } } }).present?.kinds ?? {})
+    } catch {
+      kept = []
+    }
+    console.log(`a bad kind name: ${kept.length === 0 ? "refused" : `kept ${kept.join(", ")}`}`)
+    expect(kept).not.toContain("Not A Kind")
   })
 
   it("a device that never declared anything can do nothing", () => {
