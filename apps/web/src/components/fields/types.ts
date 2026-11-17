@@ -1,5 +1,17 @@
 import type { SecretState, SettingField, SettingValue } from "@pva/protocol"
 
+/**
+ * Where a field is rendered (protocol 10): the form it belongs to and its draft. Buttons (`action` fields) need it to
+ * say which module to ask and whether the form has unsaved edits.
+ */
+export interface FieldContext {
+  readonly form: { readonly kind: "module" | "section"; readonly id: string }
+  /** The form has unsaved edits. */
+  readonly dirty: boolean
+  /** The form's draft values (every non-secret field). */
+  readonly draftValues: Readonly<Record<string, SettingValue>>
+}
+
 export interface FieldProps<F extends SettingField = SettingField> {
   readonly field: F
   /** DOM id of the control (the label points at it). */
@@ -15,6 +27,8 @@ export interface FieldProps<F extends SettingField = SettingField> {
   readonly invalid: boolean
   /** Report a value the field cannot accept yet (e.g. "12a" in a number input): blocks Save. */
   readonly onLocalError: (message: string | undefined) => void
+  /** The form around the field (absent: a field shown on its own, as inside a record). */
+  readonly context?: FieldContext
 }
 
 export const inputClass =

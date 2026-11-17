@@ -12,6 +12,7 @@ import { Tags } from "../ui/Tags.tsx"
 import { FieldRow } from "./FieldRow.tsx"
 import { ModuleHeader, ModuleInstances, ModuleTools, moduleStateText } from "./ModuleHeader.tsx"
 import { MarkerLegend } from "./FormFooter.tsx"
+import { ModuleRoutes } from "./ModuleRoutes.tsx"
 import { PageFooter } from "./PageFooter.tsx"
 import { type PageFormDef, type PageForms, type PageFormView, usePageForms } from "./usePageForms.ts"
 
@@ -164,6 +165,7 @@ function ModuleBlock({ module: m, editable, first, forms, vault }: {
         </p>
       )}
       <ModuleTools module={m} />
+      <ModuleRoutes module={m} />
     </section>
   )
 }
@@ -202,6 +204,7 @@ function FormBlock({ view, forms, heading, vault, renderAfter }: {
         vault={vault}
         setDraft={(f) => forms.setDraft(def.key, f)}
         onLocalError={(message) => forms.setLocalError(def.key, field.key, message)}
+        context={{ form: { kind: def.kind, id: def.id }, dirty: view.dirty, draftValues: state.sync.draft.values }}
       />
       {renderAfter(field)}
     </div>

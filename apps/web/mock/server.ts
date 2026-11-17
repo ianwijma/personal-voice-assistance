@@ -146,6 +146,7 @@ import { seedTraces } from "./traces.ts"
 import { createVoiceAssistants, scenarioSettings, scriptedTurn } from "./voiceAssistants.ts"
 import { encodeWav, MOCK_PROVIDERS } from "./voices.ts"
 import { createModelPickersMock } from "./modelPickers.ts"
+import { createModuleRoutesMock, demoHomeAction, demoHomeModule } from "./demoHome.ts"
 import type { Condition, FieldError } from "@pva/protocol"
 
 const PORT = Number(process.env.MOCK_PORT ?? 8787)
@@ -332,7 +333,9 @@ const initialModules = (): Array<ModuleInfo> => [
     kind: "agent",
     group: "agents"
   },
-  ...(scenario === "health" ? [clone(exampleUnavailableModule)] : [])
+  ...(scenario === "health" ? [clone(exampleUnavailableModule)] : []),
+  // Protocol 10: records, text lists, a combo, an info value, buttons and module routes.
+  demoHomeModule()
 ]
 
 /** Protocol 9: the issue registry (`health`). */
@@ -882,6 +885,7 @@ let connSeq = 0
 const voiceSessions = new Map<string, VSession>()
 let conversationSeq = 0
 let modules = initialModules()
+const moduleRoutesMock = createModuleRoutesMock()
 /** Protocol 7: assistants, device types and the devices' own sections (mock/assistants.ts). */
 const assistantsMock = createAssistantsMock({
   modules: () => modules,
@@ -1823,6 +1827,7 @@ const applyPatch = (form: SettingsForm, patch: SettingsPatch): SettingsForm => {
   for (const [k, v] of Object.entries(patch.values)) {
     const field = form.fields.find((f) => f.key === k)
     if (field === undefined || field.type === "secret") continue
+    if (field.type === "action" || field.type === "info") continue
     values[k] = v === null ? (field.default as SettingValue) : v
     sources[k] = v === null ? "default" : "saved"
   }
@@ -2178,6 +2183,17 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
         engine = { ...engine, reloadPending: true, reloadPendingFor: [...(engine.reloadPendingFor ?? []).filter((p) => p !== path), path] }
         broadcast({ type: "engine", engine })
       }
+      return
+    }
+    case "module.action": {
+      if (requireAdmin(c, m.requestId)) return
+      const mod = modules.find((x) => x.id === m.moduleId)
+      if (mod === undefined) return result(c, m.requestId, false, { code: "unknown_module", message: `No module ${m.moduleId}.` })
+      const field = mod.settings.fields.find((f) => f.key === m.key)
+      if (field?.type !== "action") return result(c, m.requestId, false, { code: "unknown_action", message: `${mod.name} has no action "${m.key}"` })
+      const values = !field.requiresSaved && m.values !== undefined ? { ...mod.settings.values, ...m.values } : mod.settings.values
+      const action = demoHomeAction(m.key, values) ?? { ok: true, text: "Done.", tone: "ok" as const }
+      after(500, () => sendTo(c, { type: "result", requestId: m.requestId, ok: true, action }))
       return
     }
     case "health.check": {
@@ -2674,6 +2690,27 @@ const apiRoute = async (req: IncomingMessage, res: ServerResponse, path: string,
     } catch {
       throw new ApiFail(400, "invalid_request", "The request body is not valid JSON")
     }
+  }
+  // Protocol 10: the admin view of module routes and their tokens (as the real server's /api/module-routes).
+  const routesMatch = /^module-routes(?:\/([a-z][a-z0-9-]{0,39})\/tokens(?:\/([a-f0-9]{8,32}))?)?$/.exec(path)
+  if (routesMatch !== null) {
+    const [, moduleId, tokenId] = routesMatch
+    if (moduleId === undefined) {
+      only("GET")
+      const id = query.get("module")
+      return { status: 200, body: moduleRoutesMock.view(modules.filter((x) => id === null || x.id === id)) }
+    }
+    if (tokenId === undefined) {
+      only("POST")
+      const b = await body()
+      if (typeof b.name !== "string" || !/^[a-z][a-z0-9-]{0,31}$/.test(b.name) || typeof b.label !== "string" || b.label.trim() === "") {
+        throw new ApiFail(400, "invalid_request", "A token needs a name and a label")
+      }
+      return { status: 201, body: moduleRoutesMock.mint(moduleId, b.name, b.label.trim()) }
+    }
+    only("DELETE")
+    if (!moduleRoutesMock.revoke(moduleId, tokenId)) throw new ApiFail(404, "not_found", "There is no such token (it may have been revoked already)")
+    return { status: 200, body: { revoked: true } }
   }
   if (path === "voice-providers") {
     only("GET")

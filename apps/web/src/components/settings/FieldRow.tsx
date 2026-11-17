@@ -1,7 +1,8 @@
 "use client"
 import { useEffect, useState } from "react"
 import type { ChoiceOption, SettingField, SettingsForm, SettingValue, VaultInfo } from "@pva/protocol"
-import { type Draft, resetDraftValue, setDraftValue, valueEqual } from "@/lib/forms.ts"
+import { type Draft, fieldDefault, hasOwnerValue, resetDraftValue, setDraftValue, valueEqual } from "@/lib/forms.ts"
+import type { FieldContext } from "@/components/fields/types.ts"
 import { secretStatus } from "@/lib/vault.ts"
 import { rendererFor } from "@/ui/fieldRenderers.ts"
 import { useClient } from "../context.tsx"
@@ -21,6 +22,11 @@ export const displayValue = (field: SettingField, value: SettingValue | undefine
     return value.map((v) => field.options.find((o) => o.value === v)?.label ?? v).join(", ") || "None"
   }
   if (field.type === "number") return `${String(value)}${field.unit ? ` ${field.unit}` : ""}`
+  if (field.type === "action") return ""
+  if (field.type === "records" && Array.isArray(value)) {
+    return value.length === 0 ? "None" : `${value.length} ${field.itemLabel}${value.length === 1 ? "" : "s"}`
+  }
+  if (field.type === "textList" && Array.isArray(value)) return value.join(", ") || "None"
   return String(value) === "" ? "(empty)" : String(value)
 }
 
@@ -49,6 +55,8 @@ export interface FieldRowProps {
   readonly vault: VaultInfo
   readonly setDraft: (f: (d: Draft) => Draft) => void
   readonly onLocalError: (message: string | undefined) => void
+  /** The form around the field (its buttons need it). */
+  readonly context?: FieldContext
 }
 
 /**
@@ -56,19 +64,19 @@ export interface FieldRowProps {
  * means when such a field is changed), "Unsaved" for an edit and "Custom · Reset" for a saved non-default value, the field's renderer (or, when the environment sets it, the value read-only with a pin and where it comes
  * from), then errors, warnings and the description.
  */
-export function FieldRow({ field, form, draft, idPrefix, errors, warnings, readOnly, saving, vault, setDraft, onLocalError }: FieldRowProps) {
+export function FieldRow({ field, form, draft, idPrefix, errors, warnings, readOnly, saving, vault, setDraft, onLocalError, context }: FieldRowProps) {
   const id = `${idPrefix}-${field.key}`
   const describedBy = `${id}-desc`
   const Renderer = rendererFor(field)
   const resetPending = draft.reset?.includes(field.key) === true
   // Saved, and not what it would be by default: "Custom" (stays until a reset is saved).
-  const custom = field.locked === undefined && field.type !== "secret" && field.source === "saved" && !resetPending &&
-    !valueEqual(form.values[field.key], field.default)
+  const custom = field.locked === undefined && field.type !== "secret" && hasOwnerValue(field) && field.source === "saved" && !resetPending &&
+    !valueEqual(form.values[field.key], fieldDefault(field))
   const canReset = !readOnly && custom
   /** The default, in words (secrets have none). */
-  const defaultText = field.type === "secret" ? "" : displayValue(field, field.default)
+  const defaultText = field.type === "secret" ? "" : displayValue(field, fieldDefault(field))
   // Edited here and not saved yet (secrets show their own state).
-  const unsaved = field.type !== "secret" && field.locked === undefined && (resetPending || (draft.values[field.key] !== undefined && !valueEqual(draft.values[field.key], draft.base[field.key])))
+  const unsaved = field.type !== "secret" && hasOwnerValue(field) && field.locked === undefined && (resetPending || (draft.values[field.key] !== undefined && !valueEqual(draft.values[field.key], draft.base[field.key])))
   const secret = form.secrets[field.key]
   // A newly chosen model that is not downloaded: offer Download, and hold Save until it is there (§3.3).
   const toDownload = field.locked === undefined ? optionsToDownload(field, draft.values[field.key]) : []
@@ -125,6 +133,7 @@ export function FieldRow({ field, form, draft, idPrefix, errors, warnings, readO
           disabled={saving || readOnly}
           invalid={errors.length > 0}
           onLocalError={onLocalError}
+          {...(context !== undefined ? { context } : {})}
         />
       )}
       {toDownload.map((o) => (
