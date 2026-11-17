@@ -148,7 +148,7 @@ describe("SQLite store: erase reaches the files", () => {
       const reader = new DatabaseSync(file, { readOnly: true })
       reader.exec("BEGIN")
       reader.prepare("SELECT count(*) FROM pva_docs").get()
-      assert.isTrue(yield* c.erase(row.id))
+      assert.isTrue(yield* c.remove(row.id))
       yield* Effect.sleep(100)
       assert.isDefined(store.erasePendingSince())
       reader.exec("COMMIT")
@@ -156,7 +156,7 @@ describe("SQLite store: erase reaches the files", () => {
       yield* store.scrubbed.pipe(Effect.timeout(5000))
       assert.isUndefined(store.erasePendingSince())
       for (const name of readdirSync(dir).filter((n) => n.startsWith("household.db"))) {
-        assert.isFalse(readFileSync(join(dir, name)).includes("quetzalcoatlsecret"), `${name} still holds the erased text`)
+        assert.isFalse(readFileSync(join(dir, name)).includes("quetzalcoatlsecret"), `${name} still holds the removed text`)
       }
       assert.isTrue(!existsSync(`${file}-wal`) || statSync(`${file}-wal`).size === 0)
     }).pipe(Effect.scoped))

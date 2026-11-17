@@ -1,15 +1,12 @@
 import type { ModuleUnavailable } from "@pva/protocol"
-import { Clock, Effect } from "effect"
+import { Effect } from "effect"
 import {
-  CHANGE_RETENTION_MS,
-  type ChangeRecord,
   type Collection,
   type CommittedChange,
   compareCodePoints,
   compareIndexed,
   type HouseholdStore,
   indexedEquals,
-  readOnlyError,
   scopeKey,
   type ScopeRef,
   type StoredModule,
@@ -33,11 +30,8 @@ export interface MemoryStoreOptions {
   readonly storedVersions?: Readonly<Record<string, Readonly<Record<string, number>>>>
 }
 
-type ChangeRow = ChangeRecord & { readonly actorKey: string }
-
 interface State {
   docs: Map<string, StoredDoc>
-  changes: Array<ChangeRow>
   nextSeq: number
 }
 
@@ -45,8 +39,6 @@ const key = (module: string, collection: string, id: string) => `${module}\u0000
 const MODULE_ID = /^[a-z][a-z0-9-]{0,39}$/
 
 export const makeMemoryHouseholdStore = (options: MemoryStoreOptions = {}): HouseholdStore & {
-  /** For assertions: every change-log row, oldest first. */
-  readonly changeLog: () => ReadonlyArray<ChangeRecord>
   /**
    * Inside a transaction of this store: run `undo` if that transaction (or the savepoint it is in, or an enclosing
    * one) rolls back. Outside one: nothing. How an in-memory table of a core service (the scheduler's) joins the
@@ -55,14 +47,14 @@ export const makeMemoryHouseholdStore = (options: MemoryStoreOptions = {}): Hous
   readonly onRollback: (undo: () => void) => Effect.Effect<void>
 } => {
   const readOnly = options.readOnly === true
-  let state: State = { docs: new Map(), changes: [], nextSeq: 1 }
+  let state: State = { docs: new Map(), nextSeq: 1 }
   const versions = new Map<string, Map<string, number>>()
   for (const [m, vs] of Object.entries(options.storedVersions ?? {})) versions.set(m, new Map(Object.entries(vs)))
   const verdicts = new Map<string, ModuleUnavailable>()
   const declared = new Map<string, ReadonlyMap<string, Collection<any>>>()
   const listeners = new Set<(changes: ReadonlyArray<CommittedChange>) => void>()
 
-  const copy = (s: State): State => ({ docs: new Map(s.docs), changes: [...s.changes], nextSeq: s.nextSeq })
+  const copy = (s: State): State => ({ docs: new Map(s.docs), nextSeq: s.nextSeq })
 
   const fire = (changes: ReadonlyArray<CommittedChange>) => {
     if (changes.length === 0) return
@@ -137,12 +129,7 @@ export const makeMemoryHouseholdStore = (options: MemoryStoreOptions = {}): Hous
           })
           .slice(0, q.limit)
       }),
-    append: (change) =>
-      Effect.sync(() => {
-        const seq = state.nextSeq++
-        state.changes.push({ ...change, seq, rev: seq, undone: false })
-        return seq
-      }),
+    nextRev: Effect.sync(() => state.nextSeq++),
     put: (doc, expect) =>
       Effect.sync(() => {
         const k = key(doc.module, doc.collection, doc.id)
@@ -158,31 +145,6 @@ export const makeMemoryHouseholdStore = (options: MemoryStoreOptions = {}): Hous
         if (existing === undefined || existing.rev !== expect || !sameScope(existing.scope, scope)) return false
         state.docs.delete(k)
         return true
-      }),
-    lastUndoable: (module, collection, actorKey, scope) =>
-      Effect.sync(() => {
-        for (let i = state.changes.length - 1; i >= 0; i--) {
-          const c = state.changes[i]!
-          if (c.module !== module || c.collection !== collection || c.actorKey !== actorKey || !sameScope(c.scope, scope)) continue
-          if (c.undone || c.undoes !== undefined || c.op === "erase" || c.payload === undefined) continue
-          const { actorKey: _k, ...record } = c
-          return record
-        }
-        return undefined
-      }),
-    markUndone: (seq) =>
-      Effect.sync(() => {
-        state.changes = state.changes.map((c) => (c.seq === seq ? { ...c, undone: true } : c))
-      }),
-    changedSince: (module, collection, id, seq) =>
-      Effect.sync(() => state.changes.some((c) => c.seq > seq && c.module === module && c.collection === collection && c.id === id && !c.undone && c.undoes === undefined)),
-    purge: (module, collection, id, scope) =>
-      Effect.sync(() => {
-        state.changes = state.changes.map((c) => {
-          if (c.module !== module || c.collection !== collection || c.id !== id || !sameScope(c.scope, scope) || c.payload === undefined) return c
-          const { payload: _gone, ...rest } = c
-          return rest
-        })
       }),
     scan: (module, collection, afterId, limit) =>
       Effect.sync(() =>
@@ -203,15 +165,7 @@ export const makeMemoryHouseholdStore = (options: MemoryStoreOptions = {}): Hous
 
   const conversations = {
     docs: (conversationId: string | undefined) =>
-      Effect.sync(() => [...state.docs.values()].filter((d) => d.scope.kind === "conversation" && (conversationId === undefined || d.scope.id === conversationId))),
-    purge: (conversationId: string | undefined, keep: ReadonlyArray<string>) =>
-      Effect.sync(() => {
-        state.changes = state.changes.map((c) => {
-          if (c.scope.kind !== "conversation" || (conversationId !== undefined && c.scope.id !== conversationId) || c.payload === undefined || keep.includes(c.module)) return c
-          const { payload: _gone, ...rest } = c
-          return rest
-        })
-      })
+      Effect.sync(() => [...state.docs.values()].filter((d) => d.scope.kind === "conversation" && (conversationId === undefined || d.scope.id === conversationId)))
   }
 
   const stores = new Map<string, ReturnType<typeof makeModuleStoreOn>>()
@@ -253,8 +207,6 @@ export const makeMemoryHouseholdStore = (options: MemoryStoreOptions = {}): Hous
     return s
   }
 
-  const oldestSeq = () => state.changes[0]?.seq ?? state.nextSeq
-
   return {
     info: { kind: "memory", readOnly },
     prepare: (modules) => Effect.forEach(modules, prepareOne, { discard: true }),
@@ -266,32 +218,14 @@ export const makeMemoryHouseholdStore = (options: MemoryStoreOptions = {}): Hous
       const fail = Effect.fail(new StoreError({ reason: "unavailable", message: "Core SQL needs the SQLite store" }))
       return { prefix: `core_${owner}__`, query: () => fail, run: () => fail, migrate: () => fail }
     },
-    changesSince: (seq, limit) =>
-      tx.statement(Effect.sync(() => {
-        const after = state.changes.filter((c) => c.seq > seq)
-        return {
-          changes: after.slice(0, limit).map(({ actorKey: _k, ...c }) => c),
-          complete: after.length <= limit,
-          oldest: oldestSeq()
-        }
-      })),
     lastSeq: tx.statement(Effect.sync(() => state.nextSeq - 1)),
     endConversation: (conversationId) => (readOnly ? Effect.succeed(0) : endConversationsOn(backend, conversations, conversationId, () => [...verdicts.keys()])),
     sweepConversations: readOnly ? Effect.succeed(0) : endConversationsOn(backend, conversations, undefined, () => [...verdicts.keys()]),
-    pruneChanges: (opts) =>
-      readOnly ? Effect.fail(readOnlyError("pruneChanges")) : tx.transaction(Effect.gen(function*() {
-        const now = opts?.now ?? (yield* Clock.currentTimeMillis)
-        const cut = now - (opts?.maxAgeMs ?? CHANGE_RETENTION_MS)
-        const before = state.changes.length
-        state.changes = state.changes.filter((c) => c.at >= cut)
-        return before - state.changes.length
-      })),
     backup: () => Effect.fail(new StoreError({ reason: "unavailable", message: "The in-memory store has no backups" })),
     onCommit: (listener) => {
       listeners.add(listener)
       return () => listeners.delete(listener)
     },
-    changeLog: () => state.changes.map(({ actorKey: _k, ...c }) => c),
     onRollback: (undo) => Effect.orDie(tx.onRollback(undo))
   }
 }

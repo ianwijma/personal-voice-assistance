@@ -6,10 +6,11 @@
 import { assert, describe, it } from "@effect/vitest"
 import { Deferred, Effect, Exit, Fiber, Schema, type Scope, Stream } from "effect"
 import { connectStoreToBus, defineEventType, type HouseholdEvent, makeEventBus } from "./EventBus.ts"
-import { type FeedProblem, makeHouseholdFeed, SNAPSHOT_PART_CHARS } from "./HouseholdFeed.ts"
+import { type FeedChange, type FeedProblem, feedRowKey, makeHouseholdFeed, SNAPSHOT_PART_CHARS } from "./HouseholdFeed.ts"
 import {
   type Actor,
   type Collection,
+  type CommittedChange,
   defineCollection,
   type HouseholdStore,
   MAX_VALUE_CHARS,
@@ -26,7 +27,6 @@ export const notes = defineCollection({ name: "notes", scope: "household", schem
 export const mine = defineCollection({ name: "mine", scope: "person", schema: Note })
 export const dev = defineCollection({ name: "dev", scope: "device", schema: Note })
 export const chat = defineCollection({ name: "chat", scope: "conversation", schema: Note })
-export const forgettable = defineCollection({ name: "forgettable", scope: "household", schema: Note, history: "none" })
 /** Shown on every page whose device is the row's `tag`; hidden elsewhere. */
 export const shown = defineCollection({
   name: "shown",
@@ -58,7 +58,7 @@ export const constructorCollection = defineCollection({ name: "constructor", sco
 
 export const KIT: { readonly id: string; readonly storage: ModuleStorage } = {
   id: "kit",
-  storage: { collections: [notes, mine, dev, chat, forgettable, shown, loose, broken, constructorCollection] }
+  storage: { collections: [notes, mine, dev, chat, shown, loose, broken, constructorCollection] }
 }
 
 export const turnOf = (over: Partial<TurnContext> = {}): TurnContext => ({
@@ -229,7 +229,7 @@ export const householdStoreContract = (name: string, make: MakeStore) =>
         assert.strictEqual((yield* c.get("x"))?.value.text, "second")
       }).pipe(Effect.scoped))
 
-    it.effect("every write appends one change in the same transaction; a rollback leaves nothing; listeners hear commits only", () =>
+    it.effect("every write takes a new rev from one counter; a rollback leaves nothing; listeners hear commits only", () =>
       Effect.gen(function*() {
         const store = yield* prepared(make)
         const heard: Array<string> = []
@@ -240,17 +240,8 @@ export const householdStoreContract = (name: string, make: MakeStore) =>
         yield* c.update(row.id, (v) => ({ ...v, text: "b" }))
         yield* c.remove(row.id)
         assert.strictEqual(yield* c.remove(row.id), false)
-        const page = yield* store.changesSince(0, 100)
-        assert.deepStrictEqual(page.changes.map((ch) => ch.op), ["insert", "update", "remove"])
-        assert.deepStrictEqual(page.changes.map((ch) => ch.seq), [1, 2, 3])
-        assert.deepStrictEqual(page.changes.map((ch) => ch.rev), [1, 2, 3])
-        assert.strictEqual(new Set(page.changes.map((ch) => ch.opId)).size, 3)
-        assert.deepStrictEqual(page.changes[1]!.payload?.before, { text: "a" })
-        assert.deepStrictEqual(page.changes[1]!.payload?.after, { text: "b" })
-        assert.strictEqual(page.changes[0]!.module, "kit")
-        assert.strictEqual(page.changes[0]!.collection, "notes")
         assert.deepStrictEqual(heard, ["insert:1", "update:2", "remove:3"])
-        // A failing transaction: neither the rows nor the change log nor the listeners see anything of it.
+        // A failing transaction: neither the rows nor the counter nor the listeners see anything of it.
         const failed = yield* Effect.exit(kit.transaction(Effect.gen(function*() {
           yield* c.insert({ text: "x" })
           yield* kit.collection(dev).insert({ text: "y" }, { scope: { kind: "device", id: "kitchen-01" } })
@@ -275,7 +266,7 @@ export const householdStoreContract = (name: string, make: MakeStore) =>
         assert.deepStrictEqual(texts(yield* c.list({ limit: 10 })), ["kept", "p", "q"])
         assert.deepStrictEqual(heard.slice(5), ["insert:6"])
         // Numbers have no holes: the rolled-back changes left none.
-        assert.deepStrictEqual((yield* store.changesSince(0, 100)).changes.map((ch) => ch.seq), [1, 2, 3, 4, 5, 6])
+        assert.strictEqual(yield* store.lastSeq, 6)
       }).pipe(Effect.scoped))
 
     it.effect("transactions: a savepoint that rolls back never takes a sibling's or the parent's write with it", () =>
@@ -385,112 +376,7 @@ export const householdStoreContract = (name: string, make: MakeStore) =>
         yield* Deferred.await(done)
         assert.strictEqual((yield* c.list()).filter((r) => r.value.text === "pong").length, 1)
       }).pipe(Effect.scoped))
-
-    it.effect("undo: the last change of an actor in a collection and scope, insert, update and remove; not someone else's", () =>
-      Effect.gen(function*() {
-        const store = yield* prepared(make)
-        const c = store.forModule("kit").collection(notes)
-        const kitchen = turnOf()
-        const study = turnOf({ deviceId: "study-001" })
-        const row = yield* c.insert({ text: "rice 500" }).pipe(inTurn(kitchen))
-        yield* c.update(row.id, (v) => ({ ...v, text: "rice 250" })).pipe(inTurn(kitchen))
-        // Nothing of the study's to undo.
-        assert.strictEqual(yield* c.undo().pipe(inTurn(study)), undefined)
-        const u1 = yield* c.undo().pipe(inTurn(kitchen))
-        assert.strictEqual(u1?.undid, "update")
-        assert.strictEqual((yield* c.get(row.id))?.value.text, "rice 500")
-        const u2 = yield* c.undo().pipe(inTurn(kitchen))
-        assert.strictEqual(u2?.undid, "insert")
-        assert.strictEqual(yield* c.get(row.id), undefined)
-        assert.strictEqual(yield* c.undo().pipe(inTurn(kitchen)), undefined)
-        // Undo a remove.
-        const other = yield* c.insert({ text: "eggs" }).pipe(inTurn(kitchen))
-        yield* c.remove(other.id).pipe(inTurn(kitchen))
-        const u3 = yield* c.undo().pipe(inTurn(kitchen))
-        assert.strictEqual(u3?.undid, "remove")
-        assert.strictEqual((yield* c.get(other.id))?.value.text, "eggs")
-        // Changed by someone else since: a conflict, nothing undone.
-        const third = yield* c.insert({ text: "bread" }).pipe(inTurn(kitchen))
-        yield* c.update(third.id, (v) => ({ ...v, text: "bread x2" })).pipe(inTurn(study))
-        const conflict = yield* Effect.exit(c.undo().pipe(inTurn(kitchen)))
-        assert.strictEqual(tagOf(failureOf(conflict)), "StoreConflict")
-        assert.strictEqual((yield* c.get(third.id))?.value.text, "bread x2")
-      }).pipe(Effect.scoped))
-
-    it.effect("undo stays in its scope: one actor in two conversations; no person is ScopeUnknown, never someone's row", () =>
-      Effect.gen(function*() {
-        const store = yield* prepared(make)
-        const kit = store.forModule("kit")
-        const one = turnOf({ conversationId: "conv-1" })
-        const two = turnOf({ conversationId: "conv-2" })
-        yield* kit.collection(chat).insert({ text: "in one" }).pipe(inTurn(one))
-        yield* kit.collection(chat).insert({ text: "in two" }).pipe(inTurn(two))
-        const undone = yield* kit.collection(chat).undo().pipe(inTurn(one))
-        assert.strictEqual(undone?.undid, "insert")
-        assert.strictEqual((yield* kit.collection(chat).list().pipe(inTurn(one))).length, 0)
-        assert.deepStrictEqual(texts(yield* kit.collection(chat).list().pipe(inTurn(two))), ["in two"])
-        // The module itself wrote two people's rows; an undo without a person cannot choose one.
-        yield* kit.collection(mine).insert({ text: "sam's" }, { scope: { kind: "person", id: "sam" } })
-        yield* kit.collection(mine).insert({ text: "ann's" }, { scope: { kind: "person", id: "ann" } })
-        const unknown = yield* Effect.exit(kit.collection(mine).undo())
-        assert.strictEqual(tagOf(failureOf(unknown)), "ScopeUnknown")
-        const forSam = yield* kit.collection(mine).undo({ scope: { kind: "person", id: "sam" } })
-        assert.strictEqual(forSam?.undid, "insert")
-        assert.strictEqual((yield* kit.collection(mine).list({ scope: { kind: "person", id: "ann" } })).length, 1)
-      }).pipe(Effect.scoped))
-
-    it.effect("history none: the log says that it changed, without content; no undo", () =>
-      Effect.gen(function*() {
-        const store = yield* prepared(make)
-        const c = store.forModule("kit").collection(forgettable)
-        const row = yield* c.insert({ text: "the wifi is under the router" })
-        yield* c.update(row.id, (v) => ({ ...v, text: "changed" }))
-        const page = yield* store.changesSince(0, 10)
-        assert.deepStrictEqual(page.changes.map((ch) => ch.op), ["insert", "update"])
-        for (const ch of page.changes) assert.strictEqual(ch.payload, undefined)
-        const undo = yield* Effect.exit(c.undo())
-        assert.strictEqual((failureOf(undo) as StoreError).reason, "invalid")
-      }).pipe(Effect.scoped))
-
-    it.effect("erase removes the row and every earlier payload of it; undo skips it", () =>
-      Effect.gen(function*() {
-        const store = yield* prepared(make)
-        const c = store.forModule("kit").collection(notes)
-        const keep = yield* c.insert({ text: "party hats" })
-        const row = yield* c.insert({ text: "sam's surprise party on friday" })
-        yield* c.update(row.id, (v) => ({ ...v, text: "sam's surprise party on saturday" }))
-        assert.isTrue(yield* c.erase(row.id))
-        assert.strictEqual(yield* c.get(row.id), undefined)
-        const page = yield* store.changesSince(0, 10)
-        const ofRow = page.changes.filter((ch) => ch.id === row.id)
-        assert.deepStrictEqual(ofRow.map((ch) => ch.op), ["insert", "update", "erase"])
-        for (const ch of ofRow) assert.strictEqual(ch.payload, undefined)
-        assert.isTrue(JSON.stringify(page.changes).includes("party hats"))
-        assert.isFalse(JSON.stringify(page.changes).includes("surprise"))
-        // The erased row's purged history does not block undo of the earlier row; then nothing is left.
-        assert.strictEqual((yield* c.undo())?.id, keep.id)
-        assert.strictEqual(yield* c.undo(), undefined)
-      }).pipe(Effect.scoped))
-
-    it.effect("erase in another scope touches nothing of the row that belongs elsewhere", () =>
-      Effect.gen(function*() {
-        const store = yield* prepared(make)
-        const c = store.forModule("kit").collection(dev)
-        const kitchen = turnOf()
-        const study = turnOf({ deviceId: "study-001" })
-        const row = yield* c.insert({ text: "kitchen secret" }).pipe(inTurn(kitchen))
-        yield* c.update(row.id, (v) => ({ ...v, text: "kitchen secret, again" })).pipe(inTurn(kitchen))
-        assert.isFalse(yield* c.erase(row.id).pipe(inTurn(study)))
-        assert.strictEqual((yield* c.get(row.id).pipe(inTurn(kitchen)))?.value.text, "kitchen secret, again")
-        const ofRow = (yield* store.changesSince(0, 10)).changes.filter((ch) => ch.id === row.id)
-        assert.isTrue(ofRow.every((ch) => ch.payload !== undefined))
-        // Removed in its own scope earlier, the history there still goes with an erase there.
-        assert.isTrue(yield* c.remove(row.id).pipe(inTurn(kitchen)))
-        assert.isFalse(yield* c.erase(row.id).pipe(inTurn(kitchen)))
-        assert.isFalse(JSON.stringify((yield* store.changesSince(0, 10)).changes).includes("kitchen secret"))
-      }).pipe(Effect.scoped))
-
-    it.effect("a conversation that ends takes its rows and their history; nothing of it can be undone; a sweep at start does the same", () =>
+    it.effect("a conversation that ends takes its rows; a sweep at start does the same", () =>
       Effect.gen(function*() {
         const store = yield* prepared(make)
         const c = store.forModule("kit").collection(chat)
@@ -498,14 +384,11 @@ export const householdStoreContract = (name: string, make: MakeStore) =>
         const removed = yield* c.insert({ text: "removed scratch" }).pipe(inTurn(turn))
         yield* c.remove(removed.id).pipe(inTurn(turn))
         yield* c.insert({ text: "live scratch" }).pipe(inTurn(turn))
+        const heard: Array<CommittedChange> = []
+        store.onCommit((changes) => heard.push(...changes))
         assert.strictEqual(yield* store.endConversation("conv-1"), 1)
-        assert.strictEqual(yield* c.undo().pipe(inTurn(turn)), undefined)
         assert.strictEqual((yield* c.list().pipe(inTurn(turn))).length, 0)
-        const log = (yield* store.changesSince(0, 20)).changes
-        assert.isFalse(JSON.stringify(log).includes("scratch"))
-        const erased = log.filter((ch) => ch.op === "erase")
-        assert.strictEqual(erased.length, 1)
-        assert.deepStrictEqual(erased[0]!.actor, { kind: "system", name: "conversation-ended" })
+        assert.deepStrictEqual(heard.map((ch) => [ch.op, ch.actor]), [["remove", { kind: "system", name: "conversation-ended" }]])
         // Rows of conversations a crash left behind.
         yield* c.insert({ text: "left behind" }).pipe(inTurn(turnOf({ conversationId: "conv-9" })))
         assert.strictEqual(yield* store.sweepConversations, 1)
@@ -526,25 +409,7 @@ export const householdStoreContract = (name: string, make: MakeStore) =>
         assert.strictEqual(yield* store.endConversation("conv-1"), 0)
         yield* store.prepare([{ id: "later", storage: { collections: [v2] } }])
         assert.deepStrictEqual(texts(yield* store.forModule("later").collection(v2).list().pipe(inTurn(turnOf()))), ["kept for the newer module"])
-        assert.isTrue(JSON.stringify((yield* store.changesSince(0, 10)).changes).includes("kept for the newer module"))
       }).pipe(Effect.scoped))
-    it.effect("retention removes changes older than 90 days", () =>
-      Effect.gen(function*() {
-        const store = yield* prepared(make)
-        const c = store.forModule("kit").collection(notes)
-        yield* c.insert({ text: "old" })
-        yield* c.insert({ text: "new" })
-        const page = yield* store.changesSince(0, 10)
-        const at = page.changes[0]!.at
-        assert.strictEqual(yield* store.pruneChanges({ now: at + 89 * 86_400_000 }), 0)
-        assert.strictEqual(yield* store.pruneChanges({ now: at + 91 * 86_400_000 }), 2)
-        assert.strictEqual((yield* store.changesSince(0, 10)).changes.length, 0)
-        // Numbers are never reused.
-        yield* c.insert({ text: "after" })
-        assert.strictEqual(yield* store.lastSeq, 3)
-        assert.strictEqual((yield* store.changesSince(0, 10)).oldest, 3)
-      }).pipe(Effect.scoped))
-
     it.effect("collection versions: rows are migrated at start (indexes follow); a newer version makes the module unavailable everywhere", () =>
       Effect.gen(function*() {
         const v1 = defineCollection({ name: "items", scope: "household", schema: Schema.Struct({ label: Schema.String }), indexes: ["label"] })
@@ -601,7 +466,7 @@ export const householdStoreContract = (name: string, make: MakeStore) =>
         assert.strictEqual((yield* store.forModule("big").collection(v1).get(row.id))?.value.body.length, Math.floor(MAX_VALUE_CHARS * 0.6))
       }).pipe(Effect.scoped))
 
-    it.effect("pages: only committed current rows through the projection; a cursor per page; hidden or erased rows never travel", () =>
+    it.effect("pages: only committed current rows through the projection; a cursor per page; hidden or removed rows never travel", () =>
       Effect.gen(function*() {
         const store = yield* prepared(make)
         const feed = makeHouseholdFeed({ store, modules: [{ moduleId: "kit", collections: KIT.storage.collections ?? [], events: [] }] })
@@ -611,18 +476,27 @@ export const householdStoreContract = (name: string, make: MakeStore) =>
         const shownRows = kit.collection(shown)
         const k = (yield* feed.snapshot(kitchen)).cursor
         const st = (yield* feed.snapshot(study)).cursor
+        // What each page has pending: the rows committed changes touched, coalesced (as `HouseholdPush` keeps them).
+        const pending = new Map<object, Map<string, FeedChange>>([[k, new Map()], [st, new Map()]])
+        store.onCommit((changes) => {
+          for (const p of pending.values()) {
+            for (const c of changes) {
+              const key = feedRowKey(c.module, c.collection, c.id)
+              p.delete(key)
+              p.set(key, { module: c.module, collection: c.collection, id: c.id, scope: c.scope })
+            }
+          }
+        })
         const drain = (device: { id: string }, cursor: typeof k) =>
           Effect.gen(function*() {
-            const out: Array<{ op: string; value?: unknown }> = []
-            for (;;) {
-              const r = yield* feed.catchUp(device, cursor)
-              if (r.kind === "resync") return "resync" as const
-              out.push(...r.events.map((e) => {
-                const d = e.data as { op: string; value?: unknown }
-                return d.op === "put" ? { op: d.op, value: d.value } : { op: d.op }
-              }))
-              if (!r.more) return out
-            }
+            const mine = pending.get(cursor)!
+            const batch = [...mine.values()]
+            mine.clear()
+            const events = yield* feed.catchUp(device, cursor, batch)
+            return events.map((e) => {
+              const d = e.data as { op: string; value?: unknown }
+              return d.op === "put" ? { op: d.op, value: d.value } : { op: d.op }
+            })
           })
         yield* kit.collection(notes).insert({ text: "never sent" })
         const forKitchen = yield* shownRows.insert({ text: "alarm: wake Sam", tag: "kitchen-01" })
@@ -633,11 +507,11 @@ export const householdStoreContract = (name: string, make: MakeStore) =>
         yield* shownRows.update(forKitchen.id, (v) => ({ ...v, text: "alarm: study", tag: "study-001" }))
         assert.deepStrictEqual((yield* drain(kitchen, k)), [{ op: "remove" }])
         assert.deepStrictEqual((yield* drain(study, st)), [{ op: "put", value: { text: "alarm: study" } }])
-        // In one transaction: shown to the kitchen, then hidden from it, then erased. The kitchen hears nothing of it.
+        // In one transaction: shown to the kitchen, then hidden from it, then removed. The kitchen hears nothing of it.
         yield* kit.transaction(Effect.gen(function*() {
           const secret = yield* shownRows.insert({ text: "secret for the kitchen", tag: "kitchen-01" })
           yield* shownRows.update(secret.id, (v) => ({ ...v, tag: "study-001" }))
-          yield* shownRows.erase(secret.id)
+          yield* shownRows.remove(secret.id)
         }))
         assert.deepStrictEqual((yield* drain(kitchen, k)), [])
         assert.deepStrictEqual((yield* drain(study, st)), [])
@@ -650,12 +524,6 @@ export const householdStoreContract = (name: string, make: MakeStore) =>
         const snapK = yield* feed.snapshot(kitchen)
         assert.deepStrictEqual(snapK.parts.flat().map((x) => x.collection), ["shown", "broken"])
         assert.deepStrictEqual(snapK.parts.flat()[0]!.rows.map((r) => r.value), [{ text: "for everyone" }])
-        // A page behind a pruned log is told to take a fresh snapshot.
-        yield* shownRows.insert({ text: "after the page left" })
-        const last = (yield* store.changesSince(0, 1000)).changes.at(-1)!
-        yield* store.pruneChanges({ now: last.at + 1, maxAgeMs: 0 })
-        yield* shownRows.insert({ text: "after the prune" })
-        assert.strictEqual(yield* drain(kitchen, k), "resync")
       }).pipe(Effect.scoped))
 
     it.effect("pages: a snapshot comes in parts that fit a frame, bounded in all; a failing projection hides only its own rows and is reported", () =>

@@ -9,8 +9,8 @@ implements it.
 
 Serve mode keeps one SQLite file, `data/household.db` (WAL, `synchronous = NORMAL`, `secure_delete = ON`, one
 connection, private to the user: `0600` in a `0700` directory). A version 2 module declares its data on the manifest
-(`storage`) and uses it through `ctx.store` in `shared` and in `start`. Every write appends one row to a change log in
-the same transaction; the log feeds the event bus (`ctx.events`), undo and voice pages. Daily backups go to
+(`storage`) and uses it through `ctx.store` in `shared` and in `start`. Every committed write is
+published on the event bus (`ctx.events`) and reaches voice pages that may see it. Daily backups go to
 `data/backups/`.
 
 **Every call is synchronous SQLite on the main thread**, which also frames the browsers' audio. So the store bounds
@@ -33,7 +33,6 @@ export const timers = defineCollection({
   version: 2,                     // raise it when the shape changes (every row is migrated at start) ...
   migrate: { 1: (v1) => ({ ...v1, state: "running" }) },  // ... and say how version n becomes n + 1
   indexes: ["state"],             // fields `list` may filter or order on (one index each; scalar values only)
-  history: "full",                // "none" for content a person may ask to forget (no payloads kept, no undo)
   ambient: (rows: ReadonlyArray<Row<typeof Timer.Type>>, { now }) => [`Timers: ${rows.map(…).join(", ")}.`],
   project: (row, device) => ({ label: row.value.label, dueAt: row.value.dueAt })  // what voice pages may see
 })
@@ -58,8 +57,6 @@ yield* t.get(row.id)                                                            
 yield* t.list({ where: { state: "running" }, limit: 20 })                          // one index, see below
 yield* t.update(row.id, (v) => ({ ...v, dueAt: v.dueAt + 300_000 }))              // read, apply, write: one step
 yield* t.remove(row.id)
-yield* t.erase(row.id)                                                             // and every payload of it
-yield* t.undo()                                                                    // the turn's actor's last change here, in this scope
 yield* ctx.store.transaction(Effect.gen(function*() { … }))                        // all or nothing; events after the commit
 ```
 
@@ -68,8 +65,8 @@ yield* ctx.store.transaction(Effect.gen(function*() { … }))                   
   `{ scope: { kind: "device", id } }`; a scope of the wrong kind is `invalid`. A person-scoped call with no known person
   fails with `ScopeUnknown` (its `message` says so): turn it into a question ("Whose reminder is this?"). It is never
   written to the household instead. Until P5 adds the device's default person, no turn has a person. Rows of a
-  conversation are erased when that conversation ends. Every call works on its scope only: a row of the same id in
-  another scope is invisible to it, and is never changed, erased or undone by it.
+  conversation are removed when that conversation ends. Every call works on its scope only: a row of the same id in
+  another scope is invisible to it, and is never changed or removed by it.
 - **Lists.** Each shape is one index, read in its own order up to `limit` (default 100, at most 1000): no `where`,
   ordered by `updatedAt` (the default, newest first), `createdAt` or a declared index; or `where` on **one** declared
   index, ordered by `updatedAt` or by that field. Other shapes (two filter fields, a filter with another order) are
@@ -83,19 +80,14 @@ yield* ctx.store.transaction(Effect.gen(function*() { … }))                   
   all land. `f` runs inside the store's transaction: keep it a plain function of the value. `expectRev` makes a row at
   another rev a `StoreConflict` (an edit a person made on a screen from an older read). Changes to amounts are still
   best written as deltas ("used 250 g").
-- **Rev** is the change-log number of the row's last write: it changes on every write and is never used twice in a
+- **Rev** is a number from the store's one counter, taken by the row's last write: it changes on every write and is never used twice in a
   household, also not when a row is removed and inserted again with the same id, so an `expectRev` from before a
   removal never matches the new row.
-- **Errors**: `StoreError` (`unavailable`, `read-only`, `invalid`, `refused`, `failed`), `StoreConflict`,
+- **Errors**: `StoreError` (`unavailable`, `read-only`, `invalid`, `failed`), `StoreConflict`,
   `StoreNotFound`, `ScopeUnknown`. A module whose data is `unavailable` (see "Versions") gets `unavailable` from every
   call, also through a handle it got earlier.
 - **Actor.** Every change records who made it (`Actor`: a turn with its device and person, a job, the admin, a tap on
-  a device, the module itself). "The same actor" for undo is the person when known, else the device, else the
-  conversation (`actorKey`). Pass `{ actor }` from jobs and taps.
-- **Undo** reverses the last change of the actor in that collection **and scope** (the turn's, or `{ scope }`; a
-  person-scoped collection with no person is `ScopeUnknown`) that is not undone yet and still has its values (insert →
-  removed, update → previous value, remove → restored). A row someone else changed since is a `StoreConflict`;
-  nothing is undone. An erased row's changes are skipped: the change before them is undone instead.
+  a device, the module itself) as the row's `updatedBy`. Pass `{ actor }` from jobs and taps.
 
 ## Transactions
 
@@ -109,7 +101,7 @@ a transaction inside one is a savepoint. Both stores follow the same model (`pac
    work inside one transaction therefore runs one step at a time.
 3. **A fiber that outlives its transaction** (forked inside it) fails with `StoreError` ("already ended") instead of
    writing outside it.
-4. **Events after the commit, in change-log order.** The data changes and the module events (`ctx.events.publish`)
+4. **Events after the commit, in order.** The data changes and the module events (`ctx.events.publish`)
    of a transaction are published after it commits, in the order they happened, before any later transaction's; a
    savepoint that rolls back drops its events, and an interrupted transaction rolls back.
 
@@ -133,34 +125,23 @@ each collection (`pva_versions`).
   update the assistant or restore a backup made by this version. The file is read read-only to find that out, so it
   is not changed at all (not even switched to WAL).
 
-## Change log, retention and forgetting
+## Removing: what `remove` guarantees
 
-Each write appends to `pva_changes`: a sequence number (also the row's new rev), a globally unique operation id,
-module, collection, scope, row id, operation, the actor, the time, and (for `history: "full"`) the value before and
-after. Changes older than 90 days are removed by the daily maintenance (100 per transaction, a yield between them).
-`history: "none"` keeps only that a change happened.
+There is no change log and no history: a row is its current value, and `remove(id)` deletes it. When it returns
+`true` it has committed that the row is gone (nothing of it can be read or sent to a page) and `secure_delete` has
+overwritten the freed space of the pages it changed. Right after the commit, in the background, the store
+checkpoints the write-ahead log into the file and empties it (`wal_checkpoint(TRUNCATE)`), so the old page images
+leave `household.db-wal`. A reader that still holds an older snapshot (a running backup, a command-line mode beside
+the server) blocks that: the store never waits for it on the event loop; it tries again (after 1 s, doubling, at
+most a minute) until the checkpoint completes; after 10 minutes it is a Health issue. A conversation that ends has
+its rows removed the same way (`endConversation`), and serve mode removes at start the rows of conversations a
+previous run left behind (conversations do not outlive a process).
 
-### Forgetting: what `erase` guarantees
-
-When `erase(id)` returns `true` it has committed that:
-
-- the row is gone, and every change of it **in its scope** has lost its values (the log
-  keeps that a change happened and by whom, without content); nothing of it can be read, undone or sent to a
-  page, and the bus event of the erase carries no content;
-- `secure_delete` has overwritten the freed space of the pages it changed.
-
-Right after the commit, in the background, the store checkpoints the write-ahead log into the file and empties it
-(`wal_checkpoint(TRUNCATE)`), so the old page images leave `household.db-wal` and the overwritten pages reach
-`household.db`. A reader that still holds an older snapshot (a running backup or export, a command-line mode beside
-the server) blocks that: the store never waits for it on the event loop; it tries again (after 1 s, doubling, at most
-a minute) until the checkpoint completes. `SqliteHouseholdStore.erasePendingSince()` says whether one is pending; after
-10 minutes it is a Health issue. A conversation that ends is erased the same way (`endConversation`), and serve mode
-erases at start the rows of conversations a previous run left behind (conversations do not outlive a process).
-
-What `erase` cannot reach: **backups**. An erased item stays in the backups made before it until they are removed
-(see "What is kept how long": 14 days at most), in a second backup directory (`HOUSEHOLD_BACKUP_COPY_DIR`) as long as
-that keeps copies the store has not pruned, and in whatever a disk or file system keeps of overwritten blocks. Say so
-where a person asks to forget something.
+What `remove` cannot reach: **backups**. A removed item stays in the backups made before it until they rotate out
+(see "What is kept how long": 14 days), in a second backup directory (`HOUSEHOLD_BACKUP_COPY_DIR`) as long as that
+keeps copies the store has not pruned, and in whatever a disk or file system keeps of overwritten blocks. Say so
+where a person asks to forget something. A module that offers "undo" keeps what it needs to reverse its own last
+operation itself.
 
 Core services keep their tables in the same file (`HouseholdStore.core("scheduler")`: tables `core_scheduler__*`,
 migrated with `migrate([...])`), and their statements join the transaction they run in, so a module's write and the
@@ -174,7 +155,7 @@ yield* Effect.forkScoped(Stream.runForEach(ctx.events.subscribe({ prefix: "lists
 ```
 
 On the bus: every committed data change (`<module>.<collection>.changed`, with `change`: the decoded row and the value
-it replaced; an erase carries neither), module events, and the host's `host.turn.ended`, `host.device.connected`,
+it replaced), module events, and the host's `host.turn.ended`, `host.device.connected`,
 `host.device.disconnected`, `host.module.state`. A module event published inside a transaction waits for its commit
 and is dropped if it rolls back ("Transactions", rule 4). Publishing never waits; each subscriber has its own queue of
 256 events and a slow one loses the newest events (counted, logged at most once per 10 s). Events are lost at a
@@ -184,7 +165,7 @@ restart: nothing may depend on one for correctness.
 
 Nothing is sent to voice pages by default. A collection opts in with `project(row, device)`, an event type with
 `project(event, device)` (`device`: `{ id, name }`; P5 adds the room and the default person): what that page may see,
-or `undefined`. Only **committed current rows** are ever projected, never a value from the change log or from an
+or `undefined`. Only **committed current rows** are ever projected, never an older value or one from an
 event.
 
 - After every `welcome` (a reconnect too: a page never keeps household rows across connections) the server sends
@@ -192,11 +173,11 @@ event.
   on the last; the page drops what it held on part 0 and applies the rows on the final one), at most the newest 500
   rows read per collection and scope and about 4 million characters in all (`truncated` when rows were left out),
   current to change number `seq`.
-- Then, after each commit, the changes after that number, read from the change log (not from the bus, so nothing is
-  lost to a slow page), coalesced per row: `put` with the row's projection now when the page may see it, `remove`
+- Then, after each commit, the rows it touched, collected from the store's commit listener (not from the bus, so
+  nothing is lost to a slow page), coalesced per row: `put` with the row's projection now when the page may see it, `remove`
   when the page holds the row and may not see it any more (or it is gone), nothing otherwise. A row shown and hidden
-  again within one transaction never reaches a page that may not see it. A page the log can no longer bring up to
-  date (pruned past it) gets a fresh snapshot.
+  again within one transaction never reaches a page that may not see it. A page with more than 2,000 rows pending gets
+  a fresh snapshot instead.
 - A projection that throws or returns something that is not plain JSON (a `BigInt`, a cycle) or more than 64,000
   characters of it hides that row (a page that held it is told `remove`) and is a Health issue of the module; it
   affects nothing else.
@@ -234,7 +215,7 @@ hosted model's prefill, which only a `TurnTrace` of real turns shows (`llmFirstT
 read their data and every write fails with `read-only` ("changes are made by the server"). Without a file, or with
 one that cannot be opened here, they get an empty read-only store. Ambient facts are serve mode only (and
 `bench --live --ambient`). A command-line mode that keeps a read open holds an older snapshot, which delays the
-checkpoint after an erase until it lets go.
+checkpoint after a removal until it lets go.
 
 ## Backups
 
@@ -247,7 +228,7 @@ checkpoint after an erase until it lets go.
 - On demand: `pnpm start household backup` (works while the server runs).
 - `pnpm start doctor` checks that the database opens, passes SQLite's quick check, is not from a newer version, and
   that the last backup is less than 48 hours old. The Health page in serve mode shows the backup checks and a pending
-  erase at every check ("Check again" too; they read only file times); the quick check reads the whole file, so it is
+  removal checkpoint at every check ("Check again" too; they read only file times); the quick check reads the whole file, so it is
   the doctor's alone.
 
 ### What is kept how long
@@ -256,9 +237,8 @@ checkpoint after an erase until it lets go.
 |---|---|---|
 | Daily backups | `data/backups/household-<date>.db`, and the second directory | beyond the newest 14, and when older than 14 days (the newest one is always kept) |
 | Backups before an upgrade | `data/backups/household-<date>-before-<module>.db` | when older than 14 days |
-| Change-log rows (with the values of `history: "full"`) | `pva_changes` | after 90 days |
 
-The server prunes them once a day and after every backup. So 14 days after an erase, the erased item is in no file
+The server prunes them once a day and after every backup. So 14 days after a removal, the removed item is in no file
 the store manages (if the server ran meanwhile).
 
 ### Restoring a backup
@@ -271,8 +251,7 @@ the store manages (if the server ran meanwhile).
 
 ## Latency
 
-`packages/store-sqlite/test/latency.test.ts` on 100,000 rows of about 1 KB (one collection with two indexes,
-and 100,000 change-log rows), on the development machine (shared with other agents), the worst of 30
+`packages/store-sqlite/test/latency.test.ts` on 100,000 rows of about 1 KB (one collection with two indexes), on the development machine (shared with other agents), the worst of 30
 calls each:
 
 | Call | Worst |
@@ -285,9 +264,7 @@ The longest stop of the event loop (a 1 ms timer) while the work ran, with a tur
 | Work | Longest stop |
 |---|---|
 | a backup (own connection, one step on a worker thread) | 4.9 ms |
-| an export of the module (own connection, 500 rows at a time) | 10 ms |
-| pruning 100,000 change-log rows (100 per transaction) | 3.3 ms |
-| an erase and its checkpoint | 2.3 ms |
+| a removal and its checkpoint | 2.3 ms |
 
 The migration of a large collection at start (one transaction, before the server serves) and the doctor's quick
 check read a whole collection or file; neither is on a turn's path.
@@ -298,6 +275,6 @@ check read a whole collection or file; neither is on a turn's path.
 prepares a store for the module and returns `household` for `makeModuleHost({ household })`. The in-memory store runs
 the same collection code and the same transaction model as the SQLite store and answers lists the same
 way (scalar indexes in one order, the same words), so a module tested on it is not surprised by the real store; both
-pass the same contract (`@pva/core/store-contract`: scopes, rev, the change log, undo, erase, transactions with
+pass the same contract (`@pva/core/store-contract`: scopes, rev, removal, transactions with
 savepoints, interruption and escaped fibers, events in order, migrations, pages). Its `onRollback(undo)` lets an
 in-memory table of a test (the scheduler's) join its transactions.

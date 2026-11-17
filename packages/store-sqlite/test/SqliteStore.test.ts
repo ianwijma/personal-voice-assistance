@@ -55,7 +55,7 @@ describe("SQLite household store", () => {
       const issues = yield* householdIssues(dir)
       assert.isUndefined(issues.find((i) => i.severity === "error"))
     }))
-  it.effect("erase leaves no trace of the content in the database files", () =>
+  it.effect("remove leaves no trace of the content in the database files", () =>
     Effect.gen(function*() {
       const dir = tmp()
       const file = join(dir, "household.db")
@@ -66,10 +66,10 @@ describe("SQLite household store", () => {
         const row = yield* c.insert({ text: "zanzibarpassphrase first" })
         yield* c.update(row.id, () => ({ text: "zanzibarpassphrase second" }))
         for (let i = 0; i < 20; i++) yield* c.insert({ text: `filler ${i}` })
-        yield* c.erase(row.id)
+        yield* c.remove(row.id)
       }))
       for (const name of readdirSync(dir).filter((n) => n.startsWith("household.db"))) {
-        assert.isFalse(readFileSync(join(dir, name)).includes("zanzibarpassphrase"), `${name} still holds the erased text`)
+        assert.isFalse(readFileSync(join(dir, name)).includes("zanzibarpassphrase"), `${name} still holds the removed text`)
       }
     }))
 

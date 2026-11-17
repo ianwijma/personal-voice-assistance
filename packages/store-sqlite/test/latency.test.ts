@@ -1,5 +1,5 @@
 // The longest stretch the store holds the event loop (which also frames audio), on a large file: every read a turn can
-// make is one bounded index read; backups, exports, pruning and the checkpoint after an erase run beside turns
+// make is one bounded index read; backups and the checkpoint after a removal run beside turns
 // without a long stop. The numbers are printed (docs/STORING-DATA.md "Latency" quotes them).
 import { assert, describe, it } from "@effect/vitest"
 import { defineCollection } from "@pva/core"
@@ -20,16 +20,14 @@ const fill = (file: string) => {
   const db = new DatabaseSync(file)
   const doc = db.prepare(`INSERT INTO pva_docs (module, collection, id, scope_kind, scope_id, rev, v, value, created_at, updated_at, updated_by)
     VALUES ('big', 'notes', ?, 'household', '', ?, 1, ?, ?, ?, '{"kind":"system","name":"fill"}')`)
-  const change = db.prepare(`INSERT INTO pva_changes (op_id, module, collection, scope_kind, scope_id, row_id, op, actor, actor_key, at, data)
-    VALUES (?, 'big', 'notes', 'household', '', ?, 'insert', '{"kind":"system","name":"fill"}', 'system:fill', ?, ?)`)
   const filler = "lorem ipsum dolor sit amet ".repeat(36)
   db.exec("BEGIN")
   for (let i = 1; i <= ROWS; i++) {
     const text = `${i % 1000 === 0 ? "rarepasta " : ""}note ${i} milk ${filler}`
     const value = JSON.stringify({ state: i % 7 === 0 ? "running" : "done", due: i % 500, text })
-    change.run(`op-${i}`, `n${i}`, 1, JSON.stringify({ v: 1, after: JSON.parse(value) }))
     doc.run(`n${i}`, i, value, i, i)
   }
+  db.prepare("UPDATE pva_meta SET value = ? WHERE key = 'rev'").run(String(ROWS))
   db.exec("COMMIT")
   db.close()
 }
@@ -85,8 +83,7 @@ describe("SQLite store latency on 100,000 rows of ~1 KB", () => {
         results.push(`${name}: worst ${worst.toFixed(2)} ms`)
       }
       const background: Record<string, Effect.Effect<unknown, unknown>> = {
-        "backup (own connection, worker thread)": store.backup(),
-        "prune 100,000 changes (100 per transaction)": store.pruneChanges({ now: 91 * 86_400_000 })
+        "backup (own connection, worker thread)": store.backup()
       }
       let worstBackground = 0
       for (const [name, work] of Object.entries(background)) {
@@ -95,9 +92,9 @@ describe("SQLite store latency on 100,000 rows of ~1 KB", () => {
         worstBackground = Math.max(worstBackground, worst)
         results.push(`${name}: longest stop ${worst.toFixed(1)} ms`)
       }
-      // An erase and its checkpoint (the log holds the pruning's pages).
-      const erase = yield* longestStop(Effect.andThen(c.erase("n100"), store.scrubbed))
-      results.push(`erase + checkpoint: longest stop ${erase.worst.toFixed(1)} ms`)
+      // A removal and its checkpoint.
+      const removal = yield* longestStop(Effect.andThen(c.remove("n100"), store.scrubbed))
+      results.push(`remove + checkpoint: longest stop ${removal.worst.toFixed(1)} ms`)
       console.log(`Household store latency (${ROWS} rows):\n  ${results.join("\n  ")}`)
       // Generous bounds for a shared, loaded runner; the printed numbers are the measurement.
       assert.isBelow(worstRead, 25)

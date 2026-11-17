@@ -1,7 +1,7 @@
 import type { HouseholdChange, HouseholdCollectionRows, HouseholdEventInfo, HouseholdRow } from "@pva/protocol"
 import { Effect } from "effect"
 import type { EventType, HouseholdEvent } from "./EventBus.ts"
-import type { ChangeRecord, Collection, HouseholdStore, Row, ScopeRef, StoreError, TargetDevice } from "./HouseholdStore.ts"
+import type { Collection, HouseholdStore, Row, ScopeRef, StoreError, TargetDevice } from "./HouseholdStore.ts"
 import { MAX_VALUE_CHARS } from "./HouseholdStore.ts"
 
 /**
@@ -9,18 +9,17 @@ import { MAX_VALUE_CHARS } from "./HouseholdStore.ts"
  *
  * Nothing is sent by default. A collection opts in with `project(row, device)` and an event type with
  * `project(event, device)`: what a page on that device may see, or `undefined` for nothing. Only **committed current
- * state** is ever projected, never a value from the change log or from an event:
+ * state** is ever projected, never a value from an event:
  *
  * - **Snapshot** (`snapshot`) after every `welcome`, also after a reconnect: every visible row now, projected, in parts
  *   that each fit one text frame (`SNAPSHOT_PART_CHARS`), at most `SNAPSHOT_ROWS` rows per collection and
- *   `SNAPSHOT_MAX_CHARS` in all (`truncated` says when rows were left out). It comes with a cursor: the change number
- *   it is current to and the rows the page now holds.
- * - **Changes** (`catchUp`): the change log after the cursor, a page of `CATCH_UP_CHANGES` at a time, read from the
- *   store (not from the bus, which may drop), coalesced per row; for each row its current value through the
- *   projection: `put` when the page may see it, `remove` when it may not but the page holds it, nothing otherwise.
- *   When the log no longer has what the page missed (pruned), the answer is `resync`: send a fresh snapshot.
- * - **Module events** (`live`): an event type's projection, for the events a module publishes (they are not in the
- *   log, and are lost to a page that is not connected).
+ *   `SNAPSHOT_MAX_CHARS` in all (`truncated` says when rows were left out). It comes with a cursor: the rows the page now
+ *   holds.
+ * - **Changes** (`catchUp`): the rows committed changes touched (coalesced per row by the caller, from the store's
+ *   commit listener), each read as it is now and passed through the projection: `put` when the page may see it,
+ *   `remove` when it may not but the page holds it, nothing otherwise.
+ * - **Module events** (`live`): an event type's projection, for the events a module publishes (they are lost to a
+ *   page that is not connected).
  *
  * A projection that throws, returns something that is not plain JSON or more than `MAX_VALUE_CHARS` of it, is
  * treated as "not visible" for that row or event (so a page loses the row rather than keeping a stale one) and
@@ -62,8 +61,8 @@ export const SNAPSHOT_ROWS = 500
 export const SNAPSHOT_PART_CHARS = 256_000
 /** The most characters of rows in one whole snapshot; collections past it are `truncated`. */
 export const SNAPSHOT_MAX_CHARS = 4_000_000
-/** The changes read per `catchUp` call. */
-export const CATCH_UP_CHANGES = 50
+/** The most rows `catchUp` reads in one call; the caller resynchronises a page with more pending. */
+export const CATCH_UP_ROWS = 200
 
 /** A projection that failed (`report`). */
 export interface FeedProblem {
@@ -73,15 +72,21 @@ export interface FeedProblem {
   readonly message: string
 }
 
-/** Where a page is: the change number it is current to, and the rows (`module/collection/id`) it holds. */
+/** Where a page is: the rows (`module/collection/id`) it holds. */
 export interface FeedCursor {
-  seq: number
   readonly visible: Set<string>
 }
 
-export type CatchUp =
-  | { readonly kind: "changes"; readonly events: ReadonlyArray<HouseholdEventInfo>; readonly more: boolean }
-  | { readonly kind: "resync" }
+/** A row a committed change touched (`CommittedChange`): which one, and in which scope. */
+export interface FeedChange {
+  readonly module: string
+  readonly collection: string
+  readonly id: string
+  readonly scope: ScopeRef
+}
+
+/** The key of a row in `FeedCursor.visible` and in the caller's pending set. */
+export const feedRowKey = (module: string, collection: string, id: string) => `${module}/${collection}/${id}`
 
 export interface Snapshot {
   readonly seq: number
@@ -94,8 +99,8 @@ export interface HouseholdFeed {
   /** Whether any collection or event type is sent to pages (nothing to do otherwise). */
   readonly active: boolean
   readonly snapshot: (device: TargetDevice) => Effect.Effect<Snapshot, StoreError>
-  /** The changes after `cursor.seq` as `device` may see them now; advances the cursor. */
-  readonly catchUp: (device: TargetDevice, cursor: FeedCursor) => Effect.Effect<CatchUp, StoreError>
+  /** The rows `changed` touched, as `device` may see them now (at most `CATCH_UP_ROWS`); updates the cursor. */
+  readonly catchUp: (device: TargetDevice, cursor: FeedCursor, changed: ReadonlyArray<FeedChange>) => Effect.Effect<ReadonlyArray<HouseholdEventInfo>, StoreError>
   /** What `device` gets of a module event now, or `undefined`. Data changes are not delivered from the bus (`catchUp`). */
   readonly live: (event: HouseholdEvent, device: TargetDevice) => HouseholdEventInfo | undefined
 }
@@ -132,7 +137,7 @@ export const projectRow = (collection: Collection<any>, row: Row<unknown> | unde
   return p.visible ? p.value : undefined
 }
 
-const rowKey = (module: string, collection: string, id: string) => `${module}/${collection}/${id}`
+const rowKey = feedRowKey
 
 export const makeHouseholdFeed = (options: {
   readonly store: HouseholdStore
@@ -190,7 +195,7 @@ export const makeHouseholdFeed = (options: {
     Effect.gen(function*() {
       // The number first: a change committed while the rows are read comes again from `catchUp` (a `put` again is harmless).
       const seq = yield* store.lastSeq
-      const cursor: FeedCursor = { seq, visible: new Set() }
+      const cursor: FeedCursor = { visible: new Set() }
       const parts: Array<Array<HouseholdCollectionRows>> = [[]]
       let partChars = 0
       let total = 0
@@ -235,39 +240,28 @@ export const makeHouseholdFeed = (options: {
       return { seq, parts, cursor } satisfies Snapshot
     })
 
-  const catchUp = (device: TargetDevice, cursor: FeedCursor) =>
+  const catchUp = (device: TargetDevice, cursor: FeedCursor, changed: ReadonlyArray<FeedChange>) =>
     Effect.gen(function*() {
-      const page = yield* store.changesSince(cursor.seq, CATCH_UP_CHANGES)
-      if (page.changes.length === 0) return { kind: "changes", events: [], more: false } satisfies CatchUp
-      // The page missed changes the log no longer has (pruned), or numbers it never saw (another database): resync.
-      if (page.oldest > cursor.seq + 1 || page.changes[0]!.seq !== cursor.seq + 1) return { kind: "resync" } satisfies CatchUp
-      // One entry per row, in the order of its last change.
-      const rows = new Map<string, ChangeRecord>()
-      for (const change of page.changes) {
-        const key = rowKey(change.module, change.collection, change.id)
-        rows.delete(key)
-        rows.set(key, change)
-      }
       const events: Array<HouseholdEventInfo> = []
-      for (const [key, change] of rows) {
+      for (const change of changed.slice(0, CATCH_UP_ROWS)) {
+        const key = rowKey(change.module, change.collection, change.id)
         const collection = collections.get(`${change.module}/${change.collection}`)
         if (collection === undefined || !usable(change.module)) continue
         const now = yield* Effect.result(store.forModule(change.module).collection(collection).get(change.id, { scope: change.scope }))
         if (now._tag === "Failure" && now.failure._tag !== "ScopeUnknown") report(change.module, collection.name, `row ${change.id} could not be read for a page: ${now.failure.message}`)
         const row = now._tag === "Success" ? now.success : undefined
         const p = projectFor(change.module, collection, row, device)
-        const base = { seq: change.seq, at: change.at, module: change.module, type: `${change.module}.${change.collection}.changed` }
+        const base = { at: row?.updatedAt ?? Date.now(), module: change.module, type: `${change.module}.${change.collection}.changed` }
         if (p.visible) {
           cursor.visible.add(key)
           const data: HouseholdChange = { collection: collection.name, id: change.id, op: "put", rev: row!.rev, value: p.value }
-          events.push({ ...base, scope: row!.scope, data })
+          events.push({ ...base, seq: row!.rev, scope: row!.scope, data })
         } else if (cursor.visible.delete(key)) {
-          const data: HouseholdChange = { collection: collection.name, id: change.id, op: "remove", rev: change.rev }
+          const data: HouseholdChange = { collection: collection.name, id: change.id, op: "remove", rev: 0 }
           events.push({ ...base, scope: change.scope, data })
         }
       }
-      cursor.seq = page.changes[page.changes.length - 1]!.seq
-      return { kind: "changes", events, more: !page.complete } satisfies CatchUp
+      return events as ReadonlyArray<HouseholdEventInfo>
     })
 
   return { active: collections.size > 0 || eventTypes.size > 0, snapshot, catchUp, live }

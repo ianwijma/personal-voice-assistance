@@ -11,7 +11,7 @@ import { CurrentTurn, type TurnContext, type TurnSource } from "./TurnContext.ts
  * - **Document collections** (`defineCollection`): JSON rows validated by a Schema, each with an id, a `rev`, a scope
  *   and who changed it last; one equality filter, ordering and a limit, each list read bound to one index by
  *   construction. A collection whose version rises is migrated whole, at start, in
- *   one transaction after a backup. Every write appends one change-log row in the same transaction.
+ *   one transaction after a backup. Every write gives the row a new `rev`.
  * - **Transactions** span a module's collections (`ModuleStore.transaction`); core services (scheduler,
  *   notifications) join the same transaction with their own tables (`HouseholdStore.core`). The model, shared by both
  *   stores, is in `StoreTransactions.ts`.
@@ -69,27 +69,6 @@ export const actorOfTurn = (turn: TurnContext): Actor => ({
   ...(turn.deviceId !== undefined ? { deviceId: turn.deviceId } : {}),
   ...(turn.person !== undefined ? { personId: turn.person.id } : {})
 })
-
-/**
- * Who "the same actor" is for undo: a person when one is known, else the device (a voice turn and a tap on the same
- * device are one actor), else the conversation; a job, the admin, a module, a system task by their ids.
- */
-export const actorKey = (actor: Actor): string => {
-  switch (actor.kind) {
-    case "turn":
-      return actor.personId !== undefined ? `person:${actor.personId}` : actor.deviceId !== undefined ? `device:${actor.deviceId}` : `conversation:${actor.conversationId}`
-    case "ui":
-      return `device:${actor.deviceId}`
-    case "job":
-      return `job:${actor.jobId}`
-    case "admin":
-      return "admin"
-    case "module":
-      return `module:${actor.moduleId}`
-    case "system":
-      return `system:${actor.name}`
-  }
-}
 
 /** The actor of a call: the one given, else the turn's (`CurrentTurn`), else the module itself. */
 export const currentActor = (moduleId: string, given?: Actor): Effect.Effect<Actor> =>
@@ -227,8 +206,6 @@ export interface Collection<A> {
    * `invalid`), so both stores order and compare them the same way (`compareIndexed`).
    */
   readonly indexes: ReadonlyArray<string>
-  /** `full`: the change log keeps each change's values (undo works). `none`: only that it happened (no undo). */
-  readonly history: "full" | "none"
   /** Lines for the per-turn household facts (shared-state §7), from the rows the turn's device and person see. */
   readonly ambient?: (rows: ReadonlyArray<Row<A>>, context: AmbientContext) => string | ReadonlyArray<string> | undefined
   /** How many rows (newest first) per scope the ambient lines are made from. Default 20. */
@@ -253,7 +230,6 @@ export const defineCollection = <A>(definition: {
   readonly version?: number
   readonly migrate?: Readonly<Record<number, (value: any) => unknown>>
   readonly indexes?: ReadonlyArray<string>
-  readonly history?: "full" | "none"
   readonly ambient?: Collection<A>["ambient"]
   readonly ambientRows?: number
   readonly project?: Collection<A>["project"]
@@ -279,7 +255,6 @@ export const defineCollection = <A>(definition: {
     version,
     migrate: definition.migrate ?? {},
     indexes: definition.indexes ?? [],
-    history: definition.history ?? "full",
     ...(definition.ambient !== undefined ? { ambient: definition.ambient } : {}),
     ambientRows,
     ...(definition.project !== undefined ? { project: definition.project } : {})
@@ -333,15 +308,8 @@ export interface ListQuery<A> extends ScopeOptions {
   readonly limit?: number
 }
 
-/** What `undo` reversed: the change it undid, and the row as it is now (`undefined` when the undo removed it). */
-export interface UndoResult<A> {
-  readonly undid: "insert" | "update" | "remove"
-  readonly id: string
-  readonly row: Row<A> | undefined
-}
-
 /**
- * One collection of a module. `rev` is the change-log number of the row's last write: it changes on every write and is
+ * One collection of a module. `rev` is a number from one counter of the store: it changes on every write and is
  * never used twice in a household, also not by a row that was removed and inserted again with the same id, so an
  * `expectRev` from before a removal never matches the new row.
  */
@@ -360,23 +328,11 @@ export interface CollectionHandle<A> {
     f: (value: A) => A,
     options?: WriteOptions & { readonly expectRev?: number }
   ) => Effect.Effect<Row<A>, StoreError | StoreConflict | StoreNotFound | ScopeUnknown>
-  /** `false` when there was no such row. */
+  /**
+   * Delete the row. `false` when there was no such row in the scope. Its content is overwritten in `household.db`
+   * and its write-ahead log soon after (docs/STORING-DATA.md "Removing"); only backups keep it, until they rotate out.
+   */
   readonly remove: (id: string, options?: WriteOptions & { readonly expectRev?: number }) => Effect.Effect<boolean, StoreError | StoreConflict | ScopeUnknown>
-  /**
-   * Forget the row: remove it and every payload of it in this scope (its values in the change log, which keeps only
-   * that a change happened), committed when this returns. Afterwards the old content is
-   * overwritten in `household.db` and the write-ahead log is emptied (a checkpoint, retried while a reader such as a
-   * running backup still holds an older snapshot; docs/STORING-DATA.md "Forgetting" says what it cannot reach:
-   * backups until they rotate out, 14 days). `false`: there is no such row in this scope (its history in this scope is
-   * purged all the same; another scope's row of that id is never touched).
-   */
-  readonly erase: (id: string, options?: WriteOptions) => Effect.Effect<boolean, StoreError | ScopeUnknown>
-  /**
-   * Undo the last change the actor (default: the turn's) made in this collection **in this scope** (default: the
-   * turn's, as every other call) that is not already undone and still has its values. A row changed by someone else
-   * since is a `StoreConflict`. `undefined`: nothing to undo. Never for `history: "none"`.
-   */
-  readonly undo: (options?: ScopeOptions & { readonly actor?: Actor }) => Effect.Effect<UndoResult<A> | undefined, StoreError | StoreConflict | ScopeUnknown>
 }
 
 /** `ctx.store`: a module's data, shared by all its instances and its `shared` part. */
@@ -389,7 +345,7 @@ export interface ModuleStore {
   /**
    * Run `work` in one transaction (nested calls are savepoints): every collection write in it
    * commits or rolls back together, and its events (data changes and `ctx.events.publish`) are published only after
-   * the commit, in change-log order. Concurrent work inside one transaction runs one savepoint at a time. A fiber
+   * the commit, in the order they happened. Concurrent work inside one transaction runs one savepoint at a time. A fiber
    * forked inside that outlives it fails with `StoreError`. No network calls inside: the transaction holds the
    * database's one connection.
    */
@@ -399,12 +355,12 @@ export interface ModuleStore {
 // ---------------------------------------------------------------------------------------------------------------------
 // The host's view
 
-export type ChangeOp = "insert" | "update" | "remove" | "erase"
+export type ChangeOp = "insert" | "update" | "remove"
 
 /** A committed change, as the bus receives it (values decoded; `before` is the value it replaced). */
 export interface CommittedChange {
+  /** The `rev` this write gave the row (for a removal: a new number too). */
   readonly seq: number
-  readonly opId: string
   readonly at: number
   readonly module: string
   readonly collection: string
@@ -415,24 +371,6 @@ export interface CommittedChange {
   readonly actor: Actor
   readonly row?: Row<unknown>
   readonly before?: Row<unknown>
-}
-
-/** One change-log row as read back (`changesSince`). Payloads are absent for `history: "none"` and erased rows. */
-export interface ChangeRecord {
-  readonly seq: number
-  readonly opId: string
-  readonly at: number
-  readonly module: string
-  readonly collection: string
-  readonly id: string
-  readonly op: ChangeOp
-  readonly rev: number
-  readonly scope: ScopeRef
-  readonly actor: Actor
-  /** The version the payloads were written at, and the values before and after (JSON form). */
-  readonly payload?: { readonly v: number; readonly before?: unknown; readonly after?: unknown }
-  readonly undoes?: string
-  readonly undone: boolean
 }
 
 /** A value bound to a `?` of core SQL. */
@@ -481,18 +419,15 @@ export interface HouseholdStore {
   readonly afterCommit: (f: () => void) => Effect.Effect<void, StoreError>
   /** A core service's own tables (P6 scheduler, P9 notifications). */
   readonly core: (owner: string) => CoreSql
-  /** The change log after `seq`, oldest first, at most `limit`; `complete`: nothing after these. */
-  readonly changesSince: (seq: number, limit: number) => Effect.Effect<{ readonly changes: ReadonlyArray<ChangeRecord>; readonly complete: boolean; readonly oldest: number }, StoreError>
-  /** The change log's last number (0 when empty). */
+  /** The last number the store's counter gave out (0 when none). */
   readonly lastSeq: Effect.Effect<number, StoreError>
   /**
-   * A conversation ended: erase every row of its scope (as `erase` does: rows and payloads in the change log; one `erase` change per row, by `system:conversation-ended`), in one transaction. Returns how many.
+   * A conversation ended: remove every row of its scope (one `remove` change per row, by `system:conversation-ended`),
+   * in one transaction. Returns how many.
    */
   readonly endConversation: (conversationId: string) => Effect.Effect<number, StoreError>
   /** At start, before any conversation: the same for every conversation-scoped row (conversations do not outlive a process). */
   readonly sweepConversations: Effect.Effect<number, StoreError>
-  /** Retention: delete change-log rows older than `maxAgeMs` (default 90 days), in small batches. */
-  readonly pruneChanges: (options?: { readonly now?: number; readonly maxAgeMs?: number }) => Effect.Effect<number, StoreError>
   /** An online backup to `<dir>/household-<date>.db` (see docs/STORING-DATA.md "Backups" for what is kept how long). */
   readonly backup: (options?: { readonly now?: number }) => Effect.Effect<{ readonly path: string }, StoreError>
   /** Called after each commit with what it committed, in order (the event bus). Returns an unsubscribe function. */
@@ -506,7 +441,6 @@ export const DEFAULT_LIST_LIMIT = 100
 export const MAX_LIST_LIMIT = 1000
 /** The largest value a row may hold, as JSON. */
 export const MAX_VALUE_CHARS = 64_000
-export const CHANGE_RETENTION_MS = 90 * 24 * 60 * 60 * 1000
 
 const ID = /^[A-Za-z0-9_.:-]{1,200}$/
 
@@ -596,7 +530,7 @@ const badIndexedField = (collection: Collection<any>, json: unknown): string | u
 /**
  * A stored value (JSON form, written at version `v`) as the collection's type now: migrated forward one version at a
  * time, then decoded (`migrated`: the JSON form at the current version, when it was older). Used for rows when their
- * collection is migrated at start, and for change-log payloads of older versions (undo). A newer value is refused.
+ * collection is migrated at start. A newer value is refused.
  */
 export const decodeStored = <A>(
   collection: Collection<A>,
@@ -668,9 +602,7 @@ export const makeClosedStore = (reason: string): HouseholdStore => {
     list: () => fail,
     insert: () => fail,
     update: () => fail,
-    remove: () => fail,
-    erase: () => fail,
-    undo: () => fail
+    remove: () => fail
   }
   return {
     info: { kind: "closed", readOnly: true },
@@ -685,11 +617,9 @@ export const makeClosedStore = (reason: string): HouseholdStore => {
     transaction: (work) => work,
     afterCommit: (f) => Effect.sync(f),
     core: (owner) => ({ prefix: `core_${owner}__`, query: () => fail, run: () => fail, migrate: () => fail }),
-    changesSince: () => Effect.succeed({ changes: [], complete: true, oldest: 0 }),
     lastSeq: Effect.succeed(0),
     endConversation: () => Effect.succeed(0),
     sweepConversations: Effect.succeed(0),
-    pruneChanges: () => Effect.succeed(0),
     backup: () => fail,
     onCommit: () => () => {}
   }

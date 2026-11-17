@@ -345,14 +345,13 @@ ModuleHostApi = {
 ```ts
 defineModule({ apiVersion: 2, storage?: { collections?: [Collection] }, events?: [EventType], … })
 defineCollection({ name, scope: "household" | "person" | "assistant" | "device" | "conversation", schema, version?, migrate?,
-                   indexes?, history?: "full" | "none", ambient?(rows, { now, turn }), ambientRows?, project?(row, device) })
+                   indexes?, ambient?(rows, { now, turn }), ambientRows?, project?(row, device) })
 ModuleStore (ctx.store) = { collection(c): CollectionHandle<A>; transaction(work); readOnly }
 CollectionHandle<A> = { get(id, { scope? }); list({ scope?, where?, orderBy?, limit? });
-                        insert(value, { id?, scope?, actor? }); update(id, f, { expectRev?, scope?, actor? }); remove(id, …);
-                        erase(id, …); undo({ scope?, actor? }) }      // Row<A> = { id, rev, scope, value, createdAt, updatedAt, updatedBy: Actor }
+                        insert(value, { id?, scope?, actor? }); update(id, f, { expectRev?, scope?, actor? }); remove(id, …) }      // Row<A> = { id, rev, scope, value, createdAt, updatedAt, updatedBy: Actor }
 ModuleEvents (ctx.events) = { publish(type, data, scope?): Effect<void>; subscribe(filter?): Stream<HouseholdEvent> }
 HouseholdStore (host) = { prepare(modules); availability(id); forModule(id); transaction; afterCommit(f); core(owner): CoreSql;
-                          changesSince; lastSeq; endConversation; sweepConversations; pruneChanges; backup; onCommit }
+                          lastSeq; endConversation; sweepConversations; backup; onCommit }
 EventBus = { publish(event); subscribe(filter?, { capacity? }); stats(); forModule(id); connect(store) }
 HouseholdFeed = { active; snapshot(device): { seq, parts, cursor }; catchUp(device, cursor): changes | resync; live(moduleEvent, device) }
 ```
@@ -362,7 +361,7 @@ HouseholdFeed = { active; snapshot(device): { seq, parts, cursor }; catchUp(devi
   `synchronous = NORMAL`, `secure_delete = ON`, one connection. Calls are synchronous on the main thread, which also
   frames audio, so every read a turn can make is bounded by construction: a `list` is one named index (`INDEXED BY`)
   read in its own order up to its limit (other shapes are `invalid`), indexed fields are scalars. Backups and exports read through a connection of their own (backups in one step on a worker thread),
-  retention deletes 100 changes per transaction, the checkpoint after an erase runs in the background and never waits
+  the checkpoint after a removal runs in the background and never waits
   for a reader; the longest stop measured on 100,000 rows is 10 ms (docs/STORING-DATA.md "Latency"). Serve mode opens
   the file read-write after the writer lock (a newer file is refused after a read-only look, untouched); the CLI modes
   read-only (writes fail `read-only`); node's `ExperimentalWarning` for `node:sqlite`, and only that text, is filtered
@@ -372,13 +371,9 @@ HouseholdFeed = { active; snapshot(device): { seq, parts, cursor }; catchUp(devi
   parent's mutex, so its rollback never takes a sibling's or the parent's write); a fiber that outlives its
   transaction is refused; data changes and module events go into the frame's outbox and are released after the
   outermost commit, under the lock, in change-log order; `onRollback` hooks for state outside the backend.
-- **Scopes** come from `CurrentTurn` or are passed; every row operation, undo and erase included, carries its scope;
+- **Scopes** come from `CurrentTurn` or are passed; every row operation carries its scope;
   a person-scoped call with no known person is `ScopeUnknown`, never a household write. Conversation-scoped rows are
-  erased when the conversation ends (`SessionConversation`), and at serve start for conversations of a previous run.
-- **Change log** (`pva_changes`): one row per write in the same transaction (seq, which is also the row's rev, op id,
-  module, collection, scope, row id, op, actor, time, the values before and after unless `history: "none"`); 90 days
-  kept; `undo` per actor, collection and scope; `erase` removes a row with every payload of it in its scope, then checkpoints the log (retried while a reader holds an older snapshot). What is kept how long and
-  what an erase cannot reach (backups, 14 days): docs/STORING-DATA.md "Forgetting".
+  removed when the conversation ends (`SessionConversation`), and at serve start for conversations of a previous run.
 - **Versions**: `prepare` (before the module host is made) migrates a collection whose version rose eagerly (every row
   through the write checks, its indexes), in one transaction after a
   backup; a failure leaves the data and makes the module `unavailable`; a module whose stored data is newer is
@@ -400,7 +395,7 @@ HouseholdFeed = { active; snapshot(device): { seq, parts, cursor }; catchUp(devi
 - **Backups**: daily `data/backups/household-<date>.db` (optional `HOUSEHOLD_BACKUP_COPY_DIR`), each through its own
   temporary file and one `rename`; every archive (daily, pre-upgrade) removed after 14 days; `pnpm start household
   backup`; restoring is a manual step with the server stopped (docs/STORING-DATA.md); `doctor` checks the database and the last backup's age, the Health
-  page the backup's age and a pending erase.
+  page the backup's age and a pending removal checkpoint.
 
 Adding a feature = one new file exporting `defineModule({...})` + one line in `moduleCatalog` in `apps/assistant/src/modules.ts`. Adding a provider = one new package implementing a core interface + one line in `apps/assistant/src/providers.ts`. Adding a voice provider = an adapter with `layerConfig` (`Tts`) and `makeVoices` (`TtsVoices`), and one entry in `ttsProviders`, `ttsProviderInfo` and (hosted) `hostedTtsVoices` in `providers.ts`. A voice needs no code: it is chosen by its key.
 

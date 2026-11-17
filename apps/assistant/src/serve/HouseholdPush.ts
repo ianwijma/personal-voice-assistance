@@ -1,4 +1,4 @@
-import { type EventBus, type FeedCursor, type HouseholdFeed, type HouseholdStore, hostEvent, type TargetDevice } from "@pva/core"
+import { CATCH_UP_ROWS, type EventBus, type FeedChange, type FeedCursor, feedRowKey, type HouseholdFeed, type HouseholdStore, hostEvent, type TargetDevice } from "@pva/core"
 import type { ServerMessage } from "@pva/protocol"
 import { Deferred, Effect, type Scope, Stream } from "effect"
 import type { HouseholdHooks, VoiceConnection } from "./SessionHub.ts"
@@ -8,15 +8,18 @@ import type { HouseholdHooks, VoiceConnection } from "./SessionHub.ts"
  * its own fiber:
  *
  * 1. after `hello` (every time, a reconnect too) a fresh snapshot (`household.snapshot`, in parts), with a cursor;
- * 2. then, whenever a commit wakes it, the change log after its cursor (`feed.catchUp`): current rows through the
- *    projections, a page of changes at a time, until it is current. The log is read from the store, so nothing is
- *    lost to a slow page; a page the log cannot bring up to date (pruned past it, or `resync`) gets a fresh snapshot.
+ * 2. then the rows that commits touched since (`feed.catchUp`), coalesced per row: each read as it is now and passed
+ *    through the projections. They are collected from the store's commit listener (not from the bus, which may drop),
+ *    so nothing is lost to a slow page; a page with more than it can catch up on gets a fresh snapshot instead.
  *
  * A connection that fails (its send throws, its projection throws) affects only itself; a store error is logged and
  * the connection starts again from a snapshot after a second. Module events (not data) come from the bus, which
  * drops for a slow subscriber; they are sent to every connection whose device the type's projection lets see them.
  * Also publishes the hub's device events on the bus.
  */
+/** The most rows a page may have pending before it is given a fresh snapshot instead. */
+const PENDING_ROWS = 2000
+
 export const makeHouseholdPush = (options: {
   readonly feed: HouseholdFeed
   readonly bus: EventBus
@@ -31,6 +34,8 @@ export const makeHouseholdPush = (options: {
     readonly connection: VoiceConnection
     /** A commit happened since the follower last looked; `signal` wakes it. */
     dirty: boolean
+    /** The rows committed changes touched since it last caught up, in the order of their last change. */
+    pending: Map<string, FeedChange>
     signal: Deferred.Deferred<void>
     readonly closed: Deferred.Deferred<void>
     /** Set by `resync`: start again from a snapshot. */
@@ -71,26 +76,25 @@ export const makeHouseholdPush = (options: {
       const device: TargetDevice = f.connection.device
       for (;;) {
         f.fresh = false
+        f.pending.clear()
         const snap = yield* feed.snapshot(device)
         for (const [part, collections] of snap.parts.entries()) {
           if (!send(f, { type: "household.snapshot", seq: snap.seq, part, final: part === snap.parts.length - 1, collections: [...collections] })) return
           yield* Effect.yieldNow
         }
         const cursor: FeedCursor = snap.cursor
-        // A commit between the snapshot's read and here has already offered a wake-up; start by catching up.
-        let resync = false
-        while (!resync) {
-          const r = yield* feed.catchUp(device, cursor)
-          if (r.kind === "resync") {
-            resync = true
-            break
+        // A commit between the snapshot's read and here is in `pending` already; start by catching up.
+        for (;;) {
+          if (f.fresh) break
+          if (f.pending.size > 0) {
+            const batch = [...f.pending.values()].slice(0, CATCH_UP_ROWS)
+            for (const c of batch) f.pending.delete(feedRowKey(c.module, c.collection, c.id))
+            const events = yield* feed.catchUp(device, cursor, batch)
+            for (const event of events) if (!send(f, { type: "household.event", event })) return
+            yield* Effect.yieldNow
+            continue
           }
-          for (const event of r.events) if (!send(f, { type: "household.event", event })) return
-          if (r.events.length > 0) yield* Effect.yieldNow
-          if (r.more) continue
-          if (f.fresh) break
           yield* waitForWake(f)
-          if (f.fresh) break
         }
       }
     }).pipe(
@@ -108,7 +112,7 @@ export const makeHouseholdPush = (options: {
       if (!feed.active) return
       const previous = followers.get(connection.id)
       if (previous !== undefined) Deferred.doneUnsafe(previous.closed, Effect.void)
-      const f: Follower = { connection, dirty: false, signal: Deferred.makeUnsafe<void>(), closed: Deferred.makeUnsafe<void>(), fresh: false }
+      const f: Follower = { connection, dirty: false, pending: new Map(), signal: Deferred.makeUnsafe<void>(), closed: Deferred.makeUnsafe<void>(), fresh: false }
       followers.set(connection.id, f)
       options.run(Effect.raceFirst(follow(f), Deferred.await(f.closed)).pipe(
         Effect.ensuring(Effect.sync(() => {
@@ -136,8 +140,20 @@ export const makeHouseholdPush = (options: {
   /** Wake every follower after each commit, and forward module events, until the scope closes. */
   const forward: Effect.Effect<void, never, Scope.Scope> = feed.active
     ? Effect.gen(function*() {
-      const off = store.onCommit(() => {
-        for (const f of followers.values()) wake(f)
+      const off = store.onCommit((changes) => {
+        for (const f of followers.values()) {
+          for (const c of changes) {
+            const key = feedRowKey(c.module, c.collection, c.id)
+            f.pending.delete(key)
+            f.pending.set(key, { module: c.module, collection: c.collection, id: c.id, scope: c.scope })
+          }
+          // Too much to catch up on: a fresh snapshot is cheaper and bounded.
+          if (f.pending.size > PENDING_ROWS) {
+            f.pending.clear()
+            f.fresh = true
+          }
+          wake(f)
+        }
       })
       yield* Effect.addFinalizer(() => Effect.sync(off))
       yield* Effect.forkScoped(Stream.runForEach(bus.subscribe(undefined, { capacity: 1024, name: "voice pages" }), (event) =>

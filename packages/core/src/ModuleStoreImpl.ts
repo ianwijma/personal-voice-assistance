@@ -2,9 +2,7 @@ import type { ModuleUnavailable } from "@pva/protocol"
 import { Clock, Effect } from "effect"
 import {
   type Actor,
-  actorKey,
   type ChangeOp,
-  type ChangeRecord,
   type CheckedQuery,
   checkQuery,
   checkRowId,
@@ -23,15 +21,14 @@ import {
   type ScopeUnknown,
   StoreConflict,
   StoreError,
-  StoreNotFound,
-  type UndoResult
+  StoreNotFound
 } from "./HouseholdStore.ts"
 import type { Transactions } from "./StoreTransactions.ts"
 
 /**
  * The semantics of `ctx.store` collections, written once over a small backend (`StoreBackend`), so the SQLite store
  * and the in-memory double behave the same: availability, scope resolution, validation, every write as one
- * read-check-write step inside a transaction, the change log, undo, erase and the migration of a collection at start.
+ * read-check-write step inside a transaction, and the migration of a collection at start.
  * Internal to `@pva/core` and `@pva/store-sqlite`.
  */
 
@@ -49,9 +46,6 @@ export interface StoredDoc {
   readonly updatedBy: Actor
 }
 
-/** A change to append (the backend gives it its number, which is also its `rev`). */
-export type NewChange = Omit<ChangeRecord, "seq" | "undone" | "rev"> & { readonly actorKey: string }
-
 /**
  * The backend's primitives. None of them takes a lock: the callers below run reads through `tx.statement` and writes
  * inside `tx.transaction` (`StoreTransactions.ts`), so a backend never sees two of them at once.
@@ -63,24 +57,17 @@ export interface StoreBackend {
   readonly read: (module: string, collection: string, id: string) => Effect.Effect<StoredDoc | undefined, StoreError>
   /** One index range read (`CheckedQuery`), in the order `compareIndexed` defines. */
   readonly list: (module: string, collection: string, scope: ScopeRef, query: CheckedQuery) => Effect.Effect<ReadonlyArray<StoredDoc>, StoreError>
-  /** Append a change; returns its number (the `rev` of the row it wrote). */
-  readonly append: (change: NewChange) => Effect.Effect<number, StoreError>
+  /** The next number of the store's counter (the `rev` of the row a write writes); rolled back with its transaction. */
+  readonly nextRev: Effect.Effect<number, StoreError>
   /** Insert (`"absent"`) or replace the row at rev `expect` in its scope; `false` when that did not hold. */
   readonly put: (doc: StoredDoc, expect: "absent" | number) => Effect.Effect<boolean, StoreError>
   /** Delete the row at rev `expect` in `scope`; `false` when it was not there so. */
   readonly remove: (module: string, collection: string, id: string, scope: ScopeRef, expect: number) => Effect.Effect<boolean, StoreError>
-  /** The newest change of `actorKey` in the collection and scope that is not undone, not an undo or an erase, and still has its values. */
-  readonly lastUndoable: (module: string, collection: string, actorKey: string, scope: ScopeRef) => Effect.Effect<ChangeRecord | undefined, StoreError>
-  readonly markUndone: (seq: number) => Effect.Effect<void, StoreError>
-  /** Whether the row id has a change after `seq` (in any scope) that is not undone and not itself an undo. */
-  readonly changedSince: (module: string, collection: string, id: string, seq: number) => Effect.Effect<boolean, StoreError>
-  /** Drop every payload of the row id in `scope` from the change log. */
-  readonly purge: (module: string, collection: string, id: string, scope: ScopeRef) => Effect.Effect<void, StoreError>
   /** Rows of a collection after `afterId` in id order (the migration at start). */
   readonly scan: (module: string, collection: string, afterId: string, limit: number) => Effect.Effect<ReadonlyArray<StoredDoc>, StoreError>
   /** Store a migrated value of a row (same rev). */
   readonly rewrite: (doc: StoredDoc, v: number, text: string) => Effect.Effect<void, StoreError>
-  /** After an erase committed: make the old content unreadable in the files too (SQLite: a checkpoint, retried). */
+  /** After a removal committed: make the old content unreadable in the files too (SQLite: a checkpoint, retried). */
   readonly scrub: () => void
 }
 
@@ -109,35 +96,19 @@ export const makeModuleStoreOn = (
         : Effect.fail(new StoreError({ reason: "unavailable", message: `Module ${moduleId}'s data is not usable here: ${verdict.reason}` }))
     })
 
-  /** Append a change and queue its event for after the commit. Inside a transaction. */
+  /** Take a new rev and queue the change's event for after the commit. Inside a transaction. */
   const logChange = (
     collection: string,
     op: ChangeOp,
-    meta: { readonly id: string; readonly scope: ScopeRef; readonly actor: Actor; readonly at: number },
-    payload: ChangeRecord["payload"],
-    undoes?: string
+    meta: { readonly id: string; readonly scope: ScopeRef; readonly actor: Actor; readonly at: number }
   ) =>
     Effect.gen(function*() {
-      const opId = newId()
-      const seq = yield* backend.append({
-        opId,
-        at: meta.at,
-        module: moduleId,
-        collection,
-        id: meta.id,
-        op,
-        scope: meta.scope,
-        actor: meta.actor,
-        actorKey: actorKey(meta.actor),
-        ...(payload !== undefined ? { payload } : {}),
-        ...(undoes !== undefined ? { undoes } : {})
-      })
+      const seq = yield* backend.nextRev
       const announce = (rows: { readonly row?: Row<unknown>; readonly before?: Row<unknown> }) =>
         tx.enqueue({
           _tag: "change",
           change: {
             seq,
-            opId,
             at: meta.at,
             module: moduleId,
             collection,
@@ -179,9 +150,6 @@ export const makeModuleStoreOn = (
       })
     const toRow = (doc: StoredDoc) => Effect.map(decode(doc), (d) => d.row)
 
-    const payloadOf = (before: unknown, after: unknown): ChangeRecord["payload"] =>
-      c.history === "none" ? undefined : { v: c.version, ...(before !== undefined ? { before } : {}), ...(after !== undefined ? { after } : {}) }
-
     const conflict = (id: string, message: string) => new StoreConflict({ collection: c.name, id, message })
 
     const get: CollectionHandle<A>["get"] = (id, options) =>
@@ -209,7 +177,7 @@ export const makeModuleStoreOn = (
         return yield* tx.transaction(Effect.gen(function*() {
           if ((yield* backend.read(moduleId, c.name, id)) !== undefined) return yield* conflict(id, `A row ${id} already exists in ${c.name}`)
           const at = yield* Clock.currentTimeMillis
-          const log = yield* logChange(c.name, "insert", { id, scope, actor, at }, payloadOf(undefined, encoded.json))
+          const log = yield* logChange(c.name, "insert", { id, scope, actor, at })
           const doc: StoredDoc = { module: moduleId, collection: c.name, id, scope, rev: log.seq, v: c.version, text: encoded.text, createdAt: at, updatedAt: at, updatedBy: actor }
           if (!(yield* backend.put(doc, "absent"))) return yield* conflict(id, `A row ${id} already exists in ${c.name}`)
           const row: Row<A> = { id, rev: log.seq, scope, value: encoded.value, createdAt: at, updatedAt: at, updatedBy: actor }
@@ -235,7 +203,7 @@ export const makeModuleStoreOn = (
           })
           const encoded = yield* encodeValue(c, next)
           const at = yield* Clock.currentTimeMillis
-          const log = yield* logChange(c.name, "update", { id, scope: doc.scope, actor, at }, payloadOf(before.json, encoded.json))
+          const log = yield* logChange(c.name, "update", { id, scope: doc.scope, actor, at })
           const written: StoredDoc = { ...doc, rev: log.seq, v: c.version, text: encoded.text, updatedAt: at, updatedBy: actor }
           if (!(yield* backend.put(written, doc.rev))) return yield* conflict(id, `Row ${id} of ${c.name} changed meanwhile`)
           const row: Row<A> = { id, rev: log.seq, scope: doc.scope, value: encoded.value, createdAt: doc.createdAt, updatedAt: at, updatedBy: actor }
@@ -256,85 +224,15 @@ export const makeModuleStoreOn = (
           }
           const before = yield* decode(doc)
           const at = yield* Clock.currentTimeMillis
-          const log = yield* logChange(c.name, "remove", { id, scope: doc.scope, actor, at }, payloadOf(before.json, undefined))
+          const log = yield* logChange(c.name, "remove", { id, scope: doc.scope, actor, at })
           if (!(yield* backend.remove(moduleId, c.name, id, doc.scope, doc.rev))) return yield* conflict(id, `Row ${id} of ${c.name} changed meanwhile`)
           yield* log.announce({ before: before.row })
-          return true
-        }))
-      }))
-
-    const erase: CollectionHandle<A>["erase"] = (id, options) =>
-      writable("erase", Effect.gen(function*() {
-        const scope = yield* resolveScope(c, options?.scope)
-        const actor = yield* currentActor(moduleId, options?.actor)
-        return yield* tx.transaction(Effect.gen(function*() {
-          const doc = yield* backend.read(moduleId, c.name, id)
-          // A row of this id in another scope is not this caller's to forget: nothing of it is touched.
-          if (doc !== undefined && !sameScope(doc.scope, scope)) return false
-          // Its history in this scope goes in any case (a row removed earlier still has payloads there).
-          yield* backend.purge(moduleId, c.name, id, scope)
           yield* tx.enqueue({ _tag: "run", run: backend.scrub })
-          if (doc === undefined) return false
-          const at = yield* Clock.currentTimeMillis
-          const log = yield* logChange(c.name, "erase", { id, scope, actor, at }, undefined)
-          if (!(yield* backend.remove(moduleId, c.name, id, doc.scope, doc.rev))) return yield* conflict(id, `Row ${id} of ${c.name} changed meanwhile`)
-          // The content does not travel on the bus either.
-          yield* log.announce({})
           return true
-        }))
-      })) as Effect.Effect<boolean, StoreError | ScopeUnknown>
-
-    const undo: CollectionHandle<A>["undo"] = (options) =>
-      writable("undo", Effect.gen(function*() {
-        if (c.history === "none") return yield* new StoreError({ reason: "invalid", message: `Collection ${c.name} keeps no history, so nothing in it can be undone` })
-        const scope = yield* resolveScope(c, options?.scope)
-        const actor = yield* currentActor(moduleId, options?.actor)
-        return yield* tx.transaction(Effect.gen(function*() {
-          const last = yield* backend.lastUndoable(moduleId, c.name, actorKey(actor), scope)
-          if (last === undefined || last.payload === undefined) return undefined
-          const payload = last.payload
-          const found = yield* backend.read(moduleId, c.name, last.id)
-          const changedSince = yield* backend.changedSince(moduleId, c.name, last.id, last.seq)
-          const notUndone = conflict(last.id, `Row ${last.id} of ${c.name} was changed again since; not undone`)
-          // The id belongs to another scope now: that is a change since, too.
-          if (changedSince || (found !== undefined && !sameScope(found.scope, scope))) return yield* notUndone
-          const doc = found
-          const at = yield* Clock.currentTimeMillis
-          const valueAt = (json: unknown) => Effect.map(decodeStored(c, payload.v, json, last.id), (d) => d.value)
-          let result: UndoResult<A>
-          if (last.op === "insert") {
-            if (doc === undefined) return yield* notUndone
-            const before = yield* decode(doc)
-            const log = yield* logChange(c.name, "remove", { id: last.id, scope, actor, at }, payloadOf(before.json, undefined), last.opId)
-            if (!(yield* backend.remove(moduleId, c.name, last.id, scope, doc.rev))) return yield* notUndone
-            yield* log.announce({ before: before.row })
-            result = { undid: "insert", id: last.id, row: undefined }
-          } else if (last.op === "update") {
-            if (doc === undefined || payload.before === undefined) return yield* notUndone
-            const before = yield* decode(doc)
-            const encoded = yield* encodeValue(c, yield* valueAt(payload.before))
-            const log = yield* logChange(c.name, "update", { id: doc.id, scope, actor, at }, payloadOf(before.json, encoded.json), last.opId)
-            const written: StoredDoc = { ...doc, rev: log.seq, v: c.version, text: encoded.text, updatedAt: at, updatedBy: actor }
-            if (!(yield* backend.put(written, doc.rev))) return yield* notUndone
-            const row: Row<A> = { id: doc.id, rev: log.seq, scope, value: encoded.value, createdAt: doc.createdAt, updatedAt: at, updatedBy: actor }
-            yield* log.announce({ row, before: before.row })
-            result = { undid: "update", id: doc.id, row }
-          } else if (last.op === "remove") {
-            if (doc !== undefined || payload.before === undefined) return yield* notUndone
-            const encoded = yield* encodeValue(c, yield* valueAt(payload.before))
-            const log = yield* logChange(c.name, "insert", { id: last.id, scope, actor, at }, payloadOf(undefined, encoded.json), last.opId)
-            const written: StoredDoc = { module: moduleId, collection: c.name, id: last.id, scope, rev: log.seq, v: c.version, text: encoded.text, createdAt: at, updatedAt: at, updatedBy: actor }
-            if (!(yield* backend.put(written, "absent"))) return yield* notUndone
-            const row: Row<A> = { id: last.id, rev: log.seq, scope, value: encoded.value, createdAt: at, updatedAt: at, updatedBy: actor }
-            yield* log.announce({ row })
-            result = { undid: "remove", id: last.id, row }
-          } else return undefined
-          yield* backend.markUndone(last.seq)
-          return result
         }))
       }))
 
-    return { get, list, insert, update, remove, erase, undo }
+    return { get, list, insert, update, remove }
   }
 
   return {
@@ -382,19 +280,15 @@ export const migrateCollectionOn = (backend: StoreBackend, moduleId: string, c: 
     }
   })
 
-/**
- * How a backend finds a conversation's rows and drops the payloads of its changes (`undefined`: every conversation),
- * leaving out the modules in `keep` (their data is not usable here: it is never touched).
- */
+/** How a backend finds a conversation's rows (`undefined`: every conversation). */
 export interface ConversationRows {
   readonly docs: (conversationId: string | undefined) => Effect.Effect<ReadonlyArray<StoredDoc>, StoreError>
-  readonly purge: (conversationId: string | undefined, keep: ReadonlyArray<string>) => Effect.Effect<void, StoreError>
 }
 
 /**
- * A conversation ended (or, with `undefined`, every conversation, at start): erase each of its rows as `erase` does,
- * in one transaction: one `erase` change per row (actor `system:conversation-ended`), the row
- * gone, and every payload of a change in that scope dropped, so nothing of it can be undone or read back.
+ * A conversation ended (or, with `undefined`, every conversation, at start): remove each of its rows, in one
+ * transaction, one `remove` change per row (actor `system:conversation-ended`), leaving out the modules whose data
+ * is not usable here (`unavailable`: their data is never touched).
  */
 export const endConversationsOn = (
   backend: StoreBackend,
@@ -403,24 +297,21 @@ export const endConversationsOn = (
   unavailable: () => ReadonlyArray<string> = () => []
 ): Effect.Effect<number, StoreError> =>
   backend.tx.transaction(Effect.gen(function*() {
-    // A module whose data is newer (or failed to upgrade) keeps its rows as they are, conversation rows too.
     const keep = unavailable()
     const docs = (yield* rows.docs(conversationId)).filter((d) => !keep.includes(d.module))
     const actor: Actor = { kind: "system", name: "conversation-ended" }
     const at = yield* Clock.currentTimeMillis
     let n = 0
     for (const doc of docs) {
-      const opId = newId()
-      const seq = yield* backend.append({ opId, at, module: doc.module, collection: doc.collection, id: doc.id, op: "erase", scope: doc.scope, actor, actorKey: actorKey(actor) })
+      const seq = yield* backend.nextRev
       if (!(yield* backend.remove(doc.module, doc.collection, doc.id, doc.scope, doc.rev))) continue
       yield* backend.tx.enqueue({
         _tag: "change",
-        change: { seq, opId, at, module: doc.module, collection: doc.collection, id: doc.id, op: "erase", rev: seq, scope: doc.scope, actor }
+        change: { seq, at, module: doc.module, collection: doc.collection, id: doc.id, op: "remove", rev: seq, scope: doc.scope, actor }
       })
       n++
       if (n % 200 === 0) yield* Effect.yieldNow
     }
-    yield* rows.purge(conversationId, keep)
-    yield* backend.tx.enqueue({ _tag: "run", run: backend.scrub })
+    if (n > 0) yield* backend.tx.enqueue({ _tag: "run", run: backend.scrub })
     return n
   }))

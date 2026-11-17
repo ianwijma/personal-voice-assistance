@@ -1,8 +1,6 @@
 import "./quiet.ts"
 import {
   type Actor,
-  CHANGE_RETENTION_MS,
-  type ChangeRecord,
   type CheckedQuery,
   type Collection,
   type CommittedChange,
@@ -36,8 +34,7 @@ import { copyDatabase, copyFilePrivately, type FileGuard, narrow, privateDir, pr
  * Every statement on that connection is synchronous on the main thread, which also frames audio. So every read a turn
  * can make is one index range with a row limit (`INDEXED BY`, so a query that cannot use its index fails instead of
  * scanning), writes touch single rows, and everything long runs elsewhere: backups and exports read through a
- * connection of their own (backups in one step on a worker thread), retention deletes in small transactions with a
- * yield between them, and the checkpoint after an erase runs in the background, never waiting for a reader.
+ * connection of their own (backups in one step on a worker thread), and the checkpoint after a removal runs in the background, never waiting for a reader.
  */
 
 /** The store's own schema version (`pva_meta.schema`). A file with a higher one is refused before it is opened for writing. */
@@ -74,11 +71,11 @@ export interface SqliteHouseholdStore extends HouseholdStore {
   /** Remove backups and set-aside copies past their time (maintenance). Returns the names removed. */
   readonly pruneBackups: (options?: { readonly now?: number }) => Effect.Effect<ReadonlyArray<string>>
   /**
-   * Since when an erase's content may still be in the file or its log (a checkpoint a reader blocked; it is retried),
+   * Since when a removed row's content may still be in the file or its log (a checkpoint a reader blocked; it is retried),
    * or `undefined` when nothing is pending.
    */
   readonly erasePendingSince: () => number | undefined
-  /** Wait until no erase is pending (tests; doctor). */
+  /** Wait until no removal is pending (tests; doctor). */
   readonly scrubbed: Effect.Effect<void>
 }
 
@@ -95,20 +92,6 @@ const CORE_DDL = [
   `CREATE INDEX pva_docs_updated ON pva_docs (module, collection, scope_kind, scope_id, updated_at, id)`,
   `CREATE INDEX pva_docs_created ON pva_docs (module, collection, scope_kind, scope_id, created_at, id)`,
   `CREATE INDEX pva_docs_conversation ON pva_docs (scope_id) WHERE scope_kind = 'conversation'`,
-  `CREATE TABLE pva_changes (
-    seq INTEGER PRIMARY KEY AUTOINCREMENT,
-    op_id TEXT NOT NULL UNIQUE,
-    module TEXT NOT NULL, collection TEXT NOT NULL,
-    scope_kind TEXT NOT NULL, scope_id TEXT NOT NULL,
-    row_id TEXT NOT NULL, op TEXT NOT NULL,
-    actor TEXT NOT NULL, actor_key TEXT NOT NULL, at INTEGER NOT NULL,
-    data TEXT, undoes TEXT, undone INTEGER NOT NULL DEFAULT 0
-  )`,
-  `CREATE INDEX pva_changes_row ON pva_changes (module, collection, row_id, seq)`,
-  `CREATE INDEX pva_changes_undoable ON pva_changes (module, collection, actor_key, scope_kind, scope_id, seq)
-    WHERE undone = 0 AND undoes IS NULL AND op != 'erase' AND data IS NOT NULL`,
-  `CREATE INDEX pva_changes_at ON pva_changes (at)`,
-  `CREATE INDEX pva_changes_conversation ON pva_changes (scope_id) WHERE scope_kind = 'conversation'`,
   `CREATE TABLE pva_indexes (name TEXT PRIMARY KEY, module TEXT NOT NULL, collection TEXT NOT NULL, field TEXT NOT NULL, ddl TEXT NOT NULL) WITHOUT ROWID`
 ]
 
@@ -203,22 +186,6 @@ interface DocRow {
   readonly updated_by: string
 }
 
-interface ChangeRow {
-  readonly seq: number
-  readonly op_id: string
-  readonly module: string
-  readonly collection: string
-  readonly scope_kind: string
-  readonly scope_id: string
-  readonly row_id: string
-  readonly op: string
-  readonly actor: string
-  readonly at: number
-  readonly data: string | null
-  readonly undoes: string | null
-  readonly undone: number
-}
-
 const toDoc = (r: DocRow): StoredDoc => ({
   module: r.module,
   collection: r.collection,
@@ -230,22 +197,6 @@ const toDoc = (r: DocRow): StoredDoc => ({
   createdAt: Number(r.created_at),
   updatedAt: Number(r.updated_at),
   updatedBy: JSON.parse(r.updated_by) as Actor
-})
-
-const toChange = (r: ChangeRow): ChangeRecord => ({
-  seq: Number(r.seq),
-  opId: r.op_id,
-  at: Number(r.at),
-  module: r.module,
-  collection: r.collection,
-  id: r.row_id,
-  op: r.op as ChangeRecord["op"],
-  rev: Number(r.seq),
-  scope: scopeFromColumns(r.scope_kind, r.scope_id),
-  actor: JSON.parse(r.actor) as Actor,
-  ...(r.data !== null ? { payload: JSON.parse(r.data) as NonNullable<ChangeRecord["payload"]> } : {}),
-  ...(r.undoes !== null ? { undoes: r.undoes } : {}),
-  undone: Number(r.undone) !== 0
 })
 
 const localDate = (ms: number) => {
@@ -324,7 +275,7 @@ export const makeSqliteStore = (options: SqliteStoreOptions): Effect.Effect<Sqli
       disableWAL: memory,
       prepareCacheSize: 500,
       // A writer waits for no one (the server is the only writer; readers never block it in WAL), and the checkpoint
-      // after an erase sets 0 itself: a busy wait would stop the event loop.
+      // after a removal sets 0 itself: a busy wait would stop the event loop.
       busyTimeout: readOnly ? "1 second" : "20 millis"
     }).pipe(Effect.provide(Reactivity.layer), Effect.mapError(toStoreError(`Could not open ${options.filename}`)))
 
@@ -394,7 +345,7 @@ export const makeSqliteStore = (options: SqliteStoreOptions): Effect.Effect<Sqli
       yield* driverTx(Effect.gen(function*() {
         for (const ddl of CORE_DDL) yield* exec(ddl)
         const at = yield* Clock.currentTimeMillis
-        yield* exec("INSERT INTO pva_meta (key, value) VALUES ('schema', ?), ('created', ?)", [String(CORE_SCHEMA_VERSION), String(at)])
+        yield* exec("INSERT INTO pva_meta (key, value) VALUES ('schema', ?), ('created', ?), ('rev', '0')", [String(CORE_SCHEMA_VERSION), String(at)])
       }))
       created = true
     } else {
@@ -405,7 +356,7 @@ export const makeSqliteStore = (options: SqliteStoreOptions): Effect.Effect<Sqli
       }
     }
 
-    // ---- Erasure: the checkpoint after an erase, in the background, retried while a reader holds an old snapshot
+    // ---- Removal: the checkpoint after a removal, in the background, retried while a reader holds an old snapshot
 
     let erasePendingSince: number | undefined
     const scrubWake = yield* Queue.sliding<void>(1)
@@ -430,7 +381,7 @@ export const makeSqliteStore = (options: SqliteStoreOptions): Effect.Effect<Sqli
         for (;;) {
           const done = yield* checkpointNow.pipe(Effect.orElseSucceed(() => false))
           if (done) break
-          log(`An erased item is still in the household log: a reader holds an older snapshot; retrying in ${Math.round(wait / 1000)} s`)
+          log(`A removed item is still in the household log: a reader holds an older snapshot; retrying in ${Math.round(wait / 1000)} s`)
           yield* Effect.sleep(wait)
           wait = Math.min(wait * 2, 60_000)
         }
@@ -459,28 +410,10 @@ export const makeSqliteStore = (options: SqliteStoreOptions): Effect.Effect<Sqli
         const { sql, params } = listSql(module, collection, scope, q)
         return Effect.map(query<DocRow>(sql, params), (rows) => rows.map(toDoc))
       },
-      append: (c) =>
-        Effect.map(
-          exec(
-            `INSERT INTO pva_changes (op_id, module, collection, scope_kind, scope_id, row_id, op, actor, actor_key, at, data, undoes)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-            [
-              c.opId,
-              c.module,
-              c.collection,
-              c.scope.kind,
-              scopeIdOf(c.scope),
-              c.id,
-              c.op,
-              JSON.stringify(c.actor),
-              c.actorKey,
-              c.at,
-              c.payload === undefined ? null : JSON.stringify(c.payload),
-              c.undoes ?? null
-            ]
-          ),
-          (r) => r.lastInsertRowid
-        ),
+      nextRev: Effect.map(
+        query<{ value: string }>("UPDATE pva_meta SET value = CAST(value AS INTEGER) + 1 WHERE key = 'rev' RETURNING value"),
+        (r) => Number(r[0]!.value)
+      ),
       put: (doc, expect) =>
         Effect.gen(function*() {
           const r = expect === "absent"
@@ -501,31 +434,6 @@ export const makeSqliteStore = (options: SqliteStoreOptions): Effect.Effect<Sqli
           const r = yield* exec("DELETE FROM pva_docs WHERE module = ? AND collection = ? AND id = ? AND rev = ? AND scope_kind = ? AND scope_id = ?", [module, collection, id, expect, scope.kind, scopeIdOf(scope)])
           return r.changes === 1
         }),
-      lastUndoable: (module, collection, actorKey, scope) =>
-        Effect.map(
-          query<ChangeRow>(
-            `SELECT * FROM pva_changes INDEXED BY pva_changes_undoable
-             WHERE module = ? AND collection = ? AND actor_key = ? AND scope_kind = ? AND scope_id = ?
-               AND undone = 0 AND undoes IS NULL AND op != 'erase' AND data IS NOT NULL
-             ORDER BY seq DESC LIMIT 1`,
-            [module, collection, actorKey, scope.kind, scopeIdOf(scope)]
-          ),
-          (r) => (r[0] === undefined ? undefined : toChange(r[0]))
-        ),
-      markUndone: (seq) => Effect.asVoid(exec("UPDATE pva_changes SET undone = 1 WHERE seq = ?", [seq])),
-      changedSince: (module, collection, id, seq) =>
-        Effect.map(
-          query<{ n: number }>(
-            "SELECT count(*) AS n FROM (SELECT 1 FROM pva_changes WHERE module = ? AND collection = ? AND row_id = ? AND seq > ? AND undone = 0 AND undoes IS NULL LIMIT 1)",
-            [module, collection, id, seq]
-          ),
-          (r) => Number(r[0]!.n) > 0
-        ),
-      purge: (module, collection, id, scope) =>
-        Effect.asVoid(exec(
-          "UPDATE pva_changes SET data = NULL WHERE module = ? AND collection = ? AND row_id = ? AND scope_kind = ? AND scope_id = ? AND data IS NOT NULL",
-          [module, collection, id, scope.kind, scopeIdOf(scope)]
-        )),
       scan: (module, collection, afterId, limit) =>
         Effect.map(query<DocRow>("SELECT * FROM pva_docs WHERE module = ? AND collection = ? AND id > ? ORDER BY id LIMIT ?", [module, collection, afterId, limit]), (rows) => rows.map(toDoc)),
       rewrite: (doc, v, text) =>
@@ -540,13 +448,7 @@ export const makeSqliteStore = (options: SqliteStoreOptions): Effect.Effect<Sqli
             ? query<DocRow>("SELECT * FROM pva_docs INDEXED BY pva_docs_conversation WHERE scope_kind = 'conversation'")
             : query<DocRow>("SELECT * FROM pva_docs INDEXED BY pva_docs_conversation WHERE scope_kind = 'conversation' AND scope_id = ?", [conversationId]),
           (rows) => rows.map(toDoc)
-        ),
-      purge: (conversationId: string | undefined, keep: ReadonlyArray<string>) => {
-        const notKept = keep.length === 0 ? "" : ` AND module NOT IN (${keep.map(() => "?").join(", ")})`
-        return Effect.asVoid(conversationId === undefined
-          ? exec(`UPDATE pva_changes SET data = NULL WHERE scope_kind = 'conversation' AND data IS NOT NULL${notKept}`, [...keep])
-          : exec(`UPDATE pva_changes SET data = NULL WHERE scope_kind = 'conversation' AND scope_id = ? AND data IS NOT NULL${notKept}`, [conversationId, ...keep]))
-      }
+        )
     }
 
     // ---- Versions and preparing modules
@@ -705,7 +607,7 @@ export const makeSqliteStore = (options: SqliteStoreOptions): Effect.Effect<Sqli
       return s
     }
 
-    const lastSeqRaw = Effect.map(query<{ seq: number }>("SELECT seq FROM sqlite_sequence WHERE name = 'pva_changes'"), (r) => Number(r[0]?.seq ?? 0))
+    const lastSeqRaw = Effect.map(query<{ value: string }>("SELECT value FROM pva_meta WHERE key = 'rev'"), (r) => Number(r[0]?.value ?? 0))
 
     const core = (owner: string): CoreSql => {
       const prefix = `core_${owner}__`
@@ -748,29 +650,9 @@ export const makeSqliteStore = (options: SqliteStoreOptions): Effect.Effect<Sqli
       transaction: tx.transaction,
       afterCommit: (f) => tx.enqueue({ _tag: "run", run: f }),
       core,
-      changesSince: (seq, limit) =>
-        tx.statement(Effect.gen(function*() {
-          const rows = yield* query<ChangeRow>("SELECT * FROM pva_changes WHERE seq > ? ORDER BY seq LIMIT ?", [seq, limit + 1])
-          const oldestRow = yield* query<{ seq: number | null }>("SELECT min(seq) AS seq FROM pva_changes")
-          const oldest = oldestRow[0]?.seq ?? (yield* lastSeqRaw) + 1
-          return { changes: rows.slice(0, limit).map(toChange), complete: rows.length <= limit, oldest: Number(oldest) }
-        })),
       lastSeq: tx.statement(lastSeqRaw),
       endConversation: (conversationId) => (readOnly ? Effect.succeed(0) : endConversationsOn(backend, conversations, conversationId, () => [...verdicts.keys()])),
       sweepConversations: readOnly ? Effect.succeed(0) : endConversationsOn(backend, conversations, undefined, () => [...verdicts.keys()]),
-      pruneChanges: (opts) =>
-        readOnly ? Effect.fail(readOnlyError("pruneChanges")) : Effect.gen(function*() {
-          const now = opts?.now ?? (yield* Clock.currentTimeMillis)
-          const cut = now - (opts?.maxAgeMs ?? CHANGE_RETENTION_MS)
-          let total = 0
-          // Small transactions with a yield between them: a turn waits for one batch at most.
-          for (;;) {
-            const r = yield* tx.transaction(exec("DELETE FROM pva_changes WHERE seq IN (SELECT seq FROM pva_changes INDEXED BY pva_changes_at WHERE at < ? ORDER BY at LIMIT 100)", [cut]))
-            total += r.changes
-            if (r.changes < 100) return total
-            yield* Effect.yieldNow
-          }
-        }),
       backup,
       onCommit: (listener) => {
         listeners.add(listener)
