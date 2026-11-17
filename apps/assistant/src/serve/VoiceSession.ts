@@ -123,9 +123,12 @@ export interface VoiceSessionOptions {
   /** The assistants in effect now, by id. */
   readonly assistants: () => ReadonlyMap<string, Assistant>
   /** Per assistant: its turn setup (prompt, module instructions, its tools), and the agent setup (claude-subscription). */
-  readonly conversationSetup: (assistant: string) => AssistantSetup
-  /** The key of the voice an assistant speaks with now (the resource pool's, docs/ASSISTANTS.md §3.2). */
-  readonly voiceOf?: (assistant: string) => string | undefined
+  readonly conversationSetup: (assistant: string, deviceId: string | undefined) => AssistantSetup
+  /**
+   * The key of the voice an assistant speaks with on this device now (the resource pool's, docs/ASSISTANTS.md §3.2):
+   * the device's own voice, else the assistant's (docs/LOOKS-AND-VOICES.md §3).
+   */
+  readonly voiceOf?: (assistant: string, deviceId: string | undefined) => string | undefined
   /** The module that contributes a tool (module host snapshot). */
   readonly moduleOfTool: (name: string) => string | null
   /**
@@ -390,7 +393,7 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
 
     /** The voice key `assistant` speaks with in this session ("" when it has none: not in use, the engines not running). */
     const voiceNow = (assistant: string | undefined): string => {
-      const own = assistant === undefined ? undefined : options.voiceOf?.(assistant)
+      const own = assistant === undefined ? undefined : options.voiceOf?.(assistant, options.deviceId)
       if (own !== undefined) return own
       const voice = options.engine.voice()
       return voice === undefined ? "" : voiceKey(voice)
@@ -617,7 +620,7 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
         Effect.gen(function*() {
           const inbox = yield* Queue.unbounded<ConversationInput>()
           let runs = 0
-          const { setup, agentSetup, config: assistantConfig } = options.conversationSetup(assistant)
+          const { setup, agentSetup, config: assistantConfig } = options.conversationSetup(assistant, options.deviceId)
           /** The assistant's part and the device's hearing, joined once per change of either (the turn path reads it). */
           let joined: { readonly part: AssistantTraceConfig; readonly hearing: TraceConfig["hearing"]; readonly value: TraceConfig } | undefined
           const traceConfig = (): TraceConfig | undefined => {

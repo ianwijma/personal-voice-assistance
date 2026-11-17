@@ -56,8 +56,14 @@
  * `device.profile`, `frontends`; `snapshot.device`, `snapshot.conversation` (`snapshot.conversations` is required),
  * `admin.snapshot.frontends`; `profile` and `overrides` on a device entry. The profile fields of protocols 5 and 6 are
  * kept only for reading a version 3 settings file (`DeviceProfile`, `ProfileOverrides`).
+ *
+ * 8: looks and voices (docs/LOOKS-AND-VOICES.md §2). `DeviceSettingsKey` gains `look` and `voice` (a closed set), and
+ * `DeviceSettings` requires both (`DeviceLook`, `DeviceVoice`), so a version 7 peer would refuse a version 8 device
+ * entry or `device.save` and a version 8 page could not read a version 7 server's devices. Additive, within 8:
+ * `Assistant.look`, `DeviceOwn`/`DeviceSettingsPatch` `look` and `voice`, `DeviceSetup.look` and `DeviceSetup.assistants[].look`,
+ * `assistant.create.saveAnyway`, `TraceConfig.voiceFrom`, `usedByDevices` on voices and resource status.
  */
-export const PROTOCOL_VERSION = 7
+export const PROTOCOL_VERSION = 8
 
 /** Path of the WebSocket endpoint, on the same origin as the UI in production. */
 export const WS_PATH = "/ws"

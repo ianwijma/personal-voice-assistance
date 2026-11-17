@@ -1,5 +1,6 @@
 import { Schema } from "effect"
 import { NonNegativeFinite } from "./common.ts"
+import { DeviceUser } from "./deviceUsers.ts"
 import { JobInfo } from "./jobs.ts"
 
 /**
@@ -69,6 +70,11 @@ export const VoiceEntry = Schema.Struct({
   previewable: Schema.Boolean,
   /** Protocol 7: the assistants that speak with this voice (replaces `selected`). */
   usedBy: Schema.Array(AssistantIdString),
+  /**
+   * Additive: the devices (and device types' defaults) that speak with this voice as their own (`voice: { from:
+   * "device" }`), from their effective settings. `usedBy` stays the assistants. Absent from an older server.
+   */
+  usedByDevices: Schema.optionalKey(Schema.Array(DeviceUser)),
   favourite: Schema.Boolean
 })
 export type VoiceEntry = typeof VoiceEntry.Type

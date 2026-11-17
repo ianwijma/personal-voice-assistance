@@ -1,4 +1,5 @@
 import { Schema } from "effect"
+import { Look } from "./looks.ts"
 import { FieldKey, ModuleId, NonNegativeInt } from "./common.ts"
 import { SettingValue } from "./settings.ts"
 import { VoiceRefSchema } from "./voices.ts"
@@ -120,6 +121,8 @@ export const AssistantBody = Schema.Struct({
   llm: AssistantLlm,
   hearing: AssistantHearing,
   voice: VoiceRefSchema,
+  /** The character on the voice stage while this assistant answers (docs/LOOKS-AND-VOICES.md); absent = the baseline. */
+  look: Schema.optionalKey(Look),
   /** A module missing here is off. */
   modules: Schema.Record(ModuleId, ModuleChoice)
 })

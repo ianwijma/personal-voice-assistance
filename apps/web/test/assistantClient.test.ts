@@ -42,6 +42,15 @@ describe("the assistant calls of the client", () => {
     })
   })
 
+  it("createAssistant adds saveAnyway only when asked (PR #84 review, finding 2)", async () => {
+    const { client, request } = clientAnswering(ok({ assistantId: "mia" }))
+    const { id: _i, rev: _r, ...body } = exampleAssistant
+    await client.createAssistant(body, { copyOf: "jeff", saveAnyway: true })
+    expect(request).toHaveBeenLastCalledWith({ type: "assistant.create", assistant: body, copyOf: "jeff", saveAnyway: true })
+    await client.createAssistant(body, { saveAnyway: false })
+    expect(request).toHaveBeenLastCalledWith({ type: "assistant.create", assistant: body })
+  })
+
   it("deleteAssistant names the revision it read", async () => {
     const { client, request } = clientAnswering(ok())
     await client.deleteAssistant("jeff", 3, "Jeff")

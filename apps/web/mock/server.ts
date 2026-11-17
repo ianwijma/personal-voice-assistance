@@ -132,7 +132,8 @@ import {
   MAX_PREVIEW_CHARS,
   type ProviderInfo,
   type ProviderVoices,
-  type VoiceEntry
+  type VoiceEntry,
+  voiceFor
 } from "@pva/protocol"
 import { exampleEngineStatus, exampleSnapshot, exampleVoiceSection, exampleWeatherModule } from "@pva/protocol/examples"
 import { type WebSocket, WebSocketServer } from "ws"
@@ -691,6 +692,19 @@ const checks = (list: ReadonlyArray<SettingsSection>): { errors: Array<FieldErro
     errors.push({ section: "voices", key: "ASSISTANT_VOICE", message: `${name} is not downloaded: download it first, or choose a voice that is.` })
   }
   return { errors, warnings }
+}
+
+/**
+ * The real server's voice check on `assistant.create` (docs/LOOKS-AND-VOICES.md §5.0), its warning half: a hosted
+ * voice whose provider has no key asks for `saveAnyway` (a copy of an assistant with such a voice too). The mock's
+ * `assistant.save` does not check the voice.
+ */
+const assistantVoiceWarning = (voice: { readonly provider: string; readonly voiceId: string }, saveAnyway: boolean) => {
+  if (saveAnyway) return undefined
+  const provider = MOCK_PROVIDERS.find((p) => p.id === voice.provider)
+  if (provider?.keyField === undefined || secretSet(provider.keyField)) return undefined
+  const message = `${provider.label} has no API key yet, so this voice cannot speak.`
+  return { code: "invalid_settings" as const, message: `${message} Save anyway to keep it.`, warnings: [{ key: "voice", message }] }
 }
 
 /** The sections with their forms' warnings for the saved values. */
@@ -1579,7 +1593,11 @@ const adminTraceFields = (r: Reply, v: VSession): Partial<TraceInfo> => {
   const config: NonNullable<TraceInfo["config"]> = {
     llm: { account: a.llm.account, model: a.llm.model, effort: a.llm.effort, thinking: a.llm.thinking, maxTokens: a.llm.maxTokens },
     hearing: { hearer: a.id, engine: a.hearing.engine, model: a.hearing.model, language: a.hearing.language, eagerSilenceMs: a.hearing.eagerSilenceMs, finalSilenceMs: a.hearing.finalSilenceMs },
-    voice: `${a.voice.provider}:${a.voice.voiceId}`,
+    // docs/LOOKS-AND-VOICES.md §3: the device's own voice, else the assistant's.
+    voice: (() => {
+      const spoken = voiceFor(voice.settingsOf(v.deviceId).voice, a)
+      return `${spoken.provider}:${spoken.voiceId}`
+    })(),
     modules: onModules.length,
     tools: onModules.reduce((n, m) => n + m.tools.filter((t) => !(chosen[m.id]?.offTools ?? []).includes(t.name)).length, 0),
     replyEarly: a.replyEarly,
@@ -2262,6 +2280,8 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
     }
     case "assistant.create": {
       if (requireAdmin(c, m.requestId)) return
+      const warned = assistantVoiceWarning(m.assistant.voice, m.saveAnyway === true)
+      if (warned !== undefined) return result(c, m.requestId, false, warned)
       const r = assistantsMock.create(m, [...devices.values()].map((d) => ({ id: d.id, name: d.name })))
       sendTo(c, r.ok ? { type: "result", requestId: m.requestId, ok: true, ...(r.assistantId !== undefined ? { assistantId: r.assistantId } : {}) } : { type: "result", requestId: m.requestId, ok: false, ...(r.error !== undefined ? { error: r.error } : {}) })
       if (r.ok) assistantsChanged()
@@ -2542,6 +2562,7 @@ const providerStatus = (p: (typeof MOCK_PROVIDERS)[number]): ProviderInfo => {
 const providerVoices = (p: (typeof MOCK_PROVIDERS)[number]): ProviderVoices => {
   const info = providerStatus(p)
   const selected = assistantVoiceKey()
+  const deviceUsers = assistantsMock.voiceUsers([...devices.values()].map((d) => ({ id: d.id, name: d.name })))
   const listed = info.status === "needs_key" ? [] : p.voices
   const voices: Array<VoiceEntry> = listed.map((v) => {
     const key = `${p.id}:${v.voiceId}`
@@ -2559,6 +2580,7 @@ const providerVoices = (p: (typeof MOCK_PROVIDERS)[number]): ProviderVoices => {
       ...(local !== undefined ? { local } : {}),
       previewable: info.status === "ready" && (local === undefined || local.state === "installed"),
       usedBy: key === selected ? ["jeff"] : [],
+      usedByDevices: deviceUsers.get(key) ?? [],
       favourite: favourites.some((f) => f.key === key)
     }
   })

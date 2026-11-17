@@ -6,10 +6,10 @@ const KEY = "pva.prefs.v1"
 const echo = { cancelled: true, residualDb: -42, at: 1700000000000, outputPath: "element" }
 
 describe("parsePrefs: the echo test", () => {
-  it("keeps a stored echo test, next to a stored character", () => {
+  it("keeps a stored echo test, and ignores a stored character (docs/LOOKS-AND-VOICES.md §3)", () => {
     const p = parsePrefs(JSON.stringify({ echoTest: echo, character: { character: "lips" } }))
     expect(p.echoTest).toEqual(echo)
-    expect(p.character).toEqual({ character: "lips" })
+    expect("character" in p).toBe(false)
   })
 
   it("drops an echo test that is not an object with a boolean `cancelled`", () => {
@@ -48,7 +48,7 @@ describe("createPrefsStore", () => {
     let calls = 0
     store.subscribe(() => calls++)
     store.load()
-    expect(store.get()).toMatchObject({ micDeviceId: "usb", shortcuts: false, character: { character: "lips", options: { size: 1.5 } } })
+    expect(store.get()).toEqual({ ...defaultPrefs, micDeviceId: "usb", shortcuts: false })
     expect(calls).toBe(1)
   })
 
@@ -65,21 +65,21 @@ describe("createPrefsStore", () => {
   it("dispatching a patch merges it into the state and persists the whole preferences under one key", () => {
     const store = createPrefsStore()
     store.dispatch({ micDeviceId: "usb" })
-    store.dispatch({ character: { character: "lips" } })
-    expect(store.get()).toEqual({ ...defaultPrefs, micDeviceId: "usb", character: { character: "lips" } })
-    expect(JSON.parse(localStorage.getItem(KEY)!)).toEqual({ ...defaultPrefs, micDeviceId: "usb", character: { character: "lips" } })
+    store.dispatch({ shortcuts: false })
+    expect(store.get()).toEqual({ ...defaultPrefs, micDeviceId: "usb", shortcuts: false })
+    expect(JSON.parse(localStorage.getItem(KEY)!)).toEqual({ ...defaultPrefs, micDeviceId: "usb", shortcuts: false })
     // A second browser tab (a fresh store) sees the same.
     const other = createPrefsStore()
     other.load()
     expect(other.get()).toEqual(store.get())
   })
 
-  it("a stored choice round-trips through storage, options included", () => {
+  it("a character stored by an older version is dropped on the next write", () => {
+    localStorage.setItem(KEY, JSON.stringify({ micDeviceId: "usb", character: { character: "lips", version: "1.0.0", options: { size: 2 } } }))
     const store = createPrefsStore()
-    store.dispatch({ character: { character: "lips", version: "1.0.0", options: { size: 2, ring: true, style: "round" } } })
-    const other = createPrefsStore()
-    other.load()
-    expect(other.get().character).toEqual({ character: "lips", version: "1.0.0", options: { size: 2, ring: true, style: "round" } })
+    store.load()
+    store.dispatch({ sinkId: "spk" })
+    expect(JSON.parse(localStorage.getItem(KEY)!)).toEqual({ ...defaultPrefs, micDeviceId: "usb", sinkId: "spk" })
   })
 
   it("when storage refuses writes (private mode), the preference still holds for this page", () => {

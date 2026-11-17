@@ -1,5 +1,5 @@
 import { type VoiceRef, voiceKey } from "@pva/core"
-import type { Assistant, DefaultVoice } from "@pva/protocol"
+import { type Assistant, type DefaultVoice, voiceUsersOf } from "@pva/protocol"
 import { Effect } from "effect"
 import { DEFAULT_ASSISTANT_VOICE } from "../voiceSelection.ts"
 import type { VoiceCatalog } from "./VoiceCatalog.ts"
@@ -31,14 +31,7 @@ export const makeAssistantVoice = (options: {
   }
   const refNow = (): VoiceRef => first()?.voice ?? DEFAULT_ASSISTANT_VOICE
 
-  const usedBy = (): ReadonlyMap<string, ReadonlyArray<string>> => {
-    const used = new Map<string, Array<string>>()
-    for (const a of options.assistants()) {
-      const key = voiceKey(a.voice)
-      used.set(key, [...(used.get(key) ?? []), a.id])
-    }
-    return used
-  }
+  const usedBy = (): ReadonlyMap<string, ReadonlyArray<string>> => voiceUsersOf(options.assistants(), []).assistants
 
   const get: Effect.Effect<DefaultVoice> = Effect.sync(() => {
     const assistant = first()

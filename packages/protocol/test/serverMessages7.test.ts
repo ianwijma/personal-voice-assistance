@@ -183,15 +183,15 @@ describe("the new messages through the codec", () => {
 
 describe("version 7 handling", () => {
   it("the welcome example and the hello example speak the current version", () => {
-    expect(PROTOCOL_VERSION).toBe(7)
+    expect(PROTOCOL_VERSION).toBe(8)
     expect(serverExamples.welcome.protocol).toBe(PROTOCOL_VERSION)
     expect(clientExamples.hello.protocol).toBe(PROTOCOL_VERSION)
   })
   it("a hello of another version still decodes (the server answers with the mismatch close), a fractional one does not", () => {
-    for (const protocol of [0, 6, 8]) {
+    for (const protocol of [0, 6, 7, 9]) {
       expect(decodeClientMessage(JSON.stringify({ ...clientExamples.hello, protocol })), String(protocol)).toMatchObject({ _tag: "Ok" })
     }
-    expect(decodeClientMessage(JSON.stringify({ ...clientExamples.hello, protocol: 7.5 }))).toMatchObject({ _tag: "Invalid", messageType: "hello" })
+    expect(decodeClientMessage(JSON.stringify({ ...clientExamples.hello, protocol: 8.5 }))).toMatchObject({ _tag: "Invalid", messageType: "hello" })
   })
   it("a welcome carries the voice snapshot's setup and conversations, and refuses a setup that is not one", () => {
     const { type: _type, ...setup } = assistantsServerExamples["device.setup"]

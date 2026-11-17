@@ -37,7 +37,7 @@ const typeBase = baseOfType(type)
 
 describe("sections of a device type", () => {
   it("a type with every key has every section; a section needs all of its keys", () => {
-    expect(sectionsOf(type)).toEqual(["assign", "phrases", "voicePage", "interrupting", "audio", "captions"])
+    expect(sectionsOf(type)).toEqual(["assign", "phrases", "voicePage", "look", "voice", "interrupting", "audio", "captions"])
     expect(sectionsOf({ keys: ["assistants", "withoutPhrase", "interruptMode"] })).toEqual(["assign", "interrupting"])
     // `assign` is two keys: one of them alone is not the section.
     expect(sectionsOf({ keys: ["assistants"] })).toEqual([])
@@ -45,7 +45,7 @@ describe("sections of a device type", () => {
   })
 
   it("an unknown type shows every section", () => {
-    expect(sectionsOf(undefined)).toHaveLength(6)
+    expect(sectionsOf(undefined)).toHaveLength(8)
   })
 })
 
@@ -329,5 +329,57 @@ describe("wakesAssistant", () => {
   it("a phrase that is only in a draft, or on another device, wakes nobody here", () => {
     expect(wakesAssistant(saved, "ok computer")).toBeUndefined()
     expect(wakesAssistant([], "hey jeff")).toBeUndefined()
+  })
+})
+
+describe("the Look and Voice sections (docs/LOOKS-AND-VOICES.md §2, §4)", () => {
+  const allKeys = type
+  const older = { ...type, keys: type.keys.filter((k) => k !== "look" && k !== "voice") }
+  const flame = { character: "flame", version: "1.1.1", options: { size: 0.8 } }
+  const amy = { provider: "piper", voiceId: "en_US-amy-medium" }
+
+  it("are sections of a type that has their keys, and not of one that does not (an older server)", () => {
+    expect(sectionsOf(allKeys)).toEqual(["assign", "phrases", "voicePage", "look", "voice", "interrupting", "audio", "captions"])
+    expect(sectionsOf(older)).not.toContain("look")
+    expect(sectionsOf(older)).not.toContain("voice")
+  })
+
+  it("a device follows its type (the assistant's look and voice) until it sets its own; Reset goes back", () => {
+    expect(valueOf(device, noEdit, "look")).toEqual({ from: "assistant" })
+    expect(isOwn(device, noEdit, "look")).toBe(false)
+    const e = setKeys(device, setKeys(device, noEdit, { look: { from: "device", look: flame } }), { voice: { from: "device", voice: amy } })
+    expect(isOwn(device, e, "look")).toBe(true)
+    expect(isOwn(device, e, "voice")).toBe(true)
+    expect(sectionChanged(device, e, "look")).toBe(true)
+    expect(settingsOf(device, e)).toMatchObject({ look: { from: "device", look: flame }, voice: { from: "device", voice: amy } })
+    expect(patchOf(device, e)).toEqual({ look: { from: "device", look: flame }, voice: { from: "device", voice: amy } })
+    const back = resetSection(device, e, "look")
+    expect(isOwn(device, back, "look")).toBe(false)
+    expect(patchOf(device, back)).toEqual({ voice: { from: "device", voice: amy } })
+  })
+
+  it("a saved own look resets to null in the patch; following the assistant can be a device's own value", () => {
+    const saved = baseOfDevice({ ...exampleDevice, own: { ...exampleDevice.own, look: { from: "device", look: flame } }, settings: { ...exampleDevice.settings, look: { from: "device", look: flame } } }, type)
+    expect(isOwn(saved, noEdit, "look")).toBe(true)
+    expect(patchOf(saved, resetSection(saved, noEdit, "look"))).toEqual({ look: null })
+    // The type's defaults fix a look; this device follows the assistant anyway, as its own value.
+    const typeFixed = { ...type, settings: { ...type.settings, look: { from: "device" as const, look: flame } } }
+    const follower = baseOfDevice({ ...exampleDevice, settings: { ...exampleDevice.settings, look: { from: "device", look: flame } } }, typeFixed)
+    const e = setKeys(follower, noEdit, { look: { from: "assistant" } })
+    expect(patchOf(follower, e)).toEqual({ look: { from: "assistant" } })
+    expect(isOwn(follower, e, "look")).toBe(true)
+  })
+
+  it("an edit back to the saved own look leaves nothing to save", () => {
+    const saved = baseOfDevice({ ...exampleDevice, own: { ...exampleDevice.own, voice: { from: "device", voice: amy } }, settings: { ...exampleDevice.settings, voice: { from: "device", voice: amy } } }, type)
+    const e = setKeys(saved, setKeys(saved, noEdit, { voice: { from: "assistant" } }), { voice: { from: "device", voice: { ...amy } } })
+    expect(patchOf(saved, e)).toEqual({})
+    expect(isDirty(saved, e, exampleDevice.name)).toBe(false)
+  })
+
+  it("a type's defaults set them for every device of the type", () => {
+    const e = setKeys(typeBase, noEdit, { look: { from: "device", look: flame } })
+    expect(patchOf(typeBase, e)).toEqual({ look: { from: "device", look: flame } })
+    expect(isOwn(typeBase, e, "look")).toBe(false) // a type has no "own": it is the defaults
   })
 })

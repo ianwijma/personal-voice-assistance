@@ -71,24 +71,29 @@ export function NameDialog({ title, text, confirm, initial, make, onClose, onCre
   const [name, setName] = useState(initial)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | undefined>()
-  const submit = () => {
+  /** The warnings of a create (a hosted voice without its key): nothing was created; "<confirm> anyway" sends `saveAnyway`. */
+  const [warnings, setWarnings] = useState<ReadonlyArray<string>>([])
+  const submit = (saveAnyway = false) => {
     setBusy(true)
     setError(undefined)
+    setWarnings([])
     const { body, copyOf } = make(name.trim())
     // continuation(none): only this dialog's own state; the page navigates to the new assistant
-    void client.createAssistant(body, copyOf !== undefined ? { copyOf } : {}).then((o) => {
+    void client.createAssistant(body, { ...(copyOf !== undefined ? { copyOf } : {}), ...(saveAnyway ? { saveAnyway: true } : {}) }).then((o) => {
       setBusy(false)
       if (o.kind === "ok" && o.assistantId !== undefined) onCreated(o.assistantId)
+      else if (o.kind === "warnings") setWarnings(o.warnings.map((w) => w.message))
       else if (o.kind === "invalid") setError(o.fieldErrors.map((e) => e.message).join(" "))
       else if (o.kind !== "ok") setError(o.message)
     })
   }
+  const warned = warnings.length > 0
   return (
     <Dialog title={title} onClose={onClose} testId="name-dialog" labelId="name-dialog-title" wide>
       <form
         onSubmit={(e) => {
           e.preventDefault()
-          if (name.trim() !== "" && !busy) submit()
+          if (name.trim() !== "" && !busy) submit(warned)
         }}
       >
         <p className="mt-1 text-[14px] text-ink-muted">{text}</p>
@@ -100,11 +105,21 @@ export function NameDialog({ title, text, confirm, initial, make, onClose, onCre
           maxLength={32}
           autoComplete="off"
           spellCheck={false}
-          onChange={(e) => setName(e.target.value)}
+          onChange={(e) => {
+            setName(e.target.value)
+            setWarnings([])
+          }}
           aria-invalid={error !== undefined || undefined}
         />
         {error !== undefined && <p role="alert" className="mt-2 text-[13px] text-danger" data-testid="field-error">{error}</p>}
-        <DialogButtons cancel="Cancel" confirm={confirm} busy={busy} onCancel={onClose} onConfirm={submit} disabled={name.trim() === ""} />
+        {warned && (
+          <div className="mt-3 flex flex-col gap-1.5 rounded-md border border-warn/40 bg-warn/5 px-3 py-2.5" role="alert" data-testid="save-warnings">
+            {warnings.map((w, i) => <p key={i} className="text-[13px] text-ink">{w}</p>)}
+          </div>
+        )}
+        {warned
+          ? <DialogButtons cancel="Go back" confirm={`${confirm} anyway`} busy={busy} onCancel={() => setWarnings([])} onConfirm={() => submit(true)} />
+          : <DialogButtons cancel="Cancel" confirm={confirm} busy={busy} onCancel={onClose} onConfirm={() => submit()} disabled={name.trim() === ""} />}
       </form>
     </Dialog>
   )

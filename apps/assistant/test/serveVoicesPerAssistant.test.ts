@@ -201,7 +201,9 @@ describe("serve: voices from the resource pool (WP-10)", () => {
     expect((await spoken(device, "bravo", "same voice", "t1")).voices).toEqual([PIPER])
     await until("kokoro released", () => voices.released.includes(KOKORO))
     expect(ttsStatus()).toHaveLength(1)
-    expect(ttsStatus()[0]).toMatchObject({ key: PIPER, state: "ready", usedBy: ["alpha", "bravo"] })
+    expect(ttsStatus()[0]).toMatchObject({ key: PIPER, state: "ready" })
+    // The pool's users are the assistants and the assistants at each place (`alpha@device:…`); both are Alpha and Bravo.
+    expect([...new Set(ttsStatus()[0]!.usedBy.map((u) => u.split("@")[0]))].sort()).toEqual(["alpha", "bravo"])
   })
 
   it("a voice change applies at that assistant's next turn without a reload and without interrupting a turn speaking on another device", async () => {

@@ -161,6 +161,8 @@ export interface AssistantsMock {
   readonly assistants: () => ReadonlyArray<Assistant>
   readonly infos: (devices: ReadonlyArray<Known>) => Array<AssistantInfo>
   readonly deviceTypes: () => Array<DeviceTypeInfo>
+  /** Voice key → the devices (and the type's defaults) whose effective voice is their own, as the real server lists them. */
+  readonly voiceUsers: (devices: ReadonlyArray<Known>) => ReadonlyMap<string, Array<{ target: DeviceTarget; name: string }>>
   /** A device's protocol 7 fields. */
   readonly deviceFields: (id: string) => { own: DeviceOwn; settings: DeviceSettings; hearer: string | null; rev: number }
   readonly create: (message: { assistant: AssistantBody; copyOf?: string | undefined; placements?: ReadonlyArray<{ target: DeviceTarget; phrase?: string | undefined }> | undefined }, devices: ReadonlyArray<Known>) => AssistantResult
@@ -221,6 +223,17 @@ export const createAssistantsMock = (catalog: ModuleCatalog): AssistantsMock => 
       deviceOwn = seedDeviceOwn(longPhrase)
     },
     assistants: () => assistants,
+    voiceUsers: (devices) => {
+      const out = new Map<string, Array<{ target: DeviceTarget; name: string }>>()
+      const add = (settings: DeviceSettings, target: DeviceTarget, name: string) => {
+        if (settings.voice.from !== "device") return
+        const key = `${settings.voice.voice.provider}:${settings.voice.voice.voiceId}`
+        out.set(key, [...(out.get(key) ?? []), { target, name }])
+      }
+      add(typeSettings, { kind: "type", type: WEB_VOICE_KIND }, `Every ${WEB_VOICE_DEVICE_TYPE.one}`)
+      for (const d of devices) add(effective(deviceOwn.get(d.id)?.own), { kind: "device", id: d.id }, d.name)
+      return out
+    },
     infos: (devices) => {
       const entries = [
         { target: { kind: "type", type: WEB_VOICE_KIND } as DeviceTarget, settings: typeSettings },

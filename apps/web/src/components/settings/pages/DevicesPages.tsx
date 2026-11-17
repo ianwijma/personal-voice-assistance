@@ -34,6 +34,7 @@ import { FormFooter } from "../FormFooter.tsx"
 import { PhraseTester } from "../PhraseTester.tsx"
 import { Dialog, DialogButtons } from "./assistants/parts.tsx"
 import { AssignSection, MarksFor, type SectionContext } from "./devices/AssignSection.tsx"
+import { LookSection, LookVoiceLine, VoiceSection } from "./devices/LookVoiceSections.tsx"
 import { Chip, DField, Pill } from "./devices/parts.tsx"
 
 /** The time, ticking every 30 s, for "Seen 5 min ago". */
@@ -55,7 +56,7 @@ const talkingOf = (d: DeviceListInfo, session: SessionInfo | undefined): boolean
 /** How many sections a device has its own value for (the list and "who answers without a phrase" are one section). */
 const ownSections = (d: Pick<DeviceListInfo, "own">): number => {
   const own = d.own as Record<string, unknown>
-  return ["assistants|withoutPhrase", "matching", "voicePage", "interruptMode", "audio", "captions"].filter((s) => s.split("|").some((k) => own[k] !== undefined)).length
+  return ["assistants|withoutPhrase", "matching", "voicePage", "look", "voice", "interruptMode", "audio", "captions"].filter((s) => s.split("|").some((k) => own[k] !== undefined)).length
 }
 
 /**
@@ -123,6 +124,7 @@ function Row({ d, type, defaults, assistants, session, now }: {
             ))}
           </span>
           <span className="block text-[12px] text-ink-faint" data-testid="device-meta">{meta.join(" · ")}</span>
+          <LookVoiceLine settings={settings} own={d.own} defaults={defaults} />
         </span>
         <Icon name="chevron" size={16} className="mt-2 shrink-0 text-ink-faint" />
       </button>
@@ -217,6 +219,8 @@ function DeviceEditor({ type, device }: { readonly type: DeviceTypeInfo; readonl
   const [acked, setAcked] = useState<DeviceEdit | undefined>()
   /** Bumped when the draft is discarded or a section reset: the number fields start again (their text and errors). */
   const [generation, setGeneration] = useState(0)
+  /** Bumped when the draft is discarded, a section reset or a save sent: an edit still on its way (a character loading) is dropped. */
+  const [epoch, setEpoch] = useState(0)
   const revNow = useRef(rev)
   /**
    * Set while a save is on its way: the editor is inert and `update` ignores changes (they would not be in the save).
@@ -269,6 +273,7 @@ function DeviceEditor({ type, device }: { readonly type: DeviceTypeInfo; readonl
   const discard = () => {
     setState({ edit: noEdit, rev })
     setGeneration((g) => g + 1)
+    setEpoch((g) => g + 1)
   }
   const update = useCallback((f: (e: DeviceEdit) => DeviceEdit) => {
     setJustSaved(false)
@@ -297,11 +302,16 @@ function DeviceEditor({ type, device }: { readonly type: DeviceTypeInfo; readonl
   const defaultsName = `Every ${type.one}`
   const thisWord = isType ? `these ${type.many}` : `this ${type.one}`
   const name = edit.name ?? device?.name ?? defaultsName
-  const ctx: SectionContext = { base, edit, update, settings, isType, thisWord, defaultsName, deviceName: name, setBlocked: setBlockedId, generation, renew: () => setGeneration((g) => g + 1) }
+  const ctx: SectionContext = { base, edit, update, settings, isType, thisWord, defaultsName, deviceName: name, setBlocked: setBlockedId, generation, epoch, renew: () => {
+    setGeneration((g) => g + 1)
+    setEpoch((g) => g + 1)
+  } }
   const sections = sectionsOf(type)
   const has = (s: ReturnType<typeof sectionsOf>[number]) => sections.includes(s)
 
   const save = async (saveAnyway = false): Promise<Outcome> => {
+    // The save takes the draft as shown: an edit still on its way is not in it and must not land after it.
+    setEpoch((g) => g + 1)
     savingNow.current = true
     setSaving(true)
     setMessage(undefined)
@@ -436,6 +446,8 @@ function DeviceEditor({ type, device }: { readonly type: DeviceTypeInfo; readonl
           </DField>
         </section>
       )}
+      {has("look") && <LookSection ctx={ctx} assistants={assistants} />}
+      {has("voice") && <VoiceSection ctx={ctx} assistants={assistants} />}
       <section className="flex flex-col gap-3" aria-labelledby="h-other" data-testid="section-other">
         <h3 id="h-other" className="label text-ink-faint">Other device settings</h3>
         {has("interrupting") && (

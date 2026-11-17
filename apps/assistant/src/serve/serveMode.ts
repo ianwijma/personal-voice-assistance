@@ -24,9 +24,12 @@ import {
   DEFAULT_MAX_VOICE_SESSIONS,
   DEFAULT_SESSION_DISCARD_MINUTES,
   type DeviceSettings,
+  type DeviceUser,
   deviceTypeOf,
+  deviceVoiceUser,
   effectiveDeviceSettings,
   type EngineInfo,
+  type ResourceInfo,
   hearerOf,
   homeLineOf,
   linkedModuleDefaults,
@@ -34,6 +37,10 @@ import {
   type VoiceInfo,
   type ServerMessage,
   type TraceConfig,
+  typeVoiceUser,
+  voiceFor,
+  type VoicePlace,
+  voiceUsersOf,
   WEB_VOICE_KIND
 } from "@pva/protocol"
 import { Cause, Config, ConfigProvider, Effect, Exit, Fiber, FiberSet, Option, type Scope, Stream } from "effect"
@@ -89,7 +96,7 @@ import {
   type TtsSpec,
   ttsSpecOf
 } from "./Resources.ts"
-import { ttsProviderInfo } from "../providers.ts"
+import { isTtsProvider, ttsProviderInfo } from "../providers.ts"
 import { DEFAULT_ASSISTANT_VOICE, voiceEngineName, voiceLabel } from "../voiceSelection.ts"
 import { type EnvMover, makeEnvMover } from "./envSettings.ts"
 import { type HttpError, type HttpServer, startHttp, webDirExists } from "./http.ts"
@@ -514,6 +521,21 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     const placeOf = (deviceId: string | undefined): string =>
       deviceId !== undefined && store.settings().devices[deviceId] !== undefined ? `device:${deviceId}` : `type:${WEB_VOICE_KIND}`
     /**
+     * Who the pool binds a voice to (docs/LOOKS-AND-VOICES.md §3): the assistant at each place that lists it,
+     * `assistant@place`, whether the place speaks with its own voice or the assistant's. The user stays the same when
+     * the place's voice changes or flips source (own <-> the assistant's), so the pool keeps that place's old voice
+     * bound until the new one has loaded, per place: two places reset at once each keep their own old voice. Instances
+     * are still shared by voice key. Beside them the assistant itself (`assistant`) is a user while some place follows
+     * its voice: what a session of a place that does not list it falls back to (`voiceUserFor`).
+     */
+    const voiceUserOf = (assistantId: string, place: string): string => `${assistantId}@${place}`
+    /** The user whose voice `assistantId` speaks with on `deviceId` now: its place's binding, else the assistant's own. */
+    const voiceUserFor = (assistantId: string, deviceId: string | undefined): string => {
+      const user = voiceUserOf(assistantId, placeOf(deviceId))
+      if (resources.ttsKeyFor(user) !== undefined || deviceSettingsOf(deviceId).voice.from === "device") return user
+      return assistantId
+    }
+    /**
      * Every hearing place (§3.2 "Wanted", stt: the hearer of every type defaults entry and of every known device) with
      * its effective settings. `override` replaces one place's settings (a save being checked); a type's new defaults
      * also apply to the devices of that type that inherit them.
@@ -533,6 +555,32 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       for (const id of Object.keys(file.devices)) places.set(`device:${id}`, deviceSettingsFrom(file, id))
       if (override !== undefined) places.set(override.place, override.settings)
       return places
+    }
+    /**
+     * The devices that speak with each voice as their own (`voice: { from: "device" }`), by voice key, from the
+     * effective settings of every place (a device's own value, else its type's defaults), so it is always current. A
+     * device that follows a type's own voice is listed beside "Every <type>" (it speaks with it too).
+     */
+    const deviceUsersByVoice = (): ReadonlyMap<string, ReadonlyArray<DeviceUser>> => {
+      const file = store.settings()
+      const places = [...placesNow()].map(([place, settings]): VoicePlace => {
+        const id = place.slice(place.indexOf(":") + 1)
+        return {
+          user: place.startsWith("type:") ? typeVoiceUser(id, deviceTypeOf(id)?.one ?? id) : deviceVoiceUser(id, file.devices[id]?.name ?? ""),
+          voice: settings.voice
+        }
+      })
+      return voiceUsersOf([], places).devices
+    }
+    /** Pool status for the snapshot: users `assistant@place` count as the assistant; the devices come from the settings. */
+    const resourceStatus = (): Array<ResourceInfo> => {
+      const devices = deviceUsersByVoice()
+      return resources.status().map((r) => {
+        if (r.kind !== "tts") return r
+        const usedBy = [...new Set(r.usedBy.map((u) => u.split("@")[0]!))]
+        const usedByDevices = devices.get(r.key) ?? []
+        return { ...r, usedBy, ...(usedByDevices.length > 0 ? { usedByDevices: [...usedByDevices] } : {}) }
+      })
     }
     /**
      * The recogniser of every hearing place: its hearer's hearing (switched on or not, §2.6: switching an assistant
@@ -579,7 +627,15 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
         const spec = llmSpecOf(assistant.llm, accounts)
         llms.set(assistant.id, spec)
         rememberLlmSpec(spec)
-        voices.set(assistant.id, ttsSpecOf(assistant.voice, voiceAccounts))
+      }
+      // A voice per place that lists the assistant: the device's own voice there (`voice` section), else the assistant's.
+      for (const [place, settings] of placesNow()) {
+        for (const listing of settings.assistants) {
+          const assistant = assistantsNow().get(listing.assistant)
+          if (assistant === undefined || !assistant.on) continue
+          voices.set(voiceUserOf(assistant.id, place), ttsSpecOf(voiceFor(settings.voice, assistant), voiceAccounts))
+          if (settings.voice.from === "assistant") voices.set(assistant.id, ttsSpecOf(assistant.voice, voiceAccounts))
+        }
       }
       return { llms, voices, recognisers: recognisersOf(placesNow(), assistantsNow()) }
     }
@@ -689,7 +745,8 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
      * a binding on the Claude subscription: the options its agent is passed, from the assistant's own fields), the
      * voice it is bound to, the modules and tools it has, and its reply-early and tool-round settings.
      */
-    const traceConfigOf = (assistant: Assistant, tools: number, modules: number): AssistantTraceConfig => {
+    const traceConfigOf = (assistant: Assistant, tools: number, modules: number, deviceId: string | undefined): AssistantTraceConfig => {
+      const deviceVoice = deviceSettingsOf(deviceId).voice
       const key = resources.keyFor(assistant.id)
       // The account of the binding in use, as `agentSetup` reads it (during a change the old binding answers, the old
       // way), not the saved one. Not bound yet: the saved account.
@@ -702,7 +759,8 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
           // No token limit is passed to Claude Code (`ClaudeConversationOptions` has none): the stand-in's, as `llmSpecOf` keeps it.
           ? { account: SUBSCRIPTION_PROVIDER, model: passed.model, effort: assistant.llm.effort, thinking: assistant.llm.thinking, maxTokens: 1024 }
           : { account: spec.account, model: spec.model, effort: spec.effort, thinking: spec.thinking, maxTokens: spec.maxTokens },
-        voice: resources.ttsKeyFor(assistant.id) ?? voiceKey(assistant.voice),
+        voice: resources.ttsKeyFor(voiceUserFor(assistant.id, deviceId)) ?? voiceKey(voiceFor(deviceVoice, assistant)),
+        voiceFrom: deviceVoice.from,
         modules,
         tools: passed !== undefined && !passed.tools ? 0 : tools,
         replyEarly: assistant.replyEarly,
@@ -716,7 +774,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
      * read here at the turn's start: a changed model applies from the next turn, once its instance is ready). Rebuilt
      * only when the module snapshot, the assistant or its instance changed (reference compares per turn).
      */
-    const conversationSetup = (assistantId: string) => {
+    const conversationSetup = (assistantId: string, deviceId: string | undefined) => {
       let cached:
         | {
           snapshot: ModuleSnapshot
@@ -724,6 +782,9 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
           home: string | undefined
           llm: Llm["Service"] | undefined
           tts: Tts["Service"] | undefined
+          voiceUser: string
+          /** The device's voice setting as the snapshot read it (`voiceSourceNow`): the trace's `voiceFrom` and, unbound, its `voice`. */
+          voiceSource: string
           setup: TurnSetup
           instructions: ReadonlyArray<string>
           /** The turn's configuration snapshot (`TraceConfig` without the hearing, which is the device's). */
@@ -740,11 +801,21 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
         return resources.llmFor(assistantId)
       }
       /** Likewise the assistant's voice: the pool's instance for its `voice`, read at the turn's start. */
+      const voiceUserNow = (): string => voiceUserFor(assistantId, deviceId)
+      /**
+       * Whose voice this device speaks with, and which (its own setting): the trace config reads it. A device switching
+       * to its own voice with the assistant's voice key, or back, changes neither the pool user nor the instance, so the
+       * guards compare this too (PR #84 review 4).
+       */
+      const voiceSourceNow = (): string => {
+        const v = deviceSettingsOf(deviceId).voice
+        return v.from === "device" ? `device:${voiceKey(v.voice)}` : "assistant"
+      }
       const ttsNow = () => {
-        const bound = resources.ttsFor(assistantId)
+        const bound = resources.ttsFor(voiceUserNow())
         if (bound !== undefined) return bound
         runSync(Effect.asVoid(Effect.forkDetach(syncResources(), { startImmediately: true })))
-        return resources.ttsFor(assistantId)
+        return resources.ttsFor(voiceUserNow())
       }
       const current = () => {
         const snapshot = host.snapshot()
@@ -752,19 +823,26 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
         const home = homeLine()
         const llm = llmNow()
         const tts = ttsNow()
-        if (cached?.snapshot !== snapshot || cached.assistant !== assistant || cached.home !== home || cached.llm !== llm || cached.tts !== tts) {
+        const voiceUser = voiceUserNow()
+        const voiceSource = voiceSourceNow()
+        if (
+          cached?.snapshot !== snapshot || cached.assistant !== assistant || cached.home !== home || cached.llm !== llm || cached.tts !== tts ||
+          cached.voiceUser !== voiceUser || cached.voiceSource !== voiceSource
+        ) {
           // An assistant that does not exist (any more) is never routed; should a turn still start, it gets no tools.
           const mine = assistant === undefined ? { registry: makeToolRegistry([]), instructions: [], modules: 0 } : modulesFor(snapshot, assistant)
           const base = assistant?.prompt ?? defaultSystemPrompt
           const instructions = home === undefined ? mine.instructions : [home, ...mine.instructions]
           // `TurnSetup.ttsReady`: completes once this `tts` (the instance bound now, not a later one) is built.
-          const ttsReady = resources.ttsReady(assistantId)
+          const ttsReady = resources.ttsReady(voiceUser)
           cached = {
             snapshot,
             assistant,
             home,
             llm,
             tts,
+            voiceUser,
+            voiceSource,
             setup: {
               system: systemFor(base, instructions),
               registry: mine.registry,
@@ -775,7 +853,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
               ...(assistant !== undefined ? { maxToolRounds: assistant.toolRounds } : {})
             },
             instructions,
-            config: assistant === undefined ? undefined : traceConfigOf(assistant, mine.registry.specs.length, mine.modules)
+            config: assistant === undefined ? undefined : traceConfigOf(assistant, mine.registry.specs.length, mine.modules, deviceId)
           }
         }
         return cached
@@ -785,13 +863,14 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       const setup = Effect.sync((): TurnSetup => current().setup)
       /**
        * The turn's configuration snapshot, read when its trace begins: the values `current()` resolved for the setup,
-       * made again only when the module snapshot, the assistant or its bindings changed (reference compares, no
+       * made again only when the module snapshot, the assistant, its bindings or the device's voice setting changed (no
        * prompt or registry work). The object is never changed afterwards: a trace keeps the one its turn began with.
        */
       const config = (): AssistantTraceConfig | undefined => {
         const c = cached
         if (c !== undefined && c.snapshot === host.snapshot() && c.assistant === assistantsNow().get(assistantId) &&
-          c.llm === resources.llmFor(assistantId) && c.tts === resources.ttsFor(assistantId)) return c.config
+          c.llm === resources.llmFor(assistantId) && c.voiceUser === voiceUserNow() && c.tts === resources.ttsFor(c.voiceUser) &&
+          c.voiceSource === voiceSourceNow()) return c.config
         return current().config
       }
       // WP-13a: a Claude subscription assistant's options for its conversations (the same object while unchanged).
@@ -985,6 +1064,24 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       return `This loads ${added.size === 1 ? "another speech model" : `${added.size} more speech models`}: about ${mb} MB more memory and ${loadS.toFixed(1)} s to load, ` +
         `more than 75 % of the ${freeMb} MB free on this machine.`
     }
+    /**
+     * A voice a device would speak with that cannot be used (docs/LOOKS-AND-VOICES.md §3): a voice on this machine that
+     * is not downloaded (or does not exist) is an error; a hosted provider without a key a warning ("Save anyway").
+     */
+    const voiceProblem = (ref: VoiceRef): { readonly level: "error" | "warning"; readonly message: string } | undefined => {
+      if (!isTtsProvider(ref.provider)) return { level: "error", message: `There is no voice provider "${ref.provider}"` }
+      const info = ttsProviderInfo[ref.provider]
+      if (info.location === "local") {
+        const preset = Object.hasOwn(SherpaTts.presets, ref.voiceId) ? SherpaTts.presets[ref.voiceId] : undefined
+        if (preset === undefined) return { level: "error", message: `There is no voice "${ref.voiceId}" on this machine` }
+        if (SherpaTts.isInstalled(preset.name, sections.modelDirs().tts)) return undefined
+        return { level: "error", message: `${preset.voice.name} is not downloaded yet: download it first (${preset.sizeMb} MB)` }
+      }
+      if (info.keyEnv !== undefined && !settingNow(info.keyEnv)) {
+        return { level: "warning", message: `${info.label} has no API key yet, so this voice cannot speak.` }
+      }
+      return undefined
+    }
     /** While the vault is locked, a key that "is not set" is really locked away. */
     const explainProblems = (problems: ReadonlyArray<{ readonly stage: string; readonly message: string }>) => {
       if (keys.state() !== "locked") return problems
@@ -1023,7 +1120,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
         ...engines.filter((e) => e.stage !== "llm" && e.stage !== "tts" && e.stage !== "stt"),
         ...(ttsRows().length > 0 ? ttsRows() : engines.filter((e) => e.stage === "tts"))
       ],
-      resources: { status: resources.status, rebuild: syncResources({ rebuild: true }), voices: voiceInfos },
+      resources: { status: resourceStatus, rebuild: syncResources({ rebuild: true }), voices: voiceInfos },
       explainProblems,
       blocked: settingsProblem
     })
@@ -1086,7 +1183,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
           ...(options.hearerSwitchWaitMs !== undefined ? { hearerSwitchWaitMs: options.hearerSwitchWaitMs } : {}),
           assistants: assistantsNow,
           conversationSetup,
-          voiceOf: resources.ttsKeyFor,
+          voiceOf: (assistant, deviceId) => resources.ttsKeyFor(voiceUserFor(assistant, deviceId)),
           moduleOfTool: (name) => host.snapshot().toolModules.get(name) ?? null,
           routing: () => routing,
           turnTrace,
@@ -1137,6 +1234,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       hearingProblems,
       llmProblems,
       speechMemoryWarning,
+      voiceProblem,
       // TypeSafe is set up: the routing section is switched on, with a key and a valid address (WP-14).
       canAuto: routing.ready
     })
@@ -1199,6 +1297,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       live: (voice) => resources.tts(voiceKey(voice)),
       busy: () => sessions.list().some((s) => inTurn.has(s.state)),
       usedBy: assistantVoice.usedBy,
+      usedByDevices: () => deviceUsersByVoice(),
       isFavourite: favourites.has,
       // Every voice of a shared archive (Kokoro) reports the one job that downloads it.
       download: (preset) => jobs.running("tts-models", SherpaTts.archiveOwner(preset) ?? preset),

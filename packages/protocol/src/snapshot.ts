@@ -1,5 +1,6 @@
 import { Schema } from "effect"
 import { AssistantId } from "./assistants.ts"
+import { DeviceUser } from "./deviceUsers.ts"
 import { AssistantInfo, DeviceListInfo, DeviceSetup, DeviceTypeInfo } from "./devices.ts"
 import { ConversationId, SessionInfo } from "./sessions.ts"
 import {
@@ -151,7 +152,10 @@ export const ResourceInfo = Schema.Struct({
   key: Schema.String,
   label: Schema.String,
   location: Schema.Literals(["local", "hosted"]),
+  /** Assistants only: a pool user `assistant@place` (a device voice) counts as the assistant. */
   usedBy: Schema.Array(AssistantId),
+  /** Additive: the devices (and device types' defaults) that use this resource as their own; today a voice. */
+  usedByDevices: Schema.optionalKey(Schema.Array(DeviceUser)),
   state: Schema.Literals(["unused", "starting", "ready", "failed"]),
   problem: Schema.optionalKey(Schema.String),
   ramMb: Schema.optionalKey(NonNegativeFinite)
@@ -223,6 +227,8 @@ export const TraceConfig = Schema.Struct({
   }),
   /** `VoiceKey` of the voice. */
   voice: Schema.String,
+  /** Whose voice it is (docs/LOOKS-AND-VOICES.md): the device's own for every assistant, or the assistant's. Absent in older traces. */
+  voiceFrom: Schema.optionalKey(Schema.Literals(["assistant", "device"])),
   modules: NonNegativeInt,
   tools: NonNegativeInt,
   replyEarly: Schema.Boolean,

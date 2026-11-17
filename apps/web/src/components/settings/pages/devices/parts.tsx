@@ -19,6 +19,7 @@ export const useValueDraft = (path: string, value: unknown, onChange: (v: unknow
   return useMemo(
     () => ({
       current,
+      epoch: 0,
       saved: current,
       dirty: false,
       saving: false,

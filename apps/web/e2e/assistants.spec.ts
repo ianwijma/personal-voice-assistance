@@ -385,6 +385,25 @@ test("Duplicate starts a new assistant with these settings (copyOf), without dev
   await expect(page.getByTestId("used-web-voice")).toContainText("Not on any browser.")
 })
 
+test("Duplicate of an assistant whose hosted voice has no key: the warning, Go back, then Duplicate anyway sends saveAnyway", async ({ page, baseURL }) => {
+  // PR #84 review, finding 2. Cartesia has no key in the mock; T3 speaks with a Cartesia voice (changed elsewhere).
+  expect((await touch("t3", { voice: { provider: "cartesia", voiceId: "db6b0ed5-d5d3-463d-ae85-518a07d3c2b4" } })).ok).toBe(true)
+  await open(page, baseURL, "t3")
+  await page.getByTestId("duplicate").click()
+  const dialog = page.getByTestId("name-dialog")
+  await dialog.getByTestId("dialog-confirm").click()
+  await expect(dialog.getByTestId("save-warnings")).toContainText("Cartesia has no API key yet")
+  await dialog.getByRole("button", { name: "Go back" }).click()
+  await expect(dialog.getByTestId("save-warnings")).toHaveCount(0)
+  await dialog.getByTestId("dialog-confirm").click()
+  await expect(dialog.getByTestId("save-warnings")).toBeVisible()
+  await dialog.getByRole("button", { name: "Duplicate anyway" }).click()
+  await expect(page.getByTestId("assistant-page")).toHaveAttribute("data-assistant", "t3-copy")
+  const sent = (await mock.log()).messages.filter((m) => m.type === "assistant.create")
+  expect(sent.map((m) => m.saveAnyway)).toEqual([undefined, undefined, true])
+  expect(sent[2]).toMatchObject({ copyOf: "t3", assistant: { voice: { provider: "cartesia" } } })
+})
+
 test("unsaved edits stay across tabs, and leaving the assistant asks first", async ({ page, baseURL }) => {
   await open(page, baseURL, "jeff")
   await page.getByLabel("Purpose").fill("Edited.")

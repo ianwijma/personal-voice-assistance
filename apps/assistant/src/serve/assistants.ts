@@ -30,6 +30,7 @@ import {
   validateAssistant,
   validateDeviceSettings,
   WAKE_PHRASES_MAX,
+  type VoiceRefJson,
   type WithoutPhrase
 } from "@pva/protocol"
 import { Effect, Schema, Semaphore } from "effect"
@@ -74,6 +75,11 @@ export interface AssistantsOptions {
     readonly place?: { readonly place: string; readonly settings: DeviceSettings }
     readonly assistant?: Assistant
   }) => string | undefined
+  /**
+   * A voice that cannot be used as a device's voice: a local voice that is not downloaded (error), a hosted provider
+   * without a key (warning, "Save anyway"). Without it every voice is accepted.
+   */
+  readonly voiceProblem?: (voice: VoiceRefJson) => { readonly level: "error" | "warning"; readonly message: string } | undefined
 }
 
 export interface Assistants {
@@ -241,6 +247,35 @@ export const makeAssistants = (options: AssistantsOptions): Assistants => {
     return warning === undefined ? undefined : fail("invalid_settings", `${warning} Save anyway to keep it.`, { warnings: [{ key, message: warning }] })
   }
 
+  /**
+   * A device voice of its own (`voice: { from: "device", voice }`) in a `device.save` patch: refused when it cannot be
+   * spoken, a warning (`saveAnyway` overrides) when its provider is not set up. `null` and `{ from: "assistant" }` need no check.
+   */
+  const voicePatchRefusal = (patch: DeviceSettingsPatch, saveAnyway: boolean): AssistantResult | undefined => {
+    const v = patch.voice
+    if (v === undefined || v === null || v.from !== "device") return undefined
+    const problem = options.voiceProblem?.(v.voice)
+    if (problem === undefined) return undefined
+    if (problem.level === "error") return refusal([{ code: "invalid", path: "voice", message: problem.message }])
+    if (saveAnyway) return undefined
+    return fail("invalid_settings", `${problem.message} Save anyway to keep it.`, { warnings: [{ key: "voice", message: problem.message }] })
+  }
+
+  /**
+   * An assistant's own voice (docs/ASSISTANTS.md §2.2), through the same check and shapes as a device voice. A voice
+   * that is new (`create`) or changed is refused when it cannot be spoken. A voice the stored assistant already has
+   * is never refused (that would lock the assistant's other edits): a problem with it is a warning that `saveAnyway`
+   * overrides, so a fine unchanged voice is not affected.
+   */
+  const assistantVoiceRefusal = (voice: VoiceRefJson, before: VoiceRefJson | undefined, saveAnyway: boolean): AssistantResult | undefined => {
+    const problem = options.voiceProblem?.(voice)
+    if (problem === undefined) return undefined
+    const unchanged = before !== undefined && before.provider === voice.provider && before.voiceId === voice.voiceId
+    if (problem.level === "error" && !unchanged) return refusal([{ code: "invalid", path: "voice", message: problem.message }])
+    if (saveAnyway) return undefined
+    return fail("invalid_settings", `${problem.message} Save anyway to keep it.`, { warnings: [{ key: "voice", message: problem.message }] })
+  }
+
   const ownWith = (own: DeviceOwn, patch: DeviceSettingsPatch, keys: ReadonlyArray<DeviceSettingsKey>): DeviceOwn => {
     const out: Record<string, unknown> = { ...own }
     for (const key of keys) {
@@ -287,6 +322,8 @@ export const makeAssistants = (options: AssistantsOptions): Assistants => {
           else if (patch[key] === null) issues.push({ code: "invalid", path: key, message: "Defaults cannot be reset; only a device can follow them." })
         }
         if (issues.length > 0) return Effect.succeed(refusal(issues))
+        const voiceRefused = voicePatchRefusal(patch, saveAnyway)
+        if (voiceRefused !== undefined) return Effect.succeed(voiceRefused)
         const before = typeSettingsFrom(file, target.type)
         const next = { ...before, ...Object.fromEntries(Object.entries(patch).filter(([, v]) => v !== undefined)) } as DeviceSettings
         const refused = settingsRefusal(next, before, saveAnyway) ?? memoryRefusal({ place: { place: `type:${target.type}`, settings: next } }, saveAnyway, "assistants")
@@ -300,6 +337,8 @@ export const makeAssistants = (options: AssistantsOptions): Assistants => {
       }
       const record = file.devices[target.id]
       if (record === undefined) return Effect.succeed(fail("unknown_device", "That device is not known (it may have been forgotten)."))
+      const voiceRefused = voicePatchRefusal(patch, saveAnyway)
+      if (voiceRefused !== undefined) return Effect.succeed(voiceRefused)
       const type = deviceTypeOf(record.kind)
       const keys = type?.keys ?? []
       const own = ownWith(record.own, patch, keys)
@@ -389,6 +428,8 @@ export const makeAssistants = (options: AssistantsOptions): Assistants => {
       const predicted = makeAssistantId(body.name, store.assistants().map((a) => a.id))
       const refused = placementIssues(predicted, placements)
       if (refused !== undefined) return Effect.succeed(refused)
+      const voiceRefused = assistantVoiceRefusal(body.voice, undefined, message.saveAnyway === true)
+      if (voiceRefused !== undefined) return Effect.succeed(voiceRefused)
       return Effect.gen(function*() {
         const created = yield* store.createAssistant(body)
         for (const p of placements) {
@@ -421,6 +462,8 @@ export const makeAssistants = (options: AssistantsOptions): Assistants => {
       if (!knownIds().has(message.assistant.id)) return Effect.succeed(fail("unknown_assistant", `There is no assistant ${message.assistant.id}.`))
       const issues = assistantIssues(message.assistant)
       if (issues.length > 0) return Effect.succeed(refusal(issues))
+      const voiceRefused = assistantVoiceRefusal(message.assistant.voice, store.assistants().find((x) => x.id === message.assistant.id)?.voice, message.saveAnyway === true)
+      if (voiceRefused !== undefined) return Effect.succeed(voiceRefused)
       const memory = memoryRefusal({ assistant: message.assistant }, message.saveAnyway === true, "hearing.model") ??
         handlesRefusal(message.assistant, message.saveAnyway === true)
       if (memory !== undefined) return Effect.succeed(memory)

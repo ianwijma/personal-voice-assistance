@@ -10,7 +10,7 @@ import {
   parseVoiceKey,
   voiceKey
 } from "@pva/core"
-import type { JobInfo, ProviderInfo, ProviderVoices, VoiceEntry } from "@pva/protocol"
+import type { DeviceUser, JobInfo, ProviderInfo, ProviderVoices, VoiceEntry } from "@pva/protocol"
 import { MAX_PREVIEW_CHARS, MAX_PREVIEW_SECONDS } from "@pva/protocol"
 import * as SherpaTts from "@pva/tts-sherpa"
 import { Config, ConfigProvider, Data, Effect, Exit, Fiber, Redacted, Scope, Semaphore } from "effect"
@@ -59,6 +59,8 @@ export interface VoiceCatalogOptions {
   readonly busy: () => boolean
   /** The assistants that speak with each voice now (docs/ASSISTANTS.md §5.5): voice key → assistant ids. */
   readonly usedBy: () => ReadonlyMap<string, ReadonlyArray<string>>
+  /** The devices that speak with each voice as their own now: voice key → devices (from their effective settings). */
+  readonly usedByDevices?: () => ReadonlyMap<string, ReadonlyArray<DeviceUser>>
   readonly isFavourite: (ref: VoiceRef) => boolean
   /** The running download of a local voice. */
   readonly download: (preset: string) => JobInfo | undefined
@@ -214,7 +216,7 @@ export const makeVoiceCatalog = (options: VoiceCatalogOptions): Effect.Effect<Vo
 
     // ---- Entries
 
-    const entry = (provider: string, v: VoiceDescription, used: ReadonlyMap<string, ReadonlyArray<string>>): VoiceEntry => {
+    const entry = (provider: string, v: VoiceDescription, used: ReadonlyMap<string, ReadonlyArray<string>>, devices: ReadonlyMap<string, ReadonlyArray<DeviceUser>>): VoiceEntry => {
       const ref = { provider, voiceId: v.id }
       const job = v.local !== undefined ? options.download(v.id) : undefined
       const local = v.local === undefined ? undefined : {
@@ -234,19 +236,20 @@ export const makeVoiceCatalog = (options: VoiceCatalogOptions): Effect.Effect<Vo
         ...(local !== undefined ? { local } : {}),
         previewable: local === undefined || local.state === "installed",
         usedBy: [...(used.get(voiceKey(ref)) ?? [])],
+        usedByDevices: [...(devices.get(voiceKey(ref)) ?? [])],
         favourite: options.isFavourite(ref)
       }
     }
 
     const localVoices = () => SherpaTts.listVoices(options.modelDir())
 
-    const providerVoices = (provider: TtsProviderName, used: ReadonlyMap<string, ReadonlyArray<string>>, mode: "if-stale" | "refresh"): Effect.Effect<ProviderVoices> =>
+    const providerVoices = (provider: TtsProviderName, used: ReadonlyMap<string, ReadonlyArray<string>>, devices: ReadonlyMap<string, ReadonlyArray<DeviceUser>>, mode: "if-stale" | "refresh"): Effect.Effect<ProviderVoices> =>
       Effect.gen(function*() {
         if (ttsProviderInfo[provider].location === "local") {
           const voices = localVoices()
           return {
             provider: info(provider, used, { voiceCount: voices.length }),
-            voices: voices.map((v) => entry(provider, v, used)),
+            voices: voices.map((v) => entry(provider, v, used, devices)),
             stale: false,
             truncated: false
           }
@@ -271,7 +274,7 @@ export const makeVoiceCatalog = (options: VoiceCatalogOptions): Effect.Effect<Vo
             ...(failed ? { status: "error" as const, message: cached.error!.message } : {}),
             ...(cached.list !== undefined ? { voiceCount: voices.length } : {})
           }),
-          voices: voices.map((v) => entry(provider, v, used)).map((e) => (failed ? { ...e, previewable: false } : e)),
+          voices: voices.map((v) => entry(provider, v, used, devices)).map((e) => (failed ? { ...e, previewable: false } : e)),
           ...(cached.fetchedAt !== undefined ? { fetchedAt: cached.fetchedAt } : {}),
           stale: cached.fetchedAt !== undefined && (failed || now() - cached.fetchedAt >= LIST_MAX_AGE_MS),
           truncated: cached.list?.truncated ?? false,
@@ -299,8 +302,9 @@ export const makeVoiceCatalog = (options: VoiceCatalogOptions): Effect.Effect<Vo
       Effect.gen(function*() {
         if (provider !== undefined && !isProvider(provider)) return yield* failure(404, "unknown_provider", `There is no voice provider "${provider}"`)
         const used = options.usedBy()
+        const devices = options.usedByDevices?.() ?? new Map<string, ReadonlyArray<DeviceUser>>()
         const which = provider === undefined ? ttsProviderNames : [provider as TtsProviderName]
-        return yield* Effect.forEach(which, (p) => providerVoices(p, used, refresh ? "refresh" : "if-stale"), { concurrency: "unbounded" })
+        return yield* Effect.forEach(which, (p) => providerVoices(p, used, devices, refresh ? "refresh" : "if-stale"), { concurrency: "unbounded" })
       })
 
     const nameOf = (ref: VoiceRef): string | undefined => {

@@ -29,6 +29,7 @@ import { Icon, type IconName, Spinner } from "../ui/Icon.tsx"
 import { cx } from "../ui/controls.tsx"
 import { useMediaQuery } from "../useMediaQuery.ts"
 import { ProviderMark } from "../voices/ProviderMark.tsx"
+import { UsedBy } from "./UsedBy.tsx"
 
 /**
  * One picker over any catalog: voices, language models, recogniser models (docs/MODEL-PICKERS.md §6). A compact button
@@ -636,7 +637,7 @@ function Row({ source, row: line, index, active, selected, favourite, onSelect, 
   return (
     <li
       className={cx(
-        "group flex items-center gap-1 rounded-md pr-1 transition-colors duration-[120ms] hover:bg-surface-2 focus-within:bg-surface-2",
+        "group flex flex-wrap items-center gap-x-1 rounded-md pr-1 transition-colors duration-[120ms] hover:bg-surface-2 focus-within:bg-surface-2",
         phase !== undefined && "bg-surface-2"
       )}
       data-testid={`${noun}-row`}
@@ -717,6 +718,11 @@ function Row({ source, row: line, index, active, selected, favourite, onSelect, 
       >
         <Icon name="star" size={16} fill={favourite ? "currentColor" : "none"} />
       </button>
+      {entry?.usedByDevices !== undefined && (entry.usedBy.length > 0 || entry.usedByDevices.length > 0) && (
+        <p className="basis-full truncate pb-1.5 pl-9 pr-2 text-[12px] text-ink-muted max-sm:pl-8" data-testid={`${noun}-used-by`}>
+          <UsedBy assistants={entry.usedBy} devices={entry.usedByDevices} testId={`${noun}-used-by-text`} plain />
+        </p>
+      )}
     </li>
   )
 }

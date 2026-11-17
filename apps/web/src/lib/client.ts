@@ -83,7 +83,12 @@ export interface AssistantClient {
   readonly saveAssistant: (assistant: Assistant, options?: { readonly saveAnyway?: boolean; readonly name?: string }) => Promise<Outcome>
   readonly createAssistant: (
     assistant: AssistantBody,
-    options?: { readonly copyOf?: AssistantId; readonly placements?: ReadonlyArray<{ readonly target: DeviceTarget; readonly phrase?: string }> }
+    options?: {
+      readonly copyOf?: AssistantId
+      readonly placements?: ReadonlyArray<{ readonly target: DeviceTarget; readonly phrase?: string }>
+      /** Create although the save warned (a hosted voice without its key): the wizard's and Duplicate's "Create anyway". */
+      readonly saveAnyway?: boolean
+    }
   ) => Promise<Outcome>
   readonly deleteAssistant: (id: AssistantId, rev: number, name?: string) => Promise<Outcome>
   readonly saveDevice: (
@@ -644,7 +649,8 @@ export const createAssistantClient = (options: { readonly frontend?: FrontendRol
           type: "assistant.create",
           assistant,
           ...(options.copyOf !== undefined ? { copyOf: options.copyOf } : {}),
-          ...(options.placements !== undefined ? { placements: options.placements.map((p) => ({ target: p.target, ...(p.phrase !== undefined ? { phrase: p.phrase } : {}) })) } : {})
+          ...(options.placements !== undefined ? { placements: options.placements.map((p) => ({ target: p.target, ...(p.phrase !== undefined ? { phrase: p.phrase } : {}) })) } : {}),
+          ...(options.saveAnyway === true ? { saveAnyway: true } : {})
         }),
         assistant.name
       ),

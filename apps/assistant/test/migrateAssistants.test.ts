@@ -156,7 +156,9 @@ describe("migration fixtures", () => {
       voicePage: { pick: false },
       interruptMode: "confirm",
       audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, speakAloud: true, outputPath: "direct", prebufferMs: 60 },
-      captions: { captions: true, speakTyped: true }
+      captions: { captions: true, speakTyped: true },
+      look: { from: "assistant" },
+      voice: { from: "assistant" }
     })
     expect(isDeviceSettings(web)).toBe(true)
     expect(existsSync(join(dir, "settings.json"))).toBe(false)

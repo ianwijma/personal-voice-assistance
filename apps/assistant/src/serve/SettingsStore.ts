@@ -2,6 +2,7 @@ import type { ModulePersistence } from "@pva/core"
 import {
   Assistant,
   type AssistantBody,
+  BUILT_IN_WEB_VOICE_SETTINGS,
   DeviceId,
   DeviceName,
   type DeviceOwn,
@@ -210,6 +211,16 @@ const readFrontendData = (u: Record<string, unknown>, problems: Array<string>): 
   return { frontends, devices }
 }
 
+/**
+ * A stored type entry is a complete `DeviceSettings`: one written before a section key existed (`look`, `voice`,
+ * docs/LOOKS-AND-VOICES.md) lacks it and takes the built-in's, so it loads whole and behaves as before.
+ */
+const withNewKeys = (value: unknown, kind: string): unknown => {
+  if (!isRecord(value)) return value
+  const builtIn: DeviceSettings = deviceTypeOf(kind)?.builtIn ?? BUILT_IN_WEB_VOICE_SETTINGS
+  return { ...(value.look === undefined ? { look: builtIn.look } : {}), ...(value.voice === undefined ? { voice: builtIn.voice } : {}), ...value }
+}
+
 /** The entities of a version-4 file; entries that do not decode are dropped, each with a problem. */
 const readEntities = (u: Record<string, unknown>, problems: Array<string>): AssistantsData & { readonly migration?: MigrationRecord } => {
   const list = isRecord(u.assistants) ? u.assistants : {}
@@ -223,7 +234,7 @@ const readEntities = (u: Record<string, unknown>, problems: Array<string>): Assi
   const order = [...new Set([...listed, ...Object.keys(byId)])]
   const deviceTypes: Record<string, StoredDeviceType> = {}
   for (const [kind, value] of Object.entries(isRecord(u.deviceTypes) ? u.deviceTypes : {})) {
-    const decoded = decodeDeviceType(value)
+    const decoded = decodeDeviceType(withNewKeys(value, kind))
     if (isKindId(kind) && decoded._tag === "Some") deviceTypes[kind] = decoded.value
     else problems.push(`settings.json: the defaults of device type "${kind.slice(0, 40)}" were not valid and were dropped`)
   }

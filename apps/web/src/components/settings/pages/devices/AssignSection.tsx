@@ -45,6 +45,11 @@ export interface SectionContext {
   readonly setBlocked: (id: string, blocked: boolean) => void
   /** Changes when the draft is discarded or a section reset: the key of the number fields, so they start again. */
   readonly generation: number
+  /**
+   * Changes when the draft is discarded (Cancel, Load latest, a stale save), a section reset or a save sent: an edit
+   * still on its way (a character whose chunk is loading) is dropped, even when the value it would land on is unchanged.
+   */
+  readonly epoch: number
   /** A reset of part of the draft: the number fields drop what was typed and its error. */
   readonly renew: () => void
 }

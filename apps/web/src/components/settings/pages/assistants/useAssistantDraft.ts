@@ -40,6 +40,12 @@ export interface AssistantDraft {
   readonly cancel: () => void
   readonly dismissWarnings: () => void
   readonly reset: (path: string) => void
+  /**
+   * Changes whenever the draft is put back or committed from outside the fields: Cancel, Load latest, a Reset, a save
+   * sent, a stale save dropped. An edit still on its way (a character whose chunk is loading) started before it is
+   * dropped, even when the value it would land on is unchanged.
+   */
+  readonly epoch: number
 }
 
 interface DraftState {
@@ -62,6 +68,8 @@ export const useAssistantDraft = (info: AssistantInfo): AssistantDraft => {
   const [justSaved, setJustSaved] = useState(false)
   // The version this page just saved, shown until the push with it arrives (the result can come first).
   const [awaiting, setAwaiting] = useState<Assistant | undefined>()
+  const [epoch, setEpoch] = useState(0)
+  const nextEpoch = () => setEpoch((e) => e + 1)
   const savedRef = useRef(saved)
   savedRef.current = saved
 
@@ -95,6 +103,7 @@ export const useAssistantDraft = (info: AssistantInfo): AssistantDraft => {
 
   return {
     current,
+    epoch,
     saved: base,
     dirty,
     saving,
@@ -109,7 +118,10 @@ export const useAssistantDraft = (info: AssistantInfo): AssistantDraft => {
     tabErrors: (tab) => state.errors.some((e) => e.key !== null && tabOfPath(e.key) === tab),
     set: (path, value) => edit((a) => setPath(a, path, value), path),
     update: (f, touched) => edit(f, touched),
-    reset: (path) => edit((a) => setPath(a, path, getPath(base, path)), path),
+    reset: (path) => {
+      nextEpoch()
+      edit((a) => setPath(a, path, getPath(base, path)), path)
+    },
     setLocalError: (path, message) =>
       setState((s) => {
         if ((s.localErrors[path] === undefined) === (message === undefined) && s.localErrors[path] === message) return s
@@ -117,6 +129,7 @@ export const useAssistantDraft = (info: AssistantInfo): AssistantDraft => {
         return { ...s, localErrors: message === undefined ? rest : { ...rest, [path]: message } }
       }),
     cancel: () => {
+      nextEpoch()
       setJustSaved(false)
       setState(clean(base.rev))
     },
@@ -130,6 +143,8 @@ export const useAssistantDraft = (info: AssistantInfo): AssistantDraft => {
         setState((s) => ({ ...s, errors: fieldErrors, warnings: [], message: undefined }))
         return { kind: "invalid", message: "Enter a name.", fieldErrors }
       }
+      // The save takes the draft as shown: an edit still on its way is not in it and must not land after it.
+      nextEpoch()
       setSaving(true)
       setJustSaved(false)
       let outcome: Outcome
@@ -148,6 +163,7 @@ export const useAssistantDraft = (info: AssistantInfo): AssistantDraft => {
           setJustSaved(true)
           break
         case "stale":
+          nextEpoch()
           setState(clean(savedRef.current.rev))
           break
         case "invalid":

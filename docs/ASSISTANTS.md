@@ -142,6 +142,7 @@ Assistant = Struct({
   llm: AssistantLlm,
   hearing: AssistantHearing,
   voice: VoiceRefSchema,                // voice-provider protocol/voices.ts:27
+  look: optionalKey(Look),              // the stage's character while it answers (docs/LOOKS-AND-VOICES.md); absent = the baseline
   modules: Record(ModuleId, ModuleChoice)   // a module missing here is off
 })
 ```
@@ -151,7 +152,8 @@ Validation on save (errors refuse it, warnings ask "Save anyway", as sections do
 - Errors: the bounds above; a duplicate name; `finalSilenceMs ≤ eagerSilenceMs`; `eagerEotThreshold > 0` and
   `≥ eotThreshold`; an `own` key that is not an `overridable` field of that module, or a value its field refuses; an
   `offTools` name the module does not have; a local voice or model that is not downloaded (as the voice-provider
-  design refuses one).
+  design refuses one). Applies to `assistant.create` and to an `assistant.save` that changes the voice; an unchanged
+  voice that became unavailable is only a warning (docs/LOOKS-AND-VOICES.md §5.0).
 - Warnings: an account that is not set up; a hosted voice provider without a key; Deepgram without a key; an empty
   Handles on an assistant that is on a TypeSafe device.
 
@@ -179,7 +181,9 @@ DeviceSettings = Struct({
   audio: Struct({ echoCancellation: Boolean, noiseSuppression: Boolean, autoGainControl: Boolean,
                   speakAloud: Boolean,          // new: off = replies shown, never spoken
                   outputPath: OutputPath, prebufferMs: PrebufferMs }),   // the last two web-voice only (advanced)
-  captions: Struct({ captions: Boolean, speakTyped: Boolean })          // web-voice only; speakTyped was `speakReplies`
+  captions: Struct({ captions: Boolean, speakTyped: Boolean }),         // web-voice only; speakTyped was `speakReplies`
+  look: DeviceLook,                             // { from: "assistant" } | { from: "device", look }: the stage's character for every assistant, or each one's (LOOKS-AND-VOICES.md)
+  voice: DeviceVoice                            // { from: "assistant" } | { from: "device", voice }: the voice of every assistant on the device, or each one's own
 })
 DeviceOwn = Partial(DeviceSettings)             // each key present = own value; absent = follows the type defaults
 
@@ -242,6 +246,12 @@ in `data/voice-favourites.json`. Conversations stay in memory, as today.
 3. else `DeviceType.builtIn[key]`.
 
 Keys that do not apply to the kind (`voicePage`, `captions`, browser audio fields on a node) are ignored.
+
+**Voice and look of assistant A on device D** (docs/LOOKS-AND-VOICES.md §3): the voice is `voiceFor(D.voice, A)` (the device's own,
+else A's), the look `lookFor(D.look, A)` (the device's own, else A's, else the baseline), D's sections resolved as above.
+The voice applies at the next turn start, as a change of A's voice does; the pool binds A at D's place to the device voice
+(users `assistant@place`), and releases the old instance when unused. A device voice is checked on `device.save` like a
+voice: a local voice that is not downloaded is refused, a hosted one without a key asks "Save anyway".
 
 **Answering a sentence on a device** (the route; §3.4 runs it):
 
@@ -590,11 +600,13 @@ the migrated assistant stay (§6, "What was built").
 
 ### 5.1 Version
 
-`PROTOCOL_VERSION = 7` (`packages/protocol/src/constants.ts`; built; the voice-provider work kept 6).
+`PROTOCOL_VERSION = 7` (`packages/protocol/src/constants.ts`; built; the voice-provider work kept 6). Since then
+looks and voices (docs/LOOKS-AND-VOICES.md) took **8**: the `look` and `voice` device sections are new members of the
+closed set `DeviceSettingsKey` and required in `DeviceSettings`.
 
 The voice-node design claims 7 for itself (docs/VOICE-NODES.md §2), but its code is at 5: it branches from #3
-(93ed0fd), before voice sessions. **Order**: voice providers merge first (no bump), then this design's WP-2 (7). Voice
-nodes then rebase onto 7 and take **8**. They add `voice-node` as a `DeviceType` (its `builtIn` follow-up 0 for the
+(93ed0fd), before voice sessions. **Order**: voice providers merge first (no bump), then this design's WP-2 (7), then
+looks and voices (8). Voice nodes then rebase onto 8 and take **9**. They add `voice-node` as a `DeviceType` (its `builtIn` follow-up 0 for the
 assignment is what "one answer per phrase" means here), their node fields as `DeviceSettings` keys (`audio` input and
 output and volume, cues, `micStreaming`), `hello.node`, `node.*` messages and pairing. Their "Device defaults" page and
 reserved `agent` field are superseded by this design: the assistant list is that field.
@@ -635,7 +647,10 @@ DeviceSetup = { type: "device.setup", deviceId?,
   withoutPhrase: { mode: "nobody" } | { mode: "assistant", assistant } | { mode: "typesafe", fallback: AssistantId | null },
   canPick: boolean,                     // voicePage.pick, and more than one assistant
   canAuto: boolean,                     // TypeSafe is set up (shows "Whichever fits" in the menu)
-  interruptMode, audio: DeviceSettings["audio"], captions: DeviceSettings["captions"] }
+  interruptMode, audio: DeviceSettings["audio"], captions: DeviceSettings["captions"],
+  look?: Look }                         // the device's own look, when it has one (shown when no assistant is listed)
+// assistants[].look?: Look  = lookFor(device look, assistant): the device's own, else the assistant's; absent = the baseline.
+// Sent again (the usual change-only push) when a look that applies to the device changes.
 // changed
 TurnStart       += { assistantId }      // also assistant.text, reply.start: assistantId
 Conversation    += { assistantId }      // conversation { id, reason, startedAt, assistantId }
@@ -686,7 +701,7 @@ TraceInfo   += {
         | { by: "typesafe", outcome: "chosen" | "none-fits" | "timeout" | "error", probability?: number, fits?: number, ms: number, fallback: boolean },
   marks.routeSent?, marks.routeReceived?,
   config?: { llm: { account, model, effort, thinking, maxTokens }, hearing: { hearer: AssistantId, engine, model?, language?, eagerSilenceMs?, finalSilenceMs?, eotThreshold? },
-             voice: VoiceKey, modules: number, tools: number, replyEarly: boolean, toolRounds: number } }
+             voice: VoiceKey, voiceFrom?: "assistant" | "device", modules: number, tools: number, replyEarly: boolean, toolRounds: number } }
 AdminSnapshot: + assistants, deviceTypes; − frontends
 ```
 
