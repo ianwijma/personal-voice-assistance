@@ -706,7 +706,9 @@ describe("review round 2: declarations are ordered by their number of arrival, a
   })
 
   for (const prior of [true, false]) {
-    it(`a declaration that arrives while the device is being forgotten is kept for its next record (${prior ? "with" : "without"} one before)`, async () => {
+    // Review round 3 (made blunt): forgetting deletes the record and everything the device declared, also what arrived
+    // while the forget was written; the device declares again when it reconnects.
+    it(`a declaration that arrives while the device is being forgotten goes with the record (${prior ? "with" : "without"} one before)`, async () => {
       const dir = tmp()
       let release: (() => void) | undefined
       let hold = false
@@ -726,15 +728,17 @@ describe("review round 2: declarations are ordered by their number of arrival, a
       const forgetting = run(registry.forget(id))
       for (let i = 0; i < 200 && release === undefined; i++) await wait(5)
       expect(release).toBeDefined()
-      // The device's new hello (or a device.caps) during the write.
+      // A device.caps during the write.
       expect(registry.declare(id, phone)).toBe(true)
       release!()
       expect((await forgetting).ok).toBe(true)
       expect(store.settings().devices[id]).toBeUndefined()
-      expect(registry.latestOf(id)!.capabilities).toEqual(phone)
-      // Registered again: the new record has the declaration that arrived last, not the one from before.
+      expect(registry.latestOf(id)).toBeUndefined()
+      // Registered again without declaring: a new record with nothing declared; it declares on its next connection.
       await run(registry.seen({ id, kind: WEB_VOICE_KIND, name: "Tablet" }, new Set()))
-      expect(store.settings().devices[id]!.declared!.capabilities).toEqual(phone)
+      expect(store.settings().devices[id]!.declared).toBeUndefined()
+      expect(registry.declare(id, phone)).toBe(true)
+      expect(registry.declaredOf(id)!.capabilities).toEqual(phone)
     })
   }
 
