@@ -15,6 +15,10 @@ import { makeToolRegistry, type ToolRegistry } from "./ToolRegistry.ts"
 import { connectStoreToBus, type EventBusOptions, type HouseholdEvent, makeEventBus } from "./EventBus.ts"
 import type { ModuleStorage } from "./HouseholdStore.ts"
 import { makeMemoryHouseholdStore, type MemoryStoreOptions } from "./MemoryHouseholdStore.ts"
+import type { IssueRegistry } from "./Issues.ts"
+import { type JobTable, memoryJobTable } from "./JobTable.ts"
+import type { DeliveryInfo, NotificationDelivery, NotificationRequest } from "./Scheduler.ts"
+import { makeSchedulerEngine, type SchedulerEngineOptions } from "./SchedulerEngine.ts"
 
 export interface Sleep {
   readonly _tag: "Sleep"
@@ -463,4 +467,61 @@ export const makeTestHousehold = (
     const recording = makeRecordingEventBus()
     connectStoreToBus(store, recording.bus)
     return { store, bus: recording.bus, events: recording.events, household: { store, events: recording.bus } }
+  })
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Scheduler (docs/SCHEDULING.md "Testing")
+
+/** An in-memory household store (`makeMemoryHouseholdStore`). */
+export type MemoryHouseholdStore = ReturnType<typeof makeMemoryHouseholdStore>
+
+/** A delivery that records every notification it is given (and can be told to fail). */
+export const makeRecordingDelivery = () => {
+  const delivered: Array<{ readonly request: NotificationRequest; readonly info: Omit<DeliveryInfo, "job"> & { readonly jobId: string } }> = []
+  const state = { failNext: 0 }
+  const delivery: NotificationDelivery = {
+    deliver: (request, info) =>
+      Effect.suspend(() => {
+        if (state.failNext > 0) {
+          state.failNext--
+          return Effect.fail(new Error("delivery failed (test)"))
+        }
+        delivered.push({ request, info: { notificationId: info.notificationId, lateByMs: info.lateByMs, inbox: info.inbox, jobId: info.job.id } })
+        return Effect.void
+      })
+  }
+  return { delivery, delivered, state }
+}
+
+/**
+ * A scheduler for module tests: the real engine (`makeSchedulerEngine`) on an in-memory job table that joins the
+ * in-memory store's transactions, so it behaves as serve mode's does (the same contract tests pass on both,
+ * `@pva/core/scheduler-contract`). It runs on the Effect clock: in `it.effect` that is the test clock, moved with
+ * `TestClock.adjust`. Give it the module host as `ModuleHostOptions.scheduler`, or call `forModule(id)` directly.
+ *
+ * A restart is simulated by making a second scheduler on the same `table` (and `store`) after closing the first one's
+ * scope: jobs left `running` are recovered as after a crash.
+ */
+export const makeTestScheduler = (
+  options: {
+    readonly store?: MemoryHouseholdStore
+    readonly table?: JobTable
+    readonly delivery?: NotificationDelivery
+    readonly timeZone?: string
+    readonly issues?: IssueRegistry
+  } & Omit<SchedulerEngineOptions, "table" | "delivery" | "timeZone" | "issues"> = {}
+) =>
+  Effect.gen(function*() {
+    const store = options.store ?? makeMemoryHouseholdStore()
+    const table = options.table ?? memoryJobTable(store)
+    const recording = makeRecordingDelivery()
+    const { delivery, store: _s, table: _t, timeZone, ...rest } = options
+    const scheduler = yield* makeSchedulerEngine({
+      ...rest,
+      table,
+      delivery: delivery ?? recording.delivery,
+      timeZone: () => timeZone,
+      ...(options.issues !== undefined ? { issues: options.issues } : {})
+    })
+    return { scheduler, store, table, deliveries: recording.delivered, delivery: recording }
   })

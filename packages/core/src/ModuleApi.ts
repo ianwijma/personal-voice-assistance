@@ -14,6 +14,7 @@ import type { ActionParam } from "./Actions.ts"
 import type { ModuleEvents } from "./EventBus.ts"
 import type { ModuleStore } from "./HouseholdStore.ts"
 import type { ModuleRoute, RouteTokens } from "./ModuleRoutes.ts"
+import type { ModuleScheduler } from "./Scheduler.ts"
 
 /**
  * Module API version 2 (docs/MODULES-PLAN.md §4 P1; module-definition-config-and-dependencies.md §A.4, §C.3–C.5).
@@ -353,6 +354,11 @@ export interface ModuleServicesV2 {
   readonly store: ModuleStore
   /** The household event bus: publish `<moduleId>.<type>`, subscribe to anything (a stream in the caller's scope). */
   readonly events: ModuleEvents
+  /**
+   * P6: this module's jobs and tasks (docs/SCHEDULING.md). Register handlers with `handle` in `shared`. In the CLI
+   * modes (and without a scheduler) `handle` succeeds and every other call fails `unavailable`.
+   */
+  readonly scheduler: ModuleScheduler
 }
 
 /**

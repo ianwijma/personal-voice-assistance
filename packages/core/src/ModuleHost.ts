@@ -33,6 +33,7 @@ import { type ExecutionGateway, type GatewayAccess, type GatewayOptions, isGatew
 import { makeIssueRegistry, type IssueRegistry } from "./Issues.ts"
 import { type EventBus, hostEvent, makeEventBus } from "./EventBus.ts"
 import { type HouseholdStore, makeClosedStore } from "./HouseholdStore.ts"
+import { closedModuleScheduler, type Scheduler } from "./Scheduler.ts"
 import { type AssistantModule, type ContextProvider, type Tool, toolMetadata } from "./Module.ts"
 import {
   type ActionRunRequest,
@@ -316,6 +317,8 @@ export interface ModuleHostOptions {
   readonly routeTokens?: RouteTokenStore
   /** P3: time a field action may take. Default `FIELD_ACTION_TIMEOUT_MS`. */
   readonly fieldActionTimeoutMs?: number
+  /** P6: `ctx.scheduler` of version 2 modules. Absent: `handle` registers nothing and every other call fails `unavailable`. */
+  readonly scheduler?: Pick<Scheduler, "forModule">
 }
 
 interface Running {
@@ -417,6 +420,8 @@ const contributionsOf = (moduleId: string, instance: ModuleInstance) => {
   const generated = actions.filter((a) => a.definition.offerAsTool !== false).map(actionTool)
   return { actions, tools: [...(instance.tools ?? []), ...generated] }
 }
+
+const NO_SCHEDULER = closedModuleScheduler("Timers and scheduled jobs run only in the server (pnpm start serve).")
 
 export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOptions) {
   const hostScope = yield* Effect.scope
@@ -1899,7 +1904,8 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
         requestRestart: (reason) => requestRestart(entry, target, reason)
       },
       store: household.store.forModule(entry.def.id),
-      events: household.events.forModule(entry.def.id)
+      events: household.events.forModule(entry.def.id),
+      scheduler: options.scheduler?.forModule(entry.def.id) ?? NO_SCHEDULER
     }
   }
 

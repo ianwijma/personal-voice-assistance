@@ -40,7 +40,7 @@ interface State {
   nextSeq: number
 }
 
-const TxRef = Context.Reference<{ readonly store: object; readonly pending: Array<CommittedChange> } | undefined>("@pva/core/MemoryStoreTx", {
+const TxRef = Context.Reference<{ readonly store: object; readonly pending: Array<CommittedChange>; readonly undo: Array<() => void> } | undefined>("@pva/core/MemoryStoreTx", {
   defaultValue: () => undefined
 })
 
@@ -51,6 +51,11 @@ export const makeMemoryHouseholdStore = (options: MemoryStoreOptions = {}): Hous
   readonly changeLog: () => ReadonlyArray<ChangeRecord>
   /** For assertions: the search text kept for a row (`undefined` when none). */
   readonly searchEntry: (module: string, collection: string, id: string) => string | undefined
+  /**
+   * Inside a transaction of this store: run `undo` if that transaction (or the nested one it is in) rolls back. Outside
+   * one: nothing. How an in-memory table of a core service (the scheduler's) joins the store's transactions.
+   */
+  readonly onRollback: (undo: () => void) => Effect.Effect<void>
 } => {
   const self = {}
   const readOnly = options.readOnly === true
@@ -81,20 +86,24 @@ export const makeMemoryHouseholdStore = (options: MemoryStoreOptions = {}): Hous
         return Effect.suspend(() => {
           const saved = copy(state)
           const mark = tx.pending.length
+          const undoMark = tx.undo.length
           return work.pipe(Effect.onError(() => Effect.sync(() => {
             state = saved
             tx.pending.length = mark
+            for (const undo of tx.undo.splice(undoMark).reverse()) undo()
           })))
         })
       }
       return lock.withPermits(1)(Effect.suspend(() => {
         const saved = copy(state)
-        const frame = { store: self, pending: [] as Array<CommittedChange> }
+        const frame = { store: self, pending: [] as Array<CommittedChange>, undo: [] as Array<() => void> }
         return work.pipe(
           Effect.provideService(TxRef, frame),
           Effect.onExit((exit) => Effect.sync(() => {
-            if (exit._tag === "Failure") state = saved
-            else fire(frame.pending)
+            if (exit._tag === "Failure") {
+              state = saved
+              for (const undo of frame.undo.splice(0).reverse()) undo()
+            } else fire(frame.pending)
           }))
         )
       }))
@@ -300,6 +309,7 @@ export const makeMemoryHouseholdStore = (options: MemoryStoreOptions = {}): Hous
       return () => listeners.delete(listener)
     },
     changeLog: () => state.changes.map(({ actorKey: _k, ...c }) => c),
+    onRollback: (undo) => Effect.flatMap(Effect.service(TxRef), (tx) => Effect.sync(() => (tx?.store === self ? void tx.undo.push(undo) : undefined))),
     searchEntry: (module, collection, id) => state.search.get(key(module, collection, id))
   }
 }
