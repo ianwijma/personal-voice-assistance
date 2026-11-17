@@ -1,4 +1,5 @@
 import { type DeviceHello, MAX_DEVICE_NAME_CHARS, WEB_VOICE_KIND } from "@pva/protocol"
+import { currentCapabilities } from "./capabilities.ts"
 
 /**
  * This browser as a device (docs/FRONTENDS-AND-ACTIVATION.md §2): a stable random id in `localStorage` (shared by
@@ -57,9 +58,13 @@ export const deviceNameFromUserAgent = (ua: string): string => {
   return (name === "" ? "Browser" : name).slice(0, MAX_DEVICE_NAME_CHARS)
 }
 
-/** What this browser says about itself in `hello`. */
-export const deviceHello = (): DeviceHello => ({
-  id: deviceId(),
-  kind: WEB_VOICE_KIND,
-  name: deviceNameFromUserAgent(typeof navigator === "undefined" ? "" : navigator.userAgent)
-})
+/** What this browser says about itself in `hello` (protocol 11: with what it can do, measured now). */
+export const deviceHello = (): DeviceHello => {
+  const capabilities = currentCapabilities()
+  return {
+    id: deviceId(),
+    kind: WEB_VOICE_KIND,
+    name: deviceNameFromUserAgent(typeof navigator === "undefined" ? "" : navigator.userAgent),
+    ...(capabilities !== undefined ? { capabilities } : {})
+  }
+}

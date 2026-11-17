@@ -48,6 +48,8 @@ export function RecordsField({ field, id, describedBy, value, onChange, disabled
   const [open, setOpen] = useState<number | undefined>(undefined)
   const max = field.maxItems ?? 50
   const titleField = field.itemFields.find((f) => f.key === field.titleKey)
+  // Protocol 11: a hidden item field (an id the server makes) is kept in each record but neither drawn nor summed up.
+  const shownFields = field.itemFields.filter((f) => f.hidden !== true)
   const set = (next: ReadonlyArray<RecordValue>) => onChange(next as unknown as SettingValue)
   const update = (index: number, key: string, v: SettingValue) =>
     set(list.map((r, i) => (i === index ? { ...r, [key]: v as RecordValue[string] } : r)))
@@ -66,7 +68,7 @@ export function RecordsField({ field, id, describedBy, value, onChange, disabled
       <ol className="flex flex-col gap-1.5">
         {list.map((record, index) => {
           const title = titleField === undefined ? "" : shown(titleField, record[field.titleKey])
-          const rest = field.itemFields.filter((f) => f.key !== field.titleKey).map((f) => shown(f, record[f.key])).filter((t) => t !== "").join(" · ")
+          const rest = shownFields.filter((f) => f.key !== field.titleKey).map((f) => shown(f, record[f.key])).filter((t) => t !== "").join(" · ")
           const expanded = open === index
           const rowId = `${id}-${index}`
           return (
@@ -106,7 +108,7 @@ export function RecordsField({ field, id, describedBy, value, onChange, disabled
               </div>
               {expanded && (
                 <div id={`${rowId}-form`} className="flex flex-col gap-4 border-t border-line/60 px-3 py-3">
-                  {field.itemFields.map((f) => {
+                  {shownFields.map((f) => {
                     const Renderer = itemRenderers[f.type]
                     const fid = `${rowId}-${f.key}`
                     return (

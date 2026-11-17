@@ -35,6 +35,7 @@ import { PhraseTester } from "../PhraseTester.tsx"
 import { Dialog, DialogButtons } from "./assistants/parts.tsx"
 import { AssignSection, MarksFor, type SectionContext } from "./devices/AssignSection.tsx"
 import { LookSection, LookVoiceLine, VoiceSection } from "./devices/LookVoiceSections.tsx"
+import { CapabilitiesSection, PlaceSection } from "./devices/PlaceSections.tsx"
 import { Chip, DField, Pill } from "./devices/parts.tsx"
 
 /** The time, ticking every 30 s, for "Seen 5 min ago". */
@@ -56,7 +57,7 @@ const talkingOf = (d: DeviceListInfo, session: SessionInfo | undefined): boolean
 /** How many sections a device has its own value for (the list and "who answers without a phrase" are one section). */
 const ownSections = (d: Pick<DeviceListInfo, "own">): number => {
   const own = d.own as Record<string, unknown>
-  return ["assistants|withoutPhrase", "matching", "voicePage", "look", "voice", "interruptMode", "audio", "captions"].filter((s) => s.split("|").some((k) => own[k] !== undefined)).length
+  return ["assistants|withoutPhrase", "matching", "voicePage", "look", "voice", "place", "capabilities", "interruptMode", "audio", "captions"].filter((s) => s.split("|").some((k) => own[k] !== undefined)).length
 }
 
 /**
@@ -97,6 +98,8 @@ function Row({ d, type, defaults, assistants, session, now }: {
     ? [`Applies to ${members.length} ${members.length === 1 ? type.one : type.many}`, "Each follows it unless it has its own value"]
     : [own > 0 ? `${own} own setting${own === 1 ? "" : "s"}` : "Follows the defaults", ...(d.id !== undefined ? [lastSeenText(devices.find((x) => x.id === d.id) ?? { lastSeen: 0, connections: 0 }, now)] : [])]
   if (settings.withoutPhrase.mode === "typesafe") meta.unshift("Without a phrase: TypeSafe decides")
+  // Protocol 11: the room it is in, when one is set.
+  if (!defaults && settings.place.room.trim() !== "") meta.unshift(settings.place.room.trim())
   const connected = !defaults && (devices.find((x) => x.id === d.id)?.connections ?? 0) > 0
   const speaker = talking && session?.state === "speaking" ? assistants.find((a) => a.id === session.answering)?.name : undefined
   return (
@@ -448,6 +451,8 @@ function DeviceEditor({ type, device }: { readonly type: DeviceTypeInfo; readonl
       )}
       {has("look") && <LookSection ctx={ctx} assistants={assistants} />}
       {has("voice") && <VoiceSection ctx={ctx} assistants={assistants} />}
+      {has("place") && <PlaceSection ctx={ctx} />}
+      {has("capabilities") && <CapabilitiesSection ctx={ctx} device={device} now={now} />}
       <section className="flex flex-col gap-3" aria-labelledby="h-other" data-testid="section-other">
         <h3 id="h-other" className="label text-ink-faint">Other device settings</h3>
         {has("interrupting") && (

@@ -105,6 +105,7 @@ import {
   DEFAULT_CONVERSATION_IDLE_MINUTES,
   DEFAULT_MAX_VOICE_SESSIONS,
   DEFAULT_SESSION_DISCARD_MINUTES,
+  type DeclaredCapabilities,
   type DeviceListInfo,
   BUILT_IN_WEB_VOICE_SETTINGS,
   WAKE_ARMED_MS,
@@ -141,7 +142,7 @@ import {
 } from "@pva/protocol"
 import { exampleEngineStatus, exampleHealth, exampleSnapshot, exampleUnavailableModule, exampleVoiceSection, exampleWeatherModule } from "@pva/protocol/examples"
 import { type WebSocket, WebSocketServer } from "ws"
-import { createAssistantsMock } from "./assistants.ts"
+import { createAssistantsMock, SAM_ID } from "./assistants.ts"
 import { seedTraces } from "./traces.ts"
 import { createVoiceAssistants, scenarioSettings, scriptedTurn } from "./voiceAssistants.ts"
 import { encodeWav, MOCK_PROVIDERS } from "./voices.ts"
@@ -183,6 +184,8 @@ const REPLY_RATE = 22_050
 
 const isScenario = (s: unknown): s is Scenario => typeof s === "string" && (SCENARIOS as ReadonlyArray<string>).includes(s)
 let scenario: Scenario = isScenario(process.env.MOCK_SCENARIO) ? process.env.MOCK_SCENARIO : "voice"
+/** The scenarios with remembered devices (and, protocol 11, Sam and Robin in Members). */
+const seededDeviceScenario = () => scenario === "devices" || scenario === "wake" || scenario === "long-phrase" || scenario === "latency"
 
 const log = (...args: Array<unknown>) => {
   if (process.env.MOCK_QUIET !== "1") console.log("[mock]", ...args)
@@ -596,6 +599,58 @@ const initialSections = (): Array<SettingsSection> => [
     revision: 1
   },
   {
+    // Protocol 11 (docs/MODULES-PLAN.md §4 P5): the household's people and diets. A person's id is made by the server
+    // when the person is added (hidden in the record); removing someone clears every device's default person there.
+    id: "members",
+    title: "Members",
+    group: "modules",
+    page: { id: "members", title: "Members", description: "The people who live here, and what they eat. A device's default person (Devices › a device › Place) says whose data a turn there means." },
+    order: 6,
+    form: {
+      fields: [
+        {
+          type: "records",
+          key: "HOUSEHOLD_MEMBERS",
+          label: "People",
+          description: "Each person's name, other names, and diet. A device points at one of them as its default person; removing someone clears that.",
+          apply: "live",
+          default: [],
+          itemFields: [
+            { type: "text", key: "id", label: "Id", default: "", maxLength: 40, hidden: true },
+            { type: "text", key: "name", label: "Name", description: "As the household says it: \"Sam\".", default: "", maxLength: 60, placeholder: "Sam" },
+            { type: "textList", key: "aliases", label: "Also called", description: "Other names people use for them: \"Sammie\", \"Mum\".", default: [], maxItems: 10, itemMaxLength: 40 },
+            { type: "text", key: "pronunciation", label: "Pronunciation", description: "How the voice should say the name, spelled as it sounds (\"Shiv-awn\"). Empty: as written.", default: "", maxLength: 60 },
+            { type: "textList", key: "allergies", label: "Allergies", description: "Never in their food: \"nuts\", \"shellfish\". Empty: the household's.", default: [], maxItems: 30, itemMaxLength: 60, placeholder: "nuts" },
+            { type: "textList", key: "diets", label: "Diets", description: "\"vegetarian\", \"halal\". Empty: the household's.", default: [], maxItems: 30, itemMaxLength: 60, placeholder: "vegetarian" },
+            { type: "textList", key: "dislikes", label: "Dislikes", description: "Left out where possible: \"coriander\". Empty: the household's.", default: [], maxItems: 30, itemMaxLength: 60, placeholder: "coriander" }
+          ],
+          itemLabel: "person",
+          titleKey: "name",
+          maxItems: 24,
+          orderable: false,
+          source: "default"
+        },
+        { type: "textList", key: "HOUSEHOLD_DIET_ALLERGIES", label: "Household allergies", description: "For everyone who has none of their own: what the kitchen never suggests.", apply: "live", default: [], maxItems: 30, itemMaxLength: 60, placeholder: "nuts", source: "default" },
+        { type: "textList", key: "HOUSEHOLD_DIET_DIETS", label: "Household diets", description: "For everyone who has none of their own.", apply: "live", default: [], maxItems: 30, itemMaxLength: 60, placeholder: "vegetarian", source: "default" },
+        { type: "textList", key: "HOUSEHOLD_DIET_DISLIKES", label: "Household dislikes", description: "For everyone who has none of their own.", apply: "live", default: [], maxItems: 30, itemMaxLength: 60, placeholder: "coriander", source: "default" }
+      ],
+      values: {
+        HOUSEHOLD_MEMBERS: seededDeviceScenario()
+          ? [
+            { id: SAM_ID, name: "Sam", aliases: ["Sammie"], pronunciation: "", allergies: ["nuts"], diets: [], dislikes: ["coriander"] },
+            { id: "p-robin0002", name: "Robin", aliases: [], pronunciation: "", allergies: [], diets: ["vegetarian"], dislikes: [] }
+          ]
+          : [],
+        HOUSEHOLD_DIET_ALLERGIES: [],
+        HOUSEHOLD_DIET_DIETS: [],
+        HOUSEHOLD_DIET_DISLIKES: []
+      },
+      secrets: {},
+      errors: []
+    },
+    revision: 1
+  },
+  {
     // Protocol 7 (WP-14): TypeSafe routes a sentence without a wake phrase. Off by default; hosted.
     id: "routing",
     title: "TypeSafe",
@@ -820,6 +875,9 @@ interface Conn {
   testerUntil?: number | undefined
   /** Protocol 6: the device the tester follows; undefined = the most recently active session. */
   testerDevice?: string | undefined
+  /** Protocol 11: the page's live state (`device.caps.live`). */
+  visible?: boolean
+  lastInteractionAt?: number
 }
 
 interface Reply {
@@ -932,17 +990,62 @@ interface DeviceRecord {
   name: string
   firstSeen: number
   lastSeen: number
+  /** Protocol 11: what it declared last (hello, `device.caps`). */
+  declared?: DeclaredCapabilities
 }
 const HOUR = 3_600_000
+/** The people of Members now (their ids). */
+const memberIds = (): ReadonlySet<string> => {
+  const value = sections.find((x) => x.id === "members")?.form.values.HOUSEHOLD_MEMBERS
+  const ids: Array<string> = []
+  for (const r of Array.isArray(value) ? value : []) {
+    const id = typeof r === "object" && r !== null && !Array.isArray(r) ? (r as Record<string, unknown>).id : undefined
+    if (typeof id === "string") ids.push(id)
+  }
+  return new Set(ids)
+}
+/** Protocol 11: a person without an id (just added) gets one, in the patch itself. */
+const withPersonIds = (patch: SettingsPatch) => {
+  const list = patch.values.HOUSEHOLD_MEMBERS
+  if (!Array.isArray(list)) return
+  const used = new Set<string>()
+  ;(patch.values as Record<string, SettingValue | null>).HOUSEHOLD_MEMBERS = list.map((r) => {
+    if (typeof r !== "object" || r === null || Array.isArray(r)) return r
+    const record = r as Record<string, unknown>
+    const id = typeof record.id === "string" && /^[a-z0-9][a-z0-9_-]{0,39}$/.test(record.id) && !used.has(record.id) ? record.id : `p-${randomBytes(4).toString("hex")}`
+    used.add(id)
+    return { ...record, id }
+  }) as unknown as SettingValue
+}
 const seededDevices = (): Map<string, DeviceRecord> => {
-  if (scenario !== "devices" && scenario !== "wake" && scenario !== "long-phrase" && scenario !== "latency") return new Map()
+  if (!seededDeviceScenario()) return new Map()
   const now = Date.now()
   return new Map([
     ...(scenario === "long-phrase"
       ? [["d-living-room-0003", { id: "d-living-room-0003", kind: WEB_VOICE_KIND, name: "Living room tablet", firstSeen: now - 20 * 24 * HOUR, lastSeen: now - 5 * 60_000 }] as [string, DeviceRecord]]
       : []),
-    ["d-kitchen-ipad-0001", { id: "d-kitchen-ipad-0001", kind: WEB_VOICE_KIND, name: "Kitchen iPad", firstSeen: now - 40 * 24 * HOUR, lastSeen: now - 2 * HOUR }],
-    ["d-pixel-phone-0002", { id: "d-pixel-phone-0002", kind: WEB_VOICE_KIND, name: "Android phone · Chrome", firstSeen: now - 9 * 24 * HOUR, lastSeen: now - 3 * 24 * HOUR }]
+    ["d-kitchen-ipad-0001", {
+      id: "d-kitchen-ipad-0001",
+      kind: WEB_VOICE_KIND,
+      name: "Kitchen iPad",
+      firstSeen: now - 40 * 24 * HOUR,
+      lastSeen: now - 2 * HOUR,
+      declared: {
+        capabilities: { v: 1, display: { class: "standard", widthPx: 1024, heightPx: 768, dpr: 2, touch: "coarse", colour: true }, present: { kinds: {} }, speaker: { media: ["speech", "audio"] }, microphone: { farField: false } },
+        seenAt: now - 2 * HOUR
+      }
+    }],
+    ["d-pixel-phone-0002", {
+      id: "d-pixel-phone-0002",
+      kind: WEB_VOICE_KIND,
+      name: "Android phone · Chrome",
+      firstSeen: now - 9 * 24 * HOUR,
+      lastSeen: now - 3 * 24 * HOUR,
+      declared: {
+        capabilities: { v: 1, display: { class: "compact", widthPx: 412, heightPx: 915, dpr: 2.63, touch: "coarse", colour: true }, present: { kinds: {} }, speaker: { media: ["speech", "audio"] }, microphone: { farField: false }, openUrl: true },
+        seenAt: now - 3 * 24 * HOUR
+      }
+    }]
   ])
 }
 /** Six words: wake phrases may be this long (the UI must not cut or jump on them). */
@@ -954,8 +1057,10 @@ const deviceInfos = (): Array<DeviceListInfo> => {
   const now = Date.now()
   return [...devices.values()]
     .map((d) => {
-      const connections = [...conns].filter((c) => c.welcomed && c.deviceId === d.id).length
-      return { ...d, lastSeen: connections > 0 ? now : d.lastSeen, connections, audioOwner: voiceSessions.get(d.id)?.owner !== undefined, ...assistantsMock.deviceFields(d.id) }
+      const open = [...conns].filter((c) => c.welcomed && c.deviceId === d.id)
+      const connections = open.length
+      const live = connections === 0 ? undefined : { visible: open.some((c) => c.visible !== false), ...(open.some((c) => c.lastInteractionAt !== undefined) ? { lastInteractionAt: Math.max(...open.map((c) => c.lastInteractionAt ?? 0)) } : {}) }
+      return { ...d, lastSeen: connections > 0 ? now : d.lastSeen, connections, audioOwner: voiceSessions.get(d.id)?.owner !== undefined, ...assistantsMock.deviceFields(d.id), ...(live !== undefined ? { live } : {}) }
     })
     .sort((a, b) => b.lastSeen - a.lastSeen)
 }
@@ -2160,6 +2265,8 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
       }
       const errors = validate(section.form, patch)
       if (errors.length > 0) return result(c, m.requestId, false, { code: "invalid_settings", message: "Some settings are not valid.", fieldErrors: errors })
+      // Protocol 11: Members gives every new person an id, as the server does.
+      if (section.id === "members") withPersonIds(patch)
       const candidate = sections.map((x, j) => (j === i ? { ...x, form: applyPatch(x.form, patch) } : x))
       const fresh = <E extends FieldError>(a: ReadonlyArray<E>, b: ReadonlyArray<E>) => b.filter((e) => !a.some((x) => x.key === e.key && x.message === e.message))
       const before = checks(sections)
@@ -2176,6 +2283,7 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
       for (const x of sections) if (changed.has(x.id)) broadcast({ type: "section.changed", section: x })
       if (changed.has("routing")) routingChanged()
       if (changed.has("llm-openai-accounts")) assistantsChanged()
+      if (changed.has("members") && assistantsMock.clearDefaultPeople(memberIds())) assistantsChanged()
       result(c, m.requestId, true)
       const needsReload = Object.keys({ ...patch.values, ...patch.secrets }).some((k) => section.form.fields.find((f) => f.key === k)?.apply === "reload")
       const path = `${section.group ?? "general"}/${section.page?.id ?? section.id}`
@@ -2413,6 +2521,18 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
     case "ping":
       sendTo(c, { type: "pong", id: m.id })
       return
+    case "device.caps": {
+      // Protocol 11: what the device can do changed, or its live state; admin's device list follows.
+      if (c.frontend !== "voice" || c.deviceId === undefined) return
+      const record = devices.get(c.deviceId)
+      if (m.capabilities !== undefined && record !== undefined) devices.set(c.deviceId, { ...record, declared: { capabilities: m.capabilities, seenAt: Date.now() } })
+      if (m.live !== undefined) {
+        c.visible = m.live.visible
+        if (m.live.lastInteractionAt !== undefined) c.lastInteractionAt = m.live.lastInteractionAt
+      }
+      devicesChanged()
+      return
+    }
   }
 }
 
@@ -2461,9 +2581,10 @@ wss.on("connection", (ws: WebSocket) => {
       if (m.frontend === "voice" && m.device !== undefined) {
         const now = Date.now()
         const known = devices.get(m.device.id)
+        const declared = m.device.capabilities !== undefined ? { declared: { capabilities: m.device.capabilities, seenAt: now } } : {}
         devices.set(m.device.id, known === undefined
-          ? { id: m.device.id, kind: m.device.kind, name: m.device.name, firstSeen: now, lastSeen: now }
-          : { ...known, lastSeen: now })
+          ? { id: m.device.id, kind: m.device.kind, name: m.device.name, firstSeen: now, lastSeen: now, ...declared }
+          : { ...known, lastSeen: now, ...declared })
         c.deviceId = m.device.id
       }
       c.welcomed = true
