@@ -4,6 +4,7 @@
  * (`server.ts`) does the access check and the pushes; this module answers the messages.
  */
 import {
+  type Assignment,
   type Assistant,
   type AssistantBody,
   type AssistantInfo,
@@ -37,6 +38,17 @@ export interface AssistantResult {
 }
 
 const OK: AssistantResult = { ok: true }
+
+/**
+ * The server's `withPlacement` (apps/assistant/src/serve/assistants.ts): the assistant added to the list; one already
+ * in it (a device following its type, placed on the type first) gets the phrase instead of a second entry.
+ */
+export const withPlacement = (list: ReadonlyArray<Assignment>, id: string, phrase: string | undefined): ReadonlyArray<Assignment> => {
+  const existing = list.find((x) => x.assistant === id)
+  if (existing === undefined) return [...list, { assistant: id, phrases: phrase !== undefined ? [phrase] : [] }]
+  if (phrase === undefined || existing.phrases.includes(phrase)) return list
+  return list.map((x) => (x === existing ? { ...x, phrases: [...x.phrases, phrase] } : x))
+}
 const fail = (code: ErrorInfo["code"], message: string, extra: { readonly fieldErrors?: ReadonlyArray<FieldError>; readonly warnings?: ReadonlyArray<FieldError> } = {}): AssistantResult => ({
   ok: false,
   error: { code, message, ...extra }
@@ -130,8 +142,12 @@ const seedTypeSettings = (): DeviceSettings => ({
   captions: { captions: true, speakTyped: false }
 })
 
-const seedDeviceOwn = (): Map<string, { own: DeviceOwn; rev: number }> =>
+const LONG_PHRASE = "hello my personal voice assistant please"
+
+/** `longPhrase`: the scenario with a living-room tablet whose list holds a six-word phrase (the UI must not cut or jump on it). */
+const seedDeviceOwn = (longPhrase = false): Map<string, { own: DeviceOwn; rev: number }> =>
   new Map([
+    ...(longPhrase ? [["d-living-room-0003", { rev: 0, own: { assistants: [{ assistant: "t3", phrases: [LONG_PHRASE, "hey computer", "ok house"] }, { assistant: "jeff", phrases: [] }] } }] as [string, { own: DeviceOwn; rev: number }]] : []),
     ["d-kitchen-ipad-0001", { rev: 0, own: { assistants: [{ assistant: "jeff", phrases: ["Hey Jeff"] }, { assistant: "keuken", phrases: ["Hé keuken", "Hey keuken"], followUpSeconds: 15 }], captions: { captions: false, speakTyped: false } } }]
   ])
 
@@ -141,13 +157,13 @@ export interface Known {
 }
 
 export interface AssistantsMock {
-  readonly reset: () => void
+  readonly reset: (longPhrase?: boolean) => void
   readonly assistants: () => ReadonlyArray<Assistant>
   readonly infos: (devices: ReadonlyArray<Known>) => Array<AssistantInfo>
   readonly deviceTypes: () => Array<DeviceTypeInfo>
   /** A device's protocol 7 fields. */
   readonly deviceFields: (id: string) => { own: DeviceOwn; settings: DeviceSettings; hearer: string | null; rev: number }
-  readonly create: (message: { assistant: AssistantBody; copyOf?: string | undefined }) => AssistantResult
+  readonly create: (message: { assistant: AssistantBody; copyOf?: string | undefined; placements?: ReadonlyArray<{ target: DeviceTarget; phrase?: string | undefined }> | undefined }, devices: ReadonlyArray<Known>) => AssistantResult
   readonly save: (message: { assistant: Assistant }) => AssistantResult
   readonly remove: (message: { id: string; rev: number }, devices: ReadonlyArray<Known>) => AssistantResult
   readonly saveDevice: (message: { target: DeviceTarget; rev: number; settings: DeviceSettingsPatch; saveAnyway?: boolean | undefined }) => AssistantResult
@@ -181,11 +197,11 @@ export const createAssistantsMock = (modules: () => ReadonlyArray<ModuleInfo>): 
   const effective = (own: DeviceOwn | undefined): DeviceSettings => effectiveDeviceSettings(BUILT_IN_WEB_VOICE_SETTINGS, typeSettings, own)
 
   const mock: AssistantsMock = {
-    reset: () => {
+    reset: (longPhrase = false) => {
       assistants = seedAssistants()
       typeSettings = seedTypeSettings()
       typeRev = 0
-      deviceOwn = seedDeviceOwn()
+      deviceOwn = seedDeviceOwn(longPhrase)
     },
     assistants: () => assistants,
     infos: (devices) => {
@@ -218,12 +234,40 @@ export const createAssistantsMock = (modules: () => ReadonlyArray<ModuleInfo>): 
       const settings = effective(record?.own)
       return { own: clone(record?.own ?? {}), settings: clone(settings), hearer: hearerOf(settings), rev: record?.rev ?? 0 }
     },
-    create: ({ assistant, copyOf }) => {
+    create: ({ assistant, copyOf, placements }, devices) => {
       if (assistants.length >= MAX_ASSISTANTS) return fail("limit_reached", `There can be at most ${MAX_ASSISTANTS} assistants.`)
       if (copyOf !== undefined && !assistants.some((a) => a.id === copyOf)) return fail("unknown_assistant", `There is no assistant ${copyOf} to start from.`)
       const found = issues(assistant)
       if (found.length > 0) return refusal(found)
       const id = makeAssistantId(assistant.name, assistants.map((a) => a.id))
+      // Placements (the wizard's Where step): the assistant is appended to each target's list, with its phrase. A device
+      // that followed its type's defaults gets its own list (the type's, then this). Refused as a whole if a phrase clashes.
+      const known = new Set([...assistants.map((a) => a.id), id])
+      let nextType = typeSettings
+      const nextOwn = new Map(deviceOwn)
+      for (const p of placements ?? []) {
+        const phrase = p.phrase === undefined || p.phrase.trim() === "" ? undefined : p.phrase.trim()
+        if (p.target.kind === "type") {
+          if (p.target.type !== WEB_VOICE_KIND) return fail("unknown_device", `No device type ${p.target.type}.`)
+          nextType = { ...nextType, assistants: withPlacement(nextType.assistants, id, phrase) }
+          const v = validateDeviceSettings(nextType, known)
+          if (v.errors.length > 0) return refusal(v.errors)
+          continue
+        }
+        const target = p.target
+        if (!devices.some((d) => d.id === target.id)) return fail("unknown_device", "That device is not known.")
+        const record = nextOwn.get(target.id) ?? { own: {}, rev: 0 }
+        const list = effectiveDeviceSettings(BUILT_IN_WEB_VOICE_SETTINGS, nextType, record.own).assistants
+        const own = { ...record.own, assistants: withPlacement(list, id, phrase) } as DeviceOwn
+        const v = validateDeviceSettings(effectiveDeviceSettings(BUILT_IN_WEB_VOICE_SETTINGS, nextType, own), known)
+        if (v.errors.length > 0) return refusal(v.errors)
+        nextOwn.set(target.id, { own, rev: record.rev + 1 })
+      }
+      if (nextType !== typeSettings) {
+        typeSettings = nextType
+        typeRev += 1
+      }
+      deviceOwn = nextOwn
       assistants = [...assistants, { ...clone(assistant), id, rev: 0 }]
       return { ok: true, assistantId: id }
     },

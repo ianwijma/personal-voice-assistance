@@ -410,6 +410,50 @@ describe("device.save", () => {
     expect(await request(a, { type: "device.save", target, rev: 0, settings: { interruptMode: "manual" } })).toMatchObject({ ok: false, error: { code: "stale" } })
   })
 
+  it("an accepted save answers with the revision it made (a type and a device); a refused one has none", async () => {
+    await start()
+    const { client: page } = await voice()
+    const a = await admin()
+    await deviceKnown(a, page.device.id)
+    await refresh(a)
+    const typeRev = typeOf(a).rev
+    const typeSaved = await request(a, { type: "device.save", target: { kind: "type", type: "web-voice" }, rev: typeRev, settings: { interruptMode: "manual" } })
+    expect(typeSaved).toMatchObject({ ok: true, rev: typeRev + 1 })
+    const deviceRev = deviceOf(a, page.device.id).rev
+    const deviceSaved = await request(a, { type: "device.save", target: { kind: "device", id: page.device.id }, rev: deviceRev, settings: { interruptMode: "instant" } })
+    expect(deviceSaved).toMatchObject({ ok: true, rev: deviceRev + 1 })
+    const stale = await request(a, { type: "device.save", target: { kind: "device", id: page.device.id }, rev: deviceRev, settings: { interruptMode: "manual" } })
+    expect(stale).toMatchObject({ ok: false, error: { code: "stale" } })
+    expect("rev" in stale).toBe(false)
+  })
+
+  for (const [state, edit] of [
+    ["no stored defaults", (file: Json) => { delete file.deviceTypes["web-voice"] }],
+    ["stored defaults that were not valid (dropped at load)", (file: Json) => { file.deviceTypes["web-voice"] = { rev: 4, matching: "sideways" } }]
+  ] as const) {
+    it(`a type with ${state} is rev 0; its first save stores, pushes and answers rev 1, the next 2; a save against 0 then is stale`, async () => {
+      await start(edit)
+      const a = await admin()
+      await refresh(a)
+      expect(typeOf(a).rev).toBe(0)
+      const save = async (settings: Json, r: number) => {
+        const from = a.messages.length
+        const result = await request(a, { type: "device.save", target: { kind: "type", type: "web-voice" }, rev: r, settings: settings as any, saveAnyway: true } as RequestInput)
+        return { result, from }
+      }
+      const first = await save({ matching: "exact" }, 0)
+      expect(first.result).toMatchObject({ ok: true, rev: 1 })
+      const pushed = await a.waitFor("device.types", (m) => m.types.some((t) => t.kind === "web-voice" && t.rev === 1), { from: first.from })
+      expect(pushed.types.find((t) => t.kind === "web-voice")).toMatchObject({ rev: 1, settings: { matching: "exact" } })
+      expect(await save({ matching: "close" }, 0)).toMatchObject({ result: { ok: false, error: { code: "stale" } } })
+      const second = await save({ matching: "close" }, 1)
+      expect(second.result).toMatchObject({ ok: true, rev: 2 })
+      await a.waitFor("device.types", (m) => m.types.some((t) => t.kind === "web-voice" && t.rev === 2), { from: second.from })
+      expect(typeOf(a)).toMatchObject({ rev: 2, settings: { matching: "close" } })
+      expect(await save({ matching: "exact" }, 1)).toMatchObject({ result: { ok: false, error: { code: "stale" } } })
+    })
+  }
+
   it("saving a device's assistants and phrases changes routing on a live session, without a reload; so does a type default", async () => {
     const { stt } = await start()
     const { client: page } = await voice()

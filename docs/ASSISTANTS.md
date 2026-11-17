@@ -424,7 +424,10 @@ RouteGate.replyStarted(assistant, now) / replyEnded(assistant, followUpMs, now)
   a phrase or dropped.
 - With the other two modes it accepts every utterance, as today's `always` does, but still matches and strips a
   leading phrase and tags the target.
-- `wake` and `wake.heard` gain the assistant.
+- `wake` and `wake.heard` gain the assistant. `wake.heard` carries it as `source: { deviceId?, assistantId? }`: the
+  device whose audio it was and the assistant the matched phrase belongs to there (both optional; the whole field is
+  absent from an older server). The admin tester shows exactly that and derives nothing from its session list or the
+  saved assignments; only a line without `source` is still worked out by the page.
 - The "awake" state is per assistant: an open armed or follow-up window names one assistant.
 - `wakeConfigFromProfile` (WakeGate.ts:69) is replaced by `routeConfigFrom(deviceSettings, assistants)`. The gate is
   reconfigured only when that part changes, which drops a held utterance, as today (VoiceSession.ts:354-362).
@@ -583,7 +586,7 @@ DeviceTarget    = { kind: "type", type: DeviceKind } | { kind: "device", id: Dev
 DeviceSave      = { type: "device.save", requestId, target: DeviceTarget, rev,
   name?: DeviceName,                                    // devices only
   settings: Partial<{ [K in keyof DeviceSettings]: DeviceSettings[K] | null }>,   // null = follow the type defaults (devices only)
-  saveAnyway?: boolean }
+  saveAnyway?: boolean }  // → result { ok, rev } (rev: the revision saved; the lists are pushed after the result)
 // unchanged: device.forget, wake.test (deviceId), module.configure (shared module settings), settings.update
 // (shared sections), job.*, engine.reload (now the full reload of §3.2)
 ```
@@ -1105,3 +1108,29 @@ Deviations from §5:
   this machine, so `ttsFirstAudio` of a hosted voice is not measured. The preview that starts a second Kokoro engine for
   a speaker the pool does not run (the pool's engine is not shared with previews) is unchanged. `ramMb` in the status is
   not filled for voices.
+
+### WP-6b wizard and WP-7 devices, overview, shared settings: built 2026-11-16
+
+`apps/web` only (and its mock server). Paths: `#settings/assistants/new/<1..7>` (the wizard), `#settings/devices` (list),
+`#settings/devices/<deviceId>` and `#settings/devices/type-<kind>` (a device, a type's defaults), `#settings/overview`
+(grid), `#settings/shared/<home|modules|accounts|routing|speech|providers|limits>`.
+
+- **Wizard** (`NewAssistantWizard.tsx`): the mock-up's seven steps (Start, Language model, Hearing, Voice, Modules, Where,
+  Check); it reuses the assistant tabs' fields through a local `AssistantDraft` (`useWizardDraft`). Nothing is sent before
+  "Create assistant": `assistant.create` with `copyOf` and `placements`. A refusal goes back to the step that owns the
+  field. The step is the third path part, so the settings screen's "Leave without saving?" guard covers it.
+- **Devices**: `DevicesPages.tsx` (list, device page, defaults page), `devices/AssignSection.tsx`, `lib/devices.ts` (a
+  draft of edits over what is saved: per section "Own value · Reset"; the list and "Answers without a phrase" are one
+  section made of two keys). Saves are `device.save`; a `warnings` outcome opens a "Save anyway?" dialog. TypeSafe is
+  listed and disabled ("which is not set up") while no decision module runs: the admin reads the server's `canAuto` as
+  "a module of kind `decider` is running" (the same rule the server uses), since `canAuto` is only sent to voice pages.
+- **Overview**: "Who answers where" grid (a list on a phone); the checklist names the assistants and accounts.
+- **Shared settings**: the tree regroups the server's `agents`, `speech`, `voices` and `modules` pages by key
+  (`settingsTree.ts`: `ASSISTANT_OWNED_KEYS`, `SHARED_PAGES`). The keys that moved onto the assistant are not shown; what
+  remains (Anthropic key and address, Deepgram key, voice provider keys, the two limits, the modules, the model lists) is
+  on Language model accounts, Speech recognition models, Voice providers, Limits and Modules. Home and Routing appear when
+  the server sends a `home` or `routing` section (Routing also when a decision module exists).
+- **Removed**: Front ends, `ProfileForm`, the old device page and the Language model, Speech recognition and Voices
+  categories. The module switches stay on the Modules page (the server still reads them until WP-12b).
+- **Not built**: Add as phrase on the tester's ignored lines (a heard phrase belongs to an assistant: pick on the device
+  page), the memory warning on the hearing notice (needs WP-11 data), per-module "own values" markers on Modules.

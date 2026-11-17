@@ -45,11 +45,14 @@ test("the list shows each assistant with its state, where it is used and the sum
   await expect(tabButton(page, "basics")).toHaveAttribute("aria-selected", "true")
 })
 
-test("New assistant makes a blank one through assistant.create and opens it", async ({ page, baseURL }) => {
+test("New assistant opens the wizard (the creation itself is covered in wizard.spec.ts) and a created one shows in the list", async ({ page, baseURL }) => {
   await loginAdmin(page, baseURL, "#settings/assistants/all")
   await page.getByTestId("new-assistant").click()
-  await page.getByLabel("Name").fill("Mia")
-  await page.getByTestId("dialog-confirm").click()
+  expect(new URL(page.url()).hash).toBe("#settings/assistants/new/1")
+  await expect(page.getByTestId("nav-assistants-all")).toHaveAttribute("aria-current", "page")
+  await page.getByLabel("Name", { exact: true }).fill("Mia")
+  await page.evaluate(() => { location.hash = "#settings/assistants/new/7" })
+  await page.getByTestId("wizard-create").click()
   await expect(page.getByTestId("assistant-page")).toHaveAttribute("data-assistant", "mia")
   await expect(page.getByTestId("page-title")).toHaveText("Mia")
   const created = (await mock.log()).messages.filter((m) => m.type === "assistant.create")

@@ -145,7 +145,7 @@ test.describe("phone", () => {
     await page.getByTestId("settings-toggle").tap()
     await expect(page.getByTestId("voice-sheet")).toBeVisible()
     expect(await overflow()).toBe(0)
-    for (const hash of ["#settings/frontends/web-voice", "#settings/devices/d-kitchen-ipad-0001", "#settings/speech/engine", "#settings/language-model/provider", "#settings/keys/keys"]) {
+    for (const hash of ["#settings/devices/type.web-voice", "#settings/devices/d-kitchen-ipad-0001", "#settings/shared/limits", "#settings/shared/accounts", "#settings/overview/overview", "#settings/assistants/new/1", "#settings/keys/keys"]) {
       await gotoAdmin(page, baseURL, hash)
       await expect(page.getByTestId("settings-page")).toBeVisible()
       const inner = await page.evaluate(() => {

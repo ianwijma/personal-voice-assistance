@@ -40,9 +40,9 @@ const FILES = [
   // Protocol 5: the admin front end's pages that await a request.
   "src/components/admin/LoginScreen.tsx",
   "src/components/admin/AdminHeader.tsx",
-  "src/components/settings/ProfileForm.tsx",
   "src/components/settings/PhraseTester.tsx",
   "src/components/settings/pages/DevicesPages.tsx",
+  "src/components/settings/pages/NewAssistantWizard.tsx",
   "src/components/settings/ReloadBar.tsx",
   "src/components/settings/ServerPage.tsx",
   "src/components/settings/ModuleHeader.tsx",

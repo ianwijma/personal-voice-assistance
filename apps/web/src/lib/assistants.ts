@@ -84,7 +84,8 @@ export const toBody = (a: Assistant | AssistantInfo): AssistantBody => {
 // ---- Results of the assistant messages
 
 export type Outcome =
-  | { readonly kind: "ok"; readonly assistantId?: string | undefined }
+  /** `rev`: a device save that went through, the revision it made (the lists that carry it come after the answer). */
+  | { readonly kind: "ok"; readonly assistantId?: string | undefined; readonly rev?: number | undefined }
   /** The entity changed since the page read it: reload it and tell the user. */
   | { readonly kind: "stale"; readonly message: string }
   /** `invalid_settings` (and its specific codes) with the dotted paths of the fields that refused. */
@@ -94,7 +95,7 @@ export type Outcome =
   | { readonly kind: "refused"; readonly code: string; readonly message: string }
 
 export const outcomeOf = (r: ResultMessage): Outcome => {
-  if (r.ok) return { kind: "ok", assistantId: r.assistantId }
+  if (r.ok) return { kind: "ok", assistantId: r.assistantId, ...(r.rev !== undefined ? { rev: r.rev } : {}) }
   const e = r.error
   if (e === undefined) return { kind: "refused", code: "internal", message: "The assistant did not say why." }
   if (e.code === "stale") return { kind: "stale", message: e.message }
@@ -190,12 +191,12 @@ export const accountState = (
       return { tone: "ok", text: "Always ready" }
     case "anthropic": {
       const set = sections.some((s) => s.form.secrets.ANTHROPIC_API_KEY?.set === true)
-      return set ? { tone: "ok", text: "Key set" } : { tone: "todo", text: "Set up…", setUp: ["language-model", "provider"] }
+      return set ? { tone: "ok", text: "Key set" } : { tone: "todo", text: "Set up…", setUp: ["shared", "accounts"] }
     }
     case "claude-subscription": {
       const m = modules.find((x) => x.id === "claude-subscription")
       if (m?.enabled === true && m.state === "running") return { tone: "ok", text: "Logged in" }
-      return { tone: "todo", text: "Set up…", setUp: ["language-model", "claude-subscription"] }
+      return { tone: "todo", text: "Set up…", setUp: ["shared", "accounts"] }
     }
     default:
       return { tone: "muted", text: "Not available yet" }

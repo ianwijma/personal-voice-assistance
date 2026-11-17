@@ -180,7 +180,8 @@ export function BehaviourTab({ draft }: TabProps) {
 
 // ---- Language model
 
-export function ModelTab({ draft }: TabProps) {
+/** Account, model and effort: the essentials of the language model (the wizard shows only these). */
+export function ModelFields({ draft }: { readonly draft: AssistantDraft }) {
   const a = draft.current
   const sections = useClientState((s) => s.sections)
   const modules = useClientState((s) => s.modules)
@@ -202,10 +203,10 @@ export function ModelTab({ draft }: TabProps) {
           accountNotAvailableYet(a.llm.account)
             ? `${info.title} is not available yet: ${name} cannot answer until it is.`
             : needsSetup
-            ? <>{info.title} is not set up yet: {name} cannot answer until you add it in <SettingsLink path={state.setUp ?? ["language-model"]}>Shared settings › Language model accounts</SettingsLink>.</>
+            ? <>{info.title} is not set up yet: {name} cannot answer until you add it in <SettingsLink path={state.setUp ?? ["shared", "accounts"]}>Shared settings › Language model accounts</SettingsLink>.</>
             : undefined
         }
-        help={<>Accounts are set up once, in <SettingsLink path={["language-model"]}>Shared settings › Language model accounts</SettingsLink>.</>}
+        help={<>Accounts are set up once, in <SettingsLink path={["shared", "accounts"]}>Shared settings › Language model accounts</SettingsLink>.</>}
       >
         <RadioCards
           groupId={idOfPath("llm.account")}
@@ -238,6 +239,15 @@ export function ModelTab({ draft }: TabProps) {
       <AField label="Effort" path="llm.effort" draft={draft} help="Low starts replies sooner; high thinks harder first.">
         <SegControl draft={draft} path="llm.effort" label="Effort" options={[{ value: "low", label: "Low" }, { value: "medium", label: "Medium" }, { value: "high", label: "High" }]} />
       </AField>
+    </>
+  )
+}
+
+export function ModelTab({ draft }: TabProps) {
+  const a = draft.current
+  return (
+    <>
+      <ModelFields draft={draft} />
       <AField label="Thinking" path="llm.thinking" draft={draft} help={a.llm.thinking === "adaptive" ? "Adaptive: the model thinks first when a question needs it. Those replies start later." : "Off: replies start as soon as possible."}>
         <SegControl draft={draft} path="llm.thinking" label="Thinking" options={[{ value: "off", label: "Off" }, { value: "adaptive", label: "Adaptive" }]} />
       </AField>
@@ -299,12 +309,10 @@ function hearingNotices(label: (preset: string) => string, info: AssistantInfo, 
   return { differs, summary: `${parts.join(" ")} A device hears with one recogniser: that of the assistant that answers without a phrase there, or else the first in its list.` }
 }
 
-export function HearingTab({ draft, info }: TabProps) {
+/** Engine, model and language: the essentials of hearing (the wizard shows only these). */
+export function HearingFields({ draft }: { readonly draft: AssistantDraft }) {
   const a = draft.current
   const sections = useClientState((s) => s.sections)
-  const assistants = useClientState((s) => s.assistants)
-  const devices = useClientState((s) => s.devices)
-  const types = useClientState((s) => s.deviceTypes)
   const isDg = a.hearing.engine === "deepgram"
   const modelField = sections.flatMap((s) => s.form.fields).find((f): f is Extract<SettingField, { type: "choice" }> => f.key === "STT_SHERPA_MODEL" && f.type === "choice")
   const languageField = sections.flatMap((s) => s.form.fields).find((f) => f.key === "STT_SHERPA_LANGUAGE")
@@ -316,25 +324,14 @@ export function HearingTab({ draft, info }: TabProps) {
   const languageOk = languageField?.visibleWhen === undefined ||
     evaluateCondition(languageField.visibleWhen, (k): SettingValue | undefined => (k === "STT_SHERPA_MODEL" ? a.hearing.model : k === "STT_PROVIDER" ? "sherpa" : undefined))
   const deepgramSet = sections.some((s) => s.form.secrets.DEEPGRAM_API_KEY?.set === true)
-  const notices = hearingNotices(hearingModelNames(sections).hearing, info, assistants, devices, types, { ...info, hearing: a.hearing })
   return (
     <>
-      <div className="flex flex-col gap-2" data-testid="hearing-notices">
-        <p className="rounded-md border border-line bg-surface-2/40 px-3 py-2 text-[13px] text-ink" data-testid="hearing-not-live">
-          These settings are saved now and used from the next start of the assistant. Until then every device hears with the shared recogniser set under{" "}
-          <SettingsLink path={["speech"]}>Speech recognition</SettingsLink>.
-        </p>
-        {notices.differs.map((d, i) => (
-          <p key={i} className="rounded-md border border-line px-3 py-2 text-[13px] text-ink-muted">{d}</p>
-        ))}
-        <p className="text-[13px] text-ink-muted" data-testid="hearing-where">{notices.summary}</p>
-      </div>
       <AField
         label="Speech to text"
         path="hearing.engine"
         draft={draft}
         implication={isDg ? "What you say is sent to Deepgram." : "Your voice never leaves this machine."}
-        warn={isDg && !deepgramSet ? <>Deepgram is not set up yet: speech recognition fails on the devices that hear with this assistant until you add its key in <SettingsLink path={["speech", "deepgram"]}>Shared settings › Speech recognition models</SettingsLink>.</> : undefined}
+        warn={isDg && !deepgramSet ? <>Deepgram is not set up yet: speech recognition fails on the devices that hear with this assistant until you add its key in <SettingsLink path={["shared", "speech"]}>Shared settings › Speech recognition models</SettingsLink>.</> : undefined}
       >
         <RadioCards
           groupId={idOfPath("hearing.engine")}
@@ -343,18 +340,47 @@ export function HearingTab({ draft, info }: TabProps) {
           onChange={(v) => draft.set("hearing.engine", v)}
           cards={[
             { value: "sherpa", title: "On this machine", tags: ["local"], description: "sherpa-onnx with a downloaded model." },
-            { value: "deepgram", title: "Deepgram", tags: ["hosted", "needs-key"], description: "Deepgram Flux over the internet.", right: deepgramSet ? <span className="inline-flex items-center gap-1.5"><span aria-hidden="true" className="size-1.5 rounded-full bg-ok" />Key set</span> : <SettingsLink path={["speech", "deepgram"]}>Set up…</SettingsLink> }
+            { value: "deepgram", title: "Deepgram", tags: ["hosted", "needs-key"], description: "Deepgram Flux over the internet.", right: deepgramSet ? <span className="inline-flex items-center gap-1.5"><span aria-hidden="true" className="size-1.5 rounded-full bg-ok" />Key set</span> : <SettingsLink path={["shared", "speech"]}>Set up…</SettingsLink> }
           ]}
         />
       </AField>
-      {!isDg ? (
+      {!isDg && (
         <>
-          <AField label="Model" path="hearing.model" draft={draft} htmlFor={idOfPath("hearing.model")} help={<>Only downloaded models can be chosen. <SettingsLink path={["speech", "models"]}>Download more in Shared settings › Speech recognition models</SettingsLink>.</>}>
+          <AField label="Model" path="hearing.model" draft={draft} htmlFor={idOfPath("hearing.model")} help={<>Only downloaded models can be chosen. <SettingsLink path={["shared", "speech"]}>Download more in Shared settings › Speech recognition models</SettingsLink>.</>}>
             <SelectControl draft={draft} path="hearing.model" label="Model" width={420} options={options} />
           </AField>
           <AField label="Language" path="hearing.language" draft={draft} htmlFor={idOfPath("hearing.language")} help={languageOk ? "Automatic works, but naming the language is faster and makes fewer mistakes." : "This model has one language, so the setting is not used."}>
             <SelectControl draft={draft} path="hearing.language" label="Language" width={260} disabled={!languageOk} options={LANGUAGES.map(([value, label]) => ({ value, label }))} />
           </AField>
+        </>
+      )}
+    </>
+  )
+}
+
+export function HearingTab({ draft, info }: TabProps) {
+  const a = draft.current
+  const sections = useClientState((s) => s.sections)
+  const assistants = useClientState((s) => s.assistants)
+  const devices = useClientState((s) => s.devices)
+  const types = useClientState((s) => s.deviceTypes)
+  const isDg = a.hearing.engine === "deepgram"
+  const notices = hearingNotices(hearingModelNames(sections).hearing, info, assistants, devices, types, { ...info, hearing: a.hearing })
+  return (
+    <>
+      <div className="flex flex-col gap-2" data-testid="hearing-notices">
+        <p className="rounded-md border border-line bg-surface-2/40 px-3 py-2 text-[13px] text-ink" data-testid="hearing-not-live">
+          These settings are saved now and used from the next start of the assistant. Until then every device hears with the shared recogniser set under{" "}
+          <SettingsLink path={["shared", "speech"]}>Speech recognition</SettingsLink>.
+        </p>
+        {notices.differs.map((d, i) => (
+          <p key={i} className="rounded-md border border-line px-3 py-2 text-[13px] text-ink-muted">{d}</p>
+        ))}
+        <p className="text-[13px] text-ink-muted" data-testid="hearing-where">{notices.summary}</p>
+      </div>
+      <HearingFields draft={draft} />
+      {!isDg ? (
+        <>
           <Group title="Turn timing">
             <AField label="Pause before an early reply" path="hearing.eagerSilenceMs" draft={draft} htmlFor={idOfPath("hearing.eagerSilenceMs")} help="After this pause a reply may start while you could still carry on. Lower is faster; raise it if replies cut in.">
               <NumberControl draft={draft} path="hearing.eagerSilenceMs" min={50} max={2000} step={10} unit="ms" label="Pause before an early reply" />
@@ -411,7 +437,7 @@ export function VoiceTab({ draft }: TabProps) {
         path="voice"
         draft={draft}
         implication={hosted ? `The text of each reply is sent to ${label}.` : "Speech is made on this machine."}
-        help={<>{a.name === "" ? "This assistant" : a.name} speaks every reply with this voice. Applies from the next reply once the voice has loaded. Favourites are shared by all devices. Keys and downloads are in <SettingsLink path={["voices"]}>Shared settings › Voice providers</SettingsLink>.</>}
+        help={<>{a.name === "" ? "This assistant" : a.name} speaks every reply with this voice. Applies from the next reply once the voice has loaded. Favourites are shared by all devices. Keys and downloads are in <SettingsLink path={["shared", "providers"]}>Shared settings › Voice providers</SettingsLink>.</>}
       >
         <div>
           <VoicePicker
@@ -458,7 +484,7 @@ function ModuleRow({ draft, module: m }: { readonly draft: AssistantDraft; reado
         </div>
         <span className="text-[13px] text-ink-muted">{m.description}</span>
         {needsSetup ? (
-          <p className="text-[13px] text-warn">Set up {m.name} in <SettingsLink path={["modules", m.id]}>its settings</SettingsLink> first.</p>
+          <p className="text-[13px] text-warn">Set up {m.name} in <SettingsLink path={["shared", "modules"]}>its settings</SettingsLink> first.</p>
         ) : choice.on && total > 0 ? (
           <>
             <button
@@ -582,19 +608,24 @@ function OwnSettings({ draft, module: m, fields }: { readonly draft: AssistantDr
   )
 }
 
-export function ModulesTab({ draft }: TabProps) {
+/** The module rows (switch, tools, own settings); the wizard shows them too. */
+export function ModuleList({ draft }: { readonly draft: AssistantDraft }) {
   const modules = useClientState((s) => s.modules)
   const list = modulesOf(modules.order.map((id) => modules.byId[id]!))
+  return list.length === 0 ? (
+    <p className="rounded-md border border-dashed border-line px-4 py-5 text-[14px] text-ink-muted">No modules are installed.</p>
+  ) : (
+    <ul className="flex flex-col divide-y divide-line/60 rounded-md border border-line" data-testid="module-list">
+      {list.map((m) => <ModuleRow key={m.id} draft={draft} module={m} />)}
+    </ul>
+  )
+}
+
+export function ModulesTab({ draft }: TabProps) {
   return (
     <>
       <p className="text-[14px] text-ink-muted">What this assistant can do. Each module uses the shared settings unless this assistant has its own.</p>
-      {list.length === 0 ? (
-        <p className="rounded-md border border-dashed border-line px-4 py-5 text-[14px] text-ink-muted">No modules are installed.</p>
-      ) : (
-        <ul className="flex flex-col divide-y divide-line/60 rounded-md border border-line" data-testid="module-list">
-          {list.map((m) => <ModuleRow key={m.id} draft={draft} module={m} />)}
-        </ul>
-      )}
+      <ModuleList draft={draft} />
     </>
   )
 }

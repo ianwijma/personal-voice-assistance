@@ -74,6 +74,13 @@ describe("result on the wire", () => {
       expect(decodeServerMessage(text), JSON.stringify(assistantId)).toMatchObject({ _tag: "Invalid", messageType: "result" })
     }
   })
+  it("rev (a device save's revision) is optional and a non-negative integer", () => {
+    expect(decodeServerMessage(JSON.stringify({ type: "result", requestId: "r", ok: true, rev: 3 }))).toEqual({ _tag: "Ok", message: { type: "result", requestId: "r", ok: true, rev: 3 } })
+    for (const rev of [-1, 1.5, "3"]) {
+      const text = JSON.stringify({ type: "result", requestId: "r", ok: true, rev })
+      expect(decodeServerMessage(text), JSON.stringify(rev)).toMatchObject({ _tag: "Invalid", messageType: "result" })
+    }
+  })
   it("each protocol 7 error code decodes from its wire spelling; its near misses do not", () => {
     for (const code of ["stale", "duplicate_phrase", "unknown_assistant", "limit_reached", "not_allowed"]) {
       expect(decodeServerMessage(failed({ code, message: "m" })), code).toMatchObject({ _tag: "Ok" })
@@ -189,5 +196,24 @@ describe("version 7 handling", () => {
     })
     expect(decodeServerMessage(welcome({ ...exampleSnapshot, setup: { ...setup, canPick: 1 } }))).toMatchObject({ _tag: "Invalid", messageType: "welcome" })
     expect(decodeServerMessage(welcome({ ...exampleSnapshot, conversations: [{ ...conversations[0], turns: -1 }] }))).toMatchObject({ _tag: "Invalid", messageType: "welcome" })
+  })
+})
+
+// PR #35 review 6, finding 2: `wake.heard` says where it was heard, so the admin tester need not guess.
+describe("wake.heard source", () => {
+  it("carries the device and the matched phrase's assistant, and decodes without them from an older server", () => {
+    const message = { type: "wake.heard", text: "hey jeff", matched: "hey jeff", accepted: true, source: { deviceId: exampleDevice.id, assistantId: "jeff" }, at: 1 }
+    expect(decodeServerMessage(JSON.stringify(message))).toEqual({ _tag: "Ok", message })
+    const nobody = { type: "wake.heard", text: "the tomatoes", accepted: false, source: { deviceId: exampleDevice.id }, at: 2 }
+    expect(decodeServerMessage(JSON.stringify(nobody))).toEqual({ _tag: "Ok", message: nobody })
+    const old = { type: "wake.heard", text: "hey jeff", matched: "hey jeff", accepted: true, at: 3 }
+    expect(decodeServerMessage(JSON.stringify(old))).toEqual({ _tag: "Ok", message: old })
+    expect(serverExamples["wake.heard"]).toMatchObject({ source: { deviceId: exampleDevice.id, assistantId: "jeff" } })
+  })
+  it("refuses a source whose ids are not ids", () => {
+    for (const source of [{ deviceId: "x" }, { assistantId: "Not An Id" }, { assistantId: "typesafe" }]) {
+      const text = JSON.stringify({ type: "wake.heard", text: "t", source, at: 1 })
+      expect(decodeServerMessage(text), JSON.stringify(source)).toMatchObject({ _tag: "Invalid", messageType: "wake.heard" })
+    }
   })
 })

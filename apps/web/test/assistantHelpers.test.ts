@@ -46,6 +46,9 @@ describe("outcomeOf: the edges of an answer", () => {
   it("a success without an id has no assistantId", () => {
     expect(outcomeOf({ type: "result", requestId: "r", ok: true })).toEqual({ kind: "ok", assistantId: undefined })
   })
+  it("a device save's success carries the revision it made", () => {
+    expect(outcomeOf({ type: "result", requestId: "r", ok: true, rev: 4 })).toEqual({ kind: "ok", assistantId: undefined, rev: 4 })
+  })
 })
 
 describe("tabs", () => {
@@ -87,13 +90,13 @@ describe("language model accounts", () => {
     })
     it("the Anthropic API is ready when its key is set, else points at where to set it", () => {
       expect(accountState("anthropic", [section([], { ANTHROPIC_API_KEY: { set: true } })], [])).toEqual({ tone: "ok", text: "Key set" })
-      expect(accountState("anthropic", [section([], { ANTHROPIC_API_KEY: { set: false } })], [])).toMatchObject({ tone: "todo", setUp: ["language-model", "provider"] })
+      expect(accountState("anthropic", [section([], { ANTHROPIC_API_KEY: { set: false } })], [])).toMatchObject({ tone: "todo", setUp: ["shared", "accounts"] })
       expect(accountState("anthropic", [section([])], [])).toMatchObject({ tone: "todo" })
     })
     it("the subscription is ready only when its module is on and running", () => {
       expect(accountState("claude-subscription", [], [mod("claude-subscription", [])])).toEqual({ tone: "ok", text: "Logged in" })
       for (const m of [mod("claude-subscription", [], { enabled: false }), mod("claude-subscription", [], { state: "starting" })]) {
-        expect(accountState("claude-subscription", [], [m])).toMatchObject({ tone: "todo", setUp: ["language-model", "claude-subscription"] })
+        expect(accountState("claude-subscription", [], [m])).toMatchObject({ tone: "todo", setUp: ["shared", "accounts"] })
       }
       expect(accountState("claude-subscription", [], [])).toMatchObject({ tone: "todo" })
     })
