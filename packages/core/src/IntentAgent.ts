@@ -16,7 +16,7 @@ import {
 import { defaultIntentWords, type IntentWords } from "./IntentWords.ts"
 import type { AgentImplementation } from "./ModuleContributions.ts"
 import { makePendingIntents, needsConfirmation, type PendingIntents } from "./PendingIntents.ts"
-import { addTraceEvent } from "./TurnTrace.ts"
+import { beginTraceSpan } from "./TurnTrace.ts"
 import { parseValues } from "./ValueParsing.ts"
 
 /**
@@ -261,11 +261,15 @@ export const makeIntentAgent = (options: IntentAgentOptions = {}): AgentImplemen
         return out
       }
       const callId = `action-${input.turnId}-${++calls}`
-      const now = input.now === undefined ? Clock.currentTimeMillis : Effect.sync(input.now)
+      // The trace clock, else the monotonic one (as `ModelAgent` and the Claude agent): the entry sits among the trace's times.
+      const now = Effect.sync(input.now ?? (() => performance.now()))
 
       const run = Effect.gen(function*() {
         input.mark("actionStarted")
         const start = yield* now
+        const name = actionToolName(action.moduleId, def.id)
+        // Recorded at its launch: an action still running when the turn ends (Stop) is on the time line, without a duration.
+        const span = beginTraceSpan(input.trace, "action", start, name)
         // Detached: once started, an action finishes even if the turn is interrupted (half a light switch is worse).
         // Suspended: a `run` that throws while building its effect fails the action, not the turn.
         const fiber = yield* Effect.forkDetach(Effect.suspend(() => def.run(params as never)).pipe(
@@ -277,9 +281,8 @@ export const makeIntentAgent = (options: IntentAgentOptions = {}): AgentImplemen
         const exit = yield* Fiber.await(fiber)
         const ms = (yield* now) - start
         input.mark("actionFinished")
-        const name = actionToolName(action.moduleId, def.id)
         input.trace.tools.push({ name, ms })
-        addTraceEvent(input.trace, "action", start, ms, name)
+        span.end(start + ms)
         return { exit, ms }
       })
 

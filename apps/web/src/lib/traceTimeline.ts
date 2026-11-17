@@ -41,6 +41,14 @@ export const EVENT_LABELS: Readonly<Record<TraceEventName, string>> = {
 
 const isKnown = (name: string): name is TraceEventName => Object.prototype.hasOwnProperty.call(EVENT_LABELS, name)
 
+/**
+ * The page's name for a typed turn's `endOfTurn` (`timelineOf` renames it): the text was sent, nobody talked. It is
+ * only in the lists, as the zero line says "text sent"; a typed turn has no speaking lane.
+ */
+export const TEXT_SENT = "textSent"
+/** The end of turn (0), spoken or typed: drawn and listed in bold. */
+export const isZeroEntry = (name: string): boolean => name === "endOfTurn" || name === TEXT_SENT
+
 export interface EventText {
   readonly label: string
   /** What is left for the detail column ("round N" is part of the label of a language-model entry). */
@@ -49,7 +57,11 @@ export interface EventText {
 
 /** The words for one entry. An unknown name is shown as it is. */
 export const eventText = (e: TraceEvent): EventText => {
-  const base = isKnown(e.name) ? EVENT_LABELS[e.name] : e.name
+  // An action or tool without a duration was still running when the turn ended (its time line was published then).
+  const unfinished = e.ms === undefined && (e.name === "action" || e.name === "tool")
+  const base = unfinished
+    ? `${e.name === "action" ? "Action" : "Tool call"} started (still running when the turn ended)`
+    : isKnown(e.name) ? EVENT_LABELS[e.name] : e.name === TEXT_SENT ? "Text sent" : e.name
   if (e.detail !== undefined && /^round \d+$/.test(e.detail)) return { label: `${base} · ${e.detail}`, detail: undefined }
   return { label: base, detail: e.detail }
 }
@@ -93,7 +105,7 @@ export const LANES: ReadonlyArray<LaneDef> = [
   { id: "other", label: "Other", short: "Other", names: [] }
 ]
 
-const NOT_IN_A_LANE: ReadonlySet<string> = new Set(["turnStarted", "turnEnded"])
+const NOT_IN_A_LANE: ReadonlySet<string> = new Set(["turnStarted", "turnEnded", TEXT_SENT])
 
 /** The lane of an entry; undefined for the two that only the lists show. */
 export const laneOf = (name: string): LaneId | undefined => {
@@ -484,16 +496,19 @@ export const rebuildTimeline = (t: TraceInfo): ReadonlyArray<TraceEvent> => {
   add("playbackStart", m.playbackStart)
   if (m.playbackStart !== undefined && t.client !== undefined) add("audible", m.playbackStart + t.client.outputLatencyMs)
   if (out.length === 0) return []
-  if (t.mode === "voice") out.push({ name: "endOfTurn", at: 0 })
+  out.push({ name: "endOfTurn", at: 0 })
   if (t.totalMs !== undefined) out.push({ name: "turnEnded", at: t.totalMs, detail: t.outcome })
   return out.sort((a, b) => a.at - b.at)
 }
 
 /** Sorted once. A recorded time line is used as it is (at most `MAX_ENTRIES`, the protocol's limit). */
 export const timelineOf = (t: TraceInfo): TimelineOf => {
-  if (t.timeline !== undefined && t.timeline.length > 0) return { events: [...t.timeline].sort((a, b) => a.at - b.at), source: "recorded" }
+  // A typed turn's end of turn is when the text was sent (`TEXT_SENT`).
+  const named = (events: ReadonlyArray<TraceEvent>): Array<TraceEvent> =>
+    t.mode === "text" ? events.map((e) => (e.name === "endOfTurn" ? { ...e, name: TEXT_SENT } : e)) : [...events]
+  if (t.timeline !== undefined && t.timeline.length > 0) return { events: named(t.timeline).sort((a, b) => a.at - b.at), source: "recorded" }
   const events = rebuildTimeline(t)
-  return events.length > 0 ? { events, source: "rebuilt" } : { events: [], source: "none" }
+  return events.length > 0 ? { events: named(events), source: "rebuilt" } : { events: [], source: "none" }
 }
 
 // ---- A turn that did not complete

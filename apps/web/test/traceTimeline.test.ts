@@ -27,6 +27,27 @@ describe("labels", () => {
     expect(eventText(e("llmRequestSent", 4, { detail: "round 2" }))).toEqual({ label: "Language model: request sent · round 2", detail: undefined })
     expect(eventText(e("tool", 4, { ms: 2, detail: "weather" }))).toEqual({ label: "Tool call", detail: "weather" })
   })
+  it("an action or tool without a duration was still running at the turn's end: its label does not say it finished", () => {
+    expect(eventText(e("action", 4, { detail: "home_all_off" })).label).toBe("Action started (still running when the turn ended)")
+    expect(eventText(e("tool", 4, { detail: "weather" })).label).toBe("Tool call started (still running when the turn ended)")
+    expect(eventText(e("action", 4, { ms: 300, detail: "home_all_off" })).label).toBe("Action ran")
+  })
+  it("a typed turn: its end of turn is \"Text sent\", only in the lists, so no speaking lane; a spoken one is unchanged", () => {
+    const line = [e("turnStarted", -0.2), e("endOfTurn", 0), e("llmRequestSent", 3, { detail: "round 1" }), e("llmFirstToken", 300, { detail: "round 1" })]
+    const typed = timelineOf(trace({ mode: "text", timeline: line })).events
+    const sent = typed.find((x) => eventText(x).label === "Text sent")
+    expect(sent?.at).toBe(0)
+    expect(typed.some((x) => eventText(x).label === "Finished talking")).toBe(false)
+    expect(laneOf(sent!.name)).toBeUndefined()
+    expect(groupLanes(typed).map((l) => l.id)).toEqual(["model"])
+    expect(listRows(typed).map((r) => r.text.label)).toContain("Text sent")
+    // Rebuilt from the marks (an older server) the same.
+    const rebuilt = timelineOf(trace({ mode: "text", marks: { llmFirstToken: 300 } })).events
+    expect(rebuilt.map((x) => eventText(x).label)).toContain("Text sent")
+    const spoken = timelineOf(trace({ mode: "voice", timeline: line })).events
+    expect(groupLanes(spoken).map((l) => l.id)).toEqual(["hearing", "model"])
+    expect(spoken.map((x) => eventText(x).label)).toContain("Finished talking")
+  })
   it("formats times with a real minus sign", () => {
     expect([signed(-2400), signed(312), signed(0), signed(0.2)]).toEqual(["−2,400", "+312", "0", "0"])
   })

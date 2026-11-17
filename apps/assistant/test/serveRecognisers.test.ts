@@ -271,7 +271,7 @@ describe("serve: one recogniser per device, from its hearer (WP-11)", () => {
     fake.emit(old, { _tag: "SpeechStarted" }, { _tag: "Interim", text: "hey alpha what" })
     await saveHearing("alpha", { model: "model-c" })
     await until("switched to model-c", () => streamOf(fake, "device-a")?.model === "model-c", 3_000)
-    await sleep(500)
+    await sleep(1_500)
     const from = client.messages.length
     const adminFrom = admin.messages.length
     fake.emit(streamOf(fake, "device-a")!, { _tag: "SpeechStarted" })
@@ -282,10 +282,11 @@ describe("serve: one recogniser per device, from its hearer (WP-11)", () => {
     const line = trace.timeline!
     const startedAt = line.find((x) => x.name === "speechStarted")!.at
     const firstInterimAt = line.find((x) => x.name === "firstInterim")!.at
-    // This utterance's own start (~100 ms before its end), not the closed one's (more than 500 ms before).
-    expect(startedAt).toBeGreaterThan(-400)
-    expect(startedAt).toBeLessThan(-50)
-    expect(firstInterimAt).toBeGreaterThanOrEqual(startedAt + 50)
+    // This utterance's own start (~100 ms before its end), not the closed one's (more than 1.5 s before, by the sleep):
+    // a margin only a reused start can cross.
+    expect(startedAt).toBeGreaterThan(-1_000)
+    expect(startedAt).toBeLessThan(0)
+    expect(firstInterimAt).toBeGreaterThan(startedAt)
   })
 
   it("a start the old stream stamped but never delivered (dispatch busy with a routing call) gives the next stream's utterance no times", async () => {
@@ -306,7 +307,7 @@ describe("serve: one recogniser per device, from its hearer (WP-11)", () => {
       await sleep(20)
       await saveHearing("alpha", { model: "model-c" })
       await until("switched to model-c", () => streamOf(fake, "device-a")?.model === "model-c", 3_000)
-      await sleep(600)
+      await sleep(1_500)
       const from = client.messages.length
       const adminFrom = admin.messages.length
       fake.emit(streamOf(fake, "device-a")!, { _tag: "SpeechStarted" })
@@ -317,9 +318,10 @@ describe("serve: one recogniser per device, from its hearer (WP-11)", () => {
       const line = trace.timeline!
       const startedAt = line.find((x) => x.name === "speechStarted")!.at
       const firstInterimAt = line.find((x) => x.name === "firstInterim")!.at
-      // Its own start, ~100 ms before its end plus the routing call; the dropped start was over 600 ms earlier still.
-      expect(startedAt).toBeGreaterThan(-800)
-      expect(firstInterimAt).toBeGreaterThanOrEqual(startedAt + 50)
+      // Its own start, ~100 ms before its end plus the routing call (400 ms); the dropped start was more than 1.5 s
+      // before this one (the sleep): a margin only a reused start can cross.
+      expect(startedAt).toBeGreaterThan(-1_300)
+      expect(firstInterimAt).toBeGreaterThan(startedAt)
     } finally {
       jev.close()
     }
@@ -341,7 +343,7 @@ describe("serve: one recogniser per device, from its hearer (WP-11)", () => {
       await saveOwn("device-a", { withoutPhrase: { mode: "nobody" } })
       expect((await Effect.runPromise(server!.handle.engine.reload)).ok).toBe(true)
       await until("a new stream", () => streamOf(fake, "device-a") !== undefined && streamOf(fake, "device-a") !== old, 5_000)
-      await sleep(800)
+      await sleep(1_500)
       const from = client.messages.length
       const adminFrom = admin.messages.length
       const now = streamOf(fake, "device-a")!
@@ -354,9 +356,10 @@ describe("serve: one recogniser per device, from its hearer (WP-11)", () => {
       expect(trace.route).toMatchObject({ by: "phrase" })
       const line = trace.timeline!
       const startedAt = line.find((x) => x.name === "speechStarted")!.at
-      // Its own start (~100 ms before its end), not the reloaded-away utterance's (well over 800 ms before).
-      expect(startedAt).toBeGreaterThan(-400)
-      expect(line.find((x) => x.name === "firstInterim")!.at).toBeGreaterThanOrEqual(startedAt + 50)
+      // Its own start (~100 ms before its end), not the reloaded-away utterance's (more than 1.5 s before, by the
+      // sleep): a margin only a reused start can cross.
+      expect(startedAt).toBeGreaterThan(-1_000)
+      expect(line.find((x) => x.name === "firstInterim")!.at).toBeGreaterThan(startedAt)
     } finally {
       jev.close()
     }

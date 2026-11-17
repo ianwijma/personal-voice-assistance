@@ -2,6 +2,7 @@ import {
   type Agent,
   type AgentEvent,
   addTraceEvent,
+  beginTraceSpan,
   AgentError,
   type AgentImplementation,
   type AgentTurnInput,
@@ -444,21 +445,25 @@ export const makeClaudeAgent = async (options: ClaudeAgentOptions): Promise<Clau
             const call: ToolCall = { id: `claude-${input.turnId}-${++callIds}`, name, input: args }
             emit({ _tag: "ToolStarted", call })
             let started = clock()
+            let span: ReturnType<typeof beginTraceSpan> | undefined
             try {
               if (!input.tools.isSpeculative(name)) await Effect.runPromise(input.promoted, { signal: controller.signal })
               // The tool's own time: after the wait for the turn to be confirmed (a speculative turn's tool span must not begin before 0).
               started = clock()
+              // Recorded at its start: a tool still running when the turn is interrupted is on the time line too.
+              span = beginTraceSpan(input.trace, "tool", started, name)
               const ran = await Effect.runPromise(input.tools.run(call), { signal: controller.signal })
               // A failed tool returns its error as a result (it does not throw): a diagnostic, redacted like the
               // catch path's (after the final review). A successful result is content and passes untouched.
               const result = ran.isError ? { ...ran, content: redact(ran.content, secrets) } : ran
               const ms = Math.round(clock() - started)
               input.trace.tools.push({ name, ms })
-              addTraceEvent(input.trace, "tool", started, ms, name)
+              span.end(started + ms)
               emit({ _tag: "ToolFinished", result, ms })
               return { content: result.content, isError: result.isError }
             } catch (e) {
               const ms = Math.round(clock() - started)
+              span?.end(started + ms)
               const result = { id: call.id, name, content: `Tool did not finish: ${fromUpstream(e, secrets)}`, isError: true }
               emit({ _tag: "ToolFinished", result, ms })
               return { content: result.content, isError: true }

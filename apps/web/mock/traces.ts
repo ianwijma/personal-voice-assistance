@@ -93,7 +93,11 @@ const timelineOf = (s: Seed, sent: number | undefined): Array<TraceEvent> => {
       ev("turnStarted", -330, { detail: "early" })
     }
     ev("endOfTurn", 0)
-  } else ev("turnStarted", 0, { detail: "typed" })
+  } else {
+    // As the server records a typed turn: it begins and its end of turn is marked at once (the text was sent); no hearing.
+    ev("turnStarted", -0.2)
+    ev("endOfTurn", 0)
+  }
   if (s.route.by === "typesafe" && sent !== undefined) {
     ev("routing", sent, { ms: s.route.ms, detail: s.route.outcome })
     ev("assistantChosen", sent + s.route.ms, { detail: s.route.outcome === "chosen" ? NAMES[s.a] : `${NAMES[s.a]} (fallback)` })

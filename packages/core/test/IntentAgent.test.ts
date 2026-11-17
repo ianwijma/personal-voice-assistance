@@ -84,6 +84,20 @@ const spoken = (events: ReadonlyArray<AgentEvent>) =>
 const tags = (events: ReadonlyArray<AgentEvent>) => events.map((e) => (e._tag === "TextDelta" ? (e.text === "\n" ? "flush" : "text") : e._tag))
 
 describe("intent agent", () => {
+  it.live("without `input.now` the action's time-line entry is on the monotonic clock, as the trace's other times", () =>
+    Effect.gen(function*() {
+      const home = makeHome()
+      const decider = makeScriptedDecider(wants("home.lights_on", { "home.lights_on/target": choiceAnswer({ "area:kitchen": 0.96, "area:living_room": 0.04 }) }), { id: "keywords" })
+      const trace: AgentTurnInput["trace"] = { id: 1, mode: "voice", speculative: false, startedAt: performance.now(), marks: {}, tools: [], voices: [] }
+      const before = performance.now()
+      yield* collect(makeIntentAgent().turn(makeInput({ actions: home.actions, deciders: new Map([["keywords", decider]]), trace })))
+      const after = performance.now()
+      const action = trace.events?.find((e) => e.name === "action")
+      assert.isDefined(action)
+      assert.isAtLeast(action!.at, before)
+      assert.isAtMost(action!.at + action!.ms!, after)
+    }))
+
   it.effect("act: decision, announcement, action run, in that order; one request with every parameter", () =>
     Effect.gen(function*() {
       const home = makeHome()

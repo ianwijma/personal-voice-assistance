@@ -18,7 +18,7 @@ import { makeModelAgent } from "./ModelAgent.ts"
 import { armAgent, initialRouterState, type RouteDecision, type Router, type RouterState, setActiveAgent } from "./Routing.ts"
 import { AudioInput, AudioOutput, Llm, Stt, Tts, type TtsAudio } from "./Services.ts"
 import { ToolRegistry } from "./ToolRegistry.ts"
-import { addTraceEvent, CurrentTurnTrace, type Trace, TurnTrace, type TurnOutcome } from "./TurnTrace.ts"
+import { addTraceEvent, beginTraceSpan, CurrentTurnTrace, type Trace, TurnTrace, type TurnOutcome } from "./TurnTrace.ts"
 import { ACTION_TIMEOUT_MS, ActionError, type ActionOutcome, actionToolName, type RegisteredAction } from "./Actions.ts"
 import { confirmationQuestion, describeProposal } from "./Decision.ts"
 import type { IntentWords } from "./IntentWords.ts"
@@ -736,6 +736,10 @@ const makeConversationCore = Effect.fnUntraced(function*(options: AgentConversat
       tt.mark(trace, "actionStarted")
       emit({ _tag: "ActionStarted", turnId, callId, actionId: action.id, label: def.label, params })
       const start = tt.now()
+      const name = actionToolName(action.moduleId, def.id)
+      // Recorded at its launch: Stop may end the turn (its time line published) while the action still runs detached;
+      // it is then shown as started, without a duration.
+      const span = beginTraceSpan(trace, "action", start, name)
       const work = Effect.suspend(() => def.run(params as never)).pipe(
         Effect.timeoutOrElse({
           duration: ACTION_TIMEOUT_MS,
@@ -748,9 +752,8 @@ const makeConversationCore = Effect.fnUntraced(function*(options: AgentConversat
           Effect.sync(() => {
             const ms = tt.now() - start
             if (trace.outcome === undefined) tt.mark(trace, "actionFinished")
-            const name = actionToolName(action.moduleId, def.id)
             trace.tools.push({ name, ms })
-            addTraceEvent(trace, "action", start, ms, name)
+            span.end(start + ms)
             if (Exit.isSuccess(exit)) {
               record.status = "ok"
               const say = (exit.value as ActionOutcome | undefined)?.say

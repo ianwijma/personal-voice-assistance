@@ -26,7 +26,10 @@ import {
 const advance = (millis: number) =>
   Effect.andThen(Effect.repeat(Effect.yieldNow, { times: 50 }), TestClock.adjust(millis))
 
-const run = (options: { readonly llm: Parameters<typeof makeScriptedLlm>[0]; readonly tools?: ReadonlyArray<ReturnType<typeof makeTool>> }, script: ReadonlyArray<SttEvent | Sleep>) => {
+type RunOptions = { readonly llm: Parameters<typeof makeScriptedLlm>[0]; readonly tools?: ReadonlyArray<ReturnType<typeof makeTool>> }
+const run = (options: RunOptions, script: ReadonlyArray<SttEvent | Sleep>) => Effect.map(runAll(options, script), (traces) => traces[traces.length - 1]!)
+/** Every finished turn's trace, oldest first. */
+const runAll = (options: RunOptions, script: ReadonlyArray<SttEvent | Sleep>) => {
   const llm = makeScriptedLlm(options.llm)
   const tts = makeTtsOut()
   const conversation = Conversation.layer({ systemPrompt: "sys" }).pipe(
@@ -36,8 +39,7 @@ const run = (options: { readonly llm: Parameters<typeof makeScriptedLlm>[0]; rea
     const fiber = yield* Effect.flatMap(Effect.service(Conversation), (c) => Effect.forkChild(c.voice(scripted(script))))
     yield* advance(2_000)
     yield* Fiber.join(fiber)
-    const traces = yield* Effect.flatMap(Effect.service(TurnTrace), (tt) => tt.recent)
-    return traces[traces.length - 1]!
+    return yield* Effect.flatMap(Effect.service(TurnTrace), (tt) => tt.recent)
   }).pipe(Effect.provide(Layer.mergeAll(conversation, tts.tts.layer, tts.out.layer)))
 }
 const makeTtsOut = () => ({ tts: makeMarkerTts({ delayMillis: 20 }), out: makeRecordingAudioOutput({ chunkMillis: 100 }) })
@@ -108,6 +110,29 @@ describe("the turn's time line", () => {
       const [r1, r2] = line.filter((e) => e.name === "llmRequestSent")
       assert.isAtLeast(r2!.at, tool.at + tool.ms!, "round 2 asks after the tool finished")
       assert.isAtLeast(tool.at, r1!.at)
+    }))
+
+  it.effect("a tool still running when the turn is interrupted is on its time line, started, without a duration", () =>
+    Effect.gen(function*() {
+      const slow = makeTool({
+        name: "slow",
+        description: "slow",
+        parameters: Schema.Struct({}),
+        speculative: true,
+        execute: () => Effect.andThen(Effect.sleep(1_000), Effect.succeed("late"))
+      })
+      // Barge-in 200 ms into the tool: the turn ends interrupted; the blank final starts nothing.
+      const traces = yield* runAll(
+        { tools: [slow], llm: [[toolCall("t1", "slow", {})], [textDelta("Done.")]] },
+        [endOfTurn("take your time"), sleep(200), speechStarted, sleep(10), endOfTurn("")]
+      )
+      const trace = traces.find((t) => t.tools.length > 0 || t.events?.some((e) => e.name === "tool") === true)
+      assert.isDefined(trace)
+      assert.strictEqual(trace!.outcome, "interrupted")
+      const tool = traceTimeline(trace!).find((e) => e.name === "tool")
+      assert.isDefined(tool, "the tool that ran is on the time line")
+      assert.strictEqual(tool!.detail, "slow")
+      assert.strictEqual(tool!.ms, undefined)
     }))
 })
 

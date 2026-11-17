@@ -120,6 +120,24 @@ export class TurnTrace extends Context.Service<TurnTrace, {
     Layer.sync(TurnTrace, () => makeTurnTrace(options))
 }
 
+/**
+ * Append a span that has begun (an action, a tool call) at its start, without `ms`; `end(at)` gives that same entry
+ * its duration. A span still running when the turn ends stays a started entry without a duration: the turn's time
+ * line was published then, so `end` changes nothing once `trace.endedAt` is set (and nothing when the entry was
+ * dropped for the `MAX_TRACE_EVENTS` limit).
+ */
+export const beginTraceSpan = (trace: Trace, name: string, at: number, detail?: string): { readonly end: (endAt: number) => void } => {
+  const events = trace.events ??= []
+  if (events.length >= MAX_TRACE_EVENTS) return { end: () => {} }
+  const entry: { name: string; at: number; ms?: number; detail?: string } = detail === undefined ? { name, at } : { name, at, detail }
+  events.push(entry)
+  return {
+    end: (endAt) => {
+      if (trace.endedAt === undefined && entry.ms === undefined) entry.ms = Math.max(0, endAt - at)
+    }
+  }
+}
+
 /** Append an entry to `trace.events` (what `TurnTrace.event` does, for code that has the time already). */
 export const addTraceEvent = (trace: Trace, name: string, at: number, ms?: number, detail?: string): void => {
   const events = trace.events ??= []

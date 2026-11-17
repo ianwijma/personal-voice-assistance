@@ -17,6 +17,7 @@ import {
   inlineLabels,
   inlineText,
   latencyTone,
+  isZeroEntry,
   laneDef,
   laneOf,
   type ListRow,
@@ -82,18 +83,28 @@ function Tooltip({ tip, anchor, bounds }: { readonly tip: Tip; readonly anchor: 
   const ref = useRef<HTMLDivElement>(null)
   const [at, setAt] = useState<{ readonly left: number; readonly top: number } | undefined>()
   useLayoutEffect(() => {
-    const el = ref.current
-    if (el === null) return
-    const r = anchor.getBoundingClientRect()
-    const b = bounds?.getBoundingClientRect()
-    const w = el.offsetWidth
-    const h = el.offsetHeight
-    const lo = Math.max(8, (b?.left ?? 0) + 8)
-    const hi = Math.min(window.innerWidth - 8, (b?.right ?? window.innerWidth) - 8) - w
-    const left = Math.max(lo, Math.min(r.left + r.width / 2 - w / 2, hi))
-    let top = r.top - h - 8
-    if (top < 8) top = r.bottom + 8
-    setAt({ left, top })
+    const place = () => {
+      const el = ref.current
+      if (el === null) return
+      const r = anchor.getBoundingClientRect()
+      const b = bounds?.getBoundingClientRect()
+      const w = el.offsetWidth
+      const h = el.offsetHeight
+      const lo = Math.max(8, (b?.left ?? 0) + 8)
+      const hi = Math.min(window.innerWidth - 8, (b?.right ?? window.innerWidth) - 8) - w
+      const left = Math.max(lo, Math.min(r.left + r.width / 2 - w / 2, hi))
+      let top = r.top - h - 8
+      if (top < 8) top = r.bottom + 8
+      setAt((prev) => (prev?.left === left && prev.top === top ? prev : { left, top }))
+    }
+    place()
+    // It follows its mark: the page, the table's horizontal scroll (any scroller: capture) and a resize move the mark.
+    window.addEventListener("scroll", place, { capture: true, passive: true })
+    window.addEventListener("resize", place)
+    return () => {
+      window.removeEventListener("scroll", place, { capture: true })
+      window.removeEventListener("resize", place)
+    }
   }, [anchor, tip, bounds])
   return (
     <div
@@ -415,7 +426,7 @@ function EntryTable({ t, rows, ix }: { readonly t: TraceInfo; readonly rows: Rea
         {rows.map((r) => {
           const e = r.event
           const pinned = ix.pin === r.index
-          const strong = e.name === "endOfTurn" || e.name === "audible"
+          const strong = isZeroEntry(e.name) || e.name === "audible"
           const detail = e.name === "audible" ? audibleDetail(t, events) : r.text.detail
           return (
             <tr
@@ -470,14 +481,14 @@ function SpineRow({ r, t, events, completed }: { readonly r: ListRow; readonly t
           <span className="self-center pl-1 font-mono text-[10px] text-ink-faint">{gapLabel(gap)}</span>
         </div>
       )}
-      <div className={cx("grid grid-cols-[28px_minmax(0,1fr)] py-1", e.name === "endOfTurn" && "border-t border-ink", audible && "bg-voice-soft")}>
+      <div className={cx("grid grid-cols-[28px_minmax(0,1fr)] py-1", isZeroEntry(e.name) && "border-t border-ink", audible && "bg-voice-soft")}>
         <div className="relative">
           <span aria-hidden="true" className="absolute inset-y-[-4px] left-1/2 w-0.5 -translate-x-1/2 bg-line" />
           <span className="absolute left-1/2 top-[9px] -translate-x-1/2 -translate-y-1/2"><Glyph shape={shapeOf(e, !completed)} vertical /></span>
         </div>
         <div className="min-w-0">
           <div className="flex items-baseline justify-between gap-2 leading-[18px]">
-            <span className={cx("text-[13px]", e.name === "endOfTurn" || audible ? "font-medium text-ink" : "text-ink")}>{r.text.label}</span>
+            <span className={cx("text-[13px]", isZeroEntry(e.name) || audible ? "font-medium text-ink" : "text-ink")}>{r.text.label}</span>
             <span className={cx("whitespace-nowrap font-mono text-[13px] tabular-nums", audible ? cx("font-medium", latencyTone(e.at)) : "text-ink")}>{signed(e.at)}</span>
           </div>
           <div className="text-[11px] leading-snug text-ink-faint">{parts.join(" · ")}</div>

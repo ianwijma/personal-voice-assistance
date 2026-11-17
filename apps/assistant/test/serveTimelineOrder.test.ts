@@ -1,5 +1,8 @@
 // The order of a voice turn's time line on the real server: the recogniser's own times (speech started, first partial
-// transcript) are kept although a gate or the TypeSafe call holds the events back. Real clock, generous gaps.
+// transcript) are kept although a gate or the TypeSafe call holds the events back. Real clock: the assertions are
+// orderings that follow from what was emitted when, or gaps the test holds open itself (a routing answer it releases),
+// with margins only a broken implementation (stamping where the conversation handles the event) violates; a slow
+// runner only makes the held gaps longer.
 import { eagerEndOfTurn, endOfTurn, interim, speechStarted, turnResumed } from "@pva/core/testing"
 import type { ServerMessageOf, TraceEvent } from "@pva/protocol"
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs"
@@ -27,8 +30,13 @@ afterEach(async () => {
   jev = undefined
 })
 
-/** A fake `/v1/systemone`: Bravo for jokes, nobody otherwise; `delayMs` before answering. */
-const fakeJev = async (delayMs = 0) => {
+/**
+ * A fake `/v1/systemone`: Bravo for jokes, nobody otherwise; `delayMs` before answering (at least). `hold`: the first
+ * request is answered only once the test calls `release()`.
+ */
+const fakeJev = async (delayMs = 0, hold = false) => {
+  let release = () => {}
+  const held = new Promise<void>((resolve) => (release = resolve))
   const requests: Array<{ readonly headers: Http.IncomingHttpHeaders; readonly body: any }> = []
   jev = Http.createServer((req, res) => {
     let raw = ""
@@ -45,14 +53,17 @@ const fakeJev = async (delayMs = 0) => {
         },
         usage: { input_tokens: 80, output_tokens: 4 }
       }
-      setTimeout(() => {
-        res.writeHead(200, { "content-type": "application/json" })
-        res.end(JSON.stringify(answer))
-      }, delayMs)
+      const first = requests.length === 1
+      void (hold && first ? held : Promise.resolve()).then(() =>
+        setTimeout(() => {
+          res.writeHead(200, { "content-type": "application/json" })
+          res.end(JSON.stringify(answer))
+        }, delayMs)
+      )
     })
   })
   await new Promise<void>((resolve) => jev!.listen(0, "127.0.0.1", resolve))
-  return { url: `http://127.0.0.1:${(jev.address() as AddressInfo).port}`, requests }
+  return { url: `http://127.0.0.1:${(jev.address() as AddressInfo).port}`, requests, release: () => release() }
 }
 
 /** Alpha (fallback, Handles set) and Bravo (no Handles) on the browser defaults, TypeSafe deciding, picking allowed. */
@@ -69,7 +80,7 @@ const dataDir = async (): Promise<string> => {
   file.deviceTypes["web-voice"] = {
     ...file.deviceTypes["web-voice"],
     assistants: [{ assistant: "alpha", phrases: ["hey alpha"] }, { assistant: "bravo", phrases: ["hey bravo"] }],
-    withoutPhrase: { mode: "typesafe", fallback: "alpha", giveUpMs: 400 },
+    withoutPhrase: { mode: "typesafe", fallback: "alpha", giveUpMs: 2_000 },
     voicePage: { pick: true },
     interruptMode: "instant"
   }
@@ -111,15 +122,22 @@ const at = (line: ReadonlyArray<TraceEvent>, name: string): number => {
   return e.at
 }
 
-/** An utterance spoken over ~300 ms: start, a partial after 100 ms, a longer one after 200 ms, the final after 300 ms. */
+/** An utterance spoken over at least `GAP_MS` × (partials + 1): start, each partial `GAP_MS` later, then the final. */
+const GAP_MS = 250
 const speak = async (stt: ReturnType<typeof controlledStt>, partials: ReadonlyArray<string>, final: string) => {
   stt.emit(speechStarted)
   for (const p of partials) {
-    await sleep(100)
+    await sleep(GAP_MS)
     stt.emit(interim(p))
   }
-  await sleep(100)
+  await sleep(GAP_MS)
   stt.emit(endOfTurn(final))
+}
+
+/** Until `check` holds (polled), else fail. */
+const until = async (what: string, check: () => boolean, ms = 5_000) => {
+  for (let i = 0; i < ms / 10 && !check(); i++) await sleep(10)
+  if (!check()) throw new Error(`Timed out waiting for ${what}`)
 }
 
 describe("the time line keeps the recogniser's times", () => {
@@ -139,11 +157,11 @@ describe("the time line keeps the recogniser's times", () => {
     const trace = (await admin.waitFor("trace", (m) => m.trace.turnId === begun.turnId, { from: adminFrom, timeoutMs: 10_000 })).trace
     const line = trace.timeline!
     expect(trace.route).toMatchObject({ by: "typesafe" })
-    // 0 is the conversation's end of turn, which waits for the routing answer: the user began 300 ms of speech + the call before it.
+    // 0 is the conversation's end of turn, which waits for the routing answer. The start and the first partial were
+    // emitted before the final that started the routing call (stamped in the conversation they would come after it).
     expect(at(line, "endOfTurn")).toBe(0)
-    expect(at(line, "speechStarted")).toBeLessThan(-400)
-    expect(at(line, "speechStarted") + 60).toBeLessThan(at(line, "firstInterim"))
-    expect(at(line, "firstInterim") + 100).toBeLessThan(at(line, "routing"))
+    expect(at(line, "speechStarted")).toBeLessThan(at(line, "firstInterim"))
+    expect(at(line, "firstInterim")).toBeLessThan(at(line, "routing"))
     expect(at(line, "routing")).toBeLessThanOrEqual(at(line, "assistantChosen"))
     expect(at(line, "assistantChosen")).toBeLessThanOrEqual(0)
   })
@@ -174,15 +192,17 @@ describe("the time line keeps the recogniser's times", () => {
     expect(trace.speculative).toBe(true)
     expect(api.requests.length).toBe(1)
     const routing = line.find((x) => x.name === "routing")!
+    // The fake answers no sooner than 200 ms after the request.
     expect(routing.ms).toBeGreaterThanOrEqual(150)
-    // The eager transcript arrived as the routing call left, not when its answer came back.
-    expect(at(line, "eagerEndOfTurn")).toBeLessThan(routing.at + routing.ms! - 100)
-    expect(at(line, "eagerEndOfTurn") + 100).toBeLessThan(at(line, "assistantChosen"))
-    expect(at(line, "speechStarted") + 150).toBeLessThan(at(line, "eagerEndOfTurn"))
+    // The eager transcript arrived before the routing call it started left (stamped in the conversation, after its answer).
+    expect(at(line, "eagerEndOfTurn")).toBeLessThanOrEqual(routing.at)
+    expect(at(line, "eagerEndOfTurn")).toBeLessThan(at(line, "assistantChosen"))
+    expect(at(line, "speechStarted")).toBeLessThan(at(line, "eagerEndOfTurn"))
   })
 
   it("TypeSafe device: a resume and a second eager transcript that arrive while routing is pending keep their own times", async () => {
-    const api = await fakeJev(300)
+    // The first routing call is held until the test releases it, 500 ms after the resume and the second eager.
+    const api = await fakeJev(0, true)
     const { stt } = await start({ TYPESAFE_ROUTING: "true", TYPESAFE_API_KEY: "ts-test-key", TYPESAFE_BASE_URL: api.url })
     const page = await connect()
     await page.hello()
@@ -197,12 +217,16 @@ describe("the time line keeps the recogniser's times", () => {
     await sleep(100)
     stt.emit(interim("a joke"))
     await sleep(100)
-    stt.emit(eagerEndOfTurn("a joke")) // ~200: the first routing call (300 ms) starts
-    await sleep(50)
-    stt.emit(turnResumed) // ~250, while it is pending
-    await sleep(50)
-    stt.emit(eagerEndOfTurn("a joke about cats")) // ~300, still pending; its own call starts at ~500
-    await sleep(1_000)
+    stt.emit(eagerEndOfTurn("a joke"))
+    await until("the first routing call", () => api.requests.length === 1)
+    // While it is pending:
+    stt.emit(turnResumed)
+    stt.emit(eagerEndOfTurn("a joke about cats"))
+    await sleep(500)
+    api.release()
+    // The second eager's own call starts only now (the session dispatches in order), and is answered at once.
+    await until("the second routing call", () => api.requests.length === 2)
+    await sleep(300)
     stt.emit(endOfTurn("a joke about cats"))
     const begun = await page.waitFor("turn.start", () => true, { from, timeoutMs: 10_000 })
     const trace = (await admin.waitFor("trace", (m) => m.trace.turnId === begun.turnId, { from: adminFrom, timeoutMs: 10_000 })).trace
@@ -210,13 +234,14 @@ describe("the time line keeps the recogniser's times", () => {
     expect(trace.route).toMatchObject({ by: "typesafe" })
     expect(trace.assistant?.id).toBe("bravo")
     expect(api.requests.length).toBe(2)
-    const s = at(line, "speechStarted")
-    // Without stamping on arrival both would come after the first call returned (≥ ~500 ms after speech started).
-    expect(at(line, "turnResumed") - s).toBeLessThan(400)
-    expect(at(line, "eagerEndOfTurn") - s).toBeLessThan(430)
-    expect(at(line, "turnResumed")).toBeLessThan(at(line, "eagerEndOfTurn"))
-    // The second eager came before the routing call it waited for left.
-    expect(at(line, "eagerEndOfTurn") + 100).toBeLessThan(at(line, "routing"))
+    // `routing` is the second eager's call (the final reuses its answer), sent once the held first call was released,
+    // at least 500 ms after the resume and the second eager arrived. Stamped when dispatched, both would be within a
+    // few ms of it.
+    const routing = at(line, "routing")
+    expect(at(line, "speechStarted")).toBeLessThan(at(line, "turnResumed"))
+    expect(at(line, "turnResumed")).toBeLessThanOrEqual(at(line, "eagerEndOfTurn"))
+    expect(at(line, "turnResumed") + 250).toBeLessThan(routing)
+    expect(at(line, "eagerEndOfTurn") + 250).toBeLessThan(routing)
   })
 
   it("wake-phrase device: the utterance's start and first partial precede the phrase, which the route gate only released with words", async () => {
@@ -234,9 +259,10 @@ describe("the time line keeps the recogniser's times", () => {
     const trace = (await admin.waitFor("trace", (m) => m.trace.turnId === begun.turnId, { from: adminFrom, timeoutMs: 10_000 })).trace
     const line = trace.timeline!
     expect(trace.route).toEqual({ by: "phrase", phrase: "hey bravo" })
-    expect(at(line, "speechStarted")).toBeLessThan(-250)
-    expect(at(line, "speechStarted") + 60).toBeLessThan(at(line, "firstInterim"))
-    expect(at(line, "firstInterim") + 60).toBeLessThan(at(line, "wakePhrase"))
+    // The route gate released the start and the partials only with "hey bravo tell", GAP_MS after "hey": stamped in the
+    // conversation, all three would come at the phrase.
+    expect(at(line, "speechStarted")).toBeLessThan(at(line, "firstInterim"))
+    expect(at(line, "firstInterim") + GAP_MS / 2).toBeLessThan(at(line, "wakePhrase"))
     expect(at(line, "wakePhrase")).toBeLessThanOrEqual(at(line, "assistantChosen"))
     expect(at(line, "assistantChosen")).toBeLessThan(0)
   })

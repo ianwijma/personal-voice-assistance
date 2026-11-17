@@ -494,6 +494,41 @@ test.describe("Diagnostics › Latency", () => {
     await row(page, 36).getByTestId("trace-toggle").click()
   })
 
+  test("a pinned tooltip follows its mark when the page scrolls", async ({ page, baseURL }) => {
+    await page.setViewportSize({ width: 1280, height: 600 })
+    await loginAdmin(page, baseURL, "#settings/diagnostics/latency")
+    await row(page, 43).getByTestId("trace-toggle").click()
+    const graphic = page.getByTestId("trace-detail-row").getByTestId("trace-timeline")
+    const tool = graphic.locator("[data-testid=trace-mark][data-event=tool]").first()
+    const tip = page.getByTestId("trace-tooltip")
+    await tool.click()
+    await expect(tool).toHaveAttribute("data-pinned", "true")
+    await page.mouse.move(0, 0)
+    await expect(tip).toBeVisible()
+    // Scroll whatever scrolls the mark (the page or a panel around it), then, two frames later (well before any other
+    // re-render), how far the mark moved and whether the tooltip is still just above or below it and over it.
+    const after = await tool.evaluate(async (mark) => {
+      const tipEl = document.querySelector("[data-testid=trace-tooltip]")!
+      const adjacent = () => {
+        const m = mark.getBoundingClientRect()
+        const t = tipEl.getBoundingClientRect()
+        const gap = Math.min(Math.abs(m.top - t.bottom), Math.abs(t.top - m.bottom))
+        return gap <= 12 && t.left <= m.right && t.right >= m.left
+      }
+      const top = mark.getBoundingClientRect().top
+      const before = adjacent()
+      let s: HTMLElement | null = mark.parentElement
+      while (s !== null && !(s.scrollHeight > s.clientHeight && /(auto|scroll)/.test(getComputedStyle(s).overflowY))) s = s.parentElement
+      if (s === null) window.scrollBy(0, 150)
+      else s.scrollTop += 150
+      await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)))
+      return { before, moved: top - mark.getBoundingClientRect().top, adjacent: adjacent() }
+    })
+    expect(after.before).toBe(true)
+    expect(after.moved).toBeGreaterThan(50)
+    expect(after.adjacent).toBe(true)
+  })
+
   test("two open rows: no id repeats, and each chart is described by its own shortened-axis note", async ({ page, baseURL }) => {
     await loginAdmin(page, baseURL, "#settings/diagnostics/latency")
     await row(page, 43).getByTestId("trace-toggle").click()

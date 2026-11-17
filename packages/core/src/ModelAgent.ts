@@ -2,7 +2,7 @@ import { Effect, Stream } from "effect"
 import { type Agent, type AgentEvent, AgentError, type AgentTurnInput } from "./Agent.ts"
 import type { Message, ToolCall, ToolResult } from "./Domain.ts"
 import type { Llm } from "./Services.ts"
-import { addTraceEvent } from "./TurnTrace.ts"
+import { addTraceEvent, beginTraceSpan } from "./TurnTrace.ts"
 
 /**
  * A `model` agent over any `Llm` (docs/AGENTS-AND-INTENTS.md §1.7): the
@@ -58,11 +58,13 @@ export const makeModelAgent = (options: { readonly llm: Llm["Service"] }): Pick<
           Stream.make({ _tag: "ToolStarted", call } as AgentEvent).pipe(
             Stream.concat(Stream.fromEffect(Effect.gen(function*() {
               const start = yield* now
+              // Recorded at its start: a tool still running when the turn is interrupted is on the time line too.
+              const span = beginTraceSpan(input.trace, "tool", start, call.name)
               const result = yield* tools.run(call)
               const ms = (yield* now) - start
               results[index] = result
               input.trace.tools.push({ name: call.name, ms })
-              addTraceEvent(input.trace, "tool", start, ms, call.name)
+              span.end(start + ms)
               return { _tag: "ToolFinished", result, ms } satisfies AgentEvent
             })))
           )

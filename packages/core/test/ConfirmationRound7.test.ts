@@ -22,6 +22,7 @@ import { makeModelAgent } from "../src/ModelAgent.ts"
 import { PROPOSED_RESULT } from "../src/PendingIntents.ts"
 import { AudioOutput, Llm } from "../src/Services.ts"
 import { makeToolRegistry, ToolRegistry } from "../src/ToolRegistry.ts"
+import { traceTimeline } from "../src/TurnTrace.ts"
 import {
   eagerEndOfTurn,
   endOfTurn,
@@ -597,6 +598,26 @@ describe("round 7 finding 3: consumption and the start of the action are one ste
         "assistant: Switching everything off. (interrupted)",
         "assistant: [Switch everything off: the owner confirmed; it ran and succeeded.]"
       ])
+    }))
+
+  it.effect("time line: the action is an entry from its start; stopped before it finished, it stays a started entry without a duration", () =>
+    Effect.gen(function*() {
+      const actionOf = (r: { readonly events: ReadonlyArray<ConversationEvent> }) => {
+        const ended = r.events.flatMap((e) => (e._tag === "TurnEnded" && e.trace.events?.some((x) => x.name === "action") === true ? [e] : []))
+        assert.strictEqual(ended.length, 1)
+        const line = traceTimeline(ended[0]!.trace)
+        return { action: line.filter((x) => x.name === "action"), turnEnded: line.find((x) => x.name === "turnEnded")! }
+      }
+      // Stopped at 400, the action runs [350, 650): on the time line when the turn ended, and never changed after.
+      const stopped = actionOf(yield* staged(400))
+      assert.strictEqual(stopped.action.length, 1)
+      assert.strictEqual(stopped.action[0]!.ms, undefined)
+      assert.strictEqual(stopped.action[0]!.detail, "home_all_off")
+      assert.isBelow(stopped.action[0]!.at, stopped.turnEnded.at)
+      // Not stopped: the same entry, given its duration when the action finished.
+      const whole = actionOf(yield* staged(undefined))
+      assert.strictEqual(whole.action.length, 1)
+      assert.strictEqual(whole.action[0]!.ms, 300)
     }))
 
   it.effect("stopped while waiting for the action (nothing playing): nothing claims success; the outcome arrives in history", () =>

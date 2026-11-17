@@ -173,10 +173,11 @@ describe("the per-turn configuration snapshot (TraceInfo.config)", () => {
     expect(spokenLine.find((e) => e.name === "wakePhrase")!.detail).toBe("hey alpha")
     expect(spokenLine.find((e) => e.name === "assistantChosen")!.detail).toBe("alpha")
     const when = (name: string) => spokenLine.find((e) => e.name === name)!.at
-    // In the order it happened, with the recogniser's times: the utterance began well before its end of turn (0).
+    // In the order it happened, with the recogniser's times (orderings only: a slow runner stretches the gaps). The route
+    // gate released the start with the partial that holds the phrase: stamped there, the start would follow the phrase.
     expect(when("endOfTurn")).toBe(0)
-    expect(when("speechStarted")).toBeLessThan(-150)
-    expect(when("speechStarted") + 60).toBeLessThan(when("firstInterim"))
+    expect(when("speechStarted")).toBeLessThan(when("firstInterim"))
+    expect(when("speechStarted")).toBeLessThan(when("wakePhrase"))
     expect(when("firstInterim")).toBeLessThanOrEqual(when("wakePhrase"))
     expect(when("wakePhrase")).toBeLessThanOrEqual(when("assistantChosen"))
     expect(when("assistantChosen")).toBeLessThan(0)
