@@ -90,13 +90,16 @@ describe("capture", () => {
       const afterStall: Array<Uint8Array> = []
       const stall = Effect.gen(function*() {
         const start = yield* now
-        // Stall until the stand-in has written all 2000 frames, so the sliding buffer has
+        // Stall until the stand-in has written every frame, so the sliding buffer has
         // certainly overflowed, then a little longer for the parent to read the channel's tail.
         while (!existsSync(written)) yield* Effect.sleep(10)
         yield* Effect.sleep(Math.max(100, 700 - ((yield* now) - start)))
       })
-      const total = 2000
-      const error = yield* captureStream(node("capture.mjs", pidFile, 640 * total, "exit")).pipe(
+      // What this process may read late (see below). The stand-in writes several times the most
+      // a bounded buffer can deliver, however large the channel is on this machine.
+      const late = Math.ceil(channelBytes() / 640) + 1
+      const total = 3 * (captureBufferFrames + late) + 500
+      const error = yield* captureStream(node("capture.mjs", pidFile, 640 * total, "exit", "indexed")).pipe(
         Stream.runForEachArray((frames) => {
           if (firstBatch === 0) {
             firstBatch = frames.length
@@ -108,18 +111,21 @@ describe("capture", () => {
         Effect.flip
       )
       assert.strictEqual(error._tag, "AudioError")
+      // One pull cannot hand over more than the buffer holds.
       assert.isAtLeast(firstBatch, 1)
+      assert.isAtMost(firstBatch, captureBufferFrames)
       const told = `${afterStall.length} frames after the stall (first batch ${firstBatch})`
       // Everything was queued while the consumer stalled; only the newest 3 s survive.
       assert.isAtLeast(afterStall.length, captureBufferFrames, told)
       // When the stall ends, the stand-in has handed everything to the kernel, but this process
       // may not have read all of it yet. What it reads late is extra, and is at most what the
-      // channel (a socketpair) holds, so that is the honest upper bound: far below the 2000 written.
-      assert.isAtMost(afterStall.length, captureBufferFrames + Math.ceil(channelBytes() / 640) + 1, told)
+      // channel (a socketpair) holds, so that is the honest upper bound: under a third of what was written.
+      assert.isAtMost(afterStall.length, captureBufferFrames + late, told)
       // Whatever arrived late, the buffer drops the oldest: the last 3 s delivered are the last 3 s written.
+      // Each frame carries its number, so this cannot pass on older frames that happen to look alike.
       assert.deepStrictEqual(
-        concat(afterStall.slice(-captureBufferFrames)),
-        Buffer.from(pattern(640 * captureBufferFrames, 640 * (total - captureBufferFrames)))
+        afterStall.slice(-captureBufferFrames).map((f) => new DataView(f.buffer, f.byteOffset, f.byteLength).getUint32(0, true)),
+        Array.from({ length: captureBufferFrames }, (_, i) => total - captureBufferFrames + i)
       )
     }))
 

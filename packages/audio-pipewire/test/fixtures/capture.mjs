@@ -3,11 +3,17 @@
 // Once the last write has been handed to the pipe (its callback; correct whether or not
 // stdout is synchronous here) it creates <pidFile>.written: by then all but the pipe's own
 // buffer has been read by the parent.
-// usage: capture.mjs <pidFile> <totalBytes> <exit|hang>
+// With `indexed`, every 640-byte frame starts with its own number (32-bit little-endian),
+// so a test can tell which frames it was given.
+// usage: capture.mjs <pidFile> <totalBytes> <exit|hang> [indexed]
 import { writeFileSync } from "node:fs"
-const [pidFile, total, mode] = process.argv.slice(2)
+const [pidFile, total, mode, indexed] = process.argv.slice(2)
 writeFileSync(pidFile, String(process.pid))
 const bytes = new Uint8Array(Number(total)).map((_, i) => i % 256)
+if (indexed === "indexed") {
+  const view = new DataView(bytes.buffer)
+  for (let frame = 0; frame * 640 + 4 <= bytes.length; frame++) view.setUint32(frame * 640, frame, true)
+}
 const sizes = [100, 1000, 333, 7]
 let offset = 0
 const done = () => {
