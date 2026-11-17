@@ -28,14 +28,6 @@ import type { SttEvent } from "./Domain.ts"
  *   a match drops it whole. The phrase alone on the `EndOfTurn` forwards nothing and opens the armed window.
  * - `always` mode passes every event unchanged (the same object); it only reports `heard` for the tester.
  *
- * `one-shot` (docs/VOICE-NODES.md §3) is `wake-phrase` with four differences: no follow-up window (`followUpMs` and a
- * reply in progress never make the device awake; `replyEnded` returns TAKEN → ASLEEP at once), the phrase alone while
- * TAKEN reports `woke.duringReply` and arms (the session interrupts the reply), `answerWindow` admits one utterance
- * without a phrase for a confirmation question, and the armed window lapses by itself (the session's timers do the
- * rest). TAKEN starts at an accepted non-empty `EndOfTurn`; `taken()` reports it. Choices there: leaving the one-shot
- * mode (`configure`) clears TAKEN and the answer window; the phrase alone leaves TAKEN (the reply is being stopped)
- * and a request accepted inside the answer window enters TAKEN like any other.
- *
  * Choices where §3 left room (recorded in the design's Status section):
  * - An accepted utterance whose transcript is only the phrase: an `Interim` or `EagerEndOfTurn` that is empty after
  *   removal is not forwarded (an `EagerEndOfTurn` is never empty by contract), and a `TurnResumed` that follows a
@@ -62,18 +54,12 @@ import type { SttEvent } from "./Domain.ts"
 export const WAKE_FILLERS: ReadonlySet<string> = new Set(["ok", "okay", "uh", "um", "so", "and", "well"])
 export const WAKE_MAX_FILLERS = 2
 
-/**
- * `one-shot` (docs/VOICE-NODES.md §3) is added to protocol's `Activation` in protocol 7; until then core declares it
- * locally. WP-6 replaces this alias with `Activation`.
- */
-export type WakeActivation = Activation | "one-shot"
-
 export interface WakeConfig {
-  readonly activation: WakeActivation
+  readonly activation: Activation
   /** As configured (shown in the UI and reported back in `woke`). */
   readonly phrases: ReadonlyArray<string>
   readonly match: WakeMatch
-  /** After a reply ends, keep reacting without the phrase this long. 0 = asleep right away. Ignored in `one-shot`. */
+  /** After a reply ends, keep reacting without the phrase this long. 0 = asleep right away. */
   readonly followUpMs: number
   /** After the phrase alone, the next utterance starting within this long is accepted. Default `WAKE_ARMED_MS`. */
   readonly armedMs?: number
@@ -96,7 +82,7 @@ export interface WakeResult {
   /** A whole utterance was dropped (asleep, no phrase). Only for the admin tester; never stored. */
   readonly dropped?: { readonly text: string }
   /** A wake phrase was heard (once per utterance). `armed`: it was the phrase alone. */
-  readonly woke?: { readonly phrase: string; readonly armed: boolean; readonly duringReply?: true }
+  readonly woke?: { readonly phrase: string; readonly armed: boolean }
   /**
    * Every non-blank `EndOfTurn` the gate sees (in every mode, also `always`, and also when dropped), before the
    * phrase was removed, with the phrase it matched (if any): what the admin tester shows (`wake.heard`).
@@ -115,13 +101,6 @@ export interface WakeGate {
   replyEnded(now: number): void
   /** A spoken reply started: while it lasts the device counts as awake when `followUpMs > 0`. */
   replyStarted(now: number): void
-  /**
-   * `one-shot`: open a window that admits exactly one utterance without a phrase (a confirmation question was played
-   * to its end), for `ms`. Reports nothing by itself; the session sends the cue. Does not leave TAKEN by itself.
-   */
-  answerWindow(now: number, ms: number): void
-  /** `one-shot`: a reply is owed or playing (from an accepted request until `replyEnded`). Always false in other modes. */
-  taken(now: number): boolean
   /** Reacting without a phrase right now (a window is open, or mode `always`). */
   awake(now: number): boolean
   filter(event: SttEvent, now: number): WakeResult
@@ -258,39 +237,13 @@ export const makeWakeGate = (initial: WakeConfig = WAKE_ALWAYS): WakeGate => {
   let armedAt: number | undefined
   /** When the follow-up window opened (a reply ended, or an accepted utterance ended). */
   let followFrom: number | undefined
-  /** `one-shot` TAKEN: a request was accepted and `replyEnded` has not come yet. */
-  let takenFlag = false
-  /** `one-shot`: the answer window (confirmation question) is open until this time; consumed by one utterance. */
-  let answerUntil: number | undefined
 
-  const oneShot = () => config.activation === "one-shot"
   const armedMs = () => config.armedMs ?? WAKE_ARMED_MS
   const armed = (now: number) => armedAt !== undefined && now - armedAt < armedMs()
-  const answering = (now: number) => answerUntil !== undefined && now < answerUntil
-  const following = (now: number) =>
-    !oneShot() && followFrom !== undefined && config.followUpMs > 0 && now - followFrom < config.followUpMs
+  const following = (now: number) => followFrom !== undefined && config.followUpMs > 0 && now - followFrom < config.followUpMs
 
   const awake = (now: number): boolean =>
-    config.activation === "always" ||
-    armed(now) ||
-    answering(now) ||
-    (oneShot() ? false : following(now) || (replying && config.followUpMs > 0))
-
-  /** The utterance ended with a request: the follow-up window starts (wake-phrase) or a reply is owed (one-shot). */
-  const requestEnded = (now: number) => {
-    if (oneShot()) takenFlag = true
-    else followFrom = now
-  }
-
-  /** The phrase alone: opens the armed window. In TAKEN it stops the reply (`duringReply`) and leaves TAKEN. */
-  const phraseAlone = (phrase: string, now: number): NonNullable<WakeResult["woke"]> => {
-    armedAt = now
-    if (oneShot() && takenFlag) {
-      takenFlag = false
-      return { phrase, armed: true, duringReply: true }
-    }
-    return { phrase, armed: true }
-  }
+    config.activation === "always" || armed(now) || following(now) || (replying && config.followUpMs > 0)
 
   const match = (text: string) => matchWakePhrase(text, config.phrases, config.match)
 
@@ -328,12 +281,11 @@ export const makeWakeGate = (initial: WakeConfig = WAKE_ALWAYS): WakeGate => {
         if (event._tag === "EndOfTurn") {
           utterance = undefined
           const only = m !== undefined && text.trim().length === 0
-          let onlyWoke: WakeResult["woke"]
-          if (only) onlyWoke = phraseAlone(m!.phrase, now)
-          else if (text.trim().length > 0) requestEnded(now)
+          if (only) armedAt = now
+          else if (text.trim().length > 0) followFrom = now
           return {
             events: [withText(event, text)],
-            ...(onlyWoke !== undefined ? { woke: onlyWoke } : woke ? { woke: { phrase: m!.phrase, armed: false } } : {}),
+            ...(woke || only ? { woke: { phrase: m!.phrase, armed: only } } : {}),
             ...heardOf(event.text, m?.phrase, true)
           }
         }
@@ -376,9 +328,10 @@ export const makeWakeGate = (initial: WakeConfig = WAKE_ALWAYS): WakeGate => {
           return event.text.trim().length === 0 ? none : { events: [], dropped: { text: event.text }, ...heardOf(event.text, undefined, false) }
         }
         if (m.rest.trim().length === 0) {
-          return { events: [], woke: phraseAlone(m.phrase, now), ...heardOf(event.text, m.phrase, true) }
+          armedAt = now
+          return { events: [], woke: { phrase: m.phrase, armed: true }, ...heardOf(event.text, m.phrase, true) }
         }
-        requestEnded(now)
+        followFrom = now
         return { events: [start, withText(event, m.rest)], woke: { phrase: m.phrase, armed: false }, ...heardOf(event.text, m.phrase, true) }
       }
     }
@@ -387,10 +340,6 @@ export const makeWakeGate = (initial: WakeConfig = WAKE_ALWAYS): WakeGate => {
   return {
     configure: (next) => {
       config = next
-      if (next.activation !== "one-shot") {
-        takenFlag = false
-        answerUntil = undefined
-      }
       if (utterance?.kind === "held") utterance = { kind: "discarding" }
     },
     config: () => config,
@@ -399,13 +348,8 @@ export const makeWakeGate = (initial: WakeConfig = WAKE_ALWAYS): WakeGate => {
     },
     replyEnded: (now) => {
       replying = false
-      if (oneShot()) takenFlag = false // TAKEN → ASLEEP at once: no follow-up window
-      else followFrom = now
+      followFrom = now
     },
-    answerWindow: (now, ms) => {
-      if (oneShot() && ms > 0) answerUntil = now + ms
-    },
-    taken: () => oneShot() && takenFlag,
     awake,
     filter: (event, now) => {
       const u = utterance
@@ -426,9 +370,7 @@ export const makeWakeGate = (initial: WakeConfig = WAKE_ALWAYS): WakeGate => {
         return awake(now) ? pass(event) : none
       }
       if (awake(now)) {
-        // The armed and answer windows admit one utterance.
-        if (armed(now)) armedAt = undefined
-        if (answering(now)) answerUntil = undefined
+        if (armed(now)) armedAt = undefined // the armed window admits one utterance
         utterance = { kind: "accepted", woke: false, eagerSwallowed: false }
         return pass(event)
       }
