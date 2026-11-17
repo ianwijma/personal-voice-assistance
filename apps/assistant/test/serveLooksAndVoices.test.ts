@@ -414,6 +414,42 @@ describe("a device's voice at run time", () => {
     await until("the old device voices are released", () => released.includes(CARTESIA) && released.includes(ELEVEN))
   })
 
+  it("a device switching to its own voice with the assistant's voice key, and back: the next trace says whose voice it is (PR #84 review 4)", async () => {
+    // Alpha speaks with a hosted voice (a local one not downloaded cannot be saved as a device's).
+    await start(await dataDirWith((file) => { file.assistants.byId.alpha.voice = voiceRef(CARTESIA) }))
+    const a = await admin()
+    const device = await knownDevice("device-a")
+    const config = (t: Spoken) => traces(a).get(`${t.device}:${t.turnId}`)?.config
+    const t0 = await spoken(device, "alpha", "before", "t0")
+    await until("trace t0", () => config(t0) !== undefined)
+    expect([t0.voices, config(t0)?.voice, config(t0)?.voiceFrom]).toEqual([[CARTESIA], CARTESIA, "assistant"])
+    // The same voice key as Alpha's own: neither the pool user's voice nor the instance changes.
+    expect(await saveDevice(a, "device-a", { voice: ownVoice(CARTESIA) }, { saveAnyway: true })).toMatchObject({ ok: true })
+    const t1 = await spoken(device, "alpha", "own", "t1")
+    await until("trace t1", () => config(t1) !== undefined)
+    expect([t1.voices, config(t1)?.voice, config(t1)?.voiceFrom]).toEqual([[CARTESIA], CARTESIA, "device"])
+    expect(await saveDevice(a, "device-a", { voice: null })).toMatchObject({ ok: true })
+    const t2 = await spoken(device, "alpha", "reset", "t2")
+    await until("trace t2", () => config(t2) !== undefined)
+    expect([t2.voices, config(t2)?.voice, config(t2)?.voiceFrom]).toEqual([[CARTESIA], CARTESIA, "assistant"])
+  })
+
+  it("a type's voice defaults switching to the assistant's voice key, and back: its devices' next traces say whose voice it is", async () => {
+    // Alpha speaks with a hosted voice (a local one not downloaded cannot be saved as a device's).
+    await start(await dataDirWith((file) => { file.assistants.byId.alpha.voice = voiceRef(CARTESIA) }))
+    const a = await admin()
+    const device = await knownDevice("device-a")
+    const config = (t: Spoken) => traces(a).get(`${t.device}:${t.turnId}`)?.config
+    expect(await saveType(a, { voice: ownVoice(CARTESIA) }, { saveAnyway: true })).toMatchObject({ ok: true })
+    const t1 = await spoken(device, "alpha", "own", "t1")
+    await until("trace t1", () => config(t1) !== undefined)
+    expect([t1.voices, config(t1)?.voiceFrom]).toEqual([[CARTESIA], "device"])
+    expect(await saveType(a, { voice: { from: "assistant" } })).toMatchObject({ ok: true })
+    const t2 = await spoken(device, "alpha", "back", "t2")
+    await until("trace t2", () => config(t2) !== undefined)
+    expect([t2.voices, config(t2)?.voiceFrom]).toEqual([[CARTESIA], "assistant"])
+  })
+
   it("a type's voice defaults apply to its devices without their own; a device's own value wins", async () => {
     await start(await dataDirWith())
     const a = await admin()

@@ -783,6 +783,8 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
           llm: Llm["Service"] | undefined
           tts: Tts["Service"] | undefined
           voiceUser: string
+          /** The device's voice setting as the snapshot read it (`voiceSourceNow`): the trace's `voiceFrom` and, unbound, its `voice`. */
+          voiceSource: string
           setup: TurnSetup
           instructions: ReadonlyArray<string>
           /** The turn's configuration snapshot (`TraceConfig` without the hearing, which is the device's). */
@@ -800,6 +802,15 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       }
       /** Likewise the assistant's voice: the pool's instance for its `voice`, read at the turn's start. */
       const voiceUserNow = (): string => voiceUserFor(assistantId, deviceId)
+      /**
+       * Whose voice this device speaks with, and which (its own setting): the trace config reads it. A device switching
+       * to its own voice with the assistant's voice key, or back, changes neither the pool user nor the instance, so the
+       * guards compare this too (PR #84 review 4).
+       */
+      const voiceSourceNow = (): string => {
+        const v = deviceSettingsOf(deviceId).voice
+        return v.from === "device" ? `device:${voiceKey(v.voice)}` : "assistant"
+      }
       const ttsNow = () => {
         const bound = resources.ttsFor(voiceUserNow())
         if (bound !== undefined) return bound
@@ -813,9 +824,10 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
         const llm = llmNow()
         const tts = ttsNow()
         const voiceUser = voiceUserNow()
+        const voiceSource = voiceSourceNow()
         if (
           cached?.snapshot !== snapshot || cached.assistant !== assistant || cached.home !== home || cached.llm !== llm || cached.tts !== tts ||
-          cached.voiceUser !== voiceUser
+          cached.voiceUser !== voiceUser || cached.voiceSource !== voiceSource
         ) {
           // An assistant that does not exist (any more) is never routed; should a turn still start, it gets no tools.
           const mine = assistant === undefined ? { registry: makeToolRegistry([]), instructions: [], modules: 0 } : modulesFor(snapshot, assistant)
@@ -830,6 +842,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
             llm,
             tts,
             voiceUser,
+            voiceSource,
             setup: {
               system: systemFor(base, instructions),
               registry: mine.registry,
@@ -850,13 +863,14 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       const setup = Effect.sync((): TurnSetup => current().setup)
       /**
        * The turn's configuration snapshot, read when its trace begins: the values `current()` resolved for the setup,
-       * made again only when the module snapshot, the assistant or its bindings changed (reference compares, no
+       * made again only when the module snapshot, the assistant, its bindings or the device's voice setting changed (no
        * prompt or registry work). The object is never changed afterwards: a trace keeps the one its turn began with.
        */
       const config = (): AssistantTraceConfig | undefined => {
         const c = cached
         if (c !== undefined && c.snapshot === host.snapshot() && c.assistant === assistantsNow().get(assistantId) &&
-          c.llm === resources.llmFor(assistantId) && c.voiceUser === voiceUserNow() && c.tts === resources.ttsFor(c.voiceUser)) return c.config
+          c.llm === resources.llmFor(assistantId) && c.voiceUser === voiceUserNow() && c.tts === resources.ttsFor(c.voiceUser) &&
+          c.voiceSource === voiceSourceNow()) return c.config
         return current().config
       }
       // WP-13a: a Claude subscription assistant's options for its conversations (the same object while unchanged).
