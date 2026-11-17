@@ -657,6 +657,16 @@ export const exampleAdminHello: Extract<ClientMessage, { readonly type: "hello" 
   adminToken: "q2Vx8m0rJ3cW5yT1bN7dK9fH4gL6pZ2aS8eU0iO3wQk"
 }
 
+/** The final part after `serverExamples["household.snapshot"]`: no rows, the collections cut short named. */
+export const exampleHouseholdSnapshotFinal: Extract<ServerMessage, { readonly type: "household.snapshot" }> = {
+  type: "household.snapshot",
+  seq: 42,
+  part: 1,
+  final: true,
+  collections: [],
+  truncated: [{ module: "shopping", collection: "items" }]
+}
+
 export const serverExamples: { readonly [T in ServerMessageType]: Extract<ServerMessage, { readonly type: T }> } = {
   "welcome": {
     type: "welcome",
@@ -724,17 +734,19 @@ export const serverExamples: { readonly [T in ServerMessageType]: Extract<Server
   "trace": { type: "trace", key: exampleDevice.id, deviceId: exampleDevice.id, trace: { ...exampleTrace, session: exampleDevice.name } },
   "pong": { type: "pong", id: 41 },
   "health": { type: "health", health: exampleHealth },
+  // A snapshot's parts: rows in the parts before the last (this one), then the empty final part
+  // (`exampleHouseholdSnapshotFinal`), which names the collections whose rows were not all sent.
   "household.snapshot": {
     type: "household.snapshot",
     seq: 42,
     part: 0,
-    final: true,
+    final: false,
     collections: [{
       module: "timers",
       collection: "timers",
       rows: [{ id: "t1", rev: 40, scope: { kind: "household" }, value: { label: "pasta", dueAt: 1_763_100_600_000 }, updatedAt: 1_763_100_000_000 }]
     }],
-    truncated: [{ module: "shopping", collection: "items" }]
+    truncated: []
   },
   "household.event": {
     type: "household.event",

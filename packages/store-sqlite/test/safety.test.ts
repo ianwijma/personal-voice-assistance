@@ -3,13 +3,15 @@
 // to the second directory), index names, and the index every list shape uses.
 import { assert, describe, it } from "@effect/vitest"
 import { defineCollection, type StoreError } from "@pva/core"
-import { checkQuery, layoutOf } from "@pva/core/store-backend"
+import { checkQuery, cursorColumns, layoutOf } from "@pva/core/store-backend"
 import { Effect, Exit, Fiber, Schema } from "effect"
 import { createHash } from "node:crypto"
-import { chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, statSync, utimesSync, writeFileSync } from "node:fs"
+import { chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs"
+import { Worker } from "node:worker_threads"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { DatabaseSync } from "node:sqlite"
+import { WORKER_WARNING_FILTER } from "../src/files.ts"
 import { conversationRowsSql, indexName, listSql, makeSqliteStore, pageSql } from "../src/index.ts"
 
 const tmp = () => mkdtempSync(join(tmpdir(), "pva-safety-"))
@@ -106,7 +108,7 @@ describe("SQLite store files", () => {
       assert.isDefined(backup)
       assert.include(readdirSync(copyDir), backup!)
       const raw = new DatabaseSync(join(dir, "backups", backup!), { readOnly: true })
-      assert.deepStrictEqual({ ...(raw.prepare("SELECT v, value FROM pva_docs").get() as object) }, { v: 1, value: "{\"text\":\"as it was\"}" })
+      assert.deepStrictEqual({ ...(raw.prepare("SELECT value FROM pva_docs").get() as object) }, { value: "{\"text\":\"as it was\"}" })
       raw.close()
     }))
 
@@ -140,6 +142,123 @@ describe("SQLite store files", () => {
       assert.strictEqual(mode(join(backups, "household-2026-11-25-before-lists.db")), 0o600)
       assert.deepStrictEqual(pruned.failed, [])
       assert.sameMembers(readdirSync(backups), ["household-2026-11-30.db", "household-2026-11-25-before-lists.db", "household-2026-11-30.db.part-1234-0123456789ab"])
+    }).pipe(Effect.scoped))
+})
+
+describe("SQLite store: backups and their copies", () => {
+  it.live("an interrupted backup holds its turn until its file work has settled: it cannot publish after the next one", () =>
+    Effect.gen(function*() {
+      const dir = tmp()
+      const file = join(dir, "household.db")
+      const order: Array<string> = []
+      let release: () => void = () => {}
+      const barrier = new Promise<void>((r) => (release = r))
+      let backups = 0
+      const store = yield* makeSqliteStore({
+        filename: file,
+        guard: async (what, run) => {
+          if (!what.startsWith("Backing up")) return run()
+          const n = ++backups
+          order.push(`start ${n}`)
+          if (n === 1) await barrier
+          const done = await run()
+          order.push(`published ${n}`)
+          return done
+        }
+      })
+      yield* store.prepare([{ id: "shop", storage: { collections: [items] } }])
+      const now = Date.UTC(2026, 10, 18, 12)
+      const first = yield* Effect.forkChild(store.backup({ now }))
+      while (backups < 1) yield* Effect.sleep(1)
+      const interrupting = yield* Effect.forkChild(Fiber.interrupt(first))
+      yield* store.forModule("shop").collection(items).insert({ text: "newer" })
+      const second = yield* Effect.forkChild(store.backup({ now }))
+      yield* Effect.sleep(30)
+      assert.deepStrictEqual(order, ["start 1"], "the second backup waits for the first one's file work")
+      release()
+      yield* Fiber.join(interrupting)
+      yield* Fiber.join(second)
+      assert.deepStrictEqual(order, ["start 1", "published 1", "start 2", "published 2"])
+      const copy = new DatabaseSync(join(dir, "backups", "household-2026-11-18.db"), { readOnly: true })
+      assert.strictEqual((copy.prepare("SELECT count(*) AS n FROM pva_docs").get() as { n: number }).n, 1)
+      copy.close()
+    }).pipe(Effect.scoped))
+
+  it.effect("a copy made late keeps the backup's time: the second directory prunes it by the snapshot's age, not by when it was copied", () =>
+    Effect.gen(function*() {
+      const dir = tmp()
+      const file = join(dir, "household.db")
+      const copyDir = join(dir, "share")
+      const store = yield* makeSqliteStore({ filename: file, backupCopyDir: copyDir })
+      // The share is away: a file where its directory should be.
+      writeFileSync(copyDir, "not a directory")
+      const made = Date.now() - DAY
+      const { path } = yield* store.backup({ now: made })
+      assert.isDefined(store.copyFailure())
+      const t = made / 1000
+      utimesSync(path, t, t)
+      // It comes back; the hourly pass copies the backup a day after it was made.
+      rmSync(copyDir)
+      yield* store.copyMissing
+      assert.isUndefined(store.copyFailure())
+      const copied = join(copyDir, path.split("/").at(-1)!)
+      assert.strictEqual(Math.round(statSync(copied).mtimeMs / 1000), Math.round(t))
+      // Fourteen days and two hours after the snapshot: gone from both directories.
+      const pruned = yield* store.pruneBackups({ now: made + 14 * DAY + 2 * 3_600_000 })
+      assert.isFalse(existsSync(path))
+      assert.isFalse(existsSync(copied), `kept in the second directory: ${JSON.stringify(pruned)}`)
+    }).pipe(Effect.scoped))
+
+  it.effect("every retained backup the second directory lacks is copied, a pre-upgrade one too; the copy failure is cleared only when none is missing", () =>
+    Effect.gen(function*() {
+      const dir = tmp()
+      const file = join(dir, "household.db")
+      const copyDir = join(dir, "share")
+      const v2 = defineCollection({ name: "items", scope: "household", schema: Schema.Struct({ text: Schema.String, n: Schema.Finite }), migrate: { 1: (v: { text: string }) => ({ ...v, n: 1 }) } })
+      yield* Effect.scoped(Effect.gen(function*() {
+        const store = yield* makeSqliteStore({ filename: file })
+        yield* store.prepare([{ id: "shop", storage: { collections: [items] } }])
+        yield* store.forModule("shop").collection(items).insert({ text: "as it was" })
+      }))
+      // The share refuses the pre-upgrade copy (and only it).
+      let refuseBefore = true
+      const store = yield* makeSqliteStore({
+        filename: file,
+        backupCopyDir: copyDir,
+        guard: (what, run) => (refuseBefore && what.startsWith("Copying") && what.includes("-before-") ? Promise.reject(new Error("the share is away")) : run())
+      })
+      yield* store.prepare([{ id: "shop", storage: { version: 2, collections: [v2] } }])
+      assert.strictEqual(store.availability("shop"), undefined)
+      const before = readdirSync(join(dir, "backups")).find((n) => n.includes("-before-shop"))!
+      assert.isDefined(store.copyFailure())
+      // A daily backup is copied, and the failure stays: the pre-upgrade one is still missing there.
+      const { path } = yield* store.backup()
+      assert.include(readdirSync(copyDir), path.split("/").at(-1)!)
+      assert.notInclude(readdirSync(copyDir), before)
+      assert.isDefined(store.copyFailure())
+      // The share takes it again: the hourly pass copies what is missing, then the failure is cleared.
+      refuseBefore = false
+      yield* store.copyMissing
+      assert.include(readdirSync(copyDir), before)
+      assert.isUndefined(store.copyFailure())
+    }).pipe(Effect.scoped))
+
+  it.effect("a directory that cannot be synced for a reason other than \"not supported here\" fails the backup, and the owner is told", () =>
+    Effect.gen(function*() {
+      if (process.getuid?.() === 0) return
+      const dir = tmp()
+      const file = join(dir, "household.db")
+      const backups = join(dir, "backups")
+      const store = yield* makeSqliteStore({ filename: file })
+      // Writable and searchable, but not readable: the directory cannot be opened to be synced (EACCES).
+      chmodSync(backups, 0o300)
+      try {
+        const exit = yield* Effect.exit(store.backup())
+        assert.strictEqual(errorOf(exit)?.reason, "failed")
+        assert.match(errorOf(exit)?.message ?? "", /EACCES|permission/i)
+      } finally {
+        chmodSync(backups, 0o700)
+      }
     }).pipe(Effect.scoped))
 })
 
@@ -242,10 +361,22 @@ describe("SQLite store: names and indexes", () => {
       const raw = new DatabaseSync(file, { readOnly: true })
       for (const shape of shapes) {
         const checked = checkQuery(timers, { ...shape, limit: 20 })
-        const { sql, params } = listSql("timers", "timers", { kind: "household" }, checked)
-        const plan = (raw.prepare(`EXPLAIN QUERY PLAN ${sql}`).all(...params) as Array<{ detail: string }>).map((r) => r.detail).join(" | ")
-        assert.notMatch(plan, /TEMP B-TREE|SCAN pva_docs(?! USING)/, `${JSON.stringify(shape)}: ${plan}`)
-        assert.match(plan, /USING (COVERING )?INDEX/, `${JSON.stringify(shape)}: ${plan}`)
+        // Also continued after a place (`after`): a key present, and a key missing (NULL), which takes two ranges.
+        const width = cursorColumns(checked.index).length
+        const places: Array<ReadonlyArray<string | number | null> | undefined> = [undefined, Array.from({ length: width }, (_, i) => (i === width - 1 ? "x" : 5))]
+        // A missing key: only a key column (`k…`) can hold one.
+        if (cursorColumns(checked.index)[0]!.startsWith("k") && checked.where === undefined) places.push([null, ...Array.from({ length: width - 1 }, (_, i) => (i === width - 2 ? "x" : 5))])
+        if (checked.index.kind === "p") places.push([5, null, ...Array.from({ length: width - 2 }, (_, i) => (i === width - 3 ? "x" : 5))])
+        for (const after of places) {
+          const parts = listSql("timers", "timers", { kind: "household" }, after === undefined ? checked : { ...checked, after })
+          for (const { sql, params } of parts) {
+            const plan = (raw.prepare(`EXPLAIN QUERY PLAN ${sql}`).all(...params, 20) as Array<{ detail: string }>).map((r) => r.detail).join(" | ")
+            assert.notMatch(plan, /TEMP B-TREE|SCAN pva_docs(?! USING)/, `${JSON.stringify(shape)} after ${JSON.stringify(after)}: ${plan}`)
+            assert.match(plan, /SEARCH pva_docs USING (COVERING )?INDEX/, `${JSON.stringify(shape)} after ${JSON.stringify(after)}: ${plan}`)
+            // A range after the place (a row-value comparison), or the missing keys (`k… IS NULL` shows as `k…=?`).
+            if (after !== undefined) assert.match(plan, /[<>]|k\d=\?\)/, `${JSON.stringify(shape)} after ${JSON.stringify(after)}: a range, not the whole scope: ${plan}`)
+          }
+        }
         assert.isTrue((yield* c.list({ ...shape, limit: 20 })).length <= 20)
       }
       // The snapshot's pages and the steps of a bulk removal: an index range each, continued by its cursor.
@@ -265,6 +396,22 @@ describe("SQLite store: names and indexes", () => {
 })
 
 describe("the warning filter", () => {
+  it("the checkpointer's worker drops only node:sqlite's ExperimentalWarning, as the main thread does", async () => {
+    const worker = new Worker(`
+      const { parentPort } = require("node:worker_threads")
+      ${WORKER_WARNING_FILTER}
+      const seen = []
+      process.on("warning", (w) => seen.push(w.name + ": " + w.message))
+      process.emitWarning("SQLite is an experimental feature and might change at any time", "ExperimentalWarning")
+      process.emitWarning("Something else", "ExperimentalWarning")
+      process.emitWarning("A deprecation", "DeprecationWarning")
+      setTimeout(() => parentPort.postMessage(seen), 10)
+    `, { eval: true, stderr: true })
+    const seen = await new Promise<Array<string>>((resolve) => worker.once("message", resolve))
+    await worker.terminate()
+    assert.deepStrictEqual(seen, ["ExperimentalWarning: Something else", "DeprecationWarning: A deprecation"])
+  })
+
   it("lets another ExperimentalWarning about SQLite through", async () => {
     await import("../src/quiet.ts")
     const seen: Array<string> = []

@@ -9,17 +9,24 @@ import { Cause, Deferred, Effect, Exit, Fiber, Schema, type Scope, Stream } from
 import { TestClock } from "effect/testing"
 import { connectStoreToBus, defineEventType, type HouseholdEvent, makeEventBus } from "./EventBus.ts"
 import { ambientLines } from "./HouseholdAmbient.ts"
-import { type FeedProblem, makeHouseholdFeed, MAX_FEED_COLLECTIONS, SNAPSHOT_MAX_CHARS, SNAPSHOT_PART_CHARS, type SnapshotRun } from "./HouseholdFeed.ts"
+import { type FeedProblem, makeHouseholdFeed, MAX_FEED_COLLECTIONS, SNAPSHOT_MAX_CHARS, SNAPSHOT_PART_CHARS, SNAPSHOT_READ_ROWS, type SnapshotRun } from "./HouseholdFeed.ts"
 import { makeHouseholdPage, type PageMessage } from "./HouseholdPage.ts"
 import {
   type Actor,
   BULK_STEP_ROWS,
   type Collection,
   type CommittedChange,
+  compareIndexed,
+  DEFAULT_MAX_CHARS,
   defineCollection,
   type HouseholdStore,
+  indexKeyOf,
+  LIST_BUDGET_CHARS,
+  type ListQuery,
   MAX_LIST_LIMIT,
   MAX_VALUE_CHARS,
+  maxListRows,
+  RESERVED_FIELDS,
   type ModuleStorage,
   type Row,
   StoreError,
@@ -40,6 +47,7 @@ export const shown = defineCollection({
   name: "shown",
   scope: "household",
   schema: Note,
+  maxChars: MAX_VALUE_CHARS,
   project: (row: Row<Note>, device) => (row.value.tag === undefined || row.value.tag === device.id ? { text: row.value.text } : undefined)
 })
 
@@ -69,7 +77,7 @@ export const byName = defineCollection({ name: "by_name", scope: "household", sc
 export const factsA = defineCollection({ name: "facts_a", scope: "household", schema: Note, ambientRows: 5, ambient: (rows) => `A: ${rows.map((r) => r.value.text).join(" ")}` })
 export const factsB = defineCollection({ name: "facts_b", scope: "device", schema: Note, ambient: (rows) => `B: ${rows.map((r) => r.value.text).join(" ")}` })
 /** Whatever the schema allows (the store still wants an object). */
-export const anything = defineCollection({ name: "anything", scope: "household", schema: Schema.Unknown })
+export const anything = defineCollection({ name: "anything", scope: "household", schema: Schema.Unknown, maxChars: MAX_VALUE_CHARS })
 /** A collection whose name is also a property of every object. */
 export const constructorCollection = defineCollection({ name: "constructor", scope: "household", schema: Note })
 
@@ -110,7 +118,7 @@ const settle = Effect.repeat(Effect.yieldNow, { times: 20 })
 const failureOf = <A, E>(exit: Exit.Exit<A, E>): E | undefined => (Exit.isFailure(exit) ? (exit.cause.reasons.find((r) => r._tag === "Fail") as { error: E } | undefined)?.error : undefined)
 const reasonOf = <A, E>(exit: Exit.Exit<A, E>) => (failureOf(exit) as StoreError | undefined)?.reason
 
-/** Every row of a collection in one scope, paged (no single list may take more than `MAX_LIST_LIMIT`). */
+/** Every row of a collection in one scope, paged (no single page may take more than `maxListRows(c)`). */
 export const allRows = <A>(store: HouseholdStore, owner: string, c: Collection<A>, scope?: { readonly kind: "device"; readonly id: string }) =>
   Effect.sync(() => {
     const reader = store.reader(owner, c)
@@ -118,9 +126,9 @@ export const allRows = <A>(store: HouseholdStore, owner: string, c: Collection<A
     const out: Array<Row<A>> = []
     let after: { updatedAt: number; createdAt: number; id: string } | undefined
     for (;;) {
-      const page = reader.page(scope ?? { kind: "household" }, after, MAX_LIST_LIMIT)
+      const page = reader.page(scope ?? { kind: "household" }, after, maxListRows(c))
       out.push(...page)
-      if (page.length < MAX_LIST_LIMIT) return out
+      if (page.length < maxListRows(c)) return out
       const last = page.at(-1)!
       after = { updatedAt: last.updatedAt, createdAt: last.createdAt, id: last.id }
     }
@@ -181,7 +189,7 @@ export const householdStoreContract = (name: string, make: MakeStore) =>
         assert.strictEqual((yield* kit.collection(chat).list().pipe(inTurn(turnOf({ conversationId: "conv-2" })))).length, 1)
       }).pipe(Effect.scoped))
 
-    it.effect("list: one indexed filter, an order an index answers, a limit of at most MAX_LIST_LIMIT; ties by createdAt then id; other shapes are refused", () =>
+    it.effect("list: one indexed filter, an order an index answers, a limit of at most maxListRows; ties by createdAt then id; other shapes are refused", () =>
       Effect.gen(function*() {
         const store = yield* prepared(make)
         const c = store.forModule("kit").collection(notes)
@@ -205,14 +213,14 @@ export const householdStoreContract = (name: string, make: MakeStore) =>
           { where: { done: true }, orderBy: { field: "n" as const } },
           { where: { n: 7 }, orderBy: { field: "tag" as const } },
           { orderBy: { field: "text" as never } },
-          { limit: MAX_LIST_LIMIT + 1 },
+          { limit: maxListRows(notes) + 1 },
           { limit: 0 },
           { limit: 1.5 }
         ]) {
           const exit = yield* Effect.exit(c.list(query))
           assert.strictEqual(reasonOf(exit), "invalid", JSON.stringify(query))
         }
-        assert.strictEqual((yield* c.list({ limit: MAX_LIST_LIMIT })).length, 5)
+        assert.strictEqual((yield* c.list({ limit: maxListRows(notes) })).length, 5)
       }).pipe(Effect.scoped))
 
     it.effect("ties are broken by createdAt, then id, in every order (equal update times, unequal creation times)", () =>
@@ -289,7 +297,7 @@ export const householdStoreContract = (name: string, make: MakeStore) =>
         assert.deepStrictEqual((yield* c.list({ where: { k: -0 } })).map((r) => r.id).sort(), ["v09", "zero"])
         assert.isTrue(Object.is((yield* c.get("zero"))!.value.k, 0))
         // Order of the exact numbers agrees with JavaScript's.
-        const ordered = (yield* c.list({ orderBy: { field: "k" }, limit: MAX_LIST_LIMIT })).filter((r) => r.id.startsWith("e")).map((r) => r.value.k as number)
+        const ordered = (yield* c.list({ orderBy: { field: "k" }, limit: maxListRows(loose) })).filter((r) => r.id.startsWith("e")).map((r) => r.value.k as number)
         assert.deepStrictEqual(ordered, [...exact].sort((a, b) => a - b))
       }).pipe(Effect.scoped))
 
@@ -522,7 +530,7 @@ export const householdStoreContract = (name: string, make: MakeStore) =>
           tx.collection(notes).insert({ text: "outer" }, { id: "outer" })
           Effect.runSync(kit.transaction((inner) => inner.collection(notes).insert({ text: "inner" }, { id: "inner" })))
           Effect.runSync(c.insert({ text: "plain" }, { id: "plain" }))
-          assert.strictEqual(tx.collection(notes).list({ limit: MAX_LIST_LIMIT }).filter((r) => ["outer", "inner", "plain"].includes(r.id)).length, 3)
+          assert.strictEqual(tx.collection(notes).list({ limit: maxListRows(notes) }).filter((r) => ["outer", "inner", "plain"].includes(r.id)).length, 3)
           throw new Error("no")
         }))
         assert.isTrue(Exit.isFailure(exit))
@@ -744,7 +752,8 @@ export const householdStoreContract = (name: string, make: MakeStore) =>
         const turn = turnOf()
         const removed = yield* c.insert({ text: "removed scratch" }).pipe(inTurn(turn))
         yield* c.remove(removed.id).pipe(inTurn(turn))
-        const n = BULK_STEP_ROWS * 2 + 50
+        const rest = Math.max(1, Math.floor(BULK_STEP_ROWS / 2))
+        const n = BULK_STEP_ROWS * 2 + rest
         yield* store.forModule("kit").transaction((tx) => {
           for (let i = 0; i < n; i++) tx.collection(chat).insert({ text: `live scratch ${i}` })
         }).pipe(inTurn(turn))
@@ -758,7 +767,7 @@ export const householdStoreContract = (name: string, make: MakeStore) =>
         assert.strictEqual(reasonOf(yield* Effect.exit(c.insert({ text: "late" }).pipe(inTurn(turn)))), "invalid")
         assert.strictEqual(yield* Fiber.join(ending), n)
         // In steps of at most BULK_STEP_ROWS, each its own commit.
-        assert.deepStrictEqual(batches, [BULK_STEP_ROWS, BULK_STEP_ROWS, 50])
+        assert.deepStrictEqual(batches, [BULK_STEP_ROWS, BULK_STEP_ROWS, rest])
         assert.strictEqual((yield* c.list().pipe(inTurn(turnOf({ conversationId: "conv-2" })))).length, 1)
         yield* c.insert({ text: "left behind" }).pipe(inTurn(turnOf({ conversationId: "conv-9" })))
         assert.strictEqual(yield* store.sweepConversations, 2)
@@ -840,10 +849,11 @@ export const householdStoreContract = (name: string, make: MakeStore) =>
 
     it.effect("a migration whose output breaks the size limit or the schema fails: nothing changes, the module is unavailable", () =>
       Effect.gen(function*() {
-        const v1 = defineCollection({ name: "texts", scope: "household", schema: Schema.Struct({ body: Schema.String }) })
+        const v1 = defineCollection({ name: "texts", scope: "household", schema: Schema.Struct({ body: Schema.String }), maxChars: MAX_VALUE_CHARS })
         const v2 = defineCollection({
           name: "texts",
           scope: "household",
+          maxChars: MAX_VALUE_CHARS,
           schema: Schema.Struct({ body: Schema.String, copy: Schema.String }),
           migrate: { 1: (old: { body: string }) => ({ ...old, copy: old.body }) }
         })
@@ -1045,7 +1055,8 @@ export const householdStoreContract = (name: string, make: MakeStore) =>
         const finalAt = after.findIndex((m) => m.type === "household.snapshot" && m.final)
         const delivered = after.flatMap((m, i) => (m.type === "household.event" ? [{ i, n: (m.event.data as { n: number }).n }] : []))
         assert.isTrue(delivered.every((d) => d.i > finalAt))
-        assert.deepStrictEqual(delivered.map((d) => d.n), [21, 22, 23, 24, 25, 26, 27, 28, 29])
+        // (The bound keeps room for a snapshot: the 20th waiting entry overflows when no snapshot is queued.)
+        assert.deepStrictEqual(delivered.map((d) => d.n), [20, 21, 22, 23, 24, 25, 26, 27, 28, 29])
         assert.strictEqual(page.size(), 0)
       }).pipe(Effect.scoped))
 
@@ -1081,7 +1092,7 @@ export const householdStoreContract = (name: string, make: MakeStore) =>
         assert.notInclude(cut, "notes")
         // Many collections, each with one row near the limit: the final part names every one that did not fit, so no
         // visible collection is silently absent.
-        const many = Array.from({ length: 128 }, (_, i) => defineCollection({ name: `c${i}`, scope: "household", schema: Note, project: (row: Row<Note>) => ({ t: row.value.text }) }))
+        const many = Array.from({ length: 128 }, (_, i) => defineCollection({ name: `c${i}`, scope: "household", schema: Note, maxChars: MAX_VALUE_CHARS, project: (row: Row<Note>) => ({ t: row.value.text }) }))
         const wideModules = Array.from({ length: 2 }, (_, m) => ({ id: `wide${m}`, storage: { collections: many.slice(m * 64, m * 64 + 64) } }))
         yield* store.prepare(wideModules)
         for (const [m, w] of wideModules.entries()) {
@@ -1119,6 +1130,40 @@ export const householdStoreContract = (name: string, make: MakeStore) =>
         assert.strictEqual(tooMany.length, 1)
       }).pipe(Effect.scoped))
 
+    it.effect("pages: a snapshot reads at most SNAPSHOT_READ_ROWS rows in all, a page shortened by that budget included, and the collection it cut is named", () =>
+      Effect.gen(function*() {
+        const tiny = Array.from({ length: 11 }, (_, i) => defineCollection({ name: `t${i}`, scope: "household", schema: Note, project: () => ({}) }))
+        const store = yield* make()
+        yield* store.prepare([{ id: "many", storage: { collections: tiny } }])
+        // 499 rows, then nine of SNAPSHOT_ROWS (500): 4,999 read before the last collection, which has more than a page.
+        const counts = [499, ...Array.from({ length: 9 }, () => 500), 40]
+        for (const [i, c] of tiny.entries()) {
+          yield* store.forModule("many").transaction((tx) => {
+            for (let k = 0; k < counts[i]!; k++) tx.collection(c).insert({ text: "x" })
+          })
+        }
+        let read = 0
+        const counting: HouseholdStore = {
+          ...store,
+          reader: (owner, c) => {
+            const r = store.reader(owner, c)
+            return r === undefined ? undefined : {
+              ...r,
+              page: (scope, after, limit) => {
+                const rows = r.page(scope, after, limit)
+                read += rows.length
+                return rows
+              }
+            }
+          }
+        }
+        const feed = makeHouseholdFeed({ store: counting, modules: [{ moduleId: "many", collections: tiny, events: [] }] })
+        const frames = allFrames(feed.snapshot({ id: "kitchen-01" }))
+        assert.strictEqual(read, SNAPSHOT_READ_ROWS)
+        assert.include(frames.at(-1)!.truncated.map((t) => t.collection), "t10")
+        assert.notInclude(frames.at(-1)!.truncated.map((t) => t.collection), "t0")
+      }).pipe(Effect.scoped))
+
     it.effect("module events reach pages only through a declared projection, which may fail on its own; host events never", () =>
       Effect.gen(function*() {
         const store = yield* prepared(make)
@@ -1149,6 +1194,259 @@ export const householdStoreContract = (name: string, make: MakeStore) =>
         assert.strictEqual(yield* lines(undefined, "off"), "")
         let t = 0
         assert.strictEqual(yield* lines(() => (t += 30)), "A: a29 a28 a27 a26 a25")
+      }).pipe(Effect.scoped))
+
+    it.effect("a read never migrates: every row is at its collection's version, so an upgrade with no rewrite leaves get and list agreeing with what is stored", () =>
+      Effect.gen(function*() {
+        const Count = Schema.Struct({ n: Schema.Finite })
+        const v1 = defineCollection({ name: "counts", scope: "household", schema: Count, indexes: ["n"] })
+        const v3 = defineCollection({ name: "counts", scope: "household", schema: Count, indexes: ["n"], migrate: { 1: (old: { n: number }) => ({ ...old, n: 2 }) } })
+        const store = yield* make()
+        yield* store.prepare([{ id: "m", storage: { collections: [v1] } }])
+        yield* store.forModule("m").collection(v1).insert({ n: 1 }, { id: "x" })
+        // Version 2: the same shape, nothing to migrate. Version 3 adds a migration from 1, which no row is at any more.
+        yield* store.prepare([{ id: "m", storage: { version: 2, collections: [v1] } }])
+        yield* store.prepare([{ id: "m", storage: { version: 3, collections: [v3] } }])
+        assert.strictEqual(store.availability("m"), undefined)
+        const c = store.forModule("m").collection(v3)
+        assert.strictEqual((yield* c.get("x"))?.value.n, 1)
+        assert.deepStrictEqual((yield* c.list({ where: { n: 1 } })).map((r) => r.id), ["x"])
+        assert.deepStrictEqual(yield* c.list({ where: { n: 2 } }), [])
+        assert.deepStrictEqual(store.reader("m", v3)?.page({ kind: "household" }, undefined, 10).map((r) => r.value), [{ n: 1 }])
+      }).pipe(Effect.scoped))
+
+    it.effect("maxChars: a value's limit, enforced at write; a list asks for at most min(100, LIST_BUDGET_CHARS / maxChars) rows; a change of it is a change of shape", () =>
+      Effect.gen(function*() {
+        for (const maxChars of [0, MAX_VALUE_CHARS + 1, 1.5]) {
+          assert.throws(() => defineCollection({ name: "x", scope: "household", schema: Note, maxChars }), /maxChars/)
+        }
+        const small = defineCollection({ name: "small", scope: "household", schema: Note })
+        const wide = defineCollection({ name: "wide", scope: "household", schema: Note, maxChars: MAX_VALUE_CHARS })
+        assert.strictEqual(small.maxChars, DEFAULT_MAX_CHARS)
+        assert.strictEqual(maxListRows(small), Math.min(MAX_LIST_LIMIT, Math.floor(LIST_BUDGET_CHARS / DEFAULT_MAX_CHARS)))
+        assert.strictEqual(maxListRows(defineCollection({ name: "x", scope: "household", schema: Note, maxChars: 1 })), MAX_LIST_LIMIT)
+        assert.isBelow(maxListRows(wide), MAX_LIST_LIMIT)
+        assert.throws(() => defineCollection({ name: "x", scope: "household", schema: Note, maxChars: MAX_VALUE_CHARS, ambientRows: maxListRows(wide) + 1 }), /ambientRows/)
+        const store = yield* make()
+        yield* store.prepare([{ id: "m", storage: { collections: [small, wide] } }])
+        const s = store.forModule("m").collection(small)
+        const w = store.forModule("m").collection(wide)
+        // {"text":"…"} is 11 characters around the text.
+        assert.strictEqual(reasonOf(yield* Effect.exit(s.insert({ text: "x".repeat(DEFAULT_MAX_CHARS - 10) }))), "invalid")
+        yield* s.insert({ text: "x".repeat(DEFAULT_MAX_CHARS - 11) }, { id: "fits" })
+        yield* w.insert({ text: "x".repeat(15_000 - 11) }, { id: "long" })
+        const most = maxListRows(wide)
+        for (let i = 0; i < most + 3; i++) yield* w.insert({ text: `w${i}` })
+        assert.strictEqual(reasonOf(yield* Effect.exit(w.list({ limit: most + 1 }))), "invalid")
+        assert.strictEqual((yield* w.list({ limit: most })).length, most)
+        // Without a limit: the default, or the most when that is smaller.
+        assert.strictEqual((yield* w.list()).length, Math.min(20, most))
+        assert.strictEqual(store.reader("m", wide)!.page({ kind: "household" }, undefined, MAX_LIST_LIMIT).length, most)
+        // Another maxChars at the same version: refused. A smaller one with a longer row stored: the upgrade fails.
+        const shrunk = defineCollection({ name: "wide", scope: "household", schema: Note, maxChars: 1000 })
+        yield* store.prepare([{ id: "m", storage: { collections: [small, shrunk] } }])
+        assert.match(store.availability("m")?.reason ?? "", /shape/)
+        yield* store.prepare([{ id: "m", storage: { version: 2, collections: [small, shrunk] } }])
+        assert.match(store.availability("m")?.reason ?? "", /could not be upgraded.*long/)
+        yield* store.prepare([{ id: "m", storage: { version: 2, collections: [small, defineCollection({ name: "wide", scope: "household", schema: Note, maxChars: 15_500 })] } }])
+        assert.strictEqual(store.availability("m"), undefined)
+      }).pipe(Effect.scoped))
+
+    it.effect("list continues `after` the last row of the previous page: 300 rows read completely, in order, in every legal order; an after of another query or collection is invalid", () =>
+      Effect.gen(function*() {
+        const store = yield* prepared(make)
+        const kit = store.forModule("kit")
+        const c = kit.collection(notes)
+        // Missing fields (indexed as missing), equal keys, equal and unequal times.
+        for (let t = 0; t < 30; t++) {
+          yield* kit.transaction((tx) => {
+            for (let i = 0; i < 10; i++) {
+              const k = t * 10 + i
+              tx.collection(notes).insert({
+                text: `r${k}`,
+                ...(k % 4 === 3 ? {} : { tag: ["a", "b", "c"][k % 3]! }),
+                ...(k % 5 === 4 ? {} : { n: k % 7 }),
+                ...(k % 6 === 5 ? {} : { done: k % 2 === 0 })
+              }, { id: `r${String((k * 37) % 300).padStart(3, "0")}` })
+            }
+          })
+          yield* TestClock.adjust(t % 3 === 0 ? 0 : 1)
+        }
+        yield* kit.transaction((tx) => {
+          for (let k = 0; k < 300; k += 7) tx.collection(notes).update(`r${String(k).padStart(3, "0")}`, (v) => ({ ...v, text: `${v.text}+` }))
+        })
+        const all = yield* allRows(store, "kit", notes)
+        assert.strictEqual(all.length, 300)
+        type Q = ListQuery<Note>
+        const fieldKey = (r: Row<Note>, f: string): ReadonlyArray<unknown> =>
+          f === "updatedAt" ? [r.updatedAt, r.createdAt, r.id] : f === "createdAt" ? [r.createdAt, r.id] : [indexKeyOf((r.value as unknown as Record<string, never>)[f]), r.createdAt, r.id]
+        const expected = (q: Q) => {
+          const where = Object.entries(q.where ?? {})[0]
+          const f = q.orderBy?.field ?? "updatedAt"
+          const desc = (q.orderBy?.direction ?? (f === "updatedAt" || f === "createdAt" ? "desc" : "asc")) === "desc"
+          return all
+            .filter((r) => where === undefined || indexKeyOf((r.value as unknown as Record<string, never>)[where[0]]) === indexKeyOf(where[1] as never))
+            .sort((a, b) => {
+              const ka = fieldKey(a, f)
+              const kb = fieldKey(b, f)
+              let x = 0
+              for (let i = 0; i < ka.length && x === 0; i++) x = compareIndexed(ka[i], kb[i])
+              return desc ? -x : x
+            })
+            .map((r) => r.id)
+        }
+        const queries: Array<Q> = []
+        for (const direction of ["asc", "desc"] as const) {
+          for (const field of ["updatedAt", "createdAt", "tag", "n", "done"] as const) queries.push({ orderBy: { field, direction } })
+          for (const field of ["updatedAt", "createdAt", "tag", "n"] as const) queries.push({ where: { tag: "a" }, orderBy: { field, direction } })
+          for (const field of ["updatedAt", "createdAt", "n"] as const) queries.push({ where: { n: 3 }, orderBy: { field, direction } })
+          queries.push({ where: { done: true }, orderBy: { field: "createdAt", direction } })
+        }
+        queries.push({}, { where: { tag: "b" } })
+        for (const q of queries) {
+          for (const limit of [7, maxListRows(notes)]) {
+            const got: Array<string> = []
+            let after: Row<Note> | undefined
+            for (let pages = 0; pages < 100; pages++) {
+              const page = yield* c.list({ ...q, limit, ...(after !== undefined ? { after } : {}) })
+              got.push(...page.map((r) => r.id))
+              if (page.length < limit) break
+              after = page.at(-1)
+            }
+            assert.deepStrictEqual(got, expected(q), `${JSON.stringify(q)} by ${limit}`)
+          }
+        }
+        // In a transaction too.
+        const firstTwo = yield* kit.transaction((tx) => {
+          const n = tx.collection(notes)
+          const one = n.list({ limit: 1 })
+          return [...one, ...n.list({ limit: 1, after: one[0]! })].map((r) => r.id)
+        })
+        assert.deepStrictEqual(firstTwo, expected({}).slice(0, 2))
+        // A row of another query, of another collection, or a copy: invalid.
+        const plain = (yield* c.list({ limit: 1 }))[0]!
+        assert.strictEqual(reasonOf(yield* Effect.exit(c.list({ where: { tag: "a" }, after: plain }))), "invalid")
+        assert.strictEqual(reasonOf(yield* Effect.exit(c.list({ orderBy: { field: "createdAt" }, after: plain }))), "invalid")
+        assert.strictEqual(reasonOf(yield* Effect.exit(c.list({ after: { ...plain } }))), "invalid")
+        const other = kit.collection(constructorCollection)
+        yield* other.insert({ text: "o" })
+        const otherRow = (yield* other.list())[0]!
+        assert.strictEqual(reasonOf(yield* Effect.exit(c.list({ after: otherRow }))), "invalid")
+      }).pipe(Effect.scoped))
+
+    it.effect("hooks, updaters and migrations that return a promise: never awaited, and a rejection is observed (no unhandled rejection)", () =>
+      Effect.gen(function*() {
+        const store = yield* prepared(make)
+        const kit = store.forModule("kit")
+        const c = kit.collection(notes)
+        const unhandled: Array<unknown> = []
+        const onUnhandled = (e: unknown) => void unhandled.push(e)
+        process.on("unhandledRejection", onUnhandled)
+        try {
+          const row = yield* c.insert({ text: "a" })
+          yield* kit.transaction((tx) => tx.afterCommit(async () => {
+            throw new Error("after-commit hook failed")
+          }))
+          yield* store.afterCommit(async () => {
+            throw new Error("host hook failed")
+          })
+          yield* Effect.exit(kit.transaction((tx) => {
+            tx.onRollback(async () => {
+              throw new Error("rollback hook failed")
+            })
+            throw new Error("roll back")
+          }))
+          const updated = yield* Effect.exit(c.update(row.id, (async () => {
+            throw new Error("updater failed")
+          }) as unknown as (v: Note) => Note))
+          assert.strictEqual(reasonOf(updated), "invalid")
+          assert.strictEqual((yield* c.get(row.id))?.value.text, "a")
+          const v1 = defineCollection({ name: "later", scope: "household", schema: Note })
+          const v2 = defineCollection({
+            name: "later",
+            scope: "household",
+            schema: Note,
+            migrate: { 1: async () => Promise.reject(new Error("migration failed")) }
+          })
+          yield* store.prepare([{ id: "mig", storage: { collections: [v1] } }])
+          yield* store.forModule("mig").collection(v1).insert({ text: "x" })
+          yield* store.prepare([{ id: "mig", storage: { version: 2, collections: [v2] } }])
+          assert.match(store.availability("mig")?.reason ?? "", /could not be upgraded/)
+          yield* Effect.promise(() => new Promise((r) => setTimeout(r, 20)))
+        } finally {
+          process.off("unhandledRejection", onUnhandled)
+        }
+        assert.deepStrictEqual(unhandled, [])
+      }).pipe(Effect.scoped))
+
+    it.effect("no storage at all is an empty declaration at version 1: newer stored data makes the module unavailable, and nothing is written for it", () =>
+      Effect.gen(function*() {
+        const a = defineCollection({ name: "a", scope: "household", schema: Note })
+        const store = yield* make()
+        yield* store.prepare([{ id: "m", storage: { version: 2, collections: [a] } }])
+        yield* store.forModule("m").collection(a).insert({ text: "kept" }, { id: "k" })
+        yield* store.prepare([{ id: "m", storage: undefined }, { id: "plain", storage: undefined }])
+        assert.match(store.availability("m")?.reason ?? "", /newer version/)
+        assert.strictEqual(reasonOf(yield* Effect.exit(store.forModule("m").transaction(() => 1))), "unavailable")
+        assert.strictEqual(store.availability("plain"), undefined)
+        assert.deepStrictEqual(store.undeclared().map((u) => u.owner), ["m"])
+        yield* store.prepare([{ id: "m", storage: { version: 2, collections: [a] } }])
+        assert.strictEqual((yield* store.forModule("m").collection(a).get("k"))?.value.text, "kept")
+      }).pipe(Effect.scoped))
+
+    it.effect("a row's own names (updatedAt, createdAt, id, rev, scope) cannot be indexed: refused where the collection is defined", () =>
+      Effect.sync(() => {
+        const Schedule = Schema.Struct({ state: Schema.String, updatedAt: Schema.Finite })
+        assert.deepStrictEqual([...RESERVED_FIELDS].sort(), ["createdAt", "id", "rev", "scope", "updatedAt"])
+        for (const field of RESERVED_FIELDS) {
+          for (const indexes of [[field], [["state", field] as const], [[field, "state"] as const]]) {
+            assert.throws(() => defineCollection({ name: "x", scope: "household", schema: Schedule, indexes }), /row's own field/, `${JSON.stringify(indexes)}`)
+          }
+        }
+      }))
+
+    it.effect("ids: get, update, remove and insert validate a row id the same way (invalid), through every handle", () =>
+      Effect.gen(function*() {
+        const store = yield* prepared(make)
+        const kit = store.forModule("kit")
+        const c = kit.collection(notes)
+        for (const id of ["bad/id", "", "x".repeat(201), "a\ud800", "a\u0000"]) {
+          assert.strictEqual(reasonOf(yield* Effect.exit(c.get(id))), "invalid", `get ${JSON.stringify(id)}`)
+          assert.strictEqual(reasonOf(yield* Effect.exit(c.update(id, (v) => v))), "invalid", `update ${JSON.stringify(id)}`)
+          assert.strictEqual(reasonOf(yield* Effect.exit(c.remove(id))), "invalid", `remove ${JSON.stringify(id)}`)
+          assert.strictEqual(reasonOf(yield* Effect.exit(c.insert({ text: "x" }, { id }))), "invalid", `insert ${JSON.stringify(id)}`)
+          const inTx = yield* kit.transaction((tx) => [
+            captureThrow(() => tx.collection(notes).get(id)),
+            captureThrow(() => tx.collection(notes).update(id, (v) => v)),
+            captureThrow(() => tx.collection(notes).remove(id))
+          ].map((e) => (e as StoreError | undefined)?.reason))
+          assert.deepStrictEqual(inTx, ["invalid", "invalid", "invalid"])
+          assert.strictEqual((captureThrow(() => store.reader("kit", notes)!.get(id, { kind: "household" })) as StoreError | undefined)?.reason, "invalid")
+        }
+      }).pipe(Effect.scoped))
+
+    it.effect("an actor is checked before it is stored: a known kind with its fields, a finite turn id", () =>
+      Effect.gen(function*() {
+        const store = yield* prepared(make)
+        const c = store.forModule("kit").collection(notes)
+        for (const actor of [
+          { kind: "turn", turnId: Number.NaN, conversationId: "c", source: "voice" },
+          { kind: "turn", turnId: Number.POSITIVE_INFINITY, conversationId: "c", source: "voice" },
+          { kind: "turn", turnId: 1, source: "voice" },
+          { kind: "turn", turnId: 1, conversationId: "c", source: "voice", personId: 5 },
+          { kind: "job" },
+          { kind: "ui", deviceId: 3 },
+          { kind: "nobody" },
+          { kind: "admin", extra: "x" },
+          null,
+          "admin"
+        ]) {
+          assert.strictEqual(reasonOf(yield* Effect.exit(c.insert({ text: "x" }, { actor: actor as never }))), "invalid", JSON.stringify(actor))
+        }
+        const row = yield* c.insert({ text: "x" }, { actor: { kind: "job", jobId: "j1" } })
+        assert.deepStrictEqual(row.updatedBy, { kind: "job", jobId: "j1" })
+        const turn = yield* c.insert({ text: "y" }, { actor: { kind: "turn", turnId: 7, conversationId: "c", source: "voice", personId: "sam" } })
+        assert.deepStrictEqual(turn.updatedBy, { kind: "turn", turnId: 7, conversationId: "c", source: "voice", personId: "sam" })
       }).pipe(Effect.scoped))
 
     it.effect("a read-only store reads, refuses every write and makes no backup; a collection the server never prepared reads as empty", () =>

@@ -419,9 +419,11 @@ export interface ModuleServicesV2 {
    */
   readonly store: ModuleStore
   /**
-   * The household event bus: publish `<moduleId>.<type>`, subscribe to anything (a stream in the caller's scope). A
-   * subscription receives events only while the part that made it (`shared` or an instance) is published: none while
-   * its module starts, none once it is withdrawn; it ends when the part's scope closes. After that, `publish` and
+   * The household event bus: publish `<moduleId>.<type>`, subscribe to anything (a stream to consume in the part's
+   * scope: `Effect.forkScoped` in `shared`/`start`, or within a call; a stream run detached from it is not supported).
+   * A subscription receives events only while the part that made it (`shared` or an instance) is published: none
+   * while its module starts, none once it is withdrawn; it ends when the part's scope closes. Its handlers are not
+   * calls in flight: they get no grace period and are interrupted when the part closes. After that, `publish` and
    * `subscribe` die with `ModuleStopped`.
    */
   readonly events: ModuleEvents

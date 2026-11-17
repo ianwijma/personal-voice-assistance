@@ -12,10 +12,11 @@ import {
 import { type BulkKey, type BulkRow, type CheckedQuery, type IndexSpec, layoutOf, makeStoreEngine, type StoredCollection, type StoredDoc, type SyncBackend } from "@pva/core/store-backend"
 import { Clock, Effect, Semaphore, type Scope } from "effect"
 import { existsSync } from "node:fs"
-import { open, stat } from "node:fs/promises"
+import { open, readdir, stat } from "node:fs/promises"
 import type { DatabaseSync, StatementSync } from "node:sqlite"
 import { basename, dirname, join } from "node:path"
 import {
+  BEFORE,
   copyDatabase,
   copyFilePrivately,
   DAILY,
@@ -93,13 +94,16 @@ export interface SqliteHouseholdStore extends HouseholdStore {
   readonly lastBackupAt: Effect.Effect<number | undefined, StoreError>
   /** The newest daily backup's time in the second directory (`undefined`: none, or no second directory). */
   readonly lastCopyAt: Effect.Effect<number | undefined, StoreError>
-  /** Copy the newest daily backup to the second directory again (after that copy failed). */
-  readonly copyLatest: Effect.Effect<void, StoreError>
+  /**
+   * Copy every retained backup (daily, before an upgrade) the second directory lacks (by name) to it; the copy failure
+   * is cleared only when none is missing any more. Maintenance runs it every hour.
+   */
+  readonly copyMissing: Effect.Effect<void, StoreError>
   readonly backupDir: string | undefined
   readonly backupCopyDir: string | undefined
   /** `PRAGMA quick_check` (doctor; it reads the whole file, so never on a turn). */
   readonly check: Effect.Effect<string, StoreError>
-  /** Remove backups past their time (maintenance): what was removed, and what could not be done. */
+  /** Remove backups past their time (maintenance): what was removed, and what could not be done. Serve mode only. */
   readonly pruneBackups: (options?: { readonly now?: number }) => Effect.Effect<PruneResult>
   /** The last pruning's failures (a Health issue while there are any). */
   readonly pruneFailures: () => ReadonlyArray<string>
@@ -132,16 +136,20 @@ const CORE_DDL = `
   CREATE TABLE pva_docs (
     owner TEXT NOT NULL, collection TEXT NOT NULL, id TEXT NOT NULL,
     scope_kind TEXT NOT NULL, scope_id TEXT NOT NULL,
-    rev INTEGER NOT NULL, v INTEGER NOT NULL, value TEXT NOT NULL,
+    rev INTEGER NOT NULL, value TEXT NOT NULL,
     created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, updated_by TEXT NOT NULL,
     ${keyColumns.join(", ")},
     PRIMARY KEY (owner, collection, id)
   ) WITHOUT ROWID;
-  CREATE INDEX pva_docs_updated ON pva_docs (owner, collection, scope_kind, scope_id, updated_at, created_at, id);
-  CREATE INDEX pva_docs_created ON pva_docs (owner, collection, scope_kind, scope_id, created_at, id);
-  CREATE INDEX pva_docs_conversation ON pva_docs (scope_id, owner, collection, id) WHERE scope_kind = 'conversation';
   CREATE TABLE pva_indexes (name TEXT PRIMARY KEY, owner TEXT NOT NULL, collection TEXT NOT NULL, ddl TEXT NOT NULL) WITHOUT ROWID;
 `
+
+/** The store's own indexes (every list without a declared index, every bulk removal reads one): name and DDL. */
+export const CORE_INDEXES: ReadonlyArray<readonly [name: string, ddl: string]> = [
+  ["pva_docs_updated", "CREATE INDEX pva_docs_updated ON pva_docs (owner, collection, scope_kind, scope_id, updated_at, created_at, id)"],
+  ["pva_docs_created", "CREATE INDEX pva_docs_created ON pva_docs (owner, collection, scope_kind, scope_id, created_at, id)"],
+  ["pva_docs_conversation", "CREATE INDEX pva_docs_conversation ON pva_docs (scope_id, owner, collection, id) WHERE scope_kind = 'conversation'"]
+]
 
 const lit = (s: string) => `'${s.replace(/'/g, "''")}'`
 const hex = (s: string) => Buffer.from(s, "utf8").toString("hex")
@@ -171,22 +179,45 @@ const indexDdl = (name: string, owner: string, collection: string, spec: IndexSp
   `CREATE INDEX ${name} ON pva_docs (owner, collection, scope_kind, scope_id, ${columnsOf(spec).join(", ")}) WHERE owner = ${lit(owner)} AND collection = ${lit(collection)}`
 
 /**
- * The SQL of one list read (`CheckedQuery`). Each shape names its index (`INDEXED BY`): a query that could not use it
- * fails ("no query solution") instead of scanning, and the order is the index's own, so SQLite never sorts the
- * matching rows: it reads at most `limit` index entries.
+ * The SQL of one list read (`CheckedQuery`): one statement, or two after a cursor whose range crosses the missing
+ * values of a key column (SQLite's row-value comparison leaves `NULL` out), read one after the other in the index's
+ * order. Each names its index (`INDEXED BY`): a query that could not use it fails ("no query solution") instead of
+ * scanning, and the order is the index's own, so SQLite never sorts the matching rows: together they read at most
+ * `limit` index entries. Each statement ends with `LIMIT ?`, which the caller binds after `params`.
  */
-export const listSql = (owner: string, collection: string, scope: ScopeRef, q: CheckedQuery): { readonly sql: string; readonly params: ReadonlyArray<string | number> } => {
+export const listSql = (owner: string, collection: string, scope: ScopeRef, q: CheckedQuery): ReadonlyArray<{ readonly sql: string; readonly params: ReadonlyArray<string | number> }> => {
   const dir = q.desc ? "DESC" : "ASC"
   const index = "slots" in q.index ? indexName(owner, collection, q.index) : q.index.kind === "updated" ? "pva_docs_updated" : "pva_docs_created"
   const columns = columnsOf(q.index)
   const where = [`owner = ${lit(owner)}`, `collection = ${lit(collection)}`, "scope_kind = ?", "scope_id = ?"]
   const params: Array<string | number> = [scope.kind, scopeIdOf(scope)]
+  let range = columns
+  let after = q.after
   if (q.where !== undefined && q.where !== null) {
     where.push(`${columns[0]} = ?`)
     params.push(q.where)
+    range = columns.slice(1)
+    after = after?.slice(1)
   }
-  params.push(q.limit)
-  return { sql: `SELECT * FROM pva_docs INDEXED BY ${index} WHERE ${where.join(" AND ")} ORDER BY ${columns.map((c) => `${c} ${dir}`).join(", ")} LIMIT ?`, params }
+  const statement = (extra: ReadonlyArray<string>, extraParams: ReadonlyArray<string | number>) => ({
+    sql: `SELECT * FROM pva_docs INDEXED BY ${index} WHERE ${[...where, ...extra].join(" AND ")} ORDER BY ${columns.map((c) => `${c} ${dir}`).join(", ")} LIMIT ?`,
+    params: [...params, ...extraParams]
+  })
+  if (after === undefined) return [statement([], [])]
+  // Only a key column (`k…`) can be NULL, and only the first of the range: NULL sorts before every value.
+  const [x, ...rest] = range
+  const [vx, ...restValues] = after
+  const nullable = x!.startsWith("k")
+  const cmp = q.desc ? "<" : ">"
+  const tuple = (cols: ReadonlyArray<string>) => `(${cols.join(", ")}) ${cmp} (${cols.map(() => "?").join(", ")})`
+  const values = (vs: ReadonlyArray<IndexKey>) => vs as ReadonlyArray<string | number>
+  if (vx !== null) {
+    const first = statement([tuple(range)], values(after))
+    // Descending, the rows whose key is missing come after every value.
+    return nullable && q.desc ? [first, statement([`${x} IS NULL`], [])] : [first]
+  }
+  const missing = statement([`${x} IS NULL`, tuple(rest)], values(restValues))
+  return q.desc ? [missing] : [missing, statement([`${x} IS NOT NULL`], [])]
 }
 
 /** The SQL of `CollectionReader.page`: one scope newest first, after a cursor, through the updated index. */
@@ -230,7 +261,6 @@ interface DocRow {
   readonly scope_kind: string
   readonly scope_id: string
   readonly rev: number
-  readonly v: number
   readonly value: string
   readonly created_at: number
   readonly updated_at: number
@@ -243,7 +273,6 @@ const toDoc = (r: DocRow): StoredDoc => ({
   id: r.id,
   scope: scopeFromColumns(r.scope_kind, r.scope_id),
   rev: Number(r.rev),
-  v: Number(r.v),
   text: r.value,
   createdAt: Number(r.created_at),
   updatedAt: Number(r.updated_at),
@@ -390,6 +419,7 @@ export const makeSqliteStore = (options: SqliteStoreOptions): Effect.Effect<Sqli
           db.exec("BEGIN IMMEDIATE")
           try {
             db.exec(CORE_DDL)
+            for (const [, ddl] of CORE_INDEXES) db.exec(ddl)
             run("INSERT INTO pva_meta (key, value) VALUES ('schema', ?), ('created', ?), ('rev', '0')", [String(CORE_SCHEMA_VERSION), String(at)])
             db.exec("COMMIT")
           } catch (e) {
@@ -405,6 +435,30 @@ export const makeSqliteStore = (options: SqliteStoreOptions): Effect.Effect<Sqli
       const schema = Number(one<{ value: string }>("SELECT value FROM pva_meta WHERE key = 'schema'")?.value ?? "0")
       if (schema > CORE_SCHEMA_VERSION) {
         return yield* new StoreError({ reason: "unavailable", message: `${options.filename} was written by a newer version of the assistant (household schema ${schema}; this version knows ${CORE_SCHEMA_VERSION})` })
+      }
+      // The store's own indexes are part of being ready: without one, a list or a bulk removal would fail ("no such
+      // index"). A writable start makes a missing one again before it serves; a read-only one (the CLI modes, doctor)
+      // writes nothing and refuses the file.
+      const missing = CORE_INDEXES.filter(([name]) => Number(one<{ n: number }>("SELECT count(*) AS n FROM sqlite_schema WHERE type = 'index' AND name = ?", [name])?.n ?? 0) === 0)
+      if (missing.length > 0) {
+        const names = missing.map(([name]) => name).join(", ")
+        if (readOnly) {
+          return yield* new StoreError({ reason: "unavailable", message: `${options.filename} lacks the household store's own indexes (${names}); the server makes them again when it starts (pnpm start serve)` })
+        }
+        yield* Effect.try({
+          try: () => {
+            db.exec("BEGIN IMMEDIATE")
+            try {
+              for (const [, ddl] of missing) db.exec(ddl)
+              db.exec("COMMIT")
+            } catch (e) {
+              if (db.isTransaction) db.exec("ROLLBACK")
+              throw e
+            }
+          },
+          catch: (e) => failed(`Could not make the household store's indexes in ${options.filename}`, e)
+        })
+        log(`The household store's own indexes ${names} were missing in ${options.filename} and were made again`)
       }
     }
 
@@ -505,8 +559,12 @@ export const makeSqliteStore = (options: SqliteStoreOptions): Effect.Effect<Sqli
         return r === undefined ? undefined : toDoc(r)
       },
       list: (owner, collection, scope, q) => {
-        const { sql, params } = listSql(owner, collection, scope, q)
-        return all<DocRow>(sql, params).map(toDoc)
+        const out: Array<StoredDoc> = []
+        for (const { sql, params } of listSql(owner, collection, scope, q)) {
+          if (out.length >= q.limit) break
+          for (const r of all<DocRow>(sql, [...params, q.limit - out.length])) out.push(toDoc(r))
+        }
+        return out
       },
       page: (owner, collection, scope, after, limit) => {
         const { sql, params } = pageSql(owner, collection, scope, after, limit)
@@ -515,14 +573,14 @@ export const makeSqliteStore = (options: SqliteStoreOptions): Effect.Effect<Sqli
       put: (doc, keys, expect) =>
         (expect === "absent"
           ? run(
-            `INSERT INTO pva_docs (owner, collection, id, scope_kind, scope_id, rev, v, value, created_at, updated_at, updated_by, ${keyColumns.join(", ")})
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ${keyColumns.map(() => "?").join(", ")}) ON CONFLICT DO NOTHING`,
-            [doc.owner, doc.collection, doc.id, doc.scope.kind, scopeIdOf(doc.scope), doc.rev, doc.v, doc.text, doc.createdAt, doc.updatedAt, doc.updatedBy, ...padKeys(keys)]
+            `INSERT INTO pva_docs (owner, collection, id, scope_kind, scope_id, rev, value, created_at, updated_at, updated_by, ${keyColumns.join(", ")})
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ${keyColumns.map(() => "?").join(", ")}) ON CONFLICT DO NOTHING`,
+            [doc.owner, doc.collection, doc.id, doc.scope.kind, scopeIdOf(doc.scope), doc.rev, doc.text, doc.createdAt, doc.updatedAt, doc.updatedBy, ...padKeys(keys)]
           )
           : run(
-            `UPDATE pva_docs SET rev = ?, v = ?, value = ?, updated_at = ?, updated_by = ?, ${keyColumns.map((k) => `${k} = ?`).join(", ")}
+            `UPDATE pva_docs SET rev = ?, value = ?, updated_at = ?, updated_by = ?, ${keyColumns.map((k) => `${k} = ?`).join(", ")}
              WHERE owner = ? AND collection = ? AND id = ? AND rev = ? AND scope_kind = ? AND scope_id = ?`,
-            [doc.rev, doc.v, doc.text, doc.updatedAt, doc.updatedBy, ...padKeys(keys), doc.owner, doc.collection, doc.id, expect, doc.scope.kind, scopeIdOf(doc.scope)]
+            [doc.rev, doc.text, doc.updatedAt, doc.updatedBy, ...padKeys(keys), doc.owner, doc.collection, doc.id, expect, doc.scope.kind, scopeIdOf(doc.scope)]
           )) === 1,
       remove: (owner, collection, id, scope, expect) =>
         run("DELETE FROM pva_docs WHERE owner = ? AND collection = ? AND id = ? AND rev = ? AND scope_kind = ? AND scope_id = ?", [owner, collection, id, expect, scope.kind, scopeIdOf(scope)]) === 1,
@@ -532,8 +590,8 @@ export const makeSqliteStore = (options: SqliteStoreOptions): Effect.Effect<Sqli
         all<DocRow>("SELECT * FROM pva_docs WHERE owner = ? AND collection = ? AND id > ? ORDER BY id LIMIT ?", [owner, collection, afterId, limit]).map(toDoc),
       count: (owner, collection, cap) =>
         Number(one<{ n: number }>("SELECT count(*) AS n FROM (SELECT 1 FROM pva_docs WHERE owner = ? AND collection = ? LIMIT ?)", [owner, collection, cap + 1])?.n ?? 0),
-      rewrite: (doc, v, text, keys) =>
-        void run(`UPDATE pva_docs SET v = ?, value = ?, ${keyColumns.map((k) => `${k} = ?`).join(", ")} WHERE owner = ? AND collection = ? AND id = ?`, [v, text, ...padKeys(keys), doc.owner, doc.collection, doc.id]),
+      rewrite: (doc, text, keys) =>
+        void run(`UPDATE pva_docs SET value = ?, ${keyColumns.map((k) => `${k} = ?`).join(", ")} WHERE owner = ? AND collection = ? AND id = ?`, [text, ...padKeys(keys), doc.owner, doc.collection, doc.id]),
       conversationRows: (conversationId, after, limit) => {
         const { sql, params } = conversationRowsSql(conversationId, after, limit)
         return all<{ owner: string; collection: string; id: string; scope_id: string; rev: number }>(sql, params)
@@ -583,24 +641,47 @@ export const makeSqliteStore = (options: SqliteStoreOptions): Effect.Effect<Sqli
 
     const noBackups = new StoreError({ reason: "unavailable", message: "Backups are made by the server (serve mode); this store makes none" })
 
-    /** Copy a finished backup to the second directory; a failure is kept (a Health issue) and retried by maintenance. */
-    const copyOut = (path: string) =>
-      Effect.gen(function*() {
-        if (copyDir === undefined) return
-        const target = join(copyDir, basename(path))
-        const done = yield* Effect.result(files(`Copying ${path} to ${target}`, () => copyFilePrivately(path, target)))
+    /**
+     * Copy every retained backup the second directory lacks (by name) to it, keeping each one's time (so both
+     * directories prune by the snapshot's age). A failure is kept (a Health issue) until no backup is missing there.
+     */
+    const reconcile = Effect.gen(function*() {
+      if (copyDir === undefined || backupDir === undefined) return
+      const listed = yield* Effect.result(files(`Listing ${backupDir} and ${copyDir}`, async () => {
+        const names = (await readdir(backupDir)).filter((n) => DAILY.test(n) || BEFORE.test(n))
+        const there = await readdir(copyDir).catch((e: unknown) => {
+          if ((e as NodeJS.ErrnoException | null)?.code === "ENOENT") return [] as Array<string>
+          throw e
+        })
+        return names.filter((n) => !there.includes(n)).sort()
+      }))
+      if (listed._tag === "Failure") {
+        copyProblem = listed.failure.message
+        log(`The household backups could not be compared with ${copyDir}: ${listed.failure.message}`)
+        return
+      }
+      let problem: string | undefined
+      for (const name of listed.success) {
+        const from = join(backupDir, name)
+        const target = join(copyDir, name)
+        const done = yield* Effect.result(files(`Copying ${from} to ${target}`, () => copyFilePrivately(from, target)))
         if (done._tag === "Failure") {
-          copyProblem = done.failure.message
+          problem = done.failure.message
           log(`The household backup could not be copied to ${copyDir}: ${done.failure.message}`)
-          return
-        }
-        copyProblem = undefined
-        noteDir(copyDir, done.success)
-      })
+        } else noteDir(copyDir, done.success)
+      }
+      copyProblem = problem
+    })
+
+    /**
+     * One backup operation: one at a time, and its file work uninterruptible inside the permit, so the permit is held
+     * until that work has really settled (an interrupted backup cannot publish after the next one).
+     */
+    const serially = <A, E>(effect: Effect.Effect<A, E>) => backups.withPermits(1)(Effect.uninterruptible(effect))
 
     /** A backup before the first upgrade of this start (never of a new or in-memory file), copied to the second directory too. */
     const backupBeforeUpgrade = (what: string) =>
-      backups.withPermits(1)(Effect.gen(function*() {
+      serially(Effect.gen(function*() {
         if (!serving || backupDir === undefined || backedUpForUpgrade !== undefined) return backedUpForUpgrade
         if (created) return undefined
         const at = yield* Clock.currentTimeMillis
@@ -608,13 +689,14 @@ export const makeSqliteStore = (options: SqliteStoreOptions): Effect.Effect<Sqli
         noteDir(backupDir, yield* files(`Backing up to ${path}`, () => copyDatabase(options.filename, path)))
         backedUpForUpgrade = path
         log(`Household data backed up to ${path} before upgrading ${what}`)
-        yield* copyOut(path)
+        yield* reconcile
         return path
       }))
 
     const pruneBackups = (opts?: { readonly now?: number }) =>
       Effect.gen(function*() {
-        if (memory) return { removed: [], failed: [] } satisfies PruneResult
+        // Only the serving process prunes (a read-only store never removes a backup or changes a file's mode).
+        if (!serving) return { removed: [], failed: [memory ? "The in-memory store has no backups" : "Backups are pruned by the server (serve mode); a read-only store removes none"] } satisfies PruneResult
         const now = opts?.now ?? (yield* Clock.currentTimeMillis)
         const dirs = [backupDir, copyDir].filter((d): d is string => d !== undefined)
         const removed: Array<string> = []
@@ -633,13 +715,13 @@ export const makeSqliteStore = (options: SqliteStoreOptions): Effect.Effect<Sqli
       })
 
     const backup = (opts?: { readonly now?: number }) =>
-      backups.withPermits(1)(Effect.gen(function*() {
+      serially(Effect.gen(function*() {
         if (!serving || backupDir === undefined) return yield* noBackups
         const at = opts?.now ?? (yield* Clock.currentTimeMillis)
         const path = join(backupDir, `household-${localDate(at)}.db`)
         noteDir(backupDir, yield* files(`Backing up to ${path}`, () => copyDatabase(options.filename, path)))
-        yield* copyOut(path)
         yield* pruneBackups({ now: at })
+        yield* reconcile
         return { path }
       }))
 
@@ -648,15 +730,9 @@ export const makeSqliteStore = (options: SqliteStoreOptions): Effect.Effect<Sqli
         ? Effect.succeed(undefined)
         : Effect.tryPromise({ try: () => lastBackupIn(dir), catch: (e) => new StoreError({ reason: "failed", message: `${dir} could not be read: ${e instanceof Error ? e.message : String(e)}`, cause: e }) })
 
-    const copyLatest = backups.withPermits(1)(Effect.gen(function*() {
+    const copyMissing = serially(Effect.gen(function*() {
       if (!serving || backupDir === undefined) return yield* noBackups
-      if (copyDir === undefined) return
-      const names = yield* Effect.tryPromise({
-        try: async () => (await import("node:fs/promises")).readdir(backupDir),
-        catch: (e) => new StoreError({ reason: "failed", message: `${backupDir} could not be read: ${String(e)}`, cause: e })
-      })
-      const newest = names.filter((n) => DAILY.test(n)).sort().at(-1)
-      if (newest !== undefined) yield* copyOut(join(backupDir, newest))
+      yield* reconcile
     }))
 
     // ---- The engine, the rest
@@ -679,7 +755,7 @@ export const makeSqliteStore = (options: SqliteStoreOptions): Effect.Effect<Sqli
       backup,
       lastBackupAt: newestIn(backupDir),
       lastCopyAt: newestIn(copyDir),
-      copyLatest,
+      copyMissing,
       backupDir,
       backupCopyDir: copyDir,
       pruneBackups,

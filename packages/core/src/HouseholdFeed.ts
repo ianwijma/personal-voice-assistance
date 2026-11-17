@@ -2,7 +2,7 @@ import type { HouseholdChange, HouseholdCollectionRef, HouseholdCollectionRows, 
 import { Effect } from "effect"
 import type { EventType, HouseholdEvent } from "./EventBus.ts"
 import { mayRevealPersonScopeTo, membersFrom, personScopesFor } from "./FeedPeople.ts"
-import { type Collection, type HouseholdStore, isStoreFailure, MAX_VALUE_CHARS, type PageCursor, type Row, type ScopeKind, type ScopeRef, scopeKey, type TargetDevice } from "./HouseholdStore.ts"
+import { type Collection, type HouseholdStore, isStoreFailure, MAX_VALUE_CHARS, maxListRows, type PageCursor, type Row, type ScopeKind, type ScopeRef, scopeKey, type TargetDevice } from "./HouseholdStore.ts"
 import type { IsMember } from "./Privacy.ts"
 
 /**
@@ -331,9 +331,13 @@ export const makeHouseholdFeed = (options: {
         return finish()
       }
       const reader = store.reader(moduleId, collection)
+      // A page of at most what one list of the collection may read (`maxListRows`: rows of a large maxChars are fewer)
+      // and what is left of the snapshot's reading budget; a page that budget cut short leaves the collection unfinished,
+      // so the next step names it as cut.
+      const want = Math.min(SNAPSHOT_PAGE_ROWS, SNAPSHOT_ROWS - rowsHere, SNAPSHOT_READ_ROWS - read, maxListRows(collection))
       let rows: ReadonlyArray<Row<unknown>> = []
       try {
-        rows = reader === undefined ? [] : reader.page(scope, after, Math.min(SNAPSHOT_PAGE_ROWS, SNAPSHOT_ROWS - rowsHere))
+        rows = reader === undefined ? [] : reader.page(scope, after, want)
       } catch (e) {
         report(moduleId, collection.name, `could not be read for a page: ${isStoreFailure(e) ? e.message : String(e)}`)
         cut(moduleId, collection.name)
@@ -355,7 +359,7 @@ export const makeHouseholdFeed = (options: {
       }
       rowsHere += rows.length
       const last = rows.at(-1)
-      if (rows.length < SNAPSHOT_PAGE_ROWS || last === undefined) next()
+      if (rows.length < want || last === undefined) next()
       else if (rowsHere >= SNAPSHOT_ROWS) {
         cut(moduleId, collection.name)
         next()

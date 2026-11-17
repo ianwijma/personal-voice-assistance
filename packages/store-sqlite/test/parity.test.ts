@@ -7,7 +7,7 @@
 // another shape at the same version, a new version with a migration), a core service's collections, conversation rows
 // and their removal, and the numbers SQLite's own JSON parser would not keep. PARITY_SEEDS=n runs more programs.
 import { assert, describe, it } from "@effect/vitest"
-import { type Collection, CurrentTurn, defineCollection, type HouseholdStore, MAX_LIST_LIMIT, type ModuleStorage, type Released, type Row, type StoreTx, type TurnContext } from "@pva/core"
+import { type Collection, CurrentTurn, defineCollection, type HouseholdStore, MAX_LIST_LIMIT, maxListRows, type ModuleStorage, type Released, type Row, type StoreTx, type TurnContext } from "@pva/core"
 import { makeMemoryHouseholdStore } from "@pva/core/testing"
 import { Cause, Effect, Exit, Schema } from "effect"
 import { TestClock } from "effect/testing"
@@ -355,9 +355,9 @@ const dump = (s: HouseholdStore, version: () => number) =>
       const out: Array<unknown> = []
       let after: { updatedAt: number; createdAt: number; id: string } | undefined
       for (;;) {
-        const page = reader.page(scope, after, MAX_LIST_LIMIT)
+        const page = reader.page(scope, after, maxListRows(c))
         out.push(...page.map(rowOf))
-        if (page.length < MAX_LIST_LIMIT) return out
+        if (page.length < maxListRows(c)) return out
         const last = page.at(-1)!
         after = { updatedAt: last.updatedAt, createdAt: last.createdAt, id: last.id }
       }

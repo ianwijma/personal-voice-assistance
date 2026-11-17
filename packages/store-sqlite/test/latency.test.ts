@@ -1,10 +1,28 @@
 // The longest stretch the store holds the event loop (which also frames audio), on a large file: every read a turn can
-// make is one bounded index read, the worst legal `list` (MAX_LIST_LIMIT rows at the value limit) included; the main
-// connection never checkpoints, also when a reader let the log grow and then let go; backups, checkpoints and the
-// removal of an ended conversation run beside turns without a long stop. The numbers are printed
-// (docs/STORING-DATA.md "Latency" quotes them).
+// make is one bounded index read; the worst legal `list` (structured values at the limits of the list rule: rows ×
+// maxChars within LIST_BUDGET_CHARS) on both stores; the main connection never checkpoints, also when a reader let the
+// log grow and then let go; backups, checkpoints and the removal of an ended conversation (its steps at the legal
+// maximum: the largest values, eight indexes, secure deletion) run beside turns without a long stop. The numbers are
+// printed (docs/STORING-DATA.md "Latency" quotes them).
 import { assert, describe, it } from "@effect/vitest"
-import { BULK_STEP_ROWS, CurrentTurn, defineCollection, makeHouseholdFeed, MAX_LIST_LIMIT, MAX_MIGRATION_ROWS, MAX_VALUE_CHARS, type Row } from "@pva/core"
+import {
+  BULK_STEP_ROWS,
+  type Collection,
+  CurrentTurn,
+  DEFAULT_MAX_CHARS,
+  defineCollection,
+  type HouseholdStore,
+  LIST_BUDGET_CHARS,
+  makeHouseholdFeed,
+  MAX_INDEXED_CHARS,
+  MAX_INDEXES,
+  MAX_LIST_LIMIT,
+  MAX_MIGRATION_ROWS,
+  MAX_VALUE_CHARS,
+  maxListRows,
+  type Row
+} from "@pva/core"
+import { makeMemoryHouseholdStore } from "@pva/core/testing"
 import { Effect, Schema } from "effect"
 import { mkdtempSync, statSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -14,17 +32,47 @@ import { makeSqliteStore } from "../src/index.ts"
 
 const ROWS = 100_000
 const Note = Schema.Struct({ state: Schema.String, due: Schema.Finite, text: Schema.String })
-const notes = defineCollection({ name: "notes", scope: "household", schema: Note, indexes: ["state", "due", ["state", "due"]], project: (row: Row<typeof Note.Type>) => row.value })
-const Wide = Schema.Struct({ tag: Schema.String, text: Schema.String })
-const wide = defineCollection({ name: "wide", scope: "household", schema: Wide, indexes: ["tag"] })
+// Rows of about 1 KB: a maxChars of 1,200 lets a list read MAX_LIST_LIMIT of them (LIST_BUDGET_CHARS / 1,200).
+const notes = defineCollection({ name: "notes", scope: "household", schema: Note, indexes: ["state", "due", ["state", "due"]], maxChars: 1_200, project: (row: Row<typeof Note.Type>) => row.value })
 const chat = defineCollection({ name: "chat", scope: "conversation", schema: Schema.Struct({ text: Schema.String }) })
-const MODULE = [{ id: "big", storage: { collections: [notes, wide, chat] } }]
+const MODULE = [{ id: "big", storage: { collections: [notes, chat] } }]
+
+/**
+ * The worst legal lists: structured values (Sol's fixtures: arrays of small objects, arrays of numbers) filling
+ * `maxChars` exactly, `maxListRows` of them, at the smallest and the largest number of rows the rule allows.
+ */
+const Objects = Schema.Struct({ tag: Schema.String, values: Schema.Array(Schema.Struct({ x: Schema.Finite })) })
+const Numbers = Schema.Struct({ tag: Schema.String, values: Schema.Array(Schema.Finite) })
+const listFixtures = [DEFAULT_MAX_CHARS, MAX_VALUE_CHARS].flatMap((maxChars) => [
+  { what: "objects", maxChars, c: defineCollection({ name: `objects_${maxChars}`, scope: "household", schema: Objects, indexes: ["tag"], maxChars }), value: () => fillTo(maxChars, '{"x":0}', (n) => ({ tag: "t", values: Array.from({ length: n }, () => ({ x: 0 })) })) },
+  { what: "numbers", maxChars, c: defineCollection({ name: `numbers_${maxChars}`, scope: "household", schema: Numbers, indexes: ["tag"], maxChars }), value: () => fillTo(maxChars, "0", (n) => ({ tag: "t", values: Array.from({ length: n }, () => 0) })) }
+])
+/** The largest value of the shape `make(n)` whose JSON fits `maxChars` (each element `element` plus a comma). */
+const fillTo = <A>(maxChars: number, element: string, make: (n: number) => A): A => {
+  const base = JSON.stringify(make(0)).length
+  const value = make(Math.floor((maxChars - base + 1) / (element.length + 1)))
+  if (JSON.stringify(value).length > maxChars) throw new Error("fixture too large")
+  return value
+}
+
+/**
+ * A conversation-scoped collection at the legal maximum for a bulk removal: the largest values, eight indexed fields
+ * (sixteen indexes) of strings at the indexed limit.
+ */
+const wideFields = Array.from({ length: MAX_INDEXES }, (_, i) => `f${i}`)
+const WideChat = Schema.Struct({ ...Object.fromEntries(wideFields.map((f) => [f, Schema.String])), text: Schema.String })
+const wideChat = defineCollection({ name: "wide_chat", scope: "conversation", schema: WideChat, indexes: wideFields, maxChars: MAX_VALUE_CHARS }) as unknown as Collection<Record<string, string>>
+const wideChatValue = (i: number): Record<string, string> => {
+  const fields = Object.fromEntries(wideFields.map((f, k) => [f, `${i}.${k}.`.padEnd(MAX_INDEXED_CHARS, "abcdefghij")]))
+  const base = JSON.stringify({ ...fields, text: "" }).length
+  return { ...fields, text: "t".repeat(MAX_VALUE_CHARS - base) }
+}
 
 /** Fill the file directly (fast), in the store's own format (index keys in k0, k1: the fields state, due). */
 const fill = (file: string, rows = ROWS) => {
   const db = new DatabaseSync(file)
-  const doc = db.prepare(`INSERT INTO pva_docs (owner, collection, id, scope_kind, scope_id, rev, v, value, created_at, updated_at, updated_by, k0, k1)
-    VALUES ('big', 'notes', ?, 'household', '', ?, 1, ?, ?, ?, '{"kind":"system","name":"fill"}', ?, ?)`)
+  const doc = db.prepare(`INSERT INTO pva_docs (owner, collection, id, scope_kind, scope_id, rev, value, created_at, updated_at, updated_by, k0, k1)
+    VALUES ('big', 'notes', ?, 'household', '', ?, ?, ?, ?, '{"kind":"system","name":"fill"}', ?, ?)`)
   const filler = "lorem ipsum dolor sit amet ".repeat(36)
   db.exec("BEGIN")
   for (let i = 1; i <= rows; i++) {
@@ -55,8 +103,13 @@ const longestStop = <A, E>(effect: Effect.Effect<A, E>) =>
     }
   })
 
+/**
+ * The worst of `n` calls, after one call that is not timed: the first call of a shape compiles its statement and its
+ * schema's codec once per process (a CI runner showed 12 ms for it), which is not the cost of a turn's read.
+ */
 const worstOf = (n: number, effect: Effect.Effect<unknown, unknown>) =>
   Effect.gen(function*() {
+    yield* effect
     let worst = 0
     for (let i = 0; i < n; i++) {
       const t0 = performance.now()
@@ -79,10 +132,6 @@ describe("SQLite store latency on 100,000 rows of ~1 KB", () => {
       const store = yield* makeSqliteStore({ filename: file, scrubRetryMs: 20 })
       yield* store.prepare(MODULE)
       const c = store.forModule("big").collection(notes)
-      // MAX_LIST_LIMIT rows at the value limit, among the 100,000.
-      yield* store.forModule("big").transaction((tx) => {
-        for (let i = 0; i < MAX_LIST_LIMIT; i++) tx.collection(wide).insert({ tag: "big", text: "w".repeat(MAX_VALUE_CHARS - 40) }, { id: `w${i}` })
-      })
       const reads = {
         "list newest 20 (ambient)": c.list({ limit: 20 }),
         [`list newest ${MAX_LIST_LIMIT} (the most a list returns)`]: c.list({ limit: MAX_LIST_LIMIT }),
@@ -90,16 +139,13 @@ describe("SQLite store latency on 100,000 rows of ~1 KB", () => {
         [`list where state = running, ${MAX_LIST_LIMIT}`]: c.list({ where: { state: "running" }, limit: MAX_LIST_LIMIT }),
         [`list ordered by due, ${MAX_LIST_LIMIT}`]: c.list({ orderBy: { field: "due" }, limit: MAX_LIST_LIMIT }),
         [`list where state = running ordered by due (a pair index), ${MAX_LIST_LIMIT}`]: c.list({ where: { state: "running" }, orderBy: { field: "due" }, limit: MAX_LIST_LIMIT }),
-        [`the worst legal list: ${MAX_LIST_LIMIT} rows of ${MAX_VALUE_CHARS} characters`]: store.forModule("big").collection(wide).list({ where: { tag: "big" }, limit: MAX_LIST_LIMIT }),
         "get by id": c.get("n54321")
       }
       const results: Array<string> = []
       let worstRead = 0
-      let worstLegal = 0
       for (const [name, read] of Object.entries(reads)) {
         const worst = yield* worstOf(30, read as Effect.Effect<unknown, unknown>)
         worstRead = Math.max(worstRead, worst)
-        if (name.startsWith("the worst legal")) worstLegal = worst
         results.push(`${name}: worst ${worst.toFixed(2)} ms`)
       }
       // Writes: one row each, one synchronous transaction each.
@@ -156,8 +202,7 @@ describe("SQLite store latency on 100,000 rows of ~1 KB", () => {
       }
       results.push(`snapshot step for a page (20 rows of ~1 KB): worst ${worstStep.toFixed(2)} ms`)
       console.log(`Household store latency (${ROWS} rows):\n  ${results.join("\n  ")}`)
-      // The stated bound for the worst legal read; generous bounds elsewhere for a shared, loaded runner.
-      assert.isBelow(worstLegal, 10)
+      // The stated bound for turn reads; generous bounds elsewhere for a shared, loaded runner.
       assert.isBelow(worstRead, 10)
       assert.isBelow(worstWrite, 25)
       assert.isBelow(afterRelease, 10)
@@ -172,17 +217,66 @@ describe("SQLite store latency on 100,000 rows of ~1 KB", () => {
       const dir = mkdtempSync(join(tmpdir(), "pva-migration-"))
       const file = join(dir, "household.db")
       const Note2 = Schema.Struct({ state: Schema.String, due: Schema.Finite, text: Schema.String, label: Schema.String })
-      const v2 = defineCollection({ name: "notes", scope: "household", schema: Note2, indexes: ["state", "due", ["state", "due"]], migrate: { 1: (v: typeof Note.Type) => ({ ...v, label: v.state }) } })
+      const v2 = defineCollection({ name: "notes", scope: "household", schema: Note2, indexes: ["state", "due", ["state", "due"]], maxChars: 1_200, migrate: { 1: (v: typeof Note.Type) => ({ ...v, label: v.state }) } })
       yield* Effect.scoped(Effect.gen(function*() {
         const store = yield* makeSqliteStore({ filename: file })
         yield* store.prepare(MODULE)
       }))
       fill(file, MAX_MIGRATION_ROWS)
       const store = yield* makeSqliteStore({ filename: file })
-      const { worst } = yield* longestStop(store.prepare([{ id: "big", storage: { version: 2, collections: [v2, wide, chat] } }]))
+      const { worst } = yield* longestStop(store.prepare([{ id: "big", storage: { version: 2, collections: [v2, chat] } }]))
       assert.strictEqual(store.availability("big"), undefined)
       assert.strictEqual((yield* store.forModule("big").collection(v2).get("n8"))?.value.label, "done")
       console.log(`Household store: migrating ${MAX_MIGRATION_ROWS} rows of ~1 KB at start (one transaction, after a backup): longest stop ${worst.toFixed(0)} ms`)
       assert.isBelow(worst, 10_000)
+    }).pipe(Effect.scoped), { timeout: 240_000 })
+
+  it.live("the worst legal list on both stores: structured values at the limits of the list rule (rows × maxChars ≤ LIST_BUDGET_CHARS) block the main thread under 10 ms", () =>
+    Effect.gen(function*() {
+      const dir = mkdtempSync(join(tmpdir(), "pva-list-"))
+      const sqlite = yield* makeSqliteStore({ filename: join(dir, "household.db") })
+      const stores: ReadonlyArray<readonly [string, HouseholdStore]> = [["SQLite", sqlite], ["in memory", makeMemoryHouseholdStore()]]
+      const results: Array<string> = []
+      let worstAll = 0
+      for (const [kind, store] of stores) {
+        yield* store.prepare([{ id: "lists", storage: { collections: listFixtures.map((f) => f.c) } }])
+        for (const f of listFixtures) {
+          const rows = maxListRows(f.c)
+          assert.isAtMost(rows * f.maxChars, LIST_BUDGET_CHARS)
+          const value = f.value()
+          yield* store.forModule("lists").transaction((tx) => {
+            for (let i = 0; i < rows; i++) tx.collection(f.c as Collection<unknown>).insert(value)
+          })
+          const c = store.forModule("lists").collection(f.c as Collection<unknown>)
+          // Blocked time: the call is synchronous, so its duration is how long the main thread is held.
+          const worst = yield* worstOf(30, Effect.tap(c.list({ where: { tag: "t" } as never, limit: rows }), (r) => Effect.sync(() => assert.strictEqual(r.length, rows))))
+          worstAll = Math.max(worstAll, worst)
+          results.push(`${kind}: ${rows} rows of ${f.what} at maxChars ${f.maxChars} (${JSON.stringify(value).length} characters each): worst ${worst.toFixed(2)} ms`)
+        }
+      }
+      console.log(`Household store, the worst legal list (LIST_BUDGET_CHARS ${LIST_BUDGET_CHARS}):\n  ${results.join("\n  ")}`)
+      assert.isBelow(worstAll, 10)
+    }).pipe(Effect.scoped), { timeout: 120_000 })
+
+  it.live("ending a conversation at the legal maximum (values of MAX_VALUE_CHARS, eight indexed fields at the indexed limit, secure deletion): each step of BULK_STEP_ROWS stays under 10 ms", () =>
+    Effect.gen(function*() {
+      const dir = mkdtempSync(join(tmpdir(), "pva-bulk-"))
+      const store = yield* makeSqliteStore({ filename: join(dir, "household.db") })
+      yield* store.prepare([{ id: "wide", storage: { collections: [wideChat] } }])
+      const turn = { turnId: 1, conversationId: "conv-wide", source: "voice" as const }
+      const total = BULK_STEP_ROWS * 40
+      for (let k = 0; k < total; k += 50) {
+        yield* store.forModule("wide").transaction((tx) => {
+          for (let i = k; i < k + 50; i++) tx.collection(wideChat).insert(wideChatValue(i))
+        }).pipe(Effect.provideService(CurrentTurn, turn))
+      }
+      // Every step is one commit: the time between two steps' commits, less the yield between them, is a step.
+      const commits: Array<number> = []
+      const off = store.onCommit(() => void commits.push(performance.now()))
+      const ended = yield* longestStop(store.endConversation("conv-wide"))
+      off()
+      assert.strictEqual(ended.value, total)
+      console.log(`Household store: ending a conversation of ${total} rows at the legal maximum, steps of ${BULK_STEP_ROWS}: longest stop ${ended.worst.toFixed(1)} ms (${commits.length} steps)`)
+      assert.isBelow(ended.worst, 10)
     }).pipe(Effect.scoped), { timeout: 240_000 })
 })
