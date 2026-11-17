@@ -130,19 +130,41 @@ const start = async (
  */
 const manualClock = () => {
   let t = 0
-  return { turnTrace: makeTurnTrace({ now: () => t }), set: (to: number) => void (t = to) }
+  let reads = 0
+  return {
+    turnTrace: makeTurnTrace({
+      now: () => {
+        reads++
+        return t
+      }
+    }),
+    set: (to: number) => void (t = to),
+    /** How often the server read the clock (a stamp reads it once): a barrier for "stamped". */
+    reads: () => reads
+  }
 }
 /** Far from 0: a time line entry stamped before the jump is −`JUMP` relative to a turn after it. */
 const JUMP = 50_000
 
-/** A fake TypeSafe (`/v1/systemone`) that picks Alpha after `delayMs`, and the `start` options that route by it. */
-const slowTypeSafe = async (delayMs: number) => {
+/**
+ * A fake TypeSafe (`/v1/systemone`) that picks Alpha, and the `start` options that route by it. The first request is
+ * held until `release()` (a routing call the test keeps pending for as long as it needs); later ones are answered at
+ * once. `close` releases it and stops the server.
+ */
+const heldTypeSafe = async () => {
+  let requests = 0
+  let release = () => {}
+  const held = new Promise<void>((resolve) => (release = resolve))
   const jev = Http.createServer((req, res) => {
     req.resume()
-    req.on("end", () => setTimeout(() => {
-      res.writeHead(200, { "content-type": "application/json" })
-      res.end(JSON.stringify({ model: "jev-1", answers: { assistant: { type: "choice", choice: "alpha", confidence: 0.9, probabilities: { alpha: 0.9, bravo: 0.1 } }, fits: { type: "noul", noul: 0.9 } }, usage: { input_tokens: 1, output_tokens: 1 } }))
-    }, delayMs))
+    req.on("end", () => {
+      const first = ++requests === 1
+      void (first ? held : Promise.resolve()).then(() => {
+        if (res.destroyed) return
+        res.writeHead(200, { "content-type": "application/json" })
+        res.end(JSON.stringify({ model: "jev-1", answers: { assistant: { type: "choice", choice: "alpha", confidence: 0.9, probabilities: { alpha: 0.9, bravo: 0.1 } }, fits: { type: "noul", noul: 0.9 } }, usage: { input_tokens: 1, output_tokens: 1 } }))
+      })
+    })
   })
   await new Promise<void>((resolve) => jev.listen(0, "127.0.0.1", resolve))
   return {
@@ -150,12 +172,23 @@ const slowTypeSafe = async (delayMs: number) => {
       env: { TYPESAFE_ROUTING: "true", TYPESAFE_API_KEY: "ts-test-key", TYPESAFE_BASE_URL: `http://127.0.0.1:${(jev.address() as AddressInfo).port}` },
       withoutPhrase: { mode: "typesafe", fallback: "alpha", giveUpMs: 2_000 }
     },
+    requests: () => requests,
+    release: () => release(),
     close: () => {
+      release()
       jev.closeAllConnections()
       jev.close()
     }
   }
 }
+
+/**
+ * The precondition of the "while routing is pending" tests: the held call was still pending when the stream or loop
+ * stopped. Had TypeSafe given up first (2 s), the old final would have been answered (by the fallback) and closed
+ * normally, and the test would prove nothing: then it fails here.
+ */
+const neverAnswered = (client: ScriptedClient, text: string) =>
+  expect(client.messages.filter((m) => m.type === "turn.start" && (m as { userText?: string }).userText === text)).toEqual([])
 
 const connect = async (deviceId?: string) => {
   const client = await ScriptedClient.connect({ url: server!.url, ...(deviceId !== undefined ? { deviceId } : {}) })
@@ -286,8 +319,10 @@ describe("serve: one recogniser per device, from its hearer (WP-11)", () => {
     const client = await device("device-a")
     await until("device-a hearing", () => streamOf(fake, "device-a") !== undefined)
     const old = streamOf(fake, "device-a")!
-    // The old stream's utterance is stamped at 0; it is closed by the switch.
+    // The old stream's utterance is stamped at 0 (a barrier: both stamps read the clock); it is closed by the switch.
+    const read = clock.reads()
     fake.emit(old, { _tag: "SpeechStarted" }, { _tag: "Interim", text: "hey alpha what" })
+    await until("the old utterance stamped", () => clock.reads() >= read + 2)
     await saveHearing("alpha", { model: "model-c" })
     await until("switched to model-c", () => streamOf(fake, "device-a")?.model === "model-c" && old.closed, 3_000)
     // Everything of the new utterance is recorded at JUMP.
@@ -306,8 +341,8 @@ describe("serve: one recogniser per device, from its hearer (WP-11)", () => {
   })
 
   it("a start the old stream stamped but never delivered (dispatch busy with a routing call) gives the next stream's utterance no times", async () => {
-    // TypeSafe answers after 400 ms: the final below keeps the session's dispatch busy while the next start comes in.
-    const jev = await slowTypeSafe(400)
+    // TypeSafe's answer is held: the final below keeps the session's dispatch busy while the next start comes in.
+    const jev = await heldTypeSafe()
     try {
       const fake = fakeRecognisers()
       const clock = manualClock()
@@ -318,12 +353,15 @@ describe("serve: one recogniser per device, from its hearer (WP-11)", () => {
       await until("device-a hearing", () => streamOf(fake, "device-a") !== undefined)
       const old = streamOf(fake, "device-a")!
       fake.emit(old, { _tag: "SpeechStarted" }, { _tag: "EndOfTurn", text: "what is the weather" })
-      await sleep(50)
-      // Stamped on arrival, still queued behind the routing call; then the switch replaces the stream.
+      await until("the routing call", () => jev.requests() === 1)
+      // Stamped on arrival (a barrier: both stamps read the clock), still queued behind the routing call; then the
+      // switch replaces the stream while that call is pending.
+      const read = clock.reads()
       fake.emit(old, { _tag: "SpeechStarted" }, { _tag: "Interim", text: "and tomorrow" })
-      await sleep(20)
+      await until("the next start stamped", () => clock.reads() >= read + 2)
       await saveHearing("alpha", { model: "model-c" })
       await until("switched to model-c", () => streamOf(fake, "device-a")?.model === "model-c" && old.closed, 3_000)
+      neverAnswered(client, "what is the weather")
       // Everything of the new utterance (and its routing call) is recorded at JUMP; the dropped start was at 0.
       clock.set(JUMP)
       const from = client.messages.length
@@ -337,13 +375,14 @@ describe("serve: one recogniser per device, from its hearer (WP-11)", () => {
       // Its own start and first words (JUMP, as its end of turn), not the dropped ones (−JUMP).
       expect(startedAt).toBe(0)
       expect(firstInterimAt).toBe(0)
+      neverAnswered(client, "what is the weather")
     } finally {
       jev.close()
     }
   })
 
   it("an engine reload while a final awaits TypeSafe closes that utterance: the next one (by its phrase) gets its own start", async () => {
-    const jev = await slowTypeSafe(600)
+    const jev = await heldTypeSafe()
     try {
       const fake = fakeRecognisers()
       const clock = manualClock()
@@ -354,11 +393,12 @@ describe("serve: one recogniser per device, from its hearer (WP-11)", () => {
       await until("device-a hearing", () => streamOf(fake, "device-a") !== undefined)
       const old = streamOf(fake, "device-a")!
       fake.emit(old, { _tag: "SpeechStarted" }, { _tag: "EndOfTurn", text: "what is the weather" })
-      await sleep(50)
-      // While the routing call is pending: nobody answers without a phrase now, and the engines reload.
+      await until("the routing call", () => jev.requests() === 1)
+      // While the routing call is pending (held): nobody answers without a phrase now, and the engines reload.
       await saveOwn("device-a", { withoutPhrase: { mode: "nobody" } })
       expect((await Effect.runPromise(server!.handle.engine.reload)).ok).toBe(true)
       await until("a new stream", () => streamOf(fake, "device-a") !== undefined && streamOf(fake, "device-a") !== old && old.closed, 5_000)
+      neverAnswered(client, "what is the weather")
       // Everything of the new utterance is recorded at JUMP; the reloaded-away one at 0.
       clock.set(JUMP)
       const from = client.messages.length
@@ -374,6 +414,7 @@ describe("serve: one recogniser per device, from its hearer (WP-11)", () => {
       // Its own start and first words (JUMP, as its end of turn), not the reloaded-away utterance's (−JUMP).
       expect(startedAt).toBe(0)
       expect(line.find((x) => x.name === "firstInterim")!.at).toBe(0)
+      neverAnswered(client, "what is the weather")
     } finally {
       jev.close()
     }
