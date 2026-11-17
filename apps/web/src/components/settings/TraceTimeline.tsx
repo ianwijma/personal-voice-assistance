@@ -1,5 +1,5 @@
 "use client"
-import { type KeyboardEvent, type ReactNode, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react"
+import { type KeyboardEvent, type ReactNode, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react"
 import type { TraceEvent, TraceInfo } from "@pva/protocol"
 import { firstSoundMs } from "@/lib/state.ts"
 import {
@@ -254,6 +254,8 @@ function Chart({ t, events, rows, mode, ix, bounds, zeroText, plotRef, width }: 
   const audible = events.find((e) => e.name === "audible")
   const linked = new Set([ix.hover, ix.rowHover, ix.pin].filter((x): x is number => x !== undefined))
   const posOf = useMemo(() => new Map(nav.order.map((i, p) => [i, p])), [nav])
+  /** Per chart: several rows can be open at once. */
+  const noteId = `${useId()}-short-note`
 
   const onKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
     if (e.key === "Escape") {
@@ -283,7 +285,7 @@ function Chart({ t, events, rows, mode, ix, bounds, zeroText, plotRef, width }: 
   const shortNote = axis.shortened
     ? `Before ${signed(axis.segments[0]!.shortened ? axis.segments[0]!.to : axis.min)} ms and after ${signed(axis.segments[axis.segments.length - 1]!.shortened ? axis.segments[axis.segments.length - 1]!.from : axis.max)} ms the axis is shortened; times in the list are exact.`
     : undefined
-  const describedBy = shortNote === undefined ? undefined : "timeline-short-note"
+  const describedBy = shortNote === undefined ? undefined : noteId
   const legendKinds = new Set(events.map((e) => shapeOf(e)))
   const mini = (label: ReactNode, glyph: ReactNode) => <span className="inline-flex items-center gap-1.5">{glyph}{label}</span>
 
@@ -297,7 +299,7 @@ function Chart({ t, events, rows, mode, ix, bounds, zeroText, plotRef, width }: 
         data-mode={mode}
         onKeyDown={onKeyDown}
       >
-        {shortNote !== undefined && <span id="timeline-short-note" className="sr-only">{shortNote}</span>}
+        {shortNote !== undefined && <span id={noteId} className="sr-only" data-testid="timeline-short-note">{shortNote}</span>}
         <div className={GRID}>
           <div />
           <div className="pr-4"><div ref={plotRef} className="relative"><Header axis={axis} zeroText={zeroText} audible={audible} end={end} /></div></div>

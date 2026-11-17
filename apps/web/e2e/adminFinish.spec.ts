@@ -494,6 +494,27 @@ test.describe("Diagnostics › Latency", () => {
     await row(page, 36).getByTestId("trace-toggle").click()
   })
 
+  test("two open rows: no id repeats, and each chart is described by its own shortened-axis note", async ({ page, baseURL }) => {
+    await loginAdmin(page, baseURL, "#settings/diagnostics/latency")
+    await row(page, 43).getByTestId("trace-toggle").click()
+    await row(page, 45).getByTestId("trace-toggle").click()
+    const details = page.getByTestId("trace-detail-row")
+    await expect(details).toHaveCount(2)
+    const ids = await details.evaluateAll((rows) => rows.flatMap((r) => [...r.querySelectorAll("[id]")].map((el) => el.id)))
+    expect(ids.length).toBeGreaterThan(0)
+    expect(ids.filter((id, i) => ids.indexOf(id) !== i)).toEqual([])
+    const charts = details.getByTestId("trace-timeline")
+    await expect(charts).toHaveCount(2)
+    for (const chart of await charts.all()) {
+      // The description it names is the note inside this chart (whose ranges are this turn's).
+      const own = await chart.evaluate((el) => {
+        const note = el.querySelector("[data-testid=timeline-short-note]")
+        return note !== null && el.getAttribute("aria-describedby") === note.id && document.getElementById(note.id) === note
+      })
+      expect(own).toBe(true)
+    }
+  })
+
   test("changed since: the snapshot differs from the assistant now; changing the assistant adds it live", async ({ page, baseURL }) => {
     await loginAdmin(page, baseURL, "#settings/diagnostics/latency")
     // Turn 41 (T3): the voice was Lessac then, it is Heart now. Turn 42 (Jeff): a bigger model then. Turn 39: Keuken heard it then.

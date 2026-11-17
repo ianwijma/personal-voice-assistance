@@ -425,6 +425,8 @@ export const makeClaudeAgent = async (options: ClaudeAgentOptions): Promise<Clau
           /** The trace clock (`input.now`), the scale of every mark and time-line entry of the turn. */
           const clock = input.now ?? (() => performance.now())
           let textSinceTool = false
+          /** This call's first text was recorded on the time line. */
+          let firstToken = false
           let toolCalls = 0
           let callIds = 0
           const tooMany = input.maxToolRounds
@@ -480,6 +482,10 @@ export const makeClaudeAgent = async (options: ClaudeAgentOptions): Promise<Clau
                   const event = m.event
                   if (event.type === "content_block_delta" && event.delta.type === "text_delta" && event.delta.text.length > 0) {
                     input.mark("llmFirstToken")
+                    if (!firstToken) {
+                      firstToken = true
+                      addTraceEvent(input.trace, "llmFirstToken", clock())
+                    }
                     textSinceTool = true
                     emit({ _tag: "TextDelta", text: event.delta.text })
                   }
@@ -530,6 +536,11 @@ export const makeClaudeAgent = async (options: ClaudeAgentOptions): Promise<Clau
               reject(new SessionError(`${AGENT_NAME} stopped: ${reason}`, "unavailable"))
             }
             input.mark("llmRequestSent")
+            // Its own entry too: after a failed agent's request in the same turn (a fallback) the first-only mark is
+            // that agent's, and the time line pairs this call's `llmDone` with the latest request. With an entry the
+            // published time line leaves the mark out (no duplicate).
+            addTraceEvent(input.trace, "llmRequestSent", clock())
+            firstToken = false
             try {
               session!.send(text, { message: onMessage, died }, toolHandler)
             } finally {

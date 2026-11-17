@@ -159,6 +159,8 @@ export interface SessionDispatcher<C extends DispatchTarget> {
   readonly owner: () => string | undefined
   /** The assistant whose conversation has the open utterance (`undefined`: none, or not delivered yet). */
   readonly delivering: () => string | undefined
+  /** An utterance is open here (its `SpeechStarted` came, its `EndOfTurn` has not been handled to the end). */
+  readonly hasOpen: () => boolean
   /** Which assistant a turn belongs to (turn ids must be unique across the session's conversations). */
   readonly assistantOfTurn: (turnId: number) => string | undefined
   /** How the latest utterance or typed message reached `assistant`. */
@@ -487,6 +489,7 @@ export const makeSessionDispatcher = <C extends DispatchTarget>(
     conversations: () => made,
     owner: () => owner()?.assistant,
     delivering: () => open?.delivered,
+    hasOpen: () => open !== undefined,
     assistantOfTurn: (turnId) => turns.get(turnId),
     routeOf: (assistant) => routes.get(assistant),
     routedAtOf: (assistant) => {

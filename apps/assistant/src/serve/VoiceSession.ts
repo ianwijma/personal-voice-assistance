@@ -722,40 +722,40 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
      * route gate drops reaches no page, no history, no agent and no recording (`heard.discard`); its text goes only
      * to admin pages with the phrase tester on (`wake.heard`).
      */
-    /** The open utterance's times (trace clock), shared by its events; see `UtteranceTimes`. */
-    let utterance: UtteranceTimes | undefined
     /**
-     * Stamp the recogniser's events where they enter the session: as they arrive (`stamped`, ahead of the buffer that
-     * `onStt`'s serial dispatch drains), before any gate or a pending routing call can hold them back.
+     * Stamp the recogniser's events where they enter the session: as they arrive, ahead of the buffer that `onStt`'s
+     * serial dispatch drains, before any gate or a pending routing call can hold them back. `onStt` awaits dispatch (a
+     * TypeSafe call may take a while), so the stamp runs on the producer side of an unbounded buffer, in its own fiber
+     * in the stream's scope: same order (one FIFO), a failure or end after the events before it, interrupted with the
+     * stream. The recognisers already push into an unbounded queue (`Stream.callback`), so the buffer takes no
+     * backpressure away from them. The open utterance's times (`UtteranceTimes`, shared by its events) belong to that
+     * one stream: the producer touches nothing else of the session, and a replacement stream (a switch, a failure, a
+     * new build) starts with none, whatever the old one had stamped but not yet delivered.
      */
-    const stamp = (event: SttEvent): SttEvent => {
-      switch (event._tag) {
-        case "SpeechStarted":
-          if (utterance === undefined) utterance = { startedAt: options.turnTrace.now() }
-          return utterance === undefined || event.heard === utterance ? event : { ...event, heard: utterance }
-        case "Interim":
-          if (utterance !== undefined && utterance.firstInterimAt === undefined && event.text.trim() !== "") {
-            utterance.firstInterimAt = options.turnTrace.now()
+    const stamped = <E>(events: Stream.Stream<SttEvent, E>): Stream.Stream<SttEvent, E> =>
+      Stream.suspend(() => {
+        let utterance: UtteranceTimes | undefined
+        const stamp = (event: SttEvent): SttEvent => {
+          switch (event._tag) {
+            case "SpeechStarted":
+              if (utterance === undefined) utterance = { startedAt: options.turnTrace.now() }
+              return event.heard === utterance ? event : { ...event, heard: utterance }
+            case "Interim":
+              if (utterance !== undefined && utterance.firstInterimAt === undefined && event.text.trim() !== "") {
+                utterance.firstInterimAt = options.turnTrace.now()
+              }
+              return event
+            case "EagerEndOfTurn":
+            case "TurnResumed":
+              // On the event itself (an utterance may have several): the dispatcher may hold it for the routing call.
+              return event.heardAt !== undefined ? event : { ...event, heardAt: options.turnTrace.now() }
+            case "EndOfTurn":
+              utterance = undefined
+              return event
           }
-          return event
-        case "EagerEndOfTurn":
-        case "TurnResumed":
-          // On the event itself (an utterance may have several): the dispatcher may hold it for the routing call.
-          return event.heardAt !== undefined ? event : { ...event, heardAt: options.turnTrace.now() }
-        case "EndOfTurn":
-          utterance = undefined
-          return event
-        default:
-          return event
-      }
-    }
-    /**
-     * The recogniser's events, stamped as they arrive. `onStt` awaits dispatch (a TypeSafe call may take a while), so
-     * the stamp runs on the producer side of an unbounded buffer, in its own fiber in the stream's scope: same order
-     * (one FIFO), a failure or end after the events before it, interrupted with the stream. The recognisers already push
-     * into an unbounded queue (`Stream.callback`), so the buffer takes no backpressure away from them.
-     */
-    const stamped = <E>(events: Stream.Stream<SttEvent, E>) => events.pipe(Stream.map(stamp), Stream.buffer({ capacity: "unbounded" }))
+        }
+        return events.pipe(Stream.map(stamp), Stream.buffer({ capacity: "unbounded" }))
+      })
     const onStt = (event: SttEvent): Effect.Effect<void> =>
       Effect.suspend(() => {
         const t = now()
@@ -833,8 +833,6 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
 
     /** An utterance closed outside `onStt` (a recogniser switch, a new build): it holds the turn no longer. */
     const utteranceDropped = () => {
-      // Its times too: the next `SpeechStarted` begins a new utterance (its `EndOfTurn` never came through `stamp`).
-      utterance = undefined
       heardFor = undefined
       heardStopped = false
       handedTo = undefined
@@ -843,7 +841,13 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
 
     /** Closes an utterance the previous stream left open (it starts nothing). */
     const closeOpenUtterance = Effect.suspend(() => {
-      if (!utteranceOpen) return Effect.void
+      if (!utteranceOpen) {
+        // The stream was stopped while its final was still being dispatched (a TypeSafe call): the dispatcher has that
+        // utterance open still, and would hand the next one its start. It is closed there (it starts nothing).
+        if (!dispatcher.hasOpen()) return Effect.void
+        utteranceDropped()
+        return dispatcher.dispatch({ events: [{ _tag: "EndOfTurn", text: "" }] })
+      }
       utteranceOpen = false
       utteranceDropped()
       heard.discard()

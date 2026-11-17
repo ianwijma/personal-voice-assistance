@@ -1,5 +1,5 @@
 import { assert, describe, expect, it } from "@effect/vitest"
-import { type AgentEvent, type AgentTurnInput, makeTool, makeToolRegistry, type Message, type Trace, type TraceMark } from "@pva/core"
+import { type AgentEvent, type AgentTurnInput, makeTool, makeToolRegistry, type Message, type Trace, type TraceMark, traceTimeline } from "@pva/core"
 import { Deferred, Effect, Exit, Fiber, Schema, Scope, Stream } from "effect"
 import { claudeSubscriptionAgentModule, makeClaudeAgent, OPT_IN_TEXT } from "../src/index.ts"
 import { makeFakeSdk } from "./fakeSdk.ts"
@@ -145,6 +145,52 @@ describe("claude-subscription agent", () => {
       const span = input.traceObj.events!.find((e) => e.name === "tool")!
       expect(span).toMatchObject({ at: 1500, detail: "lights_on" })
       expect(span.ms).toBe(0)
+      agent.shutdown()
+    }))
+
+  it.live("time line: its own request, first text and completion, after a failed agent's request too; no duplicate request otherwise", () =>
+    Effect.gen(function*() {
+      let clock = 100
+      const fake = makeFakeSdk({
+        // Each message is handled before the clock moves on (the fake delivers them asynchronously).
+        respond: async (ctx) => {
+          const later = () => new Promise((resolve) => setTimeout(resolve, 10))
+          clock = 120
+          ctx.delta("Hello")
+          await later()
+          clock = 130
+          ctx.delta(" there.")
+          await later()
+          clock = 150
+          ctx.result()
+        }
+      })
+      const agent = yield* Effect.promise(() => makeClaudeAgent({ ...agentOptions, sdk: fake.sdk }))
+      /** An input whose `mark` records first-only marks on the trace, as the conversation does. */
+      const marking = (trace?: (t: Trace) => void) => {
+        const input = makeInput({ now: () => clock })
+        trace?.(input.traceObj)
+        return { ...input, mark: (m: TraceMark) => void (input.traceObj.marks[m] ??= clock) }
+      }
+      // A model failed before answering (its request at 0, round 1), then this agent answers in the same turn.
+      clock = 100
+      const fallback = marking((t) => {
+        t.marks.llmRequestSent = 0
+        t.events = [{ name: "llmRequestSent", at: 0, detail: "round 1" }]
+      })
+      yield* collect(agent.turn(fallback))
+      const line = traceTimeline(fallback.trace)
+      expect(line.filter((e) => e.name === "llmRequestSent").map((e) => e.at)).toEqual([0, 100])
+      expect(line.find((e) => e.name === "llmFirstToken")?.at).toBe(120)
+      expect(line.filter((e) => e.name === "llmDone").map((e) => e.at)).toEqual([150])
+      expect(fallback.trace.marks.llmRequestSent).toBe(0) // the mark stays first-only
+      // No fallback: one request, one first text on the published time line (the entry replaces the mark).
+      clock = 100
+      const plain = marking()
+      yield* collect(agent.turn(plain))
+      const names = traceTimeline(plain.trace).map((e) => e.name)
+      expect(names.filter((n) => n === "llmRequestSent")).toHaveLength(1)
+      expect(names.filter((n) => n === "llmFirstToken")).toHaveLength(1)
       agent.shutdown()
     }))
 

@@ -8,6 +8,8 @@ import { sttContractKeeper } from "@pva/core/testing"
 import type { Assistant, AssistantHearing, DeviceOwn, ServerMessageOf } from "@pva/protocol"
 import { Deferred, Effect, Exit, Queue, Stream } from "effect"
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs"
+import * as Http from "node:http"
+import type { AddressInfo } from "node:net"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterEach, describe, expect, it, vi } from "vitest"
@@ -85,7 +87,7 @@ const baseHearing = (model: string, extra: Partial<AssistantHearing> = {}): Assi
 })
 
 /** Alpha (hears with model-a) and Bravo (model-b) on the browser defaults: Alpha first, nobody without a phrase. */
-const twoHearers = async (): Promise<string> => {
+const twoHearers = async (withoutPhrase: Record<string, unknown> = { mode: "nobody" }): Promise<string> => {
   const dataDir = mkdtempSync(join(tmpdir(), "pva-recognisers-"))
   const first = await startTestServer({ build: fakeBuild({ stt: controlledStt().stt, llm: scriptedLlm(() => "").llm }), dataDir })
   await first.close()
@@ -97,18 +99,21 @@ const twoHearers = async (): Promise<string> => {
   file.deviceTypes["web-voice"] = {
     ...file.deviceTypes["web-voice"],
     assistants: [{ assistant: "alpha", phrases: ["hey alpha"] }, { assistant: "bravo", phrases: ["hey bravo"] }],
-    withoutPhrase: { mode: "nobody" }
+    withoutPhrase
   }
   writeFileSync(path, `${JSON.stringify(file, null, 2)}\n`)
   return dataDir
 }
 
-const start = async (fake: ReturnType<typeof fakeRecognisers>, extra: { hearerSwitchWaitMs?: number; freeMemoryBytes?: () => number } = {}) => {
+const start = async (
+  fake: ReturnType<typeof fakeRecognisers>,
+  { withoutPhrase, ...extra }: { hearerSwitchWaitMs?: number; freeMemoryBytes?: () => number; env?: Record<string, string>; withoutPhrase?: Record<string, unknown> } = {}
+) => {
   server = await startTestServer({
     build: fakeBuild({ stt: controlledStt().stt, llm: scriptedLlm((t) => `Heard ${t}`).llm }),
     buildStt: fake.build,
     resourceGraceMs: 100,
-    dataDir: await twoHearers(),
+    dataDir: await twoHearers(withoutPhrase),
     ...extra
   })
 }
@@ -259,6 +264,55 @@ describe("serve: one recogniser per device, from its hearer (WP-11)", () => {
     expect(startedAt).toBeGreaterThan(-400)
     expect(startedAt).toBeLessThan(-50)
     expect(firstInterimAt).toBeGreaterThanOrEqual(startedAt + 50)
+  })
+
+  it("a start the old stream stamped but never delivered (dispatch busy with a routing call) gives the next stream's utterance no times", async () => {
+    // TypeSafe answers after 400 ms: the final below keeps the session's dispatch busy while the next start comes in.
+    const jev = Http.createServer((req, res) => {
+      req.resume()
+      req.on("end", () => setTimeout(() => {
+        res.writeHead(200, { "content-type": "application/json" })
+        res.end(JSON.stringify({ model: "jev-1", answers: { assistant: { type: "choice", choice: "alpha", confidence: 0.9, probabilities: { alpha: 0.9, bravo: 0.1 } }, fits: { type: "noul", noul: 0.9 } }, usage: { input_tokens: 1, output_tokens: 1 } }))
+      }, 400))
+    })
+    await new Promise<void>((resolve) => jev.listen(0, "127.0.0.1", resolve))
+    try {
+      const fake = fakeRecognisers()
+      await start(fake, {
+        hearerSwitchWaitMs: 300,
+        env: { TYPESAFE_ROUTING: "true", TYPESAFE_API_KEY: "ts-test-key", TYPESAFE_BASE_URL: `http://127.0.0.1:${(jev.address() as AddressInfo).port}` },
+        withoutPhrase: { mode: "typesafe", fallback: "alpha", giveUpMs: 2_000 }
+      })
+      const admin = await connect()
+      await admin.admin(TEST_ADMIN_PASSWORD)
+      const client = await device("device-a")
+      await until("device-a hearing", () => streamOf(fake, "device-a") !== undefined)
+      const old = streamOf(fake, "device-a")!
+      fake.emit(old, { _tag: "SpeechStarted" }, { _tag: "EndOfTurn", text: "what is the weather" })
+      await sleep(50)
+      // Stamped on arrival, still queued behind the routing call; then the switch replaces the stream.
+      fake.emit(old, { _tag: "SpeechStarted" }, { _tag: "Interim", text: "and tomorrow" })
+      await sleep(20)
+      await saveHearing("alpha", { model: "model-c" })
+      await until("switched to model-c", () => streamOf(fake, "device-a")?.model === "model-c", 3_000)
+      await sleep(600)
+      const from = client.messages.length
+      const adminFrom = admin.messages.length
+      fake.emit(streamOf(fake, "device-a")!, { _tag: "SpeechStarted" })
+      await sleep(100)
+      fake.emit(streamOf(fake, "device-a")!, { _tag: "Interim", text: "what time" }, { _tag: "EndOfTurn", text: "what time is it" })
+      const begun = await client.waitFor("turn.start", () => true, { from, timeoutMs: 10_000 })
+      const trace = (await admin.waitFor("trace", (m) => m.trace.turnId === begun.turnId, { from: adminFrom, timeoutMs: 10_000 })).trace
+      const line = trace.timeline!
+      const startedAt = line.find((x) => x.name === "speechStarted")!.at
+      const firstInterimAt = line.find((x) => x.name === "firstInterim")!.at
+      // Its own start, ~100 ms before its end plus the routing call; the dropped start was over 600 ms earlier still.
+      expect(startedAt).toBeGreaterThan(-800)
+      expect(firstInterimAt).toBeGreaterThanOrEqual(startedAt + 50)
+    } finally {
+      jev.closeAllConnections()
+      jev.close()
+    }
   })
 
   it("an utterance closed by the switch holds the turn no longer: its assistant is not reported while the hearing tail lasts", async () => {
