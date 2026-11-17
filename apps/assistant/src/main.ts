@@ -7,7 +7,6 @@ import {
   routeConfigFromWake,
   Stt,
   SttError,
-  ToolRegistry,
   TurnTrace,
   type WakeConfig,
   wakeConfigFromProfile
@@ -65,21 +64,21 @@ const StderrLogger = Logger.layer([
 // or with CLAUDE_SUBSCRIPTION_OPT_IN) answers; the offline stand-in answers, with a notice, when it is not running.
 const ConversationLayer = Layer.unwrap(Effect.gen(function*() {
   const settings = yield* AppConfig
+  // The module set is read at every turn's start (`CliModules`): a restarted or withdrawn module is never offered.
   const modules = yield* startCliModules()
-  const systemPrompt = withModuleInstructions(settings.systemPrompt, modules.instructions)
   const llmProvider = yield* Config.String("LLM_PROVIDER").pipe(Config.withDefault("fake"))
   if (llmProvider === SUBSCRIPTION_PROVIDER) {
     const fallbackLlm = yield* Llm
     const toAgents = makeSubscriptionAgents({
       fallbackLlm,
-      agents: () => modules.agents,
-      module: () => modules.infos.find((m) => m.id === SUBSCRIPTION_AGENT_ID),
+      agents: () => modules.snapshot().agents,
+      module: () => modules.infos().find((m) => m.id === SUBSCRIPTION_AGENT_ID),
       promptFor: (agent, turn) =>
-        agent.systemPrompt === undefined ? turn.system : withModuleInstructions(agent.systemPrompt, modules.instructions)
+        agent.systemPrompt === undefined ? turn.system : withModuleInstructions(agent.systemPrompt, modules.snapshot().instructions)
     })
-    return Conversation.layerWithAgents({ ...settings, setup: Effect.succeed(toAgents({ system: systemPrompt, registry: modules.registry })) })
+    return Conversation.layerWithAgents({ ...settings, setup: Effect.map(modules.setup(settings.systemPrompt), toAgents) })
   }
-  return Conversation.layer({ ...settings, systemPrompt }).pipe(Layer.provide(Layer.succeed(ToolRegistry, modules.registry)))
+  return Conversation.layerWithSetup({ ...settings, setup: modules.setup(settings.systemPrompt) })
 })).pipe(
   Layer.provide(Layer.mergeAll(LlmLayer, TurnTrace.layer()))
 )
@@ -212,7 +211,7 @@ const bench = (args: ReadonlyArray<string>) =>
       }
       const settings = yield* AppConfig
       const modules = yield* startCliModules()
-      const conversation = { ...settings, systemPrompt: withModuleInstructions(settings.systemPrompt, modules.instructions) }
+      const conversation = settings
       const { sessions, staggerMs, llmPerSession } = parsed
       // `--llm-per-session`: one language-model instance per session (serve mode's pool with two different settings).
       const ownLlm = llmPerSession ? { llmPerSession: llm } : {}

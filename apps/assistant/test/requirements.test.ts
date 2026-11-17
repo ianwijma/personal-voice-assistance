@@ -5,7 +5,7 @@ import { defineModule, type Issue as HealthIssue, isMissingProgramError, makeMod
 import type { Assistant } from "@pva/protocol"
 import { Effect, Schema } from "effect"
 import { formatDoctor, runDoctor } from "../src/doctor.ts"
-import { detectDistro, installFix, makeRequirementChecker, type ProbeOutput, type Prober, probePath, satisfiesRange, TOOL_REGISTRY } from "../src/requirements.ts"
+import { detectDistro, installFix, makeRequirementChecker, parseVersion, type ProbeOutput, type Prober, probePath, satisfiesRange, TOOL_REGISTRY } from "../src/requirements.ts"
 
 /** A prober answering from a table, recording every call. */
 const fakeProber = (answers: Readonly<Record<string, ProbeOutput>>) => {
@@ -72,6 +72,49 @@ describe("version requirements fail closed (finding 12)", () => {
       expect((yield* judge(ran("mpv 0.99.0"), "^0.35")).state).toBe("missing")
       const unversioned = yield* judge(ran("mpv vgit-abcdef"), ">=0.35")
       expect(unversioned.state).toBe("missing")
+    }))
+})
+
+describe("probe versions keep their prerelease (review round 2, finding 15)", () => {
+  it("parseVersion: full semver; a packaging revision is dropped, a prerelease kept, anything else is no version", () => {
+    expect(parseVersion("6.1")).toBe("6.1.0")
+    expect(parseVersion("2025.01.15")).toBe("2025.1.15")
+    expect(parseVersion("2025.01.15.232340")).toBe("2025.1.15+232340")
+    expect(parseVersion("n6.1-3ubuntu1")).toBe("6.1.0")
+    expect(parseVersion("5.1.6-0+deb12u1")).toBe("5.1.6")
+    expect(parseVersion("0.35.0-rc.1")).toBe("0.35.0-rc.1")
+    expect(parseVersion("7.0-rc1")).toBe("7.0.0-rc1")
+    expect(parseVersion("0.36.0+git")).toBe("0.36.0+git")
+    expect(parseVersion("0.36.0-weird_build")).toBeUndefined()
+    expect(parseVersion("vgit-abcdef")).toBeUndefined()
+  })
+
+  const check = (tool: string, output: string, version: string) =>
+    Effect.gen(function*() {
+      const { prober } = fakeProber({ [tool]: ran(output) })
+      const checker = makeRequirementChecker({ dataDir: "/d", prober, distro: "debian" })
+      const requirement: Requirement = { tool, version, why: "Plays" }
+      yield* checker.probe([requirement])
+      return checker.check([requirement])[0]!
+    })
+
+  it.effect("through the real checker: mpv 0.35.0-rc.1 does not meet >=0.35.0; a Debian revision is not a prerelease; an unreadable suffix fails closed", () =>
+    Effect.gen(function*() {
+      const rc = yield* check("mpv", "mpv 0.35.0-rc.1 Copyright © 2000-2023 mpv/MPlayer/mplayer2 projects", ">=0.35.0")
+      expect(rc.state).toBe("missing")
+      expect(rc.detail).toBe("mpv 0.35.0-rc.1 does not match >=0.35.0")
+      expect((yield* check("mpv", "mpv 0.35.0-rc.1", ">=0.35.0-rc.1")).state).toBe("met")
+      expect((yield* check("mpv", "mpv 0.35.1 Copyright", ">=0.35.0")).state).toBe("met")
+      expect((yield* check("ffmpeg", "ffmpeg version 6.1.1-3ubuntu5 Copyright (c) 2000-2023", ">=5")).state).toBe("met")
+      expect((yield* check("ffmpeg", "ffmpeg version 5.1.6-0+deb12u1 Copyright", ">=5")).state).toBe("met")
+      expect((yield* check("ffmpeg", "ffmpeg version 6.1-full_build-www.gyan.dev Copyright", ">=5")).state).toBe("met")
+      expect((yield* check("ffmpeg", "ffmpeg version 7.0-rc1 Copyright", ">=6")).state).toBe("missing")
+      const odd = yield* check("mpv", "mpv 0.36.0-weird_build", ">=0.35")
+      expect(odd.state).toBe("missing")
+      expect(odd.detail).toMatch(/not a version/)
+      // A program the registry does not know is probed with `--version` and read the same way.
+      expect((yield* check("foo", "foo 2.0.0-beta.3", ">=2")).state).toBe("missing")
+      expect((yield* check("foo", "foo 2.0.1", ">=2")).state).toBe("met")
     }))
 })
 

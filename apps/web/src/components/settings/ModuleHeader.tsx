@@ -13,10 +13,18 @@ const BADGE: Partial<Record<ModuleInfo["state"], string>> = { starting: "Startin
 export const moduleBadge = (state: ModuleInfo["state"]): string | undefined => BADGE[state]
 export const moduleSwitchBusy = (state: ModuleInfo["state"], requestPending: boolean) => requestPending || state === "starting"
 
+/**
+ * Running only because another module uses it (`uses`): its switch, or every assistant's, is off, yet its shared part
+ * runs for the modules that need it (the server's `running` with no instances; docs/UI-AND-MODULES.md §1.10.1).
+ */
+export const runsForOthers = (m: ModuleInfo): boolean => m.state === "running" && !m.enabled && (m.instances ?? []).length === 0
+
 /** "Off", "Starting", "Ready · …" or the error: one line for a module's state. */
 export const moduleStateText = (m: ModuleInfo): string =>
   m.state === "unavailable"
     ? "Not available on this server"
+    : runsForOthers(m)
+    ? "Running for the modules that use it"
     : !m.enabled || m.state === "disabled" || m.state === "stopping"
     ? "Off"
     : m.state === "starting"
@@ -129,6 +137,14 @@ export function ModuleInstances({ module: m }: { readonly module: ModuleInfo }) 
     <div className="flex flex-col gap-2" data-testid={`module-${m.id}`} data-state={m.state}>
       {m.state === "unavailable" ? (
         <ModuleUnavailableNote module={m} />
+      ) : instances.length === 0 && runsForOthers(m) ? (
+        <p className="text-[13px] text-ink-muted" data-testid="no-instances" data-shared="true">
+          Running for the modules that use it: no assistant has {m.name} switched on itself.
+        </p>
+      ) : instances.length === 0 && m.state === "starting" ? (
+        <p className="text-[13px] text-ink-muted" data-testid="no-instances">Starting…</p>
+      ) : instances.length === 0 && m.state === "error" ? (
+        <p role="alert" className="text-[13px] text-danger" data-testid="no-instances">Could not start{m.error !== undefined ? `: ${m.error}` : ""}</p>
       ) : instances.length === 0 ? (
         <p className="text-[13px] text-ink-muted" data-testid="no-instances">Not running: no assistant has {m.name} switched on.</p>
       ) : (

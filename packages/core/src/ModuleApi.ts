@@ -334,8 +334,18 @@ export interface ModuleHostApi {
   readonly view: () => HostView
   /** The service under `key` from a demanded module's `shared` part, or `undefined` while none provides it. */
   readonly service: <T>(key: ServiceKey<T>) => T | undefined
-  /** Every value contributed under `key` by the demanded modules' `shared` parts now, in catalog order. */
-  readonly contributions: <T>(key: ContributionKey<T>) => ReadonlyArray<T>
+  /**
+   * Every value contributed under `key` by the published shared parts now, in catalog order; for a caller acting for
+   * an assistant (the calling fiber's `CurrentTurn`, or a job made for an assistant) only those of the modules that
+   * assistant has on. Effectful, so the caller is read from the fiber's own context, which survives every `yield*`
+   * (an `await` inside native code does not carry a fiber: capture the assistant first and use `contributionsFor`).
+   */
+  readonly contributions: <T>(key: ContributionKey<T>) => Effect.Effect<ReadonlyArray<T>>
+  /**
+   * The same for an assistant named explicitly; `undefined` asks deliberately for every provider's (shared code
+   * acting for nobody in particular). Synchronous, for native callbacks.
+   */
+  readonly contributionsFor: <T>(key: ContributionKey<T>, assistantId: string | undefined) => ReadonlyArray<T>
   /**
    * The turn's action catalogue: the actions of the modules the calling assistant has on (`CurrentTurn`, or a job
    * made for an assistant), from the instance it uses, without those it switched off; an unavailable module's
@@ -356,8 +366,11 @@ export interface ModuleHostApi {
    * since does not stop it): from `start`, that instance; from `shared`, a new generation (a new shared part and
    * every instance, switched to at once). A tool list that changed at run time (an MCP server's) then applies from
    * the next turn. The old one serves until the new one has started, then keeps its grace period. If the new start
-   * fails, the old one keeps serving and the Health page says why. Returns at once; repeated calls before the
-   * restart starts count once. Runs outside any turn: the new start never sees the caller's `CurrentTurn`.
+   * fails, the old one keeps serving and the Health page says why. Returns at once. Requests made before a restart
+   * has begun count once; one made while it is in progress starts another afterwards (at most 5 per 30 s, later ones
+   * wait), so a change seen during a restart is never lost. Only the part's own generation counts: a request from a
+   * retired or discarded part (old code still running in its grace period) is ignored, one made during the part's
+   * own start applies once it is published. Runs outside any turn: the new start never sees the caller's `CurrentTurn`.
    */
   readonly requestRestart: (reason: string) => Effect.Effect<void>
   /**
@@ -377,7 +390,9 @@ export const isMissingProgramError = (error: unknown): boolean => {
 /**
  * The context members a version 2 module gets in `shared` and in `start`. Later PRs add one member each here
  * (`store`, `events`, `scheduler`, `speech`, `notify`, `present`, `connections`) and one line in the host's
- * `servicesFor`. A version 1 module never gets them.
+ * `servicesFor`, which receives the part's `PartHandle` (`ModuleRegistrations.ts`): a member that registers something
+ * (a job handler, a subscription) registers it through the handle, so it lives exactly as long as the part's
+ * generation is published. A version 1 module never gets them.
  */
 export interface ModuleServicesV2 {
   readonly host: ModuleHostApi
@@ -390,11 +405,12 @@ export interface ModuleServicesV2 {
 export interface SharedContext<A> extends ModuleServicesV2 {
   readonly settings: Partial<A>
   /**
-   * The module's effective settings for an assistant: its own values (`overridable` fields) over the shared ones this
-   * shared part started with; with no assistant (or one that does not have the module on), the shared values. Read
-   * live, per call: shared code that acts for a caller asks with the caller's assistant (`CurrentTurn`), so a
-   * weather briefing uses the asking assistant's place. `undefined` when those values are not valid (a required
-   * field with no value for that assistant).
+   * The module's effective settings for an assistant, computed at the call from the desired state: the shared
+   * (not `overridable`) values this shared part started with, and the `overridable` fields as they are now (the
+   * assistant's own value over the current shared default); with no assistant (or one that does not have the module
+   * on), the current shared defaults. Shared code that acts for a caller asks with the caller's assistant
+   * (`CurrentTurn`), so a weather briefing uses the asking assistant's place. `undefined` when those values are not
+   * valid (a required field with no value for that assistant).
    */
   readonly settingsFor: (assistantId: string | undefined) => A | undefined
 }

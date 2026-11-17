@@ -336,7 +336,7 @@ The **module host** (`packages/core/src/ModuleHost.ts`, new, Node-free; persiste
 
 Rules:
 
-- **One operation per module at a time.** A second request for the same module while one runs gets `result` with `busy`. Operations on different modules run concurrently.
+- **Triggers write the desired state; one reconciler applies it** (module API v2 review round 2, docs/ARCHITECTURE.md "Module host: the reconciler"). Enable, disable, configure, an assistant's change, the vault, Check again and restarts each write what should be true and wait for a reconciliation that began after the write; passes never overlap, so a disable while an enable starts is applied right after it, not refused. Only a second `module.configure` of a module whose previous one is still being applied gets `result` with `busy`. A caller that gives up (a timed-out request) only stops waiting: the change stays and is applied.
 - **Enable**: resolve settings. Invalid → `error` (form errors), intent saved as on, `result` with `invalid_settings`. Tool names clash with another running module → `error` ("Tool name `weather` is already used by module X"), `result` with `module_start_failed`. Otherwise `starting` → `start` → `running` (a new snapshot is published) or `error` (`result` with `module_start_failed` and the start error's message). Intent is saved as on in every case, so a module that failed because a key was missing comes up by itself after the key is fixed and the assistant restarts. Enabling a module in `error` is the retry.
 - **Disable**: intent saved as off; the module leaves the snapshot immediately (`stopping`); its scope is closed 10 s later (or at shutdown), so a tool call already running finishes normally. Tools must time out well under 10 s anyway (weather: 3 s).
 - **Reconfigure** (`module.configure`): `applySettingsPatch`; invalid → `result` with `invalid_settings` and `fieldErrors`, nothing changes. Then, by state:
@@ -490,7 +490,8 @@ const Sections = ContributionKey<Section>("briefing.sections") // contributed wi
 interface ModuleHostApi {
   view(): HostView                                   // module states, vault locked, engine summary, devices, Home values
   service<T>(key: ServiceKey<T>): T | undefined      // live; undefined while no demanded module provides it
-  contributions<T>(key: ContributionKey<T>): ReadonlyArray<T>   // live, catalog order
+  contributions<T>(key: ContributionKey<T>): Effect<ReadonlyArray<T>>   // live, catalog order, for the caller's assistant
+  contributionsFor<T>(key, assistantId | undefined): ReadonlyArray<T>    // the same, named explicitly (undefined: all)
   actions: { list: Effect<ReadonlyArray<CatalogAction>>; run(request): Effect<ActionRunResult> }  // the turn's catalogue
   requestRestart(reason): Effect<void>               // from start: that instance; from shared: a new generation
   reportMissingProgram(tool): Effect<void>           // a required program failed with ENOENT/EACCES
@@ -506,43 +507,60 @@ names it in `uses` (transitively; a module that is unavailable does not run, so 
 module's shared settings only: the `overridable` fields, which an assistant may own, are left out (hence
 `Partial<A>`), and only those fields are validated for it (an assistant-owned field's invalid shared value does not
 stop it; each instance validates its own effective settings in full). Shared code acting for a caller asks
-`ctx.settingsFor(assistantId)`: that assistant's own values over the shared ones this shared part started with, the
-shared values with no assistant, `undefined` when they are not valid. Sockets, caches, handlers, services and
+`ctx.settingsFor(assistantId)`, computed at the call: the shared (not overridable) values this shared part started
+with, and the overridable fields as they are now (that assistant's own value over the current shared default); the
+current shared defaults with no assistant, `undefined` when they are not valid. So a changed default of an overridable
+field (Amsterdam to London) reaches the live shared part without restarting it. Sockets, caches, handlers, services and
 contributions belong there. What it returns as `value`, every instance receives as `ctx.shared`.
 
 The shared part and the instances it serves are one **generation**:
 
-- The first generation's shared part starts before any instance (10 s) and is published at once: it is demanded
-  whatever its instances do, so a direct instance that fails does not take away a service a `uses` consumer needs.
-  If it fails, the module is in `error` and its instances fail with that message; they start once it does.
-- A changed shared setting (a save, Home moving a linked default) or secret starts a **new generation**: a new shared
-  part and every instance start while the old generation serves; then one synchronous switch checks everything
-  against the modules running then (services, tool names, the snapshot) and publishes all of it at once; then the
-  old generation (its instances, then its shared part) is closed after the 10 s grace. The old shared part's
-  services and contributions are withdrawn at the switch, never live beside the new ones. If the new shared part, an
-  instance that serves an assistant now, or the switch fails, nothing changes: an owner's change is refused (and not
-  saved), a Home change leaves the old generation serving with a Health warning ("could not apply its new settings").
-- Any start is interruption-safe: a part started and not published is closed on every exit, interruption included.
-- When demand ends the shared part is withdrawn at once and closed with the leaving instances after the grace period.
-- Order: a module is brought in line after the modules in its `uses` (their shared parts have started or failed). A
-  cycle in `uses` is an error for every module in it (`<id>.uses`), found when the catalogue is read; they never
-  start. Demand is evaluated again after every change of an assistant's switches, a module's switch, availability
-  ("Check again") or the vault, for every module, so a provider follows its consumers transitively.
+- A generation is published **only if its shared part and every one of its instances started** (decision 1 of review
+  round 2): the shared part starts first (10 s), then every instance with its value, and one synchronous switch
+  checks everything against what is live then (services, tool names, every registration) and publishes all of it at
+  once. The first generation too: if its shared part or any instance fails, the module stays down (`error`, with the
+  reason on the Health page), and a `uses` consumer runs without the service and says the other module is off.
+- A changed shared setting (a save, Home moving a linked default), a configured secret or a restart of the shared part
+  starts a **new generation**: a new shared part and every instance start while the old generation serves; then the
+  switch; then the old generation (its instances, then its shared part) is closed after the 10 s grace. The old
+  generation's services, contributions and every other registration (P3's routes, P6's job handlers, …) are withdrawn
+  at the switch, never live beside the new ones (docs/ARCHITECTURE.md "Module host: registrations"). If the new
+  generation fails, whatever caused it (an owner's change, Home, a restart, a new assistant at the same time), the old
+  one keeps serving and the Health page says why ("could not apply its new settings", or "could not be started
+  again"); an owner's change is refused and not saved. The same start is not tried again until something changes or
+  a retry (enable, configure, Check again, the vault) asks for it.
+- Within a generation, an instance for new assistants' settings starts on its own and is published if it starts (an
+  error for those assistants otherwise); an owner's configure of a module that runs is all or nothing.
+- Every part started is either published or closed, also when the host closes during a start. Rollback, retirement
+  and shutdown close a consumer before the providers it uses and an instance before its shared part, one after the
+  other; scopes in their grace period are closed when the host closes.
+- When demand ends the shared part and the instances are withdrawn at once and closed after the grace period.
+- Order: a module starts after the shared parts of the modules in its `uses` have started or failed in the same
+  reconciliation, and it can look them up during its own start. A cycle in `uses` is an error for every module in it
+  (`<id>.uses`), found when the catalogue is read; they never start. Every reconciliation evaluates demand for every
+  module, so a provider follows its consumers transitively.
 - A module used only through `uses` (no instance) is `running` while its shared part runs, and its `health()` gets
   `running: true`.
 - `requestRestart` from an instance starts that instance again with the settings it runs with (kept from its start:
   a locked vault does not stop it); from the shared part it starts a new generation with the generation's settings.
   Either way the old one serves until the new one is published, and a failure is a Health warning that a later
-  success, or the module stopping, clears. Restarts and every other start run outside any turn: the new start never
-  sees the requesting tool's `CurrentTurn`.
+  success, or the module stopping, clears. A request counts only for the part's own generation: one from a retired
+  part (old code in its grace period) or from a candidate that failed is ignored; one made during the part's own
+  start applies once it is published; one made while a restart is in progress starts another afterwards (so a tool
+  list that changed again is not lost), at most 5 per 30 s per module. Restarts and every other start run outside any
+  turn: the new start never sees the requesting tool's `CurrentTurn`.
 #### 1.10.2 Services and contributions
 
 A **service** is one typed object a module offers others under a `ServiceKey<T>`: `host.service(key)` returns the
 published shared part's service, or `undefined` while no demanded module provides it (a consumer then says the other
 module is off). One provider per key: a second module providing the same key gets a start error ("The service "x" is
 already provided by module Y"). A **contribution** is a value any number of modules add under a `ContributionKey<T>`;
-`host.contributions(key)` is the live list in catalog order; inside a turn it holds only the contributions of modules
-the turn's assistant has on (services are not filtered so: §2 row 18 of the plan). Both are read live at each call, so start order and
+`host.contributions(key)` is the live list in catalog order, an `Effect`: for a caller acting for an assistant (its
+fiber's `CurrentTurn`, or a job made for an assistant) it holds only the contributions of modules that assistant has
+on, read from the fiber's own context, so it holds after any `yield*` (in serve mode a caller with no principal gets
+none). Native code (a socket callback, an `await` inside a promise) names the assistant explicitly:
+`host.contributionsFor(key, assistantId)`, with `undefined` for every provider's, deliberately (services are not
+filtered: §2 row 18 of the plan). Both are read live at each call, so start order and
 restarts cannot lose a registration, and nothing registers itself with another module. Because services come from the
 once-per-module part, a module with several instances still has exactly one provider.
 
