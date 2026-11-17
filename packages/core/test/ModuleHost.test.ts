@@ -429,7 +429,8 @@ describe("ModuleHost: review findings", () => {
         id: "fa",
         name: "FA",
         description: "x",
-        settings: {},
+        // A button of the form (review round 3: a handler without an action field is not one).
+        settings: { check: Setting.action({ label: "Check", buttonLabel: "Check" }) },
         start: () => Effect.succeed({ fieldActions: { check: () => { throw new Error("thrown") } } })
       })
       const h = yield* makeModuleHost({ catalog: [m], persistence: fakePersistence().persistence, env: {} })

@@ -1,4 +1,13 @@
-import type { FieldActionResult, ModuleInfo, ModuleRoutesResponse, RecordValue, RouteTokenInfo, SettingValue } from "@pva/protocol"
+import {
+  type FieldActionResult,
+  MAX_ROUTE_TOKEN_LABEL,
+  MAX_ROUTE_TOKENS_PER_MODULE,
+  type ModuleInfo,
+  type ModuleRoutesResponse,
+  type RecordValue,
+  type RouteTokenInfo,
+  type SettingValue
+} from "@pva/protocol"
 import { randomBytes } from "node:crypto"
 
 /**
@@ -154,39 +163,75 @@ export const demoHomeAction = (key: string, values: Readonly<Record<string, Sett
   return { ok: true, text: `${r.length} rooms and ${l.length} ${l.length === 1 ? "lamp" : "lamps"}; every lamp is in one of the rooms.`, tone: "ok" }
 }
 
-/** The admin view of module routes: the demo home's two routes with a few recent calls, and its tokens. */
-export const createModuleRoutesMock = () => {
-  const started = Date.now()
-  let tokens: Array<RouteTokenInfo> = [
-    { id: "a1b2c3d4e5f6", moduleId: "demo-home", name: "hook", label: "Home Assistant automations", createdAt: started - 86_400_000, lastUsedAt: started - 120_000 }
-  ]
-  const calls = [
-    { at: started - 120_000, address: "192.168.1.20", status: 202, ms: 4, token: "Home Assistant automations" },
-    { at: started - 600_000, address: "203.0.113.9", status: 403, ms: 0, note: "Only callers on the home network" },
-    { at: started - 900_000, address: "192.168.1.20", status: 401, ms: 0, note: "The token is not valid (it may have been revoked)" }
-  ]
+/** Why a token operation is refused, as the real server answers it (status and code). */
+export class TokenRefusal extends Error {
+  readonly status: number
+  readonly code: string
+  constructor(status: number, code: string, message: string) {
+    super(message)
+    this.status = status
+    this.code = code
+  }
+}
+
+/**
+ * The admin view of module routes: the demo home's two routes with a few recent calls, and its tokens. As the real
+ * keeper (apps/assistant/src/serve/RouteTokens.ts): while the vault is locked nothing is listed and nothing can be
+ * minted or revoked (503 `locked`); a module holds at most `MAX_ROUTE_TOKENS_PER_MODULE` tokens (409 `limit`); a
+ * label has 1 to 80 characters (400 `invalid`). `locked` reads the mock's vault each time; `reset` goes back to the
+ * seeded tokens and calls.
+ */
+export const createModuleRoutesMock = (locked: () => boolean) => {
+  const seeded = () => {
+    const started = Date.now()
+    return {
+      tokens: [
+        { id: "a1b2c3d4e5f6", moduleId: "demo-home", name: "hook", label: "Home Assistant automations", createdAt: started - 86_400_000, lastUsedAt: started - 120_000 }
+      ] as Array<RouteTokenInfo>,
+      calls: [
+        { at: started - 120_000, address: "192.168.1.20", status: 202, ms: 4, token: "Home Assistant automations" },
+        { at: started - 600_000, address: "203.0.113.9", status: 403, ms: 0, note: "Only callers on the home network" },
+        { at: started - 900_000, address: "192.168.1.20", status: 401, ms: 0, note: "The token is not valid (it may have been revoked)" }
+      ]
+    }
+  }
+  let { calls, tokens } = seeded()
+  const whenUnlocked = () => {
+    if (locked()) throw new TokenRefusal(503, "locked", "The key vault is locked: unlock it in Settings → Keys & access first")
+  }
   return {
+    /** Back to the seeded tokens and calls (`/mock/reset`, a scenario change). */
+    reset: () => {
+      ;({ calls, tokens } = seeded())
+    },
     view: (modules: ReadonlyArray<ModuleInfo>): ModuleRoutesResponse => ({
       // As the server: a module with routes or tokens (a stopped one's tokens are listed, to be revoked).
       modules: modules.flatMap((m) =>
-        m.routes === undefined && !tokens.some((t) => t.moduleId === m.id)
+        m.routes === undefined && (locked() || !tokens.some((t) => t.moduleId === m.id))
           ? []
           : [{
             moduleId: m.id,
             running: m.state === "running",
             routes: (m.routes ?? []).map((r, i) => ({ ...r, calls: i === 0 ? calls : [] })),
-            tokens: tokens.filter((t) => t.moduleId === m.id)
+            tokens: locked() ? [] : tokens.filter((t) => t.moduleId === m.id)
           }]
       ),
-      tokensLocked: false,
+      tokensLocked: locked(),
       behindProxy: process.env.MOCK_BEHIND_PROXY === "1"
     }),
     mint: (moduleId: string, name: string, label: string) => {
-      const token: RouteTokenInfo = { id: randomBytes(6).toString("hex"), moduleId, name, label, createdAt: Date.now() }
+      whenUnlocked()
+      const text = label.trim()
+      if (text.length === 0 || text.length > MAX_ROUTE_TOKEN_LABEL) throw new TokenRefusal(400, "invalid", "Say who the token is for, in 1 to 80 characters")
+      if (tokens.filter((t) => t.moduleId === moduleId).length >= MAX_ROUTE_TOKENS_PER_MODULE) {
+        throw new TokenRefusal(409, "limit", `A module may hold at most ${MAX_ROUTE_TOKENS_PER_MODULE} tokens; revoke one first`)
+      }
+      const token: RouteTokenInfo = { id: randomBytes(6).toString("hex"), moduleId, name, label: text, createdAt: Date.now() }
       tokens = [...tokens, token]
       return { token, secret: randomBytes(32).toString("base64url") }
     },
     revoke: (moduleId: string, id: string) => {
+      whenUnlocked()
       const before = tokens.length
       tokens = tokens.filter((t) => !(t.moduleId === moduleId && t.id === id))
       return tokens.length !== before

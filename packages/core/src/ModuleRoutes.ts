@@ -1,6 +1,8 @@
 import {
   DEFAULT_ROUTE_BODY_BYTES,
   MAX_ROUTE_BODY_BYTES,
+  MAX_ROUTE_PATH,
+  MAX_ROUTES_PER_MODULE,
   MODULE_ROUTES_PREFIX,
   type ModuleRouteInfo,
   type RouteGuard,
@@ -119,9 +121,15 @@ export const bodyModeOf = (route: ModuleRoute): "json" | "bytes" | "none" =>
 /** What is wrong with a module's routes (checked when its shared part starts: a problem is a start error). */
 export const routeProblem = (routes: ReadonlyArray<ModuleRoute> | undefined): string | undefined => {
   const seen = new Set<string>()
+  if ((routes ?? []).length > MAX_ROUTES_PER_MODULE) return `A module may declare at most ${MAX_ROUTES_PER_MODULE} routes`
   for (const route of routes ?? []) {
+    if (typeof route !== "object" || route === null || typeof route.path !== "string" || typeof route.handler !== "function") return "A route is not a route (it needs a method, a path and a handler)"
+    if (route.path.length > MAX_ROUTE_PATH) return `A route path may have at most ${MAX_ROUTE_PATH} characters`
     const name = `${route.method} ${route.path === "" ? "/" : route.path}`
     if (!["GET", "POST", "PUT", "PATCH", "DELETE"].includes(route.method)) return `The route ${name} has an unknown method`
+    if (route.body !== undefined && route.body !== "json" && route.body !== "bytes" && route.body !== "none") {
+      return `The route ${name} has an unknown body mode (json, bytes or none)`
+    }
     if (route.path.startsWith("/") || route.path.endsWith("/") || !segmentsOf(route.path).every((s) => SEGMENT.test(s) && s !== "." && s !== "..")) {
       return `The route path "${route.path}" is not valid: segments of letters, digits and ._~- (not "." or "..") or :name, no leading or trailing "/"`
     }
@@ -195,8 +203,11 @@ export const matchRoutePath = (route: ModuleRoute, segments: ReadonlyArray<strin
 
 /** Why a token operation could not be done. */
 export class RouteTokenError extends Schema.TaggedError<RouteTokenError>()("RouteTokenError", {
-  /** `unknown_module`: the admin API named a module that is not installed. */
-  reason: Schema.Literals(["locked", "unavailable", "limit", "invalid", "failed", "unknown_module"]),
+  /**
+   * `unknown_module`: the admin API named a module that is not installed. `blocked`: the settings files are damaged
+   * and wait for the owner to save them (a token change never counts as that).
+   */
+  reason: Schema.Literals(["locked", "unavailable", "limit", "invalid", "failed", "unknown_module", "blocked"]),
   /** One sentence for the owner. */
   message: Schema.String
 }) {}

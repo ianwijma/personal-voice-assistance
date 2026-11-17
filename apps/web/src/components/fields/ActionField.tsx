@@ -22,9 +22,11 @@ export function ActionField({ field, id, describedBy, disabled, context }: Field
     return () => void (mounted.current = false)
   }, [])
   const moduleId = context?.form.kind === "module" ? context.form.id : undefined
-  const needsSave = field.requiresSaved && context?.dirty === true
+  // One rule with Save: a press acts on exactly what the form shows, so not while a shown field is invalid.
+  const invalid = context?.invalid
+  const needsSave = invalid === undefined && field.requiresSaved && context?.dirty === true
   const press = async () => {
-    if (running || moduleId === undefined) return
+    if (running || moduleId === undefined || invalid !== undefined) return
     if (field.confirm !== undefined && !window.confirm(field.confirm)) return
     setRunning(true)
     setResult(undefined)
@@ -49,13 +51,14 @@ export function ActionField({ field, id, describedBy, disabled, context }: Field
           size="sm"
           aria-describedby={describedBy}
           aria-busy={running}
-          disabled={disabled || running || needsSave || moduleId === undefined}
+          disabled={disabled || running || needsSave || invalid !== undefined || moduleId === undefined}
           onClick={() => void press()}
         >
           {running && <Spinner size={13} />}
           {field.buttonLabel}
         </Button>
         {needsSave && <span className="text-[13px] text-ink-muted">Save first</span>}
+        {invalid !== undefined && <span className="text-[13px] text-danger" data-testid="action-blocked">Fix this first: {invalid}</span>}
         {moduleId === undefined && <span className="text-[13px] text-ink-muted">Not available here</span>}
       </div>
       <p

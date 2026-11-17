@@ -362,11 +362,24 @@ CurrentPrincipal: Context.Reference<Principal | undefined>       // the admitted
   stopped first when it closes) or by the instance part that runs it (made with the part; `closePart` stops it before
   it closes the part's scope, in the host's closing order); the button stays busy until the press has ended. A version 2 instance gets `refreshForm()` to have its `info()` and `settingOptions()` described
   again (a closed combo shows its static options only).
-- **The page boundary** (P3, `PageBoundary.ts`): every module-produced text or value an admin page shows (field-action
-  results, `info` values, runtime options, status lines, start errors and failed saves, Health issues, tool and route
-  descriptions, route call-log notes through `ModuleHost.pageText`) passes one boundary that replaces every secret the
-  module has been given since the host started, and every one known now, with `[secret]` before anything is clipped;
-  a runtime option whose value holds a secret is dropped.
+- **Secrets and admin pages** (P3, docs/UI-AND-MODULES.md "Secrets and the admin page"): (1) the host never puts a
+  secret on a page or in an admin response, by field kind (forms carry only `SecretState`; no host message quotes a
+  rejected value; a route token's secret is shown once, at its mint, and only its hash is kept); (2) text a module's
+  code writes is the module's responsibility (never a secret, or anything derived from one); (3) `PageBoundary.ts` is
+  the safety net with an exact contract: every exact, case-sensitive occurrence of a current or earlier secret value of
+  that module, of any length, is replaced by `[secret]` before clipping. Earlier values are kept per holder (`remember`
+  / `release`: a part until `closePart`, a press until it has ended and been answered, a health check, tokens a part
+  minted) with no eviction while the holder lives; past 1024 values per module the module's texts are replaced by a
+  fixed sentence instead. Encoded or transformed secrets are not promised to be found. `ModuleHost.pageText` and
+  `ModuleHost.routeView` give the router the same boundary.
+- **Bounds** (P3): every protocol 10 string, list and record has a maximum on the wire (`MAX_*` in
+  `packages/protocol/src/settings.ts` and `moduleRoutes.ts`; a records or text-list value at most 32 KB as JSON, at
+  most 200 options per combo and 32 KB of options), the core constructors refuse declarations outside them, and the
+  host cuts what a module returns at run time (`info` 1000 characters, results 500, options to the bound) before it is
+  sent, so one module form stays far below the 1 MB frame.
+- **Stragglers** (P3, `Stragglers.ts`): a press or a route handler still running 10 s after it was asked to stop
+  counts against its module until it ends; at the cap (4 presses, 8 handlers per module) new work of that kind is
+  refused (`busy`, 503) and Health has `<module>.presses-stuck` / `<module>.routes-stuck`.
 - **Module routes** (P3, docs/UI-AND-MODULES.md §1.11): `ModuleRoute = { method, path, guards?: ("admin" | "token" |
   "lan")[], public?, token?, body?, bodyLimitBytes? (8 KB, ≤ 1 MB), rateLimit? (30/min per caller, 120 in all),
   timeoutMs? (5 s, ≤ 30 s), handler(req) }` answering a final status (200–599); every declared guard must pass, a

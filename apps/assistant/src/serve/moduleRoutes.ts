@@ -2,18 +2,21 @@ import {
   bodyModeOf,
   DEFAULT_ROUTE_RATE,
   DEFAULT_ROUTE_TIMEOUT_MS,
+  type IssueRegistry,
+  makeStragglers,
   matchRoutePath,
   type ModuleHost,
-  outsideTurns,
   type ModuleRoute,
+  outsideTurns,
   type PublishedRoute,
   type RouteRequest,
   type RouteResponse,
-  routeInfo,
-  RouteTokenError
+  RouteTokenError,
+  stragglerIssues
 } from "@pva/core"
 import {
   DEFAULT_ROUTE_BODY_BYTES,
+  MAX_ROUTE_TOKEN_LABEL,
   MODULE_ROUTES_PREFIX,
   type ModuleRoutesResponse,
   type RouteCall,
@@ -37,8 +40,14 @@ import type { RouteTokenKeeper } from "./RouteTokens.ts"
  * while the vault is locked, else 401) → body (413 over the limit or on a route that takes none, 415 not JSON, 400 bad
  * JSON) → the route is still its module's published one (503 after a restart or stop) → the handler, in its own fiber
  * in the shared part's scope with its time limit (504 at the deadline; the handler is interrupted and its cleanup
- * runs on in the background, bounded and logged), a failure answering 500 (logged; nothing of it is sent). Nothing
- * here runs on a turn's path or the WebSocket's.
+ * runs on in the background), a failure answering 500 (logged; nothing of it is sent). Nothing here runs on a turn's
+ * path or the WebSocket's.
+ *
+ * **Handlers that do not stop.** The 504 is prompt, but a handler's cleanup may not end (an uninterruptible loop, a
+ * finalizer that never returns). One still running `cleanupMs` (10 s) after it was interrupted is logged and counts as
+ * a straggler of its module until it really ends (`Stragglers`); at `MAX_ROUTE_STRAGGLERS` the module's routes answer
+ * every new request 503 (after 404/405) until some end, and Health says so. Only the log line is bounded in time; the
+ * work is bounded in number.
  *
  * **Reverse proxies.** The caller's address is the socket's, and forwarding headers (`Forwarded`, `X-Forwarded-For`,
  * `X-Real-IP`, …) are never read for it. The server cannot tell a proxied request from a local one by itself (a proxy
@@ -49,7 +58,9 @@ import type { RouteTokenKeeper } from "./RouteTokens.ts"
  */
 
 export interface ModuleRouterOptions {
-  readonly host: Pick<ModuleHost, "routes" | "modules" | "pageText">
+  readonly host: Pick<ModuleHost, "routes" | "modules" | "pageText" | "routeView">
+  /** Where the router reports a module whose handlers did not stop (`routes:<moduleId>`). Absent: not reported. */
+  readonly issues?: IssueRegistry
   readonly admin: Pick<AdminSessions, "enabled" | "check" | "touch">
   readonly tokens: RouteTokenKeeper
   /** The server's services (logging), to run handlers with. */
@@ -80,8 +91,10 @@ export const isModuleRoutePath = (url: string | undefined): boolean => (url ?? "
 
 const FORWARDING_HEADERS = ["forwarded", "x-forwarded-for", "x-real-ip", "x-forwarded-host", "x-forwarded-proto"]
 
-/** How long a timed-out handler's interruption may take before it is logged (`ModuleRouterOptions.cleanupMs`). */
+/** How long a timed-out handler's interruption may take before it is logged and counted (`ModuleRouterOptions.cleanupMs`). */
 export const ROUTE_CLEANUP_MS = 10_000
+/** Handlers of one module that did not stop before its routes refuse new requests (503). */
+export const MAX_ROUTE_STRAGGLERS = 8
 /** Per-address rate windows kept at once (the oldest goes first); route totals are kept apart and never evicted. */
 const MAX_ADDRESS_WINDOWS = 4096
 /** Routes whose call log is kept (the least recently called goes first), live or retired. */
@@ -298,6 +311,12 @@ export const makeModuleRouter = (options: ModuleRouterOptions): ModuleRouter => 
   const behindProxy = options.behindProxy === true
   const cleanupMs = options.cleanupMs ?? ROUTE_CLEANUP_MS
   const limiter = makeLimiter(now)
+  const nameOf = (moduleId: string) => options.host.modules().find((m) => m.id === moduleId)?.name ?? moduleId
+  const stragglers = makeStragglers({
+    cap: MAX_ROUTE_STRAGGLERS,
+    cleanupMs,
+    changed: (moduleId, count) => options.issues?.set(`routes:${moduleId}`, stragglerIssues(moduleId, nameOf(moduleId), "routes", count, MAX_ROUTE_STRAGGLERS))
+  })
   // The last calls per route (`moduleId method path`); at most `MAX_LOGGED_ROUTES` routes, least recently called first out.
   const logs = new Map<string, Array<RouteCall>>()
   const routeKey = (moduleId: string, route: ModuleRoute) => `${moduleId} ${route.method} ${route.path}`
@@ -348,6 +367,10 @@ export const makeModuleRouter = (options: ModuleRouterOptions): ModuleRouter => 
       return { refused: plain(405, "Method not allowed", { Allow: [...new Set(matching.map((m) => m.route.method))].join(", ") }) }
     }
     const { route, params, published } = found
+    // Too many of its earlier handlers did not stop: no new work for the module until some end.
+    if (stragglers.full(moduleId)) {
+      return { route, refused: plain(503, "The module is still stopping earlier requests; try again later", { "Retry-After": String(Math.ceil(cleanupMs / 1000)) }) }
+    }
     // A page on another site may make a browser send a simple request (no preflight) with the browser's own address:
     // refused before anything of the route runs. A public route (a GET without a body) is a browser's to arrive on.
     if (route.public !== true) {
@@ -487,14 +510,10 @@ export const makeModuleRouter = (options: ModuleRouterOptions): ModuleRouter => 
           Effect.onInterrupt(() => Effect.sync(() => fiber.interruptUnsafe()))
         )
         if (Option.isNone(exit)) {
-          // The caller gets its 504 now; the interruption and the handler's finalizers run on, bounded and logged.
+          // The caller gets its 504 now; the interruption and the handler's finalizers run on. One that has not ended
+          // `cleanupMs` later is logged and counted against the module's cap until it does.
           fiber.interruptUnsafe()
-          yield* Effect.forkDetach(
-            Fiber.await(fiber).pipe(
-              Effect.timeoutOption(cleanupMs),
-              Effect.flatMap((done) => (Option.isSome(done) ? Effect.void : Effect.logWarning(`${label}: still cleaning up ${cleanupMs} ms after its time limit`)))
-            )
-          )
+          yield* stragglers.watch(moduleId, fiber, Effect.logWarning(`${label}: still cleaning up ${cleanupMs} ms after its time limit`))
           return plain(504, "The module did not answer in time")
         }
         if (Exit.isSuccess(exit.value)) {
@@ -536,17 +555,25 @@ export const makeModuleRouter = (options: ModuleRouterOptions): ModuleRouter => 
       for (const id of installed) {
         // Tokens are listed whether or not the module runs (a stopped module's tokens can be revoked).
         const tokens = readable ? yield* options.tokens.forModule(id).list.pipe(Effect.orElseSucceed(() => [])) : []
-        // What the module declared, and what was noted of its calls, pass the host's page boundary (no secret it was given).
-        const routes = running.filter((r) => r.moduleId === id).map((r) => {
-          const info = routeInfo(id, r.route)
-          return {
-            ...info,
-            ...(info.description !== undefined ? { description: options.host.pageText(id, info.description, 500) } : {}),
-            calls: (logs.get(routeKey(id, r.route)) ?? []).map((call) => (call.note === undefined ? call : { ...call, note: options.host.pageText(id, call.note, 120) }))
-          }
-        })
+        // What the module declared (paths, token names, descriptions), the token labels (a module may mint its own)
+        // and what was noted of its calls pass the host's page boundary, before they are clipped.
+        const label = (text: string) => options.host.pageText(id, text, MAX_ROUTE_TOKEN_LABEL)
+        const routes = running.filter((r) => r.moduleId === id).map((r) => ({
+          ...options.host.routeView(id, r.route),
+          calls: (logs.get(routeKey(id, r.route)) ?? []).map((call) => ({
+            ...call,
+            ...(call.token !== undefined ? { token: label(call.token) } : {}),
+            ...(call.note !== undefined ? { note: options.host.pageText(id, call.note, 120) } : {})
+          }))
+        }))
+        const shownTokens = tokens.map((t) => ({
+          ...t,
+          label: label(t.label),
+          // A name is an identifier: one that holds a secret is not shown at all.
+          name: options.host.pageText(id, t.name, 64) === t.name ? t.name : "hidden"
+        }))
         if (routes.length === 0 && tokens.length === 0) continue
-        modules.push({ moduleId: id, running: ids.has(id), routes, tokens })
+        modules.push({ moduleId: id, running: ids.has(id), routes, tokens: shownTokens })
       }
       return { modules, tokensLocked: !readable, behindProxy }
     })

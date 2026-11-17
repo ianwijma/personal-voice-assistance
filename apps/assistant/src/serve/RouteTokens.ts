@@ -50,7 +50,7 @@ export interface RouteTokenKeeper extends RouteTokenStore {
 }
 
 export const makeRouteTokens = (options: {
-  readonly store: Pick<SettingsStore, "secrets" | "saveRouteTokens">
+  readonly store: Pick<SettingsStore, "secrets" | "saveRouteTokens" | "blocked">
   /** The key vault exists and is locked. */
   readonly locked: () => boolean
   readonly now?: () => number
@@ -72,12 +72,20 @@ export const makeRouteTokens = (options: {
   })
   const lockedError = () => new RouteTokenError({ reason: "locked", message: "The key vault is locked: unlock it in Settings → Keys & access first" })
   const whenReadable = <A>(f: () => Effect.Effect<A, RouteTokenError>) => Effect.suspend(() => (options.locked() ? Effect.fail(lockedError()) : f()))
+  /** A change is refused while the settings are damaged (the store checks again inside its serialized save). */
+  const whenWritable = <A>(f: () => Effect.Effect<A, RouteTokenError>) =>
+    whenReadable(() => {
+      const blocked = options.store.blocked()
+      return blocked === undefined
+        ? f()
+        : Effect.fail(new RouteTokenError({ reason: "blocked", message: `Tokens cannot be changed until the settings are saved once: ${blocked}` }))
+    })
   const saveFailed = (e: { readonly message: string }) => new RouteTokenError({ reason: "failed", message: e.message })
 
   const forModule = (moduleId: string): RouteTokens => ({
     list: whenReadable(() => Effect.succeed(all().filter(([, t]) => t.moduleId === moduleId).map(([id, t]) => infoOf(id, t)))),
     mint: (name, label) =>
-      whenReadable(() => {
+      whenWritable(() => {
         const text = label.trim()
         if (!NAME.test(name)) return Effect.fail(new RouteTokenError({ reason: "invalid", message: `A token name must match ${NAME}` }))
         if (text.length === 0 || text.length > 80) return Effect.fail(new RouteTokenError({ reason: "invalid", message: "Say who the token is for, in 1 to 80 characters" }))
@@ -101,7 +109,7 @@ export const makeRouteTokens = (options: {
         )
       }),
     revoke: (id) =>
-      whenReadable(() => {
+      whenWritable(() => {
         const found = all().some(([tid, t]) => tid === id && t.moduleId === moduleId)
         if (!found) return Effect.succeed(false)
         lastUsed.delete(id)

@@ -94,7 +94,7 @@ describe("extended fields: describe, save, load, resolve per layer", () => {
     expect(form.fields.find((f) => f.key === "rooms")).toMatchObject({ source: "env-process", locked: { reason: "Set by DEMO_ROOMS in the environment" } })
     const bad = resolveSettings(spec, sources({}, { DEMO_ROOMS: "not json" }))
     expect(bad.value).toBeUndefined()
-    expect(bad.form.errors[0]).toEqual({ key: "rooms", message: "DEMO_ROOMS=not json is not valid: Must be JSON: a list of objects" })
+    expect(bad.form.errors[0]).toEqual({ key: "rooms", message: "DEMO_ROOMS in the environment is not valid: Must be JSON: a list of objects" })
     // A field set by the environment cannot be patched.
     expect(applySettingsPatch(spec, sources({}, { DEMO_GREETINGS: "hi" }), { values: { greetings: ["x"] }, secrets: {} }).ok).toBe(false)
   })

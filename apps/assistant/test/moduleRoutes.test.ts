@@ -1,7 +1,7 @@
 // Module HTTP routes (docs/MODULES-PLAN.md §4 P3, docs/UI-AND-MODULES.md §1.11): guards (every declared one must
 // pass), route tokens in the vault (revocable, a locked vault answers 503), the LAN check and forwarding headers, body
 // and rate limits, time limits, the call log, and a route that disappears when its module stops.
-import { defineModule, makeModuleHost, type ModuleHost, type ModuleRoute, type PublishedRoute, readOnlyPersistence } from "@pva/core"
+import { defineModule, makeModuleHost, type ModuleHost, type ModuleRoute, type PublishedRoute, readOnlyPersistence, routeInfo } from "@pva/core"
 import { Context, Effect, Exit, Scope } from "effect"
 import { mkdtempSync, readFileSync, rmSync } from "node:fs"
 import * as http from "node:http"
@@ -362,7 +362,8 @@ describe("module routes after review round 1", () => {
           throw new Error("boom")
         },
         modules: () => [],
-        pageText: (_id, text) => String(text)
+        pageText: (_id, text) => String(text),
+        routeView: routeInfo
       }
     })
     const unhandled: Array<unknown> = []
@@ -532,7 +533,7 @@ describe("module routes after review round 1", () => {
     const routeOf = (n: number): ModuleRoute => ({ method: "GET", path: `gen${n}`, public: true, handler: () => Effect.succeed({ status: 200 }) })
     let live: Array<PublishedRoute> = []
     const churn = await otherRouter({
-      host: { routes: () => live, modules: () => [{ id: "churn" }] as never, pageText: (_id, text) => String(text) }
+      host: { routes: () => live, modules: () => [{ id: "churn" }] as never, pageText: (_id, text) => String(text), routeView: routeInfo }
     })
     try {
       for (; generation < 300; generation++) {
@@ -563,6 +564,12 @@ describe("module routes after review round 1", () => {
         pageText: (id, text, max) => {
           seen.push(`${id}:${max}`)
           return String(text).replaceAll("KEY", "[secret]")
+        },
+        // The host's own view of a route (the boundary on what the module declared).
+        routeView: (id, r) => {
+          seen.push(`view:${id}`)
+          const view = routeInfo(id, r)
+          return { ...view, ...(view.description !== undefined ? { description: view.description.replaceAll("KEY", "[secret]") } : {}) }
         }
       }
     })
@@ -571,7 +578,7 @@ describe("module routes after review round 1", () => {
       const view = await Effect.runPromise(said.router.view("said"))
       expect(view.modules[0]!.routes[0]!.description).toBe("Uses [secret]")
       expect(view.modules[0]!.routes[0]!.calls[0]!.note).toBe("Log in to admin first")
-      expect(seen).toEqual(["said:500", "said:120"])
+      expect(seen).toEqual(["view:said", "said:120"])
     } finally {
       await said.close()
     }

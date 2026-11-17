@@ -580,41 +580,34 @@ describe("routes and field actions in P1's lifecycle", () => {
       start: () => (probe.failInstance ? Effect.fail(new ModuleStartError({ message: "no" })) : Effect.succeed({}))
     })
 
-  it.effect("a new generation's routes replace the old ones at the switch; the old scope closes after the grace period", () =>
+  // Routes are one registration of the shared part (the "route" registrar): live exactly while the part is published.
+  // Nothing here depends on how a replacement is made (no old and new generation are compared).
+  it.effect("a route is in the route table only while its module is published: gone when it is switched off, back when on", () =>
     Effect.gen(function*() {
       const probe = { closed: [] as Array<string>, badRoute: false, failInstance: false }
       const host = yield* hostOf([generational(probe)], { gen: {} })
       yield* host.startEnabled
-      const first = host.routes()
-      assert.deepStrictEqual(first.map((r) => r.route.description), ["a"])
-      assert.isTrue((yield* host.configure("gen", { values: { word: "b" }, secrets: {} })).ok)
-      const second = host.routes()
-      assert.deepStrictEqual(second.map((r) => r.route.description), ["b"])
-      assert.notStrictEqual(second[0]!.scope, first[0]!.scope)
-      assert.deepStrictEqual(probe.closed, [])
-      yield* advance(10_000)
-      assert.deepStrictEqual(probe.closed, ["a"])
+      assert.deepStrictEqual(host.routes().map((r) => [r.moduleId, r.route.description]), [["gen", "a"]])
+      assert.deepStrictEqual(host.modules()[0]!.routes?.map((r) => r.path), ["/api/modules/gen/x"])
+      yield* host.disable("gen")
+      assert.deepStrictEqual(host.routes(), [])
+      assert.isUndefined(host.modules()[0]!.routes)
+      yield* host.enable("gen")
+      assert.deepStrictEqual(host.routes().map((r) => r.route.description), ["a"])
     }))
 
-  it.effect("a new generation with a bad route, or whose instance fails, changes nothing: the old routes stay published", () =>
+  it.effect("a shared part whose routes are not valid, or whose instance fails, is never published: no route of it is live", () =>
     Effect.gen(function*() {
-      const probe = { closed: [] as Array<string>, badRoute: false, failInstance: false }
-      const host = yield* hostOf([generational(probe)], { gen: {} })
-      yield* host.startEnabled
-      const before = host.routes()
-      probe.badRoute = true
-      const refusedRoute = yield* host.configure("gen", { values: { word: "b" }, secrets: {} })
-      assert.isFalse(refusedRoute.ok)
-      assert.match(refusedRoute.ok ? "" : refusedRoute.error.message, /has no guard/)
-      assert.strictEqual(host.routes()[0]!.scope, before[0]!.scope)
-      // The candidate shared part was closed at once (never published).
-      assert.deepStrictEqual(probe.closed, ["b"])
-      probe.badRoute = false
-      probe.failInstance = true
-      assert.isFalse((yield* host.configure("gen", { values: { word: "c" }, secrets: {} })).ok)
-      assert.strictEqual(host.routes()[0]!.scope, before[0]!.scope)
-      assert.deepStrictEqual(host.routes().map((r) => r.route.description), ["a"])
-      assert.deepStrictEqual(probe.closed, ["b", "c"])
+      for (const fault of ["badRoute", "failInstance"] as const) {
+        const probe = { closed: [] as Array<string>, badRoute: fault === "badRoute", failInstance: fault === "failInstance" }
+        const host = yield* hostOf([generational(probe)], { gen: {} })
+        yield* host.startEnabled
+        assert.deepStrictEqual(host.routes(), [], fault)
+        assert.strictEqual(host.modules()[0]!.state, "error", fault)
+        if (fault === "badRoute") assert.match(host.modules()[0]!.error ?? "", /has no guard/)
+        // Its shared part was closed (it never served).
+        assert.deepStrictEqual(probe.closed, ["a"], fault)
+      }
     }))
 })
 

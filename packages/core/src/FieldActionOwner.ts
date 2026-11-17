@@ -1,4 +1,5 @@
 import { Effect, type Exit, Fiber, Option } from "effect"
+import type { Stragglers } from "./Stragglers.ts"
 
 /**
  * Who a field action's press belongs to (docs/UI-AND-MODULES.md §1.7): the host for a definition's handler, the
@@ -21,6 +22,8 @@ import { Effect, type Exit, Fiber, Option } from "effect"
 /** How a press went (`FieldActionOwner.start`). */
 export type PressOutcome<A, E> =
   | { readonly _tag: "busy" }
+  /** Too many earlier presses of the module have not stopped (`Stragglers`): no new one until some end. */
+  | { readonly _tag: "stuck" }
   | { readonly _tag: "stopped" }
   | { readonly _tag: "timeout" }
   | { readonly _tag: "done"; readonly exit: Exit.Exit<A, E> }
@@ -44,25 +47,29 @@ export const makeFieldActionOwner = (options: {
   readonly cleanupMs: number
   /** A press ended (its key is free): the page may need the module again (`info` values). */
   readonly released?: (key: string) => void
+  /**
+   * The presses that did not stop within `cleanupMs` of being asked to, counted per module (shared by every owner of
+   * the host), and the module a key belongs to. At the module's cap, `start` answers `stuck`.
+   */
+  readonly stragglers: Stragglers
+  readonly moduleOf: (key: string) => string
 }): FieldActionOwner => {
   const running = new Map<string, Fiber.Fiber<unknown, unknown>>()
   let stopped = false
 
-  /** Log (once) when `fiber`, asked to stop, has not ended within the cleanup limit. Never frees its key. */
+  /** `fiber` was asked to stop: logged and counted as a straggler if it has not ended within the cleanup limit. Never frees its key. */
   const watch = (key: string, fiber: Fiber.Fiber<unknown, unknown>, why: string) =>
-    Effect.forkDetach(
-      Fiber.await(fiber).pipe(
-        Effect.timeoutOption(options.cleanupMs),
-        Effect.flatMap((done) =>
-          Option.isSome(done) ? Effect.void : Effect.logWarning(`${options.label(key)}: still cleaning up ${options.cleanupMs} ms after it was ${why}; its button stays busy until it ends`)
-        )
-      )
+    options.stragglers.watch(
+      options.moduleOf(key),
+      fiber,
+      Effect.logWarning(`${options.label(key)}: still cleaning up ${options.cleanupMs} ms after it was ${why}; its button stays busy until it ends`)
     )
 
   const start: FieldActionOwner["start"] = (key, press, timeoutMs) =>
     Effect.suspend((): Effect.Effect<PressOutcome<any, any>> => {
       if (stopped) return Effect.succeed({ _tag: "stopped" } as const)
       if (running.has(key)) return Effect.succeed({ _tag: "busy" } as const)
+      if (options.stragglers.full(options.moduleOf(key))) return Effect.succeed({ _tag: "stuck" } as const)
       return Effect.uninterruptibleMask((restore) =>
         Effect.gen(function*() {
           const fiber = yield* Effect.forkDetach(press)

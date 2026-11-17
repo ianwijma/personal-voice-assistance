@@ -57,6 +57,8 @@ export interface FieldRowProps {
   readonly onLocalError: (message: string | undefined) => void
   /** The form around the field (its buttons need it). */
   readonly context?: FieldContext
+  /** "Reset to the default" (the form clears the field's private state too); absent: only the draft value is reset. */
+  readonly onReset?: () => void
 }
 
 /**
@@ -64,7 +66,7 @@ export interface FieldRowProps {
  * means when such a field is changed), "Unsaved" for an edit and "Custom · Reset" for a saved non-default value, the field's renderer (or, when the environment sets it, the value read-only with a pin and where it comes
  * from), then errors, warnings and the description.
  */
-export function FieldRow({ field, form, draft, idPrefix, errors, warnings, readOnly, saving, vault, setDraft, onLocalError, context }: FieldRowProps) {
+export function FieldRow({ field, form, draft, idPrefix, errors, warnings, readOnly, saving, vault, setDraft, onLocalError, context, onReset }: FieldRowProps) {
   const id = `${idPrefix}-${field.key}`
   const describedBy = `${id}-desc`
   const Renderer = rendererFor(field)
@@ -106,7 +108,7 @@ export function FieldRow({ field, form, draft, idPrefix, errors, warnings, readO
           {...(resetPending ? { unsavedTitle: `Goes back to the default (${defaultText}) when saved` } : {})}
           saved={custom ? "Custom" : undefined}
           savedTitle={`Saved from this screen; the default is ${defaultText}`}
-          reset={canReset ? { label: `Reset ${field.label} to the default (${defaultText})`, onReset: () => setDraft((d) => resetDraftValue(d, field)) } : undefined}
+          reset={canReset ? { label: `Reset ${field.label} to the default (${defaultText})`, onReset: onReset ?? (() => setDraft((d) => resetDraftValue(d, field))) } : undefined}
         />
       </div>
       {field.locked !== undefined ? (

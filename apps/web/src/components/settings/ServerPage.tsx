@@ -190,8 +190,13 @@ function FormBlock({ view, forms, heading, vault, renderAfter }: {
   const formErrors = [...(state.message !== undefined ? [state.message] : []), ...loose(errors)]
   const formWarnings = loose(warnings)
   const { basic, advanced } = splitAdvanced(shown)
+  // One rule for the form (Save, a button press): they act on exactly what is shown, never while a shown field is
+  // invalid. A press with the draft gets only the shown fields' values.
+  const firstInvalid = Object.entries(view.localErrors)[0]
+  const invalid = firstInvalid === undefined ? undefined : `${shown.find((f) => f.key === firstInvalid[0])?.label ?? firstInvalid[0]}: ${firstInvalid[1]}`
+  const shownDraft = Object.fromEntries(Object.entries(state.sync.draft.values).filter(([k]) => shownKeys.has(k)))
   const row = (field: SettingField) => (
-    <div key={`${field.key}:${state.epoch}`} className="flex flex-col gap-4">
+    <div key={`${field.key}:${state.epoch}:${state.fieldEpochs[field.key] ?? 0}`} className="flex flex-col gap-4">
       <FieldRow
         field={field}
         form={def.form}
@@ -204,7 +209,8 @@ function FormBlock({ view, forms, heading, vault, renderAfter }: {
         vault={vault}
         setDraft={(f) => forms.setDraft(def.key, f)}
         onLocalError={(message) => forms.setLocalError(def.key, field.key, message)}
-        context={{ form: { kind: def.kind, id: def.id }, dirty: view.dirty, draftValues: state.sync.draft.values }}
+        onReset={() => forms.resetField(def.key, field)}
+        context={{ form: { kind: def.kind, id: def.id }, dirty: view.dirty, draftValues: shownDraft, ...(invalid !== undefined ? { invalid } : {}) }}
       />
       {renderAfter(field)}
     </div>

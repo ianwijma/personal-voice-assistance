@@ -4,8 +4,13 @@ import {
   type ErrorInfo,
   type FieldError,
   HealthIssue,
+  MAX_COMBO_OPTIONS,
+  MAX_OPTIONS_JSON,
+  MAX_ROUTE_DESCRIPTION,
+  MODULE_ROUTES_PREFIX,
   type ModuleInfo,
   type ModuleInstanceInfo,
+  type ModuleRouteInfo,
   type ModuleState,
   ModuleUnavailable,
   type SettingField,
@@ -57,6 +62,7 @@ import type { FieldActionHandler, FieldActionResult } from "./ModuleContribution
 import { type FieldActionOwner, makeFieldActionOwner } from "./FieldActionOwner.ts"
 import { type ModuleRoute, type PublishedRoute, RouteTokenError, routeInfo, routeProblem, type RouteTokens, type RouteTokenStore } from "./ModuleRoutes.ts"
 import { makePageBoundary } from "./PageBoundary.ts"
+import { makeStragglers, stragglerIssues } from "./Stragglers.ts"
 import { type ModuleDefinition, type ModuleInstance, ModuleStartError } from "./ModuleDefinition.ts"
 import {
   type Failure,
@@ -205,6 +211,8 @@ export const FIELD_ACTION_TIMEOUT_MS = 8_000
  * until it has really ended (`FieldActionOwner`).
  */
 export const FIELD_ACTION_CLEANUP_MS = 10_000
+/** Presses of one module that did not stop within the cleanup limit before its buttons are refused (`Stragglers`). */
+export const MAX_PRESS_STRAGGLERS = 4
 
 export type HostResult = { readonly ok: true } | { readonly ok: false; readonly error: ErrorInfo }
 
@@ -276,6 +284,12 @@ export interface ModuleHost {
    * `[secret]`, then clipped to `max` characters.
    */
   readonly pageText: (moduleId: string, text: unknown, max: number) => string
+  /**
+   * P3: a route as an admin page shows it (`ModuleInfo.routes`, the admin route view): what the module declared
+   * passes the boundary (a path that holds a secret shown redacted, such a token name left out, the description
+   * redacted and clipped). The live route is unchanged.
+   */
+  readonly routeView: (moduleId: string, route: ModuleRoute) => ModuleRouteInfo
   /**
    * The `settingOptions` of a running module (its instance with the shared settings): choices known only while it
    * runs, such as the models Claude Code reports at start. `undefined` when the module does not run or gives none.
@@ -753,27 +767,46 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
       })
     }
   })
-  /** Module code is about to get `settings`: its secret values are remembered by the boundary (a lock cannot forget them). */
-  const given = <T>(entry: Entry, settings: T): T => {
+  /**
+   * Module code is about to get `settings`: the boundary keeps their secret values for as long as `holders` live (the
+   * part that receives them, a press until it has ended and been answered, a health check), whatever the vault does
+   * meanwhile.
+   */
+  const given = <T>(entry: Entry, holders: ReadonlyArray<object>, settings: T): T => {
     if (typeof settings === "object" && settings !== null) {
       const record = settings as Readonly<Record<string, unknown>>
-      boundary.remember(entry.def.id, secretKeys(entry).map((key) => (Object.hasOwn(record, key) ? record[key] : undefined)))
+      const values = secretKeys(entry).map((key) => (Object.hasOwn(record, key) ? record[key] : undefined))
+      for (const holder of holders) boundary.remember(entry.def.id, holder, values)
     }
     return settings
   }
   const fieldActionTimeoutMs = options.fieldActionTimeoutMs ?? FIELD_ACTION_TIMEOUT_MS
   const fieldActionCleanupMs = options.fieldActionCleanupMs ?? FIELD_ACTION_CLEANUP_MS
-  /** An owner of field-action presses (`FieldActionOwner`): an instance part's, or the host's. */
-  const pressOwner = (label: (key: string) => string, released: (key: string) => void) => makeFieldActionOwner({ label, cleanupMs: fieldActionCleanupMs, released })
+  /**
+   * Presses of each module that did not stop when asked (across all its owners, so restarts cannot pile them up): at
+   * `MAX_PRESS_STRAGGLERS` its buttons are refused until some end, and Health says so.
+   */
+  const pressStragglers = makeStragglers({
+    cap: MAX_PRESS_STRAGGLERS,
+    cleanupMs: fieldActionCleanupMs,
+    changed: (moduleId, count) => {
+      const entry = byId.get(moduleId)
+      if (entry !== undefined) issues.set(`presses:${moduleId}`, stragglerIssues(moduleId, entry.def.name, "presses", count, MAX_PRESS_STRAGGLERS))
+    }
+  })
+  /** An owner of field-action presses (`FieldActionOwner`): an instance part's (keys are field keys), or the host's (`<module>/<key>`). */
+  const pressOwner = (label: (key: string) => string, released: (key: string) => void, moduleOf: (key: string) => string) =>
+    makeFieldActionOwner({ label, cleanupMs: fieldActionCleanupMs, released, stragglers: pressStragglers, moduleOf })
   /**
    * The host's own presses (a definition's `fieldActions`, which run without an instance), keyed `<module>/<key>`:
    * made once with the host, stopped first when it closes (before anything else stops), refusing presses from then on.
    */
+  const moduleOfKey = (key: string) => key.slice(0, key.indexOf("/"))
   const hostPresses = pressOwner((key) => `field action ${key.replace("/", ".")}`, (key) => {
-    const entry = byId.get(key.slice(0, key.indexOf("/")))
+    const entry = byId.get(moduleOfKey(key))
     // `info` values may have changed with the press.
     if (entry !== undefined) announce(entry)
-  })
+  }, moduleOfKey)
 
   /**
    * Whether the module can run on this server (module API v2): a supported `apiVersion`, a listed platform, and every
@@ -1068,10 +1101,20 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
     }
   }
 
-  /** A live route as the page sees it: its description through the boundary. */
-  const routeView = (moduleId: string, route: ModuleRoute) => {
-    const view = routeInfo(moduleId, route)
-    return view.description === undefined ? view : { ...view, description: boundary.text(moduleId, view.description, 500) }
+  /**
+   * A live route as the page sees it: what the module declared (its path, token name, description) through the
+   * boundary. The live routing identity is unchanged; only the view is: a path that holds a secret is shown redacted,
+   * a token name that does is left out.
+   */
+  const routeView = (moduleId: string, route: ModuleRoute): ModuleRouteInfo => {
+    const { description, token, ...view } = routeInfo(moduleId, route)
+    const prefix = `${MODULE_ROUTES_PREFIX}${moduleId}`
+    return {
+      ...view,
+      path: route.path === "" ? prefix : `${prefix}/${boundary.redact(moduleId, route.path)}`,
+      ...(token !== undefined && !boundary.holds(moduleId, token) ? { token } : {}),
+      ...(description !== undefined ? { description: boundary.text(moduleId, description, MAX_ROUTE_DESCRIPTION) } : {})
+    }
   }
 
   /**
@@ -1093,8 +1136,12 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
     const options = instance?.settingOptions === undefined ? undefined : read(() => instance.settingOptions!())
     const own = <T>(dict: Readonly<Record<string, T>> | undefined, key: string): T | undefined =>
       typeof dict === "object" && dict !== null && Object.hasOwn(dict, key) ? dict[key] : undefined
-    const generated = (entry.def.kind === "agent" || entry.def.kind === "decider") && !Object.hasOwn(entry.def.settings, "test")
-    if (infos === undefined && options === undefined && !generated && !form.fields.some((f) => f.type === "combo")) return form
+    const generated = generatesTest(entry)
+    // Messages may come from a field's own check (module code): through the boundary, like everything it writes.
+    const errors = form.errors.map((e) => ({ ...e, message: boundary.text(entry.def.id, e.message, 2000) }))
+    const warnings = form.warnings?.map((e) => ({ ...e, message: boundary.text(entry.def.id, e.message, 2000) }))
+    const checked = { ...form, errors, ...(warnings !== undefined ? { warnings } : {}) }
+    if (infos === undefined && options === undefined && !generated && !form.fields.some((f) => f.type === "combo")) return checked
     const values: Record<string, SettingValue> = { ...form.values }
     const fields = form.fields.map((field): SettingField => {
       const info = own(infos, field.key)
@@ -1107,8 +1154,10 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
       const list = boundary.options(entry.def.id, own(options, field.key))
       const known = new Set(field.options.map((o) => o.value))
       const added = (list ?? []).filter((o) => !known.has(o.value) && (known.add(o.value), true))
-      const note = instance === undefined ? "Not running: type a name" : list !== undefined ? `${added.length + field.options.length} suggestions from ${entry.def.name}` : undefined
-      return { ...field, options: [...field.options, ...added], ...(note !== undefined && field.optionsNote === undefined ? { optionsNote: note } : {}) }
+      // Within the wire's bounds: at most MAX_COMBO_OPTIONS in all and MAX_OPTIONS_JSON as JSON (the last go).
+      const all = withinOptionBounds([...field.options, ...added], field.options.length)
+      const note = instance === undefined ? "Not running: type a name" : list !== undefined ? `${all.length} suggestions from ${entry.def.name}` : undefined
+      return { ...field, options: all, ...(note !== undefined && field.optionsNote === undefined ? { optionsNote: note } : {}) }
     })
     if (generated) {
       fields.push({
@@ -1122,8 +1171,11 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
         source: "default"
       })
     }
-    return { ...form, fields, values }
+    return { ...checked, fields, values }
   }
+
+  /** An agent or decision provider without a `test` field of its own gets the generated Test button. */
+  const generatesTest = (entry: Entry) => (entry.def.kind === "agent" || entry.def.kind === "decider") && !Object.hasOwn(entry.def.settings, "test")
 
   const templatesOf = (entry: Entry): Array<AssistantTemplate> =>
     (entry.def.templates ?? []).map((t) => ({
@@ -1174,12 +1226,14 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
     }
     const { error, state } = stateOf(entry)
     if (state === "error" && entry.catalogError === undefined) {
-      out.push({ id: `${id}.start`, module: id, severity: "error", title: `${name} could not start`, detail: error ?? "", fix: page })
+      // The start error may be the module's own words: through the boundary (the host's words around it are not).
+      out.push({ id: `${id}.start`, module: id, severity: "error", title: `${name} could not start`, detail: boundary.redact(id, error ?? ""), fix: page })
     }
     if (entry.kept !== undefined) {
-      out.push({ id: `${id}.restart`, module: id, severity: "warning", title: entry.kept.title, detail: `It keeps running as it was. ${entry.kept.message}`, fix: page })
+      out.push({ id: `${id}.restart`, module: id, severity: "warning", title: entry.kept.title, detail: `It keeps running as it was. ${boundary.redact(id, entry.kept.message)}`, fix: page })
     }
-    return normaliseIssues(entry.def.id, entry.def.name, out, (value, max) => boundary.text(entry.def.id, value, max))
+    // Host-made issues: the module's words in them (a start error) passed the boundary above; the rest is the host's.
+    return normaliseIssues(entry.def.id, entry.def.name, out, (value, max) => boundary.text(entry.def.id, value, max), true)
   }
 
   /** Every module's issues again (a change of demand changes the severity of the modules it reaches too). */
@@ -1544,7 +1598,7 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
         register: (registration) => register(part, registration)
       }
       // `info` values may have changed with a press: announced when it ends (only while the part is published).
-      const presses = kind === "instance" ? pressOwner((key) => `field action ${entry.def.id}.${key}`, () => announce(entry)) : undefined
+      const presses = kind === "instance" ? pressOwner((key) => `field action ${entry.def.id}.${key}`, () => announce(entry), () => entry.def.id) : undefined
       const part: Part = {
         id,
         entry,
@@ -1597,6 +1651,8 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
           partById.delete(part.id)
           runningByPart.delete(part.id)
           shareds.delete(part.id)
+          // Its code has ended: the secrets only it was given are no longer looked for.
+          boundary.release(part)
           Deferred.doneUnsafe(done, Effect.void)
           announce(part.entry)
         }))
@@ -1688,8 +1744,9 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
       pass.parts.push(part)
       let run: SharedRun | undefined
       // The boundary remembers what module code is given (a vault locked since cannot make it showable).
-      given(entry, spec.settings)
-      boundary.remember(entry.def.id, Object.values(spec.secrets))
+      given(entry, [part], spec.settings)
+      // `settingsFor` resolves with these too (the environment's are current values anyway).
+      boundary.remember(entry.def.id, part, Object.values(spec.secrets))
       const context = { settings: spec.settings as never, settingsFor: settingsForOf(entry, spec) as never, ...servicesFor(entry, part.handle) }
       const exit = yield* runStart(part, "Its shared part did not start", () => entry.def.shared!(context))
       if (Exit.isFailure(exit)) return { ok: false, message: describeStartFailure(exit.cause), part }
@@ -1733,7 +1790,7 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
       const refreshForm = () => {
         if (part.state === "live") scheduleStatus(entry)
       }
-      given(entry, settings)
+      given(entry, [part], settings)
       // Version 1 modules get exactly the context they always had; version 2 modules also get the host's services and
       // what their `shared` part returned.
       const context = (entry.def.apiVersion ?? 1) >= 2
@@ -2383,7 +2440,8 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
   const checkOwn = (id: string, own: Readonly<Record<string, unknown>>): ReadonlyArray<FieldError> => {
     const entry = byId.get(id)
     if (entry === undefined) return [{ key: null, message: `There is no module "${id}"` }]
-    return checkOwnValues(entry.def.settings, own)
+    // A field's own check is module code: its messages pass the boundary.
+    return checkOwnValues(entry.def.settings, own).map((e) => ({ ...e, message: boundary.text(id, e.message, 2000) }))
   }
 
   // -- Restarts -------------------------------------------------------------------------------------------------------
@@ -2461,7 +2519,9 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
           issues.set(source, [])
           return Effect.void
         }
-        const settings = given(entry, resolve(entry).value)
+        // The check holds what it is given until its issues are published.
+        const holder = {}
+        const settings = given(entry, [holder], resolve(entry).value)
         const own = (title: string, detail: string): ReadonlyArray<Issue> => [{ id: `${entry.def.id}.health`, module: entry.def.id, severity: "warning", title, detail }]
         // Suspended: a health check that throws is reported like one that fails.
         return Effect.suspend(() => health({ settings, running: isRunning(entry) })).pipe(
@@ -2478,7 +2538,8 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
             Effect.sync(() =>
               issues.set(source, normaliseIssues(entry.def.id, entry.def.name, Array.isArray(list) ? list : [], (value, max) => boundary.text(entry.def.id, value, max)))
             )
-          )
+          ),
+          Effect.ensuring(Effect.sync(() => boundary.release(holder)))
         )
       }),
     { concurrency: "unbounded", discard: true }
@@ -2658,7 +2719,7 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
     const own = partById.get(part.id)!
     return {
       host: {
-        routeTokens: routeTokensFor(entry.def.id),
+        routeTokens: routeTokensFor(entry.def.id, own),
         view,
         service: serviceFor(own),
         contributions,
@@ -2678,8 +2739,11 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
       if (entry === undefined) return Effect.succeed({ ok: false, code: "unknown_module", message: `There is no module "${id}"` } as const)
       if (shuttingDown) return Effect.succeed({ ok: false, code: "not_running", message: "The assistant is stopping" } as const)
       const declared = Object.hasOwn(entry.def.settings, key) ? entry.def.settings[key]! : undefined
-      if (declared !== undefined && declared.value !== "none") {
-        return Effect.succeed({ ok: false, code: "unknown_action", message: `${entry.def.name}: "${key}" is not a button` } as const)
+      // Only a button of the form runs: a declared action field, or the generated Test of an agent or decision
+      // provider. A handler without a field is not a button (whatever `fieldActions` holds).
+      const generated = key === "test" && generatesTest(entry)
+      if (declared === undefined ? !generated : declared.value !== "none") {
+        return Effect.succeed({ ok: false, code: "unknown_action", message: declared === undefined ? `${entry.def.name} has no action "${key}"` : `${entry.def.name}: "${key}" is not a button` } as const)
       }
       // The published main instance (what the form shows): its part owns its presses.
       const running = mainOf(entry)?.running
@@ -2692,15 +2756,14 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
           : undefined
       // The press's owner: the host for a definition's handler (it needs no instance), else the instance part that
       // runs it (its handler, or the generated Test of its agent or decision provider), which stops it before it closes.
-      const definition = handlerOf(entry.def.fieldActions)
-      const test = key === "test" && instance !== undefined ? generatedTest(instance, (text) => boundary.redact(id, text)) : undefined
-      const handler = definition ?? handlerOf(instance?.fieldActions) ?? (test === undefined ? undefined : () => test())
+      const definition = declared === undefined ? undefined : handlerOf(entry.def.fieldActions)
+      const test = generated && instance !== undefined ? generatedTest(instance, (text) => boundary.redact(id, text)) : undefined
+      const handler = definition ?? (declared === undefined ? undefined : handlerOf(instance?.fieldActions)) ?? (test === undefined ? undefined : () => test())
       const owner = definition !== undefined ? hostPresses : running?.part.presses
       const ownerKey = definition !== undefined ? `${id}/${key}` : key
       if (handler === undefined || owner === undefined) {
-        const known = declared !== undefined || (key === "test" && (entry.def.kind === "agent" || entry.def.kind === "decider"))
         return Effect.succeed(
-          known && instance === undefined
+          instance === undefined
             ? { ok: false, code: "not_running", message: `${entry.def.name} is not running` } as const
             : { ok: false, code: "unknown_action", message: `${entry.def.name} has no action "${key}"` } as const
         )
@@ -2717,14 +2780,28 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
       const prepared = useDraft ? draftSettings(entry, values) : savedSettings(entry)
       if (!prepared.ok) return Effect.succeed(answer({ ok: false, text: prepared.message, tone: "error" }))
       const label = `field action ${id}.${key}`
+      // The secrets the press is given are kept by the boundary until the press has ended AND been answered (the
+      // first of the two releases nothing); an instance's press gives them to its instance, which keeps them as long
+      // as it lives.
+      const holder = {}
+      let holds = 2
+      const releaseOne = Effect.sync(() => {
+        if (--holds === 0) boundary.release(holder)
+      })
+      const holders = definition !== undefined || running === undefined ? [holder] : [holder, running.part]
       // Suspended: a handler that throws is reported like one that fails. Outside any turn.
-      const press = outsideTurns(Effect.suspend(() => handler({ settings: given(entry, prepared.settings), draft: useDraft })))
+      const press = outsideTurns(Effect.suspend(() => handler({ settings: given(entry, holders, prepared.settings), draft: useDraft }))).pipe(Effect.ensuring(releaseOne))
       return Effect.gen(function*() {
         const outcome = yield* owner.start(ownerKey, press, fieldActionTimeoutMs)
         switch (outcome._tag) {
           case "busy":
+            boundary.release(holder)
             return { ok: false, code: "busy", message: "That button is still running" } as const
+          case "stuck":
+            boundary.release(holder)
+            return { ok: false, code: "busy", message: `Earlier presses of ${entry.def.name}'s buttons have not stopped yet; try again later (Health has more)` } as const
           case "stopped":
+            boundary.release(holder)
             return { ok: false, code: "not_running", message: `${entry.def.name} is not running` } as const
           case "timeout":
             return answer({ ok: false, text: `Did not finish within ${Math.round(fieldActionTimeoutMs / 1000)} s`, tone: "error" })
@@ -2733,7 +2810,7 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
         // The details may hold anything the handler had (a key in an error message): the server's log only.
         yield* Effect.logWarning(`${label} failed`, outcome.exit.cause)
         return answer({ ok: false, text: "It failed; the server's log says why.", tone: "error" })
-      })
+      }).pipe(Effect.ensuring(releaseOne))
     })
 
   /** The module's saved shared settings (environment > saved > linked default, with secrets), or why they are not usable. */
@@ -2785,25 +2862,35 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
     if (typeof raw !== "object" || raw === null) return undefined
     // Through the boundary, like the form's options (the model pickers show them).
     const out: Record<string, ReadonlyArray<ChoiceOption>> = Object.create(null)
-    for (const [key, list] of Object.entries(raw)) {
+    for (const [key, list] of Object.entries(raw).slice(0, 50)) {
       const options = boundary.options(entry.def.id, list)
-      if (options !== undefined) out[key] = options
+      if (options !== undefined) out[key] = withinOptionBounds(options, 0)
     }
     return out
   }
 
-  /** P3: `host.routeTokens` of one module. */
-  function routeTokensFor(moduleId: string): RouteTokens {
-    if (options.routeTokens !== undefined) return options.routeTokens.forModule(moduleId)
-    const none = new RouteTokenError({ reason: "unavailable", message: "Route tokens are kept by the server (serve mode) only" })
-    return { mint: () => Effect.fail(none), list: Effect.fail(none), revoke: () => Effect.fail(none) }
+  /**
+   * P3: `host.routeTokens` of one part. A token it mints is a secret its code holds: the boundary keeps it for as
+   * long as that part lives (it is never shown again otherwise; the store keeps only its hash).
+   */
+  function routeTokensFor(moduleId: string, part: Part): RouteTokens {
+    if (options.routeTokens === undefined) {
+      const none = new RouteTokenError({ reason: "unavailable", message: "Route tokens are kept by the server (serve mode) only" })
+      return { mint: () => Effect.fail(none), list: Effect.fail(none), revoke: () => Effect.fail(none) }
+    }
+    const store = options.routeTokens.forModule(moduleId)
+    return {
+      list: store.list,
+      revoke: store.revoke,
+      mint: (name, label) => Effect.tap(store.mint(name, label), (minted) => Effect.sync(() => boundary.remember(moduleId, part, [minted.secret])))
+    }
   }
 
   /** P3: the live routes, from the route table the switch fills. */
   const routes = (): ReadonlyArray<PublishedRoute> =>
     [...routeTable].flatMap(([moduleId, live]) => live.routes.map((route) => ({ moduleId, route, scope: live.scope })))
 
-  /** The boundary for the app's own views of module-produced text (the route call log and route descriptions). */
+  /** The boundary for the app's own views of module-produced text (the route call log and token labels). */
   const pageText = (moduleId: string, text: unknown, max: number): string => boundary.text(moduleId, text, max)
 
   // Before any trigger: the unavailable modules' lines, and every module's issues.
@@ -2827,6 +2914,7 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
     gateway,
     fieldAction,
     routes,
+    routeView,
     pageText,
     settingOptions,
     setSecrets,
@@ -2855,24 +2943,27 @@ function normaliseIssues(
   name: string,
   list: ReadonlyArray<Issue>,
   /** The page boundary (P3): a start error or a `health()` result never carries a secret the module was given. */
-  page: (value: unknown, max: number) => string
+  page: (value: unknown, max: number) => string,
+  /** Made by the host (`moduleIssues`, the module's words in it redacted already): only clipped. */
+  hostMade = false
 ): ReadonlyArray<Issue> {
+  const own = (value: unknown, max: number) => (hostMade ? clip(String(value ?? ""), max) : page(value, max))
   return list.slice(0, 50).map((issue, i): Issue => {
     const fix = issue.fix === undefined ? undefined : {
       kind: issue.fix.kind,
-      label: page(issue.fix.label, 200),
-      ...(issue.fix.value !== undefined ? { value: page(issue.fix.value, 1000) } : {})
+      label: own(issue.fix.label, 200),
+      ...(issue.fix.value !== undefined ? { value: own(issue.fix.value, 1000) } : {})
     }
-    // The id is a key, not text: one that holds a secret is replaced whole rather than redacted.
+    // A module's id is a key, not text: one that holds a secret is replaced whole rather than redacted.
     const rawId = String(issue.id ?? "")
     const fullId = rawId.startsWith(`${id}.`) ? rawId : `${id}.${rawId}`
     const out: Issue = {
-      id: page(fullId, Number.MAX_SAFE_INTEGER) === fullId ? clip(fullId, 200) : `${id}.issue-${i}`,
+      id: hostMade || page(fullId, Number.MAX_SAFE_INTEGER) === fullId ? clip(fullId, 200) : `${id}.issue-${i}`,
       module: id,
-      ...(issue.device !== undefined ? { device: page(issue.device, 200) } : {}),
+      ...(issue.device !== undefined ? { device: own(issue.device, 200) } : {}),
       severity: issue.severity,
-      title: page(issue.title, 200),
-      detail: page(issue.detail, 2000),
+      title: own(issue.title, 200),
+      detail: own(issue.detail, 2000),
       ...(fix !== undefined ? { fix } : {})
     }
     if (isWireIssue(out)) return out
@@ -2885,6 +2976,14 @@ function normaliseIssues(
 const TEST_TIMEOUT_MS = 30_000
 
 const quote = (s: string) => (s.length > 120 ? `${s.slice(0, 117)}...` : s)
+
+/** Options within the wire's bounds (`MAX_COMBO_OPTIONS`, `MAX_OPTIONS_JSON`): the last go first, the first `keep` stay. */
+const withinOptionBounds = (options: ReadonlyArray<ChoiceOption>, keep: number): Array<ChoiceOption> => {
+  const out = options.slice(0, Math.max(keep, MAX_COMBO_OPTIONS))
+  let size = JSON.stringify(out).length
+  while (out.length > keep && size > MAX_OPTIONS_JSON) size -= JSON.stringify(out.pop()).length + 1
+  return out
+}
 
 /**
  * Does `object` declare `key` itself or through a class of its own (not `Object.prototype`, and never
@@ -2912,15 +3011,18 @@ const testFailed = (ms: number, label: string, cause: Cause.Cause<unknown>): Eff
   Effect.as(Effect.logWarning(`${label} test failed after ${ms} ms`, cause), { ok: false, text: `Failed after ${ms} ms; the server's log says why.`, tone: "error" as const })
 
 /**
- * One turn outside the conversation: "Say hello in five words.", no history, no tools, already committed. `redact`
- * (the host's page boundary) is applied to the answer before it is quoted short; a failure is logged and answered
- * with a generic sentence. The host clips the whole text after redacting it again.
+ * One turn outside the conversation: "Say hello in five words.", no history, no tools, already committed. Host code:
+ * it never puts a provider's diagnostics or credentials in what it returns (a failure is logged and answered with a
+ * generic sentence), and `redact` (the host's page boundary) sees the answer exactly as the provider sent it, every
+ * delta joined as is, before anything trims or shortens it. The host clips the whole text after redacting it again.
  */
 export const testAgent = (agent: Agent, redact: (text: string) => string = (text) => text): Effect.Effect<FieldActionResult> =>
   Effect.gen(function*() {
     const start = yield* Clock.currentTimeMillis
     let first: number | undefined
-    let text = ""
+    // Every delta as the provider sent it: nothing is trimmed, dropped or joined differently before the boundary
+    // has looked at the whole answer (a secret split over deltas, or with spaces around it, is still found).
+    let raw = ""
     const trace = { id: 0, mode: "text" as const, speculative: false, startedAt: start, marks: {}, tools: [], voices: [] }
     const exit = yield* Stream.suspend(() => agent.turn({
       turnId: 0,
@@ -2945,9 +3047,10 @@ export const testAgent = (agent: Agent, redact: (text: string) => string = (text
       Stream.runForEach((event) =>
         Effect.flatMap(Clock.currentTimeMillis, (now) =>
           Effect.sync(() => {
-            if (event._tag !== "TextDelta" || event.text.trim().length === 0) return
-            first ??= now
-            text += event.text
+            if (event._tag !== "TextDelta") return
+            raw += event.text
+            // Only the first visible text counts for the timing.
+            if (event.text.trim().length > 0) first ??= now
           }))
       ),
       Effect.timeoutOrElse({ duration: TEST_TIMEOUT_MS, orElse: () => Effect.fail(new Error(`no answer within ${TEST_TIMEOUT_MS / 1000} s`)) }),
@@ -2956,7 +3059,8 @@ export const testAgent = (agent: Agent, redact: (text: string) => string = (text
     const end = yield* Clock.currentTimeMillis
     if (Exit.isFailure(exit)) return yield* testFailed(end - start, `Agent ${agent.id}`, exit.cause)
     if (first === undefined) return { ok: false, text: `Done after ${end - start} ms without saying anything.`, tone: "warning" }
-    return { ok: true, text: `First text after ${first - start} ms, done after ${end - start} ms: '${quote(redact(text.trim()))}'`, tone: "ok" }
+    // Redacted first, on exactly what was said; only then trimmed and quoted short.
+    return { ok: true, text: `First text after ${first - start} ms, done after ${end - start} ms: '${quote(redact(raw).trim())}'`, tone: "ok" }
   })
 
 const testActions = registerActions("test", [

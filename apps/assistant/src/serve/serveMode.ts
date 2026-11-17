@@ -1390,6 +1390,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     // P3: module HTTP routes under /api/modules/ (docs/UI-AND-MODULES.md §1.11), and their admin view in the API.
     const moduleRouter = makeModuleRouter({
       host,
+      issues: host.issues,
       admin,
       tokens: routeTokens,
       services,

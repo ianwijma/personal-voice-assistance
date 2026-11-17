@@ -677,18 +677,38 @@ dropped (a changed value would change what choosing it means); only `value`, `la
 and known `tags` of a runtime option are passed on. The same applies to `ModuleHost.settingOptions` (the model
 pickers). They never take part in an instance's settings key.
 
-**The page boundary** (`packages/core/src/PageBoundary.ts`, review round 2). Everything a module produces at run time
-that an admin page shows passes one boundary in the host: field-action results, `info` values, runtime combo options
-(form and `settingOptions`), status lines (the module's and each instance's), start errors (the module's state, each
-instance's, the result of a save, enable or disable that failed to start it), Health issues (the host's issues about
-the module and what its `health()` returns), its tools' names and descriptions, route descriptions (on the module
-and in the route view) and route call-log notes (`ModuleHost.pageText`, which the router uses). It replaces with
-`[secret]` every secret value the module has been given since the host started (the settings its `shared`, `start`,
-field actions and `health()` were called with: at most 64 values per module, kept in memory) and every one known now
-(saved, environment), and their JSON-escaped and URL-encoded forms, **before** anything is clipped. A vault locked
-since, or a key rotated since, therefore does not make a running instance's old key showable, and clipping cannot
-leave a prefix that no longer matches. Values shorter than four characters are not looked for (they protect nothing,
-and replacing every "t" would leave the page unreadable). An issue id that holds a secret is replaced whole.
+**Secrets and the admin page** (review round 3). Three parts, each with its own guarantee:
+
+1. **The host itself never puts a secret on a page or in an admin response**, by construction and by field kind, not
+   by looking at text. A secret field's value is never in a form (`SettingsForm.secrets` says only whether it is set
+   and where from), never in an assistant's own values (a secret cannot be one), never quoted by a validation message
+   (no host message quotes a rejected value of any field: "PICK in the environment is not valid: …"), never in an
+   environment-view entry (keys and kinds only), never in a draft a button press applies (secrets stay the saved
+   ones) and never in a generated Test's answer about a provider failure (a generic sentence; details go to the
+   log). A route token's secret is shown once, in the answer to the mint that made it; only its hash is stored, and
+   no list, view or log shows it again. Token labels and purposes are what an admin (or the module) entered.
+2. **Text written by a module's own code is the module's responsibility.** Modules are compiled into the app and
+   trusted. **Never put a secret, or anything derived from one, in a status line, an error, an action result, an
+   `info` value, an option label or value, a route path, description or token name, or a token label.** Say what
+   happened instead ("Signed in", "The key was refused").
+3. **The page boundary** (`packages/core/src/PageBoundary.ts`) is a safety net under part 2 with an exact contract.
+   Before module-written text reaches an admin page (field-action results, `info` values, runtime combo options on
+   the form and in `settingOptions`, status lines, start errors and failed saves, Health issues, the messages of a
+   field's own `check` in the form, in an assistant's own values and in a refused save, tool names and descriptions,
+   route paths, token names and descriptions, token labels and the route call log), **every exact, case-sensitive
+   occurrence** of a current or earlier value of a secret field of that module, of any length from one character up
+   (the empty string is no value), is replaced by `[secret]`; overlapping occurrences become one. Matching happens on
+   the whole text before it is clipped, and a text longer than 64 KB is not shown at all. Current values: saved,
+   proposed and environment ones. Earlier values: those the module's code was given, kept for as long as any holder
+   that received them lives (a shared part or instance of the module until it is closed, a field-action press until it
+   has ended and been answered, a health check until its issues are published), with no eviction while it lives.
+   Tokens the module mints through `host.routeTokens` are kept the same way, with the minting part as holder. At most
+   1024 distinct values are kept per module; a value beyond that is not forgotten: while any holder given such a
+   value lives, every text of that module is replaced by one fixed sentence (and its runtime options are dropped). A
+   runtime option whose machine value holds a value is dropped. A route path that holds a value is shown redacted and
+   such a token name is not shown (the live route is unchanged). **It does not promise to find a secret that module
+   code encoded, split, hashed or transformed** (URL- or JSON-escaped, upper-cased, cut in two): only exact
+   occurrences. A module whose secret is one letter gets heavily redacted text, which is correct.
 
 **Field actions.** A button's handler is, in this order: the definition's `fieldActions[key]` (runs whether or not
 the module runs: a Test button that checks an address before it is saved), the running instance's
@@ -703,17 +723,20 @@ any turn. **Ownership** (`packages/core/src/FieldActionOwner.ts`): a press belon
 definition's handler, the published main instance's part for an instance's handler or a generated Test. The owner
 ties its lifetime, its button's busy state and its cleanup together: one press per button at a time (`busy`), and the
 button stays busy until the press's fiber has really ended (never freed by a timer; an old press cannot free a newer
-one). Owners belong to the reconciler's parts: every instance part is made with its own, and closing the part (a
-retired instance after its grace period, a discarded candidate, everything at shutdown, in the host's closing order:
-instances before their shared part, consumers before providers) first stops its presses, interrupting each and
-waiting until it has ended, and only then closes the part's scope, so what a press uses (the instance's resources,
-then its shared part's) is still open for its cleanup. A press in flight when its instance is replaced runs on with
-the retired instance until that closes; new presses go to the newly published one. The host's own owner is made with
-the host and stopped first when the host closes, before anything else; from then on every press is answered
-`not_running`, as is a press on an instance being stopped. It has 8 s: at the deadline the press is answered "Did not finish within
-8 s" at once while its interruption and finalizers run on in the background; one still running 10 s later
-(`FIELD_ACTION_CLEANUP_MS`) is logged and still waited for. A press stuck forever keeps its button busy until the
-instance is restarted (which waits for it before closing). A failure or defect is answered with one generic
+one). Owners belong to parts: an instance part is made with its own when it starts, and closing the part (by the
+host's ordinary close step, whenever and in whatever order the host closes things: instances before their shared
+part, consumers before providers) first stops its presses, interrupting each and waiting until it has ended, and only
+then closes the part's scope, so what a press uses (the instance's resources, then its shared part's) is still open
+for its cleanup. A press is admitted only by a published part; one in flight when its part is withdrawn runs on until
+the part is closed (after the host's grace period). The host's own owner is made with the host and stopped first when
+the host closes, before anything else; from then on every press is answered `not_running`, as is a press on a part
+being closed. It has 8 s: at the deadline the press is answered "Did not finish within 8 s" at once while its
+interruption and finalizers run on in the background; one still running 10 s later (`FIELD_ACTION_CLEANUP_MS`) is
+logged, still waited for (its button stays busy), and counts as a straggler of its module; at 4
+(`MAX_PRESS_STRAGGLERS`, across all its parts, so restarts cannot pile them up) the module's buttons are answered
+`busy` until some end, and Health says so (`<module>.presses-stuck`). Only a declared `action` field (or the generated
+`test` of an agent or decision provider) is a button: a `fieldActions` entry without a field is never run
+(`unknown_action`). A failure or defect is answered with one generic
 sentence ("It failed; the server's log says why.") and its details go to the server's log; a generated Test's
 provider failure too ("Failed after N ms; the server's log says why."). Result text passes the page boundary and is
 then clipped to 500 characters; a generated agent Test redacts the answer before quoting it short. The page sends `module.action { moduleId, key, values? }` (admin only); the
@@ -724,9 +747,13 @@ then clipped to 500 characters; a generated agent Test redacts the answer before
 `/api/modules/<moduleId>/<path>` while that shared part is the published one (so a stopped module's paths answer
 404 at once). Routes are one registration kind of the host's reconciler (docs/ARCHITECTURE.md "Module host:
 registrations"): the "route" registrar in `ModuleHost.ts` checks a started shared part's routes before the switch
-(`routeProblem`: a bad route refuses the part, and with it the whole generation, which is closed and never
-published), the switch that publishes the part puts its routes in the live route table under the module id, and the
-switch that withdraws it (a new generation, a stop, shutdown) takes them out. The router, guards, tokens and call log only read
+(`routeProblem`: a bad route refuses the part, which is closed and never published; at most 32 routes, paths of at
+most 200 characters, a known body mode), the step that publishes the part
+puts its routes in the live route table under the module id, and the step that withdraws the part (a stop, a
+replacement, shutdown) takes out its own entry. A route is therefore answered only while its module's shared part is
+published; a request in flight when the part is withdrawn finishes within the grace period or, when the part is
+closed, is interrupted and answered 503. The route table knows nothing of generations, only "published or not". The
+router, guards, tokens and call log only read
 `ModuleHost.routes()`. The contract is `packages/core/src/ModuleRoutes.ts`; the server is `apps/assistant/src/serve/moduleRoutes.ts`.
 
 ```ts
@@ -761,8 +788,10 @@ RouteResponse = { status /* 200–599 */, headers?, body?: string | Uint8Array |
   these steps is a 500 for that request, never the process's.
 - **The handler** runs in its own fiber in its shared part's scope: when that part is closed (a restart's or a stop's
   grace period over) the handler is interrupted and the caller gets 503. At its time limit the caller gets 504 at
-  once; the interruption and the handler's finalizers run on in the background, bounded by 10 s
-  (`ROUTE_CLEANUP_MS`) and logged if they overrun. A failure or defect answers 500 (logged; nothing of it is sent).
+  once; the interruption and the handler's finalizers run on in the background. One that has not ended 10 s later
+  (`ROUTE_CLEANUP_MS`) is logged and counts as a straggler of its module until it does; at 8
+  (`MAX_ROUTE_STRAGGLERS`) every new request to the module's routes is answered 503 (after 404 and 405) until some
+  end, and Health says so (`<module>.routes-stuck`). The work is bounded in number, not in time. A failure or defect answers 500 (logged; nothing of it is sent).
   The response must have a final status (200–599; anything else is a 500, logged), and header names and values must
   be valid (else the whole answer is a 500, and the call log records the status really sent). Nothing here runs on a
   turn or the WebSocket. Answers carry `Cache-Control: no-store` and `nosniff`; a handler cannot set framing headers
@@ -795,7 +824,9 @@ RouteResponse = { status /* 200–599 */, headers?, body?: string | Uint8Array |
   shown once. A presented token is hashed and compared with every candidate in constant time. Revoking one stops it
   at once. While the vault is locked tokens cannot be checked, listed or minted: token routes answer 503 with a plain
   reason. A module holds at most 20 tokens, judged inside the store's serialized save (two mints at once cannot both
-  take the last place). Modules mint, list and revoke their own through `host.routeTokens` (`mint(name, label)`,
+  take the last place). While the settings files are damaged and wait for the owner's save (`blocked()`), no token can
+  be minted or revoked (409 `blocked`, checked again inside the serialized save): a token change never counts as the
+  owner's word that the files are right, so it never unblocks the store or starts anything. Modules mint, list and revoke their own through `host.routeTokens` (`mint(name, label)`,
   `list`, `revoke(id)`); the owner does it on the module page, choosing the token's purpose (its name) when the
   module's routes accept more than one.
 - **Admin view** (`GET /api/module-routes[?module=<id>]`, admin token): each module's routes with guards and limits,

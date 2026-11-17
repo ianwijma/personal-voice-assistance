@@ -12,6 +12,7 @@ import {
   isEmptyPatch,
   onlyReloadFields,
   reconcile,
+  resetDraftValue,
   someReloadFields
 } from "@/lib/forms.ts"
 
@@ -50,6 +51,11 @@ export interface FormState {
    * keeps for itself (a number being typed, a list item not added yet) goes with the draft it belonged to.
    */
   readonly epoch: number
+  /**
+   * Per field, raised by "Reset to the default": that field alone is drawn again, so its renderer's private state
+   * (text being typed, a rejected item, a record's row state) and its local error go with the value it replaced.
+   */
+  readonly fieldEpochs: Readonly<Record<string, number>>
 }
 
 let epochSeq = 0
@@ -79,7 +85,8 @@ const fresh = (def: PageFormDef): FormState => ({
   serverErrors: [],
   localErrors: {},
   confirm: [],
-  epoch: ++epochSeq
+  epoch: ++epochSeq,
+  fieldEpochs: {}
 })
 
 export const usePageForms = (defs: ReadonlyArray<PageFormDef>, saved: (key: string) => unknown, fns: SaveFns) => {
@@ -135,6 +142,25 @@ export const usePageForms = (defs: ReadonlyArray<PageFormDef>, saved: (key: stri
     setDraft: (key: string, f: (d: Draft) => Draft) => {
       setSavedFlash(false)
       update(key, (s) => ({ ...s, confirm: [], sync: { ...s.sync, draft: f(s.sync.draft) } }))
+    },
+    /**
+     * "Reset to the default" of one field: its value replaced by the default (saved as `null`), its local error
+     * cleared and its renderer drawn again (`fieldEpochs`), other fields untouched.
+     */
+    resetField: (key: string, field: SettingField) => {
+      setSavedFlash(false)
+      update(key, (s) => {
+        const { [field.key]: _gone, ...localErrors } = s.localErrors
+        return {
+          ...s,
+          confirm: [],
+          localErrors,
+          // The refused save's errors of this field were about the value it no longer has.
+          serverErrors: s.serverErrors.filter((e) => e.key !== field.key),
+          fieldEpochs: { ...s.fieldEpochs, [field.key]: (s.fieldEpochs[field.key] ?? 0) + 1 },
+          sync: { ...s.sync, draft: resetDraftValue(s.sync.draft, field) }
+        }
+      })
     },
     setLocalError: (key: string, field: string, message: string | undefined) =>
       update(key, (s) => {

@@ -27,6 +27,19 @@ export const MAX_ROUTE_BODY_BYTES = 1_048_576
 export const ROUTE_CALL_LOG_SIZE = 20
 /** Tokens a module may hold at once. */
 export const MAX_ROUTE_TOKENS_PER_MODULE = 20
+/** Routes one module may declare. */
+export const MAX_ROUTES_PER_MODULE = 32
+/** A route's path after `/api/modules/<id>/`, characters. */
+export const MAX_ROUTE_PATH = 200
+/** A route's description as the admin page shows it, characters (the host clips a longer one). */
+export const MAX_ROUTE_DESCRIPTION = 500
+/** A route token's label (who it is for), characters. */
+export const MAX_ROUTE_TOKEN_LABEL = 80
+/** Modules in one `GET /api/module-routes` answer. */
+export const MAX_ROUTE_MODULES = 500
+
+/** A bounded string: at most `max` characters. */
+const Text = (max: number) => Schema.String.check(Schema.isMaxLength(max))
 
 export const RouteMethod = Schema.Literals(["GET", "POST", "PUT", "PATCH", "DELETE"])
 export type RouteMethod = typeof RouteMethod.Type
@@ -35,14 +48,14 @@ export const RouteGuard = Schema.Literals(["admin", "token", "lan"])
 export type RouteGuard = typeof RouteGuard.Type
 
 /** A route token's name (what kind of caller it is for, chosen by the module): "hook", "callback". */
-export const RouteTokenName = Schema.String.check(Schema.isPattern(/^[a-z][a-z0-9-]{0,31}$/))
+export const RouteTokenName = Schema.String.check(Schema.isPattern(/^[a-z][a-z0-9-]{0,31}$/), Schema.isMaxLength(32))
 
 /** What a module's route exposes (no handler, nothing secret). */
 export const ModuleRouteInfo = Schema.Struct({
   method: RouteMethod,
-  /** The full path pattern, `/api/modules/<id>/hook/:name`. */
-  path: Schema.String,
-  guards: Schema.Array(RouteGuard),
+  /** The full path pattern, `/api/modules/<id>/hook/:name` (the prefix, the module id, the route's own path). */
+  path: Text(MAX_ROUTE_PATH + 100),
+  guards: Schema.Array(RouteGuard).check(Schema.isMaxLength(3)),
   /** Declared without any guard (an OAuth callback). */
   public: Schema.Boolean,
   /** For a `token` guard: the token name the route accepts. */
@@ -50,7 +63,7 @@ export const ModuleRouteInfo = Schema.Struct({
   bodyLimitBytes: NonNegativeInt,
   /** Requests per minute from one caller address; and from all callers together. */
   ratePerMinute: Schema.Struct({ perAddress: NonNegativeInt, total: NonNegativeInt }),
-  description: Schema.optionalKey(Schema.String)
+  description: Schema.optionalKey(Text(MAX_ROUTE_DESCRIPTION))
 })
 export type ModuleRouteInfo = typeof ModuleRouteInfo.Type
 
@@ -59,13 +72,13 @@ export const RouteCall = Schema.Struct({
   /** Epoch ms. */
   at: Schema.Finite,
   /** The caller's address as the socket saw it (forwarding headers are not read). */
-  address: Schema.String,
+  address: Text(64),
   status: NonNegativeInt,
   ms: Schema.Finite,
   /** The token's label, when a token guard passed. */
-  token: Schema.optionalKey(Schema.String),
+  token: Schema.optionalKey(Text(MAX_ROUTE_TOKEN_LABEL)),
   /** Why it was refused, in a few words. */
-  note: Schema.optionalKey(Schema.String)
+  note: Schema.optionalKey(Text(120))
 })
 export type RouteCall = typeof RouteCall.Type
 
@@ -75,7 +88,7 @@ export const RouteTokenInfo = Schema.Struct({
   moduleId: ModuleId,
   name: RouteTokenName,
   /** Who it is for: "Home Assistant automations". */
-  label: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(80)),
+  label: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(MAX_ROUTE_TOKEN_LABEL)),
   createdAt: Schema.Finite,
   /** Since the server started. */
   lastUsedAt: Schema.optionalKey(Schema.Finite)
@@ -88,9 +101,10 @@ export const ModuleRoutesResponse = Schema.Struct({
     moduleId: ModuleId,
     /** False while the module's shared part does not run: its paths answer 404. */
     running: Schema.Boolean,
-    routes: Schema.Array(Schema.Struct({ ...ModuleRouteInfo.fields, calls: Schema.Array(RouteCall) })),
-    tokens: Schema.Array(RouteTokenInfo)
-  })),
+    routes: Schema.Array(Schema.Struct({ ...ModuleRouteInfo.fields, calls: Schema.Array(RouteCall).check(Schema.isMaxLength(ROUTE_CALL_LOG_SIZE)) }))
+      .check(Schema.isMaxLength(MAX_ROUTES_PER_MODULE)),
+    tokens: Schema.Array(RouteTokenInfo).check(Schema.isMaxLength(MAX_ROUTE_TOKENS_PER_MODULE))
+  })).check(Schema.isMaxLength(MAX_ROUTE_MODULES)),
   /** The vault is locked: tokens cannot be listed, minted or checked (token routes answer 503). */
   tokensLocked: Schema.Boolean,
   /**
@@ -106,5 +120,5 @@ export const MintRouteTokenRequest = Schema.Struct({ name: RouteTokenName, label
 export type MintRouteTokenRequest = typeof MintRouteTokenRequest.Type
 
 /** The answer: the token's secret, shown once. */
-export const MintRouteTokenResponse = Schema.Struct({ token: RouteTokenInfo, secret: Schema.String })
+export const MintRouteTokenResponse = Schema.Struct({ token: RouteTokenInfo, secret: Text(256) })
 export type MintRouteTokenResponse = typeof MintRouteTokenResponse.Type

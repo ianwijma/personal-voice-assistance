@@ -146,7 +146,7 @@ import { seedTraces } from "./traces.ts"
 import { createVoiceAssistants, scenarioSettings, scriptedTurn } from "./voiceAssistants.ts"
 import { encodeWav, MOCK_PROVIDERS } from "./voices.ts"
 import { createModelPickersMock } from "./modelPickers.ts"
-import { createModuleRoutesMock, demoHomeAction, demoHomeModule } from "./demoHome.ts"
+import { createModuleRoutesMock, demoHomeAction, demoHomeModule, TokenRefusal } from "./demoHome.ts"
 import type { Condition, FieldError } from "@pva/protocol"
 
 const PORT = Number(process.env.MOCK_PORT ?? 8787)
@@ -897,7 +897,8 @@ let connSeq = 0
 const voiceSessions = new Map<string, VSession>()
 let conversationSeq = 0
 let modules = initialModules()
-const moduleRoutesMock = createModuleRoutesMock()
+// Reads the mock's vault each time (declared below): locked, tokens are neither listed nor changed.
+const moduleRoutesMock = createModuleRoutesMock(() => vault.state === "locked")
 /** Protocol 7: assistants, device types and the devices' own sections (mock/assistants.ts). */
 const assistantsMock = createAssistantsMock({
   modules: () => modules,
@@ -1255,6 +1256,7 @@ const resetState = () => {
   voiceSessions.clear()
   lastSessions = ""
   modules = initialModules()
+  moduleRoutesMock.reset()
   forcedErrors.clear()
   models = initialModels()
   sections = withWarnings(initialSections())
@@ -2704,6 +2706,15 @@ const apiRoute = async (req: IncomingMessage, res: ServerResponse, path: string,
       throw new ApiFail(400, "invalid_request", "The request body is not valid JSON")
     }
   }
+  /** A refused token operation, answered as the real server does (status and code). */
+  const refusedAs = <A>(f: () => A): A => {
+    try {
+      return f()
+    } catch (error) {
+      if (error instanceof TokenRefusal) throw new ApiFail(error.status, error.code, error.message)
+      throw error
+    }
+  }
   // Protocol 10: the admin view of module routes and their tokens (as the real server's /api/module-routes).
   const routesMatch = /^module-routes(?:\/([a-z][a-z0-9-]{0,39})\/tokens(?:\/([a-f0-9]{8,32}))?)?$/.exec(path)
   if (routesMatch !== null) {
@@ -2721,10 +2732,12 @@ const apiRoute = async (req: IncomingMessage, res: ServerResponse, path: string,
       if (typeof b.name !== "string" || !/^[a-z][a-z0-9-]{0,31}$/.test(b.name) || typeof b.label !== "string" || b.label.trim() === "") {
         throw new ApiFail(400, "invalid_request", "A token needs a name and a label")
       }
-      return { status: 201, body: moduleRoutesMock.mint(moduleId, b.name, b.label.trim()) }
+      const name = b.name
+      const label = b.label
+      return { status: 201, body: refusedAs(() => moduleRoutesMock.mint(moduleId, name, label)) }
     }
     only("DELETE")
-    if (!moduleRoutesMock.revoke(moduleId, tokenId)) throw new ApiFail(404, "not_found", "There is no such token (it may have been revoked already)")
+    if (!refusedAs(() => moduleRoutesMock.revoke(moduleId, tokenId))) throw new ApiFail(404, "not_found", "There is no such token (it may have been revoked already)")
     return { status: 200, body: { revoked: true } }
   }
   if (path === "voice-providers") {

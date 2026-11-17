@@ -22,7 +22,7 @@ import { JobInfo, ModelSet } from "./jobs.ts"
 import { VaultInfo } from "./vault.ts"
 import { AdminState } from "./admin.ts"
 import { AssistantTemplate, HealthInfo, ModuleUnavailable } from "./health.ts"
-import { ModuleRouteInfo } from "./moduleRoutes.ts"
+import { MAX_ROUTES_PER_MODULE, ModuleRouteInfo } from "./moduleRoutes.ts"
 
 /** A one-line status a running module publishes, e.g. "Connected · 143 entities". */
 export const StatusLine = Schema.Struct({
@@ -135,7 +135,7 @@ export const ModuleInfo = Schema.Struct({
    * Protocol 10: the HTTP routes its shared part declares (docs/UI-AND-MODULES.md §1.11), while it runs. Absent =
    * none. The recent calls and the tokens are read through the admin API (`GET /api/module-routes`).
    */
-  routes: Schema.optionalKey(Schema.Array(ModuleRouteInfo))
+  routes: Schema.optionalKey(Schema.Array(ModuleRouteInfo).check(Schema.isMaxLength(MAX_ROUTES_PER_MODULE)))
 })
 export type ModuleInfo = typeof ModuleInfo.Type
 

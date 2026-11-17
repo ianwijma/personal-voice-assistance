@@ -8,8 +8,13 @@ export interface FieldContext {
   readonly form: { readonly kind: "module" | "section"; readonly id: string }
   /** The form has unsaved edits. */
   readonly dirty: boolean
-  /** The form's draft values (every non-secret field). */
+  /** The form's draft values: the non-secret fields shown now (a hidden field's draft is never sent). */
   readonly draftValues: Readonly<Record<string, SettingValue>>
+  /**
+   * A shown field holds what it cannot accept yet (its local error, "Fields: Enter a number"): the form's draft is not
+   * what the page shows, so nothing may act on it (a button press is refused with this message, as Save is).
+   */
+  readonly invalid?: string
 }
 
 export interface FieldProps<F extends SettingField = SettingField> {
