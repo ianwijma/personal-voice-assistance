@@ -528,6 +528,30 @@ test.describe("admin, desktop, dark", () => {
     await page.screenshot({ path: join(dir, "admin-desktop-77-module-extended-fields.png"), clip: { x: 0, y: Math.max(0, box.y - 24), width: 1280, height: Math.min(2400 - Math.max(0, box.y - 24), box.height + 120) } })
   })
 
+  test("people, rooms and device capabilities (protocol 11): Members, a device's Place and What it can do", async ({ page, baseURL }) => {
+    await mock.scenario("devices")
+    await loginAdmin(page, baseURL, "#settings/shared/members")
+    const members = page.getByTestId("page-shared-members")
+    await expect(members).toBeVisible()
+    await members.getByTestId("records-HOUSEHOLD_MEMBERS").getByRole("button", { name: /^Sam/ }).click()
+    await page.setViewportSize({ width: 1280, height: 1500 })
+    await page.mouse.move(2, 2)
+    await settle(page)
+    await shot(page, "admin-desktop-78-members")
+    // The Kitchen iPad: in the kitchen, shared, always on; Sam's phone follows the defaults.
+    await mock.device({ place: { room: "Kitchen", privacy: "shared", alwaysOn: true, acceptsFromOthers: true, quietRoom: false, defaultPerson: "p-sam00001" } }, "d-kitchen-ipad-0001")
+    await gotoAdmin(page, baseURL, "#settings/devices/d-kitchen-ipad-0001")
+    const place = page.getByTestId("section-place")
+    await expect(place).toBeVisible()
+    await page.setViewportSize({ width: 1280, height: 2400 })
+    await place.scrollIntoViewIfNeeded()
+    await page.mouse.move(2, 2)
+    await settle(page)
+    const top = (await place.boundingBox())!
+    const bottom = (await page.getByTestId("section-capabilities").boundingBox())!
+    await page.screenshot({ path: join(dir, "admin-desktop-79-device-place-and-capabilities.png"), clip: { x: 0, y: Math.max(0, top.y - 24), width: 1280, height: bottom.y + bottom.height - top.y + 48 } })
+  })
+
   test("shared settings: the navigation, the accounts, a module in error", async ({ page, baseURL }) => {
     await mock.scenario("modules")
     await loginAdmin(page, baseURL, "#settings/shared/accounts")

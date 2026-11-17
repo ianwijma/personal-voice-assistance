@@ -232,7 +232,7 @@ describe("household rows on voice pages: person scope through Privacy.mayReveal 
         type: "lists.items.changed",
         scope: row.scope,
         data: undefined,
-        change: { seq: 9, opId: "o", at: 1, module: "lists", collection: "items", id: row.id, op: "update" as const, rev: row.rev, scope: row.scope, actor: {}, row }
+        change: { seq: 9, opId: "o", at: 1, module: "lists", collection: "items", id: row.id, op: "update" as const, rev: row.rev, scope: row.scope, actor: { kind: "admin" as const }, row }
       }
       expect(feed.live(event, { id: "phone-0001", privacy: "private" })?.data).toMatchObject({ op: "put", value: { text: "Robin's" } })
       expect(feed.live(event, { id: "kitchen-01", privacy: "shared", defaultPerson: "p-sam" })).toBeUndefined()
