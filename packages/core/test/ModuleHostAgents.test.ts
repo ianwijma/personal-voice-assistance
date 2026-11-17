@@ -1,4 +1,5 @@
 // Piece A: agents, deciders and actions as module contributions (docs/AGENTS-AND-INTENTS.md §1.6, §3.2).
+import { defaultGateway } from "../src/Gateway.ts"
 import { assert, describe, it } from "@effect/vitest"
 import { Effect, Schema, Stream } from "effect"
 import { actionTool, defineAction, Param, registerActions, resolveOption } from "../src/Actions.ts"
@@ -49,21 +50,25 @@ describe("actionTool", () => {
     assert.deepStrictEqual(json.required, ["target"])
   })
 
-  it.effect("resolves a spoken name against the current options and runs the action", () =>
+  it.effect("resolves a spoken name against the current options and runs the action (through the gateway only)", () =>
     Effect.gen(function*() {
       switched.length = 0
-      assert.strictEqual(yield* tool.execute({ target: "the living room" }), "area:living_room on.")
-      assert.strictEqual(yield* tool.execute({ target: "Woonkamer" }), "area:living_room on.")
+      // Called directly, the generated tool refuses: only the execution gateway runs an action.
+      const direct = yield* Effect.flip(tool.execute({ target: "the living room" }))
+      assert.match(direct.message, /only through the execution gateway/)
+      assert.deepStrictEqual(switched, [])
+      assert.strictEqual(yield* defaultGateway.tool("demo-home", tool, { target: "the living room" }), "area:living_room on.")
+      assert.strictEqual(yield* defaultGateway.tool("demo-home", tool, { target: "Woonkamer" }), "area:living_room on.")
       assert.deepStrictEqual(switched, ["area:living_room", "area:living_room"])
-      const error = yield* Effect.flip(tool.execute({ target: "garage" }))
+      const error = yield* Effect.flip(defaultGateway.tool("demo-home", tool, { target: "garage" }))
       assert.strictEqual(error.message, "Unknown room or light \"garage\". Valid names: Living room, Kitchen")
     }))
 
   it.effect("checks number ranges", () =>
     Effect.gen(function*() {
       const t = actionTool(registerActions("demo-home", [setBrightness])[0]!)
-      assert.strictEqual(yield* t.execute({ target: "kitchen", level: 40 }), "area:kitchen at 40 percent.")
-      const error = yield* Effect.flip(t.execute({ target: "kitchen", level: 140 }))
+      assert.strictEqual(yield* defaultGateway.tool("demo-home", t, { target: "kitchen", level: 40 }), "area:kitchen at 40 percent.")
+      const error = yield* Effect.flip(defaultGateway.tool("demo-home", t, { target: "kitchen", level: 140 }))
       assert.match(error.message, /from 0 to 100/)
     }))
 

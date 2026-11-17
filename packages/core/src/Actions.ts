@@ -378,20 +378,9 @@ export const actionTool = (registered: RegisteredAction): Tool => {
     ...(def.risk !== undefined ? { risk: typeof def.risk === "string" ? def.risk : riskOfValues(registered, def.risk) } : {}),
     ...(def.sensitivity !== undefined ? { sensitivity: def.sensitivity } : {}),
     ...(def.latency !== undefined ? { latency: def.latency } : {}),
-    // Reached only through the gateway, which turns the input into values once and runs `runActionForTool` itself;
-    // this path stays for a caller that runs the tool directly.
-    execute: (input: Readonly<Record<string, unknown>>) =>
-      Effect.suspend(() => {
-        // Never through a registry: only core's confirmation (`consumeConfirmation`) runs such an action.
-        if (needsYes) return Effect.fail(new ToolError({ message: "Not run: this action needs the owner's confirmation, which only the assistant can ask for." }))
-        let values: Record<string, any>
-        try {
-          values = actionValues(registered, input)
-        } catch (error) {
-          return Effect.fail(error instanceof ToolError ? error : new ToolError({ message: String(error) }))
-        }
-        return runActionForTool(registered, values)
-      })
+    // Only the execution gateway runs it (`Gateway.ts`): it turns the input into the action's values once, admits
+    // the call and runs the action. Called directly, it refuses.
+    execute: () => Effect.fail(new ToolError({ message: "Not run: an action's tool runs only through the execution gateway." }))
   })
   return { ...tool, action: registered }
 }
@@ -400,22 +389,5 @@ const riskOfValues = (registered: RegisteredAction, risk: RiskByInput): RiskByIn
   classes: risk.classes,
   of: (input) => risk.of(actionValues(registered, input))
 })
-
-/**
- * Run an action for its generated tool with the values `run` receives (already resolved): the action's 5 s limit,
- * its failure as a `ToolError`, and what it says (its `say`, else its `announce`, else "ok"). The execution gateway
- * calls it with the exact values it admitted.
- */
-export const runActionForTool = (registered: RegisteredAction, values: Readonly<Record<string, unknown>>): Effect.Effect<string, ToolError> => {
-  const def = registered.definition
-  return Effect.suspend(() => def.run(values as never)).pipe(
-    Effect.timeoutOrElse({
-      duration: ACTION_TIMEOUT_MS,
-      orElse: () => Effect.fail(new ActionError({ message: `${def.label} did not finish within ${ACTION_TIMEOUT_MS / 1000} s` }))
-    }),
-    Effect.mapError((error) => new ToolError({ message: error.message, cause: error })),
-    Effect.map((outcome) => outcome?.say ?? def.announce?.(values as never) ?? "ok")
-  )
-}
 
 const sentenceOf = (s: string) => (/[.!?]$/.test(s) ? s : `${s}.`)

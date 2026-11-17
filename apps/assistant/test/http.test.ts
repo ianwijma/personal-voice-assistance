@@ -35,7 +35,9 @@ const rejectingHub = (): SessionHub & { rejected: number } => {
     refreshDevices: () => {},
     wakeHeard: () => {},
     deviceViews: () => [],
-    audioOwnerOf: () => undefined
+    audioOwnerOf: () => undefined,
+    deviceOfConnection: () => undefined,
+    deviceConnected: () => false
   }
   return hub
 }

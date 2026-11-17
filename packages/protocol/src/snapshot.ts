@@ -21,7 +21,7 @@ import { EnvInfo } from "./env.ts"
 import { JobInfo, ModelSet } from "./jobs.ts"
 import { VaultInfo } from "./vault.ts"
 import { AdminState } from "./admin.ts"
-import { AssistantTemplate, HealthInfo, ModuleUnavailable } from "./health.ts"
+import { AssistantTemplate, HealthInfo, MAX_MODULE_TEMPLATES, MAX_TOOL_RISKS, ModuleUnavailable } from "./health.ts"
 
 /** A one-line status a running module publishes, e.g. "Connected · 143 entities". */
 export const StatusLine = Schema.Struct({
@@ -67,7 +67,7 @@ export const ToolInfo = Schema.Struct({
    * Protocol 9: every class a call can have: `[risk]` for a fixed class, the declared list when the class depends on
    * the input (a cover tool: `change` and `security`). A later policy leaves a tool out of a list by these.
    */
-  risks: Schema.optionalKey(Schema.Array(ToolRisk)),
+  risks: Schema.optionalKey(Schema.Array(ToolRisk).check(Schema.isMaxLength(MAX_TOOL_RISKS))),
   sensitivity: Schema.optionalKey(ToolSensitivity),
   latency: Schema.optionalKey(ToolLatency)
 })
@@ -129,7 +129,7 @@ export const ModuleInfo = Schema.Struct({
   /** Protocol 9: the module API it was written for (absent = 1). */
   apiVersion: Schema.optionalKey(Schema.Int),
   /** Protocol 9: the assistants it suggests (the new-assistant flow offers them). Absent = none. */
-  templates: Schema.optionalKey(Schema.Array(AssistantTemplate))
+  templates: Schema.optionalKey(Schema.Array(AssistantTemplate).check(Schema.isMaxLength(MAX_MODULE_TEMPLATES)))
 })
 export type ModuleInfo = typeof ModuleInfo.Type
 

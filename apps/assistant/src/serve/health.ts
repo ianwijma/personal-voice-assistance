@@ -1,4 +1,4 @@
-import type { Issue, ModuleDefinition, ModuleHost } from "@pva/core"
+import type { ModuleDefinition, ModuleHost } from "@pva/core"
 import type { HealthInfo } from "@pva/protocol"
 import { Deferred, Effect } from "effect"
 import type { RequirementChecker } from "../requirements.ts"
@@ -6,8 +6,9 @@ import type { RequirementChecker } from "../requirements.ts"
 /**
  * The Health page's service (module-definition-config-and-dependencies.md §C.5): the issue registry as admin pages
  * see it, and one check at a time ("Check again", and once at start): probe every program the modules need again,
- * re-judge which modules are available (the host starts those that now are), run every module's `health()`, and the
- * core checks. Never on a turn.
+ * re-judge which modules are available and try again every module that is down after a failed start (`recheck`),
+ * then run every module's `health()`. Never on a turn. Checks of the machine itself (disk, TLS files, the port,
+ * speech models) are not part of this version (docs/MODULES-PLAN.md §7).
  */
 export interface HealthService {
   readonly info: () => HealthInfo
@@ -27,8 +28,6 @@ export interface HealthServiceOptions {
   readonly host: ModuleHost
   readonly checker: RequirementChecker
   readonly catalog: ReadonlyArray<ModuleDefinition<any>>
-  /** The core checks (serve mode: without the port). */
-  readonly core: Effect.Effect<ReadonlyArray<Issue>>
   readonly now?: () => number
   /** Runs a background effect (serve mode's request runner); `begin` uses it. */
   readonly fork: (effect: Effect.Effect<void>) => void
@@ -69,8 +68,6 @@ export const makeHealthService = (options: HealthServiceOptions): HealthService 
     yield* options.checker.probeCatalog(options.catalog, { force: true })
     yield* options.host.recheck
     yield* options.host.checkHealth
-    const core = yield* options.core
-    options.host.issues.set("core", core)
   }).pipe(Effect.catchCause((cause) => Effect.logWarning("The health check failed", cause)))
 
   /** Mark a check as running (synchronously), and the work that ends it. */

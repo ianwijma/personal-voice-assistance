@@ -1,7 +1,8 @@
 import { Context, Effect, Layer, Schema } from "effect"
 import type { ActionError, ActionOutcome, RegisteredAction } from "./Actions.ts"
 import type { ToolCall, ToolResult, ToolSpec } from "./Domain.ts"
-import { defaultGateway, type ExecutionGateway, prepareTool } from "./Gateway.ts"
+import { type ActionCallOptions, defaultGateway, type ExecutionGateway, prepareTool } from "./Gateway.ts"
+import { registerRegistryGateway } from "./GatewayPrivate.ts"
 import type { AssistantModule, ContextProvider, Tool } from "./Module.ts"
 
 /**
@@ -22,13 +23,13 @@ export class ToolRegistry extends Context.Service<ToolRegistry, {
    */
   readonly actions?: ReadonlyArray<RegisteredAction>
   /**
-   * Run an action with its values through the registry's gateway (the intent agent, a confirmed action). Absent in
-   * hand-made registries: callers use `defaultGateway.action`.
+   * Run an action with its values through the registry's gateway (the intent agent). An action declared
+   * `confirm: true` is refused. Absent in hand-made registries: callers use `defaultGateway.action`.
    */
   readonly runAction?: (
     action: RegisteredAction,
     values: Readonly<Record<string, unknown>>,
-    options?: { readonly confirmed?: boolean }
+    options?: Pick<ActionCallOptions, "onAdmitted" | "holdUntil">
   ) => Effect.Effect<ActionOutcome | void, ActionError>
   /** Output of every context provider, formatted for `LlmRequest.context` ("" if none; empty outputs are left out). */
   readonly context: Effect.Effect<string>
@@ -99,13 +100,20 @@ export const makeToolRegistry = (modules: ReadonlyArray<AssistantModule>, option
       concurrency: "unbounded"
     }).pipe(Effect.map((sections) => sections.filter((s) => s.length > 0).join("\n\n")))
 
-  return ToolRegistry.of({
+  const registry = ToolRegistry.of({
     specs,
     isSpeculative: (name) => tools.get(name)?.tool.speculative === true,
     actionFor: (name) => tools.get(name)?.tool.action,
     actions,
-    runAction: gateway.action,
+    // Never with a caller's principal or a claim of confirmation: the turn's own context decides who it runs for.
+    runAction: (action, values, runOptions) =>
+      gateway.action(action, values, {
+        ...(runOptions?.onAdmitted !== undefined ? { onAdmitted: runOptions.onAdmitted } : {}),
+        ...(runOptions?.holdUntil !== undefined ? { holdUntil: runOptions.holdUntil } : {})
+      }),
     run,
     context
   })
+  registerRegistryGateway(registry, gateway)
+  return registry
 }

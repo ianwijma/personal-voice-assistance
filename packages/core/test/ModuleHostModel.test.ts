@@ -1,23 +1,30 @@
-// A model-based, randomised test of the module host's interleavings (review round 2): random sequences of triggers
-// (configure with shared and with overridable changes, assistant changes, enable and disable, vault lock and unlock,
-// requestRestart from instances and shared parts of any generation, failing and slow starts, interrupted callers),
-// issued concurrently against a provider and consumers linked by `uses`. After each quiescence the invariants hold:
+// A model-based, randomised test of the module host (review round 3, finding 19). Random sequences of triggers are
+// issued concurrently against a provider, a consumer that `uses` it, and a version 1 module: configure (shared and
+// overridable values), assistants switching modules on and off and changing their own values, enable and disable,
+// vault lock and unlock, `requestRestart` from parts of any start (stale ones included), tool calls of random
+// length, faults (a start that fails, throws a defect, interrupts itself or hangs; a finalizer that hangs),
+// interrupted callers, clock jumps, and closing the host at a random moment.
 //
-// - no module has two live generations, and two live instances never share a key;
-// - every started scope is either published or closed (nothing lingers past the grace period);
-// - nothing of a withdrawn part is reachable: the service, the contributions and every tool of the snapshot belong
-//   to live parts;
-// - every module that should run but does not run as asked has a Health issue;
-// - with the faults cleared and one retry, what is published is exactly what the desired state asks (no trigger's
-//   change was lost);
-// - closing the host closes every scope exactly once, instances before their shared part, consumers before providers.
+// The expected side never reads the host's bookkeeping. It is the test's own model of the desired state (what the
+// triggers asked, in the order they were issued), the planner's `reachedBy` for demand, and invariants stated
+// independently:
+//
+// - at no moment has one module two published sets of registrations (checked inside every publish and withdraw);
+// - no tool call enters module code of a part that is not published;
+// - every scope that was opened is published, closed, or reported as abandoned (a finalizer the test made hang);
+// - every module that should run and does not has a Health issue saying why;
+// - the worker is alive: a trigger after the sequence completes;
+// - with the faults cleared and Check again, what is published is exactly the plan for the final desired state (no
+//   trigger's change was lost);
+// - closing the host returns within its bound and leaves nothing open that was not reported.
 import { assert, describe, it } from "@effect/vitest"
-import { Effect, Fiber, Schema } from "effect"
+import { Effect, Exit, Fiber, Schema, Scope } from "effect"
 import { TestClock } from "effect/testing"
 import { makeTool } from "../src/Module.ts"
 import { ContributionKey, ServiceKey } from "../src/ModuleApi.ts"
 import { defineModule, ModuleStartError } from "../src/ModuleDefinition.ts"
 import { type ModuleDemand, type ModuleHost, makeModuleHost, readOnlyPersistence } from "../src/ModuleHost.ts"
+import { reachedBy } from "../src/ModulePlanner.ts"
 import type { Registrar } from "../src/ModuleRegistrations.ts"
 import { Setting } from "../src/Settings.ts"
 
@@ -40,39 +47,77 @@ interface Svc {
 const Svc = ServiceKey<Svc>("model.svc")
 const Section = ContributionKey<string>("model.section")
 
+type Mode = "ok" | "fail" | "defect" | "interrupt" | "hang"
+const MODES: ReadonlyArray<Mode> = ["ok", "fail", "defect", "interrupt", "hang"]
+const MODULES = ["prov", "cons", "solo"] as const
+type ModuleId = (typeof MODULES)[number]
+
+/** What the test sees of the world, from module code only. */
 interface World {
-  /** Start ids by part: "prov:s3", "prov:i7"... */
-  readonly started: Set<string>
-  readonly closed: Array<string>
-  /** Live parts, by the registrar's publish and withdraw: handle id → start id. */
-  readonly live: Map<number, { readonly sid: string; readonly module: string; readonly kind: "shared" | "instance"; readonly key: string }>
-  /** Which shared part an instance was started against. */
+  readonly opened: Map<string, ModuleId>
+  readonly closed: Set<string>
+  /** Finalizers that the test made hang, and that were entered. */
+  readonly hung: Set<string>
+  /** Published parts, by the test registrar: sid → module, and an instance's parent (its shared part's sid). */
+  readonly live: Map<string, { readonly module: ModuleId; readonly parent: string | undefined }>
   readonly parentOf: Map<string, string>
+  readonly sidOfTool: Map<unknown, string>
   readonly restarters: Array<(reason: string) => Effect.Effect<void>>
-  readonly faults: { sharedFail: boolean; slow: boolean; readonly instanceFail: Set<string> }
+  readonly violations: Array<string>
+  readonly faults: { readonly start: Record<ModuleId, Mode>; readonly hangClose: Record<ModuleId, boolean> }
+  /** Abandoned closes the host reported, per module (titles seen on the Health page). */
+  readonly reported: Record<ModuleId, number>
   next: number
-  failures: number
 }
 
 const newWorld = (): World => ({
-  started: new Set(),
-  closed: [],
+  opened: new Map(),
+  closed: new Set(),
+  hung: new Set(),
   live: new Map(),
   parentOf: new Map(),
+  sidOfTool: new Map(),
   restarters: [],
-  faults: { sharedFail: false, slow: false, instanceFail: new Set() },
-  next: 0,
-  failures: 0
+  violations: [],
+  faults: { start: { prov: "ok", cons: "ok", solo: "ok" }, hangClose: { prov: false, cons: false, solo: false } },
+  reported: { prov: 0, cons: 0, solo: 0 },
+  next: 0
 })
 
 const catalogOf = (w: World) => {
-  const sid = (module: string, kind: string) => `${module}:${kind}${++w.next}`
-  const opened = (id: string) =>
+  /** A part's start: its scope's finalizer (which may hang), then its fault. */
+  const begin = (module: ModuleId, kind: "s" | "i") =>
     Effect.gen(function*() {
-      w.started.add(id)
-      yield* Effect.addFinalizer(() => Effect.sync(() => void w.closed.push(id)))
-      if (w.faults.slow) yield* Effect.sleep(40)
+      const id = `${module}:${kind}${++w.next}`
+      w.opened.set(id, module)
+      const hang = w.faults.hangClose[module]
+      yield* Effect.addFinalizer(() =>
+        hang
+          ? Effect.andThen(Effect.sync(() => void w.hung.add(id)), Effect.never)
+          : Effect.sync(() => void w.closed.add(id))
+      )
+      const mode = w.faults.start[module]
+      if (mode === "fail") return yield* new ModuleStartError({ message: `${module} refused` })
+      if (mode === "defect") throw new Error(`${module} threw`)
+      if (mode === "interrupt") return yield* Effect.interrupt
+      if (mode === "hang") return yield* Effect.never
+      return id
     })
+  const tool = (name: string, id: string) => {
+    const t = makeTool({
+      name,
+      description: "",
+      parameters: Schema.Struct({ ms: Schema.Number }),
+      execute: ({ ms }) =>
+        Effect.gen(function*() {
+          if (!w.live.has(id)) w.violations.push(`a call entered ${id}, which is not published`)
+          yield* Effect.sleep(ms)
+          return id
+        })
+    })
+    w.sidOfTool.set(t, id)
+    return t
+  }
   const prov = defineModule({
     apiVersion: 2,
     id: "prov",
@@ -84,26 +129,17 @@ const catalogOf = (w: World) => {
     },
     shared: ({ host, settings }) =>
       Effect.gen(function*() {
-        const id = sid("prov", "s")
-        yield* opened(id)
+        const id = yield* begin("prov", "s")
         w.restarters.push(host.requestRestart)
-        if (w.faults.sharedFail) {
-          w.failures++
-          return yield* new ModuleStartError({ message: "shared refused" })
-        }
-        return { value: { address: settings.address ?? "", sid: id }, services: [Svc.of({ address: settings.address ?? "", sid: id })], contributions: [Section.of(id)] }
+        const address = settings.address ?? ""
+        return { value: { address, sid: id }, services: [Svc.of({ address, sid: id })], contributions: [Section.of(id)] }
       }),
     start: ({ host, settings, shared }) =>
       Effect.gen(function*() {
-        const id = sid("prov", "i")
+        const id = yield* begin("prov", "i")
         w.parentOf.set(id, (shared as Svc).sid)
-        yield* opened(id)
         w.restarters.push(host.requestRestart)
-        if (w.faults.instanceFail.has(settings.place)) {
-          w.failures++
-          return yield* new ModuleStartError({ message: `no ${settings.place}` })
-        }
-        return { instructions: id, tools: [makeTool({ name: "prov_tool", description: "", parameters: Schema.Struct({}), execute: () => Effect.succeed(id) })] }
+        return { instructions: `prov ${settings.place}`, tools: [tool("prov_tool", id)] }
       })
   })
   const cons = defineModule({
@@ -114,18 +150,16 @@ const catalogOf = (w: World) => {
     uses: ["prov"],
     shared: ({ host }) =>
       Effect.gen(function*() {
-        const id = sid("cons", "s")
-        yield* opened(id)
+        const id = yield* begin("cons", "s")
         w.restarters.push(host.requestRestart)
         return { value: { sid: id } }
       }),
     start: ({ host, shared }) =>
       Effect.gen(function*() {
-        const id = sid("cons", "i")
+        const id = yield* begin("cons", "i")
         w.parentOf.set(id, (shared as { readonly sid: string }).sid)
-        yield* opened(id)
         w.restarters.push(host.requestRestart)
-        return { instructions: id, tools: [makeTool({ name: "cons_tool", description: "", parameters: Schema.Struct({}), execute: () => Effect.succeed(id) })] }
+        return { instructions: "cons", tools: [tool("cons_tool", id)] }
       })
   })
   const solo = defineModule({
@@ -135,258 +169,313 @@ const catalogOf = (w: World) => {
     enabledByDefault: false,
     enabledWhenSet: "token",
     settings: { token: Setting.secret({ label: "Token" }) },
-    start: () =>
-      Effect.gen(function*() {
-        const id = sid("solo", "i")
-        yield* opened(id)
-        return { instructions: id, tools: [makeTool({ name: "solo_tool", description: "", parameters: Schema.Struct({}), execute: () => Effect.succeed(id) })] }
-      })
+    start: () => Effect.map(begin("solo", "i"), (id) => ({ instructions: "solo", tools: [tool("solo_tool", id)] }))
   })
-  return [cons, prov, solo]
+  return [prov, cons, solo]
 }
 
-/** Observes every part's publication through the registration seam, with the start id the module returned. */
-const observer = (w: World): Registrar => ({ handle, instance, shared }) => {
-  const sid = shared !== undefined ? (shared.value as { readonly sid: string }).sid : instance?.instructions ?? ""
+/**
+ * The test's registration kind: one per part. Its publish and withdraw check, at that very moment, that the module
+ * has one published set of parts: at most one shared part, and every published instance belongs to it.
+ */
+const witness = (w: World): Registrar => ({ handle, instance, shared }) => {
+  const module = handle.moduleId as ModuleId
+  const id = shared !== undefined ? (shared.value as { readonly sid: string }).sid : w.sidOfTool.get(instance!.tools![0]!)!
+  const parent = shared !== undefined ? undefined : w.parentOf.get(id)
   return [{
-    kind: "model-observer",
-    publish: () => void w.live.set(handle.id, { sid, module: handle.moduleId, kind: handle.kind, key: String(handle.id) }),
-    withdraw: () => void w.live.delete(handle.id)
+    kind: "witness",
+    publish: () => {
+      for (const [other, part] of w.live) {
+        if (part.module !== module) continue
+        const sameSet = parent !== undefined && (other === parent || part.parent === parent)
+        if (!sameSet) w.violations.push(`${module}: ${id} published beside ${other}, of another start`)
+      }
+      w.live.set(id, { module, parent })
+    },
+    withdraw: () => {
+      if (!w.live.delete(id)) w.violations.push(`${module}: ${id} withdrawn without being published`)
+    }
   }]
 }
 
-interface Assistant {
-  prov: boolean
-  cons: boolean
-  place: string | undefined
+/** The desired state, as the test issued it. */
+interface Model {
+  address: string
+  placeDefault: string
+  readonly assistants: Map<string, { prov: boolean; cons: boolean; own: string | undefined }>
+  soloChosen: boolean | undefined
+  token: string | undefined
 }
 
-const settle = Effect.repeat(Effect.yieldNow, { times: 30 })
+const PLACES = ["P1", "P2", "P3"]
+const ADDRESSES = ["a1", "a2", "a3"]
+const ASSISTANTS = ["x", "y", "z"]
+
+const demandOfModel = (m: Model): ReadonlyMap<string, ReadonlyArray<ModuleDemand>> => {
+  const prov: Array<ModuleDemand> = []
+  const cons: Array<ModuleDemand> = []
+  for (const [id, a] of m.assistants) {
+    if (a.prov) prov.push({ assistantId: id, ...(a.own !== undefined ? { own: { place: a.own } } : {}) })
+    if (a.cons) cons.push({ assistantId: id })
+  }
+  return new Map([["prov", prov], ["cons", cons]])
+}
+
+/** What should run for the final desired state: the planner's demand, and the instances by effective settings. */
+const expectedOf = (m: Model) => {
+  const demand = demandOfModel(m)
+  const soloOn = m.soloChosen ?? m.token !== undefined
+  const reached = reachedBy([
+    { id: "prov", wanted: demand.get("prov")!.length > 0, blocked: false, uses: [] },
+    { id: "cons", wanted: demand.get("cons")!.length > 0, blocked: false, uses: ["prov"] },
+    { id: "solo", wanted: soloOn, blocked: false, uses: [] }
+  ])
+  const places = new Map<string, Array<string>>()
+  for (const d of demand.get("prov")!) {
+    const place = (d.own?.place as string | undefined) ?? m.placeDefault
+    places.set(place, [...(places.get(place) ?? []), d.assistantId])
+  }
+  return {
+    running: { prov: reached.has("prov"), cons: reached.has("cons"), solo: reached.has("solo") },
+    provInstances: [...places].map(([place, users]) => ({ place, users: users.sort() })).sort((a, b) => a.place.localeCompare(b.place)),
+    consUsers: demand.get("cons")!.map((d) => d.assistantId).sort(),
+    address: m.address
+  }
+}
+
+const quiet = Effect.repeat(Effect.yieldNow, { times: 30 })
+/** Let time pass in steps (timers of grace periods, start and stop limits, restart intervals). */
+const pass = (ms: number) =>
+  Effect.gen(function*() {
+    for (let left = ms; left > 0; left -= 1_000) {
+      yield* quiet
+      yield* TestClock.adjust(Math.min(1_000, left))
+    }
+    yield* quiet
+  })
+
+/** Wait for a fiber while letting the test clock run (bounded: a hung worker fails the test). */
+const joinWithin = <A>(fiber: Fiber.Fiber<A, unknown>, ms: number, what: string) =>
+  Effect.gen(function*() {
+    for (let t = 0; t <= ms; t += 1_000) {
+      yield* quiet
+      const done = fiber.pollUnsafe()
+      if (done !== undefined) return done
+      yield* TestClock.adjust(1_000)
+    }
+    return assert.fail(`${what} did not finish within ${ms} ms of test time`)
+  })
+
+/** Let time pass until the worker is idle: no module starting or stopping (bounded). */
+const settleAll = (host: ModuleHost) =>
+  Effect.gen(function*() {
+    yield* pass(6_000)
+    for (let i = 0; i < 300; i++) {
+      if (host.modules().every((m) => m.state !== "starting" && m.state !== "stopping")) {
+        yield* pass(6_000)
+        if (host.modules().every((m) => m.state !== "starting" && m.state !== "stopping")) return
+      }
+      yield* pass(1_000)
+    }
+    assert.fail("the worker never became idle")
+  })
+
+const checkInvariants = (w: World, host: ModuleHost, m: Model, label: string) => {
+  assert.deepStrictEqual(w.violations, [], `${label}: a module had two published sets, or a call entered an unpublished part`)
+  // Every opened scope: published, closed, or its finalizer hung (and the host said so).
+  const hungBy: Record<ModuleId, number> = { prov: 0, cons: 0, solo: 0 }
+  for (const [sid, module] of w.opened) {
+    if (w.live.has(sid) || w.closed.has(sid)) continue
+    if (w.hung.has(sid)) {
+      hungBy[module]++
+      continue
+    }
+    assert.fail(`${label}: ${sid} was opened and is neither published, closed nor hung (${JSON.stringify(host.modules().map((i) => [i.id, i.state, i.error]))} ${JSON.stringify(host.issues.all().map((i) => i.title))})`)
+  }
+  for (const module of MODULES) {
+    // A hung finalizer of a part whose close the host is still waiting for (at most one per module) is not yet reported.
+    assert.isAtLeast(w.reported[module] + 1, hungBy[module], `${label}: ${module}: every abandoned close is reported`)
+  }
+  // Every module that should run and does not has a Health issue saying why.
+  const expected = expectedOf(m)
+  for (const info of host.modules()) {
+    const should = expected.running[info.id as ModuleId]
+    if (!should || info.state === "running") continue
+    if (info.state === "starting" || info.state === "stopping") continue
+    assert.isTrue(host.issues.all().some((i) => i.module === info.id && i.severity === "error"), `${label}: ${info.id} is ${info.state} without an error on the Health page`)
+  }
+}
 
 const runSeed = (seed: number, steps: number) =>
   Effect.gen(function*() {
     const random = rng(seed)
     const pick = <A>(xs: ReadonlyArray<A>): A => xs[Math.floor(random() * xs.length)]!
     const w = newWorld()
-    const assistants: Record<string, Assistant> = { a: { prov: false, cons: false, place: undefined }, b: { prov: false, cons: false, place: undefined }, c: { prov: false, cons: false, place: undefined } }
-    const demand = () => {
-      const out = new Map<string, Array<ModuleDemand>>([["prov", []], ["cons", []]])
-      for (const [id, a] of Object.entries(assistants)) {
-        if (a.prov) out.get("prov")!.push({ assistantId: id, ...(a.place !== undefined ? { own: { place: a.place } } : {}) })
-        if (a.cons) out.get("cons")!.push({ assistantId: id })
+    const m: Model = { address: "a1", placeDefault: "P1", assistants: new Map(ASSISTANTS.map((id) => [id, { prov: false, cons: false, own: undefined }])), soloChosen: undefined, token: undefined }
+    let demand = demandOfModel(m)
+    const scope = yield* Scope.make()
+    const host = yield* makeModuleHost({
+      catalog: catalogOf(w),
+      persistence: readOnlyPersistence(),
+      env: {},
+      demand: () => new Map([...demand].filter(([id]) => id !== "solo")),
+      registrars: [witness(w)],
+      stopTimeoutMs: 2_000,
+      startTimeoutMs: 3_000,
+      graceMs: 4_000,
+      closeTimeoutMs: 20_000
+    }).pipe(Scope.provide(scope))
+    // Every report of an abandoned close that appears on the Health page, counted once.
+    const showing: Record<ModuleId, number> = { prov: 0, cons: 0, solo: 0 }
+    host.issues.subscribe(() => {
+      for (const module of MODULES) {
+        const n = host.issues.all().filter((i) => i.module === module && /did not finish stopping/.test(i.title)).length
+        if (n > showing[module]) w.reported[module] += n - showing[module]
+        showing[module] = n
       }
-      return out
-    }
-    let unlocked = false
-    let soloChosen: boolean | undefined
-    const closedBefore = new Set<string>()
-    const log: Array<string> = []
-    let issuesSeen = 0
-
-    yield* Effect.gen(function*() {
-      const host: ModuleHost = yield* makeModuleHost({
-        catalog: catalogOf(w),
-        persistence: readOnlyPersistence(),
-        env: {},
-        demand,
-        registrars: [observer(w)]
-      })
-      const fibers: Array<Fiber.Fiber<unknown>> = []
-      // A trigger is issued when its fiber begins (it writes the desired state at once); interrupting it later only
-      // interrupts its wait.
-      const fork = <A>(label: string, effect: Effect.Effect<A>) =>
-        Effect.gen(function*() {
-          log.push(label)
-          // Started at once: it runs up to its first wait (its write is synchronous) before the fork returns.
-          fibers.push(yield* Effect.forkChild(effect, { startImmediately: true }))
-        })
-      yield* fork("startEnabled", host.startEnabled)
-
-      const quiesce = Effect.gen(function*() {
-        for (let i = 0; i < 8; i++) {
-          yield* settle
-          yield* TestClock.adjust(11_000)
-        }
-        yield* Effect.forEach(fibers, Fiber.await, { discard: true })
-        fibers.length = 0
-        yield* settle
-      })
-
-      /** Invariants that hold after every quiescence, whatever the faults. */
-      const checkAlways = (when: string) =>
-        Effect.gen(function*() {
-          const where = `seed ${seed}, ${when}; ops: ${log.join(" | ")}`
-          const live = [...w.live.values()]
-          for (const module of ["prov", "cons"]) {
-            assert.isAtMost(live.filter((p) => p.module === module && p.kind === "shared").length, 1, `${module}: two live generations (${where})`)
-          }
-          // Every started scope is published or closed (the grace period is over).
-          const closed = new Set(w.closed)
-          const liveIds = new Set(live.map((p) => p.sid))
-          for (const id of w.started) {
-            assert.isTrue(liveIds.has(id) !== closed.has(id), `${id}: ${liveIds.has(id) ? "live and closed" : "neither live nor closed"} (${where})`)
-          }
-          assert.strictEqual(w.closed.length, closed.size, `a scope closed twice (${where})`)
-          // A live instance's shared part is live.
-          for (const p of live) {
-            if (p.kind !== "instance" || p.module === "solo") continue
-            assert.isTrue(liveIds.has(w.parentOf.get(p.sid)!), `${p.sid} is live but its shared part ${w.parentOf.get(p.sid)} is not (${where})`)
-          }
-          // Nothing of a withdrawn part is reachable.
-          const svc = host.service(Svc)
-          const provShared = live.find((p) => p.module === "prov" && p.kind === "shared")
-          assert.strictEqual(svc?.sid, provShared?.sid, `the service is not the live shared part's (${where})`)
-          assert.deepStrictEqual(host.contributionsFor(Section, undefined), provShared === undefined ? [] : [provShared.sid], `contributions (${where})`)
-          const snapshot = host.snapshot()
-          for (const spec of snapshot.registry.specs) {
-            const result = yield* snapshot.registry.run({ id: "x", name: spec.name, input: {} })
-            assert.isFalse(result.isError, `${spec.name} failed: ${result.content} (${where})`)
-            assert.isTrue(liveIds.has(result.content), `${spec.name} reached ${result.content}, which is not live (${where})`)
-          }
-          for (const [assistant, parts] of snapshot.assistantParts) {
-            for (const part of parts) {
-              for (const tool of part.module.tools ?? []) {
-                const result = yield* Effect.exit(tool.execute({}))
-                assert.isTrue(result._tag === "Success" && liveIds.has(String(result.value)), `${assistant}'s ${tool.name} is not live (${where})`)
-              }
-            }
-          }
-          issuesSeen += host.issues.all().length
-          // A module that is asked to run but does not run as asked says why.
-          for (const m of host.modules()) {
-            if (!m.enabled) continue
-            const asked = (demand().get(m.id) ?? []).map((d) => d.assistantId)
-            const served = new Set((m.instances ?? []).filter((i) => i.state === "running").flatMap((i) => i.assistants))
-            const ok = m.state === "running" && (m.instances ?? []).every((i) => i.state === "running") && asked.every((a) => served.has(a))
-            if (ok) continue
-            const issue = host.issues.all().some((i) => i.module === m.id && (i.id.endsWith(".start") || i.id.endsWith(".restart")))
-            assert.isTrue(issue, `${m.id} is ${m.state}, not serving ${asked.filter((a) => !served.has(a)).join(", ") || "as asked"}, without a Health issue (${where})`)
-          }
-        })
-
-      for (let step = 0; step < steps; step++) {
-        const op = Math.floor(random() * 12)
-        switch (op) {
-          case 0:
-            yield* fork("configure address", host.configure("prov", { values: { address: pick(["a1", "a2", "a3"]) }, secrets: {} }))
-            break
-          case 1:
-            yield* fork("configure place", host.configure("prov", { values: { place: pick(["P1", "P2", "P3"]) }, secrets: {} }))
-            break
-          case 2:
-          case 3: {
-            const a = assistants[pick(["a", "b", "c"])]!
-            const what = pick(["prov", "cons", "place"] as const)
-            if (what === "place") a.place = pick([undefined, "P1", "P2", "P3"])
-            else a[what] = !a[what]
-            yield* fork(`assistants ${JSON.stringify(assistants)}`, host.refresh)
-            break
-          }
-          case 4:
-            soloChosen = random() < 0.5
-            yield* fork(`solo ${soloChosen}`, soloChosen ? host.enable("solo") : host.disable("solo"))
-            break
-          case 5:
-            unlocked = !unlocked
-            yield* fork(`vault ${unlocked ? "unlocked" : "locked"}`, host.setSecrets(unlocked ? { solo: { token: "t" } } : {}))
-            break
-          case 6:
-          case 7:
-            if (w.restarters.length > 0) yield* fork("requestRestart", pick(w.restarters)("model"))
-            break
-          case 8:
-            w.faults.sharedFail = random() < 0.3
-            log.push(`sharedFail ${w.faults.sharedFail}`)
-            break
-          case 9: {
-            const place = pick(["P1", "P2", "P3"])
-            if (w.faults.instanceFail.has(place)) w.faults.instanceFail.delete(place)
-            else if (random() < 0.5) w.faults.instanceFail.add(place)
-            w.faults.slow = random() < 0.4
-            log.push(`instanceFail ${[...w.faults.instanceFail].join(",")} slow ${w.faults.slow}`)
-            break
-          }
-          case 10:
-            if (fibers.length > 0) {
-              log.push("interrupt a caller")
-              yield* Fiber.interrupt(pick(fibers))
-            }
-            break
-          case 11:
-            yield* TestClock.adjust(Math.floor(random() * 60))
-            break
-        }
-        yield* Effect.repeat(Effect.yieldNow, { times: Math.floor(random() * 6) })
-        if (step % 8 === 7) {
-          yield* quiesce
-          yield* checkAlways(`after step ${step}`)
-        }
+    })
+    const callers: Array<Fiber.Fiber<unknown, unknown>> = []
+    const fork = (effect: Effect.Effect<unknown, unknown>) => Effect.map(Effect.forkChild(effect, { startImmediately: true }), (f) => void callers.push(f))
+    yield* fork(host.startEnabled)
+    let closedEarly = false
+    const snapshots: Array<ReturnType<ModuleHost["snapshot"]>> = []
+    for (let step = 0; step < steps; step++) {
+      const roll = random()
+      if (roll < 0.1) {
+        m.address = pick(ADDRESSES)
+        yield* fork(host.configure("prov", { values: { address: m.address }, secrets: {} }))
+      } else if (roll < 0.17) {
+        m.placeDefault = pick(PLACES)
+        yield* fork(host.configure("prov", { values: { place: m.placeDefault }, secrets: {} }))
+      } else if (roll < 0.32) {
+        const a = m.assistants.get(pick(ASSISTANTS))!
+        const what = random()
+        if (what < 0.4) a.prov = !a.prov
+        else if (what < 0.7) a.cons = !a.cons
+        else a.own = random() < 0.3 ? undefined : pick(PLACES)
+        demand = demandOfModel(m)
+        yield* fork(host.refresh)
+      } else if (roll < 0.37) {
+        m.soloChosen = random() < 0.5
+        yield* fork(m.soloChosen ? host.enable("solo") : host.disable("solo"))
+      } else if (roll < 0.42) {
+        m.token = random() < 0.5 ? undefined : "t"
+        yield* fork(host.setSecrets(m.token === undefined ? {} : { solo: { token: m.token } }))
+      } else if (roll < 0.5) {
+        // A restart from any part ever started: a stopped one's host object answers with a defect.
+        if (w.restarters.length > 0) yield* fork(Effect.exit(pick(w.restarters)("random restart")))
+      } else if (roll < 0.62) {
+        const module = pick(MODULES)
+        w.faults.start[module] = random() < 0.5 ? "ok" : pick(MODES)
+      } else if (roll < 0.67) {
+        const module = pick(MODULES)
+        w.faults.hangClose[module] = random() < 0.25
+      } else if (roll < 0.77) {
+        // A tool call of random length, through the current snapshot or one a turn kept from earlier.
+        snapshots.push(host.snapshot())
+        const snapshot = random() < 0.5 ? host.snapshot() : pick(snapshots)
+        const parts = [...snapshot.parts, ...[...snapshot.assistantParts.values()].flat()]
+        const part = parts.length === 0 ? undefined : pick(parts)
+        const tool = part?.module.tools?.[0]
+        if (tool !== undefined) yield* fork(host.gateway.tool(part!.moduleId, tool, { ms: Math.floor(random() * 6_000) }).pipe(Effect.exit))
+      } else if (roll < 0.85) {
+        const caller = callers.length === 0 ? undefined : pick(callers)
+        if (caller !== undefined) yield* Fiber.interrupt(caller)
+      } else if (roll < 0.99) {
+        yield* pass(Math.floor(random() * 6_000))
+      } else {
+        closedEarly = true
+        break
       }
-      yield* quiesce
-      yield* checkAlways("at the end")
-
-      // No change was lost: without faults and after one retry, what is published is what the desired state asks.
-      w.faults.sharedFail = false
-      w.faults.slow = false
-      w.faults.instanceFail.clear()
-      yield* fork("startEnabled (retry)", host.startEnabled)
-      yield* quiesce
-      yield* checkAlways("after the retry")
-      const where = `seed ${seed}; ops: ${log.join(" | ")}`
-      const live = [...w.live.values()]
-      const committed = host.modules().find((m) => m.id === "prov")!.settings.values
-      const consOn = Object.values(assistants).some((a) => a.cons)
-      const provDirect = Object.values(assistants).filter((a) => a.prov)
-      const provRuns = consOn || provDirect.length > 0
-      const provShared = live.filter((p) => p.module === "prov" && p.kind === "shared")
-      assert.strictEqual(provShared.length, provRuns ? 1 : 0, `prov runs (${where})`)
-      if (provRuns) assert.strictEqual(host.service(Svc)?.address, committed.address, `prov runs with the committed address (${where})`)
-      const places = new Set(provDirect.map((a) => a.place ?? String(committed.place)))
-      const provInstances = live.filter((p) => p.module === "prov" && p.kind === "instance")
-      assert.strictEqual(provInstances.length, places.size, `prov's instances (${where})`)
-      const shown = (host.modules().find((m) => m.id === "prov")!.instances ?? [])
-      assert.deepStrictEqual(new Set(shown.filter((i) => i.state === "running").flatMap((i) => i.assistants)), new Set(Object.entries(assistants).filter(([, a]) => a.prov).map(([id]) => id)), `prov's users (${where})`)
-      assert.strictEqual(live.filter((p) => p.module === "cons" && p.kind === "shared").length, consOn ? 1 : 0, `cons runs (${where})`)
-      assert.strictEqual(live.filter((p) => p.module === "cons" && p.kind === "instance").length, consOn ? 1 : 0, `cons's instance (${where})`)
-      const soloLive = live.filter((p) => p.module === "solo").length
-      if (soloChosen !== undefined) assert.strictEqual(soloLive, soloChosen ? 1 : 0, `solo follows its switch (${where})`)
-      else if (unlocked) assert.strictEqual(soloLive, 1, `solo runs while its key is set (${where})`)
-      for (const id of w.closed) closedBefore.add(id)
-    }).pipe(Effect.scoped)
-
-    stats.starts += w.started.size
-    stats.closes += w.closed.length
-    stats.ops += log.length
-    stats.failedStarts += w.failures
-    stats.issues += issuesSeen
-    // Closing the host closed everything, once, in dependency order.
-    const where = `seed ${seed}; ops: ${log.join(" | ")}`
-    assert.strictEqual(new Set(w.closed).size, w.closed.length, `a scope closed twice (${where})`)
-    for (const id of w.started) assert.include(w.closed, id, `${id} was never closed (${where})`)
-    const atShutdown = w.closed.filter((id) => !closedBefore.has(id))
-    const position = new Map(w.closed.map((id, i) => [id, i]))
-    for (const [instance, parent] of w.parentOf) {
-      if (position.has(instance) && position.has(parent)) {
-        assert.isBelow(position.get(instance)!, position.get(parent)!, `${instance} closed after its shared part ${parent} (${where})`)
+      if (step % 8 === 7) {
+        yield* settleAll(host)
+        checkInvariants(w, host, m, `seed ${seed}, step ${step}`)
       }
     }
-    const lastCons = Math.max(-1, ...atShutdown.filter((id) => id.startsWith("cons")).map((id) => atShutdown.indexOf(id)))
-    const firstProv = Math.min(Infinity, ...atShutdown.filter((id) => id.startsWith("prov")).map((id) => atShutdown.indexOf(id)))
-    assert.isBelow(lastCons, firstProv, `at shutdown, a consumer closed after its provider (${where})`)
+    if (!closedEarly) {
+      // Before anything else is written: what runs is what the latest desired state asks (a module that is down
+      // because of a fault is not judged here; one that runs must not run an older picture).
+      yield* settleAll(host)
+      const now = expectedOf(m)
+      for (const info of host.modules()) {
+        if (info.state !== "running") continue
+        const module = info.id as ModuleId
+        if (module === "solo") {
+          if (m.soloChosen !== undefined) assert.strictEqual(m.soloChosen, true, `seed ${seed}: solo runs though it was switched off`)
+          continue
+        }
+        assert.isTrue(now.running[module], `seed ${seed}: ${module} runs though nothing wants it`)
+        if (module === "prov") {
+          assert.strictEqual(host.service(Svc)?.address, now.address, `seed ${seed}: prov runs an older address`)
+          const users = (info.instances ?? []).map((i) => [...i.assistants].sort().join()).sort()
+          assert.deepStrictEqual(users, now.provInstances.map((i) => i.users.join()).sort(), `seed ${seed}: prov runs older instances`)
+        }
+        if (module === "cons") assert.deepStrictEqual((info.instances ?? []).flatMap((i) => [...i.assistants]).sort(), now.consUsers, `seed ${seed}: cons runs older users`)
+      }
+      // Clear the faults, Check again (it retries every module down after a failed start), and let it settle.
+      for (const module of MODULES) {
+        w.faults.start[module] = "ok"
+        w.faults.hangClose[module] = false
+      }
+      m.token = "t"
+      yield* fork(host.setSecrets({ solo: { token: "t" } }))
+      yield* settleAll(host)
+      const rechecked = yield* Effect.forkChild(host.recheck)
+      yield* joinWithin(rechecked, 120_000, `seed ${seed}: Check again`)
+      yield* settleAll(host)
+      // The worker is alive: one more trigger completes.
+      const alive = yield* Effect.forkChild(host.refresh)
+      yield* joinWithin(alive, 60_000, `seed ${seed}: a refresh after the sequence`)
+      checkInvariants(w, host, m, `seed ${seed}, final`)
+      const expected = expectedOf(m)
+      const modules = new Map(host.modules().map((i) => [i.id, i]))
+      for (const module of MODULES) {
+        assert.strictEqual(modules.get(module)!.state, expected.running[module] ? "running" : "disabled", `seed ${seed}: ${module}'s state`)
+      }
+      if (expected.running.prov) {
+        assert.strictEqual(host.service(Svc)?.address, expected.address, `seed ${seed}: the last configured address runs`)
+        const instances = (modules.get("prov")!.instances ?? []).map((i) => ({ users: [...i.assistants].sort() })).sort((a, b) => a.users.join().localeCompare(b.users.join()))
+        assert.deepStrictEqual(instances, expected.provInstances.map((i) => ({ users: i.users })).sort((a, b) => a.users.join().localeCompare(b.users.join())), `seed ${seed}: prov's instances`)
+        for (const i of expected.provInstances) {
+          for (const user of i.users) {
+            const part = host.snapshot().assistantParts.get(user)?.find((p) => p.moduleId === "prov")
+            assert.strictEqual(part?.instructions, `prov ${i.place}`, `seed ${seed}: ${user} uses the instance of its place`)
+          }
+        }
+      } else assert.strictEqual(host.service(Svc), undefined, `seed ${seed}: no service while prov does not run`)
+      if (expected.running.cons) {
+        assert.deepStrictEqual((modules.get("cons")!.instances ?? []).flatMap((i) => [...i.assistants]).sort(), expected.consUsers, `seed ${seed}: cons's users`)
+      }
+    }
+    // Close the host (at a random moment, or after the sequence): it returns within its bound.
+    const closing = yield* Effect.forkChild(Scope.close(scope, Exit.void))
+    yield* joinWithin(closing, 60_000, `seed ${seed}: closing the host`)
+    assert.deepStrictEqual(w.violations, [], `seed ${seed}: after close`)
+    for (const [sid] of w.opened) {
+      if (w.closed.has(sid) || w.hung.has(sid)) continue
+      assert.fail(`seed ${seed}: ${sid} is still open after the host closed`)
+    }
+    assert.strictEqual(w.live.size, 0, `seed ${seed}: everything withdrawn at close`)
+    return { opened: w.opened.size, hung: w.hung.size, closedEarly }
   })
 
-/** How much the seeds exercised (printed with `MODEL_STATS=1`). */
-const stats = { starts: 0, closes: 0, failedStarts: 0, issues: 0, ops: 0 }
-
 describe("the module host under random interleavings", () => {
-  // `MODEL_SEEDS=2000` runs more (the suite keeps a size that takes a few seconds).
-  const seeds = Number(process.env.MODEL_SEEDS ?? 60)
+  const seeds = Number(process.env.MODEL_SEEDS ?? 300)
   const first = Number(process.env.MODEL_FIRST_SEED ?? 1)
-  it.effect(`${seeds} seeds of 24 triggers each: every invariant after every quiescence`, () =>
+  const steps = Number(process.env.MODEL_STEPS ?? 30)
+  it.effect(`${seeds} seeds of ${steps} triggers each: every invariant at every quiescence, and the plan at the end`, () =>
     Effect.gen(function*() {
-      for (let seed = first; seed < first + seeds; seed++) yield* runSeed(seed, 24)
-      if (process.env.MODEL_STATS === "1") console.log(JSON.stringify(stats))
-      assert.isAbove(stats.starts, seeds * 3, "the seeds start modules")
-      assert.isAbove(stats.failedStarts, 0, "and some starts fail")
-    }), { timeout: 120_000 })
+      let opened = 0
+      let hung = 0
+      let closedEarly = 0
+      for (let seed = first; seed < first + seeds; seed++) {
+        const r = yield* runSeed(seed, steps)
+        opened += r.opened
+        hung += r.hung
+        if (r.closedEarly) closedEarly++
+      }
+      if (process.env.MODEL_SEEDS !== undefined) console.log(`model: ${seeds} seeds from ${first}: ${opened} scopes opened, ${hung} finalizers hung, ${closedEarly} hosts closed mid-sequence`)
+      assert.isAbove(opened, 0)
+    }), { timeout: 600_000 })
 })
+

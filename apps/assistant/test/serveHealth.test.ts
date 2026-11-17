@@ -37,7 +37,8 @@ describe("health in serve mode", () => {
     const { snapshot } = await admin.admin(TEST_ADMIN_PASSWORD)
     const module = snapshot.modules.find((m) => m.id === "needs-program")!
     expect(module.state).toBe("unavailable")
-    expect(module.unavailable?.reason).toBe(`${MISSING} is missing`)
+    // The program registry is empty in this version: a program it does not know is missing.
+    expect(module.unavailable?.reason).toBe(`${MISSING} is not a program this assistant knows how to check`)
     expect(snapshot.health).toBeDefined()
 
     const from = admin.messages.length
@@ -49,7 +50,7 @@ describe("health in serve mode", () => {
     expect(health.checking).toBe(false)
     expect(health.checkedAt).toBeGreaterThan(0)
     const issue = health.issues.find((i) => i.id === `needs-program.requires.${MISSING}`)
-    expect(issue).toMatchObject({ module: "needs-program", title: `${MISSING} is missing`, detail: expect.stringMatching(/^Needs a program needs it: It does the work\./) })
+    expect(issue).toMatchObject({ module: "needs-program", title: `${MISSING} is not a program this assistant knows how to check`, detail: expect.stringMatching(/^Needs a program needs it: It does the work\./) })
     // A voice page is never sent the registry.
     const voice = await ScriptedClient.connect({ url: server.url })
     clients.push(voice)

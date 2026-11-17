@@ -296,135 +296,176 @@ ModuleServicesV2      = { host: ModuleHostApi }   // later PRs add store, events
 SharedPart<X>         = { value: X; services?: [ServiceKey<T>.of(impl)]; contributions?: [ContributionKey<T>.of(value)] }
 ModuleHostApi = {
   view(): HostView                                  // module states, vault locked, engine summary, devices, Home values
-  service<T>(key: ServiceKey<T>): T | undefined     // live; undefined while no demanded module provides it
+  service<T>(key: ServiceKey<T>): T | undefined     // live; undefined while no published module provides it
   contributions<T>(key: ContributionKey<T>): Effect<ReadonlyArray<T>>   // for the calling fiber's principal (its context)
   contributionsFor<T>(key, assistantId | undefined): ReadonlyArray<T>    // explicit, for native callbacks; undefined: all
   actions: { list: Effect<CatalogAction[]>; run(req): Effect<ActionRunResult> }  // the turn's (calling assistant's) catalogue
-  requestRestart(reason): Effect<void>             // an instance: that one; the shared part: a new generation; by part identity
+  requestRestart(reason): Effect<void>             // stop the module, then start it again (at most every 5 s, merged)
   reportMissingProgram(tool): Effect<void>         // ENOENT/EACCES at run time: judged unavailable at once
-}
+}                                                   // after its part closed, every member answers ModuleStopped (a defect)
 Principal = { turn } | { job } | { local } | { notification }   // TurnContext.ts: on whose behalf a call runs
 CurrentPrincipal: Context.Reference<Principal | undefined>       // the admitted principal, around execute/run
 ```
 
-- **Two lifetimes.** `start` runs per distinct set of effective settings as before; `shared` runs once per module while
-  it is demanded (an assistant has it on, its switch is on without demand, or a demanded module names it in `uses`,
-  transitively), with the shared settings only (validated alone), and every instance gets its `value`. Services (one
-  provider per key: a second is a start error) and contributions (any number; inside a turn only those of modules the
-  turn's assistant has on, read from the caller's own context) come from `shared` and are looked up live. A shared
-  part and its instances are a **generation**, published only if its shared part and every one of its instances
-  started; how the host gets there is the reconciler below. `settingsFor(assistantId)` is computed at the call from the
-  desired state: the generation's own shared values, the overridable ones as they are now. Module code the host starts
-  (and `health()`, and retirement) runs without `CurrentTurn`/`CurrentJob`/`CurrentPrincipal`, whoever asked. The CLI
-  modes run every module whose saved switch is on, one instance each, through the same host and gateway, and read the
-  snapshot at every turn's start (`apps/assistant/src/modules.ts`, `CliModules`).
+- **Two lifetimes.** `start` runs per distinct set of valid effective settings as before; `shared` runs once per
+  module while it is demanded (an assistant has it on, its switch is on without demand, or a demanded module names it
+  in `uses`, transitively), with the shared settings only (validated alone), and every instance gets its `value`.
+  Services (one provider per key: a second is a start error) and contributions (any number; inside a turn only those
+  of modules the turn's assistant has on, read from the caller's own context) come from `shared` and are looked up
+  live. A module's shared part and instances are started, published, stopped and closed **together** (the module
+  host, below). `settingsFor(assistantId)` answers from the desired state the module was started with (a change of it
+  restarts the module). Module code the host starts (and `health()`) runs without `CurrentTurn`/`CurrentJob`/
+  `CurrentPrincipal`, whoever asked (`outsideTurns`). The CLI modes run every module whose saved switch is on, one
+  instance each, through the same host and gateway, and read the snapshot at every turn's start
+  (`apps/assistant/src/modules.ts`, `CliModules`).
 - **The execution gateway** (`packages/core/src/Gateway.ts`) is the one way to `Tool.execute` and `ActionDefinition.run`:
-  `ToolRegistry.run` (core's tool loop, the Claude Code bridge), `ToolRegistry.runAction` (the intent agent, a
-  confirmed action) and `host.actions.run`; later phrase commands, taps, routine steps and notification actions. Its
-  admission takes a principal (`Principal`): the explicit one a caller passes (a notification, P9), else `CurrentTurn`,
-  else `CurrentJob`, else the local or notification principal of the gateway call it is made from
-  (`CurrentPrincipal`), else the local principal in the CLI modes (`ModuleHostOptions.localPrincipal`, default: without
-  `access`); in serve mode a call with none is refused, and so is one with missing parts (a turn without an assistant
-  or a device, a job or notification without its ids, a tool of no module for an assistant, what
-  `GatewayAccess.principalProblem` refuses: serve mode refuses an assistant that does not exist). **The admitted call
-  runs as that principal**: `execute` and `run` see exactly its `CurrentTurn`, `CurrentJob` and `CurrentPrincipal`
-  (`asPrincipal`), and so do the calls they make. It validates the input (a generated action tool's input is
-  resolved to the action's values once; those are admitted and run), resolves `risk` (a class, or `{ classes, of }`;
-  an undeclared answer is refused; inferred `read` for speculative tools, else `change`), `sensitivity` (fixed, or
-  `per-result`) and `latency`, and checks in order: the assistant has the module on, the tool is not in its `offTools`
-  (`ModuleHostOptions.access`; skipped for the local principal and a notification), the risk hook
-  (`ModuleHostOptions.gatewayHooks.risk`, empty until P8). There is no confirmation hook. The host's registries and
-  serve mode's per-assistant registries all carry `host.gateway`; a hand-made registry uses `defaultGateway` (no
-  access checks, local principal). Input decoders are made when a registry is built.
+  `ToolRegistry.run` (core's tool loop, the Claude Code bridge), `ToolRegistry.runAction` (the intent agent) and
+  `host.actions.run`; later phrase commands, taps, routine steps and notification actions. Every tool and action the
+  host publishes is **sealed**: its own `execute`/`run` only refuses, and the real one (inside the host's in-flight
+  tracking) is reachable only from the gateway (`GatewayPrivate.ts`, not exported from the package); a generated
+  action tool's `execute` refuses too. Its admission takes a principal (`Principal`): the explicit one a caller passes
+  (a notification, P9), else `CurrentTurn`, else `CurrentJob`, else the local or notification principal of the
+  gateway call it is made from (`CurrentPrincipal`), else the local principal in the CLI modes
+  (`ModuleHostOptions.localPrincipal`, default: without `access`). In serve mode a call with none is refused, so is a
+  local one, and so is one whose parts do not belong together: a turn without an assistant or device, a job or
+  notification without its ids, a tool of no module for an assistant, and what serve mode's
+  `GatewayAccess.principalProblem` refuses (the assistant does not exist; the device is not known; the device does not
+  have that assistant; the connection is not that device's; a person is named, which no server knows yet). **The
+  admitted call runs as that principal**: `execute` and `run` see exactly its `CurrentTurn`, `CurrentJob` and
+  `CurrentPrincipal` (`asPrincipal`), and so do the calls they make. The checks, in order: the principal; the
+  assistant has the module on; the tool is not in its `offTools` (`ModuleHostOptions.access`; skipped for the local
+  principal and a notification); only then the module's **risk function** (`risk: { classes, of }`, else the declared
+  or inferred class: `read` for speculative tools, else `change`), run on the validated input (a generated action
+  tool's input is resolved to the action's values once; those are classified, admitted and run); then the risk hook
+  (`ModuleHostOptions.gatewayHooks.risk`, empty until P8). A risk function that throws, answers a class it did not
+  declare or takes longer than `RISK_BUDGET_MS` (2 ms: it is synchronous code on the turn path, so it must be pure and
+  bounded) refuses the call with "what it would do could not be judged"; what went wrong goes to the log only. An
+  action declared `confirm: true` is refused on every public path (confirmation is off in this stack); only core's own
+  confirmed path (`Conversation`, after a consumed spoken yes, while `confirmActions` is "on") runs one. There is no
+  confirmation hook and no caller can claim a confirmation. `onAdmitted` / `holdUntil` (`ActionCallOptions`) let the
+  intent agent speak an action's announcement only once it is admitted, and hold a non-speculative action until its
+  turn is promoted (the same call is admitted again just before it runs). The host's registries and serve mode's
+  per-assistant registries all carry `host.gateway`; a hand-made registry uses `defaultGateway` (no access checks,
+  local principal). Input decoders are made when a registry is built. **Cost** (`TurnTrace` tool times, 350 warm
+  turns, `GatewayRound3.test.ts`): a module tool through the host's gateway (access checks, a risk function, sealing,
+  in-flight tracking) takes 0.016 ms at the median against 0.012 ms for a bare registry.
 - **Availability.** `requires`, `platforms` and `apiVersion` are judged before anything starts, from the app's probes
-  (`apps/assistant/src/requirements.ts`: one tool registry, argv + version regexp, no shell, 5 s, fixed `PATH` with
-  `data/tools/bin` first, cached; probed at start and on "Check again", never on a turn). A module that fails them is
-  `ModuleState` `unavailable` (protocol 9, `ModuleInfo.unavailable`: reason and fix), is never started, and each
-  assistant that has it on gets one instructions line saying it is not set up (`unavailableInstruction`) and, for
-  intent agents, stand-ins of its `declaredActions` that answer with its "not set up" line (`unavailableLine`). Version
-  ranges are semver and fail closed; a `gpu` requirement is judged on the listed device (else `unchecked`); a program
-  that fails at run time with ENOENT/EACCES is reported (`reportMissingProgram`) and marked missing without a probe.
-- **Health.** The host keeps an issue registry (`ModuleHost.issues`: requirements, unavailable, failed starts and
-  restarts, each module's `health()`), the app adds the core checks (`apps/assistant/src/coreChecks.ts`). `pnpm start
-  doctor` prints them and exits 1 on an error (a requirement is an error for a module the assistants use, directly or
-  through `uses`; doctor reads their demand and starts nothing: `ModuleHost.evaluate`); admin's Diagnostics › Health
-  shows them (`health`, `health.check`, answered once the check has started). Issues are clipped to the wire's limits.
-- **Templates** are plain data (`ModuleInfo.templates`, ids `<moduleId>.<id>`) that the new-assistant wizard offers.
+  (`apps/assistant/src/requirements.ts`). Two kinds of requirement: a **program on the server** (`{ tool, version?,
+  why }`) and the **network** (`{ network }`, not probed yet: `unchecked`). One program registry (argv and a version
+  pattern per program, no shell, 5 s, fixed `PATH` with `data/tools/bin` first, cached in a `Map`); it is **empty** in
+  this version (no first version of a module needs a program; the module that first needs one adds its entry), and a
+  program it does not know is missing. A version is what the entry's pattern captures, and only a strict semver string
+  counts (`6.1.0`, `0.35.0-rc.1`, `1.2.3+b5`); anything else is an unknown version, which satisfies no range; a
+  prerelease satisfies only a range that allows it (node-semver). A probe that was already running when a program was
+  reported missing (`markMissing`) cannot undo the report (each probe and report has a number; the newest wins).
+  Probed at start and on "Check again", never on a turn. A module that fails them is `ModuleState` `unavailable`
+  (protocol 9, `ModuleInfo.unavailable`: reason and fix), is never started, and each assistant that has it on gets one
+  instructions line saying it is not set up (`unavailableInstruction`) and, for intent agents, stand-ins of its
+  `declaredActions` that answer with its "not set up" line (`unavailableLine`). Requirements on a device, on memory,
+  disk or a GPU are not part of this version.
+- **Health.** The host keeps an issue registry (`ModuleHost.issues`: requirements, unavailable, failed starts, module
+  code that hung, each module's `health()`). Every issue is normalised where it enters (`wireSafeIssue`): id, module,
+  device, title and the fix's label and value are one line, a detail keeps its line breaks, no other control
+  character survives, every text is clipped to the wire's limits; at most 20 issues per module and, in all,
+  `MAX_HEALTH_ISSUES` (100) and 256 KB, the rest said in one last issue ("And 12 more issues"). `pnpm start doctor`
+  prints every module's requirements and health, one line per issue with its fix (no control characters, no line
+  breaks), exits 1 on an error (a requirement is an error for a module the assistants use, directly or through `uses`;
+  doctor reads their demand and starts nothing: `ModuleHost.evaluate`), and says nothing about the machine itself
+  (disk, TLS, the port, speech models: the deployment work, docs/MODULES-PLAN.md §7). It reads the saved settings and
+  the vault read-only and strictly: when either cannot be read (or the vault stays locked, or parts of the settings
+  were dropped) it says why and exits 2, never judging the defaults. Admin's Diagnostics › Health shows the registry
+  by module and, within one, the device an issue is about (`health`, `health.check`, answered once the check has
+  started); "Check again" probes again, judges again and **tries again every module that is down after a failed
+  start**, whether or not a probe result changed.
+- **Templates** are plain data (`ModuleInfo.templates`, ids `<moduleId>.<id>`, at most 8 per module and 128 KB for all
+  modules together, the rest said on the Health page) that the new-assistant wizard offers; a module a template names
+  that this server does not have is named there, never silently dropped.
 
-#### Module host: the reconciler (`ModuleHost.ts`, `ModulePlanner.ts`)
+#### Module host (`ModuleHost.ts`, `ModulePlanner.ts`)
 
-The host **reconciles; it does not interleave**. There is a **desired state** (per module: its saved switch, committed
-settings and a configure's pending proposal, the vault's secrets, the assistants' choices and own values (`demand`),
-the linked defaults, the requirement judgement, restart counters and a retry counter; and for the host: active, or
-shutting down) and a **current state** (the published shared part and instances, failed starts remembered by
-fingerprint). Every trigger (`configure`, `enable`, `disable`, `refresh`, `setSecrets`, `recheck`, `startEnabled`,
-`requestRestart`, closing the host) only **writes desired state** synchronously and then waits for a reconciliation
-that **began after** its write; an interrupted caller only stops waiting.
+**One worker, one module at a time, stop before start.** There is a **desired state** per module (its saved switch,
+committed settings, the vault's secrets and a vault epoch, a configured-secret epoch, the assistants' choices and own
+values (`demand`), the linked defaults, the requirement judgement, a restart counter, a retry counter), kept as an
+immutable object per module that triggers replace. Every trigger (`configure`, `enable`, `disable`, `refresh`,
+`setSecrets`, `recheck`, `startEnabled`, `requestRestart`) only **writes desired state** synchronously (a save it
+needs is queued in the same step) and then waits for a pass that **began after** its write; an interrupted caller just
+stops waiting (nothing is kept for it). With `demand` (serve mode) nothing runs before `startEnabled`, which the app
+calls once everything the modules depend on is built.
 
-One **reconciler fiber** runs passes, never two at once; a write during a pass makes it run again. A pass:
+One **worker fiber** runs passes, never two at once; a write during a pass makes it run again; nothing else starts or
+stops module code. A pass **captures the desired state once** (the objects as they are at its start) and asks the pure
+planner (`planModule(target, current)`, tested with a table) what each module should run: its **fingerprint** (the
+shared settings, the valid instances' keys, the configured-secret epoch, the restart counter) and its **attempt key**
+(the fingerprint plus the vault epoch, the requirement probes and the retry counter). Then it walks the modules
+**sequentially**: first stopping, consumers before the providers they `use`; then starting, providers first. For a
+module whose fingerprint differs from what runs:
 
-1. copies the desired state and asks the pure planner (`planModule(target, current)`, tested with a table) what to do
-   per module: a new **generation** (a different shared fingerprint, or none published), instances to start within
-   the published generation (new keys; a changed fingerprint: a restart or a configured secret), instances to retire,
-   or a stop. A start that failed is not tried again at the same fingerprint and retry counter (enable, configure,
-   startEnabled, a vault change and Check again bump the retry counter; a module that stops forgets its failures);
-2. starts what is missing, outside any turn: independent modules concurrently, a module only after the shared parts in
-   its `uses` have started or failed **in this pass** (a consumer starting then finds its new provider through its own
-   `host.service`), a generation's instances after its shared part;
-3. makes **one synchronous switch**: definite withdrawals first (modules that stop, instances no longer wanted), then,
-   in `uses` order, every module's starts: a generation is published only if its shared part and every instance
-   started and every registration passes its checks, else the previous generation keeps serving (or the module stays
-   down) and the failure is recorded for Health (`kept`, "could not apply its new settings" / "could not be started
-   again", or the module's `error`), whatever triggered the pass; an instance within a generation is published on its
-   own, except for an owner's configure of a module that runs, which is all or nothing (refused, not saved). The
-   snapshot is rebuilt once, at the end;
-4. resolves configures (saved once switched to, or when nothing ran to protect; dropped and reported otherwise),
-   closes discarded candidates and retires what the switch withdrew.
+1. **withdraw**: every registration of the module (tools, actions, context providers, services, contributions, every
+   other kind) out of what is published, in one synchronous step, and the snapshot rebuilt; a tool, action or context
+   provider of it called from now on is refused;
+2. **wait** for its calls in flight, at most the grace period (`graceMs`, 10 s), then interrupt what remains (the
+   waiting happens in the callers' fibers);
+3. **close** its instances, then its shared part;
+4. **start** the new shared part, then the new instances, one after another;
+5. **publish** them in one synchronous step if all started and every registration passes its claims and `validate`;
+   otherwise close what did start (instances first) and leave the module **down** with its error on the Health page.
 
-**Closing order.** Every part's scope is tracked until closed, and closed exactly once (`closePart`): rollback closes
-at once, retirement after the grace period (calls in flight finish), shutdown at once, scopes in their grace period
-included. Always a consumer before the providers it uses, an instance before its shared part, one after another (an
-instance's asynchronous finalizer finishes before its shared part closes). **Shutdown** is a desired state too:
-closing the host stops the reconciler (a start in progress is interrupted), withdraws everything, then closes every
-open scope in that order and waits for pending saves, bounded by `closeTimeoutMs`.
+There is no moment at which two starts of one module are published, and no old one kept running beside or instead of
+a new one. Assistants that only move between equal instances change no fingerprint: only who uses which changes. An
+assistant whose own values are not valid gets an error of its own and is never grouped with a valid one; the others
+run. A start that failed is tried again when its attempt key changes (its desired settings, shared or any instance's;
+its secrets or the vault; its requirements' probe results; its restart counter) or "Check again" is pressed; a module
+that stops being wanted forgets its failure.
 
-**Restarts** are counters in the desired state, routed by part identity: a request from a live part counts (one made
-while a restart is in progress starts another afterwards, so no change is lost; at most 5 per 30 s, later ones wait);
-one made during the part's own start applies once it is published; one from a retired or discarded part is ignored.
-A restart that changes no setting starts with the settings the part runs with (a vault locked since cannot stop it).
+**Bounded module code.** Every call into module code (`shared`, `start`, a finalizer, through `Scope.close`) runs in a
+fiber of its own with a limit (`startTimeoutMs` 10 s for a start, `stopTimeoutMs` 5 s for closing one part); when it
+passes, the worker interrupts that fiber without waiting for it, records a Health issue naming the module and what
+hung ("did not finish stopping", kept until "Check again"), and moves on. An interruption, failure or defect inside
+module code is that module's start failure; a failure in the worker's own handling of one module marks that module
+down with the reason; the worker itself ends only when the host closes. A `validate`, `publish` or `withdraw` that
+throws is caught: before publishing it refuses the start; during publishing it withdraws what this step published of
+the module and the module is down; during withdrawing it is reported and the stop goes on.
+
+**Closing the host** is the same walk with nothing wanted, consumers first, without grace (calls in flight are
+interrupted), bounded by `closeTimeoutMs` (30 s) in all; past that, what is left is abandoned and logged and close
+returns. Pending saves are waited for within the same bound.
+
+**Restarts.** `requestRestart` counts at once; the restart counter in the desired state follows at most once every
+5 s per module, every request in between merged into the next, and a request made after the last restart was applied
+always leads to another. One made during the part's own start applies once it is published (dropped if it is not).
+A restart with the same configured secrets starts with the secrets the module ran with (a vault locked since does not
+stop it).
+
+**A host object kept by module code** after its part's scope closed answers every member with `ModuleStopped` (an
+effect dies with it, a synchronous member throws it; `isModuleStopped`).
 
 #### Module host: registrations (`ModuleRegistrations.ts`)
 
-A generation owns everything it offers. Each started part carries a list of **registrations**:
+Everything a module offers is a **registration** of one of its parts:
 
 ```ts
 interface Registration {
   kind: string                       // "service", "contribution", "tool", "route", "job-handler", …
   claims?: ReadonlyArray<string>     // unique per kind across modules (a service id, a tool name, a route path)
-  clash?(claim, ownerName): string   // the refusal when another module's live registration holds the claim
-  validate?(): string | undefined    // its own check before the switch: a reason refuses the part (and its generation)
-  publish(): void                    // inside the switch, synchronous
-  withdraw(): void                   // inside the switch that retires the part, synchronous
+  clash?(claim, ownerName): string   // the refusal when another module's published registration holds the claim
+  validate?(): string | undefined    // its own check before anything of the module is published: a reason refuses the start
+  publish(): void                    // in the worker's publish step, synchronous; a throw is a defect (see above)
+  withdraw(): void                   // in the worker's withdraw step, synchronous
 }
 type Registrar = (part: StartedPart) => ReadonlyArray<Registration>   // StartedPart = { handle, shared?, instance? }
 interface PartHandle { moduleId; moduleName; kind: "shared" | "instance"; id; state(); scope; register(r): RegisterResult }
 ```
 
-A registration is live from the switch that publishes its part, never live for two generations of one module at
-once, withdrawn at the switch that retires or replaces the part, and never live for a part that is discarded. Services,
-contributions, tool names (and through them the snapshot's parts) are expressed this way. A later PR adds a kind in
-one place:
+Only the worker publishes and withdraws, all of a module's registrations together. Services, contributions, tool names
+(and through them the snapshot's parts) are expressed this way. A later PR adds a kind in one place:
 
 - **declared by what a part returns** (P3's `SharedPart.routes`): one `Registrar` in the host's `registrars` list. For
   routes: `claims` = the route paths, `validate` = `routeProblem` for each, `publish` puts `{ routes, scope: handle.scope
-  }` in the live route table under the module id, `withdraw` removes it if the table still holds this part's entry;
-  `host.routes()` reads that table, so a request after the switch reaches the new generation and never the old;
-- **made by module code while it runs** (P6's job handlers, P4's subscriptions, later phrase commands and notification
-  action handlers): the context member gets the part's `PartHandle` in `servicesFor(entry, part)` and calls
-  `part.register(...)`: staged during the part's start, checked and published at once on a live part, refused on a
-  retired or discarded one. A job that fires looks its handler up in the live table, so it reaches the current
-  generation; a tool or action of a part whose scope has closed (a turn that held an old snapshot past the grace
-  period) answers that it was replaced.
+  }` in the route table under the module id, `withdraw` removes it; `host.routes()` reads that table;
+- **made by module code while it starts** (P6's job handlers, P4's subscriptions, later phrase commands and
+  notification action handlers): the context member gets the part's `PartHandle` in `servicesFor(entry, part)` and
+  calls `part.register(...)` during `shared` or `start`; the registration is published with the module. A call after
+  the part has started is refused: there is no registration outside the worker.
 
 `ModuleHostOptions.registrars` adds kinds an app keeps itself (and tests).
 
@@ -488,8 +529,8 @@ apps/
                     `AUDIO_BACKEND` in the CLI modes; `llmAccountLayers` for the assistants' accounts; `ttsProviders` / `ttsProviderInfo` for the voice
                     providers), voiceSelection.ts (the default voice, `ASSISTANT_VOICE` for the CLI and the migration), modules.ts (the module catalog), main.ts, serve/ (web UI server:
                     Resources.ts the resource pool, SessionDispatcher.ts, OutputLease.ts, assistants.ts, devices.ts, migrateAssistants.ts); modes: `serve`,
-                    `voice`, `text` (stdin/stdout, no audio), `doctor` (core checks, module requirements and health;
-                    exit 1 on an error; `doctor.ts`, `coreChecks.ts`, `requirements.ts`), `bench`
+                    `voice`, `text` (stdin/stdout, no audio), `doctor` (every module's requirements and health;
+                    exit 1 on an error, 2 when the settings or vault cannot be read; `doctor.ts`, `requirements.ts`), `bench`
                     (offline with simulated delays, `--live` over WAV files with the real providers, `--make-wavs`),
                     `say` (text → a voice → speaker or WAV, with engine timings), `transcribe` (WAV → STT events with timings),
                     `compare-models` (WAVs → every installed local STT preset: transcript and timings)

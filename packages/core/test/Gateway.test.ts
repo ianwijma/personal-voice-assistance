@@ -1,5 +1,6 @@
 // The execution gateway (docs/MODULES-PLAN.md §4 P1): one way to a tool's execute and an action's run, checking the
 // assistant's module, its offTools, then the risk hook, in that order.
+import { confirmedRunnerOf } from "../src/GatewayPrivate.ts"
 import { assert, describe, it } from "@effect/vitest"
 import { Effect, Layer, Schema, Stream } from "effect"
 import { defineAction, registerActions } from "../src/Actions.ts"
@@ -60,7 +61,8 @@ describe("the execution gateway", () => {
       ])
       const off = yield* Effect.flip(gateway.action(action!, {})).pipe(Effect.provideService(CurrentTurn, turnOf("b")))
       assert.strictEqual(off.message, "Not run: the home module is not on for this assistant.")
-      const outcome = yield* gateway.action(action!, {}, { confirmed: true }).pipe(Effect.provideService(CurrentTurn, turnOf("c")))
+      // Core's confirmed path (after a spoken yes): the only one that marks a call confirmed.
+      const outcome = yield* confirmedRunnerOf(undefined, gateway)!(action!, {}).pipe(Effect.provideService(CurrentTurn, turnOf("c")))
       assert.deepStrictEqual(outcome, { say: "Open." })
       assert.strictEqual(calls[0]!.name, "home_door")
       assert.strictEqual(calls[0]!.risk, "security")

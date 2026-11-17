@@ -19,6 +19,7 @@ import { armAgent, initialRouterState, type RouteDecision, type Router, type Rou
 import { AudioInput, AudioOutput, Llm, Stt, Tts, type TtsAudio } from "./Services.ts"
 import { ToolRegistry } from "./ToolRegistry.ts"
 import { defaultGateway } from "./Gateway.ts"
+import { confirmedRunnerOf } from "./GatewayPrivate.ts"
 import { type ConnectionRef, CurrentTurn, makeTurnContext, type TurnContext } from "./TurnContext.ts"
 import { CurrentTurnTrace, type Trace, TurnTrace, type TurnOutcome } from "./TurnTrace.ts"
 import { ACTION_TIMEOUT_MS, ActionError, type ActionOutcome, actionToolName, type RegisteredAction } from "./Actions.ts"
@@ -757,8 +758,12 @@ const makeConversationCore = Effect.fnUntraced(function*(options: AgentConversat
       emit({ _tag: "ActionStarted", turnId, callId, actionId: action.id, label: def.label, params })
       const start = tt.now()
       const work = withCurrentTurn(
-        // Through the execution gateway, as confirmed (the owner said yes; the access checks still apply).
-        (setup?.registry.runAction ?? defaultGateway.action)(action, params, { confirmed: true }).pipe(
+        // Through the execution gateway's own confirmed path (the owner said yes; the access checks still apply).
+        // Only core reaches it; every public path refuses an action that needs confirmation.
+        Effect.suspend(() => {
+          const confirmed = confirmedRunnerOf(setup?.registry, defaultGateway)
+          return confirmed === undefined ? Effect.fail(new ActionError({ message: "Not run: there is no confirmed path for this action." })) : confirmed(action, params)
+        }).pipe(
           Effect.timeoutOrElse({
             duration: ACTION_TIMEOUT_MS,
             orElse: () => Effect.fail(new ActionError({ message: `${def.label} did not finish within ${ACTION_TIMEOUT_MS / 1000} seconds.` }))

@@ -6,6 +6,7 @@ import { useClient, useClientState } from "../context.tsx"
 import { StatusLine } from "../StatusLine.tsx"
 import { Spinner } from "../ui/Icon.tsx"
 import { Button, cx, Switch } from "../ui/controls.tsx"
+import { IssueFix } from "./pages/HealthPage.tsx"
 
 // `stopping` is shown as off: the module left the snapshot at once and only its scope lingers for the
 // server's 10 s grace (docs/UI-AND-MODULES.md §1.4), so a badge or spinner there would say it is still on.
@@ -58,6 +59,7 @@ export function ModuleHeader({ module: m, editable, compact = false }: { readonl
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-2">
             <span className={cx("font-medium text-ink", compact ? "text-[14px]" : "text-[15px]")}>{compact ? `${m.name} module: ${m.enabled ? "on" : "off"}` : m.enabled ? "On" : "Off"}</span>
+            {m.version !== undefined && !compact && <span className="text-[12px] text-ink-faint" data-testid="module-version">version {m.version}</span>}
             {badge !== undefined && (
               <span className={cx("label inline-flex items-center gap-1 text-[10px]", m.state === "error" ? "text-danger" : m.state === "unavailable" ? "text-warn" : "text-ink-faint")}>
                 {m.state === "starting" && <Spinner size={10} />}
@@ -85,12 +87,7 @@ export function ModuleUnavailableNote({ module: m }: { readonly module: ModuleIn
   return (
     <div role="status" className="flex flex-col items-start gap-1.5 rounded-md border border-warn/40 bg-warn/5 px-3 py-2.5" data-testid="module-unavailable">
       <p className="text-[13px] text-ink">{m.name} cannot run on this server{u !== undefined ? `: ${u.reason.replace(/[.]$/, "")}.` : "."}</p>
-      {u?.fix !== undefined && (
-        <p className="text-[13px] text-ink-muted">
-          {u.fix.label}
-          {u.fix.kind === "command" && u.fix.value !== undefined && <code className="ml-1 rounded-sm bg-surface-2 px-1 font-mono text-[12px] text-ink">{u.fix.value}</code>}
-        </p>
-      )}
+      {u?.fix !== undefined && <IssueFix fix={u.fix} />}
       <a href={formatSettingsHash(["diagnostics", "health"])} className="text-[13px] text-voice underline-offset-4 hover:underline">Diagnostics › Health</a>
     </div>
   )
