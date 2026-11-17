@@ -1,27 +1,38 @@
+import { dicts } from "./Dict.ts"
 import type { ClockTime, Language, LocalDate } from "./Result.ts"
 import type { PackUnit, UnitId } from "./Quantity.ts"
 import { monthNames, numberToWords, ordinalToWords, weekdayNames } from "./Words.ts"
 import { dayDiff, isoWeekday } from "./Zoned.ts"
 
-const round2 = (n: number): number => Math.round(n * 100) / 100
+/**
+ * The decimals a number is said with: two, or as many as its first two significant digits need when it is below 1 (0.001 is
+ * "0.001", 0.000123 is "0.00012"), at most ten. A nonzero number is never said as 0 (review round 1, finding 22).
+ */
+const decimalsFor = (v: number): number => {
+  if (v === 0 || v >= 1) return 2
+  return Math.min(10, Math.max(2, 1 - Math.floor(Math.log10(v))))
+}
+/** `v` (not negative) as digits with at most `decimals` decimals, trailing zeros dropped: "2.5", "0.001", "12". */
+const digitsOf = (v: number, decimals: number): { whole: string; fraction: string } => {
+  const fixed = v.toFixed(decimals)
+  const [whole, fraction = ""] = fixed.split(".")
+  return { whole: whole!, fraction: fraction.replace(/0+$/, "") }
+}
 
 /**
- * A number for the speech synthesiser. Digits by default, with the language's decimal mark ("2.5", "2,5"; at most two decimals,
- * no thousands separator). `words`: "forty two" / "tweeënveertig", decimals digit by digit ("two point five", "twee komma vijf").
+ * A number for the speech synthesiser. Digits by default, with the language's decimal mark ("2.5", "2,5"; two decimals, more for a
+ * number below 1 so that it keeps two significant digits; no thousands separator). `words`: "forty two" / "tweeënveertig", decimals
+ * digit by digit ("two point five", "twee komma vijf"). Not finite: "" (nothing to say).
  */
 export const speakNumber = (n: number, language: Language, options: { readonly words?: boolean } = {}): string => {
-  if (!Number.isFinite(n)) return String(n)
-  const sign = n < 0 ? (language === "en" ? "minus " : "min ") : ""
-  const v = round2(Math.abs(n))
-  const whole = Math.trunc(v)
-  const frac = Math.round((v - whole) * 100)
-  if (options.words !== true) {
-    const fraction = frac === 0 ? "" : (language === "en" ? "." : ",") + String(frac).padStart(2, "0").replace(/0$/, "")
-    return `${sign}${whole}${fraction}`
-  }
-  const w = numberToWords(whole, language)
-  if (frac === 0) return sign + w
-  const digits = String(frac).padStart(2, "0").replace(/0$/, "").split("").map((d) => numberToWords(Number(d), language)).join(" ")
+  if (!Number.isFinite(n)) return ""
+  const abs = Math.abs(n)
+  const { whole, fraction } = digitsOf(abs, decimalsFor(abs))
+  const sign = n < 0 && (whole !== "0" || fraction !== "") ? (language === "en" ? "minus " : "min ") : ""
+  if (options.words !== true) return `${sign}${whole}${fraction === "" ? "" : (language === "en" ? "." : ",") + fraction}`
+  const w = numberToWords(Number(whole), language)
+  if (fraction === "") return sign + w
+  const digits = fraction.split("").map((d) => numberToWords(Number(d), language)).join(" ")
   return `${sign}${w} ${language === "en" ? "point" : "komma"} ${digits}`
 }
 
@@ -30,7 +41,7 @@ interface Names {
   readonly many: string
 }
 const n = (one: string, many = one): Names => ({ one, many })
-const unitNames: Record<Language, Record<UnitId, Names>> = {
+const unitNames = dicts<Language, Names>({
   en: {
     g: n("gram", "grams"), kg: n("kilogram", "kilograms"), oz: n("ounce", "ounces"), lb: n("pound", "pounds"),
     ml: n("millilitre", "millilitres"), cl: n("centilitre", "centilitres"), dl: n("decilitre", "decilitres"), l: n("litre", "litres"),
@@ -47,7 +58,7 @@ const unitNames: Record<Language, Record<UnitId, Names>> = {
     loaf: n("brood", "broden"), box: n("doos", "dozen"), tub: n("bak", "bakken"), roll: n("rol", "rollen"),
     piece: n("stuk", "stuks"), handful: n("handvol"), pinch: n("snufje", "snufjes"), splash: n("scheutje", "scheutjes")
   }
-}
+})
 const packUnits: ReadonlySet<UnitId> = new Set<PackUnit>(["pack", "bag", "bottle", "can", "jar", "bunch", "loaf", "box", "tub", "roll"])
 
 export interface AmountLike {
@@ -79,23 +90,35 @@ export const speakAmount = (q: AmountLike, language: Language, options: SpeakAmo
     if (amount !== undefined) return `${q.approx === true ? (language === "en" ? "about " : "ongeveer ") : ""}${speakNumber(amount, language)}${item === undefined ? "" : " " + item}`
     return language === "en" ? (item === undefined ? "some" : `some ${item}`) : (item === undefined ? "wat" : `wat ${item}`)
   }
-  if (options.humanize !== false && amount < 1 && unit === "kg") { amount = Math.round(amount * 1000); unit = "g" }
-  if (options.humanize !== false && amount < 1 && unit === "l") { amount = Math.round(amount * 1000); unit = "ml" }
+  if (!Number.isFinite(amount)) return language === "en" ? (item === undefined ? "some" : `some ${item}`) : (item === undefined ? "wat" : `wat ${item}`)
+  // 0.25 kg is "250 grams"; 1500 g is "1.5 kilograms" only when nothing is lost (1234 g stays "1234 grams").
+  const exact = (x: number) => Math.abs(x * 100 - Math.round(x * 100)) < 1e-9
+  if (options.humanize !== false && Math.abs(amount) < 1 && amount !== 0 && unit === "kg") { amount = amount * 1000; unit = "g" }
+  if (options.humanize !== false && Math.abs(amount) < 1 && amount !== 0 && unit === "l") { amount = amount * 1000; unit = "ml" }
+  const names = unitNames[language][unit]
+  if (names === undefined) return `${speakNumber(amount, language)} ${String(unit)}${item === undefined ? "" : " " + item}`
+  // Singular or plural by what is said: "1 gram", "1.004" is said "1" too.
+  const one = (x: number) => speakNumber(x, language) === "1"
   if (unit === "piece") {
     const count = `${q.approx === true ? (language === "en" ? "about " : "ongeveer ") : ""}${speakNumber(amount, language)}`
-    return item !== undefined ? `${count} ${item}` : `${count} ${amount === 1 ? unitNames[language].piece.one : unitNames[language].piece.many}`
+    return item !== undefined ? `${count} ${item}` : `${count} ${one(amount) ? names.one : names.many}`
   }
-  if (options.humanize !== false && amount >= 1000 && unit === "g") { amount /= 1000; unit = "kg" }
-  if (options.humanize !== false && amount >= 1000 && unit === "ml") { amount /= 1000; unit = "l" }
-  const names = unitNames[language][unit]
+  if (options.humanize !== false && amount >= 1000 && unit === "g" && exact(amount / 1000)) { amount /= 1000; unit = "kg" }
+  if (options.humanize !== false && amount >= 1000 && unit === "ml" && exact(amount / 1000)) { amount /= 1000; unit = "l" }
+  return speakMeasured(amount, unit, unitNames[language][unit]!, q, language, of, one)
+}
+
+const speakMeasured = (
+  amount: number, unit: UnitId, names: Names, q: AmountLike, language: Language, of: (text: string) => string, one: (x: number) => boolean
+): string => {
   const approx = q.approx === true && unit !== "handful" && unit !== "pinch" && unit !== "splash" ? (language === "en" ? "about " : "ongeveer ") : ""
   if (unit === "handful" || unit === "pinch" || unit === "splash") {
     if (amount === 1) return of(`${a(language, names.one)} ${names.one}`)
-    return of(`${approx}${speakNumber(amount, language)} ${amount === 1 ? names.one : names.many}`)
+    return of(`${approx}${speakNumber(amount, language)} ${one(amount) ? names.one : names.many}`)
   }
   if (amount === 1 && packUnits.has(unit)) return of(`${approx}${a(language, names.one)} ${names.one}`)
   const measure = unit === "g" || unit === "kg" || unit === "ml" || unit === "cl" || unit === "dl" || unit === "l" || unit === "lb"
-  const noun = (language === "nl" && (measure || amount < 1)) || amount === 1 ? names.one : names.many
+  const noun = (language === "nl" && (measure || Math.abs(amount) < 1)) || one(amount) ? names.one : names.many
   return of(`${approx}${speakNumber(amount, language)} ${noun}`)
 }
 
@@ -119,6 +142,7 @@ const periodText: Record<Language, Record<"morning" | "afternoon" | "evening" | 
 /** A clock time as it is said. */
 export const speakTime = (t: ClockTime, language: Language, options: SpeakTimeOptions = {}): string => {
   const { hour, minute } = t
+  if (!Number.isInteger(hour) || !Number.isInteger(minute) || hour < 0 || hour > 23 || minute < 0 || minute > 59) return ""
   if ((options.style ?? "12h") === "24h") {
     if (language === "en") {
       if (hour === 0 && minute === 0) return "midnight"
@@ -156,6 +180,7 @@ const word = (count: number, language: Language, one: string, many: string): str
  * words: "half an hour" / "een half uur", "an hour and a half" / "anderhalf uur", "a quarter of an hour" / "een kwartier".
  */
 export const speakDuration = (ms: number, language: Language, options: { readonly natural?: boolean } = {}): string => {
+  if (!Number.isFinite(ms)) return ""
   const total = Math.max(0, Math.round(ms / 1000))
   const days = Math.floor(total / 86_400)
   const hours = Math.floor((total % 86_400) / 3600)
@@ -213,7 +238,7 @@ export const speakMoment = (value: { readonly date: LocalDate; readonly time?: C
  * A short list: "a, b and c"; more than `max` (default 3): "a, b and two more" / "a, b en nog twee". One item is just that item.
  */
 export const speakList = (items: ReadonlyArray<string>, language: Language, options: { readonly max?: number } = {}): string => {
-  const max = Math.max(2, options.max ?? 3)
+  const max = Number.isInteger(options.max) ? Math.max(2, options.max!) : 3
   const and = language === "en" ? "and" : "en"
   if (items.length === 0) return ""
   if (items.length === 1) return items[0]!

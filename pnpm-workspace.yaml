@@ -16,6 +16,7 @@ catalog:
   "@types/ws": 8.18.2
   tsx: 4.23.15
   "@playwright/test": 1.65.0
+  ical.js: 2.2.1
 
 onlyBuiltDependencies:
   - esbuild

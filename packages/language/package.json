@@ -11,7 +11,8 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@pva/core": "workspace:*"
+    "@pva/core": "workspace:*",
+    "ical.js": "catalog:"
   },
   "devDependencies": {
     "@effect/vitest": "catalog:",

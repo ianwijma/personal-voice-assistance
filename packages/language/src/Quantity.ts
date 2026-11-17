@@ -1,4 +1,5 @@
-import { readAmount } from "./Numbers.ts"
+import { dict, dicts } from "./Dict.ts"
+import { numbersWhole, readAmount, readNumber } from "./Numbers.ts"
 import { notUnderstood, ok, type Language, type Parsed } from "./Result.ts"
 import { tokenize, type Tok } from "./Tokens.ts"
 
@@ -52,9 +53,9 @@ const pack = (unit: PackUnit): UnitInfo => ({ unit, dimension: "pack" })
 const piece = (per = 1): UnitInfo => ({ unit: "piece", dimension: "count", factor: 1, ...(per !== 1 ? { per } : {}) })
 
 /** Base-unit factors of every convertible unit. */
-const factors: Record<string, number> = { g: 1, kg: 1000, oz: 28.349523125, lb: 453.59237, ml: 1, cl: 10, dl: 100, l: 1000, tsp: 5, tbsp: 15, cup: metricCupMl, piece: 1 }
+const factors = dict<number>({ g: 1, kg: 1000, oz: 28.349523125, lb: 453.59237, ml: 1, cl: 10, dl: 100, l: 1000, tsp: 5, tbsp: 15, cup: metricCupMl, piece: 1 })
 
-const unitTable: Record<Language, Record<string, UnitInfo>> = {
+const unitTable = dicts<Language, UnitInfo>({
   en: {
     g: mass("g", 1), gr: mass("g", 1), gram: mass("g", 1), grams: mass("g", 1), gramme: mass("g", 1), grammes: mass("g", 1),
     kg: mass("kg", 1000), kilo: mass("kg", 1000), kilos: mass("kg", 1000), kilogram: mass("kg", 1000), kilograms: mass("kg", 1000),
@@ -95,7 +96,7 @@ const unitTable: Record<Language, Record<string, UnitInfo>> = {
     snufje: { unit: "pinch", dimension: "vague", approx: true }, snuf: { unit: "pinch", dimension: "vague", approx: true }, mespunt: { unit: "pinch", dimension: "vague", approx: true },
     scheutje: { unit: "splash", dimension: "vague", approx: true }, scheut: { unit: "splash", dimension: "vague", approx: true }
   }
-}
+})
 
 const approxWords: Record<Language, ReadonlySet<string>> = {
   en: new Set(["about", "around", "roughly", "approximately", "approx", "circa", "ca", "like", "maybe", "nearly", "almost"]),
@@ -110,6 +111,7 @@ const restWords: Record<Language, ReadonlyArray<ReadonlyArray<string>>> = {
   nl: [["de", "rest"], ["de", "overige"], ["wat", "er", "over", "is"], ["de", "restjes"], ["het", "restant"]]
 }
 const linkWords: Record<Language, ReadonlySet<string>> = { en: new Set(["of"]), nl: new Set(["van", "aan"]) }
+const joinWords: ReadonlySet<string> = new Set(["and", "or", "en", "of", "plus", "to", "tot"])
 
 const round = (n: number): number => Math.round(n * 1e6) / 1e6
 
@@ -129,11 +131,20 @@ export const parseQuantity = (text: string, language: Language, options: Quantit
   const toks = tokenize(text)
   const norms = toks.map((t) => t.norm)
   const cupMl = options.cupMl ?? metricCupMl
+  if (!(cupMl > 0) || !Number.isFinite(cupMl)) return notUnderstood
   for (let i = 0; i < toks.length; i++) {
     let k = i
     let approx = false
     while (k < toks.length && approxWords[language].has(norms[k]!)) { approx = true; k++ }
     const finish = (q: Omit<Quantity, "said" | "item" | "start" | "end" | "approx"> & { approx?: boolean }, next: number): Parsed<Quantity> => {
+      // "2 kg 500 g flour", "2 kg, 3 kg": a second amount right after the first is not an item.
+      if (next < toks.length && (/^\d/.test(norms[next]!) || readNumber(toks, next, language) !== undefined || unitAt(toks, next, language) !== undefined)) return notUnderstood
+      // "2 kg flour and 3 eggs", "2 or 3 apples", "two cups and a half": a second amount is a second item or an alternative.
+      for (let j = next; j < toks.length; j++) {
+        if (!joinWords.has(norms[j]!)) continue
+        const after = norms[j + 1]
+        if (after !== undefined && (/^\d/.test(after) || readAmount(toks, j + 1, language, false) !== undefined || (["a", "an", "een"].includes(after) && readAmount(toks, j + 1, language, true)?.next !== j + 2))) return notUnderstood
+      }
       let n = next
       if (linkWords[language].has(norms[n] ?? "")) n++
       const item = n < toks.length ? text.slice(toks[n]!.start).replace(/[\s.,;!?]+$/u, "") : ""
@@ -153,6 +164,9 @@ export const parseQuantity = (text: string, language: Language, options: Quantit
     // AMOUNT [x] UNIT
     const amount = readAmount(toks, k, language, true)
     if (amount === undefined) continue
+    // The amount must be the whole numeric expression: ".5 kg", "-2 kg", "1/2 kg", "five five apples" are not read as 5, 2, 1 or 5.
+    if (!numbersWhole(text, toks, [{ start: toks[k]!.start, end: toks[amount.next - 1]!.end }])) return notUnderstood
+    if (!Number.isFinite(amount.value) || amount.value < 0) return notUnderstood
     let next = amount.next
     const lone = (language === "en" && (norms[k] === "a" || norms[k] === "an") && next === k + 1) || (language === "nl" && norms[k] === "een" && next === k + 1)
     if ((norms[next] === "a" || norms[next] === "an" || norms[next] === "een") && amount.value < 1 && unitAt(toks, next + 1, language) !== undefined) next++
@@ -196,7 +210,8 @@ const dimensionOf = (unit: UnitId): Dimension => {
  */
 export const convertAmount = (amount: number, from: UnitId, to: UnitId, options: QuantityOptions = {}): number | undefined => {
   const kind = dimensionOf(from)
-  if (kind === "none" || kind === "count" || dimensionOf(to) !== kind) return undefined
+  if (kind === "none" || kind === "count" || dimensionOf(to) !== kind || !Number.isFinite(amount)) return undefined
+  if (options.cupMl !== undefined && !(Number.isFinite(options.cupMl) && options.cupMl > 0)) return undefined
   const size = (u: UnitId) => (u === "cup" ? options.cupMl ?? metricCupMl : factors[u]!)
   return round((amount * size(from)) / size(to))
 }

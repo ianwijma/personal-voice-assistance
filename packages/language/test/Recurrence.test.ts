@@ -165,8 +165,8 @@ describe("parseRRule / formatRRule", () => {
   for (const bad of ["", "FREQ=", "INTERVAL=2", "FREQ=DAILY;INTERVAL=0", "FREQ=DAILY;BYDAY=XX", "FREQ=MONTHLY;BYMONTHDAY=0", "FREQ=DAILY;BYSETPOS=1", "FREQ=DAILY;UNTIL=tomorrow", "nonsense"])
     it(`rejects "${bad}"`, () => expect(parseRRule(bad)).toBeUndefined())
   it("reads DTSTART lines", () => {
-    expect(parseDtstart("DTSTART;TZID=Europe/Amsterdam:20261120T090000")).toEqual({ start: { year: 2026, month: 11, day: 20, hour: 9, minute: 0 }, timeZone: "Europe/Amsterdam" })
-    expect(parseDtstart("2026-11-20T09:30")?.start).toEqual({ year: 2026, month: 11, day: 20, hour: 9, minute: 30 })
+    expect(parseDtstart("DTSTART;TZID=Europe/Amsterdam:20261120T090000")).toEqual({ start: { year: 2026, month: 11, day: 20, hour: 9, minute: 0, second: 0 }, timeZone: "Europe/Amsterdam" })
+    expect(parseDtstart("2026-11-20T09:30")?.start).toEqual({ year: 2026, month: 11, day: 20, hour: 9, minute: 30, second: 0 })
     expect(parseDtstart("soon")).toBeUndefined()
   })
 })

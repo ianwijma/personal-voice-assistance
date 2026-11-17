@@ -1,4 +1,5 @@
-import { readNumber } from "./Numbers.ts"
+import { dicts } from "./Dict.ts"
+import { numbersWhole, readNumber } from "./Numbers.ts"
 import { ambiguous, notUnderstood, ok, type ClockTime, type Language, type Parsed } from "./Result.ts"
 import { sliceText, tokenize, type Tok } from "./Tokens.ts"
 
@@ -38,13 +39,13 @@ export const bandOf = (o: TimeOptions | undefined): { from: number; to: number }
   to: toMinutes(o?.band?.to ?? "21:00")
 })
 
-const periodWords: Record<Language, Record<string, Period>> = {
+const periodWords = dicts<Language, Period>({
   en: { morning: "morning", afternoon: "afternoon", evening: "evening", night: "night", tonight: "night" },
   nl: {
     ochtend: "morning", ochtends: "morning", morgens: "morning", voormiddag: "morning", vroeg: "morning",
     middag: "afternoon", middags: "afternoon", namiddag: "afternoon", avond: "evening", avonds: "evening", nacht: "night", nachts: "night"
   }
-}
+})
 export const periodAt = (toks: ReadonlyArray<Tok>, i: number, language: Language): { period: Period; next: number } | undefined => {
   const w = toks[i]?.norm
   if (w === undefined) return undefined
@@ -215,15 +216,32 @@ export const matchTime = (toks: ReadonlyArray<Tok>, i: number, language: Languag
   return { ...m, period: p.period, next: p.next }
 }
 
-/** The 24-hour hour, when am/pm or a period word settles it. */
-const settle = (hour: number, period: Period): number => {
-  const h = hour
+/** The 24-hour hour of a 12-hour reading (1–12) that am/pm or a period word settles, or `undefined` when they do not fit. */
+const settle = (hour: number, period: Period): number | undefined => {
   switch (period) {
-    case "am": case "morning": return h === 12 ? 0 : h
-    case "pm": return h === 12 ? 12 : h + 12
-    case "afternoon": return h === 12 ? 12 : h + 12
-    case "evening": return h === 12 ? 0 : h + 12
-    case "night": return h === 12 ? 0 : h >= 6 ? h + 12 : h
+    case "am": return hour === 12 ? 0 : hour
+    case "pm": return hour === 12 ? 12 : hour + 12
+    // "twelve in the morning" has no single reading (midnight or noon).
+    case "morning": return hour === 12 ? undefined : hour
+    case "afternoon": return hour === 12 ? 12 : hour + 12
+    case "evening": return hour === 12 ? undefined : hour + 12
+    case "night": return hour === 12 ? 0 : hour >= 6 ? hour + 12 : hour
+  }
+}
+
+/**
+ * The 24-hour hours a part of the day covers. A clock reading that already says its hour (a leading zero, 0 or 13–24, noon, midnight)
+ * must fall inside the part said with it: "07:00 in the evening" and "23 in the morning" contradict themselves and are not read
+ * (review round 1, finding 10).
+ */
+export const periodHours = (period: Period, hour: number): boolean => {
+  switch (period) {
+    case "am": return hour <= 11
+    case "pm": return hour >= 12
+    case "morning": return hour <= 11
+    case "afternoon": return hour >= 12 && hour <= 18
+    case "evening": return hour >= 17 && hour <= 23
+    case "night": return hour >= 18 || hour <= 5
   }
 }
 
@@ -235,14 +253,17 @@ export interface Resolved {
 
 /** Settle am/pm: said → that; not said → the readings inside the band, the next after `afterMinutes` (else the earliest). */
 export const resolveTime = (m: TimeMatch, options?: TimeOptions): Resolved | undefined => {
-  if (m.hour === 24 && m.minute > 0) return undefined
+  if (m.hour < 0 || m.hour > 24 || m.minute < 0 || m.minute > 59 || (m.hour === 24 && m.minute > 0)) return undefined
   if ((m.period === "am" || m.period === "pm") && (m.hour < 1 || m.hour > 12)) return undefined
-  if ((!m.open && m.period !== "am" && m.period !== "pm") || m.hour < 1 || m.hour > 12) {
-    return { time: { hour: m.hour % 24, minute: m.minute, guessed: false, alternatives: [] }, nextDay: false }
+  if (!m.open || m.hour < 1 || m.hour > 12) {
+    // The hour is already settled ("19:30", "07:00", "noon"): a period said with it must agree, never override or be dropped.
+    const hour = m.hour % 24
+    if (m.period !== undefined && !(m.period === "am" || m.period === "pm" ? settle(m.hour, m.period) === hour : periodHours(m.period, hour))) return undefined
+    return { time: { hour, minute: m.minute, guessed: false, alternatives: [] }, nextDay: false }
   }
   if (m.period !== undefined) {
     const hour = settle(m.hour, m.period)
-    if (hour > 23) return undefined
+    if (hour === undefined || hour > 23 || !periodHours(m.period, hour)) return undefined
     return { time: { hour, minute: m.minute, guessed: false, alternatives: [] }, nextDay: false }
   }
   const { from, to } = bandOf(options)
@@ -283,6 +304,7 @@ export const parseTimeOfDay = (text: string, language: Language, options?: TimeO
   while (end < toks.length && trailingFillers.has(toks[end]!.norm)) end++
   if (end < toks.length) return notUnderstood
   const said = sliceText(text, toks, i, m.next)
+  if (!numbersWhole(text, toks, [{ start: toks[i]!.start, end: toks[m.next - 1]!.end }])) return notUnderstood
   const r = resolveTime(m, options)
   if (r !== undefined) return ok(r.time, said)
   // The band holds no reading: both are possible.
