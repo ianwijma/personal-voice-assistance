@@ -46,7 +46,7 @@ import type { VoiceSessions } from "./VoiceSessions.ts"
  * configuration and sends the pushes.
  */
 
-export type AssistantResult = { readonly ok: true; readonly assistantId?: string } | { readonly ok: false; readonly error: ErrorInfo }
+export type AssistantResult = { readonly ok: true; readonly assistantId?: string; readonly rev?: number } | { readonly ok: false; readonly error: ErrorInfo }
 
 export interface AssistantsOptions {
   readonly store: SettingsStore
@@ -76,6 +76,8 @@ export interface Assistants {
 }
 
 const OK: AssistantResult = { ok: true }
+/** A `device.save` that went through: the revision it made (the page waits for it). */
+const savedAt = (saved: { readonly rev: number }): AssistantResult => ({ ok: true, rev: saved.rev })
 
 const fail = (
   code: ErrorInfo["code"],
@@ -251,7 +253,7 @@ export const makeAssistants = (options: AssistantsOptions): Assistants => {
         const inherited = inheritorsRefusal(target.type, next)
         if (inherited !== undefined) return Effect.succeed(inherited)
         return store.saveDeviceType(target.type, message.rev, next).pipe(
-          Effect.as(OK),
+          Effect.map(savedAt),
           Effect.catch((e) => Effect.succeed(entityFailure(e)))
         )
       }
@@ -266,7 +268,7 @@ export const makeAssistants = (options: AssistantsOptions): Assistants => {
       const refused = settingsRefusal(effective(own), effective(record.own), saveAnyway)
       if (refused !== undefined) return Effect.succeed(refused)
       return store.saveDevice(target.id, message.rev, { ...(message.name !== undefined ? { name: message.name } : {}), own }).pipe(
-        Effect.as(OK),
+        Effect.map(savedAt),
         Effect.catch((e) => Effect.succeed(entityFailure(e)))
       )
     })

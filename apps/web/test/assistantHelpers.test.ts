@@ -46,6 +46,9 @@ describe("outcomeOf: the edges of an answer", () => {
   it("a success without an id has no assistantId", () => {
     expect(outcomeOf({ type: "result", requestId: "r", ok: true })).toEqual({ kind: "ok", assistantId: undefined })
   })
+  it("a device save's success carries the revision it made", () => {
+    expect(outcomeOf({ type: "result", requestId: "r", ok: true, rev: 4 })).toEqual({ kind: "ok", assistantId: undefined, rev: 4 })
+  })
 })
 
 describe("tabs", () => {
