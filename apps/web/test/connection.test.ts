@@ -109,6 +109,59 @@ describe("connection", () => {
     expect(store.get().toasts.filter((t) => t.message === SETTINGS_CHANGED_NOTICE)).toHaveLength(1)
   })
 
+  it("P5 round 3: a close for changed settings drops the old session's turns and conversations at once, while disconnected and after the new welcome", async () => {
+    let answer = true
+    const { url, peers } = await startServer((p) => {
+      if (answer) p.ws.send(encodeServerMessage(serverExamples.welcome))
+    })
+    const { store } = connect(url, fakeAudio().audio)
+    await until(() => store.get().connection.status === "open")
+    store.dispatch({ type: "turn.start", turnId: 41, source: "text", userText: "Sam's private question", spoken: false })
+    store.dispatch({ type: "local/ui", patch: { chatView: "alpha", unread: 2 } })
+    expect(store.get().turns.map((t) => t.userText)).toContain("Sam's private question")
+    const seq = store.get().sessionSeq
+    // The successor's welcome is withheld: the page stays disconnected.
+    answer = false
+    peers[0]!.ws.close(CloseCode.settingsChanged, "settings changed")
+    await until(() => peers.length === 2 && peers[1]!.text.some((m) => m.type === "hello"))
+    expect(store.get().connection.status).not.toBe("open")
+    expect(store.get().turns).toEqual([])
+    expect(store.get().conversations).toEqual({})
+    expect(store.get().pending).toEqual({})
+    expect(store.get().ui).toMatchObject({ chatView: undefined, unread: 0 })
+    expect(store.get().sessionSeq).toBe(seq + 1)
+    // Then the welcome: still nothing of the old session.
+    peers[1]!.ws.send(encodeServerMessage(serverExamples.welcome))
+    await until(() => store.get().connection.status === "open")
+    expect(store.get().turns.map((t) => t.userText)).not.toContain("Sam's private question")
+  })
+
+  it("P5 round 3: closes for changed settings before any welcome are failures: they back off, then the page recovers", async () => {
+    let refuse = 0
+    const { url, peers } = await startServer((p) => {
+      if (refuse > 0) {
+        refuse--
+        p.ws.close(CloseCode.settingsChanged, "settings changed")
+      } else p.ws.send(encodeServerMessage(serverExamples.welcome))
+    })
+    const { store } = connect(url, fakeAudio().audio)
+    await until(() => store.get().connection.status === "open")
+    const attempts: Array<number> = []
+    const off = store.subscribe(() => {
+      const c = store.get().connection
+      if (c.status === "reconnecting") attempts.push(c.attempt)
+    })
+    // One close after an established session, then four in a row before a welcome.
+    refuse = 4
+    peers[0]!.ws.close(CloseCode.settingsChanged, "settings changed")
+    await until(() => peers.length === 6 && store.get().connection.status === "open", 4000)
+    off()
+    // The first reconnect is at once (attempt 1); the closes before a welcome count up as failures.
+    expect(attempts[0]).toBe(1)
+    expect(Math.max(...attempts)).toBeGreaterThanOrEqual(4)
+    expect(store.get().connection.attempt).toBe(0)
+  })
+
   it("says hello, dispatches the welcome and answers liveness pings", async () => {
     const { url, peers } = await startServer()
     const { store, conn } = connect(url, fakeAudio().audio)

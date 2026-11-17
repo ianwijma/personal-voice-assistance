@@ -264,6 +264,8 @@ export interface ClientState {
   /** The next trace id; never reused, also not after a logout or a new snapshot. */
   readonly traceSeq: number
   readonly pending: Readonly<Record<string, PendingRequest>>
+  /** Counts the sessions the server ended on this page (`local/session-ended`): views keyed by it start afresh. */
+  readonly sessionSeq: number
   readonly toasts: ReadonlyArray<Toast>
   readonly ui: {
     readonly chatOpen: boolean
@@ -329,6 +331,7 @@ export const initialState: ClientState = {
   traceIds: [],
   traceSeq: 0,
   pending: {},
+  sessionSeq: 0,
   toasts: [],
   ui: { chatOpen: false, chatView: undefined, sheetOpen: false, settingsOpen: false, settingsPath: [], settingsDirty: false, unread: 0, shortcutsOpen: false }
 }
@@ -367,6 +370,12 @@ export type LocalAction =
   | { readonly type: "local/toast-dismiss"; readonly id: number }
   | { readonly type: "local/ui"; readonly patch: Partial<ClientState["ui"]> }
   | { readonly type: "local/socket-lost" }
+  /**
+   * P5 round 3: the server ended this device's session (`CloseCode.settingsChanged`): what the old session showed
+   * goes at once, before reconnecting (its turns, conversations, the requests in flight, the wake prompt, what was
+   * playing), and `sessionSeq` moves on so session-scoped views (the composer's draft) start afresh.
+   */
+  | { readonly type: "local/session-ended" }
 
 export type Action = ServerMessage | LocalAction
 
@@ -664,6 +673,22 @@ const local = (s: ClientState, a: LocalAction): ClientState => {
     case "local/socket-lost":
       // Requests in flight will never be answered on this socket; the player was flushed.
       return { ...s, pending: {}, audio: withoutPlaying(s.audio), liveTranscript: "" }
+    case "local/session-ended":
+      // Not a network drop: the old session is gone for good, and nothing of it stays on screen.
+      return {
+        ...s,
+        pending: {},
+        audio: withoutPlaying(s.audio),
+        liveTranscript: "",
+        turns: [],
+        staleTurns: [],
+        conversations: {},
+        woke: undefined,
+        holder: undefined,
+        holderTold: false,
+        sessionSeq: s.sessionSeq + 1,
+        ui: { ...s.ui, chatView: undefined, unread: 0 }
+      }
     case "local/audio": {
       const { error: _error, ...rest } = s.audio
       const base = a.phase === "off" || a.phase === "error" ? { ...withoutPlaying(rest), micLive: true } : rest
