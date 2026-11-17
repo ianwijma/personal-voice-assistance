@@ -60,3 +60,91 @@ describe("LookEditor: the newest pick wins", () => {
     expect(screen.getByTestId("look-editor").getAttribute("data-character")).toBe("flame")
   })
 })
+
+// A load still on its way when the editor goes away, or when its look is changed from outside it, is dropped: it must
+// not bring back a character the person has since removed.
+type DeviceLookState = { readonly from: "assistant" } | { readonly from: "device"; readonly look: Look | undefined }
+const flame = { ...registry.baseline, id: "flame", name: "Flame", version: "1.0.0" }
+// An edit not saved yet (Cancel takes the look back to the saved one: none, the baseline).
+const sine: Look = { character: registry.baseline.id, options: { $sensitivity: 0.8 } }
+const arrive = async (id: string) => {
+  await act(async () => {
+    held.get(id)!({ kind: "ready", character: flame })
+    await Promise.resolve()
+  })
+}
+
+describe("LookEditor: a pending pick is dropped when the editor leaves or the look changes from outside", () => {
+  it("Flame picked, then \"Each assistant's own look\" before it has loaded: the device keeps following the assistant", async () => {
+    held.clear()
+    let state: DeviceLookState = { from: "device", look: undefined }
+    function Device() {
+      const [look, setLook] = useState<DeviceLookState>(state)
+      state = look
+      return (
+        <>
+          <button type="button" onClick={() => setLook({ from: "assistant" })}>Each assistant's own look</button>
+          {look.from === "device" && <LookEditor value={look.look} onChange={(l) => setLook({ from: "device", look: l })} idPrefix="d" whose="Kitchen's own" foldPicker />}
+        </>
+      )
+    }
+    render(<Device />)
+    fireEvent.click(screen.getByRole("button", { name: "flame" }))
+    fireEvent.click(screen.getByRole("button", { name: "Each assistant's own look" }))
+    expect(screen.queryByTestId("look-editor")).toBeNull()
+    await arrive("flame")
+    expect(state).toEqual({ from: "assistant" })
+    expect(screen.queryByTestId("look-editor")).toBeNull()
+  })
+
+  it("Flame picked, then Cancel before it has loaded: the look stays the saved one", async () => {
+    held.clear()
+    let draft: Look | undefined
+    function Tab() {
+      const [look, setLook] = useState<Look | undefined>(sine)
+      draft = look
+      return (
+        <>
+          <button type="button" onClick={() => setLook(undefined)}>Cancel</button>
+          <LookEditor value={look} onChange={setLook} idPrefix="a" whose="Jeff's" />
+        </>
+      )
+    }
+    render(<Tab />)
+    fireEvent.click(screen.getByRole("button", { name: "flame" }))
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }))
+    await arrive("flame")
+    expect(draft).toBeUndefined()
+    expect(screen.getByTestId("look-editor").getAttribute("data-character")).toBe(registry.baseline.id)
+  })
+
+  it("Flame picked, then the editor unmounts before it has loaded: onChange is not called", async () => {
+    held.clear()
+    const onChange = vi.fn()
+    const { unmount } = render(<LookEditor value={undefined} onChange={onChange} idPrefix="u" whose="Jeff's" />)
+    fireEvent.click(screen.getByRole("button", { name: "flame" }))
+    unmount()
+    await arrive("flame")
+    expect(onChange).not.toHaveBeenCalled()
+  })
+
+  it("the editor's own pick landing does not drop a later pick still on its way", async () => {
+    held.clear()
+    function Harness2() {
+      const [look, setLook] = useState<Look | undefined>(undefined)
+      return <LookEditor value={look} onChange={setLook} idPrefix="t2" whose="Jeff's" />
+    }
+    render(<Harness2 />)
+    fireEvent.click(screen.getByRole("button", { name: "flame" }))
+    await arrive("flame")
+    expect(screen.getByTestId("look-editor").getAttribute("data-character")).toBe("flame")
+    const other = registry.ids.find((x) => x !== "flame" && x !== registry.baseline.id)!
+    fireEvent.click(screen.getByRole("button", { name: other }))
+    await act(async () => {
+      held.get(other)!({ kind: "ready", character: { ...registry.baseline, id: other, name: other, version: "1.0.0" } })
+      await Promise.resolve()
+    })
+    expect(screen.getByTestId("look-editor").getAttribute("data-character")).toBe(other)
+  })
+})
+

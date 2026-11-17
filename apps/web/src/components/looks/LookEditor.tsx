@@ -1,15 +1,19 @@
 "use client"
-import { useMemo, useRef } from "react"
+import { useEffect, useMemo, useRef } from "react"
 import type { Look } from "@pva/protocol"
 import { loadCharacter, prettyId } from "@/characters/catalog.ts"
 import type { OptionValues } from "@/characters/contract.ts"
 import { registry } from "@/characters/registry.ts"
-import { baselineLook, HOST_OPTIONS, switchCharacter } from "@/lib/looks.ts"
+import { deepEqual } from "@/lib/assistants.ts"
+import { assistantLook, baselineLook, HOST_OPTIONS, switchCharacter } from "@/lib/looks.ts"
 import { CharacterPicker } from "./CharacterPicker.tsx"
 import { LookOptions } from "./LookOptions.tsx"
 import { LookPreview } from "./LookPreview.tsx"
 import { Icon } from "../ui/Icon.tsx"
 import { useCharacter } from "./useCharacter.ts"
+
+/** Two looks the same once stored (the baseline with nothing set is no look at all). */
+const sameLook = (a: Look | undefined, b: Look | undefined): boolean => deepEqual(assistantLook(a), assistantLook(b))
 
 /**
  * One look, edited (docs/LOOKS-AND-VOICES.md §4): the character picker, a large live preview, the character's own
@@ -37,6 +41,27 @@ export function LookEditor({ value, onChange, idPrefix, whose, foldPicker = fals
   const pickToken = useRef(0)
   const latest = useRef(current)
   latest.current = current
+  // What this editor itself sent out last (a pick, a setting): a `value` that is not it came from outside.
+  const own = useRef<{ readonly look: Look } | undefined>(undefined)
+  const emit = (look: Look) => {
+    own.current = { look }
+    onChange(look)
+  }
+
+  // A load still on its way is dropped when the editor goes away (the person chose "Each assistant's own look") and
+  // when the look is changed from outside it (Cancel, a reset, a save from elsewhere): it must not bring back a
+  // character on a look that is no longer the one it was picked on.
+  const seen = useRef(value)
+  useEffect(() => {
+    if (sameLook(value, seen.current)) return
+    seen.current = value
+    const mine = own.current !== undefined && sameLook(value, own.current.look)
+    own.current = undefined
+    if (!mine) pickToken.current++
+  }, [value])
+  useEffect(() => () => {
+    pickToken.current++
+  }, [])
 
   const pick = (next: string) => {
     // Every pick is the newest, the current character too: picking it again drops a load still on its way.
@@ -45,7 +70,7 @@ export function LookEditor({ value, onChange, idPrefix, whose, foldPicker = fals
     // continuation(state): only the newest pick applies, on the look as it is when the character has loaded
     void loadCharacter(next).then((r) => {
       if (token !== pickToken.current || r.kind !== "ready") return
-      onChange(switchCharacter(latest.current, r.character))
+      emit(switchCharacter(latest.current, r.character))
     })
   }
 
@@ -98,7 +123,7 @@ export function LookEditor({ value, onChange, idPrefix, whose, foldPicker = fals
             {picker}
           </section>
         )}
-      {character !== undefined && <LookOptions character={character} look={value} onChange={onChange} idPrefix={idPrefix} />}
+      {character !== undefined && <LookOptions character={character} look={value} onChange={emit} idPrefix={idPrefix} />}
     </div>
   )
 }
