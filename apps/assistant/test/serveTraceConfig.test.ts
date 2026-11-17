@@ -173,14 +173,13 @@ describe("the per-turn configuration snapshot (TraceInfo.config)", () => {
     expect(spokenLine.find((e) => e.name === "wakePhrase")!.detail).toBe("hey alpha")
     expect(spokenLine.find((e) => e.name === "assistantChosen")!.detail).toBe("alpha")
     const when = (name: string) => spokenLine.find((e) => e.name === name)!.at
-    // In the order it happened, with the recogniser's times (orderings only: a slow runner stretches the gaps). The route
-    // gate released the start with the partial that holds the phrase: stamped there, the start would follow the phrase.
+    // In the order it happened (non-strict orderings only, which causality guarantees whatever the scheduling; the exact
+    // times are serveTimelineOrder.test.ts's, on a hand-run clock).
     expect(when("endOfTurn")).toBe(0)
-    expect(when("speechStarted")).toBeLessThan(when("firstInterim"))
-    expect(when("speechStarted")).toBeLessThan(when("wakePhrase"))
+    expect(when("speechStarted")).toBeLessThanOrEqual(when("firstInterim"))
     expect(when("firstInterim")).toBeLessThanOrEqual(when("wakePhrase"))
     expect(when("wakePhrase")).toBeLessThanOrEqual(when("assistantChosen"))
-    expect(when("assistantChosen")).toBeLessThan(0)
+    expect(when("assistantChosen")).toBeLessThanOrEqual(0)
     // As the protocol's schema reads it.
     for (const t of first) expect(Schema.decodeUnknownSync(TraceInfo)(t).config).toEqual(t.config)
     // The device's own `turn.end` does not carry it (a voice connection never learns a model, §5.3).

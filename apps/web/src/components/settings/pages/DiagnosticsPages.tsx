@@ -199,7 +199,12 @@ function ScrollX({ label, children }: { readonly label: string; readonly childre
   useEffect(() => {
     const el = ref.current
     if (el === null) return
-    const update = () => setMore({ left: el.scrollLeft > 1, right: el.scrollLeft + el.clientWidth < el.scrollWidth - 1 })
+    const update = () => {
+      const left = el.scrollLeft > 1
+      const right = el.scrollLeft + el.clientWidth < el.scrollWidth - 1
+      // Unchanged flags keep the same state: no re-render per scroll event.
+      setMore((prev) => (prev.left === left && prev.right === right ? prev : { left, right }))
+    }
     update()
     const ro = new ResizeObserver(update)
     ro.observe(el)

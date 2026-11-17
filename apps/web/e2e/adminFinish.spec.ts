@@ -529,6 +529,33 @@ test.describe("Diagnostics › Latency", () => {
     expect(after.adjacent).toBe(true)
   })
 
+  test("a pinned tooltip goes when the chart is hidden (the viewport narrows below the chart's breakpoint) and does not come back", async ({ page, baseURL }) => {
+    // 900 → 700 px: the admin shell stays the narrow one (it changes at 1024 px, remounting the page), the chart
+    // (768 px and up) is hidden and the phone list shown in the same open row.
+    await page.setViewportSize({ width: 900, height: 800 })
+    await loginAdmin(page, baseURL, "#settings/diagnostics/latency")
+    await row(page, 43).getByTestId("trace-toggle").click()
+    const detail = page.getByTestId("trace-detail-row")
+    const tool = detail.getByTestId("trace-timeline").locator("[data-testid=trace-mark][data-event=tool]").first()
+    const tip = page.getByTestId("trace-tooltip")
+    await tool.click()
+    await expect(tool).toHaveAttribute("data-pinned", "true")
+    await page.mouse.move(0, 0)
+    await expect(tip).toBeVisible()
+    await page.setViewportSize({ width: 700, height: 800 })
+    await expect(detail.getByTestId("trace-spine")).toBeVisible()
+    // Gone at once, and stays gone (a stale one lingers until some later render).
+    for (let i = 0; i < 10; i++) {
+      expect(await tip.count()).toBe(0)
+      await page.waitForTimeout(50)
+    }
+    // Wide again: the pin went with the hidden chart.
+    await page.setViewportSize({ width: 900, height: 800 })
+    await expect(tool).toBeVisible()
+    await expect(tool).not.toHaveAttribute("data-pinned", "true")
+    await expect(tip).toHaveCount(0)
+  })
+
   test("two open rows: no id repeats, and each chart is described by its own shortened-axis note", async ({ page, baseURL }) => {
     await loginAdmin(page, baseURL, "#settings/diagnostics/latency")
     await row(page, 43).getByTestId("trace-toggle").click()

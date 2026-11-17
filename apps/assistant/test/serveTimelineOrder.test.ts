@@ -1,8 +1,10 @@
 // The order of a voice turn's time line on the real server: the recogniser's own times (speech started, first partial
-// transcript) are kept although a gate or the TypeSafe call holds the events back. Real clock: the assertions are
-// orderings that follow from what was emitted when, or gaps the test holds open itself (a routing answer it releases),
-// with margins only a broken implementation (stamping where the conversation handles the event) violates; a slow
-// runner only makes the held gaps longer.
+// transcript) are kept although a gate or the TypeSafe call holds the events back. Scheduling-independent: most tests
+// run the trace clock by hand (`manualClock`): it stands still at a value the test sets, the test waits until the
+// session has read it for the events it wants stamped (a barrier, not a sleep), then moves it on, so each entry's time
+// is known exactly. Stamped where the conversation handles the event, an entry would carry the later value. The
+// remaining one keeps the real clock and asserts only what causality guarantees.
+import { makeTurnTrace, type TurnTrace } from "@pva/core"
 import { eagerEndOfTurn, endOfTurn, interim, speechStarted, turnResumed } from "@pva/core/testing"
 import type { ServerMessageOf, TraceEvent } from "@pva/protocol"
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs"
@@ -88,12 +90,32 @@ const dataDir = async (): Promise<string> => {
   return dir
 }
 
-const start = async (env: Record<string, string>) => {
+const start = async (env: Record<string, string>, turnTrace?: TurnTrace["Service"]) => {
   const stt = controlledStt()
   const llm = scriptedLlm((t) => `Reply to ${t}.`)
-  server = await startTestServer({ build: fakeBuild({ stt: stt.stt, llm: llm.llm }), dataDir: await dataDir(), env })
+  server = await startTestServer({ build: fakeBuild({ stt: stt.stt, llm: llm.llm }), dataDir: await dataDir(), env, ...(turnTrace !== undefined ? { turnTrace } : {}) })
   return { stt, llm }
 }
+
+/** A trace clock that stands still at the value the test set last, and counts how often the server read it. */
+const manualClock = () => {
+  let t = 0
+  let reads = 0
+  return {
+    turnTrace: makeTurnTrace({
+      now: () => {
+        reads++
+        return t
+      }
+    }),
+    set: (to: number) => void (t = to),
+    reads: () => reads
+  }
+}
+/** Far apart: entries stamped at one step are a whole number of steps from those at another. */
+const STEP = 10_000
+
+const TYPESAFE_ENV = (url: string) => ({ TYPESAFE_ROUTING: "true", TYPESAFE_API_KEY: "ts-test-key", TYPESAFE_BASE_URL: url })
 const connect = async () => {
   const client = await ScriptedClient.connect({ url: server!.url })
   clients.push(client)
@@ -122,18 +144,6 @@ const at = (line: ReadonlyArray<TraceEvent>, name: string): number => {
   return e.at
 }
 
-/** An utterance spoken over at least `GAP_MS` × (partials + 1): start, each partial `GAP_MS` later, then the final. */
-const GAP_MS = 250
-const speak = async (stt: ReturnType<typeof controlledStt>, partials: ReadonlyArray<string>, final: string) => {
-  stt.emit(speechStarted)
-  for (const p of partials) {
-    await sleep(GAP_MS)
-    stt.emit(interim(p))
-  }
-  await sleep(GAP_MS)
-  stt.emit(endOfTurn(final))
-}
-
 /** Until `check` holds (polled), else fail. */
 const until = async (what: string, check: () => boolean, ms = 5_000) => {
   for (let i = 0; i < ms / 10 && !check(); i++) await sleep(10)
@@ -141,9 +151,10 @@ const until = async (what: string, check: () => boolean, ms = 5_000) => {
 }
 
 describe("the time line keeps the recogniser's times", () => {
-  it("TypeSafe device: speech started and first partial come before routing, which comes before the choice and the end of turn", async () => {
-    const api = await fakeJev(150)
-    const { stt } = await start({ TYPESAFE_ROUTING: "true", TYPESAFE_API_KEY: "ts-test-key", TYPESAFE_BASE_URL: api.url })
+  it("TypeSafe device: speech started and first partial keep their own times, before routing, the choice and the end of turn", async () => {
+    const clock = manualClock()
+    const api = await fakeJev()
+    const { stt } = await start(TYPESAFE_ENV(api.url), clock.turnTrace)
     const page = await connect()
     await page.hello()
     const admin = await connect()
@@ -152,23 +163,29 @@ describe("the time line keeps the recogniser's times", () => {
     await untilOpen(stt)
     const from = page.messages.length
     const adminFrom = admin.messages.length
-    await speak(stt, ["tell me", "tell me a"], "tell me a joke")
+    clock.set(STEP)
+    const read = clock.reads()
+    stt.emit(speechStarted, interim("tell me"))
+    await until("the start and the first partial stamped", () => clock.reads() >= read + 2)
+    clock.set(2 * STEP)
+    stt.emit(interim("tell me a"), endOfTurn("tell me a joke"))
     const begun = await page.waitFor("turn.start", () => true, { from, timeoutMs: 10_000 })
     const trace = (await admin.waitFor("trace", (m) => m.trace.turnId === begun.turnId, { from: adminFrom, timeoutMs: 10_000 })).trace
     const line = trace.timeline!
     expect(trace.route).toMatchObject({ by: "typesafe" })
-    // 0 is the conversation's end of turn, which waits for the routing answer. The start and the first partial were
-    // emitted before the final that started the routing call (stamped in the conversation they would come after it).
+    // 0 is the conversation's end of turn, which waits for the routing answer (all at 2 × STEP). The dispatcher held the
+    // start until then: stamped in the conversation, it would be 0 too.
     expect(at(line, "endOfTurn")).toBe(0)
-    expect(at(line, "speechStarted")).toBeLessThan(at(line, "firstInterim"))
-    expect(at(line, "firstInterim")).toBeLessThan(at(line, "routing"))
-    expect(at(line, "routing")).toBeLessThanOrEqual(at(line, "assistantChosen"))
-    expect(at(line, "assistantChosen")).toBeLessThanOrEqual(0)
+    expect(at(line, "speechStarted")).toBe(-STEP)
+    expect(at(line, "firstInterim")).toBe(-STEP)
+    expect(at(line, "routing")).toBe(0)
+    expect(at(line, "assistantChosen")).toBe(0)
   })
 
   it("TypeSafe device, eager transcript: the eager end of turn is the recogniser's, before the routing call it waited for", async () => {
+    // The real clock: only what causality guarantees (stamped before it was dispatched; answered no sooner than 200 ms).
     const api = await fakeJev(200)
-    const { stt } = await start({ TYPESAFE_ROUTING: "true", TYPESAFE_API_KEY: "ts-test-key", TYPESAFE_BASE_URL: api.url })
+    const { stt } = await start(TYPESAFE_ENV(api.url))
     const page = await connect()
     await page.hello()
     const admin = await connect()
@@ -197,13 +214,14 @@ describe("the time line keeps the recogniser's times", () => {
     // The eager transcript arrived before the routing call it started left (stamped in the conversation, after its answer).
     expect(at(line, "eagerEndOfTurn")).toBeLessThanOrEqual(routing.at)
     expect(at(line, "eagerEndOfTurn")).toBeLessThan(at(line, "assistantChosen"))
-    expect(at(line, "speechStarted")).toBeLessThan(at(line, "eagerEndOfTurn"))
+    expect(at(line, "speechStarted")).toBeLessThanOrEqual(at(line, "eagerEndOfTurn"))
   })
 
   it("TypeSafe device: a resume and a second eager transcript that arrive while routing is pending keep their own times", async () => {
-    // The first routing call is held until the test releases it, 500 ms after the resume and the second eager.
+    const clock = manualClock()
+    // The first routing call is held until the test releases it.
     const api = await fakeJev(0, true)
-    const { stt } = await start({ TYPESAFE_ROUTING: "true", TYPESAFE_API_KEY: "ts-test-key", TYPESAFE_BASE_URL: api.url })
+    const { stt } = await start(TYPESAFE_ENV(api.url), clock.turnTrace)
     const page = await connect()
     await page.hello()
     const admin = await connect()
@@ -213,20 +231,18 @@ describe("the time line keeps the recogniser's times", () => {
     const from = page.messages.length
     const adminFrom = admin.messages.length
     // Every transcript is Bravo's: the resume reaches the same conversation as the final.
-    stt.emit(speechStarted)
-    await sleep(100)
-    stt.emit(interim("a joke"))
-    await sleep(100)
-    stt.emit(eagerEndOfTurn("a joke"))
+    clock.set(STEP)
+    stt.emit(speechStarted, interim("a joke"), eagerEndOfTurn("a joke"))
     await until("the first routing call", () => api.requests.length === 1)
     // While it is pending:
-    stt.emit(turnResumed)
-    stt.emit(eagerEndOfTurn("a joke about cats"))
-    await sleep(500)
+    clock.set(2 * STEP)
+    const read = clock.reads()
+    stt.emit(turnResumed, eagerEndOfTurn("a joke about cats"))
+    await until("the resume and the second eager stamped", () => clock.reads() >= read + 2)
+    clock.set(3 * STEP)
     api.release()
     // The second eager's own call starts only now (the session dispatches in order), and is answered at once.
     await until("the second routing call", () => api.requests.length === 2)
-    await sleep(300)
     stt.emit(endOfTurn("a joke about cats"))
     const begun = await page.waitFor("turn.start", () => true, { from, timeoutMs: 10_000 })
     const trace = (await admin.waitFor("trace", (m) => m.trace.turnId === begun.turnId, { from: adminFrom, timeoutMs: 10_000 })).trace
@@ -234,18 +250,18 @@ describe("the time line keeps the recogniser's times", () => {
     expect(trace.route).toMatchObject({ by: "typesafe" })
     expect(trace.assistant?.id).toBe("bravo")
     expect(api.requests.length).toBe(2)
-    // `routing` is the second eager's call (the final reuses its answer), sent once the held first call was released,
-    // at least 500 ms after the resume and the second eager arrived. Stamped when dispatched, both would be within a
-    // few ms of it.
-    const routing = at(line, "routing")
-    expect(at(line, "speechStarted")).toBeLessThan(at(line, "turnResumed"))
-    expect(at(line, "turnResumed")).toBeLessThanOrEqual(at(line, "eagerEndOfTurn"))
-    expect(at(line, "turnResumed") + 250).toBeLessThan(routing)
-    expect(at(line, "eagerEndOfTurn") + 250).toBeLessThan(routing)
+    // `routing` is the second eager's call (the final reuses its answer), sent after the release. Stamped where they
+    // were dispatched (after the release), the resume and the second eager would be 0 too.
+    expect(at(line, "endOfTurn")).toBe(0)
+    expect(at(line, "routing")).toBe(0)
+    expect(at(line, "speechStarted")).toBe(-2 * STEP)
+    expect(at(line, "turnResumed")).toBe(-STEP)
+    expect(at(line, "eagerEndOfTurn")).toBe(-STEP)
   })
 
   it("wake-phrase device: the utterance's start and first partial precede the phrase, which the route gate only released with words", async () => {
-    const { stt } = await start({})
+    const clock = manualClock()
+    const { stt } = await start({}, clock.turnTrace)
     const page = await connect()
     await page.hello()
     const admin = await connect()
@@ -254,16 +270,21 @@ describe("the time line keeps the recogniser's times", () => {
     await untilOpen(stt)
     const from = page.messages.length
     const adminFrom = admin.messages.length
-    await speak(stt, ["hey", "hey bravo tell"], "hey bravo tell me a joke")
+    clock.set(STEP)
+    const read = clock.reads()
+    stt.emit(speechStarted, interim("hey"))
+    await until("the start and the first partial stamped", () => clock.reads() >= read + 2)
+    clock.set(2 * STEP)
+    stt.emit(interim("hey bravo tell"), endOfTurn("hey bravo tell me a joke"))
     const begun = await page.waitFor("turn.start", () => true, { from, timeoutMs: 10_000 })
     const trace = (await admin.waitFor("trace", (m) => m.trace.turnId === begun.turnId, { from: adminFrom, timeoutMs: 10_000 })).trace
     const line = trace.timeline!
     expect(trace.route).toEqual({ by: "phrase", phrase: "hey bravo" })
-    // The route gate released the start and the partials only with "hey bravo tell", GAP_MS after "hey": stamped in the
-    // conversation, all three would come at the phrase.
-    expect(at(line, "speechStarted")).toBeLessThan(at(line, "firstInterim"))
-    expect(at(line, "firstInterim") + GAP_MS / 2).toBeLessThan(at(line, "wakePhrase"))
-    expect(at(line, "wakePhrase")).toBeLessThanOrEqual(at(line, "assistantChosen"))
-    expect(at(line, "assistantChosen")).toBeLessThan(0)
+    // The route gate released the start and the partials only with "hey bravo tell" (at 2 × STEP, as the end of turn):
+    // stamped in the conversation, they would be 0 too.
+    expect(at(line, "speechStarted")).toBe(-STEP)
+    expect(at(line, "firstInterim")).toBe(-STEP)
+    expect(at(line, "wakePhrase")).toBe(0)
+    expect(at(line, "assistantChosen")).toBe(0)
   })
 })

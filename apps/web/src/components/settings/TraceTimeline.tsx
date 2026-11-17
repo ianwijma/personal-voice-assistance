@@ -580,6 +580,15 @@ export function TimelineTab({ t, mode, onMode }: { readonly t: TraceInfo; readon
     return () => ro.disconnect()
   }, [source])
   useEffect(() => { setPin(undefined) }, [mode])
+  // A hidden chart (below the desktop breakpoint, or the Information tab: its plot is 0 wide) has no marks to point
+  // at, and new entries make the indices name other entries: no hover, no pin then.
+  const hidden = width === 0
+  useEffect(() => {
+    clearTimeout(timer.current)
+    setHover(undefined)
+    setHoverRow(undefined)
+    setPin(undefined)
+  }, [hidden, events])
 
   const ix: Interaction = {
     hover,
@@ -604,8 +613,9 @@ export function TimelineTab({ t, mode, onMode }: { readonly t: TraceInfo; readon
   }
   const note = endNote(t, events)
   const zeroText = t.mode === "text" ? "text sent" : "you stopped talking"
-  const tipIndex = hover ?? pin
-  const tip = tipIndex === undefined ? undefined : tipOf(rows[tipIndex]!, t, events)
+  const tipIndex = hidden ? undefined : hover ?? pin
+  const tipRow = tipIndex === undefined ? undefined : rows[tipIndex]
+  const tip = tipRow === undefined ? undefined : tipOf(tipRow, t, events)
   const anchor = tipIndex === undefined ? undefined : markRefs.current.get(tipIndex)
   const canShorten = makeAxis(events, width || 800, "reply", endInfo(t, events)?.at).shortened
   return (

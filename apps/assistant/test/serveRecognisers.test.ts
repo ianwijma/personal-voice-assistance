@@ -3,7 +3,7 @@
 // without a phrase, else the first in its list) and stream options; a hearer change builds the new recogniser
 // first and switches at the next silence; a device without assistants runs none; a model that fails is that
 // recogniser's problem only.
-import type { SttEvent } from "@pva/core"
+import { makeTurnTrace, type SttEvent, type TurnTrace } from "@pva/core"
 import { sttContractKeeper } from "@pva/core/testing"
 import type { Assistant, AssistantHearing, DeviceOwn, ServerMessageOf } from "@pva/protocol"
 import { Deferred, Effect, Exit, Queue, Stream } from "effect"
@@ -107,7 +107,13 @@ const twoHearers = async (withoutPhrase: Record<string, unknown> = { mode: "nobo
 
 const start = async (
   fake: ReturnType<typeof fakeRecognisers>,
-  { withoutPhrase, ...extra }: { hearerSwitchWaitMs?: number; freeMemoryBytes?: () => number; env?: Record<string, string>; withoutPhrase?: Record<string, unknown> } = {}
+  { withoutPhrase, ...extra }: {
+    hearerSwitchWaitMs?: number
+    freeMemoryBytes?: () => number
+    env?: Record<string, string>
+    withoutPhrase?: Record<string, unknown>
+    turnTrace?: TurnTrace["Service"]
+  } = {}
 ) => {
   server = await startTestServer({
     build: fakeBuild({ stt: controlledStt().stt, llm: scriptedLlm((t) => `Heard ${t}`).llm }),
@@ -117,6 +123,17 @@ const start = async (
     ...extra
   })
 }
+
+/**
+ * A trace clock that stands still until the test moves it: every time the server records (stamps, marks, the time
+ * line) is the value set last, so a turn's times can be asserted exactly, whatever the scheduling.
+ */
+const manualClock = () => {
+  let t = 0
+  return { turnTrace: makeTurnTrace({ now: () => t }), set: (to: number) => void (t = to) }
+}
+/** Far from 0: a time line entry stamped before the jump is −`JUMP` relative to a turn after it. */
+const JUMP = 50_000
 
 /** A fake TypeSafe (`/v1/systemone`) that picks Alpha after `delayMs`, and the `start` options that route by it. */
 const slowTypeSafe = async (delayMs: number) => {
@@ -262,31 +279,30 @@ describe("serve: one recogniser per device, from its hearer (WP-11)", () => {
 
   it("an utterance closed by the switch takes its times with it: the next utterance's time line starts when it was heard", async () => {
     const fake = fakeRecognisers()
-    await start(fake, { hearerSwitchWaitMs: 300 })
+    const clock = manualClock()
+    await start(fake, { hearerSwitchWaitMs: 300, turnTrace: clock.turnTrace })
     const admin = await connect()
     await admin.admin(TEST_ADMIN_PASSWORD)
     const client = await device("device-a")
     await until("device-a hearing", () => streamOf(fake, "device-a") !== undefined)
     const old = streamOf(fake, "device-a")!
+    // The old stream's utterance is stamped at 0; it is closed by the switch.
     fake.emit(old, { _tag: "SpeechStarted" }, { _tag: "Interim", text: "hey alpha what" })
     await saveHearing("alpha", { model: "model-c" })
-    await until("switched to model-c", () => streamOf(fake, "device-a")?.model === "model-c", 3_000)
-    await sleep(1_500)
+    await until("switched to model-c", () => streamOf(fake, "device-a")?.model === "model-c" && old.closed, 3_000)
+    // Everything of the new utterance is recorded at JUMP.
+    clock.set(JUMP)
     const from = client.messages.length
     const adminFrom = admin.messages.length
-    fake.emit(streamOf(fake, "device-a")!, { _tag: "SpeechStarted" })
-    await sleep(100)
-    fake.emit(streamOf(fake, "device-a")!, { _tag: "Interim", text: "hey alpha what time" }, { _tag: "EndOfTurn", text: "hey alpha what time is it" })
+    fake.emit(streamOf(fake, "device-a")!, { _tag: "SpeechStarted" }, { _tag: "Interim", text: "hey alpha what time" }, { _tag: "EndOfTurn", text: "hey alpha what time is it" })
     const begun = await client.waitFor("turn.start", () => true, { from, timeoutMs: 10_000 })
     const trace = (await admin.waitFor("trace", (m) => m.trace.turnId === begun.turnId, { from: adminFrom, timeoutMs: 10_000 })).trace
     const line = trace.timeline!
     const startedAt = line.find((x) => x.name === "speechStarted")!.at
     const firstInterimAt = line.find((x) => x.name === "firstInterim")!.at
-    // This utterance's own start (~100 ms before its end), not the closed one's (more than 1.5 s before, by the sleep):
-    // a margin only a reused start can cross.
-    expect(startedAt).toBeGreaterThan(-1_000)
-    expect(startedAt).toBeLessThan(0)
-    expect(firstInterimAt).toBeGreaterThan(startedAt)
+    // Its own start and first words (at JUMP, as its end of turn: 0), not the closed utterance's (−JUMP).
+    expect(startedAt).toBe(0)
+    expect(firstInterimAt).toBe(0)
   })
 
   it("a start the old stream stamped but never delivered (dispatch busy with a routing call) gives the next stream's utterance no times", async () => {
@@ -294,7 +310,8 @@ describe("serve: one recogniser per device, from its hearer (WP-11)", () => {
     const jev = await slowTypeSafe(400)
     try {
       const fake = fakeRecognisers()
-      await start(fake, { hearerSwitchWaitMs: 300, ...jev.options })
+      const clock = manualClock()
+      await start(fake, { hearerSwitchWaitMs: 300, ...jev.options, turnTrace: clock.turnTrace })
       const admin = await connect()
       await admin.admin(TEST_ADMIN_PASSWORD)
       const client = await device("device-a")
@@ -306,22 +323,20 @@ describe("serve: one recogniser per device, from its hearer (WP-11)", () => {
       fake.emit(old, { _tag: "SpeechStarted" }, { _tag: "Interim", text: "and tomorrow" })
       await sleep(20)
       await saveHearing("alpha", { model: "model-c" })
-      await until("switched to model-c", () => streamOf(fake, "device-a")?.model === "model-c", 3_000)
-      await sleep(1_500)
+      await until("switched to model-c", () => streamOf(fake, "device-a")?.model === "model-c" && old.closed, 3_000)
+      // Everything of the new utterance (and its routing call) is recorded at JUMP; the dropped start was at 0.
+      clock.set(JUMP)
       const from = client.messages.length
       const adminFrom = admin.messages.length
-      fake.emit(streamOf(fake, "device-a")!, { _tag: "SpeechStarted" })
-      await sleep(100)
-      fake.emit(streamOf(fake, "device-a")!, { _tag: "Interim", text: "what time" }, { _tag: "EndOfTurn", text: "what time is it" })
+      fake.emit(streamOf(fake, "device-a")!, { _tag: "SpeechStarted" }, { _tag: "Interim", text: "what time" }, { _tag: "EndOfTurn", text: "what time is it" })
       const begun = await client.waitFor("turn.start", () => true, { from, timeoutMs: 10_000 })
       const trace = (await admin.waitFor("trace", (m) => m.trace.turnId === begun.turnId, { from: adminFrom, timeoutMs: 10_000 })).trace
       const line = trace.timeline!
       const startedAt = line.find((x) => x.name === "speechStarted")!.at
       const firstInterimAt = line.find((x) => x.name === "firstInterim")!.at
-      // Its own start, ~100 ms before its end plus the routing call (400 ms); the dropped start was more than 1.5 s
-      // before this one (the sleep): a margin only a reused start can cross.
-      expect(startedAt).toBeGreaterThan(-1_300)
-      expect(firstInterimAt).toBeGreaterThan(startedAt)
+      // Its own start and first words (JUMP, as its end of turn), not the dropped ones (−JUMP).
+      expect(startedAt).toBe(0)
+      expect(firstInterimAt).toBe(0)
     } finally {
       jev.close()
     }
@@ -331,7 +346,8 @@ describe("serve: one recogniser per device, from its hearer (WP-11)", () => {
     const jev = await slowTypeSafe(600)
     try {
       const fake = fakeRecognisers()
-      await start(fake, jev.options)
+      const clock = manualClock()
+      await start(fake, { ...jev.options, turnTrace: clock.turnTrace })
       const admin = await connect()
       await admin.admin(TEST_ADMIN_PASSWORD)
       const client = await device("device-a")
@@ -342,24 +358,22 @@ describe("serve: one recogniser per device, from its hearer (WP-11)", () => {
       // While the routing call is pending: nobody answers without a phrase now, and the engines reload.
       await saveOwn("device-a", { withoutPhrase: { mode: "nobody" } })
       expect((await Effect.runPromise(server!.handle.engine.reload)).ok).toBe(true)
-      await until("a new stream", () => streamOf(fake, "device-a") !== undefined && streamOf(fake, "device-a") !== old, 5_000)
-      await sleep(1_500)
+      await until("a new stream", () => streamOf(fake, "device-a") !== undefined && streamOf(fake, "device-a") !== old && old.closed, 5_000)
+      // Everything of the new utterance is recorded at JUMP; the reloaded-away one at 0.
+      clock.set(JUMP)
       const from = client.messages.length
       const adminFrom = admin.messages.length
       const now = streamOf(fake, "device-a")!
-      fake.emit(now, { _tag: "SpeechStarted" })
-      await sleep(100)
-      fake.emit(now, { _tag: "Interim", text: "hey alpha what time" }, { _tag: "EndOfTurn", text: "hey alpha what time is it" })
+      fake.emit(now, { _tag: "SpeechStarted" }, { _tag: "Interim", text: "hey alpha what time" }, { _tag: "EndOfTurn", text: "hey alpha what time is it" })
       const begun = await client.waitFor("turn.start", () => true, { from, timeoutMs: 10_000 })
       expect(begun).toMatchObject({ assistantId: "alpha" })
       const trace = (await admin.waitFor("trace", (m) => m.trace.turnId === begun.turnId, { from: adminFrom, timeoutMs: 10_000 })).trace
       expect(trace.route).toMatchObject({ by: "phrase" })
       const line = trace.timeline!
       const startedAt = line.find((x) => x.name === "speechStarted")!.at
-      // Its own start (~100 ms before its end), not the reloaded-away utterance's (more than 1.5 s before, by the
-      // sleep): a margin only a reused start can cross.
-      expect(startedAt).toBeGreaterThan(-1_000)
-      expect(line.find((x) => x.name === "firstInterim")!.at).toBeGreaterThan(startedAt)
+      // Its own start and first words (JUMP, as its end of turn), not the reloaded-away utterance's (−JUMP).
+      expect(startedAt).toBe(0)
+      expect(line.find((x) => x.name === "firstInterim")!.at).toBe(0)
     } finally {
       jev.close()
     }
