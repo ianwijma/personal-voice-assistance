@@ -22,6 +22,7 @@ import { JobInfo, ModelSet } from "./jobs.ts"
 import { VaultInfo } from "./vault.ts"
 import { AdminState } from "./admin.ts"
 import { AssistantTemplate, HealthInfo, ModuleUnavailable } from "./health.ts"
+import { ModuleRouteInfo } from "./moduleRoutes.ts"
 
 /** A one-line status a running module publishes, e.g. "Connected · 143 entities". */
 export const StatusLine = Schema.Struct({
@@ -121,7 +122,12 @@ export const ModuleInfo = Schema.Struct({
   /** Protocol 9: the module API it was written for (absent = 1). */
   apiVersion: Schema.optionalKey(Schema.Int),
   /** Protocol 9: the assistants it suggests (the new-assistant flow offers them). Absent = none. */
-  templates: Schema.optionalKey(Schema.Array(AssistantTemplate))
+  templates: Schema.optionalKey(Schema.Array(AssistantTemplate)),
+  /**
+   * Protocol 10: the HTTP routes its shared part declares (docs/UI-AND-MODULES.md §1.11), while it runs. Absent =
+   * none. The recent calls and the tokens are read through the admin API (`GET /api/module-routes`).
+   */
+  routes: Schema.optionalKey(Schema.Array(ModuleRouteInfo))
 })
 export type ModuleInfo = typeof ModuleInfo.Type
 

@@ -223,6 +223,11 @@ Settings fields (`Setting.*` in `Settings.ts`; each maps to exactly one protocol
 | `Setting.boolean` | `boolean` | `default` | switch |
 | `Setting.choice` | union of the option values | `options: [{ value, label, description? }]`, `default` | segmented control (≤ 4 options) or select |
 | `Setting.multichoice` | `ReadonlyArray<value>` | `options`, `default` | checkbox list |
+| `Setting.textList` (protocol 10, §1.11) | `ReadonlyArray<string>` | `default` ([]), `maxItems` (50), `itemMaxLength` (60), `placeholder`, `overridable`; env: comma-separated | chips with an "add" input |
+| `Setting.records` (§1.11) | `ReadonlyArray<{ … }>` | `item` (flat: `text`, `number`, `boolean`, `choice`, `multichoice`, `textList`; no secrets), `itemLabel`, `titleKey`, `default`, `maxItems`, `orderable`, `check(list)`; env: JSON | rows that open into a small form |
+| `Setting.combo` (§1.11) | `string` | `default`, `options`, `allowCustom` (true), `maxLength`, `placeholder`; the running instance adds options (`settingOptions`) | input with suggestions |
+| `Setting.action` (§1.11) | nothing | `buttonLabel`, `confirm`, `requiresSaved` (true); the handler is a `fieldActions` entry | a button with its result |
+| `Setting.info` (§1.11) | nothing | `tone`; the value is the running instance's `info()[key]` | read-only text |
 
 `env: "NAME"` on any field means: when that environment variable (or `.env` entry) is set and non-empty, it provides the value and the field is shown read-only in the UI with "Set by NAME in the environment". This is how today's `.env` configuration keeps working after the migration (`WEATHER_DEFAULT_PLACE`, `WEATHER_UNITS`).
 
@@ -571,6 +576,90 @@ Absent: `risk` is `read` for a speculative tool and `change` otherwise, `sensiti
 new-assistant wizard offers them under "Start from": the template's prompt and modules on, its name, purpose and
 Handles where nothing was typed, and its first suggested phrase for the places ticked in step 6. A template never
 becomes an assistant by itself, and a module update never changes an assistant made from one.
+
+### 1.11 Extended settings fields, field actions and module routes (docs/MODULES-PLAN.md §4 P3)
+
+Protocol 10. The five field types that were defined for agent forms (`textList`, `records`, `combo`, `action`, `info`,
+docs/AGENTS-AND-INTENTS.md §4.3) are members of `SettingField` itself, so module forms, agent forms and settings
+sections share one wire form and one set of renderers (`SettingFieldV2` and the other `V2` names are aliases now).
+Nothing of a module runs in the browser.
+
+**Values.** `textList`, `records` and `combo` are ordinary values: saved in the module's entry of `settings.json`,
+read from the environment (`records` as JSON, `textList` comma-separated; the field is then locked), validated by
+the field, and `overridable` where the module says so (an assistant may then own its rooms). `records` stay flat
+(§3.3 of the plan): an item is a set of non-secret simple fields; nested configuration is JSON in a validated text
+field. `action` has no value and `info` has one only the server sets: neither is ever in a patch (refused: "An action
+has no value", "Read-only"), saved, or in the settings a module receives (`SettingsOf` leaves both out). Settings
+saved before a module gained such fields load unchanged: the new fields take their defaults, and stray values under
+an action or info key are ignored and dropped by the next save.
+
+**Info and combo options.** The host describes the form with the values of the running instance (its instance with
+the shared settings): `info()[key]` fills an info field ("" while it does not run), and `settingOptions()[key]` is
+added to a combo's static options, with `optionsNote` saying where they came from ("Not running: type a name"). Both
+are read whenever the module is described: on every status line, after every button press, and when a version 2
+instance calls `refreshForm()`. They never take part in an instance's settings key.
+
+**Field actions.** A button's handler is, in this order: the definition's `fieldActions[key]` (runs whether or not
+the module runs: a Test button that checks an address before it is saved), the running instance's
+`fieldActions[key]` (it needs the instance: "Switch everything off"), or the host's generated `test` of an agent or
+decision provider (whose form now ends with that button). A handler gets `{ settings, draft }`: the module's
+settings (environment > saved > linked default, secrets included, no assistant's own values), or, for a button with
+`requiresSaved: false` pressed while the form has edits, the page's draft values applied over them (secrets are
+always the saved ones; a draft value the field refuses is reported as the result and nothing runs). It has 8 s; one
+press of a button at a time (`busy`). The page sends `module.action { moduleId, key, values? }` (admin only); the
+`result` carries `action: { ok, text, tone }`, shown next to the button. Codes: `unknown_module`,
+`unknown_action` (not a button), `not_running` (an instance handler of a module that does not run), `busy`.
+
+**Module routes.** A version 2 module's `shared` part may return `routes`; each is answered under
+`/api/modules/<moduleId>/<path>` while that shared part is the published one (so a stopped module's paths answer
+404 at once). The contract is `packages/core/src/ModuleRoutes.ts`; the server is `apps/assistant/src/serve/moduleRoutes.ts`.
+
+```ts
+interface ModuleRoute {
+  method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE"
+  path: string                       // "hook/:name": segments of [A-Za-z0-9._~-] or :param; "" = the module's root
+  guards?: ReadonlyArray<"admin" | "token" | "lan">   // every declared guard must pass
+  public?: boolean                   // required (and only allowed) without guards; a public route reads no body
+  token?: string                     // the token name a `token` guard accepts
+  body?: "json" | "bytes" | "none"   // default json for POST/PUT/PATCH, none for GET/DELETE
+  bodyLimitBytes?: number            // default 8 KB, at most 1 MB
+  rateLimit?: { perAddress?: number; total?: number }   // per minute; default 30 per caller, 120 in all
+  timeoutMs?: number                 // default 5 s, at most 30 s
+  description?: string
+  handler: (req: RouteRequest) => Effect<RouteResponse, unknown>
+}
+RouteRequest  = { method, path, params, query, queryAll, headers /* no authorization */, body, address, token?: { id, name, label } }
+RouteResponse = { status, headers?, body?: string | Uint8Array | json }
+```
+
+- **Start checks** (`routeProblem`, a start error of the shared part): a route without guards and without
+  `public: true`; a public route with guards or a body; `admin` together with `token` (both read the one
+  `Authorization` header); a `token` guard without a token name (or a name without the guard); bad paths, duplicate
+  routes, limits out of range.
+- **Order of a request**: path (404), method (405 with `Allow`), rate limit per caller address and per route (429 with
+  `Retry-After`; before the guards, so tokens cannot be guessed quickly), guards (`lan` 403, `admin` 401, `token` 503
+  while the vault is locked, else 401), body (413 over the limit or on a route that reads none, 415 not JSON, 400 bad
+  JSON), then the handler in its own fiber with its time limit (504) and a failure answering 500 (logged; nothing of
+  it is sent). Nothing here runs on a turn or the WebSocket. Answers carry `Cache-Control: no-store` and `nosniff`;
+  a handler cannot set framing headers.
+- **`lan`**: the socket's address is private or loopback (IPv4 10/8, 172.16/12, 192.168/16, 127/8, 169.254/16; IPv6
+  ::1, fc00::/7, fe80::/10; IPv4-mapped judged as IPv4; 100.64/10 is not the home network). **Reverse proxies:**
+  forwarding headers (`Forwarded`, `X-Forwarded-For`, `X-Real-IP`, …) are never read for the address, and their
+  presence fails `lan`, because behind a proxy the socket's address is the proxy's. A `lan` route is therefore not
+  reachable through a proxy; a caller from outside the home uses a `token` route. The host check (§4.6) applies first:
+  a hook called by a name other than an IP or `localhost` needs that name in `SERVE_ALLOWED_HOSTS`.
+- **`admin`**: the admin session token (`Authorization: Bearer`), as the voice API.
+- **`token`**: a route token of this module with the route's token name. Tokens are minted one per caller (`label`:
+  who it is for), kept with the module secrets under `@route-tokens` (in the key vault once there is one, before that
+  in `data/secrets.json` 0600; moved into the vault with the other keys), only as a SHA-256 of the secret, which is
+  shown once. A presented token is hashed and compared with every candidate in constant time. Revoking one stops it
+  at once. While the vault is locked tokens cannot be checked, listed or minted: token routes answer 503 with a plain
+  reason. Modules mint, list and revoke their own through `host.routeTokens` (`mint(name, label)`, `list`,
+  `revoke(id)`); the owner does it on the module page.
+- **Admin view** (`GET /api/module-routes[?module=<id>]`, admin token): each module's routes with guards and limits,
+  the last 20 calls of each (time, caller address, status, token label, why it was refused; memory only), and its
+  tokens; `POST /api/module-routes/<id>/tokens { name, label }` mints (201, the secret once), `DELETE
+  /api/module-routes/<id>/tokens/<tokenId>` revokes. The module page shows this as "Web addresses".
 
 ---
 
@@ -1005,6 +1094,11 @@ A drawer with five tabs (Modules, Assistant, Keys & access, This device, About; 
 | `boolean` | Switch |
 | `choice` | Radio rows with tag chips for ≤ 4 options that carry `tags`; segmented control for ≤ 4 plain options; select otherwise. The selected option's description, tags and `implication` line below |
 | `multichoice` | Checkbox list with descriptions |
+| `textList` | Chips with a remove button and an input that adds on Enter or a comma (Backspace removes the last); counter near `maxItems` |
+| `records` | One row per record titled by `titleKey` with a summary of the other values; a row opens into a small form built from the same renderers; **Add <itemLabel>**, remove, move up/down when `orderable`; the whole list is the value, compared deeply |
+| `combo` | Input with the options as suggestions (`optionsNote` under it); without `allowCustom` a value outside them blocks Save |
+| `action` | Button (`buttonLabel`, `confirm` asks first); disabled with "Save first" while the form has edits if `requiresSaved`, else the press carries the draft; spinner, then the result in its tone next to it; never in a patch |
+| `info` | Read-only text with a tone dot; "—" while empty; never in a patch |
 | any, `locked` | Value shown read-only with a pin and the reason (".env" or "the environment", from `source`) |
 | any, `visibleWhen` | Shown only while the condition holds on the page's draft; hidden fields are not sent |
 | any, `source: saved` | "Changed · Reset" next to the label; Reset sends `null` on save |
@@ -1199,6 +1293,7 @@ Serve mode always runs `Conversation` with `bargeIn: true`; the interrupt modes 
 
 - GET/HEAD only. `/` → `index.html`; `/x` → `x.html` if it exists; files under `PVA_WEB_DIR` with a path-traversal guard. `/_next/static/*`: `Cache-Control: public, max-age=31536000, immutable`; everything else `no-cache`. Content types for html, js, css, json, svg, png, ico, woff2, txt. If the directory is missing: HTTP 503 with a one-line page "UI not built: run `pnpm --filter @pva/web build`".
 - Cross-origin isolation (`SERVE_CROSS_ORIGIN_ISOLATION`, default on): every static response, error pages included, carries `Cross-Origin-Opener-Policy: same-origin`, `Cross-Origin-Embedder-Policy: require-corp` and `Cross-Origin-Resource-Policy: same-origin`. Only the document's own COOP and COEP are required for `crossOriginIsolated`; same-origin subresources need no header under `require-corp`, and worklets take the document's policy. Sending them everywhere covers every path the page can be loaded at and any future dedicated worker (which needs its own COEP).
+- `/api/modules/<id>/…`: module routes (§1.11), with their own guards; the rest of `/api/` is admin only.
 - Binds to `127.0.0.1` by default. Binding elsewhere prints a warning: there is no login in v1, and anyone who can reach the port can use the assistant and change its settings.
 - **Reaching it from another device** (needed: the assistant's machine has no sound card): the microphone needs a secure context. Supported routes, simplest first: (1) an SSH tunnel from the laptop (`ssh -L 8787:localhost:8787 <host>`, then `http://localhost:8787`: a secure context, no certificate); (2) `SERVE_TLS_CERT`/`SERVE_TLS_KEY` with a certificate the device trusts (own CA, or a real hostname with a DNS-01 certificate); (3) a reverse proxy (Caddy, Tailscale serve) in front of the default loopback binding. A phone needs (2) or (3).
 

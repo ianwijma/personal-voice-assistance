@@ -11,6 +11,7 @@ import {
   SettingsPatch,
   SettingValue
 } from "@pva/protocol"
+import { SettingExtra } from "./SettingsExtra.ts"
 
 /**
  * Typed settings for modules and assistant settings sections.
@@ -20,7 +21,9 @@ import {
  * settings (`SettingsOf<typeof spec>`), validation of stored and submitted
  * values, environment-variable overrides, and the field descriptions the web UI
  * renders as a form (`SettingField` in `@pva/protocol`). The set of field types
- * is closed: each has exactly one widget in the UI.
+ * is closed: each has exactly one widget in the UI. Since protocol 10 it includes the extended types of
+ * `SettingsExtra.ts` (`textList`, `records`, `combo`, `action`, `info`); `action` and `info` have no value the
+ * owner sets (`Setting.value`).
  *
  * Precedence for every field: environment variable (when the field names one
  * and it is set to a non-empty value; the field is then locked in the UI) >
@@ -72,10 +75,21 @@ export interface Setting<A> {
   readonly visibleWhen?: Condition
   /** An assistant may have its own value (`ModuleChoice.own`); never a secret. */
   readonly overridable: boolean
+  /**
+   * Absent or `editable`: an ordinary value. `none`: an `action` (no value at all: never in `values`, never saved or
+   * patched). `readOnly`: an `info` value only the server sets ("" in the resolved form, never saved or patched).
+   */
+  readonly value?: "editable" | "none" | "readOnly"
 }
 
+/** Does the owner set this field's value (saved, patched, from the environment)? */
+export const isEditableSetting = (setting: Setting<unknown>): boolean => setting.value === undefined || setting.value === "editable"
+
 export type SettingsSpec = { readonly [key: string]: Setting<any> }
-export type SettingsOf<S extends SettingsSpec> = { readonly [K in keyof S]: S[K] extends Setting<infer A> ? A : never }
+/** The settings a module receives: every field with a value (an `action` or `info` field has none the module reads). */
+export type SettingsOf<S extends SettingsSpec> = {
+  readonly [K in keyof S as S[K] extends { readonly value: "none" | "readOnly" } ? never : K]: S[K] extends Setting<infer A> ? A : never
+}
 
 const ok = <A>(value: A): Decoded<A> => ({ ok: true, value })
 const fail = (error: string): Decoded<never> => ({ ok: false, error })
@@ -258,8 +272,8 @@ const multichoice = <const V extends string>(options: SettingCommon & {
   }
 }
 
-/** Constructors for settings fields. */
-export const Setting = { text, secret, number, boolean, choice, multichoice }
+/** Constructors for settings fields (the five extended ones from `SettingsExtra.ts`). */
+export const Setting = { text, secret, number, boolean, choice, multichoice, ...SettingExtra }
 
 /** Where setting values come from. Plain records and functions, so they are easy to fake in tests. */
 export interface SettingsSources {
@@ -349,7 +363,7 @@ export interface ResolvedSettings<A> {
 }
 
 const envValue = (setting: Setting<unknown>, env: SettingsSources["env"]): string | undefined => {
-  if (setting.env === undefined) return undefined
+  if (setting.env === undefined || !isEditableSetting(setting)) return undefined
   const text = env[setting.env]
   return text === undefined || text.length === 0 ? undefined : text
 }
@@ -368,6 +382,12 @@ export const resolveSettings = <S extends SettingsSpec>(spec: S, sources: Settin
   }
 
   for (const [key, setting] of Object.entries(spec)) {
+    if (!isEditableSetting(setting)) {
+      // An action has no value; an info value is the server's ("" here: the module host fills it from the instance).
+      fields.push({ ...setting.describe(key), source: "default" })
+      if (setting.value === "readOnly") values[key] = ""
+      continue
+    }
     const fromEnv = envValue(setting, sources.env)
     const fieldDefault = defaultOf(setting, key, sources)
     const described = fieldDefault === setting.defaultValue || setting.secret
@@ -451,7 +471,7 @@ export const applySettingsPatch = (
 ): PatchResult => {
   const stored: Record<string, SettingValue> = {}
   for (const [key, value] of Object.entries(sources.stored)) {
-    if (Object.hasOwn(spec, key)) stored[key] = value as SettingValue
+    if (Object.hasOwn(spec, key) && isEditableSetting(spec[key]!)) stored[key] = value as SettingValue
   }
   const secrets: Record<string, string> = {}
   for (const [key, value] of Object.entries(sources.secrets)) {
@@ -462,7 +482,7 @@ export const applySettingsPatch = (
   // Visibility is judged on the values after the patch (a patch that chooses Deepgram shows its fields).
   const after: Record<string, unknown> = {}
   for (const [key, setting] of Object.entries(spec)) {
-    if (setting.secret) continue
+    if (setting.secret || !isEditableSetting(setting)) continue
     const fromEnv = envValue(setting, sources.env)
     const raw = fromEnv !== undefined
       ? setting.fromEnv(fromEnv)
@@ -483,6 +503,10 @@ export const applySettingsPatch = (
     const setting = Object.hasOwn(spec, key) ? spec[key] : undefined
     if (setting === undefined) {
       errors.push({ key: null, message: `Unknown setting "${key}"` })
+      return undefined
+    }
+    if (!isEditableSetting(setting)) {
+      errors.push({ key, message: setting.value === "none" ? "An action has no value" : "Read-only: the server sets it" })
       return undefined
     }
     if (setting.secret !== wantSecret) {

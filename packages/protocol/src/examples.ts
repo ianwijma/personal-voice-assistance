@@ -602,7 +602,16 @@ export const clientExamples: { readonly [T in ClientMessageType]: Extract<Client
   "conversation.new": { type: "conversation.new", requestId: "r22" },
   "ping": { type: "ping", id: 41 },
   "health.check": { type: "health.check", requestId: "h1" },
+  "module.action": { type: "module.action", requestId: "a1", moduleId: "home-assistant", key: "test", values: { baseUrl: "http://homeassistant.local:8123" } },
   ...assistantsClientExamples
+}
+
+/** The `result` of a `module.action` that ran (protocol 10). */
+export const exampleActionResult: Extract<ServerMessage, { readonly type: "result" }> = {
+  type: "result",
+  requestId: "a1",
+  ok: true,
+  action: { ok: true, text: "Connected to Home in 84 ms: 4 areas, 9 lights.", tone: "ok" }
 }
 
 /** The `result` of a successful `admin.login`. */

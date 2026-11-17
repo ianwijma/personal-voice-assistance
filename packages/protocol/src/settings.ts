@@ -188,13 +188,158 @@ export const MultiChoiceField = Schema.Struct({
   options: Schema.Array(ChoiceOption)
 })
 
-export const SettingField = Schema.Union([TextField, SecretField, NumberField, BooleanField, ChoiceField, MultiChoiceField])
-  .pipe(Schema.toTaggedUnion("type"))
+// ---------------------------------------------------------------------------------------------------------------------
+// Protocol 10: the extended field types (docs/AGENTS-AND-INTENTS.md §4.3, docs/MODULES-PLAN.md §4 P3). They were
+// defined in `agents.ts` for agent forms and joined `SettingField` here, so module forms, settings sections and
+// agent forms share one wire form.
+
+/** A list of short strings (aliases, greeting words, rooms): chips with an "add" input. Value: `string[]`. */
+export const TextListField = Schema.Struct({
+  type: Schema.Literal("textList"),
+  ...common,
+  default: Schema.Array(Schema.String),
+  maxItems: Schema.optionalKey(Schema.Int),
+  itemMaxLength: Schema.optionalKey(Schema.Int),
+  placeholder: Schema.optionalKey(Schema.String)
+})
+
+const itemCommon = {
+  key: FieldKey,
+  label: Schema.String,
+  description: Schema.optionalKey(Schema.String)
+}
+
+/** The field types allowed inside a record: flat, no secrets, no nesting, no actions (docs/MODULES-PLAN.md §3.3). */
+export const RecordItemField = Schema.Union([
+  Schema.Struct({
+    type: Schema.Literal("text"),
+    ...itemCommon,
+    default: Schema.String,
+    placeholder: Schema.optionalKey(Schema.String),
+    maxLength: Schema.optionalKey(Schema.Int),
+    multiline: Schema.optionalKey(Schema.Boolean)
+  }),
+  Schema.Struct({
+    type: Schema.Literal("number"),
+    ...itemCommon,
+    default: Schema.Finite,
+    integer: Schema.Boolean,
+    min: Schema.optionalKey(Schema.Finite),
+    max: Schema.optionalKey(Schema.Finite),
+    step: Schema.optionalKey(Schema.Finite),
+    unit: Schema.optionalKey(Schema.String)
+  }),
+  Schema.Struct({ type: Schema.Literal("boolean"), ...itemCommon, default: Schema.Boolean }),
+  Schema.Struct({ type: Schema.Literal("choice"), ...itemCommon, default: Schema.String, options: Schema.Array(ChoiceOption) }),
+  Schema.Struct({
+    type: Schema.Literal("multichoice"),
+    ...itemCommon,
+    default: Schema.Array(Schema.String),
+    options: Schema.Array(ChoiceOption)
+  }),
+  Schema.Struct({
+    type: Schema.Literal("textList"),
+    ...itemCommon,
+    default: Schema.Array(Schema.String),
+    maxItems: Schema.optionalKey(Schema.Int),
+    itemMaxLength: Schema.optionalKey(Schema.Int),
+    placeholder: Schema.optionalKey(Schema.String)
+  })
+]).pipe(Schema.toTaggedUnion("type"))
+export type RecordItemField = typeof RecordItemField.Type
+
+/** One record: item field key → value. */
+export const RecordValue = Schema.Record(FieldKey, Schema.Union([Schema.String, Schema.Finite, Schema.Boolean, Schema.Array(Schema.String)]))
+export type RecordValue = typeof RecordValue.Type
+
+/**
+ * An ordered list of records with the same flat fields (rooms with aliases, lamps, members). Rendered as a list of
+ * compact rows, each expanding into a small form built from `itemFields`; add, remove and (if `orderable`) move
+ * up/down. Value: `RecordValue[]`. Nested configuration is JSON in a validated text field instead.
+ */
+export const RecordsField = Schema.Struct({
+  type: Schema.Literal("records"),
+  ...common,
+  default: Schema.Array(RecordValue),
+  itemFields: Schema.Array(RecordItemField),
+  /** Singular noun for buttons: "Add room". */
+  itemLabel: Schema.String,
+  /** Item field whose value titles a collapsed row. */
+  titleKey: FieldKey,
+  maxItems: Schema.optionalKey(Schema.Int),
+  /** Order matters (first match wins); show move controls. */
+  orderable: Schema.Boolean
+})
+
+/**
+ * Free text with suggestions (a combobox): a model name picked from the backend's own list, with any other name
+ * allowed when `allowCustom`. The server adds the running instance's options (`settingOptions`) to the static ones;
+ * `optionsNote` says where they came from ("From the server's model list", "Not running: type a name").
+ * Value: `string`.
+ */
+export const ComboField = Schema.Struct({
+  type: Schema.Literal("combo"),
+  ...common,
+  default: Schema.String,
+  options: Schema.Array(ChoiceOption),
+  allowCustom: Schema.Boolean,
+  maxLength: Schema.optionalKey(Schema.Int),
+  placeholder: Schema.optionalKey(Schema.String),
+  optionsNote: Schema.optionalKey(Schema.String)
+})
+
+/**
+ * A button that runs something on the server ("Test", "Refresh the list"). It has no value: it is never in
+ * `values` and never in a patch. Pressing it sends `module.action`; the result (`Result.action`) is shown next to
+ * the button until the form is closed. `requiresSaved`: the handler uses the saved settings, so the button is
+ * disabled while the form has unsaved edits; without it the page sends its draft values with the press.
+ */
+export const ActionField = Schema.Struct({
+  type: Schema.Literal("action"),
+  ...common,
+  buttonLabel: Schema.String,
+  /** Ask "Are you sure?" with this text first. */
+  confirm: Schema.optionalKey(Schema.String),
+  requiresSaved: Schema.Boolean
+})
+
+/** What an `action` field's handler said: shown next to its button (`Result.action` of `module.action`). */
+export const FieldActionResult = Schema.Struct({
+  ok: Schema.Boolean,
+  /** One or two sentences for the owner. At most 500 characters. */
+  text: Schema.String.check(Schema.isMaxLength(500)),
+  tone: Schema.optionalKey(Schema.Literals(["neutral", "ok", "warning", "error"]))
+})
+export type FieldActionResult = typeof FieldActionResult.Type
+
+/** Read-only text computed by the server ("Logged in with a Max plan", "Last test: 912 ms"). Value: `string` ("" when not known). */
+export const InfoField = Schema.Struct({
+  type: Schema.Literal("info"),
+  ...common,
+  tone: Schema.optionalKey(Schema.Literals(["neutral", "ok", "warning", "error"]))
+})
+
+export const SettingField = Schema.Union([
+  TextField,
+  SecretField,
+  NumberField,
+  BooleanField,
+  ChoiceField,
+  MultiChoiceField,
+  TextListField,
+  RecordsField,
+  ComboField,
+  ActionField,
+  InfoField
+]).pipe(Schema.toTaggedUnion("type"))
 export type SettingField = typeof SettingField.Type
 export type SettingFieldType = SettingField["type"]
 
-/** A non-secret value. The field's `type` says which member applies. */
-export const SettingValue = Schema.Union([Schema.String, Schema.Finite, Schema.Boolean, Schema.Array(Schema.String)])
+/**
+ * A non-secret value. The field's `type` says which member applies; protocol 10 adds a list of records. `action`
+ * fields have no value; `info` fields have a string.
+ */
+export const SettingValue = Schema.Union([Schema.String, Schema.Finite, Schema.Boolean, Schema.Array(Schema.String), Schema.Array(RecordValue)])
 export type SettingValue = typeof SettingValue.Type
 
 /** What the client may know about a secret. */

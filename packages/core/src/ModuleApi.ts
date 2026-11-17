@@ -13,6 +13,7 @@ import type { Effect } from "effect"
 import type { ActionParam } from "./Actions.ts"
 import type { ModuleEvents } from "./EventBus.ts"
 import type { ModuleStore } from "./HouseholdStore.ts"
+import type { ModuleRoute, RouteTokens } from "./ModuleRoutes.ts"
 
 /**
  * Module API version 2 (docs/MODULES-PLAN.md §4 P1; module-definition-config-and-dependencies.md §A.4, §C.3–C.5).
@@ -197,6 +198,13 @@ export interface SharedPart<X> {
   readonly value: X
   readonly services?: ReadonlyArray<ProvidedService>
   readonly contributions?: ReadonlyArray<ProvidedContribution>
+
+  // -- P3: module HTTP routes (`ModuleRoutes.ts`) ----------------------------------------------------------------------
+  /**
+   * HTTP routes under `/api/modules/<moduleId>/…`, answered while this shared part is the published one (a stopped
+   * module's paths answer 404). Checked when it starts (`routeProblem`): a bad route is a start error.
+   */
+  readonly routes?: ReadonlyArray<ModuleRoute>
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -298,6 +306,8 @@ export interface ActionRunRequest {
  * The host as a version 2 module sees it (`ModuleServicesV2.host`, in `shared` and in `start`). Every lookup is live.
  */
 export interface ModuleHostApi {
+  /** P3: this module's route tokens (`ModuleRoutes.ts`), in the key vault. Fails `unavailable` outside serve mode. */
+  readonly routeTokens: RouteTokens
   /** A read-only snapshot of the assistant: module states, vault, engines, devices, Home values. */
   readonly view: () => HostView
   /** The service under `key` from a demanded module's `shared` part, or `undefined` while none provides it. */

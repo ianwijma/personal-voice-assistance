@@ -318,3 +318,36 @@ describe("successful answers are content, not diagnostics (fourth review, findin
       expect(describeLights(house)).toBe("Token Lamp Stand is on.")
     }))
 })
+
+describe("the Test button (P3: a field action of the definition)", () => {
+  const press = (settings: ReturnType<typeof settingsFor>) => {
+    const test = homeAssistantModule().fieldActions?.test
+    assert.isDefined(test)
+    return test!({ settings, draft: true })
+  }
+
+  it.effect("connects with the given address and token and reports what it found, without the module running", () =>
+    Effect.gen(function*() {
+      const ha = yield* Effect.promise(() => startFakeHomeAssistant())
+      const result = yield* press(settingsFor(ha.url, ha.token))
+      expect(result).toMatchObject({ ok: true, tone: "ok" })
+      expect(result.text).toMatch(/^Connected to .* in \d+ ms: 3 areas, 4 lights\.$/)
+      const wrong = yield* press(settingsFor(ha.url, "bad-token"))
+      expect(wrong).toMatchObject({ ok: false, tone: "error" })
+      expect(wrong.text).toContain("rejected the token")
+      expect(wrong.text).not.toContain("bad-token")
+      yield* Effect.promise(() => ha.close())
+    }))
+
+  it.effect("says what is missing before it tries", () =>
+    Effect.gen(function*() {
+      expect(yield* press(settingsFor("", "t"))).toMatchObject({ ok: false })
+      expect(yield* press(settingsFor("http://127.0.0.1:1", undefined))).toEqual({ ok: false, text: "Enter and save a long-lived access token first.", tone: "error" })
+    }))
+
+  it("is described on the form with its info fields", () => {
+    const form = resolveSettings(homeAssistantModule().settings, { stored: {}, secrets: {}, env: {} }).form
+    expect(form.fields.filter((f) => f.type === "action" || f.type === "info").map((f) => [f.key, f.type])).toEqual([["server", "info"], ["lists", "info"], ["test", "action"]])
+    expect(form.fields.find((f) => f.key === "test")).toMatchObject({ buttonLabel: "Test", requiresSaved: false })
+  })
+})

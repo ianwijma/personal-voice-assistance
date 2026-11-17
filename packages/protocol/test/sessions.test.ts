@@ -19,7 +19,7 @@ const valid = (schema: Schema.Codec<unknown, unknown>, value: unknown) => Schema
 
 describe("protocol 6", () => {
   it("is version 9 now (6 added these)", () => {
-    expect(PROTOCOL_VERSION).toBe(9)
+    expect(PROTOCOL_VERSION).toBe(10)
   })
 
   it("conversation.new is a request with an id", () => {

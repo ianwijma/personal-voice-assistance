@@ -5,9 +5,11 @@ import {
   defineModule,
   type ExtendedModuleInstance,
   makeTool,
+  type FieldActionResult,
   ModuleStartError,
   Param,
   Setting,
+  type SettingsOf,
   ToolError
 } from "@pva/core"
 import { Duration, Effect, Schedule, Schema } from "effect"
@@ -79,8 +81,49 @@ const settings = {
     step: 100,
     unit: "ms",
     advanced: true
+  }),
+  // P3: what the running module sees, and a Test button that also works before the address is saved.
+  server: Setting.info({ label: "Connected to" }),
+  lists: Setting.info({ label: "Rooms and lights" }),
+  test: Setting.action({
+    label: "Test the connection",
+    description: "Connects with the address above (saved or not) and the saved token, and reads the room list.",
+    buttonLabel: "Test",
+    requiresSaved: false
   })
 }
+
+type HomeAssistantSettings = SettingsOf<typeof settings>
+
+/**
+ * The Test button (a field action of the definition: it runs whether or not the module is running): the same two
+ * requests as a start, with the given settings, timed. Every text that may carry upstream words is redacted.
+ */
+const testConnection = (deps: HomeAssistantDeps, settings: HomeAssistantSettings): Effect.Effect<FieldActionResult> =>
+  Effect.gen(function*() {
+    const secrets = secretList(settings.token, addressSecrets(settings.baseUrl))
+    const problem = checkAddressSetting(settings.baseUrl)
+    if (problem !== undefined) return { ok: false, text: clip(`The address: ${problem}.`, secrets, 300), tone: "error" as const }
+    const baseUrl = normalizeBaseUrl(settings.baseUrl)
+    if (baseUrl === undefined) return { ok: false, text: "Enter the address of your Home Assistant server first.", tone: "error" as const }
+    if (settings.token === undefined) return { ok: false, text: "Enter and save a long-lived access token first.", tone: "error" as const }
+    const client = makeHomeAssistantClient({ baseUrl, token: settings.token, timeoutMs: settings.timeoutMs, fetch: deps.fetch })
+    const started = Date.now()
+    const failed = (e: HomeAssistantError) => ({ ok: false, text: clip(startErrorFields(e, baseUrl).message, secrets, 400), tone: "error" as const })
+    const config = yield* Effect.result(client.config)
+    if (config._tag === "Failure") return failed(config.failure)
+    const text = yield* Effect.result(client.renderTemplate(INVENTORY_TEMPLATE))
+    if (text._tag === "Failure") return failed(text.failure)
+    const inventory = decodeInventory(text.success)
+    if (inventory === undefined) return { ok: false, text: "Home Assistant answered, but its room list could not be read.", tone: "error" as const }
+    const house = buildHouse(inventory, settings.aliases, Date.now())
+    const where = fromUpstream(`${config.success.locationName ?? "Home Assistant"}${config.success.version !== undefined ? ` (HA ${config.success.version})` : ""}`, secrets)
+    return {
+      ok: true,
+      text: clip(`Connected to ${where} in ${Date.now() - started} ms: ${house.areas.length} areas, ${house.lights.length} lights.`, secrets, 400),
+      tone: "ok" as const
+    }
+  })
 
 /** The only way a `ModuleStartError` is made once a token is known: message and cause sanitised (see `redact.ts`). */
 const moduleStartError = (secrets: Secrets, fields: ConstructorParameters<typeof ModuleStartError>[0]): ModuleStartError =>
@@ -127,6 +170,7 @@ export const homeAssistantModule = (deps: HomeAssistantDeps = {}) =>
     description: "Turn lights on and off by room through your Home Assistant server.",
     enabledByDefault: false,
     settings,
+    fieldActions: { test: ({ settings }) => testConnection(deps, settings) },
     start: ({ setStatus: setUnsafeStatus, settings }) => {
       // The token and every credential part of the address, known before anything can fail.
       let secrets: Secrets = []

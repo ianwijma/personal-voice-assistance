@@ -67,8 +67,14 @@
  * a version 8 page would refuse a module in that state), with `ModuleInfo.unavailable` (reason and fix). Additive,
  * within 9: `ModuleInfo.version` / `apiVersion` / `templates`, `ToolInfo.risk` / `sensitivity` / `latency`, the
  * issue registry (`health`, `admin.snapshot.health`) and "Check again" (`health.check`, admin only).
+ *
+ * 10: extended settings fields and module routes (docs/MODULES-PLAN.md §4 P3). `SettingField` gains `textList`,
+ * `records`, `combo`, `action` and `info` and `SettingValue` a list of records (new members of closed sets: a
+ * version 9 page would refuse a form that uses them); `ErrorCode` gains `unknown_action` and `not_running`.
+ * Additive, within 10: `module.action` (admin only) and `Result.action`, `ModuleInfo.routes`, and the module route
+ * API (`moduleRoutes.ts`).
  */
-export const PROTOCOL_VERSION = 9
+export const PROTOCOL_VERSION = 10
 
 /** Path of the WebSocket endpoint, on the same origin as the UI in production. */
 export const WS_PATH = "/ws"
