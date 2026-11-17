@@ -910,11 +910,12 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
         return limited(
           client,
           message.requestId,
-          Effect.map(nodes.create({ name: message.name, replace: message.replace }), (r): Outcome => (r.ok ? r : { ok: false, error: r.error })),
-          // Seeding may have saved "Every voice node".
-          (r) => {
-            if (r.ok) afterAssistantsChange(r)
-          }
+          nodes.create({ name: message.name, replace: message.replace }).pipe(
+            Effect.map((r): Outcome => (r.ok ? r : { ok: false, error: r.error })),
+            // Seeding may have saved "Every voice node": admin has the seeded type (`device.types`) before the
+            // result, so the Add dialog's code step already knows whether anybody answers on voice nodes.
+            Effect.tap((r) => Effect.sync(() => afterAssistantsChange(r)))
+          )
         )
       }
       case "node.pair.cancel": {

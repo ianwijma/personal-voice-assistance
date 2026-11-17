@@ -9,6 +9,7 @@ import {
   packageFor,
   platformText,
   soundDeviceOptions,
+  runsFromSource,
   unencrypted,
   updatePending
 } from "@/lib/nodes.ts"
@@ -62,7 +63,7 @@ export function NodeStatusSection({ device, now, conversations }: { readonly dev
             <span className="font-mono text-[12px]">{node?.version ?? "Not known yet"}</span>
             {updatePending(node) && <Chip tone="warn" testId="update-pending">Update pending</Chip>}
             {node?.upToDate === true && <span className="text-ink-muted">up to date</span>}
-            {node?.version !== undefined && node.upToDate === undefined && node.bundleSha256 === undefined && <span className="text-ink-muted">runs from source</span>}
+            {runsFromSource(device) && <span className="text-ink-muted">runs from source</span>}
           </span>
         </Fact>
         {node?.platform !== undefined && <Fact label="Box" testId="node-platform">{platformText(node.platform)}</Fact>}

@@ -1,7 +1,7 @@
 // Voice node pairing (docs/VOICE-NODES.md §3.4, §6.1): codes, redeem, back-off per address and in total, admin
 // disabled, replace, and seeding "Every voice node" once. On a real settings store and device registry with a fake
 // clock; the replace case also against the real server (the old connection is closed with 4403).
-import { BUILT_IN_WEB_VOICE_SETTINGS, type NodePairRequest, PROTOCOL_VERSION, VOICE_NODE_KIND, WEB_VOICE_KIND } from "@pva/protocol"
+import { BUILT_IN_WEB_VOICE_SETTINGS, type NodePairRequest, PROTOCOL_VERSION, type ServerMessage, VOICE_NODE_KIND, WEB_VOICE_KIND } from "@pva/protocol"
 import { Effect } from "effect"
 import { createHash } from "node:crypto"
 import { mkdtempSync } from "node:fs"
@@ -302,6 +302,23 @@ describe("pairing against the server", () => {
     clients.push(fresh)
     nodeHello(fresh, second.deviceId, second.credential)
     await fresh.waitFor("welcome")
+  })
+
+  it("the first code's seeded Every voice node reaches admin (device.types) before the result, as the mock sends it", async () => {
+    server = await startTestServer({ build: fakeBuild({ stt: controlledStt().stt, llm: scriptedLlm(() => "ok").llm }) })
+    const admin = await ScriptedClient.connect({ url: server.url })
+    clients.push(admin)
+    await admin.admin(TEST_ADMIN_PASSWORD)
+    const before = admin.messages.length
+    admin.send({ type: "node.pair.create", requestId: "s1" })
+    await admin.waitFor("result", (m) => m.requestId === "s1")
+    const after = admin.messages.slice(before)
+    const resultAt = after.findIndex((m) => m.type === "result" && m.requestId === "s1")
+    const typesAt = after.findIndex((m) => m.type === "device.types")
+    expect(typesAt).toBeGreaterThanOrEqual(0)
+    expect(typesAt).toBeLessThan(resultAt)
+    const types = after[typesAt] as Extract<ServerMessage, { type: "device.types" }>
+    expect(types.types.find((t) => t.kind === VOICE_NODE_KIND)?.settings.assistants.length).toBeGreaterThan(0)
   })
 
   it("node.pair.* are admin only", async () => {

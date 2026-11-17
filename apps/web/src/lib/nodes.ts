@@ -123,6 +123,13 @@ export const installCommand = (options: { readonly url: string; readonly code: s
 /** Whether a device is a node that runs an older release than the server has. */
 export const updatePending = (node: NodeInfo | undefined): boolean => node?.upToDate === false
 export const unencrypted = (node: NodeInfo | undefined): boolean => node?.transport === "ws"
+/**
+ * The node is connected and said it runs no release bundle (`pva-node` from a checkout). Only while it is connected:
+ * the running bundle is known from its hello, so a node that is offline (just paired, or since the server restarted)
+ * has no `bundleSha256` without running from source.
+ */
+export const runsFromSource = (d: Pick<DeviceListInfo, "connections" | "node">): boolean =>
+  d.connections > 0 && d.node?.version !== undefined && d.node.upToDate === undefined && d.node.bundleSha256 === undefined
 
 /** "Offline since 14:02" today; "Offline since 12 Nov" before; with the year when it is another year. */
 export const offlineSinceText = (lastSeen: number, now: number): string => {

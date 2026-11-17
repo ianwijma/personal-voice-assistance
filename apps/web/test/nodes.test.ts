@@ -17,6 +17,7 @@ import {
   reportedSoundDevices,
   serverOriginOf,
   soundDeviceOptions,
+  runsFromSource,
   unencrypted,
   updatePending
 } from "@/lib/nodes.ts"
@@ -155,6 +156,16 @@ describe("status words", () => {
     expect(capabilitiesText(undefined)).toBeUndefined()
     expect(packageFor("arecord")).toBe("alsa-utils")
     expect(packageFor("pw-record")).toBe("pipewire-bin")
+  })
+
+  it("runs from source only while connected without a bundle (a node just paired, or offline after a server restart, is not)", () => {
+    // Seen on the real server: right after pairing the record has `version` from the pair request but no bundle yet.
+    const paired = { pairedAt: 1, version: "0.0.0+93c6103506" }
+    expect(runsFromSource({ connections: 0, node: paired })).toBe(false)
+    expect(runsFromSource({ connections: 1, node: paired })).toBe(true)
+    expect(runsFromSource({ connections: 1, node: { ...paired, bundleSha256: "a".repeat(64), upToDate: true } })).toBe(false)
+    expect(runsFromSource({ connections: 1, node: { ...paired, bundleSha256: "a".repeat(64) } })).toBe(false)
+    expect(runsFromSource({ connections: 1 })).toBe(false)
   })
 })
 
