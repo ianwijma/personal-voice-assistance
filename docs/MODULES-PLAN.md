@@ -117,6 +117,39 @@ editor in this stack.
 - A PR description says what was built, what was left out, how it was tested, and carries a screenshot where
   something is visible.
 
+### 3.5 What host code must survive
+
+Decided after the fourth review round of P1, and applied to every preparation PR. Modules are compiled into the
+app and trusted. This says which faults host code must handle correctly, and which it only has to fail loudly on.
+Reviewers judge "blocking" against it.
+
+Host code behaves correctly for:
+
+- **Anything from outside the process**: network requests, the admin pages, settings files, environment values,
+  what a model produces, what a person says, and the timing of all of these.
+- **Ordinary module faults**: a module's Effect fails, dies with a thrown exception, or takes too long and stops
+  when it is interrupted. A function a module supplies as plain code (a settings check, a decoder, a classifier)
+  that throws is caught where it is called and becomes that module's error.
+- **Callers that are interrupted at any point**: a turn is cut off by barge-in all the time, so a request a caller
+  made (a restart request, a save, a schedule) is either recorded whole or not at all.
+- **Operational faults**: a full disk, a locked vault, a lost connection, the process killed at any point. Durable
+  state stays consistent.
+
+Host code does not have to behave correctly, only to avoid corrupting durable state and to cross no security
+boundary, for:
+
+- **Module code that breaks the rules of the runtime**: it ignores interruption, blocks the event loop, or hands
+  the host an object whose properties throw when read or change between reads. Where the host already gives up on
+  such code after a time limit, that is best effort; nothing is promised about what remains afterwards except that
+  the owner is told (a Health issue or a log line) and that stopping the process works.
+- **The host's own dependencies misbehaving**: persistence, a registry, the clock, a registrar the app supplies
+  that throws or never returns. That is a defect in host code and may crash loudly.
+- **Code in the process going around a seam on purpose**: sealing of executors, private handles and the like stop
+  accidental direct calls. They are not a security boundary against compiled-in code.
+- **Constructor options no caller in the app or the test kit uses.**
+
+A finding that needs one of the second list's conditions is reported as a note, never as blocking.
+
 ## 4. The preparation stack
 
 The order of the table is the order of the stack and of the work. Two PRs in the same **slot** are written at the
@@ -222,6 +255,23 @@ Service keys and interfaces that the core provides or calls (`People`, `Privacy`
   research lists for `doctor` (disk space, TLS files, the port, speech models) belong to the deployment work (§7).
 - Templates: plain data on the manifest; the new-assistant wizard offers them.
 - Protocol: `ModuleState` gains `unavailable`; version bump.
+
+**Decided after review round 4** (the host keeps its shape; these narrow what it promises):
+
+- The grace period at a stop covers calls admitted to the stopping module itself (tools, actions, context, routes,
+  field actions). A call another module makes into its service while it stops may fail; the consumer handles that
+  failure like any other.
+- The restart limiter's promise is that a module cannot restart itself in a tight loop: at most one request is
+  taken up per interval. It does not promise a minimum distance between two restarts.
+- A restart request counts only from a part that is live. A part that is starting, failed or being closed cannot
+  ask (a "restart on disconnect" handler that fires while the host closes the part is dropped).
+- A request is recorded in one synchronous step, so interrupting the caller cannot lose it or leave a timer flag
+  set.
+- At host shutdown every module's registrations are withdrawn first, in one step, before any part is closed.
+- Registrar callbacks (`validate`, `publish`, `withdraw`) are host code: they write their own table and must not
+  read the host or throw. Registrars receive what the host has; they are not a boundary.
+- "Check again" always starts a fresh attempt for every demanded module that is not live.
+- Field actions get their time limit and their place in a stop in P3, which owns them.
 
 ### P2. Language and network helpers
 
@@ -563,6 +613,8 @@ Events follow §2 row 12. Other modules may subscribe; nothing may depend on an 
 - At most five rounds; up to ten when a round still finds real problems. A finding in round *n* that was already in
   the diff at round *n − 1* is recorded as a miss of the earlier review, so the reviewer is told to be exhaustive in
   one pass: every file in the diff is read, and the review says which files it read.
+- "Blocking" is judged against §3.5: a finding that needs module code to break the runtime's rules, a host
+  dependency to misbehave, or in-process code to go around a seam on purpose is a note.
 - A PR that still has blocking findings when the rounds run out is not approved: its description says so and lists
   them, and the owner is told. Work above it continues only where those findings do not touch a contract it uses.
 - Fixes to a lower PR are merged up through the stack.
