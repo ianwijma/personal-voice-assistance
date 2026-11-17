@@ -559,15 +559,15 @@ pins them in the workspace catalogue. Versions are the latest that pass `pnpm ch
 
 | Package | Libraries |
 |---|---|
-| `language` (P2) | `ical.js`; `chrono-node` only if its results pass the tests in both languages |
-| `net` (P2) | `ipaddr.js`, `undici` |
+| `language` (P2) | none: its grammars and its recurrence arithmetic are its own |
+| `net` (P2) | none: Node's own modules and its own address classifier |
 | `store-sqlite` (P4) | `@effect/sql-sqlite-node` |
 | core, for presentation (P10) | `sharp` |
 | `modules-builtin` (clock, weather) | `date-holidays`, `suncalc` |
 | `module-core-tools` | `mathjs`, `nspell`, `dictionary-en`, `dictionary-nl` |
 | `module-web-search` | `@mozilla/readability`, `linkedom`, `turndown`, `pdfjs-dist` |
 | `module-news` | `feedsmith`, `@mozilla/readability`, `linkedom` |
-| `module-calendar` | `tsdav`, `ical.js` |
+| `module-calendar` | `tsdav`, `ical.js` (events from outside are expanded with it, not with `@pva/language`) |
 | `module-local-info` | `ical.js` |
 | `module-kitchen`, `module-lists` | `fuse.js` |
 | `module-mcp` | `@modelcontextprotocol/client` (or the single SDK package if version 2 is not published under that name) |
