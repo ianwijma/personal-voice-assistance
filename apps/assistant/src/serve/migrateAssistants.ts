@@ -21,7 +21,9 @@ import {
   type ProfileOverrides,
   type QuietSpell,
   WEB_VOICE_KIND,
-  FOLLOW_ASSISTANT
+  FOLLOW_ASSISTANT,
+  BUILT_IN_PLACE,
+  NO_OVERRIDES
 } from "@pva/protocol"
 import * as SherpaStt from "@pva/stt-sherpa"
 import { defaultSystemPrompt } from "../config.ts"
@@ -475,7 +477,9 @@ const settingsFromProfile = (p: DeviceProfile, assistantId: string): DeviceSetti
   },
   captions: { captions: p.captions, speakTyped: p.speakReplies },
   look: FOLLOW_ASSISTANT,
-  voice: FOLLOW_ASSISTANT
+  voice: FOLLOW_ASSISTANT,
+  place: BUILT_IN_PLACE,
+  capabilities: NO_OVERRIDES
 })
 
 /** The fields present in `overrides`. */

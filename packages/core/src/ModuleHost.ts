@@ -49,6 +49,7 @@ import {
   type RequirementCheck,
   requirementKey,
   type RequirementStatus,
+  type ProvidedService,
   type ServiceKey,
   type SharedPart
 } from "./ModuleApi.ts"
@@ -316,6 +317,11 @@ export interface ModuleHostOptions {
   readonly routeTokens?: RouteTokenStore
   /** P3: time a field action may take. Default `FIELD_ACTION_TIMEOUT_MS`. */
   readonly fieldActionTimeoutMs?: number
+  /**
+   * P5: services the core itself provides to modules (`People`, `Privacy`, `Devices`), found by `host.service` before
+   * any module's; a module that provides one of these keys too fails to start. Absent: none (the CLI modes).
+   */
+  readonly coreServices?: ReadonlyArray<ProvidedService>
 }
 
 interface Running {
@@ -1728,6 +1734,8 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
     const ids = (part.services ?? []).map((p) => p.key.id)
     const twice = ids.find((id, i) => ids.indexOf(id) !== i)
     if (twice !== undefined) return `The module provides the service "${twice}" twice`
+    const core = ids.find((id) => (options.coreServices ?? []).some((p) => p.key.id === id))
+    if (core !== undefined) return `The service "${core}" is provided by the assistant itself`
     for (const other of entries) {
       if (other === entry || other.shared === undefined) continue
       const taken = ids.find((id) => (other.shared!.part.services ?? []).some((p) => p.key.id === id))
@@ -1819,6 +1827,8 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
     })
 
   const service = <T>(key: ServiceKey<T>): T | undefined => {
+    const core = options.coreServices?.find((p) => p.key.id === key.id)
+    if (core !== undefined) return core.service as T
     for (const entry of entries) {
       const found = entry.shared?.part.services?.find((p) => p.key.id === key.id)
       if (found !== undefined) return found.service as T

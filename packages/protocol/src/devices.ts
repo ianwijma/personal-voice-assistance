@@ -4,6 +4,7 @@ import type { AssistantHearing, Issue } from "./assistants.ts"
 import { DeviceLook, DeviceVoice, FOLLOW_ASSISTANT, Look, lookFor } from "./looks.ts"
 import { InterruptMode, NonNegativeFinite, OutputPath } from "./common.ts"
 import { DeviceId, DeviceInfo, DeviceName, FrontendKindId, PrebufferMs, WAKE_PHRASES_MAX, WakeMatch, WakePhrase, wakeWords, WEB_VOICE_KIND } from "./frontends.ts"
+import { BUILT_IN_PLACE, CapabilityOverrides, DeclaredCapabilities, DeviceLiveState, DevicePlace, NO_OVERRIDES } from "./capabilities.ts"
 
 /**
  * Devices, device types and assignments (docs/ASSISTANTS.md §2.3, §2.6, protocol 7 schemas). Pure and browser-safe.
@@ -79,7 +80,11 @@ export const DeviceSettings = Schema.Struct({
   /** The character on the voice stage for every assistant on the device, or each assistant's (docs/LOOKS-AND-VOICES.md). */
   look: DeviceLook,
   /** The voice of every assistant on the device, or each assistant's own. */
-  voice: DeviceVoice
+  voice: DeviceVoice,
+  /** Protocol 11 (P5): its room, how private it is, whose it is by default (`capabilities.ts`). */
+  place: DevicePlace,
+  /** Protocol 11 (P5): what the owner took away from what it declares (`effectiveCapabilities`). */
+  capabilities: CapabilityOverrides
 })
 export type DeviceSettings = typeof DeviceSettings.Type
 
@@ -93,7 +98,9 @@ export const DeviceSettingsKey = Schema.Literals([
   "audio",
   "captions",
   "look",
-  "voice"
+  "voice",
+  "place",
+  "capabilities"
 ])
 export type DeviceSettingsKey = typeof DeviceSettingsKey.Type
 export const DEVICE_SETTINGS_KEYS: ReadonlyArray<DeviceSettingsKey> = DeviceSettingsKey.literals
@@ -108,7 +115,9 @@ export const DeviceOwn = Schema.Struct({
   audio: Schema.optionalKey(DeviceAudio),
   captions: Schema.optionalKey(DeviceCaptions),
   look: Schema.optionalKey(DeviceLook),
-  voice: Schema.optionalKey(DeviceVoice)
+  voice: Schema.optionalKey(DeviceVoice),
+  place: Schema.optionalKey(DevicePlace),
+  capabilities: Schema.optionalKey(CapabilityOverrides)
 })
 export type DeviceOwn = typeof DeviceOwn.Type
 
@@ -122,7 +131,9 @@ export const DeviceSettingsPatch = Schema.Struct({
   audio: Schema.optionalKey(Schema.NullOr(DeviceAudio)),
   captions: Schema.optionalKey(Schema.NullOr(DeviceCaptions)),
   look: Schema.optionalKey(Schema.NullOr(DeviceLook)),
-  voice: Schema.optionalKey(Schema.NullOr(DeviceVoice))
+  voice: Schema.optionalKey(Schema.NullOr(DeviceVoice)),
+  place: Schema.optionalKey(Schema.NullOr(DevicePlace)),
+  capabilities: Schema.optionalKey(Schema.NullOr(CapabilityOverrides))
 })
 export type DeviceSettingsPatch = typeof DeviceSettingsPatch.Type
 
@@ -132,7 +143,9 @@ export const DeviceRecord = Schema.Struct({
   name: DeviceName,
   firstSeen: NonNegativeFinite,
   lastSeen: NonNegativeFinite,
-  own: DeviceOwn
+  own: DeviceOwn,
+  /** Protocol 11 (P5): what it declared last (`hello.device.capabilities`, `device.caps`), kept while it is offline. */
+  declared: Schema.optionalKey(DeclaredCapabilities)
 })
 export type DeviceRecord = typeof DeviceRecord.Type
 
@@ -167,7 +180,9 @@ export const BUILT_IN_WEB_VOICE_SETTINGS: DeviceSettings = {
   audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, speakAloud: true, outputPath: "direct", prebufferMs: 60 },
   captions: { captions: true, speakTyped: true },
   look: FOLLOW_ASSISTANT,
-  voice: FOLLOW_ASSISTANT
+  voice: FOLLOW_ASSISTANT,
+  place: BUILT_IN_PLACE,
+  capabilities: NO_OVERRIDES
 }
 
 export const WEB_VOICE_DEVICE_TYPE: DeviceTypeDefinition = {
@@ -543,7 +558,11 @@ export const DeviceRecordInfo = Schema.Struct({
   hearer: Schema.NullOr(AssistantId),
   rev: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
   connections: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
-  audioOwner: Schema.Boolean
+  audioOwner: Schema.Boolean,
+  /** Protocol 11: what it declared last, and when. */
+  declared: Schema.optionalKey(DeclaredCapabilities),
+  /** Protocol 11: whether it is visible now and when it was last used (connected devices). */
+  live: Schema.optionalKey(DeviceLiveState)
 })
 export type DeviceRecordInfo = typeof DeviceRecordInfo.Type
 
@@ -556,7 +575,11 @@ export const DeviceListInfo = Schema.Struct({
   own: DeviceOwn,
   settings: DeviceSettings,
   hearer: Schema.NullOr(AssistantId),
-  rev: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))
+  rev: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  /** Protocol 11 (P5): what it declared last, and when ("What it can do" in admin). */
+  declared: Schema.optionalKey(DeclaredCapabilities),
+  /** Protocol 11: whether a tab of it is visible now and when it was last used (while connected). */
+  live: Schema.optionalKey(DeviceLiveState)
 })
 export type DeviceListInfo = typeof DeviceListInfo.Type
 

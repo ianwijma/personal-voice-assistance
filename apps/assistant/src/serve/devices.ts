@@ -1,5 +1,8 @@
 import {
   applicableOwn,
+  capabilitiesDifferMaterially,
+  type DeclaredCapabilities,
+  type DeviceCapabilities,
   type DeviceHello,
   type DeviceInfo,
   type DeviceListInfo,
@@ -84,6 +87,16 @@ export interface DeviceRegistry {
   /** A remembered device's name. */
   readonly nameOf: (id: string) => string | undefined
   readonly kindOfDevice: (id: string) => string | undefined
+  /**
+   * P5: what a known device declared last (`hello.device.capabilities`, `device.caps`), newest first from memory, else
+   * from its record; `undefined` when it never declared anything.
+   */
+  readonly declaredOf: (id: string) => DeclaredCapabilities | undefined
+  /**
+   * P5: a connected device declared what it can do (`device.caps`). Kept in memory; written to its record at once when
+   * it differs in more than the window's exact size (`capabilitiesDifferMaterially`), else with the next write.
+   */
+  readonly declare: (id: string, capabilities: DeviceCapabilities) => Effect.Effect<void>
   /** `device.forget` (admin). */
   readonly forget: (id: string) => Effect.Effect<DeviceResult>
 }
@@ -99,12 +112,19 @@ export const makeDeviceRegistry = (options: DeviceRegistryOptions): DeviceRegist
   const now = options.now ?? Date.now
   /** `lastSeen` newer than the stored one (memory only until the next save). */
   const lastSeen = new Map<string, number>()
+  /** Declarations newer than the stored ones (memory only until the next save). */
+  const declared = new Map<string, DeclaredCapabilities>()
   const stored = () => store.settings().devices
 
   const withLastSeen = (id: string, record: StoredDevice): StoredDevice => {
     const seen = lastSeen.get(id)
-    return seen !== undefined && seen > record.lastSeen ? { ...record, lastSeen: seen } : record
+    const caps = declared.get(id)
+    const withSeen = seen !== undefined && seen > record.lastSeen ? { ...record, lastSeen: seen } : record
+    return caps !== undefined && (record.declared === undefined || caps.seenAt > record.declared.seenAt) ? { ...withSeen, declared: caps } : withSeen
   }
+  /** The declaration should be written now: new, or different in more than the window size from the stored one. */
+  const declarationChanged = (id: string, caps: DeviceCapabilities | undefined): boolean =>
+    caps !== undefined && capabilitiesDifferMaterially(stored()[id]?.declared?.capabilities, caps)
 
   /** The records with memory `lastSeen` folded in (what a save writes). */
   const withAllLastSeen = (devices: Readonly<Record<string, StoredDevice>>): Record<string, StoredDevice> =>
@@ -122,9 +142,10 @@ export const makeDeviceRegistry = (options: DeviceRegistryOptions): DeviceRegist
       .filter((id) => !connected.has(id))
       .sort((a, b) => Number(hasOwn(out[a]!)) - Number(hasOwn(out[b]!)) || out[a]!.lastSeen - out[b]!.lastSeen)
     for (const id of candidates) {
-      if (excess <= 0) break
+        if (excess <= 0) break
       delete out[id]
       lastSeen.delete(id)
+      declared.delete(id)
       excess--
     }
     return out
@@ -154,12 +175,15 @@ export const makeDeviceRegistry = (options: DeviceRegistryOptions): DeviceRegist
         const t = now()
         const before0 = stored()[device.id]
         lastSeen.set(device.id, t)
-        if (before0 !== undefined && t - before0.lastSeen < LAST_SEEN_WRITE_MS) return Effect.void
+        const changed = declarationChanged(device.id, device.capabilities)
+        if (device.capabilities !== undefined) declared.set(device.id, { capabilities: device.capabilities, seenAt: t })
+        if (before0 !== undefined && t - before0.lastSeen < LAST_SEEN_WRITE_MS && !changed) return Effect.void
         return store.saveDeviceRecords(before0 === undefined ? `device ${device.id}` : `the last visit of device ${device.id}`, (committed) => {
           const devices = withAllLastSeen(committed)
           const before = devices[device.id]
+          const caps = declared.get(device.id)
           const record: StoredDevice = before === undefined
-            ? { kind: device.kind, name: device.name.trim(), firstSeen: t, lastSeen: t, own: {}, rev: 0 }
+            ? { kind: device.kind, name: device.name.trim(), firstSeen: t, lastSeen: t, own: {}, rev: 0, ...(caps !== undefined ? { declared: caps } : {}) }
             : { ...before, lastSeen: Math.max(before.lastSeen, t) }
           const room = before === undefined ? capped(devices, connected) : devices
           return { ...room, [device.id]: record }
@@ -169,6 +193,22 @@ export const makeDeviceRegistry = (options: DeviceRegistryOptions): DeviceRegist
       if (stored()[id] !== undefined) lastSeen.set(id, now())
     },
     known: (id) => stored()[id] !== undefined,
+    declaredOf: (id) => {
+      const record = stored()[id]
+      if (record === undefined) return undefined
+      const caps = declared.get(id)
+      return caps !== undefined && (record.declared === undefined || caps.seenAt >= record.declared.seenAt) ? caps : record.declared
+    },
+    declare: (id, capabilities) =>
+      Effect.suspend(() => {
+        if (stored()[id] === undefined) return Effect.void
+        const changed = declarationChanged(id, capabilities)
+        declared.set(id, { capabilities, seenAt: now() })
+        if (!changed) return Effect.void
+        return store.saveDeviceRecords(`what device ${id} can do`, (committed) => withAllLastSeen(committed)).pipe(
+          Effect.catch((e) => Effect.logDebug(`Device ${id}: its capabilities were not saved: ${e.message}`))
+        )
+      }),
     nameOf: (id) => stored()[id]?.name,
     kindOfDevice: (id) => stored()[id]?.kind,
     forget: (id) =>
@@ -182,7 +222,10 @@ export const makeDeviceRegistry = (options: DeviceRegistryOptions): DeviceRegist
           Effect.as<DeviceResult>({ ok: true }),
           Effect.catch((e) => Effect.succeed(failure("internal", e.message))),
           Effect.tap((r) => Effect.sync(() => {
-            if (r.ok) lastSeen.delete(id)
+            if (r.ok) {
+              lastSeen.delete(id)
+              declared.delete(id)
+            }
           }))
         )
       })

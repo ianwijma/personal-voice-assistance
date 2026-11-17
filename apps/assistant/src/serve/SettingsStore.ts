@@ -213,12 +213,15 @@ const readFrontendData = (u: Record<string, unknown>, problems: Array<string>): 
 
 /**
  * A stored type entry is a complete `DeviceSettings`: one written before a section key existed (`look`, `voice`,
- * docs/LOOKS-AND-VOICES.md) lacks it and takes the built-in's, so it loads whole and behaves as before.
+ * docs/LOOKS-AND-VOICES.md; `place`, `capabilities`, protocol 11) lacks it and takes the built-in's, so it loads whole
+ * and behaves as before.
  */
 const withNewKeys = (value: unknown, kind: string): unknown => {
   if (!isRecord(value)) return value
   const builtIn: DeviceSettings = deviceTypeOf(kind)?.builtIn ?? BUILT_IN_WEB_VOICE_SETTINGS
-  return { ...(value.look === undefined ? { look: builtIn.look } : {}), ...(value.voice === undefined ? { voice: builtIn.voice } : {}), ...value }
+  const missing: Record<string, unknown> = {}
+  for (const key of ["look", "voice", "place", "capabilities"] as const) if (value[key] === undefined) missing[key] = builtIn[key]
+  return { ...missing, ...value }
 }
 
 /** The entities of a version-4 file; entries that do not decode are dropped, each with a problem. */
@@ -391,6 +394,11 @@ export interface SettingsStore {
   readonly deleteAssistantRecord: (id: string, rev: number) => Effect.Effect<void, SettingsStoreError | EntitySaveError>
   /** Save a device type's complete defaults (`rev` as for an assistant; a type never saved has `rev` 0). */
   readonly saveDeviceType: (kind: string, rev: number, settings: DeviceSettings) => Effect.Effect<StoredDeviceType, SettingsStoreError | EntitySaveError>
+  /**
+   * P5: a person was removed from Members: every device type and device whose `place.defaultPerson` is not one of
+   * `known` gets nobody instead (each changed entity's `rev` moves on). Nothing is written when nothing points elsewhere.
+   */
+  readonly clearDefaultPeople: (known: ReadonlySet<string>) => Effect.Effect<number, SettingsStoreError | EntitySaveError>
   /** Save a remembered device's own sections and, when given, its name (`rev` as for an assistant). */
   readonly saveDevice: (
     id: string,
@@ -1316,6 +1324,34 @@ export const loadSettingsStore = (directory: string, options: LoadOptions = {}):
           return { file: { ...file, devices: { ...file.devices, [id]: next } }, result: next }
         })
 
+      const clearDefaultPeople: SettingsStore["clearDefaultPeople"] = (known) =>
+        Effect.suspend(() => {
+          const dangling = (person: string | null | undefined) => person !== null && person !== undefined && !known.has(person)
+          const file = settings
+          const any = Object.values(file.deviceTypes).some((t) => dangling(t.place?.defaultPerson)) ||
+            Object.values(file.devices).some((d) => dangling(d.own.place?.defaultPerson))
+          if (!any) return Effect.succeed(0)
+          let count = 0
+          return persistEntities("the devices of a removed person", (committed) => {
+            const deviceTypes: Record<string, StoredDeviceType> = {}
+            for (const [kind, t] of Object.entries(committed.deviceTypes)) {
+              if (t.place !== undefined && dangling(t.place.defaultPerson)) {
+                deviceTypes[kind] = { ...t, place: { ...t.place, defaultPerson: null }, rev: t.rev + 1 }
+                count++
+              } else deviceTypes[kind] = t
+            }
+            const devices: Record<string, StoredDevice> = {}
+            for (const [id, d] of Object.entries(committed.devices)) {
+              const place = d.own.place
+              if (place !== undefined && dangling(place.defaultPerson)) {
+                devices[id] = { ...d, own: { ...d.own, place: { ...place, defaultPerson: null } }, rev: d.rev + 1 }
+                count++
+              } else devices[id] = d
+            }
+            return { file: { ...committed, deviceTypes, devices }, result: undefined }
+          }).pipe(Effect.map(() => count))
+        })
+
       const ordered = () => settings.assistants.order.flatMap((id) => (settings.assistants.byId[id] !== undefined ? [settings.assistants.byId[id]!] : []))
 
       const store: SettingsStore = {
@@ -1334,6 +1370,7 @@ export const loadSettingsStore = (directory: string, options: LoadOptions = {}):
         saveModule,
         saveAssistant,
         saveDeviceRecords,
+        clearDefaultPeople,
         assistants: ordered,
         assistantsInEffect: () => ordered().map((a) => withEnvironment(a, context)),
         createAssistant,

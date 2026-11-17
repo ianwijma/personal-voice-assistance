@@ -104,6 +104,11 @@ export interface SessionHub {
    */
   readonly refreshDevices: () => void
   /**
+   * P5: device types or devices were saved outside a `device.save` (a removed person cleared from them): as after a
+   * save, sessions and voice pages apply them and admin gets the lists again.
+   */
+  readonly entitiesChanged: () => void
+  /**
    * One final transcript of a session, for admin connections with the phrase tester on that follow it (`wake.heard`;
    * `wake.test.deviceId`, else the most recently active session): the phrase it matched, and whether its wake gate
    * accepted it. `source`: the session's device and the matched phrase's assistant there, sent as they are, so the
@@ -120,9 +125,14 @@ export interface SessionHub {
   readonly deviceViews: () => ReadonlyArray<HostDeviceView>
   /** The open voice connections, for household pushes (`HouseholdPush.ts`). */
   readonly voiceConnections: () => ReadonlyArray<VoiceConnection>
+  /** P5: whether a device is connected now, whether one of its tabs is visible, and when it was last used. */
+  readonly deviceLive: (id: string) => { readonly connected: boolean; readonly visible: boolean; readonly lastInteractionAt?: number | undefined }
 }
 
-/** A voice connection as the household push sees it: its device and a send that checks it is still open. */
+/**
+ * A voice connection as the household push sees it: its device and a send that checks it is still open. `device` is
+ * read when used: P5 keeps it current with the device's place (room, privacy, default person).
+ */
 export interface VoiceConnection {
   readonly id: string
   readonly device: TargetDevice
@@ -136,6 +146,8 @@ export interface HouseholdHooks {
   /** A device's first connection opened / its last one closed (`host.device.connected` / `.disconnected`). */
   readonly deviceConnected: (deviceId: string) => void
   readonly deviceDisconnected: (deviceId: string) => void
+  /** P5: the connection's device changed place or default person (`device` is the new one): send it a fresh snapshot. */
+  readonly placeChanged?: (connection: VoiceConnection) => void
 }
 
 export interface HubOptions {
@@ -161,6 +173,13 @@ export interface HubOptions {
   readonly env?: EnvMover
   /** Household data for voice pages and device events (P4). Absent: none sent. */
   readonly household?: HouseholdHooks
+  /**
+   * P5: what the household feed sees of a voice connection's device (its room, privacy and default person). Absent:
+   * its id and name only.
+   */
+  readonly targetDevice?: (device: { readonly id: string; readonly name: string } | undefined) => TargetDevice
+  /** P5: a device's connections, declaration or live state changed (the device facts rebuild their list). */
+  readonly onDeviceChange?: () => void
   /** Diagnostics › Health (`health`, `health.check`). Absent: no `health` in the admin snapshot, checks refused. */
   readonly health?: HealthService
   /** Model downloads (jobs). Absent: none offered. */
@@ -226,6 +245,11 @@ interface Client {
   wakeTestDevice: string | undefined
   /** This connection for household pushes (voice connections, after hello). */
   voice?: VoiceConnection
+  /** P5: the device as the household feed saw it last (JSON), to notice a change of place. */
+  lastTarget?: string
+  /** P5: this tab is visible (until it says otherwise) and when it was last used (`device.caps.live`). */
+  visible: boolean
+  lastInteractionAt: number | undefined
 }
 
 /** Who owns a session's audio (per device), and what the hub remembers about it. */
@@ -424,6 +448,31 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
     for (const c of clients) if (!c.closed && c.helloed && c.sessionKey === key) n++
     return n
   }
+  /** P5: a device is connected, one of its tabs is visible, and its last interaction over all tabs. */
+  const deviceLive = (id: string) => {
+    let connected = false
+    let visible = false
+    let lastInteractionAt: number | undefined
+    for (const c of clients) {
+      if (c.closed || !c.helloed || c.device?.id !== id) continue
+      connected = true
+      if (c.visible) visible = true
+      if (c.lastInteractionAt !== undefined && (lastInteractionAt === undefined || c.lastInteractionAt > lastInteractionAt)) lastInteractionAt = c.lastInteractionAt
+    }
+    return { connected, visible, lastInteractionAt }
+  }
+  /** Admin's list of devices: protocol 7's with what each declared last and, while connected, its live state. */
+  const deviceList = () =>
+    assistants.devices(registry.devices(live)).map((d) => {
+      const declared = registry.declaredOf(d.id)
+      const l = deviceLive(d.id)
+      return {
+        ...d,
+        ...(declared !== undefined ? { declared } : {}),
+        ...(l.connected ? { live: { visible: l.visible, ...(l.lastInteractionAt !== undefined ? { lastInteractionAt: l.lastInteractionAt } : {}) } } : {})
+      }
+    })
+  const deviceChanged = () => options.onDeviceChange?.()
   const connectedDevices = () => new Set([...clients].flatMap((c) => (c.device !== undefined && !c.closed ? [c.device.id] : [])))
 
   let devicesTimer: ReturnType<typeof setTimeout> | undefined
@@ -432,7 +481,7 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
     if (devicesTimer !== undefined) clearTimeout(devicesTimer)
     devicesTimer = undefined
     devicesSentAt = performance.now()
-    broadcast({ type: "devices", devices: [...assistants.devices(registry.devices(live))] })
+    broadcast({ type: "devices", devices: deviceList() })
   }
   /** `minor`: only last seen, connections or the audio owner changed (throttled). */
   const devicesChanged = (minor: boolean) => {
@@ -465,8 +514,26 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
   }
 
   const refreshDevices = () => {
+    deviceChanged()
     for (const session of sessions.all()) session.syncProfile()
     refreshSetups()
+    refreshTargets()
+  }
+
+  /** P5: the target device of every voice connection; one whose place or default person changed gets a fresh snapshot. */
+  const targetOf = (client: Client): TargetDevice => {
+    const device = client.device
+    if (options.targetDevice !== undefined) return options.targetDevice(device === undefined ? undefined : { id: device.id, name: registry.nameOf(device.id) ?? device.name })
+    return device === undefined ? {} : { id: device.id, name: device.name }
+  }
+  const refreshTargets = () => {
+    for (const client of clients) {
+      if (!client.helloed || client.closed || client.voice === undefined) continue
+      const text = JSON.stringify(targetOf(client))
+      if (text === client.lastTarget) continue
+      client.lastTarget = text
+      options.household?.placeChanged?.(client.voice)
+    }
   }
 
   /** Send `device.setup` to every voice connection whose setup changed (never to admin connections: it is the voice page's). */
@@ -569,6 +636,7 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
     if (!clients.delete(client)) return
     if (client.device !== undefined) {
       registry.left(client.device.id)
+      deviceChanged()
       devicesChanged(true)
       const id = client.device.id
       if (![...clients].some((c) => c.helloed && c.device?.id === id)) options.household?.deviceDisconnected(id)
@@ -633,7 +701,7 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
     ...(options.env !== undefined ? { env: options.env.info() } : {}),
     models: options.models?.list() ?? [],
     jobs: options.jobs?.list() ?? [],
-    devices: [...assistants.devices(registry.devices(live))],
+    devices: deviceList(),
     sessions: [...sessions.list()],
     assistants: [...assistants.infos()],
     deviceTypes: [...assistants.deviceTypes()],
@@ -683,11 +751,16 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
     const firstOfDevice = client.device !== undefined && ![...clients].some((c) => c !== client && c.helloed && !c.closed && c.device?.id === client.device!.id)
     client.helloed = true
     if (client.device !== undefined) registerDevice(client.device)
+    if (client.device !== undefined) deviceChanged()
     if (client.role === "voice" && options.household !== undefined) {
       const device = client.device
+      client.lastTarget = JSON.stringify(targetOf(client))
       client.voice = {
         id: client.connection.id,
-        device: device === undefined ? {} : { id: device.id, name: device.name },
+        // Read at each use: the device's place as it is now (P5).
+        get device() {
+          return targetOf(client)
+        },
         send: (m) => send(client, m)
       }
       if (firstOfDevice) options.household.deviceConnected(device!.id)
@@ -997,6 +1070,24 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
       }
       case "ping":
         return send(client, { type: "pong", id: message.id })
+      case "device.caps": {
+        // P5: only a voice connection with a device declares (admin pages and pages without a device are ignored).
+        const device = client.device
+        if (client.role !== "voice" || device === undefined) return
+        if (message.live !== undefined) {
+          client.visible = message.live.visible
+          if (message.live.lastInteractionAt !== undefined) client.lastInteractionAt = Math.min(message.live.lastInteractionAt, Date.now())
+        }
+        if (message.capabilities !== undefined) {
+          options.run(Effect.andThen(registry.declare(device.id, message.capabilities), Effect.sync(() => {
+            deviceChanged()
+            devicesChanged(true)
+          })))
+          return
+        }
+        deviceChanged()
+        return devicesChanged(true)
+      }
     }
   }
 
@@ -1023,7 +1114,9 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
         adminToken: undefined,
         lastSetup: undefined,
         wakeTestUntil: 0,
-        wakeTestDevice: undefined
+        wakeTestDevice: undefined,
+        visible: true,
+        lastInteractionAt: undefined
       }
       client.helloTimer = setTimeout(() => {
         if (!client.helloed) drop(client, CloseCode.helloTimeout, "no hello")
@@ -1097,6 +1190,8 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
       for (const client of clients) sendVault(client)
     },
     refreshDevices,
+    entitiesChanged: () => afterAssistantsChange({ ok: true }),
+    deviceLive,
     voiceConnections: () => [...clients].flatMap((c) => (c.voice !== undefined && c.helloed && !c.closed ? [c.voice] : [])),
     deviceViews: () =>
       [...registry.devices(live)].sort((a, b) => b.lastSeen - a.lastSeen).map((d) => ({ id: d.id, name: d.name, kind: d.kind, connections: d.connections })),

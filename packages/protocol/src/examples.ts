@@ -11,6 +11,7 @@ import { BUILT_IN_WEB_VOICE_SETTINGS, type AssistantInfo, type DeviceListInfo, t
 import type { EnvInfo } from "./env.ts"
 import type { JobInfo, ModelSet } from "./jobs.ts"
 import { WEB_VOICE_KIND } from "./frontends.ts"
+import type { DeviceCapabilities } from "./capabilities.ts"
 import {
   type AdminSnapshot,
   engineSummary,
@@ -404,7 +405,7 @@ export const exampleDeviceType: DeviceTypeInfo = {
   one: "browser",
   many: "browsers",
   description: "The voice page on a phone, tablet or computer.",
-  keys: ["assistants", "withoutPhrase", "matching", "voicePage", "interruptMode", "audio", "captions", "look", "voice"],
+  keys: ["assistants", "withoutPhrase", "matching", "voicePage", "interruptMode", "audio", "captions", "look", "voice", "place", "capabilities"],
   settings: exampleDeviceSettings,
   rev: 2
 }
@@ -432,6 +433,15 @@ export const exampleDeviceSetup = deviceSetupFrom(
 const { id: _id, rev: _rev, ...exampleAssistantBody } = exampleAssistant
 
 
+/** What a tablet's voice page declares (protocol 11). */
+export const exampleCapabilities: DeviceCapabilities = {
+  v: 1,
+  display: { class: "standard", widthPx: 1024, heightPx: 768, dpr: 2, touch: "coarse", colour: true },
+  present: { kinds: {} },
+  speaker: { media: ["speech", "audio"] },
+  microphone: { farField: false }
+}
+
 export const exampleDevice: DeviceListInfo = {
   id: "d-5c1e0b7a42",
   kind: WEB_VOICE_KIND,
@@ -443,7 +453,9 @@ export const exampleDevice: DeviceListInfo = {
   hearer: "jeff",
   rev: 1,
   connections: 1,
-  audioOwner: true
+  audioOwner: true,
+  declared: { capabilities: exampleCapabilities, seenAt: 1_763_100_000_000 },
+  live: { visible: true }
 }
 
 export const exampleConversation: ConversationInfo = { id: "5b0f6a0e-3c1d-4c7e-9a52-1f0e8d2b7c44", startedAt: 1_763_099_400_000 }
@@ -559,7 +571,7 @@ export const clientExamples: { readonly [T in ClientMessageType]: Extract<Client
     clientId: "c-7f3a9b21",
     resumeOwner: false,
     frontend: "voice",
-    device: { id: "d-5c1e0b7a42", kind: WEB_VOICE_KIND, name: "iPhone · Safari" }
+    device: { id: "d-5c1e0b7a42", kind: WEB_VOICE_KIND, name: "iPhone · Safari", capabilities: exampleCapabilities }
   },
   "audio.claim": { type: "audio.claim", audio },
   "audio.release": { type: "audio.release" },
@@ -603,6 +615,11 @@ export const clientExamples: { readonly [T in ClientMessageType]: Extract<Client
   "ping": { type: "ping", id: 41 },
   "health.check": { type: "health.check", requestId: "h1" },
   "module.action": { type: "module.action", requestId: "a1", moduleId: "home-assistant", key: "test", values: { baseUrl: "http://homeassistant.local:8123" } },
+  "device.caps": {
+    type: "device.caps",
+    capabilities: exampleCapabilities,
+    live: { visible: true, lastInteractionAt: 1_763_100_000_000 }
+  },
   ...assistantsClientExamples
 }
 

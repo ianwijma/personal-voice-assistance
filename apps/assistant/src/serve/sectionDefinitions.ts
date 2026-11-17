@@ -7,7 +7,8 @@ import {
   DEFAULT_SESSION_DISCARD_MINUTES,
   type OptionTag,
   type SettingsGroup,
-  type SettingsPage
+  type SettingsPage,
+  type SettingValue
 } from "@pva/protocol"
 import * as SherpaStt from "@pva/stt-sherpa"
 import * as SherpaTts from "@pva/tts-sherpa"
@@ -18,6 +19,7 @@ import { isTtsProvider, ttsProviderInfo } from "../providers.ts"
 import { checkUrl, defaults as jevDefaults } from "@pva/decide-typesafe"
 import { checkAccountAddress } from "@pva/llm-openai-compatible"
 import { ASSISTANT_VOICE, DEFAULT_ASSISTANT_VOICE } from "../voiceSelection.ts"
+import { membersSection } from "./people.ts"
 
 /**
  * The assistant settings as the settings screen shows them (docs/SETTINGS-UI.md
@@ -45,6 +47,11 @@ export interface SectionDefinition {
   readonly protected?: boolean
   readonly spec: SettingsSpec
   readonly checks?: ReadonlyArray<SettingsCheck>
+  /**
+   * P5: the section's stored values after a valid save, before it is written (Members gives a new person an id).
+   * Must keep valid values valid.
+   */
+  readonly normalize?: (values: Readonly<Record<string, SettingValue>>) => Readonly<Record<string, SettingValue>>
 }
 
 const reload = "reload" as const
@@ -334,6 +341,7 @@ const openAiAccountsSection: SectionDefinition = {
 export const sectionDefinitions = (dirs: ModelDirs = defaultModelDirs): ReadonlyArray<SectionDefinition> => {
   return [
     homeSection,
+    membersSection,
     openAiAccountsSection,
     // ---- Language model
     {

@@ -215,10 +215,12 @@ export const makeSections = (
         if (missingModel.length > 0) {
           return failed(path, { ok: false, error: { code: "invalid_settings", message: missingModel[0]!.message, fieldErrors: missingModel } })
         }
-        const patched = applySettingsPatch(d.spec, { stored, secrets, env, ...origin, context: (key) => before.values.get(key) }, patch)
+        let patched = applySettingsPatch(d.spec, { stored, secrets, env, ...origin, context: (key) => before.values.get(key) }, patch)
         if (!patched.ok) {
           return failed(path, { ok: false, error: { code: "invalid_settings", message: "Some settings are not valid", fieldErrors: patched.errors } })
         }
+        // P5: a section may complete its values before they are written (Members gives a new person an id).
+        if (d.normalize !== undefined) patched = { ...patched, stored: d.normalize(patched.stored) }
         // The values after this save, for every section (keys are global).
         const keys = Object.keys(d.spec)
         const replace = <V>(base: Readonly<Record<string, V>>, next: Readonly<Record<string, V>>) => {

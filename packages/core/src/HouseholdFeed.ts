@@ -3,6 +3,7 @@ import { Effect } from "effect"
 import type { EventType, HouseholdEvent } from "./EventBus.ts"
 import type { ChangeRecord, Collection, HouseholdStore, Row, ScopeRef, StoreError, TargetDevice } from "./HouseholdStore.ts"
 import { decodeStored } from "./HouseholdStore.ts"
+import { mayRevealTo } from "./Privacy.ts"
 
 /**
  * What voice pages receive of the household data (docs/STORING-DATA.md "Pages"; docs/MODULES-PLAN.md §4 P4).
@@ -23,10 +24,10 @@ import { decodeStored } from "./HouseholdStore.ts"
  */
 
 /**
- * THE one place where the scope of a row or event decides whether a voice page may see it at all. P5 replaces the
- * `person` branch with `Privacy.mayReveal` (docs/MODULES-PLAN.md §2 row 8); until then person-scoped data is never sent
- * to a page. Household data goes to every voice page, device data to that device only, assistant and conversation
- * data to none (they belong to turns, not to screens).
+ * THE one place where the scope of a row or event decides whether a voice page may see it at all. Household data goes
+ * to every voice page, device data to that device only, person data where `Privacy.mayReveal` allows it
+ * (docs/MODULES-PLAN.md §2 row 8: a `private` device, or a `shared` one whose default person is the owner), assistant
+ * and conversation data to none (they belong to turns, not to screens).
  */
 export const mayRevealScopeTo = (scope: ScopeRef, device: TargetDevice): boolean => {
   switch (scope.kind) {
@@ -35,7 +36,7 @@ export const mayRevealScopeTo = (scope: ScopeRef, device: TargetDevice): boolean
     case "device":
       return device.id !== undefined && scope.id === device.id
     case "person":
-      return false // P5: Privacy.mayReveal(person, device)
+      return mayRevealTo(scope.id, { privacy: device.privacy ?? "shared", defaultPerson: device.defaultPerson ?? null })
     case "assistant":
     case "conversation":
       return false
@@ -95,7 +96,12 @@ export interface HouseholdFeed {
   readonly replay: (device: TargetDevice, seq: number) => Effect.Effect<Replay, StoreError>
 }
 
-export const makeHouseholdFeed = (options: { readonly store: HouseholdStore; readonly modules: ReadonlyArray<FeedModule> }): HouseholdFeed => {
+export const makeHouseholdFeed = (options: {
+  readonly store: HouseholdStore
+  readonly modules: ReadonlyArray<FeedModule>
+  /** The household's person ids now (Members), for the person-scoped rows of a snapshot. Absent: the device's default person only. */
+  readonly people?: () => ReadonlyArray<string>
+}): HouseholdFeed => {
   const { store } = options
   const collections = new Map<string, Collection<any>>()
   const eventTypes = new Map<string, EventType>()
@@ -139,19 +145,29 @@ export const makeHouseholdFeed = (options: { readonly store: HouseholdStore; rea
       const seq = yield* store.lastSeq
       const out: Array<HouseholdCollectionRows> = []
       for (const { moduleId, collection } of sent) {
-        const scope: ScopeRef | undefined = collection.scope === "household"
-          ? { kind: "household" }
-          : collection.scope === "device" && device.id !== undefined ? { kind: "device", id: device.id } : undefined
-        if (scope === undefined || !mayRevealScopeTo(scope, device)) continue
-        const rows = yield* store.forModule(moduleId).collection(collection).list({ scope, limit: SNAPSHOT_ROWS }).pipe(
-          Effect.catchTag("ScopeUnknown", () => Effect.succeed([] as ReadonlyArray<Row<unknown>>))
-        )
+        // Person-scoped collections: one read per person the device may see (P5), the device's default person first.
+        const scopes: ReadonlyArray<ScopeRef> = collection.scope === "household"
+          ? [{ kind: "household" }]
+          : collection.scope === "device"
+          ? device.id !== undefined ? [{ kind: "device", id: device.id }] : []
+          : collection.scope === "person"
+          ? [...new Set([...(device.defaultPerson !== undefined ? [device.defaultPerson] : []), ...(options.people?.() ?? [])])].map((id): ScopeRef => ({ kind: "person", id }))
+          : []
+        const readable = scopes.filter((scope) => mayRevealScopeTo(scope, device))
+        if (readable.length === 0) continue
         const visible: Array<HouseholdRow> = []
-        for (const row of rows) {
-          const value = projectRow(collection, row, device)
-          if (value !== undefined) visible.push({ id: row.id, rev: row.rev, scope: row.scope, value, updatedAt: row.updatedAt })
+        let truncated = false
+        for (const scope of readable) {
+          const rows = yield* store.forModule(moduleId).collection(collection).list({ scope, limit: SNAPSHOT_ROWS }).pipe(
+            Effect.catchTag("ScopeUnknown", () => Effect.succeed([] as ReadonlyArray<Row<unknown>>))
+          )
+          if (rows.length >= SNAPSHOT_ROWS) truncated = true
+          for (const row of rows) {
+            const value = projectRow(collection, row, device)
+            if (value !== undefined) visible.push({ id: row.id, rev: row.rev, scope: row.scope, value, updatedAt: row.updatedAt })
+          }
         }
-        out.push({ module: moduleId, collection: collection.name, rows: visible, truncated: rows.length >= SNAPSHOT_ROWS })
+        out.push({ module: moduleId, collection: collection.name, rows: visible, truncated })
       }
       return { seq, collections: out }
     })

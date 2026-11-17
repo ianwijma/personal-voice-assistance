@@ -124,7 +124,9 @@ import { makeVoiceSessions, type VoiceSessions } from "./VoiceSessions.ts"
 import { makeRoutingService, ROUTING_KEYS } from "./routing.ts"
 import { openServeHousehold } from "./household.ts"
 import { makeHouseholdPush } from "./HouseholdPush.ts"
-import { hostEvent, withContextProvider } from "@pva/core"
+import { Devices, hostEvent, People, Privacy, withContextProvider } from "@pva/core"
+import { makeDeviceFacts } from "./deviceFacts.ts"
+import { makePeopleService, MEMBERS_KEY, MEMBERS_SECTION_ID, personIdsOf } from "./people.ts"
 import { runMaintenance } from "@pva/store-sqlite"
 import { type KdfParams, openVault, type Vault, VaultPathConfig } from "./Vault.ts"
 import * as SherpaStt from "@pva/stt-sherpa"
@@ -323,14 +325,32 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     // upgraded before any module is made. A database from a newer assistant stops the start here.
     const logContext = yield* Effect.context<never>()
     const logInfo = (line: string) => void Effect.runForkWith(logContext)(Effect.logInfo(line))
+    // P5: the household's people (shared settings › Members); a diet a module records is saved like an admin edit.
+    const people = makePeopleService({
+      value: (key) => sections.value(key),
+      update: (patch) => Effect.map(sections.update(MEMBERS_SECTION_ID, patch), (u) => (u.result.ok ? { ok: true as const } : { ok: false as const, message: u.result.error.message }))
+    })
     const household = yield* openServeHousehold({
       dataDir: options.dataDir,
       catalog,
       backupCopyDir: env.HOUSEHOLD_BACKUP_COPY_DIR,
-      log: logInfo
+      log: logInfo,
+      people: () => people.list().map((p) => p.id)
     }).pipe(Effect.mapError((e) => new SettingsStoreError({ message: e.message, cause: e })))
+    // P5: what each device is and can do (its place, its declaration, connected or not), from cached values.
+    const devices = makeDeviceRegistry({ store })
+    const deviceFacts = makeDeviceFacts({
+      file: () => store.settings(),
+      declaredOf: (id) => devices.declaredOf(id),
+      live: (id) => hub?.deviceLive(id) ?? { connected: false, visible: false },
+      isPerson: (id) => people.get(id) !== undefined,
+      nameOfPerson: (id) => people.nameOf(id),
+      peopleVersion: () => sections.value(MEMBERS_KEY)
+    })
     // Capabilities run for the assistants that switch them on (`moduleDemand`, below; read from startEnabled on).
     const host = yield* makeModuleHost({
+      // P5: the core's own services for modules (`host.service`).
+      coreServices: [People.of(people), Privacy.of(deviceFacts.privacy), Devices.of(deviceFacts.devices)],
       routeTokens,
       catalog,
       persistence: store.modulePersistence,
@@ -900,7 +920,8 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
             setup: {
               system: systemFor(base, instructions),
               // The household's ambient facts (docs/STORING-DATA.md), after the modules' context.
-              registry: withContextProvider(mine.registry, ambientFacts),
+              // P5: the line about the turn's device and the other screens comes first (cached, no I/O).
+              registry: withContextProvider(withContextProvider(mine.registry, deviceFacts.contextProvider), ambientFacts),
               llm: llm ?? notInUse,
               tts: tts ?? noVoice,
               ...(tts !== undefined ? { ttsReady } : {}),
@@ -1214,7 +1235,6 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       ...(options.adminNow !== undefined ? { now: options.adminNow } : {})
     })
     yield* Effect.addFinalizer(() => Effect.sync(() => admin.dispose()))
-    const devices = makeDeviceRegistry({ store })
 
     // TypeSafe routing (docs/ASSISTANTS.md §3.6): the shared `routing` section, read at each decision (live).
     const routing = makeRoutingService(() => ({
@@ -1234,6 +1254,8 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
           name: () => (device === undefined ? "Voice page without a device" : devices.nameOf(device.id) ?? device.name),
           engine: theEngine,
           deviceSettings: () => deviceSettingsOf(device?.id),
+          // P5: `CurrentTurn.room` and `.person` (the device's default person).
+          place: () => deviceFacts.originOf(device?.id),
           hearing: hearingOf(device?.id),
           ...(options.hearerSwitchWaitMs !== undefined ? { hearerSwitchWaitMs: options.hearerSwitchWaitMs } : {}),
           assistants: assistantsNow,
@@ -1298,6 +1320,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       llmProblems,
       speechMemoryWarning,
       voiceProblem,
+      isPerson: (id) => people.get(id) !== undefined,
       // TypeSafe is set up: the routing section is switched on, with a key and a valid address (WP-14).
       canAuto: routing.ready
     })
@@ -1322,6 +1345,8 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     const push = makeHouseholdPush({ feed: household.feed, bus: household.bus, run, log: (line) => runFork(Effect.logWarning(line)) })
     hub = makeSessionHub({
       household: push.hooks,
+      targetDevice: deviceFacts.targetOf,
+      onDeviceChange: deviceFacts.changed,
       admin,
       health,
       devices,
@@ -1369,6 +1394,18 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       if (module.id === SUBSCRIPTION_AGENT_ID && theEngine.status().engines.some((e) => e.provider === SUBSCRIPTION_PROVIDER)) theEngine.refreshStatus()
     })
     sections.subscribe((section) => hubNow.broadcast({ type: "section.changed", section: access.section(section) }))
+    // P5: a person removed from Members is no device's default person any more (also at start, after a crash between
+    // the two saves); devices and voice pages then follow the new places.
+    const clearRemovedPeople = Effect.suspend(() => store.clearDefaultPeople(personIdsOf(sections.value(MEMBERS_KEY)))).pipe(
+      Effect.flatMap((n) => (n === 0 ? Effect.void : Effect.sync(() => hubNow.entitiesChanged()))),
+      Effect.catch((e) => Effect.logWarning(`A removed person is still some device's default person: ${e.message}`))
+    )
+    sections.subscribe((section) => {
+      if (section.id !== MEMBERS_SECTION_ID) return
+      hubNow.refreshDevices()
+      run(clearRemovedPeople)
+    })
+    if (store.blocked() === undefined) run(clearRemovedPeople)
     keys.subscribe((state) => {
       hubNow.vaultChanged()
       sections.announceAll()

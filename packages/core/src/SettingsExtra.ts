@@ -98,10 +98,10 @@ export type ItemOf<I extends ItemSpec> = { readonly [K in keyof I]: I[K] extends
 
 const ITEM_TYPES: ReadonlyArray<string> = ["text", "number", "boolean", "choice", "multichoice", "textList"]
 
-const itemField = (key: string, setting: ItemSetting): RecordItemField => {
+const itemField = (key: string, setting: ItemSetting, hidden: boolean): RecordItemField => {
   const d = setting.describe(key) as Record<string, unknown> & { readonly type: string }
   const { apply: _a, advanced: _adv, locked: _l, visibleWhen: _v, overridable: _o, source: _s, ...rest } = d
-  return rest as RecordItemField
+  return (hidden ? { ...rest, hidden: true } : rest) as RecordItemField
 }
 
 /**
@@ -119,6 +119,8 @@ const records = <const I extends ItemSpec>(o: Common & {
   readonly orderable?: boolean
   /** Extra validation of the whole list (unique names); return a message for an invalid value. */
   readonly check?: (value: ReadonlyArray<ItemOf<I>>) => string | undefined
+  /** Item keys kept in every record but not drawn (protocol 11: an id the server makes). */
+  readonly hiddenKeys?: ReadonlyArray<keyof I & string>
 }): Setting<ReadonlyArray<ItemOf<I>>> => {
   for (const [key, s] of Object.entries(o.item)) {
     if (s.secret || !ITEM_TYPES.includes(s.type)) throw new Error(`Record field "${key}" cannot be of type ${s.type}`)
@@ -157,7 +159,7 @@ const records = <const I extends ItemSpec>(o: Common & {
       type: "records",
       ...commonFields(key, o),
       default: (o.default ?? []) as never,
-      itemFields: Object.entries(o.item).map(([k, s]) => itemField(k, s)),
+      itemFields: Object.entries(o.item).map(([k, s]) => itemField(k, s, o.hiddenKeys?.includes(k) === true)),
       itemLabel: o.itemLabel,
       titleKey: o.titleKey,
       maxItems,
