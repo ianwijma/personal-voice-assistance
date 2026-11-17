@@ -93,7 +93,7 @@ export interface SafeResponse {
    * accept (its body is not read).
    */
   readonly body: Uint8Array
-  /** How the body was compressed on the wire. */
+  /** How the body was compressed on the wire (`deflate` is the zlib format of RFC 9110 §8.4.1.2). */
   readonly encoding: "identity" | "gzip" | "deflate" | "br"
   /** The media type of the response, lower case without parameters ("text/html"); "" when there was none. */
   readonly contentType: string
@@ -233,11 +233,18 @@ const forbiddenHeaders: ReadonlySet<string> = new Set([
 /** What survives a redirect to another origin: nothing that could carry a credential. */
 const crossOriginHeaders: ReadonlySet<string> = new Set(["accept", "accept-language", "user-agent"])
 
-/** The caller's headers, lower-case and checked, or the refusal. Review round 1, finding 4. */
-export const checkHeaders = (url: string, given: Readonly<Record<string, string>> | undefined, accept: ContentTypePolicy): Record<string, string> | NetRefused => {
+/**
+ * A header map, checked and with lower-case names: each name a token, not one of the forbidden headers, a value a header can hold,
+ * and no name twice whatever its case. The refusal otherwise. `checkHeaders` is this plus the default `Accept`; a caller that merges
+ * two maps (defaults and per-request values) canonicalises each with this first, so a difference in case cannot make an override a
+ * duplicate (review round 3, finding 3).
+ */
+export const canonicalHeaders = (url: string, given: Readonly<Record<string, string>> | undefined): Record<string, string> | NetRefused => {
   const out: Record<string, string> = Object.create(null)
-  for (const name of Object.keys(given ?? {})) {
-    const value = given![name]
+  if (given === undefined || given === null) return out
+  if (typeof given !== "object") return refuse("header", url, "Headers must be an object of names and values")
+  for (const name of Object.keys(given)) {
+    const value = given[name]
     const key = name.toLowerCase()
     if (!tokenPattern.test(name)) return refuse("header", url, `"${name}" is not a header name`)
     if (forbiddenHeaders.has(key)) return refuse("header", url, `The ${name} header may not be set`)
@@ -245,12 +252,22 @@ export const checkHeaders = (url: string, given: Readonly<Record<string, string>
     if (key in out) return refuse("header", url, `The ${name} header is given twice`)
     out[key] = value.trim()
   }
+  return out
+}
+
+/** The caller's headers, lower-case and checked (`canonicalHeaders`), with `Accept` from the policy when none is given. Review round 1, finding 4. */
+export const checkHeaders = (url: string, given: Readonly<Record<string, string>> | undefined, accept: ContentTypePolicy): Record<string, string> | NetRefused => {
+  const out = canonicalHeaders(url, given)
+  if (out instanceof NetRefused) return out
   if (!("accept" in out)) {
     const listed = accept.types.filter((t) => !t.includes("*"))
     out["accept"] = listed.length > 0 ? listed.join(", ") : "*/*"
   }
   return out
 }
+
+/** Headers that make a request conditional on a validator of the requested resource: never carried to another URL by a redirect. */
+const conditionalHeaders: ReadonlySet<string> = new Set(["if-none-match", "if-modified-since", "if-match", "if-unmodified-since", "if-range"])
 
 // ---- response types and encodings ---------------------------------------------------------------------------------------------------
 
@@ -322,8 +339,12 @@ async function* rawChunks(body: AsyncIterable<Uint8Array>, limit: number, url: s
   }
 }
 
-/** A zlib-wrapped deflate stream starts with a header whose first two bytes are a multiple of 31 (RFC 1950); raw deflate does not. */
-const isZlibHeader = (b: Uint8Array): boolean => b.length >= 2 && (b[0]! & 0x0f) === 8 && ((b[0]! << 8) | b[1]!) % 31 === 0
+/**
+ * `Content-Encoding: deflate` is the zlib format (RFC 9110 §8.4.1.2, RFC 1950): its first two bytes name the deflate method and are a
+ * multiple of 31. Raw deflate without the zlib wrapper is not supported: two bytes cannot tell it apart from zlib for every stream
+ * (review round 3, finding 2), so a deflate body that does not start with a zlib header is refused (rule `content-encoding`).
+ */
+const isZlibHeader = (b: Uint8Array): boolean => b.length >= 2 && (b[0]! & 0x0f) === 8 && (b[0]! >> 4) <= 7 && ((b[0]! << 8) | b[1]!) % 31 === 0
 
 /**
  * The first chunks of a body until they hold `n` bytes (or the body ends), joined, so a decision about the format never rests on a
@@ -347,15 +368,17 @@ const prefixOf = async (raw: AsyncGenerator<Uint8Array>, n: number): Promise<{ h
  */
 const decodeBody = async (encoding: Exclude<Encoding, "identity">, body: AsyncIterable<Uint8Array>, limit: number, url: string, signal: AbortSignal): Promise<Array<Uint8Array>> => {
   const raw = rawChunks(body, limit, url, signal)
-  // The platform's streaming decompressors; for deflate, the first two bytes say whether it is zlib-wrapped (RFC 9110 §8.4.1.2) or
-  // raw, as some servers send it.
+  // The first two bytes, whatever the chunk boundaries: for deflate they must be a zlib header.
   const prefix = await prefixOf(raw, 2)
   // No bytes at all: an empty body, whatever the header says (servers label empty answers too).
   if (prefix.done && prefix.head.byteLength === 0) return []
+  if (encoding === "deflate" && !isZlibHeader(prefix.head)) {
+    void raw.return(undefined).catch(() => undefined)
+    throw refuse("content-encoding", url, "The deflate body is not a zlib stream (raw deflate is not supported)")
+  }
   let first: IteratorResult<Uint8Array> | undefined = prefix.head.byteLength > 0 ? { done: false, value: prefix.head } : prefix.done ? { done: true, value: undefined } : undefined
-  const stream: zlib.Gunzip | zlib.Inflate | zlib.InflateRaw | zlib.BrotliDecompress =
-    encoding === "gzip" ? zlib.createGunzip() : encoding === "br" ? zlib.createBrotliDecompress()
-      : prefix.head.byteLength > 0 && !isZlibHeader(prefix.head) ? zlib.createInflateRaw() : zlib.createInflate()
+  const stream: zlib.Gunzip | zlib.Inflate | zlib.BrotliDecompress =
+    encoding === "gzip" ? zlib.createGunzip() : encoding === "br" ? zlib.createBrotliDecompress() : zlib.createInflate()
   const out: Array<Uint8Array> = []
   let total = 0
   let failure: unknown
@@ -382,8 +405,16 @@ const decodeBody = async (encoding: Exclude<Encoding, "identity">, body: AsyncIt
       first = undefined
       if (failure !== undefined) break
       if (next.done === true) { stream.end(); break }
-      // Respect back-pressure, so a stalled consumer cannot make the decompressor buffer without bound.
-      if (!stream.write(next.value)) await new Promise<void>((r) => { stream.once("drain", r); stream.once("close", r) })
+      // Respect back-pressure, so a stalled consumer cannot make the decompressor buffer without bound. Whichever of drain and close
+      // comes first removes the other's listener, so repeated waits do not pile up listeners (review round 3, finding 6).
+      if (!stream.write(next.value)) {
+        await new Promise<void>((r) => {
+          const onDrain = () => { stream.off("close", onClose); r() }
+          const onClose = () => { stream.off("drain", onDrain); r() }
+          stream.once("drain", onDrain)
+          stream.once("close", onClose)
+        })
+      }
     }
     await done
   } catch (e) {
@@ -395,6 +426,7 @@ const decodeBody = async (encoding: Exclude<Encoding, "identity">, body: AsyncIt
   }
   if (failure !== undefined) {
     if (failure instanceof NetTooLarge || signal.aborted) throw failure
+    if (encoding === "deflate") throw refuse("content-encoding", url, `The deflate body is not a valid zlib stream: ${failure instanceof Error ? failure.message : String(failure)}`)
     throw new NetFailure({ url, stage: "response", detail: `The ${encoding} body could not be decompressed: ${failure instanceof Error ? failure.message : String(failure)}` })
   }
   return out
@@ -450,7 +482,31 @@ const resolveHop = async (url: URL, allowLan: boolean, resolver: Resolver, signa
 const positive = (v: number | undefined, fallback: number): number | undefined =>
   v === undefined ? fallback : Number.isFinite(v) && v > 0 ? v : undefined
 
-const run = async (input: string | URL, options: SafeFetchOptions, allowLan: boolean, signal: AbortSignal): Promise<SafeResponse> => {
+/**
+ * One connection attempt to one checked address, with its own budget inside the total one: when the budget runs out, the attempt is
+ * cancelled and the next address gets its turn, so one black-holed address cannot use up the whole deadline (review round 3,
+ * finding 7). The attempt's signal follows the request's, so cancelling the request (the total deadline, the caller) still stops a
+ * connection that has answered and whose body is being read.
+ */
+const attempt = async (connector: Connector, request: Omit<ConnectRequest, "signal">, signal: AbortSignal, budgetMs: number): Promise<ConnectResponse> => {
+  const own = new AbortController()
+  const follow = () => own.abort(signal.reason)
+  signal.addEventListener("abort", follow, { once: true })
+  const timer = setTimeout(() => own.abort(new Error(`No answer from ${request.address} within ${Math.round(budgetMs)} ms`)), budgetMs)
+  try {
+    const response = await raceAbort(Promise.resolve().then(() => connector({ ...request, signal: own.signal })), own.signal)
+    clearTimeout(timer)
+    return response
+  } catch (e) {
+    clearTimeout(timer)
+    signal.removeEventListener("abort", follow)
+    if (!own.signal.aborted) own.abort(e)
+    // The attempt's own budget ran out: say so; the request's own abort is the caller's to report.
+    throw own.signal.aborted && !signal.aborted && own.signal.reason instanceof Error ? own.signal.reason : e
+  }
+}
+
+const run = async (input: string | URL, options: SafeFetchOptions, allowLan: boolean, signal: AbortSignal, deadline: number): Promise<SafeResponse> => {
   const shownInput = String(input)
   const limit = positive(options.maxBytes, defaultMaxBytes)
   const maxRedirects = options.maxRedirects === undefined ? defaultMaxRedirects : Number.isInteger(options.maxRedirects) && options.maxRedirects >= 0 ? options.maxRedirects : undefined
@@ -472,13 +528,16 @@ const run = async (input: string | URL, options: SafeFetchOptions, allowLan: boo
     if (signal.aborted) throw signal.reason
     const resolved = await resolveHop(url, allowLan, resolver, signal)
     if (resolved instanceof NetRefused || resolved instanceof NetFailure) throw resolved
-    // Connect to an address we checked; try the next one only when a connection cannot be made.
+    // Connect to the addresses we checked, in order: each attempt gets an equal share of the time left (the last one all of it), and
+    // the next address is tried when an attempt fails or runs out of its share.
     let response: ConnectResponse | undefined
     let lastError = "no address"
-    for (const address of resolved.addresses) {
+    for (let k = 0; k < resolved.addresses.length; k++) {
       if (signal.aborted) throw signal.reason
+      const left = resolved.addresses.length - k
+      const budget = Math.max(1, (deadline - Date.now()) / left)
       try {
-        response = await raceAbort(Promise.resolve().then(() => connector({ url, address, method, headers, signal })), signal)
+        response = await attempt(connector, { url, address: resolved.addresses[k]!, method, headers }, signal, budget)
         break
       } catch (e) {
         if (signal.aborted) throw signal.reason
@@ -504,6 +563,11 @@ const run = async (input: string | URL, options: SafeFetchOptions, allowLan: boo
       if (!sameOrigin(url, checked)) {
         const kept: Record<string, string> = Object.create(null)
         for (const k of Object.keys(headers)) if (crossOriginHeaders.has(k)) kept[k] = headers[k]!
+        headers = kept
+      } else {
+        // A validator is about the URL it was sent to; the next hop is another resource (review round 3, finding 1).
+        const kept: Record<string, string> = Object.create(null)
+        for (const k of Object.keys(headers)) if (!conditionalHeaders.has(k)) kept[k] = headers[k]!
         headers = kept
       }
       redirects.push(checked.href)
@@ -565,7 +629,7 @@ const fetchChecked = (url: string | URL, options: SafeFetchOptions, allowLan: bo
         if (s.aborted) abort()
         else s.addEventListener("abort", abort, { once: true })
       }
-      return run(url, options, allowLan, controller.signal).finally(() => {
+      return run(url, options, allowLan, controller.signal, Date.now() + timeoutMs).finally(() => {
         clearTimeout(timer)
         for (const s of outside) s.removeEventListener("abort", abort)
         // Stop whatever connection is still open.

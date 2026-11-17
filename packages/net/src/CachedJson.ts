@@ -1,11 +1,17 @@
 import { Deferred, Effect, Exit } from "effect"
 import { createHash } from "node:crypto"
 import { NetAborted, NetBadJson, NetHttpStatus, NetRefused, type CachedJsonError, type SafeFetchError } from "./Errors.ts"
-import { checkHeaders, contentTypes, safeFetch, type SafeFetchOptions, type SafeResponse } from "./SafeFetch.ts"
+import { canonicalHeaders, checkHeaders, contentTypes, safeFetch, type SafeFetchOptions, type SafeResponse } from "./SafeFetch.ts"
 
 export interface JsonCacheEntry {
   readonly value: unknown
   readonly etag?: string
+  /**
+   * The URL the body came from, after redirects. The ETag is that resource's: a conditional request is sent only when the request
+   * goes to exactly this URL, and a 304 counts as a revalidation only when it comes from it (review round 3, finding 1). An entry
+   * without it is never revalidated.
+   */
+  readonly url?: string
   /** When the value was fetched or last confirmed (clock milliseconds): for the TTL and the age only, never for ordering. */
   readonly storedAt: number
   /** The `sequence()` number taken when the request that produced this entry started. */
@@ -14,9 +20,11 @@ export interface JsonCacheEntry {
 
 /**
  * Where fetched values live. The in-memory one below is the default; a store-backed one can implement this. `sequence` hands out
- * strictly increasing numbers (per cache, shared by every client of it); `setIfNewer` stores the entry only when the key holds
- * nothing or an entry with a lower `sequence`, and says whether it did. A cache shared by several processes must make
- * `setIfNewer` one atomic step (a transaction), and `sequence` monotonic across them.
+ * strictly increasing numbers (per cache, shared by every client of it); `setIfNewer` stores the entry only when no entry with the
+ * same or a higher `sequence` was stored for the key, and says whether it did. A cache shared by several processes must make
+ * `setIfNewer` one atomic step (a transaction), and `sequence` monotonic across them. A cache that evicts must remember, for an
+ * evicted key, the sequence it held (or a bound above it), and refuse older writes to it: otherwise a slow refresh that started
+ * before the eviction would store an older value after it. The in-memory cache keeps such a fence (review round 3, finding 4).
  */
 export interface JsonCache {
   readonly get: (key: string) => JsonCacheEntry | undefined
@@ -28,22 +36,49 @@ export interface JsonCache {
 /**
  * A bounded in-memory cache: the oldest-stored entry goes when `maxEntries` is exceeded. `maxEntries` is a whole number from 1 to
  * 1 000 000; anything else is a `RangeError` (a negative or fractional bound would never be met, `NaN` or `Infinity` would be none).
+ *
+ * The order of writes survives eviction: an evicted key's sequence is kept as a fence (at most `maxEntries` of them, oldest first);
+ * when a fence goes too, its sequence raises a floor that every write to a key without an entry or a fence must exceed. A write that
+ * a fence or the floor refuses is only a value not cached; it is never an older value served (review round 3, finding 4).
  */
 export const makeMemoryJsonCache = (maxEntries = 200): JsonCache => {
   if (!Number.isSafeInteger(maxEntries) || maxEntries < 1 || maxEntries > 1_000_000) throw new RangeError(`maxEntries must be a whole number from 1 to 1000000, not ${maxEntries}`)
   const map = new Map<string, JsonCacheEntry>()
+  const fences = new Map<string, number>()
+  let floor = 0
   let counter = 0
+  const fenceOf = (key: string): number => fences.get(key) ?? floor
   return {
     get: (key) => map.get(key),
     setIfNewer: (key, entry) => {
       const current = map.get(key)
-      if (current !== undefined && current.sequence >= entry.sequence) return false
+      if (current !== undefined ? current.sequence >= entry.sequence : fenceOf(key) >= entry.sequence) return false
       map.delete(key)
+      fences.delete(key)
       map.set(key, entry)
-      while (map.size > maxEntries) map.delete(map.keys().next().value!)
+      while (map.size > maxEntries) {
+        const [oldKey, old] = map.entries().next().value!
+        map.delete(oldKey)
+        fences.set(oldKey, old.sequence)
+        while (fences.size > maxEntries) {
+          const [fencedKey, fenced] = fences.entries().next().value!
+          fences.delete(fencedKey)
+          floor = Math.max(floor, fenced)
+        }
+      }
       return true
     },
-    delete: (key) => void map.delete(key),
+    delete: (key) => {
+      const current = map.get(key)
+      if (current === undefined) return
+      map.delete(key)
+      fences.set(key, Math.max(current.sequence, fences.get(key) ?? 0))
+      while (fences.size > maxEntries) {
+        const [fencedKey, fenced] = fences.entries().next().value!
+        fences.delete(fencedKey)
+        floor = Math.max(floor, fenced)
+      }
+    },
     sequence: () => ++counter
   }
 }
@@ -60,11 +95,15 @@ export interface JsonResult<A = unknown> {
 }
 
 export interface GetJsonOptions {
-  /** How long a value is served without asking. Not a number or below 0 counts as 0; `Infinity` is allowed. */
+  /** How long a value is served without asking. Not a number (a string, `NaN`, …) or below 0 counts as 0; `Infinity` is allowed. */
   readonly ttlMs: number
-  /** After the TTL, how long a failed refresh may fall back to the old value. Default 0 (never). A caller's abort never falls back. */
+  /** After the TTL, how long a failed refresh may fall back to the old value. Default 0 (never); not a number or below 0 counts as 0. A caller's abort never falls back. */
   readonly staleIfErrorMs?: number
-  /** Request headers (checked as `safeFetch` checks them). They are part of the cache key: Alice's `Authorization` never serves Bob. */
+  /**
+   * Request headers (checked as `safeFetch` checks them). They are part of the cache key: Alice's `Authorization` never serves Bob.
+   * Names are compared without case: each map is checked and lower-cased on its own (a name twice in one map is refused), then these
+   * override the client's `headers` name by name ("authorization" here replaces "Authorization" there).
+   */
   readonly headers?: Readonly<Record<string, string>>
   /** Options for the fetch (limits, signal, resolver, connector). The response type is always JSON. */
   readonly fetch?: Omit<SafeFetchOptions, "headers" | "method" | "accept">
@@ -107,7 +146,8 @@ const idOf = (f: object | undefined): number => {
   return id
 }
 
-const nonNegative = (v: number | undefined): number => (v !== undefined && v >= 0 ? v : 0)
+/** A duration option: a number from 0 (`Infinity` included), anything else — a string, a boolean, `NaN`, a negative number — 0. */
+const nonNegative = (v: unknown): number => (typeof v === "number" && v >= 0 ? v : 0)
 
 type Outcome = { readonly kind: "value"; readonly value: unknown; readonly ageMs: number; readonly source: "network" | "revalidated" }
 
@@ -150,33 +190,52 @@ export const makeCachedJson = (deps: CachedJsonDeps = {}): CachedJson => {
       // newer one stored, whatever the clocks say (review round 2, finding 18).
       const sequence = cache.sequence()
       const entry = cache.get(key)
-      const sent: Record<string, string> = { ...headers }
-      if (entry?.etag !== undefined) sent["if-none-match"] = entry.etag
       const { signal: _signal, ...limits } = options.fetch ?? {}
-      const response = yield* fetch(url, { ...limits, accept: contentTypes.json, method: "GET", headers: sent })
-      if (response.status === 304 && entry !== undefined) {
-        const etag = response.headers["etag"] ?? entry.etag
-        cache.setIfNewer(key, { value: entry.value, ...(etag !== undefined ? { etag } : {}), storedAt: now(), sequence })
-        return { kind: "value", value: entry.value, ageMs: 0, source: "revalidated" } satisfies Outcome
+      // A validator belongs to the resource it came from (review round 3, finding 1): it is sent only when this request goes to the
+      // URL the cached body came from, and `safeFetch` drops it on any redirect, so it never reaches another resource.
+      const validator = entry?.etag !== undefined && entry.url === url ? entry.etag : undefined
+      const ask = (conditional: boolean) => {
+        const sent: Record<string, string> = { ...headers }
+        if (conditional && validator !== undefined) sent["if-none-match"] = validator
+        return fetch(url, { ...limits, accept: contentTypes.json, method: "GET", headers: sent })
+      }
+      let response = yield* ask(true)
+      if (response.status === 304) {
+        // A revalidation only when the 304 answers the conditional request for the cached body's own URL; any other 304 (a redirect
+        // that ended elsewhere, a server that answers 304 unasked) says nothing about the cached value: ask again without conditions.
+        if (entry !== undefined && validator !== undefined && response.url === entry.url && response.redirects.length === 0) {
+          const etag = response.headers["etag"] ?? entry.etag
+          cache.setIfNewer(key, { value: entry.value, ...(etag !== undefined ? { etag } : {}), url: entry.url, storedAt: now(), sequence })
+          return { kind: "value", value: entry.value, ageMs: 0, source: "revalidated" } satisfies Outcome
+        }
+        response = yield* ask(false)
+        if (response.status === 304) return yield* Effect.fail(new NetHttpStatus({ url, status: 304 }))
       }
       if (response.status < 200 || response.status > 299) return yield* Effect.fail(new NetHttpStatus({ url, status: response.status }))
       let value: unknown
       try {
-        value = JSON.parse(response.text().replace(/^﻿/, ""))
+        value = JSON.parse(response.text().replace(/^\uFEFF/, ""))
       } catch (e) {
         return yield* Effect.fail(new NetBadJson({ url, detail: e instanceof Error ? e.message : String(e) }))
       }
       const etag = response.headers["etag"]
-      cache.setIfNewer(key, { value, ...(etag !== undefined ? { etag } : {}), storedAt: now(), sequence })
+      cache.setIfNewer(key, { value, ...(etag !== undefined ? { etag } : {}), url: response.url, storedAt: now(), sequence })
       return { kind: "value", value, ageMs: 0, source: "network" } satisfies Outcome
     })
 
   const getJson = <A>(url: string, options: GetJsonOptions): Effect.Effect<JsonResult<A>, CachedJsonError> =>
     Effect.gen(function* () {
+      // An already-aborted call fails as it would on a miss, also when the cache holds a fresh value (review round 3, finding 5).
+      if (options.fetch?.signal?.aborted === true) return yield* Effect.fail(new NetAborted({ url }))
       const ttl = nonNegative(options.ttlMs)
       const staleWindow = nonNegative(options.staleIfErrorMs)
-      const merged: Record<string, string> = { ...deps.headers, ...options.headers }
-      for (const k of Object.keys(merged)) if (conditional.has(k.toLowerCase())) delete merged[k]
+      // Each map is checked and lower-cased on its own, then merged name by name, the call's over the client's (finding 3).
+      const defaults = canonicalHeaders(url, deps.headers)
+      if (defaults instanceof NetRefused) return yield* Effect.fail(defaults)
+      const own = canonicalHeaders(url, options.headers)
+      if (own instanceof NetRefused) return yield* Effect.fail(own)
+      const merged: Record<string, string> = { ...defaults, ...own }
+      for (const k of Object.keys(merged)) if (conditional.has(k)) delete merged[k]
       const headers = checkHeaders(url, merged, contentTypes.json)
       if (headers instanceof NetRefused) return yield* Effect.fail(headers)
       const plain: Record<string, string> = { ...headers }

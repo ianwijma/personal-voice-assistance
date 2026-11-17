@@ -5,8 +5,8 @@ import { NetBadJson, NetFailure, NetHttpStatus } from "../src/Errors.ts"
 import type { SafeFetchOptions, SafeResponse } from "../src/SafeFetch.ts"
 import { bytes } from "./helpers.ts"
 
-const response = (status: number, body: string, headers: Record<string, string> = {}): SafeResponse => ({
-  url: "x", status, headers, body: bytes(body), redirects: [], text: () => body, encoding: "identity", contentType: "application/json"
+const response = (status: number, body: string, headers: Record<string, string> = {}, url = "http://x/a"): SafeResponse => ({
+  url, status, headers, body: bytes(body), redirects: [], text: () => body, encoding: "identity", contentType: "application/json"
 })
 
 const setup = () => {

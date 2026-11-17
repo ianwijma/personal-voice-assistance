@@ -15,12 +15,14 @@ Outgoing HTTP for URLs a model or a user chose, and for public APIs. No dependen
   credentials in the URL, ports 80/443, local names refused, size limit after decompression (default 2 MiB), total time limit
   (default 6 s), honours `signal` and Effect interruption (an already-aborted signal starts no lookup and no connection, and a lookup
   or connection that fails after an abort never becomes an unhandled rejection). Requests ask for `identity`; a body that comes
-  compressed anyway (gzip, deflate — zlib-wrapped or raw, told apart from its first two bytes whatever the chunk boundaries — and br)
-  is decompressed as it arrives by Node's streaming decompressors and its decompressed size counts; an empty body is empty; any
-  other encoding is refused. Request headers are
+  compressed anyway (gzip, deflate and br) is decompressed as it arrives by Node's streaming decompressors and its decompressed
+  size counts; an empty body is empty; any other encoding is refused. `deflate` is the zlib format (RFC 9110 §8.4.1.2): a deflate
+  body that is not a zlib stream (raw deflate included) is refused with the `content-encoding` rule, whatever the chunk boundaries. Request headers are
   checked: `Host`, hop-by-hop and framing headers and `Accept-Encoding` are refused, as are characters a header cannot hold; the Host
   header and the TLS name come from the URL only; a redirect to another origin keeps only `Accept`, `Accept-Language` and
-  `User-Agent`. `SafeResponse` has `contentType`, `encoding` and a `text()` that honours the charset. HEAD reads no body and is not
+  `User-Agent`, and any redirect drops the conditional headers (`If-None-Match`, …: a validator is about the URL it was sent to).
+  A name with several addresses: they are tried in order, each attempt with an equal share of the time left (the last one all of
+  it), so a black-holed first address does not use up the deadline; an attempt that runs out of its share is cancelled. `SafeResponse` has `contentType`, `encoding` and a `text()` that honours the charset. HEAD reads no body and is not
   limited by one.
 - There is no LAN option on `safeFetch`. `fetchOwnerConfiguredLan` is the separate function for endpoints the owner configured (Home
   Assistant, a LAN SearXNG): it also allows private, unique-local and CGNAT addresses, local names and other ports; loopback,
@@ -29,15 +31,21 @@ Outgoing HTTP for URLs a model or a user chose, and for public APIs. No dependen
   content-type | content-encoding | options`, plus `address` and `addressClass`), `NetTooLarge`, `NetTimeout`, `NetAborted`,
   `NetFailure` (`stage`: `dns | connect | response`). The resolver and the connector are options, so tests need no network.
 - `makeCachedJson({ cache?, now?, fetch?, headers? }).getJson(url, { ttlMs, staleIfErrorMs?, headers?, fetch? })`: JSON GET (always
-  the JSON preset) with TTL, `ETag` / `If-None-Match`, stale-if-error and an injectable clock. The cache key is the URL plus the request
+  the JSON preset) with TTL, `ETag` / `If-None-Match`, stale-if-error and an injectable clock. An entry remembers the URL its body
+  came from: `If-None-Match` is sent only when the request goes to that URL, and a 304 renews the entry only when it comes from that
+  URL without a redirect; any other 304 makes it ask again without conditions (a second 304 is `NetHttpStatus`). The client's
+  `headers` and the call's are each checked and lower-cased, then merged name by name, the call's winning. `ttlMs` and
+  `staleIfErrorMs` that are not numbers count as 0. An already-aborted `signal` fails with `NetAborted` also on a fresh hit. The cache key is the URL plus the request
   headers (`representationKey`, hashed), so one caller's `Authorization` never serves another. Callers that miss at the same time share
   one request; each keeps its own signal (it fails with `NetAborted`, never with a stale value) and its own interruption, and the request
   is cancelled when no one waits any more. The stale fallback measures the value's age after the failed request. Refreshes are
   ordered by the cache's monotonic `sequence()`, taken when a request starts, not by the clock: a slower request that started earlier
   never replaces what a later one stored (`setIfNewer`), also between clients that share a cache and in the same millisecond.
-  In-memory `makeMemoryJsonCache(maxEntries)` (1 to 1 000 000, else `RangeError`); implement `JsonCache` (`get`, `setIfNewer`,
-  `delete`, `sequence`) to back it with the store — a store shared by processes makes `setIfNewer` one transaction and `sequence`
-  monotonic across them.
+  In-memory `makeMemoryJsonCache(maxEntries)` (1 to 1 000 000, else `RangeError`); it keeps the order across eviction: an evicted
+  key's sequence stays as a fence (at most `maxEntries`, then a floor), so a slow refresh that started before the eviction cannot
+  store an older value after it (it is only not cached). Implement `JsonCache` (`get`, `setIfNewer`, `delete`, `sequence`) to back it
+  with the store — a store shared by processes makes `setIfNewer` one transaction and `sequence` monotonic across them, and one that
+  evicts keeps such a fence.
 - `userAgent(contact)`: `personal-voice-assistance/1 (contact)`, or the token alone without a contact. `contact` is the Home section's
   `HOME_API_CONTACT` (which refuses characters a header cannot hold when saved); whatever it is given, the result is a legal header
   value (anything outside ASCII is percent-encoded).
