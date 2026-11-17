@@ -359,7 +359,9 @@ export const AssistantCreate = Schema.Struct({
   /** Every field except `id` and `rev`; the wizard's "Start from" is `copyOf`, and the body still carries every field. */
   assistant: AssistantBody,
   copyOf: Schema.optionalKey(AssistantId),
-  placements: Schema.optionalKey(Schema.Array(AssistantPlacement).check(Schema.isMaxLength(MAX_ASSISTANTS * 4)))
+  placements: Schema.optionalKey(Schema.Array(AssistantPlacement).check(Schema.isMaxLength(MAX_ASSISTANTS * 4))),
+  /** Additive: keep a voice whose hosted provider has no key yet (the voice check's warning). */
+  saveAnyway: Schema.optionalKey(Schema.Boolean)
 })
 
 /** Admin only: save a whole assistant. `assistant.rev` must equal the stored rev, else `stale`. */

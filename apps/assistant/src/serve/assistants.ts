@@ -261,6 +261,21 @@ export const makeAssistants = (options: AssistantsOptions): Assistants => {
     return fail("invalid_settings", `${problem.message} Save anyway to keep it.`, { warnings: [{ key: "voice", message: problem.message }] })
   }
 
+  /**
+   * An assistant's own voice (docs/ASSISTANTS.md §2.2), through the same check and shapes as a device voice. A voice
+   * that is new (`create`) or changed is refused when it cannot be spoken. A voice the stored assistant already has
+   * is never refused (that would lock the assistant's other edits): a problem with it is a warning that `saveAnyway`
+   * overrides, so a fine unchanged voice is not affected.
+   */
+  const assistantVoiceRefusal = (voice: VoiceRefJson, before: VoiceRefJson | undefined, saveAnyway: boolean): AssistantResult | undefined => {
+    const problem = options.voiceProblem?.(voice)
+    if (problem === undefined) return undefined
+    const unchanged = before !== undefined && before.provider === voice.provider && before.voiceId === voice.voiceId
+    if (problem.level === "error" && !unchanged) return refusal([{ code: "invalid", path: "voice", message: problem.message }])
+    if (saveAnyway) return undefined
+    return fail("invalid_settings", `${problem.message} Save anyway to keep it.`, { warnings: [{ key: "voice", message: problem.message }] })
+  }
+
   const ownWith = (own: DeviceOwn, patch: DeviceSettingsPatch, keys: ReadonlyArray<DeviceSettingsKey>): DeviceOwn => {
     const out: Record<string, unknown> = { ...own }
     for (const key of keys) {
@@ -413,6 +428,8 @@ export const makeAssistants = (options: AssistantsOptions): Assistants => {
       const predicted = makeAssistantId(body.name, store.assistants().map((a) => a.id))
       const refused = placementIssues(predicted, placements)
       if (refused !== undefined) return Effect.succeed(refused)
+      const voiceRefused = assistantVoiceRefusal(body.voice, undefined, message.saveAnyway === true)
+      if (voiceRefused !== undefined) return Effect.succeed(voiceRefused)
       return Effect.gen(function*() {
         const created = yield* store.createAssistant(body)
         for (const p of placements) {
@@ -445,6 +462,8 @@ export const makeAssistants = (options: AssistantsOptions): Assistants => {
       if (!knownIds().has(message.assistant.id)) return Effect.succeed(fail("unknown_assistant", `There is no assistant ${message.assistant.id}.`))
       const issues = assistantIssues(message.assistant)
       if (issues.length > 0) return Effect.succeed(refusal(issues))
+      const voiceRefused = assistantVoiceRefusal(message.assistant.voice, store.assistants().find((x) => x.id === message.assistant.id)?.voice, message.saveAnyway === true)
+      if (voiceRefused !== undefined) return Effect.succeed(voiceRefused)
       const memory = memoryRefusal({ assistant: message.assistant }, message.saveAnyway === true, "hearing.model") ??
         handlesRefusal(message.assistant, message.saveAnyway === true)
       if (memory !== undefined) return Effect.succeed(memory)

@@ -152,7 +152,8 @@ Validation on save (errors refuse it, warnings ask "Save anyway", as sections do
 - Errors: the bounds above; a duplicate name; `finalSilenceMs ≤ eagerSilenceMs`; `eagerEotThreshold > 0` and
   `≥ eotThreshold`; an `own` key that is not an `overridable` field of that module, or a value its field refuses; an
   `offTools` name the module does not have; a local voice or model that is not downloaded (as the voice-provider
-  design refuses one).
+  design refuses one). Applies to `assistant.create` and to an `assistant.save` that changes the voice; an unchanged
+  voice that became unavailable is only a warning (docs/LOOKS-AND-VOICES.md §5.0).
 - Warnings: an account that is not set up; a hosted voice provider without a key; Deepgram without a key; an empty
   Handles on an assistant that is on a TypeSafe device.
 

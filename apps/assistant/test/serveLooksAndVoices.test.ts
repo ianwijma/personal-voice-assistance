@@ -5,7 +5,9 @@
 import { Llm, type LlmEvent, Tts, type TtsAudio } from "@pva/core"
 import type { ClientMessage, Look, ServerMessage, ServerMessageOf, TraceInfo } from "@pva/protocol"
 import { Effect, Stream } from "effect"
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs"
+import * as SherpaTts from "@pva/tts-sherpa"
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs"
+import { dirname } from "node:path"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterEach, describe, expect, it, vi } from "vitest"
@@ -149,7 +151,8 @@ const saveDevice = (a: ScriptedClient, id: string, patch: Json, extra: Json = {}
   request(a, { type: "device.save", target: { kind: "device", id }, rev: deviceRev(id), settings: patch as any, ...extra } as RequestInput)
 const saveType = (a: ScriptedClient, patch: Json, extra: Json = {}) =>
   request(a, { type: "device.save", target: { kind: "type", type: "web-voice" }, rev: typeRev(), settings: patch as any, ...extra } as RequestInput)
-const saveAssistant = (a: ScriptedClient, assistant: Json) => request(a, { type: "assistant.save", assistant: assistant as any })
+/** No local voice is downloaded here, so an assistant's unchanged voice warns on every save: these helpers are about the look, and say "Save anyway". */
+const saveAssistant = (a: ScriptedClient, assistant: Json, extra: Json = { saveAnyway: true }) => request(a, { type: "assistant.save", assistant: assistant as any, ...extra } as RequestInput)
 
 /** A voice page of `deviceId` that owns the audio and is known to the server (its record saved). */
 const knownDevice = async (deviceId: string) => {
@@ -442,5 +445,141 @@ describe("device.setup follows the looks", () => {
     expect(await saveAssistant(a, { ...assistantNamed("alpha"), look: LOOK_B })).toMatchObject({ ok: true })
     await sleep(150)
     expect(page.messages.slice(from).some((m) => m.type === "device.setup")).toBe(false)
+  })
+})
+
+/** A model directory in which only `presets` (names such as "en_US-lessac-medium") count as downloaded. */
+const voiceDirWith = (dataDir: string, presets: ReadonlyArray<string>): string => {
+  const dir = join(dataDir, "some-voices")
+  for (const name of presets) {
+    for (const file of Object.values(SherpaTts.presetFiles(SherpaTts.presets[name]!, dir))) {
+      mkdirSync(dirname(file), { recursive: true })
+      writeFileSync(file, "x")
+    }
+  }
+  return dir
+}
+const withoutIdentity = (a: Json): Json => {
+  const { id: _id, rev: _rev, ...body } = a
+  return body
+}
+
+describe("an assistant's own voice is checked like a device voice", () => {
+  const created = (a: ScriptedClient, voice: string, name: string, extra: Json = {}) =>
+    request(a, { type: "assistant.create", assistant: { ...withoutIdentity(assistantNamed("alpha")), name, voice: voiceRef(voice) } as any, ...extra } as RequestInput)
+
+  it("assistant.create: a local voice that is not downloaded (or unknown) is refused, a hosted one without a key asks 'save anyway'", async () => {
+    const dataDir = await dataDirWith()
+    await start(dataDir, { TTS_SHERPA_MODEL_DIR: voiceDirWith(dataDir, ["en_US-lessac-medium"]) })
+    const a = await admin()
+    const count = () => server!.handle.store.assistants().length
+    const before = count()
+    expect(await created(a, KOKORO, "Charlie")).toMatchObject({ ok: false, error: { code: "invalid_settings", fieldErrors: [{ key: "voice" }] } })
+    expect(await created(a, KOKORO, "Charlie", { saveAnyway: true })).toMatchObject({ ok: false })
+    expect(await created(a, "sherpa:no-such", "Charlie")).toMatchObject({ ok: false })
+    expect(await created(a, CARTESIA, "Charlie")).toMatchObject({ ok: false, error: { code: "invalid_settings", warnings: [{ key: "voice" }] } })
+    expect(count()).toBe(before)
+    expect(await created(a, CARTESIA, "Charlie", { saveAnyway: true })).toMatchObject({ ok: true })
+    expect(await created(a, PIPER, "Delta")).toMatchObject({ ok: true })
+    expect(count()).toBe(before + 2)
+  })
+
+  it("assistant.save: a new or changed voice is checked; an unchanged voice that is fine is not affected; an unchanged one that became unavailable only warns", async () => {
+    const dataDir = await dataDirWith()
+    await start(dataDir, { TTS_SHERPA_MODEL_DIR: voiceDirWith(dataDir, ["en_US-lessac-medium"]) })
+    const a = await admin()
+    const alpha = () => assistantNamed("alpha")
+    // Alpha's voice (PIPER) is downloaded: an ordinary save needs no question.
+    expect(await saveAssistant(a, { ...alpha(), purpose: "Other" }, {})).toMatchObject({ ok: true })
+    // A changed voice that is not downloaded is refused, and "Save anyway" does not override it.
+    expect(await saveAssistant(a, { ...alpha(), voice: voiceRef(KOKORO) }, {})).toMatchObject({ ok: false, error: { code: "invalid_settings", fieldErrors: [{ key: "voice" }] } })
+    expect(await saveAssistant(a, { ...alpha(), voice: voiceRef(KOKORO) })).toMatchObject({ ok: false })
+    expect(alpha().voice).toEqual(voiceRef(PIPER))
+    // A hosted voice without a key asks; "Save anyway" keeps it.
+    expect(await saveAssistant(a, { ...alpha(), voice: voiceRef(CARTESIA) }, {})).toMatchObject({ ok: false, error: { code: "invalid_settings", warnings: [{ key: "voice" }] } })
+    expect(alpha().voice).toEqual(voiceRef(PIPER))
+    expect(await saveAssistant(a, { ...alpha(), voice: voiceRef(CARTESIA) })).toMatchObject({ ok: true })
+    // Unchanged hosted voice, still without a key: a warning, not an error; other edits ask once, then save.
+    expect(await saveAssistant(a, { ...alpha(), purpose: "Again" }, {})).toMatchObject({ ok: false, error: { warnings: [{ key: "voice" }] } })
+    expect(await saveAssistant(a, { ...alpha(), purpose: "Again" })).toMatchObject({ ok: true })
+    // An unchanged local voice that is no longer downloaded (bravo's KOKORO): warned, never refused.
+    const bravo = () => assistantNamed("bravo")
+    expect(await saveAssistant(a, { ...bravo(), purpose: "Other" }, {})).toMatchObject({ ok: false, error: { code: "invalid_settings", warnings: [{ key: "voice" }] } })
+    expect(await saveAssistant(a, { ...bravo(), purpose: "Other" })).toMatchObject({ ok: true })
+    expect(bravo().purpose).toBe("Other")
+  })
+})
+
+describe("devices as users of a voice", () => {
+  const catalogue = async (dataDirToken: string) => {
+    const response = await fetch(`${server!.url}/api/voices?provider=sherpa`, { headers: { Authorization: `Bearer ${dataDirToken}` } })
+    const body = await response.json() as any
+    return (key: string) => body.providers.flatMap((p: any) => p.voices).find((v: any) => v.key === key)
+  }
+  const login = async () => {
+    const client = await connect()
+    const { token, snapshot } = await client.admin(TEST_ADMIN_PASSWORD)
+    return { client, token, snapshot }
+  }
+  const ttsResource = async (key: string) => {
+    const { snapshot } = await login()
+    return (snapshot.engine.resources ?? []).find((r) => r.kind === "tts" && r.key === key)
+  }
+
+  it("a device's own voice, the type's, and Reset: the catalogue lists them beside the assistants, from the effective settings", async () => {
+    const dataDir = await dataDirWith()
+    await start(dataDir, { TTS_SHERPA_MODEL_DIR: voiceDirWith(dataDir, ["en_US-lessac-medium", "kokoro-af_heart", "nl_NL-pim-medium"]) })
+    await knownDevice("device-a")
+    await knownDevice("device-b")
+    const { client: a, token } = await login()
+    const usersOf = async (key: string) => (await catalogue(token))(key)
+    const PIM = "sherpa:nl_NL-pim-medium"
+    // Nothing yet: the assistants only.
+    expect(await usersOf(PIPER)).toMatchObject({ usedBy: ["alpha"], usedByDevices: [] })
+    expect(await usersOf(PIM)).toMatchObject({ usedBy: [], usedByDevices: [] })
+    // A device's own voice.
+    expect(await saveDevice(a, "device-a", { voice: ownVoice(PIM) })).toMatchObject({ ok: true })
+    expect(await usersOf(PIM)).toMatchObject({ usedBy: [], usedByDevices: [{ target: { kind: "device", id: "device-a" }, name: settings().devices["device-a"]!.name }] })
+    // The assistants' voices are unchanged: a device voice is not an assistant's.
+    expect(await usersOf(PIPER)).toMatchObject({ usedBy: ["alpha"], usedByDevices: [] })
+    // The type's defaults: "Every browser" and every device that follows them (device-b), device-a keeps its own.
+    expect(await saveType(a, { voice: ownVoice(KOKORO) })).toMatchObject({ ok: true })
+    const kokoro = await usersOf(KOKORO)
+    expect(kokoro.usedBy).toEqual(["bravo"])
+    expect(kokoro.usedByDevices).toEqual(expect.arrayContaining([
+      { target: { kind: "type", type: "web-voice" }, name: "Every browser" },
+      { target: { kind: "device", id: "device-b" }, name: settings().devices["device-b"]!.name }
+    ]))
+    expect(kokoro.usedByDevices).toHaveLength(2)
+    expect((await usersOf(PIM)).usedByDevices).toHaveLength(1)
+    // Reset: device-a follows the type's voice (it is a user of that one), no longer of its own.
+    expect(await saveDevice(a, "device-a", { voice: null })).toMatchObject({ ok: true })
+    expect((await usersOf(PIM)).usedByDevices).toEqual([])
+    expect((await usersOf(KOKORO)).usedByDevices).toHaveLength(3)
+    // A device that follows its assistants again is gone from the list.
+    expect(await saveDevice(a, "device-b", { voice: { from: "assistant" } })).toMatchObject({ ok: true })
+    expect((await usersOf(KOKORO)).usedByDevices.map((u: any) => u.target)).toEqual(expect.not.arrayContaining([{ kind: "device", id: "device-b" }]))
+  })
+
+  it("resource status: pool users 'assistant@place' count as the assistant; the devices are named, never the raw key", async () => {
+    const dataDir = await dataDirWith()
+    await start(dataDir)
+    await knownDevice("device-a")
+    const { client: a } = await login()
+    expect(await saveDevice(a, "device-a", { voice: ownVoice(CARTESIA) }, { saveAnyway: true })).toMatchObject({ ok: true })
+    await until("the device voice is built", () => builds.includes(CARTESIA))
+    await until("the device voice is ready", () => server!.handle.resources.status().some((r) => r.key === CARTESIA && r.state === "ready"))
+    const resource = await ttsResource(CARTESIA)
+    expect(resource).toMatchObject({
+      usedBy: ["alpha", "bravo"],
+      usedByDevices: [{ target: { kind: "device", id: "device-a" }, name: settings().devices["device-a"]!.name }]
+    })
+    expect(JSON.stringify(resource)).not.toContain("@")
+    // The assistants' own voices have no devices.
+    expect((await ttsResource(KOKORO))?.usedByDevices).toBeUndefined()
+    // Reset: the device is gone from the list.
+    expect(await saveDevice(a, "device-a", { voice: null })).toMatchObject({ ok: true })
+    await until("the device voice is released", () => released.includes(CARTESIA))
+    expect((await ttsResource(CARTESIA))?.usedByDevices ?? []).toEqual([])
   })
 })
