@@ -31,7 +31,7 @@ import type { Agent } from "./Agent.ts"
 import { buildDecisionPlan, type DecisionProvider } from "./Decision.ts"
 import { type ExecutionGateway, type GatewayAccess, type GatewayOptions, isGatewayRefusal, makeExecutionGateway } from "./Gateway.ts"
 import { makeIssueRegistry, type IssueRegistry } from "./Issues.ts"
-import { type EventBus, hostEvent, makeEventBus } from "./EventBus.ts"
+import { type EventBus, hostEvent, makeEventBus, type SubscriptionGate } from "./EventBus.ts"
 import { type HouseholdStore, makeClosedStore } from "./HouseholdStore.ts"
 import { type AssistantModule, type ContextProvider, type Tool, toolMetadata } from "./Module.ts"
 import {
@@ -1796,7 +1796,7 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
       return Effect.uninterruptibleMask((restore) =>
         Effect.flatMap(Scope.make(), (scope) => {
           pendingShared.add(scope)
-          const context = { settings: settings as never, ...servicesFor(entry, "all") }
+          const context = { settings: settings as never, ...servicesFor(entry, "all", scope) }
           return restore(
             Effect.suspend(() => shared(context)).pipe(
               Scope.provide(scope),
@@ -1888,7 +1888,7 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
    * The context members of a version 2 module, in `shared` (`target` "all") and in `start` (one instance). A later PR
    * adds its member here, one line, and its field in `ModuleServicesV2`.
    */
-  function servicesFor(entry: Entry, target: { readonly rec: Instance; readonly generation: number } | "all"): ModuleServicesV2 {
+  function servicesFor(entry: Entry, target: { readonly rec: Instance; readonly generation: number } | "all", sharedScope?: Scope.Closeable): ModuleServicesV2 {
     return {
       host: {
         routeTokens: routeTokensFor(entry.def.id),
@@ -1899,7 +1899,23 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
         requestRestart: (reason) => requestRestart(entry, target, reason)
       },
       store: household.store.forModule(entry.def.id),
-      events: household.events.forModule(entry.def.id)
+      events: household.events.forModule(entry.def.id, sharedScope === undefined ? undefined : { gate: sharedGate(entry, sharedScope) })
+    }
+  }
+
+  /**
+   * The event subscriptions of a `shared` part live with its generation: they receive nothing while it is a candidate
+   * (not published yet), and end when it is replaced, retired or never published (P4; the host keeps this in one
+   * place so the lower PR's host rework can refit it).
+   */
+  function sharedGate(entry: Entry, scope: Scope.Closeable): SubscriptionGate {
+    let published = false
+    return () => {
+      if (entry.shared?.scope === scope) {
+        published = true
+        return "live"
+      }
+      return published || !pendingShared.has(scope) ? "ended" : "waiting"
     }
   }
 

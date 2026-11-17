@@ -1,11 +1,12 @@
 import { randomBytes } from "node:crypto"
 import { chmod, mkdir, open, readdir, rename, rm, stat } from "node:fs/promises"
 import { dirname, join } from "node:path"
+import { Worker } from "node:worker_threads"
 
 /**
- * Files of the household store (docs/STORING-DATA.md "Backups"): everything private to the user (directories
- * `0700`, files `0600`, whatever the umask), every copy written to a temporary file of its own and published with one
- * `rename`, and the retention of every archive the store makes.
+ * Files of the household store (docs/STORING-DATA.md "Backups"): everything private to the user (directories `0700`,
+ * files `0600`, whatever the umask), every copy written to a temporary file of its own and published with one
+ * `rename`, the retention of every backup the store makes, and the checkpoint after a removal.
  */
 
 /** Run `run` while the data directory's writer lock cannot be released (serve); default: just run it. */
@@ -17,15 +18,15 @@ export const privateDir = async (dir: string): Promise<void> => {
   await mkdir(dir, { recursive: true, mode: 0o700 })
 }
 
-/** Narrow an existing file to 0600 (the database and its sidecars, made by an older version or by hand). */
+/** Narrow an existing file to 0600 (the database and its sidecars, a backup made by an older version or by hand). */
 export const narrow = async (path: string): Promise<void> => {
   const s = await stat(path).catch(() => undefined)
   if (s !== undefined && (s.mode & 0o077) !== 0) await chmod(path, s.mode & 0o700)
 }
 
-/** An empty new file of our own beside `path` (`<path>.<tag>-<pid>-<random>`), mode 0600. */
-export const freshFile = async (path: string, tag: string): Promise<string> => {
-  const file = `${path}.${tag}-${process.pid}-${randomBytes(6).toString("hex")}`
+/** An empty new file of our own beside `path` (`<path>.part-<pid>-<random>`), mode 0600. */
+export const freshFile = async (path: string): Promise<string> => {
+  const file = `${path}.part-${process.pid}-${randomBytes(6).toString("hex")}`
   const handle = await open(file, "wx", 0o600)
   await handle.close()
   return file
@@ -55,13 +56,14 @@ export const sqlite = () => import("node:sqlite")
 
 /**
  * A consistent copy of the database `source` (with what its write-ahead log holds) at `path`, made from a read
- * connection of its own with SQLite's backup API in one step on a worker thread: the store's connection, and with it
- * every turn, is never held. Written to a fresh temporary file, synced, published with one `rename`.
+ * connection of its own with SQLite's backup API in one step on SQLite's worker thread: the store's connection, and
+ * with it every turn, is never held. Written to a fresh temporary file, made one self-contained file (no log beside
+ * it), synced, published with one `rename`.
  */
 export const copyDatabase = async (source: string, path: string): Promise<void> => {
   const { DatabaseSync, backup } = await sqlite()
   await privateDir(dirname(path))
-  const part = await freshFile(path, "part")
+  const part = await freshFile(path)
   try {
     const from = new DatabaseSync(source, { readOnly: true })
     try {
@@ -69,7 +71,12 @@ export const copyDatabase = async (source: string, path: string): Promise<void> 
     } finally {
       from.close()
     }
-    selfContained(DatabaseSync, part)
+    const copy = new DatabaseSync(part)
+    try {
+      copy.exec("PRAGMA journal_mode = DELETE")
+    } finally {
+      copy.close()
+    }
     await narrow(part)
     await fsyncFile(part)
     await rename(part, path)
@@ -80,24 +87,11 @@ export const copyDatabase = async (source: string, path: string): Promise<void> 
   }
 }
 
-/**
- * Make a fresh copy one file with no log of its own: the backup API copies the source's WAL flag, and a WAL-mode file
- * leaves `-wal` and `-shm` files beside it whenever it is read. The server switches the database back to WAL.
- */
-const selfContained = (DatabaseSync: typeof import("node:sqlite").DatabaseSync, file: string) => {
-  const db = new DatabaseSync(file)
-  try {
-    db.exec("PRAGMA journal_mode = DELETE")
-  } finally {
-    db.close()
-  }
-}
-
 /** Copy a finished file to `path` the same way (the second backup directory). */
 export const copyFilePrivately = async (from: string, path: string): Promise<void> => {
   const { copyFile } = await import("node:fs/promises")
-  await mkdir(dirname(path), { recursive: true, mode: 0o700 })
-  const part = await freshFile(path, "part")
+  await privateDir(dirname(path))
+  const part = await freshFile(path)
   try {
     await copyFile(from, part)
     await chmod(part, 0o600)
@@ -110,6 +104,47 @@ export const copyFilePrivately = async (from: string, path: string): Promise<voi
   }
 }
 
+// ---- The checkpoint after a removal
+
+const CHECKPOINT = `
+const { parentPort, workerData } = require("node:worker_threads")
+process.emitWarning = () => {}
+const { DatabaseSync } = require("node:sqlite")
+let db
+try {
+  db = new DatabaseSync(workerData.file)
+  db.exec("PRAGMA busy_timeout = 0")
+  // The bulk of the copying without the writer lock; then the truncation, which takes it briefly.
+  db.prepare("PRAGMA wal_checkpoint(PASSIVE)").get()
+  const r = db.prepare("PRAGMA wal_checkpoint(TRUNCATE)").get()
+  parentPort.postMessage({ ok: Number(r.busy) === 0 })
+} catch (e) {
+  parentPort.postMessage({ ok: false, error: String(e) })
+} finally {
+  try { db?.close() } catch {}
+}
+`
+
+/**
+ * Checkpoint the database's write-ahead log into the file and empty it (`wal_checkpoint(TRUNCATE)`), on a worker
+ * thread with a connection of its own that never waits: the event loop is not held by the copying. `true` when the
+ * log is empty afterwards; `false` when a reader holds an older snapshot (try again later).
+ */
+export const checkpointFile = (file: string): Promise<boolean> =>
+  new Promise((resolve) => {
+    const worker = new Worker(CHECKPOINT, { eval: true, workerData: { file } })
+    let settled = false
+    const done = (ok: boolean) => {
+      if (settled) return
+      settled = true
+      resolve(ok)
+      void worker.terminate().catch(() => undefined)
+    }
+    worker.once("message", (m: { ok: boolean }) => done(m.ok === true))
+    worker.once("error", () => done(false))
+    worker.once("exit", () => done(false))
+  })
+
 // ---- Retention
 
 /** Daily backups: `household-<date>.db`. */
@@ -121,30 +156,60 @@ const PART = /\.part-\d+-[0-9a-f]{12}$/
 
 const DAY = 24 * 60 * 60 * 1000
 
+export interface PruneResult {
+  /** Files removed. */
+  readonly removed: ReadonlyArray<string>
+  /** Files that should have gone and could not be removed (with why). */
+  readonly failed: ReadonlyArray<string>
+}
+
+/** The newest daily or pre-upgrade backup's time in `dir`, or `undefined`. */
+export const lastBackupIn = async (dir: string): Promise<number | undefined> => {
+  let newest: number | undefined
+  for (const n of await readdir(dir).catch(() => [] as Array<string>)) {
+    if (!DAILY.test(n) && !BEFORE.test(n)) continue
+    const s = await stat(join(dir, n)).catch(() => undefined)
+    if (s !== undefined && (newest === undefined || s.mtimeMs > newest)) newest = s.mtimeMs
+  }
+  return newest
+}
+
+/** The end of the local day a backup's name gives (`household-<date>….db`), in epoch ms. */
+const endOfNamedDay = (name: string): number | undefined => {
+  const m = /^household-(\d{4})-(\d{2})-(\d{2})/.exec(name)
+  return m === null ? undefined : new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]) + 1).getTime()
+}
+
 /**
- * Remove what is too old in `dir`, as docs/STORING-DATA.md "What is kept how long" says: daily backups beyond the
- * newest `keep` and every one older than `keep` days except the newest; pre-upgrade backups
- * older than `keep` days; temporary files of copies older than a day (a copy that died). Never anything else.
+ * Apply docs/STORING-DATA.md "What is kept how long" to `dir`: every backup the store makes (daily, before an upgrade)
+ * is removed once it is older than `keep` days, by the day in its name or by its file time, whichever is older,
+ * without exception; daily backups beyond the newest `keep` too; a temporary file of a copy older than a day (a copy
+ * that died) too. Every backup that stays is narrowed to `0600` (one made by an older version, or copied by hand).
+ * Nothing else is touched. Only a removal that succeeded is reported as removed; the others are `failed`.
  */
-export const pruneArchives = async (dir: string, now: number, keep: number): Promise<ReadonlyArray<string>> => {
+export const pruneArchives = async (dir: string, now: number, keep: number): Promise<PruneResult> => {
   const names = await readdir(dir).catch(() => [] as Array<string>)
   const removed: Array<string> = []
-  const drop = async (name: string) => {
-    await rm(join(dir, name), { force: true }).catch(() => undefined)
-    removed.push(name)
-  }
-  const ageOf = async (name: string) => {
-    const s = await stat(join(dir, name)).catch(() => undefined)
-    return s === undefined ? 0 : now - s.mtimeMs
-  }
-  const daily = names.filter((n) => DAILY.test(n)).sort().reverse()
-  for (const [i, name] of daily.entries()) {
-    if (i === 0) continue
-    if (i >= keep || (await ageOf(name)) > keep * DAY) await drop(name)
-  }
+  const failed: Array<string> = []
+  const beyondNewest = new Set(names.filter((n) => DAILY.test(n)).sort().reverse().slice(keep))
   for (const name of names) {
-    if (BEFORE.test(name) && (await ageOf(name)) > keep * DAY) await drop(name)
-    else if (PART.test(name) && (await ageOf(name)) > DAY) await drop(name)
+    const managed = DAILY.test(name) || BEFORE.test(name)
+    const part = PART.test(name)
+    if (!managed && !part) continue
+    const path = join(dir, name)
+    const s = await stat(path).catch(() => undefined)
+    if (s === undefined) continue
+    const age = Math.max(now - s.mtimeMs, now - (endOfNamedDay(name) ?? Infinity))
+    if ((managed && (age > keep * DAY || beyondNewest.has(name))) || (part && now - s.mtimeMs > DAY)) {
+      try {
+        await rm(path)
+        removed.push(name)
+      } catch (e) {
+        failed.push(`${name}: ${e instanceof Error ? e.message : String(e)}`)
+      }
+    } else if (managed) {
+      await narrow(path).catch((e) => failed.push(`${name}: could not be made private (${e instanceof Error ? e.message : String(e)})`))
+    }
   }
-  return removed
+  return { removed, failed }
 }

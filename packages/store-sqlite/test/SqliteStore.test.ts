@@ -73,26 +73,38 @@ describe("SQLite household store", () => {
       }
     }))
 
-  it.effect("a core service's table joins a module's transaction: both commit or neither", () =>
+  it.effect("a core service's table joins a module's transaction through its handle: both commit or neither", () =>
     Effect.gen(function*() {
       const store = yield* makeSqliteStore({ filename: ":memory:" })
       yield* store.prepare([{ id: "timers", storage: { collections: [items] } }])
       const jobs = store.core("scheduler")
-      yield* jobs.migrate(["CREATE TABLE core_scheduler__jobs (id TEXT PRIMARY KEY, module TEXT NOT NULL)"])
+      yield* jobs.migrate(["CREATE TABLE core_scheduler__jobs (id TEXT PRIMARY KEY, module TEXT NOT NULL); CREATE INDEX core_scheduler__jobs_module ON core_scheduler__jobs (module)"])
       const timers = store.forModule("timers")
-      const failed = yield* Effect.exit(timers.transaction(Effect.gen(function*() {
-        yield* timers.collection(items).insert({ text: "pasta" })
-        yield* jobs.run("INSERT INTO core_scheduler__jobs (id, module) VALUES ('j1', 'timers')")
-        return yield* Effect.fail("no")
-      })))
+      const failed = yield* Effect.exit(timers.transaction((tx) => {
+        tx.collection(items).insert({ text: "pasta" })
+        tx.core("scheduler").run("INSERT INTO core_scheduler__jobs (id, module) VALUES ('j1', 'timers')")
+        throw new Error("no")
+      }))
       assert.isTrue(Exit.isFailure(failed))
       assert.strictEqual((yield* jobs.query("SELECT * FROM core_scheduler__jobs")).length, 0)
       assert.strictEqual((yield* timers.collection(items).list()).length, 0)
-      yield* timers.transaction(Effect.gen(function*() {
-        yield* timers.collection(items).insert({ text: "pasta" })
-        yield* jobs.run("INSERT INTO core_scheduler__jobs (id, module) VALUES ('j1', 'timers')")
-      }))
+      yield* timers.transaction((tx) => {
+        tx.collection(items).insert({ text: "pasta" })
+        tx.core("scheduler").run("INSERT INTO core_scheduler__jobs (id, module) VALUES ('j1', 'timers')")
+        assert.strictEqual(tx.core("scheduler").query("SELECT * FROM core_scheduler__jobs").length, 1)
+      })
       assert.strictEqual((yield* jobs.query("SELECT * FROM core_scheduler__jobs")).length, 1)
+      // The scheduler's own transaction (no module).
+      yield* store.transaction((tx) => tx.core("scheduler").run("DELETE FROM core_scheduler__jobs WHERE id = ?", ["j1"]))
+      assert.strictEqual((yield* jobs.query("SELECT * FROM core_scheduler__jobs")).length, 0)
+      // A statement that ends the transaction itself is refused, and nothing of the transaction is kept.
+      const ended = yield* Effect.exit(timers.transaction((tx) => {
+        tx.collection(items).insert({ text: "kept?" })
+        tx.core("scheduler").run("COMMIT")
+        tx.collection(items).insert({ text: "after the end" })
+      }))
+      assert.isTrue(Exit.isFailure(ended))
+      assert.strictEqual((yield* timers.collection(items).list()).length, 1)
       // Migrating again is a no-op; fewer migrations than stored is refused.
       yield* jobs.migrate(["CREATE TABLE core_scheduler__jobs (id TEXT PRIMARY KEY, module TEXT NOT NULL)"])
       const older = yield* Effect.exit(jobs.migrate([]))

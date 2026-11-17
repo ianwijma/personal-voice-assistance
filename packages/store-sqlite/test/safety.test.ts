@@ -2,7 +2,8 @@
 // backups that cannot meet, the checkpoint after an erase, retention of every archive, collection-only upgrades,
 // index names, the index every list shape uses, module namespaces, and a complete, consistent export.
 import { assert, describe, it } from "@effect/vitest"
-import { checkQuery, defineCollection, type StoreError } from "@pva/core"
+import { defineCollection, type StoreError } from "@pva/core"
+import { checkQuery } from "@pva/core/store-backend"
 import { Effect, Exit, Fiber, Schema } from "effect"
 import { createHash } from "node:crypto"
 import { chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, statSync, utimesSync, writeFileSync } from "node:fs"
@@ -113,7 +114,9 @@ describe("SQLite store files", () => {
       const now = Date.UTC(2026, 10, 30, 12)
       const backups = join(dir, "backups")
       yield* store.backup({ now: now - 20 * DAY })
+      // The day's backup prunes too: the one named 20 days ago goes at once.
       yield* store.backup({ now })
+      assert.isFalse(existsSync(join(backups, "household-2026-11-10.db")))
       const old = (name: string, days: number) => {
         const p = join(name.startsWith("household.db.") ? dir : backups, name)
         writeFileSync(p, "x", { mode: 0o600 })
@@ -123,15 +126,21 @@ describe("SQLite store files", () => {
       old("household-2026-11-01-before-shop.db", 29)
       old("household-2026-11-25-before-lists.db", 5)
       old("household-2026-11-30.db.part-1234-0123456789ab", 0)
-      utimesSync(join(backups, "household-2026-11-10.db"), (now - 20 * DAY) / 1000, (now - 20 * DAY) / 1000)
-      const removed = yield* store.pruneBackups({ now })
-      assert.sameMembers([...removed], ["household-2026-11-10.db", "household-2026-11-01-before-shop.db"])
+      // A backup copied in by hand under an old name, readable by others: removed by its name's day.
+      old("household-2026-11-02.db", 0)
+      chmodSync(join(backups, "household-2026-11-02.db"), 0o644)
+      // One that stays but is readable by others is narrowed.
+      chmodSync(join(backups, "household-2026-11-25-before-lists.db"), 0o644)
+      const pruned = yield* store.pruneBackups({ now })
+      assert.sameMembers([...pruned.removed], ["household-2026-11-02.db", "household-2026-11-01-before-shop.db"])
+      assert.strictEqual(mode(join(backups, "household-2026-11-25-before-lists.db")), 0o600)
+      assert.deepStrictEqual(pruned.failed, [])
       assert.sameMembers(readdirSync(backups), ["household-2026-11-30.db", "household-2026-11-25-before-lists.db", "household-2026-11-30.db.part-1234-0123456789ab"])
     }).pipe(Effect.scoped))
 })
 
-describe("SQLite store: erase reaches the files", () => {
-  it.live("an erase while a reader holds an older snapshot is pending, retried, and complete once the reader lets go", (): Effect.Effect<void, unknown> =>
+describe("SQLite store: a removal reaches the files", () => {
+  it.live("a removal while a reader holds an older snapshot is pending, retried, and complete once the reader lets go", (): Effect.Effect<void, unknown> =>
     Effect.gen(function*() {
       const dir = tmp()
       const file = join(dir, "household.db")
@@ -150,11 +159,11 @@ describe("SQLite store: erase reaches the files", () => {
       reader.prepare("SELECT count(*) FROM pva_docs").get()
       assert.isTrue(yield* c.remove(row.id))
       yield* Effect.sleep(100)
-      assert.isDefined(store.erasePendingSince())
+      assert.isDefined(store.removalPendingSince())
       reader.exec("COMMIT")
       reader.close()
       yield* store.scrubbed.pipe(Effect.timeout(5000))
-      assert.isUndefined(store.erasePendingSince())
+      assert.isUndefined(store.removalPendingSince())
       for (const name of readdirSync(dir).filter((n) => n.startsWith("household.db"))) {
         assert.isFalse(readFileSync(join(dir, name)).includes("quetzalcoatlsecret"), `${name} still holds the removed text`)
       }
@@ -193,7 +202,9 @@ describe("SQLite store: names and indexes", () => {
       const timers = defineCollection({ name: "timers", scope: "household", schema: Timer, indexes: ["state", "due"] })
       yield* store.prepare([{ id: "timers", storage: { collections: [timers] } }])
       const c = store.forModule("timers").collection(timers)
-      yield* store.transaction(Effect.forEach(Array.from({ length: 3000 }, (_, i) => i), (i) => c.insert({ state: i % 3 === 0 ? "running" : "done", due: i % 50, label: `t${i}` }), { discard: true }))
+      yield* store.forModule("timers").transaction((tx) => {
+        for (let i = 0; i < 3000; i++) tx.collection(timers).insert({ state: i % 3 === 0 ? "running" : "done", due: i % 50, label: `t${i}` })
+      })
       const shapes = [
         undefined,
         { orderBy: { field: "updatedAt" as const, direction: "asc" as const } },
@@ -203,11 +214,11 @@ describe("SQLite store: names and indexes", () => {
         { where: { state: "running" } },
         { where: { state: "running" }, orderBy: { field: "updatedAt" as const, direction: "asc" as const } },
         { where: { state: "running" }, orderBy: { field: "state" as const } },
-        { where: { due: null } }
+        { where: { due: 3 } }
       ]
       const raw = store.core("probe")
       for (const shape of shapes) {
-        const checked = yield* checkQuery(timers, { ...shape, limit: 20 })
+        const checked = checkQuery(timers, { ...shape, limit: 20 })
         const { sql, params } = listSql("timers", "timers", { kind: "household" }, checked)
         const plan = (yield* raw.query<{ detail: string }>(`EXPLAIN QUERY PLAN ${sql}`, params as ReadonlyArray<string | number>)).map((r) => r.detail).join(" | ")
         assert.notMatch(plan, /TEMP B-TREE|SCAN pva_docs(?! USING)/, `${JSON.stringify(shape)}: ${plan}`)

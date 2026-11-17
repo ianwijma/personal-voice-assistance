@@ -71,7 +71,7 @@ const assemble = (
 /**
  * Serve mode: the one writer. A database from a newer assistant fails the start (the message says what to do). Every
  * file operation of the store runs under `guard` (the data directory lock's), and conversation rows left by a
- * previous process (conversations do not outlive it) are erased before any session starts.
+ * previous process (conversations do not outlive it) are removed before any session starts.
  */
 export const openServeHousehold = (options: {
   readonly dataDir: string
@@ -92,14 +92,15 @@ export const openServeHousehold = (options: {
     const household = yield* assemble(sqlite, sqlite, options.catalog, options.log, options.report)
     // After `prepare`: a module whose data is not usable here keeps its rows untouched.
     const swept = yield* sqlite.sweepConversations
-    if (swept > 0) options.log(`Household: ${swept} row(s) of conversations of the previous run erased`)
+    if (swept > 0) options.log(`Household: ${swept} row(s) of conversations of the previous run removed`)
     return household
   })
 
 /**
  * The CLI modes (`text`, `voice`, `bench`, …): the store read-only, beside a server that may be running; version 2
  * modules read their data and every write is refused (`read-only`, "changes are made by the server"). No file yet,
- * or one that cannot be opened here (a newer assistant's): an empty in-memory store, read-only too, with a warning.
+ * or one that cannot be opened here (a newer assistant's): an empty in-memory store, read-only too, with a warning
+ * (for a missing file only when a module keeps data).
  */
 export const openCliHousehold = (options: {
   readonly dataDir: string
@@ -111,7 +112,9 @@ export const openCliHousehold = (options: {
     const onFile = existsSync(file)
       ? yield* Effect.result(makeSqliteStore({ filename: file, readOnly: true }))
       : undefined
-    if (onFile?._tag === "Failure") options.log(`The household data is not available here: ${onFile.failure.message}`)
+    if (onFile === undefined) {
+      if (options.catalog.some((d) => d.storage !== undefined)) options.log(`There is no household data yet (${file}); modules read an empty store here, and the server makes the file when it starts`)
+    } else if (onFile._tag === "Failure") options.log(`The household data is not available here: ${onFile.failure.message}`)
     const sqlite = onFile?._tag === "Success" ? onFile.success : yield* makeSqliteStore({ filename: ":memory:", readOnly: true })
     return yield* assemble(sqlite, sqlite, options.catalog, options.log)
   }).pipe(Effect.catchTag("StoreError", (e) => Effect.die(e)))

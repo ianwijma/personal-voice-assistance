@@ -1,5 +1,5 @@
 import type { AudioClientLink } from "@pva/audio-web"
-import type { HostDeviceView, HostResult, ModuleHost, TargetDevice } from "@pva/core"
+import type { HostDeviceView, HostResult, ModuleHost } from "@pva/core"
 import {
   type AdminSnapshot,
   type AdminState,
@@ -122,10 +122,14 @@ export interface SessionHub {
   readonly voiceConnections: () => ReadonlyArray<VoiceConnection>
 }
 
-/** A voice connection as the household push sees it: its device and a send that checks it is still open. */
+/**
+ * A voice connection as the household push sees it: the device id it claimed in `hello` (not authenticated: §2 rows 5
+ * and 7 of docs/MODULES-PLAN.md) and a send that checks it is still open. What the device is called is the server's
+ * record of it, looked up by the push (`makeHouseholdPush({ device })`), never what the page said.
+ */
 export interface VoiceConnection {
   readonly id: string
-  readonly device: TargetDevice
+  readonly deviceId: string | undefined
   readonly send: (message: ServerMessage) => void
 }
 
@@ -135,6 +139,8 @@ export interface HouseholdHooks {
   readonly connected: (connection: VoiceConnection) => void
   /** That connection closed: stop sending to it. */
   readonly closed: (connection: VoiceConnection) => void
+  /** A device's record may have changed (a save, a newly recorded device): pages whose device record changed get a fresh snapshot. */
+  readonly devicesChanged: () => void
   /** A device's first connection opened / its last one closed (`host.device.connected` / `.disconnected`). */
   readonly deviceConnected: (deviceId: string) => void
   readonly deviceDisconnected: (deviceId: string) => void
@@ -469,6 +475,7 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
   const refreshDevices = () => {
     for (const session of sessions.all()) session.syncProfile()
     refreshSetups()
+    options.household?.devicesChanged()
   }
 
   /** Send `device.setup` to every voice connection whose setup changed (never to admin connections: it is the voice page's). */
@@ -690,7 +697,7 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
       const device = client.device
       client.voice = {
         id: client.connection.id,
-        device: device === undefined ? {} : { id: device.id, name: device.name },
+        deviceId: device?.id,
         send: (m) => send(client, m)
       }
       if (firstOfDevice) options.household.deviceConnected(device!.id)

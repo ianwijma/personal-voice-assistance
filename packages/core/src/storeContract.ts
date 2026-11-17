@@ -4,9 +4,11 @@
  * same on the real store. Test-only: imports vitest.
  */
 import { assert, describe, it } from "@effect/vitest"
-import { Deferred, Effect, Exit, Fiber, Schema, type Scope, Stream } from "effect"
+import { encodeServerMessage, type HouseholdSnapshotMessage } from "@pva/protocol"
+import { Cause, Deferred, Effect, Exit, Schema, type Scope, Stream } from "effect"
 import { connectStoreToBus, defineEventType, type HouseholdEvent, makeEventBus } from "./EventBus.ts"
-import { type FeedChange, type FeedProblem, feedRowKey, makeHouseholdFeed, SNAPSHOT_PART_CHARS } from "./HouseholdFeed.ts"
+import { ambientLines } from "./HouseholdAmbient.ts"
+import { type FeedChange, type FeedProblem, feedRowKey, makeHouseholdFeed, SNAPSHOT_MAX_CHARS, SNAPSHOT_PART_CHARS, type SnapshotRun } from "./HouseholdFeed.ts"
 import {
   type Actor,
   type Collection,
@@ -16,7 +18,8 @@ import {
   MAX_VALUE_CHARS,
   type ModuleStorage,
   type Row,
-  StoreError
+  StoreError,
+  type StoreTx
 } from "./HouseholdStore.ts"
 import { CurrentTurn, type TurnContext } from "./TurnContext.ts"
 
@@ -53,12 +56,21 @@ export const broken = defineCollection({
     return { text: row.value.text }
   }
 })
+/** Device-scoped and shown to its own device. */
+export const shownDev = defineCollection({ name: "shown_dev", scope: "device", schema: Note, project: (row: Row<Note>) => ({ text: row.value.text }) })
+/** Shown only to a device whose record has the name "Kitchen". */
+export const byName = defineCollection({ name: "by_name", scope: "household", schema: Note, project: (row: Row<Note>, device) => (device.name === "Kitchen" ? row.value : undefined) })
+/** Ambient lines: the texts of the rows, one line per collection. */
+export const factsA = defineCollection({ name: "facts_a", scope: "household", schema: Note, ambientRows: 5, ambient: (rows) => `A: ${rows.map((r) => r.value.text).join(" ")}` })
+export const factsB = defineCollection({ name: "facts_b", scope: "device", schema: Note, ambient: (rows) => `B: ${rows.map((r) => r.value.text).join(" ")}` })
+/** Whatever the schema allows (the store still wants an object). */
+export const anything = defineCollection({ name: "anything", scope: "household", schema: Schema.Unknown })
 /** A collection whose name is also a property of every object. */
 export const constructorCollection = defineCollection({ name: "constructor", scope: "household", schema: Note })
 
 export const KIT: { readonly id: string; readonly storage: ModuleStorage } = {
   id: "kit",
-  storage: { collections: [notes, mine, dev, chat, shown, loose, broken, constructorCollection] }
+  storage: { collections: [notes, mine, dev, chat, shown, loose, broken, constructorCollection, anything, shownDev, byName] }
 }
 
 export const turnOf = (over: Partial<TurnContext> = {}): TurnContext => ({
@@ -170,17 +182,23 @@ export const householdStoreContract = (name: string, make: MakeStore) =>
         assert.strictEqual((failureOf(createdFiltered) as StoreError).reason, "invalid")
       }).pipe(Effect.scoped))
 
-    it.effect("indexed fields hold scalars only, ordered the same in both stores (null, numbers and booleans, strings by code point)", () =>
+    it.effect("values are objects; indexed fields hold a well-formed string, a finite number or a boolean, ordered the same in both stores", () =>
       Effect.gen(function*() {
         const store = yield* prepared(make)
         const c = store.forModule("kit").collection(loose)
-        for (const k of [["a"], { x: 1 }]) {
+        // Anything else in an indexed field is refused at write: lists, objects, null, NaN-like, malformed or long strings.
+        for (const k of [["a"], { x: 1 }, null, "\ud800", "a\udc00", "a\u0000b", "x".repeat(501)]) {
           const exit = yield* Effect.exit(c.insert({ k }))
-          assert.strictEqual((failureOf(exit) as StoreError).reason, "invalid")
+          assert.strictEqual((failureOf(exit) as StoreError).reason, "invalid", JSON.stringify(k))
+        }
+        // A value whose JSON form is not an object is refused, whatever the schema allows.
+        for (const v of ["text", 5, null, [1, 2]]) {
+          const exit = yield* Effect.exit(store.forModule("kit").collection(anything).insert(v))
+          assert.strictEqual((failureOf(exit) as StoreError).reason, "invalid", JSON.stringify(v))
         }
         const values: ReadonlyArray<readonly [string, unknown]> = [
           ["v01", "😀"],
-          ["v02", ""],
+          ["v02", ""],
           ["v03", "é"],
           ["v04", "a"],
           ["v05", "B"],
@@ -188,22 +206,27 @@ export const householdStoreContract = (name: string, make: MakeStore) =>
           ["v07", 2],
           ["v08", true],
           ["v09", false],
-          ["v10", null],
           ["v11", undefined],
-          ["v12", 1]
+          ["v12", 1],
+          ["v13", "\uffff"],
+          ["v14", -0.5]
         ]
         for (const [id, k] of values) yield* c.insert(k === undefined ? {} : { k }, { id })
         const asc = (yield* c.list({ orderBy: { field: "k" } })).map((r) => r.id)
-        assert.deepStrictEqual(asc, ["v10", "v11", "v09", "v08", "v12", "v07", "v06", "v05", "v04", "v03", "v02", "v01"])
+        // Missing first, then numbers (false = 0, true = 1; ties by time, then id), then strings by code point.
+        assert.deepStrictEqual(asc, ["v11", "v14", "v09", "v08", "v12", "v07", "v06", "v02", "v05", "v04", "v03", "v13", "v01"])
         const desc = (yield* c.list({ orderBy: { field: "k", direction: "desc" } })).map((r) => r.id)
         assert.deepStrictEqual(desc, [...asc].reverse())
-        assert.deepStrictEqual((yield* c.list({ where: { k: null } })).map((r) => r.id).sort(), ["v10", "v11"])
         assert.deepStrictEqual((yield* c.list({ where: { k: true } })).map((r) => r.id).sort(), ["v08", "v12"])
-        assert.deepStrictEqual((yield* c.list({ where: { k: "" } })).map((r) => r.id), ["v02"])
-        assert.deepStrictEqual((yield* c.list({ where: { k: "[\"a\"]" } })).map((r) => r.id), [])
+        assert.deepStrictEqual((yield* c.list({ where: { k: "" } })).map((r) => r.id), ["v02"])
+        assert.deepStrictEqual((yield* c.list({ where: { k: "😀" } })).map((r) => r.id), ["v01"])
+        for (const bad of [null, "\ud800", ["a"]]) {
+          const exit = yield* Effect.exit(c.list({ where: { k: bad as never } }))
+          assert.strictEqual((failureOf(exit) as StoreError).reason, "invalid")
+        }
       }).pipe(Effect.scoped))
 
-    it.effect("updates: read, apply and write as one step; rev is the change number, never used again (also after a removal)", () =>
+    it.effect("updates: read, apply and write as one step; rev comes from one counter, never used again (also after a removal)", () =>
       Effect.gen(function*() {
         const store = yield* prepared(make)
         const c = store.forModule("kit").collection(notes)
@@ -214,7 +237,7 @@ export const householdStoreContract = (name: string, make: MakeStore) =>
         assert.strictEqual(tagOf(failureOf(stale)), "StoreConflict")
         const missing = yield* Effect.exit(c.update("nope", (v) => v))
         assert.strictEqual(tagOf(failureOf(missing)), "StoreNotFound")
-        // Concurrent updates all land.
+        // Concurrent updates all land (each is one synchronous step).
         yield* Effect.forEach(Array.from({ length: 8 }, () => 0), () => c.update(row.id, (v) => ({ ...v, n: (v.n ?? 0) + 1 })), { concurrency: "unbounded", discard: true })
         assert.strictEqual((yield* c.get(row.id))?.value.n, 9)
         // ABA: the same id removed and inserted again has a new rev, so a write expecting the old one is refused.
@@ -229,11 +252,11 @@ export const householdStoreContract = (name: string, make: MakeStore) =>
         assert.strictEqual((yield* c.get("x"))?.value.text, "second")
       }).pipe(Effect.scoped))
 
-    it.effect("every write takes a new rev from one counter; a rollback leaves nothing; listeners hear commits only", () =>
+    it.effect("a transaction is one step: all of it commits or none; a throw releases nothing and runs the rollback hooks; listeners hear commits only, in order", () =>
       Effect.gen(function*() {
         const store = yield* prepared(make)
         const heard: Array<string> = []
-        store.onCommit((changes) => heard.push(...changes.map((ch) => `${ch.op}:${ch.seq}`)))
+        store.onCommit((released) => heard.push(...released.map((r) => (r._tag === "change" ? `${r.change.op}:${r.change.seq}` : r.event.type))))
         const kit = store.forModule("kit")
         const c = kit.collection(notes)
         const row = yield* c.insert({ text: "a" })
@@ -241,141 +264,210 @@ export const householdStoreContract = (name: string, make: MakeStore) =>
         yield* c.remove(row.id)
         assert.strictEqual(yield* c.remove(row.id), false)
         assert.deepStrictEqual(heard, ["insert:1", "update:2", "remove:3"])
-        // A failing transaction: neither the rows nor the counter nor the listeners see anything of it.
-        const failed = yield* Effect.exit(kit.transaction(Effect.gen(function*() {
-          yield* c.insert({ text: "x" })
-          yield* kit.collection(dev).insert({ text: "y" }, { scope: { kind: "device", id: "kitchen-01" } })
-          return yield* Effect.fail("boom")
-        })))
-        assert.isTrue(Exit.isFailure(failed))
+        // A transaction that throws part-way: no row, no number taken, nothing heard, its hooks run newest first.
+        const undone: Array<string> = []
+        const ran: Array<string> = []
+        const failed = yield* Effect.exit(kit.transaction((tx) => {
+          tx.collection(notes).insert({ text: "x" })
+          tx.publish("stock.low", {})
+          tx.afterCommit(() => ran.push("after"))
+          tx.onRollback(() => undone.push("first"))
+          tx.collection(dev).insert({ text: "y" }, { scope: { kind: "device", id: "kitchen-01" } })
+          tx.onRollback(() => undone.push("second"))
+          throw new Error("boom")
+        }))
+        assert.isTrue(Exit.isFailure(failed) && Cause.hasDies(failed.cause))
+        assert.deepStrictEqual(undone, ["second", "first"])
+        assert.deepStrictEqual(ran, [])
         assert.strictEqual((yield* c.list()).length, 0)
         assert.strictEqual(yield* store.lastSeq, 3)
         assert.strictEqual(heard.length, 3)
-        // A committed transaction publishes after its commit, in order.
-        yield* kit.transaction(Effect.gen(function*() {
-          yield* c.insert({ text: "p" })
-          assert.strictEqual(heard.length, 3)
-          yield* c.insert({ text: "q" })
+        // A store failure left uncaught is the transaction's failure; caught, the transaction goes on and commits.
+        const conflict = yield* Effect.exit(kit.transaction((tx) => {
+          tx.collection(notes).insert({ text: "p" }, { id: "p" })
+          tx.collection(notes).insert({ text: "again" }, { id: "p" })
         }))
-        assert.deepStrictEqual(heard.slice(3), ["insert:4", "insert:5"])
-        // A savepoint that fails inside a transaction that commits: only its part is gone.
-        yield* kit.transaction(Effect.gen(function*() {
-          yield* c.insert({ text: "kept" })
-          yield* Effect.exit(kit.transaction(Effect.andThen(c.insert({ text: "dropped" }), Effect.fail("inner"))))
-        }))
-        assert.deepStrictEqual(texts(yield* c.list({ limit: 10 })), ["kept", "p", "q"])
-        assert.deepStrictEqual(heard.slice(5), ["insert:6"])
-        // Numbers have no holes: the rolled-back changes left none.
-        assert.strictEqual(yield* store.lastSeq, 6)
+        assert.strictEqual(tagOf(failureOf(conflict)), "StoreConflict")
+        assert.strictEqual((yield* c.list()).length, 0)
+        const kept = yield* kit.transaction((tx) => {
+          const n = tx.collection(notes)
+          n.insert({ text: "p" }, { id: "p" })
+          try {
+            n.insert({ text: "again" }, { id: "p" })
+          } catch (e) {
+            assert.strictEqual(tagOf(e), "StoreConflict")
+          }
+          n.insert({ text: "q" }, { id: "q" })
+          tx.publish("stock.low", { n: 1 })
+          tx.afterCommit(() => ran.push("after"))
+          return n.list().length
+        })
+        assert.strictEqual(kept, 2)
+        // Released after the commit, in the order the transaction made them, as one batch.
+        assert.deepStrictEqual(heard.slice(3), ["insert:4", "insert:5", "kit.stock.low"])
+        assert.deepStrictEqual(ran, ["after"])
+        assert.strictEqual(yield* store.lastSeq, 5)
+        // A handle kept after its transaction ended is refused.
+        let kept2: StoreTx | undefined
+        yield* kit.transaction((tx) => {
+          kept2 = tx
+        })
+        assert.throws(() => kept2!.collection(notes).insert({ text: "late" }))
+        assert.throws(() => kept2!.publish("late", {}))
+        assert.strictEqual((yield* c.list()).length, 2)
       }).pipe(Effect.scoped))
 
-    it.effect("transactions: a savepoint that rolls back never takes a sibling's or the parent's write with it", () =>
+    it.effect("nothing runs between a transaction's begin and its commit; a transaction started inside one joins it; the host's spans modules", () =>
       Effect.gen(function*() {
         const store = yield* prepared(make)
         const kit = store.forModule("kit")
         const c = kit.collection(notes)
-        const opened = yield* Deferred.make<void>()
-        const release = yield* Deferred.make<void>()
-        yield* kit.transaction(Effect.gen(function*() {
-          const child = yield* Effect.forkChild(Effect.exit(kit.transaction(Effect.gen(function*() {
-            yield* c.insert({ text: "child" })
-            yield* Deferred.succeed(opened, undefined)
-            yield* Deferred.await(release)
-            return yield* Effect.fail("child fails")
-          }))))
-          yield* Deferred.await(opened)
-          // While the child's savepoint is open, the parent's own write and a sibling savepoint wait for it.
-          const parent = yield* Effect.forkChild(c.insert({ text: "parent" }))
-          const sibling = yield* Effect.forkChild(kit.transaction(c.insert({ text: "sibling" })))
-          yield* settle
-          yield* Deferred.succeed(release, undefined)
-          assert.isTrue(Exit.isFailure(yield* Fiber.join(child)))
-          yield* Fiber.join(parent)
-          yield* Fiber.join(sibling)
+        // Twenty transactions at once, five rows each: every transaction's numbers are consecutive (no interleaving).
+        const revs = yield* Effect.all(
+          Array.from({ length: 20 }, (_, t) =>
+            kit.transaction((tx) => Array.from({ length: 5 }, (_, i) => tx.collection(notes).insert({ text: `${t}.${i}` }).rev))),
+          { concurrency: "unbounded" }
+        )
+        for (const r of revs) for (let i = 1; i < r.length; i++) assert.strictEqual(r[i], r[0]! + i)
+        // Joined: the inner transaction (and a plain write) is part of the outer one, and goes with its rollback.
+        const exit = yield* Effect.exit(kit.transaction((tx) => {
+          tx.collection(notes).insert({ text: "outer" }, { id: "outer" })
+          Effect.runSync(kit.transaction((inner) => inner.collection(notes).insert({ text: "inner" }, { id: "inner" })))
+          Effect.runSync(c.insert({ text: "plain" }, { id: "plain" }))
+          assert.strictEqual(tx.collection(notes).list({ limit: 1000 }).filter((r) => ["outer", "inner", "plain"].includes(r.id)).length, 3)
+          throw new Error("no")
         }))
-        assert.deepStrictEqual(texts(yield* c.list()), ["parent", "sibling"])
-        // An interrupted savepoint: its write is gone, the parent's stays.
-        const stuck = yield* Deferred.make<void>()
-        yield* kit.transaction(Effect.gen(function*() {
-          const child = yield* Effect.forkChild(kit.transaction(Effect.andThen(c.insert({ text: "interrupted" }), Effect.andThen(Deferred.succeed(stuck, undefined), Effect.never))))
-          yield* Deferred.await(stuck)
-          yield* Fiber.interrupt(child)
-          yield* c.insert({ text: "after" })
-        }))
-        assert.deepStrictEqual(texts(yield* c.list()), ["after", "parent", "sibling"])
-        // An interrupted outer transaction leaves nothing.
-        const started = yield* Deferred.make<void>()
-        const outer = yield* Effect.forkChild(kit.transaction(Effect.andThen(c.insert({ text: "never" }), Effect.andThen(Deferred.succeed(started, undefined), Effect.never))))
-        yield* Deferred.await(started)
-        yield* Fiber.interrupt(outer)
-        assert.deepStrictEqual(texts(yield* c.list()), ["after", "parent", "sibling"])
-      }).pipe(Effect.scoped))
-
-    it.effect("transactions: a fiber that outlives its transaction is refused, and nothing reaches the store", () =>
-      Effect.gen(function*() {
-        const store = yield* prepared(make)
-        const kit = store.forModule("kit")
-        const c = kit.collection(notes)
-        const go = yield* Deferred.make<void>()
-        let escaped: Fiber.Fiber<Exit.Exit<Row<Note>, unknown>> | undefined
-        yield* kit.transaction(Effect.gen(function*() {
-          escaped = yield* Effect.forkChild(Effect.andThen(Deferred.await(go), Effect.exit(c.insert({ text: "late" }))))
-          yield* c.insert({ text: "in time" })
-        }))
-        yield* Deferred.succeed(go, undefined)
-        const exit = yield* Fiber.join(escaped!)
         assert.isTrue(Exit.isFailure(exit))
-        assert.match((failureOf(exit) as StoreError).message, /already ended/)
-        assert.deepStrictEqual(texts(yield* c.list()), ["in time"])
+        for (const id of ["outer", "inner", "plain"]) assert.strictEqual(yield* c.get(id), undefined)
+        // The host's transaction: two modules' rows commit together.
+        yield* store.prepare([KIT, { id: "other", storage: { collections: [notes] } }])
+        yield* store.transaction((tx) => {
+          tx.forModule("kit").collection(notes).insert({ text: "k" }, { id: "k" })
+          tx.forModule("other").collection(notes).insert({ text: "o" }, { id: "o" })
+        })
+        assert.isDefined(yield* c.get("k"))
+        assert.isDefined(yield* store.forModule("other").collection(notes).get("o"))
+        // In-memory state of a core service follows the transaction with onRollback (the scheduler's table).
+        const table = new Map<string, number>()
+        const write = (tx: { onRollback: (f: () => void) => void }, k: string, v: number) => {
+          const before = table.get(k)
+          table.set(k, v)
+          tx.onRollback(() => (before === undefined ? table.delete(k) : table.set(k, before)))
+        }
+        yield* store.transaction((tx) => write(tx, "a", 1))
+        yield* Effect.exit(store.transaction((tx) => {
+          write(tx, "a", 2)
+          write(tx, "b", 1)
+          throw new Error("no")
+        }))
+        assert.deepStrictEqual([...table], [["a", 1]])
       }).pipe(Effect.scoped))
 
-    it.effect("events: competing transactions are heard in change-log order; module events wait for the commit", () =>
+    it.effect("events: module events published inside a transaction wait for its commit, in order with its changes; dropped on rollback", () =>
       Effect.gen(function*() {
         const store = yield* prepared(make)
         const seen: Array<string> = []
-        const bus = makeEventBus({ observe: (e) => seen.push(e.seq !== undefined ? `${e.type}@${e.seq}` : e.type) })
+        const bus = makeEventBus({ observe: (e) => seen.push(e.type) })
         connectStoreToBus(store, bus)
         const kit = store.forModule("kit")
-        const c = kit.collection(notes)
         const events = bus.forModule("kit")
-        const heard: Array<number> = []
-        store.onCommit((changes) => heard.push(...changes.map((ch) => ch.seq)))
-        yield* Effect.all([
-          kit.transaction(Effect.forEach(Array.from({ length: 40 }, (_, i) => i), (i) => c.insert({ text: `a${i}` }), { discard: true })),
-          kit.transaction(Effect.forEach(Array.from({ length: 40 }, (_, i) => i), (i) => c.insert({ text: `b${i}` }), { discard: true })),
-          c.insert({ text: "single" })
-        ], { concurrency: "unbounded" })
-        assert.strictEqual(heard.length, 81)
-        assert.deepStrictEqual(heard, [...heard].sort((x, y) => x - y))
+        yield* kit.transaction((tx) => {
+          tx.collection(notes).insert({ text: "a" })
+          tx.publish("stock.low", { n: 1 })
+          // `ctx.events.publish` from inside the function (it can only be run synchronously there) waits too.
+          Effect.runSync(events.publish("stock.empty", {}))
+          tx.collection(notes).insert({ text: "b" })
+          assert.deepStrictEqual(seen, [])
+        })
+        assert.deepStrictEqual(seen, ["kit.notes.changed", "kit.stock.low", "kit.stock.empty", "kit.notes.changed"])
         seen.length = 0
-        // In a transaction: after the commit, in order with its changes.
-        yield* kit.transaction(Effect.gen(function*() {
-          yield* c.insert({ text: "stock" })
-          yield* events.publish("stock.low", { item: "milk" })
-          assert.strictEqual(seen.length, 0)
-          yield* c.insert({ text: "more" })
+        yield* Effect.exit(kit.transaction((tx) => {
+          tx.publish("outer.failed", {})
+          throw new Error("no")
         }))
-        assert.deepStrictEqual(seen.map((s) => s.replace(/@\d+$/, "")), ["kit.notes.changed", "kit.stock.low", "kit.notes.changed"])
-        // Rolled back: never published; a savepoint's events go with it.
-        seen.length = 0
-        yield* Effect.exit(kit.transaction(Effect.andThen(events.publish("outer.failed", {}), Effect.fail("no"))))
-        yield* kit.transaction(Effect.gen(function*() {
-          yield* Effect.exit(kit.transaction(Effect.andThen(events.publish("inner.dropped", {}), Effect.fail("no"))))
-          yield* events.publish("outer.kept", {})
-        }))
-        const started = yield* Deferred.make<void>()
-        const interrupted = yield* Effect.forkChild(kit.transaction(Effect.andThen(events.publish("interrupted", {}), Effect.andThen(Deferred.succeed(started, undefined), Effect.never))))
-        yield* Deferred.await(started)
-        yield* Fiber.interrupt(interrupted)
-        assert.deepStrictEqual(seen, ["kit.outer.kept"])
-        // Outside a transaction: at once. A subscriber may write in response (its own transaction, after the commit).
+        yield* events.publish("outside", {})
+        assert.deepStrictEqual(seen, ["kit.outside"])
+        // An invalid type or scope inside a transaction is refused (the transaction fails); outside, it is not published.
+        const bad = yield* Effect.exit(kit.transaction((tx) => tx.publish("Not A Type", {})))
+        assert.strictEqual((failureOf(bad) as StoreError).reason, "invalid")
+        const badScope = yield* Effect.exit(kit.transaction((tx) => tx.publish("ok", {}, { kind: "device", id: "a\u0000b" })))
+        assert.strictEqual((failureOf(badScope) as StoreError).reason, "invalid")
+        yield* events.publish("Bad Type", {})
+        assert.deepStrictEqual(seen, ["kit.outside"])
+        // A subscriber that writes back works (it runs after the commit, outside the transaction).
         const done = yield* Deferred.make<void>()
-        yield* Effect.forkScoped(Stream.runForEach(bus.subscribe({ type: "kit.ping" }), () => Effect.andThen(c.insert({ text: "pong" }), Deferred.succeed(done, undefined))))
+        yield* Effect.forkScoped(Stream.runForEach(bus.subscribe({ type: "kit.ping" }), () => Effect.andThen(kit.collection(notes).insert({ text: "pong" }), Deferred.succeed(done, undefined))))
         yield* settle
-        yield* kit.transaction(events.publish("ping", {}))
+        yield* kit.transaction((tx) => tx.publish("ping", {}))
         yield* Deferred.await(done)
-        assert.strictEqual((yield* c.list()).filter((r) => r.value.text === "pong").length, 1)
+        assert.strictEqual((yield* kit.collection(notes).list()).filter((r) => r.value.text === "pong").length, 1)
       }).pipe(Effect.scoped))
+
+    it.effect("remove really removes: the row is gone from get and list, its event carries what it removed, another scope's row of the id is untouched", () =>
+      Effect.gen(function*() {
+        const store = yield* prepared(make)
+        const removed: Array<CommittedChange> = []
+        store.onCommit((released) => removed.push(...released.flatMap((r) => (r._tag === "change" && r.change.op === "remove" ? [r.change] : []))))
+        const c = store.forModule("kit").collection(dev)
+        const kitchen = turnOf()
+        const study = turnOf({ deviceId: "study-001" })
+        const k = yield* c.insert({ text: "kitchen secret" }, { id: "x" }).pipe(inTurn(kitchen))
+        yield* c.insert({ text: "study note" }, { id: "y" }).pipe(inTurn(study))
+        // In another scope: not found, nothing changes.
+        assert.isFalse(yield* c.remove("x").pipe(inTurn(study)))
+        assert.strictEqual((yield* c.get("x").pipe(inTurn(kitchen)))?.value.text, "kitchen secret")
+        assert.isTrue(yield* c.remove("x", { expectRev: k.rev }).pipe(inTurn(kitchen)))
+        assert.strictEqual(yield* c.get("x").pipe(inTurn(kitchen)), undefined)
+        assert.deepStrictEqual((yield* c.list().pipe(inTurn(kitchen))).length, 0)
+        assert.strictEqual(removed.length, 1)
+        assert.deepStrictEqual(removed[0]!.scope, { kind: "device", id: "kitchen-01" })
+        assert.strictEqual((removed[0]!.before?.value as Note).text, "kitchen secret")
+        // The id is free again, in any scope; the new row has a new rev.
+        const again = yield* c.insert({ text: "study's x" }, { id: "x" }).pipe(inTurn(study))
+        assert.isTrue(again.rev > k.rev)
+        assert.strictEqual(yield* c.get("x").pipe(inTurn(kitchen)), undefined)
+      }).pipe(Effect.scoped))
+
+    it.effect("ids and scopes come from a safe alphabet; the store keeps its own copies of what it is given and gives out copies", () =>
+      Effect.gen(function*() {
+        const store = yield* prepared(make)
+        const kit = store.forModule("kit")
+        const d = kit.collection(dev)
+        for (const id of ["A\u0000B", "kitchen\ud800", "with space", "", "x".repeat(201), "ü"]) {
+          const exit = yield* Effect.exit(d.insert({ text: "s" }, { scope: { kind: "device", id } }))
+          assert.strictEqual((failureOf(exit) as StoreError).reason, "invalid", JSON.stringify(id))
+          const read = yield* Effect.exit(d.get("x", { scope: { kind: "device", id } }))
+          assert.strictEqual((failureOf(read) as StoreError).reason, "invalid")
+        }
+        for (const id of ["a\u0000", "a/b", "", "x".repeat(201)]) {
+          const exit = yield* Effect.exit(kit.collection(notes).insert({ text: "s" }, { id }))
+          assert.strictEqual((failureOf(exit) as StoreError).reason, "invalid", JSON.stringify(id))
+        }
+        // A turn whose device id is outside the alphabet: refused, not stored under a mangled id.
+        const odd = yield* Effect.exit(d.insert({ text: "s" }).pipe(inTurn(turnOf({ deviceId: "a b" }))))
+        assert.strictEqual((failureOf(odd) as StoreError).reason, "invalid")
+        // What the caller keeps is not what the store keeps.
+        const scope = { kind: "device" as const, id: "kitchen-01" }
+        const value: { text: string; tag?: string } = { text: "mine" }
+        const row = yield* d.insert(value, { scope, id: "copy" })
+        ;(scope as { id: string }).id = "study-001"
+        value.text = "changed outside"
+        ;(row.value as { text: string }).text = "changed in the row"
+        ;(row.scope as { id: string }).id = "study-001"
+        const back = yield* d.get("copy", { scope: { kind: "device", id: "kitchen-01" } })
+        assert.strictEqual(back?.value.text, "mine")
+        assert.strictEqual(yield* d.get("copy", { scope: { kind: "device", id: "study-001" } }), undefined)
+        // An update function that changes its argument in place does not change the row it replaces (the event's `before`).
+        const befores: Array<unknown> = []
+        store.onCommit((released) => befores.push(...released.flatMap((r) => (r._tag === "change" && r.change.before !== undefined ? [r.change.before.value] : []))))
+        yield* d.update("copy", (v) => {
+          ;(v as { text: string }).text = "after"
+          return v
+        }, { scope: { kind: "device", id: "kitchen-01" } })
+        assert.deepStrictEqual(befores, [{ text: "mine" }])
+        assert.strictEqual((yield* d.get("copy", { scope: { kind: "device", id: "kitchen-01" } }))?.value.text, "after")
+      }).pipe(Effect.scoped))
+
     it.effect("a conversation that ends takes its rows; a sweep at start does the same", () =>
       Effect.gen(function*() {
         const store = yield* prepared(make)
@@ -385,7 +477,7 @@ export const householdStoreContract = (name: string, make: MakeStore) =>
         yield* c.remove(removed.id).pipe(inTurn(turn))
         yield* c.insert({ text: "live scratch" }).pipe(inTurn(turn))
         const heard: Array<CommittedChange> = []
-        store.onCommit((changes) => heard.push(...changes))
+        store.onCommit((released) => heard.push(...released.flatMap((r) => (r._tag === "change" ? [r.change] : []))))
         assert.strictEqual(yield* store.endConversation("conv-1"), 1)
         assert.strictEqual((yield* c.list().pipe(inTurn(turn))).length, 0)
         assert.deepStrictEqual(heard.map((ch) => [ch.op, ch.actor]), [["remove", { kind: "system", name: "conversation-ended" }]])
@@ -410,7 +502,8 @@ export const householdStoreContract = (name: string, make: MakeStore) =>
         yield* store.prepare([{ id: "later", storage: { collections: [v2] } }])
         assert.deepStrictEqual(texts(yield* store.forModule("later").collection(v2).list().pipe(inTurn(turnOf()))), ["kept for the newer module"])
       }).pipe(Effect.scoped))
-    it.effect("collection versions: rows are migrated at start (indexes follow); a newer version makes the module unavailable everywhere", () =>
+
+    it.effect("collection versions: rows are migrated at start in one transaction (indexes follow); a newer version makes the module unavailable everywhere", () =>
       Effect.gen(function*() {
         const v1 = defineCollection({ name: "items", scope: "household", schema: Schema.Struct({ label: Schema.String }), indexes: ["label"] })
         const v2 = defineCollection({
@@ -436,13 +529,16 @@ export const householdStoreContract = (name: string, make: MakeStore) =>
         const verdict = store.availability("shop")
         assert.isDefined(verdict)
         assert.match(verdict!.reason, /newer version/)
-        for (const attempt of [store.forModule("shop").collection(v1).insert({ label: "x" }), before.list(), store.forModule("shop").transaction(Effect.void)]) {
+        for (const attempt of [store.forModule("shop").collection(v1).insert({ label: "x" }), before.list(), store.forModule("shop").transaction(() => undefined)]) {
           const exit = yield* Effect.exit(attempt as Effect.Effect<unknown, unknown>)
           assert.strictEqual((failureOf(exit) as StoreError).reason, "unavailable")
         }
+        assert.strictEqual(store.reader("shop", v1), undefined)
         // Pages never read it.
         const feed = makeHouseholdFeed({ store, modules: [{ moduleId: "shop", collections: [v2], events: [] }] })
-        assert.deepStrictEqual((yield* feed.snapshot({ id: "kitchen-01" })).parts.flat(), [])
+        assert.deepStrictEqual(allFrames(feed.snapshot({ id: "kitchen-01" })).flatMap((f) => f.collections), [])
+        yield* store.prepare([{ id: "shop", storage: { collections: [v2] } }])
+        assert.strictEqual(store.availability("shop"), undefined)
       }).pipe(Effect.scoped))
 
     it.effect("a migration whose output breaks the size limit or the schema fails: nothing changes, the module is unavailable", () =>
@@ -457,16 +553,34 @@ export const householdStoreContract = (name: string, make: MakeStore) =>
         })
         const store = yield* make()
         yield* store.prepare([{ id: "big", storage: { collections: [v1] } }])
-        const row = yield* store.forModule("big").collection(v1).insert({ body: "x".repeat(Math.floor(MAX_VALUE_CHARS * 0.6)) })
+        yield* store.forModule("big").collection(v1).insert({ body: "small" }, { id: "a" })
+        const row = yield* store.forModule("big").collection(v1).insert({ body: "x".repeat(Math.floor(MAX_VALUE_CHARS * 0.6)) }, { id: "b" })
         yield* store.prepare([{ id: "big", storage: { collections: [v2] } }])
         assert.match(store.availability("big")?.reason ?? "", /could not be upgraded/)
-        // The previous version still reads the row as it was.
+        // The previous version still reads both rows as they were: the first row's migration was rolled back too.
         yield* store.prepare([{ id: "big", storage: { collections: [v1] } }])
         assert.strictEqual(store.availability("big"), undefined)
         assert.strictEqual((yield* store.forModule("big").collection(v1).get(row.id))?.value.body.length, Math.floor(MAX_VALUE_CHARS * 0.6))
+        assert.deepStrictEqual((yield* store.forModule("big").collection(v1).get("a"))?.value, { body: "small" })
       }).pipe(Effect.scoped))
 
-    it.effect("pages: only committed current rows through the projection; a cursor per page; hidden or removed rows never travel", () =>
+    it.effect("module ids: the host's namespace and an id two modules share are refused for stored data", () =>
+      Effect.gen(function*() {
+        const store = yield* make()
+        yield* store.prepare([
+          { id: "host", storage: { collections: [notes] } },
+          { id: "twice", storage: { collections: [notes] } },
+          { id: "twice", storage: { collections: [notes] } },
+          { id: "Bad_Id", storage: { collections: [notes] } }
+        ])
+        for (const id of ["host", "twice", "Bad_Id"]) {
+          assert.isDefined(store.availability(id), id)
+          const exit = yield* Effect.exit(store.forModule(id).collection(notes).insert({ text: "x" }))
+          assert.strictEqual((failureOf(exit) as StoreError).reason, "unavailable")
+        }
+      }).pipe(Effect.scoped))
+
+    it.effect("pages: what a page gets is decided when its frame is built, from the committed row and the device then", () =>
       Effect.gen(function*() {
         const store = yield* prepared(make)
         const feed = makeHouseholdFeed({ store, modules: [{ moduleId: "kit", collections: KIT.storage.collections ?? [], events: [] }] })
@@ -474,59 +588,88 @@ export const householdStoreContract = (name: string, make: MakeStore) =>
         const study = { id: "study-001" }
         const kit = store.forModule("kit")
         const shownRows = kit.collection(shown)
-        const k = (yield* feed.snapshot(kitchen)).cursor
-        const st = (yield* feed.snapshot(study)).cursor
-        // What each page has pending: the rows committed changes touched, coalesced (as `HouseholdPush` keeps them).
+        const ks = feed.snapshot(kitchen)
+        allFrames(ks)
+        const ss = feed.snapshot(study)
+        allFrames(ss)
+        const k = ks.cursor
+        const st = ss.cursor
+        // What each page has pending, as `HouseholdPush` keeps it: the rows changes touched, coalesced.
         const pending = new Map<object, Map<string, FeedChange>>([[k, new Map()], [st, new Map()]])
-        store.onCommit((changes) => {
+        store.onCommit((released) => {
           for (const p of pending.values()) {
-            for (const c of changes) {
-              const key = feedRowKey(c.module, c.collection, c.id)
+            for (const r of released) {
+              if (r._tag !== "change") continue
+              const key = feedRowKey(r.change.module, r.change.collection, r.change.id)
               p.delete(key)
-              p.set(key, { module: c.module, collection: c.collection, id: c.id, scope: c.scope })
+              p.set(key, { module: r.change.module, collection: r.change.collection, id: r.change.id, scope: r.change.scope })
             }
           }
         })
-        const drain = (device: { id: string }, cursor: typeof k) =>
-          Effect.gen(function*() {
-            const mine = pending.get(cursor)!
-            const batch = [...mine.values()]
-            mine.clear()
-            const events = yield* feed.catchUp(device, cursor, batch)
-            return events.map((e) => {
-              const d = e.data as { op: string; value?: unknown }
-              return d.op === "put" ? { op: d.op, value: d.value } : { op: d.op }
-            })
+        const drain = (device: { id: string }, cursor: typeof k) => {
+          const mine = pending.get(cursor)!
+          const out = [...mine.values()].flatMap((c) => {
+            const e = feed.change(c, device, cursor)
+            if (e === undefined) return []
+            const d = e.data as { op: string; value?: unknown }
+            return [d.op === "put" ? { op: d.op, value: d.value } : { op: d.op }]
           })
+          mine.clear()
+          return out
+        }
         yield* kit.collection(notes).insert({ text: "never sent" })
         const forKitchen = yield* shownRows.insert({ text: "alarm: wake Sam", tag: "kitchen-01" })
         yield* shownRows.insert({ text: "for everyone" })
-        assert.deepStrictEqual((yield* drain(kitchen, k)), [{ op: "put", value: { text: "alarm: wake Sam" } }, { op: "put", value: { text: "for everyone" } }])
-        assert.deepStrictEqual((yield* drain(study, st)), [{ op: "put", value: { text: "for everyone" } }])
+        assert.deepStrictEqual(drain(kitchen, k), [{ op: "put", value: { text: "alarm: wake Sam" } }, { op: "put", value: { text: "for everyone" } }])
+        assert.deepStrictEqual(drain(study, st), [{ op: "put", value: { text: "for everyone" } }])
         // Moved to the study: the kitchen, which holds it, is told it is gone; the study gets today's value.
         yield* shownRows.update(forKitchen.id, (v) => ({ ...v, text: "alarm: study", tag: "study-001" }))
-        assert.deepStrictEqual((yield* drain(kitchen, k)), [{ op: "remove" }])
-        assert.deepStrictEqual((yield* drain(study, st)), [{ op: "put", value: { text: "alarm: study" } }])
-        // In one transaction: shown to the kitchen, then hidden from it, then removed. The kitchen hears nothing of it.
-        yield* kit.transaction(Effect.gen(function*() {
-          const secret = yield* shownRows.insert({ text: "secret for the kitchen", tag: "kitchen-01" })
-          yield* shownRows.update(secret.id, (v) => ({ ...v, tag: "study-001" }))
-          yield* shownRows.remove(secret.id)
-        }))
-        assert.deepStrictEqual((yield* drain(kitchen, k)), [])
-        assert.deepStrictEqual((yield* drain(study, st)), [])
+        assert.deepStrictEqual(drain(kitchen, k), [{ op: "remove" }])
+        assert.deepStrictEqual(drain(study, st), [{ op: "put", value: { text: "alarm: study" } }])
+        // Shown to the kitchen, then hidden from it, then removed, before the kitchen's frame was built: nothing.
+        const secret = yield* shownRows.insert({ text: "secret for the kitchen", tag: "kitchen-01" })
+        yield* shownRows.update(secret.id, (v) => ({ ...v, tag: "study-001" }))
+        yield* shownRows.remove(secret.id)
+        assert.deepStrictEqual(drain(kitchen, k), [])
+        assert.deepStrictEqual(drain(study, st), [])
         // A page that fell behind gets only the value now, never the ones between.
         yield* shownRows.update(forKitchen.id, (v) => ({ ...v, text: "v2" }))
         yield* shownRows.update(forKitchen.id, (v) => ({ ...v, text: "v3" }))
-        const late = yield* drain(study, st)
-        assert.deepStrictEqual(late, [{ op: "put", value: { text: "v3" } }])
+        assert.deepStrictEqual(drain(study, st), [{ op: "put", value: { text: "v3" } }])
         // The snapshot is the rows now.
-        const snapK = yield* feed.snapshot(kitchen)
-        assert.deepStrictEqual(snapK.parts.flat().map((x) => x.collection), ["shown", "broken"])
-        assert.deepStrictEqual(snapK.parts.flat()[0]!.rows.map((r) => r.value), [{ text: "for everyone" }])
+        const snapK = allFrames(feed.snapshot(kitchen)).flatMap((f) => f.collections)
+        assert.deepStrictEqual(snapK.map((x) => x.collection), ["shown"])
+        assert.deepStrictEqual(snapK[0]!.rows.map((r) => r.value), [{ text: "for everyone" }])
+        // The device record decides: a projection by name sees the name it is given now.
+        const named = makeHouseholdFeed({ store, modules: [{ moduleId: "kit", collections: [byName], events: [] }] })
+        yield* kit.collection(byName).insert({ text: "for Kitchen" })
+        assert.strictEqual(allFrames(named.snapshot({ id: "kitchen-01", name: "Kitchen" })).flatMap((f) => f.collections).length, 1)
+        assert.strictEqual(allFrames(named.snapshot({ id: "kitchen-01", name: "Guest" })).flatMap((f) => f.collections).length, 0)
       }).pipe(Effect.scoped))
 
-    it.effect("pages: a snapshot comes in parts that fit a frame, bounded in all; a failing projection hides only its own rows and is reported", () =>
+    it.effect("pages: a removal names only what the page was given, never a row of another scope that took the id", () =>
+      Effect.gen(function*() {
+        const store = yield* prepared(make)
+        const feed = makeHouseholdFeed({ store, modules: [{ moduleId: "kit", collections: [shownDev], events: [] }] })
+        const c = store.forModule("kit").collection(shownDev)
+        const a = { id: "kitchen-01" }
+        yield* c.insert({ text: "A's" }, { id: "x", scope: { kind: "device", id: "kitchen-01" } })
+        const run = feed.snapshot(a)
+        const frames = allFrames(run)
+        assert.strictEqual(frames.flatMap((f) => f.collections).flatMap((x) => x.rows).length, 1)
+        const given = run.cursor.visible.get(feedRowKey("kit", "shown_dev", "x"))!
+        // Removed in A's scope, then recreated in B's before A's page catches up.
+        yield* c.remove("x", { scope: { kind: "device", id: "kitchen-01" } })
+        yield* c.insert({ text: "B's secret" }, { id: "x", scope: { kind: "device", id: "study-001" } })
+        const e = feed.change({ module: "kit", collection: "shown_dev", id: "x", scope: { kind: "device", id: "study-001" } }, a, run.cursor)
+        assert.deepStrictEqual(e?.scope, { kind: "device", id: "kitchen-01" })
+        assert.deepStrictEqual(e?.data, { collection: "shown_dev", id: "x", op: "remove", rev: given.rev })
+        assert.isFalse(JSON.stringify(e).includes("study-001"))
+        // A page that never held it gets nothing.
+        assert.strictEqual(feed.change({ module: "kit", collection: "shown_dev", id: "x", scope: { kind: "device", id: "study-001" } }, a, run.cursor), undefined)
+      }).pipe(Effect.scoped))
+
+    it.effect("pages: every snapshot frame fits its limit with its envelopes, and the whole snapshot is bounded, also with many collections", () =>
       Effect.gen(function*() {
         const store = yield* prepared(make)
         const problems: Array<FeedProblem> = []
@@ -535,21 +678,36 @@ export const householdStoreContract = (name: string, make: MakeStore) =>
         yield* kit.collection(broken).insert({ text: "fine" })
         yield* kit.collection(broken).insert({ text: "throws", tag: "bad" })
         yield* kit.collection(broken).insert({ text: "bigint", tag: "big" })
-        const big = "y".repeat(Math.floor(MAX_VALUE_CHARS * 0.9))
-        for (let i = 0; i < 70; i++) yield* kit.collection(shown).insert({ text: `${i} ${big}` })
-        const snap = yield* feed.snapshot({ id: "kitchen-01" })
-        for (const part of snap.parts) assert.isTrue(JSON.stringify(part).length < SNAPSHOT_PART_CHARS + MAX_VALUE_CHARS + 2000)
-        const shownRows = snap.parts.flat().filter((x) => x.collection === "shown")
-        const total = shownRows.reduce((n, x) => n + x.rows.length, 0)
-        assert.isTrue(total > 10 && total < 70)
-        assert.isTrue(shownRows.some((x) => x.truncated))
-        assert.isTrue(snap.parts.length > 2)
-        const brokenRows = snap.parts.flat().filter((x) => x.collection === "broken").flatMap((x) => x.rows.map((r) => r.value))
+        // A failing projection hides only its own row and is reported.
+        const brokenRows = allFrames(feed.snapshot({ id: "kitchen-01" })).flatMap((f) => f.collections).filter((x) => x.collection === "broken").flatMap((x) => x.rows.map((r) => r.value))
         assert.deepStrictEqual(brokenRows, [{ text: "fine" }])
         assert.deepStrictEqual(problems.map((p) => p.what), ["broken", "broken"])
+        const big = "y".repeat(Math.floor(MAX_VALUE_CHARS * 0.9))
+        for (let i = 0; i < 70; i++) yield* kit.collection(shown).insert({ text: `${i} ${big}` })
+        const frames = allFrames(feed.snapshot({ id: "kitchen-01" }))
+        for (const f of frames) assert.isAtMost(encodeServerMessage(f).length, SNAPSHOT_PART_CHARS)
+        assert.isAtMost(frames.reduce((n, f) => n + encodeServerMessage(f).length, 0), SNAPSHOT_MAX_CHARS)
+        assert.isTrue(frames.at(-1)!.final)
+        assert.isTrue(frames.slice(0, -1).every((f) => !f.final))
+        assert.deepStrictEqual(frames.map((f) => f.part), frames.map((_, i) => i))
+        const shownRows = frames.flatMap((f) => f.collections).filter((x) => x.collection === "shown")
+        const total = shownRows.reduce((n, x) => n + x.rows.length, 0)
+        assert.isTrue(total > 5 && total < 70)
+        assert.isTrue(shownRows.some((x) => x.truncated))
+        // Collections after the budget ran out are named as cut short, as far as the budget allows.
+        assert.isTrue(frames.flatMap((f) => f.collections).filter((x) => x.collection === "broken").every((x) => x.truncated))
+        // Thousands of declared collections, most with nothing visible: every frame and the whole stay bounded, and
+        // the reading stops at its budget.
+        const many = Array.from({ length: 3000 }, (_, i) => defineCollection({ name: `c${i}`, scope: "household", schema: Note, project: (row: Row<Note>) => (row.value.tag === "show" ? { t: row.value.text } : undefined) }))
+        yield* store.prepare([{ id: "wide", storage: { collections: many.slice(0, 64) } }])
+        const wideFeed = makeHouseholdFeed({ store, modules: Array.from({ length: 47 }, (_, m) => ({ moduleId: m === 0 ? "wide" : `wide${m}`, collections: many.slice(m * 64, m * 64 + 64), events: [] })) })
+        for (let i = 0; i < 64; i++) yield* store.forModule("wide").collection(many[i]!).insert({ text: `${i}`, tag: i % 2 === 0 ? "show" : "hide" })
+        const wide = allFrames(wideFeed.snapshot({ id: "kitchen-01" }))
+        for (const f of wide) assert.isAtMost(encodeServerMessage(f).length, SNAPSHOT_PART_CHARS)
+        assert.strictEqual(wide.flatMap((f) => f.collections).flatMap((x) => x.rows).length, 32)
       }).pipe(Effect.scoped))
 
-    it.effect("module events reach pages only through a declared projection, which may fail on its own", () =>
+    it.effect("module events reach pages only through a declared projection, which may fail on its own; host events never", () =>
       Effect.gen(function*() {
         const store = yield* prepared(make)
         const problems: Array<FeedProblem> = []
@@ -557,6 +715,8 @@ export const householdStoreContract = (name: string, make: MakeStore) =>
         const bad = defineEventType({ type: "alarm.bad", project: () => ({ n: 1n }) })
         const feed = makeHouseholdFeed({ store, modules: [{ moduleId: "kit", collections: [], events: [ring, bad] }], report: (p) => problems.push(p) })
         const event: HouseholdEvent = { at: 1, module: "kit", type: "kit.alarm.ringing", scope: { kind: "household" as const }, data: { device: "kitchen-01" } }
+        assert.isTrue(feed.sendsEvent("kit.alarm.ringing"))
+        assert.isFalse(feed.sendsEvent("kit.other"))
         assert.deepStrictEqual(feed.live(event, { id: "kitchen-01" })?.data, { label: "Wake up" })
         assert.strictEqual(feed.live(event, { id: "study-001" }), undefined)
         assert.strictEqual(feed.live({ ...event, type: "kit.other" }, { id: "kitchen-01" }), undefined)
@@ -564,7 +724,25 @@ export const householdStoreContract = (name: string, make: MakeStore) =>
         assert.strictEqual(problems.length, 1)
         // Person-scoped events are withheld from every page until Privacy.mayReveal exists.
         assert.strictEqual(feed.live({ ...event, scope: { kind: "person", id: "sam" } }, { id: "kitchen-01" }), undefined)
+        assert.strictEqual(feed.live({ ...event, module: "host", type: "host.turn.ended" }, { id: "kitchen-01" }), undefined)
       }).pipe(Effect.scoped))
+
+    it.effect("ambient facts: bounded reads of the turn's scopes, whole lines up to 600 characters, nothing past the time budget", () =>
+      Effect.gen(function*() {
+        const store = yield* prepared(make, [{ id: "facts", storage: { collections: [factsA, factsB] } }])
+        for (let i = 0; i < 30; i++) yield* store.forModule("facts").collection(factsA).insert({ text: `a${i}` }, { id: `a${String(i).padStart(2, "0")}` })
+        yield* store.forModule("facts").collection(factsB).insert({ text: "b" }).pipe(inTurn(turnOf()))
+        const lines = (clock?: () => number, mode: "all" | "off" = "all") =>
+          ambientLines({ store, modules: [{ moduleId: "facts", collections: [factsA, factsB] }], mode: () => mode, ...(clock !== undefined ? { clock } : {}) }).pipe(inTurn(turnOf()))
+        const all = yield* lines()
+        // At most `ambientRows` rows per scope, newest first; then the next collection.
+        assert.strictEqual(all, "A: a29 a28 a27 a26 a25\nB: b")
+        assert.strictEqual(yield* lines(undefined, "off"), "")
+        // The budget is spent after the first collection: the second is not read.
+        let t = 0
+        assert.strictEqual(yield* lines(() => (t += 30)), "A: a29 a28 a27 a26 a25")
+      }).pipe(Effect.scoped))
+
     it.effect("a read-only store reads and refuses every write", () =>
       Effect.gen(function*() {
         const store = yield* make({ readOnly: true })
@@ -573,7 +751,20 @@ export const householdStoreContract = (name: string, make: MakeStore) =>
         assert.deepStrictEqual(yield* c.list(), [])
         const exit = yield* Effect.exit(c.insert({ text: "x" }))
         assert.strictEqual((failureOf(exit) as StoreError).reason, "read-only")
+        const tx = yield* Effect.exit(store.forModule("kit").transaction((t) => t.collection(notes).insert({ text: "x" })))
+        assert.strictEqual((failureOf(tx) as StoreError).reason, "read-only")
       }).pipe(Effect.scoped))
   })
+
+/** Every frame of a snapshot, its steps run one after the other. */
+export const allFrames = (run: SnapshotRun) => {
+  const frames: Array<typeof HouseholdSnapshotMessage.Type> = []
+  for (let i = 0; i < 100_000; i++) {
+    const r = run.step()
+    frames.push(...r.frames)
+    if (r.done) return frames
+  }
+  throw new Error("the snapshot did not end")
+}
 
 export type { Collection }

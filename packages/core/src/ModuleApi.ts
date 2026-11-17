@@ -346,12 +346,15 @@ export interface ModuleHostApi {
 export interface ModuleServicesV2 {
   readonly host: ModuleHostApi
   /**
-   * The module's data (docs/STORING-DATA.md): its declared collections, its SQL, transactions. Shared by every instance
+   * The module's data (docs/STORING-DATA.md): its declared collections and synchronous transactions. Shared by every instance
    * and the `shared` part. In the CLI modes it reads and refuses writes (`read-only`); without a store, every call fails
    * `unavailable`.
    */
   readonly store: ModuleStore
-  /** The household event bus: publish `<moduleId>.<type>`, subscribe to anything (a stream in the caller's scope). */
+  /**
+   * The household event bus: publish `<moduleId>.<type>`, subscribe to anything (a stream in the caller's scope). In
+   * `shared`, a subscription receives events only while that shared part is the published one, and ends with it.
+   */
   readonly events: ModuleEvents
 }
 

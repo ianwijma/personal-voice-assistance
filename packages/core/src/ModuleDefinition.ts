@@ -5,6 +5,7 @@ import type { HealthContext, ModuleServicesV2, ModuleTemplate, Platforms, Requir
 import type { FieldActionHandler, ModuleContributions } from "./ModuleContributions.ts"
 import type { EventType } from "./EventBus.ts"
 import { checkModuleStorage, type ModuleStorage } from "./HouseholdStore.ts"
+import { RESERVED_MODULE_IDS } from "./StoreEngine.ts"
 import type { SettingsOf, SettingsSpec } from "./Settings.ts"
 
 /**
@@ -223,6 +224,8 @@ export const defineModule = <const S extends SettingsSpec = {}, const V extends 
   if (!/^[a-z][a-z0-9-]{0,39}$/.test(definition.id)) {
     throw new Error(`Module id "${definition.id}" must match /^[a-z][a-z0-9-]{0,39}$/`)
   }
+  // `host` is the host's own event namespace (`host.turn.ended`, …): no module may take it.
+  if (RESERVED_MODULE_IDS.has(definition.id)) throw new Error(`Module id "${definition.id}" is reserved for the host`)
   checkManifest(definition.id, definition)
   return {
     id: definition.id,

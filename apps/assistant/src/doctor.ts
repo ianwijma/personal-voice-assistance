@@ -72,8 +72,9 @@ export const runDoctor = (options: DoctorOptions): Effect.Effect<ReadonlyArray<I
         ? { ...issue, severity: "warning", detail: `${issue.detail} (No assistant has it on.)` }
         : issue
     )
-    // The household database: opens, passes SQLite's quick check, is not from a newer version, has a recent backup.
-    const household = yield* householdIssues(options.dataDir)
+    // The household database: opens, passes SQLite's quick check, is not from a newer version, holds no module data
+    // newer than that module (judged read-only against the catalog), has a recent backup.
+    const household = yield* householdIssues(options.dataDir, { modules: options.catalog.map((d) => ({ id: d.id, name: d.name, storage: d.storage })) })
     return [...core, ...household, ...modules]
   }))
 

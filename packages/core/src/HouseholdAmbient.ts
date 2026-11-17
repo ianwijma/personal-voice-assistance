@@ -1,26 +1,28 @@
 import { Clock, Effect } from "effect"
-import type { Collection, HouseholdStore, Row, ScopeRef } from "./HouseholdStore.ts"
+import { type Collection, type HouseholdStore, MAX_AMBIENT_ROWS, type Row, type ScopeRef } from "./HouseholdStore.ts"
 import type { ContextProvider } from "./Module.ts"
 import type { ToolRegistry } from "./ToolRegistry.ts"
 import { CurrentTurn, type TurnContext } from "./TurnContext.ts"
 
 /**
- * Ambient facts (shared-state-jobs-and-notifications.md §7.2; docs/MODULES-PLAN.md §4 P4): one host context provider
- * that puts the collections' `ambient` lines for the turn's device and person into `LlmRequest.context`, so "how long
- * is left on the pasta?" works for an assistant without the timers module. It is outside the cached prefix.
+ * Ambient facts (docs/MODULES-PLAN.md §4 P4; docs/STORING-DATA.md "Ambient facts"): one host context provider that puts
+ * the collections' `ambient` lines for the turn's device and person into `LlmRequest.context`, so "how long is left
+ * on the pasta?" works for an assistant without the timers module. It is outside the cached prefix.
  *
- * Budget: at most 600 characters (whole lines, in catalog order; a module's lines are its own order), and only bounded
- * reads: per collection one index read per visible scope of at most `ambientRows` rows, newest first (the store's
- * `list` cannot do more, by construction). The 50 ms timeout cannot stop a synchronous read; it only drops a slow
- * turn's lines. Behind the household switch `HOME_AMBIENT_FACTS`: `off` (the default, until its effect on a hosted
- * model's first token is measured: docs/STORING-DATA.md "Ambient facts"), `all`, `module-on` (only from modules the
- * turn's assistant has on).
+ * Budget: it returns within it by doing **bounded synchronous work only**, not by racing a timeout it could not win
+ * (a synchronous read cannot be preempted). Per collection with `ambient` lines it makes one index read per visible
+ * scope of at most `ambientRows` rows (never more than `MAX_AMBIENT_ROWS`), newest first, and runs the module's
+ * `ambient` function once; it stops reading when `AMBIENT_BUDGET_MS` has passed (it checks the time before each
+ * collection, so the stretch is the budget plus one bounded read and one call at most) or the text reaches
+ * `AMBIENT_MAX_CHARS` (whole lines, in catalog order; a module's lines are its own order). Behind the household switch
+ * `HOME_AMBIENT_FACTS`: `off` (the default, until its effect on a hosted model's first token is measured),
+ * `all`, `module-on` (only from modules the turn's assistant has on).
  */
 
 export type AmbientMode = "all" | "module-on" | "off"
 
 export const AMBIENT_MAX_CHARS = 600
-export const AMBIENT_TIMEOUT_MS = 50
+export const AMBIENT_BUDGET_MS = 50
 
 export interface AmbientModule {
   readonly moduleId: string
@@ -37,7 +39,9 @@ export interface AmbientOptions {
   readonly moduleOn?: (assistantId: string, moduleId: string) => boolean
   readonly usable?: (moduleId: string) => boolean
   readonly maxChars?: number
-  readonly timeoutMs?: number
+  readonly budgetMs?: number
+  /** A monotonic clock in ms (tests). Default `performance.now`. */
+  readonly clock?: () => number
 }
 
 /** The scopes a turn sees: the household, its device, its person, its assistant, its conversation. */
@@ -56,26 +60,33 @@ const scopesFor = (collection: Collection<any>, turn: TurnContext | undefined): 
   }
 }
 
-/** The lines of one turn, capped (no timeout: `makeAmbientFacts` adds it). */
+/** The lines of one turn: bounded synchronous reads, capped in characters and time. */
 export const ambientLines = (options: AmbientOptions): Effect.Effect<string> =>
   Effect.gen(function*() {
     const mode = options.mode()
     if (mode === "off") return ""
     const turn = yield* CurrentTurn
     const now = yield* Clock.currentTimeMillis
+    const clock = options.clock ?? (() => performance.now())
+    const deadline = clock() + (options.budgetMs ?? AMBIENT_BUDGET_MS)
     const max = options.maxChars ?? AMBIENT_MAX_CHARS
     const lines: Array<string> = []
     let used = 0
     for (const m of options.modules) {
       if (options.usable !== undefined && !options.usable(m.moduleId)) continue
       if (mode === "module-on" && (turn?.assistantId === undefined || options.moduleOn?.(turn.assistantId, m.moduleId) !== true)) continue
-      const store = options.store.forModule(m.moduleId)
       for (const c of m.collections) {
         if (c.ambient === undefined) continue
+        if (clock() >= deadline) return lines.join("\n")
+        const reader = options.store.reader(m.moduleId, c)
+        if (reader === undefined) continue
         const rows: Array<Row<unknown>> = []
         for (const scope of scopesFor(c, turn)) {
-          const got = yield* store.collection(c).list({ scope, limit: c.ambientRows }).pipe(Effect.orElseSucceed(() => [] as ReadonlyArray<Row<unknown>>))
-          rows.push(...got)
+          try {
+            rows.push(...reader.list({ scope, limit: Math.min(c.ambientRows, MAX_AMBIENT_ROWS) }))
+          } catch {
+            // A collection that cannot be read gives no lines this turn.
+          }
         }
         if (rows.length === 0) continue
         let out: string | ReadonlyArray<string> | undefined
@@ -85,6 +96,7 @@ export const ambientLines = (options: AmbientOptions): Effect.Effect<string> =>
           out = undefined
         }
         for (const line of out === undefined ? [] : typeof out === "string" ? [out] : out) {
+          if (typeof line !== "string") continue
           const clean = line.replace(/\s+/g, " ").trim()
           if (clean.length === 0) continue
           const cost = clean.length + (lines.length > 0 ? 1 : 0)
@@ -97,14 +109,10 @@ export const ambientLines = (options: AmbientOptions): Effect.Effect<string> =>
     return lines.join("\n")
   })
 
-/** The provider (named `Household`): the lines within the time budget, or nothing that turn. */
+/** The provider (named `Household`): the lines, or nothing that turn when something fails. */
 export const makeAmbientFacts = (options: AmbientOptions): ContextProvider => ({
   name: "Household",
-  get: ambientLines(options).pipe(
-    Effect.timeoutOption(options.timeoutMs ?? AMBIENT_TIMEOUT_MS),
-    Effect.map((o) => (o._tag === "Some" ? o.value : "")),
-    Effect.catchCause(() => Effect.succeed(""))
-  )
+  get: ambientLines(options).pipe(Effect.catchCause(() => Effect.succeed("")))
 })
 
 /** A registry whose per-turn context also has `provider`'s output (after the modules' sections). */

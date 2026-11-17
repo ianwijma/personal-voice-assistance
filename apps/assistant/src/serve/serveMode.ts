@@ -1332,7 +1332,19 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
         )
       )
     })
-    const push = makeHouseholdPush({ feed: household.feed, bus: household.bus, store: household.store, run, log: (line) => runFork(Effect.logWarning(line)) })
+    const push = makeHouseholdPush({
+      feed: household.feed,
+      bus: household.bus,
+      store: household.store,
+      // Projections see the server's record of a device (its saved name), never what a page said in its hello.
+      device: (id) => {
+        if (id === undefined) return {}
+        const name = devices.nameOf(id)
+        return name === undefined ? { id } : { id, name }
+      },
+      run,
+      log: (line) => runFork(Effect.logWarning(line))
+    })
     hub = makeSessionHub({
       household: push.hooks,
       admin,
