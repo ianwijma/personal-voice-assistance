@@ -1,4 +1,5 @@
 import { Schema } from "effect"
+import { DeviceCapabilities } from "./capabilities.ts"
 import { InterruptMode, NonNegativeFinite, OutputPath } from "./common.ts"
 
 /**
@@ -246,7 +247,9 @@ export const DeviceHello = Schema.Struct({
   id: DeviceId,
   kind: FrontendKindId,
   /** Suggested name (derived from the user agent); used only the first time the server sees this device. */
-  name: DeviceName
+  name: DeviceName,
+  /** Protocol 9: what the device can do (a voice node declares `{ v: 1, speaker, microphone }`). */
+  capabilities: Schema.optionalKey(DeviceCapabilities)
 })
 export type DeviceHello = typeof DeviceHello.Type
 

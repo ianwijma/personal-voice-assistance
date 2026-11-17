@@ -1,6 +1,8 @@
 import { Schema } from "effect"
 import { Assistant, AssistantId, MAX_ASSIGNMENTS, MAX_PHRASES_PER_DEVICE } from "./assistants.ts"
 import type { AssistantHearing, Issue } from "./assistants.ts"
+import { DeviceCapabilities } from "./capabilities.ts"
+import { NodeInfo, NodeSound, NodeSoundDevices, VOICE_NODE_KIND } from "./nodes.ts"
 import { DeviceLook, DeviceVoice, FOLLOW_ASSISTANT, Look, lookFor } from "./looks.ts"
 import { InterruptMode, NonNegativeFinite, OutputPath } from "./common.ts"
 import { DeviceId, DeviceInfo, DeviceName, FrontendKindId, PrebufferMs, WAKE_PHRASES_MAX, WakeMatch, WakePhrase, wakeWords, WEB_VOICE_KIND } from "./frontends.ts"
@@ -79,7 +81,11 @@ export const DeviceSettings = Schema.Struct({
   /** The character on the voice stage for every assistant on the device, or each assistant's (docs/LOOKS-AND-VOICES.md). */
   look: DeviceLook,
   /** The voice of every assistant on the device, or each assistant's own. */
-  voice: DeviceVoice
+  voice: DeviceVoice,
+  /** voice-node only (protocol 9): volume and cues. */
+  sound: NodeSound,
+  /** voice-node only: which capture and playback device. */
+  soundDevices: NodeSoundDevices
 })
 export type DeviceSettings = typeof DeviceSettings.Type
 
@@ -93,7 +99,9 @@ export const DeviceSettingsKey = Schema.Literals([
   "audio",
   "captions",
   "look",
-  "voice"
+  "voice",
+  "sound",
+  "soundDevices"
 ])
 export type DeviceSettingsKey = typeof DeviceSettingsKey.Type
 export const DEVICE_SETTINGS_KEYS: ReadonlyArray<DeviceSettingsKey> = DeviceSettingsKey.literals
@@ -108,7 +116,9 @@ export const DeviceOwn = Schema.Struct({
   audio: Schema.optionalKey(DeviceAudio),
   captions: Schema.optionalKey(DeviceCaptions),
   look: Schema.optionalKey(DeviceLook),
-  voice: Schema.optionalKey(DeviceVoice)
+  voice: Schema.optionalKey(DeviceVoice),
+  sound: Schema.optionalKey(NodeSound),
+  soundDevices: Schema.optionalKey(NodeSoundDevices)
 })
 export type DeviceOwn = typeof DeviceOwn.Type
 
@@ -122,7 +132,9 @@ export const DeviceSettingsPatch = Schema.Struct({
   audio: Schema.optionalKey(Schema.NullOr(DeviceAudio)),
   captions: Schema.optionalKey(Schema.NullOr(DeviceCaptions)),
   look: Schema.optionalKey(Schema.NullOr(DeviceLook)),
-  voice: Schema.optionalKey(Schema.NullOr(DeviceVoice))
+  voice: Schema.optionalKey(Schema.NullOr(DeviceVoice)),
+  sound: Schema.optionalKey(Schema.NullOr(NodeSound)),
+  soundDevices: Schema.optionalKey(Schema.NullOr(NodeSoundDevices))
 })
 export type DeviceSettingsPatch = typeof DeviceSettingsPatch.Type
 
@@ -155,6 +167,8 @@ export interface DeviceTypeDefinition {
   /** The sections that apply to the kind; the others are ignored. */
   readonly keys: ReadonlyArray<DeviceSettingsKey>
   readonly builtIn: DeviceSettings
+  /** Seconds of follow-up window the type gives an assignment that has none of its own; absent = the assistant's own. */
+  readonly followUpUnset?: number
 }
 
 /** Built-in defaults of a browser. No assistant is assigned: nothing is heard until the admin (or the migration) assigns one. */
@@ -167,7 +181,10 @@ export const BUILT_IN_WEB_VOICE_SETTINGS: DeviceSettings = {
   audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, speakAloud: true, outputPath: "direct", prebufferMs: 60 },
   captions: { captions: true, speakTyped: true },
   look: FOLLOW_ASSISTANT,
-  voice: FOLLOW_ASSISTANT
+  voice: FOLLOW_ASSISTANT,
+  /** Not in the browser's `keys`: ignored. */
+  sound: { volume: 80, cues: true },
+  soundDevices: { input: "", output: "" }
 }
 
 export const WEB_VOICE_DEVICE_TYPE: DeviceTypeDefinition = {
@@ -176,11 +193,37 @@ export const WEB_VOICE_DEVICE_TYPE: DeviceTypeDefinition = {
   one: "browser",
   many: "browsers",
   description: "The voice page on a phone, tablet or computer.",
-  keys: DEVICE_SETTINGS_KEYS,
+  keys: ["assistants", "withoutPhrase", "matching", "voicePage", "interruptMode", "audio", "captions", "look", "voice"],
   builtIn: BUILT_IN_WEB_VOICE_SETTINGS
 }
 
-export const DEVICE_TYPES: ReadonlyArray<DeviceTypeDefinition> = [WEB_VOICE_DEVICE_TYPE]
+/** Built-in defaults of a voice node (docs/VOICE-NODES.md §3.2). Assistants are seeded at the first pairing. */
+export const BUILT_IN_VOICE_NODE_SETTINGS: DeviceSettings = {
+  assistants: [],
+  withoutPhrase: { mode: "nobody" },
+  matching: "close",
+  voicePage: { pick: false },
+  interruptMode: "confirm",
+  audio: BUILT_IN_WEB_VOICE_SETTINGS.audio,
+  captions: BUILT_IN_WEB_VOICE_SETTINGS.captions,
+  look: FOLLOW_ASSISTANT,
+  voice: FOLLOW_ASSISTANT,
+  sound: { volume: 80, cues: true },
+  soundDevices: { input: "", output: "" }
+}
+
+export const VOICE_NODE_DEVICE_TYPE: DeviceTypeDefinition = {
+  kind: VOICE_NODE_KIND,
+  title: "Voice nodes",
+  one: "voice node",
+  many: "voice nodes",
+  description: "A small box with a microphone and a speaker. It answers one question per wake phrase.",
+  keys: ["assistants", "withoutPhrase", "matching", "voice", "interruptMode", "sound", "soundDevices"],
+  builtIn: BUILT_IN_VOICE_NODE_SETTINGS,
+  followUpUnset: 0
+}
+
+export const DEVICE_TYPES: ReadonlyArray<DeviceTypeDefinition> = [WEB_VOICE_DEVICE_TYPE, VOICE_NODE_DEVICE_TYPE]
 
 export const deviceTypeOf = (kind: string): DeviceTypeDefinition | undefined => DEVICE_TYPES.find((t) => t.kind === kind)
 
@@ -226,21 +269,26 @@ export const hearingFor = (
   return hearer === null ? undefined : assistants.get(hearer)?.hearing
 }
 
-/** Follow-up window, seconds: the assignment's own value if set, else the assistant's; 0 = no window. */
+/**
+ * Follow-up window, seconds: the assignment's own value if set, else the device type's `followUpUnset`, else the
+ * assistant's; 0 = no window.
+ */
 export const effectiveFollowUpSeconds = (
   assignment: Pick<Assignment, "followUpSeconds">,
-  assistant: Pick<Assistant, "followUpSeconds">
-): number => assignment.followUpSeconds ?? assistant.followUpSeconds
+  assistant: Pick<Assistant, "followUpSeconds">,
+  type?: Pick<DeviceTypeDefinition, "followUpUnset">
+): number => assignment.followUpSeconds ?? type?.followUpUnset ?? assistant.followUpSeconds
 
 /** The follow-up window of `assistantId` on this device in ms (0 for an unknown or unassigned assistant). */
 export const followUpMsFor = (
   settings: Pick<DeviceSettings, "assistants">,
   assistants: ReadonlyMap<string, Pick<Assistant, "followUpSeconds">>,
-  assistantId: string
+  assistantId: string,
+  type?: Pick<DeviceTypeDefinition, "followUpUnset">
 ): number => {
   const assignment = settings.assistants.find((a) => a.assistant === assistantId)
   const assistant = assistants.get(assistantId)
-  return assignment === undefined || assistant === undefined ? 0 : effectiveFollowUpSeconds(assignment, assistant) * 1000
+  return assignment === undefined || assistant === undefined ? 0 : effectiveFollowUpSeconds(assignment, assistant, type) * 1000
 }
 
 /**
@@ -271,7 +319,8 @@ type RouteAssistant = Pick<Assistant, "id" | "on" | "followUpSeconds">
  */
 export const routeConfigFrom = (
   settings: Pick<DeviceSettings, "assistants" | "withoutPhrase" | "matching">,
-  assistants: ReadonlyArray<RouteAssistant> | ReadonlyMap<string, RouteAssistant>
+  assistants: ReadonlyArray<RouteAssistant> | ReadonlyMap<string, RouteAssistant>,
+  type?: Pick<DeviceTypeDefinition, "followUpUnset">
 ): RouteConfigShape => {
   const byId = assistants instanceof Map ? assistants : new Map((assistants as ReadonlyArray<RouteAssistant>).map((a) => [a.id, a]))
   const phrases: Array<{ phrase: string; assistant: string }> = []
@@ -280,7 +329,7 @@ export const routeConfigFrom = (
   for (const assignment of settings.assistants) {
     for (const phrase of assignment.phrases) phrases.push({ phrase, assistant: assignment.assistant })
     const known = byId.get(assignment.assistant)
-    if (known !== undefined) followUpMs[assignment.assistant] = effectiveFollowUpSeconds(assignment, known) * 1000
+    if (known !== undefined) followUpMs[assignment.assistant] = effectiveFollowUpSeconds(assignment, known, type) * 1000
     if (known === undefined || !known.on) off.add(assignment.assistant)
   }
   const wp = settings.withoutPhrase
@@ -407,7 +456,11 @@ export interface DeviceValidation {
 export const validateDeviceSettings = (
   settings: Pick<DeviceSettings, "assistants" | "withoutPhrase">,
   knownAssistants: ReadonlySet<string>,
-  options: { readonly assistants?: ReadonlyMap<string, Pick<Assistant, "name" | "on" | "handles">> } = {}
+  options: {
+    readonly assistants?: ReadonlyMap<string, Pick<Assistant, "name" | "on" | "handles">>
+    /** With `kind: "voice-node"`: a warning (`answers_everything`) when something answers without a phrase. */
+    readonly type?: Pick<DeviceTypeDefinition, "kind">
+  } = {}
 ): DeviceValidation => {
   const errors: Array<Issue> = []
   const warnings: Array<Issue> = []
@@ -465,6 +518,13 @@ export const validateDeviceSettings = (
         message: `${record.name} has no Handles text, so TypeSafe can only go by its name and purpose.`
       })
     }
+  }
+  if (options.type?.kind === VOICE_NODE_KIND && wp.mode !== "nobody") {
+    warnings.push({
+      code: "answers_everything",
+      path: "withoutPhrase",
+      message: "A voice node would answer everything it hears, not one question per wake phrase."
+    })
   }
   return { errors, warnings }
 }
@@ -525,7 +585,9 @@ export const DeviceTypeInfo = Schema.Struct({
   description: Schema.String,
   keys: Schema.Array(DeviceSettingsKey),
   settings: DeviceSettings,
-  rev: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))
+  rev: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  /** Protocol 9: the type's follow-up window for assignments without their own, in seconds; absent = the assistant's. */
+  followUpUnset: Schema.optionalKey(Schema.Int)
 })
 export type DeviceTypeInfo = typeof DeviceTypeInfo.Type
 
@@ -556,7 +618,11 @@ export const DeviceListInfo = Schema.Struct({
   own: DeviceOwn,
   settings: DeviceSettings,
   hearer: Schema.NullOr(AssistantId),
-  rev: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))
+  rev: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  /** Protocol 9: a voice node's pairing, version and status. */
+  node: Schema.optionalKey(NodeInfo),
+  /** Protocol 9: the last `hello.device.capabilities`. */
+  capabilities: Schema.optionalKey(DeviceCapabilities)
 })
 export type DeviceListInfo = typeof DeviceListInfo.Type
 
@@ -589,7 +655,10 @@ export const DeviceSetup = Schema.Struct({
   canAuto: Schema.Boolean,
   interruptMode: InterruptMode,
   audio: DeviceAudio,
-  captions: DeviceCaptions
+  captions: DeviceCaptions,
+  /** Protocol 9: for a device whose type has the `sound` key. */
+  sound: Schema.optionalKey(NodeSound),
+  soundDevices: Schema.optionalKey(NodeSoundDevices)
 })
 export type DeviceSetup = typeof DeviceSetup.Type
 
@@ -597,7 +666,7 @@ export type DeviceSetup = typeof DeviceSetup.Type
 export const deviceSetupFrom = (
   settings: DeviceSettings,
   assistants: ReadonlyMap<string, Pick<Assistant, "id" | "name" | "purpose" | "on" | "look">>,
-  options: { readonly deviceId?: string | undefined; readonly canAuto: boolean }
+  options: { readonly deviceId?: string | undefined; readonly canAuto: boolean; readonly keys?: ReadonlyArray<DeviceSettingsKey> | undefined }
 ): DeviceSetup => {
   const listed = settings.assistants.flatMap((a) => {
     const known = assistants.get(a.assistant)
@@ -615,6 +684,8 @@ export const deviceSetupFrom = (
     interruptMode: settings.interruptMode,
     audio: settings.audio,
     captions: settings.captions,
+    ...(options.keys?.includes("sound") === true ? { sound: settings.sound } : {}),
+    ...(options.keys?.includes("soundDevices") === true ? { soundDevices: settings.soundDevices } : {}),
     ...(settings.look.from === "device" ? { look: settings.look.look } : {})
   }
 }

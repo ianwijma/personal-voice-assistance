@@ -475,7 +475,9 @@ const settingsFromProfile = (p: DeviceProfile, assistantId: string): DeviceSetti
   },
   captions: { captions: p.captions, speakTyped: p.speakReplies },
   look: FOLLOW_ASSISTANT,
-  voice: FOLLOW_ASSISTANT
+  voice: FOLLOW_ASSISTANT,
+  sound: BUILT_IN_WEB_VOICE_SETTINGS.sound,
+  soundDevices: BUILT_IN_WEB_VOICE_SETTINGS.soundDevices
 })
 
 /** The fields present in `overrides`. */
