@@ -142,7 +142,7 @@ export const runCoreChecks = (options: CoreCheckOptions): Effect.Effect<Readonly
     // The model files of every assistant's hearing and voice
     for (const assistant of options.assistants ?? []) {
       if (!assistant.on) continue
-      const stt = options.checkStt?.(assistant) ?? defaultCheckStt(assistant, options.sttShared)
+      const stt = options.checkStt !== undefined ? options.checkStt(assistant) : defaultCheckStt(assistant, options.sttShared)
       if (stt !== undefined) {
         issues.push({
           id: `core.models.stt.${assistant.id}`,

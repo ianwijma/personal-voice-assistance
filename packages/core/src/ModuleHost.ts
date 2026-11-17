@@ -1156,7 +1156,14 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
   const readDemand = () => {
     if (options.demand === undefined) return
     const demand = options.demand()
-    for (const entry of entries) entry.demand = demand.get(entry.def.id)
+    let unavailableChanged = false
+    for (const entry of entries) {
+      const next = demand.get(entry.def.id)
+      if (entry.unavailable !== undefined && JSON.stringify(next) !== JSON.stringify(entry.demand)) unavailableChanged = true
+      entry.demand = next
+    }
+    // An unavailable module starts nothing, so nothing else would rebuild its instructions lines for its new assistants.
+    if (unavailableChanged) rebuild()
   }
 
   const notAllowed = (entry: Entry): HostResult =>

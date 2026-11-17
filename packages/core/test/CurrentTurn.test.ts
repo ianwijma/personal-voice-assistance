@@ -43,7 +43,14 @@ const [whereAction] = registerActions("home", [
 ])
 
 const conversationWith = (origin: TurnOrigin | undefined) => {
-  const registry = makeToolRegistry([{ name: "t", tools: [whoami, actionTool(whereAction!)] }])
+  const context = {
+    name: "Who",
+    get: Effect.gen(function*() {
+      seen.push({ where: "context", turn: yield* CurrentTurn })
+      return ""
+    })
+  }
+  const registry = makeToolRegistry([{ name: "t", tools: [whoami, actionTool(whereAction!)], context: [context] }])
   const setup: TurnSetup = { system: "sys", registry, ...(origin !== undefined ? { turnContext: origin } : {}) }
   const llm = makeScriptedLlm([
     [toolCall("c1", "whoami", {}), toolCall("c2", "home_where", {})],
@@ -59,13 +66,13 @@ const turn = Effect.gen(function*() {
 })
 
 describe("CurrentTurn in core's tool loop", () => {
-  it.effect("a tool, a fiber it forks and an action see the turn: ids, source and the setup's origin", () => {
+  it.effect("a context provider, a tool, a fiber it forks and an action see the turn: ids, source and the setup's origin", () => {
     seen.length = 0
     const origin: TurnOrigin = { assistantId: "jeff", deviceId: "d-kitchen-0001", deviceName: "Kitchen tablet" }
     return Effect.gen(function*() {
       const { conversationId, text } = yield* turn
       assert.strictEqual(text.trim(), "Done.")
-      assert.deepStrictEqual(seen.map((s) => s.where).sort(), ["action", "forked", "tool"])
+      assert.deepStrictEqual(seen.map((s) => s.where).sort(), ["action", "context", "forked", "tool"])
       for (const { turn: t, where } of seen) {
         assert.isDefined(t, where)
         assert.strictEqual(t!.conversationId, conversationId, where)
@@ -86,7 +93,7 @@ describe("CurrentTurn in core's tool loop", () => {
     seen.length = 0
     return Effect.gen(function*() {
       yield* turn
-      assert.strictEqual(seen.length, 3)
+      assert.strictEqual(seen.length, 4)
       assert.isTrue(seen.every((s) => s.turn === undefined))
     }).pipe(Effect.provide(conversationWith(undefined)))
   })
