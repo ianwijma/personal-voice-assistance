@@ -600,11 +600,13 @@ the migrated assistant stay (§6, "What was built").
 
 ### 5.1 Version
 
-`PROTOCOL_VERSION = 7` (`packages/protocol/src/constants.ts`; built; the voice-provider work kept 6).
+`PROTOCOL_VERSION = 7` (`packages/protocol/src/constants.ts`; built; the voice-provider work kept 6). Since then
+looks and voices (docs/LOOKS-AND-VOICES.md) took **8**: the `look` and `voice` device sections are new members of the
+closed set `DeviceSettingsKey` and required in `DeviceSettings`.
 
 The voice-node design claims 7 for itself (docs/VOICE-NODES.md §2), but its code is at 5: it branches from #3
-(93ed0fd), before voice sessions. **Order**: voice providers merge first (no bump), then this design's WP-2 (7). Voice
-nodes then rebase onto 7 and take **8**. They add `voice-node` as a `DeviceType` (its `builtIn` follow-up 0 for the
+(93ed0fd), before voice sessions. **Order**: voice providers merge first (no bump), then this design's WP-2 (7), then
+looks and voices (8). Voice nodes then rebase onto 8 and take **9**. They add `voice-node` as a `DeviceType` (its `builtIn` follow-up 0 for the
 assignment is what "one answer per phrase" means here), their node fields as `DeviceSettings` keys (`audio` input and
 output and volume, cues, `micStreaming`), `hello.node`, `node.*` messages and pairing. Their "Device defaults" page and
 reserved `agent` field are superseded by this design: the assistant list is that field.

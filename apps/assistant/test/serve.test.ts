@@ -90,6 +90,14 @@ describe("serve: handshake", () => {
     expect(error.error).toEqual({ code: "bad_message", message: "This page is out of date; reload it" })
     expect((await old.closed).code).toBe(CloseCode.protocolMismatch)
 
+    // A version 7 page (before the look and voice device sections, protocol 8) is out of date too, admin or voice.
+    for (const frontend of ["voice", "admin"] as const) {
+      const v7 = await connect()
+      v7.send({ type: "hello", protocol: 7, clientId: `client-v7-${frontend}`, resumeOwner: false, frontend })
+      expect((await v7.waitFor("error")).error.code).toBe("bad_message")
+      expect((await v7.closed).code).toBe(CloseCode.protocolMismatch)
+    }
+
     const silent = await connect()
     expect((await silent.closed).code).toBe(CloseCode.helloTimeout)
 

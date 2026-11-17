@@ -27,6 +27,10 @@ Assistant      += { look?: Look }                 // absent = the baseline chara
 DeviceSettings += { look: DeviceLook, voice: DeviceVoice }   // two new section keys; built-in { from: "assistant" } for both
 ```
 
+- **Protocol 8.** `look` and `voice` are new members of the closed set `DeviceSettingsKey` and required in
+  `DeviceSettings`, so `PROTOCOL_VERSION` went from 7 to 8: a version 7 page or server gets the version-mismatch
+  close (`4400`, "Reload") instead of refusing devices it cannot read. Voice nodes (docs/VOICE-NODES.md, unmerged)
+  take 9 (docs/ASSISTANTS.md §5.1).
 - They are two separate **section keys** of the device settings (§2.6 of docs/ASSISTANTS.md): each has its own
   "Own value · Reset" on a device, and a device type's defaults can set them for every device of the type. Resolution
   is unchanged: device own → type defaults → built-in.
