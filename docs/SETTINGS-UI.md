@@ -285,6 +285,7 @@ not in the UI unless stated); *drop* = remove.
 | `WEATHER_DEFAULT_PLACE`, `WEATHER_UNITS` | Place, units | Home's location and units (WP-12a) | `weather.ts` | yes | **UI** → Modules › Weather |
 | `HOME_ASSISTANT_URL`, `HOME_ASSISTANT_TOKEN` | HA address, token | — | `module-home-assistant/src/module.ts:43,51` | in the catalog since WP-12c | **UI**, token in the vault → Modules › Home Assistant |
 | `HOME_LOCATION`, `HOME_TIME_ZONE`, `HOME_LANGUAGE`, `HOME_UNITS`, `HOME_DATE_FORMAT`, `HOME_CURRENCY`, `HOME_CUP_SIZE`, `HOME_API_CONTACT` | Home (docs/ASSISTANTS.md §2.4) | —, the machine's, `en-GB`, `metric`, `en-GB`, `EUR`, `metric`, — | section `home` (`sectionDefinitions.ts`); the prompts' Home line and the modules' linked defaults | yes (WP-12a) | **UI** → Shared settings › Home |
+| `HOUSEHOLD_MEMBERS`, `HOUSEHOLD_DIET_ALLERGIES`, `HOUSEHOLD_DIET_DIETS`, `HOUSEHOLD_DIET_DISLIKES` | Members: the people (records with a hidden id the server makes) and the household's diet (protocol 11, P5) | none | section `members` (`serve/people.ts`); the `People` service | yes | **UI** → Shared settings › Members |
 | `RECORD_HEARD_AUDIO`, `RECORD_HEARD_AUDIO_MAX_FILES` | Save what the recogniser heard | false, 50 | read only through `sections.value` (`serveMode.ts:163–164`); env only as a lock | yes | **UI** → Diagnostics › Recordings |
 
 ### 1.6 Serve mode, paths and bootstrap

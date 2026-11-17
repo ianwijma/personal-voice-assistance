@@ -149,15 +149,17 @@ correctness.
 ## Pages
 
 Nothing is sent to voice pages by default. A collection opts in with `project(row, device)`, an event type with
-`project(event, device)` (`device`: `{ id, name }`; P5 adds the room and the default person): what that page may see,
+`project(event, device)` (`device`: `{ id, name, room?, privacy?, defaultPerson? }`, its effective place): what that page may see,
 or `undefined`. The server sends `household.snapshot` after `welcome`, then `household.event` for each change after its
 commit: `put` with the projected row when the page may see it now, `remove` when it is gone or hidden now but the page
 could see the value it replaced, nothing otherwise. A reconnecting page sends `hello.household.seq`; the replay
 follows the same rule per changed row, always with today's row through today's projection (never an older payload).
 When the log cannot say what the page had (a long or pruned gap, `history: "none"`, an erased row) it gets a fresh
 snapshot. Before any projection one function decides by scope (`mayRevealScopeTo` in `HouseholdFeed.ts`): household
-to every voice page, device to that device, nothing of assistant, conversation or (until `Privacy.mayReveal`, P5)
-person scope.
+to every voice page, device to that device, person scope where `Privacy.mayReveal` allows it (a `private` device, or a
+`shared` one whose default person is the row's person; never a `public` one), nothing of assistant or conversation
+scope. A snapshot reads a person-scoped collection once per person the page may see. When a device's place or default
+person changes, its pages get a fresh snapshot.
 
 ## Ambient facts
 

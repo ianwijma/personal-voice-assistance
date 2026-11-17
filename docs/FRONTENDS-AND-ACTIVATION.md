@@ -61,7 +61,9 @@ At most 64 devices are kept (least recently seen dropped first; devices with own
 
 A device's **settings** are the sections of `DeviceSettings`: `assistants` (the ordered assistants that answer here, each
 with its wake phrases and an optional follow-up time), `withoutPhrase`, `matching`, `voicePage`, `interruptMode`, `audio`,
-`captions`. Effective settings = built-in defaults ← the type's defaults (admin: Devices › Every browser) ← the device's own
+`captions`, `look`, `voice`, and since protocol 11 `place` (room, privacy, always on, accepts from others, quiet room, default
+person) and `capabilities` (what the owner takes away from what the device declares in `hello.device.capabilities`;
+docs/ARCHITECTURE.md, "People, rooms and device capabilities"). Effective settings = built-in defaults ← the type's defaults (admin: Devices › Every browser) ← the device's own
 sections (admin: Devices › the device; each section "Own value · Reset"). They are stored in `data/settings.json` version 4
 (`deviceTypes`, `devices`). Protocol 5's `DeviceProfile` (activation, one phrase list, follow-up, voice, interrupt mode,
 audio, captions) was that, flat and per field; its stored form is read only by the version 3 migration.
