@@ -33,9 +33,6 @@ catalogs:
     effect:
       specifier: 4.1.4
       version: 4.1.4
-    ical.js:
-      specifier: 2.2.1
-      version: 2.2.1
     semver:
       specifier: 7.8.6
       version: 7.8.6
@@ -422,9 +419,6 @@ importers:
       '@pva/core':
         specifier: workspace:*
         version: link:../core
-      ical.js:
-        specifier: 'catalog:'
-        version: 2.2.1
     devDependencies:
       '@effect/vitest':
         specifier: 'catalog:'
@@ -1983,9 +1977,6 @@ packages:
   http-errors@2.0.1:
     resolution: {integrity: sha512-4FbRdAX+bSdmo4AUFuS0WNiPz8NgFt+r8ThgNWmlrjQjt1Q7ZR9+zTlce2859x4KSXrwIsaeTqDoKQmtP8pLmQ==}
     engines: {node: '>= 0.8'}
-
-  ical.js@2.2.1:
-    resolution: {integrity: sha512-yK/UlPbEs316igb/tjRgbFA8ZV75rCsBJp/hWOatpyaPNlgw0dGDmU+FoicOcwX4xXkeXOkYiOmCqNPFpNPkQg==}
 
   iconv-lite@0.7.3:
     resolution: {integrity: sha512-IKXpvIzjnC9XTAUbVBcMfGS0EPaIXtW6v+zr+RRp+hqULEpo0owZax6wyRwPOJbWbzjYspQwusTsfVr0ifh4uQ==}
@@ -3665,8 +3656,6 @@ snapshots:
       setprototypeof: 1.2.0
       statuses: 2.0.2
       toidentifier: 1.0.1
-
-  ical.js@2.2.1: {}
 
   iconv-lite@0.7.3:
     dependencies:
