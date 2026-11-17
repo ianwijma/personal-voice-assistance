@@ -53,7 +53,9 @@ class Peer {
   readonly closed: Promise<number>
   private waiters: Array<() => void> = []
   private seq = 0
-  constructor(readonly ws: WebSocket) {
+  readonly ws: WebSocket
+  constructor(ws: WebSocket) {
+    this.ws = ws
     ws.on("message", (data, binary) => {
       if (binary) return
       const d = decodeServerMessage(data.toString())
