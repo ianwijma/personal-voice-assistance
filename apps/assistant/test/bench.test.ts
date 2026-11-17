@@ -27,7 +27,12 @@ describe("offline bench", () => {
       const delays = { ...zeroDelays, llmFirstTokenMs: 20, eagerLeadMs: 10 }
       const rows = yield* runOffline({ name: "eager", delays, eager: true }, 1)
       assert.strictEqual(rows.length, 4)
-      assert.isTrue(rows.every((r) => r.trace?.speculative === true && r.trace.outcome === "completed"))
+      const notPromoted = rows.filter((r) => !(r.trace?.speculative === true && r.trace.outcome === "completed"))
+      assert.deepStrictEqual(
+        notPromoted.map((r) => ({ label: r.label, speculative: r.trace?.speculative, outcome: r.trace?.outcome, marks: r.trace?.marks })),
+        [],
+        "every turn speculative and completed"
+      )
       assert.isTrue(rows.every((r) => r.trace!.marks.llmRequestSent! < r.trace!.marks.endOfTurn!))
     }))
 })

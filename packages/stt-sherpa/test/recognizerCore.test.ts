@@ -28,6 +28,10 @@ const offlineCore = (options: { maxQueuedDecodeMs?: number; decodeMs?: number } 
 }
 
 const tick = () => new Promise((r) => setTimeout(r, 0))
+/** Resolves once `condition` holds (the test's own timeout bounds the wait). */
+const until = async (condition: () => boolean) => {
+  while (!condition()) await tick()
+}
 
 describe("recognizerCore, whole-turn: a native decode that never returns", () => {
   it("continuous speech keeps at most the bound of queued audio; the turn is dropped and the owner told", async () => {
@@ -93,14 +97,20 @@ describe("recognizerCore, whole-turn: a native decode that never returns", () =>
   })
 
   it("a reset (new session) or a committed turn drops queued decodes before they reach the decoder", async () => {
-    const { audio, core, model, posted } = offlineCore({ decodeMs: 30 })
+    const { audio, core, model, posted } = offlineCore()
+    // The first decode is held until the commit and reset are in, rather than given a duration: feeding 105 s of
+    // audio can itself take longer than any short decode on a loaded machine.
+    model.hang.on = true
     audio(3 * 35_000) // three pieces: the first runs, the others wait
     await tick()
     assert.strictEqual(model.calls.started, 1)
+    assert.strictEqual(core.inspect().pendingDecodes, 3)
     core.onMessage({ type: "commit", session: 1, frame: 1_000_000 })
     // A finalise queued behind the running decode for an already-ended turn: answered without decoding.
     core.onMessage({ type: "reset", session: 2 })
-    await new Promise((r) => setTimeout(r, 100))
+    model.hang.on = false
+    model.hang.release?.()
+    await until(() => core.inspect().pendingDecodes === 0)
     assert.strictEqual(model.calls.started, 1, "no stale piece was decoded")
     assert.strictEqual(core.inspect().pendingDecodes, 0)
     assert.deepStrictEqual(posted.filter((m) => m.type === "error"), [])

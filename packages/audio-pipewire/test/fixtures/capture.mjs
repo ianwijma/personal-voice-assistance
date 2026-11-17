@@ -1,5 +1,7 @@
 // Stand-in for pw-record: writes bytes 0,1,2,...(mod 256) to stdout in odd-sized
 // pieces, records its pid, then either exits with an error or keeps running.
+// After the last write it creates <pidFile>.written (stdout to a pipe is synchronous on
+// Linux, so by then all but the pipe's own buffer has been read by the parent).
 // usage: capture.mjs <pidFile> <totalBytes> <exit|hang>
 import { writeFileSync } from "node:fs"
 const [pidFile, total, mode] = process.argv.slice(2)
@@ -12,6 +14,7 @@ for (let i = 0; offset < bytes.length; i++) {
   process.stdout.write(bytes.subarray(offset, offset + n))
   offset += n
 }
+writeFileSync(`${pidFile}.written`, "")
 if (mode === "exit") {
   process.stderr.write("no such target node\n")
   process.stdout.end(() => process.exit(3))

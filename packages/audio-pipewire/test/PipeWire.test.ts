@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync } from "node:fs"
+import { existsSync, mkdtempSync, readFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { fileURLToPath } from "node:url"
@@ -74,16 +74,36 @@ describe("capture", () => {
   it.live("a consumer that falls behind gets at most the newest 3 s, not everything the process wrote", () =>
     Effect.gen(function*() {
       const pidFile = join(tmp(), "pid")
-      let received = 0
-      const fiber = yield* captureStream(node("capture.mjs", pidFile, 640 * 2000, "hang")).pipe(
-        Stream.runForEach(() => Effect.andThen(Effect.sync(() => void received++), received === 0 ? Effect.sleep(700) : Effect.void)),
-        Effect.forkChild
+      const written = `${pidFile}.written`
+      // The consumer stalls on the first batch it pulls. That batch is whatever was queued at the
+      // first pull (1 frame on a quiet machine, 50+ on a loaded one), and it is already in the
+      // consumer's hands, so it is counted apart from what the stall lets through.
+      let firstBatch = 0
+      let afterStall = 0
+      const stall = Effect.gen(function*() {
+        const start = yield* now
+        // Stall until the stand-in has written all 2000 frames, so the sliding buffer has
+        // certainly overflowed, then a little longer for the parent to read the pipe's tail.
+        while (!existsSync(written)) yield* Effect.sleep(10)
+        yield* Effect.sleep(Math.max(100, 700 - ((yield* now) - start)))
+      })
+      const error = yield* captureStream(node("capture.mjs", pidFile, 640 * 2000, "exit")).pipe(
+        Stream.runForEachArray((frames) => {
+          if (firstBatch === 0) {
+            firstBatch = frames.length
+            return stall
+          }
+          afterStall += frames.length
+          return Effect.void
+        }),
+        Effect.flip
       )
-      // Long enough for the stand-in process to start when the whole suite is loading the machine.
-      yield* Effect.sleep(2_500)
-      yield* Fiber.interrupt(fiber)
-      assert.isAtMost(received, 1 + captureBufferFrames + 20, `received ${received} of 2000 frames`)
-      assert.isAbove(received, 1)
+      assert.strictEqual(error._tag, "AudioError")
+      assert.isAtLeast(firstBatch, 1)
+      // Everything was queued while the consumer stalled; only the newest 3 s survive.
+      // The margin covers a read of the pipe's tail landing after the stall ends.
+      assert.isAtMost(afterStall, captureBufferFrames + 20, `${afterStall} frames after the stall (first batch ${firstBatch})`)
+      assert.isAtLeast(afterStall, captureBufferFrames, `${afterStall} frames after the stall (first batch ${firstBatch})`)
     }))
 
   it.live("an unexpected exit fails the stream with AudioError carrying stderr, after the audio", () =>
