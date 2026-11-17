@@ -110,7 +110,7 @@ import { type Keys, makeKeys } from "./Keys.ts"
 import { makeSections } from "./sections.ts"
 import { makeAssistants } from "./assistants.ts"
 import { makeSessionHub, type SessionHub } from "./SessionHub.ts"
-import { DataDirConfig, KEYS_LOCKED_MESSAGE, loadSettingsStore, type SettingsStore, SettingsStoreError } from "./SettingsStore.ts"
+import { DataDirConfig, KEYS_LOCKED_MESSAGE, loadSettingsStore, type SaveStep, type SettingsStore, SettingsStoreError } from "./SettingsStore.ts"
 import { makeApi } from "./api.ts"
 import { isModuleRoutePath, makeModuleRouter } from "./moduleRoutes.ts"
 import { makeRouteTokens } from "./RouteTokens.ts"
@@ -126,12 +126,20 @@ import { openServeHousehold } from "./household.ts"
 import { makeHouseholdPush } from "./HouseholdPush.ts"
 import { Devices, hostEvent, People, Privacy, withContextProvider } from "@pva/core"
 import { makeDeviceFacts } from "./deviceFacts.ts"
-import { makePeopleService, MEMBERS_KEY, MEMBERS_SECTION_ID, personIdsOf } from "./people.ts"
+import {
+  makeMembersGate,
+  makePeopleService,
+  MEMBERS_ENV_REFUSED,
+  MEMBERS_KEY,
+  MEMBERS_SECTION_ID,
+  membersNeedIds,
+  personIdsOf
+} from "./people.ts"
 import { householdBackupIssues, runMaintenance } from "@pva/store-sqlite"
 import { type KdfParams, openVault, type Vault, VaultPathConfig } from "./Vault.ts"
 import * as SherpaStt from "@pva/stt-sherpa"
 import * as SherpaTts from "@pva/tts-sherpa"
-import type { ToolId } from "@pva/protocol"
+import type { SettingValue, ToolId } from "@pva/protocol"
 
 /**
  * `serve` mode (docs/UI-AND-MODULES.md §4): one process, one port. The browser
@@ -237,6 +245,8 @@ export interface ServeOptions {
   readonly minuteMs?: number
   readonly helloTimeoutMs?: number
   readonly pingIntervalMs?: number
+  /** Tests: called before each file step of a settings save (to hold one save while another request comes in). */
+  readonly settingsBeforeStep?: (step: SaveStep) => void | Promise<void>
 }
 
 export interface ServeHandle {
@@ -281,7 +291,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     // Every save may change which language models are wanted (assistants, devices, shared keys): the pool reconciles.
     let resourcesChanged = () => {}
     const store = notifyAfterSaves(
-      yield* loadSettingsStore(options.dataDir, { lock, vault, assistants: { env, catalog } }),
+      yield* loadSettingsStore(options.dataDir, { lock, vault, assistants: { env, catalog }, ...(options.settingsBeforeStep !== undefined ? { beforeStep: options.settingsBeforeStep } : {}) }),
       () => resourcesChanged()
     )
     for (const problem of store.problems) yield* Effect.logError(problem)
@@ -306,7 +316,18 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     // Where environment values came from (.env with its line, or the process), for the fields' source and lock.
     const envOrigin = options.envOrigin ?? envView.sourceOf
     const envLocation = envView.locationOf
-    const sections = makeSections(store, env, { envOrigin, envLocation })
+    // P5: one serialized operation owns people and every reference to them (`people.ts`, `MembersGate`): a Members
+    // save and the clean-up of the devices whose default person it removed, and every device or device type save.
+    const membersGate = makeMembersGate()
+    /** After a Members save, inside the gate: no device or device type keeps a removed person as its default. */
+    let afterMembersSave: Effect.Effect<void> = Effect.void
+    const sections = makeSections(store, env, {
+      envOrigin,
+      envLocation,
+      around: (id, save) =>
+        id !== MEMBERS_SECTION_ID ? save : membersGate.run(Effect.tap(save, (u) => (u.result.ok ? Effect.suspend(() => afterMembersSave) : Effect.void)))
+    })
+    if (env[MEMBERS_KEY] !== undefined && env[MEMBERS_KEY] !== "") yield* Effect.logWarning(`${MEMBERS_KEY} is set in the environment. ${MEMBERS_ENV_REFUSED}`)
     /** The Home values the modules' linked defaults come from (docs/ASSISTANTS.md §2.6). */
     const homeDefaults = (moduleId: string) =>
       linkedModuleDefaults({
@@ -328,7 +349,17 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     // P5: the household's people (shared settings › Members); a diet a module records is saved like an admin edit.
     const people = makePeopleService({
       value: (key) => sections.value(key),
-      update: (patch) => Effect.map(sections.update(MEMBERS_SECTION_ID, patch), (u) => (u.result.ok ? { ok: true as const } : { ok: false as const, message: u.result.error.message }))
+      edit: (build) => {
+        let code: "unknown_person" | undefined
+        return Effect.map(
+          sections.edit(MEMBERS_SECTION_ID, (value) => {
+            const built = build(value)
+            if ("refused" in built) code = built.code
+            return built
+          }),
+          (u) => (u.result.ok ? { ok: true as const } : { ok: false as const, message: u.result.error.message, ...(code !== undefined ? { code } : {}) })
+        )
+      }
     })
     /** Projections that failed for pages, per module (a Health issue each; `host` exists once the store is open). */
     const feedProblems = new Map<string, { what: string; message: string }>()
@@ -350,6 +381,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     const deviceFacts = makeDeviceFacts({
       file: () => store.settings(),
       declaredOf: (id) => devices.declaredOf(id),
+      lastSeenOf: (id) => devices.lastSeenOf(id),
       live: (id) => hub?.deviceLive(id) ?? { connected: false, visible: false },
       isPerson: (id) => people.get(id) !== undefined,
       nameOfPerson: (id) => people.nameOf(id),
@@ -532,7 +564,9 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
         const v = sections.value("HOME_AMBIENT_FACTS")
         return v === "all" || v === "module-on" ? v : "off"
       },
-      moduleOn: (assistantId, moduleId) => assistantsNow().get(assistantId)?.modules[moduleId]?.on === true
+      moduleOn: (assistantId, moduleId) => assistantsNow().get(assistantId)?.modules[moduleId]?.on === true,
+      // P5: a person's ambient lines only where the privacy rule lets the turn's device hear them.
+      mayRevealPerson: (owner, turn) => deviceFacts.privacy.mayReveal(owner, turn)
     })
 
     // ---- The resource pool: one language-model instance per distinct configuration (docs/ASSISTANTS.md §3.2, WP-9)
@@ -1264,6 +1298,8 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
           deviceSettings: () => deviceSettingsOf(device?.id),
           // P5: `CurrentTurn.room` and `.person` (the device's default person).
           place: () => deviceFacts.originOf(device?.id),
+          // P5: "Don't use its speaker", or a declaration without one: nothing is sent to be played.
+          speakerAllowed: () => deviceFacts.speakerAllowed(device?.id),
           hearing: hearingOf(device?.id),
           ...(options.hearerSwitchWaitMs !== undefined ? { hearerSwitchWaitMs: options.hearerSwitchWaitMs } : {}),
           assistants: assistantsNow,
@@ -1329,6 +1365,8 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       speechMemoryWarning,
       voiceProblem,
       isPerson: (id) => people.get(id) !== undefined,
+      // P5: device and device type saves check their default person against the committed Members, inside the gate.
+      membersGate,
       // TypeSafe is set up: the routing section is switched on, with a key and a valid address (WP-14).
       canAuto: routing.ready
     })
@@ -1360,6 +1398,8 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       household: push.hooks,
       targetDevice: deviceFacts.targetOf,
       onDeviceChange: deviceFacts.changed,
+      boundaryOf: deviceFacts.boundaryOf,
+      speakerAllowed: deviceFacts.speakerAllowed,
       admin,
       health,
       devices,
@@ -1422,12 +1462,33 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       Effect.flatMap((n) => (n === 0 ? Effect.void : Effect.sync(() => hubNow.entitiesChanged()))),
       Effect.catch((e) => Effect.logWarning(`A removed person is still some device's default person: ${e.message}`))
     )
+    afterMembersSave = clearRemovedPeople
+    /** Who was in Members at the last look: a change of it gives every page a fresh snapshot (a removed person's rows go). */
+    let memberIds = [...personIdsOf(sections.value(MEMBERS_KEY))].sort().join(",")
     sections.subscribe((section) => {
       if (section.id !== MEMBERS_SECTION_ID) return
       hubNow.refreshDevices()
-      run(clearRemovedPeople)
+      const ids = [...personIdsOf(sections.value(MEMBERS_KEY))].sort().join(",")
+      if (ids !== memberIds) {
+        memberIds = ids
+        push.resync()
+      }
     })
-    if (store.blocked() === undefined) run(clearRemovedPeople)
+    // At start, inside the gate: a hand-edited Members value gets its ids (written), and a removed person's references
+    // go (after a crash between the two steps of an earlier version).
+    if (store.blocked() === undefined) {
+      const raw = sections.value(MEMBERS_KEY)
+      run(
+        membersNeedIds(raw)
+          // Through the section's own save (which runs in the gate and then clears removed people): validated, and
+          // the new ids made by `withPersonIds` (its `normalize`).
+          ? Effect.flatMap(
+            sections.edit(MEMBERS_SECTION_ID, () => ({ values: { [MEMBERS_KEY]: raw as SettingValue }, secrets: {} })),
+            (u) => (u.result.ok ? Effect.void : Effect.logWarning(`Members could not be given their ids: ${u.result.error.message}`))
+          )
+          : membersGate.run(clearRemovedPeople)
+      )
+    }
     keys.subscribe((state) => {
       hubNow.vaultChanged()
       sections.announceAll()

@@ -50,7 +50,13 @@ const visibility = (o: Common) => ({
   overridable: o.overridable === true
 })
 
-/** A list of short strings: aliases, greeting words. Trimmed, empty items dropped, duplicates (ignoring case) dropped. */
+/** Line breaks, control characters and bidirectional overrides: never in a one-line value. */
+export const NOT_ONE_LINE = /[\p{Cc}\p{Zl}\p{Zp}\u202A-\u202E\u2066-\u2069]/u
+
+/**
+ * A list of short strings: aliases, greeting words. Trimmed, empty items dropped, duplicates (ignoring case) dropped;
+ * an item with a line break or a control character is refused.
+ */
 const textList = (o: Common & {
   readonly default?: ReadonlyArray<string>
   readonly maxItems?: number
@@ -65,6 +71,8 @@ const textList = (o: Common & {
     const items: Array<string> = []
     for (const item of raw.map((s) => s.trim()).filter((s) => s.length > 0)) {
       if (item.length > itemMaxLength) return fail(`"${item.slice(0, 20)}…" is longer than ${itemMaxLength} characters`)
+      // Items are short words that may reach a prompt: one line each.
+      if (NOT_ONE_LINE.test(item)) return fail(`"${item.slice(0, 20).replace(NOT_ONE_LINE, " ")}…" holds a line break or a control character`)
       if (seen.has(item.toLowerCase())) continue
       seen.add(item.toLowerCase())
       items.push(item)

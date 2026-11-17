@@ -33,10 +33,15 @@ export const makeHouseholdPush = (options: {
     dirty: boolean
     signal: Deferred.Deferred<void>
     readonly closed: Deferred.Deferred<void>
-    /** Set by `resync`: start again from a snapshot. */
-    fresh: boolean
+    /** Replaced (a new generation follows the connection) or closed: it may send nothing more, from now on. */
+    ended: boolean
   }
   const followers = new Map<string, Follower>()
+
+  const end = (f: Follower) => {
+    f.ended = true
+    Deferred.doneUnsafe(f.closed, Effect.void)
+  }
 
   const wake = (f: Follower) => {
     f.dirty = true
@@ -54,8 +59,13 @@ export const makeHouseholdPush = (options: {
       })
     })
 
-  /** Send one message; `false` when the connection could not take it (it is then followed no more). */
+  /**
+   * Send one message; `false` when the connection could not take it (it is then followed no more), or when this
+   * follower is not the connection's current one: work of an older generation (begun under an older place of the
+   * device) is never delivered, whatever point it had reached.
+   */
   const send = (f: Follower, message: ServerMessage): boolean => {
+    if (f.ended || followers.get(f.connection.id) !== f) return false
     try {
       f.connection.send(message)
       return true
@@ -70,7 +80,6 @@ export const makeHouseholdPush = (options: {
     Effect.gen(function*() {
       const device: TargetDevice = f.connection.device
       for (;;) {
-        f.fresh = false
         const snap = yield* feed.snapshot(device)
         for (const [part, collections] of snap.parts.entries()) {
           if (!send(f, { type: "household.snapshot", seq: snap.seq, part, final: part === snap.parts.length - 1, collections: [...collections] })) return
@@ -88,9 +97,7 @@ export const makeHouseholdPush = (options: {
           for (const event of r.events) if (!send(f, { type: "household.event", event })) return
           if (r.events.length > 0) yield* Effect.yieldNow
           if (r.more) continue
-          if (f.fresh) break
           yield* waitForWake(f)
-          if (f.fresh) break
         }
       }
     }).pipe(
@@ -107,8 +114,8 @@ export const makeHouseholdPush = (options: {
     connected: (connection) => {
       if (!feed.active) return
       const previous = followers.get(connection.id)
-      if (previous !== undefined) Deferred.doneUnsafe(previous.closed, Effect.void)
-      const f: Follower = { connection, dirty: false, signal: Deferred.makeUnsafe<void>(), closed: Deferred.makeUnsafe<void>(), fresh: false }
+      if (previous !== undefined) end(previous)
+      const f: Follower = { connection, dirty: false, signal: Deferred.makeUnsafe<void>(), closed: Deferred.makeUnsafe<void>(), ended: false }
       followers.set(connection.id, f)
       options.run(Effect.raceFirst(follow(f), Deferred.await(f.closed)).pipe(
         Effect.ensuring(Effect.sync(() => {
@@ -116,23 +123,25 @@ export const makeHouseholdPush = (options: {
         }))
       ))
     },
-    // P5: the device's place or default person changed: what it may see changed, so it starts again from a snapshot.
+    // P5: the device's place or default person changed: what it may see changed. A new generation starts from a
+    // fresh snapshot; the old one (a snapshot or catch-up still reading under the old place) is ended and can no
+    // longer send.
     placeChanged: (connection) => hooks.connected(connection),
     closed: (connection) => {
       const f = followers.get(connection.id)
-      if (f !== undefined) Deferred.doneUnsafe(f.closed, Effect.void)
+      if (f !== undefined) end(f)
     },
     deviceConnected: (deviceId) => bus.publish(hostEvent("device.connected", { deviceId }, { kind: "device", id: deviceId })),
     deviceDisconnected: (deviceId) => bus.publish(hostEvent("device.disconnected", { deviceId }, { kind: "device", id: deviceId }))
   }
 
-  /** Give every page of `deviceId` (all pages: `undefined`) a fresh snapshot (its place changed; P5). */
+  /**
+   * Give every page of `deviceId` (all pages: `undefined`) a fresh snapshot, from a new generation (its place changed,
+   * or who is in Members; P5): what the old one was doing is never sent.
+   */
   const resync = (deviceId?: string) => {
-    for (const f of followers.values()) {
-      if (deviceId !== undefined && f.connection.device.id !== deviceId) continue
-      f.fresh = true
-      wake(f)
-    }
+    const matching = [...followers.values()].filter((f) => deviceId === undefined || f.connection.device.id === deviceId)
+    for (const f of matching) hooks.connected(f.connection)
   }
 
   /** Wake every follower after each commit, and forward module events, until the scope closes. */

@@ -1,5 +1,6 @@
 import { makeWebAudio, type WebAudio } from "@pva/audio-web"
 import {
+  type AudioOutput,
   type AgentTurnSetup,
   type ConversationEvent,
   type ConversationInput,
@@ -121,6 +122,11 @@ export interface VoiceSessionOptions {
    */
   readonly place?: () => { readonly room?: string; readonly person?: TurnPerson }
   /**
+   * P5: whether replies may be spoken here now (the device's effective speaker), read at the start of every play.
+   * When not, the reply's audio is made and counted as played but never sent to the page. Absent: always.
+   */
+  readonly speakerAllowed?: () => boolean
+  /**
    * The recogniser this device hears with now (the resource pool's for its hearer, WP-11). Read when the recogniser
    * loop starts and again after every `hearingChanged`. Absent: the engine build's `stt` (tests).
    */
@@ -201,6 +207,12 @@ export interface SessionConversations {
   /** Committed turns in `assistant`'s current conversation. */
   readonly turnsOf: (assistant?: string) => number
   readonly newConversation: (assistant?: string) => Effect.Effect<ConversationInfo>
+  /**
+   * P5: every assistant's conversation on the device starts again (a change of the device's privacy or default
+   * person): each running reply is stopped, each history dropped and its agents' sessions ended, and the ids reserved
+   * for assistants that have not spoken yet are replaced.
+   */
+  readonly resetAll: Effect.Effect<void>
   /** The answering assistant now (`undefined`: the device has none). */
   readonly answering: () => string | undefined
   /** Start running on the engines (now and after every rebuild) until `end`. */
@@ -324,6 +336,35 @@ type Target = AssistantConversation
 
 const idleMsOf = (assistant: Assistant | undefined, minuteMs: number): number | undefined =>
   assistant === undefined || assistant.newConversationAfter === "never" ? undefined : assistant.newConversationAfter * minuteMs
+
+/**
+ * P5: `output` while `allowed()` says so at the start of a play; otherwise a play that takes the whole reply and
+ * reports it as played (so the turn is recorded as answered) without sending any of it anywhere.
+ */
+export const silentUnless = (output: AudioOutput["Service"], allowed: () => boolean): AudioOutput["Service"] => ({
+  ...(output.reportsPlayback !== undefined ? { reportsPlayback: output.reportsPlayback } : {}),
+  play: (audio, sampleRate, observer) =>
+    Effect.suspend(() => {
+      let ok = true
+      try {
+        ok = allowed()
+      } catch {
+        ok = false
+      }
+      if (ok) return output.play(audio, sampleRate, observer)
+      let samples = 0
+      let started = false
+      return Stream.runForEach(audio, (chunk) =>
+        Effect.sync(() => {
+          if (!started) {
+            started = true
+            observer?.started()
+          }
+          samples += Math.floor(chunk.byteLength / 2)
+          observer?.progress(samples)
+        })).pipe(Effect.ensuring(Effect.sync(() => observer?.final?.(samples))))
+    })
+})
 
 export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<VoiceSession, never, Scope.Scope> =>
   Effect.gen(function*() {
@@ -481,8 +522,8 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
         if (unsuppress !== undefined) clearTimeout(unsuppress)
       })
     )
-    // One speaker for every conversation of the session (docs/ASSISTANTS.md §1.2).
-    const lease = makeOutputLease(web.output)
+    // One speaker for every conversation of the session (docs/ASSISTANTS.md §1.2); silent where the device may not speak.
+    const lease = makeOutputLease(options.speakerAllowed === undefined ? web.output : silentUnless(web.output, options.speakerAllowed))
 
     // Clause texts per turn, so the echo gate knows the words that just played (turn ids are unique per session).
     const clauses = new Map<number, { texts: Array<string>; given: number }>()
@@ -946,6 +987,26 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
       holderCheck()
     }
 
+    const newConversationOf = (assistant: string | undefined): Effect.Effect<ConversationInfo> =>
+      Effect.suspend(() => {
+        const a = assistant ?? answering()
+        const made = conversationOf(a)
+        if (made !== undefined) {
+          // Its conversation stops the open utterance; the dispatcher must not hand the rest to another one.
+          dispatcher.cancelUtterance(a!)
+          utteranceCancelled(a)
+          return made.newConversation
+        }
+        return Effect.sync(() => {
+          const info = fresh()
+          reserved.set(a ?? "", info)
+          turnsBy.set(a ?? "", 0)
+          options.send({ type: "conversation", id: info.id, reason: "new", startedAt: info.startedAt, ...(a !== undefined ? { assistantId: a } : {}) })
+          options.onChange(false)
+          return info
+        })
+      })
+
     const conversations: SessionConversations = {
       sendText: (text, speak, named) =>
         Effect.suspend(() => {
@@ -971,25 +1032,12 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
       lastTurnAt: (assistant) => conversationOf(assistant ?? answering())?.lastTurnAt(),
       lastTurnId: (assistant) => conversationOf(assistant ?? answering())?.lastTurnId(),
       turnsOf: (assistant) => turnsBy.get(assistant ?? answering() ?? "") ?? 0,
-      newConversation: (assistant) =>
-        Effect.suspend(() => {
-          const a = assistant ?? answering()
-          const made = conversationOf(a)
-          if (made !== undefined) {
-            // Its conversation stops the open utterance; the dispatcher must not hand the rest to another one.
-            dispatcher.cancelUtterance(a!)
-            utteranceCancelled(a)
-            return made.newConversation
-          }
-          return Effect.sync(() => {
-            const info = fresh()
-            reserved.set(a ?? "", info)
-            turnsBy.set(a ?? "", 0)
-            options.send({ type: "conversation", id: info.id, reason: "new", startedAt: info.startedAt, ...(a !== undefined ? { assistantId: a } : {}) })
-            options.onChange(false)
-            return info
-          })
-        }),
+      newConversation: newConversationOf,
+      resetAll: Effect.suspend(() => {
+        // Every conversation made so far, and every id reserved for an assistant that has not spoken yet.
+        const assistants = new Set([...dispatcher.conversations().keys(), ...reserved.keys()])
+        return Effect.forEach([...assistants], (a) => newConversationOf(a === "" ? undefined : a), { discard: true })
+      }),
       answering,
       start: () => {
         if (started) return

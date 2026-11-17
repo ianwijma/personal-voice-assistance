@@ -108,7 +108,8 @@ export interface AssistantsData {
 }
 
 export interface SettingsFile extends AssistantsData {
-  readonly version: 4
+  /** `SETTINGS_VERSION` (`SettingsStore.ts`): 5 since P5. */
+  readonly version: 5
   /** The save that wrote this file (see `SettingsStore.ts`, "Revisions"). */
   readonly revision?: number
   /** Module shared settings; `enabled` is mirrored into the migrated assistant and read by today's module host. */
@@ -706,7 +707,7 @@ export const migrateToV4 = (input: MigrationInput): SettingsFile => {
   }
 
   return {
-    version: 4,
+    version: 5,
     ...(file.revision !== undefined ? { revision: file.revision } : {}),
     modules: file.modules,
     assistant: file.assistant,

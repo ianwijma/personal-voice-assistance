@@ -3,7 +3,8 @@ import { Effect } from "effect"
 import type { EventType, HouseholdEvent } from "./EventBus.ts"
 import type { ChangeRecord, Collection, HouseholdStore, Row, ScopeRef, StoreError, TargetDevice } from "./HouseholdStore.ts"
 import { MAX_VALUE_CHARS } from "./HouseholdStore.ts"
-import { mayRevealTo } from "./Privacy.ts"
+import { mayRevealPersonScopeTo, membersFrom, personScopesFor } from "./FeedPeople.ts"
+import type { IsMember } from "./Privacy.ts"
 
 /**
  * What voice pages receive of the household data (docs/STORING-DATA.md "Pages"; docs/MODULES-PLAN.md §4 P4).
@@ -13,7 +14,8 @@ import { mayRevealTo } from "./Privacy.ts"
  * state** is ever projected, never a value from the change log or from an event:
  *
  * - **Snapshot** (`snapshot`) after every `welcome`, also after a reconnect: every visible row now, projected, in parts
- *   that each fit one text frame (`SNAPSHOT_PART_CHARS`), at most `SNAPSHOT_ROWS` rows per collection and
+ *   that each fit one text frame (`SNAPSHOT_PART_CHARS`), at most `SNAPSHOT_ROWS` rows per collection (P5: over all
+ *   its person scopes together, `FeedPeople.ts`) and
  *   `SNAPSHOT_MAX_CHARS` in all (`truncated` says when rows were left out). It comes with a cursor: the change number
  *   it is current to and the rows the page now holds.
  * - **Changes** (`catchUp`): the change log after the cursor, a page of `CATCH_UP_CHANGES` at a time, read from the
@@ -32,18 +34,18 @@ import { mayRevealTo } from "./Privacy.ts"
 
 /**
  * THE one place where the scope of a row or event decides whether a voice page may see it at all. Household data goes
- * to every voice page, device data to that device only, person data where `Privacy.mayReveal` allows it
- * (docs/MODULES-PLAN.md §2 row 8: a `private` device, or a `shared` one whose default person is the owner), assistant
- * and conversation data to none (they belong to turns, not to screens).
+ * to every voice page, device data to that device only, person data by the privacy rule (P5, `FeedPeople.ts`: a known
+ * device, an owner in Members now, `isMember`; without it, none), assistant and conversation data to none (they
+ * belong to turns, not to screens).
  */
-export const mayRevealScopeTo = (scope: ScopeRef, device: TargetDevice): boolean => {
+export const mayRevealScopeTo = (scope: ScopeRef, device: TargetDevice, isMember?: IsMember): boolean => {
   switch (scope.kind) {
     case "household":
       return true
     case "device":
       return device.id !== undefined && scope.id === device.id
     case "person":
-      return mayRevealTo(scope.id, { privacy: device.privacy ?? "shared", defaultPerson: device.defaultPerson ?? null })
+      return mayRevealPersonScopeTo(scope.id, device, isMember)
     case "assistant":
     case "conversation":
       return false
@@ -127,8 +129,8 @@ const runProjection = <T>(project: ((x: T, device: TargetDevice) => unknown) | u
 }
 
 /** What `device` may see of `row` (`undefined`: nothing, also when the projection fails). Plain JSON. */
-export const projectRow = (collection: Collection<any>, row: Row<unknown> | undefined, device: TargetDevice): unknown => {
-  if (row === undefined || !mayRevealScopeTo(row.scope, device)) return undefined
+export const projectRow = (collection: Collection<any>, row: Row<unknown> | undefined, device: TargetDevice, isMember?: IsMember): unknown => {
+  if (row === undefined || !mayRevealScopeTo(row.scope, device, isMember)) return undefined
   const p = runProjection(collection.project, row, device)
   return p.visible ? p.value : undefined
 }
@@ -140,10 +142,11 @@ export const makeHouseholdFeed = (options: {
   readonly modules: ReadonlyArray<FeedModule>
   /** A failing projection (serve mode: a Health issue). */
   readonly report?: (problem: FeedProblem) => void
-  /** The household's person ids now (Members), for the person-scoped rows of a snapshot. Absent: the device's default person only. */
+  /** P5: the household's person ids now (Members), `FeedPeople.ts`. Absent: nobody, so no person-scoped data. */
   readonly people?: () => ReadonlyArray<string>
 }): HouseholdFeed => {
   const { store } = options
+  const isMember = membersFrom(options.people)
   const collections = new Map<string, Collection<any>>()
   const eventTypes = new Map<string, EventType>()
   for (const m of options.modules) {
@@ -162,7 +165,7 @@ export const makeHouseholdFeed = (options: {
   }
 
   const projectFor = (moduleId: string, collection: Collection<any>, row: Row<unknown> | undefined, device: TargetDevice): Projected => {
-    if (row === undefined || !mayRevealScopeTo(row.scope, device)) return HIDDEN
+    if (row === undefined || !mayRevealScopeTo(row.scope, device, isMember)) return HIDDEN
     const p = runProjection(collection.project, row, device)
     if (!p.visible && p.problem !== undefined) report(moduleId, collection.name, `row ${row.id}: ${p.problem}`)
     return p
@@ -171,7 +174,7 @@ export const makeHouseholdFeed = (options: {
   const live = (event: HouseholdEvent, device: TargetDevice): HouseholdEventInfo | undefined => {
     if (event.change !== undefined) return undefined
     const type = eventTypes.get(event.type)
-    if (type === undefined || !usable(event.module) || !mayRevealScopeTo(event.scope, device)) return undefined
+    if (type === undefined || !usable(event.module) || !mayRevealScopeTo(event.scope, device, isMember)) return undefined
     const p = runProjection(type.project, event, device)
     if (!p.visible) {
       if (p.problem !== undefined) report(event.module, event.type, p.problem)
@@ -187,9 +190,9 @@ export const makeHouseholdFeed = (options: {
       ? [{ kind: "device", id: device.id }]
       : collection.scope === "person"
       // P5: one read per person the device may see, the device's default person first.
-      ? [...new Set([...(device.defaultPerson !== undefined ? [device.defaultPerson] : []), ...(options.people?.() ?? [])])].map((id): ScopeRef => ({ kind: "person", id }))
+      ? personScopesFor(device, options.people)
       : []
-    return scopes.filter((scope) => mayRevealScopeTo(scope, device))
+    return scopes.filter((scope) => mayRevealScopeTo(scope, device, isMember))
   }
 
   const snapshot = (device: TargetDevice) =>
@@ -206,16 +209,23 @@ export const makeHouseholdFeed = (options: {
         if (scopes.length === 0) continue
         let chunk: { module: string; collection: string; rows: Array<HouseholdRow>; truncated: boolean } = { module: moduleId, collection: collection.name, rows: [], truncated: false }
         parts[parts.length - 1]!.push(chunk)
+        // P5: a collection's scopes (one per person) share its SNAPSHOT_ROWS; one row more is read to know whether
+        // any were left out.
+        let left = SNAPSHOT_ROWS
         for (const scope of scopes) {
-          const read = yield* Effect.result(store.forModule(moduleId).collection(collection).list({ scope, limit: SNAPSHOT_ROWS }))
+          if (left <= 0) {
+            chunk.truncated = true
+            break
+          }
+          const read = yield* Effect.result(store.forModule(moduleId).collection(collection).list({ scope, limit: left + 1 }))
           if (read._tag === "Failure") {
             const e = read.failure
             if (e._tag !== "ScopeUnknown") report(moduleId, collection.name, `could not be read for a page: ${e.message}`)
             chunk.truncated = true
             continue
           }
-          if (read.success.length >= SNAPSHOT_ROWS) chunk.truncated = true
-          for (const row of read.success) {
+          if (read.success.length > left) chunk.truncated = true
+          for (const row of read.success.slice(0, left)) {
             const p = projectFor(moduleId, collection, row, device)
             if (!p.visible) continue
             const out: HouseholdRow = { id: row.id, rev: row.rev, scope: row.scope, value: p.value, updatedAt: row.updatedAt }
@@ -234,6 +244,7 @@ export const makeHouseholdFeed = (options: {
             cursor.visible.add(rowKey(moduleId, collection.name, row.id))
             partChars += chars
             total += chars
+            left--
           }
         }
         yield* Effect.yieldNow

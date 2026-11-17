@@ -78,7 +78,8 @@
  * `capabilities` and `DeviceSettings` requires both (`DevicePlace`, `CapabilityOverrides`), so a version 10 peer would
  * refuse a version 11 device entry. Additive, within 11: `hello.device.capabilities` and `device.caps`
  * (`DeviceCapabilities`, `DeviceLiveState`), `DeviceRecord.declared`, `DeviceListInfo.declared` / `live`, and
- * `RecordItemField.hidden` (a record field kept but not drawn: a person's id in Members).
+ * `RecordItemField.hidden` (a record field kept but not drawn: a person's id in Members), `EnvEntry.refused` (a known
+ * variable that is not read, with why: `HOUSEHOLD_MEMBERS`). `DevicePlace.room` is one line of text.
  */
 export const PROTOCOL_VERSION = 11
 

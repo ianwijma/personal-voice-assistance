@@ -148,7 +148,7 @@ import { createVoiceAssistants, scenarioSettings, scriptedTurn } from "./voiceAs
 import { encodeWav, MOCK_PROVIDERS } from "./voices.ts"
 import { createModelPickersMock } from "./modelPickers.ts"
 import { createModuleRoutesMock, demoHomeAction, demoHomeModule } from "./demoHome.ts"
-import type { Condition, FieldError } from "@pva/protocol"
+import { checkMembers, type Condition, type FieldError } from "@pva/protocol"
 
 const PORT = Number(process.env.MOCK_PORT ?? 8787)
 const HOST = process.env.MOCK_HOST ?? "127.0.0.1"
@@ -949,7 +949,9 @@ const assistantsMock = createAssistantsMock({
   modules: () => modules,
   toolNames: (id) => runningTools(id).map((t) => t.name),
   checkOwn: (id, own) => checkOwn(id, own),
-  accountProblem: (account) => accountProblem(account)
+  accountProblem: (account) => accountProblem(account),
+  // Read when a device is saved: `sections` is set before any request arrives.
+  isPerson: (id) => memberIds().has(id)
 })
 /** Protocol 7, the voice connection's side: the device's setup, a conversation per assistant, who has the turn (mock/voiceAssistants.ts). */
 const voice = createVoiceAssistants(assistantsMock, () => newConversationInfo())
@@ -2265,8 +2267,22 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
       }
       const errors = validate(section.form, patch)
       if (errors.length > 0) return result(c, m.requestId, false, { code: "invalid_settings", message: "Some settings are not valid.", fieldErrors: errors })
-      // Protocol 11: Members gives every new person an id, as the server does.
-      if (section.id === "members") withPersonIds(patch)
+      // Protocol 11: Members is checked as the server checks it (`checkMembers`), and every new person gets an id.
+      if (section.id === "members") {
+        const list = patch.values.HOUSEHOLD_MEMBERS
+        if (list !== undefined && list !== null) {
+          const people = Array.isArray(list) ? (list as ReadonlyArray<Record<string, unknown>>) : []
+          const problem = !Array.isArray(list)
+            ? "Must be a list of people"
+            : checkMembers(people.map((r) => ({
+              name: typeof r.name === "string" ? r.name : "",
+              aliases: Array.isArray(r.aliases) ? r.aliases.filter((a): a is string => typeof a === "string") : [],
+              pronunciation: typeof r.pronunciation === "string" ? r.pronunciation : ""
+            })))
+          if (problem !== undefined) return result(c, m.requestId, false, { code: "invalid_settings", message: problem, fieldErrors: [{ key: "HOUSEHOLD_MEMBERS", message: problem }] })
+        }
+        withPersonIds(patch)
+      }
       const candidate = sections.map((x, j) => (j === i ? { ...x, form: applyPatch(x.form, patch) } : x))
       const fresh = <E extends FieldError>(a: ReadonlyArray<E>, b: ReadonlyArray<E>) => b.filter((e) => !a.some((x) => x.key === e.key && x.message === e.message))
       const before = checks(sections)

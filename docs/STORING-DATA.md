@@ -237,10 +237,13 @@ event.
   affects nothing else.
 
 Before any projection one function decides by scope (`mayRevealScopeTo` in `HouseholdFeed.ts`): household to every
-voice page, device to that device, person scope where `Privacy.mayReveal` allows it (a `private` device, or a
-`shared` one whose default person is the row's person; never a `public` one), nothing of assistant or conversation
-scope. A snapshot reads a person-scoped collection once per person the page may see. When a device's place or default
-person changes, its pages get a fresh snapshot.
+voice page, device to that device, person scope by the privacy rule (P5, `FeedPeople.ts`: only a device the server
+knows, an owner who is in Members now; a `private` device, or a `shared` one whose default person is the row's person;
+never a `public` one), nothing of assistant or conversation scope. A snapshot reads a person-scoped collection once per
+person, and those reads share the collection's 500 rows. When a device's place or default person changes, or who is in
+Members, its pages get a fresh snapshot from a new generation (nothing of the old one is sent). A removed person's rows
+stay stored and reach no page. Ambient facts read a person's rows only where the same rule lets the turn's device hear
+them.
 A module whose data is `unavailable` is never read for pages. Module events (not data) come from the bus: a page that
 is not connected misses them.
 

@@ -31,6 +31,16 @@ export interface Sections {
    * it, new warnings refuse it until `confirmWarnings` (answered `invalid_settings` with `warnings`).
    */
   readonly update: (id: string, patch: SettingsPatch, options?: { readonly confirmWarnings?: boolean }) => Effect.Effect<SectionUpdate>
+  /**
+   * `update` with a patch made from the values as they are when the save runs (read, check and write in one step):
+   * `build` sees the effective values under the same lock as the save and returns the patch, or a refusal (answered
+   * `invalid_settings` with its message, nothing written).
+   */
+  readonly edit: (
+    id: string,
+    build: (value: (key: string) => SettingValue | undefined) => SettingsPatch | { readonly refused: string },
+    options?: { readonly confirmWarnings?: boolean }
+  ) => Effect.Effect<SectionUpdate>
   /** The effective value of a field (environment > saved > default). */
   readonly value: (key: string) => SettingValue | undefined
   /** Environment first, then the saved values and secrets: what the providers read. */
@@ -106,6 +116,11 @@ export const makeSections = (
   options: {
     readonly envOrigin?: (name: string) => "env-file" | "env-process"
     readonly envLocation?: (name: string) => { readonly file: string; readonly line: number } | undefined
+    /**
+     * P5: wraps every save of a section (outside its own lock): Members' saves run inside the one serialized
+     * operation that owns people and the references to them (`people.ts`).
+     */
+    readonly around?: (sectionId: string, save: Effect.Effect<SectionUpdate>) => Effect.Effect<SectionUpdate>
   } = {}
 ): Sections => {
   const revisions = new Map<string, number>()
@@ -198,11 +213,8 @@ export const makeSections = (
   // Read, validate and save as one step: two saves at once must not each start from the old values.
   const updateLock = Semaphore.makeUnsafe(1)
 
-  return {
-    list: () => current().sections,
-    value: (key) => effective().get(key) as SettingValue | undefined,
-    update: (id, patch, updateOptions = {}) =>
-      updateLock.withPermit(Effect.gen(function*() {
+  const edit: Sections["edit"] = (id, build, updateOptions = {}) => {
+    const save = updateLock.withPermit(Effect.gen(function*() {
         const definitions = sectionDefinitions(modelDirs())
         const d = definitions.find((s) => s.id === id)
         if (d === undefined) {
@@ -211,6 +223,9 @@ export const makeSections = (
         const path = sectionPath(d)
         const { stored, secrets } = saved()
         const before = view(definitions, stored, secrets)
+        const built = build((key) => before.values.get(key) as SettingValue | undefined)
+        if ("refused" in built) return failed(path, { ok: false, error: { code: "invalid_settings", message: built.refused } })
+        const patch: SettingsPatch = built
         const missingModel = [...checkModel(patch, modelDirs().stt), ...checkLocalVoice(patch, modelDirs().tts)]
         if (missingModel.length > 0) {
           return failed(path, { ok: false, error: { code: "invalid_settings", message: missingModel[0]!.message, fieldErrors: missingModel } })
@@ -264,7 +279,15 @@ export const makeSections = (
         for (const s of changed) revisions.set(s.id, (revisions.get(s.id) ?? 0) + 1)
         announce(current().sections.filter((s) => changed.some((c) => c.id === s.id)))
         return { result: { ok: true }, reload: needsReload, path } as const
-      })),
+      }))
+    return options.around === undefined ? save : options.around(id, save)
+  }
+
+  return {
+    list: () => current().sections,
+    value: (key) => effective().get(key) as SettingValue | undefined,
+    update: (id, patch, updateOptions) => edit(id, () => patch, updateOptions),
+    edit,
     configProvider: () => {
       const values: Record<string, string> = {}
       const { stored, secrets } = saved()

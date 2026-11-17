@@ -189,6 +189,8 @@ export interface ModuleCatalog {
   readonly checkOwn: (moduleId: string, own: Readonly<Record<string, unknown>>) => ReadonlyArray<{ readonly field: string; readonly message: string }>
   /** The problem of a language-model account that is not set up (OpenRouter without a key, the home model without an address). */
   readonly accountProblem: (account: string) => string | undefined
+  /** Protocol 11: whether a person id is in Members (a `place.defaultPerson` must be, as on the server). */
+  readonly isPerson?: (id: string) => boolean
 }
 
 export const createAssistantsMock = (catalog: ModuleCatalog): AssistantsMock => {
@@ -332,6 +334,11 @@ export const createAssistantsMock = (catalog: ModuleCatalog): AssistantsMock => 
     saveDevice: ({ target, rev, settings, saveAnyway }) => {
       const patch = Object.fromEntries(Object.entries(settings).filter(([, v]) => v !== undefined)) as Record<string, unknown>
       const known = new Set(assistants.map((a) => a.id))
+      // As the server: a default person must be in Members.
+      const person = settings.place?.defaultPerson
+      if (person !== undefined && person !== null && catalog.isPerson !== undefined && !catalog.isPerson(person)) {
+        return refusal([{ code: "invalid", path: "place.defaultPerson", message: "That person is not in Members (any more): pick another, or nobody." }])
+      }
       if (target.kind === "type") {
         if (target.type !== WEB_VOICE_KIND) return fail("unknown_device", `No device type ${target.type}.`)
         if (rev !== typeRev) return fail("stale", "The defaults changed since this page read them; reload them.")

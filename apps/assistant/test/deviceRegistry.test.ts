@@ -19,12 +19,12 @@ describe("settings store: older files", () => {
     const v2 = JSON.stringify({ version: 2, revision: 5, modules: {}, assistant: { A: 1 } })
     writeFileSync(join(dir, "settings.json"), v2)
     const store = await run(openStore(dir))
-    expect(store.settings()).toMatchObject({ version: 4, devices: {}, assistant: { A: 1 }, revision: 5 })
-    expect(JSON.parse(readFileSync(join(dir, "settings.json"), "utf8")).version).toBe(4) // written at load, same revision
+    expect(store.settings()).toMatchObject({ version: 5, devices: {}, assistant: { A: 1 }, revision: 5 })
+    expect(JSON.parse(readFileSync(join(dir, "settings.json"), "utf8")).version).toBe(5) // written at load, same revision
     expect(readFileSync(join(dir, "settings.json.v3-backup"), "utf8")).toBe(v2)
     await run(store.saveDeviceType(WEB_VOICE_KIND, 0, { ...BUILT_IN_WEB_VOICE_SETTINGS, captions: { ...BUILT_IN_WEB_VOICE_SETTINGS.captions, captions: false } }))
     const saved = JSON.parse(readFileSync(join(dir, "settings.json"), "utf8"))
-    expect(saved).toMatchObject({ version: 4, assistant: { A: 1 }, deviceTypes: { [WEB_VOICE_KIND]: { captions: { captions: false }, rev: 1 } }, devices: {} })
+    expect(saved).toMatchObject({ version: 5, assistant: { A: 1 }, deviceTypes: { [WEB_VOICE_KIND]: { captions: { captions: false }, rev: 1 } }, devices: {} })
     expect(saved.revision).toBeGreaterThan(5)
 
     const good = { kind: WEB_VOICE_KIND, name: "Phone", firstSeen: 1, lastSeen: 2, overrides: { voice: "x" } }

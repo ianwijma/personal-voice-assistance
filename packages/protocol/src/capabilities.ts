@@ -175,6 +175,11 @@ export type PersonId = typeof PersonId.Type
 
 export const MAX_ROOM_CHARS = 60
 
+/** Control and format characters, line and paragraph separators: never part of a name a prompt may carry. */
+const NOT_ONE_LINE = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u
+/** One line of plain text: no control or format characters, no line breaks (rooms; checked where they are saved). */
+export const isOneLine = (s: string): boolean => !NOT_ONE_LINE.test(s)
+
 /** `private`: one person's (a bedroom phone); `shared`: the household's (the kitchen); `public`: anyone may hear or see it (the hallway). */
 export const DevicePrivacy = Schema.Literals(["private", "shared", "public"])
 export type DevicePrivacy = typeof DevicePrivacy.Type
@@ -182,7 +187,10 @@ export type DevicePrivacy = typeof DevicePrivacy.Type
 /** Where and for whom a device is. Never detected: set in admin. */
 export const DevicePlace = Schema.Struct({
   /** Free text ("Kitchen"); "" = no room. Matched to Home Assistant areas by name. */
-  room: Schema.String.check(Schema.isMaxLength(MAX_ROOM_CHARS)),
+  room: Schema.String.check(
+    Schema.isMaxLength(MAX_ROOM_CHARS),
+    Schema.makeFilter((s: string) => isOneLine(s) || "a room is one line of text, without control characters")
+  ),
   privacy: DevicePrivacy,
   /** A wall tablet in kiosk mode, as opposed to a tab opened now and then. */
   alwaysOn: Schema.Boolean,
@@ -217,3 +225,41 @@ export const roomOf = (place: Pick<DevicePlace, "room">): string | undefined => 
 /** Rooms are compared without case and surrounding space. */
 export const sameRoom = (a: string | undefined, b: string | undefined): boolean =>
   a !== undefined && b !== undefined && a.trim() !== "" && a.trim().toLowerCase() === b.trim().toLowerCase()
+
+// -- Members (shared settings › Members; the server's and the mock's one check) -----------------------------------------
+
+/** The most people in Members. */
+export const MAX_MEMBERS = 24
+
+/**
+ * A person's name as names are compared (duplicates in Members, `findPerson`): compatibility-normalised and without
+ * combining marks *before* it is split into words, lower case, apostrophes dropped ("Änne" and "Änne" are
+ * "anne"; "O'Brien" is "obrien").
+ */
+export const memberNameKey = (text: string): string =>
+  [...text.normalize("NFKD").replace(/\p{M}/gu, "").matchAll(/[\p{L}\p{N}][\p{L}\p{N}'’]*/gu)]
+    .map((m) => m[0].toLowerCase().replace(/['’]/g, ""))
+    .filter((w) => w !== "")
+    .join(" ")
+
+/**
+ * The Members list as a whole: at most `MAX_MEMBERS`; every person has a name of one line with letters or digits; no
+ * two people have the same name (as `memberNameKey` compares them); aliases and the pronunciation are one line.
+ * A message for the first problem, or `undefined`.
+ */
+export const checkMembers = (list: ReadonlyArray<{ readonly name: string; readonly aliases?: ReadonlyArray<string>; readonly pronunciation?: string }>): string | undefined => {
+  if (list.length > MAX_MEMBERS) return `At most ${MAX_MEMBERS} people`
+  const seen = new Set<string>()
+  for (const [i, m] of list.entries()) {
+    if (typeof m.name !== "string" || m.name.trim() === "") return `Person ${i + 1} needs a name`
+    if (!isOneLine(m.name)) return `The name of person ${i + 1} must be one line, without control characters`
+    const key = memberNameKey(m.name)
+    if (key === "") return `Person ${i + 1} needs a name with letters or digits`
+    if (seen.has(key)) return `Two people are called ${m.name.trim()}; give one of them another name (an alias can be shared)`
+    seen.add(key)
+    if ((m.aliases ?? []).some((a) => !isOneLine(a)) || (m.pronunciation !== undefined && !isOneLine(m.pronunciation))) {
+      return `The other names and pronunciation of ${m.name.trim()} must be one line each`
+    }
+  }
+  return undefined
+}

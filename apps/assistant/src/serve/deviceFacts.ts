@@ -21,8 +21,13 @@ import type { SettingsFile } from "./SettingsStore.ts"
  * and visible. From these: the `Devices` and `Privacy` services for modules, the `TargetDevice` of a voice page for the
  * household feed, the room and person of a turn (`CurrentTurn`), and the per-turn context line.
  *
- * Everything on a turn's path is a cache read: the list is rebuilt only when the settings file, the people or the live
- * state change (`changed()`), never per turn.
+ * Everything on a turn's path is a cache read: the list is rebuilt on the first read after the settings file, the
+ * people or the live state changed (`changed()`), not on every turn.
+ *
+ * Only devices the server has a record of count: a device id it has not seen (or whose first registration has not
+ * been written yet) has no place, so the privacy rule refuses it, its turns have no room or person, and its pages get
+ * no person data. A device type's defaults never stand in for such a device. A known device that is offline keeps its
+ * saved place.
  */
 
 export interface DeviceLiveFacts {
@@ -36,7 +41,7 @@ export interface DeviceFactsOptions {
   readonly file: () => SettingsFile
   /** The last declaration of a known device (`DeviceRegistry.declaredOf`). */
   readonly declaredOf: (id: string) => DeclaredCapabilities | undefined
-  /** Last seen of a known device, with memory folded in. */
+  /** Last seen of a known device, with the registry's memory folded in (`DeviceRegistry.lastSeenOf`). */
   readonly lastSeenOf?: (id: string) => number | undefined
   /** Live state per device (the hub's connections); absent: nothing is connected. */
   readonly live: (id: string) => DeviceLiveFacts
@@ -48,12 +53,22 @@ export interface DeviceFactsOptions {
 }
 
 export interface DeviceFacts {
-  /** A device's effective place; its default person only while that person exists. Unknown device: its type's defaults. */
-  readonly placeOf: (deviceId: string | undefined) => DevicePlace
+  /** A known device's effective place (its default person only while that person is in Members); `undefined` otherwise. */
+  readonly placeOf: (deviceId: string | undefined) => DevicePlace | undefined
   /** What a projection of the household feed sees of a voice page's device. */
   readonly targetOf: (device: { readonly id: string; readonly name: string } | undefined) => TargetDevice
   /** The room and person a turn on this device has (`TurnOrigin`): `how: "device-default"`. */
   readonly originOf: (deviceId: string | undefined) => { readonly room?: string; readonly person?: TurnPerson }
+  /**
+   * What decides what a device may be told: its privacy and default person (`undefined`: not a known device). A change
+   * of it is a hard boundary (the hub resets the device's conversations and sends its pages a fresh snapshot).
+   */
+  readonly boundaryOf: (deviceId: string) => string | undefined
+  /**
+   * Whether replies may be spoken on the device: not when the owner said "Don't use its speaker", nor when its last
+   * declaration has no speaker. A device that never declared anything (a page of an older build) may.
+   */
+  readonly speakerAllowed: (deviceId: string | undefined) => boolean
   /** Something live changed (a connection, a declaration, visibility): the next read rebuilds the list. */
   readonly changed: () => void
   readonly devices: DevicesService
@@ -75,7 +90,7 @@ export const makeDeviceFacts = (options: DeviceFactsOptions): DeviceFacts => {
   }
   let cache: Cache | undefined
 
-  const placeIn = (file: SettingsFile, deviceId: string | undefined): DevicePlace => {
+  const placeIn = (file: SettingsFile, deviceId: string): DevicePlace => {
     const place = deviceSettingsFrom(file, deviceId).place
     return place.defaultPerson !== null && !options.isPerson(place.defaultPerson) ? { ...place, defaultPerson: null } : place
   }
@@ -109,17 +124,17 @@ export const makeDeviceFacts = (options: DeviceFactsOptions): DeviceFacts => {
     return cache
   }
 
-  const placeOf = (deviceId: string | undefined): DevicePlace => {
-    const known = deviceId === undefined ? undefined : current().byId.get(deviceId)
-    return known?.place ?? placeIn(options.file(), deviceId)
-  }
+  const known = (deviceId: string | undefined): KnownDevice | undefined => (deviceId === undefined ? undefined : current().byId.get(deviceId))
+  const placeOf = (deviceId: string | undefined): DevicePlace | undefined => known(deviceId)?.place
+
+  const isMember = (id: string) => options.isPerson(id)
 
   const contextLine = (deviceId: string | undefined): string => {
     const c = current()
     const key = deviceId ?? ""
     const cached = c.lines.get(key)
     if (cached !== undefined) return cached
-    const line = deviceContextLine(c.list, deviceId, options.nameOfPerson)
+    const line = deviceContextLine(c.list, deviceId, options.nameOfPerson, isMember)
     c.lines.set(key, line)
     return line
   }
@@ -128,29 +143,41 @@ export const makeDeviceFacts = (options: DeviceFactsOptions): DeviceFacts => {
     placeOf,
     targetOf: (device) => {
       if (device === undefined) return {}
-      const place = placeOf(device.id)
-      const room = roomOf(place)
+      const self = known(device.id)
+      // Not (yet) a known device: its id and name, no place, so no person data reaches its pages.
+      if (self === undefined) return { id: device.id, name: device.name }
       return {
         id: device.id,
-        name: current().byId.get(device.id)?.name ?? device.name,
-        ...(room !== undefined ? { room } : {}),
-        privacy: place.privacy,
-        ...(place.defaultPerson !== null ? { defaultPerson: place.defaultPerson } : {})
+        name: self.name,
+        ...(self.room !== undefined ? { room: self.room } : {}),
+        privacy: self.place.privacy,
+        ...(self.place.defaultPerson !== null ? { defaultPerson: self.place.defaultPerson } : {})
       }
     },
     originOf: (deviceId) => {
-      const place = placeOf(deviceId)
-      const room = roomOf(place)
+      const self = known(deviceId)
+      if (self === undefined) return {}
       return {
-        ...(room !== undefined ? { room } : {}),
-        ...(place.defaultPerson !== null ? { person: { id: place.defaultPerson, how: "device-default" } } : {})
+        ...(self.room !== undefined ? { room: self.room } : {}),
+        ...(self.place.defaultPerson !== null ? { person: { id: self.place.defaultPerson, how: "device-default" } } : {})
       }
+    },
+    boundaryOf: (deviceId) => {
+      const place = placeOf(deviceId)
+      return place === undefined ? undefined : `${place.privacy}|${place.defaultPerson ?? ""}`
+    },
+    speakerAllowed: (deviceId) => {
+      const file = options.file()
+      if (deviceId === undefined || file.devices[deviceId] === undefined) return true
+      if (deviceSettingsFrom(file, deviceId).capabilities.noSpeaker) return false
+      const declared = options.declaredOf(deviceId) ?? file.devices[deviceId]?.declared
+      return declared === undefined || declared.capabilities.speaker?.media.includes("speech") === true
     },
     changed: () => {
       version++
     },
     devices: makeDevices(() => current().list),
-    privacy: makePrivacy(placeOf),
+    privacy: makePrivacy(placeOf, isMember),
     contextLine,
     contextProvider: {
       name: "This device",

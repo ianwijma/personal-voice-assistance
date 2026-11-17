@@ -127,8 +127,28 @@ describe("telling the server again (device.caps)", () => {
     h.disconnect(false)
     h.watch.resync()
     vi.advanceTimersByTime(1000)
-    // The server forgot this tab's live state with the old connection: all of it goes again.
-    expect(h.sent.at(-1)).toEqual({ type: "device.caps", live: { visible: false, lastInteractionAt: 50_000 } })
+    // The server forgot this tab's live state with the old connection: all of it goes again, with the declaration.
+    expect(h.sent.at(-1)).toMatchObject({ type: "device.caps", capabilities: { v: 1 }, live: { visible: false, lastInteractionAt: 50_000 } })
+    h.watch.stop()
+  })
+
+  it("a change between hello and welcome is not lost: after every welcome the current declaration is sent (finding 22)", () => {
+    const h = harness()
+    // hello went with 1024 × 768; before the welcome (nothing can be sent) the tablet rotates to a phone-size window.
+    h.disconnect(true)
+    h.resize(390, 844)
+    vi.advanceTimersByTime(2000)
+    expect(h.sent).toEqual([])
+    h.disconnect(false)
+    h.watch.resync()
+    vi.advanceTimersByTime(1000)
+    expect(h.sent.at(-1)).toMatchObject({ type: "device.caps", capabilities: { display: { class: "compact", widthPx: 390, heightPx: 844 } } })
+    // A reconnect with nothing changed still sends it (the server ignores a declaration it already has).
+    const before = h.sent.length
+    h.watch.resync()
+    vi.advanceTimersByTime(1000)
+    expect(h.sent.length).toBe(before + 1)
+    expect(h.sent.at(-1)).toMatchObject({ capabilities: { display: { widthPx: 390 } } })
     h.watch.stop()
   })
 })
@@ -235,6 +255,10 @@ describe("Devices › a device: Place and What it can do", () => {
     expect(within(caps).getByTestId("caps-effective")).toHaveTextContent("The assistant is told: tablet-size screen, touch, speaker.")
     const place = screen.getByTestId("section-place")
     expect(within(place).getByTestId("marks-Place")).toHaveAttribute("data-own", "false")
+    // Next to privacy and the default person: changing either starts a new conversation on the device.
+    const notes = within(place).getAllByTestId("place-boundary-note")
+    expect(notes).toHaveLength(2)
+    for (const note of notes) expect(note).toHaveTextContent("Changing this starts a new conversation on the device")
     const person = within(place).getByTestId("place-person") as HTMLSelectElement
     expect([...person.options].map((o) => o.textContent)).toEqual(["Nobody: household data", "Sam", "Robin"])
     fireEvent.change(within(place).getByTestId("place-room"), { target: { value: "Kitchen" } })

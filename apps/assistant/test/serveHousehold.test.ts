@@ -174,7 +174,9 @@ describe("household data in serve mode", () => {
     clients.push(kitchen, study)
     await kitchen.hello()
     await study.hello()
+    // A new device's feed starts once its record is written (P5): both snapshots first, then the changes.
     await kitchen.waitFor("household.snapshot")
+    await study.waitFor("household.snapshot")
     await run(store!.collection(flaky).insert({ text: "bigint" }))
     await run(store!.collection(flaky).insert({ text: "fine" }))
     await run(store!.collection(board).insert({ text: "for the study", device: "study-00001" }))

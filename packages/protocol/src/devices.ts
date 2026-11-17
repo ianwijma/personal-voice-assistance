@@ -636,8 +636,9 @@ export const deviceSetupFrom = (
     canPick: settings.voicePage.pick && listed.length > 1,
     canAuto: options.canAuto,
     interruptMode: settings.interruptMode,
-    audio: settings.audio,
-    captions: settings.captions,
+    // P5: "Don't use its speaker" (the `capabilities` section) means nothing is spoken here, typed replies included.
+    audio: settings.capabilities.noSpeaker ? { ...settings.audio, speakAloud: false } : settings.audio,
+    captions: settings.capabilities.noSpeaker ? { ...settings.captions, speakTyped: false } : settings.captions,
     ...(settings.look.from === "device" ? { look: settings.look.look } : {})
   }
 }

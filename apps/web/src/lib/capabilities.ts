@@ -81,7 +81,11 @@ export interface CapabilityWatchOptions {
 }
 
 export interface CapabilityWatch {
-  /** After a new `welcome`: the declaration went with `hello`; send the live state again (the server starts at visible). */
+  /**
+   * After every `welcome`: send the current declaration and live state again. The page never assumes the one in
+   * `hello` is still right (it may have changed between `hello` and `welcome`, when nothing can be sent); the server
+   * ignores a declaration that did not change.
+   */
   readonly resync: () => void
   readonly stop: () => void
 }
@@ -99,7 +103,7 @@ export const watchCapabilities = (options: CapabilityWatchOptions): CapabilityWa
   const target = options.target ?? (typeof window === "undefined" ? undefined : window)
   const doc = options.doc ?? (typeof document === "undefined" ? undefined : document)
 
-  let sentCaps = JSON.stringify(measure())
+  let sentCaps: string | undefined = JSON.stringify(measure())
   let sentVisible = true
   let interaction: number | undefined
   let sentInteraction: number | undefined
@@ -140,8 +144,9 @@ export const watchCapabilities = (options: CapabilityWatchOptions): CapabilityWa
   doc?.addEventListener("visibilitychange", onChange)
   return {
     resync: () => {
-      sentCaps = JSON.stringify(measure())
-      sentVisible = true
+      // Nothing counts as sent: the next flush sends what the page measures now.
+      sentCaps = undefined
+      sentVisible = !visible()
       sentInteraction = undefined
       schedule()
     },

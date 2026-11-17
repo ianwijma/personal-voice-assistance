@@ -5,7 +5,9 @@ import {
   type AdminState,
   type ClientMessage,
   CloseCode,
+  type DeviceCapabilities,
   type DeviceHello,
+  type DeviceLiveState,
   deviceTypeOf,
   engineSummary,
   decodeClientMessage,
@@ -182,6 +184,14 @@ export interface HubOptions {
   readonly targetDevice?: (device: { readonly id: string; readonly name: string } | undefined) => TargetDevice
   /** P5: a device's connections, declaration or live state changed (the device facts rebuild their list). */
   readonly onDeviceChange?: () => void
+  /**
+   * P5: what decides what a known device may be told (its privacy and default person; `undefined`: not known). When
+   * it changes, the device's conversations are reset (every reply in flight stopped, histories and agent sessions
+   * ended) and its pages get a fresh snapshot.
+   */
+  readonly boundaryOf?: (deviceId: string) => string | undefined
+  /** P5: whether replies may be spoken on a device (its effective speaker). Absent: always. */
+  readonly speakerAllowed?: (deviceId: string | undefined) => boolean
   /** Diagnostics › Health (`health`, `health.check`). Absent: no `health` in the admin snapshot, checks refused. */
   readonly health?: HealthService
   /** Model downloads (jobs). Absent: none offered. */
@@ -249,10 +259,23 @@ interface Client {
   voice?: VoiceConnection
   /** P5: the device as the household feed saw it last (JSON), to notice a change of place. */
   lastTarget?: string
+  /**
+   * P5: the household feed follows this connection. A device the server has not recorded yet starts once its first
+   * registration is written, so its first snapshot is of the place it has (not one of an unknown device, at once
+   * replaced).
+   */
+  householdStarted?: boolean
   /** P5: this tab is visible (until it says otherwise) and when it was last used (`device.caps.live`). */
   visible: boolean
   lastInteractionAt: number | undefined
+  /** P5: the latest `device.caps` not handled yet (coalesced: at most one handled per `CAPS_MIN_GAP_MS`). */
+  capsPending: { capabilities?: DeviceCapabilities; live?: DeviceLiveState } | undefined
+  capsTimer: ReturnType<typeof setTimeout> | undefined
+  capsHandledAt: number
 }
+
+/** P5: a connection's `device.caps` are handled at most this often; later ones in between are coalesced to the latest. */
+export const CAPS_MIN_GAP_MS = 500
 
 /** Who owns a session's audio (per device), and what the hub remembers about it. */
 interface Ownership {
@@ -475,6 +498,9 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
       }
     })
   const deviceChanged = () => options.onDeviceChange?.()
+  const speakerAllowed = (deviceId: string | undefined) => options.speakerAllowed?.(deviceId) ?? true
+  /** P5: per known device, what decided what it may be told when it was last looked at (`boundaryOf`). */
+  const boundaries = new Map<string, string>()
   const connectedDevices = () => new Set([...clients].flatMap((c) => (c.device !== undefined && !c.closed ? [c.device.id] : [])))
 
   let devicesTimer: ReturnType<typeof setTimeout> | undefined
@@ -529,8 +555,29 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
     return device === undefined ? {} : { id: device.id, name: device.name }
   }
   const refreshTargets = () => {
+    // The hard boundary first: a device whose privacy or default person changed loses everything it was told under
+    // the old ones (its replies in flight, its conversations, its agents' sessions), before its pages start again.
+    if (options.boundaryOf !== undefined) {
+      const ids = new Set<string>([
+        ...boundaries.keys(),
+        ...sessions.all().flatMap((s) => (s.deviceId !== undefined ? [s.deviceId] : [])),
+        ...[...clients].flatMap((c) => (c.device !== undefined && !c.closed ? [c.device.id] : []))
+      ])
+      for (const id of ids) {
+        const now = options.boundaryOf(id)
+        const before = boundaries.get(id)
+        if (now === undefined) {
+          // Forgotten (or never written): what it knew is judged again when it is known again.
+          if (before !== undefined && sessions.get(id) !== undefined) options.run(sessions.resetDevice(id))
+          boundaries.delete(id)
+          continue
+        }
+        boundaries.set(id, now)
+        if (before !== undefined && before !== now) options.run(sessions.resetDevice(id))
+      }
+    }
     for (const client of clients) {
-      if (!client.helloed || client.closed || client.voice === undefined) continue
+      if (!client.helloed || client.closed || client.voice === undefined || client.householdStarted !== true) continue
       const text = JSON.stringify(targetOf(client))
       if (text === client.lastTarget) continue
       client.lastTarget = text
@@ -570,11 +617,51 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
     sessionsChanged(false)
   }
   /** Remember the device of this connection (background save), then push what changed. */
+  /** P5: the household feed starts following a voice connection (its first snapshot). */
+  const startHousehold = (client: Client) => {
+    if (client.voice === undefined || client.householdStarted === true || client.closed || options.household === undefined) return
+    client.householdStarted = true
+    client.lastTarget = JSON.stringify(targetOf(client))
+    options.household.connected(client.voice)
+  }
+
   const registerDevice = (device: DeviceHello) =>
     options.run(Effect.andThen(registry.seen(device, connectedDevices()), Effect.sync(() => {
       refreshDevices()
       devicesChanged(false)
+      // Written (or refused): the device's connections that waited for it start their feed now.
+      for (const c of clients) if (c.device?.id === device.id && c.helloed) startHousehold(c)
     })))
+
+  /** P5: a declaration of a connection's device (`hello`, `device.caps`): known at once, written in the background. */
+  const declare = (deviceId: string, capabilities: DeviceCapabilities) => {
+    if (!registry.declare(deviceId, capabilities)) return false
+    options.run(registry.persist)
+    return true
+  }
+
+  /** P5: one connection's latest `device.caps`, handled at most once per `CAPS_MIN_GAP_MS`. */
+  const handleCaps = (client: Client) => {
+    client.capsTimer = undefined
+    const pending = client.capsPending
+    client.capsPending = undefined
+    const device = client.device
+    if (pending === undefined || device === undefined || client.closed) return
+    client.capsHandledAt = performance.now()
+    let changed = false
+    if (pending.live !== undefined) {
+      const at = pending.live.lastInteractionAt === undefined ? client.lastInteractionAt : Math.min(pending.live.lastInteractionAt, Date.now())
+      if (client.visible !== pending.live.visible || at !== client.lastInteractionAt) {
+        client.visible = pending.live.visible
+        client.lastInteractionAt = at
+        changed = true
+      }
+    }
+    if (pending.capabilities !== undefined && declare(device.id, pending.capabilities)) changed = true
+    if (!changed) return
+    deviceChanged()
+    devicesChanged(true)
+  }
 
   // ---- Ownership
 
@@ -637,12 +724,16 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
     if (client.helloTimer !== undefined) clearTimeout(client.helloTimer)
     if (!clients.delete(client)) return
     if (client.voice !== undefined) options.household?.closed(client.voice)
+    if (client.capsTimer !== undefined) clearTimeout(client.capsTimer)
+    client.capsTimer = undefined
+    client.capsPending = undefined
     if (client.device !== undefined) {
-      registry.left(client.device.id)
+      const id = client.device.id
+      const last = ![...clients].some((c) => c.helloed && c.device?.id === id)
+      registry.left(id, last)
       deviceChanged()
       devicesChanged(true)
-      const id = client.device.id
-      if (![...clients].some((c) => c.helloed && c.device?.id === id)) options.household?.deviceDisconnected(id)
+      if (last) options.household?.deviceDisconnected(id)
     }
     const key = client.sessionKey
     if (key === undefined) return
@@ -753,11 +844,16 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
     if (client.adminToken !== undefined) send(client, { type: "admin.snapshot", snapshot: adminSnapshot() })
     const firstOfDevice = client.device !== undefined && ![...clients].some((c) => c !== client && c.helloed && !c.closed && c.device?.id === client.device!.id)
     client.helloed = true
-    if (client.device !== undefined) registerDevice(client.device)
+    // Only `hello` and `device.caps` declare; the record is written in the background (a declaration that comes while
+    // it is written is kept and goes into it).
+    if (client.device?.capabilities !== undefined) declare(client.device.id, client.device.capabilities)
     if (client.device !== undefined) deviceChanged()
+    if (client.device !== undefined && options.boundaryOf !== undefined && !boundaries.has(client.device.id)) {
+      const b = options.boundaryOf(client.device.id)
+      if (b !== undefined) boundaries.set(client.device.id, b)
+    }
     if (client.role === "voice" && options.household !== undefined) {
       const device = client.device
-      client.lastTarget = JSON.stringify(targetOf(client))
       client.voice = {
         id: client.connection.id,
         // Read at each use: the device's place as it is now (P5).
@@ -767,8 +863,10 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
         send: (m) => send(client, m)
       }
       if (firstOfDevice) options.household.deviceConnected(device!.id)
-      options.household.connected(client.voice)
+      // A device the server already knows starts at once; a new one when its registration is written.
+      if (device === undefined || registry.known(device.id)) startHousehold(client)
     }
+    if (client.device !== undefined) registerDevice(client.device)
     if (key !== undefined) sessions.connections(key, connectionsOf(key))
     if (opened === "full") send(client, { type: "error", error: sessionsFull() })
     if (resumed !== undefined) {
@@ -879,7 +977,8 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
         // the follow-up holder, else who answers without a phrase, … Its conversation is made on first use.
         const requestId = message.requestId
         return options.run(Effect.map(
-          session.conversation.sendText(message.text, message.speak && isOwner(client), message.assistantId),
+          // P5: never spoken on a device that may not speak ("Don't use its speaker", or a declaration without one).
+          session.conversation.sendText(message.text, message.speak && isOwner(client) && speakerAllowed(client.device?.id), message.assistantId),
           (outcome) =>
             result(
               client,
@@ -917,10 +1016,13 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
       case "device.forget": {
         if (!allowed(client, message.requestId)) return
         const id = message.id
+        // A connected device keeps what it declared last (never a tab's old hello).
+        const kept = registry.declaredOf(id)
         return limited(client, message.requestId, registry.forget(id), (r) => {
           if (!r.ok) return
           // A device that is connected now is recorded again as new (the type defaults).
           const again = [...clients].find((c) => c.device?.id === id && !c.closed)?.device
+          if (again !== undefined && kept !== undefined) declare(id, kept.capabilities)
           if (again !== undefined) registerDevice(again)
           refreshDevices()
           pushAssistants()
@@ -1075,21 +1177,20 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
         return send(client, { type: "pong", id: message.id })
       case "device.caps": {
         // P5: only a voice connection with a device declares (admin pages and pages without a device are ignored).
-        const device = client.device
-        if (client.role !== "voice" || device === undefined) return
-        if (message.live !== undefined) {
-          client.visible = message.live.visible
-          if (message.live.lastInteractionAt !== undefined) client.lastInteractionAt = Math.min(message.live.lastInteractionAt, Date.now())
-        }
-        if (message.capabilities !== undefined) {
-          options.run(Effect.andThen(registry.declare(device.id, message.capabilities), Effect.sync(() => {
-            deviceChanged()
-            devicesChanged(true)
-          })))
-          return
-        }
-        deviceChanged()
-        return devicesChanged(true)
+        // Bounded here, whatever the page does: an empty message is ignored, the latest one wins, at most one is
+        // handled per CAPS_MIN_GAP_MS per connection, an unchanged one changes nothing, and writes are the
+        // registry's (one at a time for all devices).
+        if (client.role !== "voice" || client.device === undefined) return
+        if (message.capabilities === undefined && message.live === undefined) return
+        const pending = client.capsPending ?? {}
+        if (message.capabilities !== undefined) pending.capabilities = message.capabilities
+        if (message.live !== undefined) pending.live = message.live
+        client.capsPending = pending
+        if (client.capsTimer !== undefined) return
+        const wait = client.capsHandledAt + CAPS_MIN_GAP_MS - performance.now()
+        if (wait <= 0) return handleCaps(client)
+        client.capsTimer = setTimeout(() => handleCaps(client), wait)
+        return
       }
     }
   }
@@ -1119,7 +1220,10 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
         wakeTestUntil: 0,
         wakeTestDevice: undefined,
         visible: true,
-        lastInteractionAt: undefined
+        lastInteractionAt: undefined,
+        capsPending: undefined,
+        capsTimer: undefined,
+        capsHandledAt: -Infinity
       }
       client.helloTimer = setTimeout(() => {
         if (!client.helloed) drop(client, CloseCode.helloTimeout, "no hello")

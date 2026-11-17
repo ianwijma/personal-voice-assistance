@@ -61,6 +61,11 @@ export interface VoiceSessions {
    * else a new id reserved for `assistant` (announced; the other assistants keep theirs). `assigned`: as above.
    */
   readonly newConversation: (key: string, assistant: string | undefined, assigned: ReadonlyArray<string>) => Effect.Effect<ConversationInfo>
+  /**
+   * P5: the device's privacy or default person changed: every conversation of its session starts again
+   * (`SessionConversations.resetAll`); without a session, the ids reserved for it are dropped (nothing was said).
+   */
+  readonly resetDevice: (key: string) => Effect.Effect<void>
   /** For admin: every session, most recently active first. */
   readonly list: () => ReadonlyArray<SessionInfo>
   readonly all: () => ReadonlyArray<VoiceSession>
@@ -193,6 +198,13 @@ export const makeVoiceSessions = (options: VoiceSessionsOptions): VoiceSessions 
           options.announce(key, info, assistant)
           return info
         })
+      }),
+    resetDevice: (key) =>
+      Effect.suspend(() => {
+        const session = sessions.get(key)?.session
+        if (session !== undefined) return session.conversation.resetAll
+        reserved.delete(key)
+        return Effect.void
       }),
     list: () => [...sessions.values()].map((e) => e.session).sort((a, b) => b.lastActiveAt() - a.lastActiveAt()).map((s) => s.info()),
     all: () => [...sessions.values()].map((e) => e.session),

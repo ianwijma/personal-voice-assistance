@@ -153,8 +153,9 @@ export interface Row<A> {
 
 /**
  * The device a page runs on, as a projection sees it. Small on purpose. `id` is absent for a voice page that sent no
- * device. P5: its room, privacy and default person (the effective `place` section), which `Privacy.mayReveal` reads.
- * Absent privacy is judged as `shared` with nobody's name on it.
+ * device. P5: its room, privacy and default person (the effective `place` section of a device the server knows),
+ * which the privacy rule reads. `privacy` is absent for a device the server has not seen (yet): such a page gets no
+ * person-scoped data at all.
  */
 export interface TargetDevice {
   readonly id?: string

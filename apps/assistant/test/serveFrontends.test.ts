@@ -318,7 +318,7 @@ describe("devices", () => {
     await setupOf(tab1.client, (m) => m.interruptMode === "instant" && !m.captions.captions)
 
     const saved = JSON.parse(readFileSync(join(server.dataDir, "settings.json"), "utf8"))
-    expect(saved.version).toBe(4)
+    expect(saved.version).toBe(5)
     expect(saved.devices["phone-0001"]).toMatchObject({ kind: WEB_VOICE_KIND, name: "Test browser", own: { captions: { captions: false } } })
     expect(saved.devices["phone-0001"].own.interruptMode).toBeUndefined()
   })

@@ -210,7 +210,7 @@ vault for secrets.
 | Page (mock-up) | Section and keys |
 |---|---|
 | Home | new section `home`: `HOME_LOCATION` (text ≤ 200), `HOME_TIME_ZONE` (IANA, empty = this machine's), `HOME_LANGUAGE` (BCP 47: en-GB, en-US, nl-NL, de-DE), `HOME_UNITS` (metric \| imperial), `HOME_DATE_FORMAT` (en-GB \| en-US \| nl-NL), `HOME_CURRENCY` (ISO 4217, default EUR), `HOME_CUP_SIZE` (metric 250 ml \| us 236.6 ml), `HOME_API_CONTACT` (text ≤ 200, no default; goes in the `User-Agent` of public API calls, see `@pva/net`) |
-| Members | protocol 11 (P5), section `members`: `HOUSEHOLD_MEMBERS` (records: a hidden server-made `id`, name, aliases, pronunciation, allergies, diets, dislikes; at most 24), `HOUSEHOLD_DIET_ALLERGIES`, `HOUSEHOLD_DIET_DIETS`, `HOUSEHOLD_DIET_DISLIKES` (the household's diet, for everyone who has none of their own). A device's `place.defaultPerson` names one of them; removing a person clears it (docs/ARCHITECTURE.md, "People, rooms and device capabilities") |
+| Members | protocol 11 (P5), section `members`: `HOUSEHOLD_MEMBERS` (records: a hidden server-made `id`, name, aliases, pronunciation, allergies, diets, dislikes; at most 24; names one line and unique as `memberNameKey` compares them), `HOUSEHOLD_DIET_ALLERGIES`, `HOUSEHOLD_DIET_DIETS`, `HOUSEHOLD_DIET_DISLIKES` (the household's diet, for everyone who has none of their own). **`HOUSEHOLD_MEMBERS` is never read from the environment** (a list of people with server-issued ids cannot live in an environment variable): the environment view lists it under "Not read" with the reason, and the start logs a warning. A device's `place.defaultPerson` names one of them. One serialized operation (`MembersGate`, `serve/people.ts`) owns every change to people and the references to them: a Members save (admin or `People.setDiet`, whose read, check and write are one step) clears every device's and type's default person that it removed before anything else runs, and every device or type save checks its default person against the committed Members inside it, so no dangling reference is committed. A Members value without ids (a hand-edited file) gets them at start, written. **A removed person's person-scoped data stays in the household database** and is delivered to no page and no turn any more (the privacy rule refuses an owner who is not a member). Deleting it is a known gap: the store has no command for one person's data yet; until it has, the only way is deleting `data/household.db` (docs/ARCHITECTURE.md, "People, rooms and device capabilities") |
 | Modules | each module's settings in `modules[id].settings`, through `module.configure` (unchanged message) |
 | Language model accounts | `anthropic`: ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL · `claude-subscription`: the agent module's optIn, claudePath, proxy, debugLogs · `openrouter`: its module's key · `home-model`: its module's address and key |
 | Routing | new section `routing`: `TYPESAFE_API_KEY` (secret), `TYPESAFE_MODEL` (default `jev-1.14.0`, shown pinned), `TYPESAFE_BASE_URL` (advanced) |
@@ -224,7 +224,8 @@ linked to (§2.6).
 
 ### 2.5 Storage
 
-`data/settings.json` version 4. It is written atomically and carries one `revision`, as today
+`data/settings.json` version 4 (version 5 since P5: the same structure, with the `place` and `capabilities`
+sections, `declared` on device records and Members; §6 "Version 5"). It is written atomically and carries one `revision`, as today
 (serve/SettingsStore.ts:96-102):
 
 ```jsonc
@@ -721,6 +722,17 @@ to the assistant's Voice tab. The picker component already takes only a key and 
 the Voice tab saves through `assistant.save`.
 
 ## 6. Migration
+
+**Version 5 (P5, people, rooms and device capabilities).** A version-4 file is migrated at load by `migrateV4ToV5`:
+nothing in it changes meaning (a type entry without `place` or `capabilities` reads as the built-in's; a device's own
+sections never had them), the original is kept as `settings.json.v4-backup`, and version 5 is written at once with the
+same revision (the CLI modes migrate in memory). A file of a newer version than the assistant reads stops the start
+(serve and the CLI modes), and is left untouched: never set aside, never overwritten. An assistant from before P5
+cannot refuse a version-5 file the same way (it does not know the rule): it sets the file aside as
+`settings.json.corrupt-<time>` (kept, not changed) and starts from the defaults. To go back to such a build, stop the
+server and copy `settings.json.v4-backup` over `settings.json` first.
+
+**Version 4.**
 
 It runs at load when `settings.json` is version 3 (or 2/1, migrated to 3 first as today). The original is kept as
 `settings.json.v3-backup`, and version 4 is written at once (the server is the only writer, holding the lock). The CLI

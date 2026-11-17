@@ -10,6 +10,7 @@ import {
   type ContextProvider,
   type FeedProblem,
   type ModuleDefinition,
+  type TurnContext,
   StoreError
 } from "@pva/core"
 import { householdDbPath, makeSqliteStore, type SqliteHouseholdStore } from "@pva/store-sqlite"
@@ -27,7 +28,12 @@ export interface Household {
   readonly bus: EventBus
   readonly feed: HouseholdFeed
   /** The per-turn ambient facts (`HOME_AMBIENT_FACTS`). */
-  readonly ambient: (options: { readonly mode: () => AmbientMode; readonly moduleOn: (assistantId: string, moduleId: string) => boolean }) => ContextProvider
+  /** `mayRevealPerson`: the privacy rule for the turn's device (`Privacy.mayReveal`); absent: no person-scoped lines. */
+  readonly ambient: (options: {
+    readonly mode: () => AmbientMode
+    readonly moduleOn: (assistantId: string, moduleId: string) => boolean
+    readonly mayRevealPerson?: (owner: string, turn: TurnContext) => boolean
+  }) => ContextProvider
 }
 
 const declared = (catalog: ReadonlyArray<ModuleDefinition<any>>) => catalog.map((d) => ({ id: d.id, storage: d.storage }))
@@ -64,8 +70,15 @@ const assemble = (
       sqlite,
       bus,
       feed,
-      ambient: ({ mode, moduleOn }) =>
-        makeAmbientFacts({ store, modules: ambientModules, mode, moduleOn, usable: (id) => store.availability(id) === undefined })
+      ambient: ({ mode, moduleOn, mayRevealPerson }) =>
+        makeAmbientFacts({
+          store,
+          modules: ambientModules,
+          mode,
+          moduleOn,
+          usable: (id) => store.availability(id) === undefined,
+          ...(mayRevealPerson !== undefined ? { mayRevealPerson } : {})
+        })
     }
     return household
   })

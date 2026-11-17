@@ -26,6 +26,15 @@ function Toggle({ label, checked, onChange, testId }: { readonly label: string; 
   )
 }
 
+/** Next to privacy and the default person: a change of either is a hard boundary for what the device was told. */
+function BoundaryNote({ ctx }: { readonly ctx: SectionContext }) {
+  return (
+    <p className="mt-1 text-[12px] text-ink-muted" data-testid="place-boundary-note">
+      Changing this starts a new conversation on {ctx.isType ? "every device that follows these defaults" : "the device"}: a reply being spoken stops, and nothing said before can be read back or repeated.
+    </p>
+  )
+}
+
 export function PlaceSection({ ctx }: { readonly ctx: SectionContext }) {
   const place = ctx.settings.place
   const people = useClientState((s) => membersOf(s.sections), (a, b) => JSON.stringify(a) === JSON.stringify(b))
@@ -59,6 +68,7 @@ export function PlaceSection({ ctx }: { readonly ctx: SectionContext }) {
           options={PRIVACY_CHOICES.map((c) => ({ value: c.value, label: c.label }))}
           testId="seg-privacy"
         />
+        <BoundaryNote ctx={ctx} />
       </DField>
       <DField
         label="Default person"
@@ -77,6 +87,7 @@ export function PlaceSection({ ctx }: { readonly ctx: SectionContext }) {
           {people.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
           {missing && <option value={place.defaultPerson!}>Removed person</option>}
         </select>
+        <BoundaryNote ctx={ctx} />
       </DField>
       <DField label="Always on" help="A wall tablet or a speaker that stays on, rather than a tab opened now and then. Things sent here wait for it less.">
         <Toggle label="Always on" checked={place.alwaysOn} onChange={(v) => set({ alwaysOn: v })} testId="place-always-on" />
@@ -127,7 +138,12 @@ export function CapabilitiesSection({ ctx, device, now }: { readonly ctx: Sectio
       <DField label="Use its screen" help={overrides.noDisplay ? "Treated as having no screen: nothing is shown here, and the assistant is told so." : "Things may be shown here when it has a screen."}>
         <Toggle label="Use its screen" checked={!overrides.noDisplay} onChange={(v) => set({ noDisplay: !v })} testId="caps-display" />
       </DField>
-      <DField label="Use its speaker" help={overrides.noSpeaker ? "Treated as having no speaker: nothing is spoken here." : "Replies and announcements may be spoken here when it has a speaker."}>
+      <DField
+        label="Use its speaker"
+        help={overrides.noSpeaker
+          ? "Treated as having no speaker: no reply is sent here to be played, spoken or typed, whatever the page says it has."
+          : "Replies and announcements may be spoken here when it has a speaker."}
+      >
         <Toggle label="Use its speaker" checked={!overrides.noSpeaker} onChange={(v) => set({ noSpeaker: !v })} testId="caps-speaker" />
       </DField>
       {kinds.length > 0 && (
