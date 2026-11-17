@@ -45,7 +45,14 @@ export interface FormState {
   readonly localErrors: Readonly<Record<string, string>>
   /** Warnings returned by the last save: shown above the footer until "Save anyway" or an edit. */
   readonly confirm: ReadonlyArray<FieldError>
+  /**
+   * New for every fresh draft (Cancel, a save, a new form): the fields are drawn again from it, so text a renderer
+   * keeps for itself (a number being typed, a list item not added yet) goes with the draft it belonged to.
+   */
+  readonly epoch: number
 }
+
+let epochSeq = 0
 
 export interface PageFormView {
   readonly def: PageFormDef
@@ -66,7 +73,8 @@ const fresh = (def: PageFormDef): FormState => ({
   sync: { draft: initialDraft(def.form), baseRevision: def.revision, stale: false },
   serverErrors: [],
   localErrors: {},
-  confirm: []
+  confirm: [],
+  epoch: ++epochSeq
 })
 
 export const usePageForms = (defs: ReadonlyArray<PageFormDef>, saved: (key: string) => unknown, fns: SaveFns) => {
@@ -211,6 +219,7 @@ const computeViews = (
     const lookup = def.kind === "section" ? pageLookup : draftLookup(state.sync.draft, () => undefined)
     const shown = (field: SettingField) => (def.only === undefined || def.only.includes(field.key)) && fieldVisible(field, lookup)
     const patch = def.readOnly ? { values: {}, secrets: {} } : computePatch(def.form, state.sync.draft, shown)
-    return { def, state, lookup, shown, patch, dirty: !isEmptyPatch(patch) }
+    // Text a field could not take yet (`localErrors`) is an edit too: leaving the page asks first, Cancel is offered.
+    return { def, state, lookup, shown, patch, dirty: !isEmptyPatch(patch) || Object.keys(state.localErrors).length > 0 }
   })
 }

@@ -15,8 +15,12 @@ export function ActionField({ field, id, describedBy, disabled, context }: Field
   const client = useClient()
   const [running, setRunning] = useState(false)
   const [result, setResult] = useState<FieldActionResult | undefined>(undefined)
-  const mounted = useRef(true)
-  useEffect(() => () => void (mounted.current = false), [])
+  // Set in the effect (not only initially): StrictMode runs setup, cleanup and setup again on a live component.
+  const mounted = useRef(false)
+  useEffect(() => {
+    mounted.current = true
+    return () => void (mounted.current = false)
+  }, [])
   const moduleId = context?.form.kind === "module" ? context.form.id : undefined
   const needsSave = field.requiresSaved && context?.dirty === true
   const press = async () => {
@@ -25,10 +29,16 @@ export function ActionField({ field, id, describedBy, disabled, context }: Field
     setRunning(true)
     setResult(undefined)
     const values = !field.requiresSaved && context?.dirty === true ? { ...context.draftValues } : undefined
-    const reply = await client.request({ type: "module.action", moduleId, key: field.key, ...(values !== undefined ? { values } : {}) })
+    let next: FieldActionResult
+    try {
+      const reply = await client.request({ type: "module.action", moduleId, key: field.key, ...(values !== undefined ? { values } : {}) })
+      next = reply.ok ? reply.action ?? { ok: true, text: "Done.", tone: "ok" } : { ok: false, text: reply.error?.message ?? "It did not run.", tone: "error" }
+    } catch {
+      next = { ok: false, text: "No answer from the assistant; try again.", tone: "error" }
+    }
     if (!mounted.current) return
     setRunning(false)
-    setResult(reply.ok ? reply.action ?? { ok: true, text: "Done.", tone: "ok" } : { ok: false, text: reply.error?.message ?? "It did not run.", tone: "error" })
+    setResult(next)
   }
   const tone = result?.tone ?? (result?.ok === false ? "error" : "neutral")
   return (

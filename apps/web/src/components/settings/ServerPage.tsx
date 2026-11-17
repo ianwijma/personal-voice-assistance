@@ -191,7 +191,7 @@ function FormBlock({ view, forms, heading, vault, renderAfter }: {
   const formWarnings = loose(warnings)
   const { basic, advanced } = splitAdvanced(shown)
   const row = (field: SettingField) => (
-    <div key={field.key} className="flex flex-col gap-4">
+    <div key={`${field.key}:${state.epoch}`} className="flex flex-col gap-4">
       <FieldRow
         field={field}
         form={def.form}

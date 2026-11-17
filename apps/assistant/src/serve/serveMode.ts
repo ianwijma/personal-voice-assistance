@@ -150,6 +150,12 @@ export interface ServeOptions {
   readonly allowedOrigins: ReadonlyArray<string>
   /** Host names the server answers to besides IP literals and `localhost` (`SERVE_ALLOWED_HOSTS`). */
   readonly allowedHosts?: ReadonlyArray<string>
+  /**
+   * A reverse proxy is in front of the server (`SERVE_BEHIND_PROXY`, default false). The server cannot tell a proxied
+   * request from a local one, so then no caller counts as on the home network: module routes with the `lan` guard
+   * refuse every request (docs/UI-AND-MODULES.md §1.11).
+   */
+  readonly behindProxy?: boolean
   readonly tls?: { readonly certFile: string; readonly keyFile: string } | undefined
   /** Cross-origin isolation headers on the page and its files (`SERVE_CROSS_ORIGIN_ISOLATION`). Default on. */
   readonly crossOriginIsolation?: boolean
@@ -1375,7 +1381,14 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       ...(options.modelCatalogNow !== undefined ? { now: options.modelCatalogNow } : {})
     })
     // P3: module HTTP routes under /api/modules/ (docs/UI-AND-MODULES.md §1.11), and their admin view in the API.
-    const moduleRouter = makeModuleRouter({ host, admin, tokens: routeTokens, services })
+    const moduleRouter = makeModuleRouter({
+      host,
+      admin,
+      tokens: routeTokens,
+      services,
+      scheme: options.tls === undefined ? "http" : "https",
+      behindProxy: options.behindProxy === true
+    })
     const api = makeApi({
       moduleRoutes: moduleRouter,
       admin,
@@ -1505,6 +1518,8 @@ export const ServeConfig = Config.all({
     Config.withDefault(""),
     Config.map((s) => s.split(",").map((h) => h.trim()).filter((h) => h.length > 0))
   ),
+  // A reverse proxy in front (docs/UI-AND-MODULES.md §1.11): then no module route caller counts as on the home network.
+  behindProxy: Config.Boolean("SERVE_BEHIND_PROXY").pipe(Config.withDefault(false)),
   // Off only to rule it out when the page fails to load on some browser (see the README).
   crossOriginIsolation: Config.Boolean("SERVE_CROSS_ORIGIN_ISOLATION").pipe(Config.withDefault(true)),
   tlsCert: Config.option(Config.String("SERVE_TLS_CERT")),

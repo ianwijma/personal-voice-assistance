@@ -13,7 +13,7 @@ import type {
   SettingValue,
   StatusLine
 } from "@pva/protocol"
-import { Cause, Clock, Effect, Exit, Scope, Stream } from "effect"
+import { Cause, Clock, Effect, Exit, Fiber, Option, Scope, Stream } from "effect"
 import {
   ACTION_TIMEOUT_MS,
   ActionError,
@@ -60,7 +60,8 @@ import {
   isEditableSetting,
   overridableKeys,
   type ResolvedSettings,
-  resolveSettings
+  resolveSettings,
+  type SettingsSpec
 } from "./Settings.ts"
 import { CurrentTurn } from "./TurnContext.ts"
 import { makeToolRegistry, type ToolRegistry } from "./ToolRegistry.ts"
@@ -163,8 +164,24 @@ export type FieldActionHostResult =
   | { readonly ok: true; readonly result: FieldActionResult }
   | { readonly ok: false; readonly code: "unknown_module" | "unknown_action" | "not_running" | "busy"; readonly message: string }
 
+/** A route of a published shared part (`ModuleHost.routes`). */
+export interface PublishedRoute {
+  readonly moduleId: string
+  readonly route: ModuleRoute
+  /**
+   * The scope of the shared part that declared it: it closes when that part is closed (after the grace period of a
+   * restart or a stop). The app runs the route's handler in it (`Effect.forkIn`), so no handler outlives its part.
+   */
+  readonly scope: Scope.Scope
+}
+
 /** Time a field action's handler has (`ModuleHostOptions.fieldActionTimeoutMs`). Below the page's 10 s request limit. */
 export const FIELD_ACTION_TIMEOUT_MS = 8_000
+/**
+ * Time a timed-out field action's interruption (its finalizers) may take in the background before the host logs it
+ * and frees the button (`ModuleHostOptions.fieldActionCleanupMs`). The press was answered at its deadline already.
+ */
+export const FIELD_ACTION_CLEANUP_MS = 10_000
 
 export type HostResult = { readonly ok: true } | { readonly ok: false; readonly error: ErrorInfo }
 
@@ -219,7 +236,7 @@ export interface ModuleHost {
    */
   readonly fieldAction: (id: string, key: string, values?: Readonly<Record<string, unknown>>) => Effect.Effect<FieldActionHostResult>
   /** P3: the routes of every published shared part, live (a module that stops takes its routes with it). */
-  readonly routes: () => ReadonlyArray<{ readonly moduleId: string; readonly route: ModuleRoute }>
+  readonly routes: () => ReadonlyArray<PublishedRoute>
   /**
    * The `settingOptions` of a running module (its instance with the shared settings): choices known only while it
    * runs, such as the models Claude Code reports at start. `undefined` when the module does not run or gives none.
@@ -308,6 +325,8 @@ export interface ModuleHostOptions {
   readonly routeTokens?: RouteTokenStore
   /** P3: time a field action may take. Default `FIELD_ACTION_TIMEOUT_MS`. */
   readonly fieldActionTimeoutMs?: number
+  /** P3: time a timed-out field action's cleanup may take before it is logged. Default `FIELD_ACTION_CLEANUP_MS`. */
+  readonly fieldActionCleanupMs?: number
 }
 
 interface Running {
@@ -670,25 +689,33 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
    */
   const decorateForm = (entry: Entry, form: SettingsForm): SettingsForm => {
     const instance = mainOf(entry)?.running?.instance
-    const read = <T>(f: (() => T) | undefined): T | undefined => {
+    // Called on the instance (a method may use `this`); a throwing one gives nothing.
+    const read = <T>(f: () => T): T | undefined => {
       try {
-        return f?.()
+        return f()
       } catch {
         return undefined
       }
     }
-    const infos = read(instance?.info)
-    const options = read(instance?.settingOptions)
+    const infos = instance?.info === undefined ? undefined : read(() => instance.info!())
+    const options = instance?.settingOptions === undefined ? undefined : read(() => instance.settingOptions!())
+    const own = <T>(dict: Readonly<Record<string, T>> | undefined, key: string): T | undefined =>
+      typeof dict === "object" && dict !== null && Object.hasOwn(dict, key) ? dict[key] : undefined
     const generated = (entry.def.kind === "agent" || entry.def.kind === "decider") && !Object.hasOwn(entry.def.settings, "test")
     if (infos === undefined && options === undefined && !generated && !form.fields.some((f) => f.type === "combo")) return form
     const values: Record<string, SettingValue> = { ...form.values }
     const fields = form.fields.map((field): SettingField => {
-      if (field.type === "info" && typeof infos?.[field.key] === "string") values[field.key] = infos[field.key]!.slice(0, 1000)
+      const info = own(infos, field.key)
+      // An info value never carries one of the module's secrets to the page.
+      if (field.type === "info" && typeof info === "string") values[field.key] = redactSecrets(entry, info).slice(0, 1000)
       if (field.type !== "combo") return field
-      const extra = options?.[field.key]
+      // A closed combo accepts only its static options (`Setting.combo`), so only an open one shows the instance's.
+      if (!field.allowCustom) return field
+      const extra = own(options, field.key)
+      const list = Array.isArray(extra) ? extra.filter((o): o is ChoiceOption => typeof o?.value === "string" && typeof o?.label === "string") : undefined
       const known = new Set(field.options.map((o) => o.value))
-      const added = (extra ?? []).filter((o) => !known.has(o.value) && (known.add(o.value), true))
-      const note = instance === undefined ? "Not running: type a name" : extra !== undefined ? `${added.length + field.options.length} suggestions from ${entry.def.name}` : undefined
+      const added = (list ?? []).filter((o) => !known.has(o.value) && (known.add(o.value), true))
+      const note = instance === undefined ? "Not running: type a name" : list !== undefined ? `${added.length + field.options.length} suggestions from ${entry.def.name}` : undefined
       return { ...field, options: [...field.options, ...added], ...(note !== undefined && field.optionsNote === undefined ? { optionsNote: note } : {}) }
     })
     if (generated) {
@@ -706,8 +733,28 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
     return { ...form, fields, values }
   }
 
+  /**
+   * `text` with every secret value of the module (saved, or set in the environment) replaced by `[secret]`: what a
+   * field action or an `info` value says never carries a key to the page. Longest first, so a secret that contains
+   * another is replaced whole.
+   */
+  const redactSecrets = (entry: Entry, text: string): string => {
+    const values = new Set<string>()
+    for (const [key, setting] of Object.entries(entry.def.settings as SettingsSpec)) {
+      if (!setting.secret) continue
+      const saved = Object.hasOwn(entry.secrets, key) ? entry.secrets[key] : undefined
+      const env = setting.env === undefined ? undefined : options.env[setting.env]
+      for (const v of [saved, env]) if (typeof v === "string" && v.length > 0) values.add(v)
+    }
+    let out = text
+    for (const secret of [...values].sort((a, b) => b.length - a.length)) out = out.split(secret).join("[secret]")
+    return out
+  }
+
   /** Field presses in progress (module id, key): a second press of the same button waits for the first. */
   const pressing = new Set<string>()
+  /** Field action handlers still running (or cleaning up after their deadline): stopped at shutdown. */
+  const actionFibers = new Set<Fiber.Fiber<unknown, unknown>>()
 
   const templatesOf = (entry: Entry): Array<AssistantTemplate> =>
     (entry.def.templates ?? []).map((t) => ({
@@ -1403,6 +1450,14 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
     return Effect.forEach(entries, refreshEntry, { concurrency: "unbounded", discard: true })
   })
 
+  // Shutdown: field actions still running are told to stop; their cleanup gets its limit, not forever.
+  yield* Effect.addFinalizer(() =>
+    Effect.forEach(
+      [...actionFibers],
+      (fiber) => Effect.sync(() => fiber.interruptUnsafe()).pipe(Effect.andThen(Effect.timeoutOption(Fiber.await(fiber), options.fieldActionCleanupMs ?? FIELD_ACTION_CLEANUP_MS))),
+      { concurrency: "unbounded", discard: true }
+    )
+  )
   // Shutdown: close every instance at once (no grace).
   yield* Effect.addFinalizer(() =>
     Effect.forEach(
@@ -1426,8 +1481,14 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
         return Effect.succeed({ ok: false, code: "unknown_action", message: `${entry.def.name}: "${key}" is not a button` } as const)
       }
       const instance = mainOf(entry)?.running?.instance
-      const fromDefinition = entry.def.fieldActions?.[key] as FieldActionHandler | undefined
-      const handler = fromDefinition ?? instance?.fieldActions?.[key] ?? (key === "test" && instance !== undefined ? generatedTest(instance) : undefined)
+      // The object's own keys or its class's methods, never what every object inherits (`constructor`, `toString`);
+      // each called on its object (`this` is kept).
+      const handlerOf = (actions: Readonly<Record<string, FieldActionHandler<any>>> | undefined): FieldActionHandler | undefined =>
+        actions !== undefined && declaresMember(actions, key) && typeof actions[key] === "function"
+          ? (input) => actions[key]!(input)
+          : undefined
+      const test = key === "test" && instance !== undefined ? generatedTest(instance) : undefined
+      const handler = handlerOf(entry.def.fieldActions) ?? handlerOf(instance?.fieldActions) ?? (test === undefined ? undefined : () => test())
       if (handler === undefined) {
         const known = declared !== undefined || (key === "test" && (entry.def.kind === "agent" || entry.def.kind === "decider"))
         return Effect.succeed(
@@ -1438,42 +1499,87 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
       }
       const pressKey = `${id}\u0000${key}`
       if (pressing.has(pressKey)) return Effect.succeed({ ok: false, code: "busy", message: "That button is still running" } as const)
-      // The settings it sees: the saved shared ones, or (requiresSaved: false) the page's draft over them.
+      // What leaves the host: no secret of the module, at most 500 characters, a known tone.
+      const answer = (result: FieldActionResult): FieldActionHostResult => {
+        const tone = result.tone === "neutral" || result.tone === "ok" || result.tone === "warning" || result.tone === "error" ? result.tone : undefined
+        return { ok: true, result: { ok: result.ok === true, text: redactSecrets(entry, String(result.text ?? "")).slice(0, 500), ...(tone !== undefined ? { tone } : {}) } }
+      }
+      // The settings it sees: the saved shared ones, or (requiresSaved: false) the page's draft over them. Settings
+      // that do not resolve (a required key not set, a saved value no longer valid) are the result: it does not run.
       const useDraft = values !== undefined && declared !== undefined && (declared.describe(key) as { readonly requiresSaved?: boolean }).requiresSaved === false
-      const prepared = useDraft ? draftSettings(entry, values) : { ok: true as const, settings: resolve(entry).value as Readonly<Record<string, unknown>> | undefined }
-      if (!prepared.ok) return Effect.succeed({ ok: true, result: { ok: false, text: prepared.message.slice(0, 500), tone: "error" } } as const)
+      const prepared = useDraft ? draftSettings(entry, values) : savedSettings(entry)
+      if (!prepared.ok) return Effect.succeed(answer({ ok: false, text: prepared.message, tone: "error" }))
       pressing.add(pressKey)
-      // Suspended: a handler that throws is reported like one that fails.
-      return Effect.suspend(() => handler({ settings: prepared.settings ?? {}, draft: useDraft })).pipe(
-        Effect.timeoutOrElse({
-          duration: options.fieldActionTimeoutMs ?? FIELD_ACTION_TIMEOUT_MS,
-          orElse: () => Effect.succeed<FieldActionResult>({ ok: false, text: `Did not finish within ${Math.round((options.fieldActionTimeoutMs ?? FIELD_ACTION_TIMEOUT_MS) / 1000)} s`, tone: "error" })
-        }),
-        Effect.catchCause((cause) => Effect.succeed<FieldActionResult>({ ok: false, text: `Failed: ${Cause.pretty(cause).split("\n")[0]}`.slice(0, 500), tone: "error" })),
-        Effect.map((result) => ({ ok: true, result: { ...result, text: String(result.text).slice(0, 500) } }) as const),
-        Effect.ensuring(Effect.sync(() => {
-          pressing.delete(pressKey)
-          // `info` values may have changed with the press.
-          notify(entry)
-        }))
-      )
+      const release = () => {
+        if (!pressing.delete(pressKey)) return
+        // `info` values may have changed with the press.
+        notify(entry)
+      }
+      const timeoutMs = options.fieldActionTimeoutMs ?? FIELD_ACTION_TIMEOUT_MS
+      const cleanupMs = options.fieldActionCleanupMs ?? FIELD_ACTION_CLEANUP_MS
+      const label = `field action ${id}.${key}`
+      return Effect.gen(function*() {
+        // Its own fiber (stopped at shutdown, `actionFibers`): the answer at the deadline never waits for its
+        // finalizers. Suspended: a handler that throws is reported like one that fails. The button is free again
+        // when the handler has really ended (or its cleanup overran its own limit).
+        const fiber = yield* Effect.forkDetach(
+          Effect.suspend(() => handler({ settings: prepared.settings, draft: useDraft })).pipe(Effect.ensuring(Effect.sync(release)))
+        )
+        actionFibers.add(fiber)
+        fiber.addObserver(() => actionFibers.delete(fiber))
+        // Ask it to stop, and wait (in the background) at most `cleanupMs` for its finalizers.
+        const stop = Effect.forkIn(
+          Effect.sync(() => fiber.interruptUnsafe()).pipe(
+            Effect.andThen(Fiber.await(fiber).pipe(Effect.timeoutOption(cleanupMs))),
+            Effect.flatMap((done) =>
+              Option.isSome(done) ? Effect.void : Effect.logWarning(`${label}: still cleaning up ${cleanupMs} ms after it was stopped`).pipe(Effect.andThen(Effect.sync(release)))
+            )
+          ),
+          hostScope
+        )
+        const exit = yield* Fiber.await(fiber).pipe(
+          Effect.timeoutOption(timeoutMs),
+          Effect.onInterrupt(() => Effect.asVoid(stop))
+        )
+        if (Option.isNone(exit)) {
+          yield* stop
+          return answer({ ok: false, text: `Did not finish within ${Math.round(timeoutMs / 1000)} s`, tone: "error" })
+        }
+        if (Exit.isSuccess(exit.value)) return answer(exit.value.value)
+        // The details may hold anything the handler had (a key in an error message): the server's log only.
+        yield* Effect.logWarning(`${label} failed`, exit.value.cause)
+        return answer({ ok: false, text: "It failed; the server's log says why.", tone: "error" })
+      })
     })
+
+  /** The module's saved shared settings (environment > saved > linked default, with secrets), or why they are not usable. */
+  const savedSettings = (entry: Entry):
+    | { readonly ok: true; readonly settings: Readonly<Record<string, unknown>> }
+    | { readonly ok: false; readonly message: string } => {
+    const resolved = resolve(entry)
+    if (resolved.value === undefined) return { ok: false, message: `Not run: ${problemsText(entry, resolved.form.errors)}` }
+    return { ok: true, settings: resolved.value as Readonly<Record<string, unknown>> }
+  }
+
+  const problemsText = (entry: Entry, errors: ReadonlyArray<{ readonly key: string | null; readonly message: string }>) =>
+    errors.map((e) => (e.key === null || !Object.hasOwn(entry.def.settings, e.key) ? e.message : `${entry.def.settings[e.key]!.describe(e.key).label}: ${e.message}`)).join("; ")
 
   /** The shared settings with a page's draft applied (non-secret, editable, known fields only), or why not. */
   const draftSettings = (entry: Entry, values: Readonly<Record<string, unknown>>):
     | { readonly ok: true; readonly settings: Readonly<Record<string, unknown>> }
     | { readonly ok: false; readonly message: string } => {
     const spec = entry.def.settings
-    const patchValues: Record<string, SettingValue> = {}
+    const patchValues: Record<string, SettingValue> = Object.create(null)
     for (const [k, v] of Object.entries(values)) {
       const setting = Object.hasOwn(spec, k) ? spec[k]! : undefined
       if (setting === undefined || setting.secret || !isEditableSetting(setting) || setting.env !== undefined && (options.env[setting.env] ?? "") !== "") continue
       patchValues[k] = v as SettingValue
     }
     const patched = applySettingsPatch(spec, { stored: entry.stored, secrets: entry.secrets, env: options.env, ...linked(entry) }, { values: patchValues, secrets: {} })
-    if (!patched.ok) return { ok: false, message: `Not tested: ${patched.errors.map((e) => (e.key === null ? e.message : `${spec[e.key]?.describe(e.key).label ?? e.key}: ${e.message}`)).join("; ")}` }
-    const resolved = resolve(entry, patched.stored, patched.secrets)
-    if (resolved.value === undefined) return { ok: false, message: `Not tested: ${resolved.form.errors.map((e) => e.message).join("; ")}` }
+    if (!patched.ok) return { ok: false, message: `Not run: ${problemsText(entry, patched.errors)}` }
+    // Secrets are always the saved ones (a draft cannot name one: it is skipped above).
+    const resolved = resolve(entry, patched.stored, entry.secrets)
+    if (resolved.value === undefined) return { ok: false, message: `Not run: ${problemsText(entry, resolved.form.errors)}` }
     return { ok: true, settings: resolved.value as Readonly<Record<string, unknown>> }
   }
 
@@ -1893,8 +1999,11 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
     return { mint: () => Effect.fail(none), list: Effect.fail(none), revoke: () => Effect.fail(none) }
   }
 
-  const routes = (): ReadonlyArray<{ readonly moduleId: string; readonly route: ModuleRoute }> =>
-    entries.flatMap((entry) => (entry.shared?.part.routes ?? []).map((route) => ({ moduleId: entry.def.id, route })))
+  const routes = (): ReadonlyArray<PublishedRoute> =>
+    entries.flatMap((entry) => {
+      const run = entry.shared
+      return run === undefined ? [] : (run.part.routes ?? []).map((route) => ({ moduleId: entry.def.id, route, scope: run.scope }))
+    })
 
   const settingOptions = (id: string): Readonly<Record<string, ReadonlyArray<ChoiceOption>>> | undefined => {
     const entry = byId.get(id)
@@ -1943,6 +2052,18 @@ const TEST_TIMEOUT_MS = 30_000
 const quote = (s: string) => (s.length > 120 ? `${s.slice(0, 117)}...` : s)
 
 /** The generated `test` field action of an agent or decision-provider instance, if it is one. */
+/**
+ * Does `object` declare `key` itself or through a class of its own (not `Object.prototype`, and never
+ * `constructor`)? A module's handlers may be a plain object or a class instance's methods.
+ */
+const declaresMember = (object: object, key: string): boolean => {
+  if (key === "constructor" || key === "__proto__") return false
+  for (let o: object | null = object; o !== null && o !== Object.prototype; o = Object.getPrototypeOf(o)) {
+    if (Object.hasOwn(o, key)) return true
+  }
+  return false
+}
+
 const generatedTest = (instance: ModuleInstance): (() => Effect.Effect<FieldActionResult>) | undefined => {
   const agent = instance.agents?.[0]
   if (agent !== undefined) return () => testAgent(agent)

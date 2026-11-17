@@ -167,17 +167,19 @@ export const createModuleRoutesMock = () => {
   ]
   return {
     view: (modules: ReadonlyArray<ModuleInfo>): ModuleRoutesResponse => ({
+      // As the server: a module with routes or tokens (a stopped one's tokens are listed, to be revoked).
       modules: modules.flatMap((m) =>
-        m.routes === undefined
+        m.routes === undefined && !tokens.some((t) => t.moduleId === m.id)
           ? []
           : [{
             moduleId: m.id,
             running: m.state === "running",
-            routes: m.routes.map((r, i) => ({ ...r, calls: i === 0 ? calls : [] })),
+            routes: (m.routes ?? []).map((r, i) => ({ ...r, calls: i === 0 ? calls : [] })),
             tokens: tokens.filter((t) => t.moduleId === m.id)
           }]
       ),
-      tokensLocked: false
+      tokensLocked: false,
+      behindProxy: process.env.MOCK_BEHIND_PROXY === "1"
     }),
     mint: (moduleId: string, name: string, label: string) => {
       const token: RouteTokenInfo = { id: randomBytes(6).toString("hex"), moduleId, name, label, createdAt: Date.now() }

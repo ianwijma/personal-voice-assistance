@@ -2700,6 +2700,8 @@ const apiRoute = async (req: IncomingMessage, res: ServerResponse, path: string,
       const id = query.get("module")
       return { status: 200, body: moduleRoutesMock.view(modules.filter((x) => id === null || x.id === id)) }
     }
+    // As the server: tokens only for an installed module (running or not).
+    if (!modules.some((x) => x.id === moduleId)) throw new ApiFail(404, "not_found", `There is no module "${moduleId}"`)
     if (tokenId === undefined) {
       only("POST")
       const b = await body()

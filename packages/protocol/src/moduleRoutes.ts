@@ -7,7 +7,9 @@ import { ModuleId, NonNegativeInt } from "./common.ts"
  * A version 2 module's `shared` part may answer HTTP requests under `/api/modules/<moduleId>/…`: an inbound hook, an
  * OAuth callback. Each route declares its guards, and every declared guard must pass: `admin` (the admin session
  * token), `token` (a bearer token minted for the module and kept in the key vault) and `lan` (the caller's address is
- * private or loopback, and no forwarding header is present). A route without a guard must say `public`.
+ * private or loopback, no forwarding header is present, and the server is not declared to be behind a reverse proxy).
+ * A route without a guard must say `public` (a GET without a body). A route that is not public refuses a request a
+ * browser marks as coming from another site; no CORS header is sent for module routes.
  *
  * The admin page reads what is exposed (`ModuleInfo.routes`) and the recent calls and tokens through the admin API
  * (`GET /api/module-routes`, admin token only). A token's secret is shown once, when it is minted.
@@ -90,7 +92,12 @@ export const ModuleRoutesResponse = Schema.Struct({
     tokens: Schema.Array(RouteTokenInfo)
   })),
   /** The vault is locked: tokens cannot be listed, minted or checked (token routes answer 503). */
-  tokensLocked: Schema.Boolean
+  tokensLocked: Schema.Boolean,
+  /**
+   * The owner declared a reverse proxy in front of the server (`SERVE_BEHIND_PROXY`): no caller counts as on the
+   * home network, so every `lan` route refuses every request (403); callers from outside use a `token` route.
+   */
+  behindProxy: Schema.Boolean
 })
 export type ModuleRoutesResponse = typeof ModuleRoutesResponse.Type
 

@@ -33,7 +33,10 @@ export interface RouteRequest {
   readonly method: RouteMethod
   /** The path after `/api/modules/<id>/` (decoded segments joined by "/"). */
   readonly path: string
-  /** The `:name` segments of the route's path. */
+  /**
+   * The `:name` segments of the route's path. `params`, `query`, `queryAll` and `headers` are dictionaries without a
+   * prototype: `query.constructor` is `undefined` unless the caller sent a `constructor` parameter.
+   */
   readonly params: Readonly<Record<string, string>>
   /** Query parameters; a repeated one keeps its first value (`queryAll` has them all). */
   readonly query: Readonly<Record<string, string>>
@@ -49,7 +52,10 @@ export interface RouteRequest {
 }
 
 export interface RouteResponse {
-  /** 100–599. */
+  /**
+   * A final status, 200–599 (one response per request: an informational 1xx would leave the caller without one).
+   * Anything else is answered 500, logged.
+   */
   readonly status: number
   readonly headers?: Readonly<Record<string, string>>
   /** A string (text/plain unless `content-type` says otherwise), bytes, or anything else as JSON. Absent: no body. */
@@ -59,17 +65,22 @@ export interface RouteResponse {
 export interface ModuleRoute {
   readonly method: RouteMethod
   /**
-   * The path under `/api/modules/<moduleId>/`: segments of `[A-Za-z0-9._~-]`, or `:name` for a parameter; "" is the
-   * module's root. Example: `hook/:name`.
+   * The path under `/api/modules/<moduleId>/`: segments of `[A-Za-z0-9._~-]` (not `.` or `..`, which a URL
+   * resolves away), or `:name` for a parameter; "" is the module's root. Example: `hook/:name`.
    */
   readonly path: string
   /**
    * Every one of them must pass: `admin` (the admin session token, `Authorization: Bearer`), `token` (a route token of
-   * this module named `token`, `Authorization: Bearer`), `lan` (a private or loopback caller, no forwarding header).
+   * this module named `token`, `Authorization: Bearer`), `lan` (a private or loopback caller, no forwarding header;
+   * refused for every caller when the server is declared to be behind a reverse proxy, `SERVE_BEHIND_PROXY`).
    * `admin` and `token` both read the one `Authorization` header, so a route declares at most one of them.
    */
   readonly guards?: ReadonlyArray<RouteGuard>
-  /** Required, and only allowed, when there is no guard: anyone may call it (an OAuth callback). It reads no body. */
+  /**
+   * Required, and only allowed, when there is no guard: anyone may call it (the browser arriving on an OAuth
+   * callback). A public route is a `GET` and reads no body. Every route that is not public also refuses a request a
+   * browser marks as coming from another site (`Sec-Fetch-Site`, `Origin`), before the guards.
+   */
   readonly public?: boolean
   /** The token name a `token` guard accepts (`RouteTokens.mint(name, …)`). */
   readonly token?: string
@@ -83,7 +94,12 @@ export interface ModuleRoute {
   readonly timeoutMs?: number
   /** One line for the admin view. */
   readonly description?: string
-  /** Runs in its own fiber, never on a turn's path. A failure or defect answers 500 (logged, not sent). */
+  /**
+   * Runs in its own fiber, never on a turn's path, and only while the shared part that declared it is published: a
+   * request admitted before a restart is answered 503 instead; a handler running when its shared part closes (after
+   * the grace period) is interrupted (503). A failure or defect answers 500 (logged, not sent). At its time limit the
+   * caller gets 504 at once, while the handler's interruption and finalizers finish in the background.
+   */
   readonly handler: (request: RouteRequest) => Effect.Effect<RouteResponse, unknown>
 }
 
@@ -106,8 +122,8 @@ export const routeProblem = (routes: ReadonlyArray<ModuleRoute> | undefined): st
   for (const route of routes ?? []) {
     const name = `${route.method} ${route.path === "" ? "/" : route.path}`
     if (!["GET", "POST", "PUT", "PATCH", "DELETE"].includes(route.method)) return `The route ${name} has an unknown method`
-    if (route.path.startsWith("/") || route.path.endsWith("/") || !segmentsOf(route.path).every((s) => SEGMENT.test(s))) {
-      return `The route path "${route.path}" is not valid: segments of letters, digits and ._~- or :name, no leading or trailing "/"`
+    if (route.path.startsWith("/") || route.path.endsWith("/") || !segmentsOf(route.path).every((s) => SEGMENT.test(s) && s !== "." && s !== "..")) {
+      return `The route path "${route.path}" is not valid: segments of letters, digits and ._~- (not "." or "..") or :name, no leading or trailing "/"`
     }
     const params = segmentsOf(route.path).filter((s) => s.startsWith(":"))
     if (new Set(params).size !== params.length) return `The route ${name} names a parameter twice`
@@ -123,6 +139,7 @@ export const routeProblem = (routes: ReadonlyArray<ModuleRoute> | undefined): st
     if (guards.includes("admin") && guards.includes("token")) return `The route ${name} cannot need both the admin token and a route token (one Authorization header)`
     if (guards.includes("token") !== (route.token !== undefined)) return `The route ${name}: a token guard needs a token name, and a token name needs the token guard`
     if (route.token !== undefined && !TOKEN_NAME.test(route.token)) return `The route ${name}: token name "${route.token}" must match ${TOKEN_NAME}`
+    if (route.public === true && route.method !== "GET") return `The public route ${name} must be a GET (a browser arriving on a callback)`
     if (route.public === true && bodyModeOf(route) !== "none") return `The public route ${name} may not read a body (body: "none")`
     const limit = route.bodyLimitBytes ?? DEFAULT_ROUTE_BODY_BYTES
     if (!Number.isInteger(limit) || limit < 0 || limit > MAX_ROUTE_BODY_BYTES) return `The route ${name}: bodyLimitBytes must be 0 to ${MAX_ROUTE_BODY_BYTES}`
@@ -150,7 +167,8 @@ export const routeInfo = (moduleId: string, route: ModuleRoute): ModuleRouteInfo
 export const matchRoutePath = (route: ModuleRoute, segments: ReadonlyArray<string>): Readonly<Record<string, string>> | undefined => {
   const pattern = segmentsOf(route.path)
   if (pattern.length !== segments.length) return undefined
-  const params: Record<string, string> = {}
+  // A dictionary without a prototype: a parameter named `constructor` is just a parameter.
+  const params: Record<string, string> = Object.create(null)
   for (const [i, p] of pattern.entries()) {
     const s = segments[i]!
     if (p.startsWith(":")) {
@@ -166,7 +184,8 @@ export const matchRoutePath = (route: ModuleRoute, segments: ReadonlyArray<strin
 
 /** Why a token operation could not be done. */
 export class RouteTokenError extends Schema.TaggedError<RouteTokenError>()("RouteTokenError", {
-  reason: Schema.Literals(["locked", "unavailable", "limit", "invalid", "failed"]),
+  /** `unknown_module`: the admin API named a module that is not installed. */
+  reason: Schema.Literals(["locked", "unavailable", "limit", "invalid", "failed", "unknown_module"]),
   /** One sentence for the owner. */
   message: Schema.String
 }) {}

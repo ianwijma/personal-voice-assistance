@@ -81,15 +81,23 @@ export const makeRouteTokens = (options: {
         const text = label.trim()
         if (!NAME.test(name)) return Effect.fail(new RouteTokenError({ reason: "invalid", message: `A token name must match ${NAME}` }))
         if (text.length === 0 || text.length > 80) return Effect.fail(new RouteTokenError({ reason: "invalid", message: "Say who the token is for, in 1 to 80 characters" }))
-        if (all().filter(([, t]) => t.moduleId === moduleId).length >= MAX_ROUTE_TOKENS_PER_MODULE) {
-          return Effect.fail(new RouteTokenError({ reason: "limit", message: `A module may hold at most ${MAX_ROUTE_TOKENS_PER_MODULE} tokens; revoke one first` }))
-        }
         const secret = randomBytes(32).toString("base64url")
         const id = randomBytes(6).toString("hex")
         const stored: Stored = { moduleId, name, label: text, hash: sha256(secret).toString("hex"), createdAt: now() }
-        return options.store.saveRouteTokens((committed) => ({ ...committed, [id]: JSON.stringify(stored) })).pipe(
+        // The limit is judged on the committed tokens inside the store's serialized save, so two mints at once cannot
+        // both take the last place.
+        let full = false
+        return options.store.saveRouteTokens((committed) => {
+          const held = Object.values(committed).filter((t) => parse(t)?.moduleId === moduleId).length
+          full = held >= MAX_ROUTE_TOKENS_PER_MODULE
+          return full ? committed : { ...committed, [id]: JSON.stringify(stored) }
+        }).pipe(
           Effect.mapError(saveFailed),
-          Effect.as({ token: infoOf(id, stored), secret })
+          Effect.flatMap(() =>
+            full
+              ? Effect.fail(new RouteTokenError({ reason: "limit", message: `A module may hold at most ${MAX_ROUTE_TOKENS_PER_MODULE} tokens; revoke one first` }))
+              : Effect.succeed({ token: infoOf(id, stored), secret })
+          )
         )
       }),
     revoke: (id) =>

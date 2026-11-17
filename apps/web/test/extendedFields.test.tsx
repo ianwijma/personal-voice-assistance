@@ -1,5 +1,5 @@
 import { act, fireEvent, render, screen, within } from "@testing-library/react"
-import { useState } from "react"
+import { StrictMode, useState } from "react"
 import { describe, expect, it, vi } from "vitest"
 import type { ModuleInfo, ModuleRoutesResponse, SettingField, SettingsForm, SettingValue } from "@pva/protocol"
 import { ClientContext } from "@/components/context.tsx"
@@ -86,9 +86,13 @@ describe("text list", () => {
     expect(input).toBeDisabled()
     fireEvent.click(screen.getByRole("button", { name: "Remove please" }))
     expect(values.at(-1)).toEqual(["hey", "yo"])
-    fireEvent.change(input, { target: { value: "far too long a word" } })
-    fireEvent.keyDown(input, { key: "Enter" })
-    expect(screen.getByRole("alert")).toHaveTextContent("is longer than 10 characters")
+    const errors: Array<string | undefined> = []
+    render(<Harness key="again" field={greetings} initial={[]} onError={(m) => errors.push(m)} />)
+    const other = screen.getAllByRole("textbox").at(-1)!
+    fireEvent.change(other, { target: { value: "far too long a word" } })
+    fireEvent.keyDown(other, { key: "Enter" })
+    expect(errors.at(-1)).toMatch(/^Not added: .*is longer than 10 characters/)
+    expect(other).toHaveValue("far too long a word")
   })
 })
 
@@ -103,9 +107,11 @@ describe("records", () => {
     fireEvent.click(screen.getByRole("button", { name: "Add room" }))
     expect(values.at(-1)).toEqual([{ name: "Kitchen", aliases: ["keuken"], dim: false }, { name: "", aliases: [], dim: false }])
     // The new row is open: its name field is a text field.
-    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "Hall" } })
+    const second = within(list).getAllByTestId("record")[1]!
+    expect(within(second).getByTestId("record-form")).toBeVisible()
+    fireEvent.change(within(second).getByLabelText("Name"), { target: { value: "Hall" } })
     expect(values.at(-1)).toEqual([{ name: "Kitchen", aliases: ["keuken"], dim: false }, { name: "Hall", aliases: [], dim: false }])
-    fireEvent.click(screen.getByRole("switch"))
+    fireEvent.click(within(second).getByRole("switch"))
     expect((values.at(-1) as ReadonlyArray<Record<string, unknown>>)[1]!.dim).toBe(true)
     fireEvent.click(screen.getByRole("button", { name: "Move Hall up" }))
     expect((values.at(-1) as ReadonlyArray<Record<string, unknown>>).map((r) => r.name)).toEqual(["Hall", "Kitchen"])
@@ -209,7 +215,8 @@ describe("module routes view", () => {
       routes: [{ ...module.routes![0]!, calls: [{ at: 0, address: "203.0.113.9", status: 403, ms: 0, note: "Only callers on the home network" }] }],
       tokens: [{ id: "a1b2c3d4e5f6", moduleId: "hooks", name: "hook", label: "Doorbell", createdAt: 0 }]
     }],
-    tokensLocked: false
+    tokensLocked: false,
+    behindProxy: false
   }
 
   it("lists the routes with their guards and last calls, and mints a token whose secret is shown once", async () => {
@@ -235,5 +242,164 @@ describe("module routes view", () => {
     await act(async () => fireEvent.click(screen.getByRole("button", { name: "New token" })))
     expect(calls).toContainEqual(["module-routes/hooks/tokens", { name: "hook", label: "Grafana" }])
     expect(screen.getByTestId("minted-token")).toHaveTextContent("s3cret-value-shown-once")
+  })
+})
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Review round 1 (PR 90).
+
+const levels: Extract<SettingField, { type: "records" }> = {
+  type: "records",
+  key: "levels",
+  label: "Levels",
+  apply: "live",
+  default: [],
+  itemFields: [
+    { type: "text", key: "name", label: "Name", default: "" },
+    { type: "number", key: "low", label: "Low", default: 1, integer: true },
+    { type: "number", key: "high", label: "High", default: 9, integer: true }
+  ],
+  itemLabel: "level",
+  titleKey: "name",
+  orderable: true
+}
+
+/** The button that opens and closes a record row. */
+const toggle = (row: HTMLElement) => row.querySelector<HTMLElement>("[aria-expanded]")!
+
+describe("records after review round 1", () => {
+  it("keeps each field's problem until it is fixed or its row removed, and names the row", () => {
+    const errors: Array<string | undefined> = []
+    render(<Harness field={levels} initial={[{ name: "A", low: 1, high: 9 }, { name: "B", low: 2, high: 8 }]} onError={(m) => errors.push(m)} />)
+    const [a, b] = screen.getAllByTestId("record")
+    fireEvent.click(toggle(a!))
+    fireEvent.change(within(a!).getByLabelText("Low"), { target: { value: "" } })
+    expect(errors.at(-1)).toMatch(/^Level 1, Low: /)
+    // A valid edit of another field of the same row does not clear it.
+    fireEvent.change(within(a!).getByLabelText("High"), { target: { value: "7" } })
+    expect(errors.at(-1)).toMatch(/^Level 1, Low: /)
+    expect(within(a!).getByLabelText("Low")).toHaveAttribute("aria-invalid", "true")
+    expect(within(a!).getByTestId("record-field-error")).toBeInTheDocument()
+    // Closing the row keeps the typed text and the problem (marked on the row).
+    fireEvent.click(toggle(a!))
+    expect(a).toHaveAttribute("data-invalid", "true")
+    expect(errors.at(-1)).toMatch(/^Level 1/)
+    // Moving rows keeps the problem with its row (now row 2).
+    fireEvent.click(within(b!).getByRole("button", { name: "Move B up" }))
+    expect(errors.at(-1)).toMatch(/^Level 2, Low: /)
+    // Removing that row removes its problem.
+    fireEvent.click(screen.getByRole("button", { name: "Remove A" }))
+    expect(errors.at(-1)).toBeUndefined()
+  })
+
+  it("keeps the open row open when a closed neighbour moves into its place", () => {
+    render(<Harness field={levels} initial={[{ name: "A", low: 1, high: 9 }, { name: "B", low: 2, high: 8 }]} />)
+    fireEvent.click(toggle(screen.getAllByTestId("record")[0]!))
+    fireEvent.change(within(screen.getAllByTestId("record")[0]!).getByLabelText("Low"), { target: { value: "" } })
+    fireEvent.click(screen.getByRole("button", { name: "Move B up" }))
+    const [first, second] = screen.getAllByTestId("record")
+    expect(first).toHaveTextContent("B")
+    expect(toggle(first!)).toHaveAttribute("aria-expanded", "false")
+    expect(toggle(second!)).toHaveAttribute("aria-expanded", "true")
+    expect(second).toHaveTextContent("A")
+    // Its typed text went with it.
+    expect(within(second!).getByLabelText("Low")).toHaveValue(null)
+  })
+})
+
+describe("action buttons after review round 1", () => {
+  it("finish a press under StrictMode, and a second one too", async () => {
+    let finish: (v: unknown) => void = () => undefined
+    const request = vi.fn(() => new Promise((resolve) => (finish = resolve))) as unknown as AssistantClient["request"]
+    withClient(request, <StrictMode><Harness field={allOff} initial={undefined} context={{ form: { kind: "module", id: "demo-home" }, dirty: false, draftValues: {} }} /></StrictMode>)
+    const button = screen.getByRole("button", { name: "Switch everything off" })
+    for (const text of ["Switched 2 lights off.", "Every light was already off."]) {
+      fireEvent.click(button)
+      expect(button).toBeDisabled()
+      await act(async () => finish({ type: "result", requestId: "r", ok: true, action: { ok: true, text, tone: "ok" } }))
+      expect(screen.getByTestId("action-result")).toHaveTextContent(text)
+      expect(button).toBeEnabled()
+    }
+  })
+
+  it("free the button when the request itself fails", async () => {
+    const request = vi.fn(async () => {
+      throw new Error("closed")
+    }) as unknown as AssistantClient["request"]
+    withClient(request, <Harness field={allOff} initial={undefined} context={{ form: { kind: "module", id: "demo-home" }, dirty: false, draftValues: {} }} />)
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Switch everything off" })))
+    expect(screen.getByTestId("action-result")).toHaveTextContent("No answer from the assistant")
+    expect(screen.getByRole("button", { name: "Switch everything off" })).toBeEnabled()
+  })
+})
+
+describe("module routes view after review round 1", () => {
+  const route = (path: string, token: string) => ({
+    method: "POST" as const,
+    path: `/api/modules/hooks/${path}`,
+    guards: ["token" as const],
+    public: false,
+    token,
+    bodyLimitBytes: 8192,
+    ratePerMinute: { perAddress: 30, total: 120 }
+  })
+  const base: ModuleInfo = {
+    id: "hooks",
+    name: "Hooks",
+    description: "",
+    enabled: true,
+    state: "running",
+    tools: [],
+    settings: { fields: [], values: {}, secrets: {}, errors: [] },
+    revision: 1
+  }
+  const apiWith = (view: ModuleRoutesResponse, calls: Array<[string, unknown]>): VoiceApi => ({
+    request: async (path, init) => {
+      calls.push([path, init?.body])
+      const name = (init?.body as { name?: string } | undefined)?.name ?? "hook"
+      const body = path.endsWith("/tokens")
+        ? { token: { id: "0f0f0f0f0f0f", moduleId: "hooks", name, label: "Uploader", createdAt: 1 }, secret: "s3cret-value-shown-once" }
+        : init?.method === "DELETE" ? { revoked: true } : view
+      return new Response(JSON.stringify(body), { status: 200 })
+    }
+  })
+
+  it("mints a token for the purpose chosen, and shows each token's purpose", async () => {
+    const module = { ...base, routes: [route("hook", "hook"), route("upload", "upload")] }
+    const view: ModuleRoutesResponse = {
+      modules: [{ moduleId: "hooks", running: true, routes: module.routes.map((r) => ({ ...r, calls: [] })), tokens: [{ id: "a1b2c3d4e5f6", moduleId: "hooks", name: "hook", label: "Doorbell", createdAt: 0 }] }],
+      tokensLocked: false,
+      behindProxy: false
+    }
+    const calls: Array<[string, unknown]> = []
+    await act(async () => void render(<ModuleRoutes module={module} api={apiWith(view, calls)} />))
+    expect(screen.getByTestId("route-token-name")).toHaveTextContent("hook")
+    fireEvent.change(screen.getByLabelText("What the new token is for"), { target: { value: "upload" } })
+    fireEvent.change(screen.getByLabelText("Who the new token is for"), { target: { value: "Uploader" } })
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "New token" })))
+    expect(calls).toContainEqual(["module-routes/hooks/tokens", { name: "upload", label: "Uploader" }])
+    expect(screen.getByTestId("minted-token")).toHaveTextContent("“upload” token for Uploader")
+  })
+
+  it("shows a stopped module's tokens, to be revoked, and marks lan routes unreachable behind a proxy", async () => {
+    const stopped = { ...base, state: "off" as const, enabled: false }
+    const view: ModuleRoutesResponse = {
+      modules: [{ moduleId: "hooks", running: false, routes: [], tokens: [{ id: "a1b2c3d4e5f6", moduleId: "hooks", name: "hook", label: "Doorbell", createdAt: 0 }] }],
+      tokensLocked: false,
+      behindProxy: false
+    }
+    const calls: Array<[string, unknown]> = []
+    vi.spyOn(window, "confirm").mockReturnValue(true)
+    await act(async () => void render(<ModuleRoutes module={stopped} api={apiWith(view, calls)} />))
+    expect(screen.getByTestId("routes-stopped")).toBeInTheDocument()
+    expect(screen.getByTestId("route-token")).toHaveTextContent("Doorbell")
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Revoke" })))
+    expect(calls.map((c) => c[0])).toContain("module-routes/hooks/tokens/a1b2c3d4e5f6")
+
+    const lan = { ...base, routes: [{ ...route("hook", "hook"), guards: ["lan" as const], token: undefined as never }] }
+    const { token: _t, ...lanRoute } = lan.routes[0]!
+    const proxied: ModuleRoutesResponse = { modules: [{ moduleId: "hooks", running: true, routes: [{ ...lanRoute, calls: [] }], tokens: [] }], tokensLocked: false, behindProxy: true }
+    await act(async () => void render(<ModuleRoutes module={{ ...base, routes: [lanRoute] }} api={apiWith(proxied, [])} />))
+    expect(screen.getByTestId("route-unreachable")).toHaveTextContent("SERVE_BEHIND_PROXY")
   })
 })

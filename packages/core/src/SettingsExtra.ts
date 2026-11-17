@@ -179,7 +179,8 @@ const upper = (s: string) => (s.length === 0 ? s : s[0]!.toUpperCase() + s.slice
 /**
  * Free text with suggestions: a model name. `options` are the static suggestions; a running instance adds more
  * through `settingOptions` (the host puts them on the described field). With `allowCustom: false` only static
- * options are accepted (so dynamic lists need `allowCustom: true`).
+ * options are accepted, on every path a value arrives by (the form, the environment, an assistant's own value, a
+ * button's draft), and the host shows only those: a list known only while the module runs needs `allowCustom: true`.
  */
 const combo = (o: Common & {
   readonly default: string
