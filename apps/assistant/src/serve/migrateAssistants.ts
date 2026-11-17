@@ -842,7 +842,7 @@ export const applyLegacyChange = (data: AssistantsData, before: FrontendData, af
     const profile = effectiveProfile(now, {}, builtInProfile(idleBuiltIn))
     const next = typeFromProfile(settings, changed, profile, assistantId)
     const stored = data.deviceTypes[kind]
-    if (!sameJson(next, settings) || stored === undefined) deviceTypes[kind] = { ...next, rev: stored === undefined ? 0 : stored.rev + 1 }
+    if (!sameJson(next, settings) || stored === undefined) deviceTypes[kind] = { ...next, rev: (stored?.rev ?? 0) + 1 }
     const assistant = assistantId === undefined ? undefined : assistants.byId[assistantId]
     if (assistant !== undefined) {
       let a = assistant
