@@ -15,11 +15,11 @@ their data in the same collections, under an owner of their own. Every committed
 (`ctx.events`) and reaches the voice pages that may see it. One backup a day goes to `data/backups/`.
 
 **Every call is synchronous on the main thread**, which also frames the browsers' audio. So nothing unbounded runs
-there, by construction, not by a timeout: a `list` is one index range read of at most 100 rows (a shape no index
-answers is refused) of values of at most 16,000 characters, a `get` is one row, a write is one row, a transaction is one
-synchronous step; the main connection never checkpoints and never waits for a lock. Backups, checkpoints and the
-removal of an ended conversation run beside turns, on threads of their own or in bounded steps ("Latency" has the
-numbers).
+there, by construction, not by a timeout: a `list` is one index range read (a shape no index answers is refused) of at
+most `min(100, 120,000 / maxChars)` rows of values of at most the collection's `maxChars` (default 2,000, at most
+16,000), a `get` is one row, a write is one row, a transaction is one synchronous step; the main connection never
+checkpoints and never waits for a lock. Backups, checkpoints and the removal of an ended conversation run beside turns,
+on threads of their own or in bounded steps ("Latency" has the numbers).
 
 ## Declaring data
 
@@ -32,8 +32,10 @@ export const timers = defineCollection({
   name: "timers",                 // /^[a-z][a-z0-9_]{0,39}$/, unique in the module
   scope: "household",             // household | person | assistant | device | conversation; never changes
   schema: Timer,                  // rows are stored in its JSON form (Schema.toCodecJson), which must be an object
+  maxChars: 2_000,                // the most characters of JSON a value may have (the default; at most 16,000; "Values")
   migrate: { 1: (v1) => ({ ...v1, state: "running" }) },  // how a value of data version 1 becomes version 2
-  indexes: ["state", ["state", "dueAt"]],  // what `list` may filter or order on (see "Lists" and "Values")
+  indexes: ["state", ["state", "dueAt"]],  // what `list` may filter or order on (see "Lists" and "Values"); never
+                                  // updatedAt, createdAt, id, rev or scope (a row's own names: refused here)
   ambient: (rows: ReadonlyArray<Row<typeof Timer.Type>>, { now }) => [`Timers: ${rows.map(…).join(", ")}.`],
   ambientRows: 10,                // newest rows per scope the lines are made from (1–20)
   project: (row, device) => ({ label: row.value.label, dueAt: row.value.dueAt })  // what voice pages may see
@@ -83,11 +85,13 @@ yield* ctx.store.transaction((tx) => {                                          
   written to the household instead. Until P5 adds the device's default person, no turn has a person. Every call works
   on its scope only: a row of the same id in another scope is invisible to it, and is never changed or removed by it.
 - **Ids.** Row ids and scope ids are 1–200 letters, digits and `_ . : -` (device ids, assistant ids, UUIDs, person ids
-  fit); anything else is `invalid`, also a turn's id that does not fit. An id is stored and compared the same way in
+  fit); anything else is `invalid` (`get`, `insert`, `update` and `remove` check a row id the same way), also a turn's
+  id that does not fit. An id is stored and compared the same way in
   SQLite and in the in-memory store. The id of a row of a projected collection can reach every page that could see
   its scope (in a removal, "Pages"): do not put anything private in it.
-- **Lists.** Each shape is one index range, read in its own order, of at most `limit` rows (default 20, at most 100;
-  more is `invalid`: page through with an order and a filter). The shapes, and only these:
+- **Lists.** Each shape is one index range, read in its own order, of at most `limit` rows: at most
+  `maxListRows(collection)`, which is `min(100, floor(120,000 / maxChars))` (60 for the default `maxChars`, 100 for
+  1,200 or less, 7 for 16,000; more is `invalid`); the default is 20, or that most when it is smaller. The shapes, and only these:
   - no `where`: ordered by `updatedAt` (the default, newest first), `createdAt` (newest first by default), or a field
     declared as an index of its own (ascending by default);
   - `where` on **one** field declared as an index of its own: ordered by `updatedAt` (default, newest first),
@@ -97,6 +101,22 @@ yield* ctx.store.transaction((tx) => {                                          
 
   Anything else (two filter fields, an order no index has) is `invalid`: store a combined field (`"list:done"`) and
   index that. Ties are broken by `createdAt`, then by id, in the same direction.
+
+  **Reading on (`after`).** To read more than one list returns, pass the last row of a page as `after` in the same query (the same
+  `where`, `orderBy` and scope): the next list continues after that row's place in the order, from the same index range,
+  so every row is read once, in order, however many there are (a row written meanwhile is seen if its place is still
+  ahead). `after` must be a row a list of the same query of the same collection returned (not a copy, not one from
+  `get`); anything else is `invalid`.
+
+  ```ts
+  let after: Row<Note> | undefined
+  for (;;) {
+    const page = yield* notes.list({ limit: 50, ...(after !== undefined ? { after } : {}) })
+    // … use page …
+    if (page.length < 50) break
+    after = page.at(-1)
+  }
+  ```
 - **No search, no undo.** To find text, `list` a bounded set (newest first, or by an index) and match in your code. A
   module that offers "undo" keeps what it needs to reverse its own last operation (in a collection of its own).
 - **Updates** read, apply your function and write as one step (nothing can come between them), so concurrent updates
@@ -114,13 +134,21 @@ yield* ctx.store.transaction((tx) => {                                          
   from every call, also through a handle it got earlier. `busy`: another connection held the database's write lock
   longer than the store waits (about 50 ms, on a timer, never on the event loop); nothing was done; try again.
 - **Actor.** Every row records who changed it last (`updatedBy`: a turn with its device and person, a job, the admin, a
-  tap on a device, the module itself). Pass `{ actor }` from jobs and taps.
+  tap on a device, the module itself). Pass `{ actor }` from jobs and taps. An actor is checked before it is stored (a
+  known kind with its fields as strings, a turn's id a finite number): anything else is `invalid`.
 
 ### Values
 
 A row's value is a **JSON object** (its schema's JSON form): a schema that allows a string, a number, `null` or a list
-as the whole value is refused at write (`invalid`). At most 16,000 characters of JSON (with the 100-row limit this
-bounds the worst legal `list`; "Latency").
+as the whole value is refused at write (`invalid`). At most the collection's `maxChars` characters of JSON (default
+2,000, at most 16,000; refused at write).
+
+**The work of a list is bounded by a product**: a list asks for at most `maxListRows` rows, so rows × `maxChars` is at
+most `LIST_BUDGET_CHARS` (120,000). The budget was chosen by measuring structured values, which cost far more to decode
+than a long string of the same length (Sol's fixtures: arrays of small objects `{ "x": 0 }`, arrays of numbers), at
+both ends of the rule (60 rows of 2,000 characters, 7 rows of 16,000), on both stores, so that the worst legal list
+holds the main thread under 10 ms with a margin of two ("Latency" has the numbers). Declare a larger `maxChars` only
+for a collection that needs it: its lists return fewer rows a page.
 
 An **indexed field** holds a string (well-formed Unicode without NUL, at most 500 characters), a finite number or
 `true` / `false`, or is missing; anything else there (`null`, a list, an object, a lone surrogate, `NaN`) is refused at
@@ -153,7 +181,9 @@ nothing else (no other fiber, no timer, no socket) runs while it does, so there 
 1. **Synchronous or it fails.** A function that returns a promise (an `async` function), an Effect, a generator or a
    function is refused: everything it did is rolled back and the transaction fails with `StoreError` `invalid`
    ("transactions cannot await"); the type already refuses promises and Effects. Do the asynchronous work before the
-   transaction or after it (`tx.afterCommit`).
+   transaction or after it. A `tx.afterCommit` or `tx.onRollback` hook may start such work, but nothing awaits it: a
+   promise a hook (or an update function, or a migration) returns is not waited for, and if it rejects, that is only
+   logged.
 2. **All or nothing.** A store failure your function throws and does not catch (`StoreConflict`, …) rolls back and is
    the transaction's failure; anything else it throws rolls back and is a defect. A failure it catches is just a
    failed call: the transaction goes on and commits the rest.
@@ -174,22 +204,29 @@ Keep a transaction small: it holds the event loop while it runs (a one-row write
 
 ## Versions, upgrades and downgrades
 
-Each owner (a module, a core service) has **one data version** for all its collections (`storage.version`, default 1),
-stored with its id; each collection's scope and shape (a canonical description of its schema's JSON form, its scope
-and its indexes) are stored with it. Before any module is made, serve mode judges every owner's data
+Each owner (a module, a core service) has **one data version** for all its collections (`storage.version`, default 1;
+a module that declares no `storage` at all is judged as declaring nothing at version 1), stored with its id; each
+collection's version, scope and shape (a canonical description of its schema's JSON form, its scope, its indexes and
+its `maxChars`) are stored with it. A row has no version of its own: every row is at its collection's version, because
+only an upgrade at start changes that version, rewriting in the same transaction every row whose value changes. **A
+read never migrates**; it decodes and checks the value against the schema. Before any module is made, serve mode judges every owner's data
 (`HouseholdStore.prepare`):
 
 - **Older data**: when the version rose, every collection of the module is brought to it **at start**, before the
   module runs, in one transaction, after a backup of the file (`household-<date>-before-<module>.db`, copied to the
-  second directory too): every row of a collection whose shape changed or that has a migration between the versions
-  is decoded at its stored version, migrated (`migrate[n]` for each version `n` passed), and stored through the same
-  checks as a write (an object, the 16,000 character limit, indexable fields, the new schema), and the indexes follow
+  second directory too): every row of a collection whose shape changed or that has a migration between the
+  collection's stored version and the new one is decoded at that stored version, migrated (`migrate[n]` for each version `n` passed), and stored through the same
+  checks as a write (an object, the collection's `maxChars`, indexable fields, the new schema), and the indexes follow
   the declaration. A failure rolls all of it back and leaves the module `unavailable`, with the row and the reason. At
   most 20,000 rows are migrated (`MAX_MIGRATION_ROWS`; more makes the module `unavailable`): that keeps the stop at
-  start bounded (about 0.6 s, "Latency").
-- **The same version, another shape**: refused. Changing a collection's schema or indexes needs a higher version (and
-  a migration where the values change); the module is `unavailable` until then and nothing is changed. Adding or
-  changing an index is such a change, so its migration checks the indexed fields of every row.
+  start bounded (about 0.7 s, "Latency").
+- **The same version, another shape**: refused. Changing a collection's schema, indexes or `maxChars` needs a higher
+  version (and a migration where the values change); the module is `unavailable` until then and nothing is changed.
+  Adding or changing an index is such a change, so its migration checks the indexed fields of every row; a smaller
+  `maxChars` fails the upgrade when a stored value is longer. The shape covers the structure of a schema and the
+  built-in checks it can represent. **A custom check's function (`Schema.makeFilter`) is not part of the shape**:
+  changing one needs a version bump by the author, and a stored row the new check refuses fails `failed` when it is
+  read.
 - **A collection's scope never changes**, also not with a new version (refused the same way): declare a new collection
   and move the rows in your own code.
 - **Newer data** (written by a newer version of the module): the module is `unavailable` ("written by a newer version
@@ -200,7 +237,8 @@ and its indexes) are stored with it. Before any module is made, serve mode judge
 - **Data no declaration names any more** (a collection the module dropped, a module that left the catalog) is never
   deleted by the store: it stays, unreachable, and `doctor` lists it (`HouseholdStore.undeclared()`). Declared again
   with a later version, it is migrated like any other.
-- **Read-only** (the CLI modes): an owner is usable only when its stored version, every collection's shape and the
+- **Read-only** (the CLI modes): the file is refused when one of the store's own indexes is missing (a writable start
+  makes it again before serving); an owner is usable only when its stored version, every collection's shape and the
   indexes in the file match what the code declares; otherwise it is `unavailable` there too ("the server makes the
   upgrade when it starts"). A collection the server never prepared reads as empty.
 - **A newer core schema** (`pva_meta.schema` above what this assistant knows): serve mode does not start, and says to
@@ -222,8 +260,10 @@ minute) until a checkpoint that started after the removal completes; after 10 mi
 checkpoint was still waiting when the previous process stopped.
 
 A conversation that ends has its rows hidden at once and removed in bounded steps off the turn's path
-(`endConversation`: 100 rows per step, each its own transaction, yielding between them), and serve mode removes at
-start, the same way, the rows of conversations a previous run left behind (conversations do not outlive a process).
+(`endConversation`: `BULK_STEP_ROWS` rows per step, each its own transaction, yielding between them), and serve mode
+removes at start, the same way, the rows of conversations a previous run left behind (conversations do not outlive a
+process). A removal that fails (the database stayed locked) or is interrupted stops hiding the conversation: the rows
+it did not reach are visible again until a later call, or the sweep at the next start, removes them.
 
 What `remove` cannot reach: **backups**. A removed item stays in the daily backups made before it until they rotate
 out after 14 days ("What is kept how long"), in a second backup directory (`HOUSEHOLD_BACKUP_COPY_DIR`) until the
@@ -251,9 +291,13 @@ its stream ends in a microtask. A slow subscriber loses the newest events (count
 logger or clock that fails stops nothing). A subscription lives with the part of the module that made it (`shared` or
 an instance): it receives events only while the module is published, not while it starts (an event published then is
 not kept for it); once the module is withdrawn (it is stopped, or replaced: the host stops the old one before it starts
-the new one) no event reaches its handler, even one already in its queue, and it ends when the part's scope closes,
-wherever the stream runs. `ctx.store` and `ctx.events` work until the part has closed (a call in flight during the
-stop's grace period still writes); after that every call dies with `ModuleStopped`.
+the new one) no event reaches its handler, even one already in its queue, and it ends when the part's scope closes.
+**Consume a subscription in its part's scope**: `Effect.forkScoped` in `shared` or `start`, or within a call. A stream
+run detached from that scope (`Effect.forkDetach`, another runtime) is not supported, and nothing is promised about when
+its subscription is released. `ctx.store` and `ctx.events` work until the part has closed (a call in flight during the
+stop's grace period still writes); after that every call dies with `ModuleStopped`. **An event handler is not a call in
+flight**: it gets no grace period of its own, and it is interrupted when its part's scope closes, so a handler must be
+fine with being stopped at any point (do what must not be cut short in a store transaction, which is one step).
 Events are lost at a restart: nothing may depend on one for correctness.
 
 ## Pages
@@ -266,7 +310,8 @@ device (its saved name; P5 adds the room and the default person), never what the
 it to the socket**: the row is read as it is committed at that moment and projected with the device's record then. A
 row that was removed, or moved away from the page, before its frame was built never travels.
 
-Each page has **one queue for everything it is sent** (`HouseholdPage` in core), with one bound (2,000 entries), filled
+Each page has **one queue for everything it is sent** (`HouseholdPage` in core), with one bound (2,000 entries, a
+snapshot counted as one: room for one is kept while none is queued, so a fresh snapshot never takes it past), filled
 from the store's commit listener (not from the bus, so nothing is lost to a slow page) and drained by the page's
 fiber a bounded step at a time:
 
@@ -287,7 +332,7 @@ fiber a bounded step at a time:
   otherwise. Nothing is remembered per page about the rows it holds.
 - A saved change to a device's record (its name; P5: its place and default person) gives that device's pages a fresh
   snapshot; the module events already queued are kept and follow it, in order, projected with the new record.
-- **Every loss is signalled, once, the same way**: when more than 2,000 entries wait (the page fell too far behind) or
+- **Every loss is signalled, once, the same way**: when more than 2,000 entries would wait (the page fell too far behind) or
   sending to it failed and starts again, everything queued is dropped and the page gets `household.gap` (`overflow`,
   `restart`) and then a fresh snapshot. Module events between the message before the gap and that snapshot may be
   missing; without a `household.gap`, nothing was.
@@ -348,9 +393,13 @@ is the recovery point for a damaged file.
 - **Only the serving process makes backups** (it holds the data directory's writer lock, and inside it backups run
   one at a time). The server makes `data/backups/household-<date>.db` once a day (the first a minute after start) and
   before an upgrade (`household-<date>-before-<owner>.db`, which does not count as the day's backup), and copies each to
-  `HOUSEHOLD_BACKUP_COPY_DIR` when set (a copy that failed is a Health issue and is tried again every hour). A backup
+  `HOUSEHOLD_BACKUP_COPY_DIR` when set, keeping the backup's time (so both directories prune by the snapshot's age).
+  Every hour it copies every retained backup that directory lacks (by name, a pre-upgrade one too); a failed copy is a
+  Health issue until none is missing. A directory that cannot be synced after a backup is published, for a reason
+  other than "not supported here", fails the backup (the owner is told). A backup
   is SQLite's online backup made through a **connection of its own**, in one step on SQLite's worker thread, so turns
-  are never held up by it ("Latency"). Each is written to a temporary file of its own (`….part-<pid>-<random>`), made
+  are never held up by it ("Latency"). Backups run one at a time, and the file work of one is not interrupted halfway:
+  an interrupted backup finishes its file work before the next one starts. Each is written to a temporary file of its own (`….part-<pid>-<random>`), made
   one self-contained file (no log beside it), synced and published with one `rename`.
 - Every file and directory the store makes is private to the user (`0600`, `0700`), whatever the umask. A data or
   backup directory that already exists and others may write to is narrowed to `0700` when it is the user's; when it is
@@ -371,7 +420,8 @@ is the recovery point for a damaged file.
 | Daily backups | `data/backups/household-<date>.db`, and the second directory | once older than 14 days (by the end of the day in the name or the file time, whichever is older) |
 | Backups before an upgrade | `data/backups/household-<date>-before-<owner>.db`, and the second directory | the same |
 
-The server prunes once a day and after every backup, without exception (also when it means no backup is left: the
+The server prunes once a day and after every backup (a read-only store never prunes and never changes a file's mode),
+without exception (also when it means no backup is left: the
 Health page then says there is none). A directory that cannot be listed, a backup that cannot be checked or removed
 (permissions, a read-only share) is reported, on the Health page too, and never counted as done. So 14 days after a
 removal, the removed item is in no file the store manages, as long as the server ran and pruning succeeded.
@@ -387,26 +437,41 @@ removal, the removed item is in no file the store manages, as long as the server
 ## Latency
 
 `packages/store-sqlite/test/latency.test.ts` on 100,000 rows of about 1 KB (one collection with two indexes and a
-pair), on the development machine (shared with other agents), the worst of 30 calls each:
+pair, `maxChars` 1,200 so a list may take 100 of them), on the development machine (shared with other agents), the
+worst of 30 calls each after one call that is not timed (a shape's first call compiles its statement and its codec):
 
 | Call | Worst |
 |---|---|
-| `list` newest 20 (the ambient read) | 1.2 ms |
-| `list` of 100 rows (the most a list returns): newest / oldest / `where` / ordered by an index / `where` ordered by a pair | 1.9 / 2.1 / 1.7 / 1.9 / 1.9 ms |
-| **the worst legal `list`: 100 rows of 16,000 characters** | **2.3 ms** (bound: 10 ms) |
-| `get` | 0.3 ms |
-| `update` of one row (its own transaction) | 0.8 ms |
-| a one-row write right after a reader let go of a log that grew while it held an old snapshot | 0.3 ms (the main connection makes no checkpoint) |
-| one snapshot step for a page (20 rows of about 1 KB, projected, frames built) | 1.1 ms |
+| `list` newest 20 (the ambient read) | 0.5 ms |
+| `list` of 100 rows (the most a list returns): newest / oldest / `where` / ordered by an index / `where` ordered by a pair | 1.6 / 2.1 / 2.2 / 1.3 / 1.3 ms |
+| `get` | 0.1 ms |
+| `update` of one row (its own transaction) | 1.8 ms |
+| a one-row write right after a reader let go of a log that grew while it held an old snapshot | 0.5 ms (the main connection makes no checkpoint) |
+| one snapshot step for a page (20 rows of about 1 KB, projected, frames built) | 1.2 ms |
+
+**The worst legal list** (the list rule at both ends, structured values filling `maxChars`; the call is synchronous,
+so its time is how long the main thread is held; `LIST_BUDGET_CHARS` 120,000). Three runs; the worst of each:
+
+| List | SQLite | In memory |
+|---|---|---|
+| 60 rows of arrays of `{ "x": 0 }`, 1,998 characters each (`maxChars` 2,000) | 4.6 ms | 4.0 ms |
+| 60 rows of arrays of numbers, 2,000 characters each | 4.1 ms | 3.9 ms |
+| 7 rows of arrays of `{ "x": 0 }`, 15,998 characters each (`maxChars` 16,000) | 3.1 ms | 2.7 ms |
+| 7 rows of arrays of numbers, 16,000 characters each | 4.9 ms | 2.9 ms |
+
+With a budget of 200,000 (100 and 12 rows) the same lists took up to 6.8 ms, and 150,000 up to 5.7 ms: over the
+margin of two, so the budget is 120,000. Long strings of the same size cost far less (Sol measured 0.8–4.4 ms for 100
+rows of 16,000 characters).
 
 The longest stop of the event loop (a 1 ms timer) while the work ran, with a turn's read every 2 ms beside it:
 
 | Work | Longest stop |
 |---|---|
-| a backup (own connection, one step on SQLite's worker thread) | 4.9 ms |
-| a removal and the truncating checkpoint after it (worker thread), after a reader let the log grow | 1.4 ms |
-| ending a conversation of 3,000 rows of about 1 KB (steps of 100) | 5.3 ms |
-| migrating 20,000 rows of about 1 KB at start (one transaction; before the server serves) | 642 ms |
+| a backup (own connection, one step on SQLite's worker thread) | 5.6 ms |
+| a removal and the truncating checkpoint after it (worker thread), after a reader let the log grow | 2.4 ms |
+| ending a conversation of 3,000 rows of about 1 KB (steps of 10) | 1.9 ms |
+| ending a conversation at the legal maximum: values of 16,000 characters, eight indexed fields of 500 characters (sixteen indexes), secure deletion (steps of 10; 100 rows a step took 48 ms) | 4.3 ms |
+| migrating 20,000 rows of about 1 KB at start (one transaction; before the server serves) | 723 ms |
 
 The doctor's quick check reads the whole file; it is not on a turn's path.
 
