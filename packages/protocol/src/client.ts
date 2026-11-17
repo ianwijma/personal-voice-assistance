@@ -3,6 +3,7 @@ import { AdminToken } from "./admin.ts"
 import { Assistant, AssistantBody, AssistantId, MAX_ASSISTANTS } from "./assistants.ts"
 import {
   ClientId,
+  FieldKey,
   ModuleId,
   NonNegativeFinite,
   NonNegativeInt,
@@ -16,7 +17,7 @@ import { MAX_MOVE_KEYS } from "./env.ts"
 import { DeviceSettingsPatch, DeviceTarget } from "./devices.ts"
 import { DeviceHello, DeviceId, DeviceName, FrontendRole, WakePhrase } from "./frontends.ts"
 import { JobAction, ToolId } from "./jobs.ts"
-import { SettingsPatch } from "./settings.ts"
+import { SettingsPatch, SettingValue } from "./settings.ts"
 import { Password } from "./vault.ts"
 
 /**
@@ -178,6 +179,20 @@ export const ModuleConfigure = Schema.Struct({
   requestId: RequestId,
   moduleId: ModuleId,
   patch: SettingsPatch
+})
+
+/**
+ * Protocol 10, admin only: press an `action` field of a module's form ("Test"). Answered with `result`, whose
+ * `action` is what the handler said (`ok: true` on the result means it ran; `action.ok` says whether it worked).
+ * `values`: the page's draft (non-secret values) for a field with `requiresSaved: false`; the handler then sees
+ * them over the saved settings. Absent: the saved settings.
+ */
+export const ModuleAction = Schema.Struct({
+  type: Schema.Literal("module.action"),
+  requestId: RequestId,
+  moduleId: ModuleId,
+  key: FieldKey,
+  values: Schema.optionalKey(Schema.Record(FieldKey, SettingValue))
 })
 
 /**
@@ -459,7 +474,8 @@ export const ClientMessage = Schema.Union([
   DeviceSave,
   ConversationRead,
   DevicePick,
-  HealthCheck
+  HealthCheck,
+  ModuleAction
 ]).pipe(Schema.toTaggedUnion("type"))
 export type ClientMessage = typeof ClientMessage.Type
 export type ClientMessageType = ClientMessage["type"]

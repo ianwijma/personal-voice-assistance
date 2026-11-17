@@ -20,6 +20,7 @@ import { JobInfo, ModelSet } from "./jobs.ts"
 import { VaultInfo } from "./vault.ts"
 import { ConversationId, ConversationReason, SessionInfo, SessionKey } from "./sessions.ts"
 import { HealthInfo } from "./health.ts"
+import { FieldActionResult } from "./settings.ts"
 
 /**
  * Text frames from the assistant to the browser. Binary frames from the
@@ -224,7 +225,9 @@ export const Result = Schema.Struct({
    * Protocol 7: present only on the successful result of `device.save`: the revision the saved device or defaults
    * have now, so the page can wait until that revision has reached it (the lists are pushed after the result).
    */
-  rev: Schema.optionalKey(NonNegativeInt)
+  rev: Schema.optionalKey(NonNegativeInt),
+  /** Protocol 10: present only on the result of `module.action` that ran: what the handler said, shown by the button. */
+  action: Schema.optionalKey(FieldActionResult)
 })
 
 /**

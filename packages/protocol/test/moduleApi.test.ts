@@ -9,7 +9,7 @@ const decodes = (schema: Schema.Top, value: unknown) => Schema.decodeUnknownResu
 
 describe("protocol 9", () => {
   it("is version 9: unavailable is a new member of the closed ModuleState set", () => {
-    expect(PROTOCOL_VERSION).toBe(9)
+    expect(PROTOCOL_VERSION).toBe(10)
     expect(decodes(ModuleState, "unavailable")).toBe(true)
     expect(decodes(ModuleInfo, exampleUnavailableModule)).toBe(true)
   })
