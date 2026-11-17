@@ -238,10 +238,10 @@ export const makeMemoryHouseholdStore = (options: MemoryStoreOptions = {}): Hous
   const conversations = {
     docs: (conversationId: string | undefined) =>
       Effect.sync(() => [...state.docs.values()].filter((d) => d.scope.kind === "conversation" && (conversationId === undefined || d.scope.id === conversationId))),
-    purge: (conversationId: string | undefined) =>
+    purge: (conversationId: string | undefined, keep: ReadonlyArray<string>) =>
       Effect.sync(() => {
         state.changes = state.changes.map((c) => {
-          if (c.scope.kind !== "conversation" || (conversationId !== undefined && c.scope.id !== conversationId) || c.payload === undefined) return c
+          if (c.scope.kind !== "conversation" || (conversationId !== undefined && c.scope.id !== conversationId) || c.payload === undefined || keep.includes(c.module)) return c
           const { payload: _gone, ...rest } = c
           return rest
         })
@@ -333,8 +333,8 @@ export const makeMemoryHouseholdStore = (options: MemoryStoreOptions = {}): Hous
         }
       })),
     lastSeq: tx.statement(Effect.sync(() => state.nextSeq - 1)),
-    endConversation: (conversationId) => (readOnly ? Effect.succeed(0) : endConversationsOn(backend, conversations, conversationId)),
-    sweepConversations: readOnly ? Effect.succeed(0) : endConversationsOn(backend, conversations, undefined),
+    endConversation: (conversationId) => (readOnly ? Effect.succeed(0) : endConversationsOn(backend, conversations, conversationId, () => [...verdicts.keys()])),
+    sweepConversations: readOnly ? Effect.succeed(0) : endConversationsOn(backend, conversations, undefined, () => [...verdicts.keys()]),
     pruneChanges: (opts) =>
       readOnly ? Effect.fail(readOnlyError("pruneChanges")) : tx.transaction(Effect.gen(function*() {
         const now = opts?.now ?? (yield* Clock.currentTimeMillis)

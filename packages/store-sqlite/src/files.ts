@@ -70,6 +70,7 @@ export const copyDatabase = async (source: string, path: string): Promise<void> 
     } finally {
       from.close()
     }
+    selfContained(DatabaseSync, part)
     await narrow(part)
     await fsyncFile(part)
     await rename(part, path)
@@ -77,6 +78,19 @@ export const copyDatabase = async (source: string, path: string): Promise<void> 
   } catch (e) {
     await rm(part, { force: true }).catch(() => undefined)
     throw e
+  }
+}
+
+/**
+ * Make a fresh copy one file with no log of its own: the backup API copies the source's WAL flag, and a WAL-mode file
+ * leaves `-wal` and `-shm` files beside it whenever it is read. The server switches the database back to WAL.
+ */
+const selfContained = (DatabaseSync: typeof import("node:sqlite").DatabaseSync, file: string) => {
+  const db = new DatabaseSync(file)
+  try {
+    db.exec("PRAGMA journal_mode = DELETE")
+  } finally {
+    db.close()
   }
 }
 
@@ -204,6 +218,7 @@ export const restoreDatabase = async (options: { readonly source: string; readon
     } finally {
       from.close()
     }
+    selfContained(DatabaseSync, staged)
     await narrow(staged)
     check(staged, `The copy of ${source}`)
     await fsyncFile(staged)

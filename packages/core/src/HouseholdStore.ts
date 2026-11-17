@@ -240,8 +240,9 @@ export interface Collection<A> {
   readonly ambientRows: number
   /**
    * What a voice page on `device` may see of a row, or `undefined` for nothing (docs/STORING-DATA.md "Pages"). Without
-   * it the collection is never sent to pages. Called for the snapshot, for every change and for the replay after a
-   * reconnect, always with the row as it is now. Return plain JSON.
+   * it the collection is never sent to pages. Called for the snapshot and for every change, always with the committed
+   * row as it is now. Return plain JSON of at most 64,000 characters; a projection that throws or returns anything
+   * else hides that row and is reported as a Health issue.
    */
   readonly project?: (row: Row<A>, device: TargetDevice) => unknown
 }
@@ -273,6 +274,9 @@ export const defineCollection = <A>(definition: {
     if (!FIELD.test(field)) throw new Error(`Collection ${definition.name}: field "${field}" must match ${FIELD}`)
   }
   if ((definition.indexes?.length ?? 0) > 8) throw new Error(`Collection ${definition.name}: at most 8 indexes`)
+  if (new Set(definition.indexes ?? []).size !== (definition.indexes?.length ?? 0)) throw new Error(`Collection ${definition.name}: an index is declared twice`)
+  const ambientRows = definition.ambientRows ?? 20
+  if (!Number.isInteger(ambientRows) || ambientRows < 1 || ambientRows > 100) throw new Error(`Collection ${definition.name}: ambientRows must be 1 to 100`)
   return {
     _tag: "Collection",
     name: definition.name,
@@ -284,7 +288,7 @@ export const defineCollection = <A>(definition: {
     search: definition.search ?? [],
     history: definition.history ?? "full",
     ...(definition.ambient !== undefined ? { ambient: definition.ambient } : {}),
-    ambientRows: definition.ambientRows ?? 20,
+    ambientRows,
     ...(definition.project !== undefined ? { project: definition.project } : {})
   }
 }

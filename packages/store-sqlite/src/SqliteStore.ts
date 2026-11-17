@@ -579,10 +579,12 @@ export const makeSqliteStore = (options: SqliteStoreOptions): Effect.Effect<Sqli
             : query<DocRow>("SELECT * FROM pva_docs INDEXED BY pva_docs_conversation WHERE scope_kind = 'conversation' AND scope_id = ?", [conversationId]),
           (rows) => rows.map(toDoc)
         ),
-      purge: (conversationId: string | undefined) =>
-        Effect.asVoid(conversationId === undefined
-          ? exec("UPDATE pva_changes SET data = NULL WHERE scope_kind = 'conversation' AND data IS NOT NULL")
-          : exec("UPDATE pva_changes SET data = NULL WHERE scope_kind = 'conversation' AND scope_id = ? AND data IS NOT NULL", [conversationId]))
+      purge: (conversationId: string | undefined, keep: ReadonlyArray<string>) => {
+        const notKept = keep.length === 0 ? "" : ` AND module NOT IN (${keep.map(() => "?").join(", ")})`
+        return Effect.asVoid(conversationId === undefined
+          ? exec(`UPDATE pva_changes SET data = NULL WHERE scope_kind = 'conversation' AND data IS NOT NULL${notKept}`, [...keep])
+          : exec(`UPDATE pva_changes SET data = NULL WHERE scope_kind = 'conversation' AND scope_id = ? AND data IS NOT NULL${notKept}`, [conversationId, ...keep]))
+      }
     }
 
     // ---- Versions and preparing modules
@@ -946,8 +948,8 @@ export const makeSqliteStore = (options: SqliteStoreOptions): Effect.Effect<Sqli
           return { changes: rows.slice(0, limit).map(toChange), complete: rows.length <= limit, oldest: Number(oldest) }
         })),
       lastSeq: tx.statement(lastSeqRaw),
-      endConversation: (conversationId) => (readOnly ? Effect.succeed(0) : endConversationsOn(backend, conversations, conversationId)),
-      sweepConversations: readOnly ? Effect.succeed(0) : endConversationsOn(backend, conversations, undefined),
+      endConversation: (conversationId) => (readOnly ? Effect.succeed(0) : endConversationsOn(backend, conversations, conversationId, () => [...verdicts.keys()])),
+      sweepConversations: readOnly ? Effect.succeed(0) : endConversationsOn(backend, conversations, undefined, () => [...verdicts.keys()]),
       pruneChanges: (opts) =>
         readOnly ? Effect.fail(readOnlyError("pruneChanges")) : Effect.gen(function*() {
           const now = opts?.now ?? (yield* Clock.currentTimeMillis)

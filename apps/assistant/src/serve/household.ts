@@ -89,9 +89,11 @@ export const openServeHousehold = (options: {
       ...(options.guard !== undefined ? { guard: options.guard } : {}),
       log: options.log
     })
+    const household = yield* assemble(sqlite, sqlite, options.catalog, options.log, options.report)
+    // After `prepare`: a module whose data is not usable here keeps its rows untouched.
     const swept = yield* sqlite.sweepConversations
     if (swept > 0) options.log(`Household: ${swept} row(s) of conversations of the previous run erased`)
-    return yield* assemble(sqlite, sqlite, options.catalog, options.log, options.report)
+    return household
   })
 
 /**

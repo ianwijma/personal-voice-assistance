@@ -41,6 +41,8 @@ export const parseLiveArgs = (
   llmPerSession: boolean
   sttModels: Array<string>
   loadModel: string | undefined
+  /** `--ambient`: the household's ambient facts in every turn's context (docs/STORING-DATA.md "Ambient facts"). */
+  ambient: boolean
   paths: Array<string>
 } | string => {
   let rounds = 1
@@ -49,9 +51,11 @@ export const parseLiveArgs = (
   let llmPerSession = false
   let sttModels: Array<string> = []
   let loadModel: string | undefined
+  let ambient = false
   const paths: Array<string> = []
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--llm-per-session") llmPerSession = true
+    else if (args[i] === "--ambient") ambient = true
     else if (args[i] === "--stt-models") {
       sttModels = (args[++i] ?? "").split(",").map((m) => m.trim()).filter((m) => m.length > 0)
       if (sttModels.length === 0) return "--stt-models needs a comma-separated list of speech models"
@@ -73,7 +77,7 @@ export const parseLiveArgs = (
       staggerMs = n
     } else paths.push(args[i]!)
   }
-  return { rounds, sessions, staggerMs, llmPerSession, sttModels, loadModel, paths }
+  return { rounds, sessions, staggerMs, llmPerSession, sttModels, loadModel, ambient, paths }
 }
 
 export interface LiveOptions {

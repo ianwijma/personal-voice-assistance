@@ -63,6 +63,8 @@ describe("Sections: effective values", () => {
     expect(sections.value("HOME_CURRENCY")).toBe("EUR")
     expect(sections.value("HOME_CUP_SIZE")).toBe("metric")
     expect(sections.value("HOME_API_CONTACT") ?? "").toBe("")
+    // Off until its effect on the first token is measured (docs/STORING-DATA.md "Ambient facts").
+    expect(sections.value("HOME_AMBIENT_FACTS")).toBe("off")
     const home = sections.list().find((s) => s.id === "home")
     expect(home?.group).toBe("modules")
     expect(home?.form.fields.map((f) => f.key)).toEqual(["HOME_LOCATION", "HOME_TIME_ZONE", "HOME_LANGUAGE", "HOME_UNITS", "HOME_DATE_FORMAT", "HOME_CURRENCY", "HOME_CUP_SIZE", "HOME_API_CONTACT", "HOME_AMBIENT_FACTS"])

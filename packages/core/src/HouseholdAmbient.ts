@@ -9,10 +9,12 @@ import { CurrentTurn, type TurnContext } from "./TurnContext.ts"
  * that puts the collections' `ambient` lines for the turn's device and person into `LlmRequest.context`, so "how long
  * is left on the pasta?" works for an assistant without the timers module. It is outside the cached prefix.
  *
- * Budget: 50 ms for the whole provider (it then contributes nothing that turn), at most 600 characters (whole lines,
- * in catalog order; a module's lines are its own order), and only indexed reads: per collection one read per visible
- * scope of at most `ambientRows` rows, newest first. Behind the household switch `HOME_AMBIENT_FACTS`: `all`
- * (default), `module-on` (only from modules the turn's assistant has on), `off`.
+ * Budget: at most 600 characters (whole lines, in catalog order; a module's lines are its own order), and only bounded
+ * reads: per collection one index read per visible scope of at most `ambientRows` rows, newest first (the store's
+ * `list` cannot do more, by construction). The 50 ms timeout cannot stop a synchronous read; it only drops a slow
+ * turn's lines. Behind the household switch `HOME_AMBIENT_FACTS`: `off` (the default, until its effect on a hosted
+ * model's first token is measured: docs/STORING-DATA.md "Ambient facts"), `all`, `module-on` (only from modules the
+ * turn's assistant has on).
  */
 
 export type AmbientMode = "all" | "module-on" | "off"

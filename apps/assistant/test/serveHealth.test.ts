@@ -4,6 +4,9 @@
 import { defineModule } from "@pva/core"
 import type { ClientMessage } from "@pva/protocol"
 import { Effect } from "effect"
+import { mkdirSync, mkdtempSync, utimesSync, writeFileSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 import { afterEach, describe, expect, it, vi } from "vitest"
 import { ScriptedClient } from "./support/scriptedClient.ts"
 import { controlledStt, fakeBuild, greeterModule, scriptedLlm, startTestServer, TEST_ADMIN_PASSWORD, type TestServer } from "./support/serveHarness.ts"
@@ -54,5 +57,27 @@ describe("health in serve mode", () => {
     clients.push(voice)
     const welcome = await voice.hello()
     expect("health" in welcome.snapshot).toBe(false)
+  })
+
+  it("Check again reports the household's backup: none yet, then one too old (backup age is read from the files, never from the database)", async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), "pva-health-household-"))
+    server = await startTestServer({ dataDir, build: fakeBuild({ stt: controlledStt().stt, llm: scriptedLlm(() => "Ok.").llm }), catalog: [greeterModule] })
+    const admin = await ScriptedClient.connect({ url: server.url })
+    clients.push(admin)
+    await admin.admin(TEST_ADMIN_PASSWORD)
+    const check = async (id: string) => {
+      const from = admin.messages.length
+      admin.send({ type: "health.check", requestId: id } as ClientMessage)
+      await admin.waitFor("result", (m) => m.requestId === id, { from, timeoutMs: 20_000 })
+      return admin.messages.slice(from).flatMap((m) => (m.type === "health" ? [m.health] : [])).at(-1)!
+    }
+    expect((await check("h1")).issues.find((i) => i.id === "core.household.backup")?.title).toBe("The household data has no backup yet")
+    const backups = join(dataDir, "backups")
+    mkdirSync(backups, { recursive: true })
+    const old = join(backups, "household-2026-01-01.db")
+    writeFileSync(old, "")
+    const t = (Date.now() - 3 * 86_400_000) / 1000
+    utimesSync(old, t, t)
+    expect((await check("h2")).issues.find((i) => i.id === "core.household.backup")?.title).toBe("The last household backup is old")
   })
 })

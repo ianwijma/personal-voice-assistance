@@ -518,6 +518,23 @@ export const householdStoreContract = (name: string, make: MakeStore) =>
         assert.strictEqual((yield* c.list().pipe(inTurn(turnOf({ conversationId: "conv-9" })))).length, 0)
       }).pipe(Effect.scoped))
 
+    it.effect("the sweep of ended conversations leaves the rows of a module whose data is not usable here untouched", () =>
+      Effect.gen(function*() {
+        const v1 = defineCollection({ name: "scratch", scope: "conversation", schema: Note })
+        const v2 = defineCollection({ name: "scratch", scope: "conversation", schema: Note, version: 2, migrate: { 1: (v: Note) => v } })
+        const store = yield* make()
+        yield* store.prepare([{ id: "later", storage: { collections: [v2] } }])
+        yield* store.forModule("later").collection(v2).insert({ text: "kept for the newer module" }).pipe(inTurn(turnOf()))
+        // An older build of the module: its data is newer than it knows, so nothing of it is touched.
+        yield* store.prepare([{ id: "later", storage: { collections: [v1] } }])
+        assert.isDefined(store.availability("later"))
+        assert.strictEqual(yield* store.sweepConversations, 0)
+        assert.strictEqual(yield* store.endConversation("conv-1"), 0)
+        yield* store.prepare([{ id: "later", storage: { collections: [v2] } }])
+        assert.deepStrictEqual(texts(yield* store.forModule("later").collection(v2).list().pipe(inTurn(turnOf()))), ["kept for the newer module"])
+        assert.isTrue(JSON.stringify((yield* store.changesSince(0, 10)).changes).includes("kept for the newer module"))
+      }).pipe(Effect.scoped))
+
     it.effect("search: every word begins a word of the row (no case, no accents), the most recently written first, the whole scope", () =>
       Effect.gen(function*() {
         const store = yield* prepared(make)

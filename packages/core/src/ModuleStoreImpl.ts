@@ -413,10 +413,13 @@ export const migrateCollectionOn = (backend: StoreBackend, moduleId: string, c: 
     }
   })
 
-/** How a backend finds a conversation's rows and drops the payloads of its changes (`undefined`: every conversation). */
+/**
+ * How a backend finds a conversation's rows and drops the payloads of its changes (`undefined`: every conversation),
+ * leaving out the modules in `keep` (their data is not usable here: it is never touched).
+ */
 export interface ConversationRows {
   readonly docs: (conversationId: string | undefined) => Effect.Effect<ReadonlyArray<StoredDoc>, StoreError>
-  readonly purge: (conversationId: string | undefined) => Effect.Effect<void, StoreError>
+  readonly purge: (conversationId: string | undefined, keep: ReadonlyArray<string>) => Effect.Effect<void, StoreError>
 }
 
 /**
@@ -424,9 +427,16 @@ export interface ConversationRows {
  * in one transaction: one `erase` change per row (actor `system:conversation-ended`), the row and its search words
  * gone, and every payload of a change in that scope dropped, so nothing of it can be undone or read back.
  */
-export const endConversationsOn = (backend: StoreBackend, rows: ConversationRows, conversationId: string | undefined): Effect.Effect<number, StoreError> =>
+export const endConversationsOn = (
+  backend: StoreBackend,
+  rows: ConversationRows,
+  conversationId: string | undefined,
+  unavailable: () => ReadonlyArray<string> = () => []
+): Effect.Effect<number, StoreError> =>
   backend.tx.transaction(Effect.gen(function*() {
-    const docs = yield* rows.docs(conversationId)
+    // A module whose data is newer (or failed to upgrade) keeps its rows as they are, conversation rows too.
+    const keep = unavailable()
+    const docs = (yield* rows.docs(conversationId)).filter((d) => !keep.includes(d.module))
     const actor: Actor = { kind: "system", name: "conversation-ended" }
     const at = yield* Clock.currentTimeMillis
     let n = 0
@@ -441,7 +451,7 @@ export const endConversationsOn = (backend: StoreBackend, rows: ConversationRows
       n++
       if (n % 200 === 0) yield* Effect.yieldNow
     }
-    yield* rows.purge(conversationId)
+    yield* rows.purge(conversationId, keep)
     yield* backend.tx.enqueue({ _tag: "run", run: backend.scrub })
     return n
   }))

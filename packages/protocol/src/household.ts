@@ -9,7 +9,8 @@ import { ModuleId, NonNegativeFinite, NonNegativeInt } from "./common.ts"
  * scope to every voice connection, device scope to that device's connections, nothing of assistant or conversation
  * scope, and person scope not at all until `Privacy.mayReveal` exists (P5). Nothing is sent by default: a collection
  * or an event type opts in with a **projection** (row or event, target device) → what that device may see, or
- * nothing, applied the same way to the snapshot, to live events and to the replay after a reconnect.
+ * nothing, applied the same way to the snapshot (after every hello) and to each change after its commit, always to
+ * the row as it is now.
  */
 
 /** Where a row or an event belongs (`household` has no id). */

@@ -171,7 +171,7 @@ const bench = (args: ReadonlyArray<string>) =>
       return
     }
     if (args[0] === "--live") {
-      const usage = "Usage: bench --live [--rounds N] [--sessions N] [--stagger MS] [--llm-per-session] [--stt-models A,B] [--load-model X] " +
+      const usage = "Usage: bench --live [--rounds N] [--sessions N] [--stagger MS] [--llm-per-session] [--stt-models A,B] [--load-model X] [--ambient] " +
         "<wav files or directories> (16 kHz mono)"
       const parsed = parseLiveArgs(args.slice(1))
       if (typeof parsed === "string") return yield* new StartupError({ message: `${parsed}. ${usage}` })
@@ -212,7 +212,9 @@ const bench = (args: ReadonlyArray<string>) =>
         yield* SherpaStt.acquire({ ...sttOptions, model: name }).pipe(Effect.mapError((e) => new StartupError({ message: e.message })))
       }
       const settings = yield* AppConfig
-      const modules = yield* startCliModules()
+      // `--ambient`: every turn's context also has the household's ambient facts (read-only, as serve mode would give
+      // them with HOME_AMBIENT_FACTS=all), so llmFirstToken can be compared with and without (docs/STORING-DATA.md).
+      const modules = yield* startCliModules({ ambient: parsed.ambient })
       const conversation = { ...settings, systemPrompt: withModuleInstructions(settings.systemPrompt, modules.instructions) }
       const { sessions, staggerMs, llmPerSession } = parsed
       // `--llm-per-session`: one language-model instance per session (serve mode's pool with two different settings).
@@ -223,6 +225,7 @@ const bench = (args: ReadonlyArray<string>) =>
       )
       const together = (sessions === 1 ? "" : `, ${sessions} sessions, user audio ends ${staggerMs === 0 ? "at the same moment" : `${staggerMs} ms apart`}`) +
         (llmPerSession ? ", one LLM instance per session" : "") +
+        (parsed.ambient ? ", household ambient facts in every turn" : "") +
         (ownStt ? `, speech models per session ${parsed.sttModels.join(",")} (${SherpaStt.workers()} loaded)` : "") +
         (parsed.loadModel !== undefined ? `, ${parsed.loadModel} loaded idle` : "")
       for (const [i, rows] of perSession.entries()) {
