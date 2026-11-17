@@ -74,6 +74,13 @@ describe("result on the wire", () => {
       expect(decodeServerMessage(text), JSON.stringify(assistantId)).toMatchObject({ _tag: "Invalid", messageType: "result" })
     }
   })
+  it("rev (a device save's revision) is optional and a non-negative integer", () => {
+    expect(decodeServerMessage(JSON.stringify({ type: "result", requestId: "r", ok: true, rev: 3 }))).toEqual({ _tag: "Ok", message: { type: "result", requestId: "r", ok: true, rev: 3 } })
+    for (const rev of [-1, 1.5, "3"]) {
+      const text = JSON.stringify({ type: "result", requestId: "r", ok: true, rev })
+      expect(decodeServerMessage(text), JSON.stringify(rev)).toMatchObject({ _tag: "Invalid", messageType: "result" })
+    }
+  })
   it("each protocol 7 error code decodes from its wire spelling; its near misses do not", () => {
     for (const code of ["stale", "duplicate_phrase", "unknown_assistant", "limit_reached", "not_allowed"]) {
       expect(decodeServerMessage(failed({ code, message: "m" })), code).toMatchObject({ _tag: "Ok" })
