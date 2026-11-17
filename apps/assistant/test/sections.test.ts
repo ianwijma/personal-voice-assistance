@@ -60,9 +60,16 @@ describe("Sections: effective values", () => {
     expect(sections.value("HOME_LANGUAGE")).toBe("en-GB")
     expect(sections.value("HOME_UNITS")).toBe("metric")
     expect(sections.value("HOME_DATE_FORMAT")).toBe("en-GB")
+    expect(sections.value("HOME_CURRENCY")).toBe("EUR")
+    expect(sections.value("HOME_CUP_SIZE")).toBe("metric")
+    expect(sections.value("HOME_API_CONTACT") ?? "").toBe("")
     const home = sections.list().find((s) => s.id === "home")
     expect(home?.group).toBe("modules")
-    expect(home?.form.fields.map((f) => f.key)).toEqual(["HOME_LOCATION", "HOME_TIME_ZONE", "HOME_LANGUAGE", "HOME_UNITS", "HOME_DATE_FORMAT"])
+    expect(home?.form.fields.map((f) => f.key)).toEqual(["HOME_LOCATION", "HOME_TIME_ZONE", "HOME_LANGUAGE", "HOME_UNITS", "HOME_DATE_FORMAT", "HOME_CURRENCY", "HOME_CUP_SIZE", "HOME_API_CONTACT"])
+
+    const badCurrency = await Effect.runPromise(sections.update("home", { values: { HOME_CURRENCY: "euro" }, secrets: {} }))
+    expect(badCurrency.result.ok).toBe(false)
+    expect(sections.value("HOME_CURRENCY")).toBe("EUR")
 
     const bad = await Effect.runPromise(sections.update("home", { values: { HOME_TIME_ZONE: "Mars/Olympus" }, secrets: {} }))
     expect(bad.result.ok).toBe(false)

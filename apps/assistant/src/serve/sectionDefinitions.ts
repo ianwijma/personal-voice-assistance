@@ -132,6 +132,10 @@ const checkTimeZone = (zone: string): string | undefined => {
   }
 }
 
+/** An ISO 4217 code: three letters, in capitals. */
+const checkCurrency = (code: string): string | undefined =>
+  /^[A-Z]{3}$/.test(code) ? undefined : "Use a three-letter ISO 4217 code in capitals, e.g. EUR"
+
 /**
  * The shared `home` section (docs/ASSISTANTS.md §2.4, §7.3): every assistant's prompt gets a Home line from it, and
  * the modules' linked defaults come from it (Weather place and units, Clock time zone and date format).
@@ -187,6 +191,29 @@ export const homeSection: SectionDefinition = {
         { value: "en-US", label: "November 13, 2026" },
         { value: "nl-NL", label: "13 november 2026" }
       ]
+    }),
+    HOME_CURRENCY: Setting.text({
+      label: "Currency",
+      description: "ISO 4217 code of the household's money, e.g. EUR, USD, GBP. The default of modules that handle prices.",
+      env: "HOME_CURRENCY",
+      default: "EUR",
+      placeholder: "EUR",
+      maxLength: 3,
+      check: checkCurrency
+    }),
+    HOME_CUP_SIZE: Setting.choice({
+      label: "Cup size",
+      description: "How big \"a cup\" is in recipes and shopping lists.",
+      env: "HOME_CUP_SIZE",
+      default: "metric",
+      options: [{ value: "metric", label: "Metric cup (250 ml)" }, { value: "us", label: "US cup (236.6 ml)" }]
+    }),
+    HOME_API_CONTACT: Setting.text({
+      label: "API contact",
+      description: "An email address or web address put in the User-Agent of requests to public web services that ask who is calling. Empty: none is sent.",
+      env: "HOME_API_CONTACT",
+      placeholder: "you@example.com",
+      maxLength: 200
     })
   }
 }
