@@ -1,6 +1,6 @@
 import { Effect, Schema } from "effect"
 import { ToolError } from "./Errors.ts"
-import { makeTool, type Tool, type ToolMetadata } from "./Module.ts"
+import { makeTool, type Tool, type ToolMetadata, type ToolRisk } from "./Module.ts"
 import { editDistance, normalizePhrase, phoneticKey } from "./TextMatching.ts"
 import { parseDuration } from "./ValueParsing.ts"
 
@@ -150,7 +150,7 @@ export interface ActionOutcome {
   readonly say?: string
 }
 
-export interface ActionDefinition<P extends ActionParams = ActionParams> extends ToolMetadata {
+export interface ActionDefinition<P extends ActionParams = ActionParams> extends ToolMetadata<ParamValues<P>> {
   /** Unique within the module: `/^[a-z][a-z0-9_]{0,39}$/`. The global id is `<moduleId>.<id>`. */
   readonly id: string
   /** Short imperative label for the UI and default confirmations: "Turn lights on". */
@@ -373,7 +373,8 @@ export const actionTool = (registered: RegisteredAction): Tool => {
     description: `${sentenceOf(def.label)} ${def.description}${confirm}`,
     parameters: Schema.Struct(fields) as unknown as Schema.Codec<Readonly<Record<string, unknown>>, unknown>,
     speculative: def.speculative === true,
-    ...(def.risk !== undefined ? { risk: def.risk } : {}),
+    // A risk that depends on the values is judged on what `run` would receive (a dynamic name resolved, a duration parsed).
+    ...(def.risk !== undefined ? { risk: typeof def.risk === "function" ? riskOfValues(registered) : def.risk } : {}),
     ...(def.sensitivity !== undefined ? { sensitivity: def.sensitivity } : {}),
     ...(def.latency !== undefined ? { latency: def.latency } : {}),
     execute: (input: Readonly<Record<string, unknown>>) =>
@@ -397,6 +398,11 @@ export const actionTool = (registered: RegisteredAction): Tool => {
       })
   })
   return { ...tool, action: registered }
+}
+
+const riskOfValues = (registered: RegisteredAction) => (input: Readonly<Record<string, unknown>>) => {
+  const risk = registered.definition.risk as (values: Record<string, unknown>) => ToolRisk
+  return risk(actionValues(registered, input))
 }
 
 const sentenceOf = (s: string) => (/[.!?]$/.test(s) ? s : `${s}.`)

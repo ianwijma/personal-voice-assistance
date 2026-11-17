@@ -46,8 +46,8 @@ export type ModuleState = typeof ModuleState.Type
  */
 export const ToolRisk = Schema.Literals(["read", "change", "message", "money", "security"])
 export type ToolRisk = typeof ToolRisk.Type
-/** Protocol 9: whether a result is about a person (`personal`: withheld on shared devices once a policy exists). Default `normal`. */
-export const ToolSensitivity = Schema.Literals(["normal", "personal"])
+/** Protocol 9: whose a result is (docs/MODULES-PLAN.md §2 row 8): `household` (default) or `personal` (one person's). */
+export const ToolSensitivity = Schema.Literals(["household", "personal"])
 export type ToolSensitivity = typeof ToolSensitivity.Type
 /** Protocol 9: how long a call usually takes: `instant` (< 50 ms), `quick` (< 1 s), `slow` (seconds), `background`. Default `quick`. */
 export const ToolLatency = Schema.Literals(["instant", "quick", "slow", "background"])
@@ -58,7 +58,7 @@ export const ToolInfo = Schema.Struct({
   description: Schema.String,
   /** Read-only: may run before the user has finished speaking. */
   speculative: Schema.Boolean,
-  /** Protocol 9 (the declared or inferred value; absent from an older server). */
+  /** Protocol 9: the declared or inferred class; absent when it depends on the input (or from an older server). */
   risk: Schema.optionalKey(ToolRisk),
   sensitivity: Schema.optionalKey(ToolSensitivity),
   latency: Schema.optionalKey(ToolLatency)

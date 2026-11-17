@@ -18,6 +18,7 @@ import { makeModelAgent } from "./ModelAgent.ts"
 import { armAgent, initialRouterState, type RouteDecision, type Router, type RouterState, setActiveAgent } from "./Routing.ts"
 import { AudioInput, AudioOutput, Llm, Stt, Tts, type TtsAudio } from "./Services.ts"
 import { ToolRegistry } from "./ToolRegistry.ts"
+import { defaultGateway } from "./Gateway.ts"
 import { CurrentTurn, makeTurnContext, type TurnContext } from "./TurnContext.ts"
 import { CurrentTurnTrace, type Trace, TurnTrace, type TurnOutcome } from "./TurnTrace.ts"
 import { ACTION_TIMEOUT_MS, ActionError, type ActionOutcome, actionToolName, type RegisteredAction } from "./Actions.ts"
@@ -756,7 +757,8 @@ const makeConversationCore = Effect.fnUntraced(function*(options: AgentConversat
       emit({ _tag: "ActionStarted", turnId, callId, actionId: action.id, label: def.label, params })
       const start = tt.now()
       const work = withCurrentTurn(
-        Effect.suspend(() => def.run(params as never)).pipe(
+        // Through the execution gateway, as confirmed (the owner said yes; the access checks still apply).
+        (setup?.registry.runAction ?? defaultGateway.action)(action, params, { confirmed: true }).pipe(
           Effect.timeoutOrElse({
             duration: ACTION_TIMEOUT_MS,
             orElse: () => Effect.fail(new ActionError({ message: `${def.label} did not finish within ${ACTION_TIMEOUT_MS / 1000} seconds.` }))

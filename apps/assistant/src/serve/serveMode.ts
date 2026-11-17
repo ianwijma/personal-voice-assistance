@@ -321,11 +321,12 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       demand: () => moduleDemand(),
       platform: { os: process.platform, arch: process.arch },
       requirements: checker.check,
-      // The action catalogue's `assistantId`: the modules an assistant has on, without the tools it switched off.
-      isOffered: (assistantId, moduleId, toolName) => {
-        if (!isCapability(moduleId)) return true
-        const choice = assistantsNow().get(assistantId)?.modules[moduleId]
-        return choice !== undefined && choice.on && !choice.offTools.includes(toolName)
+      // The execution gateway's first checks, on every call (and the turn's action catalogue): the assistant has the
+      // module on, and the tool is not one it switched off. Agents and decision providers are not per assistant.
+      access: {
+        moduleOn: (assistantId, moduleId) => !isCapability(moduleId) || assistantsNow().get(assistantId)?.modules[moduleId]?.on === true,
+        toolOff: (assistantId, moduleId, toolName) =>
+          isCapability(moduleId) && (assistantsNow().get(assistantId)?.modules[moduleId]?.offTools.includes(toolName) ?? false)
       },
       // What modules may read about the assistant (`host.view()`): every read is a reference read or a small copy.
       view: {
@@ -469,7 +470,8 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       const same = parts.length === snapshot.parts.length && parts.every((p, i) => p === snapshot.parts[i])
       if (same) return { registry: snapshot.registry, instructions: snapshot.instructions, modules }
       return {
-        registry: makeToolRegistry(parts.map((p) => p.module)),
+        // Every call still goes through the host's gateway, which checks the assistant's choices again at execution.
+        registry: makeToolRegistry(parts.map((p) => p.module), { gateway: host.gateway }),
         instructions: parts.flatMap((p) => (p.instructions.length > 0 ? [p.instructions] : [])),
         modules
       }
@@ -852,7 +854,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
           cached.voiceUser !== voiceUser || cached.voiceSource !== voiceSource
         ) {
           // An assistant that does not exist (any more) is never routed; should a turn still start, it gets no tools.
-          const mine = assistant === undefined ? { registry: makeToolRegistry([]), instructions: [], modules: 0 } : modulesFor(snapshot, assistant)
+          const mine = assistant === undefined ? { registry: makeToolRegistry([], { gateway: host.gateway }), instructions: [], modules: 0 } : modulesFor(snapshot, assistant)
           const base = assistant?.prompt ?? defaultSystemPrompt
           const instructions = home === undefined ? mine.instructions : [home, ...mine.instructions]
           // `TurnSetup.ttsReady`: completes once this `tts` (the instance bound now, not a later one) is built.

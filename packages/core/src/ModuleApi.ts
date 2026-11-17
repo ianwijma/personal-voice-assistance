@@ -16,12 +16,20 @@ import type { ActionParam } from "./Actions.ts"
  * Module API version 2 (docs/MODULES-PLAN.md §4 P1; module-definition-config-and-dependencies.md §A.4, §C.3–C.5).
  *
  * Everything here is optional for a module: a module without `apiVersion` is version 1 and sees exactly what it saw
- * before (its `start` gets `{ settings, setStatus }`). A version 2 module also gets the members of `ModuleServicesV2`
- * in its context: today `host`; later PRs add `store`, `events`, `scheduler`, `notify`, `present`, `connections`.
+ * before (its `start` gets `{ settings, setStatus }`). A version 2 module has two lifetimes:
+ *
+ * - `shared(ctx)` (optional) runs **once per module** while the module is demanded (a switched-on assistant has it on,
+ *   or a demanded module names it in `uses`), with the module's shared settings only. Sockets, caches, handlers,
+ *   services (`ServiceKey`) and contributions (`ContributionKey`) belong there.
+ * - `start(ctx)` runs once per distinct set of effective settings, as in version 1 (tools, actions, context,
+ *   instructions), and receives what `shared` returned as `ctx.shared`.
+ *
+ * Both contexts carry the members of `ModuleServicesV2`: today `host`; later PRs add `store`, `events`, `scheduler`,
+ * `speech`, `notify`, `present`, `connections`.
  *
  * **Adding a context member (later PRs).** One field in `ModuleServicesV2` (below) and one line in the module host's
- * `servicesFor` (`ModuleHost.ts`), which builds the members for one instance. Nothing else changes: version 1 modules
- * never get `servicesFor`'s result, and `ModuleContextV2` is `ModuleContext` plus `ModuleServicesV2`.
+ * `servicesFor` (`ModuleHost.ts`), which builds the members for both lifetimes. Nothing else changes: version 1
+ * modules never get `servicesFor`'s result.
  */
 
 /** The module API versions this host supports (`ModuleDefinition.apiVersion`). A module outside it is `unavailable`. */
@@ -131,21 +139,63 @@ export interface ModuleTemplate {
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
-// Services between modules
+// Services and contributions between modules
 
 /**
- * A typed key under which a module provides a service to other modules (like a `Context` tag, but looked up at run
- * time, so a consumer gets `undefined` when the provider is off): `export const Lists = ServiceKey<ListsService>("lists")`.
- * Keys are compared by `id`; give each a unique one (the shared ones live in `@pva/module-contracts`, P11).
+ * A typed key under which a module's `shared` part provides a service to other modules (like a `Context` tag, but
+ * looked up live, so a consumer gets `undefined` while the provider is not demanded):
+ * `export const Lists = ServiceKey<ListsService>("lists")`, provided with `services: [Lists.of(impl)]`. Keys are
+ * compared by `id`; one module may provide a key (a second provider is a start error for the second). The shared keys
+ * live in `@pva/module-contracts` (P11).
  */
 export interface ServiceKey<T> {
   readonly _tag: "ServiceKey"
   readonly id: string
+  /** This key with its service, for `SharedPart.services`. */
+  readonly of: (service: T) => ProvidedService
   /** Phantom: carries `T`. Never set. */
   readonly _T?: (t: T) => T
 }
 
-export const ServiceKey = <T>(id: string): ServiceKey<T> => ({ _tag: "ServiceKey", id })
+export interface ProvidedService {
+  readonly key: ServiceKey<any>
+  readonly service: unknown
+}
+
+export const ServiceKey = <T>(id: string): ServiceKey<T> => {
+  const key: ServiceKey<T> = { _tag: "ServiceKey", id, of: (service) => ({ key, service }) }
+  return key
+}
+
+/**
+ * A typed key under which `shared` parts contribute values that another module collects (a briefing section, a
+ * calendar provider): `export const BriefingSections = ContributionKey<BriefingSection>("briefing.sections")`,
+ * contributed with `contributions: [BriefingSections.of(section)]`. Any number of modules may contribute; nothing
+ * registers itself with another module, so start order and restarts cannot lose a contribution.
+ */
+export interface ContributionKey<T> {
+  readonly _tag: "ContributionKey"
+  readonly id: string
+  readonly of: (value: T) => ProvidedContribution
+  readonly _T?: (t: T) => T
+}
+
+export interface ProvidedContribution {
+  readonly key: ContributionKey<any>
+  readonly value: unknown
+}
+
+export const ContributionKey = <T>(id: string): ContributionKey<T> => {
+  const key: ContributionKey<T> = { _tag: "ContributionKey", id, of: (value) => ({ key, value }) }
+  return key
+}
+
+/** What a module's `shared` part returns: the value every instance gets (`ctx.shared`), its services and contributions. */
+export interface SharedPart<X> {
+  readonly value: X
+  readonly services?: ReadonlyArray<ProvidedService>
+  readonly contributions?: ReadonlyArray<ProvidedContribution>
+}
 
 // ---------------------------------------------------------------------------------------------------------------------
 // The host, as a module sees it
@@ -173,7 +223,7 @@ export interface HostDeviceView {
 /** What a module may read about the assistant it runs in. Every read is a snapshot; nothing here changes anything. */
 export interface HostView {
   readonly modules: ReadonlyArray<HostModuleView>
-  /** The key vault is locked (or there is none while keys are kept unencrypted: false). `undefined`: not known (CLI). */
+  /** The key vault is locked. `undefined`: not known (the CLI modes). */
   readonly vaultLocked: boolean | undefined
   /** Whether the speech and language engines run. `undefined` in the CLI modes. */
   readonly engine: EngineSummary | undefined
@@ -202,7 +252,7 @@ export interface CatalogParam {
   readonly optional: boolean
 }
 
-/** An action of a running module, as the action catalogue lists it. */
+/** An action of the turn's catalogue. */
 export interface CatalogAction {
   readonly moduleId: string
   readonly actionId: string
@@ -215,7 +265,8 @@ export interface CatalogAction {
   readonly speculative: boolean
   /** It needs the owner's spoken confirmation; `actions.run` refuses it (`needs_confirmation`). */
   readonly confirm: boolean
-  readonly risk: ToolRisk
+  /** The declared or inferred class; `undefined` when it depends on the values. */
+  readonly risk: ToolRisk | undefined
   readonly sensitivity: ToolSensitivity
   readonly latency: ToolLatency
 }
@@ -224,7 +275,8 @@ export type ActionRunResult =
   | { readonly ok: true; readonly say?: string }
   | {
     readonly ok: false
-    readonly code: "unknown_module" | "not_running" | "unknown_action" | "not_offered" | "invalid_params" | "needs_confirmation" | "failed"
+    /** `refused`: the execution gateway did not admit it (the module or the action is off for the assistant, or a later policy). */
+    readonly code: "unknown_module" | "not_running" | "unknown_action" | "invalid_params" | "needs_confirmation" | "refused" | "failed"
     readonly message: string
   }
 
@@ -238,57 +290,55 @@ export interface ActionRunRequest {
    * string. Checked against the action before it runs.
    */
   readonly params: Readonly<Record<string, unknown>>
-  /** Run it as this assistant: refused (`not_offered`) when the assistant does not have the module or the action on. */
-  readonly assistantId?: string
 }
 
 /**
- * The host as a version 2 module sees it (`ModuleContextV2.host`). Bound to the module instance it was given to:
- * `requestRestart` restarts that instance, and a service it `provide`s belongs to that instance.
+ * The host as a version 2 module sees it (`ModuleServicesV2.host`, in `shared` and in `start`). Every lookup is live.
  */
 export interface ModuleHostApi {
   /** A read-only snapshot of the assistant: module states, vault, engines, devices, Home values. */
   readonly view: () => HostView
+  /** The service under `key` from a demanded module's `shared` part, or `undefined` while none provides it. */
+  readonly service: <T>(key: ServiceKey<T>) => T | undefined
+  /** Every value contributed under `key` by the demanded modules' `shared` parts now, in catalog order. */
+  readonly contributions: <T>(key: ContributionKey<T>) => ReadonlyArray<T>
+  /**
+   * The turn's action catalogue (`CurrentTurn`): the actions of the modules the calling assistant has on, from the
+   * instance it uses, without those it switched off. Outside a turn (or a turn without an assistant): the actions of
+   * every running module.
+   */
   readonly actions: {
+    readonly list: Effect.Effect<ReadonlyArray<CatalogAction>>
     /**
-     * The actions of the running modules, catalog order. With `assistantId`: those of the modules that assistant has
-     * on, from the instance it uses, without the tools it has switched off.
-     */
-    readonly list: (options?: { readonly assistantId?: string }) => ReadonlyArray<CatalogAction>
-    /**
-     * Run one action of a running module (routines). Never fails: every refusal and failure is a result. The action's
-     * 5 s limit applies; the caller's `CurrentTurn` is the action's. An action that needs confirmation is refused.
+     * Run one action of the turn's catalogue through the execution gateway (routines). Never fails: every refusal and
+     * failure is a result. The action's 5 s limit applies; the caller's `CurrentTurn` is the action's. An action that
+     * needs confirmation is refused.
      */
     readonly run: (request: ActionRunRequest) => Effect.Effect<ActionRunResult>
   }
   /**
-   * Ask the host to start this instance again with the same settings (its tool list changed at run time: an MCP
-   * server's). The new instance is published once it has started, from the next turn on; the old one serves until
-   * then and keeps its grace period. If the new start fails, the old instance keeps serving and the Health page says
-   * why. Returns at once; repeated calls before the restart starts count once.
+   * Ask the host to start this module's instances again with the same settings (from `start`: that instance; from
+   * `shared`: every instance), so a tool list that changed at run time (an MCP server's) applies from the next turn.
+   * The new instance is published once it has started; the old one serves until then and keeps its grace period.
+   * If the new start fails, the old instance keeps serving and the Health page says why. Returns at once; repeated
+   * calls before the restart starts count once.
    */
   readonly requestRestart: (reason: string) => Effect.Effect<void>
-  readonly services: {
-    /**
-     * Provide `service` under `key` for as long as this instance runs (callable during `start` and after). A later
-     * call with the same key replaces it. Returns a function that withdraws it.
-     */
-    readonly provide: <T>(key: ServiceKey<T>, service: T) => () => void
-    /**
-     * The service under `key`, or `undefined` when no running module provides it. Without `assistantId`: the
-     * providing module's instance with the shared settings (else its first running one), the same instance whose tools
-     * are in the main registry. With `assistantId`: the instance that assistant uses, or `undefined` when it does not
-     * use the providing module. Modules are searched in catalog order; the first that provides the key wins.
-     */
-    readonly get: <T>(key: ServiceKey<T>, options?: { readonly assistantId?: string }) => T | undefined
-  }
 }
 
 /**
- * The context members a module written for API version 2 gets besides `settings` and `setStatus`. Later PRs add one
- * member each here (`store`, `events`, `scheduler`, `notify`, `present`, `connections`) and one line in the host's
+ * The context members a version 2 module gets in `shared` and in `start`. Later PRs add one member each here
+ * (`store`, `events`, `scheduler`, `speech`, `notify`, `present`, `connections`) and one line in the host's
  * `servicesFor`. A version 1 module never gets them.
  */
 export interface ModuleServicesV2 {
   readonly host: ModuleHostApi
+}
+
+/**
+ * What `shared` receives: the module's shared settings (environment > saved > linked default; the fields an assistant
+ * may own, `overridable`, are left out, so they are absent here) and the host's services.
+ */
+export interface SharedContext<A> extends ModuleServicesV2 {
+  readonly settings: Partial<A>
 }

@@ -1,12 +1,14 @@
 import { Context, Effect, Layer, Schema } from "effect"
-import type { RegisteredAction } from "./Actions.ts"
+import type { ActionError, ActionOutcome, RegisteredAction } from "./Actions.ts"
 import type { ToolCall, ToolResult, ToolSpec } from "./Domain.ts"
+import { defaultGateway, type ExecutionGateway } from "./Gateway.ts"
 import type { AssistantModule, ContextProvider, Tool } from "./Module.ts"
 
 /**
  * The tools and context providers of all enabled modules.
- * `run` never fails: unknown tools, invalid input and tool failures become
- * error results for the model.
+ * `run` never fails: unknown tools, invalid input, refusals and tool failures become
+ * error results for the model. Every call goes through the registry's execution gateway
+ * (`Gateway.ts`), which validates the input and checks the call before `execute` runs.
  */
 export class ToolRegistry extends Context.Service<ToolRegistry, {
   readonly specs: ReadonlyArray<ToolSpec>
@@ -14,6 +16,15 @@ export class ToolRegistry extends Context.Service<ToolRegistry, {
   run(call: ToolCall): Effect.Effect<ToolResult>
   /** The action a generated action tool stands for (`Tool.action`); absent for other tools and in hand-made registries. */
   readonly actionFor?: (name: string) => RegisteredAction | undefined
+  /**
+   * Run an action with its values through the registry's gateway (the intent agent, a confirmed action). Absent in
+   * hand-made registries: callers use `defaultGateway.action`.
+   */
+  readonly runAction?: (
+    action: RegisteredAction,
+    values: Readonly<Record<string, unknown>>,
+    options?: { readonly confirmed?: boolean }
+  ) => Effect.Effect<ActionOutcome | void, ActionError>
   /** Output of every context provider, formatted for `LlmRequest.context` ("" if none; empty outputs are left out). */
   readonly context: Effect.Effect<string>
 }>()("@pva/core/ToolRegistry") {
@@ -41,14 +52,20 @@ const encodeResult = (value: unknown): string => {
   return JSON.stringify(value)
 }
 
-export const makeToolRegistry = (modules: ReadonlyArray<AssistantModule>): ToolRegistry["Service"] => {
-  const tools = new Map<string, { readonly tool: Tool; readonly decode: (u: unknown) => Effect.Effect<any, Schema.SchemaError> }>()
+export interface ToolRegistryOptions {
+  /** The gateway every call goes through. Default: `defaultGateway` (no access checks, no hooks). */
+  readonly gateway?: ExecutionGateway
+}
+
+/** A registry of `modules`' tools; each tool belongs to the module whose `name` lists it (the module host names parts by module id). */
+export const makeToolRegistry = (modules: ReadonlyArray<AssistantModule>, options: ToolRegistryOptions = {}): ToolRegistry["Service"] => {
+  const gateway = options.gateway ?? defaultGateway
+  const tools = new Map<string, { readonly tool: Tool; readonly moduleId: string }>()
   const providers: Array<ContextProvider> = []
   for (const module of modules) {
     for (const tool of module.tools ?? []) {
       if (tools.has(tool.name)) throw new Error(`Duplicate tool name "${tool.name}" (module ${module.name})`)
-      // The JSON Schema describes the canonical JSON form, so decode with the matching codec.
-      tools.set(tool.name, { tool, decode: Schema.decodeUnknownEffect(Schema.toCodecJson(tool.parameters)) })
+      tools.set(tool.name, { tool, moduleId: module.name })
     }
     providers.push(...(module.context ?? []))
   }
@@ -57,18 +74,12 @@ export const makeToolRegistry = (modules: ReadonlyArray<AssistantModule>): ToolR
   const run = (call: ToolCall): Effect.Effect<ToolResult> => {
     const entry = tools.get(call.name)
     if (entry === undefined) return Effect.succeed(errorResult(call, `Unknown tool "${call.name}"`))
-    return entry.decode(call.input).pipe(
-      Effect.matchEffect({
-        onFailure: (error) => Effect.succeed(errorResult(call, `Invalid input: ${error.message}`)),
-        onSuccess: (input) =>
-          // Suspended: a tool that throws while building its effect is a defect caught below, not a failed turn.
-          // Interruption is neither an error nor a defect, so it passes through.
-          Effect.suspend(() => entry.tool.execute(input)).pipe(
-            Effect.map((value): ToolResult => ({ id: call.id, name: call.name, content: encodeResult(value), isError: false })),
-            Effect.catch((error) => Effect.succeed(errorResult(call, error.message))),
-            Effect.catchDefect((defect) => Effect.succeed(errorResult(call, `Tool crashed: ${String(defect)}`)))
-          )
-      })
+    // Validation, the checks and `execute`, in the gateway. A tool that throws while building its effect is a defect
+    // caught here, not a failed turn; interruption is neither an error nor a defect, so it passes through.
+    return gateway.tool(entry.moduleId, entry.tool, call.input).pipe(
+      Effect.map((value): ToolResult => ({ id: call.id, name: call.name, content: encodeResult(value), isError: false })),
+      Effect.catch((error) => Effect.succeed(errorResult(call, error.message))),
+      Effect.catchDefect((defect) => Effect.succeed(errorResult(call, `Tool crashed: ${String(defect)}`)))
     )
   }
 
@@ -82,6 +93,7 @@ export const makeToolRegistry = (modules: ReadonlyArray<AssistantModule>): ToolR
     specs,
     isSpeculative: (name) => tools.get(name)?.tool.speculative === true,
     actionFor: (name) => tools.get(name)?.tool.action,
+    runAction: gateway.action,
     run,
     context
   })

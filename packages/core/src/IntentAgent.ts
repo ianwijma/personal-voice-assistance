@@ -1,3 +1,4 @@
+import { defaultGateway } from "./Gateway.ts"
 import { Cause, Clock, Effect, Exit, Fiber, Stream } from "effect"
 import { ACTION_TIMEOUT_MS, ActionError, type ActionOutcome, actionToolName, type RegisteredAction } from "./Actions.ts"
 import type { AgentEvent, AgentTurnInput, IntentDecisionInfo } from "./Agent.ts"
@@ -267,7 +268,9 @@ export const makeIntentAgent = (options: IntentAgentOptions = {}): AgentImplemen
         const start = yield* now
         // Detached: once started, an action finishes even if the turn is interrupted (half a light switch is worse).
         // Suspended: a `run` that throws while building its effect fails the action, not the turn.
-        const fiber = yield* Effect.forkDetach(Effect.suspend(() => def.run(params as never)).pipe(
+        // Through the execution gateway (the module and the action must be on for the turn's assistant).
+        const runAction = input.tools.runAction ?? defaultGateway.action
+        const fiber = yield* Effect.forkDetach(runAction(action, params).pipe(
           Effect.timeoutOrElse({
             duration: ACTION_TIMEOUT_MS,
             orElse: () => Effect.fail(new ActionError({ message: `${def.label} did not finish within ${ACTION_TIMEOUT_MS / 1000} seconds.` }))
