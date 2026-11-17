@@ -86,9 +86,18 @@ importers:
       '@pva/core':
         specifier: workspace:*
         version: link:../../packages/core
+      '@pva/decide-typesafe':
+        specifier: workspace:*
+        version: link:../../packages/decide-typesafe
       '@pva/llm-anthropic':
         specifier: workspace:*
         version: link:../../packages/llm-anthropic
+      '@pva/llm-openai-compatible':
+        specifier: workspace:*
+        version: link:../../packages/llm-openai-compatible
+      '@pva/module-home-assistant':
+        specifier: workspace:*
+        version: link:../../packages/module-home-assistant
       '@pva/modules-builtin':
         specifier: workspace:*
         version: link:../../packages/modules-builtin

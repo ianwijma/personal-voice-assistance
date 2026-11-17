@@ -39,8 +39,8 @@ test("New conversation in the chat's header asks nothing: the chat empties, show
   await expect(other.getByTestId("turn")).toHaveCount(3)
 
   const button = page.getByTestId("new-conversation")
-  await expect(button).toHaveAccessibleName("New conversation")
-  await expect(button).toContainText("New conversation")
+  await expect(button).toHaveAccessibleName("New conversation with Jeff (T3 keeps its own)")
+  await expect(button).toHaveAttribute("title", "New conversation with Jeff (T3 keeps its own)") // an icon now: the title is long with several assistants
   await button.click()
   for (const p of [page, other]) {
     await expect(p.getByTestId("turn")).toHaveCount(0)
@@ -140,12 +140,12 @@ test.describe("phone", () => {
     expect(box!.height).toBeGreaterThanOrEqual(44)
     await page.getByTestId("dock-new-conversation").click()
     await expect(page.getByTestId("dock-menu")).toBeHidden()
-    await expect(page.getByTestId("toasts")).toContainText("Started a new conversation.")
+    await expect(page.getByTestId("toasts")).toContainText("New conversation with Jeff. T3 keeps its own.")
     await page.getByTestId("chat-toggle").click()
     await expect(page.getByTestId("conversation-divider")).toHaveText("New conversation")
     await expect(page.getByTestId("turn")).toHaveCount(0)
-    // The header button is there too, as an icon with its label at this width.
-    await expect(page.getByTestId("new-conversation")).toContainText("New conversation")
+    // The header button is there too, as an icon whose name says which assistant's conversation it starts.
+    await expect(page.getByTestId("new-conversation")).toHaveAccessibleName("New conversation with Jeff (T3 keeps its own)")
     expect(await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)).toBe(0)
   })
 
@@ -241,8 +241,7 @@ test("admin: the phrase tester can follow one device's session", async ({ page, 
   await phone.page.getByTestId("start").click()
   await desk.page.getByTestId("start").click()
   await expectVisualState(desk.page, "listening")
-  await loginAdmin(page, baseURL, "#settings/frontends/web-voice")
-  await page.getByTestId("profile-frontend-web-voice").getByRole("radio", { name: "Wake phrase" }).click()
+  await loginAdmin(page, baseURL, "#settings/devices/type.web-voice")
   const tester = page.getByTestId("phrase-tester")
   const picker = tester.getByTestId("tester-device")
   await expect(picker).toBeVisible()
@@ -264,16 +263,13 @@ test("admin: the phrase tester can follow one device's session", async ({ page, 
   await desk.ctx.close()
 })
 
-test("admin: the profile form has the quiet time for a new conversation", async ({ page, baseURL }) => {
+test("admin: the quiet time is set on each assistant; the device page says so; the limit is a shared setting", async ({ page, baseURL }) => {
   await mock.scenario("typed")
-  await loginAdmin(page, baseURL, "#settings/frontends/web-voice")
-  const form = page.getByTestId("page-frontends-frontend")
-  await expect(form.getByRole("heading", { name: "Conversation" })).toBeVisible()
-  const input = form.getByRole("spinbutton", { name: "Start a new conversation after" })
-  await expect(input).toHaveValue("10")
-  await expect(form).toContainText("minutes quiet")
-  await expect(form).toContainText("0 = never")
-  // The assistant settings arrive as a server section.
-  await page.goto(page.url().replace(/#.*$/, "#settings/language-model/conversations"))
+  await loginAdmin(page, baseURL, "#settings/devices/type.web-voice")
+  const help = page.getByTestId("conversation-help")
+  await expect(help).toContainText("Each assistant keeps its own conversation on these browsers")
+  await expect(help).toContainText("Jeff after 10 min quiet")
+  await expect(help).toContainText("T3 never")
+  await page.goto(page.url().replace(/#.*$/, "#settings/shared/limits"))
   await expect(page.getByRole("spinbutton", { name: "Devices talking at once" })).toHaveValue("4")
 })

@@ -73,7 +73,7 @@ test.describe("focus", () => {
     const dialog = page.getByTestId("forget-dialog")
     await expect(dialog).toBeVisible()
     expect(await page.getByTestId("admin-header").evaluate((el) => (el as HTMLElement).inert)).toBe(true)
-    expect(await page.getByTestId("rename").evaluate((el) => el.closest("[inert]") !== null)).toBe(true)
+    expect(await page.getByLabel("Name", { exact: true }).evaluate((el) => el.closest("[inert]") !== null)).toBe(true)
     expect(await dialog.evaluate((el) => el.closest("[inert]") !== null)).toBe(false)
     for (let i = 0; i < 6; i++) await page.keyboard.press("Tab")
     expect(await page.evaluate(() => document.querySelector("[data-testid=forget-dialog]")!.contains(document.activeElement))).toBe(true)
@@ -110,40 +110,34 @@ test.describe("long wake phrases", () => {
 
   test.describe("admin devices at 320 px", () => {
     test.use({ viewport: { width: 320, height: 640 }, hasTouch: true, isMobile: true })
-    test("the row wraps the phrase, keeps its last word with “+2”, has no dangling separator and drops the kind", async ({ page, baseURL }) => {
+    test("the row wraps the phrase chip, fits the row, and the page does not scroll sideways", async ({ page, baseURL }) => {
       await mock.scenario("long-phrase")
       await gotoAdmin(page, baseURL, "#settings/devices")
       const row = page.getByTestId("device-list").locator("[data-device=d-living-room-0003]")
       await expect(row).toBeVisible()
-      const phrase = row.getByTestId("device-phrase")
-      await expect(phrase).toHaveText(`“${LONG}” +2`)
-      const box = (await phrase.boundingBox())!
-      expect(box.height).toBeGreaterThan(20) // more than one line
+      const chips = row.getByTestId("device-chips")
+      await expect(chips).toContainText(`“${LONG}” +2`)
+      const box = (await chips.boundingBox())!
       const rowBox = (await row.boundingBox())!
       expect(box.x + box.width).toBeLessThanOrEqual(rowBox.x + rowBox.width)
-      // The last word and the count are one unit.
-      expect(await phrase.locator("span").innerText()).toBe("please” +2")
-      // No separators on a phone (they exist from 640 px), and the kind is not shown.
-      const contents = await row.getByTestId("device-meta").locator("> span").evaluateAll((els) => els.map((e) => getComputedStyle(e, "::before").content))
-      for (const c of contents) expect(["none", "normal", '""']).toContain(c)
-      await expect(row.getByTestId("device-meta").locator("> span").last()).toBeHidden()
       expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true)
     })
 
     test("the phrase editor shows every phrase whole", async ({ page, baseURL }) => {
       await mock.scenario("long-phrase")
-      await gotoAdmin(page, baseURL, "#settings/frontends/web-voice")
-      const text = page.getByTestId("phrase-list").getByTestId("phrase-text").first()
-      await expect(text).toHaveText("Hello My Personal Voice Assistant Please")
-      expect(await text.evaluate((el) => el.scrollWidth <= el.clientWidth + 1 && getComputedStyle(el).textOverflow !== "ellipsis")).toBe(true)
+      await gotoAdmin(page, baseURL, "#settings/devices/d-living-room-0003")
+      const text = page.getByTestId("phrases").locator("[data-phrase]").first()
+      await expect(text).toHaveText(`“${LONG}”`)
+      expect(await text.evaluate((el) => el.scrollWidth <= el.clientWidth + 1)).toBe(true)
+      expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true)
     })
 
     test("the page title is shown in full on a phone", async ({ page, baseURL }) => {
       await mock.scenario("devices")
-      await gotoAdmin(page, baseURL, "#settings/frontends/web-voice")
+      await gotoAdmin(page, baseURL, "#settings/devices/d-kitchen-ipad-0001")
       const title = page.getByTestId("page-title")
       await expect(title).toBeVisible()
-      await expect(title).toHaveText("Voice assistant in a browser")
+      await expect(title).toHaveText("Kitchen iPad")
       expect(await title.evaluate((el) => el.scrollWidth <= el.clientWidth + 1)).toBe(true)
     })
   })
@@ -152,8 +146,8 @@ test.describe("long wake phrases", () => {
 test.describe("admin wording and states", () => {
   test("Log out with unsaved changes asks first; Stay keeps the page, Discard and log out leaves", async ({ page, baseURL }) => {
     await mock.scenario("typed")
-    await loginAdmin(page, baseURL, "#settings/speech/turn-timing")
-    await page.getByTestId("settings-page").locator("input[type=number]").first().fill("700")
+    await loginAdmin(page, baseURL, "#settings/shared/limits")
+    await page.getByTestId("settings-page").locator("input[type=number]").first().fill("3")
     await page.getByTestId("logout").click()
     const dialog = page.getByTestId("leave-dialog")
     await expect(dialog).toContainText("Leave without saving?")
@@ -172,14 +166,14 @@ test.describe("admin wording and states", () => {
     await expect(page.getByTestId("login-form")).toBeVisible()
   })
 
-  test("the phrase tester says Ready to test while idle and Testing while listening; its settings note covers the follow-up time", async ({ page, baseURL, context }) => {
+  test("the phrase tester says Ready to test while idle and Testing while listening, for the device whose page it is on", async ({ page, baseURL, context }) => {
     await mock.scenario("devices")
     const voice = await context.newPage()
     await voice.goto(appUrl(baseURL))
     await voice.getByTestId("start").click()
     await expectVisualState(voice, "listening")
-    await mock.defaults({ activation: "wake-phrase" })
-    await loginAdmin(page, baseURL, "#settings/frontends/web-voice")
+    const id = await voice.evaluate(() => localStorage.getItem("pva.deviceId"))
+    await loginAdmin(page, baseURL, `#settings/devices/${id}`)
     const tester = page.getByTestId("phrase-tester")
     const scope = tester.getByTestId("tester-scope")
     await expect(scope).toContainText("Ready to test")
@@ -192,48 +186,14 @@ test.describe("admin wording and states", () => {
     await voice.close()
   })
 
-  test("a device override equal to the default is still marked Override, and says so for assistive technology", async ({ page, baseURL }) => {
-    await mock.scenario("devices")
-    await mock.defaults({ followUpSeconds: 15 })
-    await loginAdmin(page, baseURL, "#settings/devices/d-kitchen-ipad-0001")
-    const followUp = page.locator("[data-field=followUpSeconds]")
-    await expect(followUp.getByTestId("custom-marker")).toHaveText(/Override/)
-    await expect(followUp.getByTestId("custom-marker")).toContainText("same as the default now")
-    await expect(followUp.getByTestId("inherited")).toHaveCount(0)
-  })
-
-  test("what Custom and Override mean is one visible line on the pages that show them", async ({ page, baseURL }) => {
-    await mock.scenario("devices")
-    await loginAdmin(page, baseURL, "#settings/devices/d-kitchen-ipad-0001")
-    await expect(page.getByTestId("marker-legend")).toHaveText("Override: set for this device only. Reset returns to the front-end default.")
-    await gotoAdmin(page, baseURL, "#settings/frontends/web-voice")
-    await expect(page.getByTestId("marker-legend")).toHaveText("Custom: differs from the built-in default. Reset returns to it.")
-    await gotoAdmin(page, baseURL, "#settings/speech/turn-timing")
-    await expect(page.getByTestId("marker-legend")).toContainText("Custom:")
-  })
-
-  test("when a field's label is its group's heading, the markers sit on the heading's row", async ({ page, baseURL }) => {
-    await mock.scenario("devices")
-    await loginAdmin(page, baseURL, "#settings/devices/d-kitchen-ipad-0001")
-    // Activation's first field is "Activation" (the Voice group, the other such case, was retired).
-    const field = page.locator("[data-field=activation]")
-    const heading = field.locator("h4")
-    await expect(heading).toHaveText("Activation")
-    const markers = field.getByTestId("field-markers")
-    await expect(markers).toBeVisible()
-    const h = (await heading.boundingBox())!
-    const m = (await markers.boundingBox())!
-    expect(Math.abs(h.y + h.height / 2 - (m.y + m.height / 2))).toBeLessThan(12)
-  })
-
   test("nav marks: one padlock mark, and the legend is never cut off", async ({ page, baseURL }) => {
     await mock.scenario("keys-locked")
-    await loginAdmin(page, baseURL, "#settings/speech/turn-timing")
+    await loginAdmin(page, baseURL, "#settings/shared/limits")
     await page.evaluate(() => {
       const c = (window as unknown as { __pva: { store: { get: () => { engine: Record<string, unknown> }; dispatch: (a: unknown) => void } } }).__pva
       c.store.dispatch({ type: "engine", engine: { ...c.store.get().engine, problems: [{ stage: "tts", message: "Piper: the voice file is missing." }] } })
     })
-    await page.getByTestId("settings-page").locator("input[type=number]").first().fill("700")
+    await page.getByTestId("settings-page").locator("input[type=number]").first().fill("3")
     const legend = page.getByTestId("marks-legend")
     await expect(legend.locator("[data-legend=lock]")).toContainText("Locked: unlock the keys to change")
     await expect(page.locator("[data-mark=key]")).toHaveCount(0)
@@ -245,13 +205,6 @@ test.describe("admin wording and states", () => {
     }
   })
 
-  test("Language model › Provider with the subscription card chosen: the footer has no Save, only its note", async ({ page, baseURL }) => {
-    await mock.scenario("modules")
-    await loginAdmin(page, baseURL, "#settings/language-model/provider")
-    await page.getByRole("radio", { name: /Claude subscription/ }).click()
-    await expect(page.getByTestId("footer-note")).toContainText("Use Claude subscription")
-    await expect(page.getByTestId("page-footer").getByRole("button", { name: /^Save/ })).toHaveCount(0)
-  })
 })
 
 test.describe("voice small things", () => {
@@ -267,8 +220,8 @@ test.describe("voice small things", () => {
 
   test("the Advanced and folded summaries are 44 px tall on a phone", async ({ page, baseURL }) => {
     await mock.scenario("devices")
-    await gotoAdmin(page, baseURL, "#settings/frontends/web-voice")
-    const summaries = page.locator("[data-testid=profile-frontend-web-voice] summary, [data-testid^=profile-] summary")
+    await gotoAdmin(page, baseURL, "#settings/devices/d-kitchen-ipad-0001")
+    const summaries = page.locator("[data-testid=device-editor] summary")
     const count = await summaries.count()
     expect(count).toBeGreaterThan(0)
     for (let i = 0; i < count; i++) expect((await summaries.nth(i).boundingBox())!.height).toBeGreaterThanOrEqual(44)

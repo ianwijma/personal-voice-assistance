@@ -1,3 +1,4 @@
+import { ACCOUNTS, accountState, listJoin } from "./assistants.ts"
 import type { ClientState } from "./state.ts"
 import type { SettingsPath } from "./settingsTree.ts"
 
@@ -13,35 +14,39 @@ export interface ChecklistItem {
   readonly action?: { readonly label: string; readonly path: SettingsPath }
 }
 
-const LLM: Record<string, string> = { fake: "offline stand-in (echoes you)", anthropic: "Claude API", "claude-subscription": "Claude subscription" }
-
 export const setupChecklist = (s: ClientState): ReadonlyArray<ChecklistItem> => {
   const items: Array<ChecklistItem> = []
-  const llm = s.engine.engines.find((e) => e.stage === "llm")
   const stt = s.engine.engines.find((e) => e.stage === "stt")
   const voice = s.engine.voices.find((v) => v.isDefault)
   const failedStage = (word: string) => s.engine.problems.find((p) => p.stage.toLowerCase().includes(word))
 
+  // Assistants (docs/ASSISTANTS.md §7.1): who answers; the accounts they can use.
+  const on = s.assistants.filter((a) => a.on)
+  items.push(
+    s.assistants.length === 0
+      ? { id: "assistants", ok: false, text: "Assistants: none yet, so nobody answers", action: { label: "New assistant…", path: ["assistants", "new", "1"] } }
+      : { id: "assistants", ok: true, text: `Assistants: ${listJoin(s.assistants.map((a) => a.name))}${on.length === s.assistants.length ? ", all switched on" : `, ${on.length} switched on`}` }
+  )
+  const modules = Object.values(s.modules.byId)
+  const ready = ACCOUNTS.filter((a) => a.id !== "offline" && accountState(a.id, s.sections, modules).tone === "ok")
   const llmProblem = failedStage("language")
   items.push(
     llmProblem !== undefined
-      ? { id: "llm", ok: false, text: `Language model: ${llmProblem.message}`, action: { label: "Fix", path: ["language-model", "provider"] } }
-      : llm === undefined
-      ? { id: "llm", ok: false, text: "Language model: not running", action: { label: "Choose…", path: ["language-model", "provider"] } }
-      : llm.provider === "fake"
-      ? { id: "llm", ok: false, text: `Language model: ${LLM.fake}`, action: { label: "Choose…", path: ["language-model", "provider"] } }
-      : { id: "llm", ok: true, text: `Language model: ${LLM[llm.provider] ?? llm.provider} (${llm.detail})` }
+      ? { id: "llm", ok: false, text: `Language model: ${llmProblem.message}`, action: { label: "Fix", path: ["shared", "accounts"] } }
+      : ready.length === 0
+      ? { id: "llm", ok: false, text: "Language model accounts: none set up (only the offline stand-in)", action: { label: "Set up…", path: ["shared", "accounts"] } }
+      : { id: "llm", ok: true, text: `Language model accounts: ${listJoin(ready.map((a) => a.title))}` }
   )
   const sttProblem = failedStage("speech-to-text")
   items.push(
     sttProblem !== undefined || stt === undefined
-      ? { id: "stt", ok: false, text: `Speech recognition: ${sttProblem?.message ?? "not running"}`, action: { label: "Fix", path: ["speech", "engine"] } }
+      ? { id: "stt", ok: false, text: `Speech recognition: ${sttProblem?.message ?? "not running"}`, action: { label: "Fix", path: ["shared", "speech"] } }
       : { id: "stt", ok: true, text: `Speech recognition: ${stt.provider === "sherpa" ? "on this machine" : stt.provider} (${stt.detail})` }
   )
   const voiceProblem = failedStage("voice")
   items.push(
     voiceProblem !== undefined || voice === undefined
-      ? { id: "voice", ok: false, text: `Voice: ${voiceProblem?.message ?? "not running"}`, action: { label: "Fix", path: ["voices", "overview"] } }
+      ? { id: "voice", ok: false, text: `Voice: ${voiceProblem?.message ?? "not running"}`, action: { label: "Fix", path: ["shared", "providers"] } }
       : { id: "voice", ok: true, text: `Voice: ${voice.description || voice.name} (${voice.engine})` }
   )
   items.push(

@@ -1,5 +1,14 @@
 # Voice providers and the voice picker
 
+> **Built on by docs/ASSISTANTS.md (WP-10, 2026-11-16).** The voice is now **per assistant**: `Assistant.voice` is one
+> `VoiceRef`, saved with the assistant (`assistant.save`), and the resource pool holds one `Tts` per distinct voice (every
+> Kokoro speaker shares one engine). The picker is the component of §8, used on an assistant's **Voice** tab; the providers
+> page is **Shared settings › Voice providers**; the Voices category and its default-voice field are gone from the admin.
+> `ASSISTANT_VOICE` is kept for the command-line modes and for migrating an install from before assistants. `GET
+> /api/voices/default` answers with the first switched-on assistant's voice, `PUT /api/voices/default` answers `410 gone`
+> and `VoiceEntry.selected` is `usedBy` (§5.8). A changed voice applies at the assistant's next turn, with no engine reload.
+> Sections 5.8, 6.1 and 7.3 say what they described and what replaced it.
+
 Design written 2026-11-16 at the owner's request. It changes four things:
 
 1. **Voice engines become voice providers.** A *provider* is where speech is made: **on this machine** (`sherpa`:
@@ -530,6 +539,11 @@ without a key can be added from its old entry).
 
 ### 5.8 The assistant's voice
 
+> **Superseded by docs/ASSISTANTS.md §5.5 (WP-10, 2026-11-16).** Each assistant has its own `voice`, saved with the assistant
+> (`assistant.save`). `GET /api/voices/default` answers with the first assistant's voice (`source: "assistant"`, never
+> locked, `reloadPending` false), `PUT /api/voices/default` answers `410 gone`, and `VoiceEntry.selected` is `usedBy`
+> (the assistants that speak with the voice). What follows is the design before that change.
+
 `GET /api/voices/default`
 
 ```ts
@@ -568,6 +582,10 @@ Errors: 400, 401, 404 `unknown_provider` / `unknown_voice`, 409 `needs_key`, `no
 ## 6. Settings
 
 ### 6.1 Pages
+
+> Since protocol 7 these pages are: the assistant's **Voice** tab (the picker, saved with the assistant), **Shared settings › Voice
+> providers** (the keys) and the model list on Shared settings › Speech recognition models. The text below is the design as built
+> for protocol 6.
 
 - **Voices › Voices** (section `voices`, page `voices/overview`): one field, `ASSISTANT_VOICE` ("Assistant voice", a
   text field holding a voice key, `apply: reload`). The UI replaces this field with the picker (it may keep the

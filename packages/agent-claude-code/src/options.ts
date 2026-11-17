@@ -108,6 +108,10 @@ export const SESSION_CWD = join(tmpdir(), "pva-claude-subscription")
 
 export interface SessionOptionsInput {
   readonly model: string
+  /** The assistant's effort (absent: Claude Code's default for the model). */
+  readonly effort?: "low" | "medium" | "high" | undefined
+  /** "adaptive": Claude decides when to think; absent or "off": no extended thinking (the spoken default). */
+  readonly thinking?: "off" | "adaptive" | undefined
   readonly system: string
   /** Tool names (without the MCP prefix) the session may call; empty = no MCP server. */
   readonly tools: ReadonlyArray<string>
@@ -160,7 +164,8 @@ export const sessionOptions = (input: SessionOptionsInput): Options => ({
   ...(input.tools.length > 0 && input.mcpServer !== undefined ? { mcpServers: { [MCP_SERVER_NAME]: input.mcpServer } } : { mcpServers: {} }),
   // Nothing written to ~/.claude/projects.
   persistSession: false,
-  thinking: { type: "disabled" },
+  thinking: input.thinking === "adaptive" ? { type: "adaptive" } : { type: "disabled" },
+  ...(input.effort !== undefined ? { effort: input.effort } : {}),
   includePartialMessages: true,
   promptSuggestions: false,
   cwd: SESSION_CWD,

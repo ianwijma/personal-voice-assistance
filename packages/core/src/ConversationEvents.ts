@@ -1,9 +1,11 @@
 import type { RouteReason } from "@pva/protocol"
+import type { Effect } from "effect"
 import type { RegisteredAction } from "./Actions.ts"
 import type { Agent, IntentDecisionInfo } from "./Agent.ts"
 import type { DecisionProvider } from "./Decision.ts"
 import type { SttEvent, ToolCall, ToolResult } from "./Domain.ts"
 import type { Router, RouterState } from "./Routing.ts"
+import type { Llm, Tts } from "./Services.ts"
 import type { ToolRegistry } from "./ToolRegistry.ts"
 import type { Trace, TurnOutcome } from "./TurnTrace.ts"
 
@@ -151,6 +153,32 @@ export interface TurnSetup {
   readonly system: string
   /** Immutable snapshot of the enabled modules' tools and context providers. */
   readonly registry: ToolRegistry["Service"]
+  /**
+   * The language model this turn uses from start to end (every round of its tool loop), in a single-model
+   * conversation (`makeConversationWithSetup`). Absent: the `Llm` the conversation was made with. Serve mode's
+   * resource pool sets it, so a changed model applies at the next turn start (docs/ASSISTANTS.md §3.2). Ignored by
+   * agent conversations (their agents hold their own model).
+   */
+  readonly llm?: Llm["Service"] | undefined
+  /**
+   * The voice this turn speaks with, from its start to its end (`Conversation.voice`): every clause of every round,
+   * a canned reply and a notice included. Absent: the `Tts` the voice loop was given. Serve mode's resource pool sets
+   * it (the assistant's own voice), so a changed voice applies at the next turn start without touching a turn that is
+   * speaking (docs/ASSISTANTS.md §3.2). Its `sampleRate` must be final once `ttsReady` has completed.
+   */
+  readonly tts?: Tts["Service"] | undefined
+  /**
+   * The tool rounds this turn may use, fixed at its start. Absent: the agent set's `maxToolRounds`, else the
+   * conversation's. Serve mode sets it to the assistant's `toolRounds`, read with the rest of the setup, so a changed
+   * limit applies from the next turn start and the turn's configuration snapshot reports the limit it ran with.
+   */
+  readonly maxToolRounds?: number | undefined
+  /**
+   * Completes once `tts.sampleRate` is final (a voice still being built). A spoken turn waits for it inside the turn,
+   * just before it starts to play, so Stop, barge-in and a new conversation interrupt the wait, and a typed reply that
+   * is not spoken never waits. Absent: `tts.sampleRate` is final already.
+   */
+  readonly ttsReady?: Effect.Effect<void> | undefined
 }
 
 /**

@@ -22,6 +22,7 @@ export type Scenario =
   | "wake"
   | "devices"
   | "long-phrase"
+  | "latency"
   | "admin-disabled"
   | "admin-backoff"
 
@@ -43,8 +44,26 @@ export const mock = {
     expect(r.ok).toBe(true)
   },
   log: async (): Promise<MockLog> => (await (await fetch(`${MOCK}/mock/log`)).json()) as MockLog,
-  turn: async () => {
-    await fetch(`${MOCK}/mock/turn`, { method: "POST" })
+  /** The scripted voice turn. Protocol 7: `assistantId` answers (default: who has the turn, else who answers without a phrase); `phrase`: it was woken by that phrase. */
+  turn: async (opts: { assistantId?: string; phrase?: string } = {}) => {
+    await fetch(`${MOCK}/mock/turn`, { method: "POST", body: JSON.stringify(opts) })
+  },
+  /** Protocol 7: "Whichever fits" is set up (the voice menu offers it). */
+  typesafe: async (on = true) => {
+    await fetch(`${MOCK}/mock/typesafe`, { method: "POST", body: JSON.stringify({ on }) })
+  },
+  /**
+   * Protocol 7: the web-voice devices sleep until a phrase and Jeff is the only assistant, woken by `phrase`.
+   */
+  sleeps: async (phrase = "hey jeff") => {
+    const settings = { assistants: [{ assistant: "jeff", phrases: [phrase] }], withoutPhrase: { mode: "nobody" } }
+    const r = await fetch(`${MOCK}/mock/device`, { method: "POST", body: JSON.stringify({ settings }) })
+    expect(r.ok).toBe(true)
+  },
+  /** Protocol 7: a device's settings (without `deviceId`: the web-voice type's), saved as admin would; the setups follow. */
+  device: async (settings: Record<string, unknown>, deviceId?: string) => {
+    const r = await fetch(`${MOCK}/mock/device`, { method: "POST", body: JSON.stringify({ settings, ...(deviceId === undefined ? {} : { deviceId }) }) })
+    expect(r.ok).toBe(true)
   },
   offline: async (ms: number) => {
     await fetch(`${MOCK}/mock/offline`, { method: "POST", body: JSON.stringify({ ms }) })
@@ -72,10 +91,6 @@ export const mock = {
       method: "POST",
       body: JSON.stringify({ text, ...(matched === undefined ? {} : { matched }), ...(accepted === undefined ? {} : { accepted }), ...(deviceId === undefined ? {} : { deviceId }) })
     })
-  },
-  /** Change the web-voice defaults (as admin › Front ends would). */
-  defaults: async (patch: Record<string, unknown>) => {
-    await fetch(`${MOCK}/mock/defaults`, { method: "POST", body: JSON.stringify({ patch }) })
   },
   /** Make `admin.logout` fail (or work again). */
   logoutFails: async (on = true) => {

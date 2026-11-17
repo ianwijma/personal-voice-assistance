@@ -1,5 +1,6 @@
 import { Schema } from "effect"
 import { AdminToken } from "./admin.ts"
+import { Assistant, AssistantBody, AssistantId, MAX_ASSISTANTS } from "./assistants.ts"
 import {
   ClientId,
   ModuleId,
@@ -12,7 +13,8 @@ import {
 } from "./common.ts"
 import { MAX_TEXT_INPUT_CHARS } from "./constants.ts"
 import { MAX_MOVE_KEYS } from "./env.ts"
-import { DeviceHello, DeviceId, DeviceName, FrontendKindId, FrontendRole, ProfilePatch } from "./frontends.ts"
+import { DeviceSettingsPatch, DeviceTarget } from "./devices.ts"
+import { DeviceHello, DeviceId, DeviceName, FrontendRole, WakePhrase } from "./frontends.ts"
 import { JobAction, ToolId } from "./jobs.ts"
 import { SettingsPatch } from "./settings.ts"
 import { Password } from "./vault.ts"
@@ -151,7 +153,9 @@ export const TextSend = Schema.Struct({
   requestId: RequestId,
   text: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(MAX_TEXT_INPUT_CHARS)),
   /** Speak the reply. Honoured only for the audio owner; otherwise the reply is text only. */
-  speak: Schema.Boolean
+  speak: Schema.Boolean,
+  /** Protocol 7: the assistant this text is for (the voice page names the conversation shown). Absent: the device's route (docs/ASSISTANTS.md §2.6). */
+  assistantId: Schema.optionalKey(AssistantId)
 })
 
 /** Admin only. */
@@ -291,42 +295,6 @@ export const AdminLogout = Schema.Struct({
 })
 
 /**
- * Change this connection's own device profile: only `DEVICE_EDITABLE_FIELDS` (`voice`, `activation`,
- * `followUpSeconds`); a patch naming any other field is refused whole with `admin_required`. `null` removes the
- * device's override (back to the kind default). A voice connection without `hello.device` is refused (`bad_message`).
- * Every connection of the device then gets `device.profile`; admin connections get `devices`.
- */
-export const DeviceUpdate = Schema.Struct({
-  type: Schema.Literal("device.update"),
-  requestId: RequestId,
-  patch: ProfilePatch
-})
-
-/**
- * Admin only: change a front-end kind's defaults (Front ends › kind). Fields not in the kind's `fields` are refused
- * (`invalid_settings`, with `fieldErrors`). Unknown kind: `unknown_device`. Every affected device connection gets
- * `device.profile`; admin connections get `frontends` and `devices`.
- */
-export const FrontendUpdate = Schema.Struct({
-  type: Schema.Literal("frontend.update"),
-  requestId: RequestId,
-  kind: FrontendKindId,
-  patch: ProfilePatch
-})
-
-/**
- * Admin only: rename a device and/or change its overrides (any profile field that applies to its kind). Unknown
- * device: `unknown_device`. The device's connections get `device.profile`; admin connections get `devices`.
- */
-export const DeviceAdminUpdate = Schema.Struct({
-  type: Schema.Literal("device.admin.update"),
-  requestId: RequestId,
-  id: DeviceId,
-  name: Schema.optionalKey(DeviceName),
-  patch: Schema.optionalKey(ProfilePatch)
-})
-
-/**
  * Admin only: forget a device (its record and overrides). A device that is connected now is recorded again as new
  * (kind defaults) and its connections get `device.profile`. Unknown device: `unknown_device`.
  */
@@ -362,13 +330,84 @@ export const WakeTest = Schema.Struct({
  */
 export const ConversationNew = Schema.Struct({
   type: Schema.Literal("conversation.new"),
-  requestId: RequestId
+  requestId: RequestId,
+  /** Protocol 7: whose conversation restarts. Absent: the answering assistant's. */
+  assistantId: Schema.optionalKey(AssistantId)
 })
 
 /** Liveness check; the server answers `pong` with the same id. Sent every 5 s. */
 export const Ping = Schema.Struct({
   type: Schema.Literal("ping"),
   id: NonNegativeInt
+})
+
+// -- Protocol 7 (docs/ASSISTANTS.md §5.2, §5.3)
+
+/** Where a created assistant is placed (wizard step 6): appended to that entry's list, with an optional first phrase. */
+export const AssistantPlacement = Schema.Struct({
+  target: DeviceTarget,
+  phrase: Schema.optionalKey(WakePhrase)
+})
+
+/**
+ * Admin only: create an assistant. The server makes the id from the name. Answered with `result`
+ * (`assistantId`) or `invalid_settings` (fieldErrors) or `limit_reached` (`MAX_ASSISTANTS`).
+ */
+export const AssistantCreate = Schema.Struct({
+  type: Schema.Literal("assistant.create"),
+  requestId: RequestId,
+  /** Every field except `id` and `rev`; the wizard's "Start from" is `copyOf`, and the body still carries every field. */
+  assistant: AssistantBody,
+  copyOf: Schema.optionalKey(AssistantId),
+  placements: Schema.optionalKey(Schema.Array(AssistantPlacement).check(Schema.isMaxLength(MAX_ASSISTANTS * 4)))
+})
+
+/** Admin only: save a whole assistant. `assistant.rev` must equal the stored rev, else `stale`. */
+export const AssistantSave = Schema.Struct({
+  type: Schema.Literal("assistant.save"),
+  requestId: RequestId,
+  assistant: Assistant,
+  saveAnyway: Schema.optionalKey(Schema.Boolean)
+})
+
+/** Admin only: delete an assistant (removed from every list, see docs/ASSISTANTS.md §2.6). `rev` as for save. */
+export const AssistantDelete = Schema.Struct({
+  type: Schema.Literal("assistant.delete"),
+  requestId: RequestId,
+  id: AssistantId,
+  rev: NonNegativeInt
+})
+
+/**
+ * Admin only: save a device type's defaults entry or one device. `rev` is the entry's rev (`stale` otherwise).
+ * `settings` sets sections (a value) or, for a device only, returns them to the type defaults (`null`).
+ */
+export const DeviceSave = Schema.Struct({
+  type: Schema.Literal("device.save"),
+  requestId: RequestId,
+  target: DeviceTarget,
+  rev: NonNegativeInt,
+  /** Devices only. */
+  name: Schema.optionalKey(DeviceName),
+  settings: DeviceSettingsPatch,
+  saveAnyway: Schema.optionalKey(Schema.Boolean)
+})
+
+/** Voice connections: read one assistant's conversation on this device; answered with `conversation.history`. */
+export const ConversationRead = Schema.Struct({
+  type: Schema.Literal("conversation.read"),
+  requestId: RequestId,
+  assistantId: AssistantId
+})
+
+/**
+ * Voice connections: pick who answers without a phrase on this device (`""` = nobody, `"typesafe"` = whichever
+ * fits). Refused `not_allowed` unless the setup says `canPick` (and `"typesafe"` unless `canAuto`).
+ */
+export const DevicePick = Schema.Struct({
+  type: Schema.Literal("device.pick"),
+  requestId: RequestId,
+  withoutPhrase: Schema.Union([AssistantId, Schema.Literal(""), Schema.Literal("typesafe")])
 })
 
 export const ClientMessage = Schema.Union([
@@ -398,14 +437,29 @@ export const ClientMessage = Schema.Union([
   ModelDelete,
   AdminLogin,
   AdminLogout,
-  DeviceUpdate,
-  FrontendUpdate,
-  DeviceAdminUpdate,
   DeviceForget,
   WakeTest,
   ConversationNew,
-  Ping
+  Ping,
+  AssistantCreate,
+  AssistantSave,
+  AssistantDelete,
+  DeviceSave,
+  ConversationRead,
+  DevicePick
 ]).pipe(Schema.toTaggedUnion("type"))
 export type ClientMessage = typeof ClientMessage.Type
 export type ClientMessageType = ClientMessage["type"]
 export type ClientMessageOf<T extends ClientMessageType> = Extract<ClientMessage, { readonly type: T }>
+
+/** The client messages that protocol 7 adds (also members of `ClientMessage`). */
+export const AssistantsClientMessage = Schema.Union([
+  AssistantCreate,
+  AssistantSave,
+  AssistantDelete,
+  DeviceSave,
+  ConversationRead,
+  DevicePick
+]).pipe(Schema.toTaggedUnion("type"))
+export type AssistantsClientMessage = typeof AssistantsClientMessage.Type
+export type AssistantsClientMessageType = AssistantsClientMessage["type"]

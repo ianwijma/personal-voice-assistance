@@ -74,11 +74,11 @@ export const controlledStt = () => {
 
 /** An `Llm` that answers with `reply(userText)` word by word (a few ms apart); tool calls are not used. */
 export const scriptedLlm = (reply: (userText: string, requestIndex: number) => string, options: { readonly firstTokenMs?: number } = {}) => {
-  const requests: Array<{ system: string; messages: ReadonlyArray<unknown> }> = []
+  const requests: Array<{ system: string; messages: ReadonlyArray<unknown>; tools: ReadonlyArray<string> }> = []
   const llm = Llm.of({
     stream: (request) =>
       Stream.suspend(() => {
-        requests.push({ system: request.system, messages: request.messages })
+        requests.push({ system: request.system, messages: request.messages, tools: request.tools.map((t) => t.name) })
         const last = request.messages.at(-1)
         const text = reply(last?.role === "user" ? last.content : "", requests.length - 1)
         const events: Array<LlmEvent> = [

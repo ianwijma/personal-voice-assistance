@@ -8,6 +8,8 @@ import { type Action, type ClientState, initialState, reducer } from "@/lib/stat
 
 const run = (actions: ReadonlyArray<Action>, from: ClientState = initialState) => actions.reduce(reducer, from)
 const welcome = serverExamples.welcome
+/** The conversation of the assistant that answers on the example device (Jeff). */
+const only = (s: ClientState) => s.conversations.jeff
 const conversation = (reason: "new" | "idle" | "resumed", id = `conv-${reason}`): ServerMessage => ({ type: "conversation", id, reason, startedAt: 1_763_100_600_000 })
 const turnStart = (turnId: number, userText = "Hello"): ServerMessage => ({ type: "turn.start", turnId, source: "text", userText, spoken: false })
 const turnEnd = (turnId: number, outcome: "completed" | "interrupted" = "completed"): ServerMessage => ({
@@ -18,10 +20,10 @@ const turnEnd = (turnId: number, outcome: "completed" | "interrupted" = "complet
 })
 
 describe("the device's conversation", () => {
-  it("welcome takes snapshot.conversation and shows no divider on the first connect", () => {
+  it("welcome takes snapshot.conversations and shows no divider on the first connect", () => {
     const s = run([welcome])
-    expect(s.conversation).toEqual(exampleConversation)
-    expect(s.divider).toBeUndefined()
+    expect(only(s)).toMatchObject({ id: exampleConversation.id, startedAt: exampleConversation.startedAt, loaded: true })
+    expect(only(s)?.divider).toBeUndefined()
     expect(s.turns.length).toBeGreaterThan(0)
   })
 
@@ -31,28 +33,28 @@ describe("the device's conversation", () => {
     s = run([{ type: "transcript", text: "and then" }, conversation("new")], s)
     expect(s.turns).toEqual([])
     expect(s.liveTranscript).toBe("")
-    expect(s.divider).toBe("new")
-    expect(s.conversation).toEqual({ id: "conv-new", startedAt: 1_763_100_600_000 })
+    expect(only(s)?.divider).toBe("new")
+    expect(only(s)).toMatchObject({ id: "conv-new", startedAt: 1_763_100_600_000 })
     expect(s.ui.unread).toBe(0)
   })
 
   it("idle: the same, with its own divider", () => {
     const s = run([welcome, conversation("idle")])
     expect(s.turns).toEqual([])
-    expect(s.divider).toBe("idle")
+    expect(only(s)?.divider).toBe("idle")
   })
 
   it("resumed: the chat stays as it is, only the id changes", () => {
     const before = run([welcome, turnStart(30), turnEnd(30)])
     const s = reducer(before, conversation("resumed", "conv-later"))
     expect(s.turns).toBe(before.turns)
-    expect(s.divider).toBeUndefined()
-    expect(s.conversation?.id).toBe("conv-later")
+    expect(only(s)?.divider).toBeUndefined()
+    expect(only(s)?.id).toBe("conv-later")
   })
 
   it("turns of the new conversation come after the divider", () => {
     const s = run([welcome, conversation("new"), turnStart(1, "Fresh start"), turnEnd(1)])
-    expect(s.divider).toBe("new")
+    expect(only(s)?.divider).toBe("new")
     expect(s.turns.map((t) => t.userText)).toEqual(["Fresh start"])
     expect(s.turns[0]!.outcome).toBe("completed")
   })
@@ -77,15 +79,15 @@ describe("the device's conversation", () => {
 
   it("a reconnect keeps the divider while the conversation is the same one", () => {
     const s = run([welcome, conversation("new", exampleConversation.id), welcome])
-    expect(s.divider).toBe("new")
+    expect(only(s)?.divider).toBe("new")
   })
 
   it("a reconnect into an empty, different conversation (replaced while away) shows the divider", () => {
-    const away = { ...welcome, snapshot: { ...welcome.snapshot, history: [], conversation: { id: "conv-other", startedAt: 1 } } }
-    expect(run([welcome, away]).divider).toBe("new")
+    const away = { ...welcome, snapshot: { ...welcome.snapshot, history: [], conversations: [{ assistantId: "jeff", id: "conv-other", startedAt: 1, turns: 0 }] } }
+    expect(only(run([welcome, away]))?.divider).toBe("new")
     // ... but not when that conversation already has turns: the chat shows them as they are.
-    const full = { ...welcome, snapshot: { ...welcome.snapshot, conversation: { id: "conv-other", startedAt: 1 } } }
-    expect(run([welcome, full]).divider).toBeUndefined()
+    const full = { ...welcome, snapshot: { ...welcome.snapshot, conversations: [{ assistantId: "jeff", id: "conv-other", startedAt: 1, turns: 2 }] } }
+    expect(only(run([welcome, full]))?.divider).toBeUndefined()
   })
 
   it("sessions_full is not a toast: the client shows it where Start was", () => {

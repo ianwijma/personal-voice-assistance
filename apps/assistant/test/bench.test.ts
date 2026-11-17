@@ -35,6 +35,35 @@ describe("offline bench", () => {
       )
       assert.isTrue(rows.every((r) => r.trace!.marks.llmRequestSent! < r.trace!.marks.endOfTurn!))
     }))
+
+  it.live("route gate: every \"Hey Jeff, …\" turn reaches the conversation with the phrase removed", () =>
+    Effect.gen(function*() {
+      const route = {
+        phrases: [{ phrase: "hey jeff", assistant: "jeff" }, { phrase: "hey tee three", assistant: "t3" }],
+        match: "close",
+        withoutPhrase: "nobody",
+        followUpMs: { jeff: 0, t3: 0 },
+        off: new Set<string>()
+      } as const
+      for (const eager of [false, true]) {
+        const rows = yield* runOffline({ name: "route", delays: zeroDelays, eager, route, wakePrefix: "Hey Jeff, " }, 1)
+        assert.strictEqual(rows.length, 4)
+        assert.isTrue(rows.every((r) => r.trace?.outcome === "completed" && r.trace.marks.playbackStart !== undefined))
+        // The scripted LLM only calls the clock for the exact text "What time is it?": the phrase was removed.
+        assert.deepStrictEqual(rows[1]!.trace!.tools.map((t) => t.name), ["current_time"])
+      }
+    }))
+
+  it.live("session path (route gate, dispatcher, inbox, output lease): every turn completes, eager turns are promoted", () =>
+    Effect.gen(function*() {
+      for (const eager of [false, true]) {
+        const delays = eager ? { ...zeroDelays, llmFirstTokenMs: 20, eagerLeadMs: 10 } : zeroDelays
+        const rows = yield* runOffline({ name: "session path", delays, eager, dispatch: true }, 1)
+        assert.strictEqual(rows.length, 4)
+        assert.isTrue(rows.every((r) => r.trace?.outcome === "completed" && r.trace.marks.playbackStart !== undefined))
+        if (eager) assert.isTrue(rows.every((r) => r.trace?.speculative === true))
+      }
+    }))
 })
 
 describe("offline bench, several sessions (bench --sessions N)", () => {

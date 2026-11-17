@@ -1,6 +1,6 @@
-// Protocol 5 on the server (docs/FRONTENDS-AND-ACTIVATION.md): admin password and sessions, role-shaped data,
-// front-end kinds and devices with their profiles, the wake gate in serve mode, per-device voice and interrupt
-// mode. Driven by the scripted client against the real server with injected providers.
+// Admin and devices on the server (docs/FRONTENDS-AND-ACTIVATION.md, protocol 5 and 7): admin password and sessions,
+// role-shaped data, devices and their setup (device types, own sections, forgetting), the wake gate in serve mode and the
+// interrupt mode. Driven by the scripted client against the real server with injected providers.
 import { endOfTurn, interim, speechStarted } from "@pva/core/testing"
 import { type ClientMessage, type ServerMessage, type ServerMessageType, WEB_VOICE_KIND } from "@pva/protocol"
 import { existsSync, readdirSync, readFileSync } from "node:fs"
@@ -61,8 +61,18 @@ const request = async (client: ScriptedClient, message: RequestInput) => {
 const deviceKnown = (admin: ScriptedClient, id: string) =>
   admin.waitFor("devices", (m) => m.devices.some((d) => d.id === id), { from: 0 })
 
-const profileOf = (client: ScriptedClient, pred: (m: Extract<ServerMessage, { type: "device.profile" }>) => boolean) =>
-  client.waitFor("device.profile", pred, { from: 0 })
+const setupOf = (client: ScriptedClient, pred: (m: Extract<ServerMessage, { type: "device.setup" }>) => boolean) =>
+  client.waitFor("device.setup", pred, { from: 0 })
+
+/** The device's stored `rev`, from the admin page's latest `devices` push. */
+const deviceRev = (admin: ScriptedClient, id: string): number => {
+  const list = admin.messages.filter((m): m is Extract<ServerMessage, { type: "devices" }> => m.type === "devices").at(-1)
+  return list?.devices.find((d) => d.id === id)?.rev ?? 0
+}
+const typeRev = (admin: ScriptedClient): number => {
+  const list = admin.messages.filter((m): m is Extract<ServerMessage, { type: "device.types" }> => m.type === "device.types").at(-1)
+  return list?.types.find((t) => t.kind === WEB_VOICE_KIND)?.rev ?? 0
+}
 
 // ---------------------------------------------------------------------------
 
@@ -73,7 +83,7 @@ describe("admin password and sessions", () => {
       const page = await connect(server)
       const welcome = await page.hello({ frontend: "admin" })
       expect(welcome.snapshot.admin).toEqual({ enabled: false, loggedIn: false })
-      expect(welcome.snapshot.device).toBeUndefined()
+      expect(welcome.snapshot.setup).toBeUndefined()
       const { result } = await page.login(adminPassword === "" ? "anything at all" : "short")
       expect(result).toMatchObject({ ok: false, error: { code: "admin_required", message: expect.stringContaining("PVA_ADMIN_PASSWORD") } })
       expect(page.types()).not.toContain("admin.snapshot")
@@ -97,7 +107,7 @@ describe("admin password and sessions", () => {
     expect(result.admin!.expiresAt).toBeGreaterThanOrEqual(before + 12 * 3_600_000 - 1_000)
     expect(page.types(from)).toEqual(["result", "admin.state", "admin.snapshot"])
     expect(page.messages[from + 1]).toEqual({ type: "admin.state", admin: { enabled: true, loggedIn: true, expiresAt: result.admin!.expiresAt } })
-    expect(snapshot?.frontends.map((f) => f.id)).toEqual([WEB_VOICE_KIND])
+    expect(snapshot?.deviceTypes?.map((t) => t.kind)).toEqual([WEB_VOICE_KIND])
     expect(snapshot?.vault.admin).toBe(true)
 
     const voice = await voicePage(server)
@@ -128,7 +138,7 @@ describe("admin password and sessions", () => {
     const welcome = await again.hello({ frontend: "admin", adminToken: token })
     expect(welcome.snapshot.admin).toMatchObject({ enabled: true, loggedIn: true })
     expect(again.types()).toEqual(["welcome", "admin.snapshot"])
-    expect((await request(again, { type: "frontend.update", kind: WEB_VOICE_KIND, patch: {} })).ok).toBe(true)
+    expect((await request(again, { type: "wake.test", on: false })).ok).toBe(true)
 
     const stranger = await connect(server)
     const refused = await stranger.hello({ frontend: "admin", adminToken: "A".repeat(43) })
@@ -152,10 +162,10 @@ describe("admin password and sessions", () => {
         type: "admin.state",
         admin: { enabled: true, loggedIn: false, endReason: "logout" }
       })
-      expect(await request(c, { type: "frontend.update", kind: WEB_VOICE_KIND, patch: {} })).toMatchObject({ ok: false, error: { code: "admin_required" } })
+      expect(await request(c, { type: "wake.test", on: false })).toMatchObject({ ok: false, error: { code: "admin_required" } })
     }
     // Another session is not affected.
-    expect((await request(other.client, { type: "frontend.update", kind: WEB_VOICE_KIND, patch: {} })).ok).toBe(true)
+    expect((await request(other.client, { type: "wake.test", on: false })).ok).toBe(true)
     const later = await connect(server)
     expect((await later.hello({ frontend: "admin", adminToken: a.token })).snapshot.admin.endReason).toBe("token")
     // Logging out when not logged in is ok too.
@@ -168,10 +178,10 @@ describe("admin password and sessions", () => {
     const quiet = await adminPage(server)
     for (let i = 0; i < 5; i++) {
       await sleep(200)
-      expect((await request(busy.client, { type: "frontend.update", kind: WEB_VOICE_KIND, patch: {} })).ok).toBe(true)
+      expect((await request(busy.client, { type: "wake.test", on: false })).ok).toBe(true)
     }
     expect(await quiet.client.waitFor("admin.state", (m) => !m.admin.loggedIn, { from: 0 })).toMatchObject({ admin: { loggedIn: false, endReason: "idle" } })
-    expect(await request(quiet.client, { type: "frontend.update", kind: WEB_VOICE_KIND, patch: {} })).toMatchObject({ ok: false, error: { code: "admin_required" } })
+    expect(await request(quiet.client, { type: "wake.test", on: false })).toMatchObject({ ok: false, error: { code: "admin_required" } })
     expect(busy.client.messages.filter((m) => m.type === "admin.state" && !m.admin.loggedIn)).toEqual([])
   })
 
@@ -181,7 +191,7 @@ describe("admin password and sessions", () => {
     const ended = page.client.waitFor("admin.state", (m) => !m.admin.loggedIn, { from: 0, timeoutMs: 3_000 })
     for (let i = 0; i < 3; i++) {
       await sleep(100)
-      await request(page.client, { type: "frontend.update", kind: WEB_VOICE_KIND, patch: {} })
+      await request(page.client, { type: "wake.test", on: false })
     }
     expect((await ended).admin).toEqual({ enabled: true, loggedIn: false, endReason: "expired" })
   })
@@ -204,8 +214,8 @@ const adminOnly: ReadonlyArray<RequestInput> = [
   { type: "job.start", tool: "stt-models", action: "download", target: "whisper-turbo" },
   { type: "job.cancel", jobId: "job-1" },
   { type: "model.delete", tool: "tts-models", target: "nl_NL-pim-medium" },
-  { type: "frontend.update", kind: WEB_VOICE_KIND, patch: { captions: false } },
-  { type: "device.admin.update", id: "device-0001", name: "x" },
+  { type: "device.save", target: { kind: "type", type: WEB_VOICE_KIND }, rev: 0, settings: { interruptMode: "manual" } },
+  { type: "device.save", target: { kind: "device", id: "device-0001" }, rev: 0, name: "x", settings: {} },
   { type: "device.forget", id: "device-0001" },
   { type: "wake.test", on: true }
 ]
@@ -213,8 +223,8 @@ const adminOnly: ReadonlyArray<RequestInput> = [
 /** What a voice connection may ever receive. */
 const VOICE_TYPES: ReadonlySet<ServerMessageType> = new Set<ServerMessageType>([
   "welcome", "session", "state", "transcript", "turn.start", "assistant.text", "assistant.playing", "tool.start", "tool.end",
-  "turn.end", "reply.start", "reply.end", "reply.stop", "result", "error", "engine.summary", "admin.state", "device.profile",
-  "wake", "pong"
+  "turn.end", "reply.start", "reply.end", "reply.stop", "result", "error", "engine.summary", "admin.state",
+  "wake", "pong", "device.setup", "conversation", "conversation.history"
 ])
 
 describe("role-shaped data", () => {
@@ -243,8 +253,8 @@ describe("role-shaped data", () => {
     expect((await request(admin.client, { type: "module.configure", moduleId: "greeter", patch: { values: { greeting: "hoi" }, secrets: { token: "tok-secret" } } })).ok).toBe(true)
     expect((await request(admin.client, { type: "vault.setup", password: "correct horse battery" })).ok).toBe(true)
     expect((await request(admin.client, { type: "vault.lock" })).ok).toBe(true)
-    expect((await request(admin.client, { type: "frontend.update", kind: WEB_VOICE_KIND, patch: { captions: false } })).ok).toBe(true)
-    expect((await request(admin.client, { type: "device.admin.update", id: voice.client.device.id, name: "Kitchen" })).ok).toBe(true)
+    expect((await request(admin.client, { type: "device.save", target: { kind: "type", type: WEB_VOICE_KIND }, rev: typeRev(admin.client), settings: { captions: { captions: false, speakTyped: true } } })).ok).toBe(true)
+    expect((await request(admin.client, { type: "device.save", target: { kind: "device", id: voice.client.device.id }, rev: deviceRev(admin.client, voice.client.device.id), name: "Kitchen", settings: {} })).ok).toBe(true)
     expect((await request(admin.client, { type: "wake.test", on: true })).ok).toBe(true)
     expect((await request(admin.client, { type: "engine.reload" })).ok).toBe(true)
     stt.emit(endOfTurn("hello there"))
@@ -272,96 +282,110 @@ describe("role-shaped data", () => {
 
 // ---------------------------------------------------------------------------
 
-describe("front-end kinds and devices", () => {
-  it("a device is recorded at hello; its own tabs may change voice, activation and follow-up only; changes reach every tab live", async () => {
+describe("devices", () => {
+  it("a device is recorded at hello; its setup reaches every tab; the admin's changes to it reach every tab live", async () => {
     const { server } = await start()
     const admin = await adminPage(server)
     const tab1 = await voicePage(server, { deviceId: "phone-0001" })
     const tab2 = await voicePage(server, { deviceId: "phone-0001" })
-    expect(tab1.welcome.snapshot.device).toEqual({
-      deviceId: "phone-0001",
-      profile: expect.objectContaining({ activation: "always", interruptMode: "instant", voice: "" }),
-      editable: ["voice", "activation", "followUpSeconds"]
-    })
+    expect(tab1.welcome.snapshot.setup).toMatchObject({ deviceId: "phone-0001", interruptMode: "instant", captions: { captions: true, speakTyped: true } })
+    expect(tab1.welcome.snapshot).not.toHaveProperty("device")
     const listed = await admin.client.waitFor("devices", (m) => m.devices.some((d) => d.id === "phone-0001" && d.connections === 2), { from: 0 })
-    expect(listed.devices.find((d) => d.id === "phone-0001")).toMatchObject({ kind: WEB_VOICE_KIND, name: "Test browser", overrides: {}, audioOwner: false })
+    expect(listed.devices.find((d) => d.id === "phone-0001")).toMatchObject({ kind: WEB_VOICE_KIND, name: "Test browser", own: {}, audioOwner: false })
+    expect(listed.devices.find((d) => d.id === "phone-0001")).not.toHaveProperty("overrides")
+    expect(listed.devices.find((d) => d.id === "phone-0001")).not.toHaveProperty("profile")
 
-    expect((await request(tab1.client, { type: "device.update", patch: { activation: "wake-phrase", followUpSeconds: 3, voice: "sherpa:en_US-lessac-medium" } })).ok).toBe(true)
-    for (const tab of [tab1, tab2]) {
-      const p = await profileOf(tab.client, (m) => m.profile.activation === "wake-phrase")
-      expect(p.profile).toMatchObject({ followUpSeconds: 3, voice: "sherpa:en_US-lessac-medium" })
-    }
-    await admin.client.waitFor("devices", (m) => m.devices.some((d) => d.overrides.activation === "wake-phrase"), { from: 0 })
-    // Not editable by the device itself; an unknown voice; a page without a device.
-    expect(await request(tab1.client, { type: "device.update", patch: { captions: false } })).toMatchObject({ ok: false, error: { code: "admin_required" } })
-    expect(await request(tab1.client, { type: "device.update", patch: { voice: "nope" } })).toMatchObject({
-      ok: false,
-      error: { code: "invalid_settings", fieldErrors: [{ key: "voice" }] }
+    // The admin saves the device's own interrupt and caption sections: both tabs get the new setup.
+    const save = await request(admin.client, {
+      type: "device.save",
+      target: { kind: "device", id: "phone-0001" },
+      rev: deviceRev(admin.client, "phone-0001"),
+      settings: { interruptMode: "manual", captions: { captions: false, speakTyped: true } }
     })
-    const bare = await connect(server)
-    const bareWelcome = await bare.hello({ device: false })
-    expect(bareWelcome.snapshot.device).toEqual({ profile: expect.objectContaining({ interruptMode: "instant" }), editable: [] })
-    expect(await request(bare, { type: "device.update", patch: { voice: null } })).toMatchObject({ ok: false, error: { code: "bad_message" } })
-    // `null` removes the device's own override.
-    expect((await request(tab2.client, { type: "device.update", patch: { followUpSeconds: null } })).ok).toBe(true)
-    expect((await profileOf(tab1.client, (m) => m.profile.followUpSeconds === 8)).profile.activation).toBe("wake-phrase")
+    expect(save.ok).toBe(true)
+    for (const tab of [tab1, tab2]) {
+      const p = await setupOf(tab.client, (m) => m.interruptMode === "manual")
+      expect(p.captions).toEqual({ captions: false, speakTyped: true })
+    }
+    await admin.client.waitFor("devices", (m) => m.devices.some((d) => d.own.interruptMode === "manual"), { from: 0 })
+    // `null` removes the own section: the device follows the type defaults again.
+    expect((await request(admin.client, {
+      type: "device.save",
+      target: { kind: "device", id: "phone-0001" },
+      rev: deviceRev(admin.client, "phone-0001"),
+      settings: { interruptMode: null }
+    })).ok).toBe(true)
+    await setupOf(tab1.client, (m) => m.interruptMode === "instant" && !m.captions.captions)
 
     const saved = JSON.parse(readFileSync(join(server.dataDir, "settings.json"), "utf8"))
-    expect(saved.version).toBe(3)
-    expect(saved.devices["phone-0001"]).toMatchObject({ kind: WEB_VOICE_KIND, name: "Test browser", overrides: { activation: "wake-phrase", voice: "sherpa:en_US-lessac-medium" } })
+    expect(saved.version).toBe(4)
+    expect(saved.devices["phone-0001"]).toMatchObject({ kind: WEB_VOICE_KIND, name: "Test browser", own: { captions: { captions: false } } })
+    expect(saved.devices["phone-0001"].own.interruptMode).toBeUndefined()
   })
 
-  it("admin: kind defaults and device overrides reach running devices live; rename, reset, forget; unknown ids", async () => {
+  it("admin: type defaults reach running devices live; own sections win; rename and forget; unknown ids", async () => {
     const { server } = await start()
     const admin = await adminPage(server)
     const a = await voicePage(server, { deviceId: "laptop-001" })
     const b = await voicePage(server, { deviceId: "tablet-001" })
     await deviceKnown(admin.client, "laptop-001")
     await deviceKnown(admin.client, "tablet-001")
+    await admin.client.waitFor("device.types", () => true, { from: 0 }).catch(() => undefined)
 
-    // Kind defaults: every device of the kind.
-    const fromAdmin = admin.client.messages.length
-    expect((await request(admin.client, { type: "frontend.update", kind: WEB_VOICE_KIND, patch: { captions: false, prebufferMs: 120 } })).ok).toBe(true)
-    for (const c of [a.client, b.client]) await profileOf(c, (m) => !m.profile.captions && m.profile.prebufferMs === 120)
-    const kinds = await admin.client.waitFor("frontends", () => true, { from: fromAdmin })
-    expect(kinds.frontends[0]).toMatchObject({ id: WEB_VOICE_KIND, defaults: { interruptMode: "instant", captions: false, prebufferMs: 120 }, profile: { captions: false } })
+    // Type defaults: every device of the type.
+    const defaults = await admin.client.waitFor("admin.snapshot", () => true, { from: 0 })
+    const type = defaults.snapshot.deviceTypes?.find((t) => t.kind === WEB_VOICE_KIND)
+    expect(type).toBeDefined()
+    expect((await request(admin.client, {
+      type: "device.save",
+      target: { kind: "type", type: WEB_VOICE_KIND },
+      rev: type!.rev,
+      settings: { captions: { captions: false, speakTyped: true }, audio: { ...type!.settings.audio, prebufferMs: 120 } }
+    })).ok).toBe(true)
+    for (const c of [a.client, b.client]) await setupOf(c, (m) => !m.captions.captions && m.audio.prebufferMs === 120)
 
-    // A device override wins over the kind; `null` resets it; rename.
-    expect((await request(admin.client, { type: "device.admin.update", id: "laptop-001", name: "Study laptop", patch: { captions: true } })).ok).toBe(true)
-    await profileOf(a.client, (m) => m.profile.captions)
+    // A device's own section wins over the type; rename.
+    expect((await request(admin.client, {
+      type: "device.save",
+      target: { kind: "device", id: "laptop-001" },
+      rev: deviceRev(admin.client, "laptop-001"),
+      name: "Study laptop",
+      settings: { captions: { captions: true, speakTyped: true } }
+    })).ok).toBe(true)
+    await setupOf(a.client, (m) => m.captions.captions && m.audio.prebufferMs === 120)
     const renamed = await admin.client.waitFor("devices", (m) => m.devices.some((d) => d.name === "Study laptop"), { from: 0 })
-    expect(renamed.devices.find((d) => d.id === "laptop-001")).toMatchObject({ overrides: { captions: true }, profile: { captions: true, prebufferMs: 120 } })
-    const bFrom = b.client.messages.length
-    expect((await request(admin.client, { type: "device.admin.update", id: "laptop-001", patch: { captions: null } })).ok).toBe(true)
-    const reset = a.client.messages.length
-    await profileOf(a.client, (m) => !m.profile.captions)
-    await sleep(50)
-    expect(b.client.types(bFrom)).not.toContain("device.profile") // b's profile did not change
-    void reset
+    expect(renamed.devices.find((d) => d.id === "laptop-001")).toMatchObject({ own: { captions: { captions: true } }, settings: { captions: { captions: true }, audio: { prebufferMs: 120 } } })
+    const sessionName = admin.client.messages.length
+    void sessionName
 
-    // Fields that do not exist for the kind, unknown kinds and devices.
-    expect(await request(admin.client, { type: "frontend.update", kind: "satellite", patch: {} })).toMatchObject({ ok: false, error: { code: "unknown_device" } })
-    expect(await request(admin.client, { type: "device.admin.update", id: "nobody-0001", patch: {} })).toMatchObject({ ok: false, error: { code: "unknown_device" } })
+    // Unknown devices and types.
+    expect(await request(admin.client, { type: "device.save", target: { kind: "device", id: "nobody-0001" }, rev: 0, settings: {} })).toMatchObject({ ok: false, error: { code: "unknown_device" } })
     expect(await request(admin.client, { type: "device.forget", id: "nobody-0001" })).toMatchObject({ ok: false, error: { code: "unknown_device" } })
 
-    // Forget a connected device: recorded again as new (kind defaults), its tab told.
-    expect((await request(admin.client, { type: "device.admin.update", id: "tablet-001", name: "Old tablet", patch: { activation: "wake-phrase" } })).ok).toBe(true)
-    await profileOf(b.client, (m) => m.profile.activation === "wake-phrase")
+    // Forget a connected device: recorded again as new (the type defaults), its tab told.
+    expect((await request(admin.client, {
+      type: "device.save",
+      target: { kind: "device", id: "tablet-001" },
+      rev: deviceRev(admin.client, "tablet-001"),
+      name: "Old tablet",
+      settings: { interruptMode: "manual" }
+    })).ok).toBe(true)
+    await setupOf(b.client, (m) => m.interruptMode === "manual")
     expect((await request(admin.client, { type: "device.forget", id: "tablet-001" })).ok).toBe(true)
-    await profileOf(b.client, (m) => m.profile.activation === "always" && m.deviceId === "tablet-001")
+    await setupOf(b.client, (m) => m.interruptMode === "instant" && m.deviceId === "tablet-001")
     const again = await admin.client.waitFor("devices", (m) => m.devices.some((d) => d.id === "tablet-001" && d.name === "Test browser"), { from: 0 })
-    expect(again.devices.find((d) => d.id === "tablet-001")?.overrides).toEqual({})
+    expect(again.devices.find((d) => d.id === "tablet-001")?.own).toEqual({})
   })
 
-  it("the device profile decides its session's echo-gate interrupt mode, live", async () => {
+  it("a device's interrupt mode decides its session's echo-gate mode, live", async () => {
     const { server, stt } = await start()
     const admin = await adminPage(server)
     const owner = await voicePage(server, { deviceId: "speaker-01" })
     await owner.client.claim()
     expect(server.handle.sessions.get("speaker-01")?.gate.mode()).toBe("instant")
     await deviceKnown(admin.client, "speaker-01")
-    expect((await request(admin.client, { type: "device.admin.update", id: "speaker-01", patch: { interruptMode: "manual" } })).ok).toBe(true)
-    await profileOf(owner.client, (m) => m.profile.interruptMode === "manual")
+    expect((await request(admin.client, { type: "device.save", target: { kind: "device", id: "speaker-01" }, rev: deviceRev(admin.client, "speaker-01"), settings: { interruptMode: "manual" } })).ok).toBe(true)
+    await setupOf(owner.client, (m) => m.interruptMode === "manual")
     expect(server.handle.sessions.get("speaker-01")?.gate.mode()).toBe("manual")
     // Manual: talking during the reply does not interrupt it.
     stt.emit(endOfTurn("tell me"))
@@ -370,9 +394,9 @@ describe("front-end kinds and devices", () => {
     const end = await owner.client.waitFor("turn.end", () => true, { timeoutMs: 10_000 })
     expect(end.outcome).toBe("completed")
     expect(owner.client.types()).not.toContain("reply.stop")
-    // Back to the kind default (instant).
-    expect((await request(admin.client, { type: "device.admin.update", id: "speaker-01", patch: { interruptMode: null } })).ok).toBe(true)
-    await profileOf(owner.client, (m) => m.profile.interruptMode === "instant")
+    // Back to the type default (instant).
+    expect((await request(admin.client, { type: "device.save", target: { kind: "device", id: "speaker-01" }, rev: deviceRev(admin.client, "speaker-01"), settings: { interruptMode: null } })).ok).toBe(true)
+    await setupOf(owner.client, (m) => m.interruptMode === "instant")
     expect(server.handle.sessions.get("speaker-01")?.gate.mode()).toBe("instant")
   })
 
@@ -384,8 +408,6 @@ describe("front-end kinds and devices", () => {
     const owner = await voicePage(server)
     expect(owner.welcome.snapshot.engine.voices.map((v) => v.name)).toEqual(["sherpa:en_US-lessac-medium"])
     await owner.client.claim()
-    // An old voice name is not a voice any more.
-    expect((await request(owner.client, { type: "device.update", patch: { voice: "natural" } })).ok).toBe(false)
     stt.emit(endOfTurn("hi"))
     const spoken = await owner.client.waitFor("assistant.text", () => true, { timeoutMs: 10_000 })
     expect(spoken.voice).toBe("sherpa:en_US-lessac-medium")
@@ -428,10 +450,16 @@ describe("wake phrase in serve mode", () => {
   it("phrase + request: a turn with the phrase removed, `wake` to everyone; then the follow-up window; then asleep again", async () => {
     const { stt, llm, owner, admin } = await wakeServer()
     stt.emit(speechStarted, interim("Hey Jeff, what"), endOfTurn("Hey Jeff, what time is it?"))
-    expect(await owner.waitFor("wake", () => true, { from: 0 })).toEqual({ type: "wake", phrase: "hey jeff", armed: false })
+    expect(await owner.waitFor("wake", () => true, { from: 0 })).toEqual({ type: "wake", phrase: "hey jeff", armed: false, assistantId: "assistant" })
     expect((await owner.waitFor("turn.start", () => true, { from: 0 })).userText).toBe("what time is it?")
     expect(owner.messages.filter((m) => m.type === "transcript").map((m) => (m as { text: string }).text)).toEqual(["what", ""])
-    expect(await admin.waitFor("wake.heard", () => true, { from: 0 })).toMatchObject({ text: "Hey Jeff, what time is it?", matched: "hey jeff", accepted: true })
+    // PR #35 review 6, finding 2: the line says which device it was heard on and whose phrase it matched there.
+    expect(await admin.waitFor("wake.heard", () => true, { from: 0 })).toMatchObject({
+      text: "Hey Jeff, what time is it?",
+      matched: "hey jeff",
+      accepted: true,
+      source: { deviceId: owner.device.id, assistantId: "assistant" }
+    })
     await owner.waitFor("turn.end", () => true, { from: 0, timeoutMs: 10_000 })
     expect(owner.messages.some((m) => m.type === "state" && m.state === "speaking")).toBe(true)
     // Follow-up (1 s): no phrase needed.
@@ -442,6 +470,7 @@ describe("wake phrase in serve mode", () => {
     const followUp = await admin.waitFor("wake.heard", (m) => m.text === "and tomorrow", { from: 0 })
     expect(followUp.accepted).toBe(true)
     expect(followUp.matched).toBeUndefined()
+    expect(followUp.source).toEqual({ deviceId: owner.device.id })
     await owner.waitFor("turn.end", () => true, { from, timeoutMs: 10_000 })
     // The window closes with nobody speaking: asleep again, and talk is ignored.
     await owner.waitFor("state", (m) => m.state === "asleep", { from, timeoutMs: 3_000 })
@@ -483,7 +512,7 @@ describe("wake phrase in serve mode", () => {
   it("the phrase alone arms the window: `wake` armed, listening, the next utterance needs no phrase", async () => {
     const { stt, owner } = await wakeServer()
     stt.emit(speechStarted, endOfTurn("Hey Jeff."))
-    expect(await owner.waitFor("wake", () => true, { from: 0 })).toEqual({ type: "wake", phrase: "hey jeff", armed: true })
+    expect(await owner.waitFor("wake", () => true, { from: 0 })).toEqual({ type: "wake", phrase: "hey jeff", armed: true, assistantId: "assistant" })
     await owner.waitFor("state", (m) => m.state === "listening", { from: 0 })
     await sleep(100)
     expect(owner.types()).not.toContain("turn.start")
@@ -504,14 +533,17 @@ describe("wake phrase in serve mode", () => {
     expect(other.client.types()).not.toContain("wake.heard")
   })
 
-  it("in `always` mode nothing is gated: every utterance is a turn, and the state is never asleep", async () => {
+  // WP-4b (docs/ASSISTANTS.md §6 "Behaviour changes"): the route gate matches and strips a leading phrase in every
+  // mode, so in `always` mode "Hey Jeff, hello" reaches the model as "hello", and the phrase is reported (`wake`).
+  it("in `always` mode nothing is gated: every utterance is a turn (a leading phrase stripped), and the state is never asleep", async () => {
     const { server, stt } = await start()
     const owner = await voicePage(server)
     await owner.client.claim()
     stt.emit(endOfTurn("Hey Jeff, hello"))
-    expect((await owner.client.waitFor("turn.start", () => true, { from: 0 })).userText).toBe("Hey Jeff, hello")
+    expect((await owner.client.waitFor("turn.start", () => true, { from: 0 })).userText).toBe("hello")
     await owner.client.waitFor("turn.end", () => true, { from: 0, timeoutMs: 10_000 })
     expect(owner.client.messages.some((m) => m.type === "state" && m.state === "asleep")).toBe(false)
-    expect(owner.client.types()).not.toContain("wake")
+    stt.emit(endOfTurn("good morning"))
+    expect((await owner.client.waitFor("turn.start", (m) => m.userText === "good morning", { from: 0 })).userText).toBe("good morning")
   })
 })

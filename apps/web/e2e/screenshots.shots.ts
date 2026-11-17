@@ -19,16 +19,6 @@ const captionHas = (page: Page, text: string) =>
 const DESKTOP: BrowserContextOptions = { viewport: { width: 1280, height: 800 } }
 const PHONE: BrowserContextOptions = { viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true, deviceScaleFactor: 2 }
 
-/** The next activation change from this page is rewritten to a field a device may not change itself: refused. */
-const refusedChange = (page: Page) =>
-  page.evaluate(() => {
-    const send = WebSocket.prototype.send
-    WebSocket.prototype.send = function(this: WebSocket, data) {
-      if (typeof data === "string" && data.includes("\"device.update\"")) data = data.replace(/"activation":"[a-z-]+"/, "\"captions\":false")
-      return send.call(this, data)
-    }
-  })
-
 const start = async (page: Page, baseURL: string | undefined) => {
   await page.goto(appUrl(baseURL))
   await page.getByTestId("start").click()
@@ -87,7 +77,7 @@ test.describe("voice, desktop, dark", () => {
 
   test("wake phrase: asleep, then the phrase alone", async ({ page, baseURL }) => {
     await mock.scenario("typed")
-    await mock.defaults({ activation: "wake-phrase" })
+    await mock.sleeps()
     await page.goto(appUrl(baseURL))
     await page.getByTestId("start").click()
     await expectVisualState(page, "asleep")
@@ -122,16 +112,6 @@ test.describe("voice, desktop, dark", () => {
     await expect(page.getByTestId("voice-sheet")).toBeVisible()
     await settle(page, 500)
     await shot(page, "voice-desktop-10-settings-sheet")
-    await page.getByTestId("voice-sheet").getByRole("radio", { name: "Wake phrase" }).click()
-    await expect(page.getByTestId("wake-phrases")).toBeVisible()
-    await settle(page, 400)
-    await shot(page, "voice-desktop-11-settings-sheet-wake-phrase")
-    // A refused change: the message stays next to the control, in the sheet.
-    await refusedChange(page)
-    await page.getByTestId("voice-sheet").getByRole("radio", { name: "Always listening" }).click()
-    await expect(page.getByTestId("sheet-error")).toBeVisible()
-    await settle(page, 400)
-    await shot(page, "voice-desktop-18-settings-sheet-error")
   })
 
   test("new conversation: the button, the divider, after a quiet while, too many devices", async ({ page, browser, baseURL }) => {
@@ -247,7 +227,6 @@ test.describe("voice, phone, dark", () => {
     await settle(page, 500)
     await shot(page, "voice-phone-06-settings-sheet")
     const sheet = page.getByTestId("voice-sheet")
-    await sheet.getByRole("radio", { name: "Wake phrase" }).tap()
     await sheet.getByTestId("sheet-more").getByText("More").tap()
     await sheet.getByTestId("admin-link").scrollIntoViewIfNeeded()
     await settle(page, 400)
@@ -277,7 +256,7 @@ test.describe("voice, phone, dark", () => {
 
   test("phone: asleep and woke, microphone error", async ({ page, browser, baseURL }) => {
     await mock.scenario("typed")
-    await mock.defaults({ activation: "wake-phrase" })
+    await mock.sleeps()
     await page.goto(appUrl(baseURL))
     await page.getByTestId("start").tap()
     await expectVisualState(page, "asleep")
@@ -375,7 +354,7 @@ test.describe("voice, light", () => {
     await shot(page, "voice-desktop-light-03-settings-sheet")
 
     await mock.scenario("typed")
-    await mock.defaults({ activation: "wake-phrase" })
+    await mock.sleeps()
     const phone = await otherPage(browser, PHONE, "light")
     await phone.page.goto(appUrl(baseURL))
     await phone.page.getByTestId("start").tap()
@@ -467,7 +446,7 @@ test.describe("admin, desktop, dark", () => {
     await shot(page, "admin-desktop-05-session-ended")
   })
 
-  test("overview, front end with the tester, devices, a device with overrides", async ({ page, browser, baseURL }) => {
+  test("overview with the grid, devices, a device with own sections, the defaults, the warning dialog", async ({ page, browser, baseURL }) => {
     await mock.scenario("devices")
     const voice = await someTurns(browser, baseURL)
     await loginAdmin(page, baseURL)
@@ -477,63 +456,45 @@ test.describe("admin, desktop, dark", () => {
     await page.getByTestId("sessions").scrollIntoViewIfNeeded()
     await settle(page)
     await shot(page, "admin-desktop-06b-overview-sessions")
-
-    await page.getByTestId("nav-frontends").click()
-    await expect(page.getByTestId("page-frontends-frontend")).toBeVisible()
+    await page.getByTestId("who-answers-where").scrollIntoViewIfNeeded()
     await settle(page)
-    await shot(page, "admin-desktop-07-front-end")
-    const form = page.getByTestId("profile-frontend-web-voice")
-    await form.getByRole("radio", { name: "Wake phrase" }).click()
-    // Idle: "Ready to test …" (it says "Testing …" only while listening).
-    await expect(page.getByTestId("tester-scope")).toContainText("Ready to test")
-    await page.getByTestId("phrase-tester").scrollIntoViewIfNeeded()
-    await settle(page)
-    await shot(page, "admin-desktop-07b-tester-ready")
-    await page.getByTestId("tester-listen").click()
-    // All three outcomes: matched, accepted without a phrase (the device was listening), ignored.
-    await mock.heard("Hey Jeff", "hey jeff", true)
-    await mock.heard("And what about tomorrow?", undefined, true)
-    await mock.heard("Hey go, what's the weather?", undefined, false)
-    await mock.heard("Hey Jeff, set a timer for ten minutes", "hey jeff", true)
-    await expect(page.getByTestId("heard-lines").locator("li")).toHaveCount(4)
-    await page.getByTestId("phrase-tester").scrollIntoViewIfNeeded()
-    await page.getByTestId("settings-page").evaluate((el) => el.scrollBy(0, 120))
-    await settle(page)
-    await shot(page, "admin-desktop-08-front-end-tester")
-    await page.getByTestId("add-heard").click()
-    await expect(page.getByTestId("tester-unsaved")).toBeVisible()
-    await page.getByTestId("phrase-tester").scrollIntoViewIfNeeded()
-    await settle(page)
-    await shot(page, "admin-desktop-08b-tester-unsaved-changes")
-    await page.getByTestId("page-footer").getByRole("button", { name: "Cancel" }).click()
-
-    // "Custom" (saved, not the default) and "Unsaved" (an edit), on one page.
-    await form.locator("[data-field=captions]").getByRole("switch").click()
-    await page.getByTestId("page-footer").getByRole("button", { name: "Save", exact: true }).click()
-    await expect(page.getByTestId("footer-note")).toContainText("Saved")
-    await form.locator("[data-field=speakReplies]").getByRole("switch").click()
-    await form.locator("[data-field=captions]").getByRole("switch").click()
-    await form.locator("[data-group=display]").scrollIntoViewIfNeeded()
-    await settle(page)
-    await shot(page, "admin-desktop-19-unsaved-and-custom")
-    await page.getByTestId("page-footer").getByRole("button", { name: "Cancel" }).click()
-    await form.locator("[data-field=captions]").getByTestId("reset").click()
-    await page.getByTestId("page-footer").getByRole("button", { name: "Save", exact: true }).click()
-    await expect(page.getByTestId("footer-note")).toContainText("Saved")
+    await shot(page, "admin-desktop-56-overview-grid")
 
     await page.getByTestId("nav-devices").click()
     await expect(page.getByTestId("device-list")).toBeVisible()
+    await page.mouse.move(2, 2)
     await settle(page)
-    await shot(page, "admin-desktop-09-devices")
+    await shot(page, "admin-desktop-52-devices-list")
+    await page.getByTestId("device-list").locator("[data-device='type:web-voice']").click()
+    await expect(page.getByTestId("page-devices-device-type")).toBeVisible()
+    await page.mouse.move(2, 2)
+    await settle(page)
+    await shot(page, "admin-desktop-53-defaults-page")
+    await page.getByTestId("nav-devices").click()
     await page.getByTestId("device-list").locator("[data-device=d-kitchen-ipad-0001]").click()
     await expect(page.getByTestId("page-devices-device")).toBeVisible()
-    await page.getByTestId("settings-page").evaluate((el) => el.scrollBy(0, 230))
+    await page.mouse.move(2, 2)
+    await settle(page)
+    await shot(page, "admin-desktop-54-device-own-sections")
+    await page.getByTestId("settings-page").evaluate((el) => el.scrollBy(0, 560))
     await settle(page)
     await shot(page, "admin-desktop-10-device")
+    await page.getByTestId("forget").scrollIntoViewIfNeeded()
     await page.getByTestId("forget").click()
     await settle(page)
     await shot(page, "admin-desktop-11-device-forget")
     await page.getByRole("button", { name: "Keep it" }).click()
+
+    // The warning: Keuken added to the phone with no phrase cannot be reached, so saving asks first.
+    await gotoAdmin(page, baseURL, "#settings/devices/d-pixel-phone-0002")
+    await page.getByLabel("Assistant to add").selectOption("keuken")
+    await page.getByTestId("add-assistant").click()
+    await page.getByTestId("page-footer").getByRole("button", { name: "Save", exact: true }).click()
+    await expect(page.getByTestId("warnings-dialog")).toBeVisible()
+    await settle(page, 250)
+    await shot(page, "admin-desktop-55-device-unreachable-warning")
+    await page.getByRole("button", { name: "Go back" }).click()
+    await page.getByTestId("page-footer").getByRole("button", { name: "Cancel" }).click()
 
     await page.getByTestId("nav-diagnostics").click()
     await page.getByTestId("nav-diagnostics-latency").click()
@@ -542,30 +503,20 @@ test.describe("admin, desktop, dark", () => {
     await voice.ctx.close()
   })
 
-  test("language model, speech, a module in error", async ({ page, baseURL }) => {
+  test("shared settings: the navigation, the accounts, a module in error", async ({ page, baseURL }) => {
     await mock.scenario("modules")
-    await loginAdmin(page, baseURL, "#settings/language-model/provider")
-    await page.getByTestId("form-s-language-model").getByRole("radio", { name: /Claude subscription/ }).click()
-    await expect(page.getByTestId("option-module")).toBeVisible()
-    await page.getByTestId("option-module").scrollIntoViewIfNeeded()
+    await loginAdmin(page, baseURL, "#settings/shared/accounts")
+    await expect(page.getByTestId("page-shared-accounts")).toBeVisible()
+    await page.mouse.move(2, 2)
     await settle(page)
-    await shot(page, "admin-desktop-12-language-model")
-    await page.getByTestId("page-footer").getByRole("button", { name: "Cancel" }).click()
-    await page.getByTestId("nav-speech").click()
-    await page.getByTestId("nav-speech-engine").click()
-    await page.getByTestId("form-s-stt-engine").getByRole("radio", { name: /Deepgram/ }).click()
-    await page.getByTestId("page-footer").getByRole("button", { name: "Save", exact: true }).click()
-    await expect(page.getByTestId("save-warnings")).toBeVisible()
-    await settle(page)
-    await shot(page, "admin-desktop-13-speech-warnings")
-    await page.getByTestId("page-footer").getByRole("button", { name: "Go back" }).click()
-    await page.getByTestId("page-footer").getByRole("button", { name: "Cancel" }).click()
-    await page.getByTestId("nav-modules").click()
-    await page.getByTestId("nav-modules-home-assistant").click()
+    await shot(page, "admin-desktop-57-shared-settings-navigation")
+    // Home Assistant's instance fails (a capability runs while an assistant has it on: there is no switch to press).
+    await fetch(`${MOCK}/mock/module-error`, { method: "POST", body: JSON.stringify({ module: "home-assistant", message: "Home Assistant rejected the token (HTTP 401). Create a new long-lived token and paste it here." }) })
+    await page.getByTestId("nav-shared-modules").click()
     const ha = page.getByTestId("module-home-assistant")
-    await ha.getByRole("switch").click()
     await expect(ha).toHaveAttribute("data-state", "error")
-    await page.waitForTimeout(6200) // let the toast go
+    await ha.scrollIntoViewIfNeeded()
+    await settle(page)
     await shot(page, "admin-desktop-17-module-error")
   })
 
@@ -575,22 +526,22 @@ test.describe("admin, desktop, dark", () => {
     await expect(page.getByTestId("keys-panel")).toHaveAttribute("data-view", "unlock")
     await settle(page)
     await shot(page, "admin-desktop-14-keys-locked")
-    await gotoAdmin(page, baseURL, "#settings/language-model/provider")
+    await gotoAdmin(page, baseURL, "#settings/shared/accounts")
     await expect(page.getByTestId("keys-locked")).toBeVisible()
     await settle(page)
     await shot(page, "admin-desktop-15-protected-page-locked")
     // Every mark in the list at once, each in the legend: unsaved (an edit), to set up, a problem, padlock.
-    await gotoAdmin(page, baseURL, "#settings/speech/turn-timing")
+    await gotoAdmin(page, baseURL, "#settings/shared/limits")
     await page.evaluate(() => {
       const c = (window as unknown as { __pva: { store: { get: () => { engine: Record<string, unknown> }; dispatch: (a: unknown) => void } } }).__pva
       c.store.dispatch({ type: "engine", engine: { ...c.store.get().engine, problems: [{ stage: "tts", message: "Piper: the voice file is missing." }] } })
     })
-    await page.getByTestId("settings-page").locator("input[type=number]").first().fill("700")
+    await page.getByTestId("settings-page").locator("input[type=number]").first().fill("3")
     await expect(page.getByTestId("marks-legend").locator("[data-legend]")).toHaveCount(4)
     await settle(page)
     await shot(page, "admin-desktop-20-nav-legend")
     await page.getByTestId("page-footer").getByRole("button", { name: "Cancel" }).click()
-    await gotoAdmin(page, baseURL, "#settings/language-model/provider")
+    await gotoAdmin(page, baseURL, "#settings/shared/accounts")
     await page.getByTestId("unlock-form-page").getByLabel("Vault password").fill("correct horse battery")
     await page.getByTestId("unlock-form-page").getByRole("button", { name: "Unlock" }).click()
     await expect(page.getByTestId("keys-locked")).toHaveCount(0)
@@ -608,7 +559,7 @@ test.describe("admin, desktop, dark", () => {
 test.describe("admin, phone, dark", () => {
   test.use({ colorScheme: "dark", ...PHONE })
 
-  test("phone: login, the drill-down levels, front end, devices, device", async ({ page, browser, baseURL }) => {
+  test("phone: login, the drill-down levels, devices, device, overview", async ({ page, browser, baseURL }) => {
     await mock.scenario("devices")
     const voice = await someTurns(browser, baseURL)
     await page.goto(adminUrl(baseURL))
@@ -621,28 +572,14 @@ test.describe("admin, phone, dark", () => {
     await expect(settings).toHaveAttribute("data-level", "list")
     await settle(page)
     await shot(page, "admin-phone-02-categories")
-    await page.getByTestId("nav-speech").tap()
+    await page.getByTestId("nav-shared").tap()
     await expect(settings).toHaveAttribute("data-level", "pages")
     await settle(page)
     await shot(page, "admin-phone-03-category-pages")
-    await page.getByTestId("nav-speech-engine").tap()
-    await page.getByTestId("form-s-stt-engine").getByRole("radio", { name: /Deepgram/ }).tap()
+    await page.getByTestId("nav-shared-limits").tap()
+    await page.locator("[data-field=MAX_VOICE_SESSIONS]").getByRole("spinbutton").fill("3")
     await settle(page)
     await shot(page, "admin-phone-04-page")
-    await page.getByTestId("page-footer").getByRole("button", { name: "Cancel" }).tap()
-
-    await gotoAdmin(page, baseURL, "#settings/frontends/web-voice")
-    await settle(page)
-    await shot(page, "admin-phone-05-front-end")
-    await page.getByTestId("profile-frontend-web-voice").getByRole("radio", { name: "Wake phrase" }).tap()
-    await page.getByTestId("tester-listen").tap()
-    await mock.heard("Hey Jeff", "hey jeff", true)
-    await mock.heard("And tomorrow?", undefined, true)
-    await mock.heard("Hey go, what's the weather?", undefined, false)
-    await expect(page.getByTestId("heard-lines").locator("li")).toHaveCount(3)
-    await page.getByTestId("phrase-tester").scrollIntoViewIfNeeded()
-    await settle(page)
-    await shot(page, "admin-phone-06-front-end-tester")
     await page.getByTestId("page-footer").getByRole("button", { name: "Cancel" }).tap()
 
     await gotoAdmin(page, baseURL, "#settings/devices")
@@ -654,6 +591,13 @@ test.describe("admin, phone, dark", () => {
     await page.getByTestId("settings-page").evaluate((el) => el.scrollBy(0, 420))
     await settle(page)
     await shot(page, "admin-phone-08-device")
+    await gotoAdmin(page, baseURL, "#settings/devices/d-kitchen-ipad-0001")
+    await settle(page)
+    await shot(page, "admin-phone-21-device-own-sections")
+    await gotoAdmin(page, baseURL, "#settings/overview/overview")
+    await page.getByTestId("who-answers-where").scrollIntoViewIfNeeded()
+    await settle(page)
+    await shot(page, "admin-phone-22-overview-grid")
     await voice.ctx.close()
   })
 
@@ -665,9 +609,9 @@ test.describe("admin, phone, dark", () => {
     await expect(page.getByTestId("device-list")).toBeVisible()
     await settle(page)
     await shot(page, "admin-phone-320-01-devices")
-    await gotoAdmin(page, baseURL, "#settings/frontends/web-voice")
+    await gotoAdmin(page, baseURL, "#settings/devices/d-kitchen-ipad-0001")
     await settle(page)
-    await shot(page, "admin-phone-320-02-front-end")
+    await shot(page, "admin-phone-320-02-device")
     await voice.ctx.close()
   })
 
@@ -689,40 +633,17 @@ test.describe("admin, light", () => {
     await expect(page.getByTestId("login-form")).toBeVisible()
     await settle(page)
     await shot(page, "admin-desktop-light-01-login")
-    await loginAdmin(page, baseURL, "#settings/frontends/web-voice")
+    await loginAdmin(page, baseURL, "#settings/devices/d-kitchen-ipad-0001")
     await settle(page)
-    await shot(page, "admin-desktop-light-02-front-end")
+    await shot(page, "admin-desktop-light-02-device")
     await page.getByTestId("nav-devices").click()
     await expect(page.getByTestId("device-list")).toBeVisible()
     await settle(page)
     await shot(page, "admin-desktop-light-03-devices")
-
-    // The tester with matched and ignored lines, then saved.
-    await page.getByTestId("nav-frontends").click()
-    await page.getByTestId("profile-frontend-web-voice").getByRole("radio", { name: "Wake phrase" }).click()
-    await page.getByTestId("tester-listen").click()
-    await mock.heard("Hey Jeff", "hey jeff", true)
-    await mock.heard("And tomorrow?", undefined, true)
-    await mock.heard("Hey go, what's the weather?", undefined, false)
-    await expect(page.getByTestId("heard-lines").locator("li")).toHaveCount(3)
-    await page.getByTestId("phrase-tester").scrollIntoViewIfNeeded()
+    await page.getByTestId("nav-overview").click()
+    await page.getByTestId("who-answers-where").scrollIntoViewIfNeeded()
     await settle(page)
-    await shot(page, "admin-desktop-light-04-tester-matched")
-    await page.getByTestId("page-footer").getByRole("button", { name: "Save", exact: true }).click()
-    await expect(page.getByTestId("footer-note")).toContainText("Saved")
-    await settle(page)
-    await shot(page, "admin-desktop-light-05-saved")
-
-    // A save with a warning: only "Save anyway" and "Go back".
-    await page.getByTestId("nav-speech").click()
-    await page.getByTestId("nav-speech-engine").click()
-    await page.getByTestId("form-s-stt-engine").getByRole("radio", { name: /Deepgram/ }).click()
-    await page.getByTestId("page-footer").getByRole("button", { name: "Save", exact: true }).click()
-    await expect(page.getByTestId("save-warnings")).toBeVisible()
-    await settle(page)
-    await shot(page, "admin-desktop-light-06-speech-warnings")
-    await page.getByTestId("page-footer").getByRole("button", { name: "Go back" }).click()
-    await page.getByTestId("page-footer").getByRole("button", { name: "Cancel" }).click()
+    await shot(page, "admin-desktop-light-17-overview-grid")
 
     // The login back-off.
     await mock.scenario("admin-backoff")
@@ -742,6 +663,127 @@ test.describe("admin, light", () => {
     await settle(phone.page)
     await shot(phone.page, "admin-phone-light-01-categories")
     await phone.ctx.close()
+  })
+})
+
+// ---------------------------------------------------------------------------------------------------------------
+// The assistants' admin pages that finish the work (docs/ASSISTANTS.md WP-12, WP-14, WP-15): own module settings, the
+// shared Modules page with its instances, Home, Routing, a device with TypeSafe, and Latency with every route kind.
+// ---------------------------------------------------------------------------------------------------------------
+
+const post = (path: string, body: unknown) => fetch(`${MOCK}${path}`, { method: "POST", body: JSON.stringify(body) })
+const KITCHEN_ID = "d-kitchen-ipad-0001"
+
+test.describe("admin, assistants finished, desktop, dark", () => {
+  test.use({ colorScheme: "dark", ...DESKTOP })
+
+  test("own module settings, shared Modules, Home, Routing, a device with TypeSafe, Latency", async ({ page, baseURL }) => {
+    await mock.scenario("latency")
+    await post("/mock/typesafe", { on: false })
+    // An assistant's own module settings: T3's Clock has its own date format; Jeff's Weather one just chosen and refused.
+    await loginAdmin(page, baseURL, "#settings/assistants/t3/modules")
+    await expect(page.getByTestId("assistant-page")).toBeVisible()
+    await page.locator("[data-module=clock]").scrollIntoViewIfNeeded()
+    await page.mouse.move(2, 2)
+    await settle(page, 400)
+    await shot(page, "admin-desktop-58-assistant-own-module-settings")
+    await gotoAdmin(page, baseURL, "#settings/assistants/jeff/modules")
+    const weather = page.locator("[data-module=weather]")
+    await weather.getByTestId("use-own").click()
+    await weather.locator("[data-field='modules.weather.own.defaultPlace']").getByRole("textbox").fill("Atlantis")
+    await page.getByTestId("page-footer").getByRole("button", { name: "Save", exact: true }).click()
+    await expect(weather.getByTestId("field-error")).toBeVisible()
+    await weather.scrollIntoViewIfNeeded()
+    await page.mouse.move(2, 2)
+    await settle(page, 400)
+    await shot(page, "admin-desktop-59-assistant-own-module-error")
+    await page.getByTestId("page-footer").getByRole("button", { name: "Cancel" }).click()
+    // Shared settings: Modules (who uses what, the instances), Home, Routing.
+    await gotoAdmin(page, baseURL, "#settings/shared/modules")
+    await expect(page.getByTestId("module-block-clock")).toBeVisible()
+    await page.mouse.move(2, 2)
+    await settle(page, 400)
+    await shot(page, "admin-desktop-60-shared-modules")
+    await gotoAdmin(page, baseURL, "#settings/shared/home")
+    await expect(page.getByTestId("form-s-home")).toBeVisible()
+    await page.getByTestId("form-s-home").locator("[data-field=HOME_LOCATION]").getByRole("textbox").fill("Utrecht, Netherlands")
+    await page.mouse.move(2, 2)
+    await settle(page, 350)
+    await shot(page, "admin-desktop-61-shared-home")
+    await page.getByTestId("page-footer").getByRole("button", { name: "Cancel" }).click()
+    await gotoAdmin(page, baseURL, "#settings/shared/routing")
+    await expect(page.getByTestId("routing-intro")).toBeVisible()
+    await page.mouse.move(2, 2)
+    await settle(page, 350)
+    await shot(page, "admin-desktop-62-shared-routing-off")
+    // TypeSafe set up: the device page offers it, chosen with its box.
+    await post("/mock/typesafe", { on: true })
+    await gotoAdmin(page, baseURL, `#settings/devices/${KITCHEN_ID}`)
+    await page.getByTestId("without-phrase").selectOption("typesafe")
+    await expect(page.getByTestId("typesafe-box")).toBeVisible()
+    await page.getByTestId("without-phrase").evaluate((el) => el.scrollIntoView({ block: "start" }))
+    await page.getByTestId("settings-page").evaluate((el) => el.scrollBy(0, -140))
+    await page.mouse.move(2, 2)
+    await settle(page, 350)
+    await shot(page, "admin-desktop-63-device-typesafe")
+    await page.getByTestId("page-footer").getByRole("button", { name: "Cancel" }).click()
+    // Latency: the ten columns, a filter, the popover.
+    await gotoAdmin(page, baseURL, "#settings/diagnostics/latency")
+    await expect(page.getByTestId("trace-row")).toHaveCount(13)
+    await page.mouse.move(2, 2)
+    await settle(page, 400)
+    await shot(page, "admin-desktop-64-latency-columns")
+    await page.getByTestId("filter-device").selectOption({ label: "Kitchen iPad" })
+    await settle(page, 300)
+    await shot(page, "admin-desktop-65-latency-filtered")
+    await page.getByTestId("filter-device").selectOption("all")
+    await page.locator("[data-testid=trace-row][data-turn='41']").getByTestId("trace-assistant").hover()
+    await expect(page.getByTestId("trace-popover")).toBeVisible()
+    await settle(page, 250)
+    await shot(page, "admin-desktop-66-latency-popover")
+    await page.mouse.move(2, 2)
+    await page.locator("[data-testid=trace-row][data-turn='44']").getByTestId("trace-toggle").click()
+    await page.locator("[data-testid=trace-row][data-turn='41']").getByTestId("trace-toggle").click()
+    await settle(page, 300)
+    await shot(page, "admin-desktop-67-latency-open-rows")
+  })
+})
+
+test.describe("admin, assistants finished, desktop, light", () => {
+  test.use({ colorScheme: "light", ...DESKTOP })
+
+  test("Latency with its popover, and the shared Modules", async ({ page, baseURL }) => {
+    await mock.scenario("latency")
+    await loginAdmin(page, baseURL, "#settings/diagnostics/latency")
+    await expect(page.getByTestId("trace-row")).toHaveCount(13)
+    await page.locator("[data-testid=trace-row][data-turn='42']").getByTestId("trace-assistant").hover()
+    await expect(page.getByTestId("trace-popover")).toBeVisible()
+    await settle(page, 300)
+    await shot(page, "admin-desktop-light-18-latency-popover")
+    await gotoAdmin(page, baseURL, "#settings/shared/modules")
+    await page.mouse.move(2, 2)
+    await settle(page, 350)
+    await shot(page, "admin-desktop-light-19-shared-modules")
+  })
+})
+
+test.describe("admin, assistants finished, phone, dark", () => {
+  test.use({ colorScheme: "dark", ...PHONE })
+
+  test("own module settings, Latency", async ({ page, baseURL }) => {
+    await mock.scenario("latency")
+    await loginAdmin(page, baseURL, "#settings/assistants/t3/modules")
+    await expect(page.getByTestId("assistant-page")).toBeVisible()
+    await page.locator("[data-module=clock]").scrollIntoViewIfNeeded()
+    await settle(page, 400)
+    await shot(page, "admin-phone-23-assistant-own-module-settings")
+    await gotoAdmin(page, baseURL, "#settings/diagnostics/latency")
+    await expect(page.getByTestId("trace-row")).toHaveCount(13)
+    await settle(page, 400)
+    await shot(page, "admin-phone-24-latency")
+    await page.locator("[data-testid=trace-row][data-turn='44']").getByTestId("trace-toggle").tap()
+    await settle(page, 300)
+    await shot(page, "admin-phone-25-latency-open-row")
   })
 })
 
@@ -771,18 +813,18 @@ test.describe("admin, long wake phrase, 320 px", () => {
     await expect(page.getByTestId("device-list").locator("[data-device=d-living-room-0003]")).toBeVisible()
     await settle(page)
     await shot(page, "admin-phone-320-03-long-phrase-devices")
-    await gotoAdmin(page, baseURL, "#settings/frontends/web-voice")
-    await expect(page.getByTestId("page-title")).toHaveText("Voice assistant in a browser")
+    await gotoAdmin(page, baseURL, "#settings/devices/d-living-room-0003")
+    await expect(page.getByTestId("page-title")).toHaveText("Living room tablet")
     await settle(page)
     await shot(page, "admin-phone-320-04-full-title")
-    await page.getByTestId("phrase-list").evaluate((el) => el.scrollIntoView({ block: "center" }))
+    await page.getByTestId("phrases").first().evaluate((el) => el.scrollIntoView({ block: "center" }))
     await settle(page)
     await shot(page, "admin-phone-320-05-long-phrase-editor")
   })
 })
 
 /**
- * The voice picker (docs/VOICE-PROVIDERS.md §4) on Voices › Voices: the closed button, then the popup with
+ * The voice picker (docs/VOICE-PROVIDERS.md §4) on an assistant's Voice tab: the closed button, then the popup with
  * Favourites, one provider, a download in progress, a preview playing, a search across providers, and a provider
  * that needs a key. `names`: the file name of each, in that order.
  */
@@ -796,7 +838,7 @@ const pickerShots = async (page: Page, baseURL: string | undefined, names: {
   readonly needsKey: string
 }, phone = false) => {
   await mock.scenario("typed")
-  await loginAdmin(page, baseURL, "#settings/voices/overview")
+  await loginAdmin(page, baseURL, "#settings/assistants/jeff/voice")
   const picker = page.getByTestId("voice-picker")
   const popup = page.getByTestId("voice-popup")
   const press = (l: ReturnType<Page["locator"]>) => (phone ? l.tap() : l.click())
@@ -876,5 +918,295 @@ test.describe("voice picker, phone, dark", () => {
       search: "admin-phone-14-voice-picker-search",
       needsKey: "admin-phone-15-voice-picker-needs-key"
     }, true)
+  })
+})
+
+/**
+ * The model pickers (docs/MODEL-PICKERS.md) on Jeff's Language model and Hearing tabs: the closed pill, the popup on
+ * Favourites, on a provider, on a provider that is not set up, a search, the typed model, a failed list; the
+ * recogniser with a download in progress.
+ */
+const modelForce = (provider: string, state: string) => fetch(`${MOCK}/mock/models/state`, { method: "POST", body: JSON.stringify({ provider, state }) })
+
+const modelShots = async (page: Page, baseURL: string | undefined, names: {
+  readonly closed?: string
+  readonly favourites?: string
+  readonly provider?: string
+  readonly notSetUp?: string
+  readonly search?: string
+  readonly custom?: string
+  readonly failed?: string
+  readonly hearingClosed?: string
+  readonly hearingDownload?: string
+}, phone = false) => {
+  await mock.scenario("devices")
+  const press = (l: ReturnType<Page["locator"]>) => (phone ? l.tap() : l.click())
+  const picker = page.getByTestId("model-picker")
+  const popup = page.getByTestId("model-popup")
+  const tab = (id: string) => page.getByTestId("model-rail").locator(`[data-tab="${id}"]`)
+  const opened = async () => {
+    await press(picker)
+    await expect(popup.getByTestId("model-row").first()).toBeVisible()
+    await settle(page, 400)
+  }
+  if (names.closed !== undefined || names.favourites !== undefined || names.provider !== undefined || names.notSetUp !== undefined || names.search !== undefined || names.custom !== undefined || names.failed !== undefined) {
+    await loginAdmin(page, baseURL, "#settings/assistants/jeff/model")
+    await expect(picker).toContainText("Claude Haiku 5.5")
+    await page.mouse.move(2, 2)
+    await settle(page)
+    if (names.closed !== undefined) await shot(page, names.closed)
+    await opened()
+    if (names.favourites !== undefined) await shot(page, names.favourites)
+    if (names.provider !== undefined) {
+      await press(tab("anthropic"))
+      await settle(page)
+      await shot(page, names.provider)
+    }
+    if (names.notSetUp !== undefined) {
+      await press(tab("openrouter"))
+      await expect(popup.getByTestId("provider-needs-key")).toBeVisible()
+      await settle(page)
+      await shot(page, names.notSetUp)
+    }
+    if (names.search !== undefined) {
+      await modelForce("openrouter", "ready")
+      await popup.getByTestId("model-refresh").click()
+      await expect(tab("openrouter")).not.toHaveAttribute("data-trouble", /./)
+      await popup.getByTestId("model-search").fill("haiku")
+      await expect(popup.getByTestId("model-list")).toHaveAttribute("data-mode", "search")
+      await settle(page)
+      await shot(page, names.search)
+    }
+    if (names.custom !== undefined) {
+      await press(tab("anthropic"))
+      await popup.getByTestId("model-typed-input").scrollIntoViewIfNeeded()
+      await popup.getByTestId("model-typed-input").fill("claude-sonnet-4-5")
+      await settle(page)
+      await shot(page, names.custom)
+    }
+    if (names.failed !== undefined) {
+      await modelForce("anthropic", "failed")
+      await popup.getByTestId("model-refresh").click()
+      await expect(popup.getByTestId("provider-error")).toBeVisible()
+      await settle(page)
+      await shot(page, names.failed)
+    }
+  }
+  if (names.hearingClosed !== undefined || names.hearingDownload !== undefined) {
+    await loginAdmin(page, baseURL, "#settings/assistants/jeff/hearing")
+    await expect(picker).toContainText("Parakeet v2")
+    await page.mouse.move(2, 2)
+    await settle(page)
+    if (names.hearingClosed !== undefined) await shot(page, names.hearingClosed)
+    if (names.hearingDownload !== undefined) {
+      await opened()
+      await press(tab("sherpa"))
+      const whisper = popup.locator("[data-model='sherpa:whisper-turbo']")
+      await press(whisper.locator("[data-action=download]"))
+      await expect.poll(async () => Number(await whisper.getByRole("progressbar").getAttribute("aria-valuenow") ?? 0)).toBeGreaterThanOrEqual(30)
+      await shot(page, names.hearingDownload)
+      await press(whisper.locator("[data-action=cancel]"))
+    }
+  }
+}
+
+test.describe("model pickers, desktop, dark", () => {
+  test.use({ colorScheme: "dark", ...DESKTOP })
+  test("the Language model tab closed, favourites, a provider, not set up, search, a typed model, a failed list", async ({ page, baseURL }) => {
+    await modelShots(page, baseURL, {
+      closed: "admin-desktop-68-model-picker-closed",
+      favourites: "admin-desktop-69-model-picker-favourites",
+      provider: "admin-desktop-70-model-picker-provider",
+      notSetUp: "admin-desktop-71-model-picker-not-set-up",
+      search: "admin-desktop-72-model-picker-search",
+      custom: "admin-desktop-73-model-picker-custom",
+      failed: "admin-desktop-74-model-picker-failed"
+    })
+  })
+  test("the Hearing tab closed, and its popup with a download in progress", async ({ page, baseURL }) => {
+    await modelShots(page, baseURL, { hearingClosed: "admin-desktop-75-hearing-picker-closed", hearingDownload: "admin-desktop-76-hearing-picker-download" })
+  })
+})
+
+test.describe("model pickers, desktop, light", () => {
+  test.use({ colorScheme: "light", ...DESKTOP })
+  test("the language model popup on a provider", async ({ page, baseURL }) => {
+    await modelShots(page, baseURL, { provider: "admin-desktop-light-20-model-picker-provider" })
+  })
+  test("the recogniser popup with a download", async ({ page, baseURL }) => {
+    await modelShots(page, baseURL, { hearingDownload: "admin-desktop-light-21-hearing-picker-download" })
+  })
+})
+
+test.describe("model pickers, phone, dark", () => {
+  test.use({ colorScheme: "dark", ...PHONE })
+  test("the language model bottom sheet: favourites, not set up", async ({ page, baseURL }) => {
+    await modelShots(page, baseURL, { favourites: "admin-phone-26-model-picker-favourites", notSetUp: "admin-phone-27-model-picker-not-set-up" }, true)
+  })
+  test("the recogniser bottom sheet with a download", async ({ page, baseURL }) => {
+    await modelShots(page, baseURL, { hearingDownload: "admin-phone-28-hearing-picker-download" }, true)
+  })
+})
+
+// ---------------------------------------------------------------------------------------------------------------
+// Admin › Assistants (docs/ASSISTANTS.md §7.1, mock-up docs/mockups/assistants/admin.html)
+// ---------------------------------------------------------------------------------------------------------------
+
+/** Open an assistant's tab (or the list), logging in on first use; the pointer is parked so no row shows its hover. */
+const assistantsAt = async (page: Page, baseURL: string | undefined, hash: string) => {
+  await loginAdmin(page, baseURL, `#settings/assistants/${hash}`)
+  await expect(page.getByTestId(hash === "all" ? "assistant-list" : "assistant-page")).toBeVisible()
+  await page.mouse.move(2, 2)
+  await settle(page, 400)
+}
+
+test.describe("admin, assistants, desktop, dark", () => {
+  test.use({ colorScheme: "dark", ...DESKTOP })
+
+  test("the list, every tab, the delete dialog, a refused field, an assistant changed elsewhere", async ({ page, baseURL }) => {
+    await mock.scenario("devices")
+    await assistantsAt(page, baseURL, "all")
+    await shot(page, "admin-desktop-30-assistants-list")
+    const tab = (k: string) => page.locator(`[role=tab][data-tab=${k}]`)
+    const at = async (k: string, name: string) => {
+      await tab(k).click()
+      await page.mouse.move(2, 2)
+      await settle(page, 350)
+      await shot(page, name)
+    }
+    await page.getByTestId("assistant-list").locator("[data-assistant=jeff]").click()
+    await expect(page.getByTestId("assistant-page")).toBeVisible()
+    await settle(page, 350)
+    await shot(page, "admin-desktop-31-assistant-basics")
+    await at("behaviour", "admin-desktop-32-assistant-behaviour")
+    await at("model", "admin-desktop-33-assistant-model")
+    await at("hearing", "admin-desktop-35-assistant-hearing")
+    await page.getByRole("region", { name: "Turn timing" }).scrollIntoViewIfNeeded()
+    await page.getByLabel("Speech detection threshold").scrollIntoViewIfNeeded()
+    await settle(page, 200)
+    await shot(page, "admin-desktop-35b-assistant-hearing-timing")
+    await at("voice", "admin-desktop-36-assistant-voice")
+    await at("modules", "admin-desktop-37-assistant-modules")
+    await page.locator("[data-module=clock]").getByTestId("tools-toggle").click()
+    await settle(page, 200)
+    await shot(page, "admin-desktop-38-assistant-modules-tools")
+    await at("used", "admin-desktop-39-assistant-used-on")
+    // T3: the Claude subscription account shows its own block.
+    await page.getByTestId("nav-assistants-t3").click()
+    await expect(page.getByTestId("assistant-page")).toHaveAttribute("data-assistant", "t3")
+    await at("model", "admin-desktop-34-assistant-model-subscription")
+    await page.getByLabel("Start a fresh Claude session after").scrollIntoViewIfNeeded()
+    await settle(page, 200)
+    await shot(page, "admin-desktop-34b-assistant-model-subscription-limits")
+    // Edits: the dirty marks on the tab, the field and the navigation; then a field the server refuses.
+    await at("basics", "admin-desktop-40-assistant-basics-t3")
+    await page.getByLabel("Purpose").fill("Coding work, started and checked by voice.")
+    await page.getByLabel("Name", { exact: true }).fill("Keuken")
+    await page.mouse.move(2, 2)
+    await settle(page, 300)
+    await shot(page, "admin-desktop-41-assistant-unsaved")
+    await page.getByTestId("page-footer").getByRole("button", { name: "Save", exact: true }).click()
+    await expect(page.getByTestId("field-error").first()).toBeVisible()
+    await settle(page, 300)
+    await shot(page, "admin-desktop-42-assistant-field-error")
+    // Changed somewhere else, while edits are open.
+    await page.getByLabel("Name", { exact: true }).fill("T3")
+    await fetch(`${MOCK}/mock/assistant`, { method: "POST", body: JSON.stringify({ id: "t3", patch: { purpose: "Changed in another window." } }) })
+    await expect(page.getByTestId("behind")).toBeVisible()
+    await settle(page, 300)
+    await shot(page, "admin-desktop-43-assistant-changed-elsewhere")
+    // The delete dialog, naming the devices.
+    await page.getByTestId("page-footer").getByRole("button", { name: "Cancel" }).click()
+    await page.getByTestId("delete").click()
+    await expect(page.getByTestId("delete-dialog")).toBeVisible()
+    await settle(page, 250)
+    await shot(page, "admin-desktop-44-assistant-delete-dialog")
+  })
+})
+
+test.describe("admin, assistants, desktop, light", () => {
+  test.use({ colorScheme: "light", ...DESKTOP })
+
+  test("the list and the language model tab", async ({ page, baseURL }) => {
+    await mock.scenario("devices")
+    await assistantsAt(page, baseURL, "all")
+    await shot(page, "admin-desktop-light-15-assistants-list")
+    await page.getByTestId("assistant-list").locator("[data-assistant=jeff]").click()
+    await page.locator("[role=tab][data-tab=model]").click()
+    await page.mouse.move(2, 2)
+    await settle(page, 350)
+    await shot(page, "admin-desktop-light-16-assistant-model")
+  })
+})
+
+test.describe("admin, assistants, phone, dark", () => {
+  test.use({ colorScheme: "dark", ...PHONE })
+
+  test("the list, an assistant's Basics and Language model, the delete dialog", async ({ page, baseURL }) => {
+    await mock.scenario("devices")
+    await assistantsAt(page, baseURL, "all")
+    await shot(page, "admin-phone-16-assistants-list")
+    await page.getByTestId("assistant-list").locator("[data-assistant=jeff]").tap()
+    await expect(page.getByTestId("assistant-page")).toBeVisible()
+    await settle(page, 350)
+    await shot(page, "admin-phone-17-assistant-basics")
+    await page.locator("[role=tab][data-tab=model]").tap()
+    await settle(page, 350)
+    await shot(page, "admin-phone-18-assistant-model")
+    await page.locator("[role=tab][data-tab=basics]").tap()
+    await page.getByTestId("delete").tap()
+    await expect(page.getByTestId("delete-dialog")).toBeVisible()
+    await settle(page, 250)
+    await shot(page, "admin-phone-19-assistant-delete-dialog")
+  })
+})
+
+// ---------------------------------------------------------------------------------------------------------------
+// Admin › Assistants › New assistant (mock-up `pWizard`): the seven steps
+// ---------------------------------------------------------------------------------------------------------------
+
+test.describe("admin, new assistant wizard, desktop, dark", () => {
+  test.use({ colorScheme: "dark", ...DESKTOP })
+
+  test("every step", async ({ page, baseURL }) => {
+    await mock.scenario("devices")
+    await loginAdmin(page, baseURL, "#settings/assistants/new/1")
+    await expect(page.getByTestId("wizard")).toBeVisible()
+    await page.getByLabel("Name", { exact: true }).fill("Mia")
+    await page.getByLabel("Purpose").fill("Helps with the garden")
+    await page.mouse.move(2, 2)
+    await settle(page, 350)
+    await shot(page, "admin-desktop-45-wizard-1-start")
+    const next = async (name: string) => {
+      await page.getByTestId("wizard-next").click()
+      await page.mouse.move(2, 2)
+      await settle(page, 350)
+      await shot(page, name)
+    }
+    await next("admin-desktop-46-wizard-2-language-model")
+    await next("admin-desktop-47-wizard-3-hearing")
+    await next("admin-desktop-48-wizard-4-voice")
+    await next("admin-desktop-49-wizard-5-modules")
+    await page.getByTestId("wizard-next").click()
+    await page.getByRole("checkbox", { name: "Every browser (defaults)" }).click()
+    await page.getByLabel("Wake phrase on Every browser").fill("hey mia")
+    await page.getByRole("checkbox", { name: "Kitchen iPad" }).click()
+    await page.mouse.move(2, 2)
+    await settle(page, 350)
+    await shot(page, "admin-desktop-50-wizard-6-where")
+    await next("admin-desktop-51-wizard-7-check")
+  })
+})
+
+test.describe("admin, new assistant wizard, phone, dark", () => {
+  test.use({ colorScheme: "dark", ...PHONE })
+
+  test("Where", async ({ page, baseURL }) => {
+    await mock.scenario("devices")
+    await loginAdmin(page, baseURL, "#settings/assistants/new/6")
+    await page.getByRole("checkbox", { name: "Every browser (defaults)" }).tap()
+    await page.getByLabel("Wake phrase on Every browser").fill("hey mia")
+    await settle(page, 350)
+    await shot(page, "admin-phone-20-wizard-where")
   })
 })

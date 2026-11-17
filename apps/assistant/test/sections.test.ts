@@ -54,4 +54,28 @@ describe("Sections: effective values", () => {
     const sections = makeSections(store, { RECORD_HEARD_AUDIO: "true" })
     expect(sections.value("RECORD_HEARD_AUDIO")).toBe(true)
   })
+  it("the Home section: defaults, the section as a page, and a time zone the machine does not know is refused (WP-12a)", async () => {
+    const store = await Effect.runPromise(openStore(mkdtempSync(join(tmpdir(), "pva-sections-"))))
+    const sections = makeSections(store, {})
+    expect(sections.value("HOME_LANGUAGE")).toBe("en-GB")
+    expect(sections.value("HOME_UNITS")).toBe("metric")
+    expect(sections.value("HOME_DATE_FORMAT")).toBe("en-GB")
+    const home = sections.list().find((s) => s.id === "home")
+    expect(home?.group).toBe("modules")
+    expect(home?.form.fields.map((f) => f.key)).toEqual(["HOME_LOCATION", "HOME_TIME_ZONE", "HOME_LANGUAGE", "HOME_UNITS", "HOME_DATE_FORMAT"])
+
+    const bad = await Effect.runPromise(sections.update("home", { values: { HOME_TIME_ZONE: "Mars/Olympus" }, secrets: {} }))
+    expect(bad.result.ok).toBe(false)
+    expect(sections.value("HOME_TIME_ZONE") ?? "").toBe("")
+
+    for (const zone of ["Europe/Amsterdam", " Asia/Tokyo ", ""]) {
+      const saved = await Effect.runPromise(sections.update("home", { values: { HOME_TIME_ZONE: zone }, secrets: {} }))
+      expect(saved.result.ok).toBe(true)
+    }
+    expect(sections.value("HOME_TIME_ZONE")).toBe("")
+
+    const units = await Effect.runPromise(sections.update("home", { values: { HOME_UNITS: "furlongs" }, secrets: {} }))
+    expect(units.result.ok).toBe(false)
+    expect(sections.value("HOME_UNITS")).toBe("metric")
+  })
 })

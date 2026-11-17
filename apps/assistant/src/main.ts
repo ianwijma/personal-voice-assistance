@@ -1,7 +1,19 @@
 import "./env.ts" // first: loads .env before anything reads the environment
 import { NodeRuntime } from "@effect/platform-node"
-import { Conversation, Llm, ToolRegistry, TurnTrace, type WakeConfig, wakeConfigFromProfile } from "@pva/core"
+import {
+  Conversation,
+  Llm,
+  type RouteConfig,
+  routeConfigFromWake,
+  Stt,
+  SttError,
+  ToolRegistry,
+  TurnTrace,
+  type WakeConfig,
+  wakeConfigFromProfile
+} from "@pva/core"
 import { DEFAULT_DEVICE_PROFILE } from "@pva/protocol"
+import * as SherpaStt from "@pva/stt-sherpa"
 import { Cause, Config, Effect, Layer, Logger, Stream } from "effect"
 import { resolve } from "node:path"
 import * as readline from "node:readline"
@@ -9,9 +21,10 @@ import { collectWavs, parseLiveArgs, runLiveSessions } from "./bench/live.ts"
 import { makeBenchWavs } from "./bench/makeWavs.ts"
 import { runOffline, runOfflineSessions, type SimulatedDelays, zeroDelays } from "./bench/offline.ts"
 import { formatReport } from "./bench/report.ts"
+import { formatLive, parseTypesafeLiveArgs, runTypesafeLive, typesafeScenarios } from "./bench/typesafe.ts"
 import { AppConfig } from "./config.ts"
 import { userCwd } from "./env.ts"
-import { startCliModules, withModuleInstructions } from "./modules.ts"
+import { moduleCatalog, startCliModules, withModuleInstructions } from "./modules.ts"
 import { FakeLlm } from "./FakeLlm.ts"
 import { LlmLayer, SttLayer } from "./providers.ts"
 import { sayCommand } from "./say.ts"
@@ -94,6 +107,17 @@ const RealisticDelays: Config.Config<SimulatedDelays> = Config.all({
 
 /** Wake-phrase mode with the default phrases, for the offline benchmark. */
 const benchWake: WakeConfig = { ...wakeConfigFromProfile(DEFAULT_DEVICE_PROFILE), activation: "wake-phrase" }
+/** The route gate with three assistants, each with its own phrases; the bench's utterances pick the first. */
+const benchJeff = routeConfigFromWake(benchWake, "jeff")
+const benchRoute: RouteConfig = {
+  ...benchJeff,
+  phrases: [
+    ...benchJeff.phrases,
+    { phrase: "hey tee three", assistant: "t3" },
+    { phrase: "hey keuken", assistant: "keuken" }
+  ],
+  followUpMs: { jeff: benchWake.followUpMs, t3: benchWake.followUpMs, keuken: benchWake.followUpMs }
+}
 
 const offlineBench = (sessions: number) => Effect.gen(function*() {
   const rounds = yield* Config.Int("BENCH_ROUNDS").pipe(Config.withDefault(3))
@@ -110,7 +134,13 @@ const offlineBench = (sessions: number) => Effect.gen(function*() {
     { name: `realistic, eager end-of-turn ON (EagerEndOfTurn ${d.eagerLeadMs} ms before EndOfTurn)`, delays: realistic, eager: true },
     // The wake gate in wake-phrase mode: every utterance is "Hey Jeff, …" (the gate removes the phrase).
     { name: "realistic, eager OFF, wake phrase (\"Hey Jeff, …\")", delays: realistic, eager: false, wake: benchWake, wakePrefix: "Hey Jeff, " },
-    { name: "realistic, eager ON, wake phrase (\"Hey Jeff, …\")", delays: realistic, eager: true, wake: benchWake, wakePrefix: "Hey Jeff, " }
+    { name: "realistic, eager ON, wake phrase (\"Hey Jeff, …\")", delays: realistic, eager: true, wake: benchWake, wakePrefix: "Hey Jeff, " },
+    // The same through the route gate, with two more assistants' phrases on the device (docs/ASSISTANTS.md §3.4).
+    { name: "realistic, eager OFF, route gate, 3 assistants (\"Hey Jeff, …\")", delays: realistic, eager: false, route: benchRoute, wakePrefix: "Hey Jeff, " },
+    { name: "realistic, eager ON, route gate, 3 assistants (\"Hey Jeff, …\")", delays: realistic, eager: true, route: benchRoute, wakePrefix: "Hey Jeff, " },
+    // Serve's session path since WP-4b: route gate → session dispatcher → inbox → output lease (docs/ASSISTANTS.md §3.3).
+    { name: "orchestration overhead, session path (route gate, dispatcher, output lease): all delays 0, eager off", delays: zeroDelays, eager: false, dispatch: true },
+    { name: "realistic, eager ON, session path, 3 assistants (\"Hey Jeff, …\")", delays: realistic, eager: true, route: benchRoute, wakePrefix: "Hey Jeff, ", dispatch: true }
   ]
   for (const scenario of scenarios) {
     if (sessions <= 1) {
@@ -139,7 +169,8 @@ const bench = (args: ReadonlyArray<string>) =>
       return
     }
     if (args[0] === "--live") {
-      const usage = "Usage: bench --live [--rounds N] [--sessions N] [--stagger MS] <wav files or directories> (16 kHz mono)"
+      const usage = "Usage: bench --live [--rounds N] [--sessions N] [--stagger MS] [--llm-per-session] [--stt-models A,B] [--load-model X] " +
+        "<wav files or directories> (16 kHz mono)"
       const parsed = parseLiveArgs(args.slice(1))
       if (typeof parsed === "string") return yield* new StartupError({ message: `${parsed}. ${usage}` })
       const once = yield* collectWavs(parsed.paths.map((p) => resolve(userCwd, p)))
@@ -156,19 +187,42 @@ const bench = (args: ReadonlyArray<string>) =>
       const llmLabel = llmProvider === "fake"
         ? `fake LLM: 1st token ${delays.llmFirstTokenMs} ms, ${delays.llmTokensPerSecond} tok/s`
         : `LLM ${llmProvider}`
+      // `--stt-models`: each session its own local recogniser (the pool's sharing: equal models share a worker);
+      // the environment's recogniser is then not loaded.
+      const ownStt = parsed.sttModels.length > 0
       const providers = yield* buildProviders([
         voice.stage,
         { stage: "language model (LLM_PROVIDER)", layer: llm },
-        { stage: "speech-to-text (STT_PROVIDER)", layer: SttLayer }
+        ownStt
+          ? { stage: "speech-to-text (--stt-models)", layer: Layer.succeed(Stt, Stt.of({ transcribe: () => Stream.fail(new SttError({ message: "unused" })) })) }
+          : { stage: "speech-to-text (STT_PROVIDER)", layer: SttLayer }
       ])
+      const sttOptions = yield* SherpaStt.optionsConfig
+      const sessionStts: Array<Stt["Service"]> = []
+      for (const model of parsed.sttModels) {
+        const name = SherpaStt.resolvePresetName(model)
+        if (name === undefined) return yield* new StartupError({ message: `--stt-models: unknown speech model "${model}"` })
+        sessionStts.push(yield* SherpaStt.make({ ...sttOptions, model: name }).pipe(Effect.mapError((e) => new StartupError({ message: e.message }))))
+      }
+      if (parsed.loadModel !== undefined) {
+        const name = SherpaStt.resolvePresetName(parsed.loadModel)
+        if (name === undefined) return yield* new StartupError({ message: `--load-model: unknown speech model "${parsed.loadModel}"` })
+        yield* SherpaStt.acquire({ ...sttOptions, model: name }).pipe(Effect.mapError((e) => new StartupError({ message: e.message })))
+      }
       const settings = yield* AppConfig
       const modules = yield* startCliModules()
       const conversation = { ...settings, systemPrompt: withModuleInstructions(settings.systemPrompt, modules.instructions) }
-      const { sessions, staggerMs } = parsed
-      const perSession = yield* runLiveSessions({ files, outputDir, conversation, modules, sessions, staggerMs }).pipe(
+      const { sessions, staggerMs, llmPerSession } = parsed
+      // `--llm-per-session`: one language-model instance per session (serve mode's pool with two different settings).
+      const ownLlm = llmPerSession ? { llmPerSession: llm } : {}
+      const perStt = ownStt ? { sttPerSession: (i: number) => sessionStts[i % sessionStts.length]! } : {}
+      const perSession = yield* runLiveSessions({ files, outputDir, conversation, modules, sessions, staggerMs, ...ownLlm, ...perStt }).pipe(
         Effect.provide(withVoiceTrace(providers, voice.ref))
       )
-      const together = sessions === 1 ? "" : `, ${sessions} sessions, user audio ends ${staggerMs === 0 ? "at the same moment" : `${staggerMs} ms apart`}`
+      const together = (sessions === 1 ? "" : `, ${sessions} sessions, user audio ends ${staggerMs === 0 ? "at the same moment" : `${staggerMs} ms apart`}`) +
+        (llmPerSession ? ", one LLM instance per session" : "") +
+        (ownStt ? `, speech models per session ${parsed.sttModels.join(",")} (${SherpaStt.workers()} loaded)` : "") +
+        (parsed.loadModel !== undefined ? `, ${parsed.loadModel} loaded idle` : "")
       for (const [i, rows] of perSession.entries()) {
         const which = sessions === 1 ? "" : ` — session ${i + 1} of ${sessions}`
         console.log(formatReport(`live: ${files.length} turns, ${llmLabel}${together}, replies in ${outputDir}${which}`, rows, {
@@ -180,6 +234,28 @@ const bench = (args: ReadonlyArray<string>) =>
         "Times in ms from the end of each file's audio: eager = EagerEndOfTurn, eot = EndOfTurn, then the LLM's first\n" +
           "token, the first clause sent to TTS, its first audio, and PLAY = first audio handed to the speaker."
       )
+      return
+    }
+    if (args[0] === "--typesafe") {
+      // WP-14: what a TypeSafe decision costs a turn, simulated (docs/ASSISTANTS.md §3.6).
+      const rounds = yield* Config.Int("BENCH_ROUNDS").pipe(Config.withDefault(3))
+      for (const scenario of typesafeScenarios(yield* RealisticDelays)) {
+        const rows = yield* runOffline(scenario, rounds)
+        yield* Effect.sync(() => console.log(formatReport(scenario.name, rows, { headline: { key: "EOT->PLAY", label: "recogniser EndOfTurn -> playback start" } })))
+      }
+      console.log("Trace columns are relative to the conversation's end of turn (after a decision held at the final); EOT->PLAY is from the recogniser's.")
+      return
+    }
+    if (args[0] === "--typesafe-live") {
+      // WP-14: real routing requests with the owner's key (environment or vault). Sends the utterances to TypeSafe.
+      const parsed = parseTypesafeLiveArgs(args.slice(1))
+      if (typeof parsed === "string") return yield* new StartupError({ message: `${parsed}. Usage: bench --typesafe-live [--count N] [--gap-ms MS] [--timeout-ms MS]` })
+      const apiKey = yield* Config.String("TYPESAFE_API_KEY").pipe(Config.withDefault(""))
+      if (apiKey.trim() === "") return yield* new StartupError({ message: "bench --typesafe-live needs TYPESAFE_API_KEY (in the environment, or saved in the vault with PVA_VAULT_PASSWORD)." })
+      const baseUrl = yield* Config.String("TYPESAFE_BASE_URL").pipe(Config.withDefault(""))
+      const model = yield* Config.String("TYPESAFE_MODEL").pipe(Config.withDefault(""))
+      const rows = yield* runTypesafeLive({ apiKey, ...parsed, ...(baseUrl !== "" ? { baseUrl } : {}), ...(model !== "" ? { model } : {}) })
+      console.log(formatLive(rows, `TypeSafe routing, live: ${rows.length} requests to ${baseUrl || "https://api.typesafe.ai"}, ${parsed.gapMs} ms apart, model ${model || "jev-1.14.0"}`))
       return
     }
     if (args[0] === "--sessions") {
@@ -208,7 +284,7 @@ const program: Effect.Effect<void, unknown> = mode === "text"
   : mode === "serve"
   ? serveMode
   : new StartupError({
-    message: `Unknown mode "${mode}". Usage: assistant [text | voice | serve | bench [--sessions N | --live [--rounds N] [--sessions N] [--stagger MS] <wavs> | --make-wavs [dir]] | ` +
+    message: `Unknown mode "${mode}". Usage: assistant [text | voice | serve | bench [--sessions N | --typesafe | --typesafe-live [--count N] [--gap-ms MS] | --live [--rounds N] [--sessions N] [--stagger MS] [--llm-per-session] <wavs> | --make-wavs [dir]] | ` +
       "say [--voice PROVIDER:VOICE] [--out FILE] <text> | transcribe <wav file> | compare-models [--models a,b] [--agc on|off|both] [--ref TEXT] <wavs>]"
   })
 
@@ -227,7 +303,7 @@ const withSavedSettings = <A, E>(effect: Effect.Effect<A, E>): Effect.Effect<A, 
         cliSettings = settings
         return effect
       }),
-      { env: process.env, dataDir, vaultPath, ...(interactive ? { prompt: askVaultPassword } : {}) }
+      { env: process.env, dataDir, vaultPath, catalog: moduleCatalog, ...(interactive ? { prompt: askVaultPassword } : {}) }
     )
   })
 

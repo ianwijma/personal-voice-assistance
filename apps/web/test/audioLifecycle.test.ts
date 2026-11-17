@@ -14,7 +14,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import { Lifecycle } from "../src/lib/audio/lifecycle.ts"
 import { createAssistantClient } from "../src/lib/client.ts"
 import { flush, installFakeAudio } from "./fakeAudio.ts"
-import { profileMessage } from "./profile.ts"
+import { setupMessage } from "./profile.ts"
 
 let fake: ReturnType<typeof installFakeAudio>
 
@@ -198,7 +198,7 @@ describe("finding 4: a microphone change during Start does not cancel the sessio
         const { client, sent, phase } = newClient()
         client.startAudio()
         if (change === "device") client.setPrefs({ micDeviceId: "usb" })
-        else client.store.dispatch(profileMessage({ echoCancellation: false })) // the profile changed in admin
+        else client.store.dispatch(setupMessage({ echoCancellation: false })) // the device settings changed in admin
         await flush()
         expect(fake.pending).toHaveLength(1) // no second prompt while the first is pending
         if (first === "resolve") fake.pending[0]!.resolve()

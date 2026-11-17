@@ -1,4 +1,5 @@
-import type { ClientMessage, DeviceProfile, FrontendKindId, FrontendRole, ProfilePatch, SettingsPatch, ToolId } from "@pva/protocol"
+import type { Assistant, AssistantBody, AssistantId, ClientMessage, DeviceProfile, DeviceSettingsPatch, DeviceTarget, FrontendRole, SettingsPatch, ToolId } from "@pva/protocol"
+import { type Outcome, outcomeOf } from "./assistants.ts"
 import { createDiagnosticsStore, type DiagnosticsStore, type MicProcessing } from "./audio/diagnostics.ts"
 import { CUE_RATE, wakeCue } from "./audio/cue.ts"
 import { levels, markInterrupted } from "./audio/levels.ts"
@@ -42,7 +43,8 @@ export interface AssistantClient {
   /** Stop the reply now (Stop button / Esc). */
   readonly stopReply: () => void
   readonly resumeAudio: () => void
-  readonly sendText: (text: string) => Promise<ResultMessage>
+  /** Typed text goes to `assistantId`'s conversation (the one the chat shows); without one, to the answering assistant. */
+  readonly sendText: (text: string, assistantId?: string) => Promise<ResultMessage>
   readonly request: (message: RequestInput) => Promise<ResultMessage>
   readonly enableModule: (moduleId: string, enabled: boolean) => Promise<ResultMessage>
   readonly configureModule: (moduleId: string, patch: SettingsPatch) => Promise<ResultMessage>
@@ -67,25 +69,43 @@ export interface AssistantClient {
   readonly deleteModel: (tool: ToolId, target: string) => Promise<ResultMessage>
   /** This browser's own choices (microphone, speaker). */
   readonly setPrefs: (patch: Partial<Prefs>) => void
-  /**
-   * Voice: change this device's own profile (`voice`, `activation`, `followUpSeconds`). Shown at once and reconciled
-   * with the server's `device.profile`; reverted with a toast when refused.
-   */
-  readonly updateDevice: (patch: ProfilePatch, opts?: { readonly toast?: boolean }) => Promise<ResultMessage>
   /** Admin: log in (the token is kept in `sessionStorage` for reloads and reconnects) and out. */
   readonly adminLogin: (password: string) => Promise<ResultMessage>
   readonly adminLogout: () => Promise<ResultMessage>
-  /** Admin: a front-end kind's defaults; a device's name and overrides; forget a device. `null` in a patch = inherit. */
-  readonly updateFrontend: (kind: FrontendKindId, patch: ProfilePatch) => Promise<ResultMessage>
-  readonly updateDeviceAdmin: (id: string, change: { readonly name?: string; readonly patch?: ProfilePatch }) => Promise<ResultMessage>
+  /** Admin: forget a device. */
   readonly forgetDevice: (id: string) => Promise<ResultMessage>
+  /**
+   * Admin, protocol 7 (docs/ASSISTANTS.md §5.2). Each answers with an `Outcome`: `ok` (create: with `assistantId`),
+   * `invalid` (field errors by dotted path), `warnings` (send again with `saveAnyway`), `stale` (the entity changed:
+   * the user is told with a toast, and the caller drops its draft: the newest version is already in the state) or
+   * `refused`. The new lists arrive as `assistants` / `device.types` / `devices` pushes.
+   */
+  readonly saveAssistant: (assistant: Assistant, options?: { readonly saveAnyway?: boolean; readonly name?: string }) => Promise<Outcome>
+  readonly createAssistant: (
+    assistant: AssistantBody,
+    options?: { readonly copyOf?: AssistantId; readonly placements?: ReadonlyArray<{ readonly target: DeviceTarget; readonly phrase?: string }> }
+  ) => Promise<Outcome>
+  readonly deleteAssistant: (id: AssistantId, rev: number, name?: string) => Promise<Outcome>
+  readonly saveDevice: (
+    target: DeviceTarget,
+    rev: number,
+    settings: DeviceSettingsPatch,
+    options?: { readonly saveAnyway?: boolean; readonly name?: string; readonly label?: string }
+  ) => Promise<Outcome>
   /**
    * Admin: the phrase tester (`wake.heard` lines arrive while it is on), for one device's session (`deviceId`) or,
    * without one, the most recently active session.
    */
   readonly wakeTest: (on: boolean, deviceId?: string) => Promise<ResultMessage>
   /** Voice: start a new conversation on this device (`conversation.new`); the chat empties on the server's answer. */
-  readonly newConversation: () => Promise<ResultMessage>
+  readonly newConversation: (assistantId?: string) => Promise<ResultMessage>
+  /**
+   * Voice, protocol 7: pick who answers without a phrase on this device (`device.pick`): an assistant id, `"typesafe"`
+   * (whichever fits) or `""` (nobody). Device-wide. The new `device.setup` arrives as a push; a refusal is in the result.
+   */
+  readonly pickAssistant: (withoutPhrase: string) => Promise<ResultMessage>
+  /** Voice, protocol 7: ask for one assistant's conversation; the answer is a `conversation.history` (no `result`). */
+  readonly readConversation: (assistantId: string) => void
   /**
    * Run the echo test and save its result in the preferences (with the output path it ran on). Rejects
    * (saving nothing) when audio is off, a test already runs, or the test is cancelled: End, a takeover, a
@@ -166,6 +186,14 @@ export const createAssistantClient = (options: { readonly frontend?: FrontendRol
   const prefs = createPrefsStore()
   const diagnostics = createDiagnosticsStore()
   const dispatch = store.dispatch
+  /** An answer to an assistant or device message as an `Outcome`; a stale one is told to the user here. */
+  const adminOutcome = async (pending: Promise<ResultMessage>, name: string): Promise<Outcome> => {
+    const outcome = outcomeOf(await pending) // continuation(none): turns the answer into an outcome; the toast below is the only effect
+    if (outcome.kind === "stale") {
+      dispatch({ type: "local/toast", message: `${name} was changed somewhere else. Showing the latest version; your edits were not saved.`, tone: "error" })
+    }
+    return outcome
+  }
   let localPlayback: ((e: PlayerEvent) => void) | undefined
   /**
    * The echo test that runs now (its own token): it owns the microphone gate (held shut) and the local
@@ -441,8 +469,13 @@ export const createAssistantClient = (options: { readonly frontend?: FrontendRol
     connection.send(turnId === undefined ? { type: "interrupt" } : { type: "interrupt", turnId })
   }
 
-  const sendText = (text: string) =>
-    connection.request({ type: "text.send", text, speak: owner() && audio.running && profileOf(store.get()).speakReplies })
+  const sendText = (text: string, assistantId?: string) =>
+    connection.request({
+      type: "text.send",
+      text,
+      speak: owner() && audio.running && profileOf(store.get()).speakReplies,
+      ...(assistantId !== undefined ? { assistantId } : {})
+    })
 
   const setPrefs = (patch: Partial<Prefs>) => {
     const before = prefs.get()
@@ -485,8 +518,8 @@ export const createAssistantClient = (options: { readonly frontend?: FrontendRol
   let appliedProfile: DeviceProfile = profileOf(store.get())
   // continuation(state): runs synchronously on every store change and compares with the profile applied last.
   store.subscribe(() => {
-    const next = store.get().device?.profile
-    if (next === undefined || next === appliedProfile) return
+    const next = profileOf(store.get())
+    if (next === appliedProfile) return
     const before = appliedProfile
     appliedProfile = next
     applyProfile(before, next)
@@ -503,23 +536,6 @@ export const createAssistantClient = (options: { readonly frontend?: FrontendRol
     const open = audio.openReply()
     if (open !== undefined && open < LOCAL_REPLY_ID) return
     audio.playLocal(CUE_REPLY_ID, CUE_RATE, wakeCue())
-  }
-
-  /**
-   * This device's own profile change (`device.update`), shown at once. A refusal puts the shown value back and, unless
-   * `toast: false` (the settings sheet shows it next to the control instead), raises a toast.
-   */
-  const updateDevice = async (patch: ProfilePatch, opts: { readonly toast?: boolean } = {}): Promise<ResultMessage> => {
-    const shown: Partial<DeviceProfile> = {}
-    for (const [k, v] of Object.entries(patch)) if (v !== null) (shown as Record<string, unknown>)[k] = v
-    dispatch({ type: "local/profile-overlay", patch: shown })
-    const result = await connection.request({ type: "device.update", patch }) // continuation(state): the overlay is the store's; cleared on refusal
-    if (!result.ok) {
-      dispatch({ type: "local/profile-overlay-clear" })
-      if (opts.toast !== false) dispatch({ type: "local/toast", message: result.error?.message ?? "The change was not saved.", tone: "error" })
-    }
-    // Accepted: the overlay stays until the server's `device.profile` replaces it (the server may correct a value).
-    return result
   }
 
   // ---- Screen wake lock while this tab owns the audio ----
@@ -617,20 +633,41 @@ export const createAssistantClient = (options: { readonly frontend?: FrontendRol
     cancelJob: (jobId) => connection.request({ type: "job.cancel", jobId }),
     deleteModel: (tool, target) => connection.request({ type: "model.delete", tool, target }),
     setPrefs,
-    updateDevice,
     adminLogin,
     adminLogout,
-    updateFrontend: (kind, patch) => connection.request({ type: "frontend.update", kind, patch }),
-    updateDeviceAdmin: (id, change) =>
-      connection.request({
-        type: "device.admin.update",
-        id,
-        ...(change.name !== undefined ? { name: change.name } : {}),
-        ...(change.patch !== undefined ? { patch: change.patch } : {})
-      }),
     forgetDevice: (id) => connection.request({ type: "device.forget", id }),
+    saveAssistant: (assistant, options = {}) =>
+      adminOutcome(connection.request({ type: "assistant.save", assistant, ...(options.saveAnyway === true ? { saveAnyway: true } : {}) }), options.name ?? assistant.name),
+    createAssistant: (assistant, options = {}) =>
+      adminOutcome(
+        connection.request({
+          type: "assistant.create",
+          assistant,
+          ...(options.copyOf !== undefined ? { copyOf: options.copyOf } : {}),
+          ...(options.placements !== undefined ? { placements: options.placements.map((p) => ({ target: p.target, ...(p.phrase !== undefined ? { phrase: p.phrase } : {}) })) } : {})
+        }),
+        assistant.name
+      ),
+    deleteAssistant: (id, rev, name) => adminOutcome(connection.request({ type: "assistant.delete", id, rev }), name ?? id),
+    saveDevice: (target, rev, settings, options = {}) =>
+      adminOutcome(
+        connection.request({
+          type: "device.save",
+          target,
+          rev,
+          settings,
+          ...(options.name !== undefined ? { name: options.name } : {}),
+          ...(options.saveAnyway === true ? { saveAnyway: true } : {})
+        }),
+        options.label ?? "The device"
+      ),
     wakeTest: (on, deviceId) => connection.request(deviceId === undefined ? { type: "wake.test", on } : { type: "wake.test", on, deviceId }),
-    newConversation: () => connection.request({ type: "conversation.new" }),
+    newConversation: (assistantId) => connection.request(assistantId === undefined ? { type: "conversation.new" } : { type: "conversation.new", assistantId }),
+    // Who has the turn afterwards is the server's to say: an accepted pick closes its windows and the `state` that follows names the holder.
+    pickAssistant: (withoutPhrase) => connection.request({ type: "device.pick", withoutPhrase }),
+    readConversation: (assistantId) => {
+      connection.send({ type: "conversation.read", requestId: `read-${assistantId}-${Date.now().toString(36)}`, assistantId })
+    },
     diagnostics,
     echoTest: async () => {
       if (!audio.running) throw new Error("Start audio first.")

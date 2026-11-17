@@ -5,6 +5,15 @@
 > profile's `voice` no longer changes the voice (it falls back to `""`, the assistant's voice). Where this document
 > describes per-device voices or the router, that is the design as it was.
 
+> **Changed 2026-11-16 (docs/ASSISTANTS.md, protocol 7).** A device's session now holds **one conversation per
+> assistant** on that device, behind a route gate and a session dispatcher; the shared engines are the **resource pool**
+> (`serve/Resources.ts`), not one build that a reload replaces. What still holds as written: a session per device, ownership
+> per session, who receives what, the session lifetime and the limit, `conversation.new` (now with an optional
+> `assistantId`), the idle reset (now each assistant's `newConversationAfter`, "never" allowed), the Claude subscription's
+> session per conversation, turn ids and traces. What changed: `snapshot.conversation` is `snapshot.conversations`; the
+> per-device `conversationIdleMinutes` profile field is the assistant's setting; the per-session `WakeGate` is the
+> `RouteGate`; a language model change, a voice change or a changed hearer no longer reloads the engines.
+
 Design written 2026-11-14 (lead session), at the owner's request. It changes three things:
 
 1. **Several devices at once.** Every voice device (a browser today; satellites around the house later) gets its own
@@ -27,13 +36,13 @@ anything that had to differ from this design, with the reason.
 |---|---|
 | What a session is keyed by | The **device** (`hello.device.id`, shared by every tab of one browser, docs/FRONTENDS-AND-ACTIVATION.md §2). A voice hello without `device` gets a session of its own keyed by its `clientId`. Admin connections never have a session. |
 | Ownership | Per session, not per server. Inside one device the rules of today stay (one tab owns the audio, the others observe, the last claim on *that device* wins, `resumeOwner`). A claim on another device never takes anything from this one. |
-| What is shared | The engines (language model, the loaded speech-to-text model, the voices), the module host, settings, keys, jobs, models, admin. One engine reload rebuilds them for every session. |
-| What is per session | `WebAudio` (input + output link), the recogniser stream, `EchoGate`, `WakeGate`, `StateTracker`, `Publisher`, the `Conversation` and its history, the typed-input queue, the "save what it hears" tap, the device's profile (voice, interrupt mode, activation). |
+| What is shared | The engines (language models, the loaded speech-to-text models, the voices; since protocol 7 the resource pool shares one instance per distinct configuration), the module host, settings, keys, jobs, models, admin. The owner's reload rebuilds them for every session; a settings change builds only what changed. |
+| What is per session | `WebAudio` (input + output link), the recogniser stream, `EchoGate`, `RouteGate` (`WakeGate` in protocol 6), the dispatcher and output lease, `StateTracker`, `Publisher`, one `Conversation` with its history per assistant on the device, the typed-input queue, the "save what it hears" tap, the device's settings (interrupt mode, who answers, phrases). |
 | Who receives what | A session's messages (`state`, `transcript`, `turn.*`, `assistant.*`, `tool.*`, `reply.*`, `result`, `wake`, `error` about its turns, `conversation`) go only to that device's connections. `engine.summary`, `module.changed` and the like stay broadcast. Admin connections get `sessions` (§4) and do not receive turn traffic unless they follow a session (phrase tester, §4). |
 | Session lifetime | Created at the first `audio.claim` or typed message of a device (not at connect, so an idle open tab costs nothing). Its pipeline stops when the device has had no connection for `SESSION_DISCARD_MINUTES` (default **30**), and its conversation is then dropped. A device that comes back within that time keeps its conversation. |
 | Limit | `MAX_VOICE_SESSIONS` (default **4**): a claim or typed message that would start one more first takes the place of the least recently active session whose device has no connection left (that session is discarded early; step 4). Only when every session's device is connected is it refused with error `sessions_full` ("The assistant is already talking on N devices"), and the page shows it. The connection limit goes from 8 to **24**. |
 | New conversation | A voice request `conversation.new` (any connection of the device, not admin only; it touches only that device's own conversation). It stops the running turn (as Stop), drops the session's history, and gives the conversation a new id. Every connection of the device gets `conversation { id, reason: "new" }` and an empty history. The Claude subscription session of the old conversation is closed. |
-| Auto new conversation | After `CONVERSATION_IDLE_MINUTES` (default **10**, `0` = never) without a committed turn, the next turn starts a new conversation first (`reason: "idle"`). Decided at the start of the turn, by the conversation itself, so a speculative turn and its promotion see the same history. Per device: a profile field `conversationIdleMinutes` (kind default from the assistant setting) so a kitchen device can forget quickly and a desk device slowly. |
+| Auto new conversation | After `CONVERSATION_IDLE_MINUTES` (default **10**, `0` = never) without a committed turn, the next turn starts a new conversation first (`reason: "idle"`). Decided at the start of the turn, by the conversation itself, so a speculative turn and its promotion see the same history. Protocol 6 made it a device profile field `conversationIdleMinutes`; protocol 7 made it the assistant's `newConversationAfter` (a number of minutes or "never"), so a kitchen assistant can forget quickly and a desk assistant slowly on the same device. |
 | Saying it | "New conversation" / "start over" / "forget that" as a spoken command is **not** part of this design (it needs the intent path, which is not wired yet). The button and the idle timer are. |
 | History storage | Stays in memory, as today. A new conversation drops the old history; there is no archive. A server restart starts every device fresh. |
 | Claude subscription | One login, **one Claude Code session per conversation**, opened lazily at that conversation's first turn, closed on `conversation.new`, on discard, and after `sessionIdleMinutes`. Turns of different conversations run in parallel. At most `MAX_VOICE_SESSIONS` Claude sessions; when one more is needed, the least recently used one is closed (it primes from the history again if it comes back). |
@@ -43,24 +52,25 @@ anything that had to differ from this design, with the reason.
 ## 2. Shared engines, per-session pipelines
 
 ```
-                  ┌──────────────── shared engines (Engine: build / reload) ────────────────┐
-                  │ Llm · Stt model (one worker, many streams) · voices (Tts) · module host  │
+                  ┌─────── shared resources (Resources.ts pool; Engine: full reload, status) ──────┐
+                  │ Llm per configuration · Stt worker per model (many streams) · Tts per voice · modules │
                   └──────────────────────────────────────────────────────────────────────────┘
-device A tabs ─▶ VoiceSession A: WebAudio ▶ stt.transcribe ▶ EchoGate ▶ WakeGate ▶ Conversation A ▶ Tts ▶ WebAudio ─▶ A's owner tab
-device B tabs ─▶ VoiceSession B: WebAudio ▶ stt.transcribe ▶ EchoGate ▶ WakeGate ▶ Conversation B ▶ Tts ▶ WebAudio ─▶ B's owner tab
+device A tabs ─▶ VoiceSession A: WebAudio ▶ stt.transcribe ▶ EchoGate ▶ RouteGate ▶ Dispatcher ▶ Conversation(s) A ▶ Tts ▶ OutputLease ▶ WebAudio ─▶ A's owner tab
+device B tabs ─▶ VoiceSession B: WebAudio ▶ stt.transcribe ▶ EchoGate ▶ RouteGate ▶ Dispatcher ▶ Conversation(s) B ▶ Tts ▶ OutputLease ▶ WebAudio ─▶ B's owner tab
 ```
 
-- **`Engine`** (`apps/assistant/src/serve/Engine.ts`) keeps building, reloading and reporting the providers, and stops
-  owning a conversation. It exposes the built providers to sessions and tells them when they go away and come back.
-  A reload stops every session's voice loop (running turns end `interrupted`), rebuilds, and restarts every session's
-  loop with its own history (`initialHistory`), exactly as one conversation is carried over today.
+- **`Engine`** (`apps/assistant/src/serve/Engine.ts`) keeps reloading and reporting, and stops owning a conversation. It
+  exposes what was built to sessions and tells them when it goes away and comes back. A full reload (the owner's button)
+  stops every session's voice loop (running turns end `interrupted`), rebuilds, and restarts every session's loop with its
+  own histories (`initialHistory`), exactly as one conversation is carried over. Since protocol 7 the language models, voices
+  and recognisers are the **resource pool**'s (`serve/Resources.ts`): a changed assistant builds the new instance first and
+  switches at the next turn start, without a reload and without touching other devices.
 - **`VoiceSessions`** (new, `serve/VoiceSessions.ts`): the map device → `VoiceSession`, creation on first use, the
   limit, discard after `SESSION_DISCARD_MINUTES`, and the list for admin (`sessions`).
 - **`VoiceSession`** (new, `serve/VoiceSession.ts`): what `serveMode.ts` wires once today, wired per device: the
-  `WebAudio`, echo gate, wake gate, state tracker, publisher, heard-audio tap, the typed-input admission
-  (`maxPendingInputs`, Stop generations) that lives in `Engine` today, and the `Conversation` with its voice loop.
-  Its device profile configures it directly (no more "the owner's profile"): echo-gate mode, wake config, default
-  voice (the router per session, so two devices can use different default voices at the same time).
+  `WebAudio`, echo gate, route gate, dispatcher, state tracker, publisher, heard-audio tap, the typed-input admission
+  (`maxPendingInputs`, Stop generations), and one `Conversation` with its voice loop per assistant (made on first use).
+  Its device's settings configure it directly: echo-gate mode, route config, the hearer (the voice is each assistant's).
 - **`SessionHub`** keeps connections, handshake, admin and request routing. Ownership moves into the session:
   `audio.claim` from a connection becomes "claim on my device's session". The hub routes a connection's binary frames
   and owner-only messages to its session, and a session's messages to the connections of its device.
@@ -82,7 +92,9 @@ its own stream), and `AgentTurnInput.conversationId` is new.
 ## 4. Protocol (version 6)
 
 - Server `conversation { id, reason: "new" | "idle" | "resumed" }`, to the device's connections, after a new
-  conversation started (its history is empty) and in the snapshot (`snapshot.conversation: { id, startedAt }`).
+  conversation started (its history is empty) and in the snapshot (protocol 6: `snapshot.conversation: { id, startedAt }`;
+  protocol 7: `snapshot.conversations`, one `{ assistantId, id, startedAt, turns }` per assistant, with `assistantId` on the
+  `conversation` message too).
 - Client `conversation.new` (request with result; voice connections). Error `not_running` when the engines are not
   running is not needed: it works without engines (it only drops the history).
 - `snapshot.history` is the device's conversation. `snapshot.ownerPresent` and `session` messages are about the
@@ -92,7 +104,7 @@ its own stream), and `AgentTurnInput.conversationId` is new.
   conversationId, turns, lastTurnAt }]`; `admin.snapshot.sessions`. Devices list's "audio owner now" becomes "talking
   now" per device. The phrase tester gets `wake.test { on, deviceId? }`: the transcripts of that device's session
   (default: the most recently active one).
-- Profile field `conversationIdleMinutes` (0–240, kind default from `CONVERSATION_IDLE_MINUTES`).
+- Profile field `conversationIdleMinutes` (0–240, kind default from `CONVERSATION_IDLE_MINUTES`; protocol 7: the assistant's `newConversationAfter`).
 
 ## 5. The UIs
 
@@ -102,7 +114,7 @@ its own stream), and `AgentTurnInput.conversationId` is new.
   `idle`). `sessions_full` shows as the start error.
 - **Admin**: Devices list shows per device whether it is talking now and its state; Overview shows the sessions.
   Settings: `CONVERSATION_IDLE_MINUTES`, `MAX_VOICE_SESSIONS`, `SESSION_DISCARD_MINUTES` in the conversation section;
-  `conversationIdleMinutes` in the device profile form.
+  `conversationIdleMinutes` in the device profile form (protocol 7: each assistant's "new conversation after" on its Behaviour tab).
 
 ## 6. Build order
 
@@ -120,7 +132,7 @@ its own stream), and `AgentTurnInput.conversationId` is new.
 4. **Integration**: `pnpm check`, `pnpm test`, e2e, then two real browsers on the running build with the local models;
    `bench` numbers (one session before/after, two sessions) under Status.
 
-## Status
+## Status (the build log of protocol 6; "profile", `WakeGate` and `snapshot.conversation` are the names of that time, see the note at the top)
 
 ### Step 1, packages: built 2026-11-14
 

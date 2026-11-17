@@ -1,6 +1,7 @@
 "use client"
 import { useEffect, useState, useSyncExternalStore } from "react"
-import { profileOf } from "@/lib/state.ts"
+import { displayPhrase } from "@/lib/state.ts"
+import { phrased } from "@/lib/voiceSetup.ts"
 import { shallowEqual } from "@/lib/store.ts"
 import { useClient, useClientState, usePrefs } from "./context.tsx"
 import { Button } from "./ui/controls.tsx"
@@ -149,7 +150,7 @@ export function StartHint() {
   const v = useClientState(
     (s) => ({
       muted: !s.audio.micLive,
-      asleep: profileOf(s).activation === "wake-phrase" && s.session.serverState === "asleep" && s.woke === undefined && profileOf(s).wakePhrases.length > 0
+      asleep: s.setup !== undefined && s.setup.withoutPhrase.mode === "nobody" && s.session.serverState === "asleep" && s.woke === undefined && phrased(s.setup).length > 0
     }),
     shallowEqual
   )
@@ -185,4 +186,18 @@ export function StartHint() {
       )}
     </p>
   )
+}
+
+/**
+ * Asleep with more phrases than the label can name ("Say a wake phrase"): the phrases here, or where to find them
+ * (docs/mockups/assistants/voice.html).
+ */
+export function AsleepHint() {
+  const text = useClientState((s) => {
+    if (s.setup === undefined) return ""
+    if (s.setup.canPick) return "Each assistant wakes on its own phrase: the menu at the top left lists them."
+    const list = phrased(s.setup).map((a) => `“${displayPhrase(a.phrases[0]!)}”`)
+    return `${list.slice(0, -1).join(", ")} or ${list.at(-1) ?? ""}, then ask.`
+  })
+  return <p data-testid="asleep-hint" className="text-center text-[13px] text-ink-faint">{text}</p>
 }

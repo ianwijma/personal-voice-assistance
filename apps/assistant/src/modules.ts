@@ -1,5 +1,6 @@
 import { claudeSubscriptionAgent } from "@pva/agent-claude-code"
 import { makeModuleHost, type ModuleDefinition, type ModulePersistence, type ModuleSnapshot, readOnlyPersistence } from "@pva/core"
+import { homeAssistantModule } from "@pva/module-home-assistant"
 import { clockModule, weatherModule } from "@pva/modules-builtin"
 import type { ModuleInfo } from "@pva/protocol"
 import { Config, Effect, type Scope } from "effect"
@@ -16,6 +17,8 @@ import { openVault, VaultPathConfig } from "./serve/Vault.ts"
 export const moduleCatalog: ReadonlyArray<ModuleDefinition<any>> = [
   clockModule,
   weatherModule(),
+  // Lights by room through the owner's Home Assistant (address and token shared; `domains` per assistant).
+  homeAssistantModule(),
   // Off by default and behind its own opt-in switch; answers when LLM_PROVIDER=claude-subscription.
   claudeSubscriptionAgent
 ]

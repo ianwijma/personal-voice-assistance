@@ -218,6 +218,12 @@ export class Conversation extends Context.Service<Conversation, {
   readonly conversationId: Effect.Effect<string>
   /** When the current conversation's last turn was committed (epoch ms; `Clock`), or `undefined` if none yet. */
   readonly lastTurnAt: Effect.Effect<number | undefined>
+  /**
+   * The id of the turn committed last in the current conversation: the exchange that ends `history` (its user message
+   * and what followed) is that turn's. `undefined` if none was committed by this conversation yet (or its history
+   * came from before, `initialHistory`).
+   */
+  readonly lastTurnId: Effect.Effect<number | undefined>
 }>()("@pva/core/Conversation") {
   static readonly layer = (options: ConversationOptions) =>
     Layer.effect(Conversation, makeConversation(options))
@@ -402,6 +408,10 @@ interface TurnPlan {
   readonly agent?: Agent
   /** Speak this instead of running an agent. */
   readonly canned?: string
+  /** The voice of a `Say` (a canned reply made without a setup): the setup's `tts`, read when it starts. */
+  readonly tts?: Tts["Service"] | undefined
+  /** That voice's `TurnSetup.ttsReady`. */
+  readonly ttsReady?: Effect.Effect<void> | undefined
   /** Spoken before the agent's answer ("Codex isn't available."). */
   readonly notice?: string
   /** Manual routing changes (`SetActiveAgent`) made before this plan; a later one wins over this turn's routing outcome. */
@@ -479,20 +489,29 @@ export const makeConversation = Effect.fnUntraced(function*(options: Conversatio
  * events and history carry no agent fields.
  */
 export const makeConversationWithSetup = Effect.fnUntraced(function*(options: ConversationSetupOptions) {
-  const llm = yield* Llm
-  const agent: Agent = {
-    id: "llm",
-    name: "Assistant",
-    kind: "model",
-    speculate: true,
-    firstEventTimeoutMs: Number.POSITIVE_INFINITY,
-    turn: makeModelAgent({ llm }).turn
+  const defaultLlm = yield* Llm
+  /** The one `model` agent over `llm` (a turn's `TurnSetup.llm`, else the conversation's). */
+  const agentSetOf = (llm: Llm["Service"]): AgentSet => {
+    const agent: Agent = {
+      id: "llm",
+      name: "Assistant",
+      kind: "model",
+      speculate: true,
+      firstEventTimeoutMs: Number.POSITIVE_INFINITY,
+      turn: makeModelAgent({ llm }).turn
+    }
+    return { router: singleAgentRouter(agent.id), agents: new Map([[agent.id, agent]]), defaultAgent: agent.id }
   }
-  const agents: AgentSet = { router: singleAgentRouter(agent.id), agents: new Map([[agent.id, agent]]), defaultAgent: agent.id }
+  const perLlm = new WeakMap<Llm["Service"], { readonly agents: AgentSet; readonly perRegistry: WeakMap<ToolRegistry["Service"], AgentSet> }>()
   // The registry's own action tools are the actions this turn offers (review round 7): a confirmation
   // is consumed against them, so one asked before a registry replacement is not run after it.
-  const perRegistry = new WeakMap<ToolRegistry["Service"], AgentSet>()
-  const agentsFor = (registry: ToolRegistry["Service"]): AgentSet => {
+  const agentsFor = (registry: ToolRegistry["Service"], llm: Llm["Service"]): AgentSet => {
+    let forLlm = perLlm.get(llm)
+    if (forLlm === undefined) {
+      forLlm = { agents: agentSetOf(llm), perRegistry: new WeakMap() }
+      perLlm.set(llm, forLlm)
+    }
+    const { agents, perRegistry } = forLlm
     const known = perRegistry.get(registry)
     if (known !== undefined) return known
     // A hand-made registry may have no action lookup (or no specs): then it offers no actions.
@@ -506,7 +525,10 @@ export const makeConversationWithSetup = Effect.fnUntraced(function*(options: Co
     return set
   }
   return yield* makeConversationCore(
-    { ...options, setup: Effect.map(options.setup, (s): AgentTurnSetup => ({ system: s.system, registry: s.registry, agents: agentsFor(s.registry) })) },
+    {
+      ...options,
+      setup: Effect.map(options.setup, (s): AgentTurnSetup => ({ system: s.system, registry: s.registry, agents: agentsFor(s.registry, s.llm ?? defaultLlm), ...(s.tts !== undefined ? { tts: s.tts } : {}), ...(s.maxToolRounds !== undefined ? { maxToolRounds: s.maxToolRounds } : {}), ...(s.ttsReady !== undefined ? { ttsReady: s.ttsReady } : {}) }))
+    },
     true
   )
 })
@@ -529,6 +551,7 @@ const makeConversationCore = Effect.fnUntraced(function*(options: AgentConversat
   let conversationEpoch = 0
   /** When the last turn was committed (epoch ms), for the idle reset. */
   let lastTurnAt: number | undefined = options.initialLastTurnAt
+  let lastTurnId: number | undefined
   /** The running voice loop's way to stop its turn and start a new conversation (`newConversation`). */
   let voiceControl: Queue.Queue<VoiceControl> | undefined
   let routerState: RouterState = options.initialRouterState ?? initialRouterState
@@ -565,6 +588,7 @@ const makeConversationCore = Effect.fnUntraced(function*(options: AgentConversat
       conversationEpoch++
       conversationId = newConversationId()
       lastTurnAt = undefined
+      lastTurnId = undefined
       pendingIntents.set(undefined)
       asked = undefined
       setRouterState(initialRouterState)
@@ -1005,7 +1029,7 @@ const makeConversationCore = Effect.fnUntraced(function*(options: AgentConversat
       const setup = plan.setup!
       const decision = plan.decision!
       const set = setup.agents
-      const maxToolRounds = set.maxToolRounds ?? options.maxToolRounds ?? 5
+      const maxToolRounds = setup.maxToolRounds ?? set.maxToolRounds ?? options.maxToolRounds ?? 5
 
       return Stream.unwrap(Effect.map(setup.registry.context, (context) => {
         /**
@@ -1303,6 +1327,7 @@ const makeConversationCore = Effect.fnUntraced(function*(options: AgentConversat
       if (current && outcome !== "discarded" && !log.canned) {
         commit(log, spoken, outcome === "completed" && log.shortened !== true)
         lastTurnAt = now
+        lastTurnId = trace.id
       }
       if (current) armProposal(log, trace, spoken, outcome, stopped)
       const logFailure = Exit.isFailure(exit) && outcome === "failed"
@@ -1364,7 +1389,7 @@ const makeConversationCore = Effect.fnUntraced(function*(options: AgentConversat
   const voice = <E>(events: Stream.Stream<ConversationInput, E>): Effect.Effect<void, E, Tts | AudioOutput> =>
     Effect.scoped(Effect.gen(function*() {
       const scope = yield* Effect.scope
-      const tts = yield* Tts
+      const defaultTts = yield* Tts
       const output = yield* AudioOutput
       let current: ActiveTurn | undefined
 
@@ -1397,6 +1422,9 @@ const makeConversationCore = Effect.fnUntraced(function*(options: AgentConversat
       const turnBody = (turn: ActiveTurn, ctx: ReplyContext) =>
         Effect.gen(function*() {
           const log = ctx.log
+          // The turn's voice, fixed at its start (`TurnSetup.tts`), else the voice loop's.
+          const tts = ctx.plan.tts ?? ctx.plan.setup?.tts ?? defaultTts
+          const ttsReady = ctx.plan.tts !== undefined ? ctx.plan.ttsReady : ctx.plan.setup?.tts !== undefined ? ctx.plan.setup.ttsReady : undefined
           const queue = yield* Queue.unbounded<TtsAudio, AgentError | TtsError | Cause.Done>()
 
           // One TTS stream for the whole turn (all rounds), fed clause by clause as the
@@ -1427,6 +1455,9 @@ const makeConversationCore = Effect.fnUntraced(function*(options: AgentConversat
           )
 
           yield* Deferred.await(turn.promoted)
+          // A voice still being built: its sample rate is final once it is ready. Waited for here, in the turn, so
+          // Stop and barge-in interrupt the wait (`TurnSetup.ttsReady`).
+          if (ttsReady !== undefined) yield* ttsReady
           const markPlayed = (played: number) => {
             if (played <= log.played) return
             log.played = played
@@ -1502,7 +1533,10 @@ const makeConversationCore = Effect.fnUntraced(function*(options: AgentConversat
           // to the old conversation.
           const reset = how.say === undefined && (yield* resetIfIdle)
           const answerable = reset ? undefined : how.answerable
-          const plan: TurnPlan = how.say !== undefined ? { canned: how.say } : planTurn(yield* options.setup, text, source, how.explicitAgent, answerable)
+          const setup = yield* options.setup
+          const plan: TurnPlan = how.say !== undefined
+            ? { canned: how.say, tts: setup.tts, ttsReady: setup.ttsReady }
+            : planTurn(setup, text, source, how.explicitAgent, answerable)
           const trace = tt.begin(source, speculative)
           const promoted = yield* Deferred.make<void>()
           if (!speculative) {
@@ -1727,6 +1761,7 @@ const makeConversationCore = Effect.fnUntraced(function*(options: AgentConversat
     routerState: Effect.sync(() => routerState),
     newConversation,
     conversationId: Effect.sync(() => conversationId),
-    lastTurnAt: Effect.sync(() => lastTurnAt)
+    lastTurnAt: Effect.sync(() => lastTurnAt),
+    lastTurnId: Effect.sync(() => lastTurnId)
   })
 })

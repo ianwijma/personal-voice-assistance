@@ -25,7 +25,7 @@ test("a wrong password is refused and said so; the right one opens the settings;
   await expect(page.getByTestId("admin-header")).toContainText("Log out")
   // Categories in the designed order.
   const order = await page.getByTestId("settings-nav").locator(":scope > div > button").allTextContents()
-  expect(order.map((t) => t.replace(/\(.*\)/, "").trim())).toEqual(["Overview", "Front ends", "Devices", "Language model", "Speech recognition", "Voices", "Modules", "Keys & vault", "Diagnostics", "About"])
+  expect(order.map((t) => t.replace(/\(.*\)/, "").trim())).toEqual(["Overview", "Assistants", "Devices", "Shared settings", "Keys & vault", "Diagnostics", "About"])
   const logins = (await mock.log()).messages.filter((m) => m.type === "admin.login")
   expect(logins).toHaveLength(3 - 1) // the empty one never left the page
 })
@@ -60,10 +60,10 @@ test("admin switched off: the page says how to switch it on, and offers no passw
 })
 
 test("log out returns to the login with the reason; a reload stays logged in; an ended session says why", async ({ page, baseURL }) => {
-  await loginAdmin(page, baseURL, "#settings/voices")
+  await loginAdmin(page, baseURL, "#settings/shared/providers")
   await page.reload()
   await expect(page.getByTestId("settings")).toBeVisible() // the token in sessionStorage logs in again
-  await expect(page.getByTestId("page-voices-overview")).toBeVisible()
+  await expect(page.getByTestId("page-shared-providers")).toBeVisible()
   await page.getByTestId("logout").click()
   await expect(page.getByTestId("login-reason")).toHaveText("You logged out.")
   expect(await page.evaluate(() => sessionStorage.getItem("pva.adminToken"))).toBeNull()
@@ -93,8 +93,7 @@ test("the admin page never asks for the microphone and never claims the audio", 
       return original(c)
     }
   })
-  await loginAdmin(page, baseURL, "#settings/frontends/web-voice")
-  await page.getByTestId("wake-settings-folded").locator("summary").click()
+  await loginAdmin(page, baseURL, "#settings/devices/type.web-voice")
   await page.getByTestId("tester-listen").click()
   await page.waitForTimeout(500)
   expect(await page.evaluate(() => (window as unknown as { __gum: number }).__gum)).toBe(0)

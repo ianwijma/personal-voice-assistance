@@ -80,6 +80,14 @@ interface PresetCommon {
   readonly demoted?: boolean
   /** Licence of the model files (see README). */
   readonly licence: string
+  /**
+   * Resident memory the loaded recogniser adds to the process, MB: RSS after load and warm-up minus RSS before, in a
+   * fresh process, median of 5 runs, no turn decoded yet (it grows with the longest turn decoded). Measured values;
+   * see docs/ASSISTANTS.md "Baseline measurements (WP-0)".
+   */
+  readonly ramMb: number
+  /** Time to start the worker, load the model and warm it up, ms: minimum of 5 runs, files in the page cache. */
+  readonly loadMs: number
 }
 
 export interface StreamingPreset extends PresetCommon {
@@ -158,7 +166,10 @@ export const presets = {
     takesLanguage: false,
     maxTurnMs: 30_000,
     interimMs: 1_000,
-    licence: "CC-BY-4.0 (NVIDIA parakeet-tdt-0.6b-v2)"
+    licence: "CC-BY-4.0 (NVIDIA parakeet-tdt-0.6b-v2)",
+    // Measured 2026-11-16 on an AMD Ryzen 9 7945HX (16 cores, 30 GiB); WP-0 baseline.
+    ramMb: 1050,
+    loadMs: 1609
   },
   "parakeet-ultra": {
     kind: "offline",
@@ -170,7 +181,10 @@ export const presets = {
     takesLanguage: false,
     maxTurnMs: 30_000,
     interimMs: 1_000,
-    licence: "CC-BY-4.0 (Moondream, post-trained from NVIDIA parakeet-tdt-0.6b-v3)"
+    licence: "CC-BY-4.0 (Moondream, post-trained from NVIDIA parakeet-tdt-0.6b-v3)",
+    // Measured 2026-11-16 on an AMD Ryzen 9 7945HX (16 cores, 30 GiB); WP-0 baseline.
+    ramMb: 1067,
+    loadMs: 1632
   },
   "whisper-turbo": {
     kind: "offline",
@@ -190,7 +204,10 @@ export const presets = {
     maxTurnMs: 28_000,
     // A Whisper decode takes 1–3 s: interim decodes would delay the reply.
     interimMs: 0,
-    licence: "MIT (OpenAI Whisper large-v3-turbo)"
+    licence: "MIT (OpenAI Whisper large-v3-turbo)",
+    // Measured 2026-11-16 on an AMD Ryzen 9 7945HX (16 cores, 30 GiB); WP-0 baseline.
+    ramMb: 1640,
+    loadMs: 2621
   },
   "hybrid-nemotron-parakeet": {
     kind: "hybrid",
@@ -203,7 +220,10 @@ export const presets = {
     threads: 8,
     takesLanguage: false,
     maxTurnMs: 30_000,
-    licence: "CC-BY-4.0 (Parakeet v2) and NVIDIA OpenMDW-1.1 (Nemotron)"
+    licence: "CC-BY-4.0 (Parakeet v2) and NVIDIA OpenMDW-1.1 (Nemotron)",
+    // Measured 2026-11-16 on an AMD Ryzen 9 7945HX (16 cores, 30 GiB); WP-0 baseline.
+    ramMb: 1683,
+    loadMs: 2443
   },
   "nemotron-560": {
     kind: "streaming",
@@ -213,7 +233,10 @@ export const presets = {
     model: nemotron(560),
     threads: 4,
     language: "auto",
-    licence: NVIDIA_OPEN_MODEL
+    licence: NVIDIA_OPEN_MODEL,
+    // Measured 2026-11-16 on an AMD Ryzen 9 7945HX (16 cores, 30 GiB); WP-0 baseline.
+    ramMb: 948,
+    loadMs: 1178
   },
   "nemotron-320": {
     kind: "streaming",
@@ -223,7 +246,10 @@ export const presets = {
     model: nemotron(320),
     threads: 4,
     language: "auto",
-    licence: NVIDIA_OPEN_MODEL
+    licence: NVIDIA_OPEN_MODEL,
+    // Measured 2026-11-16 on an AMD Ryzen 9 7945HX (16 cores, 30 GiB); WP-0 baseline.
+    ramMb: 964,
+    loadMs: 1240
   },
   "zipformer-en": {
     kind: "streaming",
@@ -243,7 +269,10 @@ export const presets = {
       multilingual: false
     },
     threads: 2,
-    licence: "Apache-2.0 (icefall)"
+    licence: "Apache-2.0 (icefall)",
+    // Measured 2026-11-16 on an AMD Ryzen 9 7945HX (16 cores, 30 GiB); WP-0 baseline.
+    ramMb: 167,
+    loadMs: 1308
   },
   "fast-conformer-en": {
     kind: "streaming",
@@ -258,7 +287,10 @@ export const presets = {
       multilingual: false
     },
     threads: 2,
-    licence: "CC-BY-4.0 (NVIDIA NeMo)"
+    licence: "CC-BY-4.0 (NVIDIA NeMo)",
+    // Measured 2026-11-16 on an AMD Ryzen 9 7945HX (16 cores, 30 GiB); WP-0 baseline.
+    ramMb: 250,
+    loadMs: 745
   }
 } satisfies Record<string, Preset>
 

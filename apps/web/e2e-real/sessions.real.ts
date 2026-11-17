@@ -20,7 +20,7 @@ import {
   type Recorded,
   repoRoot,
   saveLog,
-  setFrontendDefaults,
+  setAssistant,
   silence,
   startAssistant,
   test,
@@ -218,7 +218,7 @@ test("two devices at once: each hears and sees only its own turn; claims, New co
 
     // The quiet reset: one "minute" (MINUTE_MS here) without a committed turn, and A's next turn starts a new
     // conversation; nothing of it reaches B.
-    await setFrontendDefaults(assistant.url, { conversationIdleMinutes: 1 })
+    await setAssistant(assistant.url, { newConversationAfter: 1 })
     const type = async (text: string) => {
       const before = await a.page.getByTestId("turn").count()
       await a.page.locator("#chat-input").fill(text)

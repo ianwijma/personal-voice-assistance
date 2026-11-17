@@ -4,12 +4,18 @@
  * speaker, each with a configurable simulated delay. No keys, no network.
  */
 import {
+  AudioOutput,
   Conversation,
+  type ConversationInput,
   type LlmRequest,
+  makeRouteGate,
   makeWakeGate,
+  type RouteConfig,
+  routeConfigFromWake,
   type SttEvent,
   ToolRegistry,
   type Trace,
+  TurnTrace,
   Tts,
   WAKE_ALWAYS,
   type WakeConfig,
@@ -32,9 +38,14 @@ import {
   turnResumed
 } from "@pva/core/testing"
 import { makeClock } from "@pva/modules-builtin"
-import { Deferred, Effect, Layer, Queue, Stream } from "effect"
+import type { TraceConfig } from "@pva/protocol"
+import { type Cause, Deferred, Effect, Layer, Queue, Stream } from "effect"
 import type { BenchRow } from "./report.ts"
-import { observedTurnTraceLayer } from "../startup.ts"
+import { observedTurnTrace, observedTurnTraceLayer } from "../startup.ts"
+import { makeOutputLease } from "../serve/OutputLease.ts"
+import { type DispatchHooks, makeSessionDispatcher } from "../serve/SessionDispatcher.ts"
+import { type AssistantTraceConfig, assistantTurnTrace } from "../serve/VoiceSession.ts"
+import { simulatedDecide } from "./typesafe.ts"
 
 export interface SimulatedDelays {
   /** Request sent → first text token. */
@@ -67,7 +78,29 @@ export interface OfflineScenario {
    * In `wake-phrase` mode every utterance starts with `wakePrefix` ("Hey Jeff, …"), which the gate removes.
    */
   readonly wake?: WakeConfig
+  /**
+   * The route gate (docs/ASSISTANTS.md §3.4) instead of the wake gate. Every utterance starts with `wakePrefix`
+   * (when set), which the gate removes; whichever assistant it picks, the one `Conversation` answers.
+   */
+  readonly route?: RouteConfig
   readonly wakePrefix?: string
+  /**
+   * Serve mode's session path since WP-4b (docs/ASSISTANTS.md §3.3): the route gate (`route`, default: one assistant
+   * answering without a phrase), the session dispatcher, the conversation's inbox queue and the output lease, in
+   * front of the one `Conversation`.
+   */
+  readonly dispatch?: boolean
+  /**
+   * WP-14: a TypeSafe device (no phrase, so every utterance is decided) on the session path, with a simulated decision
+   * of this many ms (`bench/typesafe.ts`). Implies `dispatch`. Rows then carry `EOT->PLAY`: the recogniser's
+   * `EndOfTurn` → playback start (the trace's own end of turn comes after a decision held at the final).
+   */
+  readonly decideMs?: number
+  /**
+   * The recogniser's events reach the dispatcher through a queue, as in serve mode (its timing does not wait for a
+   * decision the dispatcher holds), and rows carry `EOT->PLAY`. On with `decideMs`; set it on the baseline row too.
+   */
+  readonly queued?: boolean
 }
 
 interface ScriptedTurn {
@@ -110,7 +143,7 @@ const respond = (delays: SimulatedDelays) => (request: LlmRequest): LlmScript =>
 
 /** What the STT stand-in emits for one turn. */
 const sttEvents = (turn: ScriptedTurn, scenario: OfflineScenario): Array<SttEvent | Sleep> => {
-  const prefix = scenario.wake?.activation === "wake-phrase" ? scenario.wakePrefix ?? "" : ""
+  const prefix = scenario.wake?.activation === "wake-phrase" || scenario.route !== undefined ? scenario.wakePrefix ?? "" : ""
   if (prefix !== "") {
     turn = { ...turn, user: `${prefix}${turn.user}`, ...(turn.falseStart !== undefined ? { falseStart: `${prefix}${turn.falseStart}` } : {}) }
   }
@@ -137,6 +170,41 @@ const makeBarrier = (parties: number) => {
     })
 }
 
+/**
+ * The session path's trace service as serve mode makes it per conversation (`assistantTurnTrace`): the assistant,
+ * its route and the configuration snapshot (docs/ASSISTANTS.md §3.7) filled at each turn's start. The snapshot is
+ * looked up as serve mode's is (reference compares of what the turn is bound to, then the join with the hearing),
+ * from values that do not change during the bench.
+ */
+const sessionTurnTrace = (onFinish: (trace: Trace) => Effect.Effect<void>): TurnTrace["Service"] => {
+  const bound = { snapshot: {}, assistant: {}, llm: {}, tts: {} }
+  const part: AssistantTraceConfig = {
+    llm: { account: "offline", model: "", effort: "low", thinking: "off", maxTokens: 1024 },
+    voice: "bench:bench",
+    modules: 1,
+    tools: 1,
+    replyEarly: true,
+    toolRounds: 5
+  }
+  const cached = { ...bound, config: part }
+  const hearing = { hearer: "jeff", engine: "sherpa", model: "bench", eagerSilenceMs: 200, finalSilenceMs: 600 }
+  let joined: { readonly part: AssistantTraceConfig; readonly hearing: typeof hearing; readonly value: TraceConfig } | undefined
+  const config = (): TraceConfig | undefined => {
+    const p = cached.snapshot === bound.snapshot && cached.assistant === bound.assistant && cached.llm === bound.llm && cached.tts === bound.tts
+      ? cached.config
+      : undefined
+    if (p === undefined) return undefined
+    if (joined?.part !== p || joined.hearing !== hearing) joined = { part: p, hearing, value: { ...p, hearing } }
+    return joined.value
+  }
+  return assistantTurnTrace(observedTurnTrace(onFinish), { next: 1 }, {
+    session: () => "bench",
+    assistant: () => ({ id: "jeff", name: "Jeff" }),
+    route: () => ({ by: "default" }),
+    config
+  })
+}
+
 /** One session: the script `rounds` times (after a warm-up round) through its own `Conversation`. */
 const runSession = (
   scenario: OfflineScenario,
@@ -148,34 +216,83 @@ const runSession = (
   Effect.gen(function*() {
     const finished = yield* Queue.unbounded<Trace>()
     const onFinish = (trace: Trace) => trace.outcome === "discarded" ? Effect.void : Queue.offer(finished, trace)
-    const layer = Conversation.layer({ systemPrompt: "Benchmark.", bargeIn: true }).pipe(
+    const recording = makeRecordingAudioOutput({ chunkMillis: scenario.delays.playbackMsPerClause })
+    // Serve's session path: the dispatcher's hooks see the conversation's events; it plays through a lease.
+    let hooks: DispatchHooks | undefined
+    const dispatch = scenario.dispatch === true || scenario.decideMs !== undefined
+    const queued = scenario.queued === true || scenario.decideMs !== undefined
+    /** When the recogniser's `EndOfTurn` of the current turn was emitted (session path). */
+    let recogniserEot: number | undefined
+    const output = dispatch
+      ? Layer.effect(AudioOutput, Effect.gen(function*() {
+        return makeOutputLease(yield* AudioOutput).output("jeff")
+      })).pipe(Layer.provide(recording.layer))
+      : recording.layer
+    const layer = Conversation.layer({ systemPrompt: "Benchmark.", bargeIn: true, onEvent: (event) => hooks?.onEvent(event) }).pipe(
       Layer.provideMerge(Layer.mergeAll(
         makeScriptedLlm(respond(scenario.delays)).layer,
         ToolRegistry.layer([makeClock()]),
-        observedTurnTraceLayer(onFinish),
+        dispatch ? Layer.sync(TurnTrace, () => sessionTurnTrace(onFinish)) : observedTurnTraceLayer(onFinish),
         Layer.succeed(Tts, tts),
-        makeRecordingAudioOutput({ chunkMillis: scenario.delays.playbackMsPerClause }).layer
+        output
       ))
     )
     const turns = Array.from({ length: rounds + 1 }, (_, round) => script.map((turn) => ({ round, turn }))).flat()
+    const rows: Array<BenchRow> = []
+    const perTurn = (feed: (events: Stream.Stream<SttEvent>) => Stream.Stream<ConversationInput>) =>
+      Stream.fromIterable(turns.map((t, k) => ({ ...t, k }))).pipe(
+        Stream.flatMap(({ round, turn, k }) =>
+          Stream.fromEffectDrain(barrier === undefined ? Effect.void : barrier(k)).pipe(
+            Stream.concat(feed(scripted(sttEvents(turn, scenario)))),
+            Stream.concat(Stream.fromEffectDrain(Effect.gen(function*() {
+              const trace = yield* Queue.take(finished)
+              const play = trace.marks.playbackStart
+              const extra = queued && recogniserEot !== undefined && play !== undefined ? { extra: { "EOT->PLAY": play - recogniserEot } } : {}
+              if (round > 0) rows.push({ label: `${label}${round}.${script.indexOf(turn) + 1} ${turn.user.slice(0, 24)}`, trace, ...extra })
+            })))
+          ), { concurrency: 1 })
+      )
+    if (dispatch) {
+      // Recogniser events → route gate → dispatcher → the conversation's inbox (as `VoiceSession` wires it).
+      const inbox = yield* Queue.unbounded<ConversationInput, Cause.Done>()
+      const typesafe: RouteConfig = { phrases: [], match: "close", withoutPhrase: "decide", fallback: "jeff", followUpMs: {}, off: new Set() }
+      const route = makeRouteGate(scenario.route ?? (scenario.decideMs !== undefined ? typesafe : routeConfigFromWake(WAKE_ALWAYS, "jeff")))
+      const dispatcher = makeSessionDispatcher({
+        ...(scenario.decideMs !== undefined ? { decide: simulatedDecide(scenario.decideMs) } : {}),
+        make: (_assistant, h) =>
+          Effect.sync(() => {
+            hooks = h
+            return { push: (input: ConversationInput) => void Queue.offerUnsafe(inbox, input), send: () => "accepted" as const }
+          })
+      })
+      const feed = (events: Stream.Stream<SttEvent>) =>
+        queued
+          ? events.pipe(
+            // As the recogniser's queue does in serve mode: its timing does not wait for a decision the dispatcher holds.
+            Stream.map((event) => ({ event, at: performance.now() })),
+            Stream.buffer({ capacity: "unbounded" }),
+            Stream.mapEffect(({ event, at }) => {
+              if (event._tag === "EndOfTurn") recogniserEot = at
+              return dispatcher.dispatch(route.filter(event, at))
+            }),
+            Stream.drain
+          )
+          : events.pipe(Stream.mapEffect((event) => dispatcher.dispatch(route.filter(event, performance.now()))), Stream.drain)
+      const driver = Stream.runDrain(perTurn(feed)).pipe(Effect.ensuring(Queue.end(inbox)))
+      yield* Effect.gen(function*() {
+        const conversation = yield* Conversation
+        yield* Effect.all([driver, conversation.voice(Stream.fromQueue(inbox))], { concurrency: "unbounded", discard: true })
+      }).pipe(Effect.provide(layer))
+      return rows
+    }
     // Serve mode's wake gate, on the events as they arrive (time passed in, as there).
-    const wake = makeWakeGate(scenario.wake ?? WAKE_ALWAYS)
+    const route = scenario.route === undefined ? undefined : makeRouteGate(scenario.route)
+    const wake = route ?? makeWakeGate(scenario.wake ?? WAKE_ALWAYS)
     const gated = (events: Stream.Stream<SttEvent>) =>
       events.pipe(Stream.flatMap((event) => Stream.fromIterable(wake.filter(event, performance.now()).events)))
-    const rows: Array<BenchRow> = []
-    const events = Stream.fromIterable(turns.map((t, k) => ({ ...t, k }))).pipe(
-      Stream.flatMap(({ round, turn, k }) =>
-        Stream.fromEffectDrain(barrier === undefined ? Effect.void : barrier(k)).pipe(
-          Stream.concat(gated(scripted(sttEvents(turn, scenario)))),
-          Stream.concat(Stream.fromEffectDrain(Effect.gen(function*() {
-            const trace = yield* Queue.take(finished)
-            if (round > 0) rows.push({ label: `${label}${round}.${script.indexOf(turn) + 1} ${turn.user.slice(0, 24)}`, trace })
-          })))
-        ), { concurrency: 1 })
-    )
     yield* Effect.gen(function*() {
       const conversation = yield* Conversation
-      yield* conversation.voice(events)
+      yield* conversation.voice(perTurn(gated))
     }).pipe(Effect.provide(layer))
     return rows
   })

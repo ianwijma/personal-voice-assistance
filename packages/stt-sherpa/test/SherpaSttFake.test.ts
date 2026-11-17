@@ -8,7 +8,7 @@ import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import { modelFiles, type PresetName, presets } from "../src/presets.ts"
-import { check, makeWithWorker, orphans } from "../src/SherpaStt.ts"
+import { acquire, check, makeWithWorker, orphans, whenNoOrphans, workerKey, workers } from "../src/SherpaStt.ts"
 
 const fakeWorker = new URL("./fake-worker.mjs", import.meta.url)
 const fakeStreamingWorker = new URL("./fake-streaming-worker.mjs", import.meta.url)
@@ -163,22 +163,29 @@ describe("SherpaStt (stand-in streaming worker, production boundary code): segme
 })
 
 describe("SherpaStt (stand-in worker): a worker that does not answer close", () => {
-  it.live("is left behind once, and no second model is loaded beside it until it has gone", () =>
+  it.live("is left behind once, and no second worker of its key is loaded beside it until it has gone; another key loads", () =>
     Effect.gen(function*() {
       const options = { model: "parakeet-v2" as const, modelDir: fakeModelDir(), agc: false }
       // A native decode that takes 600 ms to settle; the close waits only 100 ms.
-      const stuck = { url: fakeWorker, data: { closeDelayMs: 600 }, closeWaitMs: 100 }
+      const data = { closeDelayMs: 600 }
+      const stuck = { url: fakeWorker, data, closeWaitMs: 100 }
+      const key = workerKey(options, stuck)
       yield* Effect.scoped(makeWithWorker(options, stuck))
-      assert.strictEqual(orphans(), 1, "left running")
+      assert.strictEqual(orphans(key), 1, "left running")
+      assert.strictEqual(orphans(), 1)
       // A reload's preflight (`check`) refuses too, before the running engines are stopped.
-      assert.strictEqual((yield* Effect.result(check(options)))._tag, "Failure")
-      const refused = yield* Effect.result(Effect.scoped(makeWithWorker(options, { url: fakeWorker })))
-      assert.strictEqual(refused._tag, "Failure")
+      assert.strictEqual((yield* Effect.result(check(options, stuck)))._tag, "Failure", "check")
+      const refused = yield* Effect.result(Effect.scoped(makeWithWorker(options, { url: fakeWorker, data })))
+      assert.strictEqual(refused._tag, "Failure", "refused")
       if (refused._tag === "Failure") assert.include(refused.failure.message, "has not shut down")
+      // The rule is per key: another model (here another model directory) loads beside the orphan.
+      const other = { ...options, modelDir: fakeModelDir() }
+      assert.strictEqual((yield* Effect.result(check(other, { url: fakeWorker, data })))._tag, "Success")
+      yield* Effect.scoped(makeWithWorker(other, { url: fakeWorker, data }))
       // Once it answers it is terminated and counted out; loading works again.
-      for (let i = 0; i < 100 && orphans() > 0; i++) yield* Effect.sleep(20)
+      yield* Effect.promise(() => whenNoOrphans(key))
       assert.strictEqual(orphans(), 0)
-      yield* Effect.scoped(makeWithWorker(options, { url: fakeWorker }))
+      yield* Effect.scoped(makeWithWorker(options, { url: fakeWorker, data }))
       assert.strictEqual(orphans(), 0)
     }))
 
@@ -195,6 +202,71 @@ describe("SherpaStt (stand-in worker): a worker that does not answer close", () 
       assert.strictEqual(orphans(), 0)
       yield* Effect.scoped(makeWithWorker(options, { url: fakeWorker }))
     }))
+})
+
+describe("SherpaStt (stand-in worker): one worker per key, per-stream options (docs/ASSISTANTS.md §3.2)", () => {
+  const tagsOf = (events: ReadonlyArray<SttEvent>) => events.map((e) => ("text" in e ? `${e._tag}(${e.text})` : e._tag)).join(" ")
+
+  it.live("two hearers on one model with different end pauses share one worker, and each gets its own end of turn", () =>
+    Effect.gen(function*() {
+      const dir = fakeModelDir()
+      const script = { url: fakeWorker, data: { wordsOfAudio: true, decodeMs: 5 } }
+      const before = workers()
+      const quick = yield* makeWithWorker({ model: "parakeet-v2", modelDir: dir, agc: false, eagerSilenceMs: 150, finalSilenceMs: 300 }, script)
+      const patient = yield* makeWithWorker({ model: "parakeet-v2", modelDir: dir, agc: false, eagerSilenceMs: 250, finalSilenceMs: 900, vadThreshold: 0.6 }, script)
+      assert.strictEqual(workers() - before, 1, "one worker for both")
+      // Speech, a 500 ms pause, more speech, a long pause: the quick hearer ends a turn in the pause, the patient one
+      // waits it out and hears one turn.
+      const spoken = () => audio([[8, 300], [false, 500], [6, 300], [false, 1_200]])
+      const [a, b] = yield* Effect.all([Stream.runCollect(quick.transcribe(spoken())), Stream.runCollect(patient.transcribe(spoken()))], {
+        concurrency: "unbounded"
+      })
+      assert.deepStrictEqual(turns([...a]), ["w8", "w6"], tagsOf([...a]))
+      assert.deepStrictEqual(turns([...b]), ["w8 w6"], tagsOf([...b]))
+    }).pipe(Effect.scoped))
+
+  it.live("two models are two workers; a worker is stopped with its last user", () =>
+    Effect.gen(function*() {
+      const before = workers()
+      yield* Effect.scoped(Effect.gen(function*() {
+        const a = yield* acquire({ model: "parakeet-v2", modelDir: fakeModelDir(), agc: false }, { url: fakeWorker, data: { text: "a" } })
+        const b = yield* acquire({ model: "parakeet-v2", modelDir: fakeModelDir(), agc: false }, { url: fakeWorker, data: { text: "b" } })
+        assert.notStrictEqual(a.key, b.key)
+        assert.strictEqual(workers() - before, 2)
+        const heard = yield* Effect.all([
+          Stream.runCollect(a.forStream({ agc: false }).transcribe(audio([[true, 300], [false, 700]]))),
+          Stream.runCollect(b.forStream({ agc: false }).transcribe(audio([[true, 300], [false, 700]])))
+        ], { concurrency: "unbounded" })
+        assert.deepStrictEqual(heard.map((events) => turns([...events])), [["a"], ["b"]])
+      }))
+      assert.strictEqual(workers(), before, "both stopped")
+    }))
+
+  it.live("the language is part of the key only for a model that takes one", () =>
+    Effect.sync(() => {
+      assert.strictEqual(workerKey({ model: "parakeet-v2", language: "en" }), workerKey({ model: "parakeet-v2", language: "nl" }))
+      assert.notStrictEqual(workerKey({ model: "whisper-turbo", language: "en" }), workerKey({ model: "whisper-turbo", language: "nl" }))
+      assert.notStrictEqual(workerKey({ model: "parakeet-v2" }), workerKey({ model: "parakeet-v2", threads: 7 }))
+      assert.strictEqual(workerKey({ model: "parakeet-v2", finalSilenceMs: 100 }), workerKey({ model: "parakeet-v2", finalSilenceMs: 900, vadThreshold: 0.3, agc: false }))
+    }))
+
+  it.live("a worker that died is not reused: its users are told, and the next caller loads a new one", () =>
+    Effect.gen(function*() {
+      const options = { model: "parakeet-v2" as const, modelDir: fakeModelDir(), agc: false }
+      const script = { url: fakeWorker, data: { exitOnAudioOf: 1 } }
+      const first = yield* acquire(options, script)
+      let told: string | undefined
+      first.onFailure((e) => {
+        told = e.message
+      })
+      const exit = yield* Effect.exit(Stream.runDrain(first.forStream().transcribe(audio([[true, 200]]))))
+      assert.strictEqual(exit._tag, "Failure")
+      assert.include(told ?? "", "exited", String(exit))
+      assert.isDefined(first.failure())
+      const second = yield* acquire(options, script)
+      assert.notStrictEqual(second, first)
+      assert.isUndefined(second.failure())
+    }).pipe(Effect.scoped))
 })
 
 describe("SherpaStt (stand-in worker): several transcriptions at once on one worker", () => {

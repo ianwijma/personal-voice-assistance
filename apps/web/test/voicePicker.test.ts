@@ -11,7 +11,7 @@ const provider = (id: string, label: string, extra: Partial<ProviderInfo> = {}):
   id, label, location: id === "sherpa" ? "local" : "hosted", status: "ready", settingsPath: "voices/providers", inUse: false, ...extra
 })
 const voice = (p: string, voiceId: string, name: string, extra: Partial<VoiceEntry> = {}): VoiceEntry => ({
-  voice: { provider: p, voiceId }, key: `${p}:${voiceId}`, name, tags: [], previewable: true, selected: false, favourite: false, ...extra
+  voice: { provider: p, voiceId }, key: `${p}:${voiceId}`, name, tags: [], previewable: true, usedBy: [], favourite: false, ...extra
 })
 const lists: ReadonlyArray<ProviderVoices> = [
   { provider: provider("sherpa", "On this machine"), stale: false, truncated: false, voices: [

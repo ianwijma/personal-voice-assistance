@@ -21,6 +21,10 @@ export interface QueryHandle {
   close(): void
   initializationResult(): Promise<{ readonly account: AccountInfo; readonly models: ReadonlyArray<ModelInfo> }>
   setMcpServers(servers: Record<string, McpServerConfig>): Promise<unknown>
+  /** The model of the session's next responses (streaming-input mode). */
+  setModel(model?: string): Promise<void>
+  /** Mid-session flag settings; `effortLevel: null` goes back to the model's default effort. */
+  applyFlagSettings(settings: { readonly effortLevel?: "low" | "medium" | "high" | null }): Promise<void>
 }
 
 /** An assistant tool as handed to the harness: name, description, JSON Schema of the input. */

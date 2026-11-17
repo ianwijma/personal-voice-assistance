@@ -1,5 +1,6 @@
 "use client"
 import { useEffect, useRef, useState } from "react"
+import { nameOf, newConversationTip, newConversationToast, viewedId } from "@/lib/voiceSetup.ts"
 import { useClient, useClientState } from "./context.tsx"
 import { Icon, Spinner } from "./ui/Icon.tsx"
 import { cx } from "./ui/controls.tsx"
@@ -16,29 +17,33 @@ const useNewConversation = (announce: boolean) => {
   const start = async () => {
     if (busy || !open) return
     setBusy(true)
-    const result = await client.newConversation() // continuation(none): only this control's own state and a toast
+    // The conversation the chat shows (or would show): the other assistants keep theirs.
+    const result = await client.newConversation(viewedId(client.store.get())) // continuation(none): only this control's own state and a toast
     setBusy(false)
     if (!result.ok) client.store.dispatch({ type: "local/toast", message: result.error?.message ?? "A new conversation could not be started.", tone: "error" })
-    else if (announce && !client.store.get().ui.chatOpen) client.store.dispatch({ type: "local/toast", message: "Started a new conversation.", tone: "info" })
+    else if (announce && !client.store.get().ui.chatOpen) client.store.dispatch({ type: "local/toast", message: newConversationToast(client.store.get()), tone: "info" })
   }
   return { busy, disabled: busy || !open, start }
 }
 
-/** In the chat panel's header: icon + label (icon only on the narrowest phones, where the title needs the room). */
+/**
+ * In the chat panel's header: an icon (the title is long with several assistants). Its tip says whose conversation
+ * restarts and that the others keep theirs.
+ */
 export function NewConversationButton() {
   const v = useNewConversation(false)
+  const tip = useClientState(newConversationTip)
   return (
     <button
       type="button"
       data-testid="new-conversation"
       onClick={() => void v.start()}
       disabled={v.disabled}
-      aria-label="New conversation"
-      title="Start a new conversation: the assistant forgets this one"
-      className="inline-flex h-11 items-center gap-1.5 rounded-md px-2.5 text-[13px] text-ink-muted transition-colors duration-[120ms] hover:bg-surface-2 hover:text-ink disabled:opacity-40"
+      aria-label={tip}
+      title={tip}
+      className="inline-flex size-11 items-center justify-center rounded-md text-ink-muted transition-colors duration-[120ms] hover:bg-surface-2 hover:text-ink disabled:opacity-40"
     >
-      {v.busy ? <Spinner size={16} /> : <Icon name="newChat" size={18} />}
-      <span className="max-[360px]:sr-only">New conversation</span>
+      {v.busy ? <Spinner size={16} /> : <Icon name="newChat" size={20} />}
     </button>
   )
 }
@@ -49,6 +54,7 @@ export function NewConversationButton() {
  */
 export function DockOverflow({ className }: { readonly className: string }) {
   const v = useNewConversation(true)
+  const menuText = useClientState((s) => ((s.setup?.assistants.length ?? 0) > 1 ? `New conversation with ${nameOf(s, viewedId(s))}` : "New conversation"))
   const [open, setOpen] = useState(false)
   const wrap = useRef<HTMLDivElement>(null)
   const trigger = useRef<HTMLButtonElement>(null)
@@ -116,7 +122,7 @@ export function DockOverflow({ className }: { readonly className: string }) {
             className="flex min-h-11 w-full items-center gap-2.5 rounded-md px-3 text-left text-[15px] text-ink transition-colors duration-[120ms] hover:bg-surface-2 disabled:opacity-40"
           >
             <Icon name="newChat" size={18} className="text-ink-muted" />
-            New conversation
+            {menuText}
           </button>
         </div>
       )}

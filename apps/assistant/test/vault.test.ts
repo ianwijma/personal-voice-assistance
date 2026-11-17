@@ -218,7 +218,7 @@ describe("vault: the settings store on top of it", () => {
     await Effect.runPromise(store.saveAssistant(["STT_PROVIDER", "DEEPGRAM_API_KEY"], { STT_PROVIDER: "deepgram" }, { DEEPGRAM_API_KEY: "dg" }))
     expect(existsSync(join(dir, "secrets.json"))).toBe(false)
     expect(vault.secrets()?.assistant).toEqual({ ANTHROPIC_API_KEY: "sk-json", DEEPGRAM_API_KEY: "dg" })
-    expect(JSON.parse(readFileSync(join(dir, "settings.json"), "utf8"))).toMatchObject({ version: 3, assistant: { STT_PROVIDER: "deepgram" } })
+    expect(JSON.parse(readFileSync(join(dir, "settings.json"), "utf8"))).toMatchObject({ version: 4, assistant: { STT_PROVIDER: "deepgram" } })
     expect(readFileSync(join(dir, "settings.json"), "utf8")).not.toContain("dg\"")
   })
 

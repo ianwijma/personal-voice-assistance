@@ -11,8 +11,10 @@ import {
   TurnSource
 } from "./common.ts"
 import { AdminSession, AdminState } from "./admin.ts"
-import { DeviceId, DeviceInfo, DeviceProfileInfo, FrontendKindInfo, WakePhrase } from "./frontends.ts"
-import { AdminSnapshot, EngineStatus, EngineSummary, ModuleInfo, SettingsSection, Snapshot, TraceInfo } from "./snapshot.ts"
+import { AssistantId } from "./assistants.ts"
+import { AssistantInfo, DeviceListInfo, DeviceSetup, DeviceTypeInfo } from "./devices.ts"
+import { DeviceId, WakePhrase } from "./frontends.ts"
+import { AdminSnapshot, EngineStatus, EngineSummary, HistoryItem, ModuleInfo, SettingsSection, Snapshot, TraceInfo } from "./snapshot.ts"
 import { EnvInfo } from "./env.ts"
 import { JobInfo, ModelSet } from "./jobs.ts"
 import { VaultInfo } from "./vault.ts"
@@ -55,7 +57,15 @@ export const State = Schema.Struct({
   type: Schema.Literal("state"),
   state: AssistantState,
   /** The committed turn this state belongs to (thinking, speaking). */
-  turnId: Schema.optionalKey(TurnId)
+  turnId: Schema.optionalKey(TurnId),
+  /**
+   * Protocol 7: the assistant that has the turn, the one rule the pages show: the assistant of the turn in flight or of
+   * the utterance being heard, else the one whose armed or follow-up window is open; `null`: nobody, speech goes to who
+   * answers without a phrase. Sent again with an unchanged `state` when only this changed (a phrase inside the
+   * utterance, a window that closed by itself while the device keeps listening, an accepted `device.pick`, which closes
+   * the windows). Absent: the server does not say.
+   */
+  holder: Schema.optionalKey(Schema.NullOr(AssistantId))
 })
 
 /**
@@ -74,7 +84,9 @@ export const TurnStart = Schema.Struct({
   source: TurnSource,
   userText: Schema.String,
   /** The reply will be spoken (voice turns, and typed turns from the audio owner with `speak`). */
-  spoken: Schema.Boolean
+  spoken: Schema.Boolean,
+  /** Protocol 7: the assistant answering. */
+  assistantId: Schema.optionalKey(AssistantId)
 })
 
 /**
@@ -88,7 +100,9 @@ export const AssistantText = Schema.Struct({
   clause: Schema.NullOr(NonNegativeInt),
   text: Schema.String,
   /** The voice speaking this clause (spoken turns only). */
-  voice: Schema.optionalKey(Schema.String)
+  voice: Schema.optionalKey(Schema.String),
+  /** Protocol 7: the assistant answering. */
+  assistantId: Schema.optionalKey(AssistantId)
 })
 
 /** Clauses up to and including `clause` have started playing in the owner's browser. */
@@ -106,7 +120,9 @@ export const ToolStart = Schema.Struct({
   /** The module that contributed the tool (null for an unknown tool name). */
   moduleId: Schema.NullOr(ModuleId),
   /** The model's input, truncated by the server to about 2 KB of JSON. */
-  input: Schema.Json
+  input: Schema.Json,
+  /** Protocol 7: the assistant whose turn it is (as on `turn.start`), so a tab that joined mid-turn files it right. */
+  assistantId: Schema.optionalKey(AssistantId)
 })
 
 export const ToolEnd = Schema.Struct({
@@ -116,7 +132,9 @@ export const ToolEnd = Schema.Struct({
   ok: Schema.Boolean,
   ms: NonNegativeFinite,
   /** The error returned to the model, when `ok` is false. */
-  error: Schema.optionalKey(Schema.String)
+  error: Schema.optionalKey(Schema.String),
+  /** Protocol 7: the assistant whose turn it is (as on `turn.start`). */
+  assistantId: Schema.optionalKey(AssistantId)
 })
 
 /** A committed turn ended. `trace` is its latency trace. */
@@ -131,7 +149,9 @@ export const TurnEnd = Schema.Struct({
 export const ReplyStart = Schema.Struct({
   type: Schema.Literal("reply.start"),
   turnId: TurnId,
-  sampleRate: Schema.Int.check(Schema.isBetween({ minimum: 8000, maximum: 96_000 }))
+  sampleRate: Schema.Int.check(Schema.isBetween({ minimum: 8000, maximum: 96_000 })),
+  /** Protocol 7: the assistant whose voice this is. */
+  assistantId: Schema.optionalKey(AssistantId)
 })
 
 /** Audio owner only: every frame of the reply has been sent. */
@@ -196,7 +216,14 @@ export const Result = Schema.Struct({
   /** Present when `ok` is false. */
   error: Schema.optionalKey(ErrorInfo),
   /** Protocol 5: present only on the successful result of `admin.login`. */
-  admin: Schema.optionalKey(AdminSession)
+  admin: Schema.optionalKey(AdminSession),
+  /** Protocol 7: present only on the successful result of `assistant.create`: the id the server made. */
+  assistantId: Schema.optionalKey(AssistantId),
+  /**
+   * Protocol 7: present only on the successful result of `device.save`: the revision the saved device or defaults
+   * have now, so the page can wait until that revision has reached it (the lists are pushed after the result).
+   */
+  rev: Schema.optionalKey(NonNegativeInt)
 })
 
 /**
@@ -227,29 +254,14 @@ export const AdminSnapshotMessage = Schema.Struct({
 })
 
 /**
- * Protocol 5: this connection's effective device profile changed (its own `device.update`, an admin change to its
- * kind or to the device, the device was forgotten, or a voice became disabled so `voice` fell back to `""`). Sent
- * to every connection of the device. Replaces `snapshot.device`.
- */
-export const DeviceProfileMessage = Schema.Struct({
-  type: Schema.Literal("device.profile"),
-  ...DeviceProfileInfo.fields
-})
-
-/** Protocol 5, admin connections only: the front-end kinds or their defaults changed. The whole list. */
-export const Frontends = Schema.Struct({
-  type: Schema.Literal("frontends"),
-  frontends: Schema.Array(FrontendKindInfo)
-})
-
-/**
  * Protocol 5, admin connections only: the devices changed (seen, renamed, overrides, forgotten, connected,
  * disconnected, audio owner). The whole list, most recently seen first; at most one per second while only
- * `lastSeen` / `connections` change.
+ * `lastSeen` / `connections` change. Protocol 7 adds `own`, `settings`, `hearer` and `rev` to each device
+ * (`DeviceListInfo`: a superset of the protocol 5 entry, so the one tag serves both).
  */
 export const Devices = Schema.Struct({
   type: Schema.Literal("devices"),
-  devices: Schema.Array(DeviceInfo)
+  devices: Schema.Array(DeviceListInfo)
 })
 
 /**
@@ -261,7 +273,9 @@ export const Devices = Schema.Struct({
 export const Wake = Schema.Struct({
   type: Schema.Literal("wake"),
   phrase: WakePhrase,
-  armed: Schema.Boolean
+  armed: Schema.Boolean,
+  /** Protocol 7: the assistant the phrase belongs to. */
+  assistantId: Schema.optionalKey(AssistantId)
 })
 
 /**
@@ -270,6 +284,9 @@ export const Wake = Schema.Struct({
  * none). `accepted`: the assistant took the utterance (it answers it, or the phrase alone made it listen); `true`
  * without `matched` means it was accepted without a phrase (always listening, or inside an armed or follow-up
  * window), `false` that it was ignored. Absent from an older server: the page then only knows "no phrase matched".
+ * `source` (protocol 7, additive): where the server heard it, so the page need not guess from its session list:
+ * `deviceId` the device whose audio it was (absent: a voice page without a device), `assistantId` the assistant the
+ * matched phrase belongs to there (absent: no phrase matched, or it is nobody's). Absent from an older server.
  * Never stored.
  */
 export const WakeHeard = Schema.Struct({
@@ -277,6 +294,7 @@ export const WakeHeard = Schema.Struct({
   text: Schema.String,
   matched: Schema.optionalKey(WakePhrase),
   accepted: Schema.optionalKey(Schema.Boolean),
+  source: Schema.optionalKey(Schema.Struct({ deviceId: Schema.optionalKey(DeviceId), assistantId: Schema.optionalKey(AssistantId) })),
   /** Epoch milliseconds. */
   at: NonNegativeFinite
 })
@@ -293,7 +311,9 @@ export const Conversation = Schema.Struct({
   id: ConversationId,
   reason: ConversationReason,
   /** Epoch milliseconds when it started. */
-  startedAt: NonNegativeFinite
+  startedAt: NonNegativeFinite,
+  /** Protocol 7: whose conversation (one per assistant per device). */
+  assistantId: Schema.optionalKey(AssistantId)
 })
 
 /**
@@ -331,6 +351,42 @@ export const Pong = Schema.Struct({
   id: NonNegativeInt
 })
 
+// -- Protocol 7 (docs/ASSISTANTS.md §5.3, §5.4)
+
+/** The voice connection's device setup (replaces `device.profile`; also `snapshot.setup`). */
+export const DeviceSetupMessage = Schema.Struct({
+  type: Schema.Literal("device.setup"),
+  ...DeviceSetup.fields
+})
+
+/** Answer to `conversation.read`, also the other assistants' history on demand. */
+export const ConversationHistory = Schema.Struct({
+  type: Schema.Literal("conversation.history"),
+  requestId: RequestId,
+  assistantId: AssistantId,
+  id: ConversationId,
+  history: Schema.Array(HistoryItem),
+  /**
+   * Protocol 7: the turn whose exchange ends `history` (its user message and what followed it), when a turn of this
+   * session was committed last. The page may still show that turn as running (its `turn.end` is on the way): that
+   * running turn and this exchange are the same, and no other running turn is in `history`. Absent: the server does
+   * not say, or no turn of this session ends the history.
+   */
+  lastTurnId: Schema.optionalKey(TurnId)
+})
+
+/** Admin connections only: the whole list of assistants, order kept. */
+export const AssistantsMessage = Schema.Struct({
+  type: Schema.Literal("assistants"),
+  assistants: Schema.Array(AssistantInfo)
+})
+
+/** Admin connections only: the device types and their defaults (replaces `frontends`). */
+export const DeviceTypesMessage = Schema.Struct({
+  type: Schema.Literal("device.types"),
+  types: Schema.Array(DeviceTypeInfo)
+})
+
 export const ServerMessage = Schema.Union([
   Welcome,
   Session,
@@ -357,16 +413,28 @@ export const ServerMessage = Schema.Union([
   EngineSummaryMessage,
   AdminStateMessage,
   AdminSnapshotMessage,
-  DeviceProfileMessage,
-  Frontends,
   Devices,
   Wake,
   WakeHeard,
   Conversation,
   Sessions,
   TraceMessage,
-  Pong
+  Pong,
+  DeviceSetupMessage,
+  ConversationHistory,
+  AssistantsMessage,
+  DeviceTypesMessage
 ]).pipe(Schema.toTaggedUnion("type"))
 export type ServerMessage = typeof ServerMessage.Type
 export type ServerMessageType = ServerMessage["type"]
 export type ServerMessageOf<T extends ServerMessageType> = Extract<ServerMessage, { readonly type: T }>
+
+/** The server messages that protocol 7 adds (also members of `ServerMessage`); `devices` and `result` are extended in place. */
+export const AssistantsServerMessage = Schema.Union([
+  DeviceSetupMessage,
+  ConversationHistory,
+  AssistantsMessage,
+  DeviceTypesMessage
+]).pipe(Schema.toTaggedUnion("type"))
+export type AssistantsServerMessage = typeof AssistantsServerMessage.Type
+export type AssistantsServerMessageType = AssistantsServerMessage["type"]

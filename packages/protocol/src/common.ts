@@ -102,20 +102,33 @@ export const ErrorCode = Schema.Literals([
    * Every settings, module, vault, job, model, `.env`, front-end and device-admin request, and `wake.test`.
    */
   "admin_required",
-  /** Protocol 5: no such device (`device.admin.update`, `device.forget`) or front-end kind (`frontend.update`). */
+  /** Protocol 5: no such device or device type (`device.save`, `device.forget`). */
   "unknown_device",
   /**
    * Protocol 6: an `audio.claim` or `text.send` would start one more voice session than `MAX_VOICE_SESSIONS` allows
    * ("The assistant is already talking on N devices").
    */
   "sessions_full",
+  /** Protocol 7: the entity (assistant, device type, device) changed since the page read it (`rev`); reload it. */
+  "stale",
+  /** Protocol 7: one wake phrase belongs to two assignments on one device. */
+  "duplicate_phrase",
+  /** Protocol 7: an assignment, `withoutPhrase`, `device.pick` or `conversation.read` names an assistant that does not exist (here). */
+  "unknown_assistant",
+  /** Protocol 7: `MAX_ASSISTANTS`, `MAX_ASSIGNMENTS` or `MAX_PHRASES_PER_DEVICE` would be exceeded. */
+  "limit_reached",
+  /** Protocol 7: `device.pick` on a device whose settings do not allow it. */
+  "not_allowed",
   "internal"
 ])
 export type ErrorCode = typeof ErrorCode.Type
 
+/** A field of a form, or (protocol 7) the dotted path of a field of an assistant or device ("hearing.finalSilenceMs"). */
+export const FieldPath = Schema.String.check(Schema.isPattern(/^[A-Za-z][A-Za-z0-9_.-]{0,127}$/))
+
 /** A validation problem in one settings field (`key: null` = the form as a whole). */
 export const FieldError = Schema.Struct({
-  key: Schema.NullOr(FieldKey),
+  key: Schema.NullOr(FieldPath),
   message: Schema.String
 })
 export type FieldError = typeof FieldError.Type

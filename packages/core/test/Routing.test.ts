@@ -1,17 +1,6 @@
 import { describe, expect, it } from "vitest"
-import {
-  activeAgent,
-  armAgent,
-  DEFAULT_AGENT_REF,
-  defaultRoutingConfig,
-  initialRouterState,
-  makeTriggerRouter,
-  type RouteInput,
-  type RouterState,
-  type RoutingConfig,
-  setActiveAgent,
-  wordMatchScore
-} from "../src/Routing.ts"
+import { activeAgent, armAgent, initialRouterState, type RouteInput, type RouterState, setActiveAgent } from "../src/Routing.ts"
+import { DEFAULT_AGENT_REF, defaultRoutingConfig, makeTriggerRouter, type RoutingConfig, wordMatchScore } from "../src/TriggerRouter.ts"
 import { phoneticWord } from "../src/TextMatching.ts"
 
 const config: RoutingConfig = {

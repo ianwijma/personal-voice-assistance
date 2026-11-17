@@ -203,7 +203,7 @@ describe("voice API: providers and voices", () => {
       gender: "female",
       local: { state: "installed", sizeMb: 68, diskMb: 83 },
       previewable: true,
-      selected: true,
+      usedBy: [expect.any(String)],
       favourite: false
     })
     expect(local.voices.find((v: any) => v.key === "sherpa:kokoro-af_heart")).toMatchObject({ local: { state: "not_installed" }, previewable: false })
@@ -410,36 +410,21 @@ describe("voice API: favourites", () => {
   })
 })
 
-describe("voice API: the assistant's voice", () => {
-  it("read, save (checked first), and the reload it needs", async () => {
-    const { server, api } = await start()
+describe("voice API: the assistants' voices (docs/ASSISTANTS.md §5.5)", () => {
+  it("GET default is the first assistant's voice; PUT default is gone (410), the voice is saved with the assistant", async () => {
+    const { api } = await start()
     const before = await api("GET", "voices/default")
-    expect(before.data.default).toMatchObject({ key: "sherpa:en_US-lessac-medium", source: "default", locked: false, running: "sherpa:en_US-lessac-medium", reloadPending: false })
-    expect((await api("PUT", "voices/default", { voice: kokoro })).data.error.code).toBe("not_installed")
-    expect((await api("PUT", "voices/default", { voice: skylar })).data.error.code).toBe("needs_key")
-    expect((await api("PUT", "voices/default", { voice: { provider: "elevenlabs", voiceId: "nosuchvoice" } })).data.error.code).toBe("unknown_voice")
-    const saved = await api("PUT", "voices/default", { voice: sarah })
-    expect(saved.status).toBe(200)
-    expect(saved.data.default).toMatchObject({ key: "elevenlabs:EXAVITQu4vr4xnSDxMaL", name: "Sarah", source: "saved", reloadPending: true })
-    expect(saved.data.reload).toBeUndefined()
-    expect(server.handle.engine.status().reloadPendingFor).toEqual(["voices/overview"])
-    const settings = JSON.parse(readFileSync(join(server.dataDir, "settings.json"), "utf8"))
-    expect(settings.assistant.ASSISTANT_VOICE).toBe("elevenlabs:EXAVITQu4vr4xnSDxMaL")
-    const reloaded = await api("PUT", "voices/default", { voice: lessac, reload: true })
-    expect(reloaded.data.reload).toEqual({ ok: true })
+    expect(before.data.default).toMatchObject({ key: "sherpa:en_US-lessac-medium", source: "assistant", locked: false, running: "sherpa:en_US-lessac-medium", reloadPending: false })
+    const gone = await api("PUT", "voices/default", { voice: sarah })
+    expect(gone.status).toBe(410)
+    expect(gone.data.error.code).toBe("gone")
+    expect(gone.data.error.message).toContain("Voice tab")
     expect((await api("GET", "voices")).data.selected).toBe("sherpa:en_US-lessac-medium")
   })
 
-  it("set in the environment: locked", async () => {
-    const { api } = await start({ env: { ASSISTANT_VOICE: "sherpa:en_US-lessac-medium" } })
-    expect((await api("GET", "voices/default")).data.default).toMatchObject({ source: "environment", locked: true })
-    expect((await api("PUT", "voices/default", { voice: sarah })).data.error.code).toBe("locked")
-  })
-
-  it("an old install's settings are migrated, with notes", async () => {
+  it("a migrated old install's voice is the assistant's", async () => {
     const { api } = await start({ env: { DEFAULT_VOICE: "natural", VOICES: "standard,natural,expressive" } })
     const { data } = await api("GET", "voices/default")
-    expect(data.default).toMatchObject({ key: "sherpa:kokoro-af_heart", source: "migrated" })
-    expect(data.default.notes.join(" ")).toContain("VOICES is no longer used")
+    expect(data.default).toMatchObject({ key: "sherpa:kokoro-af_heart", source: "assistant" })
   })
 })

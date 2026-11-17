@@ -11,7 +11,7 @@ import { createAssistantClient } from "../src/lib/client.ts"
 import { PlayerProcessor } from "../worklets/player.js"
 import { flush, installFakeAudio, tokenFor } from "./fakeAudio.ts"
 import { alternating, contentCounts, QUANTUM, replyFrame } from "./worklets/oracle.ts"
-import { profileMessage } from "./profile.ts"
+import { setupMessage } from "./profile.ts"
 
 const LOCAL_REPLY_ID = 0xffff_fff0
 let fake: ReturnType<typeof installFakeAudio>
@@ -92,7 +92,7 @@ describe("finding 1: an echo test of an older session never touches the session 
     const { client } = await owningClient()
     const outcome = client.echoTest().then(() => "resolved", (e: Error) => e.message)
     await vi.advanceTimersByTimeAsync(1200) // playing
-    client.store.dispatch(profileMessage({ outputPath: "element" })) // the profile changed in admin
+    client.store.dispatch(setupMessage({ outputPath: "element" })) // the device settings changed in admin
     await vi.advanceTimersByTimeAsync(100)
     expect(await outcome).toMatch(/interrupted/)
     expect(client.prefs.get().echoTest).toBeUndefined()
@@ -110,8 +110,8 @@ describe("finding 2 (protocol 5): a profile change reaches the running microphon
 
   it("processing changed in the profile: the microphone re-opens with it, then audio.config (without a mode) is sent", async () => {
     const { client, sent } = await owningClient()
-    client.store.dispatch(profileMessage({ echoCancellation: false }))
-    client.store.dispatch(profileMessage({ echoCancellation: false, interruptMode: "instant" }))
+    client.store.dispatch(setupMessage({ echoCancellation: false }))
+    client.store.dispatch(setupMessage({ echoCancellation: false, interruptMode: "instant" }))
     const reopened = fake.pending.at(-1)!
     expect((reopened.constraints.audio as MediaTrackConstraints).echoCancellation).toBe(false)
     reopened.resolve()
@@ -124,7 +124,7 @@ describe("finding 2 (protocol 5): a profile change reaches the running microphon
   it("an unchanged profile (another field) does not re-open the microphone", async () => {
     const { client } = await owningClient()
     const before = fake.pending.length
-    client.store.dispatch(profileMessage({ captions: false }))
+    client.store.dispatch(setupMessage({ captions: false }))
     await flush()
     expect(fake.pending.length).toBe(before)
   })

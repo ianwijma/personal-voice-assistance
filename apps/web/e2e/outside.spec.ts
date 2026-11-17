@@ -43,7 +43,7 @@ for (const size of [{ name: "desktop (1280 × 800)", viewport: { width: 1280, he
       await expect(list.locator("[data-group=movable]")).toHaveCount(0)
       await expect(page.getByTestId("move-all")).toHaveCount(0)
       // The field it locked is a saved setting now (no pin, no Move).
-      await gotoAdmin(page, baseURL, "#settings/language-model/provider")
+      await gotoAdmin(page, baseURL, "#settings/shared/accounts")
       const key = page.getByTestId("form-s-language-model").locator("[data-field=ANTHROPIC_API_KEY]")
       await expect(key).toHaveAttribute("data-source", "saved")
       await expect(key.getByTestId("move-to-settings")).toHaveCount(0)
@@ -55,7 +55,7 @@ for (const size of [{ name: "desktop (1280 × 800)", viewport: { width: 1280, he
     })
 
     test("a field set by .env shows the file and line, and moves into the settings from there", async ({ page, baseURL }) => {
-      await gotoAdmin(page, baseURL, "#settings/language-model/provider")
+      await gotoAdmin(page, baseURL, "#settings/shared/accounts")
       const key = page.getByTestId("form-s-language-model").locator("[data-field=ANTHROPIC_API_KEY]")
       await expect(key).toHaveAttribute("data-source", "env-file")
       await key.getByTestId("move-to-settings").click()
@@ -64,7 +64,7 @@ for (const size of [{ name: "desktop (1280 × 800)", viewport: { width: 1280, he
     })
 
     test("a download on the Models page shows progress and can be cancelled", async ({ page, baseURL }) => {
-      await gotoAdmin(page, baseURL, "#settings/speech/models")
+      await gotoAdmin(page, baseURL, "#settings/shared/speech")
       const models = page.getByTestId("models-stt-models")
       await expect(models).toContainText("3 of 5 downloaded")
       const whisper = models.locator("[data-model=whisper-turbo]")
@@ -88,27 +88,9 @@ for (const size of [{ name: "desktop (1280 × 800)", viewport: { width: 1280, he
       await zip.getByRole("button", { name: /Delete/ }).click()
       await expect(zip).toHaveAttribute("data-state", "missing")
       await expect(models).toContainText("2 of 5 downloaded")
-      // Voices › Models is its own page (same id, other category).
-      await gotoAdmin(page, baseURL, "#settings/voices/models")
+      // The voice models are on Voice providers.
+      await gotoAdmin(page, baseURL, "#settings/shared/providers")
       await expect(page.getByTestId("models-tts-models").locator("[data-model=nl_NL-pim-medium]")).toHaveAttribute("data-state", "missing")
-    })
-
-    test("choosing a recogniser that is not downloaded offers Download and holds Save until it is there", async ({ page, baseURL }) => {
-      await gotoAdmin(page, baseURL, "#settings/speech/engine")
-      const form = page.getByTestId("form-s-stt-engine")
-      await form.locator("[data-field=STT_SHERPA_MODEL] select").selectOption("parakeet-ultra")
-      const inline = form.getByTestId("inline-download")
-      await expect(inline).toContainText("Parakeet Ultra — multilingual is not downloaded yet.")
-      await expect(page.getByTestId("page-footer").getByRole("button", { name: "Save", exact: true })).toBeDisabled()
-      await inline.getByRole("button", { name: /Download Parakeet Ultra/ }).click()
-      await expect(inline.getByTestId("job-progress")).toBeVisible()
-      // The mock's download takes about 5.5 s; then the option is downloaded and Save works.
-      await expect(form.getByTestId("inline-download")).toHaveCount(0, { timeout: 12_000 })
-      const save = page.getByTestId("page-footer").getByRole("button", { name: "Save", exact: true })
-      await expect(save).toBeEnabled()
-      await save.click()
-      await expect(page.getByTestId("page-footer").getByText("Saved")).toBeVisible()
-      expect((await log("settings.update")).at(-1)?.patch).toEqual({ values: { STT_SHERPA_MODEL: "parakeet-ultra" }, secrets: {} })
     })
   })
 }
@@ -122,7 +104,7 @@ test.describe("with the keys locked", () => {
     const list = await overrides(page, baseURL)
     await expect(list).toContainText("keys can move once it is unlocked")
     await expect(list).not.toContainText("Needs the admin login") // a logged-in admin may change everything
-    await gotoAdmin(page, baseURL, "#settings/speech/models")
+    await gotoAdmin(page, baseURL, "#settings/shared/speech")
     const whisper = page.getByTestId("models-stt-models").locator("[data-model=whisper-turbo]")
     await expect(whisper.getByRole("button", { name: /Download/ })).toBeVisible()
   })

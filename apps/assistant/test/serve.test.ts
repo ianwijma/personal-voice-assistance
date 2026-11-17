@@ -10,7 +10,7 @@ import { afterEach, describe, expect, it, vi } from "vitest"
 vi.setConfig({ testTimeout: 20_000 })
 import { mkdtempSync } from "node:fs"
 import { tmpdir } from "node:os"
-import { defaultPreflight, EngineBuildProblems } from "../src/serve/Engine.ts"
+import { EngineBuildProblems } from "../src/serve/Engine.ts"
 import { ScriptedClient, sleep } from "./support/scriptedClient.ts"
 import { controlledStt, fakeBuild, greeterModule, markedPcm, scriptedLlm, startTestServer, TEST_ADMIN_PASSWORD, type TestServer, toneTts } from "./support/serveHarness.ts"
 
@@ -60,12 +60,14 @@ describe("serve: handshake", () => {
     expect(welcome.snapshot.state).toBe("idle")
     expect(welcome.snapshot.engine).toEqual({ ready: true, state: "ready", voices: [{ name: "sherpa:en_US-lessac-medium", description: "Lessac", isDefault: true }] })
     expect(welcome.snapshot.history).toEqual([])
-    expect(Object.keys(welcome.snapshot).sort()).toEqual(["admin", "conversation", "device", "engine", "history", "ownerPresent", "role", "state"])
+    expect(Object.keys(welcome.snapshot).sort()).toEqual(["admin", "conversations", "engine", "history", "ownerPresent", "role", "setup", "state"])
     const admin = await connect()
     const { snapshot } = await admin.admin(TEST_ADMIN_PASSWORD)
     expect(snapshot.engine.state).toBe("ready")
     expect(snapshot.modules.map((m) => [m.id, m.state])).toEqual([["greeter", "running"]])
     expect(snapshot.sections.map((s) => [s.id, `${s.group}/${s.page?.id}`])).toEqual([
+      ["home", "modules/home"],
+      ["llm-openai-accounts", "agents/openai-accounts"],
       ["language-model", "agents/provider"],
       ["llm-behaviour", "agents/behaviour"],
       ["stt-engine", "speech/engine"],
@@ -74,6 +76,7 @@ describe("serve: handshake", () => {
       ["stt-deepgram", "speech/deepgram"],
       ["voices", "voices/overview"],
       ["voice-providers", "voices/providers"],
+      ["routing", "agents/routing"],
       ["recordings", "diagnostics/recordings"]
     ])
     expect(snapshot.modules[0]).toMatchObject({ id: "greeter", group: "modules" })
@@ -263,11 +266,11 @@ describe("serve: interruptions", () => {
     expect((await owner.waitFor("turn.end", (m) => m.turnId === start.turnId, { from: owner.messages.indexOf(start) })).outcome).toBe("interrupted")
     const told = await other.waitFor("conversation")
     expect(told.reason).toBe("new")
-    expect(told.id).not.toBe(first.snapshot.conversation.id)
+    expect(told.id).not.toBe(first.snapshot.conversations[0]!.id)
     const later = await connect()
     const welcome = await later.hello()
     expect(welcome.snapshot.history).toEqual([])
-    expect(welcome.snapshot.conversation.id).toBe(told.id)
+    expect(welcome.snapshot.conversations[0]!.id).toBe(told.id)
     // The next turn starts from nothing.
     const from = owner.messages.length
     owner.send({ type: "text.send", requestId: "t3", text: "third", speak: false })
@@ -368,14 +371,14 @@ describe("serve: modules and settings", () => {
     const invalid = await a.waitFor("result", (m) => m.requestId === "c2")
     expect(invalid.error).toMatchObject({ code: "invalid_settings", fieldErrors: [{ key: "greeting", message: "Not this one" }] })
 
+    // A capability is switched on and off per assistant (docs/ASSISTANTS.md §2.6): its own switch is refused.
     b.send({ type: "module.disable", requestId: "d1", moduleId: "greeter" })
-    expect((await b.waitFor("result", (m) => m.requestId === "d1")).ok).toBe(true)
-    await a.waitFor("module.changed", (m) => !m.module.enabled && m.module.state === "stopping")
+    expect((await b.waitFor("result", (m) => m.requestId === "d1")).error?.code).toBe("not_allowed")
     a.send({ type: "module.enable", requestId: "e1", moduleId: "nope" })
     expect((await a.waitFor("result", (m) => m.requestId === "e1")).error?.code).toBe("unknown_module")
 
     const saved = JSON.parse(readFileSync(join(server!.dataDir, "settings.json"), "utf8"))
-    expect(saved.modules.greeter).toEqual({ enabled: false, settings: { greeting: "hoi" } })
+    expect(saved.modules.greeter).toEqual({ enabled: true, settings: { greeting: "hoi" } })
     const secrets = join(server!.dataDir, "secrets.json")
     expect(JSON.parse(readFileSync(secrets, "utf8")).modules.greeter).toEqual({ token: "s3cret" })
     expect(statSync(secrets).mode & 0o777).toBe(0o600)
@@ -428,7 +431,8 @@ describe("serve: modules and settings", () => {
     expect((await a.waitFor("result", (m) => m.requestId === "r1", { timeoutMs: 10_000 })).ok).toBe(true)
     await b.waitFor("engine", (m) => m.engine.state === "ready", { from })
     const engines = b.messages.slice(from).filter((m) => m.type === "engine").map((m) => (m as { engine: { state: string; reloadPending: boolean; reloadPendingFor?: ReadonlyArray<string> } }).engine)
-    expect(engines.map((e) => e.state)).toEqual(["reloading", "ready"])
+    // The resource pool's rebuild during the reload announces its own changes (more `reloading` statuses).
+    expect(engines.map((e) => e.state).filter((s, i, all) => s !== all[i - 1])).toEqual(["reloading", "ready"])
     expect(engines.at(-1)!.reloadPending).toBe(false)
     expect(engines.at(-1)!.reloadPendingFor).toEqual([])
 
@@ -438,14 +442,16 @@ describe("serve: modules and settings", () => {
       { role: "assistant", text: "Reply to before reload.", interrupted: false, tools: [] }
     ])
     const saved = JSON.parse(readFileSync(join(server!.dataDir, "settings.json"), "utf8"))
-    expect(saved).toEqual({
-      version: 3,
+    expect(saved).toMatchObject({
+      version: 4,
       revision: expect.any(Number),
-      modules: expect.anything(),
       assistant: { STT_SHERPA_FINAL_SILENCE_MS: 500 },
-      frontends: { "web-voice": { interruptMode: "instant" } },
+      deviceTypes: { "web-voice": { interruptMode: "instant" } },
       devices: expect.anything()
     })
+    expect(Object.keys(saved.assistant)).toEqual(["STT_SHERPA_FINAL_SILENCE_MS"])
+    // The flat key that became per assistant is mirrored into the migrated assistant.
+    expect(saved.assistants.byId.assistant.hearing.finalSilenceMs).toBe(500)
   })
 })
 
@@ -477,7 +483,7 @@ describe("serve: choosing the speech recognition model", () => {
 
   it("a reload whose recogniser files are missing is refused before the running engines stop", async () => {
     const emptyModels = mkdtempSync(join(tmpdir(), "pva-no-models-"))
-    const { stt } = await basic((t) => `Reply to ${t}.`, { env: { STT_SHERPA_MODEL_DIR: emptyModels }, preflight: defaultPreflight })
+    const { stt } = await basic((t) => `Reply to ${t}.`, { env: { STT_SHERPA_MODEL_DIR: emptyModels }, checkModelsBeforeReload: true })
     const a = await connect()
     await a.admin(TEST_ADMIN_PASSWORD)
     const from = a.messages.length

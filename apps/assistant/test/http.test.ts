@@ -1,5 +1,4 @@
 // The HTTP/WebSocket front door (http.ts): sockets the hub rejects, misbehaving peers, and the Host check.
-import { DEFAULT_DEVICE_PROFILE } from "@pva/protocol"
 import { ConfigProvider, Effect, Exit, Scope } from "effect"
 import { spawnSync } from "node:child_process"
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readlinkSync, writeFileSync } from "node:fs"
@@ -29,12 +28,11 @@ const rejectingHub = (): SessionHub & { rejected: number } => {
     toSession: () => {},
     sessionsChanged: () => {},
     sessionDiscarded: () => {},
-    profileOf: () => DEFAULT_DEVICE_PROFILE,
     closeAll: () => {},
     size: () => 0,
     micFramesLost: () => 0,
     vaultChanged: () => {},
-    refreshProfiles: () => {},
+    refreshDevices: () => {},
     wakeHeard: () => {}
   }
   return hub

@@ -1,5 +1,5 @@
 // SessionHub request limits: requests that do work (settings, modules, reload) are bounded per connection and overall.
-import { DEFAULT_DEVICE_PROFILE, encodeClientMessage, PROTOCOL_VERSION, type ServerMessage } from "@pva/protocol"
+import { encodeClientMessage, PROTOCOL_VERSION, type ServerMessage } from "@pva/protocol"
 import { Deferred, Effect } from "effect"
 import { describe, expect, it } from "vitest"
 import { makeAccessPolicy } from "../src/serve/access.ts"
@@ -13,9 +13,13 @@ const noVault = () => ({
   keys: { state: () => "none", info: () => ({ state: "none", admin: true, location: "" }), subscribe: () => () => {} } as never,
   access: makeAccessPolicy({ catalog: [], sections: () => [], vaultState: () => "none" }),
   admin: makeAdminSessions({ password: ADMIN_PASSWORD }),
-  frontends: {
-    profile: () => DEFAULT_DEVICE_PROFILE,
-    kinds: () => [],
+  assistants: {
+    setupFor: () => ({ assistants: [], withoutPhrase: { mode: "nobody" }, canPick: false, canAuto: false, interruptMode: "confirm", audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, speakAloud: true, outputPath: "direct", prebufferMs: 60 }, captions: { captions: true, speakTyped: true } }),
+    infos: () => [],
+    deviceTypes: () => [],
+    devices: () => []
+  } as never,
+  devices: {
     devices: () => [],
     seen: () => Effect.void,
     left: () => {}
@@ -32,10 +36,18 @@ const fakeSessions = (send: (input: unknown) => string = () => "accepted") => {
     web: { setOwner: () => {}, setMicLive: () => {}, micFrame: () => {}, report: () => {} },
     tracker: { current: () => ({ state: "idle" }) },
     publisher: { committedTurn: () => undefined },
-    conversation: { send, history: Effect.succeed([]), conversation: () => ({ id: "c1", startedAt: 0 }) },
+    // Typed text goes to the session's routed conversations (`sendText`, an Effect since WP-4b); Stop is `stop`.
+    conversation: {
+      sendText: (text: string, speak: boolean) => Effect.sync(() => send({ _tag: "TextInput", text, speak })),
+      stop: () => send({ _tag: "Interrupt" }),
+      history: () => Effect.succeed([]),
+      conversation: () => ({ id: "c1", startedAt: 0 })
+    },
     syncProfile: () => {},
     ownerChanged: () => {},
-    touch: () => {}
+    touch: () => {},
+    holder: () => null,
+    pickAccepted: () => {}
   })
   return {
     get: (key: string) => sessions.get(key),

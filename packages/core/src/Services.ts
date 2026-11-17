@@ -36,6 +36,12 @@ export class Stt extends Context.Service<Stt, {
 /** Language model. One request = one model call; the tool loop lives in `Conversation`. */
 export class Llm extends Context.Service<Llm, {
   stream(request: LlmRequest): Stream.Stream<LlmEvent, LlmError>
+  /**
+   * Optional: keep this instance alive for as long as `turn` runs, every model call of a tool loop and the gaps
+   * between them included (serve mode's resource pool releases an instance nobody uses only once no turn holds it).
+   * `makeModelAgent` runs each turn inside it. Absent: nothing to hold.
+   */
+  readonly holdDuring?: <A, E, R>(turn: Stream.Stream<A, E, R>) => Stream.Stream<A, E, R>
 }>()("@pva/core/Llm") {}
 
 /** A chunk of synthesised audio and the index of the input clause it belongs to. */
