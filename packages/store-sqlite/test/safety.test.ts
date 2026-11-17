@@ -63,7 +63,7 @@ describe("SQLite store files", () => {
       again.close()
     }))
 
-  it.effect("concurrent backups of one day never meet: each writes its own file and publishes it whole", () =>
+  it.effect("concurrent backups of one day never overlap: one at a time through the lock, each through its own file, published whole", () =>
     Effect.gen(function*() {
       const dir = tmp()
       const file = join(dir, "household.db")
@@ -75,6 +75,8 @@ describe("SQLite store files", () => {
       const now = Date.UTC(2026, 10, 18, 12)
       const results = yield* Effect.all([writer.backup({ now }), writer.backup({ now }), reader.backup({ now }), reader.backup({ now })], { concurrency: "unbounded" })
       assert.strictEqual(new Set(results.map((r) => r.path)).size, 1)
+      // One at a time, across stores (and processes): the lock is gone afterwards.
+      assert.isFalse(existsSync(join(dir, "backups", ".backup.lock")))
       for (const d of [join(dir, "backups"), copyDir]) {
         assert.deepStrictEqual(readdirSync(d).filter((n) => n.includes(".part-")), [], d)
         const copy = new DatabaseSync(join(d, readdirSync(d).find((n) => n.endsWith(".db"))!), { readOnly: true })

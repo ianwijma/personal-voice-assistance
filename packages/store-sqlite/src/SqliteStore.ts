@@ -16,7 +16,7 @@ import { Clock, Effect, Semaphore, type Scope } from "effect"
 import { open, stat } from "node:fs/promises"
 import type { DatabaseSync, StatementSync } from "node:sqlite"
 import { dirname, join } from "node:path"
-import { checkpointFile, copyDatabase, copyFilePrivately, type FileGuard, lastBackupIn, narrow, privateDir, pruneArchives, type PruneResult, sqlite, unguarded } from "./files.ts"
+import { checkpointFile, copyDatabase, copyFilePrivately, type FileGuard, lastBackupIn, narrow, privateDir, pruneArchives, type PruneResult, sqlite, unguarded, withBackupLock } from "./files.ts"
 
 /**
  * The household store on SQLite (docs/STORING-DATA.md): one file (`data/household.db`, mode 0600 in a 0700
@@ -447,7 +447,8 @@ export const makeSqliteStore = (options: SqliteStoreOptions): Effect.Effect<Sqli
       removed: scheduleScrub
     }
 
-    // ---- Backups (a connection of their own, the copy on SQLite's worker thread), one at a time
+    // ---- Backups (a connection of their own, the copy on SQLite's worker thread), one at a time: in this process (the
+    // semaphore) and across processes (the lock file in the backup directory)
 
     const backupLock = Semaphore.makeUnsafe(1)
     let backedUpForUpgrade: string | undefined
@@ -460,7 +461,7 @@ export const makeSqliteStore = (options: SqliteStoreOptions): Effect.Effect<Sqli
         if (created) return undefined
         const at = yield* Clock.currentTimeMillis
         const path = join(backupDir, `household-${localDate(at)}-before-${what}.db`)
-        yield* files(`Backing up to ${path}`, () => copyDatabase(options.filename, path))
+        yield* files(`Backing up to ${path}`, () => withBackupLock(backupDir, () => copyDatabase(options.filename, path)))
         backedUpForUpgrade = path
         log(`Household data backed up to ${path} before upgrading ${what}`)
         return path
@@ -492,11 +493,12 @@ export const makeSqliteStore = (options: SqliteStoreOptions): Effect.Effect<Sqli
         const at = opts?.now ?? (yield* Clock.currentTimeMillis)
         const name = `household-${localDate(at)}.db`
         const path = join(backupDir, name)
-        yield* files(`Backing up to ${path}`, () => copyDatabase(options.filename, path))
-        if (options.backupCopyDir !== undefined) {
-          const copyDir = options.backupCopyDir
-          yield* files(`Copying the backup to ${copyDir}`, () => copyFilePrivately(path, join(copyDir, name)))
-        }
+        const copyDir = options.backupCopyDir
+        yield* files(`Backing up to ${path}`, () =>
+          withBackupLock(backupDir, async () => {
+            await copyDatabase(options.filename, path)
+            if (copyDir !== undefined) await copyFilePrivately(path, join(copyDir, name))
+          }))
         yield* pruneBackups({ now: at })
         return { path }
       }))

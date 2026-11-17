@@ -705,6 +705,15 @@ export const householdStoreContract = (name: string, make: MakeStore) =>
         const wide = allFrames(wideFeed.snapshot({ id: "kitchen-01" }))
         for (const f of wide) assert.isAtMost(encodeServerMessage(f).length, SNAPSHOT_PART_CHARS)
         assert.strictEqual(wide.flatMap((f) => f.collections).flatMap((x) => x.rows).length, 32)
+        // Many small visible rows in many collections: hundreds of frames, and still the whole is within the bound.
+        yield* store.forModule("wide").transaction((tx) => {
+          for (let i = 0; i < 64; i++) for (let r = 0; r < 70; r++) tx.collection(many[i]!).insert({ text: `${i}.${r} ${"w".repeat(300)}`, tag: "show" })
+        })
+        const full = allFrames(wideFeed.snapshot({ id: "kitchen-01" }))
+        assert.isAbove(full.length, 50)
+        for (const f of full) assert.isAtMost(encodeServerMessage(f).length, SNAPSHOT_PART_CHARS)
+        assert.isAtMost(full.reduce((n, f) => n + encodeServerMessage(f).length, 0), SNAPSHOT_MAX_CHARS)
+        assert.isTrue(full.flatMap((f) => f.collections).some((x) => x.truncated))
       }).pipe(Effect.scoped))
 
     it.effect("module events reach pages only through a declared projection, which may fail on its own; host events never", () =>

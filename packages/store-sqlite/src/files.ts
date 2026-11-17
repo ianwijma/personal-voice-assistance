@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto"
-import { chmod, mkdir, open, readdir, rename, rm, stat } from "node:fs/promises"
+import { chmod, mkdir, open, readdir, readFile, rename, rm, stat } from "node:fs/promises"
 import { dirname, join } from "node:path"
 import { Worker } from "node:worker_threads"
 
@@ -84,6 +84,52 @@ export const copyDatabase = async (source: string, path: string): Promise<void> 
   } catch (e) {
     await rm(part, { force: true }).catch(() => undefined)
     throw e
+  }
+}
+
+/**
+ * Run `run` while holding the backup lock of `dir` (`<dir>/.backup.lock`, holding the holder's pid): one backup at a
+ * time across processes (the server's daily one and `pnpm start household backup`) and stores. A backup that finds the
+ * lock held by a live process waits for it (polling, at most `waitMs`); a lock left by a process that died is taken
+ * over.
+ */
+export const withBackupLock = async <A>(dir: string, run: () => Promise<A>, waitMs = 10 * 60_000): Promise<A> => {
+  await privateDir(dir)
+  const lock = join(dir, ".backup.lock")
+  const until = Date.now() + waitMs
+  for (;;) {
+    try {
+      const handle = await open(lock, "wx", 0o600)
+      try {
+        await handle.writeFile(String(process.pid))
+      } finally {
+        await handle.close()
+      }
+      break
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e
+      const text = (await readFile(lock, "utf8").catch(() => "")).trim()
+      const holder = Number(text)
+      const alive = text === "" || (Number.isInteger(holder) && holder > 0 && (() => {
+        try {
+          process.kill(holder, 0)
+          return true
+        } catch (err) {
+          return (err as NodeJS.ErrnoException).code === "EPERM"
+        }
+      })())
+      if (!alive) {
+        await rm(lock, { force: true })
+        continue
+      }
+      if (Date.now() > until) throw new Error(`another backup is still running (process ${text || "?"})`)
+      await new Promise((r) => setTimeout(r, 100))
+    }
+  }
+  try {
+    return await run()
+  } finally {
+    await rm(lock, { force: true }).catch(() => undefined)
   }
 }
 

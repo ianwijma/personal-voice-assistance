@@ -288,8 +288,9 @@ is the recovery point for a damaged file.
 
 - The server makes `data/backups/household-<date>.db` once a day (the first a minute after start), and copies each to
   `HOUSEHOLD_BACKUP_COPY_DIR` when set. A backup is SQLite's online backup made through a **connection of its own**, in
-  one step on SQLite's worker thread, so turns are never held up by it ("Latency"). One backup at a time: the store
-  never starts one while another runs. Each is written to a temporary file of its own (`….part-<pid>-<random>`), made
+  one step on SQLite's worker thread, so turns are never held up by it ("Latency"). One backup at a time, also across
+  processes: a backup waits while another holds `data/backups/.backup.lock` (the server's daily one and `pnpm start
+  household backup`; a lock left by a process that died is taken over). Each is written to a temporary file of its own (`….part-<pid>-<random>`), made
   one self-contained file (no log beside it), synced and published with one `rename`. Every file and directory the
   store makes is private to the user (`0600`, `0700`), whatever the umask; a backup that stays and is readable by
   others (an older one, one copied in by hand) is narrowed when the store prunes.

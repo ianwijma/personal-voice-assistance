@@ -213,7 +213,8 @@ export const makeHouseholdFeed = (options: {
     let after: { updatedAt: number; id: string } | undefined
     let rowsHere = 0
     let read = 0
-    let total = 0
+    /** Characters of the frames already sent (each counted whole, its envelope included). */
+    let sentChars = 0
     let part = 0
     let finished = false
     const frameOverhead = chars({ type: "household.snapshot", seq, part: 999_999, final: false, collections: [] })
@@ -226,6 +227,7 @@ export const makeHouseholdFeed = (options: {
       const flush = () => {
         if (chunks.length === 0) return
         frames.push({ type: "household.snapshot", seq, part: part++, final: false, collections: chunks })
+        sentChars += frameChars
         chunks = []
         frameChars = frameOverhead
       }
@@ -236,7 +238,8 @@ export const makeHouseholdFeed = (options: {
         let last = chunks.at(-1)
         const fresh = last === undefined || last.module !== module || last.collection !== collection
         const cost = rowChars + (fresh ? envelope : 0)
-        if (total + cost + frameOverhead > SNAPSHOT_MAX_CHARS) return false
+        // What is sent so far, this frame, this addition, and the final frame still to come stay within the bound.
+        if (sentChars + frameChars + cost + frameOverhead > SNAPSHOT_MAX_CHARS) return false
         if (frameChars + cost > SNAPSHOT_PART_CHARS) {
           flush()
           last = undefined
@@ -245,12 +248,10 @@ export const makeHouseholdFeed = (options: {
           last = { module, collection, rows: [], truncated: false }
           chunks.push(last)
           frameChars += envelope
-          total += envelope
         }
         if (row !== undefined) (last.rows as Array<HouseholdRow>).push(row)
         if (truncated) chunks[chunks.length - 1] = { ...last, truncated: true }
         frameChars += rowChars
-        total += rowChars
         return true
       }
       const markRestTruncated = () => {
