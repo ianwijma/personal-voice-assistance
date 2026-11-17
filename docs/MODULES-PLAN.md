@@ -399,20 +399,52 @@ version in §5 needs them.
 
 ### P6. Scheduler
 
-- `ctx.scheduler` as in shared-state §6.2: `schedule` (at, in, cron), `handle`, `pause`, `resume`, `reschedule`,
-  `cancel`, `list`, `runTask`. A `jobs` table, one fiber sleeping until the earliest due time, wall-clock due times,
-  a re-check on clock jumps. Handlers are registered in a module's `shared` part.
-- Missed-while-down policies `fire-late`, `{ fireIfWithinMs }`, `skip`, `inbox`, and "run the last missed occurrence
-  once" for recurring jobs.
-- Exactly-once as far as one process can give it. Every occurrence has a stable key (job id and due time). A due
-  job is claimed in a transaction (P4's synchronous kind; scheduling from a module's transaction uses its handle). A handler declares whether it is idempotent. Only an idempotent handler is ever
-  run again for the same occurrence, whether it failed (retried with back-off up to a declared limit) or was found
-  `running` at start; any other handler that fails or was interrupted is marked failed and reported on the Health
-  page. A `{ notify }` job is delivered again under the same notification id, which the notification service
-  dedupes. Completing or failing an occurrence and scheduling the next one of a recurring job happen in one
-  transaction, so a recurring job always moves on.
-- `{ notify }` jobs are accepted and stored in P6 and delivered once P9 exists; until then they log.
-- Admin: a list of scheduled jobs with cancel.
+Cut down after its first review (21 blocking findings, and a rewrite was due anyway for the new store and host).
+The scheduler does one thing: it calls a module's handler at a time, once.
+
+- **`ctx.scheduler`**: `schedule({ handler, payload, at | inMs | cron, key?, late?, origin? })`, `cancel(id | { key })`,
+  `reschedule(id, { at | inMs })`, `get(id)`, `list({ key?, after?, limit? })`, and `handle(name, { payload: schema,
+  idempotent?, retries?, run })` during `shared` or `start`. Nothing else: **no pause and resume** (a module cancels
+  and schedules again; a paused timer is the module's own row), **no `runTask`** (long work is a fiber in the
+  module's own scope with its progress in the module's own collection), **no `{ notify }` jobs and no `inbox`
+  policy** (P9 registers a handler of its own for notifications that are due later, and lateness of a notification
+  is P9's delivery policy).
+- **A job** is one row in a collection of the owner `core.scheduler`: module, handler name, an optional key (one
+  live job per module and key; scheduling the same key again replaces it), a JSON payload of at most 2,000
+  characters, the due time, for a repeating job its cron expression and zone, its origin (device, assistant and
+  person, taken from the turn or job that scheduled it unless given), a state (`scheduled`, `running`, `done`,
+  `failed`, `cancelled`, `missed`) and an attempt count. Modules that repeat by `RRULE` keep the rule themselves
+  and schedule one job for the next occurrence (§2); `cron` is for system jobs such as refreshing a cache.
+- **The loop**: one fiber sleeps until the earliest due time among jobs whose handler is published, and is woken by
+  a schedule, a cancel, a handler being published, and a clock jump. Per published handler it reads the due jobs
+  through an index, so a job whose module is off or down just stays `scheduled` and is run when its handler
+  appears: there is no waiting state. Finished rows are removed after seven days by a pass that also runs when
+  nothing is due.
+- **Late jobs**: `late` is `"run"` (the default: run once, however late) or `{ withinMs }` (run only if it is at
+  most that late, otherwise the job becomes `missed` and the handler is not called). There is no grace beyond what
+  the job says. A repeating job that missed several occurrences runs once, for the latest one, and then continues
+  from the first occurrence after now. The handler is told how late it is.
+- **Once**: a due job is claimed in a transaction (`running`, attempt + 1) and its outcome is written in another
+  that also plans the next occurrence of a repeating job. That second write is conditional on the row's revision at
+  the claim, so a job that was rescheduled or cancelled while it ran ignores the old run's outcome. A handler that
+  fails or times out: if it declared itself idempotent it is retried with back-off up to its limit, otherwise the
+  occurrence is `failed` and shows on the Health page. A row found `running` with no run alive (after a crash, or
+  when the outcome could not be written) is treated the same way. A repeating job always moves on to its next
+  occurrence, whatever happened to this one. A handler that ends interrupted, other than by its module stopping or
+  the server shutting down, has failed.
+- **Handlers and the host**: a handler is a registration of its part (P1's seam), so it is published and withdrawn
+  with its module in the same step as its tools. A run is a call in flight of its module: it gets the grace period
+  at a stop and is then interrupted, and its job is retried or failed by the rule above. The handler runs with the
+  job's origin as its principal (`CurrentJob`), through the gateway like any call; a job scheduled from inside a
+  handler inherits that origin.
+- **Time zones**: a cron job without a zone uses the household's zone each time its next occurrence is planned. A
+  change of the household's zone therefore takes effect from the occurrence after the one already planned; the
+  admin page shows each job's next time.
+- **Limits**: payload size, 200 live jobs per module, cron expressions that never fire are refused when scheduled.
+- **Admin**: a list of jobs, read page by page, with cancel. Cancelling a job that is running does not interrupt the
+  run; its outcome is ignored.
+- A core service schedules with the same engine under its own name (P9 for notifications due later and for the end
+  of do not disturb), with handlers registered when the server starts.
 
 ### P7. Phrase commands, windows, session and device control
 
