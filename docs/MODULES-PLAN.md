@@ -272,6 +272,13 @@ Service keys and interfaces that the core provides or calls (`People`, `Privacy`
   read the host or throw. Registrars receive what the host has; they are not a boundary.
 - "Check again" always starts a fresh attempt for every demanded module that is not live.
 - Field actions get their time limit and their place in a stop in P3, which owns them.
+- An intent action's success sentence is still synthesised during the speculative window and played at promotion.
+  If access to the action is withdrawn in the fraction of a second between the eager end of turn and promotion, the
+  person may hear the start of that sentence followed by the refusal; the action is not run. Closing this was
+  measured to delay the first audio of every held intent turn by one synthesis and was reversed. A playback gate in
+  `Conversation` could close it later without that cost.
+- A tool call from the Claude Code bridge is matched to its turn by the model's `tool_use` id, which the bridge
+  receives with the call.
 
 ### P2. Language and network helpers
 
