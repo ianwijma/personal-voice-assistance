@@ -1,5 +1,6 @@
 import { Schema } from "effect"
 import { AssistantState, NonNegativeFinite, NonNegativeInt } from "./common.ts"
+import { AssistantId } from "./assistants.ts"
 import { CONVERSATION_IDLE_MINUTES_LIMITS, DeviceId, DeviceName } from "./frontends.ts"
 
 /**
@@ -59,6 +60,15 @@ export const SessionInfo = Schema.Struct({
   /** Committed turns in the current conversation. */
   turns: NonNegativeInt,
   /** Epoch milliseconds of the last committed turn; `null`: none yet in this conversation. */
-  lastTurnAt: Schema.NullOr(NonNegativeFinite)
+  lastTurnAt: Schema.NullOr(NonNegativeFinite),
+  /** Protocol 7: the assistant that answers without a phrase (or last replied). */
+  answering: Schema.optionalKey(AssistantId),
+  /** Protocol 7: one conversation per assistant; `conversationId`, `turns` and `lastTurnAt` above are the answering one's. */
+  conversations: Schema.optionalKey(Schema.Array(Schema.Struct({
+    assistantId: AssistantId,
+    conversationId: ConversationId,
+    turns: NonNegativeInt,
+    lastTurnAt: Schema.NullOr(NonNegativeFinite)
+  })))
 })
 export type SessionInfo = typeof SessionInfo.Type

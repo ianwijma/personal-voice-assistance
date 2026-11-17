@@ -3,9 +3,11 @@
  * clients (`import { clientExamples, serverExamples } from "@pva/protocol/examples"`).
  * The protocol tests check that every message type has an example here.
  */
-import type { ClientMessage, ClientMessageType } from "./client.ts"
+import type { AssistantsClientMessage, AssistantsClientMessageType, ClientMessage, ClientMessageType } from "./client.ts"
 import { PROTOCOL_VERSION } from "./constants.ts"
-import type { ServerMessage, ServerMessageType } from "./server.ts"
+import type { AssistantsServerMessage, AssistantsServerMessageType, ServerMessage, ServerMessageType } from "./server.ts"
+import type { Assistant } from "./assistants.ts"
+import { BUILT_IN_WEB_VOICE_SETTINGS, type AssistantInfo, type DeviceRecordInfo, type DeviceSettings, type DeviceTypeInfo, deviceSetupFrom } from "./devices.ts"
 import type { EnvInfo } from "./env.ts"
 import type { JobInfo, ModelSet } from "./jobs.ts"
 import {
@@ -502,4 +504,159 @@ export const serverExamples: { readonly [T in ServerMessageType]: Extract<Server
   "sessions": { type: "sessions", sessions: [exampleSession] },
   "trace": { type: "trace", key: exampleDevice.id, deviceId: exampleDevice.id, trace: { ...exampleTrace, session: exampleDevice.name } },
   "pong": { type: "pong", id: 41 }
+}
+
+// -- Protocol 7 examples (docs/ASSISTANTS.md §2, §5) -------------------------------------------------------------------
+
+export const exampleAssistant: Assistant = {
+  id: "jeff",
+  rev: 3,
+  name: "Jeff",
+  purpose: "General questions and the house",
+  handles: "Weather, time, timers, lights and heating, anything general.",
+  on: true,
+  prompt: "You are Jeff, a calm voice assistant. Answer in one or two short sentences.",
+  toolRounds: 3,
+  followUpSeconds: 8,
+  newConversationAfter: 10,
+  replyEarly: true,
+  confirmActions: "off",
+  llm: {
+    account: "anthropic",
+    model: "claude-haiku-5-5",
+    effort: "low",
+    thinking: "off",
+    maxTokens: 1024,
+    giveUpMs: 15_000,
+    warmUp: true,
+    useModules: false,
+    freshSessionAfterMinutes: 0
+  },
+  hearing: {
+    engine: "sherpa",
+    model: "nemotron-3.5",
+    language: "auto",
+    eagerSilenceMs: 250,
+    finalSilenceMs: 600,
+    minSpeechMs: 120,
+    agc: true,
+    agcMaxGainDb: 20,
+    vadThreshold: 0.5,
+    deepgram: { eotThreshold: 0.7, eagerEotThreshold: 0.4, eotTimeoutMs: 5000 }
+  },
+  voice: { provider: "piper", voiceId: "en_US-lessac-medium" },
+  modules: {
+    weather: { on: true, offTools: [], own: { units: "fahrenheit" } },
+    clock: { on: true, offTools: ["set_timer"] }
+  }
+}
+
+export const exampleAssistantT3: Assistant = {
+  ...exampleAssistant,
+  id: "t3",
+  rev: 0,
+  name: "T3",
+  purpose: "Coding questions",
+  handles: "Programming, the repository, builds.",
+  followUpSeconds: 0,
+  newConversationAfter: "never",
+  modules: {}
+}
+
+export const exampleDeviceSettings: DeviceSettings = {
+  ...BUILT_IN_WEB_VOICE_SETTINGS,
+  assistants: [
+    { assistant: "jeff", phrases: ["hey jeff", "hey jev"] },
+    { assistant: "t3", phrases: ["hey t3"], followUpSeconds: 20 }
+  ],
+  withoutPhrase: { mode: "typesafe", fallback: "jeff", giveUpMs: 400 },
+  voicePage: { pick: true }
+}
+
+export const exampleAssistantInfo: AssistantInfo = {
+  ...exampleAssistant,
+  usedOn: [
+    { target: { kind: "type", type: "web-voice" }, hears: false, reach: "phrase" },
+    { target: { kind: "device", id: "d-5c1e0b7a42" }, hears: true, reach: "without-phrase" }
+  ],
+  resources: { llm: "ready", voice: "starting" },
+  problems: []
+}
+
+export const exampleDeviceType: DeviceTypeInfo = {
+  kind: "web-voice",
+  title: "Browsers",
+  one: "browser",
+  many: "browsers",
+  description: "The voice page on a phone, tablet or computer.",
+  keys: ["assistants", "withoutPhrase", "matching", "voicePage", "interruptMode", "audio", "captions"],
+  settings: exampleDeviceSettings,
+  rev: 2
+}
+
+export const exampleDeviceRecord: DeviceRecordInfo = {
+  id: "d-5c1e0b7a42",
+  kind: "web-voice",
+  name: "iPhone · Safari",
+  firstSeen: 1_763_000_000_000,
+  lastSeen: 1_763_100_000_000,
+  own: { interruptMode: "instant", withoutPhrase: { mode: "assistant", assistant: "jeff" } },
+  settings: { ...exampleDeviceSettings, interruptMode: "instant", withoutPhrase: { mode: "assistant", assistant: "jeff" } },
+  hearer: "jeff",
+  rev: 1,
+  connections: 1,
+  audioOwner: true
+}
+
+export const exampleDeviceSetup = deviceSetupFrom(
+  exampleDeviceSettings,
+  new Map([exampleAssistant, exampleAssistantT3].map((a) => [a.id, a])),
+  { deviceId: "d-5c1e0b7a42", canAuto: true }
+)
+
+const { id: _id, rev: _rev, ...exampleAssistantBody } = exampleAssistant
+
+export const assistantsClientExamples: { readonly [T in AssistantsClientMessageType]: Extract<AssistantsClientMessage, { readonly type: T }> } = {
+  "assistant.create": {
+    type: "assistant.create",
+    requestId: "a1",
+    assistant: exampleAssistantBody,
+    copyOf: "jeff",
+    placements: [{ target: { kind: "type", type: "web-voice" }, phrase: "hey kitchen" }, { target: { kind: "device", id: "d-5c1e0b7a42" } }]
+  },
+  "assistant.save": { type: "assistant.save", requestId: "a2", assistant: exampleAssistant, saveAnyway: true },
+  "assistant.delete": { type: "assistant.delete", requestId: "a3", id: "t3", rev: 0 },
+  "device.save": {
+    type: "device.save",
+    requestId: "a4",
+    target: { kind: "device", id: "d-5c1e0b7a42" },
+    rev: 1,
+    name: "Kitchen iPad",
+    settings: { interruptMode: "instant", captions: null, withoutPhrase: { mode: "assistant", assistant: "jeff" } }
+  },
+  "conversation.read": { type: "conversation.read", requestId: "a5", assistantId: "t3" },
+  "device.pick": { type: "device.pick", requestId: "a6", withoutPhrase: "typesafe" }
+}
+
+export const assistantsServerExamples: { readonly [T in AssistantsServerMessageType]: Extract<AssistantsServerMessage, { readonly type: T }> } = {
+  "device.setup": { type: "device.setup", ...exampleDeviceSetup },
+  "conversation.history": {
+    type: "conversation.history",
+    requestId: "a5",
+    assistantId: "t3",
+    id: "5b0f6a0e-3c1d-4c7e-9a52-1f0e8d2b7c44",
+    history: [
+      { role: "user", text: "How do I rebase?" },
+      { role: "assistant", text: "Use git rebase main.", interrupted: false, tools: [] }
+    ]
+  },
+  "assistants": { type: "assistants", assistants: [exampleAssistantInfo] },
+  "device.types": { type: "device.types", types: [exampleDeviceType] },
+  "devices": { type: "devices", devices: [exampleDeviceRecord] },
+  "result": {
+    type: "result",
+    requestId: "a1",
+    ok: false,
+    error: { code: "duplicate_phrase", message: "The phrase \"hey jeff\" is used twice on this device." }
+  }
 }
