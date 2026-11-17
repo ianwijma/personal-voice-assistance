@@ -30,6 +30,19 @@ describe("parseNumber: examples", () => {
   for (const t of notEn) it(`en "${t}" is not a number`, () => expect(value(t, "en")).toBe("not-understood"))
   const notNl = ["1,000", "2,125", ",5", "1 een", "een 1", "vijf vijf", "duizend duizend", "eenhonderd", "eenduizend", "2.5", "nul nul", "honderd en vijf", "tweeënhalf", "en vijf"]
   for (const t of notNl) it(`nl "${t}" is not a number`, () => expect(value(t, "nl")).toBe("not-understood"))
+  it("Dutch spaced parts have no ceiling but the number's own: all eleven parts of 999 999 (round 4, finding 10)", () => {
+    expect(value("twee honderd vijf en twintig duizend drie honderd vier en twintig", "nl")).toBe(225_324)
+    expect(value("negen honderd negen en negentig duizend negen honderd negen en negentig", "nl")).toBe(999_999)
+    expect(value("negen honderd negen en negentig duizend negen honderd negen en negentig komma negen negen", "nl")).toBe(999_999.99)
+    // Beyond it: a twelfth part makes no number.
+    expect(value("negen honderd negen en negentig duizend negen honderd negen en negentig en", "nl")).toBe("not-understood")
+    expect(value("negen honderd negen en negentig duizend negen honderd negen en negentig negen", "nl")).toBe("not-understood")
+    expect(value("duizend duizend", "nl")).toBe("not-understood")
+  })
+  it("an accented Dutch number in NFD (round 4, finding 24)", () => {
+    expect(value("tweeëntwintig".normalize("NFD"), "nl")).toBe(22)
+    expect(value("zeshonderdtweeëntwintig".normalize("NFD"), "nl")).toBe(622)
+  })
   it("a word that is an inherited property name is no number", () => {
     for (const t of ["constructor", "__proto__", "toString"]) expect(value(t, "en")).toBe("not-understood")
   })
@@ -61,6 +74,26 @@ describe("numbers: exhaustive and sampled round trips with the speaker", () => {
       }
     }
   })
+  it("any real number: said exactly when its size is at most 999 999.99 (the size of the number given, not of its rounding), read back to it rounded (round 4, finding 9; 20 000 numbers, seed 12)", () => {
+    const r = rng(12)
+    const max = 999_999.99
+    for (let k = 0; k < 20_000; k++) {
+      const lang = r.pick(["en", "nl"] as const)
+      // Any magnitude, and often just inside or just outside the largest: 999 999.99 plus or minus up to a hundredth.
+      let v = r.chance(0.3) ? max + (r.next() - 0.5) * 0.02 : r.next() * r.pick([0.01, 1, 1000, 1_000_000, 2_000_000])
+      if (r.chance(0.3)) v = -v
+      const rounded = Math.round(Math.abs(v) * 100) / 100
+      const sayable = Math.abs(v) <= max && (v === 0 || rounded !== 0)
+      for (const words of [false, true]) {
+        const said = speakNumber(v, lang, { words })
+        if ((said !== undefined) !== sayable) throw new Error(`${lang} ${v}: "${said}", sayable ${sayable}`)
+        if (said !== undefined && value(said, lang) !== (v < 0 ? -rounded : rounded)) throw new Error(`${lang} ${v}: "${said}" reads as ${value(said, lang)}`)
+      }
+    }
+    expect(speakNumber(999_999.994, "en")).toBeUndefined()
+    expect(speakNumber(-999_999.994, "nl")).toBeUndefined()
+    expect(speakNumber(999_999.99, "en")).toBe("999999.99")
+  })
   it("the speaker's own spelling is the tests' spelling", () => {
     for (let n = 0; n <= 999_999; n += 997) {
       expect(numberToWords(n, "en")).toBe(enSpell(n))
@@ -72,13 +105,19 @@ describe("numbers: exhaustive and sampled round trips with the speaker", () => {
 describe("numbers: generated phrases and their mutants", () => {
   for (const lang of ["en", "nl"] as const) {
     const g = signedGrammar(lang)
-    it(`${lang}: 3000 generated phrases parse to their value (seed 21)`, () => {
+    it(`${lang}: 3000 generated phrases parse to their value, also in NFD (seed 21)`, () => {
       const r = rng(21)
+      let accented = 0
       for (let k = 0; k < 3000; k++) {
         const p = generate(g, "NUMBER", r)!
         const text = p.words.join(" ")
         if (value(text, lang) !== p.value) throw new Error(`"${text}" should be ${p.value}, is ${value(text, lang)}`)
+        // Also in decomposed Unicode, as the README says (review round 4, finding 24).
+        const decomposed = text.normalize("NFD")
+        if (value(decomposed, lang) !== p.value) throw new Error(`"${text}" in NFD should be ${p.value}, is ${value(decomposed, lang)}`)
+        if (decomposed !== text) accented++
       }
+      if (lang === "nl") expect(accented).toBeGreaterThan(50)
     })
     it(`${lang}: every mutant of 150 generated phrases is refused or is a number of the grammar with that value (seed 22)`, () => {
       const r = rng(22)

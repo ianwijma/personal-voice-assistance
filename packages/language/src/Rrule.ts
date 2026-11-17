@@ -67,15 +67,25 @@ const maxDays = [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
 const rfcParts: ReadonlySet<string> = new Set(["FREQ", "UNTIL", "COUNT", "INTERVAL", "BYSECOND", "BYMINUTE", "BYHOUR", "BYDAY", "BYMONTHDAY", "BYYEARDAY", "BYWEEKNO", "BYMONTH", "BYSETPOS", "WKST"])
 const notExpanded: ReadonlySet<string> = new Set(["BYSECOND", "BYMINUTE", "BYHOUR", "BYYEARDAY", "BYWEEKNO", "BYSETPOS"])
 
-const intList = (value: string, min: number, max: number): Array<number> | undefined => {
+/** A comma-separated list of whole numbers from `min` to `max`, each once; 0 only when `min` is 0; a sign only when `signed`. */
+const intList = (value: string, min: number, max: number, signed = true): Array<number> | undefined => {
   const out: Array<number> = []
   for (const d of value.split(",")) {
-    if (!/^[+-]?\d{1,3}$/.test(d)) return undefined
+    if (!(signed ? /^[+-]?\d{1,3}$/ : /^\d{1,3}$/).test(d)) return undefined
     const n = Number(d)
-    if (n < min || n > max || n === 0 || out.includes(n)) return undefined
+    if (n < min || n > max || (n === 0 && min !== 0) || out.includes(n)) return undefined
     out.push(n)
   }
   return out
+}
+/** The value ranges of the RFC 5545 parts this package does not expand (§3.3.10). */
+const notExpandedRange: Readonly<Record<string, { min: number; max: number; signed: boolean; text: string }>> = {
+  BYSECOND: { min: 0, max: 60, signed: false, text: "0–60" },
+  BYMINUTE: { min: 0, max: 59, signed: false, text: "0–59" },
+  BYHOUR: { min: 0, max: 23, signed: false, text: "0–23" },
+  BYYEARDAY: { min: -366, max: 366, signed: true, text: "1–366 or -1…-366" },
+  BYWEEKNO: { min: -53, max: 53, signed: true, text: "1–53 or -1…-53" },
+  BYSETPOS: { min: -366, max: 366, signed: true, text: "1–366 or -1…-366" }
 }
 
 const untilPattern = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z$/
@@ -188,7 +198,14 @@ export const parseRRule: (text: string) => RRuleRead = guarded((text: string): R
     seen.add(key)
     if (key.startsWith("X-")) { unsupportedPart ??= `${key} is not supported`; continue }
     if (!rfcParts.has(key)) return invalidRule(`${key} is not an RRULE part`)
-    if (notExpanded.has(key)) { unsupportedPart ??= `${key} is not supported`; continue }
+    if (notExpanded.has(key)) {
+      // A part this package does not expand is still read by RFC 5545's grammar first: a malformed value is `invalid`, only a valid one
+      // `unsupported` (review round 4, finding 21).
+      const range = notExpandedRange[key]!
+      if (intList(value, range.min, range.max, range.signed) === undefined) return invalidRule(`${key} must be ${range.text}, each once`)
+      unsupportedPart ??= `${key} is not supported`
+      continue
+    }
     switch (key) {
       case "FREQ":
         if (!["SECONDLY", "MINUTELY", "HOURLY", "DAILY", "WEEKLY", "MONTHLY", "YEARLY"].includes(value)) return invalidRule(`FREQ=${value} is not a frequency`)
@@ -208,7 +225,12 @@ export const parseRRule: (text: string) => RRuleRead = guarded((text: string): R
           if (untilParts(value) === undefined) unsupportedPart ??= `UNTIL outside ${minYear}–${maxYear} is not supported`
           until = value
         }
-        else if (/^\d{8}(T\d{6})?$/.test(value)) { unsupportedPart ??= "UNTIL must be a UTC date-time (YYYYMMDDTHHMMSSZ) with a zoned DTSTART"; until = value }
+        else if (/^\d{8}(T\d{6})?$/.test(value)) {
+          // A date-only or floating UNTIL is valid RFC 5545 this package does not take, if it is a real date (-time) at all.
+          if (!realDateTime(value.length === 8 ? `${value}T000000Z` : `${value}Z`)) return invalidRule("UNTIL is not a real date or date-time")
+          unsupportedPart ??= "UNTIL must be a UTC date-time (YYYYMMDDTHHMMSSZ) with a zoned DTSTART"
+          until = value
+        }
         else return invalidRule("UNTIL is not a date or date-time")
         break
       case "WKST":
@@ -433,11 +455,25 @@ export interface Occurrences {
   readonly stop: "limit" | "series" | "range"
 }
 
-/** The instances of a series strictly after `after`, at most `limit` (a whole number 1–10 000; default 1), in increasing order, no instant twice. */
-export const seriesAfter: (s: Series, after: number, limit?: number) => Occurrences = guarded((s: Series, after: number, limit = 1): Occurrences => {
-  if (typeof after !== "number" || Number.isNaN(after) || !Number.isInteger(limit) || limit < 1 || limit > 10_000) return { instants: [], stop: "limit" }
-  if (typeof s !== "object" || s === null || formatRRule(s.rule) === undefined || typeof s.timeZone !== "string" || normalizeTimeZone(s.timeZone) !== s.timeZone ||
-    typeof s.start !== "object" || s.start === null || !isValidLocal(s.start) || !Number.isInteger(s.start.second)) return { instants: [], stop: "series" }
+/** The supported range of `limit`. */
+const maxLimit = 10_000
+
+/**
+ * The series again through `readSeries`: the one front door (review round 4, finding 3). A series that `readSeries` would refuse when
+ * written out (a DTSTART that is not an instance, an UNTIL before it, a zone that is not the DTSTART's, no clock time) is `undefined`.
+ */
+const reread = (s: Series): Series | undefined => {
+  if (typeof s !== "object" || s === null || typeof s.start !== "object" || s.start === null || !Number.isInteger(s.start.second)) return undefined
+  const rrule = formatRRule(s.rule)
+  const dtstart = formatDtstart(s.start, s.timeZone)
+  if (rrule === undefined || dtstart === undefined) return undefined
+  const read = readSeries({ rrule, dtstart, timeZone: s.timeZone })
+  return read.kind === "ok" ? read.series : undefined
+}
+
+/** The expansion of a series `readSeries` returned (see `seriesAfter`). */
+const expand = (s: Series, after: number, limit: number): Occurrences => {
+  const count = s.rule.count
   const until = s.rule.until === undefined ? Infinity : untilInstant(s.rule.until)
   const startDay = dayNumber(s.start.year, s.start.month, s.start.day)
   // Instances strictly after `after` lie on its local day or later, less two days for any offset change around it.
@@ -446,33 +482,52 @@ export const seriesAfter: (s: Series, after: number, limit?: number) => Occurren
   const out: Array<number> = []
   let last = -Infinity
   let counted = 0
+  // The series itself has ended: its COUNT is reached, or an instance is after its UNTIL.
   let ended = false
   // COUNT counts instances, not days: a day a zone skips altogether (Pacific/Apia, 30 December 2011) lands on the next day's instant,
   // and that instant is one instance, counted once (finding 6). So with COUNT every instance from DTSTART is converted and counted.
   const take = (day: number): boolean => {
-    if (s.rule.count === undefined && day < afterDay) return true
+    if (count === undefined && day < afterDay) return true
     const instant = instantOf(s, day)
     if (instant > until) { ended = true; return false }
     if (instant <= last) return true
     last = instant
     counted++
-    if (s.rule.count !== undefined && counted > s.rule.count) { ended = true; return false }
     if (instant > after) out.push(instant)
+    // The last counted instance ends the series at once, not when the next one is looked for (review round 4, finding 4).
+    if (count !== undefined && counted >= count) { ended = true; return false }
     return out.length < limit
   }
-  const why = eachDay(s, s.rule.count === undefined ? afterDay : startDay, take)
-  return { instants: out, stop: out.length >= limit ? "limit" : ended || why === "series" ? "series" : why === "range" ? "range" : "series" }
-}, { instants: [], stop: "series" })
+  const why = eachDay(s, count === undefined ? afterDay : startDay, take)
+  // `limit` first (as many as were asked for), then the series' own end, then the end of the supported years. An UNTIL before the
+  // first instant an instance after 31 December 2199 could have also ends the series inside the supported years.
+  if (out.length >= limit) return { instants: out, stop: "limit" }
+  if (ended || why !== "range") return { instants: out, stop: "series" }
+  return { instants: out, stop: until < instantOf(s, lastDay + 1) ? "series" : "range" }
+}
+
+/**
+ * The instances of a series strictly after `after`, at most `limit` (a whole number 1–10 000; default 1), in increasing order, no
+ * instant twice, and why there are no more. `undefined` for a series `readSeries` would refuse (it is read again through it), an
+ * `after` that is NaN, or a `limit` outside its range.
+ */
+export const seriesAfter: (s: Series, after: number, limit?: number) => Occurrences | undefined = guarded((s: Series, after: number, limit = 1): Occurrences | undefined => {
+  if (typeof after !== "number" || Number.isNaN(after) || !Number.isInteger(limit) || limit < 1 || limit > maxLimit) return undefined
+  const series = reread(s)
+  return series === undefined ? undefined : expand(series, after, limit)
+}, undefined)
 
 /**
  * The occurrences of a stored recurrence strictly after an instant, up to `limit` (default 1, a whole number to 10 000), in increasing
  * order with no instant twice, and why there are no more. Instances are local date-times in the series' zone (09:00 stays 09:00
  * across daylight saving); a time the clocks skip is taken at the UTC offset from before the gap, a time that happens twice is the
- * first (RFC 5545 §3.3.10 with §3.3.5). `undefined` when `readSeries` does not accept the spec.
+ * first (RFC 5545 §3.3.10 with §3.3.5). `undefined` when `readSeries` does not accept the spec, `after` is NaN or `limit` is out of
+ * its range.
  */
 export const occurrencesAfter: (spec: RecurrenceSpec, after: number, limit?: number) => Occurrences | undefined = guarded((spec: RecurrenceSpec, after: number, limit = 1): Occurrences | undefined => {
+  if (typeof after !== "number" || Number.isNaN(after) || !Number.isInteger(limit) || limit < 1 || limit > maxLimit) return undefined
   const read = readSeries(spec)
-  return read.kind === "ok" ? seriesAfter(read.series, after, limit) : undefined
+  return read.kind === "ok" ? expand(read.series, after, limit) : undefined
 }, undefined)
 
 /** The next occurrence strictly after `after` (epoch milliseconds or a Date), or `undefined`. See `occurrencesAfter`. */
@@ -516,13 +571,16 @@ export interface DescribeOptions {
 }
 
 /**
- * A rule of the supported set in words: "every day", "every weekday", "every Monday and Wednesday", "every second Tuesday", "every
- * three weeks on Monday", "on the first of every month", "the last Friday of every month", "every year on the third of March";
- * Dutch "elke dag", "elke werkdag", "elke tweede dinsdag", "op de eerste van elke maand". For a rule without COUNT and UNTIL the words
- * are in `parseRecurrence`'s grammar and read back (with `time`, and `now` before the first occurrence) to the same occurrences; a
- * COUNT is said after them (", 5 times" / ", 5 keer") and an UNTIL with `timeZone` (", until 31 December 2027 at 23:00" / ", tot 31
- * december 2027 om 23:00"): those two are not read back. `undefined` for a rule outside the supported set, a plain weekly, monthly or
- * yearly rule without `start`, a `start` the rule does not select, an UNTIL without `timeZone`, or a time that is not a clock time.
+ * A rule of the supported set in words, for speaking: "every day", "every weekday", "every Monday and Wednesday", "every second
+ * Tuesday, from 17 November 2026", "every three weeks on Monday, from 16 November 2026", "on the first of every month", "the last
+ * Friday of every month", "every year on the third of March"; Dutch "elke dag", "elke werkdag", "elke tweede dinsdag, vanaf 17
+ * november 2026", "op de eerste van elke maand". The promise (review round 4, decision 2) is that the words state every constraint of
+ * the rule — its frequency and interval, with the interval's phase (the first day, from `start`) when the interval is above one, its
+ * weekdays, days of the month and month (a plain rule's from `start`), the time with `time`, its COUNT (", 5 times" / ", 5 keer") or
+ * UNTIL (", until 31 December 2027 at 23:00" / ", tot 31 december 2027 om 23:00", in `timeZone`) — or that it returns `undefined`.
+ * They are not promised to read back with `parseRecurrence`. `undefined` for a rule outside the supported set, an interval above one
+ * or a plain weekly, monthly or yearly rule without `start`, a `start` the rule does not select, a `timeZone` this machine does not
+ * know, an UNTIL without `timeZone`, or a time that is not a clock time.
  */
 export const describeRRule: (rrule: string | RecurrenceRule, language: Language, options?: DescribeOptions) => string | undefined = guarded((rrule: string | RecurrenceRule, language: Language, options: DescribeOptions = {}): string | undefined => {
   if (!isLanguage(language) || !isOptions(options)) return undefined
@@ -531,6 +589,10 @@ export const describeRRule: (rrule: string | RecurrenceRule, language: Language,
   const rule = read.rule
   const start = options.start
   if (start !== undefined && (typeof start !== "object" || start === null || !isValidLocal(start))) return undefined
+  // A zone given is checked whether or not this rule needs one: a zone string is data (review round 4, finding 18).
+  if (options.timeZone !== undefined && normalizeTimeZone(options.timeZone) === undefined) return undefined
+  // With an interval above one the words must say which periods: the series' first day (review round 4, finding 1).
+  if (rule.interval > 1 && start === undefined) return undefined
   const en = language === "en"
   const every = en ? "every" : "elke"
   const n = rule.interval
@@ -589,6 +651,8 @@ export const describeRRule: (rrule: string | RecurrenceRule, language: Language,
     const said = t.hour === 0 && t.minute === 0 ? "00:00" : speakTime(t, language, { period: true })!
     text += ` ${en ? "at" : "om"} ${said}`
   }
+  // The phase of an interval above one: "every other day" is not every day, but which days is said by the first one.
+  if (rule.interval > 1 && start !== undefined) text += en ? `, from ${start.day} ${monthNames.en[start.month - 1]} ${start.year}` : `, vanaf ${start.day} ${monthNames.nl[start.month - 1]} ${start.year}`
   const tail = countAndUntil(rule, language, options.timeZone)
   return tail === undefined ? undefined : text + tail
 }, undefined)

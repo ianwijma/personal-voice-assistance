@@ -71,7 +71,7 @@ export const timeGrammar = (lang: Lang, allow24 = false): Grammar => {
       { rhs: ["MINW", lit("past"), "H12"], act: ([m, , h]) => reading(h, m, false) },
       { rhs: ["MINW", lit("to"), "H12"], act: ([m, , h]) => reading(before(h), 60 - m, false) },
       { rhs: [lit("half"), "H12"], act: ([, h]) => reading(h, 30, false) },
-      { rhs: ["H12", lit("o'clock")], act: ([h]) => reading(h, 0, false) },
+      { rhs: ["H12", oneOf({ "o'clock": 1, oclock: 1 })], act: ([h]) => reading(h, 0, false) },
       { rhs: ["H24", lit("hundred")], act: ([h]) => reading(h, 0, true) },
       { rhs: ["HW", "MW"], act: ([h, m]) => reading(h.hour, m, h.exact), weight: 3 },
       { rhs: [number("en", { min: 0, max: 23, whole: true, forms: "words" })], act: ([h]) => reading(h, 0, !(h >= 1 && h <= 12), { bare: true }) },

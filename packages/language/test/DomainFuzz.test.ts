@@ -1,5 +1,6 @@
-// Review round 3, decision 1 and 6: every exported function, called with generated arguments of wrong types, extreme values and odd
-// strings, never throws and never returns NaN, Infinity, an invalid date, a date outside the supported years, or "" / "NaN" to say.
+// Review round 3, decision 1 and 6, narrowed in round 4 (decision 1): every exported function, called with arguments of their declared
+// types holding any data — extreme and odd numbers, odd strings, unknown time zones — never throws and never returns NaN, Infinity,
+// an invalid date, a date outside the supported years, or "" / "NaN" to say; an unknown time zone gives the function's failure.
 import { describe, expect, it } from "@effect/vitest"
 import * as L from "../src/index.ts"
 import { escaped } from "../src/Domain.ts"
@@ -13,56 +14,74 @@ const strings = [
 ]
 const numbers = [0, -0, 1, -1, 0.5, 1e-300, Number.MIN_VALUE, 1e21, -1e21, Number.MAX_VALUE, -Number.MAX_VALUE, Number.MAX_SAFE_INTEGER, 8.64e15, 8.64e15 + 1, -8.64e15,
   Number.NaN, Infinity, -Infinity, 999_999.999, 1_000_000, 0.0004, 2.5, 59, 60, 23, 24, 1439, 1440, Date.UTC(2026, 10, 18), Date.UTC(1999, 11, 31, 23), Date.UTC(2200, 0, 1), Date.UTC(10000, 0, 1)]
-const odd: ReadonlyArray<unknown> = [undefined, null, true, false, {}, [], [1], () => 1, Symbol("s"), 10n, new Date(Number.NaN), new Date(Date.UTC(2026, 10, 18)), Object.create(null), { toString: () => "x" }]
-const any = (r: Rng): unknown => {
-  const k = r.int(0, 2)
-  return k === 0 ? r.pick(strings) : k === 1 ? r.pick(numbers) : r.pick(odd)
-}
-const language = (r: Rng): unknown => (r.chance(0.8) ? r.pick(["en", "nl"]) : r.pick(["de", "EN", "", undefined, null, 1, {}]))
-const zone = (r: Rng): unknown => r.pick(["Europe/Amsterdam", "UTC", "Pacific/Apia", "Australia/Lord_Howe", "europe/amsterdam ", "+01:00", "Mars/Olympus", "", undefined, 5, null])
-const now = (r: Rng): unknown => (r.chance(0.7) ? r.pick(numbers) : r.pick([new Date(Date.UTC(2026, 10, 18)), new Date(Number.NaN), "2026-11-18", undefined, null, {}]))
-const clock = (r: Rng): unknown => (r.chance(0.6) ? { hour: r.pick(numbers), minute: r.pick(numbers) } : any(r))
-const date = (r: Rng): unknown => (r.chance(0.6) ? { year: r.pick([2026, 1999, 2200, 2000, 2199, 10000, Number.NaN, 2026.5]), month: r.pick([1, 2, 12, 13, 0, Number.NaN]), day: r.pick([1, 29, 30, 31, 32, -1]) } : any(r))
-const dateOptions = (r: Rng): unknown => (r.chance(0.8)
-  ? { now: now(r), timeZone: zone(r), ...(r.chance(0.3) ? { band: r.pick([{ from: "07:00", to: "21:00" }, { from: 2000, to: 3 }, { from: "25:00", to: "x" }, null, { from: Number.NaN, to: 10 }]) } : {}),
-    ...(r.chance(0.3) ? { defaultTime: clock(r) } : {}) }
-  : any(r))
-const text = (r: Rng): unknown => (r.chance(0.85) ? r.pick(strings) : any(r))
-const spec = (r: Rng): unknown => (r.chance(0.8) ? { rrule: r.pick([...strings, "FREQ=DAILY;COUNT=3", "FREQ=WEEKLY;INTERVAL=999"]), dtstart: r.pick([...strings, "DTSTART;TZID=Pacific/Apia:20111228T090000", "DTSTART;TZID=UTC:21991231T235959"]), timeZone: zone(r) } : any(r))
-const unit = (r: Rng): unknown => r.pick(["g", "kg", "oz", "lb", "ml", "l", "cup", "tsp", "pack", "piece", "handful", "parsec", "", undefined, "constructor"])
+// Review round 4, decision 1: text and numbers are data and may be anything; everything else is the caller's code and has its declared
+// type. So every argument here has its declared type, and the data in it — every string, number, instant and time zone — is drawn
+// from the pools above, whatever it holds.
+const language = (r: Rng): L.Language => r.pick(["en", "nl"] as const)
+/** Time zone strings; the invalid ones must give the function's failure (round 4, finding 18). */
+const invalidZones: ReadonlyArray<string> = ["+01:00", "Mars/Olympus", "", "not/a/zone", "GMT+1", "x".repeat(65), "constructor"]
+const zone = (r: Rng): string => r.pick(["Europe/Amsterdam", "UTC", "Pacific/Apia", "Australia/Lord_Howe", "Africa/Casablanca", "europe/amsterdam ", ...invalidZones])
+const now = (r: Rng): number | Date => (r.chance(0.8) ? r.pick(numbers) : new Date(r.pick(numbers)))
+const clock = (r: Rng): L.ClockTime => ({ hour: r.pick(numbers), minute: r.pick(numbers) })
+const date = (r: Rng): L.LocalDate => ({ year: r.pick([2026, 1999, 2200, 2000, 2199, 10000, Number.NaN, 2026.5, ...numbers]), month: r.pick([1, 2, 12, 13, 0, Number.NaN, 2.5]), day: r.pick([1, 29, 30, 31, 32, -1, 1.5]) })
+const band = (r: Rng): { from: string | number; to: string | number } => ({ from: r.chance(0.5) ? r.pick(strings) : r.pick(numbers), to: r.chance(0.5) ? r.pick(["21:00", "07:00", "2100", "24:00", ...strings]) : r.pick(numbers) })
+const dateOptions = (r: Rng, z = zone(r)): L.DateOptions & L.RecurrenceOptions => ({
+  now: now(r), timeZone: z, ...(r.chance(0.3) ? { band: band(r) } : {}), ...(r.chance(0.3) ? { defaultTime: clock(r) } : {})
+})
+const text = (r: Rng): string => r.pick(strings)
+const spec = (r: Rng, z = zone(r)): L.RecurrenceSpec => ({
+  rrule: r.pick([...strings, "FREQ=DAILY;COUNT=3", "FREQ=WEEKLY;INTERVAL=999", "FREQ=DAILY;BYHOUR=99", "FREQ=YEARLY;BYWEEKNO=0"]),
+  dtstart: r.pick([...strings, "DTSTART;TZID=Pacific/Apia:20111228T090000", "DTSTART;TZID=UTC:21991231T235959", "DTSTART;TZID=Europe/Amsterdam:20261118T090000"]),
+  timeZone: z
+})
+const units: ReadonlyArray<L.UnitId> = ["g", "kg", "oz", "lb", "ml", "cl", "dl", "l", "cup", "tsp", "tbsp", "pack", "bag", "piece", "handful", "pinch", "splash"]
+const unit = (r: Rng): L.UnitId => r.pick(units)
+const rule = (r: Rng): L.RecurrenceRule => ({
+  freq: r.pick(["DAILY", "WEEKLY", "MONTHLY", "YEARLY"] as const), interval: r.pick([1, 2, 999, 1000, ...numbers]),
+  byDay: r.pick([[], [{ weekday: "MO" as const }], [{ weekday: "TU" as const, nth: r.pick([1, -1, 5, 6, 0, ...numbers]) }]]),
+  byMonthDay: r.pick([[], [31], [0], [-1], [1, 15], [r.pick(numbers)]]), byMonth: r.pick([[], [2], [13], [r.pick(numbers)]]),
+  ...(r.chance(0.3) ? { count: r.pick(numbers) } : {}), ...(r.chance(0.2) ? { until: r.pick([...strings, "20271231T230000Z", "21991231T235959Z"]) } : {})
+})
+
+/** A call, and whether its data says it must fail: a known-invalid zone, for every function that takes one. */
+type Call = (r: Rng) => { readonly result: unknown; readonly mustFail?: boolean }
+const failed = (v: unknown): boolean =>
+  v === undefined || (typeof v === "object" && v !== null && ["not-understood", "invalid", "unsupported"].includes((v as { kind?: string }).kind ?? ""))
+const withZone = (r: Rng, f: (z: string) => unknown) => { const z = zone(r); return { result: f(z), mustFail: invalidZones.includes(z) } }
 
 /** Every exported function with a generator of its arguments. */
-const calls: ReadonlyArray<readonly [string, (r: Rng) => unknown]> = [
-  ["parseNumber", (r) => L.parseNumber(text(r) as string, language(r) as "en")],
-  ["parseDuration", (r) => L.parseDuration(text(r) as string, language(r) as "en")],
-  ["parseTimeOfDay", (r) => L.parseTimeOfDay(text(r) as string, language(r) as "en", (r.chance(0.5) ? { band: { from: r.pick(numbers), to: r.pick(numbers) }, afterMinutes: r.pick(numbers) } : any(r)) as undefined)],
-  ["parseDateTime", (r) => L.parseDateTime(text(r) as string, language(r) as "en", dateOptions(r) as L.DateOptions)],
-  ["parseQuantity", (r) => L.parseQuantity(text(r) as string, language(r) as "en", (r.chance(0.5) ? { cupMl: r.pick(numbers) } : any(r)) as undefined)],
-  ["convertAmount", (r) => L.convertAmount(r.pick(numbers) as number, unit(r) as "g", unit(r) as "g", (r.chance(0.5) ? { cupMl: r.pick(numbers) } : any(r)) as undefined)],
-  ["parseRecurrence", (r) => L.parseRecurrence(text(r) as string, language(r) as "en", dateOptions(r) as L.RecurrenceOptions)],
-  ["parseRRule", (r) => L.parseRRule(text(r) as string)],
-  ["formatRRule", (r) => L.formatRRule((r.chance(0.5) ? { freq: r.pick(["DAILY", "WEEKLY", "HOURLY", 1]), interval: r.pick(numbers), byDay: r.pick([[], [{ weekday: "MO" }], [{ weekday: "XX" }], null]), byMonthDay: r.pick([[], [31], [0], null]), byMonth: r.pick([[], [2], null]), ...(r.chance(0.3) ? { count: r.pick(numbers) } : {}) } : any(r)) as L.RecurrenceRule)],
-  ["parseDtstart", (r) => L.parseDtstart(text(r) as string)],
-  ["formatDtstart", (r) => L.formatDtstart({ ...(date(r) as object), hour: r.pick(numbers), minute: r.pick(numbers) } as L.LocalDateTime, zone(r) as string)],
-  ["readSeries", (r) => L.readSeries(spec(r) as L.RecurrenceSpec)],
-  ["occurrencesAfter", (r) => L.occurrencesAfter(spec(r) as L.RecurrenceSpec, r.pick(numbers) as number, r.pick([1, 3, 0, -1, 10_001, Number.NaN, 2.5, undefined]) as number)],
-  ["nextOccurrence", (r) => L.nextOccurrence(spec(r) as L.RecurrenceSpec, now(r) as number)],
+const calls: ReadonlyArray<readonly [string, Call]> = [
+  ["parseNumber", (r) => ({ result: L.parseNumber(text(r), language(r)) })],
+  ["parseDuration", (r) => ({ result: L.parseDuration(text(r), language(r)) })],
+  ["parseTimeOfDay", (r) => ({ result: L.parseTimeOfDay(text(r), language(r), r.chance(0.7) ? { band: band(r), afterMinutes: r.pick(numbers) } : r.chance(0.5) ? { afterMinutes: r.pick(numbers) } : undefined) })],
+  ["parseDateTime", (r) => withZone(r, (z) => L.parseDateTime(text(r), language(r), dateOptions(r, z)))],
+  ["parseQuantity", (r) => ({ result: L.parseQuantity(text(r), language(r), r.chance(0.5) ? { cupMl: r.pick(numbers) } : undefined) })],
+  ["convertAmount", (r) => ({ result: L.convertAmount(r.pick(numbers), unit(r), unit(r), r.chance(0.5) ? { cupMl: r.pick(numbers) } : undefined) })],
+  ["parseRecurrence", (r) => withZone(r, (z) => L.parseRecurrence(text(r), language(r), dateOptions(r, z)))],
+  ["parseRRule", (r) => ({ result: L.parseRRule(text(r)) })],
+  ["formatRRule", (r) => ({ result: L.formatRRule(rule(r)) })],
+  ["parseDtstart", (r) => ({ result: L.parseDtstart(r.chance(0.5) ? text(r) : `DTSTART;TZID=${zone(r)}:20261118T090000`) })],
+  ["formatDtstart", (r) => withZone(r, (z) => L.formatDtstart({ ...date(r), hour: r.pick(numbers), minute: r.pick(numbers), ...(r.chance(0.5) ? { second: r.pick(numbers) } : {}) }, z))],
+  ["readSeries", (r) => withZone(r, (z) => L.readSeries(spec(r, z)))],
+  ["occurrencesAfter", (r) => withZone(r, (z) => L.occurrencesAfter(spec(r, z), r.pick(numbers), r.pick([1, 3, 0, -1, 10_001, Number.NaN, 2.5, ...numbers])))],
+  ["nextOccurrence", (r) => withZone(r, (z) => L.nextOccurrence(spec(r, z), now(r)))],
   ["seriesAfter", (r) => {
-    const read = L.readSeries(spec(r) as L.RecurrenceSpec)
-    const s = read.kind === "ok" ? read.series : r.pick([{ rule: { freq: "DAILY", interval: 1, byDay: [], byMonthDay: [], byMonth: [] }, start: date(r), timeZone: zone(r) }, any(r)])
-    return L.seriesAfter(s as L.Series, r.pick(numbers) as number, r.pick([1, 5, 0, 20_000]) as number)
+    const read = L.readSeries(spec(r))
+    // A series `readSeries` returned, or one made by hand from type-correct parts (round 4, finding 3: refused exactly as readSeries refuses).
+    const s: L.Series = read.kind === "ok" && r.chance(0.5) ? read.series : { rule: rule(r), start: { ...date(r), hour: r.pick(numbers), minute: r.pick(numbers), second: r.pick([0, 30, ...numbers]) }, timeZone: zone(r) }
+    return { result: L.seriesAfter(s, r.pick(numbers), r.pick([1, 5, 0, 20_000, ...numbers])) }
   }],
-  ["describeRRule", (r) => L.describeRRule(text(r) as string, language(r) as "en", (r.chance(0.6) ? { start: date(r), time: clock(r), timeZone: zone(r) } : any(r)) as undefined)],
-  ["speakNumber", (r) => L.speakNumber(r.pick(numbers) as number, language(r) as "en", (r.chance(0.5) ? { words: r.chance(0.5) } : any(r)) as undefined)],
-  ["speakAmount", (r) => L.speakAmount((r.chance(0.7) ? { amount: r.pick(numbers), unit: unit(r), approx: r.chance(0.5), rest: r.chance(0.1) } : any(r)) as L.AmountLike, language(r) as "en", (r.chance(0.5) ? { item: text(r), humanize: r.chance(0.5) } : any(r)) as undefined)],
-  ["speakDuration", (r) => L.speakDuration(r.pick(numbers) as number, language(r) as "en", any(r) as undefined)],
-  ["speakTime", (r) => L.speakTime(clock(r) as L.ClockTime, language(r) as "en", (r.chance(0.5) ? { style: r.pick(["12h", "24h", "x"]), period: r.chance(0.5) } : any(r)) as undefined)],
-  ["speakDate", (r) => L.speakDate(date(r) as L.LocalDate, language(r) as "en", date(r) as L.LocalDate)],
-  ["speakMoment", (r) => L.speakMoment((r.chance(0.7) ? { date: date(r), time: clock(r) } : any(r)) as { date: L.LocalDate }, language(r) as "en", date(r) as L.LocalDate)],
-  ["speakList", (r) => L.speakList((r.chance(0.7) ? Array.from({ length: r.int(0, 5) }, () => text(r)) : any(r)) as Array<string>, language(r) as "en", (r.chance(0.5) ? { max: r.pick(numbers) } : any(r)) as undefined)],
-  ["numberToWords", (r) => L.numberToWords(r.pick(numbers) as number, language(r) as "en")],
-  ["ordinalToWords", (r) => L.ordinalToWords(r.pick(numbers) as number, language(r) as "en")],
-  ["normalizeTimeZone", (r) => L.normalizeTimeZone(text(r) as string)]
+  ["describeRRule", (r) => withZone(r, (z) => L.describeRRule(r.chance(0.5) ? text(r) : rule(r), language(r), r.chance(0.8) ? { start: date(r), time: clock(r), timeZone: z } : { timeZone: z }))],
+  ["speakNumber", (r) => ({ result: L.speakNumber(r.pick(numbers), language(r), { words: r.chance(0.5) }) })],
+  ["speakAmount", (r) => ({ result: L.speakAmount(r.chance(0.8) ? { amount: r.pick(numbers), unit: unit(r), approx: r.chance(0.5), rest: r.chance(0.1) } : { approx: true }, language(r), { item: text(r), humanize: r.chance(0.5) }) })],
+  ["speakDuration", (r) => ({ result: L.speakDuration(r.pick(numbers), language(r), { natural: r.chance(0.5) }) })],
+  ["speakTime", (r) => ({ result: L.speakTime(clock(r), language(r), { style: r.pick(["12h", "24h"] as const), period: r.chance(0.5) }) })],
+  ["speakDate", (r) => ({ result: L.speakDate(date(r), language(r), date(r)) })],
+  ["speakMoment", (r) => ({ result: L.speakMoment(r.chance(0.5) ? { date: date(r), time: clock(r) } : { date: date(r) }, language(r), date(r), { style: r.pick(["12h", "24h"] as const) }) })],
+  ["speakList", (r) => ({ result: L.speakList(Array.from({ length: r.int(0, 5) }, () => text(r)), language(r), r.chance(0.5) ? { max: r.pick(numbers) } : undefined) })],
+  ["numberToWords", (r) => ({ result: L.numberToWords(r.pick(numbers), language(r)) })],
+  ["ordinalToWords", (r) => ({ result: L.ordinalToWords(r.pick(numbers), language(r)) })],
+  ["normalizeTimeZone", (r) => withZone(r, (z) => L.normalizeTimeZone(z))]
 ]
 
 /** What a result must never hold. Returns the first problem found, or `undefined`. */
@@ -100,31 +119,26 @@ describe("every exported function, any argument", () => {
     expect(calls.map(([name]) => name).sort()).toEqual(exported)
   })
   for (const [name, call] of calls) {
-    it(`${name}: 3000 generated calls (seed 101) never throw, never escape a check, never return NaN, Infinity or a date outside 2000–2199`, () => {
+    it(`${name}: 3000 generated calls (seed 101) never throw, never escape a check, never return NaN, Infinity or a date outside 2000–2199, and fail for an unknown zone`, () => {
       const r = rng(101 + name.length)
       const before = escaped.count
+      let mustFail = 0
       for (let k = 0; k < 3000; k++) {
-        let result: unknown
+        let out: { result: unknown; mustFail?: boolean }
         try {
-          result = call(r)
+          out = call(r)
         } catch (e) {
           throw new Error(`${name} threw on call ${k}: ${String(e)}`)
         }
-        const p = problem(result, "result", 0, name === "speakAmount" || name === "speakList")
-        if (p !== undefined) throw new Error(`${name}, call ${k}: ${p}: ${JSON.stringify(result, (_k, x) => (typeof x === "bigint" ? String(x) : x))?.slice(0, 300)}`)
+        const p = problem(out.result, "result", 0, name === "speakAmount" || name === "speakList")
+        if (p !== undefined) throw new Error(`${name}, call ${k}: ${p}: ${JSON.stringify(out.result)?.slice(0, 300)}`)
+        if (out.mustFail === true) {
+          mustFail++
+          if (!failed(out.result)) throw new Error(`${name}, call ${k}: an unknown time zone gave ${JSON.stringify(out.result)?.slice(0, 300)}`)
+        }
       }
       if (escaped.count !== before) throw new Error(`${name}: ${escaped.count - before} exceptions escaped a check; the last: ${String(escaped.last)}`)
+      if (["parseDateTime", "parseRecurrence", "formatDtstart", "readSeries", "occurrencesAfter", "nextOccurrence", "describeRRule", "normalizeTimeZone"].includes(name)) expect(mustFail).toBeGreaterThan(500)
     })
   }
-  it("hostile arguments (getters that throw, proxies) in any position are answered, never thrown", () => {
-    const hostile = new Proxy({}, { get: () => { throw new Error("no") }, has: () => { throw new Error("no") }, ownKeys: () => { throw new Error("no") }, getPrototypeOf: () => { throw new Error("no") } })
-    const benign: ReadonlyArray<unknown> = ["tomorrow", "en", { now: Date.UTC(2026, 10, 18), timeZone: "UTC" }, 1]
-    for (const [name, f] of Object.entries(L)) {
-      if (typeof f !== "function") continue
-      for (let k = 0; k < 4; k++) {
-        const args = benign.map((b, j) => (j === k ? hostile : b))
-        expect(() => (f as (...a: Array<unknown>) => unknown)(...args), `${name}, argument ${k}`).not.toThrow()
-      }
-    }
-  })
 })

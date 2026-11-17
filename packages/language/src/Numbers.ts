@@ -94,7 +94,9 @@ const nlWholeWords: P<number> = (input, at) => {
   const out: Array<{ value: number; next: number }> = []
   if (input.norms[at] === "nul") return [{ value: 0, next: at + 1 }]
   let joined = ""
-  for (let k = at; k < input.norms.length && k < at + 6 && nlPart(input.norms[k]!); k++) {
+  // No ceiling on the parts (review round 4, finding 10): the joined word must be a written number up to 999 999, and the phrase has
+  // at most `maxWords` tokens; "negen honderd negen en negentig duizend negen honderd negen en negentig" is ten parts.
+  for (let k = at; k < input.norms.length && nlPart(input.norms[k]!); k++) {
     joined += input.norms[k]
     if (input.norms[at] === "en" || input.norms[k] === "en") continue
     const v = nlWholeWord(joined)

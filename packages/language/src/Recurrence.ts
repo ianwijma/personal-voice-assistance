@@ -109,7 +109,8 @@ const grammar = (language: Language): P<Body> => {
   const interval: P<{ unit: Unit; interval: number }> = alt(
     from(adverbs[language]),
     map(seq(w.every, from(unitSingular[language])), ([, unit]) => ({ unit, interval: 1 })),
-    map(seq(w.every, ordinal(language, 2, 31), from(unitSingular[language])), ([, n, unit]) => ({ unit, interval: n })),
+    // EVERY ORDINAL UNIT from "first" ("every first day" is every day; review round 4, finding 20).
+    map(seq(w.every, ordinal(language, 1, 31), from(unitSingular[language])), ([, n, unit]) => ({ unit, interval: n })),
     map(seq(w.every, wholeNumber(language, 2, maxInterval), from(unitPlural[language])), ([, n, unit]) => ({ unit, interval: n })),
     ...(en
       ? [map(seq(oneOf("every", "each"), words("other"), from(unitSingular.en)), ([, , unit]) => ({ unit, interval: 2 }))]
@@ -166,7 +167,7 @@ const grammar = (language: Language): P<Body> => {
   const ofMonth: P<number> = alt(
     map(words(w.of, w.the, en ? "month" : "maand"), () => 1),
     map(seq(words(w.of), w.every, from(unitSingular[language])), ([, , u]) => (u === "month" ? 1 : undefined)),
-    map(seq(words(w.of), w.every, ordinal(language, 2, 31), from(unitSingular[language])), ([, , n, u]) => (u === "month" ? n : undefined)),
+    map(seq(words(w.of), w.every, ordinal(language, 1, 31), from(unitSingular[language])), ([, , n, u]) => (u === "month" ? n : undefined)),
     map(seq(words(w.of), w.every, wholeNumber(language, 2, maxInterval), from(unitPlural[language])), ([, , n, u]) => (u === "month" ? n : undefined)),
     ...(en ? [map(seq(words("of"), w.every, words("other"), from(unitSingular.en)), ([, , , u]) => (u === "month" ? 2 : undefined))] : [])
   )
@@ -308,7 +309,7 @@ export const parseRecurrence: (text: string, language: Language, options: Recurr
     if (dtstart === undefined) continue
     // The series as stored must give the start back.
     const read = readSeries({ rrule, dtstart, timeZone: zone })
-    if (read.kind !== "ok" || seriesAfter(read.series, now, 1).instants[0] !== built.instant) continue
+    if (read.kind !== "ok" || seriesAfter(read.series, now, 1)?.instants[0] !== built.instant) continue
     const value: Recurrence = {
       rule: s.rule, rrule, ...(s.time !== undefined ? { time: s.time } : {}), ...(s.part !== undefined ? { partOfDay: s.part } : {}), timeDefaulted: s.time === undefined,
       start: built.start, startInstant: built.instant, dtstart, ics: `${dtstart}\nRRULE:${rrule}`, timeZone: zone

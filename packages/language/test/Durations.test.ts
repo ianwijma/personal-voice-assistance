@@ -53,6 +53,50 @@ describe("durations: the speaker reads back over a grid", () => {
   })
 })
 
+describe("durations: decimal amounts of every unit, enumerated, compared in exact arithmetic (round 4, finding 5)", () => {
+  // Every amount in hundredths near 0, every one just below each unit's 365-day limit, and 3000 between, in digits in both languages:
+  // the value is computed with BigInt, so a floating-point tolerance in the parser cannot hide behind the same one in the test.
+  const unitMs: Record<string, bigint> = { week: 604_800_000n, day: 86_400_000n, hour: 3_600_000n, minute: 60_000n, second: 1000n, quarter: 900_000n }
+  const names: Record<"en" | "nl", Record<string, string>> = {
+    en: { week: "weeks", day: "days", hour: "hours", minute: "minutes", second: "seconds" },
+    nl: { week: "weken", day: "dagen", hour: "uur", minute: "minuten", second: "seconden", quarter: "kwartier" }
+  }
+  const limit = 365n * 86_400_000n * 100n
+  for (const language of ["en", "nl"] as const) {
+    it(`${language}: every unit`, () => {
+      const r = rng(34)
+      let checked = 0
+      for (const [unit, word] of Object.entries(names[language])) {
+        // The largest amount said in digits is 999 999.99: the top of the range is the unit's limit or that, whichever is lower.
+        const hi = Math.min(Number(limit / unitMs[unit]!) + 50, 99_999_999)
+        const amounts = new Set<number>()
+        for (let h = 1; h <= 2000; h++) amounts.add(h)
+        for (let h = Math.max(1, hi - 2050); h <= hi; h++) amounts.add(h)
+        for (let k = 0; k < 3000; k++) amounts.add(r.int(1, hi))
+        for (const h of amounts) {
+          const whole = Math.floor(h / 100)
+          const frac = h % 100
+          const digits = `${whole}${frac === 0 ? "" : (language === "en" ? "." : ",") + String(frac).padStart(2, "0").replace(/0$/, "")}`
+          const exact = BigInt(h) * unitMs[unit]!
+          const want = exact <= limit ? Number(exact / 100n) : "not-understood"
+          const got = ms(`${digits} ${word}`, language)
+          if (got !== want) throw new Error(`${language} "${digits} ${word}": ${want} expected, ${got} read`)
+          checked++
+        }
+      }
+      expect(checked).toBeGreaterThan(30_000)
+    })
+  }
+  it("the reviewer's phrases, also inside a date", () => {
+    expect(ms("128.05 days", "en")).toBe(11_063_520_000)
+    expect(ms("128,05 dagen", "nl")).toBe(11_063_520_000)
+    expect(ms("16.08 weeks", "en")).toBe(9_725_184_000)
+    expect(ms("16,08 weken", "nl")).toBe(9_725_184_000)
+    expect(ms("4096.02 hours", "en")).toBe(14_745_672_000)
+    expect(ms("4096,02 uur", "nl")).toBe(14_745_672_000)
+  })
+})
+
 describe("durations: generated phrases and their mutants", () => {
   for (const language of ["en", "nl"] as const) {
     const check: GrammarCheck = {

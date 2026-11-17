@@ -5,7 +5,11 @@
 // spaces. A mutant of a generated phrase is "a phrase the generator could have produced" exactly when `recognise` finds it.
 import type { Rng } from "./Rng.ts"
 
-export const norm = (s: string): string => s.normalize("NFD").replace(/\p{M}/gu, "").toLowerCase().replace(/['’]/g, "")
+/**
+ * A word as the README says words compare: no accents, lower case; an apostrophe inside a word is kept ("o'clock" is not "oclock", and
+ * "tw'o" is not "two"), one at its start is the gap before Dutch "s" ("'s avonds").
+ */
+export const norm = (s: string): string => s.normalize("NFD").replace(/\p{M}/gu, "").toLowerCase().replace(/’/g, "'").replace(/^'+/, "")
 
 /** A terminal: reads one word (normalised) to a value, and writes one word. */
 export interface Term {
@@ -154,11 +158,20 @@ export const mutationWords: ReadonlyArray<string> = [
   "constructor", "__proto__", "toString", "hasOwnProperty", "valueOf", "prototype"
 ]
 
-/** Every mutant of a phrase: each word of `insert` at each position, each word deleted, each pair of neighbours swapped. */
+/**
+ * Every mutant of a phrase: each word of `insert` at each position, each word deleted, each pair of neighbours swapped, and each word
+ * of two or more letters with an apostrophe after its first letter and before its last ("tw'o", "tw'o" → refused unless the grammar has
+ * that spelling: review round 4, finding 14).
+ */
 export const mutants = (phrase: ReadonlyArray<string>, insert: ReadonlyArray<string> = mutationWords): Array<Array<string>> => {
   const out: Array<Array<string>> = []
   for (let k = 0; k <= phrase.length; k++) for (const w of insert) out.push([...phrase.slice(0, k), w, ...phrase.slice(k)])
   for (let k = 0; k < phrase.length; k++) out.push([...phrase.slice(0, k), ...phrase.slice(k + 1)])
   for (let k = 0; k + 1 < phrase.length; k++) out.push([...phrase.slice(0, k), phrase[k + 1]!, phrase[k]!, ...phrase.slice(k + 2)])
+  for (let k = 0; k < phrase.length; k++) {
+    const w = phrase[k]!
+    if (!/^\p{L}{2,}$/u.test(w)) continue
+    for (const at of new Set([1, w.length - 1])) out.push([...phrase.slice(0, k), `${w.slice(0, at)}'${w.slice(at)}`, ...phrase.slice(k + 1)])
+  }
   return out
 }

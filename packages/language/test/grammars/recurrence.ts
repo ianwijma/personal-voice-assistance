@@ -50,7 +50,8 @@ export const recurrenceGrammar = (lang: Lang): Grammar => {
   const interval: Array<Rule> = [
     { rhs: [oneOf(adverbs)], act: ([[unit, n]]) => ({ unit, n }) },
     { rhs: [...every, oneOf(unitSg)], act: ([, unit]) => ({ unit, n: 1 }), weight: 4 },
-    { rhs: [...every, "ORD2", oneOf(unitSg)], act: ([, n, unit]) => ({ unit, n }) },
+    // EVERY ORDINAL UNIT, from "first" (README; review round 4, finding 20).
+    { rhs: [...every, "ORD", oneOf(unitSg)], act: ([, n, unit]) => ({ unit, n }) },
     { rhs: [...every, number(lang, { min: 2, max: 999, whole: true }), oneOf(unitPl)], act: ([, n, unit]) => ({ unit, n }), weight: 2 },
     ...(en ? [{ rhs: [...every, lit("other"), oneOf(unitSg)], act: ([, , unit]: ReadonlyArray<any>) => ({ unit, n: 2 }) }]
       : [{ rhs: [...words("om de"), oneOf(unitSg)], act: ([, , unit]: ReadonlyArray<any>) => ({ unit, n: 2 }) },
@@ -59,7 +60,7 @@ export const recurrenceGrammar = (lang: Lang): Grammar => {
   const ofMonth: Array<Rule> = [
     fixed(words(en ? "of the month" : "van de maand"), 1, 3),
     { rhs: [lit(en ? "of" : "van"), ...every, oneOf(unitSg)], act: ([, , u]) => (u === "month" ? 1 : undefined), weight: 2 },
-    { rhs: [lit(en ? "of" : "van"), ...every, "ORD2", oneOf(unitSg)], act: ([, , n, u]) => (u === "month" ? n : undefined) },
+    { rhs: [lit(en ? "of" : "van"), ...every, "ORD", oneOf(unitSg)], act: ([, , n, u]) => (u === "month" ? n : undefined) },
     { rhs: [lit(en ? "of" : "van"), ...every, number(lang, { min: 2, max: 999, whole: true }), oneOf(unitPl)], act: ([, , n, u]) => (u === "month" ? n : undefined) },
     ...(en ? [{ rhs: [lit("of"), ...every, lit("other"), oneOf(unitSg)], act: (v: ReadonlyArray<any>) => (v[3] === "month" ? 2 : undefined) }] : [])
   ]
@@ -74,7 +75,6 @@ export const recurrenceGrammar = (lang: Lang): Grammar => {
   return {
     ...time,
     ORD: ordinalRules(lang),
-    ORD2: ordinalRules(lang, 2, 31),
     ORD25: ordinalRules(lang, 2, 5),
     ORD15: ordinalRules(lang, 1, 5),
     DAYNUM: [{ rhs: ["ORD"] }, { rhs: [number(lang, { min: 1, max: 31, whole: true })] }],

@@ -14,15 +14,18 @@ longer sentence: the caller passes the phrase on its own (a tool parameter, a ty
 cut out. A list of quantities is split by the caller first.
 
 **Words.** Between words only spaces and the punctuation `, . ! ?` (not right before digits: ".5" is refused); a hyphen only between
-two words ("twenty-one"); an apostrophe only before Dutch "s" ("'s avonds"). Digits may run into a word ("5kg", "7pm"); a word never
-runs into digits ("x3", "1e3"). Anything else — a sign, "½", a slash, a bracket, a quote, digits that are not ASCII — makes the phrase
+two words ("twenty-one"); an apostrophe before a word only before Dutch "s" ("'s avonds"). An apostrophe inside a word is part of it
+and is never repaired away: the grammar's words that have one are "o'clock", "zo'n" and Dutch "kilo's" (each also accepted without it:
+"oclock", "zon", "kilos"; `’` is the same as `'`), and an item word may have one ("baker's flour"); any other ("tw'o", "s'o'm'e") is a
+word no rule reads. Digits may run into a word ("5kg", "7pm"); a word never runs into digits ("x3", "1e3"). Anything else — a sign, "½", a slash, a bracket, a quote, digits that are not ASCII — makes the phrase
 unreadable. Case and accents do not matter, also decomposed ("tweeënhalf" in NFD). Punctuation has no meaning: "every Monday,
 Wednesday" and "every Monday Wednesday" are the same list. Word tables are null-prototype: "constructor" is a word no rule reads.
 
-**One front door per function, with a validated domain.** Every exported function checks its arguments first and answers outside
-its domain with its failure value — a parser `not-understood`, a speaker `undefined` ("cannot say this"; never `""`, never "NaN"), a
-rule reader `invalid` or `unsupported`, an expansion `undefined` or no instants. No exported function throws, for any argument of any
-type (an unexpected exception is caught, counted and answered with the failure value; the fuzz test asserts the count stays 0).
+**One front door per function, with a validated domain.** Every exported function checks its data first and answers outside its
+domain with its failure value — a parser `not-understood`, a speaker `undefined` ("cannot say this"; never `""`, never "NaN"), a
+rule reader `invalid` or `unsupported`, an expansion `undefined`. Which arguments are data, and what is the caller's to get right, is
+the first paragraph of the domain below. An unexpected exception inside a function is caught, counted and answered with the failure
+value; the fuzz test asserts the count stays 0.
 
 **Nothing leaves the supported domain.** Every date returned is a local date in 2000–2199; every instant's local date is too.
 Recurrence expansion stops at 31 December 2199 and says so (`stop: "range"`). A conversion that would underflow, overflow or lose
@@ -30,18 +33,23 @@ precision is refused.
 
 ## The domain
 
-| Function | Its arguments must be | Outside |
+**Text and numbers are data and may be anything: any string as the phrase to parse, any `number` (`NaN`, the infinities, `-0`, values
+outside the range below) wherever a number, an instant or an amount is passed, and any string where a time zone is passed get the
+function's failure value below, never a throw. Everything else — the language, style and option objects, units, rule objects, lists —
+is the caller's code, checked by the TypeScript compiler, and must have its declared type; a value of another type there (a `null`
+style, a sparse array, a unit that is not a string) is a programming error, and the function may throw a `TypeError` or misbehave.**
+
+| Function | Its data must be | Outside |
 |---|---|---|
-| every function | `language` `"en"` or `"nl"`; an options argument absent or an object | the failure value |
 | every parser | `text` a string of at most 200 characters and 40 words | `not-understood` |
 | `parseNumber` | — | — |
 | `parseDuration` | (the value: whole milliseconds, more than 0, at most 365 days) | `not-understood` |
-| `parseTimeOfDay` | `band` `{ from, to }`, each "HH:MM" or whole minutes 0–1439, `from` ≤ `to`; `afterMinutes` whole 0–1439 | `not-understood` |
+| `parseTimeOfDay` | `band` `{ from, to }`, each exactly "HH:MM" (no other spelling: "0730" and " 07:30" are not) or whole minutes 0–1439, `from` ≤ `to`; `afterMinutes` whole 0–1439 | `not-understood` |
 | `parseDateTime`, `parseRecurrence` | `now` a number or a Date whose local date in `timeZone` is in 2000–2199; `timeZone` an IANA name this machine knows (not an offset); `band` as above; `defaultTime` whole hour 0–23 and minute 0–59 | `not-understood` |
 | `parseQuantity` | `cupMl` a number from 50 to 1000 | `not-understood` |
 | `convertAmount` | `amount` 0 or 0.000001–1 000 000 000 in size; units of one kind; `cupMl` as above (the result: 12 significant digits, never 0 for an amount that is not 0, at most 1e12) | `undefined` |
-| `speakNumber` | a finite number, at most 999 999.99 in size, 0 or not rounding to 0 at two decimals | `undefined` |
-| `speakAmount` | `amount` a positive number `speakNumber` says (after humanising), `unit` one of `UnitId` (Dutch: not `oz` or `lb`), or no amount ("some", with an item) or `rest`; `item` a string of at most 200 characters | `undefined` |
+| `speakNumber` | a finite number, at most 999 999.99 in size (the number given, before rounding: 999 999.994 is outside), 0 or not rounding to 0 at two decimals | `undefined` |
+| `speakAmount` | `amount` a positive number that is whole hundredths of the unit it is said in (after humanising) and that `speakNumber` says, `unit` (Dutch: not `oz` or `lb`), or no amount ("some", with an item) or `rest`; `item` at most 200 characters | `undefined` |
 | `speakDuration` | a number of milliseconds that rounds to 1 second – 365 days | `undefined` |
 | `speakTime` | whole `hour` 0–23 and `minute` 0–59; `style` `"12h"` or `"24h"` | `undefined` |
 | `speakDate`, `speakMoment` | real dates in 2000–2199 (and a time as above) | `undefined` |
@@ -49,8 +57,8 @@ precision is refused.
 | `numberToWords` / `ordinalToWords` | a whole number 0–999 999 / 1–31 | `undefined` |
 | `parseRRule`, `parseDtstart` | a string of at most 500 characters; dates (DTSTART, UNTIL) in 2000–2199 | `invalid` / `unsupported` / `undefined` |
 | `formatRRule`, `formatDtstart` | a rule of the supported set / a real date-time in 2000–2199 and a known zone | `undefined` |
-| `readSeries`, `occurrencesAfter`, `nextOccurrence`, `seriesAfter` | a spec `readSeries` accepts; `after` a number (or a Date for `nextOccurrence`); `limit` whole 1–10 000 | `invalid` / `undefined` / no instants |
-| `describeRRule` | a rule of the supported set; `start` a real date the rule selects (required for a plain weekly, monthly or yearly rule); `time` a clock time; `timeZone` known (required for UNTIL) | `undefined` |
+| `readSeries`, `occurrencesAfter`, `nextOccurrence`, `seriesAfter` | a spec (`seriesAfter`: a series) `readSeries` accepts; `after` a number that is not NaN (or a Date for `nextOccurrence`); `limit` whole 1–10 000 | `invalid` / `unsupported` / `undefined` |
+| `describeRRule` | a rule of the supported set; `start` a real date the rule selects (required for an interval above one and for a plain weekly, monthly or yearly rule); `time` a clock time; `timeZone`, when given, a zone this machine knows (required for UNTIL) | `undefined` |
 | `normalizeTimeZone` | a string of at most 64 characters | `undefined` |
 
 ## Numbers (`parseNumber(text, language)` → `Parsed<number>`)
@@ -63,8 +71,9 @@ One number grammar per language; every parser that reads a number uses it, and `
   "one thousand and five", "a thousand", "two thousand three hundred" (after "thousand" the hundreds take a number word: "a thousand
   a hundred" is no number); then optionally "point" and one or two digit words ("two point five").
 - **Dutch words**: one word as it is written ("vijfentwintig", "tweehonderd", "tweeduizend driehonderd"), or spaced parts that join
-  into one ("vijf en twintig", "twee honderd"); "eenhonderd" and "eenduizend" are not written so; then optionally "komma" and one or
-  two digit words.
+  into one ("vijf en twintig", "twee honderd"), each part itself a number word or "en"; "eenhonderd" and "eenduizend" are not written
+  so; then optionally "komma" and one or two digit words. There is no limit on the parts but the number's own: the joined word must be
+  a written number up to 999 999, so the most is eleven ("negen honderd negen en negentig duizend negen honderd negen en negentig").
 - A sign word: "minus five", "min 2,5" ("minus zero" is not a number).
 - Not a number: "5 five", "five five", "one thousand two thousand", "twenty thirty", "1e3", three decimals, a million.
 
@@ -82,6 +91,7 @@ or more parts, largest unit first, each unit once, optionally joined by "and" / 
 - Dutch part: AMOUNT UNIT ("2 uur", "anderhalf uur", "een half uur", "drie kwartier"); "een" UNIT. Units: week / weken, dag / dagen,
   uur / uren, kwartier (15 minutes, between the hour and the minute), minuut / minuten, seconde / seconden.
 - The value is whole milliseconds, more than 0, at most 365 days: "1 day 12 hours" is 36 hours, "three quarters of an hour" 45 minutes.
+  It is computed exactly (every amount is whole hundredths), so "128.05 days" is 11 063 520 000 ms, not refused or rounded.
 
 ## Time of day (`parseTimeOfDay(text, language, { band?, afterMinutes? })` → `Parsed<TimeOfDay>`)
 
@@ -142,7 +152,7 @@ millilitres or pieces, 12 significant digits), `said`, `item`.
   pinch(es), splash(es); Dutch g, gram, kg, kilo('s), kilogram, ons (100 g), pond (500 g), ml, cl, dl, l, milliliter, centiliter,
   deciliter, liter, tl, theelepel(s), el, eetlepel(s), kopje(s), stuk(s), dozijn, pak(ken), pakje(s), zak(ken), zakje(s), fles(sen),
   blik(ken), blikje(s), pot(ten), potje(s), bos(sen), brood / broden, doos / dozen, bak(ken), bakje(s), rol(len), handvol,
-  snufje(s), scheutje(s). A handful, a pinch, a splash are `approx`. A cup is `cupMl` (default 250; US 236.588).
+  snufje(s), scheutje(s). A handful, a pinch, a splash are `approx` (vague by themselves). A cup is `cupMl` (default 250; US 236.588).
 - The **item** is one or more words, none of them reserved, and is the text from its first word to its last as written. Reserved:
   every word of this grammar (numbers, fractions, units, approximators, "some" words, "rest", articles, "of" / "van"), "x", Dutch "lb",
   "lbs", "oz", and conjunctions, negations and bounds (`reservedItemWords` in `src/Quantity.ts`). So "2 kg flour and 3 eggs",
@@ -151,16 +161,19 @@ millilitres or pieces, 12 significant digits), `said`, `item`.
 
 ## Speaking
 
-| Speaker | Output | Reads back? |
+Speak-then-parse is promised for exactly four things: clock times, dates, durations and numbers. The other speakers are for speaking;
+what each promises instead is in the table.
+
+| Speaker | Output | Promise |
 |---|---|---|
-| `speakNumber(n, language, { words? })` | "2.5" / "2,5" (two decimals, trailing zeros dropped), "minus 3"; words: "forty two point five" | yes, with `parseNumber`, to the number rounded to two decimals |
-| `numberToWords(n, language)` | "forty two", "tweeduizend driehonderd" | yes, with `parseNumber` |
-| `speakAmount(q, language, { item?, humanize? })` | "about 750 grams of rice", "2 kilo bloem", "a pack of milk", "3 apples", "some rice", "the rest of the rice" | yes, with `parseQuantity`: the same base amount, dimension, `approx`, `rest` and item (and the unit, with `humanize: false`), for an item of non-reserved words |
-| `speakDuration(ms, language)` | "6 minutes 10 seconds", "1 day 12 hours", "half an hour", "anderhalf uur" | yes, with `parseDuration`, to the duration rounded to the second |
-| `speakTime(t, language, { style, period })` | "half past seven", "kwart over zeven", "nineteen thirty", "negentien uur dertig", "seven o'clock in the evening" | yes, with `parseTimeOfDay`: with `period`, exactly and not guessed; "24h", exactly when the words settle the hour (English except 10–12 with minutes, Dutch 0 and 13–23), else the same clock reading, guessed; "12h" without `period`, the same clock reading modulo 12 hours, guessed (English noon and midnight exact) |
-| `speakDate(date, language, today)` | "today", "tomorrow", "Friday", "Friday the third", "Friday the third of March 2027"; Dutch "overmorgen", "vrijdag 3 maart" | yes, with `parseDateTime` at `now` on `today`, to the date |
-| `describeRRule(rule, language, { time?, start?, timeZone? })` | "every day", "every weekday", "every second Tuesday", "on the first of every month", "the last Friday of every month", "every year on the third of March" | yes, with `parseRecurrence`, to the same occurrences — for a rule without COUNT and UNTIL, given its `time` and its `start` (a plain rule says DTSTART's weekday, day or date). A COUNT (", 5 times") or UNTIL (", until 31 December 2027 at 23:00") is said after it and is **not guaranteed to parse back** |
-| `speakMoment(value, language, today)` | "tomorrow at half past seven" | **not guaranteed to parse back** |
+| `speakNumber(n, language, { words? })` | "2.5" / "2,5" (two decimals, trailing zeros dropped), "minus 3"; words: "forty two point five" | reads back with `parseNumber` to the number rounded to two decimals |
+| `numberToWords(n, language)` | "forty two", "tweeduizend driehonderd" | reads back with `parseNumber` |
+| `speakDuration(ms, language)` | "6 minutes 10 seconds", "1 day 12 hours", "half an hour", "anderhalf uur" | reads back with `parseDuration` to the duration rounded to the second |
+| `speakTime(t, language, { style, period })` | "half past seven", "kwart over zeven", "nineteen thirty", "negentien uur dertig", "seven o'clock in the evening" | reads back with `parseTimeOfDay`: with `period`, exactly and not guessed; "24h", exactly when the words settle the hour (English except 10–12 with minutes, Dutch 0 and 13–23), else the same clock reading, guessed; "12h" without `period`, the same clock reading modulo 12 hours, guessed (English noon and midnight exact) |
+| `speakDate(date, language, today)` | "today", "tomorrow", "Friday", "Friday the third", "Friday the third of March 2027"; Dutch "overmorgen", "vrijdag 3 maart" | reads back with `parseDateTime` at `now` on `today`, to the date |
+| `speakAmount(q, language, { item?, humanize? })` | "about 750 grams of rice", "2 kilo bloem", "a pack of milk", "3 apples", "some rice", "the rest of the rice" | **never another quantity than it was given**: nothing is rounded — an amount that is not whole hundredths of the unit it is said in (after humanising) is `undefined`; humanising only changes the unit when the amount stays exact (1500 g is "1.5 kilograms", 1.234 kg "1234 grams", 0.25 kg "250 grams"; with `humanize: false` 1.234 kg is `undefined`); "about" / "ongeveer" only when `approx` is true (a handful, a pinch, a splash are vague by themselves and say no "about"). Not promised to read back |
+| `describeRRule(rule, language, { time?, start?, timeZone? })` | "every day", "every weekday", "every second Tuesday, from 17 November 2026", "on the first of every month", "the last Friday of every month", "every year on the third of March" | **states every constraint of the rule, or is `undefined`**: frequency and interval, and for an interval above one its phase (", from 20 November 2026" / ", vanaf 20 november 2026": the first day, from `start`); the weekdays, days of the month, ordinal weekday or date (a plain rule's from `start`); the time with `time` (midnight as "00:00"); a COUNT (", 5 times") or UNTIL (", until 31 December 2027 at 23:00", in `timeZone`). Not promised to read back |
+| `speakMoment(value, language, today)` | "tomorrow at half past seven" | not promised to read back |
 | `speakList(items, language, { max? })` | "a, b and c", "a, b and two more" | no parser |
 
 ## Recurrence
@@ -179,7 +192,8 @@ elsewhere are expanded by the calendar module with its own library.
 
 each with `INTERVAL` (1–999), optionally `COUNT` (1–1000) or `UNTIL` (a UTC date-time `YYYYMMDDTHHMMSSZ` in 2000–2199, not before
 DTSTART), and `WKST` only as `MO`. `DTSTART` is `DTSTART;TZID=<the series' zone>:YYYYMMDDTHHMMSS` in 2000–2199 and must itself be an
-instance. `parseRRule` returns `ok`, `unsupported` (valid RFC 5545 outside this set: `SECONDLY`, `MINUTELY`, `HOURLY`, `BYSETPOS`,
+instance. `parseRRule` reads every part by RFC 5545's grammar first, so a malformed value is `invalid` even in a part this package
+does not expand ("BYHOUR=99", "BYWEEKNO=0", "UNTIL=20270230"). It returns `ok`, `unsupported` (valid RFC 5545 outside this set: `SECONDLY`, `MINUTELY`, `HOURLY`, `BYSETPOS`,
 `BYWEEKNO`, `BYYEARDAY`, `BYHOUR`, `BYMINUTE`, `BYSECOND`, X- parts, another `WKST`, several `BYMONTH`s, `BYMONTHDAY` without `BYMONTH`
 in a yearly rule, a plain weekday in a monthly rule, a date-only or floating `UNTIL`, a date outside 2000–2199) or `invalid` (not RFC
 5545), each with a reason. `formatRRule` writes only rules of the set; `parseRRule(formatRRule(rule))` gives the rule back.
@@ -194,15 +208,19 @@ at the offset before the gap (02:30 on the spring day in Amsterdam is 03:30); a 
 skips altogether (Pacific/Apia, 30 December 2011) lands on the next day's instant: one instance. Instances are increasing, none twice.
 
 `occurrencesAfter(spec, after, limit)` → `Occurrences | undefined`: `instants` strictly after `after` (at most `limit`, default 1,
-up to 10 000) and `stop` — `limit`, `series` (COUNT or UNTIL reached, or no further day) or `range` (31 December 2199 reached).
-`undefined` when `readSeries` refuses the spec. `seriesAfter(series, after, limit)` does the same for a series `readSeries` returned;
-`nextOccurrence(spec, after)` is the first instant or `undefined`. The cost does not grow with the distance from DTSTART.
+up to 10 000) and `stop`, in this order: `limit` (as many as were asked for, also when the last of them ended the series), `series`
+(the series has ended: its COUNT-th instance is in the list or before `after`, or its UNTIL is passed — also when that happens at the
+end of the supported years) or `range` (31 December 2199 reached while the series goes on past it). `undefined` when `readSeries`
+refuses the spec, `after` is NaN or `limit` is out of range. `seriesAfter(series, after, limit)` → `Occurrences | undefined` does the
+same for a series object: it is written out and read again by `readSeries`, so it refuses exactly what `readSeries` refuses (a
+DTSTART that is not an instance, an UNTIL before it, no clock time, an unknown zone). `nextOccurrence(spec, after)` is the first
+instant or `undefined`. The cost does not grow with the distance from DTSTART.
 
 **Spoken recurrence** (`parseRecurrence(text, language, { now, timeZone, defaultTime?, band? })` → `Parsed<Recurrence>`, with `rule`,
 `rrule`, `dtstart` — the first occurrence after now, an instance, never on a day the zone skips —, `ics`, `start`, `startInstant`,
 `time?`, `partOfDay?`, `timeDefaulted`). Grammar: `[at TIME] RULE [at TIME]`, at most one time; EVERY is "every" / "each" / "elke" /
 "elk" / "iedere" / "ieder":
-- INTERVAL: EVERY UNIT ("every day"), EVERY ORDINAL UNIT ("every second week"), EVERY N UNITS (2–999), "every other" UNIT, "om de"
+- INTERVAL: EVERY UNIT ("every day"), EVERY ORDINAL UNIT, from "first" ("every first day" is every day, "every second week"), EVERY N UNITS (2–999), "every other" UNIT, "om de"
   UNIT, "om de" N UNITS, the adverbs "daily", "weekly", "fortnightly", "monthly", "quarterly", "yearly", "annually", "dagelijks",
   "wekelijks", "tweewekelijks", "maandelijks", "jaarlijks". A weekly interval may take "on" WEEKDAYS, a monthly one "on" DAYS OF THE
   MONTH or "on" an ordinal weekday, a yearly one "on" a date.
@@ -227,11 +245,13 @@ up to 10 000) and `stop` — `limit`, `series` (COUNT or UNTIL reached, or no fu
 
 | Test | What it shows |
 |---|---|
-| `test/support/Cfg.ts`, `test/grammars/*.ts` | The grammars above, written again in the tests as data (a context-free grammar per parser), with their meaning computed by the tests' own calendar (`test/support/Zone.ts`: `Date` and `Intl`, nothing from the package). The engine generates phrases with the value each must mean, and recognises a phrase. |
-| generated phrases (`*.generated.test.ts`, `Numbers.test.ts`, `Durations.test.ts`) | Numbers 3000 per language, durations 3000, times 4000, quantities 3000, dates 600 at each of 7 moments (an ordinary morning, the small hours, both Amsterdam daylight-saving days, Sydney's autumn change, both ends of the range), recurrence 500 at each of 4 moments: every phrase parses to its value, also in NFD. |
-| mutants (same files) | For generated phrases (numbers 150, durations 120, times 200, quantities 120, dates 3 × 40, recurrence 2 × 40 per language), each word of a fixed list (negations, bounds, conjunctions, units, weekdays, numbers, fillers, JavaScript property names) inserted at every position (all for numbers, durations and times; half for quantities; a third for dates and recurrence, by seed), each word deleted, each pair swapped: about 495 000 mutants. Each is refused, or is a phrase of the tests' grammar and parses to its value. |
-| round trips | `speakTime`: all 1440 times × 3 styles × 2 languages. `speakDate`: every day from 400 before to 800 after four todays (one in a leap year, one near 2199) × 2 languages. Every calendar day of 2000, 2027, 2028 and 2100 in 5 English and 4 Dutch written forms. `speakDuration`: every second to an hour, minute to a day, hour to a week, day to 365, and 3000 random, × 2 languages × 2 styles. Numbers: every whole number 0–10 000 in words and digits, and 20 000 sampled (magnitudes to 999 999, two decimals, both signs). `speakAmount`: 40 000 amounts over every unit, with and without "about", items and humanising, × 2 languages. |
-| `DomainFuzz.test.ts` | Every exported function (the test checks the list is complete) with 3000 generated arguments of wrong types, extreme numbers and odd strings: no throw, no escaped exception, no NaN, Infinity, invalid Date, date outside 2000–2199, empty or broken utterance; hostile proxies in every argument position. |
-| `RruleReference.test.ts` | The engine against a brute-force reference sharing nothing with it: 4291 rules (6 zones incl. Apia and Lord Howe, daylight-saving days, month ends, 29 February, both ends of the range, intervals 1–4 and sampled 7, 12, 13, 99, 100, 400, 999, seconds, COUNT and UNTIL incl. UNTIL at DTSTART and on daylight-saving days) × about 9 `after` instants: the same instants, in order, none twice, the same `stop`; `parseRRule(formatRRule(rule))` is the rule; UNTIL before DTSTART invalid; every description read back to the same occurrences (or, with COUNT / UNTIL, its suffix checked against the test's own rendering); fixed instants computed by hand. |
-| `ZoneOffsets.test.ts` | The zone-offset lookup against Intl's offset names over 2000–2199 for 7 zones: every transition to the second, and the wall-clock-to-instant conversion every quarter hour around each. |
-| `ReviewRound1–3.test.ts`, the other files | The reviewers' cases, and examples. |
+| `test/support/Cfg.ts`, `test/grammars/*.ts` | The grammars above, written again in the tests as data (a context-free grammar per parser), with their meaning computed by the tests' own calendar (`test/support/Zone.ts`: `Date` and `Intl`, nothing from the package) and durations in exact `BigInt` arithmetic. The engine generates phrases with the value each must mean, and recognises a phrase. Dutch numbers are written in every spacing of their parts. |
+| generated phrases (`*.generated.test.ts`, `Numbers.test.ts`, `Durations.test.ts`) | Numbers 3000 per language, durations 3000, times 4000 in the default band and 1500 in each of four other bands and moments (two of them leaving out both readings of most hours, so every candidate of an `ambiguous` answer is compared), quantities 3000, dates 600 at each of 7 moments (an ordinary morning, the small hours, both Amsterdam daylight-saving days, Sydney's autumn change, both ends of the range), recurrence 500 at each of 4 moments: every phrase parses to its value, also in NFD. |
+| mutants (same files) | For generated phrases (numbers 150, durations 120, times 200 and 4 × 40, quantities 120, dates 3 × 40, recurrence 2 × 40 per language), each word of a fixed list (negations, bounds, conjunctions, units, weekdays, numbers, fillers, JavaScript property names) inserted at every position (all for numbers, durations and times; half for quantities; a third for dates and recurrence, by seed), each word deleted, each pair swapped, and each word with an apostrophe put inside it: about 620 000 mutants. Each is refused, or is a phrase of the tests' grammar and parses to its value. |
+| round trips (the four promised) | `speakTime`: all 1440 times × 3 styles × 2 languages. `speakDate`: every day from 400 before to 800 after four todays (one in a leap year, one near 2199) × 2 languages. Every calendar day of 2000, 2027, 2028 and 2100 in 5 English and 4 Dutch written forms. `speakDuration`: every second to an hour, minute to a day, hour to a week, day to 365, and 3000 random, × 2 languages × 2 styles. Numbers: every whole number 0–10 000 in words and digits, 20 000 sampled (magnitudes to 999 999, two decimals, both signs), and 20 000 real numbers of any precision, many just inside or outside 999 999.99. |
+| `Durations.test.ts`, decimal amounts | Every unit in both languages: every amount from 0.01 to 20.00, every one up to and just past the unit's 365-day limit, and 3000 between, against `BigInt` arithmetic. |
+| `Quantity.generated.test.ts`, `speakAmount` | 40 000 amounts per language, on and off the hundredths, every unit, with and without "about", items up to 200 characters, humanised or not: the utterance, read by the test's own unit table, states the given quantity exactly and "about" exactly when it was given; an amount of whole hundredths is always said. |
+| `DomainFuzz.test.ts` | Every exported function (the test checks the list is complete) with 3000 generated calls of declared-type arguments holding any data (extreme and odd numbers, odd strings, unknown time zones): no throw, no escaped exception, no NaN, Infinity, invalid Date, date outside 2000–2199, empty or broken utterance; every function that takes a time zone fails for an unknown one. |
+| `RruleReference.test.ts` | The engine against a brute-force reference sharing nothing with it: 4291 rules (6 zones incl. Apia and Lord Howe, daylight-saving days, month ends, 29 February, both ends of the range, intervals 1–4 and sampled 7, 12, 13, 99, 100, 400, 999, seconds, COUNT and UNTIL incl. UNTIL at DTSTART and on daylight-saving days) × about 9 `after` instants: the same instants, in order, none twice, the same `stop` (the reference decides `range` by whether the series has an instance after 2199); fixed stops by hand (COUNT and UNTIL ending on 31 December 2199, a zone at UTC+14); `parseRRule(formatRRule(rule))` is the rule; UNTIL before DTSTART and a DTSTART that is not an instance refused by `readSeries` and `seriesAfter`; every description states every constraint, read by the test's own word tables (the interval's phase included); fixed instants computed by hand. |
+| `ZoneOffsets.test.ts` | The zone-offset lookup against Intl's offset names over 2000–2199 for 7 zones: every transition to the second; the wall-clock-to-instant conversion every quarter hour around each, and for civil wall-clock times made by arithmetic across every gap and fold, from both sides (Casablanca's gaps follow a zero offset). |
+| `ReviewRound1–4.test.ts`, the other files | The reviewers' cases, and examples. |

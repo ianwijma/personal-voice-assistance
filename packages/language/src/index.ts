@@ -1,4 +1,5 @@
-// The package's front doors (review round 3, decision 1): each validates its arguments and never throws. The grammar productions,
+// The package's front doors (review round 3, decision 1): each validates its data and never throws for it (round 4: arguments that are
+// not data must have their declared type; README, "The domain"). The grammar productions,
 // the tokenizer and the calendar arithmetic behind them are internal.
 export type { Language, Parsed, LocalDate, ClockTime, LocalDateTime } from "./Result.ts"
 export { languages, maxDurationMs, maxNumber, maxTextLength, maxWords, maxYear, minYear, numberDecimals } from "./Domain.ts"

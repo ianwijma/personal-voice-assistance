@@ -24,7 +24,7 @@ export const units: Record<Lang, Record<string, Unit>> = {
     handful: vague("handful"), handfuls: vague("handful"), pinch: vague("pinch"), pinches: vague("pinch"), splash: vague("splash"), splashes: vague("splash")
   },
   nl: {
-    g, gram: g, kg, kilo: kg, kilos: kg, kilogram: kg, ons: mass("g", 1, 100), pond: mass("g", 1, 500),
+    g, gram: g, kg, kilo: kg, "kilo's": kg, kilos: kg, kilogram: kg, ons: mass("g", 1, 100), pond: mass("g", 1, 500),
     ml, milliliter: ml, cl, centiliter: cl, dl, deciliter: dl, l, liter: l, tl: tsp, theelepel: tsp, theelepels: tsp, el: tbsp, eetlepel: tbsp, eetlepels: tbsp,
     kopje: cup, kopjes: cup, stuk: piece(), stuks: piece(), dozijn: piece(12),
     pak: pack("pack"), pakken: pack("pack"), pakje: pack("pack"), pakjes: pack("pack"), zak: pack("bag"), zakken: pack("bag"), zakje: pack("bag"), zakjes: pack("bag"),
@@ -41,7 +41,7 @@ export const reserved: Record<Lang, ReadonlySet<string>> = {
     "seventy eighty ninety hundred thousand million billion point minus half quarter quarters third thirds dozen about around roughly approximately approx some bit few couple " +
     "lot lots rest remaining several a an the of and or nor plus but not no without except less more than least most under over below above max maximum minimum almost nearly " +
     "up to at per each every x").split(" ")),
-  nl: new Set(("nul half halve kwart driekwart anderhalf anderhalve derde miljoen miljard komma min dozijn ongeveer circa ca zon rond wat beetje paar veel enkele rest een de " +
+  nl: new Set(("nul half halve kwart driekwart anderhalf anderhalve derde miljoen miljard komma min dozijn ongeveer circa ca zo'n zon rond wat beetje paar veel enkele rest een de " +
     "het van aan en of noch plus maar niet geen zonder behalve minder meer dan minstens hooguit maximaal minimaal bijna ruim boven onder over tot per elke elk ieder iedere x lb lbs oz").split(" "))
 }
 const itemWords: Record<Lang, ReadonlyArray<string>> = {
@@ -50,7 +50,7 @@ const itemWords: Record<Lang, ReadonlyArray<string>> = {
 }
 const itemWord = (lang: Lang): Term => ({
   read: (w) => {
-    if (!/^\p{L}+$/u.test(w) || reserved[lang].has(w) || Object.prototype.hasOwnProperty.call(units[lang], w)) return undefined
+    if (!/^\p{L}+(?:'\p{L}+)*$/u.test(w) || reserved[lang].has(w) || Object.prototype.hasOwnProperty.call(units[lang], w)) return undefined
     if (lang === "nl" && (nlWhole(w) !== undefined || (/^(.+)enhalf$/.test(w) && nlWhole(w.slice(0, -6)) !== undefined))) return undefined
     return w
   },
@@ -93,9 +93,9 @@ export const quantityGrammar = (lang: Lang): Grammar => {
     { rhs: ["AMOUNT", oneOf(units[lang])], act: ([a, u]) => (a > 0 ? measured(a, u) : undefined), weight: 5 },
     { rhs: [article, oneOf(units[lang])], act: ([, u]) => measured(1, u), weight: 2 },
     { rhs: [countNumber(lang)], act: ([a]) => (a > 0 ? { amount: a, unit: "piece", dimension: "count", approx: false, rest: false, needsItem: true, base: { amount: a, unit: "piece" } } : undefined), weight: 2 },
-    ...(en ? ["some", "a bit of", "a few", "a couple of", "a lot of"] : ["wat", "een beetje", "een paar", "veel"]).map((p) => fixed(words(p), { dimension: "none", approx: true, rest: false, needsItem: true })),
-    fixed(words(en ? "the rest" : "de rest"), { dimension: "none", approx: false, rest: true, needsItem: false })
+    ...(en ? ["some", "a bit of", "a few", "a couple of", "a lot of"] : ["wat", "een beetje", "een paar", "veel"]).map((p) => fixed(words(p), { dimension: "none", approx: true, rest: false, needsItem: true }))
   ]
+  const restHead = { dimension: "none", approx: false, rest: true }
   if (en) {
     head.push(
       { rhs: [lit("half"), article, oneOf(units.en)], act: ([, , u]) => measured(0.5, u) },
@@ -106,14 +106,19 @@ export const quantityGrammar = (lang: Lang): Grammar => {
   return {
     AMOUNT: amountRules(lang),
     HEAD: head,
-    APPROX: [{ rhs: [oneOf(Object.fromEntries((en ? ["about", "around", "roughly", "approximately"] : ["ongeveer", "circa", "zo'n"]).map((w) => [w, true])))] }],
+    APPROX: [{ rhs: [oneOf(Object.fromEntries((en ? ["about", "around", "roughly", "approximately"] : ["ongeveer", "circa", "zo'n", "zon"]).map((w) => [w, true])))] }],
     ITEM: [{ rhs: [itemWord(lang)], act: ([w]) => [w], weight: 3 }, { rhs: [itemWord(lang), "ITEM"], act: ([w, rest]) => [w, ...rest] }],
     LINK: en ? [fixed([lit("of")], "of"), fixed(words("of the"), "of the")] : [fixed([lit("van")], "van"), fixed(words("van de"), "van de"), fixed(words("van het"), "van het")],
     TAIL: [{ rhs: ["ITEM"], act: ([item]) => ({ item, link: undefined }), weight: 3 }, { rhs: ["LINK", "ITEM"], act: ([link, item]) => ({ item, link }) }],
     BODY: [{ rhs: ["HEAD"], weight: 1 }, { rhs: ["HEAD", "TAIL"], act: ([h, t]) => ({ ...h, tail: t }), weight: 3 }],
+    // "the rest [of [the] ITEM]" / "de rest [van [de | het] ITEM]": its own production, the link required with an item (README;
+    // review round 4, finding 13).
+    RESTLINK: en ? [fixed([lit("of")], "of"), fixed(words("of the"), "of the")] : [fixed([lit("van")], "van"), fixed(words("van de"), "van de"), fixed(words("van het"), "van het")],
     QUANTITY: [
       { rhs: ["BODY"], act: ([b]) => accept(b, false, en), weight: 3 },
-      { rhs: ["APPROX", "BODY"], act: ([, b]) => accept(b, true, en) }
+      { rhs: ["APPROX", "BODY"], act: ([, b]) => accept(b, true, en) },
+      fixed(words(en ? "the rest" : "de rest"), { ...restHead, item: [], linkWords: 0 }),
+      { rhs: [...words(en ? "the rest" : "de rest"), "RESTLINK", "ITEM"], act: ([, , link, item]) => ({ ...restHead, item, linkWords: link.split(" ").length }) }
     ]
   }
 }
@@ -123,7 +128,8 @@ const accept = (b: Record<string, any>, approx: boolean, en: boolean): Record<st
   const tail = b["tail"] as { item: Array<string>; link?: string } | undefined
   if (b["needsItem"] === true && tail === undefined) return undefined
   if (approx && b["dimension"] === "none") return undefined
-  if (tail?.link !== undefined && (b["needsItem"] === true || (!en && b["rest"] !== true) || (tail.link !== "of" && b["rest"] !== true))) return undefined
+  // The link of a unit: English "of" only ("a kilo of rice"); none after a count or "some" ("the rest" has its own production).
+  if (tail?.link !== undefined && (b["needsItem"] === true || !en || tail.link !== "of")) return undefined
   const { needsItem: _n, tail: _t, ...q } = b
   return { ...q, approx: approx || b["approx"] === true, item: tail === undefined ? [] : tail.item, linkWords: tail?.link === undefined ? 0 : tail.link.split(" ").length }
 }

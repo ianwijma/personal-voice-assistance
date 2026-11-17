@@ -8,7 +8,8 @@ import { dayDiff, inRange, isoWeekday } from "./Zoned.ts"
 /**
  * The speakers. Each checks its arguments and answers `undefined` — "cannot say this" — for anything outside its domain (README,
  * domain table), never an empty or a wrong utterance (review round 3, decision 1). Which outputs read back with a parser is in the
- * README ("Speaking"), and the tests prove each such promise over the whole enumerable domain.
+ * README ("Speaking"): numbers, durations, clock times and dates read back (round 4, decision 2); `speakAmount` promises instead never to
+ * state another quantity than it was given. The tests prove each promise over the whole enumerable domain.
  */
 
 const isDate = (d: unknown): d is LocalDate =>
@@ -18,12 +19,14 @@ const isDate = (d: unknown): d is LocalDate =>
  * A number for the speech synthesiser: digits with the language's decimal mark ("2.5", "2,5"), rounded to two decimals, trailing
  * zeros dropped, no thousands separator; a negative number with "minus" / "min" ("minus 3"). `words`: "forty two point five" /
  * "tweeënveertig komma vijf". `undefined` when it is not a finite number, its size is above 999 999.99, or it is not 0 but rounds
- * to 0 (a nonzero number is never said as 0). `parseNumber` reads every result back to the rounded number.
+ * to 0 (a nonzero number is never said as 0). `parseNumber` reads every result back to the number rounded to two decimals.
  */
 export const speakNumber: (n: number, language: Language, options?: { readonly words?: boolean }) => string | undefined = guarded((n: number, language: Language, options?: { readonly words?: boolean }): string | undefined => {
   if (typeof n !== "number" || !Number.isFinite(n) || !isLanguage(language) || !isOptions(options)) return undefined
+  // The size is checked on the number given, not on its rounding: 999 999.994 is above 999 999.99 (review round 4, finding 9).
+  if (Math.abs(n) > maxSpoken) return undefined
   const hundredths = Math.round(Math.abs(n) * 100)
-  if (hundredths > maxNumber * 100 + 99 || (n !== 0 && hundredths === 0)) return undefined
+  if (n !== 0 && hundredths === 0) return undefined
   const whole = Math.floor(hundredths / 100)
   const fraction = String(hundredths % 100).padStart(2, "0").replace(/0+$/, "")
   const sign = n < 0 ? (language === "en" ? "minus " : "min ") : ""
@@ -33,6 +36,9 @@ export const speakNumber: (n: number, language: Language, options?: { readonly w
   const digits = fraction.split("").map((d) => numberToWords(Number(d), language)!).join(" ")
   return `${sign}${w} ${language === "en" ? "point" : "komma"} ${digits}`
 }, undefined)
+
+/** The largest size `speakNumber` says: 999 999.99. */
+const maxSpoken = maxNumber + 0.99
 
 interface Names {
   readonly one: string
@@ -75,13 +81,18 @@ export interface SpeakAmountOptions {
 }
 
 const article = (language: Language, word: string): string => (language === "nl" ? "een" : /^[aeiou]/.test(word) ? "an" : "a")
-/** At most two decimals: `x` said by `speakNumber` is `x` itself. */
+/** Whole hundredths (to a millionth of one, the error of a decimal fraction in binary): `x` said by `speakNumber` is `x` itself. */
 const exact = (x: number): boolean => Math.abs(x * 100 - Math.round(x * 100)) < 1e-6
 
 /**
  * An amount with its unit, as it is said: "about 750 grams of rice", "2 kilo bloem", "a pack of milk", "a handful of nuts", "3
- * apples", "some rice", "the rest of the rice". Dutch units stay singular after a number ("2 liter"). `undefined` when the amount is
- * not a positive number `speakNumber` says, the unit is not one of `UnitId` (Dutch: an ounce or a pound), or the item is not text.
+ * apples", "some rice", "the rest of the rice". Dutch units stay singular after a number ("2 liter"). For speaking, not promised to
+ * read back; the promise (review round 4, decision 2) is that it never states another quantity than it was given: nothing is rounded
+ * (an amount that is not whole hundredths of the unit it is said in, after humanising, is `undefined`), humanising only changes the
+ * unit when the amount stays exact (1500 g is "1.5 kilograms", 1.234 kg "1234 grams"), and "about" is said only when `approx` is
+ * true. A handful, a pinch and a splash are vague by themselves: said as given, without "about". `undefined` when the amount is not a
+ * positive number `speakNumber` says, the unit is not one of `UnitId` (Dutch: an ounce or a pound), or the item is longer than 200
+ * characters.
  */
 export const speakAmount: (q: AmountLike, language: Language, options?: SpeakAmountOptions) => string | undefined = guarded((q: AmountLike, language: Language, options?: SpeakAmountOptions): string | undefined => {
   if (typeof q !== "object" || q === null || !isLanguage(language) || !isOptions(options)) return undefined
@@ -99,7 +110,7 @@ export const speakAmount: (q: AmountLike, language: Language, options?: SpeakAmo
   if (typeof amount !== "number" || !Number.isFinite(amount) || !(amount > 0)) return undefined
   const about = q.approx === true ? (en ? "about " : "ongeveer ") : ""
   if (unit === undefined || unit === "piece") {
-    if ((item === undefined && unit === undefined) || speakNumber(amount, language) === undefined) return undefined
+    if ((item === undefined && unit === undefined) || !exact(amount) || speakNumber(amount, language) === undefined) return undefined
     const count = `${about}${speakNumber(amount, language)!}`
     const names = unitNames[language]["piece"]!
     return item !== undefined ? `${count} ${item}` : `${count} ${speakNumber(amount, language) === "1" ? names.one : names.many}`
@@ -108,7 +119,12 @@ export const speakAmount: (q: AmountLike, language: Language, options?: SpeakAmo
   if (options?.humanize !== false) {
     if (amount < 1 && (unit === "kg" || unit === "l")) { amount = amount * 1000; unit = unit === "kg" ? "g" : "ml" }
     else if (amount >= 1000 && (unit === "g" || unit === "ml") && exact(amount / 1000)) { amount = amount / 1000; unit = unit === "g" ? "kg" : "l" }
+    // 1.234 kg is 1234 grams: said exactly in the smaller unit rather than rounded in the larger.
+    else if ((unit === "kg" || unit === "l") && !exact(amount) && exact(amount * 1000)) { amount = amount * 1000; unit = unit === "kg" ? "g" : "ml" }
   }
+  // Never a different quantity (review round 4, finding 2): an amount that is not whole hundredths of the unit it is said in would be
+  // rounded by `speakNumber`, so it is not said.
+  if (!exact(amount)) return undefined
   const names = unitNames[language][unit]!
   const of = (text: string) => (item === undefined ? text : en ? `${text} of ${item}` : `${text} ${item}`)
   const said = speakNumber(amount, language)

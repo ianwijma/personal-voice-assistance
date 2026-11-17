@@ -76,7 +76,8 @@ const nlWholeMulti: Multi = {
   readMany: (ws, at) => {
     if (ws[at] === "nul") return [{ value: 0, next: at + 1 }]
     const out: Array<{ value: number; next: number }> = []
-    for (let k = 1; k <= 6 && at + k <= ws.length; k++) {
+    // Any number of parts (README: the 40-word phrase is the only bound; review round 4, finding 10).
+    for (let k = 1; at + k <= ws.length; k++) {
       const part = ws.slice(at, at + k)
       if (!part.every(nlIsPart) || part[0] === "en" || part[k - 1] === "en") continue
       const v = nlWhole(part.join(""))
@@ -134,9 +135,46 @@ const nlB1000Spell = (n: number, r: Rng | undefined): string => {
   if (head !== "" && tail !== "" && r?.chance(0.2) === true) return `${head} ${tail}`
   return head + tail
 }
-/** A Dutch spelling: one word below 1000, "tweeduizend driehonderd" above; spaced parts when `r` is given. */
+/** The parts of a Dutch written number: 225 324 is twee honderd vijf en twintig duizend drie honderd vier en twintig. */
+const nlMorphemes = (n: number): Array<string> => {
+  const b100 = (x: number): Array<string> => (x === 0 ? [] : x < 20 ? [nlSmallAll[x]!] : x % 10 === 0 ? [nlX[x / 10 - 2]!] : [nlU[(x % 10) - 1]!, "en", nlX[Math.floor(x / 10) - 2]!])
+  const b1000 = (x: number): Array<string> => {
+    const h = Math.floor(x / 100)
+    return [...(h === 0 ? [] : h === 1 ? ["honderd"] : [nlU[h - 1]!, "honderd"]), ...b100(x % 100)]
+  }
+  const th = Math.floor(n / 1000)
+  return [...(th === 0 ? [] : th === 1 ? ["duizend"] : [...b1000(th), "duizend"]), ...b1000(n % 1000)]
+}
+/**
+ * The parts joined at random, each boundary a space or none ("en" is joined on both sides or spaced on both: "vijfentwintig", "vijf en
+ * twintig"): every spacing of the written number (review round 4, finding 10), up to all eleven parts of 999 999.
+ */
+const nlPartition = (n: number, r: Rng): string => {
+  for (;;) {
+    const spaced = nlPartitionOnce(n, r)
+    // A spaced part must itself be a number word or "en": "honderd eenduizend" is not written ("eenduizend" is no word).
+    if (spaced.split(" ").every((w) => nlIsPart(norm(w)))) return spaced
+  }
+}
+const nlPartitionOnce = (n: number, r: Rng): string => {
+  const ms = nlMorphemes(n)
+  let out = ms[0]!
+  for (let k = 1; k < ms.length; k++) {
+    const m = ms[k]!
+    // The joint after "en" follows the one before it.
+    const join = ms[k - 1] === "en" ? !out.endsWith(" en") : r.chance(0.5)
+    if (!join) { out += ` ${m}`; continue }
+    out += m === "en" && out.endsWith("e") ? "ën" : m
+  }
+  return out
+}
+/**
+ * A Dutch spelling: one word below 1000, "tweeduizend driehonderd" above (the speaker's); with `r`, often the speaker's style with
+ * some spaced parts, and otherwise any spacing of the parts.
+ */
 export const nlSpell = (n: number, r?: Rng): string => {
   if (n === 0) return "nul"
+  if (r !== undefined && r.chance(0.4)) return nlPartition(n, r)
   if (n < 1000) return nlB1000Spell(n, r)
   const th = Math.floor(n / 1000)
   const rest = n % 1000

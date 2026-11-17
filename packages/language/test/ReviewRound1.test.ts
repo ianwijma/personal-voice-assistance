@@ -330,7 +330,9 @@ describe("finding 22: a nonzero amount is never said as zero", () => {
     expect(speakAmount({ amount: 0.0005, unit: "l" }, "nl")).toBe("0,5 milliliter")
     expect(speakAmount({ amount: 1500, unit: "g" }, "en")).toBe("1.5 kilograms")
     expect(speakAmount({ amount: 1234, unit: "g" }, "en")).toBe("1234 grams")
-    expect(speakAmount({ amount: 1.001, unit: "kg" }, "en")).toBe("1 kilogram")
+    // Round 4, finding 2: never rounded into another quantity; said exactly in grams, or not at all.
+    expect(speakAmount({ amount: 1.001, unit: "kg" }, "en")).toBe("1001 grams")
+    expect(speakAmount({ amount: 1.001, unit: "kg" }, "en", { humanize: false })).toBeUndefined()
   })
 })
 

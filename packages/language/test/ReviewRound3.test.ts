@@ -65,13 +65,13 @@ describe("round 3 findings", () => {
     expect(speakAmount({ amount: 2, unit: "oz" }, "nl", { item: "suiker", humanize: false })).toBeUndefined()
     expect(parseQuantity("een pond suiker", "nl")).toMatchObject({ kind: "ok", value: { base: { amount: 500 } } })
   })
-  it("12: the reviewer's descriptions read back (COUNT and UNTIL are said after the words that do)", () => {
-    expect(describeRRule("FREQ=DAILY;INTERVAL=100", "en")).toBe("every 100 days")
+  it("12: the reviewer's descriptions (round 4: descriptions are for speaking and not promised to read back; the parser reads these phrases)", () => {
+    expect(describeRRule("FREQ=DAILY;INTERVAL=100", "en", { start: { year: 2026, month: 11, day: 20 } })).toBe("every 100 days, from 20 November 2026")
     expect(parseRecurrence("every 100 days", "en", opts)).toMatchObject({ kind: "ok", value: { rrule: "FREQ=DAILY;INTERVAL=100" } })
     expect(parseRecurrence("elke 100 dagen", "nl", opts)).toMatchObject({ kind: "ok", value: { rrule: "FREQ=DAILY;INTERVAL=100" } })
     const lists = describeRRule("FREQ=MONTHLY;BYMONTHDAY=1,15,31", "en")!
     expect(lists).toBe("on the first, the fifteenth and the thirty first of every month")
-    expect(parseRecurrence(lists, "en", opts)).toMatchObject({ kind: "ok", value: { rrule: "FREQ=MONTHLY;BYMONTHDAY=1,15,31" } })
+    expect(parseRecurrence("on the first, the fifteenth and the thirty first of every month", "en", opts)).toMatchObject({ kind: "ok", value: { rrule: "FREQ=MONTHLY;BYMONTHDAY=1,15,31" } })
     expect(describeRRule("FREQ=DAILY;COUNT=5", "en")).toBe("every day, 5 times")
   })
   it("13: tonight at midnight is the end of today, also in the small hours", () => {

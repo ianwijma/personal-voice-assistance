@@ -110,16 +110,34 @@ describe("describeRRule", () => {
     ["FREQ=YEARLY;BYMONTH=3;BYMONTHDAY=3", "every year on the third of March", "elk jaar op 3 maart"],
     ["FREQ=DAILY;COUNT=5", "every day, 5 times", "elke dag, 5 keer"]
   ]
+  // An interval above one says its phase, the series' first day (round 4, finding 1): each such rule is given a start it selects.
+  const starts: Readonly<Record<string, { year: number; month: number; day: number }>> = {
+    "FREQ=DAILY;INTERVAL=2": { year: 2026, month: 11, day: 20 }, "FREQ=DAILY;INTERVAL=3": { year: 2026, month: 11, day: 20 }, "FREQ=DAILY;INTERVAL=12": { year: 2026, month: 11, day: 20 },
+    "FREQ=WEEKLY;INTERVAL=2;BYDAY=TU": { year: 2026, month: 11, day: 17 }, "FREQ=WEEKLY;INTERVAL=2;BYDAY=MO,WE": { year: 2026, month: 11, day: 16 },
+    "FREQ=WEEKLY;INTERVAL=3;BYDAY=TU": { year: 2026, month: 11, day: 17 }, "FREQ=WEEKLY;INTERVAL=6;BYDAY=TU": { year: 2026, month: 11, day: 17 },
+    "FREQ=MONTHLY;INTERVAL=2;BYMONTHDAY=1": { year: 2026, month: 12, day: 1 }, "FREQ=MONTHLY;INTERVAL=3;BYDAY=2TU": { year: 2026, month: 12, day: 8 }
+  }
+  const monthsEn = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"]
+  const monthsNl = ["januari", "februari", "maart", "april", "mei", "juni", "juli", "augustus", "september", "oktober", "november", "december"]
   for (const [rule, en, nl] of rows) it(rule, () => {
-    expect(describeRRule(rule, "en")).toBe(en)
-    expect(describeRRule(rule, "nl")).toBe(nl)
+    const start = starts[rule]
+    if (start === undefined) {
+      expect(describeRRule(rule, "en")).toBe(en)
+      expect(describeRRule(rule, "nl")).toBe(nl)
+      return
+    }
+    expect(describeRRule(rule, "en", { start })).toBe(`${en}, from ${start.day} ${monthsEn[start.month - 1]} ${start.year}`)
+    expect(describeRRule(rule, "nl", { start })).toBe(`${nl}, vanaf ${start.day} ${monthsNl[start.month - 1]} ${start.year}`)
+    // Without the start the phase cannot be said: not described.
+    expect(describeRRule(rule, "en")).toBeUndefined()
+    expect(describeRRule(rule, "nl")).toBeUndefined()
   })
   it("a plain weekly, monthly or yearly rule says the day it takes from DTSTART, and is not described without it (round 3, findings 7 and 8)", () => {
     const start = { year: 2026, month: 11, day: 18 }
     const plain: ReadonlyArray<readonly [string, string, string]> = [
-      ["FREQ=WEEKLY", "every Wednesday", "elke woensdag"], ["FREQ=WEEKLY;INTERVAL=2", "every second Wednesday", "elke tweede woensdag"],
-      ["FREQ=WEEKLY;INTERVAL=6", "every six weeks on Wednesday", "elke zes weken op woensdag"], ["FREQ=MONTHLY", "on the eighteenth of every month", "op de achttiende van elke maand"],
-      ["FREQ=MONTHLY;INTERVAL=3", "every three months on the eighteenth", "elke drie maanden op de achttiende"], ["FREQ=YEARLY", "every year on the eighteenth of November", "elk jaar op 18 november"]
+      ["FREQ=WEEKLY", "every Wednesday", "elke woensdag"], ["FREQ=WEEKLY;INTERVAL=2", "every second Wednesday, from 18 November 2026", "elke tweede woensdag, vanaf 18 november 2026"],
+      ["FREQ=WEEKLY;INTERVAL=6", "every six weeks on Wednesday, from 18 November 2026", "elke zes weken op woensdag, vanaf 18 november 2026"], ["FREQ=MONTHLY", "on the eighteenth of every month", "op de achttiende van elke maand"],
+      ["FREQ=MONTHLY;INTERVAL=3", "every three months on the eighteenth, from 18 November 2026", "elke drie maanden op de achttiende, vanaf 18 november 2026"], ["FREQ=YEARLY", "every year on the eighteenth of November", "elk jaar op 18 november"]
     ]
     for (const [rule, en, nl] of plain) {
       expect(describeRRule(rule, "en", { start })).toBe(en)
@@ -149,19 +167,10 @@ describe("describeRRule", () => {
     expect(describeRRule("", "nl")).toBeUndefined()
   })
 
-  it("round trip: speak a rule, read it back, get the same rule", () => {
-    const rules = [
-      "FREQ=DAILY", "FREQ=DAILY;INTERVAL=2", "FREQ=DAILY;INTERVAL=3", "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR", "FREQ=WEEKLY;BYDAY=SA,SU", "FREQ=WEEKLY;BYDAY=MO", "FREQ=WEEKLY;BYDAY=MO,WE,FR", "FREQ=WEEKLY;INTERVAL=2;BYDAY=TU", "FREQ=WEEKLY;INTERVAL=2;BYDAY=MO,WE", "FREQ=WEEKLY;INTERVAL=3;BYDAY=TU",
-      "FREQ=MONTHLY;BYMONTHDAY=1", "FREQ=MONTHLY;BYMONTHDAY=15", "FREQ=MONTHLY;BYMONTHDAY=-1", "FREQ=MONTHLY;BYMONTHDAY=1,15", "FREQ=MONTHLY;INTERVAL=2;BYMONTHDAY=1",
-      "FREQ=MONTHLY;BYDAY=1MO", "FREQ=MONTHLY;BYDAY=-1FR", "FREQ=MONTHLY;BYDAY=2TU", "FREQ=YEARLY;BYMONTH=3;BYMONTHDAY=3"
-    ]
-    for (const language of ["en", "nl"] as const) {
-      for (const r of rules) {
-        const said = describeRRule(r, language)!
-        const back = parseRecurrence(said, language, opts)
-        expect(back.kind === "ok" ? back.value.rrule : back.kind, `${language}: "${said}"`).toBe(r)
-      }
-    }
+  it("a time zone given is checked, also when the rule has no UNTIL (round 4, finding 18)", () => {
+    expect(describeRRule("FREQ=DAILY", "en", { timeZone: "not/a/zone" })).toBeUndefined()
+    expect(describeRRule("FREQ=DAILY", "nl", { timeZone: "+01:00" })).toBeUndefined()
+    expect(describeRRule("FREQ=DAILY", "en", { timeZone: AMS })).toBe("every day")
   })
 })
 
@@ -180,6 +189,33 @@ describe("parseRRule / formatRRule", () => {
     it(`"${bad}" is invalid`, () => expect(parseRRule(bad).kind).toBe("invalid"))
   for (const other of ["FREQ=DAILY;BYSETPOS=1", "FREQ=HOURLY", "FREQ=DAILY;UNTIL=20270101"])
     it(`"${other}" is unsupported`, () => expect(parseRRule(other).kind).toBe("unsupported"))
+  it("a part this package does not expand is read by RFC 5545 first: a malformed value is invalid, a valid one unsupported (round 4, finding 21)", () => {
+    // Each part's range enumerated from below to above, with malformed spellings: the test's own table of RFC 5545 §3.3.10.
+    const ranges: Record<string, readonly [number, number, boolean]> = {
+      BYSECOND: [0, 60, false], BYMINUTE: [0, 59, false], BYHOUR: [0, 23, false], BYYEARDAY: [-366, 366, true], BYWEEKNO: [-53, 53, true], BYSETPOS: [-366, 366, true]
+    }
+    let checked = 0
+    for (const [part, [min, max, signed]] of Object.entries(ranges)) {
+      for (let v = min - 3; v <= max + 3; v++) {
+        const valid = v >= min && v <= max && (v !== 0 || min === 0)
+        for (const freq of ["DAILY", "YEARLY"]) {
+          const got = parseRRule(`FREQ=${freq};${part}=${v}`).kind
+          if (got !== (valid ? "unsupported" : "invalid")) throw new Error(`${part}=${v}: ${got}`)
+          checked++
+        }
+      }
+      for (const v of ["garbage", "1,1", "1,", ",1", "1.5", "1e1", "+", signed ? "--1" : "+1", signed ? "+1000" : "-1"]) expect(parseRRule(`FREQ=DAILY;${part}=${v}`).kind, `${part}=${v}`).toBe("invalid")
+      expect(parseRRule(`FREQ=DAILY;${part}=${min === 0 ? 0 : 1},${max}`).kind, `${part} list`).toBe("unsupported")
+    }
+    expect(checked).toBeGreaterThan(2000)
+    // An UNTIL in a form this package does not take is still a date: an impossible one is invalid.
+    expect(parseRRule("FREQ=DAILY;UNTIL=20270230").kind).toBe("invalid")
+    expect(parseRRule("FREQ=DAILY;UNTIL=20270230T120000").kind).toBe("invalid")
+    expect(parseRRule("FREQ=DAILY;UNTIL=20270228").kind).toBe("unsupported")
+    expect(parseRRule("FREQ=DAILY;UNTIL=20270228T250000").kind).toBe("invalid")
+    // X- parts take any value.
+    expect(parseRRule("FREQ=DAILY;X-NAME=anything at all").kind).toBe("unsupported")
+  })
   it("reads DTSTART lines of the supported form only", () => {
     expect(parseDtstart("DTSTART;TZID=Europe/Amsterdam:20261120T090000")).toEqual({ start: { year: 2026, month: 11, day: 20, hour: 9, minute: 0, second: 0 }, timeZone: "Europe/Amsterdam" })
     for (const other of ["2026-11-20T09:30", "DTSTART:20261120T090000", "DTSTART:20261120T090000Z", "DTSTART;VALUE=DATE:20261120", "soon"]) expect(parseDtstart(other), other).toBeUndefined()

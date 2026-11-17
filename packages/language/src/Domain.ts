@@ -1,9 +1,11 @@
 import type { Language } from "./Result.ts"
 
 /**
- * The domain every exported function checks before it does anything else (review round 3, decision 1). Outside it a parser answers
- * `not-understood`, a speaker `undefined` ("cannot say this"), a rule reader `invalid` or `unsupported`; nothing throws. The README's
- * domain table lists these per function.
+ * The domain every exported function checks before it does anything else (review round 3, decision 1, narrowed in round 4). Text and
+ * numbers are data and may be anything: a phrase, a number, an instant, an amount or a time zone outside the domain gets the failure
+ * value — a parser `not-understood`, a speaker `undefined` ("cannot say this"), a rule reader `invalid` or `unsupported` — never a
+ * throw. Everything else (languages, options, units, rule objects, lists) is the caller's code with its declared type; a value of
+ * another type there is a programming error and may throw. The README's domain table lists the data domain per function.
  */
 
 /** The two languages. */

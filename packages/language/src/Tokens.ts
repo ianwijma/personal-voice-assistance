@@ -1,6 +1,6 @@
 import { maxTextLength, maxWords } from "./Domain.ts"
 
-/** One word of spoken or typed text: lower case, no accents, no apostrophes, with its place in the original. */
+/** One word of spoken or typed text: lower case, no accents, an apostrophe inside it kept as `'`, with its place in the original. */
 export interface Tok {
   readonly norm: string
   readonly start: number
@@ -18,12 +18,18 @@ const dashes = new Set(["-", "‐", "–", "—"])
 const apostrophes = new Set(["'", "’"])
 
 export const stripMarks = (s: string): string => s.normalize("NFD").replace(/\p{M}/gu, "")
-const normOf = (raw: string): string => stripMarks(raw).toLowerCase().replace(/['’]/g, "")
+/**
+ * A word's normal form: no accents, lower case, and an apostrophe inside it kept (as `'`), so "tw'o" is not "two": an apostrophe the
+ * grammar does not have is not repaired away (review round 4, finding 14). The words of the grammars that have one are "o'clock",
+ * "zo'n" and Dutch "kilo's" (each also without it: "oclock", "zon", "kilos"); an item word may have one ("baker's flour").
+ */
+const normOf = (raw: string): string => stripMarks(raw).toLowerCase().replace(/’/g, "'")
 
 /**
  * Split a phrase into tokens, or `undefined` when it holds something no grammar here reads. The one tokenizer of every parser
  * (review round 3, decision 3):
- * - a word is letters (with any combining marks, so a decomposed "tweeënhalf" is one word), apostrophes only inside it ("o'clock");
+ * - a word is letters (with any combining marks, so a decomposed "tweeënhalf" is one word), apostrophes only inside it ("o'clock"),
+ *   kept in its normal form (only the grammar's own words with one read as those words);
  *   digits are ASCII digits with `.`, `,` or `:` only between digits ("7:30", "2,5", "1,500"); "a.m." and "p.m." are "am" and "pm";
  *   "3rd" and "3e" are one token;
  * - between tokens only spaces and the sentence punctuation `, . ! ?` (not right before digits: ".5"); a hyphen or dash only right between two words

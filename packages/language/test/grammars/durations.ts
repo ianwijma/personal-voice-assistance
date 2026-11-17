@@ -44,12 +44,19 @@ export const amountRules = (lang: Lang): ReadonlyArray<Rule> => lang === "en"
     fixed(words("een half"), 0.5), fixed(words("een halve"), 0.5), fixed(words("een kwart"), 0.25), fixed([lit("driekwart")], 0.75), fixed(words("drie kwart"), 0.75)
   ]
 
-const total = (parts: ReadonlyArray<Part>): number | undefined => {
-  for (let k = 1; k < parts.length; k++) if (order.indexOf(parts[k - 1]!.unit) >= order.indexOf(parts[k]!.unit)) return undefined
-  const sum = parts.reduce((n, p) => n + p.amount * ms[p.unit]!, 0)
-  const rounded = Math.round(sum)
-  return Math.abs(sum - rounded) < 1e-6 && rounded > 0 && rounded <= maxMs ? rounded : undefined
+/** The amount in hundredths, exactly: every amount the grammar writes has at most two decimals (a half and a quarter too). */
+const hundredths = (amount: number): bigint => {
+  const h = Math.round(amount * 100)
+  if (Math.abs(amount * 100 - h) > 1e-6) throw new Error(`an amount of the grammar that is not whole hundredths: ${amount}`)
+  return BigInt(h)
 }
+/** The value in milliseconds, in exact integer arithmetic (BigInt; review round 4, finding 5): more than 0, at most 365 days. */
+export const totalMs = (parts: ReadonlyArray<Part>): number | undefined => {
+  for (let k = 1; k < parts.length; k++) if (order.indexOf(parts[k - 1]!.unit) >= order.indexOf(parts[k]!.unit)) return undefined
+  const sum = parts.reduce((n, p) => n + hundredths(p.amount) * BigInt(ms[p.unit]!), 0n)
+  return sum % 100n === 0n && sum > 0n && sum <= BigInt(maxMs) * 100n ? Number(sum / 100n) : undefined
+}
+const total = totalMs
 
 /** DURATION: parts, largest unit first, each once, optionally joined by "and" / "en". Value: { ms, units }. */
 export const durationGrammar = (lang: Lang): Grammar => {

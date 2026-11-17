@@ -40,7 +40,8 @@ export interface TimeMatch {
 const toMinutes = (v: unknown): number | undefined => {
   if (typeof v === "number") return Number.isInteger(v) && v >= 0 && v <= 1439 ? v : undefined
   if (typeof v !== "string") return undefined
-  const m = /^([01][0-9]|2[0-3]):?([0-5][0-9])$/.exec(v.trim())
+  // Exactly "HH:MM", as documented: no colonless "0730", no spaces (review round 4, finding 19).
+  const m = /^([01][0-9]|2[0-3]):([0-5][0-9])$/.exec(v)
   return m === null ? undefined : Number(m[1]) * 60 + Number(m[2])
 }
 /** The band of the options, or `undefined` when it is not one (review round 3, decision 1). */
@@ -105,7 +106,7 @@ const coresEn: P<Core> = alt(
   // half HOUR (British: "half seven" is 7:30)
   map(seq(words("half"), hour12.en), ([, h]) => core(h, 30, true)),
   // HOUR o'clock
-  map(seq(hour12.en, words("oclock")), ([h]) => core(h, 0, true)),
+  map(seq(hour12.en, oneOf("o'clock", "oclock")), ([h]) => core(h, 0, true)),
   // HOUR hundred: the 24-hour clock ("ten hundred", "nineteen hundred", "oh nine hundred")
   map(seq(alt(wordNumber("en", 10, 23), ohDigit, map(words("zero"), () => 0)), words("hundred")), ([h]) => core(h, 0, false)),
   // HOUR MINUTES: "seven thirty", "nineteen forty five", "oh seven fifteen", "seven oh five"

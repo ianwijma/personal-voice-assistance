@@ -226,7 +226,7 @@ export const makeCachedJson = (deps: CachedJsonDeps = {}): CachedJson => {
         // that ended elsewhere, a server that answers 304 unasked) says nothing about the cached value: ask again without conditions.
         if (entry !== undefined && validator !== undefined && sameResource(response.url, entry.url) && response.redirects.length === 0) {
           const etag = response.headers["etag"] ?? entry.etag
-          cache.setIfNewer(key, { value: entry.value, ...(etag !== undefined ? { etag } : {}), url: entry.url, storedAt: now(), sequence })
+          cache.setIfNewer(key, { value: entry.value, ...(etag !== undefined ? { etag } : {}), url: entry.url ?? response.url, storedAt: now(), sequence })
           return { kind: "value", value: entry.value, ageMs: 0, source: "revalidated" } satisfies Outcome
         }
         response = yield* ask(false)

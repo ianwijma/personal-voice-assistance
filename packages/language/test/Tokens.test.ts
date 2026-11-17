@@ -3,9 +3,11 @@ import { sliceText, tokenize } from "../src/Tokens.ts"
 
 describe("tokenize", () => {
   const norms = (text: string) => tokenize(text)?.map((t) => t.norm)
-  it("lowers case, strips accents and apostrophes", () => {
+  it("lowers case and strips accents; an apostrophe inside a word is kept (round 4, finding 14), one before Dutch s is a gap", () => {
     expect(norms("Één kop, TWEEËNTWINTIG")).toEqual(["een", "kop", "tweeentwintig"])
-    expect(norms("five o'clock")).toEqual(["five", "oclock"])
+    expect(norms("five o'clock")).toEqual(["five", "o'clock"])
+    expect(norms("five o’clock")).toEqual(["five", "o'clock"])
+    expect(norms("tw'o")).toEqual(["tw'o"])
     expect(norms("'s Avonds")).toEqual(["s", "avonds"])
   })
   it("keeps numbers with separators whole and splits digits from letters; a word never runs into digits", () => {

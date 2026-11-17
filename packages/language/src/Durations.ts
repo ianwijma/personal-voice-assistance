@@ -55,13 +55,24 @@ export const durationParts: Record<Language, P<ReadonlyArray<DurationPart>>> = {
 }
 const ordered = (parts: ReadonlyArray<DurationPart>): boolean => parts.every((p, k) => k === 0 || rank[parts[k - 1]!.unit] < rank[p.unit])
 
-/** The milliseconds of the parts, or `undefined` when they are not whole milliseconds, or 0, or more than `maxDurationMs`. */
+/**
+ * The milliseconds of the parts, or `undefined` when they are 0 or more than `maxDurationMs`. Exact: every amount the grammar reads is
+ * whole hundredths (two decimals, a half, a quarter), so the sum is taken in hundredths of a millisecond, integers all the way, and no
+ * floating-point tolerance decides (review round 4, finding 5: "128.05 days" is 11 063 520 000 ms).
+ */
 export const durationMs = (parts: ReadonlyArray<DurationPart>): number | undefined => {
-  let total = 0
-  for (const p of parts) total += p.amount * unitMs[p.unit]
-  const rounded = Math.round(total)
-  if (Math.abs(total - rounded) > 1e-6 || rounded <= 0 || rounded > maxDurationMs) return undefined
-  return rounded
+  let hundredthsMs = 0
+  for (const p of parts) {
+    const h = Math.round(p.amount * 100)
+    // Not whole hundredths: no amount of the grammar is, so this is no duration (never rounded into one).
+    if (Math.abs(p.amount * 100 - h) > 1e-6 * Math.max(1, Math.abs(h))) return undefined
+    const part = h * unitMs[p.unit]
+    // Each part is checked before it is added, so the sum stays far below 2^53 and exact.
+    if (part > maxDurationMs * 100) return undefined
+    hundredthsMs += part
+  }
+  if (hundredthsMs <= 0 || hundredthsMs > maxDurationMs * 100 || hundredthsMs % 100 !== 0) return undefined
+  return hundredthsMs / 100
 }
 
 /** A duration phrase, every reading, with its milliseconds and units. */

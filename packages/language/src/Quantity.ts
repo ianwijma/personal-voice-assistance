@@ -69,7 +69,7 @@ export const unitTable = dicts<Language, UnitInfo>({
     handful: vague("handful"), handfuls: vague("handful"), pinch: vague("pinch"), pinches: vague("pinch"), splash: vague("splash"), splashes: vague("splash")
   },
   nl: {
-    g: mass("g"), gram: mass("g"), kg: mass("kg"), kilo: mass("kg"), kilos: mass("kg"), kilogram: mass("kg"), ons: mass("g", 100), pond: mass("g", 500),
+    g: mass("g"), gram: mass("g"), kg: mass("kg"), kilo: mass("kg"), "kilo's": mass("kg"), kilos: mass("kg"), kilogram: mass("kg"), ons: mass("g", 100), pond: mass("g", 500),
     ml: volume("ml"), milliliter: volume("ml"), cl: volume("cl"), centiliter: volume("cl"), dl: volume("dl"), deciliter: volume("dl"), l: volume("l"), liter: volume("l"),
     tl: volume("tsp"), theelepel: volume("tsp"), theelepels: volume("tsp"), el: volume("tbsp"), eetlepel: volume("tbsp"), eetlepels: volume("tbsp"),
     kopje: volume("cup"), kopjes: volume("cup"),
@@ -83,7 +83,7 @@ export const unitTable = dicts<Language, UnitInfo>({
   }
 })
 
-const approxWords: Record<Language, ReadonlyArray<string>> = { en: ["about", "around", "roughly", "approximately"], nl: ["ongeveer", "circa", "zon"] }
+const approxWords: Record<Language, ReadonlyArray<string>> = { en: ["about", "around", "roughly", "approximately"], nl: ["ongeveer", "circa", "zo'n", "zon"] }
 const someWords: Record<Language, ReadonlyArray<ReadonlyArray<string>>> = {
   en: [["some"], ["a", "bit", "of"], ["a", "few"], ["a", "couple", "of"], ["a", "lot", "of"]],
   nl: [["wat"], ["een", "beetje"], ["een", "paar"], ["veel"]]
@@ -105,7 +105,7 @@ export const reservedItemWords: Record<Language, ReadonlySet<string>> = {
   ]),
   nl: new Set([
     "nul", "half", "halve", "kwart", "driekwart", "anderhalf", "anderhalve", "derde", "miljoen", "miljard", "komma", "min", "dozijn",
-    "ongeveer", "circa", "ca", "zon", "rond", "wat", "beetje", "paar", "veel", "enkele", "rest", "een", "de", "het", "van", "aan", "en", "of",
+    "ongeveer", "circa", "ca", "zo'n", "zon", "rond", "wat", "beetje", "paar", "veel", "enkele", "rest", "een", "de", "het", "van", "aan", "en", "of",
     "noch", "plus", "maar", "niet", "geen", "zonder", "behalve", "minder", "meer", "dan", "minstens", "hooguit", "maximaal", "minimaal",
     "bijna", "ruim", "boven", "onder", "over", "tot", "per", "elke", "elk", "ieder", "iedere", "x", "lb", "lbs", "oz"
   ])
@@ -193,6 +193,8 @@ export const parseQuantity: (text: string, language: Language, options?: Quantit
       // rice"); Dutch "van" / "van de" / "van het" after "de rest" only.
       const linked = tail?.[0]
       if (linked !== undefined && (q.needsItem || (!en && !q.rest) || (linked !== "of" && !q.rest))) return undefined
+      // "the rest [of [the] ITEM]", "de rest [van [de | het] ITEM]": an item after "the rest" needs its link (review round 4, finding 13).
+      if (q.rest && itemText !== "" && linked === undefined) return undefined
       const { needsItem: _n, ...rest } = q
       return { ...rest, approx: approx !== undefined || q.approx, said: sliceText(inp.text, inp.toks, 0, h.end), item: itemText }
     }
