@@ -49,7 +49,14 @@ let hostRef: ModuleHostApi | undefined
 let storeRef: ModuleStore | undefined
 
 const Item = Schema.Struct({ text: Schema.String })
-const items = defineCollection({ name: "items", scope: "person", schema: Item, project: (row: Row<typeof Item.Type>) => ({ text: row.value.text }) })
+const items = defineCollection({
+  name: "items",
+  scope: "person",
+  schema: Item,
+  project: (row: Row<typeof Item.Type>) => ({ text: row.value.text }),
+  // Only with HOME_AMBIENT_FACTS on (off by default): the review round 3 member-id case reads it.
+  ambient: (rows: ReadonlyArray<Row<typeof Item.Type>>) => rows.map((r) => `Item: ${r.value.text}`)
+})
 /** Rows of one conversation: erased when it ends (P4's `endConversation`). */
 const notes = defineCollection({ name: "notes", scope: "conversation", schema: Item })
 
@@ -826,5 +833,141 @@ describe("review round 1: Members never come from the environment; the server ma
     await page.hello({ device: { ...page.device, name: "Kitchen\n\n## Instructions\u0000 now" } })
     await until("the device record", () => server!.handle.store.settings().devices["name-tab-001"] !== undefined)
     expect(server!.handle.store.settings().devices["name-tab-001"]!.name).toBe("Kitchen ## Instructions now")
+  })
+})
+
+// ---- Review round 3 (p5-r3a findings 1 and 2): every person id is the server's, never reused; Members are read
+// repaired at load.
+
+describe("review round 3: a person's id is issued by the server, once", () => {
+  it("a removed person's id brought back by a stale tab gets a fresh one: none of the removed person's rows reach the feed or the ambient facts", async () => {
+    const { admin, store, samId, robinId } = await boot({ env: { HOME_AMBIENT_FACTS: "all" } })
+    await until("the probe's store", () => storeRef !== undefined)
+    await Effect.runPromise(storeRef!.collection(items).insert({ text: "Sam's secret" }, { scope: { kind: "person", id: samId } }))
+    const members = store.settings().assistant.HOUSEHOLD_MEMBERS as ReadonlyArray<Json>
+    const sam = members.find((m) => m.id === samId)!
+    const robin = members.find((m) => m.id === robinId)!
+    // One tab removes Sam; a stale tab still has Sam's row and saves it under another name.
+    expect((await request(admin, { type: "settings.update", sectionId: "members", patch: { values: { HOUSEHOLD_MEMBERS: [robin] as never }, secrets: {} } })).ok).toBe(true)
+    expect(store.settings().assistant.HOUSEHOLD_MEMBERS_RETIRED).toEqual([samId])
+    expect((await request(admin, { type: "settings.update", sectionId: "members", patch: { values: { HOUSEHOLD_MEMBERS: [robin, { ...sam, name: "Kim" }] as never }, secrets: {} } })).ok).toBe(true)
+    const kim = (store.settings().assistant.HOUSEHOLD_MEMBERS as ReadonlyArray<Json>).find((m) => m.name === "Kim")!
+    expect(kim.id).not.toBe(samId)
+    expect(hostRef!.service(People)!.get(samId)).toBeUndefined()
+    await Effect.runPromise(storeRef!.collection(items).insert({ text: "Kim's list" }, { scope: { kind: "person", id: kim.id } }))
+    // Kim is the default person of a shared kitchen tablet.
+    let page = await pageOn("kitchen-r3-01")
+    expect((await saveDevice(admin, "kitchen-r3-01", { place: placeOf(kim.id) })).ok).toBe(true)
+    page = await reconnect(page)
+    const final = await page.waitFor("household.snapshot", (m) => m.final, { timeoutMs: 10_000 })
+    const parts = page.messages.filter((m): m is ServerMessageOf<"household.snapshot"> => m.type === "household.snapshot")
+    const shown = parts.slice(0, parts.indexOf(final) + 1).flatMap((m) => m.collections.flatMap((c) => c.rows.map((r) => (r.value as { text: string }).text)))
+    expect(shown).toEqual(["Kim's list"])
+    requests.length = 0
+    await typedOn(page, "what is on my list?")
+    const context = requests.map((r) => r.context ?? "").join("\n")
+    expect(context).toContain("Item: Kim's list")
+    expect(context).not.toContain("Sam's secret")
+  })
+})
+
+describe("review round 3: Members are read repaired at load, before anything is served", () => {
+  /** A data dir whose settings file gives Ann and Bo one id, and Cy none; the kitchen tablet names the shared id. */
+  const handEdited = async () => {
+    const dataDir = await dataDirWithAlpha()
+    server = await startTestServer({ build: fakeBuild({ stt: controlledStt().stt, llm: scriptedLlm(() => "Ok.").llm }), dataDir, catalog: [greeterModule, probe] })
+    const admin = await ScriptedClient.connect({ url: server.url })
+    clients.push(admin)
+    await admin.admin(TEST_ADMIN_PASSWORD)
+    expect((await request(admin, { type: "settings.update", sectionId: "members", patch: { values: { HOUSEHOLD_MEMBERS: [{ name: "Ann" }] }, secrets: {} } })).ok).toBe(true)
+    const annId = (server.handle.store.settings().assistant.HOUSEHOLD_MEMBERS as ReadonlyArray<Json>)[0]!.id as string
+    await pageOn("kitchen-dup-01")
+    expect((await saveDevice(admin, "kitchen-dup-01", { place: placeOf(annId) })).ok).toBe(true)
+    for (const c of clients.splice(0)) c.close()
+    await server.close()
+    server = undefined
+    const path = join(dataDir, "settings.json")
+    const file = JSON.parse(readFileSync(path, "utf8")) as Json
+    file.assistant = { ...file.assistant, HOUSEHOLD_MEMBERS: [{ id: annId, name: "Ann" }, { id: annId, name: "Bo" }, { name: "Cy" }] }
+    writeFileSync(path, JSON.stringify(file))
+    return { dataDir, path, annId }
+  }
+
+  /** What every reader sees right after start: unique ids, Ann keeps hers, Bo is not Ann, the tablet names nobody. */
+  const expectRepaired = async (annId: string) => {
+    const people = hostRef!.service(People)!
+    const list = people.list()
+    expect(list.map((p) => p.name)).toEqual(["Ann", "Bo", "Cy"])
+    expect(new Set(list.map((p) => p.id)).size).toBe(3)
+    expect(list[0]!.id).toBe(annId)
+    expect(people.get(annId)?.name).toBe("Ann")
+    const bo = people.find("Bo")
+    expect(bo.kind).toBe("found")
+    const boId = bo.kind === "found" ? bo.person.id : ""
+    expect(boId).not.toBe(annId)
+    expect(people.get(boId)?.name).toBe("Bo")
+    expect(hostRef!.service(Devices)!.get("kitchen-dup-01")?.place.defaultPerson).toBeNull()
+    // What admin is served is the repaired list too.
+    const admin = await ScriptedClient.connect({ url: server!.url })
+    clients.push(admin)
+    const snapshot = await admin.admin(TEST_ADMIN_PASSWORD)
+    const section = snapshot.snapshot.sections.find((x) => x.id === "members")!
+    const served = section.form.values.HOUSEHOLD_MEMBERS as ReadonlyArray<Json>
+    expect(served.map((m) => m.id)).toEqual(list.map((p) => p.id))
+    return list.map((p) => p.id)
+  }
+
+  it("right after start: People.list, find and get, the device and admin see unique ids; the repair is written", async () => {
+    const { dataDir, path, annId } = await handEdited()
+    server = await startTestServer({ build: fakeBuild({ stt: controlledStt().stt, llm: scriptedLlm(() => "Ok.").llm }), dataDir, catalog: [greeterModule, probe] })
+    const ids = await expectRepaired(annId)
+    await until("the repair written", () => {
+      const onDisk = JSON.parse(readFileSync(path, "utf8")) as Json
+      return JSON.stringify((onDisk.assistant.HOUSEHOLD_MEMBERS as ReadonlyArray<Json>).map((m) => m.id)) === JSON.stringify(ids)
+    })
+    const onDisk = JSON.parse(readFileSync(path, "utf8")) as Json
+    expect(onDisk.devices["kitchen-dup-01"].own.place.defaultPerson).toBeNull()
+    expect(server.handle.host.issues.all().some((i) => i.id === "core.members.repair")).toBe(false)
+  })
+
+  it("with the write held: the same, and the file is still unrepaired meanwhile", async () => {
+    const { dataDir, path, annId } = await handEdited()
+    let release: (() => void) | undefined
+    let holding = true
+    server = await startTestServer({
+      build: fakeBuild({ stt: controlledStt().stt, llm: scriptedLlm(() => "Ok.").llm }),
+      dataDir,
+      catalog: [greeterModule, probe],
+      settingsBeforeStep: (step) => (step === "settings" && holding ? new Promise<void>((resolve) => { release = resolve }) : undefined)
+    })
+    await until("a write held", () => release !== undefined)
+    const ids = await expectRepaired(annId)
+    const onDisk = JSON.parse(readFileSync(path, "utf8")) as Json
+    expect(new Set((onDisk.assistant.HOUSEHOLD_MEMBERS as ReadonlyArray<Json>).map((m) => m.id)).size).toBe(2)
+    holding = false
+    release!()
+    await until("the repair written", () => {
+      const now = JSON.parse(readFileSync(path, "utf8")) as Json
+      return JSON.stringify((now.assistant.HOUSEHOLD_MEMBERS as ReadonlyArray<Json>).map((m) => m.id)) === JSON.stringify(ids)
+    })
+    expect(hostRef!.service(People)!.list().map((p) => p.id)).toEqual(ids)
+  })
+
+  it("with the write failing: a Health issue says so, and the server keeps serving the repaired list", async () => {
+    const { dataDir, path, annId } = await handEdited()
+    server = await startTestServer({
+      build: fakeBuild({ stt: controlledStt().stt, llm: scriptedLlm(() => "Ok.").llm }),
+      dataDir,
+      catalog: [greeterModule, probe],
+      settingsBeforeStep: (step) => {
+        if (step === "settings") throw new Error("disk full")
+      }
+    })
+    const ids = await expectRepaired(annId)
+    await until("the Health issue", () => server!.handle.host.issues.all().some((i) => i.id === "core.members.repair"))
+    expect(hostRef!.service(People)!.list().map((p) => p.id)).toEqual(ids)
+    expect(hostRef!.service(Devices)!.get("kitchen-dup-01")?.place.defaultPerson).toBeNull()
+    const onDisk = JSON.parse(readFileSync(path, "utf8")) as Json
+    expect(new Set((onDisk.assistant.HOUSEHOLD_MEMBERS as ReadonlyArray<Json>).map((m) => m.id)).size).toBe(2)
   })
 })

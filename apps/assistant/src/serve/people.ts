@@ -12,6 +12,7 @@ import {
 } from "@pva/core"
 import { checkMembersValue, MAX_MEMBERS, MEMBER_LIMITS, type SettingsPatch, type SettingValue } from "@pva/protocol"
 import { Effect, Semaphore } from "effect"
+import { createHash } from "node:crypto"
 import type { SectionDefinition } from "./sectionDefinitions.ts"
 
 /**
@@ -33,6 +34,11 @@ import type { SectionDefinition } from "./sectionDefinitions.ts"
  */
 
 export const MEMBERS_KEY = "HOUSEHOLD_MEMBERS"
+/**
+ * Ids of people removed from Members, kept by the server beside the list (not a field: never shown or edited) so that
+ * no id is issued twice in the life of the settings file (review round 3). Absent in older files: none known.
+ */
+export const RETIRED_KEY = "HOUSEHOLD_MEMBERS_RETIRED"
 export const DIET_KEYS = {
   allergies: "HOUSEHOLD_DIET_ALLERGIES",
   diets: "HOUSEHOLD_DIET_DIETS",
@@ -140,38 +146,145 @@ export const membersSection: SectionDefinition = {
       placeholder: "coriander"
     })
   },
-  normalize: (values) => withPersonIds(values)
+  storedKeys: [RETIRED_KEY],
+  load: (stored) => withLoadedMembers(stored),
+  normalize: (values, committed) => withPersonIds(values, committed)
 }
 
 const isRecord = (u: unknown): u is Record<string, unknown> => typeof u === "object" && u !== null && !Array.isArray(u)
 const strings = (u: unknown): ReadonlyArray<string> => (Array.isArray(u) ? u.filter((x): x is string => typeof x === "string") : [])
 const ID = /^[a-z0-9][a-z0-9_-]{0,39}$/
 
+/** The retired ids in saved values (`RETIRED_KEY`). */
+export const retiredIdsOf = (value: unknown): ReadonlySet<string> =>
+  new Set(Array.isArray(value) ? value.filter((x): x is string => typeof x === "string" && ID.test(x)) : [])
+
+const validIdOf = (m: unknown): string | undefined => (isRecord(m) && typeof m.id === "string" && ID.test(m.id) ? m.id : undefined)
+
 /**
- * Saved values with an id for every person: a new person (no id, or one that is not a valid id) gets a fresh one; a
- * second person with an id already used (a copied row) too. Other keys are left as they are.
+ * Saved values with an id for every person, all issued by the server (review round 3): an incoming id is kept only
+ * when it is the id of a person in the committed Members (`committed`, the values before this save), the first row
+ * that carries it; any other row gets a fresh id, whatever it supplied (a new row, a copied row, a stale tab's row of
+ * a person removed since). The ids of committed people who are not in the new list are added to `RETIRED_KEY`, and a
+ * fresh id is none of the committed, retired or supplied ones: an id is never issued twice in the life of the
+ * settings file. Other keys are left as they are.
  */
-export const withPersonIds = (values: Readonly<Record<string, SettingValue>>, random?: () => number): Readonly<Record<string, SettingValue>> => {
+export const withPersonIds = (
+  values: Readonly<Record<string, SettingValue>>,
+  committed: Readonly<Record<string, unknown>>,
+  random?: () => number
+): Readonly<Record<string, SettingValue>> => {
   const list = values[MEMBERS_KEY]
-  if (!Array.isArray(list)) return values
-  const taken = new Set<string>()
-  for (const m of list) if (isRecord(m) && typeof m.id === "string" && ID.test(m.id)) taken.add(m.id)
+  const before = Array.isArray(committed[MEMBERS_KEY]) ? (committed[MEMBERS_KEY] as ReadonlyArray<unknown>) : []
+  const committedIds = new Set(before.flatMap((m) => validIdOf(m) ?? []))
+  const retiredBefore = retiredIdsOf(committed[RETIRED_KEY])
+  if (!Array.isArray(list)) return { ...values, [RETIRED_KEY]: [...retiredBefore] }
+  const supplied = new Set(list.flatMap((m) => (isRecord(m) && typeof m.id === "string" ? [m.id] : [])))
   const used = new Set<string>()
-  let changed = false
   const next = list.map((m) => {
     if (!isRecord(m)) return m
-    const id = typeof m.id === "string" ? m.id : ""
-    if (ID.test(id) && !used.has(id)) {
+    const id = validIdOf(m)
+    if (id !== undefined && committedIds.has(id) && !used.has(id)) {
       used.add(id)
       return m
     }
-    const fresh = newPersonId(new Set([...taken, ...used]), random)
+    const fresh = newPersonId(new Set([...committedIds, ...retiredBefore, ...supplied, ...used]), random)
     used.add(fresh)
-    changed = true
     return { ...m, id: fresh }
   })
-  return changed ? { ...values, [MEMBERS_KEY]: next as unknown as SettingValue } : values
+  const retired = [...retiredBefore, ...[...committedIds].filter((id) => !used.has(id) && !retiredBefore.has(id))]
+  const sameList = next.every((m, i) => m === list[i])
+  return {
+    ...values,
+    ...(sameList ? {} : { [MEMBERS_KEY]: next as unknown as SettingValue }),
+    [RETIRED_KEY]: retired
+  }
 }
+
+/** A deterministic fresh id for a record repaired at load (the same file gives the same ids at every start). */
+const loadedId = (seed: string, taken: ReadonlySet<string>): string => {
+  const letters = "abcdefghijklmnopqrstuvwxyz0123456789"
+  for (let salt = 0; ; salt++) {
+    const hash = createHash("sha256").update(`${salt}:${seed}`).digest()
+    let id = "p-"
+    for (let i = 0; i < 8; i++) id += letters[hash[i]! % letters.length]
+    if (!taken.has(id)) return id
+  }
+}
+
+/** Members as the server reads them (`loadedMembers`). */
+export interface LoadedMembers {
+  /** The list with a unique valid id on every record. The same array as saved when nothing needed it. */
+  readonly value: unknown
+  /** Ids that more than one saved record carried: a reference to one (a device's default person) is cleared. */
+  readonly ambiguous: ReadonlySet<string>
+  /** Whether the saved list differs (it is to be written back). */
+  readonly repaired: boolean
+}
+
+const loadedCache = new WeakMap<object, { readonly retired: unknown; readonly loaded: LoadedMembers }>()
+
+/**
+ * Members normalised synchronously, in memory, as they are read (review round 3): a hand-edited file may give a
+ * record no id, or an id that an earlier record already has. A later record with an id already seen, or without a
+ * valid one, gets a fresh id (deterministic, none of the saved or retired ids); the id seen twice is `ambiguous`,
+ * and a device's reference to it counts as no default person until the references are cleared. Every reader of
+ * Members (the settings, `People`, device contexts, the feed's person rule) reads this, never the saved list; writing
+ * it back is ordinary persistence (serveMode). Cached per saved array, so a read costs nothing.
+ */
+export const loadedMembers = (raw: unknown, retired?: unknown): LoadedMembers => {
+  if (!Array.isArray(raw)) return { value: raw, ambiguous: new Set(), repaired: false }
+  const hit = loadedCache.get(raw)
+  if (hit !== undefined && hit.retired === retired) return hit.loaded
+  const taken = new Set<string>([...retiredIdsOf(retired), ...raw.flatMap((m) => (isRecord(m) && typeof m.id === "string" ? [m.id] : []))])
+  const seen = new Set<string>()
+  const ambiguous = new Set<string>()
+  let repaired = false
+  const value = raw.map((m, index) => {
+    if (!isRecord(m)) return m
+    const id = validIdOf(m)
+    if (id !== undefined && !seen.has(id)) {
+      seen.add(id)
+      return m
+    }
+    if (id !== undefined) ambiguous.add(id)
+    repaired = true
+    const fresh = loadedId(`${index}:${String(m.id)}:${String(m.name)}`, taken)
+    taken.add(fresh)
+    seen.add(fresh)
+    return { ...m, id: fresh }
+  })
+  const loaded: LoadedMembers = repaired ? { value, ambiguous, repaired } : { value: raw, ambiguous, repaired }
+  loadedCache.set(raw, { retired, loaded })
+  return loaded
+}
+
+/** Saved values with Members as the server reads them (`loadedMembers`): the section's `load`. */
+export const withLoadedMembers = (stored: Readonly<Record<string, unknown>>): Readonly<Record<string, unknown>> => {
+  const loaded = loadedMembers(stored[MEMBERS_KEY], stored[RETIRED_KEY])
+  return loaded.repaired ? { ...stored, [MEMBERS_KEY]: loaded.value } : stored
+}
+
+const idsCache = new WeakMap<LoadedMembers, { readonly all: ReadonlySet<string>; readonly referenceable: ReadonlySet<string> }>()
+const idsOfLoaded = (assistant: Readonly<Record<string, unknown>>) => {
+  const loaded = loadedMembers(assistant[MEMBERS_KEY], assistant[RETIRED_KEY])
+  let ids = idsCache.get(loaded)
+  if (ids === undefined) {
+    const all = new Set(peopleFrom(loaded.value).map((p) => p.id))
+    ids = { all, referenceable: new Set([...all].filter((id) => !loaded.ambiguous.has(id))) }
+    idsCache.set(loaded, ids)
+  }
+  return ids
+}
+
+/** The ids of the loaded Members (`loadedMembers`) in saved values. */
+export const loadedPersonIdsOf = (assistant: Readonly<Record<string, unknown>>): ReadonlySet<string> => idsOfLoaded(assistant).all
+
+/**
+ * The person ids a device may name as its default person in these saved values: the loaded Members' ids without the
+ * ambiguous ones. Every check of a device's default person uses it.
+ */
+export const referenceableIdsOf = (assistant: Readonly<Record<string, unknown>>): ReadonlySet<string> => idsOfLoaded(assistant).referenceable
 
 /** The people in a saved `HOUSEHOLD_MEMBERS` value (records without a valid id or a name are left out). */
 export const peopleFrom = (value: unknown): ReadonlyArray<Person> => {
@@ -196,17 +309,6 @@ export const householdDietFrom = (value: (key: string) => unknown): Diet => ({
 
 /** The person ids in a members value (for the clean-up of devices after a person is removed). */
 export const personIdsOf = (value: unknown): ReadonlySet<string> => new Set(peopleFrom(value).map((p) => p.id))
-
-/** A saved Members value with a record that has no valid id, or an id twice (a hand-edited file): ids are to be made. */
-export const membersNeedIds = (value: unknown): boolean => {
-  if (!Array.isArray(value)) return false
-  const seen = new Set<string>()
-  for (const m of value) {
-    if (!isRecord(m) || typeof m.id !== "string" || !ID.test(m.id) || seen.has(m.id)) return true
-    seen.add(m.id)
-  }
-  return false
-}
 
 export interface PeopleSource {
   /** The effective value of a shared setting (`Sections.value`). */

@@ -190,10 +190,21 @@ export const makeSections = (
     return { sections, values, secretSet: checkView.secretSet, errors, warnings }
   }
 
-  const saved = () => ({ stored: migrate(store.settings().assistant), secrets: store.secrets().assistant })
+  // P5 round 3: what every reader sees is the saved values after each section's `load` (Members' ids repaired in
+  // memory at load), never the saved list as it is.
+  const loaded = (definitions: ReadonlyArray<SectionDefinition>, stored: Readonly<Record<string, unknown>>) => {
+    let out = stored
+    for (const d of definitions) if (d.load !== undefined) out = d.load(out)
+    return out
+  }
+  const saved = (definitions: ReadonlyArray<SectionDefinition> = sectionDefinitions(modelDirs())) => ({
+    stored: loaded(definitions, migrate(store.settings().assistant)),
+    secrets: store.secrets().assistant
+  })
   const current = () => {
-    const { stored, secrets } = saved()
-    return view(sectionDefinitions(modelDirs()), stored, secrets)
+    const definitions = sectionDefinitions(modelDirs())
+    const { stored, secrets } = saved(definitions)
+    return view(definitions, stored, secrets)
   }
 
   // `value` is read on the turn path (system prompt, default voice): cached until the saved values or the keys change.
@@ -234,7 +245,7 @@ export const makeSections = (
           return failed("", { ok: false, error: { code: "unknown_section", message: `There is no settings section "${id}"` } })
         }
         const path = sectionPath(d)
-        const { stored, secrets } = saved()
+        const { stored, secrets } = saved(definitions)
         const before = view(definitions, stored, secrets)
         const built = build((key) => before.values.get(key) as SettingValue | undefined)
         if ("refused" in built) return failed(path, { ok: false, error: { code: "invalid_settings", message: built.refused } })
@@ -248,9 +259,9 @@ export const makeSections = (
           return failed(path, { ok: false, error: { code: "invalid_settings", message: "Some settings are not valid", fieldErrors: patched.errors } })
         }
         // P5: a section may complete its values before they are written (Members gives a new person an id).
-        if (d.normalize !== undefined) patched = { ...patched, stored: d.normalize(patched.stored) }
-        // The values after this save, for every section (keys are global).
-        const keys = Object.keys(d.spec)
+        if (d.normalize !== undefined) patched = { ...patched, stored: d.normalize(patched.stored, stored) }
+        // The values after this save, for every section (keys are global), and the keys it writes.
+        const keys = [...Object.keys(d.spec), ...(d.storedKeys ?? [])]
         const replace = <V>(base: Readonly<Record<string, V>>, next: Readonly<Record<string, V>>) => {
           const out: Record<string, V> = { ...base }
           for (const key of keys) {
