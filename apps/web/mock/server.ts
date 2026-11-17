@@ -584,9 +584,21 @@ const initialSections = (): Array<SettingsSection> => [
           default: "en-GB",
           options: [{ value: "en-GB", label: "13 November 2026" }, { value: "en-US", label: "November 13, 2026" }, { value: "nl-NL", label: "13 november 2026" }],
           source: "default"
-        }
+        },
+        { type: "text", key: "HOME_CURRENCY", label: "Currency", description: "ISO 4217 code of the household's money, e.g. EUR, USD, GBP. The default of modules that handle prices.", apply: "live", default: "EUR", placeholder: "EUR", maxLength: 3, source: "default" },
+        {
+          type: "choice",
+          key: "HOME_CUP_SIZE",
+          label: "Cup size",
+          description: "How big \"a cup\" is in recipes and shopping lists.",
+          apply: "live",
+          default: "metric",
+          options: [{ value: "metric", label: "Metric cup (250 ml)" }, { value: "us", label: "US cup (236.6 ml)" }],
+          source: "default"
+        },
+        { type: "text", key: "HOME_API_CONTACT", label: "API contact", description: "An email address or web address put in the User-Agent of requests to public web services that ask who is calling. Empty: none is sent.", apply: "live", default: "", placeholder: "you@example.com", maxLength: 200, source: "default" }
       ],
-      values: { HOME_LOCATION: "", HOME_TIME_ZONE: "", HOME_LANGUAGE: "en-GB", HOME_UNITS: "metric", HOME_DATE_FORMAT: "en-GB" },
+      values: { HOME_LOCATION: "", HOME_TIME_ZONE: "", HOME_LANGUAGE: "en-GB", HOME_UNITS: "metric", HOME_DATE_FORMAT: "en-GB", HOME_CURRENCY: "EUR", HOME_CUP_SIZE: "metric", HOME_API_CONTACT: "" },
       secrets: {},
       errors: []
     },

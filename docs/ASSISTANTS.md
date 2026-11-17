@@ -40,7 +40,7 @@ Sections: 1 decisions · 2 data model · 3 run time · 4 existing concepts · 5 
 | Routing a sentence | A wake phrase wins: the whole sentence after it goes to that assistant. Otherwise, during an assistant's follow-up time, it stays with that assistant. Otherwise "Answers without a phrase" decides. TypeSafe is optional, hosted and per device: one Choice over the device's assistants, described by their Handles, plus a Noul for "does any fit". A timeout, an error or "none fits" goes to the fallback. With TypeSafe on, an assistant without a phrase still counts as reachable. |
 | Recogniser | One per device; speech recognition always runs on the server. A device uses the Hearing settings of the assistant that answers without a phrase, else those of the first in its list (also with TypeSafe). The other assistants' Hearing settings are not used on that device, and the UI says so. |
 | Conversations | One per assistant per device, each with its own history, id and idle clock. The reset time comes from the assistant, and "never" is allowed. |
-| Shared settings | Home (location, time zone, language, units, date format); each module's shared settings; language-model accounts; speech models; voice providers and favourites; routing (TypeSafe key and model); limits. Module settings resolve assistant's own → shared → module default. |
+| Shared settings | Home (location, time zone, language, units, date format, currency, cup size, API contact); each module's shared settings; language-model accounts; speech models; voice providers and favourites; routing (TypeSafe key and model); limits. Module settings resolve assistant's own → shared → module default. |
 | Voice page | The assistant's name, with a menu, in the top bar. Picking there changes who answers without a phrase on that device; an admin toggle per device allows it. The chat shows one conversation per assistant, with a switcher. The settings sheet loses Voice and Activation. Follow-up time is not shown for now. |
 | Diagnostics | Each trace carries the assistant, the device, who chose the assistant (phrase, follow-up, default, or TypeSafe with its probability and time) and a snapshot of the latency-relevant configuration at that turn. |
 | Latency | Everything that can add delay (the TypeSafe call, extra speech-model workers, per-assistant language-model instances and their warm-up, more voices) is measured through `TurnTrace` in its work package. No latency claims from reasoning. |
@@ -968,7 +968,7 @@ rule per key. A device with no assistant runs no recogniser; a recogniser that c
 `engine_failed`), typed text still works, and every other device hears. A save that would load local models needing more than 75 %
 of the free memory is refused with a warning until `saveAnyway`.
 
-**Home, modules (WP-12a to WP-12c).** Section `home` (location, time zone, language, units, date format) feeds every assistant's
+**Home, modules (WP-12a to WP-12c).** Section `home` (location, time zone, language, units, date format; since the modules plan P2 also currency, cup size and the API contact for `User-Agent` headers) feeds every assistant's
 prompt (one line, always present) and the linked defaults of Weather (`defaultPlace` is `HOME_LOCATION` itself, not "", so the
 module stays independent of the app) and Clock. `overridable` fields can be per assistant (never a secret, never an address);
 resolution per field is own value > environment > saved > linked default > the field's default (own wins over the environment too).

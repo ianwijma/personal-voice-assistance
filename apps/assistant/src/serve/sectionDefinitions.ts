@@ -137,6 +137,15 @@ const checkCurrency = (code: string): string | undefined =>
   /^[A-Z]{3}$/.test(code) ? undefined : "Use a three-letter ISO 4217 code in capitals, e.g. EUR"
 
 /**
+ * The API contact goes in a `User-Agent` header, which holds printable ASCII only: an address with accents or another script
+ * (an internationalised domain or mailbox) is refused with a hint rather than sent mangled.
+ */
+const checkApiContact = (contact: string): string | undefined =>
+  /^[\x20-\x7e]*$/.test(contact)
+    ? undefined
+    : "Use plain ASCII letters, digits and punctuation only: this goes in an HTTP header. Write an internationalised address in its ASCII form (xn--…, or %-encoded)"
+
+/**
  * The shared `home` section (docs/ASSISTANTS.md §2.4, §7.3): every assistant's prompt gets a Home line from it, and
  * the modules' linked defaults come from it (Weather place and units, Clock time zone and date format).
  */
@@ -213,7 +222,8 @@ export const homeSection: SectionDefinition = {
       description: "An email address or web address put in the User-Agent of requests to public web services that ask who is calling. Empty: none is sent.",
       env: "HOME_API_CONTACT",
       placeholder: "you@example.com",
-      maxLength: 200
+      maxLength: 200,
+      check: checkApiContact
     })
   }
 }
