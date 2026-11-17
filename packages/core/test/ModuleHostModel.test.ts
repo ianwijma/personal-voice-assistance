@@ -5,9 +5,9 @@
 // length, faults (a start that fails, throws a defect, interrupts itself or hangs; a finalizer that hangs),
 // interrupted callers, clock jumps, and closing the host at a random moment.
 //
-// The expected side never reads the host's bookkeeping. It is the test's own model of the desired state (what the
-// triggers asked, in the order they were issued), the planner's `reachedBy` for demand, and invariants stated
-// independently:
+// The expected side never reads the host's bookkeeping or uses its functions. It is the test's own model of the
+// desired state (what the triggers asked, in the order they were issued), its own reachability through `uses` (the
+// consumer brings the provider), its own count of restarts and attempts, and invariants stated independently:
 //
 // - at no moment has one module two published sets of registrations (checked inside every publish and withdraw);
 // - no tool call enters module code of a part that is not published;
@@ -24,7 +24,6 @@ import { makeTool } from "../src/Module.ts"
 import { ContributionKey, ServiceKey } from "../src/ModuleApi.ts"
 import { defineModule, ModuleStartError } from "../src/ModuleDefinition.ts"
 import { type ModuleDemand, type ModuleHost, makeModuleHost, readOnlyPersistence } from "../src/ModuleHost.ts"
-import { reachedBy } from "../src/ModulePlanner.ts"
 import type { Registrar } from "../src/ModuleRegistrations.ts"
 import { Setting } from "../src/Settings.ts"
 
@@ -63,6 +62,8 @@ interface World {
   readonly parentOf: Map<string, string>
   readonly sidOfTool: Map<unknown, string>
   readonly restarters: Array<(reason: string) => Effect.Effect<void>>
+  /** The restarter of each shared part of the provider, by its sid. */
+  readonly restarterOf: Map<string, (reason: string) => Effect.Effect<void>>
   readonly violations: Array<string>
   readonly faults: { readonly start: Record<ModuleId, Mode>; readonly hangClose: Record<ModuleId, boolean> }
   /** Abandoned closes the host reported, per module (titles seen on the Health page). */
@@ -78,6 +79,7 @@ const newWorld = (): World => ({
   parentOf: new Map(),
   sidOfTool: new Map(),
   restarters: [],
+  restarterOf: new Map(),
   violations: [],
   faults: { start: { prov: "ok", cons: "ok", solo: "ok" }, hangClose: { prov: false, cons: false, solo: false } },
   reported: { prov: 0, cons: 0, solo: 0 },
@@ -131,6 +133,7 @@ const catalogOf = (w: World) => {
       Effect.gen(function*() {
         const id = yield* begin("prov", "s")
         w.restarters.push(host.requestRestart)
+        w.restarterOf.set(id, host.requestRestart)
         const address = settings.address ?? ""
         return { value: { address, sid: id }, services: [Svc.of({ address, sid: id })], contributions: [Section.of(id)] }
       }),
@@ -225,11 +228,9 @@ const demandOfModel = (m: Model): ReadonlyMap<string, ReadonlyArray<ModuleDemand
 const expectedOf = (m: Model) => {
   const demand = demandOfModel(m)
   const soloOn = m.soloChosen ?? m.token !== undefined
-  const reached = reachedBy([
-    { id: "prov", wanted: demand.get("prov")!.length > 0, blocked: false, uses: [] },
-    { id: "cons", wanted: demand.get("cons")!.length > 0, blocked: false, uses: ["prov"] },
-    { id: "solo", wanted: soloOn, blocked: false, uses: [] }
-  ])
+  // The consumer `uses` the provider: wanting the consumer brings the provider (the model's own rule).
+  const consRuns = demand.get("cons")!.length > 0
+  const reached = new Set([...(demand.get("prov")!.length > 0 || consRuns ? ["prov"] : []), ...(consRuns ? ["cons"] : []), ...(soloOn ? ["solo"] : [])])
   const places = new Map<string, Array<string>>()
   for (const d of demand.get("prov")!) {
     const place = (d.own?.place as string | undefined) ?? m.placeDefault
@@ -445,6 +446,18 @@ const runSeed = (seed: number, steps: number) =>
       } else assert.strictEqual(host.service(Svc), undefined, `seed ${seed}: no service while prov does not run`)
       if (expected.running.cons) {
         assert.deepStrictEqual((modules.get("cons")!.instances ?? []).flatMap((i) => [...i.assistants]).sort(), expected.consUsers, `seed ${seed}: cons's users`)
+      }
+      if (expected.running.prov) {
+        // A restart asked for by the live shared part: exactly one more attempt of the provider, and a new shared part.
+        const shareds = () => [...w.opened.keys()].filter((sid) => sid.startsWith("prov:s")).length
+        const live = [...w.live].find(([, part]) => part.module === "prov" && part.parent === undefined)?.[0]
+        assert.isDefined(live, `seed ${seed}: prov's shared part is published`)
+        const before = shareds()
+        yield* w.restarterOf.get(live!)!("the model's restart")
+        yield* settleAll(host)
+        assert.strictEqual(shareds(), before + 1, `seed ${seed}: one restart is one more attempt`)
+        assert.isTrue(w.closed.has(live!) || w.hung.has(live!), `seed ${seed}: the restarted shared part was closed (or its finalizer, made to hang when it opened, entered)`)
+        assert.isFalse(w.live.has(live!), `seed ${seed}: and a new one is published instead`)
       }
     }
     // Close the host (at a random moment, or after the sequence): it returns within its bound.

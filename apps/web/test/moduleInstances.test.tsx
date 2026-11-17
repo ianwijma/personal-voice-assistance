@@ -99,3 +99,18 @@ describe("module instances (docs/ASSISTANTS.md §2.6)", () => {
     expect(screen.getByTestId("no-instances")).toBeInTheDocument()
   })
 })
+
+// Review round 4 (p1-r4c finding 4): a capability's page uses this view, not `ModuleHeader`: it shows the version too.
+describe("a capability's version", () => {
+  it("is shown with and without running instances, and absent when the manifest has none", () => {
+    const { unmount } = show({ ...weather([]), version: "0.3.0" })
+    expect(screen.getByTestId("module-version")).toHaveTextContent("version 0.3.0")
+    unmount()
+    const running = show({ ...weather([{ assistants: ["jeff"], own: [], state: "running" }]), version: "1.2.0" })
+    expect(screen.getByTestId("module-version")).toHaveTextContent("version 1.2.0")
+    running.unmount()
+    const { version: _, ...unversioned } = weather([])
+    show(unversioned)
+    expect(screen.queryByTestId("module-version")).toBeNull()
+  })
+})

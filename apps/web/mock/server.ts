@@ -35,9 +35,10 @@
  *                   web-voice default (asleep after a claim) and a third device that has it among three phrases.
  *   admin-disabled  no admin password: `admin.state.enabled` is false and every login is refused.
  *   admin-backoff   every wrong admin password refuses logins for 30 s.
- *   health          like typed (protocol 9): Diagnostics › Health lists a module error and a core warning; the Music
- *                   module is unavailable (yt-dlp is missing) and suggests a DJ template; Check again takes 1 s and
- *                   clears the clock warning. Every other scenario has an empty, checked registry.
+ *   health          like typed (protocol 9): Diagnostics › Health lists a module error and a module warning for one
+ *                   device (the kitchen speaker); the Music module is unavailable (yt-dlp is missing) and suggests a
+ *                   DJ template; Check again takes 1 s and clears the speaker warning. Every other scenario has an
+ *                   empty, checked registry.
  * In every scenario the vault starts as "none" (no vault yet) unless the scenario says otherwise.
  *
  * Protocol 5 (docs/FRONTENDS-AND-ACTIVATION.md): pages say `frontend: "voice" | "admin"` in hello. The admin
@@ -139,6 +140,7 @@ import {
   type VoiceEntry,
   voiceFor
 } from "@pva/protocol"
+import { answerHealthCheck } from "./health.ts"
 import { exampleEngineStatus, exampleHealth, exampleSnapshot, exampleUnavailableModule, exampleVoiceSection, exampleWeatherModule } from "@pva/protocol/examples"
 import { type WebSocket, WebSocketServer } from "ws"
 import { createAssistantsMock } from "./assistants.ts"
@@ -2230,16 +2232,20 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
     }
     case "health.check": {
       if (requireAdmin(c, m.requestId)) return
-      // As the server: answered once it has started; the outcome follows as `health`. A check already running is
-      // joined, not started again (one completion for any number of requests).
-      result(c, m.requestId, true)
-      if (health.checking) return
-      health = { ...health, checking: true }
-      broadcast({ type: "health", health })
-      after(1000, () => {
-        health = { issues: health.issues.filter((i) => i.id !== "music.speaker.kitchen"), checkedAt: Date.now(), checking: false }
-        broadcast({ type: "health", health })
+      // As the server: the current health first, then the result; the outcome follows as `health`. A check already
+      // running is joined, not started again (one completion for any number of requests).
+      const state = { health }
+      answerHealthCheck(state, {
+        send: (message) => sendTo(c, message),
+        broadcast: (message) => {
+          health = state.health
+          broadcast(message)
+        },
+        result: () => result(c, m.requestId, true),
+        after,
+        finished: (h) => ({ ...h, issues: h.issues.filter((i) => i.id !== "music.speaker.kitchen"), checkedAt: Date.now() })
       })
+      health = state.health
       return
     }
     case "engine.reload": {
