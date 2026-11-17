@@ -450,7 +450,9 @@ const decodeBody = async (encoding: Exclude<Encoding, "identity">, body: AsyncIt
     throw new NetFailure({ url, stage: "response", detail: `The ${encoding} body could not be decompressed: ${detail}` })
   }
   if (otherFailure !== undefined) throw otherFailure
-  // A single-stream encoding that stopped before the last byte it was given: the rest is not part of the stream.
+  // A single-stream encoding that stopped before the last byte it was given: the rest is not part of the stream. Gzip is exempt: its
+  // gunzip reads member after member and fails on a suffix that is not one, except that from a zero byte after the last member on it
+  // stops and ignores the rest, as `gzip` does with padding (README; review round 5, finding 2).
   if (encoding !== "gzip" && stream.bytesWritten < written) {
     throw refuse("content-encoding", url, `The ${encoding} body has ${written - stream.bytesWritten} bytes after the end of its stream`)
   }

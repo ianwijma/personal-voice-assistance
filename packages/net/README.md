@@ -19,7 +19,9 @@ Outgoing HTTP for URLs a model or a user chose, and for public APIs. No dependen
   size counts; an empty body is empty; any other encoding is refused. `deflate` is the zlib format (RFC 9110 §8.4.1.2): a deflate
   body that is not a zlib stream (raw deflate included) is refused with the `content-encoding` rule, whatever the chunk boundaries.
   Deflate and br are single streams: bytes after the end of the stream (junk, or a second stream) are refused with `content-encoding`;
-  gzip may be several members one after the other, and anything after the last that is not a member is a `NetFailure`. A failure of
+  gzip may be several members one after the other; after the last member, bytes from a zero byte on are ignored (as Node's gunzip
+  and `gzip` itself treat padding: "hello" followed by a zero byte and "AB" is "hello"), and anything else that is not another member
+  is a `NetFailure`. The decoded-size and time limits apply to what is read either way. A failure of
   the decompressor ends the read at once: a decompressed size over the limit is `NetTooLarge` and an invalid deflate stream is
   `NetRefused(content-encoding)` as soon as the offending bytes arrive, the connection is closed, and a body that never ends does not
   hold the request until the deadline. Request headers are
