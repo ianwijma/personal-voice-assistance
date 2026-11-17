@@ -10,7 +10,7 @@ import { afterEach, describe, expect, it, vi } from "vitest"
 vi.setConfig({ testTimeout: 20_000 })
 import { mkdtempSync } from "node:fs"
 import { tmpdir } from "node:os"
-import { defaultPreflight, EngineBuildProblems } from "../src/serve/Engine.ts"
+import { EngineBuildProblems } from "../src/serve/Engine.ts"
 import { ScriptedClient, sleep } from "./support/scriptedClient.ts"
 import { controlledStt, fakeBuild, greeterModule, markedPcm, scriptedLlm, startTestServer, TEST_ADMIN_PASSWORD, type TestServer, toneTts } from "./support/serveHarness.ts"
 
@@ -475,7 +475,7 @@ describe("serve: choosing the speech recognition model", () => {
 
   it("a reload whose recogniser files are missing is refused before the running engines stop", async () => {
     const emptyModels = mkdtempSync(join(tmpdir(), "pva-no-models-"))
-    const { stt } = await basic((t) => `Reply to ${t}.`, { env: { STT_SHERPA_MODEL_DIR: emptyModels }, preflight: defaultPreflight })
+    const { stt } = await basic((t) => `Reply to ${t}.`, { env: { STT_SHERPA_MODEL_DIR: emptyModels }, checkModelsBeforeReload: true })
     const a = await connect()
     await a.admin(TEST_ADMIN_PASSWORD)
     const from = a.messages.length

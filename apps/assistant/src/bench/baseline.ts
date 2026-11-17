@@ -4,13 +4,17 @@
  *   tsx src/bench/baseline.ts [--runs 3] [--model-dir DIR]          every installed recogniser preset and voice engine
  *   tsx src/bench/baseline.ts one stt <preset> [--model-dir DIR]    one fresh-process measurement, one JSON line
  *   tsx src/bench/baseline.ts one tts <preset> [--model-dir DIR]
+ *   tsx src/bench/baseline.ts together <preset,preset,...> [--runs 5] [--model-dir DIR]
+ *       WP-11: the listed recognisers loaded one after the other into one fresh process, each a hearer of its own
+ *       (its own end pause), as serve mode's pool loads them: equal presets share one worker. Prints the RSS added
+ *       after each load and the workers loaded.
  *
  * Each measurement runs in a fresh process: RSS before the load, RSS after the load and warm-up (`make` resolves
  * when the model is loaded and warmed up), and the wall-clock time of the load. The recogniser is a worker thread
  * of the process; a voice engine is a child process, so its RSS is read from /proc and added.
  * Models that are not on disk are listed, never downloaded.
  */
-import { defaultModelDir as sttDir, installedPresets, make as makeStt, presetNames, type PresetName } from "@pva/stt-sherpa"
+import { defaultModelDir as sttDir, installedPresets, make as makeStt, presetNames, type PresetName, workers } from "@pva/stt-sherpa"
 import { defaultModelDir as ttsDir, makeWithEngine, presets as voicePresets, presetFiles } from "@pva/tts-sherpa"
 import { Effect, type Scope } from "effect"
 import { spawnSync } from "node:child_process"
@@ -59,6 +63,51 @@ const args = process.argv.slice(2)
 const flag = (name: string, fallback: string) => {
   const i = args.indexOf(name)
   return i >= 0 ? args[i + 1]! : fallback
+}
+
+/** One fresh process: the listed recognisers loaded in order, each with its own end pause (a hearer of its own). */
+const measureTogether = async (names: ReadonlyArray<string>, modelDir: string) => {
+  const before = rssOf(process.pid)
+  const steps: Array<{ name: string; addedMb: number; loadMs: number; workers: number }> = []
+  await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+    for (const [i, name] of names.entries()) {
+      const t0 = performance.now()
+      yield* makeStt({ model: name as PresetName, modelDir, finalSilenceMs: 600 + 100 * i })
+      steps.push({ name, addedMb: rssOf(process.pid) - before, loadMs: performance.now() - t0, workers: workers() })
+    }
+  })))
+  return { names, steps }
+}
+
+if (args[0] === "together-one") {
+  console.log(JSON.stringify(await measureTogether(args[1]!.split(","), flag("--model-dir", sttDir))))
+  process.exit(0)
+}
+
+if (args[0] === "together") {
+  const names = args[1]!.split(",")
+  const modelDir = flag("--model-dir", sttDir)
+  const runs = Number(flag("--runs", "5"))
+  const self = fileURLToPath(import.meta.url)
+  const all: Array<Array<{ addedMb: number; loadMs: number; workers: number }>> = []
+  for (let i = 0; i < runs; i++) {
+    const r = spawnSync(process.execPath, ["--import", "tsx", self, "together-one", names.join(","), "--model-dir", modelDir], { encoding: "utf8" })
+    try {
+      all.push((JSON.parse(r.stdout.trim().split("\n").pop() ?? "") as { steps: Array<{ addedMb: number; loadMs: number; workers: number }> }).steps)
+    } catch {
+      console.log(`run ${i + 1} failed: ${r.stderr.slice(-300)}`)
+    }
+  }
+  names.forEach((name, k) => {
+    const added = all.map((steps) => steps[k]!.addedMb)
+    const load = all.map((steps) => steps[k]!.loadMs)
+    const f = (xs: Array<number>) => xs.map((x) => Math.round(x)).join("/")
+    console.log(
+      `after ${names.slice(0, k + 1).join(" + ")}: workers ${all[0]?.[k]?.workers}; added MB min ${Math.round(Math.min(...added))} median ${Math.round(median(added))} [${f(added)}]; ` +
+        `this load ms median ${Math.round(median(load))} [${f(load)}]`
+    )
+  })
+  process.exit(0)
 }
 
 if (args[0] === "one") {

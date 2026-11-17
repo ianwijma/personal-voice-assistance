@@ -1,5 +1,6 @@
 import {
   applicableOwn,
+  type Assistant,
   type AssistantBody,
   type AssistantInfo,
   assistantUsedOn,
@@ -56,6 +57,16 @@ export interface AssistantsOptions {
   readonly engineState: () => EngineState
   /** TypeSafe is set up (shows "Whichever fits" on the voice page; `device.pick` accepts `"typesafe"`). */
   readonly canAuto: () => boolean
+  /** An assistant's hearing problems (its recogniser failed; the memory of several local speech models). WP-11. */
+  readonly hearingProblems?: (assistantId: string) => ReadonlyArray<string>
+  /**
+   * The save-time memory warning (docs/ASSISTANTS.md §9): a change that loads local speech models needing more than
+   * 75 % of the free memory asks for "Save anyway". `place`: `device:<id>` or `type:<kind>` with its new settings.
+   */
+  readonly speechMemoryWarning?: (change: {
+    readonly place?: { readonly place: string; readonly settings: DeviceSettings }
+    readonly assistant?: Assistant
+  }) => string | undefined
 }
 
 export interface Assistants {
@@ -178,6 +189,7 @@ export const makeAssistants = (options: AssistantsOptions): Assistants => {
         ...usedOn.filter((u) => u.reach === "unreachable").map((u) => `Cannot be reached on ${nameOf(u.target)}: no wake phrase and not the one that answers without a phrase.`)
       ]
       const resource = used ? engineResource : "unused"
+      problems.push(...(options.hearingProblems?.(assistant.id) ?? []))
       return { ...assistant, usedOn: [...usedOn], resources: { llm: resource, voice: resource }, problems }
     })
   }
@@ -198,6 +210,17 @@ export const makeAssistants = (options: AssistantsOptions): Assistants => {
     const fresh = checked.warnings.filter((w) => !old.has(w.path))
     if (fresh.length === 0) return undefined
     return fail("invalid_settings", `${fresh[0]!.message} Save anyway to keep it.`, { warnings: fieldErrorsOf(fresh) })
+  }
+
+  /** The memory warning as a refusal that `saveAnyway` overrides. */
+  const memoryRefusal = (
+    change: Parameters<NonNullable<AssistantsOptions["speechMemoryWarning"]>>[0],
+    saveAnyway: boolean,
+    key: string
+  ): AssistantResult | undefined => {
+    if (saveAnyway) return undefined
+    const warning = options.speechMemoryWarning?.(change)
+    return warning === undefined ? undefined : fail("invalid_settings", `${warning} Save anyway to keep it.`, { warnings: [{ key, message: warning }] })
   }
 
   const ownWith = (own: DeviceOwn, patch: DeviceSettingsPatch, keys: ReadonlyArray<DeviceSettingsKey>): DeviceOwn => {
@@ -248,7 +271,7 @@ export const makeAssistants = (options: AssistantsOptions): Assistants => {
         if (issues.length > 0) return Effect.succeed(refusal(issues))
         const before = typeSettingsFrom(file, target.type)
         const next = { ...before, ...Object.fromEntries(Object.entries(patch).filter(([, v]) => v !== undefined)) } as DeviceSettings
-        const refused = settingsRefusal(next, before, saveAnyway)
+        const refused = settingsRefusal(next, before, saveAnyway) ?? memoryRefusal({ place: { place: `type:${target.type}`, settings: next } }, saveAnyway, "assistants")
         if (refused !== undefined) return Effect.succeed(refused)
         const inherited = inheritorsRefusal(target.type, next)
         if (inherited !== undefined) return Effect.succeed(inherited)
@@ -265,7 +288,8 @@ export const makeAssistants = (options: AssistantsOptions): Assistants => {
       const kindDefaults = file.deviceTypes[record.kind]
       const effective = (o: DeviceOwn) =>
         effectiveDeviceSettings((type ?? deviceTypeOf(record.kind)!).builtIn, kindDefaults, type === undefined ? undefined : applicableOwn(type, o))
-      const refused = settingsRefusal(effective(own), effective(record.own), saveAnyway)
+      const refused = settingsRefusal(effective(own), effective(record.own), saveAnyway) ??
+        memoryRefusal({ place: { place: `device:${target.id}`, settings: effective(own) } }, saveAnyway, "assistants")
       if (refused !== undefined) return Effect.succeed(refused)
       return store.saveDevice(target.id, message.rev, { ...(message.name !== undefined ? { name: message.name } : {}), own }).pipe(
         Effect.map(savedAt),
@@ -364,6 +388,8 @@ export const makeAssistants = (options: AssistantsOptions): Assistants => {
       if (!knownIds().has(message.assistant.id)) return Effect.succeed(fail("unknown_assistant", `There is no assistant ${message.assistant.id}.`))
       const issues = assistantIssues(message.assistant)
       if (issues.length > 0) return Effect.succeed(refusal(issues))
+      const memory = memoryRefusal({ assistant: message.assistant }, message.saveAnyway === true, "hearing.model")
+      if (memory !== undefined) return Effect.succeed(memory)
       return store.saveAssistantRecord(message.assistant).pipe(
         Effect.as(OK),
         Effect.catch((e) => Effect.succeed(entityFailure(e)))

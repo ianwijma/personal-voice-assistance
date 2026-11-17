@@ -205,7 +205,7 @@ export const makeSessionConversation = (options: SessionConversationOptions): Ef
 
         const speech: Stream.Stream<ConversationInput, unknown> = options.speech !== undefined
           ? options.speech(built)
-          : options.input !== undefined && options.gate !== undefined
+          : options.input !== undefined && options.gate !== undefined && providers.stt !== undefined
           ? options.gate(providers.stt.transcribe(options.input.stream))
           : Stream.never
         const events = Stream.merge(

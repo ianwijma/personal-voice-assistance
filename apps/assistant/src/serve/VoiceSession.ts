@@ -11,6 +11,7 @@ import {
   type RouteConfig,
   type RouteGate,
   type RouteResult,
+  type Stt,
   type SttEvent,
   type Trace,
   type TurnSetup,
@@ -30,7 +31,7 @@ import {
   typedTextTarget,
   WAKE_ARMED_MS
 } from "@pva/protocol"
-import { Effect, Queue, type Scope, Stream } from "effect"
+import { Cause, Deferred, Effect, Exit, Fiber, Queue, type Scope, Stream } from "effect"
 import type { Engine, SessionLoop } from "./Engine.ts"
 import { type HeardAudio, makeHeardAudio } from "./HeardAudio.ts"
 import { makeOutputLease } from "./OutputLease.ts"
@@ -47,14 +48,17 @@ import { makeStateTracker, type StateTracker } from "./StateTracker.ts"
  * the without-phrase mode and the interrupt mode, read live (`syncProfile`); each assistant's prompt, modules,
  * follow-up, quiet spell and "reply early" are read from it at use.
  *
- * The audio path: the recogniser stream runs once per session per engine build (a `SessionLoop` of its own),
- * then the echo gate, the route gate and the session dispatcher, which feeds each assistant's conversation through
- * an inbox (`SessionConversation`'s `speech` seam). All conversations play through one output lease, so two replies
+ * The audio path: the recogniser stream runs once per session per engine build (a `SessionLoop` of its own) on the
+ * recogniser the device hears with (`hearing`: the resource pool's for its hearer, docs/ASSISTANTS.md §2.6, WP-11;
+ * none while the device has no assistant), then the echo gate, the route gate and the session dispatcher, which
+ * feeds each assistant's conversation through an inbox (`SessionConversation`'s `speech` seam). When the hearing
+ * changes (another hearer, model or stream options), the pool binds the new recogniser once it is built, and the
+ * stream is replaced at the next moment no utterance is open, waiting at most `HEARER_SWITCH_WAIT_MS` (§3.5). All conversations play through one output lease, so two replies
  * never sound at once. Who owns the audio (which tab of the device) is the hub's business: it calls
  * `web.setOwner` / `setMicLive` and `ownerChanged`.
  *
  * WP-9, WP-10: each assistant's language model and voice are the resource pool's instances for its settings (read at
- * each turn start); the recogniser is still the one shared build (the engine's), until WP-11.
+ * each turn start).
  */
 
 export interface AssistantSetup {
@@ -63,6 +67,28 @@ export interface AssistantSetup {
   /** A `claude-subscription` assistant's agent setup (chosen at each run start; see `SessionConversation`). */
   readonly agentSetup?: () => Effect.Effect<AgentTurnSetup> | undefined
 }
+
+/**
+ * What this device hears with now (docs/ASSISTANTS.md §2.6 "The device's recogniser", §3.5): `none` (no assistant
+ * on the device: no recogniser runs), `waiting` (the pool has not bound one yet), or the recogniser with its hearer's
+ * stream options. `id` changes with a new instance and with changed stream options: the session's stream is then
+ * replaced at the next silence.
+ */
+export type Hearing =
+  | { readonly kind: "none" }
+  | { readonly kind: "waiting" }
+  | {
+    readonly kind: "ready"
+    readonly id: string
+    readonly stt: Stt["Service"]
+    /** The resource's key, for the log. */
+    readonly key: string
+    /** The instance failed (its streams fail with this problem until it is built again). */
+    readonly problem?: string
+  }
+
+/** Longest wait for silence before a hearer switch closes an utterance that is still open (§3.5). */
+export const HEARER_SWITCH_WAIT_MS = 5_000
 
 export interface VoiceSessionOptions {
   /** The session's key: the device id, or the client id of a voice connection without a device. */
@@ -73,6 +99,13 @@ export interface VoiceSessionOptions {
   readonly engine: Engine
   /** The device's effective settings now (docs/ASSISTANTS.md §2.6). */
   readonly deviceSettings: () => DeviceSettings
+  /**
+   * The recogniser this device hears with now (the resource pool's for its hearer, WP-11). Read when the recogniser
+   * loop starts and again after every `hearingChanged`. Absent: the engine build's `stt` (tests).
+   */
+  readonly hearing?: () => Hearing
+  /** Longest wait for silence before a hearer switch (tests shorten it). Default `HEARER_SWITCH_WAIT_MS`. */
+  readonly hearerSwitchWaitMs?: number
   /** The assistants in effect now, by id. */
   readonly assistants: () => ReadonlyMap<string, Assistant>
   /** Per assistant: its turn setup (prompt, module instructions, its tools), and the agent setup (claude-subscription). */
@@ -158,6 +191,13 @@ export interface VoiceSession {
   readonly heard: HeardAudio
   /** The device's settings or assistants may have changed: apply the interrupt mode and the route config (only when changed). */
   readonly syncProfile: () => void
+  /**
+   * What the device hears with may have changed (a save, a pool binding, a recogniser that failed or was rebuilt):
+   * read `hearing` again; a different recogniser or stream options replace the stream at the next silence (§3.5).
+   */
+  readonly hearingChanged: () => void
+  /** The key of the recogniser this session's stream runs on now (`undefined`: none runs). Tests, diagnostics. */
+  readonly hearingKey: () => string | undefined
   /** Ownership on this device changed (the hub's view): the state follows it. */
   readonly ownerChanged: (present: boolean, micLive: boolean) => void
   readonly ownerPresent: () => boolean
@@ -542,20 +582,111 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
         return Effect.forEach(results, dispatcher.dispatch, { discard: true })
       })
 
+    // ---- Which recogniser the device hears with (docs/ASSISTANTS.md §3.5)
+
+    /** An utterance is open in the recogniser's events (`SpeechStarted` … its `EndOfTurn`): no switch now. */
+    let utteranceOpen = false
+    /** Completed (and replaced) whenever `hearingChanged` is called. */
+    let changed = Deferred.makeUnsafe<void>()
+    const hearingChanged = () => {
+      const was = changed
+      changed = Deferred.makeUnsafe<void>()
+      Deferred.doneUnsafe(was, Effect.void)
+    }
+    let streamKey: string | undefined
+    const switchWaitMs = options.hearerSwitchWaitMs ?? HEARER_SWITCH_WAIT_MS
+    /** The id of a recogniser whose stream failed: not tried again until the hearing changes. */
+    let failedId: string | undefined
+
+    /** Closes an utterance the previous stream left open (it starts nothing). */
+    const closeOpenUtterance = Effect.suspend(() => {
+      if (!utteranceOpen) return Effect.void
+      utteranceOpen = false
+      heard.discard()
+      return dispatcher.dispatch(route.filter({ _tag: "EndOfTurn", text: "" }, now()))
+    })
+
+    const sameHearing = (a: Hearing, b: Hearing) => a.kind === b.kind && (a.kind !== "ready" || (b.kind === "ready" && a.id === b.id))
+
+    /**
+     * Runs one stream on `hearing` until another hearing is wanted and no utterance is open (at most
+     * `switchWaitMs`), or until it fails. A failed stream is reported once to the device (it hears nothing until the
+     * recogniser is built again: a vault unlock or the owner's reload); typed text still works.
+     */
+    const runStream = (hearing: Extract<Hearing, { kind: "ready" }>, hearingNow: () => Hearing): Effect.Effect<void> =>
+      Effect.gen(function*() {
+        streamKey = hearing.key
+        const fiber = yield* Effect.forkChild(Effect.exit(Stream.runForEach(hearing.stt.transcribe(input), (event) =>
+          Effect.suspend(() => {
+            if (event._tag === "SpeechStarted") utteranceOpen = true
+            else if (event._tag === "EndOfTurn") utteranceOpen = false
+            return onStt(event)
+          }))))
+        while (true) {
+          const signal = changed
+          const ended = yield* Effect.raceFirst(
+            Effect.map(Fiber.join(fiber), (exit) => ({ ended: exit })),
+            Effect.as(Deferred.await(signal), { ended: undefined })
+          )
+          if (ended.ended !== undefined) {
+            streamKey = undefined
+            const exit = ended.ended
+            if (Exit.isFailure(exit) && !Cause.hasInterruptsOnly(exit.cause)) {
+              const squashed = Cause.squash(exit.cause)
+              const message = squashed instanceof Error ? squashed.message : String(squashed)
+              failedId = hearing.id
+              options.log(`${options.name()}: speech recognition stopped (${hearing.key}): ${message}`)
+              options.send({ type: "error", error: { code: "engine_failed", message: `Speech recognition stopped: ${message}` } })
+            }
+            yield* closeOpenUtterance
+            return
+          }
+          const next = hearingNow()
+          // A recogniser still being bound (`waiting`) keeps the current one: the device goes on hearing.
+          if (next.kind === "waiting" || sameHearing(next, hearing)) continue
+          // §3.5: the new recogniser is ready (the pool binds it only then); switch at the next silence, waiting at
+          // most `switchWaitMs` for an open utterance to end.
+          const deadline = now() + switchWaitMs
+          while (utteranceOpen && now() < deadline) yield* Effect.sleep(20)
+          yield* Fiber.interrupt(fiber)
+          streamKey = undefined
+          yield* closeOpenUtterance
+          return
+        }
+      })
+
     let recogniserRuns = 0
     const recogniser: SessionLoop = {
       run: (built) =>
         Effect.gen(function*() {
           if (recogniserRuns++ > 0) {
             // A new build: an utterance the previous recogniser stream left open is closed (it starts nothing).
+            utteranceOpen = false
             yield* dispatcher.dispatch(route.filter({ _tag: "EndOfTurn", text: "" }, now()))
           }
-          yield* Stream.runForEach(built.providers.stt.transcribe(input), onStt)
-        })
+          failedId = undefined
+          const builtStt = built.providers.stt
+          const hearingNow = (): Hearing =>
+            options.hearing?.() ?? (builtStt === undefined ? { kind: "none" } : { kind: "ready", id: "build", stt: builtStt, key: "build" })
+          while (true) {
+            const signal = changed
+            const hearing = hearingNow()
+            if (hearing.kind === "ready" && hearing.id !== failedId) {
+              failedId = undefined
+              yield* runStream(hearing, hearingNow)
+              continue
+            }
+            // No recogniser (no assistant on the device, not bound yet, or failed): wait for a change.
+            yield* Deferred.await(signal)
+          }
+        }).pipe(Effect.ensuring(Effect.sync(() => {
+          streamKey = undefined
+        })))
     }
     let detach: Effect.Effect<void> | undefined
 
     const syncProfile = () => {
+      hearingChanged()
       const settings = options.deviceSettings()
       gate.setMode(settings.interruptMode)
       const next = routeConfigNow()
@@ -637,6 +768,8 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
       conversation: conversations,
       heard,
       syncProfile,
+      hearingChanged,
+      hearingKey: () => streamKey,
       ownerChanged: (present, micLive) => {
         owner = { present, micLive }
         if (present) touch()

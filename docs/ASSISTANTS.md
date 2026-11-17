@@ -1134,3 +1134,148 @@ Deviations from §5:
   categories. The module switches stay on the Modules page (the server still reads them until WP-12b).
 - **Not built**: Add as phrase on the tester's ignored lines (a heard phrase belongs to an assistant: pick on the device
   page), the memory warning on the hearing notice (needs WP-11 data), per-module "own values" markers on Modules.
+
+### WP-11 per-device recogniser: built 2026-11-16
+
+`serve/Resources.ts` now also holds the recognisers; `Engine.ts` holds no provider any more: it is the full reload
+(the owner's Reload button) and the status. Every device hears with its hearer's model and hearing settings.
+
+- **Keys.** `SttKey` = `sttKeyOf(sttSpecOf(hearing, shared))`: stt-sherpa `sherpa|<preset>|<language>|<model dir>|<threads>`,
+  the language only for a preset that takes one (Whisper, Nemotron; `-` for Parakeet, Zipformer, the hybrid), the
+  model directory and threads from the shared `STT_SHERPA_MODEL_DIR` / `STT_SHERPA_THREADS`; Deepgram
+  `deepgram|<DEEPGRAM_MODEL>|<address>`, the instance's identity adding a stamp of `DEEPGRAM_API_KEY` (as WP-9/10).
+  **Per stream** (not in the key, `SttStreamSpec`): `eagerSilenceMs`, `finalSilenceMs`, `minSpeechMs`,
+  `vadThreshold`, `agc`, `agcMaxGainDb` (stt-sherpa) and `eotThreshold`, `eagerEotThreshold`, `eotTimeoutMs`
+  (Deepgram). Two hearers that differ only there share one instance.
+- **Places, not assistants.** Recognisers are bound per hearing *place*: `device:<id>` for every known device, and
+  `type:<kind>` for each device type's defaults (also used by a session whose device is not recorded). Each place
+  wants its hearer's hearing (`hearerOf`: the `withoutPhrase` assistant, else the first assignment; switched on or
+  not, §2.6); a place with no assistant wants nothing, and its session runs **no recogniser** (the voice page's
+  `device.setup` lists no assistant). The status lists each recogniser once (`kind: "stt"`), `usedBy` = the hearers,
+  with `ramMb` from WP-0's table for a local model.
+- **stt-sherpa.** A process-wide registry of workers by `workerKey` (model, model directory, threads, the language when
+  the preset takes one, per-model tuning, and in tests the stand-in script): `make(options)` and the new
+  `acquire(options)` → `Recogniser { forStream(streamOptions) }` reuse the loaded worker of the key, counted, stopped
+  with the last user. The worker's `open` message carries the session's `{ vadThreshold, agc, prerollMs }`; the worker
+  keeps idle VADs per threshold and AGCs per option set, so a second session with the same options costs nothing,
+  and the startup VAD still serves the first session with the default threshold. Turn timing stays on the main
+  thread (one `TurnDetector` per stream). A worker that dies is dropped from the registry (the next caller loads a
+  new one) and tells its users (`onFailure`). **Orphan rule per key**: a worker that did not answer `close` within
+  15 s is left behind under its key; no new worker of that key loads beside it (`check`, `acquire` refuse; the pool's
+  builder waits for it to go, the resource staying `starting` and the device on its old recogniser), while other
+  models still load. `orphans(key?)`, `whenNoOrphans(key?)`, `workers()` are the diagnostics.
+- **Deepgram.** One instance per configuration (`SttKey` plus the key stamp); each stream is its own Flux connection,
+  as before, with that hearer's confidences (`DeepgramStt.make` per stream: cheap, nothing is opened until
+  `transcribe`). A missing key is the resource's problem (the locked-vault wording when the vault is locked).
+- **Hearer switching (§3.5).** A settings save, a `device.pick`, a vault change and the reload reconcile the pool. A
+  place whose spec changes keeps its old binding while a new key builds (the device goes on hearing with the old
+  model); once the new instance is ready the place is rebound (changed stream options rebind at once, no load), and
+  the pool's `onRebind` tells every session. The session's recogniser loop reads its `hearing()`: when the bound
+  instance or the stream options differ from the stream it runs, it waits until no utterance is open
+  (`SpeechStarted` … `EndOfTurn` of the recogniser's own events), at most `HEARER_SWITCH_WAIT_MS` = 5 s, then closes
+  the old `transcribe` and opens the new one on the same `WebAudioInput`; an utterance still open after 5 s is closed
+  with an empty `EndOfTurn` (it starts nothing). The released instance goes 10 s after its last user (the grace
+  period), unless it is wanted again within it.
+- **Failure.** A recogniser that fails to load (model files missing, no key) or whose worker dies is a `failed`
+  resource with its problem; its places' streams fail with it. That device hears nothing and its tabs get one
+  `error` (`engine_failed`, "Speech recognition stopped: …") per engine build; typed text is still answered; every
+  other device hears. The hearer's `AssistantInfo.problems` gains `Hearing (<label>): <problem>`. A vault unlock and
+  the owner's reload build failed recognisers again. A recogniser stream that fails no longer stops the engines.
+- **Memory (WP-0 data).** `ResourceInfo.ramMb` for each local recogniser. While more than one local model is loaded,
+  each hearer on one gets the line `Hears with <model> (about N MB of memory); K local speech models are loaded
+  together, about T MB.` in its `problems`. §9's warning at save: an `assistant.save` or `device.save` whose new
+  local models (keys not loaded now) need more than 75 % of the free memory (`os.freemem`) is refused
+  `invalid_settings` with a warning ("This loads another speech model: about N MB more memory and M s to load, more
+  than 75 % of the F MB free on this machine.") until `saveAnyway`. The Hearing tab's "about N MB more, M s to load"
+  sentence (§3.2) is the UI's (WP-6a/7), from `ramMb`/the presets.
+- **Engine.** `defaultProviderBuilder` builds nothing but the tool-rounds fallback; `EngineProviders.stt` is optional
+  (tests that inject one recogniser: the pool then hands every place a stream of it). The reload's preflight is now
+  serve mode's: the model files of every local recogniser in use exist (`ServeOptions.checkModelsBeforeReload`,
+  default with the real builders), else the running engines are kept. `defaultPreflight` is gone. The status's `stt`
+  rows come from the pool's recognisers in use (the Models page's "in use").
+- **Deviations.** (1) Bound per place, not per assistant (the hearer rule is per device). (2) The language is in the
+  key only for a preset that takes one (the doc's key always had it), so two hearers on Parakeet with different
+  languages share a worker. (3) Deepgram's key adds the address. (4) `STT_SHERPA_MODEL_DIR` and `STT_SHERPA_THREADS`
+  are part of the key, so a change to them builds the new recogniser and switches at silence without a full reload
+  (§3.2 kept a full reload for them; the Reload button still rebuilds everything). (5) The full reload's rebuild of a
+  working local recogniser reuses its loaded worker (the registry) instead of loading a second copy of the model; a
+  dead one is loaded again. (6) Every type defaults place and every known device is wanted (as §3.2 says), so the
+  browser defaults' hearer is loaded at start before any device connects, and a known device that is offline keeps
+  its own hearer's model loaded. (7) Speech shorter than `minSpeechMs` at the switch moment (no `SpeechStarted` yet)
+  can be cut. (8) Serve mode reads only the shared speech settings (`STT_SHERPA_MODEL_DIR`, `STT_SHERPA_THREADS`,
+  `DEEPGRAM_MODEL`, `DEEPGRAM_URL`, `DEEPGRAM_API_KEY`); the flat per-assistant keys are no longer read by any engine
+  (the store still mirrors a saved flat key into the migrated assistant, WP-3), and the old Speech pages still mark
+  their fields "reload". (9) The CLI modes (`voice`, `transcribe`, `bench --live`) still use the flat keys.
+- **Tests.** `packages/stt-sherpa/test/recognizerCore.test.ts` (per-session VAD threshold, AGC options and pre-roll,
+  reuse per option set), `SherpaSttFake.test.ts` (two hearers on one model with different end pauses share one worker
+  and each gets its own end of turn; two models, two workers, stopped with their last user; the key; a dead worker
+  is not reused; the orphan rule per key: refused for its key, another key loads beside it, gone → loads again),
+  `apps/assistant/test/resourcesRecognisers.test.ts` (sharing and own stream options, two models, a change built
+  first while the place keeps the old one and the old one released after the grace, stream options rebind with no
+  load, re-want within the grace, a failed load is that resource's problem and a retry builds it, a worker that dies
+  marks it failed and a retry builds a new one, keys; the default builder on the stand-in worker: one worker for two
+  places, each its own end of turn, a second model a second worker, both stopped), `serveRecognisers.test.ts`
+  (scripted client: devices with different hearers on their own model, hearers on one model sharing one instance with
+  their own end pause, the old instance released, no reload; a hearer switch loads first and waits for silence, the
+  open utterance reaching its conversation whole; an utterance that does not end is closed after the wait; a device
+  with no assistants runs no recogniser until one is assigned; a model that fails: the device is told, typed text
+  works, the other device hears, the failed resource and Bravo's problem, back on a working model; the save-time
+  memory warning and `saveAnyway`), `providers.test.ts` (the new bench flags), `serve.test.ts` (the reload preflight
+  through `checkModelsBeforeReload`).
+- **Bench.** `bench --live --stt-models A,B,…` gives session `i` the `i`-th local model (round robin) through
+  `SherpaStt.make` (equal models share a worker, as in the pool); `--load-model X` loads one more model and keeps it
+  idle. `src/bench/baseline.ts together A,B,… [--runs N]` loads the listed recognisers one after the other into one
+  fresh process, each with its own end pause, and prints the RSS added after each and the workers loaded.
+- **Measurements** (2026-11-16, the WP-0 machine: AMD Ryzen 9 7945HX, 16 logical processors, 30.3 GiB, Linux
+  7.0.0-43, Node 22.22.1, sherpa-onnx-node 2.0.1; other work ran on the machine, load average 0.8–3.5 during the
+  latency runs and 2.1–2.9 during the memory runs).
+  - **Method, latency.** `bench --live --rounds 2 bench-audio` (the five WP-0 clips, 10 turns per session), the stand-in
+    LLM (first token 250 ms, 60 tokens/s), the Piper voice `en_US-lessac-medium`; every run a fresh process; four
+    configurations alternated in each of 3 rounds to cancel drift (c1, c2, c3, c4, c1, …): **c1** one session on
+    `parakeet-v2` (`--stt-models parakeet-v2`, one model loaded); **c2** the same plus `--load-model parakeet-ultra`
+    (two models loaded, one talking); **c3** `--sessions 2 --stt-models parakeet-v2` (two talking sessions on one
+    worker); **c4** `--sessions 2 --stt-models parakeet-v2,parakeet-ultra` (two talking sessions, one worker each;
+    Ultra is the same size and decoder as v2, so the two workers do equal work). Sessions' user audio ends at the
+    same moment. Figures: median of the 10 turns of a run, ms from the end of the user's audio to `EagerEndOfTurn`
+    (eager) and to the turn's `endOfTurn` mark (eot), and to `playbackStart` (play) for context; three runs each, and
+    the median of the three. Every turn was recognised correctly in every run.
+
+    | Configuration | eager (3 runs) → median | eot (3 runs) → median | play (3 runs) → median |
+    |---|---|---|---|
+    | c1 one model, one session | 404 / 396 / 418 → **404** | 661 / 650 / 661 → **661** | 718 / 720 / 724 → 720 |
+    | c2 two models loaded, one session | 402 / 416 / 400 → **402** | 650 / 660 / 650 → **650** | 718 / 718 / 696 → 718 |
+    | c3 two sessions, same model: session 1 | 434 / 500 / 434 → **434** | 660 / 660 / 650 → **660** | 758 / 836 / 758 → 758 |
+    | c3 two sessions, same model: session 2 | 424 / 419 / 448 → **424** | 660 / 660 / 660 → **660** | 782 / 738 / 781 → 781 |
+    | c4 two sessions, two models: session 1 (v2) | 449 / 450 / 461 → **450** | 660 / 661 / 660 → **660** | 764 / 766 / 774 → 766 |
+    | c4 two sessions, two models: session 2 (Ultra) | 449 / 424 / 436 → **436** | 660 / 640 / 641 → **641** | 762 / 727 / 746 → 746 |
+
+    Reading: a second model loaded but idle changes nothing measurable (c2 vs c1: within 2–11 ms, inside the run
+    spread). Two talking sessions delay the eager point by 20–45 ms over one session whether they share a worker (c3)
+    or have one each (c4); the end of turn does not move (640–661 ms in every configuration, the 600 ms final
+    silence plus detection). On this 16-thread machine, separate workers did not remove the queueing seen on one
+    shared worker (c4's eager is not better than c3's); the decodes of two workers compete for the CPU instead of
+    waiting in one queue. The numbers match WP-0's (one session eager 397–427, eot 651–680; two sessions eager
+    404–479). Only one pair of sessions and ~1 s clips were measured.
+  - **Method, memory.** `node --import tsx src/bench/baseline.ts together <presets> --runs 5`: in one fresh process,
+    the listed recognisers loaded one after the other through `SherpaStt.make`, each with its own end pause (so as
+    two hearers of the pool); added MB = RSS after minus before (`/proc/self/statm`), five runs, min / median; no
+    turn decoded.
+
+    | Loaded | workers | added MB min / median | WP-0 (sum of single loads, median) |
+    |---|---|---|---|
+    | `parakeet-v2` | 1 | 1028 / 1053 | 1050 |
+    | `parakeet-v2` twice (two hearers, different end pauses) | 1 | 1023 / 1037 (the second adds 0 MB, load 0 ms) | – |
+    | `parakeet-v2` + `parakeet-ultra` | 2 | 1964 / 1991 | 1050 + 1067 = 2117 |
+    | `parakeet-v2` + `nemotron-560` | 2 | 1955 / 1964 | 1050 + 948 = 1998 |
+
+    A second hearer on a loaded model costs nothing; a second model costs about its WP-0 figure less 35–125 MB (the
+    native runtime both workers share is counted once). Load time of the second model: Ultra 1.59 s, Nemotron 1.27 s
+    (medians), about their WP-0 `loadMs`.
+  - **Not measured.** Deepgram (no key on this machine); more than two sessions or models; resident memory after
+    long turns (a recogniser grows with the longest turn it decodes, WP-0); the hearer switch's own cost in a live
+    serve run (a switch is a stream close and open on a loaded worker; its correctness is tested, its time is not
+    traced); the web pages (the Hearing tab's memory sentence is WP-6a/7's).
+- **Not verified.** A hearer switch through the real admin UI (WP-6a/7 do not save hearing yet); exercised through the
+  settings store and the WebSocket messages in tests. `serveLocal.test.ts` (real zipformer-en, now run in this
+  worktree because the local models are present) failed once in about eight runs with "HOLLO CAN YOU HEAR ME"
+  (a recognition variance; one stream was opened per run, no switch happened).

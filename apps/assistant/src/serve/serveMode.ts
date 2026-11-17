@@ -10,6 +10,7 @@ import {
   type ModuleHost,
   type ModuleSnapshot,
   parseVoiceKey,
+  SttError,
   Tts,
   TtsError,
   type TurnSetup,
@@ -27,6 +28,7 @@ import {
   deviceTypeOf,
   effectiveDeviceSettings,
   type EngineInfo,
+  hearerOf,
   engineSummary,
   type VoiceInfo,
   type ServerMessage,
@@ -35,6 +37,7 @@ import {
 } from "@pva/protocol"
 import { Cause, Config, ConfigProvider, Effect, Exit, Fiber, FiberSet, Option, type Scope, Stream } from "effect"
 import { createHash } from "node:crypto"
+import { freemem } from "node:os"
 import { isAbsolute, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 import { defaultSystemPrompt } from "../config.ts"
@@ -46,7 +49,6 @@ import { makeAccessPolicy } from "./access.ts"
 import { adminPasswordProblem, makeAdminSessions } from "./AdminSessions.ts"
 import { acquireDataDirLock, type DataDirLockError } from "./DataDirLock.ts"
 import {
-  defaultPreflight,
   defaultProviderBuilder,
   type Engine,
   EngineBuildProblems,
@@ -55,6 +57,7 @@ import {
 } from "./Engine.ts"
 import {
   defaultLlmBuilder,
+  defaultSttBuilder,
   defaultTtsBuilder,
   type LlmAccounts,
   type LlmBuilder,
@@ -63,6 +66,14 @@ import {
   makeResourcePool,
   type ReconcileOptions,
   type ResourcePool,
+  sherpaOptionsOf,
+  type SttBuilder,
+  type SttShared,
+  type SttSpec,
+  sttKeyOf,
+  sttLoadMsOf,
+  sttRamMbOf,
+  sttSpecOf,
   type TtsAccounts,
   type TtsBuilder,
   type TtsSpec,
@@ -85,7 +96,7 @@ import { makeApi } from "./api.ts"
 import { makeAssistantVoice } from "./AssistantVoice.ts"
 import { type Favourites, makeFavourites } from "./Favourites.ts"
 import { makeVoiceCatalog, type VoiceCatalog, type VoiceCatalogOptions } from "./VoiceCatalog.ts"
-import { makeVoiceSession } from "./VoiceSession.ts"
+import { type Hearing, makeVoiceSession, type VoiceSession } from "./VoiceSession.ts"
 import { makeVoiceSessions, type VoiceSessions } from "./VoiceSessions.ts"
 import { type KdfParams, openVault, type Vault, VaultPathConfig } from "./Vault.ts"
 import * as SherpaStt from "@pva/stt-sherpa"
@@ -140,8 +151,23 @@ export interface ServeOptions {
   readonly catalog?: ReadonlyArray<ModuleDefinition<any>>
   /** Engine providers (tests inject fakes). Default: the providers chosen by the settings. */
   readonly build?: ProviderBuilder
-  /** Checks before a reload stops the running engines. Default: `defaultPreflight` with the default builder, none otherwise. */
+  /** Checks before a reload stops the running engines. Default: `checkModelsBeforeReload`'s check, or none. */
   readonly preflight?: Effect.Effect<void, EngineBuildProblems>
+  /**
+   * Before a reload: check that the model files of every local recogniser in use exist (a reload whose recogniser
+   * would fail keeps the running engines). Default: with the default builder only.
+   */
+  readonly checkModelsBeforeReload?: boolean
+  /**
+   * Builds the resource pool's recognisers (docs/ASSISTANTS.md §3.2, WP-11; tests inject fakes). Default: stt-sherpa
+   * and Deepgram (`defaultSttBuilder`); with an injected `build` and no `buildStt`, instances that hear with that
+   * build's `stt`.
+   */
+  readonly buildStt?: SttBuilder
+  /** Tests: the longest wait for silence before a hearer switch (default 5 s, §3.5). */
+  readonly hearerSwitchWaitMs?: number
+  /** Tests: the memory free on this machine (the save-time warning of docs/ASSISTANTS.md §9). Default `os.freemem`. */
+  readonly freeMemoryBytes?: () => number
   /**
    * Builds the resource pool's language-model instances (docs/ASSISTANTS.md §3.2; tests inject fakes). Default: the
    * accounts' adapters (`defaultLlmBuilder`); with an injected `build` and no `buildLlm`, instances that answer with
@@ -389,11 +415,72 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       }
       return { credentials }
     }
+    /** The shared settings of the recognisers (§2.4 "Speech recognition models"): a change makes new instances. */
+    const sttShared = (): SttShared => {
+      const threads = Number(settingNow("STT_SHERPA_THREADS") ?? "")
+      const key = settingNow("DEEPGRAM_API_KEY")
+      return {
+        modelDir: settingNow("STT_SHERPA_MODEL_DIR"),
+        threads: Number.isInteger(threads) && threads > 0 ? threads : undefined,
+        deepgram: {
+          model: settingNow("DEEPGRAM_MODEL"),
+          address: settingNow("DEEPGRAM_URL"),
+          credential: key === undefined ? "" : createHash("sha256").update(key).digest("hex").slice(0, 16)
+        }
+      }
+    }
+    /** Where a device's recogniser is bound in the pool: the device's own place, or its type's (no record yet). */
+    const placeOf = (deviceId: string | undefined): string =>
+      deviceId !== undefined && store.settings().devices[deviceId] !== undefined ? `device:${deviceId}` : `type:${WEB_VOICE_KIND}`
+    /**
+     * Every hearing place (§3.2 "Wanted", stt: the hearer of every type defaults entry and of every known device) with
+     * its effective settings. `override` replaces one place's settings (a save being checked); a type's new defaults
+     * also apply to the devices of that type that inherit them.
+     */
+    const placesNow = (override?: { readonly place: string; readonly settings: DeviceSettings }): Map<string, DeviceSettings> => {
+      const saved = store.settings()
+      const typeKind = override?.place.startsWith("type:") === true ? override.place.slice("type:".length) : undefined
+      const file = typeKind === undefined
+        ? saved
+        : { ...saved, deviceTypes: { ...saved.deviceTypes, [typeKind]: { ...override!.settings, rev: saved.deviceTypes[typeKind]?.rev ?? 0 } } }
+      const places = new Map<string, DeviceSettings>()
+      for (const kind of new Set([WEB_VOICE_KIND, ...Object.keys(file.deviceTypes)])) {
+        const type = deviceTypeOf(kind)
+        if (type === undefined) continue
+        places.set(`type:${kind}`, effectiveDeviceSettings(type.builtIn, file.deviceTypes[kind], undefined))
+      }
+      for (const id of Object.keys(file.devices)) places.set(`device:${id}`, deviceSettingsFrom(file, id))
+      if (override !== undefined) places.set(override.place, override.settings)
+      return places
+    }
+    /**
+     * The recogniser of every hearing place: its hearer's hearing (switched on or not, §2.6: switching an assistant
+     * off does not change how a device hears). A place with no assistant has none.
+     */
+    const recognisersOf = (
+      places: ReadonlyMap<string, DeviceSettings>,
+      assistants: ReadonlyMap<string, Assistant>
+    ): Map<string, { readonly spec: SttSpec; readonly hearer: string }> => {
+      const shared = sttShared()
+      const out = new Map<string, { readonly spec: SttSpec; readonly hearer: string }>()
+      for (const [place, settings] of places) {
+        const hearer = hearerOf(settings)
+        const assistant = hearer === null ? undefined : assistants.get(hearer)
+        if (assistant === undefined) continue
+        out.set(place, { spec: sttSpecOf(assistant.hearing, shared), hearer: assistant.id })
+      }
+      return out
+    }
     /**
      * What the pool must hold (§3.2 "Wanted"): the language model and the voice of every switched-on assistant that
-     * is on at least one effective list (a type defaults entry counts, and every known device's own list).
+     * is on at least one effective list (a type defaults entry counts, and every known device's own list), and the
+     * recogniser of every hearing place.
      */
-    const wantedResources = (): { readonly llms: Map<string, LlmSpec>; readonly voices: Map<string, TtsSpec> } => {
+    const wantedResources = (): {
+      readonly llms: Map<string, LlmSpec>
+      readonly voices: Map<string, TtsSpec>
+      readonly recognisers: Map<string, { readonly spec: SttSpec; readonly hearer: string }>
+    } => {
       const file = store.settings()
       const listed = new Set<string>()
       for (const kind of new Set([WEB_VOICE_KIND, ...Object.keys(file.deviceTypes)])) {
@@ -411,7 +498,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
         llms.set(assistant.id, llmSpecOf(assistant.llm, accounts))
         voices.set(assistant.id, ttsSpecOf(assistant.voice, voiceAccounts))
       }
-      return { llms, voices }
+      return { llms, voices, recognisers: recognisersOf(placesNow(), assistantsNow()) }
     }
     const explainProblem = (message: string): string => explainProblems([{ stage: "", message }])[0]!.message
     // Tests that inject the shared build answer with its `llm`, through the pool (one instance per configuration still).
@@ -435,11 +522,28 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
             return tts === undefined ? Stream.fail(new TtsError({ message: "The engines are not running." })) : tts.synthesize(clauses)
           })
       } satisfies Tts["Service"])
-    /** Late-bound: every conversation is told when an assistant's binding may have changed its kind. */
+    // Likewise for recognisers: every hearing place hears with the build's `stt`, each with its own stream.
+    const engineSttBuilder: SttBuilder = () =>
+      Effect.succeed({
+        forStream: () => ({
+          transcribe: (audio) =>
+            Stream.suspend(() => {
+              const stt = engine?.built()?.providers.stt
+              return stt === undefined ? Stream.fail(new SttError({ message: "The engines are not running." })) : stt.transcribe(audio)
+            })
+        })
+      })
+    /** Late-bound: every voice session is told when what it hears with may have changed. */
     let sessionsRef: VoiceSessions | undefined
+    /** The real providers (no injected build, or the real builder passed explicitly): the pool builds them all. */
+    const realBuild = options.build === undefined || options.build === defaultProviderBuilder
     const resources = yield* makeResourcePool({
-      buildTts: options.buildTts ?? (options.build === undefined ? defaultTtsBuilder(sections.configProvider) : engineTtsBuilder),
-      buildLlm: options.buildLlm ?? (options.build === undefined ? defaultLlmBuilder(sections.configProvider) : engineLlmBuilder),
+      buildStt: options.buildStt ?? (realBuild ? defaultSttBuilder(sections.configProvider) : engineSttBuilder),
+      onRebind: () => {
+        for (const session of sessionsRef?.all() ?? []) session.hearingChanged()
+      },
+      buildTts: options.buildTts ?? (realBuild ? defaultTtsBuilder(sections.configProvider) : engineTtsBuilder),
+      buildLlm: options.buildLlm ?? (realBuild ? defaultLlmBuilder(sections.configProvider) : engineLlmBuilder),
       ...(options.resourceGraceMs !== undefined ? { graceMs: options.resourceGraceMs } : {}),
       onChange: () => {
         engine?.refreshStatus()
@@ -452,7 +556,11 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       log: (line) => runFork(Effect.logInfo(line))
     })
     const syncResources = (reconcile: ReconcileOptions = {}): Effect.Effect<void> =>
-      Effect.suspend(() => (store.blocked() !== undefined ? Effect.void : (({ llms, voices }) => resources.reconcile(llms, { ...reconcile, voices }))(wantedResources())))
+      Effect.suspend(() =>
+        store.blocked() !== undefined
+          ? Effect.void
+          : (({ llms, recognisers, voices }) => resources.reconcile(llms, { ...reconcile, voices, recognisers }))(wantedResources())
+      )
     resourcesChanged = () => run(syncResources())
     /** A turn of an assistant the pool does not hold (not in use: off, or on no list) is answered with this. */
     const notInUse = Llm.of({
@@ -587,6 +695,89 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       const all = [...assistantsNow().values()]
       return (all.find((a) => a.on) ?? all[0])?.voice ?? DEFAULT_ASSISTANT_VOICE
     }
+    /** The recognisers in use as engine rows (the Models page marks their presets in use). */
+    const sttRows = (): Array<EngineInfo> =>
+      resources.status().flatMap((r) => {
+        if (r.kind !== "stt" || r.usedBy.length === 0 || r.state === "failed") return []
+        const [provider = "sherpa", detail = ""] = r.key.split("|")
+        return [{ stage: "stt", provider, detail, location: r.location }]
+      })
+    /**
+     * The reload's cheap check (docs/ASSISTANTS.md §3.2: a reload rebuilds every resource in use): the model files of
+     * every local recogniser in use exist, else the running engines are kept.
+     */
+    const hearingPreflight: Effect.Effect<void, EngineBuildProblems> = Effect.suspend(() => {
+      const problems: Array<{ stage: string; message: string }> = []
+      const seen = new Set<string>()
+      for (const { spec, hearer } of wantedResources().recognisers.values()) {
+        if (spec.engine !== "sherpa" || seen.has(spec.model + (spec.modelDir ?? ""))) continue
+        seen.add(spec.model + (spec.modelDir ?? ""))
+        const checked = Effect.runSyncExit(SherpaStt.check(sherpaOptionsOf(spec, spec.stream)))
+        if (Exit.isFailure(checked)) {
+          const failure = Cause.squash(checked.cause)
+          problems.push({ stage: `speech-to-text (hearing of ${assistantsNow().get(hearer)?.name ?? hearer})`, message: failure instanceof Error ? failure.message : String(failure) })
+        }
+      }
+      return problems.length === 0 ? Effect.void : Effect.fail(new EngineBuildProblems({ problems }))
+    })
+    /**
+     * What this device hears with (§2.6, §3.5): the pool's recogniser of its place, with its hearer's stream options.
+     * No assistant on the device: none. Not bound yet: the pool reconciles at once.
+     */
+    const hearingOf = (deviceId: string | undefined) => (): Hearing => {
+      const hearer = hearerOf(deviceSettingsOf(deviceId))
+      if (hearer === null || !assistantsNow().has(hearer)) return { kind: "none" }
+      const place = placeOf(deviceId)
+      let binding = resources.sttFor(place)
+      if (binding === undefined) {
+        runSync(Effect.asVoid(Effect.forkDetach(syncResources(), { startImmediately: true })))
+        binding = resources.sttFor(place)
+      }
+      if (binding === undefined) return { kind: "waiting" }
+      return { kind: "ready", id: binding.id, stt: binding.stt, key: binding.key, ...(binding.problem !== undefined ? { problem: binding.problem } : {}) }
+    }
+    /** What a session's recordings say they were heard with. */
+    const hearingModelOf = (deviceId: string | undefined) => (): string => {
+      const binding = resources.sttFor(placeOf(deviceId))
+      return binding === undefined ? "none" : `${binding.spec.engine} ${binding.spec.model}`
+    }
+    /**
+     * Per assistant, its hearing problems (`AssistantInfo.problems`): a recogniser that failed, and the memory of the
+     * local speech models when more than one is loaded (WP-0's measured `ramMb`; docs/ASSISTANTS.md §3.2).
+     */
+    const hearingProblems = (assistantId: string): Array<string> => {
+      const stt = resources.status().filter((r) => r.kind === "stt")
+      const mine = stt.filter((r) => r.usedBy.includes(assistantId))
+      const out = mine.flatMap((r) => (r.state === "failed" ? [`Hearing (${r.label}): ${r.problem ?? "the speech recogniser could not start."}`] : []))
+      const local = stt.filter((r) => r.location === "local" && r.state !== "failed" && r.usedBy.length > 0)
+      if (local.length > 1) {
+        const total = local.reduce((sum, r) => sum + (r.ramMb ?? 0), 0)
+        for (const r of mine.filter((m) => m.location === "local" && m.state !== "failed")) {
+          out.push(`Hears with ${r.label} (about ${r.ramMb ?? "?"} MB of memory); ${local.length} local speech models are loaded together, about ${total} MB.`)
+        }
+      }
+      return out
+    }
+    /**
+     * §9 "warn above 75 % of free memory at save": the local speech models a change would load besides the ones
+     * loaded now, when together they need more than 75 % of the memory free on this machine. `undefined`: no warning.
+     */
+    const speechMemoryWarning = (change: { readonly place?: { readonly place: string; readonly settings: DeviceSettings }; readonly assistant?: Assistant }): string | undefined => {
+      const assistants = new Map(assistantsNow())
+      if (change.assistant !== undefined) assistants.set(change.assistant.id, change.assistant)
+      const loaded = new Set(resources.status().filter((r) => r.kind === "stt" && r.state !== "failed").map((r) => r.key))
+      const added = new Map<string, SttSpec>()
+      for (const { spec } of recognisersOf(placesNow(change.place), assistants).values()) {
+        const key = sttKeyOf(spec)
+        if (spec.engine === "sherpa" && !loaded.has(key)) added.set(key, spec)
+      }
+      const mb = [...added.values()].reduce((sum, spec) => sum + (sttRamMbOf(spec) ?? 0), 0)
+      const freeMb = Math.round((options.freeMemoryBytes?.() ?? freemem()) / 1e6)
+      if (mb === 0 || mb <= 0.75 * freeMb) return undefined
+      const loadS = Math.max(...[...added.values()].map((spec) => sttLoadMsOf(spec) ?? 0)) / 1000
+      return `This loads ${added.size === 1 ? "another speech model" : `${added.size} more speech models`}: about ${mb} MB more memory and ${loadS.toFixed(1)} s to load, ` +
+        `more than 75 % of the ${freeMb} MB free on this machine.`
+    }
     /** While the vault is locked, a key that "is not set" is really locked away. */
     const explainProblems = (problems: ReadonlyArray<{ readonly stage: string; readonly message: string }>) => {
       if (keys.state() !== "locked") return problems
@@ -601,8 +792,8 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       build: options.build ?? defaultProviderBuilder,
       ...(options.preflight !== undefined
         ? { preflight: options.preflight }
-        : options.build === undefined
-        ? { preflight: defaultPreflight }
+        : options.checkModelsBeforeReload ?? options.build === undefined
+        ? { preflight: hearingPreflight }
         : {}),
       configProvider: sections.configProvider,
       onStatus: (status) => {
@@ -619,7 +810,12 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
         if (hub !== undefined) broadcast({ type: "models", models: modelsRef?.list() ?? [] })
       },
       // The language model is no longer the build's: its row comes from the assistants (and the pool's resources).
-      describeEngines: (engines) => [llmRow(), ...engines.filter((e) => e.stage !== "llm" && e.stage !== "tts"), ...(ttsRows().length > 0 ? ttsRows() : engines.filter((e) => e.stage === "tts"))],
+      describeEngines: (engines) => [
+        llmRow(),
+        ...(sttRows().length > 0 ? sttRows() : engines.filter((e) => e.stage === "stt")),
+        ...engines.filter((e) => e.stage !== "llm" && e.stage !== "tts" && e.stage !== "stt"),
+        ...(ttsRows().length > 0 ? ttsRows() : engines.filter((e) => e.stage === "tts"))
+      ],
       resources: { status: resources.status, rebuild: syncResources({ rebuild: true }), voices: voiceInfos },
       explainProblems,
       blocked: settingsProblem
@@ -667,10 +863,6 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
 
     // One voice session per device (docs/VOICE-SESSIONS.md §2), on the shared engines.
     const recordings = join(options.dataDir, "recordings")
-    const sttModel = () => {
-      const stt = theEngine.status().engines.find((e) => e.stage === "stt")
-      return stt === undefined ? "unknown" : `${stt.provider} ${stt.detail}`
-    }
     const sessions: VoiceSessions = makeVoiceSessions({
       make: (key, device, reserved) =>
         makeVoiceSession({
@@ -679,6 +871,8 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
           name: () => (device === undefined ? "Voice page without a device" : frontends.nameOf(device.id) ?? device.name),
           engine: theEngine,
           deviceSettings: () => deviceSettingsOf(device?.id),
+          hearing: hearingOf(device?.id),
+          ...(options.hearerSwitchWaitMs !== undefined ? { hearerSwitchWaitMs: options.hearerSwitchWaitMs } : {}),
           assistants: assistantsNow,
           conversationSetup,
           voiceOf: resources.ttsKeyFor,
@@ -700,7 +894,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
             dir: recordings,
             enabled: () => sections.value("RECORD_HEARD_AUDIO") === true,
             maxFiles: () => Number(sections.value("RECORD_HEARD_AUDIO_MAX_FILES") ?? 50),
-            model: sttModel,
+            model: hearingModelOf(device?.id),
             writable: () => lock.held(),
             begin: lock.begin,
             lostOnTheWay: () => hub?.micFramesLost(key) ?? 0,
@@ -727,6 +921,8 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       sessions,
       modules: () => host.modules(),
       engineState: () => theEngine.status().state,
+      hearingProblems,
+      speechMemoryWarning,
       // TypeSafe is set up when a decision provider runs (the routing section arrives with WP-14).
       canAuto: () => host.modules().some((m) => m.kind === "decider" && m.state === "running")
     })

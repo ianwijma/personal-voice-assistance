@@ -1,15 +1,22 @@
 export { type Agc, type AgcOptions, makeAgc } from "./agc.mjs"
 export {
+  acquire,
   check,
   checkConfig,
   isOrphanedMessage,
   layer,
   layerConfig,
   make,
+  makeWithWorker,
   optionsConfig,
   orphans,
+  type Recogniser,
+  type SherpaStreamOptions,
   type SherpaSttOptions,
-  whenNoOrphans
+  whenNoOrphans,
+  workerKey,
+  workers,
+  type WorkerScript
 } from "./SherpaStt.ts"
 export {
   type EndOfTurnPolicy,
