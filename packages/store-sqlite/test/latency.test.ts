@@ -2,26 +2,24 @@
 // make is one bounded index read; backups, exports, pruning and the checkpoint after an erase run beside turns
 // without a long stop. The numbers are printed (docs/STORING-DATA.md "Latency" quotes them).
 import { assert, describe, it } from "@effect/vitest"
-import { defineCollection, searchTokens } from "@pva/core"
+import { defineCollection } from "@pva/core"
 import { Effect, Schema } from "effect"
 import { mkdtempSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { DatabaseSync } from "node:sqlite"
-import { makeSqliteStore, scopeToken } from "../src/index.ts"
+import { makeSqliteStore } from "../src/index.ts"
 
 const ROWS = 100_000
 const Note = Schema.Struct({ state: Schema.String, due: Schema.Finite, text: Schema.String })
-const notes = defineCollection({ name: "notes", scope: "household", schema: Note, indexes: ["state", "due"], search: ["text"] })
+const notes = defineCollection({ name: "notes", scope: "household", schema: Note, indexes: ["state", "due"] })
 const MODULE = [{ id: "big", storage: { collections: [notes] } }]
 
 /** Fill the file directly (fast), in the store's own format. */
 const fill = (file: string) => {
   const db = new DatabaseSync(file)
-  const k = scopeToken("big", "notes", { kind: "household" })
-  const doc = db.prepare(`INSERT INTO pva_docs (module, collection, id, scope_kind, scope_id, rev, v, value, created_at, updated_at, updated_by, search_id)
-    VALUES ('big', 'notes', ?, 'household', '', ?, 1, ?, ?, ?, '{"kind":"system","name":"fill"}', ?)`)
-  const fts = db.prepare("INSERT INTO pva_search (rowid, k, t) VALUES (?, ?, ?)")
+  const doc = db.prepare(`INSERT INTO pva_docs (module, collection, id, scope_kind, scope_id, rev, v, value, created_at, updated_at, updated_by)
+    VALUES ('big', 'notes', ?, 'household', '', ?, 1, ?, ?, ?, '{"kind":"system","name":"fill"}')`)
   const change = db.prepare(`INSERT INTO pva_changes (op_id, module, collection, scope_kind, scope_id, row_id, op, actor, actor_key, at, data)
     VALUES (?, 'big', 'notes', 'household', '', ?, 'insert', '{"kind":"system","name":"fill"}', 'system:fill', ?, ?)`)
   const filler = "lorem ipsum dolor sit amet ".repeat(36)
@@ -30,8 +28,7 @@ const fill = (file: string) => {
     const text = `${i % 1000 === 0 ? "rarepasta " : ""}note ${i} milk ${filler}`
     const value = JSON.stringify({ state: i % 7 === 0 ? "running" : "done", due: i % 500, text })
     change.run(`op-${i}`, `n${i}`, 1, JSON.stringify({ v: 1, after: JSON.parse(value) }))
-    doc.run(`n${i}`, i, value, i, i, i)
-    fts.run(i, k, searchTokens(text).join(" "))
+    doc.run(`n${i}`, i, value, i, i)
   }
   db.exec("COMMIT")
   db.close()
@@ -73,10 +70,7 @@ describe("SQLite store latency on 100,000 rows of ~1 KB", () => {
         "list oldest 20": c.list({ orderBy: { field: "createdAt", direction: "asc" }, limit: 20 }),
         "list where state = running": c.list({ where: { state: "running" }, limit: 20 }),
         "list ordered by due": c.list({ orderBy: { field: "due" }, limit: 20 }),
-        "get by id": c.get("n54321"),
-        "search a common word": c.search("milk"),
-        "search a rare word": c.search("rarepasta"),
-        "search a short prefix": c.search("no")
+        "get by id": c.get("n54321")
       }
       const results: Array<string> = []
       let worstRead = 0

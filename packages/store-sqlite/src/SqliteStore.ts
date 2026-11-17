@@ -90,13 +90,11 @@ const CORE_DDL = [
     scope_kind TEXT NOT NULL, scope_id TEXT NOT NULL,
     rev INTEGER NOT NULL, v INTEGER NOT NULL, value TEXT NOT NULL,
     created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, updated_by TEXT NOT NULL,
-    search_id INTEGER,
     PRIMARY KEY (module, collection, id)
   ) WITHOUT ROWID`,
   `CREATE INDEX pva_docs_updated ON pva_docs (module, collection, scope_kind, scope_id, updated_at, id)`,
   `CREATE INDEX pva_docs_created ON pva_docs (module, collection, scope_kind, scope_id, created_at, id)`,
   `CREATE INDEX pva_docs_conversation ON pva_docs (scope_id) WHERE scope_kind = 'conversation'`,
-  `CREATE UNIQUE INDEX pva_docs_search ON pva_docs (search_id) WHERE search_id IS NOT NULL`,
   `CREATE TABLE pva_changes (
     seq INTEGER PRIMARY KEY AUTOINCREMENT,
     op_id TEXT NOT NULL UNIQUE,
@@ -111,11 +109,7 @@ const CORE_DDL = [
     WHERE undone = 0 AND undoes IS NULL AND op != 'erase' AND data IS NOT NULL`,
   `CREATE INDEX pva_changes_at ON pva_changes (at)`,
   `CREATE INDEX pva_changes_conversation ON pva_changes (scope_id) WHERE scope_kind = 'conversation'`,
-  `CREATE TABLE pva_indexes (name TEXT PRIMARY KEY, module TEXT NOT NULL, collection TEXT NOT NULL, field TEXT NOT NULL, ddl TEXT NOT NULL) WITHOUT ROWID`,
-  // Search: the words (`searchTokens`, made in JS, the same as the in-memory store) separated by spaces, which the
-  // `ascii` tokenizer splits back into exactly those words; `k` is a token naming the row's module, collection and scope.
-  `CREATE VIRTUAL TABLE pva_search USING fts5(k, t, tokenize = 'ascii', prefix = '2 3', detail = 'column')`,
-  `INSERT INTO pva_search (pva_search, rank) VALUES ('secure-delete', 1)`
+  `CREATE TABLE pva_indexes (name TEXT PRIMARY KEY, module TEXT NOT NULL, collection TEXT NOT NULL, field TEXT NOT NULL, ddl TEXT NOT NULL) WITHOUT ROWID`
 ]
 
 /**
@@ -161,8 +155,6 @@ export const indexName = (module: string, collection: string, field: string) => 
 const fieldExpr = (field: string) => `json_extract(value, '$.${field}')`
 const indexDdl = (name: string, module: string, collection: string, field: string) =>
   `CREATE INDEX ${name} ON pva_docs (module, collection, scope_kind, scope_id, ${fieldExpr(field)}, updated_at, id) WHERE module = ${lit(module)} AND collection = ${lit(collection)}`
-/** The search token of a module's collection in one scope. */
-export const scopeToken = (module: string, collection: string, scope: ScopeRef) => `k${sha(`${module}\u0000${collection}\u0000${scope.kind}\u0000${scopeIdOf(scope)}`, 40)}`
 
 /**
  * The SQL of one list read (`CheckedQuery`). Each shape names its index (`INDEXED BY`): a query that could not use it
@@ -209,7 +201,6 @@ interface DocRow {
   readonly created_at: number
   readonly updated_at: number
   readonly updated_by: string
-  readonly search_id: number | null
 }
 
 interface ChangeRow {
@@ -395,13 +386,11 @@ export const makeSqliteStore = (options: SqliteStoreOptions): Effect.Effect<Sqli
     }
     // Views and triggers may not call functions with side effects.
     yield* exec("PRAGMA trusted_schema = OFF")
-    const fts5 = yield* query<{ n: number }>("SELECT count(*) AS n FROM pragma_module_list WHERE name = 'fts5'").pipe(Effect.map((r) => Number(r[0]?.n ?? 0) > 0))
     const hasMeta = (yield* query<{ n: number }>("SELECT count(*) AS n FROM sqlite_schema WHERE type = 'table' AND name = 'pva_meta'"))[0]!.n > 0
     const metaOf = (key: string) => Effect.map(query<{ value: string }>("SELECT value FROM pva_meta WHERE key = ?", [key]), (r) => r[0]?.value)
     let created = false
     if (!hasMeta) {
       if (readOnly && !memory) return yield* new StoreError({ reason: "unavailable", message: `${options.filename} holds no household data yet` })
-      if (!fts5) return yield* new StoreError({ reason: "unavailable", message: "This Node's SQLite has no full-text search (FTS5), which the household store needs" })
       yield* driverTx(Effect.gen(function*() {
         for (const ddl of CORE_DDL) yield* exec(ddl)
         const at = yield* Clock.currentTimeMillis
@@ -414,29 +403,7 @@ export const makeSqliteStore = (options: SqliteStoreOptions): Effect.Effect<Sqli
       if (schema > CORE_SCHEMA_VERSION) {
         return yield* new StoreError({ reason: "unavailable", message: `${options.filename} was written by a newer version of the assistant (household schema ${schema}; this version knows ${CORE_SCHEMA_VERSION})` })
       }
-      if (!fts5) return yield* new StoreError({ reason: "unavailable", message: `${options.filename} uses full-text search (FTS5), which this Node's SQLite does not have` })
     }
-
-    // ---- Search entries
-
-    const searchIdOf = (module: string, collection: string, id: string) =>
-      Effect.map(query<{ search_id: number | null }>("SELECT search_id FROM pva_docs WHERE module = ? AND collection = ? AND id = ?", [module, collection, id]), (r) =>
-        r[0]?.search_id === null || r[0]?.search_id === undefined ? undefined : Number(r[0].search_id))
-    /** Set a row's search words: a new entry (newest in search order), or the same entry again (`keepOrder`, migration). */
-    const setSearch = (doc: StoredDoc, tokens: ReadonlyArray<string>, keepOrder: boolean) =>
-      Effect.gen(function*() {
-        const old = yield* searchIdOf(doc.module, doc.collection, doc.id)
-        if (old !== undefined) yield* exec("DELETE FROM pva_search WHERE rowid = ?", [old])
-        if (tokens.length === 0) {
-          if (old !== undefined) yield* exec("UPDATE pva_docs SET search_id = NULL WHERE module = ? AND collection = ? AND id = ?", [doc.module, doc.collection, doc.id])
-          return
-        }
-        const k = scopeToken(doc.module, doc.collection, doc.scope)
-        const r = keepOrder && old !== undefined
-          ? yield* exec("INSERT INTO pva_search (rowid, k, t) VALUES (?, ?, ?)", [old, k, tokens.join(" ")])
-          : yield* exec("INSERT INTO pva_search (k, t) VALUES (?, ?)", [k, tokens.join(" ")])
-        yield* exec("UPDATE pva_docs SET search_id = ? WHERE module = ? AND collection = ? AND id = ?", [r.lastInsertRowid, doc.module, doc.collection, doc.id])
-      })
 
     // ---- Erasure: the checkpoint after an erase, in the background, retried while a reader holds an old snapshot
 
@@ -485,7 +452,6 @@ export const makeSqliteStore = (options: SqliteStoreOptions): Effect.Effect<Sqli
 
     const backend: StoreBackend = {
       readOnly,
-      fts5,
       tx,
       read: (module, collection, id) =>
         Effect.map(query<DocRow>("SELECT * FROM pva_docs WHERE module = ? AND collection = ? AND id = ?", [module, collection, id]), (r) => (r[0] === undefined ? undefined : toDoc(r[0]))),
@@ -493,18 +459,6 @@ export const makeSqliteStore = (options: SqliteStoreOptions): Effect.Effect<Sqli
         const { sql, params } = listSql(module, collection, scope, q)
         return Effect.map(query<DocRow>(sql, params), (rows) => rows.map(toDoc))
       },
-      search: (module, collection, scope, words, limit) =>
-        Effect.gen(function*() {
-          const match = [`k : "${scopeToken(module, collection, scope)}"`, ...words.map((w) => `t : "${w}"*`)].join(" AND ")
-          const ids = (yield* query<{ rowid: number }>("SELECT rowid FROM pva_search WHERE pva_search MATCH ? ORDER BY rowid DESC LIMIT ?", [match, limit])).map((r) => Number(r.rowid))
-          if (ids.length === 0) return []
-          const rows = yield* query<DocRow>(`SELECT * FROM pva_docs WHERE search_id IN (${ids.map(() => "?").join(", ")})`, ids)
-          const byId = new Map(rows.map((r) => [Number(r.search_id), r]))
-          return ids.flatMap((id) => {
-            const r = byId.get(id)
-            return r !== undefined && r.module === module && r.collection === collection && r.scope_kind === scope.kind && r.scope_id === scopeIdOf(scope) ? [toDoc(r)] : []
-          })
-        }),
       append: (c) =>
         Effect.map(
           exec(
@@ -527,7 +481,7 @@ export const makeSqliteStore = (options: SqliteStoreOptions): Effect.Effect<Sqli
           ),
           (r) => r.lastInsertRowid
         ),
-      put: (doc, expect, tokens) =>
+      put: (doc, expect) =>
         Effect.gen(function*() {
           const r = expect === "absent"
             ? yield* exec(
@@ -540,17 +494,12 @@ export const makeSqliteStore = (options: SqliteStoreOptions): Effect.Effect<Sqli
                WHERE module = ? AND collection = ? AND id = ? AND rev = ? AND scope_kind = ? AND scope_id = ?`,
               [doc.rev, doc.v, doc.text, doc.updatedAt, JSON.stringify(doc.updatedBy), doc.module, doc.collection, doc.id, expect, doc.scope.kind, scopeIdOf(doc.scope)]
             )
-          if (r.changes !== 1) return false
-          yield* setSearch(doc, tokens, false)
-          return true
+          return r.changes === 1
         }),
       remove: (module, collection, id, scope, expect) =>
         Effect.gen(function*() {
-          const old = yield* searchIdOf(module, collection, id)
           const r = yield* exec("DELETE FROM pva_docs WHERE module = ? AND collection = ? AND id = ? AND rev = ? AND scope_kind = ? AND scope_id = ?", [module, collection, id, expect, scope.kind, scopeIdOf(scope)])
-          if (r.changes !== 1) return false
-          if (old !== undefined) yield* exec("DELETE FROM pva_search WHERE rowid = ?", [old])
-          return true
+          return r.changes === 1
         }),
       lastUndoable: (module, collection, actorKey, scope) =>
         Effect.map(
@@ -579,11 +528,8 @@ export const makeSqliteStore = (options: SqliteStoreOptions): Effect.Effect<Sqli
         )),
       scan: (module, collection, afterId, limit) =>
         Effect.map(query<DocRow>("SELECT * FROM pva_docs WHERE module = ? AND collection = ? AND id > ? ORDER BY id LIMIT ?", [module, collection, afterId, limit]), (rows) => rows.map(toDoc)),
-      rewrite: (doc, v, text, tokens) =>
-        Effect.gen(function*() {
-          yield* exec("UPDATE pva_docs SET v = ?, value = ? WHERE module = ? AND collection = ? AND id = ?", [v, text, doc.module, doc.collection, doc.id])
-          yield* setSearch(doc, tokens, true)
-        }),
+      rewrite: (doc, v, text) =>
+        Effect.asVoid(exec("UPDATE pva_docs SET v = ?, value = ? WHERE module = ? AND collection = ? AND id = ?", [v, text, doc.module, doc.collection, doc.id])),
       scrub
     }
 
@@ -795,7 +741,7 @@ export const makeSqliteStore = (options: SqliteStoreOptions): Effect.Effect<Sqli
     }
 
     const store: SqliteHouseholdStore = {
-      info: { kind: "sqlite", readOnly, fts5, ...(memory ? {} : { path: options.filename }) },
+      info: { kind: "sqlite", readOnly, ...(memory ? {} : { path: options.filename }) },
       prepare: (modules) => Effect.forEach(modules, prepareOne, { discard: true }),
       availability: (moduleId) => verdicts.get(moduleId),
       forModule,

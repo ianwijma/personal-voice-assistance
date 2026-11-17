@@ -10,7 +10,7 @@ import { CurrentTurn, type TurnContext, type TurnSource } from "./TurnContext.ts
  *
  * - **Document collections** (`defineCollection`): JSON rows validated by a Schema, each with an id, a `rev`, a scope
  *   and who changed it last; one equality filter, ordering and a limit, each list read bound to one index by
- *   construction; word search over declared fields. A collection whose version rises is migrated whole, at start, in
+ *   construction. A collection whose version rises is migrated whole, at start, in
  *   one transaction after a backup. Every write appends one change-log row in the same transaction.
  * - **Transactions** span a module's collections (`ModuleStore.transaction`); core services (scheduler,
  *   notifications) join the same transaction with their own tables (`HouseholdStore.core`). The model, shared by both
@@ -227,8 +227,6 @@ export interface Collection<A> {
    * `invalid`), so both stores order and compare them the same way (`compareIndexed`).
    */
   readonly indexes: ReadonlyArray<string>
-  /** Top-level string (or string list) fields whose words `search` looks for. */
-  readonly search: ReadonlyArray<string>
   /** `full`: the change log keeps each change's values (undo works). `none`: only that it happened (no undo). */
   readonly history: "full" | "none"
   /** Lines for the per-turn household facts (shared-state §7), from the rows the turn's device and person see. */
@@ -255,7 +253,6 @@ export const defineCollection = <A>(definition: {
   readonly version?: number
   readonly migrate?: Readonly<Record<number, (value: any) => unknown>>
   readonly indexes?: ReadonlyArray<string>
-  readonly search?: ReadonlyArray<string>
   readonly history?: "full" | "none"
   readonly ambient?: Collection<A>["ambient"]
   readonly ambientRows?: number
@@ -267,7 +264,7 @@ export const defineCollection = <A>(definition: {
   for (let v = 1; v < version; v++) {
     if (typeof definition.migrate?.[v] !== "function") throw new Error(`Collection ${definition.name}: migrate[${v}] (version ${v} to ${v + 1}) is missing`)
   }
-  for (const field of [...(definition.indexes ?? []), ...(definition.search ?? [])]) {
+  for (const field of definition.indexes ?? []) {
     if (!FIELD.test(field)) throw new Error(`Collection ${definition.name}: field "${field}" must match ${FIELD}`)
   }
   if ((definition.indexes?.length ?? 0) > 8) throw new Error(`Collection ${definition.name}: at most 8 indexes`)
@@ -282,7 +279,6 @@ export const defineCollection = <A>(definition: {
     version,
     migrate: definition.migrate ?? {},
     indexes: definition.indexes ?? [],
-    search: definition.search ?? [],
     history: definition.history ?? "full",
     ...(definition.ambient !== undefined ? { ambient: definition.ambient } : {}),
     ambientRows,
@@ -353,13 +349,6 @@ export interface CollectionHandle<A> {
   /** The row, or `undefined` when there is none in the scope. */
   readonly get: (id: string, options?: ScopeOptions) => Effect.Effect<Row<A> | undefined, StoreError | ScopeUnknown>
   readonly list: (query?: ListQuery<A>) => Effect.Effect<ReadonlyArray<Row<A>>, StoreError | ScopeUnknown>
-  /**
-   * Rows of the scope in which every word of `text` (at most 8) begins a word of the `search` fields, the most
-   * recently written first. Words are runs of letters and digits, compared without case and accents
-   * (`searchTokens`); "milk" finds "Milk" and "milkshake", not "buttermilk". The same in both stores. Default limit
-   * 20, at most 200.
-   */
-  readonly search: (text: string, options?: ScopeOptions & { readonly limit?: number }) => Effect.Effect<ReadonlyArray<Row<A>>, StoreError | ScopeUnknown>
   /** A new row (a random id unless `id` is given; an id in use is a `StoreConflict`). */
   readonly insert: (value: A, options?: WriteOptions & { readonly id?: string }) => Effect.Effect<Row<A>, StoreError | StoreConflict | ScopeUnknown>
   /**
@@ -375,7 +364,7 @@ export interface CollectionHandle<A> {
   readonly remove: (id: string, options?: WriteOptions & { readonly expectRev?: number }) => Effect.Effect<boolean, StoreError | StoreConflict | ScopeUnknown>
   /**
    * Forget the row: remove it and every payload of it in this scope (its values in the change log, which keeps only
-   * that a change happened, and its search entries), committed when this returns. Afterwards the old content is
+   * that a change happened), committed when this returns. Afterwards the old content is
    * overwritten in `household.db` and the write-ahead log is emptied (a checkpoint, retried while a reader such as a
    * running backup still holds an older snapshot; docs/STORING-DATA.md "Forgetting" says what it cannot reach:
    * backups until they rotate out, 14 days). `false`: there is no such row in this scope (its history in this scope is
@@ -395,7 +384,6 @@ export interface ModuleStore {
   readonly moduleId: string
   /** The CLI modes read the store and refuse every write. */
   readonly readOnly: boolean
-  readonly fts5: boolean
   /** A declared collection (an undeclared one fails each call with `invalid`). */
   readonly collection: <A>(collection: Collection<A>) => CollectionHandle<A>
   /**
@@ -462,7 +450,6 @@ export interface CoreSql {
 export interface StoreInfo {
   readonly kind: "sqlite" | "memory" | "closed"
   readonly readOnly: boolean
-  readonly fts5: boolean
   /** The database file (SQLite). */
   readonly path?: string
 }
@@ -499,8 +486,7 @@ export interface HouseholdStore {
   /** The change log's last number (0 when empty). */
   readonly lastSeq: Effect.Effect<number, StoreError>
   /**
-   * A conversation ended: erase every row of its scope (as `erase` does: rows, payloads in the change log, search
-   * entries; one `erase` change per row, by `system:conversation-ended`), in one transaction. Returns how many.
+   * A conversation ended: erase every row of its scope (as `erase` does: rows and payloads in the change log; one `erase` change per row, by `system:conversation-ended`), in one transaction. Returns how many.
    */
   readonly endConversation: (conversationId: string) => Effect.Effect<number, StoreError>
   /** At start, before any conversation: the same for every conversation-scoped row (conversations do not outlive a process). */
@@ -518,7 +504,6 @@ export interface HouseholdStore {
 
 export const DEFAULT_LIST_LIMIT = 100
 export const MAX_LIST_LIMIT = 1000
-export const MAX_SEARCH_LIMIT = 200
 /** The largest value a row may hold, as JSON. */
 export const MAX_VALUE_CHARS = 64_000
 export const CHANGE_RETENTION_MS = 90 * 24 * 60 * 60 * 1000
@@ -637,33 +622,6 @@ export const decodeStored = <A>(
     return { value, migrated: v < collection.version ? current : undefined }
   })
 
-/**
- * The words of a text for search, the same in both stores: decomposed (NFKD), lower case, accents and other marks
- * removed, then the runs of letters and digits, each once. "Crème BRÛLÉE, 2×" → `crème` → `creme`, `brulee`, `2`.
- */
-export const searchTokens = (text: string): ReadonlyArray<string> =>
-  [...new Set(text.normalize("NFKD").toLowerCase().replace(/\p{M}/gu, "").match(/[\p{L}\p{N}]+/gu) ?? [])]
-
-/** The words a row contributes to search: those of its `search` fields (strings and string lists). */
-export const searchTokensOf = (collection: Collection<any>, json: unknown): ReadonlyArray<string> => {
-  if (collection.search.length === 0 || json === null || typeof json !== "object") return []
-  const parts: Array<string> = []
-  for (const field of collection.search) {
-    if (!Object.hasOwn(json, field)) continue
-    const v = (json as Record<string, unknown>)[field]
-    if (typeof v === "string") parts.push(v)
-    else if (Array.isArray(v)) for (const x of v) if (typeof x === "string") parts.push(x)
-  }
-  return searchTokens(parts.join("\n"))
-}
-
-/** The words of a search: `searchTokens` of the text, at most 8. */
-export const searchWords = (text: string): ReadonlyArray<string> => searchTokens(text).slice(0, 8)
-
-/** Whether every word begins one of the tokens (the search rule of both stores). */
-export const matchesTokens = (tokens: ReadonlyArray<string>, words: ReadonlyArray<string>): boolean =>
-  words.every((w) => tokens.some((t) => t.startsWith(w)))
-
 /** A list query as one index range read: its filter (at most one field) and its order. */
 export interface CheckedQuery {
   readonly limit: number
@@ -708,7 +666,6 @@ export const makeClosedStore = (reason: string): HouseholdStore => {
   const handle: CollectionHandle<any> = {
     get: () => fail,
     list: () => fail,
-    search: () => fail,
     insert: () => fail,
     update: () => fail,
     remove: () => fail,
@@ -716,13 +673,12 @@ export const makeClosedStore = (reason: string): HouseholdStore => {
     undo: () => fail
   }
   return {
-    info: { kind: "closed", readOnly: true, fts5: false },
+    info: { kind: "closed", readOnly: true },
     prepare: () => Effect.void,
     availability: () => undefined,
     forModule: (moduleId) => ({
       moduleId,
       readOnly: true,
-      fts5: false,
       collection: () => handle,
       transaction: (work) => work
     }),

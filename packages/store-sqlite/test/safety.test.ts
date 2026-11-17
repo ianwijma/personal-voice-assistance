@@ -13,7 +13,7 @@ import { indexName, listSql, makeSqliteStore } from "../src/index.ts"
 
 const tmp = () => mkdtempSync(join(tmpdir(), "pva-safety-"))
 const Item = Schema.Struct({ text: Schema.String })
-const items = defineCollection({ name: "items", scope: "household", schema: Item, search: ["text"] })
+const items = defineCollection({ name: "items", scope: "household", schema: Item })
 const errorOf = <A>(exit: Exit.Exit<A, unknown>) => (Exit.isFailure(exit) ? (exit.cause.reasons.find((r) => r._tag === "Fail") as { error: StoreError } | undefined)?.error : undefined)
 const mode = (path: string) => statSync(path).mode & 0o777
 const sha = (path: string) => createHash("sha256").update(readFileSync(path)).digest("hex")

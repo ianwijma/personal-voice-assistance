@@ -14,7 +14,6 @@ import {
   currentActor,
   decodeStored,
   encodeValue,
-  MAX_SEARCH_LIMIT,
   type ModuleStore,
   readOnlyError,
   resolveScope,
@@ -22,8 +21,6 @@ import {
   type ScopeRef,
   scopeKey,
   type ScopeUnknown,
-  searchTokensOf,
-  searchWords,
   StoreConflict,
   StoreError,
   StoreNotFound,
@@ -61,19 +58,16 @@ export type NewChange = Omit<ChangeRecord, "seq" | "undone" | "rev"> & { readonl
  */
 export interface StoreBackend {
   readonly readOnly: boolean
-  readonly fts5: boolean
   readonly tx: Transactions
   /** The row with this id in the collection, whatever its scope. */
   readonly read: (module: string, collection: string, id: string) => Effect.Effect<StoredDoc | undefined, StoreError>
   /** One index range read (`CheckedQuery`), in the order `compareIndexed` defines. */
   readonly list: (module: string, collection: string, scope: ScopeRef, query: CheckedQuery) => Effect.Effect<ReadonlyArray<StoredDoc>, StoreError>
-  /** Rows of the scope with a token beginning with each word, the most recently written first (`searchTokens`). */
-  readonly search: (module: string, collection: string, scope: ScopeRef, words: ReadonlyArray<string>, limit: number) => Effect.Effect<ReadonlyArray<StoredDoc>, StoreError>
   /** Append a change; returns its number (the `rev` of the row it wrote). */
   readonly append: (change: NewChange) => Effect.Effect<number, StoreError>
-  /** Insert (`"absent"`) or replace the row at rev `expect` in its scope; `false` when that did not hold. Sets its search words. */
-  readonly put: (doc: StoredDoc, expect: "absent" | number, tokens: ReadonlyArray<string>) => Effect.Effect<boolean, StoreError>
-  /** Delete the row at rev `expect` in `scope` (and its search entry); `false` when it was not there so. */
+  /** Insert (`"absent"`) or replace the row at rev `expect` in its scope; `false` when that did not hold. */
+  readonly put: (doc: StoredDoc, expect: "absent" | number) => Effect.Effect<boolean, StoreError>
+  /** Delete the row at rev `expect` in `scope`; `false` when it was not there so. */
   readonly remove: (module: string, collection: string, id: string, scope: ScopeRef, expect: number) => Effect.Effect<boolean, StoreError>
   /** The newest change of `actorKey` in the collection and scope that is not undone, not an undo or an erase, and still has its values. */
   readonly lastUndoable: (module: string, collection: string, actorKey: string, scope: ScopeRef) => Effect.Effect<ChangeRecord | undefined, StoreError>
@@ -84,8 +78,8 @@ export interface StoreBackend {
   readonly purge: (module: string, collection: string, id: string, scope: ScopeRef) => Effect.Effect<void, StoreError>
   /** Rows of a collection after `afterId` in id order (the migration at start). */
   readonly scan: (module: string, collection: string, afterId: string, limit: number) => Effect.Effect<ReadonlyArray<StoredDoc>, StoreError>
-  /** Store a migrated value of a row (same rev, same place in search order). */
-  readonly rewrite: (doc: StoredDoc, v: number, text: string, tokens: ReadonlyArray<string>) => Effect.Effect<void, StoreError>
+  /** Store a migrated value of a row (same rev). */
+  readonly rewrite: (doc: StoredDoc, v: number, text: string) => Effect.Effect<void, StoreError>
   /** After an erase committed: make the old content unreadable in the files too (SQLite: a checkpoint, retried). */
   readonly scrub: () => void
 }
@@ -205,20 +199,6 @@ export const makeModuleStoreOn = (
         return yield* Effect.forEach(docs, toRow)
       }))
 
-    const search: CollectionHandle<A>["search"] = (text, options) =>
-      guard(Effect.gen(function*() {
-        if (c.search.length === 0) return yield* new StoreError({ reason: "invalid", message: `Collection ${c.name} declares no search fields` })
-        const scope = yield* resolveScope(c, options?.scope)
-        const words = searchWords(text)
-        if (words.length === 0) return []
-        const limit = options?.limit ?? 20
-        if (!Number.isInteger(limit) || limit < 1 || limit > MAX_SEARCH_LIMIT) {
-          return yield* new StoreError({ reason: "invalid", message: `Collection ${c.name}: a search limit must be 1 to ${MAX_SEARCH_LIMIT}` })
-        }
-        const docs = yield* tx.statement(backend.search(moduleId, c.name, scope, words, limit))
-        return yield* Effect.forEach(docs, toRow)
-      }))
-
     const insert: CollectionHandle<A>["insert"] = (value, options) =>
       writable("insert", Effect.gen(function*() {
         const scope = yield* resolveScope(c, options?.scope)
@@ -231,7 +211,7 @@ export const makeModuleStoreOn = (
           const at = yield* Clock.currentTimeMillis
           const log = yield* logChange(c.name, "insert", { id, scope, actor, at }, payloadOf(undefined, encoded.json))
           const doc: StoredDoc = { module: moduleId, collection: c.name, id, scope, rev: log.seq, v: c.version, text: encoded.text, createdAt: at, updatedAt: at, updatedBy: actor }
-          if (!(yield* backend.put(doc, "absent", searchTokensOf(c, encoded.json)))) return yield* conflict(id, `A row ${id} already exists in ${c.name}`)
+          if (!(yield* backend.put(doc, "absent"))) return yield* conflict(id, `A row ${id} already exists in ${c.name}`)
           const row: Row<A> = { id, rev: log.seq, scope, value: encoded.value, createdAt: at, updatedAt: at, updatedBy: actor }
           yield* log.announce({ row })
           return row
@@ -257,7 +237,7 @@ export const makeModuleStoreOn = (
           const at = yield* Clock.currentTimeMillis
           const log = yield* logChange(c.name, "update", { id, scope: doc.scope, actor, at }, payloadOf(before.json, encoded.json))
           const written: StoredDoc = { ...doc, rev: log.seq, v: c.version, text: encoded.text, updatedAt: at, updatedBy: actor }
-          if (!(yield* backend.put(written, doc.rev, searchTokensOf(c, encoded.json)))) return yield* conflict(id, `Row ${id} of ${c.name} changed meanwhile`)
+          if (!(yield* backend.put(written, doc.rev))) return yield* conflict(id, `Row ${id} of ${c.name} changed meanwhile`)
           const row: Row<A> = { id, rev: log.seq, scope: doc.scope, value: encoded.value, createdAt: doc.createdAt, updatedAt: at, updatedBy: actor }
           yield* log.announce({ row, before: before.row })
           return row
@@ -335,7 +315,7 @@ export const makeModuleStoreOn = (
             const encoded = yield* encodeValue(c, yield* valueAt(payload.before))
             const log = yield* logChange(c.name, "update", { id: doc.id, scope, actor, at }, payloadOf(before.json, encoded.json), last.opId)
             const written: StoredDoc = { ...doc, rev: log.seq, v: c.version, text: encoded.text, updatedAt: at, updatedBy: actor }
-            if (!(yield* backend.put(written, doc.rev, searchTokensOf(c, encoded.json)))) return yield* notUndone
+            if (!(yield* backend.put(written, doc.rev))) return yield* notUndone
             const row: Row<A> = { id: doc.id, rev: log.seq, scope, value: encoded.value, createdAt: doc.createdAt, updatedAt: at, updatedBy: actor }
             yield* log.announce({ row, before: before.row })
             result = { undid: "update", id: doc.id, row }
@@ -344,7 +324,7 @@ export const makeModuleStoreOn = (
             const encoded = yield* encodeValue(c, yield* valueAt(payload.before))
             const log = yield* logChange(c.name, "insert", { id: last.id, scope, actor, at }, payloadOf(undefined, encoded.json), last.opId)
             const written: StoredDoc = { module: moduleId, collection: c.name, id: last.id, scope, rev: log.seq, v: c.version, text: encoded.text, createdAt: at, updatedAt: at, updatedBy: actor }
-            if (!(yield* backend.put(written, "absent", searchTokensOf(c, encoded.json)))) return yield* notUndone
+            if (!(yield* backend.put(written, "absent"))) return yield* notUndone
             const row: Row<A> = { id: last.id, rev: log.seq, scope, value: encoded.value, createdAt: at, updatedAt: at, updatedBy: actor }
             yield* log.announce({ row })
             result = { undid: "remove", id: last.id, row }
@@ -354,13 +334,12 @@ export const makeModuleStoreOn = (
         }))
       }))
 
-    return { get, list, search, insert, update, remove, erase, undo }
+    return { get, list, insert, update, remove, erase, undo }
   }
 
   return {
     moduleId,
     readOnly: backend.readOnly,
-    fts5: backend.fts5,
     collection: <A>(c: Collection<A>) => {
       let h = handles.get(c.name)
       if (h === undefined) {
@@ -376,7 +355,7 @@ export const makeModuleStoreOn = (
 /**
  * Migrate every row of a collection to its declared version (inside the caller's transaction, at start): each row is
  * decoded at its stored version, migrated, and stored through the same checks as a write (`encodeValue`: the schema,
- * the size limit, scalar indexed fields), with its search words. A row that fails fails the whole migration.
+ * the size limit, scalar indexed fields). A row that fails fails the whole migration.
  */
 export const migrateCollectionOn = (backend: StoreBackend, moduleId: string, c: Collection<any>): Effect.Effect<number, StoreError> =>
   Effect.gen(function*() {
@@ -394,7 +373,7 @@ export const migrateCollectionOn = (backend: StoreBackend, moduleId: string, c: 
         const encoded = yield* encodeValue(c, decoded.value).pipe(
           Effect.mapError((e) => new StoreError({ reason: "failed", message: `Row ${doc.id} of ${c.name}, migrated from version ${doc.v}: ${e.message}` }))
         )
-        yield* backend.rewrite(doc, c.version, encoded.text, searchTokensOf(c, encoded.json))
+        yield* backend.rewrite(doc, c.version, encoded.text)
         n++
       }
       if (docs.length < 200) return n
@@ -414,7 +393,7 @@ export interface ConversationRows {
 
 /**
  * A conversation ended (or, with `undefined`, every conversation, at start): erase each of its rows as `erase` does,
- * in one transaction: one `erase` change per row (actor `system:conversation-ended`), the row and its search words
+ * in one transaction: one `erase` change per row (actor `system:conversation-ended`), the row
  * gone, and every payload of a change in that scope dropped, so nothing of it can be undone or read back.
  */
 export const endConversationsOn = (

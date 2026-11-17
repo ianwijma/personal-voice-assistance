@@ -11,7 +11,7 @@ import { householdIssues, makeSqliteStore } from "../src/index.ts"
 
 const tmp = () => mkdtempSync(join(tmpdir(), "pva-sqlite-"))
 const Item = Schema.Struct({ text: Schema.String })
-const items = defineCollection({ name: "items", scope: "household", schema: Item, search: ["text"] })
+const items = defineCollection({ name: "items", scope: "household", schema: Item })
 const errorOf = <A>(exit: Exit.Exit<A, unknown>) => (Exit.isFailure(exit) ? (exit.cause.reasons.find((r) => r._tag === "Fail") as { error: StoreError } | undefined)?.error : undefined)
 
 describe("SQLite household store", () => {

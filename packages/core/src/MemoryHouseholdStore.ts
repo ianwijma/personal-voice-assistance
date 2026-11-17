@@ -9,7 +9,6 @@ import {
   compareIndexed,
   type HouseholdStore,
   indexedEquals,
-  matchesTokens,
   readOnlyError,
   scopeKey,
   type ScopeRef,
@@ -24,7 +23,7 @@ import { makeTransactions, type OutboxItem } from "./StoreTransactions.ts"
  * module tests. The collection semantics are the same code (`ModuleStoreImpl.ts`) and so is the transaction model
  * (`StoreTransactions.ts`: one transaction at a time, savepoints one at a time, ended frames refused, events after the
  * commit in change-log order); the backend below keeps rows in maps and gives the same answers as SQLite's indexes
- * and search (the shared contract, `@pva/core/store-contract`, checks both). It has no backups.
+ * (the shared contract, `@pva/core/store-contract`, checks both). It has no backups.
  */
 
 export interface MemoryStoreOptions {
@@ -34,20 +33,12 @@ export interface MemoryStoreOptions {
   readonly storedVersions?: Readonly<Record<string, Readonly<Record<string, number>>>>
 }
 
-interface SearchEntry {
-  /** Order of the last write that set it (newest first in results), like SQLite's full-text row id. */
-  readonly order: number
-  readonly tokens: ReadonlyArray<string>
-}
-
 type ChangeRow = ChangeRecord & { readonly actorKey: string }
 
 interface State {
   docs: Map<string, StoredDoc>
-  search: Map<string, SearchEntry>
   changes: Array<ChangeRow>
   nextSeq: number
-  nextSearch: number
 }
 
 const key = (module: string, collection: string, id: string) => `${module}\u0000${collection}\u0000${id}`
@@ -56,8 +47,6 @@ const MODULE_ID = /^[a-z][a-z0-9-]{0,39}$/
 export const makeMemoryHouseholdStore = (options: MemoryStoreOptions = {}): HouseholdStore & {
   /** For assertions: every change-log row, oldest first. */
   readonly changeLog: () => ReadonlyArray<ChangeRecord>
-  /** For assertions: the search words kept for a row (`undefined` when none). */
-  readonly searchEntry: (module: string, collection: string, id: string) => ReadonlyArray<string> | undefined
   /**
    * Inside a transaction of this store: run `undo` if that transaction (or the savepoint it is in, or an enclosing
    * one) rolls back. Outside one: nothing. How an in-memory table of a core service (the scheduler's) joins the
@@ -66,14 +55,14 @@ export const makeMemoryHouseholdStore = (options: MemoryStoreOptions = {}): Hous
   readonly onRollback: (undo: () => void) => Effect.Effect<void>
 } => {
   const readOnly = options.readOnly === true
-  let state: State = { docs: new Map(), search: new Map(), changes: [], nextSeq: 1, nextSearch: 1 }
+  let state: State = { docs: new Map(), changes: [], nextSeq: 1 }
   const versions = new Map<string, Map<string, number>>()
   for (const [m, vs] of Object.entries(options.storedVersions ?? {})) versions.set(m, new Map(Object.entries(vs)))
   const verdicts = new Map<string, ModuleUnavailable>()
   const declared = new Map<string, ReadonlyMap<string, Collection<any>>>()
   const listeners = new Set<(changes: ReadonlyArray<CommittedChange>) => void>()
 
-  const copy = (s: State): State => ({ docs: new Map(s.docs), search: new Map(s.search), changes: [...s.changes], nextSeq: s.nextSeq, nextSearch: s.nextSearch })
+  const copy = (s: State): State => ({ docs: new Map(s.docs), changes: [...s.changes], nextSeq: s.nextSeq })
 
   const fire = (changes: ReadonlyArray<CommittedChange>) => {
     if (changes.length === 0) return
@@ -127,7 +116,6 @@ export const makeMemoryHouseholdStore = (options: MemoryStoreOptions = {}): Hous
 
   const backend: StoreBackend = {
     readOnly,
-    fts5: false,
     tx,
     read: (module, collection, id) => Effect.sync(() => state.docs.get(key(module, collection, id))),
     list: (module, collection, scope, q) =>
@@ -149,31 +137,18 @@ export const makeMemoryHouseholdStore = (options: MemoryStoreOptions = {}): Hous
           })
           .slice(0, q.limit)
       }),
-    search: (module, collection, scope, words, limit) =>
-      Effect.sync(() =>
-        docsOf(module, collection, scope)
-          .flatMap((d) => {
-            const entry = state.search.get(key(module, collection, d.id))
-            return entry !== undefined && matchesTokens(entry.tokens, words) ? [{ d, order: entry.order }] : []
-          })
-          .sort((a, b) => b.order - a.order)
-          .slice(0, limit)
-          .map((x) => x.d)
-      ),
     append: (change) =>
       Effect.sync(() => {
         const seq = state.nextSeq++
         state.changes.push({ ...change, seq, rev: seq, undone: false })
         return seq
       }),
-    put: (doc, expect, tokens) =>
+    put: (doc, expect) =>
       Effect.sync(() => {
         const k = key(doc.module, doc.collection, doc.id)
         const existing = state.docs.get(k)
         if (expect === "absent" ? existing !== undefined : existing === undefined || existing.rev !== expect || !sameScope(existing.scope, doc.scope)) return false
         state.docs.set(k, doc)
-        if (tokens.length > 0) state.search.set(k, { order: state.nextSearch++, tokens })
-        else state.search.delete(k)
         return true
       }),
     remove: (module, collection, id, scope, expect) =>
@@ -182,7 +157,6 @@ export const makeMemoryHouseholdStore = (options: MemoryStoreOptions = {}): Hous
         const existing = state.docs.get(k)
         if (existing === undefined || existing.rev !== expect || !sameScope(existing.scope, scope)) return false
         state.docs.delete(k)
-        state.search.delete(k)
         return true
       }),
     lastUndoable: (module, collection, actorKey, scope) =>
@@ -217,15 +191,12 @@ export const makeMemoryHouseholdStore = (options: MemoryStoreOptions = {}): Hous
           .sort((a, b) => compareCodePoints(a.id, b.id))
           .slice(0, limit)
       ),
-    rewrite: (doc, v, text, tokens) =>
+    rewrite: (doc, v, text) =>
       Effect.sync(() => {
         const k = key(doc.module, doc.collection, doc.id)
         const now = state.docs.get(k)
         if (now === undefined) return
         state.docs.set(k, { ...now, v, text })
-        const entry = state.search.get(k)
-        if (tokens.length === 0) state.search.delete(k)
-        else state.search.set(k, { order: entry?.order ?? state.nextSearch++, tokens })
       }),
     scrub: () => {}
   }
@@ -285,7 +256,7 @@ export const makeMemoryHouseholdStore = (options: MemoryStoreOptions = {}): Hous
   const oldestSeq = () => state.changes[0]?.seq ?? state.nextSeq
 
   return {
-    info: { kind: "memory", readOnly, fts5: false },
+    info: { kind: "memory", readOnly },
     prepare: (modules) => Effect.forEach(modules, prepareOne, { discard: true }),
     availability: (moduleId) => verdicts.get(moduleId),
     forModule,
@@ -321,7 +292,6 @@ export const makeMemoryHouseholdStore = (options: MemoryStoreOptions = {}): Hous
       return () => listeners.delete(listener)
     },
     changeLog: () => state.changes.map(({ actorKey: _k, ...c }) => c),
-    onRollback: (undo) => Effect.orDie(tx.onRollback(undo)),
-    searchEntry: (module, collection, id) => state.search.get(key(module, collection, id))?.tokens
+    onRollback: (undo) => Effect.orDie(tx.onRollback(undo))
   }
 }

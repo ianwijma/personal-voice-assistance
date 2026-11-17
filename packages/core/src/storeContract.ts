@@ -22,11 +22,11 @@ import { CurrentTurn, type TurnContext } from "./TurnContext.ts"
 export const Note = Schema.Struct({ text: Schema.String, tag: Schema.optionalKey(Schema.String), n: Schema.optionalKey(Schema.Finite), done: Schema.optionalKey(Schema.Boolean) })
 export type Note = typeof Note.Type
 
-export const notes = defineCollection({ name: "notes", scope: "household", schema: Note, indexes: ["tag", "n", "done"], search: ["text"] })
+export const notes = defineCollection({ name: "notes", scope: "household", schema: Note, indexes: ["tag", "n", "done"] })
 export const mine = defineCollection({ name: "mine", scope: "person", schema: Note })
-export const dev = defineCollection({ name: "dev", scope: "device", schema: Note, search: ["text"] })
+export const dev = defineCollection({ name: "dev", scope: "device", schema: Note })
 export const chat = defineCollection({ name: "chat", scope: "conversation", schema: Note })
-export const forgettable = defineCollection({ name: "forgettable", scope: "household", schema: Note, history: "none", search: ["text"] })
+export const forgettable = defineCollection({ name: "forgettable", scope: "household", schema: Note, history: "none" })
 /** Shown on every page whose device is the row's `tag`; hidden elsewhere. */
 export const shown = defineCollection({
   name: "shown",
@@ -168,8 +168,6 @@ export const householdStoreContract = (name: string, make: MakeStore) =>
         assert.strictEqual((failureOf(otherOrder) as StoreError).reason, "invalid")
         const createdFiltered = yield* Effect.exit(c.list({ where: { tag: "a" }, orderBy: { field: "createdAt" } }))
         assert.strictEqual((failureOf(createdFiltered) as StoreError).reason, "invalid")
-        const found = yield* c.search("T3")
-        assert.deepStrictEqual(found.map((r) => r.value.text), ["t3"])
       }).pipe(Effect.scoped))
 
     it.effect("indexed fields hold scalars only, ordered the same in both stores (null, numbers and booleans, strings by code point)", () =>
@@ -385,7 +383,7 @@ export const householdStoreContract = (name: string, make: MakeStore) =>
         yield* settle
         yield* kit.transaction(events.publish("ping", {}))
         yield* Deferred.await(done)
-        assert.strictEqual((yield* c.search("pong")).length, 1)
+        assert.strictEqual((yield* c.list()).filter((r) => r.value.text === "pong").length, 1)
       }).pipe(Effect.scoped))
 
     it.effect("undo: the last change of an actor in a collection and scope, insert, update and remove; not someone else's", () =>
@@ -454,18 +452,15 @@ export const householdStoreContract = (name: string, make: MakeStore) =>
         assert.strictEqual((failureOf(undo) as StoreError).reason, "invalid")
       }).pipe(Effect.scoped))
 
-    it.effect("erase removes the row, every earlier payload of it and its search entries; undo skips it", () =>
+    it.effect("erase removes the row and every earlier payload of it; undo skips it", () =>
       Effect.gen(function*() {
         const store = yield* prepared(make)
         const c = store.forModule("kit").collection(notes)
         const keep = yield* c.insert({ text: "party hats" })
         const row = yield* c.insert({ text: "sam's surprise party on friday" })
         yield* c.update(row.id, (v) => ({ ...v, text: "sam's surprise party on saturday" }))
-        assert.strictEqual((yield* c.search("surprise party")).length, 1)
         assert.isTrue(yield* c.erase(row.id))
         assert.strictEqual(yield* c.get(row.id), undefined)
-        assert.strictEqual((yield* c.search("surprise")).length, 0)
-        assert.deepStrictEqual((yield* c.search("party")).map((r) => r.id), [keep.id])
         const page = yield* store.changesSince(0, 10)
         const ofRow = page.changes.filter((ch) => ch.id === row.id)
         assert.deepStrictEqual(ofRow.map((ch) => ch.op), ["insert", "update", "erase"])
@@ -487,7 +482,6 @@ export const householdStoreContract = (name: string, make: MakeStore) =>
         yield* c.update(row.id, (v) => ({ ...v, text: "kitchen secret, again" })).pipe(inTurn(kitchen))
         assert.isFalse(yield* c.erase(row.id).pipe(inTurn(study)))
         assert.strictEqual((yield* c.get(row.id).pipe(inTurn(kitchen)))?.value.text, "kitchen secret, again")
-        assert.strictEqual((yield* c.search("secret").pipe(inTurn(kitchen))).length, 1)
         const ofRow = (yield* store.changesSince(0, 10)).changes.filter((ch) => ch.id === row.id)
         assert.isTrue(ofRow.every((ch) => ch.payload !== undefined))
         // Removed in its own scope earlier, the history there still goes with an erase there.
@@ -534,33 +528,6 @@ export const householdStoreContract = (name: string, make: MakeStore) =>
         assert.deepStrictEqual(texts(yield* store.forModule("later").collection(v2).list().pipe(inTurn(turnOf()))), ["kept for the newer module"])
         assert.isTrue(JSON.stringify((yield* store.changesSince(0, 10)).changes).includes("kept for the newer module"))
       }).pipe(Effect.scoped))
-
-    it.effect("search: every word begins a word of the row (no case, no accents), the most recently written first, the whole scope", () =>
-      Effect.gen(function*() {
-        const store = yield* prepared(make)
-        const c = store.forModule("kit").collection(notes)
-        const old = yield* c.insert({ text: "Old note about the boiler" })
-        const butter = yield* c.insert({ text: "Buttermilk pancakes" })
-        const milk = yield* c.insert({ text: "Milk and eggs" })
-        const creme = yield* c.insert({ text: "Crème BRÛLÉE" })
-        const shake = yield* c.insert({ text: "MILKSHAKE" })
-        assert.deepStrictEqual((yield* c.search("milk")).map((r) => r.id), [shake.id, milk.id])
-        assert.deepStrictEqual((yield* c.search("mil eg")).map((r) => r.id), [milk.id])
-        assert.deepStrictEqual((yield* c.search("creme brulee")).map((r) => r.id), [creme.id])
-        assert.deepStrictEqual((yield* c.search("BRÛ")).map((r) => r.id), [creme.id])
-        assert.deepStrictEqual((yield* c.search("buttermilk")).map((r) => r.id), [butter.id])
-        assert.deepStrictEqual((yield* c.search("termilk")).map((r) => r.id), [])
-        // A write moves a row to the front.
-        yield* c.update(milk.id, (v) => ({ ...v, text: "Milk, eggs and flour" }))
-        assert.deepStrictEqual((yield* c.search("milk")).map((r) => r.id), [milk.id, shake.id])
-        assert.deepStrictEqual((yield* c.search("milk", { limit: 1 })).map((r) => r.id), [milk.id])
-        // Rows without search words do not crowd out an old match.
-        yield* Effect.forEach(Array.from({ length: 2100 }, (_, i) => i), () => c.insert({ text: "" }), { discard: true })
-        assert.deepStrictEqual((yield* c.search("boiler")).map((r) => r.id), [old.id])
-        const badLimit = yield* Effect.exit(c.search("milk", { limit: 0 }))
-        assert.strictEqual((failureOf(badLimit) as StoreError).reason, "invalid")
-      }).pipe(Effect.scoped))
-
     it.effect("retention removes changes older than 90 days", () =>
       Effect.gen(function*() {
         const store = yield* prepared(make)
@@ -578,16 +545,15 @@ export const householdStoreContract = (name: string, make: MakeStore) =>
         assert.strictEqual((yield* store.changesSince(0, 10)).oldest, 3)
       }).pipe(Effect.scoped))
 
-    it.effect("collection versions: rows are migrated at start (indexes and search follow); a newer version makes the module unavailable everywhere", () =>
+    it.effect("collection versions: rows are migrated at start (indexes follow); a newer version makes the module unavailable everywhere", () =>
       Effect.gen(function*() {
-        const v1 = defineCollection({ name: "items", scope: "household", schema: Schema.Struct({ label: Schema.String }), indexes: ["label"], search: ["label"] })
+        const v1 = defineCollection({ name: "items", scope: "household", schema: Schema.Struct({ label: Schema.String }), indexes: ["label"] })
         const v2 = defineCollection({
           name: "items",
           scope: "household",
           version: 2,
           schema: Schema.Struct({ text: Schema.String, qty: Schema.Finite }),
           indexes: ["text"],
-          search: ["text"],
           migrate: { 1: (old: { label: string }) => ({ text: old.label.replace("Oat", "Rice"), qty: 1 }) },
           project: (row: Row<{ text: string; qty: number }>) => ({ text: row.value.text })
         })
@@ -600,8 +566,6 @@ export const householdStoreContract = (name: string, make: MakeStore) =>
         const items = store.forModule("shop").collection(v2)
         assert.deepStrictEqual((yield* items.get(row.id))?.value, { text: "Rice milk", qty: 1 })
         assert.deepStrictEqual((yield* items.list({ where: { text: "Rice milk" } })).map((r) => r.id), [row.id])
-        assert.deepStrictEqual((yield* items.search("rice")).map((r) => r.id), [row.id])
-        assert.deepStrictEqual(yield* items.search("oat"), [])
         // The older module again: refused, with a reason; never opened and never written, also through a handle made before.
         yield* store.prepare([{ id: "shop", storage: { collections: [v1] } }])
         const verdict = store.availability("shop")

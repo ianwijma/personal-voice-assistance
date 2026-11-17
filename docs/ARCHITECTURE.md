@@ -345,9 +345,9 @@ ModuleHostApi = {
 ```ts
 defineModule({ apiVersion: 2, storage?: { collections?: [Collection] }, events?: [EventType], … })
 defineCollection({ name, scope: "household" | "person" | "assistant" | "device" | "conversation", schema, version?, migrate?,
-                   indexes?, search?, history?: "full" | "none", ambient?(rows, { now, turn }), ambientRows?, project?(row, device) })
-ModuleStore (ctx.store) = { collection(c): CollectionHandle<A>; transaction(work); readOnly; fts5 }
-CollectionHandle<A> = { get(id, { scope? }); list({ scope?, where?, orderBy?, limit? }); search(text, { scope?, limit? });
+                   indexes?, history?: "full" | "none", ambient?(rows, { now, turn }), ambientRows?, project?(row, device) })
+ModuleStore (ctx.store) = { collection(c): CollectionHandle<A>; transaction(work); readOnly }
+CollectionHandle<A> = { get(id, { scope? }); list({ scope?, where?, orderBy?, limit? });
                         insert(value, { id?, scope?, actor? }); update(id, f, { expectRev?, scope?, actor? }); remove(id, …);
                         erase(id, …); undo({ scope?, actor? }) }      // Row<A> = { id, rev, scope, value, createdAt, updatedAt, updatedBy: Actor }
 ModuleEvents (ctx.events) = { publish(type, data, scope?): Effect<void>; subscribe(filter?): Stream<HouseholdEvent> }
@@ -361,9 +361,7 @@ HouseholdFeed = { active; snapshot(device): { seq, parts, cursor }; catchUp(devi
   `node:sqlite` (`packages/store-sqlite`; `effect/sql` is unstable, so it stays behind `HouseholdStore`): WAL,
   `synchronous = NORMAL`, `secure_delete = ON`, one connection. Calls are synchronous on the main thread, which also
   frames audio, so every read a turn can make is bounded by construction: a `list` is one named index (`INDEXED BY`)
-  read in its own order up to its limit (other shapes are `invalid`), indexed fields are scalars, a `search` is one
-  full-text query of one scope (`tokenize = 'ascii'` over words made in JS, so the in-memory double matches it
-  exactly). Backups and exports read through a connection of their own (backups in one step on a worker thread),
+  read in its own order up to its limit (other shapes are `invalid`), indexed fields are scalars. Backups and exports read through a connection of their own (backups in one step on a worker thread),
   retention deletes 100 changes per transaction, the checkpoint after an erase runs in the background and never waits
   for a reader; the longest stop measured on 100,000 rows is 10 ms (docs/STORING-DATA.md "Latency"). Serve mode opens
   the file read-write after the writer lock (a newer file is refused after a read-only look, untouched); the CLI modes
@@ -379,11 +377,10 @@ HouseholdFeed = { active; snapshot(device): { seq, parts, cursor }; catchUp(devi
   erased when the conversation ends (`SessionConversation`), and at serve start for conversations of a previous run.
 - **Change log** (`pva_changes`): one row per write in the same transaction (seq, which is also the row's rev, op id,
   module, collection, scope, row id, op, actor, time, the values before and after unless `history: "none"`); 90 days
-  kept; `undo` per actor, collection and scope; `erase` removes a row with every payload of it in its scope and its
-  search words, then checkpoints the log (retried while a reader holds an older snapshot). What is kept how long and
+  kept; `undo` per actor, collection and scope; `erase` removes a row with every payload of it in its scope, then checkpoints the log (retried while a reader holds an older snapshot). What is kept how long and
   what an erase cannot reach (backups, 14 days): docs/STORING-DATA.md "Forgetting".
 - **Versions**: `prepare` (before the module host is made) migrates a collection whose version rose eagerly (every row
-  through the write checks, its indexes and search words), in one transaction after a
+  through the write checks, its indexes), in one transaction after a
   backup; a failure leaves the data and makes the module `unavailable`; a module whose stored data is newer is
   `unavailable` (`ModuleHostOptions.household`; the host's `judge` reads `store.availability`), and every call of its
   store fails `unavailable`. A newer core schema stops serve mode.

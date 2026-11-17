@@ -15,7 +15,7 @@ the same transaction; the log feeds the event bus (`ctx.events`), undo and voice
 
 **Every call is synchronous SQLite on the main thread**, which also frames the browsers' audio. So the store bounds
 every read a turn can make by construction, not by a timeout: a `list` is one index range read of at most `limit`
-rows (a shape no index answers is refused), a `get` is one row, a `search` reads the newest matches of one scope.
+rows (a shape no index answers is refused), a `get` is one row.
 Backups, exports and pruning run beside turns without holding the event loop ("Latency" has the numbers). Never wait
 on the network inside a transaction: it holds the database's one connection, and every other call waits for it.
 
@@ -33,7 +33,6 @@ export const timers = defineCollection({
   version: 2,                     // raise it when the shape changes (every row is migrated at start) ...
   migrate: { 1: (v1) => ({ ...v1, state: "running" }) },  // ... and say how version n becomes n + 1
   indexes: ["state"],             // fields `list` may filter or order on (one index each; scalar values only)
-  search: [],                     // string fields whose words `search` looks for
   history: "full",                // "none" for content a person may ask to forget (no payloads kept, no undo)
   ambient: (rows: ReadonlyArray<Row<typeof Timer.Type>>, { now }) => [`Timers: ${rows.map(…).join(", ")}.`],
   project: (row, device) => ({ label: row.value.label, dueAt: row.value.dueAt })  // what voice pages may see
@@ -57,7 +56,6 @@ const t = ctx.store.collection(timers)
 const row = yield* t.insert({ dueAt: Date.now() + 600_000, state: "running" })     // Row<A>: id, rev, scope, value, createdAt, updatedAt, updatedBy
 yield* t.get(row.id)                                                               // Row | undefined
 yield* t.list({ where: { state: "running" }, limit: 20 })                          // one index, see below
-yield* t.search("pasta")                                                           // words that begin words of the `search` fields
 yield* t.update(row.id, (v) => ({ ...v, dueAt: v.dueAt + 300_000 }))              // read, apply, write: one step
 yield* t.remove(row.id)
 yield* t.erase(row.id)                                                             // and every payload of it
@@ -80,10 +78,7 @@ yield* ctx.store.transaction(Effect.gen(function*() { … }))                   
 - **Indexed fields hold scalars**: strings, finite numbers, `true` / `false`, `null` or nothing; a write with a list or
   an object in one is `invalid`. Both stores order them the same way: missing and `null` first, then numbers
   (`false` = 0, `true` = 1), then strings by code point; a filter `true` also matches `1`.
-- **Search.** `search(text)` finds the rows of the scope in which every word of `text` (at most 8) **begins** a word of
-  the `search` fields, without case or accents: "milk" finds "Milk" and "milkshake", not "buttermilk"; "creme" finds
-  "Crème". Words are runs of letters and digits (`searchTokens`). The most recently written rows come first; default
-  20 results, at most 200. The in-memory store gives exactly the same answers.
+- **No full-text search.** To find text, `list` a bounded set (newest first, or by an index) and match in your code.
 - **Updates** read, apply your function and write as one step (nothing can come between them), so concurrent updates
   all land. `f` runs inside the store's transaction: keep it a plain function of the value. `expectRev` makes a row at
   another rev a `StoreConflict` (an edit a person made on a screen from an older read). Changes to amounts are still
@@ -127,7 +122,7 @@ each collection (`pva_versions`).
 
 - **Older data**: when a collection's version rose, **every row is migrated at start**, before the module runs:
   decoded at its stored version, migrated, and stored through the same checks as a write (the schema, the
-  64,000-character limit, scalar indexed fields), with its search words and its indexes. All of it in one transaction per module, after a backup of the file
+  64,000-character limit, scalar indexed fields), with its indexes. All of it in one transaction per module, after a backup of the file
   (`data/backups/household-<date>-before-<module>.db`), also when only a collection changed. A failure (one row is
   enough) rolls back: the file is as it was, the module is `unavailable` with the reason, the backup stays. A
   collection's indexes always match its declaration (an index the module no longer declares is dropped).
@@ -149,8 +144,8 @@ after. Changes older than 90 days are removed by the daily maintenance (100 per 
 
 When `erase(id)` returns `true` it has committed that:
 
-- the row is gone, its search words are gone, and every change of it **in its scope** has lost its values (the log
-  keeps that a change happened and by whom, without content); nothing of it can be read, searched, undone or sent to a
+- the row is gone, and every change of it **in its scope** has lost its values (the log
+  keeps that a change happened and by whom, without content); nothing of it can be read, undone or sent to a
   page, and the bus event of the erase carries no content;
 - `secure_delete` has overwritten the freed space of the pages it changed.
 
@@ -276,15 +271,14 @@ the store manages (if the server ran meanwhile).
 
 ## Latency
 
-`packages/store-sqlite/test/latency.test.ts` on 100,000 rows of about 1 KB (one collection with two indexes and
-search words, and 100,000 change-log rows), on the development machine (shared with other agents), the worst of 30
+`packages/store-sqlite/test/latency.test.ts` on 100,000 rows of about 1 KB (one collection with two indexes,
+and 100,000 change-log rows), on the development machine (shared with other agents), the worst of 30
 calls each:
 
 | Call | Worst |
 |---|---|
 | `list` newest 20 (the ambient read) / oldest 20 / `where` on one index / ordered by an index | 2.3 / 0.8 / 1.5 / 1.6 ms |
 | `get` | 0.4 ms |
-| `search` a common word / a rare word / a two-letter prefix | 4.3 / 1.0 / 2.4 ms |
 
 The longest stop of the event loop (a 1 ms timer) while the work ran, with a turn's read every 2 ms beside it:
 
@@ -302,7 +296,7 @@ check read a whole collection or file; neither is on a turn's path.
 
 `@pva/core/testing` has `makeMemoryHouseholdStore()` and `makeRecordingEventBus()`; `makeTestHousehold([module])`
 prepares a store for the module and returns `household` for `makeModuleHost({ household })`. The in-memory store runs
-the same collection code and the same transaction model as the SQLite store and answers lists and searches the same
+the same collection code and the same transaction model as the SQLite store and answers lists the same
 way (scalar indexes in one order, the same words), so a module tested on it is not surprised by the real store; both
 pass the same contract (`@pva/core/store-contract`: scopes, rev, the change log, undo, erase, transactions with
 savepoints, interruption and escaped fibers, events in order, migrations, pages). Its `onRollback(undo)` lets an
