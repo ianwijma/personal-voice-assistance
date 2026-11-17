@@ -24,6 +24,7 @@ import {
   DEFAULT_MAX_VOICE_SESSIONS,
   DEFAULT_SESSION_DISCARD_MINUTES,
   type DeviceSettings,
+  type DeviceVoice,
   deviceTypeOf,
   effectiveDeviceSettings,
   type EngineInfo,
@@ -34,6 +35,7 @@ import {
   type VoiceInfo,
   type ServerMessage,
   type TraceConfig,
+  voiceFor,
   WEB_VOICE_KIND
 } from "@pva/protocol"
 import { Cause, Config, ConfigProvider, Effect, Exit, Fiber, FiberSet, Option, type Scope, Stream } from "effect"
@@ -89,7 +91,7 @@ import {
   type TtsSpec,
   ttsSpecOf
 } from "./Resources.ts"
-import { ttsProviderInfo } from "../providers.ts"
+import { isTtsProvider, ttsProviderInfo } from "../providers.ts"
 import { DEFAULT_ASSISTANT_VOICE, voiceEngineName, voiceLabel } from "../voiceSelection.ts"
 import { type EnvMover, makeEnvMover } from "./envSettings.ts"
 import { type HttpError, type HttpServer, startHttp, webDirExists } from "./http.ts"
@@ -514,6 +516,14 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     const placeOf = (deviceId: string | undefined): string =>
       deviceId !== undefined && store.settings().devices[deviceId] !== undefined ? `device:${deviceId}` : `type:${WEB_VOICE_KIND}`
     /**
+     * Who the pool binds a voice to: the assistant itself while it speaks with its own voice, else the assistant at
+     * the place whose device voice it speaks with (docs/LOOKS-AND-VOICES.md §3). The binding is stable while the
+     * place's voice changes, so a change applies at the next turn start and releases the old instance when unused,
+     * as a change of the assistant's voice does.
+     */
+    const voiceUserOf = (assistantId: string, place: string, voice: DeviceVoice): string =>
+      voice.from === "device" ? `${assistantId}@${place}` : assistantId
+    /**
      * Every hearing place (§3.2 "Wanted", stt: the hearer of every type defaults entry and of every known device) with
      * its effective settings. `override` replaces one place's settings (a save being checked); a type's new defaults
      * also apply to the devices of that type that inherit them.
@@ -579,7 +589,14 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
         const spec = llmSpecOf(assistant.llm, accounts)
         llms.set(assistant.id, spec)
         rememberLlmSpec(spec)
-        voices.set(assistant.id, ttsSpecOf(assistant.voice, voiceAccounts))
+      }
+      // A voice per place that lists the assistant: the device's own voice there (`voice` section), else the assistant's.
+      for (const [place, settings] of placesNow()) {
+        for (const listing of settings.assistants) {
+          const assistant = assistantsNow().get(listing.assistant)
+          if (assistant === undefined || !assistant.on) continue
+          voices.set(voiceUserOf(assistant.id, place, settings.voice), ttsSpecOf(voiceFor(settings.voice, assistant), voiceAccounts))
+        }
       }
       return { llms, voices, recognisers: recognisersOf(placesNow(), assistantsNow()) }
     }
@@ -689,7 +706,8 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
      * a binding on the Claude subscription: the options its agent is passed, from the assistant's own fields), the
      * voice it is bound to, the modules and tools it has, and its reply-early and tool-round settings.
      */
-    const traceConfigOf = (assistant: Assistant, tools: number, modules: number): AssistantTraceConfig => {
+    const traceConfigOf = (assistant: Assistant, tools: number, modules: number, deviceId: string | undefined): AssistantTraceConfig => {
+      const deviceVoice = deviceSettingsOf(deviceId).voice
       const key = resources.keyFor(assistant.id)
       // The account of the binding in use, as `agentSetup` reads it (during a change the old binding answers, the old
       // way), not the saved one. Not bound yet: the saved account.
@@ -702,7 +720,8 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
           // No token limit is passed to Claude Code (`ClaudeConversationOptions` has none): the stand-in's, as `llmSpecOf` keeps it.
           ? { account: SUBSCRIPTION_PROVIDER, model: passed.model, effort: assistant.llm.effort, thinking: assistant.llm.thinking, maxTokens: 1024 }
           : { account: spec.account, model: spec.model, effort: spec.effort, thinking: spec.thinking, maxTokens: spec.maxTokens },
-        voice: resources.ttsKeyFor(assistant.id) ?? voiceKey(assistant.voice),
+        voice: resources.ttsKeyFor(voiceUserOf(assistant.id, placeOf(deviceId), deviceVoice)) ?? voiceKey(voiceFor(deviceVoice, assistant)),
+        voiceFrom: deviceVoice.from,
         modules,
         tools: passed !== undefined && !passed.tools ? 0 : tools,
         replyEarly: assistant.replyEarly,
@@ -716,7 +735,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
      * read here at the turn's start: a changed model applies from the next turn, once its instance is ready). Rebuilt
      * only when the module snapshot, the assistant or its instance changed (reference compares per turn).
      */
-    const conversationSetup = (assistantId: string) => {
+    const conversationSetup = (assistantId: string, deviceId: string | undefined) => {
       let cached:
         | {
           snapshot: ModuleSnapshot
@@ -724,6 +743,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
           home: string | undefined
           llm: Llm["Service"] | undefined
           tts: Tts["Service"] | undefined
+          voiceUser: string
           setup: TurnSetup
           instructions: ReadonlyArray<string>
           /** The turn's configuration snapshot (`TraceConfig` without the hearing, which is the device's). */
@@ -740,11 +760,13 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
         return resources.llmFor(assistantId)
       }
       /** Likewise the assistant's voice: the pool's instance for its `voice`, read at the turn's start. */
+      const voiceUserNow = (): string => voiceUserOf(assistantId, placeOf(deviceId), deviceSettingsOf(deviceId).voice)
       const ttsNow = () => {
-        const bound = resources.ttsFor(assistantId)
+        const user = voiceUserNow()
+        const bound = resources.ttsFor(user)
         if (bound !== undefined) return bound
         runSync(Effect.asVoid(Effect.forkDetach(syncResources(), { startImmediately: true })))
-        return resources.ttsFor(assistantId)
+        return resources.ttsFor(user)
       }
       const current = () => {
         const snapshot = host.snapshot()
@@ -752,19 +774,24 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
         const home = homeLine()
         const llm = llmNow()
         const tts = ttsNow()
-        if (cached?.snapshot !== snapshot || cached.assistant !== assistant || cached.home !== home || cached.llm !== llm || cached.tts !== tts) {
+        const voiceUser = voiceUserNow()
+        if (
+          cached?.snapshot !== snapshot || cached.assistant !== assistant || cached.home !== home || cached.llm !== llm || cached.tts !== tts ||
+          cached.voiceUser !== voiceUser
+        ) {
           // An assistant that does not exist (any more) is never routed; should a turn still start, it gets no tools.
           const mine = assistant === undefined ? { registry: makeToolRegistry([]), instructions: [], modules: 0 } : modulesFor(snapshot, assistant)
           const base = assistant?.prompt ?? defaultSystemPrompt
           const instructions = home === undefined ? mine.instructions : [home, ...mine.instructions]
           // `TurnSetup.ttsReady`: completes once this `tts` (the instance bound now, not a later one) is built.
-          const ttsReady = resources.ttsReady(assistantId)
+          const ttsReady = resources.ttsReady(voiceUser)
           cached = {
             snapshot,
             assistant,
             home,
             llm,
             tts,
+            voiceUser,
             setup: {
               system: systemFor(base, instructions),
               registry: mine.registry,
@@ -775,7 +802,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
               ...(assistant !== undefined ? { maxToolRounds: assistant.toolRounds } : {})
             },
             instructions,
-            config: assistant === undefined ? undefined : traceConfigOf(assistant, mine.registry.specs.length, mine.modules)
+            config: assistant === undefined ? undefined : traceConfigOf(assistant, mine.registry.specs.length, mine.modules, deviceId)
           }
         }
         return cached
@@ -791,7 +818,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       const config = (): AssistantTraceConfig | undefined => {
         const c = cached
         if (c !== undefined && c.snapshot === host.snapshot() && c.assistant === assistantsNow().get(assistantId) &&
-          c.llm === resources.llmFor(assistantId) && c.tts === resources.ttsFor(assistantId)) return c.config
+          c.llm === resources.llmFor(assistantId) && c.voiceUser === voiceUserNow() && c.tts === resources.ttsFor(c.voiceUser)) return c.config
         return current().config
       }
       // WP-13a: a Claude subscription assistant's options for its conversations (the same object while unchanged).
@@ -985,6 +1012,24 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       return `This loads ${added.size === 1 ? "another speech model" : `${added.size} more speech models`}: about ${mb} MB more memory and ${loadS.toFixed(1)} s to load, ` +
         `more than 75 % of the ${freeMb} MB free on this machine.`
     }
+    /**
+     * A voice a device would speak with that cannot be used (docs/LOOKS-AND-VOICES.md §3): a voice on this machine that
+     * is not downloaded (or does not exist) is an error; a hosted provider without a key a warning ("Save anyway").
+     */
+    const voiceProblem = (ref: VoiceRef): { readonly level: "error" | "warning"; readonly message: string } | undefined => {
+      if (!isTtsProvider(ref.provider)) return { level: "error", message: `There is no voice provider "${ref.provider}"` }
+      const info = ttsProviderInfo[ref.provider]
+      if (info.location === "local") {
+        const preset = Object.hasOwn(SherpaTts.presets, ref.voiceId) ? SherpaTts.presets[ref.voiceId] : undefined
+        if (preset === undefined) return { level: "error", message: `There is no voice "${ref.voiceId}" on this machine` }
+        if (SherpaTts.isInstalled(preset.name, sections.modelDirs().tts)) return undefined
+        return { level: "error", message: `${preset.voice.name} is not downloaded yet: download it first (${preset.sizeMb} MB)` }
+      }
+      if (info.keyEnv !== undefined && !settingNow(info.keyEnv)) {
+        return { level: "warning", message: `${info.label} has no API key yet, so this voice cannot speak.` }
+      }
+      return undefined
+    }
     /** While the vault is locked, a key that "is not set" is really locked away. */
     const explainProblems = (problems: ReadonlyArray<{ readonly stage: string; readonly message: string }>) => {
       if (keys.state() !== "locked") return problems
@@ -1086,7 +1131,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
           ...(options.hearerSwitchWaitMs !== undefined ? { hearerSwitchWaitMs: options.hearerSwitchWaitMs } : {}),
           assistants: assistantsNow,
           conversationSetup,
-          voiceOf: resources.ttsKeyFor,
+          voiceOf: (assistant, deviceId) => resources.ttsKeyFor(voiceUserOf(assistant, placeOf(deviceId), deviceSettingsOf(deviceId).voice)),
           moduleOfTool: (name) => host.snapshot().toolModules.get(name) ?? null,
           routing: () => routing,
           turnTrace,
@@ -1137,6 +1182,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       hearingProblems,
       llmProblems,
       speechMemoryWarning,
+      voiceProblem,
       // TypeSafe is set up: the routing section is switched on, with a key and a valid address (WP-14).
       canAuto: routing.ready
     })

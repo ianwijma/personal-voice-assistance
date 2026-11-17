@@ -66,4 +66,25 @@ DeviceSettings += { look: DeviceLook, voice: DeviceVoice }   // two new section 
 
 ## 5. What was built
 
-(Filled in as it lands.)
+### Server (apps/assistant)
+
+- **Old files.** A stored device-type entry is a complete `DeviceSettings`, so one written before `look` and `voice`
+  existed would have failed to decode and been dropped; `SettingsStore` now fills the two keys from the type's built-in
+  before decoding (`withNewKeys`). Device `own` and assistants have them optional and load unchanged.
+- **Saves.** `assistant.create`/`save` carry `look` as any field (absent stays absent). `device.save` takes `look` and
+  `voice` for a type and a device (`null` resets a device). A device voice of its own is checked by `voiceProblem`
+  (serve mode): a local voice that is not downloaded (or unknown) is refused, a hosted provider without a key is a
+  warning that `saveAnyway` overrides. (There is no such check on an assistant's own voice yet; ASSISTANTS.md §2.2 names one.)
+- **Run time.** The resource pool binds voices per *user*: the assistant itself while it speaks with its own voice, else
+  `assistant@place` for each place (a device, or the type's defaults) whose `voice` section is `{ from: "device" }`. A
+  turn reads the binding at its start (`conversationSetup(assistant, deviceId)`, `voiceOf`), so a change applies at the
+  next turn and the old instance goes after the grace period; typed turns and `speakTyped` use the same setup. Places
+  with the same voice share one `Tts` (the pool keys instances by voice).
+- **Trace.** `TraceInfo.config.voice` is the key of the voice the turn used; the new optional `config.voiceFrom` says
+  `"device"` or `"assistant"` (protocol, additive).
+- **Pushes.** `device.setup` is compared as a whole before sending, so a change of an assistant's look, the type's or
+  the device's own look sends it again, and a change the device does not show (an assistant's look hidden by the
+  device's own) sends nothing. The admin lists carry both keys through the schema.
+- **Not covered.** The voice catalogue's `usedBy` still lists assistants only, not devices that use a voice as theirs.
+- **Latency.** Not measured: the change only picks a different pool key at the start of a turn.
+- Tests: `apps/assistant/test/serveLooksAndVoices.test.ts`.

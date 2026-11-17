@@ -361,7 +361,7 @@ export const exampleDeviceType: DeviceTypeInfo = {
   one: "browser",
   many: "browsers",
   description: "The voice page on a phone, tablet or computer.",
-  keys: ["assistants", "withoutPhrase", "matching", "voicePage", "interruptMode", "audio", "captions"],
+  keys: ["assistants", "withoutPhrase", "matching", "voicePage", "interruptMode", "audio", "captions", "look", "voice"],
   settings: exampleDeviceSettings,
   rev: 2
 }

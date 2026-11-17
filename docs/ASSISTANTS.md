@@ -142,6 +142,7 @@ Assistant = Struct({
   llm: AssistantLlm,
   hearing: AssistantHearing,
   voice: VoiceRefSchema,                // voice-provider protocol/voices.ts:27
+  look: optionalKey(Look),              // the stage's character while it answers (docs/LOOKS-AND-VOICES.md); absent = the baseline
   modules: Record(ModuleId, ModuleChoice)   // a module missing here is off
 })
 ```
@@ -179,7 +180,9 @@ DeviceSettings = Struct({
   audio: Struct({ echoCancellation: Boolean, noiseSuppression: Boolean, autoGainControl: Boolean,
                   speakAloud: Boolean,          // new: off = replies shown, never spoken
                   outputPath: OutputPath, prebufferMs: PrebufferMs }),   // the last two web-voice only (advanced)
-  captions: Struct({ captions: Boolean, speakTyped: Boolean })          // web-voice only; speakTyped was `speakReplies`
+  captions: Struct({ captions: Boolean, speakTyped: Boolean }),         // web-voice only; speakTyped was `speakReplies`
+  look: DeviceLook,                             // { from: "assistant" } | { from: "device", look }: the stage's character for every assistant, or each one's (LOOKS-AND-VOICES.md)
+  voice: DeviceVoice                            // { from: "assistant" } | { from: "device", voice }: the voice of every assistant on the device, or each one's own
 })
 DeviceOwn = Partial(DeviceSettings)             // each key present = own value; absent = follows the type defaults
 
@@ -242,6 +245,12 @@ in `data/voice-favourites.json`. Conversations stay in memory, as today.
 3. else `DeviceType.builtIn[key]`.
 
 Keys that do not apply to the kind (`voicePage`, `captions`, browser audio fields on a node) are ignored.
+
+**Voice and look of assistant A on device D** (docs/LOOKS-AND-VOICES.md §3): the voice is `voiceFor(D.voice, A)` (the device's own,
+else A's), the look `lookFor(D.look, A)` (the device's own, else A's, else the baseline), D's sections resolved as above.
+The voice applies at the next turn start, as a change of A's voice does; the pool binds A at D's place to the device voice
+(users `assistant@place`), and releases the old instance when unused. A device voice is checked on `device.save` like a
+voice: a local voice that is not downloaded is refused, a hosted one without a key asks "Save anyway".
 
 **Answering a sentence on a device** (the route; §3.4 runs it):
 
@@ -635,7 +644,10 @@ DeviceSetup = { type: "device.setup", deviceId?,
   withoutPhrase: { mode: "nobody" } | { mode: "assistant", assistant } | { mode: "typesafe", fallback: AssistantId | null },
   canPick: boolean,                     // voicePage.pick, and more than one assistant
   canAuto: boolean,                     // TypeSafe is set up (shows "Whichever fits" in the menu)
-  interruptMode, audio: DeviceSettings["audio"], captions: DeviceSettings["captions"] }
+  interruptMode, audio: DeviceSettings["audio"], captions: DeviceSettings["captions"],
+  look?: Look }                         // the device's own look, when it has one (shown when no assistant is listed)
+// assistants[].look?: Look  = lookFor(device look, assistant): the device's own, else the assistant's; absent = the baseline.
+// Sent again (the usual change-only push) when a look that applies to the device changes.
 // changed
 TurnStart       += { assistantId }      // also assistant.text, reply.start: assistantId
 Conversation    += { assistantId }      // conversation { id, reason, startedAt, assistantId }
@@ -686,7 +698,7 @@ TraceInfo   += {
         | { by: "typesafe", outcome: "chosen" | "none-fits" | "timeout" | "error", probability?: number, fits?: number, ms: number, fallback: boolean },
   marks.routeSent?, marks.routeReceived?,
   config?: { llm: { account, model, effort, thinking, maxTokens }, hearing: { hearer: AssistantId, engine, model?, language?, eagerSilenceMs?, finalSilenceMs?, eotThreshold? },
-             voice: VoiceKey, modules: number, tools: number, replyEarly: boolean, toolRounds: number } }
+             voice: VoiceKey, voiceFrom?: "assistant" | "device", modules: number, tools: number, replyEarly: boolean, toolRounds: number } }
 AdminSnapshot: + assistants, deviceTypes; − frontends
 ```
 

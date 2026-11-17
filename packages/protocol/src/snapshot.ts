@@ -223,6 +223,8 @@ export const TraceConfig = Schema.Struct({
   }),
   /** `VoiceKey` of the voice. */
   voice: Schema.String,
+  /** Whose voice it is (docs/LOOKS-AND-VOICES.md): the device's own for every assistant, or the assistant's. Absent in older traces. */
+  voiceFrom: Schema.optionalKey(Schema.Literals(["assistant", "device"])),
   modules: NonNegativeInt,
   tools: NonNegativeInt,
   replyEarly: Schema.Boolean,
