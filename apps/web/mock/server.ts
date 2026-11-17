@@ -2134,7 +2134,7 @@ const providerVoices = (p: (typeof MOCK_PROVIDERS)[number]): ProviderVoices => {
       tags: [...v.tags],
       ...(local !== undefined ? { local } : {}),
       previewable: info.status === "ready" && (local === undefined || local.state === "installed"),
-      selected: key === selected,
+      usedBy: key === selected ? ["jeff"] : [],
       favourite: favourites.some((f) => f.key === key)
     }
   })

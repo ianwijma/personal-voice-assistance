@@ -1,6 +1,5 @@
 import {
   type PreviewAudio,
-  sameVoice,
   type Tts,
   type TtsError,
   type TtsVoices,
@@ -8,6 +7,7 @@ import {
   type VoiceDescription,
   type VoiceList,
   type VoiceRef,
+  parseVoiceKey,
   voiceKey
 } from "@pva/core"
 import type { JobInfo, ProviderInfo, ProviderVoices, VoiceEntry } from "@pva/protocol"
@@ -53,12 +53,12 @@ export interface VoiceCatalogOptions {
   readonly vaultLocked: () => boolean
   /** Where local voice models are. */
   readonly modelDir: () => string
-  /** The voice the running engines speak with, and its `Tts` (undefined while they are not running). */
-  readonly live: () => { readonly voice: VoiceRef; readonly tts: Tts["Service"] } | undefined
+  /** The running `Tts` of a voice an assistant speaks with (the resource pool's; `undefined`: none is running). */
+  readonly live: (voice: VoiceRef) => Tts["Service"] | undefined
   /** A device is in a turn (hearing, thinking or speaking): local previews wait. */
   readonly busy: () => boolean
-  /** The assistant's voice as saved now. */
-  readonly selected: Effect.Effect<VoiceRef>
+  /** The assistants that speak with each voice now (docs/ASSISTANTS.md §5.5): voice key → assistant ids. */
+  readonly usedBy: () => ReadonlyMap<string, ReadonlyArray<string>>
   readonly isFavourite: (ref: VoiceRef) => boolean
   /** The running download of a local voice. */
   readonly download: (preset: string) => JobInfo | undefined
@@ -197,7 +197,7 @@ export const makeVoiceCatalog = (options: VoiceCatalogOptions): Effect.Effect<Vo
         return entry
       }))
 
-    const info = (provider: TtsProviderName, selected: VoiceRef, extra: Partial<ProviderInfo>): ProviderInfo => {
+    const info = (provider: TtsProviderName, used: ReadonlyMap<string, ReadonlyArray<string>>, extra: Partial<ProviderInfo>): ProviderInfo => {
       const p = ttsProviderInfo[provider]
       return {
         id: provider,
@@ -207,14 +207,14 @@ export const makeVoiceCatalog = (options: VoiceCatalogOptions): Effect.Effect<Vo
         ...(p.keyEnv !== undefined ? { keyField: p.keyEnv } : {}),
         settingsPath: SETTINGS_PATH,
         ...(p.implication !== undefined ? { implication: p.implication } : {}),
-        inUse: selected.provider === provider,
+        inUse: [...used.keys()].some((key) => parseVoiceKey(key)?.provider === provider),
         ...extra
       }
     }
 
     // ---- Entries
 
-    const entry = (provider: string, v: VoiceDescription, selected: VoiceRef): VoiceEntry => {
+    const entry = (provider: string, v: VoiceDescription, used: ReadonlyMap<string, ReadonlyArray<string>>): VoiceEntry => {
       const ref = { provider, voiceId: v.id }
       const job = v.local !== undefined ? options.download(v.id) : undefined
       const local = v.local === undefined ? undefined : {
@@ -233,20 +233,20 @@ export const makeVoiceCatalog = (options: VoiceCatalogOptions): Effect.Effect<Vo
         tags: [...v.tags],
         ...(local !== undefined ? { local } : {}),
         previewable: local === undefined || local.state === "installed",
-        selected: sameVoice(ref, selected),
+        usedBy: [...(used.get(voiceKey(ref)) ?? [])],
         favourite: options.isFavourite(ref)
       }
     }
 
     const localVoices = () => SherpaTts.listVoices(options.modelDir())
 
-    const providerVoices = (provider: TtsProviderName, selected: VoiceRef, mode: "if-stale" | "refresh"): Effect.Effect<ProviderVoices> =>
+    const providerVoices = (provider: TtsProviderName, used: ReadonlyMap<string, ReadonlyArray<string>>, mode: "if-stale" | "refresh"): Effect.Effect<ProviderVoices> =>
       Effect.gen(function*() {
         if (ttsProviderInfo[provider].location === "local") {
           const voices = localVoices()
           return {
-            provider: info(provider, selected, { voiceCount: voices.length }),
-            voices: voices.map((v) => entry(provider, v, selected)),
+            provider: info(provider, used, { voiceCount: voices.length }),
+            voices: voices.map((v) => entry(provider, v, used)),
             stale: false,
             truncated: false
           }
@@ -254,24 +254,24 @@ export const makeVoiceCatalog = (options: VoiceCatalogOptions): Effect.Effect<Vo
         const state = yield* hostedState(provider)
         if (state.status === "needs_key") {
           return {
-            provider: info(provider, selected, { status: "needs_key", reason: state.reason, message: state.message }),
+            provider: info(provider, used, { status: "needs_key", reason: state.reason, message: state.message }),
             voices: [],
             stale: false,
             truncated: false
           }
         }
         if (state.status === "error") {
-          return { provider: info(provider, selected, { status: "error", message: state.message }), voices: [], stale: false, truncated: false }
+          return { provider: info(provider, used, { status: "error", message: state.message }), voices: [], stale: false, truncated: false }
         }
         const cached = yield* hostedList(provider, state, mode)
         const voices = cached.list?.voices ?? []
         const failed = cached.error !== undefined
         return {
-          provider: info(provider, selected, {
+          provider: info(provider, used, {
             ...(failed ? { status: "error" as const, message: cached.error!.message } : {}),
             ...(cached.list !== undefined ? { voiceCount: voices.length } : {})
           }),
-          voices: voices.map((v) => entry(provider, v, selected)).map((e) => (failed ? { ...e, previewable: false } : e)),
+          voices: voices.map((v) => entry(provider, v, used)).map((e) => (failed ? { ...e, previewable: false } : e)),
           ...(cached.fetchedAt !== undefined ? { fetchedAt: cached.fetchedAt } : {}),
           stale: cached.fetchedAt !== undefined && (failed || now() - cached.fetchedAt >= LIST_MAX_AGE_MS),
           truncated: cached.list?.truncated ?? false,
@@ -280,15 +280,15 @@ export const makeVoiceCatalog = (options: VoiceCatalogOptions): Effect.Effect<Vo
       })
 
     const providers: Effect.Effect<ReadonlyArray<ProviderInfo>> = Effect.gen(function*() {
-      const selected = yield* options.selected
+      const used = options.usedBy()
       return yield* Effect.forEach(ttsProviderNames, (provider) =>
         Effect.gen(function*() {
-          if (ttsProviderInfo[provider].location === "local") return info(provider, selected, { voiceCount: localVoices().length })
+          if (ttsProviderInfo[provider].location === "local") return info(provider, used, { voiceCount: localVoices().length })
           const state = yield* hostedState(provider)
-          if (state.status === "needs_key") return info(provider, selected, { status: "needs_key", reason: state.reason, message: state.message })
-          if (state.status === "error") return info(provider, selected, { status: "error", message: state.message })
+          if (state.status === "needs_key") return info(provider, used, { status: "needs_key", reason: state.reason, message: state.message })
+          if (state.status === "error") return info(provider, used, { status: "error", message: state.message })
           const cached = yield* hostedList(provider, state, "if-none")
-          return info(provider, selected, {
+          return info(provider, used, {
             ...(cached.error !== undefined ? { status: "error" as const, message: cached.error.message } : {}),
             ...(cached.list !== undefined ? { voiceCount: cached.list.voices.length } : {})
           })
@@ -298,9 +298,9 @@ export const makeVoiceCatalog = (options: VoiceCatalogOptions): Effect.Effect<Vo
     const voices = (provider: string | undefined, refresh: boolean) =>
       Effect.gen(function*() {
         if (provider !== undefined && !isProvider(provider)) return yield* failure(404, "unknown_provider", `There is no voice provider "${provider}"`)
-        const selected = yield* options.selected
+        const used = options.usedBy()
         const which = provider === undefined ? ttsProviderNames : [provider as TtsProviderName]
-        return yield* Effect.forEach(which, (p) => providerVoices(p, selected, refresh ? "refresh" : "if-stale"), { concurrency: "unbounded" })
+        return yield* Effect.forEach(which, (p) => providerVoices(p, used, refresh ? "refresh" : "if-stale"), { concurrency: "unbounded" })
       })
 
     const nameOf = (ref: VoiceRef): string | undefined => {
@@ -383,8 +383,8 @@ export const makeVoiceCatalog = (options: VoiceCatalogOptions): Effect.Effect<Vo
 
     const engineFor = (preset: string, dir: string): Effect.Effect<Tts["Service"], VoiceCatalogError, Scope.Scope> =>
       Effect.gen(function*() {
-        const live = options.live()
-        if (live !== undefined && live.voice.provider === "sherpa" && live.voice.voiceId === preset) return live.tts
+        const live = options.live({ provider: "sherpa", voiceId: preset })
+        if (live !== undefined) return live
         let tts = kept !== undefined && kept.dir === dir ? kept.engine.forPreset(preset) : undefined
         if (kept !== undefined && tts === undefined) yield* closeKept
         if (kept === undefined) {

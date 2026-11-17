@@ -9,8 +9,13 @@ import {
   type ModuleDefinition,
   type ModuleHost,
   type ModuleSnapshot,
+  parseVoiceKey,
+  Tts,
+  TtsError,
   type TurnSetup,
-  type TurnTrace
+  type TurnTrace,
+  type VoiceRef,
+  voiceKey
 } from "@pva/core"
 import {
   applicableOwn,
@@ -23,6 +28,7 @@ import {
   effectiveDeviceSettings,
   type EngineInfo,
   engineSummary,
+  type VoiceInfo,
   type ServerMessage,
   WEB_VOICE_DEVICE_TYPE,
   WEB_VOICE_KIND
@@ -49,14 +55,21 @@ import {
 } from "./Engine.ts"
 import {
   defaultLlmBuilder,
+  defaultTtsBuilder,
   type LlmAccounts,
   type LlmBuilder,
   type LlmSpec,
   llmSpecOf,
   makeResourcePool,
   type ReconcileOptions,
-  type ResourcePool
+  type ResourcePool,
+  type TtsAccounts,
+  type TtsBuilder,
+  type TtsSpec,
+  ttsSpecOf
 } from "./Resources.ts"
+import { ttsProviderInfo } from "../providers.ts"
+import { DEFAULT_ASSISTANT_VOICE, voiceEngineName, voiceLabel } from "../voiceSelection.ts"
 import { type EnvMover, makeEnvMover } from "./envSettings.ts"
 import { type HttpError, type HttpServer, startHttp, webDirExists } from "./http.ts"
 import { makeFrontends } from "./frontends.ts"
@@ -135,7 +148,12 @@ export interface ServeOptions {
    * that build's `llm`.
    */
   readonly buildLlm?: LlmBuilder
-  /** Tests: how long an unused language-model instance is kept (default `RESOURCE_GRACE_MS`, 10 s). */
+  /**
+   * Builds the resource pool's voice instances (tests inject fakes). Default: the providers' adapters
+   * (`defaultTtsBuilder`); with an injected `build` and no `buildTts`, instances that speak with that build's `tts`.
+   */
+  readonly buildTts?: TtsBuilder
+  /** Tests: how long an unused language-model or voice instance is kept (default `RESOURCE_GRACE_MS`, 10 s). */
   readonly resourceGraceMs?: number
   /**
    * The environment with where each variable came from (`envView.ts`). Default: the process environment and the
@@ -361,11 +379,21 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
         }
       }
     }
+    /** The shared voice-provider settings an instance depends on: a new key makes new instances. */
+    const ttsAccounts = (): TtsAccounts => {
+      const credentials: Record<string, string> = {}
+      for (const [provider, info] of Object.entries(ttsProviderInfo)) {
+        if (info.keyEnv === undefined) continue
+        const key = settingNow(info.keyEnv)
+        credentials[provider] = key === undefined ? "" : createHash("sha256").update(key).digest("hex").slice(0, 16)
+      }
+      return { credentials }
+    }
     /**
-     * What the pool must hold (§3.2 "Wanted"): the language model of every switched-on assistant that is on at least
-     * one effective list (a type defaults entry counts, and every known device's own list).
+     * What the pool must hold (§3.2 "Wanted"): the language model and the voice of every switched-on assistant that
+     * is on at least one effective list (a type defaults entry counts, and every known device's own list).
      */
-    const wantedLlms = (): Map<string, LlmSpec> => {
+    const wantedResources = (): { readonly llms: Map<string, LlmSpec>; readonly voices: Map<string, TtsSpec> } => {
       const file = store.settings()
       const listed = new Set<string>()
       for (const kind of new Set([WEB_VOICE_KIND, ...Object.keys(file.deviceTypes)])) {
@@ -375,11 +403,15 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       }
       for (const id of Object.keys(file.devices)) for (const a of deviceSettingsOf(id).assistants) listed.add(a.assistant)
       const accounts = llmAccounts()
-      const wanted = new Map<string, LlmSpec>()
+      const voiceAccounts = ttsAccounts()
+      const llms = new Map<string, LlmSpec>()
+      const voices = new Map<string, TtsSpec>()
       for (const assistant of assistantsNow().values()) {
-        if (assistant.on && listed.has(assistant.id)) wanted.set(assistant.id, llmSpecOf(assistant.llm, accounts))
+        if (!assistant.on || !listed.has(assistant.id)) continue
+        llms.set(assistant.id, llmSpecOf(assistant.llm, accounts))
+        voices.set(assistant.id, ttsSpecOf(assistant.voice, voiceAccounts))
       }
-      return wanted
+      return { llms, voices }
     }
     const explainProblem = (message: string): string => explainProblems([{ stage: "", message }])[0]!.message
     // Tests that inject the shared build answer with its `llm`, through the pool (one instance per configuration still).
@@ -391,9 +423,22 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
             return llm === undefined ? Stream.fail(new LlmError({ message: "The engines are not running." })) : llm.stream(request)
           })
       }))
+    // Likewise for voices: one instance per distinct voice, speaking with the build's `tts`.
+    const engineTtsBuilder: TtsBuilder = () =>
+      Effect.succeed({
+        get sampleRate() {
+          return engine?.built()?.providers.tts?.sampleRate ?? 22_050
+        },
+        synthesize: (clauses) =>
+          Stream.suspend(() => {
+            const tts = engine?.built()?.providers.tts
+            return tts === undefined ? Stream.fail(new TtsError({ message: "The engines are not running." })) : tts.synthesize(clauses)
+          })
+      } satisfies Tts["Service"])
     /** Late-bound: every conversation is told when an assistant's binding may have changed its kind. */
     let sessionsRef: VoiceSessions | undefined
     const resources = yield* makeResourcePool({
+      buildTts: options.buildTts ?? (options.build === undefined ? defaultTtsBuilder(sections.configProvider) : engineTtsBuilder),
       buildLlm: options.buildLlm ?? (options.build === undefined ? defaultLlmBuilder(sections.configProvider) : engineLlmBuilder),
       ...(options.resourceGraceMs !== undefined ? { graceMs: options.resourceGraceMs } : {}),
       onChange: () => {
@@ -407,11 +452,17 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       log: (line) => runFork(Effect.logInfo(line))
     })
     const syncResources = (reconcile: ReconcileOptions = {}): Effect.Effect<void> =>
-      Effect.suspend(() => (store.blocked() !== undefined ? Effect.void : resources.reconcile(wantedLlms(), reconcile)))
+      Effect.suspend(() => (store.blocked() !== undefined ? Effect.void : (({ llms, voices }) => resources.reconcile(llms, { ...reconcile, voices }))(wantedResources())))
     resourcesChanged = () => run(syncResources())
     /** A turn of an assistant the pool does not hold (not in use: off, or on no list) is answered with this. */
     const notInUse = Llm.of({
       stream: () => Stream.fail(new LlmError({ message: "This assistant is not in use on any device, so it has no language model." }))
+    })
+
+    /** A turn of an assistant the pool holds no voice for (not in use) cannot be spoken. */
+    const noVoice = Tts.of({
+      sampleRate: 22_050,
+      synthesize: () => Stream.fail(new TtsError({ message: "This assistant is not in use on any device, so it has no voice." }))
     })
 
     /**
@@ -422,7 +473,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
      */
     const conversationSetup = (assistantId: string) => {
       let cached:
-        | { snapshot: ModuleSnapshot; assistant: Assistant | undefined; home: string | undefined; llm: Llm["Service"] | undefined; setup: TurnSetup; instructions: ReadonlyArray<string> }
+        | { snapshot: ModuleSnapshot; assistant: Assistant | undefined; home: string | undefined; llm: Llm["Service"] | undefined; tts: Tts["Service"] | undefined; setup: TurnSetup; instructions: ReadonlyArray<string> }
         | undefined
       const llmNow = () => {
         const bound = resources.llmFor(assistantId)
@@ -433,20 +484,40 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
         runSync(Effect.asVoid(Effect.forkDetach(syncResources(), { startImmediately: true })))
         return resources.llmFor(assistantId)
       }
+      /** Likewise the assistant's voice: the pool's instance for its `voice`, read at the turn's start. */
+      const ttsNow = () => {
+        const bound = resources.ttsFor(assistantId)
+        if (bound !== undefined) return bound
+        runSync(Effect.asVoid(Effect.forkDetach(syncResources(), { startImmediately: true })))
+        return resources.ttsFor(assistantId)
+      }
       const current = () => {
         const snapshot = host.snapshot()
         const assistant = assistantsNow().get(assistantId)
         const home = homeLine()
         const llm = llmNow()
-        if (cached?.snapshot !== snapshot || cached.assistant !== assistant || cached.home !== home || cached.llm !== llm) {
+        const tts = ttsNow()
+        if (cached?.snapshot !== snapshot || cached.assistant !== assistant || cached.home !== home || cached.llm !== llm || cached.tts !== tts) {
           // An assistant that does not exist (any more) is never routed; should a turn still start, it gets no tools.
           const mine = assistant === undefined ? { registry: makeToolRegistry([]), instructions: [] } : modulesFor(snapshot, assistant)
           const base = assistant?.prompt ?? defaultSystemPrompt
           const instructions = home === undefined ? mine.instructions : [home, ...mine.instructions]
-          cached = { snapshot, assistant, home, llm, setup: { system: systemFor(base, instructions), registry: mine.registry, llm: llm ?? notInUse }, instructions }
+          // `TurnSetup.ttsReady`: completes once this `tts` (the instance bound now, not a later one) is built.
+          const ttsReady = resources.ttsReady(assistantId)
+          cached = {
+            snapshot,
+            assistant,
+            home,
+            llm,
+            tts,
+            setup: { system: systemFor(base, instructions), registry: mine.registry, llm: llm ?? notInUse, tts: tts ?? noVoice, ...(tts !== undefined ? { ttsReady } : {}) },
+            instructions
+          }
         }
         return cached
       }
+      // The setup never waits (the conversation's input loop reads it, so Stop and barge-in would wait too): a spoken
+      // turn waits for a voice still being built (the assistant came into use just now) itself, before it plays.
       const setup = Effect.sync((): TurnSetup => current().setup)
       // A Claude subscription assistant: the agent module answers; the pool's instance is the offline stand-in.
       let subscription: { readonly fallback: Llm["Service"]; readonly toAgents: (setup: TurnSetup) => AgentTurnSetup } | undefined
@@ -492,6 +563,30 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
           return { stage: "llm", provider: account, detail: first.llm.model, location: "hosted" }
       }
     }
+    /** The voices in use as engine rows (the Models page marks their presets in use) and as the status's `voices`. */
+    const voicesInUse = () =>
+      resources.status().flatMap((r) => {
+        const ref = r.kind === "tts" && r.usedBy.length > 0 && r.state !== "failed" ? parseVoiceKey(r.key) : undefined
+        return ref === undefined ? [] : [{ ref, location: r.location }]
+      })
+    const ttsRows = (): Array<EngineInfo> =>
+      voicesInUse().map(({ ref, location }) => ({ stage: "tts", provider: ref.provider, detail: ref.voiceId, location }))
+    const voiceInfos = (): Array<VoiceInfo> => {
+      const first = voiceKey(assistantVoiceRef())
+      return voicesInUse().map(({ ref, location }) => ({
+        name: voiceKey(ref),
+        description: voiceLabel(ref),
+        enabled: true,
+        isDefault: voiceKey(ref) === first,
+        engine: voiceEngineName(ref),
+        location
+      }))
+    }
+    /** The first assistant's voice (a switched-on one if there is one). */
+    const assistantVoiceRef = (): VoiceRef => {
+      const all = [...assistantsNow().values()]
+      return (all.find((a) => a.on) ?? all[0])?.voice ?? DEFAULT_ASSISTANT_VOICE
+    }
     /** While the vault is locked, a key that "is not set" is really locked away. */
     const explainProblems = (problems: ReadonlyArray<{ readonly stage: string; readonly message: string }>) => {
       if (keys.state() !== "locked") return problems
@@ -524,8 +619,8 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
         if (hub !== undefined) broadcast({ type: "models", models: modelsRef?.list() ?? [] })
       },
       // The language model is no longer the build's: its row comes from the assistants (and the pool's resources).
-      describeEngines: (engines) => [llmRow(), ...engines.filter((e) => e.stage !== "llm")],
-      resources: { status: resources.status, rebuild: syncResources({ rebuild: true }) },
+      describeEngines: (engines) => [llmRow(), ...engines.filter((e) => e.stage !== "llm" && e.stage !== "tts"), ...(ttsRows().length > 0 ? ttsRows() : engines.filter((e) => e.stage === "tts"))],
+      resources: { status: resources.status, rebuild: syncResources({ rebuild: true }), voices: voiceInfos },
       explainProblems,
       blocked: settingsProblem
     })
@@ -586,6 +681,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
           deviceSettings: () => deviceSettingsOf(device?.id),
           assistants: assistantsNow,
           conversationSetup,
+          voiceOf: resources.ttsKeyFor,
           moduleOfTool: (name) => host.snapshot().toolModules.get(name) ?? null,
           turnTrace,
           send: (message) => hub?.toSession(key, message),
@@ -676,25 +772,18 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     const favourites = makeFavourites({ dataDir: options.dataDir, writable: () => lock.held(), log: (line) => runFork(Effect.logWarning(line)) })
     let catalogRef: VoiceCatalog | undefined
     const assistantVoice = makeAssistantVoice({
-      sections,
-      engine: theEngine,
+      assistants: () => [...assistantsNow().values()],
       catalog: () => catalogRef!,
-      onSaved: (update) => {
-        const running = theEngine.voice()
-        if (update.reload && running !== undefined) theEngine.setReloadPending(true, update.path)
-      }
+      isRunning: (key) => resources.tts(key) !== undefined
     })
     const inTurn = new Set(["hearing", "thinking", "speaking"])
     const voiceCatalog = yield* makeVoiceCatalog({
       configProvider: sections.configProvider,
       vaultLocked: () => keys.state() === "locked",
       modelDir: () => sections.modelDirs().tts,
-      live: () => {
-        const built = theEngine.built()
-        return built === undefined ? undefined : { voice: built.providers.voice, tts: built.providers.tts }
-      },
+      live: (voice) => resources.tts(voiceKey(voice)),
       busy: () => sessions.list().some((s) => inTurn.has(s.state)),
-      selected: assistantVoice.ref,
+      usedBy: assistantVoice.usedBy,
       isFavourite: favourites.has,
       // Every voice of a shared archive (Kokoro) reports the one job that downloads it.
       download: (preset) => jobs.running("tts-models", SherpaTts.archiveOwner(preset) ?? preset),

@@ -132,7 +132,7 @@ describe("serve: language models from the resource pool (WP-9)", () => {
     // Admin sees both resources, each with its user.
     const admin = await connect()
     const welcome = await admin.admin(TEST_ADMIN_PASSWORD)
-    const resources = welcome.snapshot.engine.resources ?? []
+    const resources = (welcome.snapshot.engine.resources ?? []).filter((r) => r.kind === "llm")
     expect(resources.map((r) => [r.key.split("|")[1], r.state, r.usedBy]).sort()).toEqual([
       ["model-a", "ready", ["alpha"]],
       ["model-b", "ready", ["bravo"]]
@@ -145,8 +145,9 @@ describe("serve: language models from the resource pool (WP-9)", () => {
     expect(models.builds).toHaveLength(2)
     expect((await typed(voice, "bravo", "same model", "t3")).reply).toMatch(/^model-a#\d: same model$/)
     // The unused model-b instance goes after the grace period.
-    await until("model-b released", () => server!.handle.resources.status().length === 1)
-    expect(server!.handle.resources.status()[0]).toMatchObject({ state: "ready", usedBy: ["alpha", "bravo"] })
+    const models_ = () => server!.handle.resources.status().filter((r) => r.kind === "llm")
+    await until("model-b released", () => models_().length === 1)
+    expect(models_()[0]).toMatchObject({ state: "ready", usedBy: ["alpha", "bravo"] })
   })
 
   it("a model change on Alpha does not interrupt a turn in progress on another device, and applies at Alpha's next turn; no engine reload", async () => {
@@ -204,7 +205,7 @@ describe("serve: language models from the resource pool (WP-9)", () => {
     const admin = await connect()
     const welcome = await admin.admin(TEST_ADMIN_PASSWORD)
     expect(welcome.snapshot.engine.state).toBe("ready")
-    const broken = (welcome.snapshot.engine.resources ?? []).find((r) => r.usedBy.includes("bravo"))
+    const broken = (welcome.snapshot.engine.resources ?? []).find((r) => r.kind === "llm" && r.usedBy.includes("bravo"))
     expect(broken).toMatchObject({ kind: "llm", state: "failed", problem: "The model broken could not start." })
 
     const voice = await connect("device-a")
@@ -216,9 +217,9 @@ describe("serve: language models from the resource pool (WP-9)", () => {
 
     // Fixed by a new model: built, bound, answering.
     await saveModel("bravo", "model-b")
-    await until("bravo ready", () => server!.handle.resources.status().some((r) => r.usedBy.includes("bravo") && r.state === "ready"))
+    await until("bravo ready", () => server!.handle.resources.status().some((r) => r.kind === "llm" && r.usedBy.includes("bravo") && r.state === "ready"))
     expect((await typed(voice, "bravo", "again", "t3")).reply).toMatch(/^model-b#\d: again$/)
     // The failed instance is gone at once (it held nothing a turn needs).
-    expect(server!.handle.resources.status().some((r) => r.state === "failed")).toBe(false)
+    expect(server!.handle.resources.status().some((r) => r.kind === "llm" && r.state === "failed")).toBe(false)
   })
 })

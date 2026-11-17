@@ -530,6 +530,11 @@ without a key can be added from its old entry).
 
 ### 5.8 The assistant's voice
 
+> **Superseded by docs/ASSISTANTS.md §5.5 (WP-10, 2026-11-16).** Each assistant has its own `voice`, saved with the assistant
+> (`assistant.save`). `GET /api/voices/default` answers with the first assistant's voice (`source: "assistant"`, never
+> locked, `reloadPending` false), `PUT /api/voices/default` answers `410 gone`, and `VoiceEntry.selected` is `usedBy`
+> (the assistants that speak with the voice). What follows is the design before that change.
+
 `GET /api/voices/default`
 
 ```ts

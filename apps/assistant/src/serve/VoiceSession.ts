@@ -53,8 +53,8 @@ import { makeStateTracker, type StateTracker } from "./StateTracker.ts"
  * never sound at once. Who owns the audio (which tab of the device) is the hub's business: it calls
  * `web.setOwner` / `setMicLive` and `ownerChanged`.
  *
- * WP-9: each assistant's language model is the resource pool's instance for its settings (read at each turn start);
- * the recogniser and the voice are still the one shared build (the engine's), until WP-10 and WP-11.
+ * WP-9, WP-10: each assistant's language model and voice are the resource pool's instances for its settings (read at
+ * each turn start); the recogniser is still the one shared build (the engine's), until WP-11.
  */
 
 export interface AssistantSetup {
@@ -77,6 +77,8 @@ export interface VoiceSessionOptions {
   readonly assistants: () => ReadonlyMap<string, Assistant>
   /** Per assistant: its turn setup (prompt, module instructions, its tools), and the agent setup (claude-subscription). */
   readonly conversationSetup: (assistant: string) => AssistantSetup
+  /** The key of the voice an assistant speaks with now (the resource pool's, docs/ASSISTANTS.md §3.2). */
+  readonly voiceOf?: (assistant: string) => string | undefined
   /** The module that contributes a tool (module host snapshot). */
   readonly moduleOfTool: (name: string) => string | null
   /** The shared trace service (log line, recent list); this session numbers its own turns and sets `session`. */
@@ -251,8 +253,10 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
     })
     yield* Effect.addFinalizer(() => Effect.sync(() => tracker.dispose()))
 
-    /** The voice key this session speaks with ("" while the engines do not run). Shared build: one voice. */
-    const voiceNow = (): string => {
+    /** The voice key `assistant` speaks with in this session ("" when it has none: not in use, the engines not running). */
+    const voiceNow = (assistant: string | undefined): string => {
+      const own = assistant === undefined ? undefined : options.voiceOf?.(assistant)
+      if (own !== undefined) return own
       const voice = options.engine.voice()
       return voice === undefined ? "" : voiceKey(voice)
     }
