@@ -83,11 +83,16 @@ DeviceSettings += { look: DeviceLook, voice: DeviceVoice }   // two new section 
   or changed is checked as above. A voice the stored assistant already has is never refused (that would block every
   other edit of the assistant): if it became unavailable it only warns, and `saveAnyway` keeps it; a fine unchanged
   voice is not affected.
-- **Run time.** The resource pool binds voices per *user*: the assistant itself while it speaks with its own voice, else
-  `assistant@place` for each place (a device, or the type's defaults) whose `voice` section is `{ from: "device" }`. A
-  turn reads the binding at its start (`conversationSetup(assistant, deviceId)`, `voiceOf`), so a change applies at the
-  next turn and the old instance goes after the grace period; typed turns and `speakTyped` use the same setup. Places
-  with the same voice share one `Tts` (the pool keys instances by voice). When a place flips between the assistant's voice and its own, the user changes (`alpha` <-> `alpha@place`); the new user takes over the old one's binding (`ReconcileOptions.voiceInherit`) until its voice has loaded, so the old voice keeps answering meanwhile.
+- **Run time.** The resource pool binds voices per *user*: `assistant@place` for each place (a device, or the type's
+  defaults) that lists the assistant, whether that place's `voice` section is its own or follows the assistant, plus
+  the assistant itself while some place follows its voice (the fallback of a session whose place does not list it). A
+  turn reads its place's binding at its start (`conversationSetup(assistant, deviceId)`, `voiceOf`), so a change
+  applies at the next turn and the old instance goes after the grace period; typed turns and `speakTyped` use the same
+  setup. Places with the same voice share one `Tts` (the pool keys instances by voice). Because the user of a place
+  never changes, a place whose voice changes or flips source (own <-> the assistant's) keeps its own old voice until
+  the new one has loaded, per place: two devices reset while the assistant's voice loads each keep their own old voice
+  (PR #84 review; this replaced `ReconcileOptions.voiceInherit`, under which both took over the one shared
+  `assistant` binding and the second device spoke with the first one's old voice).
 - **Trace.** `TraceInfo.config.voice` is the key of the voice the turn used; the new optional `config.voiceFrom` says
   `"device"` or `"assistant"` (protocol, additive).
 - **Pushes.** `device.setup` is compared as a whole before sending, so a change of an assistant's look, the type's or
@@ -167,7 +172,15 @@ the parameters leave the address bar, a reload shows the configured look.
 **Mock** (`apps/web/mock`). It already took and sent the new fields through the protocol's schemas (`assistant.save`
 with `look`, `device.save` with `look`/`voice`, `device.setup` resolved by `deviceSetupFrom`); a trace's `config.voice`
 now follows the device's voice (`voiceFor`). It does not refuse a device voice that is not downloaded (the real
-server's check, §3).
+server's check, §3). Like the real server, its `assistant.create` warns on a hosted voice without its key
+until `saveAnyway` (its `assistant.save` does not check the voice).
+
+**Creating with a voice that warns** (PR #84 review). `assistant.create` answers a hosted voice without its key (a copy
+of an assistant that has one, say) with a warning, like `assistant.save`. The wizard's Check step then shows the warning
+in its footer with "Create anyway" and "Go back" (any other step drops it), and Duplicate (`NameDialog`) shows it with
+"Duplicate anyway" and "Go back" (a rename drops it); "anyway" sends `saveAnyway` (`client.createAssistant`). Tests:
+`test/wizardCreate.test.tsx`, `test/duplicateDialog.test.tsx`, `test/assistantClient.test.ts`, `e2e/wizard.spec.ts`,
+`e2e/assistants.spec.ts`.
 
 **Differences from §4.**
 

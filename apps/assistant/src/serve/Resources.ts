@@ -560,12 +560,6 @@ export interface ReconcileOptions {
   /** The voice of each assistant in use (`ttsSpecOf`). Default: none. */
   readonly voices?: ReadonlyMap<string, TtsSpec>
   /**
-   * For a voice user, the users whose binding it takes over while its own instance builds, when it had none: a place
-   * whose voice flips between the assistant's and its own changes user (`alpha` <-> `alpha@place`), and the old voice
-   * keeps answering until the new one is ready, as for a change of voice on the same user. Default: none.
-   */
-  readonly voiceInherit?: ReadonlyMap<string, ReadonlyArray<string>>
-  /**
    * The recogniser of every hearing place (docs/ASSISTANTS.md §2.6 "The device's recogniser"): by place
    * (`device:<id>`, or `type:<kind>` for a type's defaults and the sessions that follow them), the hearing spec of its
    * hearer (`sttSpecOf`) and who that hearer is (the status's `usedBy`). Default: none.
@@ -693,8 +687,6 @@ const makeKind = <Spec, Svc>(config: KindConfig<Spec, Svc>, hooks: PoolHooks) =>
   const boundSpec = new Map<string, Spec>()
   /** The assistants in use and the spec each one wants. */
   let wanted = new Map<string, Spec>()
-  /** Per user, the users whose binding it may take over while its own instance builds (`ReconcileOptions.inherit`). */
-  let inheritFrom: ReadonlyMap<string, ReadonlyArray<string>> = new Map()
   let serials = 0
 
   const close = (entry: Entry<Spec, Svc>) => {
@@ -748,8 +740,6 @@ const makeKind = <Spec, Svc>(config: KindConfig<Spec, Svc>, hooks: PoolHooks) =>
     hooks.rebound()
   }
   const bindAll = () => {
-    const previous = new Map(bound)
-    const previousSpec = new Map(boundSpec)
     for (const assistant of [...bound.keys()]) {
       if (wanted.has(assistant)) continue
       bound.delete(assistant)
@@ -758,26 +748,9 @@ const makeKind = <Spec, Svc>(config: KindConfig<Spec, Svc>, hooks: PoolHooks) =>
     for (const [assistant, spec] of wanted) {
       const target = current.get(config.identityOf(spec))
       if (target === undefined) continue
-      let before = bound.get(assistant)
-      let beforeSpec = boundSpec.get(assistant)
-      if (before === undefined) {
-        // A new user that replaces another one (a voice's source flipped) takes over that one's binding.
-        for (const other of inheritFrom.get(assistant) ?? []) {
-          const entry = previous.get(other)
-          if (entry === undefined || entry.closed) continue
-          before = entry
-          beforeSpec = previousSpec.get(other)
-          break
-        }
-      }
+      const before = bound.get(assistant)
       // Building: keep what the assistant used before (its turns keep answering) until the new one has settled.
-      if (target.state === "starting" && before !== undefined && before !== target && !before.closed) {
-        if (!bound.has(assistant) && beforeSpec !== undefined) {
-          bound.set(assistant, before)
-          boundSpec.set(assistant, beforeSpec)
-        }
-        continue
-      }
+      if (target.state === "starting" && before !== undefined && before !== target && !before.closed) continue
       bound.set(assistant, target)
       boundSpec.set(assistant, spec)
     }
@@ -854,13 +827,8 @@ const makeKind = <Spec, Svc>(config: KindConfig<Spec, Svc>, hooks: PoolHooks) =>
 
   return {
     /** Wants `next`: starts what is missing, rebinds. The entries started (to wait for). */
-    reconcile: (
-      next: ReadonlyMap<string, Spec>,
-      reconcileOptions: ReconcileOptions,
-      inherit: ReadonlyMap<string, ReadonlyArray<string>> = new Map()
-    ): Array<Entry<Spec, Svc>> => {
+    reconcile: (next: ReadonlyMap<string, Spec>, reconcileOptions: ReconcileOptions): Array<Entry<Spec, Svc>> => {
       wanted = new Map(next)
-      inheritFrom = inherit
       const started: Array<Entry<Spec, Svc>> = []
       const seen = new Set<string>()
       for (const spec of wanted.values()) {
@@ -1100,7 +1068,7 @@ export const makeResourcePool = (options: ResourcePoolOptions): Effect.Effect<Re
           hearers = new Map([...places].map(([place, { hearer }]) => [place, hearer]))
           const started = [
             ...llms.reconcile(next, reconcileOptions),
-            ...voices.reconcile(reconcileOptions.voices ?? new Map(), reconcileOptions, reconcileOptions.voiceInherit),
+            ...voices.reconcile(reconcileOptions.voices ?? new Map(), reconcileOptions),
             ...recognisers.reconcile(new Map([...places].map(([place, { spec }]) => [place, spec])), reconcileOptions)
           ]
           changed()

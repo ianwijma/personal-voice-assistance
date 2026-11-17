@@ -25,7 +25,6 @@ import {
   DEFAULT_SESSION_DISCARD_MINUTES,
   type DeviceSettings,
   type DeviceUser,
-  type DeviceVoice,
   deviceTypeOf,
   effectiveDeviceSettings,
   type EngineInfo,
@@ -518,13 +517,20 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     const placeOf = (deviceId: string | undefined): string =>
       deviceId !== undefined && store.settings().devices[deviceId] !== undefined ? `device:${deviceId}` : `type:${WEB_VOICE_KIND}`
     /**
-     * Who the pool binds a voice to: the assistant itself while it speaks with its own voice, else the assistant at
-     * the place whose device voice it speaks with (docs/LOOKS-AND-VOICES.md §3). The binding is stable while the
-     * place's voice changes, so a change applies at the next turn start and releases the old instance when unused,
-     * as a change of the assistant's voice does.
+     * Who the pool binds a voice to (docs/LOOKS-AND-VOICES.md §3): the assistant at each place that lists it,
+     * `assistant@place`, whether the place speaks with its own voice or the assistant's. The user stays the same when
+     * the place's voice changes or flips source (own <-> the assistant's), so the pool keeps that place's old voice
+     * bound until the new one has loaded, per place: two places reset at once each keep their own old voice. Instances
+     * are still shared by voice key. Beside them the assistant itself (`assistant`) is a user while some place follows
+     * its voice: what a session of a place that does not list it falls back to (`voiceUserFor`).
      */
-    const voiceUserOf = (assistantId: string, place: string, voice: DeviceVoice): string =>
-      voice.from === "device" ? `${assistantId}@${place}` : assistantId
+    const voiceUserOf = (assistantId: string, place: string): string => `${assistantId}@${place}`
+    /** The user whose voice `assistantId` speaks with on `deviceId` now: its place's binding, else the assistant's own. */
+    const voiceUserFor = (assistantId: string, deviceId: string | undefined): string => {
+      const user = voiceUserOf(assistantId, placeOf(deviceId))
+      if (resources.ttsKeyFor(user) !== undefined || deviceSettingsOf(deviceId).voice.from === "device") return user
+      return assistantId
+    }
     /**
      * Every hearing place (§3.2 "Wanted", stt: the hearer of every type defaults entry and of every known device) with
      * its effective settings. `override` replaces one place's settings (a save being checked); a type's new defaults
@@ -600,7 +606,6 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     const wantedResources = (): {
       readonly llms: Map<string, LlmSpec>
       readonly voices: Map<string, TtsSpec>
-      readonly voiceInherit: Map<string, Array<string>>
       readonly recognisers: Map<string, { readonly spec: SttSpec; readonly hearer: string }>
     } => {
       const file = store.settings()
@@ -615,7 +620,6 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       const voiceAccounts = ttsAccounts()
       const llms = new Map<string, LlmSpec>()
       const voices = new Map<string, TtsSpec>()
-      const voiceInherit = new Map<string, Array<string>>()
       for (const assistant of assistantsNow().values()) {
         if (!assistant.on || !listed.has(assistant.id)) continue
         const spec = llmSpecOf(assistant.llm, accounts)
@@ -627,15 +631,11 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
         for (const listing of settings.assistants) {
           const assistant = assistantsNow().get(listing.assistant)
           if (assistant === undefined || !assistant.on) continue
-          const user = voiceUserOf(assistant.id, place, settings.voice)
-          voices.set(user, ttsSpecOf(voiceFor(settings.voice, assistant), voiceAccounts))
-          // The place's voice may just have flipped source (own <-> the assistant's): the other user's binding is
-          // the one this user takes over until its instance is ready.
-          const other = user === assistant.id ? `${assistant.id}@${place}` : assistant.id
-          voiceInherit.set(user, [...(voiceInherit.get(user) ?? []), other])
+          voices.set(voiceUserOf(assistant.id, place), ttsSpecOf(voiceFor(settings.voice, assistant), voiceAccounts))
+          if (settings.voice.from === "assistant") voices.set(assistant.id, ttsSpecOf(assistant.voice, voiceAccounts))
         }
       }
-      return { llms, voices, voiceInherit, recognisers: recognisersOf(placesNow(), assistantsNow()) }
+      return { llms, voices, recognisers: recognisersOf(placesNow(), assistantsNow()) }
     }
     /**
      * The spec of every language-model key asked for, so a turn's trace can say what the instance it is bound to was
@@ -711,7 +711,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       Effect.suspend(() =>
         store.blocked() !== undefined
           ? Effect.void
-          : (({ llms, recognisers, voices, voiceInherit }) => resources.reconcile(llms, { ...reconcile, voices, voiceInherit, recognisers }))(wantedResources())
+          : (({ llms, recognisers, voices }) => resources.reconcile(llms, { ...reconcile, voices, recognisers }))(wantedResources())
       )
     resourcesChanged = () => {
       run(syncResources())
@@ -757,7 +757,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
           // No token limit is passed to Claude Code (`ClaudeConversationOptions` has none): the stand-in's, as `llmSpecOf` keeps it.
           ? { account: SUBSCRIPTION_PROVIDER, model: passed.model, effort: assistant.llm.effort, thinking: assistant.llm.thinking, maxTokens: 1024 }
           : { account: spec.account, model: spec.model, effort: spec.effort, thinking: spec.thinking, maxTokens: spec.maxTokens },
-        voice: resources.ttsKeyFor(voiceUserOf(assistant.id, placeOf(deviceId), deviceVoice)) ?? voiceKey(voiceFor(deviceVoice, assistant)),
+        voice: resources.ttsKeyFor(voiceUserFor(assistant.id, deviceId)) ?? voiceKey(voiceFor(deviceVoice, assistant)),
         voiceFrom: deviceVoice.from,
         modules,
         tools: passed !== undefined && !passed.tools ? 0 : tools,
@@ -797,13 +797,12 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
         return resources.llmFor(assistantId)
       }
       /** Likewise the assistant's voice: the pool's instance for its `voice`, read at the turn's start. */
-      const voiceUserNow = (): string => voiceUserOf(assistantId, placeOf(deviceId), deviceSettingsOf(deviceId).voice)
+      const voiceUserNow = (): string => voiceUserFor(assistantId, deviceId)
       const ttsNow = () => {
-        const user = voiceUserNow()
-        const bound = resources.ttsFor(user)
+        const bound = resources.ttsFor(voiceUserNow())
         if (bound !== undefined) return bound
         runSync(Effect.asVoid(Effect.forkDetach(syncResources(), { startImmediately: true })))
-        return resources.ttsFor(user)
+        return resources.ttsFor(voiceUserNow())
       }
       const current = () => {
         const snapshot = host.snapshot()
@@ -1168,7 +1167,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
           ...(options.hearerSwitchWaitMs !== undefined ? { hearerSwitchWaitMs: options.hearerSwitchWaitMs } : {}),
           assistants: assistantsNow,
           conversationSetup,
-          voiceOf: (assistant, deviceId) => resources.ttsKeyFor(voiceUserOf(assistant, placeOf(deviceId), deviceSettingsOf(deviceId).voice)),
+          voiceOf: (assistant, deviceId) => resources.ttsKeyFor(voiceUserFor(assistant, deviceId)),
           moduleOfTool: (name) => host.snapshot().toolModules.get(name) ?? null,
           routing: () => routing,
           turnTrace,

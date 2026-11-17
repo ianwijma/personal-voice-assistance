@@ -374,11 +374,44 @@ describe("a device's voice at run time", () => {
     expect(await saveDevice(a, "device-a", { voice: null })).toMatchObject({ ok: true })
     await until("the assistant's voice builds again", () => builds.filter((k) => k === PIPER).length === 2)
     expect((await spoken(device, "alpha", "resetting", "t3")).voices).toEqual([CARTESIA])
-    expect(resources().ttsKeyFor("alpha")).toBe(CARTESIA)
+    expect(resources().ttsKeyFor(own)).toBe(CARTESIA)
     openPiper()
-    await until("the assistant's voice is bound", () => resources().ttsKeyFor("alpha") === PIPER)
+    await until("the assistant's voice is bound", () => resources().ttsKeyFor(own) === PIPER)
     expect((await spoken(device, "alpha", "reset", "t4")).voices).toEqual([PIPER])
     await until("the own voice is released", () => released.includes(CARTESIA))
+  })
+
+  it("two devices reset while the assistant's voice loads each keep their own old voice until it is ready (PR #84 review, finding 3)", async () => {
+    // Alpha is on two devices only, each with its own voice; nothing uses Alpha's own voice (PIPER) yet.
+    await start(await dataDirWith((file) => { file.deviceTypes["web-voice"].assistants = [{ assistant: "bravo", phrases: ["hey bravo"] }] }))
+    const a = await admin()
+    const deviceA = await knownDevice("device-a")
+    const deviceB = await knownDevice("device-b")
+    const listing = [{ assistant: "alpha", phrases: ["hey alpha"] }]
+    expect(await saveDevice(a, "device-a", { assistants: listing, voice: ownVoice(CARTESIA) }, { saveAnyway: true })).toMatchObject({ ok: true })
+    expect(await saveDevice(a, "device-b", { assistants: listing, voice: ownVoice(ELEVEN) }, { saveAnyway: true })).toMatchObject({ ok: true })
+    const resources = () => server!.handle.resources
+    const userA = "alpha@device:device-a"
+    const userB = "alpha@device:device-b"
+    await until("both device voices are bound", () => resources().ttsKeyFor(userA) === CARTESIA && resources().ttsKeyFor(userB) === ELEVEN)
+    await until("Alpha's own voice is not loaded", () => !builds.includes(PIPER) || released.includes(PIPER))
+    const piperBuilds = builds.filter((k) => k === PIPER).length
+    // Alpha's own voice is slow to load. Reset A, then B while it is still loading.
+    const openPiper = gate(PIPER)
+    expect(await saveDevice(a, "device-a", { voice: null })).toMatchObject({ ok: true })
+    await until("Alpha's own voice builds", () => builds.filter((k) => k === PIPER).length === piperBuilds + 1)
+    expect((await spoken(deviceA, "alpha", "a loading", "a1")).voices).toEqual([CARTESIA])
+    expect(await saveDevice(a, "device-b", { voice: null })).toMatchObject({ ok: true })
+    expect((await spoken(deviceB, "alpha", "b loading", "b1")).voices).toEqual([ELEVEN])
+    expect((await spoken(deviceA, "alpha", "a still loading", "a2")).voices).toEqual([CARTESIA])
+    expect([resources().ttsKeyFor(userA), resources().ttsKeyFor(userB)]).toEqual([CARTESIA, ELEVEN])
+    expect(builds.filter((k) => k === PIPER)).toHaveLength(piperBuilds + 1) // one instance for both places
+    openPiper()
+    await until("both places speak with Alpha's voice", () => resources().ttsKeyFor(userA) === PIPER && resources().ttsKeyFor(userB) === PIPER)
+    expect((await spoken(deviceA, "alpha", "a reset", "a3")).voices).toEqual([PIPER])
+    expect((await spoken(deviceB, "alpha", "b reset", "b2")).voices).toEqual([PIPER])
+    expect(resources().ttsFor(userA)).toBe(resources().ttsFor(userB))
+    await until("the old device voices are released", () => released.includes(CARTESIA) && released.includes(ELEVEN))
   })
 
   it("a type's voice defaults apply to its devices without their own; a device's own value wins", async () => {
