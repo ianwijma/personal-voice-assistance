@@ -2,22 +2,29 @@ import type { HouseholdChange, HouseholdCollectionRows, HouseholdEventInfo, Hous
 import { Effect } from "effect"
 import type { EventType, HouseholdEvent } from "./EventBus.ts"
 import type { ChangeRecord, Collection, HouseholdStore, Row, ScopeRef, StoreError, TargetDevice } from "./HouseholdStore.ts"
-import { decodeStored } from "./HouseholdStore.ts"
+import { MAX_VALUE_CHARS } from "./HouseholdStore.ts"
 
 /**
  * What voice pages receive of the household data (docs/STORING-DATA.md "Pages"; docs/MODULES-PLAN.md §4 P4).
  *
  * Nothing is sent by default. A collection opts in with `project(row, device)` and an event type with
- * `project(event, device)`: what a page on that device may see, or `undefined` for nothing. The same function decides
- * the three paths, always applied to the row **as it is now**:
+ * `project(event, device)`: what a page on that device may see, or `undefined` for nothing. Only **committed current
+ * state** is ever projected, never a value from the change log or from an event:
  *
- * - the snapshot after `welcome`: every visible row, projected;
- * - a live change: `put` with the projected row when it is visible now, `remove` when it is gone or hidden now but the
- *   device could see the value it replaced, nothing otherwise;
- * - the replay after a reconnect: the same rule per row changed since the page's `seq`, with "the value it replaced"
- *   being the value before the first change the page missed. Older payloads in the change log only decide whether to
- *   send a `remove`; their content is never sent. When that earlier value is not in the log (`history: "none"`, an
- *   erased row) or the gap is too long or pruned, the page gets a fresh snapshot instead.
+ * - **Snapshot** (`snapshot`) after every `welcome`, also after a reconnect: every visible row now, projected, in parts
+ *   that each fit one text frame (`SNAPSHOT_PART_CHARS`), at most `SNAPSHOT_ROWS` rows per collection and
+ *   `SNAPSHOT_MAX_CHARS` in all (`truncated` says when rows were left out). It comes with a cursor: the change number
+ *   it is current to and the rows the page now holds.
+ * - **Changes** (`catchUp`): the change log after the cursor, a page of `CATCH_UP_CHANGES` at a time, read from the
+ *   store (not from the bus, which may drop), coalesced per row; for each row its current value through the
+ *   projection: `put` when the page may see it, `remove` when it may not but the page holds it, nothing otherwise.
+ *   When the log no longer has what the page missed (pruned), the answer is `resync`: send a fresh snapshot.
+ * - **Module events** (`live`): an event type's projection, for the events a module publishes (they are not in the
+ *   log, and are lost to a page that is not connected).
+ *
+ * A projection that throws, returns something that is not plain JSON or more than `MAX_VALUE_CHARS` of it, is
+ * treated as "not visible" for that row or event (so a page loses the row rather than keeping a stale one) and
+ * reported (`report`, a Health issue in serve mode). It affects only its own collection or event type.
  *
  * Before any projection, `mayRevealScopeTo` decides by scope (below).
  */
@@ -51,51 +58,88 @@ export interface FeedModule {
 
 /** The most rows of one collection in a snapshot. */
 export const SNAPSHOT_ROWS = 500
-/** The most changes a replay walks; a longer gap gets a snapshot. */
-export const REPLAY_CHANGES = 1000
+/** The most characters of rows in one `household.snapshot` message (the protocol's frame limit is 1,048,576). */
+export const SNAPSHOT_PART_CHARS = 256_000
+/** The most characters of rows in one whole snapshot; collections past it are `truncated`. */
+export const SNAPSHOT_MAX_CHARS = 4_000_000
+/** The changes read per `catchUp` call. */
+export const CATCH_UP_CHANGES = 50
 
-export type ProjectedChange = { readonly op: "put"; readonly value: unknown } | { readonly op: "remove" }
-
-const safeProject = <T>(project: ((x: T, device: TargetDevice) => unknown) | undefined, x: T, device: TargetDevice): unknown => {
-  if (project === undefined) return undefined
-  try {
-    return project(x, device)
-  } catch {
-    return undefined
-  }
+/** A projection that failed (`report`). */
+export interface FeedProblem {
+  readonly module: string
+  /** The collection or the event type. */
+  readonly what: string
+  readonly message: string
 }
 
-/** What `device` may see of `row` (`undefined`: nothing). */
-export const projectRow = (collection: Collection<any>, row: Row<unknown> | undefined, device: TargetDevice): unknown =>
-  row === undefined || !mayRevealScopeTo(row.scope, device) ? undefined : safeProject(collection.project, row, device)
-
-/** The rule shared by live changes and the replay: from the value the device had (`before`) to the row now. */
-export const projectChange = (
-  collection: Collection<any>,
-  before: Row<unknown> | undefined,
-  now: Row<unknown> | undefined,
-  device: TargetDevice
-): ProjectedChange | undefined => {
-  const value = projectRow(collection, now, device)
-  if (value !== undefined) return { op: "put", value }
-  return projectRow(collection, before, device) !== undefined ? { op: "remove" } : undefined
+/** Where a page is: the change number it is current to, and the rows (`module/collection/id`) it holds. */
+export interface FeedCursor {
+  seq: number
+  readonly visible: Set<string>
 }
 
-export type Replay =
-  | { readonly kind: "events"; readonly events: ReadonlyArray<HouseholdEventInfo> }
-  | { readonly kind: "snapshot"; readonly seq: number; readonly collections: ReadonlyArray<HouseholdCollectionRows> }
+export type CatchUp =
+  | { readonly kind: "changes"; readonly events: ReadonlyArray<HouseholdEventInfo>; readonly more: boolean }
+  | { readonly kind: "resync" }
+
+export interface Snapshot {
+  readonly seq: number
+  /** The rows in parts, each one `household.snapshot` message (`part` 0…, `final` on the last). */
+  readonly parts: ReadonlyArray<ReadonlyArray<HouseholdCollectionRows>>
+  readonly cursor: FeedCursor
+}
 
 export interface HouseholdFeed {
   /** Whether any collection or event type is sent to pages (nothing to do otherwise). */
   readonly active: boolean
-  readonly snapshot: (device: TargetDevice) => Effect.Effect<{ readonly seq: number; readonly collections: ReadonlyArray<HouseholdCollectionRows> }, StoreError>
-  /** What `device` gets of a bus event now, or `undefined`. Synchronous (the hub calls it per connection). */
+  readonly snapshot: (device: TargetDevice) => Effect.Effect<Snapshot, StoreError>
+  /** The changes after `cursor.seq` as `device` may see them now; advances the cursor. */
+  readonly catchUp: (device: TargetDevice, cursor: FeedCursor) => Effect.Effect<CatchUp, StoreError>
+  /** What `device` gets of a module event now, or `undefined`. Data changes are not delivered from the bus (`catchUp`). */
   readonly live: (event: HouseholdEvent, device: TargetDevice) => HouseholdEventInfo | undefined
-  /** After a reconnect with the page's last `seq`. */
-  readonly replay: (device: TargetDevice, seq: number) => Effect.Effect<Replay, StoreError>
 }
 
-export const makeHouseholdFeed = (options: { readonly store: HouseholdStore; readonly modules: ReadonlyArray<FeedModule> }): HouseholdFeed => {
+type Projected = { readonly visible: true; readonly value: unknown; readonly chars: number } | { readonly visible: false; readonly problem?: string }
+
+const HIDDEN: Projected = { visible: false }
+
+/** Run a projection and make its result plain JSON of a bounded size, or say why it cannot be sent. */
+const runProjection = <T>(project: ((x: T, device: TargetDevice) => unknown) | undefined, x: T, device: TargetDevice): Projected => {
+  if (project === undefined) return HIDDEN
+  let out: unknown
+  try {
+    out = project(x, device)
+  } catch (e) {
+    return { visible: false, problem: `the projection threw: ${e instanceof Error ? e.message : String(e)}` }
+  }
+  if (out === undefined) return HIDDEN
+  let text: string | undefined
+  try {
+    text = JSON.stringify(out)
+  } catch (e) {
+    return { visible: false, problem: `the projection's result is not JSON: ${e instanceof Error ? e.message : String(e)}` }
+  }
+  if (text === undefined) return { visible: false, problem: "the projection's result is not JSON" }
+  if (text.length > MAX_VALUE_CHARS) return { visible: false, problem: `the projection's result has ${text.length} characters (at most ${MAX_VALUE_CHARS})` }
+  return { visible: true, value: JSON.parse(text) as unknown, chars: text.length }
+}
+
+/** What `device` may see of `row` (`undefined`: nothing, also when the projection fails). Plain JSON. */
+export const projectRow = (collection: Collection<any>, row: Row<unknown> | undefined, device: TargetDevice): unknown => {
+  if (row === undefined || !mayRevealScopeTo(row.scope, device)) return undefined
+  const p = runProjection(collection.project, row, device)
+  return p.visible ? p.value : undefined
+}
+
+const rowKey = (module: string, collection: string, id: string) => `${module}/${collection}/${id}`
+
+export const makeHouseholdFeed = (options: {
+  readonly store: HouseholdStore
+  readonly modules: ReadonlyArray<FeedModule>
+  /** A failing projection (serve mode: a Health issue). */
+  readonly report?: (problem: FeedProblem) => void
+}): HouseholdFeed => {
   const { store } = options
   const collections = new Map<string, Collection<any>>()
   const eventTypes = new Map<string, EventType>()
@@ -104,107 +148,127 @@ export const makeHouseholdFeed = (options: { readonly store: HouseholdStore; rea
     for (const e of m.events) if (e.project !== undefined) eventTypes.set(`${m.moduleId}.${e.type}`, e)
   }
   const sent = [...collections.entries()].map(([key, c]) => ({ moduleId: key.slice(0, key.indexOf("/")), collection: c }))
-
-  const changeInfo = (
-    meta: { readonly seq: number; readonly at: number; readonly module: string; readonly collection: string; readonly id: string; readonly rev: number; readonly scope: ScopeRef },
-    projected: ProjectedChange
-  ): HouseholdEventInfo => {
-    const data: HouseholdChange = {
-      collection: meta.collection,
-      id: meta.id,
-      op: projected.op,
-      rev: meta.rev,
-      ...(projected.op === "put" ? { value: projected.value } : {})
+  /** A module whose data cannot be used here (newer, failed upgrade) is never read for pages. */
+  const usable = (moduleId: string) => store.availability(moduleId) === undefined
+  const report = (module: string, what: string, message: string) => {
+    try {
+      options.report?.({ module, what, message })
+    } catch {
+      // Reporting must not break delivery.
     }
-    return { seq: meta.seq, at: meta.at, module: meta.module, type: `${meta.module}.${meta.collection}.changed`, scope: meta.scope, data }
+  }
+
+  const projectFor = (moduleId: string, collection: Collection<any>, row: Row<unknown> | undefined, device: TargetDevice): Projected => {
+    if (row === undefined || !mayRevealScopeTo(row.scope, device)) return HIDDEN
+    const p = runProjection(collection.project, row, device)
+    if (!p.visible && p.problem !== undefined) report(moduleId, collection.name, `row ${row.id}: ${p.problem}`)
+    return p
   }
 
   const live = (event: HouseholdEvent, device: TargetDevice): HouseholdEventInfo | undefined => {
-    const change = event.change
-    if (change !== undefined) {
-      const collection = collections.get(`${change.module}/${change.collection}`)
-      if (collection === undefined) return undefined
-      const projected = projectChange(collection, change.before, change.row, device)
-      return projected === undefined ? undefined : changeInfo(change, projected)
-    }
+    if (event.change !== undefined) return undefined
     const type = eventTypes.get(event.type)
-    if (type === undefined || !mayRevealScopeTo(event.scope, device)) return undefined
-    const data = safeProject(type.project, event, device)
-    return data === undefined ? undefined : { at: event.at, module: event.module, type: event.type, scope: event.scope, data }
+    if (type === undefined || !usable(event.module) || !mayRevealScopeTo(event.scope, device)) return undefined
+    const p = runProjection(type.project, event, device)
+    if (!p.visible) {
+      if (p.problem !== undefined) report(event.module, event.type, p.problem)
+      return undefined
+    }
+    return { at: event.at, module: event.module, type: event.type, scope: event.scope, data: p.value }
+  }
+
+  const scopesOf = (collection: Collection<any>, device: TargetDevice): ReadonlyArray<ScopeRef> => {
+    const scopes: ReadonlyArray<ScopeRef> = collection.scope === "household"
+      ? [{ kind: "household" }]
+      : collection.scope === "device" && device.id !== undefined
+      ? [{ kind: "device", id: device.id }]
+      : []
+    return scopes.filter((scope) => mayRevealScopeTo(scope, device))
   }
 
   const snapshot = (device: TargetDevice) =>
     Effect.gen(function*() {
-      // The number first: a change committed while the rows are read is also sent live (a `put` again is harmless).
+      // The number first: a change committed while the rows are read comes again from `catchUp` (a `put` again is harmless).
       const seq = yield* store.lastSeq
-      const out: Array<HouseholdCollectionRows> = []
+      const cursor: FeedCursor = { seq, visible: new Set() }
+      const parts: Array<Array<HouseholdCollectionRows>> = [[]]
+      let partChars = 0
+      let total = 0
       for (const { moduleId, collection } of sent) {
-        const scope: ScopeRef | undefined = collection.scope === "household"
-          ? { kind: "household" }
-          : collection.scope === "device" && device.id !== undefined ? { kind: "device", id: device.id } : undefined
-        if (scope === undefined || !mayRevealScopeTo(scope, device)) continue
-        const rows = yield* store.forModule(moduleId).collection(collection).list({ scope, limit: SNAPSHOT_ROWS }).pipe(
-          Effect.catchTag("ScopeUnknown", () => Effect.succeed([] as ReadonlyArray<Row<unknown>>))
-        )
-        const visible: Array<HouseholdRow> = []
-        for (const row of rows) {
-          const value = projectRow(collection, row, device)
-          if (value !== undefined) visible.push({ id: row.id, rev: row.rev, scope: row.scope, value, updatedAt: row.updatedAt })
+        if (!usable(moduleId)) continue
+        const scopes = scopesOf(collection, device)
+        if (scopes.length === 0) continue
+        let chunk: { module: string; collection: string; rows: Array<HouseholdRow>; truncated: boolean } = { module: moduleId, collection: collection.name, rows: [], truncated: false }
+        parts[parts.length - 1]!.push(chunk)
+        for (const scope of scopes) {
+          const read = yield* Effect.result(store.forModule(moduleId).collection(collection).list({ scope, limit: SNAPSHOT_ROWS }))
+          if (read._tag === "Failure") {
+            const e = read.failure
+            if (e._tag !== "ScopeUnknown") report(moduleId, collection.name, `could not be read for a page: ${e.message}`)
+            chunk.truncated = true
+            continue
+          }
+          if (read.success.length >= SNAPSHOT_ROWS) chunk.truncated = true
+          for (const row of read.success) {
+            const p = projectFor(moduleId, collection, row, device)
+            if (!p.visible) continue
+            const out: HouseholdRow = { id: row.id, rev: row.rev, scope: row.scope, value: p.value, updatedAt: row.updatedAt }
+            const chars = p.chars + 300
+            if (total + chars > SNAPSHOT_MAX_CHARS) {
+              chunk.truncated = true
+              break
+            }
+            if (partChars + chars > SNAPSHOT_PART_CHARS && partChars > 0) {
+              chunk = { module: moduleId, collection: collection.name, rows: [], truncated: chunk.truncated }
+              parts.push([chunk])
+              partChars = 0
+              yield* Effect.yieldNow
+            }
+            chunk.rows.push(out)
+            cursor.visible.add(rowKey(moduleId, collection.name, row.id))
+            partChars += chars
+            total += chars
+          }
         }
-        out.push({ module: moduleId, collection: collection.name, rows: visible, truncated: rows.length >= SNAPSHOT_ROWS })
+        yield* Effect.yieldNow
       }
-      return { seq, collections: out }
+      return { seq, parts, cursor } satisfies Snapshot
     })
 
-  /** The value a row had before `first` (the first change the page missed), or "unknown" when the log cannot say. */
-  const beforeOf = (collection: Collection<any>, first: ChangeRecord): Effect.Effect<Row<unknown> | undefined | "unknown"> => {
-    if (first.op === "insert") return Effect.succeed(undefined)
-    const before = first.payload?.before
-    if (first.payload === undefined || before === undefined) return Effect.succeed("unknown")
-    return decodeStored(collection, first.payload.v, before, first.id).pipe(
-      Effect.map((d): Row<unknown> => ({ id: first.id, rev: first.rev - 1, scope: first.scope, value: d.value, createdAt: 0, updatedAt: first.at, updatedBy: first.actor })),
-      Effect.orElseSucceed(() => "unknown" as const)
-    )
-  }
-
-  const replay = (device: TargetDevice, seq: number) =>
+  const catchUp = (device: TargetDevice, cursor: FeedCursor) =>
     Effect.gen(function*() {
-      const fresh = Effect.map(snapshot(device), (s): Replay => ({ kind: "snapshot", ...s }))
-      const last = yield* store.lastSeq
-      if (seq > last) return yield* fresh // a restored or replaced database: the page's numbers mean nothing here
-      if (seq === last) return { kind: "events", events: [] } satisfies Replay
-      const page = yield* store.changesSince(seq, REPLAY_CHANGES)
-      // Too long a gap, or changes the page missed were pruned (numbers have no holes otherwise).
-      if (!page.complete || page.oldest > seq + 1) return yield* fresh
+      const page = yield* store.changesSince(cursor.seq, CATCH_UP_CHANGES)
+      if (page.changes.length === 0) return { kind: "changes", events: [], more: false } satisfies CatchUp
+      // The page missed changes the log no longer has (pruned), or numbers it never saw (another database): resync.
+      if (page.oldest > cursor.seq + 1 || page.changes[0]!.seq !== cursor.seq + 1) return { kind: "resync" } satisfies CatchUp
       // One entry per row, in the order of its last change.
-      const rows = new Map<string, { first: ChangeRecord; last: ChangeRecord; collection: Collection<any> }>()
+      const rows = new Map<string, ChangeRecord>()
       for (const change of page.changes) {
-        const collection = collections.get(`${change.module}/${change.collection}`)
-        if (collection === undefined) continue
-        const key = `${change.module}/${change.collection}/${change.id}`
-        const at = rows.get(key)
-        if (at === undefined) rows.set(key, { first: change, last: change, collection })
-        else {
-          rows.delete(key)
-          rows.set(key, { ...at, last: change })
-        }
+        const key = rowKey(change.module, change.collection, change.id)
+        rows.delete(key)
+        rows.set(key, change)
       }
       const events: Array<HouseholdEventInfo> = []
-      for (const { first, last: lastChange, collection } of rows.values()) {
-        const now = yield* store.forModule(lastChange.module).collection(collection).get(lastChange.id, { scope: lastChange.scope }).pipe(
-          Effect.catchTag("ScopeUnknown", () => Effect.succeed(undefined))
-        )
-        const nowValue = projectRow(collection, now, device)
-        if (nowValue !== undefined) {
-          events.push(changeInfo({ ...lastChange, rev: now!.rev, scope: now!.scope }, { op: "put", value: nowValue }))
-          continue
+      for (const [key, change] of rows) {
+        const collection = collections.get(`${change.module}/${change.collection}`)
+        if (collection === undefined || !usable(change.module)) continue
+        const now = yield* Effect.result(store.forModule(change.module).collection(collection).get(change.id, { scope: change.scope }))
+        if (now._tag === "Failure" && now.failure._tag !== "ScopeUnknown") report(change.module, collection.name, `row ${change.id} could not be read for a page: ${now.failure.message}`)
+        const row = now._tag === "Success" ? now.success : undefined
+        const p = projectFor(change.module, collection, row, device)
+        const base = { seq: change.seq, at: change.at, module: change.module, type: `${change.module}.${change.collection}.changed` }
+        if (p.visible) {
+          cursor.visible.add(key)
+          const data: HouseholdChange = { collection: collection.name, id: change.id, op: "put", rev: row!.rev, value: p.value }
+          events.push({ ...base, scope: row!.scope, data })
+        } else if (cursor.visible.delete(key)) {
+          const data: HouseholdChange = { collection: collection.name, id: change.id, op: "remove", rev: change.rev }
+          events.push({ ...base, scope: change.scope, data })
         }
-        const before = yield* beforeOf(collection, first)
-        if (before === "unknown") return yield* fresh
-        if (projectRow(collection, before, device) !== undefined) events.push(changeInfo(lastChange, { op: "remove" }))
       }
-      return { kind: "events", events } satisfies Replay
+      cursor.seq = page.changes[page.changes.length - 1]!.seq
+      return { kind: "changes", events, more: !page.complete } satisfies CatchUp
     })
 
-  return { active: collections.size > 0 || eventTypes.size > 0, snapshot, live, replay }
+  return { active: collections.size > 0 || eventTypes.size > 0, snapshot, catchUp, live }
 }

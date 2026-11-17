@@ -125,7 +125,7 @@ import { makeRoutingService, ROUTING_KEYS } from "./routing.ts"
 import { openServeHousehold } from "./household.ts"
 import { makeHouseholdPush } from "./HouseholdPush.ts"
 import { hostEvent, withContextProvider } from "@pva/core"
-import { runMaintenance } from "@pva/store-sqlite"
+import { householdBackupIssues, runMaintenance } from "@pva/store-sqlite"
 import { type KdfParams, openVault, type Vault, VaultPathConfig } from "./Vault.ts"
 import * as SherpaStt from "@pva/stt-sherpa"
 import * as SherpaTts from "@pva/tts-sherpa"
@@ -323,11 +323,19 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     // upgraded before any module is made. A database from a newer assistant stops the start here.
     const logContext = yield* Effect.context<never>()
     const logInfo = (line: string) => void Effect.runForkWith(logContext)(Effect.logInfo(line))
+    /** Projections that failed for pages, per module (a Health issue each; `host` exists once the store is open). */
+    const feedProblems = new Map<string, { what: string; message: string }>()
+    let reportFeed: (() => void) | undefined
     const household = yield* openServeHousehold({
       dataDir: options.dataDir,
       catalog,
       backupCopyDir: env.HOUSEHOLD_BACKUP_COPY_DIR,
-      log: logInfo
+      log: logInfo,
+      guard: lock.guard,
+      report: (problem) => {
+        feedProblems.set(problem.module, { what: problem.what, message: problem.message })
+        reportFeed?.()
+      }
     }).pipe(Effect.mapError((e) => new SettingsStoreError({ message: e.message, cause: e })))
     // Capabilities run for the assistants that switch them on (`moduleDemand`, below; read from startEnabled on).
     const host = yield* makeModuleHost({
@@ -502,7 +510,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     const ambientFacts = household.ambient({
       mode: () => {
         const v = sections.value("HOME_AMBIENT_FACTS")
-        return v === "off" || v === "module-on" ? v : "all"
+        return v === "all" || v === "module-on" ? v : "off"
       },
       moduleOn: (assistantId, moduleId) => assistantsNow().get(assistantId)?.modules[moduleId]?.on === true
     })
@@ -1307,19 +1315,24 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       checker,
       catalog,
       core: Effect.suspend(() =>
-        runCoreChecks({
-          checker,
-          env,
-          dataDir: options.dataDir,
-          modelDirs: sections.modelDirs(),
-          serving: true,
-          vault: { state: vault.state(), path: vault.path },
-          assistants: [...assistantsNow().values()],
-          sttShared: sttShared()
-        })
+        Effect.zipWith(
+          runCoreChecks({
+            checker,
+            env,
+            dataDir: options.dataDir,
+            modelDirs: sections.modelDirs(),
+            serving: true,
+            vault: { state: vault.state(), path: vault.path },
+            assistants: [...assistantsNow().values()],
+            sttShared: sttShared()
+          }),
+          // The household's cheap checks (backup age, a pending erase); its quick check is `pnpm start doctor`'s.
+          household.sqlite !== undefined ? householdBackupIssues(household.sqlite) : Effect.succeed([]),
+          (a, b) => [...a, ...b]
+        )
       )
     })
-    const push = makeHouseholdPush({ feed: household.feed, bus: household.bus, run, log: (line) => runFork(Effect.logWarning(line)) })
+    const push = makeHouseholdPush({ feed: household.feed, bus: household.bus, store: household.store, run, log: (line) => runFork(Effect.logWarning(line)) })
     hub = makeSessionHub({
       household: push.hooks,
       admin,
@@ -1347,7 +1360,16 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       ...(options.helloTimeoutMs !== undefined ? { helloTimeoutMs: options.helloTimeoutMs } : {})
     })
     const hubNow = hub
-    yield* push.forward(() => hubNow.voiceConnections())
+    yield* push.forward
+    // A projection for pages that failed: one Health issue per module (it affects only that collection or event type).
+    reportFeed = () =>
+      host.issues.set("household-pages", [...feedProblems].map(([moduleId, p]) => ({
+        id: `core.household.projection.${moduleId}`,
+        severity: "warning" as const,
+        title: `Module ${moduleId}: what it shows on voice pages failed`,
+        detail: `${p.what}: ${p.message}`.slice(0, 1900)
+      })))
+    reportFeed()
     // Daily backups and change-log retention (never on a turn's path); a failing backup shows on the Health page.
     if (household.sqlite !== undefined) {
       const sqlite = household.sqlite

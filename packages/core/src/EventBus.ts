@@ -3,7 +3,7 @@ import { type Actor, type CommittedChange, currentActor, HOUSEHOLD_SCOPE, type H
 
 /**
  * The household event bus (docs/MODULES-PLAN.md §4 P4; shared-state-jobs-and-notifications.md §5): one in-process bus
- * for data changes (published by the store after each commit, from the change log's rows), host events
+ * for data changes (published by the store after each commit, in change-log order), host events
  * (`host.turn.ended`, `host.device.connected`, `host.device.disconnected`, `host.module.state`) and events modules
  * publish (`<moduleId>.<type>`, docs/MODULES-PLAN.md §2 row 12).
  *
@@ -51,14 +51,21 @@ export interface EventBus {
   readonly stats: () => { readonly published: number; readonly dropped: number; readonly subscribers: number }
   /** `ctx.events` of a module. */
   readonly forModule: (moduleId: string) => ModuleEvents
+  /**
+   * Publish every commit of `store` (its data changes, in change-log order), and hold the module events published
+   * inside one of its transactions until that transaction commits (dropped if it rolls back). Returns the function
+   * that undoes both. `connectStoreToBus` is this.
+   */
+  readonly connect: (store: HouseholdStore) => () => void
 }
 
 /** `ctx.events`: a module's own events (namespaced by its id) and every event on the bus. */
 export interface ModuleEvents {
   /**
    * Publish `<moduleId>.<type>` (type: lower-case words with dots, dashes and underscores). Scope default household;
-   * the actor is the turn's, else the module. It is sent to voice pages only when the module declared the type with a
-   * projection (`defineEventType`).
+   * the actor is the turn's, else the module. Inside a transaction of the store the bus is connected to, it is held
+   * until that transaction commits (after the data changes before it, before those after it) and dropped if it rolls
+   * back. It is sent to voice pages only when the module declared the type with a projection (`defineEventType`).
    */
   readonly publish: (type: string, data: unknown, scope?: ScopeRef) => Effect.Effect<void>
   /** As `EventBus.subscribe`: a stream that lives in the caller's scope (fork it in `shared`'s scope). */
@@ -107,6 +114,8 @@ export interface EventBusOptions {
 
 export const makeEventBus = (options: EventBusOptions = {}): EventBus => {
   const subscribers = new Set<Subscriber>()
+  /** The store whose transactions hold module events back (`connect`). */
+  let store: HouseholdStore | undefined
   const now = options.now ?? Date.now
   let published = 0
   let dropped = 0
@@ -150,12 +159,28 @@ export const makeEventBus = (options: EventBusOptions = {}): EventBus => {
           return
         }
         const actor = yield* currentActor(moduleId)
-        publish({ at: now(), module: moduleId, type: `${moduleId}.${type}`, scope: scope ?? HOUSEHOLD_SCOPE, actor, data })
+        const event: HouseholdEvent = { at: now(), module: moduleId, type: `${moduleId}.${type}`, scope: scope ?? HOUSEHOLD_SCOPE, actor, data }
+        if (store === undefined) return publish(event)
+        // Inside one of the store's transactions: after its commit, in order with its changes; never on a rollback.
+        yield* store.afterCommit(() => publish(event)).pipe(
+          Effect.catch((e) => Effect.logWarning(`Module ${moduleId}: event ${type} not published: ${e.message}`))
+        )
       }),
     subscribe: (filter, opts) => subscribe(filter, { ...opts, name: `module ${moduleId}` })
   })
 
-  return { publish, subscribe, stats: () => ({ published, dropped, subscribers: subscribers.size }), forModule }
+  const connect = (target: HouseholdStore) => {
+    store = target
+    const off = target.onCommit((changes) => {
+      for (const change of changes) publish(changeEvent(change))
+    })
+    return () => {
+      off()
+      if (store === target) store = undefined
+    }
+  }
+
+  return { publish, subscribe, stats: () => ({ published, dropped, subscribers: subscribers.size }), forModule, connect }
 }
 
 /** The bus event of a committed data change: `<module>.<collection>.changed`, after the commit, in change-log order. */
@@ -170,11 +195,8 @@ export const changeEvent = (change: CommittedChange): HouseholdEvent => ({
   change
 })
 
-/** Publish every commit of `store` on `bus`. Returns the unsubscribe function. */
-export const connectStoreToBus = (store: HouseholdStore, bus: EventBus): (() => void) =>
-  store.onCommit((changes) => {
-    for (const change of changes) bus.publish(changeEvent(change))
-  })
+/** Publish every commit of `store` on `bus`, and hold module events back until their transaction commits (`EventBus.connect`). */
+export const connectStoreToBus = (store: HouseholdStore, bus: EventBus): (() => void) => bus.connect(store)
 
 /** A host event (`host.<type>`). */
 export const hostEvent = (type: "turn.ended" | "device.connected" | "device.disconnected" | "module.state", data: unknown, scope: ScopeRef = HOUSEHOLD_SCOPE): HouseholdEvent => ({

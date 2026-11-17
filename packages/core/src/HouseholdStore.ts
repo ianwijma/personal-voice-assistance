@@ -9,12 +9,14 @@ import { CurrentTurn, type TurnContext, type TurnSource } from "./TurnContext.ts
  * same semantics (`makeMemoryHouseholdStore`) that passes the same contract tests (`@pva/core/store-contract`).
  *
  * - **Document collections** (`defineCollection`): JSON rows validated by a Schema, each with an id, a `rev`, a scope
- *   and who changed it last; equality filters, ordering and limits backed by declared indexes; full-text search over
- *   declared fields; lazy migration on read. Every write appends one change-log row in the same transaction.
- * - **Module SQL** (`ModuleStore.sql`): a module's own tables, prefixed `m_<moduleId>__`, with its own migrations;
- *   statements that reach outside the prefix are refused. SQLite store only.
+ *   and who changed it last; one equality filter, ordering and a limit, each list read bound to one index by
+ *   construction; word search over declared fields. A collection whose version rises is migrated whole, at start, in
+ *   one transaction after a backup. Every write appends one change-log row in the same transaction.
+ * - **Module SQL** (`ModuleStore.sql`): a module's own tables, prefixed `sqlPrefixOf(moduleId)`, with its own
+ *   migrations; statements that reach outside the prefix are refused. SQLite store only.
  * - **Transactions** span a module's collections and its SQL (`ModuleStore.transaction`); core services (scheduler,
- *   notifications) join the same transaction with their own tables (`HouseholdStore.core`).
+ *   notifications) join the same transaction with their own tables (`HouseholdStore.core`). The model, shared by both
+ *   stores, is in `StoreTransactions.ts`.
  *
  * Every call is synchronous SQLite on the main thread in the SQLite store, which also frames audio: keep each
  * statement small (single-row writes, indexed reads), and never wait on the network inside a transaction.
@@ -167,6 +169,45 @@ export interface AmbientContext {
 /** A filter value: equality on a declared index (`null` matches a missing field). */
 export type WhereValue = string | number | boolean | null
 
+/**
+ * The order of indexed values, the same in both stores (it is SQLite's order of `json_extract` results): a missing
+ * field and `null` first, then numbers (`false` = 0, `true` = 1) by value, then strings by code point (UTF-8 byte
+ * order). Ties are broken by `updatedAt`, then by id, in the same direction.
+ */
+export const compareIndexed = (a: unknown, b: unknown): number => {
+  const rank = (x: unknown) => (x === null || x === undefined ? 0 : typeof x === "number" || typeof x === "boolean" ? 1 : 2)
+  const ra = rank(a)
+  const rb = rank(b)
+  if (ra !== rb) return ra - rb
+  if (ra === 1) return Number(a) - Number(b)
+  if (ra === 2) return compareCodePoints(a as string, b as string)
+  return 0
+}
+
+/** Two strings by code point (= UTF-8 byte order, SQLite's BINARY collation), not by UTF-16 unit. */
+export const compareCodePoints = (a: string, b: string): number => {
+  const n = Math.min(a.length, b.length)
+  for (let i = 0; i < n; i++) {
+    const x = a.charCodeAt(i)
+    const y = b.charCodeAt(i)
+    if (x === y) continue
+    // A surrogate (a code point above U+FFFF) sorts after every unit of the Basic Multilingual Plane.
+    const sx = x >= 0xd800 && x <= 0xdfff
+    const sy = y >= 0xd800 && y <= 0xdfff
+    if (sx !== sy) return sx ? 1 : -1
+    return x - y
+  }
+  return a.length - b.length
+}
+
+/** Whether a stored indexed value equals a filter value, as SQLite compares them (booleans are 1 / 0). */
+export const indexedEquals = (stored: unknown, filter: WhereValue): boolean => {
+  if (filter === null) return stored === null || stored === undefined
+  const s = typeof stored === "boolean" ? (stored ? 1 : 0) : stored
+  const f = typeof filter === "boolean" ? (filter ? 1 : 0) : filter
+  return s === f
+}
+
 /** A collection as declared (`defineCollection`). */
 export interface Collection<A> {
   readonly _tag: "Collection"
@@ -175,13 +216,21 @@ export interface Collection<A> {
   readonly scope: ScopeKind
   /** The row's type; rows are stored in its JSON form (`Schema.toCodecJson`). */
   readonly schema: Schema.Codec<A, unknown>
-  /** Raised by one for each change of shape; rows of an older version are migrated on read (`migrate`). */
+  /**
+   * Raised by one for each change of shape. When the module starts with a higher version than its stored rows, every
+   * row is migrated (`migrate`) in one transaction, after a backup, before the module runs; a failure leaves the
+   * data as it was and the module `unavailable`.
+   */
   readonly version: number
   /** `migrate[n]` turns a version-`n` value (JSON form) into a version-`n+1` one. One entry per version below `version`. */
   readonly migrate: Readonly<Record<number, (value: any) => unknown>>
-  /** Top-level fields `list` may filter (`where`) or order on. Each is one index. */
+  /**
+   * Top-level fields `list` may filter (`where`, one field per query) or order on. Each is one index. Their values must
+   * be strings, finite numbers, `true` / `false`, `null` or missing (a write with a list or an object there is
+   * `invalid`), so both stores order and compare them the same way (`compareIndexed`).
+   */
   readonly indexes: ReadonlyArray<string>
-  /** Top-level string (or string list) fields that `search` looks in. */
+  /** Top-level string (or string list) fields whose words `search` looks for. */
   readonly search: ReadonlyArray<string>
   /** `full`: the change log keeps each change's values (undo works). `none`: only that it happened (no undo). */
   readonly history: "full" | "none"
@@ -284,8 +333,17 @@ export const checkModuleStorage = (moduleId: string, storage: ModuleStorage): vo
   if ((storage.sql?.migrations.length ?? 0) > 1000) throw new Error(`Module ${moduleId}: too many SQL migrations`)
 }
 
-/** The table prefix of a module's SQL. */
-export const sqlPrefixOf = (moduleId: string): string => `m_${moduleId.replace(/-/g, "_")}__`
+/**
+ * The table prefix of a module's SQL. One-to-one and prefix-free over every valid module id, so no module's prefix
+ * starts another's: `m_<id>__` with each dash as an underscore, for an id without a double or trailing dash (its
+ * underscores then never form `__` and never end it: `home-assistant` → `m_home_assistant__`); any other id
+ * (`a--b`, `timer-`) is spelled in hex, `mx_<hex of the id>__`, which no `m_` prefix can start.
+ */
+export const sqlPrefixOf = (moduleId: string): string =>
+  /--|-$/.test(moduleId) ? `mx_${[...moduleId].map((c) => c.charCodeAt(0).toString(16).padStart(2, "0")).join("")}__` : `m_${moduleId.replace(/-/g, "_")}__`
+
+/** Whether a name (lower case) is in some module's SQL namespace (`m_…__…` or `mx_…`). */
+export const isModuleSqlName = (name: string): boolean => /^m_[a-z0-9_]*?__/.test(name) || name.startsWith("mx_")
 
 // ---------------------------------------------------------------------------------------------------------------------
 // The module's view: ctx.store
@@ -300,8 +358,17 @@ export interface WriteOptions extends ScopeOptions {
   readonly actor?: Actor
 }
 
+/**
+ * A list read. Every shape is one index range read up to `limit` rows (no sort of the matching rows), by construction:
+ *
+ * - no `where`: ordered by `updatedAt` (the default, newest first), `createdAt`, or a declared index;
+ * - `where` on **one** declared index: ordered by `updatedAt` (default newest first) or by that same field.
+ *
+ * Anything else (two filter fields, a filter with another order) is `invalid`; store a combined field and index it.
+ * Ties are broken by `updatedAt`, then id, in the same direction (`compareIndexed`).
+ */
 export interface ListQuery<A> extends ScopeOptions {
-  /** Equality on declared indexes. */
+  /** Equality on one declared index. */
   readonly where?: Partial<Record<keyof A & string, WhereValue>>
   /** A declared index, or `createdAt` / `updatedAt` (default: `updatedAt`, newest first). */
   readonly orderBy?: { readonly field: (keyof A & string) | "createdAt" | "updatedAt"; readonly direction?: "asc" | "desc" }
@@ -316,21 +383,27 @@ export interface UndoResult<A> {
   readonly row: Row<A> | undefined
 }
 
+/**
+ * One collection of a module. `rev` is the change-log number of the row's last write: it changes on every write and is
+ * never used twice in a household, also not by a row that was removed and inserted again with the same id, so an
+ * `expectRev` from before a removal never matches the new row.
+ */
 export interface CollectionHandle<A> {
   /** The row, or `undefined` when there is none in the scope. */
   readonly get: (id: string, options?: ScopeOptions) => Effect.Effect<Row<A> | undefined, StoreError | ScopeUnknown>
   readonly list: (query?: ListQuery<A>) => Effect.Effect<ReadonlyArray<Row<A>>, StoreError | ScopeUnknown>
   /**
-   * Rows whose `search` fields contain every word of `text` (FTS5 ranking where the build has it; otherwise a scan
-   * of the newest 2,000 rows of the scope). Default limit 20.
+   * Rows of the scope in which every word of `text` (at most 8) begins a word of the `search` fields, the most
+   * recently written first. Words are runs of letters and digits, compared without case and accents
+   * (`searchTokens`); "milk" finds "Milk" and "milkshake", not "buttermilk". The same in both stores. Default limit
+   * 20, at most 200.
    */
   readonly search: (text: string, options?: ScopeOptions & { readonly limit?: number }) => Effect.Effect<ReadonlyArray<Row<A>>, StoreError | ScopeUnknown>
   /** A new row (a random id unless `id` is given; an id in use is a `StoreConflict`). */
   readonly insert: (value: A, options?: WriteOptions & { readonly id?: string }) => Effect.Effect<Row<A>, StoreError | StoreConflict | ScopeUnknown>
   /**
-   * Optimistic update: `f` is applied to the value read, and the write succeeds only if the rev has not moved; it is
-   * re-applied to a fresh read on a conflict, three attempts in all. With `expectRev`, a row at another rev is a
-   * conflict at once.
+   * Read, apply `f` and write, as one step (no other write can come between them). With `expectRev`, a row at another
+   * rev is a `StoreConflict`. `f` must be a plain function of the value: it runs inside the store's transaction.
    */
   readonly update: (
     id: string,
@@ -340,15 +413,20 @@ export interface CollectionHandle<A> {
   /** `false` when there was no such row. */
   readonly remove: (id: string, options?: WriteOptions & { readonly expectRev?: number }) => Effect.Effect<boolean, StoreError | StoreConflict | ScopeUnknown>
   /**
-   * Remove the row and every earlier payload of it: its values in the change log (the log keeps that a change
-   * happened, without content) and its search entries. Daily backups keep it until they rotate out (14 days).
+   * Forget the row: remove it and every payload of it in this scope (its values in the change log, which keeps only
+   * that a change happened, and its search entries), committed when this returns. Afterwards the old content is
+   * overwritten in `household.db` and the write-ahead log is emptied (a checkpoint, retried while a reader such as a
+   * running backup still holds an older snapshot; docs/STORING-DATA.md "Forgetting" says what it cannot reach:
+   * backups until they rotate out, 14 days). `false`: there is no such row in this scope (its history in this scope is
+   * purged all the same; another scope's row of that id is never touched).
    */
   readonly erase: (id: string, options?: WriteOptions) => Effect.Effect<boolean, StoreError | ScopeUnknown>
   /**
-   * Undo the last change the actor (default: the turn's) made in this collection that is not already undone. A row
-   * changed by someone else since is a `StoreConflict`. `undefined`: nothing to undo. Never for `history: "none"`.
+   * Undo the last change the actor (default: the turn's) made in this collection **in this scope** (default: the
+   * turn's, as every other call) that is not already undone and still has its values. A row changed by someone else
+   * since is a `StoreConflict`. `undefined`: nothing to undo. Never for `history: "none"`.
    */
-  readonly undo: (options?: { readonly actor?: Actor }) => Effect.Effect<UndoResult<A> | undefined, StoreError | StoreConflict>
+  readonly undo: (options?: ScopeOptions & { readonly actor?: Actor }) => Effect.Effect<UndoResult<A> | undefined, StoreError | StoreConflict | ScopeUnknown>
 }
 
 /** A module SQL write reported to the change log and the bus (collections log their own writes). */
@@ -373,8 +451,10 @@ export interface ModuleStore {
   readonly sql: ModuleSql
   /**
    * Run `work` in one transaction (nested calls are savepoints): every collection write and SQL statement in it
-   * commits or rolls back together, and events are published only after the commit. No network calls inside: the
-   * transaction holds the database's one connection.
+   * commits or rolls back together, and its events (data changes and `ctx.events.publish`) are published only after
+   * the commit, in change-log order. Concurrent work inside one transaction runs one savepoint at a time. A fiber
+   * forked inside that outlives it fails with `StoreError`. No network calls inside: the transaction holds the
+   * database's one connection.
    */
   readonly transaction: <X, E, R>(work: Effect.Effect<X, E, R>) => Effect.Effect<X, E | StoreError, R>
   /** Record a module SQL write in the change log (for "what changed" and the bus). */
@@ -430,12 +510,17 @@ export interface CoreSql {
   readonly migrate: (migrations: ReadonlyArray<string>) => Effect.Effect<void, StoreError>
 }
 
-/** One module's data as JSON (`HouseholdStore.exportModule`). */
+/**
+ * One module's data as JSON (`HouseholdStore.exportModule`): every row of every collection and every row of its SQL
+ * tables, read from one consistent snapshot. `omitted` names what is not in it and why (a full-text table whose
+ * content lives in another table, or no content at all: its source table is exported instead).
+ */
 export interface ModuleExport {
   readonly module: string
   readonly exportedAt: number
   readonly collections: Readonly<Record<string, ReadonlyArray<{ readonly id: string; readonly rev: number; readonly scope: ScopeRef; readonly value: unknown; readonly createdAt: number; readonly updatedAt: number }>>>
   readonly tables: Readonly<Record<string, ReadonlyArray<Record<string, unknown>>>>
+  readonly omitted: ReadonlyArray<{ readonly table: string; readonly reason: string }>
 }
 
 export interface StoreInfo {
@@ -464,19 +549,29 @@ export interface HouseholdStore {
   readonly availability: (moduleId: string) => ModuleUnavailable | undefined
   /** `ctx.store` of a module (prepared or not: an unprepared module has no collections). */
   readonly forModule: (moduleId: string) => ModuleStore
-  /** One transaction across modules and core services (`ModuleStore.transaction` is this). */
+  /** One transaction across modules and core services (`ModuleStore.transaction` is this; `StoreTransactions.ts`). */
   readonly transaction: <X, E, R>(work: Effect.Effect<X, E, R>) => Effect.Effect<X, E | StoreError, R>
+  /**
+   * Inside a transaction of this store: run `f` after the outermost commit, in order with its data changes (dropped if
+   * the savepoint it was queued in rolls back). Outside one: run it now. How `ctx.events.publish` waits for a commit.
+   */
+  readonly afterCommit: (f: () => void) => Effect.Effect<void, StoreError>
   /** A core service's own tables (P6 scheduler, P9 notifications). */
   readonly core: (owner: string) => CoreSql
   /** The change log after `seq`, oldest first, at most `limit`; `complete`: nothing after these. */
   readonly changesSince: (seq: number, limit: number) => Effect.Effect<{ readonly changes: ReadonlyArray<ChangeRecord>; readonly complete: boolean; readonly oldest: number }, StoreError>
   /** The change log's last number (0 when empty). */
   readonly lastSeq: Effect.Effect<number, StoreError>
-  /** Delete every conversation-scoped row of a conversation that ended. Returns how many. */
+  /**
+   * A conversation ended: erase every row of its scope (as `erase` does: rows, payloads in the change log, search
+   * entries; one `erase` change per row, by `system:conversation-ended`), in one transaction. Returns how many.
+   */
   readonly endConversation: (conversationId: string) => Effect.Effect<number, StoreError>
+  /** At start, before any conversation: the same for every conversation-scoped row (conversations do not outlive a process). */
+  readonly sweepConversations: Effect.Effect<number, StoreError>
   /** Retention: delete change-log rows older than `maxAgeMs` (default 90 days), in small batches. */
   readonly pruneChanges: (options?: { readonly now?: number; readonly maxAgeMs?: number }) => Effect.Effect<number, StoreError>
-  /** An online backup to `<dir>/household-<date>.db` (keeps 14), and a copy to the second directory if set. */
+  /** An online backup to `<dir>/household-<date>.db` (see docs/STORING-DATA.md "Backups" for what is kept how long). */
   readonly backup: (options?: { readonly now?: number }) => Effect.Effect<{ readonly path: string }, StoreError>
   /** One module's data as JSON. */
   readonly exportModule: (moduleId: string) => Effect.Effect<ModuleExport, StoreError>
@@ -489,7 +584,7 @@ export interface HouseholdStore {
 
 export const DEFAULT_LIST_LIMIT = 100
 export const MAX_LIST_LIMIT = 1000
-export const SEARCH_SCAN_ROWS = 2000
+export const MAX_SEARCH_LIMIT = 200
 /** The largest value a row may hold, as JSON. */
 export const MAX_VALUE_CHARS = 64_000
 export const CHANGE_RETENTION_MS = 90 * 24 * 60 * 60 * 1000
@@ -548,10 +643,19 @@ export const encodeValue = <A>(collection: Collection<A>, value: A): Effect.Effe
     const json = yield* Schema.encodeUnknownEffect(codec)(value).pipe(
       Effect.mapError((e) => new StoreError({ reason: "invalid", message: `Collection ${collection.name}: the value does not match its schema: ${e.message}` }))
     )
-    const text = JSON.stringify(json)
+    let text: string | undefined
+    try {
+      text = JSON.stringify(json)
+    } catch (cause) {
+      return yield* new StoreError({ reason: "invalid", message: `Collection ${collection.name}: the value is not JSON`, cause })
+    }
     if (text === undefined) return yield* new StoreError({ reason: "invalid", message: `Collection ${collection.name}: the value is not JSON` })
     if (text.length > MAX_VALUE_CHARS) {
       return yield* new StoreError({ reason: "invalid", message: `Collection ${collection.name}: a value may hold at most ${MAX_VALUE_CHARS} characters of JSON` })
+    }
+    const bad = badIndexedField(collection, json)
+    if (bad !== undefined) {
+      return yield* new StoreError({ reason: "invalid", message: `Collection ${collection.name}: the indexed field "${bad}" must be a string, a number, true/false or null` })
     }
     const decoded = yield* Schema.decodeUnknownEffect(codec)(JSON.parse(text)).pipe(
       Effect.mapError((e) => new StoreError({ reason: "invalid", message: `Collection ${collection.name}: the value does not survive storing: ${e.message}` }))
@@ -559,9 +663,21 @@ export const encodeValue = <A>(collection: Collection<A>, value: A): Effect.Effe
     return { json, text, value: decoded }
   })
 
+/** The first indexed field of `json` that holds something other than a scalar, or `undefined`. */
+const badIndexedField = (collection: Collection<any>, json: unknown): string | undefined => {
+  if (collection.indexes.length === 0 || json === null || typeof json !== "object") return undefined
+  for (const field of collection.indexes) {
+    if (!Object.hasOwn(json, field)) continue
+    const v = (json as Record<string, unknown>)[field]
+    if (v !== null && typeof v !== "string" && typeof v !== "boolean" && !(typeof v === "number" && Number.isFinite(v))) return field
+  }
+  return undefined
+}
+
 /**
  * A stored value (JSON form, written at version `v`) as the collection's type now: migrated forward one version at a
- * time, then decoded. `migrated` tells the store to rewrite it lazily. A value from a newer version is refused.
+ * time, then decoded (`migrated`: the JSON form at the current version, when it was older). Used for rows when their
+ * collection is migrated at start, and for change-log payloads of older versions (undo). A newer value is refused.
  */
 export const decodeStored = <A>(
   collection: Collection<A>,
@@ -587,44 +703,65 @@ export const decodeStored = <A>(
     return { value, migrated: v < collection.version ? current : undefined }
   })
 
-/** The text a row contributes to search: its `search` fields (strings and string lists), joined. */
-export const searchTextOf = (collection: Collection<any>, json: unknown): string => {
-  if (collection.search.length === 0 || json === null || typeof json !== "object") return ""
+/**
+ * The words of a text for search, the same in both stores: decomposed (NFKD), lower case, accents and other marks
+ * removed, then the runs of letters and digits, each once. "Crème BRÛLÉE, 2×" → `crème` → `creme`, `brulee`, `2`.
+ */
+export const searchTokens = (text: string): ReadonlyArray<string> =>
+  [...new Set(text.normalize("NFKD").toLowerCase().replace(/\p{M}/gu, "").match(/[\p{L}\p{N}]+/gu) ?? [])]
+
+/** The words a row contributes to search: those of its `search` fields (strings and string lists). */
+export const searchTokensOf = (collection: Collection<any>, json: unknown): ReadonlyArray<string> => {
+  if (collection.search.length === 0 || json === null || typeof json !== "object") return []
   const parts: Array<string> = []
   for (const field of collection.search) {
+    if (!Object.hasOwn(json, field)) continue
     const v = (json as Record<string, unknown>)[field]
     if (typeof v === "string") parts.push(v)
     else if (Array.isArray(v)) for (const x of v) if (typeof x === "string") parts.push(x)
   }
-  return parts.join("\n")
+  return searchTokens(parts.join("\n"))
 }
 
-/** The words of a search (letters and digits, lower case, at most 8). */
-export const searchWords = (text: string): ReadonlyArray<string> =>
-  (text.toLowerCase().normalize("NFKD").replace(/[̀-ͯ]/g, "").match(/[\p{L}\p{N}]+/gu) ?? []).slice(0, 8)
+/** The words of a search: `searchTokens` of the text, at most 8. */
+export const searchWords = (text: string): ReadonlyArray<string> => searchTokens(text).slice(0, 8)
 
-/** Whether `text` contains every word (the fallback without FTS5, and the in-memory store). */
-export const matchesWords = (text: string, words: ReadonlyArray<string>): boolean => {
-  const hay = text.toLowerCase().normalize("NFKD").replace(/[̀-ͯ]/g, "")
-  return words.every((w) => hay.includes(w))
+/** Whether every word begins one of the tokens (the search rule of both stores). */
+export const matchesTokens = (tokens: ReadonlyArray<string>, words: ReadonlyArray<string>): boolean =>
+  words.every((w) => tokens.some((t) => t.startsWith(w)))
+
+/** A list query as one index range read: its filter (at most one field) and its order. */
+export interface CheckedQuery {
+  readonly limit: number
+  readonly where: readonly [field: string, value: WhereValue] | undefined
+  /** A JSON field, or the `createdAt` / `updatedAt` column. */
+  readonly order: { readonly field: string; readonly column: boolean; readonly desc: boolean }
 }
 
-/** Check a list query against the collection's indexes. */
-export const checkQuery = (collection: Collection<any>, query: ListQuery<any> | undefined): Effect.Effect<number, StoreError> => {
-  for (const field of Object.keys(query?.where ?? {})) {
-    if (!collection.indexes.includes(field)) {
-      return Effect.fail(new StoreError({ reason: "invalid", message: `Collection ${collection.name}: "${field}" is not a declared index (indexes: ${collection.indexes.join(", ") || "none"})` }))
-    }
+const isWhereValue = (v: unknown): v is WhereValue =>
+  v === null || typeof v === "string" || typeof v === "boolean" || (typeof v === "number" && Number.isFinite(v))
+
+/** Check a list query against the collection's indexes and the shapes one index can answer (`ListQuery`). */
+export const checkQuery = (collection: Collection<any>, query: ListQuery<any> | undefined): Effect.Effect<CheckedQuery, StoreError> => {
+  const invalid = (message: string) => Effect.fail(new StoreError({ reason: "invalid", message: `Collection ${collection.name}: ${message}` }))
+  const entries = Object.entries(query?.where ?? {}).filter(([, v]) => v !== undefined)
+  if (entries.length > 1) return invalid(`list filters on one indexed field at a time (it was given ${entries.map(([f]) => f).join(", ")}); store a combined field and index it`)
+  for (const [field, value] of entries) {
+    if (!collection.indexes.includes(field)) return invalid(`"${field}" is not a declared index (indexes: ${collection.indexes.join(", ") || "none"})`)
+    if (!isWhereValue(value)) return invalid(`the filter on "${field}" must be a string, a finite number, true/false or null`)
   }
-  const order = query?.orderBy?.field
-  if (order !== undefined && order !== "createdAt" && order !== "updatedAt" && !collection.indexes.includes(order)) {
-    return Effect.fail(new StoreError({ reason: "invalid", message: `Collection ${collection.name}: cannot order on "${order}", which is not a declared index` }))
+  const where = entries[0] as readonly [string, WhereValue] | undefined
+  const field = query?.orderBy?.field ?? "updatedAt"
+  const column = field === "createdAt" || field === "updatedAt"
+  if (!column && !collection.indexes.includes(field)) return invalid(`cannot order on "${field}", which is not a declared index`)
+  if (where !== undefined && field !== "updatedAt" && field !== where[0]) {
+    return invalid(`a list filtered on "${where[0]}" is ordered by updatedAt or by "${where[0]}", not by "${field}"`)
   }
+  const direction = query?.orderBy?.direction ?? (column ? "desc" : "asc")
+  if (direction !== "asc" && direction !== "desc") return invalid(`direction must be "asc" or "desc"`)
   const limit = query?.limit ?? DEFAULT_LIST_LIMIT
-  if (!Number.isInteger(limit) || limit < 1 || limit > MAX_LIST_LIMIT) {
-    return Effect.fail(new StoreError({ reason: "invalid", message: `Collection ${collection.name}: limit must be 1 to ${MAX_LIST_LIMIT}` }))
-  }
-  return Effect.succeed(limit)
+  if (!Number.isInteger(limit) || limit < 1 || limit > MAX_LIST_LIMIT) return invalid(`limit must be 1 to ${MAX_LIST_LIMIT}`)
+  return Effect.succeed({ limit, where, order: { field, column, desc: direction === "desc" } })
 }
 
 /** The error of a write in read-only mode. */
@@ -659,10 +796,12 @@ export const makeClosedStore = (reason: string): HouseholdStore => {
       logChange: () => fail
     }),
     transaction: (work) => work,
+    afterCommit: (f) => Effect.sync(f),
     core: (owner) => ({ prefix: `core_${owner}__`, query: () => fail, run: () => fail, migrate: () => fail }),
     changesSince: () => Effect.succeed({ changes: [], complete: true, oldest: 0 }),
     lastSeq: Effect.succeed(0),
     endConversation: () => Effect.succeed(0),
+    sweepConversations: Effect.succeed(0),
     pruneChanges: () => Effect.succeed(0),
     backup: () => fail,
     exportModule: () => fail,

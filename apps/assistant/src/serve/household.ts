@@ -8,6 +8,7 @@ import {
   makeEventBus,
   makeHouseholdFeed,
   type ContextProvider,
+  type FeedProblem,
   type ModuleDefinition,
   StoreError
 } from "@pva/core"
@@ -31,7 +32,13 @@ export interface Household {
 
 const declared = (catalog: ReadonlyArray<ModuleDefinition<any>>) => catalog.map((d) => ({ id: d.id, storage: d.storage }))
 
-const assemble = (store: HouseholdStore, sqlite: SqliteHouseholdStore | undefined, catalog: ReadonlyArray<ModuleDefinition<any>>, log: (line: string) => void) =>
+const assemble = (
+  store: HouseholdStore,
+  sqlite: SqliteHouseholdStore | undefined,
+  catalog: ReadonlyArray<ModuleDefinition<any>>,
+  log: (line: string) => void,
+  report?: (problem: FeedProblem) => void
+) =>
   Effect.gen(function*() {
     yield* store.prepare(declared(catalog))
     for (const d of catalog) {
@@ -43,7 +50,8 @@ const assemble = (store: HouseholdStore, sqlite: SqliteHouseholdStore | undefine
     yield* Effect.addFinalizer(() => Effect.sync(disconnect))
     const feed = makeHouseholdFeed({
       store,
-      modules: catalog.map((d) => ({ moduleId: d.id, collections: d.storage?.collections ?? [], events: d.events ?? [] }))
+      modules: catalog.map((d) => ({ moduleId: d.id, collections: d.storage?.collections ?? [], events: d.events ?? [] })),
+      ...(report !== undefined ? { report } : {})
     })
     const ambientModules = catalog.flatMap((d) => {
       const collections = (d.storage?.collections ?? []).filter((c) => c.ambient !== undefined)
@@ -60,20 +68,30 @@ const assemble = (store: HouseholdStore, sqlite: SqliteHouseholdStore | undefine
     return household
   })
 
-/** Serve mode: the one writer. A database from a newer assistant fails the start (the message says what to do). */
+/**
+ * Serve mode: the one writer. A database from a newer assistant fails the start (the message says what to do). Every
+ * file operation of the store runs under `guard` (the data directory lock's), and conversation rows left by a
+ * previous process (conversations do not outlive it) are erased before any session starts.
+ */
 export const openServeHousehold = (options: {
   readonly dataDir: string
   readonly catalog: ReadonlyArray<ModuleDefinition<any>>
   readonly backupCopyDir?: string | undefined
   readonly log: (line: string) => void
+  readonly guard?: <A>(what: string, run: () => Promise<A>) => Promise<A>
+  /** A projection for pages that failed (a Health issue). */
+  readonly report?: (problem: FeedProblem) => void
 }): Effect.Effect<Household, StoreError, Scope.Scope> =>
   Effect.gen(function*() {
     const sqlite = yield* makeSqliteStore({
       filename: householdDbPath(options.dataDir),
       ...(options.backupCopyDir !== undefined && options.backupCopyDir !== "" ? { backupCopyDir: options.backupCopyDir } : {}),
+      ...(options.guard !== undefined ? { guard: options.guard } : {}),
       log: options.log
     })
-    return yield* assemble(sqlite, sqlite, options.catalog, options.log)
+    const swept = yield* sqlite.sweepConversations
+    if (swept > 0) options.log(`Household: ${swept} row(s) of conversations of the previous run erased`)
+    return yield* assemble(sqlite, sqlite, options.catalog, options.log, options.report)
   })
 
 /**
