@@ -735,6 +735,10 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
             utterance.firstInterimAt = options.turnTrace.now()
           }
           return event
+        case "EagerEndOfTurn":
+        case "TurnResumed":
+          // On the event itself (an utterance may have several): the dispatcher may hold it for the routing call.
+          return event.heardAt !== undefined ? event : { ...event, heardAt: options.turnTrace.now() }
         case "EndOfTurn":
           utterance = undefined
           return event
@@ -820,6 +824,8 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
 
     /** An utterance closed outside `onStt` (a recogniser switch, a new build): it holds the turn no longer. */
     const utteranceDropped = () => {
+      // Its times too: the next `SpeechStarted` begins a new utterance (its `EndOfTurn` never came through `stamp`).
+      utterance = undefined
       heardFor = undefined
       heardStopped = false
       handedTo = undefined

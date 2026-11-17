@@ -1640,7 +1640,8 @@ const makeConversationCore = Effect.fnUntraced(function*(options: AgentConversat
           switch (event._tag) {
             case "EagerEndOfTurn": {
               // Taken first: the interruption of an earlier speculative turn below is not part of the user's pause.
-              const eagerAt = tt.now()
+              // The session's stamp when it has one (the dispatcher may have held the event for the routing call).
+              const eagerAt = event.heardAt ?? tt.now()
               if (!utteranceOpen) return yield* outsideUtterance(event)
               if (utteranceCancelled()) return
               // No words (yet): nothing to reply to. A speculative turn for earlier words is
@@ -1657,7 +1658,7 @@ const makeConversationCore = Effect.fnUntraced(function*(options: AgentConversat
               return yield* start(event.text, true, "voice", true, { answerable: utteranceAnswerable })
             }
             case "TurnResumed": {
-              const resumedAt = tt.now()
+              const resumedAt = event.heardAt ?? tt.now()
               if (!utteranceOpen) return yield* outsideUtterance(event)
               heard.turnResumed = resumedAt
               if (turn?.pending) yield* interrupt(turn)

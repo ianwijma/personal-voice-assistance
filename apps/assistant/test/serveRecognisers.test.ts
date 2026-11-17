@@ -233,6 +233,34 @@ describe("serve: one recogniser per device, from its hearer (WP-11)", () => {
     expect(old.closed).toBe(true)
   })
 
+  it("an utterance closed by the switch takes its times with it: the next utterance's time line starts when it was heard", async () => {
+    const fake = fakeRecognisers()
+    await start(fake, { hearerSwitchWaitMs: 300 })
+    const admin = await connect()
+    await admin.admin(TEST_ADMIN_PASSWORD)
+    const client = await device("device-a")
+    await until("device-a hearing", () => streamOf(fake, "device-a") !== undefined)
+    const old = streamOf(fake, "device-a")!
+    fake.emit(old, { _tag: "SpeechStarted" }, { _tag: "Interim", text: "hey alpha what" })
+    await saveHearing("alpha", { model: "model-c" })
+    await until("switched to model-c", () => streamOf(fake, "device-a")?.model === "model-c", 3_000)
+    await sleep(500)
+    const from = client.messages.length
+    const adminFrom = admin.messages.length
+    fake.emit(streamOf(fake, "device-a")!, { _tag: "SpeechStarted" })
+    await sleep(100)
+    fake.emit(streamOf(fake, "device-a")!, { _tag: "Interim", text: "hey alpha what time" }, { _tag: "EndOfTurn", text: "hey alpha what time is it" })
+    const begun = await client.waitFor("turn.start", () => true, { from, timeoutMs: 10_000 })
+    const trace = (await admin.waitFor("trace", (m) => m.trace.turnId === begun.turnId, { from: adminFrom, timeoutMs: 10_000 })).trace
+    const line = trace.timeline!
+    const startedAt = line.find((x) => x.name === "speechStarted")!.at
+    const firstInterimAt = line.find((x) => x.name === "firstInterim")!.at
+    // This utterance's own start (~100 ms before its end), not the closed one's (more than 500 ms before).
+    expect(startedAt).toBeGreaterThan(-400)
+    expect(startedAt).toBeLessThan(-50)
+    expect(firstInterimAt).toBeGreaterThanOrEqual(startedAt + 50)
+  })
+
   it("an utterance closed by the switch holds the turn no longer: its assistant is not reported while the hearing tail lasts", async () => {
     const fake = fakeRecognisers()
     await start(fake, { hearerSwitchWaitMs: 300 })

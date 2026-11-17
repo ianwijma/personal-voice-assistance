@@ -372,6 +372,18 @@ test.describe("Diagnostics › Latency", () => {
     await expect(graphic.getByText(/shortened/)).toHaveCount(0)
     await mode.getByRole("radio", { name: "Reply" }).click()
     await expect(graphic).toHaveAttribute("data-mode", "reply")
+    // The switch by keyboard: an arrow selects the other option and moves the focus to it, without a page error.
+    const pageErrors: Array<Error> = []
+    page.on("pageerror", (err) => pageErrors.push(err))
+    await mode.getByRole("radio", { name: "Reply" }).focus()
+    await page.keyboard.press("ArrowRight")
+    await expect(graphic).toHaveAttribute("data-mode", "entire")
+    await expect(mode.getByRole("radio", { name: "Entire turn" })).toHaveAttribute("aria-checked", "true")
+    await expect(mode.getByRole("radio", { name: "Entire turn" })).toBeFocused()
+    await page.keyboard.press("ArrowLeft")
+    await expect(graphic).toHaveAttribute("data-mode", "reply")
+    await expect(mode.getByRole("radio", { name: "Reply" })).toBeFocused()
+    expect(pageErrors.map((err) => err.message)).toEqual([])
     // The table lists every entry: "started talking" before 0, the rounds in the labels, a tool's duration, the derived playback time.
     const events = detail.getByTestId("trace-events")
     const started = events.locator("tr[data-event=speechStarted]")

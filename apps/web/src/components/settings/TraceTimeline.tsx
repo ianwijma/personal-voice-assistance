@@ -122,8 +122,10 @@ function AxisMode({ mode, onMode }: { readonly mode: AxisMode; readonly onMode: 
     if (!["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(e.key)) return
     e.preventDefault()
     const next: AxisMode = mode === "reply" ? "entire" : "reply"
+    // Taken now: React clears `currentTarget` once the handler returns.
+    const group = e.currentTarget.parentElement
     onMode(next)
-    requestAnimationFrame(() => (e.currentTarget.parentElement?.querySelector(`[data-mode=${next}]`) as HTMLElement | null)?.focus())
+    requestAnimationFrame(() => (group?.querySelector(`[data-mode=${next}]`) as HTMLElement | null)?.focus())
   }
   return (
     <div role="radiogroup" aria-label="Time axis" data-testid="timeline-axis-mode" className="inline-flex rounded-md border border-line bg-surface p-0.5">

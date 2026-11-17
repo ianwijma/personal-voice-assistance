@@ -221,7 +221,9 @@ export const makeAxis = (events: ReadonlyArray<TraceEvent>, widthPx: number, mod
     for (const seg of segments) {
       const a = Math.max(t0, seg.from)
       const b = Math.min(t1, seg.to)
-      if (b >= a && (b > a || (t0 === t1 && t0 >= seg.from && t0 <= seg.to))) out.push([x(a), x(b)])
+      // Placed inside this segment: at a boundary `x` would give the next segment's pixel, across the break.
+      const within = (t: number) => seg.x0 + (seg.to > seg.from ? (t - seg.from) / (seg.to - seg.from) : 0) * (seg.x1 - seg.x0)
+      if (b >= a && (b > a || (t0 === t1 && t0 >= seg.from && t0 <= seg.to))) out.push([within(a), within(b)])
     }
     return out
   }

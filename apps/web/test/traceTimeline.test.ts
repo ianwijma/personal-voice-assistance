@@ -79,10 +79,27 @@ describe("axis, reply mode", () => {
     expect(ax.x(-150)).toBe(0)
     expect(ax.x(900)).toBeCloseTo(800)
   })
-  it("pieces: a bar across a break is two pieces", () => {
+  it("pieces: a bar across a break is two pieces, and the break between them stays empty", () => {
     const ax = makeAxis(turn43(), 1000, "reply")
-    expect(ax.pieces(-2339, 0)).toHaveLength(2)
+    const [lead, brk] = [ax.breaks[0]!, ax.breaks[1]!]
+    const across = ax.pieces(-2339, 0)
+    expect(across).toHaveLength(2)
+    // The first piece ends where the shortened part ends (120), the second begins after the break (134).
+    expect(across[0]![0]).toBeCloseTo(0)
+    expect(across[0]![1]).toBeCloseTo(lead.x0)
+    expect(across[1]![0]).toBeCloseTo(lead.x1)
+    expect(across[1]![1]).toBeCloseTo(ax.x(0))
+    // Across the playback break too, and across both: no piece reaches into a break.
+    const whole = ax.pieces(-2339, 4564)
+    expect(whole).toHaveLength(3)
+    for (const [p0, p1] of [...across, ...whole]) {
+      for (const b of [lead, brk]) expect(p1 <= b.x0 + 1e-9 || p0 >= b.x1 - 1e-9).toBe(true)
+    }
+    expect(whole[1]![1]).toBeCloseTo(brk.x0)
+    expect(whole[2]![0]).toBeCloseTo(brk.x1)
+    expect(whole[2]![1]).toBeCloseTo(1000)
     expect(ax.pieces(100, 200)).toHaveLength(1)
+    expect(ax.pieces(100, 200)[0]).toEqual([ax.x(100), ax.x(200)])
   })
   it("fits the end of a turn that did not complete", () => {
     const ax = makeAxis([e("endOfTurn", 0), e("llmFirstToken", 150)], 800, "reply", 1820)
