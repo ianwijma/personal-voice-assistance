@@ -1,5 +1,6 @@
 // SessionHub request limits: requests that do work (settings, modules, reload) are bounded per connection and overall.
-import { encodeClientMessage, PROTOCOL_VERSION, type ServerMessage } from "@pva/protocol"
+import { decodeServerMessage, encodeClientMessage, MAX_TEXT_FRAME_BYTES, type ModuleInfo, PROTOCOL_VERSION, type ServerMessage } from "@pva/protocol"
+import { exampleWeatherModule } from "@pva/protocol/examples"
 import { Deferred, Effect } from "effect"
 import { describe, expect, it } from "vitest"
 import { makeAccessPolicy } from "../src/serve/access.ts"
@@ -65,7 +66,7 @@ const fakeSessions = (send: (input: unknown) => string = () => "accepted") => {
   } as never
 }
 
-const setup = () => {
+const setup = (modules: () => ReadonlyArray<ModuleInfo> = () => []) => {
   const gate = Effect.runSync(Deferred.make<void>())
   let started = 0
   let finished = 0
@@ -79,7 +80,7 @@ const setup = () => {
       status: () => ({ state: "ready", problems: [], reloadPending: false, reloadPendingFor: [], engines: [], voices: [] }),
       reload: work({ ok: true })
     } as never,
-    host: { modules: () => [], enable: () => work({ ok: true }), disable: () => work({ ok: true }), configure: () => work({ ok: true }) } as never,
+    host: { modules, enable: () => work({ ok: true }), disable: () => work({ ok: true }), configure: () => work({ ok: true }) } as never,
     sections: { list: () => [], update: () => work({ result: { ok: true }, reload: false }) } as never,
     sessions: fakeSessions(),
     run: (effect) => void Effect.runFork(effect),
@@ -89,9 +90,13 @@ const setup = () => {
   })
   const connect = (id: string) => {
     const received: Array<ServerMessage> = []
+    const texts: Array<string> = []
     const connection: HubConnection = {
       id,
-      sendText: (t) => received.push(JSON.parse(t)),
+      sendText: (t) => {
+        texts.push(t)
+        received.push(JSON.parse(t))
+      },
       sendBinary: () => {},
       close: () => {},
       bufferedAmount: () => 0
@@ -101,7 +106,7 @@ const setup = () => {
     handlers.onText(encodeClientMessage({ type: "admin.login", requestId: `login-${id}`, password: ADMIN_PASSWORD }))
     // Only the results of the requests under test.
     const results = () => received.filter((m): m is Extract<ServerMessage, { type: "result" }> => m.type === "result" && !m.requestId.startsWith("login-"))
-    return { handlers, results }
+    return { handlers, results, texts }
   }
   return { hub, connect, release: () => Effect.runSync(Deferred.succeed(gate, undefined)), started: () => started, finished: () => finished }
 }
@@ -184,5 +189,36 @@ describe("SessionHub: typed input", () => {
     t.say(1)
     expect(t.results()[0]?.error?.code).toBe("engine_failed")
     expect(t.sent).toEqual([])
+  })
+})
+
+// Review round 5 of PR 90 (5A-2): the modules' forms together have a share of the admin snapshot's frame.
+describe("SessionHub: the admin snapshot fits its frame", () => {
+  it("forty modules with forms just under their limit: the snapshot decodes, with the largest forms withheld and said why", () => {
+    const big = (m: number): ModuleInfo => ({
+      ...exampleWeatherModule,
+      id: `m${m}`,
+      name: `Module ${m}`,
+      tools: [],
+      settings: {
+        fields: [{ type: "textList", key: "list", label: "List", apply: "live", default: [], maxItems: 200, itemMaxLength: 500, source: "saved" }],
+        values: { list: Array.from({ length: 120 }, (_, i) => `${i} `.padEnd(380 - m, "x")) },
+        secrets: {},
+        errors: []
+      }
+    })
+    const modules = Array.from({ length: 40 }, (_, m) => big(m))
+    const t = setup(() => modules)
+    const a = t.connect("a")
+    const text = a.texts.find((x) => x.includes('"admin.snapshot"'))!
+    expect(text.length).toBeLessThanOrEqual(MAX_TEXT_FRAME_BYTES)
+    const decoded = decodeServerMessage(text)
+    expect(decoded._tag).toBe("Ok")
+    const sent = (JSON.parse(text) as { snapshot: { modules: Array<ModuleInfo> } }).snapshot.modules
+    const withheld = sent.filter((m) => m.settings.fields.length === 0)
+    expect(withheld.length).toBeGreaterThan(0)
+    // The first modules have the longest items: they are the ones withheld.
+    expect(withheld.map((m) => m.id)).toEqual(sent.slice(0, withheld.length).map((m) => m.id))
+    expect(withheld[0]!.settings.errors[0]!.message).toMatch(/^Module 0's settings are not shown: .*the largest field is "List"\)\. Reduce it in the settings file\.$/)
   })
 })

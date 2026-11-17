@@ -1,5 +1,5 @@
 import type { AudioClientLink } from "@pva/audio-web"
-import { type ConnectionRef, type HostDeviceView, type HostResult, makeConnectionRef, type ModuleHost } from "@pva/core"
+import { type ConnectionRef, type HostDeviceView, type HostResult, makeConnectionRef, type ModuleHost, withinAdminShare } from "@pva/core"
 import {
   type AdminSnapshot,
   type AdminState,
@@ -610,7 +610,8 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
 
   const adminSnapshot = (): AdminSnapshot => ({
     engine: options.engine.status(),
-    modules: options.host.modules().map(access.module),
+    // The modules' forms and tool lists together within their share of the frame (`ADMIN_FORMS_SHARE_BYTES`).
+    modules: [...withinAdminShare(options.host.modules().map(access.module))],
     sections: options.sections.list().map(access.section),
     traces: [...sessions.traces()],
     vault: keys.info(true),

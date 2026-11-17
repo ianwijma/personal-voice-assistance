@@ -69,7 +69,14 @@ export const TOO_LONG = "[hidden: too long to show]"
 
 const isOptionTag = Schema.is(OptionTag)
 
-const clip = (text: string, max: number) => (text.length <= max ? text : `${text.slice(0, Math.max(0, max - 1))}…`)
+/** Cut to `max` characters with "…", never through the middle of a character (a surrogate pair stays whole). */
+const clip = (text: string, max: number) => {
+  if (text.length <= max) return text
+  let n = Math.max(0, max - 1)
+  const c = n > 0 ? text.charCodeAt(n - 1) : 0
+  if (c >= 0xd800 && c <= 0xdbff) n--
+  return `${text.slice(0, n)}…`
+}
 
 interface ModuleValues {
   /** Value → the holders that were given it. */

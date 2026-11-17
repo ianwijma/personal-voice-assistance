@@ -101,6 +101,11 @@ export const ModuleInfo = Schema.Struct({
   status: Schema.optionalKey(StatusLine),
   /** Tools of the running instance (empty while it is not running). */
   tools: Schema.Array(ToolInfo),
+  /**
+   * Protocol 10: tools of the running instance not listed in `tools` (the admin view lists at most 100, and a
+   * module's tools count toward what its form may take); the page says "and N more". Absent = none left out.
+   */
+  toolsLeft: Schema.optionalKey(NonNegativeInt),
   settings: SettingsForm,
   /** Increases on every change to this module; a client keeps the highest it has seen. */
   revision: NonNegativeInt,
