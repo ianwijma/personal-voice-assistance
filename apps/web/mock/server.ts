@@ -147,6 +147,7 @@ import { createVoiceAssistants, scenarioSettings, scriptedTurn } from "./voiceAs
 import { encodeWav, MOCK_PROVIDERS } from "./voices.ts"
 import { createModelPickersMock } from "./modelPickers.ts"
 import { createModuleRoutesMock, demoHomeAction, demoHomeModule } from "./demoHome.ts"
+import { createScheduledJobsMock } from "./scheduledJobs.ts"
 import type { Condition, FieldError } from "@pva/protocol"
 
 const PORT = Number(process.env.MOCK_PORT ?? 8787)
@@ -886,6 +887,7 @@ const voiceSessions = new Map<string, VSession>()
 let conversationSeq = 0
 let modules = initialModules()
 const moduleRoutesMock = createModuleRoutesMock()
+const scheduledJobsMock = createScheduledJobsMock()
 /** Protocol 7: assistants, device types and the devices' own sections (mock/assistants.ts). */
 const assistantsMock = createAssistantsMock({
   modules: () => modules,
@@ -2690,6 +2692,17 @@ const apiRoute = async (req: IncomingMessage, res: ServerResponse, path: string,
     } catch {
       throw new ApiFail(400, "invalid_request", "The request body is not valid JSON")
     }
+  }
+  // P6: the scheduled jobs (as the real server's /api/scheduler/jobs).
+  if (path === "scheduler/jobs") {
+    only("GET")
+    return { status: 200, body: scheduledJobsMock.list() }
+  }
+  const cancelJob = /^scheduler\/jobs\/([A-Za-z0-9_-]{1,64})\/cancel$/.exec(path)
+  if (cancelJob !== null) {
+    only("POST")
+    if (!scheduledJobsMock.cancel(cancelJob[1]!)) throw new ApiFail(404, "not_found", "There is no such job (it may have been removed)")
+    return { status: 200, body: { cancelled: true } }
   }
   // Protocol 10: the admin view of module routes and their tokens (as the real server's /api/module-routes).
   const routesMatch = /^module-routes(?:\/([a-z][a-z0-9-]{0,39})\/tokens(?:\/([a-f0-9]{8,32}))?)?$/.exec(path)
