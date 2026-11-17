@@ -121,7 +121,8 @@ export const householdIssues = (
       const problem = dir === undefined ? undefined : openToOthers(dir)
       if (problem !== undefined) issues.push({ id: "core.household.directory", severity: "error", title: "A household data directory can be written by other users", detail: problem })
     }
-    const modules = (options.modules ?? []).filter((m) => m.storage !== undefined)
+    // Every module, also one that declares no storage: stored data a newer version of it wrote is judged too.
+    const modules = options.modules ?? []
     yield* store.prepare(modules).pipe(Effect.ignore)
     for (const m of modules) {
       const verdict = store.availability(m.id)

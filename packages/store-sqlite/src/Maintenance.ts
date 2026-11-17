@@ -3,8 +3,8 @@ import type { SqliteHouseholdStore } from "./SqliteStore.ts"
 
 /**
  * The store's maintenance fiber (serve mode): once an hour it makes the day's backup when there is none yet (the
- * first one a minute after start, so a start is not slowed down), copies it to the second directory again when that
- * copy is missing (a share that was away), and once a day it removes backups older than 14 days (`pruneBackups`, also
+ * first one a minute after start, so a start is not slowed down), copies every retained backup the second directory
+ * lacks to it (`copyMissing`: a share that was away), and once a day it removes backups older than 14 days (`pruneBackups`, also
  * after every backup). The backup reads through a connection of its own and copies on a worker thread. Each step is
  * logged, and a failed backup is reported through `onBackup`.
  */
@@ -39,8 +39,8 @@ export const runMaintenance = (
           options.onBackup?.(result.failure.message)
         }
       } else if (store.backupCopyDir !== undefined) {
-        const copy = yield* Effect.result(store.lastCopyAt)
-        if (copy._tag === "Failure" || copy.success === undefined || new Date(copy.success).toDateString() !== day) yield* Effect.ignore(store.copyLatest)
+        // The backup copies what is missing itself; otherwise every hour (a pre-upgrade backup too, by name).
+        yield* Effect.ignore(store.copyMissing)
       }
       if (prunedOn !== day) {
         prunedOn = day

@@ -22,7 +22,7 @@ import {
   type ListQuery,
   MAX_LIST_LIMIT,
   MAX_MIGRATION_ROWS,
-  MAX_VALUE_CHARS,
+  maxListRows,
   type ModuleEventRecord,
   type ModuleStorage,
   type ModuleStore,
@@ -65,14 +65,17 @@ import { CurrentTurn, type TurnContext } from "./TurnContext.ts"
  * are kept in a list on it and released after the commit, in the order they were made.
  */
 
-/** A row as a backend keeps it: the value as JSON text at the owner's data version `v`, the actor as JSON text. */
+/**
+ * A row as a backend keeps it: the value as JSON text, the actor as JSON text. A row carries no data version of its
+ * own: every row of a collection is at the collection's stored version (`StoredCollection.version`), because only
+ * `prepare` changes that version, and it rewrites every row whose value changes in the same transaction.
+ */
 export interface StoredDoc {
   readonly owner: string
   readonly collection: string
   readonly id: string
   readonly scope: ScopeRef
   readonly rev: number
-  readonly v: number
   readonly text: string
   readonly createdAt: number
   readonly updatedAt: number
@@ -105,6 +108,30 @@ export interface CheckedQuery {
   /** Equality on the index's first key column. */
   readonly where: IndexKey | undefined
   readonly desc: boolean
+  /**
+   * Continue after this place in the index's order: the values of its columns after the scope (`cursorColumns`), ending
+   * with the id. Only a key column can be `null` (a missing field): the first without `where`, the second of a pair.
+   */
+  readonly after?: ReadonlyArray<IndexKey>
+}
+
+/**
+ * The names of an index's columns after (owner, collection, scope), in its order, as the memory backend and SQLite
+ * both read them: a row's place in a list is these values, compared one after the other (`compareIndexed`).
+ */
+export const cursorColumns = (index: CheckedQuery["index"]): ReadonlyArray<string> => {
+  switch (index.kind) {
+    case "updated":
+      return ["updatedAt", "createdAt", "id"]
+    case "created":
+      return ["createdAt", "id"]
+    case "s":
+      return [`k${index.slots[0]}`, "createdAt", "id"]
+    case "u":
+      return [`k${index.slots[0]}`, "updatedAt", "createdAt", "id"]
+    case "p":
+      return [`k${index.slots[0]}`, `k${index.slots[1]}`, "createdAt", "id"]
+  }
 }
 
 /** What a backend keeps about a stored collection (`pva_collections`). */
@@ -157,7 +184,7 @@ export interface SyncBackend {
   /** How many rows a collection has, counting at most `cap + 1`. */
   readonly count: (owner: string, collection: string, cap: number) => number
   /** Store a migrated value of a row (same rev) with its new index keys. */
-  readonly rewrite: (doc: StoredDoc, v: number, text: string, keys: ReadonlyArray<IndexKey>) => void
+  readonly rewrite: (doc: StoredDoc, text: string, keys: ReadonlyArray<IndexKey>) => void
   /** Conversation-scoped rows (of one conversation, or of all) after `after`, in key order, at most `limit`. */
   readonly conversationRows: (conversationId: string | undefined, after: BulkKey | undefined, limit: number) => ReadonlyArray<BulkRow>
   /** The data version stored for an owner (`undefined`: none yet). */
@@ -228,8 +255,9 @@ const canonical = (x: unknown): string => {
 const shapes = new WeakMap<Collection<any>, string>()
 /**
  * The canonical description of a collection's declaration: its scope, its indexes (in order: they decide the key
- * columns) and its schema's JSON form (Effect's schema representation of `Schema.toCodecJson`, without annotations).
- * Two declarations with the same description store the same rows the same way.
+ * columns), its `maxChars` and its schema's JSON form (Effect's schema representation of `Schema.toCodecJson`, without
+ * annotations). It covers the structure of the schema and the built-in checks the representation holds; a custom
+ * check's function is not in it (`defineCollection`).
  */
 export const shapeOf = (c: Collection<any>): string => {
   let shape = shapes.get(c)
@@ -240,16 +268,16 @@ export const shapeOf = (c: Collection<any>): string => {
     } catch (e) {
       schema = { opaque: messageOf(e) }
     }
-    shape = canonical({ scope: c.scope, indexes: c.indexes, schema })
+    shape = canonical({ scope: c.scope, indexes: c.indexes, maxChars: c.maxChars, schema })
     shapes.set(c, shape)
   }
   return shape
 }
 
 /**
- * A value as it is stored: encoded with the schema's JSON codec, which must give an object; at most
- * `MAX_VALUE_CHARS` of JSON; indexed fields `isIndexable` or missing; decoded again from the text, so the value
- * returned is what a read gives back (and never the caller's object). With the key of each indexed field.
+ * A value as it is stored: encoded with the schema's JSON codec, which must give an object; at most the collection's
+ * `maxChars` of JSON; indexed fields `isIndexable` or missing; decoded again from the text, so the value returned is
+ * what a read gives back (and never the caller's object). With the key of each indexed field.
  */
 export const encodeValue = <A>(collection: Collection<A>, value: A): { readonly text: string; readonly value: A; readonly keys: ReadonlyArray<IndexKey> } => {
   const codec = jsonOf(collection)
@@ -264,9 +292,19 @@ export const encodeValue = <A>(collection: Collection<A>, value: A): { readonly 
     return fail("invalid", `Collection ${collection.name}: the value is not JSON`, cause)
   }
   if (text === undefined) return fail("invalid", `Collection ${collection.name}: the value is not JSON`)
-  if (text.length > MAX_VALUE_CHARS) return fail("invalid", `Collection ${collection.name}: a value may hold at most ${MAX_VALUE_CHARS} characters of JSON (this one has ${text.length})`)
+  if (text.length > collection.maxChars) {
+    return fail("invalid", `Collection ${collection.name}: a value may hold at most ${collection.maxChars} characters of JSON (its maxChars; this one has ${text.length})`)
+  }
   const parsed = JSON.parse(text) as Record<string, unknown>
-  const keys = collection.fields.map((field) => {
+  const keys = keysOf(collection, parsed)
+  const decoded = Schema.decodeUnknownExit(codec)(parsed)
+  if (Exit.isFailure(decoded)) return fail("invalid", `Collection ${collection.name}: the value does not survive storing: ${String(decoded.cause).slice(0, 500)}`)
+  return { text, value: decoded.value, keys }
+}
+
+/** The index key of each indexed field of a value's JSON form; a field that is not `isIndexable` is `invalid`. */
+const keysOf = (collection: Collection<any>, parsed: Record<string, unknown>): ReadonlyArray<IndexKey> =>
+  collection.fields.map((field) => {
     if (!Object.hasOwn(parsed, field)) return null
     const v = parsed[field]
     if (!isIndexable(v)) {
@@ -274,31 +312,55 @@ export const encodeValue = <A>(collection: Collection<A>, value: A): { readonly 
     }
     return indexKeyOf(v)
   })
-  const decoded = Schema.decodeUnknownExit(codec)(parsed)
-  if (Exit.isFailure(decoded)) return fail("invalid", `Collection ${collection.name}: the value does not survive storing: ${String(decoded.cause).slice(0, 500)}`)
-  return { text, value: decoded.value, keys }
-}
 
-/**
- * A stored value (JSON text, written at data version `v`) as the collection's type at data version `version`: migrated
- * forward one version at a time (a version without a migration of this collection leaves it as it is), then decoded.
- * A newer value is refused.
- */
-export const decodeStored = <A>(collection: Collection<A>, version: number, v: number, text: string, id: string): { readonly value: A } => {
-  if (v > version) return fail("unavailable", `Row ${id} of ${collection.name} was written by a newer version of its module (${v} > ${version})`)
-  let current: unknown
+const parseStored = (collection: Collection<any>, text: string, id: string): unknown => {
   try {
-    current = JSON.parse(text)
+    return JSON.parse(text)
   } catch (cause) {
     return fail("failed", `Row ${id} of ${collection.name} is not JSON`, cause)
   }
-  for (let at = v; at < version; at++) {
+}
+
+/**
+ * A stored value (JSON text) as the collection's type: decoded and validated, never migrated (a read never migrates:
+ * every row is at its collection's version, `StoredDoc`). A value the schema refuses (a custom check that changed
+ * without a new version) is `failed`.
+ */
+export const decodeStored = <A>(collection: Collection<A>, text: string, id: string): { readonly value: A } => {
+  const decoded = Schema.decodeUnknownExit(jsonOf(collection))(parseStored(collection, text, id))
+  if (Exit.isFailure(decoded)) return fail("failed", `Row ${id} of ${collection.name} does not match its schema: ${String(decoded.cause).slice(0, 500)}`)
+  return { value: decoded.value }
+}
+
+/** Observe a promise (or other thenable) nobody awaits, so a rejection is logged, never unhandled. */
+export const observe = (x: unknown, log: (line: string) => void, what: string): void => {
+  if ((typeof x === "object" || typeof x === "function") && x !== null && typeof (x as { then?: unknown }).then === "function") {
+    try {
+      ;(x as PromiseLike<unknown>).then(undefined, (e: unknown) => log(`${what} failed later (it is not awaited): ${messageOf(e)}`))
+    } catch {
+      // A thenable whose `then` throws has nothing more to observe.
+    }
+  }
+}
+
+/**
+ * A stored value of a collection at data version `from`, migrated to `to` one version at a time (a version without a
+ * migration of this collection leaves it as it is), then decoded as the collection's type. Only `prepare` calls it.
+ */
+export const migrateStored = <A>(collection: Collection<A>, from: number, to: number, text: string, id: string, log: (line: string) => void = () => {}): { readonly value: A } => {
+  let current = parseStored(collection, text, id)
+  for (let at = from; at < to; at++) {
     const step = collection.migrate[at]
     if (step === undefined) continue
     try {
       current = step(current)
     } catch (cause) {
       return fail("failed", `Collection ${collection.name}: migrating row ${id} from version ${at} failed: ${messageOf(cause)}`, cause)
+    }
+    const refused = refusedResult(current)
+    if (refused !== undefined) {
+      observe(current, log, `Migrating row ${id} of ${collection.name}`)
+      return fail("failed", `Collection ${collection.name}: migrating row ${id} from version ${at} returned ${refused}; a migration returns the new value`)
     }
   }
   const decoded = Schema.decodeUnknownExit(jsonOf(collection))(current)
@@ -324,8 +386,11 @@ export const checkQuery = (collection: Collection<any>, query: ListQuery<any> | 
   const column = field === "createdAt" || field === "updatedAt"
   const direction = query?.orderBy?.direction
   if (direction !== undefined && direction !== "asc" && direction !== "desc") return invalid(`direction must be "asc" or "desc"`)
-  const limit = query?.limit ?? DEFAULT_LIST_LIMIT
-  if (!Number.isInteger(limit) || limit < 1 || limit > MAX_LIST_LIMIT) return invalid(`limit must be 1 to ${MAX_LIST_LIMIT} (page through more)`)
+  const most = maxListRows(collection)
+  const limit = query?.limit ?? Math.min(DEFAULT_LIST_LIMIT, most)
+  if (!Number.isInteger(limit) || limit < 1 || limit > most) {
+    return invalid(`limit must be 1 to ${most} (rows of at most ${collection.maxChars} characters; LIST_BUDGET_CHARS / maxChars, at most ${MAX_LIST_LIMIT}); continue with \`after\``)
+  }
   const where = entries[0] as readonly [string, unknown] | undefined
   if (where === undefined) {
     if (column) return { limit, index: { kind: field === "createdAt" ? "created" : "updated" }, where: undefined, desc: (direction ?? "desc") === "desc" }
@@ -344,9 +409,37 @@ export const checkQuery = (collection: Collection<any>, query: ListQuery<any> | 
   return { limit, index: { kind: "p", slots: [slot(f), slot(field)] }, where: key, desc: (direction ?? "asc") === "desc" }
 }
 
-/** A row id a caller chose: `SAFE_ID`. */
+/** A row id a caller gave (to insert, get, update or remove): `SAFE_ID`. */
 const checkRowId = (collection: string, id: string) => {
   if (typeof id !== "string" || !SAFE_ID.test(id)) fail("invalid", `Collection ${collection}: "${String(id).slice(0, 40)}" is not a valid row id (1–200 letters, digits, _ . : -)`)
+}
+
+const ACTOR_KINDS: Readonly<Record<string, ReadonlyArray<string>>> = {
+  turn: ["conversationId", "source"],
+  job: ["jobId"],
+  admin: [],
+  ui: ["deviceId"],
+  module: ["moduleId"],
+  system: ["name"]
+}
+const OPTIONAL_TURN_FIELDS = ["assistantId", "deviceId", "personId"]
+
+/** An actor as `Actor` says: a known kind, its fields strings, a turn's id a finite number; nothing else. */
+const checkActor = (actor: unknown): Actor => {
+  const bad = (why: string) => fail("invalid", `The actor is not valid: ${why}`)
+  if (typeof actor !== "object" || actor === null || Array.isArray(actor)) return bad("it must be an object")
+  const a = actor as Record<string, unknown>
+  const kind = a.kind
+  const required = typeof kind === "string" && Object.hasOwn(ACTOR_KINDS, kind) ? ACTOR_KINDS[kind]! : undefined
+  if (required === undefined) return bad(`its kind must be one of ${Object.keys(ACTOR_KINDS).join(", ")}`)
+  const allowed = new Set(["kind", ...required, ...(kind === "turn" ? ["turnId", ...OPTIONAL_TURN_FIELDS] : [])])
+  for (const k of Object.keys(a)) if (!allowed.has(k)) bad(`a ${String(kind)} actor has no field "${k}"`)
+  for (const k of required) if (typeof a[k] !== "string") bad(`"${k}" must be a string`)
+  if (kind === "turn") {
+    if (typeof a.turnId !== "number" || !Number.isFinite(a.turnId)) bad("a turn's turnId must be a finite number")
+    for (const k of OPTIONAL_TURN_FIELDS) if (a[k] !== undefined && typeof a[k] !== "string") bad(`"${k}" must be a string`)
+  }
+  return a as unknown as Actor
 }
 
 /**
@@ -511,7 +604,7 @@ export const makeStoreEngine = (options: EngineOptions): EngineStore => {
           fire(batch)
           batch = []
           try {
-            item.run()
+            observe(item.run(), log, "An after-commit callback")
           } catch {
             // An after-commit callback must not break the others.
           }
@@ -530,7 +623,7 @@ export const makeStoreEngine = (options: EngineOptions): EngineStore => {
   const runUndo = (undo: ReadonlyArray<() => void>) => {
     for (let i = undo.length - 1; i >= 0; i--) {
       try {
-        undo[i]!()
+        observe(undo[i]!(), log, "A rollback hook")
       } catch {
         // An undo hook must not stop the others.
       }
@@ -614,10 +707,8 @@ export const makeStoreEngine = (options: EngineOptions): EngineStore => {
     }
     const refused = refusedResult(result)
     if (refused !== undefined) {
-      if (typeof (result as { then?: unknown } | null)?.then === "function") {
-        // It goes on without the transaction; whatever it does there fails. Never an unhandled rejection.
-        ;(result as PromiseLike<unknown>).then(undefined, (e: unknown) => log(`A household transaction function that returned a promise failed later: ${messageOf(e)}`))
-      }
+      // It goes on without the transaction; whatever it does there fails. Never an unhandled rejection.
+      observe(result, log, "A household transaction function that returned a promise")
       state.doomed = new StoreError({
         reason: "invalid",
         message: `A transaction function returned ${refused}: transactions cannot await (no promise, Effect or generator; do the asynchronous work before or after it). Nothing of it was kept.`
@@ -685,8 +776,8 @@ export const makeStoreEngine = (options: EngineOptions): EngineStore => {
     return { st, d }
   }
 
-  const rowOf = <A>(st: OwnerState, c: Collection<A>, doc: StoredDoc): Row<A> => {
-    const decoded = decodeStored(c, st.version, doc.v, doc.text, doc.id)
+  const rowOf = <A>(c: Collection<A>, doc: StoredDoc): Row<A> => {
+    const decoded = decodeStored(c, doc.text, doc.id)
     return {
       id: doc.id,
       rev: doc.rev,
@@ -699,7 +790,7 @@ export const makeStoreEngine = (options: EngineOptions): EngineStore => {
   }
 
   const actorText = (owner: string, given: Actor | undefined, turn: TurnContext | undefined): string => {
-    const actor: Actor = given ?? (turn === undefined ? { kind: "module", moduleId: owner } : actorOfTurn(turn))
+    const actor: Actor = checkActor(given !== undefined ? given : turn === undefined ? { kind: "module", moduleId: owner } : actorOfTurn(turn))
     let text: string | undefined
     try {
       text = JSON.stringify(actor)
@@ -717,19 +808,41 @@ export const makeStoreEngine = (options: EngineOptions): EngineStore => {
   // ---- The operations, once
 
   const doGet = <A>(owner: string, c: Collection<A>, id: string, scopeGiven: ScopeRef | undefined, turn: TurnContext | undefined): Row<A> | undefined => {
-    const { st, d } = resolve(owner, c)
+    const { d } = resolve(owner, c)
     const scope = resolveScopeSync(d.c, scopeGiven, turn)
-    if (typeof id !== "string" || !SAFE_ID.test(id) || hidden(scope) || !d.present) return undefined
+    checkRowId(d.c.name, id)
+    if (hidden(scope) || !d.present) return undefined
     const doc = guarded(() => backend.read(owner, d.c.name, id))
-    return doc === undefined || !sameScope(doc.scope, scope) ? undefined : rowOf(st, d.c, doc)
+    return doc === undefined || !sameScope(doc.scope, scope) ? undefined : rowOf(d.c, doc)
+  }
+
+  /** The rows lists gave out, with the query that gave each (a later list continues `after` one of them). */
+  const listed = new WeakMap<object, { readonly owner: string; readonly collection: string; readonly query: string; readonly doc: StoredDoc }>()
+  const queryKey = (scope: ScopeRef, q: CheckedQuery) => JSON.stringify([scopeKey(scope), q.index, q.where, q.desc])
+
+  /** Where a list continues after `row`: its values of the index's columns (`cursorColumns`). */
+  const cursorAfter = (owner: string, c: Collection<any>, scope: ScopeRef, q: CheckedQuery, row: unknown): ReadonlyArray<IndexKey> => {
+    const from = typeof row === "object" && row !== null ? listed.get(row) : undefined
+    if (from === undefined || from.owner !== owner || from.collection !== c.name || from.query !== queryKey(scope, q)) {
+      return fail("invalid", `Collection ${c.name}: \`after\` must be a row a list of the same query (where, orderBy, scope) of this collection returned`)
+    }
+    const doc = from.doc
+    const keys = keysOf(c, parseStored(c, doc.text, doc.id) as Record<string, unknown>)
+    return cursorColumns(q.index).map((col) => (col === "updatedAt" ? doc.updatedAt : col === "createdAt" ? doc.createdAt : col === "id" ? doc.id : keys[Number(col.slice(1))] ?? null))
   }
 
   const doList = <A>(owner: string, c: Collection<A>, query: ListQuery<A> | undefined, turn: TurnContext | undefined): ReadonlyArray<Row<A>> => {
-    const { st, d } = resolve(owner, c)
+    const { d } = resolve(owner, c)
     const checked = checkQuery(d.c, query)
     const scope = resolveScopeSync(d.c, query?.scope, turn)
+    const q: CheckedQuery = query?.after === undefined ? checked : { ...checked, after: cursorAfter(owner, d.c, scope, checked, query.after) }
     if (hidden(scope) || !d.present) return []
-    return guarded(() => backend.list(owner, d.c.name, scope, checked)).map((doc) => rowOf(st, d.c, doc))
+    const key = queryKey(scope, checked)
+    return guarded(() => backend.list(owner, d.c.name, scope, q)).map((doc) => {
+      const row = rowOf(d.c, doc)
+      listed.set(row, { owner, collection: d.c.name, query: key, doc })
+      return row
+    })
   }
 
   const writeTarget = (owner: string, c: Collection<any>, what: string) => {
@@ -747,7 +860,7 @@ export const makeStoreEngine = (options: EngineOptions): EngineStore => {
   const announce = (state: TxState, change: CommittedChange) => void state.out.push({ _tag: "change", change })
 
   const doInsert = <A>(state: TxState, owner: string, c: Collection<A>, value: A, opts: { readonly id?: string; readonly scope?: ScopeRef; readonly actor?: Actor } | undefined, ctx: CallContext): Row<A> => {
-    const { st, d } = writeTarget(owner, c, "insert")
+    const { d } = writeTarget(owner, c, "insert")
     const scope = writeScope(d.c, opts?.scope, ctx.turn)
     const id = opts?.id ?? newId()
     checkRowId(d.c.name, id)
@@ -756,49 +869,54 @@ export const makeStoreEngine = (options: EngineOptions): EngineStore => {
     const conflict = () => new StoreConflict({ collection: d.c.name, id, message: `A row ${id} already exists in ${d.c.name}` })
     if (guarded(() => backend.read(owner, d.c.name, id)) !== undefined) throw conflict()
     const rev = guarded(() => backend.nextRev())
-    const doc: StoredDoc = { owner, collection: d.c.name, id, scope, rev, v: st.version, text: encoded.text, createdAt: ctx.at, updatedAt: ctx.at, updatedBy }
+    const doc: StoredDoc = { owner, collection: d.c.name, id, scope, rev, text: encoded.text, createdAt: ctx.at, updatedAt: ctx.at, updatedBy }
     if (!guarded(() => backend.put(doc, encoded.keys, "absent"))) throw conflict()
-    announce(state, { seq: rev, at: ctx.at, module: owner, collection: d.c.name, id, op: "insert", rev, scope: { ...scope }, actor: JSON.parse(updatedBy) as Actor, row: rowOf(st, d.c, doc) })
-    return rowOf(st, d.c, doc)
+    announce(state, { seq: rev, at: ctx.at, module: owner, collection: d.c.name, id, op: "insert", rev, scope: { ...scope }, actor: JSON.parse(updatedBy) as Actor, row: rowOf(d.c, doc) })
+    return rowOf(d.c, doc)
   }
 
   const doUpdate = <A>(state: TxState, owner: string, c: Collection<A>, id: string, f: (value: A) => A, opts: { readonly expectRev?: number; readonly scope?: ScopeRef; readonly actor?: Actor } | undefined, ctx: CallContext): Row<A> => {
-    const { st, d } = writeTarget(owner, c, "update")
+    const { d } = writeTarget(owner, c, "update")
     const scope = writeScope(d.c, opts?.scope, ctx.turn)
-    const doc = typeof id === "string" && SAFE_ID.test(id) ? guarded(() => backend.read(owner, d.c.name, id)) : undefined
+    checkRowId(d.c.name, id)
+    const doc = guarded(() => backend.read(owner, d.c.name, id))
     if (doc === undefined || !sameScope(doc.scope, scope)) throw new StoreNotFound({ collection: d.c.name, id: String(id) })
     const conflict = (message: string) => new StoreConflict({ collection: d.c.name, id, message })
     if (opts?.expectRev !== undefined && doc.rev !== opts.expectRev) throw conflict(`Row ${id} of ${d.c.name} is at rev ${doc.rev}, not ${opts.expectRev}`)
     // The function gets a value of its own: what it does to it never reaches the row it replaces.
-    const before = rowOf(st, d.c, doc)
+    const before = rowOf(d.c, doc)
     let next: A
     try {
-      next = f(rowOf(st, d.c, doc).value)
+      next = f(rowOf(d.c, doc).value)
     } catch (cause) {
       if (isStoreFailure(cause)) throw cause
       return fail("failed", `Collection ${d.c.name}: the update function failed: ${messageOf(cause)}`, cause)
     }
     const refused = refusedResult(next)
-    if (refused !== undefined) return fail("invalid", `Collection ${d.c.name}: the update function returned ${refused}; it must return the new value`)
+    if (refused !== undefined) {
+      observe(next, log, `The update function of ${d.c.name}`)
+      return fail("invalid", `Collection ${d.c.name}: the update function returned ${refused}; it must return the new value`)
+    }
     const encoded = encodeValue(d.c, next)
     const updatedBy = actorText(owner, opts?.actor, ctx.turn)
     const rev = guarded(() => backend.nextRev())
-    const written: StoredDoc = { ...doc, rev, v: st.version, text: encoded.text, updatedAt: ctx.at, updatedBy }
+    const written: StoredDoc = { ...doc, rev, text: encoded.text, updatedAt: ctx.at, updatedBy }
     if (!guarded(() => backend.put(written, encoded.keys, doc.rev))) throw conflict(`Row ${id} of ${d.c.name} changed meanwhile`)
-    announce(state, { seq: rev, at: ctx.at, module: owner, collection: d.c.name, id, op: "update", rev, scope: { ...doc.scope }, actor: JSON.parse(updatedBy) as Actor, row: rowOf(st, d.c, written), before })
-    return rowOf(st, d.c, written)
+    announce(state, { seq: rev, at: ctx.at, module: owner, collection: d.c.name, id, op: "update", rev, scope: { ...doc.scope }, actor: JSON.parse(updatedBy) as Actor, row: rowOf(d.c, written), before })
+    return rowOf(d.c, written)
   }
 
   const doRemove = (state: TxState, owner: string, c: Collection<any>, id: string, opts: { readonly expectRev?: number; readonly scope?: ScopeRef; readonly actor?: Actor } | undefined, ctx: CallContext): boolean => {
-    const { st, d } = writeTarget(owner, c, "remove")
+    const { d } = writeTarget(owner, c, "remove")
     const scope = writeScope(d.c, opts?.scope, ctx.turn)
-    const doc = typeof id === "string" && SAFE_ID.test(id) ? guarded(() => backend.read(owner, d.c.name, id)) : undefined
+    checkRowId(d.c.name, id)
+    const doc = guarded(() => backend.read(owner, d.c.name, id))
     if (doc === undefined || !sameScope(doc.scope, scope)) return false
     if (opts?.expectRev !== undefined && doc.rev !== opts.expectRev) throw new StoreConflict({ collection: d.c.name, id, message: `Row ${id} of ${d.c.name} is at rev ${doc.rev}, not ${opts.expectRev}` })
     const updatedBy = actorText(owner, opts?.actor, ctx.turn)
     let before: Row<unknown> | undefined
     try {
-      before = rowOf(st, d.c, doc)
+      before = rowOf(d.c, doc)
     } catch {
       before = undefined
     }
@@ -920,20 +1038,23 @@ export const makeStoreEngine = (options: EngineOptions): EngineStore => {
         resolve(owner, c)
         const s = scopeOf(scope)
         if (hidden(s) || !d.present) return []
-        const n = Math.max(1, Math.min(MAX_LIST_LIMIT, Math.floor(limit)))
-        return guarded(() => backend.page(owner, d.c.name, s, after, n)).map((doc) => rowOf(st, d.c, doc))
+        const n = Math.max(1, Math.min(maxListRows(d.c), Math.floor(limit)))
+        return guarded(() => backend.page(owner, d.c.name, s, after, n)).map((doc) => rowOf(d.c, doc))
       }
     }
   }
 
   // ---- Preparing owners
 
-  const prepareOne = (owner: string, kind: "module" | "core", storage: ModuleStorage | undefined, duplicate: boolean) =>
+  const prepareOne = (owner: string, kind: "module" | "core", given: ModuleStorage | undefined, duplicate: boolean) =>
     Effect.gen(function*() {
       // A module list cannot name a core owner (module ids have no dot): such an entry is ignored, never judged in
       // place of the core service's data.
       if (kind === "module" && CORE_OWNER.test(owner)) return
-      const declaredVersion = storage?.version ?? 1
+      // No storage at all is an empty declaration at version 1: stored data of a newer version is judged the same way.
+      const declaresNothing = given === undefined
+      const storage: ModuleStorage = given ?? {}
+      const declaredVersion = storage.version ?? 1
       const st: OwnerState = { owner, version: Number.isInteger(declaredVersion) ? declaredVersion : 1, collections: new Map(), verdict: undefined }
       owners.set(owner, st)
       const deny = (reason: string) => {
@@ -942,7 +1063,6 @@ export const makeStoreEngine = (options: EngineOptions): EngineStore => {
       const okId = kind === "module" ? MODULE_ID.test(owner) && !RESERVED_MODULE_IDS.has(owner) : CORE_OWNER.test(owner)
       if (!okId) return deny("Its id cannot key stored data.")
       if (duplicate) return deny("Another module has the same id, so their stored data cannot be told apart.")
-      if (storage === undefined) return
       try {
         checkModuleStorage(owner, storage)
       } catch (e) {
@@ -962,6 +1082,8 @@ export const makeStoreEngine = (options: EngineOptions): EngineStore => {
       if (newest > version) {
         return deny(`Its stored data (version ${newest}) was written by a newer version of this module (this one knows ${version}); update the module. The data is kept as it is.`)
       }
+      // A module that declares nothing has nothing to create or upgrade.
+      if (declaresNothing) return
       for (const d of st.collections.values()) {
         const s = stored.get(d.c.name)
         if (s === undefined) continue
@@ -1022,15 +1144,16 @@ export const makeStoreEngine = (options: EngineOptions): EngineStore => {
                 let migrated = 0
                 for (;;) {
                   const docs = backend.scan(owner, d.c.name, after, 500)
+                  const from = stored.get(d.c.name)!.version
                   for (const doc of docs) {
-                    const decoded = decodeStored(d.c, version, doc.v, doc.text, doc.id)
+                    const decoded = migrateStored(d.c, from, version, doc.text, doc.id, log)
                     let encoded: ReturnType<typeof encodeValue>
                     try {
                       encoded = encodeValue(d.c, decoded.value)
                     } catch (e) {
-                      return fail("failed", `Row ${doc.id} of ${d.c.name}, migrated from version ${doc.v}: ${messageOf(e)}`)
+                      return fail("failed", `Row ${doc.id} of ${d.c.name}, migrated from version ${from}: ${messageOf(e)}`)
                     }
-                    backend.rewrite(doc, version, encoded.text, encoded.keys)
+                    backend.rewrite(doc, encoded.text, encoded.keys)
                     migrated++
                   }
                   if (docs.length < 500) break
@@ -1080,54 +1203,63 @@ export const makeStoreEngine = (options: EngineOptions): EngineStore => {
   const endConversations = (conversationId: string | undefined): Effect.Effect<number, StoreError> =>
     readOnly
       ? Effect.succeed(0)
-      : Effect.gen(function*() {
+      : Effect.suspend(() => {
         const key = conversationId ?? "*"
-        ending.set(key, (ending.get(key) ?? 0) + 1)
-        let total = 0
-        let after: BulkKey | undefined
-        const actor: Actor = { kind: "system", name: "conversation-ended" }
-        const step = (at: number) =>
-          runTx((state) => {
-            const rows = backend.conversationRows(conversationId, after, BULK_STEP_ROWS)
-            let n = 0
-            for (const r of rows) {
-              // Only rows of a declared collection of an owner whose data is usable here: an owner that is newer or
-              // failed its upgrade, and a collection no declaration names any more, keep their rows as they are.
-              const st = owners.get(r.owner)
-              if (st === undefined || st.verdict !== undefined || !st.collections.has(r.collection)) continue
-              const rev = backend.nextRev()
-              if (!backend.remove(r.owner, r.collection, r.id, r.scope, r.rev)) continue
-              state.removed = true
-              state.out.push({ _tag: "change", change: { seq: rev, at, module: r.owner, collection: r.collection, id: r.id, op: "remove", rev, scope: { ...r.scope }, actor } })
-              n++
-            }
-            return { n, last: rows.at(-1), done: rows.length < BULK_STEP_ROWS }
-          })
-        try {
-          for (;;) {
-            const at = yield* Clock.currentTimeMillis
-            const attempt = (tries: number): Effect.Effect<ReturnType<typeof step>, StoreError> =>
-              Effect.suspend(() => {
-                try {
-                  return Effect.succeed(step(at))
-                } catch (e) {
-                  if (e instanceof BusyAtBegin) return tries + 1 < BUSY_TRIES ? Effect.flatMap(pause(BUSY_PAUSE_MS), () => attempt(tries + 1)) : Effect.fail(e.error)
-                  return Effect.fail(e instanceof StoreError ? e : new StoreError({ reason: "failed", message: messageOf(e), cause: e }))
-                }
-              })
-            const done = yield* attempt(0)
-            total += done.n
-            if (done.done || done.last === undefined) break
-            after = done.last
-            yield* yieldToLoop
-          }
-        } finally {
-          const left = (ending.get(key) ?? 1) - 1
-          if (left > 0) ending.set(key, left)
-          else ending.delete(key)
-        }
-        return total
+        // Hidden from now until this removal ends, however it ends (done, failed, interrupted): the release is Effect's
+        // finalisation, not a JavaScript `finally` around a yield (which a failed or interrupted fiber never runs).
+        return Effect.acquireUseRelease(
+          Effect.sync(() => void ending.set(key, (ending.get(key) ?? 0) + 1)),
+          () => removeConversationRows(conversationId),
+          () =>
+            Effect.sync(() => {
+              const left = (ending.get(key) ?? 1) - 1
+              if (left > 0) ending.set(key, left)
+              else ending.delete(key)
+            })
+        )
       })
+
+  const removeConversationRows = (conversationId: string | undefined): Effect.Effect<number, StoreError> =>
+    Effect.gen(function*() {
+      let total = 0
+      let after: BulkKey | undefined
+      const actor: Actor = { kind: "system", name: "conversation-ended" }
+      const step = (at: number) =>
+        runTx((state) => {
+          const rows = backend.conversationRows(conversationId, after, BULK_STEP_ROWS)
+          let n = 0
+          for (const r of rows) {
+            // Only rows of a declared collection of an owner whose data is usable here: an owner that is newer or
+            // failed its upgrade, and a collection no declaration names any more, keep their rows as they are.
+            const st = owners.get(r.owner)
+            if (st === undefined || st.verdict !== undefined || !st.collections.has(r.collection)) continue
+            const rev = backend.nextRev()
+            if (!backend.remove(r.owner, r.collection, r.id, r.scope, r.rev)) continue
+            state.removed = true
+            state.out.push({ _tag: "change", change: { seq: rev, at, module: r.owner, collection: r.collection, id: r.id, op: "remove", rev, scope: { ...r.scope }, actor } })
+            n++
+          }
+          return { n, last: rows.at(-1), done: rows.length < BULK_STEP_ROWS }
+        })
+      for (;;) {
+        const at = yield* Clock.currentTimeMillis
+        const attempt = (tries: number): Effect.Effect<ReturnType<typeof step>, StoreError> =>
+          Effect.suspend(() => {
+            try {
+              return Effect.succeed(step(at))
+            } catch (e) {
+              if (e instanceof BusyAtBegin) return tries + 1 < BUSY_TRIES ? Effect.flatMap(pause(BUSY_PAUSE_MS), () => attempt(tries + 1)) : Effect.fail(e.error)
+              return Effect.fail(e instanceof StoreError ? e : new StoreError({ reason: "failed", message: messageOf(e), cause: e }))
+            }
+          })
+        const done = yield* attempt(0)
+        total += done.n
+        if (done.done || done.last === undefined) break
+        after = done.last
+        yield* yieldToLoop
+      }
+      return total
+    })
 
   // ---- The rest
 

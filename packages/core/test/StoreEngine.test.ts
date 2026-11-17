@@ -2,8 +2,9 @@
 // ended itself, a BEGIN that finds the database locked. Each is a typed StoreError (never a defect), the rollback
 // hooks run, nothing is released, and the store goes on working.
 import { assert, describe, it } from "@effect/vitest"
-import { Effect, Exit, Schema } from "effect"
-import { defineCollection, type StoreError } from "../src/HouseholdStore.ts"
+import { Effect, Exit, Fiber, Schema } from "effect"
+import { CurrentTurn } from "../src/TurnContext.ts"
+import { BULK_STEP_ROWS, defineCollection, type StoreError } from "../src/HouseholdStore.ts"
 import { makeMemoryBackend } from "../src/MemoryHouseholdStore.ts"
 import { makeStoreEngine, type SyncBackend } from "../src/StoreEngine.ts"
 
@@ -13,7 +14,7 @@ const errorOf = <A>(exit: Exit.Exit<A, unknown>) => (Exit.isFailure(exit) ? (exi
 /** The in-memory backend with faults to switch on. */
 const faulty = () => {
   const inner = makeMemoryBackend()
-  const faults = { commit: false, endItself: false, busyBegins: 0 }
+  const faults = { commit: false, endItself: false, busyBegins: 0, onRows: undefined as (() => void) | undefined }
   let ended = false
   const backend: SyncBackend = {
     ...inner,
@@ -30,6 +31,10 @@ const faulty = () => {
       inner.commit()
     },
     inTransaction: () => !ended && inner.inTransaction(),
+    conversationRows: (conversationId, after, limit) => {
+      faults.onRows?.()
+      return inner.conversationRows(conversationId, after, limit)
+    },
     put: (doc, keys, expect) => {
       const done = inner.put(doc, keys, expect)
       if (faults.endItself) {
@@ -44,10 +49,13 @@ const faulty = () => {
   return { backend, faults }
 }
 
+const chat = defineCollection({ name: "chat", scope: "conversation", schema: Schema.Struct({ text: Schema.String }) })
+const inConversation = (conversationId: string) => <A, E, R>(e: Effect.Effect<A, E, R>) => Effect.provideService(e, CurrentTurn, { turnId: 1, conversationId, source: "voice" })
+
 const setup = Effect.gen(function*() {
   const { backend, faults } = faulty()
   const engine = makeStoreEngine({ backend })
-  yield* engine.prepare([{ id: "m", storage: { collections: [items] } }])
+  yield* engine.prepare([{ id: "m", storage: { collections: [items, chat] } }])
   const heard: Array<unknown> = []
   engine.onCommit((r) => heard.push(...r))
   return { engine, faults, heard, c: engine.forModule("m").collection(items) }
@@ -116,5 +124,63 @@ describe("the store engine settles every transaction itself", () => {
       assert.isFalse(ran)
       faults.busyBegins = 0
       assert.strictEqual((yield* c.list()).length, 1)
+    }).pipe(Effect.scoped))
+
+  it.live("a bulk removal that fails (busy through every retry) or is interrupted between steps ends its hiding: a retry removes the rest and the conversation is usable again", () =>
+    Effect.gen(function*() {
+      const { engine, faults } = yield* setup
+      const c = engine.forModule("m").collection(chat)
+      const n = BULK_STEP_ROWS * 2 + 50
+      yield* engine.forModule("m").transaction((tx) => {
+        for (let i = 0; i < n; i++) tx.collection(chat).insert({ text: `r${i}` })
+      }).pipe(inConversation("c1"))
+      // Busy through all retries: the sweep fails `busy`, and hides nothing afterwards.
+      faults.busyBegins = 1000
+      assert.strictEqual(errorOf(yield* Effect.exit(engine.sweepConversations))?.reason, "busy")
+      faults.busyBegins = 0
+      assert.isDefined(yield* c.insert({ text: "a new conversation" }).pipe(inConversation("c2")))
+      assert.strictEqual((yield* c.list().pipe(inConversation("c1"))).length, 20)
+      // Interrupted after its first step: hidden while it ran, visible (what is left) after.
+      let steps = 0
+      // After its first step the next one finds the database locked (retried on a timer): it is interrupted there.
+      faults.onRows = () => {
+        steps++
+        faults.busyBegins = 1000
+      }
+      const ending = yield* Effect.forkChild(engine.endConversation("c1"))
+      while (steps < 1) yield* Effect.yieldNow
+      yield* Effect.sleep(5)
+      yield* Fiber.interrupt(ending)
+      faults.onRows = undefined
+      faults.busyBegins = 0
+      assert.strictEqual(steps, 1)
+      assert.isDefined(yield* c.insert({ text: "after the interruption" }).pipe(inConversation("c1")))
+      assert.strictEqual(yield* engine.endConversation("c1"), n + 1 - BULK_STEP_ROWS)
+      assert.isDefined(yield* c.insert({ text: "after the retry" }).pipe(inConversation("c1")))
+      assert.strictEqual(yield* engine.sweepConversations, 2)
+      assert.isDefined(yield* c.insert({ text: "after the sweep" }).pipe(inConversation("c3")))
+    }).pipe(Effect.scoped))
+})
+
+describe("the store engine: a read never migrates", () => {
+  it.effect("Sol's sequence over fresh engines on one backend: a no-op version, then a migration from a version no row is at; get and list agree with the stored value", () =>
+    Effect.gen(function*() {
+      const backend = makeMemoryBackend()
+      const Count = Schema.Struct({ n: Schema.Finite })
+      const v1 = defineCollection({ name: "counts", scope: "household", schema: Count, indexes: ["n"] })
+      const v3 = defineCollection({ name: "counts", scope: "household", schema: Count, indexes: ["n"], migrate: { 1: (old: { n: number }) => ({ ...old, n: 2 }) } })
+      const first = makeStoreEngine({ backend })
+      yield* first.prepare([{ id: "m", storage: { collections: [v1] } }])
+      yield* first.forModule("m").collection(v1).insert({ n: 1 }, { id: "x" })
+      yield* makeStoreEngine({ backend }).prepare([{ id: "m", storage: { version: 2, collections: [v1] } }])
+      const third = makeStoreEngine({ backend })
+      yield* third.prepare([{ id: "m", storage: { version: 3, collections: [v3] } }])
+      assert.strictEqual(third.availability("m"), undefined)
+      const c = third.forModule("m").collection(v3)
+      assert.strictEqual((yield* c.get("x"))?.value.n, 1)
+      assert.deepStrictEqual((yield* c.list({ where: { n: 1 } })).map((r) => r.id), ["x"])
+      assert.deepStrictEqual(yield* c.list({ where: { n: 2 } }), [])
+      assert.strictEqual(backend.read("m", "counts", "x")?.text, JSON.stringify({ n: 1 }))
+      assert.strictEqual(backend.storedCollections("m").get("counts")?.version, 3)
     }).pipe(Effect.scoped))
 })

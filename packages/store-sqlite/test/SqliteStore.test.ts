@@ -1,7 +1,7 @@
 // What only the SQLite store does: refusing newer data, backups, removal on disk, the checkpoints (never on the main
 // connection), a lock held elsewhere, SQLite ending a transaction itself, read-only opening, and the quiet warning.
 import { assert, describe, it } from "@effect/vitest"
-import { defineCollection, type StoreError } from "@pva/core"
+import { defineCollection, MAX_VALUE_CHARS, type StoreError } from "@pva/core"
 import { Effect, Exit, Schema } from "effect"
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, utimesSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -11,8 +11,8 @@ import { householdBackupIssues, householdIssues, makeSqliteStore } from "../src/
 
 const tmp = () => mkdtempSync(join(tmpdir(), "pva-sqlite-"))
 const Item = Schema.Struct({ text: Schema.String, tag: Schema.optionalKey(Schema.String) })
-const items = defineCollection({ name: "items", scope: "household", schema: Item })
-const tagged = defineCollection({ name: "items", scope: "household", schema: Item, indexes: ["tag"] })
+const items = defineCollection({ name: "items", scope: "household", schema: Item, maxChars: MAX_VALUE_CHARS })
+const tagged = defineCollection({ name: "items", scope: "household", schema: Item, indexes: ["tag"], maxChars: MAX_VALUE_CHARS })
 const errorOf = <A>(exit: Exit.Exit<A, unknown>) => (Exit.isFailure(exit) ? (exit.cause.reasons.find((r) => r._tag === "Fail") as { error: StoreError } | undefined)?.error : undefined)
 
 describe("SQLite household store", () => {
@@ -136,6 +136,57 @@ describe("SQLite household store", () => {
       assert.deepStrictEqual(yield* reader.forModule("newmod").collection(fresh).list({ where: { tag: "t" } }), [])
     }).pipe(Effect.scoped))
 
+  it.effect("the store's own indexes are part of being ready: a writable start makes a missing one again; read-only and doctor refuse the file and write nothing", () =>
+    Effect.gen(function*() {
+      for (const name of ["pva_docs_updated", "pva_docs_created", "pva_docs_conversation"]) {
+        const dir = tmp()
+        const file = join(dir, "household.db")
+        yield* Effect.scoped(Effect.gen(function*() {
+          const store = yield* makeSqliteStore({ filename: file })
+          yield* store.prepare([{ id: "shop", storage: { collections: [items] } }])
+          yield* store.forModule("shop").collection(items).insert({ text: "bread" })
+        }))
+        const raw = new DatabaseSync(file)
+        raw.exec(`DROP INDEX ${name}`)
+        raw.exec("PRAGMA wal_checkpoint(TRUNCATE)")
+        raw.close()
+        const before = readFileSync(file)
+        const reader = yield* Effect.exit(Effect.scoped(makeSqliteStore({ filename: file, readOnly: true })))
+        assert.strictEqual(errorOf(reader)?.reason, "unavailable", name)
+        assert.match(errorOf(reader)?.message ?? "", new RegExp(name))
+        const issues = yield* householdIssues(dir)
+        assert.match(issues.find((i) => i.id === "core.household.open")?.detail ?? "", new RegExp(name))
+        assert.isTrue(readFileSync(file).equals(before), `${name}: read-only and doctor wrote nothing`)
+        yield* Effect.scoped(Effect.gen(function*() {
+          const store = yield* makeSqliteStore({ filename: file })
+          yield* store.prepare([{ id: "shop", storage: { collections: [items] } }])
+          assert.deepStrictEqual((yield* store.forModule("shop").collection(items).list()).map((r) => r.value.text), ["bread"])
+          assert.strictEqual(yield* store.sweepConversations, 0)
+        }))
+        const again = new DatabaseSync(file, { readOnly: true })
+        assert.strictEqual((again.prepare("SELECT count(*) AS n FROM sqlite_schema WHERE type = 'index' AND name = ?").get(name) as { n: number }).n, 1)
+        again.close()
+      }
+    }))
+
+  it.effect("a read-only store refuses pruning: no backup is removed and no file's mode changes", () =>
+    Effect.gen(function*() {
+      const dir = tmp()
+      const file = join(dir, "household.db")
+      yield* Effect.scoped(makeSqliteStore({ filename: file }))
+      const old = join(dir, "backups", "household-2026-01-01.db")
+      writeFileSync(old, "x", { mode: 0o600 })
+      chmodSync(old, 0o644)
+      utimesSync(old, Date.UTC(2026, 0, 1) / 1000, Date.UTC(2026, 0, 1) / 1000)
+      const reader = yield* makeSqliteStore({ filename: file, readOnly: true })
+      const pruned = yield* reader.pruneBackups({ now: Date.UTC(2026, 10, 18) })
+      assert.deepStrictEqual(pruned.removed, [])
+      assert.match(pruned.failed.join(" "), /serve mode/)
+      assert.deepStrictEqual(reader.pruneFailures(), [])
+      assert.isTrue(existsSync(old))
+      assert.strictEqual(statSync(old).mode & 0o777, 0o644)
+    }).pipe(Effect.scoped))
+
   it("node:sqlite's ExperimentalWarning is filtered; other warnings pass", async () => {
     const seen: Array<string> = []
     const listener = (w: Error) => seen.push(`${w.name}: ${w.message}`)
@@ -154,7 +205,7 @@ describe("SQLite household store: transactions the database ends, locks held els
       const dir = tmp()
       const file = join(dir, "household.db")
       const Big = Schema.Struct({ text: Schema.String })
-      const bigs = defineCollection({ name: "bigs", scope: "household", schema: Big })
+      const bigs = defineCollection({ name: "bigs", scope: "household", schema: Big, maxChars: MAX_VALUE_CHARS })
       yield* Effect.scoped(Effect.gen(function*() {
         const store = yield* makeSqliteStore({ filename: file })
         yield* store.prepare([{ id: "fill", storage: { collections: [bigs] } }])

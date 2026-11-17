@@ -17,12 +17,16 @@ import type { Released, TargetDevice } from "./HouseholdStore.ts"
  * - Nothing queued after a snapshot is sent before its final part; nothing committed after it began is missed.
  * - A fresh snapshot for a changed device record (`refresh`) replaces what is queued for rows (it shows them as they
  *   are) and keeps every module event that was accepted, sent after it in order.
- * - When more than `maxQueued` entries wait, the queue overflows as a whole: everything is dropped, and the page gets
- *   `household.gap` (`overflow`) and a fresh snapshot. `restart` (sending failed) does the same with `restart`.
+ * - When more than `maxQueued` entries would wait, counting room for a snapshot when none is queued (so a `refresh`
+ *   keeps every accepted event within the bound), the queue overflows as a whole: everything is dropped, and the page
+ *   gets `household.gap` (`overflow`) and a fresh snapshot. `restart` (sending failed) does the same with `restart`.
  *   **Nothing is ever dropped without that signal.**
  */
 
-/** The most entries a page may have waiting before its queue overflows (a `household.gap` and a fresh snapshot). */
+/**
+ * The most entries a page may have waiting (a snapshot and a gap count one each; room for a snapshot is kept when none
+ * is queued) before its queue overflows (a `household.gap` and a fresh snapshot).
+ */
 export const MAX_QUEUED = 2000
 
 export type PageMessage = typeof HouseholdSnapshotMessage.Type | typeof HouseholdEventMessage.Type | typeof HouseholdGapMessage.Type
@@ -82,7 +86,8 @@ export const makeHouseholdPage = (options: {
       } else if (feed.sendsEvent(item.event.type)) {
         queue.set(`event:${events++}`, { _tag: "event", event: moduleEvent(item.event) })
       }
-      if (queue.size > max) return lose("overflow")
+      // Room for the snapshot a `refresh` adds is kept, so the bound holds across it.
+      if (queue.size + (queue.has("snapshot") ? 0 : 1) > max) return lose("overflow")
     }
   }
 
