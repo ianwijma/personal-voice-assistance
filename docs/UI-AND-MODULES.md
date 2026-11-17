@@ -754,11 +754,16 @@ for its cleanup; both within the host's time limit for closing a part, past whic
 like a finalizer that hangs. A press is admitted only by a published part; one in flight when its module is withdrawn
 gets the host's grace period, like the module's calls, and is interrupted when the part is closed. The host's own owner is made with the host and stopped first when
 the host closes, before anything else; from then on every press is answered `not_running`, as is a press on a part
-being closed. It has 8 s: at the deadline the press is answered "Did not finish within 8 s" at once while its
-interruption and finalizers run on in the background; one still running 10 s later (`FIELD_ACTION_CLEANUP_MS`) is
-logged, still waited for (its button stays busy), and counts as a straggler of its module; at 4
-(`MAX_PRESS_STRAGGLERS`, across all its parts, so restarts cannot pile them up) the module's buttons are answered
-`busy` until some end, and Health says so (`<module>.presses-stuck`). Only a declared `action` field (or the generated
+being closed. **Slots** (`packages/core/src/ModuleSlots.ts`): a press runs in a slot of its module, at most 4 at once
+(`MAX_PRESS_SLOTS`, across all its owners, so restarts cannot pile them up). `ModuleSlots.run` is the only way a press
+starts: it takes the slot, starts the press's fiber and puts an observer on it in one step, and the observer gives the
+slot back exactly once, when that fiber has really ended, whatever ended the wait for it. At the cap a press is
+refused `busy` before any module code runs, and Health says so (`<module>.presses-busy`) until one of the module's
+slots is free again. The answer never waits for cleanup: it is the first of the press's result, its 8 s deadline
+("Did not finish within 8 s"), its owner being stopped after the grace period (`not_running`) and the caller going
+away (no answer); in the last three the press is interrupted and not waited for, and its slot and its button stay
+taken until its interruption and finalizers have ended. A press that never ends keeps its slot until the process
+stops (docs/MODULES-PLAN.md §3.5). Only a declared `action` field (or the generated
 `test` of an agent or decision provider) is a button: a `fieldActions` entry without a field is never run
 (`unknown_action`). A failure or defect is answered with one generic
 sentence ("It failed; the server's log says why.") and its details go to the server's log; a generated Test's
@@ -811,12 +816,17 @@ RouteResponse = { status /* 200–599 */, headers?, body?: string | Uint8Array |
   JSON; a chunked body is counted as it arrives), the route is still its module's published one (503 "restarted or
   stopped meanwhile": the body may have taken its time), then the handler. Whatever goes wrong unexpectedly in any of
   these steps is a 500 for that request, never the process's.
-- **The handler** runs in its own fiber in its shared part's scope: when that part is closed (a restart's or a stop's
-  grace period over) the handler is interrupted and the caller gets 503. At its time limit the caller gets 504 at
-  once; the interruption and the handler's finalizers run on in the background. One that has not ended 10 s later
-  (`ROUTE_CLEANUP_MS`) is logged and counts as a straggler of its module until it does; at 8
-  (`MAX_ROUTE_STRAGGLERS`) every new request to the module's routes is answered 503 (after 404 and 405) until some
-  end, and Health says so (`<module>.routes-stuck`). The work is bounded in number, not in time. A failure or defect answers 500 (logged; nothing of it is sent).
+- **The handler** runs in a **slot** of its module (`ModuleSlots`, as presses do), in its own fiber in its shared
+  part's scope (when that part is closed the handler is interrupted). At most 16 handlers of a module run at once
+  (`MAX_ROUTE_SLOTS`): the slot is taken before the handler starts and given back exactly once, when its fiber has
+  really ended (an observer on the fiber), however the wait for it ended. At the cap a request is answered 503 with
+  `Retry-After` (`ROUTE_BUSY_RETRY_S`) before any module code runs, and Health says so (`<module>.routes-busy`) until
+  one of the module's slots is free again. **The answer never waits for cleanup**: it is the first of the handler's
+  result, its time limit (504), the host's stop signal once a restart's or a stop's grace period is over (503,
+  `PublishedRoute.stopped`) and the caller going away (nothing to answer); in the last three the handler is
+  interrupted and not waited for, and its slot stays taken until its interruption and finalizers have ended. A
+  handler that never ends keeps its slot until the process stops (docs/MODULES-PLAN.md §3.5); nothing is abandoned
+  on top. A failure or defect answers 500 (logged; nothing of it is sent).
   The response must have a final status (200–599; anything else is a 500, logged), and header names and values must
   be valid (else the whole answer is a 500, and the call log records the status really sent). Nothing here runs on a
   turn or the WebSocket. Answers carry `Cache-Control: no-store` and `nosniff`; a handler cannot set framing headers
@@ -826,7 +836,10 @@ RouteResponse = { status /* 200–599 */, headers?, body?: string | Uint8Array |
   that is not this server's own (`<scheme>://<Host>`, the Host having passed the allowed-hosts check of §4.6;
   `SERVE_ALLOWED_ORIGINS` does not count, as no CORS is sent). A page elsewhere could otherwise make the browser of
   someone at home send a simple POST from a home address. A request with neither header (a script, a webhook
-  sender) is judged by the guards alone. A `public` route answers only GET (the browser arriving on an OAuth callback
+  sender) is judged by the guards alone. With `SERVE_BEHIND_PROXY` the scheme is ignored (a proxy that terminates
+  TLS makes it unknowable upstream) and the `Origin`'s host and port must equal the `Host` header exactly, so **the
+  proxy must pass `Host` through unchanged** (Caddy and `tailscale serve` do by default); no forwarding header is
+  read. A sibling origin on another port, a foreign origin and `null` are still refused. A `public` route answers only GET (the browser arriving on an OAuth callback
   from the provider's site) and reads no body.
 - **Rate limits**: a route's total is counted apart from the per-address windows and is never pushed out by many
   addresses; per-address windows are bounded (4096, the oldest goes first), an IPv6 caller is counted by its /64, and

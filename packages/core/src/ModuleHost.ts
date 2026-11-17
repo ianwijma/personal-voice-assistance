@@ -65,7 +65,7 @@ import type { FieldActionHandler, FieldActionResult } from "./ModuleContribution
 import { type FieldActionOwner, makeFieldActionOwner } from "./FieldActionOwner.ts"
 import { type ModuleRoute, type PublishedRoute, RouteTokenError, routeInfo, routeProblem, type RouteTokens, type RouteTokenStore } from "./ModuleRoutes.ts"
 import { makePageBoundary } from "./PageBoundary.ts"
-import { makeStragglers, stragglerIssues } from "./Stragglers.ts"
+import { makeModuleSlots, MAX_PRESS_SLOTS, slotIssues } from "./ModuleSlots.ts"
 import { type ModuleDefinition, type ModuleInstance, ModuleStartError } from "./ModuleDefinition.ts"
 import { type InstanceTarget, type ModuleTarget, planModule, reachedBy, usesOrder } from "./ModulePlanner.ts"
 import type { PartHandle, PartState, Registrar, Registration } from "./ModuleRegistrations.ts"
@@ -197,14 +197,6 @@ export type { PublishedRoute } from "./ModuleRoutes.ts"
 
 /** Time a field action's handler has (`ModuleHostOptions.fieldActionTimeoutMs`). Below the page's 10 s request limit. */
 export const FIELD_ACTION_TIMEOUT_MS = 8_000
-/**
- * Time a stopped field action's interruption (its finalizers) may take in the background before the host logs it
- * (`ModuleHostOptions.fieldActionCleanupMs`). The press was answered at its deadline already; its button stays busy
- * until it has really ended (`FieldActionOwner`).
- */
-export const FIELD_ACTION_CLEANUP_MS = 10_000
-/** Presses of one module that did not stop within the cleanup limit before its buttons are refused (`Stragglers`). */
-export const MAX_PRESS_STRAGGLERS = 4
 
 export type HostResult = { readonly ok: true } | { readonly ok: false; readonly error: ErrorInfo }
 
@@ -394,8 +386,6 @@ export interface ModuleHostOptions {
   readonly routeTokens?: RouteTokenStore
   /** P3: time a field action may take. Default `FIELD_ACTION_TIMEOUT_MS`. */
   readonly fieldActionTimeoutMs?: number
-  /** P3: time a stopped field action's cleanup may take before it is logged (it is still waited for). Default `FIELD_ACTION_CLEANUP_MS`. */
-  readonly fieldActionCleanupMs?: number
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -747,28 +737,25 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
     return settings
   }
   const fieldActionTimeoutMs = options.fieldActionTimeoutMs ?? FIELD_ACTION_TIMEOUT_MS
-  const fieldActionCleanupMs = options.fieldActionCleanupMs ?? FIELD_ACTION_CLEANUP_MS
   /**
-   * Presses of each module that did not stop when asked (across all its owners, so restarts cannot pile them up): at
-   * `MAX_PRESS_STRAGGLERS` its buttons are refused until some end, and Health says so.
+   * The press slots of each module (`ModuleSlots`), across all its owners, so restarts cannot pile presses up: at
+   * `MAX_PRESS_SLOTS` a further press is refused `busy`, and Health says so (`presses:<id>`) until a slot is free.
    */
-  const pressStragglers = makeStragglers({
-    cap: MAX_PRESS_STRAGGLERS,
-    cleanupMs: fieldActionCleanupMs,
-    changed: (moduleId, count) => {
+  const pressSlots = makeModuleSlots({
+    cap: MAX_PRESS_SLOTS,
+    report: (moduleId, full) => {
       const entry = byId.get(moduleId)
-      if (entry !== undefined) issues.set(`presses:${moduleId}`, stragglerIssues(moduleId, entry.def.name, "presses", count, MAX_PRESS_STRAGGLERS))
+      if (entry !== undefined) issues.set(`presses:${moduleId}`, full ? slotIssues(moduleId, entry.def.name, "presses", MAX_PRESS_SLOTS) : [])
     }
   })
   /** An owner of field-action presses (`FieldActionOwner`): an instance part's (keys are field keys), or the host's (`<module>/<key>`). */
-  const pressOwner = (label: (key: string) => string, released: (key: string) => void, moduleOf: (key: string) => string) =>
-    makeFieldActionOwner({ label, cleanupMs: fieldActionCleanupMs, released, stragglers: pressStragglers, moduleOf })
+  const pressOwner = (released: (key: string) => void, moduleOf: (key: string) => string) => makeFieldActionOwner({ released, slots: pressSlots, moduleOf })
   /**
    * The host's own presses (a definition's `fieldActions`, which run without an instance), keyed `<module>/<key>`:
    * made once with the host, stopped first when it closes (before anything else stops), refusing presses from then on.
    */
   const moduleOfKey = (key: string) => key.slice(0, key.indexOf("/"))
-  const hostPresses = pressOwner((key) => `field action ${key.replace("/", ".")}`, (key) => {
+  const hostPresses = pressOwner((key) => {
     const entry = byId.get(moduleOfKey(key))
     // `info` values may have changed with the press.
     if (entry !== undefined) announce(entry)
@@ -1428,7 +1415,7 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
   /** Instances by part id, while they are open (the tool registrar reads their names). */
   const instanceByPart = new Map<number, InstanceRun>()
   /** P3: published module routes by module id: the published shared part's (`host.routes()`, `ModuleInfo.routes`). */
-  const routeTable = new Map<string, { readonly routes: ReadonlyArray<ModuleRoute>; readonly scope: Scope.Scope }>()
+  const routeTable = new Map<string, { readonly routes: ReadonlyArray<ModuleRoute>; readonly scope: Scope.Scope; readonly stopped: Effect.Effect<void> }>()
 
   /**
    * The kinds declared by what a part returns (`ModuleRegistrations.ts`). A later PR adds its kind here, one entry
@@ -1498,12 +1485,18 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
           }
           : route
       )
+      // The host's stop signal for this part's handlers: its run's grace period is over (`run.killed`); at once when
+      // the part is no longer the published one (its handler is refused then too).
+      const stopped = Effect.suspend(() => {
+        const run = byId.get(handle.moduleId)?.run
+        return run !== undefined && run.shared?.part.id === handle.id ? Deferred.await(run.killed) : Effect.void
+      })
       return [{
         kind: "route",
         // The full paths: unique across modules by construction (each module has its own prefix).
         claims: routes.map((r) => `${r.method} ${routeInfo(handle.moduleId, r).path}`),
         validate: () => routeProblem(routes),
-        publish: () => void routeTable.set(handle.moduleId, { routes: live, scope: handle.scope }),
+        publish: () => void routeTable.set(handle.moduleId, { routes: live, scope: handle.scope, stopped }),
         withdraw: () => void routeTable.delete(handle.moduleId)
       }]
     },
@@ -1638,7 +1631,7 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
           }
         },
         // P3: an instance's presses; `info` values may have changed with one: announced when it ends.
-        presses: kind === "instance" ? pressOwner((key) => `field action ${entry.def.id}.${key}`, () => announce(entry), () => entry.def.id) : undefined
+        presses: kind === "instance" ? pressOwner(() => announce(entry), () => entry.def.id) : undefined
       }
       openParts.add(part)
       return part
@@ -2550,28 +2543,30 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
       const prepared = useDraft ? draftSettings(entry, values) : savedSettings(entry)
       if (!prepared.ok) return Effect.succeed(answer({ ok: false, text: prepared.message, tone: "error" }))
       const label = `field action ${id}.${key}`
-      // The secrets the press is given are kept by the boundary until the press has ended AND been answered (the
-      // first of the two releases nothing); an instance's press gives them to its instance, which keeps them as long
-      // as it lives.
+      // The secrets the press is given are kept by the boundary until the press's fiber has ended (its observer, so
+      // also when it is interrupted before it began) AND it has been answered (the first of the two releases
+      // nothing); an instance's press gives them to its instance, which keeps them as long as it lives.
       const holder = {}
-      let holds = 2
-      const releaseOne = Effect.sync(() => {
+      let holds = 1
+      const releaseHold = () => {
         if (--holds === 0) boundary.release(holder)
-      })
+      }
+      const releaseOne = Effect.sync(releaseHold)
       const holders = definition !== undefined || running === undefined ? [holder] : [holder, running.part]
       // Suspended: a handler that throws is reported like one that fails. Outside any turn.
-      const press = outsideTurns(Effect.suspend(() => handler({ settings: given(entry, holders, prepared.settings), draft: useDraft }))).pipe(Effect.ensuring(releaseOne))
+      const press = outsideTurns(Effect.suspend(() => handler({ settings: given(entry, holders, prepared.settings), draft: useDraft })))
+      const started = (fiber: Fiber.Fiber<FieldActionResult, unknown>) => {
+        holds++
+        fiber.addObserver(releaseHold)
+      }
       return Effect.gen(function*() {
-        const outcome = yield* owner.start(ownerKey, press, fieldActionTimeoutMs)
+        const outcome = yield* owner.start(ownerKey, press, fieldActionTimeoutMs, started)
         switch (outcome._tag) {
           case "busy":
-            boundary.release(holder)
             return { ok: false, code: "busy", message: "That button is still running" } as const
-          case "stuck":
-            boundary.release(holder)
-            return { ok: false, code: "busy", message: `Earlier presses of ${entry.def.name}'s buttons have not stopped yet; try again later (Health has more)` } as const
+          case "full":
+            return { ok: false, code: "busy", message: `${entry.def.name} has ${MAX_PRESS_SLOTS} button presses running already; try again when one has ended (Health has more)` } as const
           case "stopped":
-            boundary.release(holder)
             return { ok: false, code: "not_running", message: `${entry.def.name} is not running` } as const
           case "timeout":
             return answer({ ok: false, text: `Did not finish within ${Math.round(fieldActionTimeoutMs / 1000)} s`, tone: "error" })
@@ -2659,7 +2654,7 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
 
   /** P3: the live routes, from the route table publication fills. */
   const routes = (): ReadonlyArray<PublishedRoute> =>
-    [...routeTable].flatMap(([moduleId, live]) => live.routes.map((route) => ({ moduleId, route, scope: live.scope })))
+    [...routeTable].flatMap(([moduleId, live]) => live.routes.map((route) => ({ moduleId, route, scope: live.scope, stopped: live.stopped })))
 
   /** The boundary for the app's own views of module-produced text (the route call log and token labels). */
   const pageText = (moduleId: string, text: unknown, max: number): string => boundary.text(moduleId, text, max)

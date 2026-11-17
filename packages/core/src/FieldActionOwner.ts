@@ -1,17 +1,19 @@
-import { Effect, type Exit, Fiber, Option } from "effect"
-import type { Stragglers } from "./Stragglers.ts"
+import { Deferred, Effect, type Exit, Fiber } from "effect"
+import type { ModuleSlots } from "./ModuleSlots.ts"
 
 /**
  * Who a field action's press belongs to (docs/UI-AND-MODULES.md §1.7): the host for a definition's handler, the
  * running instance for an instance's handler or a generated Test button. One owner ties together the press's
  * lifetime, its button's busy state and its cleanup:
  *
- * - `start` runs a press in its own fiber, at most one per key: the key is busy from the start of the press until its
- *   fiber has really ended, whatever its deadline or its cleanup take. Only the press's own end frees its key, so an
- *   old press can never free a newer one's.
+ * - `start` runs a press in a slot of its module (`ModuleSlots.run`, shared by every owner of the host, so at most
+ *   `MAX_PRESS_SLOTS` presses of a module run at once whatever restarts happen), at most one per key: the key is busy
+ *   from the start of the press until its fiber has really ended, whatever its deadline or its cleanup take. Only
+ *   the press's own end frees its key, so an old press can never free a newer one's. The answer never waits for the
+ *   press's cleanup: it is the first of its result, its deadline, the owner being stopped, the caller going away.
  * - `inFlight` says what still runs; `settled` waits, without asking anything to stop, until it has all ended.
- * - `stop` refuses new presses, interrupts those in flight and waits until each has ended (logging one whose cleanup
- *   overruns `cleanupMs`, still waiting).
+ * - `stop` refuses new presses, answers those in flight `stopped` at once, interrupts them and waits until each has
+ *   ended (the host bounds that wait: it is part of closing the part).
  *
  * The owners belong to the module host's parts (ModuleHost.ts): every instance part is made with its own owner. When
  * its module stops (after it is withdrawn, so no new press reaches it), the host gives the presses in flight the
@@ -23,8 +25,9 @@ import type { Stragglers } from "./Stragglers.ts"
 /** How a press went (`FieldActionOwner.start`). */
 export type PressOutcome<A, E> =
   | { readonly _tag: "busy" }
-  /** Too many earlier presses of the module have not stopped (`Stragglers`): no new one until some end. */
-  | { readonly _tag: "stuck" }
+  /** Every press slot of the module is taken (`MAX_PRESS_SLOTS`): no new press until one ends. */
+  | { readonly _tag: "full" }
+  /** The owner is being stopped (its instance is going): refused, or answered at once while it ran. */
   | { readonly _tag: "stopped" }
   | { readonly _tag: "timeout" }
   | { readonly _tag: "done"; readonly exit: Exit.Exit<A, E> }
@@ -32,10 +35,17 @@ export type PressOutcome<A, E> =
 export interface FieldActionOwner {
   /**
    * Run `press` under `key`, answering at `timeoutMs` at the latest. `busy`: that key's earlier press still runs;
-   * `stopped`: the owner is being stopped (its instance is going). At the deadline the press is asked to stop and the
-   * answer is `timeout`; its key stays busy until it has ended. Interrupting the caller asks the press to stop too.
+   * `full`: the module's press slots are all taken; `stopped`: the owner is being stopped. At the deadline (or the
+   * stop) the press is asked to stop and not waited for; its key and its slot stay taken until it has ended.
+   * Interrupting the caller asks the press to stop too, the same way. `started` is called with the press's fiber as
+   * soon as it is started.
    */
-  readonly start: <A, E>(key: string, press: Effect.Effect<A, E>, timeoutMs: number) => Effect.Effect<PressOutcome<A, E>>
+  readonly start: <A, E>(
+    key: string,
+    press: Effect.Effect<A, E>,
+    timeoutMs: number,
+    started?: (fiber: Fiber.Fiber<A, E>) => void
+  ) => Effect.Effect<PressOutcome<A, E>>
   /** The keys whose presses still run. */
   readonly inFlight: () => ReadonlyArray<string>
   /** Completes once every press in flight now has ended (it asks none to stop; the caller bounds the wait). */
@@ -44,38 +54,25 @@ export interface FieldActionOwner {
 }
 
 export const makeFieldActionOwner = (options: {
-  /** For the log: what the press of `key` is called ("field action <module>.<key>"). */
-  readonly label: (key: string) => string
-  /** How long a stopped press's cleanup may take before it is logged (it is still waited for). */
-  readonly cleanupMs: number
   /** A press ended (its key is free): the page may need the module again (`info` values). */
   readonly released?: (key: string) => void
-  /**
-   * The presses that did not stop within `cleanupMs` of being asked to, counted per module (shared by every owner of
-   * the host), and the module a key belongs to. At the module's cap, `start` answers `stuck`.
-   */
-  readonly stragglers: Stragglers
+  /** The press slots, per module, shared by every owner of the host, and the module a key belongs to. */
+  readonly slots: ModuleSlots
   readonly moduleOf: (key: string) => string
 }): FieldActionOwner => {
   const running = new Map<string, Fiber.Fiber<unknown, unknown>>()
   let stopped = false
+  /** Completed when `stop` begins: every press still waited for is answered `stopped`. */
+  const stopping = Deferred.makeUnsafe<void>()
 
-  /** `fiber` was asked to stop: logged and counted as a straggler if it has not ended within the cleanup limit. Never frees its key. */
-  const watch = (key: string, fiber: Fiber.Fiber<unknown, unknown>, why: string) =>
-    options.stragglers.watch(
-      options.moduleOf(key),
-      fiber,
-      Effect.logWarning(`${options.label(key)}: still cleaning up ${options.cleanupMs} ms after it was ${why}; its button stays busy until it ends`)
-    )
-
-  const start: FieldActionOwner["start"] = (key, press, timeoutMs) =>
-    Effect.suspend((): Effect.Effect<PressOutcome<any, any>> => {
+  const start: FieldActionOwner["start"] = <A, E>(key: string, press: Effect.Effect<A, E>, timeoutMs: number, started?: (fiber: Fiber.Fiber<A, E>) => void) =>
+    Effect.suspend((): Effect.Effect<PressOutcome<A, E>> => {
       if (stopped) return Effect.succeed({ _tag: "stopped" } as const)
       if (running.has(key)) return Effect.succeed({ _tag: "busy" } as const)
-      if (options.stragglers.full(options.moduleOf(key))) return Effect.succeed({ _tag: "stuck" } as const)
-      return Effect.uninterruptibleMask((restore) =>
-        Effect.gen(function*() {
-          const fiber = yield* Effect.forkDetach(press)
+      return options.slots.run(options.moduleOf(key), press, {
+        timeoutMs,
+        stopped: Deferred.await(stopping),
+        started: (fiber) => {
           running.set(key, fiber)
           fiber.addObserver(() => {
             // This press's own end frees its key; a newer press under the same key is never touched.
@@ -83,30 +80,17 @@ export const makeFieldActionOwner = (options: {
             running.delete(key)
             options.released?.(key)
           })
-          const exit = yield* restore(Fiber.await(fiber).pipe(Effect.timeoutOption(timeoutMs))).pipe(
-            Effect.onInterrupt(() => Effect.sync(() => fiber.interruptUnsafe()))
-          )
-          if (Option.isSome(exit)) return { _tag: "done", exit: exit.value } as const
-          // The answer is due now; the interruption and the press's finalizers run on in the background.
-          fiber.interruptUnsafe()
-          yield* watch(key, fiber, "timed out")
-          return { _tag: "timeout" } as const
-        })
-      )
+          started?.(fiber)
+        }
+      })
     })
 
   const stop = Effect.suspend(() => {
     stopped = true
-    const fibers = [...running.entries()]
-    return Effect.forEach(
-      fibers,
-      ([key, fiber]) =>
-        Effect.sync(() => fiber.interruptUnsafe()).pipe(
-          Effect.andThen(watch(key, fiber, "stopped")),
-          Effect.andThen(Fiber.await(fiber))
-        ),
-      { concurrency: "unbounded", discard: true }
-    )
+    Deferred.doneUnsafe(stopping, Effect.void)
+    const fibers = [...running.values()]
+    for (const fiber of fibers) fiber.interruptUnsafe()
+    return Effect.forEach(fibers, (fiber) => Fiber.await(fiber), { concurrency: "unbounded", discard: true })
   })
 
   const settled = Effect.suspend(() => Effect.forEach([...running.values()], (fiber) => Fiber.await(fiber), { concurrency: "unbounded", discard: true }))
