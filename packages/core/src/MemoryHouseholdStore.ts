@@ -95,16 +95,16 @@ export const makeMemoryBackend = (options: MemoryStoreOptions = {}): SyncBackend
     },
     list: (owner, collection, scope, q) => {
       const first = "slots" in q.index ? q.index.slots[0]! : undefined
+      const order = (ka: ReadonlyArray<unknown>, kb: ReadonlyArray<unknown>) => {
+        let c = 0
+        for (let i = 0; i < ka.length && c === 0; i++) c = compareIndexed(ka[i], kb[i])
+        return q.desc ? -c : c
+      }
+      const place = (d: MemoryDoc) => [...sortKey(d, q), d.id]
       return docsOf(owner, collection, scope)
         .filter((d) => q.where === undefined || (d.keys[first!] ?? null) === q.where)
-        .sort((a, b) => {
-          const ka = sortKey(a, q)
-          const kb = sortKey(b, q)
-          let c = 0
-          for (let i = 0; i < ka.length && c === 0; i++) c = compareIndexed(ka[i], kb[i])
-          if (c === 0) c = compareCodePoints(a.id, b.id)
-          return q.desc ? -c : c
-        })
+        .filter((d) => q.after === undefined || order(place(d), q.after) > 0)
+        .sort((a, b) => order(place(a), place(b)))
         .slice(0, q.limit)
         .map(plain)
     },
@@ -150,10 +150,10 @@ export const makeMemoryBackend = (options: MemoryStoreOptions = {}): SyncBackend
       for (const d of docs.values()) if (d.owner === owner && d.collection === collection && ++n > cap) break
       return n
     },
-    rewrite: (doc, v, text, keys) => {
+    rewrite: (doc, text, keys) => {
       const k = key(doc.owner, doc.collection, doc.id)
       const now = docs.get(k)
-      if (now !== undefined) set(k, { ...now, v, text, keys: [...keys] })
+      if (now !== undefined) set(k, { ...now, text, keys: [...keys] })
     },
     conversationRows: (conversationId, after, limit) => {
       const order = (x: BulkKey) => [x.scopeId, x.owner, x.collection, x.id]

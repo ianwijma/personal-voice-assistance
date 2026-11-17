@@ -1,7 +1,8 @@
 import { randomBytes } from "node:crypto"
-import { chmod, copyFile, mkdir, open, readdir, rename, rm, stat } from "node:fs/promises"
+import { chmod, copyFile, mkdir, open, readdir, rename, rm, stat, utimes } from "node:fs/promises"
 import { dirname, join } from "node:path"
 import { Worker } from "node:worker_threads"
+import { SQLITE_WARNING } from "./quiet.ts"
 
 /**
  * Files of the household store (docs/STORING-DATA.md "Backups"): everything private to the user (directories `0700`,
@@ -63,11 +64,23 @@ const fsyncFile = async (path: string) => {
   }
 }
 
-const fsyncDir = async (dir: string) => {
-  const handle = await open(dir, "r").catch(() => undefined)
+/** Errors that mean a directory cannot be synced here at all (some file systems); any other is a real failure. */
+const SYNC_UNSUPPORTED = new Set(["EINVAL", "ENOTSUP", "EOPNOTSUPP", "EISDIR"])
+
+/**
+ * Sync a directory, so a `rename` into it survives a power loss. Where that is not supported (Windows, file systems
+ * that refuse it) it is skipped; any other failure (`EIO`, `EACCES`, …) is thrown: the copy is not known to be durable.
+ */
+export const fsyncDir = async (dir: string): Promise<void> => {
+  if (process.platform === "win32") return
+  const unsupported = (e: unknown) => {
+    if (SYNC_UNSUPPORTED.has(codeOf(e) ?? "")) return undefined
+    throw e
+  }
+  const handle = await open(dir, "r").catch(unsupported)
   if (handle === undefined) return
   try {
-    await handle.sync().catch(() => undefined)
+    await handle.sync().catch(unsupported)
   } finally {
     await handle.close()
   }
@@ -110,13 +123,18 @@ export const copyDatabase = async (source: string, path: string): Promise<string
   return problem
 }
 
-/** Copy a finished file to `path` the same way (the second backup directory). The directory's problem, if any. */
+/**
+ * Copy a finished file to `path` the same way (the second backup directory), keeping its time: retention judges a
+ * copy by the snapshot's age, not by when it was copied. The directory's problem, if any.
+ */
 export const copyFilePrivately = async (from: string, path: string): Promise<string | undefined> => {
   const problem = await privateDir(dirname(path))
   const part = await freshFile(path)
   try {
     await copyFile(from, part)
     await chmod(part, 0o600)
+    const s = await stat(from)
+    await utimes(part, s.atime, s.mtime)
     await fsyncFile(part)
     await rename(part, path)
     await fsyncDir(dirname(path))
@@ -129,9 +147,27 @@ export const copyFilePrivately = async (from: string, path: string): Promise<str
 
 // ---- Checkpoints: a worker thread with a connection of its own
 
+/**
+ * The worker's copy of `quiet.ts`: only Node's ExperimentalWarning for `node:sqlite` is dropped; every other warning
+ * passes (exported for its test).
+ */
+export const WORKER_WARNING_FILTER = `
+{
+  const original = process.emitWarning.bind(process)
+  const sqlite = new RegExp(${JSON.stringify(SQLITE_WARNING.source)})
+  process.emitWarning = (warning, ...rest) => {
+    const text = typeof warning === "string" ? warning : warning instanceof Error ? warning.message : ""
+    const first = rest[0]
+    const type = typeof first === "string" ? first : typeof first === "object" && first !== null && "type" in first ? String(first.type) : warning instanceof Error ? warning.name : ""
+    if (type === "ExperimentalWarning" && sqlite.test(text)) return
+    original(warning, ...rest)
+  }
+}
+`
+
 const CHECKPOINTER = `
 const { parentPort, workerData } = require("node:worker_threads")
-process.emitWarning = () => {}
+${WORKER_WARNING_FILTER}
 const { DatabaseSync } = require("node:sqlite")
 let db
 const open = () => {

@@ -23,8 +23,8 @@ import { CurrentTurn, type TurnContext, type TurnSource } from "./TurnContext.ts
  *   nothing and runs its `onRollback` hooks.
  *
  * Every call is synchronous on the main thread in the SQLite store, which also frames audio: every read a turn can make
- * is bounded by construction (one index range of at most `MAX_LIST_LIMIT` rows of at most `MAX_VALUE_CHARS` each), and
- * nothing waits on the network or on a lock inside a transaction.
+ * is bounded by construction (one index range of at most `maxListRows(c)` rows of at most `c.maxChars` each, a product
+ * of at most `LIST_BUDGET_CHARS`), and nothing waits on the network or on a lock inside a transaction.
  */
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -94,7 +94,7 @@ export const currentActor = (moduleId: string, given?: Actor): Effect.Effect<Act
 /**
  * The store could not do it. `unavailable`: no store in this mode, or the module's data is not usable here;
  * `read-only`: the CLI modes read the store and never write it; `invalid`: the call itself is wrong (an undeclared
- * collection or another declaration of it, an unindexed filter, a limit above `MAX_LIST_LIMIT`, a value that does not
+ * collection or another declaration of it, an unindexed filter, a limit above `maxListRows`, a value that does not
  * match the schema, a transaction function that returned a promise or an Effect, a handle used after its transaction);
  * `busy`: another connection held the database's write lock for longer than the store waits (a few milliseconds, never
  * on the event loop); nothing was done, try again; `failed`: the database said no.
@@ -235,6 +235,12 @@ export interface Collection<A> {
   /** The row's type; its JSON form (`Schema.toCodecJson`) must be an object. */
   readonly schema: Schema.Codec<A, unknown>
   /**
+   * The most characters of JSON a value may have (default `DEFAULT_MAX_CHARS`, at most `MAX_VALUE_CHARS`; refused at
+   * write). It decides how many rows one `list` may ask for (`maxListRows`). Part of the shape: a change needs a new
+   * `storage.version`, and a smaller one fails the upgrade when a stored value is longer.
+   */
+  readonly maxChars: number
+  /**
    * `migrate[n]` turns a value of the module's data version `n` (`ModuleStorage.version`), in its JSON form, into one
    * of version `n + 1`. A version without an entry leaves this collection's values as they are.
    */
@@ -242,15 +248,15 @@ export interface Collection<A> {
   /**
    * What `list` may filter or order on (`ListQuery`). A field (`"state"`) is one index: `where` on it, ordered by it.
    * A pair (`["state", "dueAt"]`) is an index for `where` on the first ordered by the second. At most 8 entries, of at
-   * most 8 distinct top-level fields. An indexed field's value must be `isIndexable` or missing; anything else is
-   * refused at write.
+   * most 8 distinct top-level fields, none of them a row's own name (`RESERVED_FIELDS`). An indexed field's value must
+   * be `isIndexable` or missing; anything else is refused at write.
    */
   readonly indexes: ReadonlyArray<IndexDeclaration>
   /** The distinct indexed fields, in order of first appearance (each kept in a column of its own). */
   readonly fields: ReadonlyArray<string>
   /** Lines for the per-turn household facts, from the newest `ambientRows` rows the turn's device and person see. */
   readonly ambient?: (rows: ReadonlyArray<Row<A>>, context: AmbientContext) => string | ReadonlyArray<string> | undefined
-  /** How many rows (newest first) per scope the ambient lines are made from. Default 10, at most `MAX_AMBIENT_ROWS`. */
+  /** How many rows (newest first) per scope the ambient lines are made from. Default 10, at most `MAX_AMBIENT_ROWS` and `maxListRows`. */
   readonly ambientRows: number
   /**
    * What a voice page on `device` may see of a row, or `undefined` for nothing (docs/STORING-DATA.md "Pages"). Without
@@ -282,12 +288,26 @@ const SCOPES: ReadonlyArray<ScopeKind> = ["household", "person", "assistant", "d
 export const MAX_AMBIENT_ROWS = 20
 /** The most indexes of a collection, and the most distinct fields they use. */
 export const MAX_INDEXES = 8
+/**
+ * Names an index declaration may not use: a row's own fields (`Row`), which `list` orders by (`createdAt`,
+ * `updatedAt`) or which are not part of the value.
+ */
+export const RESERVED_FIELDS: ReadonlySet<string> = new Set(["updatedAt", "createdAt", "id", "rev", "scope"])
 
-/** Declare a document collection. Checked at definition time. */
+/**
+ * Declare a document collection. Checked at definition time.
+ *
+ * Whether two declarations have the same shape (docs/STORING-DATA.md "Versions") is judged from the structure of the
+ * schema and the built-in checks Effect can represent, its scope, its indexes and `maxChars`. A custom check's function
+ * (`Schema.makeFilter`) is not part of the shape: changing one needs a new `storage.version` from the author, and a
+ * stored row the new check refuses fails `failed` when it is read.
+ */
 export const defineCollection = <A>(definition: {
   readonly name: string
   readonly scope: ScopeKind
   readonly schema: Schema.Codec<A, unknown>
+  /** The most characters of JSON a value may have (default `DEFAULT_MAX_CHARS`, at most `MAX_VALUE_CHARS`). */
+  readonly maxChars?: number
   readonly migrate?: Readonly<Record<number, (value: any) => unknown>>
   readonly indexes?: ReadonlyArray<IndexDeclaration>
   readonly ambient?: Collection<A>["ambient"]
@@ -307,6 +327,7 @@ export const defineCollection = <A>(definition: {
     if (parts.length === 2 && parts[0] === parts[1]) throw new Error(`Collection ${definition.name}: the index [${parts.join(", ")}] names one field twice`)
     for (const field of parts) {
       if (typeof field !== "string" || !FIELD.test(field)) throw new Error(`Collection ${definition.name}: field "${String(field)}" must match ${FIELD}`)
+      if (RESERVED_FIELDS.has(field)) throw new Error(`Collection ${definition.name}: "${field}" is a row's own field (${[...RESERVED_FIELDS].join(", ")}) and cannot be indexed; name the value's field otherwise`)
       if (!fields.includes(field)) fields.push(field)
     }
     const key = parts.join("\u0000")
@@ -317,15 +338,21 @@ export const defineCollection = <A>(definition: {
   for (const [k, f] of Object.entries(definition.migrate ?? {})) {
     if (!/^[1-9][0-9]*$/.test(k) || typeof f !== "function") throw new Error(`Collection ${definition.name}: migrate is keyed by the data version a function migrates from (1, 2, …)`)
   }
-  const ambientRows = definition.ambientRows ?? 10
-  if (!Number.isInteger(ambientRows) || ambientRows < 1 || ambientRows > MAX_AMBIENT_ROWS) {
-    throw new Error(`Collection ${definition.name}: ambientRows must be 1 to ${MAX_AMBIENT_ROWS}`)
+  const maxChars = definition.maxChars ?? DEFAULT_MAX_CHARS
+  if (!Number.isInteger(maxChars) || maxChars < 1 || maxChars > MAX_VALUE_CHARS) {
+    throw new Error(`Collection ${definition.name}: maxChars must be a whole number from 1 to ${MAX_VALUE_CHARS}`)
+  }
+  const ambientMost = Math.min(MAX_AMBIENT_ROWS, listRowsFor(maxChars))
+  const ambientRows = definition.ambientRows ?? Math.min(10, ambientMost)
+  if (!Number.isInteger(ambientRows) || ambientRows < 1 || ambientRows > ambientMost) {
+    throw new Error(`Collection ${definition.name}: ambientRows must be 1 to ${ambientMost}`)
   }
   return {
     _tag: "Collection",
     name: definition.name,
     scope: definition.scope,
     schema: definition.schema,
+    maxChars,
     migrate: definition.migrate ?? {},
     indexes: indexes.map((i) => (typeof i === "string" ? i : [i[0], i[1]] as const)),
     fields,
@@ -339,8 +366,9 @@ export const defineCollection = <A>(definition: {
 export interface ModuleStorage {
   /**
    * The data version of all the module's collections (default 1). Raise it with every change of shape of any
-   * collection (its schema, its indexes): at start every row of every collection is migrated (`Collection.migrate`)
-   * in one transaction, after a backup, before the module runs. Changing a shape without raising it is refused.
+   * collection (its schema, its indexes, its `maxChars`): at start every row of every collection is migrated
+   * (`Collection.migrate`) in one transaction, after a backup, before the module runs. Changing a shape without raising
+   * it is refused, as far as the shape is seen (`defineCollection`: a custom check's function is not).
    */
   readonly version?: number
   /** Every collection the module uses. A collection not listed here is refused at run time. */
@@ -381,7 +409,9 @@ export interface WriteOptions extends ScopeOptions {
 
 /**
  * A list read. Every shape is one index range read of at most `limit` rows (no sort of the matching rows), by
- * construction; ties are broken by `createdAt`, then id, in the same direction:
+ * construction; ties are broken by `createdAt`, then id, in the same direction. `after` continues it: the last row of
+ * the previous page of the same query (same `where`, `orderBy` and scope), and the list goes on after that row's place
+ * in the order:
  *
  * - no `where`: ordered by `updatedAt` (the default, newest first), `createdAt` (default newest first), or a field
  *   declared as an index on its own (default ascending);
@@ -390,15 +420,18 @@ export interface WriteOptions extends ScopeOptions {
  * - `where` on field `f` ordered by another field `g`: only with the pair `[f, g]` declared (`indexes: [["state",
  *   "dueAt"]]`), default ascending.
  *
- * Anything else (two filter fields, an order no index has) is `invalid`, as is a `limit` above `MAX_LIST_LIMIT`.
+ * Anything else (two filter fields, an order no index has) is `invalid`, as is a `limit` above `maxListRows(c)` and an
+ * `after` that is not a row a list of the same query of this collection returned.
  */
 export interface ListQuery<A> extends ScopeOptions {
   /** Equality on one indexed field (`isIndexable` values). */
   readonly where?: Partial<Record<keyof A & string, WhereValue>>
   /** An indexed field, or `createdAt` / `updatedAt` (default: `updatedAt`, newest first). */
   readonly orderBy?: { readonly field: (keyof A & string) | "createdAt" | "updatedAt"; readonly direction?: "asc" | "desc" }
-  /** Default `DEFAULT_LIST_LIMIT`, at most `MAX_LIST_LIMIT`. */
+  /** Default `DEFAULT_LIST_LIMIT` (or `maxListRows(c)` when that is smaller), at most `maxListRows(c)`. */
   readonly limit?: number
+  /** The last row of the previous page of this query: the list continues after it. */
+  readonly after?: Row<A>
 }
 
 /**
@@ -572,7 +605,7 @@ export interface CollectionReader<A> {
   readonly list: (query: ListQuery<A> & { readonly scope: ScopeRef }) => ReadonlyArray<Row<A>>
   /**
    * The rows of one scope newest first (`updatedAt`, then `createdAt`, then id, descending), after `after`, at most
-   * `limit` (≤ `MAX_LIST_LIMIT`).
+   * `limit`, and never more than `maxListRows(c)` (fewer rows than asked does not mean the end then).
    */
   readonly page: (scope: ScopeRef, after: PageCursor | undefined, limit: number) => ReadonlyArray<Row<A>>
 }
@@ -638,17 +671,30 @@ export interface HouseholdStore {
 // Limits and helpers both stores use
 
 export const DEFAULT_LIST_LIMIT = 20
-/**
- * The most rows one `list` returns. With `MAX_VALUE_CHARS` it bounds the worst legal read (docs/STORING-DATA.md
- * "Latency": under 10 ms on the reference table).
- */
+/** The most rows one `list` returns, whatever its collection's `maxChars`. */
 export const MAX_LIST_LIMIT = 100
-/** The largest value a row may hold, as JSON. */
+/** The largest `maxChars` a collection may declare (and the largest projection sent to a page), as JSON. */
 export const MAX_VALUE_CHARS = 16_000
+/** A collection's `maxChars` when it declares none. */
+export const DEFAULT_MAX_CHARS = 2_000
+/**
+ * The most characters of values one `list` may decode: a list asks for at most `maxListRows(c)` rows, so
+ * rows × `maxChars` stays within it. Chosen by measuring structured values (arrays of small objects, arrays of
+ * numbers) at the limits, so the worst legal list blocks the main thread under 10 ms with a margin of two
+ * (docs/STORING-DATA.md "Latency").
+ */
+export const LIST_BUDGET_CHARS = 120_000
+const listRowsFor = (maxChars: number) => Math.max(1, Math.min(MAX_LIST_LIMIT, Math.floor(LIST_BUDGET_CHARS / maxChars)))
+/** The most rows one `list` of `c` may ask for: `min(MAX_LIST_LIMIT, floor(LIST_BUDGET_CHARS / c.maxChars))`. */
+export const maxListRows = (c: Pick<Collection<unknown>, "maxChars">): number => listRowsFor(c.maxChars)
 /** The most rows of an owner a version upgrade rewrites (one synchronous transaction at start, before serving). */
 export const MAX_MIGRATION_ROWS = 20_000
-/** The rows one step of a bulk removal (an ended conversation) removes, in one transaction of its own. */
-export const BULK_STEP_ROWS = 100
+/**
+ * The rows one step of a bulk removal (an ended conversation) removes, in one transaction of its own: measured at the
+ * legal maximum (values of `MAX_VALUE_CHARS`, eight indexed fields at `MAX_INDEXED_CHARS`, secure deletion) so one
+ * step holds the main thread under 10 ms with a margin of two (docs/STORING-DATA.md "Latency").
+ */
+export const BULK_STEP_ROWS = 10
 
 /** The error of a write in read-only mode. */
 export const readOnlyError = (what: string) =>
