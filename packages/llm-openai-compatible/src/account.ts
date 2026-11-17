@@ -22,9 +22,10 @@
  */
 import { Llm, LlmError } from "@pva/core"
 import { Config, Effect, Layer, Redacted, Stream } from "effect"
-import { listModels } from "./models.ts"
+import { createHash } from "node:crypto"
+import { listModels, type ModelListError } from "./models.ts"
 import { make, type OpenAiCompatibleLlmOptions } from "./OpenAiCompatibleLlm.ts"
-import { type Profile, profiles, type ProfileId, resolveBaseUrl } from "./profiles.ts"
+import { type ModelInfo, type Profile, profiles, type ProfileId, resolveBaseUrl } from "./profiles.ts"
 import { addressSecrets, checkAddress, fromUpstream, sanitize, secretList } from "./redact.ts"
 
 export type AccountId = "openrouter" | "home-model"
@@ -145,3 +146,51 @@ export const makeAccount = (options: AccountOptions) =>
 /** The layer of an account, from settings (the app's `ConfigProvider`). `awaitWarmUp` as `AnthropicLlm.make`. */
 export const accountLayer = (account: AccountId, awaitWarmUp = false): Layer.Layer<Llm, Config.ConfigError | LlmError> =>
   Layer.effect(Llm, Effect.flatMap(accountConfig(account), (options) => makeAccount({ ...options, awaitWarmUp })))
+
+/**
+ * Where the model picker gets an account's models (docs/MODEL-PICKERS.md §3): the account's own `GET {base}/models`,
+ * read with the shared settings only (no model needs to be chosen yet). Never on a turn's path.
+ *
+ * - `not_set_up`: no key (OpenRouter) or no address (home model); `message` is `notSetUpMessage`'s sentence.
+ * - `invalid`: the configured address is refused (message without any credential).
+ * - `ready`: `list` fetches the list; `identity` changes whenever the address or the key changes (a hash: neither
+ *   value can be read back from it), so a cache keyed by it never serves another key's list.
+ */
+export type AccountModelSource =
+  | { readonly state: "not_set_up"; readonly missing: "key" | "address"; readonly message: string }
+  | { readonly state: "invalid"; readonly message: string }
+  | {
+    readonly state: "ready"
+    readonly identity: string
+    /** The credential-free address, for messages. */
+    readonly address: string
+    readonly list: (options: { readonly timeoutMs: number; readonly fetch?: typeof globalThis.fetch }) => Effect.Effect<ReadonlyArray<ModelInfo>, ModelListError>
+  }
+
+export const accountModelSource = (account: AccountId): Effect.Effect<AccountModelSource, Config.ConfigError> => {
+  const def = accounts[account]
+  const p = def.prefix
+  return Effect.gen(function*() {
+    const key = yield* Config.Redacted(`${p}API_KEY`).pipe(Config.option)
+    const apiKey = key._tag === "Some" && Redacted.value(key.value).trim() !== "" ? Redacted.make(Redacted.value(key.value).trim()) : undefined
+    const configured = (yield* Config.String(`${p}BASE_URL`).pipe(Config.withDefault(""))).trim()
+    const secrets = secretList(apiKey !== undefined ? Redacted.value(apiKey) : undefined, addressSecrets(configured))
+    const profile: Profile = profiles[def.profile]
+    if (profile.keyRequired && apiKey === undefined) return { state: "not_set_up", missing: "key", message: notSetUpMessage(account, "key") } as const
+    if (!profile.keyRequired && configured === "") return { state: "not_set_up", missing: "address", message: notSetUpMessage(account, "address") } as const
+    if (configured !== "") {
+      const checked = checkAddress(configured, { protocols: ["http:", "https:"], query: false })
+      if (!checked.ok) return { state: "invalid", message: sanitize(secrets, { message: `The ${def.label} address ${checked.problem}` }).message } as const
+    }
+    const baseUrl = resolveBaseUrl(account === "home-model" ? profiles.ollama : profile, configured)
+    if (baseUrl === undefined) return { state: "invalid", message: `The ${def.label} address is not a valid http:// or https:// address` } as const
+    const identity = createHash("sha256").update(`${account}\u0000${baseUrl}\u0000${apiKey !== undefined ? Redacted.value(apiKey) : ""}`).digest("hex").slice(0, 16)
+    const checked = checkAddress(baseUrl, { protocols: ["http:", "https:"], query: false })
+    return {
+      state: "ready",
+      identity,
+      address: checked.ok ? checked.display : def.label,
+      list: (options) => listModels({ profile, baseUrl, apiKey, timeoutMs: options.timeoutMs, ...(options.fetch !== undefined ? { fetch: options.fetch } : {}) })
+    } as const
+  })
+}

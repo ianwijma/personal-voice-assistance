@@ -10,6 +10,7 @@ import {
   type Outcome,
   plural,
   quoted,
+  summaryMarks,
   summaryParts,
   targetKey,
   targetName,
@@ -199,7 +200,7 @@ export function NewAssistantWizard() {
                   value: x.id,
                   title: `Copy of ${x.name}`,
                   tags: [] as [],
-                  description: <Strip as="span" parts={summaryParts(x, moduleList, names, voiceName(x.voice))} className="text-ink-faint" />
+                  description: <Strip as="span" parts={summaryParts(x, moduleList, names, voiceName(x.voice))} marks={summaryMarks(x)} className="text-ink-faint" />
                 }))
               ]}
             />

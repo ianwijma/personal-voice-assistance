@@ -105,6 +105,8 @@ import { makeApi } from "./api.ts"
 import { makeAssistantVoice } from "./AssistantVoice.ts"
 import { type Favourites, makeFavourites } from "./Favourites.ts"
 import { makeVoiceCatalog, type VoiceCatalog, type VoiceCatalogOptions } from "./VoiceCatalog.ts"
+import { makeModelCatalog } from "./ModelCatalog.ts"
+import { makeModelFavourites } from "./ModelFavourites.ts"
 import { type AssistantTraceConfig, type Hearing, makeVoiceSession } from "./VoiceSession.ts"
 import { makeVoiceSessions, type VoiceSessions } from "./VoiceSessions.ts"
 import { makeRoutingService, ROUTING_KEYS } from "./routing.ts"
@@ -207,6 +209,9 @@ export interface ServeOptions {
   /** Tests: the hosted providers' voice lists and previews (local mock servers), and the engine of local previews. */
   readonly hostedVoices?: VoiceCatalogOptions["hostedVoices"]
   readonly localPreviewEngine?: VoiceCatalogOptions["localEngine"]
+  /** Tests: the model pickers' list time limit (default `LIST_TIMEOUT_MS`) and clock. */
+  readonly modelListTimeoutMs?: number
+  readonly modelCatalogNow?: () => number
   readonly turnTrace?: TurnTrace["Service"]
   /** Playback stall limit (tests shorten it). Default 2000 ms. */
   readonly stallMs?: number
@@ -1201,6 +1206,26 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       ...(options.localPreviewEngine !== undefined ? { localEngine: options.localPreviewEngine } : {})
     })
     catalogRef = voiceCatalog
+    // The model pickers' API (docs/MODEL-PICKERS.md §4): language models per account, recogniser models, favourites.
+    const modelFavourites = {
+      llm: makeModelFavourites({ dataDir: options.dataDir, kind: "llm", writable: () => lock.held(), log: (line) => runFork(Effect.logWarning(line)) }),
+      stt: makeModelFavourites({ dataDir: options.dataDir, kind: "stt", writable: () => lock.held(), log: (line) => runFork(Effect.logWarning(line)) })
+    } as const
+    const modelCatalog = makeModelCatalog({
+      configProvider: sections.configProvider,
+      vaultLocked: () => keys.state() === "locked",
+      assistants: () => [...assistantsNow().values()],
+      subscription: () => {
+        const m = host.modules().find((x) => x.id === SUBSCRIPTION_AGENT_ID)
+        const models = m?.state === "running" ? host.settingOptions(SUBSCRIPTION_AGENT_ID)?.model : undefined
+        return { state: m?.state ?? "missing", enabled: m?.enabled ?? false, ...(models !== undefined ? { models } : {}) }
+      },
+      sttItems: () => models.list().find((set) => set.tool === "stt-models")?.items ?? [],
+      sttDownload: (preset) => jobs.running("stt-models", preset),
+      isFavourite: (kind, ref) => modelFavourites[kind].has(ref),
+      ...(options.modelListTimeoutMs !== undefined ? { listTimeoutMs: options.modelListTimeoutMs } : {}),
+      ...(options.modelCatalogNow !== undefined ? { now: options.modelCatalogNow } : {})
+    })
     const api = makeApi({
       admin,
       catalog: voiceCatalog,
@@ -1208,6 +1233,8 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       jobs,
       models,
       assistantVoice,
+      modelCatalog,
+      modelFavourites,
       services,
       allowedOrigins: options.allowedOrigins,
       scheme: options.tls === undefined ? "http" : "https"

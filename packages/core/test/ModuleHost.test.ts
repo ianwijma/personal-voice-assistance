@@ -431,6 +431,31 @@ describe("ModuleHost: review findings", () => {
       const result = yield* h.fieldAction("fa", "check")
       assert.isTrue(result.ok && !result.result.ok)
     }).pipe(Effect.scoped))
+
+  it.effect("settingOptions: the running instance's choices; none while it does not run, or when they throw", () =>
+    Effect.gen(function*() {
+      let fail = false
+      const m = defineModule({
+        id: "opts",
+        name: "Opts",
+        description: "x",
+        settings: {},
+        start: () =>
+          Effect.succeed({
+            settingOptions: () => {
+              if (fail) throw new Error("thrown")
+              return { model: [{ value: "a", label: "A" }] }
+            }
+          })
+      })
+      const h = yield* makeModuleHost({ catalog: [m], persistence: fakePersistence().persistence, env: {} })
+      assert.isUndefined(h.settingOptions("opts"))
+      assert.isUndefined(h.settingOptions("nope"))
+      yield* h.enable("opts")
+      assert.deepStrictEqual(h.settingOptions("opts"), { model: [{ value: "a", label: "A" }] })
+      fail = true
+      assert.isUndefined(h.settingOptions("opts"))
+    }).pipe(Effect.scoped))
 })
 
 describe("ModuleHost: review round 2, a successful start is always published or closed", () => {

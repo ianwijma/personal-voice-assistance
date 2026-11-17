@@ -144,14 +144,20 @@ test("Behaviour: prompt with counter and the full prompt, tool rounds, follow-up
   expect((await lastSave())!.assistant.followUpSeconds).toBe(45)
 })
 
-test("Language model: account cards, model, effort, thinking, limits; the subscription block only for that account", async ({ page, baseURL }) => {
+test("Language model: the model picker, effort, thinking, limits; the subscription block only for that account", async ({ page, baseURL }) => {
   await open(page, baseURL, "jeff", "model")
-  const cards = page.getByRole("radiogroup", { name: "Account" })
-  await expect(cards.getByRole("radio", { name: /Anthropic API/ })).toBeChecked()
+  const picker = page.getByTestId("model-picker")
+  await expect(picker).toContainText("Claude Haiku 5.5")
+  await expect(field(page, "llm.model").getByTestId("implication")).toContainText("What you say is sent to Anthropic.")
   await expect(page.getByRole("heading", { name: "Claude subscription" })).toHaveCount(0)
-  // An account that is not set up links to where it is.
-  await expect(cards.getByRole("radio", { name: /Home model/ })).toContainText("Set up")
-  await page.getByLabel("Model", { exact: true }).selectOption("claude-sonnet-5-5")
+  // An account that is not set up links to where it is (in the picker).
+  await picker.click()
+  const popup = page.getByTestId("model-popup")
+  await page.getByTestId("model-rail").locator("[data-tab=home-model]").click()
+  await expect(popup.getByTestId("open-provider-settings")).toContainText("Shared settings › Language model accounts")
+  await page.getByTestId("model-rail").locator("[data-tab=anthropic]").click()
+  await popup.locator("[data-testid=model-row][data-model='anthropic:claude-sonnet-5-5'] [data-row-main]").click()
+  await expect(picker).toContainText("Claude Sonnet 5.5")
   await page.getByRole("radiogroup", { name: "Effort" }).getByRole("radio", { name: "High" }).click()
   await page.getByRole("radiogroup", { name: "Thinking" }).getByRole("radio", { name: "Adaptive" }).click()
   await expect(field(page, "llm.thinking")).toContainText("Adaptive: the model thinks first")
@@ -162,26 +168,37 @@ test("Language model: account cards, model, effort, thinking, limits; the subscr
   await saveButton(page).click()
   await expect(page.getByTestId("footer-note")).toContainText("Saved")
   expect((await lastSave())!.assistant.llm).toMatchObject({ account: "anthropic", model: "claude-sonnet-5-5", effort: "high", thinking: "adaptive", maxTokens: 2048, giveUpMs: 8000, warmUp: false })
-  // Another account: the model list changes, the subscription block appears.
-  await cards.getByRole("radio", { name: /Claude subscription/ }).click()
+  // Another account (its list forced to work): the model changes with it, the subscription block appears.
+  await fetch(`${MOCK}/mock/models/state`, { method: "POST", body: JSON.stringify({ provider: "claude-subscription", state: "ready" }) })
+  await page.reload()
+  await expect(page.getByTestId("model-picker")).toBeVisible()
+  await page.getByTestId("model-picker").click()
+  await page.getByTestId("model-rail").locator("[data-tab=claude-subscription]").click()
+  await popup.locator("[data-testid=model-row][data-model='claude-subscription:claude-haiku-5-5'] [data-row-main]").click()
   await expect(page.getByRole("heading", { name: "Claude subscription" })).toBeVisible()
   await page.getByLabel("Start a fresh Claude session after").fill("0")
-  await cards.getByRole("radio", { name: /Offline stand-in/ }).click()
-  await expect(page.getByLabel("Model", { exact: true })).toHaveCount(0)
+  await page.getByTestId("model-picker").click()
+  await page.getByTestId("model-rail").locator("[data-tab=offline]").click()
+  await popup.locator("[data-testid=model-row][data-model='offline:stand-in'] [data-row-main]").click()
+  await expect(page.getByRole("heading", { name: "Claude subscription" })).toHaveCount(0)
   await saveButton(page).click()
   await expect(page.getByTestId("footer-note")).toContainText("Saved")
   expect((await lastSave())!.assistant.llm).toMatchObject({ account: "offline", model: "", freshSessionAfterMinutes: 0 })
 })
 
-test("Hearing: says who hears with whom; model, language, timing; Deepgram swaps the groups", async ({ page, baseURL }) => {
+test("Hearing: says who hears with whom; the recogniser picker, language, timing; Deepgram swaps the groups", async ({ page, baseURL }) => {
   await open(page, baseURL, "keuken", "hearing")
   await expect(page.getByTestId("hearing-not-live")).toHaveCount(0)
   // Keuken is second on the kitchen iPad, where Jeff's recogniser is the one that runs.
   await expect(page.getByTestId("hearing-notices")).toContainText("Kitchen iPad hears with Jeff's recogniser (Parakeet v2). Keuken is set to Nemotron 320 ms: that is not used on this device.")
-  // The model list is the speech section's: a model that is not downloaded cannot be chosen.
-  const model = page.getByLabel("Model", { exact: true })
-  await expect(model.locator("option[value=whisper-turbo]")).toBeDisabled()
-  await expect(model.locator("option[value=whisper-turbo]")).toContainText("Download first")
+  // The recogniser picker: a model that is not downloaded cannot be chosen, it downloads.
+  const picker = page.getByTestId("model-picker")
+  await expect(picker).toContainText("Nemotron 320 ms")
+  await picker.click()
+  await page.getByTestId("model-rail").locator("[data-tab=sherpa]").click()
+  const whisper = page.getByTestId("model-popup").locator("[data-testid=model-row][data-model='sherpa:whisper-turbo']")
+  await expect(whisper).toHaveAttribute("data-local", "not_installed")
+  await page.keyboard.press("Escape")
   await expect(page.getByLabel("Language", { exact: true })).toHaveValue("nl")
   await page.getByLabel("Pause that ends your turn").fill("900")
   await page.getByLabel("Speech detection threshold").fill("0.4")
@@ -190,14 +207,24 @@ test("Hearing: says who hears with whom; model, language, timing; Deepgram swaps
   await expect(page.getByTestId("footer-note")).toContainText("Saved")
   expect((await lastSave())!.assistant.hearing).toMatchObject({ finalSilenceMs: 900, vadThreshold: 0.4, agc: false, model: "nemotron-320", language: "nl" })
   // Jeff's recogniser is one model for a language-less model.
-  await page.getByLabel("Model", { exact: true }).selectOption("parakeet-v2")
+  await picker.click()
+  await page.getByTestId("model-rail").locator("[data-tab=sherpa]").click()
+  await page.getByTestId("model-popup").locator("[data-testid=model-row][data-model='sherpa:parakeet-v2'] [data-row-main]").click()
   await expect(page.getByLabel("Language", { exact: true })).toBeDisabled()
-  // Deepgram: its own settings; no microphone processing (the local recogniser's).
-  await page.getByRole("radiogroup", { name: "Speech to text" }).getByRole("radio", { name: /Deepgram/ }).click()
+  // Deepgram: not set up, so the picker links to its settings instead of a list (forced ready for the rest).
+  await picker.click()
+  await page.getByTestId("model-rail").locator("[data-tab=deepgram]").click()
+  await expect(page.getByTestId("model-popup").getByTestId("provider-needs-key")).toContainText("No Deepgram key yet")
+  await page.keyboard.press("Escape")
+  await fetch(`${MOCK}/mock/models/state`, { method: "POST", body: JSON.stringify({ provider: "deepgram", state: "ready" }) })
+  await page.reload()
+  await page.getByTestId("model-picker").click()
+  await page.getByTestId("model-rail").locator("[data-tab=deepgram]").click()
+  await page.getByTestId("model-popup").locator("[data-testid=model-row][data-model='deepgram:flux-general-en'] [data-row-main]").click()
   await expect(page.getByLabel("End-of-turn confidence")).toBeVisible()
   await expect(page.getByLabel("Boost quiet microphones")).toHaveCount(0)
-  await expect(field(page, "hearing.engine")).toContainText("What you say is sent to Deepgram.")
-  await expect(field(page, "hearing.engine").getByTestId("field-warning")).toContainText("Deepgram is not set up yet")
+  await expect(field(page, "hearing.model").getByTestId("implication")).toContainText("What you say is sent to Deepgram.")
+  await expect(field(page, "hearing.model").getByTestId("field-warning")).toContainText("Deepgram is not set up yet")
 })
 
 test("Voice: the voice picker saves one voice per assistant", async ({ page, baseURL }) => {

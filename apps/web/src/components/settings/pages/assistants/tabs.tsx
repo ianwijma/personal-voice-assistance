@@ -12,13 +12,10 @@ import {
 } from "@pva/protocol"
 import {
   accountInfo,
-  ACCOUNTS,
   accountState,
   errorsFor,
   hearingModelNames,
   listJoin,
-  modelAfterAccountChange,
-  modelChoices,
   plural,
   targetName
 } from "@/lib/assistants.ts"
@@ -29,6 +26,7 @@ import { rendererFor } from "@/ui/fieldRenderers.ts"
 import { useClientState } from "../../../context.tsx"
 import { VoicePicker } from "../../../voices/VoicePicker.tsx"
 import { useCatalogState } from "../../../voices/useVoiceCatalog.ts"
+import { LlmModelPicker, SttModelPicker } from "../../../pickers/ModelPickers.tsx"
 import { Icon } from "../../../ui/Icon.tsx"
 import { Button, cx } from "../../../ui/controls.tsx"
 import {
@@ -38,7 +36,6 @@ import {
   idOfPath,
   NumberControl,
   PresetControl,
-  RadioCards,
   SegControl,
   SelectControl,
   SwitchControl,
@@ -181,60 +178,38 @@ export function BehaviourTab({ draft }: TabProps) {
 
 // ---- Language model
 
-/** Account, model and effort: the essentials of the language model (the wizard shows only these). */
+/** The language model picker and effort: the essentials of the language model (the wizard shows only these). */
 export function ModelFields({ draft }: { readonly draft: AssistantDraft }) {
   const a = draft.current
   const sections = useClientState((s) => s.sections)
   const modules = useClientState((s) => s.modules)
   const info = accountInfo(a.llm.account)
   const state = accountState(a.llm.account, sections, Object.values(modules.byId))
-  const choices = modelChoices(a.llm.account)
   const name = a.name === "" ? "The assistant" : a.name
   const needsSetup = state.tone === "todo"
-  const changeAccount = (account: typeof a.llm.account) =>
-    draft.update((x) => ({ ...x, llm: { ...x.llm, account, model: modelAfterAccountChange(account, x.llm.model) } }), "llm.account")
+  // One choice sets the account and the model together (the row's `apply`); the account's own options below follow it.
+  const apply = (llm: { readonly account: typeof a.llm.account; readonly model: string }) =>
+    draft.update((x) => ({ ...x, llm: { ...x.llm, account: llm.account, model: llm.model } }), "llm")
   return (
     <>
       <AField
-        label="Account"
-        path="llm.account"
+        label="Language model"
+        path="llm.model"
+        alsoPaths={["llm.account"]}
         draft={draft}
+        htmlFor={idOfPath("llm.model")}
         implication={info.implication}
         warn={
           needsSetup
             ? <>{info.title} is not set up yet: {name} cannot answer until you add it in <SettingsLink path={state.setUp ?? ["shared", "accounts"]}>Shared settings › Language model accounts</SettingsLink>.</>
             : undefined
         }
-        help={<>Accounts are set up once, in <SettingsLink path={["shared", "accounts"]}>Shared settings › Language model accounts</SettingsLink>.</>}
+        help={<>Pick a model of any account. Accounts are set up once, in <SettingsLink path={["shared", "accounts"]}>Shared settings › Language model accounts</SettingsLink>.</>}
       >
-        <RadioCards
-          groupId={idOfPath("llm.account")}
-          label="Account"
-          value={a.llm.account}
-          onChange={changeAccount}
-          cards={ACCOUNTS.map((acc) => {
-            const st = accountState(acc.id, sections, Object.values(modules.byId))
-            return {
-              value: acc.id,
-              title: acc.title,
-              tags: acc.tags,
-              description: acc.description,
-              right: st.tone === "ok"
-                ? <span className="inline-flex items-center gap-1.5"><span aria-hidden="true" className="size-1.5 rounded-full bg-ok" />{st.text}</span>
-                : st.tone === "todo" && st.setUp !== undefined
-                ? <SettingsLink path={st.setUp}>{st.text}</SettingsLink>
-                : st.text
-            }
-          })}
-        />
+        <div>
+          <LlmModelPicker id={idOfPath("llm.model")} account={a.llm.account} model={a.llm.model} onApply={apply} />
+        </div>
       </AField>
-      {a.llm.account !== "offline" && (
-        <AField label="Model" path="llm.model" draft={draft} htmlFor={idOfPath("llm.model")} help={choices !== undefined ? "The models this account offers." : `The model's name at the provider, for example ${a.llm.account === "openrouter" ? "qwen/qwen3-235b" : "qwen3-14b"}.`}>
-          {choices !== undefined
-            ? <SelectControl draft={draft} path="llm.model" label="Model" width={360} options={choices.map((m) => ({ value: m, label: m }))} />
-            : <TextControl draft={draft} path="llm.model" max={100} label="Model" placeholder={a.llm.account === "openrouter" ? "qwen/qwen3-235b" : "qwen3-14b"} />}
-        </AField>
-      )}
       <AField label="Effort" path="llm.effort" draft={draft} help="Low starts replies sooner; high thinks harder first.">
         <SegControl draft={draft} path="llm.effort" label="Effort" options={[{ value: "low", label: "Low" }, { value: "medium", label: "Medium" }, { value: "high", label: "High" }]} />
       </AField>
@@ -308,50 +283,38 @@ function hearingNotices(label: (preset: string) => string, info: AssistantInfo, 
   return { differs, summary: `${parts.join(" ")} A device hears with one recogniser: that of the assistant that answers without a phrase there, or else the first in its list.` }
 }
 
-/** Engine, model and language: the essentials of hearing (the wizard shows only these). */
+/** The recogniser picker and the language: the essentials of hearing (the wizard shows only these). */
 export function HearingFields({ draft }: { readonly draft: AssistantDraft }) {
   const a = draft.current
   const sections = useClientState((s) => s.sections)
   const isDg = a.hearing.engine === "deepgram"
-  const modelField = sections.flatMap((s) => s.form.fields).find((f): f is Extract<SettingField, { type: "choice" }> => f.key === "STT_SHERPA_MODEL" && f.type === "choice")
   const languageField = sections.flatMap((s) => s.form.fields).find((f) => f.key === "STT_SHERPA_LANGUAGE")
-  const options = modelField?.options.map((o) => ({
-    value: o.value,
-    label: `${o.label.split(" — ")[0]}${o.tags?.includes("not-downloaded") === true ? " · Download first" : ""}`,
-    disabled: o.tags?.includes("not-downloaded") === true && o.value !== a.hearing.model
-  })) ?? [{ value: a.hearing.model, label: a.hearing.model }]
   const languageOk = languageField?.visibleWhen === undefined ||
     evaluateCondition(languageField.visibleWhen, (k): SettingValue | undefined => (k === "STT_SHERPA_MODEL" ? a.hearing.model : k === "STT_PROVIDER" ? "sherpa" : undefined))
   const deepgramSet = sections.some((s) => s.form.secrets.DEEPGRAM_API_KEY?.set === true)
+  // One choice sets the engine (and, for a model on this machine, the model); what follows below follows the row.
+  const apply = (hearing: { readonly engine: typeof a.hearing.engine; readonly model?: string | undefined }) =>
+    draft.update((x) => ({ ...x, hearing: { ...x.hearing, engine: hearing.engine, ...(hearing.model !== undefined ? { model: hearing.model } : {}) } }), "hearing")
   return (
     <>
       <AField
-        label="Speech to text"
-        path="hearing.engine"
+        label="Speech recognition model"
+        path="hearing.model"
+        alsoPaths={["hearing.engine"]}
         draft={draft}
+        htmlFor={idOfPath("hearing.model")}
         implication={isDg ? "What you say is sent to Deepgram." : "Your voice never leaves this machine."}
         warn={isDg && !deepgramSet ? <>Deepgram is not set up yet: speech recognition fails on the devices that hear with this assistant until you add its key in <SettingsLink path={["shared", "speech"]}>Shared settings › Speech recognition models</SettingsLink>.</> : undefined}
+        help={<>Only downloaded models can be chosen: download one in the list. Keys and downloads are also in <SettingsLink path={["shared", "speech"]}>Shared settings › Speech recognition models</SettingsLink>.</>}
       >
-        <RadioCards
-          groupId={idOfPath("hearing.engine")}
-          label="Speech to text"
-          value={a.hearing.engine}
-          onChange={(v) => draft.set("hearing.engine", v)}
-          cards={[
-            { value: "sherpa", title: "On this machine", tags: ["local"], description: "sherpa-onnx with a downloaded model." },
-            { value: "deepgram", title: "Deepgram", tags: ["hosted", "needs-key"], description: "Deepgram Flux over the internet.", right: deepgramSet ? <span className="inline-flex items-center gap-1.5"><span aria-hidden="true" className="size-1.5 rounded-full bg-ok" />Key set</span> : <SettingsLink path={["shared", "speech"]}>Set up…</SettingsLink> }
-          ]}
-        />
+        <div>
+          <SttModelPicker id={idOfPath("hearing.model")} engine={a.hearing.engine} model={a.hearing.model} onApply={apply} />
+        </div>
       </AField>
       {!isDg && (
-        <>
-          <AField label="Model" path="hearing.model" draft={draft} htmlFor={idOfPath("hearing.model")} help={<>Only downloaded models can be chosen. <SettingsLink path={["shared", "speech"]}>Download more in Shared settings › Speech recognition models</SettingsLink>.</>}>
-            <SelectControl draft={draft} path="hearing.model" label="Model" width={420} options={options} />
-          </AField>
-          <AField label="Language" path="hearing.language" draft={draft} htmlFor={idOfPath("hearing.language")} help={languageOk ? "Automatic works, but naming the language is faster and makes fewer mistakes." : "This model has one language, so the setting is not used."}>
-            <SelectControl draft={draft} path="hearing.language" label="Language" width={260} disabled={!languageOk} options={LANGUAGES.map(([value, label]) => ({ value, label }))} />
-          </AField>
-        </>
+        <AField label="Language" path="hearing.language" draft={draft} htmlFor={idOfPath("hearing.language")} help={languageOk ? "Automatic works, but naming the language is faster and makes fewer mistakes." : "This model has one language, so the setting is not used."}>
+          <SelectControl draft={draft} path="hearing.language" label="Language" width={260} disabled={!languageOk} options={LANGUAGES.map(([value, label]) => ({ value, label }))} />
+        </AField>
       )}
     </>
   )

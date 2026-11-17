@@ -6,6 +6,7 @@ import { Icon, Spinner } from "../../../ui/Icon.tsx"
 import { useDialog } from "../../../ui/Panel.tsx"
 import { Button, cx, Segmented, Switch } from "../../../ui/controls.tsx"
 import { Tags } from "../../../ui/Tags.tsx"
+import { ProviderMark } from "../../../voices/ProviderMark.tsx"
 import { FieldMarkers } from "../../FormFooter.tsx"
 import type { AssistantDraft } from "./useAssistantDraft.ts"
 
@@ -14,9 +15,11 @@ import type { AssistantDraft } from "./useAssistantDraft.ts"
 export const idOfPath = (path: string) => `a-${path.replace(/[^a-zA-Z0-9_-]/g, "_")}`
 
 /** One field: label, "Unsaved", the control, what choosing it implies, a warning, the server's errors, the help. */
-export function AField({ label, path, draft, htmlFor, implication, warn, help, readOnly = false, children, resetTitle }: {
+export function AField({ label, path, alsoPaths = [], draft, htmlFor, implication, warn, help, readOnly = false, children, resetTitle }: {
   readonly label: string
   readonly path: string
+  /** Other fields this one sets together with `path` (a model picker sets the account too): their marks and errors show here. */
+  readonly alsoPaths?: ReadonlyArray<string>
   readonly draft: AssistantDraft
   /** The id of the control the label names (a group of buttons has none). */
   readonly htmlFor?: string
@@ -27,9 +30,9 @@ export function AField({ label, path, draft, htmlFor, implication, warn, help, r
   readonly children: ReactNode
   readonly resetTitle?: string
 }) {
-  const errors = errorsFor(draft.errors, path)
+  const errors = [path, ...alsoPaths].flatMap((p) => errorsFor(draft.errors, p))
   const local = draft.localErrors[path]
-  const changed = draft.changed(path)
+  const changed = [path, ...alsoPaths].some((p) => draft.changed(p))
   const id = htmlFor ?? idOfPath(path)
   return (
     <div className="flex flex-col gap-1.5" data-field={path} data-changed={changed ? "true" : undefined}>
@@ -349,11 +352,20 @@ export function StateChip({ on }: { readonly on: boolean }) {
 }
 
 /** The mono summary strip (model | hearing | voice | modules), the same on the list, the page and Diagnostics. */
-export function Strip({ parts, className, as: Tag = "p" }: { readonly parts: ReadonlyArray<string>; readonly className?: string; readonly as?: "p" | "span" }) {
+export function Strip({ parts, marks, className, as: Tag = "p" }: {
+  readonly parts: ReadonlyArray<string>
+  /** The provider each part is of (`summaryMarks`): its mark goes before the words, as in the pickers. */
+  readonly marks?: ReadonlyArray<string | undefined>
+  readonly className?: string
+  readonly as?: "p" | "span"
+}) {
   return (
     <Tag className={cx("flex flex-wrap font-mono text-[12px] leading-5 text-ink-muted", className)} data-testid="assistant-strip">
       {parts.map((p, i) => (
-        <span key={i} className={cx("whitespace-nowrap pr-2", i < parts.length - 1 && "mr-2 border-r border-line")}>{p}</span>
+        <span key={i} className={cx("max-w-full pr-2", i < parts.length - 1 && "mr-2 border-r border-line", marks?.[i] !== undefined && "inline-flex items-center gap-1.5")}>
+          {marks?.[i] !== undefined && <ProviderMark id={marks[i]!} size={14} />}
+          {p}
+        </span>
       ))}
     </Tag>
   )
