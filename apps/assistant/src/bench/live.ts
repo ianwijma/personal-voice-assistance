@@ -5,12 +5,12 @@
  * the next turn never overlaps the reply). Replies are written as WAV files.
  */
 import { frameBytes, layerOutput, loadInputPcm, pacedFrames } from "@pva/audio-file"
-import { type AudioError, Conversation, type Llm, type LlmError, type ModuleSnapshot, Stt, type SttEvent, ToolRegistry, type Trace, type Tts, TurnTrace } from "@pva/core"
+import { type AudioError, Conversation, type Llm, type LlmError, Stt, type SttEvent, type Trace, type Tts, TurnTrace } from "@pva/core"
 import { Config, Deferred, Effect, Layer, Option, Queue, type Scope, Stream } from "effect"
 import { readdirSync, statSync } from "node:fs"
 import { basename, join } from "node:path"
 import type { ConversationOptions } from "@pva/core"
-import { startCliModules } from "../modules.ts"
+import { type CliModules, startCliModules } from "../modules.ts"
 import { describeConfigError, observedTurnTraceLayer, StartupError } from "../startup.ts"
 import type { BenchRow } from "./report.ts"
 
@@ -90,8 +90,8 @@ export interface LiveOptions {
   readonly noiseFloor?: boolean
   /** Silence before the first file, while the STT connection opens. Default 1500 ms. */
   readonly leadInMs?: number
-  /** Running modules. Default: started from the saved settings. */
-  readonly modules?: ModuleSnapshot
+  /** Running modules, read per turn. Default: started from the saved settings. */
+  readonly modules?: CliModules
 }
 
 export interface LiveSessionsOptions extends LiveOptions {
@@ -146,7 +146,7 @@ const runLiveSession = (
   leadFrames: (k: number) => number,
   barrier: (k: number) => Effect.Effect<void>,
   outputDir: string,
-  modules: ModuleSnapshot,
+  modules: CliModules,
   label: string,
   ownStt?: Stt["Service"]
 ): Effect.Effect<Array<BenchRow>, AudioError | StartupError, Stt | Llm | Tts> =>
@@ -154,8 +154,8 @@ const runLiveSession = (
     const finished = yield* Queue.unbounded<Trace>()
     const onFinish = (trace: Trace) => trace.outcome === "discarded" ? Effect.void : Queue.offer(finished, trace)
     const traceLayer = observedTurnTraceLayer(onFinish)
-    const layer = Conversation.layer(options.conversation).pipe(
-      Layer.provideMerge(Layer.mergeAll(Layer.succeed(ToolRegistry, modules.registry), traceLayer, layerOutput({ directory: outputDir })))
+    const layer = Conversation.layerWithSetup({ ...options.conversation, setup: modules.setup(options.conversation.systemPrompt) }).pipe(
+      Layer.provideMerge(Layer.mergeAll(traceLayer, layerOutput({ directory: outputDir })))
     )
     return yield* Effect.gen(function*() {
       const conversation = yield* Conversation

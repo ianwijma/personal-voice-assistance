@@ -1,15 +1,20 @@
 // The household store and the event bus in the module host (docs/STORING-DATA.md): `ctx.store` and `ctx.events` for
 // version 2 modules, a module whose data is newer is `unavailable`, host events, and a slow subscriber.
 import { assert, describe, it } from "@effect/vitest"
-import { Effect, Fiber, Schema, Stream } from "effect"
-import { TestClock } from "effect/testing"
+import { Cause, Deferred, Effect, Exit, Fiber, Schema, Stream } from "effect"
+import { ToolError } from "../src/Errors.ts"
 import { hostEvent, makeEventBus } from "../src/EventBus.ts"
 import { defineCollection, type ModuleStore, StoreError } from "../src/HouseholdStore.ts"
 import type { ModuleEvents } from "../src/EventBus.ts"
+import { makeTool } from "../src/Module.ts"
+import { ModuleStopped } from "../src/ModuleApi.ts"
 import { defineModule, ModuleStartError } from "../src/ModuleDefinition.ts"
 import { type ModuleDemand, makeModuleHost, readOnlyPersistence } from "../src/ModuleHost.ts"
 import { Setting } from "../src/Settings.ts"
 import { makeTestHousehold } from "../src/testing.ts"
+
+/** Let forked fibers (subscriptions, the host's worker) run. */
+const settle = Effect.repeat(Effect.yieldNow, { times: 50 })
 
 const Item = Schema.Struct({ text: Schema.String })
 const items = defineCollection({ name: "items", scope: "household", schema: Item })
@@ -72,11 +77,14 @@ describe("household store in the module host", () => {
       const host = yield* makeModuleHost({ catalog: [shop], persistence: readOnlyPersistence(), env: {} })
       yield* host.startEnabled
       assert.strictEqual(host.modules()[0]!.state, "error")
+      assert.match(host.modules()[0]!.error ?? "", /no household store/)
       const exit = yield* Effect.exit(seen.store!.collection(items).list())
       assert.isTrue(exit._tag === "Failure")
     }).pipe(Effect.scoped))
 
-  it.effect("a shared part's subscriptions follow its generation: nothing while a candidate, nothing once replaced or retired", () =>
+  // Rewritten for the one-worker host (P1 round 3): a replacement stops the old part before it starts the new one, so
+  // there is no moment when the old one still handles while the new one starts (the earlier version asserted that).
+  it.effect("a subscription lives with its part: nothing while the module starts, nothing once it is withdrawn, released when its scope closes", () =>
     Effect.gen(function*() {
       const handled: Array<string> = []
       let release: (() => void) | undefined
@@ -90,7 +98,7 @@ describe("household store in the module host", () => {
           Effect.gen(function*() {
             const label = settings.label ?? ""
             yield* Effect.forkScoped(Stream.runForEach(events.subscribe({ type: "host.turn.ended" }), () => Effect.sync(() => handled.push(label))))
-            // The second generation is slow to start: events published meanwhile must not reach it yet.
+            // The second start is slow: events published meanwhile must reach neither part.
             if (label === "two") yield* Effect.callback<void>((resume) => void (release = () => resume(Effect.void)))
             return { value: undefined }
           }),
@@ -100,27 +108,102 @@ describe("household store in the module host", () => {
       const demand = { current: new Map<string, ReadonlyArray<ModuleDemand>>([["watcher", [{ assistantId: "a" }]]]) }
       const host = yield* makeModuleHost({ catalog: [watcher], persistence: readOnlyPersistence(), env: {}, demand: () => demand.current, household: h.household })
       yield* host.startEnabled
-      const tick = Effect.andThen(Effect.sync(() => h.bus.publish(hostEvent("turn.ended", {}))), Effect.repeat(Effect.yieldNow, { times: 20 }))
-      // Let the shared part's subscription start.
-      yield* Effect.repeat(Effect.yieldNow, { times: 50 })
+      const tick = Effect.andThen(Effect.sync(() => h.bus.publish(hostEvent("turn.ended", {}))), settle)
+      yield* settle
       yield* tick
       assert.deepStrictEqual(handled, ["one"])
-      // Replace the shared part: while the new one starts, the old one still handles; the candidate does not.
+      assert.strictEqual(h.bus.stats().subscribers, 1)
+      // Replaced: the old part is withdrawn and closed (its subscription released) before the new one starts; while the
+      // new one starts, neither handles.
       const fiber = yield* Effect.forkChild(host.configure("watcher", { values: { label: "two" }, secrets: {} }))
-      yield* Effect.repeat(Effect.yieldNow, { times: 50 })
+      yield* settle
+      assert.strictEqual(host.modules()[0]!.state, "starting")
+      assert.strictEqual(h.bus.stats().subscribers, 1, "only the starting part's subscription is left")
       yield* tick
-      assert.deepStrictEqual(handled, ["one", "one"])
+      assert.deepStrictEqual(handled, ["one"])
       release!()
       assert.isTrue((yield* Fiber.join(fiber)).ok)
-      // Published: only the new one handles, although the old one's scope stays open for its grace period.
+      // Published: the new one handles (an event published while it started was not kept for it).
       yield* tick
-      assert.deepStrictEqual(handled, ["one", "one", "two"])
-      // Demand ends: the retiring part handles nothing more.
+      assert.deepStrictEqual(handled, ["one", "two"])
+      // Demand ends: withdrawn, closed, released.
       demand.current = new Map([["watcher", []]])
       yield* host.refresh
       yield* tick
-      assert.deepStrictEqual(handled, ["one", "one", "two"])
-      yield* TestClock.adjust(10_000)
+      assert.deepStrictEqual(handled, ["one", "two"])
+      assert.strictEqual(h.bus.stats().subscribers, 0)
+    }).pipe(Effect.scoped))
+
+  it.effect("once its module is withdrawn no event reaches a handler, even one already queued; the store writes through the grace period and refuses once the part has closed", () =>
+    Effect.gen(function*() {
+      const handled: Array<number> = []
+      const handlerGate = yield* Deferred.make<void>()
+      const toolGate = yield* Deferred.make<void>()
+      const kept: { store?: ModuleStore; events?: ModuleEvents } = {}
+      const slowpoke = defineModule({
+        apiVersion: 2,
+        id: "slowpoke",
+        name: "Slowpoke",
+        description: "Handles slowly",
+        enabledByDefault: true,
+        storage: { collections: [items] },
+        start: (ctx) =>
+          Effect.gen(function*() {
+            kept.store = ctx.store
+            kept.events = ctx.events
+            // An instance's subscription, in its scope: the first event's handler waits.
+            yield* Effect.forkScoped(Stream.runForEach(ctx.events.subscribe({ type: "host.turn.ended" }), (e) =>
+              Effect.suspend(() => {
+                handled.push((e.data as { i: number }).i)
+                return handled.length === 1 ? Deferred.await(handlerGate) : Effect.void
+              })))
+            // One run outside the part's scope: it ends when the part's scope closes all the same.
+            yield* Effect.forkDetach(Stream.runDrain(ctx.events.subscribe({ type: "nobody.publishes.this" })))
+            return {
+              tools: [makeTool({
+                name: "note",
+                description: "writes a note after a while",
+                parameters: Schema.Struct({}),
+                execute: () =>
+                  Effect.andThen(Deferred.await(toolGate), ctx.store.collection(items).insert({ text: "in grace" })).pipe(
+                    Effect.map((row) => row.value.text),
+                    Effect.mapError((e) => new ToolError({ message: e.message }))
+                  )
+              })]
+            }
+          })
+      })
+      const h = yield* makeTestHousehold([slowpoke])
+      const host = yield* makeModuleHost({ catalog: [slowpoke], persistence: readOnlyPersistence(), env: {}, household: h.household })
+      yield* host.startEnabled
+      yield* settle
+      for (let i = 0; i < 3; i++) h.bus.publish(hostEvent("turn.ended", { i }))
+      yield* settle
+      assert.deepStrictEqual(handled, [0], "the first handler waits; two events are queued")
+      assert.strictEqual(h.bus.stats().subscribers, 2)
+      const tool = host.snapshot().parts[0]!.module.tools![0]!
+      const call = yield* Effect.forkChild(host.gateway.tool("slowpoke", tool, {}))
+      yield* settle
+      const stopping = yield* Effect.forkChild(host.disable("slowpoke"))
+      yield* settle
+      assert.strictEqual(host.modules()[0]!.state, "stopping", "withdrawn; the tool call holds the grace period")
+      yield* Deferred.succeed(handlerGate, undefined)
+      yield* settle
+      assert.deepStrictEqual(handled, [0], "the queued events never reach the handler of a withdrawn part")
+      yield* Deferred.succeed(toolGate, undefined)
+      assert.strictEqual(yield* Fiber.join(call), "in grace", "a call in flight still writes during the grace period")
+      yield* Fiber.join(stopping)
+      assert.strictEqual(host.modules()[0]!.state, "disabled")
+      assert.strictEqual(h.bus.stats().subscribers, 0, "both released, the detached one too")
+      // Closed: every member dies with ModuleStopped, a collection handle taken earlier too (taken now: the same).
+      const stopped = (exit: Exit.Exit<unknown, unknown>) => Exit.isFailure(exit) && Cause.squash(exit.cause) instanceof ModuleStopped
+      assert.isTrue(stopped(yield* Effect.exit(kept.store!.collection(items).list())))
+      assert.isTrue(stopped(yield* Effect.exit(kept.store!.transaction(() => 1))))
+      assert.isTrue(stopped(yield* Effect.exit(kept.events!.publish("late", {}))))
+      assert.isTrue(stopped(yield* Effect.exit(Stream.runDrain(kept.events!.subscribe()))))
+      // The write made in the grace period is there.
+      const rows = yield* h.store.forModule("slowpoke").collection(items).list()
+      assert.deepStrictEqual(rows.map((r) => r.value.text), ["in grace"])
     }).pipe(Effect.scoped))
 
   it("the host's event namespace is reserved: no module may have the id host", () => {

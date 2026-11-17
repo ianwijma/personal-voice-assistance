@@ -14,8 +14,12 @@ export interface FakeTurnContext {
   readonly text: string
   /** Emit a text delta (a `stream_event` / `text_delta`). */
   delta(text: string): void
-  /** Call a tool the way Claude Code would: through the in-process MCP server's handler. */
+  /** Call a tool the way Claude Code would: announce it in the stream, then call it through the in-process MCP server's handler. */
   callTool(name: string, args: Record<string, unknown>): Promise<{ content: string; isError: boolean }>
+  /** Only announce a tool use in the stream (its MCP call is made later, or never). */
+  announce(name: string, args: Record<string, unknown>): void
+  /** The MCP server's handler as it is now (a test keeps it to make a late call). */
+  mcp(): ToolHandler | undefined
   result(subtype?: "success" | "error_during_execution", isError?: boolean, text?: string): void
   emit(message: unknown): void
   /** Resolves when this turn was interrupted. */
@@ -59,6 +63,7 @@ const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
 
 export const makeFakeSdk = (options: FakeSdkOptions = {}) => {
   const queries: Array<FakeQuery> = []
+  let toolUses = 0
   const servers = new Map<object, { tools: ReadonlyArray<SessionTool>; handler: ToolHandler }>()
   /** While set, `setModel` and `applyFlagSettings` apply at once but are acknowledged only when it resolves (`holdRetunes`). */
   let retuneHold: Promise<void> | undefined
@@ -204,8 +209,12 @@ export const makeFakeSdk = (options: FakeSdkOptions = {}) => {
             callTool: async (name, args) => {
               const handler = handlerFor()
               if (handler === undefined || !currentTools.some((t) => t.name === name)) return { content: `No such tool: ${name}`, isError: true }
+              // As Claude Code does: the assistant message with the tool use comes first, then the MCP call.
+              push({ type: "assistant", parent_tool_use_id: null, message: { content: [{ type: "tool_use", id: `toolu_${++toolUses}`, name: `mcp__assistant__${name}`, input: args }] } })
               return handler(name, args)
             },
+            announce: (name, args) => push({ type: "assistant", parent_tool_use_id: null, message: { content: [{ type: "tool_use", id: `toolu_${++toolUses}`, name: `mcp__assistant__${name}`, input: args }] } }),
+            mcp: () => handlerFor(),
             result: (subtype = "success", isError = false, resultText = "") => {
               if (!stopped) push({ type: "result", subtype, is_error: isError, result: resultText, num_turns: 1 })
             },

@@ -1,6 +1,6 @@
 import { Effect, Schema } from "effect"
 import { ToolError } from "./Errors.ts"
-import { makeTool, type Tool, type ToolMetadata, type ToolRisk } from "./Module.ts"
+import { makeTool, type RiskByInput, type Tool, type ToolMetadata } from "./Module.ts"
 import { editDistance, normalizePhrase, phoneticKey } from "./TextMatching.ts"
 import { parseDuration } from "./ValueParsing.ts"
 
@@ -373,36 +373,21 @@ export const actionTool = (registered: RegisteredAction): Tool => {
     description: `${sentenceOf(def.label)} ${def.description}${confirm}`,
     parameters: Schema.Struct(fields) as unknown as Schema.Codec<Readonly<Record<string, unknown>>, unknown>,
     speculative: def.speculative === true,
-    // A risk that depends on the values is judged on what `run` would receive (a dynamic name resolved, a duration parsed).
-    ...(def.risk !== undefined ? { risk: typeof def.risk === "function" ? riskOfValues(registered) : def.risk } : {}),
+    // A risk that depends on the values is judged on what `run` would receive (a dynamic name resolved, a duration
+    // parsed); the gateway judges a call of this tool on the action's values directly (`Gateway.ts`).
+    ...(def.risk !== undefined ? { risk: typeof def.risk === "string" ? def.risk : riskOfValues(registered, def.risk) } : {}),
     ...(def.sensitivity !== undefined ? { sensitivity: def.sensitivity } : {}),
     ...(def.latency !== undefined ? { latency: def.latency } : {}),
-    execute: (input: Readonly<Record<string, unknown>>) =>
-      Effect.suspend(() => {
-        // Never through a registry: only core's confirmation (`consumeConfirmation`) runs such an action.
-        if (needsYes) return Effect.fail(new ToolError({ message: "Not run: this action needs the owner's confirmation, which only the assistant can ask for." }))
-        let values: Record<string, any>
-        try {
-          values = actionValues(registered, input)
-        } catch (error) {
-          return Effect.fail(error instanceof ToolError ? error : new ToolError({ message: String(error) }))
-        }
-        return def.run(values).pipe(
-          Effect.timeoutOrElse({
-            duration: ACTION_TIMEOUT_MS,
-            orElse: () => Effect.fail(new ActionError({ message: `${def.label} did not finish within ${ACTION_TIMEOUT_MS / 1000} s` }))
-          }),
-          Effect.mapError((error) => new ToolError({ message: error.message, cause: error })),
-          Effect.map((outcome) => outcome?.say ?? def.announce?.(values) ?? "ok")
-        )
-      })
+    // Only the execution gateway runs it (`Gateway.ts`): it turns the input into the action's values once, admits
+    // the call and runs the action. Called directly, it refuses.
+    execute: () => Effect.fail(new ToolError({ message: "Not run: an action's tool runs only through the execution gateway." }))
   })
   return { ...tool, action: registered }
 }
 
-const riskOfValues = (registered: RegisteredAction) => (input: Readonly<Record<string, unknown>>) => {
-  const risk = registered.definition.risk as (values: Record<string, unknown>) => ToolRisk
-  return risk(actionValues(registered, input))
-}
+const riskOfValues = (registered: RegisteredAction, risk: RiskByInput): RiskByInput<Readonly<Record<string, unknown>>> => ({
+  classes: risk.classes,
+  of: (input) => risk.of(actionValues(registered, input))
+})
 
 const sentenceOf = (s: string) => (/[.!?]$/.test(s) ? s : `${s}.`)

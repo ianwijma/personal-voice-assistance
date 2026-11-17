@@ -159,12 +159,17 @@ Service keys and interfaces that the core provides or calls (`People`, `Privacy`
     `ctx.settingsFor(assistantId)` gives the module's effective settings for an assistant (its own values over the
     shared ones), and the shared values when there is no assistant. A weather briefing section therefore uses the
     asking assistant's place and units.
-  - *Replacement.* A change to a shared setting starts a new generation: the new shared part and every instance
-    start, then the snapshot switches to them at once, then the old generation is retired. If the new generation
-    fails to start, the old one keeps serving and the Health page says why. The old shared part's handlers, routes,
-    subscriptions, services and contributions are withdrawn at the switch, never live beside the new ones; the old
-    scope itself closes after the existing grace period for calls in flight. `requestRestart` from an instance
-    restarts that instance; from the shared part it starts a new generation.
+  - *One thing at a time.* The host keeps a desired state (settings, switches, the vault, probe results, restart
+    requests) and one worker that brings the running modules in line with it, one module at a time, in `uses`
+    order. Nothing else starts or stops module code, so no two lifecycle operations ever interleave.
+  - *Replacement is stop, then start.* When what a module should run changes, its tools and registrations are
+    withdrawn, calls in flight get the existing grace period, the old instances and then the old shared part are
+    closed, and only then are the new ones started and published. For that moment the module is absent: its tools
+    are not offered and its services are not there, which consumers must handle anyway. If the new one fails to
+    start, the module is down with its error on the Health page, as on `main` today; there is no old version kept
+    running beside a new one, and so nothing of a module is ever live twice. Every call into module code (a start,
+    a finalizer) has a time limit, after which the host moves on and reports it. `requestRestart` asks the worker
+    for exactly this, at most once every few seconds per module.
   - *Order.* A module starts after the shared parts of the modules in its `uses` have started or failed. A cycle in
     `uses` is an error for every module in it, found when the catalogue is read. A consumer never keeps a service
     it looked up at start: it looks it up at each use, so a provider that fails, restarts or comes back later is
@@ -204,11 +209,17 @@ Service keys and interfaces that the core provides or calls (`People`, `Privacy`
 - `host` also gives a read-only view (module states, vault locked or not, engine summary, connected devices, the
   Home section's values) and `requestRestart(reason)`, so a module whose tool list changed at run time is started
   again.
-- Requirements: the `Requirement` type, one tool registry in the app with probes, probing at start and on "Check
-  again", a new module state `unavailable` with a reason and a fix, and one instructions line per unavailable module
-  so the assistant says "music is not set up on this server" instead of improvising.
-- Health: `health()` returning issues; an issue registry; `pnpm start doctor` with the core checks and every module's
-  requirements and health; an admin Health page.
+- Requirements: the `Requirement` type for a program on the server (with an optional version range) and for the
+  network; one registry of programs in the app with probes, which starts empty, because no first version in §5
+  needs a program, and gains an entry with the module that needs one; probing at start and on "Check again", never
+  on a turn; a version is read as strict semver or counts as unknown, and unknown does not satisfy a range; a new
+  module state `unavailable` with a reason and a fix; and one instructions line per unavailable module so the
+  assistant says "music is not set up on this server" instead of improvising. Requirements on a device, on memory,
+  disk or a GPU are not part of this version.
+- Health: `health()` returning issues; an issue registry; an admin Health page with "Check again", which also
+  retries modules that failed to start; `pnpm start doctor`, which prints every module's requirements and health
+  and the store's checks, one line each, and exits non-zero on an error. The wider checks of the machine that the
+  research lists for `doctor` (disk space, TLS files, the port, speech models) belong to the deployment work (§7).
 - Templates: plain data on the manifest; the new-assistant wizard offers them.
 - Protocol: `ModuleState` gains `unavailable`; version bump.
 
@@ -218,7 +229,7 @@ Two new packages with no dependency on the rest of the stack, plus household set
 
 - `packages/language` (`@pva/language`), English (British conventions) and Dutch:
   - parsing: time of day (English "half seven" is 7:30; Dutch "half zeven" is 6:30, "kwart voor zeven"), dates and
-    date-times ("tomorrow at five", "next Friday" reported as ambiguous), durations (re-exporting core's),
+    date-times ("tomorrow at five", "next Friday" reported as ambiguous), durations (its own closed grammar),
     quantities with units (mass, volume, pieces, "about", "a handful") for lists and the kitchen. A phrase the
     parser cannot place is reported as not understood or ambiguous, never guessed: this feeds alarms and calendar
     writes;
@@ -257,24 +268,28 @@ version in §5 needs them.
 - `ctx.store`: **document collections** and nothing else for modules. `defineCollection` with a name, a scope, a
   schema whose values are objects, a version with a migration of the whole collection when it changes, declared
   indexes on scalar fields, optional `ambient` lines and an optional projection for voice pages. Operations: `get`,
-  `list` (one equality filter on an indexed field, an order, a limit), `insert`, `update` with a revision check,
-  `remove`. No module-owned SQL, no full-text search, no generic undo. A module that needs to find text matches in
+  `list` (one equality filter on an indexed field, an order on that field or on a second one covered by a declared
+  two-field index, a limit with a hard maximum), `insert`, `update` with a revision check, `remove`. No module-owned SQL, no full-text search, no generic undo. A module that needs to find text matches in
   code over a bounded `list`; a module that offers "undo" keeps what it needs to reverse its own last operation.
 - **Transactions are synchronous and flat.** `store.transaction(tx => …)` runs a function with no awaits against a
   handle with the same operations; begin, the function and commit happen in one uninterrupted step, so there is no
-  interleaving, no nesting and nothing to interrupt. A call to `transaction` inside one joins it. Core services
-  (the scheduler, notifications) get their own tables through `store.core(owner)` and take part in the same
-  transaction through the same handle.
+  interleaving, no nesting and nothing to interrupt. A function that returns a promise fails the transaction. A
+  call to `transaction` inside one joins it.
+- **No SQL in the interface, for anyone.** Core services (the scheduler, notifications) keep their data in
+  collections too, under an owner name no module can take, through a handle that module code is never given, and
+  take part in a module's transaction the same way.
 - `remove` really removes: the row is deleted with `secure_delete`, the write-ahead log is checkpointed soon after,
   and there is no history that still holds the content. Daily backups keep it until they rotate out, and the
   documentation says how long.
 - Scopes household, person, assistant, device, conversation, derived from `CurrentTurn` or given explicitly, with
   scope ids restricted to a safe alphabet. A person-scoped call with no person is a typed error.
-- A stored schema version per module and per collection. A database written by a newer version of a module is
-  refused for that module (`unavailable`, with the reason), never opened and rewritten by older code. Migration runs
-  in one transaction after a backup.
-- A daily backup on a separate connection, kept 14 days. Restoring is a documented manual step with the server
-  stopped; `doctor` checks that the database opens and that a recent backup exists.
+- One data version per module, stored with its id. Data written by a newer version makes the module `unavailable`
+  with that reason, and nothing of it is read, migrated or deleted by older code. An older version is migrated,
+  all the module's collections in one transaction, after a backup. Any change to a collection's shape (schema,
+  indexes) needs a version bump; its scope cannot change. Data of a collection the code no longer declares stays.
+- A daily backup, made by the serving process on a separate connection, kept 14 days. Restoring is a documented
+  manual step with the server stopped; `doctor` checks that the database opens and that a recent backup exists.
+  Checkpoints of the write-ahead log run on that separate connection too, never on the one turns use.
 - Event bus: one in-process bus; `ctx.events.publish` and `subscribe`; host events (turn ended, device connected or
   disconnected, module state changed). Events about a store change, and events published inside a transaction, are
   released after it commits, in order.
@@ -554,7 +569,8 @@ Events follow §2 row 12. Other modules may subscribe; nothing may depend on an 
 
 ## 7. Out of scope
 
-- Deployment: the installer, the system unit, `systemd-creds` for the vault, a second backup location.
+- Deployment: the installer, the system unit, `systemd-creds` for the vault, a second backup location, and
+  `doctor`'s checks of the machine itself.
 - Voice nodes (PR #4) and anything that needs one.
 - Phone channels (ntfy, Web Push, the HA companion app).
 - Authenticated devices, and with them trusted devices, `money` and `security` actions, and stored secrets.

@@ -25,4 +25,7 @@ export interface ClockTime {
   readonly hour: number
   readonly minute: number
 }
-export interface LocalDateTime extends LocalDate, ClockTime {}
+export interface LocalDateTime extends LocalDate, ClockTime {
+  /** 0–59; absent means 0. */
+  readonly second?: number
+}

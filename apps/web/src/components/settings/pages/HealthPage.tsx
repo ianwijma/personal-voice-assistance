@@ -8,9 +8,9 @@ import { Button, cx } from "../../ui/controls.tsx"
 
 /**
  * Diagnostics › Health (protocol 9; module-definition-config-and-dependencies.md §C.5): the server's issue registry,
- * the same issues `pnpm start doctor` prints, grouped by the core and each module, each with its fix. "Check again"
- * probes the programs the modules need, judges again which modules can run (starting those that now can), and runs
- * every module's health check and the core checks.
+ * the same issues `pnpm start doctor` prints, grouped by module and, within a module, by the device an issue is about
+ * (its name, else its id), each with its fix. "Check again" probes the programs the modules need, judges again which
+ * modules can run, tries again every module that failed to start, and runs every module's health check.
  */
 
 const SEVERITY: Readonly<Record<HealthIssue["severity"], { readonly label: string; readonly dot: string; readonly text: string }>> = {
@@ -27,7 +27,7 @@ const ago = (at: number, now: number): string => {
   return `at ${new Date(at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`
 }
 
-function IssueFix({ fix }: { readonly fix: NonNullable<HealthIssue["fix"]> }) {
+export function IssueFix({ fix }: { readonly fix: NonNullable<HealthIssue["fix"]> }) {
   if (fix.kind === "link" && fix.value !== undefined) {
     const external = /^https?:\/\//.test(fix.value)
     return (
@@ -57,6 +57,7 @@ export function HealthPage() {
   const health = useClientState((s) => s.health)
   const names = useClientState((s) => Object.fromEntries(s.modules.order.map((id) => [id, s.modules.byId[id]?.name ?? id])), shallowEqual)
   const order = useClientState((s) => s.modules.order, shallowEqual)
+  const deviceNames = useClientState((s) => Object.fromEntries(s.devices.map((d) => [d.id, d.name])), shallowEqual)
   const [asked, setAsked] = useState(false)
   const [now, setNow] = useState(() => Date.now())
   useEffect(() => {
@@ -106,16 +107,19 @@ export function HealthPage() {
         <section key={key || "core"} aria-label={key === "" ? "The assistant itself" : names[key] ?? key} className="flex flex-col gap-2" data-testid="health-group" data-module={key || "core"}>
           <h3 className="label text-ink-faint">{key === "" ? "The assistant itself" : names[key] ?? key}</h3>
           <ul className="flex flex-col gap-2">
-            {groups.get(key)!.map((issue) => {
+            {[...groups.get(key)!].sort((a, b) => (a.device ?? "").localeCompare(b.device ?? "")).map((issue, i) => {
               const sev = SEVERITY[issue.severity]
               return (
-                <li key={issue.id} className="flex flex-col gap-1.5 rounded-md border border-line/70 px-3 py-2.5" data-testid="health-issue" data-severity={issue.severity}>
+                <li key={`${issue.id}\u0000${issue.device ?? ""}\u0000${i}`} className="flex flex-col gap-1.5 rounded-md border border-line/70 px-3 py-2.5" data-testid="health-issue" data-severity={issue.severity} data-device={issue.device}>
                   <div className="flex items-baseline gap-2">
                     <span aria-hidden="true" className={cx("inline-block size-2 shrink-0 self-center rounded-full", sev.dot)} />
                     <span className={cx("label text-[10px]", sev.text)}>{sev.label}</span>
                     <span className="min-w-0 text-[14px] font-medium text-ink">{issue.title}</span>
+                    {issue.device !== undefined && (
+                      <span className="ml-auto shrink-0 text-[12px] text-ink-faint" data-testid="issue-device">{deviceNames[issue.device] ?? issue.device}</span>
+                    )}
                   </div>
-                  {issue.detail !== "" && <p className="text-[13px] text-ink-muted">{issue.detail}</p>}
+                  {issue.detail !== "" && <p className="whitespace-pre-line text-[13px] text-ink-muted">{issue.detail}</p>}
                   {issue.fix !== undefined && <IssueFix fix={issue.fix} />}
                 </li>
               )

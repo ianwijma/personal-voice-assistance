@@ -246,10 +246,14 @@ runs waits for its commit and is dropped if it rolls back ("Transactions", rule 
 Publishing never waits and **never runs a subscriber's code on the publisher's stack** (or on the stack of the commit
 that released the event): each subscriber has its own bounded queue (default 256 events; `capacity` is brought into 1
 to 4,096, so no option makes it unbounded or hands events over synchronously), events reach the subscriber's fiber
-through the queue's scheduler, and a subscription that ends (a `shared` part replaced) leaves the fan-out at once and
+through the queue's scheduler, and a subscription that ends (its part withdrawn) leaves the fan-out at once and
 its stream ends in a microtask. A slow subscriber loses the newest events (counted, logged at most once per 10 s; a
-logger or clock that fails stops nothing). In `shared`, a subscription receives events only while that shared part is
-the published one: not while a new one is still starting, and nothing once it was replaced or retired (it ends then).
+logger or clock that fails stops nothing). A subscription lives with the part of the module that made it (`shared` or
+an instance): it receives events only while the module is published, not while it starts (an event published then is
+not kept for it); once the module is withdrawn (it is stopped, or replaced: the host stops the old one before it starts
+the new one) no event reaches its handler, even one already in its queue, and it ends when the part's scope closes,
+wherever the stream runs. `ctx.store` and `ctx.events` work until the part has closed (a call in flight during the
+stop's grace period still writes); after that every call dies with `ModuleStopped`.
 Events are lost at a restart: nothing may depend on one for correctness.
 
 ## Pages

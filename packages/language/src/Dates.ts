@@ -1,14 +1,18 @@
-import { readAmount, readNumber } from "./Numbers.ts"
-import { ambiguous, notUnderstood, ok, type Language, type LocalDate, type Parsed } from "./Result.ts"
-import { matchTime, resolveTime, type Period, type TimeOfDay, type TimeOptions } from "./Time.ts"
-import { tokenize, type Tok } from "./Tokens.ts"
-import { monthOf, readOrdinal, weekdayOf } from "./Words.ts"
-import { addDays, addMonths, daysInMonth, isoWeekday, localParts, sameDate, zonedToInstant } from "./Zoned.ts"
+import { dicts } from "./Dict.ts"
+import { guarded, isLanguage, isOptions, isText, maxYear, minYear } from "./Domain.ts"
+import { duration, type DurationUnit } from "./Durations.ts"
+import { alt, from, map, oneOf, opt, seq, tok, whole, words, type Input, type P } from "./Grammar.ts"
+import { wholeNumber } from "./Numbers.ts"
+import { ambiguous, notUnderstood, ok, type ClockTime, type Language, type LocalDate, type Parsed } from "./Result.ts"
+import { bandOf, periodAfterTime, periodHours, resolveTime, timeOfDay, type Period, type TimeMatch, type TimeOfDay, type TimeOptions } from "./Time.ts"
+import { sliceText, tokenize } from "./Tokens.ts"
+import { ordinal } from "./Words.ts"
+import { addDays, addMonths, daysInMonth, inRange, instantIn, instantInRange, isoWeekday, localParts, normalizeTimeZone, sameDate, zonedInstants } from "./Zoned.ts"
 
 export interface DateOptions extends Omit<TimeOptions, "afterMinutes"> {
-  /** The moment "now" means: epoch milliseconds or a Date. */
+  /** The moment "now" means: epoch milliseconds or a Date, whose local date in `timeZone` is in the supported years. */
   readonly now: number | Date
-  /** IANA zone the words are about, e.g. "Europe/Amsterdam". */
+  /** IANA zone the words are about, e.g. "Europe/Amsterdam". An unknown zone or an offset makes every answer `not-understood`. */
   readonly timeZone: string
 }
 
@@ -22,289 +26,317 @@ export interface DateTimeValue {
   readonly instant?: number
   /** "tonight", "tomorrow morning": a part of the day without a clock time. */
   readonly partOfDay?: Period
-  /** The moment is not after now. */
+  /** The moment (or, without a time, the day) is not after now. */
   readonly inPast: boolean
 }
 
-export interface DateTimeParsed extends DateTimeValue {
-  /** Characters of the text that were read, `[start, end)`, so a caller can cut the title out of "remind me to call mum tomorrow at five". */
-  readonly start: number
-  readonly end: number
+/** A date read from the words, before a time is added. */
+type Atom =
+  | { readonly kind: "days"; readonly dates: ReadonlyArray<LocalDate>; readonly period?: Period; readonly reason?: string; readonly leadable: boolean }
+  | { readonly kind: "offset"; readonly ms: number }
+
+interface Ctx {
+  readonly language: Language
+  readonly today: LocalDate
 }
 
-interface Atom {
-  readonly from: number
-  readonly next: number
-  readonly dates: ReadonlyArray<LocalDate>
-  readonly period?: Period
-  /** Moments relative to now ("in two hours"). */
-  readonly offsetMs?: number
-  readonly reason?: string
-}
-
-const barePeriods: Record<Language, Record<string, Period>> = {
-  en: { morning: "morning", afternoon: "afternoon", evening: "evening", night: "night" },
-  nl: { ochtend: "morning", middag: "afternoon", avond: "evening", nacht: "night" }
-}
-const dayWords: Record<Language, Record<string, { offset: number; period?: Period }>> = {
-  en: {
-    today: { offset: 0 }, tonight: { offset: 0, period: "night" }, tomorrow: { offset: 1 }, yesterday: { offset: -1 }
-  },
+const dayWords = dicts<Language, { offset: number; period?: Period }>({
+  en: { today: { offset: 0 }, tonight: { offset: 0, period: "night" }, tomorrow: { offset: 1 }, yesterday: { offset: -1 } },
   nl: {
     vandaag: { offset: 0 }, vanavond: { offset: 0, period: "evening" }, vanochtend: { offset: 0, period: "morning" }, vanmorgen: { offset: 0, period: "morning" },
     vanmiddag: { offset: 0, period: "afternoon" }, vannacht: { offset: 0, period: "night" }, morgen: { offset: 1 }, overmorgen: { offset: 2 }, gisteren: { offset: -1 },
-    morgenochtend: { offset: 1, period: "morning" }, morgenvroeg: { offset: 1, period: "morning" }, morgenmiddag: { offset: 1, period: "afternoon" },
+    eergisteren: { offset: -2 }, morgenochtend: { offset: 1, period: "morning" }, morgenmiddag: { offset: 1, period: "afternoon" },
     morgenavond: { offset: 1, period: "evening" }, morgennacht: { offset: 1, period: "night" }
   }
-}
-const dateUnits: Record<Language, Record<string, "day" | "week" | "month" | "year">> = {
-  en: { day: "day", days: "day", week: "week", weeks: "week", month: "month", months: "month", year: "year", years: "year", fortnight: "week" },
+})
+const barePeriods = dicts<Language, Period>({
+  en: { morning: "morning", afternoon: "afternoon", evening: "evening", night: "night" },
+  nl: { ochtend: "morning", middag: "afternoon", avond: "evening", nacht: "night" }
+})
+const weekdayWords = dicts<Language, number>({
+  en: { monday: 1, tuesday: 2, wednesday: 3, thursday: 4, friday: 5, saturday: 6, sunday: 7 },
+  nl: { maandag: 1, dinsdag: 2, woensdag: 3, donderdag: 4, vrijdag: 5, zaterdag: 6, zondag: 7 }
+})
+const monthWords = dicts<Language, number>({
+  en: { january: 1, february: 2, march: 3, april: 4, may: 5, june: 6, july: 7, august: 8, september: 9, october: 10, november: 11, december: 12 },
+  nl: { januari: 1, februari: 2, maart: 3, april: 4, mei: 5, juni: 6, juli: 7, augustus: 8, september: 9, oktober: 10, november: 11, december: 12 }
+})
+const modifierWords = dicts<Language, "this" | "next">({
+  en: { this: "this", coming: "this", next: "next" },
+  nl: { deze: "this", komende: "this", aanstaande: "this", volgende: "next" }
+})
+const calendarUnits = dicts<Language, "day" | "week" | "month" | "year">({
+  en: { day: "day", days: "day", week: "week", weeks: "week", month: "month", months: "month", year: "year", years: "year" },
   nl: { dag: "day", dagen: "day", week: "week", weken: "week", maand: "month", maanden: "month", jaar: "year", jaren: "year" }
-}
-const clockUnits: Record<Language, Record<string, number>> = {
-  en: { hour: 3_600_000, hours: 3_600_000, minute: 60_000, minutes: 60_000, min: 60_000, mins: 60_000, hr: 3_600_000, hrs: 3_600_000 },
-  nl: { uur: 3_600_000, uren: 3_600_000, minuut: 60_000, minuten: 60_000, kwartier: 900_000 }
-}
+})
+const calendarSingular = dicts<Language, "day" | "week" | "month" | "year">({
+  en: { day: "day", week: "week", month: "month", year: "year" },
+  nl: { dag: "day", week: "week", maand: "month", jaar: "year" }
+})
+const clockUnits: ReadonlySet<DurationUnit> = new Set(["hour", "quarter", "minute", "second"])
 
-const lastDay = (year: number, month: number, day: number): LocalDate => ({ year, month, day: Math.min(day, daysInMonth(year, month)) })
+/** A weekday, or (Dutch) a weekday and a part of the day in one word: "vrijdagavond". */
+const weekday = (language: Language): P<{ wd: number; period?: Period }> => alt(
+  map(from(weekdayWords[language]), (wd) => ({ wd })),
+  tok((w) => {
+    if (language !== "nl") return undefined
+    for (const [name, wd] of Object.entries(weekdayWords.nl)) {
+      if (!w.startsWith(name)) continue
+      const period = barePeriods.nl[w.slice(name.length)]
+      if (period !== undefined) return { wd: wd!, period }
+    }
+    return undefined
+  })
+)
 
-/** The next date at or after `today` that is day `day` of month `month` (any month if undefined), in `year` if given. */
-const nextDayOfMonth = (today: LocalDate, day: number, month?: number, year?: number): LocalDate | undefined => {
-  if (day < 1 || day > 31) return undefined
-  if (year !== undefined) {
+/** A year: four digits in the supported years. */
+const year: P<number> = tok((w, t) => (t.kind === "digits" && /^[0-9]{4}$/.test(w) && Number(w) >= minYear && Number(w) <= maxYear ? Number(w) : undefined))
+/** A day of the month: an ordinal ("third", "3rd", "derde", "3e") or a number 1–31 ("3", "three", "drie"). */
+const dayOfMonth = (language: Language): P<number> => alt(ordinal(language, 1, 31), wholeNumber(language, 1, 31))
+
+/** The next date at or after `today` with this day (and month, if given); in `inYear` when given. */
+const nextDate = (today: LocalDate, day: number, month?: number, inYear?: number): LocalDate | undefined => {
+  if (inYear !== undefined) {
     const m = month ?? today.month
-    return day <= daysInMonth(year, m) ? { year, month: m, day } : undefined
+    return day <= daysInMonth(inYear, m) ? { year: inYear, month: m, day } : undefined
   }
-  const key = (d: LocalDate) => d.year * 372 + d.month * 31 + d.day
-  for (let k = 0; k < 100; k++) {
-    const target = month === undefined ? addMonths(today, k) : { year: today.year + k, month }
-    if (day > daysInMonth(target.year, target.month)) continue
-    const candidate = { ...target, day }
-    if (key(candidate) >= key(today)) return candidate
-  }
-  return undefined
-}
-
-const connectorsBefore: Record<Language, ReadonlySet<string>> = {
-  en: new Set(["on", "at", "for", "by", "the"]),
-  nl: new Set(["op", "om", "voor", "de", "tegen"])
-}
-
-const dateAtom = (toks: ReadonlyArray<Tok>, i: number, language: Language, today: LocalDate): Atom | undefined => {
-  const norms = toks.map((t) => t.norm)
-  const w = norms[i]!
-  const lead = (from: number): number => (from > 0 && connectorsBefore[language].has(norms[from - 1]!) && (norms[from - 1] === "on" || norms[from - 1] === "op") ? from - 1 : from)
-  // today, tomorrow, …
-  const day = dayWords[language][w]
-  if (day !== undefined) {
-    let next = i + 1
-    let period = day.period
-    if (language === "en" && w === "tomorrow" && barePeriods.en[norms[next] ?? ""] !== undefined) { period = barePeriods.en[norms[next]!]; next++ }
-    if (language === "nl" && w === "morgen" && barePeriods.nl[norms[next] ?? ""] !== undefined) { period = barePeriods.nl[norms[next]!]; next++ }
-    return { from: i, next, dates: [addDays(today, day.offset)], ...(period !== undefined ? { period } : {}) }
-  }
-  if (language === "en" && w === "the" && norms[i + 1] === "day" && norms[i + 2] === "after" && norms[i + 3] === "tomorrow") return { from: i, next: i + 4, dates: [addDays(today, 2)] }
-  if (language === "en" && w === "day" && norms[i + 1] === "after" && norms[i + 2] === "tomorrow") return { from: i, next: i + 3, dates: [addDays(today, 2)] }
-  if (language === "en" && w === "this" && barePeriods.en[norms[i + 1] ?? ""] !== undefined) return { from: i, next: i + 2, dates: [today], period: barePeriods.en[norms[i + 1]!]! }
-  // in N days / over N weken / in an hour
-  if (w === "in" || (language === "nl" && w === "over")) {
-    const amount = readAmount(toks, i + 1, language)
-    if (amount !== undefined) {
-      let k = amount.next
-      if (language === "en" && (norms[k] === "a" || norms[k] === "an") && amount.value < 1) k++
-      if (language === "nl" && norms[k] === "een" && amount.value < 1) k++
-      const u = norms[k]
-      if (u !== undefined) {
-        const clock = clockUnits[language][u]
-        if (clock !== undefined && !(u === "kwartier" && !(amount.value === 1))) {
-          const n = u === "kwartier" ? 1 : amount.value
-          return { from: i, next: k + 1, dates: [], offsetMs: Math.round(n * clock) }
-        }
-        const unit = dateUnits[language][u]
-        if (unit !== undefined && Number.isInteger(amount.value) && amount.value >= 0 && amount.value < 1000) {
-          const n = (u === "fortnight" ? 2 : 1) * amount.value
-          const date = unit === "day" ? addDays(today, n) : unit === "week" ? addDays(today, 7 * n)
-            : unit === "month" ? lastDay(addMonths(today, n).year, addMonths(today, n).month, today.day) : lastDay(today.year + n, today.month, today.day)
-          return { from: i, next: k + 1, dates: [date] }
-        }
-      }
-      // "over een week" with a half etc. is not read
+  if (month === undefined) {
+    for (let k = 0; k < 13; k++) {
+      const t = addMonths(today, k)
+      if (day > daysInMonth(t.year, t.month)) continue
+      const candidate = { ...t, day }
+      if (dayKey(candidate) >= dayKey(today)) return candidate
     }
-  }
-  // next week / volgende week (+7 days) and weekday forms
-  const nextWeekWord = (k: number): boolean => (language === "en" ? norms[k] === "next" && norms[k + 1] === "week" : norms[k] === "volgende" && norms[k + 1] === "week")
-  if (nextWeekWord(i) && weekdayOf(norms[i + 2] ?? "", language) === undefined) return { from: i, next: i + 2, dates: [addDays(today, 7)] }
-  // weekday: [on|this|next|coming] WEEKDAY [next week]
-  const modifiers: Record<Language, Record<string, "this" | "next">> = {
-    en: { this: "this", coming: "this", upcoming: "this", next: "next" },
-    nl: { deze: "this", komende: "this", aanstaande: "this", aankomende: "this", volgende: "next" }
-  }
-  let k = i
-  let mod: "this" | "next" | undefined
-  if (modifiers[language][w] !== undefined) { mod = modifiers[language][w]; k++ }
-  if (language === "en" && norms[k] === "this" && norms[k + 1] === "coming") k += 2
-  if (nextWeekWord(i)) { mod = "next"; k = i + 2 }
-  const wd = weekdayOf(norms[k] ?? "", language)
-  if (wd !== undefined) {
-    const todayWd = isoWeekday(today)
-    const ahead = (wd - todayWd + 7) % 7
-    let next = k + 1
-    const weekAfter = nextWeekWord(next) || (language === "nl" && norms[next] === "over" && norms[next + 1] === "een" && norms[next + 2] === "week")
-    if (weekAfter) {
-      next += language === "nl" && norms[next] === "over" ? 3 : 2
-      const mondayThis = addDays(today, -(todayWd - 1))
-      return { from: lead(i), next, dates: [addDays(mondayThis, 7 + wd - 1)] }
-    }
-    if (mod === "next") {
-      const first = ahead === 0 ? 7 : ahead
-      if (nextWeekWord(i)) {
-        const mondayThis = addDays(today, -(todayWd - 1))
-        return { from: lead(i), next, dates: [addDays(mondayThis, 7 + wd - 1)] }
-      }
-      const dates = ahead === 0 ? [addDays(today, 7)] : [addDays(today, first), addDays(today, first + 7)]
-      return { from: lead(i), next, dates, reason: `"next ${norms[k]}" can mean the coming one or the one after` }
-    }
-    if (mod === "this") return { from: lead(i), next, dates: [addDays(today, ahead)] }
-    return { from: lead(i), next, dates: [addDays(today, ahead === 0 ? 7 : ahead)] }
-  }
-  // 3 March [2027], the 3rd of March, March 3rd, the 3rd, de derde, 3 maart
-  const readDay = (at: number): { value: number; next: number } | undefined => {
-    const ord = readOrdinal(norms, at, language)
-    if (ord !== undefined) return ord
-    const n = readNumber(toks, at, language)
-    if (n !== undefined && Number.isInteger(n.value) && n.value >= 1 && n.value <= 31) return { value: n.value, next: n.next }
     return undefined
   }
-  const readYear = (at: number): { value: number; next: number } | undefined => {
-    const t = norms[at]
-    return t !== undefined && /^(19|20)\d{2}$/.test(t) ? { value: Number(t), next: at + 1 } : undefined
-  }
-  const article = (language === "en" ? "the" : "de")
-  let s = i
-  if (norms[s] === article) s++
-  const d = readDay(s)
-  if (d !== undefined) {
-    let m = d.next
-    if (norms[m] === "of" || (language === "nl" && norms[m] === "van")) m++
-    const month = monthOf(norms[m] ?? "", language)
-    if (month !== undefined) {
-      const y = readYear(m + 1)
-      const date = nextDayOfMonth(today, d.value, month, y?.value)
-      if (date === undefined) return undefined
-      return { from: lead(i), next: y?.next ?? m + 1, dates: [date] }
-    }
-    // bare ordinal: "the 3rd" / "de derde" / "de 3e"
-    const bareOrdinal = readOrdinal(norms, s, language) !== undefined
-    if (bareOrdinal && (s > i || /^\d/.test(norms[s]!))) {
-      const date = nextDayOfMonth(today, d.value)
-      if (date === undefined) return undefined
-      return { from: lead(i), next: d.next, dates: [date] }
-    }
-  }
-  // MONTH [the] DAY [YEAR]
-  const month = monthOf(w, language)
-  if (month !== undefined) {
-    let at = i + 1
-    if (norms[at] === article) at++
-    const dd = readDay(at)
-    if (dd !== undefined) {
-      const y = readYear(dd.next)
-      const date = nextDayOfMonth(today, dd.value, month, y?.value)
-      if (date !== undefined) return { from: i, next: y?.next ?? dd.next, dates: [date] }
-    }
+  for (let y = today.year; y <= today.year + 8; y++) {
+    if (day > daysInMonth(y, month)) continue
+    const candidate = { year: y, month, day }
+    if (dayKey(candidate) >= dayKey(today)) return candidate
   }
   return undefined
 }
 
-const timeLeads: Record<Language, ReadonlySet<string>> = {
-  en: new Set(["at", "around", "about", "by", "for"]),
-  nl: new Set(["om", "rond", "tegen", "ongeveer", "voor"])
+/** "3 March [2027]", "the 3rd of March", "March 3rd", "March the third", "de derde maart", and the bare "the 3rd" / "de 3e". */
+const calendarDate = (c: Ctx): P<LocalDate> => {
+  const { language, today } = c
+  const the = language === "en" ? "the" : "de"
+  const dayMonthYear = language === "en"
+    ? alt(
+      map(seq(opt(words("the")), dayOfMonth("en"), opt(words("of")), from(monthWords.en), opt(year)), ([, d, , m, y]) => nextDate(today, d, m, y)),
+      map(seq(from(monthWords.en), opt(words("the")), dayOfMonth("en"), opt(year)), ([m, , d, y]) => nextDate(today, d, m, y))
+    )
+    : map(seq(opt(words("de")), dayOfMonth("nl"), from(monthWords.nl), opt(year)), ([, d, m, y]) => nextDate(today, d, m, y))
+  const ofTheMonth = language === "en" ? words("of", "the", "month") : words("van", "de", "maand")
+  const bareOrdinal = map(seq(words(the), ordinal(language, 1, 31), opt(ofTheMonth)), ([, d]) => nextDate(today, d))
+  return alt(dayMonthYear, bareOrdinal)
 }
 
-const minutesOf = (p: { hour: number; minute: number }): number => p.hour * 60 + p.minute
+/** [this | next | coming] WEEKDAY [next week], WEEKDAY DATE (the weekday must be the date's). */
+const weekdayDate = (c: Ctx): P<Atom> => {
+  const { language, today } = c
+  const todayWd = isoWeekday(today)
+  const mondayThis = addDays(today, -(todayWd - 1))
+  const nextWeek = language === "en" ? words("next", "week") : words("volgende", "week")
+  const days = (dates: ReadonlyArray<LocalDate>, period: Period | undefined, reason?: string): Atom =>
+    ({ kind: "days", dates, leadable: true, ...(period !== undefined ? { period } : {}), ...(reason !== undefined ? { reason } : {}) })
+  return alt(
+    map(seq(opt(from(modifierWords[language])), weekday(language)), ([mod, w]) => {
+      const ahead = (w.wd - todayWd + 7) % 7
+      if (mod === "this") return days([addDays(today, ahead)], w.period)
+      if (mod === "next") {
+        if (ahead === 0) return days([addDays(today, 7)], w.period)
+        return days([addDays(today, ahead), addDays(today, ahead + 7)], w.period, "\"next\" with a weekday can mean the coming one or the one after")
+      }
+      return days([addDays(today, ahead === 0 ? 7 : ahead)], w.period)
+    }),
+    map(seq(weekday(language), nextWeek), ([w]) => days([addDays(mondayThis, 7 + w.wd - 1)], w.period)),
+    map(seq(from(weekdayWords[language]), calendarDate(c)), ([wd, d]) => (isoWeekday(d) === wd ? days([d], undefined) : undefined))
+  )
+}
+
+/** today, tomorrow, tonight, "this evening", "the day after tomorrow"; vandaag, morgen, overmorgen, vanavond, morgenochtend, … */
+const dayWord = (c: Ctx): P<Atom> => {
+  const { language, today } = c
+  const one = (offset: number, period?: Period): Atom => ({ kind: "days", dates: [addDays(today, offset)], leadable: false, ...(period !== undefined ? { period } : {}) })
+  return alt(
+    map(from(dayWords[language]), (d) => one(d.offset, d.period)),
+    ...(language === "en"
+      ? [
+        map(seq(words("this"), from(barePeriods.en)), ([, p]): Atom | undefined => (p === "night" ? undefined : one(0, p))),
+        map(words("the", "day", "after", "tomorrow"), () => one(2))
+      ]
+      : [])
+  )
+}
+
+/** "in two days", "over twee weken", "in a month"; "in two hours and thirty minutes", "over anderhalf uur" (the duration grammar). */
+const relative = (c: Ctx): P<Atom> => {
+  const { language, today } = c
+  const lead = language === "en" ? "in" : "over"
+  const calendar = (n: number, unit: "day" | "week" | "month" | "year"): Atom => {
+    const date = unit === "day" ? addDays(today, n) : unit === "week" ? addDays(today, 7 * n)
+      : unit === "month" ? clampDay(addMonths(today, n), today.day) : clampDay({ year: today.year + n, month: today.month }, today.day)
+    return { kind: "days", dates: [date], leadable: false }
+  }
+  return alt(
+    map(seq(words(lead), wholeNumber(language, 1, 999), from(calendarUnits[language])), ([, n, u]) => calendar(n, u)),
+    map(seq(words(lead), oneOf(...(language === "en" ? ["a", "an"] : ["een"])), from(calendarSingular[language])), ([, , u]) => calendar(1, u)),
+    map(seq(words(lead), duration[language]), ([, d]): Atom | undefined => (d.units.every((u) => clockUnits.has(u)) ? { kind: "offset", ms: d.ms } : undefined))
+  )
+}
+const clampDay = (ym: { year: number; month: number }, day: number): LocalDate => ({ ...ym, day: Math.min(day, daysInMonth(ym.year, ym.month)) })
+
+/** The part of the day right after a day: "tomorrow evening", "Friday night", "Friday in the evening", "vrijdag 's avonds". */
+const dayPeriod = (language: Language): P<Period> => alt(
+  from(barePeriods[language]),
+  map(periodAfterTime[language], (p) => (p === "am" || p === "pm" ? undefined : p))
+)
+
+/** A date with its lead word and a part of the day after it. */
+const dateExpression = (c: Ctx): P<Atom> => {
+  const { language } = c
+  const on = language === "en" ? "on" : "op"
+  const leadable: P<Atom> = alt(weekdayDate(c), map(calendarDate(c), (d): Atom => ({ kind: "days", dates: [d], leadable: true })))
+  const plain: P<Atom> = alt(map(seq(opt(words(on)), leadable), ([, a]) => a), dayWord(c), relative(c))
+  return alt(
+    plain,
+    map(seq(plain, dayPeriod(language)), ([a, p]) => (a.kind === "days" && a.period === undefined ? { ...a, period: p } : undefined))
+  )
+}
+
+interface TimePart {
+  readonly match: TimeMatch
+  readonly lead: boolean
+}
+interface Reading {
+  readonly atom?: Atom
+  readonly time?: TimePart
+}
+
+/** At most one date and at most one time, in either order, and nothing else. */
+const phrase = (c: Ctx): P<Reading> => {
+  const at = c.language === "en" ? "at" : "om"
+  const time: P<TimePart> = alt<TimePart>(
+    map(seq(words(at), timeOfDay[c.language]), ([, match]) => ({ match, lead: true })),
+    map(timeOfDay[c.language], (match) => ({ match, lead: false }))
+  )
+  const date = dateExpression(c)
+  return alt<Reading>(
+    map(date, (atom) => ({ atom })),
+    map(time, (t) => ({ time: t })),
+    map(seq(date, time), ([atom, t]) => ({ atom, time: t })),
+    map(seq(time, date), ([t, atom]) => ({ atom, time: t }))
+  )
+}
+
+const dayKey = (d: LocalDate): number => d.year * 10_000 + d.month * 100 + d.day
 
 /**
- * A date, a moment or both, from free text: "today", "tomorrow", "tonight", "on Friday", "the 3rd", "3 March", "in two days",
- * "tomorrow at five", "over twee weken", "vrijdag om half acht". "next Friday" is `ambiguous` (the coming one and the one after).
- * A time without am/pm is settled by the band and the clock (see `parseTimeOfDay`); `guessed` says so. Only what is recognised is read;
- * `start` and `end` say where. Needs the zone and "now" so that "tomorrow" and daylight-saving days come out right.
+ * A phrase that is only a date, a moment or both (README, "Dates and times"): "today", "tomorrow at five", "on Friday", "the 3rd",
+ * "3 March 2027", "in two days", "in two hours and thirty minutes", "over twee weken", "vrijdag om half acht", "vrijdagavond om acht
+ * uur". The text is the time phrase alone: every word must be read by the grammar, so "remind me tomorrow", "tomorrow not at five",
+ * "before Friday", "tomorrow at 5 UTC", "tomorrow or Friday", "last Friday" and "in 2 weeks and 3 days" are `not-understood`. "next
+ * Friday" is `ambiguous` (the coming one and the one after), and so is a date with the word "midnight" (the start or the end of that
+ * day), except "tonight at midnight", the end of today. Every date returned is in the supported years. Never throws.
  */
-export const parseDateTime = (text: string, language: Language, options: DateOptions): Parsed<DateTimeParsed> => {
+export const parseDateTime: (text: string, language: Language, options: DateOptions) => Parsed<DateTimeValue> = guarded((text: string, language: Language, options: DateOptions): Parsed<DateTimeValue> => {
+  if (!isText(text) || !isLanguage(language) || !isOptions(options) || options === undefined) return notUnderstood
+  const zone = normalizeTimeZone(options.timeZone)
+  const band = bandOf(options)
+  if (zone === undefined || band === undefined) return notUnderstood
+  const nowIn = instantIn(options.now, zone)
+  if (nowIn === undefined) return notUnderstood
+  const now = nowIn.instant
+  const nowParts = nowIn.parts
   const toks = tokenize(text)
-  const now = typeof options.now === "number" ? options.now : options.now.getTime()
-  const zone = options.timeZone
-  const nowParts = localParts(now, zone)
+  if (toks === undefined || toks.length === 0) return notUnderstood
+  const input: Input = { text, toks, norms: toks.map((t) => t.norm) }
   const today: LocalDate = { year: nowParts.year, month: nowParts.month, day: nowParts.day }
-  let atom: Atom | undefined
-  let timeAt: { from: number; match: NonNullable<ReturnType<typeof matchTime>> } | undefined
-  for (let i = 0; i < toks.length; i++) {
-    if (atom === undefined) {
-      const a = dateAtom(toks, i, language, today)
-      if (a !== undefined) {
-        atom = a
-        i = a.next - 1
-        continue
-      }
-    }
-    if (timeAt === undefined) {
-      const prev = toks[i - 1]?.norm
-      const bareOk = (prev !== undefined && timeLeads[language].has(prev)) || (toks.length === 1)
-      const m = matchTime(toks, i, language, bareOk)
-      if (m !== undefined) {
-        timeAt = { from: i, match: m }
-        i = m.next - 1
-      }
-    }
-    if (atom !== undefined && timeAt !== undefined) break
-  }
-  if (atom === undefined && timeAt === undefined) return notUnderstood
-  // A part of the day with a time word that is not open ("tonight at 22:00") needs no more.
-  const lo = Math.min(atom?.from ?? Infinity, timeAt?.from ?? Infinity)
-  const startTok = timeAt !== undefined && timeAt.from === lo && timeAt.from > 0 && timeLeads[language].has(toks[timeAt.from - 1]!.norm) ? lo - 1 : lo
-  const endTok = Math.max(atom?.next ?? 0, timeAt?.match.next ?? 0)
-  const start = toks[startTok]!.start
-  const end = toks[endTok - 1]!.end
-  const said = text.slice(start, end)
+  const c: Ctx = { language, today }
+  const said = sliceText(text, toks, 0, toks.length)
 
-  const build = (date: LocalDate | undefined): DateTimeParsed | undefined => {
-    // "in two hours": a moment from now
-    if (atom?.offsetMs !== undefined) {
-      const instant = now + atom.offsetMs
+  const value = (d: LocalDate, t: TimeOfDay | undefined, instant: number | undefined, partOfDay?: Period): DateTimeValue => ({
+    date: d, weekday: isoWeekday(d), ...(t !== undefined ? { time: t } : {}), ...(instant !== undefined ? { instant } : {}),
+    ...(t === undefined && partOfDay !== undefined ? { partOfDay } : {}),
+    inPast: instant !== undefined ? instant <= now : dayKey(d) < dayKey(today)
+  })
+
+  /** The values of one date of a reading; `undefined` when the parts do not fit. */
+  const build = (atom: Atom | undefined, date: LocalDate | undefined, time: TimePart | undefined): { values: Array<DateTimeValue>; reason?: string } | undefined => {
+    if (atom?.kind === "offset") {
+      if (time !== undefined) return undefined // "in two hours at five"
+      const instant = now + atom.ms
+      if (!instantInRange(instant, zone)) return undefined
       const p = localParts(instant, zone)
-      return {
-        date: { year: p.year, month: p.month, day: p.day }, weekday: p.weekday, time: { hour: p.hour, minute: p.minute, guessed: false, alternatives: [] },
-        instant, inPast: false, start, end
+      return { values: [{ ...value({ year: p.year, month: p.month, day: p.day }, { hour: p.hour, minute: p.minute, guessed: false, alternatives: [] }, instant), inPast: false }] }
+    }
+    const dayPart = atom?.kind === "days" ? atom.period : undefined
+    if (time === undefined) return { values: [value(date!, undefined, undefined, dayPart)] }
+    const m = time.match
+    // A lone number is a time after "at" / "om", or when it is the whole phrase.
+    if (m.bare && !time.lead && atom !== undefined) return undefined
+    if (m.period !== undefined && dayPart !== undefined && m.period !== dayPart && m.period !== "am" && m.period !== "pm") return undefined
+    if (m.hour === 24 && dayPart !== undefined) return undefined
+    const settled = resolveTime(m.period === undefined && dayPart !== undefined ? { ...m, period: dayPart } : m, band)
+    if (settled === undefined) return undefined
+    // "tomorrow morning at 7 pm", "tonight at 9 am": the part of the day and the clock disagree.
+    if (dayPart !== undefined && !settled.carry && !periodHours(dayPart, settled.time.hour)) return undefined
+    const readingsOf: Array<ClockTime> = settled.time.guessed ? [settled.time, ...settled.time.alternatives].sort((a, b) => a.hour * 60 + a.minute - (b.hour * 60 + b.minute)) : [settled.time]
+    const asTime = (r: ClockTime): TimeOfDay => ({ hour: r.hour, minute: r.minute, guessed: settled.time.guessed, alternatives: readingsOf.filter((x) => x !== r).map((x) => ({ hour: x.hour, minute: x.minute })) })
+    const at = (d: LocalDate, r: ClockTime) => zonedInstants({ ...d, hour: r.hour, minute: r.minute }, zone)
+    if (date === undefined) {
+      // A time without a date: the next moment after now it names, over today and the next two days, both readings of a repeated hour.
+      let best: { d: LocalDate; r: ClockTime; instant: number } | undefined
+      for (let k = 0; k <= 2; k++) {
+        const d = addDays(today, k + (settled.carry ? 1 : 0))
+        if (!inRange(d)) continue
+        for (const r of readingsOf) for (const instant of at(d, r)) if (instant > now && (best === undefined || instant < best.instant)) best = { d, r, instant }
       }
+      return best === undefined ? undefined : { values: [value(best.d, asTime(best.r), best.instant)] }
     }
     let day = date
-    let time: TimeOfDay | undefined
-    if (timeAt !== undefined) {
-      const isToday = day === undefined || sameDate(day, today)
-      const open = { ...timeAt.match, ...(timeAt.match.period === undefined && atom?.period !== undefined ? { period: atom.period } : {}) }
-      const resolved = resolveTime(open, { ...(options.band !== undefined ? { band: options.band } : {}), ...(isToday ? { afterMinutes: minutesOf(nowParts) } : {}) })
-      if (resolved === undefined) return undefined
-      time = resolved.time
-      if (day === undefined) {
-        day = today
-        // A bare time: today if it is still ahead, otherwise tomorrow.
-        if (resolved.nextDay || (!resolved.time.guessed && minutesOf(resolved.time) <= minutesOf(nowParts))) day = addDays(today, 1)
+    if (dayPart === "night" && m.midnightWord) {
+      // "tonight at midnight", "Friday night at midnight": the end of that day, whatever the hour now (finding 13).
+      day = addDays(day, 1)
+    } else if (dayPart === "night" && !settled.carry && readingsOf.every((r) => r.hour < 6)) {
+      // "tonight at 2 am", "Friday night at 1": the small hours after that evening; said in those small hours themselves
+      // ("vannacht om drie uur" at 01:00), it is this night.
+      if (!(sameDate(day, today) && nowParts.hour < 6)) day = addDays(day, 1)
+    } else if (m.midnightWord) {
+      // "Friday at midnight": the start of Friday or its end.
+      const r = readingsOf[0]!
+      const end = addDays(day, 1)
+      if (!inRange(end)) return undefined
+      return { values: [value(day, asTime(r), at(day, r)[0]), value(end, asTime(r), at(end, r)[0])], reason: "\"midnight\" with a day can mean the start of that day or its end" }
+    }
+    if (settled.carry) day = addDays(day, 1)
+    if (!inRange(day)) return undefined
+    // Today: the next reading after now (of a repeated hour, the one after now); another day: the earliest reading, the first time.
+    if (sameDate(day, today)) {
+      for (const r of readingsOf) {
+        const later = at(day, r).find((x) => x > now)
+        if (later !== undefined) return { values: [value(day, asTime(r), later)] }
       }
     }
-    const d = day ?? today
-    const instant = time === undefined ? undefined : zonedToInstant({ ...d, hour: time.hour, minute: time.minute }, zone)
-    return {
-      date: d, weekday: isoWeekday(d), ...(time !== undefined ? { time } : {}), ...(instant !== undefined ? { instant } : {}),
-      ...(time === undefined && atom?.period !== undefined ? { partOfDay: atom.period } : {}),
-      inPast: instant !== undefined ? instant <= now : (day !== undefined && day.year * 372 + day.month * 31 + day.day < today.year * 372 + today.month * 31 + today.day),
-      start, end
-    }
+    const r = readingsOf[0]!
+    return { values: [value(day, asTime(r), at(day, r)[0])] }
   }
-  const dates = atom?.dates ?? []
-  if (dates.length > 1) {
-    const all = dates.map((d) => build(d)).filter((v): v is DateTimeParsed => v !== undefined)
-    if (all.length === 0) return notUnderstood
-    return ambiguous(all, said, atom?.reason ?? "More than one date fits")
+
+  const results: Array<DateTimeValue> = []
+  let reason: string | undefined
+  for (const reading of whole(phrase(c), input)) {
+    const { atom, time } = reading
+    const dates = atom?.kind === "days" ? atom.dates : [undefined]
+    if (dates.some((d) => d !== undefined && !inRange(d))) continue
+    const built = dates.map((d) => build(atom, d, time))
+    if (built.some((b) => b === undefined)) continue
+    const values = built.flatMap((b) => b!.values)
+    if (values.some((v) => !inRange(v.date) || (v.instant !== undefined && !Number.isFinite(v.instant)))) continue
+    reason ??= built.find((b) => b!.reason !== undefined)?.reason ?? (atom?.kind === "days" ? atom.reason : undefined)
+    for (const v of values) if (!results.some((x) => JSON.stringify(x) === JSON.stringify(v))) results.push(v)
   }
-  const value = build(dates[0])
-  return value === undefined ? notUnderstood : ok(value, said)
-}
+  if (results.length === 0) return notUnderstood
+  if (results.length === 1) return ok(results[0]!, said)
+  return ambiguous(results, said, reason ?? "The words read as more than one moment")
+}, notUnderstood)

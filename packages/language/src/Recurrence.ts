@@ -1,15 +1,20 @@
-import { readNumber } from "./Numbers.ts"
-import { formatDtstart, formatRRule, occurrencesAfter, weekdayCodes, type Freq, type RecurrenceRule, type RuleDay } from "./Rrule.ts"
-import { notUnderstood, ok, type ClockTime, type Language, type LocalDate, type LocalDateTime, type Parsed } from "./Result.ts"
-import { matchTime, resolveTime, type Period, type TimeOfDay, type TimeOptions } from "./Time.ts"
-import { tokenize, type Tok } from "./Tokens.ts"
-import { monthOf, readOrdinal, weekdayOf } from "./Words.ts"
-import { localParts, zonedToInstant } from "./Zoned.ts"
+import { dict, dicts } from "./Dict.ts"
+import { guarded, isLanguage, isOptions, isText, maxYear } from "./Domain.ts"
+import { alt, from, many1, map, oneOf, opt, seq, whole, words, type Input, type P } from "./Grammar.ts"
+import { wholeNumber } from "./Numbers.ts"
+import { formatDtstart, formatRRule, maxInterval, readSeries, ruleSelects, seriesAfter, weekdayCodes, type Freq, type RecurrenceRule, type RuleDay } from "./Rrule.ts"
+import { ambiguous, notUnderstood, ok, type ClockTime, type Language, type LocalDate, type LocalDateTime, type Parsed } from "./Result.ts"
+import { bandOf, periodHours, resolveTime, timeOfDay, type Period, type TimeMatch, type TimeOfDay, type TimeOptions } from "./Time.ts"
+import { sliceText, tokenize } from "./Tokens.ts"
+import { ordinal } from "./Words.ts"
+import { addDays, daysInMonth, instantIn, localParts, normalizeTimeZone, zonedToInstant } from "./Zoned.ts"
 
 export interface RecurrenceOptions extends Omit<TimeOptions, "afterMinutes"> {
+  /** Epoch milliseconds or a Date, whose local date in `timeZone` is in the supported years. */
   readonly now: number | Date
+  /** IANA zone; an unknown zone or an offset makes the answer `not-understood`. */
   readonly timeZone: string
-  /** The time of day when none is said ("every Monday"). Default 09:00. */
+  /** The time of day when none is said ("every Monday"): whole hour 0–23 and minute 0–59. Default 09:00. With a part of the day ("every evening") it is used only when it falls inside that part. */
   readonly defaultTime?: ClockTime
 }
 
@@ -17,9 +22,13 @@ export interface Recurrence {
   readonly rule: RecurrenceRule
   /** The `RRULE` value: "FREQ=WEEKLY;BYDAY=MO". */
   readonly rrule: string
-  /** The time said, if any (with its am/pm guess). */
+  /** The time said, if any (with its band guess). */
   readonly time?: TimeOfDay
-  /** The first occurrence, a wall-clock time in `timeZone`; matches the rule. */
+  /** The part of the day said ("every evening", "elke ochtend"); the start's time lies inside it. */
+  readonly partOfDay?: Period
+  /** No clock time was said: the start's time is `defaultTime`, or for a part of the day its usual time (08:00, 14:00, 19:00, 22:00). */
+  readonly timeDefaulted: boolean
+  /** The first occurrence after now, a wall-clock time in `timeZone`; it is an instance of the rule. */
   readonly start: LocalDateTime
   readonly startInstant: number
   /** "DTSTART;TZID=Europe/Amsterdam:20261120T090000" */
@@ -29,278 +38,309 @@ export interface Recurrence {
   readonly timeZone: string
 }
 
-type Unit = "minute" | "hour" | "day" | "week" | "month" | "year"
-type Sym =
-  | { readonly k: "every" }
-  | { readonly k: "other" }
-  | { readonly k: "and" }
-  | { readonly k: "ord"; readonly n: number }
-  | { readonly k: "num"; readonly n: number }
-  | { readonly k: "unit"; readonly u: Unit }
-  | { readonly k: "wd"; readonly days: ReadonlyArray<number> }
-  | { readonly k: "month"; readonly n: number }
-  | { readonly k: "part"; readonly p: Period }
-  | { readonly k: "junk" }
+type Unit = "day" | "week" | "month" | "year"
 
-const everyWords: Record<Language, ReadonlySet<string>> = { en: new Set(["every", "each"]), nl: new Set(["elke", "elk", "iedere", "ieder"]) }
-const fillers: Record<Language, ReadonlySet<string>> = {
-  en: new Set(["on", "the", "of", "at", "a", "an", "in", "s"]),
-  nl: new Set(["op", "de", "het", "van", "in", "aan", "om", "s", "een"])
-}
-const unitWords: Record<Language, Record<string, Unit>> = {
-  en: { minute: "minute", minutes: "minute", hour: "hour", hours: "hour", day: "day", days: "day", week: "week", weeks: "week", month: "month", months: "month", year: "year", years: "year" },
-  nl: { minuut: "minute", minuten: "minute", uur: "hour", uren: "hour", dag: "day", dagen: "day", week: "week", weken: "week", maand: "month", maanden: "month", jaar: "year", jaren: "year" }
-}
-const adverbs: Record<Language, Record<string, ReadonlyArray<Sym>>> = {
-  en: {
-    daily: [{ k: "every" }, { k: "unit", u: "day" }], weekly: [{ k: "every" }, { k: "unit", u: "week" }], monthly: [{ k: "every" }, { k: "unit", u: "month" }],
-    yearly: [{ k: "every" }, { k: "unit", u: "year" }], annually: [{ k: "every" }, { k: "unit", u: "year" }], hourly: [{ k: "every" }, { k: "unit", u: "hour" }],
-    biweekly: [{ k: "every" }, { k: "other" }, { k: "unit", u: "week" }], fortnightly: [{ k: "every" }, { k: "other" }, { k: "unit", u: "week" }],
-    fortnight: [{ k: "num", n: 2 }, { k: "unit", u: "week" }], quarterly: [{ k: "every" }, { k: "num", n: 3 }, { k: "unit", u: "month" }], quarter: [{ k: "num", n: 3 }, { k: "unit", u: "month" }],
-    weekday: [{ k: "wd", days: [1, 2, 3, 4, 5] }], weekdays: [{ k: "wd", days: [1, 2, 3, 4, 5] }], workday: [{ k: "wd", days: [1, 2, 3, 4, 5] }], workdays: [{ k: "wd", days: [1, 2, 3, 4, 5] }],
-    weekend: [{ k: "wd", days: [6, 7] }], weekends: [{ k: "wd", days: [6, 7] }]
-  },
-  nl: {
-    dagelijks: [{ k: "every" }, { k: "unit", u: "day" }], wekelijks: [{ k: "every" }, { k: "unit", u: "week" }], maandelijks: [{ k: "every" }, { k: "unit", u: "month" }],
-    jaarlijks: [{ k: "every" }, { k: "unit", u: "year" }], kwartaal: [{ k: "num", n: 3 }, { k: "unit", u: "month" }],
-    werkdag: [{ k: "wd", days: [1, 2, 3, 4, 5] }], werkdagen: [{ k: "wd", days: [1, 2, 3, 4, 5] }],
-    weekend: [{ k: "wd", days: [6, 7] }], weekenden: [{ k: "wd", days: [6, 7] }]
-  }
-}
-const parts: Record<Language, Record<string, Period>> = {
-  en: { morning: "morning", mornings: "morning", afternoon: "afternoon", afternoons: "afternoon", evening: "evening", evenings: "evening", night: "night", nights: "night" },
-  nl: { ochtend: "morning", ochtends: "morning", morgens: "morning", middag: "afternoon", middags: "afternoon", avond: "evening", avonds: "evening", nacht: "night", nachts: "night" }
+/** What a rule phrase says, before the time is added. */
+interface Body {
+  readonly freq: Freq
+  readonly interval: number
+  /** Weekdays 1–7 (WEEKLY). */
+  readonly days?: ReadonlyArray<number>
+  /** Days of the month (MONTHLY), -1 the last. */
+  readonly monthDays?: ReadonlyArray<number>
+  /** An ordinal weekday of the month (MONTHLY). */
+  readonly nth?: { readonly n: number; readonly wd: number }
+  /** A date every year (YEARLY). */
+  readonly date?: { readonly month: number; readonly day: number }
+  /** A part of the day said with the days ("every Friday night", "every evening"). */
+  readonly part?: Period
 }
 
-const weekdayOfWord = (w: string, language: Language): number | undefined => {
-  const direct = weekdayOf(w, language)
-  if (direct !== undefined) return direct
-  if (language === "en" && w.endsWith("s")) return weekdayOf(w.slice(0, -1), "en")
-  if (language === "nl" && w.endsWith("s")) return weekdayOf(w.slice(0, -1), "nl")
-  if (language === "nl" && w.endsWith("en")) return weekdayOf(w.slice(0, -2), "nl")
-  return undefined
+const both = <T>(en: Readonly<Record<string, T>>, nl: Readonly<Record<string, T>>) => dicts<Language, T>({ en, nl })
+const unitSingular = both<Unit>({ day: "day", week: "week", month: "month", year: "year" }, { dag: "day", week: "week", maand: "month", jaar: "year" })
+const unitPlural = both<Unit>({ days: "day", weeks: "week", months: "month", years: "year" }, { dagen: "day", weken: "week", maanden: "month", jaar: "year", jaren: "year" })
+const adverbs = both<{ unit: Unit; interval: number }>(
+  { daily: { unit: "day", interval: 1 }, weekly: { unit: "week", interval: 1 }, fortnightly: { unit: "week", interval: 2 }, monthly: { unit: "month", interval: 1 }, quarterly: { unit: "month", interval: 3 }, yearly: { unit: "year", interval: 1 }, annually: { unit: "year", interval: 1 } },
+  { dagelijks: { unit: "day", interval: 1 }, wekelijks: { unit: "week", interval: 1 }, tweewekelijks: { unit: "week", interval: 2 }, maandelijks: { unit: "month", interval: 1 }, jaarlijks: { unit: "year", interval: 1 } }
+)
+const partWords = both<Period>({ morning: "morning", afternoon: "afternoon", evening: "evening", night: "night" }, { ochtend: "morning", middag: "afternoon", avond: "evening", nacht: "night" })
+const partPlurals = both<Period>({ mornings: "morning", afternoons: "afternoon", evenings: "evening", nights: "night" }, { ochtenden: "morning", middagen: "afternoon", avonden: "evening", nachten: "night" })
+const weekdaySingular = both<ReadonlyArray<number>>(
+  { monday: [1], tuesday: [2], wednesday: [3], thursday: [4], friday: [5], saturday: [6], sunday: [7], weekday: [1, 2, 3, 4, 5], weekend: [6, 7] },
+  { maandag: [1], dinsdag: [2], woensdag: [3], donderdag: [4], vrijdag: [5], zaterdag: [6], zondag: [7], werkdag: [1, 2, 3, 4, 5], weekend: [6, 7] }
+)
+const weekdayPlural = both<ReadonlyArray<number>>(
+  { mondays: [1], tuesdays: [2], wednesdays: [3], thursdays: [4], fridays: [5], saturdays: [6], sundays: [7], weekdays: [1, 2, 3, 4, 5], weekends: [6, 7] },
+  { maandagen: [1], dinsdagen: [2], woensdagen: [3], donderdagen: [4], vrijdagen: [5], zaterdagen: [6], zondagen: [7], werkdagen: [1, 2, 3, 4, 5], weekenden: [6, 7] }
+)
+const nlWeekdayS = dict<ReadonlyArray<number>>({ maandags: [1], dinsdags: [2], woensdags: [3], donderdags: [4], vrijdags: [5], zaterdags: [6], zondags: [7] })
+const weekdayOne = both<number>(
+  { monday: 1, tuesday: 2, wednesday: 3, thursday: 4, friday: 5, saturday: 6, sunday: 7 },
+  { maandag: 1, dinsdag: 2, woensdag: 3, donderdag: 4, vrijdag: 5, zaterdag: 6, zondag: 7 }
+)
+const monthWords = both<number>(
+  { january: 1, february: 2, march: 3, april: 4, may: 5, june: 6, july: 7, august: 8, september: 9, october: 10, november: 11, december: 12 },
+  { januari: 1, februari: 2, maart: 3, april: 4, mei: 5, juni: 6, juli: 7, augustus: 8, september: 9, oktober: 10, november: 11, december: 12 }
+)
+/** The usual clock time of a part of the day said without one ("every evening"). */
+const partTimes = dict<ClockTime>({ morning: { hour: 8, minute: 0 }, afternoon: { hour: 14, minute: 0 }, evening: { hour: 19, minute: 0 }, night: { hour: 22, minute: 0 } })
+const maxDays = [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+
+interface Words {
+  readonly every: P<string>
+  readonly on: string
+  readonly and: string
+  readonly the: string
+  readonly of: string
+  readonly last: string
+  readonly lastDay: ReadonlyArray<string>
+}
+const vocabulary: Record<Language, Words> = {
+  en: { every: oneOf("every", "each"), on: "on", and: "and", the: "the", of: "of", last: "last", lastDay: ["last", "day"] },
+  nl: { every: oneOf("elke", "elk", "iedere", "ieder"), on: "op", and: "en", the: "de", of: "van", last: "laatste", lastDay: ["laatste", "dag"] }
 }
 
-const symbolize = (norms: ReadonlyArray<string>, toks: ReadonlyArray<Tok>, language: Language): Array<Sym> => {
-  // "om de week" = "every other week" (before fillers go)
-  const words: Array<string> = []
-  for (let i = 0; i < norms.length; i++) {
-    if (language === "nl" && norms[i] === "om" && norms[i + 1] === "de") { words.push("elke", "andere"); i++ } else words.push(norms[i]!)
+const grammar = (language: Language): P<Body> => {
+  const w = vocabulary[language]
+  const en = language === "en"
+  const and = opt(words(w.and))
+
+  /** "every day", "every other week", "every second month", "every 3 years", "daily"; "om de week", "elke twee weken". */
+  const interval: P<{ unit: Unit; interval: number }> = alt(
+    from(adverbs[language]),
+    map(seq(w.every, from(unitSingular[language])), ([, unit]) => ({ unit, interval: 1 })),
+    // EVERY ORDINAL UNIT from "first" ("every first day" is every day; review round 4, finding 20).
+    map(seq(w.every, ordinal(language, 1, 31), from(unitSingular[language])), ([, n, unit]) => ({ unit, interval: n })),
+    map(seq(w.every, wholeNumber(language, 2, maxInterval), from(unitPlural[language])), ([, n, unit]) => ({ unit, interval: n })),
+    ...(en
+      ? [map(seq(oneOf("every", "each"), words("other"), from(unitSingular.en)), ([, , unit]) => ({ unit, interval: 2 }))]
+      : [
+        map(seq(words("om", "de"), from(unitSingular.nl)), ([, unit]) => ({ unit, interval: 2 })),
+        map(seq(words("om", "de"), wholeNumber("nl", 2, maxInterval), from(unitPlural.nl)), ([, n, unit]) => ({ unit, interval: n }))
+      ])
+  )
+  const intervalOf = (unit: Unit) => map(interval, (i) => (i.unit === unit ? i.interval : undefined))
+
+  /** A Dutch weekday and part of the day in one word: "vrijdagavond". */
+  const nlCompound: P<{ days: ReadonlyArray<number>; part: Period }> = (input, at) => {
+    const t = input.norms[at]
+    if (language !== "nl" || t === undefined) return []
+    for (const [name, wd] of Object.entries(weekdayOne.nl)) {
+      if (!t.startsWith(name)) continue
+      const part = partWords.nl[t.slice(name.length)]
+      if (part !== undefined) return [{ value: { days: [wd!], part }, next: at + 1 }]
+    }
+    return []
   }
-  const syms: Array<Sym> = []
-  for (let i = 0; i < words.length; i++) {
-    const w = words[i]!
-    if (everyWords[language].has(w)) { syms.push({ k: "every" }); continue }
-    if (w === "other" || w === "andere") { syms.push({ k: "other" }); continue }
-    if (w === "and" || w === "en" || w === "or") { syms.push({ k: "and" }); continue }
-    if (fillers[language].has(w)) continue
-    if (w === "last" || w === "laatste") { syms.push({ k: "ord", n: -1 }); continue }
-    const adv = adverbs[language][w]
-    if (adv !== undefined) { syms.push(...adv); continue }
-    const ord = readOrdinal(words, i, language)
-    if (ord !== undefined) { syms.push({ k: "ord", n: ord.value }); i = ord.next - 1; continue }
-    const u = unitWords[language][w]
-    if (u !== undefined) { syms.push({ k: "unit", u }); continue }
-    const wd = weekdayOfWord(w, language)
-    if (wd !== undefined) { syms.push({ k: "wd", days: [wd] }); continue }
-    const month = monthOf(w, language)
-    if (month !== undefined) { syms.push({ k: "month", n: month }); continue }
-    const part = parts[language][w]
-    if (part !== undefined) { syms.push({ k: "part", p: part }); continue }
-    const num = readNumber(toks.map((t, k) => ({ ...t, norm: words[k] ?? t.norm })), i, language)
-    if (num !== undefined && Number.isInteger(num.value) && num.value >= 1 && num.value <= 1000) { syms.push({ k: "num", n: num.value }); i = num.next - 1; continue }
-    syms.push({ k: "junk" })
-  }
-  return syms
+  const singular: P<{ days: ReadonlyArray<number>; part?: Period }> = alt(map(from(weekdaySingular[language]), (days) => ({ days })), nlCompound)
+  /** "Monday", "Monday and Friday", "Monday, Wednesday and Friday" (a comma is punctuation), "weekday"; every part the same. */
+  const singularList: P<{ days: ReadonlyArray<number>; part?: Period }> = map(many1(singular, and, 7), (items) => {
+    const days = items.flatMap((i) => i.days)
+    const parts = new Set(items.map((i) => i.part))
+    if (new Set(days).size !== days.length || parts.size > 1) return undefined
+    const part = items[0]!.part
+    return { days: [...days].sort((a, b) => a - b), ...(part !== undefined ? { part } : {}) }
+  })
+  const pluralList: P<ReadonlyArray<number>> = map(many1(from(weekdayPlural[language]), and, 7), (items) => {
+    const days = items.flat()
+    return new Set(days).size === days.length ? [...days].sort((a, b) => a - b) : undefined
+  })
+
+  /**
+   * "the 1st and the 15th", "the 1st and 15th", "the first, the fifteenth and the last day", "de eerste en de vijftiende": the first
+   * day with "the"; each next one with "the", "and" or both.
+   */
+  const dayItem: P<number> = alt(ordinal(language, 1, 31), map(words(...w.lastDay), () => -1))
+  const monthDayList: P<ReadonlyArray<number>> = map(
+    seq(words(w.the), dayItem, opt(many1(map(seq(alt(words(w.the), map(seq(words(w.and), opt(words(w.the))), () => "")), dayItem), ([, d]) => d), undefined, 30))),
+    ([, first, rest]) => {
+      const days = [first, ...(rest ?? [])]
+      return new Set(days).size === days.length ? [...days].sort((a, b) => (a < 0 ? 100 : a) - (b < 0 ? 100 : b)) : undefined
+    }
+  )
+  /** "the second Tuesday", "the last Friday", "de eerste maandag". */
+  const nthWeekday: P<{ n: number; wd: number }> = map(
+    seq(words(w.the), alt(ordinal(language, 1, 5), map(words(w.last), () => -1)), from(weekdayOne[language])),
+    ([, n, wd]) => ({ n, wd })
+  )
+  /** "of the month", "of every month", "of every other month", "of every 3 months"; "van de maand", "van elke maand". */
+  const ofMonth: P<number> = alt(
+    map(words(w.of, w.the, en ? "month" : "maand"), () => 1),
+    map(seq(words(w.of), w.every, from(unitSingular[language])), ([, , u]) => (u === "month" ? 1 : undefined)),
+    map(seq(words(w.of), w.every, ordinal(language, 1, 31), from(unitSingular[language])), ([, , n, u]) => (u === "month" ? n : undefined)),
+    map(seq(words(w.of), w.every, wholeNumber(language, 2, maxInterval), from(unitPlural[language])), ([, , n, u]) => (u === "month" ? n : undefined)),
+    ...(en ? [map(seq(words("of"), w.every, words("other"), from(unitSingular.en)), ([, , , u]) => (u === "month" ? 2 : undefined))] : [])
+  )
+  /** "3 March", "the 3rd of March", "March 3rd", "March the third"; "3 maart", "de derde maart". */
+  const dayOfMonth = alt(ordinal(language, 1, 31), wholeNumber(language, 1, 31))
+  const valid = (month: number, day: number) => (day <= maxDays[month - 1]! ? { month, day } : undefined)
+  const yearDate: P<{ month: number; day: number }> = en
+    ? alt(
+      map(seq(opt(words("the")), dayOfMonth, opt(words("of")), from(monthWords.en)), ([, d, , m]) => valid(m, d)),
+      map(seq(from(monthWords.en), opt(words("the")), dayOfMonth), ([m, , d]) => valid(m, d))
+    )
+    : map(seq(opt(words("de")), dayOfMonth, from(monthWords.nl)), ([, d, m]) => valid(m, d))
+  const on = words(w.on)
+
+  return alt<Body>(
+    // An interval phrase, then what it may take: "every week on Monday", "every 2 months on the 15th", "every year on 3 March".
+    map(intervalOf("day"), (n) => ({ freq: "DAILY", interval: n })),
+    map(seq(intervalOf("week"), opt(seq(on, alt(map(singularList, (l) => (l.part === undefined ? l.days : undefined)), pluralList)))),
+      ([n, d]) => ({ freq: "WEEKLY", interval: n, ...(d !== undefined ? { days: d[1] } : {}) })),
+    map(intervalOf("month"), (n) => ({ freq: "MONTHLY", interval: n })),
+    map(seq(intervalOf("month"), on, monthDayList), ([n, , days]) => ({ freq: "MONTHLY", interval: n, monthDays: days })),
+    map(seq(intervalOf("month"), on, nthWeekday), ([n, , nth]) => ({ freq: "MONTHLY", interval: n, nth })),
+    map(seq(intervalOf("year"), opt(seq(on, yearDate))), ([n, d]) => ({ freq: "YEARLY", interval: n, ...(d !== undefined ? { date: d[1] } : {}) })),
+    // "every Monday and Friday [evening]", "every weekday morning", "elke vrijdagavond"
+    map(seq(w.every, singularList, opt(from(partWords[language]))), ([, l, p]) => (l.part !== undefined && p !== undefined ? undefined
+      : { freq: "WEEKLY", interval: 1, days: l.days, ...((l.part ?? p) !== undefined ? { part: (l.part ?? p)! } : {}) })),
+    // "every other Tuesday", "every second Tuesday", "every third Friday": every few weeks.
+    map(seq(w.every, alt(ordinal(language, 2, 5), ...(en ? [map(words("other"), () => 2)] : [])), from(weekdayOne[language])), ([, n, wd]) => ({ freq: "WEEKLY", interval: n, days: [wd] })),
+    // "every morning", "elke avond"
+    map(seq(w.every, from(partWords[language])), ([, part]) => ({ freq: "DAILY", interval: 1, part })),
+    // [on] Mondays [and Thursdays] [evenings]; on Monday evenings; op werkdagen; 's maandags
+    map(seq(opt(on), pluralList, opt(from(partPlurals[language]))), ([, days, part]) => ({ freq: "WEEKLY", interval: 1, days, ...(part !== undefined ? { part } : {}) })),
+    ...(en
+      ? [map(seq(opt(on), map(singularList, (l) => (l.part === undefined ? l.days : undefined)), from(partPlurals.en)), ([, days, part]): Body => ({ freq: "WEEKLY", interval: 1, days, part }))]
+      : [map(seq(opt(words("s")), from(nlWeekdayS)), ([, days]): Body => ({ freq: "WEEKLY", interval: 1, days }))]),
+    // [on] the 1st [and the 15th] of the month | of every other month; [on] the last day of the month
+    map(seq(opt(on), monthDayList, ofMonth), ([, days, n]) => ({ freq: "MONTHLY", interval: n, monthDays: days })),
+    // [on] the second Tuesday of the month
+    map(seq(opt(on), nthWeekday, ofMonth), ([, nth, n]) => ({ freq: "MONTHLY", interval: n, nth })),
+    // "every 2nd of the month", "elke eerste van de maand"
+    map(seq(w.every, ordinal(language, 1, 31), ofMonth), ([, d, i]) => ({ freq: "MONTHLY", interval: i, monthDays: [d] })),
+    // "every first Monday of the month", "every last Friday of every month", "elke tweede dinsdag van de maand"
+    map(seq(w.every, alt(ordinal(language, 1, 5), map(words(w.last), () => -1)), from(weekdayOne[language]), ofMonth), ([, n, wd, i]) => ({ freq: "MONTHLY", interval: i, nth: { n, wd } })),
+    // "every 3 March", "every March 3rd", "elke 3 maart"
+    map(seq(w.every, yearDate), ([, date]) => ({ freq: "YEARLY", interval: 1, date }))
+  )
+}
+const grammars: Record<Language, P<Body>> = { en: grammar("en"), nl: grammar("nl") }
+
+interface Reading {
+  readonly body: Body
+  readonly time?: TimeMatch
+}
+/** [at TIME] RULE [at TIME], at most one time. */
+const phrases: Record<Language, P<Reading>> = {
+  en: phraseOf("en"),
+  nl: phraseOf("nl")
+}
+function phraseOf(language: Language): P<Reading> {
+  const time = map(seq(words(language === "en" ? "at" : "om"), timeOfDay[language]), ([, m]) => m)
+  const body = grammars[language]
+  return alt(
+    map(body, (b) => ({ body: b })),
+    map(seq(body, time), ([b, t]) => ({ body: b, time: t })),
+    map(seq(time, body), ([t, b]) => ({ body: b, time: t }))
+  )
 }
 
-const wdCode = (n: number): RuleDay["weekday"] => weekdayCodes[n - 1]!
-const empty = { byDay: [] as Array<RuleDay>, byMonthDay: [] as Array<number>, byMonth: [] as Array<number> }
-const rule = (freq: Freq, interval: number, extra: Partial<Omit<RecurrenceRule, "freq" | "interval">> = {}): RecurrenceRule => ({ freq, interval, ...empty, ...extra })
-const unitFreq: Record<Unit, Freq> = { minute: "MINUTELY", hour: "HOURLY", day: "DAILY", week: "WEEKLY", month: "MONTHLY", year: "YEARLY" }
+const wdCode = (n: number): RuleDay["weekday"] => weekdayCodes[((n - 1) % 7 + 7) % 7]!
 
-/** Read the symbols of a spoken recurrence into a rule. */
-const matchRule = (s: ReadonlyArray<Sym>): { rule: RecurrenceRule; part?: Period } | undefined => {
-  let i = 0
-  const at = (k: number): Sym | undefined => s[k]
-  if (at(0)?.k === "every") i++
-  let part: Period | undefined
-  const withPart = (r: RecurrenceRule): { rule: RecurrenceRule; part?: Period } => (part === undefined ? { rule: r } : { rule: r, part })
-  const readWeekdays = (from: number): { days: Array<number>; next: number } => {
-    const days: Array<number> = []
-    let k = from
-    for (;;) {
-      const x = at(k)
-      if (x?.k === "wd") { days.push(...x.days); k++; continue }
-      if (x?.k === "and" && at(k + 1)?.k === "wd") { k++; continue }
-      break
-    }
-    return { days: [...new Set(days)].sort((a, b) => a - b), next: k }
+/** The rule of a reading, with the time settled; `undefined` when the parts do not fit together. */
+const settle = (r: Reading, band: { from: number; to: number }, defaultTime: ClockTime | undefined): { rule: RecurrenceRule; time?: TimeOfDay; clock: ClockTime; part?: Period } | undefined => {
+  const { body } = r
+  let time: TimeOfDay | undefined
+  let smallHours = false
+  if (r.time !== undefined) {
+    const m = r.time
+    if (m.hour === 24) return undefined // "every day at 24:00": a day later than said; say 00:00
+    if (m.period !== undefined && body.part !== undefined && m.period !== body.part && m.period !== "am" && m.period !== "pm") return undefined
+    const resolved = resolveTime(body.part !== undefined && m.period === undefined ? { ...m, period: body.part } : m, band)
+    if (resolved === undefined) return undefined
+    if (body.part !== undefined && !periodHours(body.part, resolved.time.hour)) return undefined
+    time = resolved.time
+    smallHours = [time, ...time.alternatives].every((t) => t.hour < 6)
+    // "every Friday at midnight": the start of Friday or its end. Only a daily rule, or a night ("every Friday night at midnight"), says.
+    if (m.midnightWord && body.freq !== "DAILY" && body.part !== "night") return undefined
   }
-  const readOrds = (from: number): { ords: Array<number>; next: number } => {
-    const ords: Array<number> = []
-    let k = from
-    for (;;) {
-      const x = at(k)
-      if (x?.k === "ord") {
-        if (x.n === -1 && at(k + 1)?.k === "unit" && (at(k + 1) as { u: Unit }).u === "day") { ords.push(-1); k += 2; continue }
-        ords.push(x.n); k++; continue
-      }
-      if (x?.k === "and" && (at(k + 1)?.k === "ord")) { k++; continue }
-      if (x?.k === "every" && ords.length > 0) { k++; continue }
-      break
-    }
-    return { ords, next: k }
+  const partDefault = body.part === undefined ? undefined
+    : defaultTime !== undefined && periodHours(body.part, defaultTime.hour) ? defaultTime : partTimes[body.part]
+  const clock: ClockTime = time ?? partDefault ?? defaultTime ?? { hour: 9, minute: 0 }
+  // "every Friday night at 1": the small hours after Friday evening are Saturday's.
+  const shift = body.part === "night" && clock.hour < 6 && (time === undefined || smallHours) ? 1 : 0
+  if (shift === 1 && body.freq !== "DAILY" && body.freq !== "WEEKLY") return undefined
+  const byDay: Array<RuleDay> = body.days !== undefined ? body.days.map((d) => ({ weekday: wdCode(d + shift) }))
+    : body.nth !== undefined ? [{ weekday: wdCode(body.nth.wd), nth: body.nth.n }] : []
+  const rule: RecurrenceRule = {
+    freq: body.freq, interval: body.interval,
+    byDay: [...byDay].sort((a, b) => weekdayCodes.indexOf(a.weekday) - weekdayCodes.indexOf(b.weekday)),
+    byMonthDay: body.monthDays !== undefined ? [...body.monthDays] : body.date !== undefined ? [body.date.day] : [],
+    byMonth: body.date !== undefined ? [body.date.month] : []
   }
-  let interval = 1
-  let ordinal: number | undefined
-  const first = at(i)
-  if (first === undefined) return undefined
-  if (first.k === "other") {
-    interval = 2
-    i++
-    const n = at(i)
-    if (n?.k === "num") { interval = n.n; i++ }
-  } else if (first.k === "num" && (at(i + 1)?.k === "unit" || at(i + 1)?.k === "month")) {
-    if (at(i + 1)?.k === "month") {
-      // "elke 3 maart": a date every year
-      const day = first.n
-      const m = at(i + 1) as { n: number }
-      return day >= 1 && day <= 31 ? withPart(rule("YEARLY", 1, { byMonth: [m.n], byMonthDay: [day] })) : undefined
-    }
-    interval = first.n
-    i++
-  }
-  const x = at(i)
-  if (x === undefined) return undefined
-  if (x.k === "part") { part = x.p; return withPart(rule("DAILY", interval)) }
-  if (x.k === "unit") {
-    const freq = unitFreq[x.u]
-    const next = at(i + 1)
-    if (x.u === "day") {
-      if (next?.k === "part") part = next.p
-      return withPart(rule(freq, interval))
-    }
-    if (x.u === "week") {
-      const wd = readWeekdays(i + 1)
-      return withPart(rule(freq, interval, { byDay: wd.days.map((d) => ({ weekday: wdCode(d) })) }))
-    }
-    if (x.u === "month") {
-      const o = readOrds(i + 1)
-      return withPart(rule(freq, interval, { byMonthDay: o.ords }))
-    }
-    if (x.u === "year") {
-      const a = at(i + 1)
-      const b = at(i + 2)
-      if (a?.k === "month" && (b?.k === "ord" || b?.k === "num")) return withPart(rule(freq, interval, { byMonth: [a.n], byMonthDay: [b.n] }))
-      if ((a?.k === "ord" || a?.k === "num") && b?.k === "month") return withPart(rule(freq, interval, { byMonth: [b.n], byMonthDay: [a.n] }))
-      return withPart(rule(freq, interval))
-    }
-    return withPart(rule(freq, interval))
-  }
-  if (x.k === "ord") {
-    const o = readOrds(i)
-    const next = at(o.next)
-    if (next?.k === "wd" && o.ords.length > 0) {
-      const wd = readWeekdays(o.next)
-      const monthly = (() => { for (let k = wd.next; k < s.length; k++) { const y = at(k); if (y?.k === "unit") return y.u === "month"; if (y?.k !== "every") break } return false })()
-      ordinal = o.ords[0]
-      if (monthly || ordinal === 1 || ordinal === -1) return withPart(rule("MONTHLY", interval, { byDay: wd.days.flatMap((d) => o.ords.map((n) => ({ weekday: wdCode(d), nth: n }))) }))
-      return withPart(rule("WEEKLY", interval * ordinal!, { byDay: wd.days.map((d) => ({ weekday: wdCode(d) })) }))
-    }
-    if (next?.k === "unit" && next.u === "month") {
-      let n = o.next + 1
-      if (at(n)?.k === "num" && (at(n + 1) as { u?: Unit } | undefined)?.u === "month") n += 2
-      return withPart(rule("MONTHLY", interval, { byMonthDay: o.ords }))
-    }
-    if (next?.k === "month") return withPart(rule("YEARLY", interval, { byMonth: [next.n], byMonthDay: [o.ords[0]!] }))
-    if (next?.k === "num" && at(o.next + 1)?.k === "unit" && (at(o.next + 1) as { u: Unit }).u === "month") {
-      return withPart(rule("MONTHLY", (next as { n: number }).n, { byMonthDay: o.ords }))
-    }
-    return undefined
-  }
-  if (x.k === "wd") {
-    const wd = readWeekdays(i)
-    let k = wd.next
-    while (at(k)?.k === "every") k++
-    return withPart(rule("WEEKLY", interval, { byDay: wd.days.map((d) => ({ weekday: wdCode(d) })) }))
-  }
-  if (x.k === "month") {
-    const b = at(i + 1)
-    if (b?.k === "ord" || b?.k === "num") return withPart(rule("YEARLY", interval, { byMonth: [x.n], byMonthDay: [b.n] }))
-    return undefined
-  }
-  return undefined
+  if (formatRRule(rule) === undefined) return undefined
+  return { rule, ...(time !== undefined ? { time } : {}), clock, ...(body.part !== undefined ? { part: body.part } : {}) }
 }
+
+const isClock = (t: unknown): t is ClockTime =>
+  typeof t === "object" && t !== null && Number.isInteger((t as ClockTime).hour) && Number.isInteger((t as ClockTime).minute) &&
+  (t as ClockTime).hour >= 0 && (t as ClockTime).hour <= 23 && (t as ClockTime).minute >= 0 && (t as ClockTime).minute <= 59
 
 /**
- * Build an RFC 5545 rule from spoken words: "every day", "every weekday", "every Monday", "every second Tuesday" (every other week),
- * "the first Monday of every month", "on the first of the month", "every 3 days", "every year on March 3rd", "weekly", with an optional time
- * ("every day at nine", "every Monday at half past seven"). Dutch: "elke dag", "elke werkdag", "elke tweede dinsdag", "om de week",
- * "elke eerste maandag van de maand", "op de eerste van de maand", "elk jaar op 3 maart". The result has the `RRULE`, a DTSTART in
- * the zone that is the first occurrence after now, and both as iCalendar lines. Anything not understood is `not-understood`.
+ * Build an RFC 5545 rule from a phrase that is only a recurrence (README, "Spoken recurrence"), and its first occurrence after now:
+ * "every day", "every weekday at seven", "every second Tuesday", "on the first of the month", "the last Friday of every month", "every
+ * year on 3 March", "elke werkdag om zeven uur", "elke tweede dinsdag", "op de eerste van de maand". Every word must be read by the
+ * grammar: "every Monday or Friday", "every hour", "every day except Sunday", "every day until June" are `not-understood`. When the
+ * words read as two different rules, the answer is `ambiguous` with both. Never throws.
  */
-export const parseRecurrence = (text: string, language: Language, options: RecurrenceOptions): Parsed<Recurrence> => {
+export const parseRecurrence: (text: string, language: Language, options: RecurrenceOptions) => Parsed<Recurrence> = guarded((text: string, language: Language, options: RecurrenceOptions): Parsed<Recurrence> => {
+  if (!isText(text) || !isLanguage(language) || !isOptions(options) || options === undefined) return notUnderstood
+  const zone = normalizeTimeZone(options.timeZone)
+  const band = bandOf(options)
+  if (zone === undefined || band === undefined) return notUnderstood
+  // A default time that is not a clock time is refused before any conversion (finding 4).
+  if (options.defaultTime !== undefined && !isClock(options.defaultTime)) return notUnderstood
+  const nowIn = instantIn(options.now, zone)
+  if (nowIn === undefined) return notUnderstood
+  const now = nowIn.instant
   const toks = tokenize(text)
-  const now = typeof options.now === "number" ? options.now : options.now.getTime()
-  const zone = options.timeZone
-  // 1. the time of day, cut out
-  let timeAt: { from: number; match: NonNullable<ReturnType<typeof matchTime>> } | undefined
-  const leads = language === "en" ? new Set(["at", "around", "about"]) : new Set(["om", "rond", "tegen"])
-  for (let i = 0; i < toks.length && timeAt === undefined; i++) {
-    const prev = toks[i - 1]?.norm
-    // "elke twee uur" is an interval, not a time
-    if (prev !== undefined && everyWords[language].has(prev)) continue
-    const m = matchTime(toks, i, language, prev !== undefined && leads.has(prev))
-    if (m !== undefined) timeAt = { from: i, match: m }
+  if (toks === undefined || toks.length === 0) return notUnderstood
+  const input: Input = { text, toks, norms: toks.map((t) => t.norm) }
+  const today: LocalDate = { year: nowIn.parts.year, month: nowIn.parts.month, day: nowIn.parts.day }
+  const results: Array<Recurrence> = []
+  for (const r of whole(phrases[language], input)) {
+    const s = settle(r, band, options.defaultTime)
+    if (s === undefined) continue
+    const built = firstAfter(s.rule, s.clock, today, now, zone)
+    if (built === undefined) continue
+    const rrule = formatRRule(s.rule)!
+    const dtstart = formatDtstart(built.start, zone)
+    if (dtstart === undefined) continue
+    // The series as stored must give the start back.
+    const read = readSeries({ rrule, dtstart, timeZone: zone })
+    if (read.kind !== "ok" || seriesAfter(read.series, now, 1)?.instants[0] !== built.instant) continue
+    const value: Recurrence = {
+      rule: s.rule, rrule, ...(s.time !== undefined ? { time: s.time } : {}), ...(s.part !== undefined ? { partOfDay: s.part } : {}), timeDefaulted: s.time === undefined,
+      start: built.start, startInstant: built.instant, dtstart, ics: `${dtstart}\nRRULE:${rrule}`, timeZone: zone
+    }
+    if (!results.some((x) => x.rrule === value.rrule && x.dtstart === value.dtstart)) results.push(value)
   }
-  const rest: Array<Tok> = []
-  const cutFrom = timeAt === undefined ? -1 : timeAt.from > 0 && leads.has(toks[timeAt.from - 1]!.norm) ? timeAt.from - 1 : timeAt.from
-  toks.forEach((t, k) => { if (timeAt === undefined || k < cutFrom || k >= timeAt.match.next) rest.push(t) })
-  // 2. the rule
-  const syms = symbolize(rest.map((t) => t.norm), rest, language)
-  let begin = 0
-  while (begin < syms.length && syms[begin]!.k === "junk") begin++
-  let end = begin
-  while (end < syms.length && syms[end]!.k !== "junk") end++
-  const matched = matchRule(syms.slice(begin, end))
-  if (matched === undefined) return notUnderstood
-  const r = matched.rule
-  // 3. the time
-  let time: TimeOfDay | undefined
-  if (timeAt !== undefined) {
-    const withPart = matched.part !== undefined && timeAt.match.period === undefined ? { ...timeAt.match, period: matched.part } : timeAt.match
-    const resolved = resolveTime(withPart, options.band !== undefined ? { band: options.band } : {})
-    if (resolved === undefined) return notUnderstood
-    time = resolved.time
-  }
-  const clock: ClockTime = time ?? options.defaultTime ?? { hour: 9, minute: 0 }
-  // 4. the first occurrence after now, matching the rule (alignment of "every other week" starts there)
-  const nowParts = localParts(now, zone)
-  const today: LocalDate = nowParts
-  if (r.freq === "HOURLY" || r.freq === "MINUTELY") {
-    const step = (r.freq === "HOURLY" ? 3_600_000 : 60_000) * r.interval
-    const t = Math.floor(now / 60_000) * 60_000 + step
-    const p = localParts(t, zone)
-    const start: LocalDateTime = { year: p.year, month: p.month, day: p.day, hour: p.hour, minute: p.minute }
-    return finish(r, start, time, zone, text, toks, rest, begin, end)
-  }
-  const probeSpec = { rrule: formatRRule({ ...r, interval: 1 }), dtstart: formatDtstart({ ...today, ...clock }, zone).replace(/^DTSTART;TZID=[^:]+:/, ""), timeZone: zone }
-  const probe = occurrencesAfter(probeSpec, now, 1)[0]
-  if (probe === undefined) return notUnderstood
-  const p = localParts(probe, zone)
-  return finish(r, { year: p.year, month: p.month, day: p.day, ...clock }, time, zone, text, toks, rest, begin, end)
-}
+  const said = sliceText(text, toks, 0, toks.length)
+  if (results.length === 0) return notUnderstood
+  if (results.length > 1) return ambiguous(results, said, "The words read as more than one rule")
+  return ok(results[0]!, said)
+}, notUnderstood)
 
-const finish = (
-  r: RecurrenceRule, start: LocalDateTime, time: TimeOfDay | undefined, zone: string, text: string, toks: ReadonlyArray<Tok>,
-  rest: ReadonlyArray<Tok>, begin: number, end: number
-): Parsed<Recurrence> => {
-  const rrule = formatRRule(r)
-  const dtstart = formatDtstart(start, zone)
-  const from = rest[begin]?.start ?? toks[0]!.start
-  const to = rest[end - 1]?.end ?? toks[toks.length - 1]!.end
-  return ok({
-    rule: r, rrule, ...(time !== undefined ? { time } : {}), start, startInstant: zonedToInstant(start, zone), dtstart, ics: `${dtstart}\nRRULE:${rrule}`, timeZone: zone
-  }, text.slice(from, to))
+/**
+ * The first instance after now: the first day from today the rule selects (with interval 1; DTSTART sets the phase), at `clock`,
+ * whose moment is after now, within the supported years. A plain weekly, monthly or yearly rule takes today's weekday, day or date.
+ */
+const firstAfter = (rule: RecurrenceRule, clock: ClockTime, today: LocalDate, now: number, zone: string): { start: LocalDateTime; instant: number } | undefined => {
+  for (let k = 0; k <= 366 * 8 + 31; k++) {
+    const d = addDays(today, k)
+    if (d.year > maxYear) return undefined
+    if (!ruleSelects(rule, today, d)) continue
+    if (rule.freq === "MONTHLY" && rule.byDay.length + rule.byMonthDay.length === 0 && d.day !== today.day) continue
+    if (rule.freq === "YEARLY" && rule.byMonth.length === 0 && (d.month !== today.month || d.day !== today.day)) continue
+    if (d.day > daysInMonth(d.year, d.month)) continue
+    const start = { ...d, hour: clock.hour, minute: clock.minute, second: 0 }
+    const instant = zonedToInstant(start, zone)
+    // A day the zone skips altogether (Pacific/Apia, 30 December 2011) is not a start: its instant is the next day's, and a start
+    // on it would shift the phase of every-few-days rules by one day.
+    const back = localParts(instant, zone)
+    if (back.year !== d.year || back.month !== d.month || back.day !== d.day) continue
+    if (instant > now) return { start, instant }
+  }
+  return undefined
 }

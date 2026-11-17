@@ -10,9 +10,6 @@
     "check": "tsc -p tsconfig.json",
     "test": "vitest run"
   },
-  "dependencies": {
-    "@pva/core": "workspace:*"
-  },
   "devDependencies": {
     "@effect/vitest": "catalog:",
     "@types/node": "catalog:",

@@ -55,8 +55,8 @@ export interface EventFilter {
 
 /**
  * Whether a subscription may receive events now: `live` (deliver), `waiting` (not yet: drop), `ended` (end the stream).
- * A module's `shared` part subscribes with the gate of its generation: waiting until it is published, ended once it is
- * replaced or retired.
+ * The module host gives each part of a module the gate of its state (`ModuleHost` `eventsFor`): waiting while it
+ * starts, live while it is published, ended once it is withdrawn.
  */
 export type SubscriptionGate = () => "live" | "waiting" | "ended"
 
@@ -87,7 +87,7 @@ export interface EventBus {
   readonly subscribe: (filter?: EventFilter, options?: SubscribeOptions) => Stream.Stream<HouseholdEvent>
   /** Events published, events dropped for slow subscribers, and subscribers now. */
   readonly stats: () => { readonly published: number; readonly dropped: number; readonly subscribers: number }
-  /** `ctx.events` of a module; `gate` for a `shared` part's generation. */
+  /** `ctx.events` of a module; `gate`: the part's state (the module host). */
   readonly forModule: (moduleId: string, options?: { readonly gate?: SubscriptionGate }) => ModuleEvents
   /**
    * Publish what `store` releases after each commit (its data changes and module events, in order), and send module

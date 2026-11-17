@@ -2,7 +2,7 @@
 // its buttons pressed with `module.action` (draft and saved settings, admin only), and module routes on the server's
 // own port: a public route, a token route whose token is minted and revoked through the admin API, kept in
 // secrets.json before there is a vault, moved into the vault with the other keys, and refused (503) while it is locked.
-import { defineModule, type ModuleRoute } from "@pva/core"
+import { defineModule, type ModuleRoute, Setting } from "@pva/core"
 import { demoHomeModule } from "@pva/modules-builtin"
 import type { ClientMessage, ModuleInfo, ModuleRoutesResponse } from "@pva/protocol"
 import { Effect } from "effect"
@@ -24,8 +24,28 @@ afterEach(async () => {
 
 const hookRoutes: ReadonlyArray<ModuleRoute> = [
   { method: "GET", path: "ping", public: true, handler: () => Effect.succeed({ status: 200, body: "pong" }) },
-  { method: "POST", path: "hook", guards: ["token"], token: "hook", handler: (req) => Effect.succeed({ status: 202, body: { from: req.token?.label } }) }
+  { method: "POST", path: "hook", guards: ["token"], token: "hook", handler: (req) => Effect.succeed({ status: 202, body: { from: req.token?.label } }) },
+  { method: "POST", path: "lan", guards: ["lan"], body: "bytes", handler: () => Effect.sync(() => ({ status: 200, body: `lan ${++lanCalls}` })) }
 ]
+let lanCalls = 0
+const KEY = "keyed-module-secret-0123456789"
+/** A module with a key and buttons whose handlers would leak it (review round 1, finding 7). */
+const keyedModule = defineModule({
+  id: "keyed",
+  name: "Keyed",
+  description: "Has a key",
+  enabledByDefault: true,
+  settings: {
+    token: Setting.secret({ label: "Token" }),
+    echo: Setting.action({ label: "Echo", buttonLabel: "Echo", requiresSaved: false }),
+    boom: Setting.action({ label: "Boom", buttonLabel: "Boom" })
+  },
+  fieldActions: {
+    echo: ({ settings }) => Effect.succeed({ ok: true, text: `The key is ${settings.token ?? "unset"}` }),
+    boom: ({ settings }) => Effect.fail(new Error(`upstream refused ${settings.token}`))
+  },
+  start: () => Effect.succeed({})
+})
 const hooksModule = defineModule({
   apiVersion: 2,
   id: "hooks",
@@ -36,7 +56,8 @@ const hooksModule = defineModule({
 })
 
 const build = () => fakeBuild({ stt: controlledStt().stt, llm: scriptedLlm(() => "Ok.").llm })
-const start = (dataDir?: string) => startTestServer({ build: build(), catalog: [demoHomeModule, hooksModule], ...(dataDir !== undefined ? { dataDir } : {}) })
+const start = (dataDir?: string, extra: { readonly behindProxy?: boolean } = {}) =>
+  startTestServer({ build: build(), catalog: [demoHomeModule, hooksModule, keyedModule], ...(dataDir !== undefined ? { dataDir } : {}), ...extra })
 
 type RequestInput = Extract<ClientMessage, { readonly requestId: string }> extends infer M ? M extends unknown ? Omit<M, "requestId"> : never : never
 let seq = 0
@@ -114,7 +135,8 @@ describe("module routes in serve mode", () => {
     const { token: adminToken, snapshot } = await admin.admin(TEST_ADMIN_PASSWORD)
     expect(snapshot.modules.find((m) => m.id === "hooks")!.routes?.map((r) => [r.method, r.path, r.guards])).toEqual([
       ["GET", "/api/modules/hooks/ping", []],
-      ["POST", "/api/modules/hooks/hook", ["token"]]
+      ["POST", "/api/modules/hooks/hook", ["token"]],
+      ["POST", "/api/modules/hooks/lan", ["lan"]]
     ])
     const ping = await fetch(`${server.url}/api/modules/hooks/ping`)
     expect([ping.status, await ping.text()]).toEqual([200, "pong"])
@@ -154,5 +176,53 @@ describe("module routes in serve mode", () => {
     expect((await adminApi(`module-routes/hooks/tokens/${token.id}`, { method: "DELETE" })).status).toBe(200)
     expect((await hook(secret)).status).toBe(401)
     expect((await adminApi(`module-routes/hooks/tokens/${token.id}`, { method: "DELETE" })).status).toBe(404)
+  })
+})
+
+describe("review round 1 in serve mode", () => {
+  it("never sends a module's key back with a button's result, and says only that a failed press failed", async () => {
+    server = await start()
+    const admin = await connect()
+    await admin.admin(TEST_ADMIN_PASSWORD)
+    expect((await request(admin, { type: "module.configure", moduleId: "keyed", patch: { values: {}, secrets: { token: KEY } } })).ok).toBe(true)
+    const echo = await request(admin, { type: "module.action", moduleId: "keyed", key: "echo" })
+    expect(echo).toMatchObject({ ok: true, action: { ok: true, text: "The key is [secret]" } })
+    // A draft cannot set the key the handler sees (and nothing of it comes back).
+    const drafted = await request(admin, { type: "module.action", moduleId: "keyed", key: "echo", values: { token: "another" } as never })
+    expect(drafted).toMatchObject({ ok: true, action: { ok: true, text: "The key is [secret]" } })
+    const boom = await request(admin, { type: "module.action", moduleId: "keyed", key: "boom" })
+    expect(boom).toMatchObject({ ok: true, action: { ok: false, text: "It failed; the server's log says why.", tone: "error" } })
+    expect(JSON.stringify([echo, drafted, boom])).not.toContain(KEY)
+  })
+
+  it("refuses cross-site browser requests on the server's port, mints only for installed modules, and honours SERVE_BEHIND_PROXY", async () => {
+    server = await start()
+    const admin = await connect()
+    const { token: adminToken } = await admin.admin(TEST_ADMIN_PASSWORD)
+    const adminApi = (path: string, init: RequestInit = {}) =>
+      fetch(`${server!.url}/api/${path}`, { ...init, headers: { Authorization: `Bearer ${adminToken}`, "Content-Type": "application/json", ...init.headers } })
+    lanCalls = 0
+    const evil = await fetch(`${server.url}/api/modules/hooks/lan`, { method: "POST", headers: { Origin: "http://evil.example", "Content-Type": "text/plain" }, body: "x" })
+    expect([evil.status, evil.headers.get("access-control-allow-origin")]).toEqual([403, null])
+    expect(lanCalls).toBe(0)
+    const own = await fetch(`${server.url}/api/modules/hooks/lan`, { method: "POST", headers: { Origin: server.url, "Sec-Fetch-Site": "same-origin" }, body: "x" })
+    expect([own.status, await own.text()]).toEqual([200, "lan 1"])
+    // Tokens only for an installed module (a stopped one is fine).
+    expect((await adminApi("module-routes/not-installed/tokens", { method: "POST", body: JSON.stringify({ name: "hook", label: "Nobody" }) })).status).toBe(404)
+    expect((await adminApi("module-routes/keyed/tokens", { method: "POST", body: JSON.stringify({ name: "hook", label: "Somebody" }) })).status).toBe(201)
+    const view = await (await adminApi("module-routes")).json() as ModuleRoutesResponse
+    expect(view.behindProxy).toBe(false)
+    expect(view.modules.find((m) => m.moduleId === "keyed")).toMatchObject({ running: false, routes: [], tokens: [{ label: "Somebody" }] })
+
+    for (const c of clients.splice(0)) c.close()
+    await server.close()
+    server = await start(undefined, { behindProxy: true })
+    const lan = await fetch(`${server.url}/api/modules/hooks/lan`, { method: "POST", body: "x" })
+    expect(lan.status).toBe(403)
+    expect(await lan.text()).toMatch(/SERVE_BEHIND_PROXY/)
+    const again = await connect()
+    const { token } = await again.admin(TEST_ADMIN_PASSWORD)
+    const proxied = await (await fetch(`${server.url}/api/module-routes`, { headers: { Authorization: `Bearer ${token}` } })).json() as ModuleRoutesResponse
+    expect(proxied.behindProxy).toBe(true)
   })
 })

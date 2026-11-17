@@ -1,7 +1,7 @@
-import type { AgentKind, HealthIssue as Issue, ModuleKind, StatusLine } from "@pva/protocol"
+import { type AgentKind, AssistantTemplate, type HealthIssue as Issue, type ModuleKind, type StatusLine } from "@pva/protocol"
 import { Effect, Schema, type Scope } from "effect"
 import type { AssistantModule, ContextProvider, Tool } from "./Module.ts"
-import type { HealthContext, ModuleServicesV2, ModuleTemplate, Platforms, Requirement, SharedContext, SharedPart } from "./ModuleApi.ts"
+import type { DeclaredAction, HealthContext, ModuleServicesV2, ModuleTemplate, Platforms, Requirement, SharedContext, SharedPart } from "./ModuleApi.ts"
 import type { FieldActionHandler, ModuleContributions } from "./ModuleContributions.ts"
 import type { EventType } from "./EventBus.ts"
 import { checkModuleStorage, type ModuleStorage } from "./HouseholdStore.ts"
@@ -120,6 +120,12 @@ export interface ModuleDefinition<S extends SettingsSpec = SettingsSpec> {
   /** Suggested assistants (plain data) the new-assistant flow offers. */
   readonly templates?: ReadonlyArray<ModuleTemplate>
   /**
+   * The actions it offers, declared so they stay known while the module is `unavailable` (§C.4): an assistant that
+   * has it on still recognises them by intent and is answered with its "not set up" line. What runs while it is
+   * available are the actions its `start` returns.
+   */
+  readonly declaredActions?: ReadonlyArray<DeclaredAction>
+  /**
    * Other modules this one needs while it is demanded (version 2): each is demanded too, so its `shared` part (its
    * services and contributions) runs even when no assistant has it on. Its instances still follow the assistants.
    */
@@ -134,8 +140,9 @@ export interface ModuleDefinition<S extends SettingsSpec = SettingsSpec> {
   readonly events?: ReadonlyArray<EventType>
   /**
    * The part that runs once per module (version 2) while it is demanded, with its shared settings only, in a scope the
-   * host closes when demand ends or the shared settings change (after the grace period): sockets, caches, handlers,
-   * services and contributions. 10 s to start. What it returns as `value` every instance receives as `ctx.shared`.
+   * host closes when the module stops (after its instances): sockets, caches, handlers, services and contributions.
+   * 10 s to start. What it returns as `value` every instance receives as `ctx.shared`. Any change of what the module
+   * runs stops it (shared part and instances) and then starts it again.
    */
   shared?(context: SharedContext<SettingsOf<S>>): Effect.Effect<SharedPart<unknown>, ModuleStartError, Scope.Scope>
   /**
@@ -158,6 +165,8 @@ export interface ModuleDefinition<S extends SettingsSpec = SettingsSpec> {
 }
 
 const TEMPLATE_ID = /^[a-z][a-z0-9_-]{0,39}$/
+const ACTION_ID = /^[a-z][a-z0-9_]{0,39}$/
+const isWireTemplate = Schema.is(AssistantTemplate)
 
 /** Refuse, at definition time, manifest values the wire could not carry. */
 const checkManifest = (
@@ -166,6 +175,7 @@ const checkManifest = (
     readonly version?: string
     readonly apiVersion?: number
     readonly templates?: ReadonlyArray<ModuleTemplate>
+    readonly declaredActions?: ReadonlyArray<DeclaredAction>
     readonly uses?: ReadonlyArray<string>
     readonly shared?: unknown
     readonly storage?: ModuleStorage
@@ -194,6 +204,32 @@ const checkManifest = (
     if (t.prompt.length > 4000) throw new Error(`Module ${id}: template "${t.id}" has a prompt over 4000 characters`)
     if ((t.purpose?.length ?? 0) > 80) throw new Error(`Module ${id}: template "${t.id}" has a purpose over 80 characters`)
     if ((t.handles?.length ?? 0) > 240) throw new Error(`Module ${id}: template "${t.id}" has handles over 240 characters`)
+    // Everything else the wire carries (module ids, suggested phrases): exactly what the admin snapshot will encode.
+    const wire = {
+      id: `${id}.${t.id}`,
+      name: t.name,
+      prompt: t.prompt,
+      ...(t.purpose !== undefined ? { purpose: t.purpose } : {}),
+      ...(t.handles !== undefined ? { handles: t.handles } : {}),
+      modules: [...(t.modules ?? [id])],
+      ...(t.suggestedPhrases !== undefined ? { suggestedPhrases: [...t.suggestedPhrases] } : {})
+    }
+    if (!isWireTemplate(wire as unknown)) {
+      const badModule = wire.modules.find((m) => !/^[a-z][a-z0-9-]{0,39}$/.test(m))
+      const longPhrase = (t.suggestedPhrases ?? []).find((p) => p.length > 60)
+      throw new Error(
+        `Module ${id}: template "${t.id}" cannot be sent to the admin page: ${
+          badModule !== undefined ? `"${badModule}" is not a module id` : longPhrase !== undefined ? `the suggested phrase "${longPhrase.slice(0, 20)}…" is over 60 characters` : "a field is out of bounds"
+        }`
+      )
+    }
+  }
+  const actionIds = new Set<string>()
+  for (const a of definition.declaredActions ?? []) {
+    if (!ACTION_ID.test(a.id)) throw new Error(`Module ${id}: declared action id "${a.id}" must match ${ACTION_ID}`)
+    if (actionIds.has(a.id)) throw new Error(`Module ${id}: declared action "${a.id}" is declared twice`)
+    actionIds.add(a.id)
+    if (a.label.length === 0) throw new Error(`Module ${id}: declared action "${a.id}" needs a label`)
   }
 }
 
@@ -215,6 +251,7 @@ export const defineModule = <const S extends SettingsSpec = {}, const V extends 
   readonly platforms?: Platforms
   readonly health?: (context: HealthContext<SettingsOf<S>>) => Effect.Effect<ReadonlyArray<Issue>>
   readonly templates?: ReadonlyArray<ModuleTemplate>
+  readonly declaredActions?: ReadonlyArray<DeclaredAction>
   readonly uses?: ReadonlyArray<string>
   readonly storage?: ModuleStorage
   readonly events?: ReadonlyArray<EventType>
@@ -242,6 +279,7 @@ export const defineModule = <const S extends SettingsSpec = {}, const V extends 
     ...(definition.platforms !== undefined ? { platforms: definition.platforms } : {}),
     ...(definition.health !== undefined ? { health: definition.health } : {}),
     ...(definition.templates !== undefined ? { templates: definition.templates } : {}),
+    ...(definition.declaredActions !== undefined ? { declaredActions: definition.declaredActions } : {}),
     ...(definition.uses !== undefined ? { uses: definition.uses } : {}),
     ...(definition.storage !== undefined ? { storage: definition.storage } : {}),
     ...(definition.events !== undefined ? { events: definition.events } : {}),
