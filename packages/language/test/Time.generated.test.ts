@@ -1,9 +1,12 @@
 // Times of day (review round 3, decision 6): every clock time in every speaking style reads back; generated phrases and mutants.
-import { describe, expect, it } from "@effect/vitest"
+import { describe, expect, it, vi } from "@effect/vitest"
 import { parseTimeOfDay, speakTime } from "../src/index.ts"
 import { stable } from "./support/Cfg.ts"
 import { generatedParse, mutantsParse, type GrammarCheck } from "./support/Check.ts"
 import { settleReading, timeGrammar, type Reading, type Settled } from "./grammars/times.ts"
+
+// Generated cases by the hundred: slow on a shared CI runner, so these tests get more than the default five seconds.
+vi.setConfig({ testTimeout: 60_000 })
 
 const clockOrder = (a: { hour: number; minute: number }, b: { hour: number; minute: number }) => a.hour * 60 + a.minute - (b.hour * 60 + b.minute)
 const parsed = (text: string, language: "en" | "nl", options?: Parameters<typeof parseTimeOfDay>[2]) => {

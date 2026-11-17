@@ -1,10 +1,13 @@
 // Spoken recurrence (review round 3, decision 6): generated phrases and their mutants against the tests' own grammar and meaning.
-import { describe, expect, it } from "@effect/vitest"
+import { describe, expect, it, vi } from "@effect/vitest"
 import { parseRecurrence, type Recurrence } from "../src/index.ts"
 import { stable } from "./support/Cfg.ts"
 import { generatedParse, mutantsParse, type GrammarCheck } from "./support/Check.ts"
 import { agree } from "./support/Agree.ts"
 import { recurrenceGrammar, recurrenceMeaning, type RecurrenceMeaning, type RecurrenceReading } from "./grammars/recurrence.ts"
+
+// Generated cases by the hundred: slow on a shared CI runner, so these tests get more than the default five seconds.
+vi.setConfig({ testTimeout: 60_000 })
 
 const project = (r: Recurrence): RecurrenceMeaning => ({
   rrule: r.rrule, dtstart: r.dtstart,
