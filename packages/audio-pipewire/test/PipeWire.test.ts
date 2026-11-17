@@ -32,6 +32,14 @@ const isAlive = (pidFile: string) => {
 const pattern = (n: number, from = 0) => new Uint8Array(n).map((_, i) => (from + i) % 256)
 const concat = (chunks: ReadonlyArray<Uint8Array>) => Buffer.concat(chunks)
 const now = Effect.sync(() => performance.now())
+/** The most a child's stdout channel can hold unread: the kernel's default socket send buffer (256 KiB if unknown). */
+const channelBytes = () => {
+  try {
+    return Number(readFileSync("/proc/sys/net/core/wmem_default", "utf8")) || 262_144
+  } catch {
+    return 262_144
+  }
+}
 
 describe("commands", () => {
   it("builds pw-record / pw-cat arguments", () => {
@@ -79,31 +87,40 @@ describe("capture", () => {
       // first pull (1 frame on a quiet machine, 50+ on a loaded one), and it is already in the
       // consumer's hands, so it is counted apart from what the stall lets through.
       let firstBatch = 0
-      let afterStall = 0
+      const afterStall: Array<Uint8Array> = []
       const stall = Effect.gen(function*() {
         const start = yield* now
         // Stall until the stand-in has written all 2000 frames, so the sliding buffer has
-        // certainly overflowed, then a little longer for the parent to read the pipe's tail.
+        // certainly overflowed, then a little longer for the parent to read the channel's tail.
         while (!existsSync(written)) yield* Effect.sleep(10)
         yield* Effect.sleep(Math.max(100, 700 - ((yield* now) - start)))
       })
-      const error = yield* captureStream(node("capture.mjs", pidFile, 640 * 2000, "exit")).pipe(
+      const total = 2000
+      const error = yield* captureStream(node("capture.mjs", pidFile, 640 * total, "exit")).pipe(
         Stream.runForEachArray((frames) => {
           if (firstBatch === 0) {
             firstBatch = frames.length
             return stall
           }
-          afterStall += frames.length
+          afterStall.push(...frames)
           return Effect.void
         }),
         Effect.flip
       )
       assert.strictEqual(error._tag, "AudioError")
       assert.isAtLeast(firstBatch, 1)
+      const told = `${afterStall.length} frames after the stall (first batch ${firstBatch})`
       // Everything was queued while the consumer stalled; only the newest 3 s survive.
-      // The margin covers a read of the pipe's tail landing after the stall ends.
-      assert.isAtMost(afterStall, captureBufferFrames + 20, `${afterStall} frames after the stall (first batch ${firstBatch})`)
-      assert.isAtLeast(afterStall, captureBufferFrames, `${afterStall} frames after the stall (first batch ${firstBatch})`)
+      assert.isAtLeast(afterStall.length, captureBufferFrames, told)
+      // When the stall ends, the stand-in has handed everything to the kernel, but this process
+      // may not have read all of it yet. What it reads late is extra, and is at most what the
+      // channel (a socketpair) holds, so that is the honest upper bound: far below the 2000 written.
+      assert.isAtMost(afterStall.length, captureBufferFrames + Math.ceil(channelBytes() / 640) + 1, told)
+      // Whatever arrived late, the buffer drops the oldest: the last 3 s delivered are the last 3 s written.
+      assert.deepStrictEqual(
+        concat(afterStall.slice(-captureBufferFrames)),
+        Buffer.from(pattern(640 * captureBufferFrames, 640 * (total - captureBufferFrames)))
+      )
     }))
 
   it.live("an unexpected exit fails the stream with AudioError carrying stderr, after the audio", () =>
