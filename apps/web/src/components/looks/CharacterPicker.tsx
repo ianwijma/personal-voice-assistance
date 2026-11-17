@@ -1,6 +1,6 @@
 "use client"
 import { type KeyboardEvent, useEffect, useRef, useState } from "react"
-import { prettyId } from "@/characters/catalog.ts"
+import { loadedNow, prettyId } from "@/characters/catalog.ts"
 import type { OptionValues } from "@/characters/contract.ts"
 import { createPreviewLoop, type PreviewHandle, type PreviewLoop } from "@/characters/preview.ts"
 import { cx } from "../ui/controls.tsx"
@@ -11,7 +11,11 @@ import { useCharacter } from "./useCharacter.ts"
  * preview, its name, family and summary. A card loads its character's chunk only when it first scrolls into view, and
  * its preview runs only while it is in view (`preview.ts`: one shared loop, 30 frames a second at most, paused while
  * the tab is hidden, held still under reduced motion). A radio group: arrow keys move the choice, as in the rest of
- * the admin.
+ * the admin. They move from the focused card, not from the selected one: a pick only becomes the selection once its
+ * chunk has loaded, so the two differ while a load is on its way (or after one failed). The tab stop follows focus
+ * while it is in the group and goes back to the selected card when focus leaves it. A card known to be unavailable is
+ * skipped, as a disabled radio is; one that fails while focused stays focused, marked "Not available", and the next
+ * arrow moves on from it.
  */
 export function CharacterPicker({ ids, value, onPick, stored, selectedStored, label, idPrefix }: {
   /** Every character id, sorted (`registry.ids`). */
@@ -32,24 +36,57 @@ export function CharacterPicker({ ids, value, onPick, stored, selectedStored, la
     return () => l.stop()
   }, [])
   const group = useRef<HTMLDivElement>(null)
+  // The focused card while focus is in the group: the tab stop (roving tabindex) and where the arrows move from.
+  const [active, setActive] = useState<string | undefined>()
+  const unavailable = (id: string) => loadedNow(id)?.kind === "unavailable"
   const onKey = (e: KeyboardEvent<HTMLDivElement>) => {
     const keys = ["ArrowRight", "ArrowDown", "ArrowLeft", "ArrowUp", "Home", "End"]
     if (!keys.includes(e.key)) return
     e.preventDefault()
-    const i = Math.max(0, ids.indexOf(value))
-    const next = e.key === "Home" ? 0 : e.key === "End" ? ids.length - 1 : (i + (e.key === "ArrowRight" || e.key === "ArrowDown" ? 1 : ids.length - 1)) % ids.length
-    onPick(ids[next]!)
-    // The choice moves at once; focus follows to the card (it is the tab stop now).
-    requestAnimationFrame(() => group.current?.querySelector<HTMLElement>(`[data-character="${CSS.escape(ids[next]!)}"]`)?.focus())
+    const from = e.currentTarget.dataset.character
+    const at = from === undefined ? -1 : ids.indexOf(from)
+    const i = at >= 0 ? at : Math.max(0, ids.indexOf(value))
+    const n = ids.length
+    // Home and End look from the ends inwards; the arrows step on (wrapping) past cards known to be unavailable.
+    const [start, step] = e.key === "Home" ? [0, 1] : e.key === "End" ? [n - 1, -1] : e.key === "ArrowRight" || e.key === "ArrowDown" ? [i + 1, 1] : [i - 1, -1]
+    let next: string | undefined
+    for (let k = 0; k < n; k++) {
+      const id = ids[(((start + k * step) % n) + n) % n]!
+      if (!unavailable(id)) {
+        next = id
+        break
+      }
+    }
+    if (next === undefined) return
+    setActive(next)
+    group.current?.querySelector<HTMLElement>(`[data-character="${CSS.escape(next)}"]`)?.focus()
+    // Selection follows focus (once the character has loaded: the editor applies the newest pick only).
+    onPick(next)
   }
+  const tabStop = active ?? (ids.includes(value) ? value : ids[0])
   return (
-    <div ref={group} role="radiogroup" aria-label={label} id={`${idPrefix}-picker`} className="grid grid-cols-2 gap-2 sm:grid-cols-3" data-testid="character-picker">
+    <div
+      ref={group}
+      role="radiogroup"
+      aria-label={label}
+      id={`${idPrefix}-picker`}
+      className="grid grid-cols-2 gap-2 sm:grid-cols-3"
+      data-testid="character-picker"
+      onFocus={(e) => {
+        const id = (e.target as HTMLElement).dataset.character
+        if (id !== undefined) setActive(id)
+      }}
+      onBlur={(e) => {
+        // Focus left the group: the tab stop goes back to the selected card.
+        if (!(e.relatedTarget instanceof Node && e.currentTarget.contains(e.relatedTarget))) setActive(undefined)
+      }}
+    >
       {ids.map((id) => (
         <Card
           key={id}
           id={id}
           checked={id === value}
-          tabbable={id === value || (!ids.includes(value) && id === ids[0])}
+          tabbable={id === tabStop}
           loop={loop}
           stored={id === value ? selectedStored : stored}
           onPick={() => onPick(id)}
