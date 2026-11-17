@@ -1,0 +1,93 @@
+import { Schema } from "effect"
+import { ASSISTANT_HANDLES_CHARS, ASSISTANT_NAME_CHARS, ASSISTANT_PROMPT_CHARS, ASSISTANT_PURPOSE_CHARS } from "./assistants.ts"
+import { ModuleId, NonNegativeFinite } from "./common.ts"
+
+/**
+ * Protocol 9: health, requirements and module manifests (docs/MODULES-PLAN.md §4 P1,
+ * docs/research/module-investigation/module-definition-config-and-dependencies.md §C.3–C.5).
+ *
+ * An **issue** (`HealthIssue`; core calls it `Issue`) is one thing that is wrong or worth knowing, with what fixes it: a missing program a module needs, a
+ * module's own `health()` finding, a core check of `pnpm start doctor`. The server keeps them in one issue registry
+ * and sends them to admin pages (`health`); the Health page shows them with "Check again" (`health.check`).
+ */
+
+/** How bad an issue is: `error` stops something working (doctor exits non-zero), `warning` may, `info` is a fact. */
+export const IssueSeverity = Schema.Literals(["error", "warning", "info"])
+export type IssueSeverity = typeof IssueSeverity.Type
+
+/**
+ * What fixes an issue: a `command` the owner runs (shown, never run by the server: `value` is the command line), a
+ * `link` to open (`value`: a URL or an admin path such as `#settings/shared/modules`), or a `job` the server can run
+ * (`value`: the job's tool id; no fix in protocol 9 is a job yet).
+ */
+export const IssueFix = Schema.Struct({
+  kind: Schema.Literals(["command", "link", "job"]),
+  /** One short line: "Install ffmpeg". */
+  label: Schema.String.check(Schema.isMaxLength(200)),
+  value: Schema.optionalKey(Schema.String.check(Schema.isMaxLength(1000)))
+})
+export type IssueFix = typeof IssueFix.Type
+
+export const HealthIssue = Schema.Struct({
+  /** Stable within its source ("music.requires.yt-dlp", "core.node"): the same problem keeps its id across checks. */
+  id: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(200)),
+  /** The module it is about; absent for a core check. */
+  module: Schema.optionalKey(ModuleId),
+  /** The device it is about, when it is one device's problem. */
+  device: Schema.optionalKey(Schema.String),
+  severity: IssueSeverity,
+  /** One line: "yt-dlp is missing". */
+  title: Schema.String.check(Schema.isMaxLength(200)),
+  /** What it means and why: "Music needs it to resolve stream addresses." May be empty. */
+  detail: Schema.String.check(Schema.isMaxLength(2000)),
+  fix: Schema.optionalKey(IssueFix)
+})
+export type HealthIssue = typeof HealthIssue.Type
+
+/** The issue registry as admin pages see it: every current issue, and when the last check finished. */
+export const HealthInfo = Schema.Struct({
+  issues: Schema.Array(HealthIssue),
+  /** Epoch ms of the last completed check (probes and every module's `health()`); absent before the first. */
+  checkedAt: Schema.optionalKey(NonNegativeFinite),
+  /** A check ("Check again", or the one at start) is running. */
+  checking: Schema.Boolean
+})
+export type HealthInfo = typeof HealthInfo.Type
+
+/**
+ * Why a module cannot run on this server (`ModuleState` `unavailable`): a program or a platform it needs is missing,
+ * or it was written for a module API this server does not support. Distinct from `error` (it tried to start and
+ * failed): an unavailable module is never started.
+ */
+export const ModuleUnavailable = Schema.Struct({
+  /** One sentence: "yt-dlp is missing", "Written for module API 3; this server supports 1–2". */
+  reason: Schema.String.check(Schema.isMaxLength(500)),
+  fix: Schema.optionalKey(IssueFix)
+})
+export type ModuleUnavailable = typeof ModuleUnavailable.Type
+
+/** Template ids: `<moduleId>.<id>` on the wire (unique across modules). */
+export const TemplateId = Schema.String.check(Schema.isPattern(/^[a-z][a-z0-9-]{0,39}\.[a-z][a-z0-9_-]{0,39}$/))
+export type TemplateId = typeof TemplateId.Type
+
+/**
+ * A suggested assistant a module ships (module-definition §A.1): plain data the new-assistant flow offers. The owner
+ * instantiates it; a template never becomes an assistant by itself, and a module update never changes an assistant
+ * made from one.
+ */
+export const AssistantTemplate = Schema.Struct({
+  /** `<moduleId>.<id>`. */
+  id: TemplateId,
+  /** The assistant's name (the limits are the assistant's own, so a template always makes a valid assistant). */
+  name: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(ASSISTANT_NAME_CHARS)),
+  prompt: Schema.String.check(Schema.isMaxLength(ASSISTANT_PROMPT_CHARS)),
+  /** What it is for, one line (`Assistant.purpose`). */
+  purpose: Schema.optionalKey(Schema.String.check(Schema.isMaxLength(ASSISTANT_PURPOSE_CHARS))),
+  /** What it handles, for routing by TypeSafe (`Assistant.handles`). */
+  handles: Schema.optionalKey(Schema.String.check(Schema.isMaxLength(ASSISTANT_HANDLES_CHARS))),
+  /** The modules it has on (the shipping module first). */
+  modules: Schema.Array(ModuleId),
+  /** Wake phrases it suggests; the owner accepts them per device. */
+  suggestedPhrases: Schema.optionalKey(Schema.Array(Schema.String.check(Schema.isMaxLength(60))))
+})
+export type AssistantTemplate = typeof AssistantTemplate.Type

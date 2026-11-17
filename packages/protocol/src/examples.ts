@@ -21,6 +21,7 @@ import {
   type TraceInfo
 } from "./snapshot.ts"
 import type { ConversationInfo, SessionInfo } from "./sessions.ts"
+import type { HealthInfo } from "./health.ts"
 
 export const exampleWeatherModule: ModuleInfo = {
   id: "weather",
@@ -105,6 +106,48 @@ export const exampleHomeAssistantModule: ModuleInfo = {
   protected: true,
   kind: "capability",
   group: "modules"
+}
+
+/** Protocol 9: a module that cannot run here (a program it needs is missing), with its manifest fields. */
+export const exampleUnavailableModule: ModuleInfo = {
+  id: "music",
+  name: "Music",
+  description: "Plays music on the device you talk to.",
+  enabled: true,
+  state: "unavailable",
+  unavailable: { reason: "yt-dlp is missing", fix: { kind: "command", label: "Install yt-dlp", value: "sudo apt install yt-dlp" } },
+  tools: [],
+  settings: { fields: [], values: {}, secrets: {}, errors: [] },
+  revision: 2,
+  kind: "capability",
+  group: "modules",
+  version: "0.3.0",
+  apiVersion: 2,
+  templates: [{
+    id: "music.dj",
+    name: "DJ",
+    prompt: "You pick and play music. Keep spoken answers to one sentence.",
+    purpose: "Plays music",
+    modules: ["music"],
+    suggestedPhrases: ["hey dj"]
+  }]
+}
+
+/** Protocol 9: the issue registry after a check. */
+export const exampleHealth: HealthInfo = {
+  issues: [
+    {
+      id: "music.requires.yt-dlp",
+      module: "music",
+      severity: "error",
+      title: "yt-dlp is missing",
+      detail: "Music needs it: Resolves stream URLs.",
+      fix: { kind: "command", label: "Install yt-dlp", value: "sudo apt install yt-dlp" }
+    },
+    { id: "core.clock", severity: "warning", title: "The clock is not synchronised", detail: "Timers and alarms may fire at the wrong time.", fix: { kind: "command", label: "Turn on time synchronisation", value: "sudo timedatectl set-ntp true" } }
+  ],
+  checkedAt: 1_763_100_000_000,
+  checking: false
 }
 
 /** A section with the settings-screen placement and field semantics (protocol 3). */
@@ -437,7 +480,7 @@ export const exampleSnapshot: Snapshot = {
 /** The admin part, as `admin.snapshot` carries it. */
 export const exampleAdminSnapshot: AdminSnapshot = {
   engine: exampleEngineStatus,
-  modules: [exampleWeatherModule, exampleHomeAssistantModule],
+  modules: [exampleWeatherModule, exampleHomeAssistantModule, exampleUnavailableModule],
   sections: [exampleVoiceSection, exampleSpeechEngineSection],
   traces: [exampleTrace],
   vault: { state: "unlocked", admin: true, location: "/home/owner/.config/pva/vault.enc" },
@@ -448,7 +491,8 @@ export const exampleAdminSnapshot: AdminSnapshot = {
   sessions: [
     exampleSession,
     { key: "c-a0d1e2f3", name: "Browser without a device id", state: "idle", ownerPresent: false, conversationId: "9d4c2a71-0b5e-4f3a-8e61-7c2d9b0a5f13", turns: 0, lastTurnAt: null }
-  ]
+  ],
+  health: exampleHealth
 }
 
 const audio = { contextSampleRate: 48_000, baseLatencyMs: 10, outputLatencyMs: 21.3, echoCancellation: true, outputPath: "direct" } as const
@@ -557,6 +601,7 @@ export const clientExamples: { readonly [T in ClientMessageType]: Extract<Client
   "wake.test": { type: "wake.test", requestId: "r21", on: true, deviceId: "d-5c1e0b7a42" },
   "conversation.new": { type: "conversation.new", requestId: "r22" },
   "ping": { type: "ping", id: 41 },
+  "health.check": { type: "health.check", requestId: "h1" },
   ...assistantsClientExamples
 }
 
@@ -644,6 +689,7 @@ export const serverExamples: { readonly [T in ServerMessageType]: Extract<Server
   "sessions": { type: "sessions", sessions: [exampleSession] },
   "trace": { type: "trace", key: exampleDevice.id, deviceId: exampleDevice.id, trace: { ...exampleTrace, session: exampleDevice.name } },
   "pong": { type: "pong", id: 41 },
+  "health": { type: "health", health: exampleHealth },
   ...assistantsServerExamples
 }
 

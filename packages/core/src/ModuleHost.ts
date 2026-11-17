@@ -1,9 +1,50 @@
-import type { ChoiceOption, ErrorInfo, FieldError, ModuleInfo, ModuleInstanceInfo, ModuleState, SettingsPatch, SettingValue, StatusLine } from "@pva/protocol"
+import type {
+  AssistantTemplate,
+  ChoiceOption,
+  ErrorInfo,
+  FieldError,
+  ModuleInfo,
+  ModuleInstanceInfo,
+  ModuleState,
+  ModuleUnavailable,
+  SettingsPatch,
+  SettingValue,
+  StatusLine
+} from "@pva/protocol"
 import { Cause, Clock, Effect, Exit, Scope, Stream } from "effect"
-import { actionTool, defineAction, Param, type RegisteredAction, registerActions } from "./Actions.ts"
+import {
+  ACTION_TIMEOUT_MS,
+  ActionError,
+  type ActionOutcome,
+  type ActionParams,
+  actionTool,
+  actionToolName,
+  checkedActionValues,
+  defineAction,
+  Param,
+  type RegisteredAction,
+  registerActions
+} from "./Actions.ts"
 import type { Agent } from "./Agent.ts"
 import { buildDecisionPlan, type DecisionProvider } from "./Decision.ts"
-import type { AssistantModule, ContextProvider, Tool } from "./Module.ts"
+import { makeIssueRegistry, type IssueRegistry } from "./Issues.ts"
+import { type AssistantModule, type ContextProvider, type Tool, toolMetadata } from "./Module.ts"
+import {
+  type ActionRunRequest,
+  type ActionRunResult,
+  type CatalogAction,
+  type HostView,
+  type HostViewSource,
+  type Issue,
+  isOptionalRequirement,
+  MODULE_API,
+  type ModuleHostApi,
+  type ModuleServicesV2,
+  type RequirementCheck,
+  requirementKey,
+  type RequirementStatus,
+  type ServiceKey
+} from "./ModuleApi.ts"
 import type { FieldActionResult } from "./ModuleContributions.ts"
 import { type ModuleDefinition, type ModuleInstance, ModuleStartError } from "./ModuleDefinition.ts"
 import { applicableOwnValues, applySettingsPatch, checkOwnValues, type ResolvedSettings, resolveSettings } from "./Settings.ts"
@@ -88,6 +129,11 @@ export interface ModulePart {
   /** `name` is the module id. */
   readonly module: AssistantModule
   readonly instructions: string
+  /**
+   * The module cannot run on this server (module API v2): the part has no tools and its `instructions` are the one
+   * line that says so (`unavailableInstruction`).
+   */
+  readonly unavailable?: boolean
 }
 
 /** One assistant that wants a module (docs/ASSISTANTS.md §2.6), with its own values for the module's fields. */
@@ -155,6 +201,28 @@ export interface ModuleHost {
    * runs, such as the models Claude Code reports at start. `undefined` when the module does not run or gives none.
    */
   readonly settingOptions: (id: string) => Readonly<Record<string, ReadonlyArray<ChoiceOption>>> | undefined
+  /**
+   * The issue registry (module API v2, §C.5): every module's requirement, availability, start and `health()` issues,
+   * plus what the app adds (`core`). Module issues are kept current by the host; `checkHealth` refreshes the rest.
+   */
+  readonly issues: IssueRegistry
+  /**
+   * Judge every module's availability again (`requirements`, after the app probed again: "Check again"): a module that
+   * became available is started if it is wanted, one that became unavailable is retired with the grace period.
+   * Completes when the starts have settled.
+   */
+  readonly recheck: Effect.Effect<void>
+  /**
+   * Run every available module's `health()` (5 s each, concurrently; never on a turn) with its shared settings and
+   * put what they return in `issues`. A health check that fails or times out is a warning of its own.
+   */
+  readonly checkHealth: Effect.Effect<void>
+  /** The action catalogue (`ModuleHostApi.actions`), for the app and tests. */
+  readonly actions: ModuleHostApi["actions"]
+  /** The read-only view modules get (`ModuleHostApi.view`). */
+  readonly view: () => HostView
+  /** Look up a service a running module provides (`ModuleHostApi.services.get`). */
+  readonly service: ModuleHostApi["services"]["get"]
 }
 
 export interface ModuleHostOptions {
@@ -185,6 +253,24 @@ export interface ModuleHostOptions {
    * its saved on/off with one instance.
    */
   readonly demand?: () => ReadonlyMap<string, ReadonlyArray<ModuleDemand>>
+  /** This server's platform (`process.platform`, `process.arch`) for `ModuleDefinition.platforms`. Absent: not judged. */
+  readonly platform?: { readonly os: string; readonly arch: string }
+  /**
+   * The app's judgement of a module's `requires` (synchronous, from its probe cache; never probes itself). Read when
+   * the host is made and on `recheck`. Absent: every requirement is `unchecked` (never unavailable for it).
+   */
+  readonly requirements?: RequirementCheck
+  /** The app's half of `HostView` (vault, engines, devices, Home values). Absent: the CLI defaults. */
+  readonly view?: HostViewSource
+  /**
+   * Whether an assistant may use one of a module's tools (serve mode: the assistant's `offTools`), for the action
+   * catalogue's `assistantId`. Absent: every tool of a module the assistant has on.
+   */
+  readonly isOffered?: (assistantId: string, moduleId: string, toolName: string) => boolean
+  /** The issue registry to keep the module issues in (the app adds its own). Default: a new one. */
+  readonly issues?: IssueRegistry
+  /** Time a module's `health()` may take. Default 5 s. */
+  readonly healthTimeoutMs?: number
 }
 
 interface Running {
@@ -194,6 +280,8 @@ interface Running {
   /** The instance's tools plus the generated action tools. */
   readonly tools: ReadonlyArray<Tool>
   readonly actions: ReadonlyArray<RegisteredAction>
+  /** Services this instance provides to other modules (`host.services.provide`), by key id. */
+  readonly services: Map<string, unknown>
 }
 
 /** One wanted instance of a module: the settings it runs with, who uses it, and how it is doing. */
@@ -233,6 +321,12 @@ interface Entry {
   dirty: boolean
   revision: number
   generation: number
+  /** Why it cannot run here (`unavailable`), judged at creation and on `recheck`; `undefined`: it can. */
+  unavailable: ModuleUnavailable | undefined
+  /** Its requirements as last judged. */
+  statuses: ReadonlyArray<RequirementStatus>
+  /** The last `requestRestart` that failed to start (the old instance kept serving); cleared by a successful start. */
+  restartError: string | undefined
 }
 
 /** The instances one set of effective settings asks for. */
@@ -254,6 +348,13 @@ const OK: HostResult = { ok: true }
 
 const toolNames = (running: { readonly tools: ReadonlyArray<Tool> } | undefined) => (running?.tools ?? []).map((t) => t.name)
 
+/**
+ * The instructions line of a module an assistant has on that cannot run here (module-definition §C.4, option a): the
+ * assistant says it is not set up in one sentence instead of improvising, and no tool round is spent on it.
+ */
+export const unavailableInstruction = (name: string, reason: string): string =>
+  `${name} is not set up on this server (${reason.replace(/[.!?]+$/, "")}). If you are asked for anything it does, say so in one sentence; the owner can fix it in the admin page under Diagnostics › Health.`
+
 /** An instance's actions, registered under the module id, and its tools plus one generated tool per offered action. */
 const contributionsOf = (moduleId: string, instance: ModuleInstance) => {
   const actions = registerActions(moduleId, instance.actions ?? [])
@@ -266,6 +367,8 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
   const startTimeoutMs = options.startTimeoutMs ?? 10_000
   const graceMs = options.graceMs ?? 10_000
   const contextTimeoutMs = options.contextTimeoutMs ?? 50
+  const healthTimeoutMs = options.healthTimeoutMs ?? 5_000
+  const issues = options.issues ?? makeIssueRegistry()
   const listeners = new Set<(info: ModuleInfo) => void>()
   const retired = new Set<Scope.Closeable>()
 
@@ -287,7 +390,10 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
       busy: false,
       dirty: false,
       revision: 0,
-      generation: 0
+      generation: 0,
+      unavailable: undefined,
+      statuses: [],
+      restartError: undefined
     }
   })
   const byId = new Map(entries.map((e) => [e.def.id, e]))
@@ -311,8 +417,101 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
   }
   for (const entry of entries) if (!entry.chosen) entry.enabled = defaultIntent(entry)
 
+  /**
+   * Whether the module can run on this server (module API v2): a supported `apiVersion`, a listed platform, and every
+   * required requirement met (as the app's probes last judged them). Synchronous; never probes.
+   */
+  const judge = (entry: Entry): { readonly unavailable: ModuleUnavailable | undefined; readonly statuses: ReadonlyArray<RequirementStatus> } => {
+    const def = entry.def
+    const api = def.apiVersion ?? 1
+    const supports: ReadonlyArray<number> = MODULE_API.supports
+    if (!supports.includes(api)) {
+      const range = `${Math.min(...supports)}–${Math.max(...supports)}`
+      return {
+        unavailable: {
+          reason: api > MODULE_API.current
+            ? `Written for module API ${api}; this assistant supports ${range}. Update the assistant.`
+            : `Written for module API ${api}, which this assistant no longer supports (${range}). Update the module.`
+        },
+        statuses: []
+      }
+    }
+    const platform = options.platform
+    if (platform !== undefined && def.platforms !== undefined) {
+      const { os, arch } = def.platforms
+      if (os !== undefined && os.length > 0 && !os.includes(platform.os)) {
+        return { unavailable: { reason: `Runs on ${os.join(" or ")}; this server runs ${platform.os}.` }, statuses: [] }
+      }
+      if (arch !== undefined && arch.length > 0 && !arch.includes(platform.arch)) {
+        return { unavailable: { reason: `Runs on ${arch.join(" or ")} processors; this server has ${platform.arch}.` }, statuses: [] }
+      }
+    }
+    const requires = def.requires ?? []
+    const statuses = requires.length === 0 ? [] : options.requirements?.(requires) ?? requires.map((requirement): RequirementStatus => ({
+      requirement,
+      state: "unchecked",
+      detail: "not checked"
+    }))
+    const missing = statuses.find((st) => st.state === "missing" && !isOptionalRequirement(st.requirement))
+    return {
+      unavailable: missing === undefined ? undefined : { reason: missing.detail, ...(missing.fix !== undefined ? { fix: missing.fix } : {}) },
+      statuses
+    }
+  }
+  for (const entry of entries) {
+    const judged = judge(entry)
+    entry.unavailable = judged.unavailable
+    entry.statuses = judged.statuses
+  }
+
+  /** Someone wants the module now (its saved switch, or an assistant has it on). */
+  const wanted = (entry: Entry) => (entry.demand === undefined ? entry.enabled : entry.demand.length > 0)
+
+  /** The module's own issues (source `module:<id>`): requirements, unavailable, a failed start or restart. */
+  const moduleIssues = (entry: Entry): ReadonlyArray<Issue> => {
+    const id = entry.def.id
+    const name = entry.def.name
+    const out: Array<Issue> = []
+    // An error only for a module someone wants: an unused module missing a program does not fail `doctor`.
+    const severity = wanted(entry) ? "error" : "warning"
+    const page = { kind: "link", label: `Open ${name}`, value: `#settings/shared/modules/${id}` } as const
+    for (const st of entry.statuses) {
+      if (st.state !== "missing") continue
+      const r = st.requirement
+      const why = "why" in r && r.why !== undefined ? r.why : undefined
+      out.push({
+        id: `${id}.requires.${requirementKey(r)}`,
+        module: id,
+        severity: isOptionalRequirement(r) ? "warning" : severity,
+        title: st.detail,
+        detail: `${name} ${isOptionalRequirement(r) ? "can use it" : "needs it"}${why === undefined ? "." : `: ${why}${/[.!?]$/.test(why) ? "" : "."}`}`,
+        ...(st.fix !== undefined ? { fix: st.fix } : {})
+      })
+    }
+    if (entry.unavailable !== undefined && out.length === 0) {
+      out.push({
+        id: `${id}.unavailable`,
+        module: id,
+        severity,
+        title: `${name} cannot run on this server`,
+        detail: entry.unavailable.reason,
+        ...(entry.unavailable.fix !== undefined ? { fix: entry.unavailable.fix } : {})
+      })
+    }
+    const { state, error } = stateOf(entry)
+    if (state === "error") {
+      out.push({ id: `${id}.start`, module: id, severity: "error", title: `${name} could not start`, detail: error ?? "", fix: page })
+    }
+    if (entry.restartError !== undefined) {
+      out.push({ id: `${id}.restart`, module: id, severity: "warning", title: `${name} could not be started again`, detail: `It keeps running as it was. ${entry.restartError}`, fix: page })
+    }
+    return out
+  }
+
   /** The groups of effective settings the module should run with now (or with `stored`/`secrets`, a change being made). */
   const groupsOf = (entry: Entry, stored = entry.stored, secrets = entry.secrets): Array<Group> => {
+    // A module that cannot run here is never started (it is `unavailable`, not `error`).
+    if (entry.unavailable !== undefined) return []
     if (entry.demand === undefined) {
       if (!entry.enabled) return []
       const resolved = resolve(entry, stored, secrets)
@@ -363,6 +562,7 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
 
   /** The module's state from its instances: `error` when one fails, `starting` while one starts. */
   const stateOf = (entry: Entry): { readonly state: ModuleState; readonly error?: string } => {
+    if (entry.unavailable !== undefined) return { state: "unavailable" }
     const all = [...entry.instances.values()]
     if (all.length === 0) return { state: entry.retiring > 0 || entry.leaving.size > 0 ? "stopping" : "disabled" }
     if (all.some((r) => r.state === "starting")) return { state: "starting" }
@@ -395,16 +595,32 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
       state,
       ...(error !== undefined ? { error } : {}),
       ...(main?.status !== undefined ? { status: main.status } : {}),
-      tools: [...tools.values()].map((t) => ({ name: t.name, description: t.description, speculative: t.speculative === true })),
+      tools: [...tools.values()].map((t) => ({ name: t.name, description: t.description, speculative: t.speculative === true, ...toolMetadata(t) })),
       settings: resolve(entry).form,
       revision: entry.revision,
       ...(entry.def.kind !== undefined ? { kind: entry.def.kind } : {}),
-      ...(entry.demand !== undefined ? { instances: [...entry.instances.values()].map(instanceInfo) } : {})
+      ...(entry.demand !== undefined ? { instances: [...entry.instances.values()].map(instanceInfo) } : {}),
+      ...(entry.unavailable !== undefined ? { unavailable: entry.unavailable } : {}),
+      ...(entry.def.version !== undefined ? { version: entry.def.version } : {}),
+      ...(entry.def.apiVersion !== undefined ? { apiVersion: entry.def.apiVersion } : {}),
+      ...(entry.def.templates !== undefined && entry.def.templates.length > 0 ? { templates: templatesOf(entry) } : {})
     }
   }
 
+  const templatesOf = (entry: Entry): Array<AssistantTemplate> =>
+    (entry.def.templates ?? []).map((t) => ({
+      id: `${entry.def.id}.${t.id}`,
+      name: t.name,
+      prompt: t.prompt,
+      ...(t.purpose !== undefined ? { purpose: t.purpose } : {}),
+      ...(t.handles !== undefined ? { handles: t.handles } : {}),
+      modules: [...(t.modules ?? [entry.def.id])],
+      ...(t.suggestedPhrases !== undefined ? { suggestedPhrases: [...t.suggestedPhrases] } : {})
+    }))
+
   const notify = (entry: Entry) => {
     entry.revision++
+    issues.set(`module:${entry.def.id}`, moduleIssues(entry))
     if (listeners.size === 0) return
     const current = info(entry)
     for (const listener of listeners) {
@@ -444,6 +660,22 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
     )
   })
 
+  /**
+   * The part of a module that cannot run here but is wanted (C.4 option a): no tools, and one instructions line so the
+   * assistant says it is not set up instead of improvising. Made once per reason, so the cached prompt prefix changes
+   * only when availability changes.
+   */
+  const unavailableParts = new Map<Entry, ModulePart>()
+  const unavailablePartOf = (entry: Entry, unavailable: ModuleUnavailable): ModulePart => {
+    const line = unavailableInstruction(entry.def.name, unavailable.reason)
+    let part = unavailableParts.get(entry)
+    if (part === undefined || part.instructions !== line) {
+      part = { moduleId: entry.def.id, module: { name: entry.def.id, tools: [], context: [] }, instructions: line, unavailable: true }
+      unavailableParts.set(entry, part)
+    }
+    return part
+  }
+
   /** One part per running instance, made once (so every snapshot and every assistant shares the same object). */
   const parts = new WeakMap<Running, ModulePart>()
   const partOf = (entry: Entry, running: Running): ModulePart => {
@@ -476,6 +708,12 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
       const r = mainOf(e)?.running
       return r === undefined ? [] : [{ e, r }]
     })
+    /** The main parts in catalog order: the running ones, and an unavailable one wherever it is wanted (no demand). */
+    const mainParts = entries.flatMap((e) => {
+      if (e.unavailable !== undefined) return e.demand === undefined && e.enabled ? [unavailablePartOf(e, e.unavailable)] : []
+      const r = mainOf(e)?.running
+      return r === undefined ? [] : [partOf(e, r)]
+    })
     const toolModules = new Map<string, string>()
     for (const e of entries) for (const r of runningOf(e)) for (const name of toolNames(r.running)) toolModules.set(name, e.def.id)
     const agents = new Map<string, Agent>()
@@ -484,7 +722,6 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
       for (const agent of r.instance.agents ?? []) if (!agents.has(agent.id)) agents.set(agent.id, agent)
       for (const decider of r.instance.deciders ?? []) if (!deciders.has(decider.id)) deciders.set(decider.id, decider)
     }
-    const mainParts = mains.map(({ e, r }) => partOf(e, r))
     const assistantParts = new Map<string, ReadonlyArray<ModulePart>>()
     for (const e of entries) {
       for (const d of e.demand ?? []) {
@@ -492,6 +729,10 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
         assistantParts.set(
           d.assistantId,
           entries.flatMap((x) => {
+            if (x.unavailable !== undefined) {
+              const wants = x.demand === undefined ? x.enabled : x.demand.some((w) => w.assistantId === d.assistantId)
+              return wants ? [unavailablePartOf(x, x.unavailable)] : []
+            }
             const r = x.demand === undefined ? mainOf(x)?.running : instanceFor(x, d.assistantId)?.running
             return r === undefined ? [] : [partOf(x, r)]
           })
@@ -644,6 +885,8 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
   const startIn = (entry: Entry, rec: Instance, settings: unknown, scope: Scope.Closeable) =>
     Effect.gen(function*() {
       const generation = ++entry.generation
+      /** What this instance provides to other modules; becomes `Running.services` (visible once it is published). */
+      const provided = new Map<string, unknown>()
       let startStatus: StatusLine | undefined
       let started = false
       const setStatus = (status: StatusLine | undefined) => {
@@ -654,7 +897,11 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
           scheduleStatus(entry)
         }
       }
-      const exit = yield* Effect.suspend(() => entry.def.start({ settings: settings as never, setStatus })).pipe(
+      // Version 1 modules get exactly the context they always had; version 2 modules also get the host's services.
+      const context = (entry.def.apiVersion ?? 1) >= 2
+        ? { settings: settings as never, setStatus, ...servicesFor(entry, rec, generation, provided) }
+        : { settings: settings as never, setStatus }
+      const exit = yield* Effect.suspend(() => entry.def.start(context)).pipe(
         Scope.provide(scope),
         Effect.timeoutOrElse({
           duration: startTimeoutMs,
@@ -688,7 +935,7 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
       }
       // Clashes with other modules are checked by `publish`, against the modules running then.
       started = true
-      return { ok: true, running: { scope, instance, generation, ...contributed }, status: startStatus } satisfies Started
+      return { ok: true, running: { scope, instance, generation, ...contributed, services: provided }, status: startStatus } satisfies Started
     })
 
   /** Start the instance `rec` of `group` on its own (enable, retry, startup, a new assistant). It is already wanted. */
@@ -1002,6 +1249,236 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
     return checkOwnValues(entry.def.settings, own)
   }
 
+  // -------------------------------------------------------------------------------------------------------------------
+  // Module API v2: availability, health, the action catalogue, services, restarts
+
+  const recheck = Effect.suspend(() => {
+    const changed: Array<Entry> = []
+    const key = (e: { readonly unavailable: ModuleUnavailable | undefined; readonly statuses: ReadonlyArray<RequirementStatus> }) =>
+      JSON.stringify([e.unavailable ?? null, e.statuses.map((st) => [st.state, st.detail, st.fix ?? null])])
+    for (const entry of entries) {
+      const before = key(entry)
+      const judged = judge(entry)
+      entry.unavailable = judged.unavailable
+      entry.statuses = judged.statuses
+      if (key(entry) !== before) changed.push(entry)
+    }
+    if (changed.length === 0) return Effect.void
+    // The instructions lines and the tools change from the next turn on; then start or retire the instances.
+    rebuild()
+    for (const entry of changed) notify(entry)
+    return Effect.forEach(changed, refreshEntry, { concurrency: "unbounded", discard: true })
+  })
+
+  const clip = (text: string, max: number) => (text.length <= max ? text : `${text.slice(0, max - 1)}…`)
+
+  /** A module's own issues, made safe for the wire: its id as prefix and `module`, texts within their limits. */
+  const normaliseIssues = (entry: Entry, list: ReadonlyArray<Issue>): ReadonlyArray<Issue> => {
+    const id = entry.def.id
+    return list.slice(0, 50).map((issue) => ({
+      ...issue,
+      id: clip(issue.id.startsWith(`${id}.`) ? issue.id : `${id}.${issue.id}`, 200),
+      module: id,
+      title: clip(issue.title, 200),
+      detail: clip(issue.detail, 2000)
+    }))
+  }
+
+  const checkHealth = Effect.forEach(
+    entries,
+    (entry) =>
+      Effect.suspend(() => {
+        const health = entry.def.health
+        const source = `health:${entry.def.id}`
+        if (health === undefined) return Effect.void
+        if (entry.unavailable !== undefined) {
+          issues.set(source, [])
+          return Effect.void
+        }
+        const settings = resolve(entry).value
+        const own = (title: string, detail: string): ReadonlyArray<Issue> => [{ id: `${entry.def.id}.health`, module: entry.def.id, severity: "warning", title, detail }]
+        // Suspended: a health check that throws is reported like one that fails.
+        return Effect.suspend(() => health({ settings, running: mainOf(entry) !== undefined })).pipe(
+          Effect.timeoutOrElse({
+            duration: healthTimeoutMs,
+            orElse: () => Effect.succeed(own(`${entry.def.name}'s health check did not finish`, `It took longer than ${Math.round(healthTimeoutMs / 1000)} s.`))
+          }),
+          Effect.catchCause((cause) =>
+            Cause.hasInterruptsOnly(cause)
+              ? Effect.interrupt
+              : Effect.succeed(own(`${entry.def.name}'s health check failed`, Cause.pretty(cause).split("\n")[0] ?? ""))
+          ),
+          Effect.flatMap((list) => Effect.sync(() => issues.set(source, normaliseIssues(entry, list))))
+        )
+      }),
+    { concurrency: "unbounded", discard: true }
+  )
+
+  /** The instance an action or service lookup uses: the assistant's own one, or the main one. */
+  const instanceUsedBy = (entry: Entry, assistantId: string | undefined): Instance | undefined => {
+    if (entry.unavailable !== undefined) return undefined
+    return assistantId !== undefined && entry.demand !== undefined ? instanceFor(entry, assistantId) : mainOf(entry)
+  }
+
+  const offered = (assistantId: string | undefined, entry: Entry, action: RegisteredAction) =>
+    assistantId === undefined || options.isOffered?.(assistantId, entry.def.id, actionToolName(entry.def.id, action.definition.id)) !== false
+
+  const catalogEntry = (entry: Entry, action: RegisteredAction): CatalogAction => {
+    const d = action.definition
+    return {
+      moduleId: entry.def.id,
+      actionId: d.id,
+      id: action.id,
+      label: d.label,
+      description: d.description,
+      examples: [...(d.examples ?? [])],
+      params: Object.entries(d.params as ActionParams).map(([name, p]) => ({ name, kind: p.kind, label: p.label, optional: p.optional === true })),
+      speculative: d.speculative === true,
+      confirm: d.confirm !== undefined && d.confirm !== false,
+      ...toolMetadata(d)
+    }
+  }
+
+  const actions: ModuleHostApi["actions"] = {
+    list: (listOptions = {}) =>
+      entries.flatMap((entry) => {
+        const running = instanceUsedBy(entry, listOptions.assistantId)?.running
+        if (running === undefined) return []
+        return running.actions.filter((a) => offered(listOptions.assistantId, entry, a)).map((a) => catalogEntry(entry, a))
+      }),
+    run: (request: ActionRunRequest) =>
+      Effect.suspend((): Effect.Effect<ActionRunResult> => {
+        const refuse = (code: Extract<ActionRunResult, { ok: false }>["code"], message: string) => Effect.succeed<ActionRunResult>({ ok: false, code, message })
+        const entry = byId.get(request.moduleId)
+        if (entry === undefined) return refuse("unknown_module", `There is no module "${request.moduleId}"`)
+        const running = instanceUsedBy(entry, request.assistantId)?.running
+        if (running === undefined) {
+          return request.assistantId !== undefined && mainOf(entry) !== undefined && entry.unavailable === undefined
+            ? refuse("not_offered", `${entry.def.name} is not on for this assistant`)
+            : refuse("not_running", `${entry.def.name} is not running`)
+        }
+        const action = running.actions.find((a) => a.definition.id === request.actionId)
+        if (action === undefined) return refuse("unknown_action", `${entry.def.name} has no action "${request.actionId}"`)
+        if (!offered(request.assistantId, entry, action)) return refuse("not_offered", `${action.definition.label} is switched off for this assistant`)
+        const def = action.definition
+        if (def.confirm !== undefined && def.confirm !== false) {
+          return refuse("needs_confirmation", `${def.label} needs the owner's spoken confirmation, which only a conversation can ask for`)
+        }
+        let values: Record<string, unknown>
+        try {
+          values = checkedActionValues(action, request.params)
+        } catch (error) {
+          return refuse("invalid_params", error instanceof Error ? error.message : String(error))
+        }
+        // Suspended: a `run` that throws while building its effect is a failure, not a defect of the caller.
+        return Effect.suspend(() => def.run(values as never)).pipe(
+          Effect.timeoutOrElse({
+            duration: ACTION_TIMEOUT_MS,
+            orElse: () => Effect.fail(new ActionError({ message: `${def.label} did not finish within ${ACTION_TIMEOUT_MS / 1000} s` }))
+          }),
+          Effect.map((outcome): ActionRunResult => {
+            const say = (outcome as ActionOutcome | undefined)?.say
+            return say !== undefined ? { ok: true, say } : { ok: true }
+          }),
+          Effect.catch((error) => refuse("failed", error.message)),
+          Effect.catchDefect((defect) => refuse("failed", `${def.label} crashed: ${String(defect)}`))
+        )
+      })
+  }
+
+  const view = (): HostView => ({
+    modules: entries.map((e) => ({
+      id: e.def.id,
+      name: e.def.name,
+      kind: e.def.kind ?? "capability",
+      state: stateOf(e).state,
+      ...(e.def.version !== undefined ? { version: e.def.version } : {}),
+      ...(e.unavailable !== undefined ? { unavailable: e.unavailable.reason } : {})
+    })),
+    vaultLocked: options.view?.vaultLocked?.(),
+    engine: options.view?.engine?.(),
+    devices: options.view?.devices?.() ?? [],
+    home: options.view?.home?.() ?? {}
+  })
+
+  const service = <T>(key: ServiceKey<T>, lookup: { readonly assistantId?: string } = {}): T | undefined => {
+    for (const entry of entries) {
+      const provided = instanceUsedBy(entry, lookup.assistantId)?.running?.services
+      if (provided?.has(key.id) === true) return provided.get(key.id) as T
+    }
+    return undefined
+  }
+
+  /** Restarts asked for and not yet started (one per instance; repeated requests count once). */
+  const pendingRestarts = new Set<Instance>()
+
+  /** Start `rec` again with its settings; publish it and retire the old one, or keep the old one and say why. */
+  const restartInstance = (entry: Entry, rec: Instance, generation: number, reason: string): Effect.Effect<HostResult> =>
+    Effect.gen(function*() {
+      const old = rec.running
+      if (old === undefined || old.generation !== generation || entry.instances.get(rec.key) !== rec) return OK
+      const group = groupsOf(entry).find((g) => g.key === rec.key)
+      if (group === undefined || group.resolved.value === undefined) return OK
+      yield* Effect.logInfo(`Module ${entry.def.id} is being started again: ${reason}`)
+      const failed = (message: string): HostResult => {
+        entry.restartError = message
+        notify(entry)
+        return failure("module_start_failed", message, { moduleId: entry.def.id })
+      }
+      return yield* startInstance(entry, rec, group.resolved.value, (result): Effect.Effect<HostResult> => {
+        if (!result.ok) return Effect.succeed(failed(result.message))
+        if (entry.instances.get(rec.key) !== rec || rec.running !== old) return Effect.as(Scope.close(result.running.scope, Exit.void), OK)
+        const clash = publish(entry, [[rec, result.running]])
+        if (clash !== undefined) return Effect.as(Scope.close(result.running.scope, Exit.void), failed(clash))
+        rec.status = result.status
+        entry.restartError = undefined
+        notify(entry)
+        return Effect.as(retire(entry, old), OK)
+      })
+    })
+
+  /** Wait (up to 10 s) for the module's other operation to end, then restart. */
+  const restartWhenFree = (entry: Entry, rec: Instance, generation: number, reason: string, attempt: number): Effect.Effect<void> =>
+    Effect.suspend(() => {
+      if (!entry.busy) return Effect.asVoid(exclusive(entry.def.id, (e) => restartInstance(e, rec, generation, reason)))
+      if (attempt >= 40) return Effect.logWarning(`Module ${entry.def.id} asked to be started again, but it stayed busy; not restarted`)
+      return Effect.andThen(Effect.sleep(250), restartWhenFree(entry, rec, generation, reason, attempt + 1))
+    })
+
+  const requestRestart = (entry: Entry, rec: Instance, generation: number, reason: string): Effect.Effect<void> =>
+    Effect.suspend(() => {
+      if (rec.running?.generation !== generation || pendingRestarts.has(rec)) return Effect.void
+      pendingRestarts.add(rec)
+      const work = restartWhenFree(entry, rec, generation, reason, 0).pipe(Effect.ensuring(Effect.sync(() => pendingRestarts.delete(rec))))
+      return Effect.asVoid(Effect.forkIn(work, hostScope))
+    })
+
+  /**
+   * The context members of a version 2 module's instance (`ModuleServicesV2`). A later PR adds its member here, one
+   * line, and its field in `ModuleServicesV2`.
+   */
+  function servicesFor(entry: Entry, rec: Instance, generation: number, provided: Map<string, unknown>): ModuleServicesV2 {
+    return {
+      host: {
+        view,
+        actions,
+        requestRestart: (reason) => requestRestart(entry, rec, generation, reason),
+        services: {
+          provide: (key, value) => {
+            provided.set(key.id, value)
+            return () => {
+              if (provided.get(key.id) === value) provided.delete(key.id)
+            }
+          },
+          get: service
+        }
+      }
+    }
+  }
+
+  for (const entry of entries) issues.set(`module:${entry.def.id}`, moduleIssues(entry))
+  if (entries.some((e) => e.unavailable !== undefined)) rebuild()
+
   const settingOptions = (id: string): Readonly<Record<string, ReadonlyArray<ChoiceOption>>> | undefined => {
     const entry = byId.get(id)
     const instance = entry === undefined ? undefined : mainOf(entry)?.running?.instance
@@ -1014,6 +1491,12 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
   }
 
   return {
+    issues,
+    recheck,
+    checkHealth,
+    actions,
+    view,
+    service,
     fieldAction,
     settingOptions,
     setSecrets,

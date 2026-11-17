@@ -18,6 +18,7 @@ import { makeModelAgent } from "./ModelAgent.ts"
 import { armAgent, initialRouterState, type RouteDecision, type Router, type RouterState, setActiveAgent } from "./Routing.ts"
 import { AudioInput, AudioOutput, Llm, Stt, Tts, type TtsAudio } from "./Services.ts"
 import { ToolRegistry } from "./ToolRegistry.ts"
+import { CurrentTurn, makeTurnContext, type TurnContext } from "./TurnContext.ts"
 import { CurrentTurnTrace, type Trace, TurnTrace, type TurnOutcome } from "./TurnTrace.ts"
 import { ACTION_TIMEOUT_MS, ActionError, type ActionOutcome, actionToolName, type RegisteredAction } from "./Actions.ts"
 import { confirmationQuestion, describeProposal } from "./Decision.ts"
@@ -527,11 +528,29 @@ export const makeConversationWithSetup = Effect.fnUntraced(function*(options: Co
   return yield* makeConversationCore(
     {
       ...options,
-      setup: Effect.map(options.setup, (s): AgentTurnSetup => ({ system: s.system, registry: s.registry, agents: agentsFor(s.registry, s.llm ?? defaultLlm), ...(s.tts !== undefined ? { tts: s.tts } : {}), ...(s.maxToolRounds !== undefined ? { maxToolRounds: s.maxToolRounds } : {}), ...(s.ttsReady !== undefined ? { ttsReady: s.ttsReady } : {}) }))
+      setup: Effect.map(options.setup, (s): AgentTurnSetup => ({ system: s.system, registry: s.registry, agents: agentsFor(s.registry, s.llm ?? defaultLlm), ...(s.tts !== undefined ? { tts: s.tts } : {}), ...(s.maxToolRounds !== undefined ? { maxToolRounds: s.maxToolRounds } : {}), ...(s.ttsReady !== undefined ? { ttsReady: s.ttsReady } : {}), ...(s.turnContext !== undefined ? { turnContext: s.turnContext } : {}) }))
     },
     true
   )
 })
+
+/**
+ * The turn's context (`CurrentTurn`) when its setup names its origin (serve mode), else `undefined`: nothing is
+ * provided and tools read `undefined` (the CLI modes).
+ */
+const turnContextOf = (
+  setup: TurnSetup | undefined,
+  trace: Trace,
+  conversationId: string,
+  source: "voice" | "text" = trace.mode
+): TurnContext | undefined =>
+  setup?.turnContext === undefined ? undefined : makeTurnContext({ turnId: trace.id, conversationId, source }, setup.turnContext)
+
+const withCurrentTurn = <A, E, R>(effect: Effect.Effect<A, E, R>, turn: TurnContext | undefined): Effect.Effect<A, E, R> =>
+  turn === undefined ? effect : Effect.provideService(effect, CurrentTurn, turn)
+
+const withCurrentTurnStream = <A, E, R>(stream: Stream.Stream<A, E, R>, turn: TurnContext | undefined): Stream.Stream<A, E, R> =>
+  turn === undefined ? stream : Stream.provideService(stream, CurrentTurn, turn)
 
 /** A conversation answered by agents, routed per turn (docs/AGENTS-AND-INTENTS.md §1.3). */
 export const makeAgentConversation = (options: AgentConversationOptions) => makeConversationCore(options, false)
@@ -725,7 +744,7 @@ const makeConversationCore = Effect.fnUntraced(function*(options: AgentConversat
    * to the turn (its speech interrupted, its consumer gone) cancels it half-way; the 5 s limit; its
    * outcome kept in `record`, emitted, and written into history even after the turn has ended.
    */
-  const startConfirmed = (entry: PendingEntry, trace: Trace, describe: string): Effect.Effect<ActionRecord> =>
+  const startConfirmed = (entry: PendingEntry, trace: Trace, describe: string, setup: AgentTurnSetup | undefined): Effect.Effect<ActionRecord> =>
     Effect.gen(function*() {
       const action = entry.intent.action
       const def = action.definition
@@ -736,11 +755,14 @@ const makeConversationCore = Effect.fnUntraced(function*(options: AgentConversat
       tt.mark(trace, "actionStarted")
       emit({ _tag: "ActionStarted", turnId, callId, actionId: action.id, label: def.label, params })
       const start = tt.now()
-      const work = Effect.suspend(() => def.run(params as never)).pipe(
-        Effect.timeoutOrElse({
-          duration: ACTION_TIMEOUT_MS,
-          orElse: () => Effect.fail(new ActionError({ message: `${def.label} did not finish within ${ACTION_TIMEOUT_MS / 1000} seconds.` }))
-        })
+      const work = withCurrentTurn(
+        Effect.suspend(() => def.run(params as never)).pipe(
+          Effect.timeoutOrElse({
+            duration: ACTION_TIMEOUT_MS,
+            orElse: () => Effect.fail(new ActionError({ message: `${def.label} did not finish within ${ACTION_TIMEOUT_MS / 1000} seconds.` }))
+          })
+        ),
+        turnContextOf(setup, trace, conversationId)
       )
       record.fiber = yield* Effect.forkDetach(Effect.interruptible(work).pipe(
         Effect.exit,
@@ -804,7 +826,7 @@ const makeConversationCore = Effect.fnUntraced(function*(options: AgentConversat
       if (pendingIntents.current(now) !== entry) return drop(now >= entry.until ? "lapsed" : "unavailable")
       const consumed = consumeConfirmation(pendingIntents, entry, { turnId: trace.id, now, actions: setup.agents.actions ?? [] })
       if (consumed === undefined) return drop("unavailable")
-      answer.resolution = { kind: "ran", entry, record: yield* startConfirmed(entry, trace, describe) }
+      answer.resolution = { kind: "ran", entry, record: yield* startConfirmed(entry, trace, describe, plan.setup) }
     }))
 
   const armFor = (set: AgentSet | undefined, agentId: string) =>
@@ -1030,8 +1052,10 @@ const makeConversationCore = Effect.fnUntraced(function*(options: AgentConversat
       const decision = plan.decision!
       const set = setup.agents
       const maxToolRounds = setup.maxToolRounds ?? set.maxToolRounds ?? options.maxToolRounds ?? 5
+      // Every tool call and action run of the turn (and every fiber its agent forks) sees the turn (`CurrentTurn`).
+      const current = turnContextOf(setup, trace, ctx.conversationId, ctx.source)
 
-      return Stream.unwrap(Effect.map(setup.registry.context, (context) => {
+      return withCurrentTurnStream(Stream.unwrap(Effect.map(setup.registry.context, (context) => {
         /**
          * Record THE proposal of this turn (review round 6); false when one exists already. A proposal
          * whose question cannot state the values is REFUSED (round 7): the reason is returned, nothing
@@ -1183,7 +1207,7 @@ const makeConversationCore = Effect.fnUntraced(function*(options: AgentConversat
 
         const head = plan.notice === undefined ? Stream.empty : unrecorded(turnId, plan.notice, true, log)
         return head.pipe(Stream.concat(run(plan.agent!, 0)))
-      }))
+      })), current)
     })
 
   // -------------------------------------------------------------------------
