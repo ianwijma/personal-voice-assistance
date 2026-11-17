@@ -118,6 +118,28 @@ const start = async (
   })
 }
 
+/** A fake TypeSafe (`/v1/systemone`) that picks Alpha after `delayMs`, and the `start` options that route by it. */
+const slowTypeSafe = async (delayMs: number) => {
+  const jev = Http.createServer((req, res) => {
+    req.resume()
+    req.on("end", () => setTimeout(() => {
+      res.writeHead(200, { "content-type": "application/json" })
+      res.end(JSON.stringify({ model: "jev-1", answers: { assistant: { type: "choice", choice: "alpha", confidence: 0.9, probabilities: { alpha: 0.9, bravo: 0.1 } }, fits: { type: "noul", noul: 0.9 } }, usage: { input_tokens: 1, output_tokens: 1 } }))
+    }, delayMs))
+  })
+  await new Promise<void>((resolve) => jev.listen(0, "127.0.0.1", resolve))
+  return {
+    options: {
+      env: { TYPESAFE_ROUTING: "true", TYPESAFE_API_KEY: "ts-test-key", TYPESAFE_BASE_URL: `http://127.0.0.1:${(jev.address() as AddressInfo).port}` },
+      withoutPhrase: { mode: "typesafe", fallback: "alpha", giveUpMs: 2_000 }
+    },
+    close: () => {
+      jev.closeAllConnections()
+      jev.close()
+    }
+  }
+}
+
 const connect = async (deviceId?: string) => {
   const client = await ScriptedClient.connect({ url: server!.url, ...(deviceId !== undefined ? { deviceId } : {}) })
   clients.push(client)
@@ -268,21 +290,10 @@ describe("serve: one recogniser per device, from its hearer (WP-11)", () => {
 
   it("a start the old stream stamped but never delivered (dispatch busy with a routing call) gives the next stream's utterance no times", async () => {
     // TypeSafe answers after 400 ms: the final below keeps the session's dispatch busy while the next start comes in.
-    const jev = Http.createServer((req, res) => {
-      req.resume()
-      req.on("end", () => setTimeout(() => {
-        res.writeHead(200, { "content-type": "application/json" })
-        res.end(JSON.stringify({ model: "jev-1", answers: { assistant: { type: "choice", choice: "alpha", confidence: 0.9, probabilities: { alpha: 0.9, bravo: 0.1 } }, fits: { type: "noul", noul: 0.9 } }, usage: { input_tokens: 1, output_tokens: 1 } }))
-      }, 400))
-    })
-    await new Promise<void>((resolve) => jev.listen(0, "127.0.0.1", resolve))
+    const jev = await slowTypeSafe(400)
     try {
       const fake = fakeRecognisers()
-      await start(fake, {
-        hearerSwitchWaitMs: 300,
-        env: { TYPESAFE_ROUTING: "true", TYPESAFE_API_KEY: "ts-test-key", TYPESAFE_BASE_URL: `http://127.0.0.1:${(jev.address() as AddressInfo).port}` },
-        withoutPhrase: { mode: "typesafe", fallback: "alpha", giveUpMs: 2_000 }
-      })
+      await start(fake, { hearerSwitchWaitMs: 300, ...jev.options })
       const admin = await connect()
       await admin.admin(TEST_ADMIN_PASSWORD)
       const client = await device("device-a")
@@ -310,7 +321,43 @@ describe("serve: one recogniser per device, from its hearer (WP-11)", () => {
       expect(startedAt).toBeGreaterThan(-800)
       expect(firstInterimAt).toBeGreaterThanOrEqual(startedAt + 50)
     } finally {
-      jev.closeAllConnections()
+      jev.close()
+    }
+  })
+
+  it("an engine reload while a final awaits TypeSafe closes that utterance: the next one (by its phrase) gets its own start", async () => {
+    const jev = await slowTypeSafe(600)
+    try {
+      const fake = fakeRecognisers()
+      await start(fake, jev.options)
+      const admin = await connect()
+      await admin.admin(TEST_ADMIN_PASSWORD)
+      const client = await device("device-a")
+      await until("device-a hearing", () => streamOf(fake, "device-a") !== undefined)
+      const old = streamOf(fake, "device-a")!
+      fake.emit(old, { _tag: "SpeechStarted" }, { _tag: "EndOfTurn", text: "what is the weather" })
+      await sleep(50)
+      // While the routing call is pending: nobody answers without a phrase now, and the engines reload.
+      await saveOwn("device-a", { withoutPhrase: { mode: "nobody" } })
+      expect((await Effect.runPromise(server!.handle.engine.reload)).ok).toBe(true)
+      await until("a new stream", () => streamOf(fake, "device-a") !== undefined && streamOf(fake, "device-a") !== old, 5_000)
+      await sleep(800)
+      const from = client.messages.length
+      const adminFrom = admin.messages.length
+      const now = streamOf(fake, "device-a")!
+      fake.emit(now, { _tag: "SpeechStarted" })
+      await sleep(100)
+      fake.emit(now, { _tag: "Interim", text: "hey alpha what time" }, { _tag: "EndOfTurn", text: "hey alpha what time is it" })
+      const begun = await client.waitFor("turn.start", () => true, { from, timeoutMs: 10_000 })
+      expect(begun).toMatchObject({ assistantId: "alpha" })
+      const trace = (await admin.waitFor("trace", (m) => m.trace.turnId === begun.turnId, { from: adminFrom, timeoutMs: 10_000 })).trace
+      expect(trace.route).toMatchObject({ by: "phrase" })
+      const line = trace.timeline!
+      const startedAt = line.find((x) => x.name === "speechStarted")!.at
+      // Its own start (~100 ms before its end), not the reloaded-away utterance's (well over 800 ms before).
+      expect(startedAt).toBeGreaterThan(-400)
+      expect(line.find((x) => x.name === "firstInterim")!.at).toBeGreaterThanOrEqual(startedAt + 50)
+    } finally {
       jev.close()
     }
   })

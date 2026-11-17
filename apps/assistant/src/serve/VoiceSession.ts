@@ -839,19 +839,27 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
       holderCheck()
     }
 
+    /**
+     * After the route gate was flushed: an utterance the dispatcher still has open is closed there directly (it starts
+     * nothing). That happens when the stream or loop was stopped while a final was still being dispatched (a TypeSafe
+     * call): the route gate had closed that utterance already, so its flush forwards nothing, and the dispatcher would
+     * treat the next `SpeechStarted` as a repeat and hand the next utterance this one's start and times. Only called
+     * once the recogniser loop that delivered the utterance has ended (no turn of it is being delivered); with nothing
+     * open it does nothing.
+     */
+    const closeDispatcherUtterance = Effect.suspend(() => {
+      if (!dispatcher.hasOpen()) return Effect.void
+      utteranceDropped()
+      return dispatcher.dispatch({ events: [{ _tag: "EndOfTurn", text: "" }] })
+    })
+
     /** Closes an utterance the previous stream left open (it starts nothing). */
     const closeOpenUtterance = Effect.suspend(() => {
-      if (!utteranceOpen) {
-        // The stream was stopped while its final was still being dispatched (a TypeSafe call): the dispatcher has that
-        // utterance open still, and would hand the next one its start. It is closed there (it starts nothing).
-        if (!dispatcher.hasOpen()) return Effect.void
-        utteranceDropped()
-        return dispatcher.dispatch({ events: [{ _tag: "EndOfTurn", text: "" }] })
-      }
+      if (!utteranceOpen) return closeDispatcherUtterance
       utteranceOpen = false
       utteranceDropped()
       heard.discard()
-      return dispatcher.dispatch(route.filter({ _tag: "EndOfTurn", text: "" }, now()))
+      return Effect.andThen(dispatcher.dispatch(route.filter({ _tag: "EndOfTurn", text: "" }, now())), closeDispatcherUtterance)
     })
 
     const sameHearing = (a: Hearing, b: Hearing) => a.kind === b.kind && (a.kind !== "ready" || (b.kind === "ready" && a.id === b.id))
@@ -920,6 +928,8 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
             utteranceOpen = false
             utteranceDropped()
             yield* dispatcher.dispatch(route.filter({ _tag: "EndOfTurn", text: "" }, now()))
+            // The previous run was interrupted (the engine stops every loop before a new build starts them).
+            yield* closeDispatcherUtterance
           }
           failedId = undefined
           const builtStt = built.providers.stt
