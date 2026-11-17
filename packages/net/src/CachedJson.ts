@@ -171,6 +171,27 @@ const untilAborted = <A, E>(effect: Effect.Effect<A, E>, signal: AbortSignal | u
 }
 
 /**
+ * The identity of the resource a URL names, for binding a validator to it: the URL as the WHATWG parser serialises it (lower-case
+ * scheme and host, no default port, dot segments resolved, `/` for a bare origin) without its fragment, which is never sent. Two
+ * spellings of one resource have the same identity (review round 4, finding 2); a string that is not a URL has none.
+ */
+const resourceIdentity = (url: string): string | undefined => {
+  try {
+    const parsed = new URL(url)
+    parsed.hash = ""
+    return parsed.href
+  } catch {
+    return undefined
+  }
+}
+
+const sameResource = (a: string | undefined, b: string | undefined): boolean => {
+  if (a === undefined || b === undefined) return false
+  const x = resourceIdentity(a)
+  return x !== undefined && x === resourceIdentity(b)
+}
+
+/**
  * A GET of JSON behind `safeFetch` (response type JSON only), cached: served from the cache within the TTL; after it, revalidated
  * with `If-None-Match` when the server gave an ETag (a 304 renews the entry without a body); when the refresh fails, the old value is
  * served for up to `staleIfErrorMs` more, its age taken when the failure is known. The key is the URL with the request headers
@@ -192,8 +213,8 @@ export const makeCachedJson = (deps: CachedJsonDeps = {}): CachedJson => {
       const entry = cache.get(key)
       const { signal: _signal, ...limits } = options.fetch ?? {}
       // A validator belongs to the resource it came from (review round 3, finding 1): it is sent only when this request goes to the
-      // URL the cached body came from, and `safeFetch` drops it on any redirect, so it never reaches another resource.
-      const validator = entry?.etag !== undefined && entry.url === url ? entry.etag : undefined
+      // URL the cached body came from (compared as resource identities: review round 4, finding 2), and `safeFetch` drops it on any redirect, so it never reaches another resource.
+      const validator = entry?.etag !== undefined && sameResource(entry.url, url) ? entry.etag : undefined
       const ask = (conditional: boolean) => {
         const sent: Record<string, string> = { ...headers }
         if (conditional && validator !== undefined) sent["if-none-match"] = validator
@@ -203,7 +224,7 @@ export const makeCachedJson = (deps: CachedJsonDeps = {}): CachedJson => {
       if (response.status === 304) {
         // A revalidation only when the 304 answers the conditional request for the cached body's own URL; any other 304 (a redirect
         // that ended elsewhere, a server that answers 304 unasked) says nothing about the cached value: ask again without conditions.
-        if (entry !== undefined && validator !== undefined && response.url === entry.url && response.redirects.length === 0) {
+        if (entry !== undefined && validator !== undefined && sameResource(response.url, entry.url) && response.redirects.length === 0) {
           const etag = response.headers["etag"] ?? entry.etag
           cache.setIfNewer(key, { value: entry.value, ...(etag !== undefined ? { etag } : {}), url: entry.url, storedAt: now(), sequence })
           return { kind: "value", value: entry.value, ageMs: 0, source: "revalidated" } satisfies Outcome

@@ -365,9 +365,19 @@ const prefixOf = async (raw: AsyncGenerator<Uint8Array>, n: number): Promise<{ h
 /**
  * Decompress as the chunks arrive and count the decompressed bytes against `limit`, so a small compressed body cannot expand past it
  * (review round 1, finding 3). Compressed bytes are counted too.
+ *
+ * A failure of the decompressor (an invalid stream, too many decompressed bytes) ends the read at once: the pending read of the raw
+ * body is abandoned and the body closed, and the caller gets that failure, not whatever a later deadline would say (review round 4,
+ * finding 1). The connection itself is closed by `fetchChecked`, which aborts the request's signal when `run` settles.
+ *
+ * Deflate (zlib) and brotli are single streams: bytes after the end of the stream are refused (rule `content-encoding`), not ignored
+ * (review round 4, finding 3). Gzip may be several members one after the other (RFC 1952 §2.2); bytes after the last member that are
+ * not another member are refused by the decompressor itself.
  */
 const decodeBody = async (encoding: Exclude<Encoding, "identity">, body: AsyncIterable<Uint8Array>, limit: number, url: string, signal: AbortSignal): Promise<Array<Uint8Array>> => {
-  const raw = rawChunks(body, limit, url, signal)
+  // Aborted when the decompressor fails, so a raw read that is waiting for bytes that may never come gives up at once.
+  const stop = new AbortController()
+  const raw = rawChunks(body, limit, url, AbortSignal.any([signal, stop.signal]))
   // The first two bytes, whatever the chunk boundaries: for deflate they must be a zlib header.
   const prefix = await prefixOf(raw, 2)
   // No bytes at all: an empty body, whatever the header says (servers label empty answers too).
@@ -381,30 +391,38 @@ const decodeBody = async (encoding: Exclude<Encoding, "identity">, body: AsyncIt
     encoding === "gzip" ? zlib.createGunzip() : encoding === "br" ? zlib.createBrotliDecompress() : zlib.createInflate()
   const out: Array<Uint8Array> = []
   let total = 0
-  let failure: unknown
+  let written = 0
+  // The decompressor's own failure: too many bytes out, or an invalid stream.
+  let decoderFailure: unknown
+  let otherFailure: unknown
+  const fail = (e: unknown) => {
+    decoderFailure ??= e
+    stream.destroy()
+    stop.abort(e)
+  }
   const done = new Promise<void>((resolve) => {
     stream.on("data", (chunk: Buffer) => {
       total += chunk.byteLength
       if (total > limit) {
-        failure ??= new NetTooLarge({ url, limit })
-        stream.destroy()
+        fail(new NetTooLarge({ url, limit }))
         resolve()
         return
       }
       out.push(new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength))
     })
-    stream.on("error", (e) => { failure ??= e; resolve() })
+    stream.on("error", (e) => { fail(e); resolve() })
     stream.on("end", () => resolve())
     stream.on("close", () => resolve())
   })
-  const onAbort = () => { failure ??= signal.reason; stream.destroy() }
+  const onAbort = () => { otherFailure ??= signal.reason; stream.destroy() }
   signal.addEventListener("abort", onAbort, { once: true })
   try {
     for (let k = 0; ; k++) {
       const next: IteratorResult<Uint8Array> = first ?? (prefix.done && k > 0 ? { done: true, value: undefined } : await raw.next())
       first = undefined
-      if (failure !== undefined) break
+      if (decoderFailure !== undefined || otherFailure !== undefined) break
       if (next.done === true) { stream.end(); break }
+      written += next.value.byteLength
       // Respect back-pressure, so a stalled consumer cannot make the decompressor buffer without bound. Whichever of drain and close
       // comes first removes the other's listener, so repeated waits do not pile up listeners (review round 3, finding 6).
       if (!stream.write(next.value)) {
@@ -418,16 +436,23 @@ const decodeBody = async (encoding: Exclude<Encoding, "identity">, body: AsyncIt
     }
     await done
   } catch (e) {
-    failure ??= e
+    // The raw read failed: too many raw bytes, the request's signal, or `stop` (then the decoder's failure is already recorded).
+    otherFailure ??= e
     stream.destroy()
   } finally {
     signal.removeEventListener("abort", onAbort)
     void raw.return(undefined).catch(() => undefined)
   }
-  if (failure !== undefined) {
-    if (failure instanceof NetTooLarge || signal.aborted) throw failure
-    if (encoding === "deflate") throw refuse("content-encoding", url, `The deflate body is not a valid zlib stream: ${failure instanceof Error ? failure.message : String(failure)}`)
-    throw new NetFailure({ url, stage: "response", detail: `The ${encoding} body could not be decompressed: ${failure instanceof Error ? failure.message : String(failure)}` })
+  if (decoderFailure !== undefined) {
+    if (decoderFailure instanceof NetTooLarge) throw decoderFailure
+    const detail = decoderFailure instanceof Error ? decoderFailure.message : String(decoderFailure)
+    if (encoding === "deflate") throw refuse("content-encoding", url, `The deflate body is not a valid zlib stream: ${detail}`)
+    throw new NetFailure({ url, stage: "response", detail: `The ${encoding} body could not be decompressed: ${detail}` })
+  }
+  if (otherFailure !== undefined) throw otherFailure
+  // A single-stream encoding that stopped before the last byte it was given: the rest is not part of the stream.
+  if (encoding !== "gzip" && stream.bytesWritten < written) {
+    throw refuse("content-encoding", url, `The ${encoding} body has ${written - stream.bytesWritten} bytes after the end of its stream`)
   }
   return out
 }
