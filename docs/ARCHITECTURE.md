@@ -400,13 +400,17 @@ packages/
                     login, off by default with an opt-in; the subprocess environment is an allowlist
   language/         `@pva/language`: English and Dutch parsing and speaking helpers for modules, pure and local (no model, no network):
                     time of day (the "half" rules), dates and date-times, quantities with units and conversion, speakable numbers, amounts,
-                    durations, clock times, dates and lists, RFC 5545 recurrence (build, describe, next occurrence through `ical.js`,
-                    daylight-saving safe); a phrase it cannot fully account for is `not-understood`, never partly read; re-exports
-                    core's `parseDuration`; README in the package
+                    durations, clock times, dates and lists, and recurrence for a closed set of RFC 5545 rule shapes (build, describe,
+                    next occurrence with its own date arithmetic, daylight-saving safe; `parseRRule` / `readSeries` answer `unsupported`
+                    for anything else). Each parser is a closed grammar over a phrase of its kind alone: every token must be read by
+                    the grammar, so a negation, a bound, an alternative, a time zone or title text makes it `not-understood`; callers
+                    pass the time phrase on its own (a tool parameter, a typed slot), there is no span to cut out of a sentence;
+                    re-exports core's `parseDuration`; README in the package
   net/              `@pva/net`: `safeFetch` for URLs a model or user chose (a required content-type policy, resolves the host itself,
                     refuses non-public addresses on every hop by the IANA registries, connects to the checked address, checked request
-                    headers, size limit after decompression, time limit), a cached JSON GET (key with the request headers, shared
-                    in-flight requests, TTL, ETag, stale-if-error) and the outgoing `User-Agent` from the household API contact
+                    headers, size limit after decompression, time limit; `makeNodeConnector({ ca })` for an owner's own CA), a cached JSON GET
+                    (key with the request headers, shared in-flight requests, refreshes ordered by the cache's sequence, TTL, ETag,
+                    stale-if-error) and the outgoing `User-Agent` from the household API contact
                     (`HOME_API_CONTACT`); README in the package
   modules-builtin/  first modules (defineModule): clock (context + tool), weather (Open-Meteo HTTP lookup, speculative-safe)
   module-home-assistant/ lights by room through the owner's Home Assistant (REST, actions); in the app's catalog since WP-12c

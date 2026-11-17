@@ -205,7 +205,7 @@ vault for secrets.
 
 | Page (mock-up) | Section and keys |
 |---|---|
-| Home | new section `home`: `HOME_LOCATION` (text ≤ 200), `HOME_TIME_ZONE` (IANA, empty = this machine's), `HOME_LANGUAGE` (BCP 47: en-GB, en-US, nl-NL, de-DE), `HOME_UNITS` (metric \| imperial), `HOME_DATE_FORMAT` (en-GB \| en-US \| nl-NL), `HOME_CURRENCY` (ISO 4217, default EUR), `HOME_CUP_SIZE` (metric 250 ml \| us 236.6 ml), `HOME_API_CONTACT` (text ≤ 200, no default; goes in the `User-Agent` of public API calls, see `@pva/net`) |
+| Home | new section `home`: `HOME_LOCATION` (text ≤ 200), `HOME_TIME_ZONE` (IANA name, not an offset; empty = this machine's), `HOME_LANGUAGE` (BCP 47: en-GB, en-US, nl-NL, de-DE), `HOME_UNITS` (metric \| imperial), `HOME_DATE_FORMAT` (en-GB \| en-US \| nl-NL), `HOME_CURRENCY` (three capital letters, the ISO 4217 code meant; any such code is accepted; default EUR), `HOME_CUP_SIZE` (metric 250 ml \| us 236.6 ml), `HOME_API_CONTACT` (text ≤ 200, no default; goes in the `User-Agent` of public API calls, see `@pva/net`) |
 | Modules | each module's settings in `modules[id].settings`, through `module.configure` (unchanged message) |
 | Language model accounts | `anthropic`: ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL · `claude-subscription`: the agent module's optIn, claudePath, proxy, debugLogs · `openrouter`: its module's key · `home-model`: its module's address and key |
 | Routing | new section `routing`: `TYPESAFE_API_KEY` (secret), `TYPESAFE_MODEL` (default `jev-1.14.0`, shown pinned), `TYPESAFE_BASE_URL` (advanced) |

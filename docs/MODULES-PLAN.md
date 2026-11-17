@@ -558,7 +558,7 @@ pins them in the workspace catalogue. Versions are the latest that pass `pnpm ch
 
 | Package | Libraries |
 |---|---|
-| `language` (P2) | `ical.js`; `chrono-node` only if its results pass the tests in both languages |
+| `language` (P2) | none: recurrence is a closed set of rule shapes expanded with its own date arithmetic (review round 2); `chrono-node` was not taken |
 | `net` (P2) | `ipaddr.js`, `undici` |
 | `store-sqlite` (P4) | `@effect/sql-sqlite-node` |
 | core, for presentation (P10) | `sharp` |
