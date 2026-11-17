@@ -188,6 +188,10 @@ DeviceSettings = Struct({
                                                 //   quietRoom, defaultPerson: PersonId | null }; built-in shared, nobody's
   capabilities: CapabilityOverrides             // protocol 11 (P5): { noDisplay, excludeKinds, noSpeaker }: can only take away what it declares
 })
+// P5 round 2: saving a change of place.privacy, place.defaultPerson or any capabilities override (the device's, or its
+// type's where it follows them), forgetting a connected device, or removing a person from Members ends the session of
+// each device it affects (every device for Members): its connections close with CloseCode.settingsChanged and its
+// pages reconnect to a new session. Room, name, alwaysOn, acceptsFromOthers and quietRoom do not end it.
 DeviceOwn = Partial(DeviceSettings)             // each key present = own value; absent = follows the type defaults
 
 DeviceRecord (stored) = { kind: DeviceKind, name: DeviceName, firstSeen, lastSeen, own: DeviceOwn,
@@ -727,7 +731,9 @@ the Voice tab saves through `assistant.save`.
 nothing in it changes meaning (a type entry without `place` or `capabilities` reads as the built-in's; a device's own
 sections never had them), the original is kept as `settings.json.v4-backup`, and version 5 is written at once with the
 same revision (the CLI modes migrate in memory). A file of a newer version than the assistant reads stops the start
-(serve and the CLI modes), and is left untouched: never set aside, never overwritten. An assistant from before P5
+(serve and the CLI modes), and is left untouched: never set aside, never overwritten. The check runs before anything
+is written to the data directory (no leftover tidied, no unfinished save recovered, nothing migrated), and covers both
+sides of an unfinished save's journal as well as `settings.json` itself. An assistant from before P5
 cannot refuse a version-5 file the same way (it does not know the rule): it sets the file aside as
 `settings.json.corrupt-<time>` (kept, not changed) and starts from the defaults. To go back to such a build, stop the
 server and copy `settings.json.v4-backup` over `settings.json` first.

@@ -22,7 +22,12 @@ const noVault = () => ({
   devices: {
     devices: () => [],
     seen: () => Effect.void,
-    left: () => {}
+    left: () => {},
+    // P5: every message is numbered on arrival.
+    arrival: (() => {
+      let n = 0
+      return () => ++n
+    })()
   } as never
 })
 
@@ -184,5 +189,53 @@ describe("SessionHub: typed input", () => {
     t.say(1)
     expect(t.results()[0]?.error?.code).toBe("engine_failed")
     expect(t.sent).toEqual([])
+  })
+})
+
+describe("SessionHub: device.caps is bounded before the registry (P5, round-1 item 8)", () => {
+  it("400 alternating declarations from one tab reach the registry a bounded number of times, each with its number of arrival", async () => {
+    const declared: Array<{ readonly seq: number | undefined; readonly at: number }> = []
+    let n = 0
+    const registry = {
+      devices: () => [],
+      seen: () => Effect.void,
+      left: () => {},
+      known: () => true,
+      nameOf: () => undefined,
+      kindOfDevice: () => "web-voice",
+      declaredOf: () => undefined,
+      arrival: () => ++n,
+      declare: (_id: string, _caps: unknown, seq?: number) => {
+        declared.push({ seq, at: performance.now() })
+        return true
+      },
+      persist: Effect.void
+    }
+    const hub = makeSessionHub({
+      engine: { status: () => ({ state: "ready", problems: [], reloadPending: false, reloadPendingFor: [], engines: [], voices: [] }) } as never,
+      host: { modules: () => [] } as never,
+      sections: { list: () => [] } as never,
+      sessions: fakeSessions(),
+      run: (effect) => void Effect.runFork(effect),
+      onSectionSaved: () => {},
+      server: { name: "test", version: "0" },
+      ...noVault(),
+      devices: registry as never
+    })
+    const handlers = hub.accept({ id: "v1", sendText: () => {}, sendBinary: () => {}, close: () => {}, bufferedAmount: () => 0 })!
+    handlers.onText(encodeClientMessage({ type: "hello", protocol: PROTOCOL_VERSION, clientId: "client-v1-0000", resumeOwner: false, frontend: "voice", device: { id: "flood-dev-01", kind: "web-voice", name: "Tab" } }))
+    const tablet = { v: 1 as const, display: { class: "standard" as const, widthPx: 1024, heightPx: 768, dpr: 1, touch: "coarse" as const, colour: true } }
+    const phone = { ...tablet, display: { ...tablet.display, class: "compact" as const, widthPx: 390 }, openUrl: true }
+    const before = n
+    for (let i = 0; i < 400; i++) handlers.onText(encodeClientMessage({ type: "device.caps", capabilities: i % 2 === 0 ? phone : tablet }))
+    // Every message was numbered as it arrived…
+    expect(n - before).toBe(400)
+    await new Promise((r) => setTimeout(r, 700))
+    // …but the registry saw the first at once and the latest after the interval, nothing in between.
+    expect(declared.length).toBe(2)
+    expect(declared[0]!.seq).toBe(before + 1)
+    expect(declared[1]!.seq).toBe(before + 400)
+    expect(declared[1]!.at - declared[0]!.at).toBeGreaterThanOrEqual(450)
+    handlers.onClose()
   })
 })

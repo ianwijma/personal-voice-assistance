@@ -10,9 +10,10 @@ import {
   type TargetDevice,
   type TurnPerson
 } from "@pva/core"
-import { type DeclaredCapabilities, type DevicePlace, effectiveCapabilities, roomOf } from "@pva/protocol"
+import { boundaryKey, type DeclaredCapabilities, type DevicePlace, effectiveCapabilities, roomOf, speakerAllowedFrom } from "@pva/protocol"
 import { Effect } from "effect"
 import { deviceSettingsFrom } from "./devices.ts"
+import { MEMBERS_KEY, personIdsOf } from "./people.ts"
 import type { SettingsFile } from "./SettingsStore.ts"
 
 /**
@@ -28,7 +29,50 @@ import type { SettingsFile } from "./SettingsStore.ts"
  * been written yet) has no place, so the privacy rule refuses it, its turns have no room or person, and its pages get
  * no person data. A device type's defaults never stand in for such a device. A known device that is offline keeps its
  * saved place.
+ *
+ * **The boundary** (`boundaryIn`, `boundaryChanged`): what decides what a device may be told or sent — its privacy,
+ * its default person (while a member), and its output overrides (`noSpeaker`, `noDisplay`, excluded kinds; its own
+ * over its type's). Serve mode compares it for every connected device and session in the step that commits a
+ * settings change (`SettingsStore.onCommitted`); a device whose boundary changed has its session ended with its
+ * connections (`SessionHub.endSessions`), as has every device when a person leaves Members. Room, name, always-on,
+ * accepts-from-others and quiet-room are not part of it.
  */
+
+/** What decides what a device may be told or sent, in one settings file (see above). */
+export interface Boundary {
+  /** The file has a record of the device (a page without a device, or one not registered yet: `false`). */
+  readonly known: boolean
+  readonly key: string
+}
+
+export const boundaryIn = (file: SettingsFile, deviceId: string | undefined, kind?: string): Boundary => {
+  const known = deviceId !== undefined && file.devices[deviceId] !== undefined
+  const settings = deviceSettingsFrom(file, known ? deviceId : undefined, kind)
+  // Without a record, only the output overrides (its type's) apply: privacy refuses an unknown device anyway.
+  if (!known) return { known: false, key: `unknown|${boundaryKey({ ...settings, place: { ...settings.place, privacy: "public", defaultPerson: null } }, () => false)}` }
+  const members = personIdsOf(file.assistant[MEMBERS_KEY])
+  return { known: true, key: boundaryKey(settings, (id) => members.has(id)) }
+}
+
+/**
+ * Whether a commit from `before` to `after` crosses the device's boundary. A device's first registration (unknown →
+ * known) does not: nothing was sent to it before (its first welcome waits for the record), and an unknown device has
+ * only its type's defaults, which its new record starts from. Being forgotten (known → unknown) does.
+ */
+export const boundaryChanged = (before: SettingsFile, after: SettingsFile, deviceId: string | undefined, kind?: string): boolean => {
+  const b = boundaryIn(before, deviceId, kind)
+  const a = boundaryIn(after, deviceId, kind)
+  if (b.key === a.key) return false
+  return !(!b.known && a.known)
+}
+
+/** A person who was in Members before the commit is not after it: every device's session ends. */
+export const membersRemoved = (before: SettingsFile, after: SettingsFile): boolean => {
+  if (before.assistant[MEMBERS_KEY] === after.assistant[MEMBERS_KEY]) return false
+  const now = personIdsOf(after.assistant[MEMBERS_KEY])
+  for (const id of personIdsOf(before.assistant[MEMBERS_KEY])) if (!now.has(id)) return true
+  return false
+}
 
 export interface DeviceLiveFacts {
   readonly connected: boolean
@@ -41,6 +85,11 @@ export interface DeviceFactsOptions {
   readonly file: () => SettingsFile
   /** The last declaration of a known device (`DeviceRegistry.declaredOf`). */
   readonly declaredOf: (id: string) => DeclaredCapabilities | undefined
+  /**
+   * The latest declaration received from a device, also one whose first registration is not written yet
+   * (`DeviceRegistry.latestOf`). Absent: `declaredOf`.
+   */
+  readonly latestOf?: (id: string) => DeclaredCapabilities | undefined
   /** Last seen of a known device, with the registry's memory folded in (`DeviceRegistry.lastSeenOf`). */
   readonly lastSeenOf?: (id: string) => number | undefined
   /** Live state per device (the hub's connections); absent: nothing is connected. */
@@ -60,15 +109,12 @@ export interface DeviceFacts {
   /** The room and person a turn on this device has (`TurnOrigin`): `how: "device-default"`. */
   readonly originOf: (deviceId: string | undefined) => { readonly room?: string; readonly person?: TurnPerson }
   /**
-   * What decides what a device may be told: its privacy and default person (`undefined`: not a known device). A change
-   * of it is a hard boundary (the hub resets the device's conversations and sends its pages a fresh snapshot).
+   * Whether reply audio may be sent to the device now, from the committed settings and its latest declaration: not
+   * when "Don't use its speaker" is set (its own, else its type's; for a device without a record, or a page without a
+   * device, its type's defaults), nor when its latest declaration has no speaker that plays speech. A device that never
+   * declared anything (a page of an older build) may. Read where audio leaves (every frame), so a cache read.
    */
-  readonly boundaryOf: (deviceId: string) => string | undefined
-  /**
-   * Whether replies may be spoken on the device: not when the owner said "Don't use its speaker", nor when its last
-   * declaration has no speaker. A device that never declared anything (a page of an older build) may.
-   */
-  readonly speakerAllowed: (deviceId: string | undefined) => boolean
+  readonly speakerAllowed: (deviceId: string | undefined, kind?: string) => boolean
   /** Something live changed (a connection, a declaration, visibility): the next read rebuilds the list. */
   readonly changed: () => void
   readonly devices: DevicesService
@@ -87,6 +133,8 @@ export const makeDeviceFacts = (options: DeviceFactsOptions): DeviceFacts => {
     readonly list: ReadonlyArray<KnownDevice>
     readonly byId: ReadonlyMap<string, KnownDevice>
     readonly lines: Map<string, string>
+    /** Per known device: `speakerAllowed`. */
+    readonly speaks: ReadonlyMap<string, boolean>
   }
   let cache: Cache | undefined
 
@@ -120,8 +168,17 @@ export const makeDeviceFacts = (options: DeviceFactsOptions): DeviceFacts => {
         }
       })
       .sort((a, b) => b.lastSeen - a.lastSeen)
-    cache = { file, people, version, list, byId: new Map(list.map((d) => [d.id, d])), lines: new Map() }
+    const speaks = new Map(Object.keys(file.devices).map((id) => [id, speaksIn(file, id, undefined)]))
+    cache = { file, people, version, list, byId: new Map(list.map((d) => [d.id, d])), lines: new Map(), speaks }
     return cache
+  }
+
+  /** `speakerAllowed` in one file (see the interface). */
+  const speaksIn = (file: SettingsFile, deviceId: string | undefined, kind: string | undefined): boolean => {
+    const known = deviceId !== undefined && file.devices[deviceId] !== undefined
+    const settings = deviceSettingsFrom(file, known ? deviceId : undefined, kind)
+    const declared = deviceId === undefined ? undefined : (options.latestOf ?? options.declaredOf)(deviceId) ?? file.devices[deviceId]?.declared
+    return speakerAllowedFrom(settings, declared?.capabilities)
   }
 
   const known = (deviceId: string | undefined): KnownDevice | undefined => (deviceId === undefined ? undefined : current().byId.get(deviceId))
@@ -162,16 +219,10 @@ export const makeDeviceFacts = (options: DeviceFactsOptions): DeviceFacts => {
         ...(self.place.defaultPerson !== null ? { person: { id: self.place.defaultPerson, how: "device-default" } } : {})
       }
     },
-    boundaryOf: (deviceId) => {
-      const place = placeOf(deviceId)
-      return place === undefined ? undefined : `${place.privacy}|${place.defaultPerson ?? ""}`
-    },
-    speakerAllowed: (deviceId) => {
-      const file = options.file()
-      if (deviceId === undefined || file.devices[deviceId] === undefined) return true
-      if (deviceSettingsFrom(file, deviceId).capabilities.noSpeaker) return false
-      const declared = options.declaredOf(deviceId) ?? file.devices[deviceId]?.declared
-      return declared === undefined || declared.capabilities.speaker?.media.includes("speech") === true
+    speakerAllowed: (deviceId, kind) => {
+      const c = current()
+      const cached = deviceId === undefined ? undefined : c.speaks.get(deviceId)
+      return cached ?? speaksIn(c.file, deviceId, kind)
     },
     changed: () => {
       version++

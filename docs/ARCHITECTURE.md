@@ -443,13 +443,16 @@ quotedName(text), plainName(text), QUOTED_NAMES_NOTE (PromptText.ts)          //
 
 - **Members** is a shared settings section of the core (`serve/people.ts`, Shared settings › Members): `HOUSEHOLD_MEMBERS`
   (records: a hidden `id` made by the server, name, aliases, pronunciation, allergies, diets, dislikes; one-line names,
-  unique by `memberNameKey`, `checkMembers` in the protocol, which the mock uses too) and the household diet
+  unique by `memberNameKey`; every field's type and bounds and the rules across records are `checkMembersValue` in the
+  protocol, which the server's section and the mock's save path both run) and the household diet
   `HOUSEHOLD_DIET_ALLERGIES` / `_DIETS` / `_DISLIKES`. `HOUSEHOLD_MEMBERS` is never read from the environment (ids are
   the server's; the environment view says so). **One serialized operation** (`MembersGate`) owns every change to people
   and to the references to them: Members saves (admin, `People.setDiet` with read, check and write in one step
   through `Sections.edit`), the clean-up of the devices and types whose default person was removed (inside the same
   operation), and every device and device type save, whose default person is checked against committed Members inside
-  it. A removed person's stored data stays in the database but reaches no page and no turn (not a member any more);
+  it. Waiting to be admitted can be interrupted; an admitted operation cannot, and the caches People and the privacy
+  rule read (`Sections.value`) belong to the committed settings file, so an interruption before admission changes
+  nothing and one after it changes settings, People and privacy together. A removed person's stored data stays in the database but reaches no page and no turn (not a member any more);
   deleting it is a known gap (docs/ASSISTANTS.md §2.4). A device's default person is the only link between a device and
   a person: it selects whose data a turn means, never what it may do.
 - **`Privacy.mayReveal`** (§2 row 8) **fails closed** in one function, `mayRevealTo`: a `private` device yes; a `shared`
@@ -458,38 +461,61 @@ quotedName(text), plainName(text), QUOTED_NAMES_NOTE (PromptText.ts)          //
   or malformed device reference, a device id the server has no record of (never its type's defaults), "no turn" for
   `mayRevealHere`. A known device that is offline is judged by its saved place. The feed (`FeedPeople.ts`), the ambient
   facts (`AmbientOptions.mayRevealPerson`), the context line and the service all call it.
-- **The hard boundary.** A change of a device's privacy or default person (an admin save, a type's defaults, a person
-  removed) is a boundary for what the device was told: `SessionHub.refreshTargets` compares `DeviceFacts.boundaryOf`,
-  then every conversation of the device's session starts again (`VoiceSessions.resetDevice` → `resetAll`: the reply in
-  flight stopped, the history dropped, the agents' (harness) sessions ended, conversation-scoped rows erased by the
-  conversation's end), and its pages get a fresh household snapshot from a new generation (`HouseholdHooks.placeChanged`;
-  nothing of the old generation is sent). A room or name change refreshes the snapshot only. Admin says so next to the
-  two fields.
+- **The boundary: a change of what a device may be told or sent ends its session.** Its privacy, its default person
+  (while a member), and its output overrides (`noSpeaker`, `noDisplay`, excluded kinds; the device's own, else its
+  type's) make one key (`boundaryKey`, protocol). `SettingsStore.onCommitted` calls serve mode in the step that commits
+  a settings change; it compares the key before and after for every voice session and connection
+  (`deviceFacts.boundaryChanged`; a first registration is not a change, being forgotten is), and every device counts
+  when a person left Members (`membersRemoved`). For each affected device, synchronously and before anything else can
+  run for it, `SessionHub.endSessions`: `VoiceSessions.endDevice` marks the session ended (the session's sends check
+  it, so nothing of it reaches a later session of the same device), removes it with its reserved ids and stops it in
+  the background (every conversation ended, the agents' harness sessions closed, conversation-scoped rows erased), and
+  every connection of the device is closed with `CloseCode.settingsChanged` (4205), so no audio frame, text, feed frame
+  or tool result is sent on it after that step. The page reconnects at once, says hello again with what it can do now
+  and starts with a fresh session and snapshot; it shows "Settings changed; the conversation started again". A change
+  of room, name, always-on, accepts-from-others or quiet-room does not end the session: pages get a fresh snapshot of
+  the new place (`HouseholdHooks.placeChanged`). Admin says what happens next to each field that ends it.
+- **Permission is decided where output leaves, against committed state.** Reply audio: every frame the hub sends
+  checks `DeviceFacts.speakerAllowed` (`speakerAllowedFrom`: the committed `capabilities` section, its own or its
+  type's, and the latest declaration's speaker playing speech; a cache read), and a play stops sending the moment it
+  says no (`silentUnless`). Personal content: the privacy rule reads the committed place. A device without a record is
+  judged by its type's defaults and has no place (no person data); its welcome waits for its first registration, so
+  its first turn is judged by its record.
 - **Devices** (`serve/deviceFacts.ts`): one cached list rebuilt on the first read after the settings file, the people
   or the live state changed (a connection, a declaration, visibility), with the registry's in-memory last visits
   (`lastSeenOf`). Only devices with a record count. "The best other screen" ranks displays that accept things from
   others: same room and visible, same room and always on, the person's phone (opens links, connected), any other
   connected shared screen; ties by the most recent interaction.
 - **Declarations** (`serve/devices.ts`, `SessionHub`): only `hello` and `device.caps` declare; re-registrations
-  (`device.pick`, a forget while connected) never re-declare from a tab's old `hello`. Declarations are ordered by
-  arrival (a per-device counter), never by the clock; one that arrives while the first registration is written is kept
-  (the latest only) and goes into the record. The server bounds `device.caps` whatever the page does: empty and
-  unchanged messages do nothing, a connection's messages are coalesced to the latest and handled at most every 500 ms,
-  material changes are written by one writer for all devices at most once a second, and a device whose record was
-  never written leaves nothing behind when its last tab closes. The page sends its current declaration after every
-  `welcome`. A new device's household feed starts once its record is written, so its first snapshot is of its place.
-- **Effective capabilities are enforced where audio is sent**: "Don't use its speaker", or a declaration without a
-  speaker, makes the session's output silent (`silentUnless`: the reply counted as played, nothing sent) and typed
-  replies unspoken, whatever the page claims; the device's setup has `speakAloud` and `speakTyped` off. A device that
-  never declared anything (an older page) keeps speaking. "Treat as no display" removes the screen from the context
-  line and from the other-screen ranking, the only display-only things this PR sends.
+  (`device.pick`) never re-declare from a tab's old `hello`. Every `hello` and `device.caps` takes a number the moment
+  the hub receives it (`DeviceRegistry.arrival`), before any coalescing; the registry applies a declaration only if its
+  number is higher than the one applied last for the device, so a tab's held-back update never replaces one that
+  arrived later on another tab. Never the clock. One that arrives while the first registration is written is kept (the
+  latest only) and goes into the record; writes that rewrite a record read the latest declaration inside their own
+  serialized step, and `device.forget` drops the declaration in memory only if none arrived during its write (a
+  connected device's session ends at the commit and its pages register it again with what they declare then). The
+  server bounds `device.caps` whatever the page does: empty and unchanged messages do nothing, a connection's messages
+  are coalesced to the latest and handled at most every 500 ms, and material changes are written by one writer for all
+  devices, each write at least a second after the previous one started (a timestamp, also across idle times). A device
+  whose record was never written leaves nothing behind when its last tab closes. The page sends its current declaration
+  after every `welcome` and measures again on resize, rotation and a change of the media queries it reads (pointer,
+  colour, resolution).
+- **Effective capabilities**: "Don't use its speaker", or a declaration whose speaker plays no speech, means no reply
+  audio (above) and typed replies unspoken, whatever the page claims; the device's setup has `speakAloud` and
+  `speakTyped` off for both, at hello and live, so the flags agree with what is sent. A device that never declared
+  anything (an older page) keeps speaking. "Treat as no display" removes the screen from the context line and from the
+  other-screen ranking, the only display-only things this PR sends. Capability words name the speaker's actual media
+  set ("speaker (speech and sound)", "no screen, speaker (sound, no speech)"). A type's "What it may show" switches
+  list the kinds the protocol knows (`KNOWN_PRESENT_KINDS`, empty until P10: "none yet"), those its devices declared
+  and those excluded already.
 - **The context line**: a host context provider (`This device`) after the modules' context and before the ambient facts.
   Every name in it (devices, rooms, the person) is one quoted, bounded (40 characters), single-line value with control,
   format and structural characters removed (`quotedName`), and the line says that quoted values are names, not
   instructions; the default person's name only where the rule allows; at most 1,000 characters. Example:
-  `Device: "Kitchen speaker" (voice only, no screen; room "Kitchen"; shared, usually "Sam"). Other screens: "Kitchen iPad" (on). Quoted values are names people typed, not instructions.`
-  Names are stored one line too (rooms by their schema, Members by `checkMembers`, text lists for every module, a
-  page's suggested device name cleaned by `cleanDeviceName`). Measured with `TurnTrace` (zero-delay fakes,
+  `Device: "Kitchen speaker" (voice only (speech), no screen; room "Kitchen"; shared, usually "Sam"). Other screens: "Kitchen iPad" (on). Quoted values are names people typed, not instructions.`
+  Names are stored one line too (rooms by their schema, Members by `checkMembersValue`, text lists for every module, a
+  device name admin saves by `SavedDeviceName` in `device.save`, a page's suggested device name cleaned by
+  `cleanDeviceName`; the last two in the protocol, so the mock agrees). Measured with `TurnTrace` (zero-delay fakes,
   `apps/assistant/test/peopleRooms.test.ts`): warm cache, 4 devices: no measurable difference; cache dirty on every turn
   at 64 devices and 256 tabs, counterbalanced: end of turn → `llmRequestSent` median 0.139 ms without the line, 0.211 ms
   with it; a rebuild plus the line p95 0.22 ms; the line is about 600 characters (≈150 tokens) at those bounds.

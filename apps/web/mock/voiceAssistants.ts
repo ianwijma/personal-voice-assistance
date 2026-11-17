@@ -92,7 +92,12 @@ export interface VoiceAssistants {
   readonly saveSettings: (deviceId: string | undefined, settings: DeviceSettingsPatch) => AssistantResult
 }
 
-export const createVoiceAssistants = (assistants: AssistantsMock, newConversationInfo: () => ConversationInfo): VoiceAssistants => {
+export const createVoiceAssistants = (
+  assistants: AssistantsMock,
+  newConversationInfo: () => ConversationInfo,
+  /** Protocol 11: whether reply audio is sent to the device (the setup's speaking flags follow it, as on the server). */
+  speakerAllowed?: (deviceId: string | undefined) => boolean
+): VoiceAssistants => {
   let canAuto = false
   /** Conversations other than the session's first, by session then assistant. */
   let extra = new WeakMap<object, Map<string, Conv>>()
@@ -105,7 +110,11 @@ export const createVoiceAssistants = (assistants: AssistantsMock, newConversatio
   const setupFor = (deviceId: string | undefined): DeviceSetup => {
     known.clear()
     for (const a of assistants.assistants()) known.set(a.id, a)
-    return deviceSetupFrom(settingsOf(deviceId), known, { ...(deviceId !== undefined ? { deviceId } : {}), canAuto })
+    return deviceSetupFrom(settingsOf(deviceId), known, {
+      ...(deviceId !== undefined ? { deviceId } : {}),
+      canAuto,
+      ...(speakerAllowed !== undefined ? { speakerAllowed: speakerAllowed(deviceId) } : {})
+    })
   }
   const holderOf = (v: object) => holders.get(v)
   const answeringOf = (v: object, deviceId: string | undefined): string | undefined => {

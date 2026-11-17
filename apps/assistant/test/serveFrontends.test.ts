@@ -58,8 +58,11 @@ const request = async (client: ScriptedClient, message: RequestInput) => {
 }
 
 /** Wait until the admin page's device list has this device (its record was saved). */
-const deviceKnown = (admin: ScriptedClient, id: string) =>
-  admin.waitFor("devices", (m) => m.devices.some((d) => d.id === id), { from: 0 })
+/** The device in admin's list: in its snapshot already (a new device is recorded before its welcome, P5), or pushed later. */
+const deviceKnown = async (admin: ScriptedClient, id: string) => {
+  if (admin.messages.some((m) => m.type === "admin.snapshot" && m.snapshot.devices.some((d) => d.id === id))) return
+  await admin.waitFor("devices", (m) => m.devices.some((d) => d.id === id), { from: 0 })
+}
 
 const setupOf = (client: ScriptedClient, pred: (m: Extract<ServerMessage, { type: "device.setup" }>) => boolean) =>
   client.waitFor("device.setup", pred, { from: 0 })

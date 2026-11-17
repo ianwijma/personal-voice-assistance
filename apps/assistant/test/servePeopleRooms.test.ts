@@ -16,10 +16,12 @@ import {
   People,
   Privacy,
   type Row,
+  Tts,
+  type TtsAudio,
   type TurnContext
 } from "@pva/core"
 import { endOfTurn } from "@pva/core/testing"
-import type { ClientMessage, DeviceCapabilities, DeviceListInfo, ServerMessageOf } from "@pva/protocol"
+import { type ClientMessage, CloseCode, type DeviceCapabilities, type DeviceListInfo, type ServerMessageOf } from "@pva/protocol"
 import { Effect, Schema, Stream } from "effect"
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -146,6 +148,19 @@ const tablet: DeviceCapabilities = {
   microphone: { farField: false }
 }
 
+/**
+ * P5 round 2: a change of what a device may be told or sent ends its session; its page is closed with
+ * `settingsChanged` and reconnects (as the web client does by itself): the same device and tab, a fresh hello.
+ */
+const reconnect = async (page: ScriptedClient, capabilities: DeviceCapabilities | undefined = tablet) => {
+  const closed = await page.closed
+  expect(closed.code).toBe(CloseCode.settingsChanged)
+  const next = await ScriptedClient.connect({ url: server!.url, deviceId: page.device.id, clientId: page.clientId })
+  clients.push(next)
+  await next.hello({ device: { ...next.device, ...(capabilities !== undefined ? { capabilities } : {}) } })
+  return next
+}
+
 const lastDevices = (admin: ScriptedClient): ReadonlyArray<DeviceListInfo> => {
   const pushed = admin.messages.filter((m): m is ServerMessageOf<"devices"> => m.type === "devices").at(-1)
   return pushed?.devices ?? admin.messages.flatMap((m) => (m.type === "admin.snapshot" ? [m.snapshot.devices] : [])).at(-1) ?? []
@@ -180,7 +195,7 @@ describe("people, rooms and device capabilities in serve mode", () => {
     expect((store.settings().assistant.HOUSEHOLD_MEMBERS as ReadonlyArray<Json>).map((m) => m.id)).toEqual([samId, robinId])
 
     // A voice page that declares a tablet; the record keeps the declaration; admin sees it.
-    const page = await ScriptedClient.connect({ url: server.url, deviceId: "kitchen-tab-1" })
+    let page = await ScriptedClient.connect({ url: server.url, deviceId: "kitchen-tab-1" })
     clients.push(page)
     await page.hello({ device: { ...page.device, capabilities: tablet } })
     await until("the device record", () => store.settings().devices["kitchen-tab-1"]?.declared !== undefined)
@@ -193,6 +208,8 @@ describe("people, rooms and device capabilities in serve mode", () => {
     const refused = await request(admin, { type: "device.save", target: { kind: "device", id: "kitchen-tab-1" }, rev: rev(), settings: { place: { ...place, defaultPerson: "p-nobody00" } } })
     expect(refused.ok).toBe(false)
     expect((await request(admin, { type: "device.save", target: { kind: "device", id: "kitchen-tab-1" }, rev: rev(), settings: { place } })).ok).toBe(true)
+    // A default person is a boundary: the page's session ended; it reconnects.
+    page = await reconnect(page)
 
     // A typed turn: the tool sees the room and the device's default person, and the services answer.
     const typed = async (text: string) => {
@@ -211,7 +228,7 @@ describe("people, rooms and device capabilities in serve mode", () => {
     expect(t1.screens).toBe(1)
     // The device line is per-turn context, never part of the cached system prompt.
     const context = requests.at(-2)!.context ?? ""
-    expect(context).toContain("## This device\nDevice: \"Test browser\" (tablet-size screen, touch, speaker, microphone; room \"Kitchen\"; shared, usually \"Sam\"). Other screens: none.")
+    expect(context).toContain("## This device\nDevice: \"Test browser\" (tablet-size screen, touch, speaker (speech and sound), microphone; room \"Kitchen\"; shared, usually \"Sam\"). Other screens: none.")
     expect(requests.at(-2)!.system).not.toContain("This device")
 
     // A spoken turn on the same device: the same room and person, source voice.
@@ -223,10 +240,12 @@ describe("people, rooms and device capabilities in serve mode", () => {
     expect(seen.at(-1)!.turn).toMatchObject({ source: "voice", deviceId: "kitchen-tab-1", room: "Kitchen", person: { id: samId, how: "device-default" } })
     await page.waitFor("turn.end", () => true, { timeoutMs: 10_000 })
 
-    // Taking the screen away in admin: the assistant is told "voice only"; the record still has the declaration.
+    // Taking the screen away in admin (a boundary: the page reconnects): the assistant is told "voice only"; the
+    // record still has the declaration.
     expect((await request(admin, { type: "device.save", target: { kind: "device", id: "kitchen-tab-1" }, rev: rev(), settings: { capabilities: { noDisplay: true, excludeKinds: [], noSpeaker: false } } })).ok).toBe(true)
+    page = await reconnect(page)
     await typed("and now?")
-    expect(requests.at(-2)!.context).toContain("Device: \"Test browser\" (voice only, no screen; room \"Kitchen\"; shared, usually \"Sam\").")
+    expect(requests.at(-2)!.context).toContain("Device: \"Test browser\" (voice only (speech and sound), no screen; room \"Kitchen\"; shared, usually \"Sam\").")
     expect(hostRef!.service(Devices)!.get("kitchen-tab-1")!.capabilities.display).toBeUndefined()
     expect(hostRef!.service(Devices)!.get("kitchen-tab-1")!.declared!.capabilities.display).toEqual(tablet.display)
 
@@ -243,9 +262,10 @@ describe("people, rooms and device capabilities in serve mode", () => {
     await admin.waitFor("section.changed", (m) => m.section.id === "members", { from })
     await expect(Effect.runPromise(hostRef!.service(People)!.setDiet({ person: "p-nobody00" }, { allergies: ["x"] }))).rejects.toBeDefined()
 
-    // Removing Sam clears the device's default person (and the turn has nobody's data).
+    // Removing Sam clears the device's default person (and the turn has nobody's data); the session ended.
     expect((await request(admin, { type: "settings.update", sectionId: "members", patch: { values: { HOUSEHOLD_MEMBERS: [members[1]!] as never }, secrets: {} } })).ok).toBe(true)
     await until("the device's default person cleared", () => store.settings().devices["kitchen-tab-1"]?.own.place?.defaultPerson === null)
+    page = await reconnect(page, { ...tablet, openUrl: true })
     const t3 = await typed("who am I?")
     expect(t3.turn?.person).toBeUndefined()
     expect(t3.turn?.room).toBe("Kitchen")
@@ -265,7 +285,7 @@ describe("people, rooms and device capabilities in serve mode", () => {
     await Effect.runPromise(storeRef!.collection(items).insert({ text: "Sam's list" }, { scope: { kind: "person", id: samId! } }))
     await Effect.runPromise(storeRef!.collection(items).insert({ text: "Robin's list" }, { scope: { kind: "person", id: robinId! } }))
 
-    const page = await ScriptedClient.connect({ url: server.url, deviceId: "kitchen-tab-2" })
+    let page = await ScriptedClient.connect({ url: server.url, deviceId: "kitchen-tab-2" })
     clients.push(page)
     await page.hello()
     const texts = (m: ServerMessageOf<"household.snapshot">) => m.collections.flatMap((c) => c.rows.map((r) => (r.value as { text: string }).text)).sort()
@@ -274,22 +294,28 @@ describe("people, rooms and device capabilities in serve mode", () => {
     await until("the device record", () => lastDevices(admin).some((d) => d.id === "kitchen-tab-2"))
     const rev = () => lastDevices(admin).find((d) => d.id === "kitchen-tab-2")?.rev ?? 0
     const place = { room: "Kitchen", privacy: "shared" as const, alwaysOn: false, acceptsFromOthers: true, quietRoom: false, defaultPerson: samId! }
-    let from = page.messages.length
     expect((await request(admin, { type: "device.save", target: { kind: "device", id: "kitchen-tab-2" }, rev: rev(), settings: { place } })).ok).toBe(true)
-    expect(texts(await page.waitFor("household.snapshot", () => true, { from }))).toEqual(["Sam's list"])
+    // A new default person ends the page's session: its successor's first snapshot is of the new place.
+    page = await reconnect(page, undefined)
+    expect(texts(await page.waitFor("household.snapshot"))).toEqual(["Sam's list"])
+    let from = page.messages.length
     // Live: Robin's new row does not reach Sam's kitchen; Sam's does.
     from = page.messages.length
     await Effect.runPromise(storeRef!.collection(items).insert({ text: "Robin's second" }, { scope: { kind: "person", id: robinId! } }))
     await Effect.runPromise(storeRef!.collection(items).insert({ text: "Sam's second" }, { scope: { kind: "person", id: samId! } }))
     const live = await page.waitFor("household.event", () => true, { from })
     expect((live.event.data as { value: { text: string } }).value.text).toBe("Sam's second")
-    // Private: both; a change of privacy alone is a change of place, so a fresh snapshot again.
-    from = page.messages.length
+    // Private: both (a change of privacy ends the session too).
     expect((await request(admin, { type: "device.save", target: { kind: "device", id: "kitchen-tab-2" }, rev: rev(), settings: { place: { ...place, privacy: "private" } } })).ok).toBe(true)
-    expect(texts(await page.waitFor("household.snapshot", () => true, { from }))).toEqual(["Robin's list", "Robin's second", "Sam's list", "Sam's second"])
+    page = await reconnect(page, undefined)
+    expect(texts(await page.waitFor("household.snapshot"))).toEqual(["Robin's list", "Robin's second", "Sam's list", "Sam's second"])
     // Public: none.
-    from = page.messages.length
     expect((await request(admin, { type: "device.save", target: { kind: "device", id: "kitchen-tab-2" }, rev: rev(), settings: { place: { ...place, privacy: "public" } } })).ok).toBe(true)
+    page = await reconnect(page, undefined)
+    expect(texts(await page.waitFor("household.snapshot"))).toEqual([])
+    // Only the room: the same page goes on, with a fresh snapshot of the new place.
+    from = page.messages.length
+    expect((await request(admin, { type: "device.save", target: { kind: "device", id: "kitchen-tab-2" }, rev: rev(), settings: { place: { ...place, privacy: "public", room: "Den" } } })).ok).toBe(true)
     expect(texts(await page.waitFor("household.snapshot", () => true, { from }))).toEqual([])
   })
 })
@@ -337,53 +363,99 @@ const typedOn = async (page: ScriptedClient, text: string, speak = false) => {
   return page.waitFor("turn.end", () => true, { from, timeoutMs: 10_000 })
 }
 
-describe("review round 1: a change of privacy or default person is a hard boundary", () => {
-  it("the device's conversation starts again (nothing said before can be read back), its pages get a fresh snapshot; a room alone does not", async () => {
+describe("review round 2: a change of what a device may be told or sent ends its session", () => {
+  it("privacy, default person and output overrides close the page with settingsChanged; its successor has a new conversation; a room alone does not", async () => {
     const { admin, samId, robinId } = await boot()
-    const page = await pageOn("kitchen-hb-01")
+    let page = await pageOn("kitchen-hb-01")
     expect((await saveDevice(admin, "kitchen-hb-01", { place: placeOf(samId) })).ok).toBe(true)
+    page = await reconnect(page)
     await typedOn(page, "what is on Sam's list?")
     const before = await historyOf(page)
     expect(before.history.length).toBeGreaterThan(0)
 
-    // Public now: a new conversation (announced), the old history gone, a fresh snapshot.
-    let from = page.messages.length
-    expect((await saveDevice(admin, "kitchen-hb-01", { place: placeOf(samId, "public") })).ok).toBe(true)
-    const started = await page.waitFor("conversation", (m) => m.reason === "new" && m.assistantId === "alpha", { from, timeoutMs: 10_000 })
-    expect(started.id).not.toBe(before.id)
-    await page.waitFor("household.snapshot", () => true, { from, timeoutMs: 10_000 })
-    const after = await historyOf(page)
-    expect(after.id).toBe(started.id)
-    expect(after.history).toEqual([])
+    // Each boundary: the old connection closes (nothing after the commit), the new one starts with nothing.
+    const boundaries: ReadonlyArray<Json> = [
+      { place: placeOf(samId, "public") },
+      { place: placeOf(robinId, "public") },
+      { capabilities: { noDisplay: false, excludeKinds: [], noSpeaker: true } },
+      { capabilities: { noDisplay: true, excludeKinds: [], noSpeaker: true } },
+      { capabilities: { noDisplay: true, excludeKinds: ["card"], noSpeaker: true } }
+    ]
+    let previous = before.id
+    for (const change of boundaries) {
+      await typedOn(page, "and now?")
+      expect((await saveDevice(admin, "kitchen-hb-01", change)).ok).toBe(true)
+      const old = page
+      page = await reconnect(page)
+      const after = await historyOf(page)
+      expect(after.id).not.toBe(previous)
+      expect(after.history).toEqual([])
+      expect(old.messages.at(-1)?.type).not.toBe("conversation.history")
+      previous = after.id
+    }
 
-    // Another default person: the same again.
-    await typedOn(page, "and now?")
-    from = page.messages.length
-    expect((await saveDevice(admin, "kitchen-hb-01", { place: placeOf(robinId, "public") })).ok).toBe(true)
-    await page.waitFor("conversation", (m) => m.reason === "new", { from, timeoutMs: 10_000 })
-    expect((await historyOf(page)).history).toEqual([])
-
-    // Only the room: what it may be told did not change, so the conversation goes on.
+    // Only the room: what it may be told did not change, so the conversation goes on, on the same connection.
     await typedOn(page, "still here?")
     const kept = await historyOf(page)
-    from = page.messages.length
+    const from = page.messages.length
     expect((await saveDevice(admin, "kitchen-hb-01", { place: { ...placeOf(robinId, "public"), room: "Den" } })).ok).toBe(true)
     await sleep(300)
     expect(page.messages.slice(from).some((m) => m.type === "conversation")).toBe(false)
     expect((await historyOf(page)).id).toBe(kept.id)
   })
 
-  it("removing the device's default person from Members is the same boundary", async () => {
+  it("removing any member of the household ends every device's session, not only where they were the default person", async () => {
     const { admin, store, samId, robinId } = await boot()
-    const page = await pageOn("kitchen-hb-02")
-    expect((await saveDevice(admin, "kitchen-hb-02", { place: placeOf(samId) })).ok).toBe(true)
-    await typedOn(page, "remember this")
-    const from = page.messages.length
-    const robin = (store.settings().assistant.HOUSEHOLD_MEMBERS as ReadonlyArray<Json>).find((m) => m.id === robinId)!
-    expect((await request(admin, { type: "settings.update", sectionId: "members", patch: { values: { HOUSEHOLD_MEMBERS: [robin] as never }, secrets: {} } })).ok).toBe(true)
-    await page.waitFor("conversation", (m) => m.reason === "new", { from, timeoutMs: 10_000 })
-    expect((await historyOf(page)).history).toEqual([])
-    expect(store.settings().devices["kitchen-hb-02"]!.own.place?.defaultPerson).toBeNull()
+    let samsPage = await pageOn("kitchen-hb-02")
+    expect((await saveDevice(admin, "kitchen-hb-02", { place: placeOf(samId, "private") })).ok).toBe(true)
+    samsPage = await reconnect(samsPage)
+    const other = await pageOn("hallway-hb-03")
+    await typedOn(samsPage, "remember Robin's thing")
+    await typedOn(other, "hello")
+    // Robin goes (not the default person anywhere): both devices' sessions end.
+    const sam = (store.settings().assistant.HOUSEHOLD_MEMBERS as ReadonlyArray<Json>).find((m) => m.id === samId)!
+    expect((await request(admin, { type: "settings.update", sectionId: "members", patch: { values: { HOUSEHOLD_MEMBERS: [sam] as never }, secrets: {} } })).ok).toBe(true)
+    samsPage = await reconnect(samsPage)
+    const next = await reconnect(other)
+    expect((await historyOf(samsPage)).history).toEqual([])
+    expect((await historyOf(next)).history).toEqual([])
+    expect(store.settings().devices["kitchen-hb-02"]!.own.place?.defaultPerson).toBe(samId)
+    // Removing the default person: the same, and the reference is cleared.
+    await typedOn(samsPage, "remember this")
+    expect((await request(admin, { type: "settings.update", sectionId: "members", patch: { values: { HOUSEHOLD_MEMBERS: [] as never }, secrets: {} } })).ok).toBe(true)
+    samsPage = await reconnect(samsPage)
+    expect((await historyOf(samsPage)).history).toEqual([])
+    await until("the reference cleared", () => store.settings().devices["kitchen-hb-02"]!.own.place?.defaultPerson === null)
+    void robinId
+  })
+
+  it("a device type's output override ends the session of every device of that type, and of a page without a device", async () => {
+    const { admin } = await boot()
+    const page = await pageOn("type-hb-0001")
+    const bare = await ScriptedClient.connect({ url: server!.url })
+    clients.push(bare)
+    await bare.hello({ device: false })
+    const type = server!.handle.store.settings().deviceTypes["web-voice"]
+    const saved = await request(admin, {
+      type: "device.save",
+      target: { kind: "type", type: "web-voice" },
+      rev: type?.rev ?? 0,
+      settings: { capabilities: { noDisplay: false, excludeKinds: [], noSpeaker: true } } as never
+    })
+    expect(saved.ok).toBe(true)
+    expect((await page.closed).code).toBe(CloseCode.settingsChanged)
+    expect((await bare.closed).code).toBe(CloseCode.settingsChanged)
+  })
+
+  it("forgetting a connected device ends its session; it says hello again as a new device with what it declares then", async () => {
+    const { admin, store } = await boot()
+    const page = await pageOn("forget-hb-01")
+    await typedOn(page, "hi")
+    expect((await request(admin, { type: "device.forget", id: "forget-hb-01" })).ok).toBe(true)
+    const phone = { ...tablet, openUrl: true }
+    const next = await reconnect(page, phone)
+    expect(store.settings().devices["forget-hb-01"]?.declared?.capabilities).toEqual(phone)
+    expect((await historyOf(next)).history).toEqual([])
   })
 })
 
@@ -403,21 +475,49 @@ describe("review round 1: \"Don't use its speaker\" is true", () => {
     await until("the reply audio", () => samples(page) > 0)
     expect(replies(page, from)).toBeGreaterThan(0)
 
-    // "Don't use its speaker": the setup turns speaking off, and nothing more is sent to be played.
-    from = page.messages.length
+    // "Don't use its speaker": the session ends; the new one's setup has speaking off, and nothing is sent to be played.
     expect((await saveDevice(admin, "speaker-off-1", { capabilities: { noDisplay: false, excludeKinds: [], noSpeaker: true } })).ok).toBe(true)
-    const setup = await page.waitFor("device.setup", (m) => m.audio.speakAloud === false, { from, timeoutMs: 10_000 })
-    expect(setup.captions.speakTyped).toBe(false)
     const heard = samples(page)
-    from = page.messages.length
+    const next = await reconnect(page)
+    const setup = next.messages.find((m): m is ServerMessageOf<"welcome"> => m.type === "welcome")!.snapshot.setup!
+    expect(setup.audio.speakAloud).toBe(false)
+    expect(setup.captions.speakTyped).toBe(false)
+    await next.claim()
+    await until("the recogniser stream", () => stt.open() >= 1)
+    from = next.messages.length
     stt.emit(endOfTurn("say something"))
-    await page.waitFor("turn.end", () => true, { from, timeoutMs: 10_000 })
+    await next.waitFor("turn.end", () => true, { from, timeoutMs: 10_000 })
     // The page (falsely) declares a speaker again and asks for a spoken typed reply: still nothing.
-    page.send({ type: "device.caps", capabilities: { ...tablet, speaker: { media: ["speech", "audio", "video"] } } })
-    await typedOn(page, "speak this", true)
+    next.send({ type: "device.caps", capabilities: { ...tablet, speaker: { media: ["speech", "audio", "video"] } } })
+    await typedOn(next, "speak this", true)
     await sleep(300)
-    expect(replies(page, from)).toBe(0)
+    expect(replies(next, from)).toBe(0)
+    expect(samples(next)).toBe(0)
     expect(samples(page)).toBe(heard)
+  })
+
+  it("a declaration without speech: the setup says nothing is spoken, at hello and live; a speaker declared later speaks again", async () => {
+    await boot()
+    const { speaker: _, ...mute } = tablet
+    const page = await pageOn("speaker-decl1", mute)
+    const welcome = page.messages.find((m): m is ServerMessageOf<"welcome"> => m.type === "welcome")!
+    expect(welcome.snapshot.setup!.audio.speakAloud).toBe(false)
+    expect(welcome.snapshot.setup!.captions.speakTyped).toBe(false)
+    let from = page.messages.length
+    page.send({ type: "device.caps", capabilities: { ...mute, speaker: { media: ["audio"] } } })
+    await sleep(700)
+    // Sound but no speech: still no speaking.
+    expect(page.messages.slice(from).some((m) => m.type === "device.setup" && m.audio.speakAloud)).toBe(false)
+    from = page.messages.length
+    page.send({ type: "device.caps", capabilities: tablet })
+    const live = await page.waitFor("device.setup", (m) => m.audio.speakAloud, { from, timeoutMs: 5000 })
+    expect(live.captions.speakTyped).toBe(true)
+    // The same device, known now, says hello again without speech: its welcome already says so.
+    page.close()
+    const again = await ScriptedClient.connect({ url: server!.url, deviceId: "speaker-decl1" })
+    clients.push(again)
+    const second = await again.hello({ device: { ...again.device, capabilities: mute } })
+    expect(second.snapshot.setup!.audio.speakAloud).toBe(false)
   })
 
   it("a page that declares no speaker gets no reply audio either", async () => {
@@ -433,6 +533,81 @@ describe("review round 1: \"Don't use its speaker\" is true", () => {
     await sleep(300)
     expect(replies(page, from)).toBe(0)
     expect(samples(page)).toBe(0)
+  })
+})
+
+describe("review round 2: permission is decided where output leaves, against committed state", () => {
+  const samples = (page: ScriptedClient) => [...page.replySamples.values()].reduce((a, b) => a + b, 0)
+
+  it("a new device's welcome waits for its first registration: nothing is decided for it before its record exists", async () => {
+    let hold: Promise<void> | undefined
+    const { store } = await boot({ settingsBeforeStep: () => hold })
+    let release!: () => void
+    hold = new Promise((r) => (release = r))
+    const page = await ScriptedClient.connect({ url: server!.url, deviceId: "held-reg-0001" })
+    clients.push(page)
+    const welcome = page.hello({ device: { ...page.device, capabilities: tablet } })
+    await sleep(300)
+    expect(page.messages.some((m) => m.type === "welcome")).toBe(false)
+    expect(store.settings().devices["held-reg-0001"]).toBeUndefined()
+    hold = undefined
+    release()
+    await welcome
+    expect(store.settings().devices["held-reg-0001"]?.declared?.capabilities).toEqual(tablet)
+  })
+
+  it("a page without a device follows its type's \"Don't use its speaker\": no reply audio, and its setup says so", async () => {
+    const { admin, stt } = await boot()
+    expect((await request(admin, {
+      type: "device.save",
+      target: { kind: "type", type: "web-voice" },
+      rev: server!.handle.store.settings().deviceTypes["web-voice"]?.rev ?? 0,
+      settings: { capabilities: { noDisplay: false, excludeKinds: [], noSpeaker: true } } as never
+    })).ok).toBe(true)
+    const bare = await ScriptedClient.connect({ url: server!.url })
+    clients.push(bare)
+    const welcome = await bare.hello({ device: false })
+    expect(welcome.snapshot.setup!.audio.speakAloud).toBe(false)
+    await bare.claim()
+    await until("the recogniser stream", () => stt.open() >= 1)
+    const from = bare.messages.length
+    stt.emit(endOfTurn("hello"))
+    await bare.waitFor("turn.end", () => true, { from, timeoutMs: 10_000 })
+    await typedOn(bare, "speak this", true)
+    await sleep(300)
+    expect(bare.messages.slice(from).some((m) => m.type === "reply.start")).toBe(false)
+    expect(samples(bare)).toBe(0)
+  })
+
+  it("a declaration without speech during a long reply: no frame after it is handled", async () => {
+    // A slow voice: 80 chunks of 40 ms, 25 ms apart.
+    const slowTts = Tts.of({
+      sampleRate: 22_050,
+      synthesize: (clauses) =>
+        clauses.pipe(Stream.zipWithIndex, Stream.flatMap(([, clause]) =>
+          Stream.fromIterable(Array.from({ length: 80 }, (): TtsAudio => ({ audio: new Uint8Array(new Int16Array(882).fill(800).buffer), clause }))).pipe(
+            Stream.tap(() => Effect.sleep(25))
+          )
+        ))
+    })
+    const dataDir = await dataDirWithAlpha()
+    const stt = controlledStt()
+    server = await startTestServer({ build: fakeBuild({ stt: stt.stt, llm: scriptedLlm(() => "A long answer.").llm, tts: slowTts }), dataDir })
+    const page = await pageOn("revoke-tab-01")
+    await page.claim()
+    await until("the recogniser stream", () => stt.open() === 1)
+    const from = page.messages.length
+    stt.emit(endOfTurn("tell me a story"))
+    await until("the first audio", () => samples(page) > 0)
+    const { speaker: _, ...mute } = tablet
+    page.send({ type: "device.caps", capabilities: mute })
+    await sleep(150)
+    const atRevoke = samples(page)
+    await page.waitFor("turn.end", () => true, { from, timeoutMs: 15_000 })
+    await sleep(200)
+    // At most what was already on the way (a frame or two), never the rest of the 80.
+    expect(samples(page) - atRevoke).toBeLessThanOrEqual(2 * 882)
+    expect(samples(page)).toBeLessThan(40 * 882)
   })
 })
 

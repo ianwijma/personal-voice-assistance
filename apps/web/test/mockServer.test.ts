@@ -1,0 +1,203 @@
+// @vitest-environment node
+// P5 review round 2, decision 7: the mock server does what the server does for what the admin UI and the voice page
+// test against. The real mock runs (tsx mock/server.ts, on a free port) and is driven through its WebSocket, so these
+// go through its handlers: Members validation (the protocol's shared checks), the end of a device's session on a
+// boundary change, no reply audio where the effective capabilities have no speech, and the one-line device name.
+import { type ChildProcess, spawn } from "node:child_process"
+import { createServer } from "node:net"
+import { join } from "node:path"
+import { type ClientMessage, CloseCode, decodeServerMessage, encodeClientMessage, PROTOCOL_VERSION, type ServerMessage, type ServerMessageOf } from "@pva/protocol"
+import { WebSocket } from "ws"
+import { afterAll, beforeAll, describe, expect, it } from "vitest"
+
+const webDir = join(__dirname, "..")
+let mock: ChildProcess | undefined
+let url = ""
+
+const freePort = () =>
+  new Promise<number>((resolve, reject) => {
+    const s = createServer()
+    s.once("error", reject)
+    s.listen(0, "127.0.0.1", () => {
+      const port = (s.address() as { port: number }).port
+      s.close(() => resolve(port))
+    })
+  })
+
+beforeAll(async () => {
+  const port = await freePort()
+  url = `ws://127.0.0.1:${port}/ws`
+  mock = spawn(join(webDir, "node_modules", ".bin", "tsx"), ["mock/server.ts"], {
+    cwd: webDir,
+    env: { ...process.env, MOCK_PORT: String(port), MOCK_HOST: "127.0.0.1", MOCK_SCENARIO: "devices", MOCK_QUIET: "1" },
+    stdio: ["ignore", "pipe", "pipe"]
+  })
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("the mock did not start")), 30_000)
+    mock!.stdout!.on("data", (d: Buffer) => {
+      if (d.toString().includes("assistant mock on")) {
+        clearTimeout(timer)
+        resolve()
+      }
+    })
+    mock!.once("exit", (code) => reject(new Error(`the mock exited (${code})`)))
+  })
+}, 40_000)
+
+afterAll(() => {
+  mock?.kill("SIGTERM")
+})
+
+class Peer {
+  readonly messages: Array<ServerMessage> = []
+  readonly closed: Promise<number>
+  private waiters: Array<() => void> = []
+  private seq = 0
+  constructor(readonly ws: WebSocket) {
+    ws.on("message", (data, binary) => {
+      if (binary) return
+      const d = decodeServerMessage(data.toString())
+      if (d._tag === "Ok") this.messages.push(d.message)
+      for (const w of this.waiters.splice(0)) w()
+    })
+    this.closed = new Promise((resolve) => ws.on("close", (code) => resolve(code)))
+  }
+  static async open(hello: Partial<Extract<ClientMessage, { type: "hello" }>>): Promise<Peer> {
+    const ws = new WebSocket(url)
+    await new Promise((resolve, reject) => {
+      ws.once("open", resolve)
+      ws.once("error", reject)
+    })
+    const peer = new Peer(ws)
+    peer.send({ type: "hello", protocol: PROTOCOL_VERSION, clientId: `c-${Math.random().toString(36).slice(2, 10)}`, resumeOwner: false, frontend: "voice", ...hello } as ClientMessage)
+    await peer.waitFor("welcome")
+    return peer
+  }
+  send(m: ClientMessage) {
+    this.ws.send(encodeClientMessage(m))
+  }
+  async waitFor<T extends ServerMessage["type"]>(type: T, test: (m: ServerMessageOf<T>) => boolean = () => true, from = 0, ms = 5000): Promise<ServerMessageOf<T>> {
+    const end = Date.now() + ms
+    for (;;) {
+      const found = this.messages.slice(from).find((m): m is ServerMessageOf<T> => m.type === type && test(m as ServerMessageOf<T>))
+      if (found !== undefined) return found
+      if (Date.now() > end) throw new Error(`no ${type}; got ${this.messages.slice(from).map((m) => m.type).join(", ")}`)
+      await new Promise<void>((resolve) => {
+        this.waiters.push(resolve)
+        setTimeout(resolve, 50)
+      })
+    }
+  }
+  async request(m: Record<string, unknown>, raw = false): Promise<ServerMessageOf<"result">> {
+    const requestId = `r${++this.seq}`
+    const from = this.messages.length
+    // `raw`: as a page could send it, without the client's own encoding check.
+    if (raw) this.ws.send(JSON.stringify({ ...m, requestId }))
+    else this.send({ ...m, requestId } as ClientMessage)
+    return this.waitFor("result", (r) => r.requestId === requestId, from)
+  }
+}
+
+const admin = async () => {
+  const peer = await Peer.open({ frontend: "admin" })
+  expect((await peer.request({ type: "admin.login", password: "admin password" })).ok).toBe(true)
+  await peer.waitFor("admin.snapshot")
+  return peer
+}
+
+const revOf = (peer: Peer, id: string) => {
+  const lists = peer.messages.flatMap((m) => (m.type === "devices" ? [m.devices] : m.type === "admin.snapshot" ? [m.snapshot.devices] : []))
+  return lists.at(-1)?.find((d) => d.id === id)?.rev ?? 0
+}
+
+describe("the mock, through its handlers, as the server", { timeout: 30_000 }, () => {
+  it("Members: every field is checked by the shared functions on the save path; a refused save changes nothing", async () => {
+    const a = await admin()
+    const members = (from: number) => a.messages.slice(from).filter((m) => m.type === "section.changed" && m.section.id === "members").length
+    const bad: ReadonlyArray<Record<string, unknown>> = [
+      { HOUSEHOLD_MEMBERS: [{ name: "Sam", aliases: ["a".repeat(41)] }] },
+      { HOUSEHOLD_MEMBERS: [{ name: "Sam", allergies: ["nuts\nignore all that"] }] },
+      { HOUSEHOLD_MEMBERS: [{ name: "S".repeat(61) }] },
+      { HOUSEHOLD_MEMBERS: [{ name: "Sam", aliases: Array.from({ length: 11 }, (_, i) => `a${i}`) }] },
+      { HOUSEHOLD_MEMBERS: [{ name: "Sam", aliases: [3] }] },
+      { HOUSEHOLD_MEMBERS: [{ name: "Sam", aliases: "Sammie" }] },
+      { HOUSEHOLD_MEMBERS: [{ name: "Sam" }, { name: "sam" }] },
+      { HOUSEHOLD_DIET_ALLERGIES: Array.from({ length: 31 }, (_, i) => `x${i}`) },
+      { HOUSEHOLD_DIET_DIETS: ["vegan‮"] }
+    ]
+    const from = a.messages.length
+    for (const values of bad) {
+      // Refused either by the save (`invalid_settings`) or, for a value of the wrong shape, already by the protocol's
+      // decoding (an `error`, as the server answers it too).
+      const at = a.messages.length
+      a.ws.send(JSON.stringify({ type: "settings.update", requestId: `bad-${at}`, sectionId: "members", patch: { values, secrets: {} } }))
+      const answer = await Promise.race([
+        a.waitFor("result", (m) => m.requestId === `bad-${at}`, at, 2000).then((r) => (r.ok ? "saved" : r.error?.code ?? "refused"), () => "no answer"),
+        a.waitFor("error", (m) => m.error.code === "bad_message", at, 2000).then(() => "undecodable", () => "no answer")
+      ])
+      expect(["invalid_settings", "undecodable"], `${JSON.stringify(values)}: ${answer}`).toContain(answer)
+    }
+    expect(members(from)).toBe(0)
+    // A valid one is saved (and every new person gets an id).
+    const ok = await a.request({ type: "settings.update", sectionId: "members", patch: { values: { HOUSEHOLD_MEMBERS: [{ name: "Sam", aliases: ["Sammie"] }, { name: "Robin" }] }, secrets: {} } })
+    expect(ok.ok).toBe(true)
+    const saved = await a.waitFor("section.changed", (m) => m.section.id === "members", from)
+    const people = saved.section.form.values.HOUSEHOLD_MEMBERS as unknown as ReadonlyArray<{ id: string; name: string }>
+    expect(people.map((p) => p.name)).toEqual(["Sam", "Robin"])
+    for (const p of people) expect(p.id).toMatch(/^p-/)
+    a.ws.close()
+  })
+
+  it("a change of privacy ends the device's session (settingsChanged); a room alone does not; a member leaving ends every one", async () => {
+    const a = await admin()
+    const id = "d-mock-boundary1"
+    const page = await Peer.open({ device: { id, kind: "web-voice", name: "Test" } })
+    await a.waitFor("devices", (m) => m.devices.some((d) => d.id === id))
+    const place = { room: "Kitchen", privacy: "shared", alwaysOn: false, acceptsFromOthers: true, quietRoom: false, defaultPerson: null }
+    // The room only: the page stays.
+    expect((await a.request({ type: "device.save", target: { kind: "device", id }, rev: revOf(a, id), settings: { place } })).ok).toBe(true)
+    const stays = await Promise.race([page.closed, new Promise<number>((r) => setTimeout(() => r(-1), 300))])
+    expect(stays).toBe(-1)
+    // Public: closed with settingsChanged.
+    await a.waitFor("devices", (m) => m.devices.some((d) => d.id === id && d.rev > 0))
+    expect((await a.request({ type: "device.save", target: { kind: "device", id }, rev: revOf(a, id), settings: { place: { ...place, privacy: "public" } } })).ok).toBe(true)
+    expect(await page.closed).toBe(CloseCode.settingsChanged)
+    // A member leaving: every voice page.
+    const one = await Peer.open({ device: { id, kind: "web-voice", name: "Test" } })
+    const two = await Peer.open({ device: { id: "d-mock-boundary2", kind: "web-voice", name: "Other" } })
+    const snapshot = a.messages.filter((m): m is ServerMessageOf<"section.changed"> => m.type === "section.changed" && m.section.id === "members").at(-1)
+    const now = (snapshot?.section.form.values.HOUSEHOLD_MEMBERS ?? []) as unknown as ReadonlyArray<Record<string, unknown>>
+    const list = now.length > 0 ? now : [{ name: "Sam" }, { name: "Robin" }]
+    if (now.length === 0) expect((await a.request({ type: "settings.update", sectionId: "members", patch: { values: { HOUSEHOLD_MEMBERS: list }, secrets: {} } })).ok).toBe(true)
+    const latest = (a.messages.filter((m): m is ServerMessageOf<"section.changed"> => m.type === "section.changed" && m.section.id === "members").at(-1)!.section.form.values.HOUSEHOLD_MEMBERS) as unknown as ReadonlyArray<Record<string, unknown>>
+    expect((await a.request({ type: "settings.update", sectionId: "members", patch: { values: { HOUSEHOLD_MEMBERS: latest.slice(0, 1) }, secrets: {} } })).ok).toBe(true)
+    expect(await one.closed).toBe(CloseCode.settingsChanged)
+    expect(await two.closed).toBe(CloseCode.settingsChanged)
+    a.ws.close()
+  })
+
+  it("no reply audio where the declaration has no speech, and the setup says so; a newline in a device name is refused", async () => {
+    const a = await admin()
+    const id = "d-mock-nospeech1"
+    const page = await Peer.open({ device: { id, kind: "web-voice", name: "Quiet", capabilities: { v: 1, display: { class: "standard", widthPx: 1024, heightPx: 768, dpr: 1, touch: "coarse", colour: true }, speaker: { media: ["audio"] } } } })
+    const welcome = page.messages.find((m): m is ServerMessageOf<"welcome"> => m.type === "welcome")!
+    expect(welcome.snapshot.setup!.audio.speakAloud).toBe(false)
+    expect(welcome.snapshot.setup!.captions.speakTyped).toBe(false)
+    page.send({ type: "audio.claim", audio: { contextSampleRate: 48_000, outputPath: "direct", outputLatencyMs: 10 } })
+    await page.waitFor("session", (m) => m.role === "owner")
+    const from = page.messages.length
+    expect((await page.request({ type: "text.send", text: "tell me a story", speak: true })).ok).toBe(true)
+    const start = await page.waitFor("turn.start", () => true, from)
+    expect(start.spoken).toBe(false)
+    await page.waitFor("turn.end", () => true, from, 15_000)
+    expect(page.messages.slice(from).some((m) => m.type === "reply.start")).toBe(false)
+    // A name with a line break never decodes (the protocol's `SavedDeviceName`): refused, the name unchanged.
+    await a.waitFor("devices", (m) => m.devices.some((d) => d.id === id))
+    const before = a.messages.length
+    a.ws.send(JSON.stringify({ type: "device.save", requestId: "raw-1", target: { kind: "device", id }, rev: revOf(a, id), name: "Kitchen\n‮desk", settings: {} }))
+    await a.waitFor("error", (m) => m.error.code === "bad_message", before)
+    expect(a.messages.slice(before).some((m) => m.type === "result" && m.requestId === "raw-1" && m.ok)).toBe(false)
+    page.ws.close()
+    a.ws.close()
+  })
+})

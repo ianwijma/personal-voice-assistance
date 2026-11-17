@@ -25,7 +25,13 @@ export interface VoiceSessionsOptions {
     key: string,
     device: { readonly id: string; readonly name: string } | undefined,
     /** Ids reserved for the device's assistants before its session existed (`conversation(key, assistant)`), by assistant. */
-    reserved?: ReadonlyMap<string, ConversationInfo>
+    reserved: ReadonlyMap<string, ConversationInfo> | undefined,
+    /**
+     * P5: this session was discarded or ended (`true` from then on, set in the step that removes it). Whatever it
+     * still does while it stops (a reply, a tool, a transcript) must check it before sending to the device's
+     * connections: a later session of the same device has the same key.
+     */
+    ended: () => boolean
   ) => Effect.Effect<VoiceSession, never, Scope.Scope>
   /** `MAX_VOICE_SESSIONS`, live. */
   readonly max: () => number
@@ -62,10 +68,12 @@ export interface VoiceSessions {
    */
   readonly newConversation: (key: string, assistant: string | undefined, assigned: ReadonlyArray<string>) => Effect.Effect<ConversationInfo>
   /**
-   * P5: the device's privacy or default person changed: every conversation of its session starts again
-   * (`SessionConversations.resetAll`); without a session, the ids reserved for it are dropped (nothing was said).
+   * P5: the device's boundary changed (`deviceFacts.ts`): synchronously, its session is marked ended (it sends nothing
+   * more), removed (the next `open` makes a new one, with new conversation ids) and stopped in the background (every
+   * conversation ended, its agents told, its conversation-scoped rows erased); its reserved ids and discard timer go
+   * too. The hub closes the device's connections in the same step.
    */
-  readonly resetDevice: (key: string) => Effect.Effect<void>
+  readonly endDevice: (key: string) => void
   /** For admin: every session, most recently active first. */
   readonly list: () => ReadonlyArray<SessionInfo>
   readonly all: () => ReadonlyArray<VoiceSession>
@@ -83,7 +91,8 @@ export interface VoiceSessions {
 const MAX_RESERVED = 64
 
 export const makeVoiceSessions = (options: VoiceSessionsOptions): VoiceSessions => {
-  const sessions = new Map<string, { readonly session: VoiceSession; readonly scope: Scope.Closeable }>()
+  type Entry = { readonly session: VoiceSession; readonly scope: Scope.Closeable; readonly fence: { ended: boolean } }
+  const sessions = new Map<string, Entry>()
   /**
    * Per device without a session, the ids reserved for its assistants (`""`: the device has no assistant).
    *
@@ -122,7 +131,7 @@ export const makeVoiceSessions = (options: VoiceSessionsOptions): VoiceSessions 
     return info
   }
 
-  const stop = (entry: { readonly session: VoiceSession; readonly scope: Scope.Closeable }) =>
+  const stop = (entry: Entry) =>
     Effect.andThen(
       entry.session.conversation.end,
       Scope.close(entry.scope, Exit.void)
@@ -131,6 +140,7 @@ export const makeVoiceSessions = (options: VoiceSessionsOptions): VoiceSessions 
   const discard = (key: string) => {
     const entry = sessions.get(key)
     if (entry === undefined) return
+    entry.fence.ended = true
     sessions.delete(key)
     reserved.delete(key)
     options.onDiscard(key)
@@ -168,8 +178,9 @@ export const makeVoiceSessions = (options: VoiceSessionsOptions): VoiceSessions 
       const scope = options.runSync(Scope.make())
       const ids = reserved.get(key)
       reserved.delete(key)
-      const session = options.runSync(Scope.provide(options.make(key, device, ids), scope))
-      sessions.set(key, { session, scope })
+      const fence = { ended: false }
+      const session = options.runSync(Scope.provide(options.make(key, device, ids, () => fence.ended), scope))
+      sessions.set(key, { session, scope, fence })
       session.conversation.start()
       options.onChange(false)
       return session
@@ -199,13 +210,11 @@ export const makeVoiceSessions = (options: VoiceSessionsOptions): VoiceSessions 
           return info
         })
       }),
-    resetDevice: (key) =>
-      Effect.suspend(() => {
-        const session = sessions.get(key)?.session
-        if (session !== undefined) return session.conversation.resetAll
-        reserved.delete(key)
-        return Effect.void
-      }),
+    endDevice: (key) => {
+      cancelTimer(key)
+      reserved.delete(key)
+      discard(key)
+    },
     list: () => [...sessions.values()].map((e) => e.session).sort((a, b) => b.lastActiveAt() - a.lastActiveAt()).map((s) => s.info()),
     all: () => [...sessions.values()].map((e) => e.session),
     size: () => sessions.size,
@@ -224,6 +233,7 @@ export const makeVoiceSessions = (options: VoiceSessionsOptions): VoiceSessions 
       for (const timer of timers.values()) clearTimeout(timer)
       timers.clear()
       const all = [...sessions.values()]
+      for (const entry of all) entry.fence.ended = true
       sessions.clear()
       return Effect.forEach(all, stop, { concurrency: "unbounded", discard: true })
     })

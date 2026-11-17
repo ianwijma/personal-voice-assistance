@@ -6,7 +6,7 @@ import { exampleAssistantInfo, exampleDevice, exampleDeviceType, exampleVoiceSec
 import type { Outcome } from "@/lib/assistants.ts"
 import { type CapabilityEnv, measureCapabilities, watchCapabilities } from "@/lib/capabilities.ts"
 import type { AssistantClient } from "@/lib/client.ts"
-import { declaredRows, membersOf } from "@/lib/place.ts"
+import { declaredRows, kindsFor, membersOf } from "@/lib/place.ts"
 import { buildSettingsTree, typePageId } from "@/lib/settingsTree.ts"
 import { initialState, reducer } from "@/lib/state.ts"
 import { createStore } from "@/lib/store.ts"
@@ -132,6 +132,56 @@ describe("telling the server again (device.caps)", () => {
     h.watch.stop()
   })
 
+  it("a media-query change alone (pointer, colour, pixel ratio) is measured again; the resolution query is re-armed; stop removes all (round 2)", () => {
+    // Fake media query lists: one per query, with their listeners; `fire` changes one.
+    const lists = new Map<string, { listeners: Set<() => void>; legacy: boolean }>()
+    const matchMedia = (q: string) => {
+      const legacy = q === "(monochrome)" // an older browser: addListener only
+      const list = lists.get(q) ?? { listeners: new Set<() => void>(), legacy }
+      lists.set(q, list)
+      return legacy
+        ? { addListener: (f: () => void) => void list.listeners.add(f), removeListener: (f: () => void) => void list.listeners.delete(f) }
+        : { addEventListener: (_: "change", f: () => void) => void list.listeners.add(f), removeEventListener: (_: "change", f: () => void) => void list.listeners.delete(f) }
+    }
+    const fire = (q: string) => {
+      for (const f of [...(lists.get(q)?.listeners ?? [])]) f()
+    }
+    let pointer: "coarse" | "fine" = "fine"
+    let ratio = 2
+    const measuredNow = () => measureCapabilities(env({ matches: (q) => q === `(pointer: ${pointer})`, dpr: ratio }))
+    const sent: Array<ClientMessage> = []
+    const watch = watchCapabilities({
+      send: (m) => {
+        sent.push(m)
+        return true
+      },
+      measure: measuredNow,
+      visible: () => true,
+      now: () => Date.now(),
+      target: new EventTarget() as unknown as Window,
+      doc: new EventTarget() as unknown as Document,
+      matchMedia,
+      dpr: () => ratio
+    })
+    for (const q of ["(pointer: coarse)", "(pointer: fine)", "(monochrome)", "(resolution: 2dppx)"]) expect(lists.get(q)?.listeners.size, q).toBe(1)
+    // A pen tablet switched to touch, nothing resized.
+    pointer = "coarse"
+    fire("(pointer: coarse)")
+    vi.advanceTimersByTime(1000)
+    expect(sent.at(-1)).toMatchObject({ type: "device.caps", capabilities: { display: { touch: "coarse" } } })
+    // Moved to a screen with another pixel ratio: measured again, and the query is now the new one's.
+    ratio = 1
+    fire("(resolution: 2dppx)")
+    vi.advanceTimersByTime(1000)
+    expect(sent.at(-1)).toMatchObject({ capabilities: { display: { dpr: 1 } } })
+    expect(lists.get("(resolution: 2dppx)")!.listeners.size).toBe(0)
+    expect(lists.get("(resolution: 1dppx)")!.listeners.size).toBe(1)
+    watch.stop()
+    for (const [q, list] of lists) expect(list.listeners.size, q).toBe(0)
+    // Without matchMedia at all: nothing breaks.
+    watchCapabilities({ send: () => true, measure: measuredNow, target: new EventTarget() as unknown as Window, doc: new EventTarget() as unknown as Document, matchMedia: undefined }).stop()
+  })
+
   it("a change between hello and welcome is not lost: after every welcome the current declaration is sent (finding 22)", () => {
     const h = harness()
     // hello went with 1024 × 768; before the welcome (nothing can be sent) the tablet rotates to a phone-size window.
@@ -173,6 +223,12 @@ describe("Members", () => {
       ["Microphone", "None", false],
       ["Opens links", "Yes (a phone)", true]
     ])
+    // The speaker row names the actual media set (round 2): no "Speech" where none is played.
+    const speaker = (media: ReadonlyArray<"speech" | "audio" | "video">) => declaredRows({ v: 1, speaker: { media } }).find((r) => r.key === "speaker")!.value
+    expect(speaker(["speech", "audio"])).toBe("Speech and sound")
+    expect(speaker(["audio"])).toBe("Sound, no speech")
+    expect(speaker(["video"])).toBe("Video, no speech")
+    expect(speaker([])).toBe("Plays nothing")
   })
 
   it("a hidden record field (a person's id) is kept in each record but not drawn", () => {
@@ -252,20 +308,22 @@ describe("Devices › a device: Place and What it can do", () => {
     expect(within(caps).getByTestId("caps-seen")).toHaveTextContent("Last seen, declared 5 min ago")
     expect(within(caps).getByTestId("caps-row-display")).toHaveTextContent("Tablet-size screen, 1024 × 768 at ×2, touch")
     expect(within(caps).getByTestId("caps-row-microphone")).toHaveTextContent("None")
-    expect(within(caps).getByTestId("caps-effective")).toHaveTextContent("The assistant is told: tablet-size screen, touch, speaker.")
+    expect(within(caps).getByTestId("caps-effective")).toHaveTextContent("The assistant is told: tablet-size screen, touch, speaker (speech).")
     const place = screen.getByTestId("section-place")
     expect(within(place).getByTestId("marks-Place")).toHaveAttribute("data-own", "false")
-    // Next to privacy and the default person: changing either starts a new conversation on the device.
+    // Next to privacy and the default person: saving a change of either ends the device's session.
     const notes = within(place).getAllByTestId("place-boundary-note")
     expect(notes).toHaveLength(2)
-    for (const note of notes) expect(note).toHaveTextContent("Changing this starts a new conversation on the device")
+    for (const note of notes) expect(note).toHaveTextContent("Saving a change here ends the session on this device: its pages reconnect at once")
+    // And next to the speaker, the screen and the kinds; not next to the room or the other place switches (two in Place).
+    expect(within(caps).getAllByTestId("caps-boundary-note")).toHaveLength(3)
     const person = within(place).getByTestId("place-person") as HTMLSelectElement
     expect([...person.options].map((o) => o.textContent)).toEqual(["Nobody: household data", "Sam", "Robin"])
     fireEvent.change(within(place).getByTestId("place-room"), { target: { value: "Kitchen" } })
     fireEvent.change(person, { target: { value: "p-sam00001" } })
     fireEvent.click(within(place).getByRole("radio", { name: "Private" }))
     fireEvent.click(within(within(caps).getByTestId("caps-display")).getByRole("switch"))
-    expect(within(caps).getByTestId("caps-effective")).toHaveTextContent("The assistant is told: voice only, no screen, no microphone")
+    expect(within(caps).getByTestId("caps-effective")).toHaveTextContent("The assistant is told: voice only (speech), no screen, no microphone")
     // The kinds it renders are switches too (only when it declared some).
     expect(within(caps).getByTestId("caps-kinds")).toHaveTextContent("card")
     await act(async () => {
@@ -298,5 +356,34 @@ describe("Devices › a device: Place and What it can do", () => {
     expect(screen.queryByTestId("caps-undeclared")).toBeNull()
     expect(screen.getByTestId("section-place")).toBeInTheDocument()
     expect(screen.getByTestId("caps-display")).toBeInTheDocument()
+    expect(within(screen.getByTestId("section-place")).getAllByTestId("place-boundary-note")[0]).toHaveTextContent("every device that follows these defaults")
+  })
+
+  it("a type's defaults can exclude a kind its devices declared, without a representative device: save, put back, Cancel (round 2)", async () => {
+    // The type's page: the kinds come from every device of the type (here one that declared a card).
+    const t = setup("type")
+    const caps = screen.getByTestId("section-capabilities")
+    const kinds = within(caps).getByTestId("caps-kinds")
+    expect(kinds).toHaveTextContent("card")
+    const show = within(kinds).getByRole("switch", { name: "Show card" })
+    expect(show).toHaveAttribute("aria-checked", "true")
+    fireEvent.click(show)
+    expect(within(kinds).getByRole("switch", { name: "Show card" })).toHaveAttribute("aria-checked", "false")
+    // Put back and excluded again: the switch stays (an excluded kind is always offered).
+    fireEvent.click(within(kinds).getByRole("switch", { name: "Show card" }))
+    fireEvent.click(within(kinds).getByRole("switch", { name: "Show card" }))
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Save" }))
+    })
+    expect(t.saveDevice).toHaveBeenCalledTimes(1)
+    expect((t.saveDevice.mock.calls[0]![2] as Record<string, unknown>).capabilities).toEqual({ noDisplay: false, excludeKinds: ["card"], noSpeaker: false })
+  })
+
+  it("with no device that declared a kind and none the protocol knows yet: \"none yet\"", () => {
+    const { declared: _never, ...undeclared } = exampleDevice
+    setup("type", undeclared)
+    expect(screen.getByTestId("caps-kinds-none")).toHaveTextContent("None yet")
+    expect(kindsFor({ known: [], declared: [], excluded: [] })).toEqual([])
+    expect(kindsFor({ known: ["list"], declared: [{ declared: { capabilities: { v: 1, present: { kinds: { card: 1 } } } } }], excluded: ["timer"] })).toEqual(["card", "list", "timer"])
   })
 })

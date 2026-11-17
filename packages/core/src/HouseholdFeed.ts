@@ -2,7 +2,7 @@ import type { HouseholdChange, HouseholdCollectionRows, HouseholdEventInfo, Hous
 import { Effect } from "effect"
 import type { EventType, HouseholdEvent } from "./EventBus.ts"
 import type { ChangeRecord, Collection, HouseholdStore, Row, ScopeRef, StoreError, TargetDevice } from "./HouseholdStore.ts"
-import { MAX_VALUE_CHARS } from "./HouseholdStore.ts"
+import { MAX_LIST_LIMIT, MAX_VALUE_CHARS } from "./HouseholdStore.ts"
 import { mayRevealPersonScopeTo, membersFrom, personScopesFor } from "./FeedPeople.ts"
 import type { IsMember } from "./Privacy.ts"
 
@@ -61,6 +61,8 @@ export interface FeedModule {
 
 /** The most rows of one collection in a snapshot. */
 export const SNAPSHOT_ROWS = 500
+/** P5: rows read past a person-scoped collection's budget, per scope, only to see whether one would have been sent. */
+export const TRUNCATION_PROBE = 64
 /** The most characters of rows in one `household.snapshot` message (the protocol's frame limit is 1,048,576). */
 export const SNAPSHOT_PART_CHARS = 256_000
 /** The most characters of rows in one whole snapshot; collections past it are `truncated`. */
@@ -209,29 +211,36 @@ export const makeHouseholdFeed = (options: {
         if (scopes.length === 0) continue
         let chunk: { module: string; collection: string; rows: Array<HouseholdRow>; truncated: boolean } = { module: moduleId, collection: collection.name, rows: [], truncated: false }
         parts[parts.length - 1]!.push(chunk)
-        // P5: a collection's scopes (one per person) share its SNAPSHOT_ROWS; one row more is read to know whether
-        // any were left out.
+        // P5: a collection's scopes (one per person) share its SNAPSHOT_ROWS. `truncated` says that a row the page
+        // would have been sent was left out: past the budget, rows are read (at most TRUNCATION_PROBE more per scope)
+        // only to see whether one of them is visible here. When that many are all hidden, it says so too (it cannot
+        // know without reading on).
         let left = SNAPSHOT_ROWS
+        let stop = false
         for (const scope of scopes) {
-          if (left <= 0) {
-            chunk.truncated = true
-            break
-          }
-          const read = yield* Effect.result(store.forModule(moduleId).collection(collection).list({ scope, limit: left + 1 }))
+          if (stop) break
+          const limit = Math.min(MAX_LIST_LIMIT, left + TRUNCATION_PROBE)
+          const read = yield* Effect.result(store.forModule(moduleId).collection(collection).list({ scope, limit }))
           if (read._tag === "Failure") {
             const e = read.failure
             if (e._tag !== "ScopeUnknown") report(moduleId, collection.name, `could not be read for a page: ${e.message}`)
             chunk.truncated = true
             continue
           }
-          if (read.success.length > left) chunk.truncated = true
-          for (const row of read.success.slice(0, left)) {
+          for (const row of read.success) {
             const p = projectFor(moduleId, collection, row, device)
             if (!p.visible) continue
+            if (left <= 0) {
+              // A visible row past the budget: left out.
+              chunk.truncated = true
+              stop = true
+              break
+            }
             const out: HouseholdRow = { id: row.id, rev: row.rev, scope: row.scope, value: p.value, updatedAt: row.updatedAt }
             const chars = p.chars + 300
             if (total + chars > SNAPSHOT_MAX_CHARS) {
               chunk.truncated = true
+              stop = true
               break
             }
             if (partChars + chars > SNAPSHOT_PART_CHARS && partChars > 0) {
@@ -246,6 +255,8 @@ export const makeHouseholdFeed = (options: {
             total += chars
             left--
           }
+          // The read stopped at its limit with nothing visible found past the budget: more may follow, unseen.
+          if (!stop && read.success.length >= limit) chunk.truncated = true
         }
         yield* Effect.yieldNow
       }

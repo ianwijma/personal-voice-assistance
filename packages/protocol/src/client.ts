@@ -15,7 +15,7 @@ import {
 import { MAX_TEXT_INPUT_CHARS } from "./constants.ts"
 import { MAX_MOVE_KEYS } from "./env.ts"
 import { DeviceSettingsPatch, DeviceTarget } from "./devices.ts"
-import { DeviceHello, DeviceId, DeviceName, FrontendRole, WakePhrase } from "./frontends.ts"
+import { DeviceHello, DeviceId, FrontendRole, SavedDeviceName, WakePhrase } from "./frontends.ts"
 import { DeviceCapabilities, DeviceLiveState } from "./capabilities.ts"
 import { JobAction, ToolId } from "./jobs.ts"
 import { SettingsPatch, SettingValue } from "./settings.ts"
@@ -405,8 +405,8 @@ export const DeviceSave = Schema.Struct({
   requestId: RequestId,
   target: DeviceTarget,
   rev: NonNegativeInt,
-  /** Devices only. */
-  name: Schema.optionalKey(DeviceName),
+  /** Devices only. One line (`SavedDeviceName`): a name with a line break or a control character is refused. */
+  name: Schema.optionalKey(SavedDeviceName),
   settings: DeviceSettingsPatch,
   saveAnyway: Schema.optionalKey(Schema.Boolean)
 })

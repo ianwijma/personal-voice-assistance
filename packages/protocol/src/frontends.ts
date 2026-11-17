@@ -1,5 +1,5 @@
 import { Schema } from "effect"
-import { DeviceCapabilities } from "./capabilities.ts"
+import { DeviceCapabilities, isOneLine } from "./capabilities.ts"
 import { InterruptMode, NonNegativeFinite, OutputPath } from "./common.ts"
 
 /**
@@ -43,6 +43,23 @@ export const DeviceName = Schema.String.check(
   Schema.makeFilter((s: string) => s.trim().length > 0 || "a device name must not be blank")
 )
 export type DeviceName = typeof DeviceName.Type
+
+/**
+ * P5: a device name as it is stored and as admin saves it (`device.save.name`): a `DeviceName` that is also one line,
+ * without control, format or bidirectional characters (the rule rooms and people's names follow). A name a page
+ * suggests in `hello` is cleaned to this (`cleanDeviceName`), not refused.
+ */
+export const SavedDeviceName = DeviceName.check(
+  Schema.makeFilter((s: string) => isOneLine(s) || "a device name is one line of text, without control characters")
+)
+export type SavedDeviceName = typeof SavedDeviceName.Type
+
+/** A name a page suggested, as kept: one line, no control or format characters, at most the limit ("Browser" if nothing is left). */
+export const cleanDeviceName = (name: string): string => {
+  const flat = name.normalize("NFKC").replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, " ").replace(/\s+/gu, " ").trim()
+  const short = [...flat].slice(0, MAX_DEVICE_NAME_CHARS).join("").trim()
+  return short === "" ? "Browser" : short
+}
 
 /** At most this many devices are remembered (least recently seen dropped first; devices with overrides last). */
 export const MAX_DEVICES = 64

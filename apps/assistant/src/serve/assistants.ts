@@ -89,6 +89,11 @@ export interface AssistantsOptions {
    * committed Members and no write made from an older read can bring a removed one back. Absent: none (tests).
    */
   readonly membersGate?: MembersGate
+  /**
+   * P5: whether reply audio is sent to a device now (`DeviceFacts.speakerAllowed`): its setup's speaking flags follow
+   * it. Absent: the `capabilities` override alone.
+   */
+  readonly speakerAllowed?: (deviceId: string | undefined, kind?: string) => boolean
 }
 
 export interface Assistants {
@@ -197,7 +202,11 @@ export const makeAssistants = (options: AssistantsOptions): Assistants => {
     deviceSetupFrom(
       deviceSettingsFrom(store.settings(), deviceId, kind),
       new Map(inEffect().map((a) => [a.id, a])),
-      { ...(deviceId !== undefined ? { deviceId } : {}), canAuto: options.canAuto() }
+      {
+        ...(deviceId !== undefined ? { deviceId } : {}),
+        canAuto: options.canAuto(),
+        ...(options.speakerAllowed !== undefined ? { speakerAllowed: options.speakerAllowed(deviceId, kind) } : {})
+      }
     )
 
   // ---- The assistants push

@@ -197,8 +197,19 @@ export const makeSections = (
   }
 
   // `value` is read on the turn path (system prompt, default voice): cached until the saved values or the keys change.
+  // P5: the cache belongs to one committed settings file (the store's object, the same until a save commits), so a
+  // value read after a commit is the committed one, also when the save that committed it was interrupted before it
+  // could say so (People and the privacy rule read Members through here).
   let values: ReadonlyMap<string, unknown> | undefined
-  const effective = () => (values ??= current().values)
+  let valuesOf: object | undefined
+  const effective = () => {
+    const file = store.settings()
+    if (values === undefined || valuesOf !== file) {
+      values = current().values
+      valuesOf = file
+    }
+    return values
+  }
 
   const nonEmptyEnv = (): Record<string, string> => {
     const out: Record<string, string> = {}
@@ -214,7 +225,9 @@ export const makeSections = (
   const updateLock = Semaphore.makeUnsafe(1)
 
   const edit: Sections["edit"] = (id, build, updateOptions = {}) => {
-    const save = updateLock.withPermit(Effect.gen(function*() {
+    // Waiting for the lock may be interrupted (nothing happened); once admitted, the read, check, write, cache and
+    // announcement are one uninterruptible step, so an interrupted caller never leaves a committed save unannounced.
+    const save = updateLock.withPermit(Effect.uninterruptible(Effect.gen(function*() {
         const definitions = sectionDefinitions(modelDirs())
         const d = definitions.find((s) => s.id === id)
         if (d === undefined) {
@@ -279,7 +292,7 @@ export const makeSections = (
         for (const s of changed) revisions.set(s.id, (revisions.get(s.id) ?? 0) + 1)
         announce(current().sections.filter((s) => changed.some((c) => c.id === s.id)))
         return { result: { ok: true }, reload: needsReload, path } as const
-      }))
+      })))
     return options.around === undefined ? save : options.around(id, save)
   }
 

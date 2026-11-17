@@ -122,8 +122,9 @@ export interface VoiceSessionOptions {
    */
   readonly place?: () => { readonly room?: string; readonly person?: TurnPerson }
   /**
-   * P5: whether replies may be spoken here now (the device's effective speaker), read at the start of every play.
-   * When not, the reply's audio is made and counted as played but never sent to the page. Absent: always.
+   * P5: whether replies may be spoken here now (the device's effective speaker), read at the start of every play and
+   * before every chunk. Not at the start: the reply's audio is made and counted as played but never sent to the page;
+   * no longer during a play: the rest of it is not sent (the hub checks again at every frame it sends). Absent: always.
    */
   readonly speakerAllowed?: () => boolean
   /**
@@ -207,12 +208,6 @@ export interface SessionConversations {
   /** Committed turns in `assistant`'s current conversation. */
   readonly turnsOf: (assistant?: string) => number
   readonly newConversation: (assistant?: string) => Effect.Effect<ConversationInfo>
-  /**
-   * P5: every assistant's conversation on the device starts again (a change of the device's privacy or default
-   * person): each running reply is stopped, each history dropped and its agents' sessions ended, and the ids reserved
-   * for assistants that have not spoken yet are replaced.
-   */
-  readonly resetAll: Effect.Effect<void>
   /** The answering assistant now (`undefined`: the device has none). */
   readonly answering: () => string | undefined
   /** Start running on the engines (now and after every rebuild) until `end`. */
@@ -338,20 +333,22 @@ const idleMsOf = (assistant: Assistant | undefined, minuteMs: number): number | 
   assistant === undefined || assistant.newConversationAfter === "never" ? undefined : assistant.newConversationAfter * minuteMs
 
 /**
- * P5: `output` while `allowed()` says so at the start of a play; otherwise a play that takes the whole reply and
- * reports it as played (so the turn is recorded as answered) without sending any of it anywhere.
+ * P5: `output` while `allowed()` says so: at the start of a play, and before each chunk (a play whose permission goes
+ * mid-way ends there: the rest of the reply is not sent). Not allowed at the start: a play that takes the whole reply
+ * and reports it as played (so the turn is recorded as answered) without sending any of it anywhere.
  */
 export const silentUnless = (output: AudioOutput["Service"], allowed: () => boolean): AudioOutput["Service"] => ({
   ...(output.reportsPlayback !== undefined ? { reportsPlayback: output.reportsPlayback } : {}),
   play: (audio, sampleRate, observer) =>
     Effect.suspend(() => {
-      let ok = true
-      try {
-        ok = allowed()
-      } catch {
-        ok = false
+      const ok = () => {
+        try {
+          return allowed()
+        } catch {
+          return false
+        }
       }
-      if (ok) return output.play(audio, sampleRate, observer)
+      if (ok()) return output.play(Stream.takeWhile(audio, () => ok()), sampleRate, observer)
       let samples = 0
       let started = false
       return Stream.runForEach(audio, (chunk) =>
@@ -1033,11 +1030,6 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
       lastTurnId: (assistant) => conversationOf(assistant ?? answering())?.lastTurnId(),
       turnsOf: (assistant) => turnsBy.get(assistant ?? answering() ?? "") ?? 0,
       newConversation: newConversationOf,
-      resetAll: Effect.suspend(() => {
-        // Every conversation made so far, and every id reserved for an assistant that has not spoken yet.
-        const assistants = new Set([...dispatcher.conversations().keys(), ...reserved.keys()])
-        return Effect.forEach([...assistants], (a) => newConversationOf(a === "" ? undefined : a), { discard: true })
-      }),
       answering,
       start: () => {
         if (started) return

@@ -11,14 +11,14 @@ import {
   DEVICE_TYPES,
   deviceTypeOf,
   effectiveDeviceSettings,
+  cleanDeviceName,
   type ErrorInfo,
   hearerOf,
-  MAX_DEVICE_NAME_CHARS,
   MAX_DEVICES,
   WEB_VOICE_DEVICE_TYPE,
   WEB_VOICE_KIND
 } from "@pva/protocol"
-import { Effect } from "effect"
+import { Duration, Effect } from "effect"
 import type { SettingsFile, SettingsStore, StoredDevice } from "./SettingsStore.ts"
 
 /**
@@ -99,20 +99,33 @@ export interface DeviceRegistry {
    * received (memory), else its record's; `undefined` when it never declared anything.
    */
   readonly declaredOf: (id: string) => DeclaredCapabilities | undefined
+  /** P5: the latest declaration received from a device, also before its first registration is written. */
+  readonly latestOf: (id: string) => DeclaredCapabilities | undefined
   /**
-   * P5: a connected device declared what it can do (`hello` or `device.caps`; nothing else declares). Declarations are
-   * ordered by arrival (a per-device counter, never the clock): the latest one is the device's, also while its first
-   * registration is still being written (it goes into the new record). Synchronous; `true` when it changed what is
-   * known (an identical declaration is ignored). A change of more than the window's exact size
+   * P5: the next number in the order declarations arrive in. The hub takes one the moment a `hello` or `device.caps`
+   * is received, before any coalescing or rate limiting, and passes it to `declare` with that message's declaration.
+   */
+  readonly arrival: () => number
+  /**
+   * P5: a connected device declared what it can do (`hello` or `device.caps`; nothing else declares). `seq`: its
+   * number in the order of arrival (`arrival()`; absent: one taken now). Applied only when it arrived after the one
+   * applied last for the device (an older one, held back by a tab's coalescing, is dropped), also while the device's
+   * first registration is being written (it goes into the new record). Synchronous; `true` when it changed what is
+   * known (an identical declaration only moves the number). A change of more than the window's exact size
    * (`capabilitiesDifferMaterially`) is then to be written: run `persist`.
    */
-  readonly declare: (id: string, capabilities: DeviceCapabilities) => boolean
+  readonly declare: (id: string, capabilities: DeviceCapabilities, seq?: number) => boolean
   /**
-   * Write the declarations that changed materially: one write at a time for all devices (later ones coalesce into
-   * the next, at most one per `DECLARE_WRITE_GAP_MS`), each record with its latest declaration. Never fails.
+   * Write the declarations that changed materially: one write at a time for all devices, each record with its latest
+   * declaration read inside the write's own step. Writes are at least `DECLARE_WRITE_GAP_MS` apart, measured from the
+   * last one (also after an idle time): requests in between coalesce into the next. Never fails.
    */
   readonly persist: Effect.Effect<void>
-  /** `device.forget` (admin). */
+  /**
+   * `device.forget` (admin). The record goes in one serialized step; the device's declaration in memory goes only if
+   * nothing newer arrived during the write. A connected device's session is ended by the boundary (its connections
+   * close at the commit and say hello again as a new device).
+   */
   readonly forget: (id: string) => Effect.Effect<DeviceResult>
 }
 
@@ -122,17 +135,15 @@ export interface DeviceRegistryOptions {
   readonly now?: () => number
   /** The gap between two writes of declarations. Default `DECLARE_WRITE_GAP_MS`. */
   readonly declareGapMs?: number
+  /** A monotonic clock in ms for that gap. Default `performance.now`. */
+  readonly monotonic?: () => number
 }
 
 /** At most one write of declarations per this long (all devices together). */
 export const DECLARE_WRITE_GAP_MS = 1000
 
-/** A name a page suggested, as kept: one line, no control or format characters, at most the limit. */
-export const cleanDeviceName = (name: string): string => {
-  const flat = name.normalize("NFKC").replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, " ").replace(/\s+/gu, " ").trim()
-  const short = [...flat].slice(0, MAX_DEVICE_NAME_CHARS).join("").trim()
-  return short === "" ? "Browser" : short
-}
+/** A name a page suggested, as kept (protocol `cleanDeviceName`, shared with the mock). */
+export { cleanDeviceName }
 
 export const makeDeviceRegistry = (options: DeviceRegistryOptions): DeviceRegistry => {
   const { store } = options
@@ -192,22 +203,26 @@ export const makeDeviceRegistry = (options: DeviceRegistryOptions): DeviceRegist
     }
   }
 
-  let persisting = false
-  let again = false
+  /** The running writer (a number per writer, so a finished one never clears a newer one's mark). */
+  let persisting: number | undefined
+  let writers = 0
+  const monotonic = options.monotonic ?? (() => performance.now())
+  /** When the last write of declarations started (monotonic ms): the next one waits until `gapMs` after it. */
+  let lastWriteAt = -Infinity
   const persistable = () => [...dirty].some((id) => stored()[id] !== undefined)
-  /** One writer for every device's declaration; requests while it writes are folded into its next round. */
+  /**
+   * One writer for every device's declaration. Requests while it waits or writes are folded into its next round; each
+   * round starts no earlier than `gapMs` after the previous one started, whether the writer was busy or idle between.
+   */
   const persist: Effect.Effect<void> = Effect.suspend(() => {
-    if (persisting) {
-      again = true
-      return Effect.void
-    }
-    if (!persistable()) return Effect.void
-    persisting = true
+    if (persisting !== undefined || !persistable()) return Effect.void
+    const mine = ++writers
+    persisting = mine
     const round = Effect.suspend(() => {
-      again = false
       const ids = [...dirty].filter((id) => stored()[id] !== undefined)
-      for (const id of ids) dirty.delete(id)
       if (ids.length === 0) return Effect.void
+      lastWriteAt = monotonic()
+      for (const id of ids) dirty.delete(id)
       /** The declaration each record took, by its place in the order of arrival. */
       const taken = new Map<string, number | undefined>()
       return store.saveDeviceRecords(ids.length === 1 ? `what device ${ids[0]} can do` : "what devices can do", (committed) => {
@@ -218,12 +233,17 @@ export const makeDeviceRegistry = (options: DeviceRegistryOptions): DeviceRegist
         Effect.catch((e) => Effect.logDebug(`Device capabilities not saved (kept in memory until the next write): ${e.message}`))
       )
     })
-    const loop: Effect.Effect<void> = Effect.andThen(
-      round,
-      Effect.suspend(() => (again || persistable() ? Effect.andThen(Effect.sleep(gapMs), loop) : Effect.void))
-    )
+    const loop: Effect.Effect<void> = Effect.suspend(() => {
+      if (!persistable()) {
+        // In the same step as the check: a request after it starts a new writer.
+        persisting = undefined
+        return Effect.void
+      }
+      const wait = lastWriteAt + gapMs - monotonic()
+      return Effect.andThen(wait > 0 ? Effect.sleep(Duration.millis(wait)) : Effect.void, Effect.andThen(round, loop))
+    })
     return loop.pipe(Effect.ensuring(Effect.sync(() => {
-      persisting = false
+      if (persisting === mine) persisting = undefined
     })))
   })
 
@@ -292,10 +312,19 @@ export const makeDeviceRegistry = (options: DeviceRegistryOptions): DeviceRegist
       if (record === undefined) return undefined
       return declared.get(id)?.value ?? record.declared
     },
-    declare: (id, capabilities) => {
-      const previous = declared.get(id)?.value ?? stored()[id]?.declared
-      if (previous !== undefined && JSON.stringify(previous.capabilities) === JSON.stringify(capabilities)) return false
-      declared.set(id, { value: { capabilities, seenAt: now() }, seq: ++declareSeq })
+    latestOf: (id) => declared.get(id)?.value ?? stored()[id]?.declared,
+    arrival: () => ++declareSeq,
+    declare: (id, capabilities, seq) => {
+      const at = seq ?? ++declareSeq
+      const latest = declared.get(id)
+      // Arrived before the one applied last (held back by a tab's coalescing): it is not the device's any more.
+      if (latest !== undefined && latest.seq >= at) return false
+      const previous = latest?.value ?? stored()[id]?.declared
+      if (previous !== undefined && JSON.stringify(previous.capabilities) === JSON.stringify(capabilities)) {
+        declared.set(id, { value: previous, seq: at })
+        return false
+      }
+      declared.set(id, { value: { capabilities, seenAt: now() }, seq: at })
       if (capabilitiesDifferMaterially(stored()[id]?.declared?.capabilities, capabilities)) dirty.add(id)
       else dirty.delete(id)
       return true
@@ -306,7 +335,10 @@ export const makeDeviceRegistry = (options: DeviceRegistryOptions): DeviceRegist
     forget: (id) =>
       Effect.suspend(() => {
         if (stored()[id] === undefined) return Effect.succeed(failure("unknown_device", "That device is not known (it may have been forgotten already)"))
+        /** The declaration the write saw (inside its serialized step): only that one goes with the record. */
+        let seen: number | undefined
         return store.saveDeviceRecords(`forgetting device ${id}`, (committed) => {
+          seen = declared.get(id)?.seq
           const devices = withAllLastSeen(committed)
           delete devices[id]
           return devices
@@ -314,8 +346,10 @@ export const makeDeviceRegistry = (options: DeviceRegistryOptions): DeviceRegist
           Effect.as<DeviceResult>({ ok: true }),
           Effect.catch((e) => Effect.succeed(failure("internal", e.message))),
           Effect.tap((r) => Effect.sync(() => {
-            if (r.ok) {
-              lastSeen.delete(id)
+            if (!r.ok) return
+            lastSeen.delete(id)
+            // A declaration that arrived during the write (a new hello of the device) is kept for its new record.
+            if (declared.get(id)?.seq === seen) {
               declared.delete(id)
               dirty.delete(id)
             }

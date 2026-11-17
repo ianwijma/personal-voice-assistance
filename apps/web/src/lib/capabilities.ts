@@ -78,6 +78,41 @@ export interface CapabilityWatchOptions {
   readonly doc?: Pick<Document, "addEventListener" | "removeEventListener">
   readonly setTimer?: (f: () => void, ms: number) => unknown
   readonly clearTimer?: (t: unknown) => void
+  /**
+   * Media queries to watch (default `window.matchMedia`; absent there: none, and the other events still count): the
+   * pointer and colour ones the measurement reads, and the current pixel ratio (re-armed for the new one on a change).
+   */
+  readonly matchMedia?: ((query: string) => MediaQueryWatch | undefined) | undefined
+  /** The pixel ratio now, for the resolution query (default `window.devicePixelRatio`). */
+  readonly dpr?: () => number
+}
+
+/** The part of a `MediaQueryList` the watch uses (older Safari has only `addListener`). */
+export interface MediaQueryWatch {
+  readonly addEventListener?: (type: "change", listener: () => void) => void
+  readonly removeEventListener?: (type: "change", listener: () => void) => void
+  readonly addListener?: (listener: () => void) => void
+  readonly removeListener?: (listener: () => void) => void
+}
+
+/** The media queries `measureCapabilities` reads: a change of any of them alone (no resize) is measured again. */
+export const WATCHED_MEDIA_QUERIES: ReadonlyArray<string> = ["(pointer: coarse)", "(pointer: fine)", "(monochrome)"]
+
+const listenTo = (mql: MediaQueryWatch | undefined, listener: () => void): (() => void) => {
+  if (mql === undefined) return () => {}
+  try {
+    if (typeof mql.addEventListener === "function") {
+      mql.addEventListener("change", listener)
+      return () => mql.removeEventListener?.("change", listener)
+    }
+    if (typeof mql.addListener === "function") {
+      mql.addListener(listener)
+      return () => mql.removeListener?.(listener)
+    }
+  } catch {
+    // A browser without change events on media queries: resize and interaction still count.
+  }
+  return () => {}
 }
 
 export interface CapabilityWatch {
@@ -91,8 +126,9 @@ export interface CapabilityWatch {
 }
 
 /**
- * Watch the page: a resize or rotation that changes the declaration, a change of visibility, and touches and keys,
- * sent as `device.caps` at most once a second (the last change wins; nothing is sent when nothing changed).
+ * Watch the page: a resize or rotation that changes the declaration, a change of a media query it reads (the pointer,
+ * colour, the pixel ratio; no polling), a change of visibility, and touches and keys, sent as `device.caps` at most once
+ * a second (the last change wins; nothing is sent when nothing changed). `stop` removes every listener.
  */
 export const watchCapabilities = (options: CapabilityWatchOptions): CapabilityWatch => {
   const measure = options.measure ?? currentCapabilities
@@ -142,6 +178,32 @@ export const watchCapabilities = (options: CapabilityWatchOptions): CapabilityWa
   target?.addEventListener("pointerdown", onInteraction, { passive: true })
   target?.addEventListener("keydown", onInteraction)
   doc?.addEventListener("visibilitychange", onChange)
+  const matchMedia = "matchMedia" in options
+    ? options.matchMedia
+    : typeof window !== "undefined" && typeof window.matchMedia === "function"
+    ? (q: string) => window.matchMedia(q) as MediaQueryWatch
+    : undefined
+  const dpr = options.dpr ?? (() => (typeof window === "undefined" ? 1 : window.devicePixelRatio || 1))
+  const safeMatch = (q: string) => {
+    try {
+      return matchMedia?.(q)
+    } catch {
+      return undefined
+    }
+  }
+  const mediaOff = WATCHED_MEDIA_QUERIES.map((q) => listenTo(safeMatch(q), onChange))
+  // The resolution query matches the pixel ratio now; once it changes (another screen, a zoom) it is armed for the new one.
+  let resolutionOff: () => void = () => {}
+  let stopped = false
+  const armResolution = () => {
+    resolutionOff()
+    if (stopped) return
+    resolutionOff = listenTo(safeMatch(`(resolution: ${dpr()}dppx)`), () => {
+      armResolution()
+      onChange()
+    })
+  }
+  armResolution()
   return {
     resync: () => {
       // Nothing counts as sent: the next flush sends what the page measures now.
@@ -158,6 +220,9 @@ export const watchCapabilities = (options: CapabilityWatchOptions): CapabilityWa
       target?.removeEventListener("pointerdown", onInteraction)
       target?.removeEventListener("keydown", onInteraction)
       doc?.removeEventListener("visibilitychange", onChange)
+      stopped = true
+      for (const off of mediaOff) off()
+      resolutionOff()
     }
   }
 }

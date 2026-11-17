@@ -6,7 +6,9 @@ import {
   BUILT_IN_PLACE,
   BUILT_IN_WEB_VOICE_SETTINGS,
   capabilitiesDifferMaterially,
+  canSpeak,
   capabilityWords,
+  speakerMediaWords,
   DEVICE_SETTINGS_KEYS,
   DeviceCapabilities,
   DeviceOwn,
@@ -85,9 +87,31 @@ describe("DeviceCapabilities", () => {
   })
 
   it("words for the context line and admin", () => {
-    expect(capabilityWords(tablet)).toBe("tablet-size screen, touch, speaker, microphone")
-    expect(capabilityWords({ v: 1, speaker: { media: ["speech"] }, microphone: { farField: true } })).toBe("voice only, no screen")
+    expect(capabilityWords(tablet)).toBe(`tablet-size screen, touch, speaker (${speakerMediaWords(tablet.speaker!.media)}), microphone`)
+    expect(capabilityWords({ v: 1, speaker: { media: ["speech"] }, microphone: { farField: true } })).toBe("voice only (speech), no screen")
+    expect(capabilityWords({ v: 1, speaker: { media: ["speech"] } })).toBe("voice only (speech), no screen, no microphone")
     expect(capabilityWords({ v: 1, display: { class: "large", widthPx: 1920, heightPx: 1080, dpr: 1, touch: "none", colour: true } })).toBe("large screen, no speaker")
+  })
+
+  it("a speaker is described by its actual media set, and only speech counts as speaking", () => {
+    const cases: ReadonlyArray<readonly [ReadonlyArray<"speech" | "audio" | "video">, string, boolean]> = [
+      [[], "nothing", false],
+      [["speech"], "speech", true],
+      [["audio"], "sound, no speech", false],
+      [["video"], "video, no speech", false],
+      [["speech", "audio"], "speech and sound", true],
+      [["speech", "video"], "speech and video", true],
+      [["audio", "video"], "sound and video, no speech", false],
+      [["speech", "audio", "video"], "speech, sound and video", true]
+    ]
+    for (const [media, words, speaks] of cases) {
+      expect(speakerMediaWords(media)).toBe(words)
+      expect(canSpeak({ v: 1, speaker: { media } })).toBe(speaks)
+      // Without a screen, "voice only" only where speech is played.
+      expect(capabilityWords({ v: 1, speaker: { media }, microphone: { farField: false } })).toBe(speaks ? `voice only (${words}), no screen` : `no screen, speaker (${words}), microphone`)
+    }
+    expect(canSpeak(undefined)).toBe(false)
+    expect(canSpeak({ v: 1 })).toBe(false)
   })
 
   it("rooms compare without case or surrounding space; an empty room is in no room", () => {

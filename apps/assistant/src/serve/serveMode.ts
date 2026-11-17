@@ -125,7 +125,7 @@ import { makeRoutingService, ROUTING_KEYS } from "./routing.ts"
 import { openServeHousehold } from "./household.ts"
 import { makeHouseholdPush } from "./HouseholdPush.ts"
 import { Devices, hostEvent, People, Privacy, withContextProvider } from "@pva/core"
-import { makeDeviceFacts } from "./deviceFacts.ts"
+import { boundaryChanged, makeDeviceFacts, membersRemoved } from "./deviceFacts.ts"
 import {
   makeMembersGate,
   makePeopleService,
@@ -381,6 +381,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     const deviceFacts = makeDeviceFacts({
       file: () => store.settings(),
       declaredOf: (id) => devices.declaredOf(id),
+      latestOf: (id) => devices.latestOf(id),
       lastSeenOf: (id) => devices.lastSeenOf(id),
       live: (id) => hub?.deviceLive(id) ?? { connected: false, visible: false },
       isPerson: (id) => people.get(id) !== undefined,
@@ -1289,7 +1290,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     // One voice session per device (docs/VOICE-SESSIONS.md §2), on the shared engines.
     const recordings = join(options.dataDir, "recordings")
     const sessions: VoiceSessions = makeVoiceSessions({
-      make: (key, device, reserved) =>
+      make: (key, device, reserved, ended) =>
         makeVoiceSession({
           key,
           ...(device !== undefined ? { deviceId: device.id } : {}),
@@ -1299,7 +1300,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
           // P5: `CurrentTurn.room` and `.person` (the device's default person).
           place: () => deviceFacts.originOf(device?.id),
           // P5: "Don't use its speaker", or a declaration without one: nothing is sent to be played.
-          speakerAllowed: () => deviceFacts.speakerAllowed(device?.id),
+          speakerAllowed: () => deviceFacts.speakerAllowed(device?.id, device === undefined ? undefined : devices.kindOfDevice(device.id)),
           hearing: hearingOf(device?.id),
           ...(options.hearerSwitchWaitMs !== undefined ? { hearerSwitchWaitMs: options.hearerSwitchWaitMs } : {}),
           assistants: assistantsNow,
@@ -1308,9 +1309,12 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
           moduleOfTool: (name) => host.snapshot().toolModules.get(name) ?? null,
           routing: () => routing,
           turnTrace,
-          send: (message) => hub?.toSession(key, message),
+          // P5: an ended session (discarded, or its device's boundary changed) sends nothing to the device's next one.
+          send: (message) => {
+            if (!ended()) hub?.toSession(key, message)
+          },
           wakeHeard: (text, phrase, accepted, assistant) =>
-            hub?.wakeHeard(key, text, phrase, accepted, { ...(device !== undefined ? { deviceId: device.id } : {}), ...(assistant !== undefined ? { assistantId: assistant } : {}) }),
+            ended() ? undefined : hub?.wakeHeard(key, text, phrase, accepted, { ...(device !== undefined ? { deviceId: device.id } : {}), ...(assistant !== undefined ? { assistantId: assistant } : {}) }),
           onChange: (minor) => hub?.sessionsChanged(minor),
           onTrace: (trace) => {
             sessions.addTrace(trace)
@@ -1367,6 +1371,8 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       isPerson: (id) => people.get(id) !== undefined,
       // P5: device and device type saves check their default person against the committed Members, inside the gate.
       membersGate,
+      // P5: the setup's speaking flags follow what is sent (the override and the declaration).
+      speakerAllowed: (deviceId, kind) => deviceFacts.speakerAllowed(deviceId, kind),
       // TypeSafe is set up: the routing section is switched on, with a key and a valid address (WP-14).
       canAuto: routing.ready
     })
@@ -1398,7 +1404,6 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       household: push.hooks,
       targetDevice: deviceFacts.targetOf,
       onDeviceChange: deviceFacts.changed,
-      boundaryOf: deviceFacts.boundaryOf,
       speakerAllowed: deviceFacts.speakerAllowed,
       admin,
       health,
@@ -1456,6 +1461,15 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       if (module.id === SUBSCRIPTION_AGENT_ID && theEngine.status().engines.some((e) => e.provider === SUBSCRIPTION_PROVIDER)) theEngine.refreshStatus()
     })
     sections.subscribe((section) => hubNow.broadcast({ type: "section.changed", section: access.section(section) }))
+    // P5: the device boundary (`deviceFacts.ts`), in the step that commits a settings change: a device whose privacy,
+    // default person or output overrides changed (its own or its type's), or every device when a person left Members,
+    // has its session ended with its connections before anything else runs for it. The pages reconnect afresh.
+    const stopBoundary = store.onCommitted((before, after) => {
+      const everyone = membersRemoved(before, after)
+      const ended = hubNow.endSessions((deviceId, kind) => everyone || boundaryChanged(before, after, deviceId, kind))
+      if (ended > 0) runFork(Effect.logInfo(`Settings that decide what ${ended === 1 ? "a device" : `${ended} connections`} may be sent changed: the session started again`))
+    })
+    yield* Effect.addFinalizer(() => Effect.sync(stopBoundary))
     // P5: a person removed from Members is no device's default person any more (also at start, after a crash between
     // the two saves); devices and voice pages then follow the new places.
     const clearRemovedPeople = Effect.suspend(() => store.clearDefaultPeople(personIdsOf(sections.value(MEMBERS_KEY)))).pipe(

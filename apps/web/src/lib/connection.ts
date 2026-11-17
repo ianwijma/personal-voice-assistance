@@ -87,6 +87,9 @@ export const defaultTiming: Timing = {
   backoffMaxMs: 5000
 }
 
+/** P5: shown once the page is back after the server ended its session because a setting changed (`CloseCode.settingsChanged`). */
+export const SETTINGS_CHANGED_NOTICE = "Settings changed; the conversation started again"
+
 /** Microphone frames are dropped (not queued) when more than this is waiting to be sent: 500 ms of audio. */
 export const MIC_BUFFER_LIMIT = 16_000
 
@@ -143,6 +146,8 @@ export const makeConnection = (options: ConnectionOptions): Connection => {
   const pendingRequests = new Map<string, { resolve: (r: ResultMessage) => void; timer: ReturnType<typeof setTimeout> }>()
   let pingSeq = 0
   let outstandingPing: { id: number; at: number } | undefined
+  /** P5: the server ended this device's session because its settings changed: say so after the next welcome. */
+  let settingsChanged = false
 
   const isOpen = () => ws !== undefined && welcomed && ws.readyState === WebSocket.OPEN
 
@@ -222,6 +227,10 @@ export const makeConnection = (options: ConnectionOptions): Connection => {
         Deferred.doneUnsafe(welcomedSignal, Effect.void)
         const resumed = m.snapshot.role === "owner" && audio.running()
         if (resumed) micSeq = 0
+        if (settingsChanged) {
+          settingsChanged = false
+          store.dispatch({ type: "local/toast", message: SETTINGS_CHANGED_NOTICE, tone: "info" })
+        }
         hooks.afterWelcome?.(resumed)
         return
       }
@@ -359,6 +368,14 @@ export const makeConnection = (options: ConnectionOptions): Connection => {
       if (error.code === CloseCode.protocolMismatch) {
         store.dispatch({ type: "local/connection", status: "outdated", attempt: 0 })
         return
+      }
+      if (error.code === CloseCode.settingsChanged) {
+        // Not a failure: the device's session ended on purpose (P5). Back at once, with a fresh hello and session.
+        settingsChanged = true
+        failures = 0
+        store.dispatch({ type: "local/connection", status: "reconnecting", attempt: 1 })
+        yield* Effect.sleep(Duration.millis(timing.backoffBaseMs))
+        continue
       }
       if (error.welcomed) failures = 0
       failures++

@@ -214,6 +214,27 @@ export const newerSettings = (path: string, text: string | undefined): SettingsS
   })
 }
 
+/**
+ * P5: the newer-format refusal of a writable start, read before any write: `settings.json`, the journal's own version,
+ * and the settings on either side of an unfinished save (recovery would write one of them back).
+ */
+const newerOnDisk = async (settingsPath: string, journalPath: string): Promise<SettingsStoreError | undefined> => {
+  const onDisk = newerSettings(settingsPath, await readText(settingsPath))
+  if (onDisk !== undefined) return onDisk
+  const raw = await readText(journalPath)
+  if (raw === undefined) return undefined
+  const journal = parseOrUndefined(raw)
+  const newer = newerJournal(journalPath, journal)
+  if (newer !== undefined) return newer
+  if (!isRecord(journal)) return undefined
+  for (const side of [journal.prior, journal.next]) {
+    if (!isRecord(side) || typeof side.settings !== "string") continue
+    const inJournal = newerSettings(journalPath, side.settings)
+    if (inJournal !== undefined) return inJournal
+  }
+  return undefined
+}
+
 const decodeOverrides = Schema.decodeUnknownOption(ProfileOverrides)
 const decodeV3Device = Schema.decodeUnknownOption(V3DeviceRecord)
 const decodeAssistant = Schema.decodeUnknownOption(Assistant)
@@ -364,6 +385,11 @@ export const KEYS_LOCKED_MESSAGE = "Keys are locked — unlock them in Settings 
 export interface SettingsStore {
   readonly directory: string
   readonly settings: () => SettingsFile
+  /**
+   * P5: `listener(before, after)` runs synchronously in the step that commits a new settings state, before anything
+   * else can run (the device boundary, `serveMode.ts`). Returns an unsubscribe function.
+   */
+  readonly onCommitted: (listener: (before: SettingsFile, after: SettingsFile) => void) => () => void
   /** The secrets in effect: the vault's (empty while it is locked) once a vault exists, else `data/secrets.json`. */
   readonly secrets: () => SecretsFile
   /** Keys still in `data/secrets.json` (a count; 0 when the file is gone or empty). */
@@ -859,6 +885,10 @@ export const loadSettingsStore = (directory: string, options: LoadOptions = {}):
           kind = snapshot.kind
           texts = snapshot
         } else {
+          // A newer format stops the start before anything is written to the data directory (no leftover tidied, no
+          // journal recovered, nothing migrated): settings.json itself, and both sides of an unfinished save.
+          const refused = await newerOnDisk(settingsPath, journalPath)
+          if (refused !== undefined) throw refused
           const asidesBefore = await tidyLeftovers(directory, problems, gate)
           const recovered = await recover(directory, paths, options, problems, gate)
           const damaged = recovered === "damaged"
@@ -961,6 +991,22 @@ export const loadSettingsStore = (directory: string, options: LoadOptions = {}):
         : { version: 2, modules: loaded.vaultSecrets?.modules ?? {}, assistant: loaded.vaultSecrets?.assistant ?? {} }
       let revision = Math.max(settings.revision ?? 0, secrets.revision ?? 0, revisionOf(loaded.vaultText) ?? 0)
       const unblockListeners: Array<() => void> = []
+      /**
+       * P5: called synchronously in the step that makes a new state the committed one (before the save's caller runs
+       * again, and before any other fiber), with the state before and after. A listener's error is logged, never the
+       * save's.
+       */
+      const commitListeners = new Set<(before: SettingsFile, after: SettingsFile) => void>()
+      const notifyCommitted = (before: SettingsFile, after: SettingsFile) => {
+        if (before === after) return
+        for (const listener of commitListeners) {
+          try {
+            listener(before, after)
+          } catch (error) {
+            console.error("settings: a commit listener failed", error)
+          }
+        }
+      }
 
       const fromVault = (): SecretsFile => {
         const s = vault?.secrets()
@@ -1013,7 +1059,9 @@ export const loadSettingsStore = (directory: string, options: LoadOptions = {}):
       const saveNow = async (change: Change, after?: () => Promise<void>) => {
         if (readOnly) {
           const next = change({ settings, secrets: current() })
+          const committedBefore = settings
           settings = next.settings
+          notifyCommitted(committedBefore, settings)
           if (readOnlyVaultSecrets === undefined) secrets = next.secrets
           return
         }
@@ -1081,7 +1129,9 @@ export const loadSettingsStore = (directory: string, options: LoadOptions = {}):
           }
         }
         if (journaled) await removeJournalAfterSave()
+        const committedBefore = settings
         settings = next.settings
+        notifyCommitted(committedBefore, settings)
         secrets = next.secrets
         return true
       }
@@ -1107,7 +1157,9 @@ export const loadSettingsStore = (directory: string, options: LoadOptions = {}):
           await options.beforeStep?.("settings")
           await write(settingsPath, wantSettings, 0o644)
           disk.settings = wantSettings
+          const committedBefore = settings
           settings = JSON.parse(wantSettings) as SettingsFile
+          notifyCommitted(committedBefore, settings)
           return true
         }
         if (!unlocked) throw new KeysUnavailable(KEYS_LOCKED_MESSAGE)
@@ -1147,7 +1199,9 @@ export const loadSettingsStore = (directory: string, options: LoadOptions = {}):
         vaultDirty = false
         await removeJournalAfterSave()
         writer.adopt({ modules: next.secrets.modules, assistant: next.secrets.assistant }, revision)
+        const committedBefore = settings
         settings = nextSettings
+        notifyCommitted(committedBefore, settings)
         return true
       }
 
@@ -1405,6 +1459,10 @@ export const loadSettingsStore = (directory: string, options: LoadOptions = {}):
       const store: SettingsStore = {
         directory,
         settings: () => settings,
+        onCommitted: (listener) => {
+          commitListeners.add(listener)
+          return () => commitListeners.delete(listener)
+        },
         secrets: current,
         legacySecretCount: () => countKeys(secrets),
         importLegacySecrets,

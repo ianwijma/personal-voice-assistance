@@ -111,6 +111,12 @@ export const CloseCode = {
   helloTimeout: 4401,
   /** A message failed validation in a way that makes the connection unusable (e.g. binary frame before `hello`). */
   badMessage: 4402,
+  /**
+   * P5: a setting that decides what the device may be told or sent changed (its privacy, its default person, its
+   * speaker or display overrides, or a person left Members). The device's session ended with its connections; the
+   * page reconnects at once and starts a fresh session ("Settings changed; the conversation started again").
+   */
+  settingsChanged: 4205,
   /** The connection fell too far behind (send buffer over the limit); reconnect to get a fresh snapshot. */
   tooSlow: 4408,
   /** Connection limit reached. */

@@ -10,7 +10,7 @@ import {
   type Person,
   Setting
 } from "@pva/core"
-import { checkMembers, MAX_MEMBERS, type SettingsPatch, type SettingValue } from "@pva/protocol"
+import { checkMembersValue, MAX_MEMBERS, MEMBER_LIMITS, type SettingsPatch, type SettingValue } from "@pva/protocol"
 import { Effect, Semaphore } from "effect"
 import type { SectionDefinition } from "./sectionDefinitions.ts"
 
@@ -47,7 +47,8 @@ export const MEMBERS_ENV_REFUSED =
 
 /**
  * The one serialized operation over people and the references to them (see above). Every Members save and every
- * device or device type save runs inside `run`; a nested `run` is not allowed (it would wait for itself).
+ * device or device type save runs inside `run`; a nested `run` is not allowed (it would wait for itself). Admission
+ * can be interrupted; an admitted operation cannot (all-or-nothing, the caches included).
  */
 export interface MembersGate {
   readonly run: <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>
@@ -55,7 +56,10 @@ export interface MembersGate {
 
 export const makeMembersGate = (): MembersGate => {
   const lock = Semaphore.makeUnsafe(1)
-  return { run: (effect) => lock.withPermit(effect) }
+  // Waiting to be admitted may be interrupted (nothing happened). Once admitted the operation is uninterruptible: a
+  // Members save, the clean-up of the references it removed and the caches that follow the committed settings all
+  // happen, or (interrupted before admission) none does.
+  return { run: (effect) => lock.withPermit(Effect.uninterruptible(effect)) }
 }
 
 /** A one-line value (no line breaks, control characters or bidirectional overrides). */
@@ -63,17 +67,17 @@ const oneLine = (label: string) => (value: string): string | undefined =>
   NOT_ONE_LINE.test(value) ? `${label} must be one line, without control characters` : undefined
 
 const dietList = (label: string, description: string, placeholder: string) =>
-  Setting.textList({ label, description, maxItems: 30, itemMaxLength: 60, placeholder })
+  Setting.textList({ label, description, maxItems: MEMBER_LIMITS.dietItems, itemMaxLength: MEMBER_LIMITS.dietItem, placeholder })
 
 /** One record of `HOUSEHOLD_MEMBERS`. */
 const memberItem = {
-  id: Setting.text({ label: "Id", maxLength: 40 }),
-  name: Setting.text({ label: "Name", description: "As the household says it: \"Sam\".", maxLength: 60, placeholder: "Sam", check: oneLine("A name") }),
-  aliases: Setting.textList({ label: "Also called", description: "Other names people use for them: \"Sammie\", \"Mum\".", maxItems: 10, itemMaxLength: 40 }),
+  id: Setting.text({ label: "Id", maxLength: MEMBER_LIMITS.id }),
+  name: Setting.text({ label: "Name", description: "As the household says it: \"Sam\".", maxLength: MEMBER_LIMITS.name, placeholder: "Sam", check: oneLine("A name") }),
+  aliases: Setting.textList({ label: "Also called", description: "Other names people use for them: \"Sammie\", \"Mum\".", maxItems: MEMBER_LIMITS.aliases, itemMaxLength: MEMBER_LIMITS.alias }),
   pronunciation: Setting.text({
     label: "Pronunciation",
     description: "How the voice should say the name, spelled as it sounds (\"Shiv-awn\"). Empty: as written.",
-    maxLength: 60,
+    maxLength: MEMBER_LIMITS.pronunciation,
     check: oneLine("A pronunciation")
   }),
   allergies: dietList("Allergies", "Never in their food: \"nuts\", \"shellfish\". Empty: the household's.", "nuts"),
@@ -81,8 +85,11 @@ const memberItem = {
   dislikes: dietList("Dislikes", "Left out where possible: \"coriander\". Empty: the household's.", "coriander")
 }
 
-/** The Members list as a whole: `checkMembers` (protocol), the one check the server and the mock share. */
-const checkMembersList = (list: ReadonlyArray<{ readonly name: string; readonly aliases?: ReadonlyArray<string>; readonly pronunciation?: string }>) => checkMembers(list)
+/**
+ * The Members list as a whole: `checkMembersValue` (protocol), the one check the server and the mock share (here after
+ * each record's own fields were checked, so it adds the rules across records).
+ */
+const checkMembersList = (list: ReadonlyArray<unknown>) => checkMembersValue(list)
 
 /** The "Members" section: shared settings › Members. */
 export const membersSection: SectionDefinition = {
@@ -99,7 +106,7 @@ export const membersSection: SectionDefinition = {
     [MEMBERS_KEY]: Setting.records({
       label: "People",
       description:
-        "Each person's name, other names, and diet. A device points at one of them as its default person; removing someone clears that. Their stored data stays in the household database but is shown and told nowhere any more.",
+        "Each person's name, other names, and diet. A device points at one of them as its default person; removing someone clears that, and ends the session on every device (its pages reconnect and start a new conversation). Their stored data stays in the household database but is shown and told nowhere any more.",
       // Never from the environment (`MEMBERS_ENV_REFUSED`): ids are the server's.
       item: memberItem,
       itemLabel: "person",
@@ -112,24 +119,24 @@ export const membersSection: SectionDefinition = {
       label: "Household allergies",
       description: "For everyone who has none of their own: what the kitchen never suggests.",
       env: DIET_KEYS.allergies,
-      maxItems: 30,
-      itemMaxLength: 60,
+      maxItems: MEMBER_LIMITS.dietItems,
+      itemMaxLength: MEMBER_LIMITS.dietItem,
       placeholder: "nuts"
     }),
     [DIET_KEYS.diets]: Setting.textList({
       label: "Household diets",
       description: "For everyone who has none of their own.",
       env: DIET_KEYS.diets,
-      maxItems: 30,
-      itemMaxLength: 60,
+      maxItems: MEMBER_LIMITS.dietItems,
+      itemMaxLength: MEMBER_LIMITS.dietItem,
       placeholder: "vegetarian"
     }),
     [DIET_KEYS.dislikes]: Setting.textList({
       label: "Household dislikes",
       description: "For everyone who has none of their own.",
       env: DIET_KEYS.dislikes,
-      maxItems: 30,
-      itemMaxLength: 60,
+      maxItems: MEMBER_LIMITS.dietItems,
+      itemMaxLength: MEMBER_LIMITS.dietItem,
       placeholder: "coriander"
     })
   },
