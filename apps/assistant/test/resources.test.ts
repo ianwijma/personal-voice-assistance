@@ -240,14 +240,14 @@ describe("resource pool: language models", () => {
     expect(pool.keyFor("a")).toBe(llmKeyOf(withKey("one")))
   })
 
-  it("the default builder: offline builds the stand-in; an account without an adapter yet is a problem of that resource", async () => {
+  it("the default builder: offline builds the stand-in; an account that is not set up is a problem of that resource", async () => {
     const pool = await makePool({ buildLlm: defaultLlmBuilder(() => ConfigProvider.fromEnvRecord({})) })
     await run(pool.reconcile(wanted({
       a: llmSpecOf({ ...anthropic(""), account: "offline" }),
       b: llmSpecOf({ ...anthropic("some/model"), account: "openrouter" })
     })))
     expect(pool.status().find((r) => r.usedBy.includes("a"))).toMatchObject({ state: "ready", location: "local", label: "Offline stand-in" })
-    expect(pool.status().find((r) => r.usedBy.includes("b"))).toMatchObject({ state: "failed", problem: "The OpenRouter account is not available yet." })
+    expect(pool.status().find((r) => r.usedBy.includes("b"))).toMatchObject({ state: "failed", problem: "OpenRouter is not set up: add its API key in Shared settings › Language model accounts." })
     expect((await ask(pool.llmFor("a"))).length).toBeGreaterThan(0)
     await expect(ask(pool.llmFor("b"))).rejects.toBeInstanceOf(LlmError)
   })

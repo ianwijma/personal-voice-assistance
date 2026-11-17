@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest"
 import { assistantsServerExamples, exampleAdminSnapshot, exampleAssistantInfo, exampleDeviceType, serverExamples } from "@pva/protocol/examples"
 import {
   accountNotAvailableYet,
+  accountState,
   blankAssistantBody,
   copyName,
   deepEqual,
@@ -97,8 +98,16 @@ describe("accounts, names and new assistants", () => {
     expect(modelAfterAccountChange("anthropic", "qwen3-14b")).toBe("claude-haiku-5-5")
     expect(modelAfterAccountChange("home-model", "claude-haiku-5-5")).toBe("")
     expect(modelAfterAccountChange("home-model", "qwen3-14b")).toBe("qwen3-14b")
-    expect(accountNotAvailableYet("openrouter")).toBe(true)
+    expect(accountNotAvailableYet("openrouter")).toBe(false)
     expect(accountNotAvailableYet("anthropic")).toBe(false)
+  })
+  it("OpenRouter and the home model are set up when the server has the key / the address", () => {
+    const section = (values: Record<string, unknown>, secrets: Record<string, { set: boolean }> = {}) =>
+      ({ form: { values, secrets, fields: [], errors: [] } }) as never
+    expect(accountState("openrouter", [], [])).toMatchObject({ tone: "todo", text: "Set up…" })
+    expect(accountState("openrouter", [section({}, { OPENROUTER_API_KEY: { set: true } })], [])).toMatchObject({ tone: "ok", text: "Key set" })
+    expect(accountState("home-model", [section({ HOME_MODEL_BASE_URL: "" })], [])).toMatchObject({ tone: "todo" })
+    expect(accountState("home-model", [section({ HOME_MODEL_BASE_URL: "http://192.168.1.20:11434" })], [])).toMatchObject({ tone: "ok", text: "Address set" })
   })
   it("copy names are unique, case-insensitively, and fit the limit", () => {
     expect(copyName("Jeff", ["Jeff"])).toBe("Jeff copy")

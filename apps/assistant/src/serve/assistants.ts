@@ -64,6 +64,8 @@ export interface AssistantsOptions {
   readonly canAuto: () => boolean
   /** An assistant's hearing problems (its recogniser failed; the memory of several local speech models). WP-11. */
   readonly hearingProblems?: (assistantId: string) => ReadonlyArray<string>
+  /** An assistant's language-model problems (its account is not set up, its instance failed). WP-13b. */
+  readonly llmProblems?: (assistantId: string) => ReadonlyArray<string>
   /**
    * The save-time memory warning (docs/ASSISTANTS.md §9): a change that loads local speech models needing more than
    * 75 % of the free memory asks for "Save anyway". `place`: `device:<id>` or `type:<kind>` with its new settings.
@@ -202,8 +204,10 @@ export const makeAssistants = (options: AssistantsOptions): Assistants => {
         ...usedOn.filter((u) => u.reach === "unreachable").map((u) => `Cannot be reached on ${nameOf(u.target)}: no wake phrase and not the one that answers without a phrase.`)
       ]
       const resource = used ? engineResource : "unused"
+      const llmProblems = options.llmProblems?.(assistant.id) ?? []
+      problems.push(...llmProblems)
       problems.push(...(options.hearingProblems?.(assistant.id) ?? []))
-      return { ...assistant, usedOn: [...usedOn], resources: { llm: resource, voice: resource }, problems }
+      return { ...assistant, usedOn: [...usedOn], resources: { llm: used && llmProblems.length > 0 ? "failed" : resource, voice: resource }, problems }
     })
   }
 

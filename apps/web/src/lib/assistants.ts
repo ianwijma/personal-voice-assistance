@@ -172,14 +172,14 @@ export const modelAfterAccountChange = (account: LlmAccountId, model: string): s
   return (CLAUDE_MODELS as ReadonlyArray<string>).includes(model) ? "" : model
 }
 
-/** Whether the accounts the server has no builder for yet are chosen (docs/ASSISTANTS.md WP-13b). */
-export const accountNotAvailableYet = (account: LlmAccountId): boolean => account === "openrouter" || account === "home-model"
+/** Whether the server has no builder for an account (none now: WP-13b added OpenRouter and the home model). */
+export const accountNotAvailableYet = (_account: LlmAccountId): boolean => false
 
 export type AccountState = { readonly tone: "ok" | "todo" | "muted"; readonly text: string; readonly setUp?: ReadonlyArray<string> }
 
 /**
  * What the admin knows of an account, from the sections and agent modules: the Anthropic key, the subscription
- * module's state. The accounts the server cannot build yet say so.
+ * module's state, the OpenRouter key, the home model's address.
  */
 export const accountState = (
   id: LlmAccountId,
@@ -197,6 +197,17 @@ export const accountState = (
       const m = modules.find((x) => x.id === "claude-subscription")
       if (m?.enabled === true && m.state === "running") return { tone: "ok", text: "Logged in" }
       return { tone: "todo", text: "Set up…", setUp: ["shared", "accounts"] }
+    }
+    case "openrouter": {
+      const set = sections.some((s) => s.form.secrets.OPENROUTER_API_KEY?.set === true)
+      return set ? { tone: "ok", text: "Key set" } : { tone: "todo", text: "Set up…", setUp: ["shared", "accounts"] }
+    }
+    case "home-model": {
+      const set = sections.some((s) => {
+        const address = s.form.values.HOME_MODEL_BASE_URL
+        return typeof address === "string" && address.trim() !== ""
+      })
+      return set ? { tone: "ok", text: "Address set" } : { tone: "todo", text: "Set up…", setUp: ["shared", "accounts"] }
     }
     default:
       return { tone: "muted", text: "Not available yet" }

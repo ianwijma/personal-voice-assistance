@@ -102,6 +102,7 @@ describe("serve: key vault and admin access", () => {
       home: false,
       "language-model": true,
       "llm-behaviour": false,
+      "llm-openai-accounts": true,
       "stt-engine": true,
       "stt-timing": false,
       "stt-mic": false,

@@ -100,9 +100,13 @@ describe("language model accounts", () => {
       }
       expect(accountState("claude-subscription", [], [])).toMatchObject({ tone: "todo" })
     })
-    it("the accounts the server cannot build yet say so", () => {
-      expect(accountState("openrouter", [], [])).toEqual({ tone: "muted", text: "Not available yet" })
-      expect(accountState("home-model", [], [])).toEqual({ tone: "muted", text: "Not available yet" })
+    it("OpenRouter is ready when its key is set, the home model when its address is set", () => {
+      const withAddress = (address: string) => ({ form: { fields: [], secrets: {}, values: { HOME_MODEL_BASE_URL: address } } }) as unknown as SettingsSection
+      expect(accountState("openrouter", [section([], { OPENROUTER_API_KEY: { set: true } })], [])).toEqual({ tone: "ok", text: "Key set" })
+      expect(accountState("openrouter", [], [])).toMatchObject({ tone: "todo", setUp: ["shared", "accounts"] })
+      expect(accountState("home-model", [withAddress("http://localhost:11434/v1")], [])).toEqual({ tone: "ok", text: "Address set" })
+      expect(accountState("home-model", [withAddress("  ")], [])).toMatchObject({ tone: "todo", setUp: ["shared", "accounts"] })
+      expect(accountState("home-model", [], [])).toMatchObject({ tone: "todo" })
     })
   })
 })

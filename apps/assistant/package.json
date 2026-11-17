@@ -18,6 +18,7 @@
     "@pva/core": "workspace:*",
     "@pva/decide-typesafe": "workspace:*",
     "@pva/llm-anthropic": "workspace:*",
+    "@pva/llm-openai-compatible": "workspace:*",
     "@pva/module-home-assistant": "workspace:*",
     "@pva/modules-builtin": "workspace:*",
     "@pva/protocol": "workspace:*",
