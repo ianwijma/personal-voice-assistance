@@ -1,5 +1,8 @@
 import {
+  type AgentTurnSetup,
   type HostResult,
+  Llm,
+  LlmError,
   makeModuleHost,
   makeToolRegistry,
   makeTurnTrace,
@@ -18,12 +21,14 @@ import {
   type DeviceSettings,
   deviceTypeOf,
   effectiveDeviceSettings,
+  type EngineInfo,
   engineSummary,
   type ServerMessage,
   WEB_VOICE_DEVICE_TYPE,
   WEB_VOICE_KIND
 } from "@pva/protocol"
-import { Cause, Config, Effect, Exit, Fiber, FiberSet, Option, type Scope } from "effect"
+import { Cause, Config, ConfigProvider, Effect, Exit, Fiber, FiberSet, Option, type Scope, Stream } from "effect"
+import { createHash } from "node:crypto"
 import { isAbsolute, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 import { defaultSystemPrompt } from "../config.ts"
@@ -39,10 +44,19 @@ import {
   defaultProviderBuilder,
   type Engine,
   EngineBuildProblems,
-  type EngineProviders,
   makeEngine,
   type ProviderBuilder
 } from "./Engine.ts"
+import {
+  defaultLlmBuilder,
+  type LlmAccounts,
+  type LlmBuilder,
+  type LlmSpec,
+  llmSpecOf,
+  makeResourcePool,
+  type ReconcileOptions,
+  type ResourcePool
+} from "./Resources.ts"
 import { type EnvMover, makeEnvMover } from "./envSettings.ts"
 import { type HttpError, type HttpServer, startHttp, webDirExists } from "./http.ts"
 import { makeFrontends } from "./frontends.ts"
@@ -53,7 +67,7 @@ import { makeSections } from "./sections.ts"
 import { makeAssistants } from "./assistants.ts"
 import { deviceSettingsFrom } from "./devices.ts"
 import { makeSessionHub, type SessionHub } from "./SessionHub.ts"
-import { DataDirConfig, KEYS_LOCKED_MESSAGE, loadSettingsStore, SettingsStoreError } from "./SettingsStore.ts"
+import { DataDirConfig, KEYS_LOCKED_MESSAGE, loadSettingsStore, type SettingsStore, SettingsStoreError } from "./SettingsStore.ts"
 import { makeApi } from "./api.ts"
 import { makeAssistantVoice } from "./AssistantVoice.ts"
 import { type Favourites, makeFavourites } from "./Favourites.ts"
@@ -116,6 +130,14 @@ export interface ServeOptions {
   /** Checks before a reload stops the running engines. Default: `defaultPreflight` with the default builder, none otherwise. */
   readonly preflight?: Effect.Effect<void, EngineBuildProblems>
   /**
+   * Builds the resource pool's language-model instances (docs/ASSISTANTS.md §3.2; tests inject fakes). Default: the
+   * accounts' adapters (`defaultLlmBuilder`); with an injected `build` and no `buildLlm`, instances that answer with
+   * that build's `llm`.
+   */
+  readonly buildLlm?: LlmBuilder
+  /** Tests: how long an unused language-model instance is kept (default `RESOURCE_GRACE_MS`, 10 s). */
+  readonly resourceGraceMs?: number
+  /**
    * The environment with where each variable came from (`envView.ts`). Default: the process environment and the
    * `.env` files `env.ts` loaded; with `env`, that record (every variable from the process).
    */
@@ -152,7 +174,11 @@ export interface ServeHandle {
   readonly jobs: Jobs
   readonly models: Models
   readonly favourites: Favourites
-  /** Completes when the first engine build and module start have settled. */
+  /** The resource pool (the language models, docs/ASSISTANTS.md §3.2). */
+  readonly resources: ResourcePool
+  /** The settings store (every save reconciles the resource pool). Tests save assistants through it until WP-5. */
+  readonly store: SettingsStore
+  /** Completes when the first engine build, module start and resource builds have settled. */
   readonly ready: Effect.Effect<void>
 }
 
@@ -173,7 +199,12 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     // Before anything in the data directory is read or recovered, and held until the server stops: the one writer.
     const lock = yield* acquireDataDirLock(options.dataDir)
     // The environment and the catalog: what a version-3 file's migration reads, and what locks the migrated assistant.
-    const store = yield* loadSettingsStore(options.dataDir, { lock, vault, assistants: { env, catalog } })
+    // Every save may change which language models are wanted (assistants, devices, shared keys): the pool reconciles.
+    let resourcesChanged = () => {}
+    const store = notifyAfterSaves(
+      yield* loadSettingsStore(options.dataDir, { lock, vault, assistants: { env, catalog } }),
+      () => resourcesChanged()
+    )
     for (const problem of store.problems) yield* Effect.logError(problem)
     /**
      * Settings and keys that may come from two saves (a damaged journal): nothing that uses them starts. Every page
@@ -309,39 +340,166 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       }
     }
 
+    // ---- The resource pool: one language-model instance per distinct configuration (docs/ASSISTANTS.md §3.2, WP-9)
+
+    /** A shared setting as the providers read it (environment > saved > vault), or `undefined` when unset. */
+    const settingNow = (name: string): string | undefined => {
+      const exit = Effect.runSyncExit(
+        Effect.gen(function*() {
+          return yield* Config.String(name)
+        }).pipe(Effect.provideService(ConfigProvider.ConfigProvider, sections.configProvider()))
+      )
+      return Exit.isSuccess(exit) && exit.value !== "" ? exit.value : undefined
+    }
+    /** The accounts' shared settings an instance depends on: a changed address or key makes new instances. */
+    const llmAccounts = (): LlmAccounts => {
+      const key = settingNow("ANTHROPIC_API_KEY")
+      return {
+        anthropic: {
+          address: settingNow("ANTHROPIC_BASE_URL"),
+          credential: key === undefined ? "" : createHash("sha256").update(key).digest("hex").slice(0, 16)
+        }
+      }
+    }
+    /**
+     * What the pool must hold (§3.2 "Wanted"): the language model of every switched-on assistant that is on at least
+     * one effective list (a type defaults entry counts, and every known device's own list).
+     */
+    const wantedLlms = (): Map<string, LlmSpec> => {
+      const file = store.settings()
+      const listed = new Set<string>()
+      for (const kind of new Set([WEB_VOICE_KIND, ...Object.keys(file.deviceTypes)])) {
+        const type = deviceTypeOf(kind)
+        if (type === undefined) continue
+        for (const a of effectiveDeviceSettings(type.builtIn, file.deviceTypes[kind], undefined).assistants) listed.add(a.assistant)
+      }
+      for (const id of Object.keys(file.devices)) for (const a of deviceSettingsOf(id).assistants) listed.add(a.assistant)
+      const accounts = llmAccounts()
+      const wanted = new Map<string, LlmSpec>()
+      for (const assistant of assistantsNow().values()) {
+        if (assistant.on && listed.has(assistant.id)) wanted.set(assistant.id, llmSpecOf(assistant.llm, accounts))
+      }
+      return wanted
+    }
+    const explainProblem = (message: string): string => explainProblems([{ stage: "", message }])[0]!.message
+    // Tests that inject the shared build answer with its `llm`, through the pool (one instance per configuration still).
+    const engineLlmBuilder: LlmBuilder = () =>
+      Effect.succeed(Llm.of({
+        stream: (request) =>
+          Stream.suspend(() => {
+            const llm = engine?.built()?.providers.llm
+            return llm === undefined ? Stream.fail(new LlmError({ message: "The engines are not running." })) : llm.stream(request)
+          })
+      }))
+    /** Late-bound: every conversation is told when an assistant's binding may have changed its kind. */
+    let sessionsRef: VoiceSessions | undefined
+    const resources = yield* makeResourcePool({
+      buildLlm: options.buildLlm ?? (options.build === undefined ? defaultLlmBuilder(sections.configProvider) : engineLlmBuilder),
+      ...(options.resourceGraceMs !== undefined ? { graceMs: options.resourceGraceMs } : {}),
+      onChange: () => {
+        engine?.refreshStatus()
+        // A published binding can switch an assistant between the subscription agents and one model (`agentSetup`).
+        for (const session of sessionsRef?.all() ?? []) {
+          for (const c of session.conversation.dispatcher.conversations().values()) c.conversation.bindingChanged()
+        }
+      },
+      explainProblem,
+      log: (line) => runFork(Effect.logInfo(line))
+    })
+    const syncResources = (reconcile: ReconcileOptions = {}): Effect.Effect<void> =>
+      Effect.suspend(() => (store.blocked() !== undefined ? Effect.void : resources.reconcile(wantedLlms(), reconcile)))
+    resourcesChanged = () => run(syncResources())
+    /** A turn of an assistant the pool does not hold (not in use: off, or on no list) is answered with this. */
+    const notInUse = Llm.of({
+      stream: () => Stream.fail(new LlmError({ message: "This assistant is not in use on any device, so it has no language model." }))
+    })
+
     /**
      * One assistant's turn setup in one session (and its agent setup): its prompt, the Home line, the instructions
-     * of its modules and a registry of its tools. Rebuilt only when the module snapshot or the assistant changed (two
-     * reference compares per turn).
+     * of its modules, a registry of its tools, and its language model (the pool's instance for its `llm` settings,
+     * read here at the turn's start: a changed model applies from the next turn, once its instance is ready). Rebuilt
+     * only when the module snapshot, the assistant or its instance changed (reference compares per turn).
      */
     const conversationSetup = (assistantId: string) => {
-      let cached: { snapshot: ModuleSnapshot; assistant: Assistant | undefined; home: string | undefined; setup: TurnSetup; instructions: ReadonlyArray<string> } | undefined
+      let cached:
+        | { snapshot: ModuleSnapshot; assistant: Assistant | undefined; home: string | undefined; llm: Llm["Service"] | undefined; setup: TurnSetup; instructions: ReadonlyArray<string> }
+        | undefined
+      const llmNow = () => {
+        const bound = resources.llmFor(assistantId)
+        if (bound !== undefined) return bound
+        // Not reconciled since the assistant came into use: reconcile now. `reconcile` binds (and starts what is
+        // missing) synchronously before it waits for the builds, so with `startImmediately` the binding is there
+        // when the fork returns; the turn then waits on the instance being built.
+        runSync(Effect.asVoid(Effect.forkDetach(syncResources(), { startImmediately: true })))
+        return resources.llmFor(assistantId)
+      }
       const current = () => {
         const snapshot = host.snapshot()
         const assistant = assistantsNow().get(assistantId)
         const home = homeLine()
-        if (cached?.snapshot !== snapshot || cached.assistant !== assistant || cached.home !== home) {
+        const llm = llmNow()
+        if (cached?.snapshot !== snapshot || cached.assistant !== assistant || cached.home !== home || cached.llm !== llm) {
           // An assistant that does not exist (any more) is never routed; should a turn still start, it gets no tools.
           const mine = assistant === undefined ? { registry: makeToolRegistry([]), instructions: [] } : modulesFor(snapshot, assistant)
           const base = assistant?.prompt ?? defaultSystemPrompt
           const instructions = home === undefined ? mine.instructions : [home, ...mine.instructions]
-          cached = { snapshot, assistant, home, setup: { system: systemFor(base, instructions), registry: mine.registry }, instructions }
+          cached = { snapshot, assistant, home, llm, setup: { system: systemFor(base, instructions), registry: mine.registry, llm: llm ?? notInUse }, instructions }
         }
         return cached
       }
       const setup = Effect.sync((): TurnSetup => current().setup)
-      const agentSetup = (providers: EngineProviders) => {
-        if (providers.llmProvider !== SUBSCRIPTION_PROVIDER) return undefined
-        const toAgents = makeSubscriptionAgents({
-          fallbackLlm: providers.llm,
-          agents: () => host.snapshot().agents,
-          module: subscriptionModule,
-          promptFor: (agent, turn) =>
-            agent.systemPrompt === undefined ? turn.system : systemFor(agent.systemPrompt, current().instructions)
+      // A Claude subscription assistant: the agent module answers; the pool's instance is the offline stand-in.
+      let subscription: { readonly fallback: Llm["Service"]; readonly toAgents: (setup: TurnSetup) => AgentTurnSetup } | undefined
+      const agentSetup = () => {
+        // The account of the binding in use (a key starts with its account), not the saved one: while a changed
+        // model is still being built the old binding answers, the old way. Not bound yet: the saved account.
+        const key = resources.keyFor(assistantId)
+        const account = key === undefined ? assistantsNow().get(assistantId)?.llm.account : key.split("|")[0]
+        if (account !== SUBSCRIPTION_PROVIDER) return undefined
+        return Effect.map(setup, (turn) => {
+          const fallback = turn.llm ?? notInUse
+          if (subscription?.fallback !== fallback) {
+            subscription = {
+              fallback,
+              toAgents: makeSubscriptionAgents({
+                fallbackLlm: fallback,
+                agents: () => host.snapshot().agents,
+                module: subscriptionModule,
+                promptFor: (agent, t) => agent.systemPrompt === undefined ? t.system : systemFor(agent.systemPrompt, current().instructions)
+              })
+            }
+          }
+          return subscription.toAgents(turn)
         })
-        return Effect.map(setup, toAgents)
       }
       return { setup, agentSetup }
+    }
+
+    /** The engine list's `llm` row (pages before WP-6 read it): the first switched-on assistant's language model. */
+    const llmRow = (): EngineInfo => {
+      const all = [...assistantsNow().values()]
+      const first = all.find((a) => a.on) ?? all[0]
+      if (first === undefined) return { stage: "llm", provider: "fake", detail: "no assistant", location: "local" }
+      const account = first.llm.account
+      switch (account) {
+        case "offline":
+          return { stage: "llm", provider: "fake", detail: "offline stand-in", location: "local" }
+        case "anthropic":
+          return { stage: "llm", provider: "anthropic", detail: first.llm.model, location: "hosted" }
+        case "claude-subscription":
+          return { stage: "llm", provider: SUBSCRIPTION_PROVIDER, detail: subscriptionDetail(), location: "hosted" }
+        default:
+          return { stage: "llm", provider: account, detail: first.llm.model, location: "hosted" }
+      }
+    }
+    /** While the vault is locked, a key that "is not set" is really locked away. */
+    const explainProblems = (problems: ReadonlyArray<{ readonly stage: string; readonly message: string }>) => {
+      if (keys.state() !== "locked") return problems
+      const names = secretNames()
+      return problems.map((p) => {
+        const missing = /^([A-Z][A-Z0-9_]*) is not set$/.exec(p.message)?.[1]
+        return missing !== undefined && names.some((n) => missing.endsWith(n)) ? { ...p, message: KEYS_LOCKED_MESSAGE } : p
+      })
     }
 
     engine = yield* makeEngine({
@@ -365,17 +523,10 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
         // Which models are in use follows the running engines.
         if (hub !== undefined) broadcast({ type: "models", models: modelsRef?.list() ?? [] })
       },
-      describeEngines: (engines) =>
-        engines.map((e) => (e.stage === "llm" && e.provider === SUBSCRIPTION_PROVIDER ? { ...e, detail: subscriptionDetail(), location: "hosted" } : e)),
-      // While the vault is locked, a key that "is not set" is really locked away.
-      explainProblems: (problems) => {
-        if (keys.state() !== "locked") return problems
-        const names = secretNames()
-        return problems.map((p) => {
-          const missing = /^([A-Z][A-Z0-9_]*) is not set$/.exec(p.message)?.[1]
-          return missing !== undefined && names.some((n) => missing.endsWith(n)) ? { ...p, message: KEYS_LOCKED_MESSAGE } : p
-        })
-      },
+      // The language model is no longer the build's: its row comes from the assistants (and the pool's resources).
+      describeEngines: (engines) => [llmRow(), ...engines.filter((e) => e.stage !== "llm")],
+      resources: { status: resources.status, rebuild: syncResources({ rebuild: true }) },
+      explainProblems,
       blocked: settingsProblem
     })
     const theEngine = engine
@@ -469,6 +620,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       announce: (key, info, assistant) =>
         hub?.toSession(key, { type: "conversation", id: info.id, reason: "new", startedAt: info.startedAt, ...(assistant !== undefined ? { assistantId: assistant } : {}) })
     })
+    sessionsRef = sessions
     // Before the lock is released and the engines close (finalizers run in reverse): every session's loop stops, and
     // no recording write or rotation happens after it.
     yield* Effect.addFinalizer(() => sessions.closeAll)
@@ -516,6 +668,8 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       if (state === "unlocked" && theEngine.status().state === "failed") {
         run(Effect.flatMap(theEngine.reload, (r) => (r.ok ? Effect.logInfo("Engines reloaded after the keys were unlocked.") : Effect.void)))
       }
+      // Language models whose key was locked away (or changed) are built again; the others keep running.
+      run(syncResources({ retryFailed: state === "unlocked" }))
     })
 
     // The voice picker's API (docs/VOICE-PROVIDERS.md §5): providers, voices, previews, downloads, favourites.
@@ -611,6 +765,8 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     // reconcile after it starts that one once the operation has finished.
     const modulesStarted = yield* Effect.forkScoped(blockedAtStart ? Effect.void : Effect.andThen(host.startEnabled, reconcileModules))
     const engineStarted = yield* Effect.forkScoped(theEngine.start)
+    // Every wanted language model is built (and warmed) alongside the engines, before the first turn (§3.2).
+    const resourcesStarted = yield* Effect.forkScoped(syncResources())
     if (blockedAtStart) {
       // Called from inside the save, which may be a module operation that still holds that module's guard: the
       // module is started once that operation has finished (`whenIdle`), not refused as `busy` and forgotten.
@@ -630,15 +786,30 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
             // `startIfStopped`: after waiting out a `busy` (a reload the owner sent meanwhile), the engines
             // that reload brought up must not be rebuilt.
             whenIdle("the engines", () => true, theEngine.startIfStopped),
-            reconcileModules
-          ], { concurrency: 2, discard: true })
+            reconcileModules,
+            syncResources()
+          ], { concurrency: 3, discard: true })
         }))
       )
     }
-    const ready = Effect.asVoid(Effect.all([Fiber.await(modulesStarted), Fiber.await(engineStarted)]))
+    const ready = Effect.asVoid(Effect.all([Fiber.await(modulesStarted), Fiber.await(engineStarted), Fiber.await(resourcesStarted)]))
 
-    return { http, hub: hubNow, engine: theEngine, sessions, host, keys, vault, envView, envMover, jobs, models, favourites, ready }
+    return { http, hub: hubNow, engine: theEngine, sessions, host, keys, vault, envView, envMover, jobs, models, favourites, resources, store, ready }
   })
+
+/**
+ * `target` with every `save…`, `create…`, `delete…` and `import…` method followed, on success, by `after` (the
+ * settings store: the resource pool reconciles after each save).
+ */
+const notifyAfterSaves = <S extends object>(target: S, after: () => void): S => {
+  const out = { ...target } as Record<string, unknown>
+  for (const [name, value] of Object.entries(target)) {
+    if (typeof value !== "function" || !/^(save|create|delete|import)/.test(name)) continue
+    const method = value as (...args: Array<unknown>) => Effect.Effect<unknown, unknown>
+    out[name] = (...args: Array<unknown>) => Effect.tap(method.apply(target, args), () => Effect.sync(after))
+  }
+  return out as unknown as S
+}
 
 const isLoopback = (host: string) => host === "localhost" || host === "::1" || host.startsWith("127.")
 

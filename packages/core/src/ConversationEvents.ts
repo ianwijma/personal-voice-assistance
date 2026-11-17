@@ -4,6 +4,7 @@ import type { Agent, IntentDecisionInfo } from "./Agent.ts"
 import type { DecisionProvider } from "./Decision.ts"
 import type { SttEvent, ToolCall, ToolResult } from "./Domain.ts"
 import type { Router, RouterState } from "./Routing.ts"
+import type { Llm } from "./Services.ts"
 import type { ToolRegistry } from "./ToolRegistry.ts"
 import type { Trace, TurnOutcome } from "./TurnTrace.ts"
 
@@ -151,6 +152,13 @@ export interface TurnSetup {
   readonly system: string
   /** Immutable snapshot of the enabled modules' tools and context providers. */
   readonly registry: ToolRegistry["Service"]
+  /**
+   * The language model this turn uses from start to end (every round of its tool loop), in a single-model
+   * conversation (`makeConversationWithSetup`). Absent: the `Llm` the conversation was made with. Serve mode's
+   * resource pool sets it, so a changed model applies at the next turn start (docs/ASSISTANTS.md §3.2). Ignored by
+   * agent conversations (their agents hold their own model).
+   */
+  readonly llm?: Llm["Service"] | undefined
 }
 
 /**

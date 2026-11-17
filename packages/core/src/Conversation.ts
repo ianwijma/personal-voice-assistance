@@ -479,20 +479,29 @@ export const makeConversation = Effect.fnUntraced(function*(options: Conversatio
  * events and history carry no agent fields.
  */
 export const makeConversationWithSetup = Effect.fnUntraced(function*(options: ConversationSetupOptions) {
-  const llm = yield* Llm
-  const agent: Agent = {
-    id: "llm",
-    name: "Assistant",
-    kind: "model",
-    speculate: true,
-    firstEventTimeoutMs: Number.POSITIVE_INFINITY,
-    turn: makeModelAgent({ llm }).turn
+  const defaultLlm = yield* Llm
+  /** The one `model` agent over `llm` (a turn's `TurnSetup.llm`, else the conversation's). */
+  const agentSetOf = (llm: Llm["Service"]): AgentSet => {
+    const agent: Agent = {
+      id: "llm",
+      name: "Assistant",
+      kind: "model",
+      speculate: true,
+      firstEventTimeoutMs: Number.POSITIVE_INFINITY,
+      turn: makeModelAgent({ llm }).turn
+    }
+    return { router: singleAgentRouter(agent.id), agents: new Map([[agent.id, agent]]), defaultAgent: agent.id }
   }
-  const agents: AgentSet = { router: singleAgentRouter(agent.id), agents: new Map([[agent.id, agent]]), defaultAgent: agent.id }
+  const perLlm = new WeakMap<Llm["Service"], { readonly agents: AgentSet; readonly perRegistry: WeakMap<ToolRegistry["Service"], AgentSet> }>()
   // The registry's own action tools are the actions this turn offers (review round 7): a confirmation
   // is consumed against them, so one asked before a registry replacement is not run after it.
-  const perRegistry = new WeakMap<ToolRegistry["Service"], AgentSet>()
-  const agentsFor = (registry: ToolRegistry["Service"]): AgentSet => {
+  const agentsFor = (registry: ToolRegistry["Service"], llm: Llm["Service"]): AgentSet => {
+    let forLlm = perLlm.get(llm)
+    if (forLlm === undefined) {
+      forLlm = { agents: agentSetOf(llm), perRegistry: new WeakMap() }
+      perLlm.set(llm, forLlm)
+    }
+    const { agents, perRegistry } = forLlm
     const known = perRegistry.get(registry)
     if (known !== undefined) return known
     // A hand-made registry may have no action lookup (or no specs): then it offers no actions.
@@ -506,7 +515,10 @@ export const makeConversationWithSetup = Effect.fnUntraced(function*(options: Co
     return set
   }
   return yield* makeConversationCore(
-    { ...options, setup: Effect.map(options.setup, (s): AgentTurnSetup => ({ system: s.system, registry: s.registry, agents: agentsFor(s.registry) })) },
+    {
+      ...options,
+      setup: Effect.map(options.setup, (s): AgentTurnSetup => ({ system: s.system, registry: s.registry, agents: agentsFor(s.registry, s.llm ?? defaultLlm) }))
+    },
     true
   )
 })

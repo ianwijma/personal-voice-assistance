@@ -86,10 +86,11 @@ describe("serve: LLM_PROVIDER=claude-subscription", () => {
     const llm = scriptedLlm((t) => `You said: ${t}.`)
     server = await startTestServer({
       catalog: [claudeSubscriptionAgentModule({ sdk: fake.sdk, env: { PATH: "/usr/bin" } })],
+      // The migrated assistant's account (an install started from `.env`).
+      env: { LLM_PROVIDER: "claude-subscription" },
       build: fakeBuild({
         stt: stt.stt,
         llm: llm.llm,
-        llmProvider: "claude-subscription",
         engines: [{ stage: "llm", provider: "claude-subscription", detail: "Claude Code login", location: "hosted" }]
       })
     })

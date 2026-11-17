@@ -1,16 +1,19 @@
-import { type HostResult, Llm, Stt, Tts, type VoiceRef, voiceKey } from "@pva/core"
-import type { EngineInfo, EngineStatus, VoiceInfo } from "@pva/protocol"
+import { type HostResult, type Llm, Stt, Tts, type VoiceRef, voiceKey } from "@pva/core"
+import type { EngineInfo, EngineStatus, ResourceInfo, VoiceInfo } from "@pva/protocol"
 import * as SherpaStt from "@pva/stt-sherpa"
 import { Cause, Config, ConfigProvider, Context, Deferred, Effect, Exit, Fiber, FiberSet, Schema, type Scope } from "effect"
 import { AppConfig } from "../config.ts"
-import { LlmLayer, SttLayer, ttsProviderInfo } from "../providers.ts"
+import { SttLayer, ttsProviderInfo } from "../providers.ts"
 import { buildStages } from "../startup.ts"
 import { assistantVoice, ttsLayerFor, voiceEngineName, voiceLabel, voiceStageName } from "../voiceSelection.ts"
 
 /**
  * The shared engines of serve mode (docs/UI-AND-MODULES.md §1.7, §4.5; docs/VOICE-SESSIONS.md §2): the providers
- * (language model, speech-to-text, voices), in one scope that can be rebuilt in-process (`reload`) while the HTTP
- * server, the sockets, the module host and the voice sessions stay. It owns no conversation: every voice session
+ * that are still one shared build (speech-to-text, the voice), in one scope that can be rebuilt in-process (`reload`,
+ * the full reload of docs/ASSISTANTS.md §3.2) while the HTTP server, the sockets, the module host and the voice
+ * sessions stay; and the engine status, which also lists the resource pool's resources (`EngineOptions.resources`).
+ * The language models are the pool's (`Resources.ts`, WP-9): built per assistant configuration and switched at a
+ * turn start, never by this build. It owns no conversation: every voice session
  * attaches its loop (`attach`), which runs on each build and is stopped (keeping that session's history) when the
  * build ends. A build failure becomes `state: "failed"` with per-stage problems instead of exiting, so settings stay
  * editable from the UI.
@@ -22,10 +25,11 @@ export class EngineBuildProblems extends Schema.TaggedError<EngineBuildProblems>
 
 /** What one engine build provides. */
 export interface EngineProviders {
-  /** The language model (for `claude-subscription`: the offline stand-in that answers while the agent is not running). */
-  readonly llm: Llm["Service"]
-  /** `LLM_PROVIDER` as built. Default (absent): a single-model conversation over `llm`. */
-  readonly llmProvider?: string
+  /**
+   * Tests only: one language model for every assistant (serve mode's pool then hands out instances that answer with
+   * it, unless `ServeOptions.buildLlm` is given). The real builder leaves it out: language models are the pool's.
+   */
+  readonly llm?: Llm["Service"]
   readonly stt: Stt["Service"]
   /** The assistant's voice (docs/VOICE-PROVIDERS.md): every reply is spoken with it; its rate is the output rate. */
   readonly tts: Tts["Service"]
@@ -44,7 +48,7 @@ const read = <A>(config: Config.Config<A>): Effect.Effect<A, Config.ConfigError>
 })
 const configValue = <A>(config: Config.Config<A>, fallback: A): Effect.Effect<A> => Effect.orElseSucceed(read(config), () => fallback)
 
-/** The providers selected by the settings, as the CLI builds them (the assistant's voice, LLM, STT). */
+/** The shared providers selected by the settings (the assistant's voice, STT). The language models are the pool's. */
 export const defaultProviderBuilder: ProviderBuilder = Effect.gen(function*() {
   const resolved = yield* assistantVoice
   if ("problem" in resolved) return yield* new EngineBuildProblems({ problems: [{ stage: voiceStageName, message: resolved.problem }] })
@@ -55,26 +59,14 @@ export const defaultProviderBuilder: ProviderBuilder = Effect.gen(function*() {
   const voice = resolved.ref
   const { context, problems } = yield* buildStages([
     { stage: voiceStageName, layer: ttsLayerFor(voice) },
-    { stage: "language model (LLM_PROVIDER)", layer: LlmLayer },
     { stage: "speech-to-text (STT_PROVIDER)", layer: SttLayer }
   ])
   if (problems.length > 0) return yield* new EngineBuildProblems({ problems })
 
-  const llmProvider = yield* configValue(Config.String("LLM_PROVIDER"), "fake")
   const sttProvider = yield* configValue(Config.String("STT_PROVIDER"), "sherpa")
   const location = (ttsProviderInfo as Record<string, { readonly location: "local" | "hosted" } | undefined>)[voice.provider]?.location ?? "hosted"
+  // No `llm` row: serve mode adds the language model's from the pool (`EngineOptions.describeEngines`).
   const engines: Array<EngineInfo> = [
-    {
-      stage: "llm",
-      provider: llmProvider,
-      // claude-subscription: serve mode fills in the agent module's model (`EngineOptions.describeEngines`).
-      detail: llmProvider === "anthropic"
-        ? yield* configValue(Config.String("ANTHROPIC_MODEL"), "claude-haiku-5-5")
-        : llmProvider === "claude-subscription"
-        ? "Claude Code login"
-        : "offline stand-in",
-      location: llmProvider === "fake" ? "local" : "hosted"
-    },
     {
       stage: "stt",
       provider: sttProvider,
@@ -95,8 +87,6 @@ export const defaultProviderBuilder: ProviderBuilder = Effect.gen(function*() {
     location
   }]
   return {
-    llm: Context.get(context as Context.Context<Llm>, Llm),
-    llmProvider,
     stt: Context.get(context as Context.Context<Stt>, Stt),
     tts: Context.get(context as Context.Context<Tts>, Tts),
     voice,
@@ -127,6 +117,15 @@ export interface EngineOptions {
   readonly onStatus: (status: EngineStatus) => void
   /** Adjust the engine list shown (live details such as an agent module's model). Applied on every status. */
   readonly describeEngines?: (engines: ReadonlyArray<EngineInfo>) => ReadonlyArray<EngineInfo>
+  /**
+   * The resource pool (docs/ASSISTANTS.md §3.2): its resources are listed in every status (`EngineStatus.resources`),
+   * and a full reload (`reload`) also rebuilds every resource in use (`rebuild`, started alongside the build and not
+   * awaited by it; it interrupts nothing: each assistant switches at its next turn start once its new instance is ready).
+   */
+  readonly resources?: {
+    readonly status: () => ReadonlyArray<ResourceInfo>
+    readonly rebuild: Effect.Effect<void>
+  }
   /** Reword build problems for the owner (a missing key while the key vault is locked). */
   readonly explainProblems?: (
     problems: ReadonlyArray<{ readonly stage: string; readonly message: string }>
@@ -220,8 +219,10 @@ export const makeEngine = (options: EngineOptions): Effect.Effect<Engine, never,
     /** Completed by the first loop that fails (not by an interruption): the build then ends. */
     let loopFailed: Deferred.Deferred<Cause.Cause<unknown>> | undefined
 
-    const view = (s: EngineStatus): EngineStatus =>
-      options.describeEngines === undefined || s.engines.length === 0 ? s : { ...s, engines: options.describeEngines(s.engines) }
+    const view = (s: EngineStatus): EngineStatus => {
+      const described = options.describeEngines === undefined || s.engines.length === 0 ? s : { ...s, engines: options.describeEngines(s.engines) }
+      return options.resources === undefined ? described : { ...described, resources: options.resources.status() }
+    }
     const setStatus = (next: EngineStatus) => {
       status = next
       options.onStatus(view(next))
@@ -327,6 +328,8 @@ export const makeEngine = (options: EngineOptions): Effect.Effect<Engine, never,
           }
         }
         setStatus({ ...status, state })
+        // The full reload rebuilds the pool's resources too (interrupting no turn); the reload does not wait for it.
+        if (state === "reloading" && options.resources !== undefined) yield* Effect.forkIn(options.resources.rebuild, scope)
         if (fiber !== undefined) {
           yield* Fiber.interrupt(fiber)
           fiber = undefined

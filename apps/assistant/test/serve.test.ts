@@ -423,7 +423,8 @@ describe("serve: modules and settings", () => {
     expect((await a.waitFor("result", (m) => m.requestId === "r1", { timeoutMs: 10_000 })).ok).toBe(true)
     await b.waitFor("engine", (m) => m.engine.state === "ready", { from })
     const engines = b.messages.slice(from).filter((m) => m.type === "engine").map((m) => (m as { engine: { state: string; reloadPending: boolean; reloadPendingFor?: ReadonlyArray<string> } }).engine)
-    expect(engines.map((e) => e.state)).toEqual(["reloading", "ready"])
+    // The resource pool's rebuild during the reload announces its own changes (more `reloading` statuses).
+    expect(engines.map((e) => e.state).filter((s, i, all) => s !== all[i - 1])).toEqual(["reloading", "ready"])
     expect(engines.at(-1)!.reloadPending).toBe(false)
     expect(engines.at(-1)!.reloadPendingFor).toEqual([])
 

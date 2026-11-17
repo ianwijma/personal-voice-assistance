@@ -6,12 +6,12 @@
  */
 import { frameBytes, layerOutput, loadInputPcm, pacedFrames } from "@pva/audio-file"
 import { type AudioError, Conversation, type Llm, type ModuleSnapshot, Stt, type SttEvent, ToolRegistry, type Trace, type Tts, TurnTrace } from "@pva/core"
-import { Deferred, Effect, Layer, Option, Queue, type Scope, Stream } from "effect"
+import { Config, Deferred, Effect, Layer, Option, Queue, type Scope, Stream } from "effect"
 import { readdirSync, statSync } from "node:fs"
 import { basename, join } from "node:path"
 import type { ConversationOptions } from "@pva/core"
 import { startCliModules } from "../modules.ts"
-import { observedTurnTraceLayer, StartupError } from "../startup.ts"
+import { describeConfigError, observedTurnTraceLayer, StartupError } from "../startup.ts"
 import type { BenchRow } from "./report.ts"
 
 /** Expand directories into their `.wav` files (sorted); keep files as given. */
@@ -26,16 +26,18 @@ export const collectWavs = (paths: ReadonlyArray<string>): Effect.Effect<Array<s
     catch: (e) => new StartupError({ message: `bench --live: ${e instanceof Error ? e.message : String(e)}` })
   })
 
-/** `[--rounds N] [--sessions N] [--stagger MS] paths...` after `bench --live`. */
+/** `[--rounds N] [--sessions N] [--stagger MS] [--llm-per-session] paths...` after `bench --live`. */
 export const parseLiveArgs = (
   args: ReadonlyArray<string>
-): { rounds: number; sessions: number; staggerMs: number; paths: Array<string> } | string => {
+): { rounds: number; sessions: number; staggerMs: number; llmPerSession: boolean; paths: Array<string> } | string => {
   let rounds = 1
   let sessions = 1
   let staggerMs = 0
+  let llmPerSession = false
   const paths: Array<string> = []
   for (let i = 0; i < args.length; i++) {
-    if (args[i] === "--rounds") {
+    if (args[i] === "--llm-per-session") llmPerSession = true
+    else if (args[i] === "--rounds") {
       const n = Number(args[++i])
       if (!Number.isInteger(n) || n < 1) return "--rounds needs a positive whole number"
       rounds = n
@@ -49,7 +51,7 @@ export const parseLiveArgs = (
       staggerMs = n
     } else paths.push(args[i]!)
   }
-  return { rounds, sessions, staggerMs, paths }
+  return { rounds, sessions, staggerMs, llmPerSession, paths }
 }
 
 export interface LiveOptions {
@@ -74,6 +76,12 @@ export interface LiveSessionsOptions extends LiveOptions {
    * same moment (to the 20 ms frame), as when several people stop talking together.
    */
   readonly staggerMs?: number
+  /**
+   * Each session builds its own language-model instance from this layer (as serve mode's resource pool gives two
+   * assistants with different settings two instances: two HTTP clients, two connections). Absent: the one `Llm` of
+   * the environment is shared by every session.
+   */
+  readonly llmPerSession?: Layer.Layer<Llm, Config.ConfigError>
 }
 
 /** One 20 ms frame (`pacedFrames`). */
@@ -216,6 +224,10 @@ export const runLiveSessions = (
           n === 1 ? options.outputDir : join(options.outputDir, `s${i + 1}`),
           modules,
           n === 1 ? "" : `s${i + 1} `
+        ).pipe((session) =>
+          options.llmPerSession === undefined ? session : Effect.provide(session, options.llmPerSession).pipe(
+            Effect.mapError((e) => (e instanceof Config.ConfigError ? new StartupError({ message: `language model: ${describeConfigError(e)}` }) : e))
+          )
         ),
       { concurrency: "unbounded" }
     )
