@@ -85,6 +85,25 @@ login), P8 (search), P9.
 
 Leftovers for later pieces are listed in §6.
 
+## Status: extended fields and module routes (modules P3, protocol 10, 2026-11-18)
+
+The five extended field types (`textList`, `records`, `combo`, `action`, `info`; docs/AGENTS-AND-INTENTS.md §4.3) are
+members of `SettingField`, so every generated form (module, agent, section) can use them, and the generic renderers
+draw them (docs/UI-AND-MODULES.md §1.11, §3.7). Built:
+
+| Piece | Where | Notes |
+|---|---|---|
+| Protocol | `packages/protocol/src/settings.ts` (the five types, `FieldActionResult`), `client.ts` (`module.action`), `server.ts` (`Result.action`), `moduleRoutes.ts` | Protocol 10: new members of the closed field and value sets; `SettingFieldV2` & co. are aliases |
+| Core | `Settings.ts` (`Setting.textList`, `records`, `combo`, `action`, `info`; `isEditableSetting`), `SettingsExtra.ts` | Stored, loaded, resolved per layer (env, saved, an assistant's own values for `overridable` fields); `action`/`info` never saved or patched, left out of `SettingsOf` |
+| Host | `ModuleHost.ts` (`fieldAction(id, key, values?)`, the described form's info values, combo options and the agents' Test button) | 8 s, one press at a time, the draft only for `requiresSaved: false` |
+| Renderers | `fields/TextListField.tsx`, `RecordsField.tsx` (item fields through the same renderers), `ComboField.tsx`, `ActionField.tsx`, `InfoField.tsx`; `lib/forms.ts` (deep equality, buttons and info never in a patch); `settings/FieldRow.tsx` (no Custom/Reset marker on them) | One renderer per type (`ui/fieldRenderers.ts`, a missing one is a compile error) |
+| Module page | `settings/ModuleRoutes.tsx` | "Web addresses": routes, guards, limits, last calls, tokens (mint shows the secret once, revoke asks first) |
+| Modules | `modules-builtin/src/demoHome.ts` (rooms and lamps as records, Check, Switch everything off, Now), `module-home-assistant` (Test, Connected to, Rooms and lights) | |
+| Mock | `apps/web/mock/demoHome.ts` | The demo home with every new type, `module.action`, `/api/module-routes` |
+
+Sections do not declare buttons yet (a section's handler would be the server's: `settings.action` is still not in the
+protocol); a button outside a module form is shown disabled.
+
 ## Status: phase 2b (P4 and P7, 2026-11-14)
 
 **Built: P4 and P7** (protocol 4). Still not built: P6 (tools, Claude login: the jobs model is ready for it), P8, P9.
@@ -478,7 +497,7 @@ the module form), then embedded cards (tool card, downloads, engine list). It ma
 | Need | Existing | New / changed |
 |---|---|---|
 | Generated form | `SettingsForm.tsx` (draft, patch, server errors, stale "Changed in another tab", Advanced disclosure) | Save/Cancel move to a sticky page footer (one footer per page; with two forms on a page, Save saves both and reports per form); `visibleWhen`; warnings; "default"/"changed" marker + "Reset to default" per field (sends `null`, already supported by `SettingsPatch`) |
-| Field renderers | `fields/*.tsx`, `ui/fieldRenderers.ts` | Choice options render `tags` as chips and disable `unavailable` options with the reason and an inline action ("Download · 640 MB"); the v2 types from AGENTS-AND-INTENTS §4.3 when piece G lands |
+| Field renderers | `fields/*.tsx`, `ui/fieldRenderers.ts` | Choice options render `tags` as chips and disable `unavailable` options with the reason and an inline action ("Download · 640 MB"); the v2 types from AGENTS-AND-INTENTS §4.3 since protocol 10 (text lists, records, combos, buttons, info values; docs/UI-AND-MODULES.md §1.11) |
 | Module page | `ModuleCard.tsx` (switch, status, error/Retry, form, tools) | Becomes `ModulePage`: the same parts laid out as a page (switch in the header); `ModuleCard` stays for compact lists (Overview) |
 | Engines list, voices list | `AssistantTab.tsx` | Split: engines → Overview and the category pages; reload bar → global shell |
 | Device settings | `DeviceTab.tsx` | Split into three pages; no logic change |
