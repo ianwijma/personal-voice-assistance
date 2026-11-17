@@ -22,6 +22,25 @@ export type TraceMark = typeof traceMarks[number]
 
 export type TurnOutcome = "completed" | "interrupted" | "discarded" | "failed"
 
+/**
+ * The most entries a trace's own list (`Trace.events`) holds; later ones are dropped (the turn goes on). Below the
+ * protocol's 200 for the published time line, so the entries `traceTimeline` adds (marks, start, end) always fit.
+ */
+export const MAX_TRACE_EVENTS = 180
+/** The most entries the published time line has (protocol `TraceInfo.timeline`). */
+export const MAX_TIMELINE_ENTRIES = 200
+
+/**
+ * One entry of the time line (monotonic milliseconds, `at` absolute). Names are the protocol's `TRACE_EVENT_NAMES`
+ * (docs/ARCHITECTURE.md, Latency tracing); `ms` makes it a span that began at `at`.
+ */
+export interface TraceEventRecord {
+  readonly name: string
+  readonly at: number
+  readonly ms?: number
+  readonly detail?: string
+}
+
 /** One turn's timestamps (monotonic milliseconds). Mutated in place while the turn runs. */
 export interface Trace {
   readonly id: number
@@ -30,7 +49,14 @@ export interface Trace {
   speculative: boolean
   readonly startedAt: number
   readonly marks: Partial<Record<TraceMark, number>>
+  /** Tool calls (and actions) that ran, with how long each took (their start is a `tool`/`action` entry of `events`). */
   readonly tools: Array<{ readonly name: string; readonly ms: number }>
+  /**
+   * The time line beyond the marks: entries that are not "first time only" (per-round language-model events, tool and
+   * action spans, hearing and voice events; created when the first is added), in the order they were added (not sorted). `traceTimeline` joins them
+   * with the marks.
+   */
+  events?: Array<TraceEventRecord>
   /** Voices that spoke in this turn, in order of first use (filled by the voice router). */
   readonly voices: Array<string>
   /** The agent that answered (agent conversations; replaced when a fallback agent takes over). */
@@ -80,6 +106,11 @@ export const CurrentTurnTrace = Context.Reference<Trace | undefined>("@pva/core/
 export class TurnTrace extends Context.Service<TurnTrace, {
   begin(mode: Trace["mode"], speculative?: boolean): Trace
   mark(trace: Trace, mark: TraceMark): void
+  /**
+   * Append a time-line entry (synchronous, no Effect; dropped after `MAX_TRACE_EVENTS`). `at` defaults to now;
+   * give it for something that happened earlier (a hearing event, a tool's start).
+   */
+  event(trace: Trace, name: string, options?: { readonly at?: number; readonly ms?: number; readonly detail?: string }): void
   /** Record outcome, log one line with the deltas, keep it in the recent list. */
   finish(trace: Trace, outcome: TurnOutcome): Effect.Effect<void>
   readonly now: () => number
@@ -87,6 +118,44 @@ export class TurnTrace extends Context.Service<TurnTrace, {
 }>()("@pva/core/TurnTrace") {
   static readonly layer = (options: { readonly keep?: number; readonly now?: () => number } = {}) =>
     Layer.sync(TurnTrace, () => makeTurnTrace(options))
+}
+
+/** Append an entry to `trace.events` (what `TurnTrace.event` does, for code that has the time already). */
+export const addTraceEvent = (trace: Trace, name: string, at: number, ms?: number, detail?: string): void => {
+  const events = trace.events ??= []
+  if (events.length >= MAX_TRACE_EVENTS) return
+  events.push(ms === undefined ? (detail === undefined ? { name, at } : { name, at, detail }) : detail === undefined ? { name, at, ms } : { name, at, ms, detail })
+}
+
+/** The marks that appear on the time line under their own name (the others are covered by spans). */
+const markNames: ReadonlyArray<TraceMark> = traceMarks.filter((m) =>
+  m !== "actionStarted" && m !== "actionFinished" && m !== "routeSent" && m !== "routeReceived"
+)
+
+/**
+ * A trace's whole time line, absolute and sorted by `at`: the entries of `events`, the marks (unless an event of the
+ * same name is there: per-round entries replace the first-only mark), `turnStarted`, the `routing` span (from
+ * `routeSent`/`routeReceived`), `audible` (playback start plus the client's output latency) and `turnEnded` (detail:
+ * the outcome). Not for hot paths (it allocates): the publisher calls it when a turn ends.
+ */
+export const traceTimeline = (trace: Trace): Array<TraceEventRecord> => {
+  const out: Array<TraceEventRecord> = [{ name: "turnStarted", at: trace.startedAt }]
+  if (trace.events !== undefined) out.push(...trace.events)
+  const has = new Set(out.map((e) => e.name))
+  for (const m of markNames) {
+    const t = trace.marks[m]
+    if (t !== undefined && !has.has(m)) out.push({ name: m, at: t })
+  }
+  const sent = trace.marks.routeSent
+  if (sent !== undefined && !has.has("routing")) {
+    const got = trace.marks.routeReceived
+    out.push(got === undefined ? { name: "routing", at: sent } : { name: "routing", at: sent, ms: Math.max(0, got - sent) })
+  }
+  const start = trace.marks.playbackStart
+  if (trace.client !== undefined && start !== undefined) out.push({ name: "audible", at: start + trace.client.outputLatencyMs })
+  if (trace.endedAt !== undefined) out.push({ name: "turnEnded", at: trace.endedAt, ...(trace.outcome !== undefined ? { detail: trace.outcome } : {}) })
+  // Stable: entries with the same time keep the order they were added in (the mark order for marks).
+  return out.filter((e) => Number.isFinite(e.at)).map((e, i) => [e, i] as const).sort((a, b) => a[0].at - b[0].at || a[1] - b[1]).map(([e]) => e)
 }
 
 const ms = (n: number) => `${Math.round(n)}ms`
@@ -131,6 +200,7 @@ export const makeTurnTrace = (options: { readonly keep?: number; readonly now?: 
     mark: (trace, mark) => {
       if (trace.marks[mark] === undefined) trace.marks[mark] = now()
     },
+    event: (trace, name, opts) => addTraceEvent(trace, name, opts?.at ?? now(), opts?.ms, opts?.detail),
     finish: (trace, outcome) =>
       Effect.suspend(() => {
         trace.outcome = outcome

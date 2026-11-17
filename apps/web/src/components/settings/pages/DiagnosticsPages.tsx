@@ -7,6 +7,8 @@ import { shallowEqual } from "@/lib/store.ts"
 import { inputClass } from "../../fields/types.ts"
 import { useClient, useClientState } from "../../context.tsx"
 import { changedSince, factsOf, type LatencyContext, latencyTone, median, ROUTE_FILTERS, TRACE_COLUMNS, TraceRow, TracePopover, type TraceView, voiceLabel } from "../latency.tsx"
+import type { AxisMode } from "@/lib/traceTimeline.ts"
+import type { TraceTab } from "../TraceDetail.tsx"
 import { cx, Segmented } from "../../ui/controls.tsx"
 import { SELECT_CHEVRON } from "./assistants/parts.tsx"
 import { useVoiceNameOf } from "./AssistantsPage.tsx"
@@ -46,6 +48,9 @@ export function LatencyPage() {
   const [deviceFilter, setDevice] = useState("all")
   const [routeFilter, setRoute] = useState("all")
   const [open, setOpen] = useState<ReadonlySet<string>>(new Set())
+  // The open rows' tab and axis view are the page's, so they stay while other rows are opened (a reload resets them).
+  const [tab, setTab] = useState<TraceTab>("timeline")
+  const [axisMode, setAxisMode] = useState<AxisMode>("reply")
   const [pop, setPop] = useState<{ readonly key: string; readonly anchor: HTMLElement } | undefined>()
 
   const ctx: LatencyContext = {
@@ -140,7 +145,7 @@ export function LatencyPage() {
               </thead>
               <tbody>
                 {rows.map((v) => (
-                  <TraceRow key={v.key} view={v} open={open.has(v.key)} onToggle={() => toggle(v.key)} onPop={(anchor) => setPop(anchor === undefined ? undefined : { key: v.key, anchor })} />
+                  <TraceRow key={v.key} view={v} tab={tab} onTab={setTab} mode={axisMode} onMode={setAxisMode} open={open.has(v.key)} onToggle={() => toggle(v.key)} onPop={(anchor) => setPop(anchor === undefined ? undefined : { key: v.key, anchor })} />
                 ))}
               </tbody>
             </table>
@@ -205,21 +210,29 @@ function ScrollX({ label, children }: { readonly label: string; readonly childre
     }
   }, [])
   const scrolls = more.left || more.right
-  const mask = more.left && more.right
-    ? "linear-gradient(to right, transparent, black 24px, black calc(100% - 24px), transparent)"
-    : more.right ? "linear-gradient(to right, black calc(100% - 32px), transparent)" : more.left ? "linear-gradient(to right, transparent, black 24px)" : undefined
-  return (
+  // The fade at an edge with more to scroll to is an overlay, not a mask, so a sticky open row (z-20) stays readable above it.
+  const fade = (side: "left" | "right") => (
     <div
-      ref={ref}
-      role="region"
-      aria-label={scrolls ? `${label} (scrolls sideways)` : label}
-      tabIndex={scrolls ? 0 : undefined}
-      data-testid="latency-table"
-      data-scrolls={scrolls ? "true" : "false"}
-      style={mask === undefined ? undefined : { maskImage: mask, WebkitMaskImage: mask }}
-      className="overflow-x-auto rounded-sm scrollbar-quiet"
-    >
-      {children}
+      aria-hidden="true"
+      className={cx("pointer-events-none absolute inset-y-0 z-10 w-6", side === "left" ? "left-0" : "right-0")}
+      style={{ background: `linear-gradient(to ${side === "left" ? "right" : "left"}, var(--color-bg), transparent)` }}
+    />
+  )
+  return (
+    <div className="relative">
+      <div
+        ref={ref}
+        role="region"
+        aria-label={scrolls ? `${label} (scrolls sideways)` : label}
+        tabIndex={scrolls ? 0 : undefined}
+        data-testid="latency-table"
+        data-scrolls={scrolls ? "true" : "false"}
+        className="overflow-x-auto rounded-sm scrollbar-quiet"
+      >
+        {children}
+      </div>
+      {more.left && fade("left")}
+      {more.right && fade("right")}
     </div>
   )
 }

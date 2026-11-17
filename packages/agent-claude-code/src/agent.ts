@@ -1,6 +1,7 @@
 import {
   type Agent,
   type AgentEvent,
+  addTraceEvent,
   AgentError,
   type AgentImplementation,
   type AgentTurnInput,
@@ -421,6 +422,8 @@ export const makeClaudeAgent = async (options: ClaudeAgentOptions): Promise<Clau
           slot.syncedThrough = start + input.history.length
           const text = composeMessage({ instructions: acquired.instructions, earlier, context: input.context, text: input.text })
 
+          /** The trace clock (`input.now`), the scale of every mark and time-line entry of the turn. */
+          const clock = input.now ?? (() => performance.now())
           let textSinceTool = false
           let toolCalls = 0
           let callIds = 0
@@ -438,19 +441,22 @@ export const makeClaudeAgent = async (options: ClaudeAgentOptions): Promise<Clau
             }
             const call: ToolCall = { id: `claude-${input.turnId}-${++callIds}`, name, input: args }
             emit({ _tag: "ToolStarted", call })
-            const started = performance.now()
+            let started = clock()
             try {
               if (!input.tools.isSpeculative(name)) await Effect.runPromise(input.promoted, { signal: controller.signal })
+              // The tool's own time: after the wait for the turn to be confirmed (a speculative turn's tool span must not begin before 0).
+              started = clock()
               const ran = await Effect.runPromise(input.tools.run(call), { signal: controller.signal })
               // A failed tool returns its error as a result (it does not throw): a diagnostic, redacted like the
               // catch path's (after the final review). A successful result is content and passes untouched.
               const result = ran.isError ? { ...ran, content: redact(ran.content, secrets) } : ran
-              const ms = Math.round(performance.now() - started)
+              const ms = Math.round(clock() - started)
               input.trace.tools.push({ name, ms })
+              addTraceEvent(input.trace, "tool", started, ms, name)
               emit({ _tag: "ToolFinished", result, ms })
               return { content: result.content, isError: result.isError }
             } catch (e) {
-              const ms = Math.round(performance.now() - started)
+              const ms = Math.round(clock() - started)
               const result = { id: call.id, name, content: `Tool did not finish: ${fromUpstream(e, secrets)}`, isError: true }
               emit({ _tag: "ToolFinished", result, ms })
               return { content: result.content, isError: true }
@@ -505,7 +511,10 @@ export const makeClaudeAgent = async (options: ClaudeAgentOptions): Promise<Clau
                   return
                 }
                 case "result": {
-                  if (m.subtype === "success" && !m.is_error) return finish()
+                  if (m.subtype === "success" && !m.is_error) {
+                    addTraceEvent(input.trace, "llmDone", clock())
+                    return finish()
+                  }
                   if (m.subtype === "error_max_turns") return finish()
                   // Redacted whole, then shortened (`clip`): a cut first could leave part of a secret unrecognisable.
                   const detail = m.subtype === "success" ? clip(m.result, secrets, 200) : redact(String(m.subtype), secrets)

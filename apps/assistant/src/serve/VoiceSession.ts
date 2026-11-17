@@ -1,5 +1,6 @@
 import { makeWebAudio, type WebAudio } from "@pva/audio-web"
 import {
+  addTraceEvent,
   type AgentTurnSetup,
   type ConversationEvent,
   type ConversationInput,
@@ -13,6 +14,7 @@ import {
   type RouteResult,
   type Stt,
   type SttEvent,
+  type UtteranceTimes,
   type Trace,
   type TurnSetup,
   TurnTrace,
@@ -255,6 +257,8 @@ export const assistantTurnTrace = (
     readonly route?: () => TraceRoute | undefined
     /** The routing call's times (trace clock) of the route, when TypeSafe was asked. */
     readonly routeTimes?: () => Pick<RouteDecision, "sentAt" | "receivedAt"> | undefined
+    /** When the route was decided and its wake phrase heard (trace clock; the time line's `assistantChosen`, `wakePhrase`). */
+    readonly routedAt?: () => { readonly chosenAt: number; readonly phraseAt?: number; readonly phrase?: string } | undefined
     /** The configuration snapshot of the turn (docs/ASSISTANTS.md §3.7), read once at its start; never changed after. */
     readonly config?: () => TraceConfig | undefined
   }
@@ -264,6 +268,13 @@ export const assistantTurnTrace = (
     const times = fields.routeTimes?.()
     delete trace.marks.routeSent
     delete trace.marks.routeReceived
+    // The route may be decided again at the final: its entries are replaced.
+    if (trace.events !== undefined) trace.events = trace.events.filter((e) => e.name !== "wakePhrase" && e.name !== "assistantChosen")
+    const at = fields.routedAt?.()
+    if (at !== undefined) {
+      if (at.phraseAt !== undefined) addTraceEvent(trace, "wakePhrase", at.phraseAt, undefined, at.phrase)
+      addTraceEvent(trace, "assistantChosen", at.chosenAt, undefined, trace.assistant?.id)
+    }
     if (times === undefined) return
     trace.marks.routeSent = times.sentAt
     if (times.receivedAt !== undefined) trace.marks.routeReceived = times.receivedAt
@@ -302,6 +313,7 @@ export const assistantTurnTrace = (
         }
       }
     },
+    event: shared.event,
     finish: shared.finish,
     recent: shared.recent
   })
@@ -612,6 +624,7 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
 
     const dispatcher = makeSessionDispatcher<Target>({
       replyEarly: (assistant) => assistantOf(assistant)?.replyEarly ?? true,
+      now: options.turnTrace.now,
       decide,
       // The device may have changed while TypeSafe was asked: the answer goes only to an assistant it still has, and
       // to nobody once the device no longer routes by TypeSafe.
@@ -643,6 +656,12 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
                 return { id: assistant, name: a?.name ?? assistant }
               },
               route: () => traceRouteOf(assistant),
+              routedAt: () => {
+                const t = dispatcherRef?.routedAtOf(assistant)
+                if (t === undefined) return undefined
+                const r = dispatcherRef?.routeOf(assistant)
+                return r?.by === "phrase" ? { ...t, phrase: r.phrase } : t
+              },
               routeTimes: () => {
                 const r = dispatcherRef?.routeOf(assistant)
                 return r?.by === "decide" ? r.decision : undefined
@@ -703,8 +722,29 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
      * route gate drops reaches no page, no history, no agent and no recording (`heard.discard`); its text goes only
      * to admin pages with the phrase tester on (`wake.heard`).
      */
-    const onStt = (event: SttEvent): Effect.Effect<void> =>
+    /** The open utterance's times (trace clock), shared by its events; see `UtteranceTimes`. */
+    let utterance: UtteranceTimes | undefined
+    /** Stamp the recogniser's events where they enter the session: before any gate can hold them back. */
+    const stamp = (event: SttEvent): SttEvent => {
+      switch (event._tag) {
+        case "SpeechStarted":
+          if (utterance === undefined) utterance = { startedAt: options.turnTrace.now() }
+          return utterance === undefined || event.heard === utterance ? event : { ...event, heard: utterance }
+        case "Interim":
+          if (utterance !== undefined && utterance.firstInterimAt === undefined && event.text.trim() !== "") {
+            utterance.firstInterimAt = options.turnTrace.now()
+          }
+          return event
+        case "EndOfTurn":
+          utterance = undefined
+          return event
+        default:
+          return event
+      }
+    }
+    const onStt = (input: SttEvent): Effect.Effect<void> =>
       Effect.suspend(() => {
+        const event = stamp(input)
         const t = now()
         if (event._tag !== "EndOfTurn") heard.event(event)
         const echo = gate.filter(event, t)

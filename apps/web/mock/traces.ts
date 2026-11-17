@@ -1,9 +1,9 @@
 /**
  * The mock's seeded latency traces (scenario `latency`): turns of every route kind (phrase, armed, follow-up, without a
  * phrase, typed, TypeSafe chosen / none fits / timed out / error) with configuration snapshots, some of which differ
- * from what the assistants are set to now ("changed since"), and two without a snapshot (an older server).
+ * from what the assistants are set to now ("changed since"), and two from an older server (turn 36 without a snapshot, turn 37 with one but no time line or module lists).
  */
-import type { TraceConfig, TraceInfo } from "@pva/protocol"
+import type { TraceConfig, TraceEvent, TraceInfo } from "@pva/protocol"
 
 const SPARK = "sherpa:en_US-lessac-medium"
 const HEART = "sherpa:kokoro-af_heart"
@@ -16,6 +16,8 @@ const JEFF: TraceConfig = {
   voice: SPARK,
   modules: 3,
   tools: 4,
+  moduleList: [{ id: "clock", name: "Clock" }, { id: "weather", name: "Weather" }, { id: "home", name: "Home state" }],
+  toolList: [{ name: "time_in", module: "clock" }, { name: "set_timer", module: "clock" }, { name: "weather", module: "weather" }, { name: "home_state", module: "home" }],
   replyEarly: true,
   toolRounds: 5
 }
@@ -25,6 +27,8 @@ const T3: TraceConfig = {
   voice: HEART,
   modules: 2,
   tools: 4,
+  moduleList: [{ id: "t3", name: "T3 threads" }, { id: "clock", name: "Clock" }],
+  toolList: [{ name: "t3_start_thread", module: "t3" }, { name: "t3_list_threads", module: "t3" }, { name: "time_in", module: "clock" }, { name: "set_timer", module: "clock" }],
   replyEarly: false,
   toolRounds: 8
 }
@@ -34,6 +38,8 @@ const KEUKEN: TraceConfig = {
   voice: PIM,
   modules: 2,
   tools: 4,
+  moduleList: [{ id: "notes", name: "Notes" }, { id: "home", name: "Home state" }],
+  toolList: [{ name: "add_note", module: "notes" }, { name: "read_notes", module: "notes" }, { name: "home_state", module: "home" }, { name: "set_light", module: "home" }],
   replyEarly: true,
   toolRounds: 5
 }
@@ -65,6 +71,68 @@ interface Seed {
   readonly voice: string
 }
 
+/**
+ * A realistic time line for a seed, derived from its numbers (the marks are repeated in it, as the server does). A
+ * voice turn starts with 1.5 to 3.7 s of speaking; a wake phrase comes first in it; TypeSafe's routing is the span
+ * `make` already puts before the end of the turn; a turn with tools has two language-model rounds (the first ends in
+ * the tool calls, the second's first token is the seed's); an early turn starts work 330 ms before the end (negative
+ * times); a typed turn has no hearing. Seed 36 and 37 get none (an older server).
+ */
+const timelineOf = (s: Seed, sent: number | undefined): Array<TraceEvent> => {
+  const [t0, t1, t2] = s.t
+  const out: Array<TraceEvent> = []
+  const ev = (name: string, at: number, extra?: Partial<TraceEvent>) => out.push({ name, at: Math.round(at * 10) / 10, ...extra })
+  const voice = s.text !== true
+  const talk = -(1500 + ((s.n * 173) % 2200))
+  if (voice) {
+    ev("speechStarted", talk)
+    ev("firstInterim", talk + 380)
+    if (s.route.by === "phrase" || s.route.by === "armed") ev("wakePhrase", talk + 700, { detail: s.route.phrase })
+    if (s.early === true) {
+      ev("eagerEndOfTurn", -330, { detail: "42 characters" })
+      ev("turnStarted", -330, { detail: "early" })
+    }
+    ev("endOfTurn", 0)
+  } else ev("turnStarted", 0, { detail: "typed" })
+  if (s.route.by === "typesafe" && sent !== undefined) {
+    ev("routing", sent, { ms: s.route.ms, detail: s.route.outcome })
+    ev("assistantChosen", sent + s.route.ms, { detail: s.route.outcome === "chosen" ? NAMES[s.a] : `${NAMES[s.a]} (fallback)` })
+  } else ev("assistantChosen", s.early === true ? -325 : 2, { detail: NAMES[s.a] })
+  const first = s.early === true ? -322 : 4
+  const tools = s.tools ?? []
+  if (tools.length === 0) {
+    ev("llmRequestSent", first, { detail: "round 1" })
+    ev("llmFirstToken", t0, { detail: "round 1" })
+  } else {
+    const tok = Math.round(t0 * 0.4)
+    const done = tok + 90
+    ev("llmRequestSent", first, { detail: "round 1" })
+    ev("llmFirstToken", tok, { detail: "round 1" })
+    ev("llmDone", done, { detail: "round 1" })
+    let at = done + 2
+    for (const x of tools) {
+      ev("tool", at, { ms: x.ms, detail: x.name })
+      at += x.ms + 1
+    }
+    ev("llmRequestSent", at + 1, { detail: "round 2" })
+    ev("llmFirstToken", t0, { detail: "round 2" })
+  }
+  const ttsReq = t1 - 38
+  ev("llmDone", ttsReq + 40, { detail: tools.length === 0 ? "round 1" : "round 2" })
+  ev("firstClause", ttsReq - 6, { detail: "clause 1" })
+  ev("ttsFirstAudio", t1)
+  ev("ttsDone", t1 + 140 + (s.n % 5) * 30)
+  ev("audioSent", t1 + 3)
+  ev("playbackStart", t2)
+  ev("audible", t2 + s.lag)
+  const end = t2 + s.lag + (s.outcome === "interrupted" ? 380 : 2200 + ((s.n * 40) % 900))
+  ev("playbackEnd", end)
+  ev("turnEnded", end + 5, { detail: s.outcome ?? "completed" })
+  return out.sort((a, b) => a.at - b.at)
+}
+
+const withoutLists = ({ moduleList: _m, toolList: _t, ...c }: TraceConfig): TraceConfig => c
+
 const make = (s: Seed): TraceInfo => {
   const ts = s.route.by === "typesafe"
   const sent = ts ? -(s.route.ms + 240) : undefined
@@ -87,7 +155,9 @@ const make = (s: Seed): TraceInfo => {
     deviceId: DEVICES[s.d].id,
     device: DEVICES[s.d].name,
     route: s.route,
-    ...(s.config !== undefined ? { config: s.config } : {})
+    ...(s.config !== undefined ? { config: s.n > 37 ? s.config : withoutLists(s.config) } : {}),
+    // Seed 36 and 37 stand for an older server: no time line (and 36 no snapshot at all).
+    ...(s.n > 37 ? { timeline: timelineOf(s, sent) } : {})
   }
 }
 

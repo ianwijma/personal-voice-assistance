@@ -125,10 +125,13 @@ describe("claude-subscription agent", () => {
       })
       const agent = yield* Effect.promise(() => makeClaudeAgent({ ...agentOptions, sdk: fake.sdk }))
       const promoted = yield* Deferred.make<void>()
-      const input = makeInput({ promoted: Deferred.await(promoted), speculative: true })
+      // The trace clock is the agent's only clock: a fake one that only the test moves.
+      let clock = 1000
+      const input = makeInput({ promoted: Deferred.await(promoted), speculative: true, now: () => clock })
       const fiber = yield* Effect.forkChild(collect(agent.turn(input)))
       yield* Effect.sleep("50 millis")
       assert.isUndefined(fiber.pollUnsafe()) // the side-effecting tool waits for promotion
+      clock = 1500 // the turn is confirmed this much later
       yield* Deferred.succeed(promoted, undefined)
       const events = yield* Fiber.join(fiber)
       expect(events.map((e) => e._tag)).toEqual(["TextDelta", "TextDelta", "ToolStarted", "ToolFinished", "TextDelta"])
@@ -138,6 +141,10 @@ describe("claude-subscription agent", () => {
       const finished = events[3] as Extract<AgentEvent, { _tag: "ToolFinished" }>
       expect(finished.result).toMatchObject({ name: "lights_on", content: "Kitchen lights on", isError: false })
       expect(input.traceObj.tools.map((t) => t.name)).toEqual(["lights_on"])
+      // The tool span begins once the turn was confirmed (not at the call), on the trace clock.
+      const span = input.traceObj.events!.find((e) => e.name === "tool")!
+      expect(span).toMatchObject({ at: 1500, detail: "lights_on" })
+      expect(span.ms).toBe(0)
       agent.shutdown()
     }))
 

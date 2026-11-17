@@ -22,8 +22,20 @@
  * must therefore send `SpeechStarted` again before the rest of it if it has already closed the first
  * part with an `EndOfTurn`. Typed text, `Say` and Stop are not recogniser events and are never ignored.
  */
+/**
+ * When the recogniser's events of one utterance arrived (trace clock), stamped by the session where they enter it and
+ * shared by reference between that utterance's events: a gate that holds events back (the echo gate in `confirm`
+ * mode, the route gate until a phrase, the dispatcher until TypeSafe has answered) does not make the utterance look
+ * late. `firstInterimAt` is filled in as the first non-blank `Interim` arrives, so it can be read later from the
+ * `SpeechStarted` that carries the object. Optional: absent in tests and wherever no session stamps events.
+ */
+export interface UtteranceTimes {
+  readonly startedAt: number
+  firstInterimAt?: number
+}
+
 export type SttEvent =
-  | { readonly _tag: "SpeechStarted" }
+  | { readonly _tag: "SpeechStarted"; readonly heard?: UtteranceTimes }
   | { readonly _tag: "Interim"; readonly text: string }
   | { readonly _tag: "EagerEndOfTurn"; readonly text: string }
   | { readonly _tag: "TurnResumed" }

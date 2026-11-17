@@ -309,6 +309,28 @@ describe("SessionDispatcher: routing (recorder fakes)", () => {
       ])
     }))
 
+  it.effect("decide: a second call for the final that picks the same assistant is a new decision (a new time for the choice)", () =>
+    Effect.gen(function*() {
+      let clock = 1000
+      const decide: DecideRoute = () => {
+        const sentAt = clock
+        clock += 50
+        return Effect.succeed({ assistant: "alpha", fallback: false, decision: { outcome: "chosen", ms: 50, sentAt, receivedAt: clock } })
+      }
+      const r = recorder({ decide, now: () => clock })
+      const feed = feedVia(makeRouteGate(routeConfig({ withoutPhrase: "decide", fallback: null })), r.dispatcher)
+      yield* feed([speechStarted, eagerEndOfTurn("play music")])
+      const first = r.dispatcher.routedAtOf("alpha")!
+      assert.strictEqual(first.chosenAt, 1050, "chosen once the first answer arrived")
+      clock += 200
+      yield* feed([endOfTurn("play music loud")])
+      const second = r.dispatcher.routedAtOf("alpha")!
+      assert.strictEqual(second.chosenAt, 1300, "the final asked again: its choice is after its own routing call")
+      assert.isAtLeast(second.chosenAt, (r.dispatcher.routeOf("alpha") as { decision: { receivedAt: number } }).decision.receivedAt)
+      // Reusing the same answer (the same text) does not move the time.
+      assert.strictEqual(r.dispatcher.routedAtOf("alpha")!.chosenAt, second.chosenAt)
+    }))
+
   it.effect("decide with no fallback: nobody answers and no conversation is made", () =>
     Effect.gen(function*() {
       const r = recorder()

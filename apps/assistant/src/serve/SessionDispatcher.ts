@@ -116,6 +116,8 @@ export type DispatchRoute =
   | { readonly by: "barge-in"; readonly assistant: string }
 
 export interface SessionDispatcherOptions<C extends DispatchTarget> {
+  /** The trace clock (`TurnTrace.now`): without it `routeTimesOf` knows nothing. */
+  readonly now?: () => number
   /** Make `assistant`'s conversation (first use). Called at most once per assistant. */
   readonly make: (assistant: string, hooks: DispatchHooks) => Effect.Effect<C>
   /** "Start replying before I finish speaking", read at each eager event. Default: on for everyone. */
@@ -161,6 +163,8 @@ export interface SessionDispatcher<C extends DispatchTarget> {
   readonly assistantOfTurn: (turnId: number) => string | undefined
   /** How the latest utterance or typed message reached `assistant`. */
   readonly routeOf: (assistant: string) => DispatchRoute | undefined
+  /** When (trace clock) `assistant`'s current route was decided, and when its wake phrase was heard (`by: "phrase"`). */
+  readonly routedAtOf: (assistant: string) => { readonly chosenAt: number; readonly phraseAt?: number } | undefined
 }
 
 /** The dispatcher's view of one conversation. */
@@ -177,6 +181,8 @@ interface Book<C> {
 }
 
 interface Open {
+  /** The utterance's `SpeechStarted` as it came in (with the session's times, `UtteranceTimes`); what is pushed to a conversation. */
+  readonly start: SttEvent
   /** The conversation that has this utterance open (got its `SpeechStarted`). */
   delivered: string | undefined
   /** Stop cancelled it: the rest goes only where it already is. */
@@ -186,7 +192,6 @@ interface Open {
 }
 
 const TURN_MEMORY = 64
-const speechStarted: SttEvent = { _tag: "SpeechStarted" }
 const emptyEnd: SttEvent = { _tag: "EndOfTurn", text: "" }
 const interrupt: ConversationInput = { _tag: "Interrupt" }
 const blank = (text: string) => text.trim().length === 0
@@ -212,8 +217,21 @@ export const makeSessionDispatcher = <C extends DispatchTarget>(
   const making = new Map<string, Deferred.Deferred<Book<C>>>()
   const routes = new Map<string, DispatchRoute>()
   const turns = new Map<number, string>()
+  /** When each assistant's current route was decided (trace clock), and, for a phrase, when it was heard. */
+  const routedAt = new Map<string, { readonly by: DispatchRoute["by"]; readonly utterance: Open | undefined; readonly decision: RouteDecision | undefined; readonly chosenAt: number; readonly phraseAt: number | undefined }>()
   let seq = 0
   let open: Open | undefined
+  /** Set `assistant`'s route; the time stays the first one of the same kind in the same utterance (the final re-sets it). */
+  const setRoute = (assistant: string, route: DispatchRoute) => {
+    routes.set(assistant, route)
+    if (options.now === undefined) return
+    const prev = routedAt.get(assistant)
+    // A new TypeSafe call (the final asked again) is a new decision, even when it picked the same assistant.
+    const decision = route.by === "decide" ? route.decision : undefined
+    if (prev !== undefined && prev.by === route.by && prev.utterance === open && prev.decision === decision && route.by !== "typed") return
+    const at = options.now()
+    routedAt.set(assistant, { by: route.by, utterance: open, decision, chosenAt: at, phraseAt: route.by === "phrase" ? at : undefined })
+  }
 
   const observe = (book: Book<C>) => (event: ConversationEvent) => {
     switch (event._tag) {
@@ -370,9 +388,9 @@ export const makeSessionDispatcher = <C extends DispatchTarget>(
       const book = yield* ensure(to)
       // Stopped while its conversation was made: that conversation got no Interrupt, so it gets nothing.
       if (u.stopped) return
-      push(book, speechStarted)
+      push(book, u.start)
       u.delivered = to
-      if (route !== undefined) routes.set(to, route)
+      if (route !== undefined) setRoute(to, route)
     })
 
   /**
@@ -403,16 +421,16 @@ export const makeSessionDispatcher = <C extends DispatchTarget>(
           if (u.delivered !== undefined) forward(u.delivered, event)
           return
         }
-        const next: Open = { delivered: undefined, stopped: false, decision: undefined }
+        const next: Open = { start: event, delivered: undefined, stopped: false, decision: undefined }
         open = next
         const o = owner()
         const to = o?.assistant ?? assistantOf(target)
         if (to === undefined) return
         const book = yield* ensure(to)
         if (next.stopped) return
-        push(book, speechStarted)
+        push(book, event)
         next.delivered = to
-        routes.set(to, assistantOf(target) === to ? (target as DispatchRoute) : { by: "barge-in", assistant: to })
+        setRoute(to, assistantOf(target) === to ? (target as DispatchRoute) : { by: "barge-in", assistant: to })
         return
       }
       if (u === undefined) {
@@ -427,7 +445,7 @@ export const makeSessionDispatcher = <C extends DispatchTarget>(
         // Stop may have come while the decision was awaited: the stopped utterance stays where it is.
         if (where !== KEEP && !u.stopped) {
           if (where.to !== (u.delivered ?? null)) yield* handOver(u, where.to, where.route)
-          else if (where.to !== null && where.route !== undefined) routes.set(where.to, where.route)
+          else if (where.to !== null && where.route !== undefined) setRoute(where.to, where.route)
         }
       }
       // A stopped utterance's final is swallowed by its conversation: it starts nothing.
@@ -447,7 +465,7 @@ export const makeSessionDispatcher = <C extends DispatchTarget>(
         const outcome = book.target!.send(input)
         if (outcome !== "accepted") return outcome
         expect(book, "typed")
-        routes.set(assistant, { by: "typed", assistant })
+        setRoute(assistant, { by: "typed", assistant })
         // Typed text replaces what runs, in the other conversations too.
         interruptOthers(assistant)
         return outcome
@@ -470,6 +488,10 @@ export const makeSessionDispatcher = <C extends DispatchTarget>(
     owner: () => owner()?.assistant,
     delivering: () => open?.delivered,
     assistantOfTurn: (turnId) => turns.get(turnId),
-    routeOf: (assistant) => routes.get(assistant)
+    routeOf: (assistant) => routes.get(assistant),
+    routedAtOf: (assistant) => {
+      const r = routedAt.get(assistant)
+      return r === undefined ? undefined : r.phraseAt === undefined ? { chosenAt: r.chosenAt } : { chosenAt: r.chosenAt, phraseAt: r.phraseAt }
+    }
   }
 }

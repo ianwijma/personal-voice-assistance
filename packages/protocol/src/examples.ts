@@ -207,7 +207,34 @@ export const exampleTrace: TraceInfo = {
   totalMs: 1925,
   tools: [{ name: "weather", ms: 241 }],
   voices: ["sherpa:en_US-lessac-medium"],
-  client: { outputLatencyMs: 21.3, startDelayMs: 0 }
+  client: { outputLatencyMs: 21.3, startDelayMs: 0 },
+  config: {
+    llm: { account: "anthropic", model: "claude-haiku-5-5", effort: "low", thinking: "off", maxTokens: 1024 },
+    hearing: { hearer: "jeff", engine: "sherpa", model: "nemotron-3.5", language: "en", eagerSilenceMs: 250, finalSilenceMs: 600 },
+    voice: "sherpa:en_US-lessac-medium",
+    modules: 2,
+    tools: 3,
+    moduleList: [{ id: "weather", name: "Weather" }, { id: "clock", name: "Clock" }],
+    toolList: [{ name: "weather", module: "weather" }, { name: "get_time", module: "clock" }, { name: "get_date", module: "clock" }],
+    replyEarly: true,
+    toolRounds: 3
+  },
+  timeline: [
+    { name: "speechStarted", at: -1450 },
+    { name: "firstInterim", at: -1190 },
+    { name: "turnStarted", at: -240 },
+    { name: "eagerEndOfTurn", at: -240 },
+    { name: "llmRequestSent", at: -232, detail: "round 1" },
+    { name: "llmFirstToken", at: -231, detail: "round 1" },
+    { name: "tool", at: -210, ms: 241, detail: "weather" },
+    { name: "firstClause", at: -216 },
+    { name: "ttsFirstAudio", at: -184 },
+    { name: "endOfTurn", at: 0 },
+    { name: "audioSent", at: 12 },
+    { name: "playbackStart", at: 31 },
+    { name: "audible", at: 52.3 },
+    { name: "turnEnded", at: 1925, detail: "completed" }
+  ]
 }
 
 export const exampleEnv: EnvInfo = {

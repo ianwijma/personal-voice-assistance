@@ -12,13 +12,13 @@ import type {
   TurnSetup
 } from "./ConversationEvents.ts"
 import type { DecisionProvider } from "./Decision.ts"
-import type { Message, SttEvent, ToolCall, ToolResult } from "./Domain.ts"
+import type { Message, SttEvent, ToolCall, ToolResult, UtteranceTimes } from "./Domain.ts"
 import { type AudioError, LlmError, type SttError, type TtsError } from "./Errors.ts"
 import { makeModelAgent } from "./ModelAgent.ts"
 import { armAgent, initialRouterState, type RouteDecision, type Router, type RouterState, setActiveAgent } from "./Routing.ts"
 import { AudioInput, AudioOutput, Llm, Stt, Tts, type TtsAudio } from "./Services.ts"
 import { ToolRegistry } from "./ToolRegistry.ts"
-import { CurrentTurnTrace, type Trace, TurnTrace, type TurnOutcome } from "./TurnTrace.ts"
+import { addTraceEvent, CurrentTurnTrace, type Trace, TurnTrace, type TurnOutcome } from "./TurnTrace.ts"
 import { ACTION_TIMEOUT_MS, ActionError, type ActionOutcome, actionToolName, type RegisteredAction } from "./Actions.ts"
 import { confirmationQuestion, describeProposal } from "./Decision.ts"
 import type { IntentWords } from "./IntentWords.ts"
@@ -748,7 +748,9 @@ const makeConversationCore = Effect.fnUntraced(function*(options: AgentConversat
           Effect.sync(() => {
             const ms = tt.now() - start
             if (trace.outcome === undefined) tt.mark(trace, "actionFinished")
-            trace.tools.push({ name: actionToolName(action.moduleId, def.id), ms })
+            const name = actionToolName(action.moduleId, def.id)
+            trace.tools.push({ name, ms })
+            addTraceEvent(trace, "action", start, ms, name)
             if (Exit.isSuccess(exit)) {
               record.status = "ok"
               const say = (exit.value as ActionOutcome | undefined)?.say
@@ -1449,7 +1451,10 @@ const makeConversationCore = Effect.fnUntraced(function*(options: AgentConversat
           yield* tts.synthesize(clauses).pipe(
             Stream.provideService(CurrentTurnTrace, turn.trace),
             Stream.tap(() => Effect.sync(() => tt.mark(turn.trace, "ttsFirstAudio"))),
-            Stream.concat(Stream.suspend(() => failure === undefined ? Stream.empty : Stream.failCause(failure))),
+            Stream.concat(Stream.suspend(() => {
+              addTraceEvent(turn.trace, "ttsDone", tt.now())
+              return failure === undefined ? Stream.empty : Stream.failCause(failure)
+            })),
             Stream.runIntoQueue(queue),
             Effect.forkChild
           )
@@ -1505,7 +1510,13 @@ const makeConversationCore = Effect.fnUntraced(function*(options: AgentConversat
           // One chunk per pull: `fromQueue` takes everything already queued in one pull,
           // so without `rechunk(1)` a TTS that ran ahead of playback would mark clauses
           // as played long before the speaker reached them.
+          let audioSent = false
           const audio = Stream.fromQueue(queue).pipe(Stream.rechunk(1), Stream.map(({ audio, clause }) => {
+            // The first audio handed to the output (a browser output writes it to the socket in the same tick).
+            if (!audioSent) {
+              audioSent = true
+              addTraceEvent(turn.trace, "audioSent", tt.now())
+            }
             if (reports) {
               while (clauseStarts.length <= clause) clauseStarts.push(pulled)
               pulled += audio.length >> 1
@@ -1516,9 +1527,24 @@ const makeConversationCore = Effect.fnUntraced(function*(options: AgentConversat
             return audio
           }))
           yield* (reports ? output.play(audio, tts.sampleRate, observer) : output.play(audio, tts.sampleRate)).pipe(
-            Effect.provideService(CurrentTurnTrace, turn.trace)
+            Effect.provideService(CurrentTurnTrace, turn.trace),
+            Effect.tap(() => Effect.sync(() => addTraceEvent(turn.trace, "playbackEnd", tt.now())))
           )
         })
+
+      /**
+       * What the recogniser did in the open utterance, kept apart from any turn (a speculative turn may be discarded and
+       * restarted inside one utterance): stamped on the trace of each voice turn that starts for it.
+       */
+      let heard: { speechStarted?: number; firstInterim?: number; eagerEndOfTurn?: number; turnResumed?: number; times?: UtteranceTimes } = {}
+      const stampHeard = (trace: Trace) => {
+        if (heard.speechStarted !== undefined) addTraceEvent(trace, "speechStarted", heard.speechStarted)
+        // The recogniser's own time when a session stamped it (it may never have forwarded that Interim), else when the loop saw one.
+        const interimAt = heard.times?.firstInterimAt ?? heard.firstInterim
+        if (interimAt !== undefined) addTraceEvent(trace, "firstInterim", interimAt)
+        if (heard.eagerEndOfTurn !== undefined) addTraceEvent(trace, "eagerEndOfTurn", heard.eagerEndOfTurn)
+        if (heard.turnResumed !== undefined) addTraceEvent(trace, "turnResumed", heard.turnResumed)
+      }
 
       const start = (
         text: string,
@@ -1538,6 +1564,7 @@ const makeConversationCore = Effect.fnUntraced(function*(options: AgentConversat
             ? { canned: how.say, tts: setup.tts, ttsReady: setup.ttsReady }
             : planTurn(setup, text, source, how.explicitAgent, answerable)
           const trace = tt.begin(source, speculative)
+          if (source === "voice" && how.say === undefined) stampHeard(trace)
           const promoted = yield* Deferred.make<void>()
           if (!speculative) {
             tt.mark(trace, "endOfTurn")
@@ -1612,6 +1639,8 @@ const makeConversationCore = Effect.fnUntraced(function*(options: AgentConversat
           const turn = live()
           switch (event._tag) {
             case "EagerEndOfTurn": {
+              // Taken first: the interruption of an earlier speculative turn below is not part of the user's pause.
+              const eagerAt = tt.now()
               if (!utteranceOpen) return yield* outsideUtterance(event)
               if (utteranceCancelled()) return
               // No words (yet): nothing to reply to. A speculative turn for earlier words is
@@ -1624,10 +1653,13 @@ const makeConversationCore = Effect.fnUntraced(function*(options: AgentConversat
                 if (!turn.pending && !bargeIn) return
                 yield* interrupt(turn)
               }
+              heard.eagerEndOfTurn = eagerAt
               return yield* start(event.text, true, "voice", true, { answerable: utteranceAnswerable })
             }
             case "TurnResumed": {
+              const resumedAt = tt.now()
               if (!utteranceOpen) return yield* outsideUtterance(event)
+              heard.turnResumed = resumedAt
               if (turn?.pending) yield* interrupt(turn)
               return
             }
@@ -1668,6 +1700,8 @@ const makeConversationCore = Effect.fnUntraced(function*(options: AgentConversat
                 // What this utterance can answer is fixed now, by what had been played to its end NOW
                 // (round 7): the armed entry, if any. Never improved by later playback reports.
                 utteranceAnswerable = asked?.entry
+                // The recogniser's time when the session stamped it (a gate may have held the event back), else now.
+                heard = { speechStarted: event.heard?.startedAt ?? tt.now(), ...(event.heard !== undefined ? { times: event.heard } : {}) }
               }
               utteranceOpen = true
               // A committed turn is interrupted whether or not its audio has started
@@ -1677,6 +1711,7 @@ const makeConversationCore = Effect.fnUntraced(function*(options: AgentConversat
               return
             }
             case "Interim":
+              if (utteranceOpen && heard.firstInterim === undefined && !isBlank(event.text)) heard.firstInterim = tt.now()
               return
             case "TextInput": {
               cancelled = undefined

@@ -16,6 +16,7 @@ import {
 import { defaultIntentWords, type IntentWords } from "./IntentWords.ts"
 import type { AgentImplementation } from "./ModuleContributions.ts"
 import { makePendingIntents, needsConfirmation, type PendingIntents } from "./PendingIntents.ts"
+import { addTraceEvent } from "./TurnTrace.ts"
 import { parseValues } from "./ValueParsing.ts"
 
 /**
@@ -276,7 +277,9 @@ export const makeIntentAgent = (options: IntentAgentOptions = {}): AgentImplemen
         const exit = yield* Fiber.await(fiber)
         const ms = (yield* now) - start
         input.mark("actionFinished")
-        input.trace.tools.push({ name: actionToolName(action.moduleId, def.id), ms })
+        const name = actionToolName(action.moduleId, def.id)
+        input.trace.tools.push({ name, ms })
+        addTraceEvent(input.trace, "action", start, ms, name)
         return { exit, ms }
       })
 

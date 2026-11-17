@@ -444,12 +444,22 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       })
       /** The modules it has on that run (capabilities; for the turn's configuration snapshot). */
       const modules = parts.reduce((n, p) => (isCapability(p.moduleId) ? n + 1 : n), 0)
+      /** The same modules by id and display name, for the turn's trace (the names the time line shows). */
+      const moduleList = parts.flatMap((p) =>
+        isCapability(p.moduleId) ? [{ id: p.moduleId, name: catalog.find((d) => d.id === p.moduleId)?.name ?? p.moduleId }] : []
+      )
       const same = parts.length === snapshot.parts.length && parts.every((p, i) => p === snapshot.parts[i])
-      if (same) return { registry: snapshot.registry, instructions: snapshot.instructions, modules }
+      const registry = same ? snapshot.registry : makeToolRegistry(parts.map((p) => p.module))
+      const toolList = registry.specs.map((spec) => {
+        const module = snapshot.toolModules.get(spec.name)
+        return module === undefined ? { name: spec.name } : { name: spec.name, module }
+      })
       return {
-        registry: makeToolRegistry(parts.map((p) => p.module)),
-        instructions: parts.flatMap((p) => (p.instructions.length > 0 ? [p.instructions] : [])),
-        modules
+        registry,
+        instructions: same ? snapshot.instructions : parts.flatMap((p) => (p.instructions.length > 0 ? [p.instructions] : [])),
+        modules,
+        moduleList,
+        toolList
       }
     }
 
@@ -745,7 +755,13 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
      * a binding on the Claude subscription: the options its agent is passed, from the assistant's own fields), the
      * voice it is bound to, the modules and tools it has, and its reply-early and tool-round settings.
      */
-    const traceConfigOf = (assistant: Assistant, tools: number, modules: number, deviceId: string | undefined): AssistantTraceConfig => {
+    const traceConfigOf = (
+      assistant: Assistant,
+      mine: { readonly modules: number; readonly registry: { readonly specs: ReadonlyArray<unknown> }; readonly moduleList: TraceConfig["moduleList"]; readonly toolList: TraceConfig["toolList"] },
+      deviceId: string | undefined
+    ): AssistantTraceConfig => {
+      const { modules, moduleList, toolList } = mine
+      const tools = mine.registry.specs.length
       const deviceVoice = deviceSettingsOf(deviceId).voice
       const key = resources.keyFor(assistant.id)
       // The account of the binding in use, as `agentSetup` reads it (during a change the old binding answers, the old
@@ -763,6 +779,9 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
         voiceFrom: deviceVoice.from,
         modules,
         tools: passed !== undefined && !passed.tools ? 0 : tools,
+        // As the counts: a subscription assistant that is not passed tools has none (the lists are shared, never changed).
+        ...(moduleList !== undefined ? { moduleList } : {}),
+        ...(toolList !== undefined ? { toolList: passed !== undefined && !passed.tools ? [] : toolList } : {}),
         replyEarly: assistant.replyEarly,
         toolRounds: assistant.toolRounds
       }
@@ -830,7 +849,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
           cached.voiceUser !== voiceUser || cached.voiceSource !== voiceSource
         ) {
           // An assistant that does not exist (any more) is never routed; should a turn still start, it gets no tools.
-          const mine = assistant === undefined ? { registry: makeToolRegistry([]), instructions: [], modules: 0 } : modulesFor(snapshot, assistant)
+          const mine = assistant === undefined ? { registry: makeToolRegistry([]), instructions: [], modules: 0, moduleList: [], toolList: [] } : modulesFor(snapshot, assistant)
           const base = assistant?.prompt ?? defaultSystemPrompt
           const instructions = home === undefined ? mine.instructions : [home, ...mine.instructions]
           // `TurnSetup.ttsReady`: completes once this `tts` (the instance bound now, not a later one) is built.
@@ -853,7 +872,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
               ...(assistant !== undefined ? { maxToolRounds: assistant.toolRounds } : {})
             },
             instructions,
-            config: assistant === undefined ? undefined : traceConfigOf(assistant, mine.registry.specs.length, mine.modules, deviceId)
+            config: assistant === undefined ? undefined : traceConfigOf(assistant, mine, deviceId)
           }
         }
         return cached
