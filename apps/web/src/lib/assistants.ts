@@ -84,7 +84,8 @@ export const toBody = (a: Assistant | AssistantInfo): AssistantBody => {
 // ---- Results of the assistant messages
 
 export type Outcome =
-  | { readonly kind: "ok"; readonly assistantId?: string | undefined }
+  /** `rev`: a device save that went through, the revision it made (the lists that carry it come after the answer). */
+  | { readonly kind: "ok"; readonly assistantId?: string | undefined; readonly rev?: number | undefined }
   /** The entity changed since the page read it: reload it and tell the user. */
   | { readonly kind: "stale"; readonly message: string }
   /** `invalid_settings` (and its specific codes) with the dotted paths of the fields that refused. */
@@ -94,7 +95,7 @@ export type Outcome =
   | { readonly kind: "refused"; readonly code: string; readonly message: string }
 
 export const outcomeOf = (r: ResultMessage): Outcome => {
-  if (r.ok) return { kind: "ok", assistantId: r.assistantId }
+  if (r.ok) return { kind: "ok", assistantId: r.assistantId, ...(r.rev !== undefined ? { rev: r.rev } : {}) }
   const e = r.error
   if (e === undefined) return { kind: "refused", code: "internal", message: "The assistant did not say why." }
   if (e.code === "stale") return { kind: "stale", message: e.message }

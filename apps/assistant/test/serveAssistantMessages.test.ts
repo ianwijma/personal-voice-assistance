@@ -403,6 +403,23 @@ describe("device.save", () => {
     expect(await request(a, { type: "device.save", target, rev: 0, settings: { interruptMode: "manual" } })).toMatchObject({ ok: false, error: { code: "stale" } })
   })
 
+  it("an accepted save answers with the revision it made (a type and a device); a refused one has none", async () => {
+    await start()
+    const { client: page } = await voice()
+    const a = await admin()
+    await deviceKnown(a, page.device.id)
+    await refresh(a)
+    const typeRev = typeOf(a).rev
+    const typeSaved = await request(a, { type: "device.save", target: { kind: "type", type: "web-voice" }, rev: typeRev, settings: { interruptMode: "manual" } })
+    expect(typeSaved).toMatchObject({ ok: true, rev: typeRev + 1 })
+    const deviceRev = deviceOf(a, page.device.id).rev
+    const deviceSaved = await request(a, { type: "device.save", target: { kind: "device", id: page.device.id }, rev: deviceRev, settings: { interruptMode: "instant" } })
+    expect(deviceSaved).toMatchObject({ ok: true, rev: deviceRev + 1 })
+    const stale = await request(a, { type: "device.save", target: { kind: "device", id: page.device.id }, rev: deviceRev, settings: { interruptMode: "manual" } })
+    expect(stale).toMatchObject({ ok: false, error: { code: "stale" } })
+    expect("rev" in stale).toBe(false)
+  })
+
   it("saving a device's assistants and phrases changes routing on a live session, without a reload; so does a type default", async () => {
     const { stt } = await start()
     const { client: page } = await voice()
