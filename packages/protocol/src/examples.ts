@@ -7,13 +7,12 @@ import type { AssistantsClientMessage, AssistantsClientMessageType, ClientMessag
 import { PROTOCOL_VERSION } from "./constants.ts"
 import type { AssistantsServerMessage, AssistantsServerMessageType, ServerMessage, ServerMessageType } from "./server.ts"
 import type { Assistant } from "./assistants.ts"
-import { BUILT_IN_WEB_VOICE_SETTINGS, type AssistantInfo, type DeviceRecordInfo, type DeviceSettings, type DeviceTypeInfo, deviceSetupFrom } from "./devices.ts"
+import { BUILT_IN_WEB_VOICE_SETTINGS, type AssistantInfo, type DeviceListInfo, type DeviceRecordInfo, type DeviceSettings, type DeviceTypeInfo, deviceSetupFrom } from "./devices.ts"
 import type { EnvInfo } from "./env.ts"
 import type { JobInfo, ModelSet } from "./jobs.ts"
 import {
   DEFAULT_DEVICE_PROFILE,
   DEVICE_EDITABLE_FIELDS,
-  type DeviceInfo,
   type DeviceProfile,
   effectiveProfile,
   type FrontendKindInfo,
@@ -303,209 +302,6 @@ export const exampleFrontend: FrontendKindInfo = {
   profile: effectiveProfile({ activation: "wake-phrase", wakePhrases: ["hey jeff", "hey jev", "hey geoff", "hey go"] })
 }
 
-export const exampleDevice: DeviceInfo = {
-  id: "d-5c1e0b7a42",
-  kind: WEB_VOICE_KIND,
-  name: "iPhone · Safari",
-  firstSeen: 1_763_000_000_000,
-  lastSeen: 1_763_100_000_000,
-  overrides: { voice: "natural", interruptMode: "instant", conversationIdleMinutes: 5 },
-  profile: effectiveProfile(exampleFrontend.defaults, { voice: "natural", interruptMode: "instant", conversationIdleMinutes: 5 }),
-  connections: 1,
-  audioOwner: true
-}
-
-export const exampleConversation: ConversationInfo = { id: "5b0f6a0e-3c1d-4c7e-9a52-1f0e8d2b7c44", startedAt: 1_763_099_400_000 }
-
-/** One voice session (protocol 6), as admin sees it. */
-export const exampleSession: SessionInfo = {
-  key: exampleDevice.id,
-  deviceId: exampleDevice.id,
-  name: exampleDevice.name,
-  state: "listening",
-  ownerPresent: true,
-  conversationId: exampleConversation.id,
-  turns: 2,
-  lastTurnAt: 1_763_100_000_000
-}
-
-/** The voice part, as a voice connection that owns the audio gets it. */
-export const exampleSnapshot: Snapshot = {
-  state: "listening",
-  role: "owner",
-  ownerPresent: true,
-  engine: engineSummary(exampleEngineStatus),
-  history: [
-    { role: "user", text: "What's the weather like?" },
-    { role: "assistant", text: "Light rain in Amsterdam, 7 degrees.", interrupted: false, tools: [{ name: "weather", ok: true }] },
-    { role: "user", text: "Tell me a long story" },
-    { role: "assistant", text: "Once upon a time,", interrupted: true, tools: [] }
-  ],
-  device: { deviceId: exampleDevice.id, profile: exampleDevice.profile, editable: DEVICE_EDITABLE_FIELDS },
-  admin: { enabled: true, loggedIn: false },
-  conversation: exampleConversation
-}
-
-/** The admin part, as `admin.snapshot` carries it. */
-export const exampleAdminSnapshot: AdminSnapshot = {
-  engine: exampleEngineStatus,
-  modules: [exampleWeatherModule, exampleHomeAssistantModule],
-  sections: [exampleVoiceSection, exampleSpeechEngineSection],
-  traces: [exampleTrace],
-  vault: { state: "unlocked", admin: true, location: "/home/owner/.config/pva/vault.enc" },
-  env: exampleEnv,
-  models: exampleModels,
-  jobs: [exampleJob],
-  frontends: [exampleFrontend],
-  devices: [exampleDevice],
-  sessions: [
-    exampleSession,
-    { key: "c-a0d1e2f3", name: "Browser without a device id", state: "idle", ownerPresent: false, conversationId: "9d4c2a71-0b5e-4f3a-8e61-7c2d9b0a5f13", turns: 0, lastTurnAt: null }
-  ]
-}
-
-const audio = { contextSampleRate: 48_000, baseLatencyMs: 10, outputLatencyMs: 21.3, echoCancellation: true, outputPath: "direct" } as const
-
-export const clientExamples: { readonly [T in ClientMessageType]: Extract<ClientMessage, { readonly type: T }> } = {
-  "hello": {
-    type: "hello",
-    protocol: PROTOCOL_VERSION,
-    clientId: "c-7f3a9b21",
-    resumeOwner: false,
-    frontend: "voice",
-    device: { id: "d-5c1e0b7a42", kind: WEB_VOICE_KIND, name: "iPhone · Safari" }
-  },
-  "audio.claim": { type: "audio.claim", audio },
-  "audio.release": { type: "audio.release" },
-  "audio.config": { type: "audio.config", audio: { ...audio, outputPath: "element" } },
-  "mic.state": { type: "mic.state", live: false },
-  "playback.started": { type: "playback.started", turnId: 12, outputLatencyMs: 21.3, startDelayMs: 0 },
-  "playback.progress": { type: "playback.progress", turnId: 12, playedSamples: 11_025, underruns: 0 },
-  "playback.finished": { type: "playback.finished", turnId: 12, playedSamples: 52_920 },
-  "playback.stopped": { type: "playback.stopped", turnId: 12, playedSamples: 17_640, exact: true },
-  "interrupt": { type: "interrupt", turnId: 12 },
-  "text.send": { type: "text.send", requestId: "r1", text: "What time is it in Tokyo?", speak: true },
-  "module.enable": { type: "module.enable", requestId: "r2", moduleId: "weather" },
-  "module.disable": { type: "module.disable", requestId: "r3", moduleId: "weather" },
-  "module.configure": {
-    type: "module.configure",
-    requestId: "r4",
-    moduleId: "home-assistant",
-    patch: { values: { baseUrl: "http://192.168.1.20:8123", includeAttributes: null }, secrets: { token: "eyJhbGciOi..." } }
-  },
-  "settings.update": {
-    type: "settings.update",
-    requestId: "r5",
-    sectionId: "stt-engine",
-    patch: { values: { STT_PROVIDER: "deepgram", STT_SHERPA_MODEL: null }, secrets: {} },
-    confirmWarnings: true
-  },
-  "engine.reload": { type: "engine.reload", requestId: "r6" },
-  "vault.setup": { type: "vault.setup", requestId: "r7", password: "correct horse battery" },
-  "vault.unlock": { type: "vault.unlock", requestId: "r8", password: "correct horse battery" },
-  "vault.lock": { type: "vault.lock", requestId: "r9" },
-  "vault.changePassword": { type: "vault.changePassword", requestId: "r10", oldPassword: "correct horse battery", newPassword: "staple gun lamp post" },
-  "settings.moveFromEnv": { type: "settings.moveFromEnv", requestId: "r11", keys: ["ANTHROPIC_API_KEY", "STT_SHERPA_MODEL"] },
-  "job.start": { type: "job.start", requestId: "r12", tool: "stt-models", action: "download", target: "whisper-turbo" },
-  "job.cancel": { type: "job.cancel", requestId: "r13", jobId: "job-3" },
-  "model.delete": { type: "model.delete", requestId: "r14", tool: "tts-models", target: "nl_NL-pim-medium" },
-  "admin.login": { type: "admin.login", requestId: "r15", password: "correct horse battery" },
-  "admin.logout": { type: "admin.logout", requestId: "r16" },
-  "device.update": { type: "device.update", requestId: "r17", patch: { activation: "wake-phrase", followUpSeconds: 12, voice: null } },
-  "frontend.update": {
-    type: "frontend.update",
-    requestId: "r18",
-    kind: WEB_VOICE_KIND,
-    patch: { wakePhrases: ["hey jeff", "hey jev", "hey geoff", "hey go"], wakeMatch: "close", prebufferMs: null }
-  },
-  "device.admin.update": { type: "device.admin.update", requestId: "r19", id: "d-5c1e0b7a42", name: "Kitchen phone", patch: { interruptMode: "instant" } },
-  "device.forget": { type: "device.forget", requestId: "r20", id: "d-5c1e0b7a42" },
-  "wake.test": { type: "wake.test", requestId: "r21", on: true, deviceId: "d-5c1e0b7a42" },
-  "conversation.new": { type: "conversation.new", requestId: "r22" },
-  "ping": { type: "ping", id: 41 }
-}
-
-/** The `result` of a successful `admin.login`. */
-export const exampleLoginResult: Extract<ServerMessage, { readonly type: "result" }> = {
-  type: "result",
-  requestId: "r15",
-  ok: true,
-  admin: { token: "q2Vx8m0rJ3cW5yT1bN7dK9fH4gL6pZ2aS8eU0iO3wQk", expiresAt: 1_763_143_200_000 }
-}
-
-/** An admin front end's `hello` with a session token from an earlier login. */
-export const exampleAdminHello: Extract<ClientMessage, { readonly type: "hello" }> = {
-  type: "hello",
-  protocol: PROTOCOL_VERSION,
-  clientId: "c-a0d1e2f3",
-  resumeOwner: false,
-  frontend: "admin",
-  adminToken: "q2Vx8m0rJ3cW5yT1bN7dK9fH4gL6pZ2aS8eU0iO3wQk"
-}
-
-export const serverExamples: { readonly [T in ServerMessageType]: Extract<ServerMessage, { readonly type: T }> } = {
-  "welcome": {
-    type: "welcome",
-    protocol: PROTOCOL_VERSION,
-    server: { name: "pva", version: "0.0.0" },
-    connectionId: "conn-3",
-    snapshot: exampleSnapshot
-  },
-  "session": { type: "session", role: "observer", ownerPresent: true, reason: "taken_over" },
-  "state": { type: "state", state: "speaking", turnId: 12 },
-  "transcript": { type: "transcript", text: "what's the weather in" },
-  "turn.start": { type: "turn.start", turnId: 12, source: "voice", userText: "What's the weather in Paris?", spoken: true },
-  "assistant.text": { type: "assistant.text", turnId: 12, clause: 0, text: "It's sunny in Paris,", voice: "sherpa:en_US-lessac-medium" },
-  "assistant.playing": { type: "assistant.playing", turnId: 12, clause: 0 },
-  "tool.start": {
-    type: "tool.start",
-    turnId: 12,
-    callId: "toolu_01",
-    tool: "weather",
-    moduleId: "weather",
-    input: { place: "Paris, France" }
-  },
-  "tool.end": { type: "tool.end", turnId: 12, callId: "toolu_01", ok: true, ms: 241 },
-  "turn.end": { type: "turn.end", turnId: 12, outcome: "completed", trace: exampleTrace },
-  "reply.start": { type: "reply.start", turnId: 12, sampleRate: 22_050 },
-  "reply.end": { type: "reply.end", turnId: 12 },
-  "reply.stop": { type: "reply.stop", turnId: 12 },
-  "module.changed": { type: "module.changed", module: exampleHomeAssistantModule },
-  "section.changed": { type: "section.changed", section: exampleSpeechEngineSection },
-  "engine": { type: "engine", engine: { ...exampleEngineStatus, state: "ready", reloadPending: true, reloadPendingFor: ["speech/engine"] } },
-  "vault": {
-    type: "vault",
-    vault: { state: "locked", admin: false, location: "/home/owner/.config/pva/vault.enc", retryAfterMs: 30_000, lockReason: "manual" }
-  },
-  "env": { type: "env", env: exampleEnv },
-  "job": { type: "job", job: { ...exampleJob, state: "succeeded", progress: { done: 563_790_207, total: 563_790_207, unit: "bytes" }, endedAt: 1_763_100_090_000 } },
-  "models": { type: "models", models: exampleModels },
-  "result": {
-    type: "result",
-    requestId: "r4",
-    ok: false,
-    error: {
-      code: "invalid_settings",
-      message: "Some settings are not valid.",
-      moduleId: "home-assistant",
-      fieldErrors: [{ key: "baseUrl", message: "Must start with http:// or https://" }]
-    }
-  },
-  "error": { type: "error", error: { code: "turn_failed", message: "The language model did not answer in time.", turnId: 12 } },
-  "engine.summary": { type: "engine.summary", engine: engineSummary(exampleEngineStatus) },
-  "admin.state": { type: "admin.state", admin: { enabled: true, loggedIn: true, expiresAt: 1_763_143_200_000 } },
-  "admin.snapshot": { type: "admin.snapshot", snapshot: exampleAdminSnapshot },
-  "device.profile": { type: "device.profile", deviceId: "d-5c1e0b7a42", profile: exampleProfile, editable: DEVICE_EDITABLE_FIELDS },
-  "frontends": { type: "frontends", frontends: [exampleFrontend] },
-  "devices": { type: "devices", devices: [exampleDevice] },
-  "wake": { type: "wake", phrase: "hey jeff", armed: true },
-  "wake.heard": { type: "wake.heard", text: "Hey go, what time is it?", at: 1_763_100_001_000 },
-  "conversation": { type: "conversation", id: "e1a7c3f9-2b4d-4e6a-8c0f-3d5b7a9e1c02", reason: "idle", startedAt: 1_763_100_600_000 },
-  "sessions": { type: "sessions", sessions: [exampleSession] },
-  "trace": { type: "trace", key: exampleDevice.id, deviceId: exampleDevice.id, trace: { ...exampleTrace, session: exampleDevice.name } },
-  "pong": { type: "pong", id: 41 }
-}
-
 // -- Protocol 7 examples (docs/ASSISTANTS.md §2, §5) -------------------------------------------------------------------
 
 export const exampleAssistant: Assistant = {
@@ -616,6 +412,74 @@ export const exampleDeviceSetup = deviceSetupFrom(
 
 const { id: _id, rev: _rev, ...exampleAssistantBody } = exampleAssistant
 
+
+export const exampleDevice: DeviceListInfo = {
+  id: "d-5c1e0b7a42",
+  kind: WEB_VOICE_KIND,
+  name: "iPhone · Safari",
+  firstSeen: 1_763_000_000_000,
+  lastSeen: 1_763_100_000_000,
+  overrides: { voice: "natural", interruptMode: "instant", conversationIdleMinutes: 5 },
+  profile: effectiveProfile(exampleFrontend.defaults, { voice: "natural", interruptMode: "instant", conversationIdleMinutes: 5 }),
+  own: { interruptMode: "instant", withoutPhrase: { mode: "assistant", assistant: "jeff" } },
+  settings: { ...exampleDeviceSettings, interruptMode: "instant", withoutPhrase: { mode: "assistant", assistant: "jeff" } },
+  hearer: "jeff",
+  rev: 1,
+  connections: 1,
+  audioOwner: true
+}
+
+export const exampleConversation: ConversationInfo = { id: "5b0f6a0e-3c1d-4c7e-9a52-1f0e8d2b7c44", startedAt: 1_763_099_400_000 }
+
+/** One voice session (protocol 6), as admin sees it. */
+export const exampleSession: SessionInfo = {
+  key: exampleDevice.id,
+  deviceId: exampleDevice.id,
+  name: exampleDevice.name,
+  state: "listening",
+  ownerPresent: true,
+  conversationId: exampleConversation.id,
+  turns: 2,
+  lastTurnAt: 1_763_100_000_000
+}
+
+/** The voice part, as a voice connection that owns the audio gets it. */
+export const exampleSnapshot: Snapshot = {
+  state: "listening",
+  role: "owner",
+  ownerPresent: true,
+  engine: engineSummary(exampleEngineStatus),
+  history: [
+    { role: "user", text: "What's the weather like?" },
+    { role: "assistant", text: "Light rain in Amsterdam, 7 degrees.", interrupted: false, tools: [{ name: "weather", ok: true }] },
+    { role: "user", text: "Tell me a long story" },
+    { role: "assistant", text: "Once upon a time,", interrupted: true, tools: [] }
+  ],
+  device: { deviceId: exampleDevice.id, profile: exampleDevice.profile, editable: DEVICE_EDITABLE_FIELDS },
+  admin: { enabled: true, loggedIn: false },
+  conversation: exampleConversation
+}
+
+/** The admin part, as `admin.snapshot` carries it. */
+export const exampleAdminSnapshot: AdminSnapshot = {
+  engine: exampleEngineStatus,
+  modules: [exampleWeatherModule, exampleHomeAssistantModule],
+  sections: [exampleVoiceSection, exampleSpeechEngineSection],
+  traces: [exampleTrace],
+  vault: { state: "unlocked", admin: true, location: "/home/owner/.config/pva/vault.enc" },
+  env: exampleEnv,
+  models: exampleModels,
+  jobs: [exampleJob],
+  frontends: [exampleFrontend],
+  devices: [exampleDevice],
+  sessions: [
+    exampleSession,
+    { key: "c-a0d1e2f3", name: "Browser without a device id", state: "idle", ownerPresent: false, conversationId: "9d4c2a71-0b5e-4f3a-8e61-7c2d9b0a5f13", turns: 0, lastTurnAt: null }
+  ]
+}
+
+const audio = { contextSampleRate: 48_000, baseLatencyMs: 10, outputLatencyMs: 21.3, echoCancellation: true, outputPath: "direct" } as const
+
 export const assistantsClientExamples: { readonly [T in AssistantsClientMessageType]: Extract<AssistantsClientMessage, { readonly type: T }> } = {
   "assistant.create": {
     type: "assistant.create",
@@ -638,6 +502,7 @@ export const assistantsClientExamples: { readonly [T in AssistantsClientMessageT
   "device.pick": { type: "device.pick", requestId: "a6", withoutPhrase: "typesafe" }
 }
 
+
 export const assistantsServerExamples: { readonly [T in AssistantsServerMessageType]: Extract<AssistantsServerMessage, { readonly type: T }> } = {
   "device.setup": { type: "device.setup", ...exampleDeviceSetup },
   "conversation.history": {
@@ -652,11 +517,163 @@ export const assistantsServerExamples: { readonly [T in AssistantsServerMessageT
   },
   "assistants": { type: "assistants", assistants: [exampleAssistantInfo] },
   "device.types": { type: "device.types", types: [exampleDeviceType] },
-  "devices": { type: "devices", devices: [exampleDeviceRecord] },
+}
+
+/** A refused `device.save` (protocol 7 error codes ride on the one `result`). */
+export const exampleDuplicatePhraseResult: Extract<ServerMessage, { readonly type: "result" }> = {
+  type: "result",
+  requestId: "a1",
+  ok: false,
+  error: { code: "duplicate_phrase", message: "The phrase \"hey jeff\" is used twice on this device." }
+}
+
+/** The successful result of `assistant.create`. */
+export const exampleCreateResult: Extract<ServerMessage, { readonly type: "result" }> = {
+  type: "result",
+  requestId: "a1",
+  ok: true,
+  assistantId: "keuken-2"
+}
+
+export const clientExamples: { readonly [T in ClientMessageType]: Extract<ClientMessage, { readonly type: T }> } = {
+  "hello": {
+    type: "hello",
+    protocol: PROTOCOL_VERSION,
+    clientId: "c-7f3a9b21",
+    resumeOwner: false,
+    frontend: "voice",
+    device: { id: "d-5c1e0b7a42", kind: WEB_VOICE_KIND, name: "iPhone · Safari" }
+  },
+  "audio.claim": { type: "audio.claim", audio },
+  "audio.release": { type: "audio.release" },
+  "audio.config": { type: "audio.config", audio: { ...audio, outputPath: "element" } },
+  "mic.state": { type: "mic.state", live: false },
+  "playback.started": { type: "playback.started", turnId: 12, outputLatencyMs: 21.3, startDelayMs: 0 },
+  "playback.progress": { type: "playback.progress", turnId: 12, playedSamples: 11_025, underruns: 0 },
+  "playback.finished": { type: "playback.finished", turnId: 12, playedSamples: 52_920 },
+  "playback.stopped": { type: "playback.stopped", turnId: 12, playedSamples: 17_640, exact: true },
+  "interrupt": { type: "interrupt", turnId: 12 },
+  "text.send": { type: "text.send", requestId: "r1", text: "What time is it in Tokyo?", speak: true },
+  "module.enable": { type: "module.enable", requestId: "r2", moduleId: "weather" },
+  "module.disable": { type: "module.disable", requestId: "r3", moduleId: "weather" },
+  "module.configure": {
+    type: "module.configure",
+    requestId: "r4",
+    moduleId: "home-assistant",
+    patch: { values: { baseUrl: "http://192.168.1.20:8123", includeAttributes: null }, secrets: { token: "eyJhbGciOi..." } }
+  },
+  "settings.update": {
+    type: "settings.update",
+    requestId: "r5",
+    sectionId: "stt-engine",
+    patch: { values: { STT_PROVIDER: "deepgram", STT_SHERPA_MODEL: null }, secrets: {} },
+    confirmWarnings: true
+  },
+  "engine.reload": { type: "engine.reload", requestId: "r6" },
+  "vault.setup": { type: "vault.setup", requestId: "r7", password: "correct horse battery" },
+  "vault.unlock": { type: "vault.unlock", requestId: "r8", password: "correct horse battery" },
+  "vault.lock": { type: "vault.lock", requestId: "r9" },
+  "vault.changePassword": { type: "vault.changePassword", requestId: "r10", oldPassword: "correct horse battery", newPassword: "staple gun lamp post" },
+  "settings.moveFromEnv": { type: "settings.moveFromEnv", requestId: "r11", keys: ["ANTHROPIC_API_KEY", "STT_SHERPA_MODEL"] },
+  "job.start": { type: "job.start", requestId: "r12", tool: "stt-models", action: "download", target: "whisper-turbo" },
+  "job.cancel": { type: "job.cancel", requestId: "r13", jobId: "job-3" },
+  "model.delete": { type: "model.delete", requestId: "r14", tool: "tts-models", target: "nl_NL-pim-medium" },
+  "admin.login": { type: "admin.login", requestId: "r15", password: "correct horse battery" },
+  "admin.logout": { type: "admin.logout", requestId: "r16" },
+  "device.update": { type: "device.update", requestId: "r17", patch: { activation: "wake-phrase", followUpSeconds: 12, voice: null } },
+  "frontend.update": {
+    type: "frontend.update",
+    requestId: "r18",
+    kind: WEB_VOICE_KIND,
+    patch: { wakePhrases: ["hey jeff", "hey jev", "hey geoff", "hey go"], wakeMatch: "close", prebufferMs: null }
+  },
+  "device.admin.update": { type: "device.admin.update", requestId: "r19", id: "d-5c1e0b7a42", name: "Kitchen phone", patch: { interruptMode: "instant" } },
+  "device.forget": { type: "device.forget", requestId: "r20", id: "d-5c1e0b7a42" },
+  "wake.test": { type: "wake.test", requestId: "r21", on: true, deviceId: "d-5c1e0b7a42" },
+  "conversation.new": { type: "conversation.new", requestId: "r22" },
+  "ping": { type: "ping", id: 41 },
+  ...assistantsClientExamples
+}
+
+/** The `result` of a successful `admin.login`. */
+export const exampleLoginResult: Extract<ServerMessage, { readonly type: "result" }> = {
+  type: "result",
+  requestId: "r15",
+  ok: true,
+  admin: { token: "q2Vx8m0rJ3cW5yT1bN7dK9fH4gL6pZ2aS8eU0iO3wQk", expiresAt: 1_763_143_200_000 }
+}
+
+/** An admin front end's `hello` with a session token from an earlier login. */
+export const exampleAdminHello: Extract<ClientMessage, { readonly type: "hello" }> = {
+  type: "hello",
+  protocol: PROTOCOL_VERSION,
+  clientId: "c-a0d1e2f3",
+  resumeOwner: false,
+  frontend: "admin",
+  adminToken: "q2Vx8m0rJ3cW5yT1bN7dK9fH4gL6pZ2aS8eU0iO3wQk"
+}
+
+export const serverExamples: { readonly [T in ServerMessageType]: Extract<ServerMessage, { readonly type: T }> } = {
+  "welcome": {
+    type: "welcome",
+    protocol: PROTOCOL_VERSION,
+    server: { name: "pva", version: "0.0.0" },
+    connectionId: "conn-3",
+    snapshot: exampleSnapshot
+  },
+  "session": { type: "session", role: "observer", ownerPresent: true, reason: "taken_over" },
+  "state": { type: "state", state: "speaking", turnId: 12 },
+  "transcript": { type: "transcript", text: "what's the weather in" },
+  "turn.start": { type: "turn.start", turnId: 12, source: "voice", userText: "What's the weather in Paris?", spoken: true },
+  "assistant.text": { type: "assistant.text", turnId: 12, clause: 0, text: "It's sunny in Paris,", voice: "sherpa:en_US-lessac-medium" },
+  "assistant.playing": { type: "assistant.playing", turnId: 12, clause: 0 },
+  "tool.start": {
+    type: "tool.start",
+    turnId: 12,
+    callId: "toolu_01",
+    tool: "weather",
+    moduleId: "weather",
+    input: { place: "Paris, France" }
+  },
+  "tool.end": { type: "tool.end", turnId: 12, callId: "toolu_01", ok: true, ms: 241 },
+  "turn.end": { type: "turn.end", turnId: 12, outcome: "completed", trace: exampleTrace },
+  "reply.start": { type: "reply.start", turnId: 12, sampleRate: 22_050 },
+  "reply.end": { type: "reply.end", turnId: 12 },
+  "reply.stop": { type: "reply.stop", turnId: 12 },
+  "module.changed": { type: "module.changed", module: exampleHomeAssistantModule },
+  "section.changed": { type: "section.changed", section: exampleSpeechEngineSection },
+  "engine": { type: "engine", engine: { ...exampleEngineStatus, state: "ready", reloadPending: true, reloadPendingFor: ["speech/engine"] } },
+  "vault": {
+    type: "vault",
+    vault: { state: "locked", admin: false, location: "/home/owner/.config/pva/vault.enc", retryAfterMs: 30_000, lockReason: "manual" }
+  },
+  "env": { type: "env", env: exampleEnv },
+  "job": { type: "job", job: { ...exampleJob, state: "succeeded", progress: { done: 563_790_207, total: 563_790_207, unit: "bytes" }, endedAt: 1_763_100_090_000 } },
+  "models": { type: "models", models: exampleModels },
   "result": {
     type: "result",
-    requestId: "a1",
+    requestId: "r4",
     ok: false,
-    error: { code: "duplicate_phrase", message: "The phrase \"hey jeff\" is used twice on this device." }
-  }
+    error: {
+      code: "invalid_settings",
+      message: "Some settings are not valid.",
+      moduleId: "home-assistant",
+      fieldErrors: [{ key: "baseUrl", message: "Must start with http:// or https://" }]
+    }
+  },
+  "error": { type: "error", error: { code: "turn_failed", message: "The language model did not answer in time.", turnId: 12 } },
+  "engine.summary": { type: "engine.summary", engine: engineSummary(exampleEngineStatus) },
+  "admin.state": { type: "admin.state", admin: { enabled: true, loggedIn: true, expiresAt: 1_763_143_200_000 } },
+  "admin.snapshot": { type: "admin.snapshot", snapshot: exampleAdminSnapshot },
+  "device.profile": { type: "device.profile", deviceId: "d-5c1e0b7a42", profile: exampleProfile, editable: DEVICE_EDITABLE_FIELDS },
+  "frontends": { type: "frontends", frontends: [exampleFrontend] },
+  "devices": { type: "devices", devices: [exampleDevice] },
+  "wake": { type: "wake", phrase: "hey jeff", armed: true },
+  "wake.heard": { type: "wake.heard", text: "Hey go, what time is it?", at: 1_763_100_001_000 },
+  "conversation": { type: "conversation", id: "e1a7c3f9-2b4d-4e6a-8c0f-3d5b7a9e1c02", reason: "idle", startedAt: 1_763_100_600_000 },
+  "sessions": { type: "sessions", sessions: [exampleSession] },
+  "trace": { type: "trace", key: exampleDevice.id, deviceId: exampleDevice.id, trace: { ...exampleTrace, session: exampleDevice.name } },
+  "pong": { type: "pong", id: 41 },
+  ...assistantsServerExamples
 }
+

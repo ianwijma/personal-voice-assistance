@@ -1,6 +1,6 @@
 import { Schema } from "effect"
 import { AssistantId } from "./assistants.ts"
-import { AssistantInfo, DeviceSetup, DeviceTypeInfo } from "./devices.ts"
+import { AssistantInfo, DeviceListInfo, DeviceSetup, DeviceTypeInfo } from "./devices.ts"
 import { ConversationId, ConversationInfo, SessionInfo } from "./sessions.ts"
 import {
   AssistantState,
@@ -19,7 +19,7 @@ import { EnvInfo } from "./env.ts"
 import { JobInfo, ModelSet } from "./jobs.ts"
 import { VaultInfo } from "./vault.ts"
 import { AdminState } from "./admin.ts"
-import { DeviceInfo, DeviceProfileInfo, FrontendKindInfo } from "./frontends.ts"
+import { DeviceProfileInfo, FrontendKindInfo } from "./frontends.ts"
 
 /** A one-line status a running module publishes, e.g. "Connected · 143 entities". */
 export const StatusLine = Schema.Struct({
@@ -340,7 +340,7 @@ export const AdminSnapshot = Schema.Struct({
   /** Every front-end kind with its defaults, in registry order. */
   frontends: Schema.Array(FrontendKindInfo),
   /** Every remembered device, most recently seen first. */
-  devices: Schema.Array(DeviceInfo),
+  devices: Schema.Array(DeviceListInfo),
   /** Protocol 6: the voice sessions, most recently active first (`sessions`). */
   sessions: Schema.Array(SessionInfo),
   /** Protocol 7: the assistants (replaces nothing yet). */

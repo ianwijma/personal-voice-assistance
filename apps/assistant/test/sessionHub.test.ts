@@ -13,6 +13,12 @@ const noVault = () => ({
   keys: { state: () => "none", info: () => ({ state: "none", admin: true, location: "" }), subscribe: () => () => {} } as never,
   access: makeAccessPolicy({ catalog: [], sections: () => [], vaultState: () => "none" }),
   admin: makeAdminSessions({ password: ADMIN_PASSWORD }),
+  assistants: {
+    setupFor: () => ({ assistants: [], withoutPhrase: { mode: "nobody" }, canPick: false, canAuto: false, interruptMode: "confirm", audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, speakAloud: true, outputPath: "direct", prebufferMs: 60 }, captions: { captions: true, speakTyped: true } }),
+    infos: () => [],
+    deviceTypes: () => [],
+    devices: () => []
+  } as never,
   frontends: {
     profile: () => DEFAULT_DEVICE_PROFILE,
     kinds: () => [],

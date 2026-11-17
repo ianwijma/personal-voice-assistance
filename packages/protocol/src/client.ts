@@ -377,47 +377,7 @@ export const Ping = Schema.Struct({
   id: NonNegativeInt
 })
 
-export const ClientMessage = Schema.Union([
-  Hello,
-  AudioClaim,
-  AudioRelease,
-  AudioConfig,
-  MicState,
-  PlaybackStarted,
-  PlaybackProgress,
-  PlaybackFinished,
-  PlaybackStopped,
-  Interrupt,
-  TextSend,
-  ModuleEnable,
-  ModuleDisable,
-  ModuleConfigure,
-  SettingsUpdate,
-  EngineReload,
-  VaultSetup,
-  VaultUnlock,
-  VaultLock,
-  VaultChangePassword,
-  SettingsMoveFromEnv,
-  JobStart,
-  JobCancel,
-  ModelDelete,
-  AdminLogin,
-  AdminLogout,
-  DeviceUpdate,
-  FrontendUpdate,
-  DeviceAdminUpdate,
-  DeviceForget,
-  WakeTest,
-  ConversationNew,
-  Ping
-]).pipe(Schema.toTaggedUnion("type"))
-export type ClientMessage = typeof ClientMessage.Type
-export type ClientMessageType = ClientMessage["type"]
-export type ClientMessageOf<T extends ClientMessageType> = Extract<ClientMessage, { readonly type: T }>
-
-// -- Protocol 7 (docs/ASSISTANTS.md §5.2, §5.3): schemas only. Kept out of `ClientMessage` until the version bump, so
-// nothing that switches over `ClientMessage` changes. `AssistantsClientMessage` is the union to merge then.
+// -- Protocol 7 (docs/ASSISTANTS.md §5.2, §5.3)
 
 /** Where a created assistant is placed (wizard step 6): appended to that entry's list, with an optional first phrase. */
 export const AssistantPlacement = Schema.Struct({
@@ -486,7 +446,52 @@ export const DevicePick = Schema.Struct({
   withoutPhrase: Schema.Union([AssistantId, Schema.Literal(""), Schema.Literal("typesafe")])
 })
 
-/** The protocol 7 client messages that are new. */
+export const ClientMessage = Schema.Union([
+  Hello,
+  AudioClaim,
+  AudioRelease,
+  AudioConfig,
+  MicState,
+  PlaybackStarted,
+  PlaybackProgress,
+  PlaybackFinished,
+  PlaybackStopped,
+  Interrupt,
+  TextSend,
+  ModuleEnable,
+  ModuleDisable,
+  ModuleConfigure,
+  SettingsUpdate,
+  EngineReload,
+  VaultSetup,
+  VaultUnlock,
+  VaultLock,
+  VaultChangePassword,
+  SettingsMoveFromEnv,
+  JobStart,
+  JobCancel,
+  ModelDelete,
+  AdminLogin,
+  AdminLogout,
+  DeviceUpdate,
+  FrontendUpdate,
+  DeviceAdminUpdate,
+  DeviceForget,
+  WakeTest,
+  ConversationNew,
+  Ping,
+  AssistantCreate,
+  AssistantSave,
+  AssistantDelete,
+  DeviceSave,
+  ConversationRead,
+  DevicePick
+]).pipe(Schema.toTaggedUnion("type"))
+export type ClientMessage = typeof ClientMessage.Type
+export type ClientMessageType = ClientMessage["type"]
+export type ClientMessageOf<T extends ClientMessageType> = Extract<ClientMessage, { readonly type: T }>
+
+/** The client messages that protocol 7 adds (also members of `ClientMessage`). */
 export const AssistantsClientMessage = Schema.Union([
   AssistantCreate,
   AssistantSave,

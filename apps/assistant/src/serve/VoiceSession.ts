@@ -92,6 +92,8 @@ export interface VoiceSessionOptions {
   readonly maxPendingInputs?: number
   /** The conversation to start with (an id this device was given before its session existed): the answering assistant's. */
   readonly initialConversation?: { readonly id: string; readonly startedAt: number }
+  /** Ids the device's other assistants were given before the session existed (`conversation.read`), by assistant. */
+  readonly reservedConversations?: ReadonlyMap<string, { readonly id: string; readonly startedAt: number }>
   /** "Save what the assistant hears". */
   readonly heard: {
     readonly dir: string
@@ -126,6 +128,8 @@ export interface SessionConversations {
   readonly history: (assistant?: string) => Effect.Effect<ReadonlyArray<Message>>
   readonly conversation: (assistant?: string) => ConversationInfo
   readonly lastTurnAt: (assistant?: string) => number | undefined
+  /** Committed turns in `assistant`'s current conversation. */
+  readonly turnsOf: (assistant?: string) => number
   readonly newConversation: (assistant?: string) => Effect.Effect<ConversationInfo>
   /** The answering assistant now (`undefined`: the device has none). */
   readonly answering: () => string | undefined
@@ -474,6 +478,7 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
       if (wp.mode === "typesafe" && wp.fallback !== null) return wp.fallback
       return settings.assistants[0]?.assistant
     }
+    for (const [assistant, info] of options.reservedConversations ?? []) reserved.set(assistant, info)
     // The device's reserved conversation (from before its session existed) is the answering assistant's.
     if (options.initialConversation !== undefined) reserved.set(answering() ?? "", options.initialConversation)
 
@@ -576,6 +581,7 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
         return conversationOf(a)?.conversation() ?? reservedFor(a ?? "")
       },
       lastTurnAt: (assistant) => conversationOf(assistant ?? answering())?.lastTurnAt(),
+      turnsOf: (assistant) => turnsBy.get(assistant ?? answering() ?? "") ?? 0,
       newConversation: (assistant) =>
         Effect.suspend(() => {
           const a = assistant ?? answering()
@@ -645,7 +651,14 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
           ownerPresent: owner.present,
           conversationId: conversations.conversation().id,
           turns: turnsBy.get(answering() ?? "") ?? 0,
-          lastTurnAt: last ?? null
+          lastTurnAt: last ?? null,
+          ...(answering() !== undefined ? { answering: answering()! } : {}),
+          conversations: [...dispatcher.conversations().entries()].map(([assistantId, target]) => ({
+            assistantId,
+            conversationId: target.conversation.conversation().id,
+            turns: turnsBy.get(assistantId) ?? 0,
+            lastTurnAt: target.conversation.lastTurnAt() ?? null
+          }))
         }
       }
     } satisfies VoiceSession

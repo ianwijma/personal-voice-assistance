@@ -12,9 +12,9 @@ import {
   TurnSource
 } from "./common.ts"
 import { AdminSession, AdminState } from "./admin.ts"
-import { AssistantErrorCode, AssistantId } from "./assistants.ts"
-import { AssistantInfo, DeviceRecordInfo, DeviceSetup, DeviceTypeInfo } from "./devices.ts"
-import { DeviceId, DeviceInfo, DeviceProfileInfo, FrontendKindInfo, WakePhrase } from "./frontends.ts"
+import { AssistantId } from "./assistants.ts"
+import { AssistantInfo, DeviceListInfo, DeviceSetup, DeviceTypeInfo } from "./devices.ts"
+import { DeviceId, DeviceProfileInfo, FrontendKindInfo, WakePhrase } from "./frontends.ts"
 import { AdminSnapshot, EngineStatus, EngineSummary, HistoryItem, ModuleInfo, SettingsSection, Snapshot, TraceInfo } from "./snapshot.ts"
 import { EnvInfo } from "./env.ts"
 import { JobInfo, ModelSet } from "./jobs.ts"
@@ -205,7 +205,9 @@ export const Result = Schema.Struct({
   /** Present when `ok` is false. */
   error: Schema.optionalKey(ErrorInfo),
   /** Protocol 5: present only on the successful result of `admin.login`. */
-  admin: Schema.optionalKey(AdminSession)
+  admin: Schema.optionalKey(AdminSession),
+  /** Protocol 7: present only on the successful result of `assistant.create`: the id the server made. */
+  assistantId: Schema.optionalKey(AssistantId)
 })
 
 /**
@@ -254,11 +256,12 @@ export const Frontends = Schema.Struct({
 /**
  * Protocol 5, admin connections only: the devices changed (seen, renamed, overrides, forgotten, connected,
  * disconnected, audio owner). The whole list, most recently seen first; at most one per second while only
- * `lastSeen` / `connections` change.
+ * `lastSeen` / `connections` change. Protocol 7 adds `own`, `settings`, `hearer` and `rev` to each device
+ * (`DeviceListInfo`: a superset of the protocol 5 entry, so the one tag serves both).
  */
 export const Devices = Schema.Struct({
   type: Schema.Literal("devices"),
-  devices: Schema.Array(DeviceInfo)
+  devices: Schema.Array(DeviceListInfo)
 })
 
 /**
@@ -344,6 +347,35 @@ export const Pong = Schema.Struct({
   id: NonNegativeInt
 })
 
+// -- Protocol 7 (docs/ASSISTANTS.md §5.3, §5.4)
+
+/** The voice connection's device setup (replaces `device.profile`; also `snapshot.setup`). */
+export const DeviceSetupMessage = Schema.Struct({
+  type: Schema.Literal("device.setup"),
+  ...DeviceSetup.fields
+})
+
+/** Answer to `conversation.read`, also the other assistants' history on demand. */
+export const ConversationHistory = Schema.Struct({
+  type: Schema.Literal("conversation.history"),
+  requestId: RequestId,
+  assistantId: AssistantId,
+  id: ConversationId,
+  history: Schema.Array(HistoryItem)
+})
+
+/** Admin connections only: the whole list of assistants, order kept. */
+export const AssistantsMessage = Schema.Struct({
+  type: Schema.Literal("assistants"),
+  assistants: Schema.Array(AssistantInfo)
+})
+
+/** Admin connections only: the device types and their defaults (replaces `frontends`). */
+export const DeviceTypesMessage = Schema.Struct({
+  type: Schema.Literal("device.types"),
+  types: Schema.Array(DeviceTypeInfo)
+})
+
 export const ServerMessage = Schema.Union([
   Welcome,
   Session,
@@ -378,70 +410,22 @@ export const ServerMessage = Schema.Union([
   Conversation,
   Sessions,
   TraceMessage,
-  Pong
+  Pong,
+  DeviceSetupMessage,
+  ConversationHistory,
+  AssistantsMessage,
+  DeviceTypesMessage
 ]).pipe(Schema.toTaggedUnion("type"))
 export type ServerMessage = typeof ServerMessage.Type
 export type ServerMessageType = ServerMessage["type"]
 export type ServerMessageOf<T extends ServerMessageType> = Extract<ServerMessage, { readonly type: T }>
 
-// -- Protocol 7 (docs/ASSISTANTS.md §5.3, §5.4): schemas only. Kept out of `ServerMessage` until the version bump, so
-// nothing that switches over `ServerMessage` changes. `AssistantsServerMessage` is the union to merge then; two of its
-// tags (`result`, `devices`) replace the protocol 5/6 messages of the same name and cannot sit in one union with them.
-
-/** The voice connection's device setup (replaces `device.profile`; also `snapshot.setup`). */
-export const DeviceSetupMessage = Schema.Struct({
-  type: Schema.Literal("device.setup"),
-  ...DeviceSetup.fields
-})
-
-/** Answer to `conversation.read`, also the other assistants' history on demand. */
-export const ConversationHistory = Schema.Struct({
-  type: Schema.Literal("conversation.history"),
-  requestId: RequestId,
-  assistantId: AssistantId,
-  id: ConversationId,
-  history: Schema.Array(HistoryItem)
-})
-
-/** Admin connections only: the whole list of assistants, order kept. */
-export const AssistantsMessage = Schema.Struct({
-  type: Schema.Literal("assistants"),
-  assistants: Schema.Array(AssistantInfo)
-})
-
-/** Admin connections only: the device types and their defaults (replaces `frontends`). */
-export const DeviceTypesMessage = Schema.Struct({
-  type: Schema.Literal("device.types"),
-  types: Schema.Array(DeviceTypeInfo)
-})
-
-/** Admin connections only: the devices (protocol 7 shape; replaces the protocol 5 `devices`). */
-export const DevicesV7Message = Schema.Struct({
-  type: Schema.Literal("devices"),
-  devices: Schema.Array(DeviceRecordInfo)
-})
-
-/** `result` with the protocol 7 error codes and `assistantId` (a successful `assistant.create`). */
-export const AssistantResultMessage = Schema.Struct({
-  type: Schema.Literal("result"),
-  requestId: RequestId,
-  ok: Schema.Boolean,
-  error: Schema.optionalKey(Schema.Struct({
-    ...ErrorInfo.fields,
-    code: Schema.Union([ErrorCode, AssistantErrorCode])
-  })),
-  admin: Schema.optionalKey(AdminSession),
-  assistantId: Schema.optionalKey(AssistantId)
-})
-
-/** The protocol 7 server messages that are new or changed. */
+/** The server messages that protocol 7 adds (also members of `ServerMessage`); `devices` and `result` are extended in place. */
 export const AssistantsServerMessage = Schema.Union([
   DeviceSetupMessage,
   ConversationHistory,
   AssistantsMessage,
-  DeviceTypesMessage,
-  DevicesV7Message,
-  AssistantResultMessage
+  DeviceTypesMessage
 ]).pipe(Schema.toTaggedUnion("type"))
 export type AssistantsServerMessage = typeof AssistantsServerMessage.Type
 export type AssistantsServerMessageType = AssistantsServerMessage["type"]

@@ -2,7 +2,7 @@ import { Schema } from "effect"
 import { Assistant, AssistantId, MAX_ASSIGNMENTS, MAX_PHRASES_PER_DEVICE } from "./assistants.ts"
 import type { AssistantHearing, Issue } from "./assistants.ts"
 import { InterruptMode, NonNegativeFinite, OutputPath } from "./common.ts"
-import { DeviceId, DeviceName, FrontendKindId, PrebufferMs, WAKE_PHRASES_MAX, WakeMatch, WakePhrase, wakeWords, WEB_VOICE_KIND } from "./frontends.ts"
+import { DeviceId, DeviceInfo, DeviceName, FrontendKindId, PrebufferMs, WAKE_PHRASES_MAX, WakeMatch, WakePhrase, wakeWords, WEB_VOICE_KIND } from "./frontends.ts"
 
 /**
  * Devices, device types and assignments (docs/ASSISTANTS.md §2.3, §2.6, protocol 7 schemas). Pure and browser-safe.
@@ -522,6 +522,19 @@ export const DeviceRecordInfo = Schema.Struct({
   audioOwner: Schema.Boolean
 })
 export type DeviceRecordInfo = typeof DeviceRecordInfo.Type
+
+/**
+ * One remembered device for admin, as `devices` and `admin.snapshot.devices` carry it in protocol 7: the protocol 5
+ * `DeviceInfo` (kept until the UI packages stop reading `overrides` and `profile`) with the protocol 7 fields added.
+ */
+export const DeviceListInfo = Schema.Struct({
+  ...DeviceInfo.fields,
+  own: DeviceOwn,
+  settings: DeviceSettings,
+  hearer: Schema.NullOr(AssistantId),
+  rev: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))
+})
+export type DeviceListInfo = typeof DeviceListInfo.Type
 
 /**
  * What a voice connection learns about its own device (`device.setup`, `snapshot.setup`): never another device's

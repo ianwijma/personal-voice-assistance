@@ -28,6 +28,7 @@ import {
 import { Effect } from "effect"
 import type { AccessPolicy } from "./access.ts"
 import type { AdminSessions, SessionEndReason } from "./AdminSessions.ts"
+import type { AssistantResult, Assistants } from "./assistants.ts"
 import type { Engine } from "./Engine.ts"
 import type { EnvMover } from "./envSettings.ts"
 import { type FrontendResult, type Frontends, kindOf } from "./frontends.ts"
@@ -128,8 +129,10 @@ export interface HubOptions {
   readonly access: AccessPolicy
   /** `PVA_ADMIN_PASSWORD` and the admin sessions. */
   readonly admin: AdminSessions
-  /** Front-end kinds, devices and profiles. */
+  /** Front-end kinds, devices and profiles (protocol 5 messages). */
   readonly frontends: Frontends
+  /** Assistants, device types and devices of protocol 7 (docs/ASSISTANTS.md §5). */
+  readonly assistants: Assistants
   /** Settings from outside the UI and "Move to settings". Absent: no `env` in the snapshot, moves refused. */
   readonly env?: EnvMover
   /** Model downloads (jobs). Absent: none offered. */
@@ -159,6 +162,8 @@ export const ADMIN_ONLY: ReadonlySet<ServerMessageType> = new Set<ServerMessageT
   "admin.snapshot",
   "frontends",
   "devices",
+  "assistants",
+  "device.types",
   "sessions",
   "trace",
   "wake.heard"
@@ -187,6 +192,8 @@ interface Client {
   adminToken: string | undefined
   /** The `device.profile` last sent (JSON), to send only changes. */
   lastProfile: string | undefined
+  /** The `device.setup` last sent (JSON; voice connections), to send only changes. */
+  lastSetup: string | undefined
   /** The phrase tester is on until then (epoch ms; 0 = off). */
   wakeTestUntil: number
   /** The device whose session the phrase tester follows (`undefined`: the most recently active one). */
@@ -210,7 +217,7 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
   const clients = new Set<Client>()
   const helloTimeoutMs = options.helloTimeoutMs ?? 5_000
   const maxConnections = options.maxConnections ?? 24
-  const { keys, access, admin, frontends } = options
+  const { keys, access, admin, frontends, assistants } = options
   const observerLimit = options.observerBufferLimit ?? 1_048_576
   const ownerLimit = options.ownerBufferLimit ?? 8_388_608
   const devicesThrottleMs = options.devicesThrottleMs ?? 1_000
@@ -227,6 +234,18 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
   }
   const isOwner = (client: Client) => client.sessionKey !== undefined && owners.get(client.sessionKey)?.owner === client
   const sessionOf = (client: Client): VoiceSession | undefined => (client.sessionKey === undefined ? undefined : sessions.get(client.sessionKey))
+  /** The ids of the assistants on the connection's device now (`VoiceSessions` keeps reservations for these only). */
+  const assignedOn = (client: Client): ReadonlyArray<string> =>
+    assistants.setupFor(client.device?.id, client.device?.kind).assistants.map((a) => a.id)
+  /**
+   * Who answers on the connection's device while it has no session (no follow-up window yet), as the session decides
+   * (§5.3, `VoiceSession.answering`): the `withoutPhrase` assistant, else the TypeSafe fallback, else the first.
+   */
+  const answersWithoutSession = (client: Client): string | undefined => {
+    const setup = assistants.setupFor(client.device?.id, client.device?.kind)
+    const wp = setup.withoutPhrase
+    return wp.mode === "assistant" ? wp.assistant : wp.mode === "typesafe" && wp.fallback !== null ? wp.fallback : setup.assistants[0]?.id
+  }
   /** The conversation an admin connection's snapshot names (admin has no session). */
   const adminConversation: ConversationInfo = { id: globalThis.crypto.randomUUID(), startedAt: Date.now() }
   const maxPendingPerConnection = options.maxPendingPerConnection ?? 4
@@ -316,8 +335,13 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
       if (!r.ok) sendVault(client)
     }))
 
-  const result = (client: Client, requestId: RequestId, outcome: HostResult | FrontendResult) =>
-    send(client, outcome.ok ? { type: "result", requestId, ok: true } : { type: "result", requestId, ok: false, error: outcome.error })
+  const result = (client: Client, requestId: RequestId, outcome: HostResult | FrontendResult | AssistantResult) =>
+    send(
+      client,
+      outcome.ok
+        ? { type: "result", requestId, ok: true, ...("assistantId" in outcome && outcome.assistantId !== undefined ? { assistantId: outcome.assistantId } : {}) }
+        : { type: "result", requestId, ok: false, error: outcome.error }
+    )
 
   const failure = (code: ErrorInfo["code"], message: string): HostResult => ({ ok: false, error: { code, message } })
 
@@ -328,8 +352,8 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
   const limited = (
     client: Client,
     requestId: RequestId,
-    work: Effect.Effect<HostResult | FrontendResult, never>,
-    after?: (r: HostResult | FrontendResult) => void
+    work: Effect.Effect<HostResult | FrontendResult | AssistantResult, never>,
+    after?: (r: HostResult | FrontendResult | AssistantResult) => void
   ) => {
     if (client.pending >= maxPendingPerConnection || pendingTotal >= maxPendingTotal) {
       return result(client, requestId, failure("busy", "Too many changes at once; try again in a moment"))
@@ -381,7 +405,7 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
     if (devicesTimer !== undefined) clearTimeout(devicesTimer)
     devicesTimer = undefined
     devicesSentAt = performance.now()
-    broadcast({ type: "devices", devices: [...frontends.devices(live)] })
+    broadcast({ type: "devices", devices: [...assistants.devices(frontends.devices(live))] })
   }
   /** `minor`: only last seen, connections or the audio owner changed (throttled). */
   const devicesChanged = (minor: boolean) => {
@@ -430,8 +454,40 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
       send(client, { type: "device.profile", ...info })
     }
     for (const session of sessions.all()) session.syncProfile()
+    refreshSetups()
   }
 
+  /** Send `device.setup` to every voice connection whose setup changed (never to admin connections: it is the voice page's). */
+  const refreshSetups = () => {
+    for (const client of clients) {
+      if (!client.helloed || client.role !== "voice") continue
+      const setup = assistants.setupFor(client.device?.id, client.device?.kind)
+      const text = JSON.stringify(setup)
+      if (text === client.lastSetup) continue
+      client.lastSetup = text
+      send(client, { type: "device.setup", ...setup })
+    }
+  }
+
+  /** The admin pages' lists of assistants and device types (admin connections only). */
+  const pushAssistants = () => {
+    if (![...clients].some((c) => c.helloed && isAdmin(c))) return
+    broadcast({ type: "assistants", assistants: [...assistants.infos()] })
+    broadcast({ type: "device.types", types: [...assistants.deviceTypes()] })
+  }
+
+  /**
+   * An assistant, device-type or device change was saved (new messages, `device.pick`): sessions apply their route
+   * configuration without a reload (`refreshProfiles` → `syncProfile`), voice connections get their new setup, admin
+   * connections the lists.
+   */
+  const afterAssistantsChange = (r: HostResult | FrontendResult | AssistantResult) => {
+    if (!r.ok) return
+    refreshProfiles()
+    pushAssistants()
+    devicesChanged(false)
+    sessionsChanged(false)
+  }
   /** Remember the device of this connection (background save), then push what changed. */
   const registerDevice = (device: DeviceHello) =>
     options.run(Effect.andThen(frontends.seen(device, connectedDevices()), Effect.sync(() => {
@@ -444,6 +500,7 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
     if (!r.ok) return
     refreshProfiles()
     if (kinds) broadcast({ type: "frontends", frontends: [...frontends.kinds()] })
+    pushAssistants()
     devicesChanged(false)
   }
 
@@ -523,6 +580,20 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
 
   // ---- Snapshots
 
+  /** Protocol 7: the device's setup and the conversations its session has (none before the session exists). */
+  const voicePart = (client: Client, session: VoiceSession | undefined): Pick<Snapshot, "setup" | "conversations"> => {
+    const setup = assistants.setupFor(client.device?.id, client.device?.kind)
+    return {
+      setup,
+      conversations: session === undefined
+        ? []
+        : setup.assistants.map((a) => {
+          const c = session.conversation.conversation(a.id)
+          return { assistantId: a.id, id: c.id, startedAt: c.startedAt, turns: session.conversation.turnsOf(a.id) }
+        })
+    }
+  }
+
   /** The voice part: of the connection's own session (its device's), or of none yet. */
   const snapshot = (client: Client, endReason?: AdminState["endReason"]): Snapshot => {
     const key = client.sessionKey
@@ -536,7 +607,8 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
       history: session === undefined ? [] : historyItems(Effect.runSync(session.conversation.history())),
       ...(client.role === "voice" ? { device: profileInfo(client) } : {}),
       admin: adminState(client, endReason),
-      conversation: key === undefined ? adminConversation : sessions.conversation(key)
+      conversation: key === undefined ? adminConversation : sessions.conversation(key, session === undefined ? answersWithoutSession(client) : undefined, assignedOn(client)),
+      ...(client.role === "voice" ? voicePart(client, session) : {})
     }
   }
 
@@ -550,8 +622,10 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
     models: options.models?.list() ?? [],
     jobs: options.jobs?.list() ?? [],
     frontends: [...frontends.kinds()],
-    devices: [...frontends.devices(live)],
-    sessions: [...sessions.list()]
+    devices: [...assistants.devices(frontends.devices(live))],
+    sessions: [...sessions.list()],
+    assistants: [...assistants.infos()],
+    deviceTypes: [...assistants.deviceTypes()]
   })
 
   const hello = (client: Client, message: ClientMessage) => {
@@ -586,6 +660,7 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
     if (resumed !== undefined) becomeOwner(client, resumed)
     const first = snapshot(client, tokenRefused ? "token" : undefined)
     if (first.device !== undefined) client.lastProfile = JSON.stringify(first.device)
+    if (first.setup !== undefined) client.lastSetup = JSON.stringify(first.setup)
     send(client, {
       type: "welcome",
       protocol: PROTOCOL_VERSION,
@@ -726,7 +801,13 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
         if (client.role !== "voice" || client.sessionKey === undefined) {
           return result(client, message.requestId, failure("bad_message", "A new conversation is started from a voice page"))
         }
-        return limited(client, message.requestId, Effect.as(sessions.newConversation(client.sessionKey, message.assistantId), { ok: true } as HostResult))
+        // Only an assistant on this device (the server keeps its conversation, and before the session its reserved id).
+        if (message.assistantId !== undefined && !assistants.setupFor(client.device?.id, client.device?.kind).assistants.some((a) => a.id === message.assistantId)) {
+          return result(client, message.requestId, failure("unknown_assistant", `${message.assistantId} is not one of the assistants on this device`))
+        }
+        // Without a session the reservation of the assistant asked for (absent: the one that will answer) is replaced.
+        const assistantId = message.assistantId ?? (sessionOf(client) === undefined ? answersWithoutSession(client) : undefined)
+        return limited(client, message.requestId, Effect.as(sessions.newConversation(client.sessionKey, assistantId, assignedOn(client)), { ok: true } as HostResult))
       }
       case "admin.login":
         return login(client, message.requestId, message.password)
@@ -756,6 +837,53 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
           const again = [...clients].find((c) => c.device?.id === id && !c.closed)?.device
           if (again !== undefined) registerDevice(again)
           afterProfileChange(false)(r)
+        })
+      }
+      case "assistant.create":
+        if (!allowed(client, message.requestId)) return
+        return limited(client, message.requestId, assistants.create(message), afterAssistantsChange)
+      case "assistant.save":
+        if (!allowed(client, message.requestId)) return
+        return limited(client, message.requestId, assistants.save(message), afterAssistantsChange)
+      case "assistant.delete":
+        if (!allowed(client, message.requestId)) return
+        return limited(client, message.requestId, assistants.remove(message), afterAssistantsChange)
+      case "device.save":
+        if (!allowed(client, message.requestId)) return
+        return limited(client, message.requestId, assistants.saveDevice(message), afterAssistantsChange)
+      case "device.pick": {
+        // The device's own voice page (any of its connections); the server checks that the device lets people pick.
+        const device = client.device
+        if (client.role !== "voice" || device === undefined) {
+          return result(client, message.requestId, failure("bad_message", "This page did not say which device it is; reload it"))
+        }
+        // The device record is saved in the background at hello: make sure it exists before the pick writes to it.
+        return limited(
+          client,
+          message.requestId,
+          Effect.andThen(frontends.seen(device, connectedDevices()), assistants.pick(device.id, message.withoutPhrase)),
+          afterAssistantsChange
+        )
+      }
+      case "conversation.read": {
+        // Another assistant's conversation on this device, without changing who answers; sent to the requester only.
+        if (client.role !== "voice" || client.sessionKey === undefined) {
+          return result(client, message.requestId, failure("bad_message", "Conversations are read on a voice page"))
+        }
+        const assistantId = message.assistantId
+        const setup = assistants.setupFor(client.device?.id, client.device?.kind)
+        if (!setup.assistants.some((a) => a.id === assistantId)) {
+          return result(client, message.requestId, failure("unknown_assistant", `${assistantId} is not one of the assistants on this device`))
+        }
+        const session = sessionOf(client)
+        // Without a session: the id reserved for that assistant (the session takes it over).
+        const info = session === undefined ? sessions.conversation(client.sessionKey, assistantId, setup.assistants.map((a) => a.id)) : session.conversation.conversation(assistantId)
+        return send(client, {
+          type: "conversation.history",
+          requestId: message.requestId,
+          assistantId,
+          id: info.id,
+          history: session === undefined ? [] : historyItems(Effect.runSync(session.conversation.history(assistantId)))
         })
       }
       case "wake.test": {
@@ -863,6 +991,7 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
         link: undefined,
         adminToken: undefined,
         lastProfile: undefined,
+        lastSetup: undefined,
         wakeTestUntil: 0,
         wakeTestDevice: undefined
       }

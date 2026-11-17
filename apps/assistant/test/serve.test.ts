@@ -60,7 +60,7 @@ describe("serve: handshake", () => {
     expect(welcome.snapshot.state).toBe("idle")
     expect(welcome.snapshot.engine).toEqual({ ready: true, state: "ready", voices: [{ name: "sherpa:en_US-lessac-medium", description: "Lessac", isDefault: true }] })
     expect(welcome.snapshot.history).toEqual([])
-    expect(Object.keys(welcome.snapshot).sort()).toEqual(["admin", "conversation", "device", "engine", "history", "ownerPresent", "role", "state"])
+    expect(Object.keys(welcome.snapshot).sort()).toEqual(["admin", "conversation", "conversations", "device", "engine", "history", "ownerPresent", "role", "setup", "state"])
     const admin = await connect()
     const { snapshot } = await admin.admin(TEST_ADMIN_PASSWORD)
     expect(snapshot.engine.state).toBe("ready")

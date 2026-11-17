@@ -50,6 +50,8 @@ import { type Jobs, makeJobs } from "./jobs.ts"
 import { makeModels, type Models, type PresetDownloader, presetsInUse } from "./models.ts"
 import { type Keys, makeKeys } from "./Keys.ts"
 import { makeSections } from "./sections.ts"
+import { makeAssistants } from "./assistants.ts"
+import { deviceSettingsFrom } from "./devices.ts"
 import { makeSessionHub, type SessionHub } from "./SessionHub.ts"
 import { DataDirConfig, KEYS_LOCKED_MESSAGE, loadSettingsStore, SettingsStoreError } from "./SettingsStore.ts"
 import { makeApi } from "./api.ts"
@@ -275,13 +277,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       return assistantsCache.byId
     }
     /** A device's effective settings: its own sections ← its type's defaults ← the built-in (no device: the browser defaults). */
-    const deviceSettingsOf = (deviceId: string | undefined): DeviceSettings => {
-      const file = store.settings()
-      const record = deviceId === undefined ? undefined : file.devices[deviceId]
-      const kind = record?.kind ?? WEB_VOICE_KIND
-      const type = deviceTypeOf(kind) ?? WEB_VOICE_DEVICE_TYPE
-      return effectiveDeviceSettings(type.builtIn, file.deviceTypes[kind], record === undefined ? undefined : applicableOwn(type, record.own))
-    }
+    const deviceSettingsOf = (deviceId: string | undefined): DeviceSettings => deviceSettingsFrom(store.settings(), deviceId)
     /** Modules an assistant chooses (capabilities); agent and decision modules are not per assistant and always pass. */
     const isCapability = (moduleId: string) => {
       const def = catalog.find((d) => d.id === moduleId)
@@ -430,7 +426,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       return stt === undefined ? "unknown" : `${stt.provider} ${stt.detail}`
     }
     const sessions: VoiceSessions = makeVoiceSessions({
-      make: (key, device, initial) =>
+      make: (key, device, reserved) =>
         makeVoiceSession({
           key,
           ...(device !== undefined ? { deviceId: device.id } : {}),
@@ -450,7 +446,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
             hub?.broadcast({ type: "trace", key, ...(device !== undefined ? { deviceId: device.id } : {}), trace })
           },
           minuteMs,
-          ...(initial !== undefined ? { initialConversation: initial } : {}),
+          ...(reserved !== undefined ? { reservedConversations: reserved } : {}),
           ...(options.stallMs !== undefined ? { stallMs: options.stallMs } : {}),
           heard: {
             dir: recordings,
@@ -470,15 +466,25 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       run,
       onChange: (minor) => hub?.sessionsChanged(minor),
       onDiscard: (key) => hub?.sessionDiscarded(key),
-      announce: (key, info) => hub?.toSession(key, { type: "conversation", id: info.id, reason: "new", startedAt: info.startedAt })
+      announce: (key, info, assistant) =>
+        hub?.toSession(key, { type: "conversation", id: info.id, reason: "new", startedAt: info.startedAt, ...(assistant !== undefined ? { assistantId: assistant } : {}) })
     })
     // Before the lock is released and the engines close (finalizers run in reverse): every session's loop stops, and
     // no recording write or rotation happens after it.
     yield* Effect.addFinalizer(() => sessions.closeAll)
 
+    const assistants = makeAssistants({
+      store,
+      sessions,
+      modules: () => host.modules(),
+      engineState: () => theEngine.status().state,
+      // TypeSafe is set up when a decision provider runs (the routing section arrives with WP-14).
+      canAuto: () => host.modules().some((m) => m.kind === "decider" && m.state === "running")
+    })
     hub = makeSessionHub({
       admin,
       frontends,
+      assistants,
       env: envMover,
       models,
       jobs,
