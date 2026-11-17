@@ -111,8 +111,9 @@ const textList = (o: Common & {
     if (raw.length > MAX_TEXT_LIST_ITEMS * 4) return fail(`At most ${maxItems} items`)
     const seen = new Set<string>()
     const items: Array<string> = []
-    for (const item of raw.map((s) => s.trim()).filter((s) => s.length > 0)) {
-      if (item.length > itemMaxLength) return fail(`"${item.slice(0, 20)}…" is longer than ${itemMaxLength} characters`)
+    for (const [n, item] of raw.map((s) => s.trim()).filter((s) => s.length > 0).entries()) {
+      // The rejected item is never quoted (it may be anything, a key pasted in the wrong field included).
+      if (item.length > itemMaxLength) return fail(`Item ${n + 1} is longer than ${itemMaxLength} characters`)
       if (seen.has(item.toLowerCase())) continue
       seen.add(item.toLowerCase())
       items.push(item)

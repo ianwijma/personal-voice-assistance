@@ -184,7 +184,8 @@ export const makePageBoundary = (options: {
   const matcher = (moduleId: string): Matcher => {
     const m = of(moduleId)
     const current = [...options.current(moduleId)].filter((v): v is string => typeof v === "string" && v.length > 0)
-    const key = `${m.revision}\u0000${current.join("\u0000")}`
+    // A collision-free key: a value may itself contain any character (NUL included), so the list is serialized whole.
+    const key = JSON.stringify([m.revision, current])
     if (m.cache?.key === key) return m.cache.matcher
     const built = matcherOf([...m.held.keys(), ...current])
     m.cache = { key, matcher: built }

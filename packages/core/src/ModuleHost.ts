@@ -7,6 +7,7 @@ import {
   MAX_MODULE_TEMPLATES,
   MAX_OPTIONS_JSON,
   MAX_ROUTE_DESCRIPTION,
+  MAX_ROUTE_PATH,
   MODULE_ROUTES_PREFIX,
   type ModuleInfo,
   type ModuleInstanceInfo,
@@ -599,7 +600,6 @@ const sameRecord = (a: Readonly<Record<string, string>>, b: Readonly<Record<stri
   return ka.length === Object.keys(b).length && ka.every((k) => Object.hasOwn(b, k) && a[k] === b[k])
 }
 
-const firstLine = (cause: Cause.Cause<unknown>) => Cause.pretty(cause).split("\n")[0] ?? "unknown"
 const describe = (error: unknown) => (error instanceof Error ? error.message : String(error))
 
 /** What a bounded call into module code came to. */
@@ -736,6 +736,12 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
     }
     return settings
   }
+  /**
+   * The first line of a cause as the page may show it: the whole text is matched by the boundary first, then cut, so
+   * a secret that spans lines (or that the cut would split) is replaced whole. Every place the host shortens a
+   * module's text goes through the boundary before it is shortened.
+   */
+  const firstLine = (moduleId: string, cause: Cause.Cause<unknown>) => boundary.redact(moduleId, Cause.pretty(cause)).split("\n")[0] || "unknown"
   const fieldActionTimeoutMs = options.fieldActionTimeoutMs ?? FIELD_ACTION_TIMEOUT_MS
   /**
    * The press slots of each module (`ModuleSlots`), across all its owners, so restarts cannot pile presses up: at
@@ -1047,7 +1053,8 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
     const prefix = `${MODULE_ROUTES_PREFIX}${moduleId}`
     return {
       ...view,
-      path: route.path === "" ? prefix : `${prefix}/${boundary.redact(moduleId, route.path)}`,
+      // Matched whole, then bounded to the wire's length (a short secret repeated in a long path expands it).
+      path: route.path === "" ? prefix : clip(`${prefix}/${boundary.redact(moduleId, route.path)}`, MAX_ROUTE_PATH + 100),
       ...(token !== undefined && !boundary.holds(moduleId, token) ? { token } : {}),
       ...(description !== undefined ? { description: boundary.text(moduleId, description, MAX_ROUTE_DESCRIPTION) } : {})
     }
@@ -1595,11 +1602,11 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
       return { _tag: "hung" } as const
     })
 
-  const describeStartFailure = (cause: Cause.Cause<unknown>): string => {
+  const describeStartFailure = (moduleId: string, cause: Cause.Cause<unknown>): string => {
     const error = Cause.findErrorOption(cause)
     if (error._tag === "Some" && error.value instanceof ModuleStartError) return error.value.message
     if (Cause.hasInterruptsOnly(cause)) return "It was interrupted while starting"
-    return `The module crashed while starting: ${firstLine(cause)}`
+    return `The module crashed while starting: ${firstLine(moduleId, cause)}`
   }
 
   let nextId = 0
@@ -1670,7 +1677,7 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
       bounded(Effect.suspend(start).pipe(Scope.provide(part.scope)), startTimeoutMs, true),
       (outcome): { readonly ok: true; readonly value: A } | { readonly ok: false; readonly message: string } => {
         if (outcome._tag === "hung") return { ok: false, message: closing ? "The assistant is stopping" : `${label} within ${Math.round(startTimeoutMs / 1000)} s` }
-        return Exit.isSuccess(outcome.exit) ? { ok: true, value: outcome.exit.value } : { ok: false, message: describeStartFailure(outcome.exit.cause) }
+        return Exit.isSuccess(outcome.exit) ? { ok: true, value: outcome.exit.value } : { ok: false, message: describeStartFailure(part.entry.def.id, outcome.exit.cause) }
       }
     )
 
@@ -1864,7 +1871,7 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
     step.pipe(Effect.catchCause((cause) =>
       Effect.gen(function*() {
         yield* Effect.logError(`Module ${entry.def.id}: the module host could not handle it`, cause)
-        entry.failure = { attempt, message: `The module host could not handle it: ${firstLine(cause)}`, instances: [] }
+        entry.failure = { attempt, message: `The module host could not handle it: ${firstLine(entry.def.id, cause)}`, instances: [] }
       })
     ))
 
@@ -2277,7 +2284,7 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
           Effect.catchCause((cause) =>
             Cause.hasInterruptsOnly(cause)
               ? Effect.interrupt
-              : Effect.succeed(own(`${entry.def.name}'s health check failed`, firstLine(cause)))
+              : Effect.succeed(own(`${entry.def.name}'s health check failed`, firstLine(entry.def.id, cause)))
           ),
           Effect.flatMap((list) =>
             Effect.sync(() =>
