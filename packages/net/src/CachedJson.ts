@@ -236,8 +236,8 @@ export const makeCachedJson = (deps: CachedJsonDeps = {}): CachedJson => {
       let value: unknown
       try {
         value = JSON.parse(response.text().replace(/^\uFEFF/, ""))
-      } catch (e) {
-        return yield* Effect.fail(new NetBadJson({ url, detail: e instanceof Error ? e.message : String(e) }))
+      } catch {
+        return yield* Effect.fail(new NetBadJson({ url, detail: "the response is not valid JSON" }))
       }
       const etag = response.headers["etag"]
       cache.setIfNewer(key, { value, ...(etag !== undefined ? { etag } : {}), url: response.url, storedAt: now(), sequence })

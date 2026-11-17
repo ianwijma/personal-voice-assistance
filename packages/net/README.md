@@ -8,11 +8,11 @@ Outgoing HTTP for URLs a model or a user chose, and for public APIs. No dependen
   `contentTypes.json` (`application/json` and any `+json`), `contentTypes.feed` (RSS, Atom, RDF, JSON Feed, XML) and
   `contentTypes.image` (PNG, JPEG, GIF, WebP, AVIF; no SVG), or a policy of its own. A response without a Content-Type or with one the
   policy does not list is refused before its body is read (an error page outside 200–299 is returned with its status and an empty body
-  instead). The guard: resolves the host itself, refuses every address the IANA special-purpose registries do not mark globally
+  instead). A final response with more than one Content-Type (two header lines, or one value listing two media types; a comma inside a quoted parameter does not count) is refused with `content-type` before its body is read. The guard: resolves the host itself, refuses every address the IANA special-purpose registries do not mark globally
   reachable (loopback, private, link-local incl. cloud metadata, CGNAT, unique-local, multicast, documentation incl. `3fff::/20`,
   benchmarking, reserved, the IETF protocol blocks, and IPv4-mapped / NAT64 / 6to4 forms of those; `Address.ts` cites the registries),
   connects to the address it checked (no second lookup), re-checks every redirect (default 3), allows `http`/`https` only, no
-  credentials in the URL, ports 80/443, local names refused, size limit after decompression (default 2 MiB), total time limit
+  credentials in the URL, ports 80/443, local names refused, size limit `maxBytes` (default 2 MiB), which caps both the encoded bytes read and the decoded body, total time limit
   (default 6 s), honours `signal` and Effect interruption (an already-aborted signal starts no lookup and no connection, and a lookup
   or connection that fails after an abort never becomes an unhandled rejection). Requests ask for `identity`; a body that comes
   compressed anyway (gzip, deflate and br) is decompressed as it arrives by Node's streaming decompressors and its decompressed
@@ -23,7 +23,7 @@ Outgoing HTTP for URLs a model or a user chose, and for public APIs. No dependen
   and `gzip` itself treat padding: "hello" followed by a zero byte and "AB" is "hello"), and anything else that is not another member
   is a `NetFailure`. The decoded-size and time limits apply to what is read either way. A failure of
   the decompressor ends the read at once: a decompressed size over the limit is `NetTooLarge` and an invalid deflate stream is
-  `NetRefused(content-encoding)` as soon as the offending bytes arrive, the connection is closed, and a body that never ends does not
+  `NetRefused(content-encoding)` as soon as the offending bytes arrive (a zlib header is judged from its first two bytes, so a body that stalls after one byte ends at the deadline with `NetTimeout`), the connection is closed, and a body that never ends does not
   hold the request until the deadline. Request headers are
   checked: `Host`, hop-by-hop and framing headers and `Accept-Encoding` are refused, as are characters a header cannot hold; the Host
   header and the TLS name come from the URL only; a redirect to another origin keeps only `Accept`, `Accept-Language` and

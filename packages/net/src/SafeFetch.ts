@@ -161,6 +161,10 @@ export const makeNodeConnector = (connectorOptions: NodeConnectorOptions = {}): 
       }
       const out: Record<string, string> = Object.create(null)
       for (const [k, v] of Object.entries(res.headers)) if (v !== undefined) out[k] = Array.isArray(v) ? v.join(", ") : v
+      // Node keeps only the first of several Content-Type lines in `res.headers`; the guard must see all of them (joined, as other repeats are).
+      const typeLines: Array<string> = []
+      for (let i = 0; i + 1 < res.rawHeaders.length; i += 2) if (res.rawHeaders[i]!.toLowerCase() === "content-type") typeLines.push(res.rawHeaders[i + 1]!)
+      if (typeLines.length > 1) out["content-type"] = typeLines.join(", ")
       resolve({ status: res.statusCode ?? 0, headers: out, body: res })
     })
     req.on("error", reject)
@@ -278,6 +282,18 @@ export const mediaTypeOf = (header: string | undefined): string => {
   if (header === undefined) return ""
   const essence = header.split(";")[0]!.trim().toLowerCase()
   return mediaTypePattern.test(essence) ? essence : ""
+}
+
+/** More than one media type: a comma outside a quoted string (a comma inside a quoted parameter value is not a second type). */
+const hasSeveralTypes = (header: string | undefined): boolean => {
+  if (header === undefined) return false
+  let quoted = false
+  for (let i = 0; i < header.length; i++) {
+    const c = header[i]!
+    if (quoted) { if (c === "\\") i++; else if (c === '"') quoted = false } else if (c === '"') quoted = true
+    else if (c === ",") return true
+  }
+  return false
 }
 
 const validPolicy = (policy: ContentTypePolicy | undefined): boolean =>
@@ -601,7 +617,8 @@ const run = async (input: string | URL, options: SafeFetchOptions, allowLan: boo
       current = checked
       continue
     }
-    const contentType = mediaTypeOf(responseHeaders["content-type"])
+    const several = hasSeveralTypes(responseHeaders["content-type"])
+    const contentType = several ? "" : mediaTypeOf(responseHeaders["content-type"])
     const finish = (body: Uint8Array, encoding: Encoding, decoded: boolean): SafeResponse => {
       const shownHeaders: Record<string, string> = Object.create(null)
       for (const [k, v] of Object.entries(responseHeaders)) if (!(decoded && (k === "content-encoding" || k === "content-length"))) shownHeaders[k] = v
@@ -613,12 +630,12 @@ const run = async (input: string | URL, options: SafeFetchOptions, allowLan: boo
       closeBody(response.body)
       return finish(new Uint8Array(0), "identity", false)
     }
-    const typeOk = acceptsType(options.accept, contentType)
+    const typeOk = !several && acceptsType(options.accept, contentType)
     if (!typeOk) {
       closeBody(response.body)
       // An error page of another type is not read; the status still reaches the caller.
       if (response.status < 200 || response.status > 299) return finish(new Uint8Array(0), "identity", false)
-      throw refuse("content-type", url.href, contentType === "" ? `The response has no content type; a ${options.accept.name} was expected` : `The response is ${contentType}, not a ${options.accept.name}`)
+      throw refuse("content-type", url.href, several ? `The response lists more than one content type; a ${options.accept.name} was expected` : contentType === "" ? `The response has no content type; a ${options.accept.name} was expected` : `The response is ${contentType}, not a ${options.accept.name}`)
     }
     const encoding = encodingOf(responseHeaders["content-encoding"])
     if (encoding === undefined) {
