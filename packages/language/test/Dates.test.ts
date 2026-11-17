@@ -1,3 +1,4 @@
+// Round 3: "this coming Monday", "next week Monday", "vrijdag over een week" and the English "in" in Dutch were removed (decision 5).
 import { describe, expect, it } from "@effect/vitest"
 import { parseDateTime, type DateOptions } from "../src/Dates.ts"
 import { AMS, ams, hm, iso, NOW } from "./helpers.ts"
@@ -17,7 +18,7 @@ describe("parseDateTime: English", () => {
     ["today", "2026-11-18"], ["tomorrow", "2026-11-19"], ["yesterday", "2026-11-17"], ["the day after tomorrow", "2026-11-20"],
     ["tonight", "2026-11-18 night"], ["this evening", "2026-11-18 evening"], ["tomorrow morning", "2026-11-19 morning"], ["tomorrow evening", "2026-11-19 evening"],
     ["on Friday", "2026-11-20"], ["Friday", "2026-11-20"], ["on Wednesday", "2026-11-25"], ["Tuesday", "2026-11-24"], ["this Friday", "2026-11-20"], ["this Wednesday", "2026-11-18"],
-    ["this coming Monday", "2026-11-23"], ["next Wednesday", "2026-11-25"], ["Friday next week", "2026-11-27"], ["next week", "not-understood"], ["next week Monday", "2026-11-23"],
+    ["this coming Monday", "not-understood"], ["next Wednesday", "2026-11-25"], ["Friday next week", "2026-11-27"], ["next week", "not-understood"], ["next week Monday", "not-understood"],
     ["next Friday", "ambiguous: 2026-11-20 | 2026-11-27"], ["next Saturday", "ambiguous: 2026-11-21 | 2026-11-28"], ["next Monday", "ambiguous: 2026-11-23 | 2026-11-30"],
     ["the 3rd", "2026-12-03"], ["on the third", "2026-12-03"], ["the 18th", "2026-11-18"], ["the 17th", "2026-12-17"], ["the 31st", "2026-12-31"], ["the twenty first", "2026-11-21"],
     ["3 March", "2027-03-03"], ["March 3rd", "2027-03-03"], ["the 3rd of March", "2027-03-03"], ["March the third", "2027-03-03"], ["3 March 2028", "2028-03-03"],
@@ -36,7 +37,7 @@ describe("parseDateTime: English", () => {
     expect(r.kind).toBe("ambiguous")
     if (r.kind === "ambiguous") {
       expect(r.candidates.map((c) => iso(c.instant!))).toEqual(["2026-11-20T17:00", "2026-11-27T17:00"])
-      expect(r.reason).toContain("next friday")
+      expect(r.reason).toContain("the coming one or the one after")
     }
   })
   it("reads the time phrase alone: a sentence around it is not searched", () => {
@@ -96,10 +97,10 @@ describe("parseDateTime: Dutch", () => {
     ["vandaag", "2026-11-18"], ["morgen", "2026-11-19"], ["overmorgen", "2026-11-20"], ["gisteren", "2026-11-17"], ["vanavond", "2026-11-18 evening"], ["vanmiddag", "2026-11-18 afternoon"],
     ["morgenochtend", "2026-11-19 morning"], ["morgenavond", "2026-11-19 evening"], ["morgen ochtend", "2026-11-19 morning"], ["morgen avond", "2026-11-19 evening"],
     ["op vrijdag", "2026-11-20"], ["vrijdag", "2026-11-20"], ["woensdag", "2026-11-25"], ["deze vrijdag", "2026-11-20"], ["aanstaande maandag", "2026-11-23"], ["komende zaterdag", "2026-11-21"],
-    ["volgende vrijdag", "ambiguous: 2026-11-20 | 2026-11-27"], ["volgende woensdag", "2026-11-25"], ["vrijdag volgende week", "2026-11-27"], ["volgende week", "not-understood"], ["vrijdag over een week", "2026-11-27"],
+    ["volgende vrijdag", "ambiguous: 2026-11-20 | 2026-11-27"], ["volgende woensdag", "2026-11-25"], ["vrijdag volgende week", "2026-11-27"], ["volgende week", "not-understood"], ["vrijdag over een week", "not-understood"],
     ["de derde", "2026-12-03"], ["op de derde", "2026-12-03"], ["de 3e", "2026-12-03"], ["de 18e", "2026-11-18"], ["de eenentwintigste", "2026-11-21"],
     ["3 maart", "2027-03-03"], ["op 3 maart", "2027-03-03"], ["de derde maart", "2027-03-03"], ["drie maart", "2027-03-03"], ["3 maart 2028", "2028-03-03"], ["25 december", "2026-12-25"], ["31 april", "not-understood"], ["1 mei", "2027-05-01"],
-    ["over twee dagen", "2026-11-20"], ["over twee weken", "2026-12-02"], ["over een week", "2026-11-25"], ["over een maand", "2026-12-18"], ["over drie maanden", "2027-02-18"], ["in twee dagen", "2026-11-20"], ["over een jaar", "2027-11-18"],
+    ["over twee dagen", "2026-11-20"], ["over twee weken", "2026-12-02"], ["over een week", "2026-11-25"], ["over een maand", "2026-12-18"], ["over drie maanden", "2027-02-18"], ["in twee dagen", "not-understood"], ["over een jaar", "2027-11-18"],
     ["morgen om vijf uur", "2026-11-19 17:00"], ["morgen om 5 uur 's ochtends", "2026-11-19 05:00"], ["vrijdag om half acht", "2026-11-20 07:30"], ["vrijdag om half acht 's avonds", "2026-11-20 19:30"],
     ["morgenavond om acht uur", "2026-11-19 20:00"], ["morgenochtend om negen uur", "2026-11-19 09:00"], ["vanavond om tien uur", "2026-11-18 22:00"], ["3 maart om kwart voor zeven", "2027-03-03 18:45"], ["3 maart om kwart voor zeven 's avonds", "2027-03-03 18:45"],
     ["om zeven uur", "2026-11-18 19:00"], ["om half acht", "2026-11-18 19:30"], ["om 9 uur", "2026-11-18 21:00"], ["om 19:30", "2026-11-18 19:30"], ["zet een wekker voor morgen om kwart over zeven", "not-understood"], ["morgen om kwart over zeven", "2026-11-19 07:15"],

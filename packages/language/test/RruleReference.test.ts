@@ -1,106 +1,93 @@
-// Review round 2, decision 2: the recurrence engine against an independent brute-force reference.
-//
-// The reference below is a direct transcription of the semantics in the README ("Recurrence"): it walks local calendar days one by
-// one (with JavaScript's own Date arithmetic, not the package's day numbers), decides membership of each day with the rule's
-// definition, counts COUNT from DTSTART, converts each instance to an instant with its own offset search over Intl (the offset before
-// a gap; the first of two), and drops an instant that is not later than the one before. The fast implementation jumps to the period
-// of `after` with arithmetic. They must agree for every rule of a generated matrix and many `after` instants.
+// The recurrence engine against an independent brute-force reference (review round 2, decision 2; made independent in round 3,
+// finding 25). The reference shares nothing with the engine: it walks every local day with JavaScript's Date (support/Zone.ts),
+// decides membership from the README's definitions, converts each instance with the tests' own Intl-based zone lookup (every offset
+// seen near it tried and checked against the wall clock Intl formats), counts COUNT over distinct instants, and stops at the end of
+// the supported years. The engine jumps to the period of `after` by arithmetic. They must agree, with no instant twice and none out
+// of order, and with the same reason for stopping.
 import { describe, expect, it } from "@effect/vitest"
 import { parseRecurrence } from "../src/Recurrence.ts"
 import { describeRRule, formatRRule, occurrencesAfter, parseRRule, readSeries, type RecurrenceRule, type RecurrenceSpec } from "../src/Rrule.ts"
+import { stable } from "./support/Cfg.ts"
+import { rng } from "./support/Rng.ts"
+import { daysIn, instantsOf, plusDays, utcOfDay, wallOf, weekdayOf, type Day } from "./support/Zone.ts"
 
-// ---- the reference ------------------------------------------------------------------------------------------------------------------
-
-interface Day { readonly y: number; readonly m: number; readonly d: number }
 const DAY = 86_400_000
-const utcOf = (x: Day): number => { const t = new Date(0); t.setUTCFullYear(x.y, x.m - 1, x.d); t.setUTCHours(0, 0, 0, 0); return t.getTime() }
-const dayAt = (ms: number): Day => { const t = new Date(ms); return { y: t.getUTCFullYear(), m: t.getUTCMonth() + 1, d: t.getUTCDate() } }
-const weekdayRef = (x: Day): number => { const w = new Date(utcOf(x)).getUTCDay(); return w === 0 ? 7 : w }
-const lastOfMonth = (x: Day): number => new Date(utcOf({ y: x.m === 12 ? x.y + 1 : x.y, m: x.m === 12 ? 1 : x.m + 1, d: 1 }) - DAY).getUTCDate()
-const codes = ["MO", "TU", "WE", "TH", "FR", "SA", "SU"]
-
-const offsetFormatters = new Map<string, Intl.DateTimeFormat>()
-/** Zone minus UTC in ms at an instant, read from Intl's "GMT+01:00" offset name. */
-const refOffset = (instant: number, zone: string): number => {
-  let f = offsetFormatters.get(zone)
-  if (f === undefined) { f = new Intl.DateTimeFormat("en-US", { timeZone: zone, timeZoneName: "longOffset" }); offsetFormatters.set(zone, f) }
-  const name = f.formatToParts(instant).find((p) => p.type === "timeZoneName")!.value
-  const m = /GMT(?:([+-])(\d{2}):(\d{2})(?::(\d{2}))?)?/.exec(name)!
-  if (m[1] === undefined) return 0
-  return (m[1] === "-" ? -1 : 1) * ((Number(m[2]) * 60 + Number(m[3])) * 60 + Number(m[4] ?? 0)) * 1000
-}
-/** The instant of a local time: the first that has it; in a gap, the reading with the offset from before the gap. */
-const refInstant = (x: Day, hour: number, minute: number, zone: string): number => {
-  const wall = utcOf(x) + (hour * 60 + minute) * 60_000
-  const before = refOffset(wall - 36 * 3_600_000, zone)
-  const after = refOffset(wall + 36 * 3_600_000, zone)
-  const valid = [before, after].filter((o) => refOffset(wall - o, zone) === o).map((o) => wall - o)
-  return valid.length > 0 ? Math.min(...valid) : wall - before
-}
+const codes = ["MO", "TU", "WE", "TH", "FR", "SA", "SU"] as const
+const lastDay: Day = { year: 2199, month: 12, day: 31 }
 
 interface Case {
   readonly rule: RecurrenceRule
-  readonly start: Day & { readonly hour: number; readonly minute: number }
+  readonly start: Day & { readonly hour: number; readonly minute: number; readonly second: number }
   readonly zone: string
 }
 
-const member = (c: Case, x: Day): boolean => {
-  const { rule, start } = c
-  const s: Day = start
-  if (utcOf(x) < utcOf(s)) return false
+const leap = (y: number) => (y % 4 === 0 && y % 100 !== 0) || y % 400 === 0
+const monthLength = (y: number, m: number) => (m === 2 ? (leap(y) ? 29 : 28) : [4, 6, 9, 11].includes(m) ? 30 : 31)
+
+/** Whether day `x` (its UTC midnight `t` and weekday `wd`) is an instance day of the case, by the README's definitions. */
+const memberAt = (c: Case, x: Day, t: number, wd: number): boolean => {
+  const { rule, start: s } = c
+  const startT = utcOfDay(s)
+  if (t < startT) return false
   const I = rule.interval
   switch (rule.freq) {
-    case "DAILY": return Math.round((utcOf(x) - utcOf(s)) / DAY) % I === 0
+    case "DAILY": return Math.round((t - startT) / DAY) % I === 0
     case "WEEKLY": {
-      const monday = (v: Day) => utcOf(v) - (weekdayRef(v) - 1) * DAY
-      if (Math.round((monday(x) - monday(s)) / (7 * DAY)) % I !== 0) return false
-      const days = rule.byDay.length > 0 ? rule.byDay.map((d) => codes.indexOf(d.weekday) + 1) : [weekdayRef(s)]
-      return days.includes(weekdayRef(x))
+      const weeks = Math.round(((t - (wd - 1) * DAY) - (startT - (weekdayOf(s) - 1) * DAY)) / (7 * DAY))
+      if (weeks % I !== 0) return false
+      const days = rule.byDay.length > 0 ? rule.byDay.map((d) => codes.indexOf(d.weekday) + 1) : [weekdayOf(s)]
+      return days.includes(wd)
     }
     case "MONTHLY": {
-      if (((x.y - s.y) * 12 + x.m - s.m) % I !== 0) return false
+      if (((x.year - s.year) * 12 + x.month - s.month) % I !== 0) return false
       if (rule.byDay.length === 1) {
         const { weekday, nth } = rule.byDay[0]!
-        if (weekdayRef(x) !== codes.indexOf(weekday) + 1) return false
-        return nth! > 0 ? Math.ceil(x.d / 7) === nth : lastOfMonth(x) - x.d < 7
+        if (wd !== codes.indexOf(weekday) + 1) return false
+        return nth! > 0 ? Math.ceil(x.day / 7) === nth : monthLength(x.year, x.month) - x.day < 7
       }
-      if (rule.byMonthDay.length > 0) return rule.byMonthDay.some((v) => (v === -1 ? x.d === lastOfMonth(x) : x.d === v))
-      return x.d === s.d
+      if (rule.byMonthDay.length > 0) return rule.byMonthDay.some((v) => (v === -1 ? x.day === monthLength(x.year, x.month) : x.day === v))
+      return x.day === s.day
     }
     case "YEARLY":
-      return (x.y - s.y) % I === 0 && x.m === (rule.byMonth[0] ?? s.m) && x.d === (rule.byMonthDay[0] ?? s.d)
+      return (x.year - s.year) % I === 0 && x.month === (rule.byMonth[0] ?? s.month) && x.day === (rule.byMonthDay[0] ?? s.day)
   }
 }
+const member = (c: Case, x: Day): boolean => memberAt(c, x, utcOfDay(x), weekdayOf(x))
 
 const untilMs = (u: string): number => Date.UTC(Number(u.slice(0, 4)), Number(u.slice(4, 6)) - 1, Number(u.slice(6, 8)), Number(u.slice(9, 11)), Number(u.slice(11, 13)), Number(u.slice(13, 15)))
 
-/**
- * Up to `n` instances strictly after `after`, by walking every day: from DTSTART when there is a COUNT (it counts from there), else
- * from two days before `after`'s day (membership itself is measured from DTSTART). Stops at `horizon` (a day): `complete` says the
- * series ended before it, so a shorter answer is the whole answer.
- */
-const reference = (c: Case, after: number, n: number, horizon: Day): { instants: Array<number>; complete: boolean } => {
-  const startDay = utcOf(c.start)
-  const afterDay = after === -Infinity ? startDay : utcOf(dayAt(after + refOffset(after, c.zone))) - 2 * DAY
-  const from = c.rule.count !== undefined ? startDay : Math.max(startDay, afterDay)
+/** Up to `n` instances strictly after `after`, walking every day from DTSTART (or two days before `after`) to 31 December 2199, and why it stopped. */
+const reference = (c: Case, after: number, n: number): { instants: Array<number>; stop: "limit" | "series" | "range" } => {
   const until = c.rule.until === undefined ? Infinity : untilMs(c.rule.until)
+  const startT = utcOfDay(c.start)
+  // Without COUNT, days long before `after` cannot matter: start two days before its local day (membership is still from DTSTART).
+  const afterT = after === -Infinity || after < startT ? startT : utcOfDay(wallOf(after, c.zone)) - 2 * DAY
+  let t = c.rule.count !== undefined ? startT : Math.max(startT, afterT)
+  const first = new Date(t)
+  const x = { year: first.getUTCFullYear(), month: first.getUTCMonth() + 1, day: first.getUTCDate() }
+  let wd = weekdayOf(x)
   const out: Array<number> = []
+  const seen = new Set<number>()
   let counted = 0
-  let last = -Infinity
-  for (let t = from; t <= utcOf(horizon); t += DAY) {
-    const x = dayAt(t)
-    if (!member(c, x)) continue
-    counted++
-    if (c.rule.count !== undefined && counted > c.rule.count) return { instants: out, complete: true }
-    if (t < afterDay) continue
-    const instant = refInstant(x, c.start.hour, c.start.minute, c.zone)
-    if (instant > until) return { instants: out, complete: true }
-    if (instant <= last) continue
-    last = instant
-    if (instant > after) out.push(instant)
-    if (out.length >= n) return { instants: out, complete: true }
+  const end = utcOfDay(lastDay)
+  for (; t <= end; t += DAY) {
+    if (memberAt(c, x, t, wd)) {
+      const instant = instantsOf({ ...x, hour: c.start.hour, minute: c.start.minute, second: c.start.second }, c.zone)[0]!
+      if (instant > until) return { instants: out, stop: "series" }
+      if (!seen.has(instant)) {
+        seen.add(instant)
+        counted++
+        if (c.rule.count !== undefined && counted > c.rule.count) return { instants: out, stop: "series" }
+        if (instant > after) out.push(instant)
+        if (out.length >= n) return { instants: out, stop: "limit" }
+      }
+    }
+    // The next day, by hand.
+    wd = wd === 7 ? 1 : wd + 1
+    if (x.day < monthLength(x.year, x.month)) x.day++
+    else if (x.month < 12) { x.day = 1; x.month++ } else { x.day = 1; x.month = 1; x.year++ }
   }
-  return { instants: out, complete: false }
+  return { instants: out, stop: "range" }
 }
 
 // ---- the matrix -----------------------------------------------------------------------------------------------------------------
@@ -108,101 +95,145 @@ const reference = (c: Case, after: number, n: number, horizon: Day): { instants:
 const pad = (v: number, w = 2) => String(v).padStart(w, "0")
 const specOf = (c: Case): RecurrenceSpec => ({
   rrule: formatRRule(c.rule)!,
-  dtstart: `DTSTART;TZID=${c.zone}:${pad(c.start.y, 4)}${pad(c.start.m)}${pad(c.start.d)}T${pad(c.start.hour)}${pad(c.start.minute)}00`,
+  dtstart: `DTSTART;TZID=${c.zone}:${pad(c.start.year, 4)}${pad(c.start.month)}${pad(c.start.day)}T${pad(c.start.hour)}${pad(c.start.minute)}${pad(c.start.second)}`,
   timeZone: c.zone
 })
 
-const zones = ["Europe/Amsterdam", "Australia/Sydney"]
-/** Month ends, 29 February, and the daylight-saving days of both zones (2026: Amsterdam 29 March and 25 October; Sydney 5 April and 4 October). */
-const startDays: ReadonlyArray<Day> = [
-  { y: 2024, m: 1, d: 31 }, { y: 2024, m: 2, d: 29 }, { y: 2025, m: 4, d: 30 }, { y: 2026, m: 12, d: 31 }, { y: 2026, m: 3, d: 29 }, { y: 2026, m: 10, d: 25 },
-  { y: 2026, m: 4, d: 5 }, { y: 2026, m: 10, d: 4 }, { y: 2026, m: 11, d: 18 }
-]
-const times: ReadonlyArray<readonly [number, number]> = [[2, 30], [0, 0], [9, 0]]
+/** Per zone: month ends, 29 February, its daylight-saving days, a skipped day (Apia, 30 December 2011), and both ends of the range. */
+const zoneDays: Record<string, ReadonlyArray<Day>> = {
+  "Europe/Amsterdam": [{ year: 2024, month: 1, day: 31 }, { year: 2028, month: 2, day: 29 }, { year: 2026, month: 3, day: 29 }, { year: 2026, month: 10, day: 25 }, { year: 2026, month: 11, day: 18 }, { year: 2000, month: 1, day: 1 }],
+  "Australia/Sydney": [{ year: 2026, month: 4, day: 5 }, { year: 2026, month: 10, day: 4 }, { year: 2025, month: 4, day: 30 }, { year: 2026, month: 12, day: 31 }],
+  "Pacific/Apia": [{ year: 2011, month: 12, day: 28 }, { year: 2011, month: 12, day: 29 }, { year: 2011, month: 12, day: 31 }],
+  "America/New_York": [{ year: 2026, month: 3, day: 8 }, { year: 2026, month: 11, day: 1 }],
+  "Australia/Lord_Howe": [{ year: 2026, month: 4, day: 5 }, { year: 2026, month: 10, day: 4 }],
+  UTC: [{ year: 2199, month: 12, day: 27 }, { year: 2199, month: 11, day: 30 }, { year: 2000, month: 2, day: 29 }]
+}
+const times: ReadonlyArray<readonly [number, number, number]> = [[2, 30, 0], [0, 0, 0], [9, 0, 30], [1, 45, 0]]
 
 const rulesFor = (s: Day, interval: number): Array<RecurrenceRule> => {
-  const wd = weekdayRef(s)
-  const code = (n: number) => codes[(n - 1 + 70) % 7]! as RecurrenceRule["byDay"][number]["weekday"]
+  const wd = weekdayOf(s)
+  const code = (n: number) => codes[(n - 1 + 70) % 7]!
   const base = { interval, byDay: [], byMonthDay: [], byMonth: [] }
+  const sortDays = (ds: Array<{ weekday: (typeof codes)[number] }>) => ds.sort((a, b) => codes.indexOf(a.weekday) - codes.indexOf(b.weekday))
   const out: Array<RecurrenceRule> = [
     { ...base, freq: "DAILY" },
     { ...base, freq: "WEEKLY" },
     { ...base, freq: "WEEKLY", byDay: [{ weekday: code(wd) }] },
-    { ...base, freq: "WEEKLY", byDay: [wd, wd + 2, wd + 4].map((d) => ({ weekday: code(d) })).sort((a, b) => codes.indexOf(a.weekday) - codes.indexOf(b.weekday)) },
+    { ...base, freq: "WEEKLY", byDay: sortDays([wd, wd + 2, wd + 4].map((d) => ({ weekday: code(d) }))) },
     { ...base, freq: "WEEKLY", byDay: (wd <= 5 ? [1, 2, 3, 4, 5] : [6, 7]).map((d) => ({ weekday: code(d) })) },
     { ...base, freq: "MONTHLY" },
-    { ...base, freq: "MONTHLY", byMonthDay: [s.d] },
-    { ...base, freq: "MONTHLY", byMonthDay: [...new Set([s.d, s.d === 15 ? 1 : 15])].sort((a, b) => a - b) },
-    { ...base, freq: "MONTHLY", byDay: [{ weekday: code(wd), nth: Math.ceil(s.d / 7) }] },
+    { ...base, freq: "MONTHLY", byMonthDay: [s.day] },
+    { ...base, freq: "MONTHLY", byMonthDay: [...new Set([s.day === 1 ? 2 : 1, s.day, s.day === 30 ? 29 : 30])].sort((a, b) => a - b) },
+    { ...base, freq: "MONTHLY", byDay: [{ weekday: code(wd), nth: Math.ceil(s.day / 7) }] },
     { ...base, freq: "YEARLY" },
-    { ...base, freq: "YEARLY", byMonth: [s.m] },
-    { ...base, freq: "YEARLY", byMonth: [s.m], byMonthDay: [s.d] }
+    { ...base, freq: "YEARLY", byMonth: [s.month] },
+    { ...base, freq: "YEARLY", byMonth: [s.month], byMonthDay: [s.day] }
   ]
-  if (s.d === lastOfMonth(s)) {
-    out.push({ ...base, freq: "MONTHLY", byMonthDay: [-1] })
-    out.push({ ...base, freq: "MONTHLY", byMonthDay: [1, -1] })
-  }
-  if (lastOfMonth(s) - s.d < 7) out.push({ ...base, freq: "MONTHLY", byDay: [{ weekday: code(wd), nth: -1 }] })
+  if (s.day === daysIn(s.year, s.month)) out.push({ ...base, freq: "MONTHLY", byMonthDay: [-1] }, { ...base, freq: "MONTHLY", byMonthDay: [1, -1] })
+  if (daysIn(s.year, s.month) - s.day < 7) out.push({ ...base, freq: "MONTHLY", byDay: [{ weekday: code(wd), nth: -1 }] })
   return out
 }
 
 const cases: Array<Case> = []
-for (const zone of zones) for (const s of startDays) for (const [hour, minute] of times) for (let interval = 1; interval <= 4; interval++) {
-  rulesFor(s, interval).forEach((r, k) => {
-    // Every third rule is unbounded, the others end by COUNT or by UNTIL (about three years on).
-    const end = (k + interval + hour) % 3
-    const rule: RecurrenceRule = end === 0 ? r : end === 1 ? { ...r, count: 5 + interval * 3 } : { ...r, until: `${s.y + 3}${pad(s.m)}${pad(Math.min(s.d, 28))}T${pad(hour)}0000Z` }
-    cases.push({ rule, start: { ...s, hour, minute }, zone })
-  })
+{
+  const r = rng(201)
+  for (const [zone, days] of Object.entries(zoneDays)) for (const s of days) for (const [hour, minute, second] of times) for (const interval of [1, 2, 3, 4, 7, 12, 13, 99, 100, 400, 999]) {
+    // The large intervals on a fifth of the rules (they walk far), every rule with the small ones.
+    rulesFor(s, interval).forEach((rule0, k) => {
+      if (interval > 4 && !r.chance(interval > 100 ? 0.03 : 0.1)) return
+      if (interval <= 4 && hour === 1 && !r.chance(0.5)) return
+      const end = (k + interval + hour) % 3
+      // A third unbounded; the others end by COUNT, or by UNTIL — at DTSTART, on a later daylight-saving day, or about three years on.
+      const until = (() => {
+        const choice = r.int(0, 2)
+        if (choice === 0 && untilAt(s, hour, minute, second, zone) >= "2000") return untilAt(s, hour, minute, second, zone)
+        const later = choice === 1 ? { year: s.year + 1, month: s.month, day: Math.min(s.day, 28) } : { year: s.year + 3, month: s.month, day: Math.min(s.day, 28) }
+        const text = `${pad(Math.min(later.year, 2199), 4)}${pad(later.month)}${pad(later.day)}T${pad(hour)}${pad(minute)}${pad(second)}Z`
+        // Near the end of the range "a year on" can fall before DTSTART: then UNTIL is DTSTART itself.
+        return text < untilAt(s, hour, minute, second, zone) ? untilAt(s, hour, minute, second, zone) : text
+      })()
+      const rule: RecurrenceRule = end === 0 ? rule0 : end === 1 ? { ...rule0, count: r.pick([1, 3, 5 + interval % 7, 13]) } : { ...rule0, until }
+      cases.push({ rule, start: { ...s, hour, minute, second }, zone })
+    })
+  }
+}
+/** UNTIL exactly at DTSTART's instant. */
+function untilAt(s: Day, hour: number, minute: number, second: number, zone: string): string {
+  const i = instantsOf({ ...s, hour, minute, second }, zone)[0]!
+  const d = new Date(i)
+  return `${pad(d.getUTCFullYear(), 4)}${pad(d.getUTCMonth() + 1)}${pad(d.getUTCDate())}T${pad(d.getUTCHours())}${pad(d.getUTCMinutes())}${pad(d.getUTCSeconds())}Z`
 }
 
-/** A small fixed generator, so the matrix is the same on every run. */
-let seed = 42
-const rand = () => { seed = (seed * 1_103_515_245 + 12_345) % 2_147_483_648; return seed / 2_147_483_648 }
-
-const horizonFor = (c: Case, after: number): Day => {
-  const years = c.rule.freq === "YEARLY" ? 13 * c.rule.interval : c.rule.freq === "MONTHLY" ? 3 * c.rule.interval : 1
-  const a = dayAt(Math.max(after, utcOf(c.start)))
-  return { y: a.y + years, m: a.m, d: Math.min(a.d, 28) }
-}
+const iso = (t: number) => new Date(t).toISOString()
 
 describe("the recurrence engine against a brute-force reference", () => {
-  it(`agrees on ${cases.length} rules over many instants`, () => {
+  it(`agrees on ${cases.length} rules over many instants, with the same reason for stopping`, () => {
     const mismatches: Array<string> = []
     let compared = 0
+    const r = rng(202)
     for (const c of cases) {
       const spec = specOf(c)
       const read = readSeries(spec)
       if (read.kind !== "ok") { mismatches.push(`${spec.rrule} ${spec.dtstart}: ${read.reason}`); continue }
-      // parse → format → parse is the identity
-      const again = parseRRule(spec.rrule)
-      if (again.kind !== "ok" || JSON.stringify(again.rule) !== JSON.stringify(read.series.rule)) mismatches.push(`${spec.rrule}: parse/format`)
-      const first = reference(c, -Infinity, 6, horizonFor(c, utcOf(c.start)))
-      const afters = [utcOf(c.start) - 30 * DAY, first.instants[0]! - 1, first.instants[0]!, first.instants[0]! + 1, ...first.instants.slice(1, 4).flatMap((t) => [t - 1, t])]
-      for (let k = 0; k < 5; k++) afters.push(utcOf(c.start) + Math.floor(rand() * 4 * 365) * DAY + Math.floor(rand() * DAY))
-      if (c.rule.count === undefined && c.rule.until === undefined && c.start.hour === 9 && c.rule.interval === 3) afters.push(Date.UTC(2071, 5, 1), Date.UTC(2300, 0, 1, 12))
+      // parse → format → parse gives the generated rule back (finding 25: compared with the original, not with another parse).
+      if (stable(parseRRule(formatRRule(c.rule)!)) !== stable({ kind: "ok", rule: c.rule })) mismatches.push(`${spec.rrule}: parse ∘ format is not the identity`)
+      const first = reference(c, -Infinity, 4)
+      const afters = [utcOfDay(c.start) - 30 * DAY, ...first.instants.slice(0, 3).flatMap((t) => [t - 1, t])]
+      for (let k = 0; k < 2; k++) afters.push(utcOfDay(c.start) + r.int(0, 4 * 365) * DAY + r.int(0, DAY))
+      if (c.rule.count === undefined && c.rule.until === undefined && r.chance(0.1)) afters.push(Date.UTC(2150, 5, 1), Date.UTC(2199, 11, 31, 12), Date.UTC(2300, 0, 1))
       for (const after of afters) {
-        const want = reference(c, after, 3, horizonFor(c, after))
-        const got = occurrencesAfter(spec, after, 3)
+        const want = reference(c, after, 3)
+        const got = occurrencesAfter(spec, after, 3)!
         compared++
-        const horizonEnd = utcOf(horizonFor(c, after))
-        const shown = got.filter((t) => want.complete || t < horizonEnd)
-        if (JSON.stringify(shown.slice(0, want.instants.length)) !== JSON.stringify(want.instants) || (want.complete && got.length !== want.instants.length)) {
-          mismatches.push(`${spec.rrule} ${spec.dtstart} after ${new Date(after).toISOString()}: got ${got.map((t) => new Date(t).toISOString())} want ${want.instants.map((t) => new Date(t).toISOString())}`)
+        const ordered = got.instants.every((t, k) => k === 0 || t > got.instants[k - 1]!)
+        if (!ordered || JSON.stringify(got.instants) !== JSON.stringify(want.instants) || got.stop !== want.stop) {
+          mismatches.push(`${spec.rrule} ${spec.dtstart} after ${iso(after)}: got ${got.instants.map(iso)} (${got.stop}) want ${want.instants.map(iso)} (${want.stop})`)
         }
       }
     }
     expect(mismatches.slice(0, 10)).toEqual([])
-    expect(compared).toBeGreaterThan(30_000)
+    expect(compared).toBeGreaterThan(20_000)
   }, 120_000)
+
+  it("fixed instants computed by hand: the spring gap, the autumn fold, Apia's skipped day, the end of the range", () => {
+    const at = (rrule: string, dtstart: string, timeZone: string, after: number, n: number) => occurrencesAfter({ rrule, dtstart, timeZone }, after, n)!
+    // Amsterdam, 29 March 2026: 02:30 does not exist; the offset before the gap (+01:00) makes it 01:30 UTC.
+    expect(at("FREQ=DAILY", "DTSTART;TZID=Europe/Amsterdam:20260328T023000", "Europe/Amsterdam", 0, 3).instants.map(iso)).toEqual(["2026-03-28T01:30:00.000Z", "2026-03-29T01:30:00.000Z", "2026-03-30T00:30:00.000Z"])
+    // Amsterdam, 25 October 2026: 02:30 happens twice; the first (+02:00) is 00:30 UTC.
+    expect(at("FREQ=DAILY", "DTSTART;TZID=Europe/Amsterdam:20261024T023000", "Europe/Amsterdam", 0, 3).instants.map(iso)).toEqual(["2026-10-24T00:30:00.000Z", "2026-10-25T00:30:00.000Z", "2026-10-26T01:30:00.000Z"])
+    // Apia skipped 30 December 2011: COUNT=4 is four distinct instants (finding 6).
+    expect(at("FREQ=DAILY;COUNT=4", "DTSTART;TZID=Pacific/Apia:20111228T090000", "Pacific/Apia", Date.UTC(2011, 11, 27), 10)).toEqual({
+      instants: ["2011-12-28T19:00:00.000Z", "2011-12-29T19:00:00.000Z", "2011-12-30T19:00:00.000Z", "2011-12-31T19:00:00.000Z"].map(Date.parse), stop: "series"
+    })
+    // The last week of 2199 (finding 15): nothing in 2200, and the stop says the range ended.
+    expect(at("FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR,SA,SU", "DTSTART;TZID=UTC:21991227T090000", "UTC", Date.UTC(2199, 11, 27, 10), 10)).toEqual({
+      instants: [28, 29, 30, 31].map((d) => Date.UTC(2199, 11, d, 9)), stop: "range"
+    })
+  })
+
+  it("UNTIL before DTSTART is invalid; UNTIL at DTSTART leaves exactly DTSTART (finding 16)", () => {
+    expect(readSeries({ rrule: "FREQ=DAILY;UNTIL=20261117T090000Z", dtstart: "DTSTART;TZID=UTC:20261118T090000", timeZone: "UTC" }).kind).toBe("invalid")
+    expect(readSeries({ rrule: "FREQ=DAILY;UNTIL=20261118T085959Z", dtstart: "DTSTART;TZID=UTC:20261118T090000", timeZone: "UTC" }).kind).toBe("invalid")
+    expect(occurrencesAfter({ rrule: "FREQ=DAILY;UNTIL=20261118T090000Z", dtstart: "DTSTART;TZID=UTC:20261118T090000", timeZone: "UTC" }, 0, 5)).toEqual({ instants: [Date.UTC(2026, 10, 18, 9)], stop: "series" })
+    let checked = 0
+    for (const c of cases.filter((x) => x.rule.until !== undefined)) {
+      const startInstant = instantsOf(c.start, c.zone)[0]!
+      const early = new Date(startInstant - 1000)
+      const until = `${pad(early.getUTCFullYear(), 4)}${pad(early.getUTCMonth() + 1)}${pad(early.getUTCDate())}T${pad(early.getUTCHours())}${pad(early.getUTCMinutes())}${pad(early.getUTCSeconds())}Z`
+      if (Number(until.slice(0, 4)) < 2000) continue
+      expect(readSeries(specOf({ ...c, rule: { ...c.rule, until } })).kind).toBe("invalid")
+      checked++
+    }
+    expect(checked).toBeGreaterThan(100)
+  })
 
   it("a DTSTART that is not an instance of its rule is invalid, as the reference says", () => {
     let checked = 0
     for (const c of cases.filter((_, k) => k % 7 === 0)) {
-      const wd = weekdayRef(c.start)
-      const wrong: RecurrenceRule = c.rule.freq === "WEEKLY" ? { ...c.rule, byDay: [{ weekday: codes[wd % 7] as "MO" }] }
-        : c.rule.freq === "MONTHLY" ? { ...c.rule, byDay: [], byMonthDay: [c.start.d === 14 ? 13 : 14] }
-        : c.rule.freq === "YEARLY" ? { ...c.rule, byMonth: [c.start.m === 6 ? 7 : 6], byMonthDay: [10] } : c.rule
+      const wd = weekdayOf(c.start)
+      const wrong: RecurrenceRule = c.rule.freq === "WEEKLY" ? { ...c.rule, byDay: [{ weekday: codes[wd % 7]! }] }
+        : c.rule.freq === "MONTHLY" ? { ...c.rule, byDay: [], byMonthDay: [c.start.day === 14 ? 13 : 14] }
+        : c.rule.freq === "YEARLY" ? { ...c.rule, byMonth: [c.start.month === 6 ? 7 : 6], byMonthDay: [10] } : c.rule
       if (wrong === c.rule) continue
       expect(member({ ...c, rule: wrong }, c.start)).toBe(false)
       expect(readSeries(specOf({ ...c, rule: wrong })).kind).toBe("invalid")
@@ -211,40 +242,58 @@ describe("the recurrence engine against a brute-force reference", () => {
     expect(checked).toBeGreaterThan(100)
   })
 
-  it("describeRRule never drops a constraint: its words, read back, give the same occurrences", () => {
+  it("describeRRule: without COUNT and UNTIL the words read back to the same occurrences; with them, the suffix is the independent rendering", () => {
     const problems: Array<string> = []
-    let checked = 0
+    let readBack = 0
+    let suffixed = 0
+    const r = rng(203)
     for (const [k, c] of cases.entries()) {
-      if (c.rule.count !== undefined || c.rule.until !== undefined) continue
-      // A plain rule takes its day from today's; at 00:00 "just before the start" is the day before.
-      if (c.start.hour === 0 && c.rule.byDay.length + c.rule.byMonthDay.length + c.rule.byMonth.length === 0 && c.rule.freq !== "DAILY") continue
       const language = k % 2 === 0 ? "en" : "nl"
       const spec = specOf(c)
+      const start = { year: c.start.year, month: c.start.month, day: c.start.day }
       const time = { hour: c.start.hour, minute: c.start.minute }
-      const text = describeRRule(spec.rrule, language, { time, start: { year: c.start.y, month: c.start.m, day: c.start.d } })
-      if (text === undefined) { problems.push(`${spec.rrule}: no description`); continue }
-      const startInstant = occurrencesAfter(spec, Date.UTC(1900, 0, 1), 1)[0]!
-      const back = parseRecurrence(text, language, { now: startInstant - 60_000, timeZone: c.zone })
-      if (back.kind !== "ok") { problems.push(`${language} "${text}" (${spec.rrule} ${spec.dtstart}): ${back.kind}`); continue }
-      const theirs = occurrencesAfter({ rrule: back.value.rrule, dtstart: back.value.dtstart, timeZone: c.zone }, startInstant - 60_000, 8)
-      const ours = occurrencesAfter(spec, startInstant - 60_000, 8)
-      if (JSON.stringify(theirs) !== JSON.stringify(ours)) problems.push(`${language} "${text}" (${spec.rrule} ${spec.dtstart}) → ${back.value.rrule} ${back.value.dtstart}`)
-      checked++
+      const plain: RecurrenceRule = { freq: c.rule.freq, interval: c.rule.interval, byDay: c.rule.byDay, byMonthDay: c.rule.byMonthDay, byMonth: c.rule.byMonth }
+      const body = describeRRule(plain, language, { time, start })
+      if (body === undefined) { problems.push(`${spec.rrule}: no description`); continue }
+      if (c.rule.count !== undefined || c.rule.until !== undefined) {
+        const said = describeRRule(c.rule, language, { time, start, timeZone: c.zone })
+        let suffix: string
+        if (c.rule.count !== undefined) suffix = language === "en" ? `, ${c.rule.count} ${c.rule.count === 1 ? "time" : "times"}` : `, ${c.rule.count} keer`
+        else {
+          const w = wallOf(untilMs(c.rule.until!), c.zone)
+          const months = language === "en" ? ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"]
+            : ["januari", "februari", "maart", "april", "mei", "juni", "juli", "augustus", "september", "oktober", "november", "december"]
+          const clock = `${pad(w.hour)}:${pad(w.minute)}${w.second === 0 ? "" : `:${pad(w.second)}`}`
+          suffix = language === "en" ? `, until ${w.day} ${months[w.month - 1]} ${w.year} at ${clock}` : `, tot ${w.day} ${months[w.month - 1]} ${w.year} om ${clock}`
+          if (describeRRule(c.rule, language, { time, start }) !== undefined) problems.push(`${spec.rrule}: an UNTIL without a zone was described`)
+        }
+        if (said !== body + suffix) problems.push(`${spec.rrule}: "${said}" is not "${body}${suffix}"`)
+        suffixed++
+        continue
+      }
+      // Seconds are not said: compare at the minute. Interval 1: read at any moment within 60 days before DTSTART (the words must carry
+      // the weekday, day or date a plain rule takes from DTSTART; finding 7, 8); a longer interval: just before DTSTART (its phase).
+      const startInstant = instantsOf(c.start, c.zone)[0]!
+      const minute = startInstant - c.start.second * 1000
+      const now = c.rule.interval === 1 ? minute - r.int(1, 60 * 1440) * 60_000 : minute - 1000
+      if (wallOf(now, c.zone).year < 2000) continue
+      const back = parseRecurrence(body, language, { now, timeZone: c.zone })
+      if (back.kind !== "ok") { problems.push(`${language} "${body}" (${spec.rrule} ${spec.dtstart}): ${back.kind}`); continue }
+      const theirs = occurrencesAfter({ rrule: back.value.rrule, dtstart: back.value.dtstart, timeZone: c.zone }, minute - 1000, 8)!.instants
+      const ours = occurrencesAfter(spec, minute - 1000, 8)!.instants.map((t) => t - c.start.second * 1000)
+      if (JSON.stringify(theirs) !== JSON.stringify(ours)) problems.push(`${language} "${body}" (${spec.rrule} ${spec.dtstart}) → ${back.value.rrule} ${back.value.dtstart}`)
+      readBack++
     }
     expect(problems.slice(0, 10)).toEqual([])
-    expect(checked).toBeGreaterThan(500)
+    expect(readBack).toBeGreaterThan(1000)
+    expect(suffixed).toBeGreaterThan(1000)
   }, 60_000)
 
-  it("COUNT and UNTIL are said", () => {
-    const start = (c: Case) => ({ year: c.start.y, month: c.start.m, day: c.start.d })
-    for (const c of cases.filter((x) => x.rule.count !== undefined)) {
-      expect(describeRRule(c.rule, "en", { timeZone: c.zone, start: start(c) })).toContain(`, ${c.rule.count} times`)
-      expect(describeRRule(c.rule, "nl", { timeZone: c.zone, start: start(c) })).toContain(`, ${c.rule.count} keer`)
-    }
-    for (const c of cases.filter((x) => x.rule.until !== undefined)) {
-      expect(describeRRule(c.rule, "en", { timeZone: c.zone, start: start(c) })).toMatch(/, until \d+ \w+ \d{4} at \d\d:\d\d/)
-      expect(describeRRule(c.rule, "nl", { timeZone: c.zone, start: start(c) })).toMatch(/, tot \d+ \w+ \d{4} om \d\d:\d\d/)
-      expect(describeRRule(c.rule, "en", { start: start(c) })).toBeUndefined()
-    }
+  it("a plain weekly, monthly or yearly rule is not described without the start it takes its day from (findings 7, 8)", () => {
+    for (const rule of ["FREQ=WEEKLY", "FREQ=MONTHLY", "FREQ=YEARLY", "FREQ=WEEKLY;INTERVAL=3"]) for (const language of ["en", "nl"] as const) expect(describeRRule(rule, language)).toBeUndefined()
+    expect(describeRRule("FREQ=MONTHLY", "en", { start: { year: 2026, month: 10, day: 30 }, time: { hour: 9, minute: 0 } })).toBe("on the thirtieth of every month at nine o'clock in the morning")
+    expect(describeRRule("FREQ=WEEKLY", "nl", { start: { year: 2026, month: 11, day: 16 }, time: { hour: 9, minute: 0 } })).toBe("elke maandag om negen uur 's ochtends")
+    // A start the rule does not select is not described.
+    expect(describeRRule("FREQ=WEEKLY;BYDAY=TU", "en", { start: { year: 2026, month: 11, day: 16 } })).toBeUndefined()
   })
 })

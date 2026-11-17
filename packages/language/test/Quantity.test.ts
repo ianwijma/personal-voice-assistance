@@ -1,3 +1,4 @@
+// Round 3: "3x milk" and "a quarter litre" (no article) were removed (decision 5); "the rest of the rice" has the item "rice".
 import { describe, expect, it } from "@effect/vitest"
 import { convertAmount, parseQuantity, usCupMl } from "../src/Quantity.ts"
 
@@ -20,7 +21,7 @@ describe("parseQuantity: English", () => {
     ["8 ounces of cheese", { amount: 8, unit: "oz", dim: "mass", approx: false, rest: false, base: "226.796185 g", item: "cheese", said: "8 ounces" }],
     ["two litres of milk", { amount: 2, unit: "l", dim: "volume", approx: false, rest: false, base: "2000 ml", item: "milk", said: "two litres" }],
     ["1.5 liters of water", { amount: 1.5, unit: "l", dim: "volume", approx: false, rest: false, base: "1500 ml", item: "water", said: "1.5 liters" }],
-    ["a quarter litre of cream", { amount: 0.25, unit: "l", dim: "volume", approx: false, rest: false, base: "250 ml", item: "cream", said: "a quarter litre" }],
+    ["a quarter of a litre of cream", { amount: 0.25, unit: "l", dim: "volume", approx: false, rest: false, base: "250 ml", item: "cream", said: "a quarter of a litre" }],
     ["300 ml of stock", { amount: 300, unit: "ml", dim: "volume", approx: false, rest: false, base: "300 ml", item: "stock", said: "300 ml" }],
     ["2 cups of flour", { amount: 2, unit: "cup", dim: "volume", approx: false, rest: false, base: "500 ml", item: "flour", said: "2 cups" }],
     ["a cup of sugar", { amount: 1, unit: "cup", dim: "volume", approx: false, rest: false, base: "250 ml", item: "sugar", said: "a cup" }],
@@ -35,10 +36,9 @@ describe("parseQuantity: English", () => {
     ["12 eggs", { amount: 12, unit: "piece", dim: "count", approx: false, rest: false, base: "12 piece", item: "eggs", said: "12" }],
     ["a dozen eggs", { amount: 12, unit: "piece", dim: "count", approx: false, rest: false, base: "12 piece", item: "eggs", said: "a dozen" }],
     ["two apples", { amount: 2, unit: "piece", dim: "count", approx: false, rest: false, base: "2 piece", item: "apples", said: "two" }],
-    ["3x milk", { amount: 3, unit: "piece", dim: "count", approx: false, rest: false, base: "3 piece", item: "milk", said: "3x" }],
     ["some milk", { amount: undefined, unit: undefined, dim: "none", approx: true, rest: false, base: undefined, item: "milk", said: "some" }],
-    ["a bit of cheese", { amount: undefined, unit: undefined, dim: "none", approx: true, rest: false, base: undefined, item: "cheese", said: "a bit" }],
-    ["the rest of the rice", { amount: undefined, unit: undefined, dim: "none", approx: false, rest: true, base: undefined, item: "the rice", said: "the rest" }],
+    ["a bit of cheese", { amount: undefined, unit: undefined, dim: "none", approx: true, rest: false, base: undefined, item: "cheese", said: "a bit of" }],
+    ["the rest of the rice", { amount: undefined, unit: undefined, dim: "none", approx: false, rest: true, base: undefined, item: "rice", said: "the rest" }],
     ["add a kilo of rice to the list", "not-understood"]
   ]
   for (const [text, expected] of rows) it(`"${text}"`, () => expect(read(text, "en")).toEqual(expected))
@@ -77,7 +77,7 @@ describe("parseQuantity: Dutch", () => {
     ["6 stuks", { amount: 6, unit: "piece", dim: "count", approx: false, rest: false, base: "6 piece", item: "", said: "6 stuks" }],
     ["wat melk", { amount: undefined, unit: undefined, dim: "none", approx: true, rest: false, base: undefined, item: "melk", said: "wat" }],
     ["een beetje zout", { amount: undefined, unit: undefined, dim: "none", approx: true, rest: false, base: undefined, item: "zout", said: "een beetje" }],
-    ["de rest van de rijst", { amount: undefined, unit: undefined, dim: "none", approx: false, rest: true, base: undefined, item: "de rijst", said: "de rest" }],
+    ["de rest van de rijst", { amount: undefined, unit: undefined, dim: "none", approx: false, rest: true, base: undefined, item: "rijst", said: "de rest" }],
     ["de rest", { amount: undefined, unit: undefined, dim: "none", approx: false, rest: true, base: undefined, item: "", said: "de rest" }]
   ]
   for (const [text, expected] of rows) it(`"${text}"`, () => expect(read(text, "nl")).toEqual(expected))

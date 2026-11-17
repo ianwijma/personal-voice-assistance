@@ -1,8 +1,7 @@
+import { maxYear, minYear } from "./Domain.ts"
 import type { ClockTime, LocalDate, LocalDateTime } from "./Result.ts"
 
-/** The years this package computes with: four digits. A date outside them is not valid (`isValidLocal`), never moved into them. */
-export const minYear = 1000
-export const maxYear = 9999
+export { maxYear, minYear }
 
 const formatters = new Map<string, Intl.DateTimeFormat>()
 const canonical = new Map<string, string | undefined>()
@@ -17,7 +16,7 @@ const ianaName = /^[A-Za-z][A-Za-z0-9_+\-]*(?:\/[A-Za-z0-9_+\-]+)*$/
  * Never substitutes another zone: a parser given an unknown zone answers `not-understood`, and `nextOccurrence` answers `undefined`.
  */
 export const normalizeTimeZone = (timeZone: string): string | undefined => {
-  if (typeof timeZone !== "string") return undefined
+  if (typeof timeZone !== "string" || timeZone.length > 64) return undefined
   if (canonical.has(timeZone)) return canonical.get(timeZone)
   const trimmed = timeZone.trim()
   let found: string | undefined
@@ -157,16 +156,27 @@ export const isValidLocal = (t: LocalDate & Partial<ClockTime> & { readonly seco
   (t.minute === undefined || (Number.isInteger(t.minute) && t.minute >= 0 && t.minute <= 59)) &&
   (t.second === undefined || (Number.isInteger(t.second) && t.second >= 0 && t.second <= 59))
 
-/**
- * "2026-11-18T09:00", "2026-11-18T09:00:30", "20261118T090030" or "20261118" → parts, seconds kept. One spelling per value
- * (both separators or neither); a date or time that does not exist ("2026-02-30", "25:00") is `undefined`, never normalised into
- * another one.
- */
-export const parseLocalIso = (s: string): LocalDateTime | undefined => {
-  const text = s.trim()
-  const m = /^(\d{4})-(\d{2})-(\d{2})(?:T(\d{2}):(\d{2})(?::(\d{2}))?)?$/.exec(text) ?? /^(\d{4})(\d{2})(\d{2})(?:T(\d{2})(\d{2})(\d{2}))?$/.exec(text)
-  if (m === null) return undefined
-  const t = { year: Number(m[1]), month: Number(m[2]), day: Number(m[3]), hour: Number(m[4] ?? 0), minute: Number(m[5] ?? 0), second: Number(m[6] ?? 0) }
-  return isValidLocal(t) ? t : undefined
-}
 export const pad = (n: number, w = 2): string => String(n).padStart(w, "0")
+
+/** The first and the last day of the supported years, as day numbers. */
+export const firstDay = dayNumber(minYear, 1, 1)
+export const lastDay = dayNumber(maxYear, 12, 31)
+
+/** A calendar date in the supported years (the day exists). */
+export const inRange = (d: LocalDate): boolean => isValidLocal(d)
+
+/** The largest instant a JavaScript Date holds. */
+const maxInstant = 8.64e15
+
+/**
+ * `now` as an instant whose local date in `zone` is in the supported years, or `undefined`: a number that is not finite or not a
+ * Date's instant, an invalid Date, anything else (review round 3, findings 3 and 14).
+ */
+export const instantIn = (now: unknown, zone: string): { readonly instant: number; readonly parts: ZonedParts } | undefined => {
+  const instant = typeof now === "number" ? now : now instanceof Date ? now.getTime() : Number.NaN
+  if (!Number.isFinite(instant) || Math.abs(instant) > maxInstant) return undefined
+  const parts = localParts(instant, zone)
+  return inRange(parts) ? { instant, parts } : undefined
+}
+/** An instant whose local date in `zone` is in the supported years. */
+export const instantInRange = (instant: number, zone: string): boolean => instantIn(instant, zone) !== undefined

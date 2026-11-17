@@ -10,10 +10,10 @@ describe("numberToWords", () => {
   const nl: ReadonlyArray<readonly [number, string]> = [[0, "nul"], [7, "zeven"], [13, "dertien"], [20, "twintig"], [21, "eenentwintig"], [22, "tweeëntwintig"], [23, "drieëntwintig"], [42, "tweeënveertig"], [100, "honderd"], [101, "honderdeen"], [250, "tweehonderdvijftig"], [1000, "duizend"], [2026, "tweeduizend zesentwintig"], [12_345, "twaalfduizend driehonderdvijfenveertig"]]
   for (const [n, w] of en) it(`en ${n}`, () => expect(numberToWords(n, "en")).toBe(w))
   for (const [n, w] of nl) it(`nl ${n}`, () => expect(numberToWords(n, "nl")).toBe(w))
-  it("leaves what it cannot word as digits", () => {
-    expect(numberToWords(1.5, "en")).toBe("1.5")
-    expect(numberToWords(-3, "nl")).toBe("-3")
-    expect(numberToWords(1_000_000, "en")).toBe("1000000")
+  it("cannot word anything but a whole number 0–999 999: undefined (round 3, decision 1)", () => {
+    expect(numberToWords(1.5, "en")).toBeUndefined()
+    expect(numberToWords(-3, "nl")).toBeUndefined()
+    expect(numberToWords(1_000_000, "en")).toBeUndefined()
   })
   it("ordinals", () => {
     expect([1, 2, 3, 12, 20, 21, 30, 31].map((n) => ordinalToWords(n, "en"))).toEqual(["first", "second", "third", "twelfth", "twentieth", "twenty first", "thirtieth", "thirty first"])
@@ -23,7 +23,7 @@ describe("numberToWords", () => {
 
 describe("speakNumber", () => {
   const rows: ReadonlyArray<readonly [number, "en" | "nl", string]> = [
-    [7, "en", "7"], [2.5, "en", "2.5"], [2.5, "nl", "2,5"], [0.25, "nl", "0,25"], [1234567, "en", "1234567"], [3.14159, "en", "3.14"], [-4, "en", "minus 4"], [-4.5, "nl", "min 4,5"], [2.0, "nl", "2"]
+    [7, "en", "7"], [2.5, "en", "2.5"], [2.5, "nl", "2,5"], [0.25, "nl", "0,25"], [999_999, "en", "999999"], [3.14159, "en", "3.14"], [-4, "en", "minus 4"], [-4.5, "nl", "min 4,5"], [2.0, "nl", "2"]
   ]
   for (const [n, l, expected] of rows) it(`${n} (${l})`, () => expect(speakNumber(n, l)).toBe(expected))
   it("in words", () => {
@@ -66,7 +66,6 @@ describe("speakAmount", () => {
     [{ amount: 1, unit: "pinch" }, "en", { item: "salt" }, "a pinch of salt"],
     [{ approx: true }, "en", { item: "milk" }, "some milk"],
     [{ approx: true }, "nl", { item: "melk" }, "wat melk"],
-    [{ approx: true }, "en", {}, "some"],
     [{ rest: true }, "en", {}, "the rest"],
     [{ rest: true }, "en", { item: "the rice" }, "the rest of the rice"],
     [{ rest: true }, "nl", { item: "de rijst" }, "de rest van de rijst"],
@@ -128,7 +127,7 @@ describe("speakTime", () => {
     for (const language of ["en", "nl"] as const) {
       for (let minutes = 0; minutes < 24 * 60; minutes += 1) {
         const t = { hour: Math.floor(minutes / 60), minute: minutes % 60 }
-        const said = speakTime(t, language, { period: true })
+        const said = speakTime(t, language, { period: true })!
         const back = parseTimeOfDay(said, language)
         const got = back.kind === "ok" ? back.value.hour * 60 + back.value.minute : back.kind
         if (got !== minutes) throw new Error(`${language} ${t.hour}:${t.minute} said "${said}" came back as ${JSON.stringify(back)}`)
@@ -139,12 +138,12 @@ describe("speakTime", () => {
 
 describe("speakDuration", () => {
   const rows: ReadonlyArray<readonly [number, string, string]> = [
-    [370_000, "6 minutes 10 seconds", "6 minuten 10 seconden"], [1000, "1 second", "1 seconde"], [0, "0 seconds", "0 seconden"], [45_000, "45 seconds", "45 seconden"],
+    [370_000, "6 minutes 10 seconds", "6 minuten 10 seconden"], [1000, "1 second", "1 seconde"], [45_000, "45 seconds", "45 seconden"],
     [60_000, "1 minute", "1 minuut"], [3_600_000, "1 hour", "1 uur"], [7_200_000, "2 hours", "2 uur"], [3_661_000, "1 hour 1 minute 1 second", "1 uur 1 minuut 1 seconde"],
     [5_400_000, "an hour and a half", "anderhalf uur"], [9_000_000, "two and a half hours", "twee en een half uur"], [1_800_000, "half an hour", "een half uur"],
     [900_000, "a quarter of an hour", "een kwartier"], [2_700_000, "three quarters of an hour", "drie kwartier"], [90_000, "a minute and a half", "anderhalve minuut"],
     [150_000, "two and a half minutes", "twee en een halve minuut"], [600_000, "10 minutes", "10 minuten"], [86_400_000, "1 day", "1 dag"], [90_000_000, "1 day 1 hour", "1 dag 1 uur"],
-    [1499, "1 second", "1 seconde"], [-5, "0 seconds", "0 seconden"]
+    [1499, "1 second", "1 seconde"]
   ]
   for (const [ms, en, nl] of rows) {
     it(`${ms} ms`, () => {
@@ -156,10 +155,13 @@ describe("speakDuration", () => {
     expect(speakDuration(5_400_000, "en", { natural: false })).toBe("1 hour 30 minutes")
     expect(speakDuration(5_400_000, "nl", { natural: false })).toBe("1 uur 30 minuten")
   })
-  it("round trip with core's parseDuration (digit style)", () => {
+  it("round trip with the package's own parseDuration (digit style; Durations.test.ts does the whole grid)", () => {
     for (const ms of [370_000, 3_661_000, 600_000, 45_000, 7_200_000, 60_000]) {
-      for (const language of ["en", "nl"] as const) expect(parseDuration(speakDuration(ms, language, { natural: false }))).toBe(ms)
+      for (const language of ["en", "nl"] as const) expect(parseDuration(speakDuration(ms, language, { natural: false })!, language)).toMatchObject({ kind: "ok", value: ms })
     }
+  })
+  it("0 and less than half a second cannot be said", () => {
+    for (const ms of [0, -5, 499]) expect(speakDuration(ms, "en")).toBeUndefined()
   })
 })
 
@@ -168,10 +170,10 @@ describe("speakDate and speakMoment", () => {
   const rows: ReadonlyArray<readonly [{ year: number; month: number; day: number }, string, string]> = [
     [{ year: 2026, month: 11, day: 18 }, "today", "vandaag"], [{ year: 2026, month: 11, day: 19 }, "tomorrow", "morgen"], [{ year: 2026, month: 11, day: 17 }, "yesterday", "gisteren"],
     [{ year: 2026, month: 11, day: 20 }, "Friday", "overmorgen"], [{ year: 2026, month: 11, day: 21 }, "Saturday", "zaterdag"], [{ year: 2026, month: 11, day: 24 }, "Tuesday", "dinsdag"],
-    [{ year: 2026, month: 11, day: 15 }, "last Sunday", "afgelopen zondag"],
+    [{ year: 2026, month: 11, day: 15 }, "Sunday the fifteenth of November 2026", "zondag 15 november 2026"], [{ year: 2026, month: 11, day: 16 }, "Monday the sixteenth of November 2026", "eergisteren"],
     [{ year: 2026, month: 11, day: 27 }, "Friday the twenty seventh", "vrijdag de zevenentwintigste"], [{ year: 2026, month: 11, day: 30 }, "Monday the thirtieth", "maandag de dertigste"],
     [{ year: 2026, month: 12, day: 3 }, "Thursday the third of December", "donderdag 3 december"], [{ year: 2027, month: 3, day: 3 }, "Wednesday the third of March 2027", "woensdag 3 maart 2027"],
-    [{ year: 2026, month: 11, day: 3 }, "Tuesday the third", "dinsdag de derde"]
+    [{ year: 2026, month: 11, day: 3 }, "Tuesday the third of November 2026", "dinsdag 3 november 2026"]
   ]
   for (const [d, en, nl] of rows) it(`${d.year}-${d.month}-${d.day}`, () => {
     expect(speakDate(d, "en", today)).toBe(en)
@@ -191,8 +193,12 @@ describe("speakDate and speakMoment", () => {
 })
 
 describe("speakList", () => {
+  it("no items, or an empty item, cannot be said", () => {
+    expect(speakList([], "en")).toBeUndefined()
+    expect(speakList(["milk", " "], "en")).toBeUndefined()
+  })
   const rows: ReadonlyArray<readonly [ReadonlyArray<string>, "en" | "nl", string]> = [
-    [[], "en", ""], [["milk"], "en", "milk"], [["milk", "eggs"], "en", "milk and eggs"], [["milk", "eggs", "bread"], "en", "milk, eggs and bread"],
+    [["milk"], "en", "milk"], [["milk", "eggs"], "en", "milk and eggs"], [["milk", "eggs", "bread"], "en", "milk, eggs and bread"],
     [["milk", "eggs", "bread", "rice"], "en", "milk, eggs and two more"], [["a", "b", "c", "d", "e"], "en", "a, b and three more"], [["a", "b", "c", "d", "e", "f"], "en", "a, b and four more"],
     [["a", "b", "c", "d"], "nl", "a, b en nog twee"], [["melk", "eieren"], "nl", "melk en eieren"], [["melk", "eieren", "brood"], "nl", "melk, eieren en brood"],
     [["a", "b", "c", "d", "e"], "nl", "a, b en nog drie"]

@@ -4,13 +4,12 @@
 import { describe, expect, it } from "@effect/vitest"
 import { parseDateTime, type DateOptions } from "../src/Dates.ts"
 import * as language from "../src/index.ts"
-import { readNumber } from "../src/Numbers.ts"
+import { parseNumber } from "../src/Numbers.ts"
 import { convertAmount, parseQuantity } from "../src/Quantity.ts"
 import { parseRecurrence, type RecurrenceOptions } from "../src/Recurrence.ts"
 import { formatDtstart, nextOccurrence, occurrencesAfter, parseRRule, readSeries, type RecurrenceSpec } from "../src/Rrule.ts"
 import { speakAmount, speakNumber } from "../src/Speak.ts"
 import { parseTimeOfDay } from "../src/Time.ts"
-import { tokenize } from "../src/Tokens.ts"
 import { addDays, dayDiff, isoWeekday, isValidLocal, normalizeTimeZone, zonedToInstant } from "../src/Zoned.ts"
 import { AMS, ams, dtstartOf, hm, iso, NOW } from "./helpers.ts"
 
@@ -34,6 +33,8 @@ const qty = (text: string, lang: "en" | "nl" = "en") => {
 }
 const spec = (rrule: string, dtstart: string, timeZone = AMS): RecurrenceSpec => ({ rrule, dtstart: dtstartOf(dtstart, timeZone), timeZone })
 const utc = (t: number) => new Date(t).toISOString()
+/** The instants of `occurrencesAfter` (round 3: it also says why it stopped, and is `undefined` for a spec it refuses). */
+const occ = (...a: Parameters<typeof occurrencesAfter>): Array<number> => [...(occurrencesAfter(...a)?.instants ?? [])]
 
 describe("whole input: every parser reads the whole phrase, or answers not-understood", () => {
   // One extra word in every position of phrases each parser reads: none of them may still give an answer.
@@ -83,7 +84,7 @@ describe("finding 2: BYSETPOS is not offered", () => {
   it("rules with it are unsupported and have no occurrences", () => {
     for (const r of ["FREQ=WEEKLY;BYDAY=MO,TU;BYHOUR=9,17;BYSETPOS=1;COUNT=5", "FREQ=MONTHLY;BYDAY=MO,TU;BYHOUR=9,17;BYSETPOS=1", "FREQ=MONTHLY;BYDAY=MO,TU,WE,TH,FR;BYSETPOS=-1"]) {
       expect(parseRRule(r).kind, r).toBe("unsupported")
-      expect(occurrencesAfter(spec(r, "2026-11-16T09:00"), ams(2026, 11, 1), 5)).toEqual([])
+      expect(occ(spec(r, "2026-11-16T09:00"), ams(2026, 11, 1), 5)).toEqual([])
     }
   })
 })
@@ -95,25 +96,25 @@ describe("finding 3: INTERVAL keeps DTSTART's phase", () => {
   })
   it("in the supported shapes the interval counts periods from DTSTART's, also through periods without an instance", () => {
     // Every 5 months on the 31st from January 2026: in phase are 2026-01, 06, 11, 2027-04, 09, 2028-02 (none has a 31st after January), 2028-07, 12, 2029-05.
-    const got = occurrencesAfter(spec("FREQ=MONTHLY;INTERVAL=5;BYMONTHDAY=31", "2026-01-31T09:00"), ams(2026, 1, 31, 10), 3).map(iso)
+    const got = occ(spec("FREQ=MONTHLY;INTERVAL=5;BYMONTHDAY=31", "2026-01-31T09:00"), ams(2026, 1, 31, 10), 3).map(iso)
     expect(got).toEqual(["2028-07-31T09:00", "2028-12-31T09:00", "2029-05-31T09:00"])
     // A weekly rule every three weeks on two days keeps both in the same week.
-    expect(occurrencesAfter(spec("FREQ=WEEKLY;INTERVAL=3;BYDAY=MO,FR", "2026-11-16T09:00"), ams(2026, 11, 16, 10), 4).map(iso)).toEqual(["2026-11-20T09:00", "2026-12-07T09:00", "2026-12-11T09:00", "2026-12-28T09:00"])
+    expect(occ(spec("FREQ=WEEKLY;INTERVAL=3;BYDAY=MO,FR", "2026-11-16T09:00"), ams(2026, 11, 16, 10), 4).map(iso)).toEqual(["2026-11-20T09:00", "2026-12-07T09:00", "2026-12-11T09:00", "2026-12-28T09:00"])
     // Every second year on 29 February: 2024, 2028 (2026 has none, 2030 none, 2032 is in phase).
-    expect(occurrencesAfter(spec("FREQ=YEARLY;INTERVAL=2;BYMONTH=2;BYMONTHDAY=29", "2024-02-29T09:00"), ams(2024, 3, 1), 3).map(iso)).toEqual(["2028-02-29T09:00", "2032-02-29T09:00", "2036-02-29T09:00"])
+    expect(occ(spec("FREQ=YEARLY;INTERVAL=2;BYMONTH=2;BYMONTHDAY=29", "2024-02-29T09:00"), ams(2024, 3, 1), 3).map(iso)).toEqual(["2028-02-29T09:00", "2032-02-29T09:00", "2036-02-29T09:00"])
   })
 })
 
 describe("finding 4: occurrences are in order, without duplicates, around a gap", () => {
   it("one time per day, so a skipped hour is one occurrence; the reviewer's several BYHOUR values are unsupported", () => {
     expect(parseRRule("FREQ=DAILY;BYHOUR=2,3;BYMINUTE=0,30;COUNT=12").kind).toBe("unsupported")
-    const got = occurrencesAfter(spec("FREQ=DAILY", "2027-03-27T02:30"), Date.UTC(2027, 2, 26, 0), 4)
+    const got = occ(spec("FREQ=DAILY", "2027-03-27T02:30"), Date.UTC(2027, 2, 26, 0), 4)
     expect(got.map(utc)).toEqual(["2027-03-27T01:30:00.000Z", "2027-03-28T01:30:00.000Z", "2027-03-29T00:30:00.000Z", "2027-03-30T00:30:00.000Z"])
     for (let k = 1; k < got.length; k++) expect(got[k]!).toBeGreaterThan(got[k - 1]!)
   })
   it("a day a zone skips altogether (Pacific/Apia, 30 December 2011) lands on the next day's instant: one occurrence", () => {
     const s = spec("FREQ=DAILY", "2011-12-28T09:00", "Pacific/Apia")
-    const got = occurrencesAfter(s, Date.UTC(2011, 11, 27), 4)
+    const got = occ(s, Date.UTC(2011, 11, 27), 4)
     expect(new Set(got).size).toBe(got.length)
     for (let k = 1; k < got.length; k++) expect(got[k]!).toBeGreaterThan(got[k - 1]!)
   })
@@ -123,9 +124,9 @@ describe("finding 5: no work budget ends a live series", () => {
   it("dense rules are not offered; a daily rule decades from DTSTART answers at once", () => {
     expect(parseRRule("FREQ=DAILY;BYHOUR=0,1,2;BYMINUTE=0,1,2").kind).toBe("unsupported")
     const t0 = performance.now()
-    expect(occurrencesAfter(spec("FREQ=DAILY", "2020-01-01T00:00"), ams(2026, 11, 18, 10), 2).map(iso)).toEqual(["2026-11-19T00:00", "2026-11-20T00:00"])
-    expect(occurrencesAfter(spec("FREQ=DAILY", "1000-01-01T00:00"), ams(9999, 12, 30, 10), 2).map(iso)).toEqual(["9999-12-31T00:00"])
-    expect(occurrencesAfter(spec("FREQ=MONTHLY;BYDAY=-1FR", "2026-01-30T00:00"), ams(9000, 1, 1), 1).map(iso)).toEqual(["9000-01-31T00:00"])
+    expect(occ(spec("FREQ=DAILY", "2020-01-01T00:00"), ams(2026, 11, 18, 10), 2).map(iso)).toEqual(["2026-11-19T00:00", "2026-11-20T00:00"])
+    expect(occ(spec("FREQ=DAILY", "2000-01-01T00:00"), ams(2199, 12, 30, 10), 2).map(iso)).toEqual(["2199-12-31T00:00"])
+    expect(occ(spec("FREQ=MONTHLY;BYDAY=-1FR", "2026-01-30T00:00"), ams(2199, 1, 1), 1).map(iso)).toEqual(["2199-01-25T00:00"])
     expect(performance.now() - t0).toBeLessThan(500)
   })
 })
@@ -156,9 +157,9 @@ describe("finding 7: DTSTART and RRULE are checked together", () => {
   })
   it("UNTIL is an instant: an occurrence at it is in, one a second later is out", () => {
     const at = spec("FREQ=DAILY;UNTIL=20261120T080000Z", "2026-11-18T09:00")
-    expect(occurrencesAfter(at, NOW, 9).map(iso)).toEqual(["2026-11-19T09:00", "2026-11-20T09:00"])
+    expect(occ(at, NOW, 9).map(iso)).toEqual(["2026-11-19T09:00", "2026-11-20T09:00"])
     const before = spec("FREQ=DAILY;UNTIL=20261120T075959Z", "2026-11-18T09:00")
-    expect(occurrencesAfter(before, NOW, 9).map(iso)).toEqual(["2026-11-19T09:00"])
+    expect(occ(before, NOW, 9).map(iso)).toEqual(["2026-11-19T09:00"])
   })
 })
 
@@ -295,8 +296,8 @@ describe("finding 16: an item holding another amount is refused", () => {
     it(`"${t}"`, () => expect(qty(t)).toBe("not-understood"))
   for (const t of ["2 kg bloem of een zak suiker", "2 kg bloem en een kilo suiker", "2 kg bloem en 3 eieren", "2 kg bloem en drie eieren", "2 kg bloem en wat suiker", "een zak bloem en een zak suiker"])
     it(`nl "${t}"`, () => expect(qty(t, "nl")).toBe("not-understood"))
-  it("an item with \"and\" that holds no amount is kept as written", () => {
-    expect(qty("2 kg salt and pepper")).toBe("2 kg salt and pepper")
+  it("an item is one thing: \"and\" is reserved (round 3), so \"salt and pepper\" is two items for the caller", () => {
+    expect(qty("2 kg salt and pepper")).toBe("not-understood")
     expect(qty("a jar of peanut butter")).toBe("1 jar peanut butter")
     expect(qty("een pot pindakaas", "nl")).toBe("1 jar pindakaas")
   })
@@ -311,48 +312,53 @@ describe("finding 17: no title extraction", () => {
 })
 
 describe("finding 20: no positive amount is rounded to zero", () => {
-  it("more decimals than supported are refused; supported ones keep their value", () => {
-    expect(qty("0.0000001 kg flour")).toBe("not-understood")
-    const r = parseQuantity("0.000001 kg flour", "en")
-    expect(r.kind === "ok" && [r.value.amount, r.value.base?.amount]).toEqual([0.000001, 0.001])
-    const g = parseQuantity("0.000001 g salt", "en")
-    expect(g.kind === "ok" && g.value.base?.amount).toBe(0.000001)
+  it("more decimals than supported (two, round 3) are refused; supported ones keep their value", () => {
+    expect(qty("0.001 kg flour")).toBe("not-understood")
+    const r = parseQuantity("0.01 kg flour", "en")
+    expect(r.kind === "ok" && [r.value.amount, r.value.base?.amount]).toEqual([0.01, 10])
+    const g = parseQuantity("0.01 g salt", "en")
+    expect(g.kind === "ok" && g.value.base?.amount).toBe(0.01)
   })
-  it("conversions keep twelve significant digits and never say 0 for a positive amount", () => {
+  it("conversions keep twelve significant digits and never say 0 for a positive amount; beyond the domain they refuse (round 3, finding 10)", () => {
     expect(convertAmount(0.000001, "ml", "l")).toBe(1e-9)
-    expect(convertAmount(1e-12, "g", "kg")).toBe(1e-15)
+    expect(convertAmount(1e-12, "g", "kg")).toBeUndefined()
+    expect(convertAmount(Number.MIN_VALUE, "g", "kg")).toBeUndefined()
+    expect(convertAmount(1e308, "kg", "g")).toBeUndefined()
+    expect(convertAmount(1e308, "kg", "kg")).toBeUndefined()
+    expect(convertAmount(1e9, "kg", "g")).toBe(1e12)
     expect(convertAmount(0.1 * 3, "l", "ml")).toBe(300)
     expect(convertAmount(1, "tsp", "cup")).toBe(0.02)
   })
 })
 
 describe("finding 21: a nonzero number is never said as 0", () => {
-  it("small numbers keep two significant digits, with their sign", () => {
-    expect(speakNumber(1e-11, "en")).toBe("0.00000000001")
-    expect(speakNumber(1e-12, "nl")).toBe("0,000000000001")
-    expect(speakNumber(-1e-11, "en")).toBe("minus 0.00000000001")
-    expect(speakNumber(-0.004, "nl")).toBe("min 0,004")
-    expect(speakNumber(1.5e-20, "en")).toBe("0.000000000000000000015")
+  it("below the two-decimal step a nonzero number cannot be said (round 3): undefined, never 0", () => {
+    for (const v of [1e-11, 1e-12, -1e-11, -0.004, 1.5e-20, 0.004]) expect(speakNumber(v, "en"), String(v)).toBeUndefined()
+    expect(speakNumber(0.005, "en")).toBe("0.01")
+    expect(speakNumber(-0.01, "nl")).toBe("min 0,01")
   })
-  it("outside the supported range nothing is said, never another number", () => {
-    expect(speakNumber(1e-95, "en")).toBe("")
-    expect(speakNumber(1e22, "en")).toBe("")
-    expect(speakNumber(Number.MIN_VALUE, "en")).toBe("")
+  it("outside the supported range nothing is said: undefined, never another number (round 3, decision 1)", () => {
+    expect(speakNumber(1e-95, "en")).toBeUndefined()
+    expect(speakNumber(1e22, "en")).toBeUndefined()
+    expect(speakNumber(Number.MIN_VALUE, "en")).toBeUndefined()
+    expect(speakNumber(1_000_000, "en")).toBeUndefined()
   })
-  it("amounts and negative amounts", () => {
-    expect(speakAmount({ amount: 1e-9, unit: "kg" }, "en")).toBe("0.000001 grams")
-    expect(speakAmount({ amount: -0.5, unit: "kg" }, "en")).toBe("minus 500 grams")
-    expect(speakAmount({ amount: -1, unit: "l" }, "en")).toBe("minus 1 litre")
+  it("amounts are positive; one that cannot be said is undefined (round 3, finding 23)", () => {
+    expect(speakAmount({ amount: 1e-9, unit: "kg" }, "en")).toBeUndefined()
+    expect(speakAmount({ amount: 0.00001, unit: "kg" }, "en")).toBe("0.01 grams")
+    expect(speakAmount({ amount: -0.5, unit: "kg" }, "en")).toBeUndefined()
+    expect(speakAmount({ amount: 1e21, unit: "kg" }, "en")).toBeUndefined()
   })
 })
 
-describe("finding 22: years outside 1000–9999 are refused, never moved", () => {
+describe("finding 22 (round 3: the supported years are 2000–2199): years outside are refused, never moved", () => {
   it("validity and conversion", () => {
     expect(isValidLocal({ year: 99, month: 1, day: 1 })).toBe(false)
-    expect(isValidLocal({ year: 999, month: 12, day: 31 })).toBe(false)
-    expect(isValidLocal({ year: 1000, month: 1, day: 1 })).toBe(true)
-    expect(isValidLocal({ year: 10000, month: 1, day: 1 })).toBe(false)
-    expect(utc(zonedToInstant({ year: 1000, month: 1, day: 1, hour: 9 }, "UTC"))).toBe("1000-01-01T09:00:00.000Z")
+    expect(isValidLocal({ year: 1999, month: 12, day: 31 })).toBe(false)
+    expect(isValidLocal({ year: 2000, month: 1, day: 1 })).toBe(true)
+    expect(isValidLocal({ year: 2199, month: 12, day: 31 })).toBe(true)
+    expect(isValidLocal({ year: 2200, month: 1, day: 1 })).toBe(false)
+    expect(utc(zonedToInstant({ year: 2000, month: 1, day: 1, hour: 9 }, "UTC"))).toBe("2000-01-01T09:00:00.000Z")
     expect(addDays({ year: 1000, month: 1, day: 1 }, -1)).toEqual({ year: 999, month: 12, day: 31 })
     expect(dayDiff({ year: 1999, month: 1, day: 1 }, { year: 2000, month: 1, day: 1 })).toBe(365)
     expect(isoWeekday({ year: 2000, month: 1, day: 1 })).toBe(6)
@@ -361,13 +367,14 @@ describe("finding 22: years outside 1000–9999 are refused, never moved", () =>
     expect(formatDtstart({ year: 99, month: 1, day: 1, hour: 9, minute: 0 }, AMS)).toBeUndefined()
     expect(readSeries({ rrule: "FREQ=DAILY", dtstart: "DTSTART;TZID=Europe/Amsterdam:00990101T090000", timeZone: AMS }).kind).not.toBe("ok")
     expect(date("3 March 1066")).toBe("not-understood")
+    expect(date("3 March 1999")).toBe("not-understood")
     expect(date("3 March 2300")).toBe("not-understood")
     expect(date("3 March 2027")).toBe("2027-03-03")
   })
 })
 
 describe("finding 23: one number grammar, total over its input", () => {
-  const n = (t: string, lang: "en" | "nl" = "en") => readNumber(tokenize(t), 0, lang)?.value
+  const n = (t: string, lang: "en" | "nl" = "en") => { const r = parseNumber(t, lang); return r.kind === "ok" ? r.value : undefined }
   it("repeated or out-of-order scales are not a number", () => {
     for (const t of ["one thousand two thousand", "thousand thousand", "two hundred three hundred", "hundred thousand hundred", "five five", "twenty thirty", "twenty twenty one", "nineteen five",
       "one hundred and two hundred", "two thousand and three hundred", "zero five", "five zero"])
@@ -386,10 +393,12 @@ describe("finding 23: one number grammar, total over its input", () => {
     expect(n("negenhonderdnegenennegentigduizend", "nl")).toBe(999_000)
   })
   it("beyond the supported range and precision is not a number", () => {
-    expect(n("1000000000")).toBeUndefined()
-    expect(n("999999999")).toBe(999_999_999)
+    // Round 3: whole part at most 999 999, at most two decimals.
+    expect(n("1000000")).toBeUndefined()
+    expect(n("999999")).toBe(999_999)
     expect(n("1.2345678")).toBeUndefined()
-    expect(n("1.234567".replace(".", ","), "nl")).toBe(1.234567)
+    expect(n("1,23", "nl")).toBe(1.23)
+    expect(n("1,234", "nl")).toBeUndefined()
     expect(n("one million")).toBeUndefined()
     expect(n("2 million")).toBeUndefined()
     expect(n("twee miljoen", "nl")).toBeUndefined()
@@ -438,7 +447,8 @@ describe("found by the self-review scripts", () => {
     expect(date("on Friday at five")).toBe("2026-11-20 17:00")
   })
   it("weekdays without \"and\" are a list only with a comma between them", () => {
-    expect(rec("every Monday Tuesday")).toBe("not-understood")
+    // Round 3: punctuation carries no meaning, so a list's items may stand side by side ("every Monday Tuesday" is Monday and Tuesday).
+    expect(rec("every Monday Tuesday")).toBe("FREQ=WEEKLY;BYDAY=MO,TU @ 20261123T090000")
     expect(rec("every second Monday Tuesday")).toBe("not-understood")
     expect(rec("every Monday, Wednesday and Friday")).toBe("FREQ=WEEKLY;BYDAY=MO,WE,FR @ 20261120T090000")
     expect(rec("de laatste vrijdag van om de maand", "nl")).toBe("not-understood")
@@ -451,8 +461,10 @@ describe("found by the self-review scripts", () => {
 
 describe("the index exports what the README lists", () => {
   it("parsers, the engine and the helpers", () => {
-    for (const name of ["parseTimeOfDay", "parseDateTime", "parseQuantity", "parseRecurrence", "parseRRule", "formatRRule", "parseDtstart", "formatDtstart", "readSeries", "seriesAfter",
-      "occurrencesAfter", "nextOccurrence", "describeRRule", "onlyWords", "accountedFor", "readNumber", "readAmount", "normalizeTimeZone", "zonedInstants"])
+    for (const name of ["parseNumber", "parseDuration", "parseTimeOfDay", "parseDateTime", "parseQuantity", "parseRecurrence", "parseRRule", "formatRRule", "parseDtstart", "formatDtstart",
+      "readSeries", "seriesAfter", "occurrencesAfter", "nextOccurrence", "describeRRule", "normalizeTimeZone"])
       expect(typeof (language as Record<string, unknown>)[name], name).toBe("function")
+    // Round 3, decision 3: the low-level readers that could not keep the closed-grammar rule are internal.
+    for (const name of ["onlyWords", "accountedFor", "readNumber", "readAmount", "zonedInstants", "tokenize", "matchTime", "resolveTime"]) expect((language as Record<string, unknown>)[name], name).toBeUndefined()
   })
 })
