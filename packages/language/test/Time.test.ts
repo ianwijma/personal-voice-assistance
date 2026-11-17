@@ -20,8 +20,7 @@ describe("parseTimeOfDay: English", () => {
     ["seven in the evening", "19:00", false], ["seven in the morning", "07:00", false], ["half past eight in the evening", "20:30", false],
     ["ten at night", "22:00", false], ["three in the afternoon", "15:00", false], ["two at night", "02:00", false],
     ["12 pm", "12:00", false], ["12 am", "00:00", false], ["12:15 am", "00:15", false], ["noon", "12:00", false], ["midnight", "00:00", false], ["half past twelve", "12:30", true],
-    ["nineteen thirty", "19:30", false], ["19:45", "19:45", false], ["07:30", "07:30", false], ["0:30", "00:30", false], ["23:59", "23:59", false], ["13", "13:00", false],
-    ["seven please", "07:00", true]
+    ["nineteen thirty", "19:30", false], ["19:45", "19:45", false], ["07:30", "07:30", false], ["0:30", "00:30", false], ["23:59", "23:59", false], ["13", "13:00", false]
   ]
   for (const [text, expected, guessed] of rows) it(`"${text}" is ${expected}${guessed ? " (guessed)" : ""}`, () => expect(read(text, "en")).toEqual([expected, guessed]))
 
@@ -30,7 +29,7 @@ describe("parseTimeOfDay: English", () => {
     expect(read("half five", "en")).toEqual(["17:30", true])
     expect(read("half six", "en")).toEqual(["18:30", true])
   })
-  for (const bad of ["", "tomorrow", "banana", "25:00", "7:75", "quarter to", "half", "seven thirty-one pm tomorrow", "13 pm", "0 pm"]) it(`"${bad}" is not a time`, () => expect(read(bad, "en")).toBe("not-understood"))
+  for (const bad of ["", "tomorrow", "banana", "25:00", "7:75", "quarter to", "half", "seven thirty-one pm tomorrow", "13 pm", "0 pm", "seven please", "around seven", "until seven", "seven or eight", "seven UTC", "not seven", "24:00"]) it(`"${bad}" is not a time`, () => expect(read(bad, "en")).toBe("not-understood"))
 })
 
 describe("parseTimeOfDay: Dutch", () => {
@@ -44,7 +43,7 @@ describe("parseTimeOfDay: Dutch", () => {
     ["zeven uur 's avonds", "19:00", false], ["acht uur 's ochtends", "08:00", false], ["kwart over zeven 's avonds", "19:15", false], ["half zeven 's avonds", "18:30", false],
     ["half twaalf 's avonds", "23:30", false], ["twaalf uur 's middags", "12:00", false], ["twaalf uur 's nachts", "00:00", false], ["twee uur 's nachts", "02:00", false],
     ["tien uur 's avonds", "22:00", false], ["drie uur in de middag", "15:00", false], ["acht uur in de avond", "20:00", false], ["middernacht", "00:00", false],
-    ["19:30", "19:30", false], ["19u30", "19:30", false], ["dertien uur", "13:00", false], ["07:30", "07:30", false], ["zeven uur alsjeblieft", "07:00", true]
+    ["19:30", "19:30", false], ["19u30", "19:30", false], ["dertien uur", "13:00", false], ["07:30", "07:30", false]
   ]
   for (const [text, expected, guessed] of rows) it(`"${text}" is ${expected}${guessed ? " (guessed)" : ""}`, () => expect(read(text, "nl")).toEqual([expected, guessed]))
 
@@ -53,7 +52,7 @@ describe("parseTimeOfDay: Dutch", () => {
     expect(read("half zeven 's ochtends", "nl")).toEqual(["06:30", false])
     expect(read("half acht 's ochtends", "nl")).toEqual(["07:30", false])
   })
-  for (const bad of ["", "morgen", "banaan", "25 uur", "half", "kwart voor", "half dertien"]) it(`"${bad}" is not a time`, () => expect(read(bad, "nl")).toBe("not-understood"))
+  for (const bad of ["", "morgen", "banaan", "25 uur", "half", "kwart voor", "half dertien", "zeven uur alsjeblieft", "rond zeven uur", "tot zeven uur", "zeven of acht uur", "niet om zeven uur"]) it(`"${bad}" is not a time`, () => expect(read(bad, "nl")).toBe("not-understood"))
 })
 
 describe("parseTimeOfDay: the band", () => {
@@ -84,7 +83,7 @@ describe("parseTimeOfDay: the band", () => {
     expect(read("three pm", "en", { band: { from: "09:00", to: "11:00" } })).toEqual(["15:00", false])
   })
   it("says what it read", () => {
-    const r = parseTimeOfDay("at half past seven please", "en")
+    const r = parseTimeOfDay("at half past seven", "en")
     expect(r.kind === "ok" && r.said).toBe("half past seven")
   })
 })

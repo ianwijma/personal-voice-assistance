@@ -1,7 +1,7 @@
 import { dict, dicts } from "./Dict.ts"
-import { numbersWhole, readAmount, readNumber } from "./Numbers.ts"
+import { largeScales, numbersWhole, readAmount, readNumber } from "./Numbers.ts"
 import { notUnderstood, ok, type Language, type Parsed } from "./Result.ts"
-import { tokenize, type Tok } from "./Tokens.ts"
+import { onlyWords, tokenize, type Tok } from "./Tokens.ts"
 
 export type MassUnit = "g" | "kg" | "oz" | "lb"
 export type VolumeUnit = "ml" | "cl" | "dl" | "l" | "tsp" | "tbsp" | "cup"
@@ -20,13 +20,10 @@ export interface Quantity {
   readonly rest: boolean
   /** The same amount in grams, millilitres or pieces, when the unit has one. */
   readonly base?: { readonly amount: number; readonly unit: "g" | "ml" | "piece" }
-  /** The words of the quantity as said. */
+  /** The words of the quantity as written, without the item ("about 2 kg" in "about 2 kg of flour"). */
   readonly said: string
-  /** What came after it ("rice" in "a kilo of rice"), without "of" / "van". */
+  /** What came after it ("rice" in "a kilo of rice"), without "of" / "van", as written. */
   readonly item: string
-  /** Where in the text the quantity was read, `[start, end)`. */
-  readonly start: number
-  readonly end: number
 }
 
 export interface QuantityOptions {
@@ -98,9 +95,13 @@ const unitTable = dicts<Language, UnitInfo>({
   }
 })
 
+/**
+ * The words that may stand before an amount: "about 2 kg", "ongeveer een kilo". Only these; a bound or a hedge that changes the
+ * amount ("less than", "at least", "almost", "not", "bijna", "ruim", "minder dan") is not one, so the phrase is `not-understood`.
+ */
 const approxWords: Record<Language, ReadonlySet<string>> = {
-  en: new Set(["about", "around", "roughly", "approximately", "approx", "circa", "ca", "like", "maybe", "nearly", "almost"]),
-  nl: new Set(["ongeveer", "ongeveer", "circa", "ca", "rond", "zon", "ruim", "bijna", "plusminus"])
+  en: new Set(["about", "around", "roughly", "approximately", "approx", "circa", "ca"]),
+  nl: new Set(["ongeveer", "circa", "ca", "rond", "zon", "plusminus"])
 }
 const someWords: Record<Language, ReadonlyArray<ReadonlyArray<string>>> = {
   en: [["some"], ["a", "bit"], ["a", "little"], ["a", "few"], ["a", "couple"], ["several"], ["a", "lot"], ["lots"]],
@@ -111,9 +112,12 @@ const restWords: Record<Language, ReadonlyArray<ReadonlyArray<string>>> = {
   nl: [["de", "rest"], ["de", "overige"], ["wat", "er", "over", "is"], ["de", "restjes"], ["het", "restant"]]
 }
 const linkWords: Record<Language, ReadonlySet<string>> = { en: new Set(["of"]), nl: new Set(["van", "aan"]) }
-const joinWords: ReadonlySet<string> = new Set(["and", "or", "en", "of", "plus", "to", "tot"])
+const joinWords: Record<Language, ReadonlySet<string>> = { en: new Set(["and", "or", "plus", "to", "nor", "versus", "vs"]), nl: new Set(["en", "of", "plus", "tot", "noch"]) }
+const fractionWords: ReadonlySet<string> = new Set(["half", "halve", "quarter", "quarters", "kwart", "anderhalf", "anderhalve", "driekwart", "third", "thirds", "derde"])
+const articles: ReadonlySet<string> = new Set(["a", "an", "een"])
 
-const round = (n: number): number => Math.round(n * 1e6) / 1e6
+/** Exact to twelve significant digits (no float noise such as 0.30000000000000004), and never 0 for an amount that is not 0. */
+export const tidy = (n: number): number => (n === 0 ? 0 : Number(n.toPrecision(12)))
 
 const startsWith = (norms: ReadonlyArray<string>, i: number, phrase: ReadonlyArray<string>): boolean => phrase.every((p, k) => norms[i + k] === p)
 
@@ -123,79 +127,91 @@ const unitAt = (toks: ReadonlyArray<Tok>, k: number, language: Language): UnitIn
 }
 
 /**
- * A quantity with a unit, for lists and the kitchen: "a kilo of rice", "about 250 grams", "twee liter melk", "een ons", "een pak",
- * "a handful", "some", "the rest". Read from the first place the text has one; `item` is what follows. Mass, volume, pieces and packs;
- * `base` is in grams, millilitres or pieces. Never throws.
+ * The item may not hold a second amount: a number (digits or number words), a unit, a fraction, or after "and" / "or" / "en" / "of" /
+ * "plus" an article or a word of "some" ("2 kg flour and a bag of sugar", "2 kg bloem of een zak suiker", "2 kg flour and some sugar").
+ * Two quantities are the caller's to split (review round 2, findings 15 and 16).
+ */
+const itemHoldsAmount = (toks: ReadonlyArray<Tok>, from: number, language: Language): boolean => {
+  const norms = toks.map((t) => t.norm)
+  // An item that starts or ends with "and" / "or" ("2 kg and flour", "2 kg flour or") is not one thing either.
+  if (from < toks.length && (joinWords[language].has(norms[from]!) || joinWords[language].has(norms[toks.length - 1]!))) return true
+  for (let k = from; k < toks.length; k++) {
+    const w = norms[k]!
+    if (/\d/.test(w)) return true
+    if (unitAt(toks, k, language) !== undefined || fractionWords.has(w) || largeScales.has(w)) return true
+    if (!articles.has(w) && readNumber(toks, k, language) !== undefined) return true
+    if (approxWords[language].has(w) && k > from) return true
+    const joined = k > from && joinWords[language].has(norms[k - 1]!)
+    if (joined && (articles.has(w) || someWords[language].some((p) => startsWith(norms, k, p)) || readAmount(toks, k, language, true) !== undefined)) return true
+    if (articles.has(w) && (unitAt(toks, k + 1, language) !== undefined || fractionWords.has(norms[k + 1] ?? ""))) return true
+  }
+  return false
+}
+
+/**
+ * A quantity of something, for lists and the kitchen: the phrase is `[about] amount [unit] [of] item` and nothing else — "a kilo of
+ * rice", "about 250 grams", "twee liter melk", "een ons kaas", "een pak melk", "3x melk", "two apples", "a handful of nuts", "some
+ * salt", "the rest of the rice". The item is everything after the amount and unit, as written (it may be empty after a unit). Only an
+ * approximator ("about", "ongeveer") may stand before the amount: "less than 2 kg flour", "not 2 kg flour" and "buy 2 kg flour" are
+ * `not-understood`. An item that holds another amount ("2 kg flour and 3 eggs", "2 kg flour or a bag of sugar") is `not-understood`:
+ * the caller splits a list into its quantities first. Mass, volume, pieces and packs; `base` is in grams, millilitres or pieces.
+ * Numbers as `readNumber` reads them (at most six decimals; nothing rounded to 0). Never throws.
  */
 export const parseQuantity = (text: string, language: Language, options: QuantityOptions = {}): Parsed<Quantity> => {
+  if (typeof text !== "string") return notUnderstood
   const toks = tokenize(text)
   const norms = toks.map((t) => t.norm)
   const cupMl = options.cupMl ?? metricCupMl
   if (!(cupMl > 0) || !Number.isFinite(cupMl)) return notUnderstood
-  for (let i = 0; i < toks.length; i++) {
-    let k = i
-    let approx = false
-    while (k < toks.length && approxWords[language].has(norms[k]!)) { approx = true; k++ }
-    const finish = (q: Omit<Quantity, "said" | "item" | "start" | "end" | "approx"> & { approx?: boolean }, next: number): Parsed<Quantity> => {
-      // "2 kg 500 g flour", "2 kg, 3 kg": a second amount right after the first is not an item.
-      if (next < toks.length && (/^\d/.test(norms[next]!) || readNumber(toks, next, language) !== undefined || unitAt(toks, next, language) !== undefined)) return notUnderstood
-      // "2 kg flour and 3 eggs", "2 or 3 apples", "two cups and a half": a second amount is a second item or an alternative.
-      for (let j = next; j < toks.length; j++) {
-        if (!joinWords.has(norms[j]!)) continue
-        const after = norms[j + 1]
-        if (after !== undefined && (/^\d/.test(after) || readAmount(toks, j + 1, language, false) !== undefined || (["a", "an", "een"].includes(after) && readAmount(toks, j + 1, language, true)?.next !== j + 2))) return notUnderstood
-      }
-      let n = next
-      if (linkWords[language].has(norms[n] ?? "")) n++
-      const item = n < toks.length ? text.slice(toks[n]!.start).replace(/[\s.,;!?]+$/u, "") : ""
-      const start = toks[i]!.start
-      const end = toks[next - 1]!.end
-      return ok({ ...q, approx: approx || q.approx === true, said: text.slice(start, end), item, start, end }, text.slice(start, end))
-    }
-    // the rest
-    const rest = restWords[language].find((p) => startsWith(norms, k, p))
-    if (rest !== undefined) return finish({ dimension: "none", rest: true }, k + rest.length)
-    // some, a bit, een paar
-    const some = someWords[language].find((p) => startsWith(norms, k, p))
-    if (some !== undefined) {
-      // "a bit of salt" and "some salt" are quantities; "wat" in Dutch only when something follows.
-      if (k + some.length < toks.length || some.length > 1 || language === "en") return finish({ dimension: "none", rest: false, approx: true }, k + some.length)
-    }
-    // AMOUNT [x] UNIT
-    const amount = readAmount(toks, k, language, true)
-    if (amount === undefined) continue
-    // The amount must be the whole numeric expression: ".5 kg", "-2 kg", "1/2 kg", "five five apples" are not read as 5, 2, 1 or 5.
-    if (!numbersWhole(text, toks, [{ start: toks[k]!.start, end: toks[amount.next - 1]!.end }])) return notUnderstood
-    if (!Number.isFinite(amount.value) || amount.value < 0) return notUnderstood
-    let next = amount.next
-    const lone = (language === "en" && (norms[k] === "a" || norms[k] === "an") && next === k + 1) || (language === "nl" && norms[k] === "een" && next === k + 1)
-    if ((norms[next] === "a" || norms[next] === "an" || norms[next] === "een") && amount.value < 1 && unitAt(toks, next + 1, language) !== undefined) next++
-    if (norms[next] === "x") {
-      if (unitAt(toks, next + 1, language) === undefined) {
-        // "3x melk": three pieces
-        return finish({ dimension: "count", unit: "piece", amount: amount.value, rest: false, base: { amount: amount.value, unit: "piece" } }, next + 1)
-      }
-    }
-    const info = unitAt(toks, next, language)
-    if (info === undefined) {
-      if (lone || amount.value === 0) continue
-      // "two apples": a count of something
-      if (next < toks.length) {
-        return finish({ dimension: "count", unit: "piece", amount: amount.value, rest: false, base: { amount: amount.value, unit: "piece" } }, next)
-      }
-      continue
-    }
-    const per = info.per ?? 1
-    const value = round(amount.value * per)
-    const unit = info.unit
-    const factor = unit === "cup" ? cupMl : factors[unit]
-    const baseUnit = info.dimension === "mass" ? "g" : info.dimension === "volume" ? "ml" : info.dimension === "count" ? "piece" : undefined
-    const base = factor !== undefined && baseUnit !== undefined ? { amount: round(value * factor), unit: baseUnit } as const : undefined
-    return finish({
-      dimension: info.dimension, unit, amount: value, rest: false, ...(info.approx === true ? { approx: true } : {}), ...(base !== undefined ? { base } : {})
-    }, next + 1)
+  if (toks.length === 0 || !onlyWords(text, toks)) return notUnderstood
+  let k = 0
+  let approx = false
+  while (k < toks.length && approxWords[language].has(norms[k]!)) { approx = true; k++ }
+  const finish = (q: Omit<Quantity, "said" | "item" | "approx"> & { approx?: boolean }, next: number, needsItem = false): Parsed<Quantity> => {
+    let n = next
+    if (linkWords[language].has(norms[n] ?? "")) n++
+    if (n === next + 1 && n >= toks.length) return notUnderstood // "a kilo of"
+    if (needsItem && n >= toks.length) return notUnderstood
+    if (itemHoldsAmount(toks, n, language)) return notUnderstood
+    if (!numbersWhole(text, toks, [{ start: toks[0]!.start, end: toks[next - 1]!.end }])) return notUnderstood
+    const item = n < toks.length ? text.slice(toks[n]!.start, toks[toks.length - 1]!.end) : ""
+    const said = text.slice(toks[0]!.start, toks[next - 1]!.end)
+    return ok({ ...q, approx: approx || q.approx === true, said, item }, text.slice(toks[0]!.start, toks[toks.length - 1]!.end))
   }
-  return notUnderstood
+  // the rest
+  const rest = restWords[language].find((p) => startsWith(norms, k, p))
+  if (rest !== undefined) return approx ? notUnderstood : finish({ dimension: "none", rest: true }, k + rest.length)
+  // some, a bit of, een paar
+  const some = someWords[language].find((p) => startsWith(norms, k, p))
+  if (some !== undefined) {
+    if (approx) return notUnderstood
+    return finish({ dimension: "none", rest: false, approx: true }, k + some.length, true)
+  }
+  // AMOUNT [x] [a] UNIT
+  const amount = readAmount(toks, k, language, true)
+  if (amount === undefined) return notUnderstood
+  if (!Number.isFinite(amount.value) || !(amount.value > 0)) return notUnderstood
+  let next = amount.next
+  // "half a kilo", "een halve liter" (the article belongs to the amount)
+  if (articles.has(norms[next] ?? "") && amount.value < 1 && unitAt(toks, next + 1, language) !== undefined) next++
+  if (norms[next] === "x" && unitAt(toks, next + 1, language) === undefined) {
+    // "3x melk": three pieces
+    return finish({ dimension: "count", unit: "piece", amount: amount.value, rest: false, base: { amount: amount.value, unit: "piece" } }, next + 1, true)
+  }
+  const info = unitAt(toks, next, language)
+  if (info === undefined) {
+    // "two apples": a count of something; a lone "a" / "een" is no amount ("a banana" is not a quantity).
+    if (amount.next === k + 1 && articles.has(norms[k]!)) return notUnderstood
+    return finish({ dimension: "count", unit: "piece", amount: amount.value, rest: false, base: { amount: amount.value, unit: "piece" } }, next, true)
+  }
+  const value = tidy(amount.value * (info.per ?? 1))
+  const unit = info.unit
+  const factor = unit === "cup" ? cupMl : factors[unit]
+  const baseUnit = info.dimension === "mass" ? "g" : info.dimension === "volume" ? "ml" : info.dimension === "count" ? "piece" : undefined
+  const base = factor !== undefined && baseUnit !== undefined ? { amount: tidy(value * factor), unit: baseUnit } as const : undefined
+  return finish({
+    dimension: info.dimension, unit, amount: value, rest: false, ...(info.approx === true ? { approx: true } : {}), ...(base !== undefined ? { base } : {})
+  }, next + 1)
 }
 
 const dimensionOf = (unit: UnitId): Dimension => {
@@ -213,5 +229,5 @@ export const convertAmount = (amount: number, from: UnitId, to: UnitId, options:
   if (kind === "none" || kind === "count" || dimensionOf(to) !== kind || !Number.isFinite(amount)) return undefined
   if (options.cupMl !== undefined && !(Number.isFinite(options.cupMl) && options.cupMl > 0)) return undefined
   const size = (u: UnitId) => (u === "cup" ? options.cupMl ?? metricCupMl : factors[u]!)
-  return round((amount * size(from)) / size(to))
+  return tidy((amount * size(from)) / size(to))
 }

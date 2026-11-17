@@ -8,7 +8,7 @@ import { describeRRule, formatRRule, nextOccurrence, occurrencesAfter, parseDtst
 import { speakAmount, speakNumber } from "../src/Speak.ts"
 import { parseTimeOfDay } from "../src/Time.ts"
 import { normalizeTimeZone, offsetAt } from "../src/Zoned.ts"
-import { AMS, ams, hm, iso, NOW } from "./helpers.ts"
+import { AMS, ams, dtstartOf, hm, iso, NOW } from "./helpers.ts"
 
 const dopts: DateOptions = { now: NOW, timeZone: AMS } // Wednesday 2026-11-18 10:00
 const ropts: RecurrenceOptions = { now: NOW, timeZone: AMS }
@@ -22,7 +22,7 @@ const rec = (text: string, lang: "en" | "nl" = "en", options: RecurrenceOptions 
   const r = parseRecurrence(text, lang, options)
   return r.kind === "ok" ? `${r.value.rrule} @ ${r.value.dtstart.replace(`DTSTART;TZID=${AMS}:`, "")}` : r.kind
 }
-const spec = (rrule: string, dtstart: string, timeZone = AMS): RecurrenceSpec => ({ rrule, dtstart, timeZone })
+const spec = (rrule: string, dtstart: string, timeZone = AMS): RecurrenceSpec => ({ rrule, dtstart: dtstartOf(dtstart, timeZone), timeZone })
 const list = (s: RecurrenceSpec, after: number, n: number) => occurrencesAfter(s, after, n).map(iso)
 
 describe("finding 6: words that are names of object properties", () => {
@@ -46,8 +46,9 @@ describe("finding 6: words that are names of object properties", () => {
       })
     }
   }
-  it("constructor at noon is noon today; the word is title text", () => {
-    expect(date("constructor at noon")).toBe("2026-11-18 12:00")
+  it("constructor at noon: a word no rule reads is refused (round 2: the phrase is read whole)", () => {
+    expect(date("constructor at noon")).toBe("not-understood")
+    expect(date("at noon")).toBe("2026-11-18 12:00")
   })
   it("describeRRule and the speakers ignore such words", () => {
     expect(describeRRule("FREQ=WEEKLY;BYDAY=constructor", "en")).toBeUndefined()
@@ -87,12 +88,12 @@ describe("finding 8: the whole temporal expression is read, or none of it", () =
     ["last Friday", "not-understood"], ["previous Monday", "not-understood"], ["before Friday", "not-understood"], ["after tomorrow at 5", "not-understood"], ["until 5 pm", "not-understood"],
     ["every Friday", "not-understood"], ["Fridays at 5", "not-understood"], ["this weekend", "not-understood"], ["in 2 weeks and 3 days", "not-understood"],
     ["tomorrow or Friday", "not-understood"], ["tomorrow at 5 and at 6", "not-understood"], ["two days ago", "not-understood"], ["tomorrow in the evening", "2026-11-19 evening"],
-    ["remind me to call mum tomorrow at five", "2026-11-19 17:00"], ["remind me to buy 3 apples tomorrow", "2026-11-19"], ["I may call mum tomorrow", "2026-11-19"]
+    ["remind me to call mum tomorrow at five", "not-understood"], ["remind me to buy 3 apples tomorrow", "not-understood"], ["I may call mum tomorrow", "not-understood"]
   ]
   for (const [t, want] of rows) it(`"${t}"`, () => expect(date(t)).toBe(want))
   const nl: ReadonlyArray<readonly [string, string]> = [
     ["woensdag 3 maart 2027 om 17:00", "2027-03-03 17:00"], ["dinsdag 3 maart 2027", "not-understood"], ["afgelopen vrijdag", "not-understood"], ["vorige maandag", "not-understood"],
-    ["na vrijdag", "not-understood"], ["voor 5 uur", "not-understood"], ["zet een wekker voor morgen om kwart over zeven", "2026-11-19 07:15"], ["twee dagen geleden", "not-understood"]
+    ["na vrijdag", "not-understood"], ["voor 5 uur", "not-understood"], ["zet een wekker voor morgen om kwart over zeven", "not-understood"], ["morgen om kwart over zeven", "2026-11-19 07:15"], ["twee dagen geleden", "not-understood"]
   ]
   for (const [t, want] of nl) it(`nl "${t}"`, () => expect(date(t, "nl")).toBe(want))
 })
@@ -145,9 +146,10 @@ describe("finding 11: a recurrence with a part it does not build is refused", ()
     it(`"${t}"`, () => expect(rec(t)).toBe("not-understood"))
   for (const t of ["elke dag behalve in het weekend", "elke dag tot 1 december", "elke maandag 3 keer", "elke dag om 25:00", "elke dag vanaf morgen"])
     it(`nl "${t}"`, () => expect(rec(t, "nl")).toBe("not-understood"))
-  it("a title around the rule is fine", () => {
-    expect(rec("take 2 pills every day at 8 am")).toBe("FREQ=DAILY @ 20261119T080000")
-    expect(rec("remind me every Monday to put the bins out")).toBe("FREQ=WEEKLY;BYDAY=MO @ 20261123T090000")
+  it("a title around the rule is not read (round 2: the caller passes the recurrence phrase alone)", () => {
+    expect(rec("take 2 pills every day at 8 am")).toBe("not-understood")
+    expect(rec("remind me every Monday to put the bins out")).toBe("not-understood")
+    expect(rec("every day at 8 am")).toBe("FREQ=DAILY @ 20261119T080000")
   })
 })
 
@@ -186,99 +188,87 @@ describe("finding 13: a part of the day sets the clock", () => {
 })
 
 describe("finding 14 (kept): a time the clocks skip, by RFC 5545 §3.3.10 and §3.3.5", () => {
-  it("a daily 02:30 in Amsterdam is 03:30 on the day the clocks go forward, and a repeated time is the first one, after the switch to ical.js", () => {
+  it("a daily 02:30 in Amsterdam is 03:30 on the day the clocks go forward, and a repeated time is the first one", () => {
     expect(list(spec("FREQ=DAILY", "2027-03-26T02:30"), ams(2027, 3, 26, 12), 3)).toEqual(["2027-03-27T02:30", "2027-03-28T03:30", "2027-03-29T02:30"])
     expect(occurrencesAfter(spec("FREQ=DAILY", "2026-10-24T02:30"), ams(2026, 10, 24, 12), 1).map((t) => new Date(t).toISOString())).toEqual(["2026-10-25T00:30:00.000Z"])
   })
-  it("a wall-clock hourly rule on the jump day gives the skipped hour once, at 03:00", () => {
-    const got = occurrencesAfter(spec("FREQ=HOURLY;BYMINUTE=0", "2027-03-28T00:00"), ams(2027, 3, 27, 23, 30), 4).map((t) => new Date(t).toISOString())
-    expect(got).toEqual(["2027-03-27T23:00:00.000Z", "2027-03-28T00:00:00.000Z", "2027-03-28T01:00:00.000Z", "2027-03-28T02:00:00.000Z"])
+  it("wall-clock hourly rules are no longer offered (round 2)", () => {
+    expect(parseRRule("FREQ=HOURLY;BYMINUTE=0").kind).toBe("unsupported")
   })
 })
-
-describe("finding 15: yearly selectors cover the whole year", () => {
-  it("BYMONTHDAY in a yearly rule is every month's", () => {
-    expect(list(spec("FREQ=YEARLY;BYMONTHDAY=1", "2026-11-01T09:00"), ams(2026, 11, 2), 3)).toEqual(["2026-12-01T09:00", "2027-01-01T09:00", "2027-02-01T09:00"])
-  })
-  it("ordinal weekdays without BYMONTH count in the year", () => {
-    expect(list(spec("FREQ=YEARLY;BYDAY=20MO", "2026-05-18T09:00"), ams(2026, 5, 19), 2)).toEqual(["2027-05-17T09:00", "2028-05-15T09:00"])
-    expect(list(spec("FREQ=YEARLY;BYDAY=1MO,-1FR", "2026-01-05T09:00"), ams(2026, 1, 6), 3)).toEqual(["2026-12-25T09:00", "2027-01-04T09:00", "2027-12-31T09:00"])
-  })
-  it("ordinal weekdays with BYMONTH count in the month; several months and days", () => {
-    expect(list(spec("FREQ=YEARLY;BYMONTH=5;BYDAY=2SU", "2026-05-10T09:00"), ams(2026, 5, 11), 2)).toEqual(["2027-05-09T09:00", "2028-05-14T09:00"])
-    expect(list(spec("FREQ=YEARLY;BYMONTH=1,2;BYMONTHDAY=1,15", "2026-01-01T09:00"), ams(2026, 1, 2), 4)).toEqual(["2026-01-15T09:00", "2026-02-01T09:00", "2026-02-15T09:00", "2027-01-01T09:00"])
-    expect(list(spec("FREQ=YEARLY;INTERVAL=2;BYMONTH=3;BYDAY=-1SU", "2026-03-29T09:00"), ams(2026, 3, 30), 2)).toEqual(["2028-03-26T09:00", "2030-03-31T09:00"])
+describe("finding 15: yearly rules", () => {
+  it("the yearly shapes RFC 5545 gives another meaning are refused (round 2): BYMONTHDAY alone, ordinal weekdays, several months, plain weekdays", () => {
+    for (const r of ["FREQ=YEARLY;BYMONTHDAY=1", "FREQ=YEARLY;BYDAY=20MO", "FREQ=YEARLY;BYDAY=1MO,-1FR", "FREQ=YEARLY;BYMONTH=5;BYDAY=2SU", "FREQ=YEARLY;BYMONTH=1,2;BYMONTHDAY=1,15", "FREQ=YEARLY;BYDAY=MO"])
+      expect(parseRRule(r).kind, r).toBe("unsupported")
   })
   it("a plain yearly rule from 29 February is every leap year's 29 February", () => {
     expect(list(spec("FREQ=YEARLY", "2024-02-29T09:00"), ams(2024, 3, 1), 2)).toEqual(["2028-02-29T09:00", "2032-02-29T09:00"])
   })
-  it("plain weekdays in a yearly rule are every such weekday", () => {
-    expect(list(spec("FREQ=YEARLY;BYDAY=MO", "2026-11-02T09:00"), ams(2026, 11, 2, 10), 2)).toEqual(["2026-11-09T09:00", "2026-11-16T09:00"])
+  it("a month and a day; a month with DTSTART's day", () => {
+    expect(list(spec("FREQ=YEARLY;INTERVAL=2;BYMONTH=3;BYMONTHDAY=29", "2026-03-29T09:00"), ams(2026, 3, 30), 2)).toEqual(["2028-03-29T09:00", "2030-03-29T09:00"])
+    expect(list(spec("FREQ=YEARLY;BYMONTH=3", "2026-03-03T09:00"), ams(2026, 3, 4), 2)).toEqual(["2027-03-03T09:00", "2028-03-03T09:00"])
   })
 })
-
-describe("finding 16: HOURLY and MINUTELY honour BYMONTHDAY", () => {
-  it("only on the first of the month", () => {
-    expect(list(spec("FREQ=HOURLY;BYMONTHDAY=1", "2026-11-01T09:00"), ams(2026, 11, 2), 2)).toEqual(["2026-12-01T00:00", "2026-12-01T01:00"])
-    expect(list(spec("FREQ=MINUTELY;INTERVAL=30;BYMONTHDAY=1", "2026-11-01T09:00"), ams(2026, 11, 2), 2)).toEqual(["2026-12-01T00:00", "2026-12-01T00:30"])
+describe("finding 16: HOURLY and MINUTELY are no longer offered (round 2)", () => {
+  it("are unsupported and have no occurrences", () => {
+    for (const r of ["FREQ=HOURLY;BYMONTHDAY=1", "FREQ=MINUTELY;INTERVAL=30;BYMONTHDAY=1"]) {
+      expect(parseRRule(r).kind).toBe("unsupported")
+      expect(list(spec(r, "2026-11-01T09:00"), ams(2026, 11, 2), 2)).toEqual([])
+    }
   })
 })
-
 describe("finding 17: long series have no iteration cap", () => {
-  it("a minutely series of 10000 still runs on the 7th, and ends at its last occurrence", () => {
-    const s = spec("FREQ=MINUTELY;COUNT=10000", "2026-11-01T09:00")
-    expect(list(s, ams(2026, 11, 7), 1)).toEqual(["2026-11-07T00:01"])
-    const last = ams(2026, 11, 1, 9) + 9999 * 60_000
-    expect(nextOccurrence(s, last - 1)).toBe(last)
-    expect(nextOccurrence(s, last)).toBeUndefined()
+  it("a daily series of 1000 runs to its last occurrence and ends there", () => {
+    const s = spec("FREQ=DAILY;COUNT=1000", "2026-11-01T09:00")
+    const last = occurrencesAfter(s, ams(2029, 7, 27), 5)
+    expect(last.map(iso)).toEqual(["2029-07-27T09:00"])
+    expect(nextOccurrence(s, last[0]!)).toBeUndefined()
   })
-  it("years into an unbounded series is quick", () => {
+  it("decades into an unbounded series is quick", () => {
     const t0 = performance.now()
-    expect(list(spec("FREQ=MINUTELY", "2000-01-01T00:00"), ams(2026, 11, 18, 10, 0), 1)).toEqual(["2026-11-18T10:01"])
-    expect(list(spec("FREQ=MINUTELY;BYHOUR=9", "2016-01-01T09:00"), ams(2026, 11, 18, 10, 0), 1)).toEqual(["2026-11-19T09:00"])
-    expect(list(spec("FREQ=HOURLY;INTERVAL=5;BYDAY=MO", "2000-01-03T00:00"), ams(2026, 11, 18, 10, 0), 1).length).toBe(1)
     expect(list(spec("FREQ=DAILY", "1990-01-01T07:00"), ams(2026, 11, 18, 10, 0), 1)).toEqual(["2026-11-19T07:00"])
+    expect(list(spec("FREQ=WEEKLY;BYDAY=MO", "1990-01-01T07:00"), ams(2026, 11, 18, 10, 0), 1)).toEqual(["2026-11-23T07:00"])
+    expect(list(spec("FREQ=MONTHLY;BYDAY=-1FR", "1990-01-26T07:00"), ams(2026, 11, 18, 10, 0), 1)).toEqual(["2026-11-27T07:00"])
+    expect(list(spec("FREQ=DAILY", "1990-01-01T07:00"), ams(9000, 1, 1, 10, 0), 1)).toEqual(["9000-01-02T07:00"])
     expect(performance.now() - t0).toBeLessThan(1500)
   })
 })
-
 describe("finding 18: DTSTART keeps its meaning", () => {
-  it("UTC, seconds, and dates that do not exist", () => {
-    expect(parseDtstart("DTSTART:20261120T080000Z")).toEqual({ start: { year: 2026, month: 11, day: 20, hour: 8, minute: 0, second: 0 }, utc: true })
-    expect(parseDtstart("DTSTART:20261120T090030")?.start.second).toBe(30)
-    expect(parseDtstart("2026-11-20T09:00:30")?.start.second).toBe(30)
-    for (const bad of ["2026-02-30T09:00", "20260230T090000", "2026-11-20T25:00", "2026-11-20T09:60", "2026-13-01T09:00", "DTSTART;TZID=Europe/Amsterdam:20261120T090000Z", "2026-1120T09:00", "DTSTART;FOO=1:20261120T090000"])
+  it("only a zoned local date-time is read; dates that do not exist are refused", () => {
+    expect(parseDtstart("DTSTART;TZID=Europe/Amsterdam:20261120T090030")?.start.second).toBe(30)
+    for (const bad of ["DTSTART:20261120T080000Z", "DTSTART;VALUE=DATE:20261120", "2026-11-20T09:00:30", "DTSTART;TZID=Europe/Amsterdam:20260230T090000", "DTSTART;TZID=Europe/Amsterdam:20261120T250000",
+      "DTSTART;TZID=Europe/Amsterdam:20261120T090000Z", "DTSTART;FOO=1:20261120T090000", "DTSTART;TZID=Mars/Olympus:20261120T090000"])
       expect(parseDtstart(bad), bad).toBeUndefined()
-    expect(parseDtstart("DTSTART;VALUE=DATE:20261120")).toEqual({ start: { year: 2026, month: 11, day: 20, hour: 0, minute: 0, second: 0 }, dateOnly: true })
   })
-  it("a UTC start runs in UTC; seconds are kept in the occurrences", () => {
-    expect(occurrencesAfter(spec("FREQ=DAILY", "DTSTART:20270327T080000Z"), Date.UTC(2027, 2, 27, 9), 2).map((t) => new Date(t).toISOString())).toEqual(["2027-03-28T08:00:00.000Z", "2027-03-29T08:00:00.000Z"])
-    expect(new Date(nextOccurrence(spec("FREQ=DAILY", "DTSTART:20261120T090030"), ams(2026, 11, 20, 10))!).toISOString()).toBe("2026-11-21T08:00:30.000Z")
+  it("seconds are kept in the occurrences", () => {
+    expect(new Date(nextOccurrence(spec("FREQ=DAILY", "DTSTART;TZID=Europe/Amsterdam:20261120T090030"), ams(2026, 11, 20, 10))!).toISOString()).toBe("2026-11-21T08:00:30.000Z")
   })
   it("a TZID that disagrees with the zone gives no occurrence; one that agrees (in any spelling) does", () => {
     expect(nextOccurrence(spec("FREQ=DAILY", "DTSTART;TZID=America/New_York:20261120T090000"), 0)).toBeUndefined()
     expect(nextOccurrence(spec("FREQ=DAILY", "DTSTART;TZID=europe/amsterdam:20261120T090000"), ams(2026, 11, 20, 10))).toBe(ams(2026, 11, 21, 9))
   })
 })
-
 describe("finding 19: only valid rules are read", () => {
-  for (const bad of ["FREQ=DAILY;BYDAY=0MO", "FREQ=WEEKLY;BYDAY=2TU", "FREQ=DAILY;BYDAY=1MO", "FREQ=DAILY;FREQ=WEEKLY", "FREQ=DAILY;INTERVAL=2;INTERVAL=3", "FREQ=DAILY;COUNT=3;UNTIL=20270101",
+  for (const bad of ["FREQ=DAILY;BYDAY=0MO", "FREQ=WEEKLY;BYDAY=2TU", "FREQ=DAILY;BYDAY=1MO", "FREQ=DAILY;FREQ=WEEKLY", "FREQ=DAILY;INTERVAL=2;INTERVAL=3", "FREQ=DAILY;COUNT=3;UNTIL=20270101T000000Z",
     "FREQ=DAILY;INTERVAL=1e3", "FREQ=DAILY;INTERVAL=+2", "FREQ=DAILY;INTERVAL=0x10", "FREQ=DAILY;COUNT=0", "FREQ=DAILY;COUNT=1.5", "FREQ=MONTHLY;BYDAY=6MO", "FREQ=YEARLY;BYDAY=54MO",
-    "FREQ=MONTHLY;BYMONTHDAY=32", "FREQ=MONTHLY;BYMONTHDAY=1,1", "FREQ=YEARLY;BYMONTH=2;BYMONTHDAY=30", "FREQ=WEEKLY;BYMONTHDAY=1", "FREQ=MONTHLY;BYSETPOS=1", "FREQ=DAILY;BYSETPOS=1;BYHOUR=9",
-    "FREQ=SECONDLY", "FREQ=DAILY;BYSECOND=5", "FREQ=YEARLY;BYWEEKNO=20", "FREQ=YEARLY;BYYEARDAY=100", "FREQ=DAILY;X-NAME=1", "FREQ=DAILY;UNTIL=20270230", "FREQ=DAILY;BYHOUR=24",
-    "FREQ=DAILY;BYHOUR=-1", "FREQ=DAILY;WKST=XX", "FREQ=DAILY;", "FREQ=DAILY;;COUNT=2", "FREQ=YEARLY;BYDAY=20MO;BYMONTHDAY=1", "FREQ=MONTHLY;BYMONTH=10;BYMONTHDAY=13;BYDAY=FR"])
-    it(`rejects "${bad}"`, () => expect(parseRRule(bad)).toBeUndefined())
+    "FREQ=MONTHLY;BYMONTHDAY=32", "FREQ=MONTHLY;BYMONTHDAY=1,1", "FREQ=YEARLY;BYMONTH=2;BYMONTHDAY=30", "FREQ=WEEKLY;BYMONTHDAY=1", "FREQ=DAILY;UNTIL=20270230T000000Z",
+    "FREQ=DAILY;WKST=XX", "FREQ=DAILY;", "FREQ=DAILY;;COUNT=2"])
+    it(`"${bad}" is invalid`, () => expect(parseRRule(bad).kind).toBe("invalid"))
+  for (const other of ["FREQ=MONTHLY;BYSETPOS=1", "FREQ=DAILY;BYSETPOS=1;BYHOUR=9", "FREQ=SECONDLY", "FREQ=DAILY;BYSECOND=5", "FREQ=YEARLY;BYWEEKNO=20", "FREQ=YEARLY;BYYEARDAY=100",
+    "FREQ=DAILY;X-NAME=1", "FREQ=DAILY;BYHOUR=9", "FREQ=YEARLY;BYDAY=20MO;BYMONTHDAY=1", "FREQ=MONTHLY;BYMONTH=10;BYMONTHDAY=13;BYDAY=FR", "FREQ=DAILY;UNTIL=20271231"])
+    it(`"${other}" is unsupported`, () => expect(parseRRule(other).kind).toBe("unsupported"))
   it("valid rules round-trip", () => {
-    for (const good of ["FREQ=MONTHLY;INTERVAL=2;BYDAY=-1FR,2TU;COUNT=6", "FREQ=WEEKLY;INTERVAL=2;BYDAY=TU,SU;WKST=SU", "FREQ=MONTHLY;BYDAY=MO,TU,WE,TH,FR;BYSETPOS=-1", "FREQ=DAILY;BYHOUR=9,17;BYMINUTE=0,30",
-      "FREQ=YEARLY;BYDAY=20MO", "FREQ=DAILY;UNTIL=20271231T230000Z", "FREQ=MONTHLY;BYMONTHDAY=13;BYDAY=FR"])
-      expect(formatRRule(parseRRule(good)!)).toBe(good)
-    expect(formatRRule(parseRRule("freq=weekly;byday=mo")!)).toBe("FREQ=WEEKLY;BYDAY=MO")
+    for (const good of ["FREQ=MONTHLY;INTERVAL=2;BYDAY=-1FR;COUNT=6", "FREQ=WEEKLY;INTERVAL=2;BYDAY=TU,SU", "FREQ=DAILY;UNTIL=20271231T230000Z", "FREQ=MONTHLY;BYMONTHDAY=1,15,-1", "FREQ=YEARLY;BYMONTH=2;BYMONTHDAY=29"]) {
+      const r = parseRRule(good)
+      expect(r.kind === "ok" && formatRRule(r.rule)).toBe(good)
+    }
+    const lower = parseRRule("freq=weekly;byday=mo")
+    expect(lower.kind === "ok" && formatRRule(lower.rule)).toBe("FREQ=WEEKLY;BYDAY=MO")
   })
   it("a rule that never occurs has no occurrence", () => {
     expect(nextOccurrence(spec("FREQ=MONTHLY;BYMONTH=2", "2026-01-31T09:00"), 0)).toBeUndefined()
   })
 })
-
 describe("finding 20: a description says every constraint or nothing", () => {
   for (const r of ["FREQ=MONTHLY;INTERVAL=2;BYDAY=MO", "FREQ=YEARLY;BYMONTH=1,2;BYMONTHDAY=1,15", "FREQ=DAILY;BYMONTH=3", "FREQ=DAILY;BYMONTHDAY=1", "FREQ=WEEKLY;BYMONTH=6;BYDAY=MO",
     "FREQ=DAILY;BYHOUR=9", "FREQ=MONTHLY;BYDAY=MO,TU,WE,TH,FR;BYSETPOS=-1", "FREQ=YEARLY;BYMONTHDAY=1", "FREQ=MONTHLY;BYDAY=-2FR", "FREQ=DAILY;INTERVAL=2;BYDAY=MO",
@@ -288,17 +278,14 @@ describe("finding 20: a description says every constraint or nothing", () => {
       expect(describeRRule(r, "nl")).toBeUndefined()
     })
   it("what it can say, it says whole", () => {
-    expect(describeRRule("FREQ=MONTHLY;BYDAY=MO", "en")).toBe("every Monday")
-    expect(describeRRule("FREQ=YEARLY;BYMONTH=5;BYDAY=2SU", "en")).toBe("every year on the second Sunday of May")
-    expect(describeRRule("FREQ=YEARLY;BYMONTH=5;BYDAY=2SU", "nl")).toBe("elk jaar op de tweede zondag van mei")
-    expect(describeRRule("FREQ=MONTHLY;BYDAY=1MO,3MO", "en")).toBe("the first Monday and third Monday of every month")
-    expect(describeRRule("FREQ=DAILY;BYDAY=MO,WE", "en")).toBe("every Monday and Wednesday")
-    expect(describeRRule("FREQ=WEEKLY;BYDAY=TU,SU;WKST=SU", "en")).toBe("every Tuesday and Sunday")
+    expect(describeRRule("FREQ=MONTHLY;BYDAY=2TU", "en")).toBe("the second Tuesday of every month")
+    expect(describeRRule("FREQ=MONTHLY;BYDAY=2TU", "nl")).toBe("de tweede dinsdag van elke maand")
+    expect(describeRRule("FREQ=WEEKLY;BYDAY=TU,SU", "en")).toBe("every Tuesday and Sunday")
+    expect(describeRRule("FREQ=DAILY;UNTIL=20271231T230000Z", "en", { timeZone: AMS })).toBe("every day, until 1 January 2028 at 00:00")
     expect(describeRRule("FREQ=YEARLY;BYMONTH=3", "en", { start: { year: 2027, month: 3, day: 3 } })).toBe("every year on the third of March")
     expect(describeRRule("FREQ=YEARLY;BYMONTH=3", "en")).toBeUndefined()
   })
 })
-
 describe("finding 21: an unknown zone is never another zone", () => {
   it("parsers answer not-understood, whether UTC was used before or not", () => {
     expect(parseDateTime("tomorrow at 5 pm", "en", { now: NOW, timeZone: "Mars/Olympus" }).kind).toBe("not-understood")
@@ -352,14 +339,13 @@ describe("finding 28: said is the text as written", () => {
     const r = parseRecurrence(t, lang, ropts)
     return r.kind === "ok" ? r.said : r.kind
   }
-  it("covers the whole rule, with fillers and the time", () => {
+  it("is the whole phrase", () => {
     expect(said("every month on the 15th")).toBe("every month on the 15th")
     expect(said("on the 15th of every month at 9 am")).toBe("on the 15th of every month at 9 am")
-    expect(said("remind me every Monday and Friday at half past seven please")).toBe("every Monday and Friday at half past seven")
+    expect(said(" every Monday and Friday at half past seven ")).toBe("every Monday and Friday at half past seven")
     expect(said("op de laatste dag van de maand", "nl")).toBe("op de laatste dag van de maand")
   })
 })
-
 describe("beyond the list: found while re-reading", () => {
   it("an alternative, an unread clock time or a second date is not dropped", () => {
     for (const t of ["tomorrow at 5 maybe 6", "tomorrow at 25", "tomorrow at half past", "tomorrow and the day after", "between 5 and 6 tomorrow", "2 days from now", "the 3rd of next month"])

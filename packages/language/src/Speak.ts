@@ -5,12 +5,20 @@ import { monthNames, numberToWords, ordinalToWords, weekdayNames } from "./Words
 import { dayDiff, isoWeekday } from "./Zoned.ts"
 
 /**
+ * The numbers `speakNumber` says: 0, and every number whose size is from `minSpoken` to below `maxSpoken`. Others are said as ""
+ * (nothing to say), never as a different number.
+ */
+export const minSpoken = 1e-90
+export const maxSpoken = 1e21
+
+/**
  * The decimals a number is said with: two, or as many as its first two significant digits need when it is below 1 (0.001 is
- * "0.001", 0.000123 is "0.00012"), at most ten. A nonzero number is never said as 0 (review round 1, finding 22).
+ * "0.001", 0.000123 is "0.00012", 1e-11 is "0.00000000001"). A nonzero number is never said as 0 (review round 1, finding 22;
+ * round 2, finding 21).
  */
 const decimalsFor = (v: number): number => {
   if (v === 0 || v >= 1) return 2
-  return Math.min(10, Math.max(2, 1 - Math.floor(Math.log10(v))))
+  return Math.max(2, 1 - Math.floor(Math.log10(v)))
 }
 /** `v` (not negative) as digits with at most `decimals` decimals, trailing zeros dropped: "2.5", "0.001", "12". */
 const digitsOf = (v: number, decimals: number): { whole: string; fraction: string } => {
@@ -27,6 +35,7 @@ const digitsOf = (v: number, decimals: number): { whole: string; fraction: strin
 export const speakNumber = (n: number, language: Language, options: { readonly words?: boolean } = {}): string => {
   if (!Number.isFinite(n)) return ""
   const abs = Math.abs(n)
+  if (abs !== 0 && (abs < minSpoken || abs >= maxSpoken)) return ""
   const { whole, fraction } = digitsOf(abs, decimalsFor(abs))
   const sign = n < 0 && (whole !== "0" || fraction !== "") ? (language === "en" ? "minus " : "min ") : ""
   if (options.words !== true) return `${sign}${whole}${fraction === "" ? "" : (language === "en" ? "." : ",") + fraction}`
@@ -98,7 +107,7 @@ export const speakAmount = (q: AmountLike, language: Language, options: SpeakAmo
   const names = unitNames[language][unit]
   if (names === undefined) return `${speakNumber(amount, language)} ${String(unit)}${item === undefined ? "" : " " + item}`
   // Singular or plural by what is said: "1 gram", "1.004" is said "1" too.
-  const one = (x: number) => speakNumber(x, language) === "1"
+  const one = (x: number) => speakNumber(Math.abs(x), language) === "1"
   if (unit === "piece") {
     const count = `${q.approx === true ? (language === "en" ? "about " : "ongeveer ") : ""}${speakNumber(amount, language)}`
     return item !== undefined ? `${count} ${item}` : `${count} ${one(amount) ? names.one : names.many}`

@@ -1,26 +1,36 @@
 import type { ClockTime, LocalDate, LocalDateTime } from "./Result.ts"
 
+/** The years this package computes with: four digits. A date outside them is not valid (`isValidLocal`), never moved into them. */
+export const minYear = 1000
+export const maxYear = 9999
+
 const formatters = new Map<string, Intl.DateTimeFormat>()
 const canonical = new Map<string, string | undefined>()
 
+/** An IANA zone name ("Europe/Amsterdam", "UTC", "Etc/GMT-1"), not a fixed offset such as "+01:00" (review round 2, finding 24). */
+const ianaName = /^[A-Za-z][A-Za-z0-9_+\-]*(?:\/[A-Za-z0-9_+\-]+)*$/
+
 /**
  * The IANA zone `timeZone` names, in its canonical spelling ("europe/amsterdam " → "Europe/Amsterdam"), or `undefined` when this
- * machine does not know it. Surrounding spaces are ignored (the Home section stores what was typed). Never substitutes another
- * zone: a parser given an unknown zone answers `not-understood`, and `nextOccurrence` answers `undefined` (review round 1, finding 21).
+ * machine does not know it or it is a fixed offset ("+01:00", "+0100", "-05"): those are not zone names, cannot be written as a
+ * `TZID` and are not accepted anywhere in this package. Surrounding spaces are ignored (the Home section stores what was typed).
+ * Never substitutes another zone: a parser given an unknown zone answers `not-understood`, and `nextOccurrence` answers `undefined`.
  */
 export const normalizeTimeZone = (timeZone: string): string | undefined => {
   if (typeof timeZone !== "string") return undefined
   if (canonical.has(timeZone)) return canonical.get(timeZone)
   const trimmed = timeZone.trim()
   let found: string | undefined
-  if (trimmed !== "") {
+  if (trimmed !== "" && ianaName.test(trimmed)) {
     try {
       const resolved = new Intl.DateTimeFormat("en-US", { timeZone: trimmed }).resolvedOptions().timeZone
-      found = resolved
-      if (!formatters.has(resolved)) {
-        formatters.set(resolved, new Intl.DateTimeFormat("en-US", {
-          timeZone: resolved, hourCycle: "h23", year: "numeric", month: "numeric", day: "numeric", hour: "numeric", minute: "numeric", second: "numeric"
-        }))
+      if (ianaName.test(resolved)) {
+        found = resolved
+        if (!formatters.has(resolved)) {
+          formatters.set(resolved, new Intl.DateTimeFormat("en-US", {
+            timeZone: resolved, hourCycle: "h23", era: "short", year: "numeric", month: "numeric", day: "numeric", hour: "numeric", minute: "numeric", second: "numeric"
+          }))
+        }
       }
     } catch {
       found = undefined
@@ -37,11 +47,44 @@ const formatterOf = (timeZone: string): Intl.DateTimeFormat => {
   return formatters.get(zone)!
 }
 
+// ---- civil calendar arithmetic (proleptic Gregorian, any year; no Date.UTC, which reads years 0–99 as 1900–1999) ----------------
+
+/** Days since 1970-01-01 of a calendar date (H. Hinnant's `days_from_civil`). */
+export const dayNumber = (year: number, month: number, day: number): number => {
+  const y = month <= 2 ? year - 1 : year
+  const era = Math.floor(y / 400)
+  const yoe = y - era * 400
+  const mp = (month + 9) % 12
+  const doy = Math.floor((153 * mp + 2) / 5) + day - 1
+  const doe = yoe * 365 + Math.floor(yoe / 4) - Math.floor(yoe / 100) + doy
+  return era * 146_097 + doe - 719_468
+}
+
+/** The calendar date of a day number (`civil_from_days`). */
+export const dateOfDay = (n: number): LocalDate => {
+  const z = n + 719_468
+  const era = Math.floor(z / 146_097)
+  const doe = z - era * 146_097
+  const yoe = Math.floor((doe - Math.floor(doe / 1460) + Math.floor(doe / 36_524) - Math.floor(doe / 146_096)) / 365)
+  const doy = doe - (365 * yoe + Math.floor(yoe / 4) - Math.floor(yoe / 100))
+  const mp = Math.floor((5 * doy + 2) / 153)
+  const day = doy - Math.floor((153 * mp + 2) / 5) + 1
+  const month = mp < 10 ? mp + 3 : mp - 9
+  return { year: yoe + era * 400 + (month <= 2 ? 1 : 0), month, day }
+}
+
+const dayMs = 86_400_000
+/** Milliseconds since the epoch of a wall-clock reading taken as UTC. */
+const wallMs = (t: LocalDate & Partial<ClockTime> & { readonly second?: number }): number =>
+  dayNumber(t.year, t.month, t.day) * dayMs + ((t.hour ?? 0) * 3600 + (t.minute ?? 0) * 60 + (t.second ?? 0)) * 1000
+
 /** The offset (zone minus UTC) in milliseconds at an instant. Throws a `RangeError` for a zone this machine does not know. */
 export const offsetAt = (instant: number, timeZone: string): number => {
   const parts = formatterOf(timeZone).formatToParts(new Date(instant))
   const get = (t: string) => Number(parts.find((p) => p.type === t)!.value)
-  const asUtc = Date.UTC(get("year"), get("month") - 1, get("day"), get("hour"), get("minute"), get("second"))
+  const bc = parts.find((p) => p.type === "era")?.value === "BC"
+  const year = bc ? 1 - get("year") : get("year")
+  const asUtc = wallMs({ year, month: get("month"), day: get("day"), hour: get("hour"), minute: get("minute"), second: get("second") })
   return asUtc - Math.floor(instant / 1000) * 1000
 }
 
@@ -51,55 +94,64 @@ export interface ZonedParts extends LocalDateTime {
   readonly weekday: number
 }
 
-export const isoWeekday = (d: LocalDate): number => {
-  const w = new Date(Date.UTC(d.year, d.month - 1, d.day)).getUTCDay()
-  return w === 0 ? 7 : w
-}
+/** 1 = Monday … 7 = Sunday, of a day number. */
+export const weekdayOfDay = (n: number): number => ((((n + 3) % 7) + 7) % 7) + 1
+
+export const isoWeekday = (d: LocalDate): number => weekdayOfDay(dayNumber(d.year, d.month, d.day))
 
 /** The wall-clock reading of an instant in a zone. */
 export const localParts = (instant: number, timeZone: string): ZonedParts => {
-  const local = new Date(instant + offsetAt(instant, timeZone))
-  const d = { year: local.getUTCFullYear(), month: local.getUTCMonth() + 1, day: local.getUTCDate() }
-  return { ...d, hour: local.getUTCHours(), minute: local.getUTCMinutes(), second: local.getUTCSeconds(), weekday: isoWeekday(d) }
+  const local = instant + offsetAt(instant, timeZone)
+  const n = Math.floor(local / dayMs)
+  const d = dateOfDay(n)
+  const s = Math.floor((local - n * dayMs) / 1000)
+  return { ...d, hour: Math.floor(s / 3600), minute: Math.floor((s % 3600) / 60), second: s % 60, weekday: weekdayOfDay(n) }
 }
 
 /**
- * The instant of a wall-clock time in a zone. A time that does not exist (the clocks jumped over it) is read with the UTC offset
- * from before the jump, so it moves forward by the jump (02:30 on the spring day in Amsterdam is 03:30). That is RFC 5545 §3.3.5
- * ("a nonexistent local time ... is interpreted using the UTC offset before the gap"), which §3.3.10 applies to recurrence
- * instances too, and it is what a household wants from an alarm. A time that happens twice (autumn) is the first one. Throws a
- * `RangeError` for a zone this machine does not know.
+ * Every instant at which a wall-clock time happens in a zone, earliest first: one, two when the clocks go back over it (autumn), or
+ * — when the clocks jump over it — the one read with the UTC offset from before the jump (RFC 5545 §3.3.5: "a nonexistent local
+ * time ... is interpreted using the UTC offset before the gap"), so 02:30 on the spring day in Amsterdam is 03:30.
  */
-export const zonedToInstant = (t: LocalDate & Partial<ClockTime> & { readonly second?: number }, timeZone: string): number => {
-  const wall = Date.UTC(t.year, t.month - 1, t.day, t.hour ?? 0, t.minute ?? 0, t.second ?? 0)
-  const before = offsetAt(wall - 86_400_000, timeZone)
-  const after = offsetAt(wall + 86_400_000, timeZone)
+export const zonedInstants = (t: LocalDate & Partial<ClockTime> & { readonly second?: number }, timeZone: string): Array<number> => {
+  const wall = wallMs(t)
+  const before = offsetAt(wall - dayMs, timeZone)
+  const after = offsetAt(wall + dayMs, timeZone)
   const valid = [...new Set([before, after])].filter((o) => offsetAt(wall - o, timeZone) === o)
-  if (valid.length === 0) return wall - before
-  return wall - Math.max(...valid)
+  if (valid.length === 0) return [wall - before]
+  return valid.map((o) => wall - o).sort((a, b) => a - b)
 }
 
-export const daysInMonth = (year: number, month: number): number => new Date(Date.UTC(year, month, 0)).getUTCDate()
+/**
+ * The instant of a wall-clock time in a zone: the first of `zonedInstants`. A time that does not exist moves forward by the jump; a
+ * time that happens twice is the first one. RFC 5545 §3.3.10 applies the same reading to recurrence instances. Throws a `RangeError`
+ * for a zone this machine does not know.
+ */
+export const zonedToInstant = (t: LocalDate & Partial<ClockTime> & { readonly second?: number }, timeZone: string): number => zonedInstants(t, timeZone)[0]!
 
-export const addDays = (d: LocalDate, n: number): LocalDate => {
-  const x = new Date(Date.UTC(d.year, d.month - 1, d.day + n))
-  return { year: x.getUTCFullYear(), month: x.getUTCMonth() + 1, day: x.getUTCDate() }
-}
+const isLeap = (y: number): boolean => (y % 4 === 0 && y % 100 !== 0) || y % 400 === 0
+export const daysInMonth = (year: number, month: number): number =>
+  month === 2 ? (isLeap(year) ? 29 : 28) : month === 4 || month === 6 || month === 9 || month === 11 ? 30 : 31
+
+export const addDays = (d: LocalDate, n: number): LocalDate => dateOfDay(dayNumber(d.year, d.month, d.day) + n)
 
 export const addMonths = (d: LocalDate, n: number): { year: number; month: number } => {
   const idx = d.year * 12 + (d.month - 1) + n
-  return { year: Math.floor(idx / 12), month: (idx % 12 + 12) % 12 + 1 }
+  return { year: Math.floor(idx / 12), month: ((idx % 12) + 12) % 12 + 1 }
 }
 
 /** Calendar days from `a` to `b`. */
-export const dayDiff = (a: LocalDate, b: LocalDate): number =>
-  Math.round((Date.UTC(b.year, b.month - 1, b.day) - Date.UTC(a.year, a.month - 1, a.day)) / 86_400_000)
+export const dayDiff = (a: LocalDate, b: LocalDate): number => dayNumber(b.year, b.month, b.day) - dayNumber(a.year, a.month, a.day)
 
 export const sameDate = (a: LocalDate, b: LocalDate): boolean => a.year === b.year && a.month === b.month && a.day === b.day
 
-/** A real calendar date and wall-clock reading: month 1–12, the day exists in that month, hour 0–23, minute and second 0–59. */
+/**
+ * A real calendar date and wall-clock reading in the supported years (`minYear`–`maxYear`, four digits): month 1–12, the day exists in
+ * that month, hour 0–23, minute and second 0–59. A year this package cannot represent is refused, never shifted (review round 2,
+ * finding 22).
+ */
 export const isValidLocal = (t: LocalDate & Partial<ClockTime> & { readonly second?: number }): boolean =>
-  Number.isInteger(t.year) && t.year >= 1 && t.year <= 9999 && Number.isInteger(t.month) && t.month >= 1 && t.month <= 12 &&
+  Number.isInteger(t.year) && t.year >= minYear && t.year <= maxYear && Number.isInteger(t.month) && t.month >= 1 && t.month <= 12 &&
   Number.isInteger(t.day) && t.day >= 1 && t.day <= daysInMonth(t.year, t.month) &&
   (t.hour === undefined || (Number.isInteger(t.hour) && t.hour >= 0 && t.hour <= 23)) &&
   (t.minute === undefined || (Number.isInteger(t.minute) && t.minute >= 0 && t.minute <= 59)) &&
@@ -108,7 +160,7 @@ export const isValidLocal = (t: LocalDate & Partial<ClockTime> & { readonly seco
 /**
  * "2026-11-18T09:00", "2026-11-18T09:00:30", "20261118T090030" or "20261118" → parts, seconds kept. One spelling per value
  * (both separators or neither); a date or time that does not exist ("2026-02-30", "25:00") is `undefined`, never normalised into
- * another one. A UTC "Z" suffix is not accepted here (see `parseDtstart`).
+ * another one.
  */
 export const parseLocalIso = (s: string): LocalDateTime | undefined => {
   const text = s.trim()
