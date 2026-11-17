@@ -8,7 +8,7 @@
   },
   "scripts": {
     "start": "pnpm --silent --filter @pva/assistant start",
-    "serve": "pnpm --silent --filter @pva/web build && pnpm --silent --filter @pva/assistant start serve",
+    "serve": "pnpm --silent --filter @pva/web build && (pnpm --silent --filter @pva/node bundle || echo \"voice node bundle not built: /node/* answers 404\") && pnpm --silent --filter @pva/assistant start serve",
     "download-models": "pnpm --silent --filter @pva/stt-sherpa download-models && pnpm --silent --filter @pva/tts-sherpa download",
     "check": "tsc -p tsconfig.json && tsc -p packages/protocol/tsconfig.json && pnpm --silent --filter @pva/web check && tsc -p docs/research/visualiser-investigation/lab/tsconfig.json",
     "test": "vitest run",

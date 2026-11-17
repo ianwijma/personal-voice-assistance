@@ -15,6 +15,9 @@ import type { SessionHub } from "./SessionHub.ts"
  * (docs/VOICE-PROVIDERS.md §5).
  */
 
+/** Requests under this path are the voice node's (`HttpOptions.node`). */
+export const NODE_PREFIX = "/node/"
+
 export class HttpError extends Schema.TaggedError<HttpError>()("HttpError", { message: Schema.String }) {}
 
 export interface HttpOptions {
@@ -44,6 +47,8 @@ export interface HttpOptions {
   readonly crossOriginIsolation?: boolean
   /** Requests under `/api/` (docs/VOICE-PROVIDERS.md §5), after the host check. Absent: they get the static 404. */
   readonly api?: (req: http.IncomingMessage, res: http.ServerResponse) => void
+  /** Requests under `/node/` (docs/VOICE-NODES.md §6.3: `makeNodeDist(...).handle`), after the host check. Absent: static 404. */
+  readonly node?: (req: http.IncomingMessage, res: http.ServerResponse) => void
 }
 
 export interface HttpServer {
@@ -305,6 +310,10 @@ export const startHttp = (options: HttpOptions): Effect.Effect<HttpServer, HttpE
         }
         if (options.api !== undefined && (req.url ?? "").startsWith(API_PREFIX)) {
           options.api(req, res)
+          return
+        }
+        if (options.node !== undefined && (req.url ?? "").startsWith(NODE_PREFIX)) {
+          options.node(req, res)
           return
         }
         serveStatic(options.webDir, options.crossOriginIsolation ?? true, req, res)
