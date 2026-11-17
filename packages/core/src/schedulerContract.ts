@@ -98,6 +98,27 @@ export const schedulerContract = (name: string, make: MakeJobStore) =>
         yield* s.close
       }))
 
+    it.effect("a handler that schedules its own successor under its key (an RRULE's next occurrence) finishes done", () =>
+      Effect.gen(function*() {
+        const { table } = yield* make()
+        const s = yield* engine(table)
+        const seen: Array<number> = []
+        yield* s.tm.handle("remind", Payload, (p, due) =>
+          Effect.andThen(
+            Effect.sync(() => seen.push(due.dueAt)),
+            Effect.asVoid(s.tm.schedule({ kind: "reminder", key: "reminder:r1", when: { at: due.dueAt + HOUR }, onDue: { handler: "remind", payload: p }, idempotent: true }))
+          )).pipe(Scope.provide(s.scope))
+        const first = yield* s.tm.schedule({ kind: "reminder", key: "reminder:r1", when: { at: HOUR }, onDue: { handler: "remind", payload: { n: 1 } }, idempotent: true })
+        yield* advance(3 * HOUR)
+        assert.deepStrictEqual(seen, [HOUR, 2 * HOUR, 3 * HOUR])
+        const done = yield* s.tm.get(first.id)
+        assert.strictEqual(done?.state, "done")
+        assert.strictEqual(done?.key, undefined)
+        const live = yield* s.tm.list({ key: "reminder:r1" })
+        assert.deepStrictEqual(live.map((j) => [j.state, j.dueAt]), [["scheduled", 4 * HOUR]])
+        yield* s.close
+      }))
+
     it.effect("pause keeps the time left; resume, reschedule and cancel", () =>
       Effect.gen(function*() {
         const { table } = yield* make()

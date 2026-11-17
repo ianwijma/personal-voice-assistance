@@ -383,6 +383,57 @@ EventBus = { publish(event); subscribe(filter?, { capacity? }); stats(); forModu
 - **Backups**: daily `data/backups/household-<date>.db` (14 kept, optional `HOUSEHOLD_BACKUP_COPY_DIR`), and `pnpm start
   household backup | export <module> | restore <file>`; `doctor` checks the database and the last backup's age.
 
+### Scheduler (docs/MODULES-PLAN.md §4 P6; how to use it: [docs/SCHEDULING.md](SCHEDULING.md))
+
+```ts
+ModuleScheduler (ctx.scheduler) = {
+  schedule({ kind: "timer" | "alarm" | "reminder" | "recurring" | "deferred", key?, label?,
+             when: { at } | { inMs } | { cron, timeZone? }, scope?, origin?,
+             onDue: { notify: NotificationRequest } | { handler, payload },
+             missed?: "fire-late" | "skip" | "inbox" | { fireIfWithinMs, otherwise?: "missed" | "inbox" },
+             idempotent?, retryLimit? }): Effect<JobRow, SchedulerError>
+  handle(name, payloadSchema, (payload, due: DueInfo) => Effect<void, unknown>, { timeoutMs? }?): Effect<void, never, Scope>
+  pause(id); resume(id); reschedule(id, when); cancel(id); list({ kind?, key?, scope?, states? }?); get(id)
+  runTask({ label, key?, scope?, origin?, work: Effect<A, E>, result?, onDone?(a): NotificationRequest, onFailed? }): Effect<JobRow>
+}
+JobRow = { id, module, kind, key?, label?, state: "scheduled" | "paused" | "running" | "done" | "cancelled" | "failed" | "missed",
+           dueAt?, remainingMs?, cron?, timeZone?, scope, origin, onDue?, missed, idempotent, retryLimit, attempts,
+           occurrenceAt?, waiting, lastRunAt?, lastError?, lastFailedAt?, delivered?, result?, skipped?, rev, … }
+DueInfo = { job, occurrenceKey: "<jobId>@<dueAt>", dueAt, lateByMs, attempt, inbox, skipped }
+NotificationDelivery = { deliver(request, { notificationId, lateByMs, inbox, job }): Effect<void, unknown> }   // P9 replaces it
+Scheduler (app) = { forModule(id); setDelivery(d); listAll(); cancelAny(id); counts }
+SchedulerError = { reason: "unavailable" | "invalid" | "not_found" | "state" | "conflict" | "failed", message }
+```
+
+- **Where**: `Scheduler.ts` (the contract), `SchedulerEngine.ts` (the engine), `JobTable.ts` (`core_scheduler__jobs` through
+  `store.core("scheduler")`, or an in-memory table on the in-memory store). Serve mode makes it on the household store
+  before the module host (`serve/scheduler.ts`) and passes it as `ModuleHostOptions.scheduler`; one line in the host's
+  `servicesFor` gives each version 2 module `ctx.scheduler = scheduler.forModule(id)`. The CLI modes have none: `handle`
+  succeeds, every other call fails `unavailable` (`closedModuleScheduler`).
+- **One fiber** sleeps until the earliest due time (an indexed one-row read), at most 10 s at a time, and is woken by
+  every change. Due times are absolute wall-clock ms; after each sleep it compares how far the wall clock and the
+  monotonic clock moved, and a jump makes it check again. `Cron` jobs are computed in their zone (default
+  `HOME_TIME_ZONE`, read at each computation), so DST does not move "7:00".
+- **Exactly once as far as one process can give it**: a due job is claimed (`scheduled → running`, compare-and-set on
+  `rev`) before its run starts in a fiber of its own (a slow handler never holds up the engine). Only an `idempotent`
+  handler, or a `{ notify }` job (redelivered under the same occurrence key), is run again for the same occurrence:
+  after a failure (back-off 5 s doubling, up to `retryLimit`) or when it is found `running` at start. Any other
+  failure or interruption marks it `failed` and raises a Health issue. Completing an occurrence and scheduling a
+  recurring job's next one are one write; a recurring job always moves on, and after downtime runs only its last
+  missed occurrence. A schedule inside `ctx.store.transaction` commits or rolls back with the module's own writes.
+- **Not running**: `{ notify }` jobs fire anyway; a `{ handler }` job found due without its handler is marked `waiting`
+  (Health, admin) and fires when the handler is registered, as its missed policy allows. Jobs do not keep a module
+  demanded. A job of a module no longer in the catalogue is listed for the owner to cancel.
+- **Tasks**: `runTask` forks the work in the scheduler's scope (not the turn's), two at a time, the rest queued;
+  `cancel` interrupts it; its row records the result or the failure; a restart marks it `failed` ("Interrupted by a
+  restart").
+- **Admin and doctor**: `GET /api/scheduler/jobs`, `POST /api/scheduler/jobs/<id>/cancel` (`serve/schedulerApi.ts`,
+  `@pva/protocol` `scheduledJobs.ts`, no protocol bump), shown under Diagnostics › Scheduled jobs; issues under the
+  source `scheduler`; `doctor` reads the table read-only and prints the counts.
+- **Turn path**: only a `schedule` (or `pause`, `cancel` …) called by a tool, at most two single-row writes.
+- **Testing**: `makeTestScheduler` (`@pva/core/testing`) is the same engine on the in-memory store and the test clock;
+  `@pva/core/scheduler-contract` runs the same suite on it and on SQLite.
+
 Adding a feature = one new file exporting `defineModule({...})` + one line in `moduleCatalog` in `apps/assistant/src/modules.ts`. Adding a provider = one new package implementing a core interface + one line in `apps/assistant/src/providers.ts`. Adding a voice provider = an adapter with `layerConfig` (`Tts`) and `makeVoices` (`TtsVoices`), and one entry in `ttsProviders`, `ttsProviderInfo` and (hosted) `hostedTtsVoices` in `providers.ts`. A voice needs no code: it is chosen by its key.
 
 ## Serve mode (web UI)

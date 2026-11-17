@@ -230,6 +230,9 @@ export const makeSchedulerEngine = (options: SchedulerEngineOptions): Effect.Eff
         options.issues!.set("scheduler", schedulerIssues({ live, failed, moduleName, isOrphan }))
       }).pipe(Effect.catch((e) => Effect.sync(() => log(`Scheduler: issues not refreshed: ${e.message}`))))
 
+    /** Recompute the issues in the engine's scope, not the caller's (a tool's `cancel` is on the turn path). */
+    const refreshIssuesSoon: Effect.Effect<void> = options.issues === undefined ? Effect.void : Effect.asVoid(Effect.forkIn(detached(refreshIssues), scope))
+
     // ---- Firing
 
     const backoff = (attempts: number) => Math.min(MAX_BACKOFF_MS, retryBaseMs * 2 ** Math.max(0, attempts - 1))
@@ -242,8 +245,9 @@ export const makeSchedulerEngine = (options: SchedulerEngineOptions): Effect.Eff
       table.transaction(Effect.gen(function*() {
         const at = yield* now
         const current = yield* table.get(claimed.id)
-        // Cancelled, rescheduled or replaced while it ran: what was done to it stands.
-        if (current === undefined || current.rev !== claimed.rev || current.state !== "running") return
+        // Cancelled or rescheduled while it ran: what was done to it stands. (Handing its key to a successor, below in
+        // `schedule`, changes only the key, so the run still completes.)
+        if (current === undefined || current.state !== "running" || current.occurrenceAt !== claimed.occurrenceAt || current.attempts !== claimed.attempts) return
         const delivered = outcome.ok && outcome.delivered !== undefined ? { delivered: outcome.delivered } : {}
         if (outcome.ok) {
           if (current.cron !== undefined) {
@@ -553,7 +557,10 @@ export const makeSchedulerEngine = (options: SchedulerEngineOptions): Effect.Eff
           return yield* changed(Effect.gen(function*() {
             if (req.key !== undefined) {
               const old = yield* table.liveByKey(moduleId, req.key)
-              if (old !== undefined && (yield* write(old, { state: "cancelled", waiting: false }, at)) === undefined) return yield* lost(old.id)
+              // A one-off job that is running now (its handler is scheduling its successor: the next occurrence of an
+              // RRULE) hands over the key and finishes as it would; any other is replaced.
+              const patch = old?.state === "running" && old.cron === undefined ? { key: undefined } : { state: "cancelled" as const, waiting: false }
+              if (old !== undefined && (yield* write(old, patch, at)) === undefined) return yield* lost(old.id)
             }
             yield* table.insert(row)
             return row
@@ -580,7 +587,7 @@ export const makeSchedulerEngine = (options: SchedulerEngineOptions): Effect.Eff
             for (const j of waiting) yield* write(j, { waiting: false }, at)
             return waiting.length
           })).pipe(
-            Effect.flatMap((n) => (n > 0 ? refreshIssues : Effect.void)),
+            Effect.flatMap((n) => (n > 0 ? refreshIssuesSoon : Effect.void)),
             Effect.catch((e) => Effect.sync(() => log(`Scheduler: waiting jobs of ${moduleId} not released: ${e.message}`)))
           )
           wake()
@@ -589,13 +596,14 @@ export const makeSchedulerEngine = (options: SchedulerEngineOptions): Effect.Eff
       pause: (id) =>
         changed(Effect.gen(function*() {
           const job = yield* ownJob(moduleId, id)
+          if (job.kind === "task") return yield* new SchedulerError({ reason: "state", message: "A task cannot be paused; cancel it instead" })
           if (job.state === "paused") return job
           if (job.state !== "scheduled") return yield* new SchedulerError({ reason: "state", message: `The job is ${job.state}; only a scheduled job can be paused` })
           const at = yield* now
           const paused = yield* write(job, {
             state: "paused",
             dueAt: undefined,
-            remainingMs: job.cron === undefined || job.kind === "task" ? Math.max(0, (job.dueAt ?? at) - at) : undefined,
+            remainingMs: job.cron === undefined ? Math.max(0, (job.dueAt ?? at) - at) : undefined,
             waiting: false
           }, at)
           return paused ?? (yield* lost(id))
@@ -734,7 +742,7 @@ export const makeSchedulerEngine = (options: SchedulerEngineOptions): Effect.Eff
         if (done === undefined) return yield* lost(job.id)
         // A task's fiber is interrupted; a handler that is running finishes, and its job stays cancelled.
         if (job.kind === "task") yield* FiberMap.remove(runs, job.id)
-        yield* refreshIssues
+        if (job.state === "failed" || job.waiting || job.lastFailedAt !== undefined || isOrphan(job.module)) yield* refreshIssuesSoon
         return true
       })
 
