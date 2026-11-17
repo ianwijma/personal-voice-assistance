@@ -570,6 +570,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     const wantedResources = (): {
       readonly llms: Map<string, LlmSpec>
       readonly voices: Map<string, TtsSpec>
+      readonly voiceInherit: Map<string, Array<string>>
       readonly recognisers: Map<string, { readonly spec: SttSpec; readonly hearer: string }>
     } => {
       const file = store.settings()
@@ -584,6 +585,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       const voiceAccounts = ttsAccounts()
       const llms = new Map<string, LlmSpec>()
       const voices = new Map<string, TtsSpec>()
+      const voiceInherit = new Map<string, Array<string>>()
       for (const assistant of assistantsNow().values()) {
         if (!assistant.on || !listed.has(assistant.id)) continue
         const spec = llmSpecOf(assistant.llm, accounts)
@@ -595,10 +597,15 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
         for (const listing of settings.assistants) {
           const assistant = assistantsNow().get(listing.assistant)
           if (assistant === undefined || !assistant.on) continue
-          voices.set(voiceUserOf(assistant.id, place, settings.voice), ttsSpecOf(voiceFor(settings.voice, assistant), voiceAccounts))
+          const user = voiceUserOf(assistant.id, place, settings.voice)
+          voices.set(user, ttsSpecOf(voiceFor(settings.voice, assistant), voiceAccounts))
+          // The place's voice may just have flipped source (own <-> the assistant's): the other user's binding is
+          // the one this user takes over until its instance is ready.
+          const other = user === assistant.id ? `${assistant.id}@${place}` : assistant.id
+          voiceInherit.set(user, [...(voiceInherit.get(user) ?? []), other])
         }
       }
-      return { llms, voices, recognisers: recognisersOf(placesNow(), assistantsNow()) }
+      return { llms, voices, voiceInherit, recognisers: recognisersOf(placesNow(), assistantsNow()) }
     }
     /**
      * The spec of every language-model key asked for, so a turn's trace can say what the instance it is bound to was
@@ -674,7 +681,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       Effect.suspend(() =>
         store.blocked() !== undefined
           ? Effect.void
-          : (({ llms, recognisers, voices }) => resources.reconcile(llms, { ...reconcile, voices, recognisers }))(wantedResources())
+          : (({ llms, recognisers, voices, voiceInherit }) => resources.reconcile(llms, { ...reconcile, voices, voiceInherit, recognisers }))(wantedResources())
       )
     resourcesChanged = () => {
       run(syncResources())

@@ -47,10 +47,19 @@ const echoLlm: LlmBuilder = () =>
 
 const builds: Array<string> = []
 const released: Array<string> = []
+/** Voices whose build waits until its gate is opened (`gate(key)` closes one, the returned function opens it). */
+const gates = new Map<string, Promise<void>>()
+const gate = (key: string): (() => void) => {
+  let open!: () => void
+  gates.set(key, new Promise<void>((resolve) => { open = resolve }))
+  return open
+}
 const buildTts: TtsBuilder = (spec) =>
   Effect.gen(function*() {
     const key = ttsKeyOf(spec)
     builds.push(key)
+    const waiting = gates.get(key)
+    if (waiting !== undefined) yield* Effect.promise(() => waiting)
     yield* Effect.addFinalizer(() => Effect.sync(() => released.push(key)))
     return Tts.of({
       sampleRate: 22_050,
@@ -89,6 +98,7 @@ const dataDirWith = async (edit: (file: Json) => void = () => {}): Promise<strin
 const start = async (dataDir: string, env: Record<string, string> = {}) => {
   builds.length = 0
   released.length = 0
+  gates.clear()
   server = await startTestServer({
     build: fakeBuild({ stt: controlledStt().stt, llm: scriptedLlm(() => "the build's model").llm }),
     buildLlm: echoLlm,
@@ -335,6 +345,37 @@ describe("a device's voice at run time", () => {
     expect((await spoken(device, "alpha", "reset", "t3")).voices).toEqual([PIPER])
     await until("the second device voice is released", () => released.includes(ELEVEN))
     expect(released).not.toContain(PIPER)
+  })
+
+  it("flipping to the device's own voice, and back, keeps the old voice answering until the new one has loaded", async () => {
+    // Alpha is on this device only (the type lists Bravo), so nothing else keeps Alpha's own voice alive.
+    await start(await dataDirWith((file) => { file.deviceTypes["web-voice"].assistants = [{ assistant: "bravo", phrases: ["hey bravo"] }] }))
+    const a = await admin()
+    const device = await knownDevice("device-a")
+    expect(await saveDevice(a, "device-a", { assistants: [{ assistant: "alpha", phrases: ["hey alpha"] }] })).toMatchObject({ ok: true })
+    const own = "alpha@device:device-a"
+    const resources = () => server!.handle.resources
+    expect((await spoken(device, "alpha", "before", "t0")).voices).toEqual([PIPER])
+    // To its own voice, which is slow to load.
+    const openCartesia = gate(CARTESIA)
+    expect(await saveDevice(a, "device-a", { voice: ownVoice(CARTESIA) }, { saveAnyway: true })).toMatchObject({ ok: true })
+    await until("the device voice starts building", () => builds.includes(CARTESIA))
+    expect((await spoken(device, "alpha", "loading", "t1")).voices).toEqual([PIPER])
+    expect(resources().ttsKeyFor(own)).toBe(PIPER)
+    openCartesia()
+    await until("the device voice is bound", () => resources().ttsKeyFor(own) === CARTESIA)
+    expect((await spoken(device, "alpha", "loaded", "t2")).voices).toEqual([CARTESIA])
+    // Back to the assistant's: nothing else uses PIPER any more, so it is released and must be built again, slowly.
+    await until("the assistant's voice is released", () => released.includes(PIPER))
+    const openPiper = gate(PIPER)
+    expect(await saveDevice(a, "device-a", { voice: null })).toMatchObject({ ok: true })
+    await until("the assistant's voice builds again", () => builds.filter((k) => k === PIPER).length === 2)
+    expect((await spoken(device, "alpha", "resetting", "t3")).voices).toEqual([CARTESIA])
+    expect(resources().ttsKeyFor("alpha")).toBe(CARTESIA)
+    openPiper()
+    await until("the assistant's voice is bound", () => resources().ttsKeyFor("alpha") === PIPER)
+    expect((await spoken(device, "alpha", "reset", "t4")).voices).toEqual([PIPER])
+    await until("the own voice is released", () => released.includes(CARTESIA))
   })
 
   it("a type's voice defaults apply to its devices without their own; a device's own value wins", async () => {

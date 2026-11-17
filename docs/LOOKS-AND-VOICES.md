@@ -79,7 +79,7 @@ DeviceSettings += { look: DeviceLook, voice: DeviceVoice }   // two new section 
   `assistant@place` for each place (a device, or the type's defaults) whose `voice` section is `{ from: "device" }`. A
   turn reads the binding at its start (`conversationSetup(assistant, deviceId)`, `voiceOf`), so a change applies at the
   next turn and the old instance goes after the grace period; typed turns and `speakTyped` use the same setup. Places
-  with the same voice share one `Tts` (the pool keys instances by voice).
+  with the same voice share one `Tts` (the pool keys instances by voice). When a place flips between the assistant's voice and its own, the user changes (`alpha` <-> `alpha@place`); the new user takes over the old one's binding (`ReconcileOptions.voiceInherit`) until its voice has loaded, so the old voice keeps answering meanwhile.
 - **Trace.** `TraceInfo.config.voice` is the key of the voice the turn used; the new optional `config.voiceFrom` says
   `"device"` or `"assistant"` (protocol, additive).
 - **Pushes.** `device.setup` is compared as a whole before sending, so a change of an assistant's look, the type's or
