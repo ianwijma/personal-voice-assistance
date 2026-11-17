@@ -39,8 +39,9 @@ export function LookEditor({ value, onChange, idPrefix, whose, foldPicker = fals
   latest.current = current
 
   const pick = (next: string) => {
-    if (next === id) return
+    // Every pick is the newest, the current character too: picking it again drops a load still on its way.
     const token = ++pickToken.current
+    if (next === id) return
     // continuation(state): only the newest pick applies, on the look as it is when the character has loaded
     void loadCharacter(next).then((r) => {
       if (token !== pickToken.current || r.kind !== "ready") return
