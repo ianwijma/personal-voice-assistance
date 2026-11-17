@@ -25,12 +25,12 @@ import { parseValues } from "./ValueParsing.ts"
  * using ONE decision request, then runs the action as code and speaks a short
  * confirmation. No conversational model.
  *
- * Speculation: the decision runs during a speculative turn; the action waits
- * for `promoted` unless it is `speculative` (read-only), and its `announce`
- * text is released only once the gateway's admission just before the action
- * runs has passed (after promotion, for one that waits), so a refusal at that
- * admission never leaves a success sentence. An action that has started runs
- * to completion even when the owner barges in (it is detached from the turn):
+ * Speculation: the decision runs during a speculative turn and an `announce`
+ * text is spoken once the gateway's first admission has passed (synthesised
+ * early, played at promotion); the action itself waits for `promoted` unless
+ * it is `speculative` (read-only), and is admitted again just before it runs.
+ * An action that has started runs to completion even when the owner barges in
+ * (it is detached from the turn):
  * waiting for promotion is bounded by `pendingMs`, the action itself by the
  * 5 s limit from the moment it starts. A pending parameter question is
  * stored only when the turn is committed. An action declared `confirm: true` is
@@ -247,11 +247,17 @@ export const makeIntentAgent = (options: IntentAgentOptions = {}): AgentImplemen
   }
 
   /**
-   * Run the action through the execution gateway, and say its announcement only once the gateway's admission just
-   * before it runs has passed: a refused action is never announced. A speculative (read) action runs at once; any
-   * other is admitted at once, held until the turn is committed (at most `pendingMs`) and admitted again just before
-   * it runs; its announcement follows that second admission. A turn that is discarded first never runs it. The
-   * action gets `ACTION_TIMEOUT_MS` from the moment it starts.
+   * Run the action through the execution gateway, and say its announcement once the gateway has admitted it: an
+   * action refused at once is never announced. A speculative (read) action runs at once; any other is admitted at once
+   * (so its announcement can be spoken, and synthesised, while the turn is still speculative), then held until the
+   * turn is committed (at most `pendingMs`) and admitted again just before it runs. A turn that is discarded first
+   * never runs it. The action gets `ACTION_TIMEOUT_MS` from the moment it starts.
+   *
+   * Known limit (review round 4, kept for latency): if access to the action is withdrawn between the eager end of
+   * turn and promotion, the second admission refuses it and it does not run, but the person may hear the start of
+   * the success sentence followed by the refusal. Releasing the sentence only after the second admission cost one
+   * first-clause synthesis on every held intent turn; a playback gate in `Conversation` that holds pre-synthesised
+   * audio until the final admission would close it without that cost (a possible later change).
    */
   const act = (input: AgentTurnInput, store: PendingIntents, outcome: Extract<IntentOutcome, { _tag: "Act" }>, decided: AgentEvent, at: number): Stream.Stream<AgentEvent> =>
     Stream.unwrap(Effect.gen(function*() {
@@ -278,8 +284,7 @@ export const makeIntentAgent = (options: IntentAgentOptions = {}): AgentImplemen
       const admitted = Deferred.makeUnsafe<boolean>()
       const dropped = Deferred.makeUnsafe<void>()
       const started = Deferred.makeUnsafe<void>()
-      // `actionStarted` and the action's time are from the moment it runs (after promotion and the second admission
-      // for one that was held).
+      // `actionStarted` and the action's time are from the moment it runs (after promotion for one that was held).
       let start = yield* now
       const starting = Effect.flatMap(now, (at) =>
         Effect.sync(() => {
@@ -292,8 +297,11 @@ export const makeIntentAgent = (options: IntentAgentOptions = {}): AgentImplemen
       const holdUntil = speculative ? undefined : Effect.raceFirst(
         input.promoted,
         Effect.flatMap(Deferred.await(dropped), () => Effect.fail(new ActionError({ message: "Not run: the turn was not committed." })))
-      ).pipe(Effect.timeoutOrElse({ duration: pendingMs, orElse: () => Effect.fail(new ActionError({ message: "Not run: the turn was not committed in time." })) }))
-      const onAdmitted = Effect.andThen(Deferred.succeed(admitted, true), starting)
+      ).pipe(
+        Effect.timeoutOrElse({ duration: pendingMs, orElse: () => Effect.fail(new ActionError({ message: "Not run: the turn was not committed in time." })) }),
+        Effect.andThen(starting)
+      )
+      const onAdmitted = Effect.andThen(Deferred.succeed(admitted, true), speculative ? starting : Effect.void)
       const limit = Effect.andThen(Deferred.await(started), Effect.sleep(ACTION_TIMEOUT_MS)).pipe(
         Effect.andThen(Effect.fail(new ActionError({ message: `${def.label} did not finish within ${ACTION_TIMEOUT_MS / 1000} seconds.` })))
       )
@@ -311,7 +319,7 @@ export const makeIntentAgent = (options: IntentAgentOptions = {}): AgentImplemen
         return { exit, ms }
       })
       return Stream.fromIterable<AgentEvent>([decided]).pipe(
-        // The announcement waits for the admission just before the action runs (and is left out if it refuses).
+        // The announcement waits for the first admission (and is left out if the gateway refuses there).
         Stream.concat(Stream.unwrap(Effect.map(Deferred.await(admitted), (ok) => Stream.fromIterable(ok && early ? sentence(announce!) : [])))),
         Stream.concat(speculative ? Stream.empty : commitPending(input, store, undefined, at)),
         Stream.concat(emit({ _tag: "ActionStarted", callId, actionId: action.id, label: def.label, params })),

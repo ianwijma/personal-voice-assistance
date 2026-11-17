@@ -125,9 +125,10 @@ export interface GatewayCallOptions {
 /** How one action call is made. */
 export interface ActionCallOptions extends GatewayCallOptions {
   /**
-   * Run once the call has passed the admission that immediately precedes its run (after `holdUntil` and the second
-   * admission, when there is one), just before the action runs: the intent agent releases its announcement then,
-   * never before. Not run for a refused call.
+   * Run once the call is admitted (the first admission), before `holdUntil`: the intent agent releases its
+   * announcement then, so it is synthesised while the turn is still speculative and plays at promotion. Not run for a
+   * call refused at that admission. A call refused at the second admission (after `holdUntil`) does not run, but its
+   * announcement may already have been released (docs/ARCHITECTURE.md, "The execution gateway": a known limit).
    */
   readonly onAdmitted?: Effect.Effect<void>
   /**
@@ -381,12 +382,12 @@ export const makeExecutionGateway = (options: GatewayOptions = {}): ExecutionGat
       )
       const refused = yield* admitCall(call, def)
       if (refused !== undefined) return yield* refusedAction(refused)
+      if (actionOptions.onAdmitted !== undefined) yield* actionOptions.onAdmitted
       if (actionOptions.holdUntil !== undefined) {
         yield* actionOptions.holdUntil
         const again = yield* admitCall(call, def)
         if (again !== undefined) return yield* refusedAction(again)
       }
-      if (actionOptions.onAdmitted !== undefined) yield* actionOptions.onAdmitted
       return yield* asPrincipal(principal, Effect.suspend(() => actionRunnerOf(registered)(values)))
     })
 

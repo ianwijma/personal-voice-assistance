@@ -344,11 +344,16 @@ CurrentPrincipal: Context.Reference<Principal | undefined>       // the admitted
   bounded) refuses the call with "what it would do could not be judged"; what went wrong goes to the log only. An
   action declared `confirm: true` is refused on every public path (confirmation is off in this stack); only core's own
   confirmed path (`Conversation`, after a consumed spoken yes, while `confirmActions` is "on") runs one. There is no
-  confirmation hook and no caller can claim a confirmation. `holdUntil` / `onAdmitted` (`ActionCallOptions`) let the
-  intent agent hold a non-speculative action until its turn is promoted (the same call is admitted again just before
-  it runs), and release its announcement only after that last admission (after promotion, for a held action), so a
-  refusal there never leaves a success sentence. Waiting for promotion is bounded by the agent's `pendingMs`; the
-  action itself by `ACTION_TIMEOUT_MS` (5 s) from the moment it starts. A risk function's failure is logged as a
+  confirmation hook and no caller can claim a confirmation. `onAdmitted` / `holdUntil` (`ActionCallOptions`) let the
+  intent agent speak an action's announcement once it is admitted (so it is synthesised during the speculative window
+  and plays at promotion), and hold a non-speculative action until its turn is promoted (the same call is admitted
+  again just before it runs). Waiting for promotion is bounded by the agent's `pendingMs`; the action itself by
+  `ACTION_TIMEOUT_MS` (5 s) from the moment it starts. **Known limit:** if access to the action is withdrawn between
+  the eager end of turn and promotion, the second admission refuses it and it does not run, but the person may hear
+  the start of the success sentence followed by the refusal. It is left because closing it by releasing the sentence
+  only after the second admission was measured to delay the first audio of every held intent turn by one first-clause
+  synthesis (review round 4); a playback gate in `Conversation` that holds pre-synthesised audio until the final
+  admission would close it without that cost, a possible later change. A risk function's failure is logged as a
   bounded category, never with what it threw. The host's registries and serve mode's
   per-assistant registries all carry `host.gateway`; a hand-made registry uses `defaultGateway` (no access checks,
   local principal). Input decoders are made when a registry is built. **A micro-comparison, not a turn's cost**

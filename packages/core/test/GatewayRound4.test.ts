@@ -1,6 +1,7 @@
-// The execution gateway and the intent path, review round 4 (p1-r4b): the success sentence of a held action is released
-// only after the admission just before it runs (finding 4); waiting for promotion and running are bounded separately
-// (finding 6); a classifier's failure is logged as a bounded category, never its text (finding 7).
+// The execution gateway and the intent path, review round 4 (p1-r4b): a held action refused at its second admission
+// does not run, and the refusal follows the success sentence already released (finding 4, kept as a known limit for
+// latency); waiting for promotion and running are bounded separately (finding 6); a classifier's failure is logged as
+// a bounded category, never its text (finding 7).
 import { assert, describe, it } from "@effect/vitest"
 import { Deferred, Effect, Fiber, Logger, Schema, Stream } from "effect"
 import { TestClock } from "effect/testing"
@@ -70,8 +71,8 @@ const homeWith = (run: () => Effect.Effect<void>, on: { current: boolean }) =>
     return makeToolRegistry(host.snapshot().parts.map((p) => p.module), { gateway: host.gateway })
   })
 
-describe("finding 4: a held action's success sentence waits for the admission just before it runs", () => {
-  it.effect("access revoked between the two admissions: nothing runs, and no success text is delivered", () =>
+describe("finding 4 (decision reversed after measurement; a known limit): access withdrawn between the two admissions", () => {
+  it.effect("the success sentence was released at the first admission; after promotion the action does not run and the refusal is spoken after it", () =>
     Effect.gen(function*() {
       const on = { current: true }
       let runs = 0
@@ -84,23 +85,15 @@ describe("finding 4: a held action's success sentence waits for the admission ju
       )
       yield* settle
       assert.isTrue(events.some((e) => e._tag === "Decision"), "decided while speculative")
-      assert.notInclude(spokenOf(events), "Kitchen lights on.", "nothing of the success sentence before promotion")
+      assert.strictEqual(spokenOf(events), "Kitchen lights on.", "released at the first admission, so it can be synthesised before promotion")
       on.current = false
       yield* Deferred.succeed(promoted, undefined)
       yield* Fiber.join(turn)
-      assert.strictEqual(runs, 0)
-      assert.notInclude(spokenOf(events), "Kitchen lights on.")
-      assert.isTrue(events.some((e) => e._tag === "ActionFinished" && !e.ok))
-    }).pipe(Effect.scoped))
-
-  it.effect("allowed at both admissions: the sentence comes after promotion, before the action is started", () =>
-    Effect.gen(function*() {
-      const on = { current: true }
-      const registry = yield* homeWith(() => Effect.void, on)
-      const events = Array.from(yield* Stream.runCollect(makeIntentAgent({ deciders: ["scripted"] }).turn(inputOf(registry))).pipe(Effect.provideService(CurrentTurn, turnOf("a"))))
-      const tags = events.map((e) => (e._tag === "TextDelta" ? `text:${e.text}` : e._tag))
-      assert.isBelow(tags.indexOf("text:Kitchen lights on."), tags.indexOf("ActionStarted"))
-      assert.isTrue(events.some((e) => e._tag === "ActionFinished" && e.ok))
+      assert.strictEqual(runs, 0, "the second admission refuses it: nothing runs")
+      const spoken = spokenOf(events)
+      assert.match(spoken, /^Kitchen lights on\. Sorry, Not run: the home module is not on for this assistant\.$/, spoken)
+      const finished = events.find((e) => e._tag === "ActionFinished")
+      assert.isTrue(finished !== undefined && finished._tag === "ActionFinished" && !finished.ok)
     }).pipe(Effect.scoped))
 })
 
