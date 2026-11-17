@@ -219,7 +219,7 @@ config, so the state shown (`asleep`) and the lapse cue follow.
 | "Hey Jev" alone during a reply | **First release**: the reply goes on and Jev is armed; the next utterance within 8 s stops it and is answered. **N6**: the reply stops at once. | N6 adds one rule to `VoiceSession`: a `woke` with `armed: true` while a reply of this device plays → `Interrupt` (as Stop). |
 | Two assistants on the node ("Hey Jev…", "Hey Kim…") | Each phrase reaches its assistant; each has its own conversation on this node; both answer once per phrase. | Assignments; one conversation per assistant per device. |
 | Which recogniser hears the room | The hearer's (the first assignment, or the without-phrase assistant). | `hearerOf`; one recogniser per device. |
-| "Answers without a phrase" set to one assistant or TypeSafe | Allowed, with a "Save anyway" warning `answers_everything`: "This node hears the whole room all the time. With this setting, {name} answers the TV and every conversation." | Existing warnings flow (`saveAnyway`). |
+| "Answers without a phrase" set to one assistant or TypeSafe | Allowed, with a "Save anyway" warning `answers_everything` (built words: "A voice node would answer everything it hears, not one question per wake phrase."), on a node and on Every voice node. | Existing warnings flow (`saveAnyway`). |
 | The model asks a question back | The owner answers with the phrase ("Hey Jev, the kitchen"), or gives that assistant a follow-up on this node. | — |
 | Confirmation questions | None exist: `confirmActions` is the literal `"off"` (ASSISTANTS.md §2.2). Whoever designs them must give follow-up-0 devices an answer window. | Out of scope. |
 | Conversation continuity | "Hey Jev, the weather?" … "Hey Jev, and tomorrow?" continues while the assistant's quiet spell (`newConversationAfter`) has not passed. | Per assistant; no node setting. |
@@ -345,10 +345,15 @@ The host check (`SERVE_ALLOWED_HOSTS`) runs first, as for every request.
 
 - **Codes**: `node.pair.create` makes 40 random bits as 8 Crockford base32 characters, valid 10 minutes, single use,
   at most 3 outstanding (a fourth cancels the oldest), in memory only (a restart cancels them). It seeds the type
-  (§3.4) before answering. `PVA_ADMIN_PASSWORD` unset → there is no admin, so no code can be made.
+  (§3.4) before answering, and admin gets `device.types` (and `assistants`, `devices`) *before* the `result`, so the
+  Add dialog's code step already knows whether anybody answers on voice nodes (as built since the integration run).
+  A dialog whose code was cancelled by a fourth one is not told; its box gets `bad_code`. `PVA_ADMIN_PASSWORD` unset
+  → there is no admin, so no code can be made.
 - **Redeem** (`POST /node/pair`): normalised code looked up; expired → `expired`; unknown → `bad_code`. Wrong codes back
   off **per remote address** like admin logins (5 in a row → 30 s, doubling, at most 10 min) and **in total** (50 wrong
-  in 10 minutes → every redeem refused `rate_limited` until the oldest code expires). On success: 32 random bytes as
+  in 10 minutes → every redeem, right or wrong, refused `rate_limited` until the oldest of those 50 wrong attempts
+  leaves the 10-minute window; the first design said "until the oldest code expires", which is not tied to the wrong
+  attempts). On success: 32 random bytes as
   base64url (the credential), a device id `vn-` + 16 base64url characters, a record
   `{ kind: "voice-node", name, firstSeen: now, lastSeen: now, own: {}, rev: 0, node: { credentialSha256, pairedAt:
   now, version, platform } }` (name: the admin's, else the hostname, made unique with " 2", " 3"), saved with
@@ -356,7 +361,8 @@ The host check (`SERVE_ALLOWED_HOSTS`) runs first, as for every request.
   everything but gets the new `credentialSha256` and `pairedAt`, and its open connections are closed with 4403. A save
   refused because the settings are `blocked()` → `503 unavailable`.
 - **Credential check** (in `SessionHub.hello`, before `welcome`): if `message.device` names an id whose record has
-  `node`, or `kind === "voice-node"`: `sha256(hello.node.credential)` compared with `crypto.timingSafeEqual` to that
+  `node`, or `kind === "voice-node"`, or the hello carries `hello.node`, or a hello *without* a device has a
+  `clientId` equal to a paired node's id (a page posing as a node by its session key; refused, as built): `sha256(hello.node.credential)` compared with `crypto.timingSafeEqual` to that
   record's digest; no record, no `node`, a mismatch, or a missing `hello.node` → close 4403 without a `welcome`. On
   success `client.device = { id, kind: "voice-node", name: <record name> }` and the node's memory info is updated
   (`version`, `bundleSha256`, `platform`, `transport`, `upToDate`).
@@ -365,7 +371,9 @@ The host check (`SERVE_ALLOWED_HOSTS`) runs first, as for every request.
 - `node.status`, `node.level` from a connection that is not an authenticated node: `bad_message`, once.
 - **Commands**: `node.command.send` → `node.command` to that device's connections. `test-mic` opens a relay window
   for `durationMs + 1 s` in which `node.level` becomes `node.meter` to admin connections; outside it levels are dropped.
-- `devices` is pushed on `node.status` changes through the existing 1 s throttle (`devicesChanged(true)`).
+- `devices` is pushed on `node.status` changes through the existing 1 s throttle (`devicesChanged(true)`), and when the
+  served bundle changes (the manifest's SHA-256 checked every 5 s; added in the integration run, so a bundle rebuilt
+  while the server runs shows "Update pending" without a reload).
 - `device.save` validation passes the target's type to `validateDeviceSettings` (the `answers_everything` warning).
 - `VoiceSession` gets the device's type for `routeConfigFrom` (§4.1).
 
@@ -375,7 +383,9 @@ The host check (`SERVE_ALLOWED_HOSTS`) runs first, as for every request.
   `sha256(new X509Certificate(pem).publicKey.export({ type: "spki", format: "der" }))` → `sha256:<hex>`. It is what the
   node checks (WP-4: `peerKeySha256`) and what curl's `--pinnedpubkey sha256//<base64>` checks. With TLS from a
   reverse proxy the server does not know the certificate: `tls: false`, and the dialog offers a pin field (§7.3).
-- The **server URL** nodes use is chosen in the Add dialog, prefilled with admin's `location.origin`. No new server
+- The **server URL** nodes use is chosen in the Add dialog, prefilled with the origin of the WebSocket address admin
+  itself uses (`serverOriginOf(resolveWsUrl(location))`, falling back to `location.origin`), so a page opened from the
+  Next.js dev server or with `?ws=` prefills the assistant's address, not the page's. No new server
   setting: the only case it would help (admin opened through an SSH tunnel on `localhost`) is covered by the dialog
   asking for the address. `loopbackOnly` makes the dialog say that nodes cannot reach a server listening on
   127.0.0.1 and how to change `SERVE_HOST`.
@@ -419,7 +429,7 @@ first, `DevicePage` / `DeviceEditor` shows the sections the type has (`has(key)`
 
 ### 7.2 The node page (`DeviceEditor` + `devices/NodeSections.tsx`)
 
-For `device.kind === "voice-node"`, in this order:
+For `device.kind === "voice-node"`, in this order (as built; the list below is the design, see the note after it):
 
 1. **Status** (read only): online / offline since, version (and "Update pending"), platform and model, audio backend,
    opened input and output, missing tools (with "install `alsa-utils` on the box"), transport, last error, and "What it
@@ -443,6 +453,13 @@ without `look` (`assistants/LookTab.tsx`). Nodes have no voice page, so no visua
 
 "Every voice node" (the type defaults page) shows sections 3–5 without Status, Actions and Remove.
 
+**As built (N4)** the page is the browsers' `DeviceEditor` with the node parts mounted in it: Status, Actions, then
+Name, **Assistants** (with Answers without a phrase inside it, as on every device), **Phrases** (matching), **Voice**,
+**Sound**, **Sound devices**, then **Other device settings** (Interrupting, Conversation), then Remove. So Interrupt
+mode comes after Sound devices, in the same group as on a browser's page, rather than before Sound. The
+`answers_everything` warning is a note in Assistants before the save asks "Save anyway"; its words are the protocol's
+("A voice node would answer everything it hears, not one question per wake phrase."), not §4.2's draft.
+
 ### 7.3 Add voice node (`devices/AddNodeDialog.tsx`)
 
 There is no device-add wizard on main (devices appear by connecting; the assistant wizard's "Where" step places an
@@ -450,7 +467,7 @@ assistant on devices and will list nodes by itself). Nodes need a step-by-step d
 before they are paired:
 
 1. **Name and address**: name (optional, placeholder "the box's host name"), "Server address the node uses"
-   (prefilled `location.origin`; a warning when it is `localhost` / 127.0.0.1, and when `pairing.loopbackOnly`), and a
+   (prefilled from admin's WebSocket address, §6.2; a warning when it is `localhost` / 127.0.0.1, and when `pairing.loopbackOnly`), and a
    note for `http:`: "The node's sound and its key travel unencrypted on your network." → **Get code**
    (`node.pair.create`).
 2. **Code**: the code large (`K7QM-2XHP`), a countdown to `expiresAt`, the install command with a copy button, and
@@ -545,30 +562,29 @@ No latency claim is made from reasoning. These are recorded under Status with th
 Dropped: M4 (the spotter; reopen with `packages/kws-sherpa/scripts/pi-m4.sh`) and M7 (the bench one-shot row: the route
 gate has no new code path, so there is nothing new to measure).
 
-**Checklist for the owner (real box and sound card).** Each line is a yes/no with what to note.
+**Checklist for the owner (real box and sound card).** Each line is a yes/no with what to note. The last column says
+what the integration run (Status, "Integration run") already showed on an x86-64 machine with a staged install
+(`install.sh --root`), `--input-wav` / `--output-wav` instead of a microphone and speaker, the fake language model and
+local Parakeet v2 / Piper; **Pi** marks what only a real box can show.
 
-1. Server: `pnpm serve` (or the unit's own command plus `pnpm --filter @pva/node bundle`); `curl -k
-   https://192.168.1.67:8787/node/manifest.json` returns JSON. `SERVE_HOST` is not loopback.
-2. Box: Raspberry Pi OS Lite arm64 (or Debian 13 x64), `sudo apt install alsa-utils curl`. Note the model.
-3. Admin › Devices › Voice nodes › Add voice node: code and command shown, the pin present for the self-signed
-   certificate.
-4. Run the command on the box: note the install time and `du -sh /opt/pva-node`. The dialog says "paired"; the node
-   shows online with the right version, platform and model, backend ALSA, and both device lists.
-5. Identify: three rising tones from the box's speaker. Test speaker: a 1 s tone; the volume slider changes it.
-6. The phrase tester on the node page: speak "hey jeff, what time is it" across the room; the line shows the phrase.
-7. Say "Hey Jeff, what time is it?" from 1 m and 3 m: one answer; then speak without the phrase: nothing happens.
-8. "Hey Jeff" alone: wake cue; then the question within 8 s: answered. "Hey Jeff" alone and silence: lapse cue.
-9. During a long answer: "Hey Jeff, stop" interrupts. Note whether the node's own voice ever triggers anything
-   (no AEC hardware: say which device).
-10. Choose another output device in Sound devices: the next answer plays there. Unplug the USB device: `lastError`
-    appears; plug it back: it recovers (note how).
-11. `sudo reboot` the box: online again within a minute, no admin action. Restart the server: the node reconnects.
-12. Restart from admin; Update now after a server-side change (`git commit --allow-empty` and `pnpm serve`): the node
-    updates and confirms (journal: `journalctl -u pva-node`).
-13. Remove in admin: the node stops (journal says removed). Install again with a new code: it comes back as a new
-    device.
-14. M1 on the box, M5 with the bench WAVs, the latency lines from `journalctl -u pva-node` (the node prints each
-    `turn.end` trace).
+| # | Step | What to note | Integration run |
+|---|---|---|---|
+| 1 | Server: `pnpm serve` (or, for a unit that runs `pnpm start serve`, add `pnpm --filter @pva/node bundle` before it). `curl -k https://<server>:8787/node/manifest.json` returns JSON. `SERVE_HOST` is not loopback (`0.0.0.0` or the LAN address). | the manifest's `version` | manifest served, `PVA_NODE_DIR` honoured; loopback only (`SERVE_HOST` not changed here) |
+| 2 | Box: Raspberry Pi OS Lite **arm64** (or Debian 13 x64): `sudo apt install curl alsa-utils` (ALSA, the default system service), or `pipewire-bin` for `--user`. | the model (`cat /proc/device-tree/model`) | **Pi** (arm64 never run; only its runtime hash checked by WP-4) |
+| 3 | Admin › Devices › Voice nodes › **Add voice node**: the address is the server's LAN address (not 127.0.0.1); code and command shown; with the self-signed certificate the command has `-k --pinnedpubkey 'sha256//…'` and `--tls-pin sha256:…`. | the pin equals `openssl x509 -in <cert> -pubkey -noout \| openssl pkey -pubin -outform der \| openssl dgst -sha256` | yes, in the real admin UI over http and https (pin checked against openssl) |
+| 4 | Run the command on the box (`sudo` for real). The dialog says "paired"; the node shows **Online**, version **up to date**, platform and model, backend **ALSA**, both device lists, Encrypted (wss). | install time, `du -sh /opt/pva-node` | staged install 1.5 s, 140 MB; dialog paired; Online, up to date, wss; backend was `file` (no sound card), model absent (not a Pi) |
+| 5 | **Identify**: three rising tones from the box's speaker. **Test speaker**: a 1 s tone; the volume slider changes it after Save. | loud enough at 80 %? | commands reached the node (log), tone files written at the expected gain; **Pi** for real sound |
+| 6 | The phrase tester on the node page: say "hey jeff, what time is it" across the room; the line shows the phrase. | distance that still works | yes with WAVs through the protocol (`wake.test`); **Pi** for room audio |
+| 7 | "Hey Jeff, what time is it?" from 1 m and 3 m: one answer; then a sentence without the phrase: nothing. | words misheard | yes with WAVs (one answer, the next sentence `accepted: false`); **Pi** for real rooms |
+| 8 | "Hey Jeff" alone: wake cue; the question within 8 s: answered. "Hey Jeff" alone and silence: lapse cue. Cues off in Sound: neither. | does the cue feel late (M3)? | cue files written with cues on, none with cues off; **Pi** for M3 |
+| 9 | During a long answer "Hey Jeff, stop" interrupts. Does the node's own voice ever trigger anything? | the speakerphone, AEC or not | **Pi** (needs a real room and speaker) |
+| 10 | A per-node "keep listening" value on the node's Assistants: a follow-up without the phrase is answered within it. | — | yes (10 s set in admin, follow-up answered) |
+| 11 | Sound devices: choose another output; the next answer plays there. Unplug the USB device: `lastError` shows; plug it back. | how it recovers | **Pi** (no sound card here) |
+| 12 | `sudo reboot` the box: online again within a minute. Restart the server: the node reconnects by itself. | seconds to online | server restart: reconnected (back-off 0.3–3.1 s); **Pi** for reboot under systemd |
+| 13 | Restart from admin. Update: after a server-side change and `pnpm serve` the node updates on reconnect; after only `pnpm --filter @pva/node bundle`, **Update now** appears within 5 s and updates it. Journal: `journalctl -u pva-node`. | — | yes: Restart and Update now (both sent through the admin protocol; the button's appearance is covered by the unit test, not seen in a browser), update on reconnect, the boot guard confirmed each release; **Pi** for systemd |
+| 14 | **Remove** in admin: the journal says removed (4403, retry every 10 min). Run the installer again with a new code: it comes back as a new device. | — | yes: 4403, old credential refused, re-run of the installer paired a new device |
+| 15 | M1 on the box, M5 with the bench WAVs, the latency lines from `journalctl -u pva-node` (the node prints each `turn.end` trace). | the numbers | first TurnTrace points only (fake LLM, file output); **Pi** |
+| 16 | `shellcheck -s sh /opt/pva-node/…/install.sh` (or on the server's `apps/node/dist/install.sh`). | clean? | not installed on this machine; `sh -n` passes |
 
 ## 12. Risks
 
@@ -766,6 +782,130 @@ Each has a recommended default; work proceeds on it until he says otherwise.
    alternative is that a new node answers nobody until he assigns someone.
 
 ## Status
+
+### Integration run: N1–N4 and N7 together, end to end on one machine (2026-11-18, this branch)
+
+Not N5: no Raspberry Pi, no sound card, no microphone. Everything below ran on the x86-64 dev machine (no sound card;
+PipeWire with only a null sink), with a real assistant server from this checkout on port 8811 (never 8787, where the
+owner's service runs), a temporary `PVA_DATA_DIR` and `PVA_VAULT_PATH`, `PVA_ADMIN_PASSWORD` set, `LLM_PROVIDER=fake`,
+the local Parakeet v2 recogniser and Piper `en_US-lessac-medium` (models linked from the main checkout). The node was
+the **real built bundle** (`pnpm --filter @pva/node bundle`), installed by the real `install.sh` fetched from the server's
+`/node/install.sh` into a temporary `--root` (no system changes; `actions.log` lists what a real install does), and run
+through the staged boot guard (`<root>/opt/pva-node/runtime/current/bin/node <root>/opt/pva-node/pva-node-boot.mjs run
+--config <root>/etc/pva-node/node.json --audio alsa --input-wav <dir> --input-gap-ms 9000 --output-wav <dir>`) under a
+shell loop standing in for `Restart=always`. Test WAVs were synthesised with Piper ("Hey Jeff, what time is it?",
+"Tell me something about the weather in Paris.", "Hey Jeff.", "And what is the capital of France?"). Admin was driven
+through the real admin protocol (a scripted `ws` client: `admin.login`, `node.pair.create`, `device.save`,
+`node.command.send`, `device.forget`, `wake.test`) and, for the Add voice node flow, the node page actions and Remove,
+through the real admin UI in Chromium (Playwright) against this server.
+
+| Step | Result | Evidence |
+|---|---|---|
+| Pairing code through the admin protocol | pass | `result.pairing { code, expiresAt, tls: false, loopbackOnly: true, bundle: { version, sha256 } }` |
+| Pairing code and the whole Add voice node flow in the admin UI (http) | pass | address prefilled `http://127.0.0.1:8811` with the loopback warning; code `MPPG-5ZXE`, "Expires in 10:00"; command `curl -fsSL http://127.0.0.1:8811/node/install.sh \| sudo sh -s -- --server http://127.0.0.1:8811 --code MPPG5ZXE`, run as shown (`sudo sh -s --` → `sh -s -- --root <dir>`); dialog "UI node is paired."; Open its page; Online, up to date, Unencrypted |
+| The same over https with a self-signed EC certificate (pinned wss) | pass | command `curl -fsSL -k --pinnedpubkey 'sha256//Id7p…zSs=' https://127.0.0.1:8811/node/install.sh \| sudo sh -s -- --server https://127.0.0.1:8811 --tls-pin sha256:21de…cd2b --code …`, pin equal to `openssl … \| openssl dgst -sha256`; node `wss://127.0.0.1:8811/ws`; admin "Encrypted (wss)"; a wrong pin: node "the server's certificate does not match the pin", no hello; curl with a wrong pin: exit 90 |
+| install.sh from `/node/install.sh` into `--root` | pass | 1.5 s (Node 22.23.5 x64 downloaded, hash matched), 140 MB under `opt/pva-node`, "paired as vn-… (Test node)"; unit `ExecStart=… pva-node-boot.mjs run --config /etc/pva-node/node.json --audio alsa` |
+| Phrase + question → one spoken answer | pass | node `turn #1 voice (speculative) completed …`, `reply-001.wav`; server `[Test node] turn #1 … assistant=assistant(phrase "hey jeff")` |
+| Next sentence without the phrase ignored | pass | phrase tester: `wake.heard { text: "Tell me something about the weather in Paris.", accepted: false }`, no turn, no second reply file (also over wss) |
+| Per-node follow-up set in admin is honoured | pass | `device.save` assistants `followUpSeconds: 10` → "And what is the capital of France?" `accepted: true`, `turn #4` answered |
+| Node online with version / up to date / transport in admin | pass | `devices`: `connections: 1`, `node { version: "0.0.0+93c6103506", bundleSha256, upToDate: true, platform, status { backend: "file", inputs, outputs }, transport: "ws" }`, `capabilities { v: 1, speaker, microphone }` |
+| Volume and cues reach the node | pass | reply peak 14 159 at volume 80 vs 1 888 at 30 (ratio 0.13, `(30/80)²` = 0.14); "Hey Jeff." alone: no cue files with cues off, wake and lapse cue files with cues on |
+| Identify, Test speaker (protocol and UI buttons) | pass | node log `command from the server: identify` / `test-speaker`; tone peaks 295 at volume 30, 2 097 at 80, 819 at 50 after a Save in the UI |
+| Test microphone levels, Restart | pass | `node.meter { rmsDbfs: -74.7, … }` to admin 213 ms after `test-mic`; `restart` → exit 0 → started again |
+| `answers_everything` | pass | `device.save` on a node (and on Every voice node) with "Answers without a phrase: assistant" → `invalid_settings` with `warnings: [{ key: "withoutPhrase", … }]`; `saveAnyway: true` → `ok` |
+| Remove (protocol and UI) | pass | node `connection lost (4403 this voice node was removed); reconnecting in 600.0 s`; a hello with the old credential: `close 4403 … welcomed=false`; the UI's alertdialog "Remove TLS node? The node disconnects and must be paired again to come back. …" |
+| Pairing again | pass | a new code in the UI (twice) and the installer re-run with `--code` over an existing `node.json` → a new device |
+| Self-update: Update now | pass | bundle rebuilt with `--label upd1` → `the server has 0.0.0+bf1ff422d0.upd1 (7ff093f53163); downloading it` → `switched … restarting` → exit 0 → `pva-node-boot: new release 7ff093f53163, start 1` → `release 7ff093f53163 confirmed` 1.2 s after the command; admin `upToDate: true` 1.2 s after it |
+| Self-update on reconnect | pass | `--label upd2`, server restarted: `1001` → refused ×3 → `the server has …upd2 (4287c3d7868f)` → switched → confirmed; admin up to date |
+| `PVA_NODE_DIR` (item 8 of the brief) | pass | a server with `PVA_NODE_DIR=<empty dir>`: `/node/manifest.json` → `404 {"error":"not_built"}`; files copied in → served at the next request, `pairing.bundle` set |
+| systemd, ALSA / PipeWire with a sound card, arm64, reboot | not exercised | no Pi, no sound card; §11 marks these **Pi** |
+
+**Mismatches found and fixed** (each with a regression test):
+1. *A fourth code*: server, mock and design already agreed (the oldest is cancelled). Left as is; §6.1 now says the
+   dialog of a cancelled code is not told.
+2. *Seeding*: done at the first `node.pair.create` (not at redeem) on both, but the server sent `device.types` after the
+   `result`, the mock before. The server now pushes first (`SessionHub`, `nodePairing.test.ts` "the first code's seeded
+   Every voice node reaches admin before the result").
+3. *`node.paired` then `devices`*: the server sends `node.paired`, `device.types`, `devices` with the new device, as the
+   mock does. No change.
+4. *`devices` on `node.status`*, `node` and `capabilities` in `devices`, `connections > 0` online, `lastSeen` = went
+   offline: as the mock. No change.
+5. *Update now → `upToDate: true`*: as the mock. But a bundle rebuilt while the server runs never reached admin (no
+   push), so "Update pending" and Update now did not appear: the server now checks the manifest every 5 s and pushes
+   `devices` (`serveMode.ts`, `SessionHub.nodeBundleChanged`; `serveNodes.test.ts` "a bundle rebuilt while the server runs
+   reaches admin", which fails without the change).
+6. *`answers_everything`*: as the mock (both use `validateDeviceSettings`). No change.
+7. *4403 without welcome, `sound` / `soundDevices` in the setup, `name` from `/node/pair`*: as N3 expects. No change.
+8. *`PVA_NODE_DIR`*: works (above).
+9. *Found by the run*: the node page said "runs from source" for a node that was paired but not connected yet (and for
+   every offline node after a server restart): the running bundle is known only from a hello. `runsFromSource()`
+   (`apps/web/src/lib/nodes.ts`) needs a connection (`apps/web/test/nodes.test.ts`). Checked again in the real UI.
+10. *Found by the run*: `serveHarness` passed no `nodeDir`, so the server tests read the checkout's `apps/node/dist`:
+    after `pnpm serve` (which now bundles) `nodePairing.test.ts` failed on `pairing.bundle`. Tests now get an empty
+    node directory.
+
+The mock needed no change: where it and the real server differed (2), the server moved.
+
+**TurnTrace, first data points only** (fake LLM, so every turn was speculative and the model costs nothing; file output,
+so `audible` has no output latency; not a latency claim). `endOfTurn → audible` (= `playbackStart`), from the server's
+lines `grep -E '^\[.*node\] turn' server.log`, eight node turns: 6, 4, 4, 2, 3, 3, 3 ms over ws and 8 ms over wss
+(median 3.5 ms, worst 8 ms); `ttsFirstAudio` −111 to −222 ms (before the end of the turn, speculative). They show the
+path works, not how fast a real model or a real speaker is: M1, M3, M5 need the Pi (§11).
+
+**Not verified here**: arm64; a real sound card, microphone and room; ALSA and PipeWire capture and playback; systemd
+(restart, reboot, `ProtectSystem`); `SERVE_HOST` on a LAN address (the dialog's loopback warning was shown instead);
+`shellcheck` (not installed; `sh -n apps/node/dist/install.sh` passes); the Update now *button* appearing in a browser
+(its push is unit-tested; the command was sent through the protocol); M1–M6.
+
+### N7 Remove WP-2's one-shot mode (2026-11-18, merged as `fb47033`)
+
+`packages/core/src/WakeGate.ts` reverted to its state before `c2e6b3b`; `packages/core/test/WakeGateOneShot.test.ts`
+deleted. Nothing used the mode (serve mode routes with `RouteGate`). `WakeGate.test.ts`,
+`RouteGate.test.ts` and `pnpm check` pass (also in the integration run's full suite); ARCHITECTURE.md and ASSISTANTS.md were corrected in the integration run.
+
+### N4 Admin: voice nodes (2026-11-18, merged as `73c1622`)
+
+Built: Devices › Voice nodes (Add voice node in the header and the empty state; rows with Online / Offline since,
+Update pending, Unencrypted, last error), the Add voice node dialog (address prefilled from admin's WebSocket address,
+loopback and http warnings, code with countdown, the http / pinned https / pasted-proxy-pin commands, not built,
+expiry with New code, Cancel and Escape send `node.pair.cancel`, paired → Open its page), the node page (Status,
+Actions, the type's sections, Sound, Sound devices with "(not connected)", Remove with node words; order in §7.2's
+note), `followUpUnset` shown as "Off: one answer per phrase (voice nodes)", the `answers_everything` note, client
+state (`pairedNodes`, `nodePairCreate`, `nodePairCancel`, `nodeCommand`), the mock (`nodes` and `nodes-empty`
+scenarios, auto-redeem after 2 s, commands, forget) and screenshots in `docs/nodes-evidence/`
+(`e2e/nodesEvidence.ts`). Tests: `apps/web/test/nodes.test.ts`, `apps/web/test/devices.test.ts`,
+`apps/web/e2e/nodes.spec.ts` (on the mock). Tested only against the mock; the integration run then drove the Add
+voice node flow, the node page actions and Remove against the real server (one fix: "runs from source").
+
+### N2 Server: pairing and nodes (2026-11-18, merged as `7411d49`, wired to N2b in `1295361`)
+
+Built as §6.1 with these choices: a device-less hello whose client id is a paired node's id is refused 4403 (a page
+cannot use a node's session key); the total back-off holds until the oldest of the last 50 wrong attempts leaves the
+10-minute window; old device-type entries get the built-in `sound` / `soundDevices` at load; `device.types` carries
+`followUpUnset`; `device.setup` carries the keys of the device's type. `serveMode` first used a stand-in for N2b's
+`makeNodeDist`; the lead replaced it with the real one and passed `nodeDir: config.nodeDir` (confirmed working in
+the integration run). Tests: `nodePairing.test.ts`, `serveNodes.test.ts`, plus the changed `serveAssistantMessages`,
+`serveFrontends`, `migrateAssistants` tests; scripted clients and injected providers only, until the integration run.
+
+### N2b Serving the node (2026-11-18, merged as `b5c0692`)
+
+Built as §6.3: `makeNodeDist(dir)` (manifest read and validated at start and on each change of its `stat`, every
+artifact's size and SHA-256 checked at load, a mismatch answers `404 not_built` and logs), the four routes with their
+cache headers and ETags, `POST /node/pair` parsing (4 KiB, JSON, `Origin` refused, the request's remote address passed
+to `redeem`), `http.ts`'s `node` option after the host check, and the root `serve` script that bundles the node (a
+failed bundle prints "voice node bundle not built: /node/* answers 404" and the server still starts). Tests:
+`apps/assistant/test/nodeDist.test.ts` with a fixture `dist/`, `http.test.ts`. Real files and the real installer were
+first served in the integration run.
+
+### N1 Protocol 9 (2026-11-18, merged as `b0c4e16`)
+
+Built as §3.1–3.2 and §5: `nodes.ts`, `capabilities.ts`, `sound` / `soundDevices` in the closed `DeviceSettingsKey` set,
+`VOICE_NODE_DEVICE_TYPE` with `followUpUnset: 0`, the `type` argument of `effectiveFollowUpSeconds` /
+`routeConfigFrom` / `validateDeviceSettings` / `deviceSetupFrom`, `Hello.node`, `DeviceHello.capabilities`, the
+`node.*` messages, `Result.pairing`, `CloseCode.unauthorized = 4403`, `PROTOCOL_VERSION = 9`, examples for every new
+message. Mechanical edits elsewhere so that `pnpm check` passed (settings literals, `ADMIN_ONLY`). Tests:
+`packages/protocol/test/nodes.test.ts` (round trips, `followUpUnset`, the warning, `deviceSetupFrom`, a real manifest),
+and the changed `assistants`, `looksAndVoices`, `serverMessages7`, `sessions` tests.
 
 ### Status after the merge of main (2026-11-18, design revision; nothing re-run)
 

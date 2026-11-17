@@ -18,8 +18,10 @@ The design builds on three other pieces of work:
 - **Voice sessions** (docs/VOICE-SESSIONS.md, merged as #5): a voice session per device.
 - **Voice providers** (docs/VOICE-PROVIDERS.md, merged). It provides one voice reference `{ provider, voiceId }`, removes the
   voice router, retires the per-device voice and expects a per-assistant voice selection (its §7.1); this work built that.
-- **Voice nodes** (docs/VOICE-NODES.md on branch `t3/standalone-triggered-voice-service`, PR #4, not merged and not
-  in this branch). Its one-shot mode is built on `WakeGate`, which therefore stays in core (§4.1).
+- **Voice nodes** (docs/VOICE-NODES.md, branch `t3/standalone-triggered-voice-service`, PR #4). Its first design built a
+  one-shot mode on `WakeGate`; that mode was removed (VOICE-NODES.md N7). A node is a device of type `voice-node` whose
+  assignments get follow-up 0 unless one is set (`DeviceTypeDefinition.followUpUnset`), so the route gate needs nothing
+  new (§4.1).
 
 `docs/ARCHITECTURE.md` stays the contract. This design changes none of its service interfaces (`AudioInput`,
 `AudioOutput`, `Stt`, `Llm`, `Tts`), and the `Conversation` API is unchanged too. It replaces `WakeGate`'s
@@ -528,9 +530,10 @@ Nothing else is sent: only the sentence and the Handles lines. TypeSafe option o
   `RouterState`, `RouteDecision` and the state helpers); the router and its configuration live on in
   `packages/core/src/TriggerRouter.ts` as a fixture for the agent tests, exported from `@pva/core/testing` only.
 - **`WakeGate`** (WakeGate.ts): its matcher is `RouteGate`'s. The gate and its config (`WakeConfig`, `wakeConfigFromProfile`)
-  stay in core because the voice-node design builds its one-shot mode on them (docs/VOICE-NODES.md §3 on branch
-  `t3/standalone-triggered-voice-service`, PR #4) and the offline bench still measures it; so do the version 3 profile types
-  it uses (`DeviceProfile`, `Activation`). Remove it when that branch has been rebased onto the route gate.
+  stay in core because the offline bench still measures it; so do the version 3 profile types it uses (`DeviceProfile`,
+  `Activation`). Voice nodes no longer need them: the one-shot mode built on them was removed (docs/VOICE-NODES.md §4.3,
+  N7) and a node is a device of type `voice-node` whose assignments get follow-up 0 unless set. Their removal is left to
+  a clean-up of the bench.
 - **`Router`, `AgentSet`, `makeAgentConversation`, `Agent`** stay as core's mechanism for an agent-backed
   conversation. The app keeps using them only for Claude subscription assistants, with the fixed
   `subscriptionRouter` (subscription.ts:59-65): the agent if running, else the offline stand-in with a notice.
@@ -1014,7 +1017,7 @@ the voice page's assistant menu, the chat switcher and per-assistant conversatio
 settings store's legacy view (`frontendData`, `saveFrontends`, `applyLegacyChange`), the unused additions of `protocol/agents.ts`,
 the dead `accountNotAvailableYet` stub of the admin, the mock server's profile layer, `profiles.real.ts`. The device registry (a device
 seen, its last visit, forgotten) moved to `serve/devices.ts` on version 4 records. `makeTriggerRouter` moved to a test fixture
-(§4.1). Kept on purpose: `WakeGate` and the version 3 profile types (the voice-node branch and the offline bench use them, §4.1); the
+(§4.1). Kept on purpose: `WakeGate` and the version 3 profile types (the offline bench uses them, §4.1; voice nodes no longer do); the
 flat per-assistant keys, their section fields and the mirror of a saved flat key into the migrated assistant (the command-line modes
 read the keys and `settings.update` still accepts them); the module fields of the Claude subscription (used outside serve mode,
 mirrored into the migrated assistant); `EngineProviders.llm/.tts/.voice/.stt` (tests inject one build through them, 42 uses in 25
@@ -1023,8 +1026,9 @@ temporary root per run (`vitest.global-setup.ts`) so they no longer leave `pva-*
 
 ## Open items
 
-- **Voice nodes (WP-17).** PR #4 is rebased onto protocol 7 later (its `voice-node` device type takes protocol 8). Until then
-  `WakeGate`, `wakeConfigFromProfile` and the version 3 profile types stay.
+- **Voice nodes (WP-17).** Done on PR #4's branch as protocol 9 (8 went to looks and voices): `voice-node` is a device type
+  with `followUpUnset: 0` (docs/VOICE-NODES.md). Its one-shot mode on `WakeGate` was removed; `WakeGate`,
+  `wakeConfigFromProfile` and the version 3 profile types stay only for the offline bench.
 - **TypeSafe.** The decision's whole time is added to playback (Measurements). A way to hide it, not built, is a design change for the
   owner: start the speculative turn at once for a tentative assistant (the fallback, or the last one chosen) while TypeSafe is asked,
   and hand over only when it chooses another. No warm-up request keeps the connection open (Node closes an idle one after about 4 s), so
