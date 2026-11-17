@@ -254,7 +254,7 @@ Server only: no voice-page work. P10 is the first consumer on a screen.
   documented restore.
 - A stored schema version per module. A database written by a newer version of a module is refused for that module
   (`unavailable`, with the reason), never opened and rewritten by older code.
-- `ctx.store`: document collections (`defineCollection` with scope, schema, version, lazy migration, `ambient`
+- `ctx.store`: document collections (`defineCollection` with scope, schema, version, migration of the whole collection when its version changes, `ambient`
   lines) and module-owned SQL tables prefixed `m_<moduleId>__` with their own migrations, including FTS5 where the
   build has it.
 - Scopes household, person, assistant, device, conversation, derived from `CurrentTurn` or given explicitly.
@@ -266,13 +266,14 @@ Server only: no voice-page work. P10 is the first consumer on a screen.
   connected or disconnected, module state changed).
 - To voice pages: `household.event` and a snapshot, defined in the protocol. Nothing is sent by default. A
   collection or an event type opts in by giving a **projection**: a function from the row or event and the target
-  device to what that device may see, or nothing. The same projection is applied to snapshots, live events and
-  replay from the change log on reconnect. This is how an alarm's label can be shown on the device it will ring on
+  device to what that device may see, or nothing. The same projection is applied to snapshots and live events; a page that
+  reconnects, or that may have missed something, gets a fresh snapshot. This is how an alarm's label can be shown on the device it will ring on
   and left out elsewhere. A row a device could see and no longer can is sent to it as a removal, and a change to a
   device's place or default person gives it a fresh snapshot. Person-scoped rows are also passed through
   `Privacy.mayReveal` once P5 exists.
 - Ambient facts: a host context provider that assembles collections' `ambient` lines within the 50 ms budget, capped
-  at 600 characters, behind a household switch. Measured with `TurnTrace` on and off.
+  at 600 characters, behind a household switch that is off until the owner has measured, with `bench --live
+  --ambient`, what the added context costs their model's first token.
 
 ### P5. People, rooms and device capabilities
 
