@@ -694,7 +694,7 @@ describe("review round 3: a declaration that takes speech away stops the reply i
     const fastTts = Tts.of({
       sampleRate: 22_050,
       synthesize: (clauses) =>
-        clauses.pipe(Stream.flatMap((clause) => Stream.fromIterable(Array.from({ length: 80 }, (): TtsAudio => ({ audio: new Uint8Array(new Int16Array(882).fill(800).buffer), clause })))))
+        clauses.pipe(Stream.zipWithIndex, Stream.flatMap(([, clause]) => Stream.fromIterable(Array.from({ length: 80 }, (): TtsAudio => ({ audio: new Uint8Array(new Int16Array(882).fill(800).buffer), clause })))))
     })
     await stopCase(fastTts, { speed: 0.1 })
   })
@@ -703,7 +703,7 @@ describe("review round 3: a declaration that takes speech away stops the reply i
     const pausedTts = Tts.of({
       sampleRate: 22_050,
       synthesize: (clauses) =>
-        clauses.pipe(Stream.flatMap((clause) =>
+        clauses.pipe(Stream.zipWithIndex, Stream.flatMap(([, clause]) =>
           Stream.concat(
             Stream.fromIterable(Array.from({ length: 4 }, (): TtsAudio => ({ audio: new Uint8Array(new Int16Array(882).fill(800).buffer), clause }))),
             Stream.fromEffect(Effect.as(Effect.sleep(30_000), { audio: new Uint8Array(0), clause } as TtsAudio))
