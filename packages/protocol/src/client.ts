@@ -16,6 +16,7 @@ import { MAX_TEXT_INPUT_CHARS } from "./constants.ts"
 import { MAX_MOVE_KEYS } from "./env.ts"
 import { DeviceSettingsPatch, DeviceTarget } from "./devices.ts"
 import { DeviceHello, DeviceId, DeviceName, FrontendRole, WakePhrase } from "./frontends.ts"
+import { DeviceCapabilities, DeviceLiveState } from "./capabilities.ts"
 import { HouseholdHello } from "./household.ts"
 import { JobAction, ToolId } from "./jobs.ts"
 import { SettingsPatch, SettingValue } from "./settings.ts"
@@ -443,6 +444,17 @@ export const HealthCheck = Schema.Struct({
   requestId: RequestId
 })
 
+/**
+ * Protocol 11 (P5), voice connections with a device: what the device can do changed (`capabilities`: a resize, a
+ * rotation; the whole declaration again), and/or its live state (`live`: visible, last interaction). Sent at most once
+ * a second. Not answered; ignored from admin connections and from voice connections without a device.
+ */
+export const DeviceCaps = Schema.Struct({
+  type: Schema.Literal("device.caps"),
+  capabilities: Schema.optionalKey(DeviceCapabilities),
+  live: Schema.optionalKey(DeviceLiveState)
+})
+
 export const ClientMessage = Schema.Union([
   Hello,
   AudioClaim,
@@ -481,7 +493,8 @@ export const ClientMessage = Schema.Union([
   ConversationRead,
   DevicePick,
   HealthCheck,
-  ModuleAction
+  ModuleAction,
+  DeviceCaps
 ]).pipe(Schema.toTaggedUnion("type"))
 export type ClientMessage = typeof ClientMessage.Type
 export type ClientMessageType = ClientMessage["type"]

@@ -150,12 +150,19 @@ export interface Row<A> {
 }
 
 /**
- * The device a page runs on, as a projection sees it. Small on purpose and growing: P5 adds the device's room and
- * default person. `id` is absent for a voice page that sent no device.
+ * The device a page runs on, as a projection sees it. Small on purpose. `id` is absent for a voice page that sent no
+ * device. P5: its room, privacy and default person (the effective `place` section), which `Privacy.mayReveal` reads.
+ * Absent privacy is judged as `shared` with nobody's name on it.
  */
 export interface TargetDevice {
   readonly id?: string
   readonly name?: string
+  /** `place.room` ("Kitchen"); absent for none. */
+  readonly room?: string
+  /** `place.privacy`. */
+  readonly privacy?: "private" | "shared" | "public"
+  /** `place.defaultPerson`: whose data a turn here means. */
+  readonly defaultPerson?: string
 }
 
 /** What an `ambient` function is given besides the rows. */

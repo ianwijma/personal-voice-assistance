@@ -24,7 +24,7 @@ test.describe("desktop (1280 × 800)", () => {
     expect(hash(page)).toBe("#settings/shared")
     // The current category is expanded to its pages, in the mock-up's order (Home and Routing when the server has them).
     const pages = await page.getByTestId("settings-nav").locator("[data-testid^=nav-shared-]").allTextContents()
-    expect(pages.map((t) => t.trim())).toEqual(["Home", "Modules", "Language model accounts", "Routing", "Speech recognition models", "Voice providers", "Limits"])
+    expect(pages.map((t) => t.trim())).toEqual(["Home", "Members", "Modules", "Language model accounts", "Routing", "Speech recognition models", "Voice providers", "Limits"])
     await page.getByTestId("nav-shared-limits").click()
     await expect(page.getByTestId("page-shared-limits")).toBeVisible()
     expect(hash(page)).toBe("#settings/shared/limits")

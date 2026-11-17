@@ -206,7 +206,9 @@ export const TextListField = Schema.Struct({
 const itemCommon = {
   key: FieldKey,
   label: Schema.String,
-  description: Schema.optionalKey(Schema.String)
+  description: Schema.optionalKey(Schema.String),
+  /** Protocol 11: kept in every record but not drawn (an id the server makes, such as a person's). */
+  hidden: Schema.optionalKey(Schema.Boolean)
 }
 
 /** The field types allowed inside a record: flat, no secrets, no nesting, no actions (docs/MODULES-PLAN.md §3.3). */

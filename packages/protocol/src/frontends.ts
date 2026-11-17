@@ -1,4 +1,5 @@
 import { Schema } from "effect"
+import { DeviceCapabilities } from "./capabilities.ts"
 import { InterruptMode, NonNegativeFinite, OutputPath } from "./common.ts"
 
 /**
@@ -246,7 +247,12 @@ export const DeviceHello = Schema.Struct({
   id: DeviceId,
   kind: FrontendKindId,
   /** Suggested name (derived from the user agent); used only the first time the server sees this device. */
-  name: DeviceName
+  name: DeviceName,
+  /**
+   * Protocol 11 (P5): what this device can do, measured by the page (absent = cannot; `capabilities.ts`). Changes are
+   * sent with `device.caps`. The server keeps the last declaration in the device's record.
+   */
+  capabilities: Schema.optionalKey(DeviceCapabilities)
 })
 export type DeviceHello = typeof DeviceHello.Type
 

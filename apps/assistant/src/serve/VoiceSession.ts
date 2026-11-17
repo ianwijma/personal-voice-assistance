@@ -15,6 +15,7 @@ import {
   type SttEvent,
   type Trace,
   type TurnOrigin,
+  type TurnPerson,
   type TurnSetup,
   TurnTrace,
   voiceKey
@@ -114,6 +115,11 @@ export interface VoiceSessionOptions {
   readonly engine: Engine
   /** The device's effective settings now (docs/ASSISTANTS.md §2.6). */
   readonly deviceSettings: () => DeviceSettings
+  /**
+   * P5: the room and person every turn here has (`CurrentTurn.room`, `.person`), read at each turn's start (a cache
+   * read). Absent: neither.
+   */
+  readonly place?: () => { readonly room?: string; readonly person?: TurnPerson }
   /**
    * The recogniser this device hears with now (the resource pool's for its hearer, WP-11). Read when the recogniser
    * loop starts and again after every `hearingChanged`. Absent: the engine build's `stt` (tests).
@@ -630,8 +636,16 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
           let origin: TurnOrigin | undefined
           const originNow = (): TurnOrigin => {
             const deviceName = options.name()
-            if (origin?.deviceName !== deviceName) {
-              origin = { assistantId: assistant, ...(options.deviceId !== undefined ? { deviceId: options.deviceId } : {}), deviceName }
+            // P5: the device's room and default person (`how: "device-default"`), from the device's place.
+            const place = options.place?.()
+            if (origin?.deviceName !== deviceName || origin.room !== place?.room || origin.person?.id !== place?.person?.id) {
+              origin = {
+                assistantId: assistant,
+                ...(options.deviceId !== undefined ? { deviceId: options.deviceId } : {}),
+                deviceName,
+                ...(place?.room !== undefined ? { room: place.room } : {}),
+                ...(place?.person !== undefined ? { person: place.person } : {})
+              }
             }
             return origin
           }

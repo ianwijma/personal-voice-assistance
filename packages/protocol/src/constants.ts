@@ -73,8 +73,14 @@
  * version 9 page would refuse a form that uses them); `ErrorCode` gains `unknown_action` and `not_running`.
  * Additive, within 10: `module.action` (admin only) and `Result.action`, `ModuleInfo.routes`, and the module route
  * API (`moduleRoutes.ts`).
+ *
+ * 11: people, rooms and device capabilities (docs/MODULES-PLAN.md §4 P5). `DeviceSettingsKey` gains `place` and
+ * `capabilities` and `DeviceSettings` requires both (`DevicePlace`, `CapabilityOverrides`), so a version 10 peer would
+ * refuse a version 11 device entry. Additive, within 11: `hello.device.capabilities` and `device.caps`
+ * (`DeviceCapabilities`, `DeviceLiveState`), `DeviceRecord.declared`, `DeviceListInfo.declared` / `live`, and
+ * `RecordItemField.hidden` (a record field kept but not drawn: a person's id in Members).
  */
-export const PROTOCOL_VERSION = 10
+export const PROTOCOL_VERSION = 11
 
 /** Path of the WebSocket endpoint, on the same origin as the UI in production. */
 export const WS_PATH = "/ws"

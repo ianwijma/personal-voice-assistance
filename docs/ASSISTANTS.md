@@ -183,11 +183,15 @@ DeviceSettings = Struct({
                   outputPath: OutputPath, prebufferMs: PrebufferMs }),   // the last two web-voice only (advanced)
   captions: Struct({ captions: Boolean, speakTyped: Boolean }),         // web-voice only; speakTyped was `speakReplies`
   look: DeviceLook,                             // { from: "assistant" } | { from: "device", look }: the stage's character for every assistant, or each one's (LOOKS-AND-VOICES.md)
-  voice: DeviceVoice                            // { from: "assistant" } | { from: "device", voice }: the voice of every assistant on the device, or each one's own
+  voice: DeviceVoice,                           // { from: "assistant" } | { from: "device", voice }: the voice of every assistant on the device, or each one's own
+  place: DevicePlace,                           // protocol 11 (P5): { room, privacy: private | shared | public, alwaysOn, acceptsFromOthers (true),
+                                                //   quietRoom, defaultPerson: PersonId | null }; built-in shared, nobody's
+  capabilities: CapabilityOverrides             // protocol 11 (P5): { noDisplay, excludeKinds, noSpeaker }: can only take away what it declares
 })
 DeviceOwn = Partial(DeviceSettings)             // each key present = own value; absent = follows the type defaults
 
-DeviceRecord (stored) = { kind: DeviceKind, name: DeviceName, firstSeen, lastSeen, own: DeviceOwn }
+DeviceRecord (stored) = { kind: DeviceKind, name: DeviceName, firstSeen, lastSeen, own: DeviceOwn,
+                          declared?: { capabilities: DeviceCapabilities, seenAt } }   // protocol 11: its last declaration
 DeviceType (code registry, replaces FRONTEND_KINDS, serve/frontends.ts:44) =
   { kind, title ("Browsers"), one ("browser"), many, description, keys: ReadonlyArray<keyof DeviceSettings>,
     builtIn: DeviceSettings }
@@ -206,6 +210,7 @@ vault for secrets.
 | Page (mock-up) | Section and keys |
 |---|---|
 | Home | new section `home`: `HOME_LOCATION` (text ≤ 200), `HOME_TIME_ZONE` (IANA, empty = this machine's), `HOME_LANGUAGE` (BCP 47: en-GB, en-US, nl-NL, de-DE), `HOME_UNITS` (metric \| imperial), `HOME_DATE_FORMAT` (en-GB \| en-US \| nl-NL), `HOME_CURRENCY` (ISO 4217, default EUR), `HOME_CUP_SIZE` (metric 250 ml \| us 236.6 ml), `HOME_API_CONTACT` (text ≤ 200, no default; goes in the `User-Agent` of public API calls, see `@pva/net`) |
+| Members | protocol 11 (P5), section `members`: `HOUSEHOLD_MEMBERS` (records: a hidden server-made `id`, name, aliases, pronunciation, allergies, diets, dislikes; at most 24), `HOUSEHOLD_DIET_ALLERGIES`, `HOUSEHOLD_DIET_DIETS`, `HOUSEHOLD_DIET_DISLIKES` (the household's diet, for everyone who has none of their own). A device's `place.defaultPerson` names one of them; removing a person clears it (docs/ARCHITECTURE.md, "People, rooms and device capabilities") |
 | Modules | each module's settings in `modules[id].settings`, through `module.configure` (unchanged message) |
 | Language model accounts | `anthropic`: ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL · `claude-subscription`: the agent module's optIn, claudePath, proxy, debugLogs · `openrouter`: its module's key · `home-model`: its module's address and key |
 | Routing | new section `routing`: `TYPESAFE_API_KEY` (secret), `TYPESAFE_MODEL` (default `jev-1.14.0`, shown pinned), `TYPESAFE_BASE_URL` (advanced) |
@@ -602,7 +607,9 @@ the migrated assistant stay (§6, "What was built").
 
 `PROTOCOL_VERSION = 7` (`packages/protocol/src/constants.ts`; built; the voice-provider work kept 6). Since then
 looks and voices (docs/LOOKS-AND-VOICES.md) took **8**: the `look` and `voice` device sections are new members of the
-closed set `DeviceSettingsKey` and required in `DeviceSettings`.
+closed set `DeviceSettingsKey` and required in `DeviceSettings`. Module API v2 took 9, extended settings fields 10, and
+people, rooms and device capabilities (docs/MODULES-PLAN.md §4 P5) **11**: the `place` and `capabilities` device sections,
+the same way (a stored type entry without them takes the built-in's when it loads).
 
 The voice-node design claims 7 for itself (docs/VOICE-NODES.md §2), but its code is at 5: it branches from #3
 (93ed0fd), before voice sessions. **Order**: voice providers merge first (no bump), then this design's WP-2 (7), then

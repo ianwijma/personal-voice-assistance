@@ -53,6 +53,8 @@ export const makeHouseholdPush = (options: {
         )
       ))
     },
+    // P5: the device's place or default person changed: what it may see changed, so it starts again from a snapshot.
+    placeChanged: (connection) => hooks.connected(connection, undefined),
     deviceConnected: (deviceId) => bus.publish(hostEvent("device.connected", { deviceId }, { kind: "device", id: deviceId })),
     deviceDisconnected: (deviceId) => bus.publish(hostEvent("device.disconnected", { deviceId }, { kind: "device", id: deviceId }))
   }

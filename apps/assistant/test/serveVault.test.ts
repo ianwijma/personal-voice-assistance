@@ -100,6 +100,7 @@ describe("serve: key vault and admin access", () => {
     const flags = Object.fromEntries(welcome.snapshot.sections.map((s) => [s.id, s.protected === true]))
     expect(flags).toEqual({
       home: false,
+      members: false,
       "language-model": true,
       "llm-behaviour": false,
       "llm-openai-accounts": true,

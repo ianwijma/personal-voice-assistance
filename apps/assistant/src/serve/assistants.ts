@@ -80,6 +80,8 @@ export interface AssistantsOptions {
    * without a key (warning, "Save anyway"). Without it every voice is accepted.
    */
   readonly voiceProblem?: (voice: VoiceRefJson) => { readonly level: "error" | "warning"; readonly message: string } | undefined
+  /** P5: whether a person id is one of the household's Members (a `place.defaultPerson` must be). Absent: any id. */
+  readonly isPerson?: (id: string) => boolean
 }
 
 export interface Assistants {
@@ -276,6 +278,13 @@ export const makeAssistants = (options: AssistantsOptions): Assistants => {
     return fail("invalid_settings", `${problem.message} Save anyway to keep it.`, { warnings: [{ key: "voice", message: problem.message }] })
   }
 
+  /** P5: a `place` whose default person is not one of the Members is refused. */
+  const placeRefusal = (patch: DeviceSettingsPatch): AssistantResult | undefined => {
+    const person = patch.place?.defaultPerson
+    if (person === undefined || person === null || options.isPerson === undefined || options.isPerson(person)) return undefined
+    return refusal([{ code: "invalid", path: "place.defaultPerson", message: "That person is not in Members (any more): pick another, or nobody." }])
+  }
+
   const ownWith = (own: DeviceOwn, patch: DeviceSettingsPatch, keys: ReadonlyArray<DeviceSettingsKey>): DeviceOwn => {
     const out: Record<string, unknown> = { ...own }
     for (const key of keys) {
@@ -322,7 +331,7 @@ export const makeAssistants = (options: AssistantsOptions): Assistants => {
           else if (patch[key] === null) issues.push({ code: "invalid", path: key, message: "Defaults cannot be reset; only a device can follow them." })
         }
         if (issues.length > 0) return Effect.succeed(refusal(issues))
-        const voiceRefused = voicePatchRefusal(patch, saveAnyway)
+        const voiceRefused = voicePatchRefusal(patch, saveAnyway) ?? placeRefusal(patch)
         if (voiceRefused !== undefined) return Effect.succeed(voiceRefused)
         const before = typeSettingsFrom(file, target.type)
         const next = { ...before, ...Object.fromEntries(Object.entries(patch).filter(([, v]) => v !== undefined)) } as DeviceSettings
@@ -337,7 +346,7 @@ export const makeAssistants = (options: AssistantsOptions): Assistants => {
       }
       const record = file.devices[target.id]
       if (record === undefined) return Effect.succeed(fail("unknown_device", "That device is not known (it may have been forgotten)."))
-      const voiceRefused = voicePatchRefusal(patch, saveAnyway)
+      const voiceRefused = voicePatchRefusal(patch, saveAnyway) ?? placeRefusal(patch)
       if (voiceRefused !== undefined) return Effect.succeed(voiceRefused)
       const type = deviceTypeOf(record.kind)
       const keys = type?.keys ?? []

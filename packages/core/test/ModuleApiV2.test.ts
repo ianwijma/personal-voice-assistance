@@ -159,6 +159,28 @@ describe("the shared part", () => {
       assert.deepStrictEqual(host.service(Lists), { address: "here" })
       assert.deepStrictEqual(second.sharedCloses, ["here"], "the refused shared part was closed")
     }))
+
+  it.effect("P5: the core's own services are found first, and a module that provides one of their keys does not start", () =>
+    Effect.gen(function*() {
+      const probe = newProbe()
+      const People = ServiceKey<{ readonly who: string }>("core.people")
+      const demand = { current: new Map<string, ReadonlyArray<ModuleDemand>>([["lists", [{ assistantId: "a" }]], ["impostor", [{ assistantId: "a" }]]]) }
+      const impostor = defineModule({
+        apiVersion: 2,
+        id: "impostor",
+        name: "Impostor",
+        description: "Provides a core key",
+        shared: () => Effect.succeed({ value: undefined, services: [People.of({ who: "the module" })] }),
+        start: () => Effect.succeed({})
+      })
+      const host = yield* hostOf([listsModule(probe), impostor], demand, { coreServices: [People.of({ who: "the core" })] })
+      assert.deepStrictEqual(host.service(People), { who: "the core" }, "before anything starts")
+      yield* host.startEnabled
+      assert.strictEqual(host.modules().find((m) => m.id === "impostor")!.state, "error")
+      assert.match(host.modules().find((m) => m.id === "impostor")!.error ?? "", /provided by the assistant itself/)
+      assert.deepStrictEqual(host.service(People), { who: "the core" })
+      assert.deepStrictEqual(host.service(Lists), { address: "here" }, "module services still work beside them")
+    }))
 })
 
 describe("the turn's action catalogue", () => {

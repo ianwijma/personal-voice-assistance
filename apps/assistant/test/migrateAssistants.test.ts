@@ -158,7 +158,10 @@ describe("migration fixtures", () => {
       audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, speakAloud: true, outputPath: "direct", prebufferMs: 60 },
       captions: { captions: true, speakTyped: true },
       look: { from: "assistant" },
-      voice: { from: "assistant" }
+      voice: { from: "assistant" },
+      // Protocol 11: the built-in place and no overrides.
+      place: { room: "", privacy: "shared", alwaysOn: false, acceptsFromOthers: true, quietRoom: false, defaultPerson: null },
+      capabilities: { noDisplay: false, excludeKinds: [], noSpeaker: false }
     })
     expect(isDeviceSettings(web)).toBe(true)
     expect(existsSync(join(dir, "settings.json"))).toBe(false)

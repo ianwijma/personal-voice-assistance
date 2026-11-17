@@ -185,7 +185,7 @@ Conversation.layerWithSetup({ setup: Effect<TurnSetup>, ... })   // TurnSetup = 
 - `TurnSetup.maxToolRounds` (optional, added 2026-11-17): the tool-round limit of that turn, fixed at its start; it wins over `AgentSet.maxToolRounds` and the conversation's `maxToolRounds`. Serve mode sets it to the assistant's `toolRounds` in the same setup read that makes the turn's configuration snapshot (`TraceInfo.config.toolRounds`), so a changed limit applies from the next turn and the snapshot reports the limit the turn ran with.
 - `onEvent` receives `ConversationEvent`s synchronously on the turn's fiber (no Effect per event): `ConversationStarted` (a new conversation, `reason` `new` or `idle`; before the turn that an idle reset started for), `TurnStarted` (with `speculative`, `spoken`, `source`), `TurnPromoted`, `TextDelta` (raw, rounds separated by `"\n"`), `ClauseQueued`, `ClausePlaying`, `ToolStarted`, `ToolFinished`, `TurnEnded` (after history is committed, with the trace). Speculative turns emit events too; the subscriber decides what to show. A throwing subscriber is ignored.
 - `CurrentTurnTrace` is provided around `AudioOutput.play` as well as around `Tts.synthesize` (the web output uses the turn id as the reply id and records the browser's numbers in the trace).
-- `TurnSetup.turnContext` (optional, module API v2, `TurnOrigin`): who and where the turn is for (assistant id, device id and name; later room and person). When it is set, `Conversation` provides `CurrentTurn` (`TurnContext`: that plus the turn id, conversation id and source) around the agent's whole turn stream, so every tool call, every action run (the intent agent's, a confirmed one) and the gathering of the context providers read it with `yield* CurrentTurn`. It is one value per turn, built at the turn's start: nothing else is added to the turn path. Absent (the CLI modes): `CurrentTurn` is `undefined`. Serve mode sets it in `VoiceSession` (the origin object is reused while the device's name does not change).
+- `TurnSetup.turnContext` (optional, module API v2, `TurnOrigin`): who and where the turn is for (assistant id, device id and name; since P5 the device's room and its default person, `how: "device-default"`). When it is set, `Conversation` provides `CurrentTurn` (`TurnContext`: that plus the turn id, conversation id and source) around the agent's whole turn stream, so every tool call, every action run (the intent agent's, a confirmed one) and the gathering of the context providers read it with `yield* CurrentTurn`. It is one value per turn, built at the turn's start: nothing else is added to the turn path. Absent (the CLI modes): `CurrentTurn` is `undefined`. Serve mode sets it in `VoiceSession` (the origin object is reused while the device's name, room and default person do not change).
 
 | Event | Action |
 |---|---|
@@ -298,7 +298,7 @@ SharedPart<X>         = { value: X; services?: [ServiceKey<T>.of(impl)]; contrib
 ModuleHostApi = {
   routeTokens: { mint(name, label): Effect<{ token, secret }>; list: Effect<RouteTokenInfo[]>; revoke(id): Effect<boolean> }  // P3
   view(): HostView                                  // module states, vault locked, engine summary, devices, Home values
-  service<T>(key: ServiceKey<T>): T | undefined     // live; undefined while no demanded module provides it
+  service<T>(key: ServiceKey<T>): T | undefined     // live; the core's own (P5: People, Privacy, Devices) first, else undefined while no demanded module provides it
   contributions<T>(key: ContributionKey<T>): ReadonlyArray<T>
   actions: { list: Effect<CatalogAction[]>; run(req): Effect<ActionRunResult> }  // the turn's (calling assistant's) catalogue
   requestRestart(reason): Effect<void>
@@ -376,12 +376,56 @@ EventBus = { publish(event); subscribe(filter?, { capacity? }); stats(); forModu
   slow subscriber never holds up a publisher or the turn path.
 - **Pages**: `household.snapshot` after `welcome` and `household.event` after each commit, only for collections and
   event types with a projection, through `mayRevealScopeTo` (household to every voice page, device to its own, person
-  withheld until P5's `Privacy.mayReveal`) and the projection, the same on all three paths (snapshot, live, replay from
-  `hello.household.seq`). `HouseholdFeed.ts`, `serve/HouseholdPush.ts`.
+  through `Privacy.mayReveal` on the page's `TargetDevice`: its privacy and default person) and the projection, the same
+  on all three paths (snapshot, live, replay from `hello.household.seq`). A change of a device's place or default person
+  gives its pages a fresh snapshot. `HouseholdFeed.ts`, `serve/HouseholdPush.ts`.
 - **Ambient facts**: one host context provider (`Household`, 50 ms, 600 characters, `HOME_AMBIENT_FACTS`) appended to
   each assistant's registry in serve mode (`withContextProvider`).
 - **Backups**: daily `data/backups/household-<date>.db` (14 kept, optional `HOUSEHOLD_BACKUP_COPY_DIR`), and `pnpm start
   household backup | export <module> | restore <file>`; `doctor` checks the database and the last backup's age.
+
+### People, rooms and device capabilities (docs/MODULES-PLAN.md §4 P5)
+
+```ts
+// packages/protocol/src/capabilities.ts (protocol 11) — absent means "cannot"
+DeviceCapabilities = { v: 1; display?: { class: "glance" | "compact" | "standard" | "large"; widthPx; heightPx; dpr; shape?;
+                         touch: "none" | "coarse" | "fine"; colour }; present?: { kinds: Record<kind, version> };
+                       speaker?: { media: ("speech" | "audio" | "video")[] }; microphone?: { farField }; openUrl?: boolean }
+DeviceLiveState    = { visible: boolean; lastInteractionAt?: number }          // memory only, at most once a second
+DevicePlace        = { room: string; privacy: "private" | "shared" | "public"; alwaysOn; acceptsFromOthers; quietRoom;
+                       defaultPerson: PersonId | null }                          // device section `place`
+CapabilityOverrides = { noDisplay: boolean; excludeKinds: kind[]; noSpeaker: boolean }   // device section `capabilities`
+effectiveCapabilities(declared | undefined, overrides): DeviceCapabilities      // declared minus overrides; never adds
+// hello.device.capabilities, then { type: "device.caps", capabilities?, live? }; DeviceRecord.declared = { capabilities, seenAt }
+
+// packages/core: provided by serve mode through `host.service(key)` (ModuleHostOptions.coreServices)
+People  (ServiceKey "core.people")  = { list(); get(id); find(spoken): PersonMatch /* found | ambiguous | none */;
+                                        householdDiet(); dietOf(personId?): Diet; setDiet(person | "household", Partial<Diet>) }
+Person  = { id; name; aliases; pronunciation; diet: Diet }    Diet = { allergies; diets; dislikes }   // no adult/child, no trusted flag
+Privacy (ServiceKey "core.privacy") = { mayReveal(owner?, device: id | { deviceId? } | undefined): boolean;
+                                        mayRevealItem({ sensitivity: "household" } | { sensitivity: "personal"; owner? }, device);
+                                        mayRevealHere(owner?): Effect<boolean> }     // pure rule: mayRevealTo(owner, place)
+Devices (ServiceKey "core.devices") = { list(): KnownDevice[]; get(id); otherScreens(from, { person? }); bestOtherScreen(from, …) }
+KnownDevice = { id; name; kind; room?; place; capabilities /* effective */; declared?; connected; visible; lastInteractionAt?; lastSeen }
+TargetDevice (HouseholdStore.ts) = { id?; name?; room?; privacy?; defaultPerson? }   // what a projection sees of a page's device
+```
+
+- **Members** is a shared settings section of the core (`serve/people.ts`, Shared settings › Members): `HOUSEHOLD_MEMBERS`
+  (records: a hidden `id` made by the server when a person is added, name, aliases, pronunciation, allergies, diets,
+  dislikes) and the household diet `HOUSEHOLD_DIET_ALLERGIES` / `_DIETS` / `_DISLIKES`. `People.setDiet` saves through
+  `Sections.update` like an admin edit. A person removed from Members is cleared from every device's and device type's
+  `place.defaultPerson` (`SettingsStore.clearDefaultPeople`, also at start); a device's default person is the only link
+  between a device and a person, and it selects whose data a turn means, never what it may do.
+- **`Privacy.mayReveal`** (§2 row 8): a `private` device yes; a `shared` one only when its default person is the owner; a
+  `public` one no; an unknown owner is someone else's; household items always. A device that is offline or unknown is
+  judged from its saved place (an unknown one: its type's defaults).
+- **Devices** (`serve/deviceFacts.ts`): one cached list rebuilt when the settings file, the people or the live state change
+  (a connection, a declaration, visibility), never per turn. "The best other screen" ranks displays that accept things
+  from others: same room and visible, same room and always on, the person's phone (opens links, connected), any other
+  connected shared screen; ties by the most recent interaction.
+- **The context line**: a host context provider (`This device`) after the modules' context and before the ambient facts:
+  `Device: Kitchen speaker (voice only, no screen; room Kitchen; shared, usually Sam). Other screens: Kitchen iPad (on).`
+  It is a cache read (no I/O); measured with `TurnTrace` it adds nothing measurable (`apps/assistant/test/peopleRooms.test.ts`).
 
 ### Scheduler (docs/MODULES-PLAN.md §4 P6; how to use it: [docs/SCHEDULING.md](SCHEDULING.md))
 
@@ -480,7 +524,7 @@ packages/
   audio-pipewire/   AudioInput/AudioOutput by spawning pw-record / pw-cat
   audio-file/       AudioInput from a WAV/PCM file (paced in real time), AudioOutput to a WAV file — for tests and benchmarks on machines with no sound card
   audio-web/        AudioInput/AudioOutput for a browser (serve mode), over an abstract link to the owner's connection
-  protocol/         browser ↔ assistant protocol (version 9; `health.ts`: issues, module availability, templates): message schemas, binary framing, examples; assistants,
+  protocol/         browser ↔ assistant protocol (version 11; `health.ts`: issues, module availability, templates; `capabilities.ts`: what a device can do, its place): message schemas, binary framing, examples; assistants,
                     device types, devices and their settings, resolution rules and bounds (`assistants.ts`, `devices.ts`);
                     device identity, wake phrases and the version 3 profile fields the migration reads (`frontends.ts`);
                     admin sessions (`admin.ts`) (browser-safe)

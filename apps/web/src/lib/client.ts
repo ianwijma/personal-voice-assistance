@@ -8,6 +8,7 @@ import { describeMicError, MicFallbackError, type PlayerEvent, VoiceAudio } from
 import { type Connection, makeConnection, type RequestInput, type ResultMessage, resolveWsUrl } from "./connection.ts"
 import { EchoTestCancelled, runEchoTest } from "./echoTest.ts"
 import { deviceHello } from "./device.ts"
+import { type CapabilityWatch, watchCapabilities } from "./capabilities.ts"
 import { ADMIN_TOKEN_KEY } from "./adminToken.ts"
 import { createPrefsStore, type Prefs, type PrefsStore } from "./prefs.ts"
 import { sessionsFullText } from "./sessions.ts"
@@ -329,6 +330,7 @@ export const createAssistantClient = (options: { readonly frontend?: FrontendRol
     // continuation(none): the connection's hooks run synchronously on each message, on the present state.
     hooks: {
       afterWelcome: (resumed) => {
+        capsWatch?.resync()
         if (resumed) {
           // The server assumes a live microphone on resume: tell it the truth.
           const s = store.get()
@@ -567,9 +569,12 @@ export const createAssistantClient = (options: { readonly frontend?: FrontendRol
     wakeLock = undefined
   }
 
+  /** Protocol 11: the voice page's declaration and live state (`device.caps`), while connected. */
+  let capsWatch: CapabilityWatch | undefined
   const connect = () => {
     prefs.load()
     const stop = connection.start()
+    if (frontend === "voice" && typeof window !== "undefined") capsWatch = watchCapabilities({ send: (m) => connection.send(m) })
     // continuation(none): acts on the present state when the page becomes visible.
     const onVisible = () => {
       if (document.visibilityState !== "visible" || !audio.running) return
@@ -588,6 +593,8 @@ export const createAssistantClient = (options: { readonly frontend?: FrontendRol
     return () => {
       document.removeEventListener("visibilitychange", onVisible)
       window.removeEventListener("pagehide", onPageHide)
+      capsWatch?.stop()
+      capsWatch = undefined
       stop()
     }
   }

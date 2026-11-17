@@ -31,7 +31,13 @@ export interface Household {
 
 const declared = (catalog: ReadonlyArray<ModuleDefinition<any>>) => catalog.map((d) => ({ id: d.id, storage: d.storage }))
 
-const assemble = (store: HouseholdStore, sqlite: SqliteHouseholdStore | undefined, catalog: ReadonlyArray<ModuleDefinition<any>>, log: (line: string) => void) =>
+const assemble = (
+  store: HouseholdStore,
+  sqlite: SqliteHouseholdStore | undefined,
+  catalog: ReadonlyArray<ModuleDefinition<any>>,
+  log: (line: string) => void,
+  people?: () => ReadonlyArray<string>
+) =>
   Effect.gen(function*() {
     yield* store.prepare(declared(catalog))
     for (const d of catalog) {
@@ -43,7 +49,8 @@ const assemble = (store: HouseholdStore, sqlite: SqliteHouseholdStore | undefine
     yield* Effect.addFinalizer(() => Effect.sync(disconnect))
     const feed = makeHouseholdFeed({
       store,
-      modules: catalog.map((d) => ({ moduleId: d.id, collections: d.storage?.collections ?? [], events: d.events ?? [] }))
+      modules: catalog.map((d) => ({ moduleId: d.id, collections: d.storage?.collections ?? [], events: d.events ?? [] })),
+      ...(people !== undefined ? { people } : {})
     })
     const ambientModules = catalog.flatMap((d) => {
       const collections = (d.storage?.collections ?? []).filter((c) => c.ambient !== undefined)
@@ -66,6 +73,8 @@ export const openServeHousehold = (options: {
   readonly catalog: ReadonlyArray<ModuleDefinition<any>>
   readonly backupCopyDir?: string | undefined
   readonly log: (line: string) => void
+  /** P5: the household's person ids now, for the person-scoped rows of a page's snapshot. */
+  readonly people?: () => ReadonlyArray<string>
 }): Effect.Effect<Household, StoreError, Scope.Scope> =>
   Effect.gen(function*() {
     const sqlite = yield* makeSqliteStore({
@@ -73,7 +82,7 @@ export const openServeHousehold = (options: {
       ...(options.backupCopyDir !== undefined && options.backupCopyDir !== "" ? { backupCopyDir: options.backupCopyDir } : {}),
       log: options.log
     })
-    return yield* assemble(sqlite, sqlite, options.catalog, options.log)
+    return yield* assemble(sqlite, sqlite, options.catalog, options.log, options.people)
   })
 
 /**

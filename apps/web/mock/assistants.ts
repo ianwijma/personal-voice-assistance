@@ -151,6 +151,9 @@ const seedDeviceOwn = (longPhrase = false): Map<string, { own: DeviceOwn; rev: n
     ["d-kitchen-ipad-0001", { rev: 0, own: { assistants: [{ assistant: "jeff", phrases: ["Hey Jeff"] }, { assistant: "keuken", phrases: ["Hé keuken", "Hey keuken"], followUpSeconds: 15 }], captions: { captions: false, speakTyped: false } } }]
   ])
 
+/** The person the sample phone belongs to (mock/server.ts seeds Members with Sam and Robin). */
+export const SAM_ID = "p-sam00001"
+
 export interface Known {
   readonly id: string
   readonly name: string
@@ -173,6 +176,8 @@ export interface AssistantsMock {
   readonly touch: (id: string, patch: Partial<AssistantBody>) => boolean
   /** A device was forgotten: its own settings go. */
   readonly forgetDevice: (id: string) => void
+  /** Protocol 11: people removed from Members are no device's default person any more. True when something changed. */
+  readonly clearDefaultPeople: (known: ReadonlySet<string>) => boolean
 }
 
 /** What the server knows about modules that the assistants' checks need (mock/server.ts gives it). */
@@ -364,6 +369,22 @@ export const createAssistantsMock = (catalog: ModuleCatalog): AssistantsMock => 
     },
     forgetDevice: (id) => {
       deviceOwn.delete(id)
+    },
+    clearDefaultPeople: (known) => {
+      let changed = false
+      const gone = (p: string | null) => p !== null && !known.has(p)
+      if (gone(typeSettings.place.defaultPerson)) {
+        typeSettings = { ...typeSettings, place: { ...typeSettings.place, defaultPerson: null } }
+        typeRev += 1
+        changed = true
+      }
+      for (const [id, record] of deviceOwn) {
+        const place = record.own.place
+        if (place === undefined || !gone(place.defaultPerson)) continue
+        deviceOwn.set(id, { own: { ...record.own, place: { ...place, defaultPerson: null } }, rev: record.rev + 1 })
+        changed = true
+      }
+      return changed
     }
   }
   return mock
