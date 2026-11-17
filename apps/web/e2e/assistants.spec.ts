@@ -32,7 +32,7 @@ test("the list shows each assistant with its state, where it is used and the sum
   await expect(jeff.getByTestId("used-count")).toHaveText("On 2 devices")
   await expect(jeff.getByTestId("assistant-strip")).toContainText("claude-haiku-5-5 · effort low")
   await expect(jeff.getByTestId("assistant-strip")).toContainText("Lessac · on this machine")
-  await expect(jeff.getByTestId("assistant-strip")).toContainText("3 modules · 3 tools")
+  await expect(jeff.getByTestId("assistant-strip")).toContainText("3 modules · 4 tools")
   await expect(list.locator("[data-assistant=keuken]").getByTestId("used-count")).toHaveText("On 1 device")
   // The category in the navigation: All assistants, then one entry each.
   await expect(page.getByTestId("nav-assistants-all")).toBeVisible()
@@ -228,13 +228,14 @@ test("Modules: switch a module, switch a tool off; a module that needs set-up is
   await expect(notes.getByRole("switch", { name: "Notes" })).not.toBeChecked()
   await notes.getByRole("switch", { name: "Notes" }).click()
   await expect(notes.getByRole("switch", { name: "Notes" })).toBeChecked()
-  // No module field is overridable yet: no "own settings" control.
-  await expect(page.getByTestId("own-settings")).toHaveCount(0)
+  // Clock, Weather and Home Assistant have overridable fields: each offers its own settings (shared by default); Notes has none.
+  await expect(page.getByTestId("own-settings")).toHaveCount(3)
+  await expect(notes.getByTestId("own-settings")).toHaveCount(0)
   await expect(tabButton(page, "modules").locator("[data-mark=dirty]")).toBeVisible()
   await saveButton(page).click()
   await expect(page.getByTestId("footer-note")).toContainText("Saved")
   expect((await lastSave())!.assistant.modules).toMatchObject({ clock: { on: true, offTools: ["time_in"] }, notes: { on: true, offTools: [] } })
-  await expect(page.getByTestId("assistant-strip")).toContainText("4 modules · 2 tools")
+  await expect(page.getByTestId("assistant-strip")).toContainText("4 modules · 5 tools")
 })
 
 test("Used on: where it answers and how it is reached; Add to a device appends it through device.save", async ({ page, baseURL }) => {

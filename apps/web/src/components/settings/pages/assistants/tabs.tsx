@@ -15,6 +15,7 @@ import {
   accountNotAvailableYet,
   ACCOUNTS,
   accountState,
+  errorsFor,
   hearingModelNames,
   listJoin,
   modelAfterAccountChange,
@@ -22,6 +23,7 @@ import {
   plural,
   targetName
 } from "@/lib/assistants.ts"
+import { displayValue } from "../../FieldRow.tsx"
 import { formatSettingsHash, type SettingsPath } from "@/lib/settingsTree.ts"
 import { parseKey } from "@/lib/voicePicker.ts"
 import { rendererFor } from "@/ui/fieldRenderers.ts"
@@ -454,20 +456,30 @@ export function VoiceTab({ draft }: TabProps) {
 
 // ---- Modules
 
-/** A module field an assistant may set itself: the data marks it (`overridable`; no module does yet, WP-12b). */
-const overridable = (f: SettingField): boolean => (f as { readonly overridable?: boolean }).overridable === true
+/** The fields an assistant may own: the data marks them (`overridable`); a secret never is. */
+const ownableFields = (m: ModuleInfo): ReadonlyArray<SettingField> => m.settings.fields.filter((f) => f.overridable === true && f.type !== "secret")
 
-function ModuleRow({ draft, module: m }: { readonly draft: AssistantDraft; readonly module: ModuleInfo }) {
+/** The shared values of a module in words ("16 November 2026 · Open-Meteo"): what an assistant uses unless it has its own. */
+const sharedSummary = (m: ModuleInfo): string =>
+  m.settings.fields
+    .filter((f) => f.type !== "secret" && f.type !== "boolean" && !(f.advanced === true))
+    .map((f) => displayValue(f, m.settings.values[f.key]))
+    .filter((t) => t !== "(empty)" && t !== "—")
+    .join(" · ")
+
+function ModuleRow({ draft, module: m, compact }: { readonly draft: AssistantDraft; readonly module: ModuleInfo; readonly compact: boolean }) {
   const a = draft.current
   const choice = a.modules[m.id] ?? { on: false, offTools: [] }
   const [open, setOpen] = useState(false)
   const total = m.tools.length
   const n = m.tools.filter((t) => !choice.offTools.includes(t.name)).length
-  const needsSetup = m.state === "error"
+  const needsSetup = m.state === "error" && m.instances === undefined
   const path = `modules.${m.id}`
-  const ownable = m.settings.fields.filter((f) => overridable(f) && f.type !== "secret")
+  const ownable = ownableFields(m)
   const setChoice = (next: typeof choice) => draft.update((x) => ({ ...x, modules: { ...x.modules, [m.id]: next } }), path)
   const changed = draft.changed(path)
+  // A refusal that names no field of the own settings (the tools list, say) is shown under the row.
+  const rowErrors = draft.errors.filter((e) => (e.key?.startsWith(path) ?? false) && !(e.key?.startsWith(`${path}.own.`) ?? false))
   return (
     <li className={cx("flex items-start gap-3 px-3 py-3", !choice.on && "opacity-80")} data-module={m.id} data-changed={changed ? "true" : undefined}>
       <div className="pt-0.5">
@@ -481,7 +493,7 @@ function ModuleRow({ draft, module: m }: { readonly draft: AssistantDraft; reado
         <span className="text-[13px] text-ink-muted">{m.description}</span>
         {needsSetup ? (
           <p className="text-[13px] text-warn">Set up {m.name} in <SettingsLink path={["shared", "modules"]}>its settings</SettingsLink> first.</p>
-        ) : choice.on && total > 0 ? (
+        ) : !compact && choice.on && total > 0 ? (
           <>
             <button
               type="button"
@@ -524,12 +536,27 @@ function ModuleRow({ draft, module: m }: { readonly draft: AssistantDraft; reado
         ) : (
           <span className="font-mono text-[12px] text-ink-faint">{total === 0 ? "Its tools are listed while it runs" : plural(total, "tool")}</span>
         )}
-        {choice.on && !needsSetup && ownable.length > 0 && <OwnSettings draft={draft} module={m} fields={ownable} />}
-        {(draft.errors.filter((e) => e.key?.startsWith(path) ?? false)).map((e, i) => (
+        {choice.on && !needsSetup && m.settings.fields.length > 0 && (
+          compact || ownable.length === 0
+            ? <SharedLine module={m} link={false} />
+            : <OwnSettings draft={draft} module={m} fields={ownable} />
+        )}
+        {rowErrors.map((e, i) => (
           <p key={i} role="alert" className="text-[13px] text-danger" data-testid="field-error">{e.message}</p>
         ))}
       </div>
     </li>
+  )
+}
+
+/** "Uses the shared settings: …" with a way to the shared page. */
+function SharedLine({ module: m, link }: { readonly module: ModuleInfo; readonly link: boolean }) {
+  const summary = sharedSummary(m)
+  return (
+    <span className="text-[12px] text-ink-muted" data-testid="shared-line">
+      Uses the shared settings{summary !== "" && <>: <span className="text-ink">{summary}</span></>}
+      {link && <> · <SettingsLink path={["shared", "modules"]}>Open</SettingsLink></>}
+    </span>
   )
 }
 
@@ -555,64 +582,106 @@ function ModuleSwitch({ checked, disabled, label, onChange }: { readonly checked
   )
 }
 
-/** "Use own settings for this assistant": only for a module whose data marks fields overridable. */
+/**
+ * "Use own settings for this assistant" (docs/ASSISTANTS.md §2.6, §7.1): per overridable field, the assistant's own
+ * value or the shared one. Shared by default, with the shared value shown; each field then says "Same as shared" or
+ * "Own value" with Reset (back to following the shared value, whatever it becomes). Saved as `modules[id].own` with
+ * the assistant; the server's refusal of a value comes back on its field (`modules.<id>.own.<field>`).
+ */
 function OwnSettings({ draft, module: m, fields }: { readonly draft: AssistantDraft; readonly module: ModuleInfo; readonly fields: ReadonlyArray<SettingField> }) {
   const choice = draft.current.modules[m.id]!
   const own = choice.own
-  const set = (next: Record<string, SettingValue> | undefined) =>
+  const set = (next: Record<string, SettingValue> | undefined, touched: string) =>
     draft.update((x) => {
       const { own: _o, ...rest } = x.modules[m.id]!
       return { ...x, modules: { ...x.modules, [m.id]: next === undefined ? rest : { ...rest, own: next } } }
-    }, `modules.${m.id}`)
+    }, touched)
   if (own === undefined) {
     return (
-      <div className="flex flex-col gap-1.5 pt-1" data-testid="own-settings">
-        <span className="text-[12px] text-ink-muted">Uses the shared settings.</span>
-        <div><Button size="sm" onClick={() => set({})}>Use own settings for this assistant</Button></div>
+      <div className="flex flex-col gap-1.5 pt-1" data-testid="own-settings" data-own="false">
+        <SharedLine module={m} link />
+        <div><Button size="sm" onClick={() => set({}, `modules.${m.id}`)} data-testid="use-own">Use own settings for this assistant</Button></div>
       </div>
     )
   }
+  const staysShared = m.settings.fields.filter((f) => !ownable(f)).map((f) => f.label.toLowerCase())
   return (
-    <div className="mt-1 flex flex-col gap-3 rounded-md border border-line/70 px-3 py-3" data-testid="own-settings">
+    <div className="mt-1 flex flex-col gap-4 rounded-md border border-line/70 px-3 py-3" data-testid="own-settings" data-own="true">
       <div className="flex items-center gap-2">
         <span className="label text-[11px] text-ink-faint">Own settings for {draft.current.name}</span>
-        <button type="button" className="ml-auto text-[12px] text-voice hover:underline" onClick={() => set(undefined)}>Use the shared settings</button>
+        <button type="button" className="ml-auto text-[12px] text-voice underline-offset-4 hover:underline" onClick={() => set(undefined, `modules.${m.id}`)} data-testid="use-shared">Use the shared settings</button>
       </div>
       {fields.map((f) => {
         const Renderer = rendererFor(f)
+        const fieldPath = `modules.${m.id}.own.${f.key}`
         const shared = m.settings.values[f.key]
-        const value = own[f.key] ?? shared
+        const isOwn = Object.hasOwn(own, f.key)
+        const value = isOwn ? own[f.key] : shared
         const id = `own-${m.id}-${f.key}`
+        const errors = errorsFor(draft.errors, fieldPath)
+        const sharedText = displayValue(f, shared)
         return (
-          <div key={f.key} className="flex flex-col gap-1" data-field={`modules.${m.id}.own.${f.key}`}>
-            <label htmlFor={id} className="text-[13px] font-medium text-ink">{f.label}</label>
+          <div key={f.key} className="flex flex-col gap-1.5" data-field={fieldPath} data-own-value={isOwn ? "true" : "false"}>
+            <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
+              <label htmlFor={id} className="text-[13px] font-medium text-ink">{f.label}</label>
+              <span className="ml-auto inline-flex items-center gap-2">
+                {/* An own value equal to the shared one is still own (it stays when the shared value changes): Reset stays. */}
+                {isOwn ? (
+                  <>
+                    <span className="label rounded-sm border border-ink-faint px-1 text-[11px] leading-[14px] text-ink-muted" data-testid="own-marker">Own value</span>
+                    <button
+                      type="button"
+                      className="relative inline-flex min-h-8 items-center text-[12px] text-voice underline-offset-4 hover:underline max-sm:before:absolute max-sm:before:-inset-x-2 max-sm:before:-inset-y-1.5 max-sm:before:content-['']"
+                      onClick={() => set(Object.fromEntries(Object.entries(own).filter(([k]) => k !== f.key)), fieldPath)}
+                      aria-label={`Reset ${f.label} to the shared value (${sharedText})`}
+                      title={`Back to the shared value (${sharedText})`}
+                      data-testid="own-reset"
+                    >
+                      Reset
+                    </button>
+                  </>
+                ) : (
+                  <span className="text-[12px] text-ink-faint" data-testid="same-as-shared">Same as shared</span>
+                )}
+              </span>
+            </div>
             <Renderer
               field={f}
               id={id}
               describedBy={`${id}-desc`}
               value={value}
-              onChange={(v) => set({ ...own, [f.key]: v })}
+              onChange={(v) => set({ ...own, [f.key]: v }, fieldPath)}
               onSecretChange={() => undefined}
               disabled={false}
-              invalid={false}
-              onLocalError={() => undefined}
+              invalid={errors.length > 0}
+              onLocalError={(message) => draft.setLocalError(fieldPath, message)}
             />
+            <div id={`${id}-desc`} className="flex flex-col gap-0.5">
+              {errors.map((message, i) => <p key={i} role="alert" className="text-[13px] text-danger" data-testid="field-error">{message}</p>)}
+              {draft.localErrors[fieldPath] !== undefined && <p role="alert" className="text-[13px] text-danger" data-testid="field-error">{draft.localErrors[fieldPath]}</p>}
+              {f.description !== undefined && <p className="text-[13px] text-ink-muted">{f.description}</p>}
+            </div>
           </div>
         )
       })}
+      {staysShared.length > 0 && (
+        <p className="text-[13px] text-ink-muted">{listJoin(staysShared).replace(/^./, (c) => c.toUpperCase())} {staysShared.length > 1 ? "stay" : "stays"} shared.</p>
+      )}
     </div>
   )
 }
 
-/** The module rows (switch, tools, own settings); the wizard shows them too. */
-export function ModuleList({ draft }: { readonly draft: AssistantDraft }) {
+const ownable = (f: SettingField): boolean => f.overridable === true && f.type !== "secret"
+
+/** The module rows (switch, tools, own settings); the wizard shows them too, without the tools and own settings (`compact`). */
+export function ModuleList({ draft, compact = false }: { readonly draft: AssistantDraft; readonly compact?: boolean }) {
   const modules = useClientState((s) => s.modules)
   const list = modulesOf(modules.order.map((id) => modules.byId[id]!))
   return list.length === 0 ? (
     <p className="rounded-md border border-dashed border-line px-4 py-5 text-[14px] text-ink-muted">No modules are installed.</p>
   ) : (
     <ul className="flex flex-col divide-y divide-line/60 rounded-md border border-line" data-testid="module-list">
-      {list.map((m) => <ModuleRow key={m.id} draft={draft} module={m} />)}
+      {list.map((m) => <ModuleRow key={m.id} draft={draft} module={m} compact={compact} />)}
     </ul>
   )
 }

@@ -80,10 +80,10 @@ test("set a password → lock → protected pages wait for the keys → unlock i
   await go(page, "shared", "modules")
   const haPage = page.getByTestId("page-shared-modules")
   await expect(haPage).toHaveAttribute("data-locked", "true")
-  await expect(page.getByTestId("module-home-assistant").getByRole("switch")).toBeDisabled()
+  await expect(page.getByTestId("form-m-home-assistant")).toHaveAttribute("data-readonly", "true")
   await expect(page.getByTestId("nav-shared-modules").locator("[data-mark=lock]")).toBeVisible()
-  // The page is read-only for its protected module only: the Weather module's switch still works.
-  await expect(page.getByTestId("module-weather").getByRole("switch")).toBeEnabled()
+  // The page is read-only for its protected module only: the Weather module's form can still be edited.
+  await expect(page.getByTestId("form-m-weather")).not.toHaveAttribute("data-readonly", "true")
 
   // The vault password can be typed on the protected page itself: a wrong one is refused, the right one unlocks.
   await go(page, "shared", "modules")
@@ -95,7 +95,7 @@ test("set a password → lock → protected pages wait for the keys → unlock i
   await inline.getByLabel("Vault password").fill(PASSWORD)
   await inline.getByRole("button", { name: "Unlock" }).click()
   await expect(haPage).not.toHaveAttribute("data-locked", "true")
-  await expect(page.getByTestId("module-home-assistant").getByRole("switch")).toBeEnabled()
+  await expect(page.getByTestId("form-m-home-assistant")).not.toHaveAttribute("data-readonly", "true")
 
   // Change a protected setting.
   await go(page, "shared", "accounts")

@@ -111,7 +111,7 @@ export const seedAssistants = (): Array<Assistant> => [
     llm: { account: "claude-subscription", model: "claude-sonnet-5-5", effort: "medium", thinking: "adaptive", maxTokens: 2048, giveUpMs: 8000, warmUp: true, useModules: true, freshSessionAfterMinutes: 30 },
     hearing: hearingOf("parakeet-v2", "en", 250, 600, 100, 0.5),
     voice: { provider: "sherpa", voiceId: "kokoro-af_heart" },
-    modules: { clock: { on: true, offTools: [] }, notes: { on: true, offTools: [] } }
+    modules: { clock: { on: true, offTools: [], own: { locale: "en-US" } }, notes: { on: true, offTools: [] } }
   },
   {
     id: "keuken",
@@ -173,23 +173,38 @@ export interface AssistantsMock {
   readonly forgetDevice: (id: string) => void
 }
 
-export const createAssistantsMock = (modules: () => ReadonlyArray<ModuleInfo>): AssistantsMock => {
+/** What the server knows about modules that the assistants' checks need (mock/server.ts gives it). */
+export interface ModuleCatalog {
+  readonly modules: () => ReadonlyArray<ModuleInfo>
+  /** The tool names a capability module has when it runs (known also while nobody has it switched on). */
+  readonly toolNames: (moduleId: string) => ReadonlyArray<string>
+  /** `ModuleHost.checkOwn`: the module's own fields refuse a value (field errors keyed by the field). */
+  readonly checkOwn: (moduleId: string, own: Readonly<Record<string, unknown>>) => ReadonlyArray<{ readonly field: string; readonly message: string }>
+}
+
+export const createAssistantsMock = (catalog: ModuleCatalog): AssistantsMock => {
+  const modules = catalog.modules
   let assistants = seedAssistants()
   let typeSettings = seedTypeSettings()
   let typeRev = 0
   let deviceOwn = seedDeviceOwn()
 
+  /** The capability modules the assistants can switch on (running or not: a module runs while one assistant has it on). */
   const offers = (): Record<string, ModuleOffer> =>
-    Object.fromEntries(modules().filter((m) => m.state === "running").map((m) => [m.id, { overridable: [], tools: m.tools.map((t) => t.name) } satisfies ModuleOffer]))
+    Object.fromEntries(
+      modules().filter((m) => m.kind === "capability").map((m) => [
+        m.id,
+        { overridable: m.settings.fields.filter((f) => f.overridable === true && f.type !== "secret").map((f) => f.key), tools: [...catalog.toolNames(m.id)] } satisfies ModuleOffer
+      ])
+    )
 
-  /** `validateAssistant` as the real server uses it: no module field is overridable yet, so any `own` value is refused. */
+  /** `validateAssistant` as the real server uses it, plus the module fields' own checks of `own` values (`modules.<id>.own.<field>`). */
   const issues = (body: AssistantBody & { readonly id?: string }): ReadonlyArray<Issue> => {
-    const running = offers()
-    const out = [...validateAssistant(body, { others: assistants, modules: running })]
-    const known = new Set(modules().map((m) => m.id))
+    const out = [...validateAssistant(body, { others: assistants, modules: offers() })]
     for (const [moduleId, choice] of Object.entries(body.modules)) {
-      if (!known.has(moduleId) || running[moduleId] !== undefined) continue
-      for (const field of Object.keys(choice.own ?? {})) out.push({ code: "invalid", path: `modules.${moduleId}.own.${field}`, message: `${field} cannot be set per assistant.` })
+      const allowed = offers()[moduleId]?.overridable ?? []
+      const own = Object.fromEntries(Object.entries(choice.own ?? {}).filter(([k]) => allowed.includes(k)))
+      for (const e of catalog.checkOwn(moduleId, own)) out.push({ code: "invalid", path: `modules.${moduleId}.own.${e.field}`, message: e.message })
     }
     return out
   }

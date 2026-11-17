@@ -157,6 +157,9 @@ export function NumberControl({ draft, path, min, max, step, unit, integer = tru
   )
 }
 
+/** The chevron of a native select (the field's own arrow is hidden). */
+export const SELECT_CHEVRON = "url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20' fill='none' stroke='%23888' stroke-width='1.5'%3E%3Cpath d='M5 7.5l5 5 5-5'/%3E%3C/svg%3E\")"
+
 export function SelectControl({ draft, path, options, label, width, disabled = false, value: given }: {
   readonly draft: AssistantDraft
   readonly path: string
@@ -176,7 +179,7 @@ export function SelectControl({ draft, path, options, label, width, disabled = f
       disabled={disabled}
       onChange={(e) => draft.set(path, e.target.value)}
       className={cx(inputClass, "appearance-none bg-[length:16px] bg-[right_10px_center] bg-no-repeat pr-9")}
-      style={{ ...(width !== undefined ? { maxWidth: width } : {}), backgroundImage: "url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20' fill='none' stroke='%23888' stroke-width='1.5'%3E%3Cpath d='M5 7.5l5 5 5-5'/%3E%3C/svg%3E\")" }}
+      style={{ ...(width !== undefined ? { maxWidth: width } : {}), backgroundImage: SELECT_CHEVRON }}
     >
       {!known && <option value={value}>{value === "" ? "—" : value}</option>}
       {options.map((o) => <option key={o.value} value={o.value} disabled={o.disabled}>{o.label}</option>)}

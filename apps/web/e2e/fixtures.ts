@@ -22,6 +22,7 @@ export type Scenario =
   | "wake"
   | "devices"
   | "long-phrase"
+  | "latency"
   | "admin-disabled"
   | "admin-backoff"
 
