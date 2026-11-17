@@ -106,13 +106,68 @@ export interface HeardJudgement {
 }
 
 /**
- * What the phrase tester says about a line: matched a phrase, accepted without one (always listening, or the device
- * was already listening), ignored, or — from a server that does not say whether it was accepted — only that no
- * phrase matched.
+ * What the phrase tester says about a line: matched a phrase and taken, matched a phrase but not taken, accepted
+ * without one (always listening, or the device was already listening), ignored, or — from a server that does not say
+ * whether it was accepted — only that no phrase matched. The label and tone of each case: `heardRow`.
  */
-export type HeardOutcome = "matched" | "accepted" | "ignored" | "no-match"
+export type HeardOutcome = "matched" | "matched-ignored" | "accepted" | "ignored" | "no-match"
 export const heardOutcome = (l: HeardLine): HeardOutcome =>
-  l.matched !== undefined ? "matched" : l.accepted === true ? "accepted" : l.accepted === false ? "ignored" : "no-match"
+  l.matched !== undefined
+    ? l.accepted === false ? "matched-ignored" : "matched"
+    : l.accepted === true ? "accepted" : l.accepted === false ? "ignored" : "no-match"
+
+/** How the tester draws a line: `ok` (green check), `you` (mint check) or `muted` (a quiet label). */
+export type HeardTone = "ok" | "you" | "muted"
+export interface HeardRow {
+  readonly outcome: HeardOutcome
+  readonly label: string
+  readonly tone: HeardTone
+  /** The line offers `Add "…"` (turn a mishearing into a phrase); never for a line that matched a phrase. */
+  readonly canAdd: boolean
+}
+
+/**
+ * The one place the phrase tester's label and tone come from (shown and announced). `who`: the assistant the line's
+ * phrase belongs to, as the tester knows it — from `wake.heard.source.assistantId` (its name, or "a removed
+ * assistant" when no assistant has that id now), else from the page's own judgement for a line from an older server
+ * (`judged.woke`, or `wakes` on the tested device). `who` is only ever shown when the line was taken.
+ *
+ * What the server sends (`RouteGate.heardOf`, sent as `wake.heard` by `SessionHub.wakeHeard`; `source` is added in
+ * `serveMode`): `matched` + `source.assistantId` are the phrase and its assistant on that device at that moment,
+ * whether that assistant is switched on or off; `accepted` is false only when the utterance was dropped (for a
+ * matched phrase that means its assistant was off then, but the message does not say so, so the tester does not
+ * either). An unmatched line never carries an assistant. `source.deviceId` only decides which device page shows the
+ * line (absent: the defaults page only), never the label.
+ *
+ * | matched | accepted   | assistant (`who`)                         | outcome         | label                                 | tone  | Add |
+ * |---------|------------|-------------------------------------------|-----------------|---------------------------------------|-------|-----|
+ * | yes     | true       | known (on, or switched off since)         | matched         | Matched <P> → wakes <name>            | ok    | no  |
+ * | yes     | true       | an id no assistant has now                | matched         | Matched <P> → wakes a removed assistant | ok  | no  |
+ * | yes     | true       | none (no `assistantId`; the mock, or nobody's phrase) | matched | Matched <P>                         | ok    | no  |
+ * | yes     | absent¹    | from the page's judgement, or none        | matched         | Matched <P>[ → wakes <who>]           | ok    | no  |
+ * | yes     | false      | any — on, off, removed, none, or a retained `judged.woke` | matched-ignored | Matched <P>, not accepted | muted | no |
+ * | no      | true       | (never sent; ignored)                     | accepted        | Accepted without a phrase             | you   | no  |
+ * | no      | false      | (never sent; ignored)                     | ignored         | Ignored                               | muted | yes |
+ * | no      | absent¹    | —                                         | no-match        | No phrase matched                     | muted | yes |
+ *
+ * ¹ A server older than `accepted` (one assistant, every matched phrase woke it). A line without `source` (a server
+ * older than it) follows the same rows; only `who` comes from the page.
+ */
+export const heardRow = (l: HeardLine, who: string | undefined): HeardRow => {
+  const outcome = heardOutcome(l)
+  switch (outcome) {
+    case "matched":
+      return { outcome, label: `Matched ${displayPhrase(l.matched!)}${who !== undefined ? ` → wakes ${who}` : ""}`, tone: "ok", canAdd: false }
+    case "matched-ignored":
+      return { outcome, label: `Matched ${displayPhrase(l.matched!)}, not accepted`, tone: "muted", canAdd: false }
+    case "accepted":
+      return { outcome, label: "Accepted without a phrase", tone: "you", canAdd: false }
+    case "ignored":
+      return { outcome, label: "Ignored", tone: "muted", canAdd: true }
+    case "no-match":
+      return { outcome, label: "No phrase matched", tone: "muted", canAdd: true }
+  }
+}
 
 export const MAX_HEARD = 40
 
