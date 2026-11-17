@@ -69,8 +69,9 @@ const calls: ReadonlyArray<readonly [string, (r: Rng) => unknown]> = [
 const problem = (v: unknown, path = "result", depth = 0, echoes = false): string | undefined => {
   if (depth > 8) return undefined
   if (typeof v === "number") return Number.isFinite(v) ? undefined : `${path} is ${v}`
-  // A speaker that repeats the caller's text (an item, a list) may repeat "NaN" from it; its own words never hold these.
-  if (typeof v === "string") return v === "" || (echoes ? /undefined|\[object/ : /NaN|Infinity|undefined|\[object/).test(v) ? `${path} is "${v}"` : undefined
+  // A speaker that repeats the caller's text (an item, a list) may repeat "NaN" or spaces from it; its own words never hold these, nor
+  // a space at either end or two in a row (an utterance with a part missing, review round 3 finding 23).
+  if (typeof v === "string") return v === "" || (echoes ? /undefined|\[object/ : /NaN|Infinity|undefined|\[object|^\s|\s$|\s\s/).test(v) ? `${path} is "${v}"` : undefined
   if (v instanceof Date) return Number.isFinite(v.getTime()) ? undefined : `${path} is an invalid Date`
   if (Array.isArray(v)) {
     for (let k = 0; k < v.length; k++) {

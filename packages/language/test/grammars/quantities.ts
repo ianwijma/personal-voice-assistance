@@ -42,7 +42,7 @@ export const reserved: Record<Lang, ReadonlySet<string>> = {
     "lot lots rest remaining several a an the of and or nor plus but not no without except less more than least most under over below above max maximum minimum almost nearly " +
     "up to at per each every x").split(" ")),
   nl: new Set(("nul half halve kwart driekwart anderhalf anderhalve derde miljoen miljard komma min dozijn ongeveer circa ca zon rond wat beetje paar veel enkele rest een de " +
-    "het van aan en of noch plus maar niet geen zonder behalve minder meer dan minstens hooguit maximaal minimaal bijna ruim boven onder over tot per elke elk ieder iedere x").split(" "))
+    "het van aan en of noch plus maar niet geen zonder behalve minder meer dan minstens hooguit maximaal minimaal bijna ruim boven onder over tot per elke elk ieder iedere x lb lbs oz").split(" "))
 }
 const itemWords: Record<Lang, ReadonlyArray<string>> = {
   en: ["flour", "rice", "sugar", "olive", "oil", "apples", "milk", "eggs", "Ben's", "crème", "fraîche", "tomatoes", "basmati", "cheddar", "Monday", "bread"],

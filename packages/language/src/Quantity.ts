@@ -107,7 +107,7 @@ export const reservedItemWords: Record<Language, ReadonlySet<string>> = {
     "nul", "half", "halve", "kwart", "driekwart", "anderhalf", "anderhalve", "derde", "miljoen", "miljard", "komma", "min", "dozijn",
     "ongeveer", "circa", "ca", "zon", "rond", "wat", "beetje", "paar", "veel", "enkele", "rest", "een", "de", "het", "van", "aan", "en", "of",
     "noch", "plus", "maar", "niet", "geen", "zonder", "behalve", "minder", "meer", "dan", "minstens", "hooguit", "maximaal", "minimaal",
-    "bijna", "ruim", "boven", "onder", "over", "tot", "per", "elke", "elk", "ieder", "iedere", "x"
+    "bijna", "ruim", "boven", "onder", "over", "tot", "per", "elke", "elk", "ieder", "iedere", "x", "lb", "lbs", "oz"
   ])
 }
 

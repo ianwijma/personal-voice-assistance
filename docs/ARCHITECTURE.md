@@ -398,14 +398,15 @@ packages/
                     admin sessions (`admin.ts`) (browser-safe)
   agent-claude-code/ the claude-subscription harness agent: Claude Code via @anthropic-ai/claude-agent-sdk with the owner's
                     login, off by default with an opt-in; the subprocess environment is an allowlist
-  language/         `@pva/language`: English and Dutch parsing and speaking helpers for modules, pure and local (no model, no network):
-                    time of day (the "half" rules), dates and date-times, quantities with units and conversion, speakable numbers, amounts,
-                    durations, clock times, dates and lists, and recurrence for a closed set of RFC 5545 rule shapes (build, describe,
-                    next occurrence with its own date arithmetic, daylight-saving safe; `parseRRule` / `readSeries` answer `unsupported`
-                    for anything else). Each parser is a closed grammar over a phrase of its kind alone: every token must be read by
-                    the grammar, so a negation, a bound, an alternative, a time zone or title text makes it `not-understood`; callers
-                    pass the time phrase on its own (a tool parameter, a typed slot), there is no span to cut out of a sentence;
-                    re-exports core's `parseDuration`; README in the package
+  language/         `@pva/language`: English and Dutch parsing and speaking helpers for modules, pure and local (no model, no network,
+                    no dependency): numbers, durations (its own grammar), time of day (the "half" rules), dates and date-times,
+                    quantities with units and conversion, speakable numbers, amounts, durations, clock times, dates and lists, and
+                    recurrence for a closed set of RFC 5545 rule shapes (build, describe, next occurrences with why they stop, its own
+                    date arithmetic, daylight-saving safe; `parseRRule` / `readSeries` answer `unsupported` for anything else). Each
+                    parser is a closed grammar over a phrase of its kind alone: a reading must use every word, so a negation, a bound, an
+                    alternative, a time zone or title text makes it `not-understood`; callers pass the phrase on its own (a tool
+                    parameter, a typed slot). Every exported function checks a stated domain (2000–2199, numbers to 999 999.99, …) and
+                    answers outside it with its failure value, never a throw; only these front doors are exported. README in the package
   net/              `@pva/net`: `safeFetch` for URLs a model or user chose (a required content-type policy, resolves the host itself,
                     refuses non-public addresses on every hop by the IANA registries, connects to the checked address, checked request
                     headers, size limit after decompression, time limit; `makeNodeConnector({ ca })` for an owner's own CA), a cached JSON GET

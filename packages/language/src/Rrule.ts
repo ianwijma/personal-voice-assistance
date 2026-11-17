@@ -94,9 +94,8 @@ const untilInstant = (value: string): number => {
 const realDateTime = (value: string): boolean => {
   const m = untilPattern.exec(value)
   if (m === null) return false
-  const year = Number(m[1])
-  const t = { year: 2000 + (((year % 400) + 400) % 400), month: Number(m[2]), day: Number(m[3]), hour: Number(m[4]), minute: Number(m[5]), second: Number(m[6]) }
-  return isValidLocal(t)
+  const [year, month, day, hour, minute, second] = m.slice(1, 7).map(Number) as [number, number, number, number, number, number]
+  return month >= 1 && month <= 12 && day >= 1 && day <= daysInMonth(year, month) && hour <= 23 && minute <= 59 && second <= 59
 }
 
 const sortDays = (days: ReadonlyArray<RuleDay>): Array<RuleDay> => [...days].sort((a, b) => weekdayIndex(a.weekday) - weekdayIndex(b.weekday))

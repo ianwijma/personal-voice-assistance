@@ -15,7 +15,10 @@ const fail = (what: string, words: ReadonlyArray<string>, want: unknown, got: un
   throw new Error(`${what} "${words.join(" ")}": the grammar says ${stable(want)}, the parser ${stable(got)}`)
 }
 
-/** `count` phrases generated from the grammar parse to the value the grammar gives them. Returns how many were checked. */
+/**
+ * `count` phrases generated from the grammar parse to the value the grammar gives them; each also in decomposed Unicode (NFD: "ë" as
+ * "e" and a combining mark), which must give the same answer. Returns how many were checked.
+ */
 export const generatedParse = (c: GrammarCheck, count: number, seed: number): number => {
   const r = rng(seed)
   let n = 0
@@ -25,6 +28,8 @@ export const generatedParse = (c: GrammarCheck, count: number, seed: number): nu
     const want = c.expected(recognise(c.grammar, c.start, p.words), p.words)
     const got = c.actual(p.words.join(" "))
     if (stable(want) !== stable(got)) fail("generated", p.words, want, got)
+    const decomposed = c.actual(p.words.join(" ").normalize("NFD"))
+    if (stable(decomposed) !== stable(got)) fail("decomposed", p.words, got, decomposed)
     n++
   }
   return n
