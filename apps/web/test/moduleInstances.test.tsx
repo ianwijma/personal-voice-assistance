@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest"
 import { exampleAssistantInfo, exampleWeatherModule } from "@pva/protocol/examples"
 import type { ModuleInfo, ModuleInstanceInfo } from "@pva/protocol"
 import { ClientContext } from "@/components/context.tsx"
-import { ModuleInstances } from "@/components/settings/ModuleHeader.tsx"
+import { ModuleInstances, moduleStateText } from "@/components/settings/ModuleHeader.tsx"
 import type { AssistantClient } from "@/lib/client.ts"
 import { initialState } from "@/lib/state.ts"
 import { createClientStore } from "@/lib/store.ts"
@@ -33,6 +33,25 @@ describe("module instances (docs/ASSISTANTS.md §2.6)", () => {
     expect(screen.getByTestId("no-instances")).toHaveTextContent("Not running: no assistant has Weather switched on.")
     expect(screen.queryAllByTestId("instance")).toHaveLength(0)
     expect(screen.getByTestId("module-weather")).toHaveAttribute("data-state", "running")
+  })
+
+  // Review round 2, finding 18: a provider demanded only through another module's `uses` runs with no instance.
+  it("a provider running only for the modules that use it says so, and is not called off", () => {
+    const shared: ModuleInfo = { ...weather([]), enabled: false, state: "running" }
+    show(shared)
+    expect(screen.getByTestId("no-instances")).toHaveTextContent("Running for the modules that use it: no assistant has Weather switched on itself.")
+    expect(screen.getByTestId("no-instances")).not.toHaveTextContent("Not running")
+    expect(moduleStateText(shared)).toBe("Running for the modules that use it")
+    expect(moduleStateText({ ...shared, state: "disabled" })).toBe("Off")
+    expect(moduleStateText({ ...shared, state: "stopping" })).toBe("Off")
+  })
+
+  it("no instance while it starts or failed: says that, not that nobody has it on", () => {
+    const { unmount } = show({ ...weather([]), state: "starting" })
+    expect(screen.getByTestId("no-instances")).toHaveTextContent("Starting…")
+    unmount()
+    show({ ...weather([]), state: "error", error: "Its shared part did not start" })
+    expect(screen.getByTestId("no-instances")).toHaveTextContent("Could not start: Its shared part did not start")
   })
 
   it("lists an instance with the assistants that use it, by name, linked to their module page", () => {

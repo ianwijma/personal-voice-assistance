@@ -2,41 +2,35 @@ import type { IssueFix, ModuleDefinition, Requirement, RequirementCheck, Require
 import { Effect } from "effect"
 import { execFile } from "node:child_process"
 import semver from "semver"
-import { readFileSync, statfsSync } from "node:fs"
-import { totalmem } from "node:os"
+import { readFileSync } from "node:fs"
 import { join } from "node:path"
 
 /**
- * Module requirements, judged on this server (module-definition-config-and-dependencies.md §C.3): one registry of the
- * programs modules may need (how to find and check each, which package installs it), probes that run each program's
- * version command with no shell and a 5 s timeout on a fixed `PATH` (the data directory's `tools/bin` first), and a
- * cache the module host reads synchronously. Probes run at start and on "Check again", never on a turn.
+ * Module requirements, judged on this server (module-definition-config-and-dependencies.md §C.3; docs/MODULES-PLAN.md
+ * §4 P1). Two kinds: a program on the server, with an optional semver range, and the network (not probed yet). One
+ * registry of the programs modules may need (how to find and check each, which package installs it), probes that
+ * run each program's version command with no shell and a 5 s timeout on a fixed `PATH` (the data directory's
+ * `tools/bin` first), and a cache the module host reads synchronously. Probes run at start and on "Check again",
+ * never on a turn.
+ *
+ * The registry starts **empty**: no first version of a module needs a program. The PR of the first module that
+ * needs one adds its entry here (tests use their own entries, `RequirementCheckerOptions.tools`).
  */
 
 /** How to find, check and install one program. */
 export interface ToolEntry {
-  /** The version command (no shell) and where the version is in its output (first capture group; none: any output). */
-  readonly probe: { readonly argv: ReadonlyArray<string>; readonly version: RegExp }
+  /**
+   * The version command (no shell) and where the version is in its output: the first capture group, which must be a
+   * strict semver version (`6.1.0`, `0.35.0-rc.1`, `1.2.3+build.5`); anything else counts as an unknown version.
+   * No pattern: the program is only looked for, its version is unknown.
+   */
+  readonly probe: { readonly argv: ReadonlyArray<string>; readonly version?: RegExp }
   /** The package that installs it, per distribution family. */
   readonly packages?: { readonly debian?: string; readonly arch?: string; readonly nix?: string }
 }
 
-/** The programs this assistant knows how to check (modules name them in `requires`). */
-export const TOOL_REGISTRY: Readonly<Record<string, ToolEntry>> = {
-  ffmpeg: { probe: { argv: ["ffmpeg", "-version"], version: /ffmpeg version n?(\d+(?:\.\d+)+)/ }, packages: { debian: "ffmpeg", arch: "ffmpeg", nix: "ffmpeg" } },
-  ffprobe: { probe: { argv: ["ffprobe", "-version"], version: /ffprobe version n?(\d+(?:\.\d+)+)/ }, packages: { debian: "ffmpeg", arch: "ffmpeg", nix: "ffmpeg" } },
-  "yt-dlp": { probe: { argv: ["yt-dlp", "--version"], version: /(\d{4}\.\d+\.\d+)/ }, packages: { debian: "yt-dlp", arch: "yt-dlp", nix: "yt-dlp" } },
-  mpv: { probe: { argv: ["mpv", "--version"], version: /mpv v?(\d+(?:\.\d+)+)/ }, packages: { debian: "mpv", arch: "mpv", nix: "mpv" } },
-  sox: { probe: { argv: ["sox", "--version"], version: /v(\d+(?:\.\d+)+)/ }, packages: { debian: "sox", arch: "sox", nix: "sox" } },
-  tar: { probe: { argv: ["tar", "--version"], version: /(\d+\.\d+(?:\.\d+)?)/ }, packages: { debian: "tar", arch: "tar", nix: "gnutar" } },
-  bzip2: { probe: { argv: ["bzip2", "-h"], version: /Version (\d+\.\d+(?:\.\d+)?)/ }, packages: { debian: "bzip2", arch: "bzip2", nix: "bzip2" } },
-  flock: { probe: { argv: ["flock", "--version"], version: /(\d+\.\d+(?:\.\d+)?)/ }, packages: { debian: "util-linux", arch: "util-linux", nix: "util-linux" } },
-  nice: { probe: { argv: ["nice", "--version"], version: /(\d+\.\d+(?:\.\d+)?)/ }, packages: { debian: "coreutils", arch: "coreutils", nix: "coreutils" } },
-  git: { probe: { argv: ["git", "--version"], version: /git version (\d+(?:\.\d+)+)/ }, packages: { debian: "git", arch: "git", nix: "git" } },
-  python3: { probe: { argv: ["python3", "--version"], version: /Python (\d+(?:\.\d+)+)/ }, packages: { debian: "python3", arch: "python", nix: "python3" } },
-  "nvidia-smi": { probe: { argv: ["nvidia-smi", "-L"], version: /GPU \d+/ }, packages: { debian: "nvidia-utils", arch: "nvidia-utils", nix: "linuxPackages.nvidia_x11" } },
-  vulkaninfo: { probe: { argv: ["vulkaninfo", "--summary"], version: /Vulkan Instance Version: (\d+(?:\.\d+)+)/ }, packages: { debian: "vulkan-tools", arch: "vulkan-tools", nix: "vulkan-tools" } }
-}
+/** The programs this assistant knows how to check (modules name them in `requires`). Empty in this version. */
+export const TOOL_REGISTRY: ReadonlyMap<string, ToolEntry> = new Map()
 
 /** What running a version command gave. */
 export type ProbeOutput =
@@ -80,7 +74,7 @@ export const execProber: Prober = (argv, options) =>
           const e = error as NodeJS.ErrnoException & { killed?: boolean; code?: unknown }
           if (e.code === "ENOENT" || e.code === "EACCES") return resolve({ kind: "missing" })
           if (e.killed === true) return resolve({ kind: "timeout" })
-          // A version command that exits non-zero but printed something (bzip2 -h exits 0; others vary) still ran.
+          // A version command that exits non-zero but printed something still ran.
           if (typeof e.code === "number") return resolve({ kind: "ran", exitCode: e.code, output })
           resolve({ kind: "failed", message: e.message })
         }
@@ -94,26 +88,24 @@ export const execProber: Prober = (argv, options) =>
 // ---------------------------------------------------------------------------------------------------------------------
 // Versions
 
-/**
- * A program's reported version as semver ("6.1" is 6.1.0, "2025.01.15" is 2025.1.15, "n6.1-3ubuntu1" is 6.1.0; a
- * prerelease such as "7.0.0-rc.1" stays one), or `undefined` when it holds no version at all.
- */
-export const parseVersion = (reported: string): string | undefined => {
-  const exact = semver.valid(semver.clean(reported, { loose: true }) ?? "", { loose: true })
-  if (exact !== null) return exact
-  return semver.coerce(reported, { includePrerelease: true })?.version ?? undefined
-}
+/** semver.org's own pattern of a valid version: no `v`, no leading zeros, prerelease and build parts as specified. */
+const STRICT_SEMVER =
+  /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\+([0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*))?$/
+
+/** The version a probe read, if it is strict semver; anything else (`6.1`, `v1.0.0`, `2025.01.15`) is `undefined`: unknown. */
+export const strictVersion = (token: string | undefined): string | undefined =>
+  token !== undefined && STRICT_SEMVER.test(token) && semver.valid(token) !== null ? token : undefined
 
 /**
- * Whether `version` lies in `range`, by semver (node-semver): comparators, `||`, `^` (for `0.x`, the same minor),
- * `~`, `x` ranges and hyphen ranges; a prerelease satisfies only a range that names a prerelease of the same version.
- * `undefined` when the range cannot be read or the version holds none: never a pass.
+ * Whether `version` lies in `range` (node-semver: comparators, `||`, `^`, `~`, `x` and hyphen ranges). A prerelease
+ * satisfies a range only if the range allows it (names a prerelease of the same version). `undefined` when the
+ * range cannot be read or the version is unknown: never a pass.
  */
-export const satisfiesRange = (version: string, range: string): boolean | undefined => {
+export const satisfiesRange = (version: string | undefined, range: string): boolean | undefined => {
   if (semver.validRange(range) === null) return undefined
-  const parsed = parseVersion(version)
-  if (parsed === undefined) return undefined
-  return semver.satisfies(parsed, range)
+  const strict = strictVersion(version)
+  if (strict === undefined) return undefined
+  return semver.satisfies(strict, range)
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -159,10 +151,10 @@ export const installFix = (tool: string, entry: ToolEntry | undefined, distro: D
 // ---------------------------------------------------------------------------------------------------------------------
 // The checker
 
-/** A probed program: its version, or why not. */
+/** A probed program: its version (strict semver, or `undefined`: unknown), or why it was not found. */
 export type ToolProbe =
-  | { readonly found: true; readonly version: string | undefined }
-  | { readonly found: false; readonly why: "missing" | "timeout" | "failed" | "not-recognised"; readonly message?: string }
+  | { readonly found: true; readonly version: string | undefined; readonly reported?: string }
+  | { readonly found: false; readonly why: "missing" | "timeout" | "failed" | "not-recognised" | "unknown-program"; readonly message?: string }
 
 export interface RequirementChecker {
   /** Judge requirements from the cache (synchronous): what the module host reads. A program never probed is missing. */
@@ -174,7 +166,10 @@ export interface RequirementChecker {
   readonly probe: (requirements: ReadonlyArray<Requirement>, options?: { readonly force?: boolean }) => Effect.Effect<void>
   /** `probe` for every requirement of every module of `catalog`. */
   readonly probeCatalog: (catalog: ReadonlyArray<ModuleDefinition<any>>, options?: { readonly force?: boolean }) => Effect.Effect<void>
-  /** A spawn of `tool` failed with ENOENT or EACCES: it is missing from now on (until probed again). */
+  /**
+   * A spawn of `tool` failed with ENOENT or EACCES: it is missing from now on, until a probe that starts after this
+   * finds it (a probe already running when this is reported cannot undo it).
+   */
   readonly markMissing: (tool: string) => void
   /** What the cache knows about one program (tests, `doctor`). */
   readonly probed: (tool: string) => ToolProbe | undefined
@@ -183,73 +178,52 @@ export interface RequirementChecker {
 export interface RequirementCheckerOptions {
   readonly dataDir: string
   readonly prober?: Prober
-  readonly tools?: Readonly<Record<string, ToolEntry>>
+  /** The program registry. Default: `TOOL_REGISTRY` (empty). */
+  readonly tools?: ReadonlyMap<string, ToolEntry>
   readonly timeoutMs?: number
   readonly distro?: Distro
-  /** Total memory in MB. Default: the machine's. */
-  readonly memoryMb?: () => number
-  /** Free space in MB in the data directory, or `undefined` when it cannot be read. Default: `statfs`. */
-  readonly freeDiskMb?: () => number | undefined
-}
-
-/** The program a `gpu` requirement is probed with. */
-const gpuTool = (gpu: "cuda" | "vulkan") => (gpu === "cuda" ? "nvidia-smi" : "vulkaninfo")
-
-export const freeMbOf = (dir: string): number | undefined => {
-  try {
-    const s = statfsSync(dir)
-    return Math.floor((Number(s.bavail) * Number(s.bsize)) / (1024 * 1024))
-  } catch {
-    return undefined
-  }
 }
 
 export const makeRequirementChecker = (options: RequirementCheckerOptions): RequirementChecker => {
   const prober = options.prober ?? execProber
-  const tools = options.tools ?? TOOL_REGISTRY
+  // A Map: a program named "constructor" or "__proto__" is an unknown program, never an inherited property.
+  const tools: ReadonlyMap<string, ToolEntry> = new Map(options.tools ?? TOOL_REGISTRY)
   const timeoutMs = options.timeoutMs ?? 5_000
   const distro = "distro" in options ? options.distro : detectDistro()
   const path = probePath(options.dataDir)
-  const memoryMb = options.memoryMb ?? (() => Math.floor(totalmem() / (1024 * 1024)))
-  const freeDiskMb = options.freeDiskMb ?? (() => freeMbOf(options.dataDir))
   const cache = new Map<string, ToolProbe>()
-  /** What a GPU program printed when it ran (its exit code and output): the devices are read from it. */
-  const ranOutput = new Map<string, { readonly exitCode: number; readonly output: string }>()
+  /** Per program: the number of the last probe or report; an older probe's result is dropped. */
+  const ticket = new Map<string, number>()
+  let tickets = 0
 
   const probeOne = (tool: string): Effect.Effect<void> =>
     Effect.promise(async () => {
-      const entry = tools[tool]
-      const argv = entry?.probe.argv ?? [tool, "--version"]
-      const pattern = entry?.probe.version ?? /(\d+(?:\.\d+)+)/
-      let out: ProbeOutput
-      try {
-        out = await prober(argv, { timeoutMs, path })
-      } catch (error) {
-        out = { kind: "failed", message: error instanceof Error ? error.message : String(error) }
+      const mine = ++tickets
+      ticket.set(tool, mine)
+      const entry = tools.get(tool)
+      let result: ToolProbe
+      if (entry === undefined) result = { found: false, why: "unknown-program" }
+      else {
+        let out: ProbeOutput
+        try {
+          out = await prober(entry.probe.argv, { timeoutMs, path })
+        } catch (error) {
+          out = { kind: "failed", message: error instanceof Error ? error.message : String(error) }
+        }
+        if (out.kind === "ran") {
+          const m = entry.probe.version?.exec(out.output)
+          const reported = m?.[1]
+          // It ran: found when it exited cleanly or printed its version; the version only if it is strict semver.
+          result = reported !== undefined || out.exitCode === 0
+            ? { found: true, version: strictVersion(reported), ...(reported !== undefined ? { reported: reported.slice(0, 60) } : {}) }
+            : { found: false, why: "not-recognised" }
+        } else result = out.kind === "failed" ? { found: false, why: "failed", message: out.message } : { found: false, why: out.kind }
       }
-      const result: ToolProbe = out.kind === "ran"
-        ? (() => {
-          const m = pattern.exec(out.output)
-          if (m !== null) return { found: true, version: m[1] }
-          // It ran but did not say what it is: present when it exited cleanly, else not recognised.
-          return out.exitCode === 0 ? { found: true, version: undefined } : { found: false, why: "not-recognised" }
-        })()
-        : out.kind === "failed"
-        ? { found: false, why: "failed", message: out.message }
-        : { found: false, why: out.kind }
-      cache.set(tool, result)
-      if (out.kind === "ran") ranOutput.set(tool, { exitCode: out.exitCode, output: out.output.slice(0, 64 * 1024) })
-      else ranOutput.delete(tool)
+      // A report or a probe that started after this one has the newer word.
+      if (ticket.get(tool) === mine) cache.set(tool, result)
     })
 
-  const toolsOf = (requirements: ReadonlyArray<Requirement>): Array<string> => {
-    const names = new Set<string>()
-    for (const r of requirements) {
-      if ("tool" in r && (r.where ?? "server") === "server") names.add(r.tool)
-      else if ("gpu" in r) names.add(gpuTool(r.gpu))
-    }
-    return [...names]
-  }
+  const toolsOf = (requirements: ReadonlyArray<Requirement>): Array<string> => [...new Set(requirements.flatMap((r) => ("tool" in r ? [r.tool] : [])))]
 
   const probe: RequirementChecker["probe"] = (requirements, probeOptions = {}) =>
     Effect.suspend(() => {
@@ -258,103 +232,50 @@ export const makeRequirementChecker = (options: RequirementCheckerOptions): Requ
     })
 
   const judgeTool = (r: Extract<Requirement, { readonly tool: string }>): RequirementStatus => {
-    const entry = tools[r.tool]
+    const entry = tools.get(r.tool)
     const p = cache.get(r.tool)
     if (p === undefined || !p.found) {
-      const detail = p === undefined || p.why === "missing"
+      const detail = p !== undefined && p.why === "unknown-program"
+        ? `${r.tool} is not a program this assistant knows how to check`
+        : p === undefined || p.why === "missing"
         ? `${r.tool} is missing`
         : p.why === "timeout"
         ? `${r.tool} did not answer within ${Math.round(timeoutMs / 1000)} s`
         : p.why === "not-recognised"
         ? `${r.tool} did not report its version`
         : `${r.tool} could not be run${p.message !== undefined ? ` (${p.message})` : ""}`
-      return { requirement: r, state: "missing", detail, fix: installFix(r.tool, entry, distro) }
+      const fix = p !== undefined && p.why === "unknown-program" ? { kind: "link" as const, label: "Update the assistant", value: "#settings/shared/updates" } : installFix(r.tool, entry, distro)
+      return { requirement: r, state: "missing", detail, fix }
     }
-    const shown = p.version === undefined ? `${r.tool} is installed` : `${r.tool} ${p.version}`
+    const shown = p.version !== undefined ? `${r.tool} ${p.version}` : p.reported !== undefined ? `${r.tool} ${p.reported}` : `${r.tool} is installed`
     if (r.version === undefined || r.version.trim() === "") return { requirement: r, state: "met", detail: shown }
     // Fail closed: a version requirement that cannot be proven is not met.
     if (semver.validRange(r.version) === null) {
       return { requirement: r, state: "missing", detail: `${r.tool}: the version range "${r.version}" cannot be read, so ${r.tool} cannot be checked` }
     }
     if (p.version === undefined) {
-      return { requirement: r, state: "missing", detail: `${r.tool} did not report its version; needs ${r.version}`, fix: installFix(r.tool, entry, distro, "Update") }
+      const why = p.reported === undefined ? "did not report its version" : `reported "${p.reported}", which is not a semver version`
+      return { requirement: r, state: "missing", detail: `${r.tool} ${why}; needs ${r.version}`, fix: installFix(r.tool, entry, distro, "Update") }
     }
-    const ok = satisfiesRange(p.version, r.version)
-    if (ok === undefined) {
-      return { requirement: r, state: "missing", detail: `${r.tool} reported "${p.version}", which is not a version; needs ${r.version}`, fix: installFix(r.tool, entry, distro, "Update") }
-    }
-    return ok
+    return satisfiesRange(p.version, r.version) === true
       ? { requirement: r, state: "met", detail: shown }
       : { requirement: r, state: "missing", detail: `${r.tool} ${p.version} does not match ${r.version}`, fix: installFix(r.tool, entry, distro, "Update") }
   }
 
   const check: RequirementCheck = (requirements) =>
-    requirements.map((r): RequirementStatus => {
-      if ("tool" in r) {
-        if ((r.where ?? "server") !== "server") return { requirement: r, state: "unchecked", detail: `${r.tool} on the device (not checked yet)` }
-        return judgeTool(r)
-      }
-      if ("network" in r) return { requirement: r, state: "unchecked", detail: r.network === "internet" ? "internet access (not checked)" : "the local network (not checked)" }
-      if ("memoryMb" in r) {
-        const has = memoryMb()
-        return has >= r.memoryMb
-          ? { requirement: r, state: "met", detail: `${has} MB of memory` }
-          : { requirement: r, state: "missing", detail: `Needs ${r.memoryMb} MB of memory; this server has ${has} MB` }
-      }
-      if ("diskMb" in r) {
-        const free = freeDiskMb()
-        if (free === undefined) return { requirement: r, state: "unchecked", detail: "free disk space (could not be read)" }
-        return free >= r.diskMb
-          ? { requirement: r, state: "met", detail: `${free} MB free` }
-          : { requirement: r, state: "missing", detail: `Needs ${r.diskMb} MB of free disk space; ${free} MB is free in ${options.dataDir}` }
-      }
-      return judgeGpu(r)
-    })
-
-  /**
-   * A `gpu` requirement, judged on the device the program lists, never on the program alone: met only for a hardware
-   * device (a CUDA GPU in `nvidia-smi -L`; a discrete, integrated or virtual GPU in `vulkaninfo --summary`, not
-   * Mesa's CPU renderer llvmpipe); missing only when the program ran and showed there is none; `unchecked` (never
-   * a pass, never unavailable) when the device cannot be judged here (the program is not installed, timed out, or
-   * printed something this server cannot read).
-   */
-  const judgeGpu = (r: Extract<Requirement, { readonly gpu: unknown }>): RequirementStatus => {
-    const tool = gpuTool(r.gpu)
-    const name = r.gpu === "cuda" ? "a CUDA graphics card" : "a Vulkan graphics device"
-    const ran = ranOutput.get(tool)
-    const p = cache.get(tool)
-    if (ran === undefined) {
-      const why = p === undefined || (!p.found && p.why === "missing") ? `${tool} is not installed` : !p.found && p.why === "timeout" ? `${tool} did not answer` : `${tool} could not be run`
-      return { requirement: r, state: "unchecked", detail: `${name}: not checked (${why}, so the device cannot be seen)`, fix: installFix(tool, tools[tool], distro) }
-    }
-    if (r.gpu === "cuda") {
-      const gpus = [...ran.output.matchAll(/^GPU \d+: (.+?)(?: \(UUID[^)]*\))?\s*$/gm)].map((m) => m[1]!.trim())
-      if (gpus.length > 0) return { requirement: r, state: "met", detail: `${gpus[0]} (CUDA)` }
-      if (/No devices were found/i.test(ran.output) || (ran.exitCode === 0 && ran.output.trim() === "")) {
-        return { requirement: r, state: "missing", detail: `Needs ${name}; nvidia-smi lists none` }
-      }
-      return { requirement: r, state: "unchecked", detail: `${name}: not checked (nvidia-smi printed something this server cannot read)` }
-    }
-    const types = [...ran.output.matchAll(/deviceType\s*=\s*PHYSICAL_DEVICE_TYPE_(\w+)/g)].map((m) => m[1]!)
-    const names = [...ran.output.matchAll(/deviceName\s*=\s*(.+)/g)].map((m) => m[1]!.trim())
-    const hardware = types.findIndex((t) => t === "DISCRETE_GPU" || t === "INTEGRATED_GPU" || t === "VIRTUAL_GPU")
-    if (hardware >= 0) return { requirement: r, state: "met", detail: `${names[hardware] ?? "a graphics device"} (Vulkan)` }
-    if (types.length > 0) {
-      return { requirement: r, state: "missing", detail: `Needs ${name}; Vulkan finds only a software renderer (${names[0] ?? "on the processor"})` }
-    }
-    if (/ERROR_INCOMPATIBLE_DRIVER|Cannot create Vulkan instance|ERROR_INITIALIZATION_FAILED/.test(ran.output)) {
-      return { requirement: r, state: "missing", detail: `Needs ${name}; Vulkan finds no driver or device` }
-    }
-    return { requirement: r, state: "unchecked", detail: `${name}: not checked (vulkaninfo printed something this server cannot read)` }
-  }
+    requirements.map((r): RequirementStatus =>
+      "tool" in r
+        ? judgeTool(r)
+        : { requirement: r, state: "unchecked", detail: r.network === "internet" ? "internet access (not checked)" : "the local network (not checked)" }
+    )
 
   return {
     check,
     probe,
     probeCatalog: (catalog, probeOptions) => probe(catalog.flatMap((d) => d.requires ?? []), probeOptions),
     markMissing: (tool) => {
+      ticket.set(tool, ++tickets)
       cache.set(tool, { found: false, why: "missing" })
-      ranOutput.delete(tool)
     },
     probed: (tool) => cache.get(tool)
   }

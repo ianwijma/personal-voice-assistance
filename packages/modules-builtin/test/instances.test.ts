@@ -8,8 +8,12 @@ import { TestClock } from "effect/testing"
 import { clockModule } from "../src/clock.ts"
 import { weatherModule } from "../src/weather.ts"
 
-const tool = (host: ModuleHost, assistant: string, name: string): Tool | undefined =>
-  (host.snapshot().assistantParts.get(assistant) ?? []).flatMap((p) => p.module.tools ?? []).find((t) => t.name === name)
+/** An assistant's tool in the host, run through its gateway (a published tool's own `execute` only refuses). */
+const tool = (host: ModuleHost, assistant: string, name: string): Pick<Tool, "execute"> | undefined => {
+  const part = (host.snapshot().assistantParts.get(assistant) ?? []).find((p) => (p.module.tools ?? []).some((t) => t.name === name))
+  const found = part?.module.tools?.find((t) => t.name === name)
+  return part === undefined || found === undefined ? undefined : { execute: (input: unknown) => host.gateway.tool(part.moduleId, found, input) }
+}
 
 describe("built-in modules per assistant", () => {
   it.effect("clock: an own date format runs a second instance and each assistant gets its own answer; the fields are overridable", () =>

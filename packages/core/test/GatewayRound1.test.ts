@@ -1,10 +1,11 @@
 // The execution gateway and CurrentTurn, review round 1 (docs/MODULES-PLAN.md §4 P1): principals (turn, job, local,
 // notification), refusal without one in serve mode, the connection a turn came in on, and concurrent turns of two
 // assistants on two devices seeing only their own identity (finding 24).
+import { confirmedRunnerOf } from "../src/GatewayPrivate.ts"
 import { assert, describe, it } from "@effect/vitest"
 import { Deferred, Effect, Fiber, Layer, Schema, Stream } from "effect"
 import { TestClock } from "effect/testing"
-import { defineAction, registerActions } from "../src/Actions.ts"
+import { actionTool, defineAction, registerActions } from "../src/Actions.ts"
 import { Conversation } from "../src/Conversation.ts"
 import type { TurnSetup } from "../src/ConversationEvents.ts"
 import { ALLOW, type GatewayAccess, type GatewayCall, makeExecutionGateway, refuse } from "../src/Gateway.ts"
@@ -194,8 +195,29 @@ describe("two assistants on two devices at once (finding 24)", () => {
       ])
       const turn: TurnContext = { turnId: 2, conversationId: "c", assistantId: "a", deviceId: "d1", source: "voice" }
       on = false
-      const refused = yield* Effect.flip(Effect.provideService(gateway.action(allOff!, {}, { confirmed: true }), CurrentTurn, turn))
+      const refused = yield* Effect.flip(Effect.provideService(confirmedRunnerOf(undefined, gateway)!(allOff!, {}), CurrentTurn, turn))
       assert.strictEqual(refused.message, "Not run: the home module is not on for this assistant.")
+      assert.deepStrictEqual(ran, [])
+    }))
+
+  it.effect("round 3, finding 4: an action that needs confirmation is refused on every public path, access allowed or not", () =>
+    Effect.gen(function*() {
+      const ran: Array<string> = []
+      const gateway = makeExecutionGateway({ access: { moduleOn: () => true, toolOff: () => false } })
+      const [allOff] = registerActions("home", [
+        defineAction({ id: "all_off", label: "All off", description: "", params: {}, confirm: true, run: () => Effect.sync(() => void ran.push("all_off")) })
+      ])
+      const turn: TurnContext = { turnId: 2, conversationId: "c", assistantId: "a", deviceId: "d1", source: "voice" }
+      const registry = makeToolRegistry([{ name: "home", tools: [actionTool(allOff!)] }], { gateway })
+      const viaGateway = yield* Effect.flip(Effect.provideService(gateway.action(allOff!, {}), CurrentTurn, turn))
+      assert.match(viaGateway.message, /needs the owner's spoken confirmation/)
+      const viaRegistry = yield* Effect.flip(Effect.provideService(registry.runAction!(allOff!, {}), CurrentTurn, turn))
+      assert.match(viaRegistry.message, /needs the owner's spoken confirmation/)
+      const viaTool = yield* Effect.provideService(registry.run({ id: "1", name: "home_all_off", input: {} }), CurrentTurn, turn)
+      assert.isTrue(viaTool.isError)
+      // A caller cannot claim a confirmation: the option does not exist, and an extra key is ignored.
+      const claimed = yield* Effect.flip(Effect.provideService(gateway.action(allOff!, {}, { confirmed: true } as never), CurrentTurn, turn))
+      assert.match(claimed.message, /needs the owner's spoken confirmation/)
       assert.deepStrictEqual(ran, [])
     }))
 })

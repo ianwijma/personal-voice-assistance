@@ -1,11 +1,11 @@
 import { claudeSubscriptionAgent } from "@pva/agent-claude-code"
-import { makeModuleHost, type ModuleDefinition, type ModuleDemand, type ModulePersistence, type ModuleSnapshot, readOnlyPersistence } from "@pva/core"
+import { makeModuleHost, type ModuleDefinition, type ModuleDemand, type ModuleHost, type ModulePersistence, type ModuleSnapshot, readOnlyPersistence, type TurnSetup } from "@pva/core"
 import { homeAssistantModule } from "@pva/module-home-assistant"
 import { clockModule, weatherModule } from "@pva/modules-builtin"
 import type { Assistant, ModuleInfo } from "@pva/protocol"
 import { Config, Effect, type Scope } from "effect"
 import { CliSettingsRef } from "./cliSettings.ts"
-import { makeRequirementChecker } from "./requirements.ts"
+import { makeRequirementChecker, type RequirementChecker } from "./requirements.ts"
 import { DataDirConfig, loadSettingsStore } from "./serve/SettingsStore.ts"
 import { openVault, VaultPathConfig } from "./serve/Vault.ts"
 
@@ -61,9 +61,28 @@ export const moduleDemandOf = (
   return demand
 }
 
+/**
+ * The CLI modes' modules: the same host and gateway as serve mode, read **per turn**. Nothing here keeps a tool,
+ * agent or instructions line from the start-up snapshot: a module restarted (`requestRestart`) or judged unavailable
+ * since (a program went missing) is what the next turn sees, never the withdrawn one.
+ */
+export interface CliModules {
+  readonly host: ModuleHost
+  /** The snapshot now (a reference read): read once at the start of every turn. */
+  readonly snapshot: () => ModuleSnapshot
+  readonly infos: () => ReadonlyArray<ModuleInfo>
+  /** A turn setup reading the snapshot at every turn's start: `systemPrompt` plus the instructions of now. */
+  readonly setup: (systemPrompt: string) => Effect.Effect<TurnSetup>
+}
+
 export const startCliModules = (
-  options: { readonly catalog?: ReadonlyArray<ModuleDefinition<any>>; readonly persistence?: ModulePersistence } = {}
-): Effect.Effect<ModuleSnapshot & { readonly infos: ReadonlyArray<ModuleInfo> }, never, Scope.Scope> =>
+  options: {
+    readonly catalog?: ReadonlyArray<ModuleDefinition<any>>
+    readonly persistence?: ModulePersistence
+    /** What probes the programs modules need. Default: the real checker on the data directory (tests give a fake). */
+    readonly checker?: RequirementChecker
+  } = {}
+): Effect.Effect<CliModules, never, Scope.Scope> =>
   Effect.gen(function*() {
     const loaded = yield* CliSettingsRef
     const persistence = options.persistence ?? (loaded !== undefined
@@ -86,7 +105,7 @@ export const startCliModules = (
     }).pipe(Effect.catchCause((cause) => Effect.as(Effect.logWarning("Could not read the saved settings; using defaults", cause), readOnlyPersistence()))))
     const catalog = options.catalog ?? moduleCatalog
     // Module API v2: what the modules need is probed once, before any starts (never on a turn).
-    const checker = makeRequirementChecker({ dataDir: yield* DataDirConfig.pipe(Effect.orElseSucceed(() => "data")) })
+    const checker = options.checker ?? makeRequirementChecker({ dataDir: yield* DataDirConfig.pipe(Effect.orElseSucceed(() => "data")) })
     yield* checker.probeCatalog(catalog)
     const host = yield* makeModuleHost({
       catalog,
@@ -105,5 +124,14 @@ export const startCliModules = (
         yield* Effect.logWarning(`Module ${module.name} cannot run here: ${module.unavailable?.reason ?? "unknown reason"} (pnpm start doctor says how to fix it)`)
       }
     }
-    return { ...host.snapshot(), infos: host.modules() }
+    return {
+      host,
+      snapshot: host.snapshot,
+      infos: host.modules,
+      setup: (systemPrompt: string) =>
+        Effect.sync((): TurnSetup => {
+          const snapshot = host.snapshot()
+          return { system: withModuleInstructions(systemPrompt, snapshot.instructions), registry: snapshot.registry }
+        })
+    }
   })

@@ -1,11 +1,22 @@
-// Module requirements and `pnpm start doctor` (docs/MODULES-PLAN.md §4 P1; module-definition §C.3–C.5), with a fake
-// prober: nothing is run on this machine.
+// Module requirements and `pnpm start doctor` (docs/MODULES-PLAN.md §4 P1; module-definition §C.3–C.5), with fake
+// program entries and a fake prober: nothing is run on this machine. The real registry is empty in this version.
 import { describe, expect, it } from "@effect/vitest"
-import { defineModule, type Issue as HealthIssue, isMissingProgramError, makeModuleHost, makeTool, type ModuleHostApi, readOnlyPersistence, type Requirement } from "@pva/core"
+import { defineModule, type Issue as HealthIssue, isMissingProgramError, isModuleStopped, makeModuleHost, makeTool, type ModuleHostApi, readOnlyPersistence, type Requirement } from "@pva/core"
 import type { Assistant } from "@pva/protocol"
-import { Effect, Schema } from "effect"
-import { formatDoctor, runDoctor } from "../src/doctor.ts"
-import { detectDistro, installFix, makeRequirementChecker, type ProbeOutput, type Prober, probePath, satisfiesRange, TOOL_REGISTRY } from "../src/requirements.ts"
+import { Cause, Effect, Fiber, Schema } from "effect"
+import { formatDoctor, loadDoctorSettings, runDoctor } from "../src/doctor.ts"
+import {
+  detectDistro,
+  installFix,
+  makeRequirementChecker,
+  type ProbeOutput,
+  type Prober,
+  probePath,
+  satisfiesRange,
+  strictVersion,
+  TOOL_REGISTRY,
+  type ToolEntry
+} from "../src/requirements.ts"
 
 /** A prober answering from a table, recording every call. */
 const fakeProber = (answers: Readonly<Record<string, ProbeOutput>>) => {
@@ -19,119 +30,47 @@ const fakeProber = (answers: Readonly<Record<string, ProbeOutput>>) => {
 
 const ran = (output: string, exitCode = 0): ProbeOutput => ({ kind: "ran", exitCode, output })
 
-describe("version ranges", () => {
-  it("reads the usual comparators", () => {
-    expect(satisfiesRange("6.1", ">=5")).toBe(true)
-    expect(satisfiesRange("4.4.2", ">=5")).toBe(false)
-    expect(satisfiesRange("0.35.1", ">=0.35 <1")).toBe(true)
-    expect(satisfiesRange("1.0", ">=0.35 <1")).toBe(false)
-    expect(satisfiesRange("6.2", "^6")).toBe(true)
-    expect(satisfiesRange("7.0", "^6")).toBe(false)
-    expect(satisfiesRange("6.1.3", "~6.1")).toBe(true)
-    expect(satisfiesRange("6.2", "~6.1")).toBe(false)
-    expect(satisfiesRange("2025.01.15", ">=2024.1")).toBe(true)
-    expect(satisfiesRange("6.1", "6.1")).toBe(true)
-    expect(satisfiesRange("6.1.4", "6.1")).toBe(true)
-    expect(satisfiesRange("6.1", "about six")).toBeUndefined()
+/** Test entries (the real registry is empty): the version is the whole token after the program's name. */
+const entry = (name: string, flag = "--version"): ToolEntry => ({
+  probe: { argv: [name, flag], version: new RegExp(`${name} (\\S+)`) },
+  packages: { debian: `${name}-pkg`, arch: name, nix: name }
+})
+const TOOLS = new Map<string, ToolEntry>([["mpv", entry("mpv")], ["ffmpeg", entry("ffmpeg", "-version")], ["yt-dlp", entry("yt-dlp")], ["sox", entry("sox")]])
+
+describe("versions: strict semver or unknown", () => {
+  it("a version is strict semver, prerelease and build parts included; anything else is unknown", () => {
+    for (const v of ["6.1.0", "0.35.0-rc.1", "1.2.3+build.5", "1.0.0-alpha.1+exp.sha.5114f85"]) expect(strictVersion(v)).toBe(v)
+    for (const v of ["6.1", "v1.2.3", "2025.01.15", "0.35.0~rc1", "1.02.3", "3.14.0rc1", "6.1.1-3ubuntu5x+", "", undefined]) expect(strictVersion(v)).toBeUndefined()
   })
 
-  // Review round 1, finding 12: real semver, and an unprovable requirement is never met.
-  it("is semver: OR ranges, zero-major carets, prereleases, and nothing to read is not a pass", () => {
-    expect(satisfiesRange("3.2", ">=5 || ^4")).toBe(false)
-    expect(satisfiesRange("4.7", ">=5 || ^4")).toBe(true)
-    expect(satisfiesRange("6.0", ">=5 || ^4")).toBe(true)
-    expect(satisfiesRange("0.99.0", "^0.35")).toBe(false)
-    expect(satisfiesRange("0.35.4", "^0.35")).toBe(true)
+  it("ranges by node-semver; unknown does not satisfy; a prerelease only a range that allows it", () => {
+    expect(satisfiesRange("6.1.0", ">=5")).toBe(true)
+    expect(satisfiesRange("4.4.2", ">=5")).toBe(false)
+    expect(satisfiesRange("4.7.0", ">=5 || ^4")).toBe(true)
     expect(satisfiesRange("0.36.0", "^0.35")).toBe(false)
     expect(satisfiesRange("7.0.0-rc.1", ">=6")).toBe(false)
     expect(satisfiesRange("7.0.0-rc.2", ">=7.0.0-rc.1")).toBe(true)
-    expect(satisfiesRange("unknown", ">=5")).toBeUndefined()
+    expect(satisfiesRange("0.35.0-1", ">=0.35.0")).toBe(false)
+    expect(satisfiesRange("6.1", ">=5")).toBeUndefined()
+    expect(satisfiesRange("6.1.0", "about six")).toBeUndefined()
   })
-})
-
-describe("version requirements fail closed (finding 12)", () => {
-  const judge = (output: ProbeOutput, version: string) =>
-    Effect.gen(function*() {
-      const { prober } = fakeProber({ mpv: output })
-      const checker = makeRequirementChecker({ dataDir: "/d", prober, distro: "debian" })
-      const requirement: Requirement = { tool: "mpv", version, why: "Plays" }
-      yield* checker.probe([requirement])
-      return checker.check([requirement])[0]!
-    })
-
-  it.effect("a version that is not reported, a range that cannot be read, and an OR range are judged, never assumed", () =>
-    Effect.gen(function*() {
-      const silent = yield* judge(ran("usage: mpv [options]"), ">=0.35")
-      expect(silent.state).toBe("missing")
-      expect(silent.detail).toBe("mpv did not report its version; needs >=0.35")
-      const unreadable = yield* judge(ran("mpv 0.36.0"), "about six")
-      expect(unreadable.state).toBe("missing")
-      expect(unreadable.detail).toMatch(/cannot be read/)
-      expect((yield* judge(ran("mpv 3.0.1"), ">=5 || ^4")).state).toBe("missing")
-      expect((yield* judge(ran("mpv 4.2.0"), ">=5 || ^4")).state).toBe("met")
-      expect((yield* judge(ran("mpv 0.99.0"), "^0.35")).state).toBe("missing")
-      const unversioned = yield* judge(ran("mpv vgit-abcdef"), ">=0.35")
-      expect(unversioned.state).toBe("missing")
-    }))
-})
-
-describe("gpu requirements judge the device, never the program alone (finding 20)", () => {
-  const judge = (gpu: "cuda" | "vulkan", answers: Readonly<Record<string, ProbeOutput>>) =>
-    Effect.gen(function*() {
-      const { prober } = fakeProber(answers)
-      const checker = makeRequirementChecker({ dataDir: "/d", prober, distro: "debian" })
-      const requirement: Requirement = { gpu }
-      yield* checker.probe([requirement])
-      return checker.check([requirement])[0]!
-    })
-  const summary = (devices: ReadonlyArray<[string, string]>) =>
-    `Vulkan Instance Version: 1.3.275\n\nDevices:\n========\n${devices.map(([type, name], i) => `GPU${i}:\n\tdeviceType         = PHYSICAL_DEVICE_TYPE_${type}\n\tdeviceName         = ${name}\n`).join("")}`
-
-  it.effect("vulkan: a hardware device is met; only llvmpipe, or no driver, is missing; no vulkaninfo is unchecked", () =>
-    Effect.gen(function*() {
-      const hardware = yield* judge("vulkan", { vulkaninfo: ran(summary([["CPU", "llvmpipe (LLVM 17.0.6, 256 bits)"], ["INTEGRATED_GPU", "Intel(R) UHD Graphics 620"]])) })
-      expect(hardware).toMatchObject({ state: "met", detail: "Intel(R) UHD Graphics 620 (Vulkan)" })
-      const software = yield* judge("vulkan", { vulkaninfo: ran(summary([["CPU", "llvmpipe (LLVM 17.0.6, 256 bits)"]])) })
-      expect(software.state).toBe("missing")
-      expect(software.detail).toMatch(/only a software renderer \(llvmpipe/)
-      const noDriver = yield* judge("vulkan", { vulkaninfo: ran("ERROR: [Loader Message] Code 0 : vkCreateInstance: Found no drivers!\nCannot create Vulkan instance.\nERROR_INCOMPATIBLE_DRIVER", 1) })
-      expect(noDriver.state).toBe("missing")
-      const absent = yield* judge("vulkan", {})
-      expect(absent.state).toBe("unchecked")
-      expect(absent.detail).toMatch(/not checked \(vulkaninfo is not installed/)
-      const odd = yield* judge("vulkan", { vulkaninfo: ran("Vulkan Instance Version: 1.3.275") })
-      expect(odd.state).toBe("unchecked")
-    }))
-
-  it.effect("cuda: a listed GPU is met; none listed is missing; no nvidia-smi is unchecked", () =>
-    Effect.gen(function*() {
-      const listed = yield* judge("cuda", { "nvidia-smi": ran("GPU 0: NVIDIA GeForce RTX 3060 (UUID: GPU-1234)\n") })
-      expect(listed).toMatchObject({ state: "met", detail: "NVIDIA GeForce RTX 3060 (CUDA)" })
-      const none = yield* judge("cuda", { "nvidia-smi": ran("No devices were found", 6) })
-      expect(none.state).toBe("missing")
-      const absent = yield* judge("cuda", {})
-      expect(absent.state).toBe("unchecked")
-    }))
 })
 
 describe("the requirement checker", () => {
   it.effect("probes each program once, concurrently, without a shell, on the fixed path with 5 s, and judges from the cache", () =>
     Effect.gen(function*() {
       const { calls, prober } = fakeProber({
-        ffmpeg: ran("ffmpeg version 6.1.1-3ubuntu5 Copyright (c) 2000-2023"),
+        ffmpeg: ran("ffmpeg 6.1.1 Copyright (c) 2000-2023"),
         mpv: ran("mpv 0.34.1 Copyright © 2000-2021"),
         sox: { kind: "timeout" }
       })
-      const checker = makeRequirementChecker({ dataDir: "/srv/pva/data", prober, distro: "debian", memoryMb: () => 2048, freeDiskMb: () => 500 })
+      const checker = makeRequirementChecker({ dataDir: "/srv/pva/data", prober, distro: "debian", tools: TOOLS })
       const requirements: ReadonlyArray<Requirement> = [
         { tool: "ffmpeg", version: ">=5", why: "Converts audio" },
         { tool: "mpv", version: ">=0.35", why: "Plays streams" },
         { tool: "yt-dlp", why: "Resolves stream URLs" },
         { tool: "sox", why: "Mixes" },
-        { tool: "mpv", where: "playback-device", why: "Plays on the device" },
-        { network: "internet" },
-        { memoryMb: 4096 },
-        { diskMb: 100 }
+        { network: "internet" }
       ]
       yield* checker.probe(requirements)
       yield* checker.probe(requirements)
@@ -144,25 +83,69 @@ describe("the requirement checker", () => {
         ["missing", "mpv 0.34.1 does not match >=0.35"],
         ["missing", "yt-dlp is missing"],
         ["missing", "sox did not answer within 5 s"],
-        ["unchecked", "mpv on the device (not checked yet)"],
-        ["unchecked", "internet access (not checked)"],
-        ["missing", "Needs 4096 MB of memory; this server has 2048 MB"],
-        ["met", "500 MB free"]
+        ["unchecked", "internet access (not checked)"]
       ])
-      expect(statuses[2]!.fix).toEqual({ kind: "command", label: "Install yt-dlp", value: "sudo apt install yt-dlp" })
+      expect(statuses[2]!.fix).toEqual({ kind: "command", label: "Install yt-dlp", value: "sudo apt install yt-dlp-pkg" })
       expect(statuses[1]!.fix?.label).toBe("Update mpv")
-
-      // "Check again" probes again; a spawn that failed with ENOENT marks the program missing at once.
       yield* checker.probe(requirements, { force: true })
       expect(calls.length).toBe(8)
-      checker.markMissing("ffmpeg")
-      expect(checker.check([requirements[0]!])[0]!.state).toBe("missing")
+    }))
+
+  it.effect("a version that is not strict semver is unknown: it never meets a range, and is shown as reported", () =>
+    Effect.gen(function*() {
+      const judge = (output: string, version?: string) =>
+        Effect.gen(function*() {
+          const checker = makeRequirementChecker({ dataDir: "/d", prober: fakeProber({ mpv: ran(output) }).prober, distro: "debian", tools: TOOLS })
+          const r: Requirement = { tool: "mpv", ...(version !== undefined ? { version } : {}), why: "Plays" }
+          yield* checker.probe([r])
+          return checker.check([r])[0]!
+        })
+      expect((yield* judge("mpv 0.35.0-1", ">=0.35.0")).state).toBe("missing")
+      expect((yield* judge("mpv 0.35.0~rc1", ">=0.35.0")).detail).toBe('mpv reported "0.35.0~rc1", which is not a semver version; needs >=0.35.0')
+      expect((yield* judge("mpv 3.14.0rc1", ">=3")).state).toBe("missing")
+      expect((yield* judge("mpv 0.35.0-rc.1", ">=0.35.0")).state).toBe("missing")
+      expect((yield* judge("mpv 0.35.0-rc.1", ">=0.35.0-rc.1")).state).toBe("met")
+      expect((yield* judge("mpv 2025.01.15", ">=2025.1.15")).state).toBe("missing")
+      expect(yield* judge("mpv 6.1")).toEqual({ requirement: { tool: "mpv", why: "Plays" }, state: "met", detail: "mpv 6.1" })
+      expect((yield* judge("mpv 1.0.0", "about one")).detail).toMatch(/cannot be read/)
+    }))
+
+  it.effect("the registry is empty; a program it does not know is missing, also a name like constructor or __proto__", () =>
+    Effect.gen(function*() {
+      expect(TOOL_REGISTRY.size).toBe(0)
+      const { calls, prober } = fakeProber({})
+      const checker = makeRequirementChecker({ dataDir: "/d", prober, distro: "debian" })
+      const names = ["ffmpeg", "constructor", "toString", "__proto__", "hasOwnProperty"]
+      const requirements = names.map((tool): Requirement => ({ tool, why: "x" }))
+      yield* checker.probe(requirements)
+      expect(calls).toEqual([]) // an unknown program is never run
+      expect(checker.check(requirements).map((s) => [s.state, s.detail])).toEqual(names.map((n) => ["missing", `${n} is not a program this assistant knows how to check`]))
+    }))
+
+  it.effect("a probe already running when a missing program is reported cannot undo the report; a later probe can", () =>
+    Effect.gen(function*() {
+      let release: (() => void) | undefined
+      const prober: Prober = () => new Promise((resolve) => (release = () => resolve(ran("mpv 1.0.0"))))
+      const checker = makeRequirementChecker({ dataDir: "/d", prober, distro: "debian", tools: TOOLS })
+      const r: Requirement = { tool: "mpv", why: "Plays" }
+      const probing = yield* Effect.forkChild(checker.probe([r], { force: true }))
+      yield* Effect.repeat(Effect.yieldNow, { times: 10 })
+      checker.markMissing("mpv")
+      release!()
+      yield* Fiber.await(probing)
+      expect(checker.check([r])[0]!.state).toBe("missing")
+      const again = yield* Effect.forkChild(checker.probe([r], { force: true }))
+      yield* Effect.repeat(Effect.yieldNow, { times: 10 })
+      release!()
+      yield* Fiber.await(again)
+      expect(checker.check([r])[0]!.state).toBe("met")
     }))
 
   it("fixes per distribution, and the os-release families", () => {
-    expect(installFix("ffmpeg", TOOL_REGISTRY.ffmpeg, "arch").value).toBe("sudo pacman -S ffmpeg")
-    expect(installFix("ffmpeg", TOOL_REGISTRY.ffmpeg, "nix").value).toMatch(/^nix-env -iA nixos\.ffmpeg/)
-    expect(installFix("ffmpeg", TOOL_REGISTRY.ffmpeg, undefined).value).toMatch(/Debian\/Ubuntu: sudo apt install ffmpeg · Arch: sudo pacman -S ffmpeg/)
+    const ffmpeg = TOOLS.get("ffmpeg")
+    expect(installFix("ffmpeg", ffmpeg, "arch").value).toBe("sudo pacman -S ffmpeg")
+    expect(installFix("ffmpeg", ffmpeg, "nix").value).toMatch(/^nix-env -iA nixos\.ffmpeg/)
+    expect(installFix("ffmpeg", ffmpeg, undefined).value).toMatch(/Debian\/Ubuntu: sudo apt install ffmpeg-pkg · Arch: sudo pacman -S ffmpeg/)
     expect(detectDistro("ID=ubuntu\nID_LIKE=debian\n")).toBe("debian")
     expect(detectDistro('ID="manjaro"\n')).toBe("arch")
     expect(detectDistro("ID=nixos\n")).toBe("nix")
@@ -185,53 +168,31 @@ const weather = defineModule({
   start: () => Effect.succeed({})
 })
 
-const quietCore = {
-  freeMb: () => 50_000,
-  portFree: async () => "free" as const,
-  clockSynced: async () => false,
-  readable: () => true,
-  checkStt: () => undefined,
-  nodeVersion: "22.20.0"
-}
-
 const assistantWith = (modules: Assistant["modules"]): Assistant => ({ id: "jeff", name: "Jeff", on: true, modules, voice: { provider: "cartesia", voiceId: "x" } } as unknown as Assistant)
 
 describe("doctor", () => {
-  it.effect("prints one line per issue with its fix, and exits 1 on an error", () =>
+  it.effect("prints one line per issue with its fix, says nothing about the machine, and exits 1 on an error", () =>
     Effect.gen(function*() {
-      const { prober } = fakeProber({ tar: ran("tar (GNU tar) 1.35"), bzip2: ran("bzip2, a block-sorting file compressor.  Version 1.0.8, 13-Jul-2019."), nice: ran("nice (GNU coreutils) 9.4") })
       const issues = yield* runDoctor({
         catalog: [music, weather],
         env: {},
         dataDir: "/nonexistent/pva-data",
-        modelDirs: { stt: "/nonexistent/stt", tts: "/nonexistent/tts" },
         assistants: [assistantWith({ music: { on: true, offTools: [] } })],
-        vault: { state: "locked", path: "/home/owner/.config/pva/vault.enc" },
-        prober,
-        core: quietCore
+        prober: fakeProber({}).prober,
+        tools: TOOLS
       })
       const { exitCode, lines } = formatDoctor(issues)
       expect(exitCode).toBe(1)
-      expect(lines.some((l) => l.startsWith("error   core: flock is missing. serve mode takes the data directory's writer lock with it; without it the server refuses to start. → Install flock: "))).toBe(true)
-      expect(lines.some((l) => l.startsWith("error   music: yt-dlp is missing. Music needs it: Resolves stream URLs. → Install yt-dlp: "))).toBe(true)
-      expect(lines).toContain("warning core: The clock is not synchronised. Times, timers and reminders may be off. → Turn on time synchronisation: sudo timedatectl set-ntp true")
-      expect(lines).toContain("info    core: The key vault is locked. Modules and engines that need a key do not run until it is unlocked (or PVA_VAULT_PASSWORD is set). → Unlock it: #settings/keys/access")
-      expect(lines).toContain("info    weather: Forecast quota at 80 %.")
-      expect(lines.at(-1)).toBe("2 errors, 1 warning, 2 notes.")
+      expect(lines).toEqual([
+        expect.stringMatching(/^error   music: yt-dlp is missing\. Music needs it: Resolves stream URLs\. → Install yt-dlp: /),
+        "info    weather: Forecast quota at 80 %.",
+        "1 error, 0 warnings, 1 note."
+      ])
     }))
 
-  it.effect("a module no assistant has on is only a warning, and a clean machine exits 0", () =>
+  it.effect("a module no assistant has on is only a warning, and nothing to report exits 0", () =>
     Effect.gen(function*() {
-      const all = fakeProber({ flock: ran("flock from util-linux 2.39.3"), tar: ran("tar (GNU tar) 1.35"), bzip2: ran("Version 1.0.8"), nice: ran("nice (GNU coreutils) 9.4") })
-      const unused = yield* runDoctor({
-        catalog: [music],
-        env: {},
-        dataDir: "/nonexistent/pva-data",
-        modelDirs: { stt: "/nonexistent/stt", tts: "/nonexistent/tts" },
-        assistants: [assistantWith({})],
-        prober: all.prober,
-        core: { ...quietCore, clockSynced: async () => true }
-      })
+      const unused = yield* runDoctor({ catalog: [music], env: {}, dataDir: "/nonexistent/pva-data", assistants: [assistantWith({})], prober: fakeProber({}).prober, tools: TOOLS })
       const report = formatDoctor(unused)
       expect(report.lines).toEqual([
         expect.stringMatching(/^warning music: yt-dlp is missing\. Music needs it: Resolves stream URLs\. \(No assistant has it on\.\) → Install yt-dlp: /),
@@ -240,12 +201,38 @@ describe("doctor", () => {
       expect(report.exitCode).toBe(0)
       expect(formatDoctor([])).toEqual({ lines: ["No problems found."], exitCode: 0 })
     }))
+
+  it("every piece of text is one line without control characters, whatever a module put in it", () => {
+    const evil: HealthIssue = {
+      id: "x",
+      module: "weather",
+      severity: "error",
+      title: "Bad\nerror   music: all fine\u001b[2J",
+      detail: "line one\r\nline two\u0007",
+      fix: { kind: "command", label: "Fix\u001b]0;owned\u0007 it", value: "rm -rf /\nreboot" }
+    }
+    const { lines } = formatDoctor([evil])
+    expect(lines.length).toBe(2)
+    expect(lines[0]).toBe("error   weather: Bad error music: all fine [2J. line one line two. → Fix ]0;owned it: rm -rf / reboot")
+    // eslint-disable-next-line no-control-regex
+    expect(lines.every((l) => !/[\u0000-\u001f\u007f-\u009f]/.test(l))).toBe(true)
+  })
+
+  it.effect("settings or a vault that cannot be read are a clear failure, never the defaults", () =>
+    Effect.gen(function*() {
+      const lockedVault = { state: () => "locked", unlock: async () => ({ ok: false, message: "wrong password" }) } as never
+      const locked = yield* Effect.flip(loadDoctorSettings({ env: {}, dataDir: "/nonexistent", vaultPath: "/v.enc", catalog: [], openVault: async () => lockedVault }))
+      expect(locked.message).toMatch(/^The key vault at \/v\.enc is locked: set PVA_VAULT_PASSWORD/)
+      const wrong = yield* Effect.flip(loadDoctorSettings({ env: { PVA_VAULT_PASSWORD: "x" }, dataDir: "/nonexistent", vaultPath: "/v.enc", catalog: [], openVault: async () => lockedVault }))
+      expect(wrong.message).toMatch(/did not unlock: wrong password/)
+      const unreadable = yield* Effect.flip(loadDoctorSettings({ env: {}, dataDir: "/d", vaultPath: "/v.enc", catalog: [], openVault: async () => Promise.reject(Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" })) }))
+      expect(unreadable.message).toBe("The key vault at /v.enc could not be read: EACCES: permission denied")
+    }))
 })
 
 // Review round 1, finding 11: doctor judges by the assistants' demand, through `uses` too, starting nothing.
 describe("doctor's severity follows the assistants' demand", () => {
-  const all = () => fakeProber({ flock: ran("flock from util-linux 2.39.3"), tar: ran("tar (GNU tar) 1.35"), bzip2: ran("Version 1.0.8"), nice: ran("nice (GNU coreutils) 9.4") })
-  const base = { env: {}, dataDir: "/nonexistent/pva-data", modelDirs: { stt: "/nonexistent/stt", tts: "/nonexistent/tts" }, core: { ...quietCore, clockSynced: async () => true } }
+  const base = { env: {}, dataDir: "/nonexistent/pva-data", tools: TOOLS, prober: fakeProber({}).prober }
   const offByDefault = defineModule({ id: "radio", name: "Radio", description: "", enabledByDefault: false, requires: [{ tool: "mpv", why: "Plays" }], start: () => Effect.succeed({}) })
   const provider = defineModule({ apiVersion: 2, id: "streams", name: "Streams", description: "", requires: [{ tool: "ffmpeg", why: "Converts" }], start: () => Effect.succeed({}) })
   const consumer = defineModule({ apiVersion: 2, id: "kitchen", name: "Kitchen", description: "", uses: ["streams"], start: () => Effect.succeed({}) })
@@ -256,8 +243,7 @@ describe("doctor's severity follows the assistants' demand", () => {
         ...base,
         catalog: [offByDefault, provider, consumer],
         assistants: [assistantWith({ radio: { on: true, offTools: [] }, kitchen: { on: true, offTools: [] } })],
-        persistence: { modules: { radio: { enabled: false } }, secrets: {} },
-        prober: all().prober
+        persistence: { modules: { radio: { enabled: false } }, secrets: {} }
       })
       const severity = (id: string) => issues.find((i) => i.id === id)?.severity
       expect(severity("radio.requires.mpv")).toBe("error")
@@ -267,7 +253,7 @@ describe("doctor's severity follows the assistants' demand", () => {
 
   it.effect("with nobody using them, both are warnings and doctor exits 0", () =>
     Effect.gen(function*() {
-      const issues = yield* runDoctor({ ...base, catalog: [offByDefault, provider, consumer], assistants: [assistantWith({})], prober: all().prober })
+      const issues = yield* runDoctor({ ...base, catalog: [offByDefault, provider, consumer], assistants: [assistantWith({})] })
       expect(issues.map((i) => i.severity)).toEqual(["warning", "warning"])
       expect(formatDoctor(issues).exitCode).toBe(0)
     }))
@@ -277,8 +263,8 @@ describe("doctor's severity follows the assistants' demand", () => {
 describe("a missing program reported at run time", () => {
   it.effect("after a successful probe, a tool's ENOENT marks it missing and the module becomes unavailable, without probing again", () =>
     Effect.gen(function*() {
-      const { calls, prober } = fakeProber({ "yt-dlp": ran("2025.01.15") })
-      const checker = makeRequirementChecker({ dataDir: "/d", prober, distro: "debian" })
+      const { calls, prober } = fakeProber({ "yt-dlp": ran("yt-dlp 2025.1.15") })
+      const checker = makeRequirementChecker({ dataDir: "/d", prober, distro: "debian", tools: TOOLS })
       let host: ModuleHostApi | undefined
       const player = defineModule({
         apiVersion: 2,
@@ -315,14 +301,17 @@ describe("a missing program reported at run time", () => {
       yield* made.startEnabled
       expect(made.modules()[0]!.state).toBe("running")
       expect(host).toBeDefined()
+      // A program it does not require is ignored.
+      yield* host!.reportMissingProgram("ffmpeg")
+      expect(checker.probed("ffmpeg")).toBeUndefined()
       yield* made.snapshot().registry.run({ id: "c1", name: "play", input: {} })
       yield* Effect.repeat(Effect.yieldNow, { times: 50 })
       expect(made.modules()[0]!.state).toBe("unavailable")
       expect(made.modules()[0]!.unavailable?.reason).toBe("yt-dlp is missing")
       // No probe on the turn path: the one at start only.
       expect(calls.length).toBe(1)
-      // A program it does not require is ignored.
-      yield* host!.reportMissingProgram("ffmpeg")
-      expect(checker.probed("ffmpeg")).toBeUndefined()
+      // The stopped module's host object answers with ModuleStopped (a defect: its types stay as they were).
+      const after = yield* Effect.exit(host!.reportMissingProgram("ffmpeg"))
+      expect(after._tag === "Failure" && isModuleStopped(Cause.squash(after.cause))).toBe(true)
     }).pipe(Effect.scoped))
 })

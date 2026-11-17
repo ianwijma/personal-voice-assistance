@@ -95,15 +95,13 @@ describe("the shared part", () => {
       assert.strictEqual(probe.instanceShared.length, 2)
       assert.strictEqual(probe.instanceShared[0], probe.instanceShared[1], "the same value for both")
       assert.deepStrictEqual(host.service(Lists), { address: "here" })
-      assert.deepStrictEqual(host.contributions(Sections), ["section@here"])
+      assert.deepStrictEqual(yield* host.contributions(Sections), ["section@here"])
 
       demand.current = new Map([["lists", []]])
       yield* host.refresh
-      assert.strictEqual(host.service(Lists), undefined, "withdrawn at once")
-      assert.deepStrictEqual(host.contributions(Sections), [])
-      assert.deepStrictEqual(probe.sharedCloses, [], "closed after the grace period")
-      yield* advance(10_000)
-      assert.deepStrictEqual(probe.sharedCloses, ["here"])
+      assert.strictEqual(host.service(Lists), undefined, "withdrawn")
+      assert.deepStrictEqual(yield* host.contributions(Sections), [])
+      assert.deepStrictEqual(probe.sharedCloses, ["here"], "closed once nothing was in flight")
     }))
 
   it.effect("`uses` makes a module demanded: its shared part runs with no instance, and stops with the user", () =>
@@ -124,7 +122,7 @@ describe("the shared part", () => {
       assert.deepStrictEqual(probe.sharedCloses, ["here"])
     }))
 
-  it.effect("service and contribution lookups before, during and after a restart of the provider", () =>
+  it.effect("service and contribution lookups before, during and after a restart of the provider (absent while it restarts)", () =>
     Effect.gen(function*() {
       const probe = newProbe()
       const demand = { current: new Map<string, ReadonlyArray<ModuleDemand>>([["lists", [{ assistantId: "a" }]]]) }
@@ -133,16 +131,16 @@ describe("the shared part", () => {
       assert.deepStrictEqual(host.service(Lists), { address: "here" }, "before")
       const fiber = yield* Effect.forkChild(host.configure("lists", { values: { address: "there" }, secrets: {} }))
       yield* advance(500)
-      assert.deepStrictEqual(host.service(Lists), { address: "here" }, "during: the old one serves")
-      assert.deepStrictEqual(host.contributions(Sections), ["section@here"])
+      // Stop before start: while the new one starts the provider is absent, which a consumer handles anyway.
+      assert.strictEqual(host.service(Lists), undefined, "during: absent")
+      assert.deepStrictEqual(yield* host.contributions(Sections), [])
+      assert.deepStrictEqual(probe.sharedCloses, ["here"], "the old shared part closed before the new one started")
       yield* advance(600)
       const result = yield* Fiber.join(fiber)
       assert.isTrue(result.ok)
       assert.deepStrictEqual(host.service(Lists), { address: "there" }, "after")
-      assert.deepStrictEqual(host.contributions(Sections), ["section@there"])
+      assert.deepStrictEqual(yield* host.contributions(Sections), ["section@there"])
       assert.deepStrictEqual(probe.instanceShared.at(-1), { address: "there" }, "the instance was started again with the new value")
-      yield* advance(10_000)
-      assert.deepStrictEqual(probe.sharedCloses, ["here"], "the old shared part is closed after the grace period")
     }))
 
   it.effect("a second provider of a service is a start error for the second module", () =>
@@ -186,7 +184,7 @@ describe("the turn's action catalogue", () => {
         ]
       })
   })
-  const turnOf = (assistantId: string): TurnContext => ({ turnId: 3, conversationId: "c-1", assistantId, source: "routine" })
+  const turnOf = (assistantId: string): TurnContext => ({ turnId: 3, conversationId: "c-1", assistantId, deviceId: "kitchen", source: "routine" })
 
   it.effect("lists the calling assistant's actions and runs them through the gateway, which refuses what it has off", () =>
     Effect.gen(function*() {

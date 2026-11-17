@@ -11,6 +11,17 @@ import { ModuleId, NonNegativeFinite } from "./common.ts"
  * and sends them to admin pages (`health`); the Health page shows them with "Check again" (`health.check`).
  */
 
+/**
+ * Bounds of the lists protocol 9 added, so that no message exceeds the frame limit (`MAX_TEXT_FRAME_BYTES`, 1 MiB).
+ * The server enforces them when it builds a list and says what it left out ("and 12 more"); a list over its bound
+ * is refused by the codec.
+ */
+export const MAX_HEALTH_ISSUES = 100
+export const MAX_MODULE_TEMPLATES = 8
+export const MAX_TEMPLATE_MODULES = 32
+export const MAX_TEMPLATE_PHRASES = 8
+export const MAX_TOOL_RISKS = 5
+
 /** How bad an issue is: `error` stops something working (doctor exits non-zero), `warning` may, `info` is a fact. */
 export const IssueSeverity = Schema.Literals(["error", "warning", "info"])
 export type IssueSeverity = typeof IssueSeverity.Type
@@ -34,7 +45,7 @@ export const HealthIssue = Schema.Struct({
   /** The module it is about; absent for a core check. */
   module: Schema.optionalKey(ModuleId),
   /** The device it is about, when it is one device's problem. */
-  device: Schema.optionalKey(Schema.String),
+  device: Schema.optionalKey(Schema.String.check(Schema.isMaxLength(200))),
   severity: IssueSeverity,
   /** One line: "yt-dlp is missing". */
   title: Schema.String.check(Schema.isMaxLength(200)),
@@ -46,7 +57,8 @@ export type HealthIssue = typeof HealthIssue.Type
 
 /** The issue registry as admin pages see it: every current issue, and when the last check finished. */
 export const HealthInfo = Schema.Struct({
-  issues: Schema.Array(HealthIssue),
+  /** At most `MAX_HEALTH_ISSUES`; the server's last one says how many more there are. */
+  issues: Schema.Array(HealthIssue).check(Schema.isMaxLength(MAX_HEALTH_ISSUES)),
   /** Epoch ms of the last completed check (probes and every module's `health()`); absent before the first. */
   checkedAt: Schema.optionalKey(NonNegativeFinite),
   /** A check ("Check again", or the one at start) is running. */
@@ -86,8 +98,8 @@ export const AssistantTemplate = Schema.Struct({
   /** What it handles, for routing by TypeSafe (`Assistant.handles`). */
   handles: Schema.optionalKey(Schema.String.check(Schema.isMaxLength(ASSISTANT_HANDLES_CHARS))),
   /** The modules it has on (the shipping module first). */
-  modules: Schema.Array(ModuleId),
+  modules: Schema.Array(ModuleId).check(Schema.isMaxLength(MAX_TEMPLATE_MODULES)),
   /** Wake phrases it suggests; the owner accepts them per device. */
-  suggestedPhrases: Schema.optionalKey(Schema.Array(Schema.String.check(Schema.isMaxLength(60))))
+  suggestedPhrases: Schema.optionalKey(Schema.Array(Schema.String.check(Schema.isMaxLength(60))).check(Schema.isMaxLength(MAX_TEMPLATE_PHRASES)))
 })
 export type AssistantTemplate = typeof AssistantTemplate.Type
