@@ -289,7 +289,8 @@ describe("front-end kinds and devices", () => {
     expect((await request(tab1.client, { type: "device.update", patch: { activation: "wake-phrase", followUpSeconds: 3, voice: "sherpa:en_US-lessac-medium" } })).ok).toBe(true)
     for (const tab of [tab1, tab2]) {
       const p = await profileOf(tab.client, (m) => m.profile.activation === "wake-phrase")
-      expect(p.profile).toMatchObject({ followUpSeconds: 3, voice: "sherpa:en_US-lessac-medium" })
+      // A device's own voice is retired since settings version 4 (the assistant's voice speaks): accepted, not kept.
+      expect(p.profile).toMatchObject({ followUpSeconds: 3, voice: "" })
     }
     await admin.client.waitFor("devices", (m) => m.devices.some((d) => d.overrides.activation === "wake-phrase"), { from: 0 })
     // Not editable by the device itself; an unknown voice; a page without a device.
@@ -307,8 +308,9 @@ describe("front-end kinds and devices", () => {
     expect((await profileOf(tab1.client, (m) => m.profile.followUpSeconds === 8)).profile.activation).toBe("wake-phrase")
 
     const saved = JSON.parse(readFileSync(join(server.dataDir, "settings.json"), "utf8"))
-    expect(saved.version).toBe(3)
-    expect(saved.devices["phone-0001"]).toMatchObject({ kind: WEB_VOICE_KIND, name: "Test browser", overrides: { activation: "wake-phrase", voice: "sherpa:en_US-lessac-medium" } })
+    expect(saved.version).toBe(4)
+    expect(saved.devices["phone-0001"]).toMatchObject({ kind: WEB_VOICE_KIND, name: "Test browser", own: { withoutPhrase: { mode: "nobody" } } })
+    expect(saved.devices["phone-0001"].own.assistants).toBeUndefined()
   })
 
   it("admin: kind defaults and device overrides reach running devices live; rename, reset, forget; unknown ids", async () => {
@@ -428,7 +430,7 @@ describe("wake phrase in serve mode", () => {
   it("phrase + request: a turn with the phrase removed, `wake` to everyone; then the follow-up window; then asleep again", async () => {
     const { stt, llm, owner, admin } = await wakeServer()
     stt.emit(speechStarted, interim("Hey Jeff, what"), endOfTurn("Hey Jeff, what time is it?"))
-    expect(await owner.waitFor("wake", () => true, { from: 0 })).toEqual({ type: "wake", phrase: "hey jeff", armed: false })
+    expect(await owner.waitFor("wake", () => true, { from: 0 })).toEqual({ type: "wake", phrase: "hey jeff", armed: false, assistantId: "assistant" })
     expect((await owner.waitFor("turn.start", () => true, { from: 0 })).userText).toBe("what time is it?")
     expect(owner.messages.filter((m) => m.type === "transcript").map((m) => (m as { text: string }).text)).toEqual(["what", ""])
     expect(await admin.waitFor("wake.heard", () => true, { from: 0 })).toMatchObject({ text: "Hey Jeff, what time is it?", matched: "hey jeff", accepted: true })
@@ -483,7 +485,7 @@ describe("wake phrase in serve mode", () => {
   it("the phrase alone arms the window: `wake` armed, listening, the next utterance needs no phrase", async () => {
     const { stt, owner } = await wakeServer()
     stt.emit(speechStarted, endOfTurn("Hey Jeff."))
-    expect(await owner.waitFor("wake", () => true, { from: 0 })).toEqual({ type: "wake", phrase: "hey jeff", armed: true })
+    expect(await owner.waitFor("wake", () => true, { from: 0 })).toEqual({ type: "wake", phrase: "hey jeff", armed: true, assistantId: "assistant" })
     await owner.waitFor("state", (m) => m.state === "listening", { from: 0 })
     await sleep(100)
     expect(owner.types()).not.toContain("turn.start")
@@ -504,14 +506,17 @@ describe("wake phrase in serve mode", () => {
     expect(other.client.types()).not.toContain("wake.heard")
   })
 
-  it("in `always` mode nothing is gated: every utterance is a turn, and the state is never asleep", async () => {
+  // WP-4b (docs/ASSISTANTS.md §6 "Behaviour changes"): the route gate matches and strips a leading phrase in every
+  // mode, so in `always` mode "Hey Jeff, hello" reaches the model as "hello", and the phrase is reported (`wake`).
+  it("in `always` mode nothing is gated: every utterance is a turn (a leading phrase stripped), and the state is never asleep", async () => {
     const { server, stt } = await start()
     const owner = await voicePage(server)
     await owner.client.claim()
     stt.emit(endOfTurn("Hey Jeff, hello"))
-    expect((await owner.client.waitFor("turn.start", () => true, { from: 0 })).userText).toBe("Hey Jeff, hello")
+    expect((await owner.client.waitFor("turn.start", () => true, { from: 0 })).userText).toBe("hello")
     await owner.client.waitFor("turn.end", () => true, { from: 0, timeoutMs: 10_000 })
     expect(owner.client.messages.some((m) => m.type === "state" && m.state === "asleep")).toBe(false)
-    expect(owner.client.types()).not.toContain("wake")
+    stt.emit(endOfTurn("good morning"))
+    expect((await owner.client.waitFor("turn.start", (m) => m.userText === "good morning", { from: 0 })).userText).toBe("good morning")
   })
 })

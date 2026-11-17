@@ -3,7 +3,7 @@ import { Cause, Clock, Effect, Exit, Scope, Stream } from "effect"
 import { actionTool, defineAction, Param, type RegisteredAction, registerActions } from "./Actions.ts"
 import type { Agent } from "./Agent.ts"
 import { buildDecisionPlan, type DecisionProvider } from "./Decision.ts"
-import type { ContextProvider, Tool } from "./Module.ts"
+import type { AssistantModule, ContextProvider, Tool } from "./Module.ts"
 import type { FieldActionResult } from "./ModuleContributions.ts"
 import { type ModuleDefinition, type ModuleInstance, ModuleStartError } from "./ModuleDefinition.ts"
 import { applySettingsPatch, resolveSettings } from "./Settings.ts"
@@ -61,6 +61,20 @@ export interface ModuleSnapshot {
   readonly actions: ReadonlyArray<RegisteredAction>
   /** Running decision providers by id. */
   readonly deciders: ReadonlyMap<string, DecisionProvider>
+  /**
+   * The same running modules one by one, in `registry` order: what each contributes (its tools, generated action
+   * tools included, and context providers, as `registry` holds them) and its instructions ("" if none). For a
+   * registry of some of them only (an assistant's module choices, docs/ASSISTANTS.md §2.6).
+   */
+  readonly parts: ReadonlyArray<ModulePart>
+}
+
+/** One running module's share of a `ModuleSnapshot`. */
+export interface ModulePart {
+  readonly moduleId: string
+  /** `name` is the module id. */
+  readonly module: AssistantModule
+  readonly instructions: string
 }
 
 /** Result of `ModuleHost.fieldAction`. */
@@ -260,7 +274,8 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
     toolModules: new Map(),
     agents: new Map(),
     actions: [],
-    deciders: new Map()
+    deciders: new Map(),
+    parts: []
   }
   /** The snapshot of the running instances, with `candidate` in place of its entry's instance. Throws on a tool name clash. */
   const buildSnapshot = (candidate?: { readonly entry: Entry; readonly running: Running }): ModuleSnapshot => {
@@ -276,21 +291,24 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
       for (const agent of r.instance.agents ?? []) if (!agents.has(agent.id)) agents.set(agent.id, agent)
       for (const decider of r.instance.deciders ?? []) if (!deciders.has(decider.id)) deciders.set(decider.id, decider)
     }
-    return {
-      version: snapshot.version + 1,
-      registry: makeToolRegistry(running.map(({ e, r }) => ({
+    const parts: Array<ModulePart> = running.map(({ e, r }) => ({
+      moduleId: e.def.id,
+      module: {
         name: e.def.id,
         tools: r.tools,
         context: (r.instance.context ?? []).map((p) => wrapProvider(e.def.id, p))
-      }))),
-      instructions: running.flatMap(({ r }) => {
-        const text = r.instance.instructions?.trim() ?? ""
-        return text.length > 0 ? [text] : []
-      }),
+      },
+      instructions: r.instance.instructions?.trim() ?? ""
+    }))
+    return {
+      version: snapshot.version + 1,
+      registry: makeToolRegistry(parts.map((p) => p.module)),
+      instructions: parts.flatMap((p) => (p.instructions.length > 0 ? [p.instructions] : [])),
       toolModules,
       agents,
       actions: running.flatMap(({ r }) => r.actions),
-      deciders
+      deciders,
+      parts
     }
   }
   const rebuild = () => {

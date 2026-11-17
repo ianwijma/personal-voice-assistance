@@ -7,7 +7,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterEach, describe, expect, it, vi } from "vitest"
 import { flattenSections } from "../src/serve/flatten.ts"
-import { readSettingsFile } from "../src/serve/SettingsStore.ts"
+import { readSettingsFile, readStoredSettings } from "../src/serve/SettingsStore.ts"
 import { readVaultSecrets } from "../src/serve/Vault.ts"
 import { ScriptedClient } from "./support/scriptedClient.ts"
 import { controlledStt, fakeBuild, scriptedLlm, startTestServer, type TestServer, TEST_ADMIN_PASSWORD } from "./support/serveHarness.ts"
@@ -71,12 +71,20 @@ describe("flat storage", () => {
     expect(section(welcome.snapshot.sections, "language-model").form.values.LLM_PROVIDER).toBe("anthropic")
     expect(welcome.snapshot.modules[0]!.settings.values.greeting).toBe("hoi")
     const written = JSON.parse(readFileSync(join(dataDir, "settings.json"), "utf8"))
-    expect(written).toEqual({
-      version: 3,
+    // Written as version 4 (docs/ASSISTANTS.md §6): the flat keys stay, and the one assistant has them.
+    expect(written).toMatchObject({
+      version: 4,
       modules: v1.modules,
       assistant: { STT_SHERPA_FINAL_SILENCE_MS: 700, STT_SHERPA_MODEL: "nemotron-3.5", DEFAULT_VOICE: "natural", LLM_PROVIDER: "anthropic" },
-      frontends: {},
-      devices: {}
+      assistants: { order: ["assistant"] },
+      devices: {},
+      migration: { from: 1 }
+    })
+    expect(written.assistants.byId.assistant).toMatchObject({
+      llm: { account: "anthropic" },
+      hearing: { finalSilenceMs: 700, model: "nemotron-320" },
+      voice: { provider: "sherpa", voiceId: "kokoro-af_heart" },
+      modules: { greeter: { on: true, offTools: [] } }
     })
     expect(JSON.parse(readFileSync(join(dataDir, "settings.json.v1-backup"), "utf8"))).toEqual(v1)
   })
@@ -99,13 +107,15 @@ describe("flat storage", () => {
     expect(read.problems.join(" ")).not.toContain("deepgram")
     // The owner wins even when it comes first.
     expect(flattenSections({ speech: { STT_PROVIDER: "sherpa" }, listening: { STT_PROVIDER: "deepgram" } }, "x").flat).toEqual({ STT_PROVIDER: "sherpa" })
-    // A version-2 file is read as it is; anything else is not a settings file.
-    expect(readSettingsFile({ version: 2, modules: {}, assistant: { A: 1 } })).toEqual({
-      file: { version: 3, modules: {}, assistant: { A: 1 }, frontends: {}, devices: {} },
-      migrated: false,
+    // A version-2 file is read as version 3 (then migrated to 4); anything else is not a settings file.
+    expect(readStoredSettings({ version: 2, modules: {}, assistant: { A: 1 } })).toEqual({
+      file: { version: 3, from: 2, file: { version: 3, modules: {}, assistant: { A: 1 }, frontends: {}, devices: {} } },
+      migrated: true,
       problems: []
     })
-    expect(readSettingsFile({ version: 4 })).toBeUndefined()
+    expect(readSettingsFile({ version: 2, modules: {}, assistant: { A: 1 } })).toMatchObject({ file: { version: 4, assistant: { A: 1 } }, migrated: true })
+    expect(readSettingsFile({ version: 5 })).toBeUndefined()
+    expect(readSettingsFile({ version: 4, devices: [] })).toBeUndefined()
     expect(readSettingsFile({ version: 3, frontends: [] })).toBeUndefined()
   })
 

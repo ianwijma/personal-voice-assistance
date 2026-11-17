@@ -433,14 +433,16 @@ describe("serve: modules and settings", () => {
       { role: "assistant", text: "Reply to before reload.", interrupted: false, tools: [] }
     ])
     const saved = JSON.parse(readFileSync(join(server!.dataDir, "settings.json"), "utf8"))
-    expect(saved).toEqual({
-      version: 3,
+    expect(saved).toMatchObject({
+      version: 4,
       revision: expect.any(Number),
-      modules: expect.anything(),
       assistant: { STT_SHERPA_FINAL_SILENCE_MS: 500 },
-      frontends: { "web-voice": { interruptMode: "instant" } },
+      deviceTypes: { "web-voice": { interruptMode: "instant" } },
       devices: expect.anything()
     })
+    expect(Object.keys(saved.assistant)).toEqual(["STT_SHERPA_FINAL_SILENCE_MS"])
+    // The flat key that became per assistant is mirrored into the migrated assistant.
+    expect(saved.assistants.byId.assistant.hearing.finalSilenceMs).toBe(500)
   })
 })
 

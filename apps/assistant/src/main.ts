@@ -20,7 +20,7 @@ import { runOffline, runOfflineSessions, type SimulatedDelays, zeroDelays } from
 import { formatReport } from "./bench/report.ts"
 import { AppConfig } from "./config.ts"
 import { userCwd } from "./env.ts"
-import { startCliModules, withModuleInstructions } from "./modules.ts"
+import { moduleCatalog, startCliModules, withModuleInstructions } from "./modules.ts"
 import { FakeLlm } from "./FakeLlm.ts"
 import { LlmLayer, SttLayer } from "./providers.ts"
 import { sayCommand } from "./say.ts"
@@ -133,7 +133,10 @@ const offlineBench = (sessions: number) => Effect.gen(function*() {
     { name: "realistic, eager ON, wake phrase (\"Hey Jeff, …\")", delays: realistic, eager: true, wake: benchWake, wakePrefix: "Hey Jeff, " },
     // The same through the route gate, with two more assistants' phrases on the device (docs/ASSISTANTS.md §3.4).
     { name: "realistic, eager OFF, route gate, 3 assistants (\"Hey Jeff, …\")", delays: realistic, eager: false, route: benchRoute, wakePrefix: "Hey Jeff, " },
-    { name: "realistic, eager ON, route gate, 3 assistants (\"Hey Jeff, …\")", delays: realistic, eager: true, route: benchRoute, wakePrefix: "Hey Jeff, " }
+    { name: "realistic, eager ON, route gate, 3 assistants (\"Hey Jeff, …\")", delays: realistic, eager: true, route: benchRoute, wakePrefix: "Hey Jeff, " },
+    // Serve's session path since WP-4b: route gate → session dispatcher → inbox → output lease (docs/ASSISTANTS.md §3.3).
+    { name: "orchestration overhead, session path (route gate, dispatcher, output lease): all delays 0, eager off", delays: zeroDelays, eager: false, dispatch: true },
+    { name: "realistic, eager ON, session path, 3 assistants (\"Hey Jeff, …\")", delays: realistic, eager: true, route: benchRoute, wakePrefix: "Hey Jeff, ", dispatch: true }
   ]
   for (const scenario of scenarios) {
     if (sessions <= 1) {
@@ -250,7 +253,7 @@ const withSavedSettings = <A, E>(effect: Effect.Effect<A, E>): Effect.Effect<A, 
         cliSettings = settings
         return effect
       }),
-      { env: process.env, dataDir, vaultPath, ...(interactive ? { prompt: askVaultPassword } : {}) }
+      { env: process.env, dataDir, vaultPath, catalog: moduleCatalog, ...(interactive ? { prompt: askVaultPassword } : {}) }
     )
   })
 

@@ -2,33 +2,65 @@ import { makeWebAudio, type WebAudio } from "@pva/audio-web"
 import {
   type AgentTurnSetup,
   type ConversationEvent,
+  type ConversationInput,
   ECHO_TAIL_MS,
   type EchoGate,
   makeEchoGate,
-  makeWakeGate,
+  makeRouteGate,
+  type Message,
+  type RouteConfig,
+  type RouteGate,
+  type RouteResult,
   type SttEvent,
+  type Trace,
   type TurnSetup,
   TurnTrace,
-  voiceKey,
-  type WakeConfig,
-  wakeConfigFromProfile
+  voiceKey
 } from "@pva/core"
-import { type DeviceProfile, MAX_DEVICE_NAME_CHARS, type ServerMessage, type SessionInfo, type TraceInfo, WAKE_ARMED_MS } from "@pva/protocol"
-import { Effect, type Scope, Stream } from "effect"
-import type { Engine, EngineProviders } from "./Engine.ts"
+import {
+  type Assistant,
+  type ConversationInfo,
+  type DeviceSettings,
+  MAX_DEVICE_NAME_CHARS,
+  routeConfigFrom,
+  type ServerMessage,
+  type SessionInfo,
+  type TraceInfo,
+  type TraceRoute,
+  typedTextTarget,
+  WAKE_ARMED_MS
+} from "@pva/protocol"
+import { Effect, Queue, type Scope, Stream } from "effect"
+import type { Engine, EngineProviders, SessionLoop } from "./Engine.ts"
 import { type HeardAudio, makeHeardAudio } from "./HeardAudio.ts"
+import { makeOutputLease } from "./OutputLease.ts"
 import { makePublisher, type Publisher } from "./Publisher.ts"
-import { makeSessionConversation, type SessionConversation } from "./SessionConversation.ts"
+import { makeSessionConversation, type SendOutcome, type SessionConversation } from "./SessionConversation.ts"
+import { type DispatchRoute, type DispatchTarget, makeSessionDispatcher, type SessionDispatcher } from "./SessionDispatcher.ts"
 import { makeStateTracker, type StateTracker } from "./StateTracker.ts"
 
 /**
- * One device's voice session (docs/VOICE-SESSIONS.md §2): what serve mode used to wire once for the whole server,
- * wired per device. Its own `WebAudio` (microphone in, replies out, to the owner tab of this device), echo gate,
- * wake gate, state tracker, publisher, "save what it hears" tap, typed-input admission and `Conversation` (with its
- * own history), on the shared engines. Configured from its device profile (echo-gate mode, wake config, idle reset),
- * read live. Who owns the audio (which tab of the device) is the hub's business: it calls
+ * One device's voice session (docs/VOICE-SESSIONS.md §2, docs/ASSISTANTS.md §3.3): its own `WebAudio` (microphone in,
+ * replies out, to the owner tab of this device), echo gate, route gate, state tracker, publisher, "save what it
+ * hears" tap, and one conversation per assistant (each with its own history, id and idle clock), on the shared
+ * engines. The device's effective settings (type defaults ← its own sections) decide its assistants, their phrases,
+ * the without-phrase mode and the interrupt mode, read live (`syncProfile`); each assistant's prompt, modules,
+ * follow-up, quiet spell and "reply early" are read from it at use.
+ *
+ * The audio path: the recogniser stream runs once per session per engine build (a `SessionLoop` of its own),
+ * then the echo gate, the route gate and the session dispatcher, which feeds each assistant's conversation through
+ * an inbox (`SessionConversation`'s `speech` seam). All conversations play through one output lease, so two replies
+ * never sound at once. Who owns the audio (which tab of the device) is the hub's business: it calls
  * `web.setOwner` / `setMicLive` and `ownerChanged`.
+ *
+ * WP-4b scope: the language model, the recogniser and the voice are still the one shared build (the engine's);
+ * per-assistant resources are the resource pool's (WP-9 onwards).
  */
+
+export interface AssistantSetup {
+  readonly setup: Effect.Effect<TurnSetup>
+  readonly agentSetup?: (providers: EngineProviders) => Effect.Effect<AgentTurnSetup> | undefined
+}
 
 export interface VoiceSessionOptions {
   /** The session's key: the device id, or the client id of a voice connection without a device. */
@@ -37,13 +69,12 @@ export interface VoiceSessionOptions {
   /** The device's name now (or a description of the connection without a device). */
   readonly name: () => string
   readonly engine: Engine
-  /** The device's effective profile now. */
-  readonly profile: () => DeviceProfile
-  /** Per session: the turn setup, and the agent setup (claude-subscription). */
-  readonly conversationSetup: () => {
-    readonly setup: Effect.Effect<TurnSetup>
-    readonly agentSetup?: (providers: EngineProviders) => Effect.Effect<AgentTurnSetup> | undefined
-  }
+  /** The device's effective settings now (docs/ASSISTANTS.md §2.6). */
+  readonly deviceSettings: () => DeviceSettings
+  /** The assistants in effect now, by id. */
+  readonly assistants: () => ReadonlyMap<string, Assistant>
+  /** Per assistant: its turn setup (prompt, module instructions, its tools), and the agent setup (claude-subscription). */
+  readonly conversationSetup: (assistant: string) => AssistantSetup
   /** The module that contributes a tool (module host snapshot). */
   readonly moduleOfTool: (name: string) => string | null
   /** The shared trace service (log line, recent list); this session numbers its own turns and sets `session`. */
@@ -56,10 +87,10 @@ export interface VoiceSessionOptions {
   readonly onChange: (minor: boolean) => void
   /** A committed turn ended (the recent traces of every session, for admin). */
   readonly onTrace?: (trace: TraceInfo) => void
-  /** What one minute of `conversationIdleMinutes` is, in ms (tests shorten it). Default 60 000. */
+  /** What one minute of `newConversationAfter` is, in ms (tests shorten it). Default 60 000. */
   readonly minuteMs?: number
   readonly maxPendingInputs?: number
-  /** The conversation to start with (an id this device was given before its session existed). */
+  /** The conversation to start with (an id this device was given before its session existed): the answering assistant's. */
   readonly initialConversation?: { readonly id: string; readonly startedAt: number }
   /** "Save what the assistant hears". */
   readonly heard: {
@@ -78,6 +109,34 @@ export interface VoiceSessionOptions {
   readonly log: (line: string) => void
 }
 
+/** What typed text came to: `dropped` when nobody answers it on this device (its target is off, or there is none). */
+export type TextOutcome = SendOutcome | "dropped"
+
+/**
+ * The session's conversations, one per assistant (made on first use), as the hub and `VoiceSessions` use them.
+ * Without `assistant`, the methods mean the *answering* assistant: the one holding a follow-up window, else the one
+ * that answers without a phrase, else the TypeSafe fallback, else the first in the device's list (§5.3).
+ */
+export interface SessionConversations {
+  /** Typed text, routed as §2.6 "Typed text" says (`named`: the assistant the page names). */
+  readonly sendText: (text: string, speak: boolean, named?: string) => Effect.Effect<TextOutcome>
+  /** Stop: `assistant`'s conversation, or every active one. */
+  readonly stop: (assistant?: string) => SendOutcome
+  readonly running: () => boolean
+  readonly history: (assistant?: string) => Effect.Effect<ReadonlyArray<Message>>
+  readonly conversation: (assistant?: string) => ConversationInfo
+  readonly lastTurnAt: (assistant?: string) => number | undefined
+  readonly newConversation: (assistant?: string) => Effect.Effect<ConversationInfo>
+  /** The answering assistant now (`undefined`: the device has none). */
+  readonly answering: () => string | undefined
+  /** Start running on the engines (now and after every rebuild) until `end`. */
+  readonly start: () => void
+  /** Stop for good: the recogniser loop and every conversation (their agents are told). */
+  readonly end: Effect.Effect<void>
+  /** The dispatcher (tests and diagnostics). */
+  readonly dispatcher: SessionDispatcher<AssistantConversation>
+}
+
 export interface VoiceSession {
   readonly key: string
   readonly deviceId: string | undefined
@@ -86,14 +145,15 @@ export interface VoiceSession {
   readonly tracker: StateTracker
   readonly publisher: Publisher
   readonly gate: EchoGate
-  readonly conversation: SessionConversation
+  readonly route: RouteGate
+  readonly conversation: SessionConversations
   readonly heard: HeardAudio
-  /** The device's profile may have changed: apply the echo-gate mode and the wake config (only when changed). */
+  /** The device's settings or assistants may have changed: apply the interrupt mode and the route config (only when changed). */
   readonly syncProfile: () => void
   /** Ownership on this device changed (the hub's view): the state follows it. */
   readonly ownerChanged: (present: boolean, micLive: boolean) => void
   readonly ownerPresent: () => boolean
-  /** Committed turns in the current conversation. */
+  /** Committed turns in the answering assistant's current conversation. */
   readonly turns: () => number
   /** `performance.now()` of the last activity (a claim, a recognition event, a turn): "the most recently active". */
   readonly lastActiveAt: () => number
@@ -101,26 +161,61 @@ export interface VoiceSession {
   readonly info: () => SessionInfo
 }
 
-/** A per-session trace service: its own turn ids (from 1), `session` = the device name, the shared log and list. */
-export const sessionTurnTrace = (shared: TurnTrace["Service"], name: () => string): TurnTrace["Service"] => {
-  let nextId = 1
-  return TurnTrace.of({
+/**
+ * The trace service of one assistant's conversation in a session: turn ids from the session's one counter (unique
+ * across its conversations), `session` / `device` = the device name, and the assistant and its route filled at
+ * the turn's start (the route again at its end of turn, when the final transcript has decided it).
+ */
+export const assistantTurnTrace = (
+  shared: TurnTrace["Service"],
+  counter: { next: number },
+  fields: {
+    readonly session: () => string
+    readonly deviceId?: string | undefined
+    readonly assistant?: () => { readonly id: string; readonly name: string } | undefined
+    readonly route?: () => TraceRoute | undefined
+  }
+): TurnTrace["Service"] =>
+  TurnTrace.of({
     now: shared.now,
-    begin: (mode, speculative = false) => ({
-      id: nextId++,
-      mode,
-      speculative,
-      startedAt: shared.now(),
-      marks: {},
-      tools: [],
-      voices: [],
-      session: name()
-    }),
-    mark: shared.mark,
+    begin: (mode, speculative = false) => {
+      const session = fields.session()
+      const assistant = fields.assistant?.()
+      const route = fields.route?.()
+      const trace: Trace = {
+        id: counter.next++,
+        mode,
+        speculative,
+        startedAt: shared.now(),
+        marks: {},
+        tools: [],
+        voices: [],
+        session,
+        ...(assistant !== undefined ? { assistant, device: session } : {}),
+        ...(assistant !== undefined && fields.deviceId !== undefined ? { deviceId: fields.deviceId } : {}),
+        ...(route !== undefined ? { route } : {})
+      }
+      return trace
+    },
+    mark: (trace, mark) => {
+      shared.mark(trace, mark)
+      if (mark === "endOfTurn" && fields.route !== undefined) {
+        const route = fields.route()
+        if (route !== undefined) trace.route = route
+      }
+    },
     finish: shared.finish,
     recent: shared.recent
   })
+
+/** One assistant's conversation in a session, as the dispatcher holds it. */
+export interface AssistantConversation extends DispatchTarget {
+  readonly conversation: SessionConversation
 }
+type Target = AssistantConversation
+
+const idleMsOf = (assistant: Assistant | undefined, minuteMs: number): number | undefined =>
+  assistant === undefined || assistant.newConversationAfter === "never" ? undefined : assistant.newConversationAfter * minuteMs
 
 export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<VoiceSession, never, Scope.Scope> =>
   Effect.gen(function*() {
@@ -129,32 +224,43 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
     const touch = () => {
       lastActive = now()
     }
-    let turns = 0
     let owner = { present: false, micLive: false }
+    const minuteMs = options.minuteMs ?? 60_000
 
     const gate = makeEchoGate("instant")
-    // After the echo gate, before Conversation; configured from this device's profile.
-    const wake = makeWakeGate(wakeConfigFromProfile(options.profile()))
-    let wakeKey = JSON.stringify(wake.config())
+    // After the echo gate, before the dispatcher; configured from this device's settings and the assistants.
+    const routeConfigNow = (): RouteConfig => routeConfigFrom(options.deviceSettings(), options.assistants())
+    const routeKeyOf = (config: RouteConfig) => JSON.stringify({ ...config, off: [...config.off].sort() })
+    const route = makeRouteGate(routeConfigNow())
+    let routeKey = routeKeyOf(route.config())
+    const followUpOf = (assistant: string | undefined) => (assistant === undefined ? 0 : route.config().followUpMs?.[assistant] ?? 0)
+    const longestFollowUp = () => Math.max(0, ...Object.values(route.config().followUpMs ?? {}))
+    const armedMs = () => route.config().armedMs ?? WAKE_ARMED_MS
     const tracker = makeStateTracker({
       onChange: (s) => {
         options.send({ type: "state", ...s })
         options.onChange(true)
       },
-      asleep: () => wake.config().activation === "wake-phrase" && !wake.awake(now())
+      asleep: () => route.config().withoutPhrase === "nobody" && !route.awake(now())
     })
     yield* Effect.addFinalizer(() => Effect.sync(() => tracker.dispose()))
 
-    let conversation: SessionConversation | undefined
-    /** The voice key this session speaks with ("" while its loop does not run). */
+    /** The voice key this session speaks with ("" while the engines do not run). Shared build: one voice. */
     const voiceNow = (): string => {
-      const voice = conversation?.voice() ?? options.engine.voice()
+      const voice = options.engine.voice()
       return voice === undefined ? "" : voiceKey(voice)
     }
 
+    // Late-bound: the dispatcher's conversations report their turns here.
+    let dispatcherRef: SessionDispatcher<Target> | undefined
+    const assistantOfTurn = (turnId: number) => dispatcherRef?.assistantOfTurn(turnId)
+
+    /** Committed turns per assistant in its current conversation (admin `sessions`). */
+    const turnsBy = new Map<string, number>()
     const send = (message: ServerMessage) => {
       if (message.type === "turn.end") {
-        turns++
+        const a = assistantOfTurn(message.turnId) ?? ""
+        turnsBy.set(a, (turnsBy.get(a) ?? 0) + 1)
         touch()
         options.onChange(false)
       }
@@ -174,17 +280,19 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
       ...(options.stallMs !== undefined ? { stallMs: options.stallMs } : {}),
       log: options.log,
       onPlayback: (event) => {
+        // The reply's assistant: its follow-up window opens when the reply ends (§2.6 rule 3).
+        const assistant = assistantOfTurn(event.turnId)
         if (event._tag === "started") {
           tracker.playbackStarted(event.turnId)
           gate.playbackStarted(now())
-          wake.replyStarted(now())
+          if (assistant !== undefined) route.replyStarted(assistant, now())
           if (unsuppress !== undefined) clearTimeout(unsuppress)
-          if (options.profile().interruptMode === "manual") web.setSuppressed(true)
+          if (options.deviceSettings().interruptMode === "manual") web.setSuppressed(true)
         } else {
           tracker.playbackEnded(event.turnId, event.reason)
           gate.playbackEnded(now())
-          wake.replyEnded(now())
-          tracker.wakeChanged(wake.config().followUpMs)
+          if (assistant !== undefined) route.replyEnded(assistant, now())
+          tracker.wakeChanged(followUpOf(assistant))
           if (unsuppress !== undefined) clearTimeout(unsuppress)
           unsuppress = setTimeout(() => web.setSuppressed(false), ECHO_TAIL_MS)
           unsuppress.unref?.()
@@ -201,11 +309,13 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
         if (unsuppress !== undefined) clearTimeout(unsuppress)
       })
     )
+    // One speaker for every conversation of the session (docs/ASSISTANTS.md §1.2).
+    const lease = makeOutputLease(web.output)
 
-    // Clause texts per turn, so the echo gate knows the words that just played.
+    // Clause texts per turn, so the echo gate knows the words that just played (turn ids are unique per session).
     const clauses = new Map<number, { texts: Array<string>; given: number }>()
-    const onEvent = (event: ConversationEvent) => {
-      publisher.onEvent(event)
+    const onEvent = (assistant: string, event: ConversationEvent) => {
+      publisher.onEvent(event, assistant)
       switch (event._tag) {
         case "TurnStarted":
           touch()
@@ -262,7 +372,114 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
       ...(options.heard.begin !== undefined ? { begin: options.heard.begin } : {})
     })
     yield* Effect.addFinalizer(() => Effect.promise(() => heard.close()))
-    const input = { stream: web.input.stream.pipe(Stream.tap((chunk) => Effect.sync(() => heard.audio(chunk)))) }
+    const input = web.input.stream.pipe(Stream.tap((chunk) => Effect.sync(() => heard.audio(chunk))))
+
+    // ---- Assistants and their conversations
+
+    /** Who `assistant` is now (name for traces); `undefined` for an assistant that does not exist (any more). */
+    const assistantOf = (assistant: string) => options.assistants().get(assistant)
+
+    /** The phrase that armed each assistant last (an `armed` route reports it). */
+    const armedPhrase = new Map<string, string>()
+    /** The dispatcher's route for `assistant`, as a trace says it (protocol 7 `TraceRoute`). */
+    const traceRouteOf = (assistant: string): TraceRoute | undefined => {
+      const r: DispatchRoute | undefined = dispatcherRef?.routeOf(assistant)
+      if (r === undefined) return undefined
+      switch (r.by) {
+        case "phrase":
+          return { by: "phrase", phrase: r.phrase }
+        case "armed":
+          return { by: "armed", phrase: armedPhrase.get(assistant) ?? "" }
+        case "follow-up":
+        case "default":
+        case "typed":
+          return { by: r.by }
+        // No TypeSafe yet (WP-14): a `decide` utterance is answered by the fallback, the device's default answerer.
+        case "decide":
+          return { by: "default" }
+        // It was replying (the barge-in owner) and no transcript chose otherwise.
+        case "barge-in":
+          return { by: "follow-up" }
+      }
+    }
+
+    /** One turn counter for every conversation of the session (`assistantOfTurn` relies on unique ids). */
+    const counter = { next: 1 }
+    let started = false
+    /** Conversation ids for assistants whose conversation is not made yet (the first one made takes it). */
+    const reserved = new Map<string, ConversationInfo>()
+    const fresh = (): ConversationInfo => ({ id: globalThis.crypto.randomUUID(), startedAt: Date.now() })
+    const reservedFor = (assistant: string): ConversationInfo => {
+      let info = reserved.get(assistant)
+      if (info === undefined) {
+        info = fresh()
+        reserved.set(assistant, info)
+      }
+      return info
+    }
+
+    const dispatcher = makeSessionDispatcher<Target>({
+      replyEarly: (assistant) => assistantOf(assistant)?.replyEarly ?? true,
+      make: (assistant, hooks) =>
+        Effect.gen(function*() {
+          const inbox = yield* Queue.unbounded<ConversationInput>()
+          let runs = 0
+          const { setup, agentSetup } = options.conversationSetup(assistant)
+          const initial = reservedFor(assistant)
+          reserved.delete(assistant)
+          const conversation = yield* makeSessionConversation({
+            engine: options.engine,
+            output: lease.output(assistant),
+            turnTrace: assistantTurnTrace(options.turnTrace, counter, {
+              session: options.name,
+              deviceId: options.deviceId,
+              assistant: () => {
+                const a = assistantOf(assistant)
+                return { id: assistant, name: a?.name ?? assistant }
+              },
+              route: () => traceRouteOf(assistant)
+            }),
+            setup,
+            ...(agentSetup !== undefined ? { agentSetup } : {}),
+            onEvent: (event) => {
+              hooks.onEvent(event)
+              onEvent(assistant, event)
+            },
+            onConversation: (info, reason) => {
+              turnsBy.set(assistant, 0)
+              options.send({ type: "conversation", id: info.id, reason, startedAt: info.startedAt, assistantId: assistant })
+              options.onChange(false)
+            },
+            // Events queued while the engines were rebuilt are stale: each run after the first starts empty.
+            speech: () => (runs++ === 0 ? Stream.fromQueue(inbox) : Stream.unwrap(Effect.as(Queue.clear(inbox), Stream.fromQueue(inbox)))),
+            // The assistant's quiet spell ("never" = no reset) and tool rounds, read live.
+            idleResetMs: () => idleMsOf(assistantOf(assistant), minuteMs),
+            maxToolRounds: () => assistantOf(assistant)?.toolRounds ?? options.engine.built()?.providers.maxToolRounds ?? 5,
+            ...(options.maxPendingInputs !== undefined ? { maxPendingInputs: options.maxPendingInputs } : {}),
+            initialConversation: initial
+          })
+          if (started) conversation.start()
+          return { push: (input) => void Queue.offerUnsafe(inbox, input), send: conversation.send, conversation }
+        })
+    })
+    dispatcherRef = dispatcher
+
+    /** §5.3: the follow-up holder, else who answers without a phrase, else the TypeSafe fallback, else the first. */
+    const answering = (): string | undefined => {
+      const w = route.window(now())
+      if (w?.by === "follow-up") return w.assistant
+      const settings = options.deviceSettings()
+      const wp = settings.withoutPhrase
+      if (wp.mode === "assistant") return wp.assistant
+      if (wp.mode === "typesafe" && wp.fallback !== null) return wp.fallback
+      return settings.assistants[0]?.assistant
+    }
+    // The device's reserved conversation (from before its session existed) is the answering assistant's.
+    if (options.initialConversation !== undefined) reserved.set(answering() ?? "", options.initialConversation)
+
+    const conversationOf = (assistant: string | undefined) => (assistant === undefined ? undefined : dispatcher.get(assistant)?.conversation)
+
+    // ---- The recogniser loop: Stt → echo gate → route gate → dispatcher
 
     let lastTranscript = ""
     const transcript = (text: string) => {
@@ -271,83 +488,130 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
       options.send({ type: "transcript", text })
     }
     /**
-     * Stt → echo gate → wake gate → Conversation. Only what passed both gates is shown (transcript), moves the state
-     * or reaches the conversation: an utterance the wake gate ignores reaches no page, no history, no agent and no
-     * recording (`heard.discard`); its text goes only to admin pages with the phrase tester on (`wake.heard`).
+     * Only what passed both gates is shown (transcript), moves the state or reaches a conversation: an utterance the
+     * route gate drops reaches no page, no history, no agent and no recording (`heard.discard`); its text goes only
+     * to admin pages with the phrase tester on (`wake.heard`).
      */
-    const gateStream = (events: Stream.Stream<SttEvent, unknown>) =>
-      events.pipe(Stream.flatMap((event) => {
+    const onStt = (event: SttEvent): Effect.Effect<void> =>
+      Effect.suspend(() => {
         const t = now()
         if (event._tag !== "EndOfTurn") heard.event(event)
         const echo = gate.filter(event, t)
-        const out: Array<SttEvent> = []
-        let wakeDropped = false
+        const results: Array<RouteResult> = []
+        let dropped = false
         for (const e of echo.events) {
-          const w = wake.filter(e, t)
-          if (w.heard !== undefined) options.wakeHeard(w.heard.text, w.heard.phrase, w.heard.accepted)
-          if (w.woke !== undefined) {
-            options.send({ type: "wake", phrase: w.woke.phrase, armed: w.woke.armed })
-            tracker.wakeChanged(w.woke.armed ? wake.config().armedMs ?? WAKE_ARMED_MS : wake.config().followUpMs)
+          const r = route.filter(e, t)
+          results.push(r)
+          if (r.heard !== undefined) options.wakeHeard(r.heard.text, r.heard.phrase, r.heard.accepted)
+          if (r.woke !== undefined) {
+            if (r.woke.armed) armedPhrase.set(r.woke.assistant, r.woke.phrase)
+            options.send({ type: "wake", phrase: r.woke.phrase, armed: r.woke.armed, assistantId: r.woke.assistant })
+            tracker.wakeChanged(r.woke.armed ? armedMs() : followUpOf(r.woke.assistant))
           }
-          if (w.dropped !== undefined || (e._tag === "EndOfTurn" && w.events.length === 0)) wakeDropped = true
-          for (const passed of w.events) {
-            out.push(passed)
+          if (r.dropped !== undefined || (e._tag === "EndOfTurn" && r.events.length === 0)) dropped = true
+          for (const passed of r.events) {
             lastActive = t
             tracker.stt(passed)
             if (passed._tag === "Interim") transcript(passed.text)
             else if (passed._tag === "EndOfTurn") {
               transcript("")
               // An accepted utterance opens the follow-up window: the state may go back to asleep by itself.
-              if (wake.config().activation === "wake-phrase") tracker.wakeChanged(wake.config().followUpMs)
+              if (route.config().withoutPhrase === "nobody") {
+                const target = r.target
+                tracker.wakeChanged(followUpOf(target !== undefined && "assistant" in target ? target.assistant : undefined))
+              }
             }
           }
         }
         if (event._tag === "EndOfTurn") {
-          if (wakeDropped) heard.discard()
+          if (dropped) heard.discard()
           else heard.event(event)
         }
         if (echo.dropped) transcript("")
-        return Stream.fromIterable(out)
-      }))
+        return Effect.forEach(results, dispatcher.dispatch, { discard: true })
+      })
 
-    const minuteMs = options.minuteMs ?? 60_000
-    const { setup, agentSetup } = options.conversationSetup()
-    conversation = yield* makeSessionConversation({
-      engine: options.engine,
-      input,
-      output: web.output,
-      turnTrace: sessionTurnTrace(options.turnTrace, options.name),
-      setup,
-      ...(agentSetup !== undefined ? { agentSetup } : {}),
-      onEvent,
-      onConversation: (info, reason) => {
-        turns = 0
-        options.send({ type: "conversation", id: info.id, reason, startedAt: info.startedAt })
-        options.onChange(false)
-      },
-      gate: gateStream,
-      // The device's conversationIdleMinutes, live (0 = never).
-      idleResetMs: () => {
-        const minutes = options.profile().conversationIdleMinutes
-        return minutes > 0 ? minutes * minuteMs : undefined
-      },
-      ...(options.maxPendingInputs !== undefined ? { maxPendingInputs: options.maxPendingInputs } : {}),
-      ...(options.initialConversation !== undefined ? { initialConversation: options.initialConversation } : {})
-    })
-    const theConversation = conversation
+    let recogniserRuns = 0
+    const recogniser: SessionLoop = {
+      run: (built) =>
+        Effect.gen(function*() {
+          if (recogniserRuns++ > 0) {
+            // A new build: an utterance the previous recogniser stream left open is closed (it starts nothing).
+            yield* dispatcher.dispatch(route.filter({ _tag: "EndOfTurn", text: "" }, now()))
+          }
+          yield* Stream.runForEach(built.providers.stt.transcribe(input), onStt)
+        })
+    }
+    let detach: Effect.Effect<void> | undefined
 
     const syncProfile = () => {
-      const profile = options.profile()
-      gate.setMode(profile.interruptMode)
-      const next: WakeConfig = wakeConfigFromProfile(profile)
-      const key = JSON.stringify(next)
-      if (key === wakeKey) return
-      wakeKey = key
-      // `configure` drops a held utterance: only when the wake part of the profile changed.
-      wake.configure(next)
-      tracker.wakeChanged(Math.max(next.followUpMs, next.armedMs ?? WAKE_ARMED_MS))
+      const settings = options.deviceSettings()
+      gate.setMode(settings.interruptMode)
+      const next = routeConfigNow()
+      const key = routeKeyOf(next)
+      if (key === routeKey) return
+      routeKey = key
+      // `configure` drops a held utterance: only when the routing part of the settings changed.
+      route.configure(next)
+      tracker.wakeChanged(Math.max(longestFollowUp(), armedMs()))
     }
     syncProfile()
+
+    const conversations: SessionConversations = {
+      sendText: (text, speak, named) =>
+        Effect.suspend(() => {
+          const w = route.window(now())
+          const target = typedTextTarget(options.deviceSettings(), options.assistants(), {
+            named,
+            followUpHolder: w?.by === "follow-up" ? w.assistant : undefined
+          })
+          if ("dropped" in target) return Effect.succeed<TextOutcome>("dropped")
+          return dispatcher.send(target.assistant, { _tag: "TextInput", text, speak })
+        }),
+      stop: (assistant) => dispatcher.stop(assistant),
+      running: () => detach !== undefined && options.engine.ready(),
+      history: (assistant) => conversationOf(assistant ?? answering())?.history ?? Effect.succeed([]),
+      conversation: (assistant) => {
+        const a = assistant ?? answering()
+        return conversationOf(a)?.conversation() ?? reservedFor(a ?? "")
+      },
+      lastTurnAt: (assistant) => conversationOf(assistant ?? answering())?.lastTurnAt(),
+      newConversation: (assistant) =>
+        Effect.suspend(() => {
+          const a = assistant ?? answering()
+          const made = conversationOf(a)
+          if (made !== undefined) {
+            // Its conversation stops the open utterance; the dispatcher must not hand the rest to another one.
+            dispatcher.cancelUtterance(a!)
+            return made.newConversation
+          }
+          return Effect.sync(() => {
+            const info = fresh()
+            reserved.set(a ?? "", info)
+            turnsBy.set(a ?? "", 0)
+            options.send({ type: "conversation", id: info.id, reason: "new", startedAt: info.startedAt, ...(a !== undefined ? { assistantId: a } : {}) })
+            options.onChange(false)
+            return info
+          })
+        }),
+      answering,
+      start: () => {
+        if (started) return
+        started = true
+        detach = options.engine.attach(recogniser)
+        for (const target of dispatcher.conversations().values()) target.conversation.start()
+      },
+      end: Effect.suspend(() => {
+        const d = detach
+        detach = undefined
+        started = false
+        return Effect.andThen(
+          d ?? Effect.void,
+          Effect.forEach([...dispatcher.conversations().values()], (t) => t.conversation.end, { discard: true })
+        )
+      }),
+      dispatcher
+    }
 
     return {
       key: options.key,
@@ -357,7 +621,8 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
       tracker,
       publisher,
       gate,
-      conversation: theConversation,
+      route,
+      conversation: conversations,
       heard,
       syncProfile,
       ownerChanged: (present, micLive) => {
@@ -367,22 +632,21 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
         options.onChange(true)
       },
       ownerPresent: () => owner.present,
-      turns: () => turns,
+      turns: () => turnsBy.get(answering() ?? "") ?? 0,
       lastActiveAt: () => lastActive,
       touch,
       info: (): SessionInfo => {
-        const last = theConversation.lastTurnAt()
+        const last = conversations.lastTurnAt()
         return {
           key: options.key,
           ...(options.deviceId !== undefined ? { deviceId: options.deviceId } : {}),
           name: options.name().trim().slice(0, MAX_DEVICE_NAME_CHARS).trim() || "Voice page",
           state: tracker.current().state,
           ownerPresent: owner.present,
-          conversationId: theConversation.conversation().id,
-          turns,
+          conversationId: conversations.conversation().id,
+          turns: turnsBy.get(answering() ?? "") ?? 0,
           lastTurnAt: last ?? null
         }
       }
     } satisfies VoiceSession
   })
-

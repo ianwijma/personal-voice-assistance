@@ -404,7 +404,13 @@ export const makeWebAudio = (options: WebAudioOptions = {}): Effect.Effect<WebAu
           lost: yield* Deferred.make<void>()
         }
         active = session
-        link.sendMessage({ type: "reply.start", turnId, sampleRate: Math.round(sampleRate) })
+        link.sendMessage({
+          type: "reply.start",
+          turnId,
+          sampleRate: Math.round(sampleRate),
+          // Protocol 7: whose voice this is (the turn's assistant, when the conversation's trace names one).
+          ...(trace?.assistant !== undefined ? { assistantId: trace.assistant.id } : {})
+        })
 
         const body = Effect.gen(function*() {
           yield* Stream.runForEach(audio, (chunk) => Effect.sync(() => sendAudio(session, chunk)))

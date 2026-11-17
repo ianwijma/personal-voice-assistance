@@ -4,11 +4,14 @@
  * speaker, each with a configurable simulated delay. No keys, no network.
  */
 import {
+  AudioOutput,
   Conversation,
+  type ConversationInput,
   type LlmRequest,
   makeRouteGate,
   makeWakeGate,
   type RouteConfig,
+  routeConfigFromWake,
   type SttEvent,
   ToolRegistry,
   type Trace,
@@ -34,9 +37,11 @@ import {
   turnResumed
 } from "@pva/core/testing"
 import { makeClock } from "@pva/modules-builtin"
-import { Deferred, Effect, Layer, Queue, Stream } from "effect"
+import { type Cause, Deferred, Effect, Layer, Queue, Stream } from "effect"
 import type { BenchRow } from "./report.ts"
 import { observedTurnTraceLayer } from "../startup.ts"
+import { makeOutputLease } from "../serve/OutputLease.ts"
+import { type DispatchHooks, makeSessionDispatcher } from "../serve/SessionDispatcher.ts"
 
 export interface SimulatedDelays {
   /** Request sent → first text token. */
@@ -75,6 +80,12 @@ export interface OfflineScenario {
    */
   readonly route?: RouteConfig
   readonly wakePrefix?: string
+  /**
+   * Serve mode's session path since WP-4b (docs/ASSISTANTS.md §3.3): the route gate (`route`, default: one assistant
+   * answering without a phrase), the session dispatcher, the conversation's inbox queue and the output lease, in
+   * front of the one `Conversation`.
+   */
+  readonly dispatch?: boolean
 }
 
 interface ScriptedTurn {
@@ -155,35 +166,64 @@ const runSession = (
   Effect.gen(function*() {
     const finished = yield* Queue.unbounded<Trace>()
     const onFinish = (trace: Trace) => trace.outcome === "discarded" ? Effect.void : Queue.offer(finished, trace)
-    const layer = Conversation.layer({ systemPrompt: "Benchmark.", bargeIn: true }).pipe(
+    const recording = makeRecordingAudioOutput({ chunkMillis: scenario.delays.playbackMsPerClause })
+    // Serve's session path: the dispatcher's hooks see the conversation's events; it plays through a lease.
+    let hooks: DispatchHooks | undefined
+    const output = scenario.dispatch === true
+      ? Layer.effect(AudioOutput, Effect.gen(function*() {
+        return makeOutputLease(yield* AudioOutput).output("jeff")
+      })).pipe(Layer.provide(recording.layer))
+      : recording.layer
+    const layer = Conversation.layer({ systemPrompt: "Benchmark.", bargeIn: true, onEvent: (event) => hooks?.onEvent(event) }).pipe(
       Layer.provideMerge(Layer.mergeAll(
         makeScriptedLlm(respond(scenario.delays)).layer,
         ToolRegistry.layer([makeClock()]),
         observedTurnTraceLayer(onFinish),
         Layer.succeed(Tts, tts),
-        makeRecordingAudioOutput({ chunkMillis: scenario.delays.playbackMsPerClause }).layer
+        output
       ))
     )
     const turns = Array.from({ length: rounds + 1 }, (_, round) => script.map((turn) => ({ round, turn }))).flat()
+    const rows: Array<BenchRow> = []
+    const perTurn = (feed: (events: Stream.Stream<SttEvent>) => Stream.Stream<ConversationInput>) =>
+      Stream.fromIterable(turns.map((t, k) => ({ ...t, k }))).pipe(
+        Stream.flatMap(({ round, turn, k }) =>
+          Stream.fromEffectDrain(barrier === undefined ? Effect.void : barrier(k)).pipe(
+            Stream.concat(feed(scripted(sttEvents(turn, scenario)))),
+            Stream.concat(Stream.fromEffectDrain(Effect.gen(function*() {
+              const trace = yield* Queue.take(finished)
+              if (round > 0) rows.push({ label: `${label}${round}.${script.indexOf(turn) + 1} ${turn.user.slice(0, 24)}`, trace })
+            })))
+          ), { concurrency: 1 })
+      )
+    if (scenario.dispatch === true) {
+      // Recogniser events → route gate → dispatcher → the conversation's inbox (as `VoiceSession` wires it).
+      const inbox = yield* Queue.unbounded<ConversationInput, Cause.Done>()
+      const route = makeRouteGate(scenario.route ?? routeConfigFromWake(WAKE_ALWAYS, "jeff"))
+      const dispatcher = makeSessionDispatcher({
+        make: (_assistant, h) =>
+          Effect.sync(() => {
+            hooks = h
+            return { push: (input: ConversationInput) => void Queue.offerUnsafe(inbox, input), send: () => "accepted" as const }
+          })
+      })
+      const feed = (events: Stream.Stream<SttEvent>) =>
+        events.pipe(Stream.mapEffect((event) => dispatcher.dispatch(route.filter(event, performance.now()))), Stream.drain)
+      const driver = Stream.runDrain(perTurn(feed)).pipe(Effect.ensuring(Queue.end(inbox)))
+      yield* Effect.gen(function*() {
+        const conversation = yield* Conversation
+        yield* Effect.all([driver, conversation.voice(Stream.fromQueue(inbox))], { concurrency: "unbounded", discard: true })
+      }).pipe(Effect.provide(layer))
+      return rows
+    }
     // Serve mode's wake gate, on the events as they arrive (time passed in, as there).
     const route = scenario.route === undefined ? undefined : makeRouteGate(scenario.route)
     const wake = route ?? makeWakeGate(scenario.wake ?? WAKE_ALWAYS)
     const gated = (events: Stream.Stream<SttEvent>) =>
       events.pipe(Stream.flatMap((event) => Stream.fromIterable(wake.filter(event, performance.now()).events)))
-    const rows: Array<BenchRow> = []
-    const events = Stream.fromIterable(turns.map((t, k) => ({ ...t, k }))).pipe(
-      Stream.flatMap(({ round, turn, k }) =>
-        Stream.fromEffectDrain(barrier === undefined ? Effect.void : barrier(k)).pipe(
-          Stream.concat(gated(scripted(sttEvents(turn, scenario)))),
-          Stream.concat(Stream.fromEffectDrain(Effect.gen(function*() {
-            const trace = yield* Queue.take(finished)
-            if (round > 0) rows.push({ label: `${label}${round}.${script.indexOf(turn) + 1} ${turn.user.slice(0, 24)}`, trace })
-          })))
-        ), { concurrency: 1 })
-    )
     yield* Effect.gen(function*() {
       const conversation = yield* Conversation
-      yield* conversation.voice(events)
+      yield* conversation.voice(perTurn(gated))
     }).pipe(Effect.provide(layer))
     return rows
   })
