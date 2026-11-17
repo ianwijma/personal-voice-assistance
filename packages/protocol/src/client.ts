@@ -15,6 +15,7 @@ import { MAX_TEXT_INPUT_CHARS } from "./constants.ts"
 import { MAX_MOVE_KEYS } from "./env.ts"
 import { DeviceSettingsPatch, DeviceTarget } from "./devices.ts"
 import { DeviceHello, DeviceId, DeviceName, FrontendRole, WakePhrase } from "./frontends.ts"
+import { HouseholdHello } from "./household.ts"
 import { JobAction, ToolId } from "./jobs.ts"
 import { SettingsPatch } from "./settings.ts"
 import { Password } from "./vault.ts"
@@ -52,7 +53,12 @@ export const Hello = Schema.Struct({
    * reload or reconnect stays logged in. Valid: `admin.snapshot` follows `welcome`. Not valid: `snapshot.admin` says
    * `loggedIn: false` (no error).
    */
-  adminToken: Schema.optionalKey(AdminToken)
+  adminToken: Schema.optionalKey(AdminToken),
+  /**
+   * Household data (additive, docs/STORING-DATA.md): the last change number this page applied. The server replays the
+   * changes after it (`household.event`), or sends a fresh `household.snapshot` when it cannot.
+   */
+  household: Schema.optionalKey(HouseholdHello)
 })
 
 /** Facts about the browser's audio setup, for logs and the latency trace. */

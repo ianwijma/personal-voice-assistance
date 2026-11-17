@@ -690,6 +690,27 @@ export const serverExamples: { readonly [T in ServerMessageType]: Extract<Server
   "trace": { type: "trace", key: exampleDevice.id, deviceId: exampleDevice.id, trace: { ...exampleTrace, session: exampleDevice.name } },
   "pong": { type: "pong", id: 41 },
   "health": { type: "health", health: exampleHealth },
+  "household.snapshot": {
+    type: "household.snapshot",
+    seq: 42,
+    collections: [{
+      module: "timers",
+      collection: "timers",
+      rows: [{ id: "t1", rev: 1, scope: { kind: "household" }, value: { label: "pasta", dueAt: 1_763_100_600_000 }, updatedAt: 1_763_100_000_000 }],
+      truncated: false
+    }]
+  },
+  "household.event": {
+    type: "household.event",
+    event: {
+      seq: 43,
+      at: 1_763_100_010_000,
+      module: "timers",
+      type: "timers.timers.changed",
+      scope: { kind: "household" },
+      data: { collection: "timers", id: "t1", op: "update", rev: 2, value: { label: "pasta", dueAt: 1_763_100_900_000 } }
+    }
+  },
   ...assistantsServerExamples
 }
 

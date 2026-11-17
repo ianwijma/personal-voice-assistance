@@ -20,6 +20,7 @@ import { JobInfo, ModelSet } from "./jobs.ts"
 import { VaultInfo } from "./vault.ts"
 import { ConversationId, ConversationReason, SessionInfo, SessionKey } from "./sessions.ts"
 import { HealthInfo } from "./health.ts"
+import { HouseholdEventMessage, HouseholdSnapshotMessage } from "./household.ts"
 
 /**
  * Text frames from the assistant to the browser. Binary frames from the
@@ -434,7 +435,9 @@ export const ServerMessage = Schema.Union([
   ConversationHistory,
   AssistantsMessage,
   DeviceTypesMessage,
-  HealthMessage
+  HealthMessage,
+  HouseholdSnapshotMessage,
+  HouseholdEventMessage
 ]).pipe(Schema.toTaggedUnion("type"))
 export type ServerMessage = typeof ServerMessage.Type
 export type ServerMessageType = ServerMessage["type"]
