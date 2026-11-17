@@ -724,7 +724,10 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
      */
     /** The open utterance's times (trace clock), shared by its events; see `UtteranceTimes`. */
     let utterance: UtteranceTimes | undefined
-    /** Stamp the recogniser's events where they enter the session: before any gate can hold them back. */
+    /**
+     * Stamp the recogniser's events where they enter the session: as they arrive (`stamped`, ahead of the buffer that
+     * `onStt`'s serial dispatch drains), before any gate or a pending routing call can hold them back.
+     */
     const stamp = (event: SttEvent): SttEvent => {
       switch (event._tag) {
         case "SpeechStarted":
@@ -746,9 +749,15 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
           return event
       }
     }
-    const onStt = (input: SttEvent): Effect.Effect<void> =>
+    /**
+     * The recogniser's events, stamped as they arrive. `onStt` awaits dispatch (a TypeSafe call may take a while), so
+     * the stamp runs on the producer side of an unbounded buffer, in its own fiber in the stream's scope: same order
+     * (one FIFO), a failure or end after the events before it, interrupted with the stream. The recognisers already push
+     * into an unbounded queue (`Stream.callback`), so the buffer takes no backpressure away from them.
+     */
+    const stamped = <E>(events: Stream.Stream<SttEvent, E>) => events.pipe(Stream.map(stamp), Stream.buffer({ capacity: "unbounded" }))
+    const onStt = (event: SttEvent): Effect.Effect<void> =>
       Effect.suspend(() => {
-        const event = stamp(input)
         const t = now()
         if (event._tag !== "EndOfTurn") heard.event(event)
         const echo = gate.filter(event, t)
@@ -852,7 +861,7 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
       Effect.gen(function*() {
         streamKey = hearing.key
         streamHearing = hearing
-        const fiber = yield* Effect.forkChild(Effect.exit(Stream.runForEach(hearing.stt.transcribe(input), (event) =>
+        const fiber = yield* Effect.forkChild(Effect.exit(Stream.runForEach(stamped(hearing.stt.transcribe(input)), (event) =>
           Effect.suspend(() => {
             if (event._tag === "SpeechStarted") utteranceOpen = true
             else if (event._tag === "EndOfTurn") utteranceOpen = false

@@ -311,14 +311,20 @@ export const PAIR_WORD: Readonly<Record<PairKind, string>> = { round: "round", v
 export const derivedPairs = (events: ReadonlyArray<TraceEvent>): ReadonlyArray<Pair> => {
   const out: Array<Pair> = []
   const idx = (name: string) => events.flatMap((e, i) => (e.name === name ? [i] : []))
-  const used = new Set<number>()
-  for (const i of idx("llmRequestSent")) {
+  // Each completion (in time order) ends the latest compatible request still open before it. A request with a later
+  // compatible one before that completion got no answer (a model that failed, then a fallback numbered from round 1
+  // again): it is closed unpaired, so no completion is matched across a later request.
+  const compatible = (a: string | undefined, b: string | undefined) => a === undefined || b === undefined || a === b
+  const closed = new Set<number>()
+  const requests = idx("llmRequestSent")
+  for (const j of [...idx("llmDone")].sort((a, b) => events[a]!.at - events[b]!.at || a - b)) {
+    const done = events[j]!
+    const open = requests.filter((i) => !closed.has(i) && events[i]!.at <= done.at && compatible(events[i]!.detail, done.detail))
+    if (open.length === 0) continue
+    const i = open.reduce((best, k) => (events[k]!.at > events[best]!.at || (events[k]!.at === events[best]!.at && k > best) ? k : best))
+    for (const k of open) closed.add(k)
     const want = events[i]!.detail
-    const j = idx("llmDone").find((k) => !used.has(k) && events[k]!.at >= events[i]!.at && (want === undefined || events[k]!.detail === undefined || events[k]!.detail === want))
-    if (j !== undefined) {
-      used.add(j)
-      out.push({ from: i, to: j, lane: "model", kind: "round", label: want === undefined ? "Language model round" : `Language model ${want}` })
-    }
+    out.push({ from: i, to: j, lane: "model", kind: "round", label: want === undefined ? "Language model round" : `Language model ${want}` })
   }
   const once = (a: string, b: string, lane: LaneId, kind: PairKind, label: string) => {
     const i = idx(a)[0]

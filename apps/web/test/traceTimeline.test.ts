@@ -163,6 +163,15 @@ describe("derived pairs", () => {
     expect(derivedPairs([e("playbackStart", 10)])).toEqual([])
     expect(derivedPairs([e("ttsRequestSent", 1), e("ttsDone", 9)])).toEqual([])
   })
+  it("pairs a completion with the latest open request: a failed model's request, then a fallback's round 1, stays unpaired", () => {
+    const ev = [e("llmRequestSent", 0, { detail: "round 1" }), e("llmRequestSent", 100, { detail: "round 1" }), e("llmDone", 150, { detail: "round 1" })]
+    const rounds = derivedPairs(ev).filter((p) => p.kind === "round")
+    expect(rounds.map((p) => [p.from, p.to])).toEqual([[1, 2]])
+    expect(listRows(ev).find((r) => r.event.name === "llmDone")!.derivedMs).toBe(50)
+    // A later completion never reaches back across a later request: the failed one stays unpaired.
+    const two = [...ev, e("llmRequestSent", 200, { detail: "round 2" }), e("llmDone", 260, { detail: "round 2" }), e("llmDone", 300)]
+    expect(derivedPairs(two).filter((p) => p.kind === "round").map((p) => [p.from, p.to])).toEqual([[1, 2], [3, 4]])
+  })
   it("gives the table's Took column the derived duration of an ending entry", () => {
     const rows = listRows(turn43())
     const done = rows.find((r) => r.event.name === "playbackEnd")!

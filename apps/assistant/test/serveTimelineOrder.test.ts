@@ -1,6 +1,6 @@
 // The order of a voice turn's time line on the real server: the recogniser's own times (speech started, first partial
 // transcript) are kept although a gate or the TypeSafe call holds the events back. Real clock, generous gaps.
-import { eagerEndOfTurn, endOfTurn, interim, speechStarted } from "@pva/core/testing"
+import { eagerEndOfTurn, endOfTurn, interim, speechStarted, turnResumed } from "@pva/core/testing"
 import type { ServerMessageOf, TraceEvent } from "@pva/protocol"
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs"
 import * as Http from "node:http"
@@ -179,6 +179,44 @@ describe("the time line keeps the recogniser's times", () => {
     expect(at(line, "eagerEndOfTurn")).toBeLessThan(routing.at + routing.ms! - 100)
     expect(at(line, "eagerEndOfTurn") + 100).toBeLessThan(at(line, "assistantChosen"))
     expect(at(line, "speechStarted") + 150).toBeLessThan(at(line, "eagerEndOfTurn"))
+  })
+
+  it("TypeSafe device: a resume and a second eager transcript that arrive while routing is pending keep their own times", async () => {
+    const api = await fakeJev(300)
+    const { stt } = await start({ TYPESAFE_ROUTING: "true", TYPESAFE_API_KEY: "ts-test-key", TYPESAFE_BASE_URL: api.url })
+    const page = await connect()
+    await page.hello()
+    const admin = await connect()
+    await admin.admin(TEST_ADMIN_PASSWORD)
+    await page.claim()
+    await untilOpen(stt)
+    const from = page.messages.length
+    const adminFrom = admin.messages.length
+    // Every transcript is Bravo's: the resume reaches the same conversation as the final.
+    stt.emit(speechStarted)
+    await sleep(100)
+    stt.emit(interim("a joke"))
+    await sleep(100)
+    stt.emit(eagerEndOfTurn("a joke")) // ~200: the first routing call (300 ms) starts
+    await sleep(50)
+    stt.emit(turnResumed) // ~250, while it is pending
+    await sleep(50)
+    stt.emit(eagerEndOfTurn("a joke about cats")) // ~300, still pending; its own call starts at ~500
+    await sleep(1_000)
+    stt.emit(endOfTurn("a joke about cats"))
+    const begun = await page.waitFor("turn.start", () => true, { from, timeoutMs: 10_000 })
+    const trace = (await admin.waitFor("trace", (m) => m.trace.turnId === begun.turnId, { from: adminFrom, timeoutMs: 10_000 })).trace
+    const line = trace.timeline!
+    expect(trace.route).toMatchObject({ by: "typesafe" })
+    expect(trace.assistant?.id).toBe("bravo")
+    expect(api.requests.length).toBe(2)
+    const s = at(line, "speechStarted")
+    // Without stamping on arrival both would come after the first call returned (≥ ~500 ms after speech started).
+    expect(at(line, "turnResumed") - s).toBeLessThan(400)
+    expect(at(line, "eagerEndOfTurn") - s).toBeLessThan(430)
+    expect(at(line, "turnResumed")).toBeLessThan(at(line, "eagerEndOfTurn"))
+    // The second eager came before the routing call it waited for left.
+    expect(at(line, "eagerEndOfTurn") + 100).toBeLessThan(at(line, "routing"))
   })
 
   it("wake-phrase device: the utterance's start and first partial precede the phrase, which the route gate only released with words", async () => {
