@@ -13,8 +13,9 @@ document wins; where it is silent, the research document's own recommendation ap
 
 1. **Preparation stack** (§4): twelve PRs, each based on the one before it. They add what a module cannot build for
    itself: tool context, the module API, storage, scheduling, notifications, presentation, connections and so on.
-2. **Module PRs** (§5): one PR per module, all based on the top of the preparation stack and written in parallel.
-   A module PR changes only its own package (§3.2), so the 23 PRs do not conflict with each other.
+2. **Module PRs** (§5): one PR per module, all based on the top of the preparation stack. Twenty-one are written
+   in parallel and change only their own package (§3.2), so they do not conflict with each other. Two wait: T3 Code
+   for the MCP client it uses, and calls-and-intercom, which changes shared files and is written last.
 3. **Review** (§6): every PR is reviewed by GPT-6.1 Sol and fixed by Opus or Sonnet until a review comes back clean,
    for at most five rounds, or ten when real problems are still being found.
 
@@ -31,11 +32,11 @@ that work can start. Each is cheap to change before the PR that builds it is mer
 | 1 | People | `Person` records live in a household settings section ("Members"), owned by the core (P5), not by the presence module (override of row h, so that every module can rely on them). A device's `place.defaultPerson` is the one authoritative link between a device and a person. No voice identification. Data without a known person is household data. |
 | 2 | Module boundaries | Rows g, i–n and 36–38 of investigation §11 are accepted: the announce tool lives in broadcast; feeds and watchers in news-and-feeds; `who_is_home` and presence events in presence-and-people; podcasts, cameras and energy are out of music and smart-home; the n8n and HA-script bridge is out of routines. `system_status` is a tool of a small `system-status` module in the core-tools package (row 56 is about computer volume and speed tests, which stay out). |
 | 3 | Rooms | A room is a free-text field on each device (`place.room`). The Home Assistant module maps rooms to HA areas by name, with aliases. |
-| 4 | Speech without the wake phrase | A closed set of control phrases may be spoken without the wake phrase in two situations, each a per-device setting. **While ringing** ("stop", "snooze", "five more minutes"): on by default, because a false match can only stop a ring. **While the assistant is audible** ("stop", "never mind", "louder", "quieter", "repeat"): built, off by default, and switched on per device by the owner; P7 measures the false-stop rate from the assistant's own voice and reports it. Everything else needs the wake phrase or an open window (§4, P7). |
+| 4 | Speech without the wake phrase | A closed set of control phrases may be spoken without the wake phrase in two situations, each a per-device setting. **While ringing** ("stop", "snooze", "five more minutes"): on by default. A false match stops or postpones a ring, and a postponed ring rings again; P9 measures how often the ring's own spoken line triggers it and reports it. **While the assistant is audible** ("stop", "never mind", "louder", "quieter", "repeat"): built, off by default, and switched on per device by the owner; P7 measures the false-stop rate from the assistant's own voice and reports it. It cannot be switched on for a device in manual interrupt mode, where the microphone is closed while a reply plays. Everything else needs the wake phrase or an open window (§4, P7). |
 | 5 | Risk | Classes `read / change / message / money / security`. Household default `{ read: allow, change: allow, message: confirm, money: deny, security: deny }`. Lower layers can only narrow. **`money` and `security` stay denied everywhere in this stack**: a device id is claimed by the page, not authenticated (`SessionHub.ts`, `hello`), so no device can be trusted with them until devices have credentials. Unlocking, disarming and purchases are therefore not built. |
-| 6 | Confirmation | Core's spoken confirmation is switched on only after the five known defects listed in `docs/AGENTS-AND-INTENTS.md` §3.2 are repaired and covered by tests (P8). Until P8 passes that bar, a `confirm` outcome is a refusal, as today. |
+| 6 | Confirmation | Stays switched off in this stack, as it is today: an operation whose outcome is `confirm` is refused with a sentence that says so. Core's confirmation has five known defects (`docs/AGENTS-AND-INTENTS.md` §3.2) and only covers declared actions asked for in a model turn, not tools, phrase commands, taps or routine steps. No first version in §5 needs it: nothing here sends a message outside the house. Repairing and extending it is out of scope (§7). |
 | 7 | Whose device | A device's default person selects whose data a turn means. It never grants access. Because device ids are not authenticated, anything a person would not want read by anyone on the home network does not belong in this stack: memory stores no secrets, and mail is read only by assistants the owner puts on devices they choose. |
-| 8 | Personal content | Three levels on a result, a presentation or a notification: `household` (default), `personal` (belongs to one person), and nothing stricter in this stack. `personal` content is spoken and shown on a `private` device, and on a `shared` device when the turn's person is its owner; on a `shared` device otherwise it is reduced by the module ("Ian: busy 12:30 to 13:30") or withheld; on a `public` device it is withheld. One helper decides (`Privacy.mayReveal`), and the modules, the Presenter and the notification router all use it. |
+| 8 | Personal content | Two levels on a result, a presentation, a notification or a spoken line: `household` (default) and `personal`, which names its owner (a person id). `personal` content is spoken and shown on a `private` device, and on a `shared` device whose default person is the owner; on any other `shared` device the module reduces it ("Ian: busy 12:30 to 13:30") or it is withheld; on a `public` device it is withheld. `personal` content with no known owner is treated as someone else's. One helper decides, `Privacy.mayReveal(owner, device)`, about the device that would speak or show it, which is not always the device that asked. Modules use it before they return a result to the model, and the Presenter, the speech service and the notification router use it per target device. This is stricter on shared screens than some module documents propose (override). |
 | 9 | Children | Not supported yet. There is no kids flag on a device and no adult/child field on a person, so nothing suggests protections that do not exist. Web search and image search default to moderate safe search. The kids policy is out of scope (§7). |
 | 10 | Storage | One SQLite file, `data/household.db`, through `node:sqlite`. Per-module tables and migrations inside it. |
 | 11 | Recurrence | What a person says ("every second Tuesday") is stored as an RFC 5545 `RRULE`; system jobs use `Cron`. One recurrence helper for every module. |
@@ -44,7 +45,9 @@ that work can start. Each is cheap to change before the PR that builds it is mer
 | 14 | Spoken English | British conventions: "half seven" is 7:30. Dutch "half zeven" is 6:30. |
 | 15 | Diets and allergies | One home: a `diet` part on each `Person` and on the household (allergies, diets, dislikes), read and written through the `People` service. Kitchen filters on it; memory's instructions send "Sam is allergic to nuts" there. |
 | 16 | `critical` notifications | Nothing in this stack may send one. The priority exists in the service; hooks, modules and routes are capped at `high`, and a hook token at `normal` unless the owner raises it to `high`. |
-| 17 | Phone push, voice nodes, deployment | Out of scope here (§7). |
+| 17 | Essential controls | "Stop", "never mind", "repeat", "louder" and "quieter" belong to the host (P7), work for every assistant on every device, and cannot be switched off per assistant. The assistant-controls module adds the tools and the other commands. No module may register those phrases. |
+| 18 | Services between modules | A service call runs on behalf of the tool, command or job that made it, which the gateway already admitted; the service does not ask again. So a service offers only what any caller may do: reads and `change`-class operations on household data. Whether an assistant has the providing module on decides its tools and its contributions, not whether another module may call its service. |
+| 19 | Phone push, voice nodes, deployment | Out of scope here (§7). |
 
 ## 3. Rules for every PR
 
@@ -131,13 +134,13 @@ and the additions below.
 | P5 | 3 | `t3/modules-05-people-rooms` | People, rooms and device capabilities | [presentation §5](research/module-investigation/presentation-and-device-capabilities.md#5-device-capabilities), [shared-state §4.6](research/module-investigation/shared-state-jobs-and-notifications.md#46-identity-who-said-it) |
 | P6 | 3 | `t3/modules-06-scheduler` | Scheduler | [shared-state §6](research/module-investigation/shared-state-jobs-and-notifications.md#6-jobs-and-the-scheduler) |
 | P7 | 4 | `t3/modules-07-phrase-commands` | Phrase commands, windows, session and device control | [assistant-controls §5](research/modules/assistant-controls.md#5-integrate-or-build) |
-| P8 | 4 | `t3/modules-08-connections-risk` | Connections, risk policy, confirmation | [module-definition B.4, B.5](research/module-investigation/module-definition-config-and-dependencies.md#b4-connections-and-oauth-on-a-headless-server) |
+| P8 | 4 | `t3/modules-08-connections-risk` | Connections and risk policy | [module-definition B.4, B.5](research/module-investigation/module-definition-config-and-dependencies.md#b4-connections-and-oauth-on-a-headless-server) |
 | P9 | 5 | `t3/modules-09-notifications` | Notification service, speech sequences, ringing | [shared-state §8](research/module-investigation/shared-state-jobs-and-notifications.md#8-notifications) |
 | P10 | 6 | `t3/modules-10-presentation` | Presentation | [presentation §3, §4, §6](research/module-investigation/presentation-and-device-capabilities.md#3-presentation-what-a-tool-returns) |
 | P11 | 7 | `t3/modules-11-scaffold` | Module packages, shared contracts, test kit, `docs/MODULES.md` | §5 and Appendix A |
 
-Service keys and interfaces that the core provides (`People`, `Privacy`, `SessionControl`, `DeviceControl`) are
-defined in `@pva/core` by the PR that implements them. Keys that a module provides are defined in
+Service keys and interfaces that the core provides or calls (`People`, `Privacy`, `SessionControl`,
+`DeviceControl`, `Playback`) are defined in `@pva/core` by the PR that implements or first uses them. Keys that a module provides are defined in
 `@pva/module-contracts` by P11.
 
 ### P1. Module API v2, tool context, the execution gateway
@@ -149,14 +152,32 @@ defined in `@pva/core` by the PR that implements them. Keys that a module provid
   (tools, actions, context, instructions). Version 2 adds an optional `shared(ctx)` part that runs **once per
   module**, with the module's shared settings only, while the module is demanded: at least one switched-on assistant
   has it on, or a demanded module names it in `uses`. Sockets, caches, job handlers, event subscriptions, services
-  and contributions belong there. Each instance receives what `shared` returned. This is what makes a service
-  unambiguous when a module has several instances.
+  and contributions belong there. Each instance receives what `shared` returned.
+  - *Settings.* Shared code that acts for a caller asks for that caller's settings:
+    `ctx.settingsFor(assistantId)` gives the module's effective settings for an assistant (its own values over the
+    shared ones), and the shared values when there is no assistant. A weather briefing section therefore uses the
+    asking assistant's place and units.
+  - *Replacement.* A change to a shared setting starts a new generation: the new shared part and every instance
+    start, then the snapshot switches to them at once, then the old generation is retired. If the new generation
+    fails to start, the old one keeps serving and the Health page says why. The old shared part's handlers, routes,
+    subscriptions, services and contributions are withdrawn at the switch, never live beside the new ones; the old
+    scope itself closes after the existing grace period for calls in flight. `requestRestart` from an instance
+    restarts that instance; from the shared part it starts a new generation.
+  - *Order.* A module starts after the shared parts of the modules in its `uses` have started or failed. A cycle in
+    `uses` is an error for every module in it, found when the catalogue is read. A consumer never keeps a service
+    it looked up at start: it looks it up at each use, so a provider that fails, restarts or comes back later is
+    seen without restarting the consumer.
+  - *CLI modes* have no assistants: every module whose saved switch is on is demanded and runs one instance, and
+    calls are admitted for an explicit local principal. On a serve-mode path a call with no `CurrentTurn` and no
+    job origin is refused; a missing context never means "allowed".
 - **Services.** `shared` may return typed services under `ServiceKey<T>` values. `host.service(key)` is a live
   lookup that returns `undefined` while no demanded module provides the key; a consumer then says that the other
-  module is off. A second provider of a key is a start error for the second module.
+  module is off. A second provider of a key is a start error for the second module. §2 row 18 says what a service
+  may offer.
 - **Contributions.** `shared` may return values under `ContributionKey<T>` (a briefing section, a calendar
-  provider). The host collects them; `host.contributions(key)` is the live list. Nothing registers itself with
-  another module, so start order and restarts cannot lose a registration.
+  provider). The host collects them; `host.contributions(key)` is the live list, and inside a turn it holds only the
+  contributions of modules the turn's assistant has on. Nothing registers itself with another module, so start
+  order and restarts cannot lose a registration.
 - `ModuleContext` gains a `host` member for version 2 modules. The later PRs add `store`, `events`, `scheduler`,
   `speech`, `notify`, `present`, `connections` beside it; P1 defines where they go, in both `shared` and `start`.
 - `CurrentTurn`: a `Context.Reference` provided around every tool call, every action run **and the gathering of
@@ -164,15 +185,17 @@ defined in `@pva/core` by the PR that implements them. Keys that a module provid
   assistant id, device id and name, room, person, source (`voice`, `text`, `touch`, `phrase`, `routine`). P1 fills
   what serve mode knows today; P5 fills room and person. Absent in CLI modes; a job carries its own origin.
 - **One execution gateway.** Every way of running a tool or an action goes through one function in the core: a
-  model's tool call, the Claude Code bridge, a phrase command, a tap on a presentation, a routine step. The gateway
-  resolves the assistant, device and person of the call, and checks, in this order: the assistant has the module on;
-  the tool is not in its `offTools`; the risk policy (added by P8); confirmation (P8). A caller cannot reach a
-  module's `execute` any other way. `host.actions` gives a module the **turn's** action catalogue (the calling
-  assistant's), and runs an action through the gateway.
-- Tool metadata: optional `risk`, `sensitivity` (`household` or `personal`) and `latency`, on tools and actions.
-  `risk` is a class, or a function from the validated input to a class (a garage door is `security`, a blind is
-  `change`). Inferred when absent: `speculative: true` means `read`, otherwise `change`. P1 carries them through the
-  gateway; P8 enforces them.
+  model's tool call, the Claude Code bridge, the intent agent, a phrase command, a tap on a presentation, a routine
+  step, a notification action. The gateway resolves the assistant, device and person of the call, and checks, in
+  this order: the assistant has the module on; the tool is not in its `offTools`; the risk policy (added by P8). A
+  caller cannot reach a module's `execute` any other way. `host.actions` gives a module the **turn's** action
+  catalogue (the calling assistant's), and runs an action through the gateway.
+- Tool metadata: optional `risk`, `sensitivity` and `latency`, on tools and actions. `risk` is a class, or a
+  function from the validated input to a class together with a declared list of the classes it can return (a cover
+  tool declares `change` and `security`: a blind is `change`, a garage door is `security`). Inferred when absent:
+  `speculative: true` means `read`, otherwise `change`. `sensitivity` is `household`, or `personal` with the owner
+  (§2 row 8), fixed or decided per result. P1 carries them through the gateway; P8 enforces them. An action's
+  existing `confirm: true` keeps meaning what it means today.
 - `host` also gives a read-only view (module states, vault locked or not, engine summary, connected devices, the
   Home section's values) and `requestRestart(reason)`, so a module whose tool list changed at run time is started
   again.
@@ -235,9 +258,12 @@ Server only: no voice-page work. P10 is the first consumer on a screen.
   removes a row together with every earlier payload of it in the change log and in search indexes; daily backups
   keep it until they rotate out, and the documentation says so.
 - Event bus: one in-process `PubSub`; `ctx.events.publish` and `subscribe`; host events (turn ended, device
-  connected or disconnected, module state changed); `household.event` and a snapshot defined in the protocol and
-  sent to voice connections, filtered by audience with `Privacy.mayReveal` once P5 exists, with replay from the
-  change log on reconnect.
+  connected or disconnected, module state changed).
+- To voice pages: `household.event` and a snapshot, defined in the protocol. Nothing is sent by default. A
+  collection or an event type opts in by giving a **projection**: a function from the row or event and the target
+  device to what that device may see, or nothing. The same projection is applied to snapshots, live events and
+  replay from the change log on reconnect. This is how an alarm's label can be shown on the device it will ring on
+  and left out elsewhere. Person-scoped rows are also passed through `Privacy.mayReveal` once P5 exists.
 - Ambient facts: a host context provider that assembles collections' `ambient` lines within the 50 ms budget, capped
   at 600 characters, behind a household switch. Measured with `TurnTrace` on and off.
 
@@ -262,11 +288,13 @@ Server only: no voice-page work. P10 is the first consumer on a screen.
   a re-check on clock jumps. Handlers are registered in a module's `shared` part.
 - Missed-while-down policies `fire-late`, `{ fireIfWithinMs }`, `skip`, `inbox`, and "run the last missed occurrence
   once" for recurring jobs.
-- Exactly-once as far as one process can give it: a due job is claimed in a transaction; a job found `running` at
-  start is recovered by its policy (a `{ notify }` job is delivered again under the same notification id, which the
-  notification service dedupes; a handler job is retried only if it declared itself idempotent, otherwise marked
-  failed and reported); completing an occurrence and scheduling the next one of a recurring job happen in one
-  transaction; a failing handler is retried with back-off up to a declared limit.
+- Exactly-once as far as one process can give it. Every occurrence has a stable key (job id and due time). A due
+  job is claimed in a transaction. A handler declares whether it is idempotent. Only an idempotent handler is ever
+  run again for the same occurrence, whether it failed (retried with back-off up to a declared limit) or was found
+  `running` at start; any other handler that fails or was interrupted is marked failed and reported on the Health
+  page. A `{ notify }` job is delivered again under the same notification id, which the notification service
+  dedupes. Completing or failing an occurrence and scheduling the next one of a recurring job happen in one
+  transaction, so a recurring job always moves on.
 - `{ notify }` jobs are accepted and stored in P6 and delivered once P9 exists; until then they log.
 - Admin: a list of scheduled jobs with cancel.
 
@@ -274,40 +302,63 @@ Server only: no voice-page work. P10 is the first consumer on a screen.
 
 The fast path the basics need: commands that run without the language model.
 
-- **Phrase commands**, a new module contribution: a closed set of phrases per language with optional typed slots
-  (the existing `Param` kinds), a `when`, and a handler that runs through the execution gateway and returns an
-  optional spoken line or earcon. `when` is `after-wake` (the utterance after a wake phrase, or inside a follow-up
-  window, matches the phrase) or the name of a window.
-- **Windows.** The host and modules open and close named windows per device: `ringing` (host, P9), `audible` (host:
-  a reply is playing or just ended), and module windows opened for some seconds (`follow-up`, `call`,
-  `briefing`). A window has one of three behaviours: `phrases` (its phrase commands are accepted without the wake
-  phrase), `phrase-only` (while it is open the device answers only to a wake phrase: used during a call and while
-  music plays in the room), and `capture` (the next utterance's text is handed to the module instead of an agent,
-  within a time limit and with a way to cancel: used for a broadcast reply).
-- **Where the matcher sits.** Two branches, each consuming what it matches:
-  1. a control branch on recogniser events **before the echo gate**, active only while a `phrases` window is open on
-     the device, matching only that window's phrases. A match is consumed (it never reaches the gates or an agent),
-     and the eager and the final transcript of one utterance count once. Speech that does not match continues
-     through the echo gate and the route gate unchanged;
-  2. a branch **after the route gate** for `after-wake` commands, on the final transcript with the wake phrase
-     removed. A match is consumed before the dispatcher; anything else goes to the assistant as today.
-- **Arbitration**, decided by the host so that exactly one command consumes an utterance: an open window beats
-  `after-wake`; among open windows the order is `call`, `ringing`, other module windows by most recently opened,
-  `audible`; within one window a longer phrase beats a shorter one. Two modules registering the same phrase in the
-  same window or both `after-wake` is a start error for the second, shown in admin.
+- **Phrase commands.** A closed set of phrases per language with optional typed slots (the existing `Param`
+  kinds), a `when`, and a handler that runs through the execution gateway and returns at once with an optional
+  spoken line or earcon; anything longer it starts in the module's shared scope. `when` is `after-wake` (the
+  utterance after a wake phrase, or inside an assistant's follow-up window, matches the phrase) or the name of a
+  window. There are two sources:
+  - the **host's essential controls** (§2 row 17): "stop", "never mind", "repeat", "louder", "quieter", in the
+    `audible` window and `after-wake`. They exist for every assistant on every device, whatever modules it has.
+    "Stop" stops the reply, then, if nothing was speaking, pauses what the `Playback` service says is playing in the
+    room. "Louder" and "quieter" change the media volume while media plays in the room, otherwise the reply volume;
+  - **modules**: `after-wake` commands from an instance, valid for the assistants that use that instance; window
+    commands from the shared part, valid in the windows that module opened.
+- **Windows.** A window belongs to one device and has an owner (the host or a module), a kind, an id and an
+  expiry. The host opens `audible` (a reply is playing or just ended) and, in P9, `ringing`. A module opens windows
+  of its own for some seconds. A window has one of three kinds:
+  - `phrases`: its phrase commands are accepted without the wake phrase;
+  - `capture`: the next utterance's text is handed to the owner instead of an agent. It starts listening only when
+    the announcement that opened it has finished playing, ends at the first utterance, at "never mind" or at its
+    expiry, and one device holds one capture at a time (a newer one replaces an older one, whose owner is told);
+  - `phrase-only`: while it is open the device answers only to a wake phrase. Used during a call and while music
+    plays in the room.
+- **How one utterance is routed**, the same in every interrupt mode, decided by the host so that exactly one
+  consumer takes it:
+  1. an utterance that starts with a wake phrase leaves every window and goes to step 5;
+  2. if a `phrases` window is open on the device and the utterance matches one of its commands, that command takes
+     it. Open windows are tried in this order: `ringing`, module windows by most recently opened, `audible`; within
+     a window the longest phrase wins. While a `phrase-only` window is open, only the windows of its own owner are
+     tried, so a voice on the other end of a call cannot stop a timer;
+  3. otherwise, if a `capture` window is listening, its owner takes the utterance, even on a device whose normal
+     route is "nobody";
+  4. otherwise, if a `phrase-only` window is open, the utterance is dropped;
+  5. otherwise the route gate decides as today, and an `after-wake` command of the answering assistant takes the
+     utterance if it matches, before the dispatcher.
+- **One decision per utterance.** Steps 2 and 3 work on recogniser events before the echo gate, so a single word is
+  not lost to its two-word rule; step 5 works after the route gate. An utterance is taken or not taken once, and
+  the decision covers all of its events (speech start, interim, eager, final, resumed). The session buffers what
+  it must so that a taken utterance never starts or commits a model call: a speculative turn begun from its first
+  events is discarded, and nothing of it reaches the conversation. An utterance that is not taken continues through
+  the gates exactly as today, with no added delay that `TurnTrace` can show; the PR reports that measurement.
+- **Conflicts.** The host's phrases are reserved. Two commands with the same phrase in one assistant's `after-wake`
+  set, or in one window, do not stop a module from starting: both are left out for that assistant or window, and
+  the Health page names them. Admin warns when a routine phrase is close to a wake phrase or a host phrase.
 - **Session control** (`SessionControl` service): stop the reply being spoken, cancel a pending interaction, repeat
   the last reply, start a new conversation, switch the answering assistant (with the existing `canPick` and
   assignment checks), put the device to sleep and wake it, read these states. Sleep and a temporary switch are kept
   per device in memory and reset at a restart.
 - **Device control** (`DeviceControl` service): reply volume, microphone mute and device state, through new
   `output.volume`, `mic.set` and `device.state` messages and a gain node on the reply output of the voice page;
-  earcons and canned replies.
+  earcons and canned replies. A microphone the person muted is never opened by a window.
+- The `Playback` service key is defined here, for the host's "stop" and volume; the music module provides it.
 - **Typed actions before the model.** Per assistant, an opt-in switch that tries the offline keyword decider over
   the assistant's actions and runs a confident, complete match without a model call, through the gateway. Off by
   default; the measurements that would justify another default are part of the PR.
-- The wake-free settings of §2 row 4, with the measurement of false stops reported in the PR.
+- The wake-free settings of §2 row 4, with the measurement of false stops reported in the PR. In manual interrupt
+  mode the microphone is closed while a reply plays, in the page and on the server; the "while audible" setting is
+  shown as unavailable there, with the reason.
 
-### P8. Connections, risk policy, confirmation
+### P8. Connections and risk policy
 
 - Connection types (declared by modules) and connection records in settings, credentials in the vault, owned by the
   household or a person, with a status (`ok`, `locked`, `needs-reauth`) and a test call.
@@ -316,36 +367,50 @@ The fast path the basics need: commands that run without the language model.
   server (discovery, dynamic client registration). Single-flight refresh; rotated refresh tokens saved at once.
 - `ctx.connections`: resolve a connection for the turn (the turn's person, then a household connection), and give a
   module a token provider it can hand to its own client.
-- Risk policy in the gateway: the household ceiling, narrowed by assistant and device. A tool whose every possible
-  class is denied is left out of the turn's tool list; every call is checked again at execution with its validated
-  input, on every entry path. `money` and `security` are denied (§2 row 5).
-- Confirmation (§2 row 6): repair the five defects listed in `docs/AGENTS-AND-INTENTS.md` §3.2, each with a
-  regression test; then `confirmActions` stops being the literal `"off"` and a `confirm` outcome asks through core's
-  spoken confirmation. If a defect cannot be repaired in this PR, confirmation stays off and the PR says which.
+- Risk policy in the gateway: the household ceiling, narrowed by assistant and device. Outcomes are `allow`,
+  `confirm` and `deny`. A tool whose every declared class is denied or needs confirmation is left out of the turn's
+  tool list; every call is checked again at execution with its validated input, on every entry path. `deny` and
+  `confirm` both refuse (§2 rows 5 and 6), each with its own sentence for the model and for speech, and the trace
+  records which. A routine is refused as a whole when it is saved or run if any step would be refused.
+- `sensitivity` enforced where the gateway can: a `personal` result is passed through `Privacy.mayReveal` for the
+  asking device before it goes back to the model.
 - Admin: Connections, and the risk policy for the household, an assistant and a device.
 
 ### P9. Notification service, speech sequences, ringing
 
-- `ctx.notify` as in shared-state §8.1: `send`, `update`, `resolve`, `inbox`. A `notifications` table.
-- Priorities and what each may do, audiences, ring policies (`origin`, `origin-then-room`, `everywhere`), one
-  decision per notification, dedupe keys, expiry, the priority caps of §2 row 16, and `Privacy.mayReveal` for
-  `personal` notifications.
+- **One delivery policy** for everything the house says or shows that nobody on that device just asked for. A
+  notification and a spoken sequence both pass through it, per target device: do not disturb, quiet hours, quiet
+  rooms, whether the device accepts things from other devices, the priority caps of §2 row 16, and
+  `Privacy.mayReveal`. A reply or a spoken line on the device that just asked is not subject to it.
+- `ctx.notify` as in shared-state §8.1: `send`, `update`, `resolve`, `inbox`. A `notifications` table. Priorities
+  and what each may do, audiences, ring policies (`origin`, `origin-then-room`, `everywhere`), one decision per
+  notification, dedupe keys, expiry.
 - **Do not disturb** as part of the service: per device and for the house, with an end time kept by the scheduler;
   `notify.dnd` to read, set and clear it; a `dnd.changed` event; the state in `device.state`. Quiet hours as a
   household setting. One table says what each priority does under each.
 - **Actions on a notification.** A request names its actions (`stop`, `snooze`, `extend`, `answer`, `decline`,
   `open`, or a custom id) and an action handler name. The owning module registers that handler in its `shared` part,
-  like a scheduler handler. A press, a ringing-window phrase or a call to `resolve` all arrive there with the
-  notification id and the actor, so the module updates its own timer or reminder and its job; the service only
-  records the outcome. `stop` with no handler running resolves the notification.
+  like a scheduler handler, and a notification that is waiting for an answer keeps that shared part demanded. A
+  press, a ringing-window phrase or a call to `resolve` all arrive there through the gateway with the notification
+  id and the actor, so the module updates its own timer or reminder and its job; the service only records the
+  outcome. While the handler cannot be reached (its module is restarting or failed), `stop` still silences and
+  resolves the notification, and any other action answers "I can't do that right now" and leaves it as it was.
 - **Speech sequences** (`ctx.speech`): a bounded, cancellable sequence of spoken segments on a device, outside a
-  model turn. It takes the output lease like a reply (waits for the current clause or reply, never talks over one),
-  can play a cue first, reports which segment is playing, can skip to the next segment or stop, and can be recorded
-  in the conversation as `[Announced: …]`. `Announce` is a one-segment sequence. Used by announcements, the spoken
-  line of a ring, routines' `say`, and the briefing's template path. Delivery is by device, not by session.
+  model reply. A request names its origin, a priority and a sensitivity, and goes through the delivery policy when
+  its target is not the device that asked.
+  - `enqueue` returns a handle at once. The sequence takes the output lease after whatever is playing: it waits
+    for the current reply to end (a `high` one for the current clause), and never talks over one.
+  - A tool or an action called inside a model turn must not wait for a sequence: the reply it belongs to is what
+    the sequence is waiting for. Speech that is the answer to a turn is returned as the result (`say`), as today.
+    Code that runs outside a turn (a phrase command's started work, a job, a routine run) may wait for each
+    segment to finish, which is how a routine keeps its steps in order.
+  - It can play a cue first, reports which segment is playing, can skip to the next segment or stop, is stopped by
+    the host's "stop", and can be recorded in the conversation as `[Announced: …]`.
+  - `Announce` is a one-segment sequence. Delivery is by device, not by session.
 - Ringing: `notification.ring` and `notification.resolved` messages; the voice page loops a local cue, shows a
-  plain card with the notification's actions, and shows a badge for what was missed. The `ringing` window and a
-  follow-up window after an announcement, through P7.
+  plain card with the notification's actions, and shows a badge for what was missed. The `ringing` window (not
+  matched against the device's own spoken line while that plays) and a follow-up window after an announcement,
+  through P7. The measurement of §2 row 4.
 - Admin: the inbox.
 
 ### P10. Presentation
@@ -363,13 +428,15 @@ The fast path the basics need: commands that run without the language model.
 - The note for the model says what the server did, not what the eye saw: "sent to Kitchen tablet", "not sent: no
   display here; Kitchen tablet can show it". A device reports `present.status`; a failed load is put in the next
   turn's context. The turn never waits for that report.
-- The Presenter per device: capability-based degradation, `Privacy.mayReveal`, the reveal rule
+- The Presenter per device: capability-based degradation, `Privacy.mayReveal` for the device that would show it,
+  the reveal rule
   (`reveal { turnId, clause }`), lifetimes, one transient at a time, pinned presentations restored on reconnect,
   `present.show / update / dismiss` and `present.action / dismissed / status`. A `present.action` of kind `tool`
   runs through the execution gateway with source `touch`.
 - `/media/<hash>`: the server fetches an image once through `safeFetch`, checks type and size, resizes with `sharp`,
   serves it with dimensions and a placeholder, and evicts it after a day.
-- The `confirm` kind is tied to P8's confirmation; P9's ring card and badge move into the presentation stage.
+- P9's ring card and badge move into the presentation stage. The `confirm` kind is defined and drawn, and is
+  used only for a tap that is itself the confirmation of something shown on that screen ("Clear the list?").
 - The three stable instructions for the system prompt.
 - The voice page: one renderer per kind, and the stage layouts that move and shrink the character's box. Every
   existing character keeps working unchanged (`docs/CHARACTERS.md`).
@@ -396,29 +463,29 @@ document's own, the row says why.
 
 | # | Module | Package (module ids) | First version | Left for later | Model |
 |---|---|---|---|---|---|
-| 1 | [assistant-controls](research/modules/assistant-controls.md) | `module-assistant-controls` | Phrase commands and tools for stop, never mind, repeat, new conversation, switch assistant, sleep and wake up, louder, quieter, set volume, mute the microphone, on `SessionControl` and `DeviceControl`. "Stop" stops, in order: a ring (P9's window wins by arbitration), the reply, then media through the `Playback` service. "Louder" means media while media plays in the room, otherwise the reply volume. | `show_on` (it is in P10), hand-off, find my phone, speech rate | Opus |
-| 2 | [timers-and-alarms](research/modules/timers-and-alarms.md) | `module-timers` (`timers`, `alarms`) | Named timers and alarms as household data: start, list, adjust, pause, resume, cancel; alarms once and repeating; ringing through P9 with stop, snooze and +5 minutes as notification actions; the `timer` presentation pinned and updated through `ctx.present`; ambient facts; HA's matching rules; phrase commands for set, ask and stop. | Phone, escalation, node-local copies, sunrise, music alarms | Opus |
+| 1 | [assistant-controls](research/modules/assistant-controls.md) | `module-assistant-controls` | The host already has stop, never mind, repeat, louder and quieter (P7). This module adds the same operations as tools, for free phrasing, and phrase commands and tools for new conversation, switch assistant, sleep and wake up, set the volume to a level, and mute the microphone, on `SessionControl` and `DeviceControl`. | `show_on` (it is in P10), hand-off, find my phone, speech rate | Sonnet |
+| 2 | [timers-and-alarms](research/modules/timers-and-alarms.md) | `module-timers` (`timers`, `alarms`) | Named timers and alarms as household data: start, list, adjust, pause, resume, cancel; alarms once and repeating; ringing through P9 with stop, snooze and +5 minutes as notification actions; the `timer` presentation pinned and updated through `ctx.present`; timers shown on every screen, an alarm's label only on the device it rings on, through P4's projections; ambient facts; HA's matching rules; phrase commands for set, ask and stop. | Phone, escalation, node-local copies, sunrise, music alarms | Opus |
 | 3 | [core-tools](research/modules/core-tools.md) | `module-core-tools` (`calculator`, `knowledge`, `system-status`), and `clock.ts` in `modules-builtin` | `calculate` with units and currency, the extended `current_time`, `lookup` (Wikipedia, Wikidata, Wiktionary), `random`, `system_status` on P1's host view. | `translate`, crypto, SPARQL | Sonnet |
 | 4 | [web-search](research/modules/web-search.md) | `module-web-search` | `web_search` with SearXNG and Brave behind a `SearchProvider` interface, `read_page` on `safeFetch`, a usage counter and caps in the store, moderate safe search. | `research`, `search_sources`, more providers, provider-native search | Sonnet |
 | 5 | [lists](research/modules/lists.md) | `module-lists` | Local store, the ten `lists_*` tools, a default shopping and to-do list, splitting on "and", quantities, duplicate merge, undo, the `Lists` service, the checklist presentation with direct ticks, phrase commands for add and read. | Chores, person lists, every outside provider (the HA provider of the document's first version too: smart-home is being rewritten beside it), the outbox | Opus |
 | 6 | [notifications](research/modules/notifications.md) | `module-notifications` | The spoken side of P9: `notifications_read` and dismiss, do-not-disturb by voice with an end time on `notify.dnd`, "send a test", one inbound `notify` hook on P3's routes that needs both its token and the LAN, capped at `normal`. | Phone channels, escalation, hooks from outside the LAN | Sonnet |
 | 7 | [kitchen](research/modules/kitchen.md) | `module-kitchen` | Slice 1: the pantry ledger with approximate amounts and undo, product settings, low stock into the shopping list through `Lists`. Plus, beyond the document's first version, stored recipes entered by voice and `kitchen_what_can_i_make` with a time limit and the household's diets: it is the owner's own example of what the kitchen is for, and it needs nothing slice 1 does not have. | URL import, scaling, guided cooking, meal plan, the Chef template with hands-free "next", outside providers, barcodes | Opus |
 | 8 | [music](research/modules/music.md) | `module-music` | Route 1 only, over the `HomeAssistant` service: play (artist, album, playlist, radio through Music Assistant), pause, resume, next, previous, volume, what is playing, per room, with the room from `CurrentTurn`; phrase commands for transport; the `Playback` service; the media guard as a `phrase-only` window on the devices of a room while its player plays, so that lyrics are not taken for requests ("hey Jeff, stop" still pauses it). | Playback in the browser or on nodes, Spotify direct, ducking, the `media` kind | Opus |
-| 9 | [smart-home](research/modules/smart-home.md) | `module-home-assistant` (existing) | The WebSocket entity cache with registries and HA's exposure list, in the module's `shared` part; typed actions for lights, switches, scenes, scripts, climate, covers and lock status, with risk decided per entity (a garage door or a lock is `security` and so refused); `media_player`; "here" from `CurrentTurn.room`; the `HomeAssistant` service; a connection instead of module secret fields, with the old fields still read. | Locking, unlocking and disarming, watches, doorbell and leak notifications, cameras, energy, the MCP long tail | Opus |
+| 9 | [smart-home](research/modules/smart-home.md) | `module-home-assistant` (existing) | The WebSocket entity cache with registries and HA's exposure list, in the module's `shared` part; typed actions for lights, switches, climate and covers; reading any exposed entity's state, a lock's included, is `read`; changing a lock, a garage door, a gate or an alarm panel is `security` and so refused; scenes and scripts only those the owner ticks one by one in the module's settings, because what a script does cannot be seen from outside it; `media_player`; "here" from `CurrentTurn.room`; the `HomeAssistant` service; a connection instead of module secret fields, with the old fields still read. | Locking, unlocking and disarming, watches, doorbell and leak notifications, cameras, energy, the MCP long tail | Opus |
 | 10 | [reminders](research/modules/reminders.md) | `module-reminders` | Time and repeating reminders, household and person scope, `RRULE` storage with one job for the next occurrence, delivery where set, done and snooze as notification actions and follow-up phrases, the `card` and `list` presentations, a briefing section. | Presence and event reminders, "remind Sam", nag, CalDAV | Sonnet |
 | 11 | [images-and-photos](research/modules/images-and-photos.md) | `module-images` | `image_find` over Wikipedia and Commons with credit, `gallery` with pick for ambiguous words (the document's kiwi case needs it), the three-part reply on a device without a screen. | Other sources, generation, Immich, photo frame, cameras | Sonnet |
 | 12 | [calendar](research/modules/calendar.md) | `module-calendar` | `CalendarProvider` contributions with ICS and CalDAV providers of its own, a cache refreshed by a job, `calendar_agenda`, `_next`, `_find`, `_free`, `_add` with undo, personal events reduced on shared devices (§2 row 8), a briefing section, an ambient line. | Change and delete, reminders from events, Microsoft, HA calendars | Opus |
-| 13 | [memory-and-notes](research/modules/memory-and-notes.md) | `module-memory` | `remember`, `recall`, `forget`, `note`, `read_notes` on the store with FTS5 (falling back to `LIKE`), household and person scope, a collection without history so that `forget` erases, pinned memories in the per-turn context within 800 characters and measured, a refusal for codes and passwords. | Secrets, sync to Obsidian or Nextcloud, embeddings, audio | Sonnet |
+| 13 | [memory-and-notes](research/modules/memory-and-notes.md) | `module-memory` | `remember`, `recall`, `forget`, `note`, `read_notes` on the store with FTS5; where the build has no FTS5, search covers the newest 2,000 entries and the module's status says so. Household and person scope, a collection without history so that `forget` erases, pinned memories in the per-turn context within 800 characters and measured, a refusal for codes and passwords. | Secrets, sync to Obsidian or Nextcloud, embeddings, audio | Sonnet |
 | 14 | [google](research/modules/google.md) | `module-google` | The `google` connection type on P8's loopback-and-paste flow with the owner's own client id, read-only: `mail_overview`, `mail_search`, `mail_read`, all `personal`; a Google `CalendarProvider` contribution; a mail briefing section. A hand-written fetch client. | Send, drafts, contacts, Drive, Tasks, the mail cache and sync job | Opus |
 | 15 | [t3-code](research/modules/t3-code.md) | `module-t3-code` (wave B, after 22) | Read-only over T3's `/mcp`: its own connection type on P8's MCP OAuth flow, the `Mcp` service's client with that connection's token provider, `t3_overview`, `t3_thread_status`, `t3_pull_requests`, `t3_projects`; a context line; the coding template. T3's upstream tools are never offered to the model directly. | Draft and send, stop, answer, watches, CI status | Sonnet |
-| 16 | [broadcast](research/modules/broadcast.md) | `module-broadcast` | `broadcast_send` to everyone or a room in the assistant's voice with a chime, through `ctx.speech`; a 30-second `capture` window on each target for a reply, routed back to the sender; `broadcast_chime`; the origin excluded; quiet rooms skipped in quiet hours; a `card` on screens. | The speaker's own voice, voice messages, schedules, phones | Sonnet |
-| 17 | [briefing](research/modules/briefing.md) | `module-briefing` | `briefing` on request from the `BriefingSection` contributions, with a length; the model words it by default, and `short` is a template join spoken through `ctx.speech` without the model; preferences. The section contract is in the first version, beyond the document's, because five other module PRs are written against it at the same time. | Skip and more, scheduled and presence briefings, cards pinned in the morning, "what did I miss" | Sonnet |
+| 16 | [broadcast](research/modules/broadcast.md) | `module-broadcast` | `broadcast_send` to everyone or a room in the assistant's voice with a chime, through `ctx.speech` and so through the delivery policy (do not disturb, quiet rooms in quiet hours, devices that accept nothing from others); a 30-second `capture` window on each target for a reply, routed back to the sender; `broadcast_chime`; the origin excluded; a `card` on screens. | The speaker's own voice, voice messages, schedules, phones | Sonnet |
+| 17 | [briefing](research/modules/briefing.md) | `module-briefing` | `briefing` on request from the `BriefingSection` contributions of the modules the assistant has on, with a length; as a tool it returns the sections for the model to word, and as a typed action or phrase command it returns a template join as its spoken result, with no model; preferences. The section contract is in the first version, beyond the document's, because five other module PRs are written against it at the same time. | Skip and more, scheduled and presence briefings, cards pinned in the morning, "what did I miss" | Sonnet |
 | 18 | [local-info](research/modules/local-info.md) | `module-local-info` (`bin-day`), and `weather.ts` in `modules-builtin` | `weather_rain_soon`, `weather_forecast`, `weather_warnings` in the weather module with the `weather` presentation and a briefing section; a `bin-day` module reading an ICS URL with `bin_next` and a briefing section. | Bin reminders, travel, places, parcels, markets, sports | Sonnet |
 | 19 | [presence-and-people](research/modules/presence-and-people.md) | `module-presence` | `presence_where` and `people_list` over HA `person` entities through the `HomeAssistant` service, a link from a `Person` to an HA person as a module setting, `presence.arrived` and `presence.left` with a departure delay. `Person` records themselves are P5. | Rooms, voice identification, guest mode, the house guide, who may ask about whom | Sonnet |
 | 20 | [news-and-feeds](research/modules/news-and-feeds.md) | `module-news` | Built-in feeds with a refresh job, starter lists, `news_headlines`, `news_story`, `news_article`, title cleaning for speech, a briefing section; and `feed_subscribe`, `feed_unsubscribe`, `feed_list`, which the document puts in the first wave: without them the owner cannot change the starter list by voice. | OPML import, reader providers, alerts, clustering beyond titles, watchers, the ticker | Sonnet |
-| 21 | [routines-and-automations](research/modules/routines-and-automations.md) | `module-routines` | Routines and quick commands defined in settings (steps as validated JSON), run by phrase after the wake phrase with no model; steps `say` (through `ctx.speech`), `call` an action from the turn's catalogue, `stop_if_failed`; every step runs through the gateway and is checked on its own, so a routine can do nothing the assistant could not; `routines_run`, `routines_list`; a "Good morning" template. | `wait`, time, event, hook and presence triggers, drafts by voice, history | Opus |
+| 21 | [routines-and-automations](research/modules/routines-and-automations.md) | `module-routines` | Routines and quick commands defined in settings (steps as validated JSON), started by phrase after the wake phrase with no model, or by `routines_run`; either way the run is started and continues in the module's shared scope, one step after the other. Steps: `say` (a `ctx.speech` segment the run waits for), `call` an action from the starting assistant's catalogue, `stop_if_failed`. Every step runs through the gateway and is checked on its own, and a routine with a step that would be refused is refused as a whole, so a routine can do nothing the assistant could not. `routines_list`; a "Good morning" template. | `wait`, steps that need confirmation, time, event, hook and presence triggers, drafts by voice, history | Opus |
 | 22 | [mcp-client](research/modules/mcp-client.md) | `module-mcp` (`mcp`) | HTTP servers with headers from the vault, both protocol revisions, an opt-in allowlist per tool with risk and timeout (as validated JSON), read-only tools, results cut and marked untrusted, restart on a changed tool list; the `Mcp` service: an authenticated, reusable HTTP client that another module can open with its own URL and token provider. | stdio, a settings page for OAuth servers, tasks, `find_tool`, MCP Apps | Opus |
-| 23 | [calls-and-intercom](research/modules/calls-and-intercom.md) | `module-calls`, plus protocol, server and voice page | Stage 1: an audio intercom between browser devices relayed by the server (frame kind 3), call by device or room name, ring 30 seconds through P9 with `answer` and `decline` actions, hang up, the call state machine, do-not-disturb respected, a `phrase-only` window during the call, a call overlay. Written last, alone, because it changes shared files. | Video, groups, phones, drop-in, listen-in, voice nodes | Opus |
+| 23 | [calls-and-intercom](research/modules/calls-and-intercom.md) | `module-calls`, plus protocol, server and voice page | Stage 1: an audio intercom between browser devices relayed by the server (frame kind 3), call by device or room name, ring 30 seconds through P9 with `answer` and `decline` actions, hang up, the call state machine, do-not-disturb respected, a `phrase-only` window during the call, a call overlay. A call leg is bound to the one connection that owns the device's audio and that answered: every action and audio frame is checked against that binding, call audio is never sent to other tabs of the same device, and a takeover or a disconnect ends the leg. Written last, alone, because it changes shared files. | Video, groups, phones, drop-in, listen-in, voice nodes | Opus |
 
 ### 5.2 Contracts between modules
 
@@ -433,10 +500,10 @@ that needs a provider to run at all names it in `uses`.
 | `Lists` (`addItem` with a dedupe key, `completeByKey`, `removeByKey`, `find`) | service | lists | kitchen |
 | `Timers` (`start` with a label and a device to ring on) | service | timers | routines; kitchen later |
 | `HomeAssistant` (entity cache, `callService`, areas, people) | service | smart-home | music, presence |
-| `Playback` (what plays in a room, pause, resume, volume) | service | music | assistant-controls |
+| `Playback` (what plays in a room, pause, resume, volume); the key is defined by P7 | service | music | the host's "stop" and volume (P7) |
 | `Mcp` (open a client to an HTTP MCP server with a token provider; list and call tools) | service | mcp | t3-code |
 | `CalendarProvider` | contribution | calendar (ICS, CalDAV), google | calendar |
-| `BriefingSection` | contribution | weather, bin-day, calendar, news, reminders, google | briefing |
+| `BriefingSection` (its `gather` gets the asking turn and uses `settingsFor` and `Privacy.mayReveal`) | contribution | weather, bin-day, calendar, news, reminders, google | briefing |
 
 Events follow §2 row 12. Other modules may subscribe; nothing may depend on an event for correctness.
 
@@ -461,6 +528,8 @@ Events follow §2 row 12. Other modules may subscribe; nothing may depend on an 
 - Authenticated devices, and with them trusted devices, `money` and `security` actions, and stored secrets.
 - The kids policy and anything that presents itself as safe for children.
 - A filler line for slow tools; text said before a tool call is already spoken while the tool runs.
+- Confirmation: repairing core's spoken confirmation and extending it beyond declared actions (§2 row 6), and
+  with it everything of class `message`: sending mail, messages to people outside the house.
 - Wiring the Jev intent agent as an agent; P7's typed-actions-first switch is the smaller step.
 - The second round's core pieces: images in tool results, capture of long dictation, the reading session, a voice
   per language, module widgets and the dashboard, companion pairing.
