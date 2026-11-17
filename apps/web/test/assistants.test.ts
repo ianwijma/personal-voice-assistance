@@ -1,7 +1,6 @@
 import { describe, expect, it } from "vitest"
 import { assistantsServerExamples, exampleAdminSnapshot, exampleAssistantInfo, exampleDeviceType, serverExamples } from "@pva/protocol/examples"
 import {
-  accountNotAvailableYet,
   accountState,
   blankAssistantBody,
   copyName,
@@ -98,8 +97,6 @@ describe("accounts, names and new assistants", () => {
     expect(modelAfterAccountChange("anthropic", "qwen3-14b")).toBe("claude-haiku-5-5")
     expect(modelAfterAccountChange("home-model", "claude-haiku-5-5")).toBe("")
     expect(modelAfterAccountChange("home-model", "qwen3-14b")).toBe("qwen3-14b")
-    expect(accountNotAvailableYet("openrouter")).toBe(false)
-    expect(accountNotAvailableYet("anthropic")).toBe(false)
   })
   it("OpenRouter and the home model are set up when the server has the key / the address", () => {
     const section = (values: Record<string, unknown>, secrets: Record<string, { set: boolean }> = {}) =>

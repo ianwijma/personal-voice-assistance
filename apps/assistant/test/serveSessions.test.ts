@@ -84,7 +84,7 @@ describe("voice sessions: several devices at once", () => {
     const lateB = await tab("device-b")
     const welcomeB = await lateB.hello()
     expect(welcomeB.snapshot.history.map((h) => h.text)).toEqual(["question from b", "Answer for question from b. More words here."])
-    expect(welcomeB.snapshot.conversation.id).not.toBe((await lateA.waitFor("welcome", () => true, { from: 0 })).snapshot.conversation.id)
+    expect(welcomeB.snapshot.conversations[0]!.id).not.toBe((await lateA.waitFor("welcome", () => true, { from: 0 })).snapshot.conversations[0]!.id)
     // State messages of B never reach A's tabs: A's states are its own.
     expect(b.messages.slice(fromB).some((m) => m.type === "state" && m.state === "speaking")).toBe(true)
   })
@@ -124,7 +124,7 @@ describe("voice sessions: several devices at once", () => {
     const firstB = await b.hello()
     expect((await say(a, "hello a")).outcome).toBe("completed")
     expect((await say(b, "hello b")).outcome).toBe("completed")
-    const before = (await (await tab("device-b")).hello()).snapshot.conversation.id
+    const before = (await (await tab("device-b")).hello()).snapshot.conversations[0]!.id
     a.send({ type: "conversation.new", requestId: "n1" })
     expect((await a.waitFor("result", (m) => m.requestId === "n1")).ok).toBe(true)
     expect((await a.waitFor("conversation", () => true, { from: 0 })).reason).toBe("new")
@@ -133,8 +133,8 @@ describe("voice sessions: several devices at once", () => {
     const lateB = await tab("device-b")
     const welcome = await lateB.hello()
     expect(welcome.snapshot.history.map((h) => h.text)).toEqual(["hello b", "Reply to hello b."])
-    expect(welcome.snapshot.conversation.id).toBe(before)
-    expect(firstB.snapshot.conversation.id).toBe(before)
+    expect(welcome.snapshot.conversations[0]!.id).toBe(before)
+    expect(firstB.snapshot.conversations[0]!.id).toBe(before)
     const lateA = await tab("device-a")
     expect((await lateA.hello()).snapshot.history).toEqual([])
   })
@@ -146,10 +146,10 @@ describe("voice sessions: several devices at once", () => {
     a.send({ type: "conversation.new", requestId: "n1" })
     const told = await a.waitFor("conversation")
     expect(told.reason).toBe("new")
-    expect(told.id).not.toBe(welcome.snapshot.conversation.id)
+    expect(told.id).not.toBe(welcome.snapshot.conversations[0]!.id)
     await say(a, "first words")
     const later = await tab("device-a")
-    expect((await later.hello()).snapshot.conversation.id).toBe(told.id)
+    expect((await later.hello()).snapshot.conversations[0]!.id).toBe(told.id)
   })
 
   it("idle reset: after the device's conversationIdleMinutes without a turn, the next turn starts a new conversation", async () => {
@@ -166,7 +166,7 @@ describe("voice sessions: several devices at once", () => {
     await say(a, "third, much later")
     const told = a.messages.slice(from).find((m): m is Extract<ServerMessage, { type: "conversation" }> => m.type === "conversation")
     expect(told?.reason).toBe("idle")
-    expect(told?.id).not.toBe(first.snapshot.conversation.id)
+    expect(told?.id).not.toBe(first.snapshot.conversations[0]!.id)
     // Sent before the turn that started it.
     expect(a.types(from).indexOf("conversation")).toBeLessThan(a.types(from).indexOf("turn.start"))
     expect(llm.requests.at(-1)!.messages.map((m: any) => m.content)).toEqual(["third, much later"])
@@ -245,13 +245,13 @@ describe("voice sessions: several devices at once", () => {
     const back = await tab("device-a")
     const welcome = await back.hello()
     expect(welcome.snapshot.history.map((h) => h.text)).toEqual(["remember me", "Reply to remember me."])
-    expect(welcome.snapshot.conversation.id).toBe(id)
+    expect(welcome.snapshot.conversations[0]!.id).toBe(id)
     back.close()
     await admin.waitFor("sessions", (m) => m.sessions.length === 0, { from: 0, timeoutMs: 3_000 })
     const later = await tab("device-a")
     const fresh = await later.hello()
     expect(fresh.snapshot.history).toEqual([])
-    expect(fresh.snapshot.conversation.id).not.toBe(id)
+    expect(fresh.snapshot.conversations[0]!.id).not.toBe(id)
   })
 
   it("an engine reload with two sessions keeps both histories and both conversation ids", async () => {
@@ -262,7 +262,7 @@ describe("voice sessions: several devices at once", () => {
     await b.hello()
     await say(a, "before reload a")
     await say(b, "before reload b")
-    const idOf = async (device: string) => (await (await tab(device)).hello()).snapshot.conversation.id
+    const idOf = async (device: string) => (await (await tab(device)).hello()).snapshot.conversations[0]!.id
     const [idA, idB] = [await idOf("device-a"), await idOf("device-b")]
     const admin = await ScriptedClient.connect({ url: server!.url })
     clients.push(admin)
@@ -275,11 +275,11 @@ describe("voice sessions: several devices at once", () => {
     const lateA = await tab("device-a")
     const welcomeA = await lateA.hello()
     expect(welcomeA.snapshot.history.filter((h) => h.role === "user").map((h) => h.text)).toEqual(["before reload a", "after reload a"])
-    expect(welcomeA.snapshot.conversation.id).toBe(idA)
+    expect(welcomeA.snapshot.conversations[0]!.id).toBe(idA)
     const lateB = await tab("device-b")
     const welcomeB = await lateB.hello()
     expect(welcomeB.snapshot.history.filter((h) => h.role === "user").map((h) => h.text)).toEqual(["before reload b", "after reload b"])
-    expect(welcomeB.snapshot.conversation.id).toBe(idB)
+    expect(welcomeB.snapshot.conversations[0]!.id).toBe(idB)
   })
 
   it("admin: sessions (and admin.snapshot.sessions) list the devices talking, most recently active first; no turn traffic", async () => {

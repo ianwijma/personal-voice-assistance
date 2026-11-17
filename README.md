@@ -9,7 +9,7 @@ A personal voice assistant that runs on your Linux machine. You talk, it answers
 Two goals decide the design:
 
 1. **Low latency.** The number that matters is the time from the end of your sentence to the first sound of the reply. Target: under 800 ms. Measured on the development machine with local speech (Parakeet v2) and a simulated 300 ms model: **median 771 ms, worst 1095 ms** (see [Measured latency](#measured-latency)).
-2. **Easy to extend and to swap.** A new capability is one file plus one line. A new provider is one package plus one line. Different replies can use different voices (engines).
+2. **Easy to extend and to swap.** A new capability is one file plus one line. A new provider is one package plus one line. Several assistants can run at once, each with its own prompt, language model, hearing, voice and modules.
 
 Node 22, TypeScript, Effect 4, pnpm workspace. The design and the service contracts are in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
@@ -26,6 +26,7 @@ microphone ─pcm 16 kHz─▶ STT (local sherpa-onnx + Silero VAD, turn detecti
 - Text goes to TTS one clause at a time, as soon as each clause is complete, so the reply starts playing before the model has finished.
 - **Speculative turns:** when the STT reports that you have *probably* finished (`EagerEndOfTurn`, after 250 ms of silence), the reply is generated right away but held back. If you really are done (`EndOfTurn`, 600 ms of silence), it plays at once. If you keep talking, it is thrown away. Only tools marked read-only run during speculation.
 - **Barge-in:** if you start talking while the assistant is speaking, it stops. Only the part you actually heard is kept in the history.
+- **Assistants and devices:** an **assistant** is a configuration you create in the admin page (`/admin/`): a prompt, a language model account and model, how it hears (speech model, turn timing), one voice and which modules it may use. A **device** (a browser today) says which assistants answer on it, which wake phrase wakes each one ("Hey Jeff", "Hey T3"), and who answers a sentence without a phrase: nobody, one assistant, or TypeSafe (hosted, optional) choosing from each assistant's description. Each device has its own conversation with each assistant, and several devices can talk at the same time. A **route gate** reads the transcript and picks the assistant; a **session dispatcher** keeps one conversation per assistant and one speaker per device; a **resource pool** shares what is equal (one language model instance, one loaded speech model, one voice) between assistants and devices and builds a changed one before switching, without a reload. Design, status and measurements: [docs/ASSISTANTS.md](docs/ASSISTANTS.md); the protocol (version 7) is in `packages/protocol`.
 
 ## Quick start
 
@@ -54,16 +55,20 @@ Optional models: `pnpm --filter @pva/tts-sherpa download kokoro-af_heart` (the K
 `data/settings.json`, keys in an encrypted key vault outside the project (see [Keys & access](#keys--access)). Every
 page says what a choice implies (hosted, needs a key, not downloaded, slower start) and what it needs, and a speech
 model that is not on this machine yet is downloaded from the same page. The command-line modes (`text`, `voice`,
-`say`, `bench`, `transcribe`) read the same saved settings and keys.
+`say`, `bench`, `transcribe`) read the same saved settings and keys; they use the shared settings and the flat keys (`LLM_PROVIDER`, `ANTHROPIC_MODEL`, `STT_SHERPA_MODEL`, `ASSISTANT_VOICE`, …) that became per-assistant settings in serve mode (a data directory from before assistants is migrated into one assistant at the first start of `serve`, and a copy of the old file is kept).
 
 | What | Where in Settings |
 |---|---|
-| Language model: offline stand-in, Claude API (key), Claude subscription | Language model › Provider |
-| Speech recognition: on this machine (model, language, turn timing, microphone processing) or Deepgram | Speech recognition › Engine, Turn timing, Microphone processing, Deepgram |
-| Speech and voice models: download, cancel, delete | Speech recognition › Models, Voices › Models |
-| Voices, the default voice, their engines and the Cartesia and ElevenLabs keys | Voices |
-| Modules (clock, weather, …) | Modules |
-| Keys, the vault password, who may change what | Keys & access |
+| An assistant: prompt, tool rounds, follow-up, new conversation after a quiet spell | Assistants › the assistant › Behaviour |
+| Language model: offline stand-in, Claude API (key), Claude subscription, OpenRouter, a home model server; model, effort, limits | Assistants › the assistant › Language model; the accounts under Shared settings › Language model accounts |
+| Speech recognition: on this machine (model, language, turn timing, microphone processing) or Deepgram | Assistants › the assistant › Hearing; Deepgram key and the model list under Shared settings › Speech recognition models |
+| Speech and voice models: download, cancel, delete | Shared settings › Speech recognition models, Voice providers |
+| The assistant's voice (any provider's voice, preview, favourites) and the Cartesia and ElevenLabs keys | Assistants › the assistant › Voice; Shared settings › Voice providers |
+| Modules (clock, weather, Home Assistant, …): which assistant has which, their shared and own settings | Assistants › the assistant › Modules; Shared settings › Modules |
+| Which assistants answer on which device, wake phrases, who answers without a phrase | Devices (a device, or "Every browser") |
+| Location, time zone, language, units (the modules' defaults) | Shared settings › Home |
+| TypeSafe routing (key, model) | Shared settings › Routing |
+| Keys, the vault password, who may change what | Keys & vault |
 | What `.env` or the environment still sets, and **Move to settings** | Diagnostics › Settings from outside |
 
 **`.env` holds almost nothing.** Only these are read before the settings exist ([`.env.example`](.env.example)), all
@@ -95,21 +100,21 @@ simulated speed in serve mode), `SERVE_ALLOWED_ORIGINS`, `PVA_WEB_DIR`, `PVA_VAU
 its variable name ([stt-sherpa](packages/stt-sherpa/README.md), [tts-sherpa](packages/tts-sherpa/README.md), [tts-elevenlabs](packages/tts-elevenlabs/README.md)), which is
 also the key it is saved under.
 
-`fake` is an offline LLM stand-in: it answers time questions through the clock tool and echoes everything else. It is the default so that text mode works without any key. **For real use choose Anthropic (with an API key) or the Claude subscription** under Settings → Language model → Provider (for the Claude subscription, **Use Claude subscription** there saves the choice, opts in, switches the agent on and reloads the engines).
+`fake` is an offline LLM stand-in: it answers time questions through the clock tool and echoes everything else. It is the default so that text mode works without any key. **For real use choose Anthropic (with an API key) or the Claude subscription** as the account on an assistant's Language model tab (Assistants › the assistant). The accounts themselves are set up once, under Shared settings › Language model accounts (the Anthropic key there; for the Claude subscription, see below).
 
-**Claude subscription** (`claude-subscription`): the language model is Claude Code with the login of the `claude` program on this machine, so replies count against your Claude plan's limits instead of an API bill ([`@pva/agent-claude-code`](packages/agent-claude-code/README.md)). Anthropic's terms for using a subscription from other software are unclear, so the *Claude subscription* module is off by default and has its own opt-in switch. Choose it under Language model, then under Modules switch on *Claude subscription* (and, in its settings, *Use my Claude subscription*); it takes effect from the next turn, no reload. While the module is off, starting or failed, the offline stand-in answers and first says so ("Claude subscription is off — switch it on under Modules."). Claude Code gets only a short allowlist of environment variables (`PATH`, `HOME`, locale, proxy and CA settings, `CLAUDE_CONFIG_DIR`, …), never other providers' keys or the vault password.
+**Claude subscription** (`claude-subscription`): the language model is Claude Code with the login of the `claude` program on this machine, so replies count against your Claude plan's limits instead of an API bill ([`@pva/agent-claude-code`](packages/agent-claude-code/README.md)). Anthropic's terms for using a subscription from other software are unclear, so the *Claude subscription* module is off by default and has its own opt-in switch. Under Shared settings › Language model accounts, switch on *Use my Claude subscription* in the *Claude subscription* block and save, then switch the module on there (it refuses to start without the opt-in); then choose *Claude subscription* as the account on an assistant's Language model tab. It takes effect from the next turn, no reload. While the module is off, starting or failed, the offline stand-in answers and first says so ("Claude subscription is off — switch it on in Settings, Language model."). Claude Code gets only a short allowlist of environment variables (`PATH`, `HOME`, locale, proxy and CA settings, `CLAUDE_CONFIG_DIR`, …), never other providers' keys or the vault password.
 
-If a required setting or a model file is missing, a command-line mode lists every problem, with the stage it belongs to and how to fix it, and exits (serve mode shows the same problems in Settings › Overview and keeps running):
+If a required setting or a model file is missing, a command-line mode lists every problem, with the stage it belongs to and how to fix it, and exits (serve mode shows the same problems in the admin Overview and keeps running):
 
 ```
 Cannot start (settings go in the environment or in .env; see .env.example):
-  voice (ASSISTANT_VOICE): Model file for TTS preset "en_US-lessac-medium" is missing: /…/models/vits-piper-en_US-lessac-medium/en_US-lessac-medium.onnx. Download it in Settings → Voices → Models, or run: pnpm --filter @pva/tts-sherpa download en_US-lessac-medium
+  voice (ASSISTANT_VOICE): Model file for TTS preset "en_US-lessac-medium" is missing: /…/models/vits-piper-en_US-lessac-medium/en_US-lessac-medium.onnx. Download it from an assistant's Voice tab, or run: pnpm --filter @pva/tts-sherpa download en_US-lessac-medium
   speech-to-text (STT_PROVIDER): DEEPGRAM_API_KEY is not set
 ```
 
 ### Speech recognition models
 
-The local recogniser is chosen under Settings → Speech recognition → **Engine** (`STT_SHERPA_MODEL`; the choice
+The local recogniser is chosen on an assistant's **Hearing** tab (`STT_SHERPA_MODEL` in the command-line modes; the choice
 reloads the engines, and if the reload fails the running one keeps running). A model that is not downloaded yet
 shows **Download** with its size right there, and Save waits until it is there. The same section sets the language, the two end-of-turn pauses, the speech
 detection threshold and the gain control, each with an explanation of what it trades.
@@ -124,7 +129,7 @@ detection threshold and the gain control, each with an explanation of what it tr
 | `nemotron-320` | The previous default (`nemotron-3.5`) | The least accurate of the large models |
 | `zipformer-en`, `fast-conformer-en` | Small machines, English | Not recommended: the worst on real-world audio |
 
-**Downloads from the UI**: Speech recognition › Models and Voices › Models list every preset with its size and state
+**Downloads from the UI**: Shared settings › Speech recognition models and an assistant's Voice tab list every preset with its size and state
 (installed, downloading x %, not downloaded) and offer Download, Cancel and Delete (a model the running engines use
 cannot be deleted). Only a page with edit access can start one; every page sees the progress. A download checks the
 free disk space first (download plus unpacked size), fetches into a `.part` file (60 s without data fails it),
@@ -181,7 +186,7 @@ pnpm dev       # development: the assistant on :8787 and the UI with hot reload 
 
 One process on one port serves the UI and a WebSocket at `/ws`. The browser becomes the assistant's microphone and speaker: press **Start** on the page. Any number of tabs (at most 8) can be open; one owns the audio and the others see the conversation and play nothing ("Use this tab" moves the audio). Without a built UI the page says how to build it; the assistant runs anyway.
 
-The settings screen switches modules on and off and edits their settings while the assistant runs (a change applies from the next turn; a tool call in progress finishes), and edits the assistant settings (system prompt, voices, turn detection, language model, speech engines). Saved values go to `data/settings.json`; secrets such as API keys go to the key vault (below; before you set a password, to `data/secrets.json` at mode 0600 as before). The browser can set or remove a secret but never read it. `PVA_DATA_DIR` moves the data directory. Environment variables and `.env` win over saved values and lock the field in the UI (with **Move to settings** for a `.env` line; see [Configuration](#configuration)). Settings marked *reload* take effect after **Reload engines**, which rebuilds the speech and language engines in about 2 s and keeps the conversation.
+The admin page (`/admin/`) has **Assistants** (one page per assistant: Basics, Behaviour, Language model, Hearing, Voice, Modules, Used on; and a seven-step wizard for a new one), **Devices** (who answers where, wake phrases, interrupting, audio, captions, a phrase tester), **Shared settings** (Home, modules, language model accounts, speech recognition models, voice providers, routing, limits), Keys & vault, Diagnostics (Latency, with the assistant, device and route of each turn) and About. A module runs while an assistant has it on; a change applies from the next turn and a tool call in progress finishes. Saved values go to `data/settings.json`; secrets such as API keys go to the key vault (below; before you set a password, to `data/secrets.json` at mode 0600 as before). The browser can set or remove a secret but never read it. `PVA_DATA_DIR` moves the data directory. Environment variables and `.env` win over saved values and lock the field in the UI (with **Move to settings** for a `.env` line; see [Configuration](#configuration)). Settings marked *reload* take effect after **Reload engines**, which rebuilds the speech and language engines in about 2 s and keeps the conversation.
 
 Settings: `SERVE_HOST` (default `127.0.0.1`), `SERVE_PORT` (8787), `SERVE_ALLOWED_ORIGINS` (other page origins allowed to open the socket; default the Next dev server on port 3000), `SERVE_ALLOWED_HOSTS` (host names the server answers to besides IP addresses, `localhost` and the origins' hosts; any other name gets HTTP 403, against DNS rebinding), `SERVE_TLS_CERT` + `SERVE_TLS_KEY` (PEM files; with both, the server speaks HTTPS/WSS on the same port), `SERVE_CROSS_ORIGIN_ISOLATION` (default `true`: COOP/COEP/CORP headers make the page cross-origin isolated, so it reads how much of a reply played straight from the player), `PVA_WEB_DIR` (default `apps/web/out`), `PVA_DATA_DIR` (default `data/`), `PVA_VAULT_PATH`, `PVA_VAULT_PASSWORD` (below). Ctrl+C closes the sockets, the engine processes and the modules.
 
@@ -486,7 +491,7 @@ Each pipeline stage is a service interface in `packages/core` (`Llm`, `Stt`, `Tt
 
 ## Voices
 
-The assistant speaks every reply with **one voice**: `ASSISTANT_VOICE`, a voice of one of the **voice providers**, written `provider:voice`. The providers are `sherpa` (on this machine: Piper and Kokoro), `cartesia` and `elevenlabs` (hosted, each needs its key). The model does not choose voices. Design: [docs/VOICE-PROVIDERS.md](docs/VOICE-PROVIDERS.md).
+Each assistant speaks every reply with **one voice** (Assistants › the assistant › Voice; `ASSISTANT_VOICE` is the voice of the command-line modes and of a migrated install), a voice of one of the **voice providers**, written `provider:voice`. The providers are `sherpa` (on this machine: Piper and Kokoro), `cartesia` and `elevenlabs` (hosted, each needs its key). The model does not choose voices. Design: [docs/VOICE-PROVIDERS.md](docs/VOICE-PROVIDERS.md).
 
 | Voice | Provider | First audio (this machine, measured 2026-11-14) |
 |---|---|---|
@@ -496,7 +501,7 @@ The assistant speaks every reply with **one voice**: `ASSISTANT_VOICE`, a voice 
 | `cartesia:<voice id>` | Cartesia, hosted (`CARTESIA_API_KEY`) | not measured |
 | `elevenlabs:<voice id>` | ElevenLabs, hosted (`ELEVENLABS_API_KEY`) | not measured |
 
-In the web UI, Settings → Voices lists every provider's voices (search, preview, favourites, download of local voices); Settings → Voices → Voice providers takes the keys. From `.env`:
+In the web UI, an assistant's Voice tab lists every provider's voices (search, preview, favourites, download of local voices); Shared settings › Voice providers takes the keys. From `.env` (the command-line modes and a migrated install):
 
 ```sh
 ASSISTANT_VOICE=sherpa:kokoro-af_heart          # after: pnpm --filter @pva/tts-sherpa download kokoro-af_heart
@@ -588,7 +593,7 @@ PVA_PIPEWIRE_LIVE=1 pnpm --filter @pva/audio-pipewire test
 ## Repository layout
 
 ```
-packages/core             service interfaces, Conversation, tool registry, clause chunker, TurnTrace, voice references, test fakes
+packages/core             service interfaces, Conversation, tool registry, clause chunker, TurnTrace, voice references, route gate, module host, test fakes
 packages/llm-anthropic    Llm via @anthropic-ai/sdk
 packages/stt-sherpa       Stt on this machine: sherpa-onnx (whole-turn Parakeet/Whisper, streaming Nemotron, hybrid) + Silero VAD + gain control in a worker thread, turn detection (default)
 packages/tts-sherpa       Tts on this machine: Piper / Kokoro via sherpa-onnx, one child process per engine (default)
@@ -598,10 +603,13 @@ packages/tts-elevenlabs   Tts via the ElevenLabs multi-context WebSocket (hosted
 packages/audio-pipewire   microphone/speaker via pw-record / pw-cat
 packages/audio-file       WAV in / WAV out (tests, benchmarks)
 packages/audio-web        the browser as microphone and speaker (serve mode), over an abstract link
-packages/protocol         the browser ↔ assistant protocol: message schemas, binary frames, examples
+packages/protocol         the browser ↔ assistant protocol (version 7): message schemas, binary frames, examples; assistants, device types, devices and their settings
 packages/agent-claude-code the claude-subscription agent (Claude Code with the owner's login), off by default with an opt-in
 models/                   downloaded models (git-ignored; pnpm download-models)
 packages/modules-builtin  clock, weather
-apps/assistant            providers.ts, voiceSelection.ts, modules.ts, modes: text, voice, serve, bench, say, transcribe
+packages/module-home-assistant  lights through Home Assistant
+packages/llm-openai-compatible  OpenRouter and home model servers (OpenAI-compatible API)
+packages/decide-typesafe  TypeSafe client (routing a sentence to an assistant; the intent decider)
+apps/assistant            providers.ts, voiceSelection.ts, modules.ts, serve/ (assistants, devices, resource pool, session dispatcher), modes: text, voice, serve, bench, say, transcribe
 apps/web                  the web UI (Next.js static export), served by serve mode
 ```

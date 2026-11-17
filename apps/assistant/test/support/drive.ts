@@ -90,7 +90,9 @@ if (!welcome.snapshot.engine.ready) await client.waitFor("engine.summary", (m) =
 if (mode !== undefined) {
   // The device record is saved right after hello; retry while it is not there yet.
   for (let attempt = 0; attempt < 20; attempt++) {
-    admin.send({ type: "device.admin.update", requestId: `mode${attempt}`, id: client.device.id, patch: { interruptMode: mode } })
+    const known = admin.messages.filter((m) => m.type === "devices").at(-1)
+    const rev = known?.type === "devices" ? known.devices.find((d) => d.id === client.device.id)?.rev ?? 0 : 0
+    admin.send({ type: "device.save", requestId: `mode${attempt}`, target: { kind: "device", id: client.device.id }, rev, settings: { interruptMode: mode } })
     const r = await admin.waitFor("result", (m) => m.requestId === `mode${attempt}`, { from: 0 })
     if (r.ok || r.error?.code !== "unknown_device") {
       console.log(`${at()}  >>> mode ${mode}: ${JSON.stringify(r)}`)

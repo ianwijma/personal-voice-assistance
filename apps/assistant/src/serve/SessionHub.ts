@@ -5,11 +5,8 @@ import {
   type AdminState,
   type ClientMessage,
   CloseCode,
-  type ConversationInfo,
-  DEVICE_EDITABLE_FIELDS,
   type DeviceHello,
-  type DeviceProfile,
-  type DeviceProfileInfo,
+  deviceTypeOf,
   engineSummary,
   decodeClientMessage,
   decodeMicFrame,
@@ -31,7 +28,7 @@ import type { AdminSessions, SessionEndReason } from "./AdminSessions.ts"
 import type { AssistantResult, Assistants } from "./assistants.ts"
 import type { Engine } from "./Engine.ts"
 import type { EnvMover } from "./envSettings.ts"
-import { type FrontendResult, type Frontends, kindOf } from "./frontends.ts"
+import type { DeviceRegistry, DeviceResult } from "./devices.ts"
 import type { Jobs } from "./jobs.ts"
 import type { Models } from "./models.ts"
 import type { Keys } from "./Keys.ts"
@@ -54,8 +51,8 @@ import type { VoiceSessions } from "./VoiceSessions.ts"
  * - **Role-shaped data**: `welcome` carries the voice part of the state only. Admin data (`admin.snapshot`, and the
  *   messages in `ADMIN_ONLY`) goes to admin connections only, `admin.snapshot` right after a successful login or a
  *   valid hello token; it stops at logout or when the session ends.
- * - **Devices**: a voice `hello` with `device` registers it (`Frontends.seen`); each voice connection is sent its
- *   effective profile (`snapshot.device`, then `device.profile` whenever it changes).
+ * - **Devices**: a voice `hello` with `device` registers it (`DeviceRegistry.seen`); each voice connection is sent its
+ *   device's setup (`snapshot.setup`, then `device.setup` whenever it changes; protocol 7).
  *
  * Protocol 6 (docs/VOICE-SESSIONS.md): every voice device has its own **voice session** (`VoiceSessions`), keyed by
  * `hello.device.id` (else the connection's `clientId`), created at the device's first `audio.claim` or `text.send`.
@@ -93,8 +90,6 @@ export interface SessionHub {
   readonly sessionsChanged: (minor: boolean) => void
   /** A voice session was discarded: forget its ownership. */
   readonly sessionDiscarded: (key: string) => void
-  /** The effective profile of a session's device. */
-  readonly profileOf: (key: string) => DeviceProfile
   readonly closeAll: (code: number, reason: string) => void
   readonly size: () => number
   /** Microphone frames lost between a session's owner tab and the server (sequence gaps), since the session started. */
@@ -102,10 +97,10 @@ export interface SessionHub {
   /** The vault changed: send every admin connection its view (`vault`). */
   readonly vaultChanged: () => void
   /**
-   * Profiles may have changed (kind defaults, a device, the enabled voices): send `device.profile` to every
-   * connection whose effective profile changed, and tell serve mode about the owner's.
+   * Devices, assistants or what they depend on may have changed (a save, the routing section, the keys): every
+   * session applies its route configuration, and every voice connection whose setup changed gets `device.setup`.
    */
-  readonly refreshProfiles: () => void
+  readonly refreshDevices: () => void
   /**
    * One final transcript of a session, for admin connections with the phrase tester on that follow it (`wake.heard`;
    * `wake.test.deviceId`, else the most recently active session): the phrase it matched, and whether its wake gate
@@ -136,8 +131,8 @@ export interface HubOptions {
   readonly access: AccessPolicy
   /** `PVA_ADMIN_PASSWORD` and the admin sessions. */
   readonly admin: AdminSessions
-  /** Front-end kinds, devices and profiles (protocol 5 messages). */
-  readonly frontends: Frontends
+  /** The remembered devices. */
+  readonly devices: DeviceRegistry
   /** Assistants, device types and devices of protocol 7 (docs/ASSISTANTS.md §5). */
   readonly assistants: Assistants
   /** Settings from outside the UI and "Move to settings". Absent: no `env` in the snapshot, moves refused. */
@@ -167,7 +162,6 @@ export const ADMIN_ONLY: ReadonlySet<ServerMessageType> = new Set<ServerMessageT
   "job",
   "models",
   "admin.snapshot",
-  "frontends",
   "devices",
   "assistants",
   "device.types",
@@ -197,8 +191,6 @@ interface Client {
   link: AudioClientLink | undefined
   /** The admin session token of this connection (it is admin while the session is valid). */
   adminToken: string | undefined
-  /** The `device.profile` last sent (JSON), to send only changes. */
-  lastProfile: string | undefined
   /** The `device.setup` last sent (JSON; voice connections), to send only changes. */
   lastSetup: string | undefined
   /** The phrase tester is on until then (epoch ms; 0 = off). */
@@ -224,7 +216,8 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
   const clients = new Set<Client>()
   const helloTimeoutMs = options.helloTimeoutMs ?? 5_000
   const maxConnections = options.maxConnections ?? 24
-  const { keys, access, admin, frontends, assistants } = options
+  const { keys, access, admin, assistants } = options
+  const registry = options.devices
   const observerLimit = options.observerBufferLimit ?? 1_048_576
   const ownerLimit = options.ownerBufferLimit ?? 8_388_608
   const devicesThrottleMs = options.devicesThrottleMs ?? 1_000
@@ -253,8 +246,6 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
     const wp = setup.withoutPhrase
     return wp.mode === "assistant" ? wp.assistant : wp.mode === "typesafe" && wp.fallback !== null ? wp.fallback : setup.assistants[0]?.id
   }
-  /** The conversation an admin connection's snapshot names (admin has no session). */
-  const adminConversation: ConversationInfo = { id: globalThis.crypto.randomUUID(), startedAt: Date.now() }
   const maxPendingPerConnection = options.maxPendingPerConnection ?? 4
   const maxPendingTotal = options.maxPendingTotal ?? 16
   let pendingTotal = 0
@@ -342,7 +333,7 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
       if (!r.ok) sendVault(client)
     }))
 
-  const result = (client: Client, requestId: RequestId, outcome: HostResult | FrontendResult | AssistantResult) =>
+  const result = (client: Client, requestId: RequestId, outcome: HostResult | DeviceResult | AssistantResult) =>
     send(
       client,
       outcome.ok
@@ -365,8 +356,8 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
   const limited = (
     client: Client,
     requestId: RequestId,
-    work: Effect.Effect<HostResult | FrontendResult | AssistantResult, never>,
-    after?: (r: HostResult | FrontendResult | AssistantResult) => void
+    work: Effect.Effect<HostResult | DeviceResult | AssistantResult, never>,
+    after?: (r: HostResult | DeviceResult | AssistantResult) => void
   ) => {
     if (client.pending >= maxPendingPerConnection || pendingTotal >= maxPendingTotal) {
       return result(client, requestId, failure("busy", "Too many changes at once; try again in a moment"))
@@ -389,14 +380,7 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
     ))
   }
 
-  // ---- Devices and profiles
-
-  const profileOf = (client: Client): DeviceProfile => frontends.profile(client.device?.id, client.device?.kind)
-  const profileInfo = (client: Client): DeviceProfileInfo => ({
-    ...(client.device !== undefined ? { deviceId: client.device.id } : {}),
-    profile: profileOf(client),
-    editable: client.device !== undefined ? [...DEVICE_EDITABLE_FIELDS] : []
-  })
+  // ---- Devices
 
   const live = (id: string) => {
     let connections = 0
@@ -418,7 +402,7 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
     if (devicesTimer !== undefined) clearTimeout(devicesTimer)
     devicesTimer = undefined
     devicesSentAt = performance.now()
-    broadcast({ type: "devices", devices: [...assistants.devices(frontends.devices(live))] })
+    broadcast({ type: "devices", devices: [...assistants.devices(registry.devices(live))] })
   }
   /** `minor`: only last seen, connections or the audio owner changed (throttled). */
   const devicesChanged = (minor: boolean) => {
@@ -450,22 +434,7 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
     sessionsTimer.unref?.()
   }
 
-  /** The effective profile of a session's device (a session without a device: the kind defaults). */
-  const profileOfKey = (key: string): DeviceProfile => {
-    // A key that is no device id (a connection without a device) has no record: the kind defaults.
-    const client = [...clients].find((c) => c.sessionKey === key && c.device !== undefined)
-    return frontends.profile(key, client?.device?.kind)
-  }
-
-  const refreshProfiles = () => {
-    for (const client of clients) {
-      if (!client.helloed || client.role !== "voice") continue
-      const info = profileInfo(client)
-      const text = JSON.stringify(info)
-      if (text === client.lastProfile) continue
-      client.lastProfile = text
-      send(client, { type: "device.profile", ...info })
-    }
+  const refreshDevices = () => {
     for (const session of sessions.all()) session.syncProfile()
     refreshSetups()
   }
@@ -494,28 +463,19 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
    * configuration without a reload (`refreshProfiles` → `syncProfile`), voice connections get their new setup, admin
    * connections the lists.
    */
-  const afterAssistantsChange = (r: HostResult | FrontendResult | AssistantResult) => {
+  const afterAssistantsChange = (r: HostResult | DeviceResult | AssistantResult) => {
     if (!r.ok) return
-    refreshProfiles()
+    refreshDevices()
     pushAssistants()
     devicesChanged(false)
     sessionsChanged(false)
   }
   /** Remember the device of this connection (background save), then push what changed. */
   const registerDevice = (device: DeviceHello) =>
-    options.run(Effect.andThen(frontends.seen(device, connectedDevices()), Effect.sync(() => {
-      refreshProfiles()
+    options.run(Effect.andThen(registry.seen(device, connectedDevices()), Effect.sync(() => {
+      refreshDevices()
       devicesChanged(false)
     })))
-
-  /** A profile-changing request finished: push the new profiles and lists. */
-  const afterProfileChange = (kinds: boolean) => (r: HostResult | FrontendResult) => {
-    if (!r.ok) return
-    refreshProfiles()
-    if (kinds) broadcast({ type: "frontends", frontends: [...frontends.kinds()] })
-    pushAssistants()
-    devicesChanged(false)
-  }
 
   // ---- Ownership
 
@@ -578,7 +538,7 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
     if (client.helloTimer !== undefined) clearTimeout(client.helloTimer)
     if (!clients.delete(client)) return
     if (client.device !== undefined) {
-      frontends.left(client.device.id)
+      registry.left(client.device.id)
       devicesChanged(true)
     }
     const key = client.sessionKey
@@ -596,10 +556,14 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
   /** Protocol 7: the device's setup and the conversations its session has (none before the session exists). */
   const voicePart = (client: Client, session: VoiceSession | undefined): Pick<Snapshot, "setup" | "conversations"> => {
     const setup = assistants.setupFor(client.device?.id, client.device?.kind)
+    const key = client.sessionKey
+    // Before the session exists, the snapshot lists the conversation reserved for the answering assistant (it keeps
+    // its id when the session opens, `VoiceSessions.open`).
+    const answering = answersWithoutSession(client)
     return {
       setup,
       conversations: session === undefined
-        ? []
+        ? answering === undefined || key === undefined ? [] : [{ assistantId: answering, ...sessions.conversation(key, answering, setup.assistants.map((a) => a.id)), turns: 0 }]
         : setup.assistants.map((a) => {
           const c = session.conversation.conversation(a.id)
           return { assistantId: a.id, id: c.id, startedAt: c.startedAt, turns: session.conversation.turnsOf(a.id) }
@@ -623,10 +587,8 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
       // Who has the turn now (an armed assistant too), apart from whose history this is.
       ...(session !== undefined ? { holder: session.holder() } : {}),
       history: session === undefined ? [] : historyItems(Effect.runSync(session.conversation.history())),
-      ...(client.role === "voice" ? { device: profileInfo(client) } : {}),
       admin: adminState(client, endReason),
-      conversation: key === undefined ? adminConversation : sessions.conversation(key, session === undefined ? answersWithoutSession(client) : undefined, assignedOn(client)),
-      ...(client.role === "voice" ? voicePart(client, session) : {})
+      ...(client.role === "voice" ? voicePart(client, session) : { conversations: [] })
     }
   }
 
@@ -639,8 +601,7 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
     ...(options.env !== undefined ? { env: options.env.info() } : {}),
     models: options.models?.list() ?? [],
     jobs: options.jobs?.list() ?? [],
-    frontends: [...frontends.kinds()],
-    devices: [...assistants.devices(frontends.devices(live))],
+    devices: [...assistants.devices(registry.devices(live))],
     sessions: [...sessions.list()],
     assistants: [...assistants.infos()],
     deviceTypes: [...assistants.deviceTypes()]
@@ -655,8 +616,8 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
     }
     client.clientId = message.clientId
     client.role = message.frontend
-    // A device of a kind this server does not know is treated like no device (kind defaults, nothing editable).
-    if (message.frontend === "voice" && message.device !== undefined && kindOf(message.device.kind) !== undefined) {
+    // A device of a kind this server does not know is treated like no device (the browser defaults).
+    if (message.frontend === "voice" && message.device !== undefined && deviceTypeOf(message.device.kind) !== undefined) {
       client.device = message.device
     }
     if (message.frontend === "voice") client.sessionKey = client.device?.id ?? message.clientId
@@ -677,7 +638,6 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
     const resumed = opened !== undefined && opened !== "full" ? opened : undefined
     if (resumed !== undefined) becomeOwner(client, resumed)
     const first = snapshot(client, tokenRefused ? "token" : undefined)
-    if (first.device !== undefined) client.lastProfile = JSON.stringify(first.device)
     if (first.setup !== undefined) client.lastSetup = JSON.stringify(first.setup)
     send(client, {
       type: "welcome",
@@ -834,27 +794,17 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
         if (client.adminToken !== undefined) admin.logout(client.adminToken)
         return result(client, message.requestId, { ok: true })
       }
-      case "device.update": {
-        if (client.role !== "voice" || client.device === undefined) {
-          return result(client, message.requestId, failure("bad_message", "This page did not say which device it is; reload it"))
-        }
-        return limited(client, message.requestId, frontends.updateOwn(client.device, message.patch, connectedDevices()), afterProfileChange(false))
-      }
-      case "frontend.update":
-        if (!allowed(client, message.requestId)) return
-        return limited(client, message.requestId, frontends.updateKind(message.kind, message.patch), afterProfileChange(true))
-      case "device.admin.update":
-        if (!allowed(client, message.requestId)) return
-        return limited(client, message.requestId, frontends.updateDevice(message.id, message.name, message.patch), afterProfileChange(false))
       case "device.forget": {
         if (!allowed(client, message.requestId)) return
         const id = message.id
-        return limited(client, message.requestId, frontends.forget(id), (r) => {
+        return limited(client, message.requestId, registry.forget(id), (r) => {
           if (!r.ok) return
-          // A device that is connected now is recorded again as new (kind defaults).
+          // A device that is connected now is recorded again as new (the type defaults).
           const again = [...clients].find((c) => c.device?.id === id && !c.closed)?.device
           if (again !== undefined) registerDevice(again)
-          afterProfileChange(false)(r)
+          refreshDevices()
+          pushAssistants()
+          devicesChanged(false)
         })
       }
       case "assistant.create":
@@ -884,7 +834,7 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
         return limited(
           client,
           message.requestId,
-          Effect.andThen(frontends.seen(device, connectedDevices()), assistants.pick(device.id, message.withoutPhrase)),
+          Effect.andThen(registry.seen(device, connectedDevices()), assistants.pick(device.id, message.withoutPhrase)),
           picked
         )
       }
@@ -915,7 +865,7 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
       case "wake.test": {
         if (!allowed(client, message.requestId)) return
         const deviceId = message.deviceId
-        if (message.on && deviceId !== undefined && !frontends.known(deviceId) && sessions.get(deviceId) === undefined) {
+        if (message.on && deviceId !== undefined && !registry.known(deviceId) && sessions.get(deviceId) === undefined) {
           return result(client, message.requestId, failure("unknown_device", "That device is not known (it may have been forgotten)"))
         }
         client.wakeTestUntil = message.on ? Date.now() + WAKE_TEST_MAX_MS : 0
@@ -1016,7 +966,6 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
         pending: 0,
         link: undefined,
         adminToken: undefined,
-        lastProfile: undefined,
         lastSetup: undefined,
         wakeTestUntil: 0,
         wakeTestDevice: undefined
@@ -1082,7 +1031,6 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
       owners.delete(key)
       devicesChanged(true)
     },
-    profileOf: profileOfKey,
     closeAll: (code, reason) => {
       if (devicesTimer !== undefined) clearTimeout(devicesTimer)
       if (sessionsTimer !== undefined) clearTimeout(sessionsTimer)
@@ -1093,7 +1041,7 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
     vaultChanged: () => {
       for (const client of clients) sendVault(client)
     },
-    refreshProfiles,
+    refreshDevices,
     wakeHeard: (key, text, phrase, accepted, source) => {
       const at = Date.now()
       const message = encodeServerMessage({ type: "wake.heard", text, ...(phrase !== undefined ? { matched: phrase } : {}), accepted, source, at })

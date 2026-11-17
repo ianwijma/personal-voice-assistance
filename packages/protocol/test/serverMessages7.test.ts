@@ -100,8 +100,12 @@ describe("DeviceListInfo", () => {
   it("is the protocol 5 entry plus own, settings, hearer and rev: every one of the four is required", () => {
     expect(accepts(DeviceListInfo, exampleDevice)).toBe(true)
     for (const key of ["own", "settings", "hearer", "rev"] as const) expect(accepts(DeviceListInfo, without(key)), key).toBe(false)
-    // and the protocol 5 fields are still required
-    for (const key of ["overrides", "profile", "connections", "audioOwner"] as const) expect(accepts(DeviceListInfo, without(key)), key).toBe(false)
+    // the protocol 5 fields that stayed are still required; the profile fields (overrides, profile) are gone
+    for (const key of ["connections", "audioOwner"] as const) expect(accepts(DeviceListInfo, without(key)), key).toBe(false)
+    expect(Object.keys(DeviceListInfo.fields)).not.toContain("overrides")
+    expect(Object.keys(DeviceListInfo.fields)).not.toContain("profile")
+    expect(exampleDevice).not.toHaveProperty("overrides")
+    expect(exampleDevice).not.toHaveProperty("profile")
   })
   it("hearer is an assistant id or null (no assistant: no recogniser)", () => {
     expect(accepts(DeviceListInfo, { ...exampleDevice, hearer: null })).toBe(true)
@@ -168,9 +172,12 @@ describe("the new messages through the codec", () => {
     expect(decodeServerMessage(JSON.stringify({ ...assistantsServerExamples["device.setup"], type: "device.types" }))).toMatchObject({ _tag: "Invalid", messageType: "device.types" })
     expect(decodeServerMessage(JSON.stringify({ type: "assistants", assistants: assistantsServerExamples["device.types"].types }))).toMatchObject({ _tag: "Invalid", messageType: "assistants" })
   })
-  it("the protocol 5 front-end messages are still in the unions next to the new ones", () => {
-    expect(decodeClientMessage(JSON.stringify(clientExamples["device.update"]))).toMatchObject({ _tag: "Ok" })
-    expect(decodeServerMessage(JSON.stringify(serverExamples.frontends))).toMatchObject({ _tag: "Ok" })
+  it("the protocol 5 front-end messages that stayed are in the unions next to the new ones; the replaced ones are Unknown", () => {
+    expect(decodeClientMessage(JSON.stringify(clientExamples["device.forget"]))).toMatchObject({ _tag: "Ok" })
+    expect(decodeClientMessage(JSON.stringify(clientExamples["wake.test"]))).toMatchObject({ _tag: "Ok" })
+    expect(decodeServerMessage(JSON.stringify(serverExamples.devices))).toMatchObject({ _tag: "Ok" })
+    expect(decodeClientMessage(JSON.stringify({ type: "device.update", requestId: "r", patch: {} }))).toEqual({ _tag: "Unknown", messageType: "device.update" })
+    expect(decodeServerMessage(JSON.stringify({ type: "frontends", frontends: [] }))).toEqual({ _tag: "Unknown", messageType: "frontends" })
   })
 })
 

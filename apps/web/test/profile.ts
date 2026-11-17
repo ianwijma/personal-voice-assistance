@@ -1,9 +1,24 @@
-import { DEFAULT_DEVICE_PROFILE, DEVICE_EDITABLE_FIELDS, type DeviceProfile, type ServerMessageOf } from "@pva/protocol"
+import { DEFAULT_DEVICE_PROFILE, type DeviceProfile, type ServerMessageOf } from "@pva/protocol"
+import { exampleDeviceSetup } from "@pva/protocol/examples"
 
-/** A `device.profile` message: the built-in defaults with `patch` on top (what the server sends a voice page). */
-export const profileMessage = (patch: Partial<DeviceProfile> = {}, deviceId = "d-test-device-1"): ServerMessageOf<"device.profile"> => ({
-  type: "device.profile",
-  deviceId,
-  profile: { ...DEFAULT_DEVICE_PROFILE, ...patch },
-  editable: [...DEVICE_EDITABLE_FIELDS]
-})
+/**
+ * A `device.setup` message whose audio, caption and interrupt fields are the built-in profile with `patch` on top
+ * (what the server sends a voice page when its device's settings change).
+ */
+export const setupMessage = (patch: Partial<DeviceProfile> = {}): ServerMessageOf<"device.setup"> => {
+  const p: DeviceProfile = { ...DEFAULT_DEVICE_PROFILE, ...patch }
+  return {
+    type: "device.setup",
+    ...exampleDeviceSetup,
+    interruptMode: p.interruptMode,
+    audio: {
+      echoCancellation: p.echoCancellation,
+      noiseSuppression: p.noiseSuppression,
+      autoGainControl: p.autoGainControl,
+      speakAloud: true,
+      outputPath: p.outputPath,
+      prebufferMs: p.prebufferMs
+    },
+    captions: { captions: p.captions, speakTyped: p.speakReplies }
+  }
+}

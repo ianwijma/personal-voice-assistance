@@ -102,7 +102,7 @@ export const ErrorCode = Schema.Literals([
    * Every settings, module, vault, job, model, `.env`, front-end and device-admin request, and `wake.test`.
    */
   "admin_required",
-  /** Protocol 5: no such device (`device.admin.update`, `device.forget`) or front-end kind (`frontend.update`). */
+  /** Protocol 5: no such device or device type (`device.save`, `device.forget`). */
   "unknown_device",
   /**
    * Protocol 6: an `audio.claim` or `text.send` would start one more voice session than `MAX_VOICE_SESSIONS` allows

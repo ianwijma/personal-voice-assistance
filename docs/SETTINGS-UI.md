@@ -1,5 +1,19 @@
 # Settings UI: everything configurable from the browser
 
+> **Changed 2026-11-16 (docs/ASSISTANTS.md §7.1, protocol 7).** The screen is still two levels (a category list, then
+> pages), but the categories are now **Overview**, **Assistants** (one entry per assistant, plus All assistants and the
+> new-assistant wizard), **Devices** (by device type, defaults first), **Shared settings** (Home, Modules, Language model
+> accounts, Routing, Speech recognition models, Voice providers, Limits), **Keys & vault**, **Diagnostics** and **About**.
+> The Language model, Speech recognition and Voices categories and the module on/off switches are gone: what they set is
+> per assistant (language model account and model, hearing, voice, the modules an assistant has on), and the accounts,
+> models and provider keys moved to Shared settings. The flat keys that became per-assistant (`LLM_PROVIDER`,
+> `ANTHROPIC_MODEL`, `STT_SHERPA_MODEL`, `ASSISTANT_VOICE`, …) are no longer read by serve mode (the command-line modes still
+> read them, and a data directory from before assistants is migrated into one assistant); the admin does not show them, and a
+> value set in the environment locks the field of the migrated assistant (**Move to settings** writes it into the
+> assistant). Everything below that says "Language model", "Speech recognition" or "Voices" category, or a module switch,
+> is the design as built for protocol 5 and 6; the shell, page, validation, apply and reload, protected and locked states, search
+> and the env view still work as described.
+
 Design for a multi-level settings screen that replaces `.env` as the way to configure the assistant, written 2026-11-14
 against commit `8cfaf14` (branch `t3/cloud-subscription-agent`). Read-only investigation; nothing in the repository was
 changed. Builds on `docs/UI-AND-MODULES.md` §1.7/§3.7 and `docs/AGENTS-AND-INTENTS.md` §4 (its audit and screen plan are

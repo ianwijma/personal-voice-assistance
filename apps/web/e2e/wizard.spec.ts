@@ -43,7 +43,11 @@ test("a blank assistant through the seven steps: Start, model, hearing, voice, m
   // Going back from Check keeps what was typed.
   await page.getByRole("button", { name: "Edit Start" }).click()
   await expect(page.getByLabel("Name", { exact: true })).toHaveValue("Mia")
-  await page.evaluate(() => { location.hash = "#settings/assistants/new/7" })
+  // Forward to Check again with Next. (Setting the fragment from the page right after the app's own pushState, as this
+  // test did, is lost about one run in twenty: Chromium reverts it to the pushed entry while that entry is still being
+  // committed. Nothing in the app is involved, so the test goes the way a person does.)
+  for (let step = 1; step < 7; step++) await next(page)
+  await expect(page.getByTestId("step-count")).toHaveText("Step 7 of 7")
   await expect(created()).resolves.toHaveLength(0) // nothing is sent before Create
   await page.getByTestId("wizard-create").click()
   await expect(page.getByTestId("assistant-page")).toHaveAttribute("data-assistant", "mia")

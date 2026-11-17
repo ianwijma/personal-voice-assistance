@@ -101,11 +101,11 @@ test("a spoken turn: listening → hearing → thinking → speaking → listeni
   await expect(latency.locator("tbody tr")).toHaveCount(1)
   await expect(latency.locator("tbody tr").first()).toContainText("completed")
 
-  // Echo cancellation is part of the device profile: switched off in admin (Front ends), the open voice page
+  // Echo cancellation is a device setting: switched off in admin (Devices › Every browser), the open voice page
   // re-opens its microphone with it off, as the browser then reports.
-  await admin.getByTestId("nav-frontends").click()
-  const kind = admin.getByTestId("profile-frontend-web-voice")
-  await kind.getByRole("switch", { name: "Echo cancellation" }).click()
+  await admin.evaluate(() => { location.hash = "#settings/devices/type-web-voice" })
+  await admin.getByTestId("group-audio").locator("summary").click()
+  await admin.getByRole("switch", { name: "Echo cancellation" }).click()
   await admin.getByTestId("page-footer").getByRole("button", { name: "Save", exact: true }).click()
   await expect(admin.getByTestId("footer-note")).toContainText("Saved")
   await expect.poll(() => page.evaluate(() => (window as unknown as { __gum: Array<{ asked: unknown; got: unknown }> }).__gum.at(-1)), { timeout: 10_000 })

@@ -493,7 +493,7 @@ describe("device.save", () => {
 describe("what a voice connection receives", () => {
   const ALLOWED: ReadonlySet<ServerMessageType> = new Set<ServerMessageType>([
     "welcome", "session", "state", "transcript", "turn.start", "assistant.text", "assistant.playing", "tool.start", "tool.end",
-    "turn.end", "reply.start", "reply.end", "reply.stop", "result", "error", "engine.summary", "admin.state", "device.profile",
+    "turn.end", "reply.start", "reply.end", "reply.stop", "result", "error", "engine.summary", "admin.state",
     "wake", "pong", "device.setup", "conversation", "conversation.history"
   ])
 
@@ -762,7 +762,7 @@ describe("changes that must hold together", () => {
     const bravo = await read("bravo")
     expect(bravo).not.toBe(alpha)
     // The device's own id (the welcome's) is the answering assistant's.
-    expect(welcome.snapshot.conversation.id).toBe(alpha)
+    expect(welcome.snapshot.conversations.find((c) => c.assistantId === "alpha")?.id).toBe(alpha)
     expect(await request(page, { type: "device.pick", withoutPhrase: "bravo" })).toMatchObject({ ok: true })
     await page.waitFor("device.setup", (m) => m.withoutPhrase.mode === "assistant" && m.withoutPhrase.assistant === "bravo", { from: 0 })
     expect(await read("bravo")).toBe(bravo)
@@ -869,7 +869,7 @@ describe("changes that must hold together", () => {
       return (await page.waitFor("conversation.history", (m) => m.requestId === requestId, { from })).id
     }
     const bravo = await read("bravo")
-    expect(welcome.snapshot.conversation.id).toBe(bravo)
+    expect(welcome.snapshot.conversations.find((c) => c.assistantId === "bravo")?.id).toBe(bravo)
     expect(await read("alpha")).not.toBe(bravo)
     await typed(page, "hello to bravo", "bravo")
     expect(await read("bravo")).toBe(bravo)

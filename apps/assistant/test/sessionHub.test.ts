@@ -1,5 +1,5 @@
 // SessionHub request limits: requests that do work (settings, modules, reload) are bounded per connection and overall.
-import { DEFAULT_DEVICE_PROFILE, encodeClientMessage, PROTOCOL_VERSION, type ServerMessage } from "@pva/protocol"
+import { encodeClientMessage, PROTOCOL_VERSION, type ServerMessage } from "@pva/protocol"
 import { Deferred, Effect } from "effect"
 import { describe, expect, it } from "vitest"
 import { makeAccessPolicy } from "../src/serve/access.ts"
@@ -19,9 +19,7 @@ const noVault = () => ({
     deviceTypes: () => [],
     devices: () => []
   } as never,
-  frontends: {
-    profile: () => DEFAULT_DEVICE_PROFILE,
-    kinds: () => [],
+  devices: {
     devices: () => [],
     seen: () => Effect.void,
     left: () => {}

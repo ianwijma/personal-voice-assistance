@@ -1,7 +1,7 @@
 import { Schema } from "effect"
 import { AssistantId } from "./assistants.ts"
 import { AssistantInfo, DeviceListInfo, DeviceSetup, DeviceTypeInfo } from "./devices.ts"
-import { ConversationId, ConversationInfo, SessionInfo } from "./sessions.ts"
+import { ConversationId, SessionInfo } from "./sessions.ts"
 import {
   AssistantState,
   FieldKey,
@@ -20,7 +20,6 @@ import { EnvInfo } from "./env.ts"
 import { JobInfo, ModelSet } from "./jobs.ts"
 import { VaultInfo } from "./vault.ts"
 import { AdminState } from "./admin.ts"
-import { DeviceProfileInfo, FrontendKindInfo } from "./frontends.ts"
 
 /** A one-line status a running module publishes, e.g. "Connected · 143 entities". */
 export const StatusLine = Schema.Struct({
@@ -328,26 +327,19 @@ export const Snapshot = Schema.Struct({
   holder: Schema.optionalKey(Schema.NullOr(AssistantId)),
   /** The most recent history (at most 200 items), oldest first. */
   history: Schema.Array(HistoryItem),
-  /**
-   * This connection's effective device profile. Present on voice connections (from `hello.device`, or the
-   * `web-voice` kind defaults with nothing editable when `hello` had no device); absent on admin connections.
-   */
-  device: Schema.optionalKey(DeviceProfileInfo),
   /** Admin access as this connection sees it (also on voice connections: the voice front end links to admin). */
   admin: AdminState,
   /**
-   * Protocol 6: the conversation `history` belongs to (the device's session's; on an admin connection, or a device
-   * without a session yet, the one its next turn would start in).
+   * Protocol 7: one conversation per assistant on the device, in the device's list order (empty on an admin
+   * connection and before the device's session exists). `history` belongs to the answering assistant's.
    */
-  conversation: ConversationInfo,
-  /** Protocol 7: one conversation per assistant on the device (replaces `conversation`). */
-  conversations: Schema.optionalKey(Schema.Array(Schema.Struct({
+  conversations: Schema.Array(Schema.Struct({
     assistantId: AssistantId,
     id: ConversationId,
     startedAt: NonNegativeFinite,
     turns: NonNegativeInt
-  }))),
-  /** Protocol 7: the device's setup (replaces `device`). Voice connections only. */
+  })),
+  /** Protocol 7: the device's setup. Voice connections only. */
   setup: Schema.optionalKey(DeviceSetup)
 })
 export type Snapshot = typeof Snapshot.Type
@@ -372,8 +364,6 @@ export const AdminSnapshot = Schema.Struct({
   models: Schema.Array(ModelSet),
   /** Running jobs and the last finished ones, oldest first. */
   jobs: Schema.Array(JobInfo),
-  /** Every front-end kind with its defaults, in registry order. */
-  frontends: Schema.Array(FrontendKindInfo),
   /** Every remembered device, most recently seen first. */
   devices: Schema.Array(DeviceListInfo),
   /** Protocol 6: the voice sessions, most recently active first (`sessions`). */

@@ -172,9 +172,6 @@ export const modelAfterAccountChange = (account: LlmAccountId, model: string): s
   return (CLAUDE_MODELS as ReadonlyArray<string>).includes(model) ? "" : model
 }
 
-/** Whether the server has no builder for an account (none now: WP-13b added OpenRouter and the home model). */
-export const accountNotAvailableYet = (_account: LlmAccountId): boolean => false
-
 export type AccountState = { readonly tone: "ok" | "todo" | "muted"; readonly text: string; readonly setUp?: ReadonlyArray<string> }
 
 /**

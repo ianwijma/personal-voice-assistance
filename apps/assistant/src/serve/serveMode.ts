@@ -20,9 +20,7 @@ import {
   voiceKey
 } from "@pva/core"
 import {
-  applicableOwn,
   type Assistant,
-  DEFAULT_CONVERSATION_IDLE_MINUTES,
   DEFAULT_MAX_VOICE_SESSIONS,
   DEFAULT_SESSION_DISCARD_MINUTES,
   type DeviceSettings,
@@ -36,7 +34,6 @@ import {
   type VoiceInfo,
   type ServerMessage,
   type TraceConfig,
-  WEB_VOICE_DEVICE_TYPE,
   WEB_VOICE_KIND
 } from "@pva/protocol"
 import { Cause, Config, ConfigProvider, Effect, Exit, Fiber, FiberSet, Option, type Scope, Stream } from "effect"
@@ -96,20 +93,19 @@ import { ttsProviderInfo } from "../providers.ts"
 import { DEFAULT_ASSISTANT_VOICE, voiceEngineName, voiceLabel } from "../voiceSelection.ts"
 import { type EnvMover, makeEnvMover } from "./envSettings.ts"
 import { type HttpError, type HttpServer, startHttp, webDirExists } from "./http.ts"
-import { makeFrontends } from "./frontends.ts"
+import { deviceSettingsFrom, makeDeviceRegistry } from "./devices.ts"
 import { type Jobs, makeJobs } from "./jobs.ts"
 import { makeModels, type Models, type PresetDownloader, presetsInUse } from "./models.ts"
 import { type Keys, makeKeys } from "./Keys.ts"
 import { makeSections } from "./sections.ts"
 import { makeAssistants } from "./assistants.ts"
-import { deviceSettingsFrom } from "./devices.ts"
 import { makeSessionHub, type SessionHub } from "./SessionHub.ts"
 import { DataDirConfig, KEYS_LOCKED_MESSAGE, loadSettingsStore, type SettingsStore, SettingsStoreError } from "./SettingsStore.ts"
 import { makeApi } from "./api.ts"
 import { makeAssistantVoice } from "./AssistantVoice.ts"
 import { type Favourites, makeFavourites } from "./Favourites.ts"
 import { makeVoiceCatalog, type VoiceCatalog, type VoiceCatalogOptions } from "./VoiceCatalog.ts"
-import { type AssistantTraceConfig, type Hearing, makeVoiceSession, type VoiceSession } from "./VoiceSession.ts"
+import { type AssistantTraceConfig, type Hearing, makeVoiceSession } from "./VoiceSession.ts"
 import { makeVoiceSessions, type VoiceSessions } from "./VoiceSessions.ts"
 import { makeRoutingService, ROUTING_KEYS } from "./routing.ts"
 import { type KdfParams, openVault, type Vault, VaultPathConfig } from "./Vault.ts"
@@ -347,13 +343,6 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     // Late-bound: the hub needs the engine and the sessions, and their callbacks need the hub.
     let hub: SessionHub | undefined
     let lastSummary: string | undefined
-    /**
-     * The voice of the engine status (kept while a rebuild fails; empty before the first build). A device profile's
-     * `voice` other than it falls back to "" (the assistant's voice): per-device voices are retired
-     * (docs/VOICE-PROVIDERS.md §1).
-     */
-    const enabledVoices = (): ReadonlySet<string> =>
-      new Set((engine?.status().voices ?? []).filter((v) => v.enabled).map((v) => v.name))
     let engine: Engine | undefined
     let modelsRef: Models | undefined
     const broadcast = (message: ServerMessage) => hub?.broadcast(message)
@@ -1018,8 +1007,6 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
         if (summary !== lastSummary) {
           lastSummary = summary
           broadcast({ type: "engine.summary", engine: engineSummary(status) })
-          // The enabled voices may have changed: a profile's voice may fall back to "" (or come back).
-          hub?.refreshProfiles()
         }
         // Which models are in use follows the running engines.
         if (hub !== undefined) broadcast({ type: "models", models: modelsRef?.list() ?? [] })
@@ -1070,11 +1057,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       ...(options.adminNow !== undefined ? { now: options.adminNow } : {})
     })
     yield* Effect.addFinalizer(() => Effect.sync(() => admin.dispose()))
-    const frontends = makeFrontends({
-      store,
-      enabledVoices,
-      conversationIdleMinutes: () => Number(sections.value("CONVERSATION_IDLE_MINUTES") ?? DEFAULT_CONVERSATION_IDLE_MINUTES)
-    })
+    const devices = makeDeviceRegistry({ store })
 
     // TypeSafe routing (docs/ASSISTANTS.md §3.6): the shared `routing` section, read at each decision (live).
     const routing = makeRoutingService(() => ({
@@ -1091,7 +1074,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
         makeVoiceSession({
           key,
           ...(device !== undefined ? { deviceId: device.id } : {}),
-          name: () => (device === undefined ? "Voice page without a device" : frontends.nameOf(device.id) ?? device.name),
+          name: () => (device === undefined ? "Voice page without a device" : devices.nameOf(device.id) ?? device.name),
           engine: theEngine,
           deviceSettings: () => deviceSettingsOf(device?.id),
           hearing: hearingOf(device?.id),
@@ -1154,7 +1137,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     })
     hub = makeSessionHub({
       admin,
-      frontends,
+      devices,
       assistants,
       env: envMover,
       models,
@@ -1169,12 +1152,10 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       access,
       onSectionSaved: (sectionId, needsReload, path) => {
         if (needsReload) theEngine.setReloadPending(true, path)
-        // CONVERSATION_IDLE_MINUTES is the built-in default of every profile's conversationIdleMinutes.
-        if (sectionId === "llm-behaviour") hubNow.refreshProfiles()
         // Home moves the modules' linked defaults (read once the section's new values are in effect).
         if (sectionId === "home") run(syncModules())
         // `canAuto` (the voice pages' `device.setup`) follows the routing section (WP-14).
-        if (sectionId === "routing") hubNow.refreshProfiles()
+        if (sectionId === "routing") hubNow.refreshDevices()
       },
       ...(options.helloTimeoutMs !== undefined ? { helloTimeoutMs: options.helloTimeoutMs } : {})
     })
@@ -1188,7 +1169,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       hubNow.vaultChanged()
       sections.announceAll()
       // The TypeSafe key may have come or gone with the vault: `canAuto` follows (WP-14).
-      hubNow.refreshProfiles()
+      hubNow.refreshDevices()
       // Engines that failed (a key was locked away) are rebuilt once the keys are there.
       if (state === "unlocked" && theEngine.status().state === "failed") {
         run(Effect.flatMap(theEngine.reload, (r) => (r.ok ? Effect.logInfo("Engines reloaded after the keys were unlocked.") : Effect.void)))

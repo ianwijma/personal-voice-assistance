@@ -281,7 +281,7 @@ test("two pages: the second observes, takes the audio mid-reply, and the first b
   }
 })
 
-test("modules in admin: a rejected value, reconfigure and disable, seen in a second admin page and used on the voice page's next turn", async ({ browser }, testInfo) => {
+test("modules in admin: a rejected value, reconfigure, and switching it off on the assistant, seen in a second admin page and used on the voice page's next turn", async ({ browser }, testInfo) => {
   const ctx = await browser.newContext({ permissions: ["microphone"], viewport: { width: 1280, height: 800 } })
   const a = await ctx.newPage() // the voice page
   const b = await ctx.newPage() // admin
@@ -304,7 +304,7 @@ test("modules in admin: a rejected value, reconfigure and disable, seen in a sec
     expect(gb).toMatch(/\d{1,2} [A-Z][a-z]+ \d{4}/) // "13 November 2026"
     expect(end.msg.outcome).toBe("completed")
 
-    await loginAdmin(b, assistant.url, "#settings/modules/clock")
+    await loginAdmin(b, assistant.url, "#settings/shared/modules")
     const card = b.getByTestId("module-clock")
     await expect(card).toHaveAttribute("data-state", "running")
     const form = b.getByTestId("form-m-clock")
@@ -322,7 +322,7 @@ test("modules in admin: a rejected value, reconfigure and disable, seen in a sec
     await expect(footer(b).getByText("Saved")).toBeVisible()
 
     // The second admin page shows the change.
-    await loginAdmin(c, assistant.url, "#settings/modules/clock")
+    await loginAdmin(c, assistant.url, "#settings/shared/modules")
     const formC = c.getByTestId("form-m-clock")
     await expect(formC.getByRole("textbox", { name: "Time zone" })).toHaveValue("Asia/Tokyo")
     await expect(formC.getByRole("radio", { name: "November 13, 2026" })).toHaveAttribute("aria-checked", "true")
@@ -335,14 +335,20 @@ test("modules in admin: a rejected value, reconfigure and disable, seen in a sec
     const us = log.filter((m) => m.msg.type === "assistant.text").map((m) => m.msg.text).join("")
     expect(us).toMatch(/[A-Z][a-z]+ \d{1,2}, \d{4}/) // "November 13, 2026"
 
-    // Disable the clock (from page B): page C sees it, and the time question is no longer a tool call.
-    // The server keeps the old instance 10 s ("stopping", out of the snapshot already); the card shows it as off.
-    await card.getByRole("switch").first().click()
-    await expect(card).toHaveAttribute("data-state", /stopping|disabled/)
-    await expect(card.getByRole("switch").first()).toHaveAttribute("aria-checked", "false")
-    await expect(card.getByRole("switch").first()).not.toHaveAttribute("aria-busy", "true")
-    await expect(card).not.toContainText(/stopping/i)
+    // A capability module has no switch of its own: it runs while an assistant has it on (docs/ASSISTANTS.md §2.6). Switch
+    // the clock off on the assistant (page B, Assistants › Assistant › Modules): page C sees it as not running (the server
+    // keeps the old instance 10 s: "stopping" is out of the snapshot already), and the time question is no longer a tool call.
+    expect(await card.getByRole("switch").count()).toBe(0)
+    const modulesTab = "#settings/assistants/assistant/modules"
+    await b.evaluate((hash) => { location.hash = hash }, modulesTab)
+    const row = b.locator("[data-module=clock]")
+    await expect(row).toBeVisible()
+    await row.getByRole("switch", { name: "Clock" }).click()
+    await expect(row.getByRole("switch", { name: "Clock" })).not.toBeChecked()
+    await footer(b).getByRole("button", { name: "Save", exact: true }).click()
+    await expect(footer(b).getByText("Saved")).toBeVisible()
     await expect(c.getByTestId("module-clock")).toHaveAttribute("data-state", /stopping|disabled/)
+    await expect(c.getByTestId("module-clock").getByTestId("no-instances")).toBeVisible()
     from = (await messages(a)).length
     await type(a, "What time is it?")
     end = await waitForMessage(a, (m) => m.msg.type === "turn.end", { from })
@@ -353,9 +359,12 @@ test("modules in admin: a rejected value, reconfigure and disable, seen in a sec
     // The voice page never received module data.
     expect((await messages(a)).some((m) => m.msg.type === "module.changed" || m.msg.type === "admin.snapshot")).toBe(false)
 
-    // Enable it again: back to the tool.
-    await card.getByRole("switch").first().click()
-    await expect(card).toHaveAttribute("data-state", "running")
+    // Switch it on again: back to the tool.
+    await row.getByRole("switch", { name: "Clock" }).click()
+    await expect(row.getByRole("switch", { name: "Clock" })).toBeChecked()
+    await footer(b).getByRole("button", { name: "Save", exact: true }).click()
+    await expect(footer(b).getByText("Saved")).toBeVisible()
+    await expect(c.getByTestId("module-clock")).toHaveAttribute("data-state", "running")
     from = (await messages(a)).length
     await type(a, "What time is it?")
     await waitForMessage(a, (m) => m.msg.type === "turn.end", { from })

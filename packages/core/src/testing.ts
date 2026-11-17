@@ -10,7 +10,7 @@ import type { LlmEvent, LlmRequest, StopReason, SttEvent } from "./Domain.ts"
 import { AudioError, LlmError } from "./Errors.ts"
 import { AudioInput, AudioOutput, Llm, Stt, Tts, type TtsAudio } from "./Services.ts"
 import { makeTurnTrace, TurnTrace } from "./TurnTrace.ts"
-import { defaultRoutingConfig, makeTriggerRouter, type RoutingConfig } from "./Routing.ts"
+import { defaultRoutingConfig, makeTriggerRouter, type RoutingConfig } from "./TriggerRouter.ts"
 import { makeToolRegistry, type ToolRegistry } from "./ToolRegistry.ts"
 
 export interface Sleep {
@@ -424,3 +424,6 @@ export const testTurnTraceLayer = Layer.effect(
   TurnTrace,
   Effect.clockWith((clock) => Effect.succeed(makeTurnTrace({ now: () => clock.currentTimeMillisUnsafe() })))
 )
+
+// The trigger-phrase router, as a fixture for agent tests (see TriggerRouter.ts).
+export * from "./TriggerRouter.ts"

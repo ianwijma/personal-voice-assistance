@@ -13,7 +13,7 @@ import {
   micWav,
   missingPrerequisite,
   question,
-  setFrontendDefaults,
+  setDeviceDefaults,
   silence,
   startAssistant,
   test,
@@ -38,13 +38,13 @@ test.afterAll(async () => {
 })
 
 test("manual mode: speech over the reply does not interrupt it; the question after the reply is answered", async ({ page }) => {
-  // Protocol 5: the interrupt mode is part of the device profile (here: the web-voice default, set in admin).
-  await setFrontendDefaults(assistant.url, { interruptMode: "manual" })
+  // The interrupt mode is a device setting (here: the web-voice defaults, set in admin).
+  await setDeviceDefaults(assistant.url, { interruptMode: "manual" })
   await page.goto(assistant.url)
   await page.getByTestId("start").click()
   await expectVisualState(page, "listening")
   const welcome = await waitForMessage(page, (m) => m.msg.type === "welcome")
-  expect((welcome.msg as unknown as { snapshot: { device: { profile: { interruptMode: string } } } }).snapshot.device.profile.interruptMode).toBe("manual")
+  expect((welcome.msg as unknown as { snapshot: { setup: { interruptMode: string } } }).snapshot.setup.interruptMode).toBe("manual")
 
   const started = await waitForMessage(page, (m) => m.msg.type === "playback.started" && m.msg.turnId === 1, { timeout: 30_000 })
   const framesAtStart = (await micStats(page)).frames

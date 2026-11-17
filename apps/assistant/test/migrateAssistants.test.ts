@@ -1,6 +1,6 @@
 // Settings version 4 and the version-3 migration (docs/ASSISTANTS.md §2.5, §6, §1.2; WP-3): fixtures for the
 // default install, "always" and wake-phrase kinds, device overrides, Claude subscription, environment-locked keys;
-// the backup and the one write; read-only loads; per-entity `rev`; the legacy view; and a version-3 install served.
+// the backup and the one write; read-only loads; per-entity `rev`; and a version-3 install served.
 import { endOfTurn, interim, speechStarted } from "@pva/core/testing"
 import {
   Assistant,
@@ -8,6 +8,8 @@ import {
   type DeviceProfile,
   DeviceSettings,
   effectiveProfile,
+  FOLLOW_UP_SECONDS_MAX,
+  hearerOf,
   type ProfileOverrides,
   WEB_VOICE_KIND
 } from "@pva/protocol"
@@ -23,7 +25,7 @@ import { defaultSystemPrompt } from "../src/config.ts"
 import { makeEnvView } from "../src/envView.ts"
 import { moduleCatalog } from "../src/modules.ts"
 import { makeEnvCatalog, makeEnvMover } from "../src/serve/envSettings.ts"
-import { makeFrontends } from "../src/serve/frontends.ts"
+import { deviceSettingsFrom } from "../src/serve/devices.ts"
 import { MIGRATED_ASSISTANT_ID } from "../src/serve/migrateAssistants.ts"
 import { makeSections } from "../src/serve/sections.ts"
 import { EntitySaveError, loadSettingsStore, type LoadOptions, type StartupStep } from "../src/serve/SettingsStore.ts"
@@ -91,15 +93,45 @@ const defaultAssistant: Assistant = {
   modules: { clock: { on: true, offTools: [] }, weather: { on: true, offTools: [] } }
 }
 
-/** Effective profiles before the migration (version 3 rules) and after it (the legacy view of version 4). */
+/**
+ * A version 4 device's settings as the version 3 profile fields they came from (the migration must keep every device
+ * behaving as before): the assistant the profile speaks about is the hearer, else the migrated one. `voice` is retired.
+ */
+const profileOfSettings = (settings: DeviceSettings, assistant: Assistant): DeviceProfile => {
+  const phrases = settings.assistants.flatMap((a) => a.phrases).slice(0, 12)
+  const assignment = settings.assistants.find((a) => a.assistant === assistant.id) ?? settings.assistants[0]
+  return {
+    activation: settings.withoutPhrase.mode === "nobody" ? "wake-phrase" : "always",
+    wakePhrases: phrases.length > 0 ? phrases : DEFAULT_DEVICE_PROFILE.wakePhrases,
+    wakeMatch: settings.matching,
+    followUpSeconds: Math.min(FOLLOW_UP_SECONDS_MAX, assignment?.followUpSeconds ?? assistant.followUpSeconds),
+    voice: "",
+    interruptMode: settings.interruptMode,
+    conversationIdleMinutes: assistant.newConversationAfter === "never" ? 0 : assistant.newConversationAfter,
+    captions: settings.captions.captions,
+    speakReplies: settings.captions.speakTyped,
+    echoCancellation: settings.audio.echoCancellation,
+    noiseSuppression: settings.audio.noiseSuppression,
+    autoGainControl: settings.audio.autoGainControl,
+    outputPath: settings.audio.outputPath,
+    prebufferMs: settings.audio.prebufferMs
+  }
+}
+
+/** Effective profiles before the migration (version 3 rules) and after it (the version 4 settings read back as profiles). */
 const profilesOf = async (dir: string, v: V3, ids: ReadonlyArray<string | undefined>) => {
   const store = await run(openStore(dir, withCatalog()))
-  const f = makeFrontends({ store, enabledVoices: () => new Set(), conversationIdleMinutes: () => Number(v.assistant?.CONVERSATION_IDLE_MINUTES ?? 10) })
+  const after = (id: string | undefined): DeviceProfile => {
+    const file = store.settings()
+    const settings = deviceSettingsFrom(file, id)
+    const assistantId = hearerOf(settings) ?? "assistant"
+    return profileOfSettings(settings, file.assistants.byId[assistantId]!)
+  }
   const builtIn: DeviceProfile = { ...DEFAULT_DEVICE_PROFILE, conversationIdleMinutes: Number(v.assistant?.CONVERSATION_IDLE_MINUTES ?? 10) }
   return ids.map((id) => {
     const record = id === undefined ? undefined : v.devices?.[id]
     const before = effectiveProfile(v.frontends?.[WEB_VOICE_KIND] ?? {}, record?.overrides ?? {}, builtIn)
-    return { id, before, after: f.profile(id), store }
+    return { id, before, after: after(id), store }
   })
 }
 
@@ -131,9 +163,8 @@ describe("migration fixtures", () => {
     expect(store.problems).toEqual([])
     // The agent module (an account now) is not one of the assistant's modules.
     expect(file.assistants.byId.assistant!.modules["claude-subscription"]).toBeUndefined()
-    // The legacy view: exactly today's built-in profile.
-    expect(store.frontendData()).toEqual({ frontends: {}, devices: {} })
-    expect(makeFrontends({ store, enabledVoices: () => new Set() }).profile(undefined)).toEqual(DEFAULT_DEVICE_PROFILE)
+    // Read back as a profile: exactly the built-in profile.
+    expect(profileOfSettings(deviceSettingsFrom(file, undefined), file.assistants.byId.assistant!)).toEqual(DEFAULT_DEVICE_PROFILE)
     // The first save writes it.
     await run(saveSection(store, "recordings", { RECORD_HEARD_AUDIO: true }, {}))
     expect(onDisk(dir)).toMatchObject({ version: 4, assistants: { order: ["assistant"] }, deviceTypes: { [WEB_VOICE_KIND]: { rev: 0 } } })
@@ -221,8 +252,6 @@ describe("migration fixtures", () => {
     for (const p of profiles) {
       expect(p.after, p.id).toEqual({ ...p.before, voice: "", ...(p.id === "kitchen-01" ? { conversationIdleMinutes: 10 } : {}) })
     }
-    // The legacy view shows the own sections as overrides.
-    expect(profiles[0]!.store.frontendData().devices["bedroom-1"]!.overrides).toEqual({ followUpSeconds: 0 })
   })
 
   it("Claude subscription as the language model: account, model, options and the agent's own prompt move to the assistant", async () => {
@@ -419,125 +448,6 @@ describe("the version-4 file", () => {
     expect(dropped.problems.some((p) => p.includes("were not valid and were dropped"))).toBe(true)
     expect(dropped.settings().deviceTypes[WEB_VOICE_KIND]).toBeUndefined()
     expect((await run(dropped.saveDeviceType(WEB_VOICE_KIND, 0, webSettings))).rev).toBe(1)
-
-    // Missing, then changed through the legacy view (`frontend.update`): also rev 1.
-    rewrite(undefined)
-    const legacy = await run(openStore(dir, withCatalog()))
-    await run(legacy.saveFrontends("kind defaults", (d) => ({ ...d, frontends: { [WEB_VOICE_KIND]: { captions: false } } })))
-    expect(legacy.settings().deviceTypes[WEB_VOICE_KIND]).toMatchObject({ rev: 1, captions: { captions: false } })
-  })
-})
-
-describe("today's pages on version 4", () => {
-  it("front-end saves are written into the type defaults, the devices and the migrated assistant; lastSeen alone keeps the rev", async () => {
-    let now = 1_000_000
-    const dir = v3Dir({})
-    const store = await run(openStore(dir, withCatalog()))
-    const f = makeFrontends({ store, enabledVoices: () => new Set(), now: () => now })
-    expect((await run(f.updateKind(WEB_VOICE_KIND, { followUpSeconds: 5, conversationIdleMinutes: 0, activation: "wake-phrase", prebufferMs: 200 }))).ok).toBe(true)
-    let file = store.settings()
-    expect(file.assistants.byId.assistant).toMatchObject({ followUpSeconds: 5, newConversationAfter: "never", rev: 1 })
-    expect(file.deviceTypes[WEB_VOICE_KIND]).toMatchObject({ withoutPhrase: { mode: "nobody" }, audio: { prebufferMs: 200, speakAloud: true }, rev: 1 })
-    expect(f.kinds()[0]!.defaults).toEqual({ followUpSeconds: 5, conversationIdleMinutes: 0, activation: "wake-phrase", prebufferMs: 200 })
-
-    await run(f.seen({ id: "phone-0001", kind: WEB_VOICE_KIND, name: "Phone" }, new Set()))
-    expect((await run(f.updateDevice("phone-0001", undefined, { wakePhrases: ["hey phone"], autoGainControl: false }))).ok).toBe(true)
-    file = store.settings()
-    expect(file.devices["phone-0001"]).toMatchObject({
-      rev: 1,
-      own: {
-        assistants: [{ assistant: "assistant", phrases: ["hey phone"] }],
-        audio: { autoGainControl: false, prebufferMs: 200, echoCancellation: true }
-      }
-    })
-    expect(f.profile("phone-0001")).toMatchObject({ wakePhrases: ["hey phone"], autoGainControl: false, prebufferMs: 200, followUpSeconds: 5, activation: "wake-phrase" })
-    now += 20 * 60_000
-    await run(f.seen({ id: "phone-0001", kind: WEB_VOICE_KIND, name: "Phone" }, new Set()))
-    expect(store.settings().devices["phone-0001"]).toMatchObject({ rev: 1, lastSeen: now })
-    // Resetting the overrides returns the sections to the type defaults.
-    expect((await run(f.updateDevice("phone-0001", "Phone 2", { wakePhrases: null, autoGainControl: null }))).ok).toBe(true)
-    expect(store.settings().devices["phone-0001"]).toMatchObject({ name: "Phone 2", own: {}, rev: 2 })
-    // What the legacy view cannot show (a second assignment) survives a save through it.
-    const { rev, ...web } = store.settings().deviceTypes[WEB_VOICE_KIND]!
-    const other = await run(store.createAssistant({ ...store.assistants()[0]!, name: "T3" }))
-    await run(store.saveDeviceType(WEB_VOICE_KIND, rev, { ...web, assistants: [...web.assistants, { assistant: other.id, phrases: ["hey t3"] }] }))
-    expect((await run(f.updateKind(WEB_VOICE_KIND, { captions: false }))).ok).toBe(true)
-    expect(store.settings().deviceTypes[WEB_VOICE_KIND]!.assistants.map((a) => a.assistant)).toEqual(["assistant", "t3"])
-  })
-
-  it("flat keys that became per assistant and module switches are mirrored into the migrated assistant", async () => {
-    const store = await run(openStore(tmp(), withCatalog()))
-    await run(saveSection(store, "llm-behaviour", { SYSTEM_PROMPT: "Talk like a pirate.", MAX_TOOL_ROUNDS: 3 }, {}))
-    await run(saveSection(store, "language-model", { LLM_PROVIDER: "anthropic", ANTHROPIC_MODEL: "claude-sonnet-5-5", ANTHROPIC_THINKING: "adaptive" }, {}))
-    await run(store.saveModule("weather", { enabled: false, settings: {}, secrets: {} }))
-    const a = store.assistants()[0]!
-    expect(a).toMatchObject({ prompt: "Talk like a pirate.", toolRounds: 3, llm: { account: "anthropic", model: "claude-sonnet-5-5", thinking: "adaptive" }, rev: 3 })
-    expect(a.modules).toEqual({ clock: { on: true, offTools: [] }, weather: { on: false, offTools: [] } })
-    // Back to the defaults: the section saved without the keys.
-    await run(saveSection(store, "llm-behaviour", {}, {}))
-    expect(store.assistants()[0]).toMatchObject({ prompt: defaultSystemPrompt, toolRounds: 5, newConversationAfter: 10 })
-    // An agent module's switch is an account, not a module choice.
-    await run(store.saveModule("claude-subscription", { enabled: true, settings: {}, secrets: {} }))
-    expect(store.assistants()[0]!.modules["claude-subscription"]).toBeUndefined()
-  })
-
-  it("the Claude subscription agent's per-assistant settings changed after migration are mirrored into the migrated assistant (WP-13a)", async () => {
-    const store = await run(openStore(tmp(), withCatalog({ LLM_PROVIDER: "claude-subscription" })))
-    const before = store.assistants()[0]!
-    expect(before.llm).toMatchObject({ account: "claude-subscription", model: "claude-haiku-5-5", useModules: true, freshSessionAfterMinutes: 60 })
-    expect(before.replyEarly).toBe(false)
-    await run(store.saveModule("claude-subscription", {
-      enabled: true,
-      settings: { optIn: true, model: "claude-sonnet-5-5", tools: false, sessionIdleMinutes: 30, speculate: true, systemPrompt: "Be brief." },
-      secrets: {}
-    }))
-    expect(store.assistants()[0]).toMatchObject({
-      prompt: "Be brief.",
-      replyEarly: true,
-      llm: { account: "claude-subscription", model: "claude-sonnet-5-5", useModules: false, freshSessionAfterMinutes: 30 },
-      rev: before.rev + 1
-    })
-    // Only what the save changed: the assistant's own later edit of its model is kept when the module's model is not
-    // touched (a shared setting saved: the program).
-    await run(store.saveAssistantRecord({ ...store.assistants()[0]!, llm: { ...store.assistants()[0]!.llm, model: "claude-opus-5-5" } }))
-    await run(store.saveModule("claude-subscription", {
-      enabled: true,
-      settings: { optIn: true, model: "claude-sonnet-5-5", tools: false, sessionIdleMinutes: 30, speculate: true, systemPrompt: "Be brief.", claudePath: "/opt/claude" },
-      secrets: {}
-    }))
-    expect(store.assistants()[0]!.llm.model).toBe("claude-opus-5-5")
-
-    // The environment's CLAUDE_SUBSCRIPTION_MODEL locks the model; an assistant on another account is not touched.
-    const locked = await run(openStore(tmp(), withCatalog({ LLM_PROVIDER: "claude-subscription", CLAUDE_SUBSCRIPTION_MODEL: "claude-haiku-5-5" })))
-    await run(locked.saveModule("claude-subscription", { enabled: true, settings: { model: "claude-sonnet-5-5", tools: false }, secrets: {} }))
-    expect(locked.assistants()[0]!.llm).toMatchObject({ model: "claude-haiku-5-5", useModules: false })
-    const other = await run(openStore(tmp(), withCatalog({ LLM_PROVIDER: "anthropic" })))
-    const otherBefore = other.assistants()[0]!
-    await run(other.saveModule("claude-subscription", { enabled: true, settings: { model: "claude-sonnet-5-5", tools: false }, secrets: {} }))
-    expect(other.assistants()[0]).toEqual(otherBefore)
-  })
-
-  it("Move to settings: a per-assistant key is an assistant-field target; moving it writes the migrated assistant and unlocks it", async () => {
-    expect(makeEnvCatalog(moduleCatalog).target("SYSTEM_PROMPT")).toMatchObject({ kind: "assistant-field", assistantId: MIGRATED_ASSISTANT_ID, field: "prompt" })
-    expect(makeEnvCatalog(moduleCatalog).target("ANTHROPIC_API_KEY")?.kind).toBe("section")
-    const dir = tmp()
-    const envPath = join(dir, ".env")
-    const envText = "SYSTEM_PROMPT=Moved prompt\nSTT_SHERPA_EAGER_SILENCE_MS=300\n"
-    writeFileSync(envPath, envText)
-    const view = makeEnvView({ processEnv: {}, files: [{ path: envPath, text: envText }] })
-    mkdirSync(join(dir, "data"))
-    const store = await run(openStore(join(dir, "data"), { assistants: { env: view.record, catalog: [greeterModule] } }))
-    expect(store.assistantsInEffect()[0]!.locks.map((l) => l.key)).toEqual(["SYSTEM_PROMPT", "STT_SHERPA_EAGER_SILENCE_MS"])
-    const sections = makeSections(store, view.record, { envOrigin: view.sourceOf, envLocation: view.locationOf })
-    await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
-      const host = yield* makeModuleHost({ catalog: [greeterModule], persistence: store.modulePersistence, env: view.record })
-      const mover = makeEnvMover({ view, catalog: [greeterModule], sections, host, store, vaultState: () => "none", onMoved: () => {} })
-      expect(yield* mover.move(["SYSTEM_PROMPT", "STT_SHERPA_EAGER_SILENCE_MS"])).toMatchObject({ ok: true })
-    })).pipe(Effect.provideService(References.MinimumLogLevel, "Error"), Effect.provide(Logger.layer([]))))
-    expect(store.assistantsInEffect()[0]!.locks).toEqual([])
-    expect(store.assistants()[0]).toMatchObject({ prompt: "Moved prompt", hearing: { eagerSilenceMs: 300 } })
-    expect(store.settings().assistant).toMatchObject({ SYSTEM_PROMPT: "Moved prompt", STT_SHERPA_EAGER_SILENCE_MS: 300 })
-    expect(readFileSync(envPath, "utf8")).toContain("# SYSTEM_PROMPT moved to the settings UI")
   })
 })
 
@@ -586,7 +496,7 @@ describe("serve: a version-3 install starts on version 4", () => {
     const client = await ScriptedClient.connect({ url: server.url })
     clients.push(client)
     const welcome = await client.hello()
-    expect(welcome.snapshot.device?.profile).toMatchObject({ activation: "wake-phrase", wakePhrases: ["hey jeff"], interruptMode: "instant" })
+    expect(welcome.snapshot.setup).toMatchObject({ withoutPhrase: { mode: "nobody" }, assistants: [{ id: "assistant", phrases: ["hey jeff"] }], interruptMode: "instant" })
     await client.claim()
     await client.waitFor("state", (m) => m.state === "asleep", { from: 0 })
     stt.emit(speechStarted, interim("Hey Jeff, what"), endOfTurn("Hey Jeff, what time is it?"))

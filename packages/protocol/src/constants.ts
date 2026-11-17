@@ -51,8 +51,11 @@
  * `stale`, `duplicate_phrase`, `unknown_assistant`, `limit_reached`, `not_allowed`; `FieldError.key` may be a dotted
  * path; `devices` entries carry `own`, `settings`, `hearer` and `rev` next to the protocol 5 fields;
  * `assistantId` on turn, reply, wake and conversation messages, `snapshot.setup`/`conversations`,
- * `admin.snapshot.assistants`/`deviceTypes`, `SessionInfo.answering`/`conversations`. The protocol 5 front-end
- * messages stay until the UI packages replace them.
+ * `admin.snapshot.assistants`/`deviceTypes`, `SessionInfo.answering`/`conversations`. Removed in the same version
+ * (the pages above replaced them): client `device.update`, `frontend.update`, `device.admin.update`; server
+ * `device.profile`, `frontends`; `snapshot.device`, `snapshot.conversation` (`snapshot.conversations` is required),
+ * `admin.snapshot.frontends`; `profile` and `overrides` on a device entry. The profile fields of protocols 5 and 6 are
+ * kept only for reading a version 3 settings file (`DeviceProfile`, `ProfileOverrides`).
  */
 export const PROTOCOL_VERSION = 7
 

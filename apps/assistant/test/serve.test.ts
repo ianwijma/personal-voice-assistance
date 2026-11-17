@@ -60,7 +60,7 @@ describe("serve: handshake", () => {
     expect(welcome.snapshot.state).toBe("idle")
     expect(welcome.snapshot.engine).toEqual({ ready: true, state: "ready", voices: [{ name: "sherpa:en_US-lessac-medium", description: "Lessac", isDefault: true }] })
     expect(welcome.snapshot.history).toEqual([])
-    expect(Object.keys(welcome.snapshot).sort()).toEqual(["admin", "conversation", "conversations", "device", "engine", "history", "ownerPresent", "role", "setup", "state"])
+    expect(Object.keys(welcome.snapshot).sort()).toEqual(["admin", "conversations", "engine", "history", "ownerPresent", "role", "setup", "state"])
     const admin = await connect()
     const { snapshot } = await admin.admin(TEST_ADMIN_PASSWORD)
     expect(snapshot.engine.state).toBe("ready")
@@ -261,11 +261,11 @@ describe("serve: interruptions", () => {
     expect((await owner.waitFor("turn.end", (m) => m.turnId === start.turnId, { from: owner.messages.indexOf(start) })).outcome).toBe("interrupted")
     const told = await other.waitFor("conversation")
     expect(told.reason).toBe("new")
-    expect(told.id).not.toBe(first.snapshot.conversation.id)
+    expect(told.id).not.toBe(first.snapshot.conversations[0]!.id)
     const later = await connect()
     const welcome = await later.hello()
     expect(welcome.snapshot.history).toEqual([])
-    expect(welcome.snapshot.conversation.id).toBe(told.id)
+    expect(welcome.snapshot.conversations[0]!.id).toBe(told.id)
     // The next turn starts from nothing.
     const from = owner.messages.length
     owner.send({ type: "text.send", requestId: "t3", text: "third", speak: false })
