@@ -131,10 +131,15 @@ describe("serve: a voice turn", () => {
     await owner.waitFor("state", (m) => m.state === "listening", { from: owner.messages.indexOf(end) })
 
     const types = owner.types(from)
+    // Two orders, each fixed by cause. The server's side: it sends `reply.end` once all audio is sent, and the turn
+    // ends after the page reports it played everything. The page's side: `speaking` and `assistant.playing` follow the
+    // page's `playback.started` (a round trip), so they may come before or after `reply.end`, which goes out as soon
+    // as the voice has made the audio (here it ran ahead while the turn was speculative).
     expect(inOrder(types, [
       "session", "state", "transcript", "transcript", "transcript", "turn.start", "state", "assistant.text", "reply.start",
-      "state", "assistant.playing", "reply.end", "turn.end", "state"
-    ])).toBe(true)
+      "state", "assistant.playing", "turn.end", "state"
+    ]), types.join(" ")).toBe(true)
+    expect(inOrder(types, ["reply.start", "reply.end", "turn.end"]), types.join(" ")).toBe(true)
     const texts = owner.messages.slice(from).filter((m) => m.type === "transcript").map((m) => (m as { text: string }).text)
     expect(texts).toEqual(["what's the", "what's the weather in Paris", ""])
     const states = owner.messages.slice(from).filter((m) => m.type === "state").map((m) => (m as { state: string }).state)

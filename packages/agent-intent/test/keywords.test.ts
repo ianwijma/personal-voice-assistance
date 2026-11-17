@@ -81,10 +81,16 @@ describe("keyword decider", () => {
   it("is fast: well under a millisecond per decision", () => {
     const plan = buildDecisionPlan({ utterance: "Turn on the lights in the living room.", actions, parse: parseValues })
     for (let i = 0; i < 200; i++) decideByKeywords(plan.request)
-    const n = 2_000
-    const start = performance.now()
-    for (let i = 0; i < n; i++) decideByKeywords(plan.request)
-    const each = (performance.now() - start) / n
+    // The best of 10 batches: on a shared machine another process or a GC pause can only add time to a batch, so the
+    // fastest batch is the decider's own cost (CI: 150-330 µs, and once 1.4 ms over a single batch). A slower decider
+    // makes every batch slower, so the bound still catches it.
+    const n = 200
+    let each = Number.POSITIVE_INFINITY
+    for (let batch = 0; batch < 10; batch++) {
+      const start = performance.now()
+      for (let i = 0; i < n; i++) decideByKeywords(plan.request)
+      each = Math.min(each, (performance.now() - start) / n)
+    }
     console.log(`keyword decision: ${(each * 1000).toFixed(0)} µs (${actions.length} actions)`)
     assert.isBelow(each, 1)
   })
