@@ -56,6 +56,8 @@ export interface AssistantClient {
    */
   readonly settings: (to: SettingsPath | "close", options?: { readonly discard?: boolean }) => void
   readonly reloadEngines: () => Promise<ResultMessage>
+  /** Admin (protocol 9): "Check again" on the Health page; the new issues arrive as `health`. */
+  readonly checkHealth: () => Promise<ResultMessage>
   /** Key vault (see `lib/vault.ts`): passwords go to the server only and are never kept here. */
   readonly setupVault: (password: string) => Promise<ResultMessage>
   readonly unlockVault: (password: string) => Promise<ResultMessage>
@@ -629,6 +631,7 @@ export const createAssistantClient = (options: { readonly frontend?: FrontendRol
       connection.request({ type: "settings.update", sectionId, patch, ...(confirmWarnings === true ? { confirmWarnings: true } : {}) }),
     settings: (to, options = {}) => dispatch({ type: "local/ui", patch: navigateSettings(store.get().ui, to, options.discard === true) }),
     reloadEngines: () => connection.request({ type: "engine.reload" }),
+    checkHealth: () => connection.request({ type: "health.check" }),
     setupVault: (password) => connection.request({ type: "vault.setup", password }),
     unlockVault: (password) => connection.request({ type: "vault.unlock", password }),
     lockVault: () => connection.request({ type: "vault.lock" }),

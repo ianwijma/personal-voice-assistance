@@ -35,6 +35,9 @@
  *                   web-voice default (asleep after a claim) and a third device that has it among three phrases.
  *   admin-disabled  no admin password: `admin.state.enabled` is false and every login is refused.
  *   admin-backoff   every wrong admin password refuses logins for 30 s.
+ *   health          like typed (protocol 9): Diagnostics › Health lists a module error and a core warning; the Music
+ *                   module is unavailable (yt-dlp is missing) and suggests a DJ template; Check again takes 1 s and
+ *                   clears the clock warning. Every other scenario has an empty, checked registry.
  * In every scenario the vault starts as "none" (no vault yet) unless the scenario says otherwise.
  *
  * Protocol 5 (docs/FRONTENDS-AND-ACTIVATION.md): pages say `frontend: "voice" | "admin"` in hello. The admin
@@ -117,6 +120,7 @@ import {
   type HistoryItem,
   type JobInfo,
   type ModelSet,
+  type HealthInfo,
   type ModuleInfo,
   PROTOCOL_VERSION,
   type ServerMessage,
@@ -135,7 +139,7 @@ import {
   type VoiceEntry,
   voiceFor
 } from "@pva/protocol"
-import { exampleEngineStatus, exampleSnapshot, exampleVoiceSection, exampleWeatherModule } from "@pva/protocol/examples"
+import { exampleEngineStatus, exampleHealth, exampleSnapshot, exampleUnavailableModule, exampleVoiceSection, exampleWeatherModule } from "@pva/protocol/examples"
 import { type WebSocket, WebSocketServer } from "ws"
 import { createAssistantsMock } from "./assistants.ts"
 import { seedTraces } from "./traces.ts"
@@ -161,7 +165,8 @@ const SCENARIOS = [
   "long-phrase",
   "latency",
   "admin-disabled",
-  "admin-backoff"
+  "admin-backoff",
+  "health"
 ] as const
 /** The admin password of the mock (`PVA_ADMIN_PASSWORD` on the real server). */
 const ADMIN_PASSWORD = "admin password"
@@ -326,8 +331,13 @@ const initialModules = (): Array<ModuleInfo> => [
     protected: true,
     kind: "agent",
     group: "agents"
-  }
+  },
+  ...(scenario === "health" ? [clone(exampleUnavailableModule)] : [])
 ]
+
+/** Protocol 9: the issue registry (`health`). */
+const initialHealth = (): HealthInfo =>
+  scenario === "health" ? { ...clone(exampleHealth), checkedAt: Date.now() - 120_000 } : { issues: [], checkedAt: Date.now(), checking: false }
 
 const sherpa = { key: "STT_PROVIDER", in: ["sherpa"] }
 const deepgram = { key: "STT_PROVIDER", in: ["deepgram"] }
@@ -898,6 +908,7 @@ let jobs: Array<JobInfo> = []
 let jobSeq = 0
 const jobTimers = new Map<string, ReturnType<typeof setInterval>>()
 let traces: Array<TraceInfo> = scenario === "latency" ? seedTraces() : []
+let health: HealthInfo = initialHealth()
 let turnSeq = 20
 let scriptTimers: Array<ReturnType<typeof setTimeout>> = []
 const clientLog: Array<Record<string, unknown>> = []
@@ -958,7 +969,7 @@ const adminState = (c: Conn, extra: Partial<AdminState> = {}): AdminState => {
 const sendAdminSnapshot = (c: Conn) =>
   sendTo(c, {
     type: "admin.snapshot",
-    snapshot: { engine, modules, sections, traces: traces.slice(-20), vault: vaultInfo(c), env, models, jobs, devices: deviceInfos(), sessions: sessionInfos(), assistants: assistantInfos(), deviceTypes: assistantsMock.deviceTypes() }
+    snapshot: { engine, modules, sections, traces: traces.slice(-20), vault: vaultInfo(c), env, models, jobs, devices: deviceInfos(), sessions: sessionInfos(), assistants: assistantInfos(), deviceTypes: assistantsMock.deviceTypes(), health }
   })
 const devicesChanged = () => broadcast({ type: "devices", devices: deviceInfos() })
 const assistantInfos = () => assistantsMock.infos([...devices.values()].map((d) => ({ id: d.id, name: d.name })))
@@ -1252,6 +1263,7 @@ const resetState = () => {
   jobTimers.clear()
   jobs = []
   traces = scenario === "latency" ? seedTraces() : []
+  health = initialHealth()
   turnSeq = 20
   clientLog.length = 0
 }
@@ -1266,7 +1278,7 @@ const sendTo = (c: Conn, m: ServerMessage) => {
   if (c.ws.readyState === c.ws.OPEN) c.ws.send(encodeServerMessage(m))
 }
 /** Messages that carry admin data: only admin connections get them (protocol 5). */
-const ADMIN_ONLY: ReadonlySet<ServerMessage["type"]> = new Set(["engine", "module.changed", "section.changed", "vault", "env", "job", "models", "devices", "assistants", "device.types", "sessions", "trace", "wake.heard", "admin.snapshot"])
+const ADMIN_ONLY: ReadonlySet<ServerMessage["type"]> = new Set(["engine", "module.changed", "section.changed", "vault", "env", "job", "models", "devices", "assistants", "device.types", "sessions", "trace", "wake.heard", "admin.snapshot", "health"])
 let lastSummary = ""
 const broadcast = (m: ServerMessage) => {
   const adminOnly = ADMIN_ONLY.has(m.type)
@@ -2166,6 +2178,17 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
         engine = { ...engine, reloadPending: true, reloadPendingFor: [...(engine.reloadPendingFor ?? []).filter((p) => p !== path), path] }
         broadcast({ type: "engine", engine })
       }
+      return
+    }
+    case "health.check": {
+      if (requireAdmin(c, m.requestId)) return
+      health = { ...health, checking: true }
+      broadcast({ type: "health", health })
+      after(1000, () => {
+        health = { issues: health.issues.filter((i) => i.id !== "core.clock"), checkedAt: Date.now(), checking: false }
+        broadcast({ type: "health", health })
+        result(c, m.requestId, true)
+      })
       return
     }
     case "engine.reload": {
