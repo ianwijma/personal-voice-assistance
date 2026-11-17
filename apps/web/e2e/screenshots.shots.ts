@@ -19,16 +19,6 @@ const captionHas = (page: Page, text: string) =>
 const DESKTOP: BrowserContextOptions = { viewport: { width: 1280, height: 800 } }
 const PHONE: BrowserContextOptions = { viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true, deviceScaleFactor: 2 }
 
-/** The next activation change from this page is rewritten to a field a device may not change itself: refused. */
-const refusedChange = (page: Page) =>
-  page.evaluate(() => {
-    const send = WebSocket.prototype.send
-    WebSocket.prototype.send = function(this: WebSocket, data) {
-      if (typeof data === "string" && data.includes("\"device.update\"")) data = data.replace(/"activation":"[a-z-]+"/, "\"captions\":false")
-      return send.call(this, data)
-    }
-  })
-
 const start = async (page: Page, baseURL: string | undefined) => {
   await page.goto(appUrl(baseURL))
   await page.getByTestId("start").click()
@@ -87,7 +77,7 @@ test.describe("voice, desktop, dark", () => {
 
   test("wake phrase: asleep, then the phrase alone", async ({ page, baseURL }) => {
     await mock.scenario("typed")
-    await mock.defaults({ activation: "wake-phrase" })
+    await mock.sleeps()
     await page.goto(appUrl(baseURL))
     await page.getByTestId("start").click()
     await expectVisualState(page, "asleep")
@@ -122,16 +112,6 @@ test.describe("voice, desktop, dark", () => {
     await expect(page.getByTestId("voice-sheet")).toBeVisible()
     await settle(page, 500)
     await shot(page, "voice-desktop-10-settings-sheet")
-    await page.getByTestId("voice-sheet").getByRole("radio", { name: "Wake phrase" }).click()
-    await expect(page.getByTestId("wake-phrases")).toBeVisible()
-    await settle(page, 400)
-    await shot(page, "voice-desktop-11-settings-sheet-wake-phrase")
-    // A refused change: the message stays next to the control, in the sheet.
-    await refusedChange(page)
-    await page.getByTestId("voice-sheet").getByRole("radio", { name: "Always listening" }).click()
-    await expect(page.getByTestId("sheet-error")).toBeVisible()
-    await settle(page, 400)
-    await shot(page, "voice-desktop-18-settings-sheet-error")
   })
 
   test("new conversation: the button, the divider, after a quiet while, too many devices", async ({ page, browser, baseURL }) => {
@@ -247,7 +227,6 @@ test.describe("voice, phone, dark", () => {
     await settle(page, 500)
     await shot(page, "voice-phone-06-settings-sheet")
     const sheet = page.getByTestId("voice-sheet")
-    await sheet.getByRole("radio", { name: "Wake phrase" }).tap()
     await sheet.getByTestId("sheet-more").getByText("More").tap()
     await sheet.getByTestId("admin-link").scrollIntoViewIfNeeded()
     await settle(page, 400)
@@ -277,7 +256,7 @@ test.describe("voice, phone, dark", () => {
 
   test("phone: asleep and woke, microphone error", async ({ page, browser, baseURL }) => {
     await mock.scenario("typed")
-    await mock.defaults({ activation: "wake-phrase" })
+    await mock.sleeps()
     await page.goto(appUrl(baseURL))
     await page.getByTestId("start").tap()
     await expectVisualState(page, "asleep")
@@ -375,7 +354,7 @@ test.describe("voice, light", () => {
     await shot(page, "voice-desktop-light-03-settings-sheet")
 
     await mock.scenario("typed")
-    await mock.defaults({ activation: "wake-phrase" })
+    await mock.sleeps()
     const phone = await otherPage(browser, PHONE, "light")
     await phone.page.goto(appUrl(baseURL))
     await phone.page.getByTestId("start").tap()

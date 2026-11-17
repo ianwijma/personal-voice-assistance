@@ -369,10 +369,6 @@ export function HearingTab({ draft, info }: TabProps) {
   return (
     <>
       <div className="flex flex-col gap-2" data-testid="hearing-notices">
-        <p className="rounded-md border border-line bg-surface-2/40 px-3 py-2 text-[13px] text-ink" data-testid="hearing-not-live">
-          These settings are saved now and used from the next start of the assistant. Until then every device hears with the shared recogniser set under{" "}
-          <SettingsLink path={["shared", "speech"]}>Speech recognition</SettingsLink>.
-        </p>
         {notices.differs.map((d, i) => (
           <p key={i} className="rounded-md border border-line px-3 py-2 text-[13px] text-ink-muted">{d}</p>
         ))}

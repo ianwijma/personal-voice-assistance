@@ -98,7 +98,7 @@ test.describe("phone", () => {
       const b = await sheet.boundingBox()
       return b === null ? null : [b.x, Math.round(b.width), Math.round(b.y + b.height)]
     }).toEqual([0, 390, 844])
-    for (const target of [sheet.getByRole("radio", { name: "Always listening" }), sheet.locator("#pref-mic"), sheet.getByTestId("admin-link"), sheet.getByRole("button", { name: "Close settings" })]) {
+    for (const target of [sheet.getByRole("radio", { name: /^Jeff/ }).locator("xpath=ancestor::label"), sheet.locator("#pref-mic"), sheet.getByTestId("admin-link"), sheet.getByRole("button", { name: "Close settings" })]) {
       const b = await target.boundingBox()
       expect(Math.round(b!.height)).toBeGreaterThanOrEqual(44)
     }
@@ -283,18 +283,18 @@ test("a refused sheet change is shown in the sheet, next to its control, until d
   await expect(page.getByTestId("start")).toBeVisible()
   await page.getByTestId("settings-toggle").click()
   const sheet = page.getByTestId("voice-sheet")
-  // The server refuses it: what the page sends is rewritten to a field a device may not change itself.
+  // The server refuses it: what the page sends is rewritten to "whichever fits", which this device does not have.
   await page.evaluate(() => {
     const send = WebSocket.prototype.send
     WebSocket.prototype.send = function(this: WebSocket, data) {
-      if (typeof data === "string" && data.includes("\"device.update\"")) data = data.replace("\"activation\":\"wake-phrase\"", "\"captions\":false")
+      if (typeof data === "string" && data.includes("\"device.pick\"")) data = data.replace(/"withoutPhrase":"[^"]*"/, "\"withoutPhrase\":\"typesafe\"")
       return send.call(this, data)
     }
   })
-  await sheet.getByRole("radio", { name: "Wake phrase" }).click()
+  await sheet.getByRole("radio", { name: /^T3/ }).click()
   const error = sheet.getByTestId("sheet-error")
-  await expect(error).toHaveText(/Not changed: Only admin can change that\./)
-  await expect(sheet.getByRole("radio", { name: "Always listening" })).toHaveAttribute("aria-checked", "true")
+  await expect(error).toHaveText(/Not changed: Whichever fits is not set up\./)
+  await expect(sheet.getByRole("radio", { name: /^Jeff/ })).toBeChecked()
   await expect(error).toHaveAttribute("role", "alert")
   await expect(page.getByTestId("toasts").locator("[role=alert]")).toHaveCount(0)
   await page.waitForTimeout(6500) // longer than a toast lives

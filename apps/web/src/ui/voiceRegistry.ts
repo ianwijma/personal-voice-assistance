@@ -1,5 +1,6 @@
 import type { ComponentType } from "react"
 import {
+  AsleepHint,
   AudioErrorCard,
   ConnectingHint,
   ObserverBanner,
@@ -9,6 +10,7 @@ import {
   StartPrompt
 } from "@/components/overlays.tsx"
 import type { ClientState } from "@/lib/state.ts"
+import { phrased } from "@/lib/voiceSetup.ts"
 
 /**
  * The voice front end's extension point (docs/UI-AND-MODULES.md §3.12): elements on the stage. A new one is one
@@ -40,5 +42,10 @@ export const stageOverlays: ReadonlyArray<StageOverlay> = [
     when: (s) => open(s) && s.session.ownerPresent && !audioHere(s) && s.audio.phase !== "error"
   },
   { id: "resume", component: ResumeAudio, when: (s) => audioHere(s) && s.audio.phase === "suspended" },
+  {
+    id: "asleep-hint",
+    component: AsleepHint,
+    when: (s) => audioHere(s) && s.session.serverState === "asleep" && s.woke === undefined && s.setup !== undefined && phrased(s.setup).length > 2
+  },
   { id: "start-hint", component: StartHint, when: (s) => open(s) && audioHere(s) && s.audio.phase === "running" }
 ]

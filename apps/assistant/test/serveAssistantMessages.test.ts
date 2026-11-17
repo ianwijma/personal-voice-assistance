@@ -632,19 +632,24 @@ describe("conversation.read", () => {
     const { client: page } = await voice()
     const watcher = await voice()
     const a = await admin()
-    expect((await typed(page, "hello to bravo")).assistantId).toBe("bravo")
-    expect((await typed(page, "hello to alpha", "alpha")).assistantId).toBe("alpha")
+    const toBravo = await typed(page, "hello to bravo")
+    expect(toBravo.assistantId).toBe("bravo")
+    const toAlpha = await typed(page, "hello to alpha", "alpha")
+    expect(toAlpha.assistantId).toBe("alpha")
     const from = page.messages.length
     const watcherFrom = watcher.client.messages.length
     page.send({ type: "conversation.read", requestId: "read-1", assistantId: "alpha" })
     const history = await page.waitFor("conversation.history", () => true, { from })
     expect(history).toMatchObject({ requestId: "read-1", assistantId: "alpha" })
     expect(history.history.map((h) => [h.role, h.text])).toEqual([["user", "hello to alpha"], ["assistant", "Reply to hello to alpha."]])
+    // The turn whose exchange ends the history, by id (the page tells a running turn apart from an equal question so).
+    expect(history.lastTurnId).toBe(toAlpha.turnId)
     expect(history.id).toMatch(/^[0-9a-f-]{36}$/)
     // Bravo's, too, and the snapshot of a new tab lists both conversations; the answering assistant is unchanged.
     page.send({ type: "conversation.read", requestId: "read-2", assistantId: "bravo" })
     const bravo = await page.waitFor("conversation.history", (m) => m.requestId === "read-2", { from })
     expect(bravo.history.map((h) => h.text)).toEqual(["hello to bravo", "Reply to hello to bravo."])
+    expect(bravo.lastTurnId).toBe(toBravo.turnId)
     expect(bravo.id).not.toBe(history.id)
     expect(page.messages.slice(from).some((m) => m.type === "device.setup")).toBe(false)
     await sleep(50)
@@ -665,7 +670,9 @@ describe("conversation.read", () => {
     const { client: page } = await voice()
     expect(await request(page, { type: "conversation.read", assistantId: "ghost" })).toMatchObject({ ok: false, error: { code: "unknown_assistant" } })
     page.send({ type: "conversation.read", requestId: "read-empty", assistantId: "bravo" })
-    expect(await page.waitFor("conversation.history", () => true)).toMatchObject({ requestId: "read-empty", assistantId: "bravo", history: [] })
+    const empty = await page.waitFor("conversation.history", () => true)
+    expect(empty).toMatchObject({ requestId: "read-empty", assistantId: "bravo", history: [] })
+    expect(empty.lastTurnId).toBeUndefined()
   })
 })
 

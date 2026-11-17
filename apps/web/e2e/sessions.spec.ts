@@ -39,8 +39,8 @@ test("New conversation in the chat's header asks nothing: the chat empties, show
   await expect(other.getByTestId("turn")).toHaveCount(3)
 
   const button = page.getByTestId("new-conversation")
-  await expect(button).toHaveAccessibleName("New conversation")
-  await expect(button).toContainText("New conversation")
+  await expect(button).toHaveAccessibleName("New conversation with Jeff (T3 keeps its own)")
+  await expect(button).toHaveAttribute("title", "New conversation with Jeff (T3 keeps its own)") // an icon now: the title is long with several assistants
   await button.click()
   for (const p of [page, other]) {
     await expect(p.getByTestId("turn")).toHaveCount(0)
@@ -140,12 +140,12 @@ test.describe("phone", () => {
     expect(box!.height).toBeGreaterThanOrEqual(44)
     await page.getByTestId("dock-new-conversation").click()
     await expect(page.getByTestId("dock-menu")).toBeHidden()
-    await expect(page.getByTestId("toasts")).toContainText("Started a new conversation.")
+    await expect(page.getByTestId("toasts")).toContainText("New conversation with Jeff. T3 keeps its own.")
     await page.getByTestId("chat-toggle").click()
     await expect(page.getByTestId("conversation-divider")).toHaveText("New conversation")
     await expect(page.getByTestId("turn")).toHaveCount(0)
-    // The header button is there too, as an icon with its label at this width.
-    await expect(page.getByTestId("new-conversation")).toContainText("New conversation")
+    // The header button is there too, as an icon whose name says which assistant's conversation it starts.
+    await expect(page.getByTestId("new-conversation")).toHaveAccessibleName("New conversation with Jeff (T3 keeps its own)")
     expect(await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)).toBe(0)
   })
 

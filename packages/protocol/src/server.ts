@@ -58,7 +58,15 @@ export const State = Schema.Struct({
   type: Schema.Literal("state"),
   state: AssistantState,
   /** The committed turn this state belongs to (thinking, speaking). */
-  turnId: Schema.optionalKey(TurnId)
+  turnId: Schema.optionalKey(TurnId),
+  /**
+   * Protocol 7: the assistant that has the turn, the one rule the pages show: the assistant of the turn in flight or of
+   * the utterance being heard, else the one whose armed or follow-up window is open; `null`: nobody, speech goes to who
+   * answers without a phrase. Sent again with an unchanged `state` when only this changed (a phrase inside the
+   * utterance, a window that closed by itself while the device keeps listening, an accepted `device.pick`, which closes
+   * the windows). Absent: the server does not say.
+   */
+  holder: Schema.optionalKey(Schema.NullOr(AssistantId))
 })
 
 /**
@@ -113,7 +121,9 @@ export const ToolStart = Schema.Struct({
   /** The module that contributed the tool (null for an unknown tool name). */
   moduleId: Schema.NullOr(ModuleId),
   /** The model's input, truncated by the server to about 2 KB of JSON. */
-  input: Schema.Json
+  input: Schema.Json,
+  /** Protocol 7: the assistant whose turn it is (as on `turn.start`), so a tab that joined mid-turn files it right. */
+  assistantId: Schema.optionalKey(AssistantId)
 })
 
 export const ToolEnd = Schema.Struct({
@@ -123,7 +133,9 @@ export const ToolEnd = Schema.Struct({
   ok: Schema.Boolean,
   ms: NonNegativeFinite,
   /** The error returned to the model, when `ok` is false. */
-  error: Schema.optionalKey(Schema.String)
+  error: Schema.optionalKey(Schema.String),
+  /** Protocol 7: the assistant whose turn it is (as on `turn.start`). */
+  assistantId: Schema.optionalKey(AssistantId)
 })
 
 /** A committed turn ended. `trace` is its latency trace. */
@@ -370,7 +382,14 @@ export const ConversationHistory = Schema.Struct({
   requestId: RequestId,
   assistantId: AssistantId,
   id: ConversationId,
-  history: Schema.Array(HistoryItem)
+  history: Schema.Array(HistoryItem),
+  /**
+   * Protocol 7: the turn whose exchange ends `history` (its user message and what followed it), when a turn of this
+   * session was committed last. The page may still show that turn as running (its `turn.end` is on the way): that
+   * running turn and this exchange are the same, and no other running turn is in `history`. Absent: the server does
+   * not say, or no turn of this session ends the history.
+   */
+  lastTurnId: Schema.optionalKey(TurnId)
 })
 
 /** Admin connections only: the whole list of assistants, order kept. */

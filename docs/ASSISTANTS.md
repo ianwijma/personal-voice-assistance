@@ -607,13 +607,34 @@ DeviceSetup = { type: "device.setup", deviceId?,
   canAuto: boolean,                     // TypeSafe is set up (shows "Whichever fits" in the menu)
   interruptMode, audio: DeviceSettings["audio"], captions: DeviceSettings["captions"] }
 // changed
-TurnStart       += { assistantId }      // also assistant.text, reply.start: assistantId
+TurnStart       += { assistantId }      // also assistant.text, tool.start, tool.end, reply.start: assistantId;
+                                        // turn.end names it in trace.assistant. A turn is its assistant's for its
+                                        // whole life: the page files it by the first message that names it (a tab
+                                        // that joined mid-turn too), never by who has the turn now.
 Conversation    += { assistantId }      // conversation { id, reason, startedAt, assistantId }
 Wake            += { assistantId }
+State           += { holder?: AssistantId | null }   // who has the turn: the turn in flight or the utterance being
+                                        // heard, else an open armed / follow-up window, else null (nobody); sent again
+                                        // with the same state when only it changes. The page shows it, never guesses.
+                                        // An accepted device.pick closes the windows (the picked one answers next).
+                                        // "Being heard": from its SpeechStarted to its EndOfTurn, then (words only)
+                                        // until its turn is committed; not the 2 s hearing tail. Stop or a new
+                                        // conversation for its assistant cancels it: it holds the turn no longer.
+                                        // Read from the routing state only (RouteGate, the open utterance, the turn
+                                        // in flight), never from the display (the hearing timer, a muted microphone:
+                                        // idle with a follow-up window open still names its assistant). The page
+                                        // takes a holder that is present as sent, in every state; only a state
+                                        // without the field (a server that does not say) leaves it to the page.
 Snapshot.conversations = Array<{ assistantId, id, startedAt, turns: number }>   // replaces snapshot.conversation
 Snapshot.history       = the history of the answering assistant (the follow-up holder, else withoutPhrase's, else
                          the first); the others are fetched on demand:
-ConversationHistory = { type: "conversation.history", requestId, assistantId, id, history: HistoryItem[] }
+Snapshot.answering     = that assistant (the page files `history` under it)
+Snapshot.holder        = who has the turn now, as State.holder (may be an armed assistant whose history it is not)
+ConversationHistory = { type: "conversation.history", requestId, assistantId, id, history: HistoryItem[],
+                        lastTurnId?: TurnId }   // the turn whose exchange (its user message and what followed) ends
+                        // `history`, when a turn of this session was committed last. A turn the page still shows as
+                        // running with that id is that exchange; no other running turn is in `history` (an exchange
+                        // is committed when its turn ends). The page tells turns apart by id only, never by text.
 
 // voice → server
 TextSend         += { assistantId? }    // the voice page always sends the conversation shown

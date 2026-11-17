@@ -173,9 +173,9 @@ test("Language model: account cards, model, effort, thinking, limits; the subscr
   expect((await lastSave())!.assistant.llm).toMatchObject({ account: "offline", model: "", freshSessionAfterMinutes: 0 })
 })
 
-test("Hearing: says it is used from the next start, who hears with whom; model, language, timing; Deepgram swaps the groups", async ({ page, baseURL }) => {
+test("Hearing: says who hears with whom; model, language, timing; Deepgram swaps the groups", async ({ page, baseURL }) => {
   await open(page, baseURL, "keuken", "hearing")
-  await expect(page.getByTestId("hearing-not-live")).toContainText("used from the next start")
+  await expect(page.getByTestId("hearing-not-live")).toHaveCount(0)
   // Keuken is second on the kitchen iPad, where Jeff's recogniser is the one that runs.
   await expect(page.getByTestId("hearing-notices")).toContainText("Kitchen iPad hears with Jeff's recogniser (Parakeet v2). Keuken is set to Nemotron 320 ms: that is not used on this device.")
   // The model list is the speech section's: a model that is not downloaded cannot be chosen.

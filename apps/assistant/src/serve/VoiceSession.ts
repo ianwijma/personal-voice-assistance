@@ -165,6 +165,8 @@ export interface SessionConversations {
   readonly history: (assistant?: string) => Effect.Effect<ReadonlyArray<Message>>
   readonly conversation: (assistant?: string) => ConversationInfo
   readonly lastTurnAt: (assistant?: string) => number | undefined
+  /** The turn whose exchange ends `assistant`'s history (`conversation.history.lastTurnId`, §5.3), if the server knows it. */
+  readonly lastTurnId: (assistant?: string) => number | undefined
   /** Committed turns in `assistant`'s current conversation. */
   readonly turnsOf: (assistant?: string) => number
   readonly newConversation: (assistant?: string) => Effect.Effect<ConversationInfo>
@@ -207,6 +209,13 @@ export interface VoiceSession {
   readonly lastActiveAt: () => number
   readonly touch: () => void
   readonly info: () => SessionInfo
+  /**
+   * Who has the turn on the device (`state.holder`, `snapshot.holder`): the assistant of the turn in flight or of the
+   * utterance being heard, else the one whose armed or follow-up window is open, else `null` (nobody).
+   */
+  readonly holder: () => string | null
+  /** A `device.pick` was accepted: the open windows close, so the picked assistant answers the next sentence (§5.3). */
+  readonly pickAccepted: () => void
 }
 
 /**
@@ -284,14 +293,61 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
     const followUpOf = (assistant: string | undefined) => (assistant === undefined ? 0 : route.config().followUpMs?.[assistant] ?? 0)
     const longestFollowUp = () => Math.max(0, ...Object.values(route.config().followUpMs ?? {}))
     const armedMs = () => route.config().armedMs ?? WAKE_ARMED_MS
+    /**
+     * The assistant the open utterance goes to (its route target), from its `SpeechStarted` to its `EndOfTurn` only, not
+     * for the hearing tail after it; `undefined` while TypeSafe decides, for nobody, or once Stop or a new conversation
+     * cancelled the utterance (`heardStopped`: the rest of it reaches no turn).
+     */
+    let heardFor: string | undefined
+    let heardStopped = false
+    /** The assistant a closed utterance's words went to, until their turn is committed (or the next utterance starts). */
+    let handedTo: string | undefined
+    /** The committed turn in flight (from its commit to its `TurnEnded`), whatever the display shows. */
+    let inFlight: number | undefined
+    /**
+     * Who has the turn, the one rule the pages show (`state.holder`, `snapshot.holder`), from the routing state only:
+     * the assistant of the turn in flight, else of the open utterance (an armed window is consumed when the utterance
+     * starts, its assistant keeps the turn to its `EndOfTurn`), else of the words a closed utterance handed over, else
+     * the one whose armed or follow-up window is open, else nobody. Never the display state (the tracker's hearing
+     * timer, the microphone): those change what the page shows, not who answers.
+     */
+    const holderNow = (): string | null =>
+      (inFlight === undefined ? undefined : assistantOfTurn(inFlight)) ?? heardFor ?? handedTo ?? route.window(now())?.assistant ?? null
+    let holderSent: string | null = null
     const tracker = makeStateTracker({
       onChange: (s) => {
-        options.send({ type: "state", ...s })
+        holderSent = holderNow()
+        options.send({ type: "state", ...s, holder: holderSent })
         options.onChange(true)
       },
       asleep: () => route.config().withoutPhrase === "nobody" && !route.awake(now())
     })
     yield* Effect.addFinalizer(() => Effect.sync(() => tracker.dispose()))
+    /** A window closes by time without the state changing (the device keeps listening): the same state, the new holder. */
+    const holderCheck = () => {
+      const holder = holderNow()
+      if (holder === holderSent) return
+      holderSent = holder
+      options.send({ type: "state", ...tracker.current(), holder })
+    }
+    const holderTimers = new Set<ReturnType<typeof setTimeout>>()
+    yield* Effect.addFinalizer(() =>
+      Effect.sync(() => {
+        for (const t of holderTimers) clearTimeout(t)
+      })
+    )
+    /** `tracker.wakeChanged`, and the same re-check for the holder. */
+    const wakeChanged = (recheckInMs?: number) => {
+      tracker.wakeChanged(recheckInMs)
+      holderCheck()
+      if (recheckInMs === undefined) return
+      const t = setTimeout(() => {
+        holderTimers.delete(t)
+        holderCheck()
+      }, recheckInMs + 10)
+      t.unref?.()
+      holderTimers.add(t)
+    }
 
     /** The voice key `assistant` speaks with in this session ("" when it has none: not in use, the engines not running). */
     const voiceNow = (assistant: string | undefined): string => {
@@ -318,7 +374,12 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
     }
     const publisher = makePublisher({
       broadcast: send,
-      onCommitted: (turnId) => tracker.turnPromoted(turnId),
+      onCommitted: (turnId) => {
+        // The handed-over words have their turn now: the turn in flight names the holder.
+        handedTo = undefined
+        inFlight = turnId
+        tracker.turnPromoted(turnId)
+      },
       moduleOfTool: options.moduleOfTool,
       voice: voiceNow,
       ...(options.onTrace !== undefined ? { onTrace: options.onTrace } : {})
@@ -342,7 +403,7 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
           tracker.playbackEnded(event.turnId, event.reason)
           gate.playbackEnded(now())
           if (assistant !== undefined) route.replyEnded(assistant, now())
-          tracker.wakeChanged(followUpOf(assistant))
+          wakeChanged(followUpOf(assistant))
           if (unsuppress !== undefined) clearTimeout(unsuppress)
           unsuppress = setTimeout(() => web.setSuppressed(false), ECHO_TAIL_MS)
           unsuppress.unref?.()
@@ -374,6 +435,7 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
           return
         case "TurnEnded":
           clauses.delete(event.turnId)
+          if (inFlight === event.turnId) inFlight = undefined
           return tracker.turnEnded(event.turnId)
         case "ClauseQueued": {
           const entry = clauses.get(event.turnId) ?? { texts: [], given: 0 }
@@ -553,11 +615,27 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
         for (const e of echo.events) {
           const r = route.filter(e, t)
           results.push(r)
+          // The utterance's assistant (a phrase in it may change it), before the state that names it is sent.
+          const routed = r.target
+          const routedTo = routed === undefined || routed.by === "decide" || routed.by === "dropped" ? undefined : routed.assistant
+          if (e._tag === "SpeechStarted") handedTo = undefined
+          if (e._tag === "EndOfTurn") {
+            // The utterance is over: it holds the turn no longer (a phrase alone leaves its armed window). Its words,
+            // if any reach a turn, hold it until that turn is committed.
+            const words = !heardStopped && r.events.some((p) => p._tag === "EndOfTurn" && p.text.trim().length > 0)
+            handedTo = words ? routedTo : undefined
+            heardFor = undefined
+            heardStopped = false
+          } else if (heardStopped) heardFor = undefined
+          else if (routed !== undefined) heardFor = routedTo
+          else if (e._tag === "SpeechStarted") heardFor = undefined
           if (r.heard !== undefined) options.wakeHeard(r.heard.text, r.heard.phrase, r.heard.accepted, r.heard.assistant)
           if (r.woke !== undefined) {
+            // The phrase's utterance is still heard: its new holder goes out before `wake`, which the page shows until the next state.
+            holderCheck()
             if (r.woke.armed) armedPhrase.set(r.woke.assistant, r.woke.phrase)
             options.send({ type: "wake", phrase: r.woke.phrase, armed: r.woke.armed, assistantId: r.woke.assistant })
-            tracker.wakeChanged(r.woke.armed ? armedMs() : followUpOf(r.woke.assistant))
+            wakeChanged(r.woke.armed ? armedMs() : followUpOf(r.woke.assistant))
           }
           if (r.dropped !== undefined || (e._tag === "EndOfTurn" && r.events.length === 0)) dropped = true
           for (const passed of r.events) {
@@ -569,7 +647,7 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
               // An accepted utterance opens the follow-up window: the state may go back to asleep by itself.
               if (route.config().withoutPhrase === "nobody") {
                 const target = r.target
-                tracker.wakeChanged(followUpOf(target !== undefined && "assistant" in target ? target.assistant : undefined))
+                wakeChanged(followUpOf(target !== undefined && "assistant" in target ? target.assistant : undefined))
               }
             }
           }
@@ -579,6 +657,8 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
           else heard.event(event)
         }
         if (echo.dropped) transcript("")
+        // A phrase inside the utterance may have changed who has the turn while the state stayed `hearing`.
+        holderCheck()
         return Effect.forEach(results, dispatcher.dispatch, { discard: true })
       })
 
@@ -598,10 +678,19 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
     /** The id of a recogniser whose stream failed: not tried again until the hearing changes. */
     let failedId: string | undefined
 
+    /** An utterance closed outside `onStt` (a recogniser switch, a new build): it holds the turn no longer. */
+    const utteranceDropped = () => {
+      heardFor = undefined
+      heardStopped = false
+      handedTo = undefined
+      holderCheck()
+    }
+
     /** Closes an utterance the previous stream left open (it starts nothing). */
     const closeOpenUtterance = Effect.suspend(() => {
       if (!utteranceOpen) return Effect.void
       utteranceOpen = false
+      utteranceDropped()
       heard.discard()
       return dispatcher.dispatch(route.filter({ _tag: "EndOfTurn", text: "" }, now()))
     })
@@ -662,6 +751,7 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
           if (recogniserRuns++ > 0) {
             // A new build: an utterance the previous recogniser stream left open is closed (it starts nothing).
             utteranceOpen = false
+            utteranceDropped()
             yield* dispatcher.dispatch(route.filter({ _tag: "EndOfTurn", text: "" }, now()))
           }
           failedId = undefined
@@ -695,9 +785,22 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
       routeKey = key
       // `configure` drops a held utterance: only when the routing part of the settings changed.
       route.configure(next)
-      tracker.wakeChanged(Math.max(longestFollowUp(), armedMs()))
+      wakeChanged(Math.max(longestFollowUp(), armedMs()))
     }
     syncProfile()
+
+    /**
+     * Stop or a new conversation for `assistant` (`undefined`: every one) cancels the open utterance it has, and the
+     * words it was handed: they reach no turn, so they hold the turn no longer.
+     */
+    const utteranceCancelled = (assistant: string | undefined) => {
+      if (heardFor !== undefined && (assistant === undefined || heardFor === assistant)) {
+        heardFor = undefined
+        heardStopped = true
+      }
+      if (handedTo !== undefined && (assistant === undefined || handedTo === assistant)) handedTo = undefined
+      holderCheck()
+    }
 
     const conversations: SessionConversations = {
       sendText: (text, speak, named) =>
@@ -710,7 +813,11 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
           if ("dropped" in target) return Effect.succeed<TextOutcome>("dropped")
           return dispatcher.send(target.assistant, { _tag: "TextInput", text, speak })
         }),
-      stop: (assistant) => dispatcher.stop(assistant),
+      stop: (assistant) => {
+        const outcome = dispatcher.stop(assistant)
+        utteranceCancelled(assistant)
+        return outcome
+      },
       running: () => detach !== undefined && options.engine.ready(),
       history: (assistant) => conversationOf(assistant ?? answering())?.history ?? Effect.succeed([]),
       conversation: (assistant) => {
@@ -718,6 +825,7 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
         return conversationOf(a)?.conversation() ?? reservedFor(a ?? "")
       },
       lastTurnAt: (assistant) => conversationOf(assistant ?? answering())?.lastTurnAt(),
+      lastTurnId: (assistant) => conversationOf(assistant ?? answering())?.lastTurnId(),
       turnsOf: (assistant) => turnsBy.get(assistant ?? answering() ?? "") ?? 0,
       newConversation: (assistant) =>
         Effect.suspend(() => {
@@ -726,6 +834,7 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
           if (made !== undefined) {
             // Its conversation stops the open utterance; the dispatcher must not hand the rest to another one.
             dispatcher.cancelUtterance(a!)
+            utteranceCancelled(a)
             return made.newConversation
           }
           return Effect.sync(() => {
@@ -780,6 +889,11 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
       turns: () => turnsBy.get(answering() ?? "") ?? 0,
       lastActiveAt: () => lastActive,
       touch,
+      holder: holderNow,
+      pickAccepted: () => {
+        route.release()
+        wakeChanged()
+      },
       info: (): SessionInfo => {
         const last = conversations.lastTurnAt()
         return {

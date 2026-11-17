@@ -612,11 +612,16 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
     const key = client.sessionKey
     const session = sessionOf(client)
     const o = key === undefined ? undefined : owners.get(key)
+    // Whose conversation `history` is (it follows the follow-up holder): the page files it under that assistant.
+    const answering = session?.conversation.answering()
     return {
       state: session?.tracker.current().state ?? "idle",
       role: isOwner(client) ? "owner" : "observer",
       ownerPresent: o?.owner !== undefined,
       engine: engineSummary(options.engine.status()),
+      ...(answering !== undefined ? { answering } : {}),
+      // Who has the turn now (an armed assistant too), apart from whose history this is.
+      ...(session !== undefined ? { holder: session.holder() } : {}),
       history: session === undefined ? [] : historyItems(Effect.runSync(session.conversation.history())),
       ...(client.role === "voice" ? { device: profileInfo(client) } : {}),
       admin: adminState(client, endReason),
@@ -870,12 +875,17 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
         if (client.role !== "voice" || device === undefined) {
           return result(client, message.requestId, failure("bad_message", "This page did not say which device it is; reload it"))
         }
+        // An accepted pick decides who answers next: the device's open armed and follow-up windows close.
+        const picked = (r: Parameters<typeof afterAssistantsChange>[0]) => {
+          afterAssistantsChange(r)
+          if (r.ok) sessionOf(client)?.pickAccepted()
+        }
         // The device record is saved in the background at hello: make sure it exists before the pick writes to it.
         return limited(
           client,
           message.requestId,
           Effect.andThen(frontends.seen(device, connectedDevices()), assistants.pick(device.id, message.withoutPhrase)),
-          afterAssistantsChange
+          picked
         )
       }
       case "conversation.read": {
@@ -891,12 +901,15 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
         const session = sessionOf(client)
         // Without a session: the id reserved for that assistant (the session takes it over).
         const info = session === undefined ? sessions.conversation(client.sessionKey, assistantId, setup.assistants.map((a) => a.id)) : session.conversation.conversation(assistantId)
+        // Read together with the history: the turn its last exchange is (the page may still show that turn as running).
+        const lastTurnId = session?.conversation.lastTurnId(assistantId)
         return send(client, {
           type: "conversation.history",
           requestId: message.requestId,
           assistantId,
           id: info.id,
-          history: session === undefined ? [] : historyItems(Effect.runSync(session.conversation.history(assistantId)))
+          history: session === undefined ? [] : historyItems(Effect.runSync(session.conversation.history(assistantId))),
+          ...(lastTurnId !== undefined ? { lastTurnId } : {})
         })
       }
       case "wake.test": {
