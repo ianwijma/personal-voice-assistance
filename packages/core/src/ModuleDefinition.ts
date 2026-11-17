@@ -129,9 +129,9 @@ export interface ModuleDefinition<S extends SettingsSpec = SettingsSpec> {
   readonly uses?: ReadonlyArray<string>
   /**
    * The part that runs once per module (version 2) while it is demanded, with its shared settings only, in a scope the
-   * host closes when demand ends or a new generation replaces it (after the grace period): sockets, caches, handlers,
-   * services and contributions. 10 s to start. What it returns as `value` every instance receives as `ctx.shared`.
-   * A changed shared setting starts a new generation: a new shared part and every instance, switched to at once.
+   * host closes when the module stops (after its instances): sockets, caches, handlers, services and contributions.
+   * 10 s to start. What it returns as `value` every instance receives as `ctx.shared`. Any change of what the module
+   * runs stops it (shared part and instances) and then starts it again.
    */
   shared?(context: SharedContext<SettingsOf<S>>): Effect.Effect<SharedPart<unknown>, ModuleStartError, Scope.Scope>
   /**

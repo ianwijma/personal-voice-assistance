@@ -698,10 +698,15 @@ describe("the page boundary after review round 2", () => {
       yield* host.startEnabled
       const press = yield* Effect.forkChild(host.fieldAction("leaky", "slowEcho"))
       yield* advance(10)
-      assert.isTrue((yield* host.configure("leaky", { values: {}, secrets: { token: NEW } })).ok)
+      // The module is stopped before it starts again: the press in flight gets the grace period, so the configure
+      // completes only once the press has ended (merge with P1 round 3: there is no second generation meanwhile).
+      const configured = yield* Effect.forkChild(host.configure("leaky", { values: {}, secrets: { token: NEW } }))
+      yield* advance(10)
+      assert.isUndefined(configured.pollUnsafe())
       probe.release!()
       const result = yield* Fiber.join(press)
       assert.deepStrictEqual(result, { ok: true, result: { ok: true, text: "Echo [secret]" } })
+      assert.isTrue((yield* Fiber.join(configured)).ok)
       assert.notInclude(pageOf(host), NEW)
       yield* advance(20_000)
     }))

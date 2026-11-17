@@ -7,6 +7,7 @@ import {
   makeModuleHost,
   makeToolRegistry,
   type ModuleDemand,
+  type Principal,
   makeTurnTrace,
   type ModuleDefinition,
   type ModuleHost,
@@ -53,7 +54,6 @@ import { defaultSystemPrompt } from "../config.ts"
 import { envView as processEnvView, userCwd } from "../env.ts"
 import { type EnvView, makeEnvView } from "../envView.ts"
 import { moduleCatalog, moduleDemandOf, withModuleInstructions } from "../modules.ts"
-import { runCoreChecks } from "../coreChecks.ts"
 import { makeRequirementChecker } from "../requirements.ts"
 import { makeHealthService } from "./health.ts"
 import {
@@ -343,11 +343,10 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
         moduleOn: (assistantId, moduleId) => !isCapability(moduleId) || assistantsNow().get(assistantId)?.modules[moduleId]?.on === true,
         toolOff: (assistantId, moduleId, toolName) =>
           isCapability(moduleId) && (assistantsNow().get(assistantId)?.modules[moduleId]?.offTools.includes(toolName) ?? false),
-        // The parts of a principal must belong together: an assistant that does not exist is no assistant to act for.
-        principalProblem: (principal) => {
-          const assistantId = principal._tag === "turn" ? principal.turn.assistantId : principal._tag === "job" ? principal.job.assistantId : undefined
-          return assistantId !== undefined && !assistantsNow().has(assistantId) ? `the assistant "${assistantId}" does not exist.` : undefined
-        }
+        // The parts of a principal must belong together (or the call is refused): the assistant exists, the device
+        // is known and has that assistant, the connection is that device's. People come with P5; until then a
+        // principal that names one is refused (this server knows no people).
+        principalProblem: (principal) => principalProblem(principal)
       },
       // What modules may read about the assistant (`host.view()`): every read is a reference read or a small copy.
       view: {
@@ -358,6 +357,30 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
         home: () => sections.list().find((x) => x.id === "home")?.form.values ?? {}
       }
     })
+    /** Serve mode's check that a principal's parts belong together (`GatewayAccess.principalProblem`). */
+    const principalProblem = (principal: Principal): string | undefined => {
+      const parts = principal._tag === "turn"
+        ? { assistantId: principal.turn.assistantId, deviceId: principal.turn.deviceId, connection: principal.turn.connection, person: principal.turn.person }
+        : principal._tag === "job"
+        ? { assistantId: principal.job.assistantId, deviceId: principal.job.deviceId, connection: undefined, person: principal.job.person }
+        : principal._tag === "notification"
+        ? { assistantId: undefined, deviceId: principal.notification.deviceId, connection: principal.notification.connection, person: principal.notification.person }
+        : undefined
+      if (parts === undefined) return undefined
+      const { assistantId, connection, deviceId, person } = parts
+      if (assistantId !== undefined && !assistantsNow().has(assistantId)) return `the assistant "${assistantId}" does not exist.`
+      if (deviceId === undefined) return undefined
+      if (!devices.known(deviceId) && hub?.deviceConnected(deviceId) !== true) return `the device "${deviceId}" is not known.`
+      if (assistantId !== undefined) {
+        const settings = deviceSettingsOf(deviceId)
+        const assigned = settings.assistants.some((a) => a.assistant === assistantId) ||
+          (settings.withoutPhrase.mode === "assistant" && settings.withoutPhrase.assistant === assistantId)
+        if (!assigned) return `the assistant "${assistantId}" is not on the device "${deviceId}".`
+      }
+      if (connection !== undefined && hub?.deviceOfConnection(connection) !== deviceId) return `the request did not come from the device "${deviceId}".`
+      if (person !== undefined) return "this server knows no people yet."
+      return undefined
+    }
     const keys = makeKeys({ vault, store, host })
     const access = makeAccessPolicy({ catalog, sections: sections.list, vaultState: keys.state })
 
@@ -1284,19 +1307,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       host,
       checker,
       catalog,
-      fork: run,
-      core: Effect.suspend(() =>
-        runCoreChecks({
-          checker,
-          env,
-          dataDir: options.dataDir,
-          modelDirs: sections.modelDirs(),
-          serving: true,
-          vault: { state: vault.state(), path: vault.path },
-          assistants: [...assistantsNow().values()],
-          sttShared: sttShared()
-        })
-      )
+      fork: run
     })
     hub = makeSessionHub({
       admin,
@@ -1487,7 +1498,8 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
             // `startIfStopped`: after waiting out a `busy` (a reload the owner sent meanwhile), the engines
             // that reload brought up must not be rebuilt.
             whenIdle("the engines", () => true, theEngine.startIfStopped),
-            Effect.andThen(syncModules(), reconcileModules),
+            // The host starts nothing before `startEnabled`, which is the first start of the modules here.
+            Effect.andThen(host.startEnabled, reconcileModules),
             syncResources()
           ], { concurrency: 3, discard: true })
         }))

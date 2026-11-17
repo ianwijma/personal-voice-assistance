@@ -87,29 +87,32 @@ const hostOf = (
 
 const info = (host: { readonly modules: () => ReadonlyArray<ModuleInfo> }, id: string) => host.modules().find((m) => m.id === id)!
 
-describe("replacement by generations (findings 1, 2, 5, 8, 9)", () => {
-  it.effect("1: a configure whose new instance clashes with another module changes nothing: old service, old scope alive", () =>
+// Since review round 3 a module is replaced by stopping it, then starting it (docs/ARCHITECTURE.md "Module host"): the
+// round 1 scenarios below now end with no two of a module at any moment, and a failed start leaves it down with its
+// error on the Health page (as on main), never an old one kept running beside a new one.
+describe("replacement is stop, then start (findings 1, 2, 5, 8, 9; round 3)", () => {
+  it.effect("1: a configure whose new instance clashes with another module: the old one stopped first, the new one is refused and closed", () =>
     Effect.gen(function*() {
       const probe: Probe = { log: [] }
       const other = defineModule({ id: "other", name: "Other", description: "", start: () => Effect.succeed({ tools: [makeTool({ name: "taken", description: "", parameters: Schema.Struct({}), execute: () => Effect.void })] }) })
       const persistence = recording()
       const host = yield* hostOf([provider(probe, { toolName: (a) => (a === "clash" ? "taken" : `prov_${a}`) }), other], demandOf({ prov: [{ assistantId: "a" }] }), { persistence })
       yield* host.startEnabled
-      const before = host.service(Svc)
-      assert.deepStrictEqual(before, { address: "a1" })
+      assert.deepStrictEqual(host.service(Svc), { address: "a1" })
       const result = yield* host.configure("prov", { values: { address: "clash" }, secrets: {} })
       assert.isFalse(result.ok)
       assert.match(result.ok ? "" : result.error.message, /already used by module Other/)
-      assert.strictEqual(host.service(Svc), before, "the same service object: the new shared part was never published")
-      assert.deepStrictEqual(yield* host.contributions(Section), ["prov@a1"])
-      yield* advance(20_000)
-      assert.notInclude(probe.log, "prov:shared-a1", "the old shared scope is alive")
-      assert.include(probe.log, "prov:shared-clash", "the candidate was closed")
-      assert.deepStrictEqual(persistence.saves, [], "nothing saved")
-      assert.deepStrictEqual(host.snapshot().registry.specs.map((s) => s.name).sort(), ["prov_a1", "taken"])
+      assert.strictEqual(host.service(Svc), undefined, "nothing of prov is published")
+      assert.deepStrictEqual(yield* host.contributions(Section), [])
+      const at = (line: string) => probe.log.indexOf(line)
+      assert.isTrue(at("prov:shared-a1") >= 0 && at("prov:shared-a1") < at("prov:shared+clash"), "the old shared part closed before the new one started")
+      assert.include(probe.log, "prov:shared-clash", "the refused start was closed")
+      assert.strictEqual(info(host, "prov").state, "error")
+      assert.deepStrictEqual(host.snapshot().registry.specs.map((s) => s.name), ["taken"])
+      assert.isDefined(host.issues.all().find((i) => i.id === "prov.start"))
     }))
 
-  it.effect("2: a Home default change with two instances: one generation; a failing second start leaves the old one serving", () =>
+  it.effect("2: a Home default change with two instances; the second fails: everything that started is closed, the module is down", () =>
     Effect.gen(function*() {
       const probe: Probe = { log: [] }
       let address = "a1"
@@ -117,18 +120,19 @@ describe("replacement by generations (findings 1, 2, 5, 8, 9)", () => {
         defaults: () => ({ address })
       })
       yield* host.startEnabled
-      const before = host.service(Svc)
       address = "bad:long"
       yield* host.refresh
-      assert.strictEqual(host.service(Svc), before, "the old generation serves")
-      assert.deepStrictEqual(info(host, "prov").instances?.map((i) => i.state), ["running", "running"])
-      assert.include(host.issues.all().map((i) => i.title), "PROV could not apply its new settings")
-      yield* advance(20_000)
-      assert.notInclude(probe.log, "prov:stop-a1/short", "no old instance was retired")
-      assert.notInclude(probe.log, "prov:shared-a1")
+      assert.strictEqual(host.service(Svc), undefined)
+      assert.deepStrictEqual(info(host, "prov").instances?.map((i) => i.state), ["error", "error"])
+      assert.match(info(host, "prov").error ?? "", /bad long/)
+      assert.includeMembers(probe.log, ["prov:stop-a1/short", "prov:stop-a1/long", "prov:shared-a1", "prov:stop-bad:long/short", "prov:shared-bad:long"])
+      // Fixed: it starts again.
+      address = "a2"
+      yield* host.refresh
+      assert.deepStrictEqual(host.service(Svc), { address: "a2" })
     }))
 
-  it.effect("2: a slow second start: nothing switches until both have started, then all at once; old generation retired together", () =>
+  it.effect("2: a slow second start: absent while it starts, then all at once; the old instances closed before the old shared part, all before", () =>
     Effect.gen(function*() {
       const probe: Probe = { log: [] }
       let address = "a1"
@@ -139,40 +143,34 @@ describe("replacement by generations (findings 1, 2, 5, 8, 9)", () => {
       address = "slowi:long"
       const fiber = yield* Effect.forkChild(host.refresh)
       yield* advance(500)
-      assert.deepStrictEqual(host.service(Svc), { address: "a1" }, "during: the old shared part")
-      assert.include(host.snapshot().registry.specs.map((s) => s.name), "prov_a1")
+      assert.strictEqual(host.service(Svc), undefined, "during: absent")
+      assert.deepStrictEqual(host.snapshot().registry.specs, [])
       yield* advance(600)
       yield* Fiber.join(fiber)
       assert.deepStrictEqual(host.service(Svc), { address: "slowi:long" }, "after: the new one")
       assert.deepStrictEqual(yield* host.contributions(Section), ["prov@slowi:long"], "never both")
-      const at = probe.log.length
-      yield* advance(9_000)
-      assert.strictEqual(probe.log.length, at, "the old generation serves its grace period")
-      yield* advance(2_000)
-      const closed = probe.log.slice(at)
+      const firstNew = probe.log.indexOf("prov:shared+slowi:long")
+      const closed = probe.log.slice(0, firstNew).filter((l) => l.startsWith("prov:stop-") || l.startsWith("prov:shared-"))
       assert.sameMembers(closed, ["prov:stop-a1/short", "prov:stop-a1/long", "prov:shared-a1"])
       assert.strictEqual(closed.at(-1), "prov:shared-a1", "its instances close before its shared part")
-      assert.isUndefined(host.issues.all().find((i) => i.id === "prov.restart"))
     }))
 
-  it.effect("5: a provider used only through `uses` whose new shared part fails keeps its settings and service", () =>
+  it.effect("5: a provider used only through `uses` whose new shared part fails: down with its error; the consumer runs; a fix starts it", () =>
     Effect.gen(function*() {
       const probe: Probe = { log: [] }
       const consumer = defineModule({ apiVersion: 2, id: "cons", name: "Cons", description: "", uses: ["prov"], start: () => Effect.succeed({}) })
       const persistence = recording()
       const host = yield* hostOf([consumer, provider(probe)], demandOf({ cons: [{ assistantId: "a" }], prov: [] }), { persistence })
       yield* host.startEnabled
-      const before = host.service(Svc)
-      assert.deepStrictEqual(before, { address: "a1" })
+      assert.deepStrictEqual(host.service(Svc), { address: "a1" })
       const result = yield* host.configure("prov", { values: { address: "fail" }, secrets: {} })
       assert.isFalse(result.ok)
-      assert.strictEqual(host.service(Svc), before)
-      assert.deepStrictEqual(persistence.saves, [], "the failed settings were not saved")
-      assert.strictEqual(info(host, "prov").settings.values.address, "a1")
+      assert.strictEqual(host.service(Svc), undefined)
+      assert.strictEqual(info(host, "prov").state, "error")
+      assert.strictEqual(info(host, "cons").state, "running")
       const ok = yield* host.configure("prov", { values: { address: "a2" }, secrets: {} })
       assert.isTrue(ok.ok)
       assert.deepStrictEqual(host.service(Svc), { address: "a2" })
-      assert.strictEqual(persistence.saves.length, 1)
     }))
 
   it.effect("8 (round 2): interrupting enable's caller only stops its wait: the start goes on, is published, and closes once at shutdown", () =>
@@ -211,7 +209,7 @@ describe("replacement by generations (findings 1, 2, 5, 8, 9)", () => {
       assert.deepStrictEqual(closes, ["prov:stop-slowi:short/short", "prov:shared-slowi:short"])
     }))
 
-  it.effect("8 (round 2): a configure whose caller gave up is still applied; a second one meanwhile is busy, then free", () =>
+  it.effect("8 (round 2): a configure whose caller gave up is still applied; a second one meanwhile is applied after it", () =>
     Effect.gen(function*() {
       const probe: Probe = { log: [] }
       const host = yield* hostOf([provider(probe)], demandOf({ prov: [{ assistantId: "a" }] }))
@@ -219,14 +217,13 @@ describe("replacement by generations (findings 1, 2, 5, 8, 9)", () => {
       const fiber = yield* Effect.forkChild(host.configure("prov", { values: { address: "slowi:short" }, secrets: {} }))
       yield* advance(200)
       yield* Fiber.interrupt(fiber)
-      assert.deepStrictEqual(host.service(Svc), { address: "a1" }, "the old generation serves while the new one starts")
-      const busy = yield* host.configure("prov", { values: { address: "a3" }, secrets: {} })
-      assert.strictEqual(busy.ok ? "" : busy.error.code, "busy")
+      assert.strictEqual(host.service(Svc), undefined, "absent while the new one starts")
+      const second = yield* Effect.forkChild(host.configure("prov", { values: { address: "a3" }, secrets: {} }))
       yield* advance(1_100)
-      assert.deepStrictEqual(host.service(Svc), { address: "slowi:short" })
-      assert.strictEqual(info(host, "prov").settings.values.address, "slowi:short", "saved once switched to")
-      assert.isTrue((yield* host.configure("prov", { values: { address: "a3" }, secrets: {} })).ok)
+      assert.isTrue((yield* Fiber.join(second)).ok)
       assert.deepStrictEqual(host.service(Svc), { address: "a3" })
+      assert.strictEqual(info(host, "prov").settings.values.address, "a3")
+      assert.include(probe.log, "prov:shared+slowi:short", "the first was applied too")
     }))
 
   it.effect("9 (decision 1): a first generation whose direct instance fails is not published; its `uses` consumer runs without the service; Health says why", () =>
@@ -325,7 +322,7 @@ describe("a generated action tool runs exactly the values it was admitted with (
       const gateway = makeExecutionGateway()
       const tool = makeTool({ name: "t", description: "", parameters: Schema.Struct({}), risk: { classes: ["change"], of: () => "security" }, execute: () => Effect.succeed("ran") })
       const error = yield* Effect.flip(gateway.tool(undefined, tool, {}))
-      assert.match(error.message, /^Not run: its risk was "security", which it does not declare/)
+      assert.strictEqual(error.message, "Not run: what it would do could not be judged.", "the module's own text goes to the log only")
     }))
 })
 
@@ -545,26 +542,28 @@ describe("restarts keep their settings (findings 16, 23)", () => {
       assert.strictEqual(info(host, "keyed").state, "running")
     }))
 
-  it.effect("23: a failed restart's warning goes when a configure succeeds, and when the module is switched off", () =>
+  it.effect("23 (round 3): a failed restart leaves it down with its error; a configure that starts brings it back; switched off, no error", () =>
     Effect.gen(function*() {
       const starts: Array<string> = []
       const fail = { current: false }
       const host = yield* hostOf([keyed(starts, fail)], undefined, { persistence: readOnlyPersistence({ modules: {}, secrets: { keyed: { token: "t" } } }) })
       yield* host.startEnabled
-      const restartWarning = () => host.issues.all().some((i) => i.id === "keyed.restart")
+      const startError = () => host.issues.all().some((i) => i.id === "keyed.start")
       fail.current = true
       yield* restartOf!("x")
       yield* settle
-      assert.isTrue(restartWarning())
+      assert.isTrue(startError())
+      assert.strictEqual(info(host, "keyed").state, "error")
       fail.current = false
       assert.isTrue((yield* host.configure("keyed", { values: { region: "us" }, secrets: {} })).ok)
-      assert.isFalse(restartWarning(), "cleared by the successful configure")
+      assert.isFalse(startError(), "cleared by the successful configure")
+      yield* advance(5_000)
       fail.current = true
       yield* restartOf!("y")
       yield* settle
-      assert.isTrue(restartWarning())
+      assert.isTrue(startError())
       yield* host.disable("keyed")
-      assert.isFalse(restartWarning(), "cleared when it stops")
+      assert.isFalse(startError(), "cleared when it stops")
     }))
 
   it.effect("plan item 2: requestRestart from the shared part starts a new generation (shared and instances), switched at once", () =>

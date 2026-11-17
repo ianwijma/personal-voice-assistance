@@ -1,13 +1,15 @@
 // Module API v2, review round 2 (docs/MODULES-PLAN.md §4 P1): each test is the reviewer's own sequence of events for
-// one finding of p1-r2, against the reconciling host (docs/ARCHITECTURE.md "Module host: the reconciler").
+// one finding of p1-r2. Since review round 3 the host replaces a module by stopping it, then starting it (one worker,
+// one module at a time; docs/ARCHITECTURE.md "Module host"), so the scenarios that depended on two generations of a
+// module now end with no overlap at all.
 import { assert, describe, it } from "@effect/vitest"
 import { encodeServerMessage, type ModuleInfo } from "@pva/protocol"
-import { Deferred, Effect, Fiber, Schema } from "effect"
+import { Cause, Deferred, Effect, Fiber, Schema } from "effect"
 import { TestClock } from "effect/testing"
 import { defineAction } from "../src/Actions.ts"
 import { makeExecutionGateway } from "../src/Gateway.ts"
 import { makeTool } from "../src/Module.ts"
-import { ContributionKey, type ModuleHostApi, type RequirementCheck, ServiceKey } from "../src/ModuleApi.ts"
+import { ContributionKey, isModuleStopped, type ModuleHostApi, type RequirementCheck, ServiceKey } from "../src/ModuleApi.ts"
 import { defineModule, type ModuleDefinition, ModuleStartError } from "../src/ModuleDefinition.ts"
 import { type ModuleDemand, type ModulePersistence, makeModuleHost, readOnlyPersistence } from "../src/ModuleHost.ts"
 import type { PartHandle, Registrar } from "../src/ModuleRegistrations.ts"
@@ -202,13 +204,14 @@ describe("a generation owns its registrations (findings 4, 12)", () => {
     }]
   }
 
-  it.effect("4: a handler is live from its generation's switch only; never for two generations; never for a failed candidate", () =>
+  it.effect("4: a handler is live while its module is published only; absent while it restarts; never twice; never for a failed start", () =>
     Effect.gen(function*() {
       const table = new Map<string, { readonly generation: number; readonly handle: PartHandle }>()
       const handles: Array<PartHandle> = []
       const log: Array<string> = []
       const gate = yield* Deferred.make<void>()
       let gated = false
+      let handleOf: PartHandle | undefined
       const mod = defineModule({
         apiVersion: 2,
         id: "sub",
@@ -224,7 +227,17 @@ describe("a generation owns its registrations (findings 4, 12)", () => {
           }),
         start: () => Effect.succeed({})
       })
-      const host = yield* hostOf([mod], demandOf({ sub: [{ assistantId: "a" }] }), { registrars: [handlerKind(table, handles)] })
+      const host = yield* hostOf([mod], demandOf({ sub: [{ assistantId: "a" }] }), {
+        registrars: [
+          handlerKind(table, handles),
+          // A part that registers during its start (a context member would, through its handle).
+          ({ handle, shared }) => {
+            if (shared === undefined) return []
+            handleOf = handle
+            return []
+          }
+        ]
+      })
       const deliver = () => table.get("on-event")?.handle.id
       yield* host.startEnabled
       const g1 = handles[0]!.id
@@ -232,25 +245,27 @@ describe("a generation owns its registrations (findings 4, 12)", () => {
       gated = true
       const fiber = yield* Effect.forkChild(host.configure("sub", { values: { address: "a2" }, secrets: {} }))
       yield* settle
-      assert.strictEqual(deliver(), g1, "while the new generation starts, the old one handles events")
+      assert.strictEqual(deliver(), undefined, "while the new one starts, the old one is withdrawn: nothing handles events")
+      assert.include(log, "closed a1", "and closed before the new one started")
       yield* Deferred.succeed(gate, undefined)
       assert.isTrue((yield* Fiber.join(fiber)).ok)
+      gated = false
       const g2 = handles[1]!.id
-      assert.strictEqual(deliver(), g2, "after the switch, only the new one; the old one is in its grace period")
-      assert.strictEqual(handles[0]!.state(), "retired")
-      // Registering through a retired part is refused; through the live one it is published at once.
+      assert.strictEqual(deliver(), g2)
+      assert.strictEqual(handles[0]!.state(), "closed")
+      // Registering after the start is refused, for an old part and for the live one: only the worker publishes.
       assert.isFalse(handles[0]!.register({ kind: "late", publish: () => log.push("late published"), withdraw: () => {} }).ok)
-      assert.isTrue(handles[1]!.register({ kind: "late", publish: () => log.push("late published"), withdraw: () => log.push("late withdrawn") }).ok)
-      assert.deepStrictEqual(log, ["late published"])
-      // A candidate that fails never handles anything.
+      assert.isFalse(handleOf!.register({ kind: "late", publish: () => log.push("late published"), withdraw: () => {} }).ok)
+      assert.notInclude(log, "late published")
+      // A start that fails never handles anything, and the module is down.
       const failed = yield* host.configure("sub", { values: { address: "fail" }, secrets: {} })
       assert.isFalse(failed.ok)
-      assert.strictEqual(deliver(), g2)
-      yield* host.configure("sub", { values: { address: "a3" }, secrets: {} })
-      assert.include(log, "late withdrawn", "a part's own registrations go with it")
+      assert.strictEqual(deliver(), undefined)
+      assert.isTrue((yield* host.configure("sub", { values: { address: "a3" }, secrets: {} })).ok)
+      assert.strictEqual(deliver(), handles.at(-1)!.id)
     }))
 
-  it.effect("12: a retired generation's requestRestart is ignored; a failed candidate's never reaches the published one", () =>
+  it.effect("12: an old part's requestRestart after its module stopped dies with ModuleStopped; a failed start's request is dropped", () =>
     Effect.gen(function*() {
       const restarts: Array<{ readonly address: string; readonly restart: (reason: string) => Effect.Effect<void> }> = []
       let shareds = 0
@@ -264,7 +279,7 @@ describe("a generation owns its registrations (findings 4, 12)", () => {
           Effect.gen(function*() {
             shareds++
             restarts.push({ address: settings.address ?? "", restart: host.requestRestart })
-            // A candidate that asks for a restart during its own start, then fails.
+            // A start that asks for a restart during itself, then fails.
             if (settings.address === "fail") {
               yield* host.requestRestart("socket dropped while starting")
               return yield* new ModuleStartError({ message: "refused" })
@@ -277,37 +292,48 @@ describe("a generation owns its registrations (findings 4, 12)", () => {
       yield* host.startEnabled
       assert.isTrue((yield* host.configure("sock", { values: { address: "a2" }, secrets: {} })).ok)
       assert.strictEqual(shareds, 2)
-      // G1 is in its grace period: its socket callback asks for a restart.
-      yield* restarts[0]!.restart("G1's socket closed")
-      yield* settle
-      assert.strictEqual(shareds, 2, "the healthy G2 is not restarted by G1")
-      // A failed candidate's request is dropped with it.
+      // The first start's part has closed: its host object answers with ModuleStopped, and nothing restarts.
+      const exit = yield* Effect.exit(restarts[0]!.restart("G1's socket closed"))
+      assert.isTrue(exit._tag === "Failure" && isModuleStopped(Cause.squash(exit.cause)))
+      yield* advance(10_000)
+      assert.strictEqual(shareds, 2, "the healthy second start is not restarted")
+      // A failed start's request is dropped with it.
       assert.isFalse((yield* host.configure("sock", { values: { address: "fail" }, secrets: {} })).ok)
-      yield* settle
+      yield* advance(10_000)
       assert.strictEqual(shareds, 3)
-      // G2's own request works.
-      yield* restarts[1]!.restart("G2's tools changed")
-      yield* settle
-      assert.strictEqual(shareds, 4)
+      assert.isTrue((yield* host.configure("sock", { values: { address: "a4" }, secrets: {} })).ok)
+      yield* restarts.at(-1)!.restart("its tools changed")
+      yield* advance(10)
+      assert.strictEqual(shareds, 5)
     }))
 })
 
 describe("CLI and shutdown (findings 6, 7)", () => {
-  it.effect("6: closing the host during a grace period closes the retired generation, instances before the shared part", () =>
+  it.effect("6: closing the host while a call is in flight: the call is interrupted, instances close before the shared part, once", () =>
     Effect.gen(function*() {
       const log: Array<string> = []
+      let call: Fiber.Fiber<unknown, unknown> | undefined
+      const slow = defineModule({
+        apiVersion: 2,
+        id: "slow",
+        name: "Slow",
+        description: "",
+        shared: () => Effect.as(Effect.addFinalizer(() => Effect.sync(() => log.push("shared closed"))), { value: undefined }),
+        start: () =>
+          Effect.as(Effect.addFinalizer(() => Effect.sync(() => log.push("instance closed"))), {
+            tools: [makeTool({ name: "wait", description: "", parameters: Schema.Struct({}), execute: () => Effect.as(Effect.sleep(60_000), "done") })]
+          })
+      })
       yield* Effect.gen(function*() {
-        const host = yield* hostOf([provider(log)], demandOf({ prov: [{ assistantId: "a" }] }))
+        const host = yield* hostOf([slow], undefined)
         yield* host.startEnabled
-        assert.isTrue((yield* host.configure("prov", { values: { address: "a2" }, secrets: {} })).ok)
-        yield* advance(1_000)
-        assert.notInclude(log, "prov:shared-a1", "still in its grace period")
+        call = yield* Effect.forkDetach(host.snapshot().registry.run({ id: "1", name: "wait", input: {} }))
+        yield* settle
       }).pipe(Effect.scoped)
-      const closes = log.filter((l) => l.includes("-a1"))
-      assert.deepStrictEqual(closes, ["prov:stop-a1/Amsterdam", "prov:shared-a1"], "closed at shutdown, once, in order")
-      assert.strictEqual(log.filter((l) => l === "prov:shared-a2").length, 1)
+      assert.deepStrictEqual(log, ["instance closed", "shared closed"])
+      const result = (yield* Fiber.join(call!)) as { readonly isError: boolean }
+      assert.isTrue(result.isError, "interrupted: no grace period when the host closes")
     }))
-
   it.effect("7: rollback and shutdown wait for an instance's asynchronous finalizer before closing its shared part", () =>
     Effect.gen(function*() {
       const log: Array<string> = []
@@ -407,9 +433,9 @@ describe("order through `uses` (findings 8, 9)", () => {
 })
 
 describe("settings (findings 10, 11, 13, 16)", () => {
-  it.effect("10: settingsFor follows a change of an overridable field's shared default, and an assistant's own value, live", () =>
+  it.effect("10 (round 3, finding 13): settingsFor answers from the desired state its module was started with; a change restarts it", () =>
     Effect.gen(function*() {
-      let settingsFor: ((assistantId: string | undefined) => unknown) | undefined
+      const seen: Array<{ readonly settingsFor: (assistantId: string | undefined) => unknown; readonly atStart: unknown }> = []
       const mod = defineModule({
         apiVersion: 2,
         id: "wx",
@@ -418,7 +444,8 @@ describe("settings (findings 10, 11, 13, 16)", () => {
         settings: { place: Setting.text({ label: "Place", default: "Amsterdam", overridable: true }), units: Setting.text({ label: "Units", default: "metric" }) },
         shared: (ctx) =>
           Effect.sync(() => {
-            settingsFor = ctx.settingsFor as never
+            // Asked inside `shared` itself: the same picture the module starts with.
+            seen.push({ settingsFor: ctx.settingsFor as never, atStart: ctx.settingsFor(undefined) })
             return { value: undefined }
           }),
         start: () => Effect.succeed({})
@@ -426,25 +453,21 @@ describe("settings (findings 10, 11, 13, 16)", () => {
       const demand = demandOf({ wx: [{ assistantId: "a" }, { assistantId: "b", own: { place: "Utrecht" } }] })
       const host = yield* hostOf([mod], demand)
       yield* host.startEnabled
-      const placeOf = (id: string | undefined) => (settingsFor!(id) as { readonly place: string }).place
+      const placeOf = (id: string | undefined) => (seen.at(-1)!.settingsFor(id) as { readonly place: string }).place
       assert.deepStrictEqual([placeOf("a"), placeOf("b"), placeOf(undefined)], ["Amsterdam", "Utrecht", "Amsterdam"])
-      // Default only: the shared part stays (place is not a shared field), and its settingsFor moves.
-      const before = settingsFor
-      assert.isTrue((yield* host.configure("wx", { values: { place: "London" }, secrets: {} })).ok)
-      assert.strictEqual(settingsFor, before, "the same shared part")
-      assert.deepStrictEqual([placeOf("a"), placeOf("b"), placeOf(undefined)], ["London", "Utrecht", "London"])
-      // Own only.
+      // Both a shared and an overridable default at once: the new start sees both, from inside `shared` too.
+      assert.isTrue((yield* host.configure("wx", { values: { place: "Rome", units: "imperial" }, secrets: {} })).ok)
+      assert.deepStrictEqual(seen.at(-1)!.atStart, { place: "Rome", units: "imperial" })
+      assert.deepStrictEqual([placeOf("a"), placeOf("b")], ["Rome", "Utrecht"])
+      // An own value only: what runs changes (an instance key), so it starts again with it.
       demand.current.set("wx", [{ assistantId: "a", own: { place: "Paris" } }, { assistantId: "b", own: { place: "Utrecht" } }])
       yield* host.refresh
-      assert.deepStrictEqual([placeOf("a"), placeOf("b")], ["Paris", "Utrecht"])
-      // Combined with a shared change: a new generation, whose settingsFor has both.
-      assert.isTrue((yield* host.configure("wx", { values: { place: "Rome", units: "imperial" }, secrets: {} })).ok)
-      assert.notStrictEqual(settingsFor, before)
-      assert.deepStrictEqual(settingsFor!("a"), { place: "Paris", units: "imperial" })
-      assert.deepStrictEqual(settingsFor!(undefined), { place: "Rome", units: "imperial" })
+      assert.deepStrictEqual(seen.at(-1)!.settingsFor("a"), { place: "Paris", units: "imperial" })
+      // The first start's settingsFor, kept after its part closed, answers with ModuleStopped.
+      assert.throws(() => seen[0]!.settingsFor("a"), /has stopped/)
     }))
 
-  it.effect("11: a shared-only provider gains a direct assistant and a new shared default at once; the new instance fails: the old generation is kept", () =>
+  it.effect("11: a shared-only provider gains a direct assistant and a new shared default at once; the new instance fails: down, closed, said", () =>
     Effect.gen(function*() {
       const log: Array<string> = []
       let address = "a1"
@@ -452,14 +475,19 @@ describe("settings (findings 10, 11, 13, 16)", () => {
       const demand = demandOf({ cons: [{ assistantId: "c" }], prov: [] })
       const host = yield* hostOf([consumer, provider(log, { failInstance: (place) => place === "Nowhere" })], demand, { defaults: () => ({ address }) })
       yield* host.startEnabled
-      const before = host.service(Svc)
-      assert.deepStrictEqual(before, { address: "a1" })
+      assert.deepStrictEqual(host.service(Svc), { address: "a1" })
       demand.current.set("prov", [{ assistantId: "d", own: { place: "Nowhere" } }])
       address = "a2"
       yield* host.refresh
-      assert.strictEqual(host.service(Svc), before, "the old generation serves: a new one is published only if every instance started")
-      assert.include(log, "prov:shared-a2", "the new shared part was closed")
-      assert.include(host.issues.all().map((i) => i.title), "PROV could not apply its new settings")
+      assert.strictEqual(host.service(Svc), undefined, "a start is published only if every part started")
+      assert.includeMembers(log, ["prov:shared-a1", "prov:shared-a2"], "the old one and the new shared part were closed")
+      assert.strictEqual(info(host, "prov").state, "error")
+      assert.isDefined(host.issues.all().find((i) => i.id === "prov.start"))
+      assert.strictEqual(info(host, "cons").state, "running", "the consumer runs without the service")
+      // The assistant leaves: the failure is forgotten and it runs for its consumer again.
+      demand.current.set("prov", [])
+      yield* host.refresh
+      assert.deepStrictEqual(host.service(Svc), { address: "a2" })
     }))
 
   it.effect("13: an unlock while a configure is held in its save still switches on an `enabledWhenSet` module, and what it uses", () =>
@@ -498,19 +526,18 @@ describe("settings (findings 10, 11, 13, 16)", () => {
       assert.isTrue((yield* Fiber.join(configuring)).ok)
     }))
 
-  it.effect("16: a configure that fails keeps the old generation serving and says why on the Health page", () =>
+  it.effect("16: a configure that fails leaves the module down and says why on the Health page; a good one brings it back", () =>
     Effect.gen(function*() {
       const host = yield* hostOf([provider([])], demandOf({ prov: [{ assistantId: "a" }] }))
       yield* host.startEnabled
-      const before = host.service(Svc)
       const result = yield* host.configure("prov", { values: { address: "fail" }, secrets: {} })
       assert.isFalse(result.ok)
-      assert.strictEqual(host.service(Svc), before)
-      const issue = host.issues.all().find((i) => i.id === "prov.restart")
-      assert.strictEqual(issue?.title, "PROV could not apply its new settings")
+      assert.strictEqual(host.service(Svc), undefined)
+      const issue = host.issues.all().find((i) => i.id === "prov.start")
+      assert.strictEqual(issue?.title, "PROV could not start")
       assert.match(issue?.detail ?? "", /no such endpoint/)
       assert.isTrue((yield* host.configure("prov", { values: { address: "a2" }, secrets: {} })).ok)
-      assert.isUndefined(host.issues.all().find((i) => i.id === "prov.restart"), "gone once a configure succeeds")
+      assert.isUndefined(host.issues.all().find((i) => i.id === "prov.start"), "gone once it starts")
     }))
 })
 
@@ -529,14 +556,14 @@ describe("wire limits (finding 14)", () => {
     }))
 })
 
-describe("restarts lose no change (finding 17)", () => {
-  it.effect("a restart asked for while one is in progress starts again afterwards: the latest tool list is published", () =>
+describe("restarts lose no change (finding 17; round 3, finding 11)", () => {
+  it.effect("a restart asked for during a restart starts it again afterwards (within the interval): the latest tool list is published", () =>
     Effect.gen(function*() {
       const toolList = { current: ["one"] }
       const sampled = yield* Deferred.make<void>()
       const release = yield* Deferred.make<void>()
       let starts = 0
-      let restart: ((reason: string) => Effect.Effect<void>) | undefined
+      const restarts: Array<(reason: string) => Effect.Effect<void>> = []
       const mod = defineModule({
         apiVersion: 2,
         id: "mcp",
@@ -545,26 +572,29 @@ describe("restarts lose no change (finding 17)", () => {
         start: ({ host }) =>
           Effect.gen(function*() {
             starts++
+            restarts.push(host.requestRestart)
             const tools = [...toolList.current]
             if (starts === 2) {
-              // The first restart has sampled the list, and waits.
+              // The restart has sampled the list, and waits; the list changes again, and the starting part asks.
               yield* Deferred.succeed(sampled, undefined)
               yield* Deferred.await(release)
+              yield* host.requestRestart("list changed again")
             }
-            if (starts === 1) restart = host.requestRestart
             return { tools: tools.map((name) => makeTool({ name, description: "", parameters: Schema.Struct({}), execute: () => Effect.void })) }
           })
       })
       const host = yield* hostOf([mod], undefined)
       yield* host.startEnabled
       toolList.current = ["one", "two"]
-      yield* restart!("list changed")
+      yield* restarts[0]!("list changed")
       yield* Deferred.await(sampled)
       toolList.current = ["one", "two", "three"]
-      // The old instance is still the published one: its request counts.
-      yield* restart!("list changed again")
       yield* Deferred.succeed(release, undefined)
       yield* settle
+      assert.deepStrictEqual(host.snapshot().registry.specs.map((s) => s.name), ["one", "two"], "the second request waits for the interval")
+      // Many more requests in the interval are merged into one restart; none is lost.
+      for (let i = 0; i < 5; i++) yield* restarts[1]!("again")
+      yield* advance(5_000)
       yield* settle
       assert.deepStrictEqual(host.snapshot().registry.specs.map((s) => s.name), ["one", "two", "three"])
       assert.strictEqual(starts, 3)

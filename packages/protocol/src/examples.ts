@@ -144,7 +144,15 @@ export const exampleHealth: HealthInfo = {
       detail: "Music needs it: Resolves stream URLs.",
       fix: { kind: "command", label: "Install yt-dlp", value: "sudo apt install yt-dlp" }
     },
-    { id: "core.clock", severity: "warning", title: "The clock is not synchronised", detail: "Timers and alarms may fire at the wrong time.", fix: { kind: "command", label: "Turn on time synchronisation", value: "sudo timedatectl set-ntp true" } }
+    {
+      id: "music.speaker.kitchen",
+      module: "music",
+      device: "d-kitchen-0001",
+      severity: "warning",
+      title: "The speaker did not answer",
+      detail: "Music could not reach it at the last check.",
+      fix: { kind: "link", label: "Open Music", value: "#settings/shared/modules/music" }
+    }
   ],
   checkedAt: 1_763_100_000_000,
   checking: false

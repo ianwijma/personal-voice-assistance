@@ -120,6 +120,10 @@ export interface SessionHub {
   readonly deviceViews: () => ReadonlyArray<HostDeviceView>
   /** The connection that owns a session's audio now (a voice turn's `CurrentTurn.connection`). */
   readonly audioOwnerOf: (sessionKey: string) => ConnectionRef | undefined
+  /** The device a connection said hello as (its id), while it is open; `undefined` otherwise. */
+  readonly deviceOfConnection: (ref: ConnectionRef) => string | undefined
+  /** A connection of this device is open now (it said hello; its record may not be saved yet). */
+  readonly deviceConnected: (deviceId: string) => boolean
 }
 
 export interface HubOptions {
@@ -1071,6 +1075,14 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
     },
     refreshDevices,
     audioOwnerOf: (key) => owners.get(key)?.owner?.ref,
+    deviceConnected: (deviceId) => {
+      for (const client of clients) if (!client.closed && client.device?.id === deviceId) return true
+      return false
+    },
+    deviceOfConnection: (ref) => {
+      for (const client of clients) if (client.ref === ref) return client.closed ? undefined : client.device?.id
+      return undefined
+    },
     deviceViews: () =>
       [...registry.devices(live)].sort((a, b) => b.lastSeen - a.lastSeen).map((d) => ({ id: d.id, name: d.name, kind: d.kind, connections: d.connections })),
     wakeHeard: (key, text, phrase, accepted, source) => {

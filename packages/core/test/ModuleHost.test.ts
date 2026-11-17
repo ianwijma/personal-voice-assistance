@@ -185,7 +185,7 @@ describe("ModuleHost", () => {
       assert.deepStrictEqual(h.snapshot().registry.specs.map((s) => s.name), ["same"])
     }).pipe(Effect.scoped))
 
-  it.effect("disable: leaves the snapshot at once; a tool call in flight finishes; the scope closes after the grace period", () =>
+  it.effect("disable: leaves the snapshot at once; a tool call in flight finishes; then the scope closes (stop before start)", () =>
     Effect.gen(function*() {
       const m = testModule({ toolMillis: 3_000 })
       const { persistence, saves } = fakePersistence()
@@ -194,20 +194,25 @@ describe("ModuleHost", () => {
       const turnSnapshot = h.snapshot() // a turn in flight holds this
       const call = yield* Effect.forkChild(turnSnapshot.registry.run({ id: "1", name: "tool", input: {} }))
       yield* advance(10)
-      assert.deepStrictEqual(yield* h.disable("test"), { ok: true })
+      const disabling = yield* Effect.forkChild(h.disable("test"))
+      yield* advance(10)
       assert.deepStrictEqual(h.snapshot().registry.specs, [])
       assert.strictEqual(stateOf(h.modules()).state, "stopping")
       assert.deepStrictEqual(saves.at(-1)!.enabled, false)
+      // A new call through the old snapshot is refused at once: the module is withdrawn.
+      const late = yield* turnSnapshot.registry.run({ id: "2", name: "tool", input: {} })
+      assert.isTrue(late.isError)
+      assert.strictEqual(m.probe.closes, 0, "the call in flight still runs")
       yield* advance(3_000)
       const result = yield* Fiber.join(call)
       assert.deepStrictEqual([result.isError, result.content], [false, "hello"])
-      assert.strictEqual(m.probe.closes, 0, "still in its grace period")
-      yield* advance(7_000)
-      assert.strictEqual(m.probe.closes, 1)
+      assert.deepStrictEqual(yield* Fiber.join(disabling), { ok: true })
+      assert.strictEqual(m.probe.closes, 1, "closed as soon as its last call finished")
       assert.strictEqual(stateOf(h.modules()).state, "disabled")
+      assert.deepStrictEqual(m.probe.toolCalls, ["hello"])
     }).pipe(Effect.scoped))
 
-  it.effect("reconfigure while running: the new instance replaces the old one, a running tool call finishes on the old one", () =>
+  it.effect("reconfigure while running: the old instance stops (its call in flight finishes first), then the new one starts", () =>
     Effect.gen(function*() {
       const m = testModule({ toolMillis: 1_000 })
       const { persistence, saves } = fakePersistence()
@@ -215,21 +220,24 @@ describe("ModuleHost", () => {
       yield* h.startEnabled
       const call = yield* Effect.forkChild(h.snapshot().registry.run({ id: "1", name: "tool", input: {} }))
       yield* advance(10)
-      const result = yield* h.configure("test", { values: { greeting: "hi" }, secrets: {} })
-      assert.deepStrictEqual(result, { ok: true })
-      assert.deepStrictEqual(h.snapshot().instructions, ["Say hi."])
+      const configuring = yield* Effect.forkChild(h.configure("test", { values: { greeting: "hi" }, secrets: {} }))
+      yield* advance(10)
+      // Withdrawn and stopping: there is no moment with two of it.
+      assert.deepStrictEqual(h.snapshot().instructions, [])
+      assert.strictEqual(m.probe.starts, 1)
       yield* advance(1_000)
       assert.strictEqual((yield* Fiber.join(call)).content, "hello", "the old instance served the call")
+      assert.deepStrictEqual(yield* Fiber.join(configuring), { ok: true })
+      assert.deepStrictEqual(h.snapshot().instructions, ["Say hi."])
+      assert.strictEqual(m.probe.closes, 1, "the old instance closed before the new one started")
+      assert.strictEqual(m.probe.starts, 2)
       assert.deepStrictEqual(saves.at(-1)!.settings, { greeting: "hi" })
       yield* Effect.yieldNow
       assert.deepStrictEqual(stateOf(h.modules()).status, { text: "Greeting hi", tone: "ok" })
       assert.deepStrictEqual(stateOf(h.modules()).settings.values.greeting, "hi")
-      assert.strictEqual(m.probe.closes, 0)
-      yield* advance(10_000)
-      assert.strictEqual(m.probe.closes, 1, "the old instance closed after the grace period")
     }).pipe(Effect.scoped))
 
-  it.effect("reconfigure that fails to start keeps the old instance and does not save", () =>
+  it.effect("reconfigure that fails to start: the module is down with its error (nothing old keeps running); the settings are saved", () =>
     Effect.gen(function*() {
       const m = testModule({})
       const { persistence, saves } = fakePersistence()
@@ -237,10 +245,11 @@ describe("ModuleHost", () => {
       yield* h.startEnabled
       const result = yield* h.configure("test", { values: { greeting: "fail" }, secrets: {} })
       assert.strictEqual(result.ok ? "" : result.error.code, "module_start_failed")
-      assert.strictEqual(stateOf(h.modules()).state, "running")
-      assert.deepStrictEqual(h.snapshot().instructions, ["Say hello."])
-      assert.deepStrictEqual(stateOf(h.modules()).settings.values.greeting, "hello")
-      assert.deepStrictEqual(saves, [])
+      assert.deepStrictEqual([stateOf(h.modules()).state, stateOf(h.modules()).error], ["error", "Refused"])
+      assert.deepStrictEqual(h.snapshot().instructions, [])
+      assert.strictEqual(m.probe.closes, 1)
+      assert.deepStrictEqual(saves.at(-1)!.settings, { greeting: "fail" })
+      assert.isTrue(h.issues.all().some((i) => i.id === "test.start" && i.detail === "Refused"))
     }).pipe(Effect.scoped))
 
   it.effect("an invalid patch changes nothing; a locked field is refused", () =>

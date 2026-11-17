@@ -1,131 +1,66 @@
-// The module host's decisions as pure functions (docs/ARCHITECTURE.md "Module host: the reconciler"), tested with a
-// table of cases: what to start, keep, retire, and when a failed start is not tried again.
+// The module host's pure planner (docs/ARCHITECTURE.md "Module host"): one table of cases, each a target (what the
+// desired state asks) and what runs now, with the plan expected. Stop before start; a failed attempt is not tried
+// again until something in its attempt key changes; it is forgotten when the module should not run.
 import { describe, expect, it } from "vitest"
-import { type Failure, type InstanceTarget, isEmptyPlan, type ModuleCurrent, type ModulePlan, type ModuleTarget, planModule, reachedBy, usesOrder } from "../src/ModulePlanner.ts"
+import { type ModuleCurrent, type ModulePlan, type ModuleTarget, planModule, reachedBy, usesOrder } from "../src/ModulePlanner.ts"
 
-const inst = (key: string, users: Array<string> = [], fingerprint = `fp-${key}`, invalid?: string): InstanceTarget => ({
-  key,
-  users,
-  ownKeys: [],
-  invalid,
-  fingerprint
-})
-const target = (instances: Array<InstanceTarget>, shared?: { key: string; fingerprint: string }, runs = true): ModuleTarget => ({
+const target = (fingerprint: string, extra: Partial<ModuleTarget> = {}): ModuleTarget => ({
   id: "m",
-  runs,
-  shared: shared === undefined ? undefined : { ...shared, invalid: undefined },
-  instances
+  runs: true,
+  invalid: undefined,
+  instances: [{ key: "k", users: ["a"], ownKeys: [], invalid: undefined }],
+  fingerprint,
+  attempt: `${fingerprint}/0`,
+  ...extra
 })
-const current = (
-  generation: string | undefined,
-  instances: Record<string, { fingerprint: string; users?: Array<string> }>,
-  extra: { failedGeneration?: Failure; failedInstances?: Record<string, Failure>; retry?: number } = {}
-): ModuleCurrent => ({
-  generation,
-  instances: new Map(Object.entries(instances).map(([k, v]) => [k, { fingerprint: v.fingerprint, users: v.users ?? [] }])),
-  failedGeneration: extra.failedGeneration,
-  failedInstances: new Map(Object.entries(extra.failedInstances ?? {})),
-  retry: extra.retry ?? 0
-})
-const summary = (plan: ModulePlan) => ({
-  generation: plan.generation?.fingerprint,
-  start: plan.start.map((i) => i.key),
-  retire: [...plan.retire],
-  stop: plan.stop,
-  keep: plan.keep.map((k) => `${k.key}:${k.users.join("+")}`),
-  kept: plan.kept
-})
+const off: ModuleTarget = { id: "m", runs: false, invalid: undefined, instances: [], fingerprint: "", attempt: "" }
+const now = (running?: string, failed?: string): ModuleCurrent => ({ running, failed })
+const plan = (p: Partial<Omit<ModulePlan, "id">>): ModulePlan => ({ id: "m", stop: false, start: false, keep: false, forget: false, ...p })
+
+const cases: ReadonlyArray<{ readonly name: string; readonly target: ModuleTarget; readonly current: ModuleCurrent; readonly plan: ModulePlan }> = [
+  { name: "should not run, nothing runs: forget any failure", target: off, current: now(), plan: plan({ forget: true }) },
+  { name: "should not run, it runs: stop it, forget any failure", target: off, current: now("f1"), plan: plan({ stop: true, forget: true }) },
+  { name: "should not run after a failure: the failure is forgotten (a new demand tries again)", target: off, current: now(undefined, "f1/0"), plan: plan({ forget: true }) },
+  { name: "nothing runs: start it", target: target("f1"), current: now(), plan: plan({ start: true }) },
+  { name: "what runs is what should run: keep it (users may move)", target: target("f1"), current: now("f1"), plan: plan({ keep: true }) },
+  { name: "something else runs: stop it, then start the target", target: target("f2"), current: now("f1"), plan: plan({ stop: true, start: true }) },
+  { name: "that very attempt failed: stay down", target: target("f1"), current: now(undefined, "f1/0"), plan: plan({}) },
+  { name: "the attempt key changed since (vault, probes, retry, settings): try again", target: target("f1", { attempt: "f1/1" }), current: now(undefined, "f1/0"), plan: plan({ start: true }) },
+  {
+    name: "settings not valid: stop what runs, start nothing",
+    target: target("f2", { invalid: "The settings are not valid: x" }),
+    current: now("f1"),
+    plan: plan({ stop: true })
+  },
+  { name: "settings not valid, nothing runs: nothing", target: target("f2", { invalid: "x" }), current: now(), plan: plan({}) },
+  {
+    name: "a restart (its counter is in the fingerprint): stop, then start",
+    target: target("[\"s\",[\"k\"],0,1]"),
+    current: now("[\"s\",[\"k\"],0,0]"),
+    plan: plan({ stop: true, start: true })
+  }
+]
 
 describe("planModule", () => {
-  const cases: ReadonlyArray<{ readonly name: string; readonly target: ModuleTarget; readonly current: ModuleCurrent; readonly plan: ReturnType<typeof summary> }> = [
-    {
-      name: "not running, nothing published: nothing",
-      target: target([], undefined, false),
-      current: current(undefined, {}),
-      plan: { generation: undefined, start: [], retire: [], stop: false, keep: [], kept: false }
-    },
-    {
-      name: "should not run: everything retired, the shared part too",
-      target: target([], undefined, false),
-      current: current("g1", { a: { fingerprint: "x" } }),
-      plan: { generation: undefined, start: [], retire: ["a"], stop: true, keep: [], kept: false }
-    },
-    {
-      name: "a first generation: the shared part and every instance, together",
-      target: target([inst("a"), inst("b")], { key: "k", fingerprint: "g1" }),
-      current: current(undefined, {}),
-      plan: { generation: "g1", start: ["a", "b"], retire: [], stop: false, keep: [], kept: false }
-    },
-    {
-      name: "a changed shared setting: a new generation with every instance; all published ones are replaced",
-      target: target([inst("a", ["x"], "fa2")], { key: "k2", fingerprint: "g2" }),
-      current: current("g1", { a: { fingerprint: "fa1", users: ["x"] } }),
-      plan: { generation: "g2", start: ["a"], retire: ["a"], stop: false, keep: [], kept: false }
-    },
-    {
-      name: "that generation failed at this retry: the old one is kept, with the assistants still on it",
-      target: target([inst("a2", ["x"], "fa2")], { key: "k2", fingerprint: "g2" }),
-      current: current("g1", { a: { fingerprint: "fa1", users: ["x", "y"] }, b: { fingerprint: "fb1", users: ["z"] } }, {
-        failedGeneration: { fingerprint: "g2", retry: 3, message: "no" },
-        retry: 3
-      }),
-      plan: { generation: undefined, start: [], retire: ["b"], stop: false, keep: ["a:x"], kept: true }
-    },
-    {
-      name: "the retry counter moved on: the failed generation is tried again",
-      target: target([inst("a2", ["x"], "fa2")], { key: "k2", fingerprint: "g2" }),
-      current: current("g1", { a: { fingerprint: "fa1", users: ["x"] } }, { failedGeneration: { fingerprint: "g2", retry: 3, message: "no" }, retry: 4 }),
-      plan: { generation: "g2", start: ["a2"], retire: ["a"], stop: false, keep: [], kept: false }
-    },
-    {
-      name: "within the generation: an unchanged instance is kept with its new users, a new one starts, a gone one retires",
-      target: target([inst("a", ["x", "y"], "fa"), inst("c", ["z"], "fc")], { key: "k", fingerprint: "g1" }),
-      current: current("g1", { a: { fingerprint: "fa", users: ["x"] }, b: { fingerprint: "fb", users: ["z"] } }),
-      plan: { generation: undefined, start: ["c"], retire: ["b"], stop: false, keep: ["a:x+y"], kept: false }
-    },
-    {
-      name: "a restart counter (or configured secret) moved: the instance starts again and keeps serving until then",
-      target: target([inst("a", ["x"], "fa-restart1")], { key: "k", fingerprint: "g1" }),
-      current: current("g1", { a: { fingerprint: "fa", users: ["x"] } }),
-      plan: { generation: undefined, start: ["a"], retire: [], stop: false, keep: [], kept: false }
-    },
-    {
-      name: "that restart failed at this retry: the running one is kept",
-      target: target([inst("a", ["x"], "fa-restart1")], { key: "k", fingerprint: "g1" }),
-      current: current("g1", { a: { fingerprint: "fa", users: ["x"] } }, { failedInstances: { a: { fingerprint: "fa-restart1", retry: 0, message: "no" } } }),
-      plan: { generation: undefined, start: [], retire: [], stop: false, keep: ["a:x"], kept: false }
-    },
-    {
-      name: "a new instance that failed at this retry is not tried again",
-      target: target([inst("a", ["x"], "fa"), inst("b", ["y"], "fb")]),
-      current: current(undefined, { a: { fingerprint: "fa", users: ["x"] } }, { failedInstances: { b: { fingerprint: "fb", retry: 2, message: "no" } }, retry: 2 }),
-      plan: { generation: undefined, start: [], retire: [], stop: false, keep: ["a:x"], kept: false }
-    },
-    {
-      name: "without a shared part: instances only (version 1)",
-      target: target([inst("a", [], "fa2")]),
-      current: current(undefined, { old: { fingerprint: "f-old" } }),
-      plan: { generation: undefined, start: ["a"], retire: ["old"], stop: false, keep: [], kept: false }
-    },
-    {
-      name: "a shared-only provider (demanded through `uses`): a generation with no instances",
-      target: target([], { key: "k", fingerprint: "g1" }),
-      current: current(undefined, {}),
-      plan: { generation: "g1", start: [], retire: [], stop: false, keep: [], kept: false }
-    }
-  ]
   for (const c of cases) {
     it(c.name, () => {
-      expect(summary(planModule(c.target, c.current))).toEqual(c.plan)
+      expect(planModule(c.target, c.current)).toEqual(c.plan)
     })
   }
 
-  it("a fixpoint: once published as planned, the planner asks for nothing", () => {
-    const t = target([inst("a", ["x"], "fa"), inst("b", ["y"], "fb")], { key: "k", fingerprint: "g1" })
-    const published = current("g1", { a: { fingerprint: "fa", users: ["x"] }, b: { fingerprint: "fb", users: ["y"] } })
-    expect(isEmptyPlan(planModule(t, published), published)).toBe(true)
-    const moved = current("g1", { a: { fingerprint: "fa", users: ["y"] }, b: { fingerprint: "fb", users: ["y"] } })
-    expect(isEmptyPlan(planModule(t, moved), moved)).toBe(false)
+  it("a fixpoint: once the target runs, the planner asks for nothing but keeping it", () => {
+    for (const c of cases) {
+      if (!c.plan.start) continue
+      expect(planModule(c.target, now(c.target.fingerprint))).toEqual(plan({ keep: true }))
+    }
+  })
+
+  it("never asks to start while something runs without stopping it first (no two of a module)", () => {
+    for (const c of cases) {
+      const p = planModule(c.target, c.current)
+      if (p.start && c.current.running !== undefined) expect(p.stop).toBe(true)
+      if (p.keep) expect(p.stop || p.start).toBe(false)
+    }
   })
 })
 

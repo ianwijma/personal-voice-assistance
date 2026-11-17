@@ -3,8 +3,8 @@ import {
   type ChoiceOption,
   type ErrorInfo,
   type FieldError,
-  HealthIssue,
   MAX_COMBO_OPTIONS,
+  MAX_MODULE_TEMPLATES,
   MAX_OPTIONS_JSON,
   MAX_ROUTE_DESCRIPTION,
   MODULE_ROUTES_PREFIX,
@@ -19,7 +19,7 @@ import {
   type SettingValue,
   type StatusLine
 } from "@pva/protocol"
-import { Cause, Clock, Deferred, Effect, Exit, Fiber, Option, Schema, Scope, Semaphore, Stream } from "effect"
+import { Cause, Clock, Deferred, Effect, Exit, Fiber, Option, Schema, Scope, Stream } from "effect"
 import {
   ACTION_TIMEOUT_MS,
   ActionError,
@@ -37,9 +37,11 @@ import type { Agent } from "./Agent.ts"
 import { buildDecisionPlan, type DecisionProvider } from "./Decision.ts"
 import { ToolError } from "./Errors.ts"
 import { type ExecutionGateway, type GatewayAccess, type GatewayOptions, isGatewayRefusal, makeExecutionGateway } from "./Gateway.ts"
-import { makeIssueRegistry, type IssueRegistry } from "./Issues.ts"
+import { sealAction, sealTool } from "./GatewayPrivate.ts"
+import { boundIssues, makeIssueRegistry, type IssueRegistry, wireSafeIssue } from "./Issues.ts"
 import { type AssistantModule, type ContextProvider, metadataProblem, type Tool, toolMetadata } from "./Module.ts"
 import {
+  type ActionCatalogue,
   type ActionRunRequest,
   type ActionRunResult,
   type CatalogAction,
@@ -51,6 +53,7 @@ import {
   MODULE_API,
   type ModuleHostApi,
   type ModuleServicesV2,
+  ModuleStopped,
   type ProvidedContribution,
   type RequirementCheck,
   requirementKey,
@@ -64,18 +67,8 @@ import { type ModuleRoute, type PublishedRoute, RouteTokenError, routeInfo, rout
 import { makePageBoundary } from "./PageBoundary.ts"
 import { makeStragglers, stragglerIssues } from "./Stragglers.ts"
 import { type ModuleDefinition, type ModuleInstance, ModuleStartError } from "./ModuleDefinition.ts"
-import {
-  type Failure,
-  type InstanceTarget,
-  type ModuleCurrent,
-  type ModulePlan,
-  type ModuleTarget,
-  planModule,
-  reachedBy,
-  type SharedTarget,
-  usesOrder
-} from "./ModulePlanner.ts"
-import type { PartHandle, PartState, Registrar, RegisterResult, Registration, StartedPart } from "./ModuleRegistrations.ts"
+import { type InstanceTarget, type ModuleTarget, planModule, reachedBy, usesOrder } from "./ModulePlanner.ts"
+import type { PartHandle, PartState, Registrar, Registration } from "./ModuleRegistrations.ts"
 import {
   applicableOwnValues,
   applySettingsPatch,
@@ -94,22 +87,21 @@ import { makeToolRegistry, type ToolRegistry } from "./ToolRegistry.ts"
  * every module of the catalog for the life of the process and publishes an immutable snapshot (tool registry +
  * instructions) that each turn reads once at its start. Persistence is injected, so the host has no Node dependency.
  *
- * **It reconciles; it does not interleave.** Every trigger (configure, enable, disable, a change of the assistants,
- * the vault, Check again, `requestRestart`, refresh, startup, shutdown) only writes the **desired state** and then
- * waits for a reconciliation that began after its write. One reconciler fiber runs **passes**, never two at once: a
- * pass copies the desired state, asks the pure planner (`ModulePlanner.ts`) what to do for each module, starts what is
- * missing (independent modules concurrently, a module only after the shared parts it `uses` have started or failed
- * in this pass), then makes **one synchronous switch** that publishes the whole new picture (snapshot, services,
- * contributions and every other registration, `ModuleRegistrations.ts`) or, for a module whose new start failed,
- * keeps what it had and records why for Health; then it retires what was replaced (instances before their shared
- * part, consumers before their providers, after the grace period). Nothing else starts or stops module code.
+ * **One worker, one module at a time, stop before start.** Every trigger (configure, enable, disable, a change of the
+ * assistants, the vault, Check again, `requestRestart`, refresh, startup) only writes the **desired state** and then
+ * waits for a pass of the worker that began after its write. The worker is one fiber and the only thing that starts
+ * or stops module code. A pass captures the desired state once, asks the pure planner (`ModulePlanner.ts`) what each
+ * module should run, then walks the modules one after another: first stopping, consumers before the providers they
+ * `use`, then starting, providers first. Stopping a module withdraws everything it published in one synchronous step,
+ * gives its calls in flight the grace period, then closes its instances and its shared part. Starting runs its shared
+ * part, then its instances, and publishes them all in one synchronous step if every one started, or closes what did
+ * and leaves the module down with its error on the Health page. Every call into module code runs in its own fiber
+ * with a time limit; one that does not return in time is abandoned and reported, and the worker moves on.
  *
- * A module runs as **instances**. Without `demand` (the CLI modes, agents and decision providers) a module has at
- * most one, following its saved switch. With `demand` (serve mode's capabilities), a module runs while at least one
- * assistant wants it, one instance per distinct set of effective settings (the assistant's own values of
- * `overridable` fields over the shared ones over the linked defaults): assistants with equal settings share one. A
- * version 2 module's `shared` part and its instances are a **generation**: a new generation is published only if its
- * shared part and every one of its instances started.
+ * A module runs as **instances**. Without `demand` (the CLI modes, agents and decision providers) a module has at most
+ * one, following its saved switch. With `demand` (serve mode's capabilities), it runs while at least one assistant
+ * wants it, one instance per distinct set of valid effective settings (the assistant's own values of `overridable`
+ * fields over the shared ones over the linked defaults): assistants with equal settings share one.
  */
 /** What is saved per module (only values the owner set). */
 export interface ModuleRecord {
@@ -142,7 +134,7 @@ export const readOnlyPersistence = (initial: ModulePersistence["initial"] = { mo
 
 /** What one turn uses: the running modules' tools and context providers, and their instructions (catalog order). */
 export interface ModuleSnapshot {
-  /** Increases whenever the set of running instances changes. */
+  /** Increases whenever what runs changes. */
   readonly version: number
   /**
    * Module tools plus one generated tool per action (unless the action says `offerAsTool: false`): one instance per
@@ -156,7 +148,7 @@ export interface ModuleSnapshot {
   readonly agents: ReadonlyMap<string, Agent>
   /**
    * Actions of the running modules, catalog order, and the stand-ins of an unavailable wanted module's declared
-   * actions (they answer with its "not set up" line).
+   * actions (they answer with its "not set up" line). Sealed: only the execution gateway runs them.
    */
   readonly actions: ReadonlyArray<RegisteredAction>
   /** Running decision providers by id. */
@@ -178,7 +170,7 @@ export interface ModuleSnapshot {
 /** One running module's share of a `ModuleSnapshot`. */
 export interface ModulePart {
   readonly moduleId: string
-  /** `name` is the module id. */
+  /** `name` is the module id. Its tools and actions are sealed: only the execution gateway runs them. */
   readonly module: AssistantModule
   readonly instructions: string
   /**
@@ -222,38 +214,36 @@ export interface ModuleHost {
   /** Every module, in catalog order. */
   readonly modules: () => ReadonlyArray<ModuleInfo>
   /**
-   * Start every module that should run (its intent is on, or an assistant wants it), concurrently; completes when
-   * all have settled. Reads `demand` first.
+   * Open the host: until it is called the worker starts nothing (writes are kept and applied by the first pass), so
+   * the app calls it once everything the modules depend on is built. Reads `demand`, then starts every module that
+   * should run (its intent is on, or an assistant wants it), one after another; completes when the pass has finished.
    */
   readonly startEnabled: Effect.Effect<void>
   /**
-   * Switch it on (saved), and wait for a reconciliation that began after the switch: the result is how it then
-   * stands (its start error, or `invalid_settings`). Refused `not_allowed` for a module with demand (the assistants
-   * switch it on and off). An interrupted caller stops waiting; the switch stays.
+   * Switch it on (saved), and wait for a pass that began after the switch: the result is how it then stands (its
+   * start error, or `invalid_settings`). Refused `not_allowed` for a module with demand (the assistants switch it on
+   * and off). An interrupted caller stops waiting; the switch and its save stay.
    */
   readonly enable: (id: string) => Effect.Effect<HostResult>
   /** Switch it off (saved); see `enable`. */
   readonly disable: (id: string) => Effect.Effect<HostResult>
   /**
-   * Change the shared settings. `includeHidden`: also save fields hidden by `visibleWhen` (moving values out of
-   * `.env`). The new settings are proposed to the reconciler: only the instances whose effective settings change are
-   * restarted (all of them when a secret changes; a changed shared setting starts a new generation). If what runs
-   * now would be replaced and a start fails, nothing changes, nothing is saved and Health says why; otherwise they
-   * are saved once switched to. `busy` while an earlier configure of the same module is still being applied.
+   * Change the shared settings (saved at once). `includeHidden`: also save fields hidden by `visibleWhen` (moving
+   * values out of `.env`). While the module runs, settings it could not start with are refused at once. Otherwise
+   * the module is stopped and started again with them if what it runs changes; a start that fails leaves it down,
+   * with its error on the Health page, and is the result.
    */
   readonly configure: (id: string, patch: SettingsPatch, options?: { readonly includeHidden?: boolean }) => Effect.Effect<HostResult>
   /**
-   * Replace every module's saved secrets without saving them (the app's key vault was unlocked or locked; a module
-   * missing from `secrets` has none). Modules whose secrets changed are announced; instances in `error` are started
-   * again (a start that failed for lack of a key). Running instances keep running with what they started with.
-   * Completes when those starts have settled.
+   * Replace every module's secrets without saving them (the app's key vault was unlocked or locked; a module missing
+   * from `secrets` has none). What runs keeps running with what it started with; a module that failed to start is
+   * tried again. Completes when the pass has finished.
    */
   readonly setSecrets: (secrets: Readonly<Record<string, Readonly<Record<string, string>>>>) => Effect.Effect<void>
   /**
-   * Read `demand` and `defaults` again and bring the instances in line (docs/ASSISTANTS.md §2.6): start the
-   * instances now wanted, and retire (after the grace period) those no longer wanted. An instance whose settings did
-   * not change is left alone; a replaced one keeps serving until its replacement has started. A module busy with
-   * another operation is brought in line when that operation ends. Completes when the starts have settled.
+   * Read `demand` and `defaults` again and bring the modules in line (docs/ASSISTANTS.md §2.6). A module whose
+   * instances do not change is left alone (assistants moving between equal instances only change who uses which);
+   * any other change stops it and starts it again. Completes when the pass has finished.
    */
   readonly refresh: Effect.Effect<void>
   /**
@@ -274,8 +264,8 @@ export interface ModuleHost {
    */
   readonly fieldAction: (id: string, key: string, values?: Readonly<Record<string, unknown>>) => Effect.Effect<FieldActionHostResult>
   /**
-   * P3: the routes of every published shared part, live: one registration kind ("route") of the part, published and
-   * withdrawn in the reconciler's switch (a module that stops or is replaced takes its routes with it at that switch).
+   * P3: the routes of every published module's shared part, live: one registration kind ("route"), published and
+   * withdrawn with the module (a module that stops takes its routes with it; while it restarts they are absent).
    */
   readonly routes: () => ReadonlyArray<PublishedRoute>
   /**
@@ -297,7 +287,7 @@ export interface ModuleHost {
   readonly settingOptions: (id: string) => Readonly<Record<string, ReadonlyArray<ChoiceOption>>> | undefined
   /**
    * The issue registry (module API v2, §C.5): every module's requirement, availability, start and `health()` issues,
-   * plus what the app adds (`core`). Module issues are kept current by the host; `checkHealth` refreshes the rest.
+   * plus what the app adds. Module issues are kept current by the host; `checkHealth` refreshes the rest.
    */
   readonly issues: IssueRegistry
   /**
@@ -306,9 +296,8 @@ export interface ModuleHost {
    */
   readonly evaluate: Effect.Effect<void>
   /**
-   * Judge every module's availability again (`requirements`, after the app probed again: "Check again"): a module that
-   * became available is started if it is wanted, one that became unavailable is retired with the grace period.
-   * Completes when the starts have settled.
+   * "Check again": judge every module's availability again (after the app probed again) and try again every module
+   * that is down after a failed start, whether or not a probe result changed. Completes when the pass has finished.
    */
   readonly recheck: Effect.Effect<void>
   /**
@@ -317,15 +306,15 @@ export interface ModuleHost {
    */
   readonly checkHealth: Effect.Effect<void>
   /** The turn's action catalogue (`ModuleHostApi.actions`), for the app and tests. */
-  readonly actions: ModuleHostApi["actions"]
+  readonly actions: ActionCatalogue
   /** The read-only view modules get (`ModuleHostApi.view`). */
   readonly view: () => HostView
   /** A service of a demanded module's `shared` part (`ModuleHostApi.service`). */
-  readonly service: ModuleHostApi["service"]
+  readonly service: <T>(key: ServiceKey<T>) => T | undefined
   /** The values contributed under a key, for the calling fiber's assistant (`ModuleHostApi.contributions`). */
-  readonly contributions: ModuleHostApi["contributions"]
+  readonly contributions: <T>(key: ContributionKey<T>) => Effect.Effect<ReadonlyArray<T>>
   /** The same for an assistant named explicitly, `undefined` for every provider (`ModuleHostApi.contributionsFor`). */
-  readonly contributionsFor: ModuleHostApi["contributionsFor"]
+  readonly contributionsFor: <T>(key: ContributionKey<T>, assistantId: string | undefined) => ReadonlyArray<T>
   /**
    * The execution gateway every registry of this host runs its calls through (`Gateway.ts`); serve mode builds each
    * assistant's registry with it.
@@ -342,18 +331,20 @@ export interface ModuleHostOptions {
   readonly envOrigin?: (name: string) => "env-file" | "env-process"
   /** The `.env` file and line that set a variable, shown on the locked field. */
   readonly envLocation?: (name: string) => { readonly file: string; readonly line: number } | undefined
-  /** Time `start` may take. Default 10 s. */
+  /** Time a module's `shared` or `start` may take. Default 10 s. */
   readonly startTimeoutMs?: number
-  /** Time a replaced or stopped instance keeps running for tool calls in flight. Default 10 s. */
+  /** Time closing one part's scope (its finalizers) may take before it is abandoned and reported. Default 5 s. */
+  readonly stopTimeoutMs?: number
+  /** Time a stopped module's calls in flight may take to finish before they are interrupted. Default 10 s. */
   readonly graceMs?: number
-  /** Time closing the host may take (the shutdown reconciliation and pending saves). Default 30 s. */
+  /** Time closing the host may take in all (stopping every module, pending saves). Default 30 s. */
   readonly closeTimeoutMs?: number
   /** Time a context provider may take per turn. Default 50 ms. */
   readonly contextTimeoutMs?: number
   /**
    * Linked defaults of a module's fields (docs/ASSISTANTS.md §2.6, computed from Home): used instead of the field's
-   * own default when nothing is saved and the environment does not set it. Read whenever settings are resolved;
-   * `refresh` restarts the instances whose settings they changed.
+   * own default when nothing is saved and the environment does not set it. Read with every write of the desired
+   * state; `refresh` restarts the modules whose settings they changed.
    */
   readonly defaults?: (moduleId: string) => Readonly<Record<string, unknown>> | undefined
   /**
@@ -373,8 +364,9 @@ export interface ModuleHostOptions {
   /** The app's half of `HostView` (vault, engines, devices, Home values). Absent: the CLI defaults. */
   readonly view?: HostViewSource
   /**
-   * Which modules and tools each assistant has on (serve mode: its module choices and `offTools`): the execution
-   * gateway's first two checks, and the turn's action catalogue. Absent: no access checks (the CLI modes).
+   * Which modules and tools each assistant has on (serve mode: its module choices and `offTools`), and whether a
+   * principal's parts belong together: the execution gateway's first checks, and the turn's action catalogue.
+   * Absent: no access checks (the CLI modes).
    */
   readonly access?: GatewayAccess
   /** The gateway's later check (P8: the risk policy). There is no confirmation hook (§2 row 6). */
@@ -409,38 +401,44 @@ export interface ModuleHostOptions {
 // ---------------------------------------------------------------------------------------------------------------------
 // Internal state
 
-/** The settings a module plans with: committed (saved) ones, or a configure's proposal. */
-interface Sources {
+/**
+ * What one module should be, as triggers write it. Never mutated: a write replaces the object, so a pass captures
+ * the whole desired state by keeping the objects it read at its start.
+ */
+interface Desired {
+  /** The saved switch (read only for a module without demand). */
+  readonly enabled: boolean
+  /** The owner has chosen on or off (saved); before that, `enabledByDefault` / `enabledWhenSet` decide. */
+  readonly chosen: boolean
   readonly stored: Readonly<Record<string, unknown>>
+  /** The secrets the vault reports (and configure changes). */
   readonly secrets: Readonly<Record<string, string>>
-  /** Counts configured secret changes: a new one restarts every part (a vault lock or unlock does not count). */
+  /** Counts configured secret changes: a new one restarts the module (a vault lock or unlock does not count). */
   readonly secretEpoch: number
-}
-
-/** A configure waiting for the reconciler: tried in the next pass, then saved or dropped. */
-interface Proposal extends Sources {
-  readonly token: object
-  /** The vault epoch it was made at: a vault report since wins over its secrets when it is saved. */
+  /** Counts changes of its secrets by the vault (a failed start is tried again after one). */
   readonly vaultEpoch: number
+  /** Who wants it; `undefined`: no demand (it follows its switch). */
+  readonly demand: ReadonlyArray<ModuleDemand> | undefined
+  readonly defaults: Readonly<Record<string, unknown>> | undefined
+  /** Why it cannot run here (`unavailable`), judged at creation and on `recheck`. */
+  readonly unavailable: ModuleUnavailable | undefined
+  readonly statuses: ReadonlyArray<RequirementStatus>
+  /** Restarts applied (`requestRestart`, throttled): a change starts it again. */
+  readonly restarts: number
+  /** A failed start is tried again only after this (or something else in its attempt) changes. */
+  readonly retry: number
 }
 
-/** One start of a module's code (a shared part or an instance): its scope, registrations and place in its life. */
+/** One part of a run (its shared part or an instance): its scope and where it is in its life. */
 interface Part {
   readonly id: number
   readonly entry: Entry
   readonly kind: "shared" | "instance"
-  /** The instance key ("" for a shared part). */
-  readonly key: string
-  readonly fingerprint: string
   readonly scope: Scope.Closeable
-  /** When its start began (Clock ms): a restart asked for later is not satisfied by it. */
-  readonly startedAt: number
   state: PartState
-  closing: Deferred.Deferred<void> | undefined
-  closed: boolean
-  /** Its registrations: staged while it starts, live while it is, withdrawn after. */
-  readonly registrations: Array<Registration>
-  /** `requestRestart` called during its own start: applied once it is published, dropped if it is discarded. */
+  /** Registrations it made during its start (`PartHandle.register`): published with the module. */
+  readonly staged: Array<Registration>
+  /** `requestRestart` called during its own start: applied once it is published, dropped if it is not. */
   stagedRestart: string | undefined
   readonly handle: PartHandle
   /**
@@ -451,130 +449,78 @@ interface Part {
   readonly presses: FieldActionOwner | undefined
 }
 
-interface Running {
+interface InstanceRun {
   readonly part: Part
+  readonly key: string
+  users: ReadonlyArray<string>
+  ownKeys: ReadonlyArray<string>
   readonly instance: ModuleInstance
-  /** The instance's tools plus the generated action tools (guarded: refused once the part is closed). */
+  /** Its tools plus the generated action tools, sealed (only the gateway runs them). */
   readonly tools: ReadonlyArray<Tool>
   readonly actions: ReadonlyArray<RegisteredAction>
-  /** The settings it was started with: a restart reuses them (a vault locked since cannot stop it). */
-  readonly settings: unknown
-  readonly secretEpoch: number
-}
-
-/** A module's started shared part (version 2), with the settings and sources it started with. */
-interface SharedRun {
-  readonly part: Part
-  readonly key: string
-  readonly value: SharedPart<unknown>
-  readonly spec: SharedSpec
-}
-
-/** The shared settings a shared part starts with: the key is their non-secret values. */
-interface SharedSpec {
-  readonly key: string
-  /** `undefined`: not valid (`errors` says why). */
-  readonly settings: Readonly<Record<string, unknown>> | undefined
-  readonly errors: ReadonlyArray<FieldError>
-  readonly stored: Readonly<Record<string, unknown>>
-  readonly secrets: Readonly<Record<string, string>>
-  readonly defaults: Readonly<Record<string, unknown>> | undefined
-  readonly secretEpoch: number
-}
-
-/** One instance as the module's info shows it: running, starting, or in error. */
-interface Instance {
-  readonly key: string
-  ownKeys: ReadonlyArray<string>
-  users: ReadonlyArray<string>
-  state: "starting" | "running" | "error"
-  error: string | undefined
-  /** Field errors of settings that are not valid (`invalid_settings`). */
-  fieldErrors: ReadonlyArray<FieldError> | undefined
   status: StatusLine | undefined
-  running: Running | undefined
+}
+
+/** One start of a module: its shared part and its instances, published together and stopped together. */
+interface Run {
+  readonly id: number
+  readonly entry: Entry
+  readonly target: HostTarget
+  state: "starting" | "live" | "withdrawn" | "closed"
+  shared: { readonly part: Part; readonly value: SharedPart<unknown> } | undefined
+  readonly instances: Map<string, InstanceRun>
+  /** What it published (withdrawn in reverse when it stops). */
+  registrations: ReadonlyArray<Registration>
+  /** Calls of its tools, actions and context providers in flight. */
+  inflight: number
+  idle: Deferred.Deferred<void> | undefined
+  /** Completed when its grace period is over: the calls still in flight are interrupted. */
+  readonly killed: Deferred.Deferred<void>
 }
 
 interface Entry {
   readonly def: ModuleDefinition<any>
   /** Position in `uses` order (providers first). */
   rank: number
-  // -- desired state ----------------------------------------------------------------------------------------------
-  /** The saved switch (read only for a module without demand). */
-  enabled: boolean
-  /** The owner has chosen on or off (saved); before that, `enabledByDefault` / `enabledWhenSet` decide. */
-  chosen: boolean
-  committed: Sources
-  /** The secrets the vault reports (and configure changes). */
-  secrets: Readonly<Record<string, string>>
-  vaultEpoch: number
-  proposal: Proposal | undefined
-  /** Who wants it, as last read; `undefined`: no demand (it follows its switch). */
-  demand: ReadonlyArray<ModuleDemand> | undefined
-  /** Its linked defaults, as last read. */
-  defaults: Readonly<Record<string, unknown>> | undefined
-  /** Why it cannot run here (`unavailable`), judged at creation and on `recheck`. */
-  unavailable: ModuleUnavailable | undefined
-  statuses: ReadonlyArray<RequirementStatus>
   /** The catalogue itself is wrong for it (its `uses` form a cycle): an error, never started. */
   readonly catalogError: string | undefined
-  restartShared: number
-  readonly restartInstances: Map<string, number>
-  /** A failed start is tried again only after this changes. */
-  retry: number
-  restartTimes: Array<number>
-  restartLater: boolean
-  // -- current state ----------------------------------------------------------------------------------------------
-  /** The published shared part. */
-  shared: SharedRun | undefined
-  /** By key: the published instances, and those in error or starting. */
-  instances: Map<string, Instance>
-  /** A first generation is starting (shown as `starting` while it has no instances). */
-  starting: boolean
-  failedGeneration: Failure | undefined
-  readonly failedInstances: Map<string, Failure>
-  /** A new generation or a restart that failed while the old one kept serving (title and why). */
-  kept: { readonly title: string; readonly message: string } | undefined
-  /** Why its generation could not start while none runs (the module is in `error`). */
-  generationError: string | undefined
-  generationFieldErrors: ReadonlyArray<FieldError> | undefined
-  // -- announcements ----------------------------------------------------------------------------------------------
+  /** The desired state now. */
+  want: Desired
+  /** The desired state the last pass published it with (its availability and who wants it, as the snapshot shows). */
+  shown: Desired
+  /** The published run. */
+  run: Run | undefined
+  /** The worker is starting or stopping it now. */
+  phase: "idle" | "starting" | "stopping"
+  /** While it starts: what it starts (its instances are shown as starting). */
+  starting: HostTarget | undefined
+  /** Its last start failed (or its settings are not valid): down until its attempt key changes. */
+  failure: { readonly attempt: string; readonly message: string; readonly fieldErrors?: ReadonlyArray<FieldError>; readonly instances: ReadonlyArray<InstanceTarget> } | undefined
+  /** Instances of the last pass whose settings are not valid (shown as errors for their assistants, never started). */
+  invalid: ReadonlyArray<HostInstanceTarget>
+  /** Module code that hung or a registration that threw: reported until "Check again". */
+  problems: Array<{ readonly title: string; readonly detail: string }>
+  restartRequests: number
+  lastRestartAt: number
+  restartTimer: boolean
+  saveRequested: number
+  saveDone: number
   revision: number
   announced: string
 }
 
-/** The instance targets the host plans with: the planner's, plus the settings to start with. */
 interface HostInstanceTarget extends InstanceTarget {
   readonly resolved: ResolvedSettings<unknown>
-  readonly secretEpoch: number
-}
-
-interface HostSharedTarget extends SharedTarget {
-  readonly spec: SharedSpec
 }
 
 interface HostTarget extends ModuleTarget {
-  readonly shared: HostSharedTarget | undefined
+  readonly shared: { readonly key: string; readonly settings: Readonly<Record<string, unknown>> | undefined; readonly errors: ReadonlyArray<FieldError> } | undefined
   readonly instances: ReadonlyArray<HostInstanceTarget>
-}
-
-type StartResult<A> = { readonly ok: true; readonly value: A } | { readonly ok: false; readonly message: string; readonly part?: Part }
-
-/** What one pass started for one module. */
-interface ModuleStarts {
-  shared: StartResult<SharedRun> | undefined
-  readonly instances: Map<string, StartResult<Running & { readonly status: StatusLine | undefined }>>
-}
-
-/** One module in a pass: what it planned with, and what it decided. */
-interface PassItem {
-  readonly entry: Entry
-  readonly target: HostTarget
-  readonly plan: ModulePlan
-  readonly retry: number
-  readonly proposal: Proposal | undefined
-  /** Something of it was published when the pass began. */
-  readonly live: boolean
+  readonly fieldErrors: ReadonlyArray<FieldError> | undefined
+  /** The secrets it starts with (a restart while the vault is locked reuses what runs). */
+  readonly secrets: Readonly<Record<string, string>>
+  /** The desired state it was planned from (`settingsFor` answers from it). */
+  readonly desired: Desired
 }
 
 const failure = (code: ErrorInfo["code"], message: string, extra: Partial<ErrorInfo> = {}): HostResult => ({
@@ -601,18 +547,13 @@ export const unavailableLine = (name: string, reason: string): string => `${name
 export const outsideTurns = <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> =>
   effect.pipe(Effect.provideService(CurrentTurn, undefined), Effect.provideService(CurrentJob, undefined), Effect.provideService(CurrentPrincipal, undefined))
 
-const isWireIssue = Schema.is(HealthIssue)
-
 const clip = (text: string, max: number) => (text.length <= max ? text : `${text.slice(0, max - 1)}…`)
 
 /** An unavailable reason made safe for the wire's `ModuleUnavailable` (reason ≤ 500, the fix's label ≤ 200, value ≤ 1000). */
 const wireUnavailable = (u: ModuleUnavailable): ModuleUnavailable => {
-  const reason = clip(String(u.reason ?? ""), 500)
-  const out: ModuleUnavailable = {
-    reason,
-    ...(u.fix !== undefined ? { fix: { kind: u.fix.kind, label: clip(String(u.fix.label ?? ""), 200), ...(u.fix.value !== undefined ? { value: clip(String(u.fix.value), 1000) } : {}) } } : {})
-  }
-  // A fix the wire does not know (its kind) is left out rather than breaking the module's info.
+  const safe = wireSafeIssue({ id: "u", severity: "warning", title: "", detail: String(u.reason ?? ""), ...(u.fix !== undefined ? { fix: u.fix } : {}) }, "u", 0)
+  const reason = clip(safe.detail.replace(/\s+/g, " "), 500)
+  const out: ModuleUnavailable = { reason, ...(safe.fix !== undefined && u.fix !== undefined ? { fix: safe.fix } : {}) }
   return isWireUnavailable(out) ? out : { reason }
 }
 const isWireUnavailable = Schema.is(ModuleUnavailable)
@@ -657,13 +598,27 @@ const usesCycles = (catalog: ReadonlyArray<ModuleDefinition<any>>): Map<string, 
   return out
 }
 
-/** Restarts a module may ask for in `RESTART_WINDOW_MS` before later ones wait (a module that restarts itself in a loop). */
-const RESTART_BUDGET = 5
-const RESTART_WINDOW_MS = 30_000
+/** Restarts of one module are at least this far apart; requests in between are merged into the next one. */
+const RESTART_INTERVAL_MS = 5_000
+
+/** The template text all modules together may send (UTF-8 bytes), so the admin snapshot stays under the frame limit. */
+const TEMPLATE_BUDGET_BYTES = 128 * 1024
+
+const sameRecord = (a: Readonly<Record<string, string>>, b: Readonly<Record<string, string>>) => {
+  const ka = Object.keys(a)
+  return ka.length === Object.keys(b).length && ka.every((k) => Object.hasOwn(b, k) && a[k] === b[k])
+}
+
+const firstLine = (cause: Cause.Cause<unknown>) => Cause.pretty(cause).split("\n")[0] ?? "unknown"
+const describe = (error: unknown) => (error instanceof Error ? error.message : String(error))
+
+/** What a bounded call into module code came to. */
+type Bounded<A> = { readonly _tag: "done"; readonly exit: Exit.Exit<A, unknown> } | { readonly _tag: "hung" }
 
 export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOptions) {
   const hostScope = yield* Effect.scope
   const startTimeoutMs = options.startTimeoutMs ?? 10_000
+  const stopTimeoutMs = options.stopTimeoutMs ?? 5_000
   const graceMs = options.graceMs ?? 10_000
   const contextTimeoutMs = options.contextTimeoutMs ?? 50
   const healthTimeoutMs = options.healthTimeoutMs ?? 5_000
@@ -686,34 +641,37 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
     ids.add(def.id)
     const record = options.persistence.initial.modules[def.id]
     const cycle = cycles.get(def.id)
-    const secrets = options.persistence.initial.secrets[def.id] ?? {}
-    return {
-      def,
-      rank: 0,
+    const want: Desired = {
       enabled: record?.enabled ?? def.enabledByDefault,
       chosen: record?.enabled !== undefined,
-      committed: { stored: record?.settings ?? {}, secrets, secretEpoch: 0 },
-      secrets,
+      stored: record?.settings ?? {},
+      secrets: options.persistence.initial.secrets[def.id] ?? {},
+      secretEpoch: 0,
       vaultEpoch: 0,
-      proposal: undefined,
       demand: undefined,
       defaults: options.defaults?.(def.id),
       unavailable: undefined,
       statuses: [],
+      restarts: 0,
+      retry: 0
+    }
+    return {
+      def,
+      rank: 0,
       catalogError: cycle === undefined ? undefined : `Its "uses" form a cycle (${[...cycle, cycle[0]].join(" → ")}), so it cannot start. Fix the module catalogue.`,
-      restartShared: 0,
-      restartInstances: new Map(),
-      retry: 0,
-      restartTimes: [],
-      restartLater: false,
-      shared: undefined,
-      instances: new Map(),
-      starting: false,
-      failedGeneration: undefined,
-      failedInstances: new Map(),
-      kept: undefined,
-      generationError: undefined,
-      generationFieldErrors: undefined,
+      want,
+      shown: want,
+      run: undefined,
+      phase: "idle",
+      starting: undefined,
+      failure: undefined,
+      invalid: [],
+      problems: [],
+      restartRequests: 0,
+      lastRestartAt: -Infinity,
+      restartTimer: false,
+      saveRequested: 0,
+      saveDone: 0,
       revision: 0,
       announced: ""
     }
@@ -730,8 +688,13 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
     ...(options.envLocation !== undefined ? { envLocation: options.envLocation } : {})
   }
 
-  /** The module's settings from `src` (with the linked defaults given, else its current ones). */
-  const resolveFrom = (entry: Entry, src: Pick<Sources, "stored" | "secrets">, own?: Readonly<Record<string, unknown>>, defaults = entry.defaults) =>
+  /** The module's settings from these sources. */
+  const resolveFrom = (
+    entry: Entry,
+    src: { readonly stored: Readonly<Record<string, unknown>>; readonly secrets: Readonly<Record<string, string>> },
+    own: Readonly<Record<string, unknown>> | undefined,
+    defaults: Readonly<Record<string, unknown>> | undefined
+  ) =>
     resolveSettings(entry.def.settings, {
       stored: src.stored,
       secrets: src.secrets,
@@ -740,11 +703,8 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
       ...(defaults !== undefined ? { defaults } : {}),
       ...(own !== undefined ? { own } : {})
     })
-  /** The committed settings (what the form shows), with the vault's secrets. */
-  const committedSources = (entry: Entry): Sources => ({ ...entry.committed, secrets: entry.secrets })
-  const resolve = (entry: Entry) => resolveFrom(entry, committedSources(entry))
-  /** What the reconciler plans with: a configure's proposal, else the committed settings. */
-  const planning = (entry: Entry): Sources => entry.proposal ?? committedSources(entry)
+  /** The settings as saved now (what the form shows). */
+  const resolve = (entry: Entry) => resolveFrom(entry, entry.want, undefined, entry.want.defaults)
 
   const invalidMessage = (errors: ReadonlyArray<FieldError>) => `The settings are not valid: ${errors.map((e) => e.message).join("; ")}`
 
@@ -754,7 +714,8 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
   const secretKeys = (entry: Entry) => Object.entries(entry.def.settings as SettingsSpec).flatMap(([key, setting]) => (setting.secret ? [key] : []))
   /**
    * THE boundary for module-produced text on its way to a page (`PageBoundary`): it redacts every secret the module
-   * was given (`given`) and every one known now (saved, environment), before anything is clipped.
+   * was given (`given`) and every one known now (desired, the run's, the start's, environment), before anything is
+   * clipped.
    */
   const boundary = makePageBoundary({
     current: (moduleId) => {
@@ -762,8 +723,13 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
       if (entry === undefined) return []
       return secretKeys(entry).flatMap((key) => {
         const env = entry.def.settings[key]!.env
-        const proposed = entry.proposal?.secrets[key]
-        return [entry.secrets[key] ?? "", entry.committed.secrets[key] ?? "", proposed ?? "", env === undefined ? "" : options.env[env] ?? ""]
+        return [
+          entry.want.secrets[key] ?? "",
+          entry.shown.secrets[key] ?? "",
+          entry.run?.target.secrets[key] ?? "",
+          entry.starting?.secrets[key] ?? "",
+          env === undefined ? "" : options.env[env] ?? ""
+        ]
       })
     }
   })
@@ -812,7 +778,7 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
    * Whether the module can run on this server (module API v2): a supported `apiVersion`, a listed platform, and every
    * required requirement met (as the app's probes last judged them). Synchronous; never probes.
    */
-  const judge = (entry: Entry): { readonly unavailable: ModuleUnavailable | undefined; readonly statuses: ReadonlyArray<RequirementStatus> } => {
+  const judge = (entry: Entry): Pick<Desired, "unavailable" | "statuses"> => {
     const def = entry.def
     const api = def.apiVersion ?? 1
     const supports: ReadonlyArray<number> = MODULE_API.supports
@@ -845,220 +811,202 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
     }))
     const missing = statuses.find((st) => st.state === "missing" && !isOptionalRequirement(st.requirement))
     return {
-      // What reaches the wire is clipped here, once: a probe's long error cannot break the module or admin messages.
       unavailable: missing === undefined ? undefined : wireUnavailable({ reason: missing.detail, ...(missing.fix !== undefined ? { fix: missing.fix } : {}) }),
       statuses
     }
   }
-  const judgeAll = (): Array<Entry> => {
-    const changed: Array<Entry> = []
-    const key = (e: { readonly unavailable: ModuleUnavailable | undefined; readonly statuses: ReadonlyArray<RequirementStatus> }) =>
-      JSON.stringify([e.unavailable ?? null, e.statuses.map((st) => [st.state, st.detail, st.fix ?? null])])
+  /** Judge every module again (inside a write): its availability and requirement statuses become desired state. */
+  const judgeAll = () => {
+    const key = (d: Pick<Desired, "unavailable" | "statuses">) => JSON.stringify([d.unavailable ?? null, d.statuses.map((st) => [st.state, st.detail, st.fix ?? null])])
     for (const entry of entries) {
-      const before = key(entry)
       const judged = judge(entry)
-      entry.unavailable = judged.unavailable
-      entry.statuses = judged.statuses
-      if (key(entry) !== before) changed.push(entry)
+      if (key(judged) !== key(entry.want)) entry.want = { ...entry.want, ...judged }
     }
-    return changed
   }
   judgeAll()
+  for (const entry of entries) entry.shown = entry.want
 
   // -- Desired state: who wants what ----------------------------------------------------------------------------------
-
-  const isLive = (entry: Entry) => entry.shared !== undefined || [...entry.instances.values()].some((r) => r.running !== undefined)
 
   /**
    * Its own switch: the owner's choice; before one, on by default, or on while the `enabledWhenSet` key is set
    * (environment, saved or the vault). A module switched on by its key that runs keeps running when the vault locks.
    */
-  const switchOn = (entry: Entry): boolean => {
-    if (entry.chosen) return entry.enabled
+  const switchOn = (entry: Entry, d: Desired): boolean => {
+    if (d.chosen) return d.enabled
     const key = entry.def.enabledWhenSet
     if (entry.def.enabledByDefault || key === undefined) return entry.def.enabledByDefault
-    if (resolveFrom(entry, planning(entry)).form.secrets[key]?.set === true) return true
-    return isLive(entry)
+    if (resolveFrom(entry, d, undefined, d.defaults).form.secrets[key]?.set === true) return true
+    return entry.run !== undefined
   }
 
-  /** Someone wants the module now (its switch, or an assistant has it on). */
-  const wanted = (entry: Entry) => (entry.demand === undefined ? switchOn(entry) : entry.demand.length > 0)
+  /** Someone wants the module (its switch, or an assistant has it on). */
+  const wantedBy = (entry: Entry, d: Desired) => (d.demand === undefined ? switchOn(entry, d) : d.demand.length > 0)
 
-  /** The modules demand reaches (directly or through `uses`), able to run or not. */
-  const reached = (): Set<Entry> => {
-    const ids = reachedBy(entries.map((e) => ({
-      id: e.def.id,
-      wanted: e.catalogError === undefined && wanted(e),
-      blocked: e.unavailable !== undefined || e.catalogError !== undefined,
-      uses: e.catalogError === undefined ? e.def.uses ?? [] : []
-    })))
-    return new Set(entries.filter((e) => ids.has(e.def.id)))
+  /** The modules demand reaches (directly or through `uses`), able to run or not, in this picture of the desired state. */
+  const demandedIn = (desired: (entry: Entry) => Desired): Set<Entry> => {
+    const reached = reachedBy(entries.map((e) => {
+      const d = desired(e)
+      return {
+        id: e.def.id,
+        wanted: e.catalogError === undefined && wantedBy(e, d),
+        blocked: d.unavailable !== undefined || e.catalogError !== undefined,
+        uses: e.catalogError === undefined ? e.def.uses ?? [] : []
+      }
+    }))
+    return new Set(entries.filter((e) => reached.has(e.def.id)))
   }
-
-  /** The modules `entry` names in `uses` that are in the catalogue. */
-  const providersOf = (entry: Entry): ReadonlyArray<Entry> =>
-    entry.catalogError !== undefined ? [] : (entry.def.uses ?? []).flatMap((id) => {
-      const used = byId.get(id)
-      return used === undefined ? [] : [used]
-    })
 
   /** The shared settings: everything resolved except the fields an assistant may own; the key is their non-secret values. */
-  const sharedSpecOf = (entry: Entry, src: Sources): SharedSpec => {
-    const resolved = resolveFrom(entry, src)
+  const sharedOf = (entry: Entry, src: { readonly stored: Readonly<Record<string, unknown>>; readonly secrets: Readonly<Record<string, string>> }, defaults: Desired["defaults"]) => {
+    const resolved = resolveFrom(entry, src, undefined, defaults)
     const owned = new Set(overridableKeys(entry.def.settings))
     const without = (record: Readonly<Record<string, unknown>>) => Object.fromEntries(Object.entries(record).filter(([k]) => !owned.has(k)))
     // Only the fields the shared part receives are judged here: an assistant-owned field's invalid shared default
     // does not stop it (each instance validates its own effective settings in full).
     const errors = resolved.form.errors.filter((e) => e.key === null || !owned.has(e.key))
-    const values = without(resolved.form.values)
-    const raw = without(resolved.value ?? (resolvedRaw(entry, src) as Record<string, unknown>))
-    return {
-      key: JSON.stringify(values),
-      settings: errors.length === 0 ? raw : undefined,
-      errors,
-      stored: src.stored,
-      secrets: src.secrets,
-      defaults: entry.defaults,
-      secretEpoch: src.secretEpoch
-    }
-  }
-
-  /** The resolved values even where some field is invalid (an overridable field's): secrets included. */
-  const resolvedRaw = (entry: Entry, src: Sources) => {
-    const form = resolveFrom(entry, src).form
-    const out: Record<string, unknown> = { ...form.values }
+    const raw: Record<string, unknown> = { ...resolved.form.values }
     for (const [key, setting] of Object.entries(entry.def.settings as SettingsSpec)) {
       if (!setting.secret) continue
       const fromEnv = setting.env !== undefined && (options.env[setting.env] ?? "") !== "" ? options.env[setting.env] : undefined
       const saved = src.secrets[key]
-      out[key] = fromEnv ?? (saved !== undefined && saved.length > 0 ? saved : undefined)
+      raw[key] = fromEnv ?? (saved !== undefined && saved.length > 0 ? saved : undefined)
     }
-    return out
+    return {
+      key: JSON.stringify(without(resolved.form.values)),
+      settings: errors.length === 0 ? without(resolved.value ?? raw) : undefined,
+      errors
+    }
   }
 
-  /** What the desired state asks of a module (`ModulePlanner.ModuleTarget`), with the settings to start with. */
-  const targetOf = (entry: Entry, demanded: ReadonlySet<Entry>, runAtAll: boolean): HostTarget => {
+  /** What the desired state `d` asks of a module (`ModulePlanner.ModuleTarget`), with the settings to start with. */
+  const targetOf = (entry: Entry, d: Desired, demanded: ReadonlySet<Entry>): HostTarget => {
     const id = entry.def.id
-    const runs = runAtAll && demanded.has(entry) && entry.unavailable === undefined && entry.catalogError === undefined
-    if (!runs) return { id, runs: false, shared: undefined, instances: [] }
-    const src = planning(entry)
-    let shared: HostSharedTarget | undefined
-    if (entry.def.shared !== undefined) {
-      const spec = sharedSpecOf(entry, src)
-      // Equal non-secret values and no configured secret since: it starts with what the live one runs with (a
-      // vault locked since does not make it invalid).
-      const retained = entry.shared !== undefined && entry.shared.key === spec.key && entry.shared.spec.secretEpoch === src.secretEpoch
-      shared = {
-        key: spec.key,
-        invalid: spec.settings === undefined && !retained ? invalidMessage(spec.errors) : undefined,
-        fingerprint: JSON.stringify([spec.key, src.secretEpoch, entry.restartShared]),
-        spec
-      }
-    }
-    const generation = shared?.fingerprint ?? ""
+    const none: HostTarget = { id, runs: false, invalid: undefined, instances: [], fingerprint: "", attempt: "", shared: undefined, fieldErrors: undefined, secrets: {}, desired: d }
+    if (closing || !demanded.has(entry) || d.unavailable !== undefined || entry.catalogError !== undefined) return none
+    // A restart with the same configured secrets starts with what runs had (the vault may be locked since).
+    const live = entry.run
+    const secrets = live !== undefined && live.target.desired.secretEpoch === d.secretEpoch ? { ...live.target.secrets, ...d.secrets } : d.secrets
+    const src = { stored: d.stored, secrets }
+    const shared = entry.def.shared !== undefined ? sharedOf(entry, src, d.defaults) : undefined
     const groups = new Map<string, { users: Array<string>; ownKeys: Array<string>; resolved: ResolvedSettings<unknown> }>()
+    const invalid: Array<HostInstanceTarget> = []
     const add = (assistantId: string | undefined, own: Readonly<Record<string, unknown>> | undefined) => {
-      const resolved = resolveFrom(entry, src, own)
+      const resolved = resolveFrom(entry, src, own, d.defaults)
+      const ownKeys = Object.keys(own ?? {})
+      if (resolved.value === undefined) {
+        // Never grouped with a valid assistant (its fallback values could equal theirs): its own error, for it alone.
+        invalid.push({ key: `invalid:${assistantId ?? ""}`, users: assistantId === undefined ? [] : [assistantId], ownKeys, invalid: invalidMessage(resolved.form.errors), resolved })
+        return
+      }
       const key = JSON.stringify(resolved.form.values)
       const group = groups.get(key)
-      if (group === undefined) groups.set(key, { users: assistantId === undefined ? [] : [assistantId], ownKeys: Object.keys(own ?? {}), resolved })
+      if (group === undefined) groups.set(key, { users: assistantId === undefined ? [] : [assistantId], ownKeys: [...ownKeys], resolved })
       else {
         if (assistantId !== undefined) group.users.push(assistantId)
-        for (const k of Object.keys(own ?? {})) if (!group.ownKeys.includes(k)) group.ownKeys.push(k)
+        for (const k of ownKeys) if (!group.ownKeys.includes(k)) group.ownKeys.push(k)
       }
     }
-    if (entry.demand === undefined) add(undefined, undefined)
-    else for (const d of entry.demand) add(d.assistantId, applicableOwnValues(entry.def.settings, d.own))
-    const instances = [...groups].map(([key, g]): HostInstanceTarget => ({
-      key,
-      users: g.users,
-      ownKeys: g.ownKeys,
-      invalid: g.resolved.value === undefined && !retainedInstance(entry, key, src.secretEpoch) ? invalidMessage(g.resolved.form.errors) : undefined,
-      fingerprint: JSON.stringify([generation, key, src.secretEpoch, entry.restartInstances.get(key) ?? 0]),
-      resolved: g.resolved,
-      secretEpoch: src.secretEpoch
-    }))
-    return { id, runs: true, shared, instances }
+    if (d.demand === undefined) add(undefined, undefined)
+    else for (const dm of d.demand) add(dm.assistantId, applicableOwnValues(entry.def.settings, dm.own))
+    const valid = [...groups].map(([key, g]): HostInstanceTarget => ({ key, users: g.users, ownKeys: g.ownKeys, invalid: undefined, resolved: g.resolved }))
+    // Demanded only through `uses` and without a shared part: nothing to run.
+    if (shared === undefined && valid.length === 0 && invalid.length === 0) return none
+    const fieldErrors = shared !== undefined && shared.settings === undefined ? shared.errors : shared === undefined && valid.length === 0 ? invalid[0]?.resolved.form.errors : undefined
+    const why = shared !== undefined && shared.settings === undefined ? invalidMessage(shared.errors) : shared === undefined && valid.length === 0 ? invalid[0]!.invalid : undefined
+    const fingerprint = JSON.stringify([shared?.key ?? null, valid.map((i) => i.key).sort(), d.secretEpoch, d.restarts])
+    return {
+      id,
+      runs: true,
+      invalid: why,
+      instances: [...valid, ...invalid],
+      fingerprint,
+      attempt: JSON.stringify([fingerprint, d.vaultEpoch, d.statuses.map((st) => [st.state, st.detail]), d.retry]),
+      shared,
+      fieldErrors,
+      secrets,
+      desired: d
+    }
   }
-
-  /** A live instance of this key started with the same configured secrets: a restart reuses its settings. */
-  const retainedInstance = (entry: Entry, key: string, secretEpoch: number) => {
-    const live = entry.instances.get(key)?.running
-    return live !== undefined && live.secretEpoch === secretEpoch
-  }
-
-  /** What the planner needs of what is published. */
-  const currentOf = (entry: Entry): ModuleCurrent => ({
-    generation: entry.shared?.part.fingerprint,
-    instances: new Map([...entry.instances].flatMap(([key, r]) => (r.running === undefined ? [] : [[key, { fingerprint: r.running.part.fingerprint, users: r.users }] as const]))),
-    failedGeneration: entry.failedGeneration,
-    failedInstances: entry.failedInstances,
-    retry: entry.retry
-  })
 
   // -- What the module's info shows -----------------------------------------------------------------------------------
 
-  /** Running instances, in key order. */
-  const runningOf = (entry: Entry): Array<Instance> => [...entry.instances.values()].filter((r) => r.running !== undefined)
-
-  /** The instance with the shared settings when it runs, else the first running one. */
-  const mainOf = (entry: Entry): Instance | undefined => {
-    const running = runningOf(entry)
+  /** The instance with the shared settings when it runs, else the first one. */
+  const mainOf = (entry: Entry): InstanceRun | undefined => {
+    const running = [...(entry.run?.instances.values() ?? [])]
     return running.find((r) => r.ownKeys.length === 0) ?? running[0]
   }
 
   /** The published instance an assistant uses. */
-  const instanceFor = (entry: Entry, assistantId: string): Instance | undefined => {
-    for (const r of entry.instances.values()) if (r.running !== undefined && r.users.includes(assistantId)) return r
+  const instanceFor = (entry: Entry, assistantId: string): InstanceRun | undefined => {
+    for (const r of entry.run?.instances.values() ?? []) if (r.users.includes(assistantId)) return r
     return undefined
   }
 
-  /** Parts of the module retired and not yet closed (in their grace period). */
-  const retiringOf = (entry: Entry) => [...openParts].some((p) => p.entry === entry && p.state === "retired")
-
-  /**
-   * The module's state from its instances and its shared part: `error` when one fails, `starting` while one starts,
-   * `running` while one runs or (no instance: demanded only through `uses`) while its shared part runs.
-   */
+  /** The module's state: what the worker is doing with it, what runs, or why nothing does. */
   const stateOf = (entry: Entry): { readonly state: ModuleState; readonly error?: string } => {
     if (entry.catalogError !== undefined) return { state: "error", error: entry.catalogError }
-    if (entry.unavailable !== undefined) return { state: "unavailable" }
-    const all = [...entry.instances.values()]
-    if (all.some((r) => r.state === "starting") || (entry.starting && entry.shared === undefined)) return { state: "starting" }
-    if (entry.generationError !== undefined && entry.shared === undefined) return { state: "error", error: entry.generationError }
-    if (all.length === 0) {
-      if (entry.shared !== undefined) return { state: "running" }
-      return { state: retiringOf(entry) ? "stopping" : "disabled" }
+    if (entry.shown.unavailable !== undefined) return { state: "unavailable" }
+    if (entry.phase === "starting") return { state: "starting" }
+    if (entry.phase === "stopping") return { state: "stopping" }
+    if (entry.run !== undefined) {
+      const bad = entry.invalid[0]
+      if (bad === undefined) return { state: "running" }
+      return { state: "error", error: `${bad.invalid} (for ${entry.invalid.flatMap((i) => i.users).join(", ")})` }
     }
-    const failed = all.find((r) => r.state === "error")
-    if (failed === undefined) return { state: "running" }
-    const message = failed.error ?? "The module could not start"
-    return { state: "error", error: all.length === 1 || failed.users.length === 0 ? message : `${message} (for ${failed.users.join(", ")})` }
+    if (entry.failure !== undefined) return { state: "error", error: entry.failure.message }
+    return { state: "disabled" }
   }
 
-  /** It runs in some form: an instance, or its shared part (`health()`'s `running`). */
-  const isRunning = (entry: Entry) => mainOf(entry) !== undefined || entry.shared !== undefined
-
-  /** An instance as the page sees it: its start error and status line through the boundary. */
-  const instanceInfo = (entry: Entry, r: Instance, moving: ReadonlySet<string>): ModuleInstanceInfo => {
-    const status = r.running === undefined ? undefined : boundary.status(entry.def.id, r.status)
-    return {
-      // An assistant whose own instance is starting is shown there (it is served here until that one is published).
-      assistants: r.running === undefined ? [...r.users] : r.users.filter((u) => !moving.has(u)),
-      own: [...r.ownKeys],
-      state: r.state,
-      ...(r.error !== undefined ? { error: boundary.text(entry.def.id, r.error, 2000) } : {}),
-      ...(status !== undefined ? { status } : {})
+  /** The instances as the page sees them: their errors and status lines through the boundary. */
+  const instanceInfos = (entry: Entry): Array<ModuleInstanceInfo> => {
+    const id = entry.def.id
+    const out: Array<ModuleInstanceInfo> = []
+    for (const r of entry.run?.instances.values() ?? []) {
+      const status = boundary.status(id, r.status)
+      out.push({ assistants: [...r.users], own: [...r.ownKeys], state: "running", ...(status !== undefined ? { status } : {}) })
     }
+    if (entry.phase === "starting" && entry.starting !== undefined) {
+      for (const t of entry.starting.instances) if (t.invalid === undefined) out.push({ assistants: [...t.users], own: [...t.ownKeys], state: "starting" })
+    } else if (entry.run === undefined && entry.failure !== undefined) {
+      for (const t of entry.failure.instances) out.push({ assistants: [...t.users], own: [...t.ownKeys], state: "error", error: boundary.text(id, entry.failure.message, 2000) })
+    }
+    for (const t of entry.invalid) {
+      if (entry.failure?.instances.includes(t) === true && entry.run === undefined) continue
+      out.push({ assistants: [...t.users], own: [...t.ownKeys], state: "error", error: boundary.text(id, t.invalid!, 2000) })
+    }
+    return out
   }
 
-  const movingOf = (entry: Entry): ReadonlySet<string> =>
-    new Set([...entry.instances.values()].flatMap((r) => (r.state === "starting" && r.running === undefined ? r.users : [])))
+  const templateBudget = new Map<Entry, { readonly list: Array<AssistantTemplate>; readonly left: number }>()
+  {
+    const encoder = new TextEncoder()
+    let used = 0
+    for (const entry of entries) {
+      const all = (entry.def.templates ?? []).map((t): AssistantTemplate => ({
+        id: `${entry.def.id}.${t.id}`,
+        name: t.name,
+        prompt: t.prompt,
+        ...(t.purpose !== undefined ? { purpose: t.purpose } : {}),
+        ...(t.handles !== undefined ? { handles: t.handles } : {}),
+        modules: [...(t.modules ?? [entry.def.id])],
+        ...(t.suggestedPhrases !== undefined ? { suggestedPhrases: [...t.suggestedPhrases] } : {})
+      }))
+      const list: Array<AssistantTemplate> = []
+      for (const t of all) {
+        const size = encoder.encode(JSON.stringify(t)).length
+        if (list.length === MAX_MODULE_TEMPLATES || used + size > TEMPLATE_BUDGET_BYTES) break
+        used += size
+        list.push(t)
+      }
+      if (all.length > 0) templateBudget.set(entry, { list, left: all.length - list.length })
+    }
+  }
 
   /**
    * The module as the page sees it. Everything in it the module produced at run time passes the boundary: its start
    * error, status line, tools, form decorations (`decorateForm`, from the published main instance) and its live
-   * routes (the route table the switch fills).
+   * routes (the route table publication fills).
    */
   const info = (entry: Entry): ModuleInfo => {
     const id = entry.def.id
@@ -1067,14 +1015,15 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
     const status = boundary.status(id, main?.status)
     const routes = routeTable.get(id)?.routes ?? []
     const tools = new Map<string, Tool>()
-    for (const r of [...(main === undefined ? [] : [main]), ...runningOf(entry)]) {
-      for (const t of r.running?.tools ?? []) if (!tools.has(t.name)) tools.set(t.name, t)
+    for (const r of [...(main === undefined ? [] : [main]), ...(entry.run?.instances.values() ?? [])]) {
+      for (const t of r.tools) if (!tools.has(t.name)) tools.set(t.name, t)
     }
+    const templates = templateBudget.get(entry)?.list ?? []
     return {
       id: entry.def.id,
       name: entry.def.name,
       description: entry.def.description,
-      enabled: wanted(entry),
+      enabled: wantedBy(entry, entry.want),
       state,
       ...(error !== undefined ? { error: boundary.text(id, error, 2000) } : {}),
       ...(status !== undefined ? { status } : {}),
@@ -1092,11 +1041,11 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
       settings: decorateForm(entry, resolve(entry).form),
       revision: entry.revision,
       ...(entry.def.kind !== undefined ? { kind: entry.def.kind } : {}),
-      ...(entry.demand !== undefined ? { instances: [...entry.instances.values()].map((r) => instanceInfo(entry, r, movingOf(entry))) } : {}),
-      ...(entry.unavailable !== undefined ? { unavailable: entry.unavailable } : {}),
+      ...(entry.want.demand !== undefined ? { instances: instanceInfos(entry) } : {}),
+      ...(entry.shown.unavailable !== undefined ? { unavailable: entry.shown.unavailable } : {}),
       ...(entry.def.version !== undefined ? { version: entry.def.version } : {}),
       ...(entry.def.apiVersion !== undefined ? { apiVersion: entry.def.apiVersion } : {}),
-      ...(entry.def.templates !== undefined && entry.def.templates.length > 0 ? { templates: templatesOf(entry) } : {}),
+      ...(templates.length > 0 ? { templates } : {}),
       ...(routes.length > 0 ? { routes: routes.map((r) => routeView(id, r)) } : {})
     }
   }
@@ -1123,7 +1072,7 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
    * decision provider. Never part of an instance's settings key.
    */
   const decorateForm = (entry: Entry, form: SettingsForm): SettingsForm => {
-    const instance = mainOf(entry)?.running?.instance
+    const instance = mainOf(entry)?.instance
     // Called on the instance (a method may use `this`); a throwing one gives nothing.
     const read = <T>(f: () => T): T | undefined => {
       try {
@@ -1177,18 +1126,7 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
   /** An agent or decision provider without a `test` field of its own gets the generated Test button. */
   const generatesTest = (entry: Entry) => (entry.def.kind === "agent" || entry.def.kind === "decider") && !Object.hasOwn(entry.def.settings, "test")
 
-  const templatesOf = (entry: Entry): Array<AssistantTemplate> =>
-    (entry.def.templates ?? []).map((t) => ({
-      id: `${entry.def.id}.${t.id}`,
-      name: t.name,
-      prompt: t.prompt,
-      ...(t.purpose !== undefined ? { purpose: t.purpose } : {}),
-      ...(t.handles !== undefined ? { handles: t.handles } : {}),
-      modules: [...(t.modules ?? [entry.def.id])],
-      ...(t.suggestedPhrases !== undefined ? { suggestedPhrases: [...t.suggestedPhrases] } : {})
-    }))
-
-  /** The module's own issues (source `module:<id>`): requirements, unavailable, a failed start or restart. */
+  /** The module's own issues (source `module:<id>`): requirements, unavailable, a failed start, what hung. */
   const moduleIssues = (entry: Entry, demandedNow: ReadonlySet<Entry>): ReadonlyArray<Issue> => {
     const id = entry.def.id
     const name = entry.def.name
@@ -1196,32 +1134,33 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
     // An error only for a module that would run (someone wants it, directly or through `uses`): an unused module
     // missing a program does not fail `doctor`.
     const severity = demandedNow.has(entry) ? "error" : "warning"
-    const unused = severity === "warning" && entry.demand !== undefined ? " (No assistant has it on.)" : ""
+    const unused = severity === "warning" && entry.want.demand !== undefined ? " (No assistant has it on.)" : ""
     const page = { kind: "link", label: `Open ${name}`, value: `#settings/shared/modules/${id}` } as const
     if (entry.catalogError !== undefined) {
       out.push({ id: `${id}.uses`, module: id, severity: "error", title: `${name} cannot start`, detail: entry.catalogError })
     }
-    for (const st of entry.statuses) {
+    for (const st of entry.want.statuses) {
       if (st.state !== "missing") continue
       const r = st.requirement
-      const why = "why" in r && r.why !== undefined ? r.why : undefined
+      const why = r.why
+      const optional = isOptionalRequirement(r)
       out.push({
         id: `${id}.requires.${requirementKey(r)}`,
         module: id,
-        severity: isOptionalRequirement(r) ? "warning" : severity,
+        severity: optional ? "warning" : severity,
         title: st.detail,
-        detail: `${name} ${isOptionalRequirement(r) ? "can use it" : "needs it"}${why === undefined ? "." : `: ${why}${/[.!?]$/.test(why) ? "" : "."}`}${isOptionalRequirement(r) ? "" : unused}`,
+        detail: `${name} ${optional ? "can use it" : "needs it"}${why === undefined ? "." : `: ${why}${/[.!?]$/.test(why) ? "" : "."}`}${optional ? "" : unused}`,
         ...(st.fix !== undefined ? { fix: st.fix } : {})
       })
     }
-    if (entry.unavailable !== undefined && out.length === 0) {
+    if (entry.want.unavailable !== undefined && out.length === 0) {
       out.push({
         id: `${id}.unavailable`,
         module: id,
         severity,
         title: `${name} cannot run on this server`,
-        detail: `${entry.unavailable.reason}${unused}`,
-        ...(entry.unavailable.fix !== undefined ? { fix: entry.unavailable.fix } : {})
+        detail: `${entry.want.unavailable.reason}${unused}`,
+        ...(entry.want.unavailable.fix !== undefined ? { fix: entry.want.unavailable.fix } : {})
       })
     }
     const { error, state } = stateOf(entry)
@@ -1229,16 +1168,25 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
       // The start error may be the module's own words: through the boundary (the host's words around it are not).
       out.push({ id: `${id}.start`, module: id, severity: "error", title: `${name} could not start`, detail: boundary.redact(id, error ?? ""), fix: page })
     }
-    if (entry.kept !== undefined) {
-      out.push({ id: `${id}.restart`, module: id, severity: "warning", title: entry.kept.title, detail: `It keeps running as it was. ${boundary.redact(id, entry.kept.message)}`, fix: page })
+    // What hung or threw: a registration's or a module's error may be in the detail, so it passes the boundary too.
+    entry.problems.forEach((p, i) => out.push({ id: `${id}.problem.${i}`, module: id, severity: "warning", title: p.title, detail: boundary.redact(id, p.detail) }))
+    const templates = templateBudget.get(entry)
+    if (templates !== undefined && templates.left > 0) {
+      out.push({
+        id: `${id}.templates`,
+        module: id,
+        severity: "warning",
+        title: `${name}: ${templates.left} of its suggested assistants are not offered`,
+        detail: `A module offers at most ${MAX_MODULE_TEMPLATES}, and all modules' suggested assistants together must fit the admin page.`
+      })
     }
-    // Host-made issues: the module's words in them (a start error) passed the boundary above; the rest is the host's.
+    // Host-made issues: the module's words in them (a start error, a problem's detail) passed the boundary above.
     return normaliseIssues(entry.def.id, entry.def.name, out, (value, max) => boundary.text(entry.def.id, value, max), true)
   }
 
   /** Every module's issues again (a change of demand changes the severity of the modules it reaches too). */
   const refreshIssues = () => {
-    const demandedNow = reached()
+    const demandedNow = demandedIn((e) => e.want)
     for (const entry of entries) issues.set(`module:${entry.def.id}`, moduleIssues(entry, demandedNow))
   }
 
@@ -1277,22 +1225,57 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
     pendingStatus.add(entry)
   }
 
-  // -- The snapshot ---------------------------------------------------------------------------------------------------
+  // -- Calls into a published run ---------------------------------------------------------------------------------------
 
-  const wrapProvider = (moduleId: string, part: Part, provider: ContextProvider): ContextProvider => ({
+  /** A tool or action of a run that was withdrawn (a turn that held an old snapshot). */
+  const gone = (entry: Entry) => `${entry.def.name} was stopped or started again since this turn began; ask again.`
+
+  /**
+   * A call into a run's code (a tool, an action, a context provider): refused once the run is withdrawn; counted while
+   * in flight, so a stop gives it the grace period; interrupted when the grace period is over. The waiting happens in
+   * the caller's fiber, never in the worker's.
+   */
+  const guarded = <A, E>(run: Run, body: () => Effect.Effect<A, E>, refused: () => Effect.Effect<A, E>): Effect.Effect<A, E> =>
+    Effect.suspend(() => {
+      if (run.state !== "live") return refused()
+      run.inflight++
+      return Effect.raceFirst(Effect.suspend(body), Effect.flatMap(Deferred.await(run.killed), refused)).pipe(
+        Effect.ensuring(Effect.sync(() => {
+          run.inflight--
+          if (run.inflight === 0 && run.idle !== undefined) Deferred.doneUnsafe(run.idle, Effect.void)
+        }))
+      )
+    })
+
+  const wrapProvider = (entry: Entry, run: Run, provider: ContextProvider): ContextProvider => ({
     name: provider.name,
-    get: Effect.suspend(() => (part.closed ? Effect.succeed("") : provider.get)).pipe(
+    get: guarded(run, () => provider.get, () => Effect.succeed("")).pipe(
       Effect.timeoutOrElse({
         duration: contextTimeoutMs,
         orElse: () =>
           Effect.as(
-            Effect.logWarning(`Context provider "${provider.name}" (module ${moduleId}) took over ${contextTimeoutMs} ms; left out of this turn`),
+            Effect.logWarning(`Context provider "${provider.name}" (module ${entry.def.id}) took over ${contextTimeoutMs} ms; left out of this turn`),
             ""
           )
       }),
       Effect.catchCause((cause) => Effect.as(Effect.logWarning(`Context provider "${provider.name}" failed`, cause), ""))
     )
   })
+
+  /** An instance's actions and tools, sealed: only the gateway reaches them, through the run's in-flight tracking. */
+  const contributionsOf = (run: Run, instance: ModuleInstance) => {
+    const entry = run.entry
+    const actions = registerActions(entry.def.id, instance.actions ?? []).map((a) =>
+      sealAction(a, (values) => guarded(run, () => a.definition.run(values as never), () => Effect.fail(new ActionError({ message: gone(entry) }))))
+    )
+    const generated = actions.filter((a) => a.definition.offerAsTool !== false).map(actionTool)
+    const own = (instance.tools ?? []).map((t) =>
+      sealTool(t, (input) => guarded(run, () => t.execute(input), () => Effect.fail(new ToolError({ message: gone(entry) }))))
+    )
+    return { actions, tools: [...own, ...generated] }
+  }
+
+  // -- The snapshot ---------------------------------------------------------------------------------------------------
 
   /**
    * The part of a module that cannot run here but is wanted (C.4 option a): no tools, one instructions line so the
@@ -1322,7 +1305,7 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
             run: () => Effect.succeed({ say })
           })
         )
-      )
+      ).map((a) => sealAction(a, (values) => a.definition.run(values as never)))
       part = { moduleId: entry.def.id, module: { name: entry.def.id, tools: [], context: [], intentActions: standIns }, instructions: line, unavailable: true }
       unavailableParts.set(entry, part)
     }
@@ -1330,22 +1313,22 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
   }
 
   /** One part per running instance, made once (so every snapshot and every assistant shares the same object). */
-  const parts = new WeakMap<Running, ModulePart>()
-  const partOf = (entry: Entry, running: Running): ModulePart => {
-    let part = parts.get(running)
+  const parts = new WeakMap<InstanceRun, ModulePart>()
+  const partOf = (entry: Entry, run: Run, inst: InstanceRun): ModulePart => {
+    let part = parts.get(inst)
     if (part === undefined) {
-      const intentOnly = running.actions.filter((a) => a.definition.offerAsTool === false)
+      const intentOnly = inst.actions.filter((a) => a.definition.offerAsTool === false)
       part = {
         moduleId: entry.def.id,
         module: {
           name: entry.def.id,
-          tools: running.tools,
-          context: (running.instance.context ?? []).map((p) => wrapProvider(entry.def.id, running.part, p)),
+          tools: inst.tools,
+          context: (inst.instance.context ?? []).map((p) => wrapProvider(entry, run, p)),
           ...(intentOnly.length > 0 ? { intentActions: intentOnly } : {})
         },
-        instructions: running.instance.instructions?.trim() ?? ""
+        instructions: inst.instance.instructions?.trim() ?? ""
       }
-      parts.set(running, part)
+      parts.set(inst, part)
     }
     return part
   }
@@ -1365,24 +1348,24 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
   let snapshotShape = ""
   const shapeOf = () =>
     JSON.stringify(entries.map((e) => [
-      e.unavailable === undefined ? null : [e.unavailable.reason, e.demand === undefined ? switchOn(e) : e.demand.map((d) => d.assistantId)],
-      [...e.instances.values()].map((r) => [r.running?.part.id ?? null, r.users, r.ownKeys.length])
+      e.shown.unavailable === undefined ? null : [e.shown.unavailable.reason, e.shown.demand === undefined ? switchOn(e, e.shown) : e.shown.demand.map((d) => d.assistantId)],
+      e.run?.id ?? null,
+      [...(e.run?.instances.values() ?? [])].map((r) => [r.key, r.users, r.ownKeys.length])
     ]))
-  /** The snapshot of the published instances. Throws on a tool name clash (the switch has refused those already). */
+  /** The snapshot of what is published, from the runs and the picture each module was published with. */
   const buildSnapshot = (): ModuleSnapshot => {
     const mains = entries.flatMap((e) => {
-      if (e.unavailable !== undefined) return []
-      const r = mainOf(e)?.running
-      return r === undefined ? [] : [{ e, r }]
+      const r = e.shown.unavailable === undefined && e.run !== undefined ? mainOf(e) : undefined
+      return r === undefined ? [] : [{ e, run: e.run!, r }]
     })
     /** The main parts in catalog order: the running ones, and an unavailable one wherever it is wanted (no demand). */
     const mainParts = entries.flatMap((e) => {
-      if (e.unavailable !== undefined) return e.demand === undefined && switchOn(e) ? [unavailablePartOf(e, e.unavailable)] : []
-      const r = mainOf(e)?.running
-      return r === undefined ? [] : [partOf(e, r)]
+      if (e.shown.unavailable !== undefined) return e.shown.demand === undefined && switchOn(e, e.shown) ? [unavailablePartOf(e, e.shown.unavailable)] : []
+      const r = e.run === undefined ? undefined : mainOf(e)
+      return r === undefined ? [] : [partOf(e, e.run!, r)]
     })
     const toolModules = new Map<string, string>()
-    for (const e of entries) for (const r of runningOf(e)) for (const t of r.running!.tools) toolModules.set(t.name, e.def.id)
+    for (const e of entries) for (const r of e.run?.instances.values() ?? []) for (const t of r.tools) toolModules.set(t.name, e.def.id)
     const agents = new Map<string, Agent>()
     const deciders = new Map<string, DecisionProvider>()
     for (const { r } of mains) {
@@ -1391,17 +1374,18 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
     }
     const assistantParts = new Map<string, ReadonlyArray<ModulePart>>()
     for (const e of entries) {
-      for (const d of e.demand ?? []) {
+      for (const d of e.shown.demand ?? []) {
         if (assistantParts.has(d.assistantId)) continue
         assistantParts.set(
           d.assistantId,
           entries.flatMap((x) => {
-            if (x.unavailable !== undefined) {
-              const wants = x.demand === undefined ? switchOn(x) : x.demand.some((w) => w.assistantId === d.assistantId)
-              return wants ? [unavailablePartOf(x, x.unavailable)] : []
+            if (x.shown.unavailable !== undefined) {
+              const wants = x.shown.demand === undefined ? switchOn(x, x.shown) : x.shown.demand.some((w) => w.assistantId === d.assistantId)
+              return wants ? [unavailablePartOf(x, x.shown.unavailable)] : []
             }
-            const r = x.demand === undefined ? mainOf(x)?.running : instanceFor(x, d.assistantId)?.running
-            return r === undefined ? [] : [partOf(x, r)]
+            if (x.run === undefined) return []
+            const r = x.shown.demand === undefined ? mainOf(x) : instanceFor(x, d.assistantId)
+            return r === undefined ? [] : [partOf(x, x.run, r)]
           })
         )
       }
@@ -1428,21 +1412,23 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
       snapshot = buildSnapshot()
       snapshotShape = shape
     } catch (error) {
-      // Cannot happen (the switch refuses clashing tool names); kept so a host bug never leaves turns without tools.
+      // Cannot happen (a start refuses clashing tool names); kept so a host bug never leaves turns without tools.
       Effect.runSync(Effect.logError("The module snapshot could not be rebuilt; the previous one stays", error))
     }
   }
 
   // -- Registrations --------------------------------------------------------------------------------------------------
 
-  /** Live claims by kind: claim → the module that holds it. */
+  /** Published claims by kind: claim → the module that holds it. */
   const claims = new Map<string, Map<string, Entry>>()
-  /** Live services by key id. */
-  const liveServices = new Map<string, { readonly entry: Entry; readonly part: Part; readonly service: unknown }>()
-  /** Live contributions by module. */
-  const liveContributions = new Map<Entry, { readonly part: Part; readonly list: ReadonlyArray<ProvidedContribution> }>()
-  /** P3: live module routes by module id: the published shared part's (`host.routes()`, `ModuleInfo.routes`). */
-  const routeTable = new Map<string, { readonly routes: ReadonlyArray<ModuleRoute>; readonly scope: Scope.Scope; readonly handle: PartHandle }>()
+  /** Published services by key id. */
+  const liveServices = new Map<string, { readonly entry: Entry; readonly service: unknown }>()
+  /** Published contributions by module. */
+  const liveContributions = new Map<Entry, ReadonlyArray<ProvidedContribution>>()
+  /** Instances by part id, while they are open (the tool registrar reads their names). */
+  const instanceByPart = new Map<number, InstanceRun>()
+  /** P3: published module routes by module id: the published shared part's (`host.routes()`, `ModuleInfo.routes`). */
+  const routeTable = new Map<string, { readonly routes: ReadonlyArray<ModuleRoute>; readonly scope: Scope.Scope }>()
 
   /**
    * The kinds declared by what a part returns (`ModuleRegistrations.ts`). A later PR adds its kind here, one entry
@@ -1450,419 +1436,622 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
    */
   const registrars: ReadonlyArray<Registrar> = [
     // Services of a shared part: one provider per key, looked up live (`host.service`).
-    ({ handle, shared }) =>
-      (shared?.services ?? []).length === 0 ? [] : [{
+    ({ handle, shared }) => {
+      const services = shared?.services ?? []
+      if (services.length === 0) return []
+      const entry = byId.get(handle.moduleId)!
+      return [{
         kind: "service",
-        claims: shared!.services!.map((p) => p.key.id),
+        claims: services.map((p) => p.key.id),
         clash: (claim, owner) => `The service "${claim}" is already provided by module ${owner}`,
         publish: () => {
-          const part = partById.get(handle.id)!
-          for (const p of shared!.services!) liveServices.set(p.key.id, { entry: part.entry, part, service: p.service })
+          for (const p of services) liveServices.set(p.key.id, { entry, service: p.service })
         },
         withdraw: () => {
-          for (const p of shared!.services!) if (liveServices.get(p.key.id)?.part.id === handle.id) liveServices.delete(p.key.id)
+          for (const p of services) if (liveServices.get(p.key.id)?.entry === entry) liveServices.delete(p.key.id)
         }
-      }],
+      }]
+    },
     // Contributions of a shared part (`host.contributions`).
-    ({ handle, shared }) =>
-      (shared?.contributions ?? []).length === 0 ? [] : [{
+    ({ handle, shared }) => {
+      const list = shared?.contributions ?? []
+      if (list.length === 0) return []
+      const entry = byId.get(handle.moduleId)!
+      return [{
         kind: "contribution",
-        publish: () => {
-          const part = partById.get(handle.id)!
-          liveContributions.set(part.entry, { part, list: [...shared!.contributions!] })
-        },
-        withdraw: () => {
-          const part = partById.get(handle.id)!
-          if (liveContributions.get(part.entry)?.part === part) liveContributions.delete(part.entry)
-        }
-      }],
-    // An instance's tool names, unique across modules (its tools and actions reach turns through the snapshot,
-    // rebuilt at the end of every switch from the published instances).
+        publish: () => void liveContributions.set(entry, [...list]),
+        withdraw: () => void liveContributions.delete(entry)
+      }]
+    },
+    // An instance's tool names, unique across modules (its tools reach turns through the snapshot, rebuilt from the
+    // published runs right after they are published).
     ({ handle, instance }) => {
-      const running = instance === undefined ? undefined : runningByPart.get(handle.id)
-      if (running === undefined || running.tools.length === 0) return []
+      const inst = instance === undefined ? undefined : instanceByPart.get(handle.id)
+      if (inst === undefined || inst.tools.length === 0) return []
       return [{
         kind: "tool",
-        claims: running.tools.map((t) => t.name),
+        claims: inst.tools.map((t) => t.name),
         clash: (claim, owner) => `Tool name "${claim}" is already used by module ${owner}`,
         publish: () => {},
         withdraw: () => {}
       }]
     },
     // P3: a shared part's HTTP routes (`SharedPart.routes`), one entry per module in the route table. Checked before
-    // the switch (a bad declaration refuses the part, and so its generation); live from the switch that publishes
-    // the part until the one that withdraws it, so a request is only ever routed to the published generation.
+    // the module is published (a bad declaration fails its start); live from its publication until it is withdrawn
+    // (only one start of a module is ever published), so a request is only ever routed to the published part.
     ({ handle, shared }) => {
       const declared = shared?.routes
       if (declared === undefined || declared.length === 0) return []
       const routes = [...declared]
+      // A handler runs as a call in flight of its module's published run (`guarded`): refused once the module is
+      // withdrawn, given the grace period when it stops, interrupted after it (the router answers 503).
+      const live = routes.map((route): ModuleRoute =>
+        typeof route === "object" && route !== null && typeof route.handler === "function"
+          ? {
+            ...route,
+            handler: (request) =>
+              Effect.suspend(() => {
+                const run = byId.get(handle.moduleId)?.run
+                if (run === undefined || run.shared?.part.id !== handle.id) return Effect.interrupt
+                return guarded(run, () => route.handler(request), () => Effect.interrupt)
+              })
+          }
+          : route
+      )
       return [{
         kind: "route",
         // The full paths: unique across modules by construction (each module has its own prefix).
         claims: routes.map((r) => `${r.method} ${routeInfo(handle.moduleId, r).path}`),
         validate: () => routeProblem(routes),
-        publish: () => void routeTable.set(handle.moduleId, { routes, scope: handle.scope, handle }),
-        withdraw: () => {
-          if (routeTable.get(handle.moduleId)?.handle.id === handle.id) routeTable.delete(handle.moduleId)
-        }
+        publish: () => void routeTable.set(handle.moduleId, { routes: live, scope: handle.scope }),
+        withdraw: () => void routeTable.delete(handle.moduleId)
       }]
     },
     ...(options.registrars ?? [])
   ]
 
-  const safely = (what: string, f: () => void) => {
-    try {
-      f()
-    } catch (error) {
-      Effect.runSync(Effect.logError(`A module registration failed to ${what}`, error))
-    }
-  }
-
-  /** Why `regs` of module `entry` cannot go live now (a claim another module holds, or their own check), else `undefined`. */
+  /** Why `regs` of module `entry` cannot be published now (a claim another module holds, their own check), else `undefined`. */
   const refusalOf = (entry: Entry, regs: ReadonlyArray<Registration>): string | undefined => {
+    const mine = new Map<string, Set<string>>()
     for (const r of regs) {
       const table = claims.get(r.kind)
+      const own = mine.get(r.kind) ?? new Set<string>()
+      mine.set(r.kind, own)
       for (const claim of r.claims ?? []) {
         const owner = table?.get(claim)
-        if (owner !== undefined && owner !== entry) return r.clash?.(claim, owner.def.name) ?? `"${claim}" is already taken by module ${owner.def.name}`
+        if (owner !== undefined && owner !== entry) {
+          try {
+            return r.clash?.(claim, owner.def.name) ?? `"${claim}" is already taken by module ${owner.def.name}`
+          } catch {
+            return `"${claim}" is already taken by module ${owner.def.name}`
+          }
+        }
+        own.add(claim)
       }
       let problem: string | undefined
       try {
         problem = r.validate?.()
       } catch (error) {
-        problem = `Its ${r.kind} could not be checked: ${error instanceof Error ? error.message : String(error)}`
+        problem = `Its ${r.kind} could not be checked: ${describe(error)}`
       }
-      if (problem !== undefined) return problem
+      if (problem !== undefined) return String(problem)
     }
     return undefined
   }
 
-  const publishRegistration = (entry: Entry, r: Registration) => {
+  const claim = (entry: Entry, r: Registration) => {
     let table = claims.get(r.kind)
     if (table === undefined) claims.set(r.kind, table = new Map())
-    for (const claim of r.claims ?? []) table.set(claim, entry)
-    safely("publish", r.publish)
+    for (const c of r.claims ?? []) table.set(c, entry)
   }
-
-  const withdrawRegistration = (entry: Entry, r: Registration) => {
+  const unclaim = (entry: Entry, r: Registration) => {
     const table = claims.get(r.kind)
-    for (const claim of r.claims ?? []) if (table?.get(claim) === entry) table.delete(claim)
-    safely("withdraw", r.withdraw)
+    for (const c of r.claims ?? []) if (table?.get(c) === entry) table.delete(c)
   }
 
-  /** Publish a part (inside the switch). */
-  const publishPart = (part: Part) => {
-    part.state = "live"
-    for (const r of part.registrations) publishRegistration(part.entry, r)
+  /** Publish every registration of a run, in one synchronous step: all, or (one throws) none. */
+  const publishAll = (entry: Entry, regs: ReadonlyArray<Registration>): string | undefined => {
+    const done: Array<Registration> = []
+    for (const r of regs) {
+      try {
+        r.publish()
+        claim(entry, r)
+        done.push(r)
+      } catch (error) {
+        withdrawAll(entry, done)
+        return `Its ${r.kind} could not be published: ${describe(error)}`
+      }
+    }
+    return undefined
   }
 
-  /** Withdraw a live part (inside the switch); its scope closes after the grace period. */
-  const withdrawPart = (part: Part) => {
-    if (part.state !== "live") return
-    part.state = "retired"
-    for (const r of part.registrations) withdrawRegistration(part.entry, r)
-    // Another part of the same module may hold the same claims (a replaced instance): give them back.
-    for (const other of livePartsOf(part.entry)) for (const r of other.registrations) {
-      let table = claims.get(r.kind)
-      if (table === undefined) claims.set(r.kind, table = new Map())
-      for (const claim of r.claims ?? []) if (!table.has(claim)) table.set(claim, part.entry)
+  /** Withdraw registrations, last first, in one synchronous step; a throw is reported and the rest are withdrawn. */
+  const withdrawAll = (entry: Entry, regs: ReadonlyArray<Registration>) => {
+    for (const r of [...regs].reverse()) {
+      unclaim(entry, r)
+      try {
+        r.withdraw()
+      } catch (error) {
+        entry.problems.push({ title: `${entry.def.name}: its ${r.kind} could not be withdrawn`, detail: describe(error) })
+      }
     }
   }
 
-  const livePartsOf = (entry: Entry): Array<Part> => [
-    ...(entry.shared !== undefined && entry.shared.part.state === "live" ? [entry.shared.part] : []),
-    ...runningOf(entry).flatMap((r) => (r.running!.part.state === "live" ? [r.running!.part] : []))
-  ]
+  // -- Module code, bounded ---------------------------------------------------------------------------------------------
 
-  // -- Parts: scopes, closing in order --------------------------------------------------------------------------------
-
-  let nextPart = 0
-  /** Every part whose scope is not closed yet (published, in its grace period, a candidate): closing the host closes them. */
-  const openParts = new Set<Part>()
-  const partById = new Map<number, Part>()
-  const runningByPart = new Map<number, Running>()
-
-  const newPart = (entry: Entry, kind: "shared" | "instance", key: string, fingerprint: string) =>
-    Effect.gen(function*() {
-      const scope = yield* Scope.make()
-      const startedAt = yield* Clock.currentTimeMillis
-      const id = ++nextPart
-      const registrations: Array<Registration> = []
-      const handle: PartHandle = {
-        moduleId: entry.def.id,
-        moduleName: entry.def.name,
-        kind,
-        id,
-        state: () => part.state,
-        scope,
-        register: (registration) => register(part, registration)
-      }
-      // `info` values may have changed with a press: announced when it ends (only while the part is published).
-      const presses = kind === "instance" ? pressOwner((key) => `field action ${entry.def.id}.${key}`, () => announce(entry), () => entry.def.id) : undefined
-      const part: Part = {
-        id,
-        entry,
-        kind,
-        key,
-        fingerprint,
-        scope,
-        startedAt,
-        state: "starting",
-        closing: undefined,
-        closed: false,
-        registrations,
-        stagedRestart: undefined,
-        handle,
-        presses
-      }
-      openParts.add(part)
-      partById.set(id, part)
-      return part
-    })
-
-  /** `PartHandle.register`: staged while starting, published at once while live (checked first), refused after. */
-  const register = (part: Part, registration: Registration): RegisterResult => {
-    if (part.state === "starting" || part.state === "candidate") {
-      part.registrations.push(registration)
-      return { ok: true }
-    }
-    if (part.state !== "live") return { ok: false, reason: `${part.entry.def.name}'s ${part.kind} part is no longer published` }
-    const refused = refusalOf(part.entry, [registration])
-    if (refused !== undefined) return { ok: false, reason: refused }
-    part.registrations.push(registration)
-    publishRegistration(part.entry, registration)
-    return { ok: true }
-  }
-
-  /** Close one part's scope, exactly once (a second call waits for the first). */
-  const closePart = (part: Part): Effect.Effect<void> =>
-    Effect.uninterruptible(Effect.suspend(() => {
-      if (part.closed) return Effect.void
-      if (part.closing !== undefined) return Deferred.await(part.closing)
-      const done = Deferred.makeUnsafe<void>()
-      part.closing = done
-      if (part.state !== "retired") part.state = "discarded"
-      // Its presses first (each has ended, its cleanup run), then its scope: what a press uses is still open for it.
-      return Effect.andThen(part.presses?.stop ?? Effect.void, Scope.close(part.scope, Exit.void)).pipe(
-        Effect.catchCause((cause) => Effect.logWarning(`Module ${part.entry.def.id}: closing its ${part.kind} part failed`, cause)),
-        Effect.ensuring(Effect.sync(() => {
-          part.closed = true
-          openParts.delete(part)
-          partById.delete(part.id)
-          runningByPart.delete(part.id)
-          shareds.delete(part.id)
-          // Its code has ended: the secrets only it was given are no longer looked for.
-          boundary.release(part)
-          Deferred.doneUnsafe(done, Effect.void)
-          announce(part.entry)
-        }))
-      )
-    }))
+  let closing = false
+  /** P3: shutdown has begun: no field action is admitted from now on. */
+  let pressesClosed = false
+  const closingSignal = Deferred.makeUnsafe<void>()
 
   /**
-   * Parts in the order they may be closed: a consumer before the providers it uses (higher `uses` rank first), an
-   * instance before its shared part, an older start before a newer.
+   * Run `work` (module code) in a fiber of its own, at most `ms`: the worker waits for its result, never longer; one
+   * that does not finish in time (or, for a start, when the host closes) is interrupted without waiting and abandoned.
+   * An interruption, failure or defect inside it is its result, never the worker's.
    */
-  const closingOrder = (list: Iterable<Part>): Array<Part> =>
-    [...list].sort((a, b) => b.entry.rank - a.entry.rank || (a.kind === b.kind ? 0 : a.kind === "instance" ? -1 : 1) || a.id - b.id)
-
-  /** Close parts one after another, in dependency order (a part closes after the parts that may still use it). */
-  const closeInOrder = (list: Iterable<Part>): Effect.Effect<void> => Effect.forEach(closingOrder(list), closePart, { discard: true })
-
-  /** Grace timers of retired parts; interrupted at shutdown (the parts stay tracked in `openParts` until closed). */
-  const timers = new Set<Fiber.Fiber<void>>()
-
-  /** Retire parts withdrawn at a switch: closed in order after the grace period (calls in flight finish first). */
-  const retireLater = (list: ReadonlyArray<Part>): Effect.Effect<void> =>
-    list.length === 0 ? Effect.void : Effect.gen(function*() {
-      const fiber = yield* Effect.forkIn(outsideTurns(Effect.andThen(Effect.sleep(graceMs), closeInOrder(list))), hostScope)
-      timers.add(fiber)
-      fiber.addObserver(() => timers.delete(fiber))
+  const bounded = <A>(work: Effect.Effect<A, unknown>, ms: number, abandonOnClose: boolean): Effect.Effect<Bounded<A>> =>
+    Effect.gen(function*() {
+      const fiber = yield* Effect.forkDetach(outsideTurns(work))
+      const waited = Effect.map(Fiber.await(fiber), Option.some)
+      const exit = yield* (abandonOnClose ? Effect.raceFirst(waited, Effect.as(Deferred.await(closingSignal), Option.none())) : waited).pipe(
+        Effect.timeoutOption(ms),
+        Effect.map(Option.flatten)
+      )
+      if (Option.isSome(exit)) return { _tag: "done", exit: exit.value } as const
+      fiber.interruptUnsafe()
+      return { _tag: "hung" } as const
     })
 
   const describeStartFailure = (cause: Cause.Cause<unknown>): string => {
     const error = Cause.findErrorOption(cause)
     if (error._tag === "Some" && error.value instanceof ModuleStartError) return error.value.message
-    return `The module crashed while starting: ${Cause.pretty(cause).split("\n")[0]}`
+    if (Cause.hasInterruptsOnly(cause)) return "It was interrupted while starting"
+    return `The module crashed while starting: ${firstLine(cause)}`
   }
 
-  /** A tool or action of a part whose scope has closed (a turn that held an old snapshot past the grace period). */
-  const gone = (part: Part) => `${part.entry.def.name} was replaced or stopped since this turn began; ask again.`
+  let nextId = 0
+  const openParts = new Set<Part>()
 
-  /** An instance's actions (guarded), registered under the module id, and its tools plus one generated tool per offered action. */
-  const contributionsOf = (part: Part, instance: ModuleInstance) => {
-    const guardedActions = (instance.actions ?? []).map((a) => ({
-      ...a,
-      run: (values: any) => Effect.suspend(() => (part.closed ? Effect.fail(new ActionError({ message: gone(part) })) : a.run(values)))
-    }))
-    const actions = registerActions(part.entry.def.id, guardedActions)
-    const generated = actions.filter((a) => a.definition.offerAsTool !== false).map(actionTool)
-    const own = (instance.tools ?? []).map((t): Tool => ({
-      ...t,
-      execute: (input) => Effect.suspend(() => (part.closed ? Effect.fail(new ToolError({ message: gone(part) })) : t.execute(input)))
-    }))
-    return { actions, tools: [...own, ...generated] }
-  }
+  const newPart = (entry: Entry, kind: "shared" | "instance") =>
+    Effect.map(Scope.make(), (scope): Part => {
+      const id = ++nextId
+      const staged: Array<Registration> = []
+      const part: Part = {
+        id,
+        entry,
+        kind,
+        scope,
+        state: "starting",
+        staged,
+        stagedRestart: undefined,
+        handle: {
+          moduleId: entry.def.id,
+          moduleName: entry.def.name,
+          kind,
+          id,
+          state: () => part.state,
+          scope,
+          register: (registration) => {
+            if (part.state !== "starting") return { ok: false, reason: `${entry.def.name}: registrations are made while the module starts` }
+            staged.push(registration)
+            return { ok: true }
+          }
+        },
+        // P3: an instance's presses; `info` values may have changed with one: announced when it ends.
+        presses: kind === "instance" ? pressOwner((key) => `field action ${entry.def.id}.${key}`, () => announce(entry), () => entry.def.id) : undefined
+      }
+      openParts.add(part)
+      return part
+    })
 
-  // -- Starting parts (the reconciler only) ---------------------------------------------------------------------------
-
-  /** `ctx.settingsFor` of a shared part: its own shared values, the overridable ones as the desired state has them now. */
-  const settingsForOf = (entry: Entry, spec: SharedSpec) => (assistantId: string | undefined): unknown => {
-    const owned = new Set(overridableKeys(entry.def.settings))
-    const pick = (record: Readonly<Record<string, unknown>> | undefined, keep: (k: string) => boolean) =>
-      Object.fromEntries(Object.entries(record ?? {}).filter(([k]) => keep(k)))
-    const now = committedSources(entry)
-    const stored = { ...pick(spec.stored, (k) => !owned.has(k)), ...pick(now.stored, (k) => owned.has(k)) }
-    const defaults = { ...pick(spec.defaults, (k) => !owned.has(k)), ...pick(entry.defaults, (k) => owned.has(k)) }
-    const own = assistantId === undefined ? undefined : entry.demand?.find((d) => d.assistantId === assistantId)?.own
-    return resolveFrom(entry, { stored, secrets: spec.secrets }, own === undefined ? undefined : applicableOwnValues(entry.def.settings, own), defaults).value
-  }
-
-  /** Run module code for a part: outside any turn, in its scope, within the start limit. Fails only with an interruption. */
-  const runStart = <A>(part: Part, label: string, start: () => Effect.Effect<A, ModuleStartError, Scope.Scope>): Effect.Effect<Exit.Exit<A, ModuleStartError>> =>
-    outsideTurns(
-      Effect.suspend(start).pipe(
-        Scope.provide(part.scope),
-        Effect.timeoutOrElse({
-          duration: startTimeoutMs,
-          orElse: () => Effect.fail(new ModuleStartError({ message: `${label} within ${Math.round(startTimeoutMs / 1000)} s` }))
+  /**
+   * Close one part: its presses (P3: each interrupted and ended, its cleanup run), then its scope (its finalizers), at
+   * most `stopTimeoutMs` in all; past that it is abandoned and reported. A press never outlives what it may use.
+   */
+  const closePart = (part: Part): Effect.Effect<void> =>
+    Effect.gen(function*() {
+      if (part.state === "closed" || part.state === "abandoned") return
+      part.state = "withdrawn"
+      const entry = part.entry
+      const outcome = yield* bounded(Effect.andThen(part.presses?.stop ?? Effect.void, Scope.close(part.scope, Exit.void)), stopTimeoutMs, false)
+      instanceByPart.delete(part.id)
+      openParts.delete(part)
+      if (outcome._tag === "hung") {
+        part.state = "abandoned"
+        entry.problems.push({
+          title: `${entry.def.name} did not finish stopping`,
+          detail: `Its ${part.kind === "shared" ? "shared part" : "instance"} was still closing after ${Math.round(stopTimeoutMs / 1000)} s and was left to finish on its own. Restart the assistant if it still holds something open.`
         })
-      )
-    ).pipe(
-      Effect.exit,
-      Effect.flatMap((exit) => (Exit.isFailure(exit) && Cause.hasInterrupts(exit.cause) ? Effect.failCause(exit.cause as Cause.Cause<never>) : Effect.succeed(exit)))
+        yield* Effect.logWarning(`Module ${entry.def.id}: closing its ${part.kind} part did not finish within ${stopTimeoutMs} ms; abandoned`)
+        return
+      }
+      part.state = "closed"
+      // Its code has ended: the secrets only it was given are no longer looked for (an abandoned part keeps them).
+      boundary.release(part)
+      if (Exit.isFailure(outcome.exit)) yield* Effect.logWarning(`Module ${entry.def.id}: closing its ${part.kind} part failed`, outcome.exit.cause)
+    })
+
+  /** Run a part's `shared` or `start`: in its scope, outside any turn, within the start limit. */
+  const runCode = <A>(part: Part, label: string, start: () => Effect.Effect<A, ModuleStartError, Scope.Scope>) =>
+    Effect.map(
+      bounded(Effect.suspend(start).pipe(Scope.provide(part.scope)), startTimeoutMs, true),
+      (outcome): { readonly ok: true; readonly value: A } | { readonly ok: false; readonly message: string } => {
+        if (outcome._tag === "hung") return { ok: false, message: closing ? "The assistant is stopping" : `${label} within ${Math.round(startTimeoutMs / 1000)} s` }
+        return Exit.isSuccess(outcome.exit) ? { ok: true, value: outcome.exit.value } : { ok: false, message: describeStartFailure(outcome.exit.cause) }
+      }
     )
 
-  /** Start a shared part (a new generation's). The settings it runs with are kept for a restart that changes nothing else. */
-  const startShared = (entry: Entry, target: HostSharedTarget, pass: PassContext): Effect.Effect<StartResult<SharedRun>> =>
+  /** Check what an instance returned and seal its tools and actions. */
+  const instanceOf = (run: Run, instance: ModuleInstance): { readonly ok: true; readonly tools: ReadonlyArray<Tool>; readonly actions: ReadonlyArray<RegisteredAction> } | { readonly ok: false; readonly message: string } => {
+    let contributed: ReturnType<typeof contributionsOf>
+    try {
+      contributed = contributionsOf(run, instance)
+    } catch (error) {
+      return { ok: false, message: `The module's actions could not be offered as tools: ${describe(error)}` }
+    }
+    const actionIds = contributed.actions.map((a) => a.id)
+    const duplicateAction = actionIds.find((n, i) => actionIds.indexOf(n) !== i)
+    if (duplicateAction !== undefined) return { ok: false, message: `The module declares the action "${duplicateAction}" twice` }
+    const names = contributed.tools.map((t) => t.name)
+    const duplicate = names.find((n, i) => names.indexOf(n) !== i)
+    if (duplicate !== undefined) return { ok: false, message: `The module declares the tool "${duplicate}" twice` }
+    const metadata = [...(instance.tools ?? []).map((t) => metadataProblem(`Tool "${t.name}"`, t)), ...contributed.actions.map((a) => metadataProblem(`Action "${a.definition.id}"`, a.definition))]
+      .find((p) => p !== undefined)
+    if (metadata !== undefined) return { ok: false, message: metadata }
+    try {
+      // Its own tools on their own: a schema the registry cannot describe fails this start, not a later snapshot.
+      makeToolRegistry([{ name: run.entry.def.id, tools: contributed.tools }])
+    } catch (error) {
+      return { ok: false, message: `The module's tools could not be offered: ${describe(error)}` }
+    }
+    return { ok: true, ...contributed }
+  }
+
+  // -- Start and stop (the worker only) ---------------------------------------------------------------------------------
+
+  /**
+   * Start a module: its shared part, then its instances one after another; then its registrations are checked and
+   * published in one synchronous step. If anything fails, what did start is closed (instances first) and the module
+   * is down with the reason.
+   */
+  const startModule = (entry: Entry, target: HostTarget): Effect.Effect<void> =>
     Effect.gen(function*() {
-      const live = entry.shared
-      // A restart that changes no setting starts with what the generation runs with (the vault may be locked since).
-      const spec = live !== undefined && live.key === target.key && live.spec.secretEpoch === target.spec.secretEpoch ? live.spec : target.spec
-      if (spec.settings === undefined) return { ok: false, message: invalidMessage(spec.errors) }
-      const part = yield* newPart(entry, "shared", "", target.fingerprint)
-      pass.parts.push(part)
-      let run: SharedRun | undefined
-      // The boundary remembers what module code is given (a vault locked since cannot make it showable).
-      given(entry, [part], spec.settings)
-      // `settingsFor` resolves with these too (the environment's are current values anyway).
-      boundary.remember(entry.def.id, part, Object.values(spec.secrets))
-      const context = { settings: spec.settings as never, settingsFor: settingsForOf(entry, spec) as never, ...servicesFor(entry, part.handle) }
-      const exit = yield* runStart(part, "Its shared part did not start", () => entry.def.shared!(context))
-      if (Exit.isFailure(exit)) return { ok: false, message: describeStartFailure(exit.cause), part }
-      const ids = (exit.value.services ?? []).map((p) => p.key.id)
-      const twice = ids.find((id, i) => ids.indexOf(id) !== i)
-      if (twice !== undefined) return { ok: false, message: `The module provides the service "${twice}" twice`, part }
-      run = { part, key: spec.key, value: exit.value, spec }
-      shareds.set(part.id, run)
-      part.state = "candidate"
-      part.registrations.unshift(...registrationsOf({ handle: part.handle, shared: exit.value }))
-      return { ok: true, value: run }
-    })
+      entry.phase = "starting"
+      entry.starting = target
+      announceAll()
+      const run: Run = {
+        id: ++nextId,
+        entry,
+        target,
+        state: "starting",
+        shared: undefined,
+        instances: new Map(),
+        registrations: [],
+        inflight: 0,
+        idle: undefined,
+        killed: Deferred.makeUnsafe<void>()
+      }
+      const opened: Array<Part> = []
+      const valid = target.instances.filter((i) => i.invalid === undefined)
+      const giveUp = (message: string) =>
+        Effect.gen(function*() {
+          run.state = "closed"
+          for (const part of [...opened].reverse()) yield* closePart(part)
+          entry.failure = { attempt: target.attempt, message, instances: valid }
+        })
+      if (entry.def.shared !== undefined) {
+        const part = yield* newPart(entry, "shared")
+        opened.push(part)
+        // The boundary remembers what module code is given (a vault locked since cannot make it showable); `settingsFor`
+        // resolves with the start's secrets too.
+        given(entry, [part], target.shared!.settings)
+        boundary.remember(entry.def.id, part, Object.values(target.secrets))
+        const context = { settings: target.shared!.settings as never, settingsFor: settingsForOf(entry, part, target) as never, ...servicesFor(entry, part) }
+        const started = yield* runCode(part, "Its shared part did not start", () => entry.def.shared!(context))
+        if (!started.ok) return yield* giveUp(started.message)
+        const keys = (started.value.services ?? []).map((p) => p.key.id)
+        const twice = keys.find((id, i) => keys.indexOf(id) !== i)
+        if (twice !== undefined) return yield* giveUp(`The module provides the service "${twice}" twice`)
+        run.shared = { part, value: started.value }
+      }
+      for (const t of valid) {
+        if (closing) return yield* giveUp("The assistant is stopping")
+        const part = yield* newPart(entry, "instance")
+        opened.push(part)
+        let status: StatusLine | undefined
+        // Bound to this part: a status from an older start never reaches what runs now.
+        const setStatus = (next: StatusLine | undefined) => {
+          const inst = instanceByPart.get(part.id)
+          if (part.state === "starting") {
+            status = next
+            if (inst !== undefined) inst.status = next
+          } else if (part.state === "live" && inst !== undefined) {
+            inst.status = next
+            scheduleStatus(entry)
+          }
+        }
+        // Version 1 modules get exactly the context they always had; version 2 modules also get the host's services and
+        // what their `shared` part returned.
+        // P3: the form shows the published instance's `info()` and options again; a part not (or no longer) published
+        // has nothing on the page to refresh.
+        const refreshForm = () => {
+          if (part.state === "live") scheduleStatus(entry)
+        }
+        const settings = given(entry, [part], t.resolved.value)
+        const context = (entry.def.apiVersion ?? 1) >= 2
+          ? { settings: settings as never, setStatus, refreshForm, shared: run.shared?.value.value, ...servicesFor(entry, part) }
+          : { settings: settings as never, setStatus }
+        const started = yield* runCode(part, "Did not start", () => entry.def.start(context))
+        if (!started.ok) return yield* giveUp(started.message)
+        const checked = instanceOf(run, started.value)
+        if (!checked.ok) return yield* giveUp(checked.message)
+        // Core always words a confirmation question itself (after the final review): a module's own text is ignored.
+        for (const a of checked.actions) {
+          if (typeof a.definition.confirm === "function") {
+            yield* Effect.logWarning(
+              `Module ${entry.def.id}, action "${a.definition.id}": its own confirmation text is ignored; the assistant asks its own question from the action's label and values`
+            )
+          }
+        }
+        const inst: InstanceRun = { part, key: t.key, users: t.users, ownKeys: t.ownKeys, instance: started.value, tools: checked.tools, actions: checked.actions, status }
+        instanceByPart.set(part.id, inst)
+        run.instances.set(t.key, inst)
+      }
+      // What the registrars find in the started parts, then what the parts registered while they started.
+      let regs: Array<Registration>
+      try {
+        regs = opened.flatMap((part) => [
+          ...registrars.flatMap((r) => [...r({ handle: part.handle, ...(part.kind === "shared" ? { shared: run.shared!.value } : { instance: instanceByPart.get(part.id)!.instance }) })]),
+          ...part.staged
+        ])
+      } catch (error) {
+        return yield* giveUp(`Its registrations could not be read: ${describe(error)}`)
+      }
+      const refused = refusalOf(entry, regs)
+      if (refused !== undefined) return yield* giveUp(refused)
+      // Published in one synchronous step: no other fiber sees part of it.
+      const problem = publishAll(entry, regs)
+      if (problem !== undefined) return yield* giveUp(problem)
+      run.registrations = regs
+      run.state = "live"
+      for (const part of opened) part.state = "live"
+      entry.run = run
+      entry.failure = undefined
+      entry.phase = "idle"
+      entry.starting = undefined
+      rebuildSnapshot()
+      announceAll()
+      for (const part of opened) {
+        const reason = part.stagedRestart
+        part.stagedRestart = undefined
+        if (reason !== undefined) yield* requestRestart(entry, reason)
+      }
+    }).pipe(Effect.ensuring(Effect.sync(() => {
+      entry.phase = "idle"
+      entry.starting = undefined
+    })))
 
-  /** Start one instance. A restart that changes no setting starts with the settings the running one has. */
-  const startInstance = (
-    entry: Entry,
-    target: HostInstanceTarget,
-    shared: SharedRun | undefined,
-    pass: PassContext
-  ): Effect.Effect<StartResult<Running & { readonly status: StatusLine | undefined }>> =>
+  /**
+   * Stop a module: withdraw everything it published (one synchronous step), give its calls in flight the grace period
+   * (none while the host closes), interrupt what remains, then close its instances and then its shared part.
+   */
+  const stopModule = (entry: Entry, grace: number): Effect.Effect<void> =>
     Effect.gen(function*() {
-      const live = entry.instances.get(target.key)?.running
-      const settings = live !== undefined && live.secretEpoch === target.secretEpoch ? live.settings : target.resolved.value
-      const part = yield* newPart(entry, "instance", target.key, target.fingerprint)
-      pass.parts.push(part)
-      let startStatus: StatusLine | undefined
-      // Bound to this part: a status from an older or discarded start never reaches the published one.
-      const setStatus = (status: StatusLine | undefined) => {
-        if (part.state === "starting" || part.state === "candidate") {
-          startStatus = status
-          return
-        }
-        if (part.state !== "live") return
-        const rec = entry.instances.get(target.key)
-        if (rec?.running?.part !== part) return
-        rec.status = status
-        scheduleStatus(entry)
+      const run = entry.run
+      if (run === undefined) return
+      entry.phase = "stopping"
+      run.state = "withdrawn"
+      entry.run = undefined
+      for (const inst of run.instances.values()) inst.part.state = "withdrawn"
+      if (run.shared !== undefined) run.shared.part.state = "withdrawn"
+      withdrawAll(entry, run.registrations)
+      rebuildSnapshot()
+      announceAll()
+      // P3: field-action presses of its instances get the same grace period as its calls (no new one reaches a
+      // withdrawn module); `closePart` interrupts what remains.
+      const presses = [...run.instances.values()].flatMap((inst) => (inst.part.presses === undefined ? [] : [inst.part.presses]))
+      const pressing = presses.some((owner) => owner.inFlight().length > 0)
+      if ((run.inflight > 0 || pressing) && grace > 0 && !closing) {
+        const idle = Deferred.makeUnsafe<void>()
+        run.idle = idle
+        const calls = run.inflight > 0 ? Deferred.await(idle) : Effect.void
+        const ended = Effect.forEach(presses, (owner) => owner.settled, { concurrency: "unbounded", discard: true })
+        yield* Effect.raceFirst(Effect.all([calls, ended], { concurrency: "unbounded", discard: true }), Deferred.await(closingSignal)).pipe(Effect.timeoutOption(grace))
       }
-      // P3: the form shows the published instance's `info()` and options again; a part not (or no longer) published
-      // has nothing on the page to refresh.
-      const refreshForm = () => {
-        if (part.state === "live") scheduleStatus(entry)
-      }
-      given(entry, [part], settings)
-      // Version 1 modules get exactly the context they always had; version 2 modules also get the host's services and
-      // what their `shared` part returned.
-      const context = (entry.def.apiVersion ?? 1) >= 2
-        ? { settings: settings as never, setStatus, refreshForm, shared: shared?.value.value, ...servicesFor(entry, part.handle) }
-        : { settings: settings as never, setStatus }
-      const exit = yield* runStart(part, "Did not start", () => entry.def.start(context))
-      const fail = (message: string) => ({ ok: false as const, message, part })
-      if (Exit.isFailure(exit)) return fail(describeStartFailure(exit.cause))
-      const instance = exit.value
-      let contributed: ReturnType<typeof contributionsOf>
-      try {
-        contributed = contributionsOf(part, instance)
-      } catch (error) {
-        return fail(`The module's actions could not be offered as tools: ${String(error)}`)
-      }
-      const actionIds = contributed.actions.map((a) => a.id)
-      const duplicateAction = actionIds.find((n, i) => actionIds.indexOf(n) !== i)
-      if (duplicateAction !== undefined) return fail(`The module declares the action "${duplicateAction}" twice`)
-      const names = contributed.tools.map((t) => t.name)
-      const duplicate = names.find((n, i) => names.indexOf(n) !== i)
-      if (duplicate !== undefined) return fail(`The module declares the tool "${duplicate}" twice`)
-      const metadata = [...(instance.tools ?? []).map((t) => metadataProblem(`Tool "${t.name}"`, t)), ...contributed.actions.map((a) => metadataProblem(`Action "${a.definition.id}"`, a.definition))]
-        .find((p) => p !== undefined)
-      if (metadata !== undefined) return fail(metadata)
-      try {
-        // Its own tools on their own: a schema the registry cannot describe fails this start, not a later switch.
-        makeToolRegistry([{ name: entry.def.id, tools: contributed.tools }])
-      } catch (error) {
-        return fail(`The module's tools could not be offered: ${error instanceof Error ? error.message : String(error)}`)
-      }
-      // Core always words a confirmation question itself (after the final review): a module's own text is ignored.
-      for (const a of contributed.actions) {
-        if (typeof a.definition.confirm === "function") {
-          yield* Effect.logWarning(
-            `Module ${entry.def.id}, action "${a.definition.id}": its own confirmation text is ignored; the assistant asks its own question from the action's label and values`
-          )
-        }
-      }
-      const running: Running = { part, instance, settings, secretEpoch: target.secretEpoch, ...contributed }
-      runningByPart.set(part.id, running)
-      part.state = "candidate"
-      part.registrations.unshift(...registrationsOf({ handle: part.handle, instance }))
-      return { ok: true, value: { ...running, status: startStatus } }
-    })
+      Deferred.doneUnsafe(run.killed, Effect.void)
+      for (const inst of run.instances.values()) yield* closePart(inst.part)
+      if (run.shared !== undefined) yield* closePart(run.shared.part)
+      run.state = "closed"
+    }).pipe(Effect.ensuring(Effect.sync(() => {
+      entry.phase = "idle"
+    })))
 
-  const registrationsOf = (started: StartedPart): Array<Registration> => registrars.flatMap((r) => [...r(started)])
+  /** One module's step in a pass: whatever goes wrong in the host's own handling marks it down and the walk goes on. */
+  const contained = (entry: Entry, attempt: string, step: Effect.Effect<void>): Effect.Effect<void> =>
+    step.pipe(Effect.catchCause((cause) =>
+      Effect.gen(function*() {
+        yield* Effect.logError(`Module ${entry.def.id}: the module host could not handle it`, cause)
+        entry.failure = { attempt, message: `The module host could not handle it: ${firstLine(cause)}`, instances: [] }
+      })
+    ))
 
-  // -- The desired state's writers, and waiting for a reconciliation --------------------------------------------------
+  // -- The worker -----------------------------------------------------------------------------------------------------
 
-  // Nothing runs before the first trigger: passes run only after a write (`evaluate` never writes).
+  // With `demand` (serve mode), nothing runs before `startEnabled` opens the host (the app calls it once everything
+  // the modules depend on is built and who wants what can be read): writes are kept and applied by its first pass.
+  let isOpen = options.demand === undefined
   let desiredVersion = 0
   let startedVersion = 0
   let completedVersion = 0
-  let shuttingDown = false
   let stopped = false
   let wake = Deferred.makeUnsafe<void>()
-  const shutdownSignal = Deferred.makeUnsafe<void>()
-  const waiters: Array<{ readonly version: number; readonly done: Deferred.Deferred<void> }> = []
+  let passDone = Deferred.makeUnsafe<void>()
 
-  /** Read who wants what (`demand`) and the linked defaults again. */
+  /** One pass: capture the desired state once, plan every module, stop (consumers first), then start (providers first). */
+  const runPass = Effect.gen(function*() {
+    const picture = new Map(entries.map((e) => [e, e.want] as const))
+    const demanded = demandedIn((e) => picture.get(e)!)
+    const items = ordered.map((entry) => {
+      const target = targetOf(entry, picture.get(entry)!, demanded)
+      return { entry, target, plan: planModule(target, { running: entry.run?.target.fingerprint, failed: entry.failure?.attempt }) }
+    })
+    for (const { entry, plan, target } of [...items].reverse()) {
+      if (plan.stop) yield* contained(entry, target.attempt, stopModule(entry, graceMs))
+    }
+    for (const { entry, plan, target } of items) {
+      if (closing) break
+      entry.shown = target.desired
+      entry.invalid = target.instances.filter((i) => i.invalid !== undefined)
+      if (plan.forget) entry.failure = undefined
+      else if (target.invalid !== undefined) {
+        entry.failure = { attempt: target.attempt, message: target.invalid, ...(target.fieldErrors !== undefined ? { fieldErrors: target.fieldErrors } : {}), instances: [] }
+      }
+      if (plan.keep && entry.run !== undefined) {
+        for (const t of target.instances) {
+          const inst = entry.run.instances.get(t.key)
+          if (inst === undefined) continue
+          inst.users = t.users
+          inst.ownKeys = t.ownKeys
+        }
+      }
+      if (plan.start) yield* contained(entry, target.attempt, startModule(entry, target))
+    }
+    rebuildSnapshot()
+    announceAll()
+  })
+
+  /** Closing the host: the same walk with nothing wanted, consumers first, without grace. */
+  const shutdownWalk = Effect.gen(function*() {
+    for (const entry of [...ordered].reverse()) {
+      if (entry.run !== undefined) yield* contained(entry, "", stopModule(entry, 0))
+    }
+    rebuildSnapshot()
+  })
+
+  const release = (version: number) => {
+    completedVersion = Math.max(completedVersion, version)
+    const done = passDone
+    passDone = Deferred.makeUnsafe<void>()
+    Deferred.doneUnsafe(done, Effect.void)
+  }
+
+  const loop = Effect.gen(function*() {
+    for (;;) {
+      if (closing) {
+        yield* shutdownWalk
+        return
+      }
+      if (!isOpen || desiredVersion <= startedVersion) {
+        const signal = wake
+        yield* Deferred.await(signal)
+        if (signal === wake) wake = Deferred.makeUnsafe<void>()
+        continue
+      }
+      const version = desiredVersion
+      startedVersion = version
+      // A pass never ends the worker: each module's step is contained, and so is anything else that goes wrong.
+      yield* runPass.pipe(Effect.catchCause((cause) => Effect.logError("A module pass failed", cause)))
+      release(version)
+    }
+  })
+
+  const worker = yield* Effect.forkIn(outsideTurns(loop), hostScope)
+
+  // -- Saving ---------------------------------------------------------------------------------------------------------
+
+  /** Modules whose desired state changed since their last save; one saver saves them one at a time, the latest state. */
+  const saveQueue = new Set<Entry>()
+  let saveWake = Deferred.makeUnsafe<void>()
+  let saveDone = Deferred.makeUnsafe<void>()
+  let saving = false
+  /** Ask for a save of `entry` (synchronously, inside the write): returns the number its caller waits for. */
+  const requestSave = (entry: Entry): number => {
+    entry.saveRequested++
+    saveQueue.add(entry)
+    Deferred.doneUnsafe(saveWake, Effect.void)
+    return entry.saveRequested
+  }
+  const saver = Effect.gen(function*() {
+    for (;;) {
+      if (saveQueue.size === 0) {
+        const signal = saveWake
+        yield* Deferred.await(signal)
+        if (signal === saveWake) saveWake = Deferred.makeUnsafe<void>()
+        continue
+      }
+      const entry = [...saveQueue][0]!
+      saveQueue.delete(entry)
+      const seq = entry.saveRequested
+      const d = entry.want
+      saving = true
+      yield* Effect.suspend(() =>
+        options.persistence.save(entry.def.id, {
+          // An owner who never chose: what its default makes it (on while its key is set), as before.
+          enabled: d.chosen ? d.enabled : switchOn(entry, d),
+          settings: d.stored as Record<string, SettingValue>,
+          secrets: d.secrets
+        })
+      ).pipe(Effect.catchCause((cause) => Effect.logError(`Could not save the settings of module ${entry.def.id}`, cause)))
+      saving = false
+      entry.saveDone = Math.max(entry.saveDone, seq)
+      const done = saveDone
+      saveDone = Deferred.makeUnsafe<void>()
+      Deferred.doneUnsafe(done, Effect.void)
+    }
+  })
+  const saverFiber = yield* Effect.forkIn(outsideTurns(saver), hostScope)
+
+  /** Wait until the save numbered `seq` of `entry` (or a later one) has been made. */
+  const savedAt = (entry: Entry, seq: number): Effect.Effect<void> =>
+    Effect.suspend(() => (entry.saveDone >= seq || stopped ? Effect.void : Effect.andThen(Deferred.await(saveDone), savedAt(entry, seq))))
+
+  // Closing the host: the worker stops every module (consumers first), then pending saves finish; bounded by
+  // `closeTimeoutMs` in all. Registered after the forks, so it runs before they are interrupted.
+  yield* Effect.addFinalizer(() =>
+    Effect.gen(function*() {
+      // P3: the host's own presses stop first (refused from now on; each in flight has ended), before anything closes.
+      pressesClosed = true
+      yield* Effect.timeoutOption(hostPresses.stop, closeTimeoutMs)
+      closing = true
+      Deferred.doneUnsafe(closingSignal, Effect.void)
+      Deferred.doneUnsafe(wake, Effect.void)
+      const deadline = (yield* Clock.currentTimeMillis) + closeTimeoutMs
+      const finished = yield* Effect.timeoutOption(Fiber.await(worker), closeTimeoutMs)
+      if (Option.isNone(finished)) {
+        worker.interruptUnsafe()
+        const left = entries.filter((e) => e.run !== undefined || e.phase !== "idle").map((e) => e.def.id)
+        yield* Effect.logWarning(`The module host did not stop within ${Math.round(closeTimeoutMs / 1000)} s; left to finish on their own: ${left.join(", ") || "(none)"}`)
+      }
+      const idle: Effect.Effect<void> = Effect.suspend(() => (saveQueue.size === 0 && !saving ? Effect.void : Effect.andThen(Deferred.await(saveDone), idle)))
+      const left = Math.max(0, deadline - (yield* Clock.currentTimeMillis))
+      if (Option.isNone(yield* Effect.timeoutOption(idle, left))) yield* Effect.logWarning("The module host did not finish saving in time")
+      saverFiber.interruptUnsafe()
+      stopped = true
+      release(desiredVersion)
+    })
+  )
+
+  // -- Triggers: each writes the desired state, then waits for a pass that began after the write ----------------------
+
+  /** Read who wants what (`demand`) into the desired state. */
   const readDemand = () => {
     if (options.demand === undefined) return
     const demand = options.demand()
-    for (const entry of entries) entry.demand = demand.get(entry.def.id)
+    for (const entry of entries) {
+      const next = demand.get(entry.def.id)
+      if (JSON.stringify(next ?? null) !== JSON.stringify(entry.want.demand ?? null)) entry.want = { ...entry.want, demand: next }
+    }
   }
   const readDefaults = () => {
-    for (const entry of entries) entry.defaults = options.defaults?.(entry.def.id)
+    for (const entry of entries) {
+      const next = options.defaults?.(entry.def.id)
+      if (JSON.stringify(next ?? null) !== JSON.stringify(entry.want.defaults ?? null)) entry.want = { ...entry.want, defaults: next }
+    }
   }
 
   /**
-   * Change the desired state (synchronously) and wake the reconciler; returns the version a pass must have begun
-   * at to satisfy the writer. The linked defaults are read with every write.
+   * Change the desired state (synchronously, with the linked defaults read again) and wake the worker; returns the
+   * version a pass must have begun at to satisfy the writer.
    */
   const write = (mutate: () => void): number => {
     readDefaults()
@@ -1872,431 +2061,24 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
     return desiredVersion
   }
 
-  /** Wait until a pass that began at `version` or later has finished (or the host has closed). */
+  /**
+   * Wait until a pass that began at `version` or later has finished (or the host is not open yet, or has closed). An
+   * interrupted caller just stops waiting: nothing is kept for it.
+   */
   const settled = (version: number): Effect.Effect<void> =>
-    Effect.suspend(() => {
-      if (completedVersion >= version || stopped) return Effect.void
-      const done = Deferred.makeUnsafe<void>()
-      waiters.push({ version, done })
-      return Deferred.await(done)
-    })
-
-  const release = (version: number) => {
-    completedVersion = Math.max(completedVersion, version)
-    for (let i = waiters.length - 1; i >= 0; i--) {
-      const w = waiters[i]!
-      if (stopped || w.version <= completedVersion) {
-        waiters.splice(i, 1)
-        Deferred.doneUnsafe(w.done, Effect.void)
-      }
-    }
-  }
-
-  // -- The reconciler -------------------------------------------------------------------------------------------------
-
-  /** A pass: what it planned, and the parts it started (every one is published or closed by the pass). */
-  interface PassContext {
-    readonly items: ReadonlyArray<PassItem>
-    readonly parts: Array<Part>
-  }
-
-  /** Outcomes of configures, by proposal token (read by the configure that wrote it). */
-  const proposalOutcomes = new Map<object, { readonly result: HostResult; readonly saved: Fiber.Fiber<void> | undefined }>()
-
-  const capture = (): PassContext => {
-    const demanded = reached()
-    const items = ordered.map((entry): PassItem => {
-      const target = targetOf(entry, demanded, !shuttingDown)
-      return { entry, target, plan: planModule(target, currentOf(entry)), retry: entry.retry, proposal: entry.proposal, live: isLive(entry) }
-    })
-    return { items, parts: [] }
-  }
-
-  /** An owner's configure of a module that runs: its instance changes are all or nothing. */
-  const atomic = (item: PassItem) => item.proposal !== undefined && item.live
-
-  /** Show what a pass starts (synchronously, before it starts): new instances and first generations are `starting`. */
-  const markStarting = (pass: PassContext) => {
-    for (const { entry, plan } of pass.items) {
-      const first = plan.generation !== undefined && entry.shared === undefined
-      if (first) entry.starting = true
-      if (plan.generation !== undefined && !first) continue
-      for (const target of plan.start) {
-        const rec = entry.instances.get(target.key)
-        if (rec?.running !== undefined) continue
-        entry.instances.set(target.key, {
-          key: target.key,
-          users: rec?.users ?? target.users,
-          ownKeys: rec?.ownKeys ?? target.ownKeys,
-          state: "starting",
-          error: undefined,
-          fieldErrors: undefined,
-          status: undefined,
-          running: undefined
-        })
-      }
-    }
-    announceAll()
-  }
-
-  /**
-   * Start everything the pass planned: each module after the shared parts its `uses` start in this pass have started
-   * or failed; a generation's instances after its shared part; independent modules concurrently.
-   */
-  const startAll = (pass: PassContext): Effect.Effect<Map<Entry, ModuleStarts>> =>
-    Effect.suspend(() => {
-      const results = new Map<Entry, ModuleStarts>()
-      const sharedDone = new Map(pass.items.map((item) => [item.entry, Deferred.makeUnsafe<void>()]))
-      const doneOf = (entry: Entry) => Effect.sync(() => Deferred.doneUnsafe(sharedDone.get(entry)!, Effect.void))
-      const one = ({ entry, plan }: PassItem): Effect.Effect<void> =>
-        Effect.gen(function*() {
-          if (plan.generation === undefined && plan.start.length === 0) return
-          const starts: ModuleStarts = { shared: undefined, instances: new Map() }
-          results.set(entry, starts)
-          yield* Effect.forEach(providersOf(entry), (p) => Deferred.await(sharedDone.get(p)!), { discard: true })
-          let shared = entry.shared
-          if (plan.generation !== undefined) {
-            // A generation with an instance whose settings are not valid fails as a whole, before anything starts.
-            const invalid = (plan.start as ReadonlyArray<HostInstanceTarget>).find((i) => i.invalid !== undefined)
-            if (invalid !== undefined) {
-              starts.shared = { ok: false, message: invalid.invalid! }
-              return
-            }
-            const started = yield* startShared(entry, plan.generation as HostSharedTarget, pass)
-            starts.shared = started
-            yield* doneOf(entry)
-            if (!started.ok) return
-            shared = started.value
-          } else yield* doneOf(entry)
-          const valid = (plan.start as ReadonlyArray<HostInstanceTarget>).filter((i) => i.invalid === undefined)
-          yield* Effect.forEach(valid, (target) => Effect.map(startInstance(entry, target, shared, pass), (r) => void starts.instances.set(target.key, r)), {
-            concurrency: "unbounded",
-            discard: true
-          })
-        }).pipe(Effect.ensuring(doneOf(entry)))
-      return Effect.as(Effect.forEach(pass.items, one, { concurrency: "unbounded", discard: true }), results)
-    })
-
-  const errorRecord = (target: InstanceTarget, message: string, fieldErrors?: ReadonlyArray<FieldError>): Instance => ({
-    key: target.key,
-    users: target.users,
-    ownKeys: target.ownKeys,
-    state: "error",
-    error: message,
-    fieldErrors,
-    status: undefined,
-    running: undefined
-  })
-
-  const runningRecord = (target: { readonly key: string; readonly users: ReadonlyArray<string>; readonly ownKeys: ReadonlyArray<string> }, running: Running, status: StatusLine | undefined): Instance => ({
-    key: target.key,
-    users: target.users,
-    ownKeys: target.ownKeys,
-    state: "running",
-    error: undefined,
-    fieldErrors: undefined,
-    status,
-    running
-  })
-
-  /**
-   * THE switch: synchronous, so no fiber ever sees a half-switched picture. Definite withdrawals first (modules that
-   * stop, instances no longer wanted), then, in `uses` order, every module's starts: a generation all or nothing, an
-   * instance on its own; every registration checked against what is live at that moment. Then the snapshot once.
-   * Returns what to close now (discarded candidates) and what to retire (withdrawn parts).
-   */
-  const switchTo = (pass: PassContext, results: Map<Entry, ModuleStarts>) => {
-    const retired: Array<Part> = []
-    const outcomes: Array<{ readonly item: PassItem; readonly rejected: string | undefined }> = []
-    const withdraw = (part: Part | undefined) => {
-      if (part === undefined || part.state !== "live") return
-      withdrawPart(part)
-      retired.push(part)
-    }
-    // 1. Definite withdrawals.
-    for (const item of pass.items) {
-      const { entry, plan, target } = item
-      if (!target.runs) {
-        for (const r of entry.instances.values()) withdraw(r.running?.part)
-        withdraw(entry.shared?.part)
-        entry.shared = undefined
-        entry.instances = new Map()
-        entry.generationError = undefined
-        entry.generationFieldErrors = undefined
-        // Nothing of it runs any more: an old failed restart is no longer news, and a failed start is tried again
-        // when it is wanted again (its error would otherwise be gone while the start stays skipped).
-        entry.kept = undefined
-        entry.failedGeneration = undefined
-        entry.failedInstances.clear()
-        continue
-      }
-      if (plan.generation !== undefined || atomic(item)) continue
-      for (const key of plan.retire) {
-        withdraw(entry.instances.get(key)?.running?.part)
-        entry.instances.delete(key)
-      }
-    }
-    // 2. Starts, providers first.
-    for (const item of pass.items) {
-      const { entry, plan, target } = item
-      entry.starting = false
-      if (!target.runs) {
-        outcomes.push({ item, rejected: undefined })
-        continue
-      }
-      const starts = results.get(entry)
-      if (plan.generation !== undefined) {
-        const s = starts?.shared
-        const instanceTargets = plan.start as ReadonlyArray<HostInstanceTarget>
-        let problem: string | undefined = s === undefined ? "It was not started" : s.ok ? undefined : s.message
-        let fieldErrors: ReadonlyArray<FieldError> | undefined = instanceTargets.find((i) => i.invalid !== undefined)?.resolved.form.errors
-        if (problem === undefined) {
-          for (const t of instanceTargets) {
-            const r = starts!.instances.get(t.key)
-            if (r === undefined || !r.ok) {
-              problem = r === undefined ? "It was not started" : r.message
-              break
-            }
-          }
-        }
-        const newParts = problem === undefined
-          ? [(s as Extract<typeof s, { ok: true }>).value.part, ...instanceTargets.map((t) => (starts!.instances.get(t.key) as Extract<StartResult<Running>, { ok: true }>).value.part)]
-          : []
-        if (problem === undefined) problem = refusalOf(entry, newParts.flatMap((p) => p.registrations))
-        if (problem !== undefined) {
-          entry.failedGeneration = { fingerprint: plan.generation.fingerprint, retry: item.retry, message: problem }
-          if (entry.shared !== undefined) {
-            const restartOnly = entry.shared.key === plan.generation.key && entry.shared.spec.secretEpoch === (plan.generation as HostSharedTarget).spec.secretEpoch
-            entry.kept = { title: restartOnly ? `${entry.def.name} could not be started again` : `${entry.def.name} could not apply its new settings`, message: problem }
-            // Placeholders of this pass go; the published generation's instances stay as they are.
-            for (const [key, r] of entry.instances) if (r.running === undefined) entry.instances.delete(key)
-            outcomes.push({ item, rejected: problem })
-          } else {
-            entry.generationError = problem
-            entry.generationFieldErrors = fieldErrors
-            entry.instances = new Map(instanceTargets.map((t) => [t.key, errorRecord(t, problem!, t.invalid !== undefined ? t.resolved.form.errors : undefined)]))
-            outcomes.push({ item, rejected: undefined })
-          }
-          continue
-        }
-        fieldErrors = undefined
-        // Accepted: the old generation is withdrawn and the new one published, in this same synchronous step.
-        for (const r of entry.instances.values()) withdraw(r.running?.part)
-        withdraw(entry.shared?.part)
-        const run = (s as Extract<typeof s, { ok: true }>).value
-        entry.shared = run
-        entry.instances = new Map(instanceTargets.map((t) => {
-          const r = (starts!.instances.get(t.key) as Extract<StartResult<Running & { status: StatusLine | undefined }>, { ok: true }>).value
-          return [t.key, runningRecord(t, runningByPart.get(r.part.id)!, r.status)]
-        }))
-        for (const p of newParts) publishPart(p)
-        entry.failedGeneration = undefined
-        entry.failedInstances.clear()
-        entry.kept = undefined
-        entry.generationError = undefined
-        entry.generationFieldErrors = undefined
-        outcomes.push({ item, rejected: undefined })
-        continue
-      }
-      // Within the published generation (or a module without a shared part): each instance on its own; for an owner's
-      // configure of a module that runs, all of them or nothing (what runs keeps running and nothing is saved).
-      let rejected: string | undefined
-      if (atomic(item)) {
-        for (const t of plan.start as ReadonlyArray<HostInstanceTarget>) {
-          const r = starts?.instances.get(t.key)
-          const problem = t.invalid ?? (r === undefined ? "It was not started" : r.ok ? refusalOf(entry, r.value.part.registrations) : r.message)
-          if (problem !== undefined) {
-            rejected = problem
-            break
-          }
-        }
-        if (rejected !== undefined) {
-          for (const [key, r] of entry.instances) if (r.running === undefined && r.state === "starting") entry.instances.delete(key)
-          outcomes.push({ item, rejected })
-          continue
-        }
-        for (const key of plan.retire) {
-          withdraw(entry.instances.get(key)?.running?.part)
-          entry.instances.delete(key)
-        }
-        // The owner's change is in effect: an earlier failed restart is no longer news.
-        entry.kept = undefined
-      }
-      for (const t of plan.start as ReadonlyArray<HostInstanceTarget>) {
-        const live = entry.instances.get(t.key)
-        const replacing = live?.running !== undefined
-        const r = starts?.instances.get(t.key)
-        let problem = t.invalid ?? (r === undefined ? "It was not started" : r.ok ? undefined : r.message)
-        if (problem === undefined) problem = refusalOf(entry, (r as Extract<typeof r, { ok: true }>).value.part.registrations)
-        if (problem !== undefined) {
-          entry.failedInstances.set(t.key, { fingerprint: t.fingerprint, retry: item.retry, message: problem })
-          if (replacing) {
-            entry.kept = { title: `${entry.def.name} could not be started again`, message: problem }
-            live!.users = t.users
-            live!.ownKeys = t.ownKeys
-            rejected ??= problem
-          } else {
-            entry.instances.set(t.key, errorRecord(t, problem, t.invalid !== undefined ? t.resolved.form.errors : undefined))
-          }
-          continue
-        }
-        const started = (r as Extract<typeof r, { ok: true }>).value
-        if (replacing) withdraw(live!.running!.part)
-        entry.instances.set(t.key, runningRecord(t, runningByPart.get(started.part.id)!, started.status))
-        publishPart(started.part)
-        entry.failedInstances.delete(t.key)
-        if (replacing) entry.kept = undefined
-      }
-      for (const k of plan.keep) {
-        const rec = entry.instances.get(k.key)
-        if (rec === undefined) continue
-        rec.users = k.users
-        if (!plan.kept) rec.ownKeys = k.ownKeys
-      }
-      if (!plan.kept) {
-        const wantedKeys = new Set(target.instances.map((i) => i.key))
-        for (const [key, rec] of entry.instances) if (!wantedKeys.has(key) && rec.running === undefined) entry.instances.delete(key)
-      }
-      outcomes.push({ item, rejected })
-    }
-    // 3. Every part this pass started that was not published is discarded (closed below, in order).
-    const discarded = pass.parts.filter((p) => p.state === "starting" || p.state === "candidate")
-    for (const p of discarded) p.state = "discarded"
-    rebuildSnapshot()
-    return { retired, discarded, outcomes }
-  }
-
-  /** After the switch: a configure's proposal is saved if it was switched to (or nothing ran to protect), else dropped. */
-  const resolveProposals = (outcomes: ReadonlyArray<{ readonly item: PassItem; readonly rejected: string | undefined }>) =>
-    Effect.gen(function*() {
-      for (const { item, rejected } of outcomes) {
-        const { entry, proposal } = item
-        if (proposal === undefined || entry.proposal !== proposal) continue
-        entry.proposal = undefined
-        if (rejected !== undefined) {
-          entry.kept = { title: `${entry.def.name} could not apply its new settings`, message: rejected }
-          proposalOutcomes.set(proposal.token, { result: failure("module_start_failed", rejected, { moduleId: entry.def.id }), saved: undefined })
-          continue
-        }
-        // A vault report since the configure wins over its secrets (it was locked or unlocked meanwhile).
-        const secrets = entry.vaultEpoch === proposal.vaultEpoch ? proposal.secrets : entry.secrets
-        entry.committed = { stored: proposal.stored, secrets, secretEpoch: proposal.secretEpoch }
-        entry.secrets = secrets
-        const saved = yield* forkSave(entry)
-        proposalOutcomes.set(proposal.token, { result: resultOf(entry, item.target.runs), saved })
-      }
-    })
-
-  /** Apply restarts asked for by parts during their own start, now that they are published. */
-  const applyStagedRestarts = (pass: PassContext) =>
-    Effect.forEach(pass.parts, (part) => {
-      const reason = part.stagedRestart
-      part.stagedRestart = undefined
-      return reason !== undefined && part.state === "live" ? requestRestartFrom(part, reason) : Effect.void
-    }, { discard: true })
-
-  /** One pass: copy, plan, start, switch, retire. */
-  const runPass = Effect.gen(function*() {
-    const pass = capture()
-    // Nothing to start: the switch alone (withdrawals, users moving, announcements).
-    if (pass.items.some(({ plan }) => plan.generation !== undefined || plan.start.length > 0)) markStarting(pass)
-    const started = yield* Effect.raceFirst(
-      Effect.map(startAll(pass), Option.some),
-      Effect.as(Deferred.await(shutdownSignal), Option.none<Map<Entry, ModuleStarts>>())
-    )
-    // Shutting down: what this pass started is closed by the shutdown, with everything else.
-    if (Option.isNone(started)) return
-    const { discarded, outcomes, retired } = switchTo(pass, started.value)
-    yield* resolveProposals(outcomes)
-    announceAll()
-    yield* closeInOrder(discarded)
-    yield* retireLater(retired)
-    yield* applyStagedRestarts(pass)
-  })
-
-  /** Shutdown is a desired state too: nothing runs. Everything is withdrawn, then every open scope closed in order. */
-  const shutdownPass = Effect.gen(function*() {
-    for (const entry of entries) {
-      for (const p of livePartsOf(entry)) withdrawPart(p)
-      entry.shared = undefined
-      entry.instances = new Map()
-    }
-    rebuildSnapshot()
-    yield* Effect.forEach([...timers], Fiber.interrupt, { discard: true })
-    yield* closeInOrder(openParts)
-  })
-
-  const loop = Effect.gen(function*() {
-    while (!shuttingDown) {
-      if (desiredVersion <= startedVersion) {
-        const signal = wake
-        yield* Effect.raceFirst(Deferred.await(signal), Deferred.await(shutdownSignal))
-        if (signal === wake) wake = Deferred.makeUnsafe<void>()
-        continue
-      }
-      const version = desiredVersion
-      startedVersion = version
-      yield* runPass.pipe(Effect.catchCause((cause) =>
-        Cause.hasInterruptsOnly(cause) ? Effect.failCause(cause) : Effect.logError("A module reconciliation failed", cause)
-      ))
-      if (!shuttingDown) release(version)
-    }
-  })
-
-  const reconciler = yield* Effect.forkIn(outsideTurns(loop), hostScope)
-
-  // -- Saving ---------------------------------------------------------------------------------------------------------
-
-  /** Saves are made one at a time, each with the module's state as it is when it runs (the latest wins). */
-  const saveLock = Semaphore.makeUnsafe(1)
-  const saveScope = yield* Scope.make()
-  const saves = new Set<Fiber.Fiber<void>>()
-  const forkSave = (entry: Entry): Effect.Effect<Fiber.Fiber<void>> =>
-    Effect.gen(function*() {
-      const save = Semaphore.withPermits(saveLock, 1)(Effect.suspend(() =>
-        options.persistence.save(entry.def.id, {
-          // An owner who never chose: what its default makes it (on while its key is set), as before.
-          enabled: entry.chosen ? entry.enabled : switchOn(entry),
-          settings: entry.committed.stored as Record<string, SettingValue>,
-          secrets: entry.secrets
-        })
-      )).pipe(Effect.catchCause((cause) => Effect.logError(`Could not save the settings of module ${entry.def.id}`, cause)))
-      const fiber = yield* Effect.forkIn(save, saveScope)
-      saves.add(fiber)
-      fiber.addObserver(() => saves.delete(fiber))
-      return fiber
-    })
-
-  // Closing the host: the reconciler retires everything (in order, scopes in their grace period too), pending saves
-  // finish; bounded by `closeTimeoutMs`. Registered after the reconciler's fork, so it runs before that is interrupted.
-  yield* Effect.addFinalizer(() =>
-    Effect.gen(function*() {
-      shuttingDown = true
-      // The host's own presses stop first (refused from now on; each in flight has ended), before anything closes.
-      yield* Effect.timeoutOption(hostPresses.stop, closeTimeoutMs)
-      Deferred.doneUnsafe(shutdownSignal, Effect.void)
-      Deferred.doneUnsafe(wake, Effect.void)
-      const finished = yield* Effect.timeoutOption(Fiber.await(reconciler), closeTimeoutMs)
-      if (Option.isNone(finished)) yield* Effect.logWarning(`The module host did not stop within ${Math.round(closeTimeoutMs / 1000)} s`)
-      yield* Effect.timeoutOption(shutdownPass, closeTimeoutMs)
-      yield* Effect.timeoutOption(Effect.forEach([...saves], Fiber.await, { discard: true }), closeTimeoutMs)
-      yield* Scope.close(saveScope, Exit.void)
-      stopped = true
-      release(desiredVersion)
-    })
-  )
-
-  // -- Triggers: each writes the desired state, then waits for a pass that began after the write ----------------------
+    Effect.suspend(() => (!isOpen || stopped || completedVersion >= version ? Effect.void : Effect.andThen(Deferred.await(passDone), settled(version))))
 
   /** How a module stands, as a trigger's result: its start error (or `invalid_settings`), else ok. */
-  const resultOf = (entry: Entry, demanded: boolean): HostResult => {
-    if (!demanded) return OK
-    const { error, state } = stateOf(entry)
-    if (state !== "error") return OK
-    const fieldErrors = entry.generationFieldErrors ?? [...entry.instances.values()].find((r) => r.state === "error" && r.fieldErrors !== undefined)?.fieldErrors
-    if (fieldErrors !== undefined) return failure("invalid_settings", error ?? "The settings are not valid", { moduleId: entry.def.id, fieldErrors })
-    const message = entry.generationError ?? [...entry.instances.values()].find((r) => r.state === "error")?.error ?? error ?? "The module could not start"
-    return failure("module_start_failed", message, { moduleId: entry.def.id })
+  const resultOf = (entry: Entry): HostResult => {
+    if (!demandedIn((e) => e.want).has(entry)) return OK
+    const f = entry.failure
+    if (f !== undefined) {
+      if (f.fieldErrors !== undefined) return failure("invalid_settings", f.message, { moduleId: entry.def.id, fieldErrors: f.fieldErrors })
+      return failure("module_start_failed", f.message, { moduleId: entry.def.id })
+    }
+    const bad = entry.invalid[0]
+    if (bad !== undefined) return failure("invalid_settings", bad.invalid!, { moduleId: entry.def.id, fieldErrors: bad.resolved.form.errors })
+    return OK
   }
 
   const unknown = (id: string): HostResult => failure("unknown_module", `There is no module "${id}"`, {})
@@ -2324,17 +2106,16 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
     Effect.suspend(() => {
       const entry = byId.get(id)
       if (entry === undefined) return Effect.succeed(unknown(id))
-      if (entry.demand !== undefined) return Effect.succeed(notAllowed(entry))
+      if (entry.want.demand !== undefined) return Effect.succeed(notAllowed(entry))
+      let seq = 0
       const version = write(() => {
-        entry.enabled = on
-        entry.chosen = true
-        entry.retry++
+        entry.want = { ...entry.want, enabled: on, chosen: true, retry: entry.want.retry + 1 }
+        seq = requestSave(entry)
       })
       return Effect.gen(function*() {
-        const saved = yield* forkSave(entry)
         yield* settled(version)
-        yield* Fiber.await(saved)
-        return on ? pageResult(entry, resultOf(entry, reached().has(entry))) : OK
+        yield* savedAt(entry, seq)
+        return on ? pageResult(entry, resultOf(entry)) : OK
       })
     })
 
@@ -2349,74 +2130,61 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
   const configureEntry = (entry: Entry, patch: SettingsPatch, configureOptions: { readonly includeHidden?: boolean }): Effect.Effect<HostResult> =>
     Effect.suspend(() => {
       const id = entry.def.id
-      if (entry.proposal !== undefined) {
-        return Effect.succeed(failure("busy", `${entry.def.name} is still applying the previous change; try again in a moment`, { moduleId: id }))
-      }
       readDefaults()
-      const base = committedSources(entry)
+      const base = entry.want
       const patched = applySettingsPatch(
         entry.def.settings,
-        { stored: base.stored, secrets: base.secrets, env: options.env, ...envOrigin, ...(entry.defaults !== undefined ? { defaults: entry.defaults } : {}) },
+        { stored: base.stored, secrets: base.secrets, env: options.env, ...envOrigin, ...(base.defaults !== undefined ? { defaults: base.defaults } : {}) },
         patch,
         configureOptions
       )
       if (!patched.ok) return Effect.succeed(failure("invalid_settings", "Some settings are not valid", { moduleId: id, fieldErrors: patched.errors }))
-      const proposal: Proposal = {
-        token: {},
-        stored: patched.stored,
-        secrets: patched.secrets,
-        secretEpoch: base.secretEpoch + (Object.keys(patch.secrets).length > 0 ? 1 : 0),
-        vaultEpoch: entry.vaultEpoch
+      // While it runs, settings it could not start with are refused at once (what runs keeps running).
+      if (entry.run !== undefined) {
+        const src = { stored: patched.stored, secrets: patched.secrets }
+        const errors = entry.def.shared !== undefined
+          ? sharedOf(entry, src, base.defaults).errors
+          : base.demand === undefined
+          ? resolveFrom(entry, src, undefined, base.defaults).form.errors
+          : []
+        if (errors.length > 0) return Effect.succeed(failure("invalid_settings", "Some settings are not valid", { moduleId: id, fieldErrors: errors }))
       }
-      // While something runs that the change would replace, settings that cannot start are refused at once.
-      if (isLive(entry)) {
-        const demanded = reached()
-        const probe = { ...entry, proposal } as Entry
-        const target = targetOf(probe, new Set([...demanded].map((e) => (e === entry ? probe : e))), true)
-        const invalid = target.instances.find((i) => i.invalid !== undefined)
-        if (invalid !== undefined) return Effect.succeed(failure("invalid_settings", "Some settings are not valid", { moduleId: id, fieldErrors: invalid.resolved.form.errors }))
-        if (target.shared?.invalid !== undefined) {
-          return Effect.succeed(failure("invalid_settings", "Some settings are not valid", { moduleId: id, fieldErrors: target.shared.spec.errors }))
-        }
-      }
+      let seq = 0
       const version = write(() => {
-        entry.proposal = proposal
-        entry.retry++
+        entry.want = {
+          ...entry.want,
+          stored: patched.stored,
+          secrets: patched.secrets,
+          // Only a real change of a secret starts it again (the same token saved again changes nothing).
+          secretEpoch: entry.want.secretEpoch + (sameRecord(patched.secrets, base.secrets) ? 0 : 1),
+          retry: entry.want.retry + 1
+        }
+        seq = requestSave(entry)
       })
       return Effect.gen(function*() {
         yield* settled(version)
-        const outcome = proposalOutcomes.get(proposal.token)
-        proposalOutcomes.delete(proposal.token)
-        if (outcome === undefined) return failure("module_start_failed", `${entry.def.name}: the change was not applied (the assistant is stopping)`, { moduleId: id })
-        if (outcome.saved !== undefined) yield* Fiber.await(outcome.saved)
-        return outcome.result
+        yield* savedAt(entry, seq)
+        return resultOf(entry)
       })
     })
 
   const setSecrets = (all: Readonly<Record<string, Readonly<Record<string, string>>>>): Effect.Effect<void> =>
-    Effect.suspend(() => {
-      const version = write(() => {
+    Effect.suspend(() =>
+      settled(write(() => {
         for (const entry of entries) {
           const next = all[entry.def.id] ?? {}
-          if (JSON.stringify(next) !== JSON.stringify(entry.secrets)) {
-            entry.secrets = next
-            entry.vaultEpoch++
-          }
-          // Starts that failed (for lack of a key) are tried again.
-          const failed = entry.failedGeneration !== undefined || entry.failedInstances.size > 0 || [...entry.instances.values()].some((r) => r.state === "error")
-          if (failed) entry.retry++
+          if (!sameRecord(next, entry.want.secrets)) entry.want = { ...entry.want, secrets: next, vaultEpoch: entry.want.vaultEpoch + 1 }
         }
-      })
-      return settled(version)
-    })
+      }))
+    )
 
   // Evaluated when run: a module switched on by `setSecrets` before this runs is included (and started once).
   const startEnabled = Effect.suspend(() => {
-    const version = write(() => {
+    isOpen = true
+    return settled(write(() => {
       readDemand()
-      for (const entry of entries) entry.retry++
-    })
-    return settled(version)
+      for (const entry of entries) entry.want = { ...entry.want, retry: entry.want.retry + 1 }
+    }))
   })
 
   const refresh = Effect.suspend(() => settled(write(readDemand)))
@@ -2427,15 +2195,20 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
     refreshIssues()
   })
 
-  const recheck = Effect.suspend(() => {
-    const changed = judgeAll()
-    // Nothing changed: nothing to reconcile (and a host no trigger has started yet starts nothing).
-    if (changed.length === 0) return Effect.void
-    // A module that became available is started if it is wanted, one that became unavailable is retired.
-    return settled(write(() => {
-      for (const entry of changed) entry.retry++
+  const recheck = Effect.suspend(() =>
+    settled(write(() => {
+      judgeAll()
+      // Check again tries every module that is down after a failed start again, whatever the probes say now, and
+      // clears what was reported of code that hung (it is reported again if it hangs again).
+      for (const entry of entries) {
+        if (entry.failure !== undefined) entry.want = { ...entry.want, retry: entry.want.retry + 1 }
+        entry.problems = []
+      }
     }))
-  })
+  )
+
+  /** After `reportMissingProgram`: judge again (the app marked the program missing), without retrying anything. */
+  const rejudge = Effect.suspend(() => settled(write(judgeAll)))
 
   const checkOwn = (id: string, own: Readonly<Record<string, unknown>>): ReadonlyArray<FieldError> => {
     const entry = byId.get(id)
@@ -2446,55 +2219,34 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
 
   // -- Restarts -------------------------------------------------------------------------------------------------------
 
-  /** Count a restart of `part`'s own generation (shared) or instance: the next pass starts it again. */
-  const bumpRestart = (part: Part) => {
-    const entry = part.entry
-    write(() => {
-      if (part.kind === "shared") entry.restartShared++
-      else entry.restartInstances.set(part.key, (entry.restartInstances.get(part.key) ?? 0) + 1)
-    })
-  }
-
   /**
-   * `requestRestart` of a part, routed by its identity: from a live part, counted (a restart already in progress
-   * then starts again afterwards, so a change it did not see is not lost); from a part still starting, staged until
-   * it is published; from a retired or discarded part, ignored. At most `RESTART_BUDGET` per `RESTART_WINDOW_MS` per
-   * module; a request over budget is applied when the window allows, to whatever is published then if it began
-   * before the request.
+   * A restart of the module: counted at once; applied (written to the desired state) at most once every
+   * `RESTART_INTERVAL_MS`, every request since the last one merged into the next. A request made after the last
+   * restart was applied always leads to another.
    */
-  const requestRestartFrom = (part: Part, reason: string): Effect.Effect<void> =>
+  const requestRestart = (entry: Entry, reason: string): Effect.Effect<void> =>
     Effect.gen(function*() {
-      if (part.state === "starting" || part.state === "candidate") {
-        part.stagedRestart = reason
-        return
-      }
-      if (part.state !== "live") {
-        yield* Effect.logInfo(`Module ${part.entry.def.id}: a restart asked for by a replaced ${part.kind} part is ignored (${reason})`)
-        return
-      }
-      const entry = part.entry
+      entry.restartRequests++
+      yield* Effect.logInfo(`Module ${entry.def.id} is to be started again: ${reason}`)
+      if (entry.restartTimer) return
       const now = yield* Clock.currentTimeMillis
-      entry.restartTimes = entry.restartTimes.filter((t) => now - t < RESTART_WINDOW_MS)
-      if (entry.restartTimes.length < RESTART_BUDGET) {
-        entry.restartTimes.push(now)
-        yield* Effect.logInfo(`Module ${entry.def.id} is being started again${part.kind === "shared" ? " (a new generation)" : ""}: ${reason}`)
-        bumpRestart(part)
-        return
+      const apply = (at: number) => {
+        entry.lastRestartAt = at
+        write(() => {
+          entry.want = { ...entry.want, restarts: entry.restartRequests }
+        })
       }
-      if (entry.restartLater) return
-      entry.restartLater = true
-      const wait = RESTART_WINDOW_MS - (now - entry.restartTimes[0]!)
-      yield* Effect.logWarning(`Module ${entry.def.id} asks to be started again too often; the next restart waits ${Math.ceil(wait / 1000)} s`)
-      const later = Effect.gen(function*() {
-        yield* Effect.sleep(wait)
-        entry.restartLater = false
-        // What is published now, if it began before the request (a later start has seen the change already).
-        const current = part.kind === "shared" ? entry.shared?.part : entry.instances.get(part.key)?.running?.part
-        if (current === undefined || current.state !== "live" || current.startedAt > now) return
-        entry.restartTimes.push(yield* Clock.currentTimeMillis)
-        bumpRestart(current)
-      })
-      yield* Effect.forkIn(outsideTurns(later), hostScope)
+      const wait = entry.lastRestartAt + RESTART_INTERVAL_MS - now
+      if (wait <= 0) return apply(now)
+      entry.restartTimer = true
+      yield* Effect.forkIn(
+        outsideTurns(Effect.gen(function*() {
+          yield* Effect.sleep(wait)
+          entry.restartTimer = false
+          apply(yield* Clock.currentTimeMillis)
+        })),
+        hostScope
+      )
     })
 
   /** `reportMissingProgram`: a required program failed to start; the app marks it missing, then every module is judged again. */
@@ -2503,7 +2255,7 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
       const required = (entry.def.requires ?? []).some((r) => "tool" in r && r.tool === tool)
       if (!required || options.programMissing === undefined) return Effect.void
       options.programMissing(tool)
-      return Effect.asVoid(Effect.forkIn(Effect.andThen(Effect.logWarning(`Module ${entry.def.id}: ${tool} could not be run; judging the modules again`), recheck), hostScope))
+      return Effect.asVoid(Effect.forkIn(outsideTurns(Effect.andThen(Effect.logWarning(`Module ${entry.def.id}: ${tool} could not be run; judging the modules again`), rejudge)), hostScope))
     })
 
   // -- Health ---------------------------------------------------------------------------------------------------------
@@ -2515,7 +2267,7 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
         const health = entry.def.health
         const source = `health:${entry.def.id}`
         if (health === undefined) return Effect.void
-        if (entry.unavailable !== undefined || entry.catalogError !== undefined) {
+        if (entry.want.unavailable !== undefined || entry.catalogError !== undefined) {
           issues.set(source, [])
           return Effect.void
         }
@@ -2524,7 +2276,7 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
         const settings = given(entry, [holder], resolve(entry).value)
         const own = (title: string, detail: string): ReadonlyArray<Issue> => [{ id: `${entry.def.id}.health`, module: entry.def.id, severity: "warning", title, detail }]
         // Suspended: a health check that throws is reported like one that fails.
-        return Effect.suspend(() => health({ settings, running: isRunning(entry) })).pipe(
+        return Effect.suspend(() => health({ settings, running: entry.run !== undefined })).pipe(
           Effect.timeoutOrElse({
             duration: healthTimeoutMs,
             orElse: () => Effect.succeed(own(`${entry.def.name}'s health check did not finish`, `It took longer than ${Math.round(healthTimeoutMs / 1000)} s.`))
@@ -2532,7 +2284,7 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
           Effect.catchCause((cause) =>
             Cause.hasInterruptsOnly(cause)
               ? Effect.interrupt
-              : Effect.succeed(own(`${entry.def.name}'s health check failed`, Cause.pretty(cause).split("\n")[0] ?? ""))
+              : Effect.succeed(own(`${entry.def.name}'s health check failed`, firstLine(cause)))
           ),
           Effect.flatMap((list) =>
             Effect.sync(() =>
@@ -2548,9 +2300,9 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
   // -- The action catalogue, services, contributions ------------------------------------------------------------------
 
   /** The instance an action lookup uses: the assistant's own one, or the main one. */
-  const instanceUsedBy = (entry: Entry, assistantId: string | undefined): Instance | undefined => {
-    if (entry.unavailable !== undefined) return undefined
-    return assistantId !== undefined && entry.demand !== undefined ? instanceFor(entry, assistantId) : mainOf(entry)
+  const instanceUsedBy = (entry: Entry, assistantId: string | undefined): InstanceRun | undefined => {
+    if (entry.shown.unavailable !== undefined) return undefined
+    return assistantId !== undefined && entry.shown.demand !== undefined ? instanceFor(entry, assistantId) : mainOf(entry)
   }
 
   /** The assistant may use this module (the gateway's own first check, so the catalogue lists what would run). */
@@ -2563,9 +2315,11 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
     (assistantId === undefined || options.access === undefined || !options.access.toolOff(assistantId, entry.def.id, actionToolName(entry.def.id, actionId)))
 
   /** An unavailable module the caller has on (an assistant's choice, or its saved switch without demand). */
-  const unavailableFor = (entry: Entry, assistantId: string | undefined) =>
-    entry.unavailable !== undefined &&
-    (entry.demand === undefined ? switchOn(entry) : assistantId === undefined ? entry.demand.length > 0 : entry.demand.some((d) => d.assistantId === assistantId))
+  const unavailableFor = (entry: Entry, assistantId: string | undefined) => {
+    const d = entry.shown
+    return d.unavailable !== undefined &&
+      (d.demand === undefined ? switchOn(entry, d) : assistantId === undefined ? d.demand.length > 0 : d.demand.some((x) => x.assistantId === assistantId))
+  }
 
   const catalogEntry = (entry: Entry, action: RegisteredAction): CatalogAction => {
     const d = action.definition
@@ -2596,15 +2350,15 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
   const catalogOf = (assistantId: string | undefined) =>
     entries.flatMap((entry) => {
       if (unavailableFor(entry, assistantId) && moduleOnFor(assistantId, entry)) {
-        const standIns = unavailablePartOf(entry, entry.unavailable!).module.intentActions ?? []
+        const standIns = unavailablePartOf(entry, entry.shown.unavailable!).module.intentActions ?? []
         return standIns.filter((a) => offered(assistantId, entry, a.definition.id)).map((action) => ({ entry, action }))
       }
-      const running = instanceUsedBy(entry, assistantId)?.running
+      const running = instanceUsedBy(entry, assistantId)
       if (running === undefined) return []
       return running.actions.filter((a) => offered(assistantId, entry, a.definition.id)).map((action) => ({ entry, action }))
     })
 
-  const actions: ModuleHostApi["actions"] = {
+  const actions: ActionCatalogue = {
     list: Effect.gen(function*() {
       const principal = yield* gateway.principal
       if ("refused" in principal) return []
@@ -2622,27 +2376,25 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
           // Known but not set up here: the module's line, never another action.
           const declared = (entry.def.declaredActions ?? []).some((a) => a.id === request.actionId)
           if (!declared) return refuse("unknown_action", `${entry.def.name} has no action "${request.actionId}"`)
-          return refuse("unavailable", unavailableLine(entry.def.name, entry.unavailable!.reason))
+          return refuse("unavailable", unavailableLine(entry.def.name, entry.shown.unavailable!.reason))
         }
-        const running = instanceUsedBy(entry, assistantId)?.running
+        const running = instanceUsedBy(entry, assistantId)
         if (running === undefined) {
-          return assistantId !== undefined && mainOf(entry) !== undefined && entry.unavailable === undefined
+          return assistantId !== undefined && mainOf(entry) !== undefined
             ? refuse("refused", `Not run: the ${entry.def.id} module is not on for this assistant.`)
             : refuse("not_running", `${entry.def.name} is not running`)
         }
         const action = running.actions.find((a) => a.definition.id === request.actionId)
         if (action === undefined) return refuse("unknown_action", `${entry.def.name} has no action "${request.actionId}"`)
         const def = action.definition
-        if (def.confirm !== undefined && def.confirm !== false) {
-          return refuse("needs_confirmation", `${def.label} needs the owner's spoken confirmation, which only a conversation can ask for`)
-        }
         let values: Record<string, unknown>
         try {
           // Resolved once: the gateway admits these values and the action runs with exactly them.
           values = checkedActionValues(action, request.params)
         } catch (error) {
-          return refuse("invalid_params", error instanceof Error ? error.message : String(error))
+          return refuse("invalid_params", describe(error))
         }
+        // Through the gateway, which refuses an action that needs confirmation (confirmation is off on this path).
         return yield* gateway.action(action, values, { principal }).pipe(
           Effect.timeoutOrElse({
             duration: ACTION_TIMEOUT_MS,
@@ -2652,7 +2404,13 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
             const say = (outcome as ActionOutcome | undefined)?.say
             return say !== undefined ? { ok: true, say } : { ok: true }
           }),
-          Effect.catch((error) => Effect.succeed(refuse(isGatewayRefusal(error) ? "refused" : "failed", error.message))),
+          Effect.catch((error) =>
+            Effect.succeed(
+              def.confirm !== undefined && def.confirm !== false && isGatewayRefusal(error)
+                ? refuse("needs_confirmation", `${def.label} needs the owner's spoken confirmation, which only a conversation can ask for`)
+                : refuse(isGatewayRefusal(error) ? "refused" : "failed", error.message)
+            )
+          ),
           Effect.catchDefect((defect) => Effect.succeed(refuse("failed", `${def.label} crashed: ${String(defect)}`)))
         )
       })
@@ -2665,7 +2423,7 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
       kind: e.def.kind ?? "capability",
       state: stateOf(e).state,
       ...(e.def.version !== undefined ? { version: e.def.version } : {}),
-      ...(e.unavailable !== undefined ? { unavailable: e.unavailable.reason } : {})
+      ...(e.shown.unavailable !== undefined ? { unavailable: e.shown.unavailable.reason } : {})
     })),
     vaultLocked: options.view?.vaultLocked?.(),
     engine: options.view?.engine?.(),
@@ -2673,32 +2431,14 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
     home: options.view?.home?.() ?? {}
   })
 
-  /** The live service under `key`. */
+  /** The published service under `key` (a module starting sees the providers published before it, in `uses` order). */
   const service = <T>(key: ServiceKey<T>): T | undefined => liveServices.get(key.id)?.service as T | undefined
-
-  /**
-   * A part's own lookup: a part still starting in a pass first sees the shared parts that pass started successfully
-   * (its providers started before it), so a consumer starting with a new provider finds the new one; every other
-   * lookup is the live one.
-   */
-  const serviceFor = (part: Part) => <T>(key: ServiceKey<T>): T | undefined => {
-    if (part.state === "starting" || part.state === "candidate") {
-      for (const other of openParts) {
-        if (other.kind !== "shared" || other.state !== "candidate" || other === part) continue
-        const found = shareds.get(other.id)?.value.services?.find((p) => p.key.id === key.id)
-        if (found !== undefined) return found.service as T
-      }
-    }
-    return service(key)
-  }
-  /** Started shared parts by part id (for a candidate's lookups). */
-  const shareds = new Map<number, SharedRun>()
 
   const contributionsFor = <T>(key: ContributionKey<T>, assistantId: string | undefined): ReadonlyArray<T> =>
     entries.flatMap((entry) =>
       assistantId !== undefined && !moduleOnFor(assistantId, entry)
         ? []
-        : (liveContributions.get(entry)?.list ?? []).filter((c) => c.key.id === key.id).map((c) => c.value as T)
+        : (liveContributions.get(entry) ?? []).filter((c) => c.key.id === key.id).map((c) => c.value as T)
     )
 
   /**
@@ -2710,24 +2450,54 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
       // Serve mode: a caller with no complete principal gets none (deliberately all: `contributionsFor(key, undefined)`).
       "refused" in principal ? (options.access === undefined ? contributionsFor(key, undefined) : []) : contributionsFor(key, assistantOf(principal)))
 
+  /** `ctx.settingsFor` of a shared part: from the desired state its module was started with. */
+  const settingsForOf = (entry: Entry, part: Part, target: HostTarget) => (assistantId: string | undefined): unknown => {
+    if (part.state === "closed" || part.state === "abandoned") throw stoppedError(entry)
+    const d = target.desired
+    const own = assistantId === undefined ? undefined : d.demand?.find((x) => x.assistantId === assistantId)?.own
+    return resolveFrom(entry, { stored: d.stored, secrets: target.secrets }, own === undefined ? undefined : applicableOwnValues(entry.def.settings, own), d.defaults).value
+  }
+
+  const stoppedError = (entry: Entry) => new ModuleStopped({ message: `${entry.def.name} has stopped; this host object no longer answers.` })
+
   /**
    * The context members of a version 2 module, in `shared` and in `start`, bound to the part they are made for. A
    * later PR adds its member here, one line, and its field in `ModuleServicesV2`; a member that registers something
-   * passes `part` on and registers through it (`PartHandle.register`).
+   * passes `part` on and registers through it during the start (`PartHandle.register`). Once the part's scope has
+   * closed, every member answers with `ModuleStopped`.
    */
-  function servicesFor(entry: Entry, part: PartHandle): ModuleServicesV2 {
-    const own = partById.get(part.id)!
+  function servicesFor(entry: Entry, part: Part): ModuleServicesV2 {
+    const isStopped = () => part.state === "closed" || part.state === "abandoned"
+    const now = <A>(f: () => A): A => {
+      if (isStopped()) throw stoppedError(entry)
+      return f()
+    }
+    const effect = <A, E = never>(f: () => Effect.Effect<A, E>): Effect.Effect<A, E> => Effect.suspend(() => (isStopped() ? Effect.die(stoppedError(entry)) : f()))
+    const tokens = routeTokensFor(entry.def.id, part)
     return {
       host: {
-        routeTokens: routeTokensFor(entry.def.id, own),
-        view,
-        service: serviceFor(own),
-        contributions,
-        contributionsFor,
-        actions,
-        requestRestart: (reason) => requestRestartFrom(own, reason),
-        reportMissingProgram: (tool) => reportMissingProgram(entry, tool)
-      }
+        routeTokens: {
+          list: effect(() => tokens.list),
+          revoke: (id) => effect(() => tokens.revoke(id)),
+          mint: (name, label) => effect(() => tokens.mint(name, label))
+        },
+        view: () => now(view),
+        service: (key) => now(() => service(key)),
+        contributions: (key) => effect(() => contributions(key)),
+        contributionsFor: (key, assistantId) => now(() => contributionsFor(key, assistantId)),
+        actions: { list: effect(() => actions.list), run: (request) => effect(() => actions.run(request)) },
+        requestRestart: (reason) =>
+          effect(() => {
+            // During its own start: applied once it is published (dropped if it is not). While it runs or is being
+            // stopped (only ever before its module's next start): counted, so the next start comes after it.
+            if (part.state === "starting") {
+              part.stagedRestart = reason
+              return Effect.void
+            }
+            return requestRestart(entry, reason)
+          }),
+        reportMissingProgram: (tool) => effect(() => reportMissingProgram(entry, tool))
+      } satisfies ModuleHostApi
     }
   }
 
@@ -2737,7 +2507,7 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
     Effect.suspend((): Effect.Effect<FieldActionHostResult> => {
       const entry = byId.get(id)
       if (entry === undefined) return Effect.succeed({ ok: false, code: "unknown_module", message: `There is no module "${id}"` } as const)
-      if (shuttingDown) return Effect.succeed({ ok: false, code: "not_running", message: "The assistant is stopping" } as const)
+      if (pressesClosed) return Effect.succeed({ ok: false, code: "not_running", message: "The assistant is stopping" } as const)
       const declared = Object.hasOwn(entry.def.settings, key) ? entry.def.settings[key]! : undefined
       // Only a button of the form runs: a declared action field, or the generated Test of an agent or decision
       // provider. A handler without a field is not a button (whatever `fieldActions` holds).
@@ -2746,7 +2516,7 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
         return Effect.succeed({ ok: false, code: "unknown_action", message: declared === undefined ? `${entry.def.name} has no action "${key}"` : `${entry.def.name}: "${key}" is not a button` } as const)
       }
       // The published main instance (what the form shows): its part owns its presses.
-      const running = mainOf(entry)?.running
+      const running = mainOf(entry)
       const instance = running?.instance
       // The object's own keys or its class's methods, never what every object inherits (`constructor`, `toString`);
       // each called on its object (`this` is kept).
@@ -2759,7 +2529,7 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
       const definition = declared === undefined ? undefined : handlerOf(entry.def.fieldActions)
       const test = generated && instance !== undefined ? generatedTest(instance, (text) => boundary.redact(id, text)) : undefined
       const handler = definition ?? (declared === undefined ? undefined : handlerOf(instance?.fieldActions)) ?? (test === undefined ? undefined : () => test())
-      const owner = definition !== undefined ? hostPresses : running?.part.presses
+      const owner = definition !== undefined ? hostPresses : running?.part.state === "live" ? running.part.presses : undefined
       const ownerKey = definition !== undefined ? `${id}/${key}` : key
       if (handler === undefined || owner === undefined) {
         return Effect.succeed(
@@ -2836,22 +2606,23 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
       if (setting === undefined || setting.secret || !isEditableSetting(setting) || setting.env !== undefined && (options.env[setting.env] ?? "") !== "") continue
       patchValues[k] = v as SettingValue
     }
-    const base = committedSources(entry)
+    // The saved state (the desired state: a configure's settings are saved even when the module could not start).
+    const base = entry.want
     const patched = applySettingsPatch(
       spec,
-      { stored: base.stored, secrets: base.secrets, env: options.env, ...envOrigin, ...(entry.defaults !== undefined ? { defaults: entry.defaults } : {}) },
+      { stored: base.stored, secrets: base.secrets, env: options.env, ...envOrigin, ...(base.defaults !== undefined ? { defaults: base.defaults } : {}) },
       { values: patchValues, secrets: {} }
     )
     if (!patched.ok) return { ok: false, message: `Not run: ${problemsText(entry, patched.errors)}` }
     // Secrets are always the saved ones (a draft cannot name one: it is skipped above).
-    const resolved = resolveFrom(entry, { stored: patched.stored, secrets: base.secrets })
+    const resolved = resolveFrom(entry, { stored: patched.stored, secrets: base.secrets }, undefined, base.defaults)
     if (resolved.value === undefined) return { ok: false, message: `Not run: ${problemsText(entry, resolved.form.errors)}` }
     return { ok: true, settings: resolved.value as Readonly<Record<string, unknown>> }
   }
 
   const settingOptions = (id: string): Readonly<Record<string, ReadonlyArray<ChoiceOption>>> | undefined => {
     const entry = byId.get(id)
-    const instance = entry === undefined ? undefined : mainOf(entry)?.running?.instance
+    const instance = entry === undefined ? undefined : mainOf(entry)?.instance
     if (entry === undefined || instance?.settingOptions === undefined) return undefined
     let raw: unknown
     try {
@@ -2886,7 +2657,7 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
     }
   }
 
-  /** P3: the live routes, from the route table the switch fills. */
+  /** P3: the live routes, from the route table publication fills. */
   const routes = (): ReadonlyArray<PublishedRoute> =>
     [...routeTable].flatMap(([moduleId, live]) => live.routes.map((route) => ({ moduleId, route, scope: live.scope })))
 
@@ -2934,42 +2705,44 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
 })
 
 /**
- * Module issues made safe for the wire: the module's id as prefix and `module`, every bounded text within its limit
- * (the fix's label and value too), at most 50. An issue that still does not fit the wire's `HealthIssue` is replaced
- * by one that says so, so one malformed issue cannot break the health message or the admin snapshot.
+ * Module issues made safe for the wire and a terminal (`wireSafeIssue`), with the module's id as prefix and `module`;
+ * at most 20 per module, the rest said in one more ("and 12 more"). P3: every text in them passes the page boundary
+ * first (`page`), before anything is clipped, so a start error or a `health()` result never carries a secret the
+ * module was given; host-made issues (`hostMade`: the module's words in them redacted already) are only made safe.
  */
 function normaliseIssues(
   id: string,
   name: string,
   list: ReadonlyArray<Issue>,
-  /** The page boundary (P3): a start error or a `health()` result never carries a secret the module was given. */
   page: (value: unknown, max: number) => string,
-  /** Made by the host (`moduleIssues`, the module's words in it redacted already): only clipped. */
   hostMade = false
 ): ReadonlyArray<Issue> {
-  const own = (value: unknown, max: number) => (hostMade ? clip(String(value ?? ""), max) : page(value, max))
-  return list.slice(0, 50).map((issue, i): Issue => {
-    const fix = issue.fix === undefined ? undefined : {
-      kind: issue.fix.kind,
-      label: own(issue.fix.label, 200),
-      ...(issue.fix.value !== undefined ? { value: own(issue.fix.value, 1000) } : {})
-    }
-    // A module's id is a key, not text: one that holds a secret is replaced whole rather than redacted.
+  // Redacted in full; `wireSafeIssue` clips afterwards.
+  const own = (value: unknown) => (hostMade || value === undefined ? value : page(value, Number.MAX_SAFE_INTEGER))
+  const redacted = list.map((issue, i): Issue => {
     const rawId = String(issue.id ?? "")
     const fullId = rawId.startsWith(`${id}.`) ? rawId : `${id}.${rawId}`
-    const out: Issue = {
-      id: hostMade || page(fullId, Number.MAX_SAFE_INTEGER) === fullId ? clip(fullId, 200) : `${id}.issue-${i}`,
+    const fix = issue.fix
+    return {
+      ...issue,
+      // A module's id is a key, not text: one that holds a secret is replaced whole rather than redacted.
+      id: hostMade || page(fullId, Number.MAX_SAFE_INTEGER) === fullId ? fullId : `${id}.issue-${i}`,
       module: id,
-      ...(issue.device !== undefined ? { device: own(issue.device, 200) } : {}),
-      severity: issue.severity,
-      title: own(issue.title, 200),
-      detail: own(issue.detail, 2000),
-      ...(fix !== undefined ? { fix } : {})
+      ...(issue.device !== undefined ? { device: own(issue.device) as string } : {}),
+      title: own(issue.title) as string,
+      detail: own(issue.detail) as string,
+      ...(typeof fix === "object" && fix !== null
+        ? { fix: { ...fix, label: own(fix.label) as string, ...(fix.value !== undefined ? { value: own(fix.value) as string } : {}) } }
+        : {})
     }
-    if (isWireIssue(out)) return out
-    return { id: `${id}.malformed-issue-${i}`, module: id, severity: "warning", title: `${name} reported an issue that cannot be shown`, detail: "Its severity or fix kind is not one the page knows." }
   })
+  return boundIssues(redacted, 20, (more) => ({ id: `${id}.more`, module: id, severity: "warning", title: `${name} reported ${more} more issues`, detail: "Only the first ones are shown." }))
+    .map((issue, i) => {
+      const safe = wireSafeIssue(issue, id, i)
+      return safe.module === undefined ? { ...safe, module: id } : safe
+    })
 }
+
 // ---------------------------------------------------------------------------
 // Generated "Test" buttons
 

@@ -444,9 +444,13 @@ export const makeClaudeAgent = async (options: ClaudeAgentOptions): Promise<Clau
             const call: ToolCall = { id: `claude-${input.turnId}-${++callIds}`, name, input: args }
             emit({ _tag: "ToolStarted", call })
             const started = performance.now()
+            // Cancelled while this call waited (the native yield, or promotion): it does not start. Checked inside the
+            // effect, so even an effect that would finish synchronously never runs after cancellation.
+            const live = <A>(effect: Effect.Effect<A>): Effect.Effect<A, SessionError> =>
+              Effect.suspend(() => (controller.signal.aborted ? Effect.fail(new SessionError("the turn was interrupted", "failed")) : effect))
             try {
-              if (!input.tools.isSpeculative(name)) await Effect.runPromise(input.promoted, { signal: controller.signal })
-              const ran = await Effect.runPromise(runTool(call), { signal: controller.signal })
+              if (!input.tools.isSpeculative(name)) await Effect.runPromise(live(input.promoted), { signal: controller.signal })
+              const ran = await Effect.runPromise(live(runTool(call)), { signal: controller.signal })
               // A failed tool returns its error as a result (it does not throw): a diagnostic, redacted like the
               // catch path's (after the final review). A successful result is content and passes untouched.
               const result = ran.isError ? { ...ran, content: redact(ran.content, secrets) } : ran

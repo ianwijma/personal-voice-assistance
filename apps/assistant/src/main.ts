@@ -310,7 +310,8 @@ const withSavedSettings = <A, E>(effect: Effect.Effect<A, E>): Effect.Effect<A, 
   })
 
 NodeRuntime.runMain(
-  (mode === "serve" ? program : withSavedSettings(program)).pipe(
+  // Serve mode and doctor read the saved settings themselves (doctor strictly: never on defaults).
+  (mode === "serve" || mode === "doctor" ? program : withSavedSettings(program)).pipe(
     Effect.catch((e) => {
       const described = e instanceof StartupError
         ? e.message

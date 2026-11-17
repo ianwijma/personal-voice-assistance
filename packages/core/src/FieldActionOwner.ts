@@ -9,14 +9,15 @@ import type { Stragglers } from "./Stragglers.ts"
  * - `start` runs a press in its own fiber, at most one per key: the key is busy from the start of the press until its
  *   fiber has really ended, whatever its deadline or its cleanup take. Only the press's own end frees its key, so an
  *   old press can never free a newer one's.
- * - `inFlight` says what still runs.
+ * - `inFlight` says what still runs; `settled` waits, without asking anything to stop, until it has all ended.
  * - `stop` refuses new presses, interrupts those in flight and waits until each has ended (logging one whose cleanup
  *   overruns `cleanupMs`, still waiting).
  *
- * The owners belong to the reconciler's parts (ModuleHost.ts): every instance part is made with its own owner, and
- * `closePart` stops it before it closes the part's scope (a retired instance after its grace period, a discarded
- * candidate at once, everything at shutdown, instances before their shared part and consumers before providers), so a
- * press has ended before anything it may use is released. The host's own owner (definition handlers) is made with
+ * The owners belong to the module host's parts (ModuleHost.ts): every instance part is made with its own owner. When
+ * its module stops (after it is withdrawn, so no new press reaches it), the host gives the presses in flight the
+ * grace period (`settled`), then `closePart` stops the owner before it closes the part's scope, both within the
+ * host's time limit for closing a part (instances before their shared part, consumers before providers), so a press
+ * has ended before anything it may use is released. The host's own owner (definition handlers) is made with
  * the host and stopped first when the host closes; from then on no press is admitted.
  */
 /** How a press went (`FieldActionOwner.start`). */
@@ -37,6 +38,8 @@ export interface FieldActionOwner {
   readonly start: <A, E>(key: string, press: Effect.Effect<A, E>, timeoutMs: number) => Effect.Effect<PressOutcome<A, E>>
   /** The keys whose presses still run. */
   readonly inFlight: () => ReadonlyArray<string>
+  /** Completes once every press in flight now has ended (it asks none to stop; the caller bounds the wait). */
+  readonly settled: Effect.Effect<void>
   readonly stop: Effect.Effect<void>
 }
 
@@ -106,5 +109,7 @@ export const makeFieldActionOwner = (options: {
     )
   })
 
-  return { start, inFlight: () => [...running.keys()], stop }
+  const settled = Effect.suspend(() => Effect.forEach([...running.values()], (fiber) => Fiber.await(fiber), { concurrency: "unbounded", discard: true }))
+
+  return { start, inFlight: () => [...running.keys()], settled, stop }
 }
