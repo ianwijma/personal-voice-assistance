@@ -1,4 +1,4 @@
-import { SqliteClient } from "@effect/sql-sqlite-node"
+import "./quiet.ts"
 import {
   type Actor,
   type ChangeRecord,
@@ -192,6 +192,9 @@ export const makeSqliteStore = (options: SqliteStoreOptions): Effect.Effect<Sqli
       })
 
     if (!memory) yield* Effect.promise(() => mkdir(dirname(options.filename), { recursive: true }).catch(() => undefined))
+    // Loaded here, not imported at the top: `node:sqlite` is a built-in, linked (and its ExperimentalWarning printed)
+    // before any module code runs, so only a dynamic import comes after the warning filter (`quiet.ts`).
+    const { SqliteClient } = yield* Effect.promise(() => import("@effect/sql-sqlite-node"))
     const client = yield* SqliteClient.make({
       filename: options.filename,
       readonly: readOnly && !memory,

@@ -65,7 +65,7 @@ describe("Sections: effective values", () => {
     expect(sections.value("HOME_API_CONTACT") ?? "").toBe("")
     const home = sections.list().find((s) => s.id === "home")
     expect(home?.group).toBe("modules")
-    expect(home?.form.fields.map((f) => f.key)).toEqual(["HOME_LOCATION", "HOME_TIME_ZONE", "HOME_LANGUAGE", "HOME_UNITS", "HOME_DATE_FORMAT", "HOME_CURRENCY", "HOME_CUP_SIZE", "HOME_API_CONTACT"])
+    expect(home?.form.fields.map((f) => f.key)).toEqual(["HOME_LOCATION", "HOME_TIME_ZONE", "HOME_LANGUAGE", "HOME_UNITS", "HOME_DATE_FORMAT", "HOME_CURRENCY", "HOME_CUP_SIZE", "HOME_API_CONTACT", "HOME_AMBIENT_FACTS"])
 
     const badCurrency = await Effect.runPromise(sections.update("home", { values: { HOME_CURRENCY: "euro" }, secrets: {} }))
     expect(badCurrency.result.ok).toBe(false)

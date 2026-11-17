@@ -17,9 +17,8 @@ export const BACKUP_STALE_MS = 48 * 60 * 60 * 1000
 export const householdIssues = (dataDir: string, options: { readonly backupDir?: string } = {}): Effect.Effect<ReadonlyArray<Issue>> =>
   Effect.scoped(Effect.gen(function*() {
     const file = householdDbPath(dataDir)
-    if (!existsSync(file)) {
-      return [{ id: "core.household.none", severity: "info", title: "No household data yet", detail: `${file} is made at the first start of the server.` }] satisfies ReadonlyArray<Issue>
-    }
+    // No file yet: nothing to check (the server makes it at its first start).
+    if (!existsSync(file)) return [] as ReadonlyArray<Issue>
     const opened = yield* Effect.result(makeSqliteStore({ filename: file, readOnly: true, ...(options.backupDir !== undefined ? { backupDir: options.backupDir } : {}) }))
     if (opened._tag === "Failure") {
       return [{

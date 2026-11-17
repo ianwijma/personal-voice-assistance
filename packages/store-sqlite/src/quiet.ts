@@ -1,8 +1,9 @@
 /**
  * Node 22 prints `ExperimentalWarning: SQLite is an experimental feature` once when `node:sqlite` is first loaded.
  * It would land in the middle of the CLI modes' output (stderr) and in every serve log, so it is filtered here: only
- * that one warning, everything else passes. This module is imported before the driver (`index.ts`), so the filter is
- * in place when `node:sqlite` loads.
+ * that one warning, everything else passes. The driver (and with it `node:sqlite`) is loaded with a dynamic import
+ * in `makeSqliteStore`, after this filter is in place: a static import of a built-in is linked, and warns, before any
+ * module code runs.
  */
 const marker = Symbol.for("@pva/store-sqlite/quiet")
 const global = globalThis as unknown as Record<symbol, boolean>

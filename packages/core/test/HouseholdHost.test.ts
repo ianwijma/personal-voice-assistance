@@ -5,14 +5,14 @@ import { Effect, Fiber, Schema, Stream } from "effect"
 import { hostEvent, makeEventBus } from "../src/EventBus.ts"
 import { defineCollection, type ModuleStore, StoreError } from "../src/HouseholdStore.ts"
 import type { ModuleEvents } from "../src/EventBus.ts"
-import { defineModule } from "../src/ModuleDefinition.ts"
+import { defineModule, ModuleStartError } from "../src/ModuleDefinition.ts"
 import { makeModuleHost, readOnlyPersistence } from "../src/ModuleHost.ts"
 import { makeTestHousehold } from "../src/testing.ts"
 
 const Item = Schema.Struct({ text: Schema.String })
 const items = defineCollection({ name: "items", scope: "household", schema: Item })
 
-const seen: { store?: ModuleStore; events?: ModuleEvents; sharedStore?: ModuleStore } = {}
+const seen: { store?: ModuleStore | undefined; events?: ModuleEvents; sharedStore?: ModuleStore } = {}
 const shop = defineModule({
   apiVersion: 2,
   id: "shop",
@@ -27,7 +27,9 @@ const shop = defineModule({
     Effect.gen(function*() {
       seen.store = ctx.store
       seen.events = ctx.events
-      yield* ctx.store.collection(items).insert({ text: "started" })
+      yield* ctx.store.collection(items).insert({ text: "started" }).pipe(
+        Effect.mapError((e) => new ModuleStartError({ message: e.message }))
+      )
       return {}
     })
 })
