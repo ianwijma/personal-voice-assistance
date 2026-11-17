@@ -1,5 +1,5 @@
 import type { AudioClientLink } from "@pva/audio-web"
-import type { HostResult, ModuleHost } from "@pva/core"
+import type { HostDeviceView, HostResult, ModuleHost } from "@pva/core"
 import {
   type AdminSnapshot,
   type AdminState,
@@ -27,6 +27,7 @@ import type { AccessPolicy } from "./access.ts"
 import type { AdminSessions, SessionEndReason } from "./AdminSessions.ts"
 import type { AssistantResult, Assistants } from "./assistants.ts"
 import type { Engine } from "./Engine.ts"
+import type { HealthService } from "./health.ts"
 import type { EnvMover } from "./envSettings.ts"
 import type { DeviceRegistry, DeviceResult } from "./devices.ts"
 import type { Jobs } from "./jobs.ts"
@@ -114,6 +115,8 @@ export interface SessionHub {
     accepted: boolean,
     source: { readonly deviceId?: string; readonly assistantId?: string }
   ) => void
+  /** The known devices with their open connections now, most recently seen first (`ModuleHostApi.view().devices`). */
+  readonly deviceViews: () => ReadonlyArray<HostDeviceView>
 }
 
 export interface HubOptions {
@@ -137,6 +140,8 @@ export interface HubOptions {
   readonly assistants: Assistants
   /** Settings from outside the UI and "Move to settings". Absent: no `env` in the snapshot, moves refused. */
   readonly env?: EnvMover
+  /** Diagnostics › Health (`health`, `health.check`). Absent: no `health` in the admin snapshot, checks refused. */
+  readonly health?: HealthService
   /** Model downloads (jobs). Absent: none offered. */
   readonly models?: Models
   readonly jobs?: Jobs
@@ -167,7 +172,8 @@ export const ADMIN_ONLY: ReadonlySet<ServerMessageType> = new Set<ServerMessageT
   "device.types",
   "sessions",
   "trace",
-  "wake.heard"
+  "wake.heard",
+  "health"
 ])
 
 interface Client {
@@ -604,7 +610,8 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
     devices: [...assistants.devices(registry.devices(live))],
     sessions: [...sessions.list()],
     assistants: [...assistants.infos()],
-    deviceTypes: [...assistants.deviceTypes()]
+    deviceTypes: [...assistants.deviceTypes()],
+    ...(options.health !== undefined ? { health: options.health.info() } : {})
   })
 
   const hello = (client: Client, message: ClientMessage) => {
@@ -900,6 +907,13 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
       case "engine.reload":
         if (!allowed(client, message.requestId)) return
         return limited(client, message.requestId, options.engine.reload)
+      case "health.check": {
+        if (!allowed(client, message.requestId)) return
+        const health = options.health
+        if (health === undefined) return result(client, message.requestId, failure("internal", "Health checks are not available here"))
+        // The new registry reaches every admin page as `health` (the service's subscription).
+        return limited(client, message.requestId, Effect.as(health.check, { ok: true } as const))
+      }
       case "vault.setup":
         if (!allowed(client, message.requestId)) return
         return vaultRequest(client, message.requestId, keys.setup(message.password))
@@ -1042,6 +1056,8 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
       for (const client of clients) sendVault(client)
     },
     refreshDevices,
+    deviceViews: () =>
+      [...registry.devices(live)].sort((a, b) => b.lastSeen - a.lastSeen).map((d) => ({ id: d.id, name: d.name, kind: d.kind, connections: d.connections })),
     wakeHeard: (key, text, phrase, accepted, source) => {
       const at = Date.now()
       const message = encodeServerMessage({ type: "wake.heard", text, ...(phrase !== undefined ? { matched: phrase } : {}), accepted, source, at })

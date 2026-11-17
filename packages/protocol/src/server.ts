@@ -19,6 +19,7 @@ import { EnvInfo } from "./env.ts"
 import { JobInfo, ModelSet } from "./jobs.ts"
 import { VaultInfo } from "./vault.ts"
 import { ConversationId, ConversationReason, SessionInfo, SessionKey } from "./sessions.ts"
+import { HealthInfo } from "./health.ts"
 
 /**
  * Text frames from the assistant to the browser. Binary frames from the
@@ -387,6 +388,15 @@ export const DeviceTypesMessage = Schema.Struct({
   types: Schema.Array(DeviceTypeInfo)
 })
 
+/**
+ * Protocol 9, admin connections only: the issue registry changed (a check started or finished, a module became
+ * unavailable or available again, a module's start failed). Always the whole registry.
+ */
+export const HealthMessage = Schema.Struct({
+  type: Schema.Literal("health"),
+  health: HealthInfo
+})
+
 export const ServerMessage = Schema.Union([
   Welcome,
   Session,
@@ -423,7 +433,8 @@ export const ServerMessage = Schema.Union([
   DeviceSetupMessage,
   ConversationHistory,
   AssistantsMessage,
-  DeviceTypesMessage
+  DeviceTypesMessage,
+  HealthMessage
 ]).pipe(Schema.toTaggedUnion("type"))
 export type ServerMessage = typeof ServerMessage.Type
 export type ServerMessageType = ServerMessage["type"]

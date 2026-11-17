@@ -21,6 +21,7 @@ import { EnvInfo } from "./env.ts"
 import { JobInfo, ModelSet } from "./jobs.ts"
 import { VaultInfo } from "./vault.ts"
 import { AdminState } from "./admin.ts"
+import { AssistantTemplate, HealthInfo, ModuleUnavailable } from "./health.ts"
 
 /** A one-line status a running module publishes, e.g. "Connected · 143 entities". */
 export const StatusLine = Schema.Struct({
@@ -29,14 +30,38 @@ export const StatusLine = Schema.Struct({
 })
 export type StatusLine = typeof StatusLine.Type
 
-export const ModuleState = Schema.Literals(["disabled", "starting", "running", "stopping", "error"])
+/**
+ * Protocol 9 adds `unavailable`: the module cannot run on this server (a program or platform it needs is missing, or
+ * it was written for an unsupported module API; `ModuleInfo.unavailable` says why). It is never started. A page that
+ * does not know a state shows it as `error`.
+ */
+export const ModuleState = Schema.Literals(["disabled", "starting", "running", "stopping", "error", "unavailable"])
 export type ModuleState = typeof ModuleState.Type
+
+/**
+ * Protocol 9: what a tool or action may do (module-definition §B.5). `read`: lookups; `change`: lights, music, timers;
+ * `message`: send mail or chat as the owner; `money`: purchases, bookings; `security`: locks, alarms, cameras.
+ * Inferred when a module does not say: a speculative tool is `read`, any other `change`. Carried only; a later
+ * protocol enforces it with a policy.
+ */
+export const ToolRisk = Schema.Literals(["read", "change", "message", "money", "security"])
+export type ToolRisk = typeof ToolRisk.Type
+/** Protocol 9: whose a result is (docs/MODULES-PLAN.md §2 row 8): `household` (default) or `personal` (one person's). */
+export const ToolSensitivity = Schema.Literals(["household", "personal"])
+export type ToolSensitivity = typeof ToolSensitivity.Type
+/** Protocol 9: how long a call usually takes: `instant` (< 50 ms), `quick` (< 1 s), `slow` (seconds), `background`. Default `quick`. */
+export const ToolLatency = Schema.Literals(["instant", "quick", "slow", "background"])
+export type ToolLatency = typeof ToolLatency.Type
 
 export const ToolInfo = Schema.Struct({
   name: Schema.String,
   description: Schema.String,
   /** Read-only: may run before the user has finished speaking. */
-  speculative: Schema.Boolean
+  speculative: Schema.Boolean,
+  /** Protocol 9: the declared or inferred class; absent when it depends on the input (or from an older server). */
+  risk: Schema.optionalKey(ToolRisk),
+  sensitivity: Schema.optionalKey(ToolSensitivity),
+  latency: Schema.optionalKey(ToolLatency)
 })
 export type ToolInfo = typeof ToolInfo.Type
 
@@ -88,7 +113,15 @@ export const ModuleInfo = Schema.Struct({
    * one switched-on assistant has it on", `state` sums up the instances (`error` when one fails), and each instance
    * is listed with its assistants. Absent: one instance at most, following `enabled`.
    */
-  instances: Schema.optionalKey(Schema.Array(ModuleInstanceInfo))
+  instances: Schema.optionalKey(Schema.Array(ModuleInstanceInfo)),
+  /** Protocol 9: why it is `unavailable` (present exactly then). */
+  unavailable: Schema.optionalKey(ModuleUnavailable),
+  /** Protocol 9: the module's own version (its manifest's `version`), shown in the UI. */
+  version: Schema.optionalKey(Schema.String.check(Schema.isMaxLength(40))),
+  /** Protocol 9: the module API it was written for (absent = 1). */
+  apiVersion: Schema.optionalKey(Schema.Int),
+  /** Protocol 9: the assistants it suggests (the new-assistant flow offers them). Absent = none. */
+  templates: Schema.optionalKey(Schema.Array(AssistantTemplate))
 })
 export type ModuleInfo = typeof ModuleInfo.Type
 
@@ -377,6 +410,8 @@ export const AdminSnapshot = Schema.Struct({
   /** Protocol 7: the assistants (replaces nothing yet). */
   assistants: Schema.optionalKey(Schema.Array(AssistantInfo)),
   /** Protocol 7: the device types with their defaults (replaces `frontends`). */
-  deviceTypes: Schema.optionalKey(Schema.Array(DeviceTypeInfo))
+  deviceTypes: Schema.optionalKey(Schema.Array(DeviceTypeInfo)),
+  /** Protocol 9: the issue registry (Diagnostics › Health). Absent: the server keeps none (tests). */
+  health: Schema.optionalKey(HealthInfo)
 })
 export type AdminSnapshot = typeof AdminSnapshot.Type

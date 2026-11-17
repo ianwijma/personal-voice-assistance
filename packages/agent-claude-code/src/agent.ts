@@ -1,4 +1,5 @@
 import {
+  CurrentTurn,
   type Agent,
   type AgentEvent,
   AgentError,
@@ -364,6 +365,10 @@ export const makeClaudeAgent = async (options: ClaudeAgentOptions): Promise<Clau
     Stream.callback<AgentEvent, AgentError>((queue) =>
       Effect.gen(function*() {
         const controller = new AbortController()
+        // The SDK calls tools from outside this fiber: the turn's context is captured here and given to each call.
+        const currentTurn = yield* CurrentTurn
+        const runTool = (call: ToolCall) =>
+          currentTurn === undefined ? input.tools.run(call) : Effect.provideService(input.tools.run(call), CurrentTurn, currentTurn)
         let session: ClaudeSession | undefined
         let settled = false
         let emittedText = false
@@ -441,7 +446,7 @@ export const makeClaudeAgent = async (options: ClaudeAgentOptions): Promise<Clau
             const started = performance.now()
             try {
               if (!input.tools.isSpeculative(name)) await Effect.runPromise(input.promoted, { signal: controller.signal })
-              const ran = await Effect.runPromise(input.tools.run(call), { signal: controller.signal })
+              const ran = await Effect.runPromise(runTool(call), { signal: controller.signal })
               // A failed tool returns its error as a result (it does not throw): a diagnostic, redacted like the
               // catch path's (after the final review). A successful result is content and passes untouched.
               const result = ran.isError ? { ...ran, content: redact(ran.content, secrets) } : ran

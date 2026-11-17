@@ -186,6 +186,8 @@ A module cannot depend on the assistant's services (it cannot speak, listen or c
 
 ### 1.2 Declaring a module (real code: `packages/core/src/ModuleDefinition.ts`, `Settings.ts`)
 
+This is module API version 1, which every module without `apiVersion` keeps. Version 2 adds optional fields (§1.10).
+
 ```ts
 export const defineModule: <const S extends SettingsSpec = {}>(definition: {
   readonly id: string                // persistence key and protocol id: /^[a-z][a-z0-9-]{0,39}$/
@@ -330,6 +332,7 @@ The **module host** (`packages/core/src/ModuleHost.ts`, new, Node-free; persiste
 | `running` | Instance is in the snapshot | `start` succeeded | `stopping` on disable; stays `running` on reconfigure |
 | `stopping` | Removed from the snapshot; scope closes after a 10 s grace | disable | `disabled` |
 | `error` | Intent on, not running. `error` says why | start failed or timed out; saved settings invalid; tool name clash | `starting` on enable (retry) or reconfigure; `disabled` on disable |
+| `unavailable` | Cannot run on this server (protocol 9, §1.10.3); `unavailable` says why and how to fix it | a required program or the platform is missing, or an unsupported `apiVersion` | `starting` (if wanted) once "Check again" finds it available |
 
 Rules:
 
@@ -454,6 +457,120 @@ The UI, persistence, enable switch, settings form and status line come for free.
 - Per-module permissions beyond the existing speculative flag; confirmation before side-effecting tools.
 - Hot-loading module code from disk (the catalog is compiled in).
 - Automatic restart of a module after runtime failures.
+
+### 1.10 Module API version 2 (docs/MODULES-PLAN.md §4 P1)
+
+Everything in this section is optional. A module without `apiVersion` is version 1 and behaves exactly as §1.2–§1.4
+describe; its `start` gets `{ settings, setStatus }` and nothing else. The contract is in
+`packages/core/src/ModuleApi.ts`, `ModuleDefinition.ts`, `Gateway.ts` and `TurnContext.ts`.
+
+```ts
+MODULE_API = { current: 2, supports: [1, 2] }       // a module outside the range is `unavailable`
+
+defineModule({
+  apiVersion: 2,
+  id, name, description, settings, kind?, enabledByDefault?, enabledWhenSet?,   // as in version 1
+  version?: "0.3.0",                                // shown in the UI
+  requires?: ReadonlyArray<Requirement>,             // judged before anything starts (§1.10.3)
+  platforms?: { os?: ["linux"], arch?: ["x64", "arm64"] },
+  health?: ({ settings, running }) => Effect<ReadonlyArray<Issue>>,   // cheap; 5 s; never on a turn
+  templates?: [{ id: "dj", name: "DJ", prompt, purpose?, handles?, modules?, suggestedPhrases? }],
+  uses?: ["lists"],                                 // other modules this one needs while it is demanded
+  shared?: (ctx: SharedContext<A>) => Effect<SharedPart<X>, ModuleStartError, Scope>,
+  start: (ctx: ModuleContextV2<A, X>) => Effect<ModuleInstance, ModuleStartError, Scope>
+})
+
+interface SharedContext<A>      { settings: Partial<A>; host: ModuleHostApi }          // + later members
+interface ModuleContextV2<A, X> { settings: A; setStatus; shared: X; host: ModuleHostApi } // + later members
+interface SharedPart<X>         { value: X; services?: ReadonlyArray<ProvidedService>; contributions?: ReadonlyArray<ProvidedContribution> }
+const Lists = ServiceKey<ListsService>("lists")           // provided with services: [Lists.of(impl)]
+const Sections = ContributionKey<Section>("briefing.sections") // contributed with contributions: [Sections.of(section)]
+
+interface ModuleHostApi {
+  view(): HostView                                   // module states, vault locked, engine summary, devices, Home values
+  service<T>(key: ServiceKey<T>): T | undefined      // live; undefined while no demanded module provides it
+  contributions<T>(key: ContributionKey<T>): ReadonlyArray<T>   // live, catalog order
+  actions: { list: Effect<ReadonlyArray<CatalogAction>>; run(request): Effect<ActionRunResult> }  // the turn's catalogue
+  requestRestart(reason): Effect<void>               // from start: that instance; from shared: every instance
+}
+```
+
+#### 1.10.1 Two lifetimes
+
+`start` keeps running once per distinct set of effective settings (§1.4, docs/ASSISTANTS.md §2.6): tools, actions,
+context providers, instructions. `shared` runs **once per module** while the module is **demanded**: a switched-on
+assistant has it on (serve mode's demand), its own switch is on (no demand: the CLI modes, agents), or a demanded module
+names it in `uses` (transitively). It gets the module's shared settings only: the `overridable` fields, which an
+assistant may own, are left out (hence `Partial<A>`). Sockets, caches, handlers, services and contributions belong
+there. What it returns as `value`, every instance receives as `ctx.shared`.
+
+- It starts before the first instance that needs it (10 s), and is published together with that instance. A module
+  demanded only through `uses` publishes it with no instance.
+- It is started again when its shared settings change (a save, Home moving a linked default) or a secret changes: the
+  new one starts while the old one serves, every instance is started again with the new value, then the new shared
+  part is published and the old one retired after the 10 s grace. If any of those starts fails, nothing changes.
+- When demand ends it is withdrawn at once (lookups no longer find its services) and closed after the grace period.
+- A `shared` that fails is the module's start error: its instances fail with that message, and the module is in `error`.
+
+#### 1.10.2 Services and contributions
+
+A **service** is one typed object a module offers others under a `ServiceKey<T>`: `host.service(key)` returns the
+published shared part's service, or `undefined` while no demanded module provides it (a consumer then says the other
+module is off). One provider per key: a second module providing the same key gets a start error ("The service "x" is
+already provided by module Y"). A **contribution** is a value any number of modules add under a `ContributionKey<T>`;
+`host.contributions(key)` is the live list in catalog order. Both are read live at each call, so start order and
+restarts cannot lose a registration, and nothing registers itself with another module. Because services come from the
+once-per-module part, a module with several instances still has exactly one provider.
+
+#### 1.10.3 Requirements and `unavailable`
+
+`requires` lists programs (`{ tool, where?, version?, optional?, managed?, why }`), `network`, `memoryMb`, `diskMb`
+and `gpu`. The app keeps one tool registry with probes (`apps/assistant/src/requirements.ts`: argv and a version
+regexp per program, no shell, 5 s, a fixed `PATH` with `data/tools/bin` first, cached), probed at start and on "Check
+again", never on a turn. A missing required requirement, an `apiVersion` outside `MODULE_API.supports` or another
+platform makes the module **`unavailable`** (`ModuleInfo.unavailable`: reason and fix, e.g. the `apt install` line for
+the detected distribution). It is never started. Each assistant that has it on gets one instructions line instead
+("Music is not set up on this server (yt-dlp is missing). If you are asked for anything it does, say so in one
+sentence; …"), which changes the cached prefix only when availability changes. Device-side programs and the network
+are not judged yet (`unchecked`).
+
+#### 1.10.4 Health
+
+`health()` returns issues (`Issue = { id, module?, device?, severity: error | warning | info, title, detail, fix?:
+{ kind: command | link | job, label, value? } }`). The host keeps an **issue registry**: per module the missing
+requirements, why it is unavailable, a failed start or restart (kept current), and the last `health()` result; the
+app adds the core checks (Node version, `tar`, `bzip2`, `flock`, `nice`, disk space, every assistant's model files,
+the vault, TLS files, the port, clock sync). `pnpm start doctor` prints them, one line per issue with its fix, and exits
+1 on an error (a module no assistant has on is only a warning). Admin › Diagnostics › Health shows the same registry
+(`health`, `admin.snapshot.health`) with "Check again" (`health.check`).
+
+#### 1.10.5 The turn and the execution gateway
+
+`CurrentTurn` (`TurnContext.ts`, a `Context.Reference<TurnContext | undefined>`) is provided around every tool call,
+every action run and the gathering of context providers of a turn whose setup names its origin (serve mode:
+`TurnSetup.turnContext` with the assistant, device id and name); it holds the turn id, conversation id, assistant,
+device, room and person (both later), and `source` (`voice`, `text`, `touch`, `phrase`, `routine`). The Claude Code
+bridge captures it at the turn's start and gives it to every tool call the SDK makes. It is `undefined` in the CLI
+modes.
+
+Every tool call and action run goes through one **execution gateway** (`Gateway.ts`): `ToolRegistry.run` (the model's
+tool loop and the bridge), `ToolRegistry.runAction` (the intent agent, a confirmed action) and `host.actions.run`.
+It validates the input, resolves the call's risk, sensitivity and latency, and checks, in order: the assistant has the
+module on; the tool (an action's generated tool name) is not in its `offTools`; the risk policy hook; the
+confirmation hook (both empty until P8). A refusal is an error result for the model ("Not run: …"); nothing reaches
+`execute` or `run` another way. The registries the host and serve mode build all carry the host's gateway.
+
+Tools and actions may declare `risk` (`read | change | message | money | security`, or a function from the validated
+input to a class), `sensitivity` (`household | personal`) and `latency` (`instant | quick | slow | background`).
+Absent: `risk` is `read` for a speculative tool and `change` otherwise, `sensitivity` `household`, `latency` `quick`.
+`ModuleInfo.tools` shows them (no `risk` when it depends on the input). They are carried, not enforced (P8).
+
+#### 1.10.6 Templates
+
+`templates` are suggested assistants, plain data; `ModuleInfo.templates` lists them with ids `<moduleId>.<id>`. The
+new-assistant wizard offers them under "Start from": the template's prompt and modules on, its name, purpose and
+Handles where nothing was typed, and its first suggested phrase for the places ticked in step 6. A template never
+becomes an assistant by itself, and a module update never changes an assistant made from one.
 
 ---
 

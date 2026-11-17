@@ -52,6 +52,9 @@ import { defaultSystemPrompt } from "../config.ts"
 import { envView as processEnvView, userCwd } from "../env.ts"
 import { type EnvView, makeEnvView } from "../envView.ts"
 import { moduleCatalog, withModuleInstructions } from "../modules.ts"
+import { runCoreChecks } from "../coreChecks.ts"
+import { makeRequirementChecker } from "../requirements.ts"
+import { makeHealthService } from "./health.ts"
 import {
   makeSubscriptionAgents,
   SUBSCRIPTION_AGENT_ID,
@@ -304,6 +307,9 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
         timeZone: String(sections.value("HOME_TIME_ZONE") ?? ""),
         dateFormat: String(sections.value("HOME_DATE_FORMAT") ?? "en-GB")
       })[moduleId]
+    // Module API v2: what the modules need is probed before any starts (concurrently, 5 s at most; never on a turn).
+    const checker = makeRequirementChecker({ dataDir: options.dataDir })
+    yield* checker.probeCatalog(catalog)
     // Capabilities run for the assistants that switch them on (`moduleDemand`, below; read from startEnabled on).
     const host = yield* makeModuleHost({
       catalog,
@@ -312,7 +318,24 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       envOrigin,
       envLocation,
       defaults: homeDefaults,
-      demand: () => moduleDemand()
+      demand: () => moduleDemand(),
+      platform: { os: process.platform, arch: process.arch },
+      requirements: checker.check,
+      // The execution gateway's first checks, on every call (and the turn's action catalogue): the assistant has the
+      // module on, and the tool is not one it switched off. Agents and decision providers are not per assistant.
+      access: {
+        moduleOn: (assistantId, moduleId) => !isCapability(moduleId) || assistantsNow().get(assistantId)?.modules[moduleId]?.on === true,
+        toolOff: (assistantId, moduleId, toolName) =>
+          isCapability(moduleId) && (assistantsNow().get(assistantId)?.modules[moduleId]?.offTools.includes(toolName) ?? false)
+      },
+      // What modules may read about the assistant (`host.view()`): every read is a reference read or a small copy.
+      view: {
+        vaultLocked: () => vault.state() === "locked",
+        engine: () => (engine === undefined ? undefined : engineSummary(engine.status())),
+        devices: () => hub?.deviceViews() ?? [],
+        // Every key of the Home section, read generically (other PRs add keys to it).
+        home: () => sections.list().find((x) => x.id === "home")?.form.values ?? {}
+      }
     })
     const keys = makeKeys({ vault, store, host })
     const access = makeAccessPolicy({ catalog, sections: sections.list, vaultState: keys.state })
@@ -443,11 +466,12 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
         return [{ ...part, module: { ...part.module, tools: (part.module.tools ?? []).filter((t) => !off.has(t.name)) } }]
       })
       /** The modules it has on that run (capabilities; for the turn's configuration snapshot). */
-      const modules = parts.reduce((n, p) => (isCapability(p.moduleId) ? n + 1 : n), 0)
+      const modules = parts.reduce((n, p) => (isCapability(p.moduleId) && p.unavailable !== true ? n + 1 : n), 0)
       const same = parts.length === snapshot.parts.length && parts.every((p, i) => p === snapshot.parts[i])
       if (same) return { registry: snapshot.registry, instructions: snapshot.instructions, modules }
       return {
-        registry: makeToolRegistry(parts.map((p) => p.module)),
+        // Every call still goes through the host's gateway, which checks the assistant's choices again at execution.
+        registry: makeToolRegistry(parts.map((p) => p.module), { gateway: host.gateway }),
         instructions: parts.flatMap((p) => (p.instructions.length > 0 ? [p.instructions] : [])),
         modules
       }
@@ -830,7 +854,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
           cached.voiceUser !== voiceUser || cached.voiceSource !== voiceSource
         ) {
           // An assistant that does not exist (any more) is never routed; should a turn still start, it gets no tools.
-          const mine = assistant === undefined ? { registry: makeToolRegistry([]), instructions: [], modules: 0 } : modulesFor(snapshot, assistant)
+          const mine = assistant === undefined ? { registry: makeToolRegistry([], { gateway: host.gateway }), instructions: [], modules: 0 } : modulesFor(snapshot, assistant)
           const base = assistant?.prompt ?? defaultSystemPrompt
           const instructions = home === undefined ? mine.instructions : [home, ...mine.instructions]
           // `TurnSetup.ttsReady`: completes once this `tts` (the instance bound now, not a later one) is built.
@@ -1238,8 +1262,27 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       // TypeSafe is set up: the routing section is switched on, with a key and a valid address (WP-14).
       canAuto: routing.ready
     })
+    // Diagnostics › Health (§C.5): the issue registry, checked once the modules have started and on "Check again".
+    const health = makeHealthService({
+      host,
+      checker,
+      catalog,
+      core: Effect.suspend(() =>
+        runCoreChecks({
+          checker,
+          env,
+          dataDir: options.dataDir,
+          modelDirs: sections.modelDirs(),
+          serving: true,
+          vault: { state: vault.state(), path: vault.path },
+          assistants: [...assistantsNow().values()],
+          sttShared: sttShared()
+        })
+      )
+    })
     hub = makeSessionHub({
       admin,
+      health,
       devices,
       assistants,
       env: envMover,
@@ -1263,6 +1306,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       ...(options.helloTimeoutMs !== undefined ? { helloTimeoutMs: options.helloTimeoutMs } : {})
     })
     const hubNow = hub
+    health.subscribe((info) => hubNow.broadcast({ type: "health", health: info }))
     host.subscribe((module) => {
       hubNow.broadcast({ type: "module.changed", module: access.module(module) })
       if (module.id === SUBSCRIPTION_AGENT_ID && theEngine.status().engines.some((e) => e.provider === SUBSCRIPTION_PROVIDER)) theEngine.refreshStatus()
@@ -1390,6 +1434,8 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     // `startEnabled` skips a module another operation holds (a request from a page that connected first); the
     // reconcile after it starts that one once the operation has finished.
     const modulesStarted = yield* Effect.forkScoped(blockedAtStart ? Effect.void : Effect.andThen(host.startEnabled, reconcileModules))
+    // The first health check, once the modules have started (in the background; a page sees `checking` meanwhile).
+    yield* Effect.forkScoped(Effect.andThen(Fiber.await(modulesStarted), health.check))
     const engineStarted = yield* Effect.forkScoped(theEngine.start)
     // Every wanted language model is built (and warmed) alongside the engines, before the first turn (§3.2).
     const resourcesStarted = yield* Effect.forkScoped(syncResources())

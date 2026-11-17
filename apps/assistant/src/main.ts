@@ -37,6 +37,7 @@ import { makeSubscriptionAgents, SUBSCRIPTION_AGENT_ID, SUBSCRIPTION_PROVIDER } 
 import { buildProviders, describeConfigError, StartupError } from "./startup.ts"
 import { runTextTurns } from "./text.ts"
 import { compareModelsCommand } from "./compareModels.ts"
+import { doctorCommand } from "./doctor.ts"
 import { transcribeCommand } from "./transcribe.ts"
 import { voiceMode } from "./voice.ts"
 import { assistantVoiceStage, withVoiceTrace } from "./voiceSelection.ts"
@@ -283,8 +284,10 @@ const program: Effect.Effect<void, unknown> = mode === "text"
   ? Effect.asVoid(compareModelsCommand(args))
   : mode === "serve"
   ? serveMode
+  : mode === "doctor"
+  ? doctorCommand
   : new StartupError({
-    message: `Unknown mode "${mode}". Usage: assistant [text | voice | serve | bench [--sessions N | --typesafe | --typesafe-live [--count N] [--gap-ms MS] | --live [--rounds N] [--sessions N] [--stagger MS] [--llm-per-session] <wavs> | --make-wavs [dir]] | ` +
+    message: `Unknown mode "${mode}". Usage: assistant [text | voice | serve | doctor | bench [--sessions N | --typesafe | --typesafe-live [--count N] [--gap-ms MS] | --live [--rounds N] [--sessions N] [--stagger MS] [--llm-per-session] <wavs> | --make-wavs [dir]] | ` +
       "say [--voice PROVIDER:VOICE] [--out FILE] <text> | transcribe <wav file> | compare-models [--models a,b] [--agc on|off|both] [--ref TEXT] <wavs>]"
   })
 

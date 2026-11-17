@@ -10,6 +10,7 @@ import {
   type EngineSummary,
   EnvInfo,
   type ErrorInfo,
+  type HealthInfo,
   type HistoryItem,
   type JobInfo,
   type ModelSet,
@@ -251,6 +252,8 @@ export interface ClientState {
   readonly staleTurns: ReadonlyArray<number>
   /** Admin: the voice sessions, most recently active first (`admin.snapshot.sessions`, `sessions`). */
   readonly sessions: ReadonlyArray<SessionInfo>
+  /** Admin (protocol 9): the issue registry (Diagnostics › Health); undefined: the server keeps none. */
+  readonly health: HealthInfo | undefined
   readonly liveTranscript: string
   readonly traces: ReadonlyArray<TraceInfo>
   /**
@@ -320,6 +323,7 @@ export const initialState: ClientState = {
   turns: [],
   staleTurns: [],
   sessions: [],
+  health: undefined,
   liveTranscript: "",
   traces: [],
   traceIds: [],
@@ -344,6 +348,7 @@ const adminPart = {
   assistants: initialState.assistants,
   deviceTypes: initialState.deviceTypes,
   sessions: initialState.sessions,
+  health: initialState.health,
   heard: initialState.heard,
   adminReady: false
 } satisfies Partial<ClientState>
@@ -505,6 +510,7 @@ const server: ServerHandlers = {
     assistants: m.snapshot.assistants ?? [],
     deviceTypes: m.snapshot.deviceTypes ?? [],
     sessions: m.snapshot.sessions,
+    health: m.snapshot.health,
     adminReady: true,
     // The snapshot's traces replace the list: each gets a new id.
     ...newTraceIds(s, Math.min(m.snapshot.traces.length, MAX_TRACES))
@@ -640,7 +646,8 @@ const server: ServerHandlers = {
   "device.setup": onSetup,
   "conversation.history": (s, m) => onHistory(s, m, historyToTurns),
   assistants: (s, m) => ({ ...s, assistants: m.assistants }),
-  "device.types": (s, m) => ({ ...s, deviceTypes: m.types })
+  "device.types": (s, m) => ({ ...s, deviceTypes: m.types }),
+  health: (s, m) => ({ ...s, health: m.health })
 }
 
 const local = (s: ClientState, a: LocalAction): ClientState => {
@@ -731,6 +738,7 @@ function pickAdmin(s: ClientState): Partial<ClientState> {
     traceIds: s.traceIds,
     traces: s.traces,
     devices: s.devices,
+    health: s.health,
     assistants: s.assistants,
     deviceTypes: s.deviceTypes,
     sessions: s.sessions,

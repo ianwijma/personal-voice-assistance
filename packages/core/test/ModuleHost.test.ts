@@ -125,7 +125,7 @@ describe("ModuleHost", () => {
       assert.deepStrictEqual(seen.map((i) => i.state), ["starting", "running"])
       assert.isTrue(seen[1]!.revision > seen[0]!.revision)
       assert.deepStrictEqual(saves, [{ id: "test", enabled: true, settings: {}, secrets: {} }])
-      assert.deepStrictEqual(seen[1]!.tools, [{ name: "tool", description: "tool", speculative: true }])
+      assert.deepStrictEqual(seen[1]!.tools, [{ name: "tool", description: "tool", speculative: true, risk: "read", sensitivity: "household", latency: "quick" }])
     }).pipe(Effect.scoped))
 
   it.effect("enable with invalid saved settings: error with form errors, intent saved, invalid_settings", () =>

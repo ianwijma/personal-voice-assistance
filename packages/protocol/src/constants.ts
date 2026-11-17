@@ -62,8 +62,13 @@
  * entry or `device.save` and a version 8 page could not read a version 7 server's devices. Additive, within 8:
  * `Assistant.look`, `DeviceOwn`/`DeviceSettingsPatch` `look` and `voice`, `DeviceSetup.look` and `DeviceSetup.assistants[].look`,
  * `assistant.create.saveAnyway`, `TraceConfig.voiceFrom`, `usedByDevices` on voices and resource status.
+ *
+ * 9: module API v2 (docs/MODULES-PLAN.md §4 P1). `ModuleState` gains `unavailable` (a new member of a closed set:
+ * a version 8 page would refuse a module in that state), with `ModuleInfo.unavailable` (reason and fix). Additive,
+ * within 9: `ModuleInfo.version` / `apiVersion` / `templates`, `ToolInfo.risk` / `sensitivity` / `latency`, the
+ * issue registry (`health`, `admin.snapshot.health`) and "Check again" (`health.check`, admin only).
  */
-export const PROTOCOL_VERSION = 8
+export const PROTOCOL_VERSION = 9
 
 /** Path of the WebSocket endpoint, on the same origin as the UI in production. */
 export const WS_PATH = "/ws"

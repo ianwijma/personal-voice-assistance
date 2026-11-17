@@ -1,6 +1,6 @@
 import { Effect, Schema } from "effect"
 import { ToolError } from "./Errors.ts"
-import { makeTool, type Tool } from "./Module.ts"
+import { makeTool, type Tool, type ToolMetadata, type ToolRisk } from "./Module.ts"
 import { editDistance, normalizePhrase, phoneticKey } from "./TextMatching.ts"
 import { parseDuration } from "./ValueParsing.ts"
 
@@ -150,7 +150,7 @@ export interface ActionOutcome {
   readonly say?: string
 }
 
-export interface ActionDefinition<P extends ActionParams = ActionParams> {
+export interface ActionDefinition<P extends ActionParams = ActionParams> extends ToolMetadata<ParamValues<P>> {
   /** Unique within the module: `/^[a-z][a-z0-9_]{0,39}$/`. The global id is `<moduleId>.<id>`. */
   readonly id: string
   /** Short imperative label for the UI and default confirmations: "Turn lights on". */
@@ -180,7 +180,10 @@ export interface ActionDefinition<P extends ActionParams = ActionParams> {
    * is committed. Leave it out for queries, whose answer comes from `run`.
    */
   readonly announce?: (params: ParamValues<P>) => string
-  /** Do it. Must finish well within 5 s (the intent agent's limit); it is not interrupted once started. */
+  /**
+   * Do it. Must finish well within 5 s (the intent agent's limit); it is not interrupted once started. Read the turn
+   * it runs in with `yield* CurrentTurn` (`undefined` when run outside a turn: a routine from a job, a test).
+   */
   readonly run: (params: ParamValues<P>) => Effect.Effect<ActionOutcome | void, ActionError>
 }
 
@@ -370,6 +373,10 @@ export const actionTool = (registered: RegisteredAction): Tool => {
     description: `${sentenceOf(def.label)} ${def.description}${confirm}`,
     parameters: Schema.Struct(fields) as unknown as Schema.Codec<Readonly<Record<string, unknown>>, unknown>,
     speculative: def.speculative === true,
+    // A risk that depends on the values is judged on what `run` would receive (a dynamic name resolved, a duration parsed).
+    ...(def.risk !== undefined ? { risk: typeof def.risk === "function" ? riskOfValues(registered) : def.risk } : {}),
+    ...(def.sensitivity !== undefined ? { sensitivity: def.sensitivity } : {}),
+    ...(def.latency !== undefined ? { latency: def.latency } : {}),
     execute: (input: Readonly<Record<string, unknown>>) =>
       Effect.suspend(() => {
         // Never through a registry: only core's confirmation (`consumeConfirmation`) runs such an action.
@@ -391,6 +398,11 @@ export const actionTool = (registered: RegisteredAction): Tool => {
       })
   })
   return { ...tool, action: registered }
+}
+
+const riskOfValues = (registered: RegisteredAction) => (input: Readonly<Record<string, unknown>>) => {
+  const risk = registered.definition.risk as (values: Record<string, unknown>) => ToolRisk
+  return risk(actionValues(registered, input))
 }
 
 const sentenceOf = (s: string) => (/[.!?]$/.test(s) ? s : `${s}.`)

@@ -412,6 +412,16 @@ export const DevicePick = Schema.Struct({
   withoutPhrase: Schema.Union([AssistantId, Schema.Literal(""), Schema.Literal("typesafe")])
 })
 
+/**
+ * Protocol 9, admin only: "Check again" on the Health page. The server probes every program the modules need again,
+ * re-judges which modules are available (starting those that now are), runs every module's `health()` and the core
+ * checks, and sends `health`. Answered with `result` once the check has finished.
+ */
+export const HealthCheck = Schema.Struct({
+  type: Schema.Literal("health.check"),
+  requestId: RequestId
+})
+
 export const ClientMessage = Schema.Union([
   Hello,
   AudioClaim,
@@ -448,7 +458,8 @@ export const ClientMessage = Schema.Union([
   AssistantDelete,
   DeviceSave,
   ConversationRead,
-  DevicePick
+  DevicePick,
+  HealthCheck
 ]).pipe(Schema.toTaggedUnion("type"))
 export type ClientMessage = typeof ClientMessage.Type
 export type ClientMessageType = ClientMessage["type"]

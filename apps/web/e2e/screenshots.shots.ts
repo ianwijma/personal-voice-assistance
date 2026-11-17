@@ -503,6 +503,14 @@ test.describe("admin, desktop, dark", () => {
     await voice.ctx.close()
   })
 
+  test("diagnostics: health (protocol 9)", async ({ page, baseURL }) => {
+    await mock.scenario("health")
+    await gotoAdmin(page, baseURL, "#settings/diagnostics/health")
+    await expect(page.getByTestId("health-page")).toBeVisible()
+    await settle(page)
+    await shot(page, "admin-desktop-17-diagnostics-health")
+  })
+
   test("shared settings: the navigation, the accounts, a module in error", async ({ page, baseURL }) => {
     await mock.scenario("modules")
     await loginAdmin(page, baseURL, "#settings/shared/accounts")

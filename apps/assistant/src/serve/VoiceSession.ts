@@ -14,6 +14,7 @@ import {
   type Stt,
   type SttEvent,
   type Trace,
+  type TurnOrigin,
   type TurnSetup,
   TurnTrace,
   voiceKey
@@ -620,7 +621,24 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
         Effect.gen(function*() {
           const inbox = yield* Queue.unbounded<ConversationInput>()
           let runs = 0
-          const { setup, agentSetup, config: assistantConfig } = options.conversationSetup(assistant, options.deviceId)
+          const made = options.conversationSetup(assistant, options.deviceId)
+          const { config: assistantConfig } = made
+          // Module API v2 (`CurrentTurn`): every turn's setup names who and where it is for. The origin object is the
+          // same while the device's name is, so a turn adds one small object (the setup with it), nothing else.
+          let origin: TurnOrigin | undefined
+          const originNow = (): TurnOrigin => {
+            const deviceName = options.name()
+            if (origin?.deviceName !== deviceName) {
+              origin = { assistantId: assistant, ...(options.deviceId !== undefined ? { deviceId: options.deviceId } : {}), deviceName }
+            }
+            return origin
+          }
+          const withOrigin = <S extends TurnSetup>(s: S): S => ({ ...s, turnContext: originNow() })
+          const setup = Effect.map(made.setup, withOrigin)
+          const agentSetup = made.agentSetup === undefined ? undefined : () => {
+            const a = made.agentSetup!()
+            return a === undefined ? undefined : Effect.map(a, withOrigin)
+          }
           /** The assistant's part and the device's hearing, joined once per change of either (the turn path reads it). */
           let joined: { readonly part: AssistantTraceConfig; readonly hearing: TraceConfig["hearing"]; readonly value: TraceConfig } | undefined
           const traceConfig = (): TraceConfig | undefined => {

@@ -185,6 +185,7 @@ Conversation.layerWithSetup({ setup: Effect<TurnSetup>, ... })   // TurnSetup = 
 - `TurnSetup.maxToolRounds` (optional, added 2026-11-17): the tool-round limit of that turn, fixed at its start; it wins over `AgentSet.maxToolRounds` and the conversation's `maxToolRounds`. Serve mode sets it to the assistant's `toolRounds` in the same setup read that makes the turn's configuration snapshot (`TraceInfo.config.toolRounds`), so a changed limit applies from the next turn and the snapshot reports the limit the turn ran with.
 - `onEvent` receives `ConversationEvent`s synchronously on the turn's fiber (no Effect per event): `ConversationStarted` (a new conversation, `reason` `new` or `idle`; before the turn that an idle reset started for), `TurnStarted` (with `speculative`, `spoken`, `source`), `TurnPromoted`, `TextDelta` (raw, rounds separated by `"\n"`), `ClauseQueued`, `ClausePlaying`, `ToolStarted`, `ToolFinished`, `TurnEnded` (after history is committed, with the trace). Speculative turns emit events too; the subscriber decides what to show. A throwing subscriber is ignored.
 - `CurrentTurnTrace` is provided around `AudioOutput.play` as well as around `Tts.synthesize` (the web output uses the turn id as the reply id and records the browser's numbers in the trace).
+- `TurnSetup.turnContext` (optional, module API v2, `TurnOrigin`): who and where the turn is for (assistant id, device id and name; later room and person). When it is set, `Conversation` provides `CurrentTurn` (`TurnContext`: that plus the turn id, conversation id and source) around the agent's whole turn stream, so every tool call, every action run (the intent agent's, a confirmed one) and the gathering of the context providers read it with `yield* CurrentTurn`. It is one value per turn, built at the turn's start: nothing else is added to the turn path. Absent (the CLI modes): `CurrentTurn` is `undefined`. Serve mode sets it in `VoiceSession` (the origin object is reused while the device's name does not change).
 
 | Event | Action |
 |---|---|
@@ -203,7 +204,7 @@ Details:
 
 Speculative turns must not run tools with side effects. Each `Tool` declares `speculative: boolean` (default `false`); if a speculative turn reaches a non-speculative tool call it pauses there until promoted.
 
-Tool loop: on `ToolCall`, look the tool up in the `ToolRegistry`, decode the input with the tool's `Schema`, run it (calls in the same response run concurrently), append results, call the LLM again. Cap at a configurable number of rounds (default 5): at most that many tool rounds and one more LLM call; if the model still asks for tools after that, the turn ends (the unanswered calls are not recorded). Tool failures, invalid input and unknown tools are returned to the model as error results, never thrown. Text the model produced before a tool call is flushed to TTS before the tools run (the text stream carries a `"\n"` between rounds), so "let me check" is heard while the tool works.
+Tool loop: on `ToolCall`, look the tool up in the `ToolRegistry`, decode the input with the tool's `Schema` and run it through the registry's execution gateway (below, "Extending the assistant") (calls in the same response run concurrently), append results, call the LLM again. Cap at a configurable number of rounds (default 5): at most that many tool rounds and one more LLM call; if the model still asks for tools after that, the turn ends (the unanswered calls are not recorded). Tool failures, invalid input and unknown tools are returned to the model as error results, never thrown. Text the model produced before a tool call is flushed to TTS before the tools run (the text stream carries a `"\n"` between rounds), so "let me check" is heard while the tool works.
 
 Clause chunker: buffers `TextDelta`s and emits at sentence or clause boundaries (`. ! ? ; :` and, once past a minimum length, `,`). The first clause is flushed aggressively (short minimum) so TTS starts as early as possible. Pure function over a stream, tested on its own.
 
@@ -246,6 +247,7 @@ defineModule({
   start: ({ settings, setStatus }) => Effect<ModuleInstance, ModuleStartError, Scope>
 })
 ModuleInstance = { tools?: ReadonlyArray<Tool>; context?: ReadonlyArray<ContextProvider>; instructions?: string }
+// module API v2 adds optional apiVersion, version, requires, platforms, health, templates, uses, shared (below)
 ```
 
 Settings use a closed set of field types (`Setting.text`, `secret`, `number`, `boolean`, `choice`, `multichoice`; `packages/core/src/Settings.ts`); precedence is environment > saved value > default, and an environment value locks the field in the UI. Since WP-12 (docs/ASSISTANTS.md §2.6) a field may be `overridable` (never a secret; modules do not mark addresses): an assistant may then hold its own value for it (`ModuleChoice.own`), which wins over the environment and the saved value for that assistant, and the field description sent to the admin says `overridable: true`; a module's default may be a *linked default* computed from the shared Home section (`ModuleHostOptions.defaults`: Weather place and units, Clock time zone and date format), used when nothing is saved and the environment does not set the field. Every field reports its `source` (default, saved, `.env` file or process environment) and may carry `visibleWhen` (shown, validated and saved only while another field has one of some values); choice options may carry `tags` (hosted, needs key, …) and an `implication` line; `runSettingsChecks` runs cross-field checks. The **module host** (`packages/core/src/ModuleHost.ts`, no Node dependency; persistence injected) starts enabled modules, enables, disables and reconfigures them while the assistant runs (one operation per module at a time; a replaced or disabled instance keeps running for a 10 s grace period so tool calls in flight finish; `start` has 10 s; a context provider has 50 ms per turn or contributes nothing), and publishes an immutable snapshot (tool registry, instructions in catalog order, tool → module map) that each turn reads once through `ConversationSetupOptions.setup`. `setSecrets` replaces the modules' saved secrets without saving them (the app's key vault was unlocked or locked) and restarts enabled modules that failed. A module runs as **instances**: without `ModuleHostOptions.demand` (the CLI modes; agent and decision-provider modules always) one at most, following its saved switch, exactly as before. With `demand` (serve mode, for every capability) the module runs while at least one switched-on assistant has it on, one instance per distinct set of effective settings (own values over shared over linked defaults), shared by every assistant whose settings are equal; its own switch is then not read (`enable`/`disable` answer `not_allowed`). `refresh` (after every settings save, and after a Home save) starts the instances now wanted and retires, with the grace period, the ones no longer wanted; a replaced instance serves until its replacement has started. `configure` restarts only the instances whose effective settings change (every one when a secret changes), all or nothing. One instance failing to start is that instance's `error` only (`ModuleInfo.instances` lists each with its assistants; the module's `state` is `error` while one fails); the others run. The snapshot keeps one instance per module in `registry`/`parts` (the shared-settings one when it runs) and adds `assistantParts`: per assistant, the parts of the instances it uses, from which serve mode builds that assistant's registry and instructions (filtered by its module and tool switches) at its turn start. `checkOwn` validates an assistant's own values with the fields' own validators (`assistant.save` refuses a secret, a field that is not overridable, or a value the field refuses). The system prompt of a turn is base prompt + (serve mode) the Home line (`homeLineOf`: location, time zone, language of the `home` section) + running modules' instructions; changing the tool list or the instructions changes the cached prefix once. The CLI modes start the catalog through the same host with the saved settings and no live changes; they read the assistant settings the same way as serve mode, environment > saved > default, with the vault's keys (`cliSettings.ts`: unlocked by `PVA_VAULT_PASSWORD`, or a password prompt on a terminal). A module may set `enabledWhenSet: <secret key>`: until the owner chooses, it is on once that key is set in the environment or the vault (judged by the host, re-checked when the vault unlocks). Full lifecycle: docs/UI-AND-MODULES.md §1.4.
@@ -263,7 +265,10 @@ interface Tool<I = any, R = never> {
   readonly description: string
   readonly parameters: Schema.Codec<I, unknown> // validated input; also the source of the JSON Schema sent to the model
   readonly speculative?: boolean             // safe to run before the turn is confirmed (read-only lookups)
-  readonly execute: (input: I) => Effect<unknown, ToolError, R>
+  readonly risk?: ToolRisk | ((input: I) => ToolRisk)  // module API v2: read | change | message | money | security
+  readonly sensitivity?: "household" | "personal"
+  readonly latency?: "instant" | "quick" | "slow" | "background"
+  readonly execute: (input: I) => Effect<unknown, ToolError, R>   // reached only through the execution gateway
 }
 interface ContextProvider { readonly name: string; readonly get: Effect<string> }  // must be fast; cached or local
 ```
@@ -271,6 +276,57 @@ interface ContextProvider { readonly name: string; readonly get: Effect<string> 
 The JSON Schema is `Schema.toJsonSchemaDocument(parameters)`, which describes the schema's canonical JSON form, so the registry decodes model input with the matching `Schema.toCodecJson(parameters)`. Prefer `Schema.Finite` / `Schema.Int` over `Schema.Number` (the latter's JSON form also admits `"NaN"`/`"Infinity"` strings, which clutters the schema). `makeTool({...})` infers `I` from `parameters`. `packages/modules-builtin/src/clock.ts` is the reference module.
 
 Context-provider output is sent each turn as `LlmRequest.context`, separate from the stable `system` prompt, so a ticking clock does not invalidate the cached prefix (system prompt + tools). The LLM adapter places it after the cached prefix. Keep it short and fast to compute.
+
+### Module API version 2 (docs/MODULES-PLAN.md §4 P1; details in docs/UI-AND-MODULES.md §1.10)
+
+Optional and additive: a module without `apiVersion` is version 1 and sees no change. `MODULE_API = { current: 2, supports: [1, 2] }`.
+
+```ts
+defineModule({
+  apiVersion: 2, version?, requires?: ReadonlyArray<Requirement>, platforms?: { os?, arch? },
+  health?: ({ settings, running }) => Effect<ReadonlyArray<Issue>>, templates?: ReadonlyArray<ModuleTemplate>,
+  uses?: ReadonlyArray<moduleId>,
+  shared?: (ctx: SharedContext<A>) => Effect<SharedPart<X>, ModuleStartError, Scope>,   // once per module
+  start: (ctx: ModuleContextV2<A, X>) => Effect<ModuleInstance, ModuleStartError, Scope>, // per effective settings
+  …version 1 fields
+})
+SharedContext<A>      = { settings: Partial<A> /* no overridable fields */ } & ModuleServicesV2
+ModuleContextV2<A, X> = ModuleContext<A> & ModuleServicesV2 & { shared: X }
+ModuleServicesV2      = { host: ModuleHostApi }   // later PRs add store, events, scheduler, speech, notify, present, connections
+SharedPart<X>         = { value: X; services?: [ServiceKey<T>.of(impl)]; contributions?: [ContributionKey<T>.of(value)] }
+ModuleHostApi = {
+  view(): HostView                                  // module states, vault locked, engine summary, devices, Home values
+  service<T>(key: ServiceKey<T>): T | undefined     // live; undefined while no demanded module provides it
+  contributions<T>(key: ContributionKey<T>): ReadonlyArray<T>
+  actions: { list: Effect<CatalogAction[]>; run(req): Effect<ActionRunResult> }  // the turn's (calling assistant's) catalogue
+  requestRestart(reason): Effect<void>
+}
+```
+
+- **Two lifetimes.** `start` runs per distinct set of effective settings as before; `shared` runs once per module while
+  it is demanded (an assistant has it on, its switch is on without demand, or a demanded module names it in `uses`),
+  with the shared settings only, and every instance gets its `value`. Services (one provider per key: a second is a
+  start error) and contributions (any number) come from `shared` and are looked up live, so restarts and start order
+  cannot lose them. A changed shared setting or secret starts a new shared part and every instance again; the old one
+  serves meanwhile and is retired after the grace period.
+- **The execution gateway** (`packages/core/src/Gateway.ts`) is the one way to `Tool.execute` and `ActionDefinition.run`:
+  `ToolRegistry.run` (core's tool loop, the Claude Code bridge), `ToolRegistry.runAction` (the intent agent, a
+  confirmed action) and `host.actions.run`; later phrase commands, taps and routine steps. It reads `CurrentTurn`,
+  validates the input, resolves `risk` (a class or a function of the validated input; inferred `read` for speculative
+  tools, else `change`), `sensitivity` (`household | personal`) and `latency`, and checks in order: the assistant has
+  the module on, the tool is not in its `offTools` (`ModuleHostOptions.access`, from the assistants' module choices),
+  the risk hook, the confirmation hook (`ModuleHostOptions.gatewayHooks`, empty until P8). The host's registries and
+  serve mode's per-assistant registries all carry `host.gateway`; a hand-made registry uses `defaultGateway` (no
+  access checks). A later check is one more hook in `GatewayOptions`, called in `admit`'s order.
+- **Availability.** `requires`, `platforms` and `apiVersion` are judged before anything starts, from the app's probes
+  (`apps/assistant/src/requirements.ts`: one tool registry, argv + version regexp, no shell, 5 s, fixed `PATH` with
+  `data/tools/bin` first, cached; probed at start and on "Check again", never on a turn). A module that fails them is
+  `ModuleState` `unavailable` (protocol 9, `ModuleInfo.unavailable`: reason and fix), is never started, and each
+  assistant that has it on gets one instructions line saying it is not set up (`unavailableInstruction`).
+- **Health.** The host keeps an issue registry (`ModuleHost.issues`: requirements, unavailable, failed starts and
+  restarts, each module's `health()`), the app adds the core checks (`apps/assistant/src/coreChecks.ts`). `pnpm start
+  doctor` prints them and exits 1 on an error; admin's Diagnostics › Health shows them (`health`, `health.check`).
+- **Templates** are plain data (`ModuleInfo.templates`, ids `<moduleId>.<id>`) that the new-assistant wizard offers.
 
 Adding a feature = one new file exporting `defineModule({...})` + one line in `moduleCatalog` in `apps/assistant/src/modules.ts`. Adding a provider = one new package implementing a core interface + one line in `apps/assistant/src/providers.ts`. Adding a voice provider = an adapter with `layerConfig` (`Tts`) and `makeVoices` (`TtsVoices`), and one entry in `ttsProviders`, `ttsProviderInfo` and (hosted) `hostedTtsVoices` in `providers.ts`. A voice needs no code: it is chosen by its key.
 
@@ -318,7 +374,7 @@ packages/
   audio-pipewire/   AudioInput/AudioOutput by spawning pw-record / pw-cat
   audio-file/       AudioInput from a WAV/PCM file (paced in real time), AudioOutput to a WAV file — for tests and benchmarks on machines with no sound card
   audio-web/        AudioInput/AudioOutput for a browser (serve mode), over an abstract link to the owner's connection
-  protocol/         browser ↔ assistant protocol (version 7): message schemas, binary framing, examples; assistants,
+  protocol/         browser ↔ assistant protocol (version 9; `health.ts`: issues, module availability, templates): message schemas, binary framing, examples; assistants,
                     device types, devices and their settings, resolution rules and bounds (`assistants.ts`, `devices.ts`);
                     device identity, wake phrases and the version 3 profile fields the migration reads (`frontends.ts`);
                     admin sessions (`admin.ts`) (browser-safe)
@@ -339,7 +395,8 @@ apps/
                     `AUDIO_BACKEND` in the CLI modes; `llmAccountLayers` for the assistants' accounts; `ttsProviders` / `ttsProviderInfo` for the voice
                     providers), voiceSelection.ts (the default voice, `ASSISTANT_VOICE` for the CLI and the migration), modules.ts (the module catalog), main.ts, serve/ (web UI server:
                     Resources.ts the resource pool, SessionDispatcher.ts, OutputLease.ts, assistants.ts, devices.ts, migrateAssistants.ts); modes: `serve`,
-                    `voice`, `text` (stdin/stdout, no audio), `bench`
+                    `voice`, `text` (stdin/stdout, no audio), `doctor` (core checks, module requirements and health;
+                    exit 1 on an error; `doctor.ts`, `coreChecks.ts`, `requirements.ts`), `bench`
                     (offline with simulated delays, `--live` over WAV files with the real providers, `--make-wavs`),
                     `say` (text → a voice → speaker or WAV, with engine timings), `transcribe` (WAV → STT events with timings),
                     `compare-models` (WAVs → every installed local STT preset: transcript and timings)

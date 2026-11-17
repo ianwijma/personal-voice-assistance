@@ -1,12 +1,57 @@
-import type { ChoiceOption, ErrorInfo, FieldError, ModuleInfo, ModuleInstanceInfo, ModuleState, SettingsPatch, SettingValue, StatusLine } from "@pva/protocol"
+import type {
+  AssistantTemplate,
+  ChoiceOption,
+  ErrorInfo,
+  FieldError,
+  ModuleInfo,
+  ModuleInstanceInfo,
+  ModuleState,
+  ModuleUnavailable,
+  SettingsPatch,
+  SettingValue,
+  StatusLine
+} from "@pva/protocol"
 import { Cause, Clock, Effect, Exit, Scope, Stream } from "effect"
-import { actionTool, defineAction, Param, type RegisteredAction, registerActions } from "./Actions.ts"
+import {
+  ACTION_TIMEOUT_MS,
+  ActionError,
+  type ActionOutcome,
+  type ActionParams,
+  actionTool,
+  actionToolName,
+  checkedActionValues,
+  defineAction,
+  Param,
+  type RegisteredAction,
+  registerActions
+} from "./Actions.ts"
 import type { Agent } from "./Agent.ts"
 import { buildDecisionPlan, type DecisionProvider } from "./Decision.ts"
-import type { AssistantModule, ContextProvider, Tool } from "./Module.ts"
+import { type ExecutionGateway, type GatewayAccess, type GatewayOptions, isGatewayRefusal, makeExecutionGateway } from "./Gateway.ts"
+import { makeIssueRegistry, type IssueRegistry } from "./Issues.ts"
+import { type AssistantModule, type ContextProvider, type Tool, toolMetadata } from "./Module.ts"
+import {
+  type ActionRunRequest,
+  type ActionRunResult,
+  type CatalogAction,
+  type ContributionKey,
+  type HostView,
+  type HostViewSource,
+  type Issue,
+  isOptionalRequirement,
+  MODULE_API,
+  type ModuleHostApi,
+  type ModuleServicesV2,
+  type RequirementCheck,
+  requirementKey,
+  type RequirementStatus,
+  type ServiceKey,
+  type SharedPart
+} from "./ModuleApi.ts"
 import type { FieldActionResult } from "./ModuleContributions.ts"
 import { type ModuleDefinition, type ModuleInstance, ModuleStartError } from "./ModuleDefinition.ts"
-import { applicableOwnValues, applySettingsPatch, checkOwnValues, type ResolvedSettings, resolveSettings } from "./Settings.ts"
+import { applicableOwnValues, applySettingsPatch, checkOwnValues, overridableKeys, type ResolvedSettings, resolveSettings } from "./Settings.ts"
+import { CurrentTurn } from "./TurnContext.ts"
 import { makeToolRegistry, type ToolRegistry } from "./ToolRegistry.ts"
 
 /**
@@ -88,6 +133,11 @@ export interface ModulePart {
   /** `name` is the module id. */
   readonly module: AssistantModule
   readonly instructions: string
+  /**
+   * The module cannot run on this server (module API v2): the part has no tools and its `instructions` are the one
+   * line that says so (`unavailableInstruction`).
+   */
+  readonly unavailable?: boolean
 }
 
 /** One assistant that wants a module (docs/ASSISTANTS.md §2.6), with its own values for the module's fields. */
@@ -155,6 +205,35 @@ export interface ModuleHost {
    * runs, such as the models Claude Code reports at start. `undefined` when the module does not run or gives none.
    */
   readonly settingOptions: (id: string) => Readonly<Record<string, ReadonlyArray<ChoiceOption>>> | undefined
+  /**
+   * The issue registry (module API v2, §C.5): every module's requirement, availability, start and `health()` issues,
+   * plus what the app adds (`core`). Module issues are kept current by the host; `checkHealth` refreshes the rest.
+   */
+  readonly issues: IssueRegistry
+  /**
+   * Judge every module's availability again (`requirements`, after the app probed again: "Check again"): a module that
+   * became available is started if it is wanted, one that became unavailable is retired with the grace period.
+   * Completes when the starts have settled.
+   */
+  readonly recheck: Effect.Effect<void>
+  /**
+   * Run every available module's `health()` (5 s each, concurrently; never on a turn) with its shared settings and
+   * put what they return in `issues`. A health check that fails or times out is a warning of its own.
+   */
+  readonly checkHealth: Effect.Effect<void>
+  /** The turn's action catalogue (`ModuleHostApi.actions`), for the app and tests. */
+  readonly actions: ModuleHostApi["actions"]
+  /** The read-only view modules get (`ModuleHostApi.view`). */
+  readonly view: () => HostView
+  /** A service of a demanded module's `shared` part (`ModuleHostApi.service`). */
+  readonly service: ModuleHostApi["service"]
+  /** The values contributed under a key (`ModuleHostApi.contributions`). */
+  readonly contributions: ModuleHostApi["contributions"]
+  /**
+   * The execution gateway every registry of this host runs its calls through (`Gateway.ts`); serve mode builds each
+   * assistant's registry with it.
+   */
+  readonly gateway: ExecutionGateway
 }
 
 export interface ModuleHostOptions {
@@ -185,6 +264,26 @@ export interface ModuleHostOptions {
    * its saved on/off with one instance.
    */
   readonly demand?: () => ReadonlyMap<string, ReadonlyArray<ModuleDemand>>
+  /** This server's platform (`process.platform`, `process.arch`) for `ModuleDefinition.platforms`. Absent: not judged. */
+  readonly platform?: { readonly os: string; readonly arch: string }
+  /**
+   * The app's judgement of a module's `requires` (synchronous, from its probe cache; never probes itself). Read when
+   * the host is made and on `recheck`. Absent: every requirement is `unchecked` (never unavailable for it).
+   */
+  readonly requirements?: RequirementCheck
+  /** The app's half of `HostView` (vault, engines, devices, Home values). Absent: the CLI defaults. */
+  readonly view?: HostViewSource
+  /**
+   * Which modules and tools each assistant has on (serve mode: its module choices and `offTools`): the execution
+   * gateway's first two checks, and the turn's action catalogue. Absent: no access checks (the CLI modes).
+   */
+  readonly access?: GatewayAccess
+  /** The gateway's later checks (P8: the risk policy and confirmation). */
+  readonly gatewayHooks?: Pick<GatewayOptions, "risk" | "confirmation">
+  /** The issue registry to keep the module issues in (the app adds its own). Default: a new one. */
+  readonly issues?: IssueRegistry
+  /** Time a module's `health()` may take. Default 5 s. */
+  readonly healthTimeoutMs?: number
 }
 
 interface Running {
@@ -195,6 +294,15 @@ interface Running {
   readonly tools: ReadonlyArray<Tool>
   readonly actions: ReadonlyArray<RegisteredAction>
 }
+
+/** A module's `shared` part while it runs: the shared settings it started with, its scope and what it returned. */
+interface SharedRun {
+  readonly key: string
+  readonly scope: Scope.Closeable
+  readonly part: SharedPart<unknown>
+}
+
+type SharedPrepared = { readonly ok: true; readonly run: SharedRun | undefined; readonly fresh: boolean } | { readonly ok: false; readonly message: string }
 
 /** One wanted instance of a module: the settings it runs with, who uses it, and how it is doing. */
 interface Instance {
@@ -233,6 +341,16 @@ interface Entry {
   dirty: boolean
   revision: number
   generation: number
+  /** Why it cannot run here (`unavailable`), judged at creation and on `recheck`; `undefined`: it can. */
+  unavailable: ModuleUnavailable | undefined
+  /** Its requirements as last judged. */
+  statuses: ReadonlyArray<RequirementStatus>
+  /** The last `requestRestart` that failed to start (the old instance kept serving); cleared by a successful start. */
+  restartError: string | undefined
+  /** The published `shared` part (version 2), while the module is demanded. */
+  shared: SharedRun | undefined
+  /** Why the `shared` part could not start (the module is then in `error`). */
+  sharedError: string | undefined
 }
 
 /** The instances one set of effective settings asks for. */
@@ -254,6 +372,13 @@ const OK: HostResult = { ok: true }
 
 const toolNames = (running: { readonly tools: ReadonlyArray<Tool> } | undefined) => (running?.tools ?? []).map((t) => t.name)
 
+/**
+ * The instructions line of a module an assistant has on that cannot run here (module-definition §C.4, option a): the
+ * assistant says it is not set up in one sentence instead of improvising, and no tool round is spent on it.
+ */
+export const unavailableInstruction = (name: string, reason: string): string =>
+  `${name} is not set up on this server (${reason.replace(/[.!?]+$/, "")}). If you are asked for anything it does, say so in one sentence; the owner can fix it in the admin page under Diagnostics › Health.`
+
 /** An instance's actions, registered under the module id, and its tools plus one generated tool per offered action. */
 const contributionsOf = (moduleId: string, instance: ModuleInstance) => {
   const actions = registerActions(moduleId, instance.actions ?? [])
@@ -266,6 +391,9 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
   const startTimeoutMs = options.startTimeoutMs ?? 10_000
   const graceMs = options.graceMs ?? 10_000
   const contextTimeoutMs = options.contextTimeoutMs ?? 50
+  const healthTimeoutMs = options.healthTimeoutMs ?? 5_000
+  const gateway = makeExecutionGateway({ ...(options.access !== undefined ? { access: options.access } : {}), ...options.gatewayHooks })
+  const issues = options.issues ?? makeIssueRegistry()
   const listeners = new Set<(info: ModuleInfo) => void>()
   const retired = new Set<Scope.Closeable>()
 
@@ -287,7 +415,12 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
       busy: false,
       dirty: false,
       revision: 0,
-      generation: 0
+      generation: 0,
+      unavailable: undefined,
+      statuses: [],
+      restartError: undefined,
+      shared: undefined,
+      sharedError: undefined
     }
   })
   const byId = new Map(entries.map((e) => [e.def.id, e]))
@@ -311,8 +444,101 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
   }
   for (const entry of entries) if (!entry.chosen) entry.enabled = defaultIntent(entry)
 
+  /**
+   * Whether the module can run on this server (module API v2): a supported `apiVersion`, a listed platform, and every
+   * required requirement met (as the app's probes last judged them). Synchronous; never probes.
+   */
+  const judge = (entry: Entry): { readonly unavailable: ModuleUnavailable | undefined; readonly statuses: ReadonlyArray<RequirementStatus> } => {
+    const def = entry.def
+    const api = def.apiVersion ?? 1
+    const supports: ReadonlyArray<number> = MODULE_API.supports
+    if (!supports.includes(api)) {
+      const range = `${Math.min(...supports)}–${Math.max(...supports)}`
+      return {
+        unavailable: {
+          reason: api > MODULE_API.current
+            ? `Written for module API ${api}; this assistant supports ${range}. Update the assistant.`
+            : `Written for module API ${api}, which this assistant no longer supports (${range}). Update the module.`
+        },
+        statuses: []
+      }
+    }
+    const platform = options.platform
+    if (platform !== undefined && def.platforms !== undefined) {
+      const { os, arch } = def.platforms
+      if (os !== undefined && os.length > 0 && !os.includes(platform.os)) {
+        return { unavailable: { reason: `Runs on ${os.join(" or ")}; this server runs ${platform.os}.` }, statuses: [] }
+      }
+      if (arch !== undefined && arch.length > 0 && !arch.includes(platform.arch)) {
+        return { unavailable: { reason: `Runs on ${arch.join(" or ")} processors; this server has ${platform.arch}.` }, statuses: [] }
+      }
+    }
+    const requires = def.requires ?? []
+    const statuses = requires.length === 0 ? [] : options.requirements?.(requires) ?? requires.map((requirement): RequirementStatus => ({
+      requirement,
+      state: "unchecked",
+      detail: "not checked"
+    }))
+    const missing = statuses.find((st) => st.state === "missing" && !isOptionalRequirement(st.requirement))
+    return {
+      unavailable: missing === undefined ? undefined : { reason: missing.detail, ...(missing.fix !== undefined ? { fix: missing.fix } : {}) },
+      statuses
+    }
+  }
+  for (const entry of entries) {
+    const judged = judge(entry)
+    entry.unavailable = judged.unavailable
+    entry.statuses = judged.statuses
+  }
+
+  /** Someone wants the module now (its saved switch, or an assistant has it on). */
+  const wanted = (entry: Entry) => (entry.demand === undefined ? entry.enabled : entry.demand.length > 0)
+
+  /** The module's own issues (source `module:<id>`): requirements, unavailable, a failed start or restart. */
+  const moduleIssues = (entry: Entry): ReadonlyArray<Issue> => {
+    const id = entry.def.id
+    const name = entry.def.name
+    const out: Array<Issue> = []
+    // An error only for a module someone wants: an unused module missing a program does not fail `doctor`.
+    const severity = wanted(entry) ? "error" : "warning"
+    const page = { kind: "link", label: `Open ${name}`, value: `#settings/shared/modules/${id}` } as const
+    for (const st of entry.statuses) {
+      if (st.state !== "missing") continue
+      const r = st.requirement
+      const why = "why" in r && r.why !== undefined ? r.why : undefined
+      out.push({
+        id: `${id}.requires.${requirementKey(r)}`,
+        module: id,
+        severity: isOptionalRequirement(r) ? "warning" : severity,
+        title: st.detail,
+        detail: `${name} ${isOptionalRequirement(r) ? "can use it" : "needs it"}${why === undefined ? "." : `: ${why}${/[.!?]$/.test(why) ? "" : "."}`}`,
+        ...(st.fix !== undefined ? { fix: st.fix } : {})
+      })
+    }
+    if (entry.unavailable !== undefined && out.length === 0) {
+      out.push({
+        id: `${id}.unavailable`,
+        module: id,
+        severity,
+        title: `${name} cannot run on this server`,
+        detail: entry.unavailable.reason,
+        ...(entry.unavailable.fix !== undefined ? { fix: entry.unavailable.fix } : {})
+      })
+    }
+    const { state, error } = stateOf(entry)
+    if (state === "error") {
+      out.push({ id: `${id}.start`, module: id, severity: "error", title: `${name} could not start`, detail: error ?? "", fix: page })
+    }
+    if (entry.restartError !== undefined) {
+      out.push({ id: `${id}.restart`, module: id, severity: "warning", title: `${name} could not be started again`, detail: `It keeps running as it was. ${entry.restartError}`, fix: page })
+    }
+    return out
+  }
+
   /** The groups of effective settings the module should run with now (or with `stored`/`secrets`, a change being made). */
   const groupsOf = (entry: Entry, stored = entry.stored, secrets = entry.secrets): Array<Group> => {
+    // A module that cannot run here is never started (it is `unavailable`, not `error`).
+    if (entry.unavailable !== undefined) return []
     if (entry.demand === undefined) {
       if (!entry.enabled) return []
       const resolved = resolve(entry, stored, secrets)
@@ -363,7 +589,9 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
 
   /** The module's state from its instances: `error` when one fails, `starting` while one starts. */
   const stateOf = (entry: Entry): { readonly state: ModuleState; readonly error?: string } => {
+    if (entry.unavailable !== undefined) return { state: "unavailable" }
     const all = [...entry.instances.values()]
+    if (all.length === 0 && entry.sharedError !== undefined) return { state: "error", error: entry.sharedError }
     if (all.length === 0) return { state: entry.retiring > 0 || entry.leaving.size > 0 ? "stopping" : "disabled" }
     if (all.some((r) => r.state === "starting")) return { state: "starting" }
     const failed = all.find((r) => r.state === "error")
@@ -395,16 +623,35 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
       state,
       ...(error !== undefined ? { error } : {}),
       ...(main?.status !== undefined ? { status: main.status } : {}),
-      tools: [...tools.values()].map((t) => ({ name: t.name, description: t.description, speculative: t.speculative === true })),
+      tools: [...tools.values()].map((t) => {
+        const { risk, ...meta } = toolMetadata(t)
+        return { name: t.name, description: t.description, speculative: t.speculative === true, ...(risk !== undefined ? { risk } : {}), ...meta }
+      }),
       settings: resolve(entry).form,
       revision: entry.revision,
       ...(entry.def.kind !== undefined ? { kind: entry.def.kind } : {}),
-      ...(entry.demand !== undefined ? { instances: [...entry.instances.values()].map(instanceInfo) } : {})
+      ...(entry.demand !== undefined ? { instances: [...entry.instances.values()].map(instanceInfo) } : {}),
+      ...(entry.unavailable !== undefined ? { unavailable: entry.unavailable } : {}),
+      ...(entry.def.version !== undefined ? { version: entry.def.version } : {}),
+      ...(entry.def.apiVersion !== undefined ? { apiVersion: entry.def.apiVersion } : {}),
+      ...(entry.def.templates !== undefined && entry.def.templates.length > 0 ? { templates: templatesOf(entry) } : {})
     }
   }
 
+  const templatesOf = (entry: Entry): Array<AssistantTemplate> =>
+    (entry.def.templates ?? []).map((t) => ({
+      id: `${entry.def.id}.${t.id}`,
+      name: t.name,
+      prompt: t.prompt,
+      ...(t.purpose !== undefined ? { purpose: t.purpose } : {}),
+      ...(t.handles !== undefined ? { handles: t.handles } : {}),
+      modules: [...(t.modules ?? [entry.def.id])],
+      ...(t.suggestedPhrases !== undefined ? { suggestedPhrases: [...t.suggestedPhrases] } : {})
+    }))
+
   const notify = (entry: Entry) => {
     entry.revision++
+    issues.set(`module:${entry.def.id}`, moduleIssues(entry))
     if (listeners.size === 0) return
     const current = info(entry)
     for (const listener of listeners) {
@@ -444,6 +691,22 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
     )
   })
 
+  /**
+   * The part of a module that cannot run here but is wanted (C.4 option a): no tools, and one instructions line so the
+   * assistant says it is not set up instead of improvising. Made once per reason, so the cached prompt prefix changes
+   * only when availability changes.
+   */
+  const unavailableParts = new Map<Entry, ModulePart>()
+  const unavailablePartOf = (entry: Entry, unavailable: ModuleUnavailable): ModulePart => {
+    const line = unavailableInstruction(entry.def.name, unavailable.reason)
+    let part = unavailableParts.get(entry)
+    if (part === undefined || part.instructions !== line) {
+      part = { moduleId: entry.def.id, module: { name: entry.def.id, tools: [], context: [] }, instructions: line, unavailable: true }
+      unavailableParts.set(entry, part)
+    }
+    return part
+  }
+
   /** One part per running instance, made once (so every snapshot and every assistant shares the same object). */
   const parts = new WeakMap<Running, ModulePart>()
   const partOf = (entry: Entry, running: Running): ModulePart => {
@@ -461,7 +724,7 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
 
   let snapshot: ModuleSnapshot = {
     version: 0,
-    registry: makeToolRegistry([]),
+    registry: makeToolRegistry([], { gateway }),
     instructions: [],
     toolModules: new Map(),
     agents: new Map(),
@@ -476,6 +739,12 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
       const r = mainOf(e)?.running
       return r === undefined ? [] : [{ e, r }]
     })
+    /** The main parts in catalog order: the running ones, and an unavailable one wherever it is wanted (no demand). */
+    const mainParts = entries.flatMap((e) => {
+      if (e.unavailable !== undefined) return e.demand === undefined && e.enabled ? [unavailablePartOf(e, e.unavailable)] : []
+      const r = mainOf(e)?.running
+      return r === undefined ? [] : [partOf(e, r)]
+    })
     const toolModules = new Map<string, string>()
     for (const e of entries) for (const r of runningOf(e)) for (const name of toolNames(r.running)) toolModules.set(name, e.def.id)
     const agents = new Map<string, Agent>()
@@ -484,7 +753,6 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
       for (const agent of r.instance.agents ?? []) if (!agents.has(agent.id)) agents.set(agent.id, agent)
       for (const decider of r.instance.deciders ?? []) if (!deciders.has(decider.id)) deciders.set(decider.id, decider)
     }
-    const mainParts = mains.map(({ e, r }) => partOf(e, r))
     const assistantParts = new Map<string, ReadonlyArray<ModulePart>>()
     for (const e of entries) {
       for (const d of e.demand ?? []) {
@@ -492,6 +760,10 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
         assistantParts.set(
           d.assistantId,
           entries.flatMap((x) => {
+            if (x.unavailable !== undefined) {
+              const wants = x.demand === undefined ? x.enabled : x.demand.some((w) => w.assistantId === d.assistantId)
+              return wants ? [unavailablePartOf(x, x.unavailable)] : []
+            }
             const r = x.demand === undefined ? mainOf(x)?.running : instanceFor(x, d.assistantId)?.running
             return r === undefined ? [] : [partOf(x, r)]
           })
@@ -500,7 +772,7 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
     }
     return {
       version: snapshot.version + 1,
-      registry: makeToolRegistry(mainParts.map((p) => p.module)),
+      registry: makeToolRegistry(mainParts.map((p) => p.module), { gateway }),
       instructions: mainParts.flatMap((p) => (p.instructions.length > 0 ? [p.instructions] : [])),
       toolModules,
       agents,
@@ -601,10 +873,10 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
    * interruption and a `start` that throws included, the scope is closed here: the cleanup is installed before the
    * module's code runs.
    */
-  const startInstance = <A>(entry: Entry, rec: Instance, settings: unknown, adopt: (result: Started) => Effect.Effect<A>) =>
+  const startInstance = <A>(entry: Entry, rec: Instance, settings: unknown, shared: SharedRun | undefined, adopt: (result: Started) => Effect.Effect<A>) =>
     Effect.uninterruptibleMask((restore) =>
       Effect.flatMap(Scope.make(), (scope) =>
-        restore(startIn(entry, rec, settings, scope)).pipe(
+        restore(startIn(entry, rec, settings, scope, shared)).pipe(
           Effect.onExit((exit) => (Exit.isSuccess(exit) && exit.value.ok ? Effect.void : Scope.close(scope, Exit.void))),
           Effect.flatMap(adopt)
         )
@@ -618,13 +890,14 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
   const startMany = <A>(
     entry: Entry,
     items: ReadonlyArray<{ readonly rec: Instance; readonly settings: unknown }>,
+    shared: SharedRun | undefined,
     adopt: (results: ReadonlyArray<Started>) => Effect.Effect<A>
   ) =>
     Effect.uninterruptibleMask((restore) => {
       const opened: Array<Scope.Closeable> = []
       return Effect.forEach(items, ({ rec, settings }) =>
         Effect.flatMap(Scope.make(), (scope) =>
-          restore(startIn(entry, rec, settings, scope)).pipe(
+          restore(startIn(entry, rec, settings, scope, shared)).pipe(
             Effect.onExit((exit) =>
               Exit.isSuccess(exit) && exit.value.ok
                 ? Effect.sync(() => {
@@ -641,7 +914,7 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
   const closeStarted = (results: ReadonlyArray<Started>) =>
     Effect.forEach(results, (r) => (r.ok ? Scope.close(r.running.scope, Exit.void) : Effect.void), { discard: true })
 
-  const startIn = (entry: Entry, rec: Instance, settings: unknown, scope: Scope.Closeable) =>
+  const startIn = (entry: Entry, rec: Instance, settings: unknown, scope: Scope.Closeable, shared: SharedRun | undefined) =>
     Effect.gen(function*() {
       const generation = ++entry.generation
       let startStatus: StatusLine | undefined
@@ -654,7 +927,12 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
           scheduleStatus(entry)
         }
       }
-      const exit = yield* Effect.suspend(() => entry.def.start({ settings: settings as never, setStatus })).pipe(
+      // Version 1 modules get exactly the context they always had; version 2 modules also get the host's services and
+      // what their `shared` part returned.
+      const context = (entry.def.apiVersion ?? 1) >= 2
+        ? { settings: settings as never, setStatus, shared: shared?.part.value, ...servicesFor(entry, { rec, generation }) }
+        : { settings: settings as never, setStatus }
+      const exit = yield* Effect.suspend(() => entry.def.start(context)).pipe(
         Scope.provide(scope),
         Effect.timeoutOrElse({
           duration: startTimeoutMs,
@@ -692,7 +970,7 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
     })
 
   /** Start the instance `rec` of `group` on its own (enable, retry, startup, a new assistant). It is already wanted. */
-  const startOne = (entry: Entry, group: Group, rec: Instance, isNew: boolean): Effect.Effect<HostResult> =>
+  const startOne = (entry: Entry, group: Group, rec: Instance, isNew: boolean, shared: SharedRun | undefined): Effect.Effect<HostResult> =>
     Effect.gen(function*() {
       const resolved = group.resolved
       if (resolved.value === undefined) {
@@ -720,14 +998,18 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
           // No longer wanted while it started (only possible at shutdown races): do not keep it.
           return Effect.as(Scope.close(result.running.scope, Exit.void), OK).pipe(Effect.tap(() => Effect.sync(() => notify(entry))))
         }
-        const clash = publish(entry, [[rec, result.running]])
-        if (clash !== undefined) return Effect.as(Scope.close(result.running.scope, Exit.void), startFailed(clash))
-        rec.status = result.status
-        rec.state = "running"
-        notify(entry)
-        return Effect.succeed(OK)
+        // The first instance of a new `shared` part publishes it (its services and contributions) with itself.
+        return Effect.flatMap(shared === undefined ? Effect.succeed(undefined) : publishShared(entry, shared), (sharedClash) => {
+          if (sharedClash !== undefined) return Effect.as(Scope.close(result.running.scope, Exit.void), startFailed(sharedClash))
+          const clash = publish(entry, [[rec, result.running]])
+          if (clash !== undefined) return Effect.as(Scope.close(result.running.scope, Exit.void), startFailed(clash))
+          rec.status = result.status
+          rec.state = "running"
+          notify(entry)
+          return Effect.succeed(OK)
+        })
       }
-      return yield* startInstance(entry, rec, resolved.value, adopt).pipe(
+      return yield* startInstance(entry, rec, resolved.value, shared, adopt).pipe(
         // Cancelled during the module's start (shutdown, the caller gave up): the scope is already closed; back to how
         // it was (a new instance is not wanted any more). An interruption that arrives once the result was adopted
         // changes nothing: that outcome stands.
@@ -751,7 +1033,11 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
    * in error), and retire those no longer wanted, once the starts have settled (a replaced instance keeps serving
    * until then). Returns the first failure of the starts, if any, and whether anything changed.
    */
-  const reconcile = (entry: Entry, retry: boolean): Effect.Effect<{ readonly result: HostResult; readonly changed: boolean }> =>
+  const reconcile = (
+    entry: Entry,
+    retry: boolean,
+    sharedOptions: { readonly force?: boolean } = {}
+  ): Effect.Effect<{ readonly result: HostResult; readonly changed: boolean }> =>
     Effect.suspend(() => {
       const groups = groupsOf(entry)
       const next = new Map<string, Instance>()
@@ -785,10 +1071,54 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
       entry.instances = next
       if (starts.length > 0) changed = true
       if (changed) rebuild()
-      return Effect.forEach(starts, ({ group, isNew, rec }) => startOne(entry, group, rec, isNew), { concurrency: starts.length > 1 ? "unbounded" : 1 }).pipe(
-        Effect.ensuring(finishLeaving(entry)),
-        Effect.map((results) => ({ result: results.find((r) => !r.ok) ?? OK, changed }))
-      )
+      return Effect.gen(function*() {
+        // Version 2: the `shared` part runs while the module is demanded, before its instances (each gets its value).
+        const demanded = isDemanded(entry)
+        let run: SharedRun | undefined
+        let fresh = false
+        if (entry.def.shared !== undefined && demanded) {
+          const prepared = yield* prepareShared(entry, sharedOptions)
+          if (!prepared.ok) {
+            entry.sharedError = prepared.message
+            for (const { rec } of starts) {
+              rec.state = "error"
+              rec.error = prepared.message
+            }
+            notify(entry)
+            yield* finishLeaving(entry)
+            return { result: failure("module_start_failed", prepared.message, { moduleId: entry.def.id }), changed: true }
+          }
+          run = prepared.run
+          fresh = prepared.fresh
+          // Demanded through `uses` only (no instance to publish it with), or a new shared part with nothing to start.
+          if (fresh && starts.length === 0 && run !== undefined) {
+            const clash = yield* publishShared(entry, run)
+            if (clash !== undefined) {
+              yield* closeShared(run)
+              entry.sharedError = clash
+              notify(entry)
+              return { result: failure("module_start_failed", clash, { moduleId: entry.def.id }), changed: true }
+            }
+            changed = true
+            notify(entry)
+          }
+        }
+        const results = yield* Effect.forEach(starts, ({ group, isNew, rec }) => startOne(entry, group, rec, isNew, run), { concurrency: starts.length > 1 ? "unbounded" : 1 }).pipe(
+          Effect.ensuring(finishLeaving(entry))
+        )
+        // A new shared part that no instance adopted (every start failed) is not kept.
+        if (fresh && run !== undefined && entry.shared !== run) yield* closeShared(run)
+        // Demand ended: the shared part goes too, after the grace period (calls in flight finish).
+        if (!demanded && entry.shared !== undefined) {
+          const old = entry.shared
+          entry.shared = undefined
+          entry.sharedError = undefined
+          yield* retireShared(entry, old)
+          changed = true
+        }
+        if (!demanded) entry.sharedError = undefined
+        return { result: results.find((r) => !r.ok) ?? OK, changed }
+      })
     })
 
   /** Run `op` unless another operation on the same module is in progress. A deferred refresh runs after it. */
@@ -826,13 +1156,43 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
   const readDemand = () => {
     if (options.demand === undefined) return
     const demand = options.demand()
-    for (const entry of entries) entry.demand = demand.get(entry.def.id)
+    let unavailableChanged = false
+    for (const entry of entries) {
+      const next = demand.get(entry.def.id)
+      if (entry.unavailable !== undefined && JSON.stringify(next) !== JSON.stringify(entry.demand)) unavailableChanged = true
+      entry.demand = next
+    }
+    // An unavailable module starts nothing, so nothing else would rebuild its instructions lines for its new assistants.
+    if (unavailableChanged) rebuild()
   }
 
   const notAllowed = (entry: Entry): HostResult =>
     failure("not_allowed", `${entry.def.name} is switched on and off per assistant (the assistant's Modules tab).`, { moduleId: entry.def.id })
 
+  /** The modules `entry` uses (transitively): their demand follows `entry`'s. */
+  const usedBy = (entry: Entry): Array<Entry> => {
+    const out: Array<Entry> = []
+    const visit = (e: Entry) => {
+      for (const id of e.def.uses ?? []) {
+        const used = byId.get(id)
+        if (used === undefined || used === entry || out.includes(used)) continue
+        out.push(used)
+        visit(used)
+      }
+    }
+    visit(entry)
+    return out
+  }
+  /** After `entry`'s own switch changed: bring the modules it uses in line (their shared parts follow the demand). */
+  const refreshUsed = (entry: Entry) => Effect.forEach(usedBy(entry), refreshEntry, { discard: true })
+
   const enable = (id: string) =>
+    Effect.tap(exclusiveEnable(id), () => Effect.suspend(() => (byId.get(id) === undefined ? Effect.void : refreshUsed(byId.get(id)!))))
+
+  const disable = (id: string) =>
+    Effect.tap(exclusiveDisable(id), () => Effect.suspend(() => (byId.get(id) === undefined ? Effect.void : refreshUsed(byId.get(id)!))))
+
+  const exclusiveEnable = (id: string) =>
     exclusive(id, (entry) =>
       Effect.gen(function*() {
         if (entry.demand !== undefined) return notAllowed(entry)
@@ -848,7 +1208,7 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
         return result
       }))
 
-  const disable = (id: string) =>
+  const exclusiveDisable = (id: string) =>
     exclusive(id, (entry) =>
       Effect.gen(function*() {
         if (entry.demand !== undefined) return notAllowed(entry)
@@ -876,7 +1236,10 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
           entry.stored = patched.stored
           entry.secrets = patched.secrets
           yield* save(entry)
-          if ([...entry.instances.values()].some((r) => r.state === "error")) return (yield* reconcile(entry, true)).result
+          const force = Object.keys(patch.secrets).length > 0
+          if ([...entry.instances.values()].some((r) => r.state === "error")) return (yield* reconcile(entry, true, { force })).result
+          // A module demanded only through `uses`: its shared part follows the new settings.
+          if (entry.def.shared !== undefined && isDemanded(entry)) return (yield* reconcile(entry, false, { force })).result
           notify(entry)
           return OK
         }
@@ -887,11 +1250,23 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
         }
         // An instance whose effective settings stay the same keeps running (a new secret restarts every one).
         const secretsChanged = Object.keys(patch.secrets).length > 0
+        // A changed shared part (its settings or a secret) is started first, and every instance again with its value.
+        const sharedChanged = entry.def.shared !== undefined && isDemanded(entry) &&
+          (secretsChanged || sharedSettingsOf(entry, patched.stored, patched.secrets).key !== entry.shared?.key)
+        let sharedRun = entry.shared
+        let sharedFresh = false
+        if (sharedChanged) {
+          const prepared = yield* prepareShared(entry, { stored: patched.stored, secrets: patched.secrets, force: true })
+          if (!prepared.ok) return failure("module_start_failed", prepared.message, { moduleId: id })
+          sharedRun = prepared.run
+          sharedFresh = prepared.fresh
+        }
+        const dropShared = sharedFresh && sharedRun !== undefined ? closeShared(sharedRun) : Effect.void
         const next = new Map<string, Instance>()
         const fresh: Array<{ readonly rec: Instance; readonly settings: unknown; readonly group: Group }> = []
         for (const group of groups) {
           const existing = entry.instances.get(group.key)
-          if (existing?.running !== undefined && !secretsChanged) {
+          if (existing?.running !== undefined && !secretsChanged && !sharedChanged) {
             next.set(group.key, existing)
             continue
           }
@@ -902,12 +1277,17 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
         const replaced = [...entry.instances.values()].filter((r) => next.get(r.key) !== r)
         // The old instances keep serving while the new ones start. Publication, the new settings and the old
         // instances' retirement happen together, uninterruptibly; if one start fails, nothing changes.
-        const adopted = yield* startMany(entry, fresh, (results): Effect.Effect<HostResult | undefined> => {
+        const adopted = yield* startMany(entry, fresh, sharedRun, (results): Effect.Effect<HostResult | undefined> => Effect.gen(function*() {
           const failed = results.find((r): r is Extract<Started, { ok: false }> => !r.ok)
-          if (failed !== undefined) return Effect.as(closeStarted(results), failure("module_start_failed", failed.message, { moduleId: id }))
+          if (failed !== undefined) return yield* Effect.as(Effect.andThen(closeStarted(results), dropShared), failure("module_start_failed", failed.message, { moduleId: id }))
+          // The new shared part's services and contributions are published with the instances, the old one retired.
+          if (sharedFresh && sharedRun !== undefined) {
+            const sharedClash = yield* publishShared(entry, sharedRun)
+            if (sharedClash !== undefined) return yield* Effect.as(Effect.andThen(closeStarted(results), dropShared), failure("module_start_failed", sharedClash, { moduleId: id }))
+          }
           const adds = results.map((r, i) => [fresh[i]!.rec, (r as Extract<Started, { ok: true }>).running] as const)
           const clash = publish(entry, adds, next)
-          if (clash !== undefined) return Effect.as(closeStarted(results), failure("module_start_failed", clash, { moduleId: id }))
+          if (clash !== undefined) return yield* Effect.as(closeStarted(results), failure("module_start_failed", clash, { moduleId: id }))
           results.forEach((r, i) => {
             const rec = fresh[i]!.rec
             rec.state = "running"
@@ -921,11 +1301,11 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
           entry.stored = patched.stored
           entry.secrets = patched.secrets
           rebuild()
-          return Effect.as(
+          return yield* Effect.as(
             Effect.forEach(replaced, (r) => (r.running === undefined ? Effect.void : retire(entry, r.running)), { discard: true }),
             undefined
           )
-        })
+        })).pipe(Effect.onInterrupt(() => dropShared))
         if (adopted !== undefined) return adopted
         yield* save(entry)
         notify(entry)
@@ -952,7 +1332,12 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
   // Shutdown: close every instance at once (no grace).
   yield* Effect.addFinalizer(() =>
     Effect.forEach(
-      [...entries.flatMap((e) => runningOf(e).map((r) => r.running!.scope)), ...retired],
+      [
+        ...entries.flatMap((e) => runningOf(e).map((r) => r.running!.scope)),
+        ...entries.flatMap((e) => (e.shared === undefined ? [] : [e.shared.scope])),
+        ...pendingShared,
+        ...retired
+      ],
       (scope) => Scope.close(scope, Exit.void),
       { concurrency: "unbounded", discard: true }
     )
@@ -990,7 +1375,7 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
         notify(entry)
       }
       return Effect.forEach(
-        entries.filter((e) => !e.busy && (switchedOn.has(e) || [...e.instances.values()].some((r) => r.state === "error"))),
+        entries.filter((e) => !e.busy && (switchedOn.has(e) || e.sharedError !== undefined || [...e.instances.values()].some((r) => r.state === "error"))),
         (entry) => exclusive(entry.def.id, (e) => Effect.map(reconcile(e, true), ({ result }) => result)),
         { concurrency: "unbounded", discard: true }
       )
@@ -1001,6 +1386,386 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
     if (entry === undefined) return [{ key: null, message: `There is no module "${id}"` }]
     return checkOwnValues(entry.def.settings, own)
   }
+
+  // -------------------------------------------------------------------------------------------------------------------
+  // Module API v2: availability, health, the action catalogue, services, restarts
+
+  const recheck = Effect.suspend(() => {
+    const changed: Array<Entry> = []
+    const key = (e: { readonly unavailable: ModuleUnavailable | undefined; readonly statuses: ReadonlyArray<RequirementStatus> }) =>
+      JSON.stringify([e.unavailable ?? null, e.statuses.map((st) => [st.state, st.detail, st.fix ?? null])])
+    for (const entry of entries) {
+      const before = key(entry)
+      const judged = judge(entry)
+      entry.unavailable = judged.unavailable
+      entry.statuses = judged.statuses
+      if (key(entry) !== before) changed.push(entry)
+    }
+    if (changed.length === 0) return Effect.void
+    // The instructions lines and the tools change from the next turn on; then start or retire the instances.
+    rebuild()
+    for (const entry of changed) notify(entry)
+    return Effect.forEach(changed, refreshEntry, { concurrency: "unbounded", discard: true })
+  })
+
+  const clip = (text: string, max: number) => (text.length <= max ? text : `${text.slice(0, max - 1)}…`)
+
+  /** A module's own issues, made safe for the wire: its id as prefix and `module`, texts within their limits. */
+  const normaliseIssues = (entry: Entry, list: ReadonlyArray<Issue>): ReadonlyArray<Issue> => {
+    const id = entry.def.id
+    return list.slice(0, 50).map((issue) => ({
+      ...issue,
+      id: clip(issue.id.startsWith(`${id}.`) ? issue.id : `${id}.${issue.id}`, 200),
+      module: id,
+      title: clip(issue.title, 200),
+      detail: clip(issue.detail, 2000)
+    }))
+  }
+
+  const checkHealth = Effect.forEach(
+    entries,
+    (entry) =>
+      Effect.suspend(() => {
+        const health = entry.def.health
+        const source = `health:${entry.def.id}`
+        if (health === undefined) return Effect.void
+        if (entry.unavailable !== undefined) {
+          issues.set(source, [])
+          return Effect.void
+        }
+        const settings = resolve(entry).value
+        const own = (title: string, detail: string): ReadonlyArray<Issue> => [{ id: `${entry.def.id}.health`, module: entry.def.id, severity: "warning", title, detail }]
+        // Suspended: a health check that throws is reported like one that fails.
+        return Effect.suspend(() => health({ settings, running: mainOf(entry) !== undefined })).pipe(
+          Effect.timeoutOrElse({
+            duration: healthTimeoutMs,
+            orElse: () => Effect.succeed(own(`${entry.def.name}'s health check did not finish`, `It took longer than ${Math.round(healthTimeoutMs / 1000)} s.`))
+          }),
+          Effect.catchCause((cause) =>
+            Cause.hasInterruptsOnly(cause)
+              ? Effect.interrupt
+              : Effect.succeed(own(`${entry.def.name}'s health check failed`, Cause.pretty(cause).split("\n")[0] ?? ""))
+          ),
+          Effect.flatMap((list) => Effect.sync(() => issues.set(source, normaliseIssues(entry, list))))
+        )
+      }),
+    { concurrency: "unbounded", discard: true }
+  )
+
+  /** The instance an action lookup uses: the assistant's own one, or the main one. */
+  const instanceUsedBy = (entry: Entry, assistantId: string | undefined): Instance | undefined => {
+    if (entry.unavailable !== undefined) return undefined
+    return assistantId !== undefined && entry.demand !== undefined ? instanceFor(entry, assistantId) : mainOf(entry)
+  }
+
+  /** The assistant may use this action (the gateway's own first two checks, so the catalogue lists what would run). */
+  const offered = (assistantId: string | undefined, entry: Entry, action: RegisteredAction) => {
+    const access = options.access
+    if (assistantId === undefined || access === undefined) return true
+    return access.moduleOn(assistantId, entry.def.id) && !access.toolOff(assistantId, entry.def.id, actionToolName(entry.def.id, action.definition.id))
+  }
+
+  const catalogEntry = (entry: Entry, action: RegisteredAction): CatalogAction => {
+    const d = action.definition
+    return {
+      moduleId: entry.def.id,
+      actionId: d.id,
+      id: action.id,
+      label: d.label,
+      description: d.description,
+      examples: [...(d.examples ?? [])],
+      params: Object.entries(d.params as ActionParams).map(([name, p]) => ({ name, kind: p.kind, label: p.label, optional: p.optional === true })),
+      speculative: d.speculative === true,
+      confirm: d.confirm !== undefined && d.confirm !== false,
+      ...toolMetadata(d)
+    }
+  }
+
+  /** The turn's catalogue: each module's actions from the instance the turn's assistant uses, as the gateway would admit them. */
+  const catalogOf = (assistantId: string | undefined) =>
+    entries.flatMap((entry) => {
+      const running = instanceUsedBy(entry, assistantId)?.running
+      if (running === undefined) return []
+      return running.actions.filter((a) => offered(assistantId, entry, a)).map((action) => ({ entry, action }))
+    })
+
+  const actions: ModuleHostApi["actions"] = {
+    list: Effect.gen(function*() {
+      const turn = yield* CurrentTurn
+      return catalogOf(turn?.assistantId).map(({ action, entry }) => catalogEntry(entry, action))
+    }),
+    run: (request: ActionRunRequest) =>
+      Effect.gen(function*() {
+        const refuse = (code: Extract<ActionRunResult, { ok: false }>["code"], message: string): ActionRunResult => ({ ok: false, code, message })
+        const entry = byId.get(request.moduleId)
+        if (entry === undefined) return refuse("unknown_module", `There is no module "${request.moduleId}"`)
+        const turn = yield* CurrentTurn
+        const running = instanceUsedBy(entry, turn?.assistantId)?.running
+        if (running === undefined) {
+          return turn?.assistantId !== undefined && mainOf(entry) !== undefined && entry.unavailable === undefined
+            ? refuse("refused", `Not run: the ${entry.def.id} module is not on for this assistant.`)
+            : refuse("not_running", `${entry.def.name} is not running`)
+        }
+        const action = running.actions.find((a) => a.definition.id === request.actionId)
+        if (action === undefined) return refuse("unknown_action", `${entry.def.name} has no action "${request.actionId}"`)
+        const def = action.definition
+        if (def.confirm !== undefined && def.confirm !== false) {
+          return refuse("needs_confirmation", `${def.label} needs the owner's spoken confirmation, which only a conversation can ask for`)
+        }
+        let values: Record<string, unknown>
+        try {
+          values = checkedActionValues(action, request.params)
+        } catch (error) {
+          return refuse("invalid_params", error instanceof Error ? error.message : String(error))
+        }
+        // Through the execution gateway, like every other way of running an action.
+        return yield* gateway.action(action, values).pipe(
+          Effect.timeoutOrElse({
+            duration: ACTION_TIMEOUT_MS,
+            orElse: () => Effect.fail(new ActionError({ message: `${def.label} did not finish within ${ACTION_TIMEOUT_MS / 1000} s` }))
+          }),
+          Effect.map((outcome): ActionRunResult => {
+            const say = (outcome as ActionOutcome | undefined)?.say
+            return say !== undefined ? { ok: true, say } : { ok: true }
+          }),
+          Effect.catch((error) => Effect.succeed(refuse(isGatewayRefusal(error) ? "refused" : "failed", error.message))),
+          Effect.catchDefect((defect) => Effect.succeed(refuse("failed", `${def.label} crashed: ${String(defect)}`)))
+        )
+      })
+  }
+
+  const view = (): HostView => ({
+    modules: entries.map((e) => ({
+      id: e.def.id,
+      name: e.def.name,
+      kind: e.def.kind ?? "capability",
+      state: stateOf(e).state,
+      ...(e.def.version !== undefined ? { version: e.def.version } : {}),
+      ...(e.unavailable !== undefined ? { unavailable: e.unavailable.reason } : {})
+    })),
+    vaultLocked: options.view?.vaultLocked?.(),
+    engine: options.view?.engine?.(),
+    devices: options.view?.devices?.() ?? [],
+    home: options.view?.home?.() ?? {}
+  })
+
+  // -- The shared part (version 2): once per module while it is demanded --------------------------------------------
+
+  /** Scopes of shared parts started and not yet published or closed (closed at shutdown). */
+  const pendingShared = new Set<Scope.Closeable>()
+
+  /**
+   * Demanded: wanted (its switch, or an assistant has it on), or named in `uses` by a demanded module (transitively).
+   * A module that cannot run here is never demanded.
+   */
+  const isDemanded = (target: Entry): boolean => {
+    if (target.unavailable !== undefined) return false
+    const reached = new Set<Entry>()
+    const stack = entries.filter((e) => e.unavailable === undefined && wanted(e))
+    while (stack.length > 0) {
+      const e = stack.pop()!
+      if (reached.has(e)) continue
+      reached.add(e)
+      if (e === target) return true
+      for (const id of e.def.uses ?? []) {
+        const used = byId.get(id)
+        if (used !== undefined && used.unavailable === undefined && !reached.has(used)) stack.push(used)
+      }
+    }
+    return false
+  }
+
+  /** The shared settings: everything resolved except the fields an assistant may own; the key is their non-secret values. */
+  const sharedSettingsOf = (entry: Entry, stored = entry.stored, secrets = entry.secrets) => {
+    const resolved = resolve(entry, stored, secrets)
+    const owned = new Set(overridableKeys(entry.def.settings))
+    const without = (record: Readonly<Record<string, unknown>>) => Object.fromEntries(Object.entries(record).filter(([k]) => !owned.has(k)))
+    return {
+      key: JSON.stringify(without(resolved.form.values)),
+      settings: resolved.value === undefined ? undefined : without(resolved.value as Record<string, unknown>),
+      errors: resolved.form.errors
+    }
+  }
+
+  /** A service of `part` that another module's published shared part already provides (or that `part` provides twice). */
+  const serviceClash = (entry: Entry, part: SharedPart<unknown>): string | undefined => {
+    const ids = (part.services ?? []).map((p) => p.key.id)
+    const twice = ids.find((id, i) => ids.indexOf(id) !== i)
+    if (twice !== undefined) return `The module provides the service "${twice}" twice`
+    for (const other of entries) {
+      if (other === entry || other.shared === undefined) continue
+      const taken = ids.find((id) => (other.shared!.part.services ?? []).some((p) => p.key.id === id))
+      if (taken !== undefined) return `The service "${taken}" is already provided by module ${other.def.name}`
+    }
+    return undefined
+  }
+
+  const closeShared = (run: SharedRun): Effect.Effect<void> =>
+    Effect.suspend(() => {
+      pendingShared.delete(run.scope)
+      return Scope.close(run.scope, Exit.void)
+    })
+
+  /** Close a replaced or no longer demanded shared part after the grace period (calls in flight finish). */
+  const retireShared = (entry: Entry, run: SharedRun): Effect.Effect<void> =>
+    Effect.suspend(() => {
+      retired.add(run.scope)
+      entry.retiring++
+      return Effect.asVoid(Effect.forkIn(
+        Effect.sleep(graceMs).pipe(
+          Effect.andThen(Scope.close(run.scope, Exit.void)),
+          Effect.ensuring(Effect.sync(() => {
+            retired.delete(run.scope)
+            entry.retiring--
+            if (entry.instances.size === 0 && entry.retiring === 0 && entry.leaving.size === 0) notify(entry)
+          }))
+        ),
+        hostScope
+      ))
+    })
+
+  /**
+   * Make `run` the module's published shared part (its services and contributions are looked up from now on) and
+   * retire the one it replaces. Returns the clash, if another module provides one of its services by now.
+   */
+  const publishShared = (entry: Entry, run: SharedRun): Effect.Effect<string | undefined> =>
+    Effect.suspend(() => {
+      if (entry.shared === run) return Effect.succeed(undefined)
+      const clash = serviceClash(entry, run.part)
+      if (clash !== undefined) return Effect.succeed(clash)
+      const old = entry.shared
+      entry.shared = run
+      entry.sharedError = undefined
+      pendingShared.delete(run.scope)
+      return Effect.as(old === undefined ? Effect.void : retireShared(entry, old), undefined)
+    })
+
+  /**
+   * The shared part the module's instances should get: the published one while its shared settings are unchanged
+   * (and not `force`d), else a new one, started (10 s) but not published: the caller publishes it with an instance,
+   * or closes it. A start that fails, or a service another module provides already, is a start error.
+   */
+  const prepareShared = (
+    entry: Entry,
+    prepareOptions: { readonly stored?: Readonly<Record<string, unknown>>; readonly secrets?: Readonly<Record<string, string>>; readonly force?: boolean } = {}
+  ): Effect.Effect<SharedPrepared> =>
+    Effect.suspend((): Effect.Effect<SharedPrepared> => {
+      const shared = entry.def.shared
+      if (shared === undefined) return Effect.succeed({ ok: true, run: undefined, fresh: false })
+      const { errors, key, settings } = sharedSettingsOf(entry, prepareOptions.stored, prepareOptions.secrets)
+      if (prepareOptions.force !== true && entry.shared?.key === key) return Effect.succeed({ ok: true, run: entry.shared, fresh: false })
+      if (settings === undefined) {
+        return Effect.succeed({ ok: false, message: `The settings are not valid: ${errors.map((e) => e.message).join("; ")}` })
+      }
+      return Effect.uninterruptibleMask((restore) =>
+        Effect.flatMap(Scope.make(), (scope) => {
+          pendingShared.add(scope)
+          const context = { settings: settings as never, ...servicesFor(entry, "all") }
+          return restore(
+            Effect.suspend(() => shared(context)).pipe(
+              Scope.provide(scope),
+              Effect.timeoutOrElse({
+                duration: startTimeoutMs,
+                orElse: () => Effect.fail(new ModuleStartError({ message: `Its shared part did not start within ${Math.round(startTimeoutMs / 1000)} s` }))
+              })
+            )
+          ).pipe(
+            Effect.exit,
+            Effect.flatMap((exit): Effect.Effect<SharedPrepared> => {
+              if (Exit.isFailure(exit)) return Effect.as(closeShared({ key, scope, part: { value: undefined } }), { ok: false, message: describeStartFailure(exit.cause) })
+              const clash = serviceClash(entry, exit.value)
+              if (clash !== undefined) return Effect.as(closeShared({ key, scope, part: exit.value }), { ok: false, message: clash })
+              return Effect.succeed({ ok: true, run: { key, scope, part: exit.value }, fresh: true })
+            })
+          )
+        })
+      )
+    })
+
+  const service = <T>(key: ServiceKey<T>): T | undefined => {
+    for (const entry of entries) {
+      const found = entry.shared?.part.services?.find((p) => p.key.id === key.id)
+      if (found !== undefined) return found.service as T
+    }
+    return undefined
+  }
+
+  const contributions = <T>(key: ContributionKey<T>): ReadonlyArray<T> =>
+    entries.flatMap((entry) => (entry.shared?.part.contributions ?? []).filter((c) => c.key.id === key.id).map((c) => c.value as T))
+
+  // -- Restarts ------------------------------------------------------------------------------------------------------
+
+  /** Restarts asked for and not yet started (one per instance; repeated requests count once). */
+  const pendingRestarts = new Set<Instance>()
+
+  /** Start `rec` again with its settings; publish it and retire the old one, or keep the old one and say why. */
+  const restartInstance = (entry: Entry, rec: Instance, generation: number, reason: string): Effect.Effect<HostResult> =>
+    Effect.gen(function*() {
+      const old = rec.running
+      if (old === undefined || old.generation !== generation || entry.instances.get(rec.key) !== rec) return OK
+      const group = groupsOf(entry).find((g) => g.key === rec.key)
+      if (group === undefined || group.resolved.value === undefined) return OK
+      yield* Effect.logInfo(`Module ${entry.def.id} is being started again: ${reason}`)
+      const failed = (message: string): HostResult => {
+        entry.restartError = message
+        notify(entry)
+        return failure("module_start_failed", message, { moduleId: entry.def.id })
+      }
+      return yield* startInstance(entry, rec, group.resolved.value, entry.shared, (result): Effect.Effect<HostResult> => {
+        if (!result.ok) return Effect.succeed(failed(result.message))
+        if (entry.instances.get(rec.key) !== rec || rec.running !== old) return Effect.as(Scope.close(result.running.scope, Exit.void), OK)
+        const clash = publish(entry, [[rec, result.running]])
+        if (clash !== undefined) return Effect.as(Scope.close(result.running.scope, Exit.void), failed(clash))
+        rec.status = result.status
+        entry.restartError = undefined
+        notify(entry)
+        return Effect.as(retire(entry, old), OK)
+      })
+    })
+
+  /** Wait (up to 10 s) for the module's other operation to end, then restart. */
+  const restartWhenFree = (entry: Entry, run: (e: Entry) => Effect.Effect<HostResult>, attempt: number): Effect.Effect<void> =>
+    Effect.suspend(() => {
+      if (!entry.busy) return Effect.asVoid(exclusive(entry.def.id, run))
+      if (attempt >= 40) return Effect.logWarning(`Module ${entry.def.id} asked to be started again, but it stayed busy; not restarted`)
+      return Effect.andThen(Effect.sleep(250), restartWhenFree(entry, run, attempt + 1))
+    })
+
+  /** `requestRestart` of one instance (from its `start`), or of every running instance (from `shared`). */
+  const requestRestart = (entry: Entry, target: { readonly rec: Instance; readonly generation: number } | "all", reason: string): Effect.Effect<void> =>
+    Effect.suspend(() => {
+      const recs = target === "all"
+        ? [...entry.instances.values()].filter((r) => r.running !== undefined).map((rec) => ({ rec, generation: rec.running!.generation }))
+        : target.rec.running?.generation === target.generation ? [target] : []
+      const todo = recs.filter(({ rec }) => !pendingRestarts.has(rec))
+      if (todo.length === 0) return Effect.void
+      for (const { rec } of todo) pendingRestarts.add(rec)
+      const run = (e: Entry) =>
+        Effect.map(Effect.forEach(todo, ({ generation, rec }) => restartInstance(e, rec, generation, reason)), (results) => results.find((r) => !r.ok) ?? OK)
+      const work = restartWhenFree(entry, run, 0).pipe(Effect.ensuring(Effect.sync(() => {
+        for (const { rec } of todo) pendingRestarts.delete(rec)
+      })))
+      return Effect.asVoid(Effect.forkIn(work, hostScope))
+    })
+
+  /**
+   * The context members of a version 2 module, in `shared` (`target` "all") and in `start` (one instance). A later PR
+   * adds its member here, one line, and its field in `ModuleServicesV2`.
+   */
+  function servicesFor(entry: Entry, target: { readonly rec: Instance; readonly generation: number } | "all"): ModuleServicesV2 {
+    return {
+      host: {
+        view,
+        service,
+        contributions,
+        actions,
+        requestRestart: (reason) => requestRestart(entry, target, reason)
+      }
+    }
+  }
+
+  for (const entry of entries) issues.set(`module:${entry.def.id}`, moduleIssues(entry))
+  if (entries.some((e) => e.unavailable !== undefined)) rebuild()
 
   const settingOptions = (id: string): Readonly<Record<string, ReadonlyArray<ChoiceOption>>> | undefined => {
     const entry = byId.get(id)
@@ -1014,6 +1779,14 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
   }
 
   return {
+    issues,
+    recheck,
+    checkHealth,
+    actions,
+    view,
+    service,
+    contributions,
+    gateway,
     fieldAction,
     settingOptions,
     setSecrets,

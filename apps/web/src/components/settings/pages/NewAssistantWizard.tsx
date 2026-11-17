@@ -1,6 +1,6 @@
 "use client"
 import { useEffect, useRef, useState } from "react"
-import type { Assistant, AssistantInfo, DeviceTarget, FieldError } from "@pva/protocol"
+import type { Assistant, AssistantInfo, AssistantTemplate, DeviceTarget, FieldError } from "@pva/protocol"
 import {
   accountInfo,
   blankAssistantBody,
@@ -64,6 +64,10 @@ const NO_PLACEMENT: Placement = { on: false, phrase: "" }
  */
 export const BLANK_START = "(blank)"
 
+/** Start from › a module's template (protocol 9), as the radio value: `template:<moduleId>.<id>`, never an assistant id. */
+export const templateStart = (id: string): string => `template:${id}`
+const templateOfStart = (value: string): string | undefined => (value.startsWith("template:") ? value.slice("template:".length) : undefined)
+
 export function NewAssistantWizard() {
   const client = useClient()
   const part = useClientState((s) => s.ui.settingsPath[2])
@@ -77,6 +81,8 @@ export function NewAssistantWizard() {
   const inset = useKeyboardInset()
   const moduleList = modules.order.flatMap((id) => (modules.byId[id] !== undefined ? [modules.byId[id]!] : []))
   const capability = moduleList.filter((m) => m.kind === undefined || m.kind === "capability")
+  /** The assistants the modules suggest (`ModuleInfo.templates`), in catalog order. */
+  const templates: ReadonlyArray<AssistantTemplate> = moduleList.flatMap((m) => m.templates ?? [])
 
   /** A blank assistant: the Claude API, Parakeet v2, the Lessac voice and the Clock module (the mock-up's "Good defaults"). */
   const blank = (): Assistant => ({
@@ -98,6 +104,8 @@ export function NewAssistantWizard() {
   const draft = useWizardDraft(blank, () => creating.current)
   const a = draft.current
   const [from, setFrom] = useState(BLANK_START)
+  /** The wake phrase the chosen template suggests: given to a place ticked in step 6 whose phrase is still empty. */
+  const [suggested, setSuggested] = useState("")
   const [where, setWhere] = useState<Readonly<Record<string, Placement>>>({})
   const [busy, setBusy] = useState(false)
   const [whereMessage, setWhereMessage] = useState<string | undefined>()
@@ -127,10 +135,36 @@ export function NewAssistantWizard() {
   const chooseFrom = (id: string) => {
     if (creating.current) return
     setFrom(id)
+    const template = templateOfStart(id)
+    if (template !== undefined) return fromTemplate(templates.find((t) => t.id === template))
+    setSuggested("")
     const source = id === BLANK_START ? undefined : assistants.find((x) => x.id === id)
     const fresh = blank()
     const body = source === undefined ? toBody(fresh) : toBody(source)
     draft.replace({ ...a, ...body, name: a.name, purpose: a.purpose, handles: a.handles, on: true, confirmActions: "off" })
+  }
+
+  /**
+   * Start from a template: good defaults with the template's prompt and its modules on (the others off); its name,
+   * purpose and Handles fill only what has not been typed. Nothing else of the template is kept once it is created.
+   */
+  const fromTemplate = (t: AssistantTemplate | undefined) => {
+    if (t === undefined) return
+    const fresh = toBody(blank())
+    const on = new Set(t.modules)
+    const mods = Object.fromEntries(capability.map((m) => [m.id, { on: on.has(m.id), offTools: [] }]))
+    setSuggested(t.suggestedPhrases?.[0] ?? "")
+    draft.replace({
+      ...a,
+      ...fresh,
+      name: a.name.trim() === "" ? t.name : a.name,
+      purpose: a.purpose.trim() === "" ? t.purpose ?? "" : a.purpose,
+      handles: a.handles.trim() === "" ? t.handles ?? "" : a.handles,
+      prompt: t.prompt,
+      modules: mods,
+      on: true,
+      confirmActions: "off"
+    })
   }
 
   const create = async (saveAnyway = false) => {
@@ -150,7 +184,7 @@ export function NewAssistantWizard() {
     const body = { ...toBody(a), name: a.name.trim() }
     let outcome: Outcome
     try {
-      outcome = await client.createAssistant(body, { ...(from !== BLANK_START ? { copyOf: from } : {}), placements, ...(saveAnyway ? { saveAnyway: true } : {}) }) // continuation(identity): only this page's own state; it navigates only while this wizard is still mounted (`alive`)
+      outcome = await client.createAssistant(body, { ...(from !== BLANK_START && templateOfStart(from) === undefined ? { copyOf: from } : {}), placements, ...(saveAnyway ? { saveAnyway: true } : {}) }) // continuation(identity): only this page's own state; it navigates only while this wizard is still mounted (`alive`)
     } catch {
       outcome = { kind: "refused", code: "internal", message: "Could not create it. Try again." }
     }
@@ -207,10 +241,23 @@ export function NewAssistantWizard() {
                   title: `Copy of ${x.name}`,
                   tags: [] as [],
                   description: <Strip as="span" parts={summaryParts(x, moduleList, names, voiceName(x.voice))} marks={summaryMarks(x)} className="text-ink-faint" />
+                })),
+                ...templates.map((t) => ({
+                  value: templateStart(t.id),
+                  title: t.name,
+                  tags: [] as [],
+                  description: [
+                    t.purpose,
+                    `Modules: ${listJoin(t.modules.map((id) => modules.byId[id]?.name ?? id))}`,
+                    t.suggestedPhrases !== undefined && t.suggestedPhrases.length > 0 ? `Suggests ${listJoin(t.suggestedPhrases.map(quoted))}` : undefined
+                  ].filter((x) => x !== undefined && x !== "").join(" · ")
                 }))
               ]}
             />
-            <p className="text-[13px] text-ink-muted">A copy takes the prompt, language model, hearing, voice and modules. Devices are not copied.</p>
+            <p className="text-[13px] text-ink-muted">
+              A copy takes the prompt, language model, hearing, voice and modules. Devices are not copied.
+              {templates.length > 0 && " A suggestion from a module takes its prompt and modules; the rest has good defaults."}
+            </p>
           </div>
         </>
       )}
@@ -277,7 +324,11 @@ export function NewAssistantWizard() {
                           role="checkbox"
                           aria-checked={w.on}
                           aria-label={`${r.name}${r.defaults ? " (defaults)" : ""}`}
-                          onClick={() => editWhere((s) => ({ ...s, [key]: { ...(s[key] ?? NO_PLACEMENT), on: !w.on } }))}
+                          onClick={() => editWhere((s) => {
+                            const was = s[key] ?? NO_PLACEMENT
+                            // A template's suggested phrase fills a place that has none yet.
+                            return { ...s, [key]: { ...was, on: !w.on, phrase: !w.on && was.phrase.trim() === "" ? suggested : was.phrase } }
+                          })}
                           className="flex min-h-11 items-start gap-3 text-left"
                           data-testid="where-check"
                         >

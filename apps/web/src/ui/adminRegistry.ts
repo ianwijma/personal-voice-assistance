@@ -6,6 +6,7 @@ import { AssistantsPage } from "@/components/settings/pages/AssistantsPage.tsx"
 import { NewAssistantWizard } from "@/components/settings/pages/NewAssistantWizard.tsx"
 import { DevicePage, DevicesPage } from "@/components/settings/pages/DevicesPages.tsx"
 import { LatencyPage, ProblemsPage } from "@/components/settings/pages/DiagnosticsPages.tsx"
+import { HealthPage } from "@/components/settings/pages/HealthPage.tsx"
 import { SpeechModelsPage, VoiceModelsPage } from "@/components/settings/pages/ModelsPages.tsx"
 import { OverridesPage } from "@/components/settings/pages/OverridesPage.tsx"
 import { OverviewPage } from "@/components/settings/pages/OverviewPage.tsx"
@@ -32,6 +33,7 @@ export const settingsPages: ReadonlyArray<SettingsPageEntry> = [
   { group: "devices", id: "device", title: "Device", order: 100, perItem: true, component: DevicePage },
   { group: "keys", id: "access", title: "Vault", description: "The encrypted file that keeps the keys, and its password.", order: 10, component: VaultPage },
   { group: "keys", id: "keys", title: "Keys", description: "Every key, whether it is set, and what uses it.", order: 20, component: KeysListPage },
+  { group: "diagnostics", id: "health", title: "Health", description: "What is missing or wrong on this server, and how to fix it.", order: 10, component: HealthPage },
   { group: "diagnostics", id: "latency", title: "Latency", description: "How fast the last replies started.", order: 20, wide: true, component: LatencyPage },
   { group: "diagnostics", id: "problems", title: "Problems", description: "Engines and modules that could not start.", order: 30, component: ProblemsPage },
   { group: "diagnostics", id: "overrides", title: "Settings from outside", description: "What .env and the environment set, and moving it into the settings.", order: 40, component: OverridesPage },
