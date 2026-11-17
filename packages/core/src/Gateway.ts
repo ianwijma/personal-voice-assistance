@@ -5,6 +5,7 @@ import { declaredSensitivity, riskOf, type Sensitivity, type Tool, type ToolLate
 import {
   type ConnectionRef,
   CurrentJob,
+  CurrentPrincipal,
   CurrentTurn,
   LOCAL_PRINCIPAL,
   type Principal,
@@ -19,9 +20,14 @@ import {
  * here; later a phrase command, a tap on a presentation, a routine step and a notification action do too.
  *
  * For every call it resolves **on whose behalf** it runs (`Principal`): the explicit one a caller passes (a
- * notification, P9), else the turn (`CurrentTurn`), else the job (`CurrentJob`), else, only in the CLI modes
- * (`withoutPrincipal: "local"`), the local principal. In serve mode a call with none of them is refused: a missing
- * context never means "allowed". It then validates the input (a generated action tool's input is turned into the
+ * notification, P9), else the turn (`CurrentTurn`), else the job (`CurrentJob`), else the principal of the gateway
+ * call this one is made from (`CurrentPrincipal`: a local or notification call's nested calls), else, only in the CLI
+ * modes (`withoutPrincipal: "local"`), the local principal. In serve mode a call with none of them is refused: a
+ * missing context never means "allowed"; so is a principal with missing parts (a turn without an assistant or a
+ * device, a tool that belongs to no module, what `GatewayAccess.principalProblem` refuses), never treated like an
+ * intentionally assistant-independent call. The admitted call then **runs as that principal**: `execute` and `run`
+ * see exactly its `CurrentTurn`, `CurrentJob` and `CurrentPrincipal` (a different ambient turn is replaced, a turn is
+ * cleared for a job, local or notification call), and so do the calls they make. It then validates the input (a generated action tool's input is turned into the
  * values `run` receives **once**, and those exact values are admitted and run), works out the call's risk,
  * sensitivity and latency, and admits it or refuses it, checking in this order:
  *
@@ -45,6 +51,11 @@ export interface GatewayAccess {
   readonly moduleOn: (assistantId: string, moduleId: string) => boolean
   /** The tool (an action's generated tool name for an action) is switched off for the assistant. */
   readonly toolOff: (assistantId: string, moduleId: string, toolName: string) => boolean
+  /**
+   * Serve mode's own check that a principal's parts belong together (the assistant exists, the device is known): a
+   * reason refuses the call before any other check. Absent: only completeness is checked.
+   */
+  readonly principalProblem?: (principal: Principal) => string | undefined
 }
 
 /** One call, as the checks see it. */
@@ -155,12 +166,42 @@ export const makeExecutionGateway = (options: GatewayOptions = {}): ExecutionGat
     if (turn !== undefined) return Effect.succeed({ _tag: "turn", turn })
     return Effect.flatMap(CurrentJob, (job): Effect.Effect<Resolved> => {
       if (job !== undefined) return Effect.succeed({ _tag: "job", job })
-      return withoutPrincipal === "local" ? local : noPrincipal
+      return Effect.flatMap(CurrentPrincipal, (outer): Effect.Effect<Resolved> => {
+        // A call made from inside a local or notification call runs for it (a turn or job one is read above).
+        if (outer !== undefined && (outer._tag === "local" || outer._tag === "notification")) return Effect.succeed(outer)
+        return withoutPrincipal === "local" ? local : noPrincipal
+      })
     })
   })
 
+  /**
+   * Serve mode (with `access`): a principal with missing parts is refused, never admitted by a more permissive rule.
+   * A turn names its assistant and device; a job or a notification names what it belongs to; a call for an assistant
+   * names the module of its tool (a tool of no module cannot be checked against the assistant's choices).
+   */
+  const incompletePrincipal = (p: Principal): string | undefined => {
+    if (access === undefined) return undefined
+    const blank = (s: string | undefined) => s === undefined || s.trim() === ""
+    if (p._tag === "turn") {
+      if (blank(p.turn.assistantId)) return "the turn names no assistant."
+      if (blank(p.turn.deviceId)) return "the turn names no device."
+    } else if (p._tag === "job") {
+      if (blank(p.job.jobId) || blank(p.job.moduleId)) return "the job names no job or module."
+    } else if (p._tag === "notification") {
+      if (blank(p.notification.notificationId) || blank(p.notification.deviceId)) return "the notification names no notification or device."
+    }
+    return access.principalProblem?.(p)
+  }
+  const incomplete = (call: GatewayCall): string | undefined => {
+    if (access === undefined) return undefined
+    if (call.assistantId !== undefined && call.moduleId === undefined) return `${call.name} belongs to no module, so the assistant's choices cannot be checked.`
+    return incompletePrincipal(call.principal)
+  }
+
   const admit = (call: GatewayCall): Effect.Effect<GatewayDecision> =>
     Effect.suspend(() => {
+      const problem = incomplete(call)
+      if (problem !== undefined) return Effect.succeed(refuse(problem))
       if (access !== undefined && call.assistantId !== undefined && call.moduleId !== undefined) {
         if (!access.moduleOn(call.assistantId, call.moduleId)) return Effect.succeed(refuse(`the ${call.moduleId} module is not on for this assistant.`))
         if (access.toolOff(call.assistantId, call.moduleId, call.name)) return Effect.succeed(refuse(`${call.name} is switched off for this assistant.`))
@@ -230,14 +271,14 @@ export const makeExecutionGateway = (options: GatewayOptions = {}): ExecutionGat
         if (typeof call === "string") return yield* new ToolError({ message: `Not run: ${call}`, cause: new GatewayRefused({ reason: call }) })
         const decision = yield* admit(call)
         if (decision._tag === "Refuse") return yield* new ToolError({ message: `Not run: ${decision.reason}`, cause: new GatewayRefused({ reason: decision.reason }) })
-        return yield* runActionForTool(registered, values)
+        return yield* asPrincipal(principal, runActionForTool(registered, values))
       }
       const call = callOf({ kind: "tool", moduleId, name: t.name, input, confirmed: false }, t, principal)
       if (typeof call === "string") return yield* new ToolError({ message: `Not run: ${call}`, cause: new GatewayRefused({ reason: call }) })
       const decision = yield* admit(call)
       if (decision._tag === "Refuse") return yield* new ToolError({ message: `Not run: ${decision.reason}`, cause: new GatewayRefused({ reason: decision.reason }) })
       // Suspended: a tool that throws while building its effect is a defect, as before.
-      return yield* Effect.suspend(() => t.execute(input))
+      return yield* asPrincipal(principal, Effect.suspend(() => t.execute(input)))
     })
 
   const action: ExecutionGateway["action"] = (registered, values, actionOptions = {}) =>
@@ -260,11 +301,29 @@ export const makeExecutionGateway = (options: GatewayOptions = {}): ExecutionGat
       if (typeof call === "string") return yield* new ActionError({ message: `Not run: ${call}`, cause: new GatewayRefused({ reason: call }) })
       const decision = yield* admit(call)
       if (decision._tag === "Refuse") return yield* new ActionError({ message: `Not run: ${decision.reason}`, cause: new GatewayRefused({ reason: decision.reason }) })
-      return yield* Effect.suspend(() => def.run(values as never))
+      return yield* asPrincipal(principal, Effect.suspend(() => def.run(values as never)))
     })
 
-  return { admit, tool, action, principal: principalNow }
+  // The principal a call made now would run for: refused (serve mode) when it has missing parts, as `admit` would.
+  const principal: Effect.Effect<Resolved> = Effect.map(principalNow, (p): Resolved => {
+    if ("refused" in p) return p
+    const problem = incompletePrincipal(p)
+    return problem === undefined ? p : { refused: problem }
+  })
+
+  return { admit, tool, action, principal }
 }
+
+/**
+ * Run `effect` as `principal`: exactly its turn or job (an ambient one of someone else is replaced, cleared for a local
+ * or notification call) and the principal itself, for the calls it makes in turn.
+ */
+export const asPrincipal = <A, E, R>(principal: Principal, effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> =>
+  effect.pipe(
+    Effect.provideService(CurrentTurn, principal._tag === "turn" ? principal.turn : undefined),
+    Effect.provideService(CurrentJob, principal._tag === "job" ? principal.job : undefined),
+    Effect.provideService(CurrentPrincipal, principal)
+  )
 
 /** The gateway of a registry made without one (tests, hand-made registries): no access checks, no hooks, local. */
 export const defaultGateway: ExecutionGateway = makeExecutionGateway()

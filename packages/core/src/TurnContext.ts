@@ -114,6 +114,16 @@ export type Principal =
 /** The local principal of the CLI modes. */
 export const LOCAL_PRINCIPAL: Principal = { _tag: "local" }
 
+/**
+ * The principal a call runs for, as the execution gateway admitted it: provided (with the matching `CurrentTurn` and
+ * `CurrentJob`) around every `execute` and `run` it admits, so code inside it, and the calls it makes in turn
+ * (`host.actions.run`, a service), act for exactly that principal, a local or notification one included. Outside a
+ * gateway call it is `undefined`. Read by the gateway after `CurrentTurn` and `CurrentJob`.
+ */
+export const CurrentPrincipal = Context.Reference<Principal | undefined>("@pva/core/CurrentPrincipal", {
+  defaultValue: () => undefined
+})
+
 /** The context of one turn: its origin plus what `Conversation` knows. */
 export const makeTurnContext = (
   turn: { readonly turnId: number; readonly conversationId: string; readonly source: TurnSource },

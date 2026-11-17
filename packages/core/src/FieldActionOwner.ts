@@ -10,13 +10,13 @@ import { Effect, type Exit, Fiber, Option } from "effect"
  *   old press can never free a newer one's.
  * - `inFlight` says what still runs.
  * - `stop` refuses new presses, interrupts those in flight and waits until each has ended (logging one whose cleanup
- *   overruns `cleanupMs`, still waiting). The host runs it before the owner's resources close: an instance's owner
- *   is the first finalizer to run when the instance's scope closes (its retirement after the grace period, or
- *   shutdown); the host's own at shutdown before any scope closes.
+ *   overruns `cleanupMs`, still waiting).
  *
- * The host's call sites (ModuleHost.ts): `makeFieldActionOwner` once for the host and once per started instance in
- * `startCandidate` (whose scope gets its `stop`), `start` in `fieldAction`, and the host's `stop` in the shutdown
- * finalizer.
+ * The owners belong to the reconciler's parts (ModuleHost.ts): every instance part is made with its own owner, and
+ * `closePart` stops it before it closes the part's scope (a retired instance after its grace period, a discarded
+ * candidate at once, everything at shutdown, instances before their shared part and consumers before providers), so a
+ * press has ended before anything it may use is released. The host's own owner (definition handlers) is made with
+ * the host and stopped first when the host closes; from then on no press is admitted.
  */
 /** How a press went (`FieldActionOwner.start`). */
 export type PressOutcome<A, E> =
@@ -38,8 +38,8 @@ export interface FieldActionOwner {
 }
 
 export const makeFieldActionOwner = (options: {
-  /** For the log: "field action <module>" and the key. */
-  readonly label: string
+  /** For the log: what the press of `key` is called ("field action <module>.<key>"). */
+  readonly label: (key: string) => string
   /** How long a stopped press's cleanup may take before it is logged (it is still waited for). */
   readonly cleanupMs: number
   /** A press ended (its key is free): the page may need the module again (`info` values). */
@@ -54,7 +54,7 @@ export const makeFieldActionOwner = (options: {
       Fiber.await(fiber).pipe(
         Effect.timeoutOption(options.cleanupMs),
         Effect.flatMap((done) =>
-          Option.isSome(done) ? Effect.void : Effect.logWarning(`${options.label}.${key}: still cleaning up ${options.cleanupMs} ms after it was ${why}; its button stays busy until it ends`)
+          Option.isSome(done) ? Effect.void : Effect.logWarning(`${options.label(key)}: still cleaning up ${options.cleanupMs} ms after it was ${why}; its button stays busy until it ends`)
         )
       )
     )

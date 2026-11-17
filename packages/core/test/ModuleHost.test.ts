@@ -118,13 +118,14 @@ describe("ModuleHost", () => {
       const fiber = yield* Effect.forkChild(h.enable("test"))
       yield* advance(10)
       assert.strictEqual(stateOf(h.modules()).state, "starting")
-      const busy = yield* h.disable("test")
-      assert.deepStrictEqual(busy.ok ? undefined : busy.error.code, "busy")
+      // A disable while it starts is not refused: it is the desired state from now on, applied after this pass.
+      const disabling = yield* Effect.forkChild(h.disable("test"))
       yield* advance(100)
       assert.deepStrictEqual(yield* Fiber.join(fiber), { ok: true })
-      assert.deepStrictEqual(seen.map((i) => i.state), ["starting", "running"])
+      assert.deepStrictEqual(yield* Fiber.join(disabling), { ok: true })
+      assert.deepStrictEqual(seen.slice(0, 3).map((i) => i.state), ["starting", "running", "stopping"])
       assert.isTrue(seen[1]!.revision > seen[0]!.revision)
-      assert.deepStrictEqual(saves, [{ id: "test", enabled: true, settings: {}, secrets: {} }])
+      assert.deepStrictEqual(saves, [{ id: "test", enabled: true, settings: {}, secrets: {} }, { id: "test", enabled: false, settings: {}, secrets: {} }])
       assert.deepStrictEqual(seen[1]!.tools, [{ name: "tool", description: "tool", speculative: true, risk: "read", risks: ["read"], sensitivity: "household", latency: "quick" }])
     }).pipe(Effect.scoped))
 
@@ -388,7 +389,7 @@ describe("ModuleHost: review findings", () => {
           })
     })
 
-  it.effect("finding 5: interrupting startEnabled closes the half-started module's scope and restores its state", () =>
+  it.effect("finding 5 (round 2): interrupting startEnabled's caller only stops its wait; closing the host mid-start closes the half-started scope once", () =>
     Effect.gen(function*() {
       const log: Array<string> = []
       const { persistence } = fakePersistence()
@@ -398,14 +399,19 @@ describe("ModuleHost: review findings", () => {
         yield* advance(10)
         assert.strictEqual(stateOf(h.modules(), "slow").state, "starting")
         yield* Fiber.interrupt(fiber)
-        assert.deepStrictEqual(log, ["closed"], "the resource was released on interruption")
-        assert.strictEqual(stateOf(h.modules(), "slow").state, "disabled")
-        const again = yield* Effect.forkChild(h.enable("slow"))
-        yield* advance(10)
-        yield* Fiber.interrupt(again)
-        assert.deepStrictEqual(log, ["closed", "closed"])
+        assert.strictEqual(stateOf(h.modules(), "slow").state, "starting", "the start goes on")
+        yield* advance(1_000)
+        assert.strictEqual(stateOf(h.modules(), "slow").state, "running")
+        assert.deepStrictEqual(log, [])
       }).pipe(Effect.scoped)
-      assert.deepStrictEqual(log, ["closed", "closed"], "nothing left for shutdown, nothing closed twice")
+      assert.deepStrictEqual(log, ["closed"], "closed at shutdown, once")
+      yield* Effect.gen(function*() {
+        const h = yield* makeModuleHost({ catalog: [slowStarter(log)], persistence, env: {} })
+        yield* Effect.forkChild(h.startEnabled)
+        yield* advance(10)
+        assert.strictEqual(stateOf(h.modules(), "slow").state, "starting")
+      }).pipe(Effect.scoped)
+      assert.deepStrictEqual(log, ["closed", "closed"], "a start in progress is closed when the host closes")
     }))
 
   it.effect("finding 5: a start that throws before returning its effect is a start failure, not a host crash", () =>

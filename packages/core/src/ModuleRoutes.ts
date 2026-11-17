@@ -7,7 +7,7 @@ import {
   type RouteMethod,
   type RouteTokenInfo
 } from "@pva/protocol"
-import { type Effect, Schema } from "effect"
+import { type Effect, Schema, type Scope } from "effect"
 
 /**
  * Module HTTP routes (docs/MODULES-PLAN.md §4 P3, docs/UI-AND-MODULES.md §1.11): what a version 2 module's `shared`
@@ -162,6 +162,17 @@ export const routeInfo = (moduleId: string, route: ModuleRoute): ModuleRouteInfo
   ratePerMinute: { ...DEFAULT_ROUTE_RATE, ...route.rateLimit },
   ...(route.description !== undefined ? { description: route.description } : {})
 })
+
+/** A route of a published shared part (`ModuleHost.routes`): the "route" registration kind's live table. */
+export interface PublishedRoute {
+  readonly moduleId: string
+  readonly route: ModuleRoute
+  /**
+   * The scope of the shared part that declared it: it closes when that part is closed (after the grace period of a
+   * restart or a stop). The app runs the route's handler in it (`Effect.forkIn`), so no handler outlives its part.
+   */
+  readonly scope: Scope.Scope
+}
 
 /** The parameters of `path` (segments after the module id) if `route` matches it, else `undefined`. */
 export const matchRoutePath = (route: ModuleRoute, segments: ReadonlyArray<string>): Readonly<Record<string, string>> | undefined => {

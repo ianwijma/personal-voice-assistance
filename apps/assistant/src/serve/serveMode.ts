@@ -342,7 +342,12 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       access: {
         moduleOn: (assistantId, moduleId) => !isCapability(moduleId) || assistantsNow().get(assistantId)?.modules[moduleId]?.on === true,
         toolOff: (assistantId, moduleId, toolName) =>
-          isCapability(moduleId) && (assistantsNow().get(assistantId)?.modules[moduleId]?.offTools.includes(toolName) ?? false)
+          isCapability(moduleId) && (assistantsNow().get(assistantId)?.modules[moduleId]?.offTools.includes(toolName) ?? false),
+        // The parts of a principal must belong together: an assistant that does not exist is no assistant to act for.
+        principalProblem: (principal) => {
+          const assistantId = principal._tag === "turn" ? principal.turn.assistantId : principal._tag === "job" ? principal.job.assistantId : undefined
+          return assistantId !== undefined && !assistantsNow().has(assistantId) ? `the assistant "${assistantId}" does not exist.` : undefined
+        }
       },
       // What modules may read about the assistant (`host.view()`): every read is a reference read or a small copy.
       view: {

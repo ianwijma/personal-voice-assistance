@@ -299,33 +299,38 @@ ModuleHostApi = {
   routeTokens: { mint(name, label): Effect<{ token, secret }>; list: Effect<RouteTokenInfo[]>; revoke(id): Effect<boolean> }  // P3
   view(): HostView                                  // module states, vault locked, engine summary, devices, Home values
   service<T>(key: ServiceKey<T>): T | undefined     // live; undefined while no demanded module provides it
-  contributions<T>(key: ContributionKey<T>): ReadonlyArray<T>
+  contributions<T>(key: ContributionKey<T>): Effect<ReadonlyArray<T>>   // for the calling fiber's principal (its context)
+  contributionsFor<T>(key, assistantId | undefined): ReadonlyArray<T>    // explicit, for native callbacks; undefined: all
   actions: { list: Effect<CatalogAction[]>; run(req): Effect<ActionRunResult> }  // the turn's (calling assistant's) catalogue
-  requestRestart(reason): Effect<void>             // an instance: that one; the shared part: a new generation
+  requestRestart(reason): Effect<void>             // an instance: that one; the shared part: a new generation; by part identity
   reportMissingProgram(tool): Effect<void>         // ENOENT/EACCES at run time: judged unavailable at once
 }
 Principal = { turn } | { job } | { local } | { notification }   // TurnContext.ts: on whose behalf a call runs
+CurrentPrincipal: Context.Reference<Principal | undefined>       // the admitted principal, around execute/run
 ```
 
 - **Two lifetimes.** `start` runs per distinct set of effective settings as before; `shared` runs once per module while
   it is demanded (an assistant has it on, its switch is on without demand, or a demanded module names it in `uses`,
   transitively), with the shared settings only (validated alone), and every instance gets its `value`. Services (one
   provider per key: a second is a start error) and contributions (any number; inside a turn only those of modules the
-  turn's assistant has on) come from `shared` and are looked up live. A shared part and its instances are a
-  **generation**: a changed shared setting or secret starts a new shared part and every instance while the old one
-  serves, one synchronous `commit` switches the snapshot to all of it at once, and the old generation (instances, then
-  shared part) closes after the grace period; a failure leaves the old one serving (an owner's change is refused and
-  not saved). Every start is a transaction: a candidate scope not published is closed on every exit, interruption
-  included. Modules are reconciled in `uses` order (a cycle is a catalogue error for its members) and demand is
-  re-evaluated for all of them after every change of switches, availability or the vault. Module code the host starts
-  (and `health()`, and retirement) runs without `CurrentTurn`/`CurrentJob`, whoever asked. The CLI modes run every
-  module whose saved switch is on, one instance each.
+  turn's assistant has on, read from the caller's own context) come from `shared` and are looked up live. A shared
+  part and its instances are a **generation**, published only if its shared part and every one of its instances
+  started; how the host gets there is the reconciler below. `settingsFor(assistantId)` is computed at the call from the
+  desired state: the generation's own shared values, the overridable ones as they are now. Module code the host starts
+  (and `health()`, and retirement) runs without `CurrentTurn`/`CurrentJob`/`CurrentPrincipal`, whoever asked. The CLI
+  modes run every module whose saved switch is on, one instance each, through the same host and gateway, and read the
+  snapshot at every turn's start (`apps/assistant/src/modules.ts`, `CliModules`).
 - **The execution gateway** (`packages/core/src/Gateway.ts`) is the one way to `Tool.execute` and `ActionDefinition.run`:
   `ToolRegistry.run` (core's tool loop, the Claude Code bridge), `ToolRegistry.runAction` (the intent agent, a
   confirmed action) and `host.actions.run`; later phrase commands, taps, routine steps and notification actions. Its
   admission takes a principal (`Principal`): the explicit one a caller passes (a notification, P9), else `CurrentTurn`,
-  else `CurrentJob`, else the local principal in the CLI modes (`ModuleHostOptions.localPrincipal`, default: without
-  `access`); in serve mode a call with none is refused. It validates the input (a generated action tool's input is
+  else `CurrentJob`, else the local or notification principal of the gateway call it is made from
+  (`CurrentPrincipal`), else the local principal in the CLI modes (`ModuleHostOptions.localPrincipal`, default: without
+  `access`); in serve mode a call with none is refused, and so is one with missing parts (a turn without an assistant
+  or a device, a job or notification without its ids, a tool of no module for an assistant, what
+  `GatewayAccess.principalProblem` refuses: serve mode refuses an assistant that does not exist). **The admitted call
+  runs as that principal**: `execute` and `run` see exactly its `CurrentTurn`, `CurrentJob` and `CurrentPrincipal`
+  (`asPrincipal`), and so do the calls they make. It validates the input (a generated action tool's input is
   resolved to the action's values once; those are admitted and run), resolves `risk` (a class, or `{ classes, of }`;
   an undeclared answer is refused; inferred `read` for speculative tools, else `change`), `sensitivity` (fixed, or
   `per-result`) and `latency`, and checks in order: the assistant has the module on, the tool is not in its `offTools`
@@ -353,9 +358,9 @@ Principal = { turn } | { job } | { local } | { notification }   // TurnContext.t
   applies the page's draft for `requiresSaved: false` buttons, refuses to run on settings that do not resolve, allows
   8 s (answered at the deadline; the press runs on until it has ended, its cleanup logged after
   `FIELD_ACTION_CLEANUP_MS`) and one press per button at a time; a failure is a generic sentence (details logged). A
-  press is owned (`FieldActionOwner`, start / in flight / stop) by the host (a definition handler) or by the instance
-  that runs it, whose scope stops its presses first when it closes, before its resources; the button stays busy until
-  the press has ended. A version 2 instance gets `refreshForm()` to have its `info()` and `settingOptions()` described
+  press is owned (`FieldActionOwner`, start / in flight / stop) by the host (a definition handler; made with the host,
+  stopped first when it closes) or by the instance part that runs it (made with the part; `closePart` stops it before
+  it closes the part's scope, in the host's closing order); the button stays busy until the press has ended. A version 2 instance gets `refreshForm()` to have its `info()` and `settingOptions()` described
   again (a closed combo shows its static options only).
 - **The page boundary** (P3, `PageBoundary.ts`): every module-produced text or value an admin page shows (field-action
   results, `info` values, runtime options, status lines, start errors and failed saves, Health issues, tool and route
@@ -365,11 +370,90 @@ Principal = { turn } | { job } | { local } | { notification }   // TurnContext.t
 - **Module routes** (P3, docs/UI-AND-MODULES.md §1.11): `ModuleRoute = { method, path, guards?: ("admin" | "token" |
   "lan")[], public?, token?, body?, bodyLimitBytes? (8 KB, ≤ 1 MB), rateLimit? (30/min per caller, 120 in all),
   timeoutMs? (5 s, ≤ 30 s), handler(req) }` answering a final status (200–599); every declared guard must pass, a
-  route without one must be `public` (a GET without a body). Their place in the lifecycle is `RouteRegistration.ts`:
-  `validate` when a candidate shared part starts (a start error of that generation), `publish` / `withdraw` in the
-  host's synchronous switch, so a route is only ever live for the published generation; the router reads
-  `ModuleHost.routes()` (each `PublishedRoute` with the `scope` of the shared part that declared it), so a stopped
-  module's paths are 404, and runs each handler in that scope (closed: interrupted), outside any turn.
+  route without one must be `public` (a GET without a body). Routes are one registration kind of the reconciler
+  ("route", a registrar in `ModuleHost.ts`, see "Module host: registrations"): a shared part's routes are checked
+  before the switch (`routeProblem`; a bad declaration refuses the part and with it its generation), put in the live
+  route table under the module id by the switch that publishes the part, and taken out by the switch that withdraws
+  it (only if the entry is still that part's), so a route is only ever live for the published generation. The router
+  reads `ModuleHost.routes()` (each `PublishedRoute` with the `scope` of the shared part that declared it), so a
+  stopped module's paths are 404, and runs each handler in that scope (closed: interrupted), outside any turn.
+
+#### Module host: the reconciler (`ModuleHost.ts`, `ModulePlanner.ts`)
+
+The host **reconciles; it does not interleave**. There is a **desired state** (per module: its saved switch, committed
+settings and a configure's pending proposal, the vault's secrets, the assistants' choices and own values (`demand`),
+the linked defaults, the requirement judgement, restart counters and a retry counter; and for the host: active, or
+shutting down) and a **current state** (the published shared part and instances, failed starts remembered by
+fingerprint). Every trigger (`configure`, `enable`, `disable`, `refresh`, `setSecrets`, `recheck`, `startEnabled`,
+`requestRestart`, closing the host) only **writes desired state** synchronously and then waits for a reconciliation
+that **began after** its write; an interrupted caller only stops waiting.
+
+One **reconciler fiber** runs passes, never two at once; a write during a pass makes it run again. A pass:
+
+1. copies the desired state and asks the pure planner (`planModule(target, current)`, tested with a table) what to do
+   per module: a new **generation** (a different shared fingerprint, or none published), instances to start within
+   the published generation (new keys; a changed fingerprint: a restart or a configured secret), instances to retire,
+   or a stop. A start that failed is not tried again at the same fingerprint and retry counter (enable, configure,
+   startEnabled, a vault change and Check again bump the retry counter; a module that stops forgets its failures);
+2. starts what is missing, outside any turn: independent modules concurrently, a module only after the shared parts in
+   its `uses` have started or failed **in this pass** (a consumer starting then finds its new provider through its own
+   `host.service`), a generation's instances after its shared part;
+3. makes **one synchronous switch**: definite withdrawals first (modules that stop, instances no longer wanted), then,
+   in `uses` order, every module's starts: a generation is published only if its shared part and every instance
+   started and every registration passes its checks, else the previous generation keeps serving (or the module stays
+   down) and the failure is recorded for Health (`kept`, "could not apply its new settings" / "could not be started
+   again", or the module's `error`), whatever triggered the pass; an instance within a generation is published on its
+   own, except for an owner's configure of a module that runs, which is all or nothing (refused, not saved). The
+   snapshot is rebuilt once, at the end;
+4. resolves configures (saved once switched to, or when nothing ran to protect; dropped and reported otherwise),
+   closes discarded candidates and retires what the switch withdrew.
+
+**Closing order.** Every part's scope is tracked until closed, and closed exactly once (`closePart`): rollback closes
+at once, retirement after the grace period (calls in flight finish), shutdown at once, scopes in their grace period
+included. Always a consumer before the providers it uses, an instance before its shared part, one after another (an
+instance's asynchronous finalizer finishes before its shared part closes). **Shutdown** is a desired state too:
+closing the host stops the reconciler (a start in progress is interrupted), withdraws everything, then closes every
+open scope in that order and waits for pending saves, bounded by `closeTimeoutMs`.
+
+**Restarts** are counters in the desired state, routed by part identity: a request from a live part counts (one made
+while a restart is in progress starts another afterwards, so no change is lost; at most 5 per 30 s, later ones wait);
+one made during the part's own start applies once it is published; one from a retired or discarded part is ignored.
+A restart that changes no setting starts with the settings the part runs with (a vault locked since cannot stop it).
+
+#### Module host: registrations (`ModuleRegistrations.ts`)
+
+A generation owns everything it offers. Each started part carries a list of **registrations**:
+
+```ts
+interface Registration {
+  kind: string                       // "service", "contribution", "tool", "route", "job-handler", …
+  claims?: ReadonlyArray<string>     // unique per kind across modules (a service id, a tool name, a route path)
+  clash?(claim, ownerName): string   // the refusal when another module's live registration holds the claim
+  validate?(): string | undefined    // its own check before the switch: a reason refuses the part (and its generation)
+  publish(): void                    // inside the switch, synchronous
+  withdraw(): void                   // inside the switch that retires the part, synchronous
+}
+type Registrar = (part: StartedPart) => ReadonlyArray<Registration>   // StartedPart = { handle, shared?, instance? }
+interface PartHandle { moduleId; moduleName; kind: "shared" | "instance"; id; state(); scope; register(r): RegisterResult }
+```
+
+A registration is live from the switch that publishes its part, never live for two generations of one module at
+once, withdrawn at the switch that retires or replaces the part, and never live for a part that is discarded. Services,
+contributions, tool names (and through them the snapshot's parts) are expressed this way. A later PR adds a kind in
+one place:
+
+- **declared by what a part returns** (P3's `SharedPart.routes`): one `Registrar` in the host's `registrars` list. For
+  routes: `claims` = the route paths, `validate` = `routeProblem` for each, `publish` puts `{ routes, scope: handle.scope
+  }` in the live route table under the module id, `withdraw` removes it if the table still holds this part's entry;
+  `host.routes()` reads that table, so a request after the switch reaches the new generation and never the old;
+- **made by module code while it runs** (P6's job handlers, P4's subscriptions, later phrase commands and notification
+  action handlers): the context member gets the part's `PartHandle` in `servicesFor(entry, part)` and calls
+  `part.register(...)`: staged during the part's start, checked and published at once on a live part, refused on a
+  retired or discarded one. A job that fires looks its handler up in the live table, so it reaches the current
+  generation; a tool or action of a part whose scope has closed (a turn that held an old snapshot past the grace
+  period) answers that it was replaced.
+
+`ModuleHostOptions.registrars` adds kinds an app keeps itself (and tests).
 
 Adding a feature = one new file exporting `defineModule({...})` + one line in `moduleCatalog` in `apps/assistant/src/modules.ts`. Adding a provider = one new package implementing a core interface + one line in `apps/assistant/src/providers.ts`. Adding a voice provider = an adapter with `layerConfig` (`Tts`) and `makeVoices` (`TtsVoices`), and one entry in `ttsProviders`, `ttsProviderInfo` and (hosted) `hostedTtsVoices` in `providers.ts`. A voice needs no code: it is chosen by its key.
 

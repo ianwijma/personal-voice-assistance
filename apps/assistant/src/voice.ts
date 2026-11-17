@@ -6,7 +6,6 @@ import {
   Llm,
   type Message,
   Stt,
-  ToolRegistry,
   type Trace
 } from "@pva/core"
 import { Config, Context, Effect, Layer, Stream } from "effect"
@@ -69,21 +68,19 @@ export const voiceMode = Effect.scoped(Effect.gen(function*() {
     })
 
   const services = Layer.succeedContext(providers)
+  // The module set is read at every turn's start (`CliModules`): a restarted or withdrawn module is never offered.
   const modules = yield* startCliModules()
-  const systemPrompt = withModuleInstructions(settings.systemPrompt, modules.instructions)
+  const toAgents = makeSubscriptionAgents({
+    fallbackLlm: Context.get(built as Context.Context<Llm>, Llm),
+    agents: () => modules.snapshot().agents,
+    module: () => modules.infos().find((m) => m.id === SUBSCRIPTION_AGENT_ID),
+    promptFor: (agent, turn) =>
+      agent.systemPrompt === undefined ? turn.system : withModuleInstructions(agent.systemPrompt, modules.snapshot().instructions)
+  })
   const ConversationLive = (llmProvider === SUBSCRIPTION_PROVIDER
-    ? Conversation.layerWithAgents({
-      ...settings,
-      setup: Effect.succeed(makeSubscriptionAgents({
-        fallbackLlm: Context.get(built as Context.Context<Llm>, Llm),
-        agents: () => modules.agents,
-        module: () => modules.infos.find((m) => m.id === SUBSCRIPTION_AGENT_ID),
-        promptFor: (agent, turn) =>
-          agent.systemPrompt === undefined ? turn.system : withModuleInstructions(agent.systemPrompt, modules.instructions)
-      })({ system: systemPrompt, registry: modules.registry }))
-    })
-    : Conversation.layer({ ...settings, systemPrompt })).pipe(
-      Layer.provide(Layer.mergeAll(services, Layer.succeed(ToolRegistry, modules.registry), observedTurnTraceLayer(onFinish)))
+    ? Conversation.layerWithAgents({ ...settings, setup: Effect.map(modules.setup(settings.systemPrompt), toAgents) })
+    : Conversation.layerWithSetup({ ...settings, setup: modules.setup(settings.systemPrompt) })).pipe(
+      Layer.provide(Layer.mergeAll(services, observedTurnTraceLayer(onFinish)))
     )
 
   yield* Effect.gen(function*() {

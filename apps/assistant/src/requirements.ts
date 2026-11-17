@@ -15,25 +15,41 @@ import { join } from "node:path"
 
 /** How to find, check and install one program. */
 export interface ToolEntry {
-  /** The version command (no shell) and where the version is in its output (first capture group; none: any output). */
-  readonly probe: { readonly argv: ReadonlyArray<string>; readonly version: RegExp }
+  /**
+   * The version command (no shell) and where the version is in its output (first capture group, the whole token:
+   * prerelease and build parts included; none: any output). `packaging`: a suffix that is the distribution's
+   * packaging, not part of the program's version (stripped before it is read; default `DEB_REVISION`).
+   */
+  readonly probe: { readonly argv: ReadonlyArray<string>; readonly version: RegExp; readonly packaging?: RegExp }
   /** The package that installs it, per distribution family. */
   readonly packages?: { readonly debian?: string; readonly arch?: string; readonly nix?: string }
 }
 
+/** A version token as programs print it: numbers, then any prerelease (`-rc.1`) or build (`+git`) part, kept whole. */
+const VERSION = String.raw`(\d+(?:\.\d+)+(?:[-+~][0-9A-Za-z][0-9A-Za-z.+~_-]*)?)`
+const versionAfter = (prefix: string) => new RegExp(`${prefix}${VERSION}`)
+
+/**
+ * A Debian/Ubuntu-style package revision after the version (`-3ubuntu5`, `-0+deb12u1`, `-1build2`, `~22.04`): it
+ * starts with a digit or a tilde, which a program's own prerelease (`-rc.1`, `-beta`, `-dev`) does not.
+ */
+export const DEB_REVISION = /(?:-\d[0-9A-Za-z.+~_-]*|~[0-9A-Za-z.+~_-]*)$/
+/** FFmpeg's builds name their packaging after the version too (`-static`, `-full_build-www.gyan.dev`). */
+const FFMPEG_PACKAGING = /(?:-\d[0-9A-Za-z.+~_-]*|~[0-9A-Za-z.+~_-]*|-(?:static|full_build|essentials_build|tessus)[0-9A-Za-z.+~_-]*)$/
+
 /** The programs this assistant knows how to check (modules name them in `requires`). */
 export const TOOL_REGISTRY: Readonly<Record<string, ToolEntry>> = {
-  ffmpeg: { probe: { argv: ["ffmpeg", "-version"], version: /ffmpeg version n?(\d+(?:\.\d+)+)/ }, packages: { debian: "ffmpeg", arch: "ffmpeg", nix: "ffmpeg" } },
-  ffprobe: { probe: { argv: ["ffprobe", "-version"], version: /ffprobe version n?(\d+(?:\.\d+)+)/ }, packages: { debian: "ffmpeg", arch: "ffmpeg", nix: "ffmpeg" } },
-  "yt-dlp": { probe: { argv: ["yt-dlp", "--version"], version: /(\d{4}\.\d+\.\d+)/ }, packages: { debian: "yt-dlp", arch: "yt-dlp", nix: "yt-dlp" } },
-  mpv: { probe: { argv: ["mpv", "--version"], version: /mpv v?(\d+(?:\.\d+)+)/ }, packages: { debian: "mpv", arch: "mpv", nix: "mpv" } },
-  sox: { probe: { argv: ["sox", "--version"], version: /v(\d+(?:\.\d+)+)/ }, packages: { debian: "sox", arch: "sox", nix: "sox" } },
-  tar: { probe: { argv: ["tar", "--version"], version: /(\d+\.\d+(?:\.\d+)?)/ }, packages: { debian: "tar", arch: "tar", nix: "gnutar" } },
-  bzip2: { probe: { argv: ["bzip2", "-h"], version: /Version (\d+\.\d+(?:\.\d+)?)/ }, packages: { debian: "bzip2", arch: "bzip2", nix: "bzip2" } },
-  flock: { probe: { argv: ["flock", "--version"], version: /(\d+\.\d+(?:\.\d+)?)/ }, packages: { debian: "util-linux", arch: "util-linux", nix: "util-linux" } },
-  nice: { probe: { argv: ["nice", "--version"], version: /(\d+\.\d+(?:\.\d+)?)/ }, packages: { debian: "coreutils", arch: "coreutils", nix: "coreutils" } },
-  git: { probe: { argv: ["git", "--version"], version: /git version (\d+(?:\.\d+)+)/ }, packages: { debian: "git", arch: "git", nix: "git" } },
-  python3: { probe: { argv: ["python3", "--version"], version: /Python (\d+(?:\.\d+)+)/ }, packages: { debian: "python3", arch: "python", nix: "python3" } },
+  ffmpeg: { probe: { argv: ["ffmpeg", "-version"], version: versionAfter("ffmpeg version n?"), packaging: FFMPEG_PACKAGING }, packages: { debian: "ffmpeg", arch: "ffmpeg", nix: "ffmpeg" } },
+  ffprobe: { probe: { argv: ["ffprobe", "-version"], version: versionAfter("ffprobe version n?"), packaging: FFMPEG_PACKAGING }, packages: { debian: "ffmpeg", arch: "ffmpeg", nix: "ffmpeg" } },
+  "yt-dlp": { probe: { argv: ["yt-dlp", "--version"], version: /(\d{4}\.\d+\.\d+(?:\.\d+)?)/ }, packages: { debian: "yt-dlp", arch: "yt-dlp", nix: "yt-dlp" } },
+  mpv: { probe: { argv: ["mpv", "--version"], version: versionAfter("mpv v?") }, packages: { debian: "mpv", arch: "mpv", nix: "mpv" } },
+  sox: { probe: { argv: ["sox", "--version"], version: versionAfter("v") }, packages: { debian: "sox", arch: "sox", nix: "sox" } },
+  tar: { probe: { argv: ["tar", "--version"], version: versionAfter("") }, packages: { debian: "tar", arch: "tar", nix: "gnutar" } },
+  bzip2: { probe: { argv: ["bzip2", "-h"], version: versionAfter("Version ") }, packages: { debian: "bzip2", arch: "bzip2", nix: "bzip2" } },
+  flock: { probe: { argv: ["flock", "--version"], version: versionAfter("") }, packages: { debian: "util-linux", arch: "util-linux", nix: "util-linux" } },
+  nice: { probe: { argv: ["nice", "--version"], version: versionAfter("") }, packages: { debian: "coreutils", arch: "coreutils", nix: "coreutils" } },
+  git: { probe: { argv: ["git", "--version"], version: versionAfter("git version ") }, packages: { debian: "git", arch: "git", nix: "git" } },
+  python3: { probe: { argv: ["python3", "--version"], version: versionAfter("Python ") }, packages: { debian: "python3", arch: "python", nix: "python3" } },
   "nvidia-smi": { probe: { argv: ["nvidia-smi", "-L"], version: /GPU \d+/ }, packages: { debian: "nvidia-utils", arch: "nvidia-utils", nix: "linuxPackages.nvidia_x11" } },
   vulkaninfo: { probe: { argv: ["vulkaninfo", "--summary"], version: /Vulkan Instance Version: (\d+(?:\.\d+)+)/ }, packages: { debian: "vulkan-tools", arch: "vulkan-tools", nix: "vulkan-tools" } }
 }
@@ -95,13 +111,21 @@ export const execProber: Prober = (argv, options) =>
 // Versions
 
 /**
- * A program's reported version as semver ("6.1" is 6.1.0, "2025.01.15" is 2025.1.15, "n6.1-3ubuntu1" is 6.1.0; a
- * prerelease such as "7.0.0-rc.1" stays one), or `undefined` when it holds no version at all.
+ * A program's reported version as full semver: "6.1" is 6.1.0, "2025.01.15" is 2025.1.15, a fourth number is build
+ * metadata ("2025.01.15.232340" is 2025.1.15+232340), a packaging suffix (`packaging`, default `DEB_REVISION`: "6.1-
+ * 3ubuntu1" is 6.1.0) is dropped, and a prerelease stays one ("0.35.0-rc.1", "7.0-rc1" is 7.0.0-rc1), so a range
+ * that names none rejects it. `undefined` when it holds no version, or a suffix that is neither: never guessed.
  */
-export const parseVersion = (reported: string): string | undefined => {
-  const exact = semver.valid(semver.clean(reported, { loose: true }) ?? "", { loose: true })
-  if (exact !== null) return exact
-  return semver.coerce(reported, { includePrerelease: true })?.version ?? undefined
+export const parseVersion = (reported: string, packaging: RegExp = DEB_REVISION): string | undefined => {
+  const token = reported.trim().replace(/^[vn](?=\d)/i, "").replace(packaging, "")
+  const m = /^(\d+(?:\.\d+)*)(.*)$/.exec(token)
+  if (m === null) return undefined
+  const numbers = m[1]!.split(".")
+  const core = [...numbers.slice(0, 3), "0", "0"].slice(0, 3).map((n) => String(Number(n))).join(".")
+  const rest = m[2]!.startsWith("~") ? `-${m[2]!.slice(1)}` : m[2]!
+  const build = numbers.length > 3 ? numbers.slice(3).join(".") : undefined
+  const candidate = build === undefined ? `${core}${rest}` : rest.includes("+") ? `${core}${rest}.${build}` : `${core}${rest}+${build}`
+  return semver.valid(candidate) === null ? undefined : candidate
 }
 
 /**
@@ -109,9 +133,9 @@ export const parseVersion = (reported: string): string | undefined => {
  * `~`, `x` ranges and hyphen ranges; a prerelease satisfies only a range that names a prerelease of the same version.
  * `undefined` when the range cannot be read or the version holds none: never a pass.
  */
-export const satisfiesRange = (version: string, range: string): boolean | undefined => {
+export const satisfiesRange = (version: string, range: string, packaging?: RegExp): boolean | undefined => {
   if (semver.validRange(range) === null) return undefined
-  const parsed = parseVersion(version)
+  const parsed = parseVersion(version, packaging)
   if (parsed === undefined) return undefined
   return semver.satisfies(parsed, range)
 }
@@ -161,7 +185,7 @@ export const installFix = (tool: string, entry: ToolEntry | undefined, distro: D
 
 /** A probed program: its version, or why not. */
 export type ToolProbe =
-  | { readonly found: true; readonly version: string | undefined }
+  | { readonly found: true; readonly version: string | undefined; readonly packaging?: RegExp | undefined }
   | { readonly found: false; readonly why: "missing" | "timeout" | "failed" | "not-recognised"; readonly message?: string }
 
 export interface RequirementChecker {
@@ -220,7 +244,7 @@ export const makeRequirementChecker = (options: RequirementCheckerOptions): Requ
     Effect.promise(async () => {
       const entry = tools[tool]
       const argv = entry?.probe.argv ?? [tool, "--version"]
-      const pattern = entry?.probe.version ?? /(\d+(?:\.\d+)+)/
+      const pattern = entry?.probe.version ?? new RegExp(VERSION)
       let out: ProbeOutput
       try {
         out = await prober(argv, { timeoutMs, path })
@@ -230,7 +254,8 @@ export const makeRequirementChecker = (options: RequirementCheckerOptions): Requ
       const result: ToolProbe = out.kind === "ran"
         ? (() => {
           const m = pattern.exec(out.output)
-          if (m !== null) return { found: true, version: m[1] }
+          // The whole token, without its packaging suffix ("6.1.1-3ubuntu5" is shown and judged as 6.1.1).
+          if (m !== null) return { found: true, version: m[1]?.replace(entry?.probe.packaging ?? DEB_REVISION, ""), packaging: entry?.probe.packaging }
           // It ran but did not say what it is: present when it exited cleanly, else not recognised.
           return out.exitCode === 0 ? { found: true, version: undefined } : { found: false, why: "not-recognised" }
         })()
@@ -279,7 +304,7 @@ export const makeRequirementChecker = (options: RequirementCheckerOptions): Requ
     if (p.version === undefined) {
       return { requirement: r, state: "missing", detail: `${r.tool} did not report its version; needs ${r.version}`, fix: installFix(r.tool, entry, distro, "Update") }
     }
-    const ok = satisfiesRange(p.version, r.version)
+    const ok = satisfiesRange(p.version, r.version, p.packaging)
     if (ok === undefined) {
       return { requirement: r, state: "missing", detail: `${r.tool} reported "${p.version}", which is not a version; needs ${r.version}`, fix: installFix(r.tool, entry, distro, "Update") }
     }
