@@ -38,7 +38,7 @@ that work can start. Each is cheap to change before the PR that builds it is mer
 | 7 | Whose device | A device's default person selects whose data a turn means. It never grants access. Because device ids are not authenticated, anything a person would not want read by anyone on the home network does not belong in this stack: memory stores no secrets, and mail is read only by assistants the owner puts on devices they choose. |
 | 8 | Personal content | Two levels on a result, a presentation, a notification or a spoken line: `household` (default) and `personal`, which names its owner (a person id). `personal` content is spoken and shown on a `private` device, and on a `shared` device whose default person is the owner; on any other `shared` device the module reduces it ("Ian: busy 12:30 to 13:30") or it is withheld; on a `public` device it is withheld. `personal` content with no known owner is treated as someone else's. One helper decides, `Privacy.mayReveal(owner, device)`, about the device that would speak or show it, which is not always the device that asked. Modules use it before they return a result to the model, and the Presenter, the speech service and the notification router use it per target device. This is stricter on shared screens than some module documents propose (override). |
 | 9 | Children | Not supported yet. There is no kids flag on a device and no adult/child field on a person, so nothing suggests protections that do not exist. Web search defaults to moderate safe search. Image search in this version uses Wikipedia and Commons, which have no such filter; its section in `docs/MODULES.md` says so. The kids policy is out of scope (§7). |
-| 10 | Storage | One SQLite file, `data/household.db`, through `node:sqlite`. Per-module tables and migrations inside it. |
+| 10 | Storage | One SQLite file, `data/household.db`, through `node:sqlite`, holding each module's document collections. Modules do not write SQL (§4, P4). |
 | 11 | Recurrence | What a person says ("every second Tuesday") is stored as an RFC 5545 `RRULE`; system jobs use `Cron`. One recurrence helper for every module. |
 | 12 | Names | `CurrentTurn` (not `CurrentTurnDevice`); timers carry `dueAt`; an event is named by the module that emits it (`kitchen.stock.low`, `presence.arrived`). |
 | 13 | Presentation | Own `present.*` messages, not a field on `tool.end`. Tools are always offered; the server decides whether something can be shown and tells the model what happened. A tap on a checklist item calls the tool directly, through the same gateway as every other call (§4, P1). |
@@ -247,30 +247,45 @@ Two new packages with no dependency on the rest of the stack, plus household set
 
 ### P4. Household store and event bus
 
-Server only: no voice-page work. P10 is the first consumer on a screen.
+Server only: no voice-page work. P10 is the first consumer on a screen. The store is deliberately small: two review
+rounds on a larger design (module-owned SQL behind a hand-written guard, a change log with undo, full-text search,
+restore and export commands, nested transactions) found dozens of problems in exactly those parts, and no first
+version in §5 needs them.
 
-- `packages/store-sqlite` implementing a core `HouseholdStore` on `@effect/sql-sqlite-node`: WAL, one writer,
-  migrations inside a transaction after a backup, a daily backup with `backup()`, export per module, and a
-  documented restore.
-- A stored schema version per module. A database written by a newer version of a module is refused for that module
-  (`unavailable`, with the reason), never opened and rewritten by older code.
-- `ctx.store`: document collections (`defineCollection` with scope, schema, version, migration of the whole collection when its version changes, `ambient`
-  lines) and module-owned SQL tables prefixed `m_<moduleId>__` with their own migrations, including FTS5 where the
-  build has it.
-- Scopes household, person, assistant, device, conversation, derived from `CurrentTurn` or given explicitly.
-- A change log written in the same transaction as every write, and undo of the last change by an actor. A
-  collection chooses its history: `full` (the default), or `none` for content a person may ask to forget. `erase`
-  removes a row together with every earlier payload of it in the change log and in search indexes; daily backups
-  keep it until they rotate out, and the documentation says so.
-- Event bus: one in-process `PubSub`; `ctx.events.publish` and `subscribe`; host events (turn ended, device
-  connected or disconnected, module state changed).
+- `packages/store-sqlite` implementing a core `HouseholdStore` on the built-in `node:sqlite`: one file
+  `data/household.db`, WAL, one connection for turns, files private to the user.
+- `ctx.store`: **document collections** and nothing else for modules. `defineCollection` with a name, a scope, a
+  schema whose values are objects, a version with a migration of the whole collection when it changes, declared
+  indexes on scalar fields, optional `ambient` lines and an optional projection for voice pages. Operations: `get`,
+  `list` (one equality filter on an indexed field, an order, a limit), `insert`, `update` with a revision check,
+  `remove`. No module-owned SQL, no full-text search, no generic undo. A module that needs to find text matches in
+  code over a bounded `list`; a module that offers "undo" keeps what it needs to reverse its own last operation.
+- **Transactions are synchronous and flat.** `store.transaction(tx => …)` runs a function with no awaits against a
+  handle with the same operations; begin, the function and commit happen in one uninterrupted step, so there is no
+  interleaving, no nesting and nothing to interrupt. A call to `transaction` inside one joins it. Core services
+  (the scheduler, notifications) get their own tables through `store.core(owner)` and take part in the same
+  transaction through the same handle.
+- `remove` really removes: the row is deleted with `secure_delete`, the write-ahead log is checkpointed soon after,
+  and there is no history that still holds the content. Daily backups keep it until they rotate out, and the
+  documentation says how long.
+- Scopes household, person, assistant, device, conversation, derived from `CurrentTurn` or given explicitly, with
+  scope ids restricted to a safe alphabet. A person-scoped call with no person is a typed error.
+- A stored schema version per module and per collection. A database written by a newer version of a module is
+  refused for that module (`unavailable`, with the reason), never opened and rewritten by older code. Migration runs
+  in one transaction after a backup.
+- A daily backup on a separate connection, kept 14 days. Restoring is a documented manual step with the server
+  stopped; `doctor` checks that the database opens and that a recent backup exists.
+- Event bus: one in-process bus; `ctx.events.publish` and `subscribe`; host events (turn ended, device connected or
+  disconnected, module state changed). Events about a store change, and events published inside a transaction, are
+  released after it commits, in order.
 - To voice pages: `household.event` and a snapshot, defined in the protocol. Nothing is sent by default. A
   collection or an event type opts in by giving a **projection**: a function from the row or event and the target
-  device to what that device may see, or nothing. The same projection is applied to snapshots and live events; a page that
-  reconnects, or that may have missed something, gets a fresh snapshot. This is how an alarm's label can be shown on the device it will ring on
-  and left out elsewhere. A row a device could see and no longer can is sent to it as a removal, and a change to a
-  device's place or default person gives it a fresh snapshot. Person-scoped rows are also passed through
-  `Privacy.mayReveal` once P5 exists.
+  device to what that device may see, or nothing. The same projection is applied to snapshots and live events; a
+  page that connects, or that may have missed something, gets a fresh snapshot. This is how an alarm's label can be
+  shown on the device it will ring on and left out elsewhere. A row a device could see and no longer can is sent to
+  it as a removal, and a change to a device's place or default person gives it a fresh snapshot. Person-scoped rows
+  are also passed through `Privacy.mayReveal` once P5 exists. A page that claims a device's id receives that
+  device's rows: device ids are not authenticated (§2 rows 5 and 7).
 - Ambient facts: a host context provider that assembles collections' `ambient` lines within the 50 ms budget, capped
   at 600 characters, behind a household switch that is off until the owner has measured, with `bench --live
   --ambient`, what the added context costs their model's first token.
@@ -297,7 +312,7 @@ Server only: no voice-page work. P10 is the first consumer on a screen.
 - Missed-while-down policies `fire-late`, `{ fireIfWithinMs }`, `skip`, `inbox`, and "run the last missed occurrence
   once" for recurring jobs.
 - Exactly-once as far as one process can give it. Every occurrence has a stable key (job id and due time). A due
-  job is claimed in a transaction. A handler declares whether it is idempotent. Only an idempotent handler is ever
+  job is claimed in a transaction (P4's synchronous kind; scheduling from a module's transaction uses its handle). A handler declares whether it is idempotent. Only an idempotent handler is ever
   run again for the same occurrence, whether it failed (retried with back-off up to a declared limit) or was found
   `running` at start; any other handler that fails or was interrupted is marked failed and reported on the Health
   page. A `{ notify }` job is delivered again under the same notification id, which the notification service
@@ -486,13 +501,13 @@ document's own, the row says why.
 | 4 | [web-search](research/modules/web-search.md) | `module-web-search` | `web_search` with SearXNG and Brave behind a `SearchProvider` interface, `read_page` on `safeFetch`, a usage counter and caps in the store, moderate safe search. | `research`, `search_sources`, more providers, provider-native search | Sonnet |
 | 5 | [lists](research/modules/lists.md) | `module-lists` | Local store, the ten `lists_*` tools, a default shopping and to-do list, splitting on "and", quantities, duplicate merge, undo, the `Lists` service, the checklist presentation with direct ticks, phrase commands for add and read. | Chores, person lists, every outside provider (the HA provider of the document's first version too: smart-home is being rewritten beside it), the outbox | Opus |
 | 6 | [notifications](research/modules/notifications.md) | `module-notifications` | The spoken side of P9: `notifications_read` and dismiss, do-not-disturb by voice with an end time on `notify.dnd`, "send a test", one inbound `notify` hook on P3's routes that needs both its token and the LAN, capped at `normal`. | Phone channels, escalation, hooks from outside the LAN | Sonnet |
-| 7 | [kitchen](research/modules/kitchen.md) | `module-kitchen` | Slice 1: the pantry ledger with approximate amounts and undo, product settings, low stock into the shopping list through `Lists`. Plus, beyond the document's first version, stored recipes entered by voice and `kitchen_what_can_i_make` with a time limit and the household's diets: it is the owner's own example of what the kitchen is for, and it needs nothing slice 1 does not have. | URL import, scaling, guided cooking, meal plan, the Chef template with hands-free "next", outside providers, barcodes | Opus |
+| 7 | [kitchen](research/modules/kitchen.md) | `module-kitchen` | Slice 1: the pantry ledger (a collection of bookings; current stock is their sum) with approximate amounts and undo by a reversing booking, product settings, low stock into the shopping list through `Lists`. Plus, beyond the document's first version, stored recipes entered by voice and `kitchen_what_can_i_make` with a time limit and the household's diets: it is the owner's own example of what the kitchen is for, and it needs nothing slice 1 does not have. | URL import, scaling, guided cooking, meal plan, the Chef template with hands-free "next", outside providers, barcodes | Opus |
 | 8 | [music](research/modules/music.md) | `module-music` | Route 1 only, over the `HomeAssistant` service: play (artist, album, playlist, radio through Music Assistant), pause, resume, next, previous, volume, what is playing, per room, with the room from `CurrentTurn`; phrase commands for transport; the `Playback` service; the `media` guard on the devices of a room while its player plays, so that lyrics are not taken for requests ("hey Jeff, stop" still pauses it); a room with a player starts guarded until the first state from Home Assistant shows it is not playing, and while the state is unknown later the guard stays as it was. | Playback in the browser or on nodes, Spotify direct, ducking, the `media` kind | Opus |
 | 9 | [smart-home](research/modules/smart-home.md) | `module-home-assistant` (existing) | The WebSocket entity cache with registries and HA's exposure list, in the module's `shared` part; typed actions for lights, switches, climate and covers; reading any exposed entity's state, a lock's included, is `read`; changing a lock, a garage door, a gate or an alarm panel is `security` and so refused; scenes and scripts only those the owner ticks one by one in the module's settings, because what a script does cannot be seen from outside it; `media_player`; "here" from `CurrentTurn.room`; the `HomeAssistant` service; a connection instead of module secret fields, with the old fields still read. | Locking, unlocking and disarming, watches, doorbell and leak notifications, cameras, energy, the MCP long tail | Opus |
 | 10 | [reminders](research/modules/reminders.md) | `module-reminders` | Time and repeating reminders, household and person scope, `RRULE` storage with one job for the next occurrence, delivery where set, done and snooze as notification actions and follow-up phrases, the `card` and `list` presentations, a briefing section. | Presence and event reminders, "remind Sam", nag, CalDAV | Sonnet |
 | 11 | [images-and-photos](research/modules/images-and-photos.md) | `module-images` | `image_find` over Wikipedia and Commons with credit, `gallery` with pick for ambiguous words (the document's kiwi case needs it), the three-part reply on a device without a screen. | Other sources, generation, Immich, photo frame, cameras | Sonnet |
 | 12 | [calendar](research/modules/calendar.md) | `module-calendar` | `CalendarProvider` contributions with ICS and CalDAV providers of its own, a cache refreshed by a job, `calendar_agenda`, `_next`, `_find`, `_free`, `_add` with undo for single events (a repeating event is refused, §2 row 6), personal events reduced on shared devices (§2 row 8), a briefing section, an ambient line. | Change and delete, reminders from events, Microsoft, HA calendars | Opus |
-| 13 | [memory-and-notes](research/modules/memory-and-notes.md) | `module-memory` | `remember`, `recall`, `forget`, `note`, `read_notes` on the store with FTS5; where the build has no FTS5, search covers the newest 2,000 entries and the module's status says so. Household and person scope, a collection without history so that `forget` erases, pinned memories in the per-turn context within 800 characters and measured, a refusal for codes and passwords. | Secrets, sync to Obsidian or Nextcloud, embeddings, audio | Sonnet |
+| 13 | [memory-and-notes](research/modules/memory-and-notes.md) | `module-memory` | `remember`, `recall`, `forget`, `note`, `read_notes` on the store; `recall` matches words in code over the newest 2,000 entries and says so when there are more. Household and person scope, `forget` removes the row for good, pinned memories in the per-turn context within 800 characters and measured, a refusal for codes and passwords. | Secrets, full-text search over everything, sync to Obsidian or Nextcloud, embeddings, audio | Sonnet |
 | 14 | [google](research/modules/google.md) | `module-google` | The `google` connection type on P8's loopback-and-paste flow with the owner's own client id, read-only: `mail_overview`, `mail_search`, `mail_read`, all `personal`; a Google `CalendarProvider` contribution; a mail briefing section. A hand-written fetch client. | Send, drafts, contacts, Drive, Tasks, the mail cache and sync job | Opus |
 | 15 | [t3-code](research/modules/t3-code.md) | `module-t3-code` (wave B, after 22) | Read-only over T3's `/mcp`: its own connection type on P8's MCP OAuth flow, the `Mcp` service's client with that connection's token provider, `t3_overview`, `t3_thread_status`, `t3_pull_requests`, `t3_projects`; a context line; the coding template. T3's upstream tools are never offered to the model directly. | Draft and send, stop, answer, watches, CI status | Sonnet |
 | 16 | [broadcast](research/modules/broadcast.md) | `module-broadcast` | `broadcast_send` to everyone or a room in the assistant's voice with a chime, through `ctx.speech` and so through the delivery policy (do not disturb, quiet rooms in quiet hours, devices that accept nothing from others); a 30-second `capture` window on each target for a reply, routed back to the sender (not on a device that is in a call); `broadcast_chime`; the origin excluded; a `card` on screens. | The speaker's own voice, voice messages, schedules, phones | Sonnet |
@@ -561,7 +576,7 @@ pins them in the workspace catalogue. Versions are the latest that pass `pnpm ch
 |---|---|
 | `language` (P2) | none: its grammars and its recurrence arithmetic are its own |
 | `net` (P2) | none: Node's own modules and its own address classifier |
-| `store-sqlite` (P4) | `@effect/sql-sqlite-node` |
+| `store-sqlite` (P4) | none: Node's built-in `node:sqlite` |
 | core, for presentation (P10) | `sharp` |
 | `modules-builtin` (clock, weather) | `date-holidays`, `suncalc` |
 | `module-core-tools` | `mathjs`, `nspell`, `dictionary-en`, `dictionary-nl` |
