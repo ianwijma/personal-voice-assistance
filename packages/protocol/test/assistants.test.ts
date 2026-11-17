@@ -79,7 +79,7 @@ const settings = (patch: Partial<DeviceSettings> = {}): DeviceSettings => ({ ...
 
 describe("protocol 7", () => {
   it("is protocol version 8 now (7 added these)", () => {
-    expect(PROTOCOL_VERSION).toBe(8)
+    expect(PROTOCOL_VERSION).toBe(9)
   })
 })
 

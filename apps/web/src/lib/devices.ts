@@ -75,7 +75,9 @@ export const settingsOf = (base: DeviceBase, edit: DeviceEdit): DeviceSettings =
   audio: valueOf(base, edit, "audio"),
   captions: valueOf(base, edit, "captions"),
   look: valueOf(base, edit, "look"),
-  voice: valueOf(base, edit, "voice")
+  voice: valueOf(base, edit, "voice"),
+  sound: valueOf(base, edit, "sound"),
+  soundDevices: valueOf(base, edit, "soundDevices")
 })
 
 const keyOwn = (base: DeviceBase, edit: DeviceEdit, k: DeviceSettingsKey): boolean =>

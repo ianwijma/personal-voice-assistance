@@ -167,7 +167,9 @@ export const ADMIN_ONLY: ReadonlySet<ServerMessageType> = new Set<ServerMessageT
   "device.types",
   "sessions",
   "trace",
-  "wake.heard"
+  "wake.heard",
+  "node.paired",
+  "node.meter"
 ])
 
 interface Client {

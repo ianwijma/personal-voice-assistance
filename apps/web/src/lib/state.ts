@@ -640,7 +640,11 @@ const server: ServerHandlers = {
   "device.setup": onSetup,
   "conversation.history": (s, m) => onHistory(s, m, historyToTurns),
   assistants: (s, m) => ({ ...s, assistants: m.assistants }),
-  "device.types": (s, m) => ({ ...s, deviceTypes: m.types })
+  "device.types": (s, m) => ({ ...s, deviceTypes: m.types }),
+  // N4: node.paired and node.meter are read by the Voice nodes pages; node.command goes to a node, never to a page.
+  "node.command": (s) => s,
+  "node.paired": (s) => s,
+  "node.meter": (s) => s
 }
 
 const local = (s: ClientState, a: LocalAction): ClientState => {

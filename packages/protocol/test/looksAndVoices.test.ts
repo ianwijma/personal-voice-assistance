@@ -20,9 +20,9 @@ const decodes = (schema: Schema.Top, value: unknown) => Schema.decodeUnknownResu
 
 describe("protocol 8", () => {
   it("is protocol version 8, and the examples speak it", () => {
-    expect(PROTOCOL_VERSION).toBe(8)
-    expect(serverExamples.welcome.protocol).toBe(8)
-    expect(clientExamples.hello.protocol).toBe(8)
+    expect(PROTOCOL_VERSION).toBe(9)
+    expect(serverExamples.welcome.protocol).toBe(9)
+    expect(clientExamples.hello.protocol).toBe(9)
   })
 
   it("a version 7 hello still decodes, so the server can answer it with the mismatch close", () => {

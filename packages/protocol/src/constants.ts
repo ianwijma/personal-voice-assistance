@@ -62,8 +62,16 @@
  * entry or `device.save` and a version 8 page could not read a version 7 server's devices. Additive, within 8:
  * `Assistant.look`, `DeviceOwn`/`DeviceSettingsPatch` `look` and `voice`, `DeviceSetup.look` and `DeviceSetup.assistants[].look`,
  * `assistant.create.saveAnyway`, `TraceConfig.voiceFrom`, `usedByDevices` on voices and resource status.
+ *
+ * 9: voice nodes (docs/VOICE-NODES.md §5). Device type `voice-node`; `DeviceSettingsKey` gains `sound` and
+ * `soundDevices` (a closed set; required in `DeviceSettings`), `DeviceTypeDefinition`/`DeviceTypeInfo.followUpUnset`;
+ * `hello.node` (required for a node), `hello.device.capabilities`; client `node.status`, `node.level` (node only),
+ * `node.command.send`, `node.pair.create`, `node.pair.cancel` (admin); server `node.command` (to the node),
+ * `node.paired`, `node.meter` (admin only); `result.pairing`; `devices` entries carry `node` and `capabilities`;
+ * `device.setup` carries `sound` and `soundDevices` for a node; close code 4403 (`unauthorized`). HTTP: `/node/*`
+ * (not part of the WebSocket protocol, but its schemas are here).
  */
-export const PROTOCOL_VERSION = 8
+export const PROTOCOL_VERSION = 9
 
 /** Path of the WebSocket endpoint, on the same origin as the UI in production. */
 export const WS_PATH = "/ws"
@@ -96,5 +104,7 @@ export const CloseCode = {
   /** The connection fell too far behind (send buffer over the limit); reconnect to get a fresh snapshot. */
   tooSlow: 4408,
   /** Connection limit reached. */
-  tooManyConnections: 4429
+  tooManyConnections: 4429,
+  /** Protocol 9: a node hello without a valid credential; an unpaired id posing as a node; a browser hello naming a paired node's id; a node removed while connected. */
+  unauthorized: 4403
 } as const

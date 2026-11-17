@@ -183,7 +183,7 @@ describe("the new messages through the codec", () => {
 
 describe("version 7 handling", () => {
   it("the welcome example and the hello example speak the current version", () => {
-    expect(PROTOCOL_VERSION).toBe(8)
+    expect(PROTOCOL_VERSION).toBe(9)
     expect(serverExamples.welcome.protocol).toBe(PROTOCOL_VERSION)
     expect(clientExamples.hello.protocol).toBe(PROTOCOL_VERSION)
   })

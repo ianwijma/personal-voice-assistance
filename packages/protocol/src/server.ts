@@ -15,6 +15,7 @@ import { AssistantId } from "./assistants.ts"
 import { AssistantInfo, DeviceListInfo, DeviceSetup, DeviceTypeInfo } from "./devices.ts"
 import { DeviceId, WakePhrase } from "./frontends.ts"
 import { AdminSnapshot, EngineStatus, EngineSummary, HistoryItem, ModuleInfo, SettingsSection, Snapshot, TraceInfo } from "./snapshot.ts"
+import { NodeCommand, NodeMeter, NodePaired, NodePairing } from "./nodes.ts"
 import { EnvInfo } from "./env.ts"
 import { JobInfo, ModelSet } from "./jobs.ts"
 import { VaultInfo } from "./vault.ts"
@@ -223,7 +224,9 @@ export const Result = Schema.Struct({
    * Protocol 7: present only on the successful result of `device.save`: the revision the saved device or defaults
    * have now, so the page can wait until that revision has reached it (the lists are pushed after the result).
    */
-  rev: Schema.optionalKey(NonNegativeInt)
+  rev: Schema.optionalKey(NonNegativeInt),
+  /** Protocol 9: present only on the successful result of `node.pair.create`. */
+  pairing: Schema.optionalKey(NodePairing)
 })
 
 /**
@@ -423,7 +426,10 @@ export const ServerMessage = Schema.Union([
   DeviceSetupMessage,
   ConversationHistory,
   AssistantsMessage,
-  DeviceTypesMessage
+  DeviceTypesMessage,
+  NodeCommand,
+  NodePaired,
+  NodeMeter
 ]).pipe(Schema.toTaggedUnion("type"))
 export type ServerMessage = typeof ServerMessage.Type
 export type ServerMessageType = ServerMessage["type"]
