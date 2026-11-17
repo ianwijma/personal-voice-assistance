@@ -12,9 +12,7 @@ import { CurrentTurn, type TurnContext, type TurnSource } from "./TurnContext.ts
  *   and who changed it last; one equality filter, ordering and a limit, each list read bound to one index by
  *   construction; word search over declared fields. A collection whose version rises is migrated whole, at start, in
  *   one transaction after a backup. Every write appends one change-log row in the same transaction.
- * - **Module SQL** (`ModuleStore.sql`): a module's own tables, prefixed `sqlPrefixOf(moduleId)`, with its own
- *   migrations; statements that reach outside the prefix are refused. SQLite store only.
- * - **Transactions** span a module's collections and its SQL (`ModuleStore.transaction`); core services (scheduler,
+ * - **Transactions** span a module's collections (`ModuleStore.transaction`); core services (scheduler,
  *   notifications) join the same transaction with their own tables (`HouseholdStore.core`). The model, shared by both
  *   stores, is in `StoreTransactions.ts`.
  *
@@ -103,11 +101,10 @@ export const currentActor = (moduleId: string, given?: Actor): Effect.Effect<Act
 /**
  * The store could not do it. `unavailable`: no store in this mode, or the module's data is not usable here;
  * `read-only`: the CLI modes read the store and never write it; `invalid`: the call itself is wrong (an undeclared
- * collection, an unindexed filter, a value that does not match the schema); `refused`: module SQL that reaches
- * outside the module's tables; `failed`: the database said no.
+ * collection, an unindexed filter, a value that does not match the schema); `failed`: the database said no.
  */
 export class StoreError extends Schema.TaggedError<StoreError>()("StoreError", {
-  reason: Schema.Literals(["unavailable", "read-only", "invalid", "refused", "failed"]),
+  reason: Schema.Literals(["unavailable", "read-only", "invalid", "failed"]),
   message: Schema.String,
   cause: Schema.optional(Schema.Defect())
 }) {}
@@ -293,37 +290,10 @@ export const defineCollection = <A>(definition: {
   }
 }
 
-// ---------------------------------------------------------------------------------------------------------------------
-// Module SQL
-
-/** A value bound to a `?` of module SQL. */
-export type SqlValue = string | number | bigint | null | Uint8Array
-
-/**
- * A module's own SQL (SQLite store): tables, indexes, views, triggers and FTS5 tables whose names start with
- * `prefix` (`m_<moduleId>__`, dashes as underscores). One statement per call, `?` placeholders. Refused: names
- * outside the prefix (in any quoting), `ATTACH`, `PRAGMA`, transaction statements, `sqlite_*` and `pragma_*` names;
- * schema statements (`CREATE`, `DROP`, `ALTER`) outside the module's migrations.
- */
-export interface ModuleSql {
-  readonly prefix: string
-  /** `table("items")` = `m_lists__items`. */
-  readonly table: (name: string) => string
-  /** The SQLite build has FTS5 (`CREATE VIRTUAL TABLE … USING fts5`). Without it, fall back to `LIKE`. */
-  readonly fts5: boolean
-  readonly query: <R = Record<string, unknown>>(sql: string, params?: ReadonlyArray<SqlValue>) => Effect.Effect<ReadonlyArray<R>, StoreError>
-  readonly run: (sql: string, params?: ReadonlyArray<SqlValue>) => Effect.Effect<{ readonly changes: number; readonly lastInsertRowid: number }, StoreError>
-}
-
-/** One migration of a module's SQL: statements (`;`-separated) or an effect on the guarded `ModuleSql`. */
-export type SqlMigration = string | ((sql: ModuleSql) => Effect.Effect<void, StoreError>)
-
 /** What a module declares about its data (`defineModule({ storage })`, module API 2). */
 export interface ModuleStorage {
   /** Every collection the module uses. A collection not listed here is refused at run time. */
   readonly collections?: ReadonlyArray<Collection<any>>
-  /** Module SQL; `migrations[n]` brings the module's SQL schema from version `n` to `n + 1`. Never edit a released one. */
-  readonly sql?: { readonly migrations: ReadonlyArray<SqlMigration> }
 }
 
 /** Check a module's storage declaration (called by `defineModule`). */
@@ -334,20 +304,7 @@ export const checkModuleStorage = (moduleId: string, storage: ModuleStorage): vo
     if (seen.has(c.name)) throw new Error(`Module ${moduleId}: collection "${c.name}" is declared twice`)
     seen.add(c.name)
   }
-  if ((storage.sql?.migrations.length ?? 0) > 1000) throw new Error(`Module ${moduleId}: too many SQL migrations`)
 }
-
-/**
- * The table prefix of a module's SQL. One-to-one and prefix-free over every valid module id, so no module's prefix
- * starts another's: `m_<id>__` with each dash as an underscore, for an id without a double or trailing dash (its
- * underscores then never form `__` and never end it: `home-assistant` → `m_home_assistant__`); any other id
- * (`a--b`, `timer-`) is spelled in hex, `mx_<hex of the id>__`, which no `m_` prefix can start.
- */
-export const sqlPrefixOf = (moduleId: string): string =>
-  /--|-$/.test(moduleId) ? `mx_${[...moduleId].map((c) => c.charCodeAt(0).toString(16).padStart(2, "0")).join("")}__` : `m_${moduleId.replace(/-/g, "_")}__`
-
-/** Whether a name (lower case) is in some module's SQL namespace (`m_…__…` or `mx_…`). */
-export const isModuleSqlName = (name: string): boolean => /^m_[a-z0-9_]*?__/.test(name) || name.startsWith("mx_")
 
 // ---------------------------------------------------------------------------------------------------------------------
 // The module's view: ctx.store
@@ -433,16 +390,6 @@ export interface CollectionHandle<A> {
   readonly undo: (options?: ScopeOptions & { readonly actor?: Actor }) => Effect.Effect<UndoResult<A> | undefined, StoreError | StoreConflict | ScopeUnknown>
 }
 
-/** A module SQL write reported to the change log and the bus (collections log their own writes). */
-export interface SqlChange {
-  /** The table without its prefix. */
-  readonly table: string
-  readonly id: string
-  readonly op: "insert" | "update" | "remove"
-  readonly scope?: ScopeRef
-  readonly actor?: Actor
-}
-
 /** `ctx.store`: a module's data, shared by all its instances and its `shared` part. */
 export interface ModuleStore {
   readonly moduleId: string
@@ -451,18 +398,14 @@ export interface ModuleStore {
   readonly fts5: boolean
   /** A declared collection (an undeclared one fails each call with `invalid`). */
   readonly collection: <A>(collection: Collection<A>) => CollectionHandle<A>
-  /** The module's SQL (fails `unavailable` without `storage.sql`, or in the in-memory store). */
-  readonly sql: ModuleSql
   /**
-   * Run `work` in one transaction (nested calls are savepoints): every collection write and SQL statement in it
+   * Run `work` in one transaction (nested calls are savepoints): every collection write in it
    * commits or rolls back together, and its events (data changes and `ctx.events.publish`) are published only after
    * the commit, in change-log order. Concurrent work inside one transaction runs one savepoint at a time. A fiber
    * forked inside that outlives it fails with `StoreError`. No network calls inside: the transaction holds the
    * database's one connection.
    */
   readonly transaction: <X, E, R>(work: Effect.Effect<X, E, R>) => Effect.Effect<X, E | StoreError, R>
-  /** Record a module SQL write in the change log (for "what changed" and the bus). */
-  readonly logChange: (change: SqlChange) => Effect.Effect<void, StoreError>
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -476,7 +419,6 @@ export interface CommittedChange {
   readonly opId: string
   readonly at: number
   readonly module: string
-  /** The collection, or `sql:<table>` for a module SQL change. */
   readonly collection: string
   readonly id: string
   readonly op: ChangeOp
@@ -487,7 +429,7 @@ export interface CommittedChange {
   readonly before?: Row<unknown>
 }
 
-/** One change-log row as read back (`changesSince`). Payloads are absent for `history: "none"`, erased rows and SQL changes. */
+/** One change-log row as read back (`changesSince`). Payloads are absent for `history: "none"` and erased rows. */
 export interface ChangeRecord {
   readonly seq: number
   readonly opId: string
@@ -504,6 +446,9 @@ export interface ChangeRecord {
   readonly undoes?: string
   readonly undone: boolean
 }
+
+/** A value bound to a `?` of core SQL. */
+export type SqlValue = string | number | bigint | null | Uint8Array
 
 /** A core service's own SQL (scheduler, notifications): tables `core_<owner>__*`, joined to `transaction`. SQLite only. */
 export interface CoreSql {
@@ -760,7 +705,6 @@ export const readOnlyError = (what: string) =>
 /** A store that refuses everything (no store in this mode): reads and writes fail `unavailable`. */
 export const makeClosedStore = (reason: string): HouseholdStore => {
   const fail = Effect.fail(new StoreError({ reason: "unavailable", message: reason }))
-  const sql: ModuleSql = { prefix: "", table: (n) => n, fts5: false, query: () => fail, run: () => fail }
   const handle: CollectionHandle<any> = {
     get: () => fail,
     list: () => fail,
@@ -780,9 +724,7 @@ export const makeClosedStore = (reason: string): HouseholdStore => {
       readOnly: true,
       fts5: false,
       collection: () => handle,
-      sql: { ...sql, prefix: sqlPrefixOf(moduleId), table: (n) => `${sqlPrefixOf(moduleId)}${n}` },
-      transaction: (work) => work,
-      logChange: () => fail
+      transaction: (work) => work
     }),
     transaction: (work) => work,
     afterCommit: (f) => Effect.sync(f),

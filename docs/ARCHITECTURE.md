@@ -343,14 +343,13 @@ ModuleHostApi = {
 ### Household store and event bus (docs/MODULES-PLAN.md §4 P4; how to use it: [docs/STORING-DATA.md](STORING-DATA.md))
 
 ```ts
-defineModule({ apiVersion: 2, storage?: { collections?: [Collection], sql?: { migrations: [SqlMigration] } }, events?: [EventType], … })
+defineModule({ apiVersion: 2, storage?: { collections?: [Collection] }, events?: [EventType], … })
 defineCollection({ name, scope: "household" | "person" | "assistant" | "device" | "conversation", schema, version?, migrate?,
                    indexes?, search?, history?: "full" | "none", ambient?(rows, { now, turn }), ambientRows?, project?(row, device) })
-ModuleStore (ctx.store) = { collection(c): CollectionHandle<A>; sql: ModuleSql; transaction(work); logChange(change); readOnly; fts5 }
+ModuleStore (ctx.store) = { collection(c): CollectionHandle<A>; transaction(work); readOnly; fts5 }
 CollectionHandle<A> = { get(id, { scope? }); list({ scope?, where?, orderBy?, limit? }); search(text, { scope?, limit? });
                         insert(value, { id?, scope?, actor? }); update(id, f, { expectRev?, scope?, actor? }); remove(id, …);
                         erase(id, …); undo({ scope?, actor? }) }      // Row<A> = { id, rev, scope, value, createdAt, updatedAt, updatedBy: Actor }
-ModuleSql = { prefix: sqlPrefixOf(id); table(name); fts5; query(sql, params); run(sql, params) }   // one guarded statement per call
 ModuleEvents (ctx.events) = { publish(type, data, scope?): Effect<void>; subscribe(filter?): Stream<HouseholdEvent> }
 HouseholdStore (host) = { prepare(modules); availability(id); forModule(id); transaction; afterCommit(f); core(owner): CoreSql;
                           changesSince; lastSeq; endConversation; sweepConversations; pruneChanges; backup; onCommit }
@@ -383,12 +382,8 @@ HouseholdFeed = { active; snapshot(device): { seq, parts, cursor }; catchUp(devi
   kept; `undo` per actor, collection and scope; `erase` removes a row with every payload of it in its scope and its
   search words, then checkpoints the log (retried while a reader holds an older snapshot). What is kept how long and
   what an erase cannot reach (backups, 14 days): docs/STORING-DATA.md "Forgetting".
-- **Module SQL**: prefixes `sqlPrefixOf(id)` are one-to-one and prefix-free over all valid ids (`m_<id>__`, or
-  `mx_<hex>__` for an id with a double or trailing dash); the guard (`SqlGuard.ts`) follows SQLite's tokenizer, fails
-  closed on anything else, refuses other namespaces, the store's own names, transaction control (`RAISE(ROLLBACK)`
-  too) and the build's virtual tables except `json_each` / `json_tree`, and passes the statements' exact text.
 - **Versions**: `prepare` (before the module host is made) migrates a collection whose version rose eagerly (every row
-  through the write checks, its indexes and search words) and runs pending SQL migrations, in one transaction after a
+  through the write checks, its indexes and search words), in one transaction after a
   backup; a failure leaves the data and makes the module `unavailable`; a module whose stored data is newer is
   `unavailable` (`ModuleHostOptions.household`; the host's `judge` reads `store.availability`), and every call of its
   store fails `unavailable`. A newer core schema stops serve mode.
@@ -467,7 +462,7 @@ packages/
                     durations, clock times, dates and lists, RFC 5545 recurrence (build, describe, next occurrence, daylight-saving safe);
                     re-exports core's `parseDuration`; README in the package
   store-sqlite/     `@pva/store-sqlite`: the household store on `data/household.db` (node:sqlite via @effect/sql-sqlite-node), the module
-                    SQL guard, backups, export, the maintenance fiber and the doctor check (docs/STORING-DATA.md)
+                    backups, the maintenance fiber and the doctor check (docs/STORING-DATA.md)
   net/              `@pva/net`: `safeFetch` for URLs a model or user chose (resolves the host itself, refuses non-public addresses on every
                     hop, connects to the checked address, size and time limits), a cached JSON GET (TTL, ETag, stale-if-error) and the
                     outgoing `User-Agent` from the household API contact (`HOME_API_CONTACT`); README in the package

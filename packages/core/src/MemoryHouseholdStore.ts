@@ -10,11 +10,9 @@ import {
   type HouseholdStore,
   indexedEquals,
   matchesTokens,
-  type ModuleSql,
   readOnlyError,
   scopeKey,
   type ScopeRef,
-  sqlPrefixOf,
   type StoredModule,
   StoreError
 } from "./HouseholdStore.ts"
@@ -26,9 +24,7 @@ import { makeTransactions, type OutboxItem } from "./StoreTransactions.ts"
  * module tests. The collection semantics are the same code (`ModuleStoreImpl.ts`) and so is the transaction model
  * (`StoreTransactions.ts`: one transaction at a time, savepoints one at a time, ended frames refused, events after the
  * commit in change-log order); the backend below keeps rows in maps and gives the same answers as SQLite's indexes
- * and search (the shared contract, `@pva/core/store-contract`, checks both). It has no module SQL and no backups: a
- * module with `storage.sql` is `unavailable` here (test it on `makeSqliteStore({ filename: ":memory:" })` from
- * `@pva/store-sqlite`).
+ * and search (the shared contract, `@pva/core/store-contract`, checks both). It has no backups.
  */
 
 export interface MemoryStoreOptions {
@@ -247,12 +243,6 @@ export const makeMemoryHouseholdStore = (options: MemoryStoreOptions = {}): Hous
       })
   }
 
-  const noSql = (moduleId: string): ModuleSql => {
-    const fail = Effect.fail(new StoreError({ reason: "unavailable", message: "Module SQL needs the SQLite store (use makeSqliteStore({ filename: \":memory:\" }) in tests)" }))
-    const prefix = sqlPrefixOf(moduleId)
-    return { prefix, table: (n) => `${prefix}${n}`, fts5: false, query: () => fail, run: () => fail }
-  }
-
   const stores = new Map<string, ReturnType<typeof makeModuleStoreOn>>()
 
   const prepareOne = (m: StoredModule) =>
@@ -264,15 +254,11 @@ export const makeMemoryHouseholdStore = (options: MemoryStoreOptions = {}): Hous
       if (!MODULE_ID.test(m.id)) return void verdicts.set(m.id, { reason: "Its id cannot key stored data." })
       const stored = versions.get(m.id) ?? new Map<string, number>()
       const newer = [...collections.values()].find((c) => (stored.get(`collection:${c.name}`) ?? 0) > c.version)
-      const sqlNewer = (stored.get("sql") ?? 0) > (m.storage?.sql?.migrations.length ?? 0)
-      if (newer !== undefined || sqlNewer) {
+      if (newer !== undefined) {
         return void verdicts.set(m.id, {
-          reason: newer !== undefined
-            ? `Its data (${newer.name}, version ${stored.get(`collection:${newer.name}`)}) was written by a newer version of this module; update the module. The data is kept as it is.`
-            : "Its data was written by a newer version of this module; update the module. The data is kept as it is."
+          reason: `Its data (${newer.name}, version ${stored.get(`collection:${newer.name}`)}) was written by a newer version of this module; update the module. The data is kept as it is.`
         })
       }
-      if ((m.storage?.sql?.migrations.length ?? 0) > 0) return void verdicts.set(m.id, { reason: "It keeps SQL tables, which need the SQLite store." })
       const pending = [...collections.values()].filter((c) => (stored.get(`collection:${c.name}`) ?? 0) < c.version)
       if (pending.length === 0) return
       if (readOnly) {
@@ -290,7 +276,7 @@ export const makeMemoryHouseholdStore = (options: MemoryStoreOptions = {}): Hous
   const forModule = (moduleId: string) => {
     let s = stores.get(moduleId)
     if (s === undefined) {
-      s = makeModuleStoreOn(backend, moduleId, declared.get(moduleId) ?? new Map(), noSql(moduleId), () => verdicts.get(moduleId))
+      s = makeModuleStoreOn(backend, moduleId, declared.get(moduleId) ?? new Map(), () => verdicts.get(moduleId))
       stores.set(moduleId, s)
     }
     return s

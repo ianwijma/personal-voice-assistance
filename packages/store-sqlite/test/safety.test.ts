@@ -2,7 +2,7 @@
 // backups that cannot meet, the checkpoint after an erase, retention of every archive, collection-only upgrades,
 // index names, the index every list shape uses, module namespaces, and a complete, consistent export.
 import { assert, describe, it } from "@effect/vitest"
-import { checkQuery, defineCollection, sqlPrefixOf, type StoreError } from "@pva/core"
+import { checkQuery, defineCollection, type StoreError } from "@pva/core"
 import { Effect, Exit, Fiber, Schema } from "effect"
 import { createHash } from "node:crypto"
 import { chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, statSync, utimesSync, writeFileSync } from "node:fs"
@@ -163,31 +163,6 @@ describe("SQLite store: erase reaches the files", () => {
 })
 
 describe("SQLite store: names and indexes", () => {
-  it("module prefixes are one-to-one and none starts another, for every valid id", () => {
-    const ids = ["a", "a-b", "a--b", "a-", "a-b-", "ab", "a1", "a-1", "a--", "home-assistant", "b", "a-b--c"]
-    const prefixes = ids.map(sqlPrefixOf)
-    assert.strictEqual(new Set(prefixes).size, ids.length)
-    for (const [i, p] of prefixes.entries()) for (const [j, q] of prefixes.entries()) if (i !== j) assert.isFalse(q.startsWith(p), `${ids[i]} (${p}) starts ${ids[j]} (${q})`)
-    assert.strictEqual(sqlPrefixOf("home-assistant"), "m_home_assistant__")
-    assert.strictEqual(sqlPrefixOf("a--b"), "mx_612d2d62__")
-  })
-
-  it.effect("module a cannot reach the tables of module a--b, or the other way round", () =>
-    Effect.gen(function*() {
-      const store = yield* makeSqliteStore({ filename: ":memory:" })
-      const other = sqlPrefixOf("a--b")
-      yield* store.prepare([
-        { id: "a", storage: { sql: { migrations: ["CREATE TABLE m_a__data (x)"] } } },
-        { id: "a--b", storage: { sql: { migrations: [`CREATE TABLE ${other}data (x)`] } } }
-      ])
-      assert.strictEqual(store.availability("a"), undefined)
-      assert.strictEqual(store.availability("a--b"), undefined)
-      for (const sql of [`SELECT * FROM ${other}data`, `DELETE FROM "${other}data"`]) {
-        assert.strictEqual(errorOf(yield* Effect.exit(store.forModule("a").sql.query(sql)))?.reason, "refused")
-      }
-      assert.strictEqual(errorOf(yield* Effect.exit(store.forModule("a--b").sql.query("SELECT * FROM m_a__data")))?.reason, "refused")
-    }).pipe(Effect.scoped))
-
   it.effect("index names cannot collide: case-distinct fields and names with __ each get their own index; a dropped field loses its index", () =>
     Effect.gen(function*() {
       const store = yield* makeSqliteStore({ filename: ":memory:" })

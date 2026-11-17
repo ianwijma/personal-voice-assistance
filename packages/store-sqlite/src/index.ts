@@ -2,7 +2,6 @@
 import "./quiet.ts"
 
 export * from "./Maintenance.ts"
-export * from "./SqlGuard.ts"
 export * from "./SqliteStore.ts"
 export * from "./doctor.ts"
 export { pruneArchives } from "./files.ts"

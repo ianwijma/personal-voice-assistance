@@ -15,7 +15,6 @@ import {
   decodeStored,
   encodeValue,
   MAX_SEARCH_LIMIT,
-  type ModuleSql,
   type ModuleStore,
   readOnlyError,
   resolveScope,
@@ -103,7 +102,6 @@ export const makeModuleStoreOn = (
   backend: StoreBackend,
   moduleId: string,
   collections: ReadonlyMap<string, Collection<any>>,
-  sql: ModuleSql,
   unavailable: () => ModuleUnavailable | undefined = () => undefined
 ): ModuleStore => {
   const { tx } = backend
@@ -371,15 +369,7 @@ export const makeModuleStoreOn = (
       }
       return h as CollectionHandle<A>
     },
-    sql,
-    transaction: (work) => usable(tx.transaction(work)),
-    logChange: (change) =>
-      backend.readOnly ? Effect.fail(readOnlyError("logChange")) : usable(tx.transaction(Effect.gen(function*() {
-        const actor = yield* currentActor(moduleId, change.actor)
-        const at = yield* Clock.currentTimeMillis
-        const log = yield* logChange(`sql:${change.table}`, change.op, { id: change.id, scope: change.scope ?? { kind: "household" }, actor, at }, undefined)
-        yield* log.announce({})
-      })))
+    transaction: (work) => usable(tx.transaction(work))
   }
 }
 

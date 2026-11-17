@@ -8,16 +8,12 @@ import {
   type CommittedChange,
   type CoreSql,
   type HouseholdStore,
-  type ModuleSql,
   makeTransactions,
   type OutboxItem,
   readOnlyError,
   type ScopeRef,
   scopeFromColumns,
   scopeIdOf,
-  type SqlMigration,
-  sqlPrefixOf,
-  type SqlValue,
   type StoredModule,
   StoreError
 } from "@pva/core"
@@ -30,7 +26,6 @@ import { createHash } from "node:crypto"
 import { open, readdir, stat } from "node:fs/promises"
 import { dirname, join } from "node:path"
 import { copyDatabase, copyFilePrivately, type FileGuard, narrow, privateDir, pruneArchives, sqlite, unguarded } from "./files.ts"
-import { checkModuleStatement, coreStatements, type GuardContext, migrationStatements } from "./SqlGuard.ts"
 
 /**
  * The household store on SQLite (docs/STORING-DATA.md; shared-state-jobs-and-notifications.md §4.1): one file
@@ -122,6 +117,39 @@ const CORE_DDL = [
   `CREATE VIRTUAL TABLE pva_search USING fts5(k, t, tokenize = 'ascii', prefix = '2 3', detail = 'column')`,
   `INSERT INTO pva_search (pva_search, rank) VALUES ('secure-delete', 1)`
 ]
+
+/**
+ * The statements of a core migration (trusted code): split at each `;` outside quotes and comments. A trigger body
+ * (`BEGIN … END`) is not supported here; a core service that needs one writes it as its own migration step.
+ */
+const statementsOf = (sql: string): ReadonlyArray<string> => {
+  const out: Array<string> = []
+  let start = 0
+  for (let i = 0; i < sql.length; i++) {
+    const c = sql[i]!
+    if (c === "'" || c === "\"" || c === "`") {
+      const end = sql.indexOf(c, i + 1)
+      if (end < 0) throw new Error("an unclosed quote")
+      i = end
+    } else if (c === "[") {
+      const end = sql.indexOf("]", i + 1)
+      if (end < 0) throw new Error("an unclosed [")
+      i = end
+    } else if (c === "-" && sql[i + 1] === "-") {
+      const end = sql.indexOf("\n", i)
+      i = end < 0 ? sql.length : end
+    } else if (c === "/" && sql[i + 1] === "*") {
+      const end = sql.indexOf("*/", i + 2)
+      if (end < 0) throw new Error("an unclosed comment")
+      i = end + 1
+    } else if (c === ";") {
+      if (sql.slice(start, i).trim().length > 0) out.push(sql.slice(start, i))
+      start = i + 1
+    }
+  }
+  if (sql.slice(start).trim().length > 0) out.push(sql.slice(start))
+  return out
+}
 
 const lit = (s: string) => `'${s.replace(/'/g, "''")}'`
 const MODULE_ID = /^[a-z][a-z0-9-]{0,39}$/
@@ -365,10 +393,9 @@ export const makeSqliteStore = (options: SqliteStoreOptions): Effect.Effect<Sqli
       yield* exec("PRAGMA synchronous = NORMAL")
       yield* exec("PRAGMA secure_delete = ON")
     }
-    // Module views and triggers may not call functions with side effects.
+    // Views and triggers may not call functions with side effects.
     yield* exec("PRAGMA trusted_schema = OFF")
     const fts5 = yield* query<{ n: number }>("SELECT count(*) AS n FROM pragma_module_list WHERE name = 'fts5'").pipe(Effect.map((r) => Number(r[0]?.n ?? 0) > 0))
-    const vtableModules = new Set((yield* query<{ name: string }>("SELECT lower(name) AS name FROM pragma_module_list")).map((r) => r.name))
     const hasMeta = (yield* query<{ n: number }>("SELECT count(*) AS n FROM sqlite_schema WHERE type = 'table' AND name = 'pva_meta'"))[0]!.n > 0
     const metaOf = (key: string) => Effect.map(query<{ value: string }>("SELECT value FROM pva_meta WHERE key = ?", [key]), (r) => r[0]?.value)
     let created = false
@@ -389,16 +416,6 @@ export const makeSqliteStore = (options: SqliteStoreOptions): Effect.Effect<Sqli
       }
       if (!fts5) return yield* new StoreError({ reason: "unavailable", message: `${options.filename} uses full-text search (FTS5), which this Node's SQLite does not have` })
     }
-
-    // ---- Names in the schema (the SQL guard's "outside the prefix" list)
-
-    let schemaNames: ReadonlySet<string> = new Set()
-    const verdictCache = new Map<string, string | undefined>()
-    const refreshNames = Effect.map(query<{ name: string }>("SELECT lower(name) AS name FROM sqlite_schema"), (rows) => {
-      schemaNames = new Set(rows.map((r) => r.name))
-      verdictCache.clear()
-    })
-    yield* refreshNames
 
     // ---- Search entries
 
@@ -595,40 +612,9 @@ export const makeSqliteStore = (options: SqliteStoreOptions): Effect.Effect<Sqli
       exec("INSERT INTO pva_versions (owner, name, version) VALUES (?, ?, ?) ON CONFLICT (owner, name) DO UPDATE SET version = excluded.version", [owner, name, version])
 
     const verdicts = new Map<string, ModuleUnavailable>()
-    const declared = new Map<string, { readonly collections: ReadonlyMap<string, Collection<any>>; readonly sql: boolean }>()
+    const declared = new Map<string, { readonly collections: ReadonlyMap<string, Collection<any>> }>()
     const stores = new Map<string, ReturnType<typeof makeModuleStoreOn>>()
     let backedUpForUpgrade: string | undefined
-
-    const guardOf = (moduleId: string, allowSchema: boolean): GuardContext => ({ prefix: sqlPrefixOf(moduleId), schemaNames, allowSchema, readOnly, vtableModules })
-
-    const moduleSql = (moduleId: string, mode: "run" | "migrate"): ModuleSql => {
-      const prefix = sqlPrefixOf(moduleId)
-      const checked = (sql: string): Effect.Effect<void, StoreError> => {
-        if (mode === "run" && declared.get(moduleId)?.sql !== true) {
-          return Effect.fail(new StoreError({ reason: "unavailable", message: `Module ${moduleId} declares no storage.sql, so it has no tables` }))
-        }
-        if (mode === "run" && verdicts.has(moduleId)) {
-          return Effect.fail(new StoreError({ reason: "unavailable", message: `Module ${moduleId}'s data is not usable: ${verdicts.get(moduleId)!.reason}` }))
-        }
-        const cacheKey = `${moduleId}\u0000${mode}\u0000${sql}`
-        let why = verdictCache.get(cacheKey)
-        if (!verdictCache.has(cacheKey)) {
-          why = checkModuleStatement(sql, guardOf(moduleId, mode === "migrate"))
-          if (verdictCache.size > 2000) verdictCache.clear()
-          verdictCache.set(cacheKey, why)
-        }
-        return why === undefined ? Effect.void : Effect.fail(new StoreError({ reason: "refused", message: `Module ${moduleId}: refused SQL (${why})` }))
-      }
-      // Migrations run inside prepare's transaction (statements unlocked); at run time every call is one statement under `tx`.
-      const wrap = mode === "migrate" ? <X>(e: Effect.Effect<X, StoreError>) => e : <X>(e: Effect.Effect<X, StoreError>) => tx.statement(e)
-      return {
-        prefix,
-        table: (name) => `${prefix}${name}`,
-        fts5,
-        query: <R>(sql: string, params: ReadonlyArray<SqlValue> = []) => wrap(Effect.andThen(checked(sql), query<R>(sql, params))),
-        run: (sql, params = []) => (readOnly ? Effect.fail(readOnlyError("module SQL")) : wrap(Effect.andThen(checked(sql), exec(sql, params))))
-      }
-    }
 
     const hasRows = (module: string, collection: string) =>
       Effect.map(query<{ n: number }>("SELECT count(*) AS n FROM (SELECT 1 FROM pva_docs WHERE module = ? AND collection = ? LIMIT 1)", [module, collection]), (r) => Number(r[0]!.n) > 0)
@@ -674,81 +660,50 @@ export const makeSqliteStore = (options: SqliteStoreOptions): Effect.Effect<Sqli
         }
       })
 
-    const runMigration = (moduleId: string, migration: SqlMigration) =>
-      typeof migration === "function"
-        ? migration(moduleSql(moduleId, "migrate")).pipe(Effect.andThen(refreshNames))
-        : Effect.gen(function*() {
-          const split = migrationStatements(migration, guardOf(moduleId, true))
-          if ("refused" in split) return yield* new StoreError({ reason: "refused", message: `Module ${moduleId}: refused SQL in a migration (${split.refused})` })
-          for (const statement of split.statements) {
-            // Each statement is checked against the names as they are now (an earlier one may have made a table).
-            const why = checkModuleStatement(statement, guardOf(moduleId, true))
-            if (why !== undefined) return yield* new StoreError({ reason: "refused", message: `Module ${moduleId}: refused SQL in a migration (${why})` })
-            yield* exec(statement)
-            yield* refreshNames
-          }
-        })
-
     const prepareOne = (m: StoredModule) =>
       Effect.gen(function*() {
         const owner = `module:${m.id}`
         const collections = new Map((m.storage?.collections ?? []).map((c) => [c.name, c]))
-        const migrations = m.storage?.sql?.migrations ?? []
-        declared.set(m.id, { collections, sql: migrations.length > 0 })
+        declared.set(m.id, { collections })
         stores.delete(m.id)
         verdicts.delete(m.id)
         if (!MODULE_ID.test(m.id)) return void verdicts.set(m.id, { reason: "Its id cannot key stored data." })
         const stored = yield* versionsOf(owner)
-        const sqlStored = stored.get("sql") ?? 0
         const newer = [...collections.values()].find((c) => (stored.get(`collection:${c.name}`) ?? 0) > c.version)
-        if (newer !== undefined || sqlStored > migrations.length) {
+        if (newer !== undefined) {
           return void verdicts.set(m.id, {
-            reason: newer !== undefined
-              ? `Its stored data (${newer.name}, version ${stored.get(`collection:${newer.name}`)}) was written by a newer version of this module (this one knows ${newer.version}); update the module. The data is kept as it is.`
-              : `Its stored tables (version ${sqlStored}) were written by a newer version of this module (this one knows ${migrations.length}); update the module. The data is kept as it is.`
+            reason: `Its stored data (${newer.name}, version ${stored.get(`collection:${newer.name}`)}) was written by a newer version of this module (this one knows ${newer.version}); update the module. The data is kept as it is.`
           })
         }
-        const pendingSql = sqlStored < migrations.length
         const pendingCollections = [...collections.values()].filter((c) => (stored.get(`collection:${c.name}`) ?? 0) < c.version)
         // Rows to rewrite: a collection whose stored version is older and that has rows.
         let rewrites = false
         for (const c of pendingCollections) if (stored.has(`collection:${c.name}`) && (yield* hasRows(m.id, c.name))) rewrites = true
         if (readOnly) {
-          if (pendingSql || rewrites) verdicts.set(m.id, { reason: "Its stored data needs an upgrade, which the server makes when it starts (pnpm start serve)." })
+          if (rewrites) verdicts.set(m.id, { reason: "Its stored data needs an upgrade, which the server makes when it starts (pnpm start serve)." })
           return
         }
         let backup: string | undefined
-        if (pendingSql || rewrites) {
+        if (rewrites) {
           const done = yield* Effect.result(backupBeforeUpgrade(m.id))
           if (done._tag === "Failure") {
             return void verdicts.set(m.id, { reason: `Its data needs an upgrade, and the backup before it failed (${done.failure.message}); nothing was changed.` })
           }
           backup = done.success
         }
-        const before = new Set(schemaNames)
         const upgraded = yield* Effect.result(tx.transaction(Effect.gen(function*() {
-          for (let i = sqlStored; i < migrations.length; i++) {
-            yield* runMigration(m.id, migrations[i]!)
-            yield* setVersion(owner, "sql", i + 1)
-          }
           for (const c of pendingCollections) {
             const n = yield* migrateCollectionOn(backend, m.id, c)
             if (n > 0) log(`Module ${m.id}: ${n} row(s) of ${c.name} migrated to version ${c.version}`)
             yield* setVersion(owner, `collection:${c.name}`, c.version)
           }
           yield* syncIndexes(m.id, collections)
-          yield* refreshNames
-          const prefix = sqlPrefixOf(m.id)
-          const strays = [...schemaNames].filter((n) => !before.has(n) && !n.startsWith(prefix) && !n.startsWith("pva_ix_") && !n.startsWith("sqlite_autoindex_"))
-          if (strays.length > 0) return yield* new StoreError({ reason: "refused", message: `Module ${m.id}: its migrations made ${strays.join(", ")}, outside ${prefix}*` })
         })))
         if (upgraded._tag === "Failure") {
-          yield* refreshNames.pipe(Effect.ignore)
           const where = backup !== undefined ? ` A backup from before is at ${backup}.` : ""
           log(`Module ${m.id}: upgrading its data failed: ${upgraded.failure.message}`)
           return void verdicts.set(m.id, { reason: `Its data could not be upgraded (${upgraded.failure.message}); it was left as it was.${where}` })
         }
-        if (pendingSql) log(`Module ${m.id}: tables upgraded to version ${migrations.length}`)
       })
 
     // ---- Backups (a connection of their own, the copy on a worker thread)
@@ -798,7 +753,7 @@ export const makeSqliteStore = (options: SqliteStoreOptions): Effect.Effect<Sqli
     const forModule = (moduleId: string) => {
       let s = stores.get(moduleId)
       if (s === undefined) {
-        s = makeModuleStoreOn(backend, moduleId, declared.get(moduleId)?.collections ?? new Map(), moduleSql(moduleId, "run"), () => verdicts.get(moduleId))
+        s = makeModuleStoreOn(backend, moduleId, declared.get(moduleId)?.collections ?? new Map(), () => verdicts.get(moduleId))
         stores.set(moduleId, s)
       }
       return s
@@ -826,7 +781,7 @@ export const makeSqliteStore = (options: SqliteStoreOptions): Effect.Effect<Sqli
             if (readOnly) return yield* new StoreError({ reason: "unavailable", message: `The ${owner} tables need an upgrade, which the server makes when it starts` })
             yield* backupBeforeUpgrade(owner)
             const statements = yield* Effect.try({
-              try: () => migrations.map((m) => coreStatements(m)),
+              try: () => migrations.map((m) => statementsOf(m)),
               catch: (cause) => new StoreError({ reason: "invalid", message: `The ${owner} migrations cannot be read: ${cause instanceof Error ? cause.message : String(cause)}`, cause })
             })
             yield* tx.transaction(Effect.gen(function*() {
@@ -835,7 +790,6 @@ export const makeSqliteStore = (options: SqliteStoreOptions): Effect.Effect<Sqli
                 yield* setVersion(`core:${owner}`, "sql", i + 1)
               }
             }))
-            yield* tx.statement(refreshNames)
           })
       }
     }

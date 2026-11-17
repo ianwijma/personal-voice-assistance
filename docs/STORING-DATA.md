@@ -41,10 +41,7 @@ export const timers = defineCollection({
 
 export const timersModule = defineModule({
   apiVersion: 2, id: "timers", …,
-  storage: {
-    collections: [timers],
-    sql: { migrations: ["CREATE TABLE m_timers__log (id TEXT PRIMARY KEY, at INTEGER NOT NULL)"] }  // optional
-  },
+  storage: { collections: [timers] },
   events: [defineEventType({ type: "timer.ringing", project: (e, device) => … })],                    // optional
   start: ({ store, events }) => …
 })
@@ -123,47 +120,20 @@ a transaction inside one is a savepoint. Both stores follow the same model (`pac
 
 Do not wait inside a savepoint for a fiber that uses the outer transaction: it waits for the savepoint (rule 2).
 
-## Module SQL
-
-For joins (pantry, recipes): tables of your own, named with your prefix (`ctx.store.sql.prefix`;
-`ctx.store.sql.table("items")` gives the name): `m_<moduleId>__` with each dash an underscore (`m_home_assistant__…`);
-an id with a double or a trailing dash (`a--b`) is spelled in hex (`mx_612d2d62__`), so no module's prefix ever
-starts another's. Migrations are an array; `migrations[n]` brings the schema from version `n` to `n + 1`: a string of
-`;`-separated statements, or an effect on the guarded `sql`. Never edit a released migration; add one. At run time:
-`sql.query(text, params)` and `sql.run(text, params)`, one statement, `?` placeholders. Record a write in the change
-log with `ctx.store.logChange({ table, id, op })` when other modules or "what changed" should see it.
-
-The guard reads your SQL with SQLite's own tokenizer rules and **refuses what it does not fully understand** (a `$` or
-`#` parameter, an unterminated comment, a character SQLite would not accept); what it accepts reaches SQLite exactly
-as you wrote it. It refuses names outside your prefix in any quoting or case (`"pva_docs"`, `[PVA_DOCS]`,
-`'pva_docs'`), names starting with `sqlite_`, `pragma_`, `pva_` (the store's own) or `core_` (core services) or in
-another module's namespace (`m_…__…`, `mx_…`), an existing object outside your prefix, several statements in one call,
-`ATTACH`, `PRAGMA`, `VACUUM`, `COMMIT`, `SAVEPOINT`, `RELEASE`, `ROLLBACK` (also `RAISE(ROLLBACK, …)` and
-`OR ROLLBACK`, which would end the store's transaction), `BEGIN` outside a trigger, temporary objects,
-`load_extension`, the build's virtual tables other than `json_each` and `json_tree` (`dbstat`, `fts5vocab`, …), and
-schema statements outside migrations. Pass values as `?` parameters: a string literal that looks like another
-table's name is refused too. After each migration the store also checks that nothing outside your prefix appeared.
-`sql.fts5` says whether the build has FTS5 (`CREATE VIRTUAL TABLE m_x__fts USING fts5(…)`); Node 22's bundled SQLite
-has it, and the store needs it for collections' `search`.
-
-The in-memory test store has no module SQL: a module with `storage.sql` is `unavailable` there. Test it on
-`makeSqliteStore({ filename: ":memory:" })` from `@pva/store-sqlite`.
-
 ## Versions, upgrades and downgrades
 
 Before any module is made, serve mode judges every module's data (`HouseholdStore.prepare`): the stored version of
-each collection and of its SQL (`pva_versions`).
+each collection (`pva_versions`).
 
 - **Older data**: when a collection's version rose, **every row is migrated at start**, before the module runs:
   decoded at its stored version, migrated, and stored through the same checks as a write (the schema, the
-  64,000-character limit, scalar indexed fields), with its search words and its indexes; pending SQL migrations run
-  too. All of it in one transaction per module, after a backup of the file
+  64,000-character limit, scalar indexed fields), with its search words and its indexes. All of it in one transaction per module, after a backup of the file
   (`data/backups/household-<date>-before-<module>.db`), also when only a collection changed. A failure (one row is
   enough) rolls back: the file is as it was, the module is `unavailable` with the reason, the backup stays. A
   collection's indexes always match its declaration (an index the module no longer declares is dropped).
 - **Newer data** (written by a newer version of the module): the module is `unavailable` ("written by a newer version
   of this module; update the module. The data is kept as it is.") and its data is never opened by the older code: its
-  collections, its SQL and its transactions all fail `unavailable`, and pages never read it.
+  collections and its transactions all fail `unavailable`, and pages never read it.
 - **A newer core schema** (`pva_meta.schema` above what this assistant knows): serve mode does not start, and says to
   update the assistant or restore a backup made by this version. The file is read read-only to find that out, so it
   is not changed at all (not even switched to WAL).
