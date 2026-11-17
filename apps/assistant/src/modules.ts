@@ -5,6 +5,7 @@ import { clockModule, weatherModule } from "@pva/modules-builtin"
 import type { ModuleInfo } from "@pva/protocol"
 import { Config, Effect, type Scope } from "effect"
 import { CliSettingsRef } from "./cliSettings.ts"
+import { makeRequirementChecker } from "./requirements.ts"
 import { DataDirConfig, loadSettingsStore } from "./serve/SettingsStore.ts"
 import { openVault, VaultPathConfig } from "./serve/Vault.ts"
 
@@ -57,10 +58,23 @@ export const startCliModules = (
       for (const problem of store.problems) yield* Effect.logWarning(problem)
       return readOnlyPersistence(store.modulePersistence.initial)
     }).pipe(Effect.catchCause((cause) => Effect.as(Effect.logWarning("Could not read the saved settings; using defaults", cause), readOnlyPersistence()))))
-    const host = yield* makeModuleHost({ catalog: options.catalog ?? moduleCatalog, persistence, env: process.env })
+    const catalog = options.catalog ?? moduleCatalog
+    // Module API v2: what the modules need is probed once, before any starts (never on a turn).
+    const checker = makeRequirementChecker({ dataDir: yield* DataDirConfig.pipe(Effect.orElseSucceed(() => "data")) })
+    yield* checker.probeCatalog(catalog)
+    const host = yield* makeModuleHost({
+      catalog,
+      persistence,
+      env: process.env,
+      platform: { os: process.platform, arch: process.arch },
+      requirements: checker.check
+    })
     yield* host.startEnabled
     for (const module of host.modules()) {
       if (module.state === "error") yield* Effect.logWarning(`Module ${module.name} is not available: ${module.error ?? "unknown error"}`)
+      if (module.state === "unavailable" && module.enabled) {
+        yield* Effect.logWarning(`Module ${module.name} cannot run here: ${module.unavailable?.reason ?? "unknown reason"} (pnpm start doctor says how to fix it)`)
+      }
     }
     return { ...host.snapshot(), infos: host.modules() }
   })
