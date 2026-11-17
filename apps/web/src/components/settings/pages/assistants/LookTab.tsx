@@ -19,7 +19,14 @@ export function LookTab({ draft }: TabProps) {
   const types = useClientState((s) => s.deviceTypes)
   // Where this assistant answers but the device shows its own look (its own value, or its type's defaults).
   const fixedTypes = types.filter((t) => t.settings.look.from === "device" && t.settings.assistants.some((x) => x.assistant === a.id))
-  const fixed = devices.filter((d) => d.own.look?.from === "device" && d.settings.assistants.some((x) => x.assistant === a.id))
+  // Every device whose effective look is its own and that lists this assistant, except those that take both the look
+  // and the assistant list from a type already named above (the type's row stands for them).
+  const fixedKinds = new Set(fixedTypes.map((t) => t.kind))
+  const fixed = devices.filter((d) =>
+    d.settings.look.from === "device" &&
+    d.settings.assistants.some((x) => x.assistant === a.id) &&
+    !(fixedKinds.has(d.kind) && d.own.look === undefined && d.own.assistants === undefined)
+  )
   return (
     <>
       <p className="text-[14px] text-ink-muted" data-testid="look-intro">
