@@ -132,7 +132,8 @@ import {
   MAX_PREVIEW_CHARS,
   type ProviderInfo,
   type ProviderVoices,
-  type VoiceEntry
+  type VoiceEntry,
+  voiceFor
 } from "@pva/protocol"
 import { exampleEngineStatus, exampleSnapshot, exampleVoiceSection, exampleWeatherModule } from "@pva/protocol/examples"
 import { type WebSocket, WebSocketServer } from "ws"
@@ -1579,7 +1580,11 @@ const adminTraceFields = (r: Reply, v: VSession): Partial<TraceInfo> => {
   const config: NonNullable<TraceInfo["config"]> = {
     llm: { account: a.llm.account, model: a.llm.model, effort: a.llm.effort, thinking: a.llm.thinking, maxTokens: a.llm.maxTokens },
     hearing: { hearer: a.id, engine: a.hearing.engine, model: a.hearing.model, language: a.hearing.language, eagerSilenceMs: a.hearing.eagerSilenceMs, finalSilenceMs: a.hearing.finalSilenceMs },
-    voice: `${a.voice.provider}:${a.voice.voiceId}`,
+    // docs/LOOKS-AND-VOICES.md §3: the device's own voice, else the assistant's.
+    voice: (() => {
+      const spoken = voiceFor(voice.settingsOf(v.deviceId).voice, a)
+      return `${spoken.provider}:${spoken.voiceId}`
+    })(),
     modules: onModules.length,
     tools: onModules.reduce((n, m) => n + m.tools.filter((t) => !(chosen[m.id]?.offTools ?? []).includes(t.name)).length, 0),
     replyEarly: a.replyEarly,

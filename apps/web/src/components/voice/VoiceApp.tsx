@@ -1,6 +1,5 @@
 "use client"
 import { useEffect, useState } from "react"
-import { choiceFromSearch } from "@/characters/choice.ts"
 import { createAssistantClient } from "@/lib/client.ts"
 import { ChatPanel } from "../ChatPanel.tsx"
 import { shallowEqual } from "@/lib/store.ts"
@@ -24,14 +23,7 @@ import { VoiceSheet } from "./VoiceSheet.tsx"
 export function VoiceApp() {
   const [client] = useState(() => createAssistantClient({ frontend: "voice" }))
   useEffect(() => client.connect(), [client])
-  // After `connect` (which loads the stored preferences): `?character=<id>&opt.<id>=<value>` sets this browser's
-  // character choice, then leaves the address bar (docs/CHARACTERS.md §7).
-  useEffect(() => {
-    const asked = choiceFromSearch(location.search, client.prefs.get().character)
-    if (asked === undefined) return
-    client.prefs.dispatch({ character: asked.choice })
-    history.replaceState(history.state, "", `${location.pathname}${asked.search}${location.hash}`)
-  }, [client])
+  // `?character=<id>&opt.<id>=<value>` tries a character for this page load: the stage reads it (`Visualiser.tsx`).
   useEffect(() => {
     // For tests and debugging in the console.
     ;(window as unknown as { __pva?: unknown }).__pva = client

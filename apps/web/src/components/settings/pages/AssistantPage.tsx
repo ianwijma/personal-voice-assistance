@@ -9,11 +9,13 @@ import { DeleteDialog, DuplicateDialog } from "./assistants/dialogs.tsx"
 import { Strip } from "./assistants/parts.tsx"
 import { BasicsTab, BehaviourTab, HearingTab, ModelTab, ModulesTab, VoiceTab } from "./assistants/tabs.tsx"
 import { useAssistantDraft } from "./assistants/useAssistantDraft.ts"
+import { LookTab } from "./assistants/LookTab.tsx"
 import { UsedTab } from "./assistants/used.tsx"
 import { useVoiceNameOf } from "./AssistantsPage.tsx"
 
 /**
- * Assistants › one assistant (docs/ASSISTANTS.md §7.1, mock-up `admin.html`): the summary strip, seven tabs
+ * Assistants › one assistant (docs/ASSISTANTS.md §7.1, mock-up `admin.html`): the summary strip, eight tabs (Look:
+ * docs/LOOKS-AND-VOICES.md §4)
  * (the tab is the third part of the path: `#settings/assistants/jeff/model`), and one save bar for the whole
  * assistant. Every tab edits the same draft; the dirty mark on a tab says which tabs have unsaved edits.
  */
@@ -120,6 +122,7 @@ function Editor({ info }: { readonly info: AssistantInfo }) {
         {tab === "model" && <ModelTab draft={draft} info={info} />}
         {tab === "hearing" && <HearingTab draft={draft} info={info} />}
         {tab === "voice" && <VoiceTab draft={draft} info={info} />}
+        {tab === "look" && <LookTab draft={draft} info={info} />}
         {tab === "modules" && <ModulesTab draft={draft} info={info} />}
         {tab === "used" && <UsedTab info={info} />}
       </div>

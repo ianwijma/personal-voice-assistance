@@ -4,7 +4,7 @@ How to design and build the thing on the voice stage that shows the assistant is
 
 This is a living document. Update it whenever a character is added, the contract gains something, or a rule turns out wrong. The investigation that produced the first set of characters is in `docs/research/visualiser-investigation/` (findings, prior art and a runnable lab with 19 prototypes); this document holds what should outlast it.
 
-**Status (2026-11-16).** The groundwork is in the app: the contract (`apps/web/src/characters/contract.ts`), the host that runs one character on the voice stage (`host.ts`), the feature extractor, kit, options and the shared helpers brought over from the lab, the registry, the baseline character (the sine lines, `library/sine-lines.ts`) and the compatibility tests of §6. Only the baseline is in the library so far; the 18 prototypes of the investigation (`docs/research/visualiser-investigation/`, where a character is called a *design*) are to be ported one file each (§7). The lab stays as a frozen research snapshot with its own copies. Extensions (§4.2, §5) are designed but none exists yet, and there is no settings page (§4.4). Port authors start at `apps/web/src/characters/README.md`.
+**Status (2026-11-16).** The groundwork is in the app: the contract (`apps/web/src/characters/contract.ts`), the host that runs one character on the voice stage (`host.ts`), the feature extractor, kit, options and the shared helpers brought over from the lab, the registry, the baseline character (the sine lines, `library/sine-lines.ts`) and the compatibility tests of §6. Only the baseline is in the library so far; the 18 prototypes of the investigation (`docs/research/visualiser-investigation/`, where a character is called a *design*) are to be ported one file each (§7). The lab stays as a frozen research snapshot with its own copies. Extensions (§4.2, §5) are designed but none exists yet. Since 2026-11-17 the look is chosen and tuned in the admin, per assistant and per device (§4.4, docs/LOOKS-AND-VOICES.md). Port authors start at `apps/web/src/characters/README.md`.
 
 **Update (2026-11-16): the whole stage.** A character may now ask for a canvas covering the whole voice page instead of the box in its middle (`canvas: "stage"`, §2.6), and every frame says where the box is (`focus`). Characters that do not ask behave exactly as before. The baseline is a stage character (version 1.1.0). The 18 ports each move to the stage by the recipe in the README.
 
@@ -131,8 +131,8 @@ What a character declares about itself: the `Character` object in `apps/web/src/
 | Field | Meaning | Where it is used |
 |---|---|---|
 | `id` | Stable kebab-case identifier, equal to the file name. Never reused for a different character. Stored in the choice. | Registry, choice, host |
-| `name`, `summary`, `inspiredBy` | For a future picker. | Manifest check only, until there is a picker |
-| `family` | `baseline`, `abstract` or `figure` (the lab calls figures `character`). | Manifest check |
+| `name`, `summary`, `inspiredBy` | For the picker. | Manifest check; the admin's character picker shows `name`, `summary` and `family` |
+| `family` | `baseline`, `abstract` or `figure` (the lab calls figures `character`). | Manifest check; the picker |
 | `version` | Semantic version of the character itself (§4.5). | Manifest check; stored with the choice |
 | `contract` | The contract major version it was written against: `1`. | Host refuses a version it does not serve |
 | `renderer` | What it draws with: `2d`, `webgl2`. | Host gives a `webgl2` character a canvas of its own; refuses a renderer it does not serve |
@@ -140,7 +140,7 @@ What a character declares about itself: the `Character` object in `apps/web/src/
 | `modes` | One line per core mode. | Manifest check |
 | `extraModes` | The extra modes it draws itself (§4.3), one line each. | Host's mode resolution |
 | `mappings` | Signal → effect pairs. | Manifest check (the promises; shown in a future picker) |
-| `options` | The settings it offers (§4.4). | Host validates stored values on every load |
+| `options` | The settings it offers (§4.4). | Host validates stored values on every load; the admin's look editor renders a control for each (label, help, `group`, `unit`) |
 | `uses` | The extensions (§4.2) its code reads from `frame.ext` today, each with what it gains and what it does without them. Only those: not an extension it might use one day (a design note says that), and none for a character that reads no extension. | Manifest check; the host will use it to decide what to produce once extensions exist |
 | `create(canvas)` | Returns an instance with `resize`, `frame`, `dispose`. | Host |
 
@@ -219,9 +219,9 @@ The app's extra modes are `asleep`, `muted`, `not-started`, `disconnected` and `
 
 ### 4.4 Options
 
-A character's settings are data: the character declares them, the host renders the controls, validates and stores the values. Validation is `apps/web/src/characters/options.ts` (from the lab); the host runs it on every load. There are no controls yet (see the end of this section).
+A character's settings are data: the character declares them, the host renders the controls, validates and stores the values. Validation is `apps/web/src/characters/options.ts` (from the lab); the host runs it on every load, and the admin's look editor runs it on every edit (see the end of this section).
 
-Stored form, as it will go into a device profile:
+Stored form, as an assistant's or a device's `look` holds it (`Look` in `packages/protocol/src/looks.ts`):
 
 ```json
 { "character": "flame", "version": "1.2.0", "options": { "size": 0.8, "style": "lantern", "sparks": false } }
@@ -257,7 +257,7 @@ Rules for the **character author**:
 | `nods` | toggle | Figures: nods along at phrase ends. |
 | `followsPointer` | toggle | Figures with eyes: gaze follows the pointer. |
 
-**Where a person chooses and tunes a character is not decided.** The admin UI is being reorganised around assistants and devices (`docs/ASSISTANTS.md`, in progress on its own branch), and a character most likely belongs to an assistant, with a device able to override it. Until that lands there is no settings page for characters: the choice is a per-browser preference (`Prefs.character` in `apps/web/src/lib/prefs.ts`, a `CharacterChoice`, absent = the baseline), and the stored form above is what any later settings page will read and write. Nothing in a character depends on where its settings are kept. To try a character, open the voice page with `?character=<id>` and any number of `&opt.<id>=<value>` (the lab's syntax): this sets the preference for this browser and the parameters then leave the address bar. Values from the address bar are stored as given (strings) and validated on load like any other.
+**Where a person chooses and tunes a character: decided (docs/LOOKS-AND-VOICES.md).** A look (the stored form above) belongs to an **assistant** (`Assistant.look`, absent = the baseline), and a **device** or a device type's defaults can override it for every assistant (`DeviceSettings.look`, `{ from: "assistant" }` or `{ from: "device", look }`). The server resolves it into `device.setup`, and the voice page shows the look of the assistant holding the turn, else of the one its top bar names, else the device's own, else the baseline. It is edited in the admin: Assistants › an assistant › Look, and Devices › a device (or "Every browser") › Look; the editor renders each character's declared options (number → slider, toggle → switch, choice → segmented control or select, colour → theme colour or custom), validates every value with `options.ts` and stores only values that differ from their defaults, with the character's `version`. The old per-browser preference (`Prefs.character`) is no longer read; a stored one is dropped on the next write. Nothing in a character depends on where its settings are kept. To try a character, open the voice page with `?character=<id>` and any number of `&opt.<id>=<value>` (the lab's syntax; `opt.*` alone tunes the configured look): it wins over the configured look for this page load only, nothing is stored, and the parameters leave the address bar. Values from the address bar are kept as given (strings) and validated on load like any other.
 
 Three settings belong to the host, not to any character, and apply to all: the person's colour, the assistant's colour, and sensitivity (a multiplier on loudness signals). A character must not duplicate them. They are stored next to the character's own options under the keys `$you`, `$voice` and `$sensitivity` (as in the lab). When the host falls back to the baseline it keeps these three and none of the failed character's own options.
 
@@ -347,7 +347,7 @@ A contract change is accepted only when the full set of existing characters pass
 3. Make the five modes read from stills in both themes. Then make voices tellable. Then add options.
 4. Add optional extension support last, each with its fallback.
 5. Run the tests: `pnpm --filter @pva/web exec vitest run test/characters/compat.test.ts -t '"<id>"'`. The first run writes `test/characters/__snapshots__/<id>.digest`; commit it with the character. Then `pnpm check` and `pnpm test`.
-6. Look at it in the app (`pnpm --filter @pva/web dev:mock`, then `?character=<id>`; the README in `apps/web/src/characters/` has the recipe for every visual state and for screenshots), and run the checklist (§2.5).
+6. Look at it in the app (`pnpm --filter @pva/web dev:mock`, then `?character=<id>` on the voice page, or pick it on an assistant's Look tab in the admin, where its options appear as controls; the README in `apps/web/src/characters/` has the recipe for every visual state and for screenshots), and run the checklist (§2.5).
 7. Add it to the list below.
 
 ## 8. Characters

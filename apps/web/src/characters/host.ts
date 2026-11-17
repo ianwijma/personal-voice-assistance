@@ -170,8 +170,8 @@ const FALLBACK_PALETTE: Palette = {
 
 const TOKENS = { bg: "bg", surface: "surface", line: "line", ink: "ink", inkFaint: "ink-faint", you: "you", voice: "voice", danger: "danger" } as const
 
-/** The theme's colour tokens as RGB, by painting each into one pixel (any CSS colour syntax, e.g. oklch). */
-const readPalette = (probe: CanvasRenderingContext2D | null, dark: boolean): Palette => {
+/** The theme's colour tokens as RGB, by painting each into one pixel (any CSS colour syntax, e.g. oklch). Also used by the admin's previews (`preview.ts`). */
+export const readPalette = (probe: CanvasRenderingContext2D | null, dark: boolean): Palette => {
   if (probe === null) return { ...FALLBACK_PALETTE, dark }
   const cs = getComputedStyle(document.documentElement)
   const out: { -readonly [K in keyof Palette]: Palette[K] } = { ...FALLBACK_PALETTE, dark }

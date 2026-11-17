@@ -1,4 +1,4 @@
-import type { ConversationInfo, DeviceProfile, DeviceSetup, HistoryItem, ServerMessage, Snapshot } from "@pva/protocol"
+import type { ConversationInfo, DeviceProfile, DeviceSetup, HistoryItem, Look, ServerMessage, Snapshot } from "@pva/protocol"
 import { DEFAULT_DEVICE_PROFILE } from "@pva/protocol"
 import type { ClientState, TurnView } from "./state.ts"
 
@@ -119,16 +119,33 @@ export const reachText = (s: ClientState, id: string, started: boolean, display:
   return text
 }
 
+/**
+ * The one assistant the top bar names as answering: who has the turn, else the one that answers without a phrase (a
+ * named one that left the list: the first), else the only one. Undefined when the bar names none ("Auto", "Jeff · T3").
+ */
+export const shownAssistantId = (s: ClientState): string | undefined => {
+  const setup = s.setup
+  if (setup === undefined || setup.assistants.length === 0) return undefined
+  const held = holderOf(s)
+  if (held !== undefined) return held
+  if (setup.withoutPhrase.mode === "assistant") return defaultAssistantId(setup) ?? setup.assistants[0]!.id
+  return setup.assistants.length === 1 ? setup.assistants[0]!.id : undefined
+}
+
+/**
+ * The look on the stage (docs/LOOKS-AND-VOICES.md §3): that of the assistant holding the turn, else of the one the top
+ * bar names (`shownAssistantId`), as the setup resolved it (the device's own look, else the assistant's); else the
+ * device's own look; else undefined, the baseline.
+ */
+export const stageLookOf = (s: ClientState): Look | undefined => assistantOf(s, shownAssistantId(s))?.look ?? s.setup?.look
+
 /** The top bar's name: who has the turn, else who answers, else "Auto", else the assistants. */
 export const topBarName = (s: ClientState): string => {
   const setup = s.setup
   if (setup === undefined || setup.assistants.length === 0) return NO_ASSISTANT
-  const held = holderOf(s)
-  if (held !== undefined) return nameOf(s, held)
-  const wp = setup.withoutPhrase
-  if (wp.mode === "assistant") return nameOf(s, defaultAssistantId(setup) ?? setup.assistants[0]!.id)
-  if (setup.assistants.length === 1) return setup.assistants[0]!.name
-  if (wp.mode === "typesafe") return "Auto"
+  const shown = shownAssistantId(s)
+  if (shown !== undefined) return nameOf(s, shown)
+  if (setup.withoutPhrase.mode === "typesafe") return "Auto"
   const names = setup.assistants.map((a) => a.name)
   return names.length <= 2 ? names.join(" · ") : `${names.length} assistants`
 }
