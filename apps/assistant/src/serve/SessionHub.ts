@@ -629,9 +629,18 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
    * P5: a declaration of a connection's device (`hello`, `device.caps`) with its number of arrival: known at once
    * (unless one that arrived later was applied already), written in the background.
    */
-  const declare = (deviceId: string, capabilities: DeviceCapabilities, seq: number) => {
+  const declare = (deviceId: string, capabilities: DeviceCapabilities, seq: number, kind?: string) => {
+    const spoke = options.speakerAllowed?.(deviceId, kind) ?? true
     if (!registry.declare(deviceId, capabilities, seq)) return false
     options.run(registry.persist)
+    // Review round 3: a declaration that takes speech away stops the reply in flight at once, by the same path as the
+    // page's Stop (the page is told to stop and flush what it holds), also while synthesis is paused; the send-time
+    // gate (`linkFor`) stays.
+    deviceChanged()
+    if (spoke && !(options.speakerAllowed?.(deviceId, kind) ?? true)) {
+      const session = sessions.get(deviceId)
+      if (session !== undefined && session.publisher.committedTurn() !== undefined) session.conversation.stop()
+    }
     return true
   }
 
@@ -652,7 +661,7 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
         changed = true
       }
     }
-    const declared = pending.capabilities !== undefined && declare(device.id, pending.capabilities.value, pending.capabilities.seq)
+    const declared = pending.capabilities !== undefined && declare(device.id, pending.capabilities.value, pending.capabilities.seq, device.kind)
     if (!changed && !declared) return
     deviceChanged()
     devicesChanged(true)
@@ -765,7 +774,7 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
     // number of arrival (a later one from another tab still wins).
     const held = client.capsPending?.capabilities
     client.capsPending = undefined
-    if (held !== undefined && client.device !== undefined && declare(client.device.id, held.value, held.seq)) {
+    if (held !== undefined && client.device !== undefined && declare(client.device.id, held.value, held.seq, client.device.kind)) {
       deviceChanged()
       refreshSetups()
     }
@@ -861,7 +870,7 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
     // P5: only `hello` and `device.caps` declare, each with its number of arrival, taken now; the record is written in
     // the background (a declaration that comes while it is written goes into it).
     // Known at once, also to the welcome below (its setup says whether replies are spoken here).
-    if (client.device?.capabilities !== undefined && declare(client.device.id, client.device.capabilities, arrival)) deviceChanged()
+    if (client.device?.capabilities !== undefined && declare(client.device.id, client.device.capabilities, arrival, client.device.kind)) deviceChanged()
     const device = client.device
     if (device === undefined || registry.known(device.id)) return welcome(client, message)
     // A device the server has no record of: answered once its first registration is written (or refused), so every

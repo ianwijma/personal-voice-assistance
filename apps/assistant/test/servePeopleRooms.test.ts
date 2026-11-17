@@ -665,6 +665,55 @@ describe("review round 2: permission is decided where output leaves, against com
   })
 })
 
+describe("review round 3: a declaration that takes speech away stops the reply in flight", () => {
+  const stopCase = async (tts: Tts["Service"], player: { readonly speed: number }) => {
+    const dataDir = await dataDirWithAlpha()
+    const stt = controlledStt()
+    server = await startTestServer({ build: fakeBuild({ stt: stt.stt, llm: scriptedLlm(() => "A long answer.").llm, tts }), dataDir })
+    const page = await ScriptedClient.connect({ url: server.url, deviceId: `stop-tab-${player.speed * 10}`, player })
+    clients.push(page)
+    await page.hello({ device: { ...page.device, capabilities: tablet } })
+    await until("the device record", () => server!.handle.store.settings().devices[page.device.id] !== undefined)
+    await page.claim()
+    await until("the recogniser stream", () => stt.open() === 1)
+    const from = page.messages.length
+    stt.emit(endOfTurn("tell me a story"))
+    await page.waitFor("reply.start", () => true, { from, timeoutMs: 10_000 })
+    await until("audio on the page", () => [...page.replySamples.values()].some((n) => n > 0))
+    const { speaker: _, ...mute } = tablet
+    const at = page.messages.length
+    page.send({ type: "device.caps", capabilities: mute })
+    // The page is told to stop and flush: a reply.stop, not a reply.end it would drain its queue for.
+    await page.waitFor("reply.stop", () => true, { from: at, timeoutMs: 3_000 })
+    await page.waitFor("turn.end", () => true, { from: at, timeoutMs: 10_000 })
+    expect(page.messages.slice(at).some((m) => m.type === "reply.end")).toBe(false)
+  }
+
+  it("with the reply buffered on the page (synthesis done, the player behind): a stop is sent", async () => {
+    // A fast voice: the whole reply is sent at once, and the page plays at a tenth of real time.
+    const fastTts = Tts.of({
+      sampleRate: 22_050,
+      synthesize: (clauses) =>
+        clauses.pipe(Stream.flatMap((clause) => Stream.fromIterable(Array.from({ length: 80 }, (): TtsAudio => ({ audio: new Uint8Array(new Int16Array(882).fill(800).buffer), clause })))))
+    })
+    await stopCase(fastTts, { speed: 0.1 })
+  })
+
+  it("with synthesis paused after a few chunks: a stop is sent at once, with no further chunk to notice it", async () => {
+    const pausedTts = Tts.of({
+      sampleRate: 22_050,
+      synthesize: (clauses) =>
+        clauses.pipe(Stream.flatMap((clause) =>
+          Stream.concat(
+            Stream.fromIterable(Array.from({ length: 4 }, (): TtsAudio => ({ audio: new Uint8Array(new Int16Array(882).fill(800).buffer), clause }))),
+            Stream.fromEffect(Effect.as(Effect.sleep(30_000), { audio: new Uint8Array(0), clause } as TtsAudio))
+          )
+        ))
+    })
+    await stopCase(pausedTts, { speed: 1 })
+  })
+})
+
 describe("review round 1: device.caps is bounded on the server", () => {
   it("a flood is coalesced to the latest declaration, written at most about once a second; empty and unchanged ones do nothing", async () => {
     let writes = 0
