@@ -150,11 +150,11 @@ function Card({ id, checked, tabbable, loop, stored, onPick, onKey }: {
         )}
       </div>
       <div className="flex min-w-0 flex-col gap-0.5 px-2.5 py-2">
-        <span className="flex min-w-0 items-center gap-1.5">
+        <span className="flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-0.5">
           <span aria-hidden="true" className={cx("inline-flex size-3.5 shrink-0 items-center justify-center rounded-full border", checked ? "border-you" : "border-ink-faint")}>
             {checked && <span className="size-1.5 rounded-full bg-you" />}
           </span>
-          <span className="truncate text-[14px] text-ink">{name}</span>
+          <span className="min-w-0 text-[14px] leading-tight text-ink [overflow-wrap:anywhere]">{name}</span>
           {character !== undefined && <span className="label ml-auto shrink-0 text-[9px] text-ink-faint">{FAMILY[character.family] ?? character.family}</span>}
         </span>
         <span id={`chr-${id}-sum`} className="line-clamp-2 min-h-[2lh] text-[12px] leading-snug text-ink-muted">

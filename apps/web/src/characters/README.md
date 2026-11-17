@@ -97,7 +97,7 @@ The suite drives your character with simulated voices through the real feature e
 MOCK_SCENARIO=typed pnpm --filter @pva/web dev:mock     # the mock assistant on :8787 and next dev on :3000
 ```
 
-Open `http://localhost:3000/?character=<id>` (add `&opt.<option>=<value>` for options, `&opt.$you=%23ff8800`, `&opt.$sensitivity=1.5` for the host-level settings). The choice is saved for this browser and the parameters leave the address bar; `?character=sine-lines` goes back to the baseline. If port 8787 is taken (a running assistant), start with `MOCK_PORT=8797` and add `&ws=ws://localhost:8797/ws`.
+Open `http://localhost:3000/?character=<id>` (add `&opt.<option>=<value>` for options, `&opt.$you=%23ff8800`, `&opt.$sensitivity=1.5` for the host-level settings). This is a try-out for this page load only: it wins over the look configured in the admin, nothing is stored, and the parameters leave the address bar; reload to see the configured look again. `opt.*` without `character` tunes the configured look. To keep a look, set it in the admin (`http://localhost:3000/admin/`, password `admin password`): Assistants › an assistant › Look (the picker, your options as controls, a live preview), or Devices › a device › Look for a device's own (docs/LOOKS-AND-VOICES.md). If port 8787 is taken (a running assistant), start with `MOCK_PORT=8797` and add `&ws=ws://localhost:8797/ws`.
 
 The `typed` scenario runs no turn by itself, so every visual state can be held with the mock's control endpoints (port as above):
 

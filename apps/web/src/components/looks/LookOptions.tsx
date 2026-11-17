@@ -204,7 +204,7 @@ function ColorControl({ id, value, helpId, onSet }: { readonly id: string; reado
           aria-label="Custom colour"
           value={hex}
           onChange={(e) => onSet(e.target.value)}
-          className="h-10 w-14 cursor-pointer rounded-md border border-line bg-surface p-1 max-sm:h-11"
+          className="h-10 w-14 cursor-pointer rounded-md border border-line bg-surface p-1 text-[16px] max-sm:h-11"
         />
       )}
     </div>

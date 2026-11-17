@@ -55,7 +55,7 @@ const main = async () => {
   // Jeff has a look of his own (flame, tuned); the kitchen iPad shows one look and one voice for every assistant.
   await post("/mock/assistant", { id: "jeff", patch: { look: { character: "flame", version: "1.1.1", options: { size: 0.8, sparks: false, $sensitivity: 1.3 } } } })
   await post("/mock/device", { deviceId: "d-kitchen-ipad-0001", settings: { look: { from: "device", look: { character: "robot-eyes", version: "1.1.1", options: { $voice: "#4f8fe0" } } }, voice: { from: "device", voice: { provider: "sherpa", voiceId: "nl_NL-pim-medium" } } } })
-  const browser = await chromium.launch()
+  const browser = await chromium.launch({ args: ["--use-fake-device-for-media-stream", "--use-fake-ui-for-media-stream"] })
   try {
     for (const theme of themes) {
       for (const size of sizes) {
@@ -93,16 +93,20 @@ const main = async () => {
         // The device list.
         await page.evaluate(() => { location.hash = "#settings/devices" })
         await page.getByTestId("device-list").waitFor()
+        await page.locator('[data-device="d-kitchen-ipad-0001"]').scrollIntoViewIfNeeded()
         await page.waitForTimeout(800)
         await shot("device-list")
         await ctx.close()
         // The voice page: Jeff answers, with his look (flame).
         if (!want("voice-page")) continue
-        const vctx = await browser.newContext({ viewport: size.viewport, deviceScaleFactor: size.scale, colorScheme: theme })
+        const vctx = await browser.newContext({ viewport: size.viewport, deviceScaleFactor: size.scale, colorScheme: theme, permissions: ["microphone"] })
         const voice = await vctx.newPage()
         await voice.goto(`${WEB}/`)
         await voice.waitForFunction(() => (window as unknown as { __pvaStage?: { debug: () => { id: string } } }).__pvaStage?.debug().id === "flame", undefined, { timeout: 15_000 })
-        await post("/mock/state", { state: "speaking" })
+        await voice.getByTestId("start").click()
+        await voice.waitForFunction(() => document.querySelector("[data-testid=stage]")?.getAttribute("data-visual-state") === "listening", undefined, { timeout: 15_000 })
+        await post("/mock/turn", {})
+        await voice.waitForFunction(() => document.querySelector("[data-testid=stage]")?.getAttribute("data-visual-state") === "speaking", undefined, { timeout: 15_000 })
         await voice.waitForTimeout(2500)
         await voice.screenshot({ path: join(out, `voice-page-${theme}-${size.name}.png`) })
         console.log(`wrote voice-page-${theme}-${size.name}.png`)
