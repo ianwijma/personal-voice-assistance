@@ -511,6 +511,23 @@ test.describe("admin, desktop, dark", () => {
     await shot(page, "admin-desktop-17-diagnostics-health")
   })
 
+  test("extended fields (protocol 10): records, text lists, a combo, an info value, buttons and web addresses", async ({ page, baseURL }) => {
+    await loginAdmin(page, baseURL, "#settings/shared/modules")
+    const demo = page.getByTestId("module-block-demo-home")
+    await expect(demo).toBeVisible()
+    await demo.getByTestId("records-rooms").getByRole("button", { name: /^Living room lounge/ }).click()
+    await demo.getByRole("button", { name: "Check" }).click()
+    await expect(demo.getByTestId("action-check").getByTestId("action-result")).toHaveText(/every lamp is in one of the rooms/)
+    await expect(demo.getByTestId("route-call").first()).toBeVisible()
+    // Tall enough for the whole module page: the demo home is the last module on it.
+    await page.setViewportSize({ width: 1280, height: 2400 })
+    await demo.scrollIntoViewIfNeeded()
+    await page.mouse.move(2, 2)
+    await settle(page)
+    const box = (await demo.boundingBox())!
+    await page.screenshot({ path: join(dir, "admin-desktop-77-module-extended-fields.png"), clip: { x: 0, y: Math.max(0, box.y - 24), width: 1280, height: Math.min(2400 - Math.max(0, box.y - 24), box.height + 120) } })
+  })
+
   test("shared settings: the navigation, the accounts, a module in error", async ({ page, baseURL }) => {
     await mock.scenario("modules")
     await loginAdmin(page, baseURL, "#settings/shared/accounts")
