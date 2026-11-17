@@ -1,6 +1,7 @@
 import { Schema } from "effect"
 import { Assistant, AssistantId, MAX_ASSIGNMENTS, MAX_PHRASES_PER_DEVICE } from "./assistants.ts"
 import type { AssistantHearing, Issue } from "./assistants.ts"
+import { DeviceLook, DeviceVoice, FOLLOW_ASSISTANT, Look, lookFor } from "./looks.ts"
 import { InterruptMode, NonNegativeFinite, OutputPath } from "./common.ts"
 import { DeviceId, DeviceInfo, DeviceName, FrontendKindId, PrebufferMs, WAKE_PHRASES_MAX, WakeMatch, WakePhrase, wakeWords, WEB_VOICE_KIND } from "./frontends.ts"
 
@@ -74,7 +75,11 @@ export const DeviceSettings = Schema.Struct({
   interruptMode: InterruptMode,
   audio: DeviceAudio,
   /** web-voice only. */
-  captions: DeviceCaptions
+  captions: DeviceCaptions,
+  /** The character on the voice stage for every assistant on the device, or each assistant's (docs/LOOKS-AND-VOICES.md). */
+  look: DeviceLook,
+  /** The voice of every assistant on the device, or each assistant's own. */
+  voice: DeviceVoice
 })
 export type DeviceSettings = typeof DeviceSettings.Type
 
@@ -86,7 +91,9 @@ export const DeviceSettingsKey = Schema.Literals([
   "voicePage",
   "interruptMode",
   "audio",
-  "captions"
+  "captions",
+  "look",
+  "voice"
 ])
 export type DeviceSettingsKey = typeof DeviceSettingsKey.Type
 export const DEVICE_SETTINGS_KEYS: ReadonlyArray<DeviceSettingsKey> = DeviceSettingsKey.literals
@@ -99,7 +106,9 @@ export const DeviceOwn = Schema.Struct({
   voicePage: Schema.optionalKey(VoicePage),
   interruptMode: Schema.optionalKey(InterruptMode),
   audio: Schema.optionalKey(DeviceAudio),
-  captions: Schema.optionalKey(DeviceCaptions)
+  captions: Schema.optionalKey(DeviceCaptions),
+  look: Schema.optionalKey(DeviceLook),
+  voice: Schema.optionalKey(DeviceVoice)
 })
 export type DeviceOwn = typeof DeviceOwn.Type
 
@@ -111,7 +120,9 @@ export const DeviceSettingsPatch = Schema.Struct({
   voicePage: Schema.optionalKey(Schema.NullOr(VoicePage)),
   interruptMode: Schema.optionalKey(Schema.NullOr(InterruptMode)),
   audio: Schema.optionalKey(Schema.NullOr(DeviceAudio)),
-  captions: Schema.optionalKey(Schema.NullOr(DeviceCaptions))
+  captions: Schema.optionalKey(Schema.NullOr(DeviceCaptions)),
+  look: Schema.optionalKey(Schema.NullOr(DeviceLook)),
+  voice: Schema.optionalKey(Schema.NullOr(DeviceVoice))
 })
 export type DeviceSettingsPatch = typeof DeviceSettingsPatch.Type
 
@@ -154,7 +165,9 @@ export const BUILT_IN_WEB_VOICE_SETTINGS: DeviceSettings = {
   voicePage: { pick: false },
   interruptMode: "confirm",
   audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, speakAloud: true, outputPath: "direct", prebufferMs: 60 },
-  captions: { captions: true, speakTyped: true }
+  captions: { captions: true, speakTyped: true },
+  look: FOLLOW_ASSISTANT,
+  voice: FOLLOW_ASSISTANT
 }
 
 export const WEB_VOICE_DEVICE_TYPE: DeviceTypeDefinition = {
@@ -559,8 +572,12 @@ export const DeviceSetup = Schema.Struct({
     name: Schema.String,
     purpose: Schema.String,
     on: Schema.Boolean,
-    phrases: Schema.Array(Schema.String)
+    phrases: Schema.Array(Schema.String),
+    /** The stage's character while this assistant answers here: the device's look, else the assistant's; absent = the baseline. */
+    look: Schema.optionalKey(Look)
   })),
+  /** The device's own look, when it has one: shown when no assistant is listed. Absent = follow the assistant (or the baseline). */
+  look: Schema.optionalKey(Look),
   withoutPhrase: Schema.Union([
     Schema.Struct({ mode: Schema.Literal("nobody") }),
     Schema.Struct({ mode: Schema.Literal("assistant"), assistant: AssistantId }),
@@ -579,14 +596,14 @@ export type DeviceSetup = typeof DeviceSetup.Type
 /** A voice connection's setup from the device's effective settings. Assignments of unknown assistants are left out. */
 export const deviceSetupFrom = (
   settings: DeviceSettings,
-  assistants: ReadonlyMap<string, Pick<Assistant, "id" | "name" | "purpose" | "on">>,
+  assistants: ReadonlyMap<string, Pick<Assistant, "id" | "name" | "purpose" | "on" | "look">>,
   options: { readonly deviceId?: string | undefined; readonly canAuto: boolean }
 ): DeviceSetup => {
   const listed = settings.assistants.flatMap((a) => {
     const known = assistants.get(a.assistant)
-    return known === undefined
-      ? []
-      : [{ id: known.id, name: known.name, purpose: known.purpose, on: known.on, phrases: [...a.phrases] }]
+    if (known === undefined) return []
+    const look = lookFor(settings.look, known)
+    return [{ id: known.id, name: known.name, purpose: known.purpose, on: known.on, phrases: [...a.phrases], ...(look !== undefined ? { look } : {}) }]
   })
   const wp = settings.withoutPhrase
   return {
@@ -597,6 +614,7 @@ export const deviceSetupFrom = (
     canAuto: options.canAuto,
     interruptMode: settings.interruptMode,
     audio: settings.audio,
-    captions: settings.captions
+    captions: settings.captions,
+    ...(settings.look.from === "device" ? { look: settings.look.look } : {})
   }
 }
