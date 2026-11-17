@@ -2,6 +2,7 @@ import { Effect } from "effect"
 import dns from "node:dns"
 import http from "node:http"
 import https from "node:https"
+import zlib from "node:zlib"
 import { classifyAddress, type AddressClass } from "./Address.ts"
 import {
   NetAborted, NetFailure, NetRefused, NetTimeout, NetTooLarge, type RefusedRule, type SafeFetchError
@@ -15,6 +16,10 @@ export interface ConnectRequest {
   readonly url: URL
   readonly address: string
   readonly method: "GET" | "HEAD"
+  /**
+   * Lower-case names, already checked. They never hold `Host` or `Accept-Encoding`: the connector derives the Host header and the TLS
+   * name from `url` alone and asks for `identity`.
+   */
   readonly headers: Readonly<Record<string, string>>
   readonly signal: AbortSignal
 }
@@ -27,10 +32,42 @@ export interface ConnectResponse {
 /** Opens one connection to `address`, sends the request, returns status, headers and a body stream. Must honour `signal`. */
 export type Connector = (request: ConnectRequest) => Promise<ConnectResponse>
 
+/**
+ * Which response types a caller accepts. `types` are media types ("text/html") or a structured-syntax suffix of a type
+ * ("application/*+json"); parameters such as `charset` are ignored when comparing. A response without a Content-Type, or with one
+ * not listed, is refused before its body is read (rule `content-type`).
+ */
+export interface ContentTypePolicy {
+  /** For messages: "web page", "JSON". */
+  readonly name: string
+  readonly types: ReadonlyArray<string>
+}
+
+/** The presets. A caller may also pass its own policy (no wildcards other than the `type/*+suffix` form). */
+export const contentTypes = {
+  /** A page a model asked to read: HTML, plain text, PDF (web-search §13, rule 5). */
+  webPage: { name: "web page", types: ["text/html", "application/xhtml+xml", "text/plain", "application/pdf"] },
+  /** An API answer. */
+  json: { name: "JSON", types: ["application/json", "application/*+json"] },
+  /** RSS, Atom, JSON Feed and the XML types feeds are served as. */
+  feed: { name: "feed", types: ["application/rss+xml", "application/atom+xml", "application/rdf+xml", "application/feed+json", "application/json", "application/xml", "text/xml"] },
+  /** Raster images, for a media proxy. SVG is not one: it can carry script. */
+  image: { name: "image", types: ["image/png", "image/jpeg", "image/gif", "image/webp", "image/avif"] }
+} as const satisfies Record<string, ContentTypePolicy>
+
 export interface SafeFetchOptions {
+  /** The response types this caller accepts: one of `contentTypes` or its own. Required. */
+  readonly accept: ContentTypePolicy
   readonly method?: "GET" | "HEAD"
+  /**
+   * Request headers. Names are compared without case; giving one twice is refused. Refused (rule `header`): `Host` and anything that
+   * would change where or how the request goes (`Connection`, `Keep-Alive`, `Proxy-Connection`, `Proxy-Authorization`,
+   * `Transfer-Encoding`, `TE`, `Trailer`, `Upgrade`, `Content-Length`, `Expect`, `HTTP2-Settings`, pseudo-headers), `Accept-Encoding`
+   * (the request always asks for `identity`), and a name or value with a character a header cannot hold. `Accept` defaults to the
+   * policy's types.
+   */
   readonly headers?: Readonly<Record<string, string>>
-  /** Default 2 MiB. */
+  /** After decompression. Default 2 MiB. */
   readonly maxBytes?: number
   /** Total, redirects and body included. Default 6000. */
   readonly timeoutMs?: number
@@ -45,9 +82,22 @@ export interface SafeResponse {
   /** The URL that finally answered (after redirects). */
   readonly url: string
   readonly status: number
+  /**
+   * Lower-case names. When the body arrived compressed, `content-encoding` and `content-length` are removed, because `body` is the
+   * decompressed content; `encoding` says how it came.
+   */
   readonly headers: Readonly<Record<string, string>>
+  /**
+   * The content, decompressed. Empty for HEAD, for 204 and 304, and for a response outside 200–299 whose type the policy does not
+   * accept (its body is not read).
+   */
   readonly body: Uint8Array
+  /** How the body was compressed on the wire. */
+  readonly encoding: "identity" | "gzip" | "deflate" | "br"
+  /** The media type of the response, lower case without parameters ("text/html"); "" when there was none. */
+  readonly contentType: string
   readonly redirects: ReadonlyArray<string>
+  /** The body as text, in the charset the Content-Type names (UTF-8 when it names none or one this machine does not know). */
   readonly text: () => string
 }
 
@@ -65,24 +115,33 @@ export const nodeResolver: Resolver = async (host, signal) => {
   return found.map((a) => a.address)
 }
 
-/** The connector of `node:http(s)`: dials the checked IP; TLS SNI, certificate name and Host header stay the URL's host. */
+/**
+ * The connector of `node:http(s)`: dials the checked IP. The Host header and the TLS name (SNI and the certificate check) come
+ * from `url` only, set after the caller's headers so nothing can replace them, and the request asks for `identity`.
+ */
 export const nodeConnector: Connector = ({ url, address, method, headers, signal }) =>
   new Promise<ConnectResponse>((resolve, reject) => {
     const secure = url.protocol === "https:"
     const hostname = url.hostname.startsWith("[") ? url.hostname.slice(1, -1) : url.hostname
     const isIp = classifyAddress(hostname) !== undefined
+    const outgoing: Record<string, string> = Object.create(null)
+    for (const [k, v] of Object.entries(headers)) if (k !== "host" && k !== "accept-encoding") outgoing[k] = v
+    outgoing["host"] = url.host
+    outgoing["accept-encoding"] = "identity"
     const options: https.RequestOptions = {
       host: address,
       port: url.port === "" ? (secure ? 443 : 80) : Number(url.port),
       method,
       path: `${url.pathname}${url.search}`,
-      headers: { host: url.host, "accept-encoding": "identity", ...headers },
+      headers: outgoing,
+      setHost: false,
       agent: false,
       signal,
+      // TLS: SNI and the certificate check use the URL's name (Node checks `servername`); an IP-literal URL is checked against that IP.
       ...(secure && !isIp ? { servername: hostname } : {})
     }
     const req = (secure ? https : http).request(options, (res) => {
-      const out: Record<string, string> = {}
+      const out: Record<string, string> = Object.create(null)
       for (const [k, v] of Object.entries(res.headers)) if (v !== undefined) out[k] = Array.isArray(v) ? v.join(", ") : v
       resolve({ status: res.statusCode ?? 0, headers: out, body: res })
     })
@@ -122,7 +181,7 @@ export const checkUrl = (input: string | URL, allowLan: boolean): URL | NetRefus
   if (host === "") return refuse("host-name", shown, "No host")
   if (classifyAddress(host) === undefined && !allowLan) {
     if (!host.includes(".")) return refuse("host-name", shown, `"${host}" is a local name`)
-    if (localSuffixes.some((s) => host.endsWith(s))) return refuse("host-name", shown, `"${host}" is a local name`)
+    if (localSuffixes.some((s) => host === s.slice(1) || host.endsWith(s))) return refuse("host-name", shown, `"${host}" is a local name`)
   }
   return url
 }
@@ -134,6 +193,185 @@ const addressRefusal = (url: URL, address: string, allowLan: boolean): NetRefuse
   return refuse("address", `${url.protocol}//${url.host}${url.pathname}`, `${address} is a ${parsed.class} address`, { address, addressClass: parsed.class })
 }
 
+// ---- request headers -------------------------------------------------------------------------------------------------------------
+
+/** RFC 9110 §5.6.2 token characters. */
+const tokenPattern = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/
+/** Visible ASCII, space and tab: what a field value may hold (RFC 9110 §5.5), without the obsolete octets above 0x7e. */
+const valuePattern = /^[\t\x20-\x7e]*$/
+/** Headers a caller may not set: the authority, hop-by-hop and framing headers, and the encoding (always `identity`). */
+const forbiddenHeaders: ReadonlySet<string> = new Set([
+  "host", "connection", "keep-alive", "proxy-connection", "proxy-authorization", "proxy-authenticate", "transfer-encoding", "te", "trailer",
+  "upgrade", "content-length", "expect", "http2-settings", "accept-encoding"
+])
+/** What survives a redirect to another origin: nothing that could carry a credential. */
+const crossOriginHeaders: ReadonlySet<string> = new Set(["accept", "accept-language", "user-agent"])
+
+/** The caller's headers, lower-case and checked, or the refusal. Review round 1, finding 4. */
+export const checkHeaders = (url: string, given: Readonly<Record<string, string>> | undefined, accept: ContentTypePolicy): Record<string, string> | NetRefused => {
+  const out: Record<string, string> = Object.create(null)
+  for (const name of Object.keys(given ?? {})) {
+    const value = given![name]
+    const key = name.toLowerCase()
+    if (!tokenPattern.test(name)) return refuse("header", url, `"${name}" is not a header name`)
+    if (forbiddenHeaders.has(key)) return refuse("header", url, `The ${name} header may not be set`)
+    if (typeof value !== "string" || !valuePattern.test(value)) return refuse("header", url, `The ${name} header holds a character a header cannot hold`)
+    if (key in out) return refuse("header", url, `The ${name} header is given twice`)
+    out[key] = value.trim()
+  }
+  if (!("accept" in out)) {
+    const listed = accept.types.filter((t) => !t.includes("*"))
+    out["accept"] = listed.length > 0 ? listed.join(", ") : "*/*"
+  }
+  return out
+}
+
+// ---- response types and encodings ---------------------------------------------------------------------------------------------------
+
+const mediaTypePattern = /^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+$/
+
+/** "Text/HTML; charset=UTF-8" → "text/html"; "" when there is none or it is not a media type. */
+export const mediaTypeOf = (header: string | undefined): string => {
+  if (header === undefined) return ""
+  const essence = header.split(";")[0]!.trim().toLowerCase()
+  return mediaTypePattern.test(essence) ? essence : ""
+}
+
+const validPolicy = (policy: ContentTypePolicy | undefined): boolean =>
+  policy !== undefined && Array.isArray(policy.types) && policy.types.length > 0 &&
+  policy.types.every((t) => typeof t === "string" && (mediaTypePattern.test(t) || /^[a-z0-9!#$&^_.+-]+\/\*\+[a-z0-9!#$&^_.-]+$/.test(t)))
+
+/** The media type is one the policy lists, directly or by its "+suffix". */
+export const acceptsType = (policy: ContentTypePolicy, type: string): boolean =>
+  type !== "" && policy.types.some((t) => {
+    const star = /^([^/]+)\/\*\+(.+)$/.exec(t)
+    if (star === null) return t === type
+    const [main, sub] = type.split("/") as [string, string]
+    return main === star[1] && sub.endsWith(`+${star[2]}`)
+  })
+
+type Encoding = SafeResponse["encoding"]
+const encodingOf = (header: string | undefined): Encoding | undefined => {
+  const v = (header ?? "").trim().toLowerCase()
+  if (v === "" || v === "identity") return "identity"
+  if (v === "gzip" || v === "x-gzip") return "gzip"
+  if (v === "deflate") return "deflate"
+  if (v === "br") return "br"
+  return undefined // another coding, or several ("gzip, br")
+}
+
+/** The charset of a Content-Type, if this machine's TextDecoder knows it. */
+const decoderFor = (header: string | undefined): InstanceType<typeof TextDecoder> => {
+  const m = /;\s*charset\s*=\s*"?([^";\s]+)"?/i.exec(header ?? "")
+  if (m !== null) {
+    try {
+      return new TextDecoder(m[1]!)
+    } catch {
+      // unknown label: UTF-8 below
+    }
+  }
+  return new TextDecoder()
+}
+
+// ---- the body ------------------------------------------------------------------------------------------------------------------------
+
+const closeBody = (body: AsyncIterable<Uint8Array>): void => {
+  void Promise.resolve(body[Symbol.asyncIterator]().return?.()).catch(() => undefined)
+}
+
+/** Read the raw body, counting bytes; a body still arriving past `limit` is refused. */
+async function* rawChunks(body: AsyncIterable<Uint8Array>, limit: number, url: string, signal: AbortSignal): AsyncGenerator<Uint8Array> {
+  const iterator = body[Symbol.asyncIterator]()
+  let total = 0
+  try {
+    for (;;) {
+      const next = await raceAbort(iterator.next(), signal)
+      if (next.done === true) return
+      total += next.value.byteLength
+      if (total > limit) throw new NetTooLarge({ url, limit })
+      yield next.value
+    }
+  } finally {
+    void Promise.resolve(iterator.return?.()).catch(() => undefined)
+  }
+}
+
+/** A zlib-wrapped deflate stream starts with a header whose first two bytes are a multiple of 31 (RFC 1950); raw deflate does not. */
+const isZlibHeader = (b: Uint8Array): boolean => b.length >= 2 && (b[0]! & 0x0f) === 8 && ((b[0]! << 8) | b[1]!) % 31 === 0
+
+/**
+ * Decompress as the chunks arrive and count the decompressed bytes against `limit`, so a small compressed body cannot expand past it
+ * (review round 1, finding 3). Compressed bytes are counted too.
+ */
+const decodeBody = async (encoding: Exclude<Encoding, "identity">, body: AsyncIterable<Uint8Array>, limit: number, url: string, signal: AbortSignal): Promise<Array<Uint8Array>> => {
+  const raw = rawChunks(body, limit, url, signal)
+  let first: IteratorResult<Uint8Array> | undefined = await raw.next()
+  const stream: zlib.Gunzip | zlib.Inflate | zlib.InflateRaw | zlib.BrotliDecompress =
+    encoding === "gzip" ? zlib.createGunzip() : encoding === "br" ? zlib.createBrotliDecompress()
+      : first.done !== true && !isZlibHeader(first.value) ? zlib.createInflateRaw() : zlib.createInflate()
+  const out: Array<Uint8Array> = []
+  let total = 0
+  let failure: unknown
+  const done = new Promise<void>((resolve) => {
+    stream.on("data", (chunk: Buffer) => {
+      total += chunk.byteLength
+      if (total > limit) {
+        failure ??= new NetTooLarge({ url, limit })
+        stream.destroy()
+        resolve()
+        return
+      }
+      out.push(new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength))
+    })
+    stream.on("error", (e) => { failure ??= e; resolve() })
+    stream.on("end", () => resolve())
+    stream.on("close", () => resolve())
+  })
+  const onAbort = () => { failure ??= signal.reason; stream.destroy() }
+  signal.addEventListener("abort", onAbort, { once: true })
+  try {
+    for (;;) {
+      const next = first ?? (await raw.next())
+      first = undefined
+      if (failure !== undefined) break
+      if (next.done === true) { stream.end(); break }
+      // Respect back-pressure, so a stalled consumer cannot make the decompressor buffer without bound.
+      if (!stream.write(next.value)) await new Promise<void>((r) => { stream.once("drain", r); stream.once("close", r) })
+    }
+    await done
+  } catch (e) {
+    failure ??= e
+    stream.destroy()
+  } finally {
+    signal.removeEventListener("abort", onAbort)
+    void raw.return(undefined).catch(() => undefined)
+  }
+  if (failure !== undefined) {
+    if (failure instanceof NetTooLarge || signal.aborted) throw failure
+    throw new NetFailure({ url, stage: "response", detail: `The ${encoding} body could not be decompressed: ${failure instanceof Error ? failure.message : String(failure)}` })
+  }
+  return out
+}
+
+const concat = (chunks: ReadonlyArray<Uint8Array>): Uint8Array => {
+  const total = chunks.reduce((n, c) => n + c.byteLength, 0)
+  const out = new Uint8Array(total)
+  let at = 0
+  for (const c of chunks) {
+    out.set(c, at)
+    at += c.byteLength
+  }
+  return out
+}
+
+const readBody = async (encoding: Encoding, body: AsyncIterable<Uint8Array>, limit: number, url: string, signal: AbortSignal): Promise<Uint8Array> => {
+  if (encoding !== "identity") return concat(await decodeBody(encoding, body, limit, url, signal))
+  const chunks: Array<Uint8Array> = []
+  for await (const c of rawChunks(body, limit, url, signal)) chunks.push(c)
+  return concat(chunks)
+}
+
+const sameOrigin = (a: URL, b: URL) => a.origin === b.origin
 const redirectStatuses: ReadonlySet<number> = new Set([301, 302, 303, 307, 308])
 
 interface Hop {
@@ -153,7 +391,7 @@ const resolveHop = async (url: URL, allowLan: boolean, resolver: Resolver, signa
     if (signal.aborted) throw signal.reason
     return new NetFailure({ url: url.href, stage: "dns", detail: e instanceof Error ? e.message : String(e) })
   }
-  if (addresses.length === 0) return new NetFailure({ url: url.href, stage: "dns", detail: `No address for ${host}` })
+  if (!Array.isArray(addresses) || addresses.length === 0) return new NetFailure({ url: url.href, stage: "dns", detail: `No address for ${host}` })
   // Every answer must be public: a name that also points inside is refused, so a mixed answer cannot be used to probe.
   for (const a of addresses) {
     const refusal = addressRefusal(url, a, allowLan)
@@ -162,40 +400,22 @@ const resolveHop = async (url: URL, allowLan: boolean, resolver: Resolver, signa
   return { url, addresses }
 }
 
-const readBody = async (body: AsyncIterable<Uint8Array>, limit: number, url: string, signal: AbortSignal): Promise<Uint8Array> => {
-  const iterator = body[Symbol.asyncIterator]()
-  const chunks: Array<Uint8Array> = []
-  let total = 0
-  try {
-    for (;;) {
-      const next = await raceAbort(iterator.next(), signal)
-      if (next.done === true) break
-      total += next.value.byteLength
-      if (total > limit) throw new NetTooLarge({ url, limit })
-      chunks.push(next.value)
-    }
-  } finally {
-    void Promise.resolve(iterator.return?.()).catch(() => undefined)
-  }
-  const out = new Uint8Array(total)
-  let at = 0
-  for (const c of chunks) {
-    out.set(c, at)
-    at += c.byteLength
-  }
-  return out
-}
-
-const sameOrigin = (a: URL, b: URL) => a.origin === b.origin
+const positive = (v: number | undefined, fallback: number): number | undefined =>
+  v === undefined ? fallback : Number.isFinite(v) && v > 0 ? v : undefined
 
 const run = async (input: string | URL, options: SafeFetchOptions, allowLan: boolean, signal: AbortSignal): Promise<SafeResponse> => {
-  const limit = options.maxBytes ?? defaultMaxBytes
-  const maxRedirects = options.maxRedirects ?? defaultMaxRedirects
+  const shownInput = String(input)
+  const limit = positive(options.maxBytes, defaultMaxBytes)
+  const maxRedirects = options.maxRedirects === undefined ? defaultMaxRedirects : Number.isInteger(options.maxRedirects) && options.maxRedirects >= 0 ? options.maxRedirects : undefined
+  const method = options.method ?? "GET"
+  if (limit === undefined || maxRedirects === undefined) throw refuse("options", shownInput, "maxBytes must be a positive number and maxRedirects a whole number from 0")
+  if (method !== "GET" && method !== "HEAD") throw refuse("options", shownInput, "Only GET and HEAD")
+  if (!validPolicy(options.accept)) throw refuse("options", shownInput, "A content-type policy with at least one media type is required")
   const resolver = options.resolver ?? nodeResolver
   const connector = options.connector ?? nodeConnector
-  const method = options.method ?? "GET"
-  let headers: Record<string, string> = {}
-  for (const [k, v] of Object.entries(options.headers ?? {})) headers[k.toLowerCase()] = v
+  const checkedHeaders = checkHeaders(shownInput, options.headers, options.accept)
+  if (checkedHeaders instanceof NetRefused) throw checkedHeaders
+  let headers = checkedHeaders
   const redirects: Array<string> = []
   let current = checkUrl(input, allowLan)
   if (current instanceof NetRefused) throw current
@@ -216,9 +436,11 @@ const run = async (input: string | URL, options: SafeFetchOptions, allowLan: boo
       }
     }
     if (response === undefined) throw new NetFailure({ url: url.href, stage: "connect", detail: lastError })
+    const responseHeaders: Record<string, string> = Object.create(null)
+    for (const [k, v] of Object.entries(response.headers)) responseHeaders[k.toLowerCase()] = v
     if (redirectStatuses.has(response.status)) {
-      void Promise.resolve(response.body[Symbol.asyncIterator]().return?.()).catch(() => undefined)
-      const location = response.headers["location"]
+      closeBody(response.body)
+      const location = responseHeaders["location"]
       if (location === undefined || location === "") throw refuse("redirect-target", url.href, "Redirect without a Location")
       if (hop >= maxRedirects) throw refuse("redirect-limit", url.href, `More than ${maxRedirects} redirects`)
       let next: URL
@@ -230,41 +452,61 @@ const run = async (input: string | URL, options: SafeFetchOptions, allowLan: boo
       const checked = checkUrl(next, allowLan)
       if (checked instanceof NetRefused) throw checked
       if (!sameOrigin(url, checked)) {
-        const { authorization: _a, cookie: _c, ...rest } = headers
-        headers = rest
+        const kept: Record<string, string> = Object.create(null)
+        for (const k of Object.keys(headers)) if (crossOriginHeaders.has(k)) kept[k] = headers[k]!
+        headers = kept
       }
       redirects.push(checked.href)
       current = checked
       continue
     }
-    const declared = Number(response.headers["content-length"])
+    const contentType = mediaTypeOf(responseHeaders["content-type"])
+    const finish = (body: Uint8Array, encoding: Encoding, decoded: boolean): SafeResponse => {
+      const shownHeaders: Record<string, string> = Object.create(null)
+      for (const [k, v] of Object.entries(responseHeaders)) if (!(decoded && (k === "content-encoding" || k === "content-length"))) shownHeaders[k] = v
+      const decoder = decoderFor(responseHeaders["content-type"])
+      return { url: url.href, status: response!.status, headers: shownHeaders, body, encoding, contentType, redirects, text: () => decoder.decode(body) }
+    }
+    // HEAD, 204 and 304 have no body: nothing to limit or to type-check.
+    if (method === "HEAD" || response.status === 204 || response.status === 304) {
+      closeBody(response.body)
+      return finish(new Uint8Array(0), "identity", false)
+    }
+    const typeOk = acceptsType(options.accept, contentType)
+    if (!typeOk) {
+      closeBody(response.body)
+      // An error page of another type is not read; the status still reaches the caller.
+      if (response.status < 200 || response.status > 299) return finish(new Uint8Array(0), "identity", false)
+      throw refuse("content-type", url.href, contentType === "" ? `The response has no content type; a ${options.accept.name} was expected` : `The response is ${contentType}, not a ${options.accept.name}`)
+    }
+    const encoding = encodingOf(responseHeaders["content-encoding"])
+    if (encoding === undefined) {
+      closeBody(response.body)
+      throw refuse("content-encoding", url.href, `The response is encoded as "${responseHeaders["content-encoding"]}"`)
+    }
+    const declared = Number(responseHeaders["content-length"])
     if (Number.isFinite(declared) && declared > limit) {
-      void Promise.resolve(response.body[Symbol.asyncIterator]().return?.()).catch(() => undefined)
+      closeBody(response.body)
       throw new NetTooLarge({ url: url.href, limit })
     }
-    const bytes = method === "HEAD" ? new Uint8Array(0) : await readBody(response.body, limit, url.href, signal)
-    return {
-      url: url.href,
-      status: response.status,
-      headers: response.headers,
-      body: bytes,
-      redirects,
-      text: () => new TextDecoder().decode(bytes)
-    }
+    const bytes = await readBody(encoding, response.body, limit, url.href, signal)
+    return finish(bytes, encoding, encoding !== "identity")
   }
 }
 
 /**
  * Fetch a URL a model or a user chose. Resolves the host itself and refuses private, loopback, link-local,
  * unique-local and other non-public addresses (IPv4, IPv6, IPv4-mapped); connects to the address it checked; checks
- * every redirect again; http and https only; no credentials; ports 80 and 443; size and total
- * time limits; honours `options.signal` and Effect interruption. Errors say which rule refused (`NetRefused.rule`).
+ * every redirect again; http and https only; no credentials; ports 80 and 443; only the response types `options.accept` lists;
+ * size (after decompression) and total time limits; honours `options.signal` and Effect interruption. Errors say which rule refused
+ * (`NetRefused.rule`).
  */
 const fetchChecked = (url: string | URL, options: SafeFetchOptions, allowLan: boolean): Effect.Effect<SafeResponse, SafeFetchError> =>
   Effect.tryPromise({
     try: (effectSignal) => {
       const timeoutMs = options.timeoutMs ?? defaultTimeoutMs
       const shown = String(url)
+      if (!(Number.isFinite(timeoutMs) && timeoutMs > 0)) return Promise.reject(refuse("options", shown, "timeoutMs must be a positive number"))
       const controller = new AbortController()
       const timer = setTimeout(() => controller.abort(new NetTimeout({ url: shown, timeoutMs })), timeoutMs)
       const abort = () => controller.abort(new NetAborted({ url: shown }))
@@ -286,7 +528,7 @@ const fetchChecked = (url: string | URL, options: SafeFetchOptions, allowLan: bo
         : new NetFailure({ url: String(url), stage: "response", detail: e instanceof Error ? e.message : String(e) })
   })
 
-export const safeFetch = (url: string | URL, options: SafeFetchOptions = {}): Effect.Effect<SafeResponse, SafeFetchError> =>
+export const safeFetch = (url: string | URL, options: SafeFetchOptions): Effect.Effect<SafeResponse, SafeFetchError> =>
   fetchChecked(url, options, false)
 
 /**
@@ -295,5 +537,5 @@ export const safeFetch = (url: string | URL, options: SafeFetchOptions = {}): Ef
  * link-local (cloud metadata), multicast and the other classes stay refused, and so do other schemes and credentials in the URL.
  * Never call this with a URL a model or a page produced; use `safeFetch`.
  */
-export const fetchOwnerConfiguredLan = (url: string | URL, options: SafeFetchOptions = {}): Effect.Effect<SafeResponse, SafeFetchError> =>
+export const fetchOwnerConfiguredLan = (url: string | URL, options: SafeFetchOptions): Effect.Effect<SafeResponse, SafeFetchError> =>
   fetchChecked(url, options, true)

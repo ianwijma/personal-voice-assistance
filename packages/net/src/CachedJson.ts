@@ -1,6 +1,7 @@
-import { Effect } from "effect"
-import { NetBadJson, NetHttpStatus, type CachedJsonError, type SafeFetchError } from "./Errors.ts"
-import { safeFetch, type SafeFetchOptions, type SafeResponse } from "./SafeFetch.ts"
+import { Deferred, Effect, Exit } from "effect"
+import { createHash } from "node:crypto"
+import { NetAborted, NetBadJson, NetHttpStatus, NetRefused, type CachedJsonError, type SafeFetchError } from "./Errors.ts"
+import { checkHeaders, contentTypes, safeFetch, type SafeFetchOptions, type SafeResponse } from "./SafeFetch.ts"
 
 export interface JsonCacheEntry {
   readonly value: unknown
@@ -16,8 +17,12 @@ export interface JsonCache {
   readonly delete: (key: string) => void
 }
 
-/** A bounded in-memory cache: the oldest-stored entry goes when `maxEntries` is exceeded. */
+/**
+ * A bounded in-memory cache: the oldest-stored entry goes when `maxEntries` is exceeded. `maxEntries` is a whole number from 1 to
+ * 1 000 000; anything else is a `RangeError` (a negative or fractional bound would never be met, `NaN` or `Infinity` would be none).
+ */
 export const makeMemoryJsonCache = (maxEntries = 200): JsonCache => {
+  if (!Number.isSafeInteger(maxEntries) || maxEntries < 1 || maxEntries > 1_000_000) throw new RangeError(`maxEntries must be a whole number from 1 to 1000000, not ${maxEntries}`)
   const map = new Map<string, JsonCacheEntry>()
   return {
     get: (key) => map.get(key),
@@ -35,20 +40,21 @@ export type JsonSource = "cache" | "network" | "revalidated" | "stale"
 export interface JsonResult<A = unknown> {
   readonly value: A
   readonly source: JsonSource
-  /** How old the value is (ms since it was fetched or last confirmed by the server). */
+  /** How old the value is (ms since it was fetched or last confirmed by the server), at the moment it is returned. */
   readonly ageMs: number
   /** For `stale`: why the network failed. */
   readonly error?: CachedJsonError
 }
 
 export interface GetJsonOptions {
-  /** How long a value is served without asking. */
+  /** How long a value is served without asking. Not a number or below 0 counts as 0; `Infinity` is allowed. */
   readonly ttlMs: number
-  /** After the TTL, how long a failed refresh may fall back to the old value. Default 0 (never). */
+  /** After the TTL, how long a failed refresh may fall back to the old value. Default 0 (never). A caller's abort never falls back. */
   readonly staleIfErrorMs?: number
+  /** Request headers (checked as `safeFetch` checks them). They are part of the cache key: Alice's `Authorization` never serves Bob. */
   readonly headers?: Readonly<Record<string, string>>
-  /** Options for the fetch (limits, signal, allowLan, resolver, connector). */
-  readonly fetch?: Omit<SafeFetchOptions, "headers" | "method">
+  /** Options for the fetch (limits, signal, resolver, connector). The response type is always JSON. */
+  readonly fetch?: Omit<SafeFetchOptions, "headers" | "method" | "accept">
 }
 
 export interface CachedJsonDeps {
@@ -65,46 +71,156 @@ export interface CachedJson {
   readonly getJson: <A = unknown>(url: string, options: GetJsonOptions) => Effect.Effect<JsonResult<A>, CachedJsonError>
 }
 
+/** Headers that only make a request conditional; the cache sets `If-None-Match` itself. */
+const conditional: ReadonlySet<string> = new Set(["if-none-match", "if-modified-since", "if-match", "if-unmodified-since", "if-range"])
+
 /**
- * A GET of JSON behind `safeFetch`, cached in memory: served from the cache within the TTL; after it, revalidated
- * with `If-None-Match` when the server gave an ETag (a 304 renews the entry without a body); when the refresh fails,
- * the old value is served for up to `staleIfErrorMs` more. The cache key is the URL.
+ * The cache key of a representation: the URL and every request header that can change what the server answers (all of them except
+ * the conditional ones), hashed so a credential never sits in a key a store might persist or log. Review round 1, finding 1.
+ */
+export const representationKey = (url: string, headers: Readonly<Record<string, string>>): string => {
+  const pairs = Object.keys(headers).filter((k) => !conditional.has(k)).sort().map((k) => [k, headers[k]!])
+  if (pairs.length === 0) return url
+  return `${url}#${createHash("sha256").update(JSON.stringify(pairs)).digest("base64url").slice(0, 32)}`
+}
+
+/** Function options (resolver, connector) are told apart by identity in the key of a shared request. */
+const ids = new WeakMap<object, number>()
+let nextId = 1
+const idOf = (f: object | undefined): number => {
+  if (f === undefined) return 0
+  let id = ids.get(f)
+  if (id === undefined) { id = nextId++; ids.set(f, id) }
+  return id
+}
+
+const nonNegative = (v: number | undefined): number => (v !== undefined && v >= 0 ? v : 0)
+
+type Outcome = { readonly kind: "value"; readonly value: unknown; readonly ageMs: number; readonly source: "network" | "revalidated" }
+
+interface Shared {
+  readonly deferred: Deferred.Deferred<Outcome, CachedJsonError>
+  readonly interrupt: () => void
+  waiters: number
+  settled: boolean
+}
+
+/** Wait for `effect`, or fail with `NetAborted` as soon as `signal` fires; nothing else is interrupted by it. */
+const untilAborted = <A, E>(effect: Effect.Effect<A, E>, signal: AbortSignal | undefined, url: string): Effect.Effect<A, E | NetAborted> => {
+  if (signal === undefined) return effect
+  const aborted = Effect.callback<never, NetAborted>((resume) => {
+    const fire = () => resume(Effect.fail(new NetAborted({ url })))
+    if (signal.aborted) fire()
+    else signal.addEventListener("abort", fire, { once: true })
+    return Effect.sync(() => signal.removeEventListener("abort", fire))
+  })
+  return Effect.raceFirst(effect, aborted)
+}
+
+/**
+ * A GET of JSON behind `safeFetch` (response type JSON only), cached: served from the cache within the TTL; after it, revalidated
+ * with `If-None-Match` when the server gave an ETag (a 304 renews the entry without a body); when the refresh fails, the old value is
+ * served for up to `staleIfErrorMs` more, its age taken when the failure is known. The key is the URL with the request headers
+ * (`representationKey`). Callers that miss the cache at the same time share one request: each waits on its own terms (its signal
+ * makes it fail with `NetAborted`, its interruption only stops its wait), and the request is cancelled when no one waits for it any
+ * more. A request never overwrites an entry newer than itself.
  */
 export const makeCachedJson = (deps: CachedJsonDeps = {}): CachedJson => {
   const cache = deps.cache ?? makeMemoryJsonCache()
   const now = deps.now ?? Date.now
   const fetch = deps.fetch ?? safeFetch
+  const inflight = new Map<string, Shared>()
+
+  const refresh = (url: string, key: string, headers: Record<string, string>, options: GetJsonOptions): Effect.Effect<Outcome, CachedJsonError> =>
+    Effect.gen(function* () {
+      const startedAt = now()
+      const entry = cache.get(key)
+      const sent: Record<string, string> = { ...headers }
+      if (entry?.etag !== undefined) sent["if-none-match"] = entry.etag
+      const { signal: _signal, ...limits } = options.fetch ?? {}
+      const response = yield* fetch(url, { ...limits, accept: contentTypes.json, method: "GET", headers: sent })
+      const newer = (): boolean => (cache.get(key)?.storedAt ?? -Infinity) > startedAt
+      if (response.status === 304 && entry !== undefined) {
+        const etag = response.headers["etag"] ?? entry.etag
+        if (!newer()) cache.set(key, { value: entry.value, ...(etag !== undefined ? { etag } : {}), storedAt: now() })
+        return { kind: "value", value: entry.value, ageMs: 0, source: "revalidated" } satisfies Outcome
+      }
+      if (response.status < 200 || response.status > 299) return yield* Effect.fail(new NetHttpStatus({ url, status: response.status }))
+      let value: unknown
+      try {
+        value = JSON.parse(response.text().replace(/^﻿/, ""))
+      } catch (e) {
+        return yield* Effect.fail(new NetBadJson({ url, detail: e instanceof Error ? e.message : String(e) }))
+      }
+      const etag = response.headers["etag"]
+      // A slower request must not replace what a newer one stored meanwhile (another process sharing a store, say).
+      if (!newer()) cache.set(key, { value, ...(etag !== undefined ? { etag } : {}), storedAt: now() })
+      return { kind: "value", value, ageMs: 0, source: "network" } satisfies Outcome
+    })
+
   const getJson = <A>(url: string, options: GetJsonOptions): Effect.Effect<JsonResult<A>, CachedJsonError> =>
     Effect.gen(function* () {
-      const entry = cache.get(url)
-      const age = entry === undefined ? Infinity : now() - entry.storedAt
-      if (entry !== undefined && age >= 0 && age < options.ttlMs) return { value: entry.value as A, source: "cache", ageMs: age } satisfies JsonResult<A>
-      const headers: Record<string, string> = { accept: "application/json", ...deps.headers, ...options.headers }
-      if (entry?.etag !== undefined) headers["if-none-match"] = entry.etag
-      const attempt = Effect.gen(function* () {
-        const response = yield* fetch(url, { ...options.fetch, method: "GET", headers })
-        if (response.status === 304 && entry !== undefined) {
-          cache.set(url, { ...entry, storedAt: now() })
-          return { value: entry.value as A, source: "revalidated", ageMs: 0 } satisfies JsonResult<A>
-        }
-        if (response.status < 200 || response.status > 299) return yield* Effect.fail(new NetHttpStatus({ url, status: response.status }))
-        let value: unknown
-        try {
-          value = JSON.parse(response.text())
-        } catch (e) {
-          return yield* Effect.fail(new NetBadJson({ url, detail: e instanceof Error ? e.message : String(e) }))
-        }
-        const etag = response.headers["etag"]
-        cache.set(url, { value, ...(etag !== undefined ? { etag } : {}), storedAt: now() })
-        return { value: value as A, source: "network", ageMs: 0 } satisfies JsonResult<A>
-      })
-      return yield* attempt.pipe(
-        Effect.catch((error: CachedJsonError) =>
-          entry !== undefined && age >= 0 && age < options.ttlMs + (options.staleIfErrorMs ?? 0)
-            ? Effect.succeed({ value: entry.value as A, source: "stale", ageMs: age, error } satisfies JsonResult<A>)
-            : Effect.fail(error)
+      const ttl = nonNegative(options.ttlMs)
+      const staleWindow = nonNegative(options.staleIfErrorMs)
+      const merged: Record<string, string> = { ...deps.headers, ...options.headers }
+      for (const k of Object.keys(merged)) if (conditional.has(k.toLowerCase())) delete merged[k]
+      const headers = checkHeaders(url, merged, contentTypes.json)
+      if (headers instanceof NetRefused) return yield* Effect.fail(headers)
+      const plain: Record<string, string> = { ...headers }
+      const key = representationKey(url, plain)
+      const fresh = (e: JsonCacheEntry | undefined) => {
+        if (e === undefined) return undefined
+        const age = now() - e.storedAt
+        return age >= 0 && age < ttl ? { value: e.value as A, source: "cache", ageMs: age } satisfies JsonResult<A> : undefined
+      }
+      const hit = fresh(cache.get(key))
+      if (hit !== undefined) return hit
+      // One request per representation and fetch setup; the caller's own signal is not part of it.
+      const f = options.fetch
+      const flightKey = `${key}\n${f?.maxBytes ?? ""}|${f?.timeoutMs ?? ""}|${f?.maxRedirects ?? ""}|${idOf(f?.resolver)}|${idOf(f?.connector)}`
+      let shared = inflight.get(flightKey)
+      if (shared === undefined) {
+        const deferred = Deferred.makeUnsafe<Outcome, CachedJsonError>()
+        const s: Shared = { deferred, interrupt: () => undefined, waiters: 0, settled: false }
+        const settle = Effect.sync(() => { s.settled = true; if (inflight.get(flightKey) === s) inflight.delete(flightKey) })
+        const fiber = yield* refresh(url, key, plain, options).pipe(
+          Effect.exit,
+          Effect.flatMap((exit) => settle.pipe(Effect.andThen(Deferred.done(deferred, exit)))),
+          // Interrupted (no one waits, or the runtime stops): anyone still waiting is told, never left hanging.
+          Effect.onInterrupt(() => settle.pipe(Effect.andThen(Deferred.interrupt(deferred)))),
+          Effect.forkDetach
         )
-      )
+        ;(s as { interrupt: () => void }).interrupt = () => fiber.interruptUnsafe()
+        inflight.set(flightKey, s)
+        shared = s
+      }
+      const s = shared
+      s.waiters++
+      const leave = Effect.sync(() => {
+        s.waiters--
+        // Nobody waits any more: cancel the request, and let the next caller start a new one.
+        if (s.waiters === 0 && !s.settled) {
+          if (inflight.get(flightKey) === s) inflight.delete(flightKey)
+          s.interrupt()
+        }
+      })
+      const outcome = yield* untilAborted(Deferred.await(s.deferred), options.fetch?.signal, url).pipe(Effect.exit, Effect.ensuring(leave))
+      if (Exit.isSuccess(outcome)) {
+        const o = outcome.value
+        return { value: o.value as A, source: o.source, ageMs: o.ageMs } satisfies JsonResult<A>
+      }
+      const error = outcome.cause.reasons.map((r) => (r._tag === "Fail" ? r.error : undefined)).find((e) => e !== undefined)
+      // The caller's abort is not a network failure: no stale fallback (review round 1, finding 25). Interruption is not an error.
+      if (error === undefined) return yield* Effect.failCause(outcome.cause)
+      if (error instanceof NetAborted) return yield* Effect.fail(error)
+      // Stale-if-error, with the age the value has now, after the failed request (finding 24).
+      const old = cache.get(key)
+      if (old !== undefined) {
+        const age = now() - old.storedAt
+        if (age >= 0 && age < ttl) return { value: old.value as A, source: "cache", ageMs: age } satisfies JsonResult<A>
+        if (age >= 0 && age < ttl + staleWindow) return { value: old.value as A, source: "stale", ageMs: age, error } satisfies JsonResult<A>
+      }
+      return yield* Effect.fail(error)
     })
   return { getJson }
 }

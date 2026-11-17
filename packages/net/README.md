@@ -2,18 +2,38 @@
 
 Outgoing HTTP for URLs a model or a user chose, and for public APIs. No dependencies beyond Effect and `node:`.
 
-- `safeFetch(url, options)` → `Effect<SafeResponse, SafeFetchError>`. Resolves the host itself, refuses non-public
-  addresses (loopback, private, link-local incl. cloud metadata, CGNAT, unique-local, multicast, reserved, IPv4-mapped /
-  NAT64 / 6to4 forms of those), connects to the address it checked (no second lookup), re-checks every redirect
-  (default 3), allows `http`/`https` only, no credentials in the URL, ports 80/443, local names refused, size limit
-  (default 2 MiB), total time limit (default 6 s), honours `signal` and Effect interruption. There is no LAN option on it. `fetchOwnerConfiguredLan` is the separate function for endpoints the owner configured (Home
+- `safeFetch(url, options)` → `Effect<SafeResponse, SafeFetchError>`. `options.accept` is **required**: the response types the caller
+  takes, one of the presets `contentTypes.webPage` (HTML, XHTML, plain text, PDF: what web-search §13 allows `read_page`),
+  `contentTypes.json` (`application/json` and any `+json`), `contentTypes.feed` (RSS, Atom, RDF, JSON Feed, XML) and
+  `contentTypes.image` (PNG, JPEG, GIF, WebP, AVIF; no SVG), or a policy of its own. A response without a Content-Type or with one the
+  policy does not list is refused before its body is read (an error page outside 200–299 is returned with its status and an empty body
+  instead). The guard: resolves the host itself, refuses every address the IANA special-purpose registries do not mark globally
+  reachable (loopback, private, link-local incl. cloud metadata, CGNAT, unique-local, multicast, documentation incl. `3fff::/20`,
+  benchmarking, reserved, the IETF protocol blocks, and IPv4-mapped / NAT64 / 6to4 forms of those; `Address.ts` cites the registries),
+  connects to the address it checked (no second lookup), re-checks every redirect (default 3), allows `http`/`https` only, no
+  credentials in the URL, ports 80/443, local names refused, size limit after decompression (default 2 MiB), total time limit
+  (default 6 s), honours `signal` and Effect interruption. Requests ask for `identity`; a body that comes compressed anyway (gzip,
+  deflate, br) is decompressed as it arrives and its decompressed size counts, any other encoding is refused. Request headers are
+  checked: `Host`, hop-by-hop and framing headers and `Accept-Encoding` are refused, as are characters a header cannot hold; the Host
+  header and the TLS name come from the URL only; a redirect to another origin keeps only `Accept`, `Accept-Language` and
+  `User-Agent`. `SafeResponse` has `contentType`, `encoding` and a `text()` that honours the charset. HEAD reads no body and is not
+  limited by one.
+- There is no LAN option on `safeFetch`. `fetchOwnerConfiguredLan` is the separate function for endpoints the owner configured (Home
   Assistant, a LAN SearXNG): it also allows private, unique-local and CGNAT addresses, local names and other ports; loopback,
-  link-local and multicast stay refused. Never pass it a URL a model chose. Errors: `NetRefused` (`rule`: `scheme | credentials | port | host-name | address | redirect-limit |
-  redirect-target`, plus `address` and `addressClass`), `NetTooLarge`, `NetTimeout`, `NetAborted`, `NetFailure`
-  (`stage`: `dns | connect | response`). The resolver and the connector are options, so tests need no network.
-- `makeCachedJson({ cache?, now?, fetch?, headers? }).getJson(url, { ttlMs, staleIfErrorMs? })`: JSON GET with TTL,
-  `ETag` / `If-None-Match`, stale-if-error and an injectable clock; in-memory `makeMemoryJsonCache` (implement `JsonCache`
-  to back it with the store).
-- `userAgent(contact)`: `personal-voice-assistance/1 (contact)`, or the token alone without a contact. `contact` is
-  the Home section's `HOME_API_CONTACT`.
+  link-local and multicast stay refused. Never pass it a URL a model chose.
+- Errors: `NetRefused` (`rule`: `scheme | credentials | port | host-name | address | redirect-limit | redirect-target | header |
+  content-type | content-encoding | options`, plus `address` and `addressClass`), `NetTooLarge`, `NetTimeout`, `NetAborted`,
+  `NetFailure` (`stage`: `dns | connect | response`). The resolver and the connector are options, so tests need no network.
+- `makeCachedJson({ cache?, now?, fetch?, headers? }).getJson(url, { ttlMs, staleIfErrorMs?, headers?, fetch? })`: JSON GET (always
+  the JSON preset) with TTL, `ETag` / `If-None-Match`, stale-if-error and an injectable clock. The cache key is the URL plus the request
+  headers (`representationKey`, hashed), so one caller's `Authorization` never serves another. Callers that miss at the same time share
+  one request; each keeps its own signal (it fails with `NetAborted`, never with a stale value) and its own interruption, and the request
+  is cancelled when no one waits any more. The stale fallback measures the value's age after the failed request. In-memory
+  `makeMemoryJsonCache(maxEntries)` (1 to 1 000 000, else `RangeError`); implement `JsonCache` to back it with the store.
+- `userAgent(contact)`: `personal-voice-assistance/1 (contact)`, or the token alone without a contact. `contact` is the Home section's
+  `HOME_API_CONTACT` (which refuses characters a header cannot hold when saved); whatever it is given, the result is a legal header
+  value (anything outside ASCII is percent-encoded).
 - `classifyAddress(text)`: the address class of an IPv4 or IPv6 address, for other guards.
+
+Tests: no test reaches the network. `test/NodeConnector.loopback.test.ts` binds a server on this machine's loopback interface to check
+what only a real socket shows (the Host header, a compressing server); a socket on 127.0.0.1 is not network in this sense.
