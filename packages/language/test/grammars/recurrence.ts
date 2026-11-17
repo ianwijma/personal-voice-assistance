@@ -195,6 +195,7 @@ export const recurrenceMeaning = (r: RecurrenceReading, now: number, zone: strin
       case "YEARLY": return b.date !== undefined ? d.month === b.date.month && d.day === b.date.day : d.month === today.month && d.day === today.day
     }
   }
+  // The search starts at today's civil date (README: spoken recurrence, 'on or after today's civil date'; round 6, finding 1).
   for (let k = 0; k <= 366 * 8 + 31; k++) {
     const d = plusDays(today, k)
     if (d.year > 2199) return undefined

@@ -177,6 +177,9 @@ const shapeProblem = (rule: RecurrenceRule): RRuleRead | undefined => {
   return undefined
 }
 
+/** Upper-case ASCII letters only: Unicode look-alikes (dotless i, long s) must not fold into rule tokens. */
+const asciiUpper = (text: string): string => text.replace(/[a-z]/g, (c) => c.toUpperCase())
+
 /**
  * Read an `RRULE` value ("FREQ=WEEKLY;BYDAY=MO,WE") or line ("RRULE:FREQ=…") by RFC 5545 §3.3.10: every part once, digits only for
  * numbers, ordinals in range and only where the frequency allows them. `ok` with the rule (lists sorted) exactly for a rule of the
@@ -200,8 +203,8 @@ export const parseRRule: (text: string) => RRuleRead = guarded((text: string): R
   for (const part of body.split(";")) {
     const eq = part.indexOf("=")
     if (eq <= 0) return invalidRule(`"${part}" is not NAME=VALUE`)
-    const key = part.slice(0, eq).toUpperCase()
-    const value = part.slice(eq + 1).toUpperCase()
+    const key = asciiUpper(part.slice(0, eq))
+    const value = asciiUpper(part.slice(eq + 1))
     if (value === "") return invalidRule(`${key} has no value`)
     if (seen.has(key)) return invalidRule(`${key} is given twice`)
     seen.add(key)

@@ -219,7 +219,7 @@ DTSTART that is not an instance, an UNTIL before it, no clock time, an unknown z
 instant or `undefined`. The cost does not grow with the distance from DTSTART.
 
 **Spoken recurrence** (`parseRecurrence(text, language, { now, timeZone, defaultTime?, band? })` → `Parsed<Recurrence>`, with `rule`,
-`rrule`, `dtstart` — the first occurrence after now, an instance, never on a day the zone skips altogether (a gap that only pushes the time past midnight, as in Nuuk on 28 March 2026 at 23:30, is an ordinary gap: the pre-gap reading on that day) —, `ics`, `start`, `startInstant`,
+`rrule`, `dtstart` — the first occurrence on or after today's civil date in the zone whose instant is after now, an instance, never on a day the zone skips altogether (a gap that only pushes the time past midnight, as in Nuuk on 28 March 2026 at 23:30, is an ordinary gap: the pre-gap reading on that day; but an occurrence of yesterday's date that such a clock change pushed past midnight into today is not considered) —, `ics`, `start`, `startInstant`,
 `time?`, `partOfDay?`, `timeDefaulted`). Grammar: `[at TIME] RULE [at TIME]`, at most one time; EVERY is "every" / "each" / "elke" /
 "elk" / "iedere" / "ieder":
 - INTERVAL: EVERY UNIT ("every day"), EVERY ORDINAL UNIT, from "first" ("every first day" is every day, "every second week"), EVERY N UNITS (2–999), "every other" UNIT, "om de"
