@@ -89,6 +89,9 @@ importers:
       '@pva/llm-anthropic':
         specifier: workspace:*
         version: link:../../packages/llm-anthropic
+      '@pva/module-home-assistant':
+        specifier: workspace:*
+        version: link:../../packages/module-home-assistant
       '@pva/modules-builtin':
         specifier: workspace:*
         version: link:../../packages/modules-builtin

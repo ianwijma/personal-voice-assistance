@@ -112,10 +112,11 @@ export const clockModule = defineModule({
   settings: {
     timeZone: Setting.text({
       label: "Time zone",
-      description: "IANA name, e.g. Europe/Amsterdam. Empty: this machine's zone.",
+      description: "IANA name, e.g. Europe/Amsterdam. Follows Home's time zone unless set here; empty: this machine's zone.",
       placeholder: Intl.DateTimeFormat().resolvedOptions().timeZone,
       env: "CLOCK_TIME_ZONE",
       maxLength: 64,
+      overridable: true,
       check: (zone) => (zone === "" || Option.isSome(DateTime.zoneMakeNamed(zone)) ? undefined : "Unknown time zone")
     }),
     locale: Setting.choice({
@@ -125,7 +126,8 @@ export const clockModule = defineModule({
         { value: "en-US", label: "November 13, 2026" },
         { value: "nl-NL", label: "13 november 2026" }
       ],
-      default: "en-GB"
+      default: "en-GB",
+      overridable: true
     })
   },
   start: ({ settings }) => Effect.sync(() => ({ ...makeClock(settings), actions: clockActions(settings) }))

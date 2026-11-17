@@ -17,6 +17,7 @@
     "@pva/audio-web": "workspace:*",
     "@pva/core": "workspace:*",
     "@pva/llm-anthropic": "workspace:*",
+    "@pva/module-home-assistant": "workspace:*",
     "@pva/modules-builtin": "workspace:*",
     "@pva/protocol": "workspace:*",
     "@pva/stt-deepgram": "workspace:*",

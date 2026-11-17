@@ -1300,3 +1300,131 @@ Deviations from §5:
   settings store and the WebSocket messages in tests. `serveLocal.test.ts` (real zipformer-en, now run in this
   worktree because the local models are present) failed once in about eight runs with "HOLLO CAN YOU HEAR ME"
   (a recognition variance; one stream was opened per run, no switch happened).
+
+### WP-12a Home and linked defaults: built 2026-11-16
+
+- **Section `home`** (`sectionDefinitions.ts` `homeSection`, group `modules`, page `home`, order 5; the admin's Shared
+  settings › Home picks it up by id): `HOME_LOCATION` (text ≤ 200), `HOME_TIME_ZONE` (IANA, checked with `Intl`; empty
+  = this machine's), `HOME_LANGUAGE` (en-GB, en-US, nl-NL, de-DE; default en-GB), `HOME_UNITS` (metric | imperial;
+  default metric), `HOME_DATE_FORMAT` (en-GB | en-US | nl-NL; default en-GB, §7.3). Live (no reload). Environment
+  variables of the same names lock them, as every flat key.
+- **Home line** (`homeLineOf`, protocol `assistants.ts`, pure so the admin's "See the full prompt" can show it): in
+  every assistant's stable prompt, after its own prompt and before the module instructions, through the WP-4b seam
+  (`homeLine` in `serveMode`): `Home: <location>; time zone <zone>; language <language>.` The location is left out
+  when empty; the zone is the machine's when Home names none. Unchanged while Home is unchanged (cached prefix).
+- **Linked defaults** (`linkedModuleDefaults`, now with `location`; `ModuleHostOptions.defaults`): Weather
+  `defaultPlace` ← `HOME_LOCATION`, `units` ← `HOME_UNITS` (imperial → fahrenheit), Clock `timeZone` ←
+  `HOME_TIME_ZONE`, `locale` ← `HOME_DATE_FORMAT`. A linked default replaces the field's own default only (saved value
+  and environment win; an assistant's own value wins over all); a default the field refuses is ignored. The module's
+  form shows it as the field's `default` and value (`source: "default"`). A Home save refreshes the module host
+  (`onSectionSaved`, after the section's values are in effect), which restarts only the instances whose settings it
+  moved.
+- **Deviations.** (1) Weather's `defaultPlace` default is `HOME_LOCATION` itself (§2.6 said "" with the module
+  reading `HOME_LOCATION`): the module stays independent of the app, and the form shows the place used. (2) The Home
+  line is always there (with the machine's zone and the default language when Home is not set), so every prompt
+  gained one line once. (3) The CLI modes do not apply Home (no Home line, no linked defaults: `startCliModules` is
+  unchanged).
+
+### WP-12b module overrides: built 2026-11-16
+
+- **Flag.** `Setting.*({ overridable: true })` (not offered on `Setting.secret`; addresses are simply not marked).
+  The field description carries `overridable: true` (protocol `SettingField`, optional). Marked: Clock `timeZone`,
+  `locale`; Weather `defaultPlace`, `units`; Home Assistant `domains`. Not marked: Weather `timeoutMs`, Home Assistant
+  `baseUrl` (address), `aliases`, `timeoutMs`, every secret, every agent or decision module field.
+- **Resolution** (`resolveSettings` sources `own` and `defaults`): per field, the assistant's own value (overridable
+  fields only) > environment > saved > linked default > the field's default. `applicableOwnValues`, `overridableKeys`,
+  `checkOwnValues` (core `Settings.ts`).
+- **Instances** (`ModuleHost`, `ModuleHostOptions.demand`). Serve mode gives the host, for every capability module,
+  the switched-on assistants that have it on with their `own` values (`moduleDemand`); agent and decision modules have
+  no demand and keep their own switch, as do all modules in the CLI modes (no `demand`: one instance, exactly the old
+  behaviour, the old tests unchanged). An instance's key is the JSON of the effective non-secret values (own applied);
+  assistants with equal keys share one instance. A module with demand:
+  - runs while its list is not empty (its saved `enabled` is not read; `module.enable`/`module.disable` answer
+    `not_allowed`, "switched on and off per assistant");
+  - starts its instances at `startEnabled` and at every `refresh`: serve calls `refresh` after every settings-store
+    save (assistant, device, section, module saves all pass `notifyAfterSaves`), after a Home save and after the
+    store is unblocked. New keys start (concurrently, each on its own: one failing is that instance's `error`, the
+    others run); an instance whose key no longer appears keeps serving until the new ones have settled, then leaves the
+    snapshot and is closed after the 10 s grace period (tool calls in flight finish). A key that is wanted again while
+    it is still leaving is kept; one already retired starts anew. A refresh that finds the module busy (a configure)
+    runs when that operation ends;
+  - `configure` (the shared settings) restarts only the instances whose key changes (all of them when the patch sets a
+    secret), all or nothing: if one cannot start, nothing changes and nothing is saved. Saving the same values restarts
+    nothing (before, a configure always restarted the one instance). `setSecrets` (vault) keeps running instances and
+    retries the ones in `error`.
+- **Per assistant.** `ModuleSnapshot.assistantParts`: for each assistant with demand, the parts of the instances it
+  uses (catalog order, plus every module without demand). The part object is shared between assistants on one
+  instance and with `parts` (the shared-settings instance is the one in `registry`, `parts`, `instructions`, `agents`,
+  `actions`). Serve's `modulesFor` takes the assistant's parts (else `parts`), then filters by its module switches and
+  `offTools` as before, so each assistant's tool registry, context providers and module instructions come from its own
+  instance. `toolModules` covers every instance's tools.
+- **`assistant.save` / `assistant.create`**: `own` values are checked by the module's fields (`ModuleHost.checkOwn`,
+  passed to `makeAssistants` as `checkOwn`): a secret ("A secret is shared: it cannot be set per assistant"), a field
+  that is not overridable ("This setting is shared: …"), an unknown field, or a value the field refuses is
+  `invalid_settings` with `fieldErrors` keyed `modules.<moduleId>.own.<field>`. Checked whether or not the module runs.
+- **Admin data for the Modules tab** (`ModuleInfo`, `module.changed` and `admin.snapshot.modules`, admin connections
+  only): `settings.fields[].overridable: true` on the fields an assistant may own; `instances` (present for a module
+  with demand): `[{ assistants: AssistantId[], own: FieldKey[] /* the fields these assistants own */, state, error?,
+  status? }]`; `enabled` = at least one switched-on assistant has it on; `state` = `error` while one instance fails
+  (`error` names its assistants: "… (for bravo)"), `starting` while one starts, else `running`; `tools` = the union of
+  the running instances' tools; `settings.values` and each field's `default` include the linked defaults. The web
+  page can enable "own settings" for the fields with `overridable` and save them as `modules[id].own` through
+  `assistant.save`.
+- **Deviations.** (1) A module whose wanted settings are invalid (e.g. Home Assistant without a token) does not run,
+  but shows an instance in `error` with the settings message instead of being silently absent (§2.6 "required settings
+  are set"). (2) The module's own switch is refused for capabilities rather than kept as a second switch; the admin's
+  Modules page still shows it (apps/web not changed: the switch now gets `not_allowed`). (3) Own values win over the
+  environment too (rule 1 of §2.6 as written). (4) Agents, decision providers and actions come from the
+  shared-settings instance only (none of them is per assistant). (5) `ModuleSnapshot.assistantParts` and
+  `ModuleInfo.instances` are additive; ARCHITECTURE.md describes the contract.
+- **Tests.** `packages/core/test/ModuleHostInstances.test.ts` (equal settings share one instance and one part; an
+  own date format runs a second and each assistant's tool answers in its own; the run rule and `not_allowed`; secrets,
+  shared fields and bad values refused by `checkOwn` and ignored at run time; grace on stop with a call in flight;
+  a shared change restarts only the affected instances, same values none, a secret all, a failing start nothing;
+  one instance failing leaves the other running; linked defaults and their refresh; a replaced instance serves
+  until its replacement runs; a module without demand), `packages/core/test/Settings.test.ts` (precedence, flag,
+  helpers), `packages/modules-builtin/test/instances.test.ts` (Clock with an own `nl-NL` answers "vrijdag 13 november
+  2026" to that assistant and "Friday, 13 November 2026" to the other, tool and context; Weather looks up Home's place in
+  Home's units, an own unit wins, a saved place wins over Home), `packages/protocol/test/assistants.test.ts`
+  (`homeLineOf`, `linkedModuleDefaults` with a location), `apps/assistant/test/serveModules.test.ts` (scripted client:
+  the Home line in the system prompt the model receives for both assistants, Weather and Clock follow a Home save, two
+  clock instances with each assistant's context in its own date format; `assistant.save` accepts an own time zone and
+  refuses a secret, a shared field and a bad value, back to one shared instance). Changed: `serve.test.ts` (sections
+  list starts with `home`; a capability's `module.disable` is `not_allowed`), `serveVault.test.ts` (`home` is not
+  protected).
+
+### WP-12c Home Assistant in the app: built 2026-11-16
+
+- `@pva/module-home-assistant` is a dependency of `apps/assistant` and in `moduleCatalog` after Weather. It is a
+  capability: it runs for the assistants that switch it on, with the shared address and token (the token in the vault
+  as every module secret) and an assistant's own `domains` if any. It talks plain HTTP (`fetch`): no provider SDK.
+  Migration: an install whose saved `enabled` was not on (the module was off by default) gets it off on the migrated
+  assistant.
+- **Test** (`serveModules.test.ts`, against the package's fake Home Assistant server on 127.0.0.1): wanted by Alpha
+  but without a token it is one instance in `error`; `module.configure` with the server's address and token starts it
+  (`/api/config` called with the token, which never reaches an admin message); Alpha's request carries `home_state`,
+  `home-assistant_lights_on`, `…_lights_off`, `…_lights_status` (its `offTools` removed `…_set_brightness`) and the
+  module's instructions, Bravo's none; `home_state` answers from the server.
+
+### WP-12 measurements (2026-11-16, the WP-0 machine)
+
+- **Offline bench** (`pnpm start bench`, three runs before the change — the branch's base commit — and three after,
+  end of turn → playback start, median / worst ms; machine load 7–16 before, 4.6–0.5 after). Orchestration overhead
+  1.5 / 2.8, 1.3 / 1.9, 1.0 / 1.9 → 1.0 / 2.2, 0.9 / 3.4, 0.9 / 1.5; session path 3.2 / 14, 0.7 / 1.3, 0.7 / 1.4 →
+  0.7 / 1.4, 0.7 / 1.1, 0.8 / 1.2; realistic rows eager off 508–526 / 735–763 → 507–509 / 734–736, eager on 307–316 /
+  534–554 → 306–307 / 534–537. The offline bench builds its tools directly (`makeClock`), not through the module
+  host, so it shows that the turn path is unchanged, not the module path.
+- **Module path in serve** (a temporary scripted-client measurement, not committed): 400 typed turns alternating two
+  assistants with Clock and Weather on, the instant stand-in LLM, `TurnTrace` `llmRequestSent` − turn start (the
+  setup: prompt with the Home line, the assistant's parts, registry, context providers), the first 100 turns dropped,
+  0.1 ms resolution; three runs per configuration, the code before and after run in the same worktree minutes apart
+  (load 5–8). Before: median 0.4, p90 0.5, mean 0.435–0.439 ms (equal settings) and 0.439–0.459 (Bravo with an own
+  date format, which the old code ignored). After: median 0.4, p90 0.5–0.6, mean 0.434–0.503 (one Clock instance) and
+  median 0.4, p90 0.5, mean 0.453–0.469 (two Clock instances). No measurable cost per turn.
+- **Memory of a second instance** (one process, `node --expose-gc`, 200 more instances each with an own value,
+  heap used after a double GC minus before, divided by 200; three runs): Clock **12.6 KB** per instance, Weather
+  **7.8 KB** (all three runs equal to 0.1 KB); RSS grew 5.6–9.1 MB (Clock) and 5.2–6.3 MB (Weather) for 200, i.e.
+  under 50 KB each. A second Home Assistant instance was not measured (it holds its house model and a 60 s refresh
+  timer and makes its own requests; its size depends on the house).
+- **Not verified.** The web pages (no "own settings" control yet; the Modules page's switch now answers
+  `not_allowed` for a capability); a real Home Assistant (only the fake server); the CLI modes with Home (not applied).

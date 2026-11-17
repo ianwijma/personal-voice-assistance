@@ -3,8 +3,11 @@ import { Effect, Exit, Schema, Scope } from "effect"
 import { defineModule, fromAssistantModule, ModuleStartError } from "../src/ModuleDefinition.ts"
 import { makeTool } from "../src/Module.ts"
 import {
+  applicableOwnValues,
   applySettingsPatch,
+  checkOwnValues,
   isVisible,
+  overridableKeys,
   resolveSettings,
   runSettingsChecks,
   Setting,
@@ -273,4 +276,41 @@ describe("defineModule", () => {
       assert.strictEqual(instance.context?.length, 1)
       assert.strictEqual(instance.tools, undefined)
     }))
+})
+
+describe("own values and linked defaults (docs/ASSISTANTS.md §2.6)", () => {
+  const spec = {
+    units: Setting.choice({ label: "Units", env: "UNITS", options: [{ value: "c", label: "C" }, { value: "f", label: "F" }], default: "c", overridable: true }),
+    place: Setting.text({ label: "Place", overridable: true }),
+    url: Setting.text({ label: "Address", default: "http://x" }),
+    key: Setting.secret({ label: "Key" })
+  }
+  const base: SettingsSources = { stored: {}, secrets: {}, env: {} }
+
+  it("per field: own (overridable only) > environment > saved > linked default > default", () => {
+    const resolved = resolveSettings(spec, { ...base, stored: { place: "Saved" }, env: { UNITS: "c" }, defaults: { place: "Home", url: "http://home" }, own: { units: "f", url: "http://mine", key: "x" } })
+    assert.deepStrictEqual(resolved.value, { units: "f", place: "Saved", url: "http://home", key: undefined })
+    assert.deepStrictEqual(resolveSettings(spec, { ...base, defaults: { place: "Home" } }).value?.place, "Home")
+    // A linked default the field refuses is ignored; the form shows the linked default as the field's default.
+    assert.deepStrictEqual(resolveSettings(spec, { ...base, defaults: { units: "kelvin" } }).value?.units, "c")
+    const field = resolveSettings(spec, { ...base, defaults: { place: "Home" } }).form.fields.find((f) => f.key === "place")!
+    assert.deepStrictEqual(["default" in field ? field.default : undefined, field.source], ["Home", "default"])
+    // An own value the field refuses is an error of that resolution.
+    assert.strictEqual(resolveSettings(spec, { ...base, own: { units: "kelvin" } }).value, undefined)
+  })
+
+  it("the flag reaches the field description, never on a secret; helpers", () => {
+    const form = resolveSettings(spec, base).form
+    assert.deepStrictEqual(form.fields.map((f) => [f.key, f.overridable]), [["units", true], ["place", true], ["url", undefined], ["key", undefined]])
+    assert.deepStrictEqual(overridableKeys(spec), ["units", "place"])
+    assert.deepStrictEqual(applicableOwnValues(spec, { units: "f", url: "u", key: "k", other: 1 }), { units: "f" })
+    assert.deepStrictEqual(checkOwnValues(spec, { units: "f", place: "x" }), [])
+    assert.deepStrictEqual(checkOwnValues(spec, { url: "u", key: "k", units: 3 }).map((e) => e.key), ["url", "key", "units"])
+  })
+
+  it("a patch judges visibility against the linked defaults", () => {
+    const shown = { ...spec, extra: Setting.text({ label: "Extra", visibleWhen: { key: "place", in: ["Home"] } }) }
+    const patched = applySettingsPatch(shown, { ...base, defaults: { place: "Home" } }, { values: { extra: "yes" }, secrets: {} })
+    assert.isTrue(patched.ok && patched.stored.extra === "yes")
+  })
 })

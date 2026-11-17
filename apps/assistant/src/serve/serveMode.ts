@@ -5,6 +5,7 @@ import {
   LlmError,
   makeModuleHost,
   makeToolRegistry,
+  type ModuleDemand,
   makeTurnTrace,
   type ModuleDefinition,
   type ModuleHost,
@@ -29,6 +30,8 @@ import {
   effectiveDeviceSettings,
   type EngineInfo,
   hearerOf,
+  homeLineOf,
+  linkedModuleDefaults,
   engineSummary,
   type VoiceInfo,
   type ServerMessage,
@@ -272,7 +275,24 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     const envOrigin = options.envOrigin ?? envView.sourceOf
     const envLocation = envView.locationOf
     const sections = makeSections(store, env, { envOrigin, envLocation })
-    const host = yield* makeModuleHost({ catalog, persistence: store.modulePersistence, env, envOrigin, envLocation })
+    /** The Home values the modules' linked defaults come from (docs/ASSISTANTS.md §2.6). */
+    const homeDefaults = (moduleId: string) =>
+      linkedModuleDefaults({
+        location: String(sections.value("HOME_LOCATION") ?? ""),
+        units: sections.value("HOME_UNITS") === "imperial" ? "imperial" : "metric",
+        timeZone: String(sections.value("HOME_TIME_ZONE") ?? ""),
+        dateFormat: String(sections.value("HOME_DATE_FORMAT") ?? "en-GB")
+      })[moduleId]
+    // Capabilities run for the assistants that switch them on (`moduleDemand`, below; read from startEnabled on).
+    const host = yield* makeModuleHost({
+      catalog,
+      persistence: store.modulePersistence,
+      env,
+      envOrigin,
+      envLocation,
+      defaults: homeDefaults,
+      demand: () => moduleDemand()
+    })
     const keys = makeKeys({ vault, store, host })
     const access = makeAccessPolicy({ catalog, sections: sections.list, vaultState: keys.state })
 
@@ -359,16 +379,47 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       return def === undefined || def.kind === undefined || def.kind === "capability"
     }
     /**
-     * The Home line of every assistant's stable prompt (location, time zone, language; docs/ASSISTANTS.md §2.4).
-     * The `home` section arrives with WP-12a; until then there is no line.
+     * Who wants which capability (docs/ASSISTANTS.md §2.6): every switched-on assistant that has it on, with its own
+     * values. Each capability has an entry (an empty list: nobody, so it does not run); agents and decision providers
+     * have none and follow their own switch.
      */
-    const homeLine = (): string | undefined => undefined
+    const moduleDemand = (): ReadonlyMap<string, ReadonlyArray<ModuleDemand>> => {
+      const demand = new Map<string, Array<ModuleDemand>>(catalog.filter((d) => isCapability(d.id)).map((d) => [d.id, []]))
+      for (const assistant of assistantsNow().values()) {
+        if (!assistant.on) continue
+        for (const [moduleId, choice] of Object.entries(assistant.modules)) {
+          if (choice.on) demand.get(moduleId)?.push({ assistantId: assistant.id, ...(choice.own !== undefined ? { own: choice.own } : {}) })
+        }
+      }
+      return demand
+    }
+    /** Bring the module instances in line with the assistants and Home (after every save; not while blocked). */
+    const syncModules = (): Effect.Effect<void> => Effect.suspend(() => (store.blocked() !== undefined ? Effect.void : host.refresh))
     /**
-     * An assistant's share of the running modules: the modules it has on (capabilities; the others always pass), the
-     * tools it has not switched off, and their instructions. The whole snapshot when nothing is left out.
+     * The Home line of every assistant's stable prompt (location, time zone, language; docs/ASSISTANTS.md §2.4): the
+     * `home` section, the machine's zone when it names none. The same string while Home does not change.
+     */
+    let homeCache: { readonly values: string; readonly line: string } | undefined
+    const homeLine = (): string | undefined => {
+      const home = {
+        location: String(sections.value("HOME_LOCATION") ?? ""),
+        timeZone: String(sections.value("HOME_TIME_ZONE") ?? ""),
+        language: String(sections.value("HOME_LANGUAGE") ?? "")
+      }
+      const values = `${home.location}\n${home.timeZone}\n${home.language}`
+      if (homeCache?.values !== values) {
+        homeCache = { values, line: homeLineOf({ ...home, machineTimeZone: Intl.DateTimeFormat().resolvedOptions().timeZone }) }
+      }
+      return homeCache.line === "" ? undefined : homeCache.line
+    }
+    /**
+     * An assistant's share of the running modules: the modules it has on (capabilities, each the instance of its
+     * effective settings; the others always pass), the tools it has not switched off, and their instructions. The
+     * whole snapshot when nothing is left out.
      */
     const modulesFor = (snapshot: ModuleSnapshot, assistant: Assistant) => {
-      const parts = snapshot.parts.flatMap((part) => {
+      const own = snapshot.assistantParts.get(assistant.id) ?? snapshot.parts
+      const parts = own.flatMap((part) => {
         if (!isCapability(part.moduleId)) return [part]
         const choice = assistant.modules[part.moduleId]
         if (choice === undefined || !choice.on) return []
@@ -561,7 +612,11 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
           ? Effect.void
           : (({ llms, recognisers, voices }) => resources.reconcile(llms, { ...reconcile, voices, recognisers }))(wantedResources())
       )
-    resourcesChanged = () => run(syncResources())
+    resourcesChanged = () => {
+      run(syncResources())
+      // The assistants' module choices and Home decide which module instances run.
+      run(syncModules())
+    }
     /** A turn of an assistant the pool does not hold (not in use: off, or on no list) is answered with this. */
     const notInUse = Llm.of({
       stream: () => Stream.fail(new LlmError({ message: "This assistant is not in use on any device, so it has no language model." }))
@@ -920,6 +975,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       store,
       sessions,
       modules: () => host.modules(),
+      checkOwn: host.checkOwn,
       engineState: () => theEngine.status().state,
       hearingProblems,
       speechMemoryWarning,
@@ -945,6 +1001,8 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
         if (needsReload) theEngine.setReloadPending(true, path)
         // CONVERSATION_IDLE_MINUTES is the built-in default of every profile's conversationIdleMinutes.
         if (sectionId === "llm-behaviour") hubNow.refreshProfiles()
+        // Home moves the modules' linked defaults (read once the section's new values are in effect).
+        if (sectionId === "home") run(syncModules())
       },
       ...(options.helloTimeoutMs !== undefined ? { helloTimeoutMs: options.helloTimeoutMs } : {})
     })
@@ -1034,7 +1092,8 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     /** Brings the running modules in line with the enabled set: starts every enabled module that is not running. */
     const reconcileModules = Effect.suspend(() =>
       Effect.forEach(
-        host.modules().filter((m) => m.enabled && m.state === "disabled").map((m) => m.id),
+        // Capabilities are started by the assistants' demand (`startEnabled`, `refresh`), not by their switch.
+        host.modules().filter((m) => m.enabled && m.state === "disabled" && !isCapability(m.id)).map((m) => m.id),
         (id) => {
           // Still enabled and still not started (the owner may have disabled or started it meanwhile).
           const waiting = () => host.modules().some((m) => m.id === id && m.enabled && m.state === "disabled")
@@ -1072,7 +1131,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
             // `startIfStopped`: after waiting out a `busy` (a reload the owner sent meanwhile), the engines
             // that reload brought up must not be rebuilt.
             whenIdle("the engines", () => true, theEngine.startIfStopped),
-            reconcileModules,
+            Effect.andThen(syncModules(), reconcileModules),
             syncResources()
           ], { concurrency: 3, discard: true })
         }))

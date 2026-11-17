@@ -52,8 +52,13 @@ export type AssistantResult = { readonly ok: true; readonly assistantId?: string
 export interface AssistantsOptions {
   readonly store: SettingsStore
   readonly sessions: VoiceSessions
-  /** The modules and, while one runs, its tools (module host). */
-  readonly modules: () => ReadonlyArray<Pick<ModuleInfo, "id" | "state" | "tools">>
+  /** The modules, their fields (`overridable`) and, while one runs, its tools (module host). */
+  readonly modules: () => ReadonlyArray<Pick<ModuleInfo, "id" | "state" | "tools" | "settings">>
+  /**
+   * The module's check of an assistant's own values (`ModuleHost.checkOwn`): overridable fields only, never a secret,
+   * values the field accepts. Without it no own value is accepted.
+   */
+  readonly checkOwn?: (moduleId: string, own: Readonly<Record<string, unknown>>) => ReadonlyArray<FieldError>
   readonly engineState: () => EngineState
   /** TypeSafe is set up (shows "Whichever fits" on the voice page; `device.pick` accepts `"typesafe"`). */
   readonly canAuto: () => boolean
@@ -141,23 +146,31 @@ export const makeAssistants = (options: AssistantsOptions): Assistants => {
   const inEffect = () => store.assistantsInEffect().map((e) => e.assistant)
   const knownIds = (): ReadonlySet<string> => new Set(store.assistants().map((a) => a.id))
 
+  /** The running modules' tools (a module that does not run has no known tools: its `offTools` are not checked). */
   const moduleOffers = (): Record<string, ModuleOffer> =>
     Object.fromEntries(
-      options.modules().filter((m) => m.state === "running").map((m) => [m.id, { overridable: [], tools: m.tools.map((t) => t.name) } satisfies ModuleOffer])
+      options.modules().filter((m) => m.state === "running").map((m) => [
+        m.id,
+        { overridable: m.settings.fields.flatMap((f) => (f.overridable === true && f.type !== "secret" ? [f.key] : [])), tools: m.tools.map((t) => t.name) } satisfies ModuleOffer
+      ])
     )
 
   /**
-   * `validateAssistant` for the modules that run, and, for the others (their tools and fields are not known), no
-   * `own` value at all: no field is overridable yet (WP-12b adds the flag).
+   * `validateAssistant` (tools of the running modules), and each module's own values checked by the module's fields
+   * (`checkOwn`: overridable fields only, never a secret, a value the field accepts), running or not.
    */
   const assistantIssues = (body: AssistantBody & { readonly id?: string }): ReadonlyArray<Issue> => {
-    const offers = moduleOffers()
-    const issues = [...validateAssistant(body, { others: store.assistants(), modules: offers })]
+    // Own values are the module's to judge (below), so `validateAssistant` sees the choices without them.
+    const withoutOwn = { ...body, modules: Object.fromEntries(Object.entries(body.modules).map(([id, { own: _own, ...choice }]) => [id, choice])) }
+    const issues = [...validateAssistant(withoutOwn, { others: store.assistants(), modules: moduleOffers() })]
     const known = new Set(options.modules().map((m) => m.id))
     for (const [moduleId, choice] of Object.entries(body.modules)) {
-      if (!known.has(moduleId) || offers[moduleId] !== undefined) continue
-      for (const field of Object.keys(choice.own ?? {})) {
-        issues.push({ code: "invalid", path: `modules.${moduleId}.own.${field}`, message: `${field} cannot be set per assistant.` })
+      if (!known.has(moduleId)) continue
+      const own = choice.own ?? {}
+      if (Object.keys(own).length === 0) continue
+      const problems = options.checkOwn?.(moduleId, own) ?? Object.keys(own).map((key) => ({ key, message: `${key} cannot be set per assistant.` }))
+      for (const p of problems) {
+        issues.push({ code: "invalid", path: p.key === null ? `modules.${moduleId}.own` : `modules.${moduleId}.own.${p.key}`, message: p.message })
       }
     }
     return issues

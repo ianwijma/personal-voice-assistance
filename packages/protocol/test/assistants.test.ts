@@ -29,6 +29,7 @@ import {
   followUpMsFor,
   hearerOf,
   hearingFor,
+  homeLineOf,
   linkedModuleDefaults,
   makeAssistantId,
   moduleInstances,
@@ -548,6 +549,11 @@ describe("module settings (section 2.6)", () => {
       clock: { timeZone: "Europe/Amsterdam", locale: "nl-NL" }
     })
     expect(linkedModuleDefaults({ units: "metric", timeZone: "", dateFormat: "en-GB" }).weather?.units).toBe("celsius")
+    // Home accepts a zone with spaces around it (its check trims); the linked default is the bare zone.
+    expect(linkedModuleDefaults({ location: " Utrecht ", units: "metric", timeZone: " Asia/Tokyo ", dateFormat: "en-GB" })).toEqual({
+      weather: { defaultPlace: "Utrecht", units: "celsius" },
+      clock: { timeZone: "Asia/Tokyo", locale: "en-GB" }
+    })
     const eff = resolveModuleSettings({
       choice: undefined,
       overridable: ["timeZone", "locale"],
@@ -555,6 +561,28 @@ describe("module settings (section 2.6)", () => {
       defaults: linkedModuleDefaults({ units: "metric", timeZone: "Europe/Berlin", dateFormat: "en-US" }).clock!
     })
     expect(eff).toEqual({ timeZone: "Europe/Berlin", locale: "en-US" })
+    expect(linkedModuleDefaults({ location: "Utrecht", units: "metric", timeZone: "", dateFormat: "en-GB" }).weather).toEqual({ defaultPlace: "Utrecht", units: "celsius" })
+  })
+  it("the Home line: location, time zone (the machine's when Home names none), language", () => {
+    expect(homeLineOf({ location: "Amsterdam, Netherlands", timeZone: "Europe/Amsterdam", language: "nl-NL" })).toBe(
+      "Home: Amsterdam, Netherlands; time zone Europe/Amsterdam; language nl-NL."
+    )
+    expect(homeLineOf({ location: " ", timeZone: "", language: "en-GB", machineTimeZone: "Europe/London" })).toBe("Home: time zone Europe/London; language en-GB.")
+    expect(homeLineOf({ location: "", timeZone: "", language: "" })).toBe("")
+  })
+  it("the Home line: trims every part, the machine's zone only when Home names none, nothing to say is empty", () => {
+    expect(homeLineOf({ location: "  Utrecht ", timeZone: " Europe/Berlin ", language: " de-DE ", machineTimeZone: "Asia/Tokyo" })).toBe(
+      "Home: Utrecht; time zone Europe/Berlin; language de-DE."
+    )
+    expect(homeLineOf({ location: "Utrecht", timeZone: "  ", language: "" })).toBe("Home: Utrecht.")
+    expect(homeLineOf({ location: "", timeZone: "", language: "", machineTimeZone: "" })).toBe("")
+    expect(homeLineOf({ location: "", timeZone: "", language: "nl-NL" })).toBe("Home: language nl-NL.")
+  })
+  it("linked defaults: Home without a location leaves the weather place empty; imperial maps to Fahrenheit", () => {
+    expect(linkedModuleDefaults({ units: "imperial", timeZone: "", dateFormat: "nl-NL" })).toEqual({
+      weather: { defaultPlace: "", units: "fahrenheit" },
+      clock: { timeZone: "", locale: "nl-NL" }
+    })
   })
   it("tools: allowed when the module is on and the tool not switched off", () => {
     expect(toolAllowed(jeff, "weather", "weather")).toBe(true)

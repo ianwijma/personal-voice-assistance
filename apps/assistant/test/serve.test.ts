@@ -66,6 +66,7 @@ describe("serve: handshake", () => {
     expect(snapshot.engine.state).toBe("ready")
     expect(snapshot.modules.map((m) => [m.id, m.state])).toEqual([["greeter", "running"]])
     expect(snapshot.sections.map((s) => [s.id, `${s.group}/${s.page?.id}`])).toEqual([
+      ["home", "modules/home"],
       ["language-model", "agents/provider"],
       ["llm-behaviour", "agents/behaviour"],
       ["stt-engine", "speech/engine"],
@@ -363,14 +364,14 @@ describe("serve: modules and settings", () => {
     const invalid = await a.waitFor("result", (m) => m.requestId === "c2")
     expect(invalid.error).toMatchObject({ code: "invalid_settings", fieldErrors: [{ key: "greeting", message: "Not this one" }] })
 
+    // A capability is switched on and off per assistant (docs/ASSISTANTS.md §2.6): its own switch is refused.
     b.send({ type: "module.disable", requestId: "d1", moduleId: "greeter" })
-    expect((await b.waitFor("result", (m) => m.requestId === "d1")).ok).toBe(true)
-    await a.waitFor("module.changed", (m) => !m.module.enabled && m.module.state === "stopping")
+    expect((await b.waitFor("result", (m) => m.requestId === "d1")).error?.code).toBe("not_allowed")
     a.send({ type: "module.enable", requestId: "e1", moduleId: "nope" })
     expect((await a.waitFor("result", (m) => m.requestId === "e1")).error?.code).toBe("unknown_module")
 
     const saved = JSON.parse(readFileSync(join(server!.dataDir, "settings.json"), "utf8"))
-    expect(saved.modules.greeter).toEqual({ enabled: false, settings: { greeting: "hoi" } })
+    expect(saved.modules.greeter).toEqual({ enabled: true, settings: { greeting: "hoi" } })
     const secrets = join(server!.dataDir, "secrets.json")
     expect(JSON.parse(readFileSync(secrets, "utf8")).modules.greeter).toEqual({ token: "s3cret" })
     expect(statSync(secrets).mode & 0o777).toBe(0o600)

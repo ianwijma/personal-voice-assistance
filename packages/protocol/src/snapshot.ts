@@ -4,6 +4,7 @@ import { AssistantInfo, DeviceListInfo, DeviceSetup, DeviceTypeInfo } from "./de
 import { ConversationId, ConversationInfo, SessionInfo } from "./sessions.ts"
 import {
   AssistantState,
+  FieldKey,
   ModuleId,
   NonNegativeFinite,
   NonNegativeInt,
@@ -39,6 +40,21 @@ export const ToolInfo = Schema.Struct({
 })
 export type ToolInfo = typeof ToolInfo.Type
 
+/**
+ * One running (or failing) instance of a module that assistants switch on (docs/ASSISTANTS.md §2.6, §3): assistants
+ * whose effective settings are equal share one instance; an assistant with its own values may run another.
+ */
+export const ModuleInstanceInfo = Schema.Struct({
+  /** The switched-on assistants that use this instance. */
+  assistants: Schema.Array(Schema.String),
+  /** The fields this instance's assistants have their own values for (empty: the shared settings). */
+  own: Schema.Array(FieldKey),
+  state: ModuleState,
+  error: Schema.optionalKey(Schema.String),
+  status: Schema.optionalKey(StatusLine)
+})
+export type ModuleInstanceInfo = typeof ModuleInstanceInfo.Type
+
 export const ModuleInfo = Schema.Struct({
   id: ModuleId,
   name: Schema.String,
@@ -66,7 +82,13 @@ export const ModuleInfo = Schema.Struct({
    * The settings category that shows the module's page (`#settings/<group>/<id>`): `modules` for capabilities,
    * `agents` (Language model) for agents and decision providers. Absent = by `kind`.
    */
-  group: Schema.optionalKey(SettingsGroup)
+  group: Schema.optionalKey(SettingsGroup),
+  /**
+   * Present for a module the assistants switch on and off (a capability, in serve mode): `enabled` is then "at least
+   * one switched-on assistant has it on", `state` sums up the instances (`error` when one fails), and each instance
+   * is listed with its assistants. Absent: one instance at most, following `enabled`.
+   */
+  instances: Schema.optionalKey(Schema.Array(ModuleInstanceInfo))
 })
 export type ModuleInfo = typeof ModuleInfo.Type
 
