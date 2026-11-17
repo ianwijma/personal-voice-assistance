@@ -306,6 +306,20 @@ Two new packages with no dependency on the rest of the stack, plus household set
   per caller), LAN only. It also declares a body limit and a rate limit. Used by inbound notification hooks and
   OAuth callbacks.
 
+**Decided after review round 4**:
+
+- Route handlers and "Test" presses run in **slots**: a slot of the module is taken before the fiber starts and
+  given back when the fiber has really ended, whatever ended the wait for it. At most 16 handlers and 4 presses per
+  module at once; at the cap a request gets 503 and a press is refused as busy, and a Health issue says so until a
+  slot is free. This replaces the counting of stragglers after the fact.
+- An answer never waits for cleanup: the response is decided by the first of the handler's result, its deadline,
+  the host's stop signal after the grace period, or the caller going away.
+- With `SERVE_BEHIND_PROXY` set, the same-origin check for non-public routes ignores the scheme and compares host
+  and port of `Origin` with `Host`; the proxy must pass `Host` through.
+- A module's described form is checked once against the wire schema and a size budget; a module whose form does not
+  encode or is too large does not start. Runtime options and `info` values are trimmed to the budget.
+- A field's default goes through its own decoder; a default the field rejects is a declaration error.
+
 ### P4. Household store and event bus
 
 Server only: no voice-page work. P10 is the first consumer on a screen. The store is deliberately small: two review
