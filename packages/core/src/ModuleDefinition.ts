@@ -3,6 +3,8 @@ import { Effect, Schema, type Scope } from "effect"
 import type { AssistantModule, ContextProvider, Tool } from "./Module.ts"
 import type { HealthContext, ModuleServicesV2, ModuleTemplate, Platforms, Requirement, SharedContext, SharedPart } from "./ModuleApi.ts"
 import type { ModuleContributions } from "./ModuleContributions.ts"
+import type { EventType } from "./EventBus.ts"
+import { checkModuleStorage, type ModuleStorage } from "./HouseholdStore.ts"
 import type { SettingsOf, SettingsSpec } from "./Settings.ts"
 
 /**
@@ -116,6 +118,13 @@ export interface ModuleDefinition<S extends SettingsSpec = SettingsSpec> {
    */
   readonly uses?: ReadonlyArray<string>
   /**
+   * Its data (version 2; docs/STORING-DATA.md): the collections it uses and its own SQL migrations. Judged and upgraded
+   * before anything starts; data written by a newer version of the module makes it `unavailable`.
+   */
+  readonly storage?: ModuleStorage
+  /** The event types it publishes that voice pages may see (each with a projection). Others stay on the server. */
+  readonly events?: ReadonlyArray<EventType>
+  /**
    * The part that runs once per module (version 2) while it is demanded, with its shared settings only, in a scope the
    * host closes when demand ends or the shared settings change (after the grace period): sockets, caches, handlers,
    * services and contributions. 10 s to start. What it returns as `value` every instance receives as `ctx.shared`.
@@ -146,9 +155,14 @@ const checkManifest = (
     readonly templates?: ReadonlyArray<ModuleTemplate>
     readonly uses?: ReadonlyArray<string>
     readonly shared?: unknown
+    readonly storage?: ModuleStorage
+    readonly events?: ReadonlyArray<EventType>
   }
 ) => {
   if (definition.shared !== undefined && (definition.apiVersion ?? 1) < 2) throw new Error(`Module ${id}: shared needs apiVersion 2`)
+  if (definition.storage !== undefined && (definition.apiVersion ?? 1) < 2) throw new Error(`Module ${id}: storage needs apiVersion 2`)
+  if (definition.events !== undefined && (definition.apiVersion ?? 1) < 2) throw new Error(`Module ${id}: events needs apiVersion 2`)
+  if (definition.storage !== undefined) checkModuleStorage(id, definition.storage)
   for (const used of definition.uses ?? []) {
     if (!/^[a-z][a-z0-9-]{0,39}$/.test(used) || used === id) throw new Error(`Module ${id}: uses names "${used}", which is not another module id`)
   }
@@ -189,6 +203,8 @@ export const defineModule = <const S extends SettingsSpec = {}, const V extends 
   readonly health?: (context: HealthContext<SettingsOf<S>>) => Effect.Effect<ReadonlyArray<Issue>>
   readonly templates?: ReadonlyArray<ModuleTemplate>
   readonly uses?: ReadonlyArray<string>
+  readonly storage?: ModuleStorage
+  readonly events?: ReadonlyArray<EventType>
   readonly shared?: (context: SharedContext<SettingsOf<S>>) => Effect.Effect<SharedPart<X>, ModuleStartError, Scope.Scope>
   readonly start: (context: ModuleContextOf<V, SettingsOf<S>, X>) => Effect.Effect<ModuleInstance, ModuleStartError, Scope.Scope>
 }): ModuleDefinition<S> => {
@@ -211,6 +227,8 @@ export const defineModule = <const S extends SettingsSpec = {}, const V extends 
     ...(definition.health !== undefined ? { health: definition.health } : {}),
     ...(definition.templates !== undefined ? { templates: definition.templates } : {}),
     ...(definition.uses !== undefined ? { uses: definition.uses } : {}),
+    ...(definition.storage !== undefined ? { storage: definition.storage } : {}),
+    ...(definition.events !== undefined ? { events: definition.events } : {}),
     ...(definition.shared !== undefined ? { shared: definition.shared as NonNullable<ModuleDefinition<S>["shared"]> } : {}),
     // The host passes the context of the module's version (`ModuleContextOf`).
     start: definition.start as ModuleDefinition<S>["start"]

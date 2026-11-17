@@ -7,8 +7,9 @@ import { ModuleId, NonNegativeFinite, NonNegativeInt } from "./common.ts"
  *
  * The server sends a voice connection only what its audience may see (`SessionHub`, `householdAudience`): household
  * scope to every voice connection, device scope to that device's connections, nothing of assistant or conversation
- * scope, and person scope not at all until `Privacy.mayReveal` exists (P5). Only collections a module opted in
- * (`defineCollection({ frontEnds: true })`) and events a module published with `frontEnds: true` are sent.
+ * scope, and person scope not at all until `Privacy.mayReveal` exists (P5). Nothing is sent by default: a collection
+ * or an event type opts in with a **projection** (row or event, target device) → what that device may see, or
+ * nothing, applied the same way to the snapshot, to live events and to the replay after a reconnect.
  */
 
 /** Where a row or an event belongs (`household` has no id). */
@@ -21,7 +22,7 @@ export const HouseholdScope = Schema.Union([
 ])
 export type HouseholdScope = typeof HouseholdScope.Type
 
-/** One stored row, as a page sees it. `value` is the collection's JSON form. */
+/** One stored row, as a page sees it. `value` is what the collection's projection gave for that page's device. */
 export const HouseholdRow = Schema.Struct({
   id: Schema.String,
   rev: NonNegativeInt,
@@ -41,13 +42,14 @@ export const HouseholdCollectionRows = Schema.Struct({
 export type HouseholdCollectionRows = typeof HouseholdCollectionRows.Type
 
 /**
- * A change to a row (`data` of a `<module>.<collection>.changed` event): what happened and, for an insert or an
- * update, the new value. `remove` and `erase` carry no value.
+ * A change to a row as one device sees it (`data` of a `<module>.<collection>.changed` event), after the collection's
+ * projection for that device: `put` with what the device may see of the row now, or `remove` when the row is gone
+ * or no longer visible to a device that could see it. Nothing is sent for a row the device never could see.
  */
 export const HouseholdChange = Schema.Struct({
   collection: Schema.String,
   id: Schema.String,
-  op: Schema.Literals(["insert", "update", "remove", "erase"]),
+  op: Schema.Literals(["put", "remove"]),
   rev: NonNegativeInt,
   value: Schema.optionalKey(Schema.Unknown)
 })
@@ -78,7 +80,8 @@ export const HouseholdSnapshotMessage = Schema.Struct({
 
 /**
  * A data change of a collection sent to pages, or an event a module published for pages, after its commit; also
- * the replay after a reconnect (each change after `hello.household.seq`, in order). Values are the current ones.
+ * the replay after a reconnect (each row changed after `hello.household.seq`, once, in order). Values are always the
+ * current row through today's projection, never an older payload from the change log.
  */
 export const HouseholdEventMessage = Schema.Struct({
   type: Schema.Literal("household.event"),

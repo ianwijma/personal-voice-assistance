@@ -11,6 +11,8 @@ import type {
 } from "@pva/protocol"
 import type { Effect } from "effect"
 import type { ActionParam } from "./Actions.ts"
+import type { ModuleEvents } from "./EventBus.ts"
+import type { ModuleStore } from "./HouseholdStore.ts"
 
 /**
  * Module API version 2 (docs/MODULES-PLAN.md §4 P1; module-definition-config-and-dependencies.md §A.4, §C.3–C.5).
@@ -333,6 +335,14 @@ export interface ModuleHostApi {
  */
 export interface ModuleServicesV2 {
   readonly host: ModuleHostApi
+  /**
+   * The module's data (docs/STORING-DATA.md): its declared collections, its SQL, transactions. Shared by every instance
+   * and the `shared` part. In the CLI modes it reads and refuses writes (`read-only`); without a store, every call fails
+   * `unavailable`.
+   */
+  readonly store: ModuleStore
+  /** The household event bus: publish `<moduleId>.<type>`, subscribe to anything (a stream in the caller's scope). */
+  readonly events: ModuleEvents
 }
 
 /**

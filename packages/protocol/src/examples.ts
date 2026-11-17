@@ -708,7 +708,7 @@ export const serverExamples: { readonly [T in ServerMessageType]: Extract<Server
       module: "timers",
       type: "timers.timers.changed",
       scope: { kind: "household" },
-      data: { collection: "timers", id: "t1", op: "update", rev: 2, value: { label: "pasta", dueAt: 1_763_100_900_000 } }
+      data: { collection: "timers", id: "t1", op: "put", rev: 2, value: { label: "pasta", dueAt: 1_763_100_900_000 } }
     }
   },
   ...assistantsServerExamples

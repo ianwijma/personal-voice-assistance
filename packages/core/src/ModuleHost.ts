@@ -29,6 +29,8 @@ import type { Agent } from "./Agent.ts"
 import { buildDecisionPlan, type DecisionProvider } from "./Decision.ts"
 import { type ExecutionGateway, type GatewayAccess, type GatewayOptions, isGatewayRefusal, makeExecutionGateway } from "./Gateway.ts"
 import { makeIssueRegistry, type IssueRegistry } from "./Issues.ts"
+import { type EventBus, hostEvent, makeEventBus } from "./EventBus.ts"
+import { type HouseholdStore, makeClosedStore } from "./HouseholdStore.ts"
 import { type AssistantModule, type ContextProvider, type Tool, toolMetadata } from "./Module.ts"
 import {
   type ActionRunRequest,
@@ -284,6 +286,12 @@ export interface ModuleHostOptions {
   readonly issues?: IssueRegistry
   /** Time a module's `health()` may take. Default 5 s. */
   readonly healthTimeoutMs?: number
+  /**
+   * The household store and event bus (P4): `ctx.store` and `ctx.events` of version 2 modules, and the data verdict
+   * of `store.availability` (a module whose data is newer than it is `unavailable`). `prepare` must have run. Absent:
+   * a store that fails every call (`unavailable`) and a bus of the host's own.
+   */
+  readonly household?: { readonly store: HouseholdStore; readonly events: EventBus }
 }
 
 interface Running {
@@ -394,6 +402,7 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
   const healthTimeoutMs = options.healthTimeoutMs ?? 5_000
   const gateway = makeExecutionGateway({ ...(options.access !== undefined ? { access: options.access } : {}), ...options.gatewayHooks })
   const issues = options.issues ?? makeIssueRegistry()
+  const household = options.household ?? { store: makeClosedStore("There is no household store in this mode."), events: makeEventBus() }
   const listeners = new Set<(info: ModuleInfo) => void>()
   const retired = new Set<Scope.Closeable>()
 
@@ -463,6 +472,9 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
         statuses: []
       }
     }
+    // Its stored data was written by a newer version of it, or could not be upgraded (the store's `prepare`).
+    const data = household.store.availability(def.id)
+    if (data !== undefined) return { unavailable: data, statuses: [] }
     const platform = options.platform
     if (platform !== undefined && def.platforms !== undefined) {
       const { os, arch } = def.platforms
@@ -649,11 +661,17 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
       ...(t.suggestedPhrases !== undefined ? { suggestedPhrases: [...t.suggestedPhrases] } : {})
     }))
 
+  /** The state last announced on the bus per module (`host.module.state`). */
+  const announcedState = new Map<string, ModuleState>()
   const notify = (entry: Entry) => {
     entry.revision++
     issues.set(`module:${entry.def.id}`, moduleIssues(entry))
-    if (listeners.size === 0) return
     const current = info(entry)
+    if (announcedState.get(entry.def.id) !== current.state) {
+      announcedState.set(entry.def.id, current.state)
+      household.events.publish(hostEvent("module.state", { moduleId: entry.def.id, state: current.state }))
+    }
+    if (listeners.size === 0) return
     for (const listener of listeners) {
       try {
         listener(current)
@@ -1760,7 +1778,9 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
         contributions,
         actions,
         requestRestart: (reason) => requestRestart(entry, target, reason)
-      }
+      },
+      store: household.store.forModule(entry.def.id),
+      events: household.events.forModule(entry.def.id)
     }
   }
 

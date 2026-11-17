@@ -12,6 +12,9 @@ import { AudioInput, AudioOutput, Llm, Stt, Tts, type TtsAudio } from "./Service
 import { makeTurnTrace, TurnTrace } from "./TurnTrace.ts"
 import { defaultRoutingConfig, makeTriggerRouter, type RoutingConfig } from "./TriggerRouter.ts"
 import { makeToolRegistry, type ToolRegistry } from "./ToolRegistry.ts"
+import { connectStoreToBus, type EventBusOptions, type HouseholdEvent, makeEventBus } from "./EventBus.ts"
+import type { ModuleStorage } from "./HouseholdStore.ts"
+import { makeMemoryHouseholdStore, type MemoryStoreOptions } from "./MemoryHouseholdStore.ts"
 
 export interface Sleep {
   readonly _tag: "Sleep"
@@ -427,3 +430,37 @@ export const testTurnTraceLayer = Layer.effect(
 
 // The trigger-phrase router, as a fixture for agent tests (see TriggerRouter.ts).
 export * from "./TriggerRouter.ts"
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Household store and event bus (docs/STORING-DATA.md "Testing a module")
+
+export { makeMemoryHouseholdStore, type MemoryStoreOptions }
+
+/** An event bus that also records every event published on it (by the store, the host or modules), in order. */
+export const makeRecordingEventBus = (options: EventBusOptions = {}) => {
+  const events: Array<HouseholdEvent> = []
+  const bus = makeEventBus({
+    ...options,
+    observe: (event) => {
+      events.push(event)
+      options.observe?.(event)
+    }
+  })
+  return { bus, events }
+}
+
+/**
+ * A household for a module test: an in-memory store prepared for `modules` (their `storage`), a recording bus fed
+ * from the store's commits, and what to give the module host (`ModuleHostOptions.household`).
+ */
+export const makeTestHousehold = (
+  modules: ReadonlyArray<{ readonly id: string; readonly storage?: ModuleStorage }>,
+  options: MemoryStoreOptions = {}
+) =>
+  Effect.gen(function*() {
+    const store = makeMemoryHouseholdStore(options)
+    yield* store.prepare(modules.map((m) => ({ id: m.id, storage: m.storage })))
+    const recording = makeRecordingEventBus()
+    connectStoreToBus(store, recording.bus)
+    return { store, bus: recording.bus, events: recording.events, household: { store, events: recording.bus } }
+  })
