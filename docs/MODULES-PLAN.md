@@ -229,7 +229,7 @@ Two new packages with no dependency on the rest of the stack, plus household set
 
 - `packages/language` (`@pva/language`), English (British conventions) and Dutch:
   - parsing: time of day (English "half seven" is 7:30; Dutch "half zeven" is 6:30, "kwart voor zeven"), dates and
-    date-times ("tomorrow at five", "next Friday" reported as ambiguous), durations (re-exporting core's),
+    date-times ("tomorrow at five", "next Friday" reported as ambiguous), durations (its own closed grammar),
     quantities with units (mass, volume, pieces, "about", "a handful") for lists and the kitchen. A phrase the
     parser cannot place is reported as not understood or ambiguous, never guessed: this feeds alarms and calendar
     writes;
@@ -268,24 +268,28 @@ version in §5 needs them.
 - `ctx.store`: **document collections** and nothing else for modules. `defineCollection` with a name, a scope, a
   schema whose values are objects, a version with a migration of the whole collection when it changes, declared
   indexes on scalar fields, optional `ambient` lines and an optional projection for voice pages. Operations: `get`,
-  `list` (one equality filter on an indexed field, an order, a limit), `insert`, `update` with a revision check,
-  `remove`. No module-owned SQL, no full-text search, no generic undo. A module that needs to find text matches in
+  `list` (one equality filter on an indexed field, an order on that field or on a second one covered by a declared
+  two-field index, a limit with a hard maximum), `insert`, `update` with a revision check, `remove`. No module-owned SQL, no full-text search, no generic undo. A module that needs to find text matches in
   code over a bounded `list`; a module that offers "undo" keeps what it needs to reverse its own last operation.
 - **Transactions are synchronous and flat.** `store.transaction(tx => …)` runs a function with no awaits against a
   handle with the same operations; begin, the function and commit happen in one uninterrupted step, so there is no
-  interleaving, no nesting and nothing to interrupt. A call to `transaction` inside one joins it. Core services
-  (the scheduler, notifications) get their own tables through `store.core(owner)` and take part in the same
-  transaction through the same handle.
+  interleaving, no nesting and nothing to interrupt. A function that returns a promise fails the transaction. A
+  call to `transaction` inside one joins it.
+- **No SQL in the interface, for anyone.** Core services (the scheduler, notifications) keep their data in
+  collections too, under an owner name no module can take, through a handle that module code is never given, and
+  take part in a module's transaction the same way.
 - `remove` really removes: the row is deleted with `secure_delete`, the write-ahead log is checkpointed soon after,
   and there is no history that still holds the content. Daily backups keep it until they rotate out, and the
   documentation says how long.
 - Scopes household, person, assistant, device, conversation, derived from `CurrentTurn` or given explicitly, with
   scope ids restricted to a safe alphabet. A person-scoped call with no person is a typed error.
-- A stored schema version per module and per collection. A database written by a newer version of a module is
-  refused for that module (`unavailable`, with the reason), never opened and rewritten by older code. Migration runs
-  in one transaction after a backup.
-- A daily backup on a separate connection, kept 14 days. Restoring is a documented manual step with the server
-  stopped; `doctor` checks that the database opens and that a recent backup exists.
+- One data version per module, stored with its id. Data written by a newer version makes the module `unavailable`
+  with that reason, and nothing of it is read, migrated or deleted by older code. An older version is migrated,
+  all the module's collections in one transaction, after a backup. Any change to a collection's shape (schema,
+  indexes) needs a version bump; its scope cannot change. Data of a collection the code no longer declares stays.
+- A daily backup, made by the serving process on a separate connection, kept 14 days. Restoring is a documented
+  manual step with the server stopped; `doctor` checks that the database opens and that a recent backup exists.
+  Checkpoints of the write-ahead log run on that separate connection too, never on the one turns use.
 - Event bus: one in-process bus; `ctx.events.publish` and `subscribe`; host events (turn ended, device connected or
   disconnected, module state changed). Events about a store change, and events published inside a transaction, are
   released after it commits, in order.

@@ -52,9 +52,9 @@ describe("finding 3: compressed bodies are decompressed and limited after decomp
     expect(await errorOf(safeFetch("http://a.example/", page({ resolver, connector: served("br", zlib.brotliCompressSync(big)) })))).toBeInstanceOf(NetTooLarge)
     expect(await errorOf(safeFetch("http://a.example/", page({ resolver, connector: served("deflate", zlib.deflateSync(big)) })))).toBeInstanceOf(NetTooLarge)
   })
-  it("gzip, x-gzip, deflate (zlib and raw) and br are decoded; the headers say what the body is now", async () => {
+  it("gzip, x-gzip, deflate (zlib) and br are decoded; the headers say what the body is now", async () => {
     const text = "héllo wörld ".repeat(50)
-    for (const [encoding, body] of [["gzip", zlib.gzipSync(text)], ["x-gzip", zlib.gzipSync(text)], ["deflate", zlib.deflateSync(text)], ["deflate", zlib.deflateRawSync(text)], ["br", zlib.brotliCompressSync(text)]] as const) {
+    for (const [encoding, body] of [["gzip", zlib.gzipSync(text)], ["x-gzip", zlib.gzipSync(text)], ["deflate", zlib.deflateSync(text)], ["br", zlib.brotliCompressSync(text)]] as const) {
       const res = await Effect.runPromise(safeFetch("http://a.example/", page({ resolver, connector: served(encoding, new Uint8Array(body), "text/plain; charset=utf-8") })))
       expect(res.text(), encoding).toBe(text)
       expect(res.encoding).toBe(encoding === "x-gzip" ? "gzip" : encoding)

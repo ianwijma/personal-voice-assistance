@@ -6,7 +6,7 @@ import http from "node:http"
 import type { AddressInfo } from "node:net"
 import zlib from "node:zlib"
 import { makeCachedJson, makeMemoryJsonCache } from "../src/CachedJson.ts"
-import { NetAborted, NetFailure } from "../src/Errors.ts"
+import { NetAborted, NetFailure, NetRefused } from "../src/Errors.ts"
 import { contentTypes, fetchOwnerConfiguredLan, nodeConnector, safeFetch, type SafeResponse } from "../src/SafeFetch.ts"
 import { bytes, chunks, fakeConnector, fakeResolver, reply } from "./helpers.ts"
 
@@ -88,7 +88,7 @@ describe("finding 19: a compressed body decodes whatever its chunk boundaries", 
       connector: fakeConnector(() => reply(200, chunks(...parts), { "content-encoding": encoding }))
     }))
   const bodies: ReadonlyArray<readonly [string, string, Uint8Array]> = [
-    ["deflate", "zlib-wrapped", zlib.deflateSync(text)], ["deflate", "raw", zlib.deflateRawSync(text)], ["gzip", "gzip", zlib.gzipSync(text)], ["br", "brotli", zlib.brotliCompressSync(text)]
+    ["deflate", "zlib-wrapped", zlib.deflateSync(text)], ["gzip", "gzip", zlib.gzipSync(text)], ["br", "brotli", zlib.brotliCompressSync(text)]
   ]
   for (const [encoding, kind, body] of bodies) {
     it(`${kind}: split at every byte once, and into single bytes`, async () => {
@@ -107,10 +107,11 @@ describe("finding 19: a compressed body decodes whatever its chunk boundaries", 
     const body = zlib.deflateSync("hello world")
     expect((await fetchWith("deflate", [body.subarray(0, 1), body.subarray(1)])).text()).toBe("hello world")
   })
-  it("an empty deflate body is an empty body, and a corrupt one is a failure", async () => {
+  it("an empty deflate body is an empty body, and one that is not a zlib stream is refused (review round 3: deflate is zlib)", async () => {
     expect((await fetchWith("deflate", [])).text()).toBe("")
     const error = await errorOf(safeFetch("http://a.example/", { accept: contentTypes.webPage, resolver, connector: fakeConnector(() => reply(200, chunks(bytes("x")), { "content-encoding": "deflate" })) }))
-    expect(error).toBeInstanceOf(NetFailure)
+    expect(error).toBeInstanceOf(NetRefused)
+    expect((error as NetRefused).rule).toBe("content-encoding")
   })
 })
 

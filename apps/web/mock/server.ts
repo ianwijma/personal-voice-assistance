@@ -142,6 +142,7 @@ import {
 import { exampleEngineStatus, exampleHealth, exampleSnapshot, exampleUnavailableModule, exampleVoiceSection, exampleWeatherModule } from "@pva/protocol/examples"
 import { type WebSocket, WebSocketServer } from "ws"
 import { createAssistantsMock } from "./assistants.ts"
+import { fieldValueError } from "./fieldChecks.ts"
 import { seedTraces } from "./traces.ts"
 import { createVoiceAssistants, scenarioSettings, scriptedTurn } from "./voiceAssistants.ts"
 import { encodeWav, MOCK_PROVIDERS } from "./voices.ts"
@@ -1860,6 +1861,7 @@ const validate = (form: SettingsForm, patch: SettingsPatch) => {
     const field = form.fields.find((f) => f.key === k)
     if (field === undefined) errors.push({ key: null, message: `Unknown setting ${k}.` })
     else if (field.locked !== undefined) errors.push({ key: k, message: `${field.locked.reason}; change it there.` })
+    else if (fieldValueError(field, v) !== undefined) errors.push({ key: k, message: fieldValueError(field, v)! })
     else if (field.type === "number" && typeof v === "number" && ((field.min !== undefined && v < field.min) || (field.max !== undefined && v > field.max))) {
       errors.push({ key: k, message: `Must be between ${field.min} and ${field.max}.` })
     } else if (k === "defaultPlace" && typeof v === "string" && /atlantis/i.test(v)) errors.push({ key: k, message: "Open-Meteo does not know this place." })

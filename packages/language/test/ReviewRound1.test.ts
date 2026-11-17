@@ -4,7 +4,7 @@ import { parseDateTime, type DateOptions } from "../src/Dates.ts"
 import * as language from "../src/index.ts"
 import { parseQuantity } from "../src/Quantity.ts"
 import { parseRecurrence, type RecurrenceOptions } from "../src/Recurrence.ts"
-import { describeRRule, formatRRule, nextOccurrence, occurrencesAfter, parseDtstart, parseRRule, type RecurrenceSpec } from "../src/Rrule.ts"
+import { describeRRule, formatRRule, nextOccurrence, occurrencesAfter, parseDtstart, parseRRule, readSeries, type RecurrenceSpec } from "../src/Rrule.ts"
 import { speakAmount, speakNumber } from "../src/Speak.ts"
 import { parseTimeOfDay } from "../src/Time.ts"
 import { normalizeTimeZone, offsetAt } from "../src/Zoned.ts"
@@ -23,7 +23,9 @@ const rec = (text: string, lang: "en" | "nl" = "en", options: RecurrenceOptions 
   return r.kind === "ok" ? `${r.value.rrule} @ ${r.value.dtstart.replace(`DTSTART;TZID=${AMS}:`, "")}` : r.kind
 }
 const spec = (rrule: string, dtstart: string, timeZone = AMS): RecurrenceSpec => ({ rrule, dtstart: dtstartOf(dtstart, timeZone), timeZone })
-const list = (s: RecurrenceSpec, after: number, n: number) => occurrencesAfter(s, after, n).map(iso)
+/** The instants of `occurrencesAfter` (round 3: it also says why it stopped, and is `undefined` for a spec it refuses). */
+const occ = (...a: Parameters<typeof occurrencesAfter>): Array<number> => [...(occurrencesAfter(...a)?.instants ?? [])]
+const list = (s: RecurrenceSpec, after: number, n: number) => occ(s, after, n).map(iso)
 
 describe("finding 6: words that are names of object properties", () => {
   const names = ["constructor", "toString", "__proto__", "hasOwnProperty", "valueOf", "prototype", "isPrototypeOf", "__defineGetter__"]
@@ -52,7 +54,8 @@ describe("finding 6: words that are names of object properties", () => {
   })
   it("describeRRule and the speakers ignore such words", () => {
     expect(describeRRule("FREQ=WEEKLY;BYDAY=constructor", "en")).toBeUndefined()
-    expect(speakAmount({ amount: 2, unit: "constructor" as never }, "en")).toBe("2 constructor")
+    // Round 3: a unit that is not one of `UnitId` cannot be said (decision 1).
+    expect(speakAmount({ amount: 2, unit: "constructor" as never }, "en")).toBeUndefined()
   })
 })
 
@@ -67,7 +70,7 @@ describe("finding 7: a number is read whole or not at all", () => {
     ["tweeduizend driehonderd gram meel", "nl", "2300 g meel"], ["twee duizend gram meel", "nl", "2000 g meel"], ["vijf en twintig gram suiker", "nl", "25 g suiker"],
     ["five five apples", "en", "not-understood"], ["3-5 apples", "en", "not-understood"], ["1e3 kg", "en", "not-understood"], ["1.000 g sugar", "en", "not-understood"],
     ["1,000 g sugar", "nl", "not-understood"], ["1,500 g sugar", "en", "1500 g sugar"], ["1.500 gram suiker", "nl", "1500 g suiker"], ["2 kg 500 g flour", "en", "not-understood"],
-    ["two and a half kilo potatoes", "en", "2.5 kg potatoes"], ["a kilo of rice", "en", "1 kg rice"], ["3x melk", "nl", "3 piece melk"]
+    ["two and a half kilo potatoes", "en", "2.5 kg potatoes"], ["a kilo of rice", "en", "1 kg rice"], ["3x melk", "nl", "not-understood"]
   ]
   for (const [t, lang, want] of rows) it(`${lang} "${t}"`, () => expect(q(t, lang)).toBe(want))
   it("times and dates use the same rule", () => {
@@ -83,7 +86,7 @@ describe("finding 7: a number is read whole or not at all", () => {
 describe("finding 8: the whole temporal expression is read, or none of it", () => {
   const rows: ReadonlyArray<readonly [string, string]> = [
     ["Wednesday 3 March 2027 at 5 pm", "2027-03-03 17:00"], ["Tuesday 3 March 2027 at 5 pm", "not-understood"], ["Friday the 20th", "2026-11-20"], ["Friday the 21st", "not-understood"],
-    ["on Wednesday, 3 March 2027", "2027-03-03"], ["tomorrow, Thursday", "2026-11-19"], ["tomorrow Friday", "not-understood"],
+    ["on Wednesday, 3 March 2027", "2027-03-03"], ["tomorrow, Thursday", "not-understood"], ["tomorrow Friday", "not-understood"],
     ["29 February 2027 at 5 pm", "not-understood"], ["31 April at 9", "not-understood"], ["the 32nd", "not-understood"], ["the 0th", "not-understood"],
     ["last Friday", "not-understood"], ["previous Monday", "not-understood"], ["before Friday", "not-understood"], ["after tomorrow at 5", "not-understood"], ["until 5 pm", "not-understood"],
     ["every Friday", "not-understood"], ["Fridays at 5", "not-understood"], ["this weekend", "not-understood"], ["in 2 weeks and 3 days", "not-understood"],
@@ -190,7 +193,7 @@ describe("finding 13: a part of the day sets the clock", () => {
 describe("finding 14 (kept): a time the clocks skip, by RFC 5545 §3.3.10 and §3.3.5", () => {
   it("a daily 02:30 in Amsterdam is 03:30 on the day the clocks go forward, and a repeated time is the first one", () => {
     expect(list(spec("FREQ=DAILY", "2027-03-26T02:30"), ams(2027, 3, 26, 12), 3)).toEqual(["2027-03-27T02:30", "2027-03-28T03:30", "2027-03-29T02:30"])
-    expect(occurrencesAfter(spec("FREQ=DAILY", "2026-10-24T02:30"), ams(2026, 10, 24, 12), 1).map((t) => new Date(t).toISOString())).toEqual(["2026-10-25T00:30:00.000Z"])
+    expect(occ(spec("FREQ=DAILY", "2026-10-24T02:30"), ams(2026, 10, 24, 12), 1).map((t) => new Date(t).toISOString())).toEqual(["2026-10-25T00:30:00.000Z"])
   })
   it("wall-clock hourly rules are no longer offered (round 2)", () => {
     expect(parseRRule("FREQ=HOURLY;BYMINUTE=0").kind).toBe("unsupported")
@@ -220,16 +223,19 @@ describe("finding 16: HOURLY and MINUTELY are no longer offered (round 2)", () =
 describe("finding 17: long series have no iteration cap", () => {
   it("a daily series of 1000 runs to its last occurrence and ends there", () => {
     const s = spec("FREQ=DAILY;COUNT=1000", "2026-11-01T09:00")
-    const last = occurrencesAfter(s, ams(2029, 7, 27), 5)
+    const last = occ(s, ams(2029, 7, 27), 5)
     expect(last.map(iso)).toEqual(["2029-07-27T09:00"])
     expect(nextOccurrence(s, last[0]!)).toBeUndefined()
   })
   it("decades into an unbounded series is quick", () => {
     const t0 = performance.now()
-    expect(list(spec("FREQ=DAILY", "1990-01-01T07:00"), ams(2026, 11, 18, 10, 0), 1)).toEqual(["2026-11-19T07:00"])
-    expect(list(spec("FREQ=WEEKLY;BYDAY=MO", "1990-01-01T07:00"), ams(2026, 11, 18, 10, 0), 1)).toEqual(["2026-11-23T07:00"])
-    expect(list(spec("FREQ=MONTHLY;BYDAY=-1FR", "1990-01-26T07:00"), ams(2026, 11, 18, 10, 0), 1)).toEqual(["2026-11-27T07:00"])
-    expect(list(spec("FREQ=DAILY", "1990-01-01T07:00"), ams(9000, 1, 1, 10, 0), 1)).toEqual(["9000-01-02T07:00"])
+    expect(list(spec("FREQ=DAILY", "2000-01-03T07:00"), ams(2026, 11, 18, 10, 0), 1)).toEqual(["2026-11-19T07:00"])
+    expect(list(spec("FREQ=WEEKLY;BYDAY=MO", "2000-01-03T07:00"), ams(2026, 11, 18, 10, 0), 1)).toEqual(["2026-11-23T07:00"])
+    expect(list(spec("FREQ=MONTHLY;BYDAY=-1FR", "2000-01-28T07:00"), ams(2026, 11, 18, 10, 0), 1)).toEqual(["2026-11-27T07:00"])
+    expect(list(spec("FREQ=DAILY", "2000-01-03T07:00"), ams(2199, 12, 30, 10, 0), 1)).toEqual(["2199-12-31T07:00"])
+    expect(occurrencesAfter(spec("FREQ=DAILY", "2000-01-03T07:00"), ams(2199, 12, 31, 10, 0), 1)).toEqual({ instants: [], stop: "range" })
+    // Round 3: a DTSTART before 2000 is outside the supported years.
+    expect(readSeries(spec("FREQ=DAILY", "1990-01-01T07:00")).kind).toBe("unsupported")
     expect(performance.now() - t0).toBeLessThan(1500)
   })
 })
@@ -308,14 +314,15 @@ describe("finding 21: an unknown zone is never another zone", () => {
 })
 
 describe("finding 22: a nonzero amount is never said as zero", () => {
-  it("numbers keep two significant digits below 1", () => {
-    expect(speakNumber(0.001, "en")).toBe("0.001")
-    expect(speakNumber(0.000123, "en")).toBe("0.00012")
-    expect(speakNumber(0.001, "nl")).toBe("0,001")
-    expect(speakNumber(0.001, "en", { words: true })).toBe("zero point zero zero one")
-    expect(speakNumber(-0.004, "en")).toBe("minus 0.004")
+  it("a nonzero number is never said as 0: below the two-decimal step it cannot be said (round 3)", () => {
+    expect(speakNumber(0.01, "en")).toBe("0.01")
+    expect(speakNumber(0.001, "en")).toBeUndefined()
+    expect(speakNumber(0.000123, "en")).toBeUndefined()
+    expect(speakNumber(0.01, "nl")).toBe("0,01")
+    expect(speakNumber(0.01, "en", { words: true })).toBe("zero point zero one")
+    expect(speakNumber(-0.004, "en")).toBeUndefined()
     expect(speakNumber(2.346, "en")).toBe("2.35")
-    expect(speakNumber(Number.NaN, "en")).toBe("")
+    expect(speakNumber(Number.NaN, "en")).toBeUndefined()
   })
   it("amounts convert without rounding to zero, and humanise only exactly", () => {
     expect(speakAmount({ amount: 0.0001, unit: "kg" }, "en")).toBe("0.1 grams")
@@ -323,14 +330,16 @@ describe("finding 22: a nonzero amount is never said as zero", () => {
     expect(speakAmount({ amount: 0.0005, unit: "l" }, "nl")).toBe("0,5 milliliter")
     expect(speakAmount({ amount: 1500, unit: "g" }, "en")).toBe("1.5 kilograms")
     expect(speakAmount({ amount: 1234, unit: "g" }, "en")).toBe("1234 grams")
-    expect(speakAmount({ amount: 1.001, unit: "kg" }, "en")).toBe("1 kilogram")
+    // Round 4, finding 2: never rounded into another quantity; said exactly in grams, or not at all.
+    expect(speakAmount({ amount: 1.001, unit: "kg" }, "en")).toBe("1001 grams")
+    expect(speakAmount({ amount: 1.001, unit: "kg" }, "en", { humanize: false })).toBeUndefined()
   })
 })
 
-describe("finding 27: the package index exports the tokenizer", () => {
-  it("tokenize and sliceText are exported", () => {
-    expect(language.tokenize("7pm").map((t) => t.norm)).toEqual(["7", "pm"])
-    expect(typeof language.sliceText).toBe("function")
+describe("finding 27 (round 3): the tokenizer is internal; every exported function is a front door", () => {
+  it("tokenize and sliceText are no longer exported", () => {
+    expect((language as Record<string, unknown>)["tokenize"]).toBeUndefined()
+    expect((language as Record<string, unknown>)["sliceText"]).toBeUndefined()
   })
 })
 
