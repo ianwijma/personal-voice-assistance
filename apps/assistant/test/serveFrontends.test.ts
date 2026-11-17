@@ -107,7 +107,8 @@ describe("admin password and sessions", () => {
     expect(result.admin!.expiresAt).toBeGreaterThanOrEqual(before + 12 * 3_600_000 - 1_000)
     expect(page.types(from)).toEqual(["result", "admin.state", "admin.snapshot"])
     expect(page.messages[from + 1]).toEqual({ type: "admin.state", admin: { enabled: true, loggedIn: true, expiresAt: result.admin!.expiresAt } })
-    expect(snapshot?.deviceTypes?.map((t) => t.kind)).toEqual([WEB_VOICE_KIND])
+    // Protocol 9: browsers and voice nodes.
+    expect(snapshot?.deviceTypes?.map((t) => t.kind)).toEqual([WEB_VOICE_KIND, "voice-node"])
     expect(snapshot?.vault.admin).toBe(true)
 
     const voice = await voicePage(server)

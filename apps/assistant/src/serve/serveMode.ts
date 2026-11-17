@@ -29,6 +29,8 @@ import {
   deviceVoiceUser,
   effectiveDeviceSettings,
   type EngineInfo,
+  type NodeManifest,
+  type NodePairRequest,
   type ResourceInfo,
   hearerOf,
   homeLineOf,
@@ -45,6 +47,8 @@ import {
 } from "@pva/protocol"
 import { Cause, Config, ConfigProvider, Effect, Exit, Fiber, FiberSet, Option, type Scope, Stream } from "effect"
 import { createHash } from "node:crypto"
+import { readFileSync } from "node:fs"
+import type * as nodeHttp from "node:http"
 import { freemem } from "node:os"
 import { isAbsolute, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
@@ -107,6 +111,7 @@ import { type Keys, makeKeys } from "./Keys.ts"
 import { makeSections } from "./sections.ts"
 import { makeAssistants } from "./assistants.ts"
 import { makeSessionHub, type SessionHub } from "./SessionHub.ts"
+import { makeNodes, type Nodes, type RedeemAnswer, spkiPin } from "./nodes.ts"
 import { DataDirConfig, KEYS_LOCKED_MESSAGE, loadSettingsStore, type SettingsStore, SettingsStoreError } from "./SettingsStore.ts"
 import { makeApi } from "./api.ts"
 import { makeAssistantVoice } from "./AssistantVoice.ts"
@@ -226,7 +231,32 @@ export interface ServeOptions {
   readonly minuteMs?: number
   readonly helloTimeoutMs?: number
   readonly pingIntervalMs?: number
+  /** The built voice node (`PVA_NODE_DIR`, default `<repo>/apps/node/dist`), served under `/node/` (docs/VOICE-NODES.md §6.3). */
+  readonly nodeDir?: string
+  /** Tests: the pairing codes' and back-offs' clock (epoch ms). Default `Date.now`. */
+  readonly nodesNow?: () => number
 }
+
+/**
+ * N2b's `makeNodeDist` (`serve/nodeDist.ts`, docs/VOICE-NODES.md §6.3), declared here by its shape until N2b is merged.
+ * LEAD, when merging N2b: delete this block and `makeNodeDistStandIn`, import `{ makeNodeDist }` from "./nodeDist.ts",
+ * and call it where `makeNodeDistStandIn` is called.
+ */
+interface NodeDistShape {
+  readonly manifest: () => NodeManifest | undefined
+  readonly handle: (
+    req: nodeHttp.IncomingMessage,
+    res: nodeHttp.ServerResponse,
+    redeem: (body: NodePairRequest, remoteAddress: string) => Effect.Effect<RedeemAnswer>
+  ) => void
+}
+/** Serves nothing: every `/node/*` path is a plain 404 (N2b replaces it). */
+const makeNodeDistStandIn = (_dir: string): NodeDistShape => ({
+  manifest: () => undefined,
+  handle: (_req, res) => {
+    res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" }).end("Not found")
+  }
+})
 
 export interface ServeHandle {
   readonly http: HttpServer
@@ -246,6 +276,8 @@ export interface ServeHandle {
   readonly resources: ResourcePool
   /** The settings store (every save reconciles the resource pool). Tests save assistants through it until WP-5. */
   readonly store: SettingsStore
+  /** Voice nodes: pairing (`redeem` is what `POST /node/pair` calls) and credentials. */
+  readonly nodes: Nodes
   /** Completes when the first engine build, module start and resource builds have settled. */
   readonly ready: Effect.Effect<void>
 }
@@ -1161,6 +1193,28 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     yield* Effect.addFinalizer(() => Effect.sync(() => admin.dispose()))
     const devices = makeDeviceRegistry({ store })
 
+    // Voice nodes (docs/VOICE-NODES.md §6): the served bundle, the certificate's pin, pairing and credentials.
+    const nodeDist = makeNodeDistStandIn(options.nodeDir ?? join(repoRoot, "apps", "node", "dist"))
+    let tlsPin: string | undefined
+    if (options.tls !== undefined) {
+      try {
+        tlsPin = spkiPin(readFileSync(options.tls.certFile))
+      } catch (error) {
+        yield* Effect.logWarning(`The voice nodes' TLS pin could not be computed from ${options.tls.certFile}: ${String(error)}`)
+      }
+    }
+    const nodes: Nodes = makeNodes({
+      store,
+      registry: devices,
+      adminEnabled: admin.enabled,
+      tls: options.tls !== undefined,
+      tlsPin,
+      loopbackOnly: isLoopback(options.host),
+      manifest: nodeDist.manifest,
+      ...(options.nodesNow !== undefined ? { now: options.nodesNow } : {}),
+      log: (line) => runFork(Effect.logWarning(line))
+    })
+
     // TypeSafe routing (docs/ASSISTANTS.md §3.6): the shared `routing` section, read at each decision (live).
     const routing = makeRoutingService(() => ({
       enabled: sections.value(ROUTING_KEYS.enabled) === true,
@@ -1179,6 +1233,8 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
           name: () => (device === undefined ? "Voice page without a device" : devices.nameOf(device.id) ?? device.name),
           engine: theEngine,
           deviceSettings: () => deviceSettingsOf(device?.id),
+          // A voice node's assignments without a follow-up of their own get none (docs/VOICE-NODES.md §4.1).
+          deviceType: () => deviceTypeOf((device === undefined ? undefined : devices.kindOfDevice(device.id)) ?? WEB_VOICE_KIND),
           hearing: hearingOf(device?.id),
           ...(options.hearerSwitchWaitMs !== undefined ? { hearerSwitchWaitMs: options.hearerSwitchWaitMs } : {}),
           assistants: assistantsNow,
@@ -1241,6 +1297,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     hub = makeSessionHub({
       admin,
       devices,
+      nodes,
       assistants,
       env: envMover,
       models,
@@ -1349,6 +1406,9 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       crossOriginIsolation: options.crossOriginIsolation ?? true,
       hub: hubNow,
       api,
+      // LEAD, when merging N2b: write this as `node: (req, res) => nodeDist.handle(req, res, nodes.redeem),` (http.ts's
+      // `node` option). Spread until then, because this checkout's HttpOptions has no `node` yet.
+      ...{ node: (req: nodeHttp.IncomingMessage, res: nodeHttp.ServerResponse) => nodeDist.handle(req, res, nodes.redeem) },
       ...(options.pingIntervalMs !== undefined ? { pingIntervalMs: options.pingIntervalMs } : {})
     })
 
@@ -1420,7 +1480,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     }
     const ready = Effect.asVoid(Effect.all([Fiber.await(modulesStarted), Fiber.await(engineStarted), Fiber.await(resourcesStarted)]))
 
-    return { http, hub: hubNow, engine: theEngine, sessions, host, keys, vault, envView, envMover, jobs, models, favourites, resources, store, ready }
+    return { http, hub: hubNow, engine: theEngine, sessions, host, keys, vault, envView, envMover, jobs, models, favourites, resources, store, nodes, ready }
   })
 
 /**
@@ -1457,6 +1517,10 @@ export const ServeConfig = Config.all({
   tlsKey: Config.option(Config.String("SERVE_TLS_KEY")),
   webDir: Config.String("PVA_WEB_DIR").pipe(
     Config.withDefault(join(repoRoot, "apps", "web", "out")),
+    Config.map((p) => (isAbsolute(p) ? p : resolve(userCwd, p)))
+  ),
+  nodeDir: Config.String("PVA_NODE_DIR").pipe(
+    Config.withDefault(join(repoRoot, "apps", "node", "dist")),
     Config.map((p) => (isAbsolute(p) ? p : resolve(userCwd, p)))
   ),
   dataDir: DataDirConfig,
