@@ -1,5 +1,5 @@
 import { claudeSubscriptionAgent } from "@pva/agent-claude-code"
-import { makeModuleHost, type ModuleDefinition, type ModulePersistence, type ModuleSnapshot, readOnlyPersistence } from "@pva/core"
+import { makeModuleHost, type ModuleDefinition, type ModulePersistence, type ModuleSnapshot, readOnlyPersistence, withContextProvider } from "@pva/core"
 import { homeAssistantModule } from "@pva/module-home-assistant"
 import { clockModule, weatherModule } from "@pva/modules-builtin"
 import type { ModuleInfo } from "@pva/protocol"
@@ -37,7 +37,12 @@ export const withModuleInstructions = (systemPrompt: string, instructions: Reado
  * terminal prompt).
  */
 export const startCliModules = (
-  options: { readonly catalog?: ReadonlyArray<ModuleDefinition<any>>; readonly persistence?: ModulePersistence } = {}
+  options: {
+    readonly catalog?: ReadonlyArray<ModuleDefinition<any>>
+    readonly persistence?: ModulePersistence
+    /** Add the household's ambient facts (mode `all`) to the registry's context (`bench --live --ambient`). */
+    readonly ambient?: boolean
+  } = {}
 ): Effect.Effect<ModuleSnapshot & { readonly infos: ReadonlyArray<ModuleInfo> }, never, Scope.Scope> =>
   Effect.gen(function*() {
     const loaded = yield* CliSettingsRef
@@ -82,5 +87,7 @@ export const startCliModules = (
         yield* Effect.logWarning(`Module ${module.name} cannot run here: ${module.unavailable?.reason ?? "unknown reason"} (pnpm start doctor says how to fix it)`)
       }
     }
-    return { ...host.snapshot(), infos: host.modules() }
+    const snapshot = host.snapshot()
+    const registry = options.ambient === true ? withContextProvider(snapshot.registry, household.ambient({ mode: () => "all", moduleOn: () => true })) : snapshot.registry
+    return { ...snapshot, registry, infos: host.modules() }
   })

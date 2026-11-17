@@ -224,9 +224,9 @@ export const homeSection: SectionDefinition = {
     }),
     HOME_AMBIENT_FACTS: Setting.choice({
       label: "Household facts in every reply",
-      description: "Running timers, the next alarm and other short facts modules keep, told to the assistant with each turn (at most 600 characters), so any assistant can answer \"how long is left on the pasta?\".",
+      description: "Running timers, the next alarm and other short facts modules keep, told to the assistant with each turn (at most 600 characters), so any assistant can answer \"how long is left on the pasta?\". Off until its effect on the time to the first word is measured on your model (docs/STORING-DATA.md, \"Ambient facts\").",
       env: "HOME_AMBIENT_FACTS",
-      default: "all",
+      default: "off",
       options: [
         { value: "all", label: "For every assistant" },
         { value: "module-on", label: "Only for assistants that have the module on" },

@@ -719,10 +719,12 @@ export const serverExamples: { readonly [T in ServerMessageType]: Extract<Server
   "household.snapshot": {
     type: "household.snapshot",
     seq: 42,
+    part: 0,
+    final: true,
     collections: [{
       module: "timers",
       collection: "timers",
-      rows: [{ id: "t1", rev: 1, scope: { kind: "household" }, value: { label: "pasta", dueAt: 1_763_100_600_000 }, updatedAt: 1_763_100_000_000 }],
+      rows: [{ id: "t1", rev: 40, scope: { kind: "household" }, value: { label: "pasta", dueAt: 1_763_100_600_000 }, updatedAt: 1_763_100_000_000 }],
       truncated: false
     }]
   },
@@ -734,7 +736,7 @@ export const serverExamples: { readonly [T in ServerMessageType]: Extract<Server
       module: "timers",
       type: "timers.timers.changed",
       scope: { kind: "household" },
-      data: { collection: "timers", id: "t1", op: "put", rev: 2, value: { label: "pasta", dueAt: 1_763_100_900_000 } }
+      data: { collection: "timers", id: "t1", op: "put", rev: 43, value: { label: "pasta", dueAt: 1_763_100_900_000 } }
     }
   },
   ...assistantsServerExamples

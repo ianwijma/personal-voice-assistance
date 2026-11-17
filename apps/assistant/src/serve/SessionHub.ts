@@ -141,8 +141,10 @@ export interface VoiceConnection {
 
 /** What the hub tells the household push (docs/STORING-DATA.md "Pages"). */
 export interface HouseholdHooks {
-  /** A voice connection finished its hello: send it the snapshot, or the replay after `seq` (`hello.household`). */
-  readonly connected: (connection: VoiceConnection, seq: number | undefined) => void
+  /** A voice connection finished its hello: send it a fresh snapshot, then the changes after it. */
+  readonly connected: (connection: VoiceConnection) => void
+  /** That connection closed: stop sending to it. */
+  readonly closed: (connection: VoiceConnection) => void
   /** A device's first connection opened / its last one closed (`host.device.connected` / `.disconnected`). */
   readonly deviceConnected: (deviceId: string) => void
   readonly deviceDisconnected: (deviceId: string) => void
@@ -634,6 +636,7 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
   const lost = (client: Client) => {
     if (client.helloTimer !== undefined) clearTimeout(client.helloTimer)
     if (!clients.delete(client)) return
+    if (client.voice !== undefined) options.household?.closed(client.voice)
     if (client.device !== undefined) {
       registry.left(client.device.id)
       deviceChanged()
@@ -764,7 +767,7 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
         send: (m) => send(client, m)
       }
       if (firstOfDevice) options.household.deviceConnected(device!.id)
-      options.household.connected(client.voice, message.household?.seq)
+      options.household.connected(client.voice)
     }
     if (key !== undefined) sessions.connections(key, connectionsOf(key))
     if (opened === "full") send(client, { type: "error", error: sessionsFull() })

@@ -3,8 +3,11 @@ import type { SqliteHouseholdStore } from "./SqliteStore.ts"
 
 /**
  * The store's maintenance fiber (serve mode): once an hour it makes the day's backup when there is none yet (the
- * first one a minute after start, so a start is not slowed down), and once a day it prunes the change log to 90 days.
- * Never on a turn's path; each step is logged, and a failed backup is reported through `onBackup`.
+ * first one a minute after start, so a start is not slowed down), and once a day it prunes the change log to 90 days
+ * and removes backups and set-aside copies older than 14 days (`pruneBackups`, also after every backup). The backup
+ * reads through a connection of its own and copies on a worker thread; the pruning deletes 100 changes per
+ * transaction with a yield between them, so a turn waits for one small batch at most. Each step is logged, and a
+ * failed backup is reported through `onBackup`.
  */
 export const runMaintenance = (
   store: SqliteHouseholdStore,
@@ -38,6 +41,7 @@ export const runMaintenance = (
         prunedOn = day
         const pruned = yield* Effect.result(store.pruneChanges({ now }))
         if (pruned._tag === "Success" && pruned.success > 0) log(`Household change log: ${pruned.success} change(s) older than 90 days removed`)
+        yield* store.pruneBackups({ now })
       }
       yield* Effect.sleep(options.intervalMs ?? 60 * 60_000)
     }

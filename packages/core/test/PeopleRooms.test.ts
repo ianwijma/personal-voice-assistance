@@ -4,6 +4,7 @@ import { describe, expect, it } from "@effect/vitest"
 import { BUILT_IN_PLACE, type DeviceCapabilities, type DevicePlace } from "@pva/protocol"
 import { Effect, Schema } from "effect"
 import {
+  type CatchUp,
   CurrentTurn,
   defineCollection,
   deviceContextLine,
@@ -20,7 +21,8 @@ import {
   type Person,
   type PrivacyPlace,
   rankOtherScreens,
-  type Row
+  type Row,
+  type Snapshot
 } from "../src/index.ts"
 import { makeMemoryHouseholdStore } from "../src/testing.ts"
 
@@ -217,25 +219,25 @@ describe("household rows on voice pages: person scope through Privacy.mayReveal 
       yield* m.collection(items).insert({ text: "Sam's" }, { scope: { kind: "person", id: "p-sam" } })
       yield* m.collection(items).insert({ text: "Robin's" }, { scope: { kind: "person", id: "p-robin" } })
       const feed = makeHouseholdFeed({ store, modules: [{ moduleId: "lists", collections: [items], events: [] }], people: () => ["p-sam", "p-robin"] })
-      const texts = (s: { readonly collections: ReadonlyArray<{ readonly rows: ReadonlyArray<{ readonly value: unknown }> }> }) =>
-        s.collections.flatMap((c) => c.rows.map((r) => (r.value as { text: string }).text)).sort()
+      const texts = (s: Snapshot) => s.parts.flat().flatMap((c) => c.rows.map((r) => (r.value as { text: string }).text)).sort()
       expect(texts(yield* feed.snapshot({ id: "phone-0001", privacy: "private" }))).toEqual(["Robin's", "Sam's"])
       expect(texts(yield* feed.snapshot({ id: "kitchen-01", privacy: "shared", defaultPerson: "p-sam" }))).toEqual(["Sam's"])
       expect(texts(yield* feed.snapshot({ id: "kitchen-01", privacy: "shared" }))).toEqual([])
       expect(texts(yield* feed.snapshot({ id: "hall-0001", privacy: "public", defaultPerson: "p-sam" }))).toEqual([])
-      // Live: a change to Robin's row reaches the private phone, not Sam's kitchen.
-      const row = (yield* m.collection(items).list({ scope: { kind: "person", id: "p-robin" }, limit: 5 }))[0]!
-      const event = {
-        seq: 9,
-        at: 1,
-        module: "lists",
-        type: "lists.items.changed",
-        scope: row.scope,
-        data: undefined,
-        change: { seq: 9, opId: "o", at: 1, module: "lists", collection: "items", id: row.id, op: "update" as const, rev: row.rev, scope: row.scope, actor: { kind: "admin" as const }, row }
+      // Changes: an update of Robin's row reaches the private phone and Robin's kitchen, not Sam's kitchen.
+      const phone = { id: "phone-0001", privacy: "private" } as const
+      const samKitchen = { id: "kitchen-01", privacy: "shared", defaultPerson: "p-sam" } as const
+      const robinKitchen = { id: "kitchen-01", privacy: "shared", defaultPerson: "p-robin" } as const
+      const cursors = {
+        phone: (yield* feed.snapshot(phone)).cursor,
+        sam: (yield* feed.snapshot(samKitchen)).cursor,
+        robin: (yield* feed.snapshot(robinKitchen)).cursor
       }
-      expect(feed.live(event, { id: "phone-0001", privacy: "private" })?.data).toMatchObject({ op: "put", value: { text: "Robin's" } })
-      expect(feed.live(event, { id: "kitchen-01", privacy: "shared", defaultPerson: "p-sam" })).toBeUndefined()
-      expect(feed.live(event, { id: "kitchen-01", privacy: "shared", defaultPerson: "p-robin" })?.data).toMatchObject({ op: "put" })
+      const row = (yield* m.collection(items).list({ scope: { kind: "person", id: "p-robin" }, limit: 5 }))[0]!
+      yield* m.collection(items).update(row.id, () => ({ text: "Robin's 2" }), { scope: row.scope })
+      const changes = (r: CatchUp) => (r.kind === "changes" ? r.events.map((e) => e.data) : [])
+      expect(changes(yield* feed.catchUp(phone, cursors.phone))).toMatchObject([{ op: "put", value: { text: "Robin's 2" } }])
+      expect(changes(yield* feed.catchUp(samKitchen, cursors.sam))).toEqual([])
+      expect(changes(yield* feed.catchUp(robinKitchen, cursors.robin))).toMatchObject([{ op: "put" }])
     }))
 })
