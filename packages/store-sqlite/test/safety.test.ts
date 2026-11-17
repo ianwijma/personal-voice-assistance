@@ -10,7 +10,7 @@ import { chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, statSync
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { DatabaseSync } from "node:sqlite"
-import { indexName, listSql, makeSqliteStore } from "../src/index.ts"
+import { conversationRowsSql, indexName, listSql, makeSqliteStore, pageSql } from "../src/index.ts"
 
 const tmp = () => mkdtempSync(join(tmpdir(), "pva-safety-"))
 const Item = Schema.Struct({ text: Schema.String })
@@ -247,6 +247,18 @@ describe("SQLite store: names and indexes", () => {
         assert.notMatch(plan, /TEMP B-TREE|SCAN pva_docs(?! USING)/, `${JSON.stringify(shape)}: ${plan}`)
         assert.match(plan, /USING (COVERING )?INDEX/, `${JSON.stringify(shape)}: ${plan}`)
         assert.isTrue((yield* c.list({ ...shape, limit: 20 })).length <= 20)
+      }
+      // The snapshot's pages and the steps of a bulk removal: an index range each, continued by its cursor.
+      const cursor = { updatedAt: 5, createdAt: 5, id: "x" }
+      const key = { scopeId: "c", owner: "o", collection: "k", id: "i" }
+      for (const [what, { sql, params }, range] of [
+        ["page", pageSql("timers", "timers", { kind: "household" }, cursor, 20), /\(updated_at,created_at,id\)</],
+        ["one conversation", conversationRowsSql("conv-1", key, 100), /scope_id=\? AND \(owner,collection,id\)>/],
+        ["every conversation", conversationRowsSql(undefined, key, 100), /\(scope_id,owner,collection,id\)>/]
+      ] as const) {
+        const plan = (raw.prepare(`EXPLAIN QUERY PLAN ${sql}`).all(...params) as Array<{ detail: string }>).map((r) => r.detail).join(" | ")
+        assert.notMatch(plan, /TEMP B-TREE/, `${what}: ${plan}`)
+        assert.match(plan, range, `${what}: ${plan}`)
       }
       raw.close()
     }).pipe(Effect.scoped))

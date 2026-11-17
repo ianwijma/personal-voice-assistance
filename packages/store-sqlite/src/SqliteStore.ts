@@ -3,12 +3,13 @@ import {
   type Collection,
   type HouseholdStore,
   type IndexKey,
+  type PageCursor,
   type ScopeRef,
   scopeFromColumns,
   scopeIdOf,
   StoreError
 } from "@pva/core"
-import { type BulkRow, type CheckedQuery, type IndexSpec, layoutOf, makeStoreEngine, type StoredCollection, type StoredDoc, type SyncBackend } from "@pva/core/store-backend"
+import { type BulkKey, type BulkRow, type CheckedQuery, type IndexSpec, layoutOf, makeStoreEngine, type StoredCollection, type StoredDoc, type SyncBackend } from "@pva/core/store-backend"
 import { Clock, Effect, Semaphore, type Scope } from "effect"
 import { existsSync } from "node:fs"
 import { open, stat } from "node:fs/promises"
@@ -186,6 +187,40 @@ export const listSql = (owner: string, collection: string, scope: ScopeRef, q: C
   }
   params.push(q.limit)
   return { sql: `SELECT * FROM pva_docs INDEXED BY ${index} WHERE ${where.join(" AND ")} ORDER BY ${columns.map((c) => `${c} ${dir}`).join(", ")} LIMIT ?`, params }
+}
+
+/** The SQL of `CollectionReader.page`: one scope newest first, after a cursor, through the updated index. */
+export const pageSql = (owner: string, collection: string, scope: ScopeRef, after: PageCursor | undefined, limit: number): { readonly sql: string; readonly params: ReadonlyArray<string | number> } =>
+  after === undefined
+    ? {
+      sql: `SELECT * FROM pva_docs INDEXED BY pva_docs_updated WHERE owner = ? AND collection = ? AND scope_kind = ? AND scope_id = ?
+        ORDER BY updated_at DESC, created_at DESC, id DESC LIMIT ?`,
+      params: [owner, collection, scope.kind, scopeIdOf(scope), limit]
+    }
+    : {
+      sql: `SELECT * FROM pva_docs INDEXED BY pva_docs_updated WHERE owner = ? AND collection = ? AND scope_kind = ? AND scope_id = ?
+        AND (updated_at, created_at, id) < (?, ?, ?) ORDER BY updated_at DESC, created_at DESC, id DESC LIMIT ?`,
+      params: [owner, collection, scope.kind, scopeIdOf(scope), after.updatedAt, after.createdAt, after.id, limit]
+    }
+
+/** The SQL of one step of a bulk removal: conversation rows (of one conversation, or all) after a key, in key order. */
+export const conversationRowsSql = (conversationId: string | undefined, after: BulkKey | undefined, limit: number): { readonly sql: string; readonly params: ReadonlyArray<string | number> } => {
+  const where = ["scope_kind = 'conversation'"]
+  const params: Array<string | number> = []
+  if (conversationId !== undefined) {
+    where.push("scope_id = ?")
+    params.push(conversationId)
+  }
+  if (after !== undefined && conversationId !== undefined) {
+    // Within one conversation the rest of the key is the range (SQLite would seek on scope_id alone otherwise).
+    where.push("(owner, collection, id) > (?, ?, ?)")
+    params.push(after.owner, after.collection, after.id)
+  } else if (after !== undefined) {
+    where.push("(scope_id, owner, collection, id) > (?, ?, ?, ?)")
+    params.push(after.scopeId, after.owner, after.collection, after.id)
+  }
+  params.push(limit)
+  return { sql: `SELECT owner, collection, id, scope_id, rev FROM pva_docs INDEXED BY pva_docs_conversation WHERE ${where.join(" AND ")} ORDER BY scope_id, owner, collection, id LIMIT ?`, params }
 }
 
 interface DocRow {
@@ -473,18 +508,10 @@ export const makeSqliteStore = (options: SqliteStoreOptions): Effect.Effect<Sqli
         const { sql, params } = listSql(owner, collection, scope, q)
         return all<DocRow>(sql, params).map(toDoc)
       },
-      page: (owner, collection, scope, after, limit) =>
-        (after === undefined
-          ? all<DocRow>(
-            `SELECT * FROM pva_docs INDEXED BY pva_docs_updated WHERE owner = ? AND collection = ? AND scope_kind = ? AND scope_id = ?
-             ORDER BY updated_at DESC, created_at DESC, id DESC LIMIT ?`,
-            [owner, collection, scope.kind, scopeIdOf(scope), limit]
-          )
-          : all<DocRow>(
-            `SELECT * FROM pva_docs INDEXED BY pva_docs_updated WHERE owner = ? AND collection = ? AND scope_kind = ? AND scope_id = ?
-             AND (updated_at, created_at, id) < (?, ?, ?) ORDER BY updated_at DESC, created_at DESC, id DESC LIMIT ?`,
-            [owner, collection, scope.kind, scopeIdOf(scope), after.updatedAt, after.createdAt, after.id, limit]
-          )).map(toDoc),
+      page: (owner, collection, scope, after, limit) => {
+        const { sql, params } = pageSql(owner, collection, scope, after, limit)
+        return all<DocRow>(sql, params).map(toDoc)
+      },
       put: (doc, keys, expect) =>
         (expect === "absent"
           ? run(
@@ -508,21 +535,9 @@ export const makeSqliteStore = (options: SqliteStoreOptions): Effect.Effect<Sqli
       rewrite: (doc, v, text, keys) =>
         void run(`UPDATE pva_docs SET v = ?, value = ?, ${keyColumns.map((k) => `${k} = ?`).join(", ")} WHERE owner = ? AND collection = ? AND id = ?`, [v, text, ...padKeys(keys), doc.owner, doc.collection, doc.id]),
       conversationRows: (conversationId, after, limit) => {
-        const where = ["scope_kind = 'conversation'"]
-        const params: Array<Param> = []
-        if (conversationId !== undefined) {
-          where.push("scope_id = ?")
-          params.push(conversationId)
-        }
-        if (after !== undefined) {
-          where.push("(scope_id, owner, collection, id) > (?, ?, ?, ?)")
-          params.push(after.scopeId, after.owner, after.collection, after.id)
-        }
-        params.push(limit)
-        return all<{ owner: string; collection: string; id: string; scope_id: string; rev: number }>(
-          `SELECT owner, collection, id, scope_id, rev FROM pva_docs INDEXED BY pva_docs_conversation WHERE ${where.join(" AND ")} ORDER BY scope_id, owner, collection, id LIMIT ?`,
-          params
-        ).map((r): BulkRow => ({ scopeId: r.scope_id, owner: r.owner, collection: r.collection, id: r.id, scope: { kind: "conversation", id: r.scope_id }, rev: Number(r.rev) }))
+        const { sql, params } = conversationRowsSql(conversationId, after, limit)
+        return all<{ owner: string; collection: string; id: string; scope_id: string; rev: number }>(sql, params)
+          .map((r): BulkRow => ({ scopeId: r.scope_id, owner: r.owner, collection: r.collection, id: r.id, scope: { kind: "conversation", id: r.scope_id }, rev: Number(r.rev) }))
       },
       ownerVersion: (owner) => {
         const r = one<{ version: number }>("SELECT version FROM pva_owners WHERE owner = ?", [owner])

@@ -1091,8 +1091,10 @@ export const makeStoreEngine = (options: EngineOptions): EngineStore => {
             const rows = backend.conversationRows(conversationId, after, BULK_STEP_ROWS)
             let n = 0
             for (const r of rows) {
-              // An owner whose data is not usable here (newer, failed upgrade) keeps its rows as they are.
-              if (owners.get(r.owner)?.verdict !== undefined) continue
+              // Only rows of a declared collection of an owner whose data is usable here: an owner that is newer or
+              // failed its upgrade, and a collection no declaration names any more, keep their rows as they are.
+              const st = owners.get(r.owner)
+              if (st === undefined || st.verdict !== undefined || !st.collections.has(r.collection)) continue
               const rev = backend.nextRev()
               if (!backend.remove(r.owner, r.collection, r.id, r.scope, r.rev)) continue
               state.removed = true

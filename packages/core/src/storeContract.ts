@@ -907,17 +907,22 @@ export const householdStoreContract = (name: string, make: MakeStore) =>
       Effect.gen(function*() {
         const a = defineCollection({ name: "a", scope: "household", schema: Note })
         const b = defineCollection({ name: "b", scope: "household", schema: Note })
+        const talk = defineCollection({ name: "talk", scope: "conversation", schema: Note })
         const store = yield* make()
-        yield* store.prepare([{ id: "m", storage: { collections: [a, b] } }])
+        yield* store.prepare([{ id: "m", storage: { collections: [a, b, talk] } }])
         yield* store.forModule("m").collection(b).insert({ text: "in b" }, { id: "x" })
+        yield* store.forModule("m").collection(talk).insert({ text: "said" }, { id: "t" }).pipe(inTurn(turnOf()))
         yield* store.prepare([{ id: "m", storage: { version: 2, collections: [a] } }])
         assert.strictEqual(store.availability("m"), undefined)
-        assert.deepStrictEqual(store.undeclared(), [{ owner: "m", collection: "b", version: 1 }])
+        assert.deepStrictEqual(store.undeclared(), [{ owner: "m", collection: "b", version: 1 }, { owner: "m", collection: "talk", version: 1 }])
         assert.strictEqual(reasonOf(yield* Effect.exit(store.forModule("m").collection(b).list())), "invalid")
+        // Not even an ended conversation's rows of a collection no one declares are removed.
         assert.strictEqual(yield* store.sweepConversations, 0)
-        yield* store.prepare([{ id: "m", storage: { version: 3, collections: [a, b] } }])
+        assert.strictEqual(yield* store.endConversation("conv-1"), 0)
+        yield* store.prepare([{ id: "m", storage: { version: 3, collections: [a, b, talk] } }])
         assert.deepStrictEqual(store.undeclared(), [])
         assert.strictEqual((yield* store.forModule("m").collection(b).get("x"))?.value.text, "in b")
+        assert.strictEqual((yield* store.forModule("m").collection(talk).get("t", { scope: { kind: "conversation", id: "conv-1" } }))?.value.text, "said")
       }).pipe(Effect.scoped))
 
     it.effect("module ids: the host's and the core services' namespaces and an id two modules share are refused for stored data", () =>
