@@ -784,6 +784,28 @@ Checked by reading the code at `cee5e5a`, not by running anything:
   removes them.
 - WP-4's "WP-7 must serve / implement" list maps to §6.3.
 
+### N3 Node client on protocol 9 (2026-11-18, branch `t3/8c04f2a6`)
+
+Built against the fake server in `apps/node/test/support` (real codecs and examples); not run against the N2 server.
+
+- `hello.node`, `device.capabilities`, `VOICE_NODE_KIND`, `CloseCode.unauthorized`, `AudioDeviceInfo`, `NodeManifest`
+  from `@pva/protocol`; the local stand-ins are gone. `NodeConfig.credential` is required (a config without it is
+  not a config), so `--server` / `--device-id` runs, `configure` and install.sh's `--no-pair` / `--device-id` are
+  gone; the installer pairs again over a `node.json` that has no `"credential"` (a pre-protocol-9 install).
+- `sessions_full` is handled as a decoded `error` in `Session.onMessage`; `isSessionsFull` is gone.
+- Pushed `sound` / `soundDevices` applied (`applySetup` in `node.ts`); the input is reopened by interrupting the capture
+  fiber and starting it on the new `AudioInput` (`buildAudio` in `audio.ts` makes the services for a device choice);
+  the output and cue output are read per play (`ReplyPlayer` takes getters). A chosen input that yields no frame, or
+  an output whose player fails, falls back to `""` and is reported as `node.status.lastError`.
+- `node.status` (`status.ts`): after `welcome`, device lists polled every 5 s, throttled to 1 s, deduplicated.
+  `node.command`: identify, test-speaker, test-mic (`node.level` every 200 ms for the window), restart (exit 0),
+  update. 4403: the 10-minute retry with the "pair it again" line.
+- TLS pin on the WebSocket: `rejectUnauthorized: false` with a pin, the peer key checked at `open` before `hello`.
+- Differences from §8: `restart` and `update` are `NodeExit` values (`Restarted`, `Updated`), so `main.ts` exits with
+  their code as it does for a self-update. The pin mismatch sets `lastError` on the reporter, but nothing can send it
+  until a connection has a `welcome`; it is cleared at the next `welcome`.
+- Not verified: a real server, real ALSA / PipeWire hardware, arm64, `shellcheck` (not installed here; `sh -n` passes).
+
 ### WP-1 ALSA backend and audio device listing (2026-11-14, branch `t3/alsa-audio-device-listing`)
 
 Built: `packages/audio-alsa` (`arecord` / `aplay` on audio-pipewire's capture and playback helpers) and

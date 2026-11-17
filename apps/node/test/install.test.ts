@@ -1,5 +1,5 @@
 /**
- * The distribution artefacts and the installer (docs/VOICE-NODES.md §7, WP-4), end to end on this machine without
+ * The distribution artefacts and the installer (docs/VOICE-NODES.md §8, WP-4), end to end on this machine without
  * touching it: `scripts/bundle.mjs` builds the real `dist/` into a temporary directory, a local HTTP fixture serves
  * it under `/node/` (as the server will, WP-7), and `install.sh --root <dir>` stages an install there (no root, no
  * users, no packages, no systemd: those steps are only recorded in `actions.log`).
@@ -13,6 +13,8 @@ import * as http from "node:http"
 import type { AddressInfo } from "node:net"
 import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
+import { NodeManifest } from "@pva/protocol"
+import { Schema } from "effect"
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest"
 import { sha256Hex } from "../src/releases.ts"
 
@@ -148,7 +150,7 @@ describe.skipIf(!tools)("bundle", { timeout: 60_000 }, () => {
 
 describe.skipIf(!tools)("install.sh (staged with --root)", { timeout: 60_000 }, () => {
   it("installs runtime, boot guard, release, config and the system unit", async () => {
-    const r = await install(["--server", `${base}/`, "--no-pair", "--device-id", "node-test-01", "--runtime", runtimeTarball])
+    const r = await install(["--server", `${base}/`, "--code", "K7QM-2XHP", "--runtime", runtimeTarball])
     expect(r.stderr).toContain("staged under")
     expect(r.status).toBe(0)
     const manifest = JSON.parse(readFileSync(join(dist, "manifest.json"), "utf8"))
@@ -158,7 +160,7 @@ describe.skipIf(!tools)("install.sh (staged with --root)", { timeout: 60_000 }, 
     expect(readlinkSync(at("opt/pva-node/releases/current"))).toBe(manifest.bundle.sha256)
     expect(sha256Hex(readFileSync(at("opt/pva-node/releases/current/pva-node.mjs")))).toBe(manifest.bundle.sha256)
 
-    expect(JSON.parse(readFileSync(at("etc/pva-node/node.json"), "utf8"))).toEqual({ server: base, deviceId: "node-test-01" })
+    expect(JSON.parse(readFileSync(at("etc/pva-node/node.json"), "utf8"))).toEqual({ server: base, deviceId: "node-kitchen-1", credential: "A".repeat(43), name: "Kitchen" })
     expect(mode("etc/pva-node/node.json")).toBe("600")
     expect(mode("var/lib/pva-node")).toBe("700")
     expect(readFileSync(at("etc/pva-node/install.env"), "utf8")).toContain(`VARIANT=system\nRUN_USER=pva-node\nAUDIO=alsa\nSERVER=${base}\n`)
@@ -177,14 +179,14 @@ describe.skipIf(!tools)("install.sh (staged with --root)", { timeout: 60_000 }, 
   })
 
   it("the staged release runs through the boot guard and knows it is installed", async () => {
-    expect((await install(["--server", base, "--no-pair", "--runtime", runtimeTarball])).status).toBe(0)
+    expect((await install(["--server", base, "--code", "K7QM-2XHP", "--runtime", runtimeTarball])).status).toBe(0)
     const r = await run(at("opt/pva-node/runtime/current/bin/node"), [at("opt/pva-node/pva-node-boot.mjs"), "version"], { PVA_NODE_RELEASES: at("opt/pva-node/releases") })
     expect(r.status).toBe(0)
     expect(JSON.parse(r.stdout)).toMatchObject({ installed: true, bundleSha256: readlinkSync(at("opt/pva-node/releases/current")) })
   })
 
   it("is idempotent: a second run downloads nothing new, keeps the config and remembers the server", async () => {
-    expect((await install(["--server", base, "--no-pair", "--device-id", "node-test-01", "--runtime", runtimeTarball])).status).toBe(0)
+    expect((await install(["--server", base, "--code", "K7QM-2XHP", "--runtime", runtimeTarball])).status).toBe(0)
     const config = readFileSync(at("etc/pva-node/node.json"), "utf8")
     requests.length = 0
     const again = await install(["--runtime", runtimeTarball]) // no --server: from install.env
@@ -208,7 +210,7 @@ describe.skipIf(!tools)("install.sh (staged with --root)", { timeout: 60_000 }, 
   })
 
   it("fails closed on a bundle that does not match the manifest, leaving the installed release alone", async () => {
-    expect((await install(["--server", base, "--no-pair", "--runtime", runtimeTarball])).status).toBe(0)
+    expect((await install(["--server", base, "--code", "K7QM-2XHP", "--runtime", runtimeTarball])).status).toBe(0)
     const before = readlinkSync(at("opt/pva-node/releases/current"))
     const manifest = JSON.parse(readFileSync(join(dist, "manifest.json"), "utf8"))
     const other = Buffer.from("x".repeat(manifest.bundle.bytes))
@@ -221,7 +223,7 @@ describe.skipIf(!tools)("install.sh (staged with --root)", { timeout: 60_000 }, 
   })
 
   it("fails closed on a runtime tarball that does not match the pin, and installs nothing", async () => {
-    const r = await install(["--server", base, "--no-pair", "--runtime", badTarball])
+    const r = await install(["--server", base, "--code", "K7QM-2XHP", "--runtime", badTarball])
     expect(r.status).toBe(1)
     expect(r.stderr).toContain("nothing was installed")
     expect(existsSync(at("opt/pva-node/runtime/current"))).toBe(false)
@@ -231,9 +233,32 @@ describe.skipIf(!tools)("install.sh (staged with --root)", { timeout: 60_000 }, 
   it("refuses a manifest that pins another runtime than the installer (a stale install.sh)", async () => {
     const manifest = JSON.parse(readFileSync(join(dist, "manifest.json"), "utf8"))
     tamper = { "manifest.json": Buffer.from(JSON.stringify({ ...manifest, runtime: { ...manifest.runtime, version: "22.99.0" } })) }
-    const r = await install(["--server", base, "--no-pair", "--runtime", runtimeTarball])
+    const r = await install(["--server", base, "--code", "K7QM-2XHP", "--runtime", runtimeTarball])
     expect(r.status).toBe(1)
     expect(r.stderr).toContain("download install.sh from the server again")
+  })
+
+  it("has no unpaired mode any more: --no-pair and --device-id are unknown options", async () => {
+    for (const option of [["--no-pair"], ["--device-id", "node-test-01"]]) {
+      const r = await install(["--server", base, ...option, "--runtime", runtimeTarball])
+      expect(r.status).toBe(1)
+      expect(r.stderr).toContain(`unknown option ${option[0]}`)
+    }
+    expect(existsSync(at("etc/pva-node/node.json"))).toBe(false)
+    expect(existsSync(at("opt/pva-node/releases/current"))).toBe(false)
+  })
+
+  it("pairs again over a config from before pairing (no credential) instead of keeping it", async () => {
+    mkdirSync(at("etc/pva-node"), { recursive: true })
+    writeFileSync(at("etc/pva-node/node.json"), JSON.stringify({ server: base, deviceId: "node-test-01" }))
+    const r = await install(["--server", base, "--code", "K7QM-2XHP", "--runtime", runtimeTarball])
+    expect(r.status).toBe(0)
+    expect(JSON.parse(readFileSync(at("etc/pva-node/node.json"), "utf8"))).toMatchObject({ deviceId: "node-kitchen-1", credential: "A".repeat(43) })
+  })
+
+  it("the built manifest decodes as the NodeManifest of @pva/protocol", () => {
+    const manifest = JSON.parse(readFileSync(join(dist, "manifest.json"), "utf8"))
+    expect(Schema.decodeUnknownSync(NodeManifest)(manifest)).toEqual(manifest)
   })
 
   it("refuses 32-bit ARM, a bad server URL and PipeWire without a user", async () => {
@@ -249,7 +274,7 @@ describe.skipIf(!tools)("install.sh (staged with --root)", { timeout: 60_000 }, 
   })
 
   it("installs a PipeWire user unit for --user", async () => {
-    const r = await install(["--server", base, "--no-pair", "--audio", "pipewire", "--user", "ian", "--runtime", runtimeTarball])
+    const r = await install(["--server", base, "--code", "K7QM-2XHP", "--audio", "pipewire", "--user", "ian", "--runtime", runtimeTarball])
     expect(r.status).toBe(0)
     const unit = readFileSync(at("home/ian/.config/systemd/user/pva-node.service"), "utf8")
     expect(unit).toContain("--audio pipewire")
@@ -262,7 +287,7 @@ describe.skipIf(!tools)("install.sh (staged with --root)", { timeout: 60_000 }, 
   })
 
   it("a re-run keeps the release previous points at and removes other old releases", async () => {
-    expect((await install(["--server", base, "--no-pair", "--runtime", runtimeTarball])).status).toBe(0)
+    expect((await install(["--server", base, "--code", "K7QM-2XHP", "--runtime", runtimeTarball])).status).toBe(0)
     const releases = at("opt/pva-node/releases")
     const kept = "a".repeat(64)
     const orphan = "b".repeat(64)
@@ -278,7 +303,7 @@ describe.skipIf(!tools)("install.sh (staged with --root)", { timeout: 60_000 }, 
   })
 
   it("--upgrade-runtime and --uninstall", async () => {
-    expect((await install(["--server", base, "--no-pair", "--runtime", runtimeTarball])).status).toBe(0)
+    expect((await install(["--server", base, "--code", "K7QM-2XHP", "--runtime", runtimeTarball])).status).toBe(0)
     const up = await install(["--upgrade-runtime", "--runtime", runtimeTarball])
     expect(up.status).toBe(0)
     expect(up.stderr).toContain("runs on Node 22.23.5")

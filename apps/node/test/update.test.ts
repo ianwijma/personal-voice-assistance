@@ -13,7 +13,8 @@ import type { AddressInfo } from "node:net"
 import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
 import { AudioInput, AudioOutput } from "@pva/core"
-import { Context, Effect, Exit, Fiber, Layer } from "effect"
+import { NodeManifest } from "@pva/protocol"
+import { Context, Effect, Exit, Fiber, Layer, Schema } from "effect"
 import { afterEach, beforeEach, describe, expect, it } from "vitest"
 import { NodeAudioInfo } from "../src/audio.ts"
 import { countsAsFailedStart, type NodeExit, type NodeRunOptions, type NodeUpdates, runNode } from "../src/node.ts"
@@ -34,6 +35,7 @@ import { type CheckResult, httpFetch, makeUpdater, manifestUrl, nodeBaseUrl, par
 import { makeFakeInput, makeFakeOutput } from "./support/fakeAudio.ts"
 import { FakeServer } from "./support/fakeServer.ts"
 
+const CREDENTIAL = "A".repeat(43)
 const bytes = (text: string) => new Uint8Array(Buffer.from(text))
 const A = bytes("// release A\n")
 const B = bytes("// release B\n")
@@ -193,6 +195,15 @@ const manifestFor = (bundle: Uint8Array, overrides: { readonly sha256?: string; 
     "linux-arm64": { url: "https://example.invalid/a.tar.gz", sha256: "1".repeat(64) },
     "linux-x64": { url: "https://example.invalid/x.tar.gz", sha256: "2".repeat(64) }
   }
+})
+
+describe("update: manifest", () => {
+  it("is the NodeManifest of @pva/protocol", async () => {
+    const manifest = manifestFor(A)
+    expect(Schema.decodeUnknownSync(NodeManifest)(manifest)).toEqual(manifest)
+    expect(() => Schema.decodeUnknownSync(NodeManifest)({ ...manifest, format: 2 })).toThrow()
+    expect(() => Schema.decodeUnknownSync(NodeManifest)({ ...manifest, bundle: { ...manifest.bundle, sha256: "xyz" } })).toThrow()
+  })
 })
 
 describe("update: manifest URL", () => {
@@ -373,7 +384,7 @@ describe("runNode: update hooks", () => {
     server = await FakeServer.start()
   })
   afterEach(() => server.stop())
-  const config = () => ({ server: server.url, deviceId: "node-test-1" as never })
+  const config = () => ({ server: server.url, deviceId: "node-test-1" as never, credential: CREDENTIAL })
 
   it("checks before the hello, and exits for a new release without connecting", async () => {
     const { calls, updates } = scriptedUpdates(["Switched"])
@@ -416,7 +427,7 @@ describe("runNode: update hooks", () => {
 
   it("on probation, a server that is away is not the release's fault: it keeps retrying", async () => {
     const { calls, updates } = scriptedUpdates([], true)
-    const node = runWith({ config: { server: "http://127.0.0.1:1", deviceId: "node-test-1" as never }, timing: fastTiming, updates })
+    const node = runWith({ config: { server: "http://127.0.0.1:1", deviceId: "node-test-1" as never, credential: CREDENTIAL }, timing: fastTiming, updates })
     await new Promise((r) => setTimeout(r, 400))
     expect(calls.filter((c) => c === "check").length).toBeGreaterThanOrEqual(2)
     await node.stop()
@@ -480,5 +491,57 @@ describe("boot guard", () => {
     const r = start("run")
     expect(r.status).toBe(1)
     expect(r.stderr).toContain("no release installed")
+  })
+})
+
+// --- the TLS pin on the WebSocket (docs/VOICE-NODES.md §8) ---------------------------------------------------------
+
+describe("runNode: TLS pin on the WebSocket", () => {
+  const openssl = spawnSync("openssl", ["version"]).status === 0
+  let dir: string
+  let key: string
+  let cert: string
+  let pin: string
+  let server: FakeServer | undefined
+  beforeEach(() => {
+    if (!openssl) return
+    dir = mkdtempSync(join(tmpdir(), "pva-node-wss-"))
+    execFileSync("openssl", ["req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes", "-subj", "/CN=localhost", "-days", "1", "-keyout", join(dir, "key.pem"), "-out", join(dir, "cert.pem")], { stdio: "ignore" })
+    key = readFileSync(join(dir, "key.pem"), "utf8")
+    cert = readFileSync(join(dir, "cert.pem"), "utf8")
+    pin = `sha256:${sha256Hex(new X509Certificate(cert).publicKey.export({ type: "spki", format: "der" }))}`
+  })
+  afterEach(async () => {
+    await server?.stop()
+    server = undefined
+    if (dir !== undefined) rmSync(dir, { recursive: true, force: true })
+  })
+
+  it.skipIf(!openssl)("sends hello (and so the credential) once the key matches the pin", async () => {
+    server = await FakeServer.start({ tls: { key, cert } })
+    const node = runWith({ config: { server: server.url, deviceId: "node-test-1" as never, credential: CREDENTIAL, tlsPin: pin }, timing: fastTiming })
+    const c = await server.connection(1)
+    await c.waitFor("hello")
+    await c.waitFor("audio.claim")
+    expect(c.of("hello")[0]!.node?.credential).toBe(CREDENTIAL)
+    await node.stop()
+  })
+
+  it.skipIf(!openssl)("never sends hello when the key does not match, says so, and retries with the normal backoff", async () => {
+    server = await FakeServer.start({ tls: { key, cert } })
+    const node = runWith({ config: { server: server.url, deviceId: "node-test-1" as never, credential: CREDENTIAL, tlsPin: `sha256:${"0".repeat(64)}` }, timing: fastTiming })
+    await new Promise((r) => setTimeout(r, 600))
+    expect(node.logs.filter((l) => l.includes("does not match the pin")).length).toBeGreaterThanOrEqual(2) // it retried
+    for (const c of server.connections) expect(c.messages).toHaveLength(0)
+    await node.stop()
+  })
+
+  it.skipIf(!openssl)("without a pin a self-signed server is refused by the system's certificate check", async () => {
+    server = await FakeServer.start({ tls: { key, cert } })
+    const node = runWith({ config: { server: server.url, deviceId: "node-test-1" as never, credential: CREDENTIAL }, timing: fastTiming })
+    await new Promise((r) => setTimeout(r, 400))
+    for (const c of server.connections) expect(c.messages).toHaveLength(0)
+    expect(node.logs.some((l) => l.includes("connection lost"))).toBe(true)
+    await node.stop()
   })
 })

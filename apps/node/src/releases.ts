@@ -213,7 +213,7 @@ export const installRelease = (dir: string, sha: string, bytes: Uint8Array, now 
   pointTo(dir, "current", sha)
 }
 
-/** Record an error for the node's status (`lastError`, WP-10 reports it in `node.status`). */
+/** Record an error for the node's status (`lastError` of the state file). */
 export const recordError = (dir: string, message: string, now = Date.now()): void => {
   writeState(dir, { ...readState(dir), lastError: { message, at: now } })
 }

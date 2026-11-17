@@ -1,19 +1,20 @@
 /**
- * The device side of the protocol for one connection (docs/VOICE-NODES.md §4.2, §4.4, §7.4): after `welcome` it
- * claims the audio and turns the microphone on, sends microphone frames with sequence numbers while it is the
- * owner, hands reply audio to the player, plays the wake and lapse cues, and prints the latency line of every turn
- * from `turn.end.trace` (the same `TurnTrace` numbers as the server's log).
+ * The device side of the protocol for one connection (docs/VOICE-NODES.md §5, §8): after `welcome` it claims the
+ * audio and turns the microphone on, sends microphone frames with sequence numbers while it is the owner, hands
+ * reply audio to the player, plays the wake and lapse cues, hands the pushed settings (`snapshot.setup`,
+ * `device.setup`) and `node.command`s to the node, and prints the latency line of every turn from `turn.end.trace`
+ * (the same `TurnTrace` numbers as the server's log).
  *
- * Protocol 5 (main) facts this relies on: the last `audio.claim` wins; `session` tells the role; `wake` carries
- * `armed`; reply audio comes only to the owner. Not here yet (later packages, no protocol messages invented):
- * `hello.node` and 4403 (WP-10 / WP-6), `node.status` / `node.command` / `node.level` (WP-10), on-keyword
- * streaming (WP-10, `kws.ts`). The protocol-6 error `sessions_full` is recognised from the raw text (see
- * `isSessionsFull`) because the protocol-5 codec cannot decode its code yet.
+ * The node is its own device with its own session (protocol 6 on): the audio owner it fights over is only another
+ * connection with the same device id, which in practice is a copied `node.json`. It does not fight that connection.
+ * `sessions_full` is a coded `error`: the node claims again later.
  */
 import {
   type ClientMessage,
+  type DeviceSetup,
   encodeMicFrame,
   MIC_SAMPLE_RATE,
+  type NodeCommand,
   type ServerMessage,
   type TraceInfo
 } from "@pva/protocol"
@@ -33,7 +34,7 @@ export interface SessionLink {
 export interface SessionOptions {
   readonly link: SessionLink
   readonly player: ReplyPlayer
-  /** Cues on (profile `cues`, WP-10; a CLI flag until then). */
+  /** Cues on (`sound.cues` of the pushed setup). */
   readonly cues: () => boolean
   /** After `sessions_full`, claim again this much later. */
   readonly claimRetryMs: number
@@ -42,6 +43,10 @@ export interface SessionOptions {
   readonly onTrace?: (line: string, trace: TraceInfo) => void
   /** The node became the owner (the capture can start). */
   readonly onOwner?: () => void
+  /** `snapshot.setup` in `welcome`, and every `device.setup`: the node applies `sound` and `soundDevices`. */
+  readonly onSetup?: (setup: Pick<DeviceSetup, "sound" | "soundDevices">) => void
+  /** The server asked for `identify`, `test-speaker`, `test-mic`, `restart` or `update`. */
+  readonly onCommand?: (command: NodeCommand) => void
   readonly setTimer?: (f: () => void, ms: number) => () => void
 }
 
@@ -53,28 +58,12 @@ export interface SessionStats {
 
 export interface Session {
   readonly onMessage: (message: ServerMessage) => void
-  /** A text frame the codec could not decode (`Invalid`), for the protocol-6 `sessions_full` seam. */
-  readonly onUndecodable: (text: string) => void
   readonly onReplyFrame: (turnId: number, pcm: Uint8Array) => void
   /** One captured 20 ms frame; sent only while this connection owns the audio. */
   readonly sendMic: (pcm: Uint8Array) => void
   readonly isOwner: () => boolean
   readonly close: () => void
   readonly stats: () => SessionStats
-}
-
-/**
- * TODO(protocol 6 / WP-10): `sessions_full` is an `error` code from the voice-sessions branch on. Protocol 5's
- * `ErrorCode` does not have it, so its codec reports such a message as invalid; recognise it from the raw JSON.
- * Once `@pva/protocol` has the code, handle it in `onMessage` and drop this.
- */
-export const isSessionsFull = (text: string): boolean => {
-  try {
-    const parsed = JSON.parse(text) as { type?: unknown; error?: { code?: unknown } }
-    return parsed.type === "error" && parsed.error?.code === "sessions_full"
-  } catch {
-    return false
-  }
 }
 
 const fmt = (n: number) => `${Math.round(n)}ms`
@@ -122,8 +111,7 @@ export const makeSession = (options: SessionOptions): Session => {
     cancelRetry = undefined
     counters.claims++
     link.send({ type: "audio.claim", audio: { contextSampleRate: MIC_SAMPLE_RATE, outputPath: "direct" } })
-    // Continuous streaming (§6): the microphone is live from the claim on. WP-10's on-keyword mode sends
-    // `mic.state` on a spotter fire instead.
+    // Continuous streaming: the microphone is live from the claim on.
     link.send({ type: "mic.state", live: true })
     micSeq = 0
   }
@@ -155,15 +143,22 @@ export const makeSession = (options: SessionOptions): Session => {
       case "welcome":
         ownerPresent = m.snapshot.ownerPresent
         setOwner(m.snapshot.role === "owner")
+        if (m.snapshot.setup !== undefined) options.onSetup?.(m.snapshot.setup)
         claim()
+        return
+      case "device.setup":
+        options.onSetup?.(m)
+        return
+      case "node.command":
+        options.onCommand?.(m)
         return
       case "session":
         ownerPresent = m.ownerPresent
         setOwner(m.role === "owner")
-        // Protocol 5 shares one audio owner between all devices. Do not fight a browser that took it; take it
-        // back once nobody holds it. (With voice sessions, protocol 6, a node is its own device and keeps it.)
+        // Only a connection with this node's own device id can take the audio from it: do not fight it, take the
+        // audio back once nobody holds it.
         if (!owner && !ownerPresent) retryClaimLater("nobody owns the audio")
-        else if (!owner) log(`another device took the audio (${m.reason}); waiting until it lets go`)
+        else if (!owner) log(`another connection of this node took the audio (${m.reason}): is node.json on two boxes?`)
         return
       case "reply.start":
         if (owner) player.start(m.turnId, m.sampleRate)
@@ -196,7 +191,8 @@ export const makeSession = (options: SessionOptions): Session => {
         return
       }
       case "error":
-        log(`server: ${m.error.code}: ${m.error.message}`)
+        if (m.error.code === "sessions_full") retryClaimLater("the assistant is talking on as many devices as it may (sessions_full)")
+        else log(`server: ${m.error.code}: ${m.error.message}`)
         return
       default:
         return
@@ -205,9 +201,6 @@ export const makeSession = (options: SessionOptions): Session => {
 
   return {
     onMessage,
-    onUndecodable: (text) => {
-      if (isSessionsFull(text)) retryClaimLater("the assistant is talking on as many devices as it may (sessions_full)")
-    },
     onReplyFrame: (turnId, pcm) => {
       if (owner && !closed) player.frame(turnId, pcm)
     },

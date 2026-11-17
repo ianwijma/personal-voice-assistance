@@ -2,16 +2,18 @@
  * Stand-in audio for the node's tests, through the same core contract the real backends implement: a microphone fed
  * by the test, and players that consume audio in real time (like a device) and record what they were given.
  */
-import { AudioInput, AudioOutput } from "@pva/core"
-import { MIC_FRAME_SAMPLES } from "@pva/protocol"
+import { AudioError, AudioInput, AudioOutput } from "@pva/core"
+import { MIC_FRAME_SAMPLES, type NodeSoundDevices } from "@pva/protocol"
 import { Cause, Context, Effect, Exit, Fiber, Layer, Queue, Stream } from "effect"
 import { NodeAudioInfo } from "../../src/audio.ts"
-import { runNode, type NodeRunOptions } from "../../src/node.ts"
+import { type NodeExit, runNode, type NodeRunOptions } from "../../src/node.ts"
 
 export interface Play {
   readonly sampleRate: number
   /** Samples the player took so far. */
   pulled: number
+  /** What the player was given, in order. */
+  readonly chunks: Array<Uint8Array>
   outcome: "playing" | "finished" | "interrupted" | "failed"
 }
 
@@ -21,10 +23,11 @@ export const makeFakeOutput = (speed = 1) => {
   const output = AudioOutput.of({
     play: (audio, sampleRate) =>
       Effect.suspend(() => {
-        const play: Play = { sampleRate, pulled: 0, outcome: "playing" }
+        const play: Play = { sampleRate, pulled: 0, chunks: [], outcome: "playing" }
         plays.push(play)
         return Stream.runForEach(audio, (chunk) => {
           play.pulled += chunk.length >> 1
+          play.chunks.push(chunk)
           return Effect.sleep(((chunk.length >> 1) / sampleRate) * 1000 / speed)
         }).pipe(
           Effect.onExit((exit) =>
@@ -58,13 +61,21 @@ export const makeFakeInput = () => {
 export interface TestNode {
   readonly replies: ReturnType<typeof makeFakeOutput>
   readonly cues: ReturnType<typeof makeFakeOutput>
+  /** The microphone the node started with. */
   readonly mic: ReturnType<typeof makeFakeInput>
+  /** Every device choice `audioFor` was asked for, with the microphone it gave (the first is the CLI's). */
+  readonly opened: Array<{ readonly devices: NodeSoundDevices; readonly mic: ReturnType<typeof makeFakeInput> }>
   readonly logs: Array<string>
   readonly traces: Array<string>
+  /** What `runNode` returned (only when it ends by itself: restart, update, failed start). */
+  readonly exit: Promise<NodeExit>
   readonly stop: () => Promise<void>
 }
 
-export const startNode = (options: Omit<NodeRunOptions, "log" | "onTrace"> & { readonly speed?: number }): TestNode => {
+export const startNode = (
+  options: Omit<NodeRunOptions, "log" | "onTrace"> & { readonly speed?: number; readonly brokenInputs?: ReadonlyArray<string> }
+): TestNode => {
+  const { speed: _speed, brokenInputs = [], ...runOptions } = options
   const replies = makeFakeOutput(options.speed ?? 1)
   const cues = makeFakeOutput(20)
   const mic = makeFakeInput()
@@ -73,11 +84,24 @@ export const startNode = (options: Omit<NodeRunOptions, "log" | "onTrace"> & { r
   const layer = Layer.succeedContext(
     Context.make(AudioInput, mic.input).pipe(
       Context.add(AudioOutput, replies.output),
-      Context.add(NodeAudioInfo, NodeAudioInfo.of({ input: "file", output: "file", outputLatencyMs: 20, cueOutput: cues.output }))
+      Context.add(NodeAudioInfo, NodeAudioInfo.of({ input: "alsa", output: "alsa", outputLatencyMs: 20, cueOutput: cues.output }))
     )
   )
-  const fiber = Effect.runFork(Effect.scoped(runNode({ ...options, log: (l) => logs.push(l), onTrace: (l) => traces.push(l) })).pipe(Effect.provide(layer)))
-  return { replies, cues, mic, logs, traces, stop: () => Effect.runPromise(Fiber.interrupt(fiber)) }
+  const opened: TestNode["opened"] = []
+  // Reopening the microphone on another device gives a fresh fake microphone; the player and the cue output stay.
+  const audioFor = (devices: NodeSoundDevices) => {
+    const fresh = makeFakeInput()
+    opened.push({ devices: { ...devices }, mic: fresh })
+    return {
+      input: brokenInputs.includes(devices.input) ? AudioInput.of({ stream: Stream.fail(new AudioError({ message: `cannot open ${devices.input}` })) }) : fresh.input,
+      output: replies.output,
+      info: NodeAudioInfo.of({ input: "alsa", output: "alsa", outputLatencyMs: 20, cueOutput: cues.output })
+    }
+  }
+  const fiber = Effect.runFork(Effect.scoped(runNode({ audioFor, missingTools: () => [], ...runOptions, log: (l) => logs.push(l), onTrace: (l) => traces.push(l) })).pipe(Effect.provide(layer)))
+  const exit = Effect.runPromise(Fiber.join(fiber)) as Promise<NodeExit>
+  exit.catch(() => {})
+  return { replies, cues, mic, opened, logs, traces, exit, stop: () => Effect.runPromise(Fiber.interrupt(fiber)) }
 }
 
 export const until = async (predicate: () => boolean, timeoutMs = 3000, what = "condition"): Promise<void> => {
