@@ -1,7 +1,7 @@
 import { act, render } from "@testing-library/react"
 import { describe, expect, it, vi } from "vitest"
 import type { AssistantClient } from "@/lib/client.ts"
-import { initialState, reducer } from "@/lib/state.ts"
+import { type HeardLine, type HeardOutcome, type HeardTone, heardRow, initialState, reducer } from "@/lib/state.ts"
 import { createStore } from "@/lib/store.ts"
 import { ClientContext } from "@/components/context.tsx"
 import { PhraseTester } from "@/components/settings/PhraseTester.tsx"
@@ -115,5 +115,97 @@ describe("Phrase tester: a line that says where it was heard", () => {
     expect(matched(page.container)[0]).toMatch(/wakes T3/)
     expect(store.get().heard.find((l) => l.at === 7)?.judged).toEqual({ deviceId: "d-kitchen0001", woke: "T3" })
     expect(store.get().heard.find((l) => l.at === 6)?.judged).toBeUndefined()
+  })
+})
+
+// PR #35 review 7, finding 1: every kind of heard line, from the table at `heardRow` (lib/state.ts). A line that was
+// not accepted never says, or implies, that an assistant woke — also a retained line the page judged earlier.
+describe("Phrase tester: every kind of heard line", () => {
+  const kitchen = "d-kitchen0001"
+  const office = "d-office00001"
+  // Jeff is on, Otto is switched off now; "gone" is the id of an assistant that has been removed.
+  const assistants = [{ id: "jeff", name: "Jeff", enabled: true }, { id: "otto", name: "Otto", enabled: false }] as unknown as typeof initialState.assistants
+  // The kitchen is the device talking, so a line without `source` is judged on it (with `wakes`: T3).
+  const sessions = [{ key: kitchen, deviceId: kitchen, name: "Kitchen", ownerPresent: true }] as unknown as typeof initialState.sessions
+  const devices = [{ id: kitchen, name: "Kitchen", audioOwner: true }] as unknown as typeof initialState.devices
+  type Row = {
+    readonly name: string
+    readonly line: Omit<HeardLine, "text" | "at">
+    readonly outcome: HeardOutcome
+    readonly tone: HeardTone
+    readonly label: string
+    readonly add: boolean
+    /** Shown on the kitchen's device page. */
+    readonly onKitchen: boolean
+  }
+  const jeff = { matched: "hey jeff" } as const
+  const rows: ReadonlyArray<Row> = [
+    // The server says where it was heard (`source`).
+    { name: "matched, taken, assistant known", line: { ...jeff, accepted: true, source: { deviceId: kitchen, assistantId: "jeff" } }, outcome: "matched", tone: "ok", label: "Matched Hey Jeff → wakes Jeff", add: false, onKitchen: true },
+    { name: "matched, taken, assistant switched off since", line: { matched: "hey otto", accepted: true, source: { deviceId: kitchen, assistantId: "otto" } }, outcome: "matched", tone: "ok", label: "Matched Hey Otto → wakes Otto", add: false, onKitchen: true },
+    { name: "matched, taken, assistant removed since", line: { ...jeff, accepted: true, source: { deviceId: kitchen, assistantId: "gone" } }, outcome: "matched", tone: "ok", label: "Matched Hey Jeff → wakes a removed assistant", add: false, onKitchen: true },
+    { name: "matched, taken, nobody's phrase", line: { ...jeff, accepted: true, source: { deviceId: kitchen } }, outcome: "matched", tone: "ok", label: "Matched Hey Jeff", add: false, onKitchen: true },
+    { name: "matched, taken, no device", line: { ...jeff, accepted: true, source: { assistantId: "jeff" } }, outcome: "matched", tone: "ok", label: "Matched Hey Jeff → wakes Jeff", add: false, onKitchen: false },
+    { name: "matched, taken, another device", line: { ...jeff, accepted: true, source: { deviceId: office, assistantId: "jeff" } }, outcome: "matched", tone: "ok", label: "Matched Hey Jeff → wakes Jeff", add: false, onKitchen: false },
+    { name: "matched, not taken, assistant off", line: { matched: "hey otto", accepted: false, source: { deviceId: kitchen, assistantId: "otto" } }, outcome: "matched-ignored", tone: "muted", label: "Matched Hey Otto, not accepted", add: false, onKitchen: true },
+    { name: "matched, not taken, assistant on now", line: { ...jeff, accepted: false, source: { deviceId: kitchen, assistantId: "jeff" } }, outcome: "matched-ignored", tone: "muted", label: "Matched Hey Jeff, not accepted", add: false, onKitchen: true },
+    { name: "matched, not taken, assistant removed", line: { ...jeff, accepted: false, source: { deviceId: kitchen, assistantId: "gone" } }, outcome: "matched-ignored", tone: "muted", label: "Matched Hey Jeff, not accepted", add: false, onKitchen: true },
+    { name: "matched, not taken, nobody's phrase", line: { ...jeff, accepted: false, source: { deviceId: kitchen } }, outcome: "matched-ignored", tone: "muted", label: "Matched Hey Jeff, not accepted", add: false, onKitchen: true },
+    { name: "matched, not taken, no device", line: { ...jeff, accepted: false, source: { assistantId: "jeff" } }, outcome: "matched-ignored", tone: "muted", label: "Matched Hey Jeff, not accepted", add: false, onKitchen: false },
+    { name: "no phrase, taken", line: { accepted: true, source: { deviceId: kitchen } }, outcome: "accepted", tone: "you", label: "Accepted without a phrase", add: false, onKitchen: true },
+    { name: "no phrase, taken, with an assistant (never sent)", line: { accepted: true, source: { deviceId: kitchen, assistantId: "jeff" } }, outcome: "accepted", tone: "you", label: "Accepted without a phrase", add: false, onKitchen: true },
+    { name: "no phrase, not taken", line: { accepted: false, source: { deviceId: kitchen } }, outcome: "ignored", tone: "muted", label: "Ignored", add: true, onKitchen: true },
+    { name: "no phrase, not taken, no device", line: { accepted: false, source: {} }, outcome: "ignored", tone: "muted", label: "Ignored", add: true, onKitchen: false },
+    // An older server, without `source`: judged by the page on the tested device (the kitchen), `wakes` says T3.
+    { name: "old server: matched, taken", line: { ...jeff, accepted: true }, outcome: "matched", tone: "ok", label: "Matched Hey Jeff → wakes T3", add: false, onKitchen: true },
+    { name: "old server: matched, not taken", line: { ...jeff, accepted: false }, outcome: "matched-ignored", tone: "muted", label: "Matched Hey Jeff, not accepted", add: false, onKitchen: true },
+    { name: "older server: matched, no accepted", line: { ...jeff }, outcome: "matched", tone: "ok", label: "Matched Hey Jeff → wakes T3", add: false, onKitchen: true },
+    { name: "old server: no phrase, taken", line: { accepted: true }, outcome: "accepted", tone: "you", label: "Accepted without a phrase", add: false, onKitchen: true },
+    { name: "old server: no phrase, not taken", line: { accepted: false }, outcome: "ignored", tone: "muted", label: "Ignored", add: true, onKitchen: true },
+    { name: "older server: no phrase, no accepted", line: {}, outcome: "no-match", tone: "muted", label: "No phrase matched", add: true, onKitchen: true },
+    // Retained lines the page judged earlier (`judged`): their own device and assistant, never relabelled.
+    { name: "retained: matched, taken", line: { ...jeff, accepted: true, judged: { deviceId: kitchen, woke: "Jeff" } }, outcome: "matched", tone: "ok", label: "Matched Hey Jeff → wakes Jeff", add: false, onKitchen: true },
+    { name: "retained: matched, not taken, judged with an assistant", line: { ...jeff, accepted: false, judged: { deviceId: kitchen, woke: "Jeff" } }, outcome: "matched-ignored", tone: "muted", label: "Matched Hey Jeff, not accepted", add: false, onKitchen: true },
+    { name: "retained: matched, taken, on another device", line: { ...jeff, accepted: true, judged: { deviceId: office, woke: "Jeff" } }, outcome: "matched", tone: "ok", label: "Matched Hey Jeff → wakes Jeff", add: false, onKitchen: false }
+  ]
+  const textOf = (i: number) => `line ${i} said`
+  const heard: ReadonlyArray<HeardLine> = rows.map((r, i) => ({ ...r.line, text: textOf(i), at: 100 + i }))
+  const rowOf = (container: HTMLElement, i: number) =>
+    [...container.querySelectorAll<HTMLElement>('[data-testid="heard-lines"] li')].find((li) => (li.textContent ?? "").includes(`“${textOf(i)}”`))
+  const setup = () => {
+    const store = createStore({ ...initialState, assistants, sessions, devices, heard }, reducer)
+    const client = { store, wakeTest: vi.fn(async () => ({ type: "result", requestId: "r", ok: true })) } as unknown as AssistantClient
+    const tester = (deviceId?: string) => (
+      <ClientContext.Provider value={client}>
+        <PhraseTester key={deviceId ?? "defaults"} {...(deviceId !== undefined ? { deviceId } : {})} wakes={() => "T3"} onAdd={() => undefined} />
+      </ClientContext.Provider>
+    )
+    return { tester }
+  }
+
+  it("labels, tones and Add for every row, on the defaults page and on a device page", () => {
+    const { tester } = setup()
+    const page = render(tester())
+    rows.forEach((r, i) => {
+      const li = rowOf(page.container, i)
+      expect(li, r.name).toBeDefined()
+      expect(li!.dataset.outcome, r.name).toBe(r.outcome)
+      expect(li!.dataset.tone, r.name).toBe(r.tone)
+      const label = (li!.textContent ?? "").replace(`“${textOf(i)}”`, "").replace(/Add “.*”$/, "")
+      expect(label, r.name).toBe(r.label)
+      expect(li!.querySelector('[data-testid="add-heard"]') !== null, r.name).toBe(r.add)
+      // The one rule the table exists for: not accepted, so nobody woke.
+      if (r.line.accepted === false) expect(li!.textContent, r.name).not.toMatch(/wakes/)
+      // The label is the pure function's, given what the page knows of the assistant.
+      expect(heardRow(heard[i]!, undefined).outcome, r.name).toBe(r.outcome)
+    })
+    page.unmount()
+
+    const onKitchen = render(tester(kitchen))
+    rows.forEach((r, i) => {
+      const li = rowOf(onKitchen.container, i)
+      expect(li !== undefined, r.name).toBe(r.onKitchen)
+      if (li !== undefined) expect((li.textContent ?? "").replace(`“${textOf(i)}”`, "").replace(/Add “.*”$/, ""), r.name).toBe(r.label)
+    })
   })
 })
