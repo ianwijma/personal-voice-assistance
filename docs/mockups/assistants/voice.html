@@ -1,0 +1,1124 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Voice page assistants</title>
+<meta name="description" content="Clickable mock-up: the voice page with several assistants on one device.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+/* ---- Product tokens (apps/web/src/app/globals.css), dark by default */
+:root {
+  --color-bg: oklch(0.165 0.006 110);
+  --color-surface: oklch(0.205 0.007 110);
+  --color-surface-2: oklch(0.245 0.008 110);
+  --color-line: oklch(0.32 0.008 110);
+  --color-ink: oklch(0.93 0.015 95);
+  --color-ink-muted: oklch(0.70 0.014 95);
+  --color-ink-faint: oklch(0.64 0.010 95);
+  --color-voice: oklch(0.80 0.140 75);
+  --color-voice-soft: oklch(0.80 0.140 75 / 0.16);
+  --color-you: oklch(0.83 0.090 180);
+  --color-you-soft: oklch(0.83 0.090 180 / 0.16);
+  --color-ok: oklch(0.78 0.110 150);
+  --color-warn: oklch(0.80 0.120 55);
+  --color-danger: oklch(0.70 0.170 28);
+  --font-sans: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", monospace;
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 16px;
+  --shadow-panel: 0 16px 48px -16px oklch(0 0 0 / 0.65);
+  --ease-out: cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+@media (prefers-color-scheme: light) {
+  :root {
+    --color-bg: oklch(0.970 0.008 95);
+    --color-surface: oklch(0.995 0.004 95);
+    --color-surface-2: oklch(0.940 0.008 95);
+    --color-line: oklch(0.870 0.010 95);
+    --color-ink: oklch(0.220 0.010 110);
+    --color-ink-muted: oklch(0.450 0.012 110);
+    --color-ink-faint: oklch(0.510 0.010 110);
+    --color-voice: oklch(0.520 0.150 60);
+    --color-voice-soft: oklch(0.620 0.150 60 / 0.14);
+    --color-you: oklch(0.470 0.090 195);
+    --color-you-soft: oklch(0.550 0.090 195 / 0.10);
+    --color-ok: oklch(0.500 0.110 150);
+    --color-warn: oklch(0.520 0.120 50);
+    --color-danger: oklch(0.530 0.190 28);
+    --shadow-panel: 0 16px 48px -20px oklch(0.3 0.02 95 / 0.35);
+  }
+}
+html { color-scheme: dark; -webkit-text-size-adjust: 100%; }
+@media (prefers-color-scheme: light) { html { color-scheme: light; } }
+*, *::before, *::after { box-sizing: border-box; }
+html, body { height: 100%; }
+body {
+  margin: 0; background: var(--color-bg); color: var(--color-ink);
+  font-family: var(--font-sans); font-size: 15px; line-height: 1.5; overflow: hidden;
+  -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale;
+  display: flex; flex-direction: column;
+}
+button, input, select, textarea { font: inherit; color: inherit; }
+button { cursor: pointer; }
+::selection { background: var(--color-you-soft); }
+:focus-visible { outline: 2px solid var(--color-you); outline-offset: 2px; }
+.label { font-family: var(--font-mono); font-size: 11px; line-height: 16px; letter-spacing: 0.08em; text-transform: uppercase; font-weight: 500; }
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }
+.scrollbar-quiet { scrollbar-width: thin; scrollbar-color: var(--color-line) transparent; }
+@keyframes pva-fade-in { from { opacity: 0 } to { opacity: 1 } }
+@keyframes pva-rise { from { opacity: 0; transform: translateY(8px) } to { opacity: 1; transform: none } }
+@keyframes pva-drop { from { opacity: 0; transform: translateY(-6px) } to { opacity: 1; transform: none } }
+@keyframes pva-slide-in { from { transform: translateX(24px); opacity: 0 } to { transform: none; opacity: 1 } }
+@keyframes pva-sheet-up { from { transform: translateY(24px); opacity: 0 } to { transform: none; opacity: 1 } }
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: 1ms !important; animation-iteration-count: 1 !important; transition-duration: 1ms !important; }
+}
+
+/* ============ Mock-up controls: deliberately not product styling (dashed, no accents) ============ */
+.mock {
+  flex-shrink: 0; margin: 8px 8px 0; padding: 8px 10px; border: 1.5px dashed var(--color-ink-faint); border-radius: 10px;
+  display: flex; flex-wrap: wrap; align-items: center; gap: 6px 16px; font: 12px/1.3 var(--font-sans); color: var(--color-ink-muted);
+}
+.mock-tag { font-family: var(--font-mono); font-size: 10px; letter-spacing: .08em; text-transform: uppercase; border: 1px dashed var(--color-ink-faint); border-radius: 4px; padding: 2px 6px; color: var(--color-ink-faint); }
+.mock-group { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; }
+.mock-group > .mock-name { margin-right: 4px; color: var(--color-ink-faint); }
+.mock button.opt, .mock select, .mock .hide {
+  height: 26px; padding: 0 9px; border: 1px dashed var(--color-line); border-radius: 6px; background: transparent; color: var(--color-ink-muted); font-size: 12px;
+}
+.mock select { padding-right: 6px; }
+.mock button.opt:hover, .mock .hide:hover { color: var(--color-ink); border-color: var(--color-ink-faint); }
+.mock button.opt[aria-pressed="true"] { border-style: solid; border-color: var(--color-ink-muted); color: var(--color-ink); background: var(--color-surface-2); }
+.mock button.opt:disabled { opacity: .4; cursor: not-allowed; }
+.mock label.chk { display: inline-flex; align-items: center; gap: 5px; cursor: pointer; }
+.mock .hide { margin-left: auto; }
+.mock-follow { border-left: 1px dashed var(--color-line); padding-left: 12px; color: var(--color-ink-muted); font-variant-numeric: tabular-nums; }
+.mock-tab { position: fixed; left: 8px; bottom: 8px; z-index: 100; height: 28px; padding: 0 10px; border: 1.5px dashed var(--color-ink-faint); border-radius: 8px; background: var(--color-bg); color: var(--color-ink-muted); font: 12px var(--font-sans); }
+body.mock-hidden .mock { display: none; }
+body:not(.mock-hidden) .mock-tab { display: none; }
+
+/* The area that holds the page frame */
+.viewport { position: relative; flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; overflow: hidden; }
+.frame { position: relative; overflow: hidden; background: var(--color-bg); container-type: size; container-name: pva; }
+body.desktop .frame { width: 100%; height: 100%; border-top: 1px solid var(--color-line); margin-top: 8px; }
+body.mock-hidden.desktop .frame { margin-top: 0; border-top: 0; }
+body.phone .frame { width: 390px; height: 844px; flex-shrink: 0; border: 1px solid var(--color-line); border-radius: 36px; transform-origin: center center; }
+
+/* ============ The voice page (container queries stand in for the product's media queries) ============ */
+.app { position: absolute; inset: 0; display: flex; flex-direction: column; }
+.topbar { position: relative; z-index: 20; display: flex; height: 56px; flex-shrink: 0; align-items: center; gap: 12px; padding: 0 8px 0 12px; }
+@container pva (min-width: 640px) { .topbar { gap: 20px; padding: 0 24px; } }
+.tb-left { position: relative; display: flex; min-width: 0; align-items: center; gap: 10px; padding-left: 4px; }
+.tdot { width: 8px; height: 8px; border-radius: 9999px; flex-shrink: 0; background: var(--color-ink-faint); transition: background-color 240ms var(--ease-out); }
+.tdot.ok { background: var(--color-ok); }
+.who-plain { color: var(--color-ink); white-space: nowrap; }
+.who-btn {
+  display: inline-flex; align-items: center; gap: 6px; height: 44px; margin-left: -8px; padding: 0 8px; border: 0; border-radius: var(--radius-md);
+  background: transparent; color: var(--color-ink); white-space: nowrap; transition: background-color 120ms var(--ease-out);
+}
+.who-btn:hover, .who-btn[aria-expanded="true"] { background: var(--color-surface-2); }
+.who-btn svg { color: var(--color-ink-faint); transition: transform 120ms var(--ease-out); }
+.who-btn[aria-expanded="true"] svg { transform: rotate(180deg); }
+@container pva (min-width: 640px) { .who-btn { height: 32px; } }
+.end-btn {
+  margin-left: auto; display: inline-flex; height: 44px; align-items: center; gap: 8px; padding: 0 12px; border: 1px solid var(--color-line); border-radius: var(--radius-md);
+  background: transparent; color: var(--color-ink-muted); transition: background-color 120ms, color 120ms;
+}
+.end-btn:hover { background: var(--color-surface-2); color: var(--color-ink); }
+.end-btn i { width: 8px; height: 8px; border-radius: 2px; background: currentColor; }
+@container pva (min-width: 640px) { .end-btn { margin-left: 0; height: 32px; border-color: transparent; padding: 0 10px; } }
+.tb-right { margin-left: auto; display: flex; align-items: center; }
+.has-end .tb-right { margin-left: 0; }
+@container pva (min-width: 640px) { .has-end .tb-right { margin-left: auto; } }
+.icon-btn { display: inline-flex; width: 44px; height: 44px; align-items: center; justify-content: center; border: 0; border-radius: var(--radius-md); background: transparent; color: var(--color-ink-muted); transition: background-color 120ms, color 120ms; }
+.icon-btn:hover { background: var(--color-surface-2); color: var(--color-ink); }
+
+/* Assistant menu */
+.menu {
+  position: absolute; top: calc(100% + 6px); left: -8px; z-index: 50; width: 296px; max-width: calc(100cqw - 24px);
+  border: 1px solid var(--color-line); border-radius: var(--radius-lg); background: var(--color-surface); box-shadow: var(--shadow-panel); padding: 4px;
+  animation: pva-drop 160ms var(--ease-out);
+}
+.mi {
+  display: flex; width: 100%; min-height: 52px; align-items: flex-start; gap: 10px; padding: 8px 10px; border: 0; border-radius: var(--radius-md);
+  background: transparent; text-align: left; transition: background-color 120ms;
+}
+.mi:hover, .mi:focus-visible { background: var(--color-surface-2); }
+.mi:focus-visible { outline-offset: -2px; }
+.mi-check { display: inline-flex; width: 16px; height: 20px; flex-shrink: 0; align-items: center; justify-content: center; color: var(--color-you); }
+.mi-name { display: block; font-size: 14px; color: var(--color-ink); }
+.mi-reach { display: block; font-size: 13px; color: var(--color-ink-muted); }
+.mi-sep { height: 1px; margin: 4px 6px; background: color-mix(in oklab, var(--color-line) 60%, transparent); }
+.mi-note { margin: 0; padding: 6px 10px 8px 36px; font-size: 12px; color: var(--color-ink-faint); }
+
+/* Stage */
+.main { position: relative; flex: 1; min-height: 0; }
+.stage {
+  position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; overflow-y: auto; overflow-x: hidden; padding-bottom: 128px;
+  padding-top: max(12px, min(36cqh - 100px, 50cqh - 200px)); transition: transform 320ms var(--ease-out); scrollbar-width: none;
+}
+@container pva (min-width: 640px) { .stage { padding-top: max(12px, min(38cqh - 141px, 60cqh - 280px)); } }
+@container pva (min-width: 1024px) and (max-width: 1439px) { .chat-open .stage { transform: translateX(-200px); } }
+.vis { position: relative; width: calc(100% - 32px); max-width: 720px; flex-shrink: 0; height: clamp(48px, 100cqh - 320px, 160px); }
+@container pva (min-width: 640px) { .vis { height: clamp(48px, 100cqh - 320px, 240px); } }
+.vis canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+.vis .mic-off { position: absolute; inset: 0; display: none; align-items: center; justify-content: center; color: var(--color-ink-faint); }
+.is-muted .vis .mic-off { display: flex; }
+.state-box { margin-top: 16px; display: grid; min-height: 16px; width: 100%; max-width: calc(100% - 32px); justify-items: center; }
+.state { margin: 0; text-align: center; overflow-wrap: anywhere; transition: color 240ms var(--ease-out); }
+.tone-voice { color: var(--color-voice); } .tone-you { color: var(--color-you); } .tone-muted { color: var(--color-ink-muted); } .tone-faint { color: var(--color-ink-faint); }
+.captions { margin-top: 12px; min-height: 3.2em; width: 100%; max-width: 640px; padding: 0 24px; text-align: center; font-size: 16px; line-height: 1.45; }
+@container pva (min-width: 640px) { .captions { font-size: 20px; } }
+.captions[hidden] { display: none; }
+.captions p { margin: 0; text-wrap: balance; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.cap-you { color: var(--color-you); } .cap-main { color: var(--color-ink); } .cap-next { color: var(--color-ink-muted); }
+.below { margin-top: 24px; display: flex; width: 100%; max-width: 560px; flex-direction: column; align-items: center; gap: 16px; padding: 0 16px; }
+.below:empty { display: none; }
+.hint { margin: 0; text-align: center; font-size: 13px; color: var(--color-ink-faint); animation: pva-fade-in 320ms var(--ease-out); }
+.hint kbd { font-family: var(--font-mono); color: var(--color-ink-muted); }
+.start-pill {
+  display: inline-flex; height: 48px; align-items: center; gap: 12px; padding: 0 28px; border-radius: 9999px;
+  border: 1px solid color-mix(in oklab, var(--color-voice) 70%, transparent); background: transparent; color: var(--color-voice);
+  transition: background-color 120ms, border-color 120ms;
+}
+.start-pill:hover { border-color: var(--color-voice); background: var(--color-voice-soft); }
+.start-pill .label { font-size: 12px; }
+.privacy { max-width: 420px; text-align: center; font-size: 13px; line-height: 1.625; color: var(--color-ink-faint); }
+.privacy summary { display: inline-flex; min-height: 44px; align-items: center; gap: 4px; cursor: pointer; list-style: none; }
+.privacy summary::-webkit-details-marker { display: none; }
+.privacy summary:hover { color: var(--color-ink-muted); }
+.privacy summary svg { transition: transform 120ms; }
+.privacy[open] summary svg { transform: rotate(90deg); }
+.privacy p { margin: 4px 0 0; }
+.type-instead { border: 0; background: none; padding: 0; font-size: 13px; color: var(--color-ink-muted); text-decoration: underline; text-decoration-color: var(--color-line); text-underline-offset: 4px; }
+.type-instead:hover { color: var(--color-ink); }
+@container pva (max-width: 639.98px) { .type-instead { min-height: 44px; } }
+
+/* Dock */
+.dock { pointer-events: none; position: absolute; left: 0; right: 0; bottom: 24px; z-index: 10; display: flex; justify-content: center; }
+.dock-row { pointer-events: auto; display: flex; align-items: center; gap: 16px; }
+@container pva (min-width: 640px) { .dock-row { gap: 12px; } }
+.round {
+  position: relative; display: inline-flex; width: 56px; height: 56px; align-items: center; justify-content: center; border-radius: 9999px;
+  border: 1px solid var(--color-line); background: var(--color-surface); color: var(--color-ink); transition: background-color 120ms, border-color 120ms, color 120ms, opacity 120ms;
+}
+@container pva (min-width: 640px) { .round { width: 48px; height: 48px; } }
+.round:hover { background: var(--color-surface-2); }
+.round.muted { background: var(--color-surface-2); color: var(--color-ink-faint); }
+.round.stop-off { color: var(--color-ink-faint); opacity: .6; cursor: default; }
+.round.stop-off:hover { background: var(--color-surface); }
+.round.stop-on { border-color: color-mix(in oklab, var(--color-voice) 60%, transparent); background: var(--color-voice-soft); color: var(--color-voice); }
+.round.stop-on:hover { border-color: var(--color-voice); }
+.round.pressed { background: var(--color-surface-2); }
+.mic-ring { pointer-events: none; position: absolute; inset: -3px; border-radius: 9999px; border: 2px solid var(--color-you); opacity: .9; will-change: transform; }
+.more-wrap { position: relative; display: none; }
+@container pva (max-width: 639.98px) { .more-wrap { display: block; } }
+.dock-menu { position: absolute; bottom: calc(100% + 12px); right: 0; min-width: 192px; width: max-content; border: 1px solid var(--color-line); border-radius: var(--radius-lg); background: var(--color-surface); padding: 4px; box-shadow: var(--shadow-panel); animation: pva-rise 160ms var(--ease-out); }
+.dock-menu button { display: flex; width: 100%; min-height: 44px; align-items: center; gap: 10px; padding: 0 12px; border: 0; border-radius: var(--radius-md); background: transparent; font-size: 15px; color: var(--color-ink); text-align: left; }
+.dock-menu button:hover { background: var(--color-surface-2); }
+.dock-menu svg { color: var(--color-ink-muted); }
+
+/* Panels: shared header */
+.scrim { position: absolute; inset: 0; z-index: 30; background: color-mix(in oklab, var(--color-bg) 50%, transparent); animation: pva-fade-in 200ms var(--ease-out); }
+.panel-head { display: flex; height: 56px; flex-shrink: 0; align-items: center; gap: 12px; border-bottom: 1px solid var(--color-line); padding: 0 8px 0 20px; }
+.panel-head h2 { margin: 0; min-width: 0; color: var(--color-ink-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.conv-wrap { position: relative; flex: 1 1 auto; min-width: 0; }
+.conv-btn { display: inline-flex; max-width: 100%; align-items: center; gap: 6px; height: 44px; margin-left: -8px; padding: 0 8px; border: 0; border-radius: var(--radius-md); background: transparent; color: var(--color-ink-muted); white-space: nowrap; transition: background-color 120ms, color 120ms; }
+.conv-btn .label { overflow: hidden; text-overflow: ellipsis; }
+.conv-btn:hover, .conv-btn[aria-expanded="true"] { background: var(--color-surface-2); color: var(--color-ink); }
+.conv-btn svg { flex-shrink: 0; color: var(--color-ink-faint); transition: transform 120ms; }
+.conv-btn[aria-expanded="true"] svg { transform: rotate(180deg); }
+.conv-menu { top: calc(100% + 2px); }
+.panel-head .acts { margin-left: auto; display: flex; flex-shrink: 0; align-items: center; gap: 4px; }
+.grab { margin: 8px auto 0; height: 4px; width: 40px; flex-shrink: 0; border-radius: 9999px; background: var(--color-line); }
+@container pva (min-width: 640px) { .grab { display: none; } }
+
+/* Chat */
+.chat {
+  position: absolute; z-index: 40; display: flex; flex-direction: column; overflow: hidden; background: var(--color-surface); box-shadow: var(--shadow-panel);
+  left: 0; right: 0; bottom: 0; height: 85cqh; border-top: 1px solid var(--color-line); border-radius: var(--radius-lg) var(--radius-lg) 0 0;
+  animation: pva-sheet-up 320ms var(--ease-out);
+}
+@container pva (min-width: 640px) {
+  .chat { left: auto; top: 0; right: 0; height: 100%; width: 400px; border-radius: 0; border-top: 0; border-left: 1px solid var(--color-line); animation-name: pva-slide-in; }
+}
+@container pva (min-width: 1024px) {
+  .chat { top: auto; bottom: 24px; right: 24px; height: min(640px, 100cqh - 120px); border: 1px solid var(--color-line); border-radius: var(--radius-lg); animation: pva-rise 240ms var(--ease-out); }
+  .chat-scrim { display: none; }
+}
+.msgs-wrap { position: relative; min-height: 0; flex: 1; display: flex; flex-direction: column; }
+.msgs { min-height: 0; flex: 1; overflow-y: auto; padding: 16px 20px; }
+.conv-note { flex-shrink: 0; margin: 0; padding: 10px 20px; font-size: 12px; color: var(--color-ink-faint); border-bottom: 1px solid color-mix(in oklab, var(--color-line) 60%, transparent); }
+.divider { margin: 0 0 20px; display: flex; align-items: center; gap: 12px; font-size: 12px; color: var(--color-ink-faint); }
+.divider::before, .divider::after { content: ""; height: 1px; min-width: 24px; flex: 1; background: var(--color-line); }
+.empty-chat { margin: 32px 0 0; text-align: center; font-size: 14px; color: var(--color-ink-faint); }
+.turns { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 20px; }
+.turn { display: flex; flex-direction: column; gap: 12px; }
+.msg { border-left: 2px solid; padding-left: 12px; }
+.msg.you { border-color: var(--color-you); }
+.msg.voice { border-color: var(--color-voice); }
+.msg .who { display: flex; align-items: center; gap: 6px; }
+.msg.you .who { color: var(--color-you); }
+.msg.voice .who { color: var(--color-voice); }
+.msg .who svg { color: var(--color-ink-faint); }
+.msg p { margin: 2px 0 0; font-size: 15px; color: var(--color-ink); white-space: pre-wrap; }
+.msg.voice p { margin-top: 4px; }
+.played { color: var(--color-ink); transition: color 240ms var(--ease-out); } .unplayed { color: var(--color-ink-muted); transition: color 240ms var(--ease-out); }
+.tools { margin-top: 6px; display: flex; flex-direction: column; align-items: flex-start; gap: 4px; }
+.toolchip { display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--color-line); border-radius: var(--radius-sm); padding: 2px 8px; font-family: var(--font-mono); font-size: 12px; color: var(--color-ink); }
+.toolchip svg { color: var(--color-ok); }
+.composer { flex-shrink: 0; border-top: 1px solid var(--color-line); padding: 10px 12px 12px; }
+.comp-box { display: flex; align-items: flex-end; gap: 8px; border: 1px solid var(--color-line); border-radius: var(--radius-md); background: color-mix(in oklab, var(--color-surface-2) 70%, transparent); padding: 4px 4px 4px 12px; }
+.comp-box:focus-within { border-color: var(--color-you); outline: 2px solid var(--color-you); outline-offset: 2px; }
+.comp-box textarea { min-height: 38px; max-height: 148px; flex: 1; resize: none; border: 0; background: transparent; padding: 8px 0; font-size: 16px; line-height: 22px; color: var(--color-ink); outline: none; }
+@container pva (min-width: 640px) { .comp-box textarea { font-size: 15px; } }
+.comp-box textarea::placeholder { color: var(--color-ink-faint); }
+.send { margin-bottom: 2px; display: inline-flex; width: 44px; height: 44px; flex-shrink: 0; align-items: center; justify-content: center; border: 0; border-radius: var(--radius-md); background: var(--color-ink); color: var(--color-bg); transition: opacity 120ms; }
+@container pva (min-width: 640px) { .send { width: 36px; height: 36px; } }
+.send:disabled { opacity: .25; cursor: default; }
+.comp-hint { margin: 6px 4px 0; font-size: 11px; color: var(--color-ink-faint); }
+@container pva (max-width: 639.98px) { .comp-hint { display: none; } }
+
+/* Settings sheet */
+.sheet {
+  position: absolute; z-index: 40; display: flex; flex-direction: column; overflow: hidden; background: var(--color-surface); box-shadow: var(--shadow-panel);
+  left: 0; right: 0; bottom: 0; max-height: 88cqh; border-top: 1px solid var(--color-line); border-radius: var(--radius-lg) var(--radius-lg) 0 0;
+  animation: pva-sheet-up 320ms var(--ease-out);
+}
+@container pva (min-width: 640px) {
+  .sheet { left: auto; top: 0; right: 0; max-height: none; width: 400px; border-radius: 0; border-top: 0; border-left: 1px solid var(--color-line); animation-name: pva-slide-in; }
+}
+.sheet-body { min-height: 0; flex: 1; overflow-y: auto; overscroll-behavior: contain; padding: 20px 20px 20px; display: flex; flex-direction: column; gap: 24px; }
+.sec { display: flex; flex-direction: column; gap: 12px; padding-bottom: 24px; border-bottom: 1px solid color-mix(in oklab, var(--color-line) 60%, transparent); }
+.sec h3 { margin: 0; color: var(--color-ink-faint); }
+.choices { display: flex; flex-direction: column; border: 1px solid var(--color-line); border-radius: var(--radius-md); }
+.choices > * + * { border-top: 1px solid color-mix(in oklab, var(--color-line) 60%, transparent); }
+.choice { display: flex; min-height: 48px; align-items: flex-start; gap: 12px; padding: 10px 12px; cursor: pointer; transition: background-color 120ms; }
+.choice:hover, .choice.on { background: color-mix(in oklab, var(--color-surface-2) 60%, transparent); }
+.choice.static { cursor: default; }
+.choice.static:hover { background: transparent; }
+.choice input { margin: 4px 0 0; width: 18px; height: 18px; flex-shrink: 0; appearance: none; border-radius: 9999px; border: 1.5px solid var(--color-ink-faint); background: var(--color-surface); cursor: pointer; transition: border-color 120ms, border-width 120ms; }
+.choice input:checked { border: 5px solid var(--color-you); }
+.c-text { min-width: 0; flex: 1; }
+.c-title { display: block; font-size: 14px; color: var(--color-ink); }
+.c-desc { display: block; font-size: 13px; color: var(--color-ink-muted); }
+.c-reach { display: block; margin-top: 2px; font-size: 12px; color: var(--color-ink-faint); }
+.note12 { margin: 0; font-size: 12px; color: var(--color-ink-faint); }
+.p13 { margin: 0; font-size: 13px; color: var(--color-ink-muted); }
+.ok-note { margin: 0; display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--color-ok); }
+.alink { color: var(--color-voice); text-decoration: none; text-underline-offset: 4px; }
+.alink:hover { text-decoration: underline; }
+.field { display: flex; flex-direction: column; gap: 6px; }
+.field > label { font-size: 14px; font-weight: 500; color: var(--color-ink); }
+.input { height: 44px; width: 100%; border-radius: var(--radius-md); border: 1px solid var(--color-line); background: color-mix(in oklab, var(--color-surface-2) 60%, transparent); padding: 0 12px; font-size: 16px; color: var(--color-ink); }
+@container pva (min-width: 640px) { .input { height: 40px; font-size: 14px; } }
+.input:focus-visible { border-color: var(--color-you); }
+select.input { appearance: none; padding-right: 36px; background-repeat: no-repeat; background-position: right 10px center; background-size: 16px;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20' fill='none' stroke='%23888' stroke-width='1.5'%3E%3Cpath d='M5 7.5l5 5 5-5'/%3E%3C/svg%3E"); }
+details.more { border: 1px solid color-mix(in oklab, var(--color-line) 70%, transparent); border-radius: var(--radius-md); }
+details.more summary { display: flex; min-height: 44px; align-items: center; gap: 6px; padding: 0 12px; cursor: pointer; list-style: none; color: var(--color-ink-muted); }
+details.more summary::-webkit-details-marker { display: none; }
+details.more summary:hover { color: var(--color-ink); }
+details.more summary svg { transition: transform 120ms; }
+details.more[open] summary svg { transform: rotate(90deg); }
+details.more .more-body { display: flex; flex-direction: column; gap: 20px; padding: 4px 12px 16px; }
+.btn { display: inline-flex; height: 44px; align-items: center; gap: 8px; padding: 0 16px; border: 1px solid var(--color-line); border-radius: var(--radius-md); background: var(--color-surface); font-size: 14px; font-weight: 500; color: var(--color-ink); }
+@container pva (min-width: 640px) { .btn { height: 40px; } }
+.btn:hover { background: var(--color-surface-2); }
+.admin-row { display: flex; min-height: 48px; align-items: center; gap: 12px; padding: 12px 16px; border: 1px solid var(--color-line); border-radius: var(--radius-md); font-size: 14px; color: var(--color-ink); text-decoration: none; transition: background-color 120ms; }
+.admin-row:hover { background: var(--color-surface-2); }
+.admin-row .t { min-width: 0; flex: 1; }
+.admin-row .t span { display: block; }
+.admin-row .t span + span { font-size: 12px; color: var(--color-ink-muted); }
+
+/* Toasts */
+.toasts { pointer-events: none; position: absolute; left: 0; right: 0; bottom: 104px; z-index: 70; display: flex; flex-direction: column; align-items: center; gap: 8px; padding: 0 16px; }
+@container pva (min-width: 640px) { .toasts { bottom: 96px; } }
+.toast { pointer-events: auto; display: flex; max-width: 520px; align-items: flex-start; gap: 12px; border: 1px solid var(--color-line); border-radius: var(--radius-md); background: var(--color-surface); padding: 10px 16px; font-size: 14px; color: var(--color-ink); box-shadow: var(--shadow-panel); animation: pva-rise 200ms var(--ease-out); }
+.toast .d { margin-top: 7px; width: 6px; height: 6px; border-radius: 9999px; background: var(--color-ink-faint); flex-shrink: 0; }
+</style>
+</head>
+<body class="desktop">
+
+<div class="mock" id="mock" role="region" aria-label="Mock-up controls, not part of the page">
+  <span class="mock-tag">Mock-up</span>
+  <div class="mock-group" role="group" aria-label="State" id="mock-states"></div>
+  <div class="mock-group">
+    <label class="mock-name" for="mock-device">Device</label>
+    <select id="mock-device"></select>
+    <label class="chk" title="Admin: Every browser › On the voice page › Let people pick the assistant on the device"><input type="checkbox" id="mock-picking" checked> Picking allowed</label>
+  </div>
+  <div class="mock-group" role="group" aria-label="Width">
+    <span class="mock-name">Width</span>
+    <button class="opt" type="button" id="mock-desktop" aria-pressed="true">Desktop</button>
+    <button class="opt" type="button" id="mock-phone" aria-pressed="false">Phone 390 × 844</button>
+  </div>
+  <span class="mock-follow" id="mock-follow" aria-live="polite" hidden></span>
+  <button class="hide" type="button" id="mock-hide">Hide controls</button>
+</div>
+<button class="mock-tab" type="button" id="mock-show">Mock-up controls</button>
+
+<div class="viewport" id="viewport">
+  <div class="frame" id="frame">
+    <div class="app" id="behind">
+      <h1 class="sr-only">Voice assistant</h1>
+      <header class="topbar" id="topbar"></header>
+      <main class="main" id="main">
+        <section class="stage" id="stage" aria-label="Assistant">
+          <div class="vis"><canvas id="cv" aria-hidden="true"></canvas><div class="mic-off" id="micoff" aria-hidden="true"></div></div>
+          <div class="state-box"><p class="label state" id="state"></p></div>
+          <div class="captions" id="captions"></div>
+          <div class="below" id="below"></div>
+        </section>
+        <div class="dock" id="dock"></div>
+      </main>
+    </div>
+    <div id="chat-layer"></div>
+    <div id="sheet-layer"></div>
+    <div class="toasts" id="toasts" aria-live="polite"></div>
+  </div>
+</div>
+
+<script>
+"use strict";
+/* ---------- Icons (apps/web/src/components/ui/Icon.tsx) ---------- */
+const P = {
+  mic: '<rect x="7.25" y="2.75" width="5.5" height="9.5" rx="2.75"/><path d="M4.5 9.5a5.5 5.5 0 0 0 11 0M10 15v2.25"/>',
+  micOff: '<path d="M12.75 8.6V5.5a2.75 2.75 0 0 0-5.3-1.03M7.25 7.5v2a2.75 2.75 0 0 0 4.4 2.2M15.5 9.5a5.48 5.48 0 0 1-.7 2.7M4.5 9.5a5.5 5.5 0 0 0 8.6 4.54M10 15v2.25M3 3l14 14"/>',
+  stop: '<rect x="5.5" y="5.5" width="9" height="9" rx="1.5" fill="currentColor" stroke="none"/>',
+  chat: '<path d="M3.75 5.75a2 2 0 0 1 2-2h8.5a2 2 0 0 1 2 2v6a2 2 0 0 1-2 2H9.5l-3.25 2.75v-2.75h-.5a2 2 0 0 1-2-2z"/><path d="M7 8.25h6M7 10.75h3.5"/>',
+  newChat: '<path d="M3.75 5.75a2 2 0 0 1 2-2h8.5a2 2 0 0 1 2 2v6a2 2 0 0 1-2 2H9.5l-3.25 2.75v-2.75h-.5a2 2 0 0 1-2-2z"/><path d="M10 6.5v4.5M7.75 8.75h4.5"/>',
+  more: '<circle cx="5" cy="10" r="0.6" fill="currentColor"/><circle cx="10" cy="10" r="0.6" fill="currentColor"/><circle cx="15" cy="10" r="0.6" fill="currentColor"/>',
+  gear: '<circle cx="10" cy="10" r="2.5"/><path d="M8.58 4.48 8.69 2.51h2.62l.11 1.97a5.7 5.7 0 0 1 1.48.61l1.47-1.31 1.85 1.85-1.31 1.47a5.7 5.7 0 0 1 .61 1.48l1.97.11v2.62l-1.97.11a5.7 5.7 0 0 1-.61 1.48l1.31 1.47-1.85 1.85-1.47-1.31a5.7 5.7 0 0 1-1.48.61l-.11 1.97H8.69l-.11-1.97a5.7 5.7 0 0 1-1.48-.61l-1.47 1.31-1.85-1.85 1.31-1.47a5.7 5.7 0 0 1-.61-1.48l-1.97-.11V8.69l1.97-.11a5.7 5.7 0 0 1 .61-1.48L3.78 5.63l1.85-1.85L7.1 5.09a5.7 5.7 0 0 1 1.48-.61z"/>',
+  close: '<path d="M5.5 5.5l9 9M14.5 5.5l-9 9"/>',
+  keyboard: '<rect x="2.75" y="5.25" width="14.5" height="9.5" rx="1.5"/><path d="M5.75 8.25h.01M8.25 8.25h.01M10.75 8.25h.01M13.25 8.25h.01M6.5 11.5h7"/>',
+  chevron: '<path d="M7.5 5l5 5-5 5"/>',
+  chevronDown: '<path d="M5 7.5l5 5 5-5"/>',
+  check: '<path d="M4.5 10.5l3.5 3.5 7.5-8"/>',
+  send: '<path d="M10 16V4M5 9l5-5 5 5"/>',
+  arrowRight: '<path d="M4 10h12M11 5l5 5-5 5"/>',
+  wrench: '<path d="M12.5 3.25a3.75 3.75 0 0 0-3.4 5.33L3.75 13.9a1.5 1.5 0 0 0 2.12 2.12l5.33-5.33a3.75 3.75 0 0 0 5.03-4.35l-2.2 2.2-2.12-.53-.53-2.12 2.2-2.2a3.75 3.75 0 0 0-1.08-.44z"/>'
+};
+const ic = (n, s = 20, cls = "") => `<svg width="${s}" height="${s}" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"${cls ? ` class="${cls}"` : ""}>${P[n]}</svg>`;
+const esc = (t) => String(t).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const q = (p) => `“${p}”`;
+
+/* ---------- Sample data (mockup-spec.md) ---------- */
+const A = {
+  jeff: { name: "Jeff", purpose: "Everyday questions and the house.", follow: 8,
+    clauses: ["It’s eleven degrees in Utrecht,", "with light rain until about four.", "Take a coat if you go out."], liveTool: "current_weather",
+    sample: [
+      { you: "Is the back door locked?", tools: ["read_state"], reply: "Yes, the back door is locked. The garden light is still on." },
+      { you: "Turn it off.", tools: ["turn_off"], reply: "Done, the garden light is off." }
+    ], canned: "This is a mock-up, so there is no real reply." },
+  t3: { name: "T3", purpose: "Talks to my T3 Code instance: starts and checks coding work.", follow: 30,
+    clauses: ["Started a thread for the assistant menu", "in personal-voice-assistance.", "It is reading the voice page now,", "and I’ll tell you when it needs you."], liveTool: "start_thread",
+    sample: [
+      { you: "How is the voice sessions thread doing?", tools: ["read_thread"], reply: "It finished twelve minutes ago. The tests pass and it is waiting for your review." },
+      { you: "Tell it to merge when the checks are green.", typed: true, tools: ["send_message"], reply: "Sent. It will merge once the checks are green." }
+    ], canned: "This is a mock-up, so there is no real reply." },
+  keuken: { name: "Keuken", purpose: "Dutch kitchen helper: timers, recipes, shopping list.", follow: 0,
+    clauses: ["Goed, een timer van tien minuten", "voor de eieren.", "Ik zeg het als hij afloopt."], liveTool: "start_timer",
+    sample: [
+      { you: "Zet eieren op het boodschappenlijstje.", tools: ["add_item"], reply: "Eieren staan op je boodschappenlijstje." },
+      { you: "Hoe lang moet een zachtgekookt ei?", tools: [], reply: "Zes minuten in kokend water, daarna even koud afspoelen." }
+    ], canned: "Dit is een mock-up, dus er komt geen echt antwoord." }
+};
+/* Devices. `always` is the assistant that answers without a phrase (null: nobody; "auto": whichever fits, only where
+   admin set up the decision service, see `auto`). hear/woken pick sample moments. */
+const D = {
+  iphone: { name: "iPhone · Safari", hint: "follows Every browser",
+    list: [{ id: "jeff", phrases: [] }, { id: "t3", phrases: ["Hey T3", "Hey tee three"] }], always: "jeff",
+    hear: { turn: null, text: "What’s the weather like this afternoon" },
+    woken: { turn: "t3", text: "Hey T3, start a thread to add the assistant menu" } },
+  desk: { name: "Desk · Firefox", hint: "own value",
+    list: [{ id: "t3", phrases: [] }, { id: "jeff", phrases: ["Hey Jeff", "Hey Geoff"] }], always: "t3",
+    hear: { turn: null, text: "Is the voice sessions thread finished yet" },
+    woken: { turn: "jeff", text: "Hey Jeff, what’s the weather this afternoon" } },
+  kitchen: { name: "Kitchen iPad", hint: "own value, whichever fits",
+    list: [{ id: "jeff", phrases: ["Hey Jeff"] }, { id: "keuken", phrases: ["Hé keuken", "Hey keuken"] }], always: "auto",
+    auto: { fallback: "jeff", picks: "keuken" }, follow: "jeff",
+    hear: { turn: null, text: "Zet een timer op tien minuten" },
+    woken: { turn: "keuken", text: "Hé keuken, zet een timer op tien minuten" } },
+  study: { name: "Study · Chrome", hint: "made up",
+    list: [{ id: "jeff", phrases: ["Hey Jeff"] }, { id: "t3", phrases: ["Hey T3"] }, { id: "keuken", phrases: ["Hé keuken"] }], always: null,
+    follow: "jeff",
+    hear: { turn: "jeff", text: "Hey Jeff, is the back door locked" },
+    woken: { turn: "t3", text: "Hey T3, start a thread to add the assistant menu" } },
+  single: { name: "Guest laptop · Chrome", hint: "made up",
+    list: [{ id: "jeff", phrases: [] }], always: "jeff",
+    hear: { turn: null, text: "Turn on the hallway light" },
+    woken: { turn: null, text: "What’s the weather this afternoon" } }
+};
+
+/* Conversations per device and assistant (each assistant keeps its own, per device) */
+const conv = {};
+const convOf = (dev, id) => (conv[dev + ":" + id] ??= { turns: A[id].sample.map((t) => ({ ...t })), fresh: false });
+
+/* ---------- State ---------- */
+const S = {
+  preset: "listening", device: "iphone", state: "listening", turn: null, muted: false,
+  menu: false, more: false, sheet: false, chat: false, phone: false, picking: true,
+  clause: 0, words: 0, draft: "", sheetNote: false,
+  followUntil: 0, mockNote: "", mockNoteUntil: 0, chatView: null, convMenu: false
+};
+const dev = () => D[S.device];
+const multi = () => dev().list.length > 1;
+const canPick = () => multi() && S.picking;
+const entry = (id) => dev().list.find((e) => e.id === id);
+const nm = (id) => A[id].name;
+/** Who answers if you just speak now (null: nobody, the device sleeps). */
+const AUTO = "auto";
+const isAuto = () => dev().always === AUTO;
+const canAuto = () => !!dev().auto;
+const current = () => S.turn ?? (isAuto() ? null : dev().always);
+/** What the device falls back to after a turn, in words. */
+const fallbackWords = () => isAuto() ? "Auto picks again" : dev().always ? nm(dev().always) + " answers" : "asleep";
+/** The assistant the chat talks to: the one with the turn, else the no-phrase one, else the first (it hears for the device). */
+const answerId = () => current() ?? (isAuto() ? dev().auto.fallback : dev().list[0].id);
+/** The conversation shown in the chat: one picked in its header, else the one who answers. Reading it changes nobody's turn. */
+const chatId = () => (S.chatView && entry(S.chatView) ? S.chatView : answerId());
+const isDefault = (id) => id === dev().always;
+const phrased = () => dev().list.filter((e) => e.id !== dev().always && e.phrases.length > 0);
+
+function reachText(id) {
+  const e = entry(id);
+  let t;
+  if (isDefault(id)) t = "Answers without a phrase";
+  else if (e.phrases.length === 0) t = "No phrase on this device";
+  else t = "Say " + q(e.phrases[0]) + (e.phrases.length === 2 ? " or " + q(e.phrases[1]) : e.phrases.length > 2 ? " +" + (e.phrases.length - 1) : "");
+  if (isAuto() && id === dev().auto.fallback) t += " · answers if none fits";
+  if (S.turn === id && !isDefault(id) && S.state !== "notStarted") t += " · answering now";
+  return t;
+}
+function topName() {
+  const c = current();
+  if (c) return nm(c);
+  if (isAuto()) return "Auto";
+  const names = dev().list.map((e) => nm(e.id));
+  return names.length <= 2 ? names.join(" · ") : names.length + " assistants";
+}
+function stateText() {
+  if (S.state === "notStarted") return ["Not started", "faint"];
+  if (S.muted) return ["Mic off", "faint"];
+  const t = S.turn, suffix = t && !isDefault(t) ? " · " + nm(t) : "";
+  switch (S.state) {
+    case "listening": return [(t && !isDefault(t) ? "Listening…" : "Listening") + suffix, "you"];
+    case "hearing": return ["Hearing you" + suffix, "you"];
+    case "thinking": return ["Thinking" + suffix, "voice"];
+    case "speaking": return ["Speaking" + suffix, "voice"];
+    case "asleep": {
+      const ph = phrased();
+      if (ph.length === 0) return ["Waiting for the wake phrase", "muted"];
+      if (ph.length === 1) return ["Say " + q(ph[0].phrases[0]), "muted"];
+      if (ph.length === 2) return ["Say " + q(ph[0].phrases[0]) + " or " + q(ph[1].phrases[0]), "muted"];
+      return ["Say a wake phrase", "muted"];
+    }
+  }
+  return ["", "faint"];
+}
+const visual = () => S.state === "notStarted" ? "not-started" : S.muted ? "muted" : S.state;
+const started = () => S.state !== "notStarted";
+const speakingId = () => S.turn ?? answerId();
+
+/* ---------- Presets (the mock-up strip) ---------- */
+function presets() {
+  const d = dev();
+  const lname = d.always === AUTO ? "" : nm(d.always ?? d.follow ?? d.list[0].id);
+  return [
+    ["notStarted", "Not started"],
+    ["listening", d.always === AUTO ? "Listening (Auto: whichever fits)" : d.always ? `Listening (${lname} answers without a phrase)` : `Listening (follow-up after ${lname})`],
+    ["hearing", "Hearing you"],
+    ["woken", d.woken.turn ? `Woken as ${nm(d.woken.turn)}, speaking` : "Speaking"],
+    ["follow", "After a reply (follow-up)"],
+    ["asleep", d.always ? "Asleep (Study · Chrome)" : `Asleep (${phrased().length} phrases)`],
+    ["auto", "Auto: chose Keuken"],
+    ["menu", "Assistant menu open", !canPick()],
+    ["sheet", "Settings sheet"],
+    ["chat", "Chat"]
+  ];
+}
+function applyPreset(p) {
+  if (p === "asleep" && dev().always) { S.device = "study"; D.study.always = null; }
+  if (p === "auto" && !isAuto()) { S.device = "kitchen"; D.kitchen.always = AUTO; }
+  timers.forEach(clearTimeout); timers.length = 0;
+  if (p === "menu" && !canPick()) return;
+  const d = dev();
+  S.preset = p; S.menu = S.sheet = S.chat = S.more = false; S.muted = false; S.turn = null; S.clause = 0; S.words = 0;
+  S.followUntil = 0; S.mockNote = ""; S.chatView = null; S.convMenu = false; S.utter = d.woken.text;
+  const base = () => { if (d.always) { S.state = "listening"; } else { S.state = "listening"; S.turn = d.follow ?? d.list[0].id; S.followUntil = Date.now() + A[S.turn].follow * 1000; } };
+  switch (p) {
+    case "notStarted": S.state = "notStarted"; break;
+    // No phrase: Auto listens, hears the sentence, the decision service picks Keuken, Keuken thinks and speaks.
+    case "auto": S.state = "listening"; S.utter = d.hear.text;
+      later(1500, () => { S.state = "hearing"; S.words = 1; });
+      later(3700, () => { S.state = "thinking"; S.turn = d.auto.picks; });
+      later(5100, () => { S.state = "speaking"; S.clause = 0; });
+      break;
+    case "listening": base(); break;
+    case "hearing": S.state = "hearing"; S.turn = d.hear.turn; break;
+    case "woken": S.state = "speaking"; S.turn = d.woken.turn; break;
+    // The last beat of the woken reply: the follow-up (or its absence) comes next.
+    case "follow": S.state = "speaking"; S.turn = d.woken.turn; S.clause = A[speakingId()].clauses.length; break;
+    case "asleep": S.state = d.always ? "listening" : "asleep"; break;
+    case "menu": S.state = d.always ? "listening" : "asleep"; S.menu = true; break;
+    case "sheet": S.state = d.always ? "listening" : "asleep"; S.sheet = true; break;
+    case "chat": S.state = "speaking"; S.turn = d.woken.turn; S.chat = true; break;
+  }
+  render(p === "menu" ? firstMenuItem() : p === "sheet" ? "sheet-close" : null);
+}
+const timers = [];
+const later = (ms, fn) => timers.push(setTimeout(() => { fn(); render(); }, ms));
+/** Make `id` the assistant that answers without a phrase on this device (null: nobody; "auto": whichever fits). */
+function choose(id) {
+  dev().always = id;
+  S.turn = null; S.followUntil = 0; timers.forEach(clearTimeout); timers.length = 0;
+  if (started()) { S.state = id ? "listening" : "asleep"; S.clause = 0; }
+  S.preset = "";
+}
+
+/* ---------- Rendering ---------- */
+const $ = (id) => document.getElementById(id);
+
+function renderStrip() {
+  $("mock-states").innerHTML = '<span class="mock-name">State</span>' + presets().map(([id, label, dis]) =>
+    `<button class="opt" type="button" data-preset="${id}" aria-pressed="${S.preset === id}"${dis ? ' disabled title="Needs a device with several assistants and picking allowed"' : ""}>${esc(label)}</button>`).join("");
+  renderMockNote();
+  $("mock-device").innerHTML = Object.entries(D).map(([k, d]) => `<option value="${k}"${k === S.device ? " selected" : ""}>${esc(d.name)} (${d.list.length === 1 ? "1 assistant" : d.list.length + " assistants"}, ${esc(d.hint)})</option>`).join("");
+  $("mock-picking").checked = S.picking;
+  $("mock-desktop").setAttribute("aria-pressed", String(!S.phone));
+  $("mock-phone").setAttribute("aria-pressed", String(S.phone));
+}
+
+/** The strip says what the follow-up is doing, since the page itself shows no countdown. */
+function renderMockNote() {
+  const el = $("mock-follow");
+  let t = "";
+  if (S.followUntil && S.state === "listening" && S.turn) {
+    const left = Math.max(0, Math.ceil((S.followUntil - Date.now()) / 1000));
+    t = `Follow-up: ${nm(S.turn)} keeps listening ${A[S.turn].follow} s (${left} s left), then ${fallbackWords()}.`;
+  } else if (S.mockNote && Date.now() < S.mockNoteUntil) t = S.mockNote;
+  el.textContent = t;
+  el.hidden = t === "";
+}
+
+function renderTopbar() {
+  const tb = $("topbar");
+  tb.classList.toggle("has-end", started());
+  let who;
+  if (canPick()) {
+    who = `<button type="button" class="who-btn" id="who-btn" aria-haspopup="menu" aria-expanded="${S.menu}" aria-controls="who-menu" title="Who answers on this device">
+      <span class="label">${esc(topName())}</span>${ic("chevronDown", 12)}</button>`;
+    if (S.menu) {
+      const items = dev().list.map((e, i) => `
+        <button type="button" role="menuitemradio" class="mi" id="mi-${i}" data-choose="${e.id}" aria-checked="${isDefault(e.id)}" tabindex="-1">
+          <span class="mi-check">${isDefault(e.id) ? ic("check", 16) : ""}</span>
+          <span><span class="mi-name">${esc(nm(e.id))}</span><span class="mi-reach">${esc(reachText(e.id))}</span></span>
+        </button>`).join("");
+      const n = dev().list.length + (canAuto() ? 1 : 0);
+      who += `<div class="menu" id="who-menu" role="menu" aria-label="Assistants on this device">${items}
+        <div class="mi-sep" role="separator"></div>
+        ${canAuto() ? `<button type="button" role="menuitemradio" class="mi" id="mi-${n - 1}" data-choose="auto" aria-checked="${isAuto()}" tabindex="-1">
+          <span class="mi-check">${isAuto() ? ic("check", 16) : ""}</span>
+          <span><span class="mi-name">Whichever fits</span><span class="mi-reach">Each thing you say goes to the assistant it suits.</span></span>
+        </button>` : ""}
+        <button type="button" role="menuitemradio" class="mi" id="mi-${n}" data-choose="" aria-checked="${dev().always === null}" tabindex="-1">
+          <span class="mi-check">${dev().always === null ? ic("check", 16) : ""}</span>
+          <span><span class="mi-name">Nobody</span><span class="mi-reach">Sleeps until it hears a phrase</span></span>
+        </button>
+        <p class="mi-note">This decides who answers without a phrase on this device.</p>
+      </div>`;
+    }
+  } else {
+    who = `<span class="label who-plain">${esc(multi() ? topName() : nm(dev().list[0].id))}</span>`;
+  }
+  tb.innerHTML = `
+    <div class="tb-left"><span class="tdot${started() ? " ok" : ""}" aria-hidden="true"></span>${who}</div>
+    ${started() ? `<button type="button" class="label end-btn" id="end-btn" title="Release the microphone and speaker"><i aria-hidden="true"></i>End session</button>` : ""}
+    <div class="tb-right"><button type="button" class="icon-btn" id="gear" title="Settings (S)" aria-label="Settings (S)" aria-haspopup="dialog" aria-expanded="${S.sheet}">${ic("gear")}</button></div>`;
+}
+
+function renderStage() {
+  const [text, tone] = stateText();
+  const st = $("state");
+  st.textContent = text;
+  st.className = "label state tone-" + tone;
+  $("frame").classList.toggle("is-muted", S.muted && started());
+  $("micoff").innerHTML = ic("micOff", 22);
+  renderCaptions();
+  const phone = S.phone;
+  let below = "";
+  if (S.state === "notStarted") {
+    below = `<button type="button" class="start-pill" id="start">${ic("mic", 18)}<span class="label">Start talking</span></button>
+      <details class="privacy"><summary>Only text goes to the language model ${ic("chevron", 12)}</summary>
+      <p>Uses your microphone. The assistant turns your speech into text, on its own machine or with a speech service chosen in admin.</p></details>
+      <button type="button" class="type-instead" id="type-instead">or type instead</button>`;
+  } else if (S.muted) {
+    below = `<p class="hint">${phone ? "Tap the microphone to unmute." : "Press <kbd>M</kbd> or the microphone to unmute."}</p>`;
+  } else if (S.state === "asleep") {
+    if (phrased().length > 2) below = `<p class="hint">${canPick() ? "Each assistant wakes on its own phrase: the menu at the top left lists them." : esc(phrased().map((e) => q(e.phrases[0])).join(", ").replace(/, ([^,]*)$/, " or $1")) + ", then ask."}</p>`;
+  } else if (S.state === "listening" && !S.turn || S.state === "speaking" || S.state === "thinking") {
+    below = `<p class="hint">Speak any time. ${phone ? "Tap the microphone to mute, the square to stop a reply." : "<kbd>M</kbd> mutes, <kbd>Esc</kbd> stops a reply."}</p>`;
+  }
+  $("below").innerHTML = below;
+}
+
+function renderCaptions() {
+  let html = "";
+  if (S.state === "hearing" && !S.muted) {
+    const words = dev().hear.text.split(" ");
+    html = `<p><span class="cap-you">${esc(words.slice(0, Math.max(1, S.words)).join(" "))}</span></p>`;
+  } else if (S.state === "speaking" && !S.muted) {
+    const c = A[speakingId()].clauses;
+    const i = Math.min(S.clause, c.length - 1);
+    html = `<p><span class="cap-main">${esc(c[i])}</span>${c[i + 1] ? ` <span class="cap-next">${esc(c[i + 1])}</span>` : ""}</p>`;
+  }
+  $("captions").innerHTML = html;
+  $("captions").hidden = !started();
+}
+
+function renderDock() {
+  const canStop = S.state === "speaking" || S.state === "thinking";
+  let html = "";
+  if (started()) {
+    html += `<button type="button" class="round${S.muted ? " muted" : ""}" id="mic" aria-label="Microphone (M)" aria-pressed="${!S.muted}" title="${S.muted ? "Unmute (M)" : "Mute (M)"}">
+      ${S.muted ? "" : '<span class="mic-ring" id="mic-ring" aria-hidden="true"></span>'}${ic(S.muted ? "micOff" : "mic")}</button>
+      <button type="button" class="round ${canStop ? "stop-on" : "stop-off"}" id="stop" aria-label="Stop the reply (Esc)" title="Stop (Esc)"${canStop ? "" : ' aria-disabled="true"'}>${ic("stop")}</button>`;
+  }
+  html += `<button type="button" class="round${S.chat ? " pressed" : ""}" id="chat-btn" aria-label="Conversation (C)" aria-pressed="${S.chat}" aria-haspopup="dialog" title="Conversation (C)">${ic("chat")}</button>`;
+  if (started()) {
+    html += `<div class="more-wrap"><button type="button" class="round${S.more ? " pressed" : ""}" id="more-btn" aria-label="More" aria-haspopup="menu" aria-expanded="${S.more}" title="More">${ic("more")}</button>
+      ${S.more ? `<div class="dock-menu" role="menu" aria-label="More"><button type="button" role="menuitem" id="more-new">${ic("newChat", 18)}New conversation with ${esc(nm(chatId()))}</button></div>` : ""}</div>`;
+  }
+  $("dock").innerHTML = `<div class="dock-row" role="toolbar" aria-label="Controls">${html}</div>`;
+}
+
+function messagesHtml() {
+  const id = chatId(), c = convOf(S.device, id), others = dev().list.filter((e) => e.id !== id).map((e) => nm(e.id));
+  let h = "";
+  if (c.fresh) h += `<p class="divider">New conversation</p>`;
+  const live = S.state === "speaking" && speakingId() === id && !c.fresh ? { you: S.utter || dev().woken.text, tools: [A[id].liveTool], clauses: A[id].clauses } : null;
+  if (c.turns.length === 0 && !live) h += `<p class="empty-chat">Nothing said yet. Talk, or type below.</p>`;
+  const msg = (t) => `<li class="turn">
+      ${t.you ? `<div class="msg you"><div class="label who">You${t.typed ? ic("keyboard", 13) : ""}</div><p>${esc(t.you)}</p></div>` : ""}
+      ${t.reply || t.clauses ? `<div class="msg voice"><div class="label who">${esc(nm(id))}</div>
+        ${t.tools && t.tools.length ? `<div class="tools">${t.tools.map((x) => `<span class="toolchip">${ic("check", 12)}${esc(x)}</span>`).join("")}</div>` : ""}
+        <p>${t.clauses ? t.clauses.map((x, i) => `<span class="${i <= S.clause ? "played" : "unplayed"}">${i ? " " : ""}${esc(x)}</span>`).join("") : esc(t.reply)}</p></div>` : ""}
+    </li>`;
+  h += `<ol class="turns">${c.turns.map(msg).join("")}${live ? msg(live) : ""}</ol>`;
+  return h;
+}
+function renderMessages() {
+  const m = $("msgs");
+  if (!m) return;
+  m.innerHTML = messagesHtml();
+  const id = chatId(), note = $("conv-note");
+  if (note) note.textContent = id === answerId() || !started()
+    ? "Each assistant keeps its own conversation on this device."
+    : `Typed messages go to ${nm(id)}. Speaking still reaches ${current() ? nm(current()) : isAuto() ? "whichever fits" : "the one you wake"}.`;
+  m.scrollTop = m.scrollHeight;
+}
+function renderChat() {
+  const layer = $("chat-layer");
+  $("main").classList.toggle("chat-open", S.chat);
+  if (!S.chat) { layer.innerHTML = ""; return; }
+  const id = chatId();
+  let title = `<h2 class="label" id="chat-title">Conversation</h2>`;
+  if (multi()) {
+    title = `<div class="conv-wrap"><h2 class="sr-only" id="chat-title">Conversation with ${esc(nm(id))}</h2>
+      <button type="button" class="conv-btn" id="conv-btn" aria-haspopup="menu" aria-expanded="${S.convMenu}" aria-controls="conv-menu" title="Read another assistant's conversation">
+        <span class="label">Conversation with ${esc(nm(id))}</span>${ic("chevronDown", 12)}</button>
+      ${S.convMenu ? `<div class="menu conv-menu" id="conv-menu" role="menu" aria-label="Conversations on this device">
+        ${dev().list.map((e, i) => `<button type="button" role="menuitemradio" class="mi" id="ci-${i}" data-view="${e.id}" aria-checked="${e.id === id}" tabindex="-1">
+          <span class="mi-check">${e.id === id ? ic("check", 16) : ""}</span>
+          <span><span class="mi-name">${esc(nm(e.id))}</span><span class="mi-reach">${e.id === answerId() && started() ? "Answers when you speak" : esc(convOf(S.device, e.id).turns.length + (convOf(S.device, e.id).turns.length === 1 ? " exchange" : " exchanges"))}</span></span>
+        </button>`).join("")}
+        <p class="mi-note">Reading a conversation does not change who answers.</p></div>` : ""}</div>`;
+  }
+  layer.innerHTML = `<div class="scrim chat-scrim" id="chat-scrim" aria-hidden="true"></div>
+    <aside class="chat" id="chat" role="dialog" aria-labelledby="chat-title">
+      <div class="grab" aria-hidden="true"></div>
+      <div class="panel-head">${title}
+        <div class="acts">
+          <button type="button" class="icon-btn" id="chat-new" aria-label="${esc(newConvTip())}" title="${esc(newConvTip())}">${ic("newChat")}</button>
+          <button type="button" class="icon-btn" id="chat-close" aria-label="Close conversation">${ic("close")}</button>
+        </div></div>
+      <div class="msgs-wrap">${multi() ? '<p class="conv-note" id="conv-note"></p>' : ""}<div class="msgs scrollbar-quiet" id="msgs"></div></div>
+      <div class="composer">
+        <div class="comp-box"><label for="chat-input" class="sr-only">Message to ${esc(nm(chatId()))}</label>
+          <textarea id="chat-input" rows="1" placeholder="${multi() ? "Type a message to " + esc(nm(chatId())) : "Type a message"}">${esc(S.draft)}</textarea>
+          <button type="button" class="send" id="send" aria-label="Send"${S.draft.trim() ? "" : " disabled"}>${ic("send", 18)}</button></div>
+        <p class="comp-hint">Enter to send · Shift+Enter for a new line</p>
+      </div>
+    </aside>`;
+  renderMessages();
+}
+
+function renderSheet() {
+  const layer = $("sheet-layer");
+  $("behind").inert = S.sheet;
+  $("chat-layer").inert = S.sheet;
+  if (!S.sheet) { layer.innerHTML = ""; return; }
+  const d = dev();
+  let assistant;
+  if (canPick()) {
+    const row = (id, title, desc, reach, checked) => `
+      <label class="choice${checked ? " on" : ""}" for="as-${id || "none"}">
+        <input type="radio" name="sheet-assistant" id="as-${id || "none"}" value="${id}"${checked ? " checked" : ""}>
+        <span class="c-text"><span class="c-title">${esc(title)}</span>${desc ? `<span class="c-desc">${esc(desc)}</span>` : ""}<span class="c-reach">${esc(reach)}</span></span>
+      </label>`;
+    assistant = `<div class="choices" role="radiogroup" aria-labelledby="sh-assistant">
+        ${d.list.map((e) => row(e.id, nm(e.id), A[e.id].purpose, reachText(e.id), isDefault(e.id))).join("")}
+        ${canAuto() ? row(AUTO, "Whichever fits", "", "Each thing you say goes to the assistant it suits.", isAuto()) : ""}
+        ${row("", "Nobody", "", "Sleeps until it hears a phrase", d.always === null)}
+      </div>
+      <p class="${S.sheetNote ? "ok-note" : "sr-only"}" aria-live="polite">${S.sheetNote ? ic("check", 14) + "Used from the next thing you say." : ""}</p>
+      <p class="note12">This decides who answers without a phrase on this device (${esc(d.name)}), for everyone who uses it.</p>
+      <p class="note12">Phrases and follow-up are changed in <a class="alink" href="#admin">admin</a>.</p>`;
+  } else {
+    assistant = `<div class="choices">${d.list.map((e) => `<div class="choice static"><span class="c-text"><span class="c-title">${esc(nm(e.id))}</span><span class="c-desc">${esc(A[e.id].purpose)}</span><span class="c-reach">${esc(reachText(e.id))}</span></span></div>`).join("")}</div>
+      <p class="note12">${multi() ? "Who answers, phrases and follow-up are" : "Phrases and follow-up are"} changed in <a class="alink" href="#admin">admin</a>.</p>`;
+  }
+  layer.innerHTML = `<div class="scrim" id="sheet-scrim" aria-hidden="true"></div>
+    <aside class="sheet" id="sheet" role="dialog" aria-modal="true" aria-labelledby="sheet-title">
+      <div class="grab" aria-hidden="true"></div>
+      <div class="panel-head"><h2 class="label" id="sheet-title">Settings</h2>
+        <div class="acts"><button type="button" class="icon-btn" id="sheet-close" aria-label="Close settings">${ic("close")}</button></div></div>
+      <div class="sheet-body scrollbar-quiet">
+        <section class="sec" aria-labelledby="sh-assistant"><h3 class="label" id="sh-assistant">Assistant</h3>${assistant}</section>
+        <section class="sec" aria-labelledby="sh-mic"><h3 class="label" id="sh-mic">Microphone</h3>
+          <select class="input" id="sheet-mic" aria-labelledby="sh-mic"><option>Default</option><option>MacBook Pro Microphone</option></select></section>
+        <section class="sec" aria-labelledby="sh-speaker"><h3 class="label" id="sh-speaker">Speaker</h3>
+          <select class="input" id="sheet-speaker" aria-labelledby="sh-speaker"><option>Default</option><option>MacBook Pro Speakers</option></select></section>
+        <details class="more"><summary class="label" id="sheet-more">${ic("chevron", 14)}More</summary>
+          <div class="more-body">
+            <div class="field"><p style="margin:0;font-size:14px;font-weight:500">Echo test</p>
+              <p class="p13">Plays a short sound and listens for it. If this device removes its own echo, it can be set (in admin, under Interrupting) to stop a reply as soon as you talk.</p>
+              <div><button type="button" class="btn">Test echo</button></div></div>
+            <div class="field"><p style="margin:0;font-size:14px;font-weight:500">Help</p>
+              <p class="p13">Keyboard shortcuts (and switching them off), and an audio report for when playback stutters.</p>
+              <div><button type="button" class="btn">Keyboard and audio report</button></div></div>
+          </div></details>
+        <a class="admin-row" href="#admin">${ic("wrench", 18)}<span class="t"><span>Admin</span><span>Everything else: models, voices, phrases, devices. Needs the admin password.</span></span>${ic("arrowRight", 16)}</a>
+      </div>
+    </aside>`;
+}
+
+function render(focusId) {
+  const keep = focusId ?? (document.activeElement && document.activeElement.id) ?? null;
+  renderStrip(); renderTopbar(); renderStage(); renderDock(); renderChat(); renderSheet();
+  document.body.classList.toggle("phone", S.phone);
+  document.body.classList.toggle("desktop", !S.phone);
+  fit();
+  if (keep) { const el = $(keep); if (el) el.focus({ preventScroll: true }); }
+}
+
+function toast(text) {
+  const t = document.createElement("div");
+  t.className = "toast";
+  t.innerHTML = `<span class="d" aria-hidden="true"></span><span>${esc(text)}</span>`;
+  $("toasts").appendChild(t);
+  setTimeout(() => t.remove(), 6000);
+}
+
+function newConvTip() {
+  const id = chatId(), others = dev().list.filter((e) => e.id !== id).map((e) => nm(e.id));
+  return multi() ? `New conversation with ${nm(id)} (${others.join(" and ")} ${others.length > 1 ? "keep theirs" : "keeps its own"})` : "New conversation";
+}
+function newConversation() {
+  const id = chatId(), c = convOf(S.device, id);
+  c.turns = []; c.fresh = true;
+  if (multi()) toast(`New conversation with ${nm(id)}. ${dev().list.filter((e) => e.id !== id).map((e) => nm(e.id)).join(" and ")} ${dev().list.length > 2 ? "keep their" : "keeps its"} own.`);
+  else toast("New conversation.");
+}
+
+/* ---------- Phone frame scaling ---------- */
+function fit() {
+  const f = $("frame");
+  if (!S.phone) { f.style.transform = ""; return; }
+  const v = $("viewport").getBoundingClientRect();
+  const s = Math.min(1, (v.height - 24) / 844, (v.width - 24) / 390);
+  f.style.transform = `scale(${s})`;
+}
+window.addEventListener("resize", fit);
+
+/* ---------- Events ---------- */
+document.addEventListener("click", (e) => {
+  const t = e.target.closest("button, [data-preset], label, a, #chat-scrim, #sheet-scrim");
+  // Clicking outside the assistant menu closes it.
+  if (S.menu && !e.target.closest("#who-menu") && !e.target.closest("#who-btn")) { S.menu = false; S.preset = ""; render(); }
+  if (S.more && !e.target.closest(".more-wrap")) { S.more = false; renderDock(); }
+  if (S.convMenu && !e.target.closest("#conv-menu") && !e.target.closest("#conv-btn")) { S.convMenu = false; renderChat(); }
+  if (!t) return;
+  if (t.dataset.preset) return applyPreset(t.dataset.preset);
+  if (t.matches("a[href='#admin']")) { e.preventDefault(); toast("Admin opens in its own page (not part of this mock-up)."); return; }
+  switch (t.id) {
+    case "who-btn": S.menu = !S.menu; S.preset = S.menu ? "menu" : ""; render(S.menu ? firstMenuItem() : "who-btn"); return;
+    case "gear": S.sheet = !S.sheet; S.menu = false; S.sheetNote = false; S.preset = S.sheet ? "sheet" : ""; render(S.sheet ? "sheet-close" : "gear"); return;
+    case "sheet-close": case "sheet-scrim": S.sheet = false; S.preset = ""; render("gear"); return;
+    case "chat-btn": S.chat = !S.chat; S.more = false; S.chatView = null; S.convMenu = false; render(S.chat ? "chat-input" : "chat-btn"); return;
+    case "type-instead": S.chat = true; render("chat-input"); return;
+    case "chat-close": case "chat-scrim": S.chat = false; S.chatView = null; S.convMenu = false; render("chat-btn"); return;
+    case "chat-new": newConversation(); renderChat(); $("chat-new").focus(); return;
+    case "conv-btn": S.convMenu = !S.convMenu; renderChat(); focusConvMenu(); return;
+    case "more-btn": S.more = !S.more; renderDock(); if (S.more) $("more-new").focus(); return;
+    case "more-new": S.more = false; newConversation(); render("more-btn"); return;
+    case "start": S.state = dev().always ? "listening" : "asleep"; S.turn = null; S.preset = ""; render("mic"); return;
+    case "end-btn": timers.forEach(clearTimeout); timers.length = 0; S.state = "notStarted"; S.turn = null; S.muted = false; S.preset = "notStarted"; render("start"); return;
+    case "mic": S.muted = !S.muted; S.preset = ""; render("mic"); return;
+    case "stop": if (S.state === "speaking" || S.state === "thinking") { timers.forEach(clearTimeout); timers.length = 0; stopReply(); } return;
+    case "send": send(); return;
+    case "mock-desktop": S.phone = false; render(); return;
+    case "mock-phone": S.phone = true; render(); return;
+    case "mock-hide": document.body.classList.add("mock-hidden"); fit(); $("mock-show").focus(); return;
+    case "mock-show": document.body.classList.remove("mock-hidden"); fit(); $("mock-hide").focus(); return;
+  }
+  if (t.dataset.view) { S.chatView = t.dataset.view; S.convMenu = false; renderChat(); $("conv-btn").focus(); return; }
+  if (t.dataset.choose !== undefined) {
+    const id = t.dataset.choose || null;
+    choose(id); S.menu = false;
+    render("who-btn");
+  }
+});
+function focusConvMenu() {
+  if (!S.convMenu) { $("conv-btn").focus(); return; }
+  const i = dev().list.findIndex((e) => e.id === chatId());
+  $("ci-" + Math.max(0, i)).focus();
+}
+/** After a reply: the woken assistant keeps the turn for its own follow-up time, then the device falls back. */
+function afterReply(record) {
+  const id = speakingId(), d = dev();
+  if (record) {
+    const c = convOf(S.device, id), reply = A[id].clauses.join(" "), last = c.turns[c.turns.length - 1];
+    const said = S.utter || d.woken.text;
+    if (!last || last.you !== said || last.reply !== reply) c.turns.push({ you: said, tools: [A[id].liveTool], reply });
+  }
+  S.clause = 0;
+  if (S.turn && !isDefault(S.turn) && A[S.turn].follow > 0) {
+    S.state = "listening"; S.followUntil = Date.now() + A[S.turn].follow * 1000;
+  } else {
+    if (S.turn && !isDefault(S.turn)) { S.mockNote = `${nm(S.turn)} has no follow-up: one answer, then ${fallbackWords()}.`; S.mockNoteUntil = Date.now() + 8000; }
+    S.turn = null; S.followUntil = 0; S.state = d.always ? "listening" : "asleep";
+  }
+  render();
+}
+function stopReply() { S.preset = ""; afterReply(false); if ($("stop")) $("stop").focus(); }
+document.addEventListener("change", (e) => {
+  const t = e.target;
+  if (t.name === "sheet-assistant") { choose(t.value || null); S.sheetNote = true; render(t.id); return; }
+  if (t.id === "mock-device") {
+    S.device = t.value; S.menu = false;
+    let p = S.preset || "listening";
+    if ((p === "asleep" && dev().always) || (p === "menu" && !canPick()) || (p === "auto" && !canAuto())) p = "listening";
+    applyPreset(p); return;
+  }
+  if (t.id === "mock-picking") { S.picking = t.checked; if (!S.picking) S.menu = false; render(); return; }
+});
+document.addEventListener("input", (e) => {
+  if (e.target.id === "chat-input") {
+    S.draft = e.target.value;
+    $("send").disabled = !S.draft.trim();
+    e.target.style.height = "auto";
+    e.target.style.height = Math.min(e.target.scrollHeight, 148) + "px";
+  }
+});
+function send() {
+  const text = S.draft.trim();
+  if (!text) return;
+  const id = chatId(), c = convOf(S.device, id);
+  const turn = { you: text, typed: true };
+  c.turns.push(turn);
+  S.draft = "";
+  renderChat(); $("chat-input").focus();
+  // Answer this turn, not the latest one; a new conversation in the meantime drops the reply.
+  setTimeout(() => { if (!c.turns.includes(turn)) return; turn.reply = A[id].canned; renderMessages(); }, 700);
+}
+function firstMenuItem() {
+  const i = dev().list.findIndex((e) => isDefault(e.id)), n = dev().list.length;
+  return "mi-" + (i >= 0 ? i : isAuto() ? n : n + (canAuto() ? 1 : 0));
+}
+
+document.addEventListener("keydown", (e) => {
+  const inField = e.target.closest && e.target.closest("input, textarea, select");
+  if (e.target.id === "chat-input" && e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); return; }
+  // Menu keyboard: arrows move, Home/End jump, Tab closes.
+  if (S.convMenu && e.target.closest("#conv-menu")) {
+    const items = [...document.querySelectorAll("#conv-menu .mi")], i = items.indexOf(e.target);
+    if (e.key === "ArrowDown") { e.preventDefault(); items[(i + 1) % items.length].focus(); return; }
+    if (e.key === "ArrowUp") { e.preventDefault(); items[(i - 1 + items.length) % items.length].focus(); return; }
+    if (e.key === "Tab" || e.key === "Escape") { e.preventDefault(); S.convMenu = false; renderChat(); $("conv-btn").focus(); return; }
+  }
+  if (e.target.id === "conv-btn" && (e.key === "ArrowDown" || e.key === "ArrowUp") && !S.convMenu) { e.preventDefault(); S.convMenu = true; renderChat(); focusConvMenu(); return; }
+  if (S.menu && e.target.closest("#who-menu")) {
+    const items = [...document.querySelectorAll("#who-menu .mi")], i = items.indexOf(e.target);
+    if (e.key === "ArrowDown") { e.preventDefault(); items[(i + 1) % items.length].focus(); return; }
+    if (e.key === "ArrowUp") { e.preventDefault(); items[(i - 1 + items.length) % items.length].focus(); return; }
+    if (e.key === "Home") { e.preventDefault(); items[0].focus(); return; }
+    if (e.key === "End") { e.preventDefault(); items[items.length - 1].focus(); return; }
+    if (e.key === "Tab") { S.menu = false; S.preset = ""; render("who-btn"); return; }
+  }
+  if (e.target.id === "who-btn" && (e.key === "ArrowDown" || e.key === "ArrowUp") && !S.menu) { e.preventDefault(); S.menu = true; S.preset = "menu"; render(firstMenuItem()); return; }
+  if (e.key === "Escape") {
+    if (S.menu) { e.preventDefault(); S.menu = false; S.preset = ""; render("who-btn"); return; }
+    if (S.more) { e.preventDefault(); S.more = false; renderDock(); $("more-btn").focus(); return; }
+    if (S.sheet) { e.preventDefault(); S.sheet = false; S.preset = ""; render("gear"); return; }
+    if (S.chat && (e.target.closest("#chat") || S.phone)) { e.preventDefault(); S.chat = false; S.chatView = null; render("chat-btn"); return; }
+    if (S.state === "speaking" && !inField) { e.preventDefault(); stopReply(); return; }
+    return;
+  }
+  // Focus stays inside the settings sheet (modal).
+  if (S.sheet && e.key === "Tab" && $("frame").contains(document.activeElement)) {
+    const f = [...$("sheet").querySelectorAll('button, select, input, a[href], summary')].filter((x) => x.offsetParent !== null);
+    const first = f[0], last = f[f.length - 1];
+    if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+    else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+    return;
+  }
+  if (inField || e.metaKey || e.ctrlKey || e.altKey || e.target.closest(".mock")) return;
+  const k = e.key.toLowerCase();
+  if (k === "s") { e.preventDefault(); S.sheet = !S.sheet; S.menu = false; S.sheetNote = false; render(S.sheet ? "sheet-close" : "gear"); }
+  else if (k === "c") { e.preventDefault(); S.chat = !S.chat; S.chatView = null; S.convMenu = false; render(S.chat ? "chat-input" : "chat-btn"); }
+  else if (k === "m" && started()) { e.preventDefault(); S.muted = !S.muted; S.preset = ""; render(); }
+});
+
+/* ---------- Captions progressing ---------- */
+setInterval(() => {
+  if (S.state === "speaking" && !S.muted) {
+    const n = A[speakingId()].clauses.length;
+    S.clause += 1;                          // clause n is one held beat on the last clause
+    if (S.clause > n) { afterReply(true); return; }
+    renderCaptions();
+    if (S.chat) renderMessages();
+  }
+}, 1700);
+setInterval(() => {
+  if (S.followUntil && S.state === "listening" && S.turn && Date.now() >= S.followUntil) {
+    S.turn = null; S.followUntil = 0; S.state = dev().always ? "listening" : "asleep"; render();
+  }
+  renderMockNote();
+}, 250);
+setInterval(() => {
+  if (S.state === "hearing" && !S.muted) {
+    const n = dev().hear.text.split(" ").length;
+    S.words = S.words >= n + 4 ? 1 : S.words + 1;
+    renderCaptions();
+  }
+}, 320);
+
+/* ---------- The luminous line (port of apps/web/src/lib/visualiser.ts, with stand-in levels) ---------- */
+const STATE_PARAMS = {
+  "not-started": { color: "ink-faint", alpha: 0.4, aMin: 0, omega: [0, 0, 0], weights: [1, 0.5, 0.3] },
+  speaking: { color: "voice", alpha: 1, aMin: 3, omega: [2.0, 2.8, 3.9], weights: "bands", glow: { blur: 12, alpha: 0.4 } },
+  thinking: { color: "voice", alpha: 0.7, aMin: 4, omega: [1.2, 1.6, 2.1], weights: [1, 0.5, 0.3], sweep: true },
+  muted: { color: "ink-faint", alpha: 1, aMin: 0, omega: [0, 0, 0], weights: [1, 0.5, 0.3], gap: true },
+  hearing: { color: "you", alpha: 1, aMin: 3, omega: [2.4, 3.1, 4.2], weights: [1, 0.7, 0.5], glow: { blur: 8, alpha: 0.35 } },
+  listening: { color: "you", alpha: 0.85, aMin: 2, omega: [0.6, 0.9, 1.3], weights: [1, 0.6, 0.35], breathe: true },
+  asleep: { color: "you", alpha: 0.42, aMin: 1.5, omega: [0.25, 0.35, 0.45], weights: [1, 0.5, 0.3], breathe: true }
+};
+(function visualiser() {
+  const canvas = $("cv"), g = canvas.getContext("2d");
+  const probeC = document.createElement("canvas"); probeC.width = probeC.height = 1;
+  const probe = probeC.getContext("2d", { willReadFrequently: true });
+  const colors = { "ink-faint": [128, 128, 120], voice: [230, 180, 90], you: [120, 220, 200] };
+  const readColors = () => {
+    const cs = getComputedStyle(document.documentElement);
+    for (const k of Object.keys(colors)) {
+      const v = cs.getPropertyValue("--color-" + k).trim();
+      if (!v) continue;
+      probe.clearRect(0, 0, 1, 1); probe.fillStyle = "#000"; probe.fillStyle = v; probe.fillRect(0, 0, 1, 1);
+      const d = probe.getImageData(0, 0, 1, 1).data; colors[k] = [d[0], d[1], d[2]];
+    }
+  };
+  readColors();
+  matchMedia("(prefers-color-scheme: light)").addEventListener("change", readColors);
+  const motion = matchMedia("(prefers-reduced-motion: reduce)");
+  const K = [1.5, 2.5, 4.0], PHI = [0, 2.1, 4.2], STROKE = [2, 1.5, 1], OPACITY = [1, 0.45, 0.25], BAND_BASE = [0.5, 0.3, 0.2];
+  const clamp01 = (x) => (x < 0 ? 0 : x > 1 ? 1 : x);
+  const noise = (t) => 0.5 * Math.sin(1.7 * t) + 0.3 * Math.sin(2.9 * t + 1.3) + 0.2 * Math.sin(5.3 * t + 0.4);
+  let W = 1, H = 1, dpr = 1;
+  const resize = () => { dpr = Math.min(3, devicePixelRatio || 1); W = Math.max(1, canvas.offsetWidth); H = Math.max(1, canvas.offsetHeight); canvas.width = Math.round(W * dpr); canvas.height = Math.round(H * dpr); };
+  resize(); new ResizeObserver(resize).observe(canvas);
+  let level = 0; const theta = [0, 0, 0], omega = [0, 0, 0], weights = [1, 0.5, 0.3], bands = [1 / 3, 1 / 3, 1 / 3];
+  let rgb = [...colors["ink-faint"]], alpha = 0.4, fromRgb = rgb, fromAlpha = alpha, toKey = "ink-faint", toAlpha = 0.4, fadeStart = -1, shown = "not-started";
+  let last = performance.now();
+  const target = (st, t) => {
+    switch (st) {
+      case "speaking": return clamp01(0.42 + 0.3 * noise(t * 1.4) + 0.1 * Math.sin(t * 7.1));
+      case "hearing": return clamp01(0.4 + 0.28 * noise(t * 1.6) + 0.08 * Math.sin(t * 9.3));
+      case "listening": return clamp01(0.12 + 0.08 * noise(t * 0.7));
+      case "thinking": return 0.08;
+      default: return 0;
+    }
+  };
+  const frame = (now) => {
+    requestAnimationFrame(frame);
+    const reduced = motion.matches;
+    const dt = Math.min(0.1, Math.max(0, (now - last) / 1000)); last = now;
+    const t = now / 1000, st = visual(), p = STATE_PARAMS[st];
+    if (p.color !== toKey || p.alpha !== toAlpha || st !== shown) { fromRgb = rgb; fromAlpha = alpha; toKey = p.color; toAlpha = p.alpha; fadeStart = reduced ? -1 : now; shown = st; }
+    const tc = colors[toKey];
+    if (fadeStart < 0) { rgb = [...tc]; alpha = toAlpha; }
+    else { const m = clamp01((now - fadeStart) / 240), e = 1 - (1 - m) * (1 - m); rgb = rgb.map((_, i) => fromRgb[i] + (tc[i] - fromRgb[i]) * e); alpha = fromAlpha + (toAlpha - fromAlpha) * e; if (m >= 1) fadeStart = -1; }
+    if (st === "speaking") { const b = [0.45 + 0.3 * Math.sin(t * 2.3), 0.35 + 0.25 * Math.sin(t * 3.1 + 1), 0.2 + 0.15 * Math.sin(t * 4.7 + 2)].map((x) => Math.max(0.05, x)); const s = b[0] + b[1] + b[2]; for (let i = 0; i < 3; i++) bands[i] = b[i] / s; }
+    let goal = target(st, t), tau;
+    if (reduced) { goal = Math.round(goal * 3) / 3; tau = 0.15; } else tau = goal > level ? 0.04 : 0.18;
+    level += (goal - level) * (1 - Math.exp(-dt / tau));
+    const glide = 1 - Math.exp(-dt / 0.24);
+    for (let i = 0; i < 3; i++) {
+      const w = p.weights === "bands" ? BAND_BASE[i] + (1 - BAND_BASE[i]) * bands[i] : p.weights[i];
+      weights[i] += (w - weights[i]) * (p.weights === "bands" ? 1 - Math.exp(-dt / 0.12) : glide);
+      omega[i] += ((reduced ? 0 : p.omega[i]) - omega[i]) * glide;
+      theta[i] = (theta[i] + omega[i] * dt) % (Math.PI * 2000);
+    }
+    // draw
+    g.setTransform(1, 0, 0, 1, 0, 0); g.clearRect(0, 0, canvas.width, canvas.height); g.setTransform(dpr, 0, 0, dpr, 0, 0);
+    const y0 = H / 2, A0 = p.aMin + level * (0.38 * H - p.aMin), step = 2, n = Math.floor(W / step) + 1;
+    let ga = alpha; if (p.breathe && !reduced) ga *= 0.875 + 0.125 * Math.cos((2 * Math.PI * t) / 4);
+    const col = (a) => `rgba(${rgb[0] | 0},${rgb[1] | 0},${rgb[2] | 0},${a})`;
+    g.lineCap = "round"; g.lineJoin = "round";
+    const gapHalf = p.gap ? 24 : 0;
+    for (let i = 2; i >= 0; i--) {
+      const amp = A0 * weights[i], k = 2 * Math.PI * K[i], ph = PHI[i] + theta[i];
+      g.lineWidth = STROKE[i]; g.strokeStyle = col(ga * OPACITY[i]);
+      if (i === 0 && p.glow && !reduced) { g.shadowBlur = p.glow.blur; g.shadowColor = col(p.glow.alpha * Math.min(1, 0.4 + level * 1.5)); } else g.shadowBlur = 0;
+      g.beginPath(); let pen = false;
+      for (let j = 0; j < n; j++) {
+        const x = j * step, u = x / W, e = Math.sin(Math.PI * u), y = y0 + amp * e * e * Math.sin(k * u + ph);
+        if (gapHalf && Math.abs(x - W / 2) < gapHalf) { pen = false; continue; }
+        if (pen) g.lineTo(x, y); else { g.moveTo(x, y); pen = true; }
+      }
+      g.stroke();
+    }
+    g.shadowBlur = 0;
+    if (p.sweep && !reduced) {
+      const sigma = 0.08 * W, c = -2 * sigma + ((t % 1.4) / 1.4) * (W + 4 * sigma);
+      const grad = g.createLinearGradient(c - 2 * sigma, 0, c + 2 * sigma, 0);
+      grad.addColorStop(0, col(0)); grad.addColorStop(0.5, col(1)); grad.addColorStop(1, col(0));
+      g.strokeStyle = grad; g.lineWidth = 2.5; g.shadowBlur = 10; g.shadowColor = col(0.55);
+      const amp = A0 * weights[0], k = 2 * Math.PI * K[0], ph = PHI[0] + theta[0];
+      g.beginPath();
+      for (let x = Math.max(0, c - 2 * sigma), first = true; x <= Math.min(W, c + 2 * sigma); x += step, first = false) {
+        const u = x / W, e = Math.sin(Math.PI * u), y = y0 + amp * e * e * Math.sin(k * u + ph);
+        if (first) g.moveTo(x, y); else g.lineTo(x, y);
+      }
+      g.stroke(); g.shadowBlur = 0;
+    }
+    // The mic ring follows the stand-in level while you are heard.
+    const ring = document.getElementById("mic-ring");
+    if (ring) { const l = st === "hearing" ? level : st === "listening" ? level * 0.6 : 0.05; ring.style.transform = `scale(${1 + l * 0.22})`; ring.style.opacity = String(Math.min(1, 0.15 + l * 1.2)); }
+  };
+  requestAnimationFrame(frame);
+})();
+
+/* ---------- Start ---------- */
+const params = new URLSearchParams(location.hash.slice(1));
+if (params.get("device") && D[params.get("device")]) S.device = params.get("device");
+if (params.get("width") === "phone") S.phone = true;
+if (params.get("picking") === "off") S.picking = false;
+applyPreset(params.get("state") || "listening");
+</script>
+</body>
+</html>
