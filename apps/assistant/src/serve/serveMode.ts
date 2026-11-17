@@ -104,6 +104,7 @@ import { isTtsProvider, ttsProviderInfo } from "../providers.ts"
 import { DEFAULT_ASSISTANT_VOICE, voiceEngineName, voiceLabel } from "../voiceSelection.ts"
 import { type EnvMover, makeEnvMover } from "./envSettings.ts"
 import { type HttpError, type HttpServer, startHttp, webDirExists } from "./http.ts"
+import { makeNodeDist } from "./nodeDist.ts"
 import { deviceSettingsFrom, makeDeviceRegistry } from "./devices.ts"
 import { type Jobs, makeJobs } from "./jobs.ts"
 import { makeModels, type Models, type PresetDownloader, presetsInUse } from "./models.ts"
@@ -236,27 +237,6 @@ export interface ServeOptions {
   /** Tests: the pairing codes' and back-offs' clock (epoch ms). Default `Date.now`. */
   readonly nodesNow?: () => number
 }
-
-/**
- * N2b's `makeNodeDist` (`serve/nodeDist.ts`, docs/VOICE-NODES.md §6.3), declared here by its shape until N2b is merged.
- * LEAD, when merging N2b: delete this block and `makeNodeDistStandIn`, import `{ makeNodeDist }` from "./nodeDist.ts",
- * and call it where `makeNodeDistStandIn` is called.
- */
-interface NodeDistShape {
-  readonly manifest: () => NodeManifest | undefined
-  readonly handle: (
-    req: nodeHttp.IncomingMessage,
-    res: nodeHttp.ServerResponse,
-    redeem: (body: NodePairRequest, remoteAddress: string) => Effect.Effect<RedeemAnswer>
-  ) => void
-}
-/** Serves nothing: every `/node/*` path is a plain 404 (N2b replaces it). */
-const makeNodeDistStandIn = (_dir: string): NodeDistShape => ({
-  manifest: () => undefined,
-  handle: (_req, res) => {
-    res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" }).end("Not found")
-  }
-})
 
 export interface ServeHandle {
   readonly http: HttpServer
@@ -1194,7 +1174,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     const devices = makeDeviceRegistry({ store })
 
     // Voice nodes (docs/VOICE-NODES.md §6): the served bundle, the certificate's pin, pairing and credentials.
-    const nodeDist = makeNodeDistStandIn(options.nodeDir ?? join(repoRoot, "apps", "node", "dist"))
+    const nodeDist = makeNodeDist(options.nodeDir ?? join(repoRoot, "apps", "node", "dist"))
     let tlsPin: string | undefined
     if (options.tls !== undefined) {
       try {
@@ -1406,9 +1386,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       crossOriginIsolation: options.crossOriginIsolation ?? true,
       hub: hubNow,
       api,
-      // LEAD, when merging N2b: write this as `node: (req, res) => nodeDist.handle(req, res, nodes.redeem),` (http.ts's
-      // `node` option). Spread until then, because this checkout's HttpOptions has no `node` yet.
-      ...{ node: (req: nodeHttp.IncomingMessage, res: nodeHttp.ServerResponse) => nodeDist.handle(req, res, nodes.redeem) },
+      node: (req, res) => nodeDist.handle(req, res, nodes.redeem),
       ...(options.pingIntervalMs !== undefined ? { pingIntervalMs: options.pingIntervalMs } : {})
     })
 
@@ -1551,6 +1529,7 @@ export const serveMode = Effect.scoped(Effect.gen(function*() {
   if (minuteMs !== undefined) yield* Effect.logWarning(`PVA_TEST_MINUTE_MS: a minute of the idle and discard settings is ${minuteMs} ms (tests only).`)
   const handle = yield* startServe({
     ...config,
+    nodeDir: config.nodeDir,
     tls,
     ...(minuteMs !== undefined ? { minuteMs } : {}),
     ...(vaultPassword !== undefined && vaultPassword !== "" ? { vaultPassword } : {}),
