@@ -480,7 +480,7 @@ export const exampleSnapshot: Snapshot = {
 /** The admin part, as `admin.snapshot` carries it. */
 export const exampleAdminSnapshot: AdminSnapshot = {
   engine: exampleEngineStatus,
-  modules: [exampleWeatherModule, exampleHomeAssistantModule, exampleUnavailableModule],
+  modules: [exampleWeatherModule, exampleHomeAssistantModule],
   sections: [exampleVoiceSection, exampleSpeechEngineSection],
   traces: [exampleTrace],
   vault: { state: "unlocked", admin: true, location: "/home/owner/.config/pva/vault.enc" },
