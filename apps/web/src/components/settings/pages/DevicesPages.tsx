@@ -210,8 +210,26 @@ function DeviceEditor({ type, device }: { readonly type: DeviceTypeInfo; readonl
   /** Bumped when the draft is discarded or a section reset: the number fields start again (their text and errors). */
   const [generation, setGeneration] = useState(0)
   const revNow = useRef(rev)
-  /** Set while a save is on its way: the editor is inert and `update` ignores changes (they would not be in the save). */
+  /**
+   * Set while a save is on its way: the editor is inert and `update` ignores changes (they would not be in the save).
+   * A save that went through is over only when the revision it made (`awaitRev`) has reached the base: an edit made
+   * between the answer and that push would be judged against the old base and lost (PR #35 review 8).
+   */
   const savingNow = useRef(false)
+  const awaitRev = useRef<number | undefined>(undefined)
+  /** The edits of that save, while its revision is awaited (as `acked`, which a render may not have picked up yet). */
+  const awaitEdit = useRef<DeviceEdit | undefined>(undefined)
+  /** A new connection while the revision is awaited: the next list it brings is the server's word (saved or not). */
+  const reconnected = useRef(false)
+  const saveOver = () => {
+    savingNow.current = false
+    awaitRev.current = undefined
+    awaitEdit.current = undefined
+    reconnected.current = false
+    setSaving(false)
+  }
+  const connectionId = useClientState((s) => s.connection.connectionId)
+  const list = useClientState((s) => (device === undefined ? s.deviceTypes : s.devices))
   const [justSaved, setJustSaved] = useState(false)
   const [errors, setErrors] = useState<ReadonlyArray<FieldError>>([])
   const [message, setMessage] = useState<string | undefined>()
@@ -223,9 +241,22 @@ function DeviceEditor({ type, device }: { readonly type: DeviceTypeInfo; readonl
   // A new version from the server: a clean draft follows it (the edits of a save that went through are dropped, later ones kept).
   useEffect(() => {
     revNow.current = rev
-    setState((s) => draftOnRevision(s, rev, base, savedName, acked))
+    const sent = acked ?? awaitEdit.current
+    setState((s) => draftOnRevision(s, rev, base, savedName, sent))
     setAcked(undefined)
+    // The saved revision (or a later one, which contains it) is the base now: the editor is free again.
+    if (awaitRev.current !== undefined && rev >= awaitRev.current) saveOver()
   }, [rev]) // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    if (awaitRev.current !== undefined) reconnected.current = true
+  }, [connectionId])
+  // The first list after a reconnect: had the save been applied, its revision would be in it (handled above); it was
+  // not, so the draft is unsaved edits again.
+  useEffect(() => {
+    if (!reconnected.current || awaitRev.current === undefined) return
+    saveOver()
+    setAcked(undefined)
+  }, [list]) // eslint-disable-line react-hooks/exhaustive-deps
 
   const discard = () => {
     setState({ edit: noEdit, rev })
@@ -280,8 +311,13 @@ function DeviceEditor({ type, device }: { readonly type: DeviceTypeInfo; readonl
       // A request that fails gives the editor back, with the draft as it was.
       outcome = { kind: "refused", code: "internal", message: "Could not save. Try again." }
     }
-    savingNow.current = false
-    setSaving(false)
+    // A save that went through waits for its revision unless it is here already; anything else is over now. Without a
+    // revision in the answer (an older server) there is nothing to wait for.
+    const savedRev = outcome.kind === "ok" ? outcome.rev : undefined
+    if (savedRev !== undefined && revNow.current < savedRev) {
+      awaitRev.current = savedRev
+      awaitEdit.current = edit
+    } else saveOver()
     switch (outcome.kind) {
       case "ok": {
         // Only what was sent is saved: edits made meanwhile stay. Its revision may have arrived before the answer.

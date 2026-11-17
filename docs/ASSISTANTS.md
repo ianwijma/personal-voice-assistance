@@ -586,7 +586,7 @@ DeviceTarget    = { kind: "type", type: DeviceKind } | { kind: "device", id: Dev
 DeviceSave      = { type: "device.save", requestId, target: DeviceTarget, rev,
   name?: DeviceName,                                    // devices only
   settings: Partial<{ [K in keyof DeviceSettings]: DeviceSettings[K] | null }>,   // null = follow the type defaults (devices only)
-  saveAnyway?: boolean }
+  saveAnyway?: boolean }  // → result { ok, rev } (rev: the revision saved; the lists are pushed after the result)
 // unchanged: device.forget, wake.test (deviceId), module.configure (shared module settings), settings.update
 // (shared sections), job.*, engine.reload (now the full reload of §3.2)
 ```
