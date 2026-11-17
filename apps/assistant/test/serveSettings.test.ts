@@ -71,9 +71,9 @@ describe("flat storage", () => {
     expect(section(welcome.snapshot.sections, "language-model").form.values.LLM_PROVIDER).toBe("anthropic")
     expect(welcome.snapshot.modules[0]!.settings.values.greeting).toBe("hoi")
     const written = JSON.parse(readFileSync(join(dataDir, "settings.json"), "utf8"))
-    // Written as version 4 (docs/ASSISTANTS.md §6): the flat keys stay, and the one assistant has them.
+    // Written as the current version (5) (docs/ASSISTANTS.md §6): the flat keys stay, and the one assistant has them.
     expect(written).toMatchObject({
-      version: 4,
+      version: 5,
       modules: v1.modules,
       assistant: { STT_SHERPA_FINAL_SILENCE_MS: 700, STT_SHERPA_MODEL: "nemotron-3.5", DEFAULT_VOICE: "natural", LLM_PROVIDER: "anthropic" },
       assistants: { order: ["assistant"] },
@@ -113,8 +113,8 @@ describe("flat storage", () => {
       migrated: true,
       problems: []
     })
-    expect(readSettingsFile({ version: 2, modules: {}, assistant: { A: 1 } })).toMatchObject({ file: { version: 4, assistant: { A: 1 } }, migrated: true })
-    expect(readSettingsFile({ version: 5 })).toBeUndefined()
+    expect(readSettingsFile({ version: 2, modules: {}, assistant: { A: 1 } })).toMatchObject({ file: { version: 5, assistant: { A: 1 } }, migrated: true })
+    expect(readSettingsFile({ version: 6 })).toBeUndefined()
     expect(readSettingsFile({ version: 4, devices: [] })).toBeUndefined()
     expect(readSettingsFile({ version: 3, frontends: [] })).toBeUndefined()
   })

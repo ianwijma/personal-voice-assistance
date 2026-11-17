@@ -72,13 +72,15 @@
  * `records`, `combo`, `action` and `info` and `SettingValue` a list of records (new members of closed sets: a
  * version 9 page would refuse a form that uses them); `ErrorCode` gains `unknown_action` and `not_running`.
  * Additive, within 10: `module.action` (admin only) and `Result.action`, `ModuleInfo.routes`, and the module route
- * API (`moduleRoutes.ts`).
+ * API (`moduleRoutes.ts`); the household messages to voice pages (§4 P4: `household.snapshot`, `household.event`,
+ * `household.gap`, `household.ts`), which a page that does not show household data ignores.
  *
  * 11: people, rooms and device capabilities (docs/MODULES-PLAN.md §4 P5). `DeviceSettingsKey` gains `place` and
  * `capabilities` and `DeviceSettings` requires both (`DevicePlace`, `CapabilityOverrides`), so a version 10 peer would
  * refuse a version 11 device entry. Additive, within 11: `hello.device.capabilities` and `device.caps`
  * (`DeviceCapabilities`, `DeviceLiveState`), `DeviceRecord.declared`, `DeviceListInfo.declared` / `live`, and
- * `RecordItemField.hidden` (a record field kept but not drawn: a person's id in Members).
+ * `RecordItemField.hidden` (a record field kept but not drawn: a person's id in Members), `EnvEntry.refused` (a known
+ * variable that is not read, with why: `HOUSEHOLD_MEMBERS`). `DevicePlace.room` is one line of text.
  */
 export const PROTOCOL_VERSION = 11
 
@@ -110,6 +112,12 @@ export const CloseCode = {
   helloTimeout: 4401,
   /** A message failed validation in a way that makes the connection unusable (e.g. binary frame before `hello`). */
   badMessage: 4402,
+  /**
+   * P5: a setting that decides what the device may be told or sent changed (its privacy, its default person, its
+   * speaker or display overrides, or a person left Members). The device's session ended with its connections; the
+   * page reconnects at once and starts a fresh session ("Settings changed; the conversation started again").
+   */
+  settingsChanged: 4205,
   /** The connection fell too far behind (send buffer over the limit); reconnect to get a fresh snapshot. */
   tooSlow: 4408,
   /** Connection limit reached. */

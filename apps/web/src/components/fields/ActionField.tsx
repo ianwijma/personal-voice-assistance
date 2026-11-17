@@ -15,20 +15,32 @@ export function ActionField({ field, id, describedBy, disabled, context }: Field
   const client = useClient()
   const [running, setRunning] = useState(false)
   const [result, setResult] = useState<FieldActionResult | undefined>(undefined)
-  const mounted = useRef(true)
-  useEffect(() => () => void (mounted.current = false), [])
+  // Set in the effect (not only initially): StrictMode runs setup, cleanup and setup again on a live component.
+  const mounted = useRef(false)
+  useEffect(() => {
+    mounted.current = true
+    return () => void (mounted.current = false)
+  }, [])
   const moduleId = context?.form.kind === "module" ? context.form.id : undefined
-  const needsSave = field.requiresSaved && context?.dirty === true
+  // One rule with Save: a press acts on exactly what the form shows, so not while a shown field is invalid.
+  const invalid = context?.invalid
+  const needsSave = invalid === undefined && field.requiresSaved && context?.dirty === true
   const press = async () => {
-    if (running || moduleId === undefined) return
+    if (running || moduleId === undefined || invalid !== undefined) return
     if (field.confirm !== undefined && !window.confirm(field.confirm)) return
     setRunning(true)
     setResult(undefined)
     const values = !field.requiresSaved && context?.dirty === true ? { ...context.draftValues } : undefined
-    const reply = await client.request({ type: "module.action", moduleId, key: field.key, ...(values !== undefined ? { values } : {}) })
+    let next: FieldActionResult
+    try {
+      const reply = await client.request({ type: "module.action", moduleId, key: field.key, ...(values !== undefined ? { values } : {}) })
+      next = reply.ok ? reply.action ?? { ok: true, text: "Done.", tone: "ok" } : { ok: false, text: reply.error?.message ?? "It did not run.", tone: "error" }
+    } catch {
+      next = { ok: false, text: "No answer from the assistant; try again.", tone: "error" }
+    }
     if (!mounted.current) return
     setRunning(false)
-    setResult(reply.ok ? reply.action ?? { ok: true, text: "Done.", tone: "ok" } : { ok: false, text: reply.error?.message ?? "It did not run.", tone: "error" })
+    setResult(next)
   }
   const tone = result?.tone ?? (result?.ok === false ? "error" : "neutral")
   return (
@@ -39,13 +51,14 @@ export function ActionField({ field, id, describedBy, disabled, context }: Field
           size="sm"
           aria-describedby={describedBy}
           aria-busy={running}
-          disabled={disabled || running || needsSave || moduleId === undefined}
+          disabled={disabled || running || needsSave || invalid !== undefined || moduleId === undefined}
           onClick={() => void press()}
         >
           {running && <Spinner size={13} />}
           {field.buttonLabel}
         </Button>
         {needsSave && <span className="text-[13px] text-ink-muted">Save first</span>}
+        {invalid !== undefined && <span className="text-[13px] text-danger" data-testid="action-blocked">Fix this first: {invalid}</span>}
         {moduleId === undefined && <span className="text-[13px] text-ink-muted">Not available here</span>}
       </div>
       <p

@@ -1,5 +1,6 @@
 import { makeWebAudio, type WebAudio } from "@pva/audio-web"
 import {
+  type AudioOutput,
   type AgentTurnSetup,
   type ConversationEvent,
   type ConversationInput,
@@ -14,6 +15,7 @@ import {
   type Stt,
   type SttEvent,
   type Trace,
+  type ConnectionRef,
   type TurnOrigin,
   type TurnPerson,
   type TurnSetup,
@@ -121,6 +123,12 @@ export interface VoiceSessionOptions {
    */
   readonly place?: () => { readonly room?: string; readonly person?: TurnPerson }
   /**
+   * P5: whether replies may be spoken here now (the device's effective speaker), read at the start of every play and
+   * before every chunk. Not at the start: the reply's audio is made and counted as played but never sent to the page;
+   * no longer during a play: the rest of it is not sent (the hub checks again at every frame it sends). Absent: always.
+   */
+  readonly speakerAllowed?: () => boolean
+  /**
    * The recogniser this device hears with now (the resource pool's for its hearer, WP-11). Read when the recogniser
    * loop starts and again after every `hearingChanged`. Absent: the engine build's `stt` (tests).
    */
@@ -131,6 +139,8 @@ export interface VoiceSessionOptions {
   readonly assistants: () => ReadonlyMap<string, Assistant>
   /** Per assistant: its turn setup (prompt, module instructions, its tools), and the agent setup (claude-subscription). */
   readonly conversationSetup: (assistant: string, deviceId: string | undefined) => AssistantSetup
+  /** The connection that owns the device's audio now, for a voice turn's `CurrentTurn.connection`. */
+  readonly audioConnection?: () => ConnectionRef | undefined
   /**
    * The key of the voice an assistant speaks with on this device now (the resource pool's, docs/ASSISTANTS.md §3.2):
    * the device's own voice, else the assistant's (docs/LOOKS-AND-VOICES.md §3).
@@ -189,7 +199,8 @@ export type TextOutcome = SendOutcome | "dropped"
  */
 export interface SessionConversations {
   /** Typed text, routed as §2.6 "Typed text" says (`named`: the assistant the page names). */
-  readonly sendText: (text: string, speak: boolean, named?: string) => Effect.Effect<TextOutcome>
+  /** `connection`: the tab that typed it (the turn's `CurrentTurn.connection`). */
+  readonly sendText: (text: string, speak: boolean, named?: string, connection?: ConnectionRef) => Effect.Effect<TextOutcome>
   /** Stop: `assistant`'s conversation, or every active one. */
   readonly stop: (assistant?: string) => SendOutcome
   readonly running: () => boolean
@@ -324,6 +335,37 @@ type Target = AssistantConversation
 
 const idleMsOf = (assistant: Assistant | undefined, minuteMs: number): number | undefined =>
   assistant === undefined || assistant.newConversationAfter === "never" ? undefined : assistant.newConversationAfter * minuteMs
+
+/**
+ * P5: `output` while `allowed()` says so: at the start of a play, and before each chunk (a play whose permission goes
+ * mid-way ends there: the rest of the reply is not sent). Not allowed at the start: a play that takes the whole reply
+ * and reports it as played (so the turn is recorded as answered) without sending any of it anywhere.
+ */
+export const silentUnless = (output: AudioOutput["Service"], allowed: () => boolean): AudioOutput["Service"] => ({
+  ...(output.reportsPlayback !== undefined ? { reportsPlayback: output.reportsPlayback } : {}),
+  play: (audio, sampleRate, observer) =>
+    Effect.suspend(() => {
+      const ok = () => {
+        try {
+          return allowed()
+        } catch {
+          return false
+        }
+      }
+      if (ok()) return output.play(Stream.takeWhile(audio, () => ok()), sampleRate, observer)
+      let samples = 0
+      let started = false
+      return Stream.runForEach(audio, (chunk) =>
+        Effect.sync(() => {
+          if (!started) {
+            started = true
+            observer?.started()
+          }
+          samples += Math.floor(chunk.byteLength / 2)
+          observer?.progress(samples)
+        })).pipe(Effect.ensuring(Effect.sync(() => observer?.final?.(samples))))
+    })
+})
 
 export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<VoiceSession, never, Scope.Scope> =>
   Effect.gen(function*() {
@@ -481,8 +523,8 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
         if (unsuppress !== undefined) clearTimeout(unsuppress)
       })
     )
-    // One speaker for every conversation of the session (docs/ASSISTANTS.md §1.2).
-    const lease = makeOutputLease(web.output)
+    // One speaker for every conversation of the session (docs/ASSISTANTS.md §1.2); silent where the device may not speak.
+    const lease = makeOutputLease(options.speakerAllowed === undefined ? web.output : silentUnless(web.output, options.speakerAllowed))
 
     // Clause texts per turn, so the echo gate knows the words that just played (turn ids are unique per session).
     const clauses = new Map<number, { texts: Array<string>; given: number }>()
@@ -633,16 +675,23 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
           const { config: assistantConfig } = made
           // Module API v2 (`CurrentTurn`): every turn's setup names who and where it is for. The origin object is the
           // same while the device's name is, so a turn adds one small object (the setup with it), nothing else.
+          // A voice turn's connection is the tab that owns the device's audio as the turn starts; a typed turn names
+          // the tab that typed it (`TextInput.connection`, which wins).
           let origin: TurnOrigin | undefined
           const originNow = (): TurnOrigin => {
             const deviceName = options.name()
+            const connection = options.audioConnection?.()
             // P5: the device's room and default person (`how: "device-default"`), from the device's place.
             const place = options.place?.()
-            if (origin?.deviceName !== deviceName || origin.room !== place?.room || origin.person?.id !== place?.person?.id) {
+            if (
+              origin?.deviceName !== deviceName || origin.connection !== connection || origin.room !== place?.room ||
+              origin.person?.id !== place?.person?.id
+            ) {
               origin = {
                 assistantId: assistant,
                 ...(options.deviceId !== undefined ? { deviceId: options.deviceId } : {}),
                 deviceName,
+                ...(connection !== undefined ? { connection } : {}),
                 ...(place?.room !== undefined ? { room: place.room } : {}),
                 ...(place?.person !== undefined ? { person: place.person } : {})
               }
@@ -946,8 +995,28 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
       holderCheck()
     }
 
+    const newConversationOf = (assistant: string | undefined): Effect.Effect<ConversationInfo> =>
+      Effect.suspend(() => {
+        const a = assistant ?? answering()
+        const made = conversationOf(a)
+        if (made !== undefined) {
+          // Its conversation stops the open utterance; the dispatcher must not hand the rest to another one.
+          dispatcher.cancelUtterance(a!)
+          utteranceCancelled(a)
+          return made.newConversation
+        }
+        return Effect.sync(() => {
+          const info = fresh()
+          reserved.set(a ?? "", info)
+          turnsBy.set(a ?? "", 0)
+          options.send({ type: "conversation", id: info.id, reason: "new", startedAt: info.startedAt, ...(a !== undefined ? { assistantId: a } : {}) })
+          options.onChange(false)
+          return info
+        })
+      })
+
     const conversations: SessionConversations = {
-      sendText: (text, speak, named) =>
+      sendText: (text, speak, named, connection) =>
         Effect.suspend(() => {
           const w = route.window(now())
           const target = typedTextTarget(options.deviceSettings(), options.assistants(), {
@@ -955,7 +1024,7 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
             followUpHolder: w?.by === "follow-up" ? w.assistant : undefined
           })
           if ("dropped" in target) return Effect.succeed<TextOutcome>("dropped")
-          return dispatcher.send(target.assistant, { _tag: "TextInput", text, speak })
+          return dispatcher.send(target.assistant, { _tag: "TextInput", text, speak, ...(connection !== undefined ? { connection } : {}) })
         }),
       stop: (assistant) => {
         const outcome = dispatcher.stop(assistant)
@@ -971,25 +1040,7 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
       lastTurnAt: (assistant) => conversationOf(assistant ?? answering())?.lastTurnAt(),
       lastTurnId: (assistant) => conversationOf(assistant ?? answering())?.lastTurnId(),
       turnsOf: (assistant) => turnsBy.get(assistant ?? answering() ?? "") ?? 0,
-      newConversation: (assistant) =>
-        Effect.suspend(() => {
-          const a = assistant ?? answering()
-          const made = conversationOf(a)
-          if (made !== undefined) {
-            // Its conversation stops the open utterance; the dispatcher must not hand the rest to another one.
-            dispatcher.cancelUtterance(a!)
-            utteranceCancelled(a)
-            return made.newConversation
-          }
-          return Effect.sync(() => {
-            const info = fresh()
-            reserved.set(a ?? "", info)
-            turnsBy.set(a ?? "", 0)
-            options.send({ type: "conversation", id: info.id, reason: "new", startedAt: info.startedAt, ...(a !== undefined ? { assistantId: a } : {}) })
-            options.onChange(false)
-            return info
-          })
-        }),
+      newConversation: newConversationOf,
       answering,
       start: () => {
         if (started) return

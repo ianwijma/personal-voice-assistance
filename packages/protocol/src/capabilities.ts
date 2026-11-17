@@ -149,9 +149,24 @@ const DISPLAY_WORDS: Readonly<Record<DisplayClass, string>> = {
   large: "large screen"
 }
 
+/** Whether replies may be spoken on a device with these capabilities: a speaker that plays speech. */
+export const canSpeak = (caps: DeviceCapabilities | undefined): boolean => caps?.speaker?.media.includes("speech") === true
+
 /**
- * A few words for what a device can do ("tablet-size screen, touch, speaker, microphone"; "voice only, no screen";
- * "nothing declared"), for the per-turn context line and admin.
+ * What a speaker plays, from its actual media set: "speech", "speech and sound", "sound and video, no speech",
+ * "nothing" (an empty set). Admin and the context line both use it, so neither says "speech" where none is sent.
+ */
+export const speakerMediaWords = (media: ReadonlyArray<"speech" | "audio" | "video">): string => {
+  const names = [media.includes("speech") ? "speech" : undefined, media.includes("audio") ? "sound" : undefined, media.includes("video") ? "video" : undefined]
+    .filter((n): n is string => n !== undefined)
+  if (names.length === 0) return "nothing"
+  const list = names.length === 1 ? names[0]! : `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]!}`
+  return media.includes("speech") ? list : `${list}, no speech`
+}
+
+/**
+ * A few words for what a device can do ("tablet-size screen, touch, speaker (speech), microphone"; "voice only
+ * (speech), no screen"; "no screen, speaker (sound, no speech)"; "nothing declared"), for the per-turn context line and admin. The speaker's words are its media set.
  */
 export const capabilityWords = (caps: DeviceCapabilities): string => {
   const parts: Array<string> = []
@@ -159,13 +174,23 @@ export const capabilityWords = (caps: DeviceCapabilities): string => {
     parts.push(DISPLAY_WORDS[caps.display.class])
     if (caps.display.touch !== "none") parts.push("touch")
   }
-  if (caps.speaker !== undefined) parts.push("speaker")
+  if (caps.speaker !== undefined) parts.push(`speaker (${speakerMediaWords(caps.speaker.media)})`)
   if (caps.microphone !== undefined) parts.push("microphone")
   if (parts.length === 0) return "nothing declared"
-  if (caps.display === undefined) return caps.speaker !== undefined ? `voice only, no screen${caps.microphone === undefined ? ", no microphone" : ""}` : `no screen, ${parts.join(", ")}`
+  if (caps.display === undefined) {
+    if (canSpeak(caps)) return `voice only (${speakerMediaWords(caps.speaker!.media)}), no screen${caps.microphone === undefined ? ", no microphone" : ""}`
+    return `no screen, ${parts.join(", ")}`
+  }
   if (caps.speaker === undefined) parts.push("no speaker")
   return parts.join(", ")
 }
+
+/**
+ * The presentation kinds the protocol knows, for the "never show these" switches of a device type that has no
+ * representative device. Empty until the presentation catalogue arrives (P10 fills this one constant); admin then says
+ * "none yet".
+ */
+export const KNOWN_PRESENT_KINDS: ReadonlyArray<PresentKind> = []
 
 // -- Place (the `place` device settings section) -----------------------------------------------------------------------
 
@@ -175,6 +200,11 @@ export type PersonId = typeof PersonId.Type
 
 export const MAX_ROOM_CHARS = 60
 
+/** Control and format characters, line and paragraph separators: never part of a name a prompt may carry. */
+const NOT_ONE_LINE = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u
+/** One line of plain text: no control or format characters, no line breaks (rooms; checked where they are saved). */
+export const isOneLine = (s: string): boolean => !NOT_ONE_LINE.test(s)
+
 /** `private`: one person's (a bedroom phone); `shared`: the household's (the kitchen); `public`: anyone may hear or see it (the hallway). */
 export const DevicePrivacy = Schema.Literals(["private", "shared", "public"])
 export type DevicePrivacy = typeof DevicePrivacy.Type
@@ -182,7 +212,10 @@ export type DevicePrivacy = typeof DevicePrivacy.Type
 /** Where and for whom a device is. Never detected: set in admin. */
 export const DevicePlace = Schema.Struct({
   /** Free text ("Kitchen"); "" = no room. Matched to Home Assistant areas by name. */
-  room: Schema.String.check(Schema.isMaxLength(MAX_ROOM_CHARS)),
+  room: Schema.String.check(
+    Schema.isMaxLength(MAX_ROOM_CHARS),
+    Schema.makeFilter((s: string) => isOneLine(s) || "a room is one line of text, without control characters")
+  ),
   privacy: DevicePrivacy,
   /** A wall tablet in kiosk mode, as opposed to a tab opened now and then. */
   alwaysOn: Schema.Boolean,
@@ -217,3 +250,109 @@ export const roomOf = (place: Pick<DevicePlace, "room">): string | undefined => 
 /** Rooms are compared without case and surrounding space. */
 export const sameRoom = (a: string | undefined, b: string | undefined): boolean =>
   a !== undefined && b !== undefined && a.trim() !== "" && a.trim().toLowerCase() === b.trim().toLowerCase()
+
+// -- Members (shared settings › Members; the server's and the mock's one check) -----------------------------------------
+
+/** The most people in Members. */
+export const MAX_MEMBERS = 24
+
+/**
+ * A person's name as names are compared (duplicates in Members, `findPerson`): compatibility-normalised and without
+ * combining marks *before* it is split into words, lower case, apostrophes dropped ("Änne" and "Änne" are
+ * "anne"; "O'Brien" is "obrien").
+ */
+export const memberNameKey = (text: string): string =>
+  [...text.normalize("NFKD").replace(/\p{M}/gu, "").matchAll(/[\p{L}\p{N}][\p{L}\p{N}'’]*/gu)]
+    .map((m) => m[0].toLowerCase().replace(/['’]/g, ""))
+    .filter((w) => w !== "")
+    .join(" ")
+
+/**
+ * The Members list as a whole: at most `MAX_MEMBERS`; every person has a name of one line with letters or digits; no
+ * two people have the same name (as `memberNameKey` compares them); aliases and the pronunciation are one line.
+ * A message for the first problem, or `undefined`.
+ */
+export const checkMembers = (list: ReadonlyArray<{ readonly name: string; readonly aliases?: ReadonlyArray<string>; readonly pronunciation?: string }>): string | undefined => {
+  if (list.length > MAX_MEMBERS) return `At most ${MAX_MEMBERS} people`
+  const seen = new Set<string>()
+  for (const [i, m] of list.entries()) {
+    if (typeof m.name !== "string" || m.name.trim() === "") return `Person ${i + 1} needs a name`
+    if (!isOneLine(m.name)) return `The name of person ${i + 1} must be one line, without control characters`
+    const key = memberNameKey(m.name)
+    if (key === "") return `Person ${i + 1} needs a name with letters or digits`
+    if (seen.has(key)) return `Two people are called ${m.name.trim()}; give one of them another name (an alias can be shared)`
+    seen.add(key)
+    if ((m.aliases ?? []).some((a) => !isOneLine(a)) || (m.pronunciation !== undefined && !isOneLine(m.pronunciation))) {
+      return `The other names and pronunciation of ${m.name.trim()} must be one line each`
+    }
+  }
+  return undefined
+}
+
+/** The bounds of a Members record and of a diet list (the server's section and the mock's check use these). */
+export const MEMBER_LIMITS = {
+  id: 40,
+  name: 60,
+  aliases: 10,
+  alias: 40,
+  pronunciation: 60,
+  dietItems: 30,
+  dietItem: 60
+} as const
+
+/** The diet lists of a person and of the household. */
+export const DIET_FIELDS = ["allergies", "diets", "dislikes"] as const
+
+const isRecordValue = (u: unknown): u is Readonly<Record<string, unknown>> => typeof u === "object" && u !== null && !Array.isArray(u)
+
+/**
+ * A diet list (a person's or the household's): a list of at most `dietItems` one-line texts of at most `dietItem`
+ * characters. A message for the first problem, or `undefined`.
+ */
+export const checkDietList = (label: string, value: unknown): string | undefined => {
+  if (value === undefined) return undefined
+  if (!Array.isArray(value)) return `${label} must be a list`
+  if (value.length > MEMBER_LIMITS.dietItems) return `${label}: at most ${MEMBER_LIMITS.dietItems}`
+  for (const item of value) {
+    if (typeof item !== "string") return `${label} must be texts`
+    if ([...item].length > MEMBER_LIMITS.dietItem) return `${label}: each at most ${MEMBER_LIMITS.dietItem} characters`
+    if (!isOneLine(item)) return `${label}: each one line, without control characters`
+  }
+  return undefined
+}
+
+/**
+ * P5 round 2: the whole `HOUSEHOLD_MEMBERS` value as it arrives from a page, before anything is stored: a list of
+ * records whose every field has its type and bounds (`MEMBER_LIMITS`), then `checkMembers`. The server's Members
+ * section runs it as its check and the mock server on its save path, so both refuse the same values. A message for
+ * the first problem, or `undefined`.
+ */
+export const checkMembersValue = (value: unknown): string | undefined => {
+  if (!Array.isArray(value)) return "Must be a list of people"
+  if (value.length > MAX_MEMBERS) return `At most ${MAX_MEMBERS} people`
+  for (const [i, r] of value.entries()) {
+    const who = `Person ${i + 1}`
+    if (!isRecordValue(r)) return `${who} must be a record`
+    if (r.id !== undefined && (typeof r.id !== "string" || [...r.id].length > MEMBER_LIMITS.id)) return `${who} has an id that is not valid`
+    if (typeof r.name !== "string") return `${who} needs a name`
+    if ([...r.name].length > MEMBER_LIMITS.name) return `The name of person ${i + 1}: at most ${MEMBER_LIMITS.name} characters`
+    if (r.aliases !== undefined) {
+      if (!Array.isArray(r.aliases) || r.aliases.some((a) => typeof a !== "string")) return `The other names of person ${i + 1} must be a list of texts`
+      if (r.aliases.length > MEMBER_LIMITS.aliases) return `Person ${i + 1}: at most ${MEMBER_LIMITS.aliases} other names`
+      if (r.aliases.some((a: string) => [...a].length > MEMBER_LIMITS.alias)) return `The other names of person ${i + 1}: each at most ${MEMBER_LIMITS.alias} characters`
+    }
+    if (r.pronunciation !== undefined) {
+      if (typeof r.pronunciation !== "string") return `The pronunciation of person ${i + 1} must be a text`
+      if ([...r.pronunciation].length > MEMBER_LIMITS.pronunciation) return `The pronunciation of person ${i + 1}: at most ${MEMBER_LIMITS.pronunciation} characters`
+    }
+    for (const field of DIET_FIELDS) {
+      const problem = checkDietList(`${field.charAt(0).toUpperCase()}${field.slice(1)} of person ${i + 1}`, r[field])
+      if (problem !== undefined) return problem
+    }
+  }
+  return checkMembers(value.map((r) => ({
+    name: (r as { name: string }).name,
+    aliases: ((r as { aliases?: ReadonlyArray<string> }).aliases ?? []) as ReadonlyArray<string>,
+    ...(typeof (r as { pronunciation?: unknown }).pronunciation === "string" ? { pronunciation: (r as { pronunciation: string }).pronunciation } : {})
+  })))
+}

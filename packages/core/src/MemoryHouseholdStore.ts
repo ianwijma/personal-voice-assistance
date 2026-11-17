@@ -1,315 +1,206 @@
-import type { ModuleUnavailable } from "@pva/protocol"
-import { Clock, Context, Effect, Semaphore } from "effect"
+import { Effect } from "effect"
 import {
-  CHANGE_RETENTION_MS,
-  type ChangeRecord,
   type Collection,
-  type CommittedChange,
+  compareCodePoints,
+  compareIndexed,
   type HouseholdStore,
-  matchesWords,
-  type ModuleExport,
-  type ModuleSql,
-  readOnlyError,
-  SEARCH_SCAN_ROWS,
+  type IndexKey,
   scopeKey,
   type ScopeRef,
-  sqlPrefixOf,
-  type StoredModule,
   StoreError
 } from "./HouseholdStore.ts"
-import { compareJsonValues, jsonEquals, makeModuleStoreOn, type StoreBackend, type StoredDoc } from "./ModuleStoreImpl.ts"
+import { type BulkKey, type BulkRow, type CheckedQuery, layoutOf, makeStoreEngine, type StoredCollection, type StoredDoc, type SyncBackend } from "./StoreEngine.ts"
 
 /**
- * The in-memory household store (`@pva/core/testing`): the semantics of the SQLite store (scopes, rev, the change log,
- * undo, erase, transactions with rollback, events after commit, schema versions and downgrade refusal) without a
- * database, for module tests. It has no module SQL and no backups: a module with `storage.sql` is `unavailable` here
- * (test it on `makeSqliteStore({ filename: ":memory:" })` from `@pva/store-sqlite`).
+ * The in-memory household store (`@pva/core/testing`): the semantics of the SQLite store without a database, for
+ * module tests. It runs the same engine (`StoreEngine.ts`: collections, synchronous flat transactions, events after
+ * the commit, `prepare`) over a backend of maps with an undo list (a rollback replays it backwards), and answers lists
+ * in the same order as SQLite's indexes (the same index keys, compared the way SQLite compares its columns). It keeps
+ * rows as JSON text, as SQLite does, so nothing a caller passes in or gets back is shared with what it stores. The
+ * shared contract (`@pva/core/store-contract`) and a randomised comparison with the SQLite store check both. It has
+ * no backups.
  */
 
 export interface MemoryStoreOptions {
   /** Refuse every write, like the CLI modes. */
   readonly readOnly?: boolean
-  /** Versions as if a newer build had written them: `{ "<moduleId>": { "collection:<name>": 3 } }`. */
-  readonly storedVersions?: Readonly<Record<string, Readonly<Record<string, number>>>>
+  /** Data versions as if a newer build had written them: `{ "<owner>": 3 }`. */
+  readonly storedVersions?: Readonly<Record<string, number>>
 }
 
-interface State {
-  docs: Map<string, StoredDoc>
-  search: Map<string, string>
-  changes: Array<ChangeRecord & { readonly actorKey: string }>
-  nextSeq: number
+const key = (owner: string, collection: string, id: string) => `${owner}\u0000${collection}\u0000${id}`
+
+interface MemoryDoc extends StoredDoc {
+  readonly keys: ReadonlyArray<IndexKey>
 }
 
-const TxRef = Context.Reference<{ readonly store: object; readonly pending: Array<CommittedChange>; readonly undo: Array<() => void> } | undefined>("@pva/core/MemoryStoreTx", {
-  defaultValue: () => undefined
-})
+/** The in-memory backend (exported for the randomised comparison with SQLite). */
+export const makeMemoryBackend = (options: MemoryStoreOptions = {}): SyncBackend => {
+  const docs = new Map<string, MemoryDoc>()
+  const ownerVersions = new Map<string, number>(Object.entries(options.storedVersions ?? {}))
+  const collections = new Map<string, Map<string, StoredCollection>>()
+  let rev = 0
+  let undo: Array<() => void> | undefined
 
-const key = (module: string, collection: string, id: string) => `${module}\u0000${collection}\u0000${id}`
-
-export const makeMemoryHouseholdStore = (options: MemoryStoreOptions = {}): HouseholdStore & {
-  /** For assertions: every change-log row, oldest first. */
-  readonly changeLog: () => ReadonlyArray<ChangeRecord>
-  /** For assertions: the search text kept for a row (`undefined` when none). */
-  readonly searchEntry: (module: string, collection: string, id: string) => string | undefined
-  /**
-   * Inside a transaction of this store: run `undo` if that transaction (or the nested one it is in) rolls back. Outside
-   * one: nothing. How an in-memory table of a core service (the scheduler's) joins the store's transactions.
-   */
-  readonly onRollback: (undo: () => void) => Effect.Effect<void>
-} => {
-  const self = {}
-  const readOnly = options.readOnly === true
-  let state: State = { docs: new Map(), search: new Map(), changes: [], nextSeq: 1 }
-  const versions = new Map<string, Map<string, number>>()
-  for (const [m, vs] of Object.entries(options.storedVersions ?? {})) versions.set(m, new Map(Object.entries(vs)))
-  const verdicts = new Map<string, ModuleUnavailable>()
-  const declared = new Map<string, ReadonlyMap<string, Collection<any>>>()
-  const listeners = new Set<(changes: ReadonlyArray<CommittedChange>) => void>()
-  const lock = Semaphore.makeUnsafe(1)
-
-  const copy = (s: State): State => ({ docs: new Map(s.docs), search: new Map(s.search), changes: [...s.changes], nextSeq: s.nextSeq })
-
-  const fire = (changes: ReadonlyArray<CommittedChange>) => {
-    if (changes.length === 0) return
-    for (const l of listeners) {
-      try {
-        l(changes)
-      } catch {
-        // A listener must not break a commit.
-      }
-    }
+  const remember = (f: () => void) => {
+    if (undo === undefined) throw new StoreError({ reason: "failed", message: "A write outside a transaction" })
+    undo.push(f)
   }
-
-  const transaction = <X, E, R>(work: Effect.Effect<X, E, R>): Effect.Effect<X, E | StoreError, R> =>
-    Effect.flatMap(Effect.service(TxRef), (tx) => {
-      if (tx?.store === self) {
-        return Effect.suspend(() => {
-          const saved = copy(state)
-          const mark = tx.pending.length
-          const undoMark = tx.undo.length
-          return work.pipe(Effect.onError(() => Effect.sync(() => {
-            state = saved
-            tx.pending.length = mark
-            for (const undo of tx.undo.splice(undoMark).reverse()) undo()
-          })))
-        })
-      }
-      return lock.withPermits(1)(Effect.suspend(() => {
-        const saved = copy(state)
-        const frame = { store: self, pending: [] as Array<CommittedChange>, undo: [] as Array<() => void> }
-        return work.pipe(
-          Effect.provideService(TxRef, frame),
-          Effect.onExit((exit) => Effect.sync(() => {
-            if (exit._tag === "Failure") {
-              state = saved
-              for (const undo of frame.undo.splice(0).reverse()) undo()
-            } else fire(frame.pending)
-          }))
-        )
-      }))
-    })
-
-  /** Reads and writes outside a transaction wait for one that runs (as on SQLite's one connection). */
-  const locked = <X, E>(effect: Effect.Effect<X, E>): Effect.Effect<X, E> =>
-    Effect.flatMap(Effect.service(TxRef), (tx) => (tx?.store === self ? effect : lock.withPermits(1)(effect)))
-
+  const set = (k: string, doc: MemoryDoc | undefined) => {
+    const before = docs.get(k)
+    remember(() => (before === undefined ? docs.delete(k) : docs.set(k, before)))
+    if (doc === undefined) docs.delete(k)
+    else docs.set(k, doc)
+  }
   const sameScope = (a: ScopeRef, b: ScopeRef) => scopeKey(a) === scopeKey(b)
-  const docsOf = (module: string, collection: string, scope: ScopeRef) =>
-    [...state.docs.values()].filter((d) => d.module === module && d.collection === collection && sameScope(d.scope, scope))
+  const docsOf = (owner: string, collection: string, scope: ScopeRef) =>
+    [...docs.values()].filter((d) => d.owner === owner && d.collection === collection && sameScope(d.scope, scope))
+  const plain = ({ keys: _keys, ...doc }: MemoryDoc): StoredDoc => doc
 
-  const backend: StoreBackend = {
-    readOnly,
-    fts5: false,
-    transaction,
-    afterCommit: (change) => Effect.flatMap(Effect.service(TxRef), (tx) => Effect.sync(() => (tx?.store === self ? tx.pending.push(change) : fire([change])))),
-    read: (module, collection, id) => locked(Effect.sync(() => state.docs.get(key(module, collection, id)))),
-    list: (module, collection, scope, q) =>
-      locked(Effect.sync(() => {
-        const field = (d: StoredDoc) => (q.order.column ? (q.order.field === "createdAt" ? d.createdAt : d.updatedAt) : (JSON.parse(d.text) as Record<string, unknown>)[q.order.field])
-        return docsOf(module, collection, scope)
-          .filter((d) => {
-            if (q.where.length === 0) return true
-            const value = JSON.parse(d.text) as Record<string, unknown>
-            return q.where.every(([f, v]) => jsonEquals(value[f], v))
-          })
-          .sort((a, b) => {
-            const c = compareJsonValues(field(a), field(b))
-            return (q.order.desc ? -c : c) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)
-          })
-          .slice(0, q.limit)
-      })),
-    search: (module, collection, scope, words, limit) =>
-      locked(Effect.sync(() =>
-        docsOf(module, collection, scope)
-          .sort((a, b) => b.updatedAt - a.updatedAt)
-          .slice(0, SEARCH_SCAN_ROWS)
-          .filter((d) => matchesWords(state.search.get(key(module, collection, d.id)) ?? "", words))
-          .slice(0, limit)
-      )),
-    put: (doc, expect, search) =>
-      Effect.sync(() => {
-        const k = key(doc.module, doc.collection, doc.id)
-        const existing = state.docs.get(k)
-        if (expect === "absent" ? existing !== undefined : existing?.rev !== expect) return false
-        state.docs.set(k, doc)
-        if (search.length > 0) state.search.set(k, search)
-        else state.search.delete(k)
-        return true
-      }),
-    delete: (module, collection, id, expect) =>
-      Effect.sync(() => {
-        const k = key(module, collection, id)
-        if (state.docs.get(k)?.rev !== expect) return false
-        state.docs.delete(k)
-        state.search.delete(k)
-        return true
-      }),
-    rewrite: (doc, v, text) =>
-      locked(Effect.sync(() => {
-        const k = key(doc.module, doc.collection, doc.id)
-        const now = state.docs.get(k)
-        if (now !== undefined && now.rev === doc.rev) state.docs.set(k, { ...now, v, text })
-      })),
-    append: (change) =>
-      Effect.sync(() => {
-        const seq = state.nextSeq++
-        state.changes.push({ ...change, seq, undone: false })
-        return seq
-      }),
-    lastUndoable: (module, collection, actorKey) =>
-      Effect.sync(() => {
-        for (let i = state.changes.length - 1; i >= 0; i--) {
-          const c = state.changes[i]!
-          if (c.module !== module || c.collection !== collection || c.actorKey !== actorKey) continue
-          if (c.undone || c.undoes !== undefined || c.op === "erase") continue
-          return c
-        }
-        return undefined
-      }),
-    markUndone: (seq) =>
-      Effect.sync(() => {
-        state.changes = state.changes.map((c) => (c.seq === seq ? { ...c, undone: true } : c))
-      }),
-    changedSince: (module, collection, id, seq) =>
-      Effect.sync(() => state.changes.some((c) => c.seq > seq && c.module === module && c.collection === collection && c.id === id && !c.undone && c.undoes === undefined)),
-    purge: (module, collection, id) =>
-      Effect.sync(() => {
-        state.changes = state.changes.map((c) => {
-          if (c.module !== module || c.collection !== collection || c.id !== id || c.payload === undefined) return c
-          const { payload: _gone, ...rest } = c
-          return rest
-        })
-        state.search.delete(key(module, collection, id))
-      }),
-    afterErase: Effect.void
-  }
-
-  const noSql = (moduleId: string): ModuleSql => {
-    const fail = Effect.fail(new StoreError({ reason: "unavailable", message: "Module SQL needs the SQLite store (use makeSqliteStore({ filename: \":memory:\" }) in tests)" }))
-    const prefix = sqlPrefixOf(moduleId)
-    return { prefix, table: (n) => `${prefix}${n}`, fts5: false, query: () => fail, run: () => fail }
-  }
-
-  const stores = new Map<string, ReturnType<typeof makeModuleStoreOn>>()
-
-  const prepare = (modules: ReadonlyArray<StoredModule>) =>
-    Effect.sync(() => {
-      for (const m of modules) {
-        const collections = new Map((m.storage?.collections ?? []).map((c) => [c.name, c]))
-        declared.set(m.id, collections)
-        stores.delete(m.id)
-        const stored = versions.get(m.id) ?? new Map<string, number>()
-        const newer = [...collections.values()].find((c) => (stored.get(`collection:${c.name}`) ?? 0) > c.version)
-        const sqlNewer = (stored.get("sql") ?? 0) > (m.storage?.sql?.migrations.length ?? 0)
-        if (newer !== undefined || sqlNewer) {
-          verdicts.set(m.id, {
-            reason: newer !== undefined
-              ? `Its data (${newer.name}, version ${stored.get(`collection:${newer.name}`)}) was written by a newer version of this module; update the module. The data is kept as it is.`
-              : "Its data was written by a newer version of this module; update the module. The data is kept as it is."
-          })
-          continue
-        }
-        if ((m.storage?.sql?.migrations.length ?? 0) > 0) {
-          verdicts.set(m.id, { reason: "It keeps SQL tables, which need the SQLite store." })
-          continue
-        }
-        verdicts.delete(m.id)
-        if (readOnly) continue
-        for (const c of collections.values()) stored.set(`collection:${c.name}`, Math.max(stored.get(`collection:${c.name}`) ?? 0, c.version))
-        versions.set(m.id, stored)
-      }
-    })
-
-  const forModule = (moduleId: string) => {
-    let s = stores.get(moduleId)
-    if (s === undefined) {
-      s = makeModuleStoreOn(backend, moduleId, declared.get(moduleId) ?? new Map(), noSql(moduleId))
-      stores.set(moduleId, s)
+  /** The sort key of a row in an index (`CheckedQuery.index`), ending with createdAt; the id breaks the last tie. */
+  const sortKey = (d: MemoryDoc, q: CheckedQuery): ReadonlyArray<unknown> => {
+    const i = q.index
+    switch (i.kind) {
+      case "updated":
+        return [d.updatedAt, d.createdAt]
+      case "created":
+        return [d.createdAt]
+      case "s":
+        return [d.keys[i.slots[0]!] ?? null, d.createdAt]
+      case "u":
+        return [d.keys[i.slots[0]!] ?? null, d.updatedAt, d.createdAt]
+      case "p":
+        return [d.keys[i.slots[0]!] ?? null, d.keys[i.slots[1]!] ?? null, d.createdAt]
     }
-    return s
   }
-
-  const oldestSeq = () => state.changes[0]?.seq ?? state.nextSeq
-
-  const exportModule = (moduleId: string): Effect.Effect<ModuleExport, StoreError> =>
-    locked(Effect.gen(function*() {
-      const at = yield* Clock.currentTimeMillis
-      const collections: Record<string, Array<ModuleExport["collections"][string][number]>> = {}
-      for (const d of state.docs.values()) {
-        if (d.module !== moduleId) continue
-        ;(collections[d.collection] ??= []).push({ id: d.id, rev: d.rev, scope: d.scope, value: JSON.parse(d.text), createdAt: d.createdAt, updatedAt: d.updatedAt })
-      }
-      return { module: moduleId, exportedAt: at, collections, tables: {} }
-    }))
 
   return {
-    info: { kind: "memory", readOnly, fts5: false },
-    prepare,
-    availability: (moduleId) => verdicts.get(moduleId),
-    forModule,
-    transaction,
-    core: (owner) => {
-      const fail = Effect.fail(new StoreError({ reason: "unavailable", message: "Core SQL needs the SQLite store" }))
-      return { prefix: `core_${owner}__`, query: () => fail, run: () => fail, migrate: () => fail }
+    readOnly: options.readOnly === true,
+    begin: () => {
+      if (undo !== undefined) throw new StoreError({ reason: "failed", message: "A transaction is already open" })
+      undo = []
     },
-    changesSince: (seq, limit) =>
-      locked(Effect.sync(() => {
-        const after = state.changes.filter((c) => c.seq > seq)
-        return {
-          changes: after.slice(0, limit).map(({ actorKey: _k, ...c }) => c),
-          complete: after.length <= limit,
-          oldest: oldestSeq()
-        }
-      })),
-    lastSeq: locked(Effect.sync(() => state.nextSeq - 1)),
-    endConversation: (conversationId) =>
-      readOnly ? Effect.succeed(0) : transaction(Effect.sync(() => {
-        let n = 0
-        for (const [k, d] of state.docs) {
-          if (d.scope.kind === "conversation" && d.scope.id === conversationId) {
-            state.docs.delete(k)
-            state.search.delete(k)
-            n++
-          }
-        }
-        return n
-      })),
-    pruneChanges: (opts) =>
-      readOnly ? Effect.fail(readOnlyError("pruneChanges")) : transaction(Effect.gen(function*() {
-        const now = opts?.now ?? (yield* Clock.currentTimeMillis)
-        const cut = now - (opts?.maxAgeMs ?? CHANGE_RETENTION_MS)
-        const before = state.changes.length
-        state.changes = state.changes.filter((c) => c.at >= cut)
-        return before - state.changes.length
-      })),
-    backup: () => Effect.fail(new StoreError({ reason: "unavailable", message: "The in-memory store has no backups" })),
-    exportModule,
-    onCommit: (listener) => {
-      listeners.add(listener)
-      return () => listeners.delete(listener)
+    commit: () => {
+      undo = undefined
     },
-    changeLog: () => state.changes.map(({ actorKey: _k, ...c }) => c),
-    onRollback: (undo) => Effect.flatMap(Effect.service(TxRef), (tx) => Effect.sync(() => (tx?.store === self ? void tx.undo.push(undo) : undefined))),
-    searchEntry: (module, collection, id) => state.search.get(key(module, collection, id))
+    rollback: () => {
+      const steps = undo ?? []
+      undo = undefined
+      for (let i = steps.length - 1; i >= 0; i--) steps[i]!()
+    },
+    inTransaction: () => undo !== undefined,
+    read: (owner, collection, id) => {
+      const d = docs.get(key(owner, collection, id))
+      return d === undefined ? undefined : plain(d)
+    },
+    list: (owner, collection, scope, q) => {
+      const first = "slots" in q.index ? q.index.slots[0]! : undefined
+      return docsOf(owner, collection, scope)
+        .filter((d) => q.where === undefined || (d.keys[first!] ?? null) === q.where)
+        .sort((a, b) => {
+          const ka = sortKey(a, q)
+          const kb = sortKey(b, q)
+          let c = 0
+          for (let i = 0; i < ka.length && c === 0; i++) c = compareIndexed(ka[i], kb[i])
+          if (c === 0) c = compareCodePoints(a.id, b.id)
+          return q.desc ? -c : c
+        })
+        .slice(0, q.limit)
+        .map(plain)
+    },
+    page: (owner, collection, scope, after, limit) => {
+      const cmp = (a: { updatedAt: number; createdAt: number; id: string }, b: { updatedAt: number; createdAt: number; id: string }) =>
+        a.updatedAt - b.updatedAt || a.createdAt - b.createdAt || compareCodePoints(a.id, b.id)
+      return docsOf(owner, collection, scope)
+        .filter((d) => after === undefined || cmp(d, after) < 0)
+        .sort((a, b) => cmp(b, a))
+        .slice(0, limit)
+        .map(plain)
+    },
+    put: (doc, keys, expect) => {
+      const k = key(doc.owner, doc.collection, doc.id)
+      const existing = docs.get(k)
+      if (expect === "absent" ? existing !== undefined : existing === undefined || existing.rev !== expect || !sameScope(existing.scope, doc.scope)) return false
+      set(k, { ...doc, scope: { ...doc.scope }, keys: [...keys] })
+      return true
+    },
+    remove: (owner, collection, id, scope, expect) => {
+      const k = key(owner, collection, id)
+      const existing = docs.get(k)
+      if (existing === undefined || existing.rev !== expect || !sameScope(existing.scope, scope)) return false
+      set(k, undefined)
+      return true
+    },
+    nextRev: () => {
+      const before = rev
+      remember(() => {
+        rev = before
+      })
+      return ++rev
+    },
+    lastRev: () => rev,
+    scan: (owner, collection, afterId, limit) =>
+      [...docs.values()]
+        .filter((d) => d.owner === owner && d.collection === collection && compareCodePoints(d.id, afterId) > 0)
+        .sort((a, b) => compareCodePoints(a.id, b.id))
+        .slice(0, limit)
+        .map(plain),
+    count: (owner, collection, cap) => {
+      let n = 0
+      for (const d of docs.values()) if (d.owner === owner && d.collection === collection && ++n > cap) break
+      return n
+    },
+    rewrite: (doc, v, text, keys) => {
+      const k = key(doc.owner, doc.collection, doc.id)
+      const now = docs.get(k)
+      if (now !== undefined) set(k, { ...now, v, text, keys: [...keys] })
+    },
+    conversationRows: (conversationId, after, limit) => {
+      const order = (x: BulkKey) => [x.scopeId, x.owner, x.collection, x.id]
+      const cmp = (a: BulkKey, b: BulkKey) => {
+        const ka = order(a)
+        const kb = order(b)
+        for (let i = 0; i < ka.length; i++) {
+          const c = compareCodePoints(ka[i]!, kb[i]!)
+          if (c !== 0) return c
+        }
+        return 0
+      }
+      return [...docs.values()]
+        .filter((d) => d.scope.kind === "conversation" && (conversationId === undefined || d.scope.id === conversationId))
+        .map((d): BulkRow => ({ scopeId: d.scope.kind === "household" ? "" : d.scope.id, owner: d.owner, collection: d.collection, id: d.id, scope: { ...d.scope }, rev: d.rev }))
+        .filter((r) => after === undefined || cmp(r, after) > 0)
+        .sort(cmp)
+        .slice(0, limit)
+    },
+    ownerVersion: (owner) => ownerVersions.get(owner),
+    setOwnerVersion: (owner, version) => {
+      const before = ownerVersions.get(owner)
+      remember(() => (before === undefined ? ownerVersions.delete(owner) : ownerVersions.set(owner, before)))
+      ownerVersions.set(owner, version)
+    },
+    storedCollections: (owner) => new Map(collections.get(owner) ?? []),
+    allCollections: () => [...collections.entries()].flatMap(([owner, cs]) => [...cs.entries()].map(([name, meta]) => ({ owner, name, version: meta.version }))),
+    setCollection: (owner, name, meta) => {
+      let cs = collections.get(owner)
+      if (cs === undefined) collections.set(owner, cs = new Map())
+      const target = cs
+      const before = target.get(name)
+      remember(() => (before === undefined ? target.delete(name) : target.set(name, before)))
+      target.set(name, { ...meta })
+    },
+    syncIndexes: (_owner, c: Collection<any>) => void layoutOf(c),
+    indexesReady: () => true,
+    removed: () => {}
+  }
+}
+
+export const makeMemoryHouseholdStore = (options: MemoryStoreOptions = {}): HouseholdStore => {
+  const backend = makeMemoryBackend(options)
+  const { inTransaction: _inTransaction, ...engine } = makeStoreEngine({ backend })
+  return {
+    ...engine,
+    info: { kind: "memory", readOnly: backend.readOnly },
+    backup: () => Effect.fail(new StoreError({ reason: "unavailable", message: "The in-memory store has no backups" }))
   }
 }

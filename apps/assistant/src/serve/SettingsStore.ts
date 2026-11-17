@@ -133,7 +133,16 @@ const V3DeviceRecord = Schema.Struct({
 const StoredDeviceTypeSchema = Schema.Struct({ ...DeviceSettings.fields, rev: NonNegativeInt })
 const StoredDeviceSchema = Schema.Struct({ ...DeviceRecordSchema.fields, rev: NonNegativeInt })
 
-export const SETTINGS_VERSION = 4
+/**
+ * The settings file's format. 5 (P5): device types and devices have the `place` and `capabilities` sections and a
+ * device record its last declaration (`declared`); shared settings have Members. A version-4 file is migrated at load
+ * (`migrateV4ToV5`: nothing in it changes meaning; the original is kept as `settings.json.v4-backup`). A file of a
+ * newer version than this stops the start (it is never set aside or overwritten). An assistant of version 4 (before
+ * P5) cannot refuse a version-5 file this way: it sets the file aside as `settings.json.corrupt-<time>` (kept, not
+ * changed) and starts from the defaults; to go back to such a build, put `settings.json.v4-backup` back first
+ * (docs/ASSISTANTS.md §6).
+ */
+export const SETTINGS_VERSION = 5
 
 export interface SecretsFile {
   readonly version: 2
@@ -179,12 +188,52 @@ interface Read<A> {
 }
 
 /**
- * `settings.json` as read: version 4, or an older one read as version 3 (`from`: the version it had; 0: no file)
- * that `migrateToV4` turns into version 4.
+ * `settings.json` as read: version 5 (`from` 4: a version-4 file, migrated by `migrateV4ToV5`), or an older one read
+ * as version 3 (`from`: the version it had; 0: no file) that `migrateToV4` turns into the current version.
  */
 export type StoredSettings =
-  | { readonly version: 4; readonly file: SettingsFile }
+  | { readonly version: 5; readonly file: SettingsFile; readonly from: 4 | 5 }
   | { readonly version: 3; readonly file: SettingsFileV3; readonly from: number }
+
+/**
+ * Version 4 → 5 (P5). Explicit, although nothing changes meaning: a type entry without `place` or `capabilities`
+ * already reads as the built-in's (`withNewKeys`), and a device's own sections never had them. The file is then
+ * written as version 5, so a version-4 assistant can no longer read it as its own and drop what it does not know.
+ */
+export const migrateV4ToV5 = (file: Omit<SettingsFile, "version"> & { readonly version: 4 | 5 }): SettingsFile => ({ ...file, version: 5 })
+
+/** The error for a settings file of a newer format than this assistant's (`undefined` otherwise). */
+export const newerSettings = (path: string, text: string | undefined): SettingsStoreError | undefined => {
+  if (text === undefined) return undefined
+  const u = parseOrUndefined(text)
+  if (!isRecord(u) || typeof u.version !== "number" || u.version <= SETTINGS_VERSION) return undefined
+  return new SettingsStoreError({
+    message: `${path} was written by a newer version of the assistant (settings version ${u.version}; this one reads up to ` +
+      `${SETTINGS_VERSION}). Nothing was changed. Start that version, or restore an older copy of the file (settings.json.v4-backup ` +
+      "and the daily backups are next to it)."
+  })
+}
+
+/**
+ * P5: the newer-format refusal of a writable start, read before any write: `settings.json`, the journal's own version,
+ * and the settings on either side of an unfinished save (recovery would write one of them back).
+ */
+const newerOnDisk = async (settingsPath: string, journalPath: string): Promise<SettingsStoreError | undefined> => {
+  const onDisk = newerSettings(settingsPath, await readText(settingsPath))
+  if (onDisk !== undefined) return onDisk
+  const raw = await readText(journalPath)
+  if (raw === undefined) return undefined
+  const journal = parseOrUndefined(raw)
+  const newer = newerJournal(journalPath, journal)
+  if (newer !== undefined) return newer
+  if (!isRecord(journal)) return undefined
+  for (const side of [journal.prior, journal.next]) {
+    if (!isRecord(side) || typeof side.settings !== "string") continue
+    const inJournal = newerSettings(journalPath, side.settings)
+    if (inJournal !== undefined) return inJournal
+  }
+  return undefined
+}
 
 const decodeOverrides = Schema.decodeUnknownOption(ProfileOverrides)
 const decodeV3Device = Schema.decodeUnknownOption(V3DeviceRecord)
@@ -255,17 +304,19 @@ const readEntities = (u: Record<string, unknown>, problems: Array<string>): Assi
 }
 
 /**
- * Read `settings.json` of version 1, 2, 3 or 4 (exported for tests). The revision is kept. Versions 1–3 are read
- * as version 3 with the version they had (`from`), for `migrateToV4`.
+ * Read `settings.json` of version 1 to 5 (exported for tests). The revision is kept. Version 4 is read as version 5
+ * (`migrateV4ToV5`, `migrated`); versions 1–3 as version 3 with the version they had (`from`), for `migrateToV4`.
+ * A newer version is not read (`newerSettings` stops the start before this).
  */
 export const readStoredSettings = (u: unknown): Read<StoredSettings> | undefined => {
   if (!isRecord(u) || !optionalRecords(u.modules)) return undefined
   const modules = (u.modules ?? {}) as SettingsFile["modules"]
-  if (u.version === 4 && (u.assistant === undefined || isRecord(u.assistant))) {
+  if ((u.version === 4 || u.version === 5) && (u.assistant === undefined || isRecord(u.assistant))) {
     if (["assistants", "deviceTypes", "devices"].some((k) => u[k] !== undefined && !isRecord(u[k]))) return undefined
     const problems: Array<string> = []
-    const file: SettingsFile = { version: 4, ...revisionField(u), modules, assistant: (u.assistant ?? {}) as Record<string, unknown>, ...readEntities(u, problems) }
-    return { file: { version: 4, file }, migrated: false, problems }
+    const from = u.version
+    const file = migrateV4ToV5({ version: from, ...revisionField(u), modules, assistant: (u.assistant ?? {}) as Record<string, unknown>, ...readEntities(u, problems) })
+    return { file: { version: 5, file, from }, migrated: from === 4, problems }
   }
   if ((u.version === 2 || u.version === 3) && (u.assistant === undefined || isRecord(u.assistant))) {
     if (u.version === 3 && ((u.frontends !== undefined && !isRecord(u.frontends)) || (u.devices !== undefined && !isRecord(u.devices)))) {
@@ -285,8 +336,8 @@ export const readStoredSettings = (u: unknown): Read<StoredSettings> | undefined
 }
 
 /**
- * Read `settings.json` of any version as version 4 (exported for tests): an older file is migrated in memory
- * (`migrateToV4`, without secrets). `migrated`: it was not version 4.
+ * Read `settings.json` of any version as the current one (exported for tests): an older file is migrated in memory
+ * (`migrateToV4`, without secrets, or `migrateV4ToV5`). `migrated`: it was not the current version.
  */
 export const readSettingsFile = (
   u: unknown,
@@ -296,8 +347,8 @@ export const readSettingsFile = (
   if (read === undefined) return undefined
   const stored = read.file
   return {
-    file: stored.version === 4 ? stored.file : migrateToV4({ file: stored.file, from: stored.from, context: options.context ?? {}, now: options.now ?? Date.now() }),
-    migrated: stored.version === 3,
+    file: stored.version === 5 ? stored.file : migrateToV4({ file: stored.file, from: stored.from, context: options.context ?? {}, now: options.now ?? Date.now() }),
+    migrated: read.migrated || stored.version === 3,
     problems: read.problems
   }
 }
@@ -334,6 +385,11 @@ export const KEYS_LOCKED_MESSAGE = "Keys are locked — unlock them in Settings 
 export interface SettingsStore {
   readonly directory: string
   readonly settings: () => SettingsFile
+  /**
+   * P5: `listener(before, after)` runs synchronously in the step that commits a new settings state, before anything
+   * else can run (the device boundary, `serveMode.ts`). Returns an unsubscribe function.
+   */
+  readonly onCommitted: (listener: (before: SettingsFile, after: SettingsFile) => void) => () => void
   /** The secrets in effect: the vault's (empty while it is locked) once a vault exists, else `data/secrets.json`. */
   readonly secrets: () => SecretsFile
   /** Keys still in `data/secrets.json` (a count; 0 when the file is gone or empty). */
@@ -410,7 +466,9 @@ export interface SettingsStore {
   /**
    * P3: replace the module route tokens (`RouteTokens.ts`), kept with the module secrets under the entry
    * `ROUTE_TOKENS_ENTRY` (not a module id), so they live in the key vault once there is one. `change` maps the
-   * committed entry to the new one. Refused while the vault is locked.
+   * committed entry to the new one. Refused while the vault is locked, and while the settings are `blocked()`
+   * (checked again inside the serialized save): like a device registering, a token change is never the owner's word
+   * that damaged settings are right, so it never acknowledges them or lets anything start.
    */
   readonly saveRouteTokens: (change: (committed: Readonly<Record<string, string>>) => Readonly<Record<string, string>>) => Effect.Effect<void, SettingsStoreError>
 }
@@ -469,6 +527,7 @@ export type StartupStep =
   | "set-aside-file"
   | "migrate-settings"
   | "migrate-assistants"
+  | "migrate-settings-v5"
 
 /**
  * Before each file operation of a writable startup: a check that the lock is still held (its release has not
@@ -652,6 +711,9 @@ const readSnapshot = async (
     const readKind = validJournal(journal) ? journalKind(journal) : kind
     const settings = await readText(paths.settings)
     await options.afterRead?.("settings", attempt)
+    // A newer format is refused here too (the CLI modes), before any comparison.
+    const newerFile = newerSettings(paths.settings, settings)
+    if (newerFile !== undefined) throw newerFile
     const secrets = await readText(secretsPathOf(paths, readKind, paths.journal))
     await options.afterRead?.("secrets", attempt)
     const journalAgain = await readText(paths.journal)
@@ -825,6 +887,10 @@ export const loadSettingsStore = (directory: string, options: LoadOptions = {}):
           kind = snapshot.kind
           texts = snapshot
         } else {
+          // A newer format stops the start before anything is written to the data directory (no leftover tidied, no
+          // journal recovered, nothing migrated): settings.json itself, and both sides of an unfinished save.
+          const refused = await newerOnDisk(settingsPath, journalPath)
+          if (refused !== undefined) throw refused
           const asidesBefore = await tidyLeftovers(directory, problems, gate)
           const recovered = await recover(directory, paths, options, problems, gate)
           const damaged = recovered === "damaged"
@@ -858,6 +924,9 @@ export const loadSettingsStore = (directory: string, options: LoadOptions = {}):
           }
         }
         const settingsText = texts.settings
+        // A newer format stops here, before anything could set the file aside or write over it.
+        const newer = newerSettings(settingsPath, settingsText)
+        if (newer !== undefined) throw newer
         const loadedSettings = await loadFile(settingsPath, readStoredSettings, emptyStored, options, problems, settingsText, gate)
         // `secrets.json`: the secrets themselves (no vault), or keys left to import into the vault.
         const fileText = kind === "file" ? texts.secrets : await readText(secretsPath)
@@ -869,8 +938,19 @@ export const loadSettingsStore = (directory: string, options: LoadOptions = {}):
           : undefined
         const stored = loadedSettings.file
         let settingsFile: SettingsFile
-        if (stored.version === 4) {
+        if (stored.version === 5) {
           settingsFile = stored.file
+          if (stored.from === 4 && !readOnly) {
+            // Version 4 → 5: the original next to it, then version 5 with the same revision (one write).
+            await gate("migrate-settings-v5")
+            const backup = await backupPath(settingsPath, "v4", settingsText ?? "", options)
+            await writeFile(backup, settingsText ?? "", { mode: 0o644 })
+            await writeAtomic(directory, settingsPath, text(settingsFile), 0o644)
+            problems.push(
+              `${settingsPath} was migrated to version 5 (people, rooms and device capabilities); the original is in ${backup}. ` +
+                "An assistant from before this version cannot read the new file: to go back to one, put the original back first."
+            )
+          }
         } else {
           // Version 1–3 → 4 (docs/ASSISTANTS.md §6). The keys are read only for whether a module's key is set.
           const keys = kind === "vault" ? (readOnly ? vaultSecrets : vault?.secrets()) : loadedSecrets.file
@@ -882,7 +962,7 @@ export const loadSettingsStore = (directory: string, options: LoadOptions = {}):
             now: (options.now ?? Date.now)()
           })
           if (stored.from > 0 && !readOnly) {
-            // Keep the original next to it, then write version 4 with the same revision (secrets.json, if it was
+            // Keep the original next to it, then write the current version with the same revision (secrets.json, if it was
             // version 1, is rewritten at its next save). One write: a reader sees the old file or the new one.
             await gate(stored.from === 1 ? "migrate-settings" : "migrate-assistants")
             const backup = await backupPath(settingsPath, stored.from === 1 ? "v1" : "v3", settingsText ?? "", options)
@@ -890,7 +970,7 @@ export const loadSettingsStore = (directory: string, options: LoadOptions = {}):
             await writeAtomic(directory, settingsPath, text(settingsFile), 0o644)
             const notes = settingsFile.migration?.notes ?? []
             problems.push(
-              `${settingsPath} was migrated to version 4 (assistants and devices); the original is in ${backup}.` +
+              `${settingsPath} was migrated to version ${SETTINGS_VERSION} (assistants and devices); the original is in ${backup}.` +
                 (notes.length > 0 ? ` What changed: ${notes.join(" ")}` : "")
             )
           }
@@ -913,6 +993,22 @@ export const loadSettingsStore = (directory: string, options: LoadOptions = {}):
         : { version: 2, modules: loaded.vaultSecrets?.modules ?? {}, assistant: loaded.vaultSecrets?.assistant ?? {} }
       let revision = Math.max(settings.revision ?? 0, secrets.revision ?? 0, revisionOf(loaded.vaultText) ?? 0)
       const unblockListeners: Array<() => void> = []
+      /**
+       * P5: called synchronously in the step that makes a new state the committed one (before the save's caller runs
+       * again, and before any other fiber), with the state before and after. A listener's error is logged, never the
+       * save's.
+       */
+      const commitListeners = new Set<(before: SettingsFile, after: SettingsFile) => void>()
+      const notifyCommitted = (before: SettingsFile, after: SettingsFile) => {
+        if (before === after) return
+        for (const listener of commitListeners) {
+          try {
+            listener(before, after)
+          } catch (error) {
+            console.error("settings: a commit listener failed", error)
+          }
+        }
+      }
 
       const fromVault = (): SecretsFile => {
         const s = vault?.secrets()
@@ -965,7 +1061,9 @@ export const loadSettingsStore = (directory: string, options: LoadOptions = {}):
       const saveNow = async (change: Change, after?: () => Promise<void>) => {
         if (readOnly) {
           const next = change({ settings, secrets: current() })
+          const committedBefore = settings
           settings = next.settings
+          notifyCommitted(committedBefore, settings)
           if (readOnlyVaultSecrets === undefined) secrets = next.secrets
           return
         }
@@ -1033,7 +1131,9 @@ export const loadSettingsStore = (directory: string, options: LoadOptions = {}):
           }
         }
         if (journaled) await removeJournalAfterSave()
+        const committedBefore = settings
         settings = next.settings
+        notifyCommitted(committedBefore, settings)
         secrets = next.secrets
         return true
       }
@@ -1059,7 +1159,9 @@ export const loadSettingsStore = (directory: string, options: LoadOptions = {}):
           await options.beforeStep?.("settings")
           await write(settingsPath, wantSettings, 0o644)
           disk.settings = wantSettings
+          const committedBefore = settings
           settings = JSON.parse(wantSettings) as SettingsFile
+          notifyCommitted(committedBefore, settings)
           return true
         }
         if (!unlocked) throw new KeysUnavailable(KEYS_LOCKED_MESSAGE)
@@ -1099,7 +1201,9 @@ export const loadSettingsStore = (directory: string, options: LoadOptions = {}):
         vaultDirty = false
         await removeJournalAfterSave()
         writer.adopt({ modules: next.secrets.modules, assistant: next.secrets.assistant }, revision)
+        const committedBefore = settings
         settings = nextSettings
+        notifyCommitted(committedBefore, settings)
         return true
       }
 
@@ -1357,6 +1461,10 @@ export const loadSettingsStore = (directory: string, options: LoadOptions = {}):
       const store: SettingsStore = {
         directory,
         settings: () => settings,
+        onCommitted: (listener) => {
+          commitListeners.add(listener)
+          return () => commitListeners.delete(listener)
+        },
         secrets: current,
         legacySecretCount: () => countKeys(secrets),
         importLegacySecrets,
@@ -1383,13 +1491,22 @@ export const loadSettingsStore = (directory: string, options: LoadOptions = {}):
           save: saveModule
         },
         saveRouteTokens: (change) =>
-          persistSettings("the route tokens", (committed) => ({
-            settings: committed.settings,
-            secrets: {
-              ...committed.secrets,
-              modules: withSecrets(committed.secrets.modules, ROUTE_TOKENS_ENTRY, change(committed.secrets.modules[ROUTE_TOKENS_ENTRY] ?? {}))
-            }
-          }))
+          Effect.suspend(() =>
+            blockedProblem !== undefined
+              ? Effect.fail(new SettingsStoreError({ message: `The route tokens were not saved: ${blockedProblem}` }))
+              : persistSettings("the route tokens", (committed) => {
+                // Inside the serialized save too: a token change queued behind another save never reaches the files
+                // of a blocked store.
+                if (blockedProblem !== undefined) throw new KeysUnavailable(`The route tokens were not saved: ${blockedProblem}`)
+                return {
+                  settings: committed.settings,
+                  secrets: {
+                    ...committed.secrets,
+                    modules: withSecrets(committed.secrets.modules, ROUTE_TOKENS_ENTRY, change(committed.secrets.modules[ROUTE_TOKENS_ENTRY] ?? {}))
+                  }
+                }
+              })
+          )
       }
       return store
     },

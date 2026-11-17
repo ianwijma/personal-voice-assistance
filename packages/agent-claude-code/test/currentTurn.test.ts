@@ -40,9 +40,12 @@ const unlock = makeTool({
 
 const turn: TurnContext = { turnId: 7, conversationId: "c1", assistantId: "jeff", deviceId: "d-kitchen-0001", deviceName: "Kitchen", source: "voice" }
 
-const inputOf = (): AgentTurnInput => {
+const inputOf = (mode: "serve" | "cli" = "serve"): AgentTurnInput => {
   const trace: Trace = { id: 7, mode: "voice", speculative: false, startedAt: 0, marks: {}, tools: [], voices: [] }
-  const gateway = makeExecutionGateway({ access: { moduleOn: () => true, toolOff: (assistant, _m, tool) => assistant === "jeff" && tool === "unlock" } })
+  // Serve mode gives the gateway the assistants' choices (a call with no turn is then refused); the CLI modes do not.
+  const gateway = mode === "cli"
+    ? makeExecutionGateway()
+    : makeExecutionGateway({ access: { moduleOn: () => true, toolOff: (assistant, _m, tool) => assistant === "jeff" && tool === "unlock" } })
   return {
     turnId: 7,
     text: "Who am I?",
@@ -89,10 +92,16 @@ describe("the Claude Code bridge and module API v2", () => {
       expect(results[1]).toEqual({ content: "Not run: unlock is switched off for this assistant.", isError: true })
       expect(ran).toEqual(["whoami"])
 
-      // Without a turn (no origin: the CLI modes) the tool reads undefined, and no access check applies.
+      // Without a turn in the CLI modes the tool reads undefined and runs for the local principal.
       seen.length = 0
-      yield* Stream.runDrain(agent.turn(inputOf()))
+      yield* Stream.runDrain(agent.turn(inputOf("cli")))
       expect(seen).toEqual([undefined])
+      // In serve mode a call that comes with no turn is refused, never run (a missing context is not "allowed").
+      seen.length = 0
+      results.length = 0
+      yield* Stream.runDrain(agent.turn(inputOf("serve")))
+      expect(seen).toEqual([])
+      expect(results[0]).toEqual({ content: "Not run: it has no turn, job or other principal to run for.", isError: true })
       agent.shutdown()
     }))
 })

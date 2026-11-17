@@ -7,9 +7,8 @@
     ".": "./src/index.ts",
     "./testing": "./src/testing.ts",
     "./download": "./src/download.ts",
-    "./store-backend": "./src/ModuleStoreImpl.ts",
-    "./store-contract": "./src/storeContract.ts",
-    "./scheduler-contract": "./src/schedulerContract.ts"
+    "./store-backend": "./src/StoreEngine.ts",
+    "./store-contract": "./src/storeContract.ts"
   },
   "scripts": {
     "check": "tsc -p tsconfig.json",

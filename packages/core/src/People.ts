@@ -1,6 +1,7 @@
 import type { Effect } from "effect"
 import { ServiceKey } from "./ModuleApi.ts"
-import { editDistance, normalizePhrase, phoneticKey, stem, words } from "./TextMatching.ts"
+import { memberNameKey } from "@pva/protocol"
+import { editDistance, phoneticKey, stem, words } from "./TextMatching.ts"
 
 /**
  * The household's people (docs/MODULES-PLAN.md §2 rows 1, 9, 15; §4 P5). `Person` records live in the core's household
@@ -83,6 +84,9 @@ export const effectiveDiet = (person: Pick<Person, "diet"> | undefined, househol
   }
 }
 
+/** A name as it is compared: `memberNameKey` (protocol), the same rule as the duplicate check of Members. */
+export const nameKey = (text: string): string => memberNameKey(text)
+
 /** Drop a trailing possessive ("Sam's" → "sam", "James'" → "james"). */
 const withoutPossessive = (text: string): string => text.replace(/['’]s?\s*$/u, "").trim()
 
@@ -93,10 +97,10 @@ const withoutPossessive = (text: string): string => text.replace(/['’]s?\s*$/u
  * is `ambiguous`; nothing is `none`.
  */
 export const findPerson = (people: ReadonlyArray<Person>, spoken: string): PersonMatch => {
-  const query = normalizePhrase(withoutPossessive(spoken))
+  const query = nameKey(withoutPossessive(spoken))
   if (query === "") return { kind: "none" }
   const stemmed = query.split(" ").map(stem).join(" ")
-  const names = (p: Person) => [p.name, ...p.aliases].map(normalizePhrase).filter((n) => n !== "")
+  const names = (p: Person) => [p.name, ...p.aliases].map(nameKey).filter((n) => n !== "")
   const decide = (matches: (p: Person) => boolean): PersonMatch | undefined => {
     const hits = people.filter(matches)
     if (hits.length === 0) return undefined

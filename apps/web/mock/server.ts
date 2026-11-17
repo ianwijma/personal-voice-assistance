@@ -143,13 +143,13 @@ import {
 import { exampleEngineStatus, exampleHealth, exampleSnapshot, exampleUnavailableModule, exampleVoiceSection, exampleWeatherModule } from "@pva/protocol/examples"
 import { type WebSocket, WebSocketServer } from "ws"
 import { createAssistantsMock, SAM_ID } from "./assistants.ts"
+import { fieldValueError } from "./fieldChecks.ts"
 import { seedTraces } from "./traces.ts"
 import { createVoiceAssistants, scenarioSettings, scriptedTurn } from "./voiceAssistants.ts"
 import { encodeWav, MOCK_PROVIDERS } from "./voices.ts"
 import { createModelPickersMock } from "./modelPickers.ts"
-import { createModuleRoutesMock, demoHomeAction, demoHomeModule } from "./demoHome.ts"
-import { createScheduledJobsMock } from "./scheduledJobs.ts"
-import type { Condition, FieldError } from "@pva/protocol"
+import { createModuleRoutesMock, demoHomeAction, demoHomeModule, TokenRefusal } from "./demoHome.ts"
+import { boundaryKey, checkDietList, checkMembersValue, cleanDeviceName, type Condition, type FieldError, speakerAllowedFrom } from "@pva/protocol"
 
 const PORT = Number(process.env.MOCK_PORT ?? 8787)
 const HOST = process.env.MOCK_HOST ?? "127.0.0.1"
@@ -561,7 +561,7 @@ const initialSections = (): Array<SettingsSection> => [
     form: {
       fields: [
         { type: "text", key: "HOME_LOCATION", label: "Location", description: "Town and country, e.g. \"Amsterdam, Netherlands\". Every assistant is told; the weather uses it when you name no place.", apply: "live", default: "", placeholder: "Amsterdam, Netherlands", maxLength: 200, source: "default" },
-        { type: "text", key: "HOME_TIME_ZONE", label: "Time zone", description: "IANA name, e.g. Europe/Amsterdam. Empty: this machine's zone.", apply: "live", default: "", placeholder: "Europe/Amsterdam", maxLength: 64, source: "default" },
+        { type: "text", key: "HOME_TIME_ZONE", label: "Time zone", description: "IANA name, e.g. Europe/Amsterdam (not an offset such as +01:00). Empty: this machine's zone.", apply: "live", default: "", placeholder: "Europe/Amsterdam", maxLength: 64, source: "default" },
         {
           type: "choice",
           key: "HOME_LANGUAGE",
@@ -591,9 +591,21 @@ const initialSections = (): Array<SettingsSection> => [
           default: "en-GB",
           options: [{ value: "en-GB", label: "13 November 2026" }, { value: "en-US", label: "November 13, 2026" }, { value: "nl-NL", label: "13 november 2026" }],
           source: "default"
-        }
+        },
+        { type: "text", key: "HOME_CURRENCY", label: "Currency", description: "Three-letter code of the household's money, e.g. EUR, USD, GBP (any three capital letters are accepted; use the ISO 4217 code). The default of modules that handle prices.", apply: "live", default: "EUR", placeholder: "EUR", maxLength: 3, source: "default" },
+        {
+          type: "choice",
+          key: "HOME_CUP_SIZE",
+          label: "Cup size",
+          description: "How big \"a cup\" is in recipes and shopping lists.",
+          apply: "live",
+          default: "metric",
+          options: [{ value: "metric", label: "Metric cup (250 ml)" }, { value: "us", label: "US cup (236.6 ml)" }],
+          source: "default"
+        },
+        { type: "text", key: "HOME_API_CONTACT", label: "API contact", description: "An email address or web address put in the User-Agent of requests to public web services that ask who is calling. Empty: none is sent.", apply: "live", default: "", placeholder: "you@example.com", maxLength: 200, source: "default" }
       ],
-      values: { HOME_LOCATION: "", HOME_TIME_ZONE: "", HOME_LANGUAGE: "en-GB", HOME_UNITS: "metric", HOME_DATE_FORMAT: "en-GB" },
+      values: { HOME_LOCATION: "", HOME_TIME_ZONE: "", HOME_LANGUAGE: "en-GB", HOME_UNITS: "metric", HOME_DATE_FORMAT: "en-GB", HOME_CURRENCY: "EUR", HOME_CUP_SIZE: "metric", HOME_API_CONTACT: "" },
       secrets: {},
       errors: []
     },
@@ -613,7 +625,7 @@ const initialSections = (): Array<SettingsSection> => [
           type: "records",
           key: "HOUSEHOLD_MEMBERS",
           label: "People",
-          description: "Each person's name, other names, and diet. A device points at one of them as its default person; removing someone clears that.",
+          description: "Each person's name, other names, and diet. A device points at one of them as its default person; removing someone clears that, and ends the session on every device (its pages reconnect and start a new conversation). Their stored data stays in the household database but is shown and told nowhere any more.",
           apply: "live",
           default: [],
           itemFields: [
@@ -944,17 +956,61 @@ let connSeq = 0
 const voiceSessions = new Map<string, VSession>()
 let conversationSeq = 0
 let modules = initialModules()
-const moduleRoutesMock = createModuleRoutesMock()
-const scheduledJobsMock = createScheduledJobsMock()
+// Reads the mock's vault each time (declared below): locked, tokens are neither listed nor changed.
+const moduleRoutesMock = createModuleRoutesMock(() => vault.state === "locked")
 /** Protocol 7: assistants, device types and the devices' own sections (mock/assistants.ts). */
 const assistantsMock = createAssistantsMock({
   modules: () => modules,
   toolNames: (id) => runningTools(id).map((t) => t.name),
   checkOwn: (id, own) => checkOwn(id, own),
-  accountProblem: (account) => accountProblem(account)
+  accountProblem: (account) => accountProblem(account),
+  // Read when a device is saved: `sections` is set before any request arrives.
+  isPerson: (id) => memberIds().has(id)
 })
 /** Protocol 7, the voice connection's side: the device's setup, a conversation per assistant, who has the turn (mock/voiceAssistants.ts). */
-const voice = createVoiceAssistants(assistantsMock, () => newConversationInfo())
+const voice = createVoiceAssistants(assistantsMock, () => newConversationInfo(), (deviceId) => speakerAllowedOf(deviceId))
+/**
+ * Protocol 11, as the server: reply audio is sent to a device only while its effective settings and its latest
+ * declaration allow speech (`speakerAllowedFrom`, shared with the server); its setup's speaking flags follow it.
+ */
+const speakerAllowedOf = (deviceId: string | undefined): boolean =>
+  speakerAllowedFrom(assistantsMock.deviceFields(deviceId ?? "").settings, deviceId === undefined ? undefined : devices.get(deviceId)?.declared?.capabilities)
+/**
+ * Protocol 11, as the server (`boundaryKey`, shared): what decides what each voice connection's device may be told or
+ * sent, by session key. Taken before a save and compared after it: a session whose key changed is ended with its
+ * connections (`CloseCode.settingsChanged`); every one when a person left Members.
+ */
+const boundaries = (): Map<string, string> => {
+  const members = memberIds()
+  const out = new Map<string, string>()
+  const keys = new Set<string>([...voiceSessions.keys(), ...[...conns].flatMap((c) => (c.frontend === "voice" && keyOf(c) !== undefined ? [keyOf(c)!] : []))])
+  for (const key of keys) {
+    const deviceId = voiceSessions.get(key)?.deviceId ?? [...conns].find((c) => keyOf(c) === key)?.deviceId
+    const known = deviceId !== undefined && devices.has(deviceId)
+    const settings = assistantsMock.deviceFields(known ? deviceId! : "").settings
+    out.set(key, known ? boundaryKey(settings, (id) => members.has(id)) : `unknown|${boundaryKey({ ...settings, place: { ...settings.place, defaultPerson: null } }, () => false)}`)
+  }
+  return out
+}
+/** End the sessions whose boundary changed since `before` (all of them: `everyone`). */
+const endChangedSessions = (before: ReadonlyMap<string, string>, everyone = false) => {
+  const after = boundaries()
+  for (const [key, was] of before) {
+    const now = after.get(key)
+    if (!everyone && now === was) continue
+    // A device not known before and known now (its first registration) is not a boundary.
+    if (!everyone && was.startsWith("unknown|") && now !== undefined && !now.startsWith("unknown|")) continue
+    const v = voiceSessions.get(key)
+    if (v !== undefined) dropSession(v)
+    for (const c of [...conns]) {
+      if (c.frontend !== "voice" || keyOf(c) !== key) continue
+      // Nothing more is sent on it from here on.
+      c.welcomed = false
+      conns.delete(c)
+      c.ws.close(CloseCode.settingsChanged, "settings changed")
+    }
+  }
+}
 /** The `wake` and `long-phrase` scenarios sleep until the phrase: saved on the web-voice type, as admin would. */
 const seedVoiceScenario = () => {
   const patch = scenarioSettings(scenario, LONG_PHRASE)
@@ -1350,6 +1406,7 @@ const resetState = () => {
   voiceSessions.clear()
   lastSessions = ""
   modules = initialModules()
+  moduleRoutesMock.reset()
   forcedErrors.clear()
   models = initialModels()
   sections = withWarnings(initialSections())
@@ -1806,6 +1863,8 @@ const runReply = (v: VSession, opts: {
   assistantId?: string | undefined
 }) => {
   if (v.reply !== undefined) interruptReply(v.reply)
+  // As the server: never spoken where no reply audio is sent (the override, or a declaration without speech).
+  opts = { ...opts, spoken: opts.spoken && speakerAllowedOf(v.deviceId) }
   const assistantId = opts.assistantId ?? voice.answeringOf(v, v.deviceId)
   const conv = voice.convFor(v, assistantId)
   const withId = assistantId === undefined ? {} : { assistantId }
@@ -1953,6 +2012,7 @@ const validate = (form: SettingsForm, patch: SettingsPatch) => {
     const field = form.fields.find((f) => f.key === k)
     if (field === undefined) errors.push({ key: null, message: `Unknown setting ${k}.` })
     else if (field.locked !== undefined) errors.push({ key: k, message: `${field.locked.reason}; change it there.` })
+    else if (fieldValueError(field, v) !== undefined) errors.push({ key: k, message: fieldValueError(field, v)! })
     else if (field.type === "number" && typeof v === "number" && ((field.min !== undefined && v < field.min) || (field.max !== undefined && v > field.max))) {
       errors.push({ key: k, message: `Must be between ${field.min} and ${field.max}.` })
     } else if (k === "defaultPlace" && typeof v === "string" && /atlantis/i.test(v)) errors.push({ key: k, message: "Open-Meteo does not know this place." })
@@ -2267,8 +2327,23 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
       }
       const errors = validate(section.form, patch)
       if (errors.length > 0) return result(c, m.requestId, false, { code: "invalid_settings", message: "Some settings are not valid.", fieldErrors: errors })
-      // Protocol 11: Members gives every new person an id, as the server does.
-      if (section.id === "members") withPersonIds(patch)
+      // Protocol 11: Members is checked as the server checks it (`checkMembersValue` and `checkDietList`, the same
+      // functions), and every new person gets an id.
+      if (section.id === "members") {
+        const problems: Array<{ key: string; message: string }> = []
+        const list = patch.values.HOUSEHOLD_MEMBERS
+        if (list !== undefined && list !== null) {
+          const problem = checkMembersValue(list)
+          if (problem !== undefined) problems.push({ key: "HOUSEHOLD_MEMBERS", message: problem })
+        }
+        for (const key of ["HOUSEHOLD_DIET_ALLERGIES", "HOUSEHOLD_DIET_DIETS", "HOUSEHOLD_DIET_DISLIKES"]) {
+          const value = patch.values[key]
+          const problem = value === null ? undefined : checkDietList(section.form.fields.find((f) => f.key === key)?.label ?? key, value)
+          if (problem !== undefined) problems.push({ key, message: problem })
+        }
+        if (problems.length > 0) return result(c, m.requestId, false, { code: "invalid_settings", message: problems[0]!.message, fieldErrors: problems })
+        withPersonIds(patch)
+      }
       const candidate = sections.map((x, j) => (j === i ? { ...x, form: applyPatch(x.form, patch) } : x))
       const fresh = <E extends FieldError>(a: ReadonlyArray<E>, b: ReadonlyArray<E>) => b.filter((e) => !a.some((x) => x.key === e.key && x.message === e.message))
       const before = checks(sections)
@@ -2279,13 +2354,20 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
       if (newWarnings.length > 0 && m.confirmWarnings !== true) {
         return result(c, m.requestId, false, { code: "invalid_settings", message: "Check the warnings below, then save anyway or change the settings", warnings: newWarnings })
       }
+      const membersBefore = memberIds()
+      const boundariesBefore = boundaries()
       const committed = withWarnings(candidate)
       const changed = new Set(committed.filter((x, j) => j === i || JSON.stringify(x.form) !== JSON.stringify(sections[j]!.form)).map((x) => x.id))
       sections = committed.map((x) => (changed.has(x.id) ? { ...x, revision: x.revision + 1 } : x))
       for (const x of sections) if (changed.has(x.id)) broadcast({ type: "section.changed", section: x })
       if (changed.has("routing")) routingChanged()
       if (changed.has("llm-openai-accounts")) assistantsChanged()
-      if (changed.has("members") && assistantsMock.clearDefaultPeople(memberIds())) assistantsChanged()
+      if (changed.has("members")) {
+        const removed = [...membersBefore].some((id) => !memberIds().has(id))
+        if (assistantsMock.clearDefaultPeople(memberIds())) assistantsChanged()
+        // As the server: a person leaving Members ends every device's session.
+        if (removed) endChangedSessions(boundariesBefore, true)
+      }
       result(c, m.requestId, true)
       const needsReload = Object.keys({ ...patch.values, ...patch.secrets }).some((k) => section.form.fields.find((f) => f.key === k)?.apply === "reload")
       const path = `${section.group ?? "general"}/${section.page?.id ?? section.id}`
@@ -2308,12 +2390,15 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
     }
     case "health.check": {
       if (requireAdmin(c, m.requestId)) return
+      // As the server: answered once it has started; the outcome follows as `health`. A check already running is
+      // joined, not started again (one completion for any number of requests).
+      result(c, m.requestId, true)
+      if (health.checking) return
       health = { ...health, checking: true }
       broadcast({ type: "health", health })
       after(1000, () => {
-        health = { issues: health.issues.filter((i) => i.id !== "core.clock"), checkedAt: Date.now(), checking: false }
+        health = { issues: health.issues.filter((i) => i.id !== "music.speaker.kitchen"), checkedAt: Date.now(), checking: false }
         broadcast({ type: "health", health })
-        result(c, m.requestId, true)
       })
       return
     }
@@ -2417,11 +2502,11 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
       if (requireAdmin(c, m.requestId)) return
       const record = devices.get(m.id)
       if (record === undefined) return result(c, m.requestId, false, { code: "unknown_device", message: "This device is not known (any more)." })
+      const before = boundaries()
       devices.delete(m.id)
       assistantsMock.forgetDevice(m.id)
-      // A device that is connected now is recorded again as new.
-      const now = Date.now()
-      if ([...conns].some((x) => x.welcomed && x.deviceId === m.id)) devices.set(m.id, { ...record, firstSeen: now, lastSeen: now })
+      // As the server: a connected device's session ends (known → not known); its pages say hello again as a new device.
+      endChangedSessions(before)
       pushSetups()
       result(c, m.requestId, true)
       devicesChanged()
@@ -2453,15 +2538,21 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
     case "device.save": {
       if (requireAdmin(c, m.requestId)) return
       if (m.target.kind === "device" && !devices.has(m.target.id)) return result(c, m.requestId, false, { code: "unknown_device", message: "That device is not known." })
+      // The name went through the protocol's `SavedDeviceName` (one line, no control characters) when it was decoded.
       const name = m.name === undefined ? undefined : m.name.trim()
       if (name !== undefined && m.target.kind === "device" && name === "") return result(c, m.requestId, false, { code: "invalid_settings", message: "A device needs a name.", fieldErrors: [{ key: "name", message: "A device needs a name." }] })
+      const before = boundaries()
       const r = assistantsMock.saveDevice(m)
       if (r.ok && name !== undefined && m.target.kind === "device") {
         const record = devices.get(m.target.id)
         if (record !== undefined) record.name = name
       }
       sendTo(c, r.ok ? { type: "result", requestId: m.requestId, ok: true } : { type: "result", requestId: m.requestId, ok: false, ...(r.error !== undefined ? { error: r.error } : {}) })
-      if (r.ok) assistantsChanged()
+      if (r.ok) {
+        // As the server: privacy, the default person or an output override changed: those devices' sessions end.
+        endChangedSessions(before)
+        assistantsChanged()
+      }
       return
     }
     case "wake.test": {
@@ -2533,6 +2624,8 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
         if (m.live.lastInteractionAt !== undefined) c.lastInteractionAt = m.live.lastInteractionAt
       }
       devicesChanged()
+      // Whether replies are spoken here follows what it declared (the setup says so).
+      if (m.capabilities !== undefined) pushSetups()
       return
     }
   }
@@ -2585,7 +2678,7 @@ wss.on("connection", (ws: WebSocket) => {
         const known = devices.get(m.device.id)
         const declared = m.device.capabilities !== undefined ? { declared: { capabilities: m.device.capabilities, seenAt: now } } : {}
         devices.set(m.device.id, known === undefined
-          ? { id: m.device.id, kind: m.device.kind, name: m.device.name, firstSeen: now, lastSeen: now, ...declared }
+          ? { id: m.device.id, kind: m.device.kind, name: cleanDeviceName(m.device.name), firstSeen: now, lastSeen: now, ...declared }
           : { ...known, lastSeen: now, ...declared })
         c.deviceId = m.device.id
       }
@@ -2814,16 +2907,14 @@ const apiRoute = async (req: IncomingMessage, res: ServerResponse, path: string,
       throw new ApiFail(400, "invalid_request", "The request body is not valid JSON")
     }
   }
-  // P6: the scheduled jobs (as the real server's /api/scheduler/jobs).
-  if (path === "scheduler/jobs") {
-    only("GET")
-    return { status: 200, body: scheduledJobsMock.list() }
-  }
-  const cancelJob = /^scheduler\/jobs\/([A-Za-z0-9_-]{1,64})\/cancel$/.exec(path)
-  if (cancelJob !== null) {
-    only("POST")
-    if (!scheduledJobsMock.cancel(cancelJob[1]!)) throw new ApiFail(404, "not_found", "There is no such job (it may have been removed)")
-    return { status: 200, body: { cancelled: true } }
+  /** A refused token operation, answered as the real server does (status and code). */
+  const refusedAs = <A>(f: () => A): A => {
+    try {
+      return f()
+    } catch (error) {
+      if (error instanceof TokenRefusal) throw new ApiFail(error.status, error.code, error.message)
+      throw error
+    }
   }
   // Protocol 10: the admin view of module routes and their tokens (as the real server's /api/module-routes).
   const routesMatch = /^module-routes(?:\/([a-z][a-z0-9-]{0,39})\/tokens(?:\/([a-f0-9]{8,32}))?)?$/.exec(path)
@@ -2834,16 +2925,20 @@ const apiRoute = async (req: IncomingMessage, res: ServerResponse, path: string,
       const id = query.get("module")
       return { status: 200, body: moduleRoutesMock.view(modules.filter((x) => id === null || x.id === id)) }
     }
+    // As the server: tokens only for an installed module (running or not).
+    if (!modules.some((x) => x.id === moduleId)) throw new ApiFail(404, "not_found", `There is no module "${moduleId}"`)
     if (tokenId === undefined) {
       only("POST")
       const b = await body()
       if (typeof b.name !== "string" || !/^[a-z][a-z0-9-]{0,31}$/.test(b.name) || typeof b.label !== "string" || b.label.trim() === "") {
         throw new ApiFail(400, "invalid_request", "A token needs a name and a label")
       }
-      return { status: 201, body: moduleRoutesMock.mint(moduleId, b.name, b.label.trim()) }
+      const name = b.name
+      const label = b.label
+      return { status: 201, body: refusedAs(() => moduleRoutesMock.mint(moduleId, name, label)) }
     }
     only("DELETE")
-    if (!moduleRoutesMock.revoke(moduleId, tokenId)) throw new ApiFail(404, "not_found", "There is no such token (it may have been revoked already)")
+    if (!refusedAs(() => moduleRoutesMock.revoke(moduleId, tokenId))) throw new ApiFail(404, "not_found", "There is no such token (it may have been revoked already)")
     return { status: 200, body: { revoked: true } }
   }
   if (path === "voice-providers") {

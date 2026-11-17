@@ -153,7 +153,7 @@ describe("release gate: startup (recovery and clean-up)", () => {
     })))
     // The prior (version-2) settings were restored, then migrated to version 4 with the same revision.
     expect(readFileSync(join(dir, "settings.json.v3-backup"), "utf8")).toBe(prior.settings)
-    expect(JSON.parse(readFileSync(join(dir, "settings.json"), "utf8"))).toMatchObject({ version: 4, revision: 1 })
+    expect(JSON.parse(readFileSync(join(dir, "settings.json"), "utf8"))).toMatchObject({ version: 5, revision: 1 })
     expect(readFileSync(join(dir, "secrets.json"), "utf8")).toBe(prior.secrets)
     expect(existsSync(join(dir, "transaction.json"))).toBe(false)
     expect(store.settings().modules.m?.settings?.greeting).toBe("hello")

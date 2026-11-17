@@ -15,9 +15,8 @@ import {
 import { MAX_TEXT_INPUT_CHARS } from "./constants.ts"
 import { MAX_MOVE_KEYS } from "./env.ts"
 import { DeviceSettingsPatch, DeviceTarget } from "./devices.ts"
-import { DeviceHello, DeviceId, DeviceName, FrontendRole, WakePhrase } from "./frontends.ts"
+import { DeviceHello, DeviceId, FrontendRole, SavedDeviceName, WakePhrase } from "./frontends.ts"
 import { DeviceCapabilities, DeviceLiveState } from "./capabilities.ts"
-import { HouseholdHello } from "./household.ts"
 import { JobAction, ToolId } from "./jobs.ts"
 import { SettingsPatch, SettingValue } from "./settings.ts"
 import { Password } from "./vault.ts"
@@ -55,12 +54,7 @@ export const Hello = Schema.Struct({
    * reload or reconnect stays logged in. Valid: `admin.snapshot` follows `welcome`. Not valid: `snapshot.admin` says
    * `loggedIn: false` (no error).
    */
-  adminToken: Schema.optionalKey(AdminToken),
-  /**
-   * Household data (additive, docs/STORING-DATA.md): the last change number this page applied. The server replays the
-   * changes after it (`household.event`), or sends a fresh `household.snapshot` when it cannot.
-   */
-  household: Schema.optionalKey(HouseholdHello)
+  adminToken: Schema.optionalKey(AdminToken)
 })
 
 /** Facts about the browser's audio setup, for logs and the latency trace. */
@@ -411,8 +405,8 @@ export const DeviceSave = Schema.Struct({
   requestId: RequestId,
   target: DeviceTarget,
   rev: NonNegativeInt,
-  /** Devices only. */
-  name: Schema.optionalKey(DeviceName),
+  /** Devices only. One line (`SavedDeviceName`): a name with a line break or a control character is refused. */
+  name: Schema.optionalKey(SavedDeviceName),
   settings: DeviceSettingsPatch,
   saveAnyway: Schema.optionalKey(Schema.Boolean)
 })
@@ -437,7 +431,9 @@ export const DevicePick = Schema.Struct({
 /**
  * Protocol 9, admin only: "Check again" on the Health page. The server probes every program the modules need again,
  * re-judges which modules are available (starting those that now are), runs every module's `health()` and the core
- * checks, and sends `health`. Answered with `result` once the check has finished.
+ * checks, and sends `health`. Answered with `result` as soon as the check has started (it can take longer than a
+ * page waits for an answer): `health` with `checking: true` comes first, and the outcome arrives as `health` with
+ * `checking: false`. A check already running is not started twice.
  */
 export const HealthCheck = Schema.Struct({
   type: Schema.Literal("health.check"),

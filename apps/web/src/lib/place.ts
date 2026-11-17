@@ -1,4 +1,4 @@
-import type { DeviceCapabilities, DevicePrivacy, SettingsSection } from "@pva/protocol"
+import { type DeviceCapabilities, type DevicePrivacy, type SettingsSection, speakerMediaWords } from "@pva/protocol"
 
 /**
  * The Place and "What it can do" sections of a device page (protocol 11), as pure functions: the household's people
@@ -54,8 +54,33 @@ export const declaredRows = (caps: DeviceCapabilities): ReadonlyArray<{ readonly
         : `${DISPLAY_SIZE[d.class] ?? d.class}, ${d.widthPx} × ${d.heightPx}${d.dpr !== 1 ? ` at ×${d.dpr}` : ""}${d.touch === "none" ? "" : d.touch === "coarse" ? ", touch" : ", mouse or pen"}${d.colour ? "" : ", no colour"}`,
       has: d !== undefined
     },
-    { key: "speaker", label: "Speaker", value: caps.speaker === undefined ? "None" : caps.speaker.media.includes("audio") ? "Speech and sound" : "Speech", has: caps.speaker !== undefined },
+    // The speaker's actual media set: "Speech and sound", "Sound, no speech" (no reply is spoken there), "Plays nothing".
+    { key: "speaker", label: "Speaker", value: caps.speaker === undefined ? "None" : speakerValue(caps.speaker.media), has: caps.speaker !== undefined },
     { key: "microphone", label: "Microphone", value: caps.microphone === undefined ? "None" : caps.microphone.farField ? "Hears across the room" : "Yes", has: caps.microphone !== undefined },
     { key: "openUrl", label: "Opens links", value: caps.openUrl === true ? "Yes (a phone)" : "No", has: caps.openUrl === true }
   ]
 }
+
+const speakerValue = (media: ReadonlyArray<"speech" | "audio" | "video">): string => {
+  const words = speakerMediaWords(media)
+  return words === "nothing" ? "Plays nothing" : words.charAt(0).toUpperCase() + words.slice(1)
+}
+
+/**
+ * The presentation kinds a "What it may show" switch is offered for: those the protocol knows (`KNOWN_PRESENT_KINDS`),
+ * those declared by the device (or by any device of a type), and those excluded already. Sorted, without repeats.
+ */
+export const kindsFor = (from: {
+  readonly known: ReadonlyArray<string>
+  readonly declared: ReadonlyArray<{ readonly declared?: { readonly capabilities: DeviceCapabilities } | undefined }>
+  readonly excluded: ReadonlyArray<string>
+}): ReadonlyArray<string> =>
+  [...new Set([...from.known, ...from.declared.flatMap((d) => Object.keys(d.declared?.capabilities.present?.kinds ?? {})), ...from.excluded])].sort()
+
+/**
+ * Next to the fields whose change ends a device's session (privacy, default person, its speaker, screen and kinds),
+ * what saving does (`CloseCode.settingsChanged` on the server).
+ */
+export const BOUNDARY_NOTE = (isType: boolean): string =>
+  `Saving a change here ends the session on ${isType ? "every device that follows these defaults" : "this device"}: ` +
+  "its pages reconnect at once, a reply being spoken stops, and a new conversation starts with nothing said before."

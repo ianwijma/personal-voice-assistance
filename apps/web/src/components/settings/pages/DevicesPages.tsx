@@ -1,6 +1,6 @@
 "use client"
 import { type ReactNode, useCallback, useEffect, useRef, useState } from "react"
-import { type AssistantInfo, type DeviceListInfo, type DeviceTypeInfo, type FieldError, MAX_DEVICE_NAME_CHARS, type SessionInfo } from "@pva/protocol"
+import { type AssistantInfo, type DeviceListInfo, type DeviceTypeInfo, type FieldError, isOneLine, MAX_DEVICE_NAME_CHARS, type SessionInfo } from "@pva/protocol"
 import { type Outcome, quoted } from "@/lib/assistants.ts"
 import {
   baseOfDevice,
@@ -136,6 +136,14 @@ function Row({ d, type, defaults, assistants, session, now }: {
 }
 
 /** Devices › All devices: each type with its defaults first, then its devices; who answers on each, and how. */
+
+/**
+ * P5: a device name as admin may save it (the protocol's `SavedDeviceName`: not blank, one line, no control or
+ * bidirectional characters), so the page never sends one the server refuses. `undefined`: fine, or not edited.
+ */
+const nameProblem = (name: string | undefined): string | undefined =>
+  name === undefined ? undefined : name.trim() === "" ? "A device needs a name." : !isOneLine(name) ? "A name is one line of text, without control characters." : undefined
+
 export function DevicesPage() {
   const types = useClientState((s) => s.deviceTypes)
   const devices = useClientState((s) => s.devices)
@@ -406,13 +414,13 @@ function DeviceEditor({ type, device }: { readonly type: DeviceTypeInfo; readonl
             <dt className="text-ink-muted">First seen</dt>
             <dd className="text-ink">{new Date(device.firstSeen).toLocaleDateString(undefined, { day: "numeric", month: "long", year: "numeric" })}</dd>
           </dl>
-          <DField testId="name" label="Name" htmlFor="device-name" help="Shown here, in Diagnostics and in the header while this device has the audio." markers={edit.name !== undefined && edit.name.trim() !== device.name ? <span className="label ml-auto text-[11px] text-voice" data-testid="unsaved-marker">Unsaved</span> : undefined}>
+          <DField testId="name" label="Name" htmlFor="device-name" help="Shown here, in Diagnostics and in the header while this device has the audio." {...(nameProblem(edit.name) !== undefined ? { error: nameProblem(edit.name)! } : {})} markers={edit.name !== undefined && edit.name.trim() !== device.name ? <span className="label ml-auto text-[11px] text-voice" data-testid="unsaved-marker">Unsaved</span> : undefined}>
             <input
               id="device-name"
               value={edit.name ?? device.name}
               maxLength={MAX_DEVICE_NAME_CHARS}
               onChange={(e) => update((x) => ({ ...x, name: e.target.value }))}
-              aria-invalid={edit.name !== undefined && edit.name.trim() === "" ? true : undefined}
+              aria-invalid={nameProblem(edit.name) !== undefined ? true : undefined}
               className={inputClass}
             />
           </DField>
@@ -452,7 +460,7 @@ function DeviceEditor({ type, device }: { readonly type: DeviceTypeInfo; readonl
       {has("look") && <LookSection ctx={ctx} assistants={assistants} />}
       {has("voice") && <VoiceSection ctx={ctx} assistants={assistants} />}
       {has("place") && <PlaceSection ctx={ctx} />}
-      {has("capabilities") && <CapabilitiesSection ctx={ctx} device={device} now={now} />}
+      {has("capabilities") && <CapabilitiesSection ctx={ctx} device={device} now={now} {...(isType ? { typeKind: type.kind } : {})} />}
       <section className="flex flex-col gap-3" aria-labelledby="h-other" data-testid="section-other">
         <h3 id="h-other" className="label text-ink-faint">Other device settings</h3>
         {has("interrupting") && (
@@ -514,7 +522,7 @@ function DeviceEditor({ type, device }: { readonly type: DeviceTypeInfo; readonl
       <FormFooter
         dirty={dirty}
         saving={saving}
-        saveDisabled={!dirty || saving || blocked.size > 0 || (edit.name !== undefined && edit.name.trim() === "")}
+        saveDisabled={!dirty || saving || blocked.size > 0 || nameProblem(edit.name) !== undefined}
         onSave={() => void save()}
         onCancel={() => {
           discard()

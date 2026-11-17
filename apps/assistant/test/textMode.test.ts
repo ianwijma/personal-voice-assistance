@@ -7,7 +7,7 @@ import { startCliModules } from "../src/modules.ts"
 import { runTextTurns } from "../src/text.ts"
 
 // The module catalog through the host, with nothing saved (the test never reads data/).
-const Modules = Layer.effect(ToolRegistry, Effect.map(startCliModules({ persistence: readOnlyPersistence() }), (s) => s.registry))
+const Modules = Layer.effect(ToolRegistry, Effect.map(startCliModules({ persistence: readOnlyPersistence() }), (s) => s.snapshot().registry))
 
 it.live("text turn: fake LLM → clock tool → spoken-style answer", () =>
   Effect.gen(function*() {

@@ -452,7 +452,7 @@ describe("serve: modules and settings", () => {
     ])
     const saved = JSON.parse(readFileSync(join(server!.dataDir, "settings.json"), "utf8"))
     expect(saved).toMatchObject({
-      version: 4,
+      version: 5,
       revision: expect.any(Number),
       assistant: { STT_SHERPA_FINAL_SILENCE_MS: 500 },
       deviceTypes: { "web-voice": { interruptMode: "instant" } },

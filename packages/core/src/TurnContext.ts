@@ -36,7 +36,22 @@ export interface TurnContext {
   readonly person?: TurnPerson
   /** How it came: `voice` spoken, `text` typed, `touch` a tap on a presentation, `phrase` a phrase command, `routine` a routine step. */
   readonly source: TurnSource
+  /**
+   * The connection (browser tab) the request came in on, opaque: several tabs can share a device id. Serve mode sets
+   * it for voice turns (the tab that owns the device's audio when the turn starts) and typed turns (the tab that sent
+   * the text). Compare with `===`; never shown or stored.
+   */
+  readonly connection?: ConnectionRef
 }
+
+/** An opaque reference to one connection of the server (serve mode makes one per WebSocket client). */
+export interface ConnectionRef {
+  readonly _tag: "ConnectionRef"
+  /** For logs only: the connection's client id. */
+  readonly id: string
+}
+
+export const makeConnectionRef = (id: string): ConnectionRef => ({ _tag: "ConnectionRef", id })
 
 /** Where a call came from (`TurnContext.source`). `Conversation` makes `voice` and `text`; later entry paths the others. */
 export type TurnSource = "voice" | "text" | "touch" | "phrase" | "routine"
@@ -50,6 +65,62 @@ export type TurnOrigin = Omit<TurnContext, "turnId" | "conversationId" | "source
 
 /** The current turn, provided around every tool call and action run; `undefined` outside a turn. */
 export const CurrentTurn = Context.Reference<TurnContext | undefined>("@pva/core/CurrentTurn", {
+  defaultValue: () => undefined
+})
+
+/**
+ * Where a job's call comes from (P6's scheduler provides it as `CurrentJob` around a job's work): the job, the module
+ * that owns it, and, when the job acts for someone, the assistant, device and person it was made for.
+ */
+export interface JobOrigin {
+  readonly jobId: string
+  readonly moduleId: string
+  readonly assistantId?: string
+  readonly deviceId?: string
+  readonly person?: TurnPerson
+}
+
+/** The job a call runs for, outside a turn; `undefined` otherwise. Nothing in P1 provides it. */
+export const CurrentJob = Context.Reference<JobOrigin | undefined>("@pva/core/CurrentJob", {
+  defaultValue: () => undefined
+})
+
+/**
+ * Where an action on a notification comes from (P9): the notification, and the device and connection it was taken
+ * on. Nothing produces it yet; the gateway admits such a call by the notification (`Principal`).
+ */
+export interface NotificationOrigin {
+  readonly notificationId: string
+  readonly deviceId: string
+  readonly connection?: ConnectionRef
+  readonly person?: TurnPerson
+}
+
+/**
+ * On whose behalf a tool or action runs: the execution gateway's admission takes one (docs/MODULES-PLAN.md §4 P1).
+ *
+ * - `turn`: a turn (assistant, device, person, connection), from `CurrentTurn`.
+ * - `job`: a job, from `CurrentJob` (P6).
+ * - `local`: the person at the terminal (the CLI modes, which have no assistants); explicit, never assumed in serve mode.
+ * - `notification`: an action on a notification (P9), admitted by the notification whatever modules the device's
+ *   assistant has on. Passed explicitly; nothing produces it yet.
+ */
+export type Principal =
+  | { readonly _tag: "turn"; readonly turn: TurnContext }
+  | { readonly _tag: "job"; readonly job: JobOrigin }
+  | { readonly _tag: "local" }
+  | { readonly _tag: "notification"; readonly notification: NotificationOrigin }
+
+/** The local principal of the CLI modes. */
+export const LOCAL_PRINCIPAL: Principal = { _tag: "local" }
+
+/**
+ * The principal a call runs for, as the execution gateway admitted it: provided (with the matching `CurrentTurn` and
+ * `CurrentJob`) around every `execute` and `run` it admits, so code inside it, and the calls it makes in turn
+ * (`host.actions.run`, a service), act for exactly that principal, a local or notification one included. Outside a
+ * gateway call it is `undefined`. Read by the gateway after `CurrentTurn` and `CurrentJob`.
+ */
+export const CurrentPrincipal = Context.Reference<Principal | undefined>("@pva/core/CurrentPrincipal", {
   defaultValue: () => undefined
 })
 

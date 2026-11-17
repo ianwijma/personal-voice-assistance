@@ -4,7 +4,7 @@ import { type AddressInfo } from "node:net"
 import { type ClientMessage, CloseCode, decodeClientMessage, decodeMicFrame, encodeReplyFrame, encodeServerMessage, PROTOCOL_VERSION, type ServerMessage } from "@pva/protocol"
 import { serverExamples } from "@pva/protocol/examples"
 import { WebSocket as WsClient, WebSocketServer, type WebSocket as ServerSocket } from "ws"
-import { type AudioPort, backoffMs, makeConnection } from "@/lib/connection.ts"
+import { type AudioPort, backoffMs, makeConnection, SETTINGS_CHANGED_NOTICE } from "@/lib/connection.ts"
 import { createClientStore } from "@/lib/store.ts"
 
 const timing = { openTimeoutMs: 1000, welcomeTimeoutMs: 500, pingEveryMs: 60, pongTimeoutMs: 150, requestTimeoutMs: 300, backoffBaseMs: 20, backoffMaxMs: 80 }
@@ -94,6 +94,21 @@ const connect = (url: string, audio: AudioPort, hooks = {}) => {
 }
 
 describe("connection", () => {
+  it("P5: a close for changed settings reconnects at once, says hello again and shows a notice after the welcome (once)", async () => {
+    const { url, peers } = await startServer()
+    const { store } = connect(url, fakeAudio().audio)
+    await until(() => store.get().connection.status === "open")
+    expect(store.get().toasts).toEqual([])
+    peers[0]!.ws.close(CloseCode.settingsChanged, "settings changed")
+    await until(() => peers.length === 2 && store.get().connection.status === "open")
+    expect(peers[1]!.text[0]!.type).toBe("hello")
+    expect(store.get().toasts.map((t) => [t.message, t.tone])).toEqual([[SETTINGS_CHANGED_NOTICE, "info"]])
+    // An ordinary drop afterwards: no notice again.
+    peers[1]!.ws.terminate()
+    await until(() => peers.length === 3 && store.get().connection.status === "open")
+    expect(store.get().toasts.filter((t) => t.message === SETTINGS_CHANGED_NOTICE)).toHaveLength(1)
+  })
+
   it("says hello, dispatches the welcome and answers liveness pings", async () => {
     const { url, peers } = await startServer()
     const { store, conn } = connect(url, fakeAudio().audio)

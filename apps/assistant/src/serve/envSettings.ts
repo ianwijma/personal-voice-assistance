@@ -7,6 +7,7 @@ import { assistantFieldOf, MIGRATED_ASSISTANT_ID } from "./migrateAssistants.ts"
 import type { Sections } from "./sections.ts"
 import { sectionDefinitions } from "./sectionDefinitions.ts"
 import type { SettingsStore } from "./SettingsStore.ts"
+import { MEMBERS_ENV_REFUSED, MEMBERS_KEY } from "./people.ts"
 
 /**
  * Settings set outside the UI (docs/SETTINGS-UI.md §4.4): which environment
@@ -32,7 +33,8 @@ export const BOOTSTRAP_KEYS: ReadonlySet<string> = new Set([
   "SERVE_HOST",
   "SERVE_PORT",
   "SERVE_TLS_CERT",
-  "SERVE_TLS_KEY"
+  "SERVE_TLS_KEY",
+  "SERVE_BEHIND_PROXY"
 ])
 
 /** Benchmarks, tests and the command-line modes' audio (docs/SETTINGS-UI.md §1). */
@@ -91,6 +93,12 @@ const ENGINE_KEYS: Readonly<Record<string, string>> = {
 }
 /** `VOICE_<NAME>_<KEY>`: a per-voice override of an engine key (or `VOICE_<NAME>_PROVIDER`). */
 const VOICE_KEY = /^VOICE_[A-Z0-9]+_(.+)$/
+
+/**
+ * Variables the assistant knows and refuses to read, with why (shown in the environment view; protocol 11
+ * `EnvEntry.refused`). `HOUSEHOLD_MEMBERS`: people have ids the server makes.
+ */
+export const REFUSED_KEYS: Readonly<Record<string, string>> = { [MEMBERS_KEY]: MEMBERS_ENV_REFUSED }
 
 const isSecretName = (key: string) => /(_API_KEY|_TOKEN|_SECRET|_PASSWORD)$/.test(key)
 
@@ -210,7 +218,8 @@ export const envInfo = (view: EnvView, envCatalog: EnvCatalog): EnvInfo => {
     const origin = view.origin(key)
     if (origin === undefined) continue
     const kind = envCatalog.kind(key)
-    if (origin.kind === "process" && kind === "unknown") continue
+    const refused = Object.hasOwn(REFUSED_KEYS, key) ? REFUSED_KEYS[key] : undefined
+    if (origin.kind === "process" && kind === "unknown" && refused === undefined) continue
     const target = envCatalog.target(key)
     entries.push({
       key,
@@ -219,7 +228,8 @@ export const envInfo = (view: EnvView, envCatalog: EnvCatalog): EnvInfo => {
       kind,
       secret: isSecretTarget(target, key) || BOOTSTRAP_KEYS.has(key) && isSecretName(key),
       ...(target !== undefined && kind === "setting" ? { page: { path: [...target.path], title: target.title } } : {}),
-      movable: origin.kind === "file" && kind === "setting"
+      movable: origin.kind === "file" && kind === "setting",
+      ...(refused !== undefined ? { refused } : {})
     })
   }
   return { files: [...view.files], entries }

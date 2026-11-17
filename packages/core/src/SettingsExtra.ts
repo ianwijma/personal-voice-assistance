@@ -1,4 +1,19 @@
-import type { ChoiceOption, Condition, RecordItemField, SettingField } from "@pva/protocol"
+import {
+  type ChoiceOption,
+  type Condition,
+  MAX_COMBO_OPTIONS,
+  MAX_FIELD_DESCRIPTION,
+  MAX_FIELD_LABEL,
+  MAX_LIST_JSON,
+  MAX_OPTIONS_JSON,
+  MAX_RECORD_FIELDS,
+  MAX_RECORD_TEXT,
+  MAX_RECORDS,
+  MAX_TEXT_LIST_ITEM,
+  MAX_TEXT_LIST_ITEMS,
+  type RecordItemField,
+  type SettingField
+} from "@pva/protocol"
 import type { Decoded, Setting } from "./Settings.ts"
 
 /**
@@ -35,6 +50,33 @@ export type ExtendedSetting<A> = Setting<A>
 const ok = <A>(value: A): Decoded<A> => ({ ok: true, value })
 const fail = (error: string): Decoded<never> => ({ ok: false, error })
 
+/**
+ * A declaration outside the wire's bounds (docs/SETTINGS-UI.md §3.2) is refused when the module is defined, not
+ * when its form is sent: one module's long label must never break the admin snapshot.
+ */
+const declare = (what: string, ok: boolean, rule: string) => {
+  if (!ok) throw new Error(`${what}: ${rule}`)
+}
+const limit = (what: string, n: number | undefined, max: number) =>
+  declare(what, n === undefined || (Number.isInteger(n) && n >= 1 && n <= max), `must be a whole number from 1 to ${max}`)
+const textBound = (what: string, text: string | undefined, max: number) => declare(what, text === undefined || text.length <= max, `at most ${max} characters`)
+const declareCommon = (o: { readonly label: string; readonly description?: string | undefined }) => {
+  textBound(`Field "${o.label.slice(0, 40)}" label`, o.label, MAX_FIELD_LABEL)
+  textBound(`Field "${o.label.slice(0, 40)}" description`, o.description, MAX_FIELD_DESCRIPTION)
+}
+const declareOptions = (what: string, options: ReadonlyArray<ChoiceOption> | undefined) => {
+  if (options === undefined) return
+  declare(what, options.length <= MAX_COMBO_OPTIONS, `at most ${MAX_COMBO_OPTIONS} options`)
+  for (const option of options) {
+    declare(what, option.value.length >= 1 && option.value.length <= 200, "an option value has 1 to 200 characters")
+    textBound(`${what} option label`, option.label, MAX_FIELD_LABEL)
+    textBound(`${what} option description`, option.description, 500)
+    textBound(`${what} option implication`, option.implication, 500)
+  }
+  declare(what, JSON.stringify(options).length <= MAX_OPTIONS_JSON, `the options must be at most ${MAX_OPTIONS_JSON} characters as JSON`)
+}
+const tooLarge = (value: unknown) => JSON.stringify(value).length > MAX_LIST_JSON
+
 const commonFields = (key: string, o: Common) => ({
   key,
   label: o.label,
@@ -50,27 +92,43 @@ const visibility = (o: Common) => ({
   overridable: o.overridable === true
 })
 
-/** A list of short strings: aliases, greeting words. Trimmed, empty items dropped, duplicates (ignoring case) dropped. */
+/** Line breaks, control characters and bidirectional overrides: never in a one-line value. */
+export const NOT_ONE_LINE = /[\p{Cc}\p{Zl}\p{Zp}\u202A-\u202E\u2066-\u2069]/u
+
+/**
+ * A list of short strings: aliases, greeting words. Trimmed, empty items dropped, duplicates (ignoring case) dropped;
+ * an item with a line break or a control character is refused.
+ */
 const textList = (o: Common & {
   readonly default?: ReadonlyArray<string>
   readonly maxItems?: number
   readonly itemMaxLength?: number
   readonly placeholder?: string
 }): Setting<ReadonlyArray<string>> => {
+  declareCommon(o)
+  limit("A text list's maxItems", o.maxItems, MAX_TEXT_LIST_ITEMS)
+  limit("A text list's itemMaxLength", o.itemMaxLength, MAX_TEXT_LIST_ITEM)
+  textBound("A text list's placeholder", o.placeholder, MAX_FIELD_LABEL)
   const maxItems = o.maxItems ?? 50
   const itemMaxLength = o.itemMaxLength ?? 60
   const decode = (raw: unknown): Decoded<ReadonlyArray<string>> => {
     if (!Array.isArray(raw) || !raw.every((v): v is string => typeof v === "string")) return fail("Must be a list of text")
+    // Bounded before anything is looked at (the wire's limits, whatever the field declares).
+    if (raw.length > MAX_TEXT_LIST_ITEMS * 4) return fail(`At most ${maxItems} items`)
     const seen = new Set<string>()
     const items: Array<string> = []
     for (const item of raw.map((s) => s.trim()).filter((s) => s.length > 0)) {
       if (item.length > itemMaxLength) return fail(`"${item.slice(0, 20)}…" is longer than ${itemMaxLength} characters`)
+      // Items are short words that may reach a prompt: one line each.
+      if (NOT_ONE_LINE.test(item)) return fail(`"${item.slice(0, 20).replace(NOT_ONE_LINE, " ")}…" holds a line break or a control character`)
       if (seen.has(item.toLowerCase())) continue
       seen.add(item.toLowerCase())
       items.push(item)
     }
-    return items.length > maxItems ? fail(`At most ${maxItems} items`) : ok(items)
+    if (items.length > maxItems) return fail(`At most ${maxItems} items`)
+    return tooLarge(items) ? fail(`The list is too long (at most ${MAX_LIST_JSON} characters in all)`) : ok(items)
   }
+  declare("A text list's default", decode(o.default ?? []).ok, "must be a value the field accepts")
   return {
     type: "textList",
     secret: false,
@@ -105,8 +163,9 @@ const itemField = (key: string, setting: ItemSetting, hidden: boolean): RecordIt
 }
 
 /**
- * An ordered list of records with the same flat fields (rooms with aliases, lamps). Missing item keys take the item
- * field's default; unknown keys are dropped. From the environment: JSON (`DEMO_ROOMS='[{"name":"Kitchen"}]'`).
+ * An ordered list of records with the same flat fields (rooms with aliases, lamps). A missing item key is the item
+ * field's default, decoded and checked exactly like a given value (a field whose check refuses its default refuses the
+ * omission); unknown keys are dropped. From the environment: JSON (`DEMO_ROOMS='[{"name":"Kitchen"}]'`).
  */
 const records = <const I extends ItemSpec>(o: Common & {
   readonly item: I
@@ -124,8 +183,16 @@ const records = <const I extends ItemSpec>(o: Common & {
 }): Setting<ReadonlyArray<ItemOf<I>>> => {
   for (const [key, s] of Object.entries(o.item)) {
     if (s.secret || !ITEM_TYPES.includes(s.type)) throw new Error(`Record field "${key}" cannot be of type ${s.type}`)
+    const d = s.describe(key) as { readonly label: string; readonly description?: string; readonly maxLength?: number; readonly options?: ReadonlyArray<ChoiceOption> }
+    declareCommon(d)
+    if (s.type === "text") limit(`Record field "${key}" maxLength`, d.maxLength, MAX_RECORD_TEXT)
+    declareOptions(`Record field "${key}"`, d.options)
   }
   if (!Object.hasOwn(o.item, o.titleKey)) throw new Error(`Records title "${o.titleKey}" is not one of its item fields`)
+  declareCommon(o)
+  declare("A records field", Object.keys(o.item).length <= MAX_RECORD_FIELDS, `at most ${MAX_RECORD_FIELDS} item fields`)
+  limit("A records field's maxItems", o.maxItems, MAX_RECORDS)
+  textBound("A records field's itemLabel", o.itemLabel, 60)
   const maxItems = o.maxItems ?? 50
   const decode = (raw: unknown): Decoded<ReadonlyArray<ItemOf<I>>> => {
     if (!Array.isArray(raw)) return fail("Must be a list")
@@ -135,19 +202,22 @@ const records = <const I extends ItemSpec>(o: Common & {
       if (typeof entry !== "object" || entry === null || Array.isArray(entry)) return fail(`${upper(o.itemLabel)} ${index + 1}: must be an object`)
       const value: Record<string, unknown> = {}
       for (const [key, setting] of Object.entries(o.item)) {
-        if (!Object.hasOwn(entry, key)) {
-          value[key] = setting.defaultValue
-          continue
-        }
-        const decoded = setting.decode((entry as Record<string, unknown>)[key])
+        // An omitted key is the field's default, decoded and checked exactly like a value that was given (a field
+        // whose check refuses its own default, a required name, refuses the omission too). A field without a
+        // default must be given.
+        const given = Object.hasOwn(entry, key)
+        if (!given && setting.defaultValue === undefined) return fail(`${upper(o.itemLabel)} ${index + 1}, ${setting.describe(key).label}: Missing`)
+        const decoded = setting.decode(given ? (entry as Record<string, unknown>)[key] : setting.defaultValue)
         if (!decoded.ok) return fail(`${upper(o.itemLabel)} ${index + 1}, ${setting.describe(key).label}: ${decoded.error}`)
         value[key] = decoded.value
       }
       result.push(value as ItemOf<I>)
     }
+    if (tooLarge(result)) return fail(`The list is too long (at most ${MAX_LIST_JSON} characters in all)`)
     const problem = o.check?.(result)
     return problem === undefined ? ok(result) : fail(problem)
   }
+  declare("A records field's default", decode(o.default ?? []).ok, "must be a value the field accepts")
   return {
     type: "records",
     secret: false,
@@ -181,7 +251,8 @@ const upper = (s: string) => (s.length === 0 ? s : s[0]!.toUpperCase() + s.slice
 /**
  * Free text with suggestions: a model name. `options` are the static suggestions; a running instance adds more
  * through `settingOptions` (the host puts them on the described field). With `allowCustom: false` only static
- * options are accepted (so dynamic lists need `allowCustom: true`).
+ * options are accepted, on every path a value arrives by (the form, the environment, an assistant's own value, a
+ * button's draft), and the host shows only those: a list known only while the module runs needs `allowCustom: true`.
  */
 const combo = (o: Common & {
   readonly default: string
@@ -190,6 +261,10 @@ const combo = (o: Common & {
   readonly maxLength?: number
   readonly placeholder?: string
 }): Setting<string> => {
+  declareCommon(o)
+  limit("A combo's maxLength", o.maxLength, MAX_RECORD_TEXT)
+  textBound("A combo's placeholder", o.placeholder, MAX_FIELD_LABEL)
+  declareOptions("A combo", o.options)
   const allowCustom = o.allowCustom ?? true
   const maxLength = o.maxLength ?? 200
   const known = new Set((o.options ?? []).map((x) => x.value))
@@ -234,6 +309,17 @@ const action = (o: Omit<Common, "env" | "apply" | "overridable"> & {
    * False: the page sends its draft (non-secret values; secrets stay the saved ones) and the handler sees it.
    */
   readonly requiresSaved?: boolean
+}): Setting<undefined> & { readonly value: "none" } => {
+  declareCommon(o)
+  textBound("An action's buttonLabel", o.buttonLabel, 60)
+  textBound("An action's confirm text", o.confirm, MAX_FIELD_DESCRIPTION)
+  return actionSetting(o)
+}
+
+const actionSetting = (o: Omit<Common, "env" | "apply" | "overridable"> & {
+  readonly buttonLabel: string
+  readonly confirm?: string
+  readonly requiresSaved?: boolean
 }): Setting<undefined> & { readonly value: "none" } => ({
   type: "action",
   secret: false,
@@ -254,7 +340,12 @@ const action = (o: Omit<Common, "env" | "apply" | "overridable"> & {
 })
 
 /** Read-only text from the running instance (`info()[key]`); "" while it does not run. */
-const info = (o: Omit<Common, "env" | "apply" | "overridable"> & { readonly tone?: "neutral" | "ok" | "warning" | "error" }): Setting<string> & { readonly value: "readOnly" } => ({
+const info = (o: Omit<Common, "env" | "apply" | "overridable"> & { readonly tone?: "neutral" | "ok" | "warning" | "error" }): Setting<string> & { readonly value: "readOnly" } => {
+  declareCommon(o)
+  return infoSetting(o)
+}
+
+const infoSetting = (o: Omit<Common, "env" | "apply" | "overridable"> & { readonly tone?: "neutral" | "ok" | "warning" | "error" }): Setting<string> & { readonly value: "readOnly" } => ({
   type: "info",
   secret: false,
   ...visibility(o),

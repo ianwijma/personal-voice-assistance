@@ -6,11 +6,12 @@ export async function* chunks(...parts: ReadonlyArray<string | Uint8Array>): Asy
   for (const p of parts) yield typeof p === "string" ? bytes(p) : p
 }
 
-export const reply = (status: number, body: string | AsyncIterable<Uint8Array> = "", headers: Record<string, string> = {}): ConnectResponse => ({
-  status,
-  headers,
-  body: typeof body === "string" ? chunks(body) : body
-})
+/** A response; a 2xx one is `text/plain` unless `headers` says otherwise (pass `"content-type": ""` for none). */
+export const reply = (status: number, body: string | AsyncIterable<Uint8Array> = "", headers: Record<string, string> = {}): ConnectResponse => {
+  const h: Record<string, string> = status >= 200 && status <= 299 && !("content-type" in headers) ? { "content-type": "text/plain", ...headers } : { ...headers }
+  if (h["content-type"] === "") delete h["content-type"]
+  return { status, headers: h, body: typeof body === "string" ? chunks(body) : body }
+}
 
 /** A resolver from a table; anything else fails like NXDOMAIN. Records its calls. */
 export const fakeResolver = (table: Record<string, ReadonlyArray<string>>): Resolver & { calls: Array<string> } => {

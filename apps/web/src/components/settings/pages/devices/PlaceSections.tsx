@@ -1,7 +1,7 @@
 "use client"
-import { capabilityWords, type DeviceListInfo, type DevicePlace, type DevicePrivacy, effectiveCapabilities, MAX_ROOM_CHARS } from "@pva/protocol"
+import { capabilityWords, type DeviceListInfo, type DevicePlace, type DevicePrivacy, effectiveCapabilities, KNOWN_PRESENT_KINDS, MAX_ROOM_CHARS } from "@pva/protocol"
 import { setKeys } from "@/lib/devices.ts"
-import { membersOf, PRIVACY_CHOICES, declaredRows } from "@/lib/place.ts"
+import { BOUNDARY_NOTE, declaredRows, kindsFor, membersOf, PRIVACY_CHOICES } from "@/lib/place.ts"
 import { agoText } from "@/lib/sessions.ts"
 import { formatSettingsHash } from "@/lib/settingsTree.ts"
 import { useClientState } from "../../../context.tsx"
@@ -23,6 +23,18 @@ function Toggle({ label, checked, onChange, testId }: { readonly label: string; 
       <Switch checked={checked} onChange={onChange} label={label} />
       <span className="text-[14px] text-ink">{checked ? "On" : "Off"}</span>
     </div>
+  )
+}
+
+/**
+ * Next to every field whose change ends the device's session (privacy, default person, its speaker, screen and kinds):
+ * what happens when it is saved. Room, always on, accepts and quiet room have none: they do not end it.
+ */
+function BoundaryNote({ ctx, testId = "place-boundary-note" }: { readonly ctx: SectionContext; readonly testId?: string }) {
+  return (
+    <p className="mt-1 text-[12px] text-ink-muted" data-testid={testId}>
+      {BOUNDARY_NOTE(ctx.isType)}
+    </p>
   )
 }
 
@@ -59,6 +71,7 @@ export function PlaceSection({ ctx }: { readonly ctx: SectionContext }) {
           options={PRIVACY_CHOICES.map((c) => ({ value: c.value, label: c.label }))}
           testId="seg-privacy"
         />
+        <BoundaryNote ctx={ctx} />
       </DField>
       <DField
         label="Default person"
@@ -77,6 +90,7 @@ export function PlaceSection({ ctx }: { readonly ctx: SectionContext }) {
           {people.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
           {missing && <option value={place.defaultPerson!}>Removed person</option>}
         </select>
+        <BoundaryNote ctx={ctx} />
       </DField>
       <DField label="Always on" help="A wall tablet or a speaker that stays on, rather than a tab opened now and then. Things sent here wait for it less.">
         <Toggle label="Always on" checked={place.alwaysOn} onChange={(v) => set({ alwaysOn: v })} testId="place-always-on" />
@@ -91,12 +105,21 @@ export function PlaceSection({ ctx }: { readonly ctx: SectionContext }) {
   )
 }
 
-export function CapabilitiesSection({ ctx, device, now }: { readonly ctx: SectionContext; readonly device: DeviceListInfo | undefined; readonly now: number }) {
+export function CapabilitiesSection({ ctx, device, now, typeKind }: {
+  readonly ctx: SectionContext
+  readonly device: DeviceListInfo | undefined
+  readonly now: number
+  /** A device type's page: its kind (its devices' declarations offer their kinds). */
+  readonly typeKind?: string
+}) {
   const overrides = ctx.settings.capabilities
   const set = (patch: Partial<typeof overrides>) => ctx.update((e) => setKeys(ctx.base, e, { capabilities: { ...overrides, ...patch } }))
   const declared = device?.declared
   const rows = declared === undefined ? [] : declaredRows(declared.capabilities)
-  const kinds = [...new Set([...Object.keys(declared?.capabilities.present?.kinds ?? {}), ...overrides.excludeKinds])].sort()
+  const devices = useClientState((s) => s.devices)
+  // The kinds a switch is offered for: the ones the protocol knows, what this device (or any device of this type)
+  // declared, and what is excluded already, so an exclusion can always be taken back and made again.
+  const kinds = kindsFor({ known: KNOWN_PRESENT_KINDS, declared: device !== undefined ? [device] : devices.filter((d) => d.kind === typeKind), excluded: overrides.excludeKinds })
   const effective = declared === undefined ? undefined : effectiveCapabilities(declared.capabilities, overrides)
   return (
     <section className="flex flex-col gap-5" aria-labelledby="h-caps" data-testid="section-capabilities">
@@ -126,12 +149,21 @@ export function CapabilitiesSection({ ctx, device, now }: { readonly ctx: Sectio
       <p className="text-[13px] text-ink-muted">You can only take things away here: a phone used as a speaker can be treated as having no screen, but nothing can be given a screen or a speaker it does not have.</p>
       <DField label="Use its screen" help={overrides.noDisplay ? "Treated as having no screen: nothing is shown here, and the assistant is told so." : "Things may be shown here when it has a screen."}>
         <Toggle label="Use its screen" checked={!overrides.noDisplay} onChange={(v) => set({ noDisplay: !v })} testId="caps-display" />
+        <BoundaryNote ctx={ctx} testId="caps-boundary-note" />
       </DField>
-      <DField label="Use its speaker" help={overrides.noSpeaker ? "Treated as having no speaker: nothing is spoken here." : "Replies and announcements may be spoken here when it has a speaker."}>
+      <DField
+        label="Use its speaker"
+        help={overrides.noSpeaker
+          ? "Treated as having no speaker: no reply is sent here to be played, spoken or typed, whatever the page says it has."
+          : "Replies and announcements may be spoken here when it has a speaker."}
+      >
         <Toggle label="Use its speaker" checked={!overrides.noSpeaker} onChange={(v) => set({ noSpeaker: !v })} testId="caps-speaker" />
+        <BoundaryNote ctx={ctx} testId="caps-boundary-note" />
       </DField>
-      {kinds.length > 0 && (
-        <DField label="What it may show">
+      <DField label="What it may show">
+        {kinds.length === 0
+          ? <p className="text-[13px] text-ink-faint" data-testid="caps-kinds-none">None yet: kinds of things to show arrive with the presentation stage.</p>
+          : (
           <div className="flex flex-col gap-2" data-testid="caps-kinds">
             {kinds.map((k) => (
               <div key={k} className="flex items-center gap-3">
@@ -144,8 +176,9 @@ export function CapabilitiesSection({ ctx, device, now }: { readonly ctx: Sectio
               </div>
             ))}
           </div>
-        </DField>
-      )}
+          )}
+        {kinds.length > 0 && <BoundaryNote ctx={ctx} testId="caps-boundary-note" />}
+      </DField>
       {effective !== undefined && (
         <p className="text-[13px] text-ink-muted" data-testid="caps-effective">The assistant is told: {capabilityWords(effective)}.</p>
       )}

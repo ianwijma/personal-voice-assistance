@@ -1,16 +1,21 @@
 import { describe, expect, it } from "@effect/vitest"
 import { Effect, Exit, Fiber } from "effect"
 import { NetAborted, NetFailure, NetRefused, NetTimeout, NetTooLarge } from "../src/Errors.ts"
-import { fetchOwnerConfiguredLan, safeFetch, type SafeFetchOptions } from "../src/SafeFetch.ts"
+import { contentTypes, fetchOwnerConfiguredLan, safeFetch as safeFetchWith, type SafeFetchOptions } from "../src/SafeFetch.ts"
 import { chunks, fakeConnector, fakeResolver, reply } from "./helpers.ts"
 
-const failure = async (url: string, options: SafeFetchOptions, lan = false) => {
-  const exit = await Effect.runPromiseExit((lan ? fetchOwnerConfiguredLan : safeFetch)(url, options))
+type Options = Omit<SafeFetchOptions, "accept"> & { readonly accept?: SafeFetchOptions["accept"] }
+/** The tests read web pages unless they say otherwise. */
+const withAccept = (options: Options): SafeFetchOptions => ({ accept: contentTypes.webPage, ...options })
+const safeFetch = (url: string, options: Options) => safeFetchWith(url, withAccept(options))
+const lanFetch = (url: string, options: Options) => fetchOwnerConfiguredLan(url, withAccept(options))
+const failure = async (url: string, options: Options, lan = false) => {
+  const exit = await Effect.runPromiseExit((lan ? lanFetch : safeFetch)(url, options))
   if (!Exit.isFailure(exit)) throw new Error("expected a failure")
   const error = exit.cause.reasons.map((r) => (r._tag === "Fail" ? r.error : undefined)).find((e) => e !== undefined)
   return error
 }
-const refusedRule = async (url: string, options: SafeFetchOptions, lan = false) => {
+const refusedRule = async (url: string, options: Options, lan = false) => {
   const error = await failure(url, options, lan)
   expect(error).toBeInstanceOf(NetRefused)
   return (error as NetRefused).rule
@@ -258,7 +263,7 @@ describe("fetchOwnerConfiguredLan", () => {
   })
   it("lets private, unique-local and CGNAT addresses, local names and other ports through", async () => {
     for (const url of ["http://192.168.1.5:8123/", "http://nas.local/", "http://box.lan:3000/", "http://[fd00::1]/", "http://100.64.0.2/", "http://printer/"]) {
-      const res = await Effect.runPromise(fetchOwnerConfiguredLan(url, { connector, resolver: fakeResolver({ nas: ["10.0.0.1"], "nas.local": ["192.168.1.5"], "box.lan": ["10.0.0.9"], printer: ["192.168.1.7"] }) }))
+      const res = await Effect.runPromise(lanFetch(url, { connector, resolver: fakeResolver({ nas: ["10.0.0.1"], "nas.local": ["192.168.1.5"], "box.lan": ["10.0.0.9"], printer: ["192.168.1.7"] }) }))
       expect(res.status).toBe(200)
     }
   })

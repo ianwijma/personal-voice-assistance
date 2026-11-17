@@ -6,13 +6,21 @@ import type { RequirementChecker } from "../requirements.ts"
 /**
  * The Health page's service (module-definition-config-and-dependencies.md §C.5): the issue registry as admin pages
  * see it, and one check at a time ("Check again", and once at start): probe every program the modules need again,
- * re-judge which modules are available (the host starts those that now are), run every module's `health()`, and the
- * core checks. Never on a turn.
+ * re-judge which modules are available and try again every module that is down after a failed start (`recheck`),
+ * then run every module's `health()`, then the app's own `checks` (P4: the household store's backups, directories and
+ * log). Never on a turn. Checks of the machine itself (disk, TLS files, the port, speech models) are not part of this
+ * version (docs/MODULES-PLAN.md §7).
  */
 export interface HealthService {
   readonly info: () => HealthInfo
   /** Run a check; a check already running is joined, not repeated. Never fails. */
   readonly check: Effect.Effect<void>
+  /**
+   * Start a check in the background ("Check again") and return at once: `info()` says `checking` from this moment,
+   * and the outcome reaches admin pages as `health`. A check can take longer than a page waits for an answer (a slow
+   * probe, a module that now starts), so the request is answered when it has started, not when it ends.
+   */
+  readonly begin: () => void
   /** Called after every change of `info`. Returns an unsubscribe function. */
   readonly subscribe: (listener: (info: HealthInfo) => void) => () => void
 }
@@ -21,9 +29,14 @@ export interface HealthServiceOptions {
   readonly host: ModuleHost
   readonly checker: RequirementChecker
   readonly catalog: ReadonlyArray<ModuleDefinition<any>>
-  /** The core checks (serve mode: without the port). */
-  readonly core: Effect.Effect<ReadonlyArray<Issue>>
   readonly now?: () => number
+  /** Runs a background effect (serve mode's request runner); `begin` uses it. */
+  readonly fork: (effect: Effect.Effect<void>) => void
+  /**
+   * The app's own checks, by issue source (P4: `household-checks`), run after the modules' at every check. Their issues
+   * replace the source's in the registry, which makes every text safe and bounded (`Issues.ts`).
+   */
+  readonly checks?: Readonly<Record<string, Effect.Effect<ReadonlyArray<Issue>>>>
 }
 
 export const makeHealthService = (options: HealthServiceOptions): HealthService => {
@@ -61,28 +74,36 @@ export const makeHealthService = (options: HealthServiceOptions): HealthService 
     yield* options.checker.probeCatalog(options.catalog, { force: true })
     yield* options.host.recheck
     yield* options.host.checkHealth
-    const core = yield* options.core
-    options.host.issues.set("core", core)
+    for (const [source, check] of Object.entries(options.checks ?? {})) {
+      const issues = yield* check.pipe(Effect.catchCause((cause) => Effect.as(Effect.logWarning(`The ${source} check failed`, cause), undefined)))
+      if (issues !== undefined) options.host.issues.set(source, issues)
+    }
   }).pipe(Effect.catchCause((cause) => Effect.logWarning("The health check failed", cause)))
 
-  const check = Effect.suspend(() => {
-    if (checking !== undefined) return Deferred.await(checking)
-    return Effect.gen(function*() {
-      const done = yield* Deferred.make<void>()
-      checking = done
+  /** Mark a check as running (synchronously), and the work that ends it. */
+  const open = (): Effect.Effect<void> => {
+    const done = Deferred.makeUnsafe<void>()
+    checking = done
+    changed()
+    return run.pipe(Effect.ensuring(Effect.sync(() => {
+      checking = undefined
+      checkedAt = now()
       changed()
-      yield* run.pipe(Effect.ensuring(Effect.sync(() => {
-        checking = undefined
-        checkedAt = now()
-        changed()
-        Deferred.doneUnsafe(done, Effect.void)
-      })))
-    })
-  })
+      Deferred.doneUnsafe(done, Effect.void)
+    })))
+  }
+
+  const check = Effect.suspend(() => (checking !== undefined ? Deferred.await(checking) : open()))
+
+  const begin = () => {
+    if (checking !== undefined) return
+    options.fork(open())
+  }
 
   return {
     info,
     check,
+    begin,
     subscribe: (listener) => {
       listeners.add(listener)
       return () => listeners.delete(listener)

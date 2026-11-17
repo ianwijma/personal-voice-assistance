@@ -1,42 +1,54 @@
-import type { HouseholdChange, HouseholdCollectionRows, HouseholdEventInfo, HouseholdRow } from "@pva/protocol"
+import type { HouseholdChange, HouseholdCollectionRef, HouseholdCollectionRows, HouseholdEventInfo, HouseholdRow, HouseholdSnapshotMessage } from "@pva/protocol"
 import { Effect } from "effect"
 import type { EventType, HouseholdEvent } from "./EventBus.ts"
-import type { ChangeRecord, Collection, HouseholdStore, Row, ScopeRef, StoreError, TargetDevice } from "./HouseholdStore.ts"
-import { decodeStored } from "./HouseholdStore.ts"
-import { mayRevealTo } from "./Privacy.ts"
+import { mayRevealPersonScopeTo, membersFrom, personScopesFor } from "./FeedPeople.ts"
+import { type Collection, type HouseholdStore, isStoreFailure, MAX_VALUE_CHARS, type PageCursor, type Row, type ScopeKind, type ScopeRef, scopeKey, type TargetDevice } from "./HouseholdStore.ts"
+import type { IsMember } from "./Privacy.ts"
 
 /**
  * What voice pages receive of the household data (docs/STORING-DATA.md "Pages"; docs/MODULES-PLAN.md §4 P4).
  *
  * Nothing is sent by default. A collection opts in with `project(row, device)` and an event type with
- * `project(event, device)`: what a page on that device may see, or `undefined` for nothing. The same function decides
- * the three paths, always applied to the row **as it is now**:
+ * `project(event, device)`: what a page on that device may see, or `undefined` for nothing. **What reaches a page is
+ * decided when its frame is built, and a frame is built in the same synchronous step that hands it to the socket**:
+ * the row is read as it is committed at that moment and projected with the server's record of the device then. So a
+ * row that was removed or moved away before its frame was built never travels, whatever happened earlier.
  *
- * - the snapshot after `welcome`: every visible row, projected;
- * - a live change: `put` with the projected row when it is visible now, `remove` when it is gone or hidden now but the
- *   device could see the value it replaced, nothing otherwise;
- * - the replay after a reconnect: the same rule per row changed since the page's `seq`, with "the value it replaced"
- *   being the value before the first change the page missed. Older payloads in the change log only decide whether to
- *   send a `remove`; their content is never sent. When that earlier value is not in the log (`history: "none"`, an
- *   erased row) or the gap is too long or pruned, the page gets a fresh snapshot instead.
+ * - **Snapshot** (`snapshot`): a run of bounded steps (`SnapshotRun.step`), each reading at most `SNAPSHOT_PAGE_ROWS`
+ *   rows of one collection and scope through an index and returning the frames to send at once. Every frame has at
+ *   most `SNAPSHOT_PART_CHARS` characters and the whole snapshot at most `SNAPSHOT_MAX_CHARS`, every frame counted
+ *   whole as it is encoded (both under the protocol's frame limit of 1,048,576); at most `SNAPSHOT_ROWS` rows per
+ *   collection and scope and `SNAPSHOT_READ_ROWS` rows read in all. The final frame names every collection whose
+ *   visible rows were not all sent (`truncated`); room for naming all of them is kept from the start, so that list
+ *   always fits.
+ * - **Changes** (`change`): a row a committed change touched, read now: `put` when the page may see it; otherwise
+ *   `remove` (the collection and the id, nothing else) when the page's device could have been shown one of the scopes
+ *   the row was in, nothing otherwise. Nothing is remembered per page about the rows it holds: a page ignores the
+ *   removal of an id it does not have.
+ * - **Module events** (`live`): an event type's projection, now.
+ *
+ * A projection that throws, returns something that is not plain JSON or more than `MAX_VALUE_CHARS` of it, is treated
+ * as "not visible" for that row or event (so a page loses the row rather than keeping a stale one) and reported
+ * (`report`, a Health issue in serve mode). It affects only its own collection or event type.
  *
  * Before any projection, `mayRevealScopeTo` decides by scope (below).
  */
 
 /**
  * THE one place where the scope of a row or event decides whether a voice page may see it at all. Household data goes
- * to every voice page, device data to that device only, person data where `Privacy.mayReveal` allows it
- * (docs/MODULES-PLAN.md §2 row 8: a `private` device, or a `shared` one whose default person is the owner), assistant
- * and conversation data to none (they belong to turns, not to screens).
+ * to every voice page, device data to that device's pages only, person data by the privacy rule (P5, `FeedPeople.ts`:
+ * a known device, an owner in Members now, `isMember`; without it, none), assistant and conversation data to none
+ * (they belong to turns, not to screens). The device is the id the page claimed in `hello`: device ids are not
+ * authenticated (docs/MODULES-PLAN.md §2 rows 5 and 7).
  */
-export const mayRevealScopeTo = (scope: ScopeRef, device: TargetDevice): boolean => {
+export const mayRevealScopeTo = (scope: ScopeRef, device: TargetDevice, isMember?: IsMember): boolean => {
   switch (scope.kind) {
     case "household":
       return true
     case "device":
       return device.id !== undefined && scope.id === device.id
     case "person":
-      return mayRevealTo(scope.id, { privacy: device.privacy ?? "shared", defaultPerson: device.defaultPerson ?? null })
+      return mayRevealPersonScopeTo(scope.id, device, isMember)
     case "assistant":
     case "conversation":
       return false
@@ -50,177 +62,357 @@ export interface FeedModule {
   readonly events: ReadonlyArray<EventType>
 }
 
-/** The most rows of one collection in a snapshot. */
+/** The most rows of one collection and scope in a snapshot. */
 export const SNAPSHOT_ROWS = 500
-/** The most changes a replay walks; a longer gap gets a snapshot. */
-export const REPLAY_CHANGES = 1000
+/** The rows one snapshot step reads (one index read). */
+export const SNAPSHOT_PAGE_ROWS = 20
+/** The most rows a snapshot reads in all (visible or not). */
+export const SNAPSHOT_READ_ROWS = 5000
+/** The most characters of one `household.snapshot` message, everything in it included. */
+export const SNAPSHOT_PART_CHARS = 256_000
+/** The most characters of one whole snapshot, all its messages together, each counted whole. */
+export const SNAPSHOT_MAX_CHARS = 900_000
+/**
+ * The most collections pages are sent (all modules together): the final frame must be able to name every one of them
+ * as `truncated`. A declaration beyond it is not sent, and reported.
+ */
+export const MAX_FEED_COLLECTIONS = 1500
+/** The most scopes a queued change remembers for its row; beyond, a removal goes to every page that sees the kind. */
+export const MAX_CHANGE_SCOPES = 16
 
-export type ProjectedChange = { readonly op: "put"; readonly value: unknown } | { readonly op: "remove" }
-
-const safeProject = <T>(project: ((x: T, device: TargetDevice) => unknown) | undefined, x: T, device: TargetDevice): unknown => {
-  if (project === undefined) return undefined
-  try {
-    return project(x, device)
-  } catch {
-    return undefined
-  }
+/** A projection that failed, or a declaration the feed cannot carry (`report`). */
+export interface FeedProblem {
+  readonly module: string
+  /** The collection or the event type. */
+  readonly what: string
+  readonly message: string
 }
 
-/** What `device` may see of `row` (`undefined`: nothing). */
-export const projectRow = (collection: Collection<any>, row: Row<unknown> | undefined, device: TargetDevice): unknown =>
-  row === undefined || !mayRevealScopeTo(row.scope, device) ? undefined : safeProject(collection.project, row, device)
-
-/** The rule shared by live changes and the replay: from the value the device had (`before`) to the row now. */
-export const projectChange = (
-  collection: Collection<any>,
-  before: Row<unknown> | undefined,
-  now: Row<unknown> | undefined,
-  device: TargetDevice
-): ProjectedChange | undefined => {
-  const value = projectRow(collection, now, device)
-  if (value !== undefined) return { op: "put", value }
-  return projectRow(collection, before, device) !== undefined ? { op: "remove" } : undefined
+/**
+ * A row committed changes touched: which one, and the scopes it was in (those changes' scopes, so a page that could
+ * see the row where it was is told it is gone); `"any"` when there were more than `MAX_CHANGE_SCOPES`.
+ */
+export interface FeedChange {
+  readonly module: string
+  readonly collection: string
+  readonly id: string
+  readonly scopes: ReadonlyArray<ScopeRef> | "any"
 }
 
-export type Replay =
-  | { readonly kind: "events"; readonly events: ReadonlyArray<HouseholdEventInfo> }
-  | { readonly kind: "snapshot"; readonly seq: number; readonly collections: ReadonlyArray<HouseholdCollectionRows> }
+/** The key of a row in a page's queue. */
+export const feedRowKey = (module: string, collection: string, id: string) => `${module}/${collection}/${id}`
+
+/** Another change of the same row: its scopes added to those already queued. */
+export const mergeScopes = (queued: FeedChange["scopes"], scope: ScopeRef): FeedChange["scopes"] => {
+  if (queued === "any") return "any"
+  if (queued.some((s) => scopeKey(s) === scopeKey(scope))) return queued
+  return queued.length >= MAX_CHANGE_SCOPES ? "any" : [...queued, { ...scope }]
+}
+
+type SnapshotFrame = typeof HouseholdSnapshotMessage.Type
+
+/** A snapshot being sent: `step()` until `done`, sending each step's frames at once. */
+export interface SnapshotRun {
+  readonly seq: number
+  readonly step: () => { readonly frames: ReadonlyArray<SnapshotFrame>; readonly done: boolean }
+}
 
 export interface HouseholdFeed {
   /** Whether any collection or event type is sent to pages (nothing to do otherwise). */
   readonly active: boolean
-  readonly snapshot: (device: TargetDevice) => Effect.Effect<{ readonly seq: number; readonly collections: ReadonlyArray<HouseholdCollectionRows> }, StoreError>
-  /** What `device` gets of a bus event now, or `undefined`. Synchronous (the hub calls it per connection). */
+  /** Whether `moduleType` (`<module>.<type>`) is a declared event type with a projection. */
+  readonly sendsEvent: (moduleType: string) => boolean
+  /** Whether a change to this collection can concern pages. */
+  readonly sendsCollection: (module: string, collection: string) => boolean
+  /** Start a snapshot for `device` (read when each step runs). */
+  readonly snapshot: (device: TargetDevice) => SnapshotRun
+  /** What `device` gets now of a row changes touched, or `undefined`. */
+  readonly change: (change: FeedChange, device: TargetDevice) => HouseholdEventInfo | undefined
+  /** What `device` gets of a module event now, or `undefined`. */
   readonly live: (event: HouseholdEvent, device: TargetDevice) => HouseholdEventInfo | undefined
-  /** After a reconnect with the page's last `seq`. */
-  readonly replay: (device: TargetDevice, seq: number) => Effect.Effect<Replay, StoreError>
 }
+
+type Projected = { readonly visible: true; readonly value: unknown } | { readonly visible: false; readonly problem?: string }
+
+const HIDDEN: Projected = { visible: false }
+
+/** Run a projection and make its result plain JSON of a bounded size, or say why it cannot be sent. */
+const runProjection = <T>(project: ((x: T, device: TargetDevice) => unknown) | undefined, x: T, device: TargetDevice): Projected => {
+  if (project === undefined) return HIDDEN
+  let out: unknown
+  try {
+    out = project(x, { ...device })
+  } catch (e) {
+    return { visible: false, problem: `the projection threw: ${e instanceof Error ? e.message : String(e)}` }
+  }
+  if (out === undefined) return HIDDEN
+  let text: string | undefined
+  try {
+    text = JSON.stringify(out)
+  } catch (e) {
+    return { visible: false, problem: `the projection's result is not JSON: ${e instanceof Error ? e.message : String(e)}` }
+  }
+  if (text === undefined) return { visible: false, problem: "the projection's result is not JSON" }
+  if (text.length > MAX_VALUE_CHARS) return { visible: false, problem: `the projection's result has ${text.length} characters (at most ${MAX_VALUE_CHARS})` }
+  return { visible: true, value: JSON.parse(text) as unknown }
+}
+
+/** What `device` may see of `row` (`undefined`: nothing, also when the projection fails). Plain JSON. */
+export const projectRow = (collection: Collection<any>, row: Row<unknown> | undefined, device: TargetDevice, isMember?: IsMember): unknown => {
+  if (row === undefined || !mayRevealScopeTo(row.scope, device, isMember)) return undefined
+  const p = runProjection(collection.project, row, device)
+  return p.visible ? p.value : undefined
+}
+
+const chars = (x: unknown) => JSON.stringify(x).length
+
+/**
+ * Whether a page on `device` could ever be shown a row of this scope kind (for a removal whose scopes are unknown).
+ * P5: person rows, when the device may see any person now.
+ */
+const kindVisibleTo = (kind: ScopeKind, device: TargetDevice, personScopes: () => ReadonlyArray<ScopeRef>, isMember: IsMember) =>
+  kind === "household"
+    ? true
+    : kind === "device"
+    ? device.id !== undefined
+    : kind === "person"
+    ? personScopes().some((s) => mayRevealScopeTo(s, device, isMember))
+    : false
 
 export const makeHouseholdFeed = (options: {
   readonly store: HouseholdStore
   readonly modules: ReadonlyArray<FeedModule>
-  /** The household's person ids now (Members), for the person-scoped rows of a snapshot. Absent: the device's default person only. */
+  /** A failing projection (serve mode: a Health issue). */
+  readonly report?: (problem: FeedProblem) => void
+  /** P5: the household's person ids now (Members), `FeedPeople.ts`. Absent: nobody, so no person-scoped data. */
   readonly people?: () => ReadonlyArray<string>
 }): HouseholdFeed => {
   const { store } = options
+  const isMember = membersFrom(options.people)
+  const report = (module: string, what: string, message: string) => {
+    try {
+      options.report?.({ module, what, message })
+    } catch {
+      // Reporting must not break delivery.
+    }
+  }
   const collections = new Map<string, Collection<any>>()
   const eventTypes = new Map<string, EventType>()
   for (const m of options.modules) {
-    for (const c of m.collections) if (c.project !== undefined) collections.set(`${m.moduleId}/${c.name}`, c)
+    for (const c of m.collections) {
+      if (c.project === undefined) continue
+      if (collections.size >= MAX_FEED_COLLECTIONS) {
+        report(m.moduleId, c.name, `not sent to pages: pages are sent at most ${MAX_FEED_COLLECTIONS} collections`)
+        continue
+      }
+      collections.set(`${m.moduleId}/${c.name}`, c)
+    }
     for (const e of m.events) if (e.project !== undefined) eventTypes.set(`${m.moduleId}.${e.type}`, e)
   }
   const sent = [...collections.entries()].map(([key, c]) => ({ moduleId: key.slice(0, key.indexOf("/")), collection: c }))
+  /** A module whose data cannot be used here (newer, failed upgrade) is never read for pages. */
+  const usable = (moduleId: string) => store.availability(moduleId) === undefined
 
-  const changeInfo = (
-    meta: { readonly seq: number; readonly at: number; readonly module: string; readonly collection: string; readonly id: string; readonly rev: number; readonly scope: ScopeRef },
-    projected: ProjectedChange
-  ): HouseholdEventInfo => {
-    const data: HouseholdChange = {
-      collection: meta.collection,
-      id: meta.id,
-      op: projected.op,
-      rev: meta.rev,
-      ...(projected.op === "put" ? { value: projected.value } : {})
-    }
-    return { seq: meta.seq, at: meta.at, module: meta.module, type: `${meta.module}.${meta.collection}.changed`, scope: meta.scope, data }
+  const projectFor = (moduleId: string, collection: Collection<any>, row: Row<unknown> | undefined, device: TargetDevice): Projected => {
+    if (row === undefined || !mayRevealScopeTo(row.scope, device, isMember)) return HIDDEN
+    const p = runProjection(collection.project, row, device)
+    if (!p.visible && p.problem !== undefined) report(moduleId, collection.name, `row ${row.id}: ${p.problem}`)
+    return p
   }
 
   const live = (event: HouseholdEvent, device: TargetDevice): HouseholdEventInfo | undefined => {
-    const change = event.change
-    if (change !== undefined) {
-      const collection = collections.get(`${change.module}/${change.collection}`)
-      if (collection === undefined) return undefined
-      const projected = projectChange(collection, change.before, change.row, device)
-      return projected === undefined ? undefined : changeInfo(change, projected)
-    }
+    if (event.change !== undefined || event.module === "host") return undefined
     const type = eventTypes.get(event.type)
-    if (type === undefined || !mayRevealScopeTo(event.scope, device)) return undefined
-    const data = safeProject(type.project, event, device)
-    return data === undefined ? undefined : { at: event.at, module: event.module, type: event.type, scope: event.scope, data }
+    if (type === undefined || !usable(event.module) || !mayRevealScopeTo(event.scope, device, isMember)) return undefined
+    const p = runProjection(type.project, event, device)
+    if (!p.visible) {
+      if (p.problem !== undefined) report(event.module, event.type, p.problem)
+      return undefined
+    }
+    return { at: event.at, module: event.module, type: event.type, scope: event.scope, data: p.value }
   }
 
-  const snapshot = (device: TargetDevice) =>
-    Effect.gen(function*() {
-      // The number first: a change committed while the rows are read is also sent live (a `put` again is harmless).
-      const seq = yield* store.lastSeq
-      const out: Array<HouseholdCollectionRows> = []
-      for (const { moduleId, collection } of sent) {
-        // Person-scoped collections: one read per person the device may see (P5), the device's default person first.
-        const scopes: ReadonlyArray<ScopeRef> = collection.scope === "household"
-          ? [{ kind: "household" }]
-          : collection.scope === "device"
-          ? device.id !== undefined ? [{ kind: "device", id: device.id }] : []
-          : collection.scope === "person"
-          ? [...new Set([...(device.defaultPerson !== undefined ? [device.defaultPerson] : []), ...(options.people?.() ?? [])])].map((id): ScopeRef => ({ kind: "person", id }))
-          : []
-        const readable = scopes.filter((scope) => mayRevealScopeTo(scope, device))
-        if (readable.length === 0) continue
-        const visible: Array<HouseholdRow> = []
-        let truncated = false
-        for (const scope of readable) {
-          const rows = yield* store.forModule(moduleId).collection(collection).list({ scope, limit: SNAPSHOT_ROWS }).pipe(
-            Effect.catchTag("ScopeUnknown", () => Effect.succeed([] as ReadonlyArray<Row<unknown>>))
-          )
-          if (rows.length >= SNAPSHOT_ROWS) truncated = true
-          for (const row of rows) {
-            const value = projectRow(collection, row, device)
-            if (value !== undefined) visible.push({ id: row.id, rev: row.rev, scope: row.scope, value, updatedAt: row.updatedAt })
-          }
-        }
-        out.push({ module: moduleId, collection: collection.name, rows: visible, truncated })
-      }
-      return { seq, collections: out }
-    })
-
-  /** The value a row had before `first` (the first change the page missed), or "unknown" when the log cannot say. */
-  const beforeOf = (collection: Collection<any>, first: ChangeRecord): Effect.Effect<Row<unknown> | undefined | "unknown"> => {
-    if (first.op === "insert") return Effect.succeed(undefined)
-    const before = first.payload?.before
-    if (first.payload === undefined || before === undefined) return Effect.succeed("unknown")
-    return decodeStored(collection, first.payload.v, before, first.id).pipe(
-      Effect.map((d): Row<unknown> => ({ id: first.id, rev: first.rev - 1, scope: first.scope, value: d.value, createdAt: 0, updatedAt: first.at, updatedBy: first.actor })),
-      Effect.orElseSucceed(() => "unknown" as const)
-    )
+  /** The scopes of a collection a page on `device` may see. */
+  const scopesOf = (collection: Collection<any>, device: TargetDevice): ReadonlyArray<ScopeRef> => {
+    const scopes: ReadonlyArray<ScopeRef> = collection.scope === "household"
+      ? [{ kind: "household" }]
+      : collection.scope === "device" && device.id !== undefined
+      ? [{ kind: "device", id: device.id }]
+      : collection.scope === "person"
+      // P5: one read per person the device may see, the device's default person first; each is a collection and
+      // scope of its own (`SNAPSHOT_ROWS` each), and the snapshot as a whole stays within `SNAPSHOT_READ_ROWS`.
+      ? personScopesFor(device, options.people)
+      : []
+    return scopes.filter((scope) => mayRevealScopeTo(scope, device, isMember))
   }
 
-  const replay = (device: TargetDevice, seq: number) =>
-    Effect.gen(function*() {
-      const fresh = Effect.map(snapshot(device), (s): Replay => ({ kind: "snapshot", ...s }))
-      const last = yield* store.lastSeq
-      if (seq > last) return yield* fresh // a restored or replaced database: the page's numbers mean nothing here
-      if (seq === last) return { kind: "events", events: [] } satisfies Replay
-      const page = yield* store.changesSince(seq, REPLAY_CHANGES)
-      // Too long a gap, or changes the page missed were pruned (numbers have no holes otherwise).
-      if (!page.complete || page.oldest > seq + 1) return yield* fresh
-      // One entry per row, in the order of its last change.
-      const rows = new Map<string, { first: ChangeRecord; last: ChangeRecord; collection: Collection<any> }>()
-      for (const change of page.changes) {
-        const collection = collections.get(`${change.module}/${change.collection}`)
-        if (collection === undefined) continue
-        const key = `${change.module}/${change.collection}/${change.id}`
-        const at = rows.get(key)
-        if (at === undefined) rows.set(key, { first: change, last: change, collection })
-        else {
-          rows.delete(key)
-          rows.set(key, { ...at, last: change })
-        }
-      }
-      const events: Array<HouseholdEventInfo> = []
-      for (const { first, last: lastChange, collection } of rows.values()) {
-        const now = yield* store.forModule(lastChange.module).collection(collection).get(lastChange.id, { scope: lastChange.scope }).pipe(
-          Effect.catchTag("ScopeUnknown", () => Effect.succeed(undefined))
-        )
-        const nowValue = projectRow(collection, now, device)
-        if (nowValue !== undefined) {
-          events.push(changeInfo({ ...lastChange, rev: now!.rev, scope: now!.scope }, { op: "put", value: nowValue }))
-          continue
-        }
-        const before = yield* beforeOf(collection, first)
-        if (before === "unknown") return yield* fresh
-        if (projectRow(collection, before, device) !== undefined) events.push(changeInfo(lastChange, { op: "remove" }))
-      }
-      return { kind: "events", events } satisfies Replay
-    })
+  const snapshot = (device: TargetDevice): SnapshotRun => {
+    const seq = lastSeqNow(store)
+    // The work: one entry per collection and visible scope.
+    const todo = sent.flatMap(({ moduleId, collection }) => scopesOf(collection, device).map((scope) => ({ moduleId, collection, scope })))
+    /** The collections cut short so far (by `module/collection`), in the order found. */
+    const truncated = new Map<string, HouseholdCollectionRef>()
+    const refOf = (module: string, collection: string): HouseholdCollectionRef => ({ module, collection })
+    const frameOf = (part: number, final: boolean, collections: ReadonlyArray<HouseholdCollectionRows>, cut: ReadonlyArray<HouseholdCollectionRef>): SnapshotFrame =>
+      ({ type: "household.snapshot", seq, part, final, collections, truncated: cut })
+    let part = 0
+    // The final frame's cost when it names every collection this snapshot could cut short: kept free from the start.
+    const allRefs = [...new Map(todo.map((t) => [`${t.moduleId}/${t.collection.name}`, refOf(t.moduleId, t.collection.name)])).values()]
+    const finalReserve = chars(frameOf(999_999, true, [], allRefs))
+    /** Characters of the frames already sent, each counted whole (as `encodeServerMessage` writes it). */
+    let sentChars = 0
+    let at = 0
+    let after: PageCursor | undefined
+    let rowsHere = 0
+    let read = 0
+    let finished = false
+    const cut = (module: string, collection: string) => void truncated.set(`${module}/${collection}`, refOf(module, collection))
 
-  return { active: collections.size > 0 || eventTypes.size > 0, snapshot, live, replay }
+    const step = () => {
+      if (finished) return { frames: [], done: true }
+      const frames: Array<SnapshotFrame> = []
+      let chunks: Array<{ module: string; collection: string; rows: Array<HouseholdRow> }> = []
+      // Lengths are exact and kept as rows are added (JSON: "[" + items joined by "," + "]"), never estimated.
+      const emptyLen = (n: number) => chars(frameOf(n, false, [], []))
+      let frameLen = emptyLen(part)
+      const flush = () => {
+        if (chunks.length === 0) return
+        const frame = frameOf(part++, false, chunks, [])
+        sentChars += frameLen
+        frames.push(frame)
+        chunks = []
+        frameLen = emptyLen(part)
+      }
+      /** Add one row: `false` when it does not fit the whole snapshot's bound (nothing is changed then). */
+      const add = (module: string, collection: string, row: HouseholdRow): boolean => {
+        const rowChars = chars(row)
+        const last = chunks.at(-1)
+        const same = last !== undefined && last.module === module && last.collection === collection
+        const envelope = chars({ module, collection, rows: [] })
+        const grow = same ? rowChars + (last.rows.length > 0 ? 1 : 0) : (chunks.length > 0 ? 1 : 0) + envelope + rowChars
+        if (frameLen + grow <= SNAPSHOT_PART_CHARS) {
+          if (sentChars + frameLen + grow + finalReserve > SNAPSHOT_MAX_CHARS) return false
+          if (same) last.rows.push(row)
+          else chunks.push({ module, collection, rows: [row] })
+          frameLen += grow
+          return true
+        }
+        // A new frame: this one is sent as it is (if it holds anything), the row starts the next with its envelope.
+        const freshLen = emptyLen(chunks.length > 0 ? part + 1 : part) + envelope + rowChars
+        const flushed = chunks.length > 0 ? frameLen : 0
+        if (freshLen > SNAPSHOT_PART_CHARS || sentChars + flushed + freshLen + finalReserve > SNAPSHOT_MAX_CHARS) return false
+        flush()
+        chunks.push({ module, collection, rows: [row] })
+        frameLen = freshLen
+        return true
+      }
+      const finish = () => {
+        flush()
+        finished = true
+        frames.push(frameOf(part++, true, [], [...truncated.values()]))
+        return { frames, done: true }
+      }
+      const work = todo[at]
+      if (work === undefined) return finish()
+      const { moduleId, collection, scope } = work
+      const next = () => {
+        at++
+        after = undefined
+        rowsHere = 0
+      }
+      if (!usable(moduleId)) {
+        next()
+        return { frames, done: false }
+      }
+      if (read >= SNAPSHOT_READ_ROWS) {
+        // The reading budget is spent: every collection still to do may have rows; say so.
+        for (let i = at; i < todo.length; i++) cut(todo[i]!.moduleId, todo[i]!.collection.name)
+        at = todo.length
+        return finish()
+      }
+      const reader = store.reader(moduleId, collection)
+      let rows: ReadonlyArray<Row<unknown>> = []
+      try {
+        rows = reader === undefined ? [] : reader.page(scope, after, Math.min(SNAPSHOT_PAGE_ROWS, SNAPSHOT_ROWS - rowsHere))
+      } catch (e) {
+        report(moduleId, collection.name, `could not be read for a page: ${isStoreFailure(e) ? e.message : String(e)}`)
+        cut(moduleId, collection.name)
+        next()
+        flush()
+        return { frames, done: false }
+      }
+      read += Math.max(1, rows.length)
+      for (const row of rows) {
+        const p = projectFor(moduleId, collection, row, device)
+        if (!p.visible) continue
+        const out: HouseholdRow = { id: row.id, rev: row.rev, scope: row.scope, value: p.value, updatedAt: row.updatedAt }
+        if (!add(moduleId, collection.name, out)) {
+          // Full: this collection and every one after it may have rows left out.
+          for (let i = at; i < todo.length; i++) cut(todo[i]!.moduleId, todo[i]!.collection.name)
+          at = todo.length
+          return finish()
+        }
+      }
+      rowsHere += rows.length
+      const last = rows.at(-1)
+      if (rows.length < SNAPSHOT_PAGE_ROWS || last === undefined) next()
+      else if (rowsHere >= SNAPSHOT_ROWS) {
+        cut(moduleId, collection.name)
+        next()
+      } else after = { updatedAt: last.updatedAt, createdAt: last.createdAt, id: last.id }
+      flush()
+      return { frames, done: false }
+    }
+    return { seq, step }
+  }
+
+  const change = (c: FeedChange, device: TargetDevice): HouseholdEventInfo | undefined => {
+    const collection = collections.get(`${c.module}/${c.collection}`)
+    if (collection === undefined || !usable(c.module)) return undefined
+    const type = `${c.module}.${c.collection}.changed`
+    const could = c.scopes === "any"
+      ? kindVisibleTo(collection.scope, device, () => personScopesFor(device, options.people), isMember)
+      : c.scopes.some((s) => mayRevealScopeTo(s, device, isMember))
+    if (!could) return undefined
+    // The row now, in whichever of its scopes this page may see.
+    let row: Row<unknown> | undefined
+    const reader = store.reader(c.module, collection)
+    const candidates = c.scopes === "any" ? scopesOf(collection, device) : c.scopes.filter((s) => mayRevealScopeTo(s, device, isMember))
+    try {
+      for (const scope of candidates) {
+        row = reader?.get(c.id, scope)
+        if (row !== undefined) break
+      }
+    } catch (e) {
+      report(c.module, collection.name, `row ${c.id} could not be read for a page: ${isStoreFailure(e) ? e.message : String(e)}`)
+      row = undefined
+    }
+    const p = projectFor(c.module, collection, row, device)
+    if (p.visible && row !== undefined) {
+      const data: HouseholdChange = { collection: collection.name, id: c.id, op: "put", rev: row.rev, value: p.value }
+      return { seq: row.rev, at: row.updatedAt, module: c.module, type, scope: row.scope, data }
+    }
+    // Gone, or no longer for this page: the collection and the id only, in a scope this page may see anyway.
+    const data: HouseholdChange = { collection: collection.name, id: c.id, op: "remove" }
+    const scope: ScopeRef = candidates[0] ?? { kind: "household" }
+    return { at: Date.now(), module: c.module, type, scope, data }
+  }
+
+  return {
+    active: collections.size > 0 || eventTypes.size > 0,
+    sendsEvent: (moduleType) => eventTypes.has(moduleType),
+    sendsCollection: (module, collection) => collections.has(`${module}/${collection}`),
+    snapshot,
+    change,
+    live
+  }
+}
+
+/** The store's counter now (`lastSeq` is a synchronous effect in both stores). */
+const lastSeqNow = (store: HouseholdStore): number => {
+  try {
+    return Effect.runSync(store.lastSeq.pipe(Effect.orElseSucceed(() => 0)))
+  } catch {
+    return 0
+  }
 }

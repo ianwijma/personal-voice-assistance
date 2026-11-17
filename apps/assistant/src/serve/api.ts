@@ -163,7 +163,13 @@ export const makeApi = (options: ApiOptions) => {
         const routes = options.moduleRoutes
         const [, moduleId, tokenId] = routesMatch
         const tokenFailure = (e: { readonly reason: string; readonly message: string }) =>
-          fail(e.reason === "locked" || e.reason === "unavailable" ? 503 : e.reason === "invalid" ? 400 : e.reason === "limit" ? 409 : 500, e.reason === "locked" ? "locked" : e.reason, e.message)
+          e.reason === "unknown_module"
+            ? fail(404, "not_found", e.message)
+            : fail(
+              e.reason === "locked" || e.reason === "unavailable" ? 503 : e.reason === "invalid" ? 400 : e.reason === "limit" || e.reason === "blocked" ? 409 : 500,
+              e.reason === "locked" ? "locked" : e.reason,
+              e.message
+            )
         if (moduleId === undefined) {
           yield* only("GET")
           return json(200, yield* routes.view(query.get("module") ?? undefined))

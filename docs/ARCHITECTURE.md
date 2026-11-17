@@ -185,7 +185,7 @@ Conversation.layerWithSetup({ setup: Effect<TurnSetup>, ... })   // TurnSetup = 
 - `TurnSetup.maxToolRounds` (optional, added 2026-11-17): the tool-round limit of that turn, fixed at its start; it wins over `AgentSet.maxToolRounds` and the conversation's `maxToolRounds`. Serve mode sets it to the assistant's `toolRounds` in the same setup read that makes the turn's configuration snapshot (`TraceInfo.config.toolRounds`), so a changed limit applies from the next turn and the snapshot reports the limit the turn ran with.
 - `onEvent` receives `ConversationEvent`s synchronously on the turn's fiber (no Effect per event): `ConversationStarted` (a new conversation, `reason` `new` or `idle`; before the turn that an idle reset started for), `TurnStarted` (with `speculative`, `spoken`, `source`), `TurnPromoted`, `TextDelta` (raw, rounds separated by `"\n"`), `ClauseQueued`, `ClausePlaying`, `ToolStarted`, `ToolFinished`, `TurnEnded` (after history is committed, with the trace). Speculative turns emit events too; the subscriber decides what to show. A throwing subscriber is ignored.
 - `CurrentTurnTrace` is provided around `AudioOutput.play` as well as around `Tts.synthesize` (the web output uses the turn id as the reply id and records the browser's numbers in the trace).
-- `TurnSetup.turnContext` (optional, module API v2, `TurnOrigin`): who and where the turn is for (assistant id, device id and name; since P5 the device's room and its default person, `how: "device-default"`). When it is set, `Conversation` provides `CurrentTurn` (`TurnContext`: that plus the turn id, conversation id and source) around the agent's whole turn stream, so every tool call, every action run (the intent agent's, a confirmed one) and the gathering of the context providers read it with `yield* CurrentTurn`. It is one value per turn, built at the turn's start: nothing else is added to the turn path. Absent (the CLI modes): `CurrentTurn` is `undefined`. Serve mode sets it in `VoiceSession` (the origin object is reused while the device's name, room and default person do not change).
+- `TurnSetup.turnContext` (optional, module API v2, `TurnOrigin`): who and where the turn is for (assistant id, device id and name, the connection: an opaque `ConnectionRef`; since P5 the device's room and its default person, `how: "device-default"`). A `TextInput` may name the connection that typed it, which wins for that turn. When it is set, `Conversation` provides `CurrentTurn` (`TurnContext`: that plus the turn id, conversation id and source) around the agent's whole turn stream, so every tool call, every action run (the intent agent's, a confirmed one) and the gathering of the context providers read it with `yield* CurrentTurn`. It is one value per turn, built at the turn's start: nothing else is added to the turn path. Absent (the CLI modes): `CurrentTurn` is `undefined`. Serve mode sets it in `VoiceSession` (the origin object is reused while the device's name, room and default person and the audio owner's connection do not change); the hub passes the typing tab's `ConnectionRef` with typed text.
 
 | Event | Action |
 |---|---|
@@ -265,8 +265,8 @@ interface Tool<I = any, R = never> {
   readonly description: string
   readonly parameters: Schema.Codec<I, unknown> // validated input; also the source of the JSON Schema sent to the model
   readonly speculative?: boolean             // safe to run before the turn is confirmed (read-only lookups)
-  readonly risk?: ToolRisk | ((input: I) => ToolRisk)  // module API v2: read | change | message | money | security
-  readonly sensitivity?: "household" | "personal"
+  readonly risk?: ToolRisk | { classes: ReadonlyArray<ToolRisk>; of: (input: I) => ToolRisk }  // v2: read | change | message | money | security
+  readonly sensitivity?: "household" | "personal" | { kind: "personal"; owner: string } | ((result: unknown) => Sensitivity)
   readonly latency?: "instant" | "quick" | "slow" | "background"
   readonly execute: (input: I) => Effect<unknown, ToolError, R>   // reached only through the execution gateway
 }
@@ -290,7 +290,7 @@ defineModule({
   start: (ctx: ModuleContextV2<A, X>) => Effect<ModuleInstance, ModuleStartError, Scope>, // per effective settings
   …version 1 fields
 })
-SharedContext<A>      = { settings: Partial<A> /* no overridable fields */ } & ModuleServicesV2
+SharedContext<A>      = { settings: Partial<A> /* no overridable fields */; settingsFor(assistantId?): A | undefined } & ModuleServicesV2
 ModuleContextV2<A, X> = ModuleContext<A> & ModuleServicesV2 & { shared: X }
 ModuleServicesV2      = { host: ModuleHostApi; store: ModuleStore; events: ModuleEvents }   // later PRs add scheduler, speech, notify, present, connections
 SharedPart<X>         = { value: X; services?: [ServiceKey<T>.of(impl)]; contributions?: [ContributionKey<T>.of(value)];
@@ -298,91 +298,307 @@ SharedPart<X>         = { value: X; services?: [ServiceKey<T>.of(impl)]; contrib
 ModuleHostApi = {
   routeTokens: { mint(name, label): Effect<{ token, secret }>; list: Effect<RouteTokenInfo[]>; revoke(id): Effect<boolean> }  // P3
   view(): HostView                                  // module states, vault locked, engine summary, devices, Home values
-  service<T>(key: ServiceKey<T>): T | undefined     // live; the core's own (P5: People, Privacy, Devices) first, else undefined while no demanded module provides it
-  contributions<T>(key: ContributionKey<T>): ReadonlyArray<T>
+  service<T>(key: ServiceKey<T>): T | undefined     // live; the core's own (P5: People, Privacy, Devices; ModuleStopped once the part has closed) first, else undefined while no published module provides it
+  contributions<T>(key: ContributionKey<T>): Effect<ReadonlyArray<T>>   // for the calling fiber's principal (its context)
+  contributionsFor<T>(key, assistantId | undefined): ReadonlyArray<T>    // explicit, for native callbacks; undefined: all
   actions: { list: Effect<CatalogAction[]>; run(req): Effect<ActionRunResult> }  // the turn's (calling assistant's) catalogue
-  requestRestart(reason): Effect<void>
-}
+  requestRestart(reason): Effect<void>             // stop the module, then start it again (at most every 5 s, merged)
+  reportMissingProgram(tool): Effect<void>         // ENOENT/EACCES at run time: judged unavailable at once
+}                                                   // after its part closed, every member answers ModuleStopped (a defect)
+Principal = { turn } | { job } | { local } | { notification }   // TurnContext.ts: on whose behalf a call runs
+CurrentPrincipal: Context.Reference<Principal | undefined>       // the admitted principal, around execute/run
 ```
 
-- **Two lifetimes.** `start` runs per distinct set of effective settings as before; `shared` runs once per module while
-  it is demanded (an assistant has it on, its switch is on without demand, or a demanded module names it in `uses`),
-  with the shared settings only, and every instance gets its `value`. Services (one provider per key: a second is a
-  start error) and contributions (any number) come from `shared` and are looked up live, so restarts and start order
-  cannot lose them. A changed shared setting or secret starts a new shared part and every instance again; the old one
-  serves meanwhile and is retired after the grace period.
+- **Two lifetimes.** `start` runs per distinct set of valid effective settings as before; `shared` runs once per
+  module while it is demanded (an assistant has it on, its switch is on without demand, or a demanded module names it
+  in `uses`, transitively), with the shared settings only (validated alone), and every instance gets its `value`.
+  Services (one provider per key: a second is a start error) and contributions (any number; inside a turn only those
+  of modules the turn's assistant has on, read from the caller's own context) come from `shared` and are looked up
+  live. A module's shared part and instances are started, published, stopped and closed **together** (the module
+  host, below). `settingsFor(assistantId)` answers from the desired state the module was started with (a change of it
+  restarts the module). Module code the host starts (and `health()`) runs without `CurrentTurn`/`CurrentJob`/
+  `CurrentPrincipal`, whoever asked (`outsideTurns`). The CLI modes run every module whose saved switch is on, one
+  instance each, through the same host and gateway, and read the snapshot at every turn's start
+  (`apps/assistant/src/modules.ts`, `CliModules`).
 - **The execution gateway** (`packages/core/src/Gateway.ts`) is the one way to `Tool.execute` and `ActionDefinition.run`:
-  `ToolRegistry.run` (core's tool loop, the Claude Code bridge), `ToolRegistry.runAction` (the intent agent, a
-  confirmed action) and `host.actions.run`; later phrase commands, taps and routine steps. It reads `CurrentTurn`,
-  validates the input, resolves `risk` (a class or a function of the validated input; inferred `read` for speculative
-  tools, else `change`), `sensitivity` (`household | personal`) and `latency`, and checks in order: the assistant has
-  the module on, the tool is not in its `offTools` (`ModuleHostOptions.access`, from the assistants' module choices),
-  the risk hook, the confirmation hook (`ModuleHostOptions.gatewayHooks`, empty until P8). The host's registries and
-  serve mode's per-assistant registries all carry `host.gateway`; a hand-made registry uses `defaultGateway` (no
-  access checks). A later check is one more hook in `GatewayOptions`, called in `admit`'s order.
+  `ToolRegistry.run` (core's tool loop, the Claude Code bridge), `ToolRegistry.runAction` (the intent agent) and
+  `host.actions.run`; later phrase commands, taps, routine steps and notification actions. Every tool and action the
+  host publishes is **sealed**: its own `execute`/`run` only refuses, and the real one (inside the host's in-flight
+  tracking) is reachable only from the gateway (`GatewayPrivate.ts`, not exported from the package); a generated
+  action tool's `execute` refuses too. Its admission takes a principal (`Principal`): the explicit one a caller passes
+  (a notification, P9), else `CurrentTurn`, else `CurrentJob`, else the local or notification principal of the
+  gateway call it is made from (`CurrentPrincipal`), else the local principal in the CLI modes
+  (`ModuleHostOptions.localPrincipal`, default: without `access`). In serve mode a call with none is refused, so is a
+  local one, and so is one whose parts do not belong together: a turn without an assistant or device, a job or
+  notification without its ids, a tool of no module for an assistant, and what serve mode's
+  `GatewayAccess.principalProblem` refuses (the assistant does not exist; the device is not known; the device does not
+  have that assistant; the connection is not that device's; a person is named, which no server knows yet). **The
+  admitted call runs as that principal**: `execute` and `run` see exactly its `CurrentTurn`, `CurrentJob` and
+  `CurrentPrincipal` (`asPrincipal`), and so do the calls they make. The checks, in order: the principal; the
+  assistant has the module on; the tool is not in its `offTools` (`ModuleHostOptions.access`; skipped for the local
+  principal and a notification); only then the module's **risk function** (`risk: { classes, of }`, else the declared
+  or inferred class: `read` for speculative tools, else `change`), run on the validated input (a generated action
+  tool's input is resolved to the action's values once; those are classified, admitted and run); then the risk hook
+  (`ModuleHostOptions.gatewayHooks.risk`, empty until P8). A risk function that throws, answers a class it did not
+  declare or takes longer than `RISK_BUDGET_MS` (2 ms: it is synchronous code on the turn path, so it must be pure and
+  bounded) refuses the call with "what it would do could not be judged"; what went wrong goes to the log only. An
+  action declared `confirm: true` is refused on every public path (confirmation is off in this stack); only core's own
+  confirmed path (`Conversation`, after a consumed spoken yes, while `confirmActions` is "on") runs one. There is no
+  confirmation hook and no caller can claim a confirmation. `onAdmitted` / `holdUntil` (`ActionCallOptions`) let the
+  intent agent speak an action's announcement only once it is admitted, and hold a non-speculative action until its
+  turn is promoted (the same call is admitted again just before it runs). The host's registries and serve mode's
+  per-assistant registries all carry `host.gateway`; a hand-made registry uses `defaultGateway` (no access checks,
+  local principal). Input decoders are made when a registry is built. **Cost** (`TurnTrace` tool times, 350 warm
+  turns, `GatewayRound3.test.ts`): a module tool through the host's gateway (access checks, a risk function, sealing,
+  in-flight tracking) takes 0.016 ms at the median against 0.012 ms for a bare registry.
 - **Availability.** `requires`, `platforms` and `apiVersion` are judged before anything starts, from the app's probes
-  (`apps/assistant/src/requirements.ts`: one tool registry, argv + version regexp, no shell, 5 s, fixed `PATH` with
-  `data/tools/bin` first, cached; probed at start and on "Check again", never on a turn). A module that fails them is
-  `ModuleState` `unavailable` (protocol 9, `ModuleInfo.unavailable`: reason and fix), is never started, and each
-  assistant that has it on gets one instructions line saying it is not set up (`unavailableInstruction`).
-- **Health.** The host keeps an issue registry (`ModuleHost.issues`: requirements, unavailable, failed starts and
-  restarts, each module's `health()`), the app adds the core checks (`apps/assistant/src/coreChecks.ts`). `pnpm start
-  doctor` prints them and exits 1 on an error; admin's Diagnostics › Health shows them (`health`, `health.check`).
-- **Templates** are plain data (`ModuleInfo.templates`, ids `<moduleId>.<id>`) that the new-assistant wizard offers.
+  (`apps/assistant/src/requirements.ts`). Two kinds of requirement: a **program on the server** (`{ tool, version?,
+  why }`) and the **network** (`{ network }`, not probed yet: `unchecked`). One program registry (argv and a version
+  pattern per program, no shell, 5 s, fixed `PATH` with `data/tools/bin` first, cached in a `Map`); it is **empty** in
+  this version (no first version of a module needs a program; the module that first needs one adds its entry), and a
+  program it does not know is missing. A version is what the entry's pattern captures, and only a strict semver string
+  counts (`6.1.0`, `0.35.0-rc.1`, `1.2.3+b5`); anything else is an unknown version, which satisfies no range; a
+  prerelease satisfies only a range that allows it (node-semver). A probe that was already running when a program was
+  reported missing (`markMissing`) cannot undo the report (each probe and report has a number; the newest wins).
+  Probed at start and on "Check again", never on a turn. A module that fails them is `ModuleState` `unavailable`
+  (protocol 9, `ModuleInfo.unavailable`: reason and fix), is never started, and each assistant that has it on gets one
+  instructions line saying it is not set up (`unavailableInstruction`) and, for intent agents, stand-ins of its
+  `declaredActions` that answer with its "not set up" line (`unavailableLine`). Requirements on a device, on memory,
+  disk or a GPU are not part of this version.
+- **Health.** The host keeps an issue registry (`ModuleHost.issues`: requirements, unavailable, failed starts, module
+  code that hung, each module's `health()`). Every issue is normalised where it enters (`wireSafeIssue`): id, module,
+  device, title and the fix's label and value are one line, a detail keeps its line breaks, no other control
+  character survives, every text is clipped to the wire's limits; at most 20 issues per module and, in all,
+  `MAX_HEALTH_ISSUES` (100) and 256 KB, the rest said in one last issue ("And 12 more issues"). `pnpm start doctor`
+  prints every module's requirements and health, one line per issue with its fix (no control characters, no line
+  breaks), exits 1 on an error (a requirement is an error for a module the assistants use, directly or through `uses`;
+  doctor reads their demand and starts nothing: `ModuleHost.evaluate`), and says nothing about the machine itself
+  (disk, TLS, the port, speech models: the deployment work, docs/MODULES-PLAN.md §7). It reads the saved settings and
+  the vault read-only and strictly: when either cannot be read (or the vault stays locked, or parts of the settings
+  were dropped) it says why and exits 2, never judging the defaults. Admin's Diagnostics › Health shows the registry
+  by module and, within one, the device an issue is about (`health`, `health.check`, answered once the check has
+  started); "Check again" probes again, judges again and **tries again every module that is down after a failed
+  start**, whether or not a probe result changed.
+- **Templates** are plain data (`ModuleInfo.templates`, ids `<moduleId>.<id>`, at most 8 per module and 128 KB for all
+  modules together, the rest said on the Health page) that the new-assistant wizard offers; a module a template names
+  that this server does not have is named there, never silently dropped.
 - **Field actions** (P3): `defineModule({ fieldActions: { test: ({ settings, draft }) => Effect<FieldActionResult> } })`
   runs without an instance; an instance's `fieldActions` need it running; `host.fieldAction(id, key, values?)` picks
-  definition, instance, then an agent's generated `test`, applies the page's draft for `requiresSaved: false` buttons,
-  allows 8 s and one press at a time. A version 2 instance gets `refreshForm()` to have its `info()` and
-  `settingOptions()` described again.
+  definition, instance, then an agent's generated `test` (own keys or class methods only, called on their object),
+  applies the page's draft for `requiresSaved: false` buttons, refuses to run on settings that do not resolve, allows
+  8 s (answered at the deadline; the press runs on until it has ended, its cleanup logged after
+  `FIELD_ACTION_CLEANUP_MS`) and one press per button at a time; a failure is a generic sentence (details logged). A
+  press is owned (`FieldActionOwner`, start / in flight / stop) by the host (a definition handler; made with the host,
+  stopped first when it closes) or by the instance part that runs it (made with the part; `closePart` stops it before
+  it closes the part's scope, in the host's closing order); the button stays busy until the press has ended. A version 2 instance gets `refreshForm()` to have its `info()` and `settingOptions()` described
+  again (a closed combo shows its static options only).
+- **Secrets and admin pages** (P3, docs/UI-AND-MODULES.md "Secrets and the admin page"): (1) the host never puts a
+  secret on a page or in an admin response, by field kind (forms carry only `SecretState`; no host message quotes a
+  rejected value; a route token's secret is shown once, at its mint, and only its hash is kept); (2) text a module's
+  code writes is the module's responsibility (never a secret, or anything derived from one); (3) `PageBoundary.ts` is
+  the safety net with an exact contract: every exact, case-sensitive occurrence of a current or earlier secret value of
+  that module, of any length, is replaced by `[secret]` before clipping. Earlier values are kept per holder (`remember`
+  / `release`: a part until `closePart`, a press until it has ended and been answered, a health check, tokens a part
+  minted) with no eviction while the holder lives; past 1024 values per module the module's texts are replaced by a
+  fixed sentence instead. Encoded or transformed secrets are not promised to be found. `ModuleHost.pageText` and
+  `ModuleHost.routeView` give the router the same boundary.
+- **Bounds** (P3): every protocol 10 string, list and record has a maximum on the wire (`MAX_*` in
+  `packages/protocol/src/settings.ts` and `moduleRoutes.ts`; a records or text-list value at most 32 KB as JSON, at
+  most 200 options per combo and 32 KB of options), the core constructors refuse declarations outside them, and the
+  host cuts what a module returns at run time (`info` 1000 characters, results 500, options to the bound) before it is
+  sent, so one module form stays far below the 1 MB frame.
+- **Stragglers** (P3, `Stragglers.ts`): a press or a route handler still running 10 s after it was asked to stop
+  counts against its module until it ends; at the cap (4 presses, 8 handlers per module) new work of that kind is
+  refused (`busy`, 503) and Health has `<module>.presses-stuck` / `<module>.routes-stuck`.
 - **Module routes** (P3, docs/UI-AND-MODULES.md §1.11): `ModuleRoute = { method, path, guards?: ("admin" | "token" |
   "lan")[], public?, token?, body?, bodyLimitBytes? (8 KB, ≤ 1 MB), rateLimit? (30/min per caller, 120 in all),
-  timeoutMs? (5 s, ≤ 30 s), handler(req) }`; every declared guard must pass, a route without one must be `public`
-  and reads no body; checked when the shared part starts, looked up live (`ModuleHost.routes()`), so a stopped
-  module's paths are 404.
+  timeoutMs? (5 s, ≤ 30 s), handler(req) }` answering a final status (200–599); every declared guard must pass, a
+  route without one must be `public` (a GET without a body). Routes are one registration kind of the host
+  ("route", a registrar in `ModuleHost.ts`, see "Module host: registrations"): a shared part's routes are checked
+  during its start (`routeProblem`; a bad declaration fails the start and the module stays down), put in the live
+  route table under the module id when the module is published, and taken out when it is withdrawn, so a route is
+  only live while its module is published; while a module restarts its paths are absent. The router
+  reads `ModuleHost.routes()` (each `PublishedRoute` with the `scope` of the shared part that declared it), so a
+  stopped module's paths are 404, and runs each handler in that scope (closed: interrupted), outside any turn, as one of
+  the module's calls in flight (refused once it is withdrawn, given the grace period when it stops, then 503).
+
+#### Module host (`ModuleHost.ts`, `ModulePlanner.ts`)
+
+**One worker, one module at a time, stop before start.** There is a **desired state** per module (its saved switch,
+committed settings, the vault's secrets and a vault epoch, a configured-secret epoch, the assistants' choices and own
+values (`demand`), the linked defaults, the requirement judgement, a restart counter, a retry counter), kept as an
+immutable object per module that triggers replace. Every trigger (`configure`, `enable`, `disable`, `refresh`,
+`setSecrets`, `recheck`, `startEnabled`, `requestRestart`) only **writes desired state** synchronously (a save it
+needs is queued in the same step) and then waits for a pass that **began after** its write; an interrupted caller just
+stops waiting (nothing is kept for it). With `demand` (serve mode) nothing runs before `startEnabled`, which the app
+calls once everything the modules depend on is built.
+
+One **worker fiber** runs passes, never two at once; a write during a pass makes it run again; nothing else starts or
+stops module code. A pass **captures the desired state once** (the objects as they are at its start) and asks the pure
+planner (`planModule(target, current)`, tested with a table) what each module should run: its **fingerprint** (the
+shared settings, the valid instances' keys, the configured-secret epoch, the restart counter) and its **attempt key**
+(the fingerprint plus the vault epoch, the requirement probes and the retry counter). Then it walks the modules
+**sequentially**: first stopping, consumers before the providers they `use`; then starting, providers first. For a
+module whose fingerprint differs from what runs:
+
+1. **withdraw**: every registration of the module (tools, actions, context providers, services, contributions, every
+   other kind) out of what is published, in one synchronous step, and the snapshot rebuilt; a tool, action or context
+   provider of it called from now on is refused;
+2. **wait** for its calls in flight, at most the grace period (`graceMs`, 10 s), then interrupt what remains (the
+   waiting happens in the callers' fibers);
+3. **close** its instances, then its shared part;
+4. **start** the new shared part, then the new instances, one after another;
+5. **publish** them in one synchronous step if all started and every registration passes its claims and `validate`;
+   otherwise close what did start (instances first) and leave the module **down** with its error on the Health page.
+
+There is no moment at which two starts of one module are published, and no old one kept running beside or instead of
+a new one. Assistants that only move between equal instances change no fingerprint: only who uses which changes. An
+assistant whose own values are not valid gets an error of its own and is never grouped with a valid one; the others
+run. A start that failed is tried again when its attempt key changes (its desired settings, shared or any instance's;
+its secrets or the vault; its requirements' probe results; its restart counter) or "Check again" is pressed; a module
+that stops being wanted forgets its failure.
+
+**Bounded module code.** Every call into module code (`shared`, `start`, a finalizer, through `Scope.close`) runs in a
+fiber of its own with a limit (`startTimeoutMs` 10 s for a start, `stopTimeoutMs` 5 s for closing one part); when it
+passes, the worker interrupts that fiber without waiting for it, records a Health issue naming the module and what
+hung ("did not finish stopping", kept until "Check again"), and moves on. An interruption, failure or defect inside
+module code is that module's start failure; a failure in the worker's own handling of one module marks that module
+down with the reason; the worker itself ends only when the host closes. A `validate`, `publish` or `withdraw` that
+throws is caught: before publishing it refuses the start; during publishing it withdraws what this step published of
+the module and the module is down; during withdrawing it is reported and the stop goes on.
+
+**Closing the host** is the same walk with nothing wanted, consumers first, without grace (calls in flight are
+interrupted), bounded by `closeTimeoutMs` (30 s) in all; past that, what is left is abandoned and logged and close
+returns. Pending saves are waited for within the same bound.
+
+**Restarts.** `requestRestart` counts at once; the restart counter in the desired state follows at most once every
+5 s per module, every request in between merged into the next, and a request made after the last restart was applied
+always leads to another. One made during the part's own start applies once it is published (dropped if it is not).
+A restart with the same configured secrets starts with the secrets the module ran with (a vault locked since does not
+stop it).
+
+**A host object kept by module code** after its part's scope closed answers every member with `ModuleStopped` (an
+effect dies with it, a synchronous member throws it; `isModuleStopped`).
+
+#### Module host: registrations (`ModuleRegistrations.ts`)
+
+Everything a module offers is a **registration** of one of its parts:
+
+```ts
+interface Registration {
+  kind: string                       // "service", "contribution", "tool", "route", "job-handler", …
+  claims?: ReadonlyArray<string>     // unique per kind across modules (a service id, a tool name, a route path)
+  clash?(claim, ownerName): string   // the refusal when another module's published registration holds the claim
+  validate?(): string | undefined    // its own check before anything of the module is published: a reason refuses the start
+  publish(): void                    // in the worker's publish step, synchronous; a throw is a defect (see above)
+  withdraw(): void                   // in the worker's withdraw step, synchronous
+}
+type Registrar = (part: StartedPart) => ReadonlyArray<Registration>   // StartedPart = { handle, shared?, instance? }
+interface PartHandle { moduleId; moduleName; kind: "shared" | "instance"; id; state(); scope; register(r): RegisterResult }
+```
+
+Only the worker publishes and withdraws, all of a module's registrations together. Services, contributions, tool names
+(and through them the snapshot's parts) are expressed this way. A later PR adds a kind in one place:
+
+- **declared by what a part returns** (P3's `SharedPart.routes`): one `Registrar` in the host's `registrars` list. For
+  routes: `claims` = the route paths, `validate` = `routeProblem` for each, `publish` puts `{ routes, scope: handle.scope
+  }` in the route table under the module id, `withdraw` removes it; `host.routes()` reads that table;
+- **made by module code while it starts** (P6's job handlers, P4's subscriptions, later phrase commands and
+  notification action handlers): the context member gets the part's `PartHandle` in `servicesFor(entry, part)` and
+  calls `part.register(...)` during `shared` or `start`; the registration is published with the module. A call after
+  the part has started is refused: there is no registration outside the worker.
+
+`ModuleHostOptions.registrars` adds kinds an app keeps itself (and tests).
 
 ### Household store and event bus (docs/MODULES-PLAN.md §4 P4; how to use it: [docs/STORING-DATA.md](STORING-DATA.md))
 
 ```ts
-defineModule({ apiVersion: 2, storage?: { collections?: [Collection], sql?: { migrations: [SqlMigration] } }, events?: [EventType], … })
-defineCollection({ name, scope: "household" | "person" | "assistant" | "device" | "conversation", schema, version?, migrate?,
-                   indexes?, search?, history?: "full" | "none", ambient?(rows, { now, turn }), ambientRows?, project?(row, device) })
-ModuleStore (ctx.store) = { collection(c): CollectionHandle<A>; sql: ModuleSql; transaction(work); logChange(change); readOnly; fts5 }
-CollectionHandle<A> = { get(id, { scope? }); list({ scope?, where?, orderBy?, limit? }); search(text, { scope?, limit? });
-                        insert(value, { id?, scope?, actor? }); update(id, f, { expectRev?, scope?, actor? }); remove(id, …);
-                        erase(id, …); undo({ actor? }) }      // Row<A> = { id, rev, scope, value, createdAt, updatedAt, updatedBy: Actor }
-ModuleSql = { prefix: "m_<id>__"; table(name); fts5; query(sql, params); run(sql, params) }   // one guarded statement per call
-ModuleEvents (ctx.events) = { publish(type, data, scope?): Effect<void>; subscribe(filter?): Stream<HouseholdEvent> }
-HouseholdStore (host) = { prepare(modules); availability(id); forModule(id); transaction; core(owner): CoreSql; changesSince;
-                          lastSeq; endConversation; pruneChanges; backup; exportModule; onCommit }
-EventBus = { publish(event); subscribe(filter?, { capacity? }); stats(); forModule(id) }
+defineModule({ apiVersion: 2, storage?: { version?, collections?: [Collection] }, events?: [EventType], … })   // ids "host", "core" reserved
+defineCollection({ name, scope: "household" | "person" | "assistant" | "device" | "conversation", schema,
+                   migrate?: { [fromVersion]: (json) => json }, indexes?: [field | [filterField, orderField]],
+                   ambient?(rows, { now, turn }), ambientRows?, project?(row, device) })
+ModuleStore (ctx.store) = { moduleId; readOnly; collection(c): CollectionHandle<A>; transaction<X>(f: (tx: StoreTx) => X): Effect<X, StoreFailure> }
+CollectionHandle<A> = { get(id, { scope? }); list({ scope?, where?, orderBy?, limit? ≤ 100 });
+                        insert(value, { id?, scope?, actor? }); update(id, f, { expectRev?, scope?, actor? }); remove(id, { expectRev?, scope?, actor? }) }
+                        // each an Effect and one synchronous step; Row<A> = { id, rev, scope, value, createdAt, updatedAt, updatedBy: Actor }
+StoreTx = { collection(c): TxCollection<A>  /* the same five, synchronous, throwing StoreFailure */; publish(type, data, scope?);
+            afterCommit(f); onRollback(f) }                           // valid only while its function runs
+ModuleEvents (ctx.events) = { publish(type, data, scope?): Effect<void>; subscribe(filter?, { capacity? }): Stream<HouseholdEvent> }
+HouseholdStore (host) = { info; prepare(modules, core?: [{ owner: "core.<name>", storage }]); availability(owner); undeclared();
+                          forModule(id); forCore(owner); transaction(f: (tx: HostTx) => X); afterCommit(f); publish(moduleEvent);
+                          reader(owner, c): CollectionReader | undefined; lastSeq; endConversation(id); sweepConversations; backup;
+                          onCommit(listener: (released: Released[]) => void) }
+HostTx = { forModule(id): StoreTx; forCore(owner): StoreTx; afterCommit(f); onRollback(f) }
+EventBus = { publish(event); subscribe(filter?, { capacity? 1–4096, gate? }); stats(); forModule(id, { gate? }); connect(store) }
+HouseholdFeed = { active; sendsEvent; sendsCollection; snapshot(device): SnapshotRun; change(change, device); live(event, device) }
+HouseholdPage = { offer(released); refresh(); restart(); pending(); step(): PageMessage[]; size(); snapshotDevice() }
 ```
 
-- **One file**, `data/household.db`, SQLite through `@effect/sql-sqlite-node` on `node:sqlite` (`packages/store-sqlite`;
-  `effect/sql` is unstable, so it stays behind `HouseholdStore`): WAL, `synchronous = NORMAL`, `secure_delete = ON`, one
-  connection, writes serialised. Calls are synchronous on the main thread, which also frames audio: every statement is
-  small (single-row writes, indexed reads), and nothing waits on the network inside a transaction. Serve mode opens it
-  read-write after the writer lock; the CLI modes read-only (writes fail `read-only`); node's `ExperimentalWarning` for
-  `node:sqlite` is filtered (`store-sqlite/src/quiet.ts`).
-- **Scopes** come from `CurrentTurn` or are passed; a person-scoped call with no known person is `ScopeUnknown`, never
-  a household write. Conversation-scoped rows are deleted when the conversation ends (`SessionConversation`).
-- **Change log** (`pva_changes`): one row per write in the same transaction (seq, op id, module, collection, scope, row
-  id, op, rev, actor, time, the values before and after unless `history: "none"`); 90 days kept; `undo` per actor and
-  collection; `erase` removes a row with every earlier payload and its search entries (daily backups keep it 14 days).
-- **Versions**: `prepare` (before the module host is made) migrates older data after a backup, in a transaction, and
-  makes a module whose stored data is newer `unavailable` (`ModuleHostOptions.household`; the host's `judge` reads
-  `store.availability`). A newer core schema stops serve mode.
-- **Bus**: data changes after commit, module events (`<moduleId>.<type>`), `host.turn.ended`, `host.device.connected`,
-  `host.device.disconnected`, `host.module.state`. One queue of 256 per subscriber, dropping and counting when full, so a
-  slow subscriber never holds up a publisher or the turn path.
-- **Pages**: `household.snapshot` after `welcome` and `household.event` after each commit, only for collections and
-  event types with a projection, through `mayRevealScopeTo` (household to every voice page, device to its own, person
-  through `Privacy.mayReveal` on the page's `TargetDevice`: its privacy and default person) and the projection, the same
-  on all three paths (snapshot, live, replay from `hello.household.seq`). A change of a device's place or default person
-  gives its pages a fresh snapshot. `HouseholdFeed.ts`, `serve/HouseholdPush.ts`.
-- **Ambient facts**: one host context provider (`Household`, 50 ms, 600 characters, `HOME_AMBIENT_FACTS`) appended to
-  each assistant's registry in serve mode (`withContextProvider`).
-- **Backups**: daily `data/backups/household-<date>.db` (14 kept, optional `HOUSEHOLD_BACKUP_COPY_DIR`), and `pnpm start
-  household backup | export <module> | restore <file>`; `doctor` checks the database and the last backup's age.
+- **One file**, `data/household.db` (mode `0600`, directory `0700`), Node's built-in `node:sqlite` (`DatabaseSync`, no
+  driver in between; `packages/store-sqlite`): WAL, `synchronous = NORMAL`, `secure_delete = ON`, one connection.
+  Both stores run one engine (`packages/core/src/StoreEngine.ts`) over a small synchronous backend (SQLite's
+  statements, or maps with an undo list in `MemoryHouseholdStore.ts`). Calls are synchronous on the main thread, which
+  also frames audio, so nothing unbounded runs there: a `list` is one named index (`INDEXED BY`) read in its own order
+  up to its limit (at most 100 rows of at most 16,000 characters: 2.3 ms worst measured), a write one row; the
+  connection never checkpoints (`wal_autocheckpoint = 0`) and never waits for a lock (`busy_timeout = 0`; `busy` is a
+  typed failure, a transaction's begin is retried on a timer). Serve mode opens the file read-write after the writer
+  lock (a newer file is refused after a read-only look, untouched); the CLI modes read-only (writes fail `read-only`);
+  node's `ExperimentalWarning` for `node:sqlite`, and only that text, is filtered (`store-sqlite/src/quiet.ts`).
+- **Collections only, no SQL anywhere in the interface.** Modules and core services (the scheduler, notifications)
+  keep the same document collections; a core service's are under a reserved owner (`core.<name>`, which no module id
+  can be), reached only through the host's `forCore`. A module's store, and its `tx`, reach that module's own
+  collections only. Values are JSON objects; an indexed field's value is kept in a key column of its own bound from
+  JavaScript (a well-formed string without NUL ≤ 500, any finite number, a boolean as 1/0), never re-parsed by SQLite;
+  ties are broken by `createdAt`, then id. Row and scope ids are 1–200 of `[A-Za-z0-9_.:-]`; index names hex-encode
+  owner and collection, so they are injective. `rev` comes from one counter of the store (`pva_meta.rev`).
+- **Transactions are synchronous and flat**: `transaction(f)` begins, runs `f` and commits, or rolls back when `f`
+  throws, in one step that never yields, begun and ended by the engine alone; a `transaction` started inside one joins
+  it. A function that returns a promise, an Effect, a generator or a function rolls everything back and fails
+  `invalid`. A handle is valid only while its function runs. SQLite ending the transaction itself, or a failed
+  `COMMIT`, is a typed `StoreError`; rollback hooks run. Events of a transaction (changes, `tx.publish`, `afterCommit`)
+  are a list on it, released after the commit in order, never re-entrantly; `onRollback` hooks run newest first.
+- **Removal**: `remove` deletes the row (`secure_delete`); after the commit the checkpointer's worker thread empties the
+  log (`PASSIVE`, then `TRUNCATE`, never waiting), retried while a reader holds an old snapshot; a removal counts as
+  done only when a checkpoint that started after it succeeded, and every start makes one (settling a removal a stopped
+  process left pending). Ended conversations are hidden at once and removed in bounded steps off the turn's path.
+  Backups keep a removed row until they rotate out (14 days).
+- **Scopes** come from `CurrentTurn` or are passed; a collection's scope never changes; a person-scoped call with no
+  known person is `ScopeUnknown`, never a household write.
+- **Versions**: one data version per owner (`storage.version`). `prepare` (before the module host is made): newer
+  stored data makes the owner `unavailable` and nothing of it is read, migrated or deleted; older data is migrated in
+  one transaction after a backup, every row checked against the new schema and indexes (at most 20,000 rows); a
+  failure leaves the data as it was, the owner `unavailable` with the row and why. The same version with another
+  shape (a canonical description of schema, scope and indexes) is refused, as is a scope change. A collection no
+  declaration names keeps its data, unreachable (`undeclared()`, `doctor`). Read-only, an owner is usable only when its
+  version, shapes and indexes match. A newer core schema stops serve mode.
+- **Bus**: what the store releases after each commit (data changes and module events, in one order; module events go
+  through `HouseholdStore.publish`), and `host.turn.ended`, `host.device.connected`, `host.device.disconnected`,
+  `host.module.state`. One bounded queue per subscriber (1–4096, default 256; no option makes it unbounded or
+  synchronous), dropping and counting when full; no subscriber code runs on a publisher's stack, also not to end a
+  subscription. A module's subscription (in `shared` or `start`) lives with its part (`ModuleHost` `eventsFor`):
+  events reach it only while the part is live (published with its module), none reaches a handler once the module
+  is withdrawn, and it ends when the part's scope closes. `ctx.store` and `ctx.events` are made per part by
+  `servicesFor` and die with `ModuleStopped` once the part has closed.
+- **Pages**: only collections and event types with a projection, through `mayRevealScopeTo` (household to every voice
+  page, device to its own, person by the privacy rule on the page's `TargetDevice`, P5's `FeedPeople.ts`; device ids are claimed, not
+  authenticated).
+  Per connection **one queue for everything it is sent** (`HouseholdPage`: snapshot parts, coalesced row changes,
+  removals, module events; one bound) filled from the store's commit listener, drained by a fiber a bounded step at a
+  time; **every frame is built when it is handed to the socket**, from committed state and the server's record of the
+  device. A device-record change (its name; P5: its room, or a person added to Members) gives a fresh snapshot and keeps queued module events after it; an overflow or a
+  restart is signalled with `household.gap`, then a fresh snapshot. The snapshot's final part names the collections cut
+  short. A removal carries the collection and the id only, to every page that could see the row's scope; nothing is
+  remembered per page. `HouseholdFeed.ts`, `HouseholdPage.ts`, `serve/HouseholdPush.ts`.
+- **Ambient facts**: one host context provider (`Household`, 600 characters, bounded synchronous reads with a time
+  check, `HOME_AMBIENT_FACTS`, **off by default** until measured with `bench --live --ambient`) appended to each
+  assistant's registry in serve mode (`withContextProvider`).
+- **Backups** (serve mode only): daily `data/backups/household-<date>.db` and before an upgrade, both copied to
+  `HOUSEHOLD_BACKUP_COPY_DIR` when set, one at a time, each through its own temporary file and one `rename`; every
+  backup removed after 14 days without exception (a failure to list, check or remove is a Health issue, kept ones
+  narrowed to `0600`); a data or backup directory others may write to is made private when it is the user's, else an
+  error on the Health page. Restoring is a manual step with the server stopped (docs/STORING-DATA.md). `doctor` checks
+  that the database opens, the quick check, each module's data, stored data nothing declares, the directories and the
+  last backup's age; the Health page the backups, the log's size and a pending removal checkpoint.
 
 ### People, rooms and device capabilities (docs/MODULES-PLAN.md §4 P5)
 
@@ -398,34 +614,100 @@ CapabilityOverrides = { noDisplay: boolean; excludeKinds: kind[]; noSpeaker: boo
 effectiveCapabilities(declared | undefined, overrides): DeviceCapabilities      // declared minus overrides; never adds
 // hello.device.capabilities, then { type: "device.caps", capabilities?, live? }; DeviceRecord.declared = { capabilities, seenAt }
 
-// packages/core: provided by serve mode through `host.service(key)` (ModuleHostOptions.coreServices)
+// packages/core: provided by serve mode through `host.service(key)` (ModuleHostOptions.coreServices); each part gets its
+// own view (`servicesFor`) whose calls die with ModuleStopped once the part has closed; a module may not provide these keys
 People  (ServiceKey "core.people")  = { list(); get(id); find(spoken): PersonMatch /* found | ambiguous | none */;
                                         householdDiet(); dietOf(personId?): Diet; setDiet(person | "household", Partial<Diet>) }
 Person  = { id; name; aliases; pronunciation; diet: Diet }    Diet = { allergies; diets; dislikes }   // no adult/child, no trusted flag
 Privacy (ServiceKey "core.privacy") = { mayReveal(owner?, device: id | { deviceId? } | undefined): boolean;
                                         mayRevealItem({ sensitivity: "household" } | { sensitivity: "personal"; owner? }, device);
-                                        mayRevealHere(owner?): Effect<boolean> }     // pure rule: mayRevealTo(owner, place)
+                                        mayRevealHere(owner?): Effect<boolean> }
+mayRevealTo(owner: unknown, place: unknown, isMember): boolean                  // THE rule; validates every argument
+makePrivacy(placeOf: (deviceId) => PrivacyPlace | undefined, isMember)          // undefined place = not a known device: no
 Devices (ServiceKey "core.devices") = { list(): KnownDevice[]; get(id); otherScreens(from, { person? }); bestOtherScreen(from, …) }
 KnownDevice = { id; name; kind; room?; place; capabilities /* effective */; declared?; connected; visible; lastInteractionAt?; lastSeen }
-TargetDevice (HouseholdStore.ts) = { id?; name?; room?; privacy?; defaultPerson? }   // what a projection sees of a page's device
+TargetDevice (HouseholdStore.ts) = { id?; name?; room?; privacy?; defaultPerson? }   // privacy only for a device the server knows
+quotedName(text), plainName(text), QUOTED_NAMES_NOTE (PromptText.ts)          // typed text on its way into a prompt
 ```
 
 - **Members** is a shared settings section of the core (`serve/people.ts`, Shared settings › Members): `HOUSEHOLD_MEMBERS`
-  (records: a hidden `id` made by the server when a person is added, name, aliases, pronunciation, allergies, diets,
-  dislikes) and the household diet `HOUSEHOLD_DIET_ALLERGIES` / `_DIETS` / `_DISLIKES`. `People.setDiet` saves through
-  `Sections.update` like an admin edit. A person removed from Members is cleared from every device's and device type's
-  `place.defaultPerson` (`SettingsStore.clearDefaultPeople`, also at start); a device's default person is the only link
-  between a device and a person, and it selects whose data a turn means, never what it may do.
-- **`Privacy.mayReveal`** (§2 row 8): a `private` device yes; a `shared` one only when its default person is the owner; a
-  `public` one no; an unknown owner is someone else's; household items always. A device that is offline or unknown is
-  judged from its saved place (an unknown one: its type's defaults).
-- **Devices** (`serve/deviceFacts.ts`): one cached list rebuilt when the settings file, the people or the live state change
-  (a connection, a declaration, visibility), never per turn. "The best other screen" ranks displays that accept things
-  from others: same room and visible, same room and always on, the person's phone (opens links, connected), any other
+  (records: a hidden `id` made by the server, name, aliases, pronunciation, allergies, diets, dislikes; one-line names,
+  unique by `memberNameKey`; every field's type and bounds and the rules across records are `checkMembersValue` in the
+  protocol, which the server's section and the mock's save path both run) and the household diet
+  `HOUSEHOLD_DIET_ALLERGIES` / `_DIETS` / `_DISLIKES`. `HOUSEHOLD_MEMBERS` is never read from the environment (ids are
+  the server's; the environment view says so). **One serialized operation** (`MembersGate`) owns every change to people
+  and to the references to them: Members saves (admin, `People.setDiet` with read, check and write in one step
+  through `Sections.edit`), the clean-up of the devices and types whose default person was removed (inside the same
+  operation), and every device and device type save, whose default person is checked against committed Members inside
+  it. Waiting to be admitted can be interrupted; an admitted operation cannot, and the caches People and the privacy
+  rule read (`Sections.value`) belong to the committed settings file, so an interruption before admission changes
+  nothing and one after it changes settings, People and privacy together. A removed person's stored data stays in the database but reaches no page and no turn (not a member any more);
+  deleting it is a known gap (docs/ASSISTANTS.md §2.4). A device's default person is the only link between a device and
+  a person: it selects whose data a turn means, never what it may do.
+- **`Privacy.mayReveal`** (§2 row 8) **fails closed** in one function, `mayRevealTo`: a `private` device yes; a `shared`
+  one only when its default person is the owner; a `public` one no; household items always. Anything else is no: a
+  missing, null, empty or malformed owner, an owner not in Members, an unknown sensitivity, a malformed place, a missing
+  or malformed device reference, a device id the server has no record of (never its type's defaults), "no turn" for
+  `mayRevealHere`. A known device that is offline is judged by its saved place. The feed (`FeedPeople.ts`), the ambient
+  facts (`AmbientOptions.mayRevealPerson`), the context line and the service all call it.
+- **The boundary: a change of what a device may be told or sent ends its session.** Its privacy, its default person
+  (while a member), and its output overrides (`noSpeaker`, `noDisplay`, excluded kinds; the device's own, else its
+  type's) make one key (`boundaryKey`, protocol). `SettingsStore.onCommitted` calls serve mode in the step that commits
+  a settings change; it compares the key before and after for every voice session and connection
+  (`deviceFacts.boundaryChanged`; a first registration is not a change, being forgotten is), and every device counts
+  when a person left Members (`membersRemoved`). For each affected device, synchronously and before anything else can
+  run for it, `SessionHub.endSessions`: `VoiceSessions.endDevice` marks the session ended (the session's sends check
+  it, so nothing of it reaches a later session of the same device), removes it with its reserved ids and stops it in
+  the background (every conversation ended, the agents' harness sessions closed, conversation-scoped rows erased), and
+  every connection of the device is closed with `CloseCode.settingsChanged` (4205), so no audio frame, text, feed frame
+  or tool result is sent on it after that step. The page reconnects at once, says hello again with what it can do now
+  and starts with a fresh session and snapshot; it shows "Settings changed; the conversation started again". A change
+  of room, name, always-on, accepts-from-others or quiet-room does not end the session: pages get a fresh snapshot of
+  the new place (the device record changed: `HouseholdHooks.devicesChanged`, the page's queue `refresh`). Admin says what happens next to each field that ends it.
+- **Permission is decided where output leaves, against committed state.** Reply audio: every frame the hub sends
+  checks `DeviceFacts.speakerAllowed` (`speakerAllowedFrom`: the committed `capabilities` section, its own or its
+  type's, and the latest declaration's speaker playing speech; a cache read), and a play stops sending the moment it
+  says no (`silentUnless`). Personal content: the privacy rule reads the committed place. A device without a record is
+  judged by its type's defaults and has no place (no person data); its welcome waits for its first registration, so
+  its first turn is judged by its record.
+- **Devices** (`serve/deviceFacts.ts`): one cached list rebuilt on the first read after the settings file, the people
+  or the live state changed (a connection, a declaration, visibility), with the registry's in-memory last visits
+  (`lastSeenOf`). Only devices with a record count. "The best other screen" ranks displays that accept things from
+  others: same room and visible, same room and always on, the person's phone (opens links, connected), any other
   connected shared screen; ties by the most recent interaction.
-- **The context line**: a host context provider (`This device`) after the modules' context and before the ambient facts:
-  `Device: Kitchen speaker (voice only, no screen; room Kitchen; shared, usually Sam). Other screens: Kitchen iPad (on).`
-  It is a cache read (no I/O); measured with `TurnTrace` it adds nothing measurable (`apps/assistant/test/peopleRooms.test.ts`).
+- **Declarations** (`serve/devices.ts`, `SessionHub`): only `hello` and `device.caps` declare; re-registrations
+  (`device.pick`) never re-declare from a tab's old `hello`. Every `hello` and `device.caps` takes a number the moment
+  the hub receives it (`DeviceRegistry.arrival`), before any coalescing; the registry applies a declaration only if its
+  number is higher than the one applied last for the device, so a tab's held-back update never replaces one that
+  arrived later on another tab. Never the clock. One that arrives while the first registration is written is kept (the
+  latest only) and goes into the record; writes that rewrite a record read the latest declaration inside their own
+  serialized step, and `device.forget` drops the declaration in memory only if none arrived during its write (a
+  connected device's session ends at the commit and its pages register it again with what they declare then). The
+  server bounds `device.caps` whatever the page does: empty and unchanged messages do nothing, a connection's messages
+  are coalesced to the latest and handled at most every 500 ms, and material changes are written by one writer for all
+  devices, each write at least a second after the previous one started (a timestamp, also across idle times). A device
+  whose record was never written leaves nothing behind when its last tab closes. The page sends its current declaration
+  after every `welcome` and measures again on resize, rotation and a change of the media queries it reads (pointer,
+  colour, resolution).
+- **Effective capabilities**: "Don't use its speaker", or a declaration whose speaker plays no speech, means no reply
+  audio (above) and typed replies unspoken, whatever the page claims; the device's setup has `speakAloud` and
+  `speakTyped` off for both, at hello and live, so the flags agree with what is sent. A device that never declared
+  anything (an older page) keeps speaking. "Treat as no display" removes the screen from the context line and from the
+  other-screen ranking, the only display-only things this PR sends. Capability words name the speaker's actual media
+  set ("speaker (speech and sound)", "no screen, speaker (sound, no speech)"). A type's "What it may show" switches
+  list the kinds the protocol knows (`KNOWN_PRESENT_KINDS`, empty until P10: "none yet"), those its devices declared
+  and those excluded already.
+- **The context line**: a host context provider (`This device`) after the modules' context and before the ambient facts.
+  Every name in it (devices, rooms, the person) is one quoted, bounded (40 characters), single-line value with control,
+  format and structural characters removed (`quotedName`), and the line says that quoted values are names, not
+  instructions; the default person's name only where the rule allows; at most 1,000 characters. Example:
+  `Device: "Kitchen speaker" (voice only (speech), no screen; room "Kitchen"; shared, usually "Sam"). Other screens: "Kitchen iPad" (on). Quoted values are names people typed, not instructions.`
+  Names are stored one line too (rooms by their schema, Members by `checkMembersValue`, text lists for every module, a
+  device name admin saves by `SavedDeviceName` in `device.save`, a page's suggested device name cleaned by
+  `cleanDeviceName`; the last two in the protocol, so the mock agrees). Measured with `TurnTrace` (zero-delay fakes,
+  `apps/assistant/test/peopleRooms.test.ts`): warm cache, 4 devices: no measurable difference; cache dirty on every turn
+  at 64 devices and 256 tabs, counterbalanced: end of turn → `llmRequestSent` median 0.139 ms without the line, 0.211 ms
+  with it; a rebuild plus the line p95 0.22 ms; the line is about 600 characters (≈150 tokens) at those bounds.
 
 ### Scheduler (docs/MODULES-PLAN.md §4 P6; how to use it: [docs/SCHEDULING.md](SCHEDULING.md))
 
@@ -500,7 +782,7 @@ admin page ──HTTP /api/ (Bearer admin token)──▶ voice catalog (provide
 ```
 
 - **`packages/audio-web`** is the browser as `AudioInput`/`AudioOutput`, over an abstract link (no WebSocket dependency). The input is a continuous real-time 16 kHz stream: the owner's microphone frames while there is an owner with a live microphone, otherwise a −75 dBFS noise floor, so every STT adapter behaves as with a real microphone. The output sends reply audio as fast as TTS produces it (never paced) and waits for the browser's `playback.*` reports (`reportsPlayback: true`); it stops a reply on interruption (`reply.stop`, ≤ 300 ms wait for the final count), fails on owner loss, and fails with `playback_timeout` when the browser stops reporting for 2 s. Every reported count is clamped to the samples it sent to that link for that reply, so the `PlaybackObserver` never sees more than was transmitted (docs/UI-AND-MODULES.md, "Changes since the design"). Its input queue holds 3 s and counts what it drops (`inputStats()`).
-- **SessionHub**: handshake, roles, requests, routing by audience, send limits. A voice connection belongs to the session of its device (`hello.device.id`, else its own `clientId`); ownership is per session (one tab of the device owns its audio, the others observe, the last claim on *that device* wins, `resumeOwner` within the device; a claim on another device takes nothing; admin pages never own audio). A session's messages (`state`, `transcript`, `turn.*`, `assistant.*`, `tool.*`, `reply.*`, `wake`, `conversation`, its `error`s) go to its device's connections only; shared ones (`engine.summary`, …) are broadcast; `ADMIN_ONLY` types (now with `sessions`, throttled like `devices`, and `trace`: every finished turn of every session with its `key`, `deviceId` and `TraceInfo.session`, so admin's latency view grows live without turn traffic) go to admin connections only. At most 24 connections. **VoiceSessions** (`serve/VoiceSessions.ts`): device → session, created at the device's first `audio.claim` or `text.send` (an idle open tab costs nothing), at most `MAX_VOICE_SESSIONS` (default 4; one more takes the place of the least recently active session whose device has no connection, else it is refused `sessions_full`), discarded with its conversation after `SESSION_DISCARD_MINUTES` (default 30) without a connection; a device without a session still has the conversation id its first turn will use (`conversation.new` works before anything was said); the recent traces of every session for admin. **VoiceSession** (`serve/VoiceSession.ts`): one device's `WebAudio`, echo gate, wake gate, state tracker, publisher, heard-audio tap and **SessionConversation** (`serve/SessionConversation.ts`: the `Conversation` and its voice loop on the shared engines, the history, conversation id and idle clock carried across builds, the typed-input admission; every reply is spoken with the voice of its turn's setup, `TurnSetup.tts`). Its device's settings configure it live (`syncProfile`: interrupt mode, the route gate's phrases and without-phrase mode, the hearer); each assistant on the device has its own `SessionConversation` (made on first use; its prompt, tools, follow-up, `idleResetMs` from `newConversationAfter`, reply early, tool rounds come from that assistant), all behind one **SessionDispatcher** and one **OutputLease**. Its turns are numbered per session and its traces carry `session` (the device name) in the latency line and in `TraceInfo`. A Claude subscription assistant's conversations use the one running agent module, which keeps one Claude Code session per conversation id (so per device and assistant) and answers each turn with that assistant's model, effort, thinking, tools and fresh-session time (`withConversationOptions`, docs/ASSISTANTS.md WP-13a; the module's opt-in, program, proxy and debug logs are the account's, shared), at most `MAX_VOICE_SESSIONS` × the switched-on assistants on the account open at once; a discarded session ends its conversation there. Every finished turn's `TraceInfo.config` (admin only) is the configuration snapshot taken at its start (docs/ASSISTANTS.md §3.7). **AdminSessions**: `PVA_ADMIN_PASSWORD` (read once at start, removed from the environment and the env view; unset or < 8 characters = admin disabled), `admin.login` → a random token kept in memory (12 h, 30 min idle, constant-time compare, the vault's back-off), accepted again in an admin page's `hello`; every request that changes the server is admin only (`admin_required`). **Assistants and devices** (`serve/assistants.ts`, `serve/devices.ts`; docs/ASSISTANTS.md): the assistants, the **device types** (`DEVICE_TYPES`, `web-voice` today: the registry that replaced the front-end kinds) with their defaults, and the **device registry** (devices recorded at hello, at most 64, with their names and last visits), stored in `settings.json` version 4 (`assistants`, `deviceTypes`, `devices`, each entity with a `rev`). A device's effective settings = built-in ← its type's defaults ← its own sections; `assistant.*`, `device.save`, `device.pick` and `device.forget` change them, and the new setup is pushed live to the device's tabs (`device.setup`) and the lists to the admin pages (`assistants`, `device.types`, `devices`). **Publisher**: maps conversation events to messages synchronously, holding a speculative turn's messages until it is promoted. **StateTracker**: the assistant state. **Engine**: since WP-11 it holds no provider (`EngineProviders.llm` / `.stt` / `.tts` / `.voice` exist only for tests that inject one of each; the pool then hands out instances that use them); it is the **full reload** of docs/ASSISTANTS.md §3.2 (the owner's Reload button, model directories and thread counts) and the status. Each session attaches its loop (`attach`), which runs on every build and is stopped, keeping that session's history and conversation id, when the build ends; a loop that fails (not interrupted) stops the engines (`failed`, stage speech-to-text); a build failure is reported per stage instead of exiting; a reload first runs cheap checks (serve mode's: the model files of every local recogniser in use exist), and if they fail the running engines are kept; a reload also rebuilds every resource in use in the background. Its status lists the resource pool's resources (`EngineStatus.resources`) and, from them, the `llm`, `stt` and `tts` engine rows and the `voices` in use. **Resources** (`serve/Resources.ts`, docs/ASSISTANTS.md §3.2): the resource pool: the language models, the voices and the recognisers; one language-model instance per distinct `LlmKey` (plus the account's key stamp), shared by every assistant with equal settings, built at start and reconciled after every settings save and vault change; a changed model is built first, then the assistant's next turn start takes it (`TurnSetup.llm`), turns already running finish on the old one, which is released 10 s after its last user; a build failure is that resource's problem only (its assistants' turns fail, the others run); the owner's reload rebuilds every instance in use without interrupting a turn. Voices (WP-10) are keyed by `voiceKey`; assistants with the same voice share one instance, and the voices of one local engine (every Kokoro speaker) share that engine, which runs one clause at a time; a changed voice is built first and applies at that assistant's next turn (`TurnSetup.tts`). Recognisers (WP-11) are keyed by `SttKey` (stt-sherpa: model, language when the model takes one, model directory, threads; Deepgram: the shared model and address) and bound per hearing place (a known device, or a device type's defaults for the devices that follow them): each device hears with its *hearer's* (`hearerOf`: the assistant that answers without a phrase, else the first in its list) model, on a stream with that hearer's turn timing, VAD and gain (Deepgram: confidences), so hearers on one model share one loaded worker; a device with no assistant runs none. A changed hearer, model or stream option builds the new recogniser first, and the device's stream is replaced at its next silence (at most 5 s; an utterance still open then is closed and starts nothing). A recogniser that fails to load or whose worker dies is a failed resource: its devices hear nothing (told once with `engine_failed`), typed text still works, the hearer's `AssistantInfo.problems` name it, every other device hears. A save whose new local models would need more than 75 % of the free memory (WP-0's `ramMb`) asks for "Save anyway". **HeardAudio** (one per session): when "Save what the assistant hears" is on, each turn's audio as the recogniser received it goes to `data/recordings/<time>-<device>-<n>.wav` with level statistics, the transcript, the device (`device: { key, name }`) and transport counters (`pnpm start compare-models` replays them through every installed model). **SettingsStore**: `data/settings.json` (version 4: module settings per module, the shared settings flat by key, the assistants, the device types' defaults and the device records; a version-3 file is migrated at load into one assistant with the same behaviour and kept as `settings.json.v3-backup`; a version-2 file is read as version 3 first, a version-1 file is migrated at load, collision-safe, with a `.v1-backup`, keeping its revision), atomic writes; secrets in the key vault once one exists, else `data/secrets.json` (0600), the same shape. A save that changes both the settings and the secrets file (`secrets.json`, or the vault's file) writes both with one new `revision`, journalled in `data/transaction.json` (0600; with the vault it holds only the vault's encrypted text, and restoring it needs no password) and resolved at the next load; the vault carries its revision outside the encrypted part (authenticated), so a locked vault can still be matched with `settings.json`, and a save that changes no secret while the vault is in use writes `settings.json` alone with the vault's revision (so settings save while the keys are locked). Read-only loads (the CLI modes) take no lock and see exactly one committed save: they re-read while the journal or the files change (equal revisions prove the two files are one save), at most 20 times (~1 s), and otherwise fail rather than mix two saves; with the vault they decrypt the vault text that snapshot chose. Settings and keys that may come from two saves (a damaged journal) start no engine and no module until the next save (the engine status says why). `serve` is the only writer: it holds an advisory `flock` on `data/writer.lock` (`DataDirLock.ts`: taken by the util-linux `flock` program on the server's own descriptor, released by the kernel when the server exits or dies; the file is never removed; `data/writer.holder` names the holder for messages) from before it reads the settings until it stops, so a second server on the same directory refuses to start; the CLI modes only read. (The lock is the data directory's: two servers with different data directories sharing one vault file are not kept apart.) **Vault** / **Keys**: the encrypted key vault outside the project (`PVA_VAULT_PATH`, default `~/.config/pva/vault.enc`; scrypt + AES-256-GCM, `node:crypto` only), locked after every start, unlocked with the owner's password (or `PVA_VAULT_PASSWORD`); an unlock reloads engines that failed and restarts modules that failed. **access**: which sections and modules are protected (a secret field, the provider sections `language-model`, `stt-engine`, `voice-providers`, agent modules); since protocol 5 this is information only (every change needs an admin session, and the vault password alone grants nothing). Details: docs/UI-AND-MODULES.md §1.6, docs/FRONTENDS-AND-ACTIVATION.md §1. **Voice API** (`serve/api.ts`, `VoiceCatalog.ts`, `Favourites.ts`, `AssistantVoice.ts`; docs/VOICE-PROVIDERS.md §5, §7.3): HTTP routes under `/api/` on the same server (host check, same-origin only, every route admin only with `Authorization: Bearer <admin token>`): providers and their status (a missing key is `needs_key`, never an error), every provider's voices (hosted lists cached 6 h per key), previews as WAV (at most 300 characters; one at a time, a newer one supersedes; hosted over the provider's REST synthesis; local ones refused while a device is in a turn and cancelled when one starts, the running engine reused for the assistant's own voice, one kept engine for another local voice), local voice downloads as `tts-models` jobs, favourites in `data/voice-favourites.json`, and, since WP-10, no single assistant voice: `VoiceEntry.usedBy` lists the assistants that speak with a voice, `GET /api/voices/default` answers with the first assistant's voice (`source: "assistant"`), `PUT /api/voices/default` answers `410 gone` (each assistant's voice is saved with the assistant). **Module routes** (`serve/moduleRoutes.ts`, `serve/RouteTokens.ts`; docs/UI-AND-MODULES.md §1.11): `/api/modules/<id>/…` answered by the published shared parts' routes: 404/405, a rate limit per caller address and per route (429, before the guards), guards (`lan`: the socket's private or loopback address and no forwarding header, whose values are never read; `admin`: the admin token; `token`: a route token, 503 while the vault is locked), body limits (413/415/400), the handler in its own fiber with its time limit (504; a failure is 500, logged), the last 20 calls per route in memory; route tokens hashed (SHA-256, compared in constant time) with the module secrets under `@route-tokens` (the vault once there is one); `/api/module-routes` (admin) lists routes, calls and tokens, mints and revokes. **`module.action`** (admin) presses a form's button (`ModuleHost.fieldAction`), its result in `Result.action`. **Model picker API** (`serve/ModelCatalog.ts`, `ModelFavourites.ts`; docs/MODEL-PICKERS.md): `/api/models/{llm,stt}` on the same routes and rules: each language-model account's models (fetched on demand through the adapters, cached per key and address, never on a turn's path) and the recogniser presets with their install state, favourites per kind in `data/model-favourites-<kind>.json`, recogniser downloads as `stt-models` jobs. **sections**: the assistant settings (voices, engines, turn detection) as settings forms keyed by their environment variable names, fed to the providers through a `ConfigProvider` placed under the environment. `sectionDefinitions.ts` places each section on a page of the web UI's settings screen (`group`, `page`, `order`), makes fields and pages depend on a choice (`visibleWhen`: hidden fields are not validated or saved) and declares cross-field checks (errors refuse a save, warnings ask for "Save anyway"); a save names the page in `EngineStatus.reloadPendingFor` when it needs an engine reload. Design: docs/SETTINGS-UI.md. **Env view** (`apps/assistant/src/envView.ts`, loaded by `env.ts`): every environment variable with its origin (a `.env` file with path and line, from Node's own `util.parseEnv` plus a line scan, or the process); sections and the module host read it live, so **envSettings** (`serve/envSettings.ts`) can move a `.env` value into the saved settings (a key into the vault, refused while it is locked), release it from the view and `process.env`, and comment its line out of the file (backup, atomic rewrite, mode kept; values never logged or sent). **Jobs** (`serve/jobs.ts`): long-running work with progress, a short log and cancel, published to every page (`job`), started only by admin pages; **models** (`serve/models.ts`) uses them to download speech models by preset name through `downloadPreset` of the speech packages (the shared downloader is `@pva/core/download`: disk check with `statfs`, `.part` file, stall timeout, size check, `nice -n 10 tar -xjf` into a temporary folder, file check, then into place; cancel and failures clean up, and a start removes what an interrupted run left).
+- **SessionHub**: handshake, roles, requests, routing by audience, send limits. A voice connection belongs to the session of its device (`hello.device.id`, else its own `clientId`); ownership is per session (one tab of the device owns its audio, the others observe, the last claim on *that device* wins, `resumeOwner` within the device; a claim on another device takes nothing; admin pages never own audio). A session's messages (`state`, `transcript`, `turn.*`, `assistant.*`, `tool.*`, `reply.*`, `wake`, `conversation`, its `error`s) go to its device's connections only; shared ones (`engine.summary`, …) are broadcast; `ADMIN_ONLY` types (now with `sessions`, throttled like `devices`, and `trace`: every finished turn of every session with its `key`, `deviceId` and `TraceInfo.session`, so admin's latency view grows live without turn traffic) go to admin connections only. At most 24 connections. **VoiceSessions** (`serve/VoiceSessions.ts`): device → session, created at the device's first `audio.claim` or `text.send` (an idle open tab costs nothing), at most `MAX_VOICE_SESSIONS` (default 4; one more takes the place of the least recently active session whose device has no connection, else it is refused `sessions_full`), discarded with its conversation after `SESSION_DISCARD_MINUTES` (default 30) without a connection; a device without a session still has the conversation id its first turn will use (`conversation.new` works before anything was said); the recent traces of every session for admin. **VoiceSession** (`serve/VoiceSession.ts`): one device's `WebAudio`, echo gate, wake gate, state tracker, publisher, heard-audio tap and **SessionConversation** (`serve/SessionConversation.ts`: the `Conversation` and its voice loop on the shared engines, the history, conversation id and idle clock carried across builds, the typed-input admission; every reply is spoken with the voice of its turn's setup, `TurnSetup.tts`). Its device's settings configure it live (`syncProfile`: interrupt mode, the route gate's phrases and without-phrase mode, the hearer); each assistant on the device has its own `SessionConversation` (made on first use; its prompt, tools, follow-up, `idleResetMs` from `newConversationAfter`, reply early, tool rounds come from that assistant), all behind one **SessionDispatcher** and one **OutputLease**. Its turns are numbered per session and its traces carry `session` (the device name) in the latency line and in `TraceInfo`. A Claude subscription assistant's conversations use the one running agent module, which keeps one Claude Code session per conversation id (so per device and assistant) and answers each turn with that assistant's model, effort, thinking, tools and fresh-session time (`withConversationOptions`, docs/ASSISTANTS.md WP-13a; the module's opt-in, program, proxy and debug logs are the account's, shared), at most `MAX_VOICE_SESSIONS` × the switched-on assistants on the account open at once; a discarded session ends its conversation there. Every finished turn's `TraceInfo.config` (admin only) is the configuration snapshot taken at its start (docs/ASSISTANTS.md §3.7). **AdminSessions**: `PVA_ADMIN_PASSWORD` (read once at start, removed from the environment and the env view; unset or < 8 characters = admin disabled), `admin.login` → a random token kept in memory (12 h, 30 min idle, constant-time compare, the vault's back-off), accepted again in an admin page's `hello`; every request that changes the server is admin only (`admin_required`). **Assistants and devices** (`serve/assistants.ts`, `serve/devices.ts`; docs/ASSISTANTS.md): the assistants, the **device types** (`DEVICE_TYPES`, `web-voice` today: the registry that replaced the front-end kinds) with their defaults, and the **device registry** (devices recorded at hello, at most 64, with their names and last visits), stored in `settings.json` version 4 (`assistants`, `deviceTypes`, `devices`, each entity with a `rev`). A device's effective settings = built-in ← its type's defaults ← its own sections; `assistant.*`, `device.save`, `device.pick` and `device.forget` change them, and the new setup is pushed live to the device's tabs (`device.setup`) and the lists to the admin pages (`assistants`, `device.types`, `devices`). **Publisher**: maps conversation events to messages synchronously, holding a speculative turn's messages until it is promoted. **StateTracker**: the assistant state. **Engine**: since WP-11 it holds no provider (`EngineProviders.llm` / `.stt` / `.tts` / `.voice` exist only for tests that inject one of each; the pool then hands out instances that use them); it is the **full reload** of docs/ASSISTANTS.md §3.2 (the owner's Reload button, model directories and thread counts) and the status. Each session attaches its loop (`attach`), which runs on every build and is stopped, keeping that session's history and conversation id, when the build ends; a loop that fails (not interrupted) stops the engines (`failed`, stage speech-to-text); a build failure is reported per stage instead of exiting; a reload first runs cheap checks (serve mode's: the model files of every local recogniser in use exist), and if they fail the running engines are kept; a reload also rebuilds every resource in use in the background. Its status lists the resource pool's resources (`EngineStatus.resources`) and, from them, the `llm`, `stt` and `tts` engine rows and the `voices` in use. **Resources** (`serve/Resources.ts`, docs/ASSISTANTS.md §3.2): the resource pool: the language models, the voices and the recognisers; one language-model instance per distinct `LlmKey` (plus the account's key stamp), shared by every assistant with equal settings, built at start and reconciled after every settings save and vault change; a changed model is built first, then the assistant's next turn start takes it (`TurnSetup.llm`), turns already running finish on the old one, which is released 10 s after its last user; a build failure is that resource's problem only (its assistants' turns fail, the others run); the owner's reload rebuilds every instance in use without interrupting a turn. Voices (WP-10) are keyed by `voiceKey`; assistants with the same voice share one instance, and the voices of one local engine (every Kokoro speaker) share that engine, which runs one clause at a time; a changed voice is built first and applies at that assistant's next turn (`TurnSetup.tts`). Recognisers (WP-11) are keyed by `SttKey` (stt-sherpa: model, language when the model takes one, model directory, threads; Deepgram: the shared model and address) and bound per hearing place (a known device, or a device type's defaults for the devices that follow them): each device hears with its *hearer's* (`hearerOf`: the assistant that answers without a phrase, else the first in its list) model, on a stream with that hearer's turn timing, VAD and gain (Deepgram: confidences), so hearers on one model share one loaded worker; a device with no assistant runs none. A changed hearer, model or stream option builds the new recogniser first, and the device's stream is replaced at its next silence (at most 5 s; an utterance still open then is closed and starts nothing). A recogniser that fails to load or whose worker dies is a failed resource: its devices hear nothing (told once with `engine_failed`), typed text still works, the hearer's `AssistantInfo.problems` name it, every other device hears. A save whose new local models would need more than 75 % of the free memory (WP-0's `ramMb`) asks for "Save anyway". **HeardAudio** (one per session): when "Save what the assistant hears" is on, each turn's audio as the recogniser received it goes to `data/recordings/<time>-<device>-<n>.wav` with level statistics, the transcript, the device (`device: { key, name }`) and transport counters (`pnpm start compare-models` replays them through every installed model). **SettingsStore**: `data/settings.json` (version 4: module settings per module, the shared settings flat by key, the assistants, the device types' defaults and the device records; a version-3 file is migrated at load into one assistant with the same behaviour and kept as `settings.json.v3-backup`; a version-2 file is read as version 3 first, a version-1 file is migrated at load, collision-safe, with a `.v1-backup`, keeping its revision), atomic writes; secrets in the key vault once one exists, else `data/secrets.json` (0600), the same shape. A save that changes both the settings and the secrets file (`secrets.json`, or the vault's file) writes both with one new `revision`, journalled in `data/transaction.json` (0600; with the vault it holds only the vault's encrypted text, and restoring it needs no password) and resolved at the next load; the vault carries its revision outside the encrypted part (authenticated), so a locked vault can still be matched with `settings.json`, and a save that changes no secret while the vault is in use writes `settings.json` alone with the vault's revision (so settings save while the keys are locked). Read-only loads (the CLI modes) take no lock and see exactly one committed save: they re-read while the journal or the files change (equal revisions prove the two files are one save), at most 20 times (~1 s), and otherwise fail rather than mix two saves; with the vault they decrypt the vault text that snapshot chose. Settings and keys that may come from two saves (a damaged journal) start no engine and no module until the next save (the engine status says why). `serve` is the only writer: it holds an advisory `flock` on `data/writer.lock` (`DataDirLock.ts`: taken by the util-linux `flock` program on the server's own descriptor, released by the kernel when the server exits or dies; the file is never removed; `data/writer.holder` names the holder for messages) from before it reads the settings until it stops, so a second server on the same directory refuses to start; the CLI modes only read. (The lock is the data directory's: two servers with different data directories sharing one vault file are not kept apart.) **Vault** / **Keys**: the encrypted key vault outside the project (`PVA_VAULT_PATH`, default `~/.config/pva/vault.enc`; scrypt + AES-256-GCM, `node:crypto` only), locked after every start, unlocked with the owner's password (or `PVA_VAULT_PASSWORD`); an unlock reloads engines that failed and restarts modules that failed. **access**: which sections and modules are protected (a secret field, the provider sections `language-model`, `stt-engine`, `voice-providers`, agent modules); since protocol 5 this is information only (every change needs an admin session, and the vault password alone grants nothing). Details: docs/UI-AND-MODULES.md §1.6, docs/FRONTENDS-AND-ACTIVATION.md §1. **Voice API** (`serve/api.ts`, `VoiceCatalog.ts`, `Favourites.ts`, `AssistantVoice.ts`; docs/VOICE-PROVIDERS.md §5, §7.3): HTTP routes under `/api/` on the same server (host check, same-origin only, every route admin only with `Authorization: Bearer <admin token>`): providers and their status (a missing key is `needs_key`, never an error), every provider's voices (hosted lists cached 6 h per key), previews as WAV (at most 300 characters; one at a time, a newer one supersedes; hosted over the provider's REST synthesis; local ones refused while a device is in a turn and cancelled when one starts, the running engine reused for the assistant's own voice, one kept engine for another local voice), local voice downloads as `tts-models` jobs, favourites in `data/voice-favourites.json`, and, since WP-10, no single assistant voice: `VoiceEntry.usedBy` lists the assistants that speak with a voice, `GET /api/voices/default` answers with the first assistant's voice (`source: "assistant"`), `PUT /api/voices/default` answers `410 gone` (each assistant's voice is saved with the assistant). **Module routes** (`serve/moduleRoutes.ts`, `serve/RouteTokens.ts`; docs/UI-AND-MODULES.md §1.11): `/api/modules/<id>/…` answered by the published shared parts' routes: 404/405, a cross-site browser request refused on every route that is not public (403: `Sec-Fetch-Site`, a foreign `Origin`; no CORS header is ever sent), a rate limit per caller address (IPv6 by /64) and per route (429, before the guards; route totals are never evicted), guards (`lan`: the socket's private or loopback address and no forwarding header, whose values are never read, and refused for everyone when `SERVE_BEHIND_PROXY` declares a reverse proxy in front; `admin`: the admin token; `token`: a route token, 503 while the vault is locked), body limits (413/415/400; chunked bodies counted as read), 503 when the module restarted or stopped while the body arrived, the handler in its own fiber in its shared part's scope with its time limit (504 at once, cleanup bounded and logged; a failure is 500, logged; a status outside 200–599 or an invalid header is 500), the last 20 calls per route (at most 256 routes) in memory; route tokens hashed (SHA-256, compared in constant time) with the module secrets under `@route-tokens` (the vault once there is one); `/api/module-routes` (admin) lists routes, calls and tokens (a stopped module's too) and `behindProxy`, mints (installed modules only; at most 20 per module, judged inside the serialized save) and revokes. **`module.action`** (admin) presses a form's button (`ModuleHost.fieldAction`), its result in `Result.action`. **Model picker API** (`serve/ModelCatalog.ts`, `ModelFavourites.ts`; docs/MODEL-PICKERS.md): `/api/models/{llm,stt}` on the same routes and rules: each language-model account's models (fetched on demand through the adapters, cached per key and address, never on a turn's path) and the recogniser presets with their install state, favourites per kind in `data/model-favourites-<kind>.json`, recogniser downloads as `stt-models` jobs. **sections**: the assistant settings (voices, engines, turn detection) as settings forms keyed by their environment variable names, fed to the providers through a `ConfigProvider` placed under the environment. `sectionDefinitions.ts` places each section on a page of the web UI's settings screen (`group`, `page`, `order`), makes fields and pages depend on a choice (`visibleWhen`: hidden fields are not validated or saved) and declares cross-field checks (errors refuse a save, warnings ask for "Save anyway"); a save names the page in `EngineStatus.reloadPendingFor` when it needs an engine reload. Design: docs/SETTINGS-UI.md. **Env view** (`apps/assistant/src/envView.ts`, loaded by `env.ts`): every environment variable with its origin (a `.env` file with path and line, from Node's own `util.parseEnv` plus a line scan, or the process); sections and the module host read it live, so **envSettings** (`serve/envSettings.ts`) can move a `.env` value into the saved settings (a key into the vault, refused while it is locked), release it from the view and `process.env`, and comment its line out of the file (backup, atomic rewrite, mode kept; values never logged or sent). **Jobs** (`serve/jobs.ts`): long-running work with progress, a short log and cancel, published to every page (`job`), started only by admin pages; **models** (`serve/models.ts`) uses them to download speech models by preset name through `downloadPreset` of the speech packages (the shared downloader is `@pva/core/download`: disk check with `statfs`, `.part` file, stall timeout, size check, `nice -n 10 tar -xjf` into a temporary folder, file check, then into place; cancel and failures clean up, and a start removes what an interrupted run left).
 - **`EchoGate`** (`packages/core`, pure): during the audible window it passes everything (`instant`), drops recognition events that are the assistant's own words (`confirm`), or drops everything (`manual`). Serve mode always runs `Conversation` with barge-in on; the gate implements the interrupt modes.
 - **`RouteGate`** (`packages/core/src/RouteGate.ts`, pure; docs/ASSISTANTS.md §3.4, docs/FRONTENDS-AND-ACTIVATION.md §3): placed after the `EchoGate` and before the dispatcher. It decides, for each utterance on a device, which assistant it goes to: a wake phrase at the start (matched over every assignment's phrases, `matchWakePhrase`: normalised words, at most two fillers first, `exact` or `close` = one edit on words of four or more letters, longest phrase wins, the phrase removed in every mode) picks its assistant; the phrase alone opens that assistant's armed window; a reply opens its follow-up window (per assistant, from the assignment or the assistant); otherwise the device's `withoutPhrase` decides (`nobody`: the utterance is dropped and the device is asleep; `assistant`: that one; `decide`: TypeSafe, asked by the dispatcher). A switched-off assistant is the answer and the utterance is dropped. Every event it lets through is tagged with a target; the utterance contract holds (a dropped utterance forwards nothing). The gate is reconfigured only when its config changes (`routeConfigFrom`), which drops a held utterance. Only events that passed both gates move the session state (`asleep` while the owner's mic is live and nobody is awake), become captions, reach a conversation or end a "what the assistant hears" recording; an ignored utterance's text goes only to admin pages with the phrase tester on (`wake.heard`). A heard phrase is sent to the device's tabs as `wake` (with `assistantId`). `WakeGate` (`WakeGate.ts`, the single-assistant gate with `always`/`wake-phrase` and `wakeConfigFromProfile`) stays in core: `RouteGate` uses its matcher, the offline bench still measures it, and the voice-node branch builds its one-shot mode on it.
 - **`SessionDispatcher`** (`serve/SessionDispatcher.ts`, docs/ASSISTANTS.md §3.3): per voice session, after the route gate: it owns the routing state of one device, makes one `SessionConversation` per assistant on first use, sends `SpeechStarted` to the conversation whose turn is running (barge-in) and hands the utterance over to its target with an empty `EndOfTurn` when the words show it is for another assistant, drops `EagerEndOfTurn` and `TurnResumed` for assistants with `replyEarly` off, and for a `decide` target asks TypeSafe (`serve/routing.ts`, `packages/decide-typesafe/src/routing.ts`) at the first eager event, holding events until the answer or the give-up time (default 400 ms). **`OutputLease`** (`serve/OutputLease.ts`) gives every conversation the session's one `AudioOutput`: a `play` that starts while another conversation's plays makes the older fail with `AudioError("superseded")` (committed like an interrupted turn), so two replies never sound at once.
@@ -530,15 +812,23 @@ packages/
                     admin sessions (`admin.ts`) (browser-safe)
   agent-claude-code/ the claude-subscription harness agent: Claude Code via @anthropic-ai/claude-agent-sdk with the owner's
                     login, off by default with an opt-in; the subprocess environment is an allowlist
-  language/         `@pva/language`: English and Dutch parsing and speaking helpers for modules, pure and local (no model, no network):
-                    time of day (the "half" rules), dates and date-times, quantities with units and conversion, speakable numbers, amounts,
-                    durations, clock times, dates and lists, RFC 5545 recurrence (build, describe, next occurrence, daylight-saving safe);
-                    re-exports core's `parseDuration`; README in the package
-  store-sqlite/     `@pva/store-sqlite`: the household store on `data/household.db` (node:sqlite via @effect/sql-sqlite-node), the module
-                    SQL guard, backups, export, the maintenance fiber and the doctor check (docs/STORING-DATA.md)
-  net/              `@pva/net`: `safeFetch` for URLs a model or user chose (resolves the host itself, refuses non-public addresses on every
-                    hop, connects to the checked address, size and time limits), a cached JSON GET (TTL, ETag, stale-if-error) and the
-                    outgoing `User-Agent` from the household API contact (`HOME_API_CONTACT`); README in the package
+  language/         `@pva/language`: English and Dutch parsing and speaking helpers for modules, pure and local (no model, no network,
+                    no dependency): numbers, durations (its own grammar), time of day (the "half" rules), dates and date-times,
+                    quantities with units and conversion, speakable numbers, amounts, durations, clock times, dates and lists, and
+                    recurrence for a closed set of RFC 5545 rule shapes (build, describe, next occurrences with why they stop, its own
+                    date arithmetic, daylight-saving safe; `parseRRule` / `readSeries` answer `unsupported` for anything else). Each
+                    parser is a closed grammar over a phrase of its kind alone: a reading must use every word, so a negation, a bound, an
+                    alternative, a time zone or title text makes it `not-understood`; callers pass the phrase on its own (a tool
+                    parameter, a typed slot). Every exported function checks a stated domain (2000–2199, numbers to 999 999.99, …) and
+                    answers outside it with its failure value, never a throw; only these front doors are exported. README in the package
+  store-sqlite/     `@pva/store-sqlite`: the household store on `data/household.db` (node:sqlite),
+                    backups, the maintenance fiber and the doctor check (docs/STORING-DATA.md)
+  net/              `@pva/net`: `safeFetch` for URLs a model or user chose (a required content-type policy, resolves the host itself,
+                    refuses non-public addresses on every hop by the IANA registries, connects to the checked address, checked request
+                    headers, size limit after decompression, time limit; `makeNodeConnector({ ca })` for an owner's own CA), a cached JSON GET
+                    (key with the request headers, shared in-flight requests, refreshes ordered by the cache's sequence, TTL, ETag,
+                    stale-if-error) and the outgoing `User-Agent` from the household API contact
+                    (`HOME_API_CONTACT`); README in the package
   modules-builtin/  first modules (defineModule): clock (context + tool), weather (Open-Meteo HTTP lookup, speculative-safe)
   module-home-assistant/ lights by room through the owner's Home Assistant (REST, actions); in the app's catalog since WP-12c
 models/             downloaded model files (git-ignored; `pnpm download-models`, or Settings › Models in the web UI)
@@ -547,8 +837,8 @@ apps/
                     `AUDIO_BACKEND` in the CLI modes; `llmAccountLayers` for the assistants' accounts; `ttsProviders` / `ttsProviderInfo` for the voice
                     providers), voiceSelection.ts (the default voice, `ASSISTANT_VOICE` for the CLI and the migration), modules.ts (the module catalog), main.ts, serve/ (web UI server:
                     Resources.ts the resource pool, SessionDispatcher.ts, OutputLease.ts, assistants.ts, devices.ts, migrateAssistants.ts); modes: `serve`,
-                    `voice`, `text` (stdin/stdout, no audio), `doctor` (core checks, module requirements and health;
-                    exit 1 on an error; `doctor.ts`, `coreChecks.ts`, `requirements.ts`), `bench`
+                    `voice`, `text` (stdin/stdout, no audio), `doctor` (every module's requirements and health;
+                    exit 1 on an error, 2 when the settings or vault cannot be read; `doctor.ts`, `requirements.ts`), `bench`
                     (offline with simulated delays, `--live` over WAV files with the real providers, `--make-wavs`),
                     `say` (text → a voice → speaker or WAV, with engine timings), `transcribe` (WAV → STT events with timings),
                     `compare-models` (WAVs → every installed local STT preset: transcript and timings)

@@ -4,7 +4,7 @@ import type { AssistantHearing, Issue } from "./assistants.ts"
 import { DeviceLook, DeviceVoice, FOLLOW_ASSISTANT, Look, lookFor } from "./looks.ts"
 import { InterruptMode, NonNegativeFinite, OutputPath } from "./common.ts"
 import { DeviceId, DeviceInfo, DeviceName, FrontendKindId, PrebufferMs, WAKE_PHRASES_MAX, WakeMatch, WakePhrase, wakeWords, WEB_VOICE_KIND } from "./frontends.ts"
-import { BUILT_IN_PLACE, CapabilityOverrides, DeclaredCapabilities, DeviceLiveState, DevicePlace, NO_OVERRIDES } from "./capabilities.ts"
+import { BUILT_IN_PLACE, canSpeak, CapabilityOverrides, DeclaredCapabilities, type DeviceCapabilities, DeviceLiveState, DevicePlace, NO_OVERRIDES } from "./capabilities.ts"
 
 /**
  * Devices, device types and assignments (docs/ASSISTANTS.md §2.3, §2.6, protocol 7 schemas). Pure and browser-safe.
@@ -620,8 +620,17 @@ export type DeviceSetup = typeof DeviceSetup.Type
 export const deviceSetupFrom = (
   settings: DeviceSettings,
   assistants: ReadonlyMap<string, Pick<Assistant, "id" | "name" | "purpose" | "on" | "look">>,
-  options: { readonly deviceId?: string | undefined; readonly canAuto: boolean }
+  options: {
+    readonly deviceId?: string | undefined
+    readonly canAuto: boolean
+    /**
+     * P5: whether the server will send reply audio to this device (its effective speaker: the `capabilities` section's
+     * "Don't use its speaker", and a declaration whose speaker plays speech). Absent: from the override alone.
+     */
+    readonly speakerAllowed?: boolean
+  }
 ): DeviceSetup => {
+  const speaks = options.speakerAllowed ?? !settings.capabilities.noSpeaker
   const listed = settings.assistants.flatMap((a) => {
     const known = assistants.get(a.assistant)
     if (known === undefined) return []
@@ -636,8 +645,30 @@ export const deviceSetupFrom = (
     canPick: settings.voicePage.pick && listed.length > 1,
     canAuto: options.canAuto,
     interruptMode: settings.interruptMode,
-    audio: settings.audio,
-    captions: settings.captions,
+    // P5: where the server sends no reply audio (the override, or a declaration without speech), nothing is said to
+    // be spoken here, typed replies included: the flags agree with what is sent.
+    audio: speaks ? settings.audio : { ...settings.audio, speakAloud: false },
+    captions: speaks ? settings.captions : { ...settings.captions, speakTyped: false },
     ...(settings.look.from === "device" ? { look: settings.look.look } : {})
   }
+}
+
+/**
+ * P5: whether reply audio is sent to a device: not when its effective `capabilities` section says "Don't use its
+ * speaker", nor when its latest declaration has no speaker that plays speech. A device that never declared anything (a
+ * page of an older build) may. The server (`deviceFacts.ts`, where audio leaves) and the mock decide with this.
+ */
+export const speakerAllowedFrom = (settings: Pick<DeviceSettings, "capabilities">, declared: DeviceCapabilities | undefined): boolean =>
+  !settings.capabilities.noSpeaker && (declared === undefined || canSpeak(declared))
+
+/**
+ * P5: what decides what a device may be told or sent, as one comparable text: its privacy, its default person while a
+ * member, and its output overrides (no speaker, no display, excluded kinds). When a save changes it, the device's
+ * session ends with its connections (`CloseCode.settingsChanged`); the room, name, always-on, accepts-from-others and
+ * quiet-room are not in it. The server (`deviceFacts.ts`) and the mock compare with this.
+ */
+export const boundaryKey = (settings: Pick<DeviceSettings, "place" | "capabilities">, isMember: (id: string) => boolean): string => {
+  const caps = settings.capabilities
+  const person = settings.place.defaultPerson !== null && isMember(settings.place.defaultPerson) ? settings.place.defaultPerson : ""
+  return `${settings.place.privacy}|${person}|${caps.noSpeaker ? 1 : 0}|${caps.noDisplay ? 1 : 0}|${[...caps.excludeKinds].sort().join(",")}`
 }
