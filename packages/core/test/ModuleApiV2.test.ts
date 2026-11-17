@@ -198,7 +198,7 @@ describe("the turn's action catalogue", () => {
       yield* host.startEnabled
       const asA = <A>(e: Effect.Effect<A>) => Effect.provideService(e, CurrentTurn, turnOf("a"))
       assert.deepStrictEqual((yield* asA(host.actions.list)).map((a) => a.id), ["lights.on"], "off is switched off for a")
-      assert.deepStrictEqual((yield* host.actions.list).map((a) => a.id), ["lights.on", "lights.off"], "no turn: every running module's")
+      assert.deepStrictEqual(yield* host.actions.list, [], "serve mode (access given), no turn and no job: nothing (a missing context is not a principal)")
       assert.deepStrictEqual(yield* asA(host.actions.run({ moduleId: "lights", actionId: "on", params: {} })), { ok: true, say: "On." })
       assert.strictEqual(ran[0]?.source, "routine", "the action sees the caller's turn")
       const off = yield* asA(host.actions.run({ moduleId: "lights", actionId: "off", params: {} }))
@@ -206,8 +206,11 @@ describe("the turn's action catalogue", () => {
       const asB = yield* Effect.provideService(host.actions.run({ moduleId: "lights", actionId: "on", params: {} }), CurrentTurn, turnOf("b"))
       assert.strictEqual(asB.ok, false)
       assert.strictEqual(ran.length, 1, "nothing ran for b")
-      const unknown = yield* host.actions.run({ moduleId: "lights", actionId: "dim", params: {} })
+      const unknown = yield* asA(host.actions.run({ moduleId: "lights", actionId: "dim", params: {} }))
       assert.deepStrictEqual(unknown, { ok: false, code: "unknown_action", message: "Lights has no action \"dim\"" })
+      const noOne = yield* host.actions.run({ moduleId: "lights", actionId: "on", params: {} })
+      assert.deepStrictEqual(noOne, { ok: false, code: "refused", message: "Not run: it has no turn, job or other principal to run for." })
+      assert.strictEqual(ran.length, 1, "nothing ran without a principal")
     }))
 })
 
@@ -333,7 +336,7 @@ describe("templates and tool metadata", () => {
                 name: "door",
                 description: "",
                 parameters: Schema.Struct({ which: Schema.String }),
-                risk: ({ which }) => (which === "garage" ? "security" : "change"),
+                risk: { classes: ["change", "security"], of: ({ which }) => (which === "garage" ? "security" : "change") },
                 execute: () => Effect.void
               })
             ]

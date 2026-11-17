@@ -1,9 +1,9 @@
 // Module requirements and `pnpm start doctor` (docs/MODULES-PLAN.md §4 P1; module-definition §C.3–C.5), with a fake
 // prober: nothing is run on this machine.
 import { describe, expect, it } from "@effect/vitest"
-import { defineModule, type Issue as HealthIssue, type Requirement } from "@pva/core"
+import { defineModule, type Issue as HealthIssue, isMissingProgramError, makeModuleHost, makeTool, type ModuleHostApi, readOnlyPersistence, type Requirement } from "@pva/core"
 import type { Assistant } from "@pva/protocol"
-import { Effect } from "effect"
+import { Effect, Schema } from "effect"
 import { formatDoctor, runDoctor } from "../src/doctor.ts"
 import { detectDistro, installFix, makeRequirementChecker, type ProbeOutput, type Prober, probePath, satisfiesRange, TOOL_REGISTRY } from "../src/requirements.ts"
 
@@ -34,6 +34,84 @@ describe("version ranges", () => {
     expect(satisfiesRange("6.1.4", "6.1")).toBe(true)
     expect(satisfiesRange("6.1", "about six")).toBeUndefined()
   })
+
+  // Review round 1, finding 12: real semver, and an unprovable requirement is never met.
+  it("is semver: OR ranges, zero-major carets, prereleases, and nothing to read is not a pass", () => {
+    expect(satisfiesRange("3.2", ">=5 || ^4")).toBe(false)
+    expect(satisfiesRange("4.7", ">=5 || ^4")).toBe(true)
+    expect(satisfiesRange("6.0", ">=5 || ^4")).toBe(true)
+    expect(satisfiesRange("0.99.0", "^0.35")).toBe(false)
+    expect(satisfiesRange("0.35.4", "^0.35")).toBe(true)
+    expect(satisfiesRange("0.36.0", "^0.35")).toBe(false)
+    expect(satisfiesRange("7.0.0-rc.1", ">=6")).toBe(false)
+    expect(satisfiesRange("7.0.0-rc.2", ">=7.0.0-rc.1")).toBe(true)
+    expect(satisfiesRange("unknown", ">=5")).toBeUndefined()
+  })
+})
+
+describe("version requirements fail closed (finding 12)", () => {
+  const judge = (output: ProbeOutput, version: string) =>
+    Effect.gen(function*() {
+      const { prober } = fakeProber({ mpv: output })
+      const checker = makeRequirementChecker({ dataDir: "/d", prober, distro: "debian" })
+      const requirement: Requirement = { tool: "mpv", version, why: "Plays" }
+      yield* checker.probe([requirement])
+      return checker.check([requirement])[0]!
+    })
+
+  it.effect("a version that is not reported, a range that cannot be read, and an OR range are judged, never assumed", () =>
+    Effect.gen(function*() {
+      const silent = yield* judge(ran("usage: mpv [options]"), ">=0.35")
+      expect(silent.state).toBe("missing")
+      expect(silent.detail).toBe("mpv did not report its version; needs >=0.35")
+      const unreadable = yield* judge(ran("mpv 0.36.0"), "about six")
+      expect(unreadable.state).toBe("missing")
+      expect(unreadable.detail).toMatch(/cannot be read/)
+      expect((yield* judge(ran("mpv 3.0.1"), ">=5 || ^4")).state).toBe("missing")
+      expect((yield* judge(ran("mpv 4.2.0"), ">=5 || ^4")).state).toBe("met")
+      expect((yield* judge(ran("mpv 0.99.0"), "^0.35")).state).toBe("missing")
+      const unversioned = yield* judge(ran("mpv vgit-abcdef"), ">=0.35")
+      expect(unversioned.state).toBe("missing")
+    }))
+})
+
+describe("gpu requirements judge the device, never the program alone (finding 20)", () => {
+  const judge = (gpu: "cuda" | "vulkan", answers: Readonly<Record<string, ProbeOutput>>) =>
+    Effect.gen(function*() {
+      const { prober } = fakeProber(answers)
+      const checker = makeRequirementChecker({ dataDir: "/d", prober, distro: "debian" })
+      const requirement: Requirement = { gpu }
+      yield* checker.probe([requirement])
+      return checker.check([requirement])[0]!
+    })
+  const summary = (devices: ReadonlyArray<[string, string]>) =>
+    `Vulkan Instance Version: 1.3.275\n\nDevices:\n========\n${devices.map(([type, name], i) => `GPU${i}:\n\tdeviceType         = PHYSICAL_DEVICE_TYPE_${type}\n\tdeviceName         = ${name}\n`).join("")}`
+
+  it.effect("vulkan: a hardware device is met; only llvmpipe, or no driver, is missing; no vulkaninfo is unchecked", () =>
+    Effect.gen(function*() {
+      const hardware = yield* judge("vulkan", { vulkaninfo: ran(summary([["CPU", "llvmpipe (LLVM 17.0.6, 256 bits)"], ["INTEGRATED_GPU", "Intel(R) UHD Graphics 620"]])) })
+      expect(hardware).toMatchObject({ state: "met", detail: "Intel(R) UHD Graphics 620 (Vulkan)" })
+      const software = yield* judge("vulkan", { vulkaninfo: ran(summary([["CPU", "llvmpipe (LLVM 17.0.6, 256 bits)"]])) })
+      expect(software.state).toBe("missing")
+      expect(software.detail).toMatch(/only a software renderer \(llvmpipe/)
+      const noDriver = yield* judge("vulkan", { vulkaninfo: ran("ERROR: [Loader Message] Code 0 : vkCreateInstance: Found no drivers!\nCannot create Vulkan instance.\nERROR_INCOMPATIBLE_DRIVER", 1) })
+      expect(noDriver.state).toBe("missing")
+      const absent = yield* judge("vulkan", {})
+      expect(absent.state).toBe("unchecked")
+      expect(absent.detail).toMatch(/not checked \(vulkaninfo is not installed/)
+      const odd = yield* judge("vulkan", { vulkaninfo: ran("Vulkan Instance Version: 1.3.275") })
+      expect(odd.state).toBe("unchecked")
+    }))
+
+  it.effect("cuda: a listed GPU is met; none listed is missing; no nvidia-smi is unchecked", () =>
+    Effect.gen(function*() {
+      const listed = yield* judge("cuda", { "nvidia-smi": ran("GPU 0: NVIDIA GeForce RTX 3060 (UUID: GPU-1234)\n") })
+      expect(listed).toMatchObject({ state: "met", detail: "NVIDIA GeForce RTX 3060 (CUDA)" })
+      const none = yield* judge("cuda", { "nvidia-smi": ran("No devices were found", 6) })
+      expect(none.state).toBe("missing")
+      const absent = yield* judge("cuda", {})
+      expect(absent.state).toBe("unchecked")
+    }))
 })
 
 describe("the requirement checker", () => {
@@ -162,4 +240,89 @@ describe("doctor", () => {
       expect(report.exitCode).toBe(0)
       expect(formatDoctor([])).toEqual({ lines: ["No problems found."], exitCode: 0 })
     }))
+})
+
+// Review round 1, finding 11: doctor judges by the assistants' demand, through `uses` too, starting nothing.
+describe("doctor's severity follows the assistants' demand", () => {
+  const all = () => fakeProber({ flock: ran("flock from util-linux 2.39.3"), tar: ran("tar (GNU tar) 1.35"), bzip2: ran("Version 1.0.8"), nice: ran("nice (GNU coreutils) 9.4") })
+  const base = { env: {}, dataDir: "/nonexistent/pva-data", modelDirs: { stt: "/nonexistent/stt", tts: "/nonexistent/tts" }, core: { ...quietCore, clockSynced: async () => true } }
+  const offByDefault = defineModule({ id: "radio", name: "Radio", description: "", enabledByDefault: false, requires: [{ tool: "mpv", why: "Plays" }], start: () => Effect.succeed({}) })
+  const provider = defineModule({ apiVersion: 2, id: "streams", name: "Streams", description: "", requires: [{ tool: "ffmpeg", why: "Converts" }], start: () => Effect.succeed({}) })
+  const consumer = defineModule({ apiVersion: 2, id: "kitchen", name: "Kitchen", description: "", uses: ["streams"], start: () => Effect.succeed({}) })
+
+  it.effect("a disabled-by-default capability an assistant has on, and a provider it reaches through `uses`, are errors", () =>
+    Effect.gen(function*() {
+      const issues = yield* runDoctor({
+        ...base,
+        catalog: [offByDefault, provider, consumer],
+        assistants: [assistantWith({ radio: { on: true, offTools: [] }, kitchen: { on: true, offTools: [] } })],
+        persistence: { modules: { radio: { enabled: false } }, secrets: {} },
+        prober: all().prober
+      })
+      const severity = (id: string) => issues.find((i) => i.id === id)?.severity
+      expect(severity("radio.requires.mpv")).toBe("error")
+      expect(severity("streams.requires.ffmpeg")).toBe("error")
+      expect(formatDoctor(issues).exitCode).toBe(1)
+    }))
+
+  it.effect("with nobody using them, both are warnings and doctor exits 0", () =>
+    Effect.gen(function*() {
+      const issues = yield* runDoctor({ ...base, catalog: [offByDefault, provider, consumer], assistants: [assistantWith({})], prober: all().prober })
+      expect(issues.map((i) => i.severity)).toEqual(["warning", "warning"])
+      expect(formatDoctor(issues).exitCode).toBe(0)
+    }))
+})
+
+// Review round 1, finding 18: a required program that fails at run time makes its module unavailable at once.
+describe("a missing program reported at run time", () => {
+  it.effect("after a successful probe, a tool's ENOENT marks it missing and the module becomes unavailable, without probing again", () =>
+    Effect.gen(function*() {
+      const { calls, prober } = fakeProber({ "yt-dlp": ran("2025.01.15") })
+      const checker = makeRequirementChecker({ dataDir: "/d", prober, distro: "debian" })
+      let host: ModuleHostApi | undefined
+      const player = defineModule({
+        apiVersion: 2,
+        id: "player",
+        name: "Player",
+        description: "",
+        requires: [{ tool: "yt-dlp", why: "Resolves" }],
+        start: (ctx) =>
+          Effect.sync(() => {
+            host = ctx.host
+            return {
+              tools: [makeTool({
+                name: "play",
+                description: "",
+                parameters: Schema.Struct({}),
+                execute: () =>
+                  Effect.gen(function*() {
+                    const spawnError = Object.assign(new Error("spawn yt-dlp ENOENT"), { code: "ENOENT" })
+                    if (isMissingProgramError(spawnError)) yield* ctx.host.reportMissingProgram("yt-dlp")
+                    return "could not play"
+                  })
+              })]
+            }
+          })
+      })
+      yield* checker.probeCatalog([player])
+      const made = yield* makeModuleHost({
+        catalog: [player],
+        persistence: readOnlyPersistence(),
+        env: {},
+        requirements: checker.check,
+        programMissing: (tool) => checker.markMissing(tool)
+      })
+      yield* made.startEnabled
+      expect(made.modules()[0]!.state).toBe("running")
+      expect(host).toBeDefined()
+      yield* made.snapshot().registry.run({ id: "c1", name: "play", input: {} })
+      yield* Effect.repeat(Effect.yieldNow, { times: 50 })
+      expect(made.modules()[0]!.state).toBe("unavailable")
+      expect(made.modules()[0]!.unavailable?.reason).toBe("yt-dlp is missing")
+      // No probe on the turn path: the one at start only.
+      expect(calls.length).toBe(1)
+      // A program it does not require is ignored.
+      yield* host!.reportMissingProgram("ffmpeg")
+      expect(checker.probed("ffmpeg")).toBeUndefined()
+    }).pipe(Effect.scoped))
 })

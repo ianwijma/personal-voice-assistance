@@ -14,6 +14,7 @@ import {
   type Stt,
   type SttEvent,
   type Trace,
+  type ConnectionRef,
   type TurnOrigin,
   type TurnSetup,
   TurnTrace,
@@ -125,6 +126,8 @@ export interface VoiceSessionOptions {
   readonly assistants: () => ReadonlyMap<string, Assistant>
   /** Per assistant: its turn setup (prompt, module instructions, its tools), and the agent setup (claude-subscription). */
   readonly conversationSetup: (assistant: string, deviceId: string | undefined) => AssistantSetup
+  /** The connection that owns the device's audio now, for a voice turn's `CurrentTurn.connection`. */
+  readonly audioConnection?: () => ConnectionRef | undefined
   /**
    * The key of the voice an assistant speaks with on this device now (the resource pool's, docs/ASSISTANTS.md §3.2):
    * the device's own voice, else the assistant's (docs/LOOKS-AND-VOICES.md §3).
@@ -181,7 +184,8 @@ export type TextOutcome = SendOutcome | "dropped"
  */
 export interface SessionConversations {
   /** Typed text, routed as §2.6 "Typed text" says (`named`: the assistant the page names). */
-  readonly sendText: (text: string, speak: boolean, named?: string) => Effect.Effect<TextOutcome>
+  /** `connection`: the tab that typed it (the turn's `CurrentTurn.connection`). */
+  readonly sendText: (text: string, speak: boolean, named?: string, connection?: ConnectionRef) => Effect.Effect<TextOutcome>
   /** Stop: `assistant`'s conversation, or every active one. */
   readonly stop: (assistant?: string) => SendOutcome
   readonly running: () => boolean
@@ -625,11 +629,19 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
           const { config: assistantConfig } = made
           // Module API v2 (`CurrentTurn`): every turn's setup names who and where it is for. The origin object is the
           // same while the device's name is, so a turn adds one small object (the setup with it), nothing else.
+          // A voice turn's connection is the tab that owns the device's audio as the turn starts; a typed turn names
+          // the tab that typed it (`TextInput.connection`, which wins).
           let origin: TurnOrigin | undefined
           const originNow = (): TurnOrigin => {
             const deviceName = options.name()
-            if (origin?.deviceName !== deviceName) {
-              origin = { assistantId: assistant, ...(options.deviceId !== undefined ? { deviceId: options.deviceId } : {}), deviceName }
+            const connection = options.audioConnection?.()
+            if (origin?.deviceName !== deviceName || origin.connection !== connection) {
+              origin = {
+                assistantId: assistant,
+                ...(options.deviceId !== undefined ? { deviceId: options.deviceId } : {}),
+                deviceName,
+                ...(connection !== undefined ? { connection } : {})
+              }
             }
             return origin
           }
@@ -930,7 +942,7 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
     }
 
     const conversations: SessionConversations = {
-      sendText: (text, speak, named) =>
+      sendText: (text, speak, named, connection) =>
         Effect.suspend(() => {
           const w = route.window(now())
           const target = typedTextTarget(options.deviceSettings(), options.assistants(), {
@@ -938,7 +950,7 @@ export const makeVoiceSession = (options: VoiceSessionOptions): Effect.Effect<Vo
             followUpHolder: w?.by === "follow-up" ? w.assistant : undefined
           })
           if ("dropped" in target) return Effect.succeed<TextOutcome>("dropped")
-          return dispatcher.send(target.assistant, { _tag: "TextInput", text, speak })
+          return dispatcher.send(target.assistant, { _tag: "TextInput", text, speak, ...(connection !== undefined ? { connection } : {}) })
         }),
       stop: (assistant) => {
         const outcome = dispatcher.stop(assistant)

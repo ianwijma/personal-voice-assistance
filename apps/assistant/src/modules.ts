@@ -1,8 +1,8 @@
 import { claudeSubscriptionAgent } from "@pva/agent-claude-code"
-import { makeModuleHost, type ModuleDefinition, type ModulePersistence, type ModuleSnapshot, readOnlyPersistence } from "@pva/core"
+import { makeModuleHost, type ModuleDefinition, type ModuleDemand, type ModulePersistence, type ModuleSnapshot, readOnlyPersistence } from "@pva/core"
 import { homeAssistantModule } from "@pva/module-home-assistant"
 import { clockModule, weatherModule } from "@pva/modules-builtin"
-import type { ModuleInfo } from "@pva/protocol"
+import type { Assistant, ModuleInfo } from "@pva/protocol"
 import { Config, Effect, type Scope } from "effect"
 import { CliSettingsRef } from "./cliSettings.ts"
 import { makeRequirementChecker } from "./requirements.ts"
@@ -35,6 +35,32 @@ export const withModuleInstructions = (systemPrompt: string, instructions: Reado
  * Module keys in the key vault are used when it was unlocked (`cliSettings.ts`: `PVA_VAULT_PASSWORD` or the
  * terminal prompt).
  */
+/** Capabilities are switched on per assistant; agent and decision-provider modules follow their own switch. */
+export const isCapabilityOf = (catalog: ReadonlyArray<ModuleDefinition<any>>) => (moduleId: string): boolean => {
+  const def = catalog.find((d) => d.id === moduleId)
+  return def === undefined || def.kind === undefined || def.kind === "capability"
+}
+
+/**
+ * Who wants which capability (docs/ASSISTANTS.md §2.6): every switched-on assistant that has it on, with its own
+ * values. Each capability has an entry (an empty list: nobody); agents and decision providers have none. Serve mode
+ * runs modules by it, and `doctor` judges by it (a module an assistant uses is an error when it cannot run).
+ */
+export const moduleDemandOf = (
+  catalog: ReadonlyArray<ModuleDefinition<any>>,
+  assistants: Iterable<Assistant>
+): ReadonlyMap<string, ReadonlyArray<ModuleDemand>> => {
+  const isCapability = isCapabilityOf(catalog)
+  const demand = new Map<string, Array<ModuleDemand>>(catalog.filter((d) => isCapability(d.id)).map((d) => [d.id, []]))
+  for (const assistant of assistants) {
+    if (!assistant.on) continue
+    for (const [moduleId, choice] of Object.entries(assistant.modules)) {
+      if (choice.on) demand.get(moduleId)?.push({ assistantId: assistant.id, ...(choice.own !== undefined ? { own: choice.own } : {}) })
+    }
+  }
+  return demand
+}
+
 export const startCliModules = (
   options: { readonly catalog?: ReadonlyArray<ModuleDefinition<any>>; readonly persistence?: ModulePersistence } = {}
 ): Effect.Effect<ModuleSnapshot & { readonly infos: ReadonlyArray<ModuleInfo> }, never, Scope.Scope> =>
@@ -67,7 +93,10 @@ export const startCliModules = (
       persistence,
       env: process.env,
       platform: { os: process.platform, arch: process.arch },
-      requirements: checker.check
+      requirements: checker.check,
+      // The CLI modes have no assistants: a call runs for the person at the terminal.
+      localPrincipal: true,
+      programMissing: (tool) => checker.markMissing(tool)
     })
     yield* host.startEnabled
     for (const module of host.modules()) {

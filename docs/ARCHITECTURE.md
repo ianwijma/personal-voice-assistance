@@ -185,7 +185,7 @@ Conversation.layerWithSetup({ setup: Effect<TurnSetup>, ... })   // TurnSetup = 
 - `TurnSetup.maxToolRounds` (optional, added 2026-11-17): the tool-round limit of that turn, fixed at its start; it wins over `AgentSet.maxToolRounds` and the conversation's `maxToolRounds`. Serve mode sets it to the assistant's `toolRounds` in the same setup read that makes the turn's configuration snapshot (`TraceInfo.config.toolRounds`), so a changed limit applies from the next turn and the snapshot reports the limit the turn ran with.
 - `onEvent` receives `ConversationEvent`s synchronously on the turn's fiber (no Effect per event): `ConversationStarted` (a new conversation, `reason` `new` or `idle`; before the turn that an idle reset started for), `TurnStarted` (with `speculative`, `spoken`, `source`), `TurnPromoted`, `TextDelta` (raw, rounds separated by `"\n"`), `ClauseQueued`, `ClausePlaying`, `ToolStarted`, `ToolFinished`, `TurnEnded` (after history is committed, with the trace). Speculative turns emit events too; the subscriber decides what to show. A throwing subscriber is ignored.
 - `CurrentTurnTrace` is provided around `AudioOutput.play` as well as around `Tts.synthesize` (the web output uses the turn id as the reply id and records the browser's numbers in the trace).
-- `TurnSetup.turnContext` (optional, module API v2, `TurnOrigin`): who and where the turn is for (assistant id, device id and name; later room and person). When it is set, `Conversation` provides `CurrentTurn` (`TurnContext`: that plus the turn id, conversation id and source) around the agent's whole turn stream, so every tool call, every action run (the intent agent's, a confirmed one) and the gathering of the context providers read it with `yield* CurrentTurn`. It is one value per turn, built at the turn's start: nothing else is added to the turn path. Absent (the CLI modes): `CurrentTurn` is `undefined`. Serve mode sets it in `VoiceSession` (the origin object is reused while the device's name does not change).
+- `TurnSetup.turnContext` (optional, module API v2, `TurnOrigin`): who and where the turn is for (assistant id, device id and name, the connection: an opaque `ConnectionRef`; later room and person). A `TextInput` may name the connection that typed it, which wins for that turn. When it is set, `Conversation` provides `CurrentTurn` (`TurnContext`: that plus the turn id, conversation id and source) around the agent's whole turn stream, so every tool call, every action run (the intent agent's, a confirmed one) and the gathering of the context providers read it with `yield* CurrentTurn`. It is one value per turn, built at the turn's start: nothing else is added to the turn path. Absent (the CLI modes): `CurrentTurn` is `undefined`. Serve mode sets it in `VoiceSession` (the origin object is reused while the device's name and the audio owner's connection do not change); the hub passes the typing tab's `ConnectionRef` with typed text.
 
 | Event | Action |
 |---|---|
@@ -265,8 +265,8 @@ interface Tool<I = any, R = never> {
   readonly description: string
   readonly parameters: Schema.Codec<I, unknown> // validated input; also the source of the JSON Schema sent to the model
   readonly speculative?: boolean             // safe to run before the turn is confirmed (read-only lookups)
-  readonly risk?: ToolRisk | ((input: I) => ToolRisk)  // module API v2: read | change | message | money | security
-  readonly sensitivity?: "household" | "personal"
+  readonly risk?: ToolRisk | { classes: ReadonlyArray<ToolRisk>; of: (input: I) => ToolRisk }  // v2: read | change | message | money | security
+  readonly sensitivity?: "household" | "personal" | { kind: "personal"; owner: string } | ((result: unknown) => Sensitivity)
   readonly latency?: "instant" | "quick" | "slow" | "background"
   readonly execute: (input: I) => Effect<unknown, ToolError, R>   // reached only through the execution gateway
 }
@@ -290,7 +290,7 @@ defineModule({
   start: (ctx: ModuleContextV2<A, X>) => Effect<ModuleInstance, ModuleStartError, Scope>, // per effective settings
   …version 1 fields
 })
-SharedContext<A>      = { settings: Partial<A> /* no overridable fields */ } & ModuleServicesV2
+SharedContext<A>      = { settings: Partial<A> /* no overridable fields */; settingsFor(assistantId?): A | undefined } & ModuleServicesV2
 ModuleContextV2<A, X> = ModuleContext<A> & ModuleServicesV2 & { shared: X }
 ModuleServicesV2      = { host: ModuleHostApi }   // later PRs add store, events, scheduler, speech, notify, present, connections
 SharedPart<X>         = { value: X; services?: [ServiceKey<T>.of(impl)]; contributions?: [ContributionKey<T>.of(value)] }
@@ -299,33 +299,51 @@ ModuleHostApi = {
   service<T>(key: ServiceKey<T>): T | undefined     // live; undefined while no demanded module provides it
   contributions<T>(key: ContributionKey<T>): ReadonlyArray<T>
   actions: { list: Effect<CatalogAction[]>; run(req): Effect<ActionRunResult> }  // the turn's (calling assistant's) catalogue
-  requestRestart(reason): Effect<void>
+  requestRestart(reason): Effect<void>             // an instance: that one; the shared part: a new generation
+  reportMissingProgram(tool): Effect<void>         // ENOENT/EACCES at run time: judged unavailable at once
 }
+Principal = { turn } | { job } | { local } | { notification }   // TurnContext.ts: on whose behalf a call runs
 ```
 
 - **Two lifetimes.** `start` runs per distinct set of effective settings as before; `shared` runs once per module while
-  it is demanded (an assistant has it on, its switch is on without demand, or a demanded module names it in `uses`),
-  with the shared settings only, and every instance gets its `value`. Services (one provider per key: a second is a
-  start error) and contributions (any number) come from `shared` and are looked up live, so restarts and start order
-  cannot lose them. A changed shared setting or secret starts a new shared part and every instance again; the old one
-  serves meanwhile and is retired after the grace period.
+  it is demanded (an assistant has it on, its switch is on without demand, or a demanded module names it in `uses`,
+  transitively), with the shared settings only (validated alone), and every instance gets its `value`. Services (one
+  provider per key: a second is a start error) and contributions (any number; inside a turn only those of modules the
+  turn's assistant has on) come from `shared` and are looked up live. A shared part and its instances are a
+  **generation**: a changed shared setting or secret starts a new shared part and every instance while the old one
+  serves, one synchronous `commit` switches the snapshot to all of it at once, and the old generation (instances, then
+  shared part) closes after the grace period; a failure leaves the old one serving (an owner's change is refused and
+  not saved). Every start is a transaction: a candidate scope not published is closed on every exit, interruption
+  included. Modules are reconciled in `uses` order (a cycle is a catalogue error for its members) and demand is
+  re-evaluated for all of them after every change of switches, availability or the vault. Module code the host starts
+  (and `health()`, and retirement) runs without `CurrentTurn`/`CurrentJob`, whoever asked. The CLI modes run every
+  module whose saved switch is on, one instance each.
 - **The execution gateway** (`packages/core/src/Gateway.ts`) is the one way to `Tool.execute` and `ActionDefinition.run`:
   `ToolRegistry.run` (core's tool loop, the Claude Code bridge), `ToolRegistry.runAction` (the intent agent, a
-  confirmed action) and `host.actions.run`; later phrase commands, taps and routine steps. It reads `CurrentTurn`,
-  validates the input, resolves `risk` (a class or a function of the validated input; inferred `read` for speculative
-  tools, else `change`), `sensitivity` (`household | personal`) and `latency`, and checks in order: the assistant has
-  the module on, the tool is not in its `offTools` (`ModuleHostOptions.access`, from the assistants' module choices),
-  the risk hook, the confirmation hook (`ModuleHostOptions.gatewayHooks`, empty until P8). The host's registries and
+  confirmed action) and `host.actions.run`; later phrase commands, taps, routine steps and notification actions. Its
+  admission takes a principal (`Principal`): the explicit one a caller passes (a notification, P9), else `CurrentTurn`,
+  else `CurrentJob`, else the local principal in the CLI modes (`ModuleHostOptions.localPrincipal`, default: without
+  `access`); in serve mode a call with none is refused. It validates the input (a generated action tool's input is
+  resolved to the action's values once; those are admitted and run), resolves `risk` (a class, or `{ classes, of }`;
+  an undeclared answer is refused; inferred `read` for speculative tools, else `change`), `sensitivity` (fixed, or
+  `per-result`) and `latency`, and checks in order: the assistant has the module on, the tool is not in its `offTools`
+  (`ModuleHostOptions.access`; skipped for the local principal and a notification), the risk hook
+  (`ModuleHostOptions.gatewayHooks.risk`, empty until P8). There is no confirmation hook. The host's registries and
   serve mode's per-assistant registries all carry `host.gateway`; a hand-made registry uses `defaultGateway` (no
-  access checks). A later check is one more hook in `GatewayOptions`, called in `admit`'s order.
+  access checks, local principal). Input decoders are made when a registry is built.
 - **Availability.** `requires`, `platforms` and `apiVersion` are judged before anything starts, from the app's probes
   (`apps/assistant/src/requirements.ts`: one tool registry, argv + version regexp, no shell, 5 s, fixed `PATH` with
   `data/tools/bin` first, cached; probed at start and on "Check again", never on a turn). A module that fails them is
   `ModuleState` `unavailable` (protocol 9, `ModuleInfo.unavailable`: reason and fix), is never started, and each
-  assistant that has it on gets one instructions line saying it is not set up (`unavailableInstruction`).
+  assistant that has it on gets one instructions line saying it is not set up (`unavailableInstruction`) and, for
+  intent agents, stand-ins of its `declaredActions` that answer with its "not set up" line (`unavailableLine`). Version
+  ranges are semver and fail closed; a `gpu` requirement is judged on the listed device (else `unchecked`); a program
+  that fails at run time with ENOENT/EACCES is reported (`reportMissingProgram`) and marked missing without a probe.
 - **Health.** The host keeps an issue registry (`ModuleHost.issues`: requirements, unavailable, failed starts and
   restarts, each module's `health()`), the app adds the core checks (`apps/assistant/src/coreChecks.ts`). `pnpm start
-  doctor` prints them and exits 1 on an error; admin's Diagnostics › Health shows them (`health`, `health.check`).
+  doctor` prints them and exits 1 on an error (a requirement is an error for a module the assistants use, directly or
+  through `uses`; doctor reads their demand and starts nothing: `ModuleHost.evaluate`); admin's Diagnostics › Health
+  shows them (`health`, `health.check`, answered once the check has started). Issues are clipped to the wire's limits.
 - **Templates** are plain data (`ModuleInfo.templates`, ids `<moduleId>.<id>`) that the new-assistant wizard offers.
 
 Adding a feature = one new file exporting `defineModule({...})` + one line in `moduleCatalog` in `apps/assistant/src/modules.ts`. Adding a provider = one new package implementing a core interface + one line in `apps/assistant/src/providers.ts`. Adding a voice provider = an adapter with `layerConfig` (`Tts`) and `makeVoices` (`TtsVoices`), and one entry in `ttsProviders`, `ttsProviderInfo` and (hosted) `hostedTtsVoices` in `providers.ts`. A voice needs no code: it is chosen by its key.

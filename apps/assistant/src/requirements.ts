@@ -1,6 +1,7 @@
 import type { IssueFix, ModuleDefinition, Requirement, RequirementCheck, RequirementStatus } from "@pva/core"
 import { Effect } from "effect"
 import { execFile } from "node:child_process"
+import semver from "semver"
 import { readFileSync, statfsSync } from "node:fs"
 import { totalmem } from "node:os"
 import { join } from "node:path"
@@ -93,44 +94,26 @@ export const execProber: Prober = (argv, options) =>
 // ---------------------------------------------------------------------------------------------------------------------
 // Versions
 
-const parts = (v: string): Array<number> => v.split(/[.-]/).map((p) => Number.parseInt(p, 10)).map((n) => (Number.isFinite(n) ? n : 0))
-
-const compare = (a: string, b: string): number => {
-  const x = parts(a)
-  const y = parts(b)
-  for (let i = 0; i < Math.max(x.length, y.length); i++) {
-    const d = (x[i] ?? 0) - (y[i] ?? 0)
-    if (d !== 0) return d
-  }
-  return 0
+/**
+ * A program's reported version as semver ("6.1" is 6.1.0, "2025.01.15" is 2025.1.15, "n6.1-3ubuntu1" is 6.1.0; a
+ * prerelease such as "7.0.0-rc.1" stays one), or `undefined` when it holds no version at all.
+ */
+export const parseVersion = (reported: string): string | undefined => {
+  const exact = semver.valid(semver.clean(reported, { loose: true }) ?? "", { loose: true })
+  if (exact !== null) return exact
+  return semver.coerce(reported, { includePrerelease: true })?.version ?? undefined
 }
 
 /**
- * Whether `version` lies in `range`: space-separated comparators, all of which must hold: `>=1.2`, `>1`, `<2`,
- * `<=2.1`, `=1.4`, `1.4` (the same as `=`), `^1.2` (same major), `~1.2` (same major and minor). Returns `undefined`
- * for a range it cannot read.
+ * Whether `version` lies in `range`, by semver (node-semver): comparators, `||`, `^` (for `0.x`, the same minor),
+ * `~`, `x` ranges and hyphen ranges; a prerelease satisfies only a range that names a prerelease of the same version.
+ * `undefined` when the range cannot be read or the version holds none: never a pass.
  */
 export const satisfiesRange = (version: string, range: string): boolean | undefined => {
-  const comparators = range.trim().split(/\s+/).filter((c) => c.length > 0)
-  if (comparators.length === 0) return true
-  for (const c of comparators) {
-    const m = /^(>=|<=|>|<|=|\^|~)?v?(\d+(?:\.\d+)*)$/.exec(c)
-    if (m === null) return undefined
-    const op = m[1] ?? "="
-    const target = m[2]!
-    const d = compare(version, target)
-    const [major, minor] = parts(target)
-    const [vMajor, vMinor] = parts(version)
-    const ok = op === ">=" ? d >= 0
-      : op === "<=" ? d <= 0
-      : op === ">" ? d > 0
-      : op === "<" ? d < 0
-      : op === "^" ? d >= 0 && vMajor === major
-      : op === "~" ? d >= 0 && vMajor === major && vMinor === (minor ?? vMinor)
-      : compare(version, target) === 0 || (target.split(".").length < version.split(".").length && version.startsWith(`${target}.`))
-    if (!ok) return false
-  }
-  return true
+  if (semver.validRange(range) === null) return undefined
+  const parsed = parseVersion(version)
+  if (parsed === undefined) return undefined
+  return semver.satisfies(parsed, range)
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -230,6 +213,8 @@ export const makeRequirementChecker = (options: RequirementCheckerOptions): Requ
   const memoryMb = options.memoryMb ?? (() => Math.floor(totalmem() / (1024 * 1024)))
   const freeDiskMb = options.freeDiskMb ?? (() => freeMbOf(options.dataDir))
   const cache = new Map<string, ToolProbe>()
+  /** What a GPU program printed when it ran (its exit code and output): the devices are read from it. */
+  const ranOutput = new Map<string, { readonly exitCode: number; readonly output: string }>()
 
   const probeOne = (tool: string): Effect.Effect<void> =>
     Effect.promise(async () => {
@@ -253,6 +238,8 @@ export const makeRequirementChecker = (options: RequirementCheckerOptions): Requ
         ? { found: false, why: "failed", message: out.message }
         : { found: false, why: out.kind }
       cache.set(tool, result)
+      if (out.kind === "ran") ranOutput.set(tool, { exitCode: out.exitCode, output: out.output.slice(0, 64 * 1024) })
+      else ranOutput.delete(tool)
     })
 
   const toolsOf = (requirements: ReadonlyArray<Requirement>): Array<string> => {
@@ -285,9 +272,17 @@ export const makeRequirementChecker = (options: RequirementCheckerOptions): Requ
     }
     const shown = p.version === undefined ? `${r.tool} is installed` : `${r.tool} ${p.version}`
     if (r.version === undefined || r.version.trim() === "") return { requirement: r, state: "met", detail: shown }
-    if (p.version === undefined) return { requirement: r, state: "met", detail: `${shown} (version not reported; needs ${r.version})` }
+    // Fail closed: a version requirement that cannot be proven is not met.
+    if (semver.validRange(r.version) === null) {
+      return { requirement: r, state: "missing", detail: `${r.tool}: the version range "${r.version}" cannot be read, so ${r.tool} cannot be checked` }
+    }
+    if (p.version === undefined) {
+      return { requirement: r, state: "missing", detail: `${r.tool} did not report its version; needs ${r.version}`, fix: installFix(r.tool, entry, distro, "Update") }
+    }
     const ok = satisfiesRange(p.version, r.version)
-    if (ok === undefined) return { requirement: r, state: "met", detail: `${shown} (the range "${r.version}" could not be read)` }
+    if (ok === undefined) {
+      return { requirement: r, state: "missing", detail: `${r.tool} reported "${p.version}", which is not a version; needs ${r.version}`, fix: installFix(r.tool, entry, distro, "Update") }
+    }
     return ok
       ? { requirement: r, state: "met", detail: shown }
       : { requirement: r, state: "missing", detail: `${r.tool} ${p.version} does not match ${r.version}`, fix: installFix(r.tool, entry, distro, "Update") }
@@ -313,13 +308,45 @@ export const makeRequirementChecker = (options: RequirementCheckerOptions): Requ
           ? { requirement: r, state: "met", detail: `${free} MB free` }
           : { requirement: r, state: "missing", detail: `Needs ${r.diskMb} MB of free disk space; ${free} MB is free in ${options.dataDir}` }
       }
-      const tool = gpuTool(r.gpu)
-      const p = cache.get(tool)
-      const name = r.gpu === "cuda" ? "a CUDA graphics card" : "a Vulkan graphics device"
-      return p?.found === true
-        ? { requirement: r, state: "met", detail: `${name} (${tool})` }
-        : { requirement: r, state: "missing", detail: `Needs ${name}; ${tool} found none`, fix: installFix(tool, tools[tool], distro) }
+      return judgeGpu(r)
     })
+
+  /**
+   * A `gpu` requirement, judged on the device the program lists, never on the program alone: met only for a hardware
+   * device (a CUDA GPU in `nvidia-smi -L`; a discrete, integrated or virtual GPU in `vulkaninfo --summary`, not
+   * Mesa's CPU renderer llvmpipe); missing only when the program ran and showed there is none; `unchecked` (never
+   * a pass, never unavailable) when the device cannot be judged here (the program is not installed, timed out, or
+   * printed something this server cannot read).
+   */
+  const judgeGpu = (r: Extract<Requirement, { readonly gpu: unknown }>): RequirementStatus => {
+    const tool = gpuTool(r.gpu)
+    const name = r.gpu === "cuda" ? "a CUDA graphics card" : "a Vulkan graphics device"
+    const ran = ranOutput.get(tool)
+    const p = cache.get(tool)
+    if (ran === undefined) {
+      const why = p === undefined || (!p.found && p.why === "missing") ? `${tool} is not installed` : !p.found && p.why === "timeout" ? `${tool} did not answer` : `${tool} could not be run`
+      return { requirement: r, state: "unchecked", detail: `${name}: not checked (${why}, so the device cannot be seen)`, fix: installFix(tool, tools[tool], distro) }
+    }
+    if (r.gpu === "cuda") {
+      const gpus = [...ran.output.matchAll(/^GPU \d+: (.+?)(?: \(UUID[^)]*\))?\s*$/gm)].map((m) => m[1]!.trim())
+      if (gpus.length > 0) return { requirement: r, state: "met", detail: `${gpus[0]} (CUDA)` }
+      if (/No devices were found/i.test(ran.output) || (ran.exitCode === 0 && ran.output.trim() === "")) {
+        return { requirement: r, state: "missing", detail: `Needs ${name}; nvidia-smi lists none` }
+      }
+      return { requirement: r, state: "unchecked", detail: `${name}: not checked (nvidia-smi printed something this server cannot read)` }
+    }
+    const types = [...ran.output.matchAll(/deviceType\s*=\s*PHYSICAL_DEVICE_TYPE_(\w+)/g)].map((m) => m[1]!)
+    const names = [...ran.output.matchAll(/deviceName\s*=\s*(.+)/g)].map((m) => m[1]!.trim())
+    const hardware = types.findIndex((t) => t === "DISCRETE_GPU" || t === "INTEGRATED_GPU" || t === "VIRTUAL_GPU")
+    if (hardware >= 0) return { requirement: r, state: "met", detail: `${names[hardware] ?? "a graphics device"} (Vulkan)` }
+    if (types.length > 0) {
+      return { requirement: r, state: "missing", detail: `Needs ${name}; Vulkan finds only a software renderer (${names[0] ?? "on the processor"})` }
+    }
+    if (/ERROR_INCOMPATIBLE_DRIVER|Cannot create Vulkan instance|ERROR_INITIALIZATION_FAILED/.test(ran.output)) {
+      return { requirement: r, state: "missing", detail: `Needs ${name}; Vulkan finds no driver or device` }
+    }
+    return { requirement: r, state: "unchecked", detail: `${name}: not checked (vulkaninfo printed something this server cannot read)` }
+  }
 
   return {
     check,
@@ -327,6 +354,7 @@ export const makeRequirementChecker = (options: RequirementCheckerOptions): Requ
     probeCatalog: (catalog, probeOptions) => probe(catalog.flatMap((d) => d.requires ?? []), probeOptions),
     markMissing: (tool) => {
       cache.set(tool, { found: false, why: "missing" })
+      ranOutput.delete(tool)
     },
     probed: (tool) => cache.get(tool)
   }

@@ -1,4 +1,5 @@
 import {
+  actionToolName,
   type AgentTurnSetup,
   type HostResult,
   Llm,
@@ -51,7 +52,7 @@ import { fileURLToPath } from "node:url"
 import { defaultSystemPrompt } from "../config.ts"
 import { envView as processEnvView, userCwd } from "../env.ts"
 import { type EnvView, makeEnvView } from "../envView.ts"
-import { moduleCatalog, withModuleInstructions } from "../modules.ts"
+import { moduleCatalog, moduleDemandOf, withModuleInstructions } from "../modules.ts"
 import { runCoreChecks } from "../coreChecks.ts"
 import { makeRequirementChecker } from "../requirements.ts"
 import { makeHealthService } from "./health.ts"
@@ -321,6 +322,10 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       demand: () => moduleDemand(),
       platform: { os: process.platform, arch: process.arch },
       requirements: checker.check,
+      // A program a module requires failed to run (ENOENT, EACCES): missing from now on; the host judges again.
+      programMissing: (tool) => checker.markMissing(tool),
+      // Serve mode: a call with no turn and no job is refused (a missing context never means "allowed").
+      localPrincipal: false,
       // The execution gateway's first checks, on every call (and the turn's action catalogue): the assistant has the
       // module on, and the tool is not one it switched off. Agents and decision providers are not per assistant.
       access: {
@@ -421,16 +426,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
      * values. Each capability has an entry (an empty list: nobody, so it does not run); agents and decision providers
      * have none and follow their own switch.
      */
-    const moduleDemand = (): ReadonlyMap<string, ReadonlyArray<ModuleDemand>> => {
-      const demand = new Map<string, Array<ModuleDemand>>(catalog.filter((d) => isCapability(d.id)).map((d) => [d.id, []]))
-      for (const assistant of assistantsNow().values()) {
-        if (!assistant.on) continue
-        for (const [moduleId, choice] of Object.entries(assistant.modules)) {
-          if (choice.on) demand.get(moduleId)?.push({ assistantId: assistant.id, ...(choice.own !== undefined ? { own: choice.own } : {}) })
-        }
-      }
-      return demand
-    }
+    const moduleDemand = (): ReadonlyMap<string, ReadonlyArray<ModuleDemand>> => moduleDemandOf(catalog, assistantsNow().values())
     /** Bring the module instances in line with the assistants and Home (after every save; not while blocked). */
     const syncModules = (): Effect.Effect<void> => Effect.suspend(() => (store.blocked() !== undefined ? Effect.void : host.refresh))
     /**
@@ -463,7 +459,11 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
         if (choice === undefined || !choice.on) return []
         if (choice.offTools.length === 0) return [part]
         const off = new Set(choice.offTools)
-        return [{ ...part, module: { ...part.module, tools: (part.module.tools ?? []).filter((t) => !off.has(t.name)) } }]
+        const intentActions = part.module.intentActions?.filter((a) => !off.has(actionToolName(a.moduleId, a.definition.id)))
+        return [{
+          ...part,
+          module: { ...part.module, tools: (part.module.tools ?? []).filter((t) => !off.has(t.name)), ...(intentActions !== undefined ? { intentActions } : {}) }
+        }]
       })
       /** The modules it has on that run (capabilities; for the turn's configuration snapshot). */
       const modules = parts.reduce((n, p) => (isCapability(p.moduleId) && p.unavailable !== true ? n + 1 : n), 0)
@@ -1207,6 +1207,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
           ...(options.hearerSwitchWaitMs !== undefined ? { hearerSwitchWaitMs: options.hearerSwitchWaitMs } : {}),
           assistants: assistantsNow,
           conversationSetup,
+          audioConnection: () => hub?.audioOwnerOf(key),
           voiceOf: (assistant, deviceId) => resources.ttsKeyFor(voiceUserFor(assistant, deviceId)),
           moduleOfTool: (name) => host.snapshot().toolModules.get(name) ?? null,
           routing: () => routing,
@@ -1267,6 +1268,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       host,
       checker,
       catalog,
+      fork: run,
       core: Effect.suspend(() =>
         runCoreChecks({
           checker,

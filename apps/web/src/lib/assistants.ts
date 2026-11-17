@@ -339,3 +339,30 @@ export const copyName = (name: string, taken: ReadonlyArray<string>): string => 
     if (!used.has(candidate.toLowerCase())) return candidate
   }
 }
+
+/** The identity fields of an assistant draft the new-assistant wizard fills from a template. */
+export interface DraftIdentity {
+  readonly name: string
+  readonly purpose: string
+  readonly handles: string
+}
+
+/**
+ * The identity fields when the wizard starts from `next` (a template, or `undefined`: a blank start or a copy): what
+ * the owner typed stays; an empty field, or one still holding exactly what the previous template filled in
+ * (`previous`), takes the next template's value (or becomes empty again). So choosing one template and then another
+ * does not keep the first one's name, purpose and Handles.
+ */
+export const identityOnStart = (
+  current: DraftIdentity,
+  previous: Partial<DraftIdentity> | undefined,
+  next: Partial<DraftIdentity> | undefined
+): DraftIdentity => {
+  const pick = (typed: string, before: string | undefined, after: string | undefined) =>
+    typed.trim() === "" || (before !== undefined && before !== "" && typed === before) ? after ?? "" : typed
+  return {
+    name: pick(current.name, previous?.name, next?.name),
+    purpose: pick(current.purpose, previous?.purpose, next?.purpose),
+    handles: pick(current.handles, previous?.handles, next?.handles)
+  }
+}

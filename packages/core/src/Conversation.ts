@@ -19,7 +19,7 @@ import { armAgent, initialRouterState, type RouteDecision, type Router, type Rou
 import { AudioInput, AudioOutput, Llm, Stt, Tts, type TtsAudio } from "./Services.ts"
 import { ToolRegistry } from "./ToolRegistry.ts"
 import { defaultGateway } from "./Gateway.ts"
-import { CurrentTurn, makeTurnContext, type TurnContext } from "./TurnContext.ts"
+import { type ConnectionRef, CurrentTurn, makeTurnContext, type TurnContext } from "./TurnContext.ts"
 import { CurrentTurnTrace, type Trace, TurnTrace, type TurnOutcome } from "./TurnTrace.ts"
 import { ACTION_TIMEOUT_MS, ActionError, type ActionOutcome, actionToolName, type RegisteredAction } from "./Actions.ts"
 import { confirmationQuestion, describeProposal } from "./Decision.ts"
@@ -518,10 +518,10 @@ export const makeConversationWithSetup = Effect.fnUntraced(function*(options: Co
     if (known !== undefined) return known
     // A hand-made registry may have no action lookup (or no specs): then it offers no actions.
     const actionFor = registry.actionFor
-    const actions = actionFor === undefined ? [] : (registry.specs ?? []).flatMap((spec) => {
+    const actions = registry.actions ?? (actionFor === undefined ? [] : (registry.specs ?? []).flatMap((spec) => {
       const action = actionFor(spec.name)
       return action === undefined ? [] : [action]
-    })
+    }))
     const set: AgentSet = { ...agents, actions }
     perRegistry.set(registry, set)
     return set
@@ -1551,7 +1551,13 @@ const makeConversationCore = Effect.fnUntraced(function*(options: AgentConversat
         speculative: boolean,
         source: "voice" | "text" = "voice",
         spoken = true,
-        how: { readonly explicitAgent?: string | undefined; readonly say?: string; readonly answerable?: PendingEntry | undefined } = {}
+        how: {
+          readonly explicitAgent?: string | undefined
+          readonly say?: string
+          readonly answerable?: PendingEntry | undefined
+          /** The connection that typed it (`TextInput.connection`): the turn's, over the setup's. */
+          readonly connection?: ConnectionRef | undefined
+        } = {}
       ) =>
         Effect.gen(function*() {
           // Idle reset, decided here at the turn's start (a speculative turn and its promotion see the same
@@ -1559,7 +1565,8 @@ const makeConversationCore = Effect.fnUntraced(function*(options: AgentConversat
           // to the old conversation.
           const reset = how.say === undefined && (yield* resetIfIdle)
           const answerable = reset ? undefined : how.answerable
-          const setup = yield* options.setup
+          const read = yield* options.setup
+          const setup = how.connection === undefined || read.turnContext === undefined ? read : { ...read, turnContext: { ...read.turnContext, connection: how.connection } }
           const plan: TurnPlan = how.say !== undefined
             ? { canned: how.say, tts: setup.tts, ttsReady: setup.ttsReady }
             : planTurn(setup, text, source, how.explicitAgent, answerable)
@@ -1709,7 +1716,7 @@ const makeConversationCore = Effect.fnUntraced(function*(options: AgentConversat
               const answerable = asked?.entry
               // Deliberate input: replaces whatever runs, whatever the barge-in setting.
               if (turn !== undefined) yield* interrupt(turn)
-              return yield* start(event.text, false, "text", event.speak, { explicitAgent: event.agentId, answerable })
+              return yield* start(event.text, false, "text", event.speak, { explicitAgent: event.agentId, answerable, connection: event.connection })
             }
             case "Say": {
               cancelled = undefined

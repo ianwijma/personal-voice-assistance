@@ -2182,12 +2182,13 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
     }
     case "health.check": {
       if (requireAdmin(c, m.requestId)) return
+      // As the server: answered once it has started; the outcome follows as `health`.
       health = { ...health, checking: true }
       broadcast({ type: "health", health })
+      result(c, m.requestId, true)
       after(1000, () => {
         health = { issues: health.issues.filter((i) => i.id !== "core.clock"), checkedAt: Date.now(), checking: false }
         broadcast({ type: "health", health })
-        result(c, m.requestId, true)
       })
       return
     }
