@@ -2,7 +2,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react"
 import { WAKE_TEST_MAX_MS } from "@pva/protocol"
 import { normalisePhrase, phraseFromHeard } from "@/lib/profileForm.ts"
-import { displayPhrase, type HeardJudgement, type HeardLine, heardOutcome } from "@/lib/state.ts"
+import { type HeardJudgement, type HeardLine, heardRow } from "@/lib/state.ts"
 import { shallowEqual } from "@/lib/store.ts"
 import { useClient, useClientState } from "../context.tsx"
 import { inputClass } from "../fields/types.ts"
@@ -14,21 +14,6 @@ const listHas = (list: ReadonlyArray<string>, phrase: string): boolean => list.i
 const clock = (ms: number) => {
   const s = Math.max(0, Math.ceil(ms / 1000))
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`
-}
-
-/** The words for a line's outcome, as shown and as announced (`who`: the assistant a matched line woke). */
-const outcomeText = (l: HeardLine, who?: string): string => {
-  switch (heardOutcome(l)) {
-    case "matched": {
-      return `Matched ${displayPhrase(l.matched!)}${who !== undefined ? ` → wakes ${who}` : ""}`
-    }
-    case "accepted":
-      return "Accepted without a phrase"
-    case "ignored":
-      return "Ignored"
-    case "no-match":
-      return "No phrase matched"
-  }
 }
 
 /**
@@ -79,13 +64,14 @@ export function PhraseTester({ onAdd, phrases: draftPhrases = [], savedPhrases =
   const tested = chosen !== "" ? chosen : owner?.id
   const assistants = useClientState((s) => s.assistants)
   /**
-   * The device a line was heard on and the assistant a matched line woke. A line with `source` says both (the server
-   * knows them): taken as it is, nothing is derived from the sessions or the assignments. Only a line from an older
+   * The device a line was heard on and the assistant its matched phrase belongs to (`heardRow` shows it only for a
+   * line that was taken). A line with `source` says both (the server knows them): taken as it is, nothing is
+   * derived from the sessions or the assignments. Only a line from an older
    * server, without it, is worked out once, when it is first shown, from the tested device's settings then, and kept
    * with the line in the store (`local/heard-judged`): saving other assignments later, or opening another device's
    * page, does not relabel it.
    */
-  const nameOf = (id: string | undefined): string | undefined => (id === undefined ? undefined : assistants.find((x) => x.id === id)?.name ?? id)
+  const nameOf = (id: string | undefined): string | undefined => (id === undefined ? undefined : assistants.find((x) => x.id === id)?.name ?? "a removed assistant")
   const judge = (l: HeardLine): HeardJudgement =>
     l.source !== undefined
       ? { deviceId: l.source.deviceId, woke: l.matched === undefined ? undefined : nameOf(l.source.assistantId) }
@@ -149,7 +135,7 @@ export function PhraseTester({ onAdd, phrases: draftPhrases = [], savedPhrases =
   const latest = heard[heard.length - 1]
   useEffect(() => {
     if (latest === undefined || !onRef.current) return
-    setAnnouncement(`Heard “${latest.text}”: ${outcomeText(latest, wokeBy(latest)).toLowerCase()}.`)
+    setAnnouncement(`Heard “${latest.text}”: ${heardRow(latest, wokeBy(latest)).label.toLowerCase()}.`)
   }, [latest])
   // Leaving the page stops it. When the session has ended (logout, restart) the server has already switched it off
   // and would refuse the request (`admin_required`), so nothing is sent then.
@@ -229,24 +215,24 @@ export function PhraseTester({ onAdd, phrases: draftPhrases = [], savedPhrases =
           <ul className="flex max-h-72 flex-col divide-y divide-line/60 overflow-y-auto rounded-md border border-line bg-surface scrollbar-quiet" ref={listRef} aria-label="Heard, newest first" data-testid="heard-lines">
             {lines.map((l) => {
               const phrase = phraseFromHeard(l.text, phrases)
-              const outcome = heardOutcome(l)
+              const row = heardRow(l, wokeBy(l))
               return (
-                <li key={`${l.at}-${l.text}`} className="flex flex-wrap items-center gap-x-3 gap-y-1 px-3 py-2" data-matched={outcome === "matched" ? "true" : "false"} data-outcome={outcome}>
+                <li key={`${l.at}-${l.text}`} className="flex flex-wrap items-center gap-x-3 gap-y-1 px-3 py-2" data-matched={l.matched !== undefined ? "true" : "false"} data-outcome={row.outcome} data-tone={row.tone}>
                   <span className="min-w-0 flex-1 basis-full text-[14px] text-ink sm:basis-0">“{l.text}”</span>
-                  {outcome === "matched" ? (
+                  {row.tone === "ok" ? (
                     <span className="inline-flex items-center gap-1 text-[12px] text-ok">
                       <Icon name="check" size={14} />
-                      {outcomeText(l, wokeBy(l))}
+                      {row.label}
                     </span>
-                  ) : outcome === "accepted" ? (
+                  ) : row.tone === "you" ? (
                     <span className="inline-flex items-center gap-1 text-[12px] text-you" title="Always listening, or the device was already listening (after the phrase or a reply)">
                       <Icon name="check" size={14} />
-                      {outcomeText(l, wokeBy(l))}
+                      {row.label}
                     </span>
                   ) : (
                     <span className="inline-flex items-center gap-2">
-                      <span className="label text-[10px] text-ink-muted">{outcomeText(l, wokeBy(l))}</span>
-                      {onAdd === undefined ? null : added[l.at] !== undefined && listHas(draftPhrases, added[l.at]!) ? (
+                      <span className="label text-[10px] text-ink-muted">{row.label}</span>
+                      {onAdd === undefined || !row.canAdd ? null : added[l.at] !== undefined && listHas(draftPhrases, added[l.at]!) ? (
                         // Derived from the form: in the draft only = not saved yet; also in the saved list = saved.
                         <span tabIndex={-1} data-added-at={l.at} className="text-[12px] text-ok outline-none focus-visible:underline" data-testid="added-status">
                           {listHas(savedPhrases, added[l.at]!) ? `Saved “${added[l.at]}”` : `Added “${added[l.at]}”, not saved yet`}
