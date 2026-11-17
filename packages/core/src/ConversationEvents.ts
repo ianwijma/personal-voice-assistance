@@ -7,7 +7,7 @@ import type { SttEvent, ToolCall, ToolResult } from "./Domain.ts"
 import type { Router, RouterState } from "./Routing.ts"
 import type { Llm, Tts } from "./Services.ts"
 import type { ToolRegistry } from "./ToolRegistry.ts"
-import type { TurnOrigin } from "./TurnContext.ts"
+import type { ConnectionRef, TurnOrigin } from "./TurnContext.ts"
 import type { Trace, TurnOutcome } from "./TurnTrace.ts"
 
 /**
@@ -109,6 +109,11 @@ export type ConversationInput =
     readonly speak: boolean
     /** The agent chosen in the composer (route reason `explicit`); absent = routed like speech. */
     readonly agentId?: string | undefined
+    /**
+     * The connection (tab) that typed it (module API v2): the turn's `CurrentTurn.connection`, over the setup's
+     * (which names the tab that owns the device's audio).
+     */
+    readonly connection?: ConnectionRef | undefined
   }
   | { readonly _tag: "Interrupt" }
   /** `routing.set`: make an agent sticky, or `null` to go back to the default. Applied at once; starts no turn. */

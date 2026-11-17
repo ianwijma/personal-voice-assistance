@@ -1,5 +1,5 @@
 // The execution gateway (docs/MODULES-PLAN.md §4 P1): one way to a tool's execute and an action's run, checking the
-// assistant's module, its offTools, then the risk and confirmation hooks, in that order.
+// assistant's module, its offTools, then the risk hook, in that order.
 import { assert, describe, it } from "@effect/vitest"
 import { Effect, Layer, Schema, Stream } from "effect"
 import { defineAction, registerActions } from "../src/Actions.ts"
@@ -15,7 +15,7 @@ const door = makeTool({
   name: "door",
   description: "Open a door",
   parameters: Schema.Struct({ which: Schema.String }),
-  risk: ({ which }) => (which === "garage" ? "security" : "change"),
+  risk: { classes: ["change", "security"], of: ({ which }) => (which === "garage" ? "security" : "change") },
   execute: ({ which }) => Effect.sync(() => (ran.push(which), `${which} open`))
 })
 const turnOf = (assistantId: string): TurnContext => ({ turnId: 1, conversationId: "c", assistantId, deviceId: "d-1", source: "voice" })
@@ -31,8 +31,7 @@ describe("the execution gateway", () => {
       const seen: Array<string> = []
       const gateway = makeExecutionGateway({
         access,
-        risk: (call) => Effect.sync(() => (seen.push(`risk:${call.risk}`), call.risk === "security" ? refuse("security is denied.") : ALLOW)),
-        confirmation: (call) => Effect.sync(() => (seen.push("confirm"), ALLOW))
+        risk: (call) => Effect.sync(() => (seen.push(`risk:${call.risk}`), call.risk === "security" ? refuse("security is denied.") : ALLOW))
       })
       const run = (assistantId: string | undefined, which: string) =>
         Effect.flip(gateway.tool("home", door, { which })).pipe(
@@ -44,11 +43,11 @@ describe("the execution gateway", () => {
       assert.strictEqual(yield* run("a", "front"), "Not run: door is switched off for this assistant.")
       assert.deepStrictEqual(seen, [], "the hooks are not asked once an access check refused")
       assert.strictEqual(yield* run("c", "garage"), "Not run: security is denied.", "the risk function saw the validated input")
-      assert.deepStrictEqual(seen, ["risk:security"], "confirmation is not asked after a refusal")
+      assert.deepStrictEqual(seen, ["risk:security"])
       assert.strictEqual(yield* run("c", "front"), "ran")
-      assert.deepStrictEqual(seen, ["risk:security", "risk:change", "confirm"])
-      assert.strictEqual(yield* run(undefined, "back"), "ran", "outside a turn the access checks are skipped; the hooks still run")
-      assert.deepStrictEqual(ran, ["front", "back"])
+      assert.deepStrictEqual(seen, ["risk:security", "risk:change"])
+      assert.strictEqual(yield* run(undefined, "back"), "Not run: it has no turn, job or other principal to run for.", "serve mode: no turn, no job, refused")
+      assert.deepStrictEqual(ran, ["front"])
       assert.match(yield* run("c", 42 as unknown as string), /^Invalid input: Expected string/)
     }))
 
@@ -57,7 +56,7 @@ describe("the execution gateway", () => {
       const calls: Array<GatewayCall> = []
       const gateway = makeExecutionGateway({ access, risk: (call) => Effect.sync(() => (calls.push(call), ALLOW)) })
       const [action] = registerActions("home", [
-        defineAction({ id: "door", label: "Open", description: "", params: {}, risk: () => "security", run: () => Effect.succeed({ say: "Open." }) })
+        defineAction({ id: "door", label: "Open", description: "", params: {}, risk: { classes: ["security"], of: () => "security" }, run: () => Effect.succeed({ say: "Open." }) })
       ])
       const off = yield* Effect.flip(gateway.action(action!, {})).pipe(Effect.provideService(CurrentTurn, turnOf("b")))
       assert.strictEqual(off.message, "Not run: the home module is not on for this assistant.")

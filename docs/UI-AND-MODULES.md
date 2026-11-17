@@ -480,12 +480,13 @@ defineModule({
   platforms?: { os?: ["linux"], arch?: ["x64", "arm64"] },
   health?: ({ settings, running }) => Effect<ReadonlyArray<Issue>>,   // cheap; 5 s; never on a turn
   templates?: [{ id: "dj", name: "DJ", prompt, purpose?, handles?, modules?, suggestedPhrases? }],
+  declaredActions?: [{ id: "play", label, description, examples? }],   // known while unavailable (§1.10.3)
   uses?: ["lists"],                                 // other modules this one needs while it is demanded
   shared?: (ctx: SharedContext<A>) => Effect<SharedPart<X>, ModuleStartError, Scope>,
   start: (ctx: ModuleContextV2<A, X>) => Effect<ModuleInstance, ModuleStartError, Scope>
 })
 
-interface SharedContext<A>      { settings: Partial<A>; host: ModuleHostApi }          // + later members
+interface SharedContext<A>      { settings: Partial<A>; settingsFor(assistantId?): A | undefined; host: ModuleHostApi } // + later members
 interface ModuleContextV2<A, X> { settings: A; setStatus; shared: X; host: ModuleHostApi } // + later members
 interface SharedPart<X>         { value: X; services?: ReadonlyArray<ProvidedService>; contributions?: ReadonlyArray<ProvidedContribution> }
 const Lists = ServiceKey<ListsService>("lists")           // provided with services: [Lists.of(impl)]
@@ -496,7 +497,8 @@ interface ModuleHostApi {
   service<T>(key: ServiceKey<T>): T | undefined      // live; undefined while no demanded module provides it
   contributions<T>(key: ContributionKey<T>): ReadonlyArray<T>   // live, catalog order
   actions: { list: Effect<ReadonlyArray<CatalogAction>>; run(request): Effect<ActionRunResult> }  // the turn's catalogue
-  requestRestart(reason): Effect<void>               // from start: that instance; from shared: every instance
+  requestRestart(reason): Effect<void>               // from start: that instance; from shared: a new generation
+  reportMissingProgram(tool): Effect<void>           // a required program failed with ENOENT/EACCES
 }
 ```
 
@@ -505,25 +507,47 @@ interface ModuleHostApi {
 `start` keeps running once per distinct set of effective settings (§1.4, docs/ASSISTANTS.md §2.6): tools, actions,
 context providers, instructions. `shared` runs **once per module** while the module is **demanded**: a switched-on
 assistant has it on (serve mode's demand), its own switch is on (no demand: the CLI modes, agents), or a demanded module
-names it in `uses` (transitively). It gets the module's shared settings only: the `overridable` fields, which an
-assistant may own, are left out (hence `Partial<A>`). Sockets, caches, handlers, services and contributions belong
-there. What it returns as `value`, every instance receives as `ctx.shared`.
+names it in `uses` (transitively; a module that is unavailable does not run, so it demands nothing). It gets the
+module's shared settings only: the `overridable` fields, which an assistant may own, are left out (hence
+`Partial<A>`), and only those fields are validated for it (an assistant-owned field's invalid shared value does not
+stop it; each instance validates its own effective settings in full). Shared code acting for a caller asks
+`ctx.settingsFor(assistantId)`: that assistant's own values over the shared ones this shared part started with, the
+shared values with no assistant, `undefined` when they are not valid. Sockets, caches, handlers, services and
+contributions belong there. What it returns as `value`, every instance receives as `ctx.shared`.
 
-- It starts before the first instance that needs it (10 s), and is published together with that instance. A module
-  demanded only through `uses` publishes it with no instance.
-- It is started again when its shared settings change (a save, Home moving a linked default) or a secret changes: the
-  new one starts while the old one serves, every instance is started again with the new value, then the new shared
-  part is published and the old one retired after the 10 s grace. If any of those starts fails, nothing changes.
-- When demand ends it is withdrawn at once (lookups no longer find its services) and closed after the grace period.
-- A `shared` that fails is the module's start error: its instances fail with that message, and the module is in `error`.
+The shared part and the instances it serves are one **generation**:
 
+- The first generation's shared part starts before any instance (10 s) and is published at once: it is demanded
+  whatever its instances do, so a direct instance that fails does not take away a service a `uses` consumer needs.
+  If it fails, the module is in `error` and its instances fail with that message; they start once it does.
+- A changed shared setting (a save, Home moving a linked default) or secret starts a **new generation**: a new shared
+  part and every instance start while the old generation serves; then one synchronous switch checks everything
+  against the modules running then (services, tool names, the snapshot) and publishes all of it at once; then the
+  old generation (its instances, then its shared part) is closed after the 10 s grace. The old shared part's
+  services and contributions are withdrawn at the switch, never live beside the new ones. If the new shared part, an
+  instance that serves an assistant now, or the switch fails, nothing changes: an owner's change is refused (and not
+  saved), a Home change leaves the old generation serving with a Health warning ("could not apply its new settings").
+- Any start is interruption-safe: a part started and not published is closed on every exit, interruption included.
+- When demand ends the shared part is withdrawn at once and closed with the leaving instances after the grace period.
+- Order: a module is brought in line after the modules in its `uses` (their shared parts have started or failed). A
+  cycle in `uses` is an error for every module in it (`<id>.uses`), found when the catalogue is read; they never
+  start. Demand is evaluated again after every change of an assistant's switches, a module's switch, availability
+  ("Check again") or the vault, for every module, so a provider follows its consumers transitively.
+- A module used only through `uses` (no instance) is `running` while its shared part runs, and its `health()` gets
+  `running: true`.
+- `requestRestart` from an instance starts that instance again with the settings it runs with (kept from its start:
+  a locked vault does not stop it); from the shared part it starts a new generation with the generation's settings.
+  Either way the old one serves until the new one is published, and a failure is a Health warning that a later
+  success, or the module stopping, clears. Restarts and every other start run outside any turn: the new start never
+  sees the requesting tool's `CurrentTurn`.
 #### 1.10.2 Services and contributions
 
 A **service** is one typed object a module offers others under a `ServiceKey<T>`: `host.service(key)` returns the
 published shared part's service, or `undefined` while no demanded module provides it (a consumer then says the other
 module is off). One provider per key: a second module providing the same key gets a start error ("The service "x" is
 already provided by module Y"). A **contribution** is a value any number of modules add under a `ContributionKey<T>`;
-`host.contributions(key)` is the live list in catalog order. Both are read live at each call, so start order and
+`host.contributions(key)` is the live list in catalog order; inside a turn it holds only the contributions of modules
+the turn's assistant has on (services are not filtered so: §2 row 18 of the plan). Both are read live at each call, so start order and
 restarts cannot lose a registration, and nothing registers itself with another module. Because services come from the
 once-per-module part, a module with several instances still has exactly one provider.
 
@@ -536,8 +560,20 @@ again", never on a turn. A missing required requirement, an `apiVersion` outside
 platform makes the module **`unavailable`** (`ModuleInfo.unavailable`: reason and fix, e.g. the `apt install` line for
 the detected distribution). It is never started. Each assistant that has it on gets one instructions line instead
 ("Music is not set up on this server (yt-dlp is missing). If you are asked for anything it does, say so in one
-sentence; …"), which changes the cached prefix only when availability changes. Device-side programs and the network
-are not judged yet (`unchecked`).
+sentence; …"), which changes the cached prefix only when availability changes. Its `declaredActions` stay known on the
+intent path: the turn's registry carries stand-ins (`AssistantModule.intentActions`, not offered as tools) that answer with
+"Music is not set up on this server (yt-dlp is missing).", and `host.actions.run` answers `unavailable` with that line,
+so "play jazz" never falls through to another action. Device-side programs and the network are not judged yet
+(`unchecked`).
+
+A `version` range is semver (`semver`, node-semver: comparators, `||`, `^`, `~`, x- and hyphen ranges, prereleases
+only for a range naming one) and **fails closed**: a range that cannot be read, a program that does not report its
+version, or a version that is not one, is a missing requirement with a reason that says so. A `gpu` requirement is
+judged on the device the program lists (`nvidia-smi -L`: a GPU line; `vulkaninfo --summary`: a discrete, integrated or
+virtual GPU, not Mesa's software renderer llvmpipe): met only for a hardware device, missing only when the program ran
+and showed none, otherwise `unchecked` (never a pass). A module whose required program fails at run time with ENOENT
+or EACCES calls `host.reportMissingProgram(tool)` (`isMissingProgramError` classifies the error): the app marks it
+missing in its cache, no probe runs on the turn path, and every module is judged again.
 
 #### 1.10.4 Health
 
@@ -546,35 +582,52 @@ are not judged yet (`unchecked`).
 requirements, why it is unavailable, a failed start or restart (kept current), and the last `health()` result; the
 app adds the core checks (Node version, `tar`, `bzip2`, `flock`, `nice`, disk space, every assistant's model files,
 the vault, TLS files, the port, clock sync). `pnpm start doctor` prints them, one line per issue with its fix, and exits
-1 on an error (a module no assistant has on is only a warning). Admin › Diagnostics › Health shows the same registry
-(`health`, `admin.snapshot.health`) with "Check again" (`health.check`).
+1 on an error. A requirement is an error for a module the assistants use (directly, or through `uses`), and only a
+warning for one nobody uses; doctor reads the same demand as serve mode and starts nothing (`ModuleHost.evaluate`).
+Every issue is clipped to the wire's limits (the fix's label and value too); one that still does not fit is replaced
+by a warning that says so, so one module cannot break the health message. Admin › Diagnostics › Health shows the same
+registry (`health`, `admin.snapshot.health`) with "Check again" (`health.check`), which is answered as soon as the
+check has started (`health` with `checking: true` first); the outcome follows as `health`.
 
 #### 1.10.5 The turn and the execution gateway
 
 `CurrentTurn` (`TurnContext.ts`, a `Context.Reference<TurnContext | undefined>`) is provided around every tool call,
 every action run and the gathering of context providers of a turn whose setup names its origin (serve mode:
 `TurnSetup.turnContext` with the assistant, device id and name); it holds the turn id, conversation id, assistant,
-device, room and person (both later), and `source` (`voice`, `text`, `touch`, `phrase`, `routine`). The Claude Code
-bridge captures it at the turn's start and gives it to every tool call the SDK makes. It is `undefined` in the CLI
-modes.
+device, room and person (both later), `source` (`voice`, `text`, `touch`, `phrase`, `routine`) and `connection`, an
+opaque reference to the connection the request came in on (a voice turn: the tab that owns the device's audio as the
+turn starts; a typed turn: the tab that typed it, `TextInput.connection`). The Claude Code bridge captures it at the
+turn's start and gives it to every tool call the SDK makes. It is `undefined` in the CLI modes; a job carries its own
+origin (`CurrentJob`, P6).
 
 Every tool call and action run goes through one **execution gateway** (`Gateway.ts`): `ToolRegistry.run` (the model's
 tool loop and the bridge), `ToolRegistry.runAction` (the intent agent, a confirmed action) and `host.actions.run`.
-It validates the input, resolves the call's risk, sensitivity and latency, and checks, in order: the assistant has the
-module on; the tool (an action's generated tool name) is not in its `offTools`; the risk policy hook; the
-confirmation hook (both empty until P8). A refusal is an error result for the model ("Not run: …"); nothing reaches
-`execute` or `run` another way. The registries the host and serve mode build all carry the host's gateway.
+Its admission takes a **principal**: a turn, a job, the local principal of the CLI modes (explicit: the host is made
+with `localPrincipal: true`), or (P9) a notification, passed explicitly and admitted by the notification whatever
+modules the device's assistant has on. In serve mode a call with no turn and no job is refused ("it has no turn, job
+or other principal to run for"). It validates the input (a generated action tool's input becomes the action's values
+**once**: the hooks see those values and `run` receives exactly them), resolves the call's risk, sensitivity and
+latency, and checks, in order: the assistant has the module on; the tool (an action's generated tool name) is not in
+its `offTools`; the risk policy hook (empty until P8). There is no confirmation hook; an action's `confirm: true`
+behaves as before. A refusal is an error result for the model ("Not run: …"); nothing reaches `execute` or `run`
+another way. The registries the host and serve mode build all carry the host's gateway; input decoders are made when a
+registry is built, never on a call.
 
-Tools and actions may declare `risk` (`read | change | message | money | security`, or a function from the validated
-input to a class), `sensitivity` (`household | personal`) and `latency` (`instant | quick | slow | background`).
-Absent: `risk` is `read` for a speculative tool and `change` otherwise, `sensitivity` `household`, `latency` `quick`.
-`ModuleInfo.tools` shows them (no `risk` when it depends on the input). They are carried, not enforced (P8).
+Tools and actions may declare `risk` (`read | change | message | money | security`, or `{ classes, of }`: a function
+of the validated input with the classes it can return; an answer outside them is refused), `sensitivity`
+(`household`, `personal`, `{ kind: "personal", owner }` with a person id or `"unknown"`, or a function deciding it per
+result, `sensitivityOf`) and `latency` (`instant | quick | slow | background`). Absent: `risk` is `read` for a
+speculative tool and `change` otherwise, `sensitivity` `household`, `latency` `quick`. `ModuleInfo.tools` shows them:
+`risk` when fixed, `risks` every class a call can have (what a later policy filters by), `sensitivity` `per-result`
+for a function. They are carried, not enforced (P8). A risk function without declared classes is a start error.
 
 #### 1.10.6 Templates
 
 `templates` are suggested assistants, plain data; `ModuleInfo.templates` lists them with ids `<moduleId>.<id>`. The
 new-assistant wizard offers them under "Start from": the template's prompt and modules on, its name, purpose and
-Handles where nothing was typed, and its first suggested phrase for the places ticked in step 6. A template never
+Handles where nothing was typed (a value an earlier template filled in counts as not typed, so switching templates
+replaces it), and its first suggested phrase for the places ticked in step 6. A template's module ids and suggested
+phrases are checked against the wire's limits when the module is defined. A template never
 becomes an assistant by itself, and a module update never changes an assistant made from one.
 
 ### 1.11 Extended settings fields, field actions and module routes (docs/MODULES-PLAN.md §4 P3)

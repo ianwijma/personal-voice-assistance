@@ -28,6 +28,7 @@
     "@pva/tts-elevenlabs": "workspace:*",
     "@pva/tts-sherpa": "workspace:*",
     "effect": "catalog:",
+    "semver": "catalog:",
     "ws": "catalog:"
   },
   "devDependencies": {
@@ -36,6 +37,7 @@
     "tsx": "catalog:",
     "typescript": "catalog:",
     "vitest": "catalog:",
-    "@types/ws": "catalog:"
+    "@types/ws": "catalog:",
+    "@types/semver": "catalog:"
   }
 }

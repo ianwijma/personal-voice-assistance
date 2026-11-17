@@ -13,6 +13,12 @@ export interface HealthService {
   readonly info: () => HealthInfo
   /** Run a check; a check already running is joined, not repeated. Never fails. */
   readonly check: Effect.Effect<void>
+  /**
+   * Start a check in the background ("Check again") and return at once: `info()` says `checking` from this moment,
+   * and the outcome reaches admin pages as `health`. A check can take longer than a page waits for an answer (a slow
+   * probe, a module that now starts), so the request is answered when it has started, not when it ends.
+   */
+  readonly begin: () => void
   /** Called after every change of `info`. Returns an unsubscribe function. */
   readonly subscribe: (listener: (info: HealthInfo) => void) => () => void
 }
@@ -24,6 +30,8 @@ export interface HealthServiceOptions {
   /** The core checks (serve mode: without the port). */
   readonly core: Effect.Effect<ReadonlyArray<Issue>>
   readonly now?: () => number
+  /** Runs a background effect (serve mode's request runner); `begin` uses it. */
+  readonly fork: (effect: Effect.Effect<void>) => void
 }
 
 export const makeHealthService = (options: HealthServiceOptions): HealthService => {
@@ -65,24 +73,30 @@ export const makeHealthService = (options: HealthServiceOptions): HealthService 
     options.host.issues.set("core", core)
   }).pipe(Effect.catchCause((cause) => Effect.logWarning("The health check failed", cause)))
 
-  const check = Effect.suspend(() => {
-    if (checking !== undefined) return Deferred.await(checking)
-    return Effect.gen(function*() {
-      const done = yield* Deferred.make<void>()
-      checking = done
+  /** Mark a check as running (synchronously), and the work that ends it. */
+  const open = (): Effect.Effect<void> => {
+    const done = Deferred.makeUnsafe<void>()
+    checking = done
+    changed()
+    return run.pipe(Effect.ensuring(Effect.sync(() => {
+      checking = undefined
+      checkedAt = now()
       changed()
-      yield* run.pipe(Effect.ensuring(Effect.sync(() => {
-        checking = undefined
-        checkedAt = now()
-        changed()
-        Deferred.doneUnsafe(done, Effect.void)
-      })))
-    })
-  })
+      Deferred.doneUnsafe(done, Effect.void)
+    })))
+  }
+
+  const check = Effect.suspend(() => (checking !== undefined ? Deferred.await(checking) : open()))
+
+  const begin = () => {
+    if (checking !== undefined) return
+    options.fork(open())
+  }
 
   return {
     info,
     check,
+    begin,
     subscribe: (listener) => {
       listeners.add(listener)
       return () => listeners.delete(listener)

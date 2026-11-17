@@ -5,10 +5,11 @@ import { assert, describe, it } from "@effect/vitest"
 import { Effect, Fiber, Logger, Stream } from "effect"
 import { TestClock } from "effect/testing"
 import { defineAgent, type FieldActionHandler } from "../src/ModuleContributions.ts"
-import { defineModule, type ModuleDefinition } from "../src/ModuleDefinition.ts"
+import { defineModule, type ModuleDefinition, ModuleStartError } from "../src/ModuleDefinition.ts"
 import { makeModuleHost, readOnlyPersistence } from "../src/ModuleHost.ts"
 import type { ModuleRoute } from "../src/ModuleRoutes.ts"
 import { Setting } from "../src/Settings.ts"
+import { CurrentTurn, type TurnContext } from "../src/TurnContext.ts"
 
 const advance = (millis: number) => Effect.andThen(Effect.repeat(Effect.yieldNow, { times: 50 }), TestClock.adjust(millis))
 
@@ -479,3 +480,89 @@ const refusedRoutes = (routes: ReadonlyArray<ModuleRoute>) =>
     assert.deepStrictEqual(host.routes(), [])
     return host.modules()[0]!.error ?? ""
   })
+
+// ---------------------------------------------------------------------------------------------------------------------
+// After merging P1's lifecycle (generations, one switch): routes belong to the published generation only, and module
+// code the host starts never sees the turn of whoever triggered it.
+
+describe("routes and field actions in P1's lifecycle", () => {
+  const asA: TurnContext = { turnId: 1, conversationId: "c1", assistantId: "a", deviceId: "d", source: "voice" }
+
+  it.effect("a field action pressed inside a turn runs outside it", () =>
+    Effect.gen(function*() {
+      const seen: Array<unknown> = []
+      const mod = defineModule({
+        id: "turnless",
+        name: "Turnless",
+        description: "Looks for a turn",
+        settings: { look: Setting.action({ label: "Look", buttonLabel: "Look" }) },
+        fieldActions: {
+          look: () =>
+            Effect.gen(function*() {
+              seen.push(yield* CurrentTurn)
+              return { ok: true, text: "looked" }
+            })
+        },
+        start: () => Effect.succeed({})
+      })
+      const host = yield* hostOf([mod])
+      yield* Effect.provideService(host.fieldAction("turnless", "look"), CurrentTurn, asA)
+      assert.deepStrictEqual(seen, [undefined])
+    }))
+
+  const generational = (probe: { closed: Array<string>; badRoute: boolean; failInstance: boolean }) =>
+    defineModule({
+      apiVersion: 2,
+      id: "gen",
+      name: "Gen",
+      description: "Generations",
+      settings: { word: Setting.text({ label: "Word", default: "a" }) },
+      shared: ({ settings }) =>
+        Effect.gen(function*() {
+          const word = String(settings.word)
+          yield* Effect.addFinalizer(() => Effect.sync(() => probe.closed.push(word)))
+          const route: ModuleRoute = probe.badRoute
+            ? { method: "GET", path: "x", handler: ok }
+            : { method: "GET", path: "x", guards: ["lan"], handler: ok, description: word }
+          return { value: word, routes: [route] }
+        }),
+      start: () => (probe.failInstance ? Effect.fail(new ModuleStartError({ message: "no" })) : Effect.succeed({}))
+    })
+
+  it.effect("a new generation's routes replace the old ones at the switch; the old scope closes after the grace period", () =>
+    Effect.gen(function*() {
+      const probe = { closed: [] as Array<string>, badRoute: false, failInstance: false }
+      const host = yield* hostOf([generational(probe)], { gen: {} })
+      yield* host.startEnabled
+      const first = host.routes()
+      assert.deepStrictEqual(first.map((r) => r.route.description), ["a"])
+      assert.isTrue((yield* host.configure("gen", { values: { word: "b" }, secrets: {} })).ok)
+      const second = host.routes()
+      assert.deepStrictEqual(second.map((r) => r.route.description), ["b"])
+      assert.notStrictEqual(second[0]!.scope, first[0]!.scope)
+      assert.deepStrictEqual(probe.closed, [])
+      yield* advance(10_000)
+      assert.deepStrictEqual(probe.closed, ["a"])
+    }))
+
+  it.effect("a new generation with a bad route, or whose instance fails, changes nothing: the old routes stay published", () =>
+    Effect.gen(function*() {
+      const probe = { closed: [] as Array<string>, badRoute: false, failInstance: false }
+      const host = yield* hostOf([generational(probe)], { gen: {} })
+      yield* host.startEnabled
+      const before = host.routes()
+      probe.badRoute = true
+      const refusedRoute = yield* host.configure("gen", { values: { word: "b" }, secrets: {} })
+      assert.isFalse(refusedRoute.ok)
+      assert.match(refusedRoute.ok ? "" : refusedRoute.error.message, /has no guard/)
+      assert.strictEqual(host.routes()[0]!.scope, before[0]!.scope)
+      // The candidate shared part was closed at once (never published).
+      assert.deepStrictEqual(probe.closed, ["b"])
+      probe.badRoute = false
+      probe.failInstance = true
+      assert.isFalse((yield* host.configure("gen", { values: { word: "c" }, secrets: {} })).ok)
+      assert.strictEqual(host.routes()[0]!.scope, before[0]!.scope)
+      assert.deepStrictEqual(host.routes().map((r) => r.route.description), ["a"])
+      assert.deepStrictEqual(probe.closed, ["b", "c"])
+    }))
+})

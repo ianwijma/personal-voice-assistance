@@ -6,6 +6,7 @@ import {
   blankAssistantBody,
   deepEqual,
   hearingModelNames,
+  identityOnStart,
   listJoin,
   type Outcome,
   plural,
@@ -131,6 +132,9 @@ export function NewAssistantWizard() {
   }
   const next = () => go(Math.min(LAST, step + 1))
 
+  /** The template whose name, purpose and Handles were filled in last (they are replaced, not kept, when it changes). */
+  const filledFrom = useRef<AssistantTemplate | undefined>(undefined)
+
   /** Start from: a copy takes the prompt, language model, hearing, voice and modules; the typed name, purpose and Handles stay. */
   const chooseFrom = (id: string) => {
     if (creating.current) return
@@ -141,12 +145,15 @@ export function NewAssistantWizard() {
     const source = id === BLANK_START ? undefined : assistants.find((x) => x.id === id)
     const fresh = blank()
     const body = source === undefined ? toBody(fresh) : toBody(source)
-    draft.replace({ ...a, ...body, name: a.name, purpose: a.purpose, handles: a.handles, on: true, confirmActions: "off" })
+    // What only the previous template filled in goes; what the owner typed stays.
+    const identity = identityOnStart(a, filledFrom.current, undefined)
+    filledFrom.current = undefined
+    draft.replace({ ...a, ...body, ...identity, on: true, confirmActions: "off" })
   }
 
   /**
    * Start from a template: good defaults with the template's prompt and its modules on (the others off); its name,
-   * purpose and Handles fill only what has not been typed. Nothing else of the template is kept once it is created.
+   * purpose and Handles fill what has not been typed (an earlier template's values count as not typed). Nothing else of the template is kept once it is created.
    */
   const fromTemplate = (t: AssistantTemplate | undefined) => {
     if (t === undefined) return
@@ -154,12 +161,13 @@ export function NewAssistantWizard() {
     const on = new Set(t.modules)
     const mods = Object.fromEntries(capability.map((m) => [m.id, { on: on.has(m.id), offTools: [] }]))
     setSuggested(t.suggestedPhrases?.[0] ?? "")
+    // Typed values stay; empty ones, and those the previous template filled in, take this template's.
+    const identity = identityOnStart(a, filledFrom.current, t)
+    filledFrom.current = t
     draft.replace({
       ...a,
       ...fresh,
-      name: a.name.trim() === "" ? t.name : a.name,
-      purpose: a.purpose.trim() === "" ? t.purpose ?? "" : a.purpose,
-      handles: a.handles.trim() === "" ? t.handles ?? "" : a.handles,
+      ...identity,
       prompt: t.prompt,
       modules: mods,
       on: true,

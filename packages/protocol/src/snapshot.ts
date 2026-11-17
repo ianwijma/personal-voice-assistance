@@ -47,8 +47,11 @@ export type ModuleState = typeof ModuleState.Type
  */
 export const ToolRisk = Schema.Literals(["read", "change", "message", "money", "security"])
 export type ToolRisk = typeof ToolRisk.Type
-/** Protocol 9: whose a result is (docs/MODULES-PLAN.md §2 row 8): `household` (default) or `personal` (one person's). */
-export const ToolSensitivity = Schema.Literals(["household", "personal"])
+/**
+ * Protocol 9: whose a result is (docs/MODULES-PLAN.md §2 row 8): `household` (default), `personal` (one person's; the
+ * module names the owner, or it is unknown), or `per-result` (the module decides for each result).
+ */
+export const ToolSensitivity = Schema.Literals(["household", "personal", "per-result"])
 export type ToolSensitivity = typeof ToolSensitivity.Type
 /** Protocol 9: how long a call usually takes: `instant` (< 50 ms), `quick` (< 1 s), `slow` (seconds), `background`. Default `quick`. */
 export const ToolLatency = Schema.Literals(["instant", "quick", "slow", "background"])
@@ -61,6 +64,11 @@ export const ToolInfo = Schema.Struct({
   speculative: Schema.Boolean,
   /** Protocol 9: the declared or inferred class; absent when it depends on the input (or from an older server). */
   risk: Schema.optionalKey(ToolRisk),
+  /**
+   * Protocol 9: every class a call can have: `[risk]` for a fixed class, the declared list when the class depends on
+   * the input (a cover tool: `change` and `security`). A later policy leaves a tool out of a list by these.
+   */
+  risks: Schema.optionalKey(Schema.Array(ToolRisk)),
   sensitivity: Schema.optionalKey(ToolSensitivity),
   latency: Schema.optionalKey(ToolLatency)
 })

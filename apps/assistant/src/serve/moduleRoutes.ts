@@ -4,6 +4,7 @@ import {
   DEFAULT_ROUTE_TIMEOUT_MS,
   matchRoutePath,
   type ModuleHost,
+  outsideTurns,
   type ModuleRoute,
   type PublishedRoute,
   type RouteRequest,
@@ -479,7 +480,8 @@ export const makeModuleRouter = (options: ModuleRouterOptions): ModuleRouter => 
       const answer = Effect.gen(function*() {
         // In the shared part's scope: when that part is closed (after a restart's grace period) the handler is
         // interrupted (503), so it never runs on with its resources gone.
-        const fiber = yield* Effect.forkIn(Effect.suspend(() => current.handler(request)), live.scope)
+        // Outside any turn or job, whatever the serving fiber carries (module code the host starts never sees one).
+        const fiber = yield* Effect.forkIn(outsideTurns(Effect.suspend(() => current.handler(request))), live.scope)
         const exit = yield* Fiber.await(fiber).pipe(
           Effect.timeoutOption(timeoutMs),
           Effect.onInterrupt(() => Effect.sync(() => fiber.interruptUnsafe()))

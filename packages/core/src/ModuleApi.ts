@@ -110,7 +110,10 @@ export const isOptionalRequirement = (r: Requirement): boolean => r.optional ===
 // ---------------------------------------------------------------------------------------------------------------------
 // Health (§C.5)
 
-/** What a module's `health()` receives: its shared settings (`undefined` when they are not valid) and whether it runs. */
+/**
+ * What a module's `health()` receives: its shared settings (`undefined` when they are not valid) and whether it runs:
+ * an instance runs, or its `shared` part runs (a module demanded only through another module's `uses`).
+ */
 export interface HealthContext<A> {
   readonly settings: A | undefined
   readonly running: boolean
@@ -137,6 +140,23 @@ export interface ModuleTemplate {
   readonly handles?: string
   readonly modules?: ReadonlyArray<string>
   readonly suggestedPhrases?: ReadonlyArray<string>
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Declared actions (§C.4)
+
+/**
+ * An action a module offers, declared on the manifest (`ModuleDefinition.declaredActions`) so it stays known while the
+ * module is `unavailable` (never started): the intent agent can still recognise "play jazz" as the music module's,
+ * and core answers with the module's "not set up" line instead of running some other action. Only what a decision
+ * model needs to recognise it; the running module's own actions (from `start`) are what runs. `id` is the action's
+ * id (`/^[a-z][a-z0-9_]{0,39}$/`).
+ */
+export interface DeclaredAction {
+  readonly id: string
+  readonly label: string
+  readonly description: string
+  readonly examples?: ReadonlyArray<string>
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -275,6 +295,8 @@ export interface CatalogAction {
   readonly confirm: boolean
   /** The declared or inferred class; `undefined` when it depends on the values. */
   readonly risk: ToolRisk | undefined
+  /** Every class a run can have (`[risk]`, or the declared list when it depends on the values). */
+  readonly risks: ReadonlyArray<ToolRisk>
   readonly sensitivity: ToolSensitivity
   readonly latency: ToolLatency
 }
@@ -283,8 +305,20 @@ export type ActionRunResult =
   | { readonly ok: true; readonly say?: string }
   | {
     readonly ok: false
-    /** `refused`: the execution gateway did not admit it (the module or the action is off for the assistant, or a later policy). */
-    readonly code: "unknown_module" | "not_running" | "unknown_action" | "invalid_params" | "needs_confirmation" | "refused" | "failed"
+    /**
+     * `refused`: the execution gateway did not admit it (the module or the action is off for the assistant, no turn or
+     * job to run for, or a later policy). `unavailable`: the module cannot run on this server; `message` is its
+     * "not set up" line.
+     */
+    readonly code:
+      | "unknown_module"
+      | "not_running"
+      | "unavailable"
+      | "unknown_action"
+      | "invalid_params"
+      | "needs_confirmation"
+      | "refused"
+      | "failed"
     readonly message: string
   }
 
@@ -313,9 +347,10 @@ export interface ModuleHostApi {
   /** Every value contributed under `key` by the demanded modules' `shared` parts now, in catalog order. */
   readonly contributions: <T>(key: ContributionKey<T>) => ReadonlyArray<T>
   /**
-   * The turn's action catalogue (`CurrentTurn`): the actions of the modules the calling assistant has on, from the
-   * instance it uses, without those it switched off. Outside a turn (or a turn without an assistant): the actions of
-   * every running module.
+   * The turn's action catalogue: the actions of the modules the calling assistant has on (`CurrentTurn`, or a job
+   * made for an assistant), from the instance it uses, without those it switched off; an unavailable module's
+   * declared actions are listed too (running one answers with its "not set up" line). The local principal of the
+   * CLI modes sees every running module's actions; in serve mode a caller with no turn or job sees none.
    */
   readonly actions: {
     readonly list: Effect.Effect<ReadonlyArray<CatalogAction>>
@@ -327,13 +362,26 @@ export interface ModuleHostApi {
     readonly run: (request: ActionRunRequest) => Effect.Effect<ActionRunResult>
   }
   /**
-   * Ask the host to start this module's instances again with the same settings (from `start`: that instance; from
-   * `shared`: every instance), so a tool list that changed at run time (an MCP server's) applies from the next turn.
-   * The new instance is published once it has started; the old one serves until then and keeps its grace period.
-   * If the new start fails, the old instance keeps serving and the Health page says why. Returns at once; repeated
-   * calls before the restart starts count once.
+   * Ask the host to start this module again with the settings it runs with (kept from its start, so a vault locked
+   * since does not stop it): from `start`, that instance; from `shared`, a new generation (a new shared part and
+   * every instance, switched to at once). A tool list that changed at run time (an MCP server's) then applies from
+   * the next turn. The old one serves until the new one has started, then keeps its grace period. If the new start
+   * fails, the old one keeps serving and the Health page says why. Returns at once; repeated calls before the
+   * restart starts count once. Runs outside any turn: the new start never sees the caller's `CurrentTurn`.
    */
   readonly requestRestart: (reason: string) => Effect.Effect<void>
+  /**
+   * A program the module `requires` failed to start with ENOENT or EACCES (`isMissingProgramError`): the host marks
+   * it missing at once and judges every module again (it becomes `unavailable` and Health says why), without probing
+   * on the turn path. A program the module does not require is ignored. Returns at once.
+   */
+  readonly reportMissingProgram: (tool: string) => Effect.Effect<void>
+}
+
+/** Whether an error from spawning a program means it is not there or cannot be run (`ENOENT`, `EACCES`). */
+export const isMissingProgramError = (error: unknown): boolean => {
+  const code = typeof error === "object" && error !== null ? (error as { readonly code?: unknown }).code : undefined
+  return code === "ENOENT" || code === "EACCES"
 }
 
 /**
@@ -351,4 +399,12 @@ export interface ModuleServicesV2 {
  */
 export interface SharedContext<A> extends ModuleServicesV2 {
   readonly settings: Partial<A>
+  /**
+   * The module's effective settings for an assistant: its own values (`overridable` fields) over the shared ones this
+   * shared part started with; with no assistant (or one that does not have the module on), the shared values. Read
+   * live, per call: shared code that acts for a caller asks with the caller's assistant (`CurrentTurn`), so a
+   * weather briefing uses the asking assistant's place. `undefined` when those values are not valid (a required
+   * field with no value for that assistant).
+   */
+  readonly settingsFor: (assistantId: string | undefined) => A | undefined
 }
