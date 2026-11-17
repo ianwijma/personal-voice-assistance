@@ -112,6 +112,8 @@ import { makeAssistants } from "./assistants.ts"
 import { makeSessionHub, type SessionHub } from "./SessionHub.ts"
 import { DataDirConfig, KEYS_LOCKED_MESSAGE, loadSettingsStore, type SettingsStore, SettingsStoreError } from "./SettingsStore.ts"
 import { makeApi } from "./api.ts"
+import { isModuleRoutePath, makeModuleRouter } from "./moduleRoutes.ts"
+import { makeRouteTokens } from "./RouteTokens.ts"
 import { makeAssistantVoice } from "./AssistantVoice.ts"
 import { type Favourites, makeFavourites } from "./Favourites.ts"
 import { makeVoiceCatalog, type VoiceCatalog, type VoiceCatalogOptions } from "./VoiceCatalog.ts"
@@ -310,8 +312,11 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
     // Module API v2: what the modules need is probed before any starts (concurrently, 5 s at most; never on a turn).
     const checker = makeRequirementChecker({ dataDir: options.dataDir })
     yield* checker.probeCatalog(catalog)
+    // P3: module route tokens, with the module secrets (in the vault once there is one).
+    const routeTokens = makeRouteTokens({ store, locked: () => vault.state() === "locked" })
     // Capabilities run for the assistants that switch them on (`moduleDemand`, below; read from startEnabled on).
     const host = yield* makeModuleHost({
+      routeTokens,
       catalog,
       persistence: store.modulePersistence,
       env,
@@ -1369,7 +1374,10 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       ...(options.modelListTimeoutMs !== undefined ? { listTimeoutMs: options.modelListTimeoutMs } : {}),
       ...(options.modelCatalogNow !== undefined ? { now: options.modelCatalogNow } : {})
     })
+    // P3: module HTTP routes under /api/modules/ (docs/UI-AND-MODULES.md §1.11), and their admin view in the API.
+    const moduleRouter = makeModuleRouter({ host, admin, tokens: routeTokens, services })
     const api = makeApi({
+      moduleRoutes: moduleRouter,
       admin,
       catalog: voiceCatalog,
       favourites,
@@ -1392,7 +1400,7 @@ export const startServe = (options: ServeOptions): Effect.Effect<ServeHandle, Ht
       tls: options.tls,
       crossOriginIsolation: options.crossOriginIsolation ?? true,
       hub: hubNow,
-      api,
+      api: (req, res) => (isModuleRoutePath(req.url) ? moduleRouter.handle(req, res) : api(req, res)),
       ...(options.pingIntervalMs !== undefined ? { pingIntervalMs: options.pingIntervalMs } : {})
     })
 

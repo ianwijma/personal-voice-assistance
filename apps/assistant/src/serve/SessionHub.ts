@@ -26,6 +26,7 @@ import { Effect } from "effect"
 import type { AccessPolicy } from "./access.ts"
 import type { AdminSessions, SessionEndReason } from "./AdminSessions.ts"
 import type { AssistantResult, Assistants } from "./assistants.ts"
+import { type ActionOutcome, moduleActionOutcome } from "./moduleAction.ts"
 import type { Engine } from "./Engine.ts"
 import type { HealthService } from "./health.ts"
 import type { EnvMover } from "./envSettings.ts"
@@ -339,7 +340,7 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
       if (!r.ok) sendVault(client)
     }))
 
-  const result = (client: Client, requestId: RequestId, outcome: HostResult | DeviceResult | AssistantResult) =>
+  const result = (client: Client, requestId: RequestId, outcome: HostResult | DeviceResult | AssistantResult | ActionOutcome) =>
     send(
       client,
       outcome.ok
@@ -348,7 +349,8 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
           requestId,
           ok: true,
           ...("assistantId" in outcome && outcome.assistantId !== undefined ? { assistantId: outcome.assistantId } : {}),
-          ...("rev" in outcome && outcome.rev !== undefined ? { rev: outcome.rev } : {})
+          ...("rev" in outcome && outcome.rev !== undefined ? { rev: outcome.rev } : {}),
+          ...("action" in outcome ? { action: outcome.action } : {})
         }
         : { type: "result", requestId, ok: false, error: outcome.error }
     )
@@ -362,8 +364,8 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
   const limited = (
     client: Client,
     requestId: RequestId,
-    work: Effect.Effect<HostResult | DeviceResult | AssistantResult, never>,
-    after?: (r: HostResult | DeviceResult | AssistantResult) => void
+    work: Effect.Effect<HostResult | DeviceResult | AssistantResult | ActionOutcome, never>,
+    after?: (r: HostResult | DeviceResult | AssistantResult | ActionOutcome) => void
   ) => {
     if (client.pending >= maxPendingPerConnection || pendingTotal >= maxPendingTotal) {
       return result(client, requestId, failure("busy", "Too many changes at once; try again in a moment"))
@@ -888,6 +890,10 @@ export const makeSessionHub = (options: HubOptions): SessionHub => {
       case "module.configure":
         if (!allowed(client, message.requestId)) return
         return limited(client, message.requestId, options.host.configure(message.moduleId, message.patch))
+      case "module.action":
+        // P3: a button of a module's form ("Test"); its own 8 s limit and double-press guard are the host's.
+        if (!allowed(client, message.requestId)) return
+        return limited(client, message.requestId, moduleActionOutcome(options.host, message))
       case "settings.update": {
         if (!allowed(client, message.requestId)) return
         let saved: { reload: boolean; path: string } = { reload: false, path: "" }

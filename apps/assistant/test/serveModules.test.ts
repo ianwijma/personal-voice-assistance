@@ -256,7 +256,10 @@ describe("Home Assistant in the app (WP-12c)", () => {
       ["token", false],
       ["domains", true],
       ["aliases", false],
-      ["timeoutMs", false]
+      ["timeoutMs", false],
+      ["server", false],
+      ["lists", false],
+      ["test", false]
     ])
     const configured = await request(admin, { type: "module.configure", moduleId: "home-assistant", patch: { values: { baseUrl: ha.url }, secrets: { token: ha.token } } })
     expect(configured.ok).toBe(true)

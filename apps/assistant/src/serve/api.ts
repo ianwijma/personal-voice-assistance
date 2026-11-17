@@ -5,6 +5,7 @@ import {
   type ApiErrorBody,
   FavouriteRequest,
   MAX_API_BODY_BYTES,
+  MintRouteTokenRequest,
   type ModelRefJson,
   ModelRequest,
   modelKey,
@@ -23,6 +24,7 @@ import type { Favourites } from "./Favourites.ts"
 import type { Jobs } from "./jobs.ts"
 import type { ModelCatalog } from "./ModelCatalog.ts"
 import type { ModelFavourites } from "./ModelFavourites.ts"
+import type { ModuleRouter } from "./moduleRoutes.ts"
 import type { Models } from "./models.ts"
 import { ApiFailure, type VoiceCatalog } from "./VoiceCatalog.ts"
 
@@ -49,6 +51,8 @@ export interface ApiOptions {
   /** Origins allowed besides the server's own. */
   readonly allowedOrigins: ReadonlyArray<string>
   readonly scheme: "http" | "https"
+  /** P3: the admin view of module routes and their tokens (`/api/module-routes`). Absent: 404. */
+  readonly moduleRoutes?: ModuleRouter
 }
 
 /** A JSON answer, or a WAV body. */
@@ -150,6 +154,27 @@ export const makeApi = (options: ApiOptions) => {
       const method = req.method ?? "GET"
       const only = (...allowed: Array<string>) => (allowed.includes(method) ? Effect.void : Effect.fail(methodNotAllowed(allowed.join(", "))))
 
+      // P3 (docs/UI-AND-MODULES.md §1.11): what the modules expose, their recent calls, and their route tokens.
+      const routesMatch = /^module-routes(?:\/([a-z][a-z0-9-]{0,39})\/tokens(?:\/([a-f0-9]{8,32}))?)?$/.exec(path)
+      if (routesMatch !== null && options.moduleRoutes !== undefined) {
+        const routes = options.moduleRoutes
+        const [, moduleId, tokenId] = routesMatch
+        const tokenFailure = (e: { readonly reason: string; readonly message: string }) =>
+          fail(e.reason === "locked" || e.reason === "unavailable" ? 503 : e.reason === "invalid" ? 400 : e.reason === "limit" ? 409 : 500, e.reason === "locked" ? "locked" : e.reason, e.message)
+        if (moduleId === undefined) {
+          yield* only("GET")
+          return json(200, yield* routes.view(query.get("module") ?? undefined))
+        }
+        if (tokenId === undefined) {
+          yield* only("POST")
+          const body = yield* decode(MintRouteTokenRequest, yield* readJson(req))
+          return json(201, yield* routes.mint(moduleId, body.name, body.label).pipe(Effect.mapError(tokenFailure)))
+        }
+        yield* only("DELETE")
+        const revoked = yield* routes.revoke(moduleId, tokenId).pipe(Effect.mapError(tokenFailure))
+        if (!revoked) return yield* fail(404, "not_found", "There is no such token (it may have been revoked already)")
+        return json(200, { revoked: true })
+      }
       if (path === "voice-providers") {
         yield* only("GET")
         return json(200, { providers: yield* catalog.providers })

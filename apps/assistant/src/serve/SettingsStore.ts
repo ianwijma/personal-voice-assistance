@@ -399,7 +399,16 @@ export interface SettingsStore {
   ) => Effect.Effect<StoredDevice, SettingsStoreError | EntitySaveError>
   /** The module host's view of the store. */
   readonly modulePersistence: ModulePersistence
+  /**
+   * P3: replace the module route tokens (`RouteTokens.ts`), kept with the module secrets under the entry
+   * `ROUTE_TOKENS_ENTRY` (not a module id), so they live in the key vault once there is one. `change` maps the
+   * committed entry to the new one. Refused while the vault is locked.
+   */
+  readonly saveRouteTokens: (change: (committed: Readonly<Record<string, string>>) => Readonly<Record<string, string>>) => Effect.Effect<void, SettingsStoreError>
 }
+
+/** P3: where route tokens are kept among the module secrets; never a module id (they cannot contain "@"). */
+export const ROUTE_TOKENS_ENTRY = "@route-tokens"
 
 export interface LoadOptions {
   /** Never write (CLI modes): a corrupt file is reported but left in place, and saves are ignored. */
@@ -1335,7 +1344,15 @@ export const loadSettingsStore = (directory: string, options: LoadOptions = {}):
         modulePersistence: {
           initial: { modules: settings.modules, secrets: current().modules },
           save: saveModule
-        }
+        },
+        saveRouteTokens: (change) =>
+          persistSettings("the route tokens", (committed) => ({
+            settings: committed.settings,
+            secrets: {
+              ...committed.secrets,
+              modules: withSecrets(committed.secrets.modules, ROUTE_TOKENS_ENTRY, change(committed.secrets.modules[ROUTE_TOKENS_ENTRY] ?? {}))
+            }
+          }))
       }
       return store
     },
