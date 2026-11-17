@@ -1,6 +1,7 @@
-import { readNumber } from "./Numbers.ts"
+import { dict } from "./Dict.ts"
+import { nlWholeWord, numbersWhole } from "./Numbers.ts"
 import { ambiguous, notUnderstood, ok, type ClockTime, type Language, type Parsed } from "./Result.ts"
-import { sliceText, tokenize, type Tok } from "./Tokens.ts"
+import { accountedFor, onlyWords, range, sliceText, tokenize, type Tok } from "./Tokens.ts"
 
 /** A clock time said aloud. `guessed`: no am/pm was said and the band chose; `alternatives`: other readings inside the band. */
 export interface TimeOfDay extends ClockTime {
@@ -19,11 +20,15 @@ export type Period = "am" | "pm" | "morning" | "afternoon" | "evening" | "night"
 
 /** The time as read, before am/pm is settled. */
 export interface TimeMatch {
-  /** 0–24 as said. */
+  /** 0–24 as said; 24 only as "24:00" or "24" (the end of the day). */
   readonly hour: number
   readonly minute: number
   /** 1–12 said without a marker: could be morning or evening. */
   readonly open: boolean
+  /** Only a number was said ("seven", "7"): no "o'clock", "uur", minutes, am/pm or part of the day. */
+  readonly bare: boolean
+  /** The word "midnight" / "middernacht": with a date it can mean the start or the end of that day. */
+  readonly midnightWord: boolean
   readonly period?: Period
   readonly next: number
 }
@@ -38,192 +43,256 @@ export const bandOf = (o: TimeOptions | undefined): { from: number; to: number }
   to: toMinutes(o?.band?.to ?? "21:00")
 })
 
-const periodWords: Record<Language, Record<string, Period>> = {
-  en: { morning: "morning", afternoon: "afternoon", evening: "evening", night: "night", tonight: "night" },
-  nl: {
-    ochtend: "morning", ochtends: "morning", morgens: "morning", voormiddag: "morning", vroeg: "morning",
-    middag: "afternoon", middags: "afternoon", namiddag: "afternoon", avond: "evening", avonds: "evening", nacht: "night", nachts: "night"
-  }
-}
+const enPeriodNouns = dict<Period>({ morning: "morning", afternoon: "afternoon", evening: "evening", night: "night" })
+const nlSPeriods = dict<Period>({ ochtends: "morning", morgens: "morning", middags: "afternoon", avonds: "evening", nachts: "night" })
+const nlPeriodNouns = dict<Period>({ ochtend: "morning", morgen: "morning", voormiddag: "morning", middag: "afternoon", namiddag: "afternoon", avond: "evening", nacht: "night" })
+
+/**
+ * The part of the day said right after a clock time: "am", "pm", "in the morning", "in the afternoon", "in the evening", "at night";
+ * Dutch "'s ochtends", "'s morgens", "'s middags", "'s avonds", "'s nachts", "in de ochtend", "in de avond", … Nothing else.
+ */
 export const periodAt = (toks: ReadonlyArray<Tok>, i: number, language: Language): { period: Period; next: number } | undefined => {
   const w = toks[i]?.norm
   if (w === undefined) return undefined
   if (w === "am" || w === "pm") return { period: w, next: i + 1 }
-  let k = i
+  const n1 = toks[i + 1]?.norm ?? ""
+  const n2 = toks[i + 2]?.norm ?? ""
   if (language === "en") {
-    if (w === "in" && toks[k + 1]?.norm === "the") k += 2
-    else if (w === "at" && toks[k + 1]?.norm === "night") return { period: "night", next: k + 2 }
-    else if (w === "this") k += 1
-    else return undefined
-  } else {
-    if (w === "s") k += 1
-    else if (w === "in" && toks[k + 1]?.norm === "de") k += 2
-    else if (w === "van" && toks[k + 1]?.norm === "de") k += 2
+    if (w === "in" && n1 === "the" && enPeriodNouns[n2] !== undefined && n2 !== "night") return { period: enPeriodNouns[n2]!, next: i + 3 }
+    if (w === "at" && n1 === "night") return { period: "night", next: i + 2 }
+    return undefined
   }
-  const p = toks[k] === undefined ? undefined : periodWords[language][toks[k]!.norm]
-  return p === undefined ? undefined : { period: p, next: k + 1 }
+  if (w === "s" && nlSPeriods[n1] !== undefined) return { period: nlSPeriods[n1]!, next: i + 2 }
+  if (w === "in" && n1 === "de" && nlPeriodNouns[n2] !== undefined) return { period: nlPeriodNouns[n2]!, next: i + 3 }
+  return undefined
 }
 
-interface Hour {
+// ---- hours and minutes: fixed shapes, not the open number grammar ("seven thirty" is a time, not a number) ---------------------
+
+const enSmall = dict<number>({
+  one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9, ten: 10, eleven: 11, twelve: 12,
+  thirteen: 13, fourteen: 14, fifteen: 15, sixteen: 16, seventeen: 17, eighteen: 18, nineteen: 19
+})
+const enTens = dict<number>({ twenty: 20, thirty: 30, forty: 40, fifty: 50 })
+
+interface Read {
   readonly value: number
   readonly next: number
+  /** The reading says the hour of a 24-hour clock (0, 13–24, a leading zero, "oh nine"). */
   readonly exact: boolean
 }
-const hourAt = (toks: ReadonlyArray<Tok>, k: number, language: Language): Hour | undefined => {
+
+/** English 0–59 in words at `k`: "seven", "nineteen", "twenty", "forty five". Every way to read it (longest first). */
+const enWords = (toks: ReadonlyArray<Tok>, k: number): Array<{ value: number; next: number }> => {
+  const w = toks[k]?.norm ?? ""
+  const out: Array<{ value: number; next: number }> = []
+  const t = enTens[w]
+  if (t !== undefined) {
+    const u = enSmall[toks[k + 1]?.norm ?? ""]
+    if (u !== undefined && u <= 9) out.push({ value: t + u, next: k + 2 })
+    out.push({ value: t, next: k + 1 })
+  } else if (enSmall[w] !== undefined) out.push({ value: enSmall[w]!, next: k + 1 })
+  return out
+}
+
+/** The hours that may start at `k` (longest first): digits 0–24, a word 1–24, "zero", "oh nine". */
+const hoursAt = (toks: ReadonlyArray<Tok>, k: number, language: Language): Array<Read> => {
   const t = toks[k]
-  if (t === undefined) return undefined
-  if (language === "en") {
-    if (t.norm === "noon" || t.norm === "midday") return { value: 12, next: k + 1, exact: true }
-    if (t.norm === "midnight") return { value: 0, next: k + 1, exact: true }
-  } else if (t.norm === "middernacht") return { value: 0, next: k + 1, exact: true }
+  if (t === undefined) return []
   if (/^\d{1,2}$/.test(t.norm)) {
     const v = Number(t.norm)
-    return v > 24 ? undefined : { value: v, next: k + 1, exact: v === 0 || v > 12 || (t.norm.length === 2 && t.norm.startsWith("0")) }
+    return v > 24 ? [] : [{ value: v, next: k + 1, exact: v === 0 || v > 12 || (t.norm.length === 2 && t.norm.startsWith("0")) }]
   }
-  const n = readNumber(toks, k, language)
-  if (n === undefined || n.digits || !Number.isInteger(n.value) || n.value > 24) return undefined
-  return { value: n.value, next: n.next, exact: n.value === 0 || n.value > 12 }
+  if (language === "en") {
+    if (t.norm === "zero") return [{ value: 0, next: k + 1, exact: true }]
+    if (t.norm === "oh") {
+      const u = enSmall[toks[k + 1]?.norm ?? ""]
+      return u !== undefined && u <= 9 ? [{ value: u, next: k + 2, exact: true }] : []
+    }
+    return enWords(toks, k).filter((r) => r.value >= 1 && r.value <= 24).map((r) => ({ ...r, exact: r.value > 12 }))
+  }
+  const v = nlWholeWord(t.norm)
+  return v === undefined || v > 24 ? [] : [{ value: v, next: k + 1, exact: v === 0 || v > 12 }]
+}
+/** An hour of a 12-hour clock (1–12) at `k`, as "half seven", "quarter past seven" and "kwart voor zeven" use. */
+const hour12At = (toks: ReadonlyArray<Tok>, k: number, language: Language): Read | undefined =>
+  hoursAt(toks, k, language).find((h) => h.value >= 1 && h.value <= 12 && h.next === k + 1 && !/^0/.test(toks[k]!.norm))
+
+/** The minutes after an hour: "thirty", "forty five", "oh five", "05", "30"; English "hundred" is :00 ("nineteen hundred"). */
+const minutesAfterHour = (toks: ReadonlyArray<Tok>, k: number, language: Language): Array<{ value: number; next: number }> => {
+  const t = toks[k]
+  if (t === undefined) return []
+  if (/^\d{2}$/.test(t.norm)) {
+    const v = Number(t.norm)
+    return v <= 59 ? [{ value: v, next: k + 1 }] : []
+  }
+  if (language === "en") {
+    if (t.norm === "hundred") return [{ value: 0, next: k + 1 }]
+    if (t.norm === "oh" || t.norm === "o") {
+      const u = enSmall[toks[k + 1]?.norm ?? ""]
+      return u !== undefined && u <= 9 ? [{ value: u, next: k + 2 }] : []
+    }
+    return enWords(toks, k).filter((r) => r.value >= 10 && r.value <= 59)
+  }
+  const v = nlWholeWord(t.norm)
+  return v !== undefined && v >= 1 && v <= 59 ? [{ value: v, next: k + 1 }] : []
 }
 
-const minuteWords = (toks: ReadonlyArray<Tok>, k: number, language: Language): { value: number; next: number } | undefined => {
+/** The minutes before "past" / "to" / "over" / "voor": 1–29 in words or digits, "a quarter", "quarter", "kwart", [minutes]. */
+const minutesBefore = (toks: ReadonlyArray<Tok>, k: number, language: Language): Array<{ value: number; next: number }> => {
   const w = toks[k]?.norm
-  if (w === undefined) return undefined
-  let value: number
-  let next: number
-  if (language === "en" && (w === "a" || w === "an") && toks[k + 1]?.norm === "quarter") { value = 15; next = k + 2 }
-  else if (w === "quarter" || w === "kwart") { value = 15; next = k + 1 }
+  if (w === undefined) return []
+  let found: Array<{ value: number; next: number }>
+  if (language === "en" && (w === "a" || w === "an") && toks[k + 1]?.norm === "quarter") found = [{ value: 15, next: k + 2 }]
+  else if (w === "quarter" || w === "kwart") found = [{ value: 15, next: k + 1 }]
+  else if (/^\d{1,2}$/.test(w) && !w.startsWith("0")) found = [{ value: Number(w), next: k + 1 }]
+  else if (language === "en") found = enWords(toks, k)
   else {
-    const n = readNumber(toks, k, language)
-    if (n === undefined || n.value < 1 || n.value > 29 || !Number.isInteger(n.value)) return undefined
-    value = n.value
-    next = n.next
+    const v = nlWholeWord(w)
+    found = v === undefined ? [] : [{ value: v, next: k + 1 }]
   }
-  const unit = toks[next]?.norm
-  if (unit === "minutes" || unit === "minute" || unit === "mins" || unit === "min" || unit === "minuten" || unit === "minuut") next++
-  return { value, next }
+  const unit: ReadonlySet<string> = language === "en" ? new Set(["minutes", "minute", "mins", "min"]) : new Set(["minuten", "minuut"])
+  // Without "minutes" only the counts a clock is read in: "five to eight", "twenty past seven". "seven to eight" and "two to three"
+  // are ranges, not 7:53 and 2:58.
+  const spoken: ReadonlySet<number> = new Set([5, 10, 15, 20, 25])
+  return found.filter((f) => f.value >= 1 && f.value <= 29)
+    .flatMap((f) => unit.has(toks[f.next]?.norm ?? "") ? [{ value: f.value, next: f.next + 1 }] : spoken.has(f.value) ? [f] : [])
 }
 
-/** hour (1–12 or 0/13–24 as said) minus one hour, keeping the 12-hour openness. */
-const hourBefore = (h: number): number => (h === 0 ? 23 : h === 1 ? 12 : h - 1)
+/** hour (1–12) minus one hour, keeping the 12-hour openness. */
+const hourBefore = (h: number): number => (h === 1 ? 12 : h - 1)
 
-const matchClockToken = (toks: ReadonlyArray<Tok>, k: number): { hour: number; minute: number; exact: boolean; next: number } | undefined => {
+const clockToken = (toks: ReadonlyArray<Tok>, k: number): { hour: number; minute: number; exact: boolean } | undefined => {
   const m = /^(\d{1,2})[:.](\d{2})$/.exec(toks[k]?.norm ?? "")
   if (m === null) return undefined
   const hour = Number(m[1])
   const minute = Number(m[2])
   if (hour > 24 || minute > 59 || (hour === 24 && minute > 0)) return undefined
-  return { hour: hour === 24 ? 0 : hour, minute, exact: hour === 0 || hour > 12 || (m[1]!.length === 2 && m[1]!.startsWith("0")), next: k + 1 }
+  return { hour, minute, exact: hour === 0 || hour > 12 || (m[1]!.length === 2 && m[1]!.startsWith("0")) }
 }
 
-const base = (hour: Hour, minute: number, next: number): Omit<TimeMatch, "period"> => ({ hour: hour.value, minute, open: !hour.exact, next })
+type Core = Omit<TimeMatch, "period" | "midnightWord"> & { readonly midnightWord?: boolean }
 
-const matchEn = (toks: ReadonlyArray<Tok>, i: number, bareOk: boolean): Omit<TimeMatch, "period"> | undefined => {
+/** Every clock reading that starts at `i`, in the order tried. */
+const coresEn = (toks: ReadonlyArray<Tok>, i: number): Array<Core> => {
   const w = toks[i]!.norm
-  const clock = matchClockToken(toks, i)
-  if (clock !== undefined) return { hour: clock.hour, minute: clock.minute, open: !clock.exact, next: clock.next }
-  // noon, midnight
-  const special = hourAt(toks, i, "en")
-  if (special !== undefined && (w === "noon" || w === "midday" || w === "midnight")) return base(special, 0, special.next)
+  const out: Array<Core> = []
+  const clock = clockToken(toks, i)
+  if (clock !== undefined) out.push({ hour: clock.hour, minute: clock.minute, open: !clock.exact, bare: false, next: i + 1 })
+  if (w === "noon" || w === "midday") out.push({ hour: 12, minute: 0, open: false, bare: false, next: i + 1 })
+  if (w === "midnight") out.push({ hour: 0, minute: 0, open: false, bare: false, midnightWord: true, next: i + 1 })
+  // [MINS] past|after|to|till|of HOUR, "half past HOUR"
+  const mins = w === "half" ? [{ value: 30, next: i + 1 }] : minutesBefore(toks, i, "en")
+  for (const m of mins) {
+    const c = toks[m.next]?.norm
+    const h = hour12At(toks, m.next + 1, "en")
+    if (h === undefined) continue
+    if (c === "past" || c === "after") out.push({ hour: h.value, minute: m.value, open: true, bare: false, next: h.next })
+    else if ((c === "to" || c === "till" || c === "of") && w !== "half") out.push({ hour: hourBefore(h.value), minute: 60 - m.value, open: true, bare: false, next: h.next })
+  }
   // half HOUR (British "half seven" = 7:30)
   if (w === "half") {
-    const h = hourAt(toks, i + 1, "en")
-    if (h !== undefined && h.value >= 1 && h.value <= 12) return base(h, 30, h.next)
+    const h = hour12At(toks, i + 1, "en")
+    if (h !== undefined) out.push({ hour: h.value, minute: 30, open: true, bare: false, next: h.next })
   }
-  // [MINS] past|to HOUR
-  const half = w === "half" ? { value: 30, next: i + 1 } : minuteWords(toks, i, "en")
-  if (half !== undefined) {
-    const c = toks[half.next]?.norm
-    if (c === "past" || c === "after" || c === "to" || c === "till" || c === "until" || c === "of") {
-      const h = hourAt(toks, half.next + 1, "en")
-      if (h !== undefined && h.value <= 12) {
-        if (c === "past" || c === "after") return base(h, half.value, h.next)
-        return { hour: hourBefore(h.value), minute: 60 - half.value, open: !h.exact, next: h.next }
-      }
+  for (const h of hoursAt(toks, i, "en")) {
+    if (toks[h.next]?.norm === "oclock" && h.value >= 1 && h.value <= 12) out.push({ hour: h.value, minute: 0, open: !h.exact, bare: false, next: h.next + 1 })
+    for (const m of minutesAfterHour(toks, h.next, "en")) {
+      // "nineteen hundred", "oh nine hundred": the 24-hour clock; "seven hundred" is not a time.
+      if (toks[h.next]!.norm === "hundred" && !h.exact) continue
+      if (h.value === 24 && m.value > 0) continue
+      out.push({ hour: h.value, minute: m.value, open: !h.exact, bare: false, next: m.next })
     }
+    out.push({ hour: h.value, minute: 0, open: !h.exact, bare: true, next: h.next })
   }
-  // HOUR [o'clock] | HOUR MIN
-  const h = hourAt(toks, i, "en")
-  if (h === undefined) return undefined
-  const n1 = toks[h.next]?.norm
-  if (n1 === "oclock") return base(h, 0, h.next + 1)
-  if (n1 === "oh" || n1 === "o" || n1 === "zero") {
-    const m = readNumber(toks, h.next + 1, "en")
-    if (m !== undefined && m.value >= 1 && m.value <= 9 && (bareOk || toks[m.next]?.norm === "am" || toks[m.next]?.norm === "pm")) return base(h, m.value, m.next)
-  }
-  const m = readNumber(toks, h.next, "en")
-  const markerFollows = (k: number) => toks[k]?.norm === "am" || toks[k]?.norm === "pm"
-  if (m !== undefined && m.value >= 10 && m.value <= 59 && Number.isInteger(m.value) && (!m.digits || toks[h.next]!.norm.length <= 2) && (bareOk || markerFollows(m.next))) return base(h, m.value, m.next)
-  if (markerFollows(h.next)) return base(h, 0, h.next)
-  const p = periodAt(toks, h.next, "en")
-  if (bareOk || (p !== undefined && h.value >= 1 && h.value <= 12 && toks[h.next]?.norm !== "this")) return base(h, 0, h.next)
-  return undefined
+  return out
 }
 
-const matchNl = (toks: ReadonlyArray<Tok>, i: number, bareOk: boolean): Omit<TimeMatch, "period"> | undefined => {
+const coresNl = (toks: ReadonlyArray<Tok>, i: number): Array<Core> => {
   const w = toks[i]!.norm
-  const clock = matchClockToken(toks, i)
-  if (clock !== undefined) return { hour: clock.hour, minute: clock.minute, open: !clock.exact, next: clock.next }
-  if (w === "middernacht") return { hour: 0, minute: 0, open: false, next: i + 1 }
+  const out: Array<Core> = []
+  const clock = clockToken(toks, i)
+  if (clock !== undefined) out.push({ hour: clock.hour, minute: clock.minute, open: !clock.exact, bare: false, next: i + 1 })
+  if (w === "middernacht") out.push({ hour: 0, minute: 0, open: false, bare: false, midnightWord: true, next: i + 1 })
+  // [MINS] voor|over [half] HOUR
+  for (const m of minutesBefore(toks, i, "nl")) {
+    const c = toks[m.next]?.norm
+    if (c !== "voor" && c !== "over") continue
+    const isHalf = toks[m.next + 1]?.norm === "half"
+    const h = hour12At(toks, m.next + 1 + (isHalf ? 1 : 0), "nl")
+    if (h === undefined) continue
+    // minutes since the reference: "half acht" is 7:30
+    let hour = isHalf ? hourBefore(h.value) : h.value
+    let minute = (isHalf ? 30 : 0) + (c === "over" ? m.value : -m.value)
+    if (minute < 0) { minute += 60; hour = hourBefore(hour) }
+    if (minute >= 60) { minute -= 60; hour = hour === 12 ? 1 : hour + 1 }
+    out.push({ hour, minute, open: true, bare: false, next: h.next })
+  }
   // half HOUR: "half acht" = 7:30
   if (w === "half") {
-    const h = hourAt(toks, i + 1, "nl")
-    if (h !== undefined && h.value >= 1 && h.value <= 12) return { hour: hourBefore(h.value), minute: 30, open: true, next: h.next }
-    return undefined
+    const h = hour12At(toks, i + 1, "nl")
+    if (h !== undefined) out.push({ hour: hourBefore(h.value), minute: 30, open: true, bare: false, next: h.next })
   }
-  // [MINS] voor|over [half] HOUR
-  const mins = minuteWords(toks, i, "nl")
-  if (mins !== undefined) {
-    const c = toks[mins.next]?.norm
-    if (c === "voor" || c === "over") {
-      const isHalf = toks[mins.next + 1]?.norm === "half"
-      const h = hourAt(toks, mins.next + 1 + (isHalf ? 1 : 0), "nl")
-      if (h !== undefined && h.value >= 1 && h.value <= 12) {
-        // minutes since the reference hour: "half acht" is 7:30
-        let hour = h.value
-        let minute = 0
-        if (isHalf) { hour = hourBefore(hour); minute = 30 }
-        if (c === "over") minute += mins.value
-        else minute -= mins.value
-        if (minute < 0) { minute += 60; hour = hourBefore(hour) }
-        if (minute >= 60) { minute -= 60; hour = hour === 12 ? 1 : hour + 1 }
-        return { hour, minute, open: true, next: h.next }
+  for (const h of hoursAt(toks, i, "nl")) {
+    const u = toks[h.next]?.norm
+    if (u === "uur" || u === "u" || u === "h") {
+      for (const m of minutesAfterHour(toks, h.next + 1, "nl")) {
+        if (h.value === 24 && m.value > 0) continue
+        out.push({ hour: h.value, minute: m.value, open: !h.exact, bare: false, next: m.next })
       }
+      if (u === "uur") out.push({ hour: h.value, minute: 0, open: !h.exact, bare: false, next: h.next + 1 })
     }
+    out.push({ hour: h.value, minute: 0, open: !h.exact, bare: true, next: h.next })
   }
-  // HH u MM ("19u30")
-  const h = hourAt(toks, i, "nl")
-  if (h === undefined) return undefined
-  const u = toks[h.next]?.norm
-  if (u === "u" || u === "uur") {
-    const m = /^\d{1,2}$/.test(toks[h.next + 1]?.norm ?? "") ? { value: Number(toks[h.next + 1]!.norm), next: h.next + 2 } : readNumber(toks, h.next + 1, "nl")
-    if (m !== undefined && m.value >= 1 && m.value <= 59 && Number.isInteger(m.value)) return base(h, m.value, m.next)
-    return base(h, 0, h.next + 1)
-  }
-  if (bareOk) return base(h, 0, h.next)
-  return undefined
+  return out
 }
 
-/** The time of day starting at word `i`, with its am/pm or period words. `bareOk`: a lone number may be a time. */
-export const matchTime = (toks: ReadonlyArray<Tok>, i: number, language: Language, bareOk: boolean): TimeMatch | undefined => {
-  if (toks[i] === undefined) return undefined
-  const m = language === "en" ? matchEn(toks, i, bareOk) : matchNl(toks, i, bareOk)
-  if (m === undefined) return undefined
-  let next = m.next
-  if (language === "en" && toks[next]?.norm === "oclock") next++
-  const p = periodAt(toks, next, language)
-  if (p === undefined) return { ...m, next }
-  return { ...m, period: p.period, next: p.next }
+/**
+ * Every clock time starting at word `i`, each with the part of the day said right after it, longest first. `bareOk`: a lone number
+ * ("seven") may be one. Callers pick the reading that lets their whole phrase be read.
+ */
+export const matchTimes = (toks: ReadonlyArray<Tok>, i: number, language: Language, bareOk: boolean): Array<TimeMatch> => {
+  if (toks[i] === undefined) return []
+  const cores = (language === "en" ? coresEn(toks, i) : coresNl(toks, i)).filter((c) => bareOk || !c.bare)
+  const out: Array<TimeMatch> = []
+  for (const c of cores) {
+    const base: TimeMatch = { ...c, midnightWord: c.midnightWord === true }
+    const p = periodAt(toks, c.next, language)
+    if (p !== undefined) out.push({ ...base, bare: false, period: p.period, next: p.next })
+    out.push(base)
+  }
+  return out.sort((a, b) => b.next - a.next)
 }
 
-/** The 24-hour hour, when am/pm or a period word settles it. */
-const settle = (hour: number, period: Period): number => {
-  const h = hour
+/** The longest clock time at word `i` (see `matchTimes`). */
+export const matchTime = (toks: ReadonlyArray<Tok>, i: number, language: Language, bareOk: boolean): TimeMatch | undefined =>
+  matchTimes(toks, i, language, bareOk)[0]
+
+/** The 24-hour hour of a 12-hour reading (1–12) that am/pm or a period word settles, or `undefined` when they do not fit. */
+const settle = (hour: number, period: Period): number | undefined => {
   switch (period) {
-    case "am": case "morning": return h === 12 ? 0 : h
-    case "pm": return h === 12 ? 12 : h + 12
-    case "afternoon": return h === 12 ? 12 : h + 12
-    case "evening": return h === 12 ? 0 : h + 12
-    case "night": return h === 12 ? 0 : h >= 6 ? h + 12 : h
+    case "am": return hour === 12 ? 0 : hour
+    case "pm": return hour === 12 ? 12 : hour + 12
+    // "twelve in the morning" has no single reading (midnight or noon).
+    case "morning": return hour === 12 ? undefined : hour
+    case "afternoon": return hour === 12 ? 12 : hour + 12
+    case "evening": return hour === 12 ? undefined : hour + 12
+    case "night": return hour === 12 ? 0 : hour >= 6 ? hour + 12 : hour
+  }
+}
+
+/**
+ * The 24-hour hours a part of the day covers. A clock reading that already says its hour (a leading zero, 0 or 13–23, noon, midnight)
+ * must fall inside the part said with it: "07:00 in the evening" and "23 in the morning" contradict themselves and are not read.
+ */
+export const periodHours = (period: Period, hour: number): boolean => {
+  switch (period) {
+    case "am": return hour <= 11
+    case "pm": return hour >= 12
+    case "morning": return hour <= 11
+    case "afternoon": return hour >= 12 && hour <= 18
+    case "evening": return hour >= 17 && hour <= 23
+    case "night": return hour >= 18 || hour <= 5
   }
 }
 
@@ -231,19 +300,27 @@ export interface Resolved {
   readonly time: TimeOfDay
   /** The band left no later reading today; the earliest one is meant for tomorrow. */
   readonly nextDay: boolean
+  /** "24:00": midnight at the end of the day, so 00:00 of the next one. */
+  readonly carry: boolean
 }
 
-/** Settle am/pm: said → that; not said → the readings inside the band, the next after `afterMinutes` (else the earliest). */
+/**
+ * Settle am/pm: said → that; not said → the readings inside the band, the next after `afterMinutes` (else the earliest). "24:00"
+ * is 00:00 with `carry`; it takes no part of the day.
+ */
 export const resolveTime = (m: TimeMatch, options?: TimeOptions): Resolved | undefined => {
-  if (m.hour === 24 && m.minute > 0) return undefined
-  if ((m.period === "am" || m.period === "pm") && (m.hour < 1 || m.hour > 12)) return undefined
-  if ((!m.open && m.period !== "am" && m.period !== "pm") || m.hour < 1 || m.hour > 12) {
-    return { time: { hour: m.hour % 24, minute: m.minute, guessed: false, alternatives: [] }, nextDay: false }
+  if (m.hour < 0 || m.hour > 24 || m.minute < 0 || m.minute > 59 || (m.hour === 24 && m.minute > 0)) return undefined
+  if (m.hour === 24) return m.period === undefined ? { time: { hour: 0, minute: 0, guessed: false, alternatives: [] }, nextDay: false, carry: true } : undefined
+  if ((m.period === "am" || m.period === "pm") && (m.hour < 1 || m.hour > 12 || !m.open)) return undefined
+  if (!m.open || m.hour < 1 || m.hour > 12) {
+    // The hour is already settled ("19:30", "07:00", "noon"): a period said with it must agree, never override or be dropped.
+    if (m.period !== undefined && !periodHours(m.period, m.hour)) return undefined
+    return { time: { hour: m.hour, minute: m.minute, guessed: false, alternatives: [] }, nextDay: false, carry: false }
   }
   if (m.period !== undefined) {
     const hour = settle(m.hour, m.period)
-    if (hour > 23) return undefined
-    return { time: { hour, minute: m.minute, guessed: false, alternatives: [] }, nextDay: false }
+    if (hour === undefined || hour > 23 || !periodHours(m.period, hour)) return undefined
+    return { time: { hour, minute: m.minute, guessed: false, alternatives: [] }, nextDay: false, carry: false }
   }
   const { from, to } = bandOf(options)
   const candidates = [m.hour === 12 ? 0 : m.hour, m.hour === 12 ? 12 : m.hour + 12]
@@ -259,36 +336,40 @@ export const resolveTime = (m: TimeMatch, options?: TimeOptions): Resolved | und
     if (later !== undefined) chosen = later
     else nextDay = true
   }
-  return { time: { ...chosen, guessed: true, alternatives: inBand.filter((c) => c !== chosen) }, nextDay }
+  return { time: { ...chosen, guessed: true, alternatives: inBand.filter((c) => c !== chosen) }, nextDay, carry: false }
 }
 
-const leadingFillers: Record<Language, ReadonlySet<string>> = {
-  en: new Set(["at", "around", "about", "by", "roughly", "approximately", "for", "until", "till"]),
-  nl: new Set(["om", "rond", "tegen", "ongeveer", "circa", "omstreeks", "tot", "voor"])
-}
-const trailingFillers: ReadonlySet<string> = new Set(["please", "alsjeblieft", "graag", "alstublieft", "sharp", "stipt", "precies", "exactly"])
+/** The one word a time phrase may start with besides the time: "at seven", "om zeven uur". */
+export const timeFillers: Record<Language, ReadonlySet<string>> = { en: new Set(["at"]), nl: new Set(["om"]) }
 
 /**
- * A time of day: "seven", "7:30", "half past seven", "quarter to seven", "seven thirty pm"; Dutch "half acht" (7:30), "kwart voor zeven",
- * "kwart over zeven", "zeven uur 's avonds". English "half seven" is 7:30, Dutch "half zeven" is 6:30. Without am/pm the reading inside
- * the band (default 07:00–21:00) wins and `guessed` is true. Ambiguous only when the band holds no reading.
+ * A time of day, and nothing else: "seven", "7:30", "half past seven", "quarter to seven", "seven thirty pm", "nineteen hundred",
+ * "seven in the evening"; Dutch "half acht" (7:30), "kwart voor zeven", "kwart over zeven", "zeven uur 's avonds", "19u30". English
+ * "half seven" is 7:30, Dutch "half zeven" is 6:30. Without am/pm the reading inside the band (default 07:00–21:00) wins and `guessed`
+ * is true; `ambiguous` only when the band holds no reading. The phrase may have "at" / "om" before it and no other word:
+ * "around seven", "until seven", "seven or eight", "seven UTC" and "seven please" are `not-understood`. "24:00" is refused here (a
+ * time of day cannot say "the next day"); `parseDateTime` reads it.
  */
 export const parseTimeOfDay = (text: string, language: Language, options?: TimeOptions): Parsed<TimeOfDay> => {
+  if (typeof text !== "string") return notUnderstood
   const toks = tokenize(text)
-  let i = 0
-  while (i < toks.length && leadingFillers[language].has(toks[i]!.norm)) i++
-  const m = matchTime(toks, i, language, true)
-  if (m === undefined) return notUnderstood
-  let end = m.next
-  while (end < toks.length && trailingFillers.has(toks[end]!.norm)) end++
-  if (end < toks.length) return notUnderstood
-  const said = sliceText(text, toks, i, m.next)
-  const r = resolveTime(m, options)
-  if (r !== undefined) return ok(r.time, said)
-  // The band holds no reading: both are possible.
-  if (m.open && m.hour >= 1 && m.hour <= 12 && m.period === undefined) {
-    const both = [m.hour === 12 ? 0 : m.hour, m.hour === 12 ? 12 : m.hour + 12].map((hour) => ({ hour, minute: m.minute, guessed: true, alternatives: [] }))
-    return ambiguous(both, said, "No am or pm was said and neither reading falls inside the band")
+  if (!onlyWords(text, toks)) return notUnderstood
+  // One lead word, first; then the time, and nothing after it.
+  const i = toks.length > 0 && timeFillers[language].has(toks[0]!.norm) ? 1 : 0
+  for (const m of matchTimes(toks, i, language, true)) {
+    if (!accountedFor(toks, new Set(range(0, m.next)), new Set())) continue
+    if (!numbersWhole(text, toks, [{ start: toks[i]!.start, end: toks[m.next - 1]!.end }])) return notUnderstood
+    if (m.hour === 24) return notUnderstood
+    const said = sliceText(text, toks, i, m.next)
+    const r = resolveTime(m, options)
+    if (r !== undefined) return ok(r.time, said)
+    // The band holds no reading: both are possible.
+    if (m.open && m.hour >= 1 && m.hour <= 12 && m.period === undefined) {
+      const both = [m.hour === 12 ? 0 : m.hour, m.hour === 12 ? 12 : m.hour + 12].map((hour) => ({ hour, minute: m.minute, guessed: true, alternatives: [] }))
+      return ambiguous(both, said, "No am or pm was said and neither reading falls inside the band")
+    }
+    return notUnderstood
   }
   return notUnderstood
 }
+

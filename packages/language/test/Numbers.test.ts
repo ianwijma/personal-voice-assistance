@@ -1,5 +1,5 @@
 import { describe, expect, it } from "@effect/vitest"
-import { digitValue, nlWord, readAmount, readNumber } from "../src/Numbers.ts"
+import { digitValue, nlWholeWord, readAmount, readNumber } from "../src/Numbers.ts"
 import { tokenize } from "../src/Tokens.ts"
 
 const num = (text: string, language: "en" | "nl") => {
@@ -15,15 +15,17 @@ describe("readNumber", () => {
   const en: ReadonlyArray<readonly [string, number, number]> = [
     ["seven", 7, 1], ["fifteen", 15, 1], ["twenty", 20, 1], ["twenty five", 25, 2], ["twenty-five", 25, 2], ["ninety nine", 99, 2], ["one hundred", 100, 2], ["a hundred", 100, 2],
     ["one hundred and fifty", 150, 4], ["two hundred fifty", 250, 3], ["three hundred and fifty grams", 350, 4], ["one thousand", 1000, 2], ["two thousand five hundred", 2500, 4], ["a thousand", 1000, 2],
-    ["zero", 0, 1], ["250", 250, 1], ["2.5", 2.5, 1], ["1,500", 1500, 1], ["seven thirty", 7, 1], ["nineteen thirty", 19, 1], ["fifty five and", 55, 2]
+    ["zero", 0, 1], ["250", 250, 1], ["2.5", 2.5, 1], ["1,500", 1500, 1], ["fifty five and", 55, 2]
   ]
   for (const [text, value, next] of en) it(`en "${text}"`, () => expect(num(text, "en")).toEqual([value, next]))
   const nl: ReadonlyArray<readonly [string, number, number]> = [
     ["zeven", 7, 1], ["vijftien", 15, 1], ["twintig", 20, 1], ["eenentwintig", 21, 1], ["tweeëntwintig", 22, 1], ["vijfentwintig", 25, 1], ["negenennegentig", 99, 1],
     ["honderd", 100, 1], ["honderdvijftig", 150, 1], ["tweehonderd", 200, 1], ["tweehonderdvijftig", 250, 1], ["twee honderd", 200, 2], ["honderd vijftig", 150, 2], ["duizend", 1000, 1],
-    ["tweeduizenddriehonderd", 2300, 1], ["250", 250, 1], ["2,5", 2.5, 1], ["1.500", 1500, 1], ["tweeënhalf", 2.5, 1], ["een", 1, 1]
+    ["tweeduizenddriehonderd", 2300, 1], ["250", 250, 1], ["2,5", 2.5, 1], ["1.500", 1500, 1], ["een", 1, 1]
   ]
   for (const [text, value, next] of nl) it(`nl "${text}"`, () => expect(num(text, "nl")).toEqual([value, next]))
+  for (const bad of ["seven thirty", "nineteen thirty", "five five", "one thousand two thousand", "twenty thirty"]) it(`en "${bad}" is not one number`, () => expect(num(bad, "en")).toBeUndefined())
+  for (const bad of ["vijf vijf", "duizend duizend", "tweeënhalf"]) it(`nl "${bad}" is not one number`, () => expect(num(bad, "nl")).toBeUndefined())
   for (const bad of ["", "apple", "hundred", "and", "thousand", "twenty-"]) it(`en "${bad}" is no number`, () => {
     const r = num(bad, "en")
     if (bad === "twenty-") expect(r).toEqual([20, 1])
@@ -38,10 +40,12 @@ describe("readNumber", () => {
     expect(digitValue("1,234,567", "en")).toBe(1234567)
     expect(digitValue("1:30", "en")).toBeUndefined()
   })
-  it("nlWord", () => {
-    expect(nlWord("zeventien")).toBe(17)
-    expect(nlWord("drieënzestig".normalize("NFD").replace(/\p{M}/gu, ""))).toBe(63)
-    expect(nlWord("appel")).toBeUndefined()
+  it("nlWholeWord", () => {
+    expect(nlWholeWord("zeventien")).toBe(17)
+    expect(nlWholeWord("tweehonderdduizend")).toBe(200_000)
+    expect(nlWholeWord("duizendduizend")).toBeUndefined()
+    expect(nlWholeWord("drieënzestig".normalize("NFD").replace(/\p{M}/gu, ""))).toBe(63)
+    expect(nlWholeWord("appel")).toBeUndefined()
   })
 })
 

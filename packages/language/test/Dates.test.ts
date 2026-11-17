@@ -17,7 +17,7 @@ describe("parseDateTime: English", () => {
     ["today", "2026-11-18"], ["tomorrow", "2026-11-19"], ["yesterday", "2026-11-17"], ["the day after tomorrow", "2026-11-20"],
     ["tonight", "2026-11-18 night"], ["this evening", "2026-11-18 evening"], ["tomorrow morning", "2026-11-19 morning"], ["tomorrow evening", "2026-11-19 evening"],
     ["on Friday", "2026-11-20"], ["Friday", "2026-11-20"], ["on Wednesday", "2026-11-25"], ["Tuesday", "2026-11-24"], ["this Friday", "2026-11-20"], ["this Wednesday", "2026-11-18"],
-    ["this coming Monday", "2026-11-23"], ["next Wednesday", "2026-11-25"], ["Friday next week", "2026-11-27"], ["next week", "2026-11-25"], ["next week Monday", "2026-11-23"],
+    ["this coming Monday", "2026-11-23"], ["next Wednesday", "2026-11-25"], ["Friday next week", "2026-11-27"], ["next week", "not-understood"], ["next week Monday", "2026-11-23"],
     ["next Friday", "ambiguous: 2026-11-20 | 2026-11-27"], ["next Saturday", "ambiguous: 2026-11-21 | 2026-11-28"], ["next Monday", "ambiguous: 2026-11-23 | 2026-11-30"],
     ["the 3rd", "2026-12-03"], ["on the third", "2026-12-03"], ["the 18th", "2026-11-18"], ["the 17th", "2026-12-17"], ["the 31st", "2026-12-31"], ["the twenty first", "2026-11-21"],
     ["3 March", "2027-03-03"], ["March 3rd", "2027-03-03"], ["the 3rd of March", "2027-03-03"], ["March the third", "2027-03-03"], ["3 March 2028", "2028-03-03"],
@@ -27,7 +27,7 @@ describe("parseDateTime: English", () => {
     ["Friday at nine", "2026-11-20 09:00"], ["on Friday at 3 pm", "2026-11-20 15:00"], ["March 3rd at noon", "2027-03-03 12:00"], ["tonight at nine", "2026-11-18 21:00"],
     ["tomorrow evening at eight", "2026-11-19 20:00"], ["tomorrow morning at seven", "2026-11-19 07:00"], ["tomorrow night at eleven", "2026-11-19 23:00"],
     ["at seven", "2026-11-18 19:00"], ["at 11", "2026-11-18 11:00"], ["at 9 am", "2026-11-19 09:00"], ["at nine", "2026-11-18 21:00"], ["at 7:30 pm", "2026-11-18 19:30"], ["at 08:00", "2026-11-19 08:00"],
-    ["remind me to call mum tomorrow at 5 pm please", "2026-11-19 17:00"], ["seven", "2026-11-18 19:00"], ["buy 3 apples", "not-understood"], ["banana", "not-understood"], ["", "not-understood"]
+    ["remind me to call mum tomorrow at 5 pm please", "not-understood"], ["seven", "2026-11-18 19:00"], ["buy 3 apples", "not-understood"], ["banana", "not-understood"], ["", "not-understood"]
   ]
   for (const [text, expected] of rows) it(`"${text}"`, () => expect(read(text, "en")).toBe(expected))
 
@@ -39,11 +39,11 @@ describe("parseDateTime: English", () => {
       expect(r.reason).toContain("next friday")
     }
   })
-  it("says where in the text it read, so the title can be cut out", () => {
-    const text = "remind me to call mum tomorrow at five o'clock about the thing"
-    const r = parseDateTime(text, "en", opts)
-    expect(r.kind === "ok" && text.slice(r.value.start, r.value.end)).toBe("tomorrow at five o'clock")
+  it("reads the time phrase alone: a sentence around it is not searched", () => {
+    expect(read("remind me to call mum tomorrow at five o'clock about the thing", "en")).toBe("not-understood")
+    const r = parseDateTime("tomorrow at five o'clock", "en", opts)
     expect(r.kind === "ok" && r.said).toBe("tomorrow at five o'clock")
+    expect(r.kind === "ok" && "start" in r.value).toBe(false)
   })
   it("in two hours is a moment from now", () => {
     const r = parseDateTime("in two hours", "en", opts)
@@ -96,13 +96,13 @@ describe("parseDateTime: Dutch", () => {
     ["vandaag", "2026-11-18"], ["morgen", "2026-11-19"], ["overmorgen", "2026-11-20"], ["gisteren", "2026-11-17"], ["vanavond", "2026-11-18 evening"], ["vanmiddag", "2026-11-18 afternoon"],
     ["morgenochtend", "2026-11-19 morning"], ["morgenavond", "2026-11-19 evening"], ["morgen ochtend", "2026-11-19 morning"], ["morgen avond", "2026-11-19 evening"],
     ["op vrijdag", "2026-11-20"], ["vrijdag", "2026-11-20"], ["woensdag", "2026-11-25"], ["deze vrijdag", "2026-11-20"], ["aanstaande maandag", "2026-11-23"], ["komende zaterdag", "2026-11-21"],
-    ["volgende vrijdag", "ambiguous: 2026-11-20 | 2026-11-27"], ["volgende woensdag", "2026-11-25"], ["vrijdag volgende week", "2026-11-27"], ["volgende week", "2026-11-25"], ["vrijdag over een week", "2026-11-27"],
+    ["volgende vrijdag", "ambiguous: 2026-11-20 | 2026-11-27"], ["volgende woensdag", "2026-11-25"], ["vrijdag volgende week", "2026-11-27"], ["volgende week", "not-understood"], ["vrijdag over een week", "2026-11-27"],
     ["de derde", "2026-12-03"], ["op de derde", "2026-12-03"], ["de 3e", "2026-12-03"], ["de 18e", "2026-11-18"], ["de eenentwintigste", "2026-11-21"],
     ["3 maart", "2027-03-03"], ["op 3 maart", "2027-03-03"], ["de derde maart", "2027-03-03"], ["drie maart", "2027-03-03"], ["3 maart 2028", "2028-03-03"], ["25 december", "2026-12-25"], ["31 april", "not-understood"], ["1 mei", "2027-05-01"],
     ["over twee dagen", "2026-11-20"], ["over twee weken", "2026-12-02"], ["over een week", "2026-11-25"], ["over een maand", "2026-12-18"], ["over drie maanden", "2027-02-18"], ["in twee dagen", "2026-11-20"], ["over een jaar", "2027-11-18"],
     ["morgen om vijf uur", "2026-11-19 17:00"], ["morgen om 5 uur 's ochtends", "2026-11-19 05:00"], ["vrijdag om half acht", "2026-11-20 07:30"], ["vrijdag om half acht 's avonds", "2026-11-20 19:30"],
     ["morgenavond om acht uur", "2026-11-19 20:00"], ["morgenochtend om negen uur", "2026-11-19 09:00"], ["vanavond om tien uur", "2026-11-18 22:00"], ["3 maart om kwart voor zeven", "2027-03-03 18:45"], ["3 maart om kwart voor zeven 's avonds", "2027-03-03 18:45"],
-    ["om zeven uur", "2026-11-18 19:00"], ["om half acht", "2026-11-18 19:30"], ["om 9 uur", "2026-11-18 21:00"], ["om 19:30", "2026-11-18 19:30"], ["zet een wekker voor morgen om kwart over zeven", "2026-11-19 07:15"],
+    ["om zeven uur", "2026-11-18 19:00"], ["om half acht", "2026-11-18 19:30"], ["om 9 uur", "2026-11-18 21:00"], ["om 19:30", "2026-11-18 19:30"], ["zet een wekker voor morgen om kwart over zeven", "not-understood"], ["morgen om kwart over zeven", "2026-11-19 07:15"],
     ["boodschappen doen", "not-understood"], ["", "not-understood"]
   ]
   for (const [text, expected] of rows) it(`"${text}"`, () => expect(read(text, "nl")).toBe(expected))

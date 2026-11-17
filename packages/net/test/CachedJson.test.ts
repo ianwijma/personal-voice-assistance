@@ -6,7 +6,7 @@ import type { SafeFetchOptions, SafeResponse } from "../src/SafeFetch.ts"
 import { bytes } from "./helpers.ts"
 
 const response = (status: number, body: string, headers: Record<string, string> = {}): SafeResponse => ({
-  url: "x", status, headers, body: bytes(body), redirects: [], text: () => body
+  url: "x", status, headers, body: bytes(body), redirects: [], text: () => body, encoding: "identity", contentType: "application/json"
 })
 
 const setup = () => {
@@ -98,11 +98,21 @@ describe("getJson", () => {
     s.respond(() => Effect.succeed(response(200, "[1]")))
     expect((await get(s)).source).toBe("network")
   })
-  it("keeps URLs apart, and the memory cache is bounded", async () => {
+  it("keeps URLs apart", async () => {
+    const s = setup()
+    s.respond(() => Effect.succeed(response(200, '"a"')))
+    expect((await Effect.runPromise(s.api.getJson("http://x/a", { ttlMs: 1000 }))).value).toBe("a")
+    s.respond(() => Effect.succeed(response(200, '"b"')))
+    expect((await Effect.runPromise(s.api.getJson("http://x/b", { ttlMs: 1000 }))).value).toBe("b")
+    expect(await Effect.runPromise(s.api.getJson("http://x/a", { ttlMs: 1000 }))).toMatchObject({ value: "a", source: "cache" })
+    expect(await Effect.runPromise(s.api.getJson("http://x/b", { ttlMs: 1000 }))).toMatchObject({ value: "b", source: "cache" })
+    expect(s.seen.map((x) => x.url)).toEqual(["http://x/a", "http://x/b"])
+  })
+  it("the memory cache is bounded", async () => {
     const cache = makeMemoryJsonCache(2)
-    cache.set("a", { value: 1, storedAt: 0 })
-    cache.set("b", { value: 2, storedAt: 0 })
-    cache.set("c", { value: 3, storedAt: 0 })
+    cache.setIfNewer("a", { value: 1, storedAt: 0, sequence: cache.sequence() })
+    cache.setIfNewer("b", { value: 2, storedAt: 0, sequence: cache.sequence() })
+    cache.setIfNewer("c", { value: 3, storedAt: 0, sequence: cache.sequence() })
     expect(cache.get("a")).toBeUndefined()
     expect(cache.get("b")?.value).toBe(2)
     cache.delete("b")

@@ -9,6 +9,10 @@ export type RefusedRule =
   | "address" // the host is, or resolves to, a non-public address
   | "redirect-limit" // more redirects than allowed
   | "redirect-target" // a redirect without a usable Location
+  | "header" // a request header that may not be sent (Host, hop-by-hop, Accept-Encoding) or cannot be sent (a character a header cannot hold)
+  | "content-type" // the response's type is missing or not one the caller's policy accepts (checked before the body is read)
+  | "content-encoding" // the response is compressed in a way other than gzip, deflate or br
+  | "options" // a limit that is not a positive number, a method other than GET or HEAD, or an empty content-type policy
 
 /** A rule refused the URL, before or during the request. `detail` is for people; never contains response data. */
 export class NetRefused extends Data.TaggedError("NetRefused")<{
@@ -24,7 +28,7 @@ export class NetRefused extends Data.TaggedError("NetRefused")<{
   }
 }
 
-/** The response is bigger than `maxBytes` (said by Content-Length, or counted while reading). */
+/** The response is bigger than `maxBytes` (said by Content-Length, or counted while reading, after decompression). */
 export class NetTooLarge extends Data.TaggedError("NetTooLarge")<{ readonly url: string; readonly limit: number }> {
   override get message(): string {
     return `Response larger than ${this.limit} bytes`
