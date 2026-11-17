@@ -28,9 +28,13 @@ const offlineCore = (options: { maxQueuedDecodeMs?: number; decodeMs?: number } 
 }
 
 const tick = () => new Promise((r) => setTimeout(r, 0))
-/** Resolves once `condition` holds (the test's own timeout bounds the wait). */
+/** Resolves once `condition` holds; fails after 5 s, so a test that times out leaves no loop running. */
 const until = async (condition: () => boolean) => {
-  while (!condition()) await tick()
+  const deadline = Date.now() + 5_000
+  while (!condition()) {
+    if (Date.now() > deadline) throw new Error("until: the condition did not hold within 5 s")
+    await tick()
+  }
 }
 
 describe("recognizerCore, whole-turn: a native decode that never returns", () => {
