@@ -49,7 +49,7 @@ import type { RouteTokenKeeper } from "./RouteTokens.ts"
  */
 
 export interface ModuleRouterOptions {
-  readonly host: Pick<ModuleHost, "routes" | "modules">
+  readonly host: Pick<ModuleHost, "routes" | "modules" | "pageText">
   readonly admin: Pick<AdminSessions, "enabled" | "check" | "touch">
   readonly tokens: RouteTokenKeeper
   /** The server's services (logging), to run handlers with. */
@@ -536,7 +536,15 @@ export const makeModuleRouter = (options: ModuleRouterOptions): ModuleRouter => 
       for (const id of installed) {
         // Tokens are listed whether or not the module runs (a stopped module's tokens can be revoked).
         const tokens = readable ? yield* options.tokens.forModule(id).list.pipe(Effect.orElseSucceed(() => [])) : []
-        const routes = running.filter((r) => r.moduleId === id).map((r) => ({ ...routeInfo(id, r.route), calls: [...(logs.get(routeKey(id, r.route)) ?? [])] }))
+        // What the module declared, and what was noted of its calls, pass the host's page boundary (no secret it was given).
+        const routes = running.filter((r) => r.moduleId === id).map((r) => {
+          const info = routeInfo(id, r.route)
+          return {
+            ...info,
+            ...(info.description !== undefined ? { description: options.host.pageText(id, info.description, 500) } : {}),
+            calls: (logs.get(routeKey(id, r.route)) ?? []).map((call) => (call.note === undefined ? call : { ...call, note: options.host.pageText(id, call.note, 120) }))
+          }
+        })
         if (routes.length === 0 && tokens.length === 0) continue
         modules.push({ moduleId: id, running: ids.has(id), routes, tokens })
       }

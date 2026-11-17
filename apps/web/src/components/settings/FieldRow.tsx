@@ -1,5 +1,5 @@
 "use client"
-import { useEffect, useState } from "react"
+import { useEffect, useRef, useState } from "react"
 import type { ChoiceOption, SettingField, SettingsForm, SettingValue, VaultInfo } from "@pva/protocol"
 import { type Draft, fieldDefault, hasOwnerValue, ownValue, resetDraftValue, setDraftValue, valueEqual } from "@/lib/forms.ts"
 import type { FieldContext } from "@/components/fields/types.ts"
@@ -82,10 +82,15 @@ export function FieldRow({ field, form, draft, idPrefix, errors, warnings, readO
   const toDownload = field.locked === undefined ? optionsToDownload(field, draft.values[field.key]) : []
   const saved = new Set(optionsToDownload(field, form.values[field.key]).map((o) => o.value))
   const blocking = toDownload.filter((o) => !saved.has(o.value)).map((o) => o.value).join(",")
+  const report = useRef(onLocalError)
+  report.current = onLocalError
   useEffect(() => {
     if (field.type !== "choice" && field.type !== "multichoice") return
-    onLocalError(blocking === "" ? undefined : "Download this model first, or choose one that is downloaded.")
+    report.current(blocking === "" ? undefined : "Download this model first, or choose one that is downloaded.")
   }, [blocking])
+  // A row that goes (hidden by `visibleWhen`, gone from a new form) takes its local error with it, whatever renderer
+  // reported it.
+  useEffect(() => () => report.current(undefined), [])
   return (
     <div className="flex flex-col gap-1.5" data-field={field.key} data-field-type={field.type} data-source={field.source}>
       <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">

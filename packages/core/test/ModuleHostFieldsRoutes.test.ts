@@ -2,9 +2,11 @@
 // settings, timeout, double press, not running), `info` values and `combo` options on the described form, the
 // generated agent Test button, and module routes: checked at start, live while the shared part runs, gone when it stops.
 import { assert, describe, it } from "@effect/vitest"
-import { Effect, Fiber, Logger, Stream } from "effect"
+import { Effect, Exit, Fiber, Logger, Scope, Stream } from "effect"
 import { TestClock } from "effect/testing"
-import { defineAgent, type FieldActionHandler } from "../src/ModuleContributions.ts"
+import { AgentError } from "../src/Agent.ts"
+import { DecisionError } from "../src/Decision.ts"
+import { defineAgent, defineDecider, type FieldActionHandler } from "../src/ModuleContributions.ts"
 import { defineModule, type ModuleDefinition, ModuleStartError } from "../src/ModuleDefinition.ts"
 import { makeModuleHost, readOnlyPersistence } from "../src/ModuleHost.ts"
 import type { ModuleRoute } from "../src/ModuleRoutes.ts"
@@ -277,7 +279,7 @@ const keyedHost = (probe: { seen: Array<unknown> }, opts: { readonly stored?: Re
 
 describe("field actions after review round 1", () => {
   const logs: Array<string> = []
-  it.effect("answer at the deadline even when the handler's cleanup hangs; the button is free once cleanup ends or overruns", () =>
+  it.effect("answer at the deadline even when the handler's cleanup hangs; the button stays busy until the press has really ended", () =>
     Effect.gen(function*() {
       let cleaned = false
       const mod = defineModule({
@@ -312,15 +314,64 @@ describe("field actions after review round 1", () => {
       const again = yield* Effect.forkChild(host.fieldAction("stuck", "busyWork"))
       yield* advance(8_000)
       assert.strictEqual((yield* Fiber.join(again)).ok, true)
-      // The hung one overran its 10 s cleanup limit: logged, and the button is free.
+      // The hung one overran its 10 s cleanup limit: logged, and its button is STILL busy (its cleanup still runs).
       yield* advance(6_000)
-      assert.isTrue(logs.some((l) => /field action stuck\.hang: still cleaning up 10000 ms after it was stopped/.test(l)))
+      assert.isTrue(logs.some((l) => /field action stuck\.hang: still cleaning up 10000 ms after it was timed out/.test(l)))
+      assert.deepStrictEqual(yield* host.fieldAction("stuck", "hang"), { ok: false, code: "busy", message: "That button is still running" })
+      // Its finalizer ends 60 s after the deadline (at 68 s): only then is the button free.
+      yield* advance(40_000)
+      assert.strictEqual((yield* host.fieldAction("stuck", "hang")).ok, false)
+      yield* advance(2_000)
       const third = yield* Effect.forkChild(host.fieldAction("stuck", "hang"))
       yield* advance(8_000)
       assert.deepStrictEqual(yield* Fiber.join(third), { ok: true, result: { ok: false, text: "Did not finish within 8 s", tone: "error" } })
       // Let the slow finalizers end, so the host shuts down at once.
       yield* advance(120_000)
     }).pipe(Effect.provide(Logger.layer([Logger.make(({ message }) => logs.push(String(message)))]))))
+
+  it.effect("never let a press overlap the same button's earlier one, and never let an old press free a newer one", () =>
+    Effect.gen(function*() {
+      const running: Array<string> = []
+      let overlapped = false
+      const work = (name: string, ms: number) =>
+        Effect.uninterruptible(Effect.gen(function*() {
+          if (running.length > 0) overlapped = true
+          running.push(name)
+          yield* Effect.sleep(ms)
+          running.splice(running.indexOf(name), 1)
+          return { ok: true, text: name }
+        }))
+      const plan: Array<number> = [60_000, 30_000, 1_000]
+      const names = ["A", "B", "C"]
+      let n = 0
+      const mod = defineModule({
+        id: "solo",
+        name: "Solo",
+        description: "One at a time",
+        settings: { go: Setting.action({ label: "Go", buttonLabel: "Go" }) },
+        fieldActions: { go: () => Effect.suspend(() => work(names[n]!, plan[n++]!)) },
+        start: () => Effect.succeed({})
+      })
+      const host = yield* hostOf([mod])
+      // A: 60 s of uninterruptible work, answered at 8 s.
+      const a = yield* Effect.forkChild(host.fieldAction("solo", "go"))
+      yield* advance(8_000)
+      assert.strictEqual((yield* Fiber.join(a)).ok && "answered", "answered")
+      // At 18 s (past the cleanup limit) and at 55 s, A still runs: the button is busy.
+      yield* advance(10_000)
+      assert.strictEqual((yield* host.fieldAction("solo", "go")).ok, false)
+      yield* advance(37_000)
+      assert.strictEqual((yield* host.fieldAction("solo", "go")).ok, false)
+      // A ends at 60 s; B starts and runs on; A's end has already been accounted and cannot free B's button.
+      yield* advance(5_000)
+      const b = yield* Effect.forkChild(host.fieldAction("solo", "go"))
+      yield* advance(10)
+      assert.deepStrictEqual(yield* host.fieldAction("solo", "go"), { ok: false, code: "busy", message: "That button is still running" })
+      yield* advance(30_000)
+      yield* Fiber.join(b)
+      assert.isFalse(overlapped)
+      assert.strictEqual(n, 2)
+    }))
 
   it.effect("never send a saved or environment secret back: failures say a generic sentence, results are redacted", () =>
     Effect.gen(function*() {
@@ -564,5 +615,279 @@ describe("routes and field actions in P1's lifecycle", () => {
       assert.strictEqual(host.routes()[0]!.scope, before[0]!.scope)
       assert.deepStrictEqual(host.routes().map((r) => r.route.description), ["a"])
       assert.deepStrictEqual(probe.closed, ["b", "c"])
+    }))
+})
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Review round 2 (PR 90): one page boundary for everything a module says (findings 1–3 and the rest of 7), and
+// field-action presses owned by the instance or host that runs them (findings 4–5).
+
+describe("the page boundary after review round 2", () => {
+  /** A module with a saved key that it puts into every kind of text the page shows. */
+  const leaky = (token: { current: string }, probe: { release?: () => void; options?: unknown }) =>
+    defineModule({
+      apiVersion: 2,
+      id: "leaky",
+      name: "Leaky",
+      description: "Says its key everywhere",
+      settings: {
+        token: Setting.secret({ label: "Token", required: true }),
+        state: Setting.info({ label: "Now" }),
+        pick: Setting.combo({ label: "Pick", default: "a", options: [{ value: "a", label: "A" }] }),
+        slowEcho: Setting.action({ label: "Slow echo", buttonLabel: "Echo" })
+      },
+      shared: ({ settings }) =>
+        Effect.succeed({
+          value: settings.token,
+          routes: [{ method: "GET", path: "x", guards: ["lan"], handler: ok, description: `Route for ${settings.token}` }]
+        }),
+      health: ({ settings }) => Effect.succeed([{ id: "h", severity: "warning", title: `Key ${String(settings?.token)}`, detail: `Detail ${String(settings?.token)}` }]),
+      start: ({ setStatus, settings }) =>
+        Effect.sync(() => {
+          token.current = String(settings.token)
+          setStatus({ text: `Using ${settings.token}`, tone: "ok" })
+          return {
+            info: () => ({ state: `Signed in with ${settings.token}` }),
+            settingOptions: () => (probe.options ?? {
+              pick: [
+                { value: "b", label: `Account ${settings.token}`, description: `d ${settings.token}`, implication: `i ${settings.token}` },
+                { value: `id-${settings.token}`, label: "Hidden value" }
+              ]
+            }) as never,
+            fieldActions: {
+              slowEcho: () =>
+                Effect.gen(function*() {
+                  yield* Effect.callback<void>((resume) => {
+                    probe.release = () => resume(Effect.void)
+                  })
+                  return { ok: true, text: `Echo ${settings.token}` }
+                })
+            }
+          }
+        })
+    })
+
+  const OLD = "old-secret-0123456789"
+  const NEW = "new-secret-9876543210"
+
+  const leakyHost = (probe: { release?: () => void; options?: unknown }) =>
+    makeModuleHost({
+      catalog: [leaky({ current: "" }, probe)],
+      persistence: readOnlyPersistence({ modules: { leaky: { enabled: true } }, secrets: { leaky: { token: OLD } } }),
+      env: {}
+    })
+
+  /** Everything the page gets about the module, as one string. */
+  const pageOf = (host: Effect.Success<ReturnType<typeof leakyHost>>) => JSON.stringify([host.modules(), host.issues.all(), host.settingOptions("leaky")])
+
+  it.effect("1: after the vault is locked, a running instance's key is still redacted everywhere the page looks", () =>
+    Effect.gen(function*() {
+      const host = yield* leakyHost({})
+      yield* host.startEnabled
+      yield* host.checkHealth
+      assert.include(pageOf(host), "Key [secret]")
+      assert.notInclude(pageOf(host), OLD)
+      // Locking the vault: no saved key is known now, but the instance still runs (and talks) with it.
+      yield* host.setSecrets({})
+      assert.strictEqual(host.modules()[0]!.state, "running")
+      yield* host.checkHealth
+      const page = pageOf(host)
+      assert.notInclude(page, OLD)
+      assert.include(page, "Signed in with [secret]")
+      assert.include(page, "Using [secret]")
+      assert.include(page, "Route for [secret]")
+    }))
+
+  it.effect("1: a key rotated while a press runs: the old key in its answer is still redacted", () =>
+    Effect.gen(function*() {
+      const probe: { release?: () => void } = {}
+      const host = yield* leakyHost(probe)
+      yield* host.startEnabled
+      const press = yield* Effect.forkChild(host.fieldAction("leaky", "slowEcho"))
+      yield* advance(10)
+      assert.isTrue((yield* host.configure("leaky", { values: {}, secrets: { token: NEW } })).ok)
+      probe.release!()
+      const result = yield* Fiber.join(press)
+      assert.deepStrictEqual(result, { ok: true, result: { ok: true, text: "Echo [secret]" } })
+      assert.notInclude(pageOf(host), NEW)
+      yield* advance(20_000)
+    }))
+
+  it.effect("2: runtime combo options: display texts redacted, an option whose value holds a key dropped, on the form and in settingOptions", () =>
+    Effect.gen(function*() {
+      const host = yield* leakyHost({})
+      yield* host.startEnabled
+      const combo = host.modules()[0]!.settings.fields.find((f) => f.key === "pick")
+      assert.deepStrictEqual(combo?.type === "combo" && combo.options, [
+        { value: "a", label: "A" },
+        { value: "b", label: "Account [secret]", description: "d [secret]", implication: "i [secret]" }
+      ])
+      assert.deepStrictEqual(host.settingOptions("leaky"), {
+        pick: [{ value: "b", label: "Account [secret]", description: "d [secret]", implication: "i [secret]" }]
+      })
+    }))
+
+  it.effect("3 and 7: the generated agent Test redacts a long key before quoting it short; a provider failure says only a generic sentence", () =>
+    Effect.gen(function*() {
+      const LONG = `sk-${"x".repeat(100)}${"y".repeat(97)}`
+      const mode = { current: "echo" as "echo" | "fail" | "longFail" }
+      const agent = defineAgent({
+        id: "talker",
+        name: "Talker",
+        description: "Talks",
+        kind: "model",
+        settings: { key: Setting.secret({ label: "Key", required: true }) },
+        enabledByDefault: true,
+        start: ({ settings }) =>
+          Effect.succeed({
+            turn: () =>
+              mode.current === "echo"
+                ? Stream.make({ _tag: "TextDelta" as const, text: `My key is ${settings.key}` })
+                : Stream.fail(new AgentError({ reason: "failed", message: mode.current === "fail" ? `401 for key ${settings.key}` : `${"e".repeat(480)} ${settings.key}` }))
+          })
+      })
+      const host = yield* makeModuleHost({
+        catalog: [agent],
+        persistence: readOnlyPersistence({ modules: { talker: { enabled: true } }, secrets: { talker: { key: LONG } } }),
+        env: {}
+      })
+      yield* host.startEnabled
+      const echoed = yield* host.fieldAction("talker", "test")
+      assert.isTrue(echoed.ok && echoed.result.ok)
+      const text = echoed.ok ? echoed.result.text : ""
+      assert.include(text, "'My key is [secret]'")
+      assert.notInclude(text, LONG.slice(0, 20))
+      for (const m of ["fail", "longFail"] as const) {
+        mode.current = m
+        const failed = yield* host.fieldAction("talker", "test")
+        assert.isTrue(failed.ok && !failed.result.ok)
+        assert.match(failed.ok ? failed.result.text : "", /^Failed after \d+ ms; the server's log says why\.$/)
+      }
+    }))
+
+  it.effect("3: the generated decider Test does not show the provider's error either", () =>
+    Effect.gen(function*() {
+      const decider = defineDecider({
+        id: "picker",
+        name: "Picker",
+        description: "Picks",
+        settings: { key: Setting.secret({ label: "Key", required: true }) },
+        enabledByDefault: true,
+        start: ({ settings }) =>
+          Effect.succeed({ location: "hosted" as const, decide: () => Effect.fail(new DecisionError({ reason: "rejected", message: `bad key ${settings.key}` })) })
+      })
+      const host = yield* makeModuleHost({
+        catalog: [decider],
+        persistence: readOnlyPersistence({ modules: { picker: { enabled: true } }, secrets: { picker: { key: "decider-secret-123" } } }),
+        env: {}
+      })
+      yield* host.startEnabled
+      const r = yield* host.fieldAction("picker", "test")
+      assert.match(r.ok ? r.result.text : "", /^Failed after \d+ ms; the server's log says why\.$/)
+    }))
+
+  it.effect("7: a start error and a status line with the key are redacted, the status clipped to the wire's 120 characters after", () =>
+    Effect.gen(function*() {
+      const KEY = "start-secret-0123456789"
+      const mod = defineModule({
+        id: "starter",
+        name: "Starter",
+        description: "Fails to start",
+        settings: { key: Setting.secret({ label: "Key", required: true }), fail: Setting.boolean({ label: "Fail", default: true }) },
+        start: ({ setStatus, settings }) =>
+          settings.fail
+            ? Effect.fail(new ModuleStartError({ message: `Login refused for ${settings.key}` }))
+            : Effect.sync(() => {
+              setStatus({ text: `${"s".repeat(110)}${settings.key}`, tone: "ok" })
+              return {}
+            })
+      })
+      const host = yield* makeModuleHost({
+        catalog: [mod],
+        persistence: readOnlyPersistence({ modules: { starter: { enabled: true } }, secrets: { starter: { key: KEY } } }),
+        env: {}
+      })
+      yield* host.startEnabled
+      assert.strictEqual(host.modules()[0]!.error, "Login refused for [secret]")
+      assert.notInclude(JSON.stringify(host.issues.all()), KEY)
+      // The result of a save that fails to start reaches the page too.
+      const refusedSave = yield* host.configure("starter", { values: {}, secrets: { key: "rotated-secret-424242" } })
+      assert.deepStrictEqual(refusedSave.ok ? "" : refusedSave.error.message, "Login refused for [secret]")
+      assert.isTrue((yield* host.configure("starter", { values: { fail: false }, secrets: {} })).ok)
+      const status = host.modules()[0]!.status
+      // Redacted first, so no prefix of the key survives the clipping.
+      assert.strictEqual(status?.text, `${"s".repeat(110)}[secret]`)
+    }))
+})
+
+describe("field-action presses after review round 2: owned by what runs them", () => {
+  /** An instance with a socket-like resource; its action sleeps, then uses it; its cleanup looks at it too. */
+  const socketed = (probe: { open: Array<boolean>; used: Array<boolean>; cleanup: Array<boolean> }) =>
+    defineModule({
+      id: "sock",
+      name: "Sock",
+      description: "Has a socket",
+      settings: { word: Setting.text({ label: "Word", default: "a" }), use: Setting.action({ label: "Use", buttonLabel: "Use" }) },
+      start: () =>
+        Effect.gen(function*() {
+          const socket = { open: true }
+          yield* Effect.acquireRelease(Effect.sync(() => socket), (s) => Effect.sync(() => void (s.open = false)))
+          probe.open.push(true)
+          return {
+            fieldActions: {
+              use: () =>
+                Effect.sleep(5_000).pipe(
+                  Effect.andThen(Effect.sync(() => probe.used.push(socket.open))),
+                  Effect.ensuring(Effect.sync(() => probe.cleanup.push(socket.open))),
+                  Effect.as({ ok: true, text: "used" })
+                )
+            }
+          }
+        })
+    })
+
+  it.effect("5: a reconfigure with no grace stops the old instance's press, whose cleanup still sees its resource open", () =>
+    Effect.gen(function*() {
+      const probe = { open: [] as Array<boolean>, used: [] as Array<boolean>, cleanup: [] as Array<boolean> }
+      const host = yield* makeModuleHost({
+        catalog: [socketed(probe)],
+        persistence: readOnlyPersistence({ modules: { sock: { enabled: true } }, secrets: {} }),
+        env: {},
+        graceMs: 0
+      })
+      yield* host.startEnabled
+      const press = yield* Effect.forkChild(host.fieldAction("sock", "use"))
+      yield* advance(100)
+      assert.isTrue((yield* host.configure("sock", { values: { word: "b" }, secrets: {} })).ok)
+      yield* advance(10)
+      // The old instance went: its press was stopped first, while the socket was still open, and never used it closed.
+      assert.deepStrictEqual(probe.cleanup, [true])
+      assert.deepStrictEqual(probe.used, [])
+      const answered = yield* Fiber.join(press)
+      assert.isTrue(answered.ok)
+      yield* advance(10_000)
+      assert.deepStrictEqual(probe.used, [])
+      // The new instance's button works.
+      const again = yield* Effect.forkChild(host.fieldAction("sock", "use"))
+      yield* advance(5_000)
+      assert.deepStrictEqual(yield* Fiber.join(again), { ok: true, result: { ok: true, text: "used" } })
+      assert.deepStrictEqual(probe.used, [true])
+    }))
+
+  it.effect("5: at shutdown an instance's press is stopped before its resources are released", () =>
+    Effect.gen(function*() {
+      const probe = { open: [] as Array<boolean>, used: [] as Array<boolean>, cleanup: [] as Array<boolean> }
+      const scope = yield* Scope.make()
+      const host = yield* makeModuleHost({
+        catalog: [socketed(probe)],
+        persistence: readOnlyPersistence({ modules: { sock: { enabled: true } }, secrets: {} }),
+        env: {}
+      }).pipe(Scope.provide(scope))
+      yield* host.startEnabled
+      yield* Effect.forkChild(host.fieldAction("sock", "use"))
+      yield* advance(100)
+      yield* Scope.close(scope, Exit.void)
+      assert.deepStrictEqual(probe.cleanup, [true])
+      assert.deepStrictEqual(probe.used, [])
     }))
 })

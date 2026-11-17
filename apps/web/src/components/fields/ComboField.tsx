@@ -1,5 +1,5 @@
 "use client"
-import { useEffect } from "react"
+import { useEffect, useRef } from "react"
 import type { SettingField } from "@pva/protocol"
 import { type FieldProps, inputClass } from "./types.ts"
 
@@ -13,9 +13,13 @@ export function ComboField({ field, id, describedBy, value, onChange, disabled, 
   const listId = `${id}-options`
   const known = field.options.some((o) => o.value === text.trim())
   const refused = !field.allowCustom && !known
+  const report = useRef(onLocalError)
+  report.current = onLocalError
   useEffect(() => {
-    onLocalError(refused ? "Choose one of the suggestions." : text.trim() === "" ? "Enter a value." : undefined)
+    report.current(refused ? "Choose one of the suggestions." : text.trim() === "" ? "Enter a value." : undefined)
   }, [refused, text])
+  // Hidden (`visibleWhen`) or removed: its error goes with it.
+  useEffect(() => () => report.current(undefined), [])
   const selected = field.options.find((o) => o.value === text.trim())
   return (
     <div className="flex flex-col gap-1">

@@ -128,3 +128,54 @@ describe("a field named like an Object member (review round 1)", () => {
     expect(configureModule.mock.calls[0]![1].values).toEqual({ constructor: "Bob" })
   })
 })
+
+// PR 90 review round 2, finding 6: a field hidden by `visibleWhen` (or gone from the form) takes its local error with
+// it, so an invalid combo that is hidden no longer holds Save of the switch that hid it.
+describe("a hidden field's local error (review round 2)", () => {
+  const scenes: ModuleInfo = {
+    id: "scenes",
+    name: "Scenes",
+    description: "Scenes",
+    enabled: true,
+    state: "running",
+    tools: [],
+    revision: 1,
+    settings: {
+      fields: [
+        { type: "boolean", key: "enabled", label: "Use scenes", apply: "live", default: false, source: "saved" },
+        {
+          type: "combo",
+          key: "scene",
+          label: "Scene",
+          apply: "live",
+          default: "a",
+          options: [{ value: "a", label: "A" }],
+          allowCustom: false,
+          visibleWhen: { key: "enabled", in: [true] },
+          source: "default"
+        }
+      ],
+      values: { enabled: true, scene: "a" },
+      secrets: {},
+      errors: []
+    }
+  }
+
+  it("hiding an invalid closed combo frees Save, and the switch is saved without it", async () => {
+    const store = createStore({ ...initialState, vault: { state: "none", admin: true }, modules: { order: [scenes.id], byId: { [scenes.id]: scenes } } }, reducer)
+    const ok: ResultMessage = { type: "result", requestId: "r", ok: true }
+    const configureModule = vi.fn(async (_id: string, _patch: SettingsPatch) => ok)
+    const client = { store, configureModule, updateSection: vi.fn(async () => ok), reloadEngines: vi.fn(async () => ok), settings: vi.fn() } as unknown as AssistantClient
+    render(<ClientContext.Provider value={client}><ServerPage page={{ ...page, source: { kind: "server", sections: [], moduleIds: [scenes.id] } }} /></ClientContext.Provider>)
+    const save = () => within(screen.getByTestId("page-footer")).getByRole("button", { name: "Save" }) as HTMLButtonElement
+    fireEvent.change(screen.getByLabelText("Scene"), { target: { value: "b" } })
+    expect(save().disabled).toBe(true)
+    // Switch scenes off: the combo goes, and so does its error.
+    fireEvent.click(screen.getByRole("switch", { name: "Use scenes" }))
+    expect(screen.queryByLabelText("Scene")).toBeNull()
+    expect(save().disabled).toBe(false)
+    await act(async () => fireEvent.click(save()))
+    expect(configureModule).toHaveBeenCalledTimes(1)
+    expect(configureModule.mock.calls[0]![1].values).toEqual({ enabled: false })
+  })
+})

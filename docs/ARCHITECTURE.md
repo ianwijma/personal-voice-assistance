@@ -351,16 +351,25 @@ Principal = { turn } | { job } | { local } | { notification }   // TurnContext.t
   runs without an instance; an instance's `fieldActions` need it running; `host.fieldAction(id, key, values?)` picks
   definition, instance, then an agent's generated `test` (own keys or class methods only, called on their object),
   applies the page's draft for `requiresSaved: false` buttons, refuses to run on settings that do not resolve, allows
-  8 s (answered at the deadline; cleanup runs on, bounded by `FIELD_ACTION_CLEANUP_MS`, logged) and one press at a
-  time; a failure is a generic sentence (details logged) and every secret value of the module is replaced by
-  `[secret]` in what it returns. A version 2 instance gets `refreshForm()` to have its `info()` and
-  `settingOptions()` described again (a closed combo shows its static options only).
+  8 s (answered at the deadline; the press runs on until it has ended, its cleanup logged after
+  `FIELD_ACTION_CLEANUP_MS`) and one press per button at a time; a failure is a generic sentence (details logged). A
+  press is owned (`FieldActionOwner`, start / in flight / stop) by the host (a definition handler) or by the instance
+  that runs it, whose scope stops its presses first when it closes, before its resources; the button stays busy until
+  the press has ended. A version 2 instance gets `refreshForm()` to have its `info()` and `settingOptions()` described
+  again (a closed combo shows its static options only).
+- **The page boundary** (P3, `PageBoundary.ts`): every module-produced text or value an admin page shows (field-action
+  results, `info` values, runtime options, status lines, start errors and failed saves, Health issues, tool and route
+  descriptions, route call-log notes through `ModuleHost.pageText`) passes one boundary that replaces every secret the
+  module has been given since the host started, and every one known now, with `[secret]` before anything is clipped;
+  a runtime option whose value holds a secret is dropped.
 - **Module routes** (P3, docs/UI-AND-MODULES.md §1.11): `ModuleRoute = { method, path, guards?: ("admin" | "token" |
   "lan")[], public?, token?, body?, bodyLimitBytes? (8 KB, ≤ 1 MB), rateLimit? (30/min per caller, 120 in all),
   timeoutMs? (5 s, ≤ 30 s), handler(req) }` answering a final status (200–599); every declared guard must pass, a
-  route without one must be `public` (a GET without a body); checked when the shared part starts, looked up live
-  (`ModuleHost.routes()`, each `PublishedRoute` with the `scope` of the shared part that declared it), so a stopped
-  module's paths are 404, and the app runs each handler in that scope (closed: interrupted).
+  route without one must be `public` (a GET without a body). Their place in the lifecycle is `RouteRegistration.ts`:
+  `validate` when a candidate shared part starts (a start error of that generation), `publish` / `withdraw` in the
+  host's synchronous switch, so a route is only ever live for the published generation; the router reads
+  `ModuleHost.routes()` (each `PublishedRoute` with the `scope` of the shared part that declared it), so a stopped
+  module's paths are 404, and runs each handler in that scope (closed: interrupted), outside any turn.
 
 Adding a feature = one new file exporting `defineModule({...})` + one line in `moduleCatalog` in `apps/assistant/src/modules.ts`. Adding a provider = one new package implementing a core interface + one line in `apps/assistant/src/providers.ts`. Adding a voice provider = an adapter with `layerConfig` (`Tts`) and `makeVoices` (`TtsVoices`), and one entry in `ttsProviders`, `ttsProviderInfo` and (hosted) `hostedTtsVoices` in `providers.ts`. A voice needs no code: it is chosen by its key.
 

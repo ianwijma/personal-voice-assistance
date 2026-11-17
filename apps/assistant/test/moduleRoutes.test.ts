@@ -361,7 +361,8 @@ describe("module routes after review round 1", () => {
         routes: () => {
           throw new Error("boom")
         },
-        modules: () => []
+        modules: () => [],
+        pageText: (_id, text) => String(text)
       }
     })
     const unhandled: Array<unknown> = []
@@ -531,7 +532,7 @@ describe("module routes after review round 1", () => {
     const routeOf = (n: number): ModuleRoute => ({ method: "GET", path: `gen${n}`, public: true, handler: () => Effect.succeed({ status: 200 }) })
     let live: Array<PublishedRoute> = []
     const churn = await otherRouter({
-      host: { routes: () => live, modules: () => [{ id: "churn" }] as never }
+      host: { routes: () => live, modules: () => [{ id: "churn" }] as never, pageText: (_id, text) => String(text) }
     })
     try {
       for (; generation < 300; generation++) {
@@ -544,6 +545,35 @@ describe("module routes after review round 1", () => {
       expect(view.modules[0]!.routes.map((r) => r.calls.length)).toEqual([0, 1])
     } finally {
       await churn.close()
+    }
+  })
+
+  it("show route descriptions and call-log notes only through the host's page boundary (review round 2)", async () => {
+    const scope = Effect.runSync(Scope.make())
+    const live: Array<PublishedRoute> = [{
+      moduleId: "said",
+      route: { method: "GET", path: "x", guards: ["admin"], description: "Uses KEY", handler: () => Effect.succeed({ status: 200 }) },
+      scope
+    }]
+    const seen: Array<string> = []
+    const said = await otherRouter({
+      host: {
+        routes: () => live,
+        modules: () => [{ id: "said" }] as never,
+        pageText: (id, text, max) => {
+          seen.push(`${id}:${max}`)
+          return String(text).replaceAll("KEY", "[secret]")
+        }
+      }
+    })
+    try {
+      expect((await raw("/api/modules/said/x", { port: said.port })).status).toBe(401)
+      const view = await Effect.runPromise(said.router.view("said"))
+      expect(view.modules[0]!.routes[0]!.description).toBe("Uses [secret]")
+      expect(view.modules[0]!.routes[0]!.calls[0]!.note).toBe("Log in to admin first")
+      expect(seen).toEqual(["said:500", "said:120"])
+    } finally {
+      await said.close()
     }
   })
 

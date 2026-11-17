@@ -653,8 +653,24 @@ running: type a name"). A closed combo accepts only its static options on every 
 the environment, an assistant's own value, a button's draft), so only those are shown on it. Both are read whenever
 the module is described: on every status line, after every button press, and when a version 2 instance calls
 `refreshForm()`; `info` and `settingOptions` are called on the instance (a class's methods may use `this`), and only
-the instance's own keys count. An info value has every secret of the module replaced by `[secret]`. They never take
-part in an instance's settings key.
+the instance's own keys count. Both pass the page boundary (below): an info value's secrets are replaced, and a
+runtime option's label, description and implication too, while an option whose machine value holds a secret is
+dropped (a changed value would change what choosing it means); only `value`, `label`, `description`, `implication`
+and known `tags` of a runtime option are passed on. The same applies to `ModuleHost.settingOptions` (the model
+pickers). They never take part in an instance's settings key.
+
+**The page boundary** (`packages/core/src/PageBoundary.ts`, review round 2). Everything a module produces at run time
+that an admin page shows passes one boundary in the host: field-action results, `info` values, runtime combo options
+(form and `settingOptions`), status lines (the module's and each instance's), start errors (the module's state, each
+instance's, the result of a save, enable or disable that failed to start it), Health issues (the host's issues about
+the module and what its `health()` returns), its tools' names and descriptions, route descriptions (on the module
+and in the route view) and route call-log notes (`ModuleHost.pageText`, which the router uses). It replaces with
+`[secret]` every secret value the module has been given since the host started (the settings its `shared`, `start`,
+field actions and `health()` were called with: at most 64 values per module, kept in memory) and every one known now
+(saved, environment), and their JSON-escaped and URL-encoded forms, **before** anything is clipped. A vault locked
+since, or a key rotated since, therefore does not make a running instance's old key showable, and clipping cannot
+leave a prefix that no longer matches. Values shorter than four characters are not looked for (they protect nothing,
+and replacing every "t" would leave the page unreadable). An issue id that holds a secret is replaced whole.
 
 **Field actions.** A button's handler is, in this order: the definition's `fieldActions[key]` (runs whether or not
 the module runs: a Test button that checks an address before it is saved), the running instance's
@@ -664,19 +680,32 @@ settings (environment > saved > linked default, secrets included, no assistant's
 `requiresSaved: false` pressed while the form has edits, the page's draft values applied over them (secrets are
 always the saved ones). Settings that do not resolve are the result and nothing runs ("Not run: Token: Not set"; a
 draft value the field refuses, a required key not saved, a saved value no longer valid). Handlers are an object's own
-keys or its class's methods, never inherited names such as `constructor`, and are called on their object. It has 8 s:
-at the deadline the press is answered "Did not finish within 8 s" at once, while the handler's interruption and
-finalizers run on in the background, bounded by 10 s (`FIELD_ACTION_CLEANUP_MS`; logged if it overruns); the button
-stays `busy` until the handler has really ended or that bound has passed. A failure or defect is answered with one
-generic sentence ("It failed; the server's log says why.") and its details go to the server's log; and before any
-result text leaves the host, every secret value of the module (saved or from the environment) in it is replaced by
-`[secret]`, then it is clipped to 500 characters. The page sends `module.action { moduleId, key, values? }` (admin only); the
+keys or its class's methods, never inherited names such as `constructor`, and are called on their object, outside
+any turn. **Ownership** (`packages/core/src/FieldActionOwner.ts`, review round 2): a press belongs to what runs it,
+the host for a definition's handler, the running instance for an instance's handler or a generated Test. The owner
+ties its lifetime, its button's busy state and its cleanup together: one press per button at a time (`busy`), and the
+button stays busy until the press's fiber has really ended (never freed by a timer; an old press cannot free a newer
+one). An instance's presses are stopped first when its scope closes (its retirement after the grace period, a
+`graceMs: 0` reconfigure, shutdown): interrupted and waited for, before the instance's own finalizers release the
+resources they use. At shutdown the host's presses are stopped before any scope closes. A press on an instance that
+is being stopped is answered `not_running`. It has 8 s: at the deadline the press is answered "Did not finish within
+8 s" at once while its interruption and finalizers run on in the background; one still running 10 s later
+(`FIELD_ACTION_CLEANUP_MS`) is logged and still waited for. A press stuck forever keeps its button busy until the
+instance is restarted (which waits for it before closing). A failure or defect is answered with one generic
+sentence ("It failed; the server's log says why.") and its details go to the server's log; a generated Test's
+provider failure too ("Failed after N ms; the server's log says why."). Result text passes the page boundary and is
+then clipped to 500 characters; a generated agent Test redacts the answer before quoting it short. The page sends `module.action { moduleId, key, values? }` (admin only); the
 `result` carries `action: { ok, text, tone }`, shown next to the button. Codes: `unknown_module`,
 `unknown_action` (not a button), `not_running` (an instance handler of a module that does not run), `busy`.
 
 **Module routes.** A version 2 module's `shared` part may return `routes`; each is answered under
 `/api/modules/<moduleId>/<path>` while that shared part is the published one (so a stopped module's paths answer
-404 at once). The contract is `packages/core/src/ModuleRoutes.ts`; the server is `apps/assistant/src/serve/moduleRoutes.ts`.
+404 at once). Their place in the host's lifecycle is one piece, `packages/core/src/RouteRegistration.ts`, with three
+operations the host calls at three points: `validate` when a candidate shared part has started (`startShared`: a bad
+route is a start error of that generation, which is then closed and never published), `publish` and `withdraw` inside
+the synchronous switch (`commit`: the new generation's routes go live with its services and contributions, the
+replaced one's go), and `withdraw` where demand ends (`reconcile`). The router, guards, tokens and call log only read
+`ModuleHost.routes()`. The contract is `packages/core/src/ModuleRoutes.ts`; the server is `apps/assistant/src/serve/moduleRoutes.ts`.
 
 ```ts
 interface ModuleRoute {

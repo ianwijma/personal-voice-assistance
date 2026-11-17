@@ -61,6 +61,11 @@ export interface PageFormView {
   readonly shown: (field: SettingField) => boolean
   readonly patch: SettingsPatch
   readonly dirty: boolean
+  /**
+   * The local errors that count: those of fields still in the form and shown now. A field hidden by `visibleWhen`,
+   * left out by `only`, or gone from a new form is not saved, so its leftover error cannot hold Save.
+   */
+  readonly localErrors: Readonly<Record<string, string>>
 }
 
 export interface SaveFns {
@@ -114,7 +119,7 @@ export const usePageForms = (defs: ReadonlyArray<PageFormDef>, saved: (key: stri
 
   const dirtyViews = views.filter((v) => v.dirty)
   const dirty = dirtyViews.length > 0
-  const hasLocalErrors = views.some((v) => Object.keys(v.state.localErrors).length > 0)
+  const hasLocalErrors = views.some((v) => Object.keys(v.localErrors).length > 0)
 
   return {
     views,
@@ -219,7 +224,11 @@ const computeViews = (
     const lookup = def.kind === "section" ? pageLookup : draftLookup(state.sync.draft, () => undefined)
     const shown = (field: SettingField) => (def.only === undefined || def.only.includes(field.key)) && fieldVisible(field, lookup)
     const patch = def.readOnly ? { values: {}, secrets: {} } : computePatch(def.form, state.sync.draft, shown)
+    const localErrors: Record<string, string> = {}
+    for (const field of def.form.fields) {
+      if (Object.hasOwn(state.localErrors, field.key) && shown(field)) localErrors[field.key] = state.localErrors[field.key]!
+    }
     // Text a field could not take yet (`localErrors`) is an edit too: leaving the page asks first, Cancel is offered.
-    return { def, state, lookup, shown, patch, dirty: !isEmptyPatch(patch) || Object.keys(state.localErrors).length > 0 }
+    return { def, state, lookup, shown, patch, localErrors, dirty: !isEmptyPatch(patch) || Object.keys(localErrors).length > 0 }
   })
 }
