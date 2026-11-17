@@ -147,7 +147,7 @@ import { seedTraces } from "./traces.ts"
 import { createVoiceAssistants, scenarioSettings, scriptedTurn } from "./voiceAssistants.ts"
 import { encodeWav, MOCK_PROVIDERS } from "./voices.ts"
 import { createModelPickersMock } from "./modelPickers.ts"
-import { createModuleRoutesMock, demoHomeAction, demoHomeModule, TokenRefusal } from "./demoHome.ts"
+import { createModuleRoutesMock, DEMO_DEFINITION_ACTIONS, demoHomeAction, demoHomeModule, TokenRefusal } from "./demoHome.ts"
 import type { Condition, FieldError } from "@pva/protocol"
 
 const PORT = Number(process.env.MOCK_PORT ?? 8787)
@@ -900,6 +900,8 @@ let conversationSeq = 0
 let modules = initialModules()
 // Reads the mock's vault each time (declared below): locked, tokens are neither listed nor changed.
 const moduleRoutesMock = createModuleRoutesMock(() => vault.state === "locked")
+/** Buttons whose press is running (`<module>/<key>`): a second press is `busy`, as on the host. */
+const pressing = new Set<string>()
 /** Protocol 7: assistants, device types and the devices' own sections (mock/assistants.ts). */
 const assistantsMock = createAssistantsMock({
   modules: () => modules,
@@ -1258,6 +1260,7 @@ const resetState = () => {
   lastSessions = ""
   modules = initialModules()
   moduleRoutesMock.reset()
+  pressing.clear()
   forcedErrors.clear()
   models = initialModels()
   sections = withWarnings(initialSections())
@@ -1992,7 +1995,9 @@ const startModule = (c: Conn, requestId: string, id: string) => {
       : id === "claude-subscription"
       ? { text: `Ready · ${String(m.settings.values.model)} · max plan`, tone: "ok" as const }
       : m.status
-    setModule(id, (x) => ({ ...x, state: "running", tools, ...(status !== undefined ? { status } : {}) }))
+    // Its declared routes are published again with the start.
+    const routes = initialModules().find((x) => x.id === id)?.routes
+    setModule(id, (x) => ({ ...x, state: "running", tools, ...(status !== undefined ? { status } : {}), ...(routes !== undefined ? { routes } : {}) }))
     result(c, requestId, true)
     if (id === "claude-subscription") refreshEngine()
   })
@@ -2134,8 +2139,9 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
         startModule(c, m.requestId, m.moduleId)
         return
       }
+      // As the real host: its routes are withdrawn when it starts stopping (its tokens are kept).
       setModule(m.moduleId, (x) => {
-        const { error: _e, status: _s, ...rest } = x
+        const { error: _e, status: _s, routes: _r, ...rest } = x
         return { ...rest, enabled: false, state: "stopping", tools: [] }
       })
       result(c, m.requestId, true)
@@ -2207,9 +2213,19 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
       if (mod === undefined) return result(c, m.requestId, false, { code: "unknown_module", message: `No module ${m.moduleId}.` })
       const field = mod.settings.fields.find((f) => f.key === m.key)
       if (field?.type !== "action") return result(c, m.requestId, false, { code: "unknown_action", message: `${mod.name} has no action "${m.key}"` })
+      // As the host: an instance's button needs its module running; one press per button at a time.
+      if (mod.state !== "running" && !DEMO_DEFINITION_ACTIONS.has(`${mod.id}/${m.key}`)) {
+        return result(c, m.requestId, false, { code: "not_running", message: `${mod.name} is not running` })
+      }
+      const pressKey = `${mod.id}/${m.key}`
+      if (pressing.has(pressKey)) return result(c, m.requestId, false, { code: "busy", message: "That button is still running" })
+      pressing.add(pressKey)
       const values = !field.requiresSaved && m.values !== undefined ? { ...mod.settings.values, ...m.values } : mod.settings.values
       const action = demoHomeAction(m.key, values) ?? { ok: true, text: "Done.", tone: "ok" as const }
-      after(500, () => sendTo(c, { type: "result", requestId: m.requestId, ok: true, action }))
+      after(500, () => {
+        pressing.delete(pressKey)
+        sendTo(c, { type: "result", requestId: m.requestId, ok: true, action })
+      })
       return
     }
     case "health.check": {
