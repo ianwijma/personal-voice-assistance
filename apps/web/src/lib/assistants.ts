@@ -25,6 +25,7 @@ export const ASSISTANT_TABS = [
   ["model", "Language model"],
   ["hearing", "Hearing"],
   ["voice", "Voice"],
+  ["look", "Look"],
   ["modules", "Modules"],
   ["used", "Used on"]
 ] as const
@@ -39,6 +40,7 @@ export const TAB_PATHS: Readonly<Record<AssistantTab, ReadonlyArray<string>>> = 
   model: ["llm"],
   hearing: ["hearing"],
   voice: ["voice"],
+  look: ["look"],
   modules: ["modules"],
   used: []
 }

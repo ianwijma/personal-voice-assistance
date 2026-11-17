@@ -20,15 +20,10 @@ describe("parseCharacterChoice", () => {
   })
 })
 
-describe("prefs.character", () => {
-  it("defaults to none (the baseline) and parses leniently next to the other preferences", () => {
-    expect(defaultPrefs.character).toBeUndefined()
-    expect(parsePrefs(JSON.stringify({ shortcuts: false })).character).toBeUndefined()
-    expect(parsePrefs(JSON.stringify({ shortcuts: false, character: { character: "lips", options: { mouthRange: 1.2 } } }))).toMatchObject({ shortcuts: false, character: { character: "lips", options: { mouthRange: 1.2 } } })
-    expect(parsePrefs(JSON.stringify({ shortcuts: false, character: "lips" }))).toEqual({ ...defaultPrefs, shortcuts: false })
-  })
-  it("keeps a choice for a character this build does not have (the host falls back; the choice survives)", () => {
-    expect(parsePrefs(JSON.stringify({ character: { character: "from-the-future", version: "9.0.0" } })).character).toEqual({ character: "from-the-future", version: "9.0.0" })
+describe("prefs.character (no longer read: docs/LOOKS-AND-VOICES.md §3)", () => {
+  it("a stored character is ignored: the look comes from the device's setup", () => {
+    expect("character" in defaultPrefs).toBe(false)
+    expect(parsePrefs(JSON.stringify({ shortcuts: false, character: { character: "lips", options: { mouthRange: 1.2 } } }))).toEqual({ ...defaultPrefs, shortcuts: false })
   })
 })
 

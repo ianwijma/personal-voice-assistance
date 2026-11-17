@@ -34,6 +34,7 @@ import { FormFooter } from "../FormFooter.tsx"
 import { PhraseTester } from "../PhraseTester.tsx"
 import { Dialog, DialogButtons } from "./assistants/parts.tsx"
 import { AssignSection, MarksFor, type SectionContext } from "./devices/AssignSection.tsx"
+import { LookSection, LookVoiceLine, VoiceSection } from "./devices/LookVoiceSections.tsx"
 import { Chip, DField, Pill } from "./devices/parts.tsx"
 
 /** The time, ticking every 30 s, for "Seen 5 min ago". */
@@ -55,7 +56,7 @@ const talkingOf = (d: DeviceListInfo, session: SessionInfo | undefined): boolean
 /** How many sections a device has its own value for (the list and "who answers without a phrase" are one section). */
 const ownSections = (d: Pick<DeviceListInfo, "own">): number => {
   const own = d.own as Record<string, unknown>
-  return ["assistants|withoutPhrase", "matching", "voicePage", "interruptMode", "audio", "captions"].filter((s) => s.split("|").some((k) => own[k] !== undefined)).length
+  return ["assistants|withoutPhrase", "matching", "voicePage", "look", "voice", "interruptMode", "audio", "captions"].filter((s) => s.split("|").some((k) => own[k] !== undefined)).length
 }
 
 /**
@@ -123,6 +124,7 @@ function Row({ d, type, defaults, assistants, session, now }: {
             ))}
           </span>
           <span className="block text-[12px] text-ink-faint" data-testid="device-meta">{meta.join(" · ")}</span>
+          <LookVoiceLine settings={settings} own={d.own} defaults={defaults} />
         </span>
         <Icon name="chevron" size={16} className="mt-2 shrink-0 text-ink-faint" />
       </button>
@@ -436,6 +438,8 @@ function DeviceEditor({ type, device }: { readonly type: DeviceTypeInfo; readonl
           </DField>
         </section>
       )}
+      {has("look") && <LookSection ctx={ctx} assistants={assistants} />}
+      {has("voice") && <VoiceSection ctx={ctx} assistants={assistants} />}
       <section className="flex flex-col gap-3" aria-labelledby="h-other" data-testid="section-other">
         <h3 id="h-other" className="label text-ink-faint">Other device settings</h3>
         {has("interrupting") && (

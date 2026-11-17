@@ -20,12 +20,14 @@ import { deepEqual } from "./assistants.ts"
  */
 
 /** A section of the page. `assign` is two keys of the settings: the list and who answers without a phrase. */
-export type SectionId = "assign" | "phrases" | "voicePage" | "interrupting" | "audio" | "captions"
+export type SectionId = "assign" | "phrases" | "voicePage" | "look" | "voice" | "interrupting" | "audio" | "captions"
 
 export const SECTION_KEYS: Readonly<Record<SectionId, ReadonlyArray<DeviceSettingsKey>>> = {
   assign: ["assistants", "withoutPhrase"],
   phrases: ["matching"],
   voicePage: ["voicePage"],
+  look: ["look"],
+  voice: ["voice"],
   interrupting: ["interruptMode"],
   audio: ["audio"],
   captions: ["captions"]

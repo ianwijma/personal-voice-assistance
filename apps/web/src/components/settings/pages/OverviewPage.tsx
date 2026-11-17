@@ -9,6 +9,7 @@ import { shallowEqual } from "@/lib/store.ts"
 import { useClient, useClientState } from "../../context.tsx"
 import { Icon, Spinner } from "../../ui/Icon.tsx"
 import { Button, cx } from "../../ui/controls.tsx"
+import { LookVoiceLine } from "./devices/LookVoiceSections.tsx"
 import type { AssistantInfo, DeviceListInfo, DeviceTypeInfo } from "@pva/protocol"
 
 const STAGE: Record<string, string> = { llm: "Language model", stt: "Speech recognition", tts: "Speech synthesis" }
@@ -115,7 +116,7 @@ export function WhoAnswersWhere() {
   const assistants = useClientState((s) => s.assistants)
   const sessions = useClientState((s) => s.sessions)
   const real = devices.length
-  type Entry = { readonly key: string; readonly path: string; readonly name: string; readonly defaults: boolean; readonly sub: string; readonly follows: boolean; readonly talking: boolean; readonly settings: DeviceListInfo["settings"] }
+  type Entry = { readonly key: string; readonly path: string; readonly name: string; readonly defaults: boolean; readonly sub: string; readonly follows: boolean; readonly talking: boolean; readonly settings: DeviceListInfo["settings"]; readonly own?: DeviceListInfo["own"] }
   const entries = (t: DeviceTypeInfo): ReadonlyArray<Entry> => {
     const members = devices.filter((d) => d.kind === t.kind)
     const followers = members.filter((d) => d.own.assistants === undefined)
@@ -129,6 +130,7 @@ export function WhoAnswersWhere() {
         follows: d.own.assistants === undefined,
         talking: sessions.find((x) => x.deviceId === d.id)?.ownerPresent === true,
         settings: d.settings,
+        own: d.own,
         sub: d.own.assistants === undefined ? `Follows Every ${t.one}` : d.connections > 0 ? "Connected now" : "Own list"
       }))
     ]
@@ -177,6 +179,7 @@ export function WhoAnswersWhere() {
                             {e.talking && <span className="label rounded-sm border border-you/50 px-1 text-[9px] leading-[14px] text-you">Talking now</span>}
                           </span>
                           <span className="text-[12px] font-normal text-ink-faint">{e.sub}</span>
+                          <LookVoiceLine settings={e.settings} own={e.own} defaults={e.defaults} />
                         </button>
                       </th>
                       {assistants.map((a) => (
@@ -204,6 +207,7 @@ export function WhoAnswersWhere() {
                       {e.talking && <span className="label rounded-sm border border-you/50 px-1 text-[9px] leading-[14px] text-you">Talking now</span>}
                     </span>
                     <span className="text-[12px] text-ink-faint">{e.sub}</span>
+                    <LookVoiceLine settings={e.settings} own={e.own} defaults={e.defaults} />
                     {e.settings.assistants.map((x) => (
                       <span key={x.assistant} className="flex flex-wrap items-center gap-2 text-[13px] text-ink-muted">
                         <span className="min-w-12 text-ink">{assistants.find((a) => a.id === x.assistant)?.name ?? x.assistant}</span>

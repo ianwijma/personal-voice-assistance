@@ -74,3 +74,31 @@ export const choiceFromSearch = (search: string, current: CharacterChoice | unde
   const base = current ?? { character: BASELINE_ID }
   return { choice: { ...base, options: { ...(base.options ?? {}), ...opts } }, search: search2 }
 }
+
+/**
+ * A try-out from the address bar (`?character=<id>&opt.<id>=<value>`), for one page load (docs/LOOKS-AND-VOICES.md §3):
+ * `character` names the character to show instead of the configured look (absent: the configured look, with the
+ * `opt.*` values over its options). Values are kept as given (strings) and validated on load like any other.
+ */
+export interface Tryout {
+  readonly character?: string
+  readonly options: { readonly [id: string]: string }
+}
+
+/** The try-out the address bar asks for, and the query string without those parameters; undefined when it asks for none. */
+export const tryoutFromSearch = (search: string): { readonly tryout: Tryout; readonly search: string } | undefined => {
+  const asked = choiceFromSearch(search, undefined)
+  if (asked === undefined) return undefined
+  const options = (asked.choice.options ?? {}) as { readonly [id: string]: string }
+  return new URLSearchParams(search).has("character")
+    ? { tryout: { character: asked.choice.character, options }, search: asked.search }
+    : { tryout: { options }, search: asked.search }
+}
+
+/** The choice to show: the configured one (undefined = the baseline), with a try-out over it (the try-out wins). */
+export const withTryout = (configured: CharacterChoice | undefined, tryout: Tryout | undefined): CharacterChoice | undefined => {
+  if (tryout === undefined) return configured
+  if (tryout.character !== undefined) return { character: tryout.character, options: tryout.options }
+  const base = configured ?? { character: BASELINE_ID }
+  return { ...base, options: { ...(base.options ?? {}), ...tryout.options } }
+}
