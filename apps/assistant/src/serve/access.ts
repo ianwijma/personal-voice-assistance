@@ -9,7 +9,7 @@ import { KEYS_LOCKED_MESSAGE } from "./SettingsStore.ts"
  * data-driven, so it holds for any module or section, wherever a UI shows it:
  *
  * - any form with a secret field (an API key, a token);
- * - the sections that choose providers (`language-model`, `stt-engine`, `voice-engines`: marked `protected` in
+ * - the sections that choose providers (`language-model`, `stt-engine`, `voice-providers`: marked `protected` in
  *   `sectionDefinitions.ts`);
  * - every agent module (it decides who answers, and may use a subscription).
  *
@@ -17,7 +17,7 @@ import { KEYS_LOCKED_MESSAGE } from "./SettingsStore.ts"
  * open to every page.
  */
 
-export const PROTECTED_SECTION_IDS: ReadonlySet<string> = new Set(["language-model", "stt-engine", "voice-engines"])
+export const PROTECTED_SECTION_IDS: ReadonlySet<string> = new Set(["language-model", "stt-engine", "voice-providers"])
 
 const hasSecret = (form: SettingsForm) => form.fields.some((f) => f.type === "secret")
 const specHasSecret = (spec: SettingsSpec) => Object.entries(spec).some(([key, setting]) => setting.describe(key).type === "secret")

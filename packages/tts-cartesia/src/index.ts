@@ -6,7 +6,10 @@ import { randomUUID } from "node:crypto"
 import { Tts, type TtsAudio, TtsError } from "@pva/core"
 import { Cause, Config, Effect, Layer, Queue, Redacted, Stream } from "effect"
 import WebSocket from "ws"
+import { DEFAULT_LANGUAGE, lookupVoiceLanguage } from "./voices.ts"
 import { addressSecrets, checkAddress, clip, errorName, fromUpstream, sanitize, type Secrets, secretList } from "./redact.ts"
+
+export { type CartesiaVoicesOptions, describeVoice, effectiveLanguage, languageCode, lookupVoiceLanguage, makeVoices, voicesConfig } from "./voices.ts"
 
 export const CARTESIA_VERSION = "2026-08-14"
 export const DEFAULT_BASE_URL = "wss://api.cartesia.ai"
@@ -19,6 +22,7 @@ export interface CartesiaOptions {
   readonly apiKey: Redacted.Redacted<string>
   readonly model?: string
   readonly voice?: string
+  /** Bare code (`en`, `nl`) or locale sent with every request. Default `en`; `layerConfig` fills it from the voice. */
   readonly language?: string
   /** Output rate in Hz (8000, 16000, 22050, 24000, 44100 or 48000). Default 24000. */
   readonly sampleRate?: number
@@ -347,7 +351,7 @@ const makeService = Effect.fnUntraced(function*(options: CartesiaOptions) {
     model_id: options.model ?? DEFAULT_MODEL,
     voice: { id: options.voice ?? DEFAULT_VOICE },
     output_format: { container: "raw", encoding: "pcm_s16le", sample_rate: sampleRate },
-    language: options.language ?? "en",
+    language: options.language ?? DEFAULT_LANGUAGE,
     max_buffer_delay_ms: options.maxBufferDelayMs ?? 0
   }
 
@@ -574,17 +578,25 @@ export const config = Config.all({
   apiKey: Config.Redacted("CARTESIA_API_KEY"),
   model: Config.String("CARTESIA_MODEL").pipe(Config.withDefault(DEFAULT_MODEL)),
   voice: Config.String("CARTESIA_VOICE").pipe(Config.withDefault(DEFAULT_VOICE)),
-  language: Config.String("CARTESIA_LANGUAGE").pipe(Config.withDefault("en")),
+  /** The override; empty = unset (the voice's own language is looked up when the engine is built). */
+  language: Config.String("CARTESIA_LANGUAGE").pipe(Config.withDefault("")),
   sampleRate: Config.Int("CARTESIA_SAMPLE_RATE").pipe(Config.withDefault(24_000)),
   maxBufferDelayMs: Config.Int("CARTESIA_MAX_BUFFER_DELAY_MS").pipe(Config.withDefault(0)),
   baseUrl: Config.String("CARTESIA_URL").pipe(Config.withDefault(DEFAULT_BASE_URL))
 })
 
+/** The voice-language lookup at startup is bounded: a slow Cartesia must not hold startup up. */
+const LANGUAGE_LOOKUP_TIMEOUT_MS = 3000
+
 /** `Tts` configured from the environment (`CARTESIA_API_KEY`, `CARTESIA_MODEL`, ...). */
 export const layerConfig: Layer.Layer<Tts, Config.ConfigError> = Layer.effect(
   Tts,
   Effect.gen(function*() {
-    return yield* make(yield* config)
+    const options = yield* config
+    if (options.language.trim() !== "") return yield* make(options)
+    // Unset: the voice's own language, asked once now (never during a turn); `en` when it cannot be had.
+    const found = yield* lookupVoiceLanguage({ apiKey: options.apiKey, baseUrl: options.baseUrl, timeoutMs: LANGUAGE_LOOKUP_TIMEOUT_MS }, options.voice)
+    return yield* make({ ...options, language: found ?? DEFAULT_LANGUAGE })
   })
 )
 

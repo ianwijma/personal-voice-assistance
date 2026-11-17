@@ -255,10 +255,14 @@ export const makeWebAudio = (options: WebAudioOptions = {}): Effect.Effect<WebAu
       }
     }).pipe(Effect.forkScoped)
 
+    let consumers = 0
     const input = AudioInput.of({
-      // A new consumer (after an engine reload) starts from now, not from stale frames.
+      // A later consumer (after an engine reload) starts from now, not from stale frames. The first one takes what
+      // arrived before it (a voice session is created at the claim: the owner's first frames may come first).
       stream: Stream.unwrap(Effect.as(
-        Effect.andThen(Queue.clear(frames), Effect.sync(() => void (queuedBytes = 0))),
+        Effect.suspend(() =>
+          consumers++ === 0 ? Effect.void : Effect.andThen(Queue.clear(frames), Effect.sync(() => void (queuedBytes = 0)))
+        ),
         Stream.fromQueue(frames).pipe(Stream.tap((frame) => Effect.sync(() => void (queuedBytes -= frame.length))))
       ))
     })
@@ -400,7 +404,13 @@ export const makeWebAudio = (options: WebAudioOptions = {}): Effect.Effect<WebAu
           lost: yield* Deferred.make<void>()
         }
         active = session
-        link.sendMessage({ type: "reply.start", turnId, sampleRate: Math.round(sampleRate) })
+        link.sendMessage({
+          type: "reply.start",
+          turnId,
+          sampleRate: Math.round(sampleRate),
+          // Protocol 7: whose voice this is (the turn's assistant, when the conversation's trace names one).
+          ...(trace?.assistant !== undefined ? { assistantId: trace.assistant.id } : {})
+        })
 
         const body = Effect.gen(function*() {
           yield* Stream.runForEach(audio, (chunk) => Effect.sync(() => sendAudio(session, chunk)))

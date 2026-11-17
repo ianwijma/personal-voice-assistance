@@ -3,7 +3,8 @@
 //
 // Protocol over the IPC channel (advanced serialisation, so typed arrays travel as-is):
 //   in:  { type: "init", module, config, speaker, speed }   once, first message
-//        { type: "speak", id, text }                         one at a time (the parent queues)
+//        { type: "speak", id, text, sid? }                   one at a time (the parent queues); sid: another
+//                                                            speaker of the same model (default: init's speaker)
 //        { type: "exit" }
 //   out: { type: "ready", sampleRate } | { type: "error", message }   reply to init
 //        { type: "audio", id, samples: Float32Array }               reply to speak
@@ -40,7 +41,7 @@ process.on("message", async (msg) => {
     case "speak": {
       try {
         // generateAsync runs on the libuv pool, so this process keeps answering IPC while it synthesises.
-        const result = await tts.generateAsync({ text: msg.text, sid: speaker, speed })
+        const result = await tts.generateAsync({ text: msg.text, sid: msg.sid ?? speaker, speed })
         process.send({ type: "audio", id: msg.id, samples: result.samples })
       } catch (error) {
         process.send({ type: "failed", id: msg.id, message: String(error?.message ?? error) })

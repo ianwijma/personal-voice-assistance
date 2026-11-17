@@ -1,7 +1,6 @@
 import { Schema } from "effect"
 import { describe, expect, it } from "vitest"
 import {
-  applyProfilePatch,
   DEFAULT_DEVICE_PROFILE,
   decodeClientMessage,
   decodeServerMessage,
@@ -12,8 +11,6 @@ import {
   PROFILE_FIELDS,
   ProfileField,
   ProfileOverrides,
-  ProfilePatch,
-  patchFields,
   PROTOCOL_VERSION,
   wakeWords
 } from "../src/index.ts"
@@ -29,9 +26,6 @@ const decodeProfile = Schema.decodeUnknownResult(DeviceProfile)
 const okProfile = (v: unknown) => decodeProfile(v)._tag === "Success"
 
 describe("protocol 5", () => {
-  it("is version 5", () => {
-    expect(PROTOCOL_VERSION).toBe(5)
-  })
 
   it("hello needs a front-end role; device and adminToken are optional and validated", () => {
     const { frontend: _f, ...noRole } = clientExamples.hello
@@ -86,8 +80,7 @@ describe("protocol 5", () => {
       ready: true,
       state: "ready",
       voices: [
-        { name: "standard", description: "Everyday answers: quick and clear.", isDefault: true },
-        { name: "natural", description: "Longer replies where warmth matters.", isDefault: false }
+        { name: "sherpa:en_US-lessac-medium", description: "Lessac", isDefault: true }
       ]
     })
     expect(engineSummary({ ...exampleEngineStatus, state: "failed" })).toEqual({ ready: false, state: "failed", voices: [] })
@@ -100,7 +93,6 @@ describe("device profiles", () => {
     expect(okProfile(DEFAULT_DEVICE_PROFILE)).toBe(true)
     expect([...PROFILE_FIELDS].sort()).toEqual(Object.keys(DEFAULT_DEVICE_PROFILE).sort())
     expect([...ProfileField.literals].sort()).toEqual(Object.keys(ProfileOverrides.fields).sort())
-    expect([...ProfileField.literals].sort()).toEqual(Object.keys(ProfilePatch.fields).sort())
   })
 
   it("bounds: phrases 1..12, 1..6 words each; follow-up 0..60 whole seconds; prebuffer 20..500", () => {
@@ -127,24 +119,16 @@ describe("device profiles", () => {
     expect(wakeWords("...")).toEqual([])
   })
 
-  it("patches: a value sets, null removes, absent keeps", () => {
-    const start: ProfileOverrides = { voice: "natural", captions: false }
-    const next = applyProfilePatch(start, { voice: null, followUpSeconds: 12 })
-    expect(next).toEqual({ captions: false, followUpSeconds: 12 })
-    expect(start).toEqual({ voice: "natural", captions: false })
-    expect(patchFields({ voice: null, activation: "always" }).sort()).toEqual(["activation", "voice"])
-    expect(patchFields({})).toEqual([])
-  })
-
   it("effective profile: built-in ← kind ← device", () => {
     const profile = effectiveProfile({ activation: "wake-phrase", voice: "standard" }, { voice: "natural" })
     expect(profile).toEqual({ ...DEFAULT_DEVICE_PROFILE, activation: "wake-phrase", voice: "natural" })
   })
 
-  it("device.update and frontend.update validate their patches", () => {
-    const bad = { ...clientExamples["device.update"], patch: { followUpSeconds: 99 } }
-    expect(decodeClientMessage(JSON.stringify(bad))._tag).toBe("Invalid")
-    const badKind = { ...clientExamples["frontend.update"], kind: "Web Voice" }
-    expect(decodeClientMessage(JSON.stringify(badKind))._tag).toBe("Invalid")
+  it("the protocol 5 messages that protocol 7 replaced are gone (device.update, frontend.update, device.admin.update, device.profile, frontends)", () => {
+    for (const type of ["device.update", "frontend.update", "device.admin.update"]) {
+      expect(Object.keys(clientExamples)).not.toContain(type)
+      expect(decodeClientMessage(JSON.stringify({ type, requestId: "r1", patch: {} }))._tag).toBe("Unknown")
+    }
+    for (const type of ["device.profile", "frontends"]) expect(Object.keys(serverExamples)).not.toContain(type)
   })
 })

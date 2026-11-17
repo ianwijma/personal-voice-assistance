@@ -58,6 +58,7 @@ describe.skipIf(!live)("claude-subscription (live)", () => {
           const start = performance.now()
           const input: AgentTurnInput = {
             turnId: rows.length + 1,
+            conversationId: "live",
             text,
             utterance: text,
             source: "voice",

@@ -9,10 +9,18 @@ Local, CPU-only `Tts` with [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx):
 | `en_US-lessac-medium` (default) | Piper, fp32 | 22050 Hz | 4 | Trained on the Blizzard 2013 Lessac dataset: **non-commercial (research) use only** |
 | `nl_NL-pim-medium` (Dutch) | Piper, fp32 | 22050 Hz | 4 | Dataset CC0; fine-tuned from lessac-medium, so the Lessac terms may carry over |
 | `kokoro-af_heart` | Kokoro v1.0, fp32, speaker 3 | 24000 Hz | 8 | Apache-2.0 |
+| 24 more Piper voices | Piper, fp32 | 22050 Hz (16000 Hz for "low") | 4 | per voice (`license` in the table) |
+| 35 more Kokoro voices (`kokoro-<speaker>`: 27 English, 8 Mandarin) | Kokoro v1.0, fp32, the same archive as `kokoro-af_heart` | 24000 Hz | 8 | Apache-2.0 |
 
-All presets also ship `espeak-ng-data` (GPL-3.0 data files, used for phonemisation). The int8 builds are not used: on this CPU they are about five times slower than fp32.
+The full list, how each voice was chosen and checked, and what was left out (Kokoro's speakers other than English and Chinese: sherpa-onnx 2.x has no espeak fallback, so it skips their words) are in [docs/VOICE-PROVIDERS.md](../../docs/VOICE-PROVIDERS.md) §3.1.
 
-Adding a Piper voice is one line in `src/Presets.ts`: `piper("en_GB-alba-medium", "<licence>")`. The voice must exist as `vits-piper-<voice>.tar.bz2` in the sherpa-onnx `tts-models` release.
+All Piper presets ship `espeak-ng-data` (GPL-3.0 data files, used for phonemisation); the Kokoro archive does too, but sherpa-onnx 2.x ignores it and uses the archive's lexicons. The int8 builds are not used: on this CPU they are about five times slower than fp32.
+
+Adding a Piper voice is one line in `src/Presets.ts`: `piper("en_GB-alba-medium", "<licence>", piperVoice(...))`. The voice must exist as `vits-piper-<voice>.tar.bz2` in the sherpa-onnx `tts-models` release; pass `{ sampleRate: 16_000 }` for a "low" voice and the real sizes when they are not 68/83 MB. Adding a Kokoro speaker is a `kokoro("<speaker>", <id>, ...)` line; take the id from the archive's `speaker2id` (`presets.test.ts` holds the verified table). All Kokoro presets share one archive: `archiveOwner` (the first in the table, `kokoro-af_heart`) is what is downloaded, listed on the Models page and deleted, and `archiveVoices` lists the presets that come with it.
+
+The real-model test (`test/models.test.ts`) runs once per engine set-up (archive and lexicon), not once per Kokoro speaker.
+
+Kokoro has three engine set-ups (`engineSetup`): American, British and Chinese (US + Chinese lexicons and the Chinese rule FSTs). `makeShared` starts an engine that can also speak the other presets of its set-up, each with its own speaker id per clause; the web UI's previews use it so moving between Kokoro voices does not reload the model. `make` (live turns) is unchanged: one speaker per engine.
 
 ## Models
 

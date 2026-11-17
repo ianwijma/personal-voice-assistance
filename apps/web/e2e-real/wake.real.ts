@@ -17,7 +17,8 @@ import {
   missingPrerequisite,
   type Recorded,
   saveLog,
-  setFrontendDefaults,
+  setAssistant,
+  setDeviceDefaults,
   silence,
   spoken,
   startAssistant,
@@ -66,16 +67,16 @@ test.describe("asleep: unrelated talk is ignored; the phrase with a request is a
   const wav = wavOf("wake-ignored-then-request", [silence(2000), spoken(UNRELATED), silence(3000), spoken("Hey Jeff, what time is it?"), silence(16_000)])
   const assistant = withAssistant("request")
 
-  test("ignored talk makes no caption, no transcript and no turn; Add as phrase on it makes it a phrase that wakes", async ({}, testInfo) => {
+  test("ignored talk makes no caption, no transcript and no turn; only the tester sees it", async ({}, testInfo) => {
     test.setTimeout(150_000)
-    await setFrontendDefaults(assistant().url, { activation: "wake-phrase" })
+    await setDeviceDefaults(assistant().url, { withoutPhrase: { mode: "nobody" } })
     const browser = await launch(wav)
     const admin = await newPage(browser, " admin")
     const voice = await admin.context().newPage()
     await instrument(voice, " voice")
     try {
       // The admin's phrase tester listens before the device starts, so it sees every line.
-      await loginAdmin(admin, assistant().url, "#settings/frontends/web-voice")
+      await loginAdmin(admin, assistant().url, "#settings/devices/type-web-voice")
       const tester = admin.getByTestId("phrase-tester")
       await tester.getByTestId("tester-listen").click()
       await expect(tester).toHaveAttribute("data-on", "true")
@@ -92,12 +93,15 @@ test.describe("asleep: unrelated talk is ignored; the phrase with a request is a
       const start = ofType(before, "turn.start")[0] as unknown as { userText: string }
       console.log(`[wake] turn.start userText: ${JSON.stringify(start.userText)}`)
       expect(start.userText).toMatch(/^what time is it\??$/i)
-      expect(ofType(before, "wake")).toEqual([{ type: "wake", phrase: "hey jeff", armed: false }])
+      expect(ofType(before, "wake")).toEqual([{ type: "wake", phrase: "hey jeff", armed: false, assistantId: "assistant" }])
       // Nothing of the unrelated sentence reached the voice page: no transcript, no caption, no "hearing".
       const transcripts = ofType(before, "transcript").map((m) => String(m.text))
       expect(transcripts.join(" ")).not.toMatch(/tomato/i)
-      const states = await visualHistory(voice)
-      expect(states.slice(0, states.indexOf("listening") === -1 ? states.length : states.indexOf("listening"))).not.toContain("hearing")
+      // No "hearing" before the phrase woke it (at the wake the state goes straight to hearing: the same utterance).
+      const inbound = before.filter((m) => m.dir === "in")
+      const wokeAt = inbound.findIndex((m) => m.msg.type === "wake")
+      expect(wokeAt).toBeGreaterThan(-1)
+      expect(ofType(inbound.slice(0, wokeAt), "state").map((m) => m.state)).not.toContain("hearing")
       await waitForMessage(voice, (m) => m.msg.type === "turn.end", { timeout: 30_000 })
       expect((await turnEnds(voice))[0]!.outcome).toBe("completed")
 
@@ -114,16 +118,7 @@ test.describe("asleep: unrelated talk is ignored; the phrase with a request is a
       await expectVisualState(voice, "listening", 10_000)
       await expectVisualState(voice, "asleep", 15_000)
 
-      // Add as phrase on the ignored line ("i think"), save: the same sentence wakes the assistant on the next loop.
-      await ignored.getByRole("button", { name: /Add “i think” as a wake phrase/ }).click()
-      await expect(admin.getByTestId("phrase-list").locator("[data-phrase='i think']")).toBeVisible()
-      await admin.getByTestId("page-footer").getByRole("button", { name: "Save", exact: true }).click()
-      await expect(admin.getByTestId("footer-note")).toContainText("Saved")
-      const from = (await messages(voice)).length
-      const next = await waitForMessage(voice, (m) => m.msg.type === "turn.start", { from, timeout: 45_000 })
-      console.log(`[wake] after Add as phrase, turn.start userText: ${JSON.stringify(next.msg.userText)}`)
-      expect(String(next.msg.userText)).toMatch(/^the tomatoes in the garden need more water\.?$/i)
-      expect(ofType((await messages(voice)).slice(from), "wake")[0]).toMatchObject({ phrase: "i think", armed: false })
+      // (Add as phrase on an ignored line is not built: a heard phrase belongs to an assistant, picked on the device page.)
       expect(await alerts(voice)).toEqual([])
       expect(await alerts(admin)).toEqual([])
     } finally {
@@ -138,18 +133,18 @@ test.describe("asleep: unrelated talk is ignored; the phrase with a request is a
 test.describe("the phrase alone, then the request; the follow-up window; asleep again", () => {
   const wav = wavOf("wake-phrase-alone", [
         silence(2000),
-        spoken("Hey Jeff.", { voice: "natural" }),
+        spoken("Hey Jeff.", { voice: "sherpa:kokoro-af_heart" }),
         silence(1500),
-        spoken("What time is it?", { voice: "natural" }),
+        spoken("What time is it?", { voice: "sherpa:kokoro-af_heart" }),
         silence(7000),
-        spoken(UNRELATED, { voice: "natural" }),
+        spoken(UNRELATED, { voice: "sherpa:kokoro-af_heart" }),
         silence(25_000)
       ])
   const assistant = withAssistant("alone")
 
   test("Hey Jeff. → Listening…, the next sentence is answered; within the follow-up window no phrase is needed; then asleep", async ({}, testInfo) => {
     test.setTimeout(150_000)
-    await setFrontendDefaults(assistant().url, { activation: "wake-phrase", followUpSeconds: 8 })
+    await setDeviceDefaults(assistant().url, { withoutPhrase: { mode: "nobody" } })
     const browser = await launch(wav)
     const page = await newPage(browser, "")
     try {
@@ -157,7 +152,7 @@ test.describe("the phrase alone, then the request; the follow-up window; asleep 
     await page.getByTestId("start").click()
     await expectVisualState(page, "asleep")
     const wake = await waitForMessage(page, (m) => m.msg.type === "wake", { timeout: 20_000 })
-    expect(wake.msg).toEqual({ type: "wake", phrase: "hey jeff", armed: true })
+    expect(wake.msg).toEqual({ type: "wake", phrase: "hey jeff", armed: true, assistantId: "assistant" })
     await expect(page.getByTestId("state-label")).toHaveText("Listening…")
     await waitForMessage(page, (m) => m.msg.type === "turn.start", { timeout: 20_000 })
     await waitForMessage(page, (m) => m.msg.type === "turn.end", { timeout: 30_000 })
@@ -191,7 +186,8 @@ for (const mode of ["always", "wake-phrase"] as const) {
     test(`${LATENCY_TURNS} spoken turns in ${mode} mode: the TurnTrace lines`, async ({}, testInfo) => {
       test.setTimeout(120_000)
       // Follow-up off, so each turn in wake mode really goes through the asleep gate.
-      await setFrontendDefaults(assistant().url, { activation: mode, followUpSeconds: 0 })
+      await setDeviceDefaults(assistant().url, { withoutPhrase: mode === "always" ? { mode: "assistant", assistant: "assistant" } : { mode: "nobody" } })
+      await setAssistant(assistant().url, { followUpSeconds: 0 })
       const logFrom = assistant().log().length
       const browser = await launch(wav)
       const page = await newPage(browser, "")

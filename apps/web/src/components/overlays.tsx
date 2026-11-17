@@ -1,6 +1,7 @@
 "use client"
 import { useEffect, useState, useSyncExternalStore } from "react"
-import { profileOf } from "@/lib/state.ts"
+import { displayPhrase } from "@/lib/state.ts"
+import { phrased } from "@/lib/voiceSetup.ts"
 import { shallowEqual } from "@/lib/store.ts"
 import { useClient, useClientState, usePrefs } from "./context.tsx"
 import { Button } from "./ui/controls.tsx"
@@ -78,7 +79,7 @@ export function ObserverBanner() {
   const secure = useSecureContext()
   return (
     <div data-testid="observer-banner" className="flex flex-col items-center gap-3 animate-[pva-fade-in_320ms_var(--ease-out)] short:gap-2">
-      <p className="text-[14px] text-ink-muted short:text-[13px]">Audio is on another tab or device</p>
+      <p className="text-[14px] text-ink-muted short:text-[13px]">Audio is on another tab</p>
       {secure ? <StartButton>Use this tab</StartButton> : <InsecureNotice />}
     </div>
   )
@@ -123,7 +124,7 @@ export function ConnectingHint() {
   }, [])
   if (!late) return null
   return (
-    <p className="max-w-[420px] text-center text-[14px] text-ink-muted animate-[pva-fade-in_320ms_var(--ease-out)]">
+    <p className="stage-legible max-w-[420px] text-center text-[14px] text-ink-muted animate-[pva-fade-in_320ms_var(--ease-out)]">
       Is the assistant running? Start it with <code className="font-mono text-[13px] text-ink">pnpm start serve</code>.
     </p>
   )
@@ -149,7 +150,7 @@ export function StartHint() {
   const v = useClientState(
     (s) => ({
       muted: !s.audio.micLive,
-      asleep: profileOf(s).activation === "wake-phrase" && s.session.serverState === "asleep" && s.woke === undefined && profileOf(s).wakePhrases.length > 0
+      asleep: s.setup !== undefined && s.setup.withoutPhrase.mode === "nobody" && s.session.serverState === "asleep" && s.woke === undefined && phrased(s.setup).length > 0
     }),
     shallowEqual
   )
@@ -166,13 +167,13 @@ export function StartHint() {
   const kbd = (k: string) => <kbd className="font-mono text-ink-muted">{k}</kbd>
   if (v.muted) {
     return (
-      <p data-testid="start-hint" className="text-center text-[13px] text-ink-faint animate-[pva-fade-in_320ms_var(--ease-out)]">
+      <p data-testid="start-hint" className="stage-legible text-center text-[13px] text-ink-faint animate-[pva-fade-in_320ms_var(--ease-out)]">
         {touch || !keys ? "Tap the microphone to unmute." : <>Press {kbd("M")} or the microphone to unmute.</>}
       </p>
     )
   }
   return (
-    <p data-testid="start-hint" className="text-center text-[13px] text-ink-faint animate-[pva-fade-in_320ms_var(--ease-out)]">
+    <p data-testid="start-hint" className="stage-legible text-center text-[13px] text-ink-faint animate-[pva-fade-in_320ms_var(--ease-out)]">
       {v.asleep ? "…then ask." : "Speak any time."}{" "}
       {touch ? (
         "Tap the microphone to mute, the square to stop a reply."
@@ -185,4 +186,18 @@ export function StartHint() {
       )}
     </p>
   )
+}
+
+/**
+ * Asleep with more phrases than the label can name ("Say a wake phrase"): the phrases here, or where to find them
+ * (docs/mockups/assistants/voice.html).
+ */
+export function AsleepHint() {
+  const text = useClientState((s) => {
+    if (s.setup === undefined) return ""
+    if (s.setup.canPick) return "Each assistant wakes on its own phrase: the menu at the top left lists them."
+    const list = phrased(s.setup).map((a) => `“${displayPhrase(a.phrases[0]!)}”`)
+    return `${list.slice(0, -1).join(", ")} or ${list.at(-1) ?? ""}, then ask.`
+  })
+  return <p data-testid="asleep-hint" className="text-center text-[13px] text-ink-faint">{text}</p>
 }

@@ -2,14 +2,15 @@
 import { useEffect, useMemo, useRef, useState } from "react"
 import type { ChoiceOption, FieldError, ModuleInfo, SettingField, SettingsSection } from "@pva/protocol"
 import { type Draft, errorsByKey, setDraftValue, splitAdvanced } from "@/lib/forms.ts"
-import { type NavPage, savedValues } from "@/lib/settingsTree.ts"
+import { formatSettingsHash, type NavPage, savedValues } from "@/lib/settingsTree.ts"
 import { shallowEqual } from "@/lib/store.ts"
 import { useClient, useClientState } from "../context.tsx"
 import { UnlockForm } from "../KeysPanel.tsx"
 import { Icon, Spinner } from "../ui/Icon.tsx"
 import { Button, cx } from "../ui/controls.tsx"
+import { Tags } from "../ui/Tags.tsx"
 import { FieldRow } from "./FieldRow.tsx"
-import { ModuleHeader, ModuleTools, moduleStateText } from "./ModuleHeader.tsx"
+import { ModuleHeader, ModuleInstances, ModuleTools, moduleStateText } from "./ModuleHeader.tsx"
 import { MarkerLegend } from "./FormFooter.tsx"
 import { PageFooter } from "./PageFooter.tsx"
 import { type PageFormDef, type PageForms, type PageFormView, usePageForms } from "./usePageForms.ts"
@@ -28,30 +29,28 @@ const linkedOptions = (sections: ReadonlyArray<SettingsSection>) =>
  * has keys, chooses providers or is an agent) is read-only only while the key vault is locked, and offers Unlock
  * right here. One sticky footer saves every form on the page.
  */
-export function ServerPage({ page }: { readonly page: NavPage }) {
+export function ServerPage({ page, extra }: { readonly page: NavPage; readonly extra?: React.ReactNode }) {
   const client = useClient()
   const keysLocked = useClientState((s) => s.vault.state === "locked")
   const admin = !keysLocked
   const vault = useClientState((s) => s.vault, shallowEqual)
   const allSections = useClientState((s) => s.sections)
   const modules = useClientState((s) => s.modules.byId)
-  const sections = page.source.kind === "sections" ? page.source.sections : []
-  const module = page.source.kind === "module" ? modules[page.source.moduleId] : undefined
+  const sections = page.source.kind === "server" ? page.source.sections : []
+  const pageModules = (page.source.kind === "server" ? page.source.moduleIds : []).flatMap((id) => (modules[id] !== undefined ? [modules[id]!] : []))
   const links = linkedOptions(sections)
   const editable = !page.protected || admin
 
   const defs: ReadonlyArray<PageFormDef> = useMemo(() => [
     ...sections.map((s): PageFormDef => ({ key: `s:${s.id}`, kind: "section", id: s.id, form: s.form, revision: s.revision, readOnly: s.protected === true && !admin })),
-    ...(module !== undefined
-      ? [{ key: `m:${module.id}`, kind: "module" as const, id: module.id, form: module.settings, revision: module.revision, readOnly: module.protected === true && !admin }]
-      : []),
+    ...pageModules.map((module) => ({ key: `m:${module.id}`, kind: "module" as const, id: module.id, form: module.settings, revision: module.revision, readOnly: module.protected === true && !admin })),
     ...links.flatMap((l) => {
       const m = modules[l.module.id]
       return m === undefined || l.module.optIn === undefined
         ? []
         : [{ key: `m:${m.id}`, kind: "module" as const, id: m.id, form: m.settings, revision: m.revision, readOnly: m.protected === true && !admin, only: [l.module.optIn] }]
     })
-  ], [sections, module, links.map((l) => `${l.module.id}:${modules[l.module.id]?.revision}`).join(","), modules, admin])
+  ], [sections, pageModules.map((m) => `${m.id}:${m.revision}:${m.protected}`).join(","), links.map((l) => `${l.module.id}:${modules[l.module.id]?.revision}`).join(","), modules, admin])
 
   const values = useMemo(() => savedValues(allSections), [allSections])
   const forms = usePageForms(defs, (key) => values.get(key), {
@@ -74,14 +73,20 @@ export function ServerPage({ page }: { readonly page: NavPage }) {
   })?.option.label
 
   const notInUse = !page.inUse
+  // A merged page can hold protected and unprotected forms: while the vault is locked only the protected ones are
+  // read-only, so Save and Cancel are there for the others.
+  const someEditable = forms.views.some((v) => !v.def.readOnly && v.def.form.fields.some((f) => f.locked === undefined))
   return (
     <div className="flex flex-1 flex-col" data-testid={`page-${page.group}-${page.id}`} data-locked={editable ? undefined : "true"}>
       <div className="flex flex-1 flex-col gap-7 pb-8">
         {forms.views.some((v) => v.def.form.fields.some((f) => f.locked === undefined)) && <div className="-mb-3"><MarkerLegend device={false} /></div>}
-        {!editable && <KeysLocked />}
+        {!editable && <KeysLocked partly={someEditable} />}
         {notInUse && sections.length > 0 && <NotInUse />}
-        {module !== undefined && <ModuleHeader module={module} editable={editable} />}
-        {forms.views.filter((v) => v.def.only === undefined).map((view) => (
+        {page.group === "shared" && page.id === "routing" && <RoutingIntro />}
+        {page.id === "modules" && pageModules.length === 0 && (
+          <p className="rounded-md border border-dashed border-line px-4 py-5 text-[14px] text-ink-muted" data-testid="no-modules">No modules are installed.</p>
+        )}
+        {forms.views.filter((v) => v.def.only === undefined && v.def.kind === "section").map((view) => (
           <FormBlock key={view.def.key} view={view} forms={forms} heading={sections.length > 1 ? sections.find((s) => `s:${s.id}` === view.def.key)?.title : undefined} vault={vault}
             renderAfter={(field) => {
               const link = links.find((l) => l.field.key === field.key && `s:${l.section.id}` === view.def.key)
@@ -96,17 +101,70 @@ export function ServerPage({ page }: { readonly page: NavPage }) {
                   fieldKey={field.key}
                   view={forms.views.find((v) => v.def.key === `m:${m.id}` && v.def.only !== undefined)}
                   forms={forms}
-                  editable={editable}
+                  editable={!view.def.readOnly && (m.protected !== true || admin)}
                   saved={values.get(field.key)}
                 />
               )
             }}
           />
         ))}
-        {module !== undefined && <ModuleTools module={module} />}
+        {pageModules.map((module, i) => (
+          <ModuleBlock key={module.id} module={module} editable={module.protected !== true || admin} first={i === 0 && sections.length === 0} forms={forms} vault={vault} />
+        ))}
+        {extra}
       </div>
-      {editable && (forms.views.some((v) => !v.def.readOnly && v.def.form.fields.some((f) => f.locked === undefined)) || forms.dirty) && <PageFooter forms={forms} commitVia={commitVia} />}
+      {(someEditable || forms.dirty) && <PageFooter forms={forms} commitVia={commitVia} />}
     </div>
+  )
+}
+
+/** One module on a shared page: its name, who uses it, its switch and state, its form and its tools. */
+function ModuleBlock({ module: m, editable, first, forms, vault }: {
+  readonly module: ModuleInfo
+  readonly editable: boolean
+  readonly first: boolean
+  readonly forms: PageForms
+  readonly vault: Parameters<typeof FieldRow>[0]["vault"]
+}) {
+  const view = forms.views.find((v) => v.def.key === `m:${m.id}` && v.def.only === undefined)
+  const assistants = useClientState((s) => s.assistants, shallowEqual)
+  // Who uses the module: the switched-on assistants that have it on; those with their own values for some of its fields are named for them.
+  const users = assistants.filter((a) => a.on && a.modules[m.id]?.on === true)
+  const ownerOf = (a: (typeof users)[number]) => {
+    const own = a.modules[m.id]?.own
+    if (own === undefined) return undefined
+    const keys = m.settings.fields.filter((f) => f.overridable === true && Object.hasOwn(own, f.key) && JSON.stringify(own[f.key]) !== JSON.stringify(m.settings.values[f.key])).map((f) => f.label.toLowerCase())
+    return keys.length === 0 ? "settings, the same as these" : keys.join(", ")
+  }
+  const sharedUsers = users.filter((a) => ownerOf(a) === undefined || ownerOf(a) === "settings, the same as these")
+  const owners = users.filter((a) => ownerOf(a) !== undefined && ownerOf(a) !== "settings, the same as these")
+  const link = (a: (typeof users)[number]) => <a href={formatSettingsHash(["assistants", a.id, "modules"])} className="text-voice underline-offset-4 hover:underline">{a.name}</a>
+  return (
+    <section className={cx("flex flex-col gap-5", !first && "border-t border-line/60 pt-7")} data-testid={`module-block-${m.id}`}>
+      <div className="flex flex-col gap-1">
+        <h3 className="text-[16px] font-medium text-ink">{m.name}</h3>
+        {m.kind !== "agent" && m.kind !== "decider" && (
+          <p className="text-[13px] text-ink-muted" data-testid="used-by">
+            {users.length === 0 ? "Used by: no assistant yet" : (
+              <>
+                Used by:{" "}
+                {sharedUsers.length === 0 ? "no assistant with these values" : sharedUsers.map((a, i) => <span key={a.id}>{i > 0 && ", "}{link(a)}</span>)}
+                {owners.map((a) => <span key={a.id}>{" · "}{link(a)} has its own {ownerOf(a)}</span>)}
+              </>
+            )}
+          </p>
+        )}
+      </div>
+      {m.instances !== undefined && m.kind !== "agent" && m.kind !== "decider" ? <ModuleInstances module={m} /> : <ModuleHeader module={m} editable={editable} />}
+      {view !== undefined && <FormBlock view={view} forms={forms} heading={undefined} vault={vault} renderAfter={() => null} />}
+      {m.instances !== undefined && m.settings.fields.some((f) => f.overridable === true) && (
+        <p className="-mt-2 text-[13px] text-ink-muted" data-testid="own-note">
+          An assistant can have its own {m.settings.fields.filter((f) => f.overridable === true).map((f) => f.label.toLowerCase()).join(", ")}
+          {m.settings.fields.some((f) => f.overridable !== true) ? "; the other settings are always shared" : ""}.
+        </p>
+      )}
+      <ModuleTools module={m} />
+    </section>
   )
 }
 
@@ -182,13 +240,47 @@ function FormBlock({ view, forms, heading, vault, renderAfter }: {
   )
 }
 
+/**
+ * Shared settings › Routing: what TypeSafe is, that it is hosted, whether it is set up, and which devices let it
+ * decide (the mock-up's header; the switch, key, model and address are the section's own fields below).
+ */
+function RoutingIntro() {
+  const routing = useClientState((s) => s.sections.find((x) => x.id === "routing"))
+  const devices = useClientState((s) => s.devices.filter((d) => d.settings.withoutPhrase.mode === "typesafe").map((d) => ({ id: d.id, name: d.name })), shallowEqual)
+  const on = routing?.form.values.TYPESAFE_ROUTING === true
+  const key = routing?.form.secrets.TYPESAFE_API_KEY?.set === true
+  const status = on && key ? "On" : key ? "Key set, switched off" : on ? "Needs a key" : "Not set up"
+  return (
+    <section className="flex flex-col gap-3" data-testid="routing-intro">
+      <div className="flex flex-wrap items-baseline gap-2">
+        <h3 className="text-[16px] font-medium text-ink">TypeSafe</h3>
+        <Tags tags={["hosted", "needs-key"]} />
+        <span className="ml-auto inline-flex items-center gap-1.5 text-[12px] text-ink-muted" data-testid="routing-status">
+          <span className={cx("inline-block size-2 rounded-full", on && key ? "bg-ok" : "bg-ink-faint")} aria-hidden="true" />
+          {status}
+        </span>
+      </div>
+      {routing?.description !== undefined && <p className="text-[13px] text-ink-muted">{routing.description}</p>}
+      <p className="text-[13px] text-ink-muted" data-testid="routing-used-by">
+        Used by:{" "}
+        {devices.length === 0 ? "no device yet" : devices.map((d, i) => (
+          <span key={d.id}>
+            {i > 0 && ", "}
+            <a href={formatSettingsHash(["devices", d.id])} className="text-voice underline-offset-4 hover:underline">{d.name}</a>
+          </span>
+        ))}
+      </p>
+    </section>
+  )
+}
+
 /** A protected page while the key vault is locked: say so, and take the vault password right here. */
-function KeysLocked() {
+function KeysLocked({ partly }: { readonly partly: boolean }) {
   return (
     <div className="flex flex-col gap-3 rounded-md border border-line bg-surface-2/40 px-4 py-3" data-testid="keys-locked">
       <p className="flex items-start gap-2 text-[13px] text-ink">
         <Icon name="key" size={15} className="mt-0.5 shrink-0 text-ink-muted" />
-        <span>The keys are locked, so this page cannot be changed. Type the vault password to unlock them.</span>
+        <span>The keys are locked, so {partly ? "some settings on this page" : "this page"} cannot be changed. Type the vault password to unlock them.</span>
       </p>
       <UnlockForm label="Unlock" compact idSuffix="page" />
     </div>

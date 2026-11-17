@@ -23,6 +23,7 @@ import { VoiceSheet } from "./VoiceSheet.tsx"
 export function VoiceApp() {
   const [client] = useState(() => createAssistantClient({ frontend: "voice" }))
   useEffect(() => client.connect(), [client])
+  // `?character=<id>&opt.<id>=<value>` tries a character for this page load: the stage reads it (`Visualiser.tsx`).
   useEffect(() => {
     // For tests and debugging in the console.
     ;(window as unknown as { __pva?: unknown }).__pva = client

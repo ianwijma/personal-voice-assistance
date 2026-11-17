@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync } from "node:fs"
+import { existsSync, mkdtempSync, readFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { fileURLToPath } from "node:url"
@@ -32,6 +32,14 @@ const isAlive = (pidFile: string) => {
 const pattern = (n: number, from = 0) => new Uint8Array(n).map((_, i) => (from + i) % 256)
 const concat = (chunks: ReadonlyArray<Uint8Array>) => Buffer.concat(chunks)
 const now = Effect.sync(() => performance.now())
+/** The most a child's stdout channel can hold unread: the kernel's default socket send buffer (256 KiB if unknown). */
+const channelBytes = () => {
+  try {
+    return Number(readFileSync("/proc/sys/net/core/wmem_default", "utf8")) || 262_144
+  } catch {
+    return 262_144
+  }
+}
 
 describe("commands", () => {
   it("builds pw-record / pw-cat arguments", () => {
@@ -74,16 +82,51 @@ describe("capture", () => {
   it.live("a consumer that falls behind gets at most the newest 3 s, not everything the process wrote", () =>
     Effect.gen(function*() {
       const pidFile = join(tmp(), "pid")
-      let received = 0
-      const fiber = yield* captureStream(node("capture.mjs", pidFile, 640 * 2000, "hang")).pipe(
-        Stream.runForEach(() => Effect.andThen(Effect.sync(() => void received++), received === 0 ? Effect.sleep(700) : Effect.void)),
-        Effect.forkChild
+      const written = `${pidFile}.written`
+      // The consumer stalls on the first batch it pulls. That batch is whatever was queued at the
+      // first pull (1 frame on a quiet machine, 50+ on a loaded one), and it is already in the
+      // consumer's hands, so it is counted apart from what the stall lets through.
+      let firstBatch = 0
+      const afterStall: Array<Uint8Array> = []
+      const stall = Effect.gen(function*() {
+        const start = yield* now
+        // Stall until the stand-in has written every frame, so the sliding buffer has
+        // certainly overflowed, then a little longer for the parent to read the channel's tail.
+        while (!existsSync(written)) yield* Effect.sleep(10)
+        yield* Effect.sleep(Math.max(100, 700 - ((yield* now) - start)))
+      })
+      // What this process may read late (see below). The stand-in writes several times the most
+      // a bounded buffer can deliver, however large the channel is on this machine.
+      const late = Math.ceil(channelBytes() / 640) + 1
+      const total = 3 * (captureBufferFrames + late) + 500
+      const error = yield* captureStream(node("capture.mjs", pidFile, 640 * total, "exit", "indexed")).pipe(
+        Stream.runForEachArray((frames) => {
+          if (firstBatch === 0) {
+            firstBatch = frames.length
+            return stall
+          }
+          afterStall.push(...frames)
+          return Effect.void
+        }),
+        Effect.flip
       )
-      // Long enough for the stand-in process to start when the whole suite is loading the machine.
-      yield* Effect.sleep(2_500)
-      yield* Fiber.interrupt(fiber)
-      assert.isAtMost(received, 1 + captureBufferFrames + 20, `received ${received} of 2000 frames`)
-      assert.isAbove(received, 1)
+      assert.strictEqual(error._tag, "AudioError")
+      // One pull cannot hand over more than the buffer holds.
+      assert.isAtLeast(firstBatch, 1)
+      assert.isAtMost(firstBatch, captureBufferFrames)
+      const told = `${afterStall.length} frames after the stall (first batch ${firstBatch})`
+      // Everything was queued while the consumer stalled; only the newest 3 s survive.
+      assert.isAtLeast(afterStall.length, captureBufferFrames, told)
+      // When the stall ends, the stand-in has handed everything to the kernel, but this process
+      // may not have read all of it yet. What it reads late is extra, and is at most what the
+      // channel (a socketpair) holds, so that is the honest upper bound: under a third of what was written.
+      assert.isAtMost(afterStall.length, captureBufferFrames + late, told)
+      // Whatever arrived late, the buffer drops the oldest: the last 3 s delivered are the last 3 s written.
+      // Each frame carries its number, so this cannot pass on older frames that happen to look alike.
+      assert.deepStrictEqual(
+        afterStall.slice(-captureBufferFrames).map((f) => new DataView(f.buffer, f.byteOffset, f.byteLength).getUint32(0, true)),
+        Array.from({ length: captureBufferFrames }, (_, i) => total - captureBufferFrames + i)
+      )
     }))
 
   it.live("an unexpected exit fails the stream with AudioError carrying stderr, after the audio", () =>

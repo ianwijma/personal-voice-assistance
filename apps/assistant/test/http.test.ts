@@ -25,13 +25,14 @@ const rejectingHub = (): SessionHub & { rejected: number } => {
       return undefined
     },
     broadcast: () => {},
-    ownerMode: () => undefined,
+    toSession: () => {},
+    sessionsChanged: () => {},
+    sessionDiscarded: () => {},
     closeAll: () => {},
     size: () => 0,
     micFramesLost: () => 0,
     vaultChanged: () => {},
-    ownerProfile: () => undefined,
-    refreshProfiles: () => {},
+    refreshDevices: () => {},
     wakeHeard: () => {}
   }
   return hub

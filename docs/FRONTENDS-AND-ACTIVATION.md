@@ -1,5 +1,27 @@
 # Front ends, admin and activation
 
+> **Changed 2026-11-16 (docs/ASSISTANTS.md, protocol 7).** Assistants are things the admin creates, and devices say which
+> assistants answer on them. What this document still describes as it is: the two front ends, the admin password and
+> sessions, role-shaped data, device identity, wake-phrase matching and the utterance contract, the phrase tester. What
+> was replaced:
+>
+> | Protocol 5 / 6 | Now |
+> |---|---|
+> | front-end kinds (`FRONTEND_KINDS`, the Front ends page) | device types (`DEVICE_TYPES`; Devices › Every browser) with their defaults |
+> | device profile (`DeviceProfile`, overrides, `effectiveProfile`) | device settings in sections (`DeviceSettings`, `own`, `effectiveDeviceSettings`) |
+> | `device.profile`, `device.update`, `frontend.update`, `device.admin.update`, `frontends`, `snapshot.device` | `device.setup`, `device.pick` (voice); `device.save`, `device.types`, `assistants` (admin) |
+> | `activation` `always` / `wake-phrase`, one phrase list, one follow-up time | the device's `withoutPhrase` (`nobody`, one assistant, TypeSafe decides) and per assignment phrases and follow-up |
+> | `WakeGate` in the session | `RouteGate` and the session dispatcher (`WakeGate` stays in core for the offline bench and the voice-node branch) |
+> | `snapshot.conversation` | `snapshot.conversations`, one per assistant |
+>
+> The version 3 profile types stay in `@pva/protocol` only for the settings migration. Sections 2 to 5 below say what was
+> built in protocol 5; each says what replaced it. The "Status" section is the build log of protocol 5.
+
+> **Changed 2026-11-16 (docs/VOICE-PROVIDERS.md):** the assistant speaks every reply with one voice
+> (`ASSISTANT_VOICE`); the voice router, `[voice:NAME]` markers, `VOICES` and `DEFAULT_VOICE` are gone, and a device
+> profile's `voice` no longer changes the voice (it falls back to `""`, the assistant's voice). Where this document
+> describes per-device voices or the router, that is the design as it was.
+
 Design written 2026-11-14 (lead session). It changes three things:
 
 1. The web UI splits into two front ends: a simple **voice** front end and a password-protected **admin** front end.
@@ -19,65 +41,52 @@ anything that had to differ from this design, with the reason.
 | What admin means | A connection is admin after `admin.login` with that password (or a valid session token, below). **Every** change to server settings, modules, the vault, jobs, models, `.env` moves, front-end defaults and devices needs an admin connection. The old rule "typing the vault password makes a page admin" and "no vault = everyone is admin" both go away. |
 | Vault | Unchanged as the encrypted key store. It still needs its own password to unlock (`PVA_VAULT_PASSWORD` for unattended start, or typed in the admin UI by an admin). Admin login does not unlock it. |
 | Admin session | Login returns a random session token (32 bytes, base64url). The admin page keeps it in `sessionStorage` and sends it in `hello`, so a reload or reconnect stays logged in. The server keeps tokens in memory only: they end at logout, after 12 h, after 30 min without an admin action, and at restart. Wrong passwords use the same back-off as vault unlock attempts. Comparison is constant-time (`crypto.timingSafeEqual` over SHA-256 digests). |
-| What a non-admin connection receives | A voice connection gets what it needs to run a conversation and nothing else: state, role, history, engine state reduced to "ready / not ready" plus the enabled voices, its device profile. No settings sections, modules, env list, models, jobs, vault info, traces. Admin data is sent only after login. |
-| Configuration | All of it lives in the admin front end: the existing two-level settings screen moves there whole. New categories: **Front ends** and **Devices**. |
-| Voice front end settings | One small sheet: Voice, Activation, Microphone, Speaker, and one collapsed "More" group at most. Everything else that used to be per-browser (`interruptMode`, audio processing, captions, output path, prebuffer) becomes part of the device profile, with defaults per kind and overrides per device, edited in admin. Microphone and speaker ids stay in the browser (hardware ids mean nothing elsewhere). |
-| Activation | Server-side, on the recogniser's transcript: a pure `WakeGate` in `packages/core`, placed after the `EchoGate` and before `Conversation`. No extra model, no extra latency, any phrase in any language, several phrases per device. |
+| What a non-admin connection receives | A voice connection gets what it needs to run a conversation and nothing else: state, role, history, engine state reduced to "ready / not ready" plus the enabled voices, its device setup (protocol 7; a device profile in protocol 5). No settings sections, modules, env list, models, jobs, vault info, traces. Admin data is sent only after login. |
+| Configuration | All of it lives in the admin front end: the existing two-level settings screen moves there whole. Protocol 5 added the categories **Front ends** and **Devices**; protocol 7 replaced them with **Assistants**, **Devices** and **Shared settings** (docs/ASSISTANTS.md §7.1). |
+| Voice front end settings | One small sheet: Assistant (who answers on this device, when the admin allows picking), Microphone, Speaker, and one collapsed "More" group at most (protocol 5 had Voice and Activation here; the voice is the assistant's and activation is the device's `withoutPhrase`). Everything else that used to be per-browser (`interruptMode`, audio processing, captions, output path, prebuffer) is a device setting, with defaults per device type and own sections per device, edited in admin. Microphone and speaker ids stay in the browser (hardware ids mean nothing elsewhere). |
+| Activation | Server-side, on the recogniser's transcript: a pure gate in `packages/core` (`WakeGate` in protocol 5, `RouteGate` since protocol 7: phrases carry their assistant), placed after the `EchoGate` and before the conversations. No extra model, no extra latency, any phrase in any language, several phrases per device. |
 
-## 2. Front-end kinds, devices, profiles
+## 2. Device types, devices, settings (protocol 5: kinds, devices, profiles; replaced by docs/ASSISTANTS.md §2.3)
 
-A **front-end kind** is a type of client. Today there is one: `web-voice` ("Voice assistant in a browser"). The near
-future adds apps on machines with a microphone and a speaker plugged in (`satellite`). Kinds are a small registry on
-the server (`apps/assistant/src/serve/frontends.ts`): id, title, description, and which profile fields apply to it.
-Adding a kind is one entry.
+A **device type** is a kind of client. Today there is one: `web-voice` ("Browsers"). The near future adds apps on machines
+with a microphone and a speaker plugged in (the voice nodes, docs/VOICE-NODES.md on its branch). Types are a code registry
+(`DEVICE_TYPES`, `packages/protocol/src/devices.ts`; protocol 5 had `FRONTEND_KINDS` in `serve/frontends.ts`): kind id,
+title, which setting sections apply, and the built-in defaults. Adding a type is one entry.
 
-A **device** is one installed front end: a browser on a phone, a satellite box. It has a stable `deviceId` (random,
-kept in `localStorage` by the browser; distinct from the per-tab `clientId`), a kind, and a name (default: derived
-from the user agent, e.g. "iPhone · Safari"; renameable in admin). The server records a device the first time it says
-hello: `{ id, kind, name, firstSeen, lastSeen, overrides }`. Admin can rename and forget devices. At most 64 devices
-are kept (least recently seen dropped first; devices with overrides are dropped last).
+A **device** is one installed front end: a browser on a phone, a satellite box. It has a stable `deviceId` (random, kept in
+`localStorage` by the browser; distinct from the per-tab `clientId`), a kind, and a name (default: derived from the user
+agent, e.g. "iPhone · Safari"; renameable in admin). The server records a device the first time it says hello
+(`DeviceRegistry`, `serve/devices.ts`): `{ kind, name, firstSeen, lastSeen, own, rev }`. Admin can rename and forget devices.
+At most 64 devices are kept (least recently seen dropped first; devices with own settings are dropped last).
 
-A **profile** is the set of per-device settings:
+A device's **settings** are the sections of `DeviceSettings`: `assistants` (the ordered assistants that answer here, each
+with its wake phrases and an optional follow-up time), `withoutPhrase`, `matching`, `voicePage`, `interruptMode`, `audio`,
+`captions`. Effective settings = built-in defaults ← the type's defaults (admin: Devices › Every browser) ← the device's own
+sections (admin: Devices › the device; each section "Own value · Reset"). They are stored in `data/settings.json` version 4
+(`deviceTypes`, `devices`). Protocol 5's `DeviceProfile` (activation, one phrase list, follow-up, voice, interrupt mode,
+audio, captions) was that, flat and per field; its stored form is read only by the version 3 migration.
 
-```ts
-DeviceProfile = {
-  activation: "always" | "wake-phrase"
-  wakePhrases: ReadonlyArray<string>      // 1..12 phrases, each 1..6 words, e.g. ["hey jeff", "hey jev", "hey geoff"]
-  wakeMatch: "exact" | "close"            // "close" tolerates small spelling differences per word (see §3)
-  followUpSeconds: number                 // 0..60; after a reply, keep reacting without the phrase this long. Default 8
-  voice: string                           // "" = the assistant's default voice; else the name of an enabled voice
-  interruptMode: "instant" | "confirm" | "manual"
-  captions: boolean
-  speakReplies: boolean
-  echoCancellation: boolean
-  noiseSuppression: boolean
-  autoGainControl: boolean
-  outputPath: "direct" | "element"
-  prebufferMs: number
-}
-```
+The server sends each voice connection its device's setup (`device.setup`, also `snapshot.setup`: the assistants with their
+phrases, who answers without a phrase, `canPick`, `canAuto`, interrupt mode, audio and captions) and again whenever it
+changes, so a change in admin reaches a running device live. A voice connection never learns another device's setup, or a
+prompt, model, key or Handles. A device may change only who answers without a phrase, and only when its settings allow it
+(`device.pick`); everything else is admin only.
 
-Effective profile = built-in defaults ← kind defaults (admin: Front ends › *kind*) ← device overrides (admin: Devices ›
-*device*, and the device's own sheet for the fields it may change). Stored in `data/settings.json` under
-`frontends: { [kind]: Partial<DeviceProfile> }` and `devices: { [id]: DeviceRecord }` through the existing
-`SettingsStore` (same atomic write, same revision rules; a version bump with a migration that adds the two empty
-maps). A device may change **only** `voice`, `activation` and `followUpSeconds` for itself without admin; everything
-else in its profile is admin only. The server validates every value (a voice that is not enabled falls back to `""`).
+What the server does with a device's settings:
 
-The server sends each connection its effective profile (`device.profile`, also in the snapshot) and again whenever it
-changes, so a change in admin reaches a running device live. The browser's old `localStorage` values for the moved
-fields are not migrated: they are dropped and the kind defaults apply (these equal today's defaults).
+- `assistants`, `withoutPhrase`, `matching` → the `RouteGate` (§3). A device with no assistant runs no recogniser.
+- the hearer (the assistant that answers without a phrase, else the first in the list) → which recogniser the device uses.
+- `interruptMode` → the `EchoGate`.
 
-What the server does with the audio owner's profile:
+The rest is applied by the browser.
 
-- `activation`, `wakePhrases`, `wakeMatch`, `followUpSeconds` → the `WakeGate` (§3). No owner = gate in `always`.
-- `voice` → the voice router's default voice while this device owns the audio (`Engine`'s `defaultVoice()` hook already
-  swaps the default live at a fixed output rate). Falls back to `DEFAULT_VOICE` when empty or no longer enabled.
-- `interruptMode` → the `EchoGate`, as today, but read from the profile instead of `audio.claim`.
+## 3. Wake phrases (`packages/core/src/WakeGate.ts`; since protocol 7 `RouteGate.ts`)
 
-The rest of the profile is applied by the browser.
-
-## 3. Wake phrases (`packages/core/src/WakeGate.ts`)
+> Since protocol 7 the session runs `RouteGate` (docs/ASSISTANTS.md §3.4), built from the gate below: the same matcher
+> (`matchWakePhrase`) and utterance contract, with phrases that carry their assistant, armed and follow-up windows per
+> assistant, three without-phrase modes, and a phrase that is matched and removed in every mode (`always` used to pass it
+> on). The text below describes `WakeGate`, which stays in core for the offline bench and the voice-node branch, and the
+> matching rules both share.
 
 Pure and synchronous like `EchoGate`; time is passed in. It filters the `SttEvent` stream and must keep the
 utterance contract of docs/ARCHITECTURE.md (every forwarded utterance begins with `SpeechStarted` and ends with
@@ -145,7 +154,7 @@ Latency: the gate is a synchronous function on events that already exist; with w
 made on the eager transcript, the same moment a speculative turn starts today. Verify with `bench` (offline) that
 the `TurnTrace` numbers in `always` mode are unchanged, and report the wake-mode numbers next to them.
 
-## 4. Protocol (version 5)
+## 4. Protocol (version 5; the current version is 7, docs/ASSISTANTS.md §5)
 
 The builder of the protocol part writes the exact schemas in `packages/protocol` and lists them here under Status.
 Required shape:
@@ -157,38 +166,41 @@ Required shape:
 - Admin: `admin.login { password }` → result with `{ token, expiresAt }`; `admin.logout`; server `admin.state`
   (`{ enabled, loggedIn, retryAfterMs? }`, where `enabled: false` means no `PVA_ADMIN_PASSWORD`). New error code
   `admin_required` for any admin-only request from a non-admin connection.
-- Profiles: server `device.profile { profile, editable: [...] }`; client `device.update { patch }` (own device,
-  editable fields only); admin `frontend.update { kind, patch }`, `device.admin.update { id, name?, patch? }`,
-  `device.forget { id }`; server `frontends` / `devices` to admin connections on change. A `null` in a patch
-  removes the override.
+- Profiles (protocol 5; removed in protocol 7): server `device.profile { profile, editable: [...] }`; client
+  `device.update { patch }`; admin `frontend.update { kind, patch }`, `device.admin.update { id, name?, patch? }`; server
+  `frontends`. Their replacements: server `device.setup`; voice `device.pick`; admin `device.save { target, rev, settings }`
+  (a `null` section removes a device's own value), `assistant.create` / `assistant.save` / `assistant.delete`; server
+  `assistants`, `device.types`. Still there: admin `device.forget { id }` and server `devices` (now with `own`, `settings`,
+  `hearer`, `rev`).
 - Activation: `AssistantState` gains `asleep` (owner present, wake mode, no window open). Server `wake`
   `{ phrase, armed }` to all connections when a phrase is heard. Admin tester: `wake.test { on }` and server
   `wake.heard { text, matched?: phrase, at }` to connections that switched it on (5 min limit, then off).
-- `audio.claim` / `audio.config` lose `interruptMode` (it comes from the profile).
+- `audio.claim` / `audio.config` lose `interruptMode` (it comes from the device's settings).
 - A voice connection no longer needs `vault.*`, `settings.*`, `module.*`, `job.*`, `model.*`: all admin only.
 
 ## 5. The two UIs
 
 **Voice (`/`)**: the stage (visualiser, state label, captions), the control dock (start/stop, mute, stop reply, chat),
 the chat panel, and a settings sheet. New state `asleep`: the state label reads *Say "Hey Jeff"* (first phrase of the
-profile), the visualiser is calm; on `wake` it shows "Listening…" and plays a short soft cue (WebAudio, two tones,
+device's phrases), the visualiser is calm; on `wake` it shows "Listening…" and plays a short soft cue (WebAudio, two tones,
 under 200 ms, generated, no asset; skipped when the phrase and the request came in one sentence and a reply follows).
-Settings sheet: **Voice** (enabled voices with description; "Assistant default"), **Activation** (Always listening /
-Wake phrase, showing the phrases read-only with "Change in admin"; follow-up seconds), **Microphone**, **Speaker**,
-link "Admin" (opens `/admin/`). Removed from this front end: the whole settings shell, latency readout, keys,
+Settings sheet (protocol 7): **Assistant** (who answers on this device; a radio list when the device allows picking),
+**Microphone**, **Speaker**, link "Admin" (opens `/admin/`). Protocol 5 had **Voice** and **Activation** groups here; the
+voice is the assistant's and activation is the device's `withoutPhrase` (docs/ASSISTANTS.md §7.2). Removed from this front end: the whole settings shell, latency readout, keys,
 diagnostics, shortcuts for them.
 
 **Admin (`/admin/`)**: login screen (password, error, back-off countdown, the disabled explanation), then the existing
 two-level settings screen as the page itself (not a dialog over the voice stage), with a header showing the assistant
-state, "Log out" and a link back to the voice front end. Categories, in order: Overview, **Front ends**, **Devices**,
-Language model, Speech recognition, Voices, Modules, Keys & vault, Diagnostics, About. No audio is ever claimed by the
+state, "Log out" and a link back to the voice front end. Categories, in order, in protocol 5: Overview, **Front ends**, **Devices**,
+Language model, Speech recognition, Voices, Modules, Keys & vault, Diagnostics, About; in protocol 7: Overview, **Assistants**,
+**Devices**, **Shared settings**, Keys & vault, Diagnostics, About (docs/ASSISTANTS.md §7.1). No audio is ever claimed by the
 admin page.
 
-- **Front ends › Voice assistant in a browser**: the kind's default profile, as one page with groups *Activation*
+- **Front ends › Voice assistant in a browser** (protocol 7: **Devices › Every browser**, the same page as a device's with "Own value · Reset" per section): the kind's default profile, as one page with groups *Activation*
   (mode, phrases as an editable list with add/remove, match strictness, follow-up), *Voice*, *Interrupting*,
   *Audio processing*, *Display*, *Advanced*. A **phrase tester** sits under the phrase list: "Listen" shows what the
   recogniser heard from the current audio owner, live, each line marked matched (with the phrase) or ignored, and an
-  **Add as phrase** button on ignored lines: this is how a mishearing ("hey go") becomes an accepted phrase.
+  **Add as phrase** button on ignored lines: this is how a mishearing ("hey go") becomes an accepted phrase (not built in protocol 7: a heard phrase belongs to an assistant, which is picked on the device page).
 - **Devices**: a list (name, kind, last seen, "this is the audio owner now", how it activates); a device page with
   rename, forget, and the same profile form where each field shows "Default (…)" or an override with "Reset".
 - **Keys & vault** keeps the vault parts of the old Edit access page; the "admin access" part is replaced by the login.
@@ -204,7 +216,7 @@ admin page.
 3. **Integration**: build, run the real server against both pages, `pnpm check`, `pnpm test`, e2e.
 4. **UI review rounds** until both front ends score at least 8 overall.
 
-## Status
+## Status (the build log of protocol 5; names are as built then, protocol 7 replaced the ones in the table at the top)
 
 ### Step 1, foundations: built (2026-11-14)
 
@@ -266,7 +278,7 @@ New and changed messages (schema constant → `type`):
 | server | `Frontends` | `frontends` | `{ frontends: FrontendKindInfo[] }`, admin only |
 | server | `Devices` | `devices` | `{ devices: DeviceInfo[] }`, admin only |
 | server | `Wake` | `wake` | `{ phrase, armed }`, everyone |
-| server | `WakeHeard` | `wake.heard` | `{ text, matched?, at }`, admin connections with the tester on |
+| server | `WakeHeard` | `wake.heard` | `{ text, matched?, at }` (protocol 7 adds `source?: { deviceId?, assistantId? }`, where it was heard: docs/ASSISTANTS.md §5), admin connections with the tester on |
 | common | `AssistantState` | — | + `asleep` |
 | common | `ErrorCode` | — | + `admin_required`, + `unknown_device`; `locked` now means "the keys are locked" only |
 

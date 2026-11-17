@@ -1,5 +1,22 @@
 # Agents, trigger routing and typed intents
 
+> **Changed 2026-11-16 (docs/ASSISTANTS.md §4.1).** The app no longer routes by trigger rules. Which assistant answers a
+> sentence is decided by the device's **route gate** (wake phrases that carry their assistant, follow-up windows,
+> "answers without a phrase", optionally TypeSafe choosing from each assistant's Handles) and the **session dispatcher**;
+> `makeTriggerRouter`, `RoutingConfig` and its rules (section 2 below) are not used by the app and live only as a test
+> fixture in `packages/core/src/TriggerRouter.ts` (`@pva/core/testing`). `Router`, `AgentSet`, `makeAgentConversation` and
+> `Agent` stay as core's mechanism for an agent-backed conversation, which the app uses for Claude subscription assistants
+> with a fixed router (`subscription.ts`: the agent if running, else the offline stand-in with a notice). The Jev intent agent
+> and the decision providers are not wired into the app; `makeJevClient` is reused for TypeSafe routing. The protocol
+> additions this document specified that were never put in the unions (`module.action`, `settings.action`, `routing.set`,
+> `routing`, `intent.decision`, `turn.agent`, the agent fields of turns and traces) were removed from `protocol/agents.ts`;
+> the settings field types stay (`SettingFieldV2`). Everything below is the design and its change log as they were.
+
+> **Changed 2026-11-16 (docs/VOICE-PROVIDERS.md):** the assistant speaks every reply with one voice
+> (`ASSISTANT_VOICE`); the voice router, `[voice:NAME]` markers, `VOICES` and `DEFAULT_VOICE` are gone, and a device
+> profile's `voice` no longer changes the voice (it falls back to `""`, the assistant's voice). Where this document
+> describes per-device voices or the router, that is the design as it was.
+
 Design for the next stage: several interchangeable agents (Claude and Codex subscriptions through their harnesses,
 OpenAI-compatible servers on the home network and OpenRouter, the existing Anthropic API), a spoken trigger phrase that
 picks the agent ("hey Jev, …"), a typed-intent path that runs programmatic actions without a conversational model, and a
@@ -733,7 +750,7 @@ action (demo-home `all_off` among them) while `confirmActions` is not `"on"`.
 | File | What | Tests |
 |---|---|---|
 | `packages/core/src/Agent.ts` | `Agent`, `AgentTurnInput`, `AgentEvent`, `AgentError`, `IntentDecisionInfo` | (types) |
-| `packages/core/src/Routing.ts` | `Router`, `RoutingConfig`, `RouterState`, `RouteDecision`, `makeTriggerRouter` (tolerant trigger matching, stickiness, arming, availability fallback), `armAgent`, `setActiveAgent`, `activeAgent` | `test/Routing.test.ts` (24) |
+| `packages/core/src/Routing.ts` | `Router`, `RouterState`, `RouteDecision`, `armAgent`, `setActiveAgent`, `activeAgent` (the trigger router, `makeTriggerRouter` and `RoutingConfig` with tolerant trigger matching, stickiness, arming and availability fallback, moved to `TriggerRouter.ts`, a test fixture) | `test/Routing.test.ts` (24) |
 | `packages/core/src/TextMatching.ts` | words with offsets, normalisation, phonetic keys, edit distance, spelled-letter joining (finished from the interrupted attempt) | `test/TextMatching.test.ts` (19) |
 | `packages/core/src/Actions.ts` | `defineAction`, `Param.*` (six parameter kinds), `ActionError`, `RegisteredAction`, `actionToolName` | via `Decision.test.ts` |
 | `packages/core/src/Decision.ts` | `DecisionProvider`, request/response types, `buildDecisionPlan` (one request per utterance), `interpretDecision` (thresholds, ask, confirm, fallback), `makeScriptedDecider` | `test/Decision.test.ts` (14) |
@@ -1155,6 +1172,9 @@ All additive; existing options, inputs and events keep their meaning.
 ---
 
 ## 2. Routing by trigger phrase
+
+> Not used by the app since 2026-11-16 (see the note at the top): the route gate of docs/ASSISTANTS.md §3.4 replaced it. The
+> router below is a test fixture (`makeTriggerRouter` in `packages/core/src/TriggerRouter.ts`).
 
 Real code: `packages/core/src/Routing.ts` (pure; 24 tests). Integration into `Conversation`: piece A.
 

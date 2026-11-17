@@ -7,7 +7,7 @@ test("wide screen: focus goes to the visible page title, the next Tab reaches th
   await mock.scenario("devices")
   await loginAdmin(page, baseURL, "#settings/overview")
   // From the keyboard: the title takes focus and shows the focus ring.
-  await page.getByTestId("nav-frontends").focus()
+  await page.getByTestId("nav-devices").focus()
   await page.keyboard.press("Enter")
   const title = page.getByTestId("page-title")
   await expect(title).toBeFocused()
@@ -33,9 +33,9 @@ test("wide screen: focus goes to the visible page title, the next Tab reaches th
 
 test("nav marks differ in shape and every mark shown is in the legend", async ({ page, baseURL }) => {
   await mock.scenario("keys-locked")
-  await loginAdmin(page, baseURL, "#settings/speech/turn-timing")
+  await loginAdmin(page, baseURL, "#settings/shared/limits")
   const legend = page.getByTestId("marks-legend")
-  await page.getByTestId("settings-page").locator("input[type=number]").first().fill("700")
+  await page.getByTestId("settings-page").locator("input[type=number]").first().fill("3")
   await expect(page.getByTestId("settings-nav").locator("button [data-mark=dirty]").first()).toBeVisible()
   const shown = await page.getByTestId("settings-nav").locator("button [data-mark]").evaluateAll((els) => [...new Set(els.map((e) => e.getAttribute("data-mark")))])
   const listed = await legend.locator("[data-legend]").evaluateAll((els) => els.map((e) => e.getAttribute("data-legend")))
@@ -62,7 +62,7 @@ test("latency: every column fits the page column at 1280 px", async ({ page, bas
         turnId: 900 + i,
         outcome,
         trace: {
-          turnId: 900 + i, mode: "voice", speculative: i % 2 === 0, outcome, voices: ["natural"],
+          turnId: 900 + i, mode: "voice", speculative: i % 2 === 0, outcome, voices: ["sherpa:kokoro-af_heart"],
           tools: i === 2 ? [{ name: "weather", ms: 241 }, { name: "calendar", ms: 88 }] : [],
           marks: { llmFirstToken: 180 + i, ttsFirstAudio: 260 + i, playbackStart: 300 + i }
         }
@@ -93,14 +93,14 @@ test.describe("phone at 320 px", () => {
     }
     const kitchen = page.getByTestId("device-list").locator("[data-device=d-kitchen-ipad-0001]")
     await expect(kitchen).toContainText("Seen 2 h ago")
-    const seen = kitchen.getByText("Seen 2 h ago")
+    const seen = kitchen.getByTestId("device-meta")
     expect(await seen.evaluate((el) => {
       const box = el.getBoundingClientRect()
       const row = el.parentElement!.getBoundingClientRect()
       return box.right <= row.right + 0.5
     })).toBe(true)
-    await gotoAdmin(page, baseURL, "#settings/frontends/web-voice")
-    const remove = page.getByTestId("phrase-list").locator("button[aria-label^=Remove]")
+    await gotoAdmin(page, baseURL, "#settings/devices/d-kitchen-ipad-0001")
+    const remove = page.getByTestId("phrases").locator("button[aria-label^=Remove]")
     if (await remove.count() > 0) expect(Math.round((await remove.first().boundingBox())!.width)).toBeGreaterThanOrEqual(44)
   })
 })

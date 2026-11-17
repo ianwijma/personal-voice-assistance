@@ -98,6 +98,12 @@ body {
   font-weight: 500;
 }
 
+/* Text over the voice stage, where a character may draw glow across the whole page (docs/CHARACTERS.md §2.6): a halo
+   in the page colour, invisible on the plain background, that keeps the text clear of any light behind it. */
+@utility stage-legible {
+  text-shadow: 0 0 2px var(--color-bg), 0 0 6px var(--color-bg), 0 0 12px var(--color-bg);
+}
+
 @utility scrollbar-quiet {
   scrollbar-width: thin;
   scrollbar-color: var(--color-line) transparent;
@@ -125,6 +131,8 @@ body {
 @keyframes pva-rise { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
 @keyframes pva-slide-in { from { transform: translateX(24px); opacity: 0; } to { transform: none; opacity: 1; } }
 @keyframes pva-sheet-up { from { transform: translateY(24px); opacity: 0; } to { transform: none; opacity: 1; } }
+/* The voice picker's "reading" bars (four, staggered). */
+@keyframes pva-bar { from { height: 4px; } to { height: 13px; } }
 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {

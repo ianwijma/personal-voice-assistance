@@ -95,7 +95,12 @@ const common = {
   /** Shown only while this holds (evaluated against the draft). A hidden field is not validated and not sent. */
   visibleWhen: Schema.optionalKey(Condition),
   /** Where the value comes from (markers and "Reset to default" in the UI). Absent: unknown (an older server). */
-  source: Schema.optionalKey(FieldSource)
+  source: Schema.optionalKey(FieldSource),
+  /**
+   * Module fields only: an assistant may have its own value for this field (`ModuleChoice.own`, docs/ASSISTANTS.md
+   * §2.6), which wins over the shared one for that assistant. Never on secrets or addresses. Absent = false.
+   */
+  overridable: Schema.optionalKey(Schema.Boolean)
 }
 
 /**

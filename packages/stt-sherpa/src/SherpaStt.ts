@@ -5,8 +5,7 @@
  */
 import type { AudioError, SttEvent } from "@pva/core"
 import { Stt, SttError } from "@pva/core"
-import { Cause, Config, Effect, Layer, Option, Queue, Stream } from "effect"
-import type { Scope } from "effect"
+import { Cause, Config, Deferred, Effect, Exit, Layer, Option, Queue, Scope, Stream } from "effect"
 import { Worker } from "node:worker_threads"
 import type { AgcOptions } from "./agc.d.mts"
 import {
@@ -20,7 +19,8 @@ import {
   type PresetName,
   presetNames,
   presets,
-  resolvePresetName
+  resolvePresetName,
+  takesLanguage
 } from "./presets.ts"
 import { type EndOfTurnPolicy, fixedSilence, FRAME_MS, TurnDetector, type TurnInput } from "./TurnDetector.ts"
 
@@ -98,24 +98,29 @@ const CLOSE_WAIT_MS = 15_000
 
 /**
  * Workers that did not answer `close` in time and were left running (each holds a loaded model, up to about a
- * gigabyte). While there is one, no new recogniser is loaded beside it (see `makeWithWorker`), so at most one
- * is ever left behind; it is counted out when it finally answers or exits.
+ * gigabyte), by worker key (`workerKey`). While one of a key is left behind, no new worker of that key is loaded
+ * beside it (see `acquire`), so at most one per key is ever left behind; it is counted out when it finally
+ * answers or exits. Workers of other keys (other models) still load (docs/ASSISTANTS.md §3.2: the rule is per key).
  */
-let orphanedWorkers = 0
+const orphanedByKey = new Map<string, number>()
 
-/** Workers left running after a close that timed out (diagnostics, tests). */
-export const orphans = (): number => orphanedWorkers
+/** Workers left running after a close that timed out (diagnostics, tests): of `key`, or of every key. */
+export const orphans = (key?: string): number =>
+  key === undefined ? [...orphanedByKey.values()].reduce((a, b) => a + b, 0) : orphanedByKey.get(key) ?? 0
 
-let orphanWaiters: Array<() => void> = []
+let orphanWaiters: Array<{ readonly key: string | undefined; readonly resolve: () => void }> = []
 const orphanGone = () => {
-  if (orphanedWorkers > 0) return
-  for (const resolve of orphanWaiters) resolve()
+  const waiting = orphanWaiters
   orphanWaiters = []
+  for (const w of waiting) {
+    if (orphans(w.key) === 0) w.resolve()
+    else orphanWaiters.push(w)
+  }
 }
 
-/** Resolves once no worker is left behind (at once if none is). */
-export const whenNoOrphans = (): Promise<void> =>
-  orphanedWorkers === 0 ? Promise.resolve() : new Promise((resolve) => orphanWaiters.push(resolve))
+/** Resolves once no worker (of `key`, or of any key) is left behind (at once if none is). */
+export const whenNoOrphans = (key?: string): Promise<void> =>
+  orphans(key) === 0 ? Promise.resolve() : new Promise((resolve) => orphanWaiters.push({ key, resolve }))
 
 const orphanedMessage =
   "The previous local speech model has not shut down: a native decode has not finished, and it still holds its memory. " +
@@ -128,10 +133,10 @@ export const isOrphanedMessage = (message: string): boolean => message.includes(
  * Stops the worker without cutting a native decode short: terminating the thread while `decodeAsync` runs
  * aborts the whole process. The worker is asked to close and answers once its decodes have settled; only then
  * is it terminated. If that takes longer than `closeWaitMs` the worker is left to finish on its own (it no
- * longer keeps the process alive, and is terminated when it answers) and counted in `orphanedWorkers`.
+ * longer keeps the process alive, and is terminated when it answers) and counted in `orphanedByKey` for `key`.
  * Succeeds with `true` when it was left behind. A worker that has already exited (it crashed) has nothing to wait for.
  */
-const stopWorker = (worker: Worker, closeWaitMs: number, exited: () => boolean) =>
+const stopWorker = (worker: Worker, key: string, closeWaitMs: number, exited: () => boolean) =>
   Effect.callback<boolean>((resume) => {
     if (exited()) return resume(Effect.succeed(false))
     let done = false
@@ -148,7 +153,9 @@ const stopWorker = (worker: Worker, closeWaitMs: number, exited: () => boolean) 
     worker.once("exit", () => {
       if (orphaned) {
         orphaned = false
-        orphanedWorkers--
+        const left = (orphanedByKey.get(key) ?? 1) - 1
+        if (left > 0) orphanedByKey.set(key, left)
+        else orphanedByKey.delete(key)
         orphanGone()
       }
       finish(false)
@@ -156,7 +163,7 @@ const stopWorker = (worker: Worker, closeWaitMs: number, exited: () => boolean) 
     const timer = setTimeout(() => {
       worker.unref()
       orphaned = true
-      orphanedWorkers++
+      orphanedByKey.set(key, (orphanedByKey.get(key) ?? 0) + 1)
       finish(true)
     }, closeWaitMs)
     timer.unref()
@@ -188,16 +195,22 @@ const startWorker = (url: URL, workerData: unknown) =>
     return Effect.promise(() => worker.terminate())
   })
 
-/** What the worker needs (see worker.mjs). */
+/** The language the worker is configured with (`""`: the preset takes none, so it is not part of the worker key). */
+const languageOf = (preset: Preset, options: Pick<SherpaSttOptions, "language">): string =>
+  takesLanguage(preset) ? options.language ?? (preset.kind === "streaming" ? preset.language : undefined) ?? "auto" : ""
+
+/**
+ * What the worker needs (see worker.mjs): the model, per model. The VAD threshold, gain control and pre-roll here are
+ * only the defaults of a session that does not send its own (every session of `acquire`'s recognisers does).
+ */
 const workerConfig = (preset: Preset, modelDir: string, options: SherpaSttOptions) => {
   const files = modelFiles(preset, modelDir)
-  const language = options.language ?? (preset.kind === "streaming" ? preset.language : undefined) ?? "auto"
-  const agc = options.agc === false ? false : options.agc === true || options.agc === undefined ? {} : options.agc
+  const language = languageOf(preset, options) || "auto"
   const common = {
     kind: preset.kind,
-    vad: { file: files.vad, threshold: options.vadThreshold ?? DEFAULT_VAD_THRESHOLD },
-    prerollMs: options.prerollMs ?? 400,
-    agc
+    vad: { file: files.vad, threshold: DEFAULT_VAD_THRESHOLD },
+    prerollMs: DEFAULT_PREROLL_MS,
+    agc: {}
   }
   switch (preset.kind) {
     case "streaming":
@@ -238,41 +251,147 @@ const workerConfig = (preset: Preset, modelDir: string, options: SherpaSttOption
   }
 }
 
+const DEFAULT_PREROLL_MS = 400
+
+/** A test stand-in for the worker script (`makeWithWorker`, `acquire`). */
+export interface WorkerScript {
+  readonly url?: URL
+  readonly data?: Readonly<Record<string, unknown>>
+  readonly closeWaitMs?: number
+}
+
 /**
- * Fails with the error `make` would give for missing model files (with the download command), without
- * loading anything: a cheap check before an engine reload.
+ * The options that need a worker of their own (docs/ASSISTANTS.md §3.2, `SttKey`): the model, the model directory,
+ * the recogniser threads, the language (only for a preset that takes one), and the per-model tuning (tail padding,
+ * longest turn, interim interval). Everything else is per stream (`SherpaStreamOptions`). Two `make` / `acquire`
+ * calls with the same key share one worker. `script` (tests) is part of the key.
  */
-export const check = (options: SherpaSttOptions = {}): Effect.Effect<void, SttError> =>
-  Effect.suspend(() => {
-    const name = options.model ?? DEFAULT_PRESET
-    // Checked before a reload stops the running engines: a new model would be refused anyway (see `makeWithWorker`).
-    if (orphanedWorkers > 0) return Effect.fail(new SttError({ message: orphanedMessage }))
-    if (!presets[name]) {
-      return Effect.fail(new SttError({ message: `Unknown speech model "${name}"; choose one of ${presetNames.join(", ")}` }))
+export const workerKey = (options: SherpaSttOptions = {}, script: WorkerScript = {}): string => {
+  const name = options.model ?? DEFAULT_PRESET
+  const preset: Preset | undefined = presets[name]
+  return JSON.stringify([
+    name,
+    options.modelDir ?? defaultModelDir,
+    options.threads ?? preset?.threads ?? 0,
+    preset === undefined ? options.language ?? "" : languageOf(preset, options),
+    options.tailPaddingMs ?? null,
+    options.maxTurnMs ?? null,
+    options.interimMs ?? null,
+    script.url?.href ?? null,
+    script.data ?? null
+  ])
+}
+
+/**
+ * Per stream (one `transcribe` call; docs/ASSISTANTS.md §3.2): turn timing on the main thread (`TurnDetector`), and
+ * the worker session's VAD threshold, gain control and pre-roll. Two streams with different values share a worker.
+ */
+export type SherpaStreamOptions = Pick<
+  SherpaSttOptions,
+  "eagerSilenceMs" | "finalSilenceMs" | "policy" | "minSpeechMs" | "vadThreshold" | "agc" | "prerollMs" | "maxBacklogMs"
+>
+
+/** One loaded model (one worker), shared by every stream that hears with it. */
+export interface Recogniser {
+  /** `workerKey` of the worker. */
+  readonly key: string
+  readonly model: PresetName
+  /** Time the worker took to load and warm up the model, ms. */
+  readonly loadMs: number
+  /** An `Stt` whose streams use these per-stream options on this worker (cheap: no model load). */
+  readonly forStream: (options?: SherpaStreamOptions) => Stt["Service"]
+  /** The worker died (crash or exit): every stream on it has failed, and every later one fails at once. */
+  readonly failure: () => SttError | undefined
+  /** Called once if the worker dies. The returned function unsubscribes. */
+  readonly onFailure: (listener: (error: SttError) => void) => () => void
+}
+
+interface WorkerSlot {
+  refs: number
+  readonly scope: Scope.Closeable
+  readonly ready: Deferred.Deferred<Recogniser, SttError>
+}
+
+/** Loaded workers by key: shared by every `make` / `acquire` with that key, counted, stopped with the last user. */
+const slots = new Map<string, WorkerSlot>()
+/** Workers being stopped, by key: a new worker of that key waits for the stop (and its orphan rule). */
+const stopping = new Map<string, Promise<void>>()
+
+/** Workers loaded now (one per distinct `workerKey`; diagnostics, tests). */
+export const workers = (): number => slots.size
+
+/** `make` with another worker script (tests: a stand-in that speaks the worker protocol without a model). */
+export const makeWithWorker = (options: SherpaSttOptions, script: WorkerScript = {}): Effect.Effect<Stt["Service"], SttError, Scope.Scope> =>
+  Effect.map(acquire(options, script), (recogniser) => recogniser.forStream(options))
+
+/**
+ * The shared worker for `options`' key (`workerKey`): loaded by the first caller, reused by the others, stopped when
+ * the last caller's scope closes. A worker that died is not reused: the next caller loads a new one. While a worker
+ * of the same key is being stopped, this waits for it; while one of the same key is left behind (an orphan), this
+ * fails (no second copy of a model beside one that has not shut down).
+ */
+export const acquire = (options: SherpaSttOptions = {}, script: WorkerScript = {}): Effect.Effect<Recogniser, SttError, Scope.Scope> =>
+  Effect.gen(function*() {
+    const key = workerKey(options, script)
+    const previous = stopping.get(key)
+    if (previous !== undefined && !slots.has(key)) yield* Effect.promise(() => previous)
+    const joined = yield* Effect.acquireRelease(
+      Effect.sync(() => {
+        const existing = slots.get(key)
+        if (existing !== undefined) {
+          existing.refs++
+          return { slot: existing, builder: false }
+        }
+        const slot: WorkerSlot = { refs: 1, scope: Effect.runSync(Scope.make()), ready: Deferred.makeUnsafe() }
+        slots.set(key, slot)
+        return { slot, builder: true }
+      }),
+      ({ slot }) =>
+        Effect.suspend(() => {
+          if (--slot.refs > 0) return Effect.void
+          if (slots.get(key) === slot) slots.delete(key)
+          const closed = Effect.runPromise(Scope.close(slot.scope, Exit.void)).finally(() => {
+            if (stopping.get(key) === closed) stopping.delete(key)
+          })
+          stopping.set(key, closed)
+          return Effect.promise(() => closed)
+        })
+    )
+    if (joined.builder) {
+      yield* Scope.provide(loadWorker(key, options, script, () => {
+        // Dead: not offered to later callers (they load a new one).
+        if (slots.get(key) === joined.slot) slots.delete(key)
+      }), joined.slot.scope).pipe(
+        Effect.onExit((exit) =>
+          Effect.suspend(() => {
+            if (Exit.isSuccess(exit)) return Deferred.done(joined.slot.ready, exit)
+            if (slots.get(key) === joined.slot) slots.delete(key)
+            const failure = Exit.isFailure(exit) && !Cause.hasInterruptsOnly(exit.cause) ? Cause.squash(exit.cause) : undefined
+            const error = failure instanceof SttError ? failure : new SttError({ message: "The local speech model did not load." })
+            return Effect.andThen(Deferred.fail(joined.slot.ready, error), Scope.close(joined.slot.scope, Exit.void))
+          })
+        ),
+        Effect.uninterruptible
+      )
     }
-    const message = missingModelMessage(name, options.modelDir ?? defaultModelDir, options.modelDir !== undefined)
-    return message === undefined ? Effect.void : Effect.fail(new SttError({ message }))
+    return yield* Deferred.await(joined.slot.ready)
   })
 
-export const make = (options: SherpaSttOptions = {}): Effect.Effect<Stt["Service"], SttError, Scope.Scope> => makeWithWorker(options)
-
-/**
- * `make` with another worker script (tests: a stand-in that speaks the worker protocol without a model) and
- * extra worker data merged over the configuration.
- */
-export const makeWithWorker = (
+/** Loads one worker in the scope it is given (closed when its last user is gone). */
+const loadWorker = (
+  key: string,
   options: SherpaSttOptions,
-  script: { readonly url?: URL; readonly data?: Readonly<Record<string, unknown>>; readonly closeWaitMs?: number } = {}
-): Effect.Effect<Stt["Service"], SttError, Scope.Scope> =>
+  script: WorkerScript,
+  died: () => void
+): Effect.Effect<Recogniser, SttError, Scope.Scope> =>
   Effect.gen(function*() {
     const name = options.model ?? DEFAULT_PRESET
-    yield* check(options)
+    yield* check(options, script)
+    if (orphans(key) > 0) return yield* new SttError({ message: orphanedMessage })
     const preset: Preset = presets[name]
     const modelDir = options.modelDir ?? defaultModelDir
-    const policy = options.policy ?? fixedSilence(options.eagerSilenceMs ?? 250, options.finalSilenceMs ?? 600)
-    const minSpeechMs = options.minSpeechMs ?? 100
     const cumulative = preset.kind !== "streaming"
-    const maxBacklogFrames = Math.ceil((options.maxBacklogMs ?? 1000) / FRAME_MS)
+    const closeWaitMs = script.closeWaitMs ?? CLOSE_WAIT_MS
 
     let closing = false
     let exited = false
@@ -281,13 +400,13 @@ export const makeWithWorker = (
       ({ worker }) =>
         Effect.suspend(() => {
           closing = true
-          return stopWorker(worker, script.closeWaitMs ?? CLOSE_WAIT_MS, () => exited).pipe(
+          return stopWorker(worker, key, closeWaitMs, () => exited).pipe(
             Effect.flatMap((left) =>
               left
                 ? Effect.logWarning(
-                  `The local speech model ${name} did not shut down within ${Math.round((script.closeWaitMs ?? CLOSE_WAIT_MS) / 1000)} s ` +
+                  `The local speech model ${name} did not shut down within ${Math.round(closeWaitMs / 1000)} s ` +
                     "(a native decode is still running); it was left to finish and keeps its memory until then. " +
-                    "No new local model is loaded while it runs."
+                    "This model is not loaded again while it runs."
                 )
                 : Effect.void
             )
@@ -296,17 +415,31 @@ export const makeWithWorker = (
     )
     yield* Effect.logInfo(`Local speech model ${name} loaded in ${Math.round(loadMs)} ms`)
 
-    // One worker, one recogniser stream: one transcription at a time.
-    let session: Session | undefined
+    // One worker (one loaded model), any number of concurrent transcriptions: each is a session of its own in the
+    // worker (its own VAD and turn state) and here (its own TurnDetector). A crash fails every open one.
+    const open = new Map<number, Session>()
     let sessions = 0
     let crashed: SttError | undefined
+    const listeners = new Set<(error: SttError) => void>()
     const crash = (error: SttError) => {
       if (closing || crashed) return
       crashed = error
-      session?.fail(error)
+      died()
+      // The listeners first: failing a stream may run its consumer at once.
+      const told = [...listeners]
+      listeners.clear()
+      for (const listener of told) {
+        try {
+          listener(error)
+        } catch {
+          // a throwing listener changes nothing here
+        }
+      }
+      for (const session of [...open.values()]) session.fail(error)
     }
     worker.on("message", (message: WorkerMessage) => {
-      if (session && "session" in message && message.session === session.id) session.onMessage(message)
+      if (!("session" in message)) return
+      open.get(message.session)?.onMessage(message)
     })
     worker.on("error", (cause) => crash(new SttError({ message: `Speech worker crashed: ${cause.message}`, cause })))
     worker.on("exit", (code) => {
@@ -314,11 +447,13 @@ export const makeWithWorker = (
       crash(new SttError({ message: `Speech worker exited with code ${code}` }))
     })
 
-    const transcribe = (audio: Stream.Stream<Uint8Array, AudioError>) =>
+    const transcribe = (stream: SherpaStreamOptions, audio: Stream.Stream<Uint8Array, AudioError>) =>
       Stream.callback<SttEvent, SttError>((queue) =>
         Effect.gen(function*() {
           if (crashed) return yield* crashed
-          if (session) return yield* new SttError({ message: "The local recogniser is already transcribing" })
+          const policy = stream.policy ?? fixedSilence(stream.eagerSilenceMs ?? 250, stream.finalSilenceMs ?? 600)
+          const minSpeechMs = stream.minSpeechMs ?? 100
+          const maxBacklogFrames = Math.ceil((stream.maxBacklogMs ?? 1000) / FRAME_MS)
           const runLog = Effect.runForkWith(yield* Effect.context<never>())
           const id = ++sessions
           const detector = new TurnDetector({ policy, minSpeechMs, cumulative })
@@ -342,7 +477,7 @@ export const makeWithWorker = (
             }
           }
 
-          session = {
+          open.set(id, {
             id,
             fail: (error) => Queue.failCauseUnsafe(queue, Cause.fail(error)),
             onMessage: (message) => {
@@ -381,14 +516,15 @@ export const makeWithWorker = (
                   return
               }
             }
-          }
+          })
+          // Closing this transcription ends only its session in the worker; the others keep running.
           yield* Effect.addFinalizer(() =>
             Effect.sync(() => {
-              session = undefined
-              if (!crashed && !closing) worker.postMessage({ type: "reset", session: 0 })
+              open.delete(id)
+              if (!crashed && !closing) worker.postMessage({ type: "end", session: id })
             })
           )
-          worker.postMessage({ type: "reset", session: id })
+          worker.postMessage({ type: "open", session: id, options: sessionOptionsOf(stream) })
 
           // Per batch of chunks: one memcpy into a fresh buffer that is transferred, not cloned.
           const send = (chunks: ReadonlyArray<Uint8Array>) => {
@@ -426,8 +562,51 @@ export const makeWithWorker = (
         })
       )
 
-    return Stt.of({ transcribe })
+    return {
+      key,
+      model: name,
+      loadMs,
+      forStream: (stream = {}) => Stt.of({ transcribe: (audio) => transcribe(stream, audio) }),
+      failure: () => crashed,
+      onFailure: (listener) => {
+        if (crashed !== undefined) {
+          listener(crashed)
+          return () => {}
+        }
+        listeners.add(listener)
+        return () => void listeners.delete(listener)
+      }
+    } satisfies Recogniser
   })
+
+/** The worker session's share of the per-stream options (`open`'s `options`, worker.mjs). */
+const sessionOptionsOf = (stream: SherpaStreamOptions) => ({
+  vadThreshold: stream.vadThreshold ?? DEFAULT_VAD_THRESHOLD,
+  agc: stream.agc === false ? false : stream.agc === true || stream.agc === undefined ? {} : stream.agc,
+  prerollMs: stream.prerollMs ?? DEFAULT_PREROLL_MS
+})
+
+/**
+ * Fails with the error `make` would give for missing model files (with the download command), without
+ * loading anything: a cheap check before an engine reload.
+ */
+export const check = (options: SherpaSttOptions = {}, script: WorkerScript = {}): Effect.Effect<void, SttError> =>
+  Effect.suspend(() => {
+    const name = options.model ?? DEFAULT_PRESET
+    // A new worker of this key would be refused anyway (see `acquire`): a previous one of it has not shut down.
+    if (!slots.has(workerKey(options, script)) && orphans(workerKey(options, script)) > 0) return Effect.fail(new SttError({ message: orphanedMessage }))
+    if (!presets[name]) {
+      return Effect.fail(new SttError({ message: `Unknown speech model "${name}"; choose one of ${presetNames.join(", ")}` }))
+    }
+    const message = missingModelMessage(name, options.modelDir ?? defaultModelDir, options.modelDir !== undefined)
+    return message === undefined ? Effect.void : Effect.fail(new SttError({ message }))
+  })
+
+/**
+ * A recogniser: the shared worker of `options`' key (`acquire`; loaded by the first, reused by the others), with
+ * `options`' per-stream settings. Two `make` calls that differ only in per-stream options share one loaded model.
+ */
+export const make = (options: SherpaSttOptions = {}): Effect.Effect<Stt["Service"], SttError, Scope.Scope> => makeWithWorker(options)
 
 export const layer = (options: SherpaSttOptions = {}): Layer.Layer<Stt, SttError> => Layer.effect(Stt, make(options))
 

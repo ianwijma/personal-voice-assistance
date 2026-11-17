@@ -98,7 +98,7 @@ test.describe("phone", () => {
       const b = await sheet.boundingBox()
       return b === null ? null : [b.x, Math.round(b.width), Math.round(b.y + b.height)]
     }).toEqual([0, 390, 844])
-    for (const target of [sheet.getByRole("radio", { name: "Always listening" }), sheet.locator("#pref-mic"), sheet.getByTestId("admin-link"), sheet.getByRole("button", { name: "Close settings" })]) {
+    for (const target of [sheet.getByRole("radio", { name: /^Jeff/ }).locator("xpath=ancestor::label"), sheet.locator("#pref-mic"), sheet.getByTestId("admin-link"), sheet.getByRole("button", { name: "Close settings" })]) {
       const b = await target.boundingBox()
       expect(Math.round(b!.height)).toBeGreaterThanOrEqual(44)
     }
@@ -145,7 +145,7 @@ test.describe("phone", () => {
     await page.getByTestId("settings-toggle").tap()
     await expect(page.getByTestId("voice-sheet")).toBeVisible()
     expect(await overflow()).toBe(0)
-    for (const hash of ["#settings/frontends/web-voice", "#settings/devices/d-kitchen-ipad-0001", "#settings/speech/engine", "#settings/language-model/provider", "#settings/keys/keys"]) {
+    for (const hash of ["#settings/devices/type.web-voice", "#settings/devices/d-kitchen-ipad-0001", "#settings/shared/limits", "#settings/shared/accounts", "#settings/overview/overview", "#settings/assistants/new/1", "#settings/keys/keys"]) {
       await gotoAdmin(page, baseURL, hash)
       await expect(page.getByTestId("settings-page")).toBeVisible()
       const inner = await page.evaluate(() => {
@@ -277,23 +277,24 @@ test("the chat popover on a wide screen is not modal: Tab leaves it for the page
   await expect(page.getByRole("heading", { level: 1, name: "Voice assistant" })).toBeAttached()
 })
 
-test("a refused sheet change is shown in the sheet, next to its control, until dismissed; a voice choice is confirmed", async ({ page, baseURL }) => {
+test("a refused sheet change is shown in the sheet, next to its control, until dismissed", async ({ page, baseURL }) => {
   await mock.scenario("typed")
   await page.goto(appUrl(baseURL))
   await expect(page.getByTestId("start")).toBeVisible()
   await page.getByTestId("settings-toggle").click()
   const sheet = page.getByTestId("voice-sheet")
-  await sheet.locator("[data-voice]").nth(1).click()
-  await expect(sheet.getByTestId("voice-note")).toHaveText("Used from the next reply.")
-  // A stale list: a voice the assistant no longer has.
+  // The server refuses it: what the page sends is rewritten to "whichever fits", which this device does not have.
   await page.evaluate(() => {
-    const c = (window as unknown as { __pva: { store: { get: () => { summary: { voices: ReadonlyArray<unknown> } }; dispatch: (a: unknown) => void } } }).__pva
-    const s = c.store.get().summary
-    c.store.dispatch({ type: "engine.summary", engine: { ...s, voices: [...s.voices, { name: "expressive", description: "Lively, through Cartesia.", isDefault: false }] } })
+    const send = WebSocket.prototype.send
+    WebSocket.prototype.send = function(this: WebSocket, data) {
+      if (typeof data === "string" && data.includes("\"device.pick\"")) data = data.replace(/"withoutPhrase":"[^"]*"/, "\"withoutPhrase\":\"typesafe\"")
+      return send.call(this, data)
+    }
   })
-  await sheet.locator("[data-voice=expressive]").click()
+  await sheet.getByRole("radio", { name: /^T3/ }).click()
   const error = sheet.getByTestId("sheet-error")
-  await expect(error).toHaveText(/Not changed: Expressive is switched off in admin\./)
+  await expect(error).toHaveText(/Not changed: Whichever fits is not set up\./)
+  await expect(sheet.getByRole("radio", { name: /^Jeff/ })).toBeChecked()
   await expect(error).toHaveAttribute("role", "alert")
   await expect(page.getByTestId("toasts").locator("[role=alert]")).toHaveCount(0)
   await page.waitForTimeout(6500) // longer than a toast lives

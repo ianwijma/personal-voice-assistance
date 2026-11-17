@@ -11,7 +11,11 @@
  *                   and reply.stop. Typed messages work in every scenario.
  *   typed           no automatic voice turn; typed messages get replies (spoken for the owner if asked).
  *   modules         like typed; the module catalog covers every field type, an invalid value
- *                   (weather "Home location" = "Atlantis") and a module that fails to start (home-assistant).
+ *                   (weather "Home location" = "Atlantis"). Capability modules run while an assistant has them on
+ *                   (`instances` per effective settings; `module.enable` is `not_allowed`); POST /mock/module-error
+ *                   {module, message?} makes a module's instances fail, and a saved token with "good" in it fixes them.
+ *   latency         like typed, with Diagnostics › Latency seeded: turns of every route kind with configuration
+ *                   snapshots (some differ from the assistants now), and a few devices.
  * Settings in every scenario are placed like the real server's (group/page/order, visibleWhen, option tags), with
  * its cross-field checks (final silence > early guess: error; a hosted provider without its key: warning, "Save
  * anyway" with confirmWarnings), reloadPendingFor, and the Claude subscription agent (starts once opted in).
@@ -26,7 +30,7 @@
  *   wake            like voice, but the web-voice default is the wake phrase: after a claim the assistant is asleep;
  *                   "hey go …" is ignored (a tester line), then "hey jeff" alone wakes it (`wake`, armed) and the voice
  *                   turn follows; after the reply the follow-up window, then asleep again. Devices are seeded.
- *   devices         like typed, with two remembered devices (one with overrides) besides the ones that connect.
+ *   devices         like typed, with two remembered devices (the Kitchen iPad has its own assistant list) besides the ones that connect.
  *   long-phrase     like typed, with a six-word wake phrase ("hello my personal voice assistant please") as the
  *                   web-voice default (asleep after a claim) and a third device that has it among three phrases.
  *   admin-disabled  no admin password: `admin.state.enabled` is false and every login is refused.
@@ -35,9 +39,9 @@
  *
  * Protocol 5 (docs/FRONTENDS-AND-ACTIVATION.md): pages say `frontend: "voice" | "admin"` in hello. The admin
  * password is ADMIN_PASSWORD below ("admin password"); a login returns a token that a later hello may carry. The
- * admin part (settings, modules, engine status, vault, env, models, jobs, traces, front ends, devices) goes to
+ * admin part (settings, modules, engine status, vault, env, models, jobs, traces, assistants, devices) goes to
  * admin connections only, and every change needs one (`admin_required` otherwise). Voice pages get the voice part,
- * `engine.summary`, their device profile (`device.profile`, live), and `wake`. Admin pages that switched the
+ * `engine.summary`, their device setup (`device.setup`, live, protocol 7), and `wake`. Admin pages that switched the
  * tester on get `wake.heard`.
  *
  * Every scenario also has settings from a fake .env (Diagnostics › Settings from outside: Move works, keys are refused
@@ -48,26 +52,58 @@
  * POST /mock/turn (run the scripted voice turn now), POST /mock/send {"messages": [ServerMessage…]} (broadcast),
  * POST /mock/drop (terminate every socket), POST /mock/offline {"ms": 3000} (drop and refuse connections for a while),
  * POST /mock/admin/end {"reason": "idle" | "expired"} (end every admin session), POST /mock/wake {"phrase", "armed"}
- * (the owner said the wake phrase), POST /mock/heard {"text", "matched"?, "accepted"?} (a tester line; `accepted: null` leaves the field out), POST /mock/state
+ * (the owner said the wake phrase), POST /mock/heard {"text", "matched"?, "accepted"?, "source"?} (a tester line; `accepted: null` or `source: null` leaves that field out), POST /mock/state
  * {"state"} (set the assistant state, e.g. "asleep"), POST /mock/defaults {"patch"} (change the web-voice defaults).
+ *
+ * Protocol 6 (docs/VOICE-SESSIONS.md): one voice session per device (`hello.device.id`; a voice page without one has
+ * its own), each with its own audio owner, state, conversation (starting with the example history) and reply.
+ * Turn traffic, `state`, `session`, `wake` and `conversation` go to that device's tabs only; admin connections get
+ * `sessions` (and `admin.snapshot.sessions`) and no turn traffic. A claim on one device never touches another; within
+ * a device the last claim wins. `conversation.new` restarts the device's conversation; a turn after more than the
+ * device's `conversationIdleMinutes` without one starts with `conversation { reason: "idle" }`. More started sessions
+ * than MAX_VOICE_SESSIONS (Language model › Conversations, default 4) are refused with `sessions_full` unless a
+ * session whose device left can make room (the least recently active one is dropped); a session
+ * without a connection for SESSION_DISCARD_MINUTES is dropped. `wake.test.deviceId` picks whose lines the tester gets.
+ * The endpoints that act on a session (/mock/turn, /mock/wake, /mock/state, /mock/heard) take an optional
+ * "deviceId" (default: the most recently active session that has an owner); POST /mock/idle {"deviceId"?, "now"?}
+ * makes the device's conversation old enough for the idle reset at its next turn (`now`: at once);
+ * POST /mock/max-sessions {"n"} sets MAX_VOICE_SESSIONS. POST /mock/typesafe {"on"?} sets TypeSafe up (a running decision module, so
+ * the server's `canAuto` is true) or off.
+ *
+ * Protocol 7, the voice connection (docs/ASSISTANTS.md §5.3, mock/voiceAssistants.ts): `snapshot.setup` / `device.setup` from
+ * the device's effective settings (what admin saved, so a pick shows in the admin state), one conversation per assistant
+ * (`snapshot.conversations`, `conversation.read` → `conversation.history`, `conversation.new { assistantId }`), turns,
+ * `wake` and `reply.start` that name their assistant, `device.pick` (`not_allowed` unless the setup says `canPick`).
+ * The first conversation of a session is the one that has the example history. The wake and long-phrase scenarios sleep
+ * until the phrase (saved on the web-voice type). POST /mock/turn {"assistantId"?, "phrase"?} runs the scripted turn for an assistant (woken
+ * by the phrase), POST /mock/wake takes "assistantId"?, POST /mock/typesafe {"on"?} sets up "Whichever fits",
+ * POST /mock/device {"deviceId"?, "settings"} saves a device's (default: the type's) settings as admin would.
+ *
+ * The voice picker's HTTP API (docs/VOICE-PROVIDERS.md §5) is under /api/ on the same port (admin token from a login,
+ * CORS for the page's origin): the providers of mock/voices.ts (On this machine; Cartesia without a key, `vault_locked`
+ * while the vault is locked; ElevenLabs with one), favourites, previews (WAV tones, one at a time: `superseded`; `busy`
+ * for a voice on this machine while a device is in a turn), downloads (the Models page's jobs) and the assistant's voice
+ * (ASSISTANT_VOICE, with the server's checks). POST /mock/voices/fail {"provider", "on"?} makes a provider's key
+ * refused; POST /mock/voices/hold {"ms"} delays previews.
+ *
+ * The model pickers' API (docs/MODEL-PICKERS.md §4) is under /api/models/ (mock/modelPickers.ts: every provider state,
+ * recogniser downloads as the Models page's jobs); POST /mock/models/state {"provider", "state"} forces a state.
  */
 import { randomBytes } from "node:crypto"
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http"
 import {
+  hearerOf,
+  phraseKey,
   type AdminState,
   type ClientMessage,
   CloseCode,
-  DEFAULT_DEVICE_PROFILE,
-  DEVICE_EDITABLE_FIELDS,
-  type DeviceInfo,
-  type DeviceProfile,
-  type DeviceProfileInfo,
-  type FrontendKindInfo,
-  applyProfilePatch,
-  effectiveProfile,
-  PROFILE_FIELDS,
-  type ProfileOverrides,
-  type ProfilePatch,
+  type AssistantState,
+  type ConversationInfo,
+  DEFAULT_CONVERSATION_IDLE_MINUTES,
+  DEFAULT_MAX_VOICE_SESSIONS,
+  DEFAULT_SESSION_DISCARD_MINUTES,
+  type DeviceListInfo,
+  BUILT_IN_WEB_VOICE_SETTINGS,
   WAKE_ARMED_MS,
   WAKE_TEST_MAX_MS,
   WEB_VOICE_KIND,
@@ -84,15 +120,28 @@ import {
   type ModuleInfo,
   PROTOCOL_VERSION,
   type ServerMessage,
+  type SessionInfo,
   type SettingsForm,
   type SettingsPatch,
   type SettingsSection,
   type SettingValue,
   type ToolId,
-  type TraceInfo
+  type TraceInfo,
+  type Favourite,
+  MAX_FAVOURITES,
+  MAX_PREVIEW_CHARS,
+  type ProviderInfo,
+  type ProviderVoices,
+  type VoiceEntry,
+  voiceFor
 } from "@pva/protocol"
 import { exampleEngineStatus, exampleSnapshot, exampleVoiceSection, exampleWeatherModule } from "@pva/protocol/examples"
 import { type WebSocket, WebSocketServer } from "ws"
+import { createAssistantsMock } from "./assistants.ts"
+import { seedTraces } from "./traces.ts"
+import { createVoiceAssistants, scenarioSettings, scriptedTurn } from "./voiceAssistants.ts"
+import { encodeWav, MOCK_PROVIDERS } from "./voices.ts"
+import { createModelPickersMock } from "./modelPickers.ts"
 import type { Condition, FieldError } from "@pva/protocol"
 
 const PORT = Number(process.env.MOCK_PORT ?? 8787)
@@ -110,6 +159,7 @@ const SCENARIOS = [
   "wake",
   "devices",
   "long-phrase",
+  "latency",
   "admin-disabled",
   "admin-backoff"
 ] as const
@@ -138,6 +188,14 @@ const log = (...args: Array<unknown>) => {
 
 const clone = <T>(x: T): T => structuredClone(x)
 
+/** A capability module whose fields `keys` an assistant may own (`overridable`), as the server marks them. */
+const withOverridable = (m: ModuleInfo, keys: ReadonlyArray<string>): ModuleInfo => ({
+  ...m,
+  kind: "capability",
+  group: "modules",
+  settings: { ...m.settings, fields: m.settings.fields.map((f) => (keys.includes(f.key) ? { ...f, overridable: true } : f)) }
+})
+
 const initialModules = (): Array<ModuleInfo> => [
   {
     id: "clock",
@@ -146,16 +204,17 @@ const initialModules = (): Array<ModuleInfo> => [
     enabled: true,
     state: "running",
     status: { text: "Europe/Amsterdam · 13 November 2026", tone: "neutral" },
-    tools: [{ name: "current_time", description: "The current time in a time zone.", speculative: true }],
+    tools: [{ name: "current_time", description: "The current time in a time zone.", speculative: true }, { name: "time_in", description: "The time in another place.", speculative: true }],
     settings: {
       fields: [
-        { type: "text", key: "timeZone", label: "Time zone", description: "IANA name, e.g. Europe/Amsterdam. Empty: this machine's zone.", apply: "live", default: "", placeholder: "Europe/Amsterdam", locked: { reason: "Set by CLOCK_TIME_ZONE in the environment" } },
+        { type: "text", key: "timeZone", label: "Time zone", description: "IANA name, e.g. Europe/Amsterdam. Empty: this machine's zone.", apply: "live", default: "", placeholder: "Europe/Amsterdam", locked: { reason: "Set by CLOCK_TIME_ZONE in the environment" }, overridable: true },
         {
           type: "choice",
           key: "locale",
           label: "Date format",
           apply: "live",
           default: "en-GB",
+          overridable: true,
           options: [{ value: "en-GB", label: "13 November 2026" }, { value: "en-US", label: "November 13, 2026" }, { value: "nl-NL", label: "13 november 2026" }]
         }
       ],
@@ -167,7 +226,7 @@ const initialModules = (): Array<ModuleInfo> => [
     kind: "capability",
     group: "modules"
   },
-  { ...clone(exampleWeatherModule), kind: "capability", group: "modules" },
+  withOverridable(clone(exampleWeatherModule), ["defaultPlace", "units"]),
   {
     id: "home-assistant",
     name: "Home Assistant",
@@ -185,6 +244,7 @@ const initialModules = (): Array<ModuleInfo> => [
           label: "Devices it may read",
           apply: "live",
           default: ["light", "sensor", "climate"],
+          overridable: true,
           options: [
             { value: "light", label: "Lights" },
             { value: "sensor", label: "Sensors" },
@@ -316,9 +376,10 @@ const initialSections = (): Array<SettingsSection> => [
           source: "default",
           visibleWhen: anthropic,
           options: [{ value: "low", label: "Low" }, { value: "medium", label: "Medium", tags: ["slow-start"] }, { value: "high", label: "High", tags: ["slow-start"] }]
-        }
+        },
+        { type: "text", key: "ANTHROPIC_BASE_URL", label: "API address", description: "Only for a proxy or gateway in front of the Anthropic API.", apply: "reload", default: "https://api.anthropic.com", maxLength: 300, advanced: true, source: "default", visibleWhen: anthropic }
       ],
-      values: { LLM_PROVIDER: "anthropic", ANTHROPIC_MODEL: "claude-haiku-5-5", ANTHROPIC_EFFORT: "low" },
+      values: { LLM_PROVIDER: "anthropic", ANTHROPIC_MODEL: "claude-haiku-5-5", ANTHROPIC_EFFORT: "low", ANTHROPIC_BASE_URL: "https://api.anthropic.com" },
       secrets: { ANTHROPIC_API_KEY: { set: true, source: "env" } },
       errors: []
     },
@@ -434,32 +495,142 @@ const initialSections = (): Array<SettingsSection> => [
     },
     revision: 1
   },
-  { ...clone(exampleVoiceSection), group: "voices", page: { id: "overview", title: "Voices", description: "Which voices the assistant may use." }, order: 10 },
+  { ...clone(exampleVoiceSection), group: "voices", page: { id: "overview", title: "Voices", description: "Which voice the assistant speaks with." }, order: 10 },
   {
-    id: "voice-engines",
-    title: "Voice engines",
+    // docs/VOICE-PROVIDERS.md §6.1 (was "voice-engines"; TTS_PROVIDER is gone: the provider follows from the voice).
+    id: "voice-providers",
+    title: "Voice providers",
     group: "voices",
-    page: { id: "engines", title: "Voice engines", description: "The engine of the standard voice, and the hosted voice service." },
+    page: { id: "providers", title: "Voice providers", description: "Where the voices come from: this machine, and the hosted voice services." },
     order: 20,
     protected: true,
     form: {
       fields: [
+        { type: "secret", key: "CARTESIA_API_KEY", label: "Cartesia API key", description: "For Cartesia voices: listing them, previews, and speaking with one.", apply: "reload", env: "CARTESIA_API_KEY", source: "default" },
+        { type: "secret", key: "ELEVENLABS_API_KEY", label: "ElevenLabs API key", description: "For ElevenLabs voices: listing them, previews, and speaking with one.", apply: "reload", env: "ELEVENLABS_API_KEY", source: "saved" }
+      ],
+      values: {},
+      secrets: { CARTESIA_API_KEY: { set: false, source: "none" }, ELEVENLABS_API_KEY: { set: true, source: "store" } },
+      errors: []
+    },
+    revision: 1
+  },
+  {
+    // Protocol 6 (docs/VOICE-SESSIONS.md): voice sessions and conversations.
+    id: "conversations",
+    title: "Conversations",
+    group: "agents",
+    page: { id: "conversations", title: "Conversations", description: "How long a conversation lasts, and how many devices may talk at once." },
+    order: 30,
+    form: {
+      fields: [
+        { type: "number", key: "CONVERSATION_IDLE_MINUTES", label: "Start a new conversation after", description: "Minutes without a turn after which the next thing said starts a fresh conversation. 0 = never. An assistant's own setting wins.", apply: "live", default: DEFAULT_CONVERSATION_IDLE_MINUTES, integer: true, min: 0, max: 240, step: 1, unit: "min", source: "default" },
+        { type: "number", key: "MAX_VOICE_SESSIONS", label: "Devices talking at once", description: "One more device is refused until one of them is done.", apply: "live", default: DEFAULT_MAX_VOICE_SESSIONS, integer: true, min: 1, max: 16, step: 1, source: "default" },
+        { type: "number", key: "SESSION_DISCARD_MINUTES", label: "Forget a device's conversation after", description: "Minutes without any open page on that device.", apply: "live", default: DEFAULT_SESSION_DISCARD_MINUTES, integer: true, min: 1, max: 1440, step: 1, unit: "min", advanced: true, source: "default" }
+      ],
+      values: { CONVERSATION_IDLE_MINUTES: DEFAULT_CONVERSATION_IDLE_MINUTES, MAX_VOICE_SESSIONS: DEFAULT_MAX_VOICE_SESSIONS, SESSION_DISCARD_MINUTES: DEFAULT_SESSION_DISCARD_MINUTES },
+      secrets: {},
+      errors: []
+    },
+    revision: 1
+  },
+  {
+    // Protocol 7 (docs/ASSISTANTS.md §2.4, WP-12a): where the house is. Modules and every assistant's prompt use it.
+    id: "home",
+    title: "Home",
+    group: "modules",
+    page: { id: "home", title: "Home", description: "Where the house is. Modules and every assistant's prompt use these." },
+    order: 5,
+    form: {
+      fields: [
+        { type: "text", key: "HOME_LOCATION", label: "Location", description: "Town and country, e.g. \"Amsterdam, Netherlands\". Every assistant is told; the weather uses it when you name no place.", apply: "live", default: "", placeholder: "Amsterdam, Netherlands", maxLength: 200, source: "default" },
+        { type: "text", key: "HOME_TIME_ZONE", label: "Time zone", description: "IANA name, e.g. Europe/Amsterdam. Empty: this machine's zone.", apply: "live", default: "", placeholder: "Europe/Amsterdam", maxLength: 64, source: "default" },
         {
           type: "choice",
-          key: "TTS_PROVIDER",
-          label: "Standard voice engine",
-          apply: "reload",
-          default: "sherpa",
-          source: "default",
-          options: [
-            { value: "sherpa", label: "On this machine (Piper/Kokoro)", tags: ["local"] },
-            { value: "cartesia", label: "Cartesia", tags: ["hosted", "needs-key"], implication: "Replies are sent to Cartesia to be spoken." }
-          ]
+          key: "HOME_LANGUAGE",
+          label: "Language",
+          description: "The household's language, told to every assistant.",
+          apply: "live",
+          default: "en-GB",
+          options: [{ value: "en-GB", label: "English (United Kingdom)" }, { value: "en-US", label: "English (United States)" }, { value: "nl-NL", label: "Dutch (Netherlands)" }, { value: "de-DE", label: "German (Germany)" }],
+          source: "default"
         },
-        { type: "secret", key: "CARTESIA_API_KEY", label: "Cartesia API key", apply: "reload", env: "CARTESIA_API_KEY", source: "default" }
+        {
+          type: "choice",
+          key: "HOME_UNITS",
+          label: "Units",
+          description: "The default of modules that measure (the weather), unless they or an assistant say otherwise.",
+          apply: "live",
+          default: "metric",
+          options: [{ value: "metric", label: "Metric (°C, km/h)" }, { value: "imperial", label: "Imperial (°F, mph)" }],
+          source: "default"
+        },
+        {
+          type: "choice",
+          key: "HOME_DATE_FORMAT",
+          label: "Date format",
+          description: "The default of modules that say dates (the clock), unless they or an assistant say otherwise.",
+          apply: "live",
+          default: "en-GB",
+          options: [{ value: "en-GB", label: "13 November 2026" }, { value: "en-US", label: "November 13, 2026" }, { value: "nl-NL", label: "13 november 2026" }],
+          source: "default"
+        }
       ],
-      values: { TTS_PROVIDER: "sherpa" },
-      secrets: { CARTESIA_API_KEY: { set: false, source: "none" } },
+      values: { HOME_LOCATION: "", HOME_TIME_ZONE: "", HOME_LANGUAGE: "en-GB", HOME_UNITS: "metric", HOME_DATE_FORMAT: "en-GB" },
+      secrets: {},
+      errors: []
+    },
+    revision: 1
+  },
+  {
+    // Protocol 7 (WP-14): TypeSafe routes a sentence without a wake phrase. Off by default; hosted.
+    id: "routing",
+    title: "TypeSafe",
+    description: "TypeSafe's Jev model picks which assistant on a device a sentence without a wake phrase is for, from each assistant's Handles line.",
+    group: "agents",
+    page: { id: "routing", title: "Routing", description: "Who a sentence is for, when no wake phrase was said. Used only on devices that let TypeSafe decide." },
+    order: 40,
+    protected: true,
+    form: {
+      fields: [
+        {
+          type: "boolean",
+          key: "TYPESAFE_ROUTING",
+          label: "Let TypeSafe choose the assistant",
+          description: "Hosted and optional. What is sent: the sentence as text and the Handles line of each assistant on that device. A wake phrase always wins and skips TypeSafe; so does the next sentence within an assistant's follow-up time. It adds a delay before the reply starts, only for sentences without a phrase (see Diagnostics › Latency, Routing).",
+          apply: "live",
+          default: false,
+          source: "default"
+        },
+        { type: "secret", key: "TYPESAFE_API_KEY", label: "TypeSafe API key", description: "From console.typesafe.ai/keys. Kept in the vault. Without it, devices set to \"The one that fits\" answer nobody without a phrase.", apply: "live", env: "TYPESAFE_API_KEY" },
+        { type: "text", key: "TYPESAFE_MODEL", label: "Model", description: "A pinned version: the decision thresholds are tuned for one version, and jev-latest moves.", apply: "live", default: "jev-1.14.0", maxLength: 100, source: "default" },
+        { type: "text", key: "TYPESAFE_BASE_URL", label: "Server address", description: "Any server that speaks /v1/systemone.", apply: "live", default: "https://api.typesafe.ai", advanced: true, source: "default" }
+      ],
+      values: { TYPESAFE_ROUTING: false, TYPESAFE_MODEL: "jev-1.14.0", TYPESAFE_BASE_URL: "https://api.typesafe.ai" },
+      secrets: { TYPESAFE_API_KEY: { set: false, source: "none" } },
+      errors: []
+    },
+    revision: 1
+  },
+  {
+    // Protocol 7 (WP-13b): the OpenRouter key and the home model's address, as the real server's section has them.
+    id: "llm-openai-accounts",
+    title: "OpenRouter and home model",
+    description: "Language models over the OpenAI-compatible API: OpenRouter with your key, or a server on your own network.",
+    group: "agents",
+    page: { id: "openai-accounts", title: "OpenRouter and home model", description: "The OpenRouter key and the address of a model server on your network." },
+    order: 15,
+    protected: true,
+    form: {
+      fields: [
+        { type: "secret", key: "OPENROUTER_API_KEY", label: "OpenRouter API key", description: "From openrouter.ai/keys. Kept in the vault. What you say is sent to OpenRouter and the model's provider.", apply: "live", env: "OPENROUTER_API_KEY" },
+        { type: "boolean", key: "OPENROUTER_SORT_BY_LATENCY", label: "Prefer the fastest provider", description: "Ask OpenRouter to route to the provider with the lowest latency for the model.", apply: "live", default: true, advanced: true, source: "default" },
+        { type: "text", key: "OPENROUTER_BASE_URL", label: "OpenRouter address", description: "Only for a proxy or gateway in front of OpenRouter. Empty: https://openrouter.ai/api/v1.", apply: "live", default: "", placeholder: "https://openrouter.ai/api/v1", advanced: true, source: "default" },
+        { type: "text", key: "HOME_MODEL_BASE_URL", label: "Home model server address", description: "Ollama, llama.cpp, LM Studio, vLLM or any server with the OpenAI-compatible API. http://host:port is enough; /v1 is added. What you say stays on your network.", apply: "live", default: "", placeholder: "http://192.168.1.20:11434", source: "default" },
+        { type: "secret", key: "HOME_MODEL_API_KEY", label: "Home model API key", description: "Only if the server was started with a key (llama.cpp --api-key, vLLM --api-key). Kept in the vault.", apply: "live", env: "HOME_MODEL_API_KEY" }
+      ],
+      values: { OPENROUTER_SORT_BY_LATENCY: true, OPENROUTER_BASE_URL: "", HOME_MODEL_BASE_URL: "" },
+      secrets: { OPENROUTER_API_KEY: { set: false, source: "none" }, HOME_MODEL_API_KEY: { set: false, source: "none" } },
       errors: []
     },
     revision: 1
@@ -506,14 +677,34 @@ const checks = (list: ReadonlyArray<SettingsSection>): { errors: Array<FieldErro
   if (v("LLM_PROVIDER") === "anthropic" && !secretSet("ANTHROPIC_API_KEY", list)) {
     warnings.push({ section: "language-model", key: "ANTHROPIC_API_KEY", message: "The Claude API is chosen but there is no API key: replies fail until you add it here." })
   }
-  if (v("TTS_PROVIDER") === "cartesia" && !secretSet("CARTESIA_API_KEY", list)) {
-    warnings.push({ section: "voice-engines", key: "TTS_PROVIDER", message: "Cartesia is chosen but there is no Cartesia key: the standard voice fails until you add it below." })
+  if (v("TYPESAFE_ROUTING") === true && !secretSet("TYPESAFE_API_KEY", list)) {
+    warnings.push({ section: "routing", key: "TYPESAFE_API_KEY", message: "TypeSafe is switched on but there is no API key: devices set to \"The one that fits\" answer nobody without a phrase until you add it." })
   }
-  const voices = v("VOICES")
-  if (Array.isArray(voices) && voices.includes("expressive") && !secretSet("CARTESIA_API_KEY", list)) {
-    warnings.push({ section: "voices", key: "VOICES", message: "expressive speaks through Cartesia, but there is no Cartesia key: add it on the Voice engines page." })
+  // ASSISTANT_VOICE (docs/VOICE-PROVIDERS.md §6.1): a hosted voice without its key warns; a voice on this machine
+  // that is not downloaded refuses the save.
+  const voice = parseVoiceKey(String(v("ASSISTANT_VOICE") ?? ""))
+  const provider = voice === undefined ? undefined : MOCK_PROVIDERS.find((p) => p.id === voice.provider)
+  if (voice !== undefined && provider?.keyField !== undefined && !secretSet(provider.keyField, list)) {
+    warnings.push({ section: "voices", key: "ASSISTANT_VOICE", message: `This voice speaks through ${provider.label}, but there is no ${provider.label} key: add it on the Voice providers page.` })
+  }
+  if (voice !== undefined && provider?.location === "local" && !presetInstalled(voice.voiceId)) {
+    const name = provider.voices.find((x) => x.voiceId === voice.voiceId)?.name ?? voice.voiceId
+    errors.push({ section: "voices", key: "ASSISTANT_VOICE", message: `${name} is not downloaded: download it first, or choose a voice that is.` })
   }
   return { errors, warnings }
+}
+
+/**
+ * The real server's voice check on `assistant.create` (docs/LOOKS-AND-VOICES.md §5.0), its warning half: a hosted
+ * voice whose provider has no key asks for `saveAnyway` (a copy of an assistant with such a voice too). The mock's
+ * `assistant.save` does not check the voice.
+ */
+const assistantVoiceWarning = (voice: { readonly provider: string; readonly voiceId: string }, saveAnyway: boolean) => {
+  if (saveAnyway) return undefined
+  const provider = MOCK_PROVIDERS.find((p) => p.id === voice.provider)
+  if (provider?.keyField === undefined || secretSet(provider.keyField)) return undefined
+  const message = `${provider.label} has no API key yet, so this voice cannot speak.`
+  return { code: "invalid_settings" as const, message: `${message} Save anyway to keep it.`, warnings: [{ key: "voice", message }] }
 }
 
 /** The sections with their forms' warnings for the saved values. */
@@ -537,11 +728,40 @@ const readyEngine = (): EngineStatus => {
     : provider === "claude-subscription"
     ? sub?.state === "running" ? model : `${model} · module ${sub?.enabled === true ? sub.state : "off"}: the offline stand-in answers`
     : "offline stand-in"
+  // The voice stage follows ASSISTANT_VOICE: one voice, `name` its key, `description` its name.
+  const key = assistantVoiceKey()
+  const ref = parseVoiceKey(key) ?? { provider: "sherpa", voiceId: "en_US-lessac-medium" }
+  const p = MOCK_PROVIDERS.find((x) => x.id === ref.provider) ?? MOCK_PROVIDERS[0]!
+  const location = p.location
   return {
     ...base,
     reloadPendingFor: [],
-    engines: base.engines.map((e) => (e.stage === "llm" ? { ...e, provider, detail, location: provider === "fake" ? "local" : "hosted" } : e))
+    engines: base.engines.map((e) =>
+      e.stage === "llm" ? { ...e, provider, detail, location: provider === "fake" ? "local" : "hosted" }
+      : e.stage === "tts" ? { ...e, provider: ref.provider, detail: ref.voiceId, location }
+      : e
+    ),
+    voices: [{ name: key, description: p.voices.find((x) => x.voiceId === ref.voiceId)?.name ?? ref.voiceId, enabled: true, isDefault: true, engine: p.engine(ref.voiceId), location }]
   }
+}
+/** The assistant's voice as saved (ASSISTANT_VOICE), else the voice on this machine. */
+const assistantVoiceKey = (): string => {
+  const saved = String(valueOf("ASSISTANT_VOICE") ?? "").trim()
+  return parseVoiceKey(saved) !== undefined ? saved : "sherpa:en_US-lessac-medium"
+}
+/** The voice the running engines speak with. */
+const runningVoiceKey = (): string => engine.voices[0]?.name ?? assistantVoiceKey()
+/** A voice key → its parts (split at the first colon). */
+function parseVoiceKey(key: string): { provider: string; voiceId: string } | undefined {
+  const i = key.indexOf(":")
+  if (i <= 0) return undefined
+  const provider = key.slice(0, i)
+  const voiceId = key.slice(i + 1)
+  return /^[a-z][a-z0-9-]{0,31}$/.test(provider) && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(voiceId) ? { provider, voiceId } : undefined
+}
+/** Whether a voice model on this machine is downloaded (Voices › Models). */
+function presetInstalled(id: string): boolean {
+  return models.find((m) => m.tool === "tts-models")?.items.find((i) => i.id === id)?.installed === true
 }
 /** The Claude subscription module changed: the running engines say so when it is the language model. */
 const refreshEngine = () => {
@@ -585,6 +805,8 @@ interface Conn {
   deviceId?: string
   /** The phrase tester is on until then (epoch ms). */
   testerUntil?: number | undefined
+  /** Protocol 6: the device the tester follows; undefined = the most recently active session. */
+  testerDevice?: string | undefined
 }
 
 interface Reply {
@@ -595,6 +817,11 @@ interface Reply {
   readonly tools: Array<{ name: string; ms: number }>
   readonly source: "voice" | "text"
   readonly owner: Conn | undefined
+  /** The voice session (device) the turn belongs to, and its conversation then. */
+  readonly session: VSession
+  readonly conversationId: string
+  /** Protocol 7: the assistant answering, whose conversation the turn belongs to. */
+  readonly assistantId: string | undefined
   playedClause: number
   started?: { at: number; outputLatencyMs: number; startDelayMs: number }
   lastReport: number
@@ -608,28 +835,70 @@ interface Reply {
   provisional?: number
 }
 
+/**
+ * Protocol 6 (docs/VOICE-SESSIONS.md): one voice session per device (the device id, or the client id of a voice page
+ * without one): its own audio owner, state, conversation and reply. A record exists from the device's first
+ * connection (its conversation is what the page shows), but it is *started* (counts against MAX_VOICE_SESSIONS, is
+ * listed to admin) only at its first claim or typed message. Each starts with the example history.
+ */
+interface VSession {
+  readonly key: string
+  readonly deviceId: string | undefined
+  started: boolean
+  owner: Conn | undefined
+  lastOwnerClientId: string | undefined
+  state: AssistantState
+  micLive: boolean
+  history: Array<HistoryItem>
+  conversation: ConversationInfo
+  reply: Reply | undefined
+  /** Committed turns in this conversation, and when the last one ended (epoch ms). */
+  turns: number
+  lastTurnAt: number | null
+  lastActive: number
+  /** Wake-phrase windows: the armed window after the phrase alone, the follow-up window after a reply. */
+  awakeUntil: number
+  /** The assistant the utterance being heard goes to (`runVoiceTurn`), and the `holder` the last `state` said. */
+  hearingFor: string | undefined
+  /** The timer that turns the utterance being heard into its turn (cleared when Stop or a new conversation cancels it). */
+  hearingEnd: ReturnType<typeof setTimeout> | undefined
+  holderSent: string | null
+  awakeTimer: ReturnType<typeof setTimeout> | undefined
+  discardTimer: ReturnType<typeof setTimeout> | undefined
+}
+
 const conns = new Set<Conn>()
 let connSeq = 0
-let owner: Conn | undefined
-let lastOwnerClientId: string | undefined
-let claimedSince = false
-let assistantState: "idle" | "asleep" | "listening" | "hearing" | "thinking" | "speaking" = "idle"
-let micLive = true
+const voiceSessions = new Map<string, VSession>()
+let conversationSeq = 0
 let modules = initialModules()
+/** Protocol 7: assistants, device types and the devices' own sections (mock/assistants.ts). */
+const assistantsMock = createAssistantsMock({
+  modules: () => modules,
+  toolNames: (id) => runningTools(id).map((t) => t.name),
+  checkOwn: (id, own) => checkOwn(id, own),
+  accountProblem: (account) => accountProblem(account)
+})
+/** Protocol 7, the voice connection's side: the device's setup, a conversation per assistant, who has the turn (mock/voiceAssistants.ts). */
+const voice = createVoiceAssistants(assistantsMock, () => newConversationInfo())
+/** The `wake` and `long-phrase` scenarios sleep until the phrase: saved on the web-voice type, as admin would. */
+const seedVoiceScenario = () => {
+  const patch = scenarioSettings(scenario, LONG_PHRASE)
+  if (patch !== undefined) voice.saveSettings(undefined, patch)
+}
+// Before the sections: their checks look at which voice models are downloaded.
+let models: Array<ModelSet> = initialModels()
 let sections = withWarnings(initialSections())
 let engine: EngineStatus = initialEngine()
 let vault: { state: "none" | "locked" | "unlocked"; password?: string; lockReason?: "start" | "manual" } = scenario === "keys-locked"
   ? { state: "locked", password: VAULT_PASSWORD, lockReason: "start" }
   : { state: "none" }
 let env: EnvInfo = initialEnv()
-let models: Array<ModelSet> = initialModels()
 let jobs: Array<JobInfo> = []
 let jobSeq = 0
 const jobTimers = new Map<string, ReturnType<typeof setInterval>>()
-let history: Array<HistoryItem> = clone([...exampleSnapshot.history])
-let traces: Array<TraceInfo> = []
+let traces: Array<TraceInfo> = scenario === "latency" ? seedTraces() : []
 let turnSeq = 20
-let reply: Reply | undefined
 let scriptTimers: Array<ReturnType<typeof setTimeout>> = []
 const clientLog: Array<Record<string, unknown>> = []
 
@@ -648,51 +917,33 @@ interface DeviceRecord {
   name: string
   firstSeen: number
   lastSeen: number
-  overrides: ProfileOverrides
 }
 const HOUR = 3_600_000
 const seededDevices = (): Map<string, DeviceRecord> => {
-  if (scenario !== "devices" && scenario !== "wake" && scenario !== "long-phrase") return new Map()
+  if (scenario !== "devices" && scenario !== "wake" && scenario !== "long-phrase" && scenario !== "latency") return new Map()
   const now = Date.now()
   return new Map([
     ...(scenario === "long-phrase"
-      ? [["d-living-room-0003", { id: "d-living-room-0003", kind: WEB_VOICE_KIND, name: "Living room tablet", firstSeen: now - 20 * 24 * HOUR, lastSeen: now - 5 * 60_000, overrides: { activation: "wake-phrase", wakePhrases: [LONG_PHRASE, "hey computer", "ok house"] } }] as [string, DeviceRecord]]
+      ? [["d-living-room-0003", { id: "d-living-room-0003", kind: WEB_VOICE_KIND, name: "Living room tablet", firstSeen: now - 20 * 24 * HOUR, lastSeen: now - 5 * 60_000 }] as [string, DeviceRecord]]
       : []),
-    ["d-kitchen-ipad-0001", { id: "d-kitchen-ipad-0001", kind: WEB_VOICE_KIND, name: "Kitchen iPad", firstSeen: now - 40 * 24 * HOUR, lastSeen: now - 2 * HOUR, overrides: { activation: "wake-phrase", followUpSeconds: 15, voice: "natural" } }],
-    ["d-pixel-phone-0002", { id: "d-pixel-phone-0002", kind: WEB_VOICE_KIND, name: "Android phone · Chrome", firstSeen: now - 9 * 24 * HOUR, lastSeen: now - 3 * 24 * HOUR, overrides: {} }]
+    ["d-kitchen-ipad-0001", { id: "d-kitchen-ipad-0001", kind: WEB_VOICE_KIND, name: "Kitchen iPad", firstSeen: now - 40 * 24 * HOUR, lastSeen: now - 2 * HOUR }],
+    ["d-pixel-phone-0002", { id: "d-pixel-phone-0002", kind: WEB_VOICE_KIND, name: "Android phone · Chrome", firstSeen: now - 9 * 24 * HOUR, lastSeen: now - 3 * 24 * HOUR }]
   ])
 }
 /** Six words: wake phrases may be this long (the UI must not cut or jump on them). */
 const LONG_PHRASE = "hello my personal voice assistant please"
-const initialKindDefaults = (): ProfileOverrides =>
-  scenario === "wake" ? { activation: "wake-phrase" } : scenario === "long-phrase" ? { activation: "wake-phrase", wakePhrases: [LONG_PHRASE] } : {}
 let devices = seededDevices()
-let kindDefaults: ProfileOverrides = initialKindDefaults()
-/** Wake-phrase windows: the armed window after the phrase alone, the follow-up window after a reply. */
-let awakeUntil = 0
-let awakeTimer: ReturnType<typeof setTimeout> | undefined
+seedVoiceScenario()
 
-const KIND_INFO = {
-  id: WEB_VOICE_KIND,
-  title: "Voice assistant in a browser",
-  description: "The voice front end opened in a browser: a phone, a tablet or a computer.",
-  fields: [...PROFILE_FIELDS]
-}
-const frontendInfos = (): Array<FrontendKindInfo> => [{ ...KIND_INFO, defaults: kindDefaults, profile: effectiveProfile(kindDefaults) }]
-const deviceProfile = (id: string | undefined): DeviceProfile => effectiveProfile(kindDefaults, id === undefined ? {} : devices.get(id)?.overrides ?? {})
-const deviceInfos = (): Array<DeviceInfo> => {
+const deviceInfos = (): Array<DeviceListInfo> => {
   const now = Date.now()
   return [...devices.values()]
     .map((d) => {
       const connections = [...conns].filter((c) => c.welcomed && c.deviceId === d.id).length
-      return { ...d, lastSeen: connections > 0 ? now : d.lastSeen, profile: deviceProfile(d.id), connections, audioOwner: owner?.deviceId === d.id }
+      return { ...d, lastSeen: connections > 0 ? now : d.lastSeen, connections, audioOwner: voiceSessions.get(d.id)?.owner !== undefined, ...assistantsMock.deviceFields(d.id) }
     })
     .sort((a, b) => b.lastSeen - a.lastSeen)
 }
-const profileInfo = (c: Conn): DeviceProfileInfo =>
-  c.deviceId === undefined
-    ? { profile: effectiveProfile(kindDefaults), editable: [] }
-    : { deviceId: c.deviceId, profile: deviceProfile(c.deviceId), editable: [...DEVICE_EDITABLE_FIELDS] }
 const isAdminConn = (c: Conn) => c.session !== undefined && sessions.has(c.session)
 const adminState = (c: Conn, extra: Partial<AdminState> = {}): AdminState => {
   const wait = loginRefusedUntil - Date.now()
@@ -707,49 +958,247 @@ const adminState = (c: Conn, extra: Partial<AdminState> = {}): AdminState => {
 const sendAdminSnapshot = (c: Conn) =>
   sendTo(c, {
     type: "admin.snapshot",
-    snapshot: { engine, modules, sections, traces: traces.slice(-20), vault: vaultInfo(c), env, models, jobs, frontends: frontendInfos(), devices: deviceInfos() }
+    snapshot: { engine, modules, sections, traces: traces.slice(-20), vault: vaultInfo(c), env, models, jobs, devices: deviceInfos(), sessions: sessionInfos(), assistants: assistantInfos(), deviceTypes: assistantsMock.deviceTypes() }
   })
-const pushProfiles = () => {
-  for (const c of conns) if (c.welcomed && c.frontend === "voice") sendTo(c, { type: "device.profile", ...profileInfo(c) })
-}
 const devicesChanged = () => broadcast({ type: "devices", devices: deviceInfos() })
-const frontendsChanged = () => broadcast({ type: "frontends", frontends: frontendInfos() })
-const ownerProfile = (): DeviceProfile => (owner === undefined ? DEFAULT_DEVICE_PROFILE : deviceProfile(owner.deviceId))
-const wakeMode = () => owner !== undefined && ownerProfile().activation === "wake-phrase"
-/** Keep the owner awake (no phrase needed) for `ms`; then asleep again unless something is going on. */
-const stayAwake = (ms: number) => {
-  awakeUntil = Date.now() + ms
-  if (awakeTimer !== undefined) clearTimeout(awakeTimer)
-  awakeTimer = setTimeout(() => {
-    awakeTimer = undefined
-    if (reply === undefined && (assistantState === "listening" || assistantState === "asleep")) setState(restingState())
+const assistantInfos = () => assistantsMock.infos([...devices.values()].map((d) => ({ id: d.id, name: d.name })))
+/** After an assistant or device save: the whole lists, as the real server pushes them (admin connections only). */
+/** The routing section changed: "Whichever fits" is offered when it is on and has a key (the server's `canAuto`). */
+/** As the real server: an account whose key or address is not set is a failed resource with this problem. */
+const accountProblem = (account: string): string | undefined => {
+  const x = sections.find((y) => y.id === "llm-openai-accounts")
+  if (account === "openrouter" && x?.form.secrets.OPENROUTER_API_KEY?.set !== true) return "OpenRouter is not set up: add its API key in Shared settings › Language model accounts."
+  const address = x?.form.values.HOME_MODEL_BASE_URL
+  if (account === "home-model" && (typeof address !== "string" || address.trim() === "")) return "Home model is not set up: add the server address in Shared settings › Language model accounts."
+  return undefined
+}
+const routingChanged = () => {
+  const x = sections.find((y) => y.id === "routing")
+  voice.setCanAuto(x?.form.values.TYPESAFE_ROUTING === true && x.form.secrets.TYPESAFE_API_KEY?.set === true)
+  pushSetups()
+}
+const assistantsChanged = () => {
+  syncCapabilities()
+  broadcast({ type: "assistants", assistants: assistantInfos() })
+  broadcast({ type: "device.types", types: assistantsMock.deviceTypes() })
+  devicesChanged()
+  pushSetups()
+}
+/** Each voice connection's setup, when it changed (never to admin connections); a session that is not in a turn settles. */
+const lastSetup = new WeakMap<Conn, string>()
+const pushSetups = () => {
+  for (const c of conns) {
+    if (!c.welcomed || c.frontend !== "voice") continue
+    const setup = voice.setupFor(c.deviceId)
+    const text = JSON.stringify(setup)
+    if (lastSetup.get(c) === text) continue
+    lastSetup.set(c, text)
+    sendTo(c, { type: "device.setup", ...setup })
+  }
+  settleAll()
+}
+// ---- Voice sessions (protocol 6)
+
+/** A voice connection's session key: its device, or its own client id; admin connections have none. */
+const keyOf = (c: Conn): string | undefined => (c.frontend !== "voice" ? undefined : c.deviceId ?? c.clientId)
+const newConversationInfo = (): ConversationInfo => ({ id: `conv-${++conversationSeq}-${Date.now().toString(36)}`, startedAt: Date.now() })
+/** The session record of a voice connection, made on first use (not started yet). */
+const sessionFor = (c: Conn): VSession | undefined => {
+  const key = keyOf(c)
+  if (key === undefined) return undefined
+  let v = voiceSessions.get(key)
+  if (v === undefined) {
+    const now = Date.now()
+    v = {
+      key,
+      deviceId: c.deviceId,
+      started: false,
+      owner: undefined,
+      lastOwnerClientId: undefined,
+      state: "idle",
+      micLive: true,
+      history: clone([...exampleSnapshot.history]),
+      conversation: { id: `conv-${++conversationSeq}-${now.toString(36)}`, startedAt: now - 6 * 60_000 },
+      reply: undefined,
+      turns: exampleSnapshot.history.filter((h) => h.role === "user").length,
+      lastTurnAt: now - 5 * 60_000,
+      lastActive: now,
+      awakeUntil: 0,
+      hearingFor: undefined,
+      hearingEnd: undefined,
+      holderSent: null,
+      awakeTimer: undefined,
+      discardTimer: undefined
+    }
+    voiceSessions.set(key, v)
+  }
+  return v
+}
+const sessionName = (v: VSession) => (v.deviceId === undefined ? "A browser tab without a device id" : devices.get(v.deviceId)?.name ?? "A device")
+const connsOf = (v: VSession) => [...conns].filter((c) => c.welcomed && keyOf(c) === v.key)
+/** A message about a session's turns: only to that device's connections. */
+const toSession = (v: VSession, m: ServerMessage) => {
+  for (const c of connsOf(v)) sendTo(c, m)
+}
+const startedSessions = () => [...voiceSessions.values()].filter((v) => v.started).sort((a, b) => b.lastActive - a.lastActive)
+const ownerPresentIn = (v: VSession) => v.owner !== undefined || v.lastOwnerClientId === "c-another-tab"
+const answeringOf = (v: VSession): string | undefined => {
+  const settings = v.deviceId === undefined ? assistantsMock.deviceTypes()[0]?.settings : assistantsMock.deviceFields(v.deviceId).settings
+  return settings === undefined ? undefined : hearerOf(settings) ?? undefined
+}
+const sessionInfos = (): Array<SessionInfo> =>
+  startedSessions().map((v) => ({
+    key: v.key,
+    ...(v.deviceId === undefined ? {} : { deviceId: v.deviceId }),
+    name: sessionName(v),
+    state: v.state,
+    ownerPresent: ownerPresentIn(v),
+    conversationId: v.conversation.id,
+    turns: v.turns,
+    lastTurnAt: v.lastTurnAt,
+    // Protocol 7: who answers on that device now, and one conversation per assistant on it.
+    ...(answeringOf(v) === undefined ? {} : { answering: answeringOf(v)!, conversations: [{ assistantId: answeringOf(v)!, conversationId: v.conversation.id, turns: v.turns, lastTurnAt: v.lastTurnAt }] })
+  }))
+let lastSessions = ""
+/** Admin connections get the list when it changed. */
+const sessionsChanged = () => {
+  const list = sessionInfos()
+  const key = JSON.stringify(list)
+  if (key === lastSessions) return
+  lastSessions = key
+  broadcast({ type: "sessions", sessions: list })
+}
+const numberSetting = (key: string, fallback: number) => {
+  const v = valueOf(key)
+  return typeof v === "number" ? v : fallback
+}
+/** Start a session at its first claim or typed message; `false`: refused, MAX_VOICE_SESSIONS are talking already. */
+const startSession = (v: VSession): boolean => {
+  v.lastActive = Date.now()
+  if (v.started) return true
+  const max = numberSetting("MAX_VOICE_SESSIONS", DEFAULT_MAX_VOICE_SESSIONS)
+  // At the limit, the least recently active session whose device left makes room (as the server does).
+  while (startedSessions().length >= max) {
+    const gone = startedSessions().filter((x) => connsOf(x).length === 0).at(-1)
+    if (gone === undefined) return false
+    dropSession(gone)
+  }
+  v.started = true
+  return true
+}
+const sessionsFull = () => ({ code: "sessions_full" as const, message: `The assistant is already talking on ${startedSessions().length} devices.` })
+/** The session a test endpoint means: `deviceId`, else the most recently active one that talks, else any started. */
+const targetSession = (deviceId?: unknown): VSession | undefined => {
+  if (typeof deviceId === "string") return voiceSessions.get(deviceId)
+  const started = startedSessions()
+  return started.find((v) => v.owner !== undefined) ?? started[0]
+}
+/** Per conversation (`voice.convFor`): the turn whose exchange ends its history (`conversation.history.lastTurnId`). */
+const lastTurnOf = new WeakMap<object, number>()
+/** A new conversation on the session: the running turn stops, the history goes, every tab of the device is told. */
+const newConversation = (v: VSession, reason: "new" | "idle", assistantId: string | undefined = voice.answeringOf(v, v.deviceId)) => {
+  // Only the turn of this assistant's conversation stops; the other assistants keep theirs.
+  if (v.reply !== undefined && v.reply.assistantId === assistantId) interruptReply(v.reply)
+  if (reason === "new") cancelHearing(v, assistantId)
+  const conv = voice.convFor(v, assistantId)
+  conv.history = []
+  lastTurnOf.delete(conv)
+  conv.conversation = newConversationInfo()
+  conv.turns = 0
+  conv.lastTurnAt = null
+  toSession(v, { type: "conversation", id: conv.conversation.id, reason, startedAt: conv.conversation.startedAt, ...(assistantId !== undefined ? { assistantId } : {}) })
+  sessionsChanged()
+}
+/**
+ * As the server: Stop, or a new conversation for the assistant (`undefined`: any) whose sentence is being heard,
+ * cancels that sentence. No turn follows, and its assistant holds the turn no longer.
+ */
+const cancelHearing = (v: VSession, assistantId: string | undefined) => {
+  if (v.hearingFor === undefined || (assistantId !== undefined && v.hearingFor !== assistantId)) return
+  if (v.hearingEnd !== undefined) clearTimeout(v.hearingEnd)
+  v.hearingEnd = undefined
+  v.hearingFor = undefined
+  setState(v, v.state === "hearing" && v.reply === undefined ? restingState(v) : v.state)
+}
+/** The session and its conversation go (discarded, or its place taken at the limit). */
+const dropSession = (v: VSession) => {
+  if (v.discardTimer !== undefined) clearTimeout(v.discardTimer)
+  v.discardTimer = undefined
+  if (v.reply !== undefined) clearReply(v.reply)
+  if (v.awakeTimer !== undefined) clearTimeout(v.awakeTimer)
+  voiceSessions.delete(v.key)
+  sessionsChanged()
+}
+/** No connection left on the device: drop its session after SESSION_DISCARD_MINUTES. */
+const scheduleDiscard = (v: VSession) => {
+  if (v.discardTimer !== undefined) clearTimeout(v.discardTimer)
+  v.discardTimer = setTimeout(() => {
+    v.discardTimer = undefined
+    if (connsOf(v).length > 0) return
+    dropSession(v)
+  }, numberSetting("SESSION_DISCARD_MINUTES", DEFAULT_SESSION_DISCARD_MINUTES) * 60_000)
+}
+
+/** Minutes of quiet after which the assistant's next turn starts a new conversation (its `newConversationAfter`; 0 = never). */
+const idleMinutesOf = (assistantId: string | undefined): number => {
+  const spell = assistantsMock.assistants().find((a) => a.id === assistantId)?.newConversationAfter
+  return spell === undefined || spell === "never" ? 0 : spell
+}
+/**
+ * The device sleeps until a phrase: nobody answers without one (protocol 7 `withoutPhrase: nobody`).
+ */
+const wakeMode = (v: VSession) => v.owner !== undefined && voice.sleeps(v.deviceId)
+/** Keep the session awake (no phrase needed) for `ms`; then asleep again unless something is going on. */
+const stayAwake = (v: VSession, ms: number) => {
+  v.awakeUntil = Date.now() + ms
+  if (v.awakeTimer !== undefined) clearTimeout(v.awakeTimer)
+  v.awakeTimer = setTimeout(() => {
+    v.awakeTimer = undefined
+    // The window closed: nobody keeps the turn (a reply in flight keeps it; its end opens a window of its own).
+    voice.setHolder(v, undefined)
+    if (v.reply === undefined) setState(v, v.state === "listening" || v.state === "asleep" ? restingState(v) : v.state)
   }, ms + 20)
 }
 /**
- * A tester line to admin connections that switched the tester on. `accepted` defaults to what the server's wake gate
- * would say: matched a phrase, always listening, or inside an armed / follow-up window; `null` leaves it out (an older
- * server).
+ * A tester line from session `v` to admin connections that switched the tester on and follow that session (a device
+ * id, or the most recently active session); without a session, to every tester. `accepted` defaults to what the
+ * server's wake gate would say: matched a phrase, always listening, or inside an armed / follow-up window; `null`
+ * leaves it out (an older server). `source`, as the real server sends it: the session's device and the assistant the
+ * matched phrase belongs to there (its saved assignments); left out without a session, or with `source: null`
+ * (an older server).
  */
-const sendHeard = (text: string, matched?: string, accepted?: boolean | null) => {
+const sendHeard = (v: VSession | undefined, text: string, matched?: string, accepted?: boolean | null, withSource = true) => {
   const now = Date.now()
-  const taken = accepted === undefined ? matched !== undefined || !wakeMode() || awakeUntil > now : accepted
+  const taken = accepted === undefined ? matched !== undefined || v === undefined || !wakeMode(v) || v.awakeUntil > now : accepted
+  const auto = targetSession()
+  const source = v === undefined || !withSource ? undefined : heardSource(v, matched)
   for (const c of conns) {
     if (!c.welcomed || !isAdminConn(c) || c.testerUntil === undefined || c.testerUntil < now) continue
+    if (v !== undefined && (c.testerDevice === undefined ? auto !== v : c.testerDevice !== v.deviceId)) continue
     sendTo(c, {
       type: "wake.heard",
       text,
       ...(matched === undefined ? {} : { matched }),
       ...(taken === null ? {} : { accepted: taken }),
+      ...(source === undefined ? {} : { source }),
       at: now
     })
   }
 }
-/** The owner said the wake phrase. */
-const wakeUp = (phrase: string, armed: boolean) => {
-  broadcast({ type: "wake", phrase, armed })
+/** Where a tester line was heard: the session's device, and whose phrase it matched there (like `RouteGate`'s `heard`). */
+const heardSource = (v: VSession, matched: string | undefined): { deviceId?: string; assistantId?: string } => {
+  const settings = v.deviceId === undefined ? assistantsMock.deviceTypes()[0]?.settings : assistantsMock.deviceFields(v.deviceId).settings
+  const key = matched === undefined ? "" : phraseKey(matched)
+  const who = key === "" || settings === undefined ? undefined : settings.assistants.find((a) => a.phrases.some((p) => phraseKey(p) === key))?.assistant
+  return { ...(v.deviceId === undefined ? {} : { deviceId: v.deviceId }), ...(who === undefined ? {} : { assistantId: who }) }
+}
+/** The session's owner said the wake phrase. */
+const wakeUp = (v: VSession, phrase: string, armed: boolean, assistantId: string | undefined = voice.phraseOwner(v.deviceId, phrase)) => {
+  toSession(v, { type: "wake", phrase, armed, ...(assistantId !== undefined ? { assistantId } : {}) })
   if (!armed) return // the request came in the same sentence: a turn follows
-  stayAwake(WAKE_ARMED_MS)
-  if (reply === undefined) setState("listening")
+  if (assistantId !== undefined) voice.setHolder(v, assistantId)
+  stayAwake(v, WAKE_ARMED_MS)
+  if (v.reply === undefined) setState(v, "listening")
 }
 const endSessions = (reason: "logout" | "expired" | "idle", token?: string) => {
   for (const [t] of sessions) if (token === undefined || t === token) sessions.delete(t)
@@ -757,6 +1206,7 @@ const endSessions = (reason: "logout" | "expired" | "idle", token?: string) => {
     if (!c.welcomed || c.session === undefined || sessions.has(c.session)) continue
     c.session = undefined
     c.testerUntil = undefined
+    c.testerDevice = undefined
     sendTo(c, { type: "admin.state", admin: adminState(c, { endReason: reason }) })
   }
 }
@@ -766,23 +1216,20 @@ const requireAdmin = (c: Conn, requestId: string): boolean => {
   result(c, requestId, false, { code: "admin_required", message: adminEnabled() ? "Log in to admin to change this." : "Admin is switched off: set PVA_ADMIN_PASSWORD in .env and restart." })
   return true
 }
-/** The server checks every value: a voice that is not enabled falls back to "". */
-const cleanPatch = (patch: ProfilePatch): ProfilePatch => {
-  if (typeof patch.voice !== "string" || patch.voice === "") return patch
-  return engine.voices.some((v) => v.enabled && v.name === patch.voice) ? patch : { ...patch, voice: "" }
-}
 
 const resetState = () => {
   for (const t of scriptTimers) clearTimeout(t)
   scriptTimers = []
-  if (reply !== undefined) clearReply(reply)
-  reply = undefined
-  owner = undefined
-  lastOwnerClientId = undefined
-  claimedSince = false
-  assistantState = "idle"
-  micLive = true
+  for (const v of voiceSessions.values()) {
+    if (v.reply !== undefined) clearReply(v.reply)
+    if (v.awakeTimer !== undefined) clearTimeout(v.awakeTimer)
+    if (v.discardTimer !== undefined) clearTimeout(v.discardTimer)
+  }
+  voiceSessions.clear()
+  lastSessions = ""
   modules = initialModules()
+  forcedErrors.clear()
+  models = initialModels()
   sections = withWarnings(initialSections())
   engine = initialEngine()
   vault = scenario === "keys-locked" ? { state: "locked", password: VAULT_PASSWORD, lockReason: "start" } : { state: "none" }
@@ -792,17 +1239,19 @@ const resetState = () => {
   loginRefusedUntil = 0
   logoutFails = false
   devices = seededDevices()
-  kindDefaults = initialKindDefaults()
-  awakeUntil = 0
-  if (awakeTimer !== undefined) clearTimeout(awakeTimer)
-  awakeTimer = undefined
+  assistantsMock.reset(scenario === "long-phrase")
+  syncCapabilities()
+  voice.reset()
+  seedVoiceScenario()
   env = initialEnv()
-  models = initialModels()
+  favourites = initialFavourites()
+  modelPickers.reset()
+  providerFailures.clear()
+  previewHold = 0
   for (const t of jobTimers.values()) clearInterval(t)
   jobTimers.clear()
   jobs = []
-  history = clone([...exampleSnapshot.history])
-  traces = []
+  traces = scenario === "latency" ? seedTraces() : []
   turnSeq = 20
   clientLog.length = 0
 }
@@ -817,7 +1266,7 @@ const sendTo = (c: Conn, m: ServerMessage) => {
   if (c.ws.readyState === c.ws.OPEN) c.ws.send(encodeServerMessage(m))
 }
 /** Messages that carry admin data: only admin connections get them (protocol 5). */
-const ADMIN_ONLY: ReadonlySet<ServerMessage["type"]> = new Set(["engine", "module.changed", "section.changed", "vault", "env", "job", "models", "frontends", "devices", "wake.heard", "admin.snapshot"])
+const ADMIN_ONLY: ReadonlySet<ServerMessage["type"]> = new Set(["engine", "module.changed", "section.changed", "vault", "env", "job", "models", "devices", "assistants", "device.types", "sessions", "trace", "wake.heard", "admin.snapshot"])
 let lastSummary = ""
 const broadcast = (m: ServerMessage) => {
   const adminOnly = ADMIN_ONLY.has(m.type)
@@ -833,10 +1282,25 @@ const broadcast = (m: ServerMessage) => {
   }
 }
 
-const setState = (state: typeof assistantState, turnId?: number) => {
-  if (state === assistantState && turnId === undefined) return
-  assistantState = state
-  broadcast(turnId === undefined ? { type: "state", state } : { type: "state", state, turnId })
+/**
+ * Who has the turn, as the server says it (`state.holder`, `snapshot.holder`): the reply's assistant, else the
+ * assistant of the utterance being heard, else the one whose armed or follow-up window is open, else nobody.
+ */
+const holderNow = (v: VSession): string | null => {
+  if (v.reply !== undefined) return v.reply.assistantId ?? null
+  if (v.state === "hearing" && v.hearingFor !== undefined) return v.hearingFor
+  return Date.now() < v.awakeUntil ? voice.holderOf(v) ?? null : null
+}
+
+/** The state, with who has the turn; sent again with the same state when only the holder changed (as the server does). */
+const setState = (v: VSession, state: AssistantState, turnId?: number) => {
+  const was = v.state
+  v.state = state
+  const holder = holderNow(v)
+  if (state === was && turnId === undefined && holder === v.holderSent) return
+  v.holderSent = holder
+  toSession(v, turnId === undefined ? { type: "state", state, holder } : { type: "state", state, turnId, holder })
+  sessionsChanged()
 }
 
 // ---- Settings from outside (.env) and model downloads
@@ -850,7 +1314,7 @@ function initialEnv(): EnvInfo {
       { key: "PVA_VAULT_PASSWORD", origin: "file", file: ENV_FILE, line: 1, kind: "bootstrap", secret: true, movable: false },
       { key: "SERVE_PORT", origin: "file", file: ENV_FILE, line: 2, kind: "bootstrap", secret: false, movable: false },
       { key: "STT_SHERPA_MODLE", origin: "file", file: ENV_FILE, line: 6, kind: "unknown", secret: false, movable: false },
-      { key: "TTS_SHERPA_SPEED", origin: "file", file: ENV_FILE, line: 5, kind: "setting", secret: false, page: { path: ["voices", "engines"], title: "Voices › Voice engines" }, movable: true }
+      { key: "TTS_SHERPA_SPEED", origin: "file", file: ENV_FILE, line: 5, kind: "setting", secret: false, page: { path: ["voices", "providers"], title: "Voices › Voice providers" }, movable: true }
     ]
   }
 }
@@ -877,6 +1341,7 @@ function initialModels(): Array<ModelSet> {
       freeMb: 41_200,
       items: [
         { id: "en_US-lessac-medium", label: "Piper en_US-lessac-medium", description: "Fast · 22050 Hz", sizeMb: 68, diskMb: 83, installed: true, inUse: true },
+        { id: "en_GB-alba-medium", label: "Piper en_GB-alba-medium", description: "Fast · 22050 Hz", sizeMb: 68, diskMb: 83, installed: false, inUse: false },
         { id: "nl_NL-pim-medium", label: "Piper nl_NL-pim-medium", description: "Fast · 22050 Hz", sizeMb: 68, diskMb: 83, installed: false, inUse: false },
         { id: "kokoro-af_heart", label: "Kokoro kokoro-af_heart", description: "Higher quality, slower first audio · 24000 Hz", sizeMb: 350, diskMb: 403, installed: true, inUse: false }
       ]
@@ -913,11 +1378,18 @@ const updateJob = (job: JobInfo) => {
 }
 
 const startDownload = (c: Conn, requestId: string, tool: ToolId, target: string) => {
+  const started = startJob(tool, target)
+  if (!started.ok) return result(c, requestId, false, { code: started.code === "unknown" ? "invalid_settings" : "busy", message: started.message })
+  result(c, requestId, true)
+}
+
+/** A model download job (the Models pages and the voice picker's downloads are the same job). */
+const startJob = (tool: ToolId, target: string): { ok: true; job: JobInfo } | { ok: false; code: "unknown" | "installed" | "running"; message: string } => {
   const item = models.find((m) => m.tool === tool)?.items.find((i) => i.id === target)
-  if (item === undefined) return result(c, requestId, false, { code: "invalid_settings", message: `There is no model "${target}"` })
-  if (item.installed) return result(c, requestId, false, { code: "busy", message: `${item.label} is already downloaded` })
+  if (item === undefined) return { ok: false, code: "unknown", message: `There is no model "${target}"` }
+  if (item.installed) return { ok: false, code: "installed", message: `${item.label} is already downloaded` }
   if (jobs.some((j) => j.state === "running" && j.tool === tool && j.target === target)) {
-    return result(c, requestId, false, { code: "busy", message: `${item.label} is already being downloaded` })
+    return { ok: false, code: "running", message: `${item.label} is already being downloaded` }
   }
   const total = item.sizeMb * 1e6
   let job: JobInfo = {
@@ -932,7 +1404,7 @@ const startDownload = (c: Conn, requestId: string, tool: ToolId, target: string)
     startedAt: Date.now()
   }
   updateJob(job)
-  result(c, requestId, true)
+  const first = job
   let tick = 0
   const unpackTicks = 6
   const timer = setInterval(() => {
@@ -952,16 +1424,23 @@ const startDownload = (c: Conn, requestId: string, tool: ToolId, target: string)
     updateJob(job)
   }, 250)
   jobTimers.set(job.id, timer)
+  return { ok: true, job: first }
 }
 
 const cancelJob = (c: Conn, requestId: string, jobId: string) => {
+  const cancelled = stopJob(jobId)
+  if (cancelled === undefined) return result(c, requestId, false, { code: "invalid_settings", message: "That job is not running" })
+  result(c, requestId, true)
+}
+const stopJob = (jobId: string): JobInfo | undefined => {
   const job = jobs.find((j) => j.id === jobId && j.state === "running")
   const timer = jobTimers.get(jobId)
-  if (job === undefined || timer === undefined) return result(c, requestId, false, { code: "invalid_settings", message: "That job is not running" })
+  if (job === undefined || timer === undefined) return undefined
   clearInterval(timer)
   jobTimers.delete(jobId)
-  updateJob({ ...job, state: "cancelled", endedAt: Date.now() })
-  result(c, requestId, true)
+  const cancelled: JobInfo = { ...job, state: "cancelled", endedAt: Date.now() }
+  updateJob(cancelled)
+  return cancelled
 }
 
 const deleteModel = (c: Conn, requestId: string, tool: ToolId, target: string) => {
@@ -1034,14 +1513,17 @@ const afterUnlock = () => {
   }
 }
 
-const restingState = () =>
-  owner === undefined || !micLive ? "idle" : wakeMode() && Date.now() >= awakeUntil ? "asleep" : "listening"
+const restingState = (v: VSession): AssistantState =>
+  v.owner === undefined || !v.micLive ? "idle" : wakeMode(v) && Date.now() >= v.awakeUntil ? "asleep" : "listening"
 
-const sessionUpdate = (reason: "claimed" | "released" | "taken_over" | "owner_disconnected" | "resumed", ownerPresentOverride?: boolean) => {
-  for (const c of conns) {
-    if (!c.welcomed) continue
-    sendTo(c, { type: "session", role: c === owner ? "owner" : "observer", ownerPresent: ownerPresentOverride ?? owner !== undefined, reason })
-  }
+const sessionUpdate = (v: VSession, reason: "claimed" | "released" | "taken_over" | "owner_disconnected" | "resumed") => {
+  for (const c of connsOf(v)) sendTo(c, { type: "session", role: c === v.owner ? "owner" : "observer", ownerPresent: ownerPresentIn(v), reason })
+  devicesChanged()
+  sessionsChanged()
+}
+/** After a change of devices or assistants: every session that is not in a turn settles in its resting state. */
+const settleAll = () => {
+  for (const v of voiceSessions.values()) if (v.reply === undefined) setState(v, restingState(v))
 }
 
 // ---------------------------------------------------------------------------
@@ -1096,27 +1578,69 @@ const makeTrace = (r: Reply, outcome: TraceInfo["outcome"]): TraceInfo => {
     marks,
     totalMs: Date.now() - r.endOfTurn,
     tools: r.tools,
-    voices: r.spoken ? ["standard"] : [],
+    voices: r.spoken ? [runningVoiceKey()] : [],
     ...(r.started !== undefined ? { client: { outputLatencyMs: r.started.outputLatencyMs, startDelayMs: r.started.startDelayMs } } : {})
   }
   return trace
 }
 
+/** Protocol 7: who answered, on which device, chosen how, and what the assistant was set to (`TraceInfo.config`). */
+const adminTraceFields = (r: Reply, v: VSession): Partial<TraceInfo> => {
+  const a = assistantsMock.assistants().find((x) => x.id === (r.assistantId ?? voice.setupFor(v.deviceId).assistants[0]?.id))
+  if (a === undefined) return {}
+  const chosen = a.modules
+  const onModules = modules.filter((m) => m.kind === "capability" && chosen[m.id]?.on === true)
+  const config: NonNullable<TraceInfo["config"]> = {
+    llm: { account: a.llm.account, model: a.llm.model, effort: a.llm.effort, thinking: a.llm.thinking, maxTokens: a.llm.maxTokens },
+    hearing: { hearer: a.id, engine: a.hearing.engine, model: a.hearing.model, language: a.hearing.language, eagerSilenceMs: a.hearing.eagerSilenceMs, finalSilenceMs: a.hearing.finalSilenceMs },
+    // docs/LOOKS-AND-VOICES.md §3: the device's own voice, else the assistant's.
+    voice: (() => {
+      const spoken = voiceFor(voice.settingsOf(v.deviceId).voice, a)
+      return `${spoken.provider}:${spoken.voiceId}`
+    })(),
+    modules: onModules.length,
+    tools: onModules.reduce((n, m) => n + m.tools.filter((t) => !(chosen[m.id]?.offTools ?? []).includes(t.name)).length, 0),
+    replyEarly: a.replyEarly,
+    toolRounds: a.toolRounds
+  }
+  return {
+    assistant: { id: a.id, name: a.name },
+    ...(v.deviceId === undefined ? {} : { deviceId: v.deviceId, device: sessionName(v).slice(0, 64) }),
+    route: r.source === "text" ? { by: "typed" } : { by: "default" },
+    config
+  }
+}
+
 const endTurn = (r: Reply, outcome: "completed" | "interrupted" | "failed") => {
   if (r.ended) return
+  const v = r.session
   clearReply(r)
-  if (reply === r) reply = undefined
+  if (v.reply === r) v.reply = undefined
   const trace = makeTrace(r, outcome)
-  traces = [...traces, trace].slice(-20)
-  const heard = r.spoken ? r.clauses.filter((_, i) => i <= r.playedClause || outcome === "completed").map((c) => c.text).join(" ") : r.clauses.map((c) => c.text).join("")
-  history.push({ role: "assistant", text: heard, interrupted: outcome !== "completed", tools: r.tools.map((t) => ({ name: t.name, ok: true })) })
-  broadcast({ type: "turn.end", turnId: r.turnId, outcome, trace })
-  if (wakeMode()) {
-    const followUp = ownerProfile().followUpSeconds * 1000
-    if (followUp > 0) stayAwake(followUp)
-    else awakeUntil = 0
+  // Admin's traces carry the session (the device's name) and arrive live as `trace`; the device's tabs get turn.end.
+  const forAdmin: TraceInfo = { ...trace, session: sessionName(v).slice(0, 64), ...adminTraceFields(r, v) }
+  traces = [...traces, forAdmin].slice(-20)
+  broadcast({ type: "trace", key: v.key, ...(v.deviceId === undefined ? {} : { deviceId: v.deviceId }), trace: forAdmin })
+  // A turn of a conversation that was replaced (New conversation) is never committed to the new one.
+  const conv = voice.convFor(v, r.assistantId)
+  if (conv.conversation.id === r.conversationId) {
+    const heard = r.spoken ? r.clauses.filter((_, i) => i <= r.playedClause || outcome === "completed").map((c) => c.text).join(" ") : r.clauses.map((c) => c.text).join("")
+    conv.history.push({ role: "assistant", text: heard, interrupted: outcome !== "completed", tools: r.tools.map((t) => ({ name: t.name, ok: true })) })
+    conv.turns++
+    conv.lastTurnAt = Date.now()
   }
-  setState(restingState())
+  toSession(v, { type: "turn.end", turnId: r.turnId, outcome, trace })
+  // The reply's assistant keeps the turn for its follow-up window, in every mode (as the server's route gate).
+  const followUp = voice.followUpMs(v.deviceId, r.assistantId)
+  if (followUp > 0) {
+    voice.setHolder(v, r.assistantId)
+    stayAwake(v, followUp)
+  } else {
+    v.awakeUntil = 0
+    voice.setHolder(v, undefined)
+  }
+  setState(v, restingState(v))
+  sessionsChanged()
 }
 
 /** Clauses up to `samples` started playing: tell every tab. */
@@ -1125,7 +1649,7 @@ const playedTo = (r: Reply, samples: number) => {
   while (k + 1 < r.clauses.length && r.clauses[k + 1]!.startSample < samples) k++
   if (k > r.playedClause) {
     r.playedClause = k
-    broadcast({ type: "assistant.playing", turnId: r.turnId, clause: k })
+    toSession(r.session, { type: "assistant.playing", turnId: r.turnId, clause: k })
   }
 }
 
@@ -1149,20 +1673,31 @@ const interruptReply = (r: Reply) => {
   }
 }
 
-const runReply = (opts: {
+const runReply = (v: VSession, opts: {
   source: "voice" | "text"
   userText: string
   clauses: ReadonlyArray<string>
   spoken: boolean
   tool?: { name: string; moduleId: string; input: unknown; ms: number; ok?: boolean; error?: string }
+  /** Protocol 7: the assistant that answers; absent: the one with the turn, else the one that answers without a phrase. */
+  assistantId?: string | undefined
 }) => {
-  if (reply !== undefined) interruptReply(reply)
+  if (v.reply !== undefined) interruptReply(v.reply)
+  const assistantId = opts.assistantId ?? voice.answeringOf(v, v.deviceId)
+  const conv = voice.convFor(v, assistantId)
+  const withId = assistantId === undefined ? {} : { assistantId }
+  // The idle reset, decided at the start of the turn: quiet for longer than the device's conversationIdleMinutes.
+  const idleMinutes = idleMinutesOf(assistantId)
+  if (idleMinutes > 0 && conv.lastTurnAt !== null && Date.now() - conv.lastTurnAt > idleMinutes * 60_000) newConversation(v, "idle", assistantId)
   const turnId = ++turnSeq
   const endOfTurn = Date.now()
-  history.push({ role: "user", text: opts.userText })
-  broadcast({ type: "transcript", text: "" })
-  broadcast({ type: "turn.start", turnId, source: opts.source, userText: opts.userText, spoken: opts.spoken })
-  setState("thinking", turnId)
+  v.lastActive = endOfTurn
+  conv.history.push({ role: "user", text: opts.userText })
+  lastTurnOf.set(conv, turnId)
+  voice.setHolder(v, assistantId)
+  v.hearingFor = undefined
+  toSession(v, { type: "transcript", text: "" })
+  toSession(v, { type: "turn.start", turnId, source: opts.source, userText: opts.userText, spoken: opts.spoken, ...withId })
   let startSample = 0
   const pcms = opts.clauses.map((text, i) => synthesize(text, i * 1.7 + turnId))
   const clauses = opts.clauses.map((text, i) => {
@@ -1170,41 +1705,43 @@ const runReply = (opts: {
     startSample += pcms[i]!.length
     return c
   })
-  const r: Reply = { turnId, clauses, endOfTurn, spoken: opts.spoken, tools: [], source: opts.source, owner, playedClause: -1, lastReport: Date.now(), timers: [], ended: false }
-  reply = r
+  const r: Reply = { turnId, clauses, endOfTurn, spoken: opts.spoken, tools: [], source: opts.source, owner: v.owner, session: v, conversationId: conv.conversation.id, assistantId, playedClause: -1, lastReport: Date.now(), timers: [], ended: false }
+  v.reply = r
+  // After the reply is recorded: the state names its assistant as the holder (the turn in flight), as the server does.
+  setState(v, "thinking", turnId)
   let t = 120
   if (opts.tool !== undefined) {
     const tool = opts.tool
-    r.timers.push(setTimeout(() => broadcast({ type: "tool.start", turnId, callId: `toolu_${turnId}`, tool: tool.name, moduleId: tool.moduleId, input: tool.input as never }), t))
+    r.timers.push(setTimeout(() => toSession(v, { type: "tool.start", turnId, callId: `toolu_${turnId}`, tool: tool.name, moduleId: tool.moduleId, input: tool.input as never, ...withId }), t))
     t += tool.ms
     r.timers.push(setTimeout(() => {
       r.tools.push({ name: tool.name, ms: tool.ms })
-      broadcast({ type: "tool.end", turnId, callId: `toolu_${turnId}`, ok: tool.ok ?? true, ms: tool.ms, ...(tool.error !== undefined ? { error: tool.error } : {}) })
+      toSession(v, { type: "tool.end", turnId, callId: `toolu_${turnId}`, ok: tool.ok ?? true, ms: tool.ms, ...(tool.error !== undefined ? { error: tool.error } : {}), ...withId })
     }, t))
     t += 40
   }
   if (!opts.spoken) {
     // Unspoken: stream raw text deltas, then end.
     const words = opts.clauses.join(" ").split(/(?<= )/)
-    words.forEach((w, i) => r.timers.push(setTimeout(() => broadcast({ type: "assistant.text", turnId, clause: null, text: w }), t + 280 + i * 45)))
+    words.forEach((w, i) => r.timers.push(setTimeout(() => toSession(v, { type: "assistant.text", turnId, clause: null, text: w, ...withId }), t + 280 + i * 45)))
     r.timers.push(setTimeout(() => endTurn(r, "completed"), t + 300 + words.length * 45))
     return
   }
-  const c = owner
+  const c = v.owner
   r.timers.push(setTimeout(() => {
     if (c === undefined || c.ws.readyState !== c.ws.OPEN) {
-      broadcast({ type: "error", error: { code: "turn_failed", message: "No audio client: the reply could not be played.", turnId } })
+      toSession(v, { type: "error", error: { code: "turn_failed", message: "No audio client: the reply could not be played.", turnId } })
       endTurn(r, "failed")
       return
     }
-    sendTo(c, { type: "reply.start", turnId, sampleRate: REPLY_RATE })
+    sendTo(c, { type: "reply.start", turnId, sampleRate: REPLY_RATE, ...withId })
     r.lastReport = Date.now()
     // Watch for stalls: no report for 2 s while waiting → reply.stop + playback_timeout.
     r.stallTimer = setInterval(() => {
       if (r.ended) return
       if (Date.now() - r.lastReport > 2000) {
         sendTo(c, { type: "reply.stop", turnId })
-        broadcast({ type: "error", error: { code: "playback_timeout", message: "The browser stopped reporting playback; the reply was stopped.", turnId } })
+        toSession(v, { type: "error", error: { code: "playback_timeout", message: "The browser stopped reporting playback; the reply was stopped.", turnId } })
         endTurn(r, "failed")
       }
     }, 250)
@@ -1212,7 +1749,7 @@ const runReply = (opts: {
   // Clauses go to TTS one after another, faster than real time.
   opts.clauses.forEach((text, i) => {
     r.timers.push(setTimeout(() => {
-      broadcast({ type: "assistant.text", turnId, clause: i, text, voice: ownerProfile().voice || "standard" })
+      toSession(v, { type: "assistant.text", turnId, clause: i, text, voice: runningVoiceKey(), ...withId })
       if (c !== undefined) sendReplyAudio(c, turnId, pcms[i]!)
       if (i === opts.clauses.length - 1 && c !== undefined) sendTo(c, { type: "reply.end", turnId })
     }, t + 30 + i * 380))
@@ -1221,31 +1758,43 @@ const runReply = (opts: {
 
 const VOICE_CLAUSES = ["It's sunny in Paris,", "eighteen degrees with a light wind from the west,", "and it stays dry until the evening."]
 
-const runVoiceTurn = () => {
-  if (owner === undefined) return
-  setState("hearing")
-  const words = ["what's", "what's the", "what's the weather", "what's the weather in", "what's the weather in Paris"]
-  words.forEach((w, i) => after(250 + i * 260, () => broadcast({ type: "transcript", text: w })))
-  after(250 + words.length * 260 + 350, () => {
-    sendHeard("What's the weather in Paris?", undefined, true)
-    runReply({
-      source: "voice",
-      userText: "What's the weather in Paris?",
-      clauses: VOICE_CLAUSES,
-      spoken: true,
-      tool: { name: "weather", moduleId: "weather", input: { place: "Paris, France" }, ms: 241 }
-    })
+const WEATHER_TURN = {
+  userText: "What's the weather in Paris?",
+  clauses: VOICE_CLAUSES,
+  tool: { name: "weather", moduleId: "weather", input: { place: "Paris, France" }, ms: 241 }
+}
+
+/**
+ * The scripted voice turn. `assistantId` (protocol 7): the assistant that answers; absent: the one with the turn, else
+ * the one that answers without a phrase. `phrase`: it was woken by that phrase in the same sentence (a `wake` with
+ * `armed: false` names the assistant first).
+ */
+const runVoiceTurn = (v: VSession | undefined, opts: { assistantId?: string | undefined; phrase?: string | undefined } = {}) => {
+  if (v === undefined || v.owner === undefined) return
+  const assistantId = opts.assistantId ?? voice.answeringOf(v, v.deviceId)
+  const script = scriptedTurn(assistantId, WEATHER_TURN)
+  v.hearingFor = assistantId
+  setState(v, "hearing")
+  if (opts.phrase !== undefined) wakeUp(v, opts.phrase, false, assistantId)
+  if (v.hearingEnd !== undefined) clearTimeout(v.hearingEnd)
+  const spoken = (script.userText.charAt(0).toLowerCase() + script.userText.slice(1)).replace(/[?]/g, "").split(" ")
+  const words = spoken.map((_, i) => spoken.slice(0, i + 1).join(" "))
+  words.forEach((w, i) => after(250 + i * 260, () => toSession(v, { type: "transcript", text: w })))
+  v.hearingEnd = after(250 + words.length * 260 + 350, () => {
+    v.hearingEnd = undefined
+    sendHeard(v, script.userText, opts.phrase, true)
+    runReply(v, { source: "voice", userText: script.userText, clauses: script.clauses, spoken: true, tool: script.tool, assistantId })
   })
 }
 
 /** The wake scenario after a claim: asleep; a line it ignores; the phrase alone; then the voice turn. */
-const runWakeScript = () => {
-  after(2500, () => sendHeard("Hey go, what's the weather?"))
+const runWakeScript = (v: VSession) => {
+  after(2500, () => sendHeard(v, "Hey go, what's the weather?"))
   after(4000, () => {
-    sendHeard("Hey Jeff", "hey jeff")
-    wakeUp("hey jeff", true)
+    sendHeard(v, "Hey Jeff", "hey jeff")
+    wakeUp(v, "hey jeff", true)
   })
-  after(5500, runVoiceTurn)
+  after(5500, () => runVoiceTurn(v))
 }
 
 // ---------------------------------------------------------------------------
@@ -1297,6 +1846,86 @@ const setModule = (id: string, f: (m: ModuleInfo) => ModuleInfo) => {
   return next
 }
 
+// ---- Capability modules follow the assistants (docs/ASSISTANTS.md §2.6, WP-12b)
+
+const HA_TOOLS = [{ name: "home_state", description: "Current state of devices, by area or by name.", speculative: true }]
+const NOTES_TOOLS = [{ name: "add_note", description: "Save a short note.", speculative: false }, { name: "read_notes", description: "Read recent notes.", speculative: true }]
+/** What a running capability module offers, whether or not an assistant has it on right now. */
+const runningTools = (id: string): ModuleInfo["tools"] =>
+  id === "home-assistant" ? HA_TOOLS : id === "notes" ? NOTES_TOOLS : initialModules().find((x) => x.id === id)?.tools ?? []
+/** An instance's status: the clock says today's date in the instance's own date format. */
+const instanceStatus = (id: string, m: ModuleInfo, own: Readonly<Record<string, SettingValue>> | undefined) => {
+  const status = runningStatus(id, m)
+  if (id !== "clock" || status === undefined) return status
+  const locale = String(own?.locale ?? m.settings.values.locale ?? "en-GB")
+  const zone = String(own?.timeZone ?? m.settings.values.timeZone ?? "Europe/Amsterdam")
+  return { ...status, text: `${zone} · ${new Date(Date.UTC(2026, 10, 13)).toLocaleDateString(locale, { day: "numeric", month: "long", year: "numeric", timeZone: "UTC" })}` }
+}
+const runningStatus = (id: string, m: ModuleInfo) =>
+  id === "home-assistant" ? { text: "Connected to Home · 42 devices", tone: "ok" as const }
+  : id === "notes" ? { text: "12 notes in Inbox", tone: "neutral" as const }
+  : m.status
+/** A failure injected into a capability module's instances (tests: `/mock/module-error`); a saved token with "good" in it clears it. */
+const forcedErrors = new Map<string, string>()
+const ownableKeys = (m: ModuleInfo) => new Set(m.settings.fields.filter((f) => f.overridable === true && f.type !== "secret").map((f) => f.key))
+/** An instance's key: the effective non-secret values (an assistant's own applied), as the host keys them. */
+const instanceKey = (m: ModuleInfo, own: Readonly<Record<string, SettingValue>> | undefined) => {
+  const over = ownableKeys(m)
+  const values: Record<string, SettingValue> = { ...m.settings.values }
+  for (const [k, v] of Object.entries(own ?? {})) if (over.has(k)) values[k] = v
+  return JSON.stringify(Object.keys(values).sort().map((k) => [k, values[k]]))
+}
+/** The field errors the module's own checks give an assistant's own values (`ModuleHost.checkOwn`). */
+const checkOwn = (moduleId: string, own: Readonly<Record<string, unknown>>) => {
+  const m = modules.find((x) => x.id === moduleId)
+  if (m === undefined) return []
+  const values = Object.fromEntries(Object.entries(own)) as Record<string, SettingValue>
+  return validate(m.settings, { values, secrets: {} }).flatMap((e) => (e.key === null ? [] : [{ field: e.key, message: e.message }]))
+}
+/**
+ * A capability module runs while at least one switched-on assistant has it on; assistants whose effective values are
+ * equal share one instance, an assistant with its own values may run another. Module infos are updated (and pushed)
+ * only when they change. The shared instance is listed first.
+ */
+const syncCapabilities = () => {
+  const list = assistantsMock.assistants()
+  for (const m of [...modules]) {
+    if (m.kind !== "capability") continue
+    const wanting = list.filter((a) => a.on && a.modules[m.id]?.on === true)
+    const over = ownableKeys(m)
+    const sharedKey = instanceKey(m, undefined)
+    const groups = new Map<string, { assistants: Array<string>; own: Set<string>; values: Record<string, SettingValue> | undefined }>()
+    for (const a of wanting) {
+      const own = a.modules[m.id]!.own
+      const key = instanceKey(m, own)
+      const g = groups.get(key) ?? { assistants: [], own: new Set<string>(), values: key === sharedKey ? undefined : (own as Record<string, SettingValue> | undefined) }
+      g.assistants.push(a.id)
+      if (key !== sharedKey) for (const [k, v] of Object.entries(own ?? {})) if (over.has(k) && JSON.stringify(v) !== JSON.stringify(m.settings.values[k])) g.own.add(k)
+      groups.set(key, g)
+    }
+    const forced = forcedErrors.get(m.id)
+    const status = runningStatus(m.id, m)
+    const ordered = [...groups.entries()].sort(([a], [b]) => (a === sharedKey ? -1 : b === sharedKey ? 1 : 0)).map(([, g]) => g)
+    const instances = ordered.map((g) => ({
+      assistants: g.assistants,
+      own: [...g.own],
+      state: forced !== undefined ? ("error" as const) : ("running" as const),
+      ...(forced !== undefined ? { error: `${forced} (for ${g.assistants.join(", ")})` } : instanceStatus(m.id, m, g.values) !== undefined ? { status: instanceStatus(m.id, m, g.values)! } : {})
+    }))
+    const { error: _e, status: _s, ...rest } = m
+    const next: ModuleInfo = {
+      ...rest,
+      enabled: wanting.length > 0,
+      state: wanting.length === 0 ? "disabled" : forced !== undefined ? "error" : "running",
+      tools: wanting.length > 0 && forced === undefined ? [...runningTools(m.id)] : [],
+      ...(wanting.length > 0 && forced !== undefined ? { error: forced } : wanting.length > 0 && status !== undefined ? { status } : {}),
+      instances
+    }
+    const same = (a: ModuleInfo, b: ModuleInfo) => JSON.stringify({ ...a, revision: 0 }) === JSON.stringify({ ...b, revision: 0 })
+    if (!same(m, next)) setModule(m.id, () => next)
+  }
+}
+
 /** Start a module (600 ms). home-assistant fails unless its token was replaced with one containing "good". */
 const startModule = (c: Conn, requestId: string, id: string) => {
   setModule(id, (m) => {
@@ -1343,62 +1972,67 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
     case "hello":
       return
     case "audio.claim": {
-      if (c.frontend === "admin") return sendTo(c, { type: "error", error: { code: "bad_message", message: "The admin page cannot use the audio." } })
-      const previous = owner
-      if (previous !== undefined && previous !== c) {
-        if (reply !== undefined && reply.owner === previous) sendTo(previous, { type: "reply.stop", turnId: reply.turnId })
-        if (reply !== undefined) interruptReply(reply)
+      const v = sessionFor(c)
+      if (v === undefined) return sendTo(c, { type: "error", error: { code: "bad_message", message: "The admin page cannot use the audio." } })
+      // Protocol 6: a claim that would start one more session than MAX_VOICE_SESSIONS is refused.
+      if (!startSession(v)) return sendTo(c, { type: "error", error: sessionsFull() })
+      // Within the device, the last claim wins (another device is never touched).
+      const previous = v.owner
+      if (previous !== undefined && previous !== c && v.reply !== undefined) {
+        if (v.reply.owner === previous) sendTo(previous, { type: "reply.stop", turnId: v.reply.turnId })
+        interruptReply(v.reply)
       }
-      owner = c
-      lastOwnerClientId = c.clientId
-      claimedSince = true
-      micLive = true
+      v.owner = c
+      v.lastOwnerClientId = c.clientId
+      v.micLive = true
       c.lastSeq = undefined
-      for (const x of conns) {
-        if (!x.welcomed) continue
-        sendTo(x, { type: "session", role: x === c ? "owner" : "observer", ownerPresent: true, reason: x === previous ? "taken_over" : "claimed" })
-      }
-      awakeUntil = 0
-      setState(restingState())
+      for (const x of connsOf(v)) sendTo(x, { type: "session", role: x === c ? "owner" : "observer", ownerPresent: true, reason: x === previous ? "taken_over" : "claimed" })
+      v.awakeUntil = 0
+      voice.setHolder(v, undefined)
+      setState(v, restingState(v))
       devicesChanged()
-      if (scenario === "voice" || scenario === "drop-mid-reply") after(900, runVoiceTurn)
-      if (scenario === "wake") runWakeScript()
+      sessionsChanged()
+      if (scenario === "voice" || scenario === "drop-mid-reply") after(900, () => runVoiceTurn(v))
+      if (scenario === "wake") runWakeScript(v)
       if (scenario === "takeover") {
         after(1500, () => {
-          if (owner !== c) return
-          owner = undefined
-          lastOwnerClientId = "c-another-tab"
+          if (v.owner !== c) return
+          v.owner = undefined
+          v.lastOwnerClientId = "c-another-tab"
           sendTo(c, { type: "session", role: "observer", ownerPresent: true, reason: "taken_over" })
-          for (const x of conns) if (x !== c && x.welcomed) sendTo(x, { type: "session", role: "observer", ownerPresent: true, reason: "claimed" })
-          setState("listening")
+          for (const x of connsOf(v)) if (x !== c) sendTo(x, { type: "session", role: "observer", ownerPresent: true, reason: "claimed" })
+          setState(v, "listening")
         })
       }
       return
     }
-    case "audio.release":
-      if (owner !== c) return
-      owner = undefined
-      if (reply !== undefined) interruptReply(reply)
-      sessionUpdate("released")
-      setState("idle")
-      devicesChanged()
+    case "audio.release": {
+      const v = sessionFor(c)
+      if (v === undefined || v.owner !== c) return
+      v.owner = undefined
+      if (v.reply !== undefined) interruptReply(v.reply)
+      sessionUpdate(v, "released")
+      setState(v, "idle")
       return
+    }
     case "audio.config":
       return
-    case "mic.state":
-      if (owner !== c) return sendTo(c, { type: "error", error: { code: "not_owner", message: "Only the audio owner can do that." } })
-      micLive = m.live
+    case "mic.state": {
+      const v = sessionFor(c)
+      if (v === undefined || v.owner !== c) return sendTo(c, { type: "error", error: { code: "not_owner", message: "Only the audio owner can do that." } })
+      v.micLive = m.live
       c.lastSeq = undefined
-      if (reply === undefined) setState(restingState())
+      if (v.reply === undefined) setState(v, restingState(v))
       return
+    }
     case "playback.started": {
-      const r = reply
+      const r = sessionFor(c)?.reply
       if (r === undefined || r.turnId !== m.turnId || r.started !== undefined) return
       r.started = { at: Date.now(), outputLatencyMs: m.outputLatencyMs, startDelayMs: m.startDelayMs }
       r.lastReport = Date.now()
       r.playedClause = 0
-      setState("speaking", r.turnId)
-      broadcast({ type: "assistant.playing", turnId: r.turnId, clause: 0 })
+      setState(r.session, "speaking", r.turnId)
+      toSession(r.session, { type: "assistant.playing", turnId: r.turnId, clause: 0 })
       if (scenario === "drop-mid-reply" && r.dropScheduled !== true) {
         r.dropScheduled = true
         r.timers.push(setTimeout(() => dropAll(), 800))
@@ -1408,7 +2042,7 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
     case "playback.progress":
     case "playback.finished":
     case "playback.stopped": {
-      const r = reply
+      const r = sessionFor(c)?.reply
       if (r === undefined || r.turnId !== m.turnId) return
       r.lastReport = Date.now()
       if (m.type === "playback.stopped" && m.exact === false) {
@@ -1426,15 +2060,25 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
       return
     }
     case "interrupt": {
-      const r = reply
-      if (r === undefined || (m.turnId !== undefined && m.turnId !== r.turnId)) return
-      interruptReply(r)
+      const v = sessionFor(c)
+      const r = v?.reply
+      if (m.turnId !== undefined && m.turnId !== r?.turnId) return
+      if (r !== undefined) interruptReply(r)
+      // As the server: Stop also cancels the sentence being heard.
+      if (v !== undefined) cancelHearing(v, undefined)
       return
     }
     case "text.send": {
       if (engine.state !== "ready") return result(c, m.requestId, false, { code: "engine_failed", message: "The assistant's engines are not running; see Settings → Overview." })
+      const v = sessionFor(c)
+      if (v === undefined) return result(c, m.requestId, false, { code: "bad_message", message: "The admin page has no conversation." })
+      // Protocol 7: the assistant named (the voice page names the conversation it shows) must be on the device.
+      if (m.assistantId !== undefined && !voice.setupFor(c.deviceId).assistants.some((a) => a.id === m.assistantId)) {
+        return result(c, m.requestId, false, { code: "unknown_assistant", message: `${m.assistantId} is not one of the assistants on this device.` })
+      }
+      if (!startSession(v)) return result(c, m.requestId, false, sessionsFull())
       result(c, m.requestId, true)
-      const spoken = c === owner && m.speak
+      const spoken = c === v.owner && m.speak
       const lower = m.text.toLowerCase()
       const clauses = lower.includes("time")
         ? ["It's twenty past four in the afternoon in Tokyo."]
@@ -1442,20 +2086,21 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
         ? ["Once upon a time, in a city of canals,", "a small boat carried letters from door to door,", "and every evening the boatman sang the names of the streets,", "so that the houses would remember them."]
         : ["You said: " + m.text.slice(0, 80) + ".", "This is the mock assistant, so that is all I can say."]
       const tool = lower.includes("time") ? { name: "current_time", moduleId: "clock", input: { zone: "Asia/Tokyo" }, ms: 3 } : lower.includes("fail") ? { name: "weather", moduleId: "weather", input: { place: "Atlantis" }, ms: 3000, ok: false, error: "Weather service did not answer within 3000 ms" } : undefined
-      runReply({ source: "text", userText: m.text, clauses, spoken, ...(tool !== undefined ? { tool } : {}) })
+      runReply(v, { source: "text", userText: m.text, clauses, spoken, assistantId: m.assistantId, ...(tool !== undefined ? { tool } : {}) })
+      sessionsChanged()
       return
     }
-    case "module.enable": {
-      const mod = modules.find((x) => x.id === m.moduleId)
-      if (mod === undefined) return result(c, m.requestId, false, { code: "unknown_module", message: `No module ${m.moduleId}.` })
-      if (refuseLocked(c, m.requestId, mod.protected)) return
-      startModule(c, m.requestId, m.moduleId)
-      return
-    }
+    case "module.enable":
     case "module.disable": {
       const mod = modules.find((x) => x.id === m.moduleId)
       if (mod === undefined) return result(c, m.requestId, false, { code: "unknown_module", message: `No module ${m.moduleId}.` })
       if (refuseLocked(c, m.requestId, mod.protected)) return
+      // A capability runs while an assistant has it on (WP-12b): the switch is the assistant's.
+      if (mod.kind === "capability") return result(c, m.requestId, false, { code: "not_allowed", message: `${mod.name} is switched on and off per assistant: change it on the assistant's Modules tab.` })
+      if (m.type === "module.enable") {
+        startModule(c, m.requestId, m.moduleId)
+        return
+      }
       setModule(m.moduleId, (x) => {
         const { error: _e, status: _s, ...rest } = x
         return { ...rest, enabled: false, state: "stopping", tools: [] }
@@ -1475,7 +2120,12 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
       if (errors.length > 0) return result(c, m.requestId, false, { code: "invalid_settings", message: "Some settings are not valid.", moduleId: m.moduleId, fieldErrors: errors })
       const tokenGood = typeof m.patch.secrets.token === "string" ? m.patch.secrets.token.includes("good") : (mod as ModuleInfo & { tokenGood?: boolean }).tokenGood
       setModule(m.moduleId, (x) => ({ ...x, settings: applyPatch(x.settings, m.patch), ...(tokenGood !== undefined ? { tokenGood } : {}) }) as ModuleInfo)
-      if (mod.state === "error" && mod.enabled) startModule(c, m.requestId, m.moduleId)
+      if (mod.kind === "capability") {
+        // The instances follow the new shared values; a token that works clears an injected failure.
+        if (tokenGood === true) forcedErrors.delete(m.moduleId)
+        syncCapabilities()
+        result(c, m.requestId, true)
+      } else if (mod.state === "error" && mod.enabled) startModule(c, m.requestId, m.moduleId)
       else result(c, m.requestId, true)
       return
     }
@@ -1507,6 +2157,8 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
       const changed = new Set(committed.filter((x, j) => j === i || JSON.stringify(x.form) !== JSON.stringify(sections[j]!.form)).map((x) => x.id))
       sections = committed.map((x) => (changed.has(x.id) ? { ...x, revision: x.revision + 1 } : x))
       for (const x of sections) if (changed.has(x.id)) broadcast({ type: "section.changed", section: x })
+      if (changed.has("routing")) routingChanged()
+      if (changed.has("llm-openai-accounts")) assistantsChanged()
       result(c, m.requestId, true)
       const needsReload = Object.keys({ ...patch.values, ...patch.secrets }).some((k) => section.form.fields.find((f) => f.key === k)?.apply === "reload")
       const path = `${section.group ?? "general"}/${section.page?.id ?? section.id}`
@@ -1519,7 +2171,7 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
     case "engine.reload": {
       if (requireAdmin(c, m.requestId)) return
       if (engine.state === "reloading") return result(c, m.requestId, false, { code: "busy", message: "A reload is already running." })
-      if (reply !== undefined) interruptReply(reply)
+      for (const v of voiceSessions.values()) if (v.reply !== undefined) interruptReply(v.reply)
       engine = { ...engine, state: "reloading" }
       broadcast({ type: "engine", engine })
       after(1200, () => {
@@ -1612,69 +2264,111 @@ const onClientMessage = (c: Conn, m: ClientMessage) => {
       if (c.session !== undefined) endSessions("logout", c.session)
       return
     }
-    case "device.update": {
-      if (c.frontend !== "voice" || c.deviceId === undefined) return result(c, m.requestId, false, { code: "bad_message", message: "This page has no device." })
-      const fields = Object.keys(m.patch)
-      if (fields.some((f) => !(DEVICE_EDITABLE_FIELDS as ReadonlyArray<string>).includes(f))) {
-        return result(c, m.requestId, false, { code: "admin_required", message: "Only admin can change that." })
-      }
-      const record = devices.get(c.deviceId)
-      if (record === undefined) return result(c, m.requestId, false, { code: "unknown_device", message: "This device is not known." })
-      // As the server: a voice that is not enabled (a stale list) is refused.
-      if (typeof m.patch.voice === "string" && m.patch.voice !== "" && !engine.voices.some((v) => v.enabled && v.name === m.patch.voice)) {
-        return result(c, m.requestId, false, { code: "invalid_settings", message: `"${m.patch.voice}" is not an enabled voice.` })
-      }
-      record.overrides = applyProfilePatch(record.overrides, cleanPatch(m.patch))
-      pushProfiles()
-      result(c, m.requestId, true)
-      devicesChanged()
-      if (c === owner && reply === undefined) setState(restingState())
-      return
-    }
-    case "frontend.update": {
-      if (requireAdmin(c, m.requestId)) return
-      if (m.kind !== WEB_VOICE_KIND) return result(c, m.requestId, false, { code: "unknown_device", message: `No front-end kind ${m.kind}.` })
-      kindDefaults = applyProfilePatch(kindDefaults, cleanPatch(m.patch))
-      pushProfiles()
-      result(c, m.requestId, true)
-      frontendsChanged()
-      devicesChanged()
-      if (reply === undefined) setState(restingState())
-      return
-    }
-    case "device.admin.update": {
-      if (requireAdmin(c, m.requestId)) return
-      const record = devices.get(m.id)
-      if (record === undefined) return result(c, m.requestId, false, { code: "unknown_device", message: "This device is not known (any more)." })
-      if (m.name !== undefined) record.name = m.name.trim()
-      if (m.patch !== undefined) record.overrides = applyProfilePatch(record.overrides, cleanPatch(m.patch))
-      pushProfiles()
-      result(c, m.requestId, true)
-      devicesChanged()
-      if (reply === undefined) setState(restingState())
-      return
-    }
     case "device.forget": {
       if (requireAdmin(c, m.requestId)) return
       const record = devices.get(m.id)
       if (record === undefined) return result(c, m.requestId, false, { code: "unknown_device", message: "This device is not known (any more)." })
       devices.delete(m.id)
+      assistantsMock.forgetDevice(m.id)
       // A device that is connected now is recorded again as new.
       const now = Date.now()
-      if ([...conns].some((x) => x.welcomed && x.deviceId === m.id)) devices.set(m.id, { ...record, firstSeen: now, lastSeen: now, overrides: {} })
-      pushProfiles()
+      if ([...conns].some((x) => x.welcomed && x.deviceId === m.id)) devices.set(m.id, { ...record, firstSeen: now, lastSeen: now })
+      pushSetups()
       result(c, m.requestId, true)
       devicesChanged()
       return
     }
+    case "assistant.create": {
+      if (requireAdmin(c, m.requestId)) return
+      const warned = assistantVoiceWarning(m.assistant.voice, m.saveAnyway === true)
+      if (warned !== undefined) return result(c, m.requestId, false, warned)
+      const r = assistantsMock.create(m, [...devices.values()].map((d) => ({ id: d.id, name: d.name })))
+      sendTo(c, r.ok ? { type: "result", requestId: m.requestId, ok: true, ...(r.assistantId !== undefined ? { assistantId: r.assistantId } : {}) } : { type: "result", requestId: m.requestId, ok: false, ...(r.error !== undefined ? { error: r.error } : {}) })
+      if (r.ok) assistantsChanged()
+      return
+    }
+    case "assistant.save": {
+      if (requireAdmin(c, m.requestId)) return
+      const r = assistantsMock.save(m)
+      sendTo(c, r.ok ? { type: "result", requestId: m.requestId, ok: true } : { type: "result", requestId: m.requestId, ok: false, ...(r.error !== undefined ? { error: r.error } : {}) })
+      if (r.ok) assistantsChanged()
+      return
+    }
+    case "assistant.delete": {
+      if (requireAdmin(c, m.requestId)) return
+      const r = assistantsMock.remove(m, [...devices.values()].map((d) => ({ id: d.id, name: d.name })))
+      sendTo(c, r.ok ? { type: "result", requestId: m.requestId, ok: true } : { type: "result", requestId: m.requestId, ok: false, ...(r.error !== undefined ? { error: r.error } : {}) })
+      if (r.ok) assistantsChanged()
+      return
+    }
+    case "device.save": {
+      if (requireAdmin(c, m.requestId)) return
+      if (m.target.kind === "device" && !devices.has(m.target.id)) return result(c, m.requestId, false, { code: "unknown_device", message: "That device is not known." })
+      const name = m.name === undefined ? undefined : m.name.trim()
+      if (name !== undefined && m.target.kind === "device" && name === "") return result(c, m.requestId, false, { code: "invalid_settings", message: "A device needs a name.", fieldErrors: [{ key: "name", message: "A device needs a name." }] })
+      const r = assistantsMock.saveDevice(m)
+      if (r.ok && name !== undefined && m.target.kind === "device") {
+        const record = devices.get(m.target.id)
+        if (record !== undefined) record.name = name
+      }
+      sendTo(c, r.ok ? { type: "result", requestId: m.requestId, ok: true } : { type: "result", requestId: m.requestId, ok: false, ...(r.error !== undefined ? { error: r.error } : {}) })
+      if (r.ok) assistantsChanged()
+      return
+    }
     case "wake.test": {
       if (requireAdmin(c, m.requestId)) return
+      if (m.deviceId !== undefined && !devices.has(m.deviceId)) return result(c, m.requestId, false, { code: "unknown_device", message: "This device is not known (any more)." })
       if (m.on) {
         c.testerUntil = Date.now() + WAKE_TEST_MAX_MS
+        c.testerDevice = m.deviceId
       } else {
         c.testerUntil = undefined
+        c.testerDevice = undefined
       }
       result(c, m.requestId, true)
+      return
+    }
+    case "conversation.new": {
+      // Protocol 6: this device's conversation only; the running turn stops, the history goes, its tabs are told.
+      const v = sessionFor(c)
+      if (v === undefined) return result(c, m.requestId, false, { code: "bad_message", message: "The admin page has no conversation." })
+      if (m.assistantId !== undefined && !voice.setupFor(c.deviceId).assistants.some((a) => a.id === m.assistantId)) {
+        return result(c, m.requestId, false, { code: "unknown_assistant", message: `${m.assistantId} is not one of the assistants on this device.` })
+      }
+      result(c, m.requestId, true)
+      newConversation(v, "new", m.assistantId)
+      return
+    }
+    case "device.pick": {
+      // Protocol 7: who answers without a phrase on this device; written to the device's own settings (admin sees it).
+      if (c.frontend !== "voice" || c.deviceId === undefined) return result(c, m.requestId, false, { code: "bad_message", message: "This page did not say which device it is; reload it." })
+      const r = voice.pick(c.deviceId, m.withoutPhrase)
+      sendTo(c, r.ok ? { type: "result", requestId: m.requestId, ok: true } : { type: "result", requestId: m.requestId, ok: false, ...(r.error !== undefined ? { error: r.error } : {}) })
+      if (!r.ok) return
+      // As the server: an accepted pick closes the device's armed and follow-up windows (a reply in flight keeps its
+      // turn), and the state that follows names who has the turn; the page does not guess.
+      const v = sessionFor(c)
+      if (v !== undefined) {
+        voice.setHolder(v, undefined)
+        v.awakeUntil = 0
+        if (v.awakeTimer !== undefined) clearTimeout(v.awakeTimer)
+        v.awakeTimer = undefined
+      }
+      assistantsChanged()
+      if (v !== undefined) setState(v, v.reply === undefined && (v.state === "listening" || v.state === "asleep") ? restingState(v) : v.state)
+      return
+    }
+    case "conversation.read": {
+      // Protocol 7: another assistant's conversation on this device; answered to the requester, nothing else changes.
+      const v = sessionFor(c)
+      if (c.frontend !== "voice" || v === undefined) return result(c, m.requestId, false, { code: "bad_message", message: "Conversations are read on a voice page." })
+      if (!voice.setupFor(c.deviceId).assistants.some((a) => a.id === m.assistantId)) {
+        return result(c, m.requestId, false, { code: "unknown_assistant", message: `${m.assistantId} is not one of the assistants on this device.` })
+      }
+      const conv = voice.convFor(v, m.assistantId)
+      // As the server: the turn whose exchange ends the history (here its user message is noted when the turn starts).
+      const lastTurnId = lastTurnOf.get(conv)
+      sendTo(c, { type: "conversation.history", requestId: m.requestId, assistantId: m.assistantId, id: conv.conversation.id, history: clone(conv.history.slice(-200)), ...(lastTurnId !== undefined ? { lastTurnId } : {}) })
       return
     }
     case "ping":
@@ -1702,7 +2396,7 @@ wss.on("connection", (ws: WebSocket) => {
     if (isBinary) {
       if (!c.welcomed) return ws.close(CloseCode.badMessage)
       const frame = decodeMicFrame(data)
-      if (!frame.ok || c !== owner) return
+      if (!frame.ok || c !== sessionFor(c)?.owner) return
       c.micFrames++
       if (frame.frame.pcm.byteLength !== 640) clientLog.push({ at: Date.now(), conn: c.id, type: "mic.bad-size", bytes: frame.frame.pcm.byteLength })
       if (c.lastSeq !== undefined && frame.frame.seq !== ((c.lastSeq + 1) >>> 0)) c.micGaps++
@@ -1729,36 +2423,49 @@ wss.on("connection", (ws: WebSocket) => {
         const now = Date.now()
         const known = devices.get(m.device.id)
         devices.set(m.device.id, known === undefined
-          ? { id: m.device.id, kind: m.device.kind, name: m.device.name, firstSeen: now, lastSeen: now, overrides: {} }
+          ? { id: m.device.id, kind: m.device.kind, name: m.device.name, firstSeen: now, lastSeen: now }
           : { ...known, lastSeen: now })
         c.deviceId = m.device.id
       }
       c.welcomed = true
-      const resumed = m.frontend === "voice" && m.resumeOwner && owner === undefined && lastOwnerClientId === m.clientId
+      const v = sessionFor(c)
+      if (v?.discardTimer !== undefined) {
+        clearTimeout(v.discardTimer)
+        v.discardTimer = undefined
+      }
+      const resumed = v !== undefined && m.resumeOwner && v.owner === undefined && v.lastOwnerClientId === m.clientId
       if (resumed) {
-        owner = c
+        v.owner = c
         c.lastSeq = undefined
       }
+      // Protocol 7: the voice page learns its device's setup and has one conversation per assistant; the snapshot's
+      // history is the answering assistant's.
+      const setup = m.frontend === "voice" ? voice.setupFor(c.deviceId) : undefined
+      if (setup !== undefined) lastSetup.set(c, JSON.stringify(setup))
+      const answering = v === undefined ? undefined : voice.convFor(v, voice.answeringOf(v, c.deviceId))
       sendTo(c, {
         type: "welcome",
         protocol: PROTOCOL_VERSION,
         server: { name: "pva-mock", version: "0.0.0" },
         connectionId: c.id,
         snapshot: {
-          state: resumed ? restingState() : assistantState,
-          role: c === owner ? "owner" : "observer",
-          ownerPresent: owner !== undefined || lastOwnerClientId === "c-another-tab",
+          // Protocol 6: about the device's own session; an admin connection has none.
+          state: v === undefined ? "idle" : resumed ? restingState(v) : v.state,
+          role: v !== undefined && c === v.owner ? "owner" : "observer",
+          ownerPresent: v !== undefined && ownerPresentIn(v),
           engine: engineSummary(engine),
-          history: history.slice(-200),
-          ...(m.frontend === "voice" ? { device: profileInfo(c) } : {}),
-          admin: adminState(c, tokenSent !== undefined && c.session === undefined ? { endReason: "token" } : {})
+          // Who has the turn now (an armed assistant too), apart from whose history this is.
+          ...(v !== undefined && m.frontend === "voice" ? { holder: holderNow(v) } : {}),
+          history: answering === undefined ? [] : answering.history.slice(-200),
+          admin: adminState(c, tokenSent !== undefined && c.session === undefined ? { endReason: "token" } : {}),
+          ...(setup !== undefined ? { setup, conversations: voice.conversationsOf(v, setup) } : { conversations: [] })
         }
       })
       if (isAdminConn(c)) sendAdminSnapshot(c)
       if (c.deviceId !== undefined) devicesChanged()
       if (resumed) {
-        sessionUpdate("resumed")
-        setState(restingState())
+        sessionUpdate(v, "resumed")
+        setState(v, restingState(v))
       }
       return
     }
@@ -1771,18 +2478,340 @@ wss.on("connection", (ws: WebSocket) => {
       const record = devices.get(c.deviceId)
       if (record !== undefined) record.lastSeen = Date.now()
     }
-    if (owner === c) {
-      owner = undefined
-      if (reply !== undefined && reply.owner === c) {
-        broadcast({ type: "error", error: { code: "turn_failed", message: "The audio client disconnected during the reply.", turnId: reply.turnId } })
-        endTurn(reply, "failed")
+    const v = keyOf(c) === undefined ? undefined : voiceSessions.get(keyOf(c)!)
+    if (v !== undefined && v.owner === c) {
+      v.owner = undefined
+      if (v.reply !== undefined && v.reply.owner === c) {
+        toSession(v, { type: "error", error: { code: "turn_failed", message: "The audio client disconnected during the reply.", turnId: v.reply.turnId } })
+        endTurn(v.reply, "failed")
       }
-      sessionUpdate("owner_disconnected")
-      setState("idle")
+      sessionUpdate(v, "owner_disconnected")
+      setState(v, "idle")
     }
+    if (v !== undefined && connsOf(v).length === 0) scheduleDiscard(v)
     if (c.deviceId !== undefined) devicesChanged()
   })
 })
+
+
+// ---------------------------------------------------------------------------
+// The voice picker's HTTP API (docs/VOICE-PROVIDERS.md §5), under /api/
+// ---------------------------------------------------------------------------
+
+/** Favourites, as `data/voice-favourites.json` would hold them: one Cartesia voice (no key yet) among them. */
+function initialFavourites(): Array<Favourite> {
+  const at = Date.UTC(2026, 10, 10)
+  const fav = (provider: string, voiceId: string, name: string, i: number): Favourite => ({ voice: { provider, voiceId }, key: `${provider}:${voiceId}`, name, addedAt: at + i * 60_000 })
+  return [
+    fav("elevenlabs", "mk2Ls1fsHW4xr9Ic3Bb2", "Charlotte", 0),
+    fav("sherpa", "kokoro-af_heart", "Heart", 1),
+    fav("cartesia", "db6b0ed5-d5d3-463d-ae85-518a07d3c2b4", "Skylar", 2),
+    fav("elevenlabs", "mk3Mt2gtIX5ys0Jd4Cc3", "Daniel", 3),
+    fav("sherpa", "en_US-lessac-medium", "Lessac", 4)
+  ]
+}
+let favourites: Array<Favourite> = initialFavourites()
+/** The model pickers (mock/modelPickers.ts), on the mock's own sections, modules, assistants and jobs. */
+const modelPickers = createModelPickersMock({
+  secretSet: (key) => secretSet(key),
+  valueOf: (key) => valueOf(key),
+  vaultLocked: () => vault.state === "locked",
+  subscriptionRunning: () => modules.some((m) => m.id === "claude-subscription" && m.enabled && m.state === "running"),
+  assistants: () => assistantsMock.assistants(),
+  sttItems: () => models.find((m) => m.tool === "stt-models")?.items ?? [],
+  runningJob: (target) => jobs.find((j) => j.tool === "stt-models" && j.target === target && j.state === "running"),
+  startJob: (target) => startJob("stt-models", target),
+  stopJob: (id) => stopJob(id)
+})
+/** POST /mock/voices/fail {"provider", "on"}: a hosted provider whose key is refused (status `error`). */
+const providerFailures = new Set<string>()
+/** POST /mock/voices/hold {"ms"}: previews answer after this long (default 300 ms). */
+let previewHold = 0
+let pendingPreview: { readonly res: ServerResponse; readonly timer: ReturnType<typeof setTimeout> } | undefined
+
+class ApiFail {
+  readonly status: number
+  readonly code: string
+  readonly message: string
+  readonly retryAfterMs: number | undefined
+  constructor(status: number, code: string, message: string, retryAfterMs?: number) {
+    this.status = status
+    this.code = code
+    this.message = message
+    this.retryAfterMs = retryAfterMs
+  }
+}
+
+const providerStatus = (p: (typeof MOCK_PROVIDERS)[number]): ProviderInfo => {
+  const base = {
+    id: p.id,
+    label: p.label,
+    location: p.location,
+    settingsPath: "voices/providers",
+    ...(p.keyField !== undefined ? { keyField: p.keyField } : {}),
+    ...(p.implication !== undefined ? { implication: p.implication } : {}),
+    inUse: parseVoiceKey(assistantVoiceKey())?.provider === p.id
+  }
+  if (p.keyField === undefined) return { ...base, status: "ready", voiceCount: p.voices.length }
+  if (vault.state === "locked") return { ...base, status: "needs_key", reason: "vault_locked", message: `The keys are locked: unlock them to use ${p.label} voices.` }
+  if (!secretSet(p.keyField)) return { ...base, status: "needs_key", reason: "missing", message: `Add a ${p.label} API key to use its voices.` }
+  if (providerFailures.has(p.id)) return { ...base, status: "error", message: `${p.label} refused the API key (401): check it on the Voice providers page.`, voiceCount: p.voices.length }
+  return { ...base, status: "ready", voiceCount: p.voices.length }
+}
+
+const providerVoices = (p: (typeof MOCK_PROVIDERS)[number]): ProviderVoices => {
+  const info = providerStatus(p)
+  const selected = assistantVoiceKey()
+  const deviceUsers = assistantsMock.voiceUsers([...devices.values()].map((d) => ({ id: d.id, name: d.name })))
+  const listed = info.status === "needs_key" ? [] : p.voices
+  const voices: Array<VoiceEntry> = listed.map((v) => {
+    const key = `${p.id}:${v.voiceId}`
+    const item = p.location === "local" ? models.find((m) => m.tool === "tts-models")?.items.find((i) => i.id === v.voiceId) : undefined
+    const job = item === undefined ? undefined : jobs.find((j) => j.tool === "tts-models" && j.target === v.voiceId && j.state === "running")
+    const local = item === undefined ? undefined : { state: job !== undefined ? "downloading" as const : item.installed ? "installed" as const : "not_installed" as const, sizeMb: item.sizeMb, diskMb: item.diskMb, ...(job !== undefined ? { job } : {}) }
+    return {
+      voice: { provider: p.id, voiceId: v.voiceId },
+      key,
+      name: v.name,
+      ...(v.description !== undefined ? { description: v.description } : {}),
+      ...(v.language !== undefined ? { language: v.language } : {}),
+      ...(v.gender !== undefined ? { gender: v.gender } : {}),
+      tags: [...v.tags],
+      ...(local !== undefined ? { local } : {}),
+      previewable: info.status === "ready" && (local === undefined || local.state === "installed"),
+      usedBy: key === selected ? ["jeff"] : [],
+      usedByDevices: deviceUsers.get(key) ?? [],
+      favourite: favourites.some((f) => f.key === key)
+    }
+  })
+  return {
+    provider: info,
+    voices,
+    ...(p.location === "hosted" && info.status !== "needs_key" ? { fetchedAt: Date.now() - 20 * 60_000 } : {}),
+    stale: false,
+    truncated: false,
+    ...(info.status === "error" ? { error: { code: "provider_error", message: info.message ?? "The provider refused." } } : {})
+  }
+}
+
+const findVoice = (ref: unknown): { provider: (typeof MOCK_PROVIDERS)[number]; voice: (typeof MOCK_PROVIDERS)[number]["voices"][number] } => {
+  const r = ref as { provider?: unknown; voiceId?: unknown } | undefined
+  if (typeof r?.provider !== "string" || typeof r.voiceId !== "string") throw new ApiFail(400, "invalid_request", "The request is not valid: voice")
+  const provider = MOCK_PROVIDERS.find((p) => p.id === r.provider)
+  if (provider === undefined) throw new ApiFail(404, "unknown_provider", `There is no voice provider "${r.provider}"`)
+  const voice = provider.voices.find((v) => v.voiceId === r.voiceId)
+  if (voice === undefined) throw new ApiFail(404, "unknown_voice", `${provider.label} has no voice "${r.voiceId}"`)
+  return { provider, voice }
+}
+
+const needKey = (p: (typeof MOCK_PROVIDERS)[number]) => {
+  const info = providerStatus(p)
+  if (info.status === "needs_key") throw new ApiFail(409, "needs_key", info.message ?? `There is no ${p.label} key: add it on the Voice providers page.`)
+  return info
+}
+
+const defaultVoiceInfo = () => {
+  const saved = String(valueOf("ASSISTANT_VOICE") ?? "").trim()
+  const key = assistantVoiceKey()
+  const ref = parseVoiceKey(key)!
+  const name = MOCK_PROVIDERS.find((p) => p.id === ref.provider)?.voices.find((v) => v.voiceId === ref.voiceId)?.name
+  return {
+    voice: ref,
+    key,
+    ...(name !== undefined ? { name } : {}),
+    source: saved !== "" ? "saved" as const : "default" as const,
+    locked: false,
+    ...(engine.state === "ready" ? { running: runningVoiceKey() } : {}),
+    reloadPending: (engine.reloadPendingFor ?? []).includes("voices/overview"),
+    notes: [] as Array<string>
+  }
+}
+
+/** Save ASSISTANT_VOICE as settings.update would (a new revision, section.changed, the reload pending). */
+const saveAssistantVoice = (key: string) => {
+  sections = withWarnings(sections.map((x) => (x.id === "voices" ? { ...x, form: { ...x.form, values: { ...x.form.values, ASSISTANT_VOICE: key } }, revision: x.revision + 1 } : x)))
+  const section = sections.find((x) => x.id === "voices")
+  if (section !== undefined) broadcast({ type: "section.changed", section })
+  if (!(engine.reloadPendingFor ?? []).includes("voices/overview")) {
+    engine = { ...engine, reloadPending: true, reloadPendingFor: [...(engine.reloadPendingFor ?? []), "voices/overview"] }
+    broadcast({ type: "engine", engine })
+  }
+}
+
+const apiRoute = async (req: IncomingMessage, res: ServerResponse, path: string, query: URLSearchParams): Promise<{ status: number; body: unknown } | undefined> => {
+  const method = req.method ?? "GET"
+  const only = (...allowed: Array<string>) => {
+    if (!allowed.includes(method)) throw new ApiFail(405, "method_not_allowed", `Use ${allowed.join(", ")}`)
+  }
+  const body = async (): Promise<Record<string, unknown>> => {
+    const text = await readBody(req)
+    if (text === "") return {}
+    try {
+      return JSON.parse(text) as Record<string, unknown>
+    } catch {
+      throw new ApiFail(400, "invalid_request", "The request body is not valid JSON")
+    }
+  }
+  if (path === "voice-providers") {
+    only("GET")
+    return { status: 200, body: { providers: MOCK_PROVIDERS.map(providerStatus) } }
+  }
+  if (path === "voices") {
+    only("GET")
+    const id = query.get("provider")
+    if (id !== null && !MOCK_PROVIDERS.some((p) => p.id === id)) throw new ApiFail(404, "unknown_provider", `There is no voice provider "${id}"`)
+    // Hosted lists take a moment (a refresh longer: the providers are asked again).
+    await new Promise((r) => setTimeout(r, query.get("refresh") === "1" ? 500 : 120))
+    const providers = MOCK_PROVIDERS.filter((p) => id === null || p.id === id).map(providerVoices)
+    return { status: 200, body: { providers, selected: assistantVoiceKey() } }
+  }
+  if (path === "voices/preview") {
+    only("POST")
+    const b = await body()
+    const { provider, voice } = findVoice(b.voice)
+    const text = typeof b.text === "string" ? b.text.trim() : ""
+    if (text.length === 0 || text.length > MAX_PREVIEW_CHARS) throw new ApiFail(400, "invalid_request", "The preview text must be 1–300 characters", undefined)
+    const info = needKey(provider)
+    if (info.status === "error") throw new ApiFail(502, "provider_error", info.message ?? "The provider refused.")
+    if (provider.location === "local") {
+      if (!presetInstalled(voice.voiceId)) throw new ApiFail(409, "not_installed", `${voice.name} is not downloaded: download it first`)
+      if ([...voiceSessions.values()].some((v) => v.state === "hearing" || v.state === "thinking" || v.state === "speaking")) {
+        throw new ApiFail(409, "busy", "The assistant is talking; try again in a moment", 1000)
+      }
+    }
+    clientLog.push({ type: "api.preview", conn: "http", at: Date.now(), voice: `${provider.id}:${voice.voiceId}`, text })
+    // One preview at a time: a new one supersedes the one still waiting.
+    if (pendingPreview !== undefined) {
+      clearTimeout(pendingPreview.timer)
+      apiAnswer(req, pendingPreview.res, 409, { error: { code: "superseded", message: "A newer preview replaced this one" } })
+      pendingPreview = undefined
+    }
+    const pcm = synthesize(text, voice.name.length)
+    const wav = encodeWav(pcm, REPLY_RATE)
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(() => {
+        if (pendingPreview?.res === res) pendingPreview = undefined
+        resolve()
+      }, previewHold > 0 ? previewHold : 300)
+      pendingPreview = { res, timer }
+      res.on("close", () => {
+        if (pendingPreview?.res === res) {
+          clearTimeout(timer)
+          pendingPreview = undefined
+        }
+        resolve()
+      })
+    })
+    if (res.writableEnded || res.destroyed) return undefined
+    res.writeHead(200, { ...corsHeaders(req), "content-type": "audio/wav", "content-length": String(wav.length), "x-voice-sample-rate": String(REPLY_RATE), "x-preview-cache": "miss", "cache-control": "no-store" })
+    res.end(wav)
+    return undefined
+  }
+  if (path === "voices/download" || path === "voices/download/cancel") {
+    only("POST")
+    const { provider, voice } = findVoice((await body()).voice)
+    if (provider.location !== "local") throw new ApiFail(400, "invalid_request", "Only voices on this machine are downloaded")
+    if (path === "voices/download/cancel") {
+      const job = jobs.find((j) => j.tool === "tts-models" && j.target === voice.voiceId && j.state === "running")
+      const cancelled = job === undefined ? undefined : stopJob(job.id)
+      if (cancelled === undefined) throw new ApiFail(404, "not_found", `${voice.name} is not being downloaded`)
+      return { status: 200, body: { cancelled: true, job: cancelled } }
+    }
+    const started = startJob("tts-models", voice.voiceId)
+    if (!started.ok) {
+      throw started.code === "installed" ? new ApiFail(409, "already_installed", started.message)
+        : started.code === "running" ? new ApiFail(409, "busy", started.message)
+        : new ApiFail(404, "unknown_voice", started.message)
+    }
+    return { status: 202, body: { job: started.job } }
+  }
+  const jobMatch = /^jobs\/([^/]+)$/.exec(path)
+  if (jobMatch !== null) {
+    only("GET")
+    const job = jobs.find((j) => j.id === decodeURIComponent(jobMatch[1]!))
+    if (job === undefined) throw new ApiFail(404, "not_found", "There is no such job")
+    return { status: 200, body: { job } }
+  }
+  if (path === "voices/favourites") {
+    only("GET")
+    return { status: 200, body: { favourites } }
+  }
+  const favMatch = /^voices\/favourites\/([^/]+)$/.exec(path)
+  if (favMatch !== null) {
+    only("PUT", "DELETE")
+    let key: string
+    try {
+      key = decodeURIComponent(favMatch[1]!)
+    } catch {
+      throw new ApiFail(400, "invalid_request", "The voice in the address is not valid")
+    }
+    const ref = parseVoiceKey(key)
+    if (ref === undefined) throw new ApiFail(400, "invalid_request", `"${key.slice(0, 80)}" is not a voice (provider:voice)`)
+    if (!MOCK_PROVIDERS.some((p) => p.id === ref.provider)) throw new ApiFail(404, "unknown_provider", `There is no voice provider "${ref.provider}"`)
+    if (method === "DELETE") {
+      if (!favourites.some((f) => f.key === key)) throw new ApiFail(404, "not_found", "That voice is not a favourite")
+      favourites = favourites.filter((f) => f.key !== key)
+      return { status: 200, body: { favourites } }
+    }
+    const b = await body()
+    const listed = MOCK_PROVIDERS.find((p) => p.id === ref.provider)?.voices.find((v) => v.voiceId === ref.voiceId)?.name
+    const name = typeof b.name === "string" && b.name.length > 0 ? b.name.slice(0, 100) : listed ?? ref.voiceId
+    const existing = favourites.find((f) => f.key === key)
+    if (existing === undefined && favourites.length >= MAX_FAVOURITES) throw new ApiFail(409, "limit_reached", `At most ${MAX_FAVOURITES} favourites`)
+    const favourite: Favourite = existing !== undefined ? { ...existing, name } : { voice: ref, key, name, addedAt: Date.now() }
+    favourites = existing !== undefined ? favourites.map((f) => (f.key === key ? favourite : f)) : [...favourites, favourite]
+    return { status: 200, body: { favourite, favourites } }
+  }
+  if (path === "voices/default") {
+    only("GET", "PUT")
+    if (method === "GET") return { status: 200, body: { default: defaultVoiceInfo() } }
+    const b = await body()
+    const { provider, voice } = findVoice(b.voice)
+    needKey(provider)
+    if (provider.location === "local" && !presetInstalled(voice.voiceId)) throw new ApiFail(409, "not_installed", `${voice.name} is not downloaded: download it first`)
+    saveAssistantVoice(`${provider.id}:${voice.voiceId}`)
+    if (b.reload === true) {
+      engine = { ...readyEngine(), reloadPending: false }
+      broadcast({ type: "engine", engine })
+      return { status: 200, body: { default: defaultVoiceInfo(), reload: { ok: true } } }
+    }
+    return { status: 200, body: { default: defaultVoiceInfo() } }
+  }
+  const picked = await modelPickers.route(method, path, query, body)
+  if (picked !== undefined) return picked
+  throw new ApiFail(404, "not_found", `There is nothing at /api/${path}`)
+}
+
+/** CORS for the page's origin (the static export and the mock are on different ports). */
+const corsHeaders = (req: IncomingMessage): Record<string, string> => {
+  const origin = req.headers.origin
+  return origin === undefined ? {} : { "access-control-allow-origin": origin, vary: "Origin", "access-control-expose-headers": "X-Voice-Sample-Rate, X-Preview-Cache" }
+}
+
+function apiAnswer(req: IncomingMessage, res: ServerResponse, status: number, body: unknown) {
+  if (res.writableEnded || res.destroyed) return
+  res.writeHead(status, { ...corsHeaders(req), "content-type": "application/json; charset=utf-8", "cache-control": "no-store", "x-content-type-options": "nosniff" })
+  res.end(JSON.stringify(body))
+}
+
+const handleApi = async (req: IncomingMessage, res: ServerResponse, url: URL) => {
+  if (req.method === "OPTIONS") {
+    res.writeHead(204, { ...corsHeaders(req), "access-control-allow-methods": "GET, POST, PUT, DELETE", "access-control-allow-headers": "authorization, content-type", "access-control-max-age": "600" })
+    return res.end()
+  }
+  try {
+    const token = /^Bearer\s+(\S+)$/.exec(req.headers.authorization ?? "")?.[1]
+    if (!adminEnabled()) throw new ApiFail(401, "admin_required", "Admin is disabled: set PVA_ADMIN_PASSWORD (at least 8 characters) in .env and restart.")
+    if (token === undefined || !sessions.has(token)) throw new ApiFail(401, "admin_required", "Log in to admin first (the session may have ended)")
+    const answer = await apiRoute(req, res, url.pathname.slice("/api/".length).replace(/\/+$/, ""), url.searchParams)
+    if (answer !== undefined) apiAnswer(req, res, answer.status, answer.body)
+  } catch (e) {
+    if (e instanceof ApiFail) {
+      return apiAnswer(req, res, e.status, { error: { code: e.code, message: e.message, ...(e.retryAfterMs !== undefined ? { retryAfterMs: e.retryAfterMs } : {}) } })
+    }
+    apiAnswer(req, res, 500, { error: { code: "internal", message: String(e) } })
+  }
+}
 
 const readBody = (req: IncomingMessage) =>
   new Promise<string>((resolve) => {
@@ -1799,6 +2828,7 @@ const json = (res: ServerResponse, status: number, body: unknown) => {
 const http = createServer((req, res) => {
   void (async () => {
     const url = new URL(req.url ?? "/", "http://localhost")
+    if (url.pathname.startsWith("/api/")) return handleApi(req, res, url)
     if (req.method === "OPTIONS") {
       res.writeHead(204, { "access-control-allow-origin": "*", "access-control-allow-methods": "GET,POST", "access-control-allow-headers": "content-type" })
       return res.end()
@@ -1807,8 +2837,9 @@ const http = createServer((req, res) => {
       return json(res, 200, {
         scenario,
         messages: clientLog,
-        mic: [...conns].map((c) => ({ conn: c.id, frames: c.micFrames, gaps: c.micGaps, owner: c === owner })),
-        state: assistantState,
+        mic: [...conns].map((c) => ({ conn: c.id, frames: c.micFrames, gaps: c.micGaps, owner: c === sessionFor(c)?.owner })),
+        state: targetSession()?.state ?? "idle",
+        sessions: sessionInfos(),
         connections: conns.size
       })
     }
@@ -1823,13 +2854,45 @@ const http = createServer((req, res) => {
         dropAll()
         log("scenario", scenario)
         return json(res, 200, { scenario })
+      case "/mock/models/state": {
+        const answer = modelPickers.control(payload)
+        return json(res, answer.status, answer.body)
+      }
       case "/mock/reset":
         resetState()
         dropAll()
         return json(res, 200, { ok: true })
       case "/mock/turn":
-        runVoiceTurn()
+        // Protocol 7: `assistantId` answers (default: who has the turn, else who answers without a phrase); `phrase`: it was
+        // woken by that phrase in the same sentence.
+        runVoiceTurn(targetSession(payload.deviceId), {
+          assistantId: typeof payload.assistantId === "string" ? payload.assistantId : undefined,
+          phrase: typeof payload.phrase === "string" ? payload.phrase : undefined
+        })
         return json(res, 200, { ok: true })
+      case "/mock/device": {
+        // A device's (without `deviceId`: the web-voice type's) settings, saved as admin would (tests): the setups follow.
+        const r = voice.saveSettings(typeof payload.deviceId === "string" ? payload.deviceId : undefined, (payload.settings ?? {}) as Parameters<typeof voice.saveSettings>[1])
+        if (r.ok) assistantsChanged()
+        return json(res, r.ok ? 200 : 400, r.ok ? { ok: true } : { ok: false, error: r.error })
+      }
+      case "/mock/idle": {
+        // Protocol 6: the device's conversation has been quiet for longer than its conversationIdleMinutes: the next
+        // turn starts a new one (reason "idle"); `now: true` starts it at once.
+        const v = targetSession(payload.deviceId)
+        if (v === undefined) return json(res, 400, { error: "no session" })
+        if (payload.now === true) newConversation(v, "idle")
+        else v.lastTurnAt = Date.now() - (Math.max(1, idleMinutesOf(voice.answeringOf(v, v.deviceId))) + 1) * 60_000
+        return json(res, 200, { ok: true })
+      }
+      case "/mock/max-sessions": {
+        // MAX_VOICE_SESSIONS, as admin › Language model › Conversations would set it.
+        const n = typeof payload.n === "number" ? payload.n : DEFAULT_MAX_VOICE_SESSIONS
+        sections = sections.map((x) => (x.id === "conversations" ? { ...x, form: { ...x.form, values: { ...x.form.values, MAX_VOICE_SESSIONS: n } }, revision: x.revision + 1 } : x))
+        const section = sections.find((x) => x.id === "conversations")
+        if (section !== undefined) broadcast({ type: "section.changed", section })
+        return json(res, 200, { ok: true })
+      }
       case "/mock/drop":
         dropAll()
         return json(res, 200, { ok: true })
@@ -1845,31 +2908,67 @@ const http = createServer((req, res) => {
         return json(res, 200, { ok: true })
       }
       case "/mock/wake": {
-        wakeUp(typeof payload.phrase === "string" ? payload.phrase : "hey jeff", payload.armed !== false)
+        const v = targetSession(payload.deviceId)
+        if (v !== undefined) wakeUp(v, typeof payload.phrase === "string" ? payload.phrase : "hey jeff", payload.armed !== false, typeof payload.assistantId === "string" ? payload.assistantId : undefined)
         return json(res, 200, { ok: true })
       }
       case "/mock/heard": {
         sendHeard(
+          typeof payload.deviceId === "string" ? voiceSessions.get(payload.deviceId) : undefined,
           String(payload.text ?? ""),
           typeof payload.matched === "string" ? payload.matched : undefined,
-          typeof payload.accepted === "boolean" ? payload.accepted : payload.accepted === null ? null : undefined
+          typeof payload.accepted === "boolean" ? payload.accepted : payload.accepted === null ? null : undefined,
+          payload.source !== null
         )
         return json(res, 200, { ok: true })
       }
-      case "/mock/defaults": {
-        // The web-voice defaults, as admin › Front ends would set them (tests).
-        kindDefaults = applyProfilePatch(kindDefaults, (payload.patch ?? {}) as ProfilePatch)
-        pushProfiles()
-        frontendsChanged()
+      case "/mock/typesafe": {
+        // TypeSafe set up or not (tests): the routing section switched on with a key, as `canAuto` reads it.
+        const on = payload.on !== false
+        sections = withWarnings(sections.map((x) => {
+          if (x.id !== "routing") return x
+          const form = on
+            ? { ...x.form, values: { ...x.form.values, TYPESAFE_ROUTING: true }, secrets: { ...x.form.secrets, TYPESAFE_API_KEY: { set: true, source: "store" as const } } }
+            : { ...x.form, values: { ...x.form.values, TYPESAFE_ROUTING: false }, secrets: { ...x.form.secrets, TYPESAFE_API_KEY: { set: false, source: "none" as const } } }
+          return { ...x, form, revision: x.revision + 1 }
+        }))
+        const routing = sections.find((x) => x.id === "routing")
+        if (routing !== undefined) broadcast({ type: "section.changed", section: routing })
+        routingChanged()
         return json(res, 200, { ok: true })
       }
+      case "/mock/module-error": {
+        // A capability module's instances fail (tests); `message` absent: they run again.
+        const id = String(payload.module ?? "")
+        if (typeof payload.message === "string") forcedErrors.set(id, payload.message)
+        else forcedErrors.delete(id)
+        syncCapabilities()
+        return json(res, 200, { ok: true })
+      }
+      case "/mock/assistant": {
+        // Another admin changed an assistant (tests): `patch` is set on it and its rev goes up; the lists are pushed.
+        const ok = assistantsMock.touch(String(payload.id ?? ""), (payload.patch ?? {}) as Parameters<typeof assistantsMock.touch>[1])
+        if (ok) assistantsChanged()
+        return json(res, ok ? 200 : 404, { ok })
+      }
+      case "/mock/voices/fail": {
+        // A hosted provider whose key is refused (`on: false` makes it work again).
+        const id = String(payload.provider ?? "")
+        if (payload.on === false) providerFailures.delete(id)
+        else providerFailures.add(id)
+        return json(res, 200, { ok: true })
+      }
+      case "/mock/voices/hold":
+        previewHold = typeof payload.ms === "number" ? payload.ms : 0
+        return json(res, 200, { ok: true })
       case "/mock/logout-fails":
         logoutFails = payload.on !== false
         return json(res, 200, { ok: true })
       case "/mock/state": {
         const state = payload.state
         if (state !== "idle" && state !== "asleep" && state !== "listening" && state !== "hearing" && state !== "thinking" && state !== "speaking") return json(res, 400, { error: "state?" })
-        setState(state)
+        const v = targetSession(payload.deviceId)
+        for (const x of v !== undefined ? [v] : [...voiceSessions.values()]) setState(x, state)
         return json(res, 200, { ok: true })
       }
       case "/mock/send": {
@@ -1894,6 +2993,7 @@ http.on("upgrade", (req, socket, head) => {
   wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req))
 })
 
+syncCapabilities()
 http.listen(PORT, HOST, () => console.log(`[mock] assistant mock on ws://${HOST}:${PORT}/ws · scenario ${scenario}`))
 
 const shutdown = () => {

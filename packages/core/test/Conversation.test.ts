@@ -7,7 +7,6 @@ import { type ContextProvider, makeTool, type Tool } from "../src/Module.ts"
 import { ToolRegistry } from "../src/ToolRegistry.ts"
 import { Tts } from "../src/Services.ts"
 import { TurnTrace } from "../src/TurnTrace.ts"
-import { makeVoiceRouter } from "../src/VoiceRouter.ts"
 import {
   eagerEndOfTurn,
   endOfTurn,
@@ -489,55 +488,5 @@ describe("Conversation", () => {
       assert.deepStrictEqual(t.out.probe.chunks, [{ text: "<Hi!>", at: 100 }])
       assert.strictEqual(stt.probe.completed, 1)
     }).pipe(Effect.provide(Layer.mergeAll(t.layer, stt.layer, mic.layer)))
-  })
-
-  describe("with the voice router", () => {
-    const voiceSetup = (llm: Setup["llm"]) => {
-      const t = setup({ llm, ttsDelay: 100 })
-      const standard = makeMarkerTts({ label: "std", delayMillis: 100 })
-      const expressive = makeMarkerTts({ label: "exp", delayMillis: 100 })
-      const router = makeVoiceRouter({
-        defaultVoice: "standard",
-        voices: [
-          { name: "standard", description: "", tts: standard.service },
-          { name: "expressive", description: "", tts: expressive.service }
-        ]
-      })
-      const layer = Layer.mergeAll(t.conversation, Layer.succeed(Tts, router), t.out.layer)
-      return { ...t, standard, expressive, layer }
-    }
-
-    it.effect("a marked reply is spoken by the chosen voice; history keeps the marker; the trace names the voice", () => {
-      const t = voiceSetup([[textDelta("[voice:"), textDelta("expressive] Jingle bells, "), textDelta("jingle all the way!")]])
-      return Effect.gen(function*() {
-        const fiber = yield* startVoice([endOfTurn("sing")])
-        yield* advance(2_000)
-        yield* Fiber.join(fiber)
-        assert.deepStrictEqual(played(t.out), ["<exp:Jingle bells,>", "<exp:jingle all the way!>"])
-        assert.strictEqual(t.standard.probe.started, 0)
-        assert.deepStrictEqual(yield* history, [
-          { role: "user", content: "sing" },
-          { role: "assistant", content: "[voice:expressive] Jingle bells, jingle all the way!" }
-        ])
-        const [trace] = yield* Effect.flatMap(Effect.service(TurnTrace), (tt) => tt.recent)
-        assert.deepStrictEqual(trace!.voices, ["expressive"])
-      }).pipe(Effect.provide(t.layer))
-    })
-
-    it.effect("an interrupted marked reply records only the clauses that played, across a voice switch", () => {
-      const t = voiceSetup([[textDelta("Sure. [voice:expressive] Ho ho ho. "), textDelta("Merry Christmas. "), sleep(10_000), textDelta("Bye.")]])
-      return Effect.gen(function*() {
-        // "Sure." synthesised 0–100 and plays 100–200; "Ho ho ho." ready at 200 and plays 200–300. Barge in at 250.
-        const fiber = yield* startVoice([endOfTurn("sing"), sleep(250), speechStarted])
-        yield* advance(20_000)
-        yield* Fiber.join(fiber)
-        assert.deepStrictEqual(played(t.out), ["<std:Sure.>", "<exp:Ho ho ho.>"])
-        assert.strictEqual(t.expressive.probe.interrupted, 1)
-        assert.deepStrictEqual(yield* history, [
-          { role: "user", content: "sing" },
-          { role: "assistant", content: "Sure. [voice:expressive] Ho ho ho.", interrupted: true }
-        ] satisfies Array<Message>)
-      }).pipe(Effect.provide(t.layer))
-    })
   })
 })

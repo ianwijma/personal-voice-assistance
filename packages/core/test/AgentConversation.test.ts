@@ -12,7 +12,7 @@ import { makeIntentAgent } from "../src/IntentAgent.ts"
 import type { AgentTurnSetup, ConversationEvent, ConversationInput } from "../src/ConversationEvents.ts"
 import { makeTool } from "../src/Module.ts"
 import { makeModelAgent } from "../src/ModelAgent.ts"
-import type { RoutingConfig } from "../src/Routing.ts"
+import type { RoutingConfig } from "../src/TriggerRouter.ts"
 import { Llm } from "../src/Services.ts"
 import { makeToolRegistry } from "../src/ToolRegistry.ts"
 import { TurnTrace } from "../src/TurnTrace.ts"
@@ -244,8 +244,8 @@ describe("trigger only, arming and canned turns", () => {
     const main = makeScriptedAgent({ id: "main" }, [[agentText("One. "), sleep(5_000), agentText("Two.")]])
     const t = harness({ setup: makeAgentSetup({ agents: [main.agent], routing: routing() }) })
     return Effect.gen(function*() {
-      yield* run([endOfTurn("count"), sleep(150), { _tag: "Say", text: "This is the natural voice.", voice: "natural" }], 10_000)
-      assert.deepStrictEqual(played(t.out), ["<One.>", "<[voice:natural] This is the natural voice.>"])
+      yield* run([endOfTurn("count"), sleep(150), { _tag: "Say", text: "This is the natural voice." }], 10_000)
+      assert.deepStrictEqual(played(t.out), ["<One.>", "<This is the natural voice.>"])
       assert.deepStrictEqual(yield* history, [{ role: "user", content: "count" }, { role: "assistant", content: "One.", interrupted: true, agentId: "main" }])
       assert.strictEqual(ofTag(t.events, "TurnStarted")[1]!.canned, true)
     }).pipe(Effect.provide(t.layer))

@@ -30,6 +30,12 @@ export interface AnthropicLlmOptions {
   readonly timeoutMs: number
   /** Open the HTTPS connection at startup (cheap authenticated GET). */
   readonly warmUp: boolean
+  /**
+   * With `warmUp`: the service is returned once the warm-up request has ended (succeeded or failed, at most
+   * `timeoutMs`), instead of warming up in the background. Serve mode's resource pool uses it, so an instance is
+   * ready only once it is warm (docs/ASSISTANTS.md §3.2). Default false.
+   */
+  readonly awaitWarmUp?: boolean
   /** For tests; defaults to the SDK's (the global `fetch`). */
   readonly fetch?: typeof globalThis.fetch
 }
@@ -370,7 +376,7 @@ const makeService = Effect.fnUntraced(function*(options: AnthropicLlmOptions) {
       Effect.catchDefect((d) => Effect.fail(llmError(secrets, `Anthropic warm-up failed unexpectedly: ${fromUpstream(d, secrets)}`, d))),
       Effect.tapError((e) => Effect.logWarning(`Anthropic warm-up failed: ${e.message}`)),
       Effect.ignore,
-      Effect.forkScoped
+      (warmUp) => (options.awaitWarmUp === true ? warmUp : Effect.asVoid(Effect.forkScoped(warmUp)))
     )
   }
 
@@ -464,3 +470,5 @@ export const layerConfig: Layer.Layer<Llm, Config.ConfigError> = Layer.effect(
 )
 
 export const AnthropicLlm = { layer, layerConfig, make, config } as const
+
+export * from "./models.ts"

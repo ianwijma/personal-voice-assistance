@@ -71,7 +71,7 @@ const vaultState = async (client: ScriptedClient, pred: (v: VaultInfo) => boolea
 }
 
 const protectedUpdate = { type: "settings.update", sectionId: "language-model", patch: { values: { LLM_PROVIDER: "fake" }, secrets: {} } } as const
-const openUpdate = { type: "settings.update", sectionId: "voices", patch: { values: { DEFAULT_VOICE: "standard" }, secrets: {} } } as const
+const openUpdate = { type: "settings.update", sectionId: "voices", patch: { values: { ASSISTANT_VOICE: null }, secrets: {} } } as const
 const configureGreeter = { type: "module.configure", moduleId: "greeter", patch: { values: { greeting: "hoi" }, secrets: {} } } as const
 
 /** A provider build that needs ANTHROPIC_API_KEY from the settings (as the real Anthropic adapter does). */
@@ -99,14 +99,17 @@ describe("serve: key vault and admin access", () => {
     expect(welcome.snapshot.vault).toEqual({ state: "none", admin: true, location: join(server.dataDir, "vault", "vault.enc") })
     const flags = Object.fromEntries(welcome.snapshot.sections.map((s) => [s.id, s.protected === true]))
     expect(flags).toEqual({
+      home: false,
       "language-model": true,
       "llm-behaviour": false,
+      "llm-openai-accounts": true,
       "stt-engine": true,
       "stt-timing": false,
       "stt-mic": false,
       "stt-deepgram": true,
       voices: false,
-      "voice-engines": true,
+      "voice-providers": true,
+      routing: true,
       recordings: false
     })
     expect(welcome.snapshot.modules[0]).toMatchObject({ id: "greeter", protected: true })
@@ -172,7 +175,9 @@ describe("serve: key vault and admin access", () => {
     })
     const greeter = welcome.snapshot.modules.find((m) => m.id === "greeter")!
     expect(greeter.settings.secrets.token).toEqual({ set: false, source: "none" })
-    const refusedText = await request(b, { type: "text.send", text: "hello", speak: false })
+    // Typed on a voice page (admin connections have no voice session since protocol 6).
+    const { client: voice } = await helloed(second)
+    const refusedText = await request(voice, { type: "text.send", text: "hello", speak: false })
     expect(refusedText.error?.code).toBe("engine_failed")
 
     expect((await request(b, { type: "vault.unlock", password: PASSWORD })).ok).toBe(true)

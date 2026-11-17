@@ -104,6 +104,28 @@ describe("WebAudioOutput.play", () => {
       assert.strictEqual(web.playingTurn(), undefined)
     }).pipe(Effect.scoped))
 
+  it.effect("protocol 7: reply.start names the turn's assistant when the trace has one, and omits assistantId otherwise", () =>
+    Effect.gen(function*() {
+      const web = yield* makeWebAudio()
+      const owner = fakeLink()
+      web.setOwner(owner.link)
+      const named: Trace = { ...trace(20), assistant: { id: "jarvis", name: "Jarvis" } }
+      for (const tr of [named, trace(21)]) {
+        const fiber = yield* web.output.play(Stream.make(pcm(100)), 22_050).pipe(
+          Effect.provideService(CurrentTurnTrace, tr),
+          Effect.forkChild
+        )
+        yield* Effect.yieldNow
+        web.report({ type: "playback.finished", turnId: tr.id, playedSamples: 100 })
+        yield* Fiber.join(fiber)
+      }
+      const starts = owner.messages.filter((m) => m.type === "reply.start")
+      assert.deepStrictEqual(starts, [
+        { type: "reply.start", turnId: 20, sampleRate: 22_050, assistantId: "jarvis" },
+        { type: "reply.start", turnId: 21, sampleRate: 22_050 }
+      ])
+    }).pipe(Effect.scoped))
+
   it.effect("no owner: fails at once", () =>
     Effect.gen(function*() {
       const web = yield* makeWebAudio()
@@ -339,16 +361,19 @@ describe("WebAudioInput: bounds", () => {
       const owner = fakeLink()
       web.setOwner(owner.link)
       web.setMicLive(true)
-      // Nobody consumes yet: 100 frames of 8 s each (256 000 bytes) arrive.
+      // Nobody consumes yet: 100 frames of 8 s each (256 000 bytes) arrive; the queue keeps ~3 s of them.
       for (let i = 0; i < 100; i++) web.micFrame(pcm(128_000))
       const got: Array<Uint8Array> = []
       yield* web.input.stream.pipe(Stream.runForEach((c) => Effect.sync(() => got.push(c))), Effect.forkChild)
-      yield* Effect.yieldNow
-      // The consumer started from now (the queue is cleared for a new consumer): feed again while it runs.
+      yield* Effect.repeat(Effect.yieldNow, { times: 20 })
+      // The first consumer takes what was queued before it (a voice session's first frames), at most the cap.
+      const before = got.reduce((n, c) => n + c.length, 0)
+      assert.isAtMost(before, 96_000, `bytes queued before the consumer: ${before}`)
+      // Feed again while it runs.
       for (let i = 0; i < 400; i++) web.micFrame(pcm(320))
       for (let i = 0; i < 100; i++) web.micFrame(pcm(128_000))
       yield* Effect.repeat(Effect.yieldNow, { times: 20 })
-      const bytes = got.reduce((n, c) => n + c.length, 0)
+      const bytes = got.reduce((n, c) => n + c.length, 0) - before
       // Everything above was offered without a yield, so what the consumer got is what the queue held at once.
       assert.isAtMost(bytes, 96_000, `bytes queued: ${bytes}`)
       assert.isTrue(web.inputStats().droppedFrames > 0)

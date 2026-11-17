@@ -1,6 +1,11 @@
 import { Schema } from "effect"
+import { AssistantId } from "./assistants.ts"
+import { DeviceUser } from "./deviceUsers.ts"
+import { AssistantInfo, DeviceListInfo, DeviceSetup, DeviceTypeInfo } from "./devices.ts"
+import { ConversationId, SessionInfo } from "./sessions.ts"
 import {
   AssistantState,
+  FieldKey,
   ModuleId,
   NonNegativeFinite,
   NonNegativeInt,
@@ -16,7 +21,6 @@ import { EnvInfo } from "./env.ts"
 import { JobInfo, ModelSet } from "./jobs.ts"
 import { VaultInfo } from "./vault.ts"
 import { AdminState } from "./admin.ts"
-import { DeviceInfo, DeviceProfileInfo, FrontendKindInfo } from "./frontends.ts"
 
 /** A one-line status a running module publishes, e.g. "Connected · 143 entities". */
 export const StatusLine = Schema.Struct({
@@ -35,6 +39,21 @@ export const ToolInfo = Schema.Struct({
   speculative: Schema.Boolean
 })
 export type ToolInfo = typeof ToolInfo.Type
+
+/**
+ * One running (or failing) instance of a module that assistants switch on (docs/ASSISTANTS.md §2.6, §3): assistants
+ * whose effective settings are equal share one instance; an assistant with its own values may run another.
+ */
+export const ModuleInstanceInfo = Schema.Struct({
+  /** The switched-on assistants that use this instance. */
+  assistants: Schema.Array(Schema.String),
+  /** The fields this instance's assistants have their own values for (empty: the shared settings). */
+  own: Schema.Array(FieldKey),
+  state: ModuleState,
+  error: Schema.optionalKey(Schema.String),
+  status: Schema.optionalKey(StatusLine)
+})
+export type ModuleInstanceInfo = typeof ModuleInstanceInfo.Type
 
 export const ModuleInfo = Schema.Struct({
   id: ModuleId,
@@ -63,7 +82,13 @@ export const ModuleInfo = Schema.Struct({
    * The settings category that shows the module's page (`#settings/<group>/<id>`): `modules` for capabilities,
    * `agents` (Language model) for agents and decision providers. Absent = by `kind`.
    */
-  group: Schema.optionalKey(SettingsGroup)
+  group: Schema.optionalKey(SettingsGroup),
+  /**
+   * Present for a module the assistants switch on and off (a capability, in serve mode): `enabled` is then "at least
+   * one switched-on assistant has it on", `state` sums up the instances (`error` when one fails), and each instance
+   * is listed with its assistants. Absent: one instance at most, following `enabled`.
+   */
+  instances: Schema.optionalKey(Schema.Array(ModuleInstanceInfo))
 })
 export type ModuleInfo = typeof ModuleInfo.Type
 
@@ -121,6 +146,22 @@ export type EngineInfo = typeof EngineInfo.Type
 export const EngineState = Schema.Literals(["starting", "ready", "reloading", "failed"])
 export type EngineState = typeof EngineState.Type
 
+/** Protocol 7: one shared resource of the pool (docs/ASSISTANTS.md §3.2) and who uses it. */
+export const ResourceInfo = Schema.Struct({
+  kind: Schema.Literals(["llm", "stt", "tts"]),
+  key: Schema.String,
+  label: Schema.String,
+  location: Schema.Literals(["local", "hosted"]),
+  /** Assistants only: a pool user `assistant@place` (a device voice) counts as the assistant. */
+  usedBy: Schema.Array(AssistantId),
+  /** Additive: the devices (and device types' defaults) that use this resource as their own; today a voice. */
+  usedByDevices: Schema.optionalKey(Schema.Array(DeviceUser)),
+  state: Schema.Literals(["unused", "starting", "ready", "failed"]),
+  problem: Schema.optionalKey(Schema.String),
+  ramMb: Schema.optionalKey(NonNegativeFinite)
+})
+export type ResourceInfo = typeof ResourceInfo.Type
+
 export const EngineStatus = Schema.Struct({
   /** `failed`: a provider could not start; see `problems`. The UI and settings still work. */
   state: EngineState,
@@ -130,11 +171,13 @@ export const EngineStatus = Schema.Struct({
   /** The settings pages (`<group>/<page>`) whose saved changes wait for that reload. Absent = not known. */
   reloadPendingFor: Schema.optionalKey(Schema.Array(Schema.String)),
   engines: Schema.Array(EngineInfo),
-  voices: Schema.Array(VoiceInfo)
+  voices: Schema.Array(VoiceInfo),
+  /** Protocol 7: the resource pool, replacing `engines` once the server builds it. */
+  resources: Schema.optionalKey(Schema.Array(ResourceInfo))
 })
 export type EngineStatus = typeof EngineStatus.Type
 
-/** Conversation history, as shown to the user (voice markers removed, tool results omitted). */
+/** Conversation history, as shown to the user (tool results omitted). */
 export const HistoryItem = Schema.Union([
   Schema.Struct({ role: Schema.Literal("user"), text: Schema.String }),
   Schema.Struct({
@@ -146,6 +189,52 @@ export const HistoryItem = Schema.Union([
   })
 ]).pipe(Schema.toTaggedUnion("role"))
 export type HistoryItem = typeof HistoryItem.Type
+
+/** Protocol 7: how the assistant was chosen. */
+export const TraceRoute = Schema.Union([
+  Schema.Struct({ by: Schema.Literals(["phrase", "armed"]), phrase: Schema.String }),
+  Schema.Struct({ by: Schema.Literals(["follow-up", "default", "typed"]) }),
+  Schema.Struct({
+    by: Schema.Literal("typesafe"),
+    outcome: Schema.Literals(["chosen", "none-fits", "timeout", "error"]),
+    /** The chosen (or best) option's probability, 0..1; absent with one candidate (the Noul alone decides). */
+    probability: Schema.optionalKey(Schema.Finite),
+    /** The companion Noul "does any fit", 0..1. */
+    fits: Schema.optionalKey(Schema.Finite),
+    ms: NonNegativeFinite,
+    fallback: Schema.Boolean
+  })
+])
+export type TraceRoute = typeof TraceRoute.Type
+
+/** Protocol 7: the latency-relevant configuration of one turn. */
+export const TraceConfig = Schema.Struct({
+  llm: Schema.Struct({
+    account: Schema.String,
+    model: Schema.String,
+    effort: Schema.String,
+    thinking: Schema.String,
+    maxTokens: NonNegativeInt
+  }),
+  hearing: Schema.Struct({
+    hearer: AssistantId,
+    engine: Schema.String,
+    model: Schema.optionalKey(Schema.String),
+    language: Schema.optionalKey(Schema.String),
+    eagerSilenceMs: Schema.optionalKey(NonNegativeFinite),
+    finalSilenceMs: Schema.optionalKey(NonNegativeFinite),
+    eotThreshold: Schema.optionalKey(Schema.Finite)
+  }),
+  /** `VoiceKey` of the voice. */
+  voice: Schema.String,
+  /** Whose voice it is (docs/LOOKS-AND-VOICES.md): the device's own for every assistant, or the assistant's. Absent in older traces. */
+  voiceFrom: Schema.optionalKey(Schema.Literals(["assistant", "device"])),
+  modules: NonNegativeInt,
+  tools: NonNegativeInt,
+  replyEarly: Schema.Boolean,
+  toolRounds: NonNegativeInt
+})
+export type TraceConfig = typeof TraceConfig.Type
 
 /**
  * One turn's latency trace. Marks are milliseconds relative to end of turn
@@ -162,7 +251,10 @@ export const TraceInfo = Schema.Struct({
     firstClause: Schema.optionalKey(Schema.Finite),
     ttsFirstAudio: Schema.optionalKey(Schema.Finite),
     /** The browser reported that the reply started playing (includes the one-way network delay). */
-    playbackStart: Schema.optionalKey(Schema.Finite)
+    playbackStart: Schema.optionalKey(Schema.Finite),
+    /** Protocol 7: the routing request left / its answer arrived. */
+    routeSent: Schema.optionalKey(Schema.Finite),
+    routeReceived: Schema.optionalKey(Schema.Finite)
   }),
   totalMs: Schema.optionalKey(Schema.Finite),
   tools: Schema.Array(Schema.Struct({ name: Schema.String, ms: NonNegativeFinite })),
@@ -172,7 +264,17 @@ export const TraceInfo = Schema.Struct({
     outputLatencyMs: NonNegativeFinite,
     /** From the reply's first audio chunk arriving in the browser to playback starting (prebuffer). */
     startDelayMs: NonNegativeFinite
-  }))
+  })),
+  /** Protocol 6: the voice session the turn belongs to (its device's name), so admin can tell sessions apart. */
+  session: Schema.optionalKey(Schema.String.check(Schema.isMaxLength(64))),
+  /** Protocol 7: who answered. */
+  assistant: Schema.optionalKey(Schema.Struct({ id: AssistantId, name: Schema.String })),
+  deviceId: Schema.optionalKey(Schema.String),
+  device: Schema.optionalKey(Schema.String),
+  /** Protocol 7: who chose the assistant. */
+  route: Schema.optionalKey(TraceRoute),
+  /** Protocol 7: a snapshot of the latency-relevant configuration at that turn. */
+  config: Schema.optionalKey(TraceConfig)
 })
 export type TraceInfo = typeof TraceInfo.Type
 
@@ -218,15 +320,33 @@ export const Snapshot = Schema.Struct({
   role: Role,
   ownerPresent: Schema.Boolean,
   engine: EngineSummary,
+  /**
+   * Protocol 7: the assistant `history` belongs to (the answering one: the follow-up holder, else who answers without
+   * a phrase, …). Absent: no session yet, or the server does not say.
+   */
+  answering: Schema.optionalKey(AssistantId),
+  /**
+   * Protocol 7: who has the turn on the device now, as `state.holder` says it (the turn in flight or the utterance
+   * being heard, else an open armed or follow-up window; `null`: nobody). Not whose `history` this is (`answering`):
+   * an armed assistant has the turn without the history being its. Absent: no session yet, or the server does not say.
+   */
+  holder: Schema.optionalKey(Schema.NullOr(AssistantId)),
   /** The most recent history (at most 200 items), oldest first. */
   history: Schema.Array(HistoryItem),
-  /**
-   * This connection's effective device profile. Present on voice connections (from `hello.device`, or the
-   * `web-voice` kind defaults with nothing editable when `hello` had no device); absent on admin connections.
-   */
-  device: Schema.optionalKey(DeviceProfileInfo),
   /** Admin access as this connection sees it (also on voice connections: the voice front end links to admin). */
-  admin: AdminState
+  admin: AdminState,
+  /**
+   * Protocol 7: one conversation per assistant on the device, in the device's list order (empty on an admin
+   * connection and before the device's session exists). `history` belongs to the answering assistant's.
+   */
+  conversations: Schema.Array(Schema.Struct({
+    assistantId: AssistantId,
+    id: ConversationId,
+    startedAt: NonNegativeFinite,
+    turns: NonNegativeInt
+  })),
+  /** Protocol 7: the device's setup. Voice connections only. */
+  setup: Schema.optionalKey(DeviceSetup)
 })
 export type Snapshot = typeof Snapshot.Type
 
@@ -250,9 +370,13 @@ export const AdminSnapshot = Schema.Struct({
   models: Schema.Array(ModelSet),
   /** Running jobs and the last finished ones, oldest first. */
   jobs: Schema.Array(JobInfo),
-  /** Every front-end kind with its defaults, in registry order. */
-  frontends: Schema.Array(FrontendKindInfo),
   /** Every remembered device, most recently seen first. */
-  devices: Schema.Array(DeviceInfo)
+  devices: Schema.Array(DeviceListInfo),
+  /** Protocol 6: the voice sessions, most recently active first (`sessions`). */
+  sessions: Schema.Array(SessionInfo),
+  /** Protocol 7: the assistants (replaces nothing yet). */
+  assistants: Schema.optionalKey(Schema.Array(AssistantInfo)),
+  /** Protocol 7: the device types with their defaults (replaces `frontends`). */
+  deviceTypes: Schema.optionalKey(Schema.Array(DeviceTypeInfo))
 })
 export type AdminSnapshot = typeof AdminSnapshot.Type

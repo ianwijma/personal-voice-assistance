@@ -3,6 +3,7 @@ import type { HostResult } from "@pva/core"
 import type { EnvEntry, EnvInfo, EnvKind, SettingsGroup, SettingsPatch, SettingValue } from "@pva/protocol"
 import { Effect } from "effect"
 import { type CommentOutResult, commentOutKeys, type EnvOrigin, type EnvView } from "../envView.ts"
+import { assistantFieldOf, MIGRATED_ASSISTANT_ID } from "./migrateAssistants.ts"
 import type { Sections } from "./sections.ts"
 import { sectionDefinitions } from "./sectionDefinitions.ts"
 import type { SettingsStore } from "./SettingsStore.ts"
@@ -15,6 +16,11 @@ import type { SettingsStore } from "./SettingsStore.ts"
  * (benchmarks, tests, the command-line audio), `setting` (a field of a section
  * or module, or an engine setting without a field yet) and `unknown` (nothing
  * reads it). Only `setting` variables from a `.env` file can be moved.
+ *
+ * A key that became a field of the assistant (docs/ASSISTANTS.md §4.4: SYSTEM_PROMPT, ANTHROPIC_MODEL, STT_*, …) is
+ * an `assistant-field` target: its value applies to, and locks, that field of the migrated assistant only, and
+ * "Move to settings" writes it there (through its flat key, which today's engines still read and which the store
+ * mirrors into the assistant) before the line is commented out.
  */
 
 /** Read before the settings exist, or deciding who may reach the page: they stay in `.env`. */
@@ -41,6 +47,8 @@ const DEVELOPMENT_KEYS: ReadonlySet<string> = new Set([
   "DEEPGRAM_URL",
   "CARTESIA_URL",
   "CARTESIA_SAMPLE_RATE",
+  "ELEVENLABS_URL",
+  "ELEVENLABS_SAMPLE_RATE",
   "NEXT_PUBLIC_PVA_WS_URL",
   "SCREENSHOT_DIR",
   "RUNS",
@@ -57,19 +65,29 @@ const ENGINE_KEYS: Readonly<Record<string, string>> = {
   STT_SHERPA_MODEL_DIR: "speech/engine",
   DEEPGRAM_MODEL: "speech/deepgram",
   DEEPGRAM_EOT_TIMEOUT_MS: "speech/deepgram",
-  TTS_SHERPA_PRESET: "voices/engines",
-  TTS_SHERPA_MODEL_DIR: "voices/engines",
-  TTS_SHERPA_THREADS: "voices/engines",
-  TTS_SHERPA_SPEED: "voices/engines",
-  TTS_SHERPA_TRIM_SILENCE: "voices/engines",
-  TTS_SHERPA_CLAUSE_PAUSE_MS: "voices/engines",
-  TTS_SHERPA_SENTENCE_PAUSE_MS: "voices/engines",
-  TTS_SHERPA_PAD_MS: "voices/engines",
-  TTS_SHERPA_CHUNK_MS: "voices/engines",
-  CARTESIA_MODEL: "voices/engines",
-  CARTESIA_VOICE: "voices/engines",
-  CARTESIA_LANGUAGE: "voices/engines",
-  CARTESIA_MAX_BUFFER_DELAY_MS: "voices/engines"
+  // Read only to migrate to ASSISTANT_VOICE (docs/VOICE-PROVIDERS.md §6.2); no field any more.
+  TTS_PROVIDER: "voices/providers",
+  DEFAULT_VOICE: "voices/overview",
+  VOICES: "voices/overview",
+  TTS_SHERPA_PRESET: "voices/providers",
+  TTS_SHERPA_MODEL_DIR: "voices/providers",
+  TTS_SHERPA_THREADS: "voices/providers",
+  TTS_SHERPA_SPEED: "voices/providers",
+  TTS_SHERPA_TRIM_SILENCE: "voices/providers",
+  TTS_SHERPA_CLAUSE_PAUSE_MS: "voices/providers",
+  TTS_SHERPA_SENTENCE_PAUSE_MS: "voices/providers",
+  TTS_SHERPA_PAD_MS: "voices/providers",
+  TTS_SHERPA_CHUNK_MS: "voices/providers",
+  CARTESIA_MODEL: "voices/providers",
+  CARTESIA_VOICE: "voices/providers",
+  CARTESIA_LANGUAGE: "voices/providers",
+  CARTESIA_MAX_BUFFER_DELAY_MS: "voices/providers",
+  ELEVENLABS_MODEL: "voices/providers",
+  ELEVENLABS_VOICE: "voices/providers",
+  ELEVENLABS_LANGUAGE: "voices/providers",
+  ELEVENLABS_SPEED: "voices/providers",
+  ELEVENLABS_STABILITY: "voices/providers",
+  ELEVENLABS_AUTO_MODE: "voices/providers"
 }
 /** `VOICE_<NAME>_<KEY>`: a per-voice override of an engine key (or `VOICE_<NAME>_PROVIDER`). */
 const VOICE_KEY = /^VOICE_[A-Z0-9]+_(.+)$/
@@ -99,6 +117,18 @@ const groupTitle: Readonly<Record<string, string>> = {
 /** Where a known variable lands. */
 export type EnvTarget =
   | { readonly kind: "section"; readonly key: string; readonly setting: Setting<unknown>; readonly path: ReadonlyArray<string>; readonly title: string }
+  | {
+    readonly kind: "assistant-field"
+    /** The assistant whose field it sets and locks: the migrated one. */
+    readonly assistantId: string
+    /** The field (a dotted path of `Assistant`). */
+    readonly field: string
+    /** Its flat key (the section field the settings screen still shows). */
+    readonly key: string
+    readonly setting: Setting<unknown>
+    readonly path: ReadonlyArray<string>
+    readonly title: string
+  }
   | {
     readonly kind: "module"
     readonly moduleId: string
@@ -130,7 +160,14 @@ export const makeEnvCatalog = (catalog: ReadonlyArray<ModuleDefinition<any>>): E
   for (const d of sectionDefinitions()) {
     const p = page(`${groupSlug[d.group]}/${d.page.id}`, titles)
     for (const [key, setting] of Object.entries(d.spec as SettingsSpec)) {
-      if (setting.env !== undefined) targets.set(setting.env, { kind: "section", key, setting, ...p })
+      if (setting.env === undefined) continue
+      const assistantField = assistantFieldOf(setting.env)
+      targets.set(
+        setting.env,
+        assistantField === undefined
+          ? { kind: "section", key, setting, ...p }
+          : { kind: "assistant-field", assistantId: MIGRATED_ASSISTANT_ID, field: assistantField, key, setting, ...p }
+      )
     }
   }
   for (const def of catalog) {
@@ -146,7 +183,7 @@ export const makeEnvCatalog = (catalog: ReadonlyArray<ModuleDefinition<any>>): E
     const voice = VOICE_KEY.exec(key)?.[1]
     if (voice === undefined) return undefined
     if (voice === "PROVIDER" || ENGINE_KEYS[voice] !== undefined || targets.has(voice)) {
-      return { kind: "engine", secret: isSecretName(voice), ...page("voices/engines", titles) }
+      return { kind: "engine", secret: isSecretName(voice), ...page("voices/providers", titles) }
     }
     return undefined
   }
@@ -299,8 +336,10 @@ export const makeEnvMover = (options: {
         const r = yield* options.host.configure(p.target.moduleId, patch, { includeHidden: true })
         return r.ok ? { ok: true as const } : { ok: false as const, message: r.error.message }
       }
-      const storeKey = p.target.kind === "section" ? p.target.key : p.key
-      const value = p.target.kind === "section" ? decodedValue(p.target.setting, p.text) : p.text
+      // A section field or an assistant field by its flat key (the store mirrors the latter into the assistant), or
+      // an engine key as it is.
+      const storeKey = p.target.kind === "engine" ? p.key : p.target.key
+      const value = p.target.kind === "engine" ? p.text : decodedValue(p.target.setting, p.text)
       const r = yield* Effect.result(
         options.store.saveAssistant([storeKey], secret ? {} : { [storeKey]: value as SettingValue }, secret ? { [storeKey]: p.text } : {})
       )

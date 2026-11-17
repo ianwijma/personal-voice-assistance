@@ -1,5 +1,5 @@
-import { type ConversationEvent, makeMarkerStripper, type Message, parseVoiceMarker, stripVoiceMarkers, type Trace } from "@pva/core"
-import type { HistoryItem, ServerMessage, TraceInfo } from "@pva/protocol"
+import type { ConversationEvent, Message, Trace } from "@pva/core"
+import type { HistoryItem, ServerMessage, TraceConfig, TraceInfo } from "@pva/protocol"
 
 /**
  * Turns `ConversationEvent`s into protocol messages (docs/UI-AND-MODULES.md
@@ -17,22 +17,26 @@ interface TurnView {
   readonly spoken: boolean
   pending: boolean
   readonly buffer: Array<ServerMessage>
-  voice: string
-  readonly strip: ReturnType<typeof makeMarkerStripper>
+  readonly voice: string
+  /** The assistant answering (protocol 7 `assistantId` on its messages). */
+  readonly assistant: string | undefined
 }
 
 export interface PublisherOptions {
   readonly broadcast: (message: ServerMessage) => void
   /** The module that contributes a tool (from the module host's current snapshot). */
   readonly moduleOfTool: (name: string) => string | null
-  /** The default voice and the enabled voices (the voice per clause is tracked as the router does). */
-  readonly voices: () => { readonly defaultVoice: string; readonly names: ReadonlySet<string> }
+  /** The key of the voice that speaks `assistant`'s replies in this session (`assistant.text.voice`). */
+  readonly voice: (assistant: string | undefined) => string
   /** Right after `turn.start` of a committed (or just promoted) turn went out, before the rest of its messages. */
   readonly onCommitted?: (turnId: number) => void
+  /** A committed turn ended: its trace (serve mode keeps the recent ones of every session for admin). */
+  readonly onTrace?: (trace: TraceInfo) => void
 }
 
 export interface Publisher {
-  readonly onEvent: (event: ConversationEvent) => void
+  /** `assistant`: the assistant whose conversation the event comes from (its id tags the turn's messages). */
+  readonly onEvent: (event: ConversationEvent, assistant?: string) => void
   /** The most recent traces, oldest first (for `welcome`). */
   readonly traces: () => ReadonlyArray<TraceInfo>
   /** The committed turn that is running (between `turn.start` and `turn.end`). */
@@ -54,7 +58,7 @@ const truncateInput = (input: unknown): unknown => {
 export const traceInfo = (trace: Trace): TraceInfo => {
   const origin = trace.marks.endOfTurn ?? trace.startedAt
   const marks: Record<string, number> = {}
-  for (const key of ["llmRequestSent", "llmFirstToken", "firstClause", "ttsFirstAudio", "playbackStart"] as const) {
+  for (const key of ["llmRequestSent", "llmFirstToken", "firstClause", "ttsFirstAudio", "playbackStart", "routeSent", "routeReceived"] as const) {
     const t = trace.marks[key]
     if (t !== undefined) marks[key] = Math.round((t - origin) * 10) / 10
   }
@@ -67,7 +71,16 @@ export const traceInfo = (trace: Trace): TraceInfo => {
     ...(trace.endedAt !== undefined ? { totalMs: Math.round((trace.endedAt - origin) * 10) / 10 } : {}),
     tools: trace.tools.map((t) => ({ name: t.name, ms: Math.max(0, Math.round(t.ms)) })),
     voices: [...trace.voices],
-    ...(trace.client !== undefined ? { client: { ...trace.client } } : {})
+    ...(trace.client !== undefined ? { client: { ...trace.client } } : {}),
+    ...(trace.session !== undefined ? { session: trace.session.slice(0, 64) } : {}),
+    // Protocol 7 (docs/ASSISTANTS.md §3.7, §5.4): who answered, on which device, and who chose the assistant.
+    ...(trace.assistant !== undefined ? { assistant: { id: trace.assistant.id, name: trace.assistant.name } } : {}),
+    ...(trace.deviceId !== undefined ? { deviceId: trace.deviceId } : {}),
+    ...(trace.device !== undefined ? { device: trace.device } : {}),
+    ...(trace.route !== undefined ? { route: { ...trace.route } } : {}),
+    // The configuration the turn began with (docs/ASSISTANTS.md §3.7): an object made at its start and never changed,
+    // shared by the traces of every turn that began with the same one.
+    ...(trace.config !== undefined ? { config: trace.config as TraceConfig } : {})
   }
 }
 
@@ -82,18 +95,28 @@ export const makePublisher = (options: PublisherOptions): Publisher => {
     else options.broadcast(message)
   }
 
-  const handle = (event: ConversationEvent) => {
+  /** Protocol 7: `assistantId` on a turn's messages. */
+  const tag = (view: TurnView | undefined) => (view?.assistant !== undefined ? { assistantId: view.assistant } : {})
+
+  const handle = (event: ConversationEvent, assistant: string | undefined) => {
     switch (event._tag) {
       case "TurnStarted": {
         const view: TurnView = {
           spoken: event.spoken,
           pending: event.speculative,
           buffer: [],
-          voice: options.voices().defaultVoice,
-          strip: makeMarkerStripper()
+          voice: options.voice(assistant),
+          assistant
         }
         turns.set(event.turnId, view)
-        const start: ServerMessage = { type: "turn.start", turnId: event.turnId, source: event.source, userText: event.text, spoken: event.spoken }
+        const start: ServerMessage = {
+          type: "turn.start",
+          turnId: event.turnId,
+          source: event.source,
+          userText: event.text,
+          spoken: event.spoken,
+          ...tag(view)
+        }
         if (event.speculative) view.buffer.push(start)
         else {
           committed = event.turnId
@@ -116,19 +139,16 @@ export const makePublisher = (options: PublisherOptions): Publisher => {
       case "TextDelta": {
         const view = turns.get(event.turnId)
         if (view === undefined || view.spoken) return
-        const text = view.strip.push(event.text)
-        if (text.length > 0) send(event.turnId, { type: "assistant.text", turnId: event.turnId, clause: null, text })
+        const text = event.text
+        if (text.length > 0) send(event.turnId, { type: "assistant.text", turnId: event.turnId, clause: null, text, ...tag(view) })
         return
       }
       case "ClauseQueued": {
         const view = turns.get(event.turnId)
         if (view === undefined) return
-        const voices = options.voices()
-        const parsed = parseVoiceMarker(event.text)
-        if (parsed.voice !== undefined) view.voice = voices.names.has(parsed.voice) ? parsed.voice : voices.defaultVoice
-        const text = stripVoiceMarkers(parsed.text).trim()
+        const text = event.text.trim()
         if (text.length === 0) return
-        send(event.turnId, { type: "assistant.text", turnId: event.turnId, clause: event.index, text, voice: view.voice })
+        send(event.turnId, { type: "assistant.text", turnId: event.turnId, clause: event.index, text, voice: view.voice, ...tag(view) })
         return
       }
       case "ClausePlaying":
@@ -140,7 +160,8 @@ export const makePublisher = (options: PublisherOptions): Publisher => {
           callId: event.call.id,
           tool: event.call.name,
           moduleId: options.moduleOfTool(event.call.name),
-          input: truncateInput(event.call.input) as never
+          input: truncateInput(event.call.input) as never,
+          ...tag(turns.get(event.turnId))
         })
       case "ToolFinished":
         return send(event.turnId, {
@@ -149,21 +170,22 @@ export const makePublisher = (options: PublisherOptions): Publisher => {
           callId: event.result.id,
           ok: !event.result.isError,
           ms: Math.max(0, event.ms),
-          ...(event.result.isError ? { error: event.result.content.slice(0, 500) } : {})
+          ...(event.result.isError ? { error: event.result.content.slice(0, 500) } : {}),
+          ...tag(turns.get(event.turnId))
         })
       case "TurnEnded": {
         const view = turns.get(event.turnId)
         turns.delete(event.turnId)
         if (committed === event.turnId) committed = undefined
         if (event.outcome === "discarded" || view?.pending === true) return
-        if (view !== undefined && !view.spoken) {
-          const rest = view.strip.flush()
-          if (rest.length > 0) options.broadcast({ type: "assistant.text", turnId: event.turnId, clause: null, text: rest })
-        }
         const info = traceInfo(event.trace)
         traces.push(info)
         if (traces.length > MAX_TRACES) traces.shift()
-        options.broadcast({ type: "turn.end", turnId: event.turnId, outcome: event.outcome, trace: info })
+        // Admin's traces carry the session, the device (its name, which admin sets) and the configuration snapshot;
+        // the device's own tabs do not need the first two and may not learn the model (docs/ASSISTANTS.md §5.3).
+        options.onTrace?.(info)
+        const { session: _session, device: _device, deviceId: _deviceId, config: _config, ...forDevice } = info
+        options.broadcast({ type: "turn.end", turnId: event.turnId, outcome: event.outcome, trace: forDevice })
         if (event.outcome === "failed") {
           options.broadcast({
             type: "error",
@@ -176,9 +198,9 @@ export const makePublisher = (options: PublisherOptions): Publisher => {
   }
 
   return {
-    onEvent: (event) => {
+    onEvent: (event, assistant) => {
       try {
-        handle(event)
+        handle(event, assistant)
       } catch (error) {
         console.error("serve: could not publish a conversation event", error)
       }
@@ -190,7 +212,7 @@ export const makePublisher = (options: PublisherOptions): Publisher => {
 
 /**
  * History as the user saw it: one user item per user message and at most one
- * assistant item per turn (its text without markers, interrupted if any part
+ * assistant item per turn (its text, interrupted if any part
  * was, and its tool calls with success). The last `MAX_HISTORY_ITEMS` items.
  */
 export const historyItems = (messages: ReadonlyArray<Message>): Array<HistoryItem> => {
@@ -217,7 +239,7 @@ export const historyItems = (messages: ReadonlyArray<Message>): Array<HistoryIte
         break
       case "assistant": {
         open = true
-        const text = stripVoiceMarkers(message.content).trim()
+        const text = message.content.trim()
         if (text.length > 0) texts.push(text)
         if (message.interrupted === true) interrupted = true
         for (const call of message.toolCalls ?? []) {

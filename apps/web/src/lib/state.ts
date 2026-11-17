@@ -1,13 +1,13 @@
 import {
   type AdminState,
+  type AssistantInfo,
+  type DeviceTypeInfo,
   type AssistantState,
-  DEFAULT_DEVICE_PROFILE,
-  type DeviceInfo,
+  type DeviceListInfo,
   type DeviceProfile,
-  type DeviceProfileInfo,
+  type DeviceSetup,
   type EngineStatus,
   type EngineSummary,
-  type FrontendKindInfo,
   EnvInfo,
   type ErrorInfo,
   type HistoryItem,
@@ -17,12 +17,14 @@ import {
   type Role,
   type ServerMessage,
   type ServerMessageType,
+  type SessionInfo,
   type SettingsSection,
   type TraceInfo,
   type TurnSource,
   type VaultInfo
 } from "@pva/protocol"
 import type { SettingsPath } from "./settingsTree.ts"
+import { atWelcome, type ConversationView, onConversation, onHistory, onSetup, profileFromSetup } from "./voiceSetup.ts"
 
 /**
  * Client state: one immutable value, changed only by `reducer`. Reply audio
@@ -51,6 +53,8 @@ export interface TurnView {
   /** `t${turnId}` for live turns, `h${index}` for history. */
   readonly key: string
   readonly turnId?: number
+  /** The assistant whose conversation the turn belongs to (protocol 7; one conversation per assistant). */
+  readonly assistantId?: string
   readonly source: TurnSource
   readonly userText: string
   readonly spoken: boolean
@@ -82,16 +86,88 @@ export interface HeardLine {
   /** The assistant took it (answered it, or the phrase alone made it listen); absent from an older server. */
   readonly accepted?: boolean
   readonly at: number
+  /**
+   * Where the server heard it (`wake.heard.source`): the device, and the assistant the matched phrase belongs to
+   * there. Shown as it is; the tester derives nothing for such a line. Absent from an older server.
+   */
+  readonly source?: { readonly deviceId?: string; readonly assistantId?: string }
+  /**
+   * Only for a line without `source` (an older server): set by the phrase tester when it first shows the line, the
+   * device it was tested on and the assistant the matched phrase woke there, with that device's settings then. Kept
+   * with the line, so a later tester (another device's page, or the same page after a save) neither relabels it nor
+   * shows it as its own.
+   */
+  readonly judged?: HeardJudgement
+}
+
+export interface HeardJudgement {
+  readonly deviceId: string | undefined
+  readonly woke: string | undefined
 }
 
 /**
- * What the phrase tester says about a line: matched a phrase, accepted without one (always listening, or the device
- * was already listening), ignored, or — from a server that does not say whether it was accepted — only that no
- * phrase matched.
+ * What the phrase tester says about a line: matched a phrase and taken, matched a phrase but not taken, accepted
+ * without one (always listening, or the device was already listening), ignored, or — from a server that does not say
+ * whether it was accepted — only that no phrase matched. The label and tone of each case: `heardRow`.
  */
-export type HeardOutcome = "matched" | "accepted" | "ignored" | "no-match"
+export type HeardOutcome = "matched" | "matched-ignored" | "accepted" | "ignored" | "no-match"
 export const heardOutcome = (l: HeardLine): HeardOutcome =>
-  l.matched !== undefined ? "matched" : l.accepted === true ? "accepted" : l.accepted === false ? "ignored" : "no-match"
+  l.matched !== undefined
+    ? l.accepted === false ? "matched-ignored" : "matched"
+    : l.accepted === true ? "accepted" : l.accepted === false ? "ignored" : "no-match"
+
+/** How the tester draws a line: `ok` (green check), `you` (mint check) or `muted` (a quiet label). */
+export type HeardTone = "ok" | "you" | "muted"
+export interface HeardRow {
+  readonly outcome: HeardOutcome
+  readonly label: string
+  readonly tone: HeardTone
+  /** The line offers `Add "…"` (turn a mishearing into a phrase); never for a line that matched a phrase. */
+  readonly canAdd: boolean
+}
+
+/**
+ * The one place the phrase tester's label and tone come from (shown and announced). `who`: the assistant the line's
+ * phrase belongs to, as the tester knows it — from `wake.heard.source.assistantId` (its name, or "a removed
+ * assistant" when no assistant has that id now), else from the page's own judgement for a line from an older server
+ * (`judged.woke`, or `wakes` on the tested device). `who` is only ever shown when the line was taken.
+ *
+ * What the server sends (`RouteGate.heardOf`, sent as `wake.heard` by `SessionHub.wakeHeard`; `source` is added in
+ * `serveMode`): `matched` + `source.assistantId` are the phrase and its assistant on that device at that moment,
+ * whether that assistant is switched on or off; `accepted` is false only when the utterance was dropped (for a
+ * matched phrase that means its assistant was off then, but the message does not say so, so the tester does not
+ * either). An unmatched line never carries an assistant. `source.deviceId` only decides which device page shows the
+ * line (absent: the defaults page only), never the label.
+ *
+ * | matched | accepted   | assistant (`who`)                         | outcome         | label                                 | tone  | Add |
+ * |---------|------------|-------------------------------------------|-----------------|---------------------------------------|-------|-----|
+ * | yes     | true       | known (on, or switched off since)         | matched         | Matched <P> → wakes <name>            | ok    | no  |
+ * | yes     | true       | an id no assistant has now                | matched         | Matched <P> → wakes a removed assistant | ok  | no  |
+ * | yes     | true       | none (no `assistantId`; the mock, or nobody's phrase) | matched | Matched <P>                         | ok    | no  |
+ * | yes     | absent¹    | from the page's judgement, or none        | matched         | Matched <P>[ → wakes <who>]           | ok    | no  |
+ * | yes     | false      | any — on, off, removed, none, or a retained `judged.woke` | matched-ignored | Matched <P>, not accepted | muted | no |
+ * | no      | true       | (never sent; ignored)                     | accepted        | Accepted without a phrase             | you   | no  |
+ * | no      | false      | (never sent; ignored)                     | ignored         | Ignored                               | muted | yes |
+ * | no      | absent¹    | —                                         | no-match        | No phrase matched                     | muted | yes |
+ *
+ * ¹ A server older than `accepted` (one assistant, every matched phrase woke it). A line without `source` (a server
+ * older than it) follows the same rows; only `who` comes from the page.
+ */
+export const heardRow = (l: HeardLine, who: string | undefined): HeardRow => {
+  const outcome = heardOutcome(l)
+  switch (outcome) {
+    case "matched":
+      return { outcome, label: `Matched ${displayPhrase(l.matched!)}${who !== undefined ? ` → wakes ${who}` : ""}`, tone: "ok", canAdd: false }
+    case "matched-ignored":
+      return { outcome, label: `Matched ${displayPhrase(l.matched!)}, not accepted`, tone: "muted", canAdd: false }
+    case "accepted":
+      return { outcome, label: "Accepted without a phrase", tone: "you", canAdd: false }
+    case "ignored":
+      return { outcome, label: "Ignored", tone: "muted", canAdd: true }
+    case "no-match":
+      return { outcome, label: "No phrase matched", tone: "muted", canAdd: true }
+  }
+}
 
 export const MAX_HEARD = 40
 
@@ -126,24 +202,33 @@ export interface ClientState {
   }
   /** What every connection knows about the engines (protocol 5 `engine.summary`): ready or not, the enabled voices. */
   readonly summary: EngineSummary
-  /**
-   * This connection's device profile as the server sent it (`snapshot.device`, `device.profile`); undefined on admin
-   * connections and before `welcome`. `profileOverlay`: this page's own changes sent with `device.update` and not yet
-   * confirmed (optimistic; any `device.profile` replaces them). Read the effective profile with `profileOf`.
-   */
-  readonly device: DeviceProfileInfo | undefined
-  readonly profileOverlay: Partial<DeviceProfile>
   /** Admin access as this connection sees it (`snapshot.admin`, `admin.state`). */
   readonly admin: AdminState
   /** Counts `admin.state` messages, so a page can restart a countdown when the same `retryAfterMs` comes again. */
   readonly adminSeq: number
   /** The admin part of the state (`admin.snapshot`) has arrived for the current login. */
   readonly adminReady: boolean
-  /** Admin: the front-end kinds with their defaults, and the remembered devices (most recently seen first). */
-  readonly frontends: ReadonlyArray<FrontendKindInfo>
-  readonly devices: ReadonlyArray<DeviceInfo>
+  /** Admin: the remembered devices (most recently seen first). */
+  readonly devices: ReadonlyArray<DeviceListInfo>
+  /** Admin (protocol 7): the assistants with where they are used, and the device types with their defaults. */
+  readonly assistants: ReadonlyArray<AssistantInfo>
+  readonly deviceTypes: ReadonlyArray<DeviceTypeInfo>
   /** The audio owner said the wake phrase alone (`wake` with `armed`): "Listening…" until the next state change. */
-  readonly woke: { readonly phrase: string } | undefined
+  readonly woke: { readonly phrase: string; readonly assistantId?: string } | undefined
+  /**
+   * Protocol 7 (voice connections): who answers on this device (`snapshot.setup`, `device.setup`); undefined on admin
+   * connections and from a server that does not send one.
+   */
+  readonly setup: DeviceSetup | undefined
+  /** The assistant that has the turn now: a phrase woke it, or it answered last and may keep listening (docs/ASSISTANTS.md §7.2). */
+  readonly holder: string | undefined
+  /**
+   * The server says who has the turn (`state.holder`, `snapshot.holder`): the page then takes it only from those and
+   * derives nothing itself (no holder from `wake` or `turn.start`, which serve a server that does not say).
+   */
+  readonly holderTold: boolean
+  /** One conversation per assistant on this device, by assistant id (`lib/voiceSetup.ts`). */
+  readonly conversations: Readonly<Record<string, ConversationView>>
   /** Admin phrase tester: what the recogniser heard while it was on, oldest first. */
   readonly heard: ReadonlyArray<HeardLine>
   /** Admin only: the full engine status (`admin.snapshot.engine`, `engine`). */
@@ -158,12 +243,29 @@ export interface ClientState {
   readonly models: ReadonlyArray<ModelSet>
   readonly jobs: ReadonlyArray<JobInfo>
   readonly turns: ReadonlyArray<TurnView>
+  /**
+   * Turn ids of the conversation that was replaced: late messages about them (the stopped turn's `turn.end`) are
+   * dropped instead of showing up in the new conversation. A `turn.start` with the same id (ids restart at 1 per
+   * conversation) is a turn of the new one.
+   */
+  readonly staleTurns: ReadonlyArray<number>
+  /** Admin: the voice sessions, most recently active first (`admin.snapshot.sessions`, `sessions`). */
+  readonly sessions: ReadonlyArray<SessionInfo>
   readonly liveTranscript: string
   readonly traces: ReadonlyArray<TraceInfo>
+  /**
+   * The own id of each of `traces`, in the same order: given when the trace arrives and kept while it stays, so neither
+   * a newer trace nor dropping the oldest changes another's (the latency table keeps open rows and its popover by it).
+   */
+  readonly traceIds: ReadonlyArray<number>
+  /** The next trace id; never reused, also not after a logout or a new snapshot. */
+  readonly traceSeq: number
   readonly pending: Readonly<Record<string, PendingRequest>>
   readonly toasts: ReadonlyArray<Toast>
   readonly ui: {
     readonly chatOpen: boolean
+    /** The conversation the chat shows when it is not the answering assistant's (reset when the chat opens or closes). */
+    readonly chatView: string | undefined
     /** Voice front end: the settings sheet. */
     readonly sheetOpen: boolean
     /**
@@ -196,14 +298,17 @@ export const initialState: ClientState = {
   session: { role: "observer", ownerPresent: false, serverState: "idle" },
   audio: { phase: "off", micLive: true },
   summary: emptySummary,
-  device: undefined,
-  profileOverlay: {},
   admin: noAdmin,
   adminSeq: 0,
   adminReady: false,
-  frontends: [],
   devices: [],
+  assistants: [],
+  deviceTypes: [],
   woke: undefined,
+  setup: undefined,
+  holder: undefined,
+  holderTold: false,
+  conversations: {},
   heard: [],
   engine: emptyEngine,
   modules: { order: [], byId: {} },
@@ -213,11 +318,15 @@ export const initialState: ClientState = {
   models: [],
   jobs: [],
   turns: [],
+  staleTurns: [],
+  sessions: [],
   liveTranscript: "",
   traces: [],
+  traceIds: [],
+  traceSeq: 0,
   pending: {},
   toasts: [],
-  ui: { chatOpen: false, sheetOpen: false, settingsOpen: false, settingsPath: [], settingsDirty: false, unread: 0, shortcutsOpen: false }
+  ui: { chatOpen: false, chatView: undefined, sheetOpen: false, settingsOpen: false, settingsPath: [], settingsDirty: false, unread: 0, shortcutsOpen: false }
 }
 
 /** The admin part of the state, emptied at logout and when a session ends. */
@@ -229,9 +338,12 @@ const adminPart = {
   env: undefined,
   models: initialState.models,
   jobs: initialState.jobs,
+  traceIds: initialState.traceIds,
   traces: initialState.traces,
-  frontends: initialState.frontends,
   devices: initialState.devices,
+  assistants: initialState.assistants,
+  deviceTypes: initialState.deviceTypes,
+  sessions: initialState.sessions,
   heard: initialState.heard,
   adminReady: false
 } satisfies Partial<ClientState>
@@ -241,10 +353,9 @@ export type LocalAction =
   | { readonly type: "local/connection"; readonly status: ConnectionStatus; readonly attempt: number }
   | { readonly type: "local/audio"; readonly phase: AudioPhase; readonly error?: string }
   | { readonly type: "local/mic"; readonly live: boolean }
-  | { readonly type: "local/profile-overlay"; readonly patch: Partial<DeviceProfile> }
-  | { readonly type: "local/profile-overlay-clear" }
   | { readonly type: "local/heard-clear" }
   | { readonly type: "local/playing"; readonly turnId: number | undefined }
+  | { readonly type: "local/heard-judged"; readonly lines: ReadonlyArray<{ readonly at: number; readonly text: string; readonly judged: HeardJudgement }> }
   | { readonly type: "local/request"; readonly requestId: string; readonly kind: string; readonly target?: string }
   | { readonly type: "local/request-done"; readonly requestId: string }
   | { readonly type: "local/toast"; readonly message: string; readonly tone: "error" | "info" }
@@ -308,11 +419,21 @@ const withTurn = (
   create: () => TurnView = () => newTurn(`t${turnId}`, { turnId, source: "voice", spoken: true })
 ): ClientState => {
   const idx = findTurn(s.turns, turnId)
-  if (idx === -1) return { ...s, turns: capTurns([...s.turns, f(create())]) }
+  if (idx === -1) {
+    if (s.staleTurns.includes(turnId)) return s // a turn of the conversation that was replaced
+    return { ...s, turns: capTurns([...s.turns, f(create())]) }
+  }
   const turns = s.turns.slice()
   turns[idx] = f(turns[idx]!)
   return { ...s, turns }
 }
+
+/**
+ * A turn belongs to one assistant for its whole life: the first message that names it (`assistantId`, a trace's
+ * assistant) sets it, and nothing changes it after that.
+ */
+const ownedBy = (t: TurnView, assistantId: string | undefined): TurnView =>
+  t.assistantId !== undefined || assistantId === undefined ? t : { ...t, assistantId }
 
 const findTurn = (turns: ReadonlyArray<TurnView>, turnId: number): number => {
   for (let i = turns.length - 1; i >= 0; i--) if (turns[i]!.turnId === turnId) return i
@@ -361,13 +482,13 @@ const server: ServerHandlers = {
     // The audio graph belongs to the page and survives reconnects; the player was flushed on loss.
     audio: withoutPlaying(s.audio),
     summary: m.snapshot.engine,
-    device: m.snapshot.device,
     admin: m.snapshot.admin,
     adminSeq: s.adminSeq + 1,
     // A reconnect with a valid admin token keeps the admin data on screen until the new `admin.snapshot` replaces it.
     ...(m.snapshot.admin.loggedIn ? pickAdmin(s) : {}),
-    turns: historyToTurns(m.snapshot.history),
+    ...atWelcome(s, m.snapshot, historyToTurns),
     toasts: s.toasts,
+    traceSeq: s.traceSeq,
     ui: s.ui
   }),
   "admin.snapshot": (s, m) => ({
@@ -380,29 +501,40 @@ const server: ServerHandlers = {
     models: m.snapshot.models,
     jobs: m.snapshot.jobs,
     traces: m.snapshot.traces.slice(-MAX_TRACES),
-    frontends: m.snapshot.frontends,
     devices: m.snapshot.devices,
-    adminReady: true
+    assistants: m.snapshot.assistants ?? [],
+    deviceTypes: m.snapshot.deviceTypes ?? [],
+    sessions: m.snapshot.sessions,
+    adminReady: true,
+    // The snapshot's traces replace the list: each gets a new id.
+    ...newTraceIds(s, Math.min(m.snapshot.traces.length, MAX_TRACES))
   }),
   "engine.summary": (s, m) => ({ ...s, summary: m.engine }),
   "admin.state": (s, m) => {
     const next = { ...s, admin: m.admin, adminSeq: s.adminSeq + 1 }
     return m.admin.loggedIn ? next : { ...next, ...adminPart }
   },
-  "device.profile": (s, m) => ({
-    ...s,
-    device: m.deviceId === undefined ? { profile: m.profile, editable: m.editable } : { deviceId: m.deviceId, profile: m.profile, editable: m.editable },
-    profileOverlay: {}
-  }),
-  frontends: (s, m) => ({ ...s, frontends: m.frontends }),
   devices: (s, m) => ({ ...s, devices: m.devices }),
+  // Protocol 6/7. A new conversation (New conversation, or after being quiet for a while) of one assistant starts with an
+  // empty chat and a divider; `resumed` only says which conversation goes on (the chat stays).
+  conversation: onConversation,
+  sessions: (s, m) => ({ ...s, sessions: m.sessions }),
+  // Admin: a session's finished turn (admin gets no turn.end); turn ids repeat across sessions, so it is appended.
+  trace: (s, m) => ({ ...s, ...withTraces(s, [m.trace]) }),
   // The phrase and the request in one sentence (`armed: false`): a turn follows, nothing to show.
-  wake: (s, m) => (m.armed ? { ...s, woke: { phrase: m.phrase } } : s),
+  wake: (s, m) =>
+    m.armed ? { ...s, woke: m.assistantId === undefined ? { phrase: m.phrase } : { phrase: m.phrase, assistantId: m.assistantId }, holder: s.holderTold ? s.holder : m.assistantId ?? s.holder } : s,
   "wake.heard": (s, m) => ({
     ...s,
     heard: [
       ...s.heard,
-      { text: m.text, ...(m.matched === undefined ? {} : { matched: m.matched }), ...(m.accepted === undefined ? {} : { accepted: m.accepted }), at: m.at }
+      {
+        text: m.text,
+        ...(m.matched === undefined ? {} : { matched: m.matched }),
+        ...(m.accepted === undefined ? {} : { accepted: m.accepted }),
+        ...(m.source === undefined ? {} : { source: m.source }),
+        at: m.at
+      }
     ].slice(-MAX_HEARD)
   }),
   session: (s, m) => ({ ...s, session: { ...s.session, role: m.role, ownerPresent: m.ownerPresent } }),
@@ -410,23 +542,31 @@ const server: ServerHandlers = {
     const { stateTurnId: _previous, ...rest } = s.session
     const session = m.turnId === undefined ? { ...rest, serverState: m.state } : { ...rest, serverState: m.state, stateTurnId: m.turnId }
     // "Listening…" after the wake phrase lasts until the assistant hears something, or falls asleep again.
-    return { ...s, session, woke: m.state === "listening" ? s.woke : undefined }
+    // The server is the one authority on who has the turn (protocol 7 `holder`: the turn in flight or the utterance being
+    // heard, else an open window; also sent when only it changed). The page takes it as sent, whatever the state (a
+    // muted microphone is idle while a follow-up window still holds). Only a state without the field (a server that does
+    // not say) falls back: asleep or idle, nobody has the turn any more.
+    if (m.holder !== undefined) return { ...s, session, woke: m.state === "listening" && m.holder !== null ? s.woke : undefined, holder: m.holder ?? undefined, holderTold: true }
+    const sleeping = m.state === "asleep" || m.state === "idle"
+    return { ...s, session, woke: m.state === "listening" ? s.woke : undefined, holder: sleeping ? undefined : s.holder }
   },
   transcript: (s, m) => (s.liveTranscript === m.text ? s : { ...s, liveTranscript: m.text }),
   "turn.start": (s, m) => {
+    const fresh = s.staleTurns.includes(m.turnId) ? { ...s, staleTurns: s.staleTurns.filter((id) => id !== m.turnId) } : s
     const next = withTurn(
-      s,
+      fresh,
       m.turnId,
-      (t) => ({ ...t, source: m.source, userText: m.userText, spoken: m.spoken }),
+      (t) => ({ ...ownedBy(t, m.assistantId), source: m.source, userText: m.userText, spoken: m.spoken }),
       () => newTurn(`t${m.turnId}`, { turnId: m.turnId, source: m.source, userText: m.userText, spoken: m.spoken })
     )
-    return { ...next, liveTranscript: "", woke: undefined }
+    return { ...next, liveTranscript: "", woke: undefined, holder: next.holderTold ? next.holder : m.assistantId ?? next.holder }
   },
   "assistant.text": (s, m) =>
     withTurn(
       s,
       m.turnId,
-      (t) => {
+      (owned) => {
+        const t = ownedBy(owned, m.assistantId)
         if (m.clause === null) return { ...t, text: t.text + m.text }
         const clauses = t.clauses.slice()
         while (clauses.length < m.clause) clauses.push({ text: "" })
@@ -438,12 +578,12 @@ const server: ServerHandlers = {
   "assistant.playing": (s, m) => withTurn(s, m.turnId, (t) => (m.clause > t.playedClause ? { ...t, playedClause: m.clause } : t)),
   "tool.start": (s, m) =>
     withTurn(s, m.turnId, (t) => ({
-      ...t,
+      ...ownedBy(t, m.assistantId),
       tools: [...t.tools.filter((x) => x.callId !== m.callId), { callId: m.callId, tool: m.tool, input: m.input, status: "running" }]
     })),
   "tool.end": (s, m) =>
     withTurn(s, m.turnId, (t) => ({
-      ...t,
+      ...ownedBy(t, m.assistantId),
       tools: t.tools.some((x) => x.callId === m.callId)
         ? t.tools.map((x) =>
           x.callId === m.callId
@@ -460,10 +600,10 @@ const server: ServerHandlers = {
         }]
     })),
   "turn.end": (s, m) => {
-    const next = withTurn(s, m.turnId, (t) => ({ ...t, outcome: m.outcome, trace: m.trace }))
-    const traces = [...next.traces.filter((t) => t.turnId !== m.trace.turnId), m.trace].slice(-MAX_TRACES)
+    if (findTurn(s.turns, m.turnId) === -1 && s.staleTurns.includes(m.turnId)) return s
+    const next = withTurn(s, m.turnId, (t) => ({ ...ownedBy(t, m.trace.assistant?.id), outcome: m.outcome, trace: m.trace }))
     const unread = next.ui.chatOpen ? next.ui.unread : next.ui.unread + 1
-    return { ...next, traces, ui: { ...next.ui, unread } }
+    return { ...next, ...withTraces(next, [m.trace], (t) => t.turnId === m.trace.turnId), ui: { ...next.ui, unread } }
   },
   // Reply audio control goes to the player, not the store.
   "reply.start": (s) => s,
@@ -489,11 +629,18 @@ const server: ServerHandlers = {
   },
   error: (s, m) => {
     const e = m.error
+    // Refused Start: the client closes the microphone and shows it as the start error (`client.ts`), not as a toast.
+    if (e.code === "sessions_full") return s
     let next = s
     if (e.turnId !== undefined) next = withTurn(next, e.turnId, (t) => ({ ...t, error: describeError(e) }))
     return addToast(next, describeError(e), e.code === "mic_gap" ? "info" : "error")
   },
-  pong: (s) => s
+  pong: (s) => s,
+  // Protocol 7: the voice page's (WP-8; `lib/voiceSetup.ts`). `assistants` and `device.types` are WP-6a's, below.
+  "device.setup": onSetup,
+  "conversation.history": (s, m) => onHistory(s, m, historyToTurns),
+  assistants: (s, m) => ({ ...s, assistants: m.assistants }),
+  "device.types": (s, m) => ({ ...s, deviceTypes: m.types })
 }
 
 const local = (s: ClientState, a: LocalAction): ClientState => {
@@ -513,15 +660,22 @@ const local = (s: ClientState, a: LocalAction): ClientState => {
     }
     case "local/mic":
       return { ...s, audio: { ...s.audio, micLive: a.live } }
-    case "local/profile-overlay":
-      return { ...s, profileOverlay: { ...s.profileOverlay, ...a.patch } }
-    case "local/profile-overlay-clear":
-      return Object.keys(s.profileOverlay).length === 0 ? s : { ...s, profileOverlay: {} }
     case "local/heard-clear":
       return s.heard.length === 0 ? s : { ...s, heard: [] }
     case "local/playing":
       if (a.turnId === undefined) return s.audio.playing === undefined ? s : { ...s, audio: withoutPlaying(s.audio) }
       return { ...s, audio: { ...s.audio, playing: { turnId: a.turnId } } }
+    case "local/heard-judged": {
+      let changed = false
+      const heard = s.heard.map((l) => {
+        if (l.judged !== undefined) return l
+        const hit = a.lines.find((x) => x.at === l.at && x.text === l.text)
+        if (hit === undefined) return l
+        changed = true
+        return { ...l, judged: hit.judged }
+      })
+      return changed ? { ...s, heard } : s
+    }
     case "local/request":
       return {
         ...s,
@@ -538,6 +692,8 @@ const local = (s: ClientState, a: LocalAction): ClientState => {
       return { ...s, toasts: s.toasts.filter((t) => t.id !== a.id) }
     case "local/ui": {
       const ui = { ...s.ui, ...a.patch }
+      // Opening or closing the chat goes back to the answering assistant's conversation.
+      if (a.patch.chatOpen !== undefined && !("chatView" in a.patch)) ui.chatView = undefined
       if (a.patch.chatOpen === true) ui.unread = 0
       // One modal panel at a time: opening the settings sheet closes Help, and the other way round.
       if (a.patch.sheetOpen === true && a.patch.shortcutsOpen === undefined) ui.shortcutsOpen = false
@@ -545,6 +701,22 @@ const local = (s: ClientState, a: LocalAction): ClientState => {
       return { ...s, ui }
     }
   }
+}
+
+/**
+ * `traces` without those `drop` picks, with `add` appended (each with a new id), the last MAX_TRACES kept; the traces
+ * that stay keep their ids.
+ */
+function withTraces(s: ClientState, add: ReadonlyArray<TraceInfo>, drop: (t: TraceInfo) => boolean = () => false): Pick<ClientState, "traces" | "traceIds" | "traceSeq"> {
+  const kept = s.traces.flatMap((t, i) => (drop(t) ? [] : [{ t, id: s.traceIds[i] ?? -1 - i }]))
+  const fresh = newTraceIds(s, add.length)
+  const all = [...kept, ...add.map((t, i) => ({ t, id: fresh.traceIds[i]! }))].slice(-MAX_TRACES)
+  return { traces: all.map((x) => x.t), traceIds: all.map((x) => x.id), traceSeq: fresh.traceSeq }
+}
+
+/** `n` new trace ids, and the counter after them. */
+function newTraceIds(s: ClientState, n: number): Pick<ClientState, "traceIds" | "traceSeq"> {
+  return { traceIds: Array.from({ length: n }, (_, i) => s.traceSeq + i), traceSeq: s.traceSeq + n }
 }
 
 function pickAdmin(s: ClientState): Partial<ClientState> {
@@ -556,9 +728,12 @@ function pickAdmin(s: ClientState): Partial<ClientState> {
     env: s.env,
     models: s.models,
     jobs: s.jobs,
+    traceIds: s.traceIds,
     traces: s.traces,
-    frontends: s.frontends,
     devices: s.devices,
+    assistants: s.assistants,
+    deviceTypes: s.deviceTypes,
+    sessions: s.sessions,
     heard: s.heard,
     adminReady: s.adminReady
   }
@@ -580,11 +755,8 @@ export const reducer = (s: ClientState, a: Action): ClientState => {
 
 // ---- Derived values (selectors) ----
 
-/** This connection's effective device profile: the server's, with this page's unconfirmed changes on top. */
-export const profileOf = (s: ClientState): DeviceProfile => {
-  const base = s.device?.profile ?? DEFAULT_DEVICE_PROFILE
-  return Object.keys(s.profileOverlay).length === 0 ? base : { ...base, ...s.profileOverlay }
-}
+/** This connection's device profile fields the page uses, from its setup. */
+export const profileOf = (s: ClientState): DeviceProfile => profileFromSetup(s.setup)
 
 /** The engines failed and the key vault is locked: unlocking is the fix (the server reloads them). */
 export const engineNeedsKeys = (s: ClientState): boolean => s.engine.state === "failed" && s.vault.state === "locked"
@@ -645,27 +817,8 @@ export const lastLatency = (s: ClientState) => {
   return undefined
 }
 
-/** The voice name to show next to SPEAKING: only when more than one voice is enabled. */
-export const speakingVoice = (s: ClientState): string | undefined => {
-  if (s.summary.voices.length < 2) return undefined
-  const turnId = s.audio.playing?.turnId ?? s.session.stateTurnId
-  if (turnId === undefined) return undefined
-  const idx = findTurn(s.turns, turnId)
-  if (idx === -1) return undefined
-  const t = s.turns[idx]!
-  const clause = t.clauses[Math.max(0, t.playedClause)]
-  return clause?.voice ?? defaultVoiceOf(s)
-}
-
-/** The voice a reply uses when no clause names one: the profile's voice, else the assistant's default. */
-export const defaultVoiceOf = (s: ClientState): string | undefined => {
-  const chosen = profileOf(s).voice
-  if (chosen !== "" && s.summary.voices.some((v) => v.name === chosen)) return chosen
-  return s.summary.voices.find((v) => v.isDefault)?.name
-}
-
-/** "Hey Jeff" for "hey jeff": a phrase as shown on the stage. */
-export const displayPhrase = (phrase: string): string => phrase.replace(/(^|\s)(\p{L})/gu, (_m, space: string, letter: string) => space + letter.toUpperCase())
+/** "Hey Jeff" for "hey jeff": a phrase as shown on the stage (one that already has capitals is shown as it is). */
+export const displayPhrase = (phrase: string): string => /\p{Lu}/u.test(phrase) ? phrase : phrase.replace(/(^|\s)(\p{L})/gu, (_m, space: string, letter: string) => space + letter.toUpperCase())
 
 export const turnById = (s: ClientState, turnId: number | undefined): TurnView | undefined => {
   if (turnId === undefined) return undefined

@@ -1,6 +1,6 @@
 import { appUrl, expect, expectVisualState, mock, test } from "./fixtures.ts"
 
-// The voice front end with protocol 5: the settings sheet (voice, activation, follow-up from the device profile),
+// The voice front end with protocol 5 and 7: the settings sheet (who answers; microphone and speaker),
 // the device identity in hello, and the asleep / woke display.
 
 test("hello carries a stable device id and a name from the user agent; the profile comes from the server", async ({ page, baseURL }) => {
@@ -14,36 +14,26 @@ test("hello carries a stable device id and a name from the user agent; the profi
   expect(await page.evaluate(() => localStorage.getItem("pva.deviceId"))).toBe(id)
 })
 
-test("the sheet: choosing a voice and the wake phrase goes to the server; the phrases are read-only; follow-up", async ({ page, baseURL }) => {
+test("the sheet: who answers goes to the server as a pick; phrases and follow-up are admin's; no voice of its own", async ({ page, baseURL }) => {
   await mock.scenario("typed")
   await page.goto(appUrl(baseURL))
   await page.getByTestId("settings-toggle").click()
   const sheet = page.getByTestId("voice-sheet")
-  const voices = sheet.getByTestId("voice-choices")
-  await expect(voices.getByRole("radio")).toHaveCount(3) // Assistant default + two enabled voices
-  await expect(voices.getByRole("radio", { name: /Assistant default/ })).toBeChecked()
-  await expect(voices).toContainText("Longer replies where warmth matters.")
-  await voices.getByRole("radio", { name: /natural/i }).check()
-  await expect(voices.getByRole("radio", { name: /natural/i })).toBeChecked()
-  await expect.poll(async () => (await mock.log()).messages.filter((m) => m.type === "device.update").map((m) => m.patch)).toEqual([{ voice: "natural" }])
+  // The voice is the assistant's, chosen in admin (docs/VOICE-PROVIDERS.md §1): the sheet has no voice choice.
+  await expect(sheet.getByTestId("voice-choices")).toHaveCount(0)
+  await expect(sheet.getByRole("heading", { name: "Voice", exact: true })).toHaveCount(0)
+  // Activation and the follow-up time left the sheet (docs/ASSISTANTS.md §7.2): who answers is the Assistant group's.
+  await expect(sheet.getByRole("heading", { name: "Activation" })).toHaveCount(0)
+  await expect(sheet.getByLabel("Keep listening after a reply")).toHaveCount(0)
+  await expect(sheet.getByTestId("wake-phrases")).toHaveCount(0)
+  await expect(sheet.getByRole("link", { name: "admin" }).first()).toHaveAttribute("href", /\/admin\//)
 
-  await expect(sheet).toContainText("reacts to everything it hears")
-  await sheet.getByRole("radio", { name: "Wake phrase" }).click()
-  const phrases = sheet.getByTestId("wake-phrases")
-  await expect(phrases).toContainText("Hey Jeff")
-  await expect(phrases.getByRole("textbox")).toHaveCount(0) // changed in admin only
-  await expect(phrases.getByRole("link", { name: "admin" })).toHaveAttribute("href", /\/admin\//)
-  await sheet.getByLabel("Keep listening after a reply").selectOption("15")
-  await expect.poll(async () => (await mock.log()).messages.filter((m) => m.type === "device.update").map((m) => m.patch)).toEqual([
-    { voice: "natural" },
-    { activation: "wake-phrase" },
-    { followUpSeconds: 15 }
-  ])
+  await sheet.getByTestId("sheet-assistant-none").click()
+  await expect.poll(async () => (await mock.log()).messages.filter((m) => m.type === "device.pick").map((m) => m.withoutPhrase)).toEqual([""])
   // The server is the source of truth: after a reload the sheet shows what it stored.
   await page.reload()
   await page.getByTestId("settings-toggle").click()
-  await expect(page.getByTestId("voice-sheet").getByRole("radio", { name: "Wake phrase" })).toHaveAttribute("aria-checked", "true")
-  await expect(page.getByTestId("voice-sheet").getByLabel("Keep listening after a reply")).toHaveValue("15")
+  await expect(page.getByTestId("voice-sheet").getByTestId("sheet-assistant-none")).toBeChecked()
   // Microphone and speaker stay in this browser.
   await expect(page.getByTestId("voice-sheet").locator("#pref-mic")).toBeVisible()
 })

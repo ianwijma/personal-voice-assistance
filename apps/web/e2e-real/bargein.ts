@@ -14,7 +14,7 @@ import {
   missingPrerequisite,
   question,
   serverHistory,
-  setFrontendDefaults,
+  setDeviceDefaults,
   silence,
   startAssistant,
   test,
@@ -39,13 +39,13 @@ export const bargeIn = (mode: "instant" | "confirm", gapMs: number, port: number
   {
 
     test(`speaking over the reply interrupts it (${mode}); history keeps only what played; the new question is answered`, async ({ page }) => {
-      // Protocol 5: the interrupt mode is part of the device profile (here: the web-voice default, set in admin).
-      await setFrontendDefaults(assistant.url, { interruptMode: mode })
+      // The interrupt mode is a device setting (here: the web-voice defaults, set in admin).
+      await setDeviceDefaults(assistant.url, { interruptMode: mode })
       await page.goto(assistant.url)
       await page.getByTestId("start").click()
       await expectVisualState(page, "listening")
       const welcome = await waitForMessage(page, (m) => m.msg.type === "welcome")
-      expect((welcome.msg as unknown as { snapshot: { device: { profile: { interruptMode: string } } } }).snapshot.device.profile.interruptMode).toBe(mode)
+      expect((welcome.msg as unknown as { snapshot: { setup: { interruptMode: string } } }).snapshot.setup.interruptMode).toBe(mode)
       const claim = await waitForMessage(page, (m) => m.msg.type === "audio.claim")
       expect(claim.msg.interruptMode).toBeUndefined()
 
@@ -73,7 +73,7 @@ export const bargeIn = (mode: "instant" | "confirm", gapMs: number, port: number
       const clauses = log.filter((m) => m.msg.type === "assistant.text" && m.msg.turnId === 1).map((m) => m.msg as unknown as { clause: number; text: string })
       const playedUpTo = Math.max(...log.filter((m) => m.msg.type === "assistant.playing" && m.msg.turnId === 1).map((m) => m.msg.clause as number))
       const heard = clauses.filter((c) => c.clause <= playedUpTo).map((c) => c.text).join(" ")
-      const history = await serverHistory(assistant.url)
+      const history = await serverHistory(assistant.url, page)
       const reply1 = history[1]!
       expect(history[0]).toMatchObject({ role: "user" })
       expect(reply1).toMatchObject({ role: "assistant", interrupted: true })

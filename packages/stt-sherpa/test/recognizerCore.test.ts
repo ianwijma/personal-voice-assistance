@@ -28,6 +28,14 @@ const offlineCore = (options: { maxQueuedDecodeMs?: number; decodeMs?: number } 
 }
 
 const tick = () => new Promise((r) => setTimeout(r, 0))
+/** Resolves once `condition` holds; fails after 5 s, so a test that times out leaves no loop running. */
+const until = async (condition: () => boolean) => {
+  const deadline = Date.now() + 5_000
+  while (!condition()) {
+    if (Date.now() > deadline) throw new Error("until: the condition did not hold within 5 s")
+    await tick()
+  }
+}
 
 describe("recognizerCore, whole-turn: a native decode that never returns", () => {
   it("continuous speech keeps at most the bound of queued audio; the turn is dropped and the owner told", async () => {
@@ -93,14 +101,20 @@ describe("recognizerCore, whole-turn: a native decode that never returns", () =>
   })
 
   it("a reset (new session) or a committed turn drops queued decodes before they reach the decoder", async () => {
-    const { audio, core, model, posted } = offlineCore({ decodeMs: 30 })
+    const { audio, core, model, posted } = offlineCore()
+    // The first decode is held until the commit and reset are in, rather than given a duration: feeding 105 s of
+    // audio can itself take longer than any short decode on a loaded machine.
+    model.hang.on = true
     audio(3 * 35_000) // three pieces: the first runs, the others wait
     await tick()
     assert.strictEqual(model.calls.started, 1)
+    assert.strictEqual(core.inspect().pendingDecodes, 3)
     core.onMessage({ type: "commit", session: 1, frame: 1_000_000 })
     // A finalise queued behind the running decode for an already-ended turn: answered without decoding.
     core.onMessage({ type: "reset", session: 2 })
-    await new Promise((r) => setTimeout(r, 100))
+    model.hang.on = false
+    model.hang.release?.()
+    await until(() => core.inspect().pendingDecodes === 0)
     assert.strictEqual(model.calls.started, 1, "no stale piece was decoded")
     assert.strictEqual(core.inspect().pendingDecodes, 0)
     assert.deepStrictEqual(posted.filter((m) => m.type === "error"), [])
@@ -121,6 +135,236 @@ describe("recognizerCore, whole-turn: a native decode that never returns", () =>
     audio(80_000)
     const frames = posted.filter((m) => m.type === "frames").reduce((n, m) => n + m.speech.length, 0)
     assert.strictEqual(frames, 80_000 / 20)
+  })
+})
+
+describe("recognizerCore, several sessions on one model", () => {
+  const twoSessions = (options: { decodeMs?: number; maxQueuedDecodeMs?: number } = {}) => {
+    const posted: Array<any> = []
+    const model = fakeOffline({ decodeMs: options.decodeMs ?? 10 })
+    let vads = 0
+    const core = makeRecognizerCore({
+      config: offlineConfig,
+      offline: model,
+      vad: fakeVad(),
+      makeVad: () => {
+        vads++
+        return fakeVad()
+      },
+      post: (m: any) => posted.push(m),
+      ...(options.maxQueuedDecodeMs !== undefined ? { maxQueuedDecodeMs: options.maxQueuedDecodeMs } : {})
+    })
+    core.onMessage({ type: "open", session: 1 })
+    core.onMessage({ type: "open", session: 2 })
+    const audio = (session: number, ms: number, amplitude = 8000) => {
+      for (let t = 0; t < ms; t += 1000) core.onMessage({ type: "audio", session, buffer: pcm(Math.min(1000, ms - t), amplitude) })
+    }
+    return { core, posted, model, audio, vads: () => vads }
+  }
+
+  it("each session has its own VAD and turn audio; decodes of both are answered to their own session", async () => {
+    const { audio, core, posted, vads } = twoSessions()
+    assert.strictEqual(vads(), 1, "the startup VAD serves the first session; one more for the second")
+    assert.strictEqual(core.inspect().sessions, 2)
+    audio(1, 500, 0)
+    audio(2, 500, 0)
+    audio(1, 600, 9000) // "w9"
+    audio(2, 600, 5000) // "w5"
+    audio(1, 600, 0)
+    audio(2, 600, 0)
+    core.onMessage({ type: "finalize", session: 1, frame: 1_000_000, through: true })
+    core.onMessage({ type: "finalize", session: 2, frame: 1_000_000, through: true })
+    await new Promise((r) => setTimeout(r, 60))
+    const segments = posted.filter((m) => m.type === "segment").map((m) => [m.session, m.text])
+    assert.deepStrictEqual(segments, [[1, "w9"], [2, "w5"]])
+    // Each session's VAD decisions are its own.
+    const speech = (session: number) => posted.filter((m) => m.type === "frames" && m.session === session).flatMap((m) => m.speech)
+    assert.strictEqual(speech(1).filter((x: number) => x === 1).length, 30)
+    assert.strictEqual(speech(2).filter((x: number) => x === 1).length, 30)
+  })
+
+  it("ending one session drops only its queued decodes; the other's are still decoded", async () => {
+    const { audio, core, model, posted } = twoSessions({ decodeMs: 30 })
+    audio(1, 3 * 35_000) // three long pieces of session 1: the first runs, two wait
+    audio(2, 600, 5000)
+    audio(2, 600, 0)
+    core.onMessage({ type: "finalize", session: 2, frame: 1_000_000, through: true }) // queued behind them
+    core.onMessage({ type: "end", session: 1 })
+    assert.strictEqual(core.inspect().sessions, 1)
+    await new Promise((r) => setTimeout(r, 150))
+    assert.strictEqual(model.calls.started, 2, "session 1's running piece, then session 2's finalise; nothing else")
+    assert.deepStrictEqual(posted.filter((m) => m.type === "segment").map((m) => [m.session, m.text]), [[2, "w5"]])
+    // A message for the ended session is ignored.
+    core.onMessage({ type: "flush", session: 1 })
+    assert.isFalse(posted.some((m) => m.type === "flushed" && m.session === 1))
+  })
+
+  it("the bound on queued audio is per session: one session's backlog never drops another's turn", async () => {
+    const { audio, core, model, posted } = twoSessions({ maxQueuedDecodeMs: 40_000 })
+    model.hang.on = true
+    audio(1, 3 * 35_000) // session 1 overflows its own bound
+    assert.strictEqual(posted.filter((m) => m.type === "overload" && m.session === 1).length, 1)
+    audio(2, 600, 5000)
+    audio(2, 600, 0)
+    core.onMessage({ type: "finalize", session: 2, frame: 1_000_000, through: true })
+    assert.isFalse(posted.some((m) => m.type === "overload" && m.session === 2))
+    model.hang.on = false
+    model.hang.release?.()
+    await new Promise((r) => setTimeout(r, 60))
+    assert.deepStrictEqual(posted.filter((m) => m.type === "segment" && m.session === 2).map((m) => m.text), ["w5"])
+  })
+
+  it("a VAD is reused after its session ends", () => {
+    const { core, vads } = twoSessions()
+    core.onMessage({ type: "end", session: 2 })
+    core.onMessage({ type: "open", session: 3 })
+    assert.strictEqual(vads(), 1)
+    core.onMessage({ type: "open", session: 4 })
+    assert.strictEqual(vads(), 2)
+  })
+})
+
+describe("recognizerCore, per-stream options (docs/ASSISTANTS.md §3.2)", () => {
+  it("each session's VAD threshold and gain options are its own; detectors and gain controls are reused per option set", () => {
+    const vadsMade: Array<number> = []
+    const agcsMade: Array<string> = []
+    const posted: Array<any> = []
+    const config = { ...offlineConfig, vad: { threshold: 0.5 }, agc: {} }
+    const core = makeRecognizerCore({
+      config,
+      offline: fakeOffline({ text: "x" }),
+      vad: fakeVad(),
+      makeVad: (threshold: number) => {
+        vadsMade.push(threshold)
+        return fakeVad()
+      },
+      makeAgc: (options: unknown) => {
+        agcsMade.push(JSON.stringify(options))
+        return { process: () => {}, reset: () => {}, gainDb: () => 0 }
+      },
+      post: (m: any) => posted.push(m)
+    })
+    // The startup VAD (threshold 0.5) serves the first session with the default.
+    core.onMessage({ type: "open", session: 1, options: { vadThreshold: 0.5, agc: false, prerollMs: 400 } })
+    core.onMessage({ type: "open", session: 2, options: { vadThreshold: 0.7, agc: { maxGainDb: 12 }, prerollMs: 200 } })
+    core.onMessage({ type: "open", session: 3, options: { vadThreshold: 0.7, agc: { maxGainDb: 30 }, prerollMs: 400 } })
+    assert.deepStrictEqual(vadsMade, [0.7, 0.7])
+    assert.deepStrictEqual(agcsMade, [JSON.stringify({ maxGainDb: 12 }), JSON.stringify({ maxGainDb: 30 })])
+    // Ended sessions give theirs back for the next session with the same options.
+    core.onMessage({ type: "end", session: 2 })
+    core.onMessage({ type: "open", session: 4, options: { vadThreshold: 0.7, agc: { maxGainDb: 12 }, prerollMs: 400 } })
+    assert.deepStrictEqual(vadsMade, [0.7, 0.7])
+    assert.strictEqual(agcsMade.length, 2)
+    // No options: the worker's configuration (the protocol before per-stream options).
+    core.onMessage({ type: "end", session: 1 })
+    core.onMessage({ type: "open", session: 5 })
+    assert.deepStrictEqual(vadsMade, [0.7, 0.7], "the startup VAD again")
+    assert.strictEqual(agcsMade.at(-1), JSON.stringify({}))
+    assert.strictEqual(core.inspect().sessions, 3)
+    assert.deepStrictEqual(posted.filter((m) => m.type === "error"), [])
+  })
+})
+
+describe("recognizerCore, per-stream options: which option wins (docs/ASSISTANTS.md §3.2)", () => {
+  const setup = (config: Record<string, unknown>, withMakers = true, startupAgc = false) => {
+    const vadsMade: Array<number> = []
+    const agcsMade: Array<unknown> = []
+    const posted: Array<any> = []
+    const core = makeRecognizerCore({
+      config: { ...offlineConfig, ...config },
+      offline: fakeOffline({ text: "x" }),
+      vad: fakeVad(),
+      ...(startupAgc ? { agc: { process: () => {}, reset: () => {}, gainDb: () => 0 } } : {}),
+      ...(withMakers
+        ? {
+          makeVad: (threshold: number) => {
+            vadsMade.push(threshold)
+            return fakeVad()
+          },
+          makeAgc: (options: unknown) => {
+            agcsMade.push(options)
+            return { process: () => {}, reset: () => {}, gainDb: () => 0 }
+          }
+        }
+        : {}),
+      post: (m: any) => posted.push(m)
+    })
+    return { core, vadsMade, agcsMade, posted }
+  }
+
+  it("a session that says `agc: false` runs without gain control even when the worker's default has it", () => {
+    const { core, agcsMade } = setup({ vad: { threshold: 0.5 }, agc: { maxGainDb: 20 } }, true, true)
+    core.onMessage({ type: "open", session: 1, options: { agc: false } })
+    assert.deepStrictEqual(agcsMade, [], "no gain control was made or taken for it")
+    // The startup gain control still serves a session that says nothing about gain.
+    core.onMessage({ type: "open", session: 2, options: { vadThreshold: 0.5 } })
+    assert.deepStrictEqual(agcsMade, [], "the worker's own gain control, not a new one")
+  })
+
+  it("a session may ask for gain control the worker's default does not have", () => {
+    const { core, agcsMade } = setup({ vad: { threshold: 0.5 } })
+    core.onMessage({ type: "open", session: 1, options: { agc: { maxGainDb: 9 } } })
+    assert.deepStrictEqual(agcsMade, [{ maxGainDb: 9 }])
+    // No options at all: the worker's default (none), so no gain control.
+    core.onMessage({ type: "open", session: 2 })
+    assert.strictEqual(agcsMade.length, 1)
+  })
+
+  it("an option that is not a number falls back to the worker's default threshold: the startup VAD serves it", () => {
+    const { core, vadsMade, posted } = setup({ vad: { threshold: 0.5 } })
+    core.onMessage({ type: "open", session: 1, options: { vadThreshold: "0.9" } })
+    assert.deepStrictEqual(vadsMade, [])
+    // A second session at the same time needs a detector of its own, made with the default threshold.
+    core.onMessage({ type: "open", session: 2, options: { vadThreshold: null } })
+    assert.deepStrictEqual(vadsMade, [0.5])
+    assert.deepStrictEqual(posted.filter((m) => m.type === "error"), [])
+  })
+
+  it("`reset` takes the options too: it ends every other session and opens this one with its own detector", () => {
+    const { core, vadsMade } = setup({ vad: { threshold: 0.5 } })
+    core.onMessage({ type: "open", session: 1 })
+    core.onMessage({ type: "open", session: 2 })
+    assert.deepStrictEqual(vadsMade, [0.5], "the second session needed a detector of its own")
+    core.onMessage({ type: "reset", session: 3, options: { vadThreshold: 0.8 } })
+    assert.strictEqual(core.inspect().sessions, 1)
+    assert.deepStrictEqual(vadsMade, [0.5, 0.8], "the new session has the threshold it asked for, not a detector of the ended ones")
+    // Session 0 only ends everything.
+    core.onMessage({ type: "reset", session: 0 })
+    assert.strictEqual(core.inspect().sessions, 0)
+  })
+
+  it("idle detectors are bounded: a session reopened with one threshold after another does not keep one per threshold", () => {
+    const { core, vadsMade } = setup({ vad: { threshold: 0.5 } })
+    const thresholds = [0.1, 0.2, 0.3, 0.4, 0.6, 0.7, 0.8, 0.9]
+    for (const vadThreshold of thresholds) core.onMessage({ type: "open", session: 1, options: { vadThreshold } })
+    core.onMessage({ type: "end", session: 1 })
+    assert.deepStrictEqual(vadsMade, thresholds, "each new threshold needed a detector")
+    assert.strictEqual(core.inspect().idleVads, 4, "only the most recently given back are kept")
+    // A recent threshold is still served from the idle ones; an old one (and the startup default) is made again.
+    core.onMessage({ type: "open", session: 2, options: { vadThreshold: 0.9 } })
+    assert.strictEqual(vadsMade.length, thresholds.length)
+    core.onMessage({ type: "open", session: 3, options: { vadThreshold: 0.5 } })
+    assert.deepStrictEqual(vadsMade.slice(thresholds.length), [0.5])
+    assert.strictEqual(core.inspect().idleVads, 3)
+  })
+
+  it("opening an id again replaces that session and hands its detector back for the new options", () => {
+    const { core, vadsMade } = setup({ vad: { threshold: 0.5 } })
+    core.onMessage({ type: "open", session: 1, options: { vadThreshold: 0.7 } })
+    core.onMessage({ type: "open", session: 1, options: { vadThreshold: 0.7 } })
+    assert.strictEqual(core.inspect().sessions, 1)
+    assert.deepStrictEqual(vadsMade, [0.7], "the first one's detector was reused, not a second one made")
+  })
+
+  it("a session that needs a detector the worker cannot make is reported as an error, and the others go on", () => {
+    const { core, posted } = setup({ vad: { threshold: 0.5 } }, false)
+    core.onMessage({ type: "open", session: 1 })
+    core.onMessage({ type: "open", session: 2 }) // a second detector, with no `makeVad`
+    const errors = posted.filter((m) => m.type === "error")
+    assert.strictEqual(errors.length, 1)
+    assert.strictEqual(errors[0].session, 2)
+    assert.include(errors[0].message, "No voice-activity detector")
+    assert.strictEqual(core.inspect().sessions, 1)
   })
 })
 

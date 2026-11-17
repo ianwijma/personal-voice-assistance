@@ -15,6 +15,9 @@ const TINTED: ReadonlyArray<readonly [text: string, tint: string, base: string]>
   ["ink", "voice-soft", "surface"],
   ["ink-muted", "voice-soft", "surface"],
   ["you", "you-soft", "surface-2"],
+  // The voice picker's provider marks (ui/voiceProviderMarks.ts), on the popup (surface) and on a hovered row (surface-2).
+  ["you", "you-soft", "surface"],
+  ["ink", "voice-soft", "surface-2"],
   ["danger", "danger", "surface"] // bg-danger/10 under text-danger: checked below with alpha 0.1
 ]
 

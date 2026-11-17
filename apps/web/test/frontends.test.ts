@@ -1,22 +1,12 @@
 import { describe, expect, it } from "vitest"
 import { DEFAULT_DEVICE_PROFILE, type ServerMessage } from "@pva/protocol"
-import { exampleAdminSnapshot, exampleDevice, exampleFrontend, serverExamples } from "@pva/protocol/examples"
+import { exampleDevice, serverExamples } from "@pva/protocol/examples"
 import { CUE_MS, CUE_RATE, wakeCue } from "@/lib/audio/cue.ts"
 import { deviceId, deviceNameFromUserAgent } from "@/lib/device.ts"
-import {
-  activationSummary,
-  clearOverride,
-  displayProfileValue,
-  draftPatch,
-  effectiveValue,
-  lastSeenText,
-  phraseFromHeard,
-  phraseProblem,
-  setOverride
-} from "@/lib/profileForm.ts"
-import { buildSettingsTree, parentPath, resolveSettingsPath } from "@/lib/settingsTree.ts"
+import { lastSeenText, phraseFromHeard, phraseProblem } from "@/lib/profileForm.ts"
+import { buildSettingsTree, parentPath, resolveSettingsPath, typePageId } from "@/lib/settingsTree.ts"
 import { type Action, type ClientState, displayPhrase, heardOutcome, initialState, profileOf, reducer, visualState } from "@/lib/state.ts"
-import { profileMessage } from "./profile.ts"
+import { setupMessage } from "./profile.ts"
 
 const run = (actions: ReadonlyArray<Action>, from: ClientState = initialState) => actions.reduce(reducer, from)
 const welcome = serverExamples.welcome
@@ -44,28 +34,26 @@ describe("this browser as a device", () => {
   })
 })
 
-describe("reducer, protocol 5", () => {
-  it("welcome takes the voice part: the engine summary, the device profile and admin access", () => {
+describe("reducer, protocol 5 and 7", () => {
+  it("welcome takes the voice part: the engine summary, the device setup and admin access", () => {
     const s = run([welcome])
     expect(s.summary).toEqual(welcome.snapshot.engine)
-    expect(s.device).toEqual(welcome.snapshot.device)
+    expect(s.setup).toEqual(welcome.snapshot.setup)
     expect(s.admin).toEqual(welcome.snapshot.admin)
     expect(s.adminReady).toBe(false)
   })
 
-  it("device.profile replaces the profile and clears this page's unconfirmed changes", () => {
-    let s = run([welcome, profileMessage()])
-    s = reducer(s, { type: "local/profile-overlay", patch: { voice: "natural" } })
-    expect(profileOf(s).voice).toBe("natural")
-    expect(s.device!.profile.voice).toBe("")
-    s = reducer(s, profileMessage({ voice: "natural", activation: "wake-phrase" }))
-    expect(s.profileOverlay).toEqual({})
-    expect(profileOf(s)).toMatchObject({ voice: "natural", activation: "wake-phrase" })
+  it("device.setup replaces the setup the page's profile fields come from", () => {
+    let s = run([welcome])
+    expect(profileOf(s)).toMatchObject({ interruptMode: welcome.snapshot.setup!.interruptMode })
+    s = reducer(s, setupMessage({ captions: false, interruptMode: "manual", echoCancellation: false }))
+    expect(profileOf(s)).toMatchObject({ captions: false, interruptMode: "manual", echoCancellation: false })
+    expect(profileOf(s)).toBe(profileOf(s)) // cached: the same object while the setup is the same
     expect(profileOf(initialState)).toEqual(DEFAULT_DEVICE_PROFILE)
   })
 
   it("asleep: its own visual state; the phrase alone shows listening until the next state change", () => {
-    let s = run([welcome, owner, profileMessage({ activation: "wake-phrase" }), { type: "state", state: "asleep" }])
+    let s = run([welcome, owner, { type: "state", state: "asleep" }])
     expect(visualState(s)).toBe("asleep")
     s = reducer(s, { type: "wake", phrase: "hey jeff", armed: false })
     expect(visualState(s)).toBe("asleep") // a turn follows; nothing to show
@@ -80,14 +68,12 @@ describe("reducer, protocol 5", () => {
     expect(visualState(s)).toBe("asleep")
   })
 
-  it("admin: the snapshot, live front ends and devices; a session end empties the admin part", () => {
+  it("admin: the snapshot and live devices; a session end empties the admin part", () => {
     let s = run([{ ...welcome, snapshot: { ...welcome.snapshot, admin: { enabled: true, loggedIn: true } } }, serverExamples["admin.snapshot"]])
     expect(s.adminReady).toBe(true)
-    expect(s.frontends).toEqual(exampleAdminSnapshot.frontends)
+    expect(s.devices).toEqual(serverExamples["admin.snapshot"].type === "admin.snapshot" ? serverExamples["admin.snapshot"].snapshot.devices : [])
     s = reducer(s, { type: "devices", devices: [] })
     expect(s.devices).toEqual([])
-    s = reducer(s, { type: "frontends", frontends: [exampleFrontend] })
-    expect(s.frontends).toHaveLength(1)
     s = reducer(s, { type: "wake.heard", text: "hey go", at: 1 })
     s = reducer(s, { type: "wake.heard", text: "hey jeff", matched: "hey jeff", accepted: true, at: 2 })
     s = reducer(s, { type: "wake.heard", text: "and tomorrow", accepted: true, at: 3 })
@@ -102,7 +88,7 @@ describe("reducer, protocol 5", () => {
     const seq = s.adminSeq
     s = reducer(s, { type: "admin.state", admin: { enabled: true, loggedIn: false, endReason: "idle" } })
     expect(s.adminSeq).toBe(seq + 1)
-    expect(s).toMatchObject({ adminReady: false, modules: { order: [] }, sections: [], frontends: [], devices: [], heard: [] })
+    expect(s).toMatchObject({ adminReady: false, modules: { order: [] }, sections: [], devices: [], heard: [] })
     expect(s.admin.endReason).toBe("idle")
   })
 
@@ -111,7 +97,7 @@ describe("reducer, protocol 5", () => {
     const s = run([loggedIn, serverExamples["admin.snapshot"]])
     expect(run([loggedIn], s).adminReady).toBe(true)
     const refused = { ...welcome, snapshot: { ...welcome.snapshot, admin: { enabled: true, loggedIn: false, endReason: "token" as const } } }
-    expect(run([refused], s)).toMatchObject({ adminReady: false, frontends: [] })
+    expect(run([refused], s)).toMatchObject({ adminReady: false, devices: [] })
   })
 
   it("shows phrases with capitals", () => {
@@ -120,31 +106,7 @@ describe("reducer, protocol 5", () => {
   })
 })
 
-describe("the profile form", () => {
-  const saved = { activation: "wake-phrase" as const, followUpSeconds: 15 }
-
-  it("a draft becomes a patch: changed values, null for a reset, nothing for unchanged fields", () => {
-    let draft = setOverride(saved, "captions", false)
-    draft = clearOverride(draft, "followUpSeconds")
-    draft = setOverride(draft, "activation", "wake-phrase")
-    expect(draftPatch(saved, draft, ["activation", "followUpSeconds", "captions", "voice"])).toEqual({ followUpSeconds: null, captions: false })
-    expect(draftPatch(saved, saved, ["activation", "followUpSeconds"])).toEqual({})
-    // Lists compare by value.
-    expect(draftPatch({ wakePhrases: ["a"] }, { wakePhrases: ["a"] }, ["wakePhrases"])).toEqual({})
-    expect(draftPatch({ wakePhrases: ["a"] }, { wakePhrases: ["a", "b"] }, ["wakePhrases"])).toEqual({ wakePhrases: ["a", "b"] })
-  })
-
-  it("an inherited field shows the level below", () => {
-    expect(effectiveValue(saved, DEFAULT_DEVICE_PROFILE, "followUpSeconds")).toBe(15)
-    expect(effectiveValue({}, DEFAULT_DEVICE_PROFILE, "followUpSeconds")).toBe(8)
-    expect(displayProfileValue("followUpSeconds", 0)).toBe("Off")
-    expect(displayProfileValue("voice", "")).toBe("Assistant default")
-    expect(displayProfileValue("wakePhrases", ["hey jeff", "hey jev"])).toBe("2 phrases")
-    expect(displayProfileValue("interruptMode", "confirm")).toBe("A few words")
-    expect(activationSummary(DEFAULT_DEVICE_PROFILE)).toBe("Always listening")
-    expect(activationSummary({ ...DEFAULT_DEVICE_PROFILE, activation: "wake-phrase" })).toBe("Wake phrase · “hey jeff” +2")
-  })
-
+describe("the phrase checks and the device list", () => {
   it("checks a new phrase against the protocol's bounds and the list", () => {
     const list = ["hey jeff", "hey jev"]
     expect(phraseProblem("", list)).toMatch(/Type a phrase/)
@@ -172,25 +134,24 @@ describe("the profile form", () => {
   })
 })
 
-describe("the admin tree: Front ends and Devices", () => {
+describe("the admin tree: Devices", () => {
   const pages = [
-    { group: "frontends", id: "frontend", title: "Front end", order: 0, perItem: true },
     { group: "devices", id: "all", title: "All devices", order: 0 },
+    { group: "devices", id: "device-type", title: "Device type", order: 10, perItem: true },
     { group: "devices", id: "device", title: "Device", order: 100, perItem: true }
   ]
-  const tree = buildSettingsTree({ sections: [], modules: [], clientPages: pages, frontends: [exampleFrontend], devices: [exampleDevice] })
+  const tree = buildSettingsTree({ sections: [], modules: [], clientPages: pages, deviceTypes: [{ kind: "web-voice", title: "Browsers" }], devices: [exampleDevice] })
 
-  it("one Front ends page per kind; one unlisted page per device next to the list", () => {
-    const frontends = tree.find((g) => g.slug === "frontends")!
-    expect(frontends.pages.map((p) => [p.id, p.title, p.listed])).toEqual([[exampleFrontend.id, exampleFrontend.title, true]])
+  it("one unlisted defaults page per type and one unlisted page per device next to the list", () => {
     const devices = tree.find((g) => g.slug === "devices")!
-    expect(devices.pages.map((p) => [p.id, p.listed])).toEqual([["all", true], [exampleDevice.id, false]])
-    expect(tree.map((g) => g.slug).slice(0, 2)).toEqual(["frontends", "devices"])
+    expect(devices.pages.map((p) => [p.id, p.title, p.listed])).toEqual([["all", "All devices", true], [typePageId("web-voice"), "Every browser", false], [exampleDevice.id, exampleDevice.name, false]])
+    expect(tree.map((g) => g.slug)).toEqual(["devices", "shared"]) // Shared settings always lists Modules
   })
 
   it("a device page resolves by its id, and goes back to the list on every screen", () => {
     expect(resolveSettingsPath(tree, ["devices"], false).page?.id).toBe("all") // the only listed page
     expect(resolveSettingsPath(tree, ["devices", exampleDevice.id], true).page?.source).toEqual({ kind: "client", id: "device" })
+    expect(resolveSettingsPath(tree, ["devices", typePageId("web-voice")], true).page?.source).toEqual({ kind: "client", id: "device-type" })
     expect(parentPath(tree, ["devices", exampleDevice.id], true)).toEqual(["devices"])
     expect(parentPath(tree, ["devices", exampleDevice.id], false)).toEqual(["devices"])
     expect(parentPath(tree, ["devices", "all"], true)).toBeUndefined()

@@ -86,18 +86,19 @@ export const keysList = (tree: ReadonlyArray<NavGroup>, modules: Readonly<Record
   const entries = new Map<string, { -readonly [K in keyof KeyEntry]: KeyEntry[K] } & { usedBy: Array<{ title: string; path: SettingsPath }> }>()
   for (const group of tree) {
     for (const page of group.pages) {
-      const forms = page.source.kind === "sections"
-        ? page.source.sections.map((s) => ({ form: s.form, scope: "" }))
-        : page.source.kind === "module" && modules[page.source.moduleId] !== undefined
-        ? [{ form: modules[page.source.moduleId]!.settings, scope: `${page.source.moduleId}.` }]
+      const forms = page.source.kind === "server"
+        ? [
+            ...page.source.sections.map((s) => ({ form: s.form, scope: "", name: "" })),
+            ...page.source.moduleIds.flatMap((id) => (modules[id] !== undefined ? [{ form: modules[id]!.settings, scope: `${id}.`, name: modules[id]!.name }] : []))
+          ]
         : []
-      for (const { form, scope } of forms) {
+      for (const { form, scope, name } of forms) {
         for (const field of form.fields) {
           if (field.type !== "secret") continue
           const id = `${scope}${field.key}`
           const entry = entries.get(id) ?? {
             id,
-            label: scope === "" ? field.label : `${page.title}: ${field.label}`,
+            label: scope === "" ? field.label : `${name}: ${field.label}`,
             ...(field.env !== undefined ? { env: field.env } : {}),
             state: form.secrets[field.key] ?? { set: false, source: "none" as const },
             ...(field.source !== undefined ? { source: field.source } : {}),

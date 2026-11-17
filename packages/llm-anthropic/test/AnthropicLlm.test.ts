@@ -3,7 +3,7 @@ import { Llm, LlmError, type LlmEvent, type LlmRequest } from "@pva/core"
 import { ConfigProvider, Effect, Exit, Fiber, Redacted, Stream } from "effect"
 import * as Http from "node:http"
 import type { AddressInfo } from "node:net"
-import { type AnthropicLlmOptions, config, DEFAULT_BASE_URL, defaults, layer, layerConfig, toStopReason } from "../src/index.ts"
+import { type AnthropicLlmOptions, config, DEFAULT_BASE_URL, defaults, layer, layerConfig, make, toStopReason } from "../src/index.ts"
 
 // ---------------------------------------------------------------------------
 // A local server that records requests and replays SSE fixtures.
@@ -430,6 +430,54 @@ describe.skipIf(!process.env.ANTHROPIC_API_KEY)("AnthropicLlm (live)", () => {
         warmUp: false
       })
     )), 30_000)
+})
+
+describe("AnthropicLlm warm-up", () => {
+  /** An API whose warm-up GET (`models.retrieve`) answers after `delayMs`. */
+  const slowModels = (delayMs: number) => {
+    const seen: Array<string> = []
+    const handler: Handler = (req, res) => {
+      seen.push(`${req.method} ${req.url}`)
+      setTimeout(() => {
+        res.writeHead(200, { "content-type": "application/json" })
+        res.end(JSON.stringify({ id: "claude-test", type: "model", display_name: "Test", created_at: "2026-01-01T00:00:00Z" }))
+      }, delayMs)
+    }
+    return { handler, seen }
+  }
+
+  it.live("awaitWarmUp: the service is returned once the warm-up request has ended (the resource pool's ready = warm)", () =>
+    Effect.gen(function*() {
+      const models = slowModels(150)
+      const api = yield* fakeApi(models.handler)
+      const started = performance.now()
+      yield* Effect.scoped(Effect.gen(function*() {
+        yield* make({ ...options(api.url), warmUp: true, awaitWarmUp: true })
+        assert.isAtLeast(performance.now() - started, 140)
+        assert.strictEqual(models.seen.length, 1)
+        assert.match(models.seen[0]!, /^GET \/v1\/models\//)
+      }))
+    }))
+
+  it.live("without awaitWarmUp the warm-up runs in the background (as before)", () =>
+    Effect.gen(function*() {
+      const models = slowModels(300)
+      const api = yield* fakeApi(models.handler)
+      const started = performance.now()
+      yield* Effect.scoped(Effect.gen(function*() {
+        yield* make({ ...options(api.url), warmUp: true })
+        assert.isBelow(performance.now() - started, 250)
+      }))
+    }))
+
+  it.live("a failed warm-up does not fail the build (awaitWarmUp)", () =>
+    Effect.gen(function*() {
+      const api = yield* fakeApi((_req, res) => {
+        res.writeHead(401, { "content-type": "application/json" })
+        res.end(JSON.stringify({ type: "error", error: { type: "authentication_error", message: "invalid x-api-key" } }))
+      })
+      yield* Effect.scoped(make({ ...options(api.url), warmUp: true, awaitWarmUp: true }))
+    }))
 })
 
 describe("AnthropicLlm config: ANTHROPIC_BASE_URL is an explicit setting", () => {

@@ -1,5 +1,23 @@
 import type { ModulePersistence } from "@pva/core"
-import { DeviceId, DeviceName, FrontendKindId, NonNegativeFinite, ProfileOverrides, type SettingValue } from "@pva/protocol"
+import {
+  Assistant,
+  type AssistantBody,
+  BUILT_IN_WEB_VOICE_SETTINGS,
+  DeviceId,
+  DeviceName,
+  type DeviceOwn,
+  DeviceRecord as DeviceRecordSchema,
+  DeviceSettings,
+  deviceTypeOf,
+  FrontendKindId,
+  makeAssistantId,
+  MAX_ASSISTANTS,
+  NonNegativeFinite,
+  NonNegativeInt,
+  ProfileOverrides,
+  removeAssistantFromSettings,
+  type SettingValue
+} from "@pva/protocol"
 import { Config, Effect, Schema, Semaphore } from "effect"
 import { chmod, mkdir, readdir, readFile, rename, rm, unlink, writeFile } from "node:fs/promises"
 import { dirname, join, resolve } from "node:path"
@@ -7,6 +25,27 @@ import { fileURLToPath } from "node:url"
 import { userCwd } from "../env.ts"
 import type { DataDirLock } from "./DataDirLock.ts"
 import { flattenSections } from "./flatten.ts"
+import {
+  type AssistantContext,
+  type AssistantList,
+  type AssistantsData,
+  type EnvironmentLock,
+  type V3FrontendData,
+  getPath,
+  type V3DeviceRecord as V3Device,
+  MIGRATED_ASSISTANT_ID,
+  migrateToV4,
+  mirrorFlatKeys,
+  mirrorModuleSwitch,
+  mirrorSubscriptionSettings,
+  type MigrationRecord,
+  setPath,
+  type SettingsFile,
+  type SettingsFileV3,
+  type StoredDevice,
+  type StoredDeviceType,
+  withEnvironment
+} from "./migrateAssistants.ts"
 import { isVaultText, type Vault, type VaultSecrets, type VaultWriter } from "./Vault.ts"
 
 /**
@@ -16,19 +55,26 @@ import { isVaultText, type Vault, type VaultSecrets, type VaultWriter } from "./
  * atomic (temporary file, then rename) and serialised; memory changes only
  * after a successful write.
  *
- * Front ends (version 3; docs/FRONTENDS-AND-ACTIVATION.md §2): `frontends` holds each front-end kind's default
- * profile overrides, `devices` every remembered device (`DeviceRecord`). A version-2 file is read as version 3
- * with both maps empty and written as version 3 at its next save (nothing is lost, so there is no backup).
- * Entries that do not decode are dropped at load with a problem. Saves of front-end data (`saveFrontends`) follow
- * the same atomic-write and revision rules, but are refused while the settings are `blocked()`: a device
- * registering must not count as the owner's word that settings from two saves belong together.
+ * Assistants and devices (version 4; docs/ASSISTANTS.md §2.5, §6): `assistants` (order and records), `deviceTypes`
+ * (each device type's complete defaults) and `devices` (each remembered device with its own sections), every entity
+ * with a `rev` that each of its saves raises; a save naming an older `rev` is refused `stale` (`EntitySaveError`).
+ * A version-3 file (or 2/1, read as 3 first) is migrated at load (`migrateAssistants.ts`): the original is kept as
+ * `settings.json.v3-backup` (`.v1-backup` for version 1), then version 4 is written at once with the same revision
+ * (one committed state either way: a reader taking no lock sees the old file migrated in memory, or the new one).
+ * Read-only loads migrate in memory only. A missing file is the default install: its assistant and browser defaults
+ * are made in memory and written by the first save. Entries that do not decode are dropped at load with a problem.
+ *
+ * The device registry's saves (`saveDeviceRecords`: a device seen, forgotten) are refused while the settings are
+ * `blocked()`: a device registering must not count as the owner's word that settings from two saves belong
+ * together. Saves of flat keys that became per assistant, and of module switches, are mirrored into the migrated
+ * assistant (see `migrateAssistants.ts`).
  *
  * Assistant settings are stored flat by key (version 2; docs/SETTINGS-UI.md
  * §4.3): the settings sections are only how the screen groups them, so a field
  * can move to another page without losing its saved value. A version-1 file
  * (values per section) is migrated at load: flattened collision-safe
  * (`flatten.ts`), the original kept as `settings.json.v1-backup`, and the file
- * written back as version 2 with its revision (in read-only mode only in memory).
+ * written back (now as version 4) with its revision (in read-only mode only in memory).
  *
  * Secrets: once a key vault exists (`Vault.ts`), they are read from and written
  * to the vault only: nothing while it is locked (a save that changes a secret
@@ -73,34 +119,21 @@ import { isVaultText, type Vault, type VaultSecrets, type VaultWriter } from "./
  * next successful save clears it (the owner has then looked at and saved the settings).
  */
 
-/** One remembered device (`devices[id]`). */
-export const DeviceRecord = Schema.Struct({
+export type { AssistantContext, AssistantList, AssistantsData, EnvironmentLock, MigrationRecord, SettingsFile, StoredDevice, StoredDeviceType }
+
+/** A device record of a version-3 file. */
+const V3DeviceRecord = Schema.Struct({
   kind: FrontendKindId,
   name: DeviceName,
   firstSeen: NonNegativeFinite,
   lastSeen: NonNegativeFinite,
   overrides: ProfileOverrides
 })
-export type DeviceRecord = typeof DeviceRecord.Type
 
-/** The front-end part of `settings.json`. */
-export interface FrontendData {
-  /** Kind id → its default profile overrides. */
-  readonly frontends: Readonly<Record<string, ProfileOverrides>>
-  /** Device id → its record. */
-  readonly devices: Readonly<Record<string, DeviceRecord>>
-}
+const StoredDeviceTypeSchema = Schema.Struct({ ...DeviceSettings.fields, rev: NonNegativeInt })
+const StoredDeviceSchema = Schema.Struct({ ...DeviceRecordSchema.fields, rev: NonNegativeInt })
 
-export const SETTINGS_VERSION = 3
-
-export interface SettingsFile extends FrontendData {
-  readonly version: 3
-  /** The save that wrote this file; both files of one save carry the same one (see "Revisions" above). */
-  readonly revision?: number
-  readonly modules: Readonly<Record<string, { readonly enabled?: boolean; readonly settings?: Readonly<Record<string, unknown>> }>>
-  /** Assistant settings by key (environment-variable names). */
-  readonly assistant: Readonly<Record<string, unknown>>
-}
+export const SETTINGS_VERSION = 4
 
 export interface SecretsFile {
   readonly version: 2
@@ -115,6 +148,13 @@ export class SettingsStoreError extends Schema.TaggedError<SettingsStoreError>()
   cause: Schema.optional(Schema.Defect())
 }) {}
 
+/** A save of an assistant, a device type or a device that was refused (nothing was written). */
+export class EntitySaveError extends Schema.TaggedError<EntitySaveError>()("EntitySaveError", {
+  /** `stale`: the entity changed since the page read it (reload it); `locked`: a field set by the environment changed. */
+  code: Schema.Literals(["stale", "unknown_assistant", "unknown_device", "limit_reached", "locked"]),
+  message: Schema.String
+}) {}
+
 const repoRoot = fileURLToPath(new URL("../../../../", import.meta.url))
 
 /** `PVA_DATA_DIR`, default `<repo>/data`. Relative paths resolve against where the command was run. */
@@ -123,7 +163,6 @@ export const DataDirConfig = Config.String("PVA_DATA_DIR").pipe(
   Config.map((p) => resolve(userCwd, p))
 )
 
-const emptySettings = (): SettingsFile => ({ version: 3, modules: {}, assistant: {}, frontends: {}, devices: {} })
 const emptySecrets = (): SecretsFile => ({ version: 2, modules: {}, assistant: {} })
 
 const isRecord = (u: unknown): u is Record<string, unknown> => typeof u === "object" && u !== null && !Array.isArray(u)
@@ -139,22 +178,33 @@ interface Read<A> {
   readonly problems: ReadonlyArray<string>
 }
 
+/**
+ * `settings.json` as read: version 4, or an older one read as version 3 (`from`: the version it had; 0: no file)
+ * that `migrateToV4` turns into version 4.
+ */
+export type StoredSettings =
+  | { readonly version: 4; readonly file: SettingsFile }
+  | { readonly version: 3; readonly file: SettingsFileV3; readonly from: number }
+
 const decodeOverrides = Schema.decodeUnknownOption(ProfileOverrides)
-const decodeDevice = Schema.decodeUnknownOption(DeviceRecord)
+const decodeV3Device = Schema.decodeUnknownOption(V3DeviceRecord)
+const decodeAssistant = Schema.decodeUnknownOption(Assistant)
+const decodeDeviceType = Schema.decodeUnknownOption(StoredDeviceTypeSchema)
+const decodeDevice = Schema.decodeUnknownOption(StoredDeviceSchema)
 const isKindId = Schema.is(FrontendKindId)
 const isDeviceId = Schema.is(DeviceId)
 
 /** The front-end maps of a version-3 file; entries that do not decode are dropped, each with a problem. */
-const readFrontendData = (u: Record<string, unknown>, problems: Array<string>): FrontendData => {
+const readFrontendData = (u: Record<string, unknown>, problems: Array<string>): V3FrontendData => {
   const frontends: Record<string, ProfileOverrides> = {}
-  const devices: Record<string, DeviceRecord> = {}
+  const devices: Record<string, V3Device> = {}
   for (const [kind, value] of Object.entries(isRecord(u.frontends) ? u.frontends : {})) {
     const decoded = decodeOverrides(value)
     if (isKindId(kind) && decoded._tag === "Some") frontends[kind] = decoded.value
     else problems.push(`settings.json: the defaults of front-end kind "${kind.slice(0, 40)}" were not valid and were dropped`)
   }
   for (const [id, value] of Object.entries(isRecord(u.devices) ? u.devices : {})) {
-    const decoded = decodeDevice(value)
+    const decoded = decodeV3Device(value)
     if (isDeviceId(id) && decoded._tag === "Some") devices[id] = decoded.value
     else problems.push(`settings.json: the record of device "${id.slice(0, 64)}" was not valid and was dropped`)
   }
@@ -162,31 +212,98 @@ const readFrontendData = (u: Record<string, unknown>, problems: Array<string>): 
 }
 
 /**
- * Read `settings.json` of version 1, 2 or 3 (exported for tests). The revision is kept. `migrated` only for
- * version 1 (rewritten at load with a backup); a version-2 file becomes version 3 in memory (empty front-end maps)
- * and on disk at its next save.
+ * A stored type entry is a complete `DeviceSettings`: one written before a section key existed (`look`, `voice`,
+ * docs/LOOKS-AND-VOICES.md) lacks it and takes the built-in's, so it loads whole and behaves as before.
  */
-export const readSettingsFile = (u: unknown): Read<SettingsFile> | undefined => {
+const withNewKeys = (value: unknown, kind: string): unknown => {
+  if (!isRecord(value)) return value
+  const builtIn: DeviceSettings = deviceTypeOf(kind)?.builtIn ?? BUILT_IN_WEB_VOICE_SETTINGS
+  return { ...(value.look === undefined ? { look: builtIn.look } : {}), ...(value.voice === undefined ? { voice: builtIn.voice } : {}), ...value }
+}
+
+/** The entities of a version-4 file; entries that do not decode are dropped, each with a problem. */
+const readEntities = (u: Record<string, unknown>, problems: Array<string>): AssistantsData & { readonly migration?: MigrationRecord } => {
+  const list = isRecord(u.assistants) ? u.assistants : {}
+  const byId: Record<string, Assistant> = {}
+  for (const [id, value] of Object.entries(isRecord(list.byId) ? list.byId : {})) {
+    const decoded = decodeAssistant(value)
+    if (decoded._tag === "Some" && decoded.value.id === id) byId[id] = decoded.value
+    else problems.push(`settings.json: assistant "${id.slice(0, 40)}" was not valid and was dropped`)
+  }
+  const listed = Array.isArray(list.order) ? list.order.filter((id): id is string => typeof id === "string" && Object.hasOwn(byId, id)) : []
+  const order = [...new Set([...listed, ...Object.keys(byId)])]
+  const deviceTypes: Record<string, StoredDeviceType> = {}
+  for (const [kind, value] of Object.entries(isRecord(u.deviceTypes) ? u.deviceTypes : {})) {
+    const decoded = decodeDeviceType(withNewKeys(value, kind))
+    if (isKindId(kind) && decoded._tag === "Some") deviceTypes[kind] = decoded.value
+    else problems.push(`settings.json: the defaults of device type "${kind.slice(0, 40)}" were not valid and were dropped`)
+  }
+  const devices: Record<string, StoredDevice> = {}
+  for (const [id, value] of Object.entries(isRecord(u.devices) ? u.devices : {})) {
+    const decoded = decodeDevice(value)
+    if (isDeviceId(id) && decoded._tag === "Some") devices[id] = decoded.value
+    else problems.push(`settings.json: the record of device "${id.slice(0, 64)}" was not valid and was dropped`)
+  }
+  const m = u.migration
+  const migration = isRecord(m) && typeof m.from === "number" && typeof m.at === "number" && Array.isArray(m.notes)
+    ? { migration: { from: m.from, at: m.at, notes: m.notes.filter((n): n is string => typeof n === "string") } }
+    : {}
+  return { assistants: { order, byId }, deviceTypes, devices, ...migration }
+}
+
+/**
+ * Read `settings.json` of version 1, 2, 3 or 4 (exported for tests). The revision is kept. Versions 1–3 are read
+ * as version 3 with the version they had (`from`), for `migrateToV4`.
+ */
+export const readStoredSettings = (u: unknown): Read<StoredSettings> | undefined => {
   if (!isRecord(u) || !optionalRecords(u.modules)) return undefined
   const modules = (u.modules ?? {}) as SettingsFile["modules"]
+  if (u.version === 4 && (u.assistant === undefined || isRecord(u.assistant))) {
+    if (["assistants", "deviceTypes", "devices"].some((k) => u[k] !== undefined && !isRecord(u[k]))) return undefined
+    const problems: Array<string> = []
+    const file: SettingsFile = { version: 4, ...revisionField(u), modules, assistant: (u.assistant ?? {}) as Record<string, unknown>, ...readEntities(u, problems) }
+    return { file: { version: 4, file }, migrated: false, problems }
+  }
   if ((u.version === 2 || u.version === 3) && (u.assistant === undefined || isRecord(u.assistant))) {
     if (u.version === 3 && ((u.frontends !== undefined && !isRecord(u.frontends)) || (u.devices !== undefined && !isRecord(u.devices)))) {
       return undefined
     }
     const problems: Array<string> = []
     const frontendData = u.version === 3 ? readFrontendData(u, problems) : { frontends: {}, devices: {} }
-    return {
-      file: { version: 3, ...revisionField(u), modules, assistant: (u.assistant ?? {}) as Record<string, unknown>, ...frontendData },
-      migrated: false,
-      problems
-    }
+    const file: SettingsFileV3 = { version: 3, ...revisionField(u), modules, assistant: (u.assistant ?? {}) as Record<string, unknown>, ...frontendData }
+    return { file: { version: 3, file, from: u.version }, migrated: true, problems }
   }
   if (u.version === 1 && optionalRecords(u.sections)) {
     const { flat, problems } = flattenSections((u.sections ?? {}) as Record<string, Record<string, unknown>>, "settings.json")
-    return { file: { version: 3, ...revisionField(u), modules, assistant: flat, frontends: {}, devices: {} }, migrated: true, problems }
+    const file: SettingsFileV3 = { version: 3, ...revisionField(u), modules, assistant: flat, frontends: {}, devices: {} }
+    return { file: { version: 3, file, from: 1 }, migrated: true, problems }
   }
   return undefined
 }
+
+/**
+ * Read `settings.json` of any version as version 4 (exported for tests): an older file is migrated in memory
+ * (`migrateToV4`, without secrets). `migrated`: it was not version 4.
+ */
+export const readSettingsFile = (
+  u: unknown,
+  options: { readonly context?: AssistantContext; readonly now?: number } = {}
+): Read<SettingsFile> | undefined => {
+  const read = readStoredSettings(u)
+  if (read === undefined) return undefined
+  const stored = read.file
+  return {
+    file: stored.version === 4 ? stored.file : migrateToV4({ file: stored.file, from: stored.from, context: options.context ?? {}, now: options.now ?? Date.now() }),
+    migrated: stored.version === 3,
+    problems: read.problems
+  }
+}
+
+const emptyStored = (): StoredSettings => ({
+  version: 3,
+  file: { version: 3, modules: {}, assistant: {}, frontends: {}, devices: {} },
+  from: 0
+})
 
 const readSecretsFile = (u: unknown): Read<SecretsFile> | undefined => {
   if (!isRecord(u) || !optionalRecords(u.modules) || !Object.values(u.modules ?? {}).every(allStrings)) return undefined
@@ -205,7 +322,7 @@ const readSecretsFile = (u: unknown): Read<SecretsFile> | undefined => {
   return undefined
 }
 
-const validSettings = (u: unknown) => readSettingsFile(u) !== undefined
+const validSettings = (u: unknown) => readStoredSettings(u) !== undefined
 const validSecrets = (u: unknown) => readSecretsFile(u) !== undefined
 
 /** The message of a save refused because the vault is locked. */
@@ -248,10 +365,38 @@ export interface SettingsStore {
     secrets: Readonly<Record<string, string>>
   ) => Effect.Effect<void, SettingsStoreError>
   /**
-   * Save front-end data (kind defaults, device records): `change` maps the committed data to the new data. Refused
-   * while `blocked()` (see the header). Never touches the secrets.
+   * Save the remembered devices (a device seen for the first time, its last visit, forgotten): `change` maps the
+   * committed records to the new ones. Refused while `blocked()` (see the header). Never touches the secrets.
    */
-  readonly saveFrontends: (what: string, change: (committed: FrontendData) => FrontendData) => Effect.Effect<void, SettingsStoreError>
+  readonly saveDeviceRecords: (what: string, change: (committed: Readonly<Record<string, StoredDevice>>) => Readonly<Record<string, StoredDevice>>) => Effect.Effect<void, SettingsStoreError>
+  /** The assistants as stored, in the admin's order. */
+  readonly assistants: () => ReadonlyArray<Assistant>
+  /**
+   * The assistants in effect: the migrated assistant with its fields set by the environment applied, and the
+   * fields that locks (docs/ASSISTANTS.md §1.2); others as stored, with none.
+   */
+  readonly assistantsInEffect: () => ReadonlyArray<{ readonly assistant: Assistant; readonly locks: ReadonlyArray<EnvironmentLock> }>
+  /** Create an assistant (its id from its name, `rev` 0), last in the order. `limit_reached` at `MAX_ASSISTANTS`. */
+  readonly createAssistant: (body: AssistantBody) => Effect.Effect<Assistant, SettingsStoreError | EntitySaveError>
+  /**
+   * Save a whole assistant. Its `rev` must be the stored one (else `stale`); it is stored with `rev + 1`, which is
+   * returned. A field locked by the environment must be unchanged (its effective or stored value), else `locked`;
+   * the stored value of a locked field is kept.
+   */
+  readonly saveAssistantRecord: (assistant: Assistant) => Effect.Effect<Assistant, SettingsStoreError | EntitySaveError>
+  /**
+   * Delete an assistant (`rev` as for a save). It leaves every assignment list; a `withoutPhrase` naming it becomes
+   * `nobody`, a TypeSafe fallback naming it the first remaining assistant (docs/ASSISTANTS.md §2.6).
+   */
+  readonly deleteAssistantRecord: (id: string, rev: number) => Effect.Effect<void, SettingsStoreError | EntitySaveError>
+  /** Save a device type's complete defaults (`rev` as for an assistant; a type never saved has `rev` 0). */
+  readonly saveDeviceType: (kind: string, rev: number, settings: DeviceSettings) => Effect.Effect<StoredDeviceType, SettingsStoreError | EntitySaveError>
+  /** Save a remembered device's own sections and, when given, its name (`rev` as for an assistant). */
+  readonly saveDevice: (
+    id: string,
+    rev: number,
+    change: { readonly name?: string; readonly own: DeviceOwn }
+  ) => Effect.Effect<StoredDevice, SettingsStoreError | EntitySaveError>
   /** The module host's view of the store. */
   readonly modulePersistence: ModulePersistence
 }
@@ -286,6 +431,12 @@ export interface LoadOptions {
   readonly afterRead?: (file: "journal" | "settings" | "secrets" | "journal-again", attempt: number) => void | Promise<void>
   /** For tests, read-only loads: attempts before giving up (default `SNAPSHOT_ATTEMPTS`). */
   readonly snapshotAttempts?: number
+  /**
+   * The environment and the module catalog: what the version-3 migration reads (effective values: environment >
+   * saved > default; which modules were on), and which fields of the migrated assistant the environment locks.
+   * Without it: no environment, and module switches only as saved.
+   */
+  readonly assistants?: AssistantContext
 }
 
 /** A read-only load reads the files at most this many times while they keep changing (about 1 s in all). */
@@ -300,6 +451,7 @@ export type StartupStep =
   | "recover-journal-remove"
   | "set-aside-file"
   | "migrate-settings"
+  | "migrate-assistants"
 
 /**
  * Before each file operation of a writable startup: a check that the lock is still held (its release has not
@@ -320,6 +472,8 @@ const startupGate = (directory: string, options: LoadOptions): StartupGate => as
 type SecretsKind = "file" | "vault"
 
 const JOURNAL_VERSION = 2
+/** The Claude subscription agent module, whose per-assistant settings are mirrored into the migrated assistant. */
+const SUBSCRIPTION_MODULE_ID = "claude-subscription"
 
 interface Journal {
   /** 1: written before the settings screen (secrets always in `secrets.json`). */
@@ -570,6 +724,17 @@ const recover = async (
   return restoredVault ? "vault-restored" : undefined
 }
 
+/**
+ * Where the migration keeps the original: `settings.json.<tag>-backup`, unless that holds something else already
+ * (an earlier migration's original): then with the time after it, so no backup is overwritten.
+ */
+const backupPath = async (settingsPath: string, tag: string, original: string, options: LoadOptions): Promise<string> => {
+  const plainPath = `${settingsPath}.${tag}-backup`
+  const existing = await readText(plainPath)
+  if (existing === undefined || existing === original) return plainPath
+  return `${plainPath}-${new Date((options.now ?? Date.now)()).toISOString().replace(/[:.]/g, "-")}`
+}
+
 /** A file's text parsed and migrated; a corrupt one is set aside (writer) or reported (read-only). */
 const loadFile = async <A>(
   path: string,
@@ -676,27 +841,45 @@ export const loadSettingsStore = (directory: string, options: LoadOptions = {}):
           }
         }
         const settingsText = texts.settings
-        const loadedSettings = await loadFile(settingsPath, readSettingsFile, emptySettings, options, problems, settingsText, gate)
+        const loadedSettings = await loadFile(settingsPath, readStoredSettings, emptyStored, options, problems, settingsText, gate)
         // `secrets.json`: the secrets themselves (no vault), or keys left to import into the vault.
         const fileText = kind === "file" ? texts.secrets : await readText(secretsPath)
         const loadedSecrets = await loadFile(secretsPath, readSecretsFile, emptySecrets, options, problems, fileText, gate)
-        // Version 1 → 2: keep the original next to it, then write the flat file with the same revision
-        // (secrets.json is rewritten at its next save).
-        if (loadedSettings.migrated && !readOnly) {
-          await gate("migrate-settings")
-          await writeFile(`${settingsPath}.v1-backup`, settingsText ?? "", { mode: 0o644 })
-          await writeAtomic(directory, settingsPath, text(loadedSettings.file), 0o644)
-          problems.push(
-            `${settingsPath} was migrated to version 2 (assistant settings stored by key); the original is in ${settingsPath}.v1-backup`
-          )
-        }
         // A read-only load with the vault: the keys of the vault file the snapshot chose, under the key the CLI
         // unlocked with (else what the vault itself holds).
         const vaultSecrets = readOnly && kind === "vault" && texts.secrets !== undefined
           ? vault?.decode(texts.secrets) ?? vault?.secrets()
           : undefined
+        const stored = loadedSettings.file
+        let settingsFile: SettingsFile
+        if (stored.version === 4) {
+          settingsFile = stored.file
+        } else {
+          // Version 1–3 → 4 (docs/ASSISTANTS.md §6). The keys are read only for whether a module's key is set.
+          const keys = kind === "vault" ? (readOnly ? vaultSecrets : vault?.secrets()) : loadedSecrets.file
+          settingsFile = migrateToV4({
+            file: stored.file,
+            from: stored.from,
+            secrets: { assistant: keys?.assistant ?? {}, modules: keys?.modules ?? {} },
+            context: options.assistants ?? {},
+            now: (options.now ?? Date.now)()
+          })
+          if (stored.from > 0 && !readOnly) {
+            // Keep the original next to it, then write version 4 with the same revision (secrets.json, if it was
+            // version 1, is rewritten at its next save). One write: a reader sees the old file or the new one.
+            await gate(stored.from === 1 ? "migrate-settings" : "migrate-assistants")
+            const backup = await backupPath(settingsPath, stored.from === 1 ? "v1" : "v3", settingsText ?? "", options)
+            await writeFile(backup, settingsText ?? "", { mode: 0o644 })
+            await writeAtomic(directory, settingsPath, text(settingsFile), 0o644)
+            const notes = settingsFile.migration?.notes ?? []
+            problems.push(
+              `${settingsPath} was migrated to version 4 (assistants and devices); the original is in ${backup}.` +
+                (notes.length > 0 ? ` What changed: ${notes.join(" ")}` : "")
+            )
+          }
+        }
         return {
-          settings: loadedSettings.file,
+          settings: settingsFile,
           secrets: loadedSecrets.file,
           secretsMigrated: loadedSecrets.migrated,
           secretsText: fileText,
@@ -752,12 +935,15 @@ export const loadSettingsStore = (directory: string, options: LoadOptions = {}):
             readOnly || lock === undefined
               ? saveNow(change, after)
               : lock.guard(`saving ${what}`, () => saveNow(change, after)),
-          catch: (cause) =>
-            new SettingsStoreError({
+          catch: (cause): SettingsStoreError | EntitySaveError =>
+            cause instanceof EntitySaveError ? cause : new SettingsStoreError({
               message: cause instanceof KeysUnavailable ? cause.message : `Could not save ${what} in ${directory}`,
               cause
             })
         })))
+      /** A save whose refusals (`EntitySaveError`) are thrown inside `change`. */
+      const persistSettings = (what: string, change: Change, after?: () => Promise<void>) =>
+        persist(what, change, after).pipe(Effect.catchTag("EntitySaveError", (e) => Effect.die(e))) as Effect.Effect<void, SettingsStoreError>
 
       const saveNow = async (change: Change, after?: () => Promise<void>) => {
         if (readOnly) {
@@ -924,9 +1110,28 @@ export const loadSettingsStore = (directory: string, options: LoadOptions = {}):
         return out
       }
 
+      const context: AssistantContext = options.assistants ?? {}
+      /** `file` with the migrated assistant changed by `f` (and its `rev` raised), when it exists and `f` changes it. */
+      const withMigrated = (file: SettingsFile, f: (a: Assistant) => Assistant): SettingsFile => {
+        const a = file.assistants.byId[MIGRATED_ASSISTANT_ID]
+        if (a === undefined) return file
+        const next = f(a)
+        if (JSON.stringify(next) === JSON.stringify(a)) return file
+        return { ...file, assistants: { ...file.assistants, byId: { ...file.assistants.byId, [a.id]: { ...next, rev: a.rev + 1 } } } }
+      }
+
       const saveModule: SettingsStore["saveModule"] = (id, record) =>
-        persist(`the settings of module ${id}`, (committed) => ({
-          settings: { ...committed.settings, modules: { ...committed.settings.modules, [id]: { enabled: record.enabled, settings: record.settings } } },
+        persistSettings(`the settings of module ${id}`, (committed) => ({
+          settings: withMigrated(
+            { ...committed.settings, modules: { ...committed.settings.modules, [id]: { enabled: record.enabled, settings: record.settings } } },
+            (a) => {
+              const switched = mirrorModuleSwitch(a, id, record.enabled, context)
+              // The Claude subscription agent's per-assistant settings (WP-13a), changed in its module form.
+              return id === SUBSCRIPTION_MODULE_ID
+                ? mirrorSubscriptionSettings(switched, committed.settings.modules[id]?.settings ?? {}, record.settings, context)
+                : switched
+            }
+          ),
           secrets: { ...committed.secrets, modules: withSecrets(committed.secrets.modules, id, record.secrets) }
         }))
 
@@ -939,10 +1144,16 @@ export const loadSettingsStore = (directory: string, options: LoadOptions = {}):
         return out
       }
       const saveAssistant: SettingsStore["saveAssistant"] = (keys, values, assistantSecrets) =>
-        persist("the assistant settings", (committed) => ({
-          settings: { ...committed.settings, assistant: replaceKeys(committed.settings.assistant, keys, values) },
-          secrets: { ...committed.secrets, assistant: replaceKeys(committed.secrets.assistant, keys, assistantSecrets) }
-        }))
+        persistSettings("the assistant settings", (committed) => {
+          const flat = replaceKeys(committed.settings.assistant, keys, values)
+          return {
+            settings: withMigrated(
+              { ...committed.settings, assistant: flat },
+              (a) => mirrorFlatKeys(a, keys, flat, committed.settings.modules, context)
+            ),
+            secrets: { ...committed.secrets, assistant: replaceKeys(committed.secrets.assistant, keys, assistantSecrets) }
+          }
+        })
 
       const importLegacySecrets: SettingsStore["importLegacySecrets"] = () =>
         Effect.suspend(() => {
@@ -978,7 +1189,7 @@ export const loadSettingsStore = (directory: string, options: LoadOptions = {}):
               message: `${secretsPath} still holds ${countKeys(secrets)} key(s); they move into the vault after the settings are saved once`
             }))
           }
-          return persist(
+          return persistSettings(
             `${secretsPath} into the vault`,
             (committed) => {
               if (vault.secrets() === undefined) throw new KeysUnavailable(KEYS_LOCKED_MESSAGE)
@@ -999,15 +1210,104 @@ export const loadSettingsStore = (directory: string, options: LoadOptions = {}):
           ).pipe(Effect.map(() => count))
         })
 
-      const saveFrontends: SettingsStore["saveFrontends"] = (what, change) =>
+      const saveDeviceRecords: SettingsStore["saveDeviceRecords"] = (what, change) =>
         Effect.suspend(() =>
           blockedProblem !== undefined
             ? Effect.fail(new SettingsStoreError({ message: `${what} was not saved: ${blockedProblem}` }))
-            : persist(what, (committed) => {
-              const next = change({ frontends: committed.settings.frontends, devices: committed.settings.devices })
-              return { settings: { ...committed.settings, frontends: next.frontends, devices: next.devices }, secrets: committed.secrets }
-            })
+            : persistSettings(what, (committed) => ({
+              settings: { ...committed.settings, devices: change(committed.settings.devices) },
+              secrets: committed.secrets
+            }))
         )
+
+      // -- Entities (docs/ASSISTANTS.md §1.2 "Admin transport"): saved whole, each with its `rev`.
+      const refuse = (code: EntitySaveError["code"], message: string) => new EntitySaveError({ code, message })
+      const stale = (what: string, rev: number, stored: number) =>
+        refuse("stale", `${what} was changed elsewhere (saved ${stored} time${stored === 1 ? "" : "s"}, this page had ${rev}); reload it`)
+      /** Run a change of the entities; `change` may throw an `EntitySaveError` (nothing is written then). */
+      const persistEntities = <A>(what: string, change: (committed: SettingsFile) => { readonly file: SettingsFile; readonly result: A }) =>
+        Effect.suspend(() => {
+          let result: A | undefined
+          return persist(what, (committed) => {
+            const out = change(committed.settings)
+            result = out.result
+            return { settings: out.file, secrets: committed.secrets }
+          }).pipe(Effect.map(() => result as A))
+        })
+      const withAssistant = (list: AssistantList, a: Assistant): AssistantList => ({
+        order: list.order.includes(a.id) ? list.order : [...list.order, a.id],
+        byId: { ...list.byId, [a.id]: a }
+      })
+
+      const createAssistant: SettingsStore["createAssistant"] = (body) =>
+        persistEntities(`the new assistant ${body.name.slice(0, 32)}`, (file) => {
+          if (file.assistants.order.length >= MAX_ASSISTANTS) throw refuse("limit_reached", `There can be at most ${MAX_ASSISTANTS} assistants`)
+          const assistant: Assistant = { ...body, id: makeAssistantId(body.name, file.assistants.order), rev: 0 }
+          return { file: { ...file, assistants: withAssistant(file.assistants, assistant) }, result: assistant }
+        })
+
+      const saveAssistantRecord: SettingsStore["saveAssistantRecord"] = (incoming) =>
+        persistEntities(`assistant ${incoming.id}`, (file) => {
+          const stored = file.assistants.byId[incoming.id]
+          if (stored === undefined) throw refuse("unknown_assistant", `There is no assistant ${incoming.id}`)
+          if (incoming.rev !== stored.rev) throw stale(`Assistant ${stored.name}`, incoming.rev, stored.rev)
+          const { assistant: inEffect, locks } = withEnvironment(stored, context)
+          let next: Assistant = { ...incoming, id: stored.id, rev: stored.rev + 1 }
+          for (const lock of locks) {
+            const value = JSON.stringify(getPath(incoming, lock.field))
+            if (value !== JSON.stringify(getPath(inEffect, lock.field)) && value !== JSON.stringify(getPath(stored, lock.field))) {
+              throw refuse("locked", `${lock.field} is set by ${lock.key} in the environment; change it there, or move it to the settings first`)
+            }
+            next = setPath(next, lock.field, getPath(stored, lock.field))
+          }
+          return { file: { ...file, assistants: withAssistant(file.assistants, next) }, result: next }
+        })
+
+      const deleteAssistantRecord: SettingsStore["deleteAssistantRecord"] = (id, rev) =>
+        persistEntities(`deleting assistant ${id}`, (file) => {
+          const stored = file.assistants.byId[id]
+          if (stored === undefined) throw refuse("unknown_assistant", `There is no assistant ${id}`)
+          if (rev !== stored.rev) throw stale(`Assistant ${stored.name}`, rev, stored.rev)
+          const byId = { ...file.assistants.byId }
+          delete byId[id]
+          const deviceTypes: Record<string, StoredDeviceType> = {}
+          for (const [kind, t] of Object.entries(file.deviceTypes)) {
+            const next = removeAssistantFromSettings(t, id)
+            deviceTypes[kind] = JSON.stringify(next) === JSON.stringify(t) ? t : { ...next, rev: t.rev + 1 }
+          }
+          const devices: Record<string, StoredDevice> = {}
+          for (const [deviceId, d] of Object.entries(file.devices)) {
+            const inherited = (deviceTypes[d.kind] ?? deviceTypeOf(d.kind)?.builtIn)?.assistants ?? []
+            const own = removeAssistantFromSettings(d.own, id, inherited)
+            devices[deviceId] = JSON.stringify(own) === JSON.stringify(d.own) ? d : { ...d, own, rev: d.rev + 1 }
+          }
+          return {
+            file: { ...file, assistants: { order: file.assistants.order.filter((x) => x !== id), byId }, deviceTypes, devices },
+            result: undefined
+          }
+        })
+
+      const saveDeviceType: SettingsStore["saveDeviceType"] = (kind, rev, deviceSettings) =>
+        persistEntities(`the defaults of ${kind}`, (file) => {
+          const stored = file.deviceTypes[kind]
+          if (stored === undefined && deviceTypeOf(kind) === undefined) throw refuse("unknown_device", `There is no device type ${kind}`)
+          const storedRev = stored?.rev ?? 0
+          if (rev !== storedRev) throw stale(`The defaults of ${kind}`, rev, storedRev)
+          // A type with no stored defaults is reported at rev 0, so its first save stores 1: every save moves the rev on.
+          const next: StoredDeviceType = { ...deviceSettings, rev: storedRev + 1 }
+          return { file: { ...file, deviceTypes: { ...file.deviceTypes, [kind]: next } }, result: next }
+        })
+
+      const saveDevice: SettingsStore["saveDevice"] = (id, rev, change) =>
+        persistEntities(`device ${id}`, (file) => {
+          const stored = file.devices[id]
+          if (stored === undefined) throw refuse("unknown_device", "That device is not known (it may have been forgotten)")
+          if (rev !== stored.rev) throw stale(`Device ${stored.name}`, rev, stored.rev)
+          const next: StoredDevice = { ...stored, ...(change.name !== undefined ? { name: change.name.trim() } : {}), own: change.own, rev: stored.rev + 1 }
+          return { file: { ...file, devices: { ...file.devices, [id]: next } }, result: next }
+        })
+
+      const ordered = () => settings.assistants.order.flatMap((id) => (settings.assistants.byId[id] !== undefined ? [settings.assistants.byId[id]!] : []))
 
       const store: SettingsStore = {
         directory,
@@ -1024,7 +1324,14 @@ export const loadSettingsStore = (directory: string, options: LoadOptions = {}):
         },
         saveModule,
         saveAssistant,
-        saveFrontends,
+        saveDeviceRecords,
+        assistants: ordered,
+        assistantsInEffect: () => ordered().map((a) => withEnvironment(a, context)),
+        createAssistant,
+        saveAssistantRecord,
+        deleteAssistantRecord,
+        saveDeviceType,
+        saveDevice,
         modulePersistence: {
           initial: { modules: settings.modules, secrets: current().modules },
           save: saveModule

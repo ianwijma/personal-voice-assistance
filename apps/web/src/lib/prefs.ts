@@ -3,10 +3,12 @@ import { createStore, type Store } from "./store.ts"
 
 /**
  * What this browser keeps for itself in `localStorage`: the microphone and speaker (hardware ids mean nothing on
- * another machine), a one-time hint, whether single-key shortcuts are on, and the last echo test. Everything else that used to be per browser
+ * another machine), a one-time hint, whether single-key shortcuts are on and the last echo test. Everything else that used to be per browser
  * (interrupting, audio processing, captions, speaking replies, output path, prebuffer) is the device profile since
- * protocol 5: it comes from the server (`device.profile`) and is edited in admin
+ * protocol 5: it comes from the server (the device's `device.setup`) and is edited in admin
  * (docs/FRONTENDS-AND-ACTIVATION.md §2). Old stored values of those fields are ignored and dropped on the next write.
+ * So is the stage's character (`character`, a per-browser choice until docs/LOOKS-AND-VOICES.md): the look now
+ * belongs to the assistant or the device and arrives in `device.setup`.
  */
 export interface Prefs {
   /** `""` = the system default. */

@@ -59,12 +59,13 @@ const readWav16k = (file: string): Int16Array => {
 
 /**
  * Speech synthesised by the assistant itself (`pnpm start say`), cached in `.fixtures/`: the wake-phrase tests need
- * sentences the bench files do not have ("Hey Jeff, what time is it?"). `voice`: a voice of the catalog
- * (`standard` = Piper lessac, `natural` = Kokoro af_heart); `speed`: `TTS_SHERPA_SPEED`.
+ * sentences the bench files do not have ("Hey Jeff, what time is it?"). `voice`: a voice key (`say --voice
+ * provider:voiceId`, docs/VOICE-PROVIDERS.md §2): `sherpa:en_US-lessac-medium` (Piper, the default) or
+ * `sherpa:kokoro-af_heart` (Kokoro); `speed`: `TTS_SHERPA_SPEED`.
  */
 export const spoken = (text: string, options: { readonly voice?: string; readonly speed?: number } = {}): Segment => {
-  const voice = options.voice ?? "standard"
-  const slug = `${voice}${options.speed === undefined ? "" : `-x${options.speed}`}-${text.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 40)}`
+  const voice = options.voice ?? "sherpa:en_US-lessac-medium"
+  const slug = `${voice.replace(/[^A-Za-z0-9_-]+/g, "_")}${options.speed === undefined ? "" : `-x${options.speed}`}-${text.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 40)}`
   const path = join(fixturesDir, "say", `${slug}.wav`)
   if (!existsSync(path)) {
     mkdirSync(dirname(path), { recursive: true })
@@ -209,7 +210,7 @@ export const startAssistant = async (options: {
       PVA_DATA_DIR: options.dataDir,
       PVA_VAULT_PATH: join(options.dataDir, "vault", "vault.enc"), // never the owner's real key vault
       PVA_WEB_DIR: webOut,
-      // Protocol 5: settings change through an admin connection (`setFrontendDefaults`).
+      // Protocol 7: settings change through an admin connection (`setDeviceDefaults`, `setAssistant`).
       PVA_ADMIN_PASSWORD: E2E_ADMIN_PASSWORD,
       ...options.env
     }
@@ -408,40 +409,65 @@ export const setPrefs = (page: Page, prefs: Record<string, unknown>) =>
   page.addInitScript({ content: `localStorage.setItem("pva.prefs.v1", ${JSON.stringify(JSON.stringify(prefs))})` })
 
 /**
- * Protocol 5: set the `web-voice` defaults (e.g. `{ interruptMode: "manual" }`), as admin › Front ends would: log in
- * on an admin connection with `E2E_ADMIN_PASSWORD`, send `frontend.update`, wait for its result.
+ * An admin connection (`E2E_ADMIN_PASSWORD`): log in, wait for `admin.snapshot`, send the request `build` makes from it
+ * (it may read the stored `rev` of what it saves), and wait for its result.
  */
-export const setFrontendDefaults = async (url: string, patch: Record<string, unknown>): Promise<void> => {
+const adminRequest = async (url: string, build: (snapshot: Record<string, any>) => Record<string, unknown>): Promise<void> => {
   const ws = new WebSocket(`${url.replace(/^http/, "ws")}/ws`)
   await new Promise<void>((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error("admin: no answer")), 10_000)
     ws.onopen = () => ws.send(JSON.stringify({ type: "hello", protocol: PROTOCOL_VERSION, clientId: `admin-${Date.now()}`, resumeOwner: false, frontend: "admin" }))
     ws.onmessage = (e) => {
-      const m = JSON.parse(String(e.data)) as { type: string; requestId?: string; ok?: boolean; error?: { message: string } }
+      const m = JSON.parse(String(e.data)) as { type: string; requestId?: string; ok?: boolean; error?: { message: string }; snapshot?: Record<string, any> }
       if (m.type === "welcome") ws.send(JSON.stringify({ type: "admin.login", requestId: "login", password: E2E_ADMIN_PASSWORD }))
-      if (m.type === "result" && m.requestId === "login") {
-        if (m.ok !== true) return reject(new Error(`admin login failed: ${m.error?.message}`))
-        ws.send(JSON.stringify({ type: "frontend.update", requestId: "defaults", kind: "web-voice", patch }))
-      }
-      if (m.type === "result" && m.requestId === "defaults") {
+      if (m.type === "result" && m.requestId === "login" && m.ok !== true) return reject(new Error(`admin login failed: ${m.error?.message}`))
+      if (m.type === "admin.snapshot") ws.send(JSON.stringify({ ...build(m.snapshot!), requestId: "change" }))
+      if (m.type === "result" && m.requestId === "change") {
         clearTimeout(timer)
         ws.close()
         if (m.ok === true) resolve()
-        else reject(new Error(`frontend.update failed: ${m.error?.message}`))
+        else reject(new Error(`admin request failed: ${m.error?.message}`))
       }
     }
     ws.onerror = () => reject(new Error("socket error"))
   })
 }
 
+/**
+ * Protocol 7: save sections of the `web-voice` type's defaults (e.g. `{ interruptMode: "manual" }` or
+ * `{ withoutPhrase: { mode: "nobody" } }`), as Devices › Every browser would (`device.save`).
+ */
+export const setDeviceDefaults = (url: string, settings: Record<string, unknown>): Promise<void> =>
+  adminRequest(url, (snapshot) => ({
+    type: "device.save",
+    target: { kind: "type", type: "web-voice" },
+    rev: (snapshot.deviceTypes as Array<{ kind: string; rev: number }>).find((t) => t.kind === "web-voice")!.rev,
+    settings
+  }))
+
+/** Protocol 7: change fields of the first assistant (`{ newConversationAfter: 1 }`, `{ followUpSeconds: 0 }`), as its pages would (`assistant.save`). */
+export const setAssistant = (url: string, patch: Record<string, unknown>): Promise<void> =>
+  adminRequest(url, (snapshot) => ({ type: "assistant.save", assistant: { ...(snapshot.assistants as Array<Record<string, unknown>>)[0]!, ...patch } }))
+
 export type History = ReadonlyArray<{ role: "user" | "assistant"; text: string; interrupted?: boolean; tools?: ReadonlyArray<{ name: string; ok: boolean }> }>
 
-/** The server's conversation history, as a newly connecting tab receives it (`welcome.snapshot.history`). */
-export const serverHistory = async (url: string): Promise<History> => {
+/**
+ * The server's conversation history of `page`'s device, as a newly connecting tab of that device receives it
+ * (`welcome.snapshot.history`). Protocol 6: a conversation per device, so the probe says it is that device.
+ */
+export const serverHistory = async (url: string, page: Page): Promise<History> => {
+  const deviceId = await page.evaluate(() => localStorage.getItem("pva.deviceId") ?? "")
   const ws = new WebSocket(`${url.replace(/^http/, "ws")}/ws`)
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error("no welcome")), 5000)
-    ws.onopen = () => ws.send(JSON.stringify({ type: "hello", protocol: PROTOCOL_VERSION, clientId: `probe-${Date.now()}`, resumeOwner: false, frontend: "voice" }))
+    ws.onopen = () => ws.send(JSON.stringify({
+        type: "hello",
+        protocol: PROTOCOL_VERSION,
+        clientId: `probe-${Date.now()}`,
+        resumeOwner: false,
+        frontend: "voice",
+        ...(deviceId === "" ? {} : { device: { id: deviceId, kind: "web-voice", name: "probe" } })
+      }))
     ws.onmessage = (e) => {
       const m = JSON.parse(String(e.data)) as { type: string; snapshot?: { history: History } }
       if (m.type === "welcome") {

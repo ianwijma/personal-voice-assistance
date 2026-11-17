@@ -1,5 +1,5 @@
 // SessionHub request limits: requests that do work (settings, modules, reload) are bounded per connection and overall.
-import { DEFAULT_DEVICE_PROFILE, encodeClientMessage, PROTOCOL_VERSION, type ServerMessage } from "@pva/protocol"
+import { encodeClientMessage, PROTOCOL_VERSION, type ServerMessage } from "@pva/protocol"
 import { Deferred, Effect } from "effect"
 import { describe, expect, it } from "vitest"
 import { makeAccessPolicy } from "../src/serve/access.ts"
@@ -13,14 +13,57 @@ const noVault = () => ({
   keys: { state: () => "none", info: () => ({ state: "none", admin: true, location: "" }), subscribe: () => () => {} } as never,
   access: makeAccessPolicy({ catalog: [], sections: () => [], vaultState: () => "none" }),
   admin: makeAdminSessions({ password: ADMIN_PASSWORD }),
-  frontends: {
-    profile: () => DEFAULT_DEVICE_PROFILE,
-    kinds: () => [],
+  assistants: {
+    setupFor: () => ({ assistants: [], withoutPhrase: { mode: "nobody" }, canPick: false, canAuto: false, interruptMode: "confirm", audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, speakAloud: true, outputPath: "direct", prebufferMs: 60 }, captions: { captions: true, speakTyped: true } }),
+    infos: () => [],
+    deviceTypes: () => [],
+    devices: () => []
+  } as never,
+  devices: {
     devices: () => [],
     seen: () => Effect.void,
     left: () => {}
   } as never
 })
+
+/** Voice sessions: `send` is what each session's conversation answers a typed input with. */
+const fakeSessions = (send: (input: unknown) => string = () => "accepted") => {
+  const sessions = new Map<string, unknown>()
+  const make = (key: string) => ({
+    key,
+    deviceId: undefined,
+    name: () => "tab",
+    web: { setOwner: () => {}, setMicLive: () => {}, micFrame: () => {}, report: () => {} },
+    tracker: { current: () => ({ state: "idle" }) },
+    publisher: { committedTurn: () => undefined },
+    // Typed text goes to the session's routed conversations (`sendText`, an Effect since WP-4b); Stop is `stop`.
+    conversation: {
+      sendText: (text: string, speak: boolean) => Effect.sync(() => send({ _tag: "TextInput", text, speak })),
+      stop: () => send({ _tag: "Interrupt" }),
+      history: () => Effect.succeed([]),
+      conversation: () => ({ id: "c1", startedAt: 0 })
+    },
+    syncProfile: () => {},
+    ownerChanged: () => {},
+    touch: () => {},
+    holder: () => null,
+    pickAccepted: () => {}
+  })
+  return {
+    get: (key: string) => sessions.get(key),
+    open: (key: string) => {
+      if (!sessions.has(key)) sessions.set(key, make(key))
+      return sessions.get(key)
+    },
+    connections: () => {},
+    conversation: () => ({ id: "c1", startedAt: 0 }),
+    list: () => [],
+    all: () => [...sessions.values()],
+    size: () => sessions.size,
+    mostRecent: () => undefined,
+    traces: () => []
+  } as never
+}
 
 const setup = () => {
   const gate = Effect.runSync(Deferred.make<void>())
@@ -32,18 +75,13 @@ const setup = () => {
       return Deferred.await(gate).pipe(Effect.as(value), Effect.ensuring(Effect.sync(() => finished++)))
     })
   const hub = makeSessionHub({
-    web: { setOwner: () => {}, setMicLive: () => {}, micFrame: () => {}, report: () => {} } as never,
     engine: {
       status: () => ({ state: "ready", problems: [], reloadPending: false, reloadPendingFor: [], engines: [], voices: [] }),
-      history: Effect.succeed([]),
-      reload: work({ ok: true }),
-      send: () => true
+      reload: work({ ok: true })
     } as never,
     host: { modules: () => [], enable: () => work({ ok: true }), disable: () => work({ ok: true }), configure: () => work({ ok: true }) } as never,
     sections: { list: () => [], update: () => work({ result: { ok: true }, reload: false }) } as never,
-    publisher: { traces: () => [], committedTurn: () => undefined } as never,
-    tracker: { current: () => ({ state: "idle" }), setOwner: () => {} } as never,
-    gate: { setMode: () => {} } as never,
+    sessions: fakeSessions(),
     run: (effect) => void Effect.runFork(effect),
     onSectionSaved: () => {},
     server: { name: "test", version: "0" },
@@ -112,20 +150,15 @@ describe("SessionHub: typed input", () => {
   const hubWith = (send: () => string, state = "ready") => {
     const sent: Array<unknown> = []
     const hub = makeSessionHub({
-      web: { setOwner: () => {}, setMicLive: () => {}, micFrame: () => {}, report: () => {} } as never,
       engine: {
-        status: () => ({ state, problems: [], reloadPending: false, reloadPendingFor: [], engines: [], voices: [] }),
-        history: Effect.succeed([]),
-        send: (input: unknown) => {
-          sent.push(input)
-          return send()
-        }
+        status: () => ({ state, problems: [], reloadPending: false, reloadPendingFor: [], engines: [], voices: [] })
       } as never,
       host: { modules: () => [] } as never,
       sections: { list: () => [] } as never,
-      publisher: { traces: () => [], committedTurn: () => undefined } as never,
-      tracker: { current: () => ({ state: "idle" }), setOwner: () => {} } as never,
-      gate: { setMode: () => {} } as never,
+      sessions: fakeSessions((input: unknown) => {
+        sent.push(input)
+        return send()
+      }),
       run: (effect) => void Effect.runFork(effect),
       onSectionSaved: () => {},
       server: { name: "test", version: "0" },
@@ -139,7 +172,7 @@ describe("SessionHub: typed input", () => {
     return { say, results, sent }
   }
 
-  it("text.send is acknowledged ok only when the engine accepted it; refused input is answered busy", () => {
+  it("text.send is acknowledged ok only when the session accepted it; refused input is answered busy", () => {
     let n = 0
     const t = hubWith(() => (n++ < 4 ? "accepted" : "busy"))
     for (let i = 0; i < 10; i++) t.say(i)

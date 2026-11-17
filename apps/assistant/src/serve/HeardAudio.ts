@@ -6,7 +6,7 @@ import { formatLevelStats, levelStats, type LevelStats, wavBytes } from "../leve
 /**
  * "What does the assistant hear": while switched on (the `RECORD_HEARD_AUDIO`
  * setting, live), every turn's audio as the recogniser received it (before the
- * recogniser's own gain control) is saved as `<dataDir>/recordings/<time>.wav`
+ * recogniser's own gain control) is saved as `<dataDir>/recordings/<time>-<device>-<n>.wav`
  * with a `.json` beside it (transcript, model, level statistics, transport
  * counters), and one line is logged per turn. `pnpm start compare-models
  * <file>` then runs every installed model on it (README, "Is it the audio or
@@ -37,6 +37,11 @@ export interface HeardAudioOptions {
   readonly maxFiles: () => number
   /** The recogniser in use, e.g. "sherpa parakeet-v2". */
   readonly model: () => string
+  /**
+   * The voice session (device) this recorder belongs to: its name goes into the file name (after the time) and the
+   * session's key and name into the `.json` (`device`), so recordings of several devices can be told apart.
+   */
+  readonly device?: () => { readonly key: string; readonly name: string }
   /** Transport counters since the previous call (WebAudio.inputStats). */
   readonly transport?: () => Readonly<Record<string, number>>
   readonly log: (line: string) => void
@@ -240,7 +245,9 @@ export const makeHeardAudio = (options: HeardAudioOptions): HeardAudio => {
     const pcm = new Int16Array(bytes.buffer, 0, bytes.length / 2)
     const stats = levelStats(pcm)
     const stamp = new Date(r.startedAt).toISOString().replace(/[:.]/g, "-")
-    const base = `${stamp}-${String(++counter).padStart(3, "0")}`
+    const device = options.device?.()
+    const slug = device === undefined ? "" : device.name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 32)
+    const base = `${stamp}${slug !== "" ? `-${slug}` : ""}-${String(++counter).padStart(3, "0")}`
     const wav = join(options.dir, `${base}.wav`)
     const json = join(options.dir, `${base}.json`)
     const transport = options.transport?.()
@@ -255,6 +262,7 @@ export const makeHeardAudio = (options: HeardAudioOptions): HeardAudio => {
           {
             startedAt: new Date(r.startedAt).toISOString(),
             model: options.model(),
+            ...(device !== undefined ? { device: { key: device.key, name: device.name } } : {}),
             transcript,
             speculative: r.eager,
             lastInterim: r.interim,
@@ -271,7 +279,7 @@ export const makeHeardAudio = (options: HeardAudioOptions): HeardAudio => {
     }
     sequence(steps, mayWrite, () => {
       ended()
-      done(wav, json, transcript, stats, transport)
+      done(wav, json, transcript, stats, transport, device)
     }, onError)
   }
 
@@ -285,14 +293,21 @@ export const makeHeardAudio = (options: HeardAudioOptions): HeardAudio => {
     }
   }
 
-  const done = (wav: string, json: string, transcript: string, stats: LevelStats, transport: Readonly<Record<string, number>> | undefined) => {
+  const done = (
+    wav: string,
+    json: string,
+    transcript: string,
+    stats: LevelStats,
+    transport: Readonly<Record<string, number>> | undefined,
+    device: { readonly name: string } | undefined
+  ) => {
     saved.push({ wav, json, transcript, stats })
     if (saved.length > 100) saved.shift()
     const problems = transport === undefined
       ? ""
       : Object.entries(transport).filter(([key, v]) => v > 0 && key !== "micFrames" && key !== "maxMicGapMs").map(([k, v]) => `${k} ${v}`).join(", ")
     options.log(
-      `Heard (${options.model()}): "${transcript || "(no words recognised)"}" — ${formatLevelStats(stats)}` +
+      `Heard${device === undefined ? "" : ` on ${device.name}`} (${options.model()}): "${transcript || "(no words recognised)"}" — ${formatLevelStats(stats)}` +
         (transport?.maxMicGapMs !== undefined && transport.maxMicGapMs > 200 ? `; mic frames paused up to ${Math.round(transport.maxMicGapMs)} ms` : "") +
         (problems ? `; ${problems}` : "") + ` — ${wav}`
     )

@@ -1,5 +1,7 @@
 "use client"
 import type { ModuleInfo } from "@pva/protocol"
+import { formatSettingsHash } from "@/lib/settingsTree.ts"
+import { shallowEqual } from "@/lib/store.ts"
 import { useClient, useClientState } from "../context.tsx"
 import { StatusLine } from "../StatusLine.tsx"
 import { Spinner } from "../ui/Icon.tsx"
@@ -81,6 +83,54 @@ export function ModuleTools({ module: m }: { readonly module: ModuleInfo }) {
           </li>
         ))}
       </ul>
+    </div>
+  )
+}
+
+/** The labels of the fields an instance's assistants have their own values for ("date format"). */
+const ownLabels = (m: ModuleInfo, keys: ReadonlyArray<string>): string =>
+  keys.map((k) => (m.settings.fields.find((f) => f.key === k)?.label ?? k).toLowerCase()).join(", ")
+
+/**
+ * A capability module's use (docs/ASSISTANTS.md §2.6, §7.1): whether it runs follows the assistants that have it on, so
+ * there is no switch. Each running instance is listed with the assistants that use it ("Shared settings", or "Own date
+ * format" for the assistants that have their own values), its state, status and error.
+ */
+export function ModuleInstances({ module: m }: { readonly module: ModuleInfo }) {
+  const names = useClientState((s) => Object.fromEntries(s.assistants.map((a) => [a.id, a.name])), shallowEqual)
+  const instances = m.instances ?? []
+  const nameOf = (id: string) => names[id] ?? id
+  return (
+    <div className="flex flex-col gap-2" data-testid={`module-${m.id}`} data-state={m.state}>
+      {instances.length === 0 ? (
+        <p className="text-[13px] text-ink-muted" data-testid="no-instances">Not running: no assistant has {m.name} switched on.</p>
+      ) : (
+        <ul className="flex flex-col gap-2" aria-label={`${m.name} instances`}>
+          {instances.map((inst, i) => {
+            const own = inst.own.length > 0
+            return (
+              <li key={i} className="flex flex-col gap-1 rounded-md border border-line/70 px-3 py-2" data-testid="instance" data-state={inst.state} data-own={own ? "true" : "false"}>
+                <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5 text-[13px]">
+                  <span className={cx("inline-block size-2 shrink-0 self-center rounded-full", inst.state === "error" ? "bg-danger" : inst.state === "starting" ? "bg-warn" : "bg-ok")} aria-hidden="true" />
+                  <span className="font-medium text-ink">{inst.state === "error" ? "Could not start" : inst.state === "starting" ? "Starting…" : "Running"}</span>
+                  <span className="text-ink-muted">
+                    {own ? <>Own {ownLabels(m, inst.own)}</> : "Shared settings"}
+                    {" · "}
+                    {inst.assistants.map((id, j) => (
+                      <span key={id}>
+                        {j > 0 && ", "}
+                        <a href={formatSettingsHash(["assistants", id, "modules"])} className="text-voice underline-offset-4 hover:underline">{nameOf(id)}</a>
+                      </span>
+                    ))}
+                  </span>
+                </div>
+                {inst.status !== undefined && inst.state === "running" && <span className="flex"><StatusLine status={inst.status} /></span>}
+                {inst.state === "error" && inst.error !== undefined && <p role="alert" className="text-[13px] text-danger" data-testid="instance-error">{inst.error}</p>}
+              </li>
+            )
+          })}
+        </ul>
+      )}
     </div>
   )
 }

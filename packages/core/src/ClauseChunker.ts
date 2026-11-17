@@ -1,5 +1,4 @@
 import { Stream } from "effect"
-import { isUnfinishedMarker, leadingMarkerLength } from "./VoiceMarkers.ts"
 
 export interface ClauseChunkerOptions {
   /** Minimum clause length before a `,` ends the first clause. Default 12. */
@@ -50,11 +49,10 @@ export const chunkClauses = (options: ClauseChunkerOptions = {}) => {
       } else if (c === ",") {
         if (i + 1 >= buffer.length) break
         if (isSpace(buffer[i + 1])) {
-          const length = i + 1 - start - leadingMarkerLength(buffer.slice(start, i + 1))
+          const length = i + 1 - start
           if (length >= (emitted === 0 ? firstMin : min)) cut = i + 1
         }
       }
-      if (cut >= 0 && isUnfinishedMarker(buffer.slice(start, cut))) cut = -1
       if (cut >= 0) {
         const clause = buffer.slice(start, cut).trim()
         if (clause.length > 0) {

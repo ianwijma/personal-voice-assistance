@@ -18,8 +18,19 @@
 //   replaces the turn's text instead of being appended to it.
 // - hybrid: offline as above, plus an online stream per turn for live words only.
 //
+// Sessions: several voice sessions can be open at once (docs/VOICE-SESSIONS.md §3), also of several hearers with
+// different microphone settings (docs/ASSISTANTS.md §3.2). The model is loaded once and shared; each session has
+// its own VAD with its own threshold (the one loaded below serves the first with the default threshold; more are
+// created only when more sessions are open at once), AGC with its own options, pre-roll and turn state. Whole-turn
+// decodes of every session go through one queue.
+//
 // Protocol (every message carries the session id; the main thread ignores stale ones):
-//   in : { type: "reset", session }                 new session: clear all state
+//   in : { type: "open", session, options? }         a new session with fresh state (others keep running);
+//                                                    `options` (per stream, docs/ASSISTANTS.md §3.2): { vadThreshold,
+//                                                    agc: false | AgcOptions, prerollMs }; absent = the worker's
+//                                                    configuration
+//        { type: "end", session }                   the session is over: its state and queued decodes are dropped
+//        { type: "reset", session }                 one session only: end every open session, open this one
 //        { type: "audio", session, buffer }          s16le mono 16 kHz, any length (transferred)
 //        { type: "finalize", session, frame, through? }
 //                                                    finalise unless speech came after `frame`; with `through`,
@@ -110,10 +121,10 @@ const offlineRecognizer = (offline) => {
 const online = config.streaming ? onlineRecognizer(config.streaming) : undefined
 const offline = config.offline ? offlineRecognizer(config.offline) : undefined
 
-const vad = new sherpa.Vad({
+const makeVad = (threshold = config.vad.threshold) => new sherpa.Vad({
   sileroVad: {
     model: config.vad.file,
-    threshold: config.vad.threshold,
+    threshold,
     // Near-raw decisions; all timing (minimum speech, silence thresholds) lives in the TurnDetector.
     minSpeechDuration: 0.01,
     minSilenceDuration: 0.01,
@@ -123,8 +134,8 @@ const vad = new sherpa.Vad({
   numThreads: 1,
   debug: false
 }, 60)
-
-const agc = config.agc ? makeAgc(config.agc) : undefined
+// The first session's VAD, loaded with the model; later concurrent sessions get their own (`makeVad`).
+const vad = makeVad()
 
 // Warm up: the first decodes are much slower than the rest.
 if (online) {
@@ -141,7 +152,17 @@ if (offline) {
   }
 }
 
-const core = makeRecognizerCore({ config, online, offline, vad, agc, post, collect })
+const core = makeRecognizerCore({
+  config,
+  online,
+  offline,
+  vad,
+  makeVad,
+  // Per session: a session may ask for gain control (with its own options) even when the worker's default has none.
+  makeAgc: (options) => makeAgc(options),
+  post,
+  collect
+})
 parentPort.on("message", (message) => core.onMessage(message))
 
 post({ type: "ready", loadMs: performance.now() - t0 })

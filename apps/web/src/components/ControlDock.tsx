@@ -3,12 +3,13 @@ import { useEffect, useRef } from "react"
 import { currentMicRms } from "@/lib/audio/levels.ts"
 import { shallowEqual } from "@/lib/store.ts"
 import { useClient, useClientState } from "./context.tsx"
+import { DockOverflow } from "./NewConversation.tsx"
 import { Icon } from "./ui/Icon.tsx"
 import { cx } from "./ui/controls.tsx"
 
 const round = "inline-flex size-14 items-center justify-center rounded-full border transition-[background-color,border-color,color,opacity] duration-[120ms] ease-out disabled:cursor-not-allowed disabled:opacity-40 sm:size-12"
 
-/** Mic (mute), Stop and Chat, centred at the bottom of the stage. */
+/** Mic (mute), Stop and Chat, centred at the bottom of the stage; on a phone also More (New conversation). */
 export function ControlDock() {
   const client = useClient()
   const v = useClientState(
@@ -73,6 +74,7 @@ export function ControlDock() {
           <Icon name="chat" />
           {v.unread && !v.chatOpen && <span data-testid="unread-dot" className="absolute right-3 top-3 size-2 rounded-full bg-voice ring-2 ring-surface sm:right-2.5 sm:top-2.5" />}
         </button>
+        <DockOverflow className="sm:hidden" />
       </div>
     </div>
   )

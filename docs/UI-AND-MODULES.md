@@ -1,5 +1,10 @@
 # Web UI, modules and the browser protocol
 
+> **Changed 2026-11-16 (docs/VOICE-PROVIDERS.md):** the assistant speaks every reply with one voice
+> (`ASSISTANT_VOICE`); the voice router, `[voice:NAME]` markers, `VOICES` and `DEFAULT_VOICE` are gone, and a device
+> profile's `voice` no longer changes the voice (it falls back to `""`, the assistant's voice). Where this document
+> describes per-device voices or the router, that is the design as it was.
+
 Design for the next stage: a browser UI that is also the microphone and speaker, a module system that can be changed while the assistant runs, and the protocol between them. Written 2026-11-13. `docs/ARCHITECTURE.md` remains the contract for everything that already exists; this document adds to it.
 
 ## Changes since the design
@@ -112,7 +117,7 @@ save may now be answered with warnings first (a v2 page could not confirm them) 
 | Sections and modules carry their **placement** (`SettingsSection.group/page/order/visibleWhen`, `ModuleInfo.kind/group`); the server splits the old five sections into the pages of docs/SETTINGS-UI.md §2.1 (`sectionDefinitions.ts`). | Protocol, server | Modules and agents from the catalog appear without UI changes. |
 | Assistant settings are **stored flat by key**: `settings.json` version 2 (`assistant: { KEY: value }`), the vault and `secrets.json` the same (`assistant`); a version-1 file is migrated at load, collision-safe, with `settings.json.v1-backup`. §1.6. | Server (`SettingsStore.ts`, `flatten.ts`, `Vault.ts`) | A field can move between pages without losing its value. |
 | Field `visibleWhen` (judged on the draft in the UI, on the saved values on the server; hidden fields are neither validated nor saved), field `source` (`default` / `saved` / `env-file` / `env-process`, with Reset), option `tags` / `implication` / `module`, form `warnings`, `ErrorInfo.warnings` + `settings.update.confirmWarnings` ("Save anyway"), section cross-field checks, `EngineStatus.reloadPendingFor`, `VaultInfo.lockReason`. | Protocol, core (`Settings.ts`), server | §1.7. |
-| Protected sections are marked in their definition: `language-model`, `stt-engine`, `voice-engines`, plus any with a secret. | Server (`access.ts`) | Same rule, new ids. |
+| Protected sections are marked in their definition: `language-model`, `stt-engine`, `voice-providers` (was `voice-engines`), plus any with a secret. | Server (`access.ts`) | Same rule, new ids. |
 
 **Settings from outside and model downloads (2026-11-14, phase 2b: P4 and P7 of docs/SETTINGS-UI.md)**: **protocol 4**
 (new messages, new closed literal sets). What changed:
@@ -150,7 +155,7 @@ Where this design relies on the browser-audio research, which was **never run**,
 | Process | `pnpm start serve`: one Node process, one port (default `127.0.0.1:8787`): static UI + WebSocket at `/ws` | One thing to run; the UI ships with the server, so versions always match |
 | Transport | One WebSocket. Text frames = JSON messages (Effect Schema). Binary frames = PCM with an 8-byte header | Ordered, simple, no copy on the audio path |
 | Browser audio | The browser is an `AudioInput`/`AudioOutput` backend (`packages/audio-web`). `Conversation` gains playback reports so history records what was heard | Keeps the pipeline unchanged; browser playback is not pull-paced |
-| Several tabs | Any number may connect (max 8). Exactly one is the **audio owner** (mic + speaker); others are **observers** that see everything and play nothing. Ownership is claimed by pressing Start; the last claim wins | Personal assistant; moving from laptop to phone must be one tap |
+| Several tabs | Any number may connect (max 24 since protocol 6). Exactly one is the **audio owner** (mic + speaker); others are **observers** that see everything and play nothing. Ownership is claimed by pressing Start; the last claim wins. **Superseded by docs/VOICE-SESSIONS.md (protocol 6): ownership is per device, every device has its own session and conversation, several devices talk at once.** | Personal assistant; moving from laptop to phone must be one tap |
 | Module | `defineModule({ id, name, description, settings, start })`: contributes tools, context providers, prompt instructions and a status line. One file + one line in the catalog | Same "one file plus one line" rule, now with settings and lifecycle |
 | Settings | Declared with a closed set of field types (`text`, `secret`, `number`, `boolean`, `choice`, `multichoice`); the UI renders forms from the descriptions | No front-end change to add a module or a setting |
 | UI contributions from modules | **Data only**: a one-line status. No module code or markup in the browser | Keeps modules server-only; cards are deferred (see §1.9) |
@@ -397,7 +402,7 @@ Secrets: in the **key vault** once the owner has set a password (below); before 
   - Setup (`vault.setup`, ≥ 8 characters) imports `secrets.json` and deletes it; an unlock does the same if the file came back (the vault's values win). Change password re-encrypts with a new salt. Lock forgets key and secrets (running engines keep what they started with). Forgotten password: delete the file; the keys are lost.
   - Unlock attempts (also wrong old passwords): after 5 failures in a row refused for 30 s, then the wait doubles (at most an hour). Server-wide, not per connection.
   - Environment still wins (`source: env`); the UI labels such keys "set in .env (not protected)" and the server logs their names at start.
-  - **Admin access** is per connection (`SessionHub`): granted by a successful `vault.setup`, `vault.unlock` or `vault.changePassword` on that connection; ends on disconnect, `vault.lock` (from any admin page: it locks the vault for everyone) or 15 minutes without an admin action. **Protected** (`access.ts`): a section or module with a secret field, the sections that choose providers (`language-model`, `stt-engine`, `voice-engines`; `protected` in `sectionDefinitions.ts`), every agent module. Changes to protected items from other connections are answered `locked`. `PVA_VAULT_PASSWORD` never grants admin access.
+  - **Admin access** is per connection (`SessionHub`): granted by a successful `vault.setup`, `vault.unlock` or `vault.changePassword` on that connection; ends on disconnect, `vault.lock` (from any admin page: it locks the vault for everyone) or 15 minutes without an admin action. **Protected** (`access.ts`): a section or module with a secret field, the sections that choose providers (`language-model`, `stt-engine`, `voice-providers`; `protected` in `sectionDefinitions.ts`), every agent module. Changes to protected items from other connections are answered `locked`. `PVA_VAULT_PASSWORD` never grants admin access.
 - **Environment wins** over both files, everywhere. Consequence for `.env.example`: it currently sets many defaults uncommented (`STT_SHERPA_FINAL_SILENCE_MS=600`, `VOICES=standard`, …); copied as is, they would lock those fields in the UI. The server work must comment out every line whose value equals the default, keeping the explanations.
 
 ### 1.7 Voices, engines and turn detection: assistant settings sections
@@ -425,12 +430,12 @@ settings screen (`group`, `page`, `order`) and may have cross-field **checks** (
 | `stt-mic` (› Microphone processing; with sherpa) | `STT_SHERPA_AGC`, `STT_SHERPA_VAD_THRESHOLD`; advanced `_AGC_MAX_GAIN_DB` | | reload | |
 | `stt-deepgram` (› Deepgram; with deepgram) | `DEEPGRAM_API_KEY`, `DEEPGRAM_EOT_THRESHOLD`, `DEEPGRAM_EAGER_EOT_THRESHOLD`; advanced `_EOT_TIMEOUT_MS` | | reload | Check: eager ≥ final → error |
 | `voices` (Voices › Voices) | `DEFAULT_VOICE` (**live**), `VOICES` | choice, multichoice | live; reload | Check: a Cartesia voice without key → warning |
-| `voice-engines` (Voices › Voice engines) | `TTS_PROVIDER`, `CARTESIA_API_KEY` | choice, secret | reload | Check: Cartesia without key → warning |
+| `voice-providers` (Voices › Voice providers; was `voice-engines`, Voice engines) | `CARTESIA_API_KEY`, `ELEVENLABS_API_KEY` | secret | reload | Since 2026-11-16 (docs/VOICE-PROVIDERS.md): `TTS_PROVIDER` is gone; the voice's provider follows from `ASSISTANT_VOICE` |
 | `recordings` (Diagnostics › Recordings) | `RECORD_HEARD_AUDIO`; advanced `_MAX_FILES` | | live | |
 | not in the UI yet | `VOICE_<NAME>_*`, thread counts, URLs, model folders | | | Environment only (pieces P4/H) |
 | **per device, in the browser** | interrupt mode, microphone, speaker, output path, prebuffer, captions, latency readout | | live | `localStorage`; not server settings, because they depend on the device (headphones on the laptop, speakers on the phone) |
 
-**Reload** (`engine.reload`): interrupt the running turn (committed as interrupted, as with barge-in), stop the voice loop, close the engine scope (engine processes, STT worker, sockets), rebuild providers with the saved settings, start a new `Conversation` with the previous history (`initialHistory`, §4.3) and a new voice loop. The HTTP server, the sockets, the module host and the audio owner are untouched. About 2 s with local models. The old engines are closed **before** the new ones are built (two STT models would not fit comfortably in memory). If the build fails, the engine state is `failed` with the same per-stage problem lines as the CLI startup error; the UI shows them and settings stay editable, so the owner can fix the key and reload again. After saving a `reload` field, `EngineStatus.reloadPending` is true until a reload succeeds.
+**Reload** (`engine.reload`): interrupt every voice session's running turn (committed as interrupted, as with barge-in), stop every session's voice loop, close the engine scope (engine processes, STT worker, sockets), rebuild providers with the saved settings, and start every session's loop again with a new `Conversation` carrying that session's history and conversation id (`initialHistory`, `initialConversationId`, §4.3). The HTTP server, the sockets, the module host, the voice sessions and their audio owners are untouched. About 2 s with local models. The old engines are closed **before** the new ones are built (two STT models would not fit comfortably in memory). If the build fails, the engine state is `failed` with the same per-stage problem lines as the CLI startup error; the UI shows them and settings stay editable, so the owner can fix the key and reload again. After saving a `reload` field, `EngineStatus.reloadPending` is true until a reload succeeds.
 
 Making turn-detection thresholds live is a later, small change (the sherpa `TurnDetector` runs on the main thread): deferred.
 
@@ -463,11 +468,12 @@ Source of truth: `packages/protocol/src/*.ts`. This section explains the behavio
 - **Host check** (DNS rebinding: a page on an attacker's host name that resolves to the assistant would otherwise pass the origin check, since its origin and the `Host` it sends are the same name): every request and upgrade whose `Host` is not an IP address, `localhost`, a host of `SERVE_ALLOWED_ORIGINS` or a name in `SERVE_ALLOWED_HOSTS` is refused with HTTP 403.
 - **Handshake**: the client's first message is `hello { protocol, clientId, resumeOwner }`. Nothing else (text or binary) is accepted before it; no `hello` within 5 s → close `4401`. If `protocol !== PROTOCOL_VERSION`, the server sends `error` (`bad_message`, "This page is out of date; reload it") and closes with `4400`; the client stops reconnecting and shows "Reload". Otherwise the server answers `welcome { protocol, server, connectionId, snapshot }`.
 - `clientId`: random, created per page load and kept in `sessionStorage` (survives reloads of that tab, not shared between tabs).
-- **Roles**: every connection starts as `observer` (it receives every message except reply audio, and its microphone frames are ignored), except a reconnect with `resumeOwner: true` from the `clientId` that was the last owner, when no other tab has claimed the audio since; that connection becomes `owner` again (`session` reason `resumed`).
-- **Claim** (`audio.claim`, sent after the Start gesture succeeded): the sender becomes the owner. A previous owner gets `reply.stop` for any reply it is playing, then `session { role: "observer", reason: "taken_over" }`, and its turn in flight is interrupted (§2.5). Every tab gets `session` with `ownerPresent: true`.
-- **Release** (`audio.release`) or owner disconnect: no owner; every tab gets `session { ownerPresent: false }` (`released` / `owner_disconnected`).
-- **Second tab, in short**: it connects as an observer and shows "Audio is on another tab or device · Use this tab". Pressing it claims the audio.
-- **Limits**: 8 connections (the 9th is closed with `4429`). A connection whose send buffer exceeds 1 MiB (observers) or 8 MiB (owner) is closed with `4408` and will reconnect for a fresh snapshot.
+- **Voice sessions** (protocol 6, docs/VOICE-SESSIONS.md): every voice device has its own session (audio pipeline, state, conversation), keyed by `hello.device.id` (shared by every tab of one browser), else by the connection's `clientId`. It is created at the device's first `audio.claim` or `text.send`; one more than `MAX_VOICE_SESSIONS` (default 4) takes the place of the least recently active session whose device has no connection left, and is refused with error `sessions_full` only when every session's device is connected. A session's messages (`state`, `transcript`, `turn.*`, `assistant.*`, `tool.*`, `reply.*`, `wake`, `conversation`, errors about its turns) go only to its device's connections; the snapshot (`history`, `state`, `ownerPresent`, `conversation`) is the device's. Admin connections have no session (they type nothing and own no audio) and get `sessions` instead, and `trace { key, deviceId?, trace }` for every finished turn of every session (Diagnostics › Latency: one row per turn, the device's name under the turn number). Everything below about roles is **per device**: a claim on another device takes nothing from this one.
+- **Roles**: every connection starts as `observer` of its device's session (it receives every message of that session except reply audio, and its microphone frames are ignored), except a reconnect with `resumeOwner: true` from the `clientId` that was the device's last owner, when no other tab of that device has claimed the audio since; that connection becomes `owner` again (`session` reason `resumed`).
+- **Claim** (`audio.claim`, sent after the Start gesture succeeded): the sender becomes the owner of its device's session. A previous owner on the same device gets `reply.stop` for any reply it is playing, then `session { role: "observer", reason: "taken_over" }`, and its turn in flight is interrupted (§2.5). Every tab of the device gets `session` with `ownerPresent: true`.
+- **Release** (`audio.release`) or owner disconnect: no owner on that device; its tabs get `session { ownerPresent: false }` (`released` / `owner_disconnected`).
+- **Second tab, in short**: a second tab of the same device connects as an observer and shows "Audio is on another tab · Use this tab". Pressing it claims the audio. A second device has its own session and simply presses Start.
+- **Limits**: 24 connections (the 25th is closed with `4429`). A connection whose send buffer exceeds 1 MiB (observers) or 8 MiB (owner) is closed with `4408` and will reconnect for a fresh snapshot.
 - **Liveness**: the server sends a WebSocket ping every 15 s and terminates a connection with no pong for 30 s (browsers answer pings themselves, unaffected by background-tab timer throttling). The client sends `ping { id }` every 5 s and treats the socket as dead if no `pong` arrives within 10 s (close and reconnect).
 - **Close codes**: `CloseCode` in `constants.ts`.
 
@@ -764,7 +770,7 @@ Components: buttons are 40 px (56 px round dock buttons on phones, 48 px on desk
 
 ### 3.3 The visualiser
 
-A `<canvas>` drawn on `requestAnimationFrame`, outside React. It reads a plain mutable object (`levels`, below) and the current visual state; React never re-renders per frame.
+A `<canvas>` drawn on `requestAnimationFrame`, outside React, by the **character host** (`apps/web/src/characters/host.ts`): it runs one *character*, a pluggable drawing module, and hands it each frame the visual state (as a mode), both voices' features, the theme colours and the viewer's settings. What a character is, how the host resolves modes, loads characters, validates their options and isolates failures, and how to add one: `docs/CHARACTERS.md`. The default character, and the fallback whenever another fails, is the **sine lines** described below (`characters/library/sine-lines.ts`), which draws every visual state of this section. The host reads a plain mutable object (`levels`, below) and the current visual state; React never re-renders per frame. The choice of character is a per-browser preference with no visible UI yet (`?character=<id>` on the voice page; docs/CHARACTERS.md §4.4).
 
 **Shape.** Three superimposed lines across the canvas width `W`, centred at `y0 = H/2`, sampled every 2 CSS px:
 
@@ -794,11 +800,11 @@ Drawn with the device pixel ratio for crisp lines; per-frame work under 2 ms (on
 | listening | server state `listening` | `you` 85 % | owner: `micRms · 4` | 2 px | [0.6, 0.9, 1.3] | [1, 0.6, 0.35] | Breathing: global opacity 0.75 ↔ 1 over 4 s |
 | idle | otherwise (observer, nobody owns the audio) | `ink-faint` | 0 | 1 px | [0.3, 0.4, 0.5] | [1, 0.5, 0.3] | — |
 
-- **Drivers**: microphone level comes from the 20 ms PCM frames the capture worklet already produces (RMS of each frame, on the main thread), so the line reacts to your voice with no network delay; in `listening` it already moves a little, in `hearing` fully. Output level and bands come from an `AnalyserNode` (fftSize 1024) on the player node, read once per frame: `outRms` from the time-domain data, band energies low 80–300 Hz, mid 300–1500 Hz, high 1500–4000 Hz, normalised to their sum and smoothed (τ 120 ms) into weights `a = [0.5 + 0.5·low, 0.3 + 0.7·mid, 0.2 + 0.8·high]`.
+- **Drivers**: the host computes both voices' features with the feature extractor (`characters/features.ts`) once per frame. The person: the 20 ms PCM frames the capture worklet already produces are copied into a ring buffer (`levels.mic`, on the main thread, as they arrive); the host analyses the latest 40 ms, so the line reacts to your voice with no network delay; in `listening` it already moves a little, in `hearing` fully. The assistant: the time-domain data of an `AnalyserNode` (fftSize 2048, 43 ms at 48 kHz) on the player node. Only the side that is on gets audio (the person in listening and hearing, the assistant in speaking); the other decays to silence. The sine lines use `micRms` / `outRms` as the window RMS (`rms`) and the extractor's `low`, `mid`, `high` raised to the 4th power as energy shares for the weights `a = [0.5 + 0.5·low, 0.3 + 0.7·mid, 0.2 + 0.8·high]` (smoothed, τ 120 ms). An observer tab (no audio) gets stand-in features from smooth pseudo-noise, scaled so the levels are the observer levels of the table.
 - **Transitions**: colour crossfades over 240 ms (draw the old and new colour with complementary alpha). On an interruption (`turn.end` interrupted, or local Stop), the falling time constant drops to 60 ms so the amber line collapses quickly, then mint takes over.
 - **Label** under the line: mono 12 px upper case: `LISTENING`, `HEARING YOU`, `THINKING`, `SPEAKING · <voice>` (voice name shown when more than one voice is enabled), `MIC OFF`, `RECONNECTING · n`, `NOT CONNECTED`. It is an `aria-live="polite"` region (the only announcement of state changes).
 - **Captions** (on by default; per-device toggle): under the label, centred, at most two lines. In `hearing`: the interim transcript in `you`. In `speaking`: the clause that is playing in `ink`, the next one in `ink-muted`. They fade out 2 s after the state ends.
-- **Reduced motion** (`prefers-reduced-motion: reduce`): `ω = 0`, no breathing, no sweep, no glow; the amplitude still follows the level but is quantised to 4 steps and smoothed with τ = 150 ms, and colour changes are instant. The label carries the state.
+- **Reduced motion** (`prefers-reduced-motion: reduce`): `ω = 0`, no breathing, no sweep, no glow; the shape is held: the amplitude still follows the level, quantised to 4 steps, and the line weights still follow the spectrum, but both step to the current values only on a mode change and then at most once a second, with no gliding in between (sine-lines 1.1.1); colour changes are instant. The label carries the state.
 
 ### 3.4 Starting
 
@@ -930,8 +936,16 @@ apps/web/
     state.ts                ClientState, initial state, reducer(state, ServerMessage | LocalAction): pure, tested
     connection.ts           the Effect connection program (below); send(), request()
     audio/VoiceAudio.ts     AudioContext, capture and player graphs, devices, analysers (from the research)
-    audio/levels.ts         the mutable levels object written by audio, read by the visualiser
-    prefs.ts                per-device preferences (localStorage)
+    audio/levels.ts         the mutable levels object written by audio (incl. a ring of microphone samples), read by the host
+    prefs.ts                per-browser preferences (localStorage), incl. the stage's character choice
+  src/characters/           the stage's characters (docs/CHARACTERS.md; apps/web/src/characters/README.md):
+    contract.ts             the contract between host and character
+    host.ts                 the character host: loop, voices, loading, mode resolution, fallback (replaces visualiser.ts)
+    runner.ts, voices.ts    building one frame; both voices' features (extractor or observer stand-ins)
+    features.ts, kit.ts, options.ts, manifest.ts, choice.ts, registry.ts
+    shared/                 helpers shared by families of characters (figure, light, matter)
+    library/<id>.ts         one character per file; sine-lines.ts is the baseline
+  scripts/build-characters.mjs  lists library/ into the git-ignored library.generated.ts (predev/prebuild/check/test)
   src/components/           App, TopBar, LatencyReadout, Stage, Visualiser, StateLabel, Captions, StartPrompt,
                             ObserverBanner, EngineBanner, ControlDock, ChatPanel, MessageList, AssistantMessage,
                             ToolChip, Composer, KeysPanel, fields/{Text,Secret,Number,Boolean,Choice,MultiChoice}Field,
@@ -1138,7 +1152,7 @@ Deliver:
 
 ## 7. Deliberately left out of this version
 
-- Login, multiple users, access from the internet. (Loopback by default; LAN access through a tunnel or TLS.)
+- Login, multiple users, access from the internet. (Several devices at once, each with its own conversation: docs/VOICE-SESSIONS.md.) (Loopback by default; LAN access through a tunnel or TLS.)
 - Starting a new conversation from the UI ("clear history"), editing or deleting messages, conversation persistence across restarts.
 - Module cards and other rich module output (§1.9), module-contributed UI code, hot-loading modules.
 - Live turn-detection thresholds; per-voice provider settings in the UI; a manual light/dark toggle.

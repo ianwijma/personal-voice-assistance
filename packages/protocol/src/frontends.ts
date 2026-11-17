@@ -119,6 +119,8 @@ export const PREBUFFER_MS_MAX = 500
 export const WAKE_ARMED_MS = 8_000
 /** The admin phrase tester (`wake.test`) switches itself off after this long. */
 export const WAKE_TEST_MAX_MS = 300_000
+/** `conversationIdleMinutes` bounds (docs/VOICE-SESSIONS.md §4); the built-in default is the setting's default. */
+export const CONVERSATION_IDLE_MINUTES_LIMITS = { min: 0, max: 240, default: 10 } as const
 /** Longest voice name in a profile. */
 export const MAX_VOICE_NAME_CHARS = 64
 
@@ -126,6 +128,13 @@ export const MAX_VOICE_NAME_CHARS = 64
 export const FollowUpSeconds = Schema.Int.check(Schema.isBetween({ minimum: FOLLOW_UP_SECONDS_MIN, maximum: FOLLOW_UP_SECONDS_MAX }))
 /** Reply audio buffered by the browser before playback starts, 20..500 ms. */
 export const PrebufferMs = Schema.Int.check(Schema.isBetween({ minimum: PREBUFFER_MS_MIN, maximum: PREBUFFER_MS_MAX }))
+/**
+ * Minutes without a committed turn after which the next turn starts a new conversation (protocol 6); 0 = never.
+ * Whole minutes, 0..240.
+ */
+export const ConversationIdleMinutes = Schema.Int.check(
+  Schema.isBetween({ minimum: CONVERSATION_IDLE_MINUTES_LIMITS.min, maximum: CONVERSATION_IDLE_MINUTES_LIMITS.max })
+)
 /** `""` = the assistant's default voice; else the name of an enabled voice (the server falls back to `""` otherwise). */
 export const ProfileVoice = Schema.String.check(Schema.isMaxLength(MAX_VOICE_NAME_CHARS))
 
@@ -143,6 +152,11 @@ export const DeviceProfile = Schema.Struct({
   voice: ProfileVoice,
   /** Server: the echo gate's mode while this device owns the audio (it used to come in `audio.claim`). */
   interruptMode: InterruptMode,
+  /**
+   * Server (protocol 6): the device's conversation starts afresh at the next turn after this many minutes without a
+   * committed turn; 0 = never. The kind default comes from the assistant setting `CONVERSATION_IDLE_MINUTES`.
+   */
+  conversationIdleMinutes: ConversationIdleMinutes,
   /** Browser: show captions of the reply on the stage. */
   captions: Schema.Boolean,
   /** Browser: speak replies to typed messages (`text.send.speak`). */
@@ -166,6 +180,7 @@ export const ProfileField = Schema.Literals([
   "followUpSeconds",
   "voice",
   "interruptMode",
+  "conversationIdleMinutes",
   "captions",
   "speakReplies",
   "echoCancellation",
@@ -179,9 +194,6 @@ export type ProfileField = typeof ProfileField.Type
 /** Every profile field, in form order. */
 export const PROFILE_FIELDS: ReadonlyArray<ProfileField> = ProfileField.literals
 
-/** The fields a device may change for itself without admin (`device.update`). Everything else is admin only. */
-export const DEVICE_EDITABLE_FIELDS: ReadonlyArray<ProfileField> = ["voice", "activation", "followUpSeconds"]
-
 /** Built-in defaults: equal to the browser defaults before protocol 5, with `activation: always`. */
 export const DEFAULT_DEVICE_PROFILE: DeviceProfile = {
   activation: "always",
@@ -190,6 +202,7 @@ export const DEFAULT_DEVICE_PROFILE: DeviceProfile = {
   followUpSeconds: 8,
   voice: "",
   interruptMode: "confirm",
+  conversationIdleMinutes: CONVERSATION_IDLE_MINUTES_LIMITS.default,
   captions: true,
   speakReplies: true,
   echoCancellation: true,
@@ -210,6 +223,7 @@ export const ProfileOverrides = Schema.Struct({
   followUpSeconds: Schema.optionalKey(FollowUpSeconds),
   voice: Schema.optionalKey(ProfileVoice),
   interruptMode: Schema.optionalKey(InterruptMode),
+  conversationIdleMinutes: Schema.optionalKey(ConversationIdleMinutes),
   captions: Schema.optionalKey(Schema.Boolean),
   speakReplies: Schema.optionalKey(Schema.Boolean),
   echoCancellation: Schema.optionalKey(Schema.Boolean),
@@ -219,42 +233,6 @@ export const ProfileOverrides = Schema.Struct({
   prebufferMs: Schema.optionalKey(PrebufferMs)
 })
 export type ProfileOverrides = typeof ProfileOverrides.Type
-
-/**
- * A change to overrides: only the fields named change. A value sets the override; `null` removes it (the field
- * inherits again, shown as "Default (…)" / "Reset" in admin). An empty patch is valid and changes nothing.
- */
-export const ProfilePatch = Schema.Struct({
-  activation: Schema.optionalKey(Schema.NullOr(Activation)),
-  wakePhrases: Schema.optionalKey(Schema.NullOr(WakePhrases)),
-  wakeMatch: Schema.optionalKey(Schema.NullOr(WakeMatch)),
-  followUpSeconds: Schema.optionalKey(Schema.NullOr(FollowUpSeconds)),
-  voice: Schema.optionalKey(Schema.NullOr(ProfileVoice)),
-  interruptMode: Schema.optionalKey(Schema.NullOr(InterruptMode)),
-  captions: Schema.optionalKey(Schema.NullOr(Schema.Boolean)),
-  speakReplies: Schema.optionalKey(Schema.NullOr(Schema.Boolean)),
-  echoCancellation: Schema.optionalKey(Schema.NullOr(Schema.Boolean)),
-  noiseSuppression: Schema.optionalKey(Schema.NullOr(Schema.Boolean)),
-  autoGainControl: Schema.optionalKey(Schema.NullOr(Schema.Boolean)),
-  outputPath: Schema.optionalKey(Schema.NullOr(OutputPath)),
-  prebufferMs: Schema.optionalKey(Schema.NullOr(PrebufferMs))
-})
-export type ProfilePatch = typeof ProfilePatch.Type
-
-/** The fields a patch touches (sets or removes). The server refuses a `device.update` naming a field not editable. */
-export const patchFields = (patch: ProfilePatch): Array<ProfileField> =>
-  PROFILE_FIELDS.filter((f) => Object.hasOwn(patch, f))
-
-/** Apply a patch to overrides: a value sets, `null` removes, absent keeps. Returns a new object. */
-export const applyProfilePatch = (overrides: ProfileOverrides, patch: ProfilePatch): ProfileOverrides => {
-  const next: Record<string, unknown> = { ...overrides }
-  for (const field of patchFields(patch)) {
-    const value = (patch as Record<string, unknown>)[field]
-    if (value === null) delete next[field]
-    else next[field] = value
-  }
-  return next as ProfileOverrides
-}
 
 /** Effective profile: built-in defaults ← kind defaults ← device overrides. */
 export const effectiveProfile = (
@@ -272,34 +250,6 @@ export const DeviceHello = Schema.Struct({
 })
 export type DeviceHello = typeof DeviceHello.Type
 
-/**
- * A connection's effective profile (`snapshot.device`, `device.profile`). `editable`: the fields this connection
- * may change itself with `device.update` (`DEVICE_EDITABLE_FIELDS`, or none for a voice connection without a
- * device).
- */
-export const DeviceProfileInfo = Schema.Struct({
-  /** The device this profile belongs to; absent for a voice connection that sent no `device` (kind defaults). */
-  deviceId: Schema.optionalKey(DeviceId),
-  profile: DeviceProfile,
-  editable: Schema.Array(ProfileField)
-})
-export type DeviceProfileInfo = typeof DeviceProfileInfo.Type
-
-/** One front-end kind, for admin (Front ends › kind). */
-export const FrontendKindInfo = Schema.Struct({
-  id: FrontendKindId,
-  /** "Voice assistant in a browser". */
-  title: Schema.String,
-  description: Schema.String,
-  /** The profile fields that apply to this kind (the form shows only these), in form order. */
-  fields: Schema.Array(ProfileField),
-  /** The kind's defaults set by admin (stored in `data/settings.json` `frontends[kind]`). */
-  defaults: ProfileOverrides,
-  /** `DEFAULT_DEVICE_PROFILE` ← `defaults`: what a device of this kind without overrides gets. */
-  profile: DeviceProfile
-})
-export type FrontendKindInfo = typeof FrontendKindInfo.Type
-
 /** One remembered device, for admin (Devices). */
 export const DeviceInfo = Schema.Struct({
   id: DeviceId,
@@ -309,10 +259,6 @@ export const DeviceInfo = Schema.Struct({
   firstSeen: NonNegativeFinite,
   /** Epoch milliseconds of the last `hello` (or now, while connected). */
   lastSeen: NonNegativeFinite,
-  /** The device's own overrides over its kind's defaults (stored in `data/settings.json` `devices[id]`). */
-  overrides: ProfileOverrides,
-  /** The effective profile (kind defaults ← overrides). */
-  profile: DeviceProfile,
   /** Open voice connections of this device right now. */
   connections: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
   /** One of its connections owns the audio now ("this is the audio owner now"). */

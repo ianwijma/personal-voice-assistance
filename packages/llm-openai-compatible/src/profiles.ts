@@ -25,6 +25,15 @@ export interface ModelInfo {
   readonly reasoningEfforts?: ReadonlyArray<string>
   /** The model accepts a reasoning setting at all (OpenRouter's `supported_parameters` has `reasoning`). */
   readonly reasoning?: boolean
+  /** The context window, tokens, when the server says (OpenRouter's `context_length`). */
+  readonly contextTokens?: number
+  /**
+   * Price in US dollars per million tokens, when the server says (OpenRouter's `pricing.prompt` and
+   * `pricing.completion`, which are dollars per token as decimal strings).
+   */
+  readonly pricing?: { readonly inputPerMTok: number; readonly outputPerMTok: number }
+  /** One paragraph from the server (OpenRouter's `description`), at most 300 characters. */
+  readonly description?: string
 }
 
 export interface Profile {
@@ -73,13 +82,32 @@ const openRouterModel = (raw: Readonly<Record<string, unknown>>): ModelInfo | un
   const reasoning = isRecord(raw.reasoning) ? raw.reasoning : undefined
   if (reasoning?.mandatory === true) return undefined
   const efforts = strings(reasoning?.supported_efforts)
+  const context = typeof raw.context_length === "number" && Number.isFinite(raw.context_length) && raw.context_length > 0 ? Math.round(raw.context_length) : undefined
+  const pricing = isRecord(raw.pricing) ? perMillion(raw.pricing.prompt, raw.pricing.completion) : undefined
+  const description = typeof raw.description === "string" && raw.description.trim() !== "" ? clipText(raw.description.trim(), 300) : undefined
   return {
     id: base.id,
     label: typeof raw.name === "string" && raw.name.length > 0 ? raw.name : base.id,
     ...(efforts !== undefined ? { reasoningEfforts: efforts } : {}),
-    ...(params !== undefined ? { reasoning: params.includes("reasoning") || params.includes("reasoning_effort") } : {})
+    ...(params !== undefined ? { reasoning: params.includes("reasoning") || params.includes("reasoning_effort") } : {}),
+    ...(context !== undefined ? { contextTokens: context } : {}),
+    ...(pricing !== undefined ? { pricing } : {}),
+    ...(description !== undefined ? { description } : {})
   }
 }
+
+/** Dollars per token (a decimal string or number) → dollars per million tokens; `undefined` unless both are prices. */
+const perMillion = (input: unknown, output: unknown): ModelInfo["pricing"] => {
+  const price = (u: unknown) => {
+    const n = typeof u === "number" ? u : typeof u === "string" && u.trim() !== "" ? Number(u) : Number.NaN
+    return Number.isFinite(n) && n >= 0 ? Math.round(n * 1e6 * 1e4) / 1e4 : undefined
+  }
+  const i = price(input)
+  const o = price(output)
+  return i !== undefined && o !== undefined ? { inputPerMTok: i, outputPerMTok: o } : undefined
+}
+
+const clipText = (s: string, max: number) => ([...s].length <= max ? s : `${[...s].slice(0, max - 1).join("")}…`)
 
 export const profiles: Readonly<Record<ProfileId, Profile>> = {
   openrouter: {

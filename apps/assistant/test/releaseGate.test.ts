@@ -125,7 +125,9 @@ describe("release gate: startup (recovery and clean-up)", () => {
     ["recover-journal-remove", halfSaved, (dir) => expect(existsSync(join(dir, "transaction.json"))).toBe(false)],
     ["set-aside-file", (dir) => writeFileSync(join(dir, "settings.json"), "{corrupt"), () => {}],
     // A version-1 settings.json (per section) is rewritten flat by key at start: also under the lock.
-    ["migrate-settings", (dir) => writeFileSync(join(dir, "settings.json"), `${JSON.stringify({ version: 1, modules: {}, sections: { conversation: { SYSTEM_PROMPT: "x" } } })}\n`), () => {}]
+    ["migrate-settings", (dir) => writeFileSync(join(dir, "settings.json"), `${JSON.stringify({ version: 1, modules: {}, sections: { conversation: { SYSTEM_PROMPT: "x" } } })}\n`), () => {}],
+    // A version-3 settings.json is migrated to version 4 (assistants and devices) at start: also under the lock.
+    ["migrate-assistants", (dir) => writeFileSync(join(dir, "settings.json"), `${JSON.stringify({ version: 3, modules: {}, assistant: {}, frontends: {}, devices: {} })}\n`), () => {}]
   ]
 
   for (const [step, prepare, after] of cases) {
@@ -149,7 +151,9 @@ describe("release gate: startup (recovery and clean-up)", () => {
       const lock = yield* acquireDataDirLock(dir)
       return yield* loadSettingsStore(dir, { lock })
     })))
-    expect(readFileSync(join(dir, "settings.json"), "utf8")).toBe(prior.settings)
+    // The prior (version-2) settings were restored, then migrated to version 4 with the same revision.
+    expect(readFileSync(join(dir, "settings.json.v3-backup"), "utf8")).toBe(prior.settings)
+    expect(JSON.parse(readFileSync(join(dir, "settings.json"), "utf8"))).toMatchObject({ version: 4, revision: 1 })
     expect(readFileSync(join(dir, "secrets.json"), "utf8")).toBe(prior.secrets)
     expect(existsSync(join(dir, "transaction.json"))).toBe(false)
     expect(store.settings().modules.m?.settings?.greeting).toBe("hello")

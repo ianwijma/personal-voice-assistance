@@ -21,6 +21,10 @@ export interface RecognizerCore {
     readonly pendingDecodes: number
     readonly retainedStreamingFrames: number
     readonly pieces: number
+    /** Sessions open now. */
+    readonly sessions: number
+    /** Detectors kept for later sessions (at most a few, whatever thresholds were asked for). */
+    readonly idleVads: number
     readonly stats: RecognizerCoreStats
   }
 }
@@ -37,8 +41,17 @@ export declare const makeRecognizerCore: (deps: {
   config: unknown
   online?: unknown
   offline?: unknown
-  vad: unknown
+  /** The VAD of the first session (loaded and warm at startup); reused by later sessions when it is free. */
+  vad?: unknown
+  /**
+   * Creates a VAD for a session when every existing one with that threshold is in use (several sessions at once, or
+   * a session whose `open` asks for another threshold).
+   */
+  makeVad?: (threshold: number) => unknown
+  /** The AGC of the first session with the worker's default gain options (`config.agc`). */
   agc?: unknown
+  /** Creates an AGC with a session's options. Without it, sessions get no gain control. */
+  makeAgc?: (options: unknown) => unknown
   post: (message: any) => void
   collect?: () => void
   segmentLimits?: Partial<{ checkpointMs: number; pauseMs: number; hardCheckpointMs: number; overlapMs: number; keepMs: number; joinHoldMs: number }>

@@ -2,7 +2,8 @@ import { Context } from "effect"
 import type { Effect, Stream } from "effect"
 import type { LlmEvent, LlmRequest, SttEvent } from "./Domain.ts"
 import type { PlaybackObserver } from "./ConversationEvents.ts"
-import type { AudioError, LlmError, SttError, TtsError } from "./Errors.ts"
+import type { AudioError, LlmError, SttError, TtsError, VoiceCatalogError } from "./Errors.ts"
+import type { PreviewAudio, VoiceList } from "./VoiceRef.ts"
 
 /**
  * Microphone. Raw PCM s16le mono 16 kHz in ~20 ms `Uint8Array` chunks.
@@ -35,6 +36,12 @@ export class Stt extends Context.Service<Stt, {
 /** Language model. One request = one model call; the tool loop lives in `Conversation`. */
 export class Llm extends Context.Service<Llm, {
   stream(request: LlmRequest): Stream.Stream<LlmEvent, LlmError>
+  /**
+   * Optional: keep this instance alive for as long as `turn` runs, every model call of a tool loop and the gaps
+   * between them included (serve mode's resource pool releases an instance nobody uses only once no turn holds it).
+   * `makeModelAgent` runs each turn inside it. Absent: nothing to hold.
+   */
+  readonly holdDuring?: <A, E, R>(turn: Stream.Stream<A, E, R>) => Stream.Stream<A, E, R>
 }>()("@pva/core/Llm") {}
 
 /** A chunk of synthesised audio and the index of the input clause it belongs to. */
@@ -54,3 +61,14 @@ export class Tts extends Context.Service<Tts, {
   readonly sampleRate: number
   synthesize(clauses: Stream.Stream<string>): Stream.Stream<TtsAudio, TtsError>
 }>()("@pva/core/Tts") {}
+
+/**
+ * The voices of one text-to-speech provider (docs/VOICE-PROVIDERS.md §7.2): what it offers, and a preview of any of
+ * them. Separate from `Tts` (which speaks with one chosen voice), so a picker can browse a provider that no voice is
+ * built from. Interrupting either effect cancels the work (an HTTP request is aborted, a local engine stopped).
+ */
+export class TtsVoices extends Context.Service<TtsVoices, {
+  readonly list: Effect.Effect<VoiceList, VoiceCatalogError>
+  /** `voiceId` reads `text` (already limited by the caller). */
+  readonly preview: (voiceId: string, text: string) => Effect.Effect<PreviewAudio, VoiceCatalogError>
+}>()("@pva/core/TtsVoices") {}

@@ -1,10 +1,23 @@
 import { Setting, type SettingsCheck, type SettingsProblem, type SettingsSpec } from "@pva/core"
-import type { Condition, OptionTag, SettingsGroup, SettingsPage } from "@pva/protocol"
+import {
+  type Condition,
+  CONVERSATION_IDLE_MINUTES_LIMITS,
+  DEFAULT_CONVERSATION_IDLE_MINUTES,
+  DEFAULT_MAX_VOICE_SESSIONS,
+  DEFAULT_SESSION_DISCARD_MINUTES,
+  type OptionTag,
+  type SettingsGroup,
+  type SettingsPage
+} from "@pva/protocol"
 import * as SherpaStt from "@pva/stt-sherpa"
 import * as SherpaTts from "@pva/tts-sherpa"
 import { SUBSCRIPTION_AGENT_ID, SUBSCRIPTION_PROVIDER } from "../subscription.ts"
 import { defaultSystemPrompt } from "../config.ts"
-import { voiceCatalog } from "../voices.ts"
+import { parseVoiceKey, voiceKey } from "@pva/core"
+import { isTtsProvider, ttsProviderInfo } from "../providers.ts"
+import { checkUrl, defaults as jevDefaults } from "@pva/decide-typesafe"
+import { checkAccountAddress } from "@pva/llm-openai-compatible"
+import { ASSISTANT_VOICE, DEFAULT_ASSISTANT_VOICE } from "../voiceSelection.ts"
 
 /**
  * The assistant settings as the settings screen shows them (docs/SETTINGS-UI.md
@@ -99,30 +112,191 @@ const languagePresets = SherpaStt.presetNames.filter((name) => SherpaStt.takesLa
 const warn = (key: string, message: string): SettingsProblem => ({ level: "warning", key, message })
 const error = (key: string, message: string): SettingsProblem => ({ level: "error", key, message })
 
-/** The voice's engine: its declared provider, else the standard engine (`TTS_PROVIDER`). */
-const engineOfVoice = (name: string, ttsProvider: unknown) => voiceCatalog.find((v) => v.name === name)?.provider ?? String(ttsProvider ?? "sherpa")
+/** `ASSISTANT_VOICE`'s own check: a voice key of a known provider (empty = the earlier settings decide). */
+const checkVoiceKey = (value: string): string | undefined => {
+  const v = value.trim()
+  if (v === "") return undefined
+  const ref = parseVoiceKey(v)
+  if (ref === undefined) return "Must be a voice: provider:voice, e.g. sherpa:en_US-lessac-medium"
+  return isTtsProvider(ref.provider) ? undefined : `There is no voice provider "${ref.provider}"`
+}
+
+/** An IANA time zone this machine knows (empty = this machine's own). */
+const checkTimeZone = (zone: string): string | undefined => {
+  if (zone.trim() === "") return undefined
+  try {
+    new Intl.DateTimeFormat("en", { timeZone: zone.trim() })
+    return undefined
+  } catch {
+    return "Unknown time zone (use an IANA name such as Europe/Amsterdam)"
+  }
+}
+
+/**
+ * The shared `home` section (docs/ASSISTANTS.md §2.4, §7.3): every assistant's prompt gets a Home line from it, and
+ * the modules' linked defaults come from it (Weather place and units, Clock time zone and date format).
+ */
+export const homeSection: SectionDefinition = {
+  id: "home",
+  title: "Home",
+  group: "modules",
+  page: { id: "home", title: "Home", description: "Where the house is. Modules and every assistant's prompt use these." },
+  order: 5,
+  spec: {
+    HOME_LOCATION: Setting.text({
+      label: "Location",
+      description: "Town and country, e.g. \"Amsterdam, Netherlands\". Every assistant is told; the weather uses it when you name no place.",
+      env: "HOME_LOCATION",
+      placeholder: "Amsterdam, Netherlands",
+      maxLength: 200
+    }),
+    HOME_TIME_ZONE: Setting.text({
+      label: "Time zone",
+      description: "IANA name, e.g. Europe/Amsterdam. Empty: this machine's zone.",
+      env: "HOME_TIME_ZONE",
+      placeholder: Intl.DateTimeFormat().resolvedOptions().timeZone,
+      maxLength: 64,
+      check: checkTimeZone
+    }),
+    HOME_LANGUAGE: Setting.choice({
+      label: "Language",
+      description: "The household's language, told to every assistant.",
+      env: "HOME_LANGUAGE",
+      default: "en-GB",
+      options: [
+        { value: "en-GB", label: "English (United Kingdom)" },
+        { value: "en-US", label: "English (United States)" },
+        { value: "nl-NL", label: "Dutch (Netherlands)" },
+        { value: "de-DE", label: "German (Germany)" }
+      ]
+    }),
+    HOME_UNITS: Setting.choice({
+      label: "Units",
+      description: "The default of modules that measure (the weather), unless they or an assistant say otherwise.",
+      env: "HOME_UNITS",
+      default: "metric",
+      options: [{ value: "metric", label: "Metric (°C, km/h)" }, { value: "imperial", label: "Imperial (°F, mph)" }]
+    }),
+    HOME_DATE_FORMAT: Setting.choice({
+      label: "Date format",
+      description: "The default of modules that say dates (the clock), unless they or an assistant say otherwise.",
+      env: "HOME_DATE_FORMAT",
+      default: "en-GB",
+      options: [
+        { value: "en-GB", label: "13 November 2026" },
+        { value: "en-US", label: "November 13, 2026" },
+        { value: "nl-NL", label: "13 november 2026" }
+      ]
+    })
+  }
+}
+
+/**
+ * The shared `routing` section (WP-14). Off by default: sentences leave this machine only once the owner switches it
+ * on and adds a key, and only from devices set to "TypeSafe decides". Applied live (each decision reads it).
+ */
+const routingSection: SectionDefinition = {
+  id: "routing",
+  title: "TypeSafe",
+  description: "TypeSafe's Jev model picks which assistant on a device a sentence without a wake phrase is for, from each assistant's Handles line.",
+  group: "agents",
+  page: { id: "routing", title: "Routing", description: "Who a sentence is for, when no wake phrase was said. Used only on devices that let TypeSafe decide." },
+  order: 40,
+  protected: true,
+  spec: {
+    TYPESAFE_ROUTING: Setting.boolean({
+      label: "Let TypeSafe choose the assistant",
+      description: "Hosted and optional. What is sent: the sentence as text and the Handles line of each assistant on that device. " +
+        "A wake phrase always wins and skips TypeSafe; so does the next sentence within an assistant's follow-up time. " +
+        "It adds a delay before the reply starts, only for sentences without a phrase (see Diagnostics › Latency, Routing).",
+      env: "TYPESAFE_ROUTING",
+      default: false
+    }),
+    TYPESAFE_API_KEY: Setting.secret({
+      label: "TypeSafe API key",
+      description: "From console.typesafe.ai/keys. Kept in the vault. Without it, devices set to \"The one that fits\" answer nobody without a phrase.",
+      env: "TYPESAFE_API_KEY"
+    }),
+    TYPESAFE_MODEL: Setting.text({
+      label: "Model",
+      description: "A pinned version: the decision thresholds are tuned for one version, and jev-latest moves.",
+      env: "TYPESAFE_MODEL",
+      default: jevDefaults.model,
+      maxLength: 100,
+      check: (v) => (v.trim() === "" ? "Must not be empty" : undefined)
+    }),
+    TYPESAFE_BASE_URL: Setting.text({
+      label: "Server address",
+      description: "Any server that speaks /v1/systemone.",
+      env: "TYPESAFE_BASE_URL",
+      default: jevDefaults.baseUrl,
+      advanced: true,
+      check: checkUrl
+    })
+  },
+  checks: [
+    (v) =>
+      v.value("TYPESAFE_ROUTING") === true && !v.secretSet("TYPESAFE_API_KEY")
+        ? [warn("TYPESAFE_API_KEY", "TypeSafe is switched on but there is no API key: devices set to \"The one that fits\" answer nobody without a phrase until you add it.")]
+        : []
+  ]
+}
+
+/**
+ * The shared settings of the `openrouter` and `home-model` accounts (WP-13b, docs/ASSISTANTS.md §2.4 "Language model
+ * accounts"). The assistant's own fields (model, longest reply, give-up time, warm-up) are not here. Applied live: a
+ * changed key or address builds new instances in the resource pool (the key is part of an instance's identity).
+ */
+const openAiAccountsSection: SectionDefinition = {
+  id: "llm-openai-accounts",
+  title: "OpenRouter and home model",
+  description: "Language models over the OpenAI-compatible API: OpenRouter with your key, or a server on your own network.",
+  group: "agents",
+  page: { id: "openai-accounts", title: "OpenRouter and home model", description: "The OpenRouter key and the address of a model server on your network." },
+  order: 15,
+  protected: true,
+  spec: {
+    OPENROUTER_API_KEY: Setting.secret({
+      label: "OpenRouter API key",
+      description: "From openrouter.ai/keys. Kept in the vault. What you say is sent to OpenRouter and the model's provider.",
+      env: "OPENROUTER_API_KEY"
+    }),
+    OPENROUTER_SORT_BY_LATENCY: Setting.boolean({
+      label: "Prefer the fastest provider",
+      description: "Ask OpenRouter to route to the provider with the lowest latency for the model.",
+      env: "OPENROUTER_SORT_BY_LATENCY",
+      default: true,
+      advanced: true
+    }),
+    OPENROUTER_BASE_URL: Setting.text({
+      label: "OpenRouter address",
+      description: "Only for a proxy or gateway in front of OpenRouter. Empty: https://openrouter.ai/api/v1.",
+      env: "OPENROUTER_BASE_URL",
+      default: "",
+      placeholder: "https://openrouter.ai/api/v1",
+      advanced: true,
+      check: checkAccountAddress
+    }),
+    HOME_MODEL_BASE_URL: Setting.text({
+      label: "Home model server address",
+      description: "Ollama, llama.cpp, LM Studio, vLLM or any server with the OpenAI-compatible API. http://host:port is enough; /v1 is added. What you say stays on your network.",
+      env: "HOME_MODEL_BASE_URL",
+      default: "",
+      placeholder: "http://192.168.1.20:11434",
+      check: checkAccountAddress
+    }),
+    HOME_MODEL_API_KEY: Setting.secret({
+      label: "Home model API key",
+      description: "Only if the server was started with a key (llama.cpp --api-key, vLLM --api-key). Kept in the vault.",
+      env: "HOME_MODEL_API_KEY"
+    })
+  }
+}
 
 export const sectionDefinitions = (dirs: ModelDirs = defaultModelDirs): ReadonlyArray<SectionDefinition> => {
-  const voiceOptions = voiceCatalog.map((v) => {
-    const hosted = (v.provider ?? "sherpa") === "cartesia"
-    const kokoro = v.settings?.TTS_SHERPA_PRESET?.startsWith("kokoro") === true
-    const tags: Array<OptionTag> = hosted ? ["hosted", "needs-key"] : kokoro ? ["local", "slow-start"] : ["local"]
-    // A voice on this machine whose declared preset is not downloaded yet can be downloaded from the option.
-    const preset = hosted ? undefined : SherpaTts.presets[v.settings?.TTS_SHERPA_PRESET ?? SherpaTts.DEFAULT_PRESET]
-    const download = preset === undefined ? undefined : { tool: "tts-models" as const, target: preset.name, sizeMb: SherpaTts.sizeMb(preset) }
-    if (preset !== undefined && !SherpaTts.isInstalled(preset.name, dirs.tts)) tags.push("not-downloaded")
-    return {
-      value: v.name,
-      label: v.name,
-      description: v.description,
-      tags,
-      ...(download !== undefined ? { download } : {}),
-      ...(hosted ? { implication: "Replies in this voice are sent to Cartesia to be spoken." } : {}),
-      ...(kokoro ? { implication: "Its first audio takes about 0.2–0.9 s longer than the standard voice." } : {})
-    }
-  })
-
   return [
+    homeSection,
+    openAiAccountsSection,
     // ---- Language model
     {
       id: "language-model",
@@ -163,7 +337,8 @@ export const sectionDefinitions = (dirs: ModelDirs = defaultModelDirs): Readonly
           ],
           apply: reload
         }),
-        ANTHROPIC_API_KEY: Setting.secret({ label: "Anthropic API key", env: "ANTHROPIC_API_KEY", apply: reload, visibleWhen: anthropic }),
+        // The account (key and address) is shared by every assistant, so it is shown and saved whatever LLM_PROVIDER says.
+        ANTHROPIC_API_KEY: Setting.secret({ label: "Anthropic API key", env: "ANTHROPIC_API_KEY", apply: reload }),
         ANTHROPIC_MODEL: Setting.text({
           label: "Model",
           description: "claude-haiku-5-5 is the fastest; claude-sonnet-5-5 and claude-opus-5-5 are slower to start speaking.",
@@ -234,8 +409,7 @@ export const sectionDefinitions = (dirs: ModelDirs = defaultModelDirs): Readonly
           check: (v) => (/^https?:\/\/[^\s]+$/.test(v.trim()) ? undefined : "Must be an address such as https://api.anthropic.com"),
           description: "Only for a proxy or gateway in front of the Anthropic API.",
           advanced: true,
-          apply: reload,
-          visibleWhen: anthropic
+          apply: reload
         })
       },
       checks: [
@@ -269,6 +443,38 @@ export const sectionDefinitions = (dirs: ModelDirs = defaultModelDirs): Readonly
           max: 10,
           advanced: true,
           apply: reload
+        }),
+        // Voice sessions (docs/VOICE-SESSIONS.md): live, no reload.
+        CONVERSATION_IDLE_MINUTES: Setting.number({
+          label: "New conversation after a quiet spell (minutes)",
+          description: "After this many minutes without a turn, the next thing said starts a new conversation (0 = never). " +
+            "The default for every device; a device's own setting can differ.",
+          env: "CONVERSATION_IDLE_MINUTES",
+          default: DEFAULT_CONVERSATION_IDLE_MINUTES,
+          integer: true,
+          min: CONVERSATION_IDLE_MINUTES_LIMITS.min,
+          max: CONVERSATION_IDLE_MINUTES_LIMITS.max
+        }),
+        MAX_VOICE_SESSIONS: Setting.number({
+          label: "Devices talking at once",
+          description: "How many devices can each have a conversation with the assistant at the same time. One more is refused " +
+            "until one of them has been closed for a while.",
+          env: "MAX_VOICE_SESSIONS",
+          default: DEFAULT_MAX_VOICE_SESSIONS,
+          integer: true,
+          min: 1,
+          max: 8,
+          advanced: true
+        }),
+        SESSION_DISCARD_MINUTES: Setting.number({
+          label: "Forget a closed device's conversation after (minutes)",
+          description: "A device with no page open for this long loses its conversation; one that comes back sooner carries on.",
+          env: "SESSION_DISCARD_MINUTES",
+          default: DEFAULT_SESSION_DISCARD_MINUTES,
+          integer: true,
+          min: 1,
+          max: 1_440,
+          advanced: true
         })
       }
     },
@@ -448,75 +654,66 @@ export const sectionDefinitions = (dirs: ModelDirs = defaultModelDirs): Readonly
       ]
     },
 
-    // ---- Voices
+    // ---- Voices (docs/VOICE-PROVIDERS.md §6.1)
     {
       id: "voices",
       title: "Voices",
-      description: "The model picks a voice per reply; the default speaks everything else.",
+      description: "The voice the assistant speaks every reply with.",
       group: "voices",
-      page: { id: "overview", title: "Voices", description: "Which voices the assistant may use." },
+      page: { id: "overview", title: "Voices", description: "Which voice the assistant speaks with." },
       order: 10,
       spec: {
-        DEFAULT_VOICE: Setting.choice({
-          label: "Default voice",
-          description: "Applies from the next reply when the voice is enabled; otherwise after reloading the engines.",
-          env: "DEFAULT_VOICE",
-          default: voiceCatalog[0]!.name,
-          options: voiceOptions
-        }),
-        VOICES: Setting.multichoice({
-          label: "Enabled voices",
-          description: "Each local voice is its own engine process. The default voice is always enabled.",
-          env: "VOICES",
-          default: [voiceCatalog[0]!.name],
-          options: voiceOptions,
+        [ASSISTANT_VOICE]: Setting.text({
+          label: "Assistant voice",
+          description: "A voice of one of the voice providers (provider:voice). Applies after reloading the engines. " +
+            "Empty: the voice of the earlier voice settings, else the voice on this machine.",
+          env: ASSISTANT_VOICE,
+          placeholder: voiceKey(DEFAULT_ASSISTANT_VOICE),
+          maxLength: 200,
+          check: checkVoiceKey,
           apply: reload
         })
       },
       checks: [
         (v) => {
-          if (v.secretSet("CARTESIA_API_KEY")) return []
-          const enabled = new Set([...(Array.isArray(v.value("VOICES")) ? v.value("VOICES") as ReadonlyArray<string> : []), String(v.value("DEFAULT_VOICE"))])
-          const hosted = [...enabled].filter((name) => engineOfVoice(name, v.value("TTS_PROVIDER")) === "cartesia")
-          return hosted.length === 0 ? [] : [
-            warn("VOICES", `${hosted.join(", ")} ${hosted.length === 1 ? "speaks" : "speak"} through Cartesia, but there is no Cartesia key: add it on the Voice engines page.`)
+          const ref = parseVoiceKey(String(v.value(ASSISTANT_VOICE) ?? "").trim())
+          if (ref === undefined || !isTtsProvider(ref.provider)) return []
+          const info = ttsProviderInfo[ref.provider]
+          if (info.keyEnv === undefined || v.secretSet(info.keyEnv)) return []
+          return [
+            warn(
+              ASSISTANT_VOICE,
+              `This voice speaks through ${info.label}, but there is no ${info.label} key: add it on the Voice providers page.`
+            )
           ]
         }
       ]
     },
     {
-      id: "voice-engines",
-      title: "Voice engines",
+      id: "voice-providers",
+      title: "Voice providers",
       group: "voices",
-      page: { id: "engines", title: "Voice engines", description: "The engine of the standard voice, and the hosted voice service." },
+      page: { id: "providers", title: "Voice providers", description: "Where the voices come from: this machine, and the hosted voice services." },
       order: 20,
       protected: true,
       spec: {
-        TTS_PROVIDER: Setting.choice({
-          label: "Standard voice engine",
-          description: "Also used by voices that do not name an engine of their own.",
-          env: "TTS_PROVIDER",
-          default: "sherpa",
-          options: [
-            { value: "sherpa", label: "On this machine (Piper/Kokoro)", tags: ["local"] },
-            { value: "cartesia", label: "Cartesia", tags: ["hosted", "needs-key"], implication: "Replies are sent to Cartesia to be spoken." }
-          ],
-          apply: reload
-        }),
         CARTESIA_API_KEY: Setting.secret({
           label: "Cartesia API key",
-          description: "For Cartesia voices (the standard voice on Cartesia, or the expressive voice).",
+          description: "For Cartesia voices: listing them, previews, and speaking with one.",
           env: "CARTESIA_API_KEY",
           apply: reload
+        }),
+        ELEVENLABS_API_KEY: Setting.secret({
+          label: "ElevenLabs API key",
+          description: "For ElevenLabs voices: listing them, previews, and speaking with one.",
+          env: "ELEVENLABS_API_KEY",
+          apply: reload
         })
-      },
-      checks: [
-        (v) =>
-          v.value("TTS_PROVIDER") === "cartesia" && !v.secretSet("CARTESIA_API_KEY")
-            ? [warn("TTS_PROVIDER", "Cartesia is chosen but there is no Cartesia key: the standard voice fails until you add it below.")]
-            : []
-      ]
+      }
     },
+
+    // ---- Routing (docs/ASSISTANTS.md §2.4, §3.6): TypeSafe chooses the assistant for a sentence without a phrase
+    routingSection,
 
     // ---- Diagnostics
     {

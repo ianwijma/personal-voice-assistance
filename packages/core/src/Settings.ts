@@ -48,6 +48,11 @@ interface SettingCommon {
   readonly env?: string
   /** Shown (and validated) only while this holds. */
   readonly visibleWhen?: Condition
+  /**
+   * Module fields: an assistant may have its own value (docs/ASSISTANTS.md §2.6), which wins over the shared one for
+   * that assistant. Never for secrets (not offered) or addresses (do not set it).
+   */
+  readonly overridable?: boolean
 }
 
 /** One setting. `A` is the type the module receives. */
@@ -65,6 +70,8 @@ export interface Setting<A> {
   readonly fromEnv: (text: string) => Decoded<A>
   /** When the field is shown (and validated); absent = always. */
   readonly visibleWhen?: Condition
+  /** An assistant may have its own value (`ModuleChoice.own`); never a secret. */
+  readonly overridable: boolean
 }
 
 export type SettingsSpec = { readonly [key: string]: Setting<any> }
@@ -79,11 +86,15 @@ const commonFields = (key: string, options: SettingCommon) => ({
   apply: options.apply ?? "live",
   ...(options.description !== undefined ? { description: options.description } : {}),
   ...(options.advanced !== undefined ? { advanced: options.advanced } : {}),
-  ...(options.visibleWhen !== undefined ? { visibleWhen: options.visibleWhen } : {})
+  ...(options.visibleWhen !== undefined ? { visibleWhen: options.visibleWhen } : {}),
+  ...(options.overridable === true ? { overridable: true } : {})
 })
 
 /** The `visibleWhen` of a constructor's options, for the `Setting` itself. */
-const visibility = (options: SettingCommon) => (options.visibleWhen !== undefined ? { visibleWhen: options.visibleWhen } : {})
+const visibility = (options: SettingCommon) => ({
+  ...(options.visibleWhen !== undefined ? { visibleWhen: options.visibleWhen } : {}),
+  overridable: options.overridable === true
+})
 
 const text = (options: SettingCommon & {
   readonly default?: string
@@ -120,7 +131,7 @@ const text = (options: SettingCommon & {
 }
 
 /** A secret (API key, token): never sent to the browser, stored apart from other settings. `undefined` = not set. */
-const secret = (options: Omit<SettingCommon, "advanced"> & {
+const secret = (options: Omit<SettingCommon, "advanced" | "overridable"> & {
   /** The module cannot work without it: a missing secret is a settings error and the module does not start. */
   readonly required?: boolean
 }): Setting<string | undefined> & { readonly required: boolean } => {
@@ -134,6 +145,7 @@ const secret = (options: Omit<SettingCommon, "advanced"> & {
     type: "secret",
     secret: true,
     ...visibility(options),
+    overridable: false,
     required: options.required ?? false,
     env: options.env,
     defaultValue: undefined,
@@ -263,6 +275,61 @@ export interface SettingsSources {
   readonly envLocation?: (name: string) => { readonly file: string; readonly line: number } | undefined
   /** Effective values of fields outside this spec (other sections), for `visibleWhen`. */
   readonly context?: (key: string) => unknown
+  /**
+   * Defaults computed elsewhere (a module's linked defaults from Home, docs/ASSISTANTS.md §2.6): used instead of a
+   * field's own default when nothing is saved and the environment does not set it. A value the field refuses is
+   * ignored.
+   */
+  readonly defaults?: Readonly<Record<string, unknown>>
+  /**
+   * An assistant's own values (`ModuleChoice.own`): for `overridable` fields only (others are ignored), they win over
+   * the environment, the saved value and the default. The form then shows the assistant's effective values.
+   */
+  readonly own?: Readonly<Record<string, unknown>>
+}
+
+/** The default of a field: the linked default when there is a valid one, else its own. */
+const defaultOf = (setting: Setting<unknown>, key: string, sources: Pick<SettingsSources, "defaults">): unknown => {
+  if (sources.defaults === undefined || !Object.hasOwn(sources.defaults, key) || setting.secret) return setting.defaultValue
+  const decoded = setting.decode(sources.defaults[key])
+  return decoded.ok ? decoded.value : setting.defaultValue
+}
+
+/** Does `own` hold a value for this field that counts (an overridable, non-secret field)? */
+const ownApplies = (setting: Setting<unknown>, key: string, own: SettingsSources["own"]): own is Readonly<Record<string, unknown>> =>
+  own !== undefined && Object.hasOwn(own, key) && setting.overridable && !setting.secret
+
+/** The keys of the fields an assistant may have its own value for, in declaration order. */
+export const overridableKeys = (spec: SettingsSpec): ReadonlyArray<string> =>
+  Object.entries(spec).flatMap(([key, setting]) => (setting.overridable && !setting.secret ? [key] : []))
+
+/** Only the values of `own` that count (overridable, non-secret fields of `spec`). */
+export const applicableOwnValues = (spec: SettingsSpec, own: Readonly<Record<string, unknown>> | undefined): Record<string, unknown> => {
+  const out: Record<string, unknown> = {}
+  for (const [key, value] of Object.entries(own ?? {})) {
+    const setting = Object.hasOwn(spec, key) ? spec[key] : undefined
+    if (setting !== undefined && ownApplies(setting, key, own)) out[key] = value
+  }
+  return out
+}
+
+/**
+ * Check an assistant's own values for a module (docs/ASSISTANTS.md §2.2): every key must be an `overridable` field
+ * (never a secret), and every value one the field accepts. One error per bad key.
+ */
+export const checkOwnValues = (spec: SettingsSpec, own: Readonly<Record<string, unknown>>): ReadonlyArray<FieldError> => {
+  const errors: Array<FieldError> = []
+  for (const [key, value] of Object.entries(own)) {
+    const setting = Object.hasOwn(spec, key) ? spec[key] : undefined
+    if (setting === undefined) errors.push({ key, message: `There is no setting "${key}"` })
+    else if (setting.secret) errors.push({ key, message: "A secret is shared: it cannot be set per assistant" })
+    else if (!setting.overridable) errors.push({ key, message: "This setting is shared: it cannot be set per assistant" })
+    else {
+      const decoded = setting.decode(value)
+      if (!decoded.ok) errors.push({ key, message: decoded.error })
+    }
+  }
+  return errors
 }
 
 /** Is the field shown, given the effective values of its own form (`values`) and of the others (`context`)? */
@@ -302,7 +369,10 @@ export const resolveSettings = <S extends SettingsSpec>(spec: S, sources: Settin
 
   for (const [key, setting] of Object.entries(spec)) {
     const fromEnv = envValue(setting, sources.env)
-    const described = setting.describe(key)
+    const fieldDefault = defaultOf(setting, key, sources)
+    const described = fieldDefault === setting.defaultValue || setting.secret
+      ? setting.describe(key)
+      : ({ ...setting.describe(key), default: fieldDefault } as SettingField)
 
     if (setting.secret) {
       const stored = sources.secrets[key]
@@ -319,7 +389,11 @@ export const resolveSettings = <S extends SettingsSpec>(spec: S, sources: Settin
 
     let decoded: Decoded<unknown>
     let source: FieldSource
-    if (fromEnv !== undefined) {
+    if (ownApplies(setting, key, sources.own)) {
+      source = "saved"
+      decoded = setting.decode(sources.own[key])
+      if (!decoded.ok) decoded = fail(`The assistant's own value is not valid (${decoded.error})`)
+    } else if (fromEnv !== undefined) {
       source = origin(setting.env!)
       decoded = setting.fromEnv(fromEnv)
       if (!decoded.ok) decoded = fail(`${setting.env}=${fromEnv} is not valid: ${decoded.error}`)
@@ -329,15 +403,15 @@ export const resolveSettings = <S extends SettingsSpec>(spec: S, sources: Settin
       if (!decoded.ok) decoded = fail(`The saved value is not valid (${decoded.error}); save a new one`)
     } else {
       source = "default"
-      decoded = ok(setting.defaultValue)
+      decoded = ok(fieldDefault)
     }
     fields.push(fromEnv === undefined ? { ...described, source } : { ...described, source, locked: lock(setting.env!, source) })
     if (decoded.ok) {
       values[key] = decoded.value as SettingValue
       result[key] = decoded.value
     } else {
-      values[key] = setting.defaultValue as SettingValue
-      result[key] = setting.defaultValue
+      values[key] = fieldDefault as SettingValue
+      result[key] = fieldDefault
       problems.push({ key, message: decoded.error })
     }
   }
@@ -395,9 +469,9 @@ export const applySettingsPatch = (
       : Object.hasOwn(patch.values, key) && patch.values[key] !== null
       ? setting.decode(patch.values[key])
       : Object.hasOwn(patch.values, key) || !Object.hasOwn(sources.stored, key)
-      ? ok(setting.defaultValue)
+      ? ok(defaultOf(setting, key, sources))
       : setting.decode(sources.stored[key])
-    after[key] = raw.ok ? raw.value : setting.defaultValue
+    after[key] = raw.ok ? raw.value : defaultOf(setting, key, sources)
   }
   const hidden = (key: string) => {
     if (options.includeHidden === true) return false

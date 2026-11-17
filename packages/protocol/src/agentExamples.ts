@@ -1,41 +1,9 @@
 /**
- * Valid examples of the protocol additions in `agents.ts`, for tests and mocks
- * (`import { agentExamples } from "@pva/protocol/agent-examples"`). Not part of
- * `@pva/protocol/examples` until the integration step merges the additions.
+ * Valid examples of the extended settings field types in `agents.ts`, for tests and mocks
+ * (`import { exampleRulesField } from "@pva/protocol/agent-examples"`).
  */
-import type {
-  ActionInfo,
-  ClientMessageAdditions,
-  RoutingInfo,
-  ServerMessageAdditions,
-  SettingFieldV2,
-  SettingsFormV2
-} from "./agents.ts"
+import type { SettingFieldV2, SettingsFormV2 } from "./agents.ts"
 
-export const exampleRouting: RoutingInfo = {
-  defaultAgent: "anthropic",
-  activeAgent: "claude-subscription",
-  reason: "sticky",
-  expiresInMs: 104_000
-}
-
-export const exampleLightsOnAction: ActionInfo = {
-  id: "demo-home.lights_on",
-  label: "Turn lights on",
-  description: "Switch on the lights in a room, one light, or every light.",
-  params: [{
-    name: "target",
-    label: "Room or light",
-    kind: "dynamic",
-    optional: false,
-    options: ["Living room", "Kitchen", "Bedroom", "Office", "Desk lamp", "All lights"]
-  }],
-  speculative: false,
-  confirm: false,
-  tool: "demo-home_lights_on"
-}
-
-/** The routing section's rule list, as the server describes it. */
 export const exampleRulesField: SettingFieldV2 = {
   type: "records",
   key: "ROUTING_RULES",
@@ -84,32 +52,4 @@ export const exampleAgentForm: SettingsFormV2 = {
   },
   secrets: { apiKey: { set: true, source: "store" } },
   errors: []
-}
-
-export const agentClientExamples: { readonly [T in ClientMessageAdditions["type"]]: Extract<ClientMessageAdditions, { type: T }> } = {
-  "module.action": { type: "module.action", requestId: "r7", moduleId: "anthropic", key: "test" },
-  "settings.action": { type: "settings.action", requestId: "r8", sectionId: "voice-natural", key: "PLAY_SAMPLE" },
-  "routing.set": { type: "routing.set", requestId: "r9", agentId: null }
-}
-
-export const agentServerExamples: { readonly [T in ServerMessageAdditions["type"]]: Extract<ServerMessageAdditions, { type: T }> } = {
-  routing: { type: "routing", routing: exampleRouting },
-  "intent.decision": {
-    type: "intent.decision",
-    turnId: 31,
-    agentId: "jev",
-    decider: "jev-typesafe",
-    outcome: "act",
-    action: { id: "demo-home.lights_on", label: "Turn lights on", moduleId: "demo-home" },
-    params: [{ name: "target", label: "Room or light", value: "Living room", probability: 0.93 }],
-    probability: 0.93,
-    ms: 241
-  },
-  "turn.agent": {
-    type: "turn.agent",
-    turnId: 32,
-    agent: { id: "anthropic", name: "Claude (API)", kind: "model" },
-    from: { id: "jev", name: "Jev", kind: "intent" },
-    reason: "handoff"
-  }
 }
