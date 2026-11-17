@@ -1920,6 +1920,9 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
         const ended = Effect.forEach(presses, (owner) => owner.settled, { concurrency: "unbounded", discard: true })
         yield* Effect.raceFirst(Effect.all([calls, ended], { concurrency: "unbounded", discard: true }), Deferred.await(closingSignal)).pipe(Effect.timeoutOption(grace))
       }
+      // The grace period is over: every press of every instance is answered `stopped` and asked to stop in this one
+      // step, before any part's cleanup is awaited (no press's answer waits for another instance's finalizers).
+      for (const owner of presses) owner.signal()
       Deferred.doneUnsafe(run.killed, Effect.void)
       for (const inst of run.instances.values()) yield* closePart(inst.part)
       if (run.shared !== undefined) yield* closePart(run.shared.part)
@@ -1940,6 +1943,7 @@ export const makeModuleHost = Effect.fnUntraced(function*(options: ModuleHostOpt
       if (run === undefined) continue
       withdrawRun(entry, run)
       Deferred.doneUnsafe(run.killed, Effect.void)
+      for (const inst of run.instances.values()) inst.part.presses?.signal()
       revoked.push(run)
     }
     rebuildSnapshot()
