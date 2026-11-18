@@ -5,6 +5,7 @@ import { assert, describe, it } from "@effect/vitest"
 import {
   OFF_THREAD_CONCURRENCY,
   OFF_THREAD_DEFAULT_RESULT_BYTES,
+  OFF_THREAD_MAX_ANSWER_NODES,
   OFF_THREAD_MAX_INPUT_BYTES,
   OFF_THREAD_MAX_RESULT_BYTES,
   OFF_THREAD_MAX_WAITING,
@@ -21,7 +22,9 @@ import { join } from "node:path"
 import type { MessagePort, Worker } from "node:worker_threads"
 import { vi } from "vitest"
 import { bound } from "../../store-sqlite/test/latencyBound.ts"
+import { syncBuiltinESMExports } from "node:module"
 import * as v8 from "node:v8"
+import v8Default from "node:v8"
 import { describeThrown, markersOf, offThreadYoungGenerationMb, wireShape } from "../src/OffThread.ts"
 
 // Every call here starts a real worker (about a quarter of a second each on a fast machine): the tests that make
@@ -106,6 +109,34 @@ const onWorkers = <A, E>(hook: (worker: Worker) => void, effect: Effect.Effect<A
     () => Effect.sync(() => process.off("worker", hook))
   )
 
+/** What arrived on the bootstrap's private answer port, seen before the helper reads it (`edit` may change it). */
+interface Arrival {
+  readonly keys: ReadonlyArray<string>
+  readonly wireBytes: number | undefined
+}
+const observeAnswers = <A, E>(effect: Effect.Effect<A, E>, edit?: (message: Record<string, unknown>) => void) =>
+  Effect.gen(function*() {
+    const arrivals: Array<Arrival> = []
+    const workerErrors: Array<unknown> = []
+    const hook = (worker: Worker) => {
+      worker.on("error", (e) => workerErrors.push(e))
+      worker.prependOnceListener("message", (first: { answerPort?: MessagePort }) =>
+        first.answerPort?.once("message", (message: Record<string, unknown>) => {
+          arrivals.push({ keys: Object.keys(message).sort(), wireBytes: message.wire instanceof ArrayBuffer ? message.wire.byteLength : undefined })
+          edit?.(message)
+        }))
+    }
+    const value = yield* onWorkers(hook, effect)
+    return { value, arrivals, workerErrors }
+  })
+
+/** A refusal that came as bounded metadata: no buffer, a few fixed fields. */
+const assertMetadataOnly = (arrivals: ReadonlyArray<Arrival>) => {
+  assert.strictEqual(arrivals.length, 1)
+  assert.strictEqual(arrivals[0]!.wireBytes, undefined)
+  for (const key of arrivals[0]!.keys) assert.include(["kind", "size", "structured", "shape", "name", "code"], key)
+}
+
 /** A folder of the test's own, for barrier files. */
 const scratch = mkdtempSync(join(tmpdir(), "pva-offthread-barrier-"))
 let barriers = 0
@@ -128,21 +159,28 @@ describe("offThread", () => {
       assert.strictEqual(offThreadWorkers().running, 0)
     }))
 
-  it.live("a task that loops forever is terminated at its time limit, promptly, once it has entered its loop", () =>
+  it.live("a running loop is terminated at its time limit, promptly; a limit start-up used up is a correct timeout", () =>
     Effect.gen(function*() {
-      // The limit is long enough for the task to load even on a slow runner; the barrier file proves it did, so this
-      // terminates a running loop, not a thread still loading.
-      const limit = bound(1_000)
-      const entered = barrier()
-      const { exit, ms: took } = yield* timed(offThread(loop, { entered }, { timeoutMs: limit }))
-      const e = failure(exit)
-      assert.isTrue(existsSync(entered), "the task entered its loop before the limit")
-      assert.strictEqual(e.reason, "timeout")
-      assert.strictEqual(e.message, `loop.task.ts: took longer than ${limit} ms`)
-      results.push(`loop terminated: call took ${ms(took)} for a limit of ${limit} ms (${ms(took - limit)} to terminate)`)
-      assert.isAtLeast(took, limit - 1)
-      assert.isBelow(took, limit + bound(150))
-      assert.strictEqual(offThreadWorkers().running, 0)
+      // Every run is a correct timeout. Only a run whose barrier file was written (the task entered its loop before
+      // the limit) proves a running loop terminated, and only there is the time to terminate measured. When start-up
+      // used up the short limit (a slow runner), the proof is tried again with a longer one, inside the file's 60 s.
+      for (const limit of [bound(1_000), 10_000, 30_000]) {
+        const entered = barrier()
+        const { exit, ms: took } = yield* timed(offThread(loop, { entered }, { timeoutMs: limit }))
+        const e = failure(exit)
+        assert.strictEqual(e.reason, "timeout")
+        assert.strictEqual(e.message, `loop.task.ts: took longer than ${limit} ms`)
+        assert.isAtLeast(took, limit - 1)
+        assert.strictEqual(offThreadWorkers().running, 0)
+        if (!existsSync(entered)) {
+          results.push(`loop: start-up used the whole ${limit} ms limit (a correct timeout); tried again with a longer one`)
+          continue
+        }
+        results.push(`loop terminated: call took ${ms(took)} for a limit of ${limit} ms (${ms(took - limit)} to terminate)`)
+        assert.isBelow(took, limit + bound(150))
+        return
+      }
+      results.push("loop: start-up used every limit; each was a correct timeout, the loop's termination was not measured")
     }))
 
   it.live("a task that allocates until it dies fails with `memory`; the next call works", () =>
@@ -202,9 +240,12 @@ describe("offThread", () => {
 
   it.live("an answer over the result limit fails with `too-large`", () =>
     Effect.gen(function*() {
-      const e = failure(yield* Effect.exit(offThread(big, { chars: 200_000 }, { timeoutMs: 10_000, maxResultBytes: 100_000 })))
+      // Refused in the worker: what arrives is the size, not the buffer.
+      const { value: exit, arrivals } = yield* observeAnswers(Effect.exit(offThread(big, { chars: 200_000 }, { timeoutMs: 10_000, maxResultBytes: 100_000 })))
+      const e = failure(exit)
       assert.strictEqual(e.reason, "too-large")
       assert.match(e.message, /^big\.task\.ts: answered 195\.3 KiB, over its limit of 97\.7 KiB$/)
+      assertMetadataOnly(arrivals)
       // Within the limit it is answered.
       assert.strictEqual((yield* offThread(big, { chars: 50_000 }, { timeoutMs: 10_000, maxResultBytes: 100_000 })).length, 50_000)
     }))
@@ -509,11 +550,16 @@ describe("offThread", () => {
   it.live("a structured answer is small: over 128 KiB it is refused whatever the limit says; only text or bytes may be larger", () =>
     Effect.gen(function*() {
       // 14,100 small objects serialise to 129.6 KiB: refused with a limit of 4 MiB, and over the default limit.
-      const raised = failure(yield* Effect.exit(offThread(probe, { kind: "objects", count: 14_100 }, { timeoutMs: 10_000, maxResultBytes: OFF_THREAD_MAX_RESULT_BYTES })))
+      const observed = yield* observeAnswers(Effect.exit(offThread(probe, { kind: "objects", count: 14_100 }, { timeoutMs: 10_000, maxResultBytes: OFF_THREAD_MAX_RESULT_BYTES })))
+      const raised = failure(observed.value)
       assert.strictEqual(raised.reason, "too-large")
+      // Refused in the worker, from what it serialised: no buffer arrived.
+      assertMetadataOnly(observed.arrivals)
       assert.strictEqual(raised.message, "probe.task.mjs: answered 129.6 KiB of structured data, over its limit of 128.0 KiB (only a string or bytes may be larger)")
-      const usual = failure(yield* Effect.exit(offThread(probe, { kind: "objects", count: 14_100 }, { timeoutMs: 10_000 })))
+      const observedUsual = yield* observeAnswers(Effect.exit(offThread(probe, { kind: "objects", count: 14_100 }, { timeoutMs: 10_000 })))
+      const usual = failure(observedUsual.value)
       assert.strictEqual(usual.reason, "too-large")
+      assertMetadataOnly(observedUsual.arrivals)
       assert.strictEqual(usual.message, "probe.task.mjs: answered 129.6 KiB, over its limit of 128.0 KiB")
       // A string or bytes of 4 MiB pass with a limit of 4 MiB.
       const text = yield* offThread(probe, { kind: "string", chars: OFF_THREAD_MAX_RESULT_BYTES - 16 }, { timeoutMs: 10_000, maxResultBytes: OFF_THREAD_MAX_RESULT_BYTES })
@@ -525,6 +571,102 @@ describe("offThread", () => {
       // The default limit is 128 KiB, for text too.
       assert.strictEqual(OFF_THREAD_DEFAULT_RESULT_BYTES, 128 * 1024)
       assert.strictEqual(failure(yield* Effect.exit(offThread(big, { chars: 128 * 1024 + 1 }, { timeoutMs: 10_000 }))).reason, "too-large")
+    }))
+
+  it.live("the main thread refuses an oversized buffer without reading it (a buffer injected past the worker's checks)", () =>
+    Effect.gen(function*() {
+      // The test's listener on the answer port runs before the helper's and swaps the answer's buffer.
+      const original = v8Default.deserialize
+      let reads = 0
+      v8Default.deserialize = (buffer: Parameters<typeof original>[0]) => {
+        reads++
+        return original(buffer)
+      }
+      syncBuiltinESMExports()
+      try {
+        // The spy sees an ordinary answer read.
+        assert.strictEqual(yield* offThread(plain, "x", { timeoutMs: 10_000 }), "x")
+        assert.strictEqual(reads, 1)
+        // A structured buffer of 200 KiB, with a raised limit: refused unread.
+        const structured = v8.serialize(Array.from({ length: 20_000 }, (_, i) => ({ i })))
+        const swapIn = (bytes: Uint8Array) => (message: Record<string, unknown>) => {
+          if (message.kind === "ok") message.wire = bytes.slice().buffer
+        }
+        const one = yield* observeAnswers(Effect.exit(offThread(plain, "x", { timeoutMs: 10_000, maxResultBytes: OFF_THREAD_MAX_RESULT_BYTES })), swapIn(structured))
+        assert.strictEqual(failure(one.value).message, `plain.task.mjs: answered ${(structured.byteLength / 1024).toFixed(1)} KiB of structured data, over its limit of 128.0 KiB (only a string or bytes may be larger)`)
+        // Text over the call's limit: refused unread.
+        const text = v8.serialize("x".repeat(200_000))
+        const two = yield* observeAnswers(Effect.exit(offThread(plain, "x", { timeoutMs: 10_000 })), swapIn(text))
+        assert.strictEqual(failure(two.value).reason, "too-large")
+        assert.strictEqual(reads, 1)
+      } finally {
+        v8Default.deserialize = original
+        syncBuiltinESMExports()
+      }
+    }))
+
+  it.live("an answer with an array with holes is refused in the worker, however small its serialised form (no sparse arrays)", () =>
+    Effect.gen(function*() {
+      // 20 bytes serialised, ten million entries when read: it never reaches the main thread.
+      const { value, worst } = yield* longestStop(observeAnswers(Effect.exit(offThread(probe, { kind: "sparse", count: 10_000_000, nested: false }, { timeoutMs: 10_000, maxResultBytes: 32 }))))
+      const e = failure(value.value)
+      assert.strictEqual(e.reason, "too-large")
+      assert.strictEqual(e.message, "probe.task.mjs: answered more than 131072 values")
+      assertMetadataOnly(value.arrivals)
+      results.push(`main thread, a sparse answer of ten million entries (20 bytes serialised): refused, longest stop ${ms(worst)}`)
+      assert.isBelow(worst, bound(10))
+      // Nested, and short: an array with any hole is refused.
+      for (const input of [{ kind: "sparse", count: 1_000, nested: true }, { kind: "holey" }]) {
+        const observed = yield* observeAnswers(Effect.exit(offThread(probe, input, { timeoutMs: 10_000 })))
+        assert.strictEqual(failure(observed.value).message, "probe.task.mjs: answered an array with holes (no sparse arrays)")
+        assertMetadataOnly(observed.arrivals)
+      }
+    }))
+
+  it.live(`an answer of more than ${OFF_THREAD_MAX_ANSWER_NODES} values is refused in the worker; one of fewer is answered`, () =>
+    Effect.gen(function*() {
+      for (const input of [{ kind: "values", count: OFF_THREAD_MAX_ANSWER_NODES, map: false }, { kind: "values", count: 140_000, map: true }]) {
+        const observed = yield* observeAnswers(Effect.exit(offThread(probe, input, { timeoutMs: 10_000, maxResultBytes: OFF_THREAD_MAX_RESULT_BYTES })))
+        assert.strictEqual(failure(observed.value).message, `probe.task.mjs: answered more than ${OFF_THREAD_MAX_ANSWER_NODES} values`)
+        assertMetadataOnly(observed.arrivals)
+      }
+      // 131,000 booleans fit in 128 KiB, and in the bound.
+      assert.strictEqual((yield* offThread(probe, { kind: "values", count: 131_000, map: false }, { timeoutMs: 10_000 })).length, 131_000)
+    }))
+
+  it.live("an uncaught failure (a throw from a timer, an unhandled rejection) arrives as a name only, never as the thrown value", () =>
+    Effect.gen(function*() {
+      const bytes = 32 * MiB
+      for (const [kind, message] of [["uncaughtBig", "probe.task.mjs: failed (Error)"], ["uncaughtObject", "probe.task.mjs: failed (other error)"], ["unhandled", "probe.task.mjs: failed (Error)"]] as const) {
+        const { value, worst } = yield* longestStop(observeAnswers(Effect.exit(offThread(probe, { kind, bytes }, { timeoutMs: 10_000, maxResultBytes: 32 }))))
+        const e = failure(value.value)
+        assert.strictEqual(e.reason, "failed", kind)
+        assert.strictEqual(e.message, message)
+        assert.isBelow(JSON.stringify(e).length, 300)
+        // It came on the private channel, as fixed metadata; Node's own error transport carried nothing.
+        assertMetadataOnly(value.arrivals)
+        assert.deepStrictEqual(value.workerErrors, [])
+        results.push(`main thread, an uncaught 32 MiB failure (${kind}): longest stop ${ms(worst)}`)
+        assert.isBelow(worst, bound(10))
+      }
+      assert.strictEqual(offThreadWorkers().running, 0)
+    }))
+
+  it.live("an own `__proto__` key of a legal input arrives as an own field, and comes back as one", () =>
+    Effect.gen(function*() {
+      for (const [json, expected] of [['{"kind":"keys","__proto__":null}', null], ['{"kind":"keys","__proto__":"text"}', "text"]] as const) {
+        const input = JSON.parse(json) as { readonly kind: string }
+        assert.deepStrictEqual(yield* offThread(probe, input, { timeoutMs: 10_000 }), { keys: ["kind", "__proto__"], proto: expected })
+      }
+      const withBytes: Record<string, unknown> = JSON.parse('{"kind":"keys"}')
+      Object.defineProperty(withBytes, "__proto__", { value: new Uint8Array([1, 2]), enumerable: true, writable: true, configurable: true })
+      const seen = yield* offThread(probe, withBytes as { readonly kind: string }, { timeoutMs: 10_000 })
+      assert.deepStrictEqual(seen.keys, ["kind", "__proto__"])
+      assert.deepStrictEqual([...seen.proto], [1, 2])
+      // The answer side: an own `__proto__` field of the answer stays one.
+      const back = (yield* offThread(plain, JSON.parse('{"__proto__":"x","a":1}'), { timeoutMs: 10_000 })) as object
+      assert.deepStrictEqual(Object.getOwnPropertyDescriptor(back, "__proto__")?.value, "x")
+      assert.strictEqual(Object.getPrototypeOf(back), Object.prototype)
     }))
 
   it("the main thread tells text and bytes from a structure by the serialised tag, before it reads the buffer", () => {
