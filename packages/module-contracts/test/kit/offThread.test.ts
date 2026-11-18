@@ -7,6 +7,8 @@ import { makeOfflineNet, offThreadWorkers, startTestModule } from "@pva/core/tes
 import { type Connector, contentTypes, type Resolver, safeFetch } from "@pva/net"
 import { Effect, Schema } from "effect"
 import { vi } from "vitest"
+// A latency test (vitest.latency.ts): its workers spin and its time limit is real time, so CI runs it alone.
+import "../../../store-sqlite/test/latencyBound.ts"
 import { defineTexts, homeLanguage, say } from "../../src/index.ts"
 
 // Real workers start here (a quarter of a second each, several times that on a slow CI runner).

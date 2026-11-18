@@ -1085,13 +1085,17 @@ loop or allocate. What a worker thread cannot guarantee is said below.
   per other value, keys included) is at most `maxInputBytes`: 4 MiB, the default and the most a call may ask for,
   checked before anything is copied. Bytes are copied onto a buffer of their own before they cross: the task never
   sees the bytes beside them in a pooled `Buffer`, and what it writes stays in the worker. Pass a fetched body as it
-  is (cap the fetch first: `safeFetch`'s `maxBytes`), and the settings the task needs as a few plain fields.
+  is (cap the fetch first: `safeFetch`'s `maxBytes`), and the settings the task needs as a few plain fields: pass a
+  small record of your own, never an object parsed from outside (counting the keys of a huge one costs the main
+  thread before it is refused: 80 to 150 ms for 500,000 keys).
 - **The answer: return text or a small structure; a big structure is refused.** The worker serialises the answer
   once, into one buffer that is checked, transferred, checked again and read on the main thread (the task's value
   itself never crosses). Reading text or bytes costs the main thread by the byte, reading a structure by the object.
   So `maxResultBytes` (default 128 KiB) may be raised to 4 MiB, but only an answer that is one string or one
   `Uint8Array` may use more than 128 KiB. A structured answer (an object, an array, anything else) over 128 KiB fails
-  with `too-large` whatever the limit says, and its buffer is never read. The longest stop of the main thread while
+  with `too-large` whatever the limit says, and its buffer is never read. No sparse arrays: an array with holes, or an
+  answer of more than 131,072 values in all, is refused too (a hole costs nothing to send but is allocated whole when
+  read). The longest stop of the main thread while
   receiving the largest allowed answers, and what larger structures cost (development machine, worst of 5 calls):
 
   | Answer | Allowed | Longest stop |
@@ -1132,8 +1136,8 @@ loop or allocate. What a worker thread cannot guarantee is said below.
   |---|---|---|
   | `timeout` | the time limit passed (waiting included); the worker was terminated | it took too long to read |
   | `memory` | the worker ran out of `maxMemoryMb` | it could not be read |
-  | `too-large` | the answer was over `maxResultBytes`, or is a structure over 128 KiB | it could not be read (or: it is too long) |
-  | `failed` | the task threw or rejected (a stack overflow too), or its answer cannot be serialised | it could not be read |
+  | `too-large` | the answer was over `maxResultBytes`, is a structure over 128 KiB, holds an array with holes or more than 131,072 values | it could not be read (or: it is too long) |
+  | `failed` | the task threw or rejected (a stack overflow too, and a throw from a timer or a rejection nobody handled), or its answer cannot be serialised | it could not be read |
   | `exited` | the worker ended without answering, or could not start | it could not be read |
   | `load` | the task module is missing, has no default function, or is not a `.ts`, `.mts` or `.mjs` file: a bug of the module | it could not be read |
   | `input` | the input is not of the shape above, or over `maxInputBytes`: a bug of the module (cap first) | it could not be read |
@@ -1142,7 +1146,8 @@ loop or allocate. What a worker thread cannot guarantee is said below.
 
 - **Not**: no state shared between calls (each call is a fresh thread: a global set in one call is gone in the next),
   no network and no store from the task (fetch first, store after, on the main thread), no secrets in the input
-  unless the task needs them (the worker gets none of the server's environment variables either). It is not a
+  unless the task needs them. Of the server's environment variables the worker gets only `NODE_ENV`, `TMPDIR`,
+  `TMP`, `TEMP`, `TZ` and those whose names start with `TSX_`; every other one is left out. It is not a
   sandbox: the worker keeps the server's working directory and file access, because the task is trusted code. Never
   from a context provider or anywhere else on the turn path: the start-up cost below is more than a context
   provider's 50 ms.
@@ -1154,6 +1159,9 @@ loop or allocate. What a worker thread cannot guarantee is said below.
   - The main thread's own share, the longest stop of a 1 ms timer over 5 calls: 1 MiB in and 100 KiB out 1.8 ms; the
     largest legal input (4 MiB as counted) 3.6 to 4.0 ms as a string of two-byte characters, 1.8 to 1.9 ms as bytes,
     1.5 to 1.9 ms as an object of 30 strings; a task writing 80 MB to console and the streams 1.2 to 1.5 ms.
+  - Refusals that never reach the main thread as data: a sparse answer of ten million entries (20 bytes serialised)
+    holds it 1.6 ms, an uncaught 32 MiB failure (a thrown `Error` or object from a timer, an unhandled rejection) 1.2
+    to 1.3 ms.
   - A task that loops forever ends 4 ms after its time limit; an interrupted one is gone 3 to 4 ms after the
     interruption.
   - A rare stop of 6 to 8 ms on the main thread is its own garbage collection, not the helper's work (a GC observer
@@ -1234,6 +1242,13 @@ assert.strictEqual((yield* on.tool("reader_read_page", { url: "https://example.o
 // Every worker has ended.
 assert.strictEqual(offThreadWorkers().running, 0)
 ```
+
+### Latency tests
+
+A test file that asserts how long the main thread stops (the longest gap of a 1 ms heartbeat) or how long real work
+takes imports `packages/store-sqlite/test/latencyBound.ts` and writes its bounds as `bound(ms)`, and **that import is
+what makes it a latency test**: CI runs those files alone, one at a time after the rest (`vitest.latency.ts`), so other
+tests' busy threads do not lengthen what they measure, while `pnpm test` still runs everything together.
 
 ## 16. Speaking
 

@@ -161,8 +161,14 @@ describe("household data in serve mode", () => {
     for (let i = 0; i < 150; i += 2) await run(store!.collection(board).update(`b${i}`, (v) => (v.device === undefined ? { ...v, device: "study-00001" } : { text: v.text })))
     for (let i = 0; i < 450; i += 5) await run(store!.collection(wall).remove(`x${i}`))
     await studyHello
+    // A page has settled when the last change reached it: one more row, for every device, committed once the study's
+    // feed has begun (its snapshot is final), so it is queued behind everything still on its way to either page. Not
+    // the size of what a page holds: on its way through the burst the kitchen's passes the final size (100 rows and 335
+    // of the 450 puts) while 118 of its changes are still queued.
+    await study.waitFor("household.snapshot", (m) => m.final, { timeoutMs: 20_000 })
+    await run(store!.collection(board).insert({ text: "the end" }, { id: "end" }))
     // What is committed now, from the writes above.
-    const all = new Map<string, Note>()
+    const all = new Map<string, Note>([["board/end", { text: "the end" }]])
     for (let i = 0; i < 150; i++) {
       const before: Note = { text: `before ${i}`, ...(i % 3 === 0 ? { device: "study-00001" } : {}) }
       all.set(`board/b${i}`, i % 2 !== 0 ? before : before.device === undefined ? { ...before, device: "study-00001" } : { text: before.text })
@@ -170,9 +176,8 @@ describe("household data in serve mode", () => {
     for (let i = 0; i < 450; i++) if (i % 5 !== 0) all.set(`wall/x${i}`, { text: `burst ${i}`, device: "kitchen-0001" })
     const visibleTo = (device: string) => new Map([...all].filter(([, v]) => v.device === undefined || v.device === device).map(([key, v]) => [key, { text: v.text }] as const))
     for (const [client, device] of [[kitchen, "kitchen-0001"], [study, "study-00001"]] as const) {
-      const expected = visibleTo(device)
-      for (let t = 0; t < 100 && held(client).size !== expected.size; t++) await sleep(50)
-      expect(held(client)).toEqual(expected)
+      await client.waitFor("household.event", (m) => changeOf(m).collection === "board" && changeOf(m).id === "end", { from: 0, timeoutMs: 20_000 })
+      expect(held(client)).toEqual(visibleTo(device))
     }
   })
 
